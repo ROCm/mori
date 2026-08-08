@@ -49,7 +49,9 @@ constexpr int kMaxGpusPerNode = 8;
 // __syncthreads() is the arch-portable equivalent: the compiler emits the correct
 // LDS wait + workgroup barrier for the target arch (mirrors FlyDSL's fx.barrier()).
 #define LDS_BARRIER() \
-  { __syncthreads(); }
+  {                   \
+    __syncthreads();  \
+  }
 
 /* ──────────────────────────────────────────────────────────────────────────────
  * ReadLanePtr — broadcast a 64-bit pointer from one lane to all via

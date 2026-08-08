@@ -241,8 +241,7 @@ mori::application::SymmMemObjPtr EpDispatchCombineHandle::MallocSymm(size_t size
   }
   uintptr_t* p2pDev = nullptr;
   HIP_RUNTIME_CHECK(hipMalloc(&p2pDev, ws * sizeof(uintptr_t)));
-  HIP_RUNTIME_CHECK(
-      hipMemcpy(p2pDev, peers.data(), ws * sizeof(uintptr_t), hipMemcpyHostToDevice));
+  HIP_RUNTIME_CHECK(hipMemcpy(p2pDev, peers.data(), ws * sizeof(uintptr_t), hipMemcpyHostToDevice));
 
   auto* cpuObj = new mori::application::SymmMemObj();
   cpuObj->localPtr = localPtr;
@@ -252,8 +251,8 @@ mori::application::SymmMemObjPtr EpDispatchCombineHandle::MallocSymm(size_t size
 
   mori::application::SymmMemObj* gpuObj = nullptr;
   HIP_RUNTIME_CHECK(hipMalloc(&gpuObj, sizeof(mori::application::SymmMemObj)));
-  HIP_RUNTIME_CHECK(hipMemcpy(gpuObj, cpuObj, sizeof(mori::application::SymmMemObj),
-                              hipMemcpyHostToDevice));
+  HIP_RUNTIME_CHECK(
+      hipMemcpy(gpuObj, cpuObj, sizeof(mori::application::SymmMemObj), hipMemcpyHostToDevice));
 
   // win=nullptr marks a sub-region (arena window is freed once in FinalizeCcoAllocs).
   ccoAllocs.push_back(CcoSymmAlloc{nullptr, localPtr, cpuObj, gpuObj, p2pDev});
@@ -339,8 +338,7 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
     bufs.staging = MallocSymm(stagingSize, hipDeviceMallocUncached);
     bufs.dispatchOut = MallocSymm(dispatchOutSize, hipDeviceMallocUncached);
     bufs.combineOut = MallocSymm(combineOutSize, hipDeviceMallocUncached);
-    bufs.dispatchStaging =
-        MallocSymm(dispatchStagingSize, hipDeviceMallocUncached);
+    bufs.dispatchStaging = MallocSymm(dispatchStagingSize, hipDeviceMallocUncached);
   } else {
     auto& bufs = shmemTokBufs.emplace<ShmemBufsInterNode>();
     // NOTE(ditian12): no overflow protection for dispatchInp/combinInp/staging in async kernel,
@@ -358,10 +356,8 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
   size_t maxWeightSize =
       static_cast<size_t>(config.MaxNumTokensToRecv()) * config.numExpertPerToken * sizeof(float);
   shmemInpWeightsMemObj = MallocSymm(maxWeightSize, hipDeviceMallocUncached);
-  shmemDispatchOutWeightsMemObj =
-      MallocSymm(maxWeightSize, hipDeviceMallocUncached);
-  shmemCombineOutWeightsMemObj =
-      MallocSymm(maxWeightSize, hipDeviceMallocUncached);
+  shmemDispatchOutWeightsMemObj = MallocSymm(maxWeightSize, hipDeviceMallocUncached);
+  shmemCombineOutWeightsMemObj = MallocSymm(maxWeightSize, hipDeviceMallocUncached);
 
   size_t userScaleSize = 0;
   if (config.scaleDim > 0 && config.scaleTypeSize > 0) {
@@ -437,15 +433,14 @@ void EpDispatchCombineHandle::InitializeTokenNumSignalBuf() {
   size_t tokenNumSignalSize = config.worldSize * sizeof(index_t) * 2 * config.numQpPerPe;
   recvTokenNumMemObj = MallocSymm(tokenNumSignalSize, hipDeviceMallocUncached);
   sendTokenNumMemObj = MallocSymm(tokenNumSignalSize, hipDeviceMallocUncached);
-  sendAtomicSignalMemObj = MallocSymm(
-      (config.worldSize * 2) * sizeof(int64_t) * 2, hipDeviceMallocUncached);
+  sendAtomicSignalMemObj =
+      MallocSymm((config.worldSize * 2) * sizeof(int64_t) * 2, hipDeviceMallocUncached);
 
   HIP_RUNTIME_CHECK(hipMalloc(&totalRecvTokenNum, sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(totalRecvTokenNum, 0, sizeof(index_t)));
 
   size_t nodeTokenNumSignalSize = config.worldSize / config.gpuPerNode * sizeof(uint64_t);
-  nodeRecvTokenNumMemObj =
-      MallocSymm(nodeTokenNumSignalSize, hipDeviceMallocUncached);
+  nodeRecvTokenNumMemObj = MallocSymm(nodeTokenNumSignalSize, hipDeviceMallocUncached);
 }
 
 void EpDispatchCombineHandle::FinalizeTokenNumSignalBuf() {
@@ -483,8 +478,7 @@ void EpDispatchCombineHandle::InitializeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipMemset(localPeTokenCounter, 0, config.worldSize * sizeof(index_t)));
 
   dispTokOffsetMemObj = MallocSymm(sizeof(index_t), hipDeviceMallocUncached);
-  dispTokIdToSrcTokIdMemObj =
-      MallocSymm(maxNumOutToken * sizeof(index_t), hipDeviceMallocUncached);
+  dispTokIdToSrcTokIdMemObj = MallocSymm(maxNumOutToken * sizeof(index_t), hipDeviceMallocUncached);
 
   HIP_RUNTIME_CHECK(hipMalloc(&dispDestTokIdMap, maxNumOutToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(dispDestTokIdMap, 0, maxNumOutToken * sizeof(index_t)));
@@ -553,8 +547,7 @@ void EpDispatchCombineHandle::InitializeBarrier() {
 
   size_t interNodeChunkFlagSize = static_cast<size_t>(config.worldSize) / config.gpuPerNode *
                                   config.MaxNumTokensToSendPerRank() * sizeof(uint64_t);
-  interNodeChunkFlagMemObj =
-      MallocSymm(interNodeChunkFlagSize, hipDeviceMallocUncached);
+  interNodeChunkFlagMemObj = MallocSymm(interNodeChunkFlagSize, hipDeviceMallocUncached);
 
   HIP_RUNTIME_CHECK(hipMalloc(&interNodeChunkFlagCombine, interNodeChunkFlagSize));
   HIP_RUNTIME_CHECK(hipMemset(interNodeChunkFlagCombine, 0, interNodeChunkFlagSize));

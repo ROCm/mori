@@ -24,37 +24,37 @@ MORI_FP8_ANY(WRAP_BOOL4_ENTRY(EpCombineIntraNodeKernel, bf16_nop2p_fp8_blockwise
 // splitting the quantise out took it to 367.6us. intranode_entry.hpp now keeps quantization out of
 // the TDM body entirely, because 367.6us is still 2.2x bf16 (169.2us) for half the bytes, so
 // neither symbol has a caller left.
-MORI_FP8_ANY(
-    WRAP_BOOL6_ENTRY(EpCombineIntraNodeKernel, bf16_nop2p_fp8_blockwise_noweight_block128_vec8,
-                     hip_bfloat16, false, false, false, true, false, 128))
-MORI_FP8_ANY(
-    WRAP_BOOL6_ENTRY(EpCombineIntraNodeKernel, bf16_nop2p_fp8_blockwise_noweight_block256_vec8,
-                     hip_bfloat16, false, false, false, true, false, 256))
+MORI_FP8_ANY(WRAP_BOOL6_ENTRY(EpCombineIntraNodeKernel,
+                              bf16_nop2p_fp8_blockwise_noweight_block128_vec8, hip_bfloat16, false,
+                              false, false, true, false, 128))
+MORI_FP8_ANY(WRAP_BOOL6_ENTRY(EpCombineIntraNodeKernel,
+                              bf16_nop2p_fp8_blockwise_noweight_block256_vec8, hip_bfloat16, false,
+                              false, false, true, false, 256))
 // AccumNum=9 variants: shared-expert fusion routes every token through 9 sources
 // (8 routed + 1 fused shared expert, topk 8->9). Same weightless vec8 path as top8.
-MORI_FP8_ANY(
-    WRAP_BOOL7_ENTRY(EpCombineIntraNodeKernel, bf16_nop2p_fp8_blockwise_noweight_block128_vec8_top9,
-                     hip_bfloat16, false, false, false, true, false, 128, 9))
-MORI_FP8_ANY(
-    WRAP_BOOL7_ENTRY(EpCombineIntraNodeKernel, bf16_nop2p_fp8_blockwise_noweight_block256_vec8_top9,
-                     hip_bfloat16, false, false, false, true, false, 256, 9))
+MORI_FP8_ANY(WRAP_BOOL7_ENTRY(EpCombineIntraNodeKernel,
+                              bf16_nop2p_fp8_blockwise_noweight_block128_vec8_top9, hip_bfloat16,
+                              false, false, false, true, false, 128, 9))
+MORI_FP8_ANY(WRAP_BOOL7_ENTRY(EpCombineIntraNodeKernel,
+                              bf16_nop2p_fp8_blockwise_noweight_block256_vec8_top9, hip_bfloat16,
+                              false, false, false, true, false, 256, 9))
 
 // Blockwise FP4 (E2M1) combine: same as the fp8_blockwise variants but with UseFp4Combine=true (8th
 // template arg), transporting packed FP4 (0.5 byte/elem) over the shared blockwise staging path.
 MORI_FP8_ANY(WRAP_BOOL8_ENTRY(EpCombineIntraNodeKernel, bf16_nop2p_fp4_blockwise, hip_bfloat16,
                               false, false, false, true, true, 0, 8, true))
-MORI_FP8_ANY(
-    WRAP_BOOL8_ENTRY(EpCombineIntraNodeKernel, bf16_nop2p_fp4_blockwise_noweight_block128_vec8,
-                     hip_bfloat16, false, false, false, true, false, 128, 8, true))
-MORI_FP8_ANY(
-    WRAP_BOOL8_ENTRY(EpCombineIntraNodeKernel, bf16_nop2p_fp4_blockwise_noweight_block256_vec8,
-                     hip_bfloat16, false, false, false, true, false, 256, 8, true))
-MORI_FP8_ANY(
-    WRAP_BOOL8_ENTRY(EpCombineIntraNodeKernel, bf16_nop2p_fp4_blockwise_noweight_block128_vec8_top9,
-                     hip_bfloat16, false, false, false, true, false, 128, 9, true))
-MORI_FP8_ANY(
-    WRAP_BOOL8_ENTRY(EpCombineIntraNodeKernel, bf16_nop2p_fp4_blockwise_noweight_block256_vec8_top9,
-                     hip_bfloat16, false, false, false, true, false, 256, 9, true))
+MORI_FP8_ANY(WRAP_BOOL8_ENTRY(EpCombineIntraNodeKernel,
+                              bf16_nop2p_fp4_blockwise_noweight_block128_vec8, hip_bfloat16, false,
+                              false, false, true, false, 128, 8, true))
+MORI_FP8_ANY(WRAP_BOOL8_ENTRY(EpCombineIntraNodeKernel,
+                              bf16_nop2p_fp4_blockwise_noweight_block256_vec8, hip_bfloat16, false,
+                              false, false, true, false, 256, 8, true))
+MORI_FP8_ANY(WRAP_BOOL8_ENTRY(EpCombineIntraNodeKernel,
+                              bf16_nop2p_fp4_blockwise_noweight_block128_vec8_top9, hip_bfloat16,
+                              false, false, false, true, false, 128, 9, true))
+MORI_FP8_ANY(WRAP_BOOL8_ENTRY(EpCombineIntraNodeKernel,
+                              bf16_nop2p_fp4_blockwise_noweight_block256_vec8_top9, hip_bfloat16,
+                              false, false, false, true, false, 256, 9, true))
 
 // Convert (used with ENABLE_STANDARD_MOE_ADAPT)
 extern "C" __global__ void mori_ConvertDispatchOutputKernel(ConvertDispatchOutputArgs args) {

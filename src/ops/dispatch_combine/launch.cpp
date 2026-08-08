@@ -588,8 +588,8 @@ void LaunchCombine(EpDispatchCombineHandle& handle, void* input, void* weights, 
           useVec8Top8 = true;
         }
         int fp8_blockwise_smem = combine_shared_mem(wpb, handle.config.numExpertPerToken,
-                                             /*use_scale_ptrs=*/true,
-                                             /*use_weight_ptrs=*/!useVec8Top8);
+                                                    /*use_scale_ptrs=*/true,
+                                                    /*use_weight_ptrs=*/!useVec8Top8);
         reg.Launch(kernel_name, bn, block_x, fp8_blockwise_smem, stream, &args, args_size);
       } else if (args.config.useExternalInpBuffer) {
         reg.Launch(std::string("EpCombineIntraNodeKernel_") + sfx + "_nop2p", bn, block_x, smem,

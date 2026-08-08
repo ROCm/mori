@@ -77,6 +77,7 @@ def _detect_warp_size():
         pass
     return _DEFAULT_WAVE_SIZE
 
+
 # Process-global CCO communicator, reused across ops (creating one per op would
 # re-run the socket bootstrap every time). Used when _ep_comm() resolves to cco, which
 # routes the C++ EP handle's symmetric buffers through a cco LSA window instead of
@@ -99,7 +100,9 @@ def _maybe_get_cco_comm(config):
     from mori.cco import Communicator
 
     if not dist.is_initialized():
-        raise RuntimeError("MORI_EP_COMM=cco requires an initialized torch.distributed group")
+        raise RuntimeError(
+            "MORI_EP_COMM=cco requires an initialized torch.distributed group"
+        )
     # Per-rank VMM must hold every symmetric buffer this rank allocates. The
     # dispatch/combine token buffers dominate (~world * max_tok * hidden * dtype);
     # use generous headroom for the ~18 buffers + alignment slack.
@@ -1556,7 +1559,9 @@ class EpDispatchCombineOp:
                 # the fp8_blockwise variants; only the in-kernel quant/dequant math differs). Assert the
                 # derived name is a registered fp4_blockwise symbol so a naming mismatch fails loudly.
                 if quant_type == EpDispatchCombineQuantType.Fp4BlockwiseQuant:
-                    kernel_name = kernel_name.replace("_fp8_blockwise", "_fp4_blockwise")
+                    kernel_name = kernel_name.replace(
+                        "_fp8_blockwise", "_fp4_blockwise"
+                    )
                     assert (
                         kernel_name in _FP4_COMBINE_KERNELS
                     ), f"fp4_blockwise combine selected unregistered kernel '{kernel_name}'"
@@ -1926,7 +1931,12 @@ class EpDispatchCombineOp:
             mp = self._handle_info["multi_processor_count"]
             self._launch(f"EpCombineSync_{sfx}", (mp,), block, 0, stream, args_ptr)
             self._launch(
-                f"EpCombineSyncBarrier_{sfx}", (1,), (self._warp_size,), 0, stream, args_ptr
+                f"EpCombineSyncBarrier_{sfx}",
+                (1,),
+                (self._warp_size,),
+                0,
+                stream,
+                args_ptr,
             )
             self._launch(
                 f"EpCombineInterNodeV1KernelLowLatency_{sfx}_stdmoe",

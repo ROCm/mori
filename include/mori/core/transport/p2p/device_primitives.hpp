@@ -795,8 +795,7 @@ __forceinline__ __device__ void WarpAccum(T* __restrict__ dest, T* const* __rest
 // The default WarpAccumImpl only keeps AccumNum reads in flight (load-first over
 // experts, but one vec-chunk per iter); this adds the Unroll dimension.
 template <typename T, int VecBytes, int AccumNum, int Unroll>
-__forceinline__ __device__ void WarpAccumLFImpl(T* __restrict__ dest,
-                                                T* const* __restrict__ srcs,
+__forceinline__ __device__ void WarpAccumLFImpl(T* __restrict__ dest, T* const* __restrict__ srcs,
                                                 const float* __restrict__ srcScales, size_t& offset,
                                                 size_t nelems) {
   constexpr int vecSize = VecBytes / sizeof(T);
@@ -865,10 +864,10 @@ __forceinline__ __device__ void WarpAccumLF(T* __restrict__ dest, T* const* __re
                                             size_t nelems) {
   static_assert((VecBytes <= 16) && (VecBytes >= 4) && IsPowerOf2(VecBytes));
   size_t offset = 0;
-#define WARP_ACCUM_LF_CASE(AccumNum)                                                    \
-  case AccumNum:                                                                        \
-    WarpAccumLFImpl<T, VecBytes, AccumNum, WARP_ACCUM_UNROLL>(dest, srcs, srcScales,    \
-                                                             offset, nelems);           \
+#define WARP_ACCUM_LF_CASE(AccumNum)                                                         \
+  case AccumNum:                                                                             \
+    WarpAccumLFImpl<T, VecBytes, AccumNum, WARP_ACCUM_UNROLL>(dest, srcs, srcScales, offset, \
+                                                              nelems);                       \
     break;
   switch (accumNum) {
     WARP_ACCUM_LF_CASE(1)
@@ -1249,7 +1248,8 @@ __device__ __forceinline__ void WarpQuantizeBf16ToFp8BlockwiseVec(
       int bases[kU];
 #pragma unroll
       for (int u = 0; u < kU; ++u) {
-        bases[u] = (sbStart + u * kSubwarpsPerWarp + subWarpId) * blockElems + subLaneId * kVecElems;
+        bases[u] =
+            (sbStart + u * kSubwarpsPerWarp + subWarpId) * blockElems + subLaneId * kVecElems;
         cached[u] = load<InVecBytes>(srcToken + bases[u]);
       }
 #pragma unroll

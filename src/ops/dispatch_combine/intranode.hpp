@@ -113,7 +113,10 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   __shared__ index_t s_run[kMaxNpes];   // block-local running distribution index
 
   // ---- Phase 1: block-local count committed tokens per destPe (+ drop sentinels) ----
-  for (int p = thdId; p < npes; p += blockDim.x) { s_N[p] = 0; s_run[p] = 0; }
+  for (int p = thdId; p < npes; p += blockDim.x) {
+    s_N[p] = 0;
+    s_run[p] = 0;
+  }
   __syncthreads();
   if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
     for (int i = globalWarpId; i < Npair; i += globalWarpNum) {
@@ -145,9 +148,8 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   // ---- Phase 2: reserve N contiguous slots per destPe with ONE remote atomic each ----
   for (int p = thdId; p < npes; p += blockDim.x) {
     if (s_N[p] > 0) {
-      s_base[p] = __hip_atomic_fetch_add(
-          args.dispTokOffsetMemObj->template GetAs<index_t*>(p), s_N[p], __ATOMIC_RELAXED,
-          __HIP_MEMORY_SCOPE_SYSTEM);
+      s_base[p] = __hip_atomic_fetch_add(args.dispTokOffsetMemObj->template GetAs<index_t*>(p),
+                                         s_N[p], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
       atomicAdd(args.destPeTokenCounter + p, s_N[p]);
     }
   }
@@ -170,7 +172,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 
       index_t destTokId = 0;
       if (laneId == 0) {
-        index_t j = atomicAdd(&s_run[destPe], 1);       // fast LDS slot (was remote)
+        index_t j = atomicAdd(&s_run[destPe], 1);  // fast LDS slot (was remote)
         destTokId = s_base[destPe] + j;
         args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, destTokId);
         args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
