@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
 # EP intra-node dispatch/combine bench driver (A/B by gate set, "deletion method").
 #
-# Runs tests/python/ops/bench_dispatch_combine.py once per SPEC and prints one aligned row per spec
-# with BOTH phases' latency and bandwidth.
+# Drives tests/python/ops/bench_dispatch_combine.py and prints a token sweep, three columns wide:
+#
+#   tokens/rank   dispatch                combine PUSH ZC=0       combine PULL ZC=1
+#                 GB/s (lat us)           GB/s (lat us)           GB/s (lat us)
+#            64   38.3 (90.3)             97.7 (33.7)             126.6 (26.0)
+#           ...
+#
+# Two runs per row, one per transport; dispatch is read off the PUSH run because ZC does not touch
+# that phase. Nine token counts by default, so a default invocation is ~18 bench runs and takes
+# roughly a quarter of an hour -- TOKS=4096 for a single row.
 #
 # Run it INSIDE the container, from anywhere, with no arguments:
 #   ./tools/ep_test.sh
 # It finds the repo from its own path, so there is nothing to configure to get a first number. Every
-# knob below is an optional override, and the defaults are the 64x8 bf16 EP4 PUSH case.
+# knob below is an optional override, and with none of them set this measures WHAT SHIPS: bf16 EP4
+# at whatever geometry the library picks for itself.
 #
 # Why deletion method rather than the in-kernel TIMING buckets: [CSPLIT] is per-warp max with no
 # __syncthreads at either end, so it systematically understates a phase's wall clock (cPush reads
@@ -17,17 +26,21 @@
 # Optional overrides:
 #   SPECS="tag=GATES; tag2=GATES2"   one run per spec; MORI_BENCH_SKIPCHECK=1 unless tag ends in '!'
 #   tag ending in '!'                run this spec WITH the correctness check (rc=0 is the pass)
-#   CBN/CWPB/DBN/DWPB                geometry; DBN/DWPB accept SAME to follow the combine values
+#   CBN/CWPB/DBN/DWPB                geometry; unset sends 0, which is how you ask the library for
+#                                    its own per-body default, i.e. what ships (see run() below).
+#                                    DBN/DWPB accept SAME to follow the combine values
 #   CBNS="64 128 256"                sweep combine block count, running every spec at each
 #   BASE                             gates shared by every spec
 #   WS                               peer count
-#   ZC                               0 = PUSH (_nop2p), 1 = PULL (_p2p, cross-card read)
+#   TOKS="4096 8192" / MAXTOK=4096   which token counts make up the rows
+#   ZCS                              which combine columns to fill: "0 1" (default), "0", or "1"
 #   QT                               none / fp8_blockwise / fp8_direct_cast
 # Examples:
 #   ./tools/ep_test.sh
-#   ZC=1 ./tools/ep_test.sh
+#   TOKS=4096 ./tools/ep_test.sh
+#   ZCS=1 ./tools/ep_test.sh
 #   SPECS="full=; nopush=MORI_COMB_NOPUSH=1" CBNS="64 128" ./tools/ep_test.sh
-#   SPECS="check!=" ZC=1 ./tools/ep_test.sh
+#   SPECS="check!=" TOKS="4096 16384" ./tools/ep_test.sh
 # From the node, without giving this script any docker knowledge of its own:
 #   docker exec MORI-EPV2 bash -lc 'cd /root/mori_tdm && ./tools/ep_test.sh'
 set -uo pipefail
@@ -49,17 +62,28 @@ if command -v flock >/dev/null 2>&1; then
   fi
   echo $$ > /tmp/ep_test.pid
 fi
-CBN="${CBN:-64}"        # single value; use CBNS to sweep
-CBNS="${CBNS:-}"        # non-empty: run every spec once per block count (diagnostic; default is 64x8)
-CWPB="${CWPB:-8}"
-DBN="${DBN:-64}"        # SAME = follow the combine block count being swept (per-row geometry)
-DWPB="${DWPB:-8}"       # SAME = follow CWPB
+# Geometry. Empty means no opinion, which run() spells as an explicit 0 so _resolve_launch_params
+# falls through to the per-body default, which IS the shipping configuration. This used to force 64x8 on
+# both phases, and because an explicit value outranks the per-body default, the headline number was
+# a geometry that ships to nobody: gfx125x combine defaults to 64x16 for PUSH (64x8 only for PULL,
+# where 16 warps want 458KB against a 320KB budget), and every non-gfx125x arch defaults to 256x16
+# for dispatch. Forcing 8 warps on a PUSH run reads 234.7us where the shipping default reads ~193.
+# Deferring also keeps the ZC=0/ZC=1 width pairing out of the caller's memory, which is where the
+# rest of this script tries to keep such things.
+CBN="${CBN:-}"          # single value; use CBNS to sweep
+CBNS="${CBNS:-}"        # non-empty: run every spec once per block count (diagnostic)
+CWPB="${CWPB:-}"
+DBN="${DBN:-}"          # SAME = follow the combine block count being swept (per-row geometry)
+DWPB="${DWPB:-}"        # SAME = follow CWPB
+g() { [ -n "$1" ] && printf '%s' "$1" || printf 'lib'; }   # 'lib' = deferred to the library
 WS="${WS:-4}"           # peer count; 2 is the case where round-robin has the least imbalance to recover
-ZC="${ZC:-0}"           # who owns the combine input buffer: 0 = the caller, 1 = mori.
-                        # It means exactly "PUSH or PULL" again. For a while on gfx125x it did not:
-                        # ZC=0 staged the caller-owned buffer into the registered one and pulled
-                        # anyway, and MORI_COMB_PULL=off was how you got the PUSH transport back.
-                        # That route and the knob are gone (bed30dcf), so ZC=0 always takes _nop2p.
+# Which combine transports to put in the table. Both by default, because the interesting quantity is
+# the gap between them, not either alone. ZC is who owns the combine input buffer: 0 = the caller
+# (PUSH, _nop2p), 1 = mori (PULL, _p2p, cross-card read). It means exactly "PUSH or PULL" again --
+# for a while on gfx125x it did not, because ZC=0 staged the caller-owned buffer into the registered
+# one and pulled anyway, and MORI_COMB_PULL=off was how you got the PUSH transport back. That route
+# and the knob are gone (bed30dcf). ZC=0 or ZC=1 alone still works and leaves the other column empty.
+ZCS="${ZCS:-${ZC:-0 1}}"
 QT="${QT:-none}"        # none / fp8_blockwise / fp8_direct_cast; blockwise only pairs with ZC=0
 # BARSLEEP is deliberately NOT set here. It used to default to 127 in this script, which silently
 # overrode the library's own default of 15 (jit/core.py) and cost 2.2us on every PULL reading:
@@ -73,11 +97,13 @@ QT="${QT:-none}"        # none / fp8_blockwise / fp8_direct_cast; blockwise only
 # at both EP2 and EP4), so there is nothing left to pass. Anything set here applies to every spec.
 BASE="${BASE:-}"
 SPECS="${SPECS:-full=}"
-# Tokens per rank. 4096 is the default every recorded number on this tree was taken at, so leaving
-# it unset reproduces them exactly; it is a variable only so the payload can be swept. Note the
-# headline GB/s stays honest across the sweep because the printer takes the bench's OWN bw field
-# rather than dividing a hardcoded 212.3 MB, and that payload is proportional to this.
-MAXTOK="${MAXTOK:-4096}"
+# Tokens per rank, swept. The whole curve is the deliverable: both transports change rank with size
+# (PULL wins throughout, and PUSH used to collapse past 8192 until the tile fix), so a single point
+# invites reading a crossover that is not there. 4096 is the point every older recorded number on
+# this tree was taken at. MAXTOK=<n> still pins it to one column's worth of work.
+# The headline GB/s stays honest across the sweep because the printer takes the bench's OWN bw field
+# rather than dividing a hardcoded 212.3 MB, and that payload is proportional to the token count.
+TOKS="${TOKS:-${MAXTOK:-64 128 256 512 1024 2048 4096 8192 16384}}"
 
 # Printed so a number is attributable to a tree. Deploying by copying files in used to make this
 # unknowable, and it cost a wrong conclusion: a recheck once compiled a file the copy had never
@@ -127,10 +153,12 @@ idle() {
 # filesystem, which survives a host reboot, and a line without a matching "done" names the suspect.
 CRUMB="$SRC/.ep_test_last"
 crumb() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >> "$CRUMB" 2>/dev/null; sync 2>/dev/null; }
-crumb "sweep start geometry=${CBNS:-$CBN}x$CWPB WS=$WS ZC=$ZC QT=$QT maxtok=$MAXTOK"
+crumb "sweep start geometry=$(g "${CBNS:-$CBN}")x$(g "$CWPB") WS=$WS ZCS='$ZCS' QT=$QT toks='$TOKS'"
 
 P=$(( 37000 + RANDOM % 900 ))
-run() { # $1=tag  $2=gates  $3=1 means run WITH the correctness check
+# Leaves the reading in R_RC / R_CLAT / R_CBW / R_DLAT / R_DBW rather than printing it, because one
+# table row is assembled from two runs (PUSH and PULL) and cannot be printed until both are in.
+run() { # $1=tag  $2=gates  $3=1 means run WITH the correctness check  $4=tokens  $5=zero-copy
   pkill -9 -f bench_dispatch_combine 2>/dev/null; pkill -9 -f spawn_main 2>/dev/null
   sleep 4; idle
   crumb "run  $1  gates='$2'"
@@ -138,14 +166,22 @@ run() { # $1=tag  $2=gates  $3=1 means run WITH the correctness check
   local sk=MORI_BENCH_SKIPCHECK=1; [ "${3:-0}" = 1 ] && sk=MORI_BENCH_SKIPCHECK=0
   local db=$DBN; [ "$db" = SAME ] && db=$CB
   local dw=$DWPB; [ "$dw" = SAME ] && dw=$CWPB
+  # "No opinion" is the literal value 0, NOT an absent flag. _resolve_launch_params treats bn/wpb
+  # <= 0 as "apply the per-body default", which is the shipping geometry; but an ABSENT flag never
+  # reaches it, because the bench substitutes _get_default_launch_config() first and then passes
+  # that as an explicit value. That table is a gfx942/FlyDSL artefact and is wrong here twice over:
+  # at WS<=4, maxtok>128 it hands ZC=0 a 768x8 dispatch with a 256x14 combine, and hands ZC=1 a
+  # 192x32 dispatch -- 32 warps is 32*7168*2 = 458,752B of LDS against a 327,680B budget, so the
+  # ZC=1 column does not read slow, it dies on hipModuleLaunchKernel with HIP error 1.
+  local geo="--combine-block-num ${CB:-0} --combine-warp-per-block ${CWPB:-0}"
+  geo="$geo --dispatch-block-num ${db:-0} --dispatch-warp-per-block ${dw:-0}"
   local log=/tmp/ep_test_$1.log
   env $sk $BASE $2 MASTER_PORT=$P \
     timeout 900 python3 tests/python/ops/bench_dispatch_combine.py \
-    --cmd bench --world-size "$WS" --dtype bf16 --max-tokens "$MAXTOK" --hidden-dim 7168 \
-    --num-experts-per-rank 64 --num-experts-per-token 8 --zero-copy "$ZC" --quant-type "$QT" \
-    --dispatch-block-num "$db" --dispatch-warp-per-block "$dw" \
-    --combine-block-num "$CB" --combine-warp-per-block "$CWPB" > "$log" 2>&1
-  local rc=$?
+    --cmd bench --world-size "$WS" --dtype bf16 --max-tokens "$4" --hidden-dim 7168 \
+    --num-experts-per-rank 64 --num-experts-per-token 8 --zero-copy "$5" --quant-type "$QT" \
+    $geo > "$log" 2>&1
+  R_RC=$?
   # Take the bench's OWN bw field. This used to recompute 202.47MB/lat, which understated every
   # number this script ever printed by exactly 4.86%: the bench used to print that payload through
   # 1024**2 while labelling it MB, so 202.47 was MiB and the real figure is 212.3 MB -- the same
@@ -158,16 +194,31 @@ run() { # $1=tag  $2=gates  $3=1 means run WITH the correctness check
        /^Round [0-9]+ duration/&&c{n++;for(i=1;i<=NF;i++)if($i==fld)s+=$(i+1)}
        END{if(n)printf "%.1f",s/n; else print "NA"}' "$log"
   }
-  crumb "done $1  rc=$rc"
-  printf "  %-18s rc=%-3s combine=%8s us (%7s GB/s)  disp=%7s us (%7s GB/s)\n" \
-    "$1" "$rc" "$(avg Combine lat)" "$(avg Combine bw)" "$(avg Dispatch lat)" "$(avg Dispatch bw)"
-  grep -oE "AssertionError|Memory access fault.*|HSA_STATUS[A-Z_]*|LDS.*exceed.*|out of memory|invalid configuration|dispatch metadata staging holds.*" "$log" | head -2 | sed 's/^/       /'
-  grep -oE "\[BENCHW\].*|Weight mismatch for token [0-9]+" "$log" | head -3 | sed 's/^/       /'
+  R_CLAT=$(avg Combine lat); R_CBW=$(avg Combine bw)
+  R_DLAT=$(avg Dispatch lat); R_DBW=$(avg Dispatch bw)
+  crumb "done $1  rc=$R_RC"
+  # Tagged and out of band so a clean sweep prints nothing but the table, and a dirty one still
+  # says which cell went wrong.
+  grep -oE "AssertionError|Memory access fault.*|HSA_STATUS[A-Z_]*|LDS.*exceed.*|out of memory|invalid configuration|dispatch metadata staging holds.*" "$log" | head -2 | sed "s|^|## $1: |"
+  grep -oE "\[BENCHW\].*|Weight mismatch for token [0-9]+" "$log" | head -3 | sed "s|^|## $1: |"
 }
 
-echo "## geometry comb <cbn>x${CWPB}  disp ${DBN}x${DWPB}  WS=$WS  ZC=$ZC  QT=$QT  BASE='$BASE'"
-for CB in ${CBNS:-$CBN}; do
-  echo "## --- combine block = $CB ---"
+cell() { # $1=bw $2=lat $3=rc -- one table cell. A failure has to be visible as a failure, not as a
+         # plausible number, so it replaces the reading rather than sitting beside it.
+  [ "${3:-0}" != 0 ] && { printf 'FAIL rc=%s' "$3"; return; }
+  [ "$1" = NA ] && { printf 'no rounds parsed'; return; }
+  printf '%s (%s)' "$1" "$2"
+}
+ROW='%11s   %-21s %-21s %-21s\n'
+
+cbs="${CBNS:-$CBN}"; case "$cbs" in *' '*) cbs="[$cbs]";; esac   # a swept list, not one block count
+echo "## geometry comb $(g "$cbs")x$(g "$CWPB")  disp $(g "$DBN")x$(g "$DWPB")" \
+     " WS=$WS  QT=$QT  BASE='$BASE'   (lib = the library's own default, i.e. what ships)"
+# A '-' placeholder so the loop still runs exactly once when no block count was asked for; an empty
+# list would iterate zero times and the script would silently do nothing.
+CBLIST="${CBNS:-$CBN}"; [ -z "$CBLIST" ] && CBLIST='-'
+for CB in $CBLIST; do
+  [ "$CB" = '-' ] && CB=''
   OLDIFS=$IFS; IFS=';'
   for sp in $SPECS; do
     IFS=$OLDIFS
@@ -175,7 +226,23 @@ for CB in ${CBNS:-$CBN}; do
     [ -z "$sp" ] && { IFS=';'; continue; }
     tag="${sp%%=*}"; gates="${sp#*=}"
     chk=0; case "$tag" in *!) chk=1; tag="${tag%!}";; esac
-    run "${tag}_b$CB" "$gates" "$chk"
+    ck=off; [ "$chk" = 1 ] && ck=armed
+    echo "## --- spec '$tag'  gates='$gates'  comb block $(g "$CB")  check $ck ---"
+    # shellcheck disable=SC2059
+    printf "$ROW" 'tokens/rank' 'dispatch' 'combine PUSH ZC=0' 'combine PULL ZC=1'
+    printf "$ROW" ''            'GB/s (lat us)' 'GB/s (lat us)' 'GB/s (lat us)'
+    for T in $TOKS; do
+      dcell='-'; pcell='-'; lcell='-'
+      for z in $ZCS; do
+        run "${tag}_t${T}_zc${z}_b$(g "$CB")" "$gates" "$chk" "$T" "$z"
+        if [ "$z" = 0 ]; then pcell="$(cell "$R_CBW" "$R_CLAT" "$R_RC")"
+                         else lcell="$(cell "$R_CBW" "$R_CLAT" "$R_RC")"; fi
+        # ZC picks the combine transport and does not touch dispatch, so the dispatch column comes
+        # from the PUSH run; the fallback only matters when PUSH was not asked for at all.
+        { [ "$z" = 0 ] || [ "$dcell" = '-' ]; } && dcell="$(cell "$R_DBW" "$R_DLAT" "$R_RC")"
+      done
+      printf "$ROW" "$T" "$dcell" "$pcell" "$lcell"
+    done
     IFS=';'
   done
   IFS=$OLDIFS
