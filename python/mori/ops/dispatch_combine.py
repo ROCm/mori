@@ -465,9 +465,14 @@ class EpDispatchCombineOp:
                     f"instead on this device."
                 )
 
-        # Dispatch metadata staging capacity. The scratch in intranode_1250x.hpp is a fixed pool
-        # (CUSPLIT_POOL_SLOTS) split by world_size at runtime, and destTokId spans the destination
-        # peer's WHOLE recv space, so the slice has to cover MaxNumTokensToRecv().
+        # Dispatch metadata staging capacity, gfx125x only. The scratch in intranode_1250x.hpp is a
+        # fixed pool (CUSPLIT_POOL_SLOTS) split by world_size at runtime, and destTokId spans the
+        # destination peer's WHOLE recv space, so the slice has to cover MaxNumTokensToRecv().
+        #
+        # The arch gate matters: the portable dispatch body has no such pool -- it indexes
+        # dispTokIdToSrcTokId, which is allocated for MaxNumTokensToRecv() outright -- so without it
+        # this rejects configs the other archs serve fine. Ungated, it failed the world_size=8
+        # 65536-token/rank intranode test on gfx950.
         #
         # Checked here rather than on the device because an over-capacity config has no correct
         # device-side answer -- the kernel can only drop the metadata -- and because it used to be
@@ -479,7 +484,10 @@ class EpDispatchCombineOp:
         #
         # Keep CUSPLIT_POOL_SLOTS in sync with the .hpp. Drifting high here only over-restricts,
         # which fails closed.
-        if config.kernel_type == EpDispatchCombineKernelType.IntraNode:
+        if (
+            config.kernel_type == EpDispatchCombineKernelType.IntraNode
+            and _is_gfx125x()
+        ):
             _cusplit_pool_slots = 8 * 32768
             _slots_per_peer = _cusplit_pool_slots // max(config.world_size, 1)
             if config.max_total_recv_tokens > 0:
