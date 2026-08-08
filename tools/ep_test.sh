@@ -168,12 +168,13 @@ run() { # $1=tag  $2=tokens  $3=zero-copy
   local db=$DBN; [ "$db" = SAME ] && db=$CB
   local dw=$DWPB; [ "$dw" = SAME ] && dw=$CWPB
   # "No opinion" is the literal value 0, NOT an absent flag. _resolve_launch_params treats bn/wpb
-  # <= 0 as "apply the per-body default", which is the shipping geometry; but an ABSENT flag never
-  # reaches it, because the bench substitutes _get_default_launch_config() first and then passes
-  # that as an explicit value. That table is a gfx942/FlyDSL artefact and is wrong here twice over:
-  # at WS<=4, maxtok>128 it hands ZC=0 a 768x8 dispatch with a 256x14 combine, and hands ZC=1 a
-  # 192x32 dispatch -- 32 warps is 32*7168*2 = 458,752B of LDS against a 327,680B budget, so the
-  # ZC=1 column does not read slow, it dies on hipModuleLaunchKernel with HIP error 1.
+  # <= 0 as "apply the per-body default", which is the shipping geometry; an ABSENT flag goes to the
+  # bench's own _get_default_launch_config() first, and whatever that returns is passed down as an
+  # explicit value. Those agree on gfx125x now -- the table defers there too -- so this is belt and
+  # braces rather than a workaround. It stays because what this script reports has to be the
+  # shipping geometry whether or not a bench-side table is doing the right thing that week: the
+  # table used to hand ZC=1 a 32-warp dispatch, 32*7168*2 = 458,752B against a 327,680B budget, and
+  # that column did not read slow, it died on hipModuleLaunchKernel.
   local geo="--combine-block-num ${CB:-0} --combine-warp-per-block ${CWPB:-0}"
   geo="$geo --dispatch-block-num ${db:-0} --dispatch-warp-per-block ${dw:-0}"
   local log=/tmp/ep_test_$1.log
