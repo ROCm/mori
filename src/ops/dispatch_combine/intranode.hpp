@@ -237,33 +237,6 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 }
 
 /* ---------------------------------------------------------------------------------------------- */
-/*                               EpCombineQuantizeInputKernel (pre-pass)                          */
-/* ---------------------------------------------------------------------------------------------- */
-template <typename T>
-__device__ __forceinline__ void EpCombineQuantizeInputKernel_body(EpDispatchCombineArgs<T> args) {
-  using Fp8T = core::CombineInternalFp8;
-  const index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
-  if (totalRecvTokenNum <= 0) return;
-  const size_t hiddenDim = args.config.HiddenDimSz();
-  const int scaleDim = args.fp8BlockwiseCombineScaleDim;
-  const int warpNum = blockDim.x / warpSize;
-  const int warpId = threadIdx.x / warpSize;
-  const int globalWarpId = blockIdx.x * warpNum + warpId;
-  const int globalWarpNum = gridDim.x * warpNum;
-  Fp8T* dstBase = args.intraNodeTokBufs.combineInp->template GetAs<Fp8T*>();
-  float* scaleBase = args.shmemInpScalesMemObj->template GetAs<float*>();
-  for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
-    core::WarpQuantizeToFp8Blockwise<Fp8T>(dstBase + (size_t)i * hiddenDim,
-                                           scaleBase + (size_t)i * scaleDim,
-                                           args.inpTokenBuf + (size_t)i * hiddenDim, hiddenDim,
-                                           scaleDim);
-  }
-  // One release per thread before it exits, so the bytes are visible to ANOTHER CARD and not just
-  // to the next kernel on this one.
-  __threadfence_system();
-}
-
-/* ---------------------------------------------------------------------------------------------- */
 /*                                    EpCombineIntraNodeKernel                                    */
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,

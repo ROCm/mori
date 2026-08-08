@@ -148,30 +148,6 @@ _QUANT_TYPE_MAP = {
 # Blockwise combine quant types share the staging/scale layout and kernel launch config; only the
 # element codec (and staging slot size) differ, so kernel selection treats them together and then
 # swaps the codec token (fp8_blockwise <-> fp4_blockwise) in the kernel name.
-def _comb_qpull() -> bool:
-    """Whether blockwise combine moves its bytes by PULL gather rather than PUSH staging.
-
-    gfx125x defaults to PULL, every other arch keeps PUSH, and MORI_COMB_QPULL wins either way.
-
-    The two differ only in who carries the bytes, not in what is computed. PUSH has the producer
-    quantise straight into the peer's staging slot, which is a per-lane cross-card scatter that
-    cannot use a TDM bulk store. PULL has it quantise into its own buffer and lets each consumer
-    read peer fp8 plus scales in bulk. MEASURED 64x8 EP4 bf16 fp8_blockwise, correctness check
-    armed, rc=0 on both: PUSH 3646.2us / 58.3 GB/s against PULL 1410.9us / 150.5 GB/s.
-
-    Chunk count is not part of the win and the recorded 1466.4us figure misattributed it:
-    MORI_COMB_TDM=4 on its own moves nothing (3651.7us against 3646.2us), and on top of PULL it
-    COSTS 3.9% (1466.7us against 1410.9us). PULL at the default chunk count is the fast one.
-
-    PULL gives up the weightless top8/top9 vec8 kernels, which have no _p2p variant. That is free at
-    EP4, where those need worldSize > 4 to be eligible at all, and is NOT measured above it.
-    """
-    val = os.environ.get("MORI_COMB_QPULL", "").strip().lower()
-    if val:
-        return val in ("1", "true", "on", "yes")
-    return _is_gfx125x()
-
-
 def _comb_pull_mode() -> str:
     """How a CALLER-OWNED (use_external_inp_buf) combine input reaches the PULL gather.
 
@@ -240,46 +216,6 @@ def _comb_pull_default() -> str:
     registered buffer. This is only about the caller who cannot.
     """
     return "off"
-
-
-def _comb_env_int(name: str, default: int) -> int:
-    val = os.environ.get(name, "").strip()
-    if val.isdigit() and int(val) > 0:
-        return int(val)
-    return default
-
-
-def _comb_qpre_mode() -> str:
-    """Whether the blockwise quantise pass runs as its OWN kernel before the combine kernel.
-
-    This is the blockwise counterpart of _comb_pull_mode()="host", and it is here for the same
-    reason: staging and gathering want different launch widths, and one fused kernel can only have
-    one. The gather is bound by peer reads in flight and by the LDS its tiles need; the quantise is
-    a pure local stream over the caller's bf16 with no cross-card edge in it at all. Fusing them
-    made one width serve both. MEASURED EP4 fp8_blockwise, check armed, rc=0 on every row:
-
-        inline, combine 64x8                        1011.3us
-        split, pre 256x8, combine 64x8               856.4
-        split, pre 256x8, combine 256x8              428.2
-        split, pre 256x8, combine 256x16             367.6
-        bf16 zero-copy PULL 64x8 (the bar)           169.2   / 1254.7 GB/s
-
-    Only the PULL blockwise path can use it: PUSH quantises straight into the peer's slot, which is
-    the transport itself and not a separable pass.
-
-      "on"  / 1  -- launch it.
-      "off" / 0  -- keep the pass inside the combine kernel.
-
-    MORI_COMB_QPRE_BN and MORI_COMB_QPRE_WPB set the pre-pass geometry (default: 4 blocks per CU,
-    8 warps each). MEASURED at combine 64x8, pre-grid alone moving: 1024x8 1143.5us, 512x8 940.7,
-    128x8 876.0, 512x4 860.4, 256x8 856.4.
-    """
-    val = os.environ.get("MORI_COMB_QPRE", "").strip().lower()
-    if val in ("1", "true", "on", "yes"):
-        return "on"
-    if val in ("0", "false", "no", "off"):
-        return "off"
-    return "on" if _is_gfx125x() else "off"
 
 
 _BLOCKWISE_COMBINE_QUANT_TYPES = (
@@ -956,38 +892,26 @@ class EpDispatchCombineOp:
         # staged then TDM-stored to the peer); False -> _p2p -> PULL (one tile per source, all topk
         # loads issued before the wait).
         #
-        # Blockwise-quant combine is excluded because the kernel gates TDM on
-        # !UseFp8BlockwiseQuant -- allocating a tile there would only shrink occupancy, and could
-        # trip the budget check below on a configuration that never runs TDM at all.
+        # Blockwise-quant combine is excluded, and this is a layout requirement rather than a
+        # tuning choice: intranode_entry.hpp sends every quantizing instantiation to the portable
+        # body, which has no LDS tiles at all. Reserving them here would shrink occupancy for
+        # nothing and could trip the budget check below on a kernel that never had a tile.
         #
         # MORI_COMB_TDM in intranode_1250x.hpp, the chunk count. Reserving for the tiles requires
         # knowing whether the device compiled them at all, which is the arch test in
         # intranode_entry.hpp and nothing else -- see _is_gfx125x for why all three host-side
         # answers come from one place.
         chunks = 2 if _is_gfx125x() else 0
-        # ...that exclusion held only while blockwise was PUSH-only. Under MORI_COMB_QPULL the
-        # kernel runs _p2p and _cPullBwq lets blockwise onto the tile path, so the tiles have to be
-        # reserved here or _cPullOk fails its budget check and silently drops back to the lane
-        # gather -- the slow thing this is meant to remove.
-        _qpull_bwq = _comb_qpull() and (
-            quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant
-        )
-        if chunks and (quant_type not in _BLOCKWISE_COMBINE_QUANT_TYPES or _qpull_bwq):
-            # The tile holds TokT, which is 1-byte fp8 under blockwise rather than the token dtype,
-            # so both the row width and the byte total below follow sizeof(TokT). Mirrors
-            # _cPullRowElems = 128 / sizeof(TokT).
-            elem = 1 if _qpull_bwq else int(self.config.max_token_type_size)
+        if chunks and quant_type not in _BLOCKWISE_COMBINE_QUANT_TYPES:
+            elem = int(self.config.max_token_type_size)
             row_elems = 128 // elem
             hidden = int(self.config.hidden_dim)
             topk = int(self.config.num_experts_per_token)
             world = int(self.config.world_size)
-            # _qpull_bwq keeps use_external_inp_buf True (that is what makes the kernel quantise
-            # locally) while compiling UseP2PRead=true, so the transport here follows the KERNEL,
-            # not the buffer flag. This is the one case where the two disagree.
-            # force_pull is the same disagreement as _qpull_bwq from the other direction: the
+            # force_pull is the one case where the buffer flag and the transport disagree: the
             # caller owns the input buffer but its bytes were staged into the registered one
             # before launch, so the kernel is a _p2p kernel and needs PULL tiles.
-            if self.config.use_external_inp_buf and not _qpull_bwq and not force_pull:
+            if self.config.use_external_inp_buf and not force_pull:
                 # PUSH never splits a token and never holds more than one: one warp sends one whole
                 # token to its one destination PE, so the tile is exactly hiddenDim elements and
                 # MORI_COMB_TDM only gates TDM on/off there.
@@ -1008,15 +932,9 @@ class EpDispatchCombineOp:
                 # instead of one per source. It gets _QUAD_DEPTH of them, each a whole token:
                 # D*hidden*elem*wpb bytes buy D-1 reads in flight at hidden*elem bytes each.
                 #
-                # QUAD serves blockwise too (the kernel gate takes _cPullBwq), and `elem` above is
-                # already 1 there, so the tiles reserved here are the fp8 ones the kernel lays out.
-                # Getting this wrong in either direction is a silent layout mismatch, not a slowdown:
-                # host and kernel must agree on the tile size to the byte -- which is why the depth-4
-                # floor below is repeated from intranode_1250x.hpp rather than assumed. See there
-                # for why blockwise refuses depth 2 (wrong results, cause not yet found).
+                # Getting this wrong in either direction is a silent layout mismatch, not a
+                # slowdown: host and kernel must agree on the tile size to the byte.
                 _qd = _QUAD_DEPTH if chunks else 0
-                if _qpull_bwq and _qd < 4:
-                    _qd = 0
                 if _qd >= 2:
                     tile_elems = hidden
                     tiles_per_warp = _qd
@@ -1051,13 +969,13 @@ class EpDispatchCombineOp:
             total = ((base + 127) & ~127) + tile_bytes
             if total <= _COMB_LDS_BUDGET:
                 base = total
-            elif self.config.use_external_inp_buf and not _qpull_bwq and not force_pull:
+            elif self.config.use_external_inp_buf and not force_pull:
                 # PUSH has no fallback in the kernel -- its fold aliases the send tile rather than
-                # allocating one -- so an overflow there is fatal. The buffer flag alone does not mean
-                # PUSH: under _qpull_bwq and force_pull the caller owns the input while the kernel
-                # compiled is _p2p, and _cPullOk there declines the tiles and gathers without them.
-                # Raising on those turned a fallback into a crash, which is how a 16-warp PULL with
-                # two tile sets per warp behaves -- 458 KB of tiles against a 320 KB budget.
+                # allocating one -- so an overflow there is fatal. The buffer flag alone does not
+                # mean PUSH: under force_pull the caller owns the input while the kernel compiled
+                # is _p2p, and _cPullOk there declines the tiles and gathers without them. Raising
+                # on that turned a fallback into a crash, which is how a 16-warp PULL with two tile
+                # sets per warp behaves -- 458 KB of tiles against a 320 KB budget.
                 raise ValueError(
                     f"The combine TDM push needs {total} B of LDS "
                     f"(warp_per_block={warp_per_block}, tiles/warp={tiles_per_warp}, "
@@ -1544,8 +1462,8 @@ class EpDispatchCombineOp:
         # The stream orders the copy before the launch, so the kernel's existing producer/consumer
         # barrier remains the only cross-card edge -- exactly the situation true zero copy is in,
         # which is why this inherits its correctness rather than needing a new argument for it.
-        # Restricted to unquantised intranode combine: blockwise reaches PULL through
-        # _comb_qpull instead, and fp8_direct_cast has no _p2p kernel to fall into.
+        # Restricted to unquantised intranode combine: no quantizing combine has a _p2p kernel
+        # to fall into on gfx125x any more.
         force_pull = False
         if (
             actual_use_ext
@@ -1570,22 +1488,8 @@ class EpDispatchCombineOp:
             elif _pm == "kernel":
                 # The buffer flag stays set -- that is what makes the kernel run its own staging
                 # arm -- while the kernel compiled is the PULL one, so the transport follows the
-                # kernel and not the flag. Same disagreement _qpull_bwq already relies on.
+                # kernel and not the flag.
                 force_pull = True
-        # Blockwise PULL: run the quantise pass as its own kernel and tell the combine kernel the
-        # input buffer is no longer external, which is the one flag its staging arm reads. Decided
-        # here rather than at the launch below because the flag has to reach build_args.
-        qpre_mode = _comb_qpre_mode()
-        qpre = (
-            qpre_mode != "off"
-            and actual_use_ext
-            and self.config.kernel_type.value
-            == EpDispatchCombineKernelType.IntraNode.value
-            and _normalize_quant_type(self.config.quant_type)
-            == EpDispatchCombineQuantType.Fp8BlockwiseQuant
-            and _comb_qpull()
-        )
-        kernel_ext_flag = 0 if qpre else use_external_inp_buf
         cur_n = (
             self._routing_source_token_count(routing)
             if routing is not None
@@ -1599,7 +1503,6 @@ class EpDispatchCombineOp:
         is_push = bool(
             actual_use_ext
             and not force_pull
-            and not qpre
             and self.config.kernel_type.value
             == EpDispatchCombineKernelType.IntraNode.value
             and _normalize_quant_type(self.config.quant_type)
@@ -1638,14 +1541,14 @@ class EpDispatchCombineOp:
                 rdma_block_num=actual_rbn,
                 hidden_dim=hidden_dim,
                 replay_mode=False,
-                use_external_inp_buf=kernel_ext_flag,
+                use_external_inp_buf=use_external_inp_buf,
             )
         else:
             args_ptr = mori_cpp.build_args(
                 self._handle,
                 rdma_block_num=actual_rbn,
                 hidden_dim=hidden_dim,
-                use_external_inp_buf=kernel_ext_flag,
+                use_external_inp_buf=use_external_inp_buf,
             )
 
         grid = (actual_bn,)
@@ -1746,24 +1649,14 @@ class EpDispatchCombineOp:
                     and self.config.world_size > 4
                 )
                 top9 = self.config.num_experts_per_token == 9
-                # PULL, the gfx125x default (_comb_qpull), routes blockwise over the gather instead
-                # of the PUSH staging. useExternalInpBuffer stays true either way -- that is what
-                # makes the kernel quantise into its own combineInp rather than expecting bf16
-                # already there -- so this only swaps which half of the kernel moves the bytes.
-                # It costs the weightless top8/top9 vec8 kernels below, which have no _p2p variant;
-                # they need worldSize > 4 to be eligible, so at EP4 there is nothing to give up.
-                # fp4 is excluded: the kernel's _cPullBwq gate refuses UseFp4Combine (packed 2-per-
-                # byte indexing is not what the tile fold assumes) and no _p2p_fp4_blockwise is registered.
-                _qpull = _comb_qpull() and (
-                    quant_type != EpDispatchCombineQuantType.Fp4BlockwiseQuant
-                )
-                kernel_name = (
-                    "EpCombineIntraNodeKernel_bf16_p2p_fp8_blockwise"
-                    if _qpull
-                    else "EpCombineIntraNodeKernel_bf16_nop2p_fp8_blockwise"
-                )
+                # PUSH on every arch. gfx125x used to pick the _p2p symbol here so blockwise could
+                # ride the TDM tile fold, which was worth 3646.2us -> 1410.9us; that fold is gone
+                # (intranode_entry.hpp keeps quantization out of the TDM body), so the _p2p symbol
+                # no longer buys anything and cost the weightless top8/top9 vec8 kernels below,
+                # which have no _p2p variant.
+                kernel_name = "EpCombineIntraNodeKernel_bf16_nop2p_fp8_blockwise"
                 use_vec8_top8 = False
-                if base_vec8_top8_eligible and not _qpull:
+                if base_vec8_top8_eligible:
                     if block_elems == 128:
                         kernel_name = (
                             "EpCombineIntraNodeKernel_bf16_nop2p_fp8_blockwise_noweight_block128_vec8_top9"
@@ -1789,24 +1682,6 @@ class EpDispatchCombineOp:
                 shared_mem = self._combine_shared_mem(
                     actual_wpb, use_weights=not use_vec8_top8
                 )
-                if qpre:
-                    # Its own width, and deliberately not the combine geometry: this pass has no
-                    # cross-card edge and no LDS tiles, so the only thing it wants is enough waves
-                    # to hide the loads. Grid-strided over a token count that only the device
-                    # knows, so the grid is a latency-hiding choice and not a partition.
-                    q_wpb = _comb_env_int("MORI_COMB_QPRE_WPB", 8)
-                    q_bn = _comb_env_int(
-                        "MORI_COMB_QPRE_BN",
-                        4 * int(self._handle_info["multi_processor_count"]),
-                    )
-                    self._launch(
-                        "EpCombineQuantizeInputKernel_bf16",
-                        (q_bn,),
-                        (self._warp_size * q_wpb,),
-                        0,
-                        stream,
-                        args_ptr,
-                    )
                 self._last_combine_kernel_name = kernel_name
                 self._launch(
                     kernel_name,
