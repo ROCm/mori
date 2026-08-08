@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# EP intra-node dispatch/combine bench driver (A/B by gate set, "deletion method").
+# EP intra-node dispatch/combine bench driver.
 #
 # Drives tests/python/ops/bench_dispatch_combine.py and prints a token sweep, three columns wide:
 #
@@ -18,28 +18,21 @@
 # knob below is an optional override, and with none of them set this measures WHAT SHIPS: bf16 EP4
 # at whatever geometry the library picks for itself, with the correctness check armed on every row.
 #
-# Why deletion method rather than the in-kernel TIMING buckets: [CSPLIT] is per-warp max with no
-# __syncthreads at either end, so it systematically understates a phase's wall clock (cPush reads
-# 113us there against 231us by deletion) and the TIMING build is itself ~2x slower overall. Price
-# phases by deleting them from a noTIMING build and diffing, never by reading the buckets.
-#
-# ⚠ GATES REACH NOTHING IN THIS TREE. jit/core.py:_tunable_defines() returns [] -- the MORI_COMB_* /
-# MORI_DISP_* env-to--D route was removed when the kernels took their transport configuration into
-# the arch macros, so `SPECS="a=; b=MORI_COMB_NOPUSH=1"` now compiles ONE kernel and prints two rows
-# of the same number. That reads as "the gate is worth nothing" when it means "the gate is not
-# there". A gate-based A/B needs the -D put back in _tunable_defines() first, which is also what
-# keys the build cache, so it cannot be compiled in without being in the key. The SPECS machinery is
-# kept because that is the one place it has to go back.
+# There is deliberately NO env-gate A/B here, and adding one back is a source change, not a knob:
+# jit/core.py:_tunable_defines() returns [] because the kernels took their transport configuration
+# into the arch macros, so a MORI_COMB_* / MORI_DISP_* in the environment reaches no compile at all.
+# This driver used to carry a SPECS="a=; b=MORI_COMB_NOPUSH=1" mechanism for exactly that, which
+# after the cleanup built ONE kernel and printed two rows of the same number -- and two equal rows
+# read as "the gate is worth nothing" when they mean "the gate is not there". Put the -D back in
+# _tunable_defines() first (it is also what keys the build cache, so it cannot reach the compile
+# without reaching the key), then A/B by rebuilding.
 #
 # Optional overrides:
-#   SPECS="tag=GATES; tag2=GATES2"   one table per spec; MORI_BENCH_SKIPCHECK=1 unless tag ends in '!'
-#   tag ending in '!'                run this spec WITH the correctness check (rc=0 is the pass).
-#                                    The default spec is "v!=", i.e. checked; SPECS="full=" drops it
 #   CBN/CWPB/DBN/DWPB                geometry; unset sends 0, which is how you ask the library for
 #                                    its own per-body default, i.e. what ships (see run() below).
 #                                    DBN/DWPB accept SAME to follow the combine values
-#   CBNS="64 128 256"                sweep combine block count, running every spec at each
-#   BASE                             gates shared by every spec
+#   CBNS="64 128 256"                sweep combine block count, one table per count
+#   CHECK=0                          drop the correctness check (default 1: rc=0 is the pass)
 #   WS                               peer count
 #   TOKS="4096 8192" / MAXTOK=4096   which token counts make up the rows
 #   ZCS                              which combine columns to fill: "0 1" (default), "0", or "1"
@@ -47,8 +40,8 @@
 # Examples:
 #   ./tools/ep_test.sh
 #   TOKS=4096 ./tools/ep_test.sh
-#   ZCS=1 ./tools/ep_test.sh
-#   SPECS="full=; nopush=MORI_COMB_NOPUSH=1" CBNS="64 128" ./tools/ep_test.sh   (A/B, check off)
+#   ZCS=1 CHECK=0 ./tools/ep_test.sh
+#   CBNS="64 128" TOKS=16384 ./tools/ep_test.sh
 # From the node, without giving this script any docker knowledge of its own:
 #   docker exec MORI-EPV2 bash -lc 'cd /root/mori_tdm && ./tools/ep_test.sh'
 set -uo pipefail
@@ -79,7 +72,7 @@ fi
 # Deferring also keeps the ZC=0/ZC=1 width pairing out of the caller's memory, which is where the
 # rest of this script tries to keep such things.
 CBN="${CBN:-}"          # single value; use CBNS to sweep
-CBNS="${CBNS:-}"        # non-empty: run every spec once per block count (diagnostic)
+CBNS="${CBNS:-}"        # non-empty: one whole table per block count (diagnostic)
 CWPB="${CWPB:-}"
 DBN="${DBN:-}"          # SAME = follow the combine block count being swept (per-row geometry)
 DWPB="${DWPB:-}"        # SAME = follow CWPB
@@ -100,16 +93,11 @@ QT="${QT:-none}"        # none / fp8_blockwise / fp8_direct_cast; blockwise only
 # ZC=1 bf16 EP4, check armed: nothing set 169.4us / 1195 GB/s, RUNRR alone 168.9 / 1199,
 # RUNRR+BARSLEEP=127 171.1 / 1183 -- a phantom "regression" against the recorded 168.9 / 1199.
 # Studying the barrier now means editing that define and rebuilding, not setting a variable.
-# BASE is empty on purpose. It used to carry MORI_COMB_RUNRR=1, which was worth 22% on PUSH and so
-# looked mandatory; the push loop now always uses that ordering (the queued variant, measured better
-# at both EP2 and EP4), so there is nothing left to pass. Anything set here applies to every spec.
-BASE="${BASE:-}"
-# One spec, no gates, and the '!' arms the correctness check. Armed by default because an unchecked
-# number is not cheaper, it is just unfalsifiable: the failure this driver actually catches is a
-# kernel that got faster by dropping tokens, and with the check off that reads as a win. The cost is
-# a comparison pass per run, not a second measurement, and every row of the recorded curve was taken
-# this way. SPECS="full=" is how you drop it when you are chasing a hang rather than a number.
-SPECS="${SPECS:-v!=}"
+# Armed by default, because an unchecked number is not cheaper, it is just unfalsifiable: the
+# failure this driver actually catches is a kernel that got faster by dropping tokens, and with the
+# check off that reads as a win. The cost is a comparison pass per run, not a second measurement,
+# and every row of the recorded curve was taken this way. CHECK=0 when chasing a hang, not a number.
+CHECK="${CHECK:-1}"
 # Tokens per rank, swept. The whole curve is the deliverable: both transports change rank with size
 # (PULL wins throughout, and PUSH used to collapse past 8192 until the tile fix), so a single point
 # invites reading a crossover that is not there. 4096 is the point every older recorded number on
@@ -151,7 +139,7 @@ idle() {
   for _ in $(seq 1 40); do
     u=$(rocm-smi --showmeminfo vram 2>/dev/null | grep -oP 'VRAM Total Used Memory \(B\): \K[0-9]+' | sort -rn | head -1)
     # No figure at all is a broken probe, not a busy GPU. Waiting out all 40 rounds on it burns two
-    # minutes per spec and then aborts with "VRAM=" and nothing after it, which says neither.
+    # minutes per point and then aborts with "VRAM=" and nothing after it, which says neither.
     [ -z "$u" ] && { echo "## warn: rocm-smi gave no VRAM figure, skipping the idle wait"; return 0; }
     [ "$u" -lt 400000000 ] && return 0
     sleep 3
@@ -159,9 +147,9 @@ idle() {
   echo "ABORT: $u bytes of VRAM still in use after 120s"; exit 1
 }
 
-# A breadcrumb that survives the node, written before each spec and closed out after it. Two
+# A breadcrumb that survives the node, written before each run and closed out after it. Two
 # gfx1250 boxes have now stopped answering ssh in the middle of a sweep, and in both cases the only
-# record of which spec was running lived in /tmp on the machine that was gone -- so "what kills the
+# record of which point was running lived in /tmp on the machine that was gone -- so "what kills the
 # node" is still unknown after paying for it twice. This file is inside the container's own
 # filesystem, which survives a host reboot, and a line without a matching "done" names the suspect.
 CRUMB="$SRC/.ep_test_last"
@@ -171,12 +159,12 @@ crumb "sweep start geometry=$(g "${CBNS:-$CBN}")x$(g "$CWPB") WS=$WS ZCS='$ZCS' 
 P=$(( 37000 + RANDOM % 900 ))
 # Leaves the reading in R_RC / R_CLAT / R_CBW / R_DLAT / R_DBW rather than printing it, because one
 # table row is assembled from two runs (PUSH and PULL) and cannot be printed until both are in.
-run() { # $1=tag  $2=gates  $3=1 means run WITH the correctness check  $4=tokens  $5=zero-copy
+run() { # $1=tag  $2=tokens  $3=zero-copy
   pkill -9 -f bench_dispatch_combine 2>/dev/null; pkill -9 -f spawn_main 2>/dev/null
   sleep 4; idle
-  crumb "run  $1  gates='$2'"
+  crumb "run  $1"
   P=$((P+1))
-  local sk=MORI_BENCH_SKIPCHECK=1; [ "${3:-0}" = 1 ] && sk=MORI_BENCH_SKIPCHECK=0
+  local sk=MORI_BENCH_SKIPCHECK=1; [ "$CHECK" = 1 ] && sk=MORI_BENCH_SKIPCHECK=0
   local db=$DBN; [ "$db" = SAME ] && db=$CB
   local dw=$DWPB; [ "$dw" = SAME ] && dw=$CWPB
   # "No opinion" is the literal value 0, NOT an absent flag. _resolve_launch_params treats bn/wpb
@@ -189,10 +177,10 @@ run() { # $1=tag  $2=gates  $3=1 means run WITH the correctness check  $4=tokens
   local geo="--combine-block-num ${CB:-0} --combine-warp-per-block ${CWPB:-0}"
   geo="$geo --dispatch-block-num ${db:-0} --dispatch-warp-per-block ${dw:-0}"
   local log=/tmp/ep_test_$1.log
-  env $sk $BASE $2 MASTER_PORT=$P \
+  env $sk MASTER_PORT=$P \
     timeout 900 python3 tests/python/ops/bench_dispatch_combine.py \
-    --cmd bench --world-size "$WS" --dtype bf16 --max-tokens "$4" --hidden-dim 7168 \
-    --num-experts-per-rank 64 --num-experts-per-token 8 --zero-copy "$5" --quant-type "$QT" \
+    --cmd bench --world-size "$WS" --dtype bf16 --max-tokens "$2" --hidden-dim 7168 \
+    --num-experts-per-rank 64 --num-experts-per-token 8 --zero-copy "$3" --quant-type "$QT" \
     $geo > "$log" 2>&1
   R_RC=$?
   # Take the bench's OWN bw field. This used to recompute 202.47MB/lat, which understated every
@@ -225,40 +213,30 @@ cell() { # $1=bw $2=lat $3=rc -- one table cell. A failure has to be visible as 
 ROW='%11s   %-21s %-21s %-21s\n'
 
 cbs="${CBNS:-$CBN}"; case "$cbs" in *' '*) cbs="[$cbs]";; esac   # a swept list, not one block count
+ck=off; [ "$CHECK" = 1 ] && ck=armed
 echo "## geometry comb $(g "$cbs")x$(g "$CWPB")  disp $(g "$DBN")x$(g "$DWPB")" \
-     " WS=$WS  QT=$QT  BASE='$BASE'   (lib = the library's own default, i.e. what ships)"
+     " WS=$WS  QT=$QT  check $ck   (lib = the library's own default, i.e. what ships)"
 # A '-' placeholder so the loop still runs exactly once when no block count was asked for; an empty
 # list would iterate zero times and the script would silently do nothing.
 CBLIST="${CBNS:-$CBN}"; [ -z "$CBLIST" ] && CBLIST='-'
 for CB in $CBLIST; do
   [ "$CB" = '-' ] && CB=''
-  OLDIFS=$IFS; IFS=';'
-  for sp in $SPECS; do
-    IFS=$OLDIFS
-    sp="$(echo "$sp" | sed 's/^ *//;s/ *$//')"
-    [ -z "$sp" ] && { IFS=';'; continue; }
-    tag="${sp%%=*}"; gates="${sp#*=}"
-    chk=0; case "$tag" in *!) chk=1; tag="${tag%!}";; esac
-    ck=off; [ "$chk" = 1 ] && ck=armed
-    echo "## --- spec '$tag'  gates='$gates'  comb block $(g "$CB")  check $ck ---"
-    # shellcheck disable=SC2059
-    printf "$ROW" 'tokens/rank' 'dispatch' 'combine PUSH ZC=0' 'combine PULL ZC=1'
-    printf "$ROW" ''            'GB/s (lat us)' 'GB/s (lat us)' 'GB/s (lat us)'
-    for T in $TOKS; do
-      dcell='-'; pcell='-'; lcell='-'
-      for z in $ZCS; do
-        run "${tag}_t${T}_zc${z}_b$(g "$CB")" "$gates" "$chk" "$T" "$z"
-        if [ "$z" = 0 ]; then pcell="$(cell "$R_CBW" "$R_CLAT" "$R_RC")"
-                         else lcell="$(cell "$R_CBW" "$R_CLAT" "$R_RC")"; fi
-        # ZC picks the combine transport and does not touch dispatch, so the dispatch column comes
-        # from the PUSH run; the fallback only matters when PUSH was not asked for at all.
-        { [ "$z" = 0 ] || [ "$dcell" = '-' ]; } && dcell="$(cell "$R_DBW" "$R_DLAT" "$R_RC")"
-      done
-      printf "$ROW" "$T" "$dcell" "$pcell" "$lcell"
+  [ -n "$CBNS" ] && echo "## --- combine block $(g "$CB") ---"
+  # shellcheck disable=SC2059
+  printf "$ROW" 'tokens/rank' 'dispatch' 'combine PUSH ZC=0' 'combine PULL ZC=1'
+  printf "$ROW" ''            'GB/s (lat us)' 'GB/s (lat us)' 'GB/s (lat us)'
+  for T in $TOKS; do
+    dcell='-'; pcell='-'; lcell='-'
+    for z in $ZCS; do
+      run "t${T}_zc${z}_b$(g "$CB")" "$T" "$z"
+      if [ "$z" = 0 ]; then pcell="$(cell "$R_CBW" "$R_CLAT" "$R_RC")"
+                       else lcell="$(cell "$R_CBW" "$R_CLAT" "$R_RC")"; fi
+      # ZC picks the combine transport and does not touch dispatch, so the dispatch column comes
+      # from the PUSH run; the fallback only matters when PUSH was not asked for at all.
+      { [ "$z" = 0 ] || [ "$dcell" = '-' ]; } && dcell="$(cell "$R_DBW" "$R_DLAT" "$R_RC")"
     done
-    IFS=';'
+    printf "$ROW" "$T" "$dcell" "$pcell" "$lcell"
   done
-  IFS=$OLDIFS
 done
 crumb "sweep end"
 echo EP_TEST_DONE
