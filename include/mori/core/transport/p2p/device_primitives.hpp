@@ -1193,14 +1193,6 @@ struct Bf16Vec<16> {
 #define MORI_COMB_QSTGU 7
 #endif
 
-// How the exact-fit path writes the per-block scales. 0 = one 4-byte store per subwarp per block
-// (what this always did and what ships), 1 = shuffle a whole group into consecutive lanes and store
-// it in one instruction, 2 = DIAGNOSTIC, do not store them at all (WRONG RESULTS; it is the upper
-// bound on what 1 could be worth, so it is the row to read first).
-#ifndef MORI_COMB_QSCW
-#define MORI_COMB_QSCW 0
-#endif
-
 template <int SubwarpSize, int InVecBytes, int MaxCacheIters, typename Fp8T>
 __device__ __forceinline__ void WarpQuantizeBf16ToFp8BlockwiseVec(
     Fp8T* __restrict__ dstToken, float* __restrict__ dstScales,
@@ -1252,11 +1244,6 @@ __device__ __forceinline__ void WarpQuantizeBf16ToFp8BlockwiseVec(
   if (maxIters == 1 && blockElems == kStrideElems && blockElems * scaleDim == hiddenDim) {
     constexpr int kU = (MORI_COMB_QSTGU) < 1 ? 1 : (MORI_COMB_QSTGU);
     constexpr int kStep = kSubwarpsPerWarp * kU;
-    // The grouped store needs one lane per scale in the group. kStep is 14 at the shipping shape
-    // (2 subwarps x 7 blocks in flight) against 32 lanes, but QSTGU is tunable, so a group wider
-    // than the warp falls back to the per-subwarp store rather than dropping the tail scales.
-    constexpr bool kGroupStore = (MORI_COMB_QSCW == 1) && (kStep <= warpSize);
-    constexpr bool kNoScaleStore = (MORI_COMB_QSCW == 2);
     for (; sbStart + kStep <= scaleDim; sbStart += kStep) {
       typename Bf16Vec<InVecBytes>::LoadT cached[kU];
       int bases[kU];
@@ -1265,11 +1252,6 @@ __device__ __forceinline__ void WarpQuantizeBf16ToFp8BlockwiseVec(
         bases[u] = (sbStart + u * kSubwarpsPerWarp + subWarpId) * blockElems + subLaneId * kVecElems;
         cached[u] = load<InVecBytes>(srcToken + bases[u]);
       }
-      // MORI_COMB_QSCW=1 collects this group's kStep scales into lanes 0..kStep-1 and stores them
-      // in one instruction instead of kU. `grouped` is the value THIS lane will store; it is only
-      // meaningful for lane < kStep, and the shuffle sources are compile-time constants because u
-      // is unrolled, so nothing here indexes a register array dynamically.
-      float grouped = 0.0f;
 #pragma unroll
       for (int u = 0; u < kU; ++u) {
         const int sb = sbStart + u * kSubwarpsPerWarp + subWarpId;
@@ -1282,30 +1264,14 @@ __device__ __forceinline__ void WarpQuantizeBf16ToFp8BlockwiseVec(
         subwarpScaled = subwarpScaled || sbScaled;
         const float invScale = sbScaled ? (fp8Max / maxAbs) : 1.0f;
         const float s = sbScaled ? (maxAbs * invFp8Max) : 1.0f;
-        (void)s;
-        if constexpr (kGroupStore) {
-#pragma unroll
-          for (int w = 0; w < kSubwarpsPerWarp; ++w) {
-            const float sw = __shfl(s, w * SubwarpSize, warpSize);
-            if (laneId == u * kSubwarpsPerWarp + w) grouped = sw;
-          }
-          if (sb == 0 && laneId == 0) {
+        if (subLaneId == 0) {
+          dstScales[sb] = s;
+          if (sb == 0) {
             sb0Scale = s;
             sb0Cached = true;
           }
-        } else if constexpr (!kNoScaleStore) {
-          if (subLaneId == 0) {
-            dstScales[sb] = s;
-            if (sb == 0) {
-              sb0Scale = s;
-              sb0Cached = true;
-            }
-          }
         }
         Bf16Vec<InVecBytes>::template QuantizeStore<Fp8T>(dstBytes, bases[u], cached[u], invScale);
-      }
-      if constexpr (kGroupStore) {
-        if (laneId < kStep) dstScales[sbStart + laneId] = grouped;
       }
     }
   }
