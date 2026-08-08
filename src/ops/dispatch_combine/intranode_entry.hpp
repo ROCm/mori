@@ -28,6 +28,10 @@
 // tests for one. The launch symbols in ep_intranode.hip are registered with the WRAP_*_ENTRY
 // macros, which forward to *_entry below instead of straight to *_body -- that indirection is the
 // whole reason this file exists, and it is what keeps the choice out of the two implementations.
+//
+// The choice is not the architecture alone. Combine also asks what the instantiation transports:
+// a quantizing one gets the portable body even on gfx125x, because the TDM body has nothing to
+// offer it (see the comment at the combine entry).
 
 #include "src/ops/dispatch_combine/intranode.hpp"
 
@@ -54,9 +58,30 @@ template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,
           int Vec8Top8BlockElems = 0, int Vec8AccumNum = 8, bool UseFp4Combine = false>
 __device__ __forceinline__ void EpCombineIntraNodeKernel_entry(EpDispatchCombineArgs<T> args) {
 #if defined(__gfx1250__) || defined(__gfx1251__)
-  EpCombineIntraNodeKernel_1250x_body<T, UseP2PRead, EnableStdMoE, UseFp8DirectCast,
-                                      UseFp8BlockwiseQuant, UseWeights, Vec8Top8BlockElems,
-                                      Vec8AccumNum, UseFp4Combine>(args);
+  // Only the unquantized combine takes the TDM body, and the TDM body is written for that case
+  // alone -- it does not take the quantization parameters at all. Vec8Top8BlockElems /
+  // Vec8AccumNum only tune the scalar dequant chain, so they are not passed on either.
+  //
+  // What this costs, measured as a two-tree ISA diff on gfx1250 (50 symbols, s1 = before):
+  //   * every unquantized symbol is instruction-for-instruction identical -- those are the ones
+  //     production runs here, and they keep the whole TDM body;
+  //   * the PUSH-quantized ones (_nop2p_fp8_blockwise, _nop2p_fp4_blockwise, _nop2p_fp8cast) move
+  //     by -40..-111 instructions, all of it the barrier, because they really did reach no TDM
+  //     instruction: their send is a per-lane quantize into the peer slot and their reduce is the
+  //     scalar dequant chain;
+  //   * _bf16_p2p_fp8_blockwise grows 81401 -> 104013 and gives up its one tensor_load_to_lds.
+  //     That one DID use the TDM tile fold -- PULL blockwise was the case the fold's scale
+  //     prefetch was written for. It is a deliberate loss: blockwise combine is 367.6us at its
+  //     best tuning against 169.2us for bf16 moving twice the bytes, so the fold was buying speed
+  //     for a transport nobody should pick, at the price of the scale plumbing threaded through
+  //     every loop of the TDM body.
+  if constexpr (!UseFp8DirectCast && !UseFp8BlockwiseQuant && !UseFp4Combine) {
+    EpCombineIntraNodeKernel_1250x_body<T, UseP2PRead, EnableStdMoE, UseWeights>(args);
+  } else {
+    EpCombineIntraNodeKernel_body<T, UseP2PRead, EnableStdMoE, UseFp8DirectCast,
+                                  UseFp8BlockwiseQuant, UseWeights, Vec8Top8BlockElems,
+                                  Vec8AccumNum, UseFp4Combine>(args);
+  }
 #else
   EpCombineIntraNodeKernel_body<T, UseP2PRead, EnableStdMoE, UseFp8DirectCast, UseFp8BlockwiseQuant,
                                 UseWeights, Vec8Top8BlockElems, Vec8AccumNum, UseFp4Combine>(args);
