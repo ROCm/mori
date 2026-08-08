@@ -16,7 +16,7 @@
 #   ./tools/ep_test.sh
 # It finds the repo from its own path, so there is nothing to configure to get a first number. Every
 # knob below is an optional override, and with none of them set this measures WHAT SHIPS: bf16 EP4
-# at whatever geometry the library picks for itself.
+# at whatever geometry the library picks for itself, with the correctness check armed on every row.
 #
 # Why deletion method rather than the in-kernel TIMING buckets: [CSPLIT] is per-warp max with no
 # __syncthreads at either end, so it systematically understates a phase's wall clock (cPush reads
@@ -24,8 +24,9 @@
 # phases by deleting them from a noTIMING build and diffing, never by reading the buckets.
 #
 # Optional overrides:
-#   SPECS="tag=GATES; tag2=GATES2"   one run per spec; MORI_BENCH_SKIPCHECK=1 unless tag ends in '!'
-#   tag ending in '!'                run this spec WITH the correctness check (rc=0 is the pass)
+#   SPECS="tag=GATES; tag2=GATES2"   one table per spec; MORI_BENCH_SKIPCHECK=1 unless tag ends in '!'
+#   tag ending in '!'                run this spec WITH the correctness check (rc=0 is the pass).
+#                                    The default spec is "v!=", i.e. checked; SPECS="full=" drops it
 #   CBN/CWPB/DBN/DWPB                geometry; unset sends 0, which is how you ask the library for
 #                                    its own per-body default, i.e. what ships (see run() below).
 #                                    DBN/DWPB accept SAME to follow the combine values
@@ -39,8 +40,7 @@
 #   ./tools/ep_test.sh
 #   TOKS=4096 ./tools/ep_test.sh
 #   ZCS=1 ./tools/ep_test.sh
-#   SPECS="full=; nopush=MORI_COMB_NOPUSH=1" CBNS="64 128" ./tools/ep_test.sh
-#   SPECS="check!=" TOKS="4096 16384" ./tools/ep_test.sh
+#   SPECS="full=; nopush=MORI_COMB_NOPUSH=1" CBNS="64 128" ./tools/ep_test.sh   (A/B, check off)
 # From the node, without giving this script any docker knowledge of its own:
 #   docker exec MORI-EPV2 bash -lc 'cd /root/mori_tdm && ./tools/ep_test.sh'
 set -uo pipefail
@@ -96,7 +96,12 @@ QT="${QT:-none}"        # none / fp8_blockwise / fp8_direct_cast; blockwise only
 # looked mandatory; the push loop now always uses that ordering (the queued variant, measured better
 # at both EP2 and EP4), so there is nothing left to pass. Anything set here applies to every spec.
 BASE="${BASE:-}"
-SPECS="${SPECS:-full=}"
+# One spec, no gates, and the '!' arms the correctness check. Armed by default because an unchecked
+# number is not cheaper, it is just unfalsifiable: the failure this driver actually catches is a
+# kernel that got faster by dropping tokens, and with the check off that reads as a win. The cost is
+# a comparison pass per run, not a second measurement, and every row of the recorded curve was taken
+# this way. SPECS="full=" is how you drop it when you are chasing a hang rather than a number.
+SPECS="${SPECS:-v!=}"
 # Tokens per rank, swept. The whole curve is the deliverable: both transports change rank with size
 # (PULL wins throughout, and PUSH used to collapse past 8192 until the tile fix), so a single point
 # invites reading a crossover that is not there. 4096 is the point every older recorded number on
