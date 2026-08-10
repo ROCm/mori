@@ -91,7 +91,9 @@ class SsdCopyPipeline {
   bool Enqueue(SsdCopyTask task);
 
   // Prometheus-only observability snapshots (see metrics_ below).  Not
-  // correctness state; sampled once per metrics tick by PublishSsdMetrics().
+  // correctness state.  Unread while dormant (PoolClient::PublishSsdMetrics,
+  // the former sampler, was removed with the rest of Phase 0's
+  // distributed-mode SSD wiring — see design-backend-agnostic-refactor.md).
   uint64_t Enqueued() const { return metrics_.enqueued.load(std::memory_order_relaxed); }
   // CopiedOk counts completed copies: a real backend Write OR a content-addressed
   // dedup hit (already resident) — both report success, only the former emits ADD SSD.

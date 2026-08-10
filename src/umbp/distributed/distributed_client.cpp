@@ -62,22 +62,16 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   // 2 MiB, so this only matters with non-default page size combinations.
   dram_pool_size_ = dram_pool_handle_.mapped_size;
 
-  // Lower SSD config to the peer.  When ssd.enabled, the peer builds a
-  // PeerSsdManager (SSDTier backend) from the SSD config (UMBPSsdConfig) and
-  // reports SSD capacity via TierType::SSD; when disabled, behavior is exactly
-  // DRAM-only (no PeerSsdManager, no SSD capacity, no SSD event source).
+  // SSD is unwired from the distributed data plane (backend-agnostic refactor
+  // Phase 0, see design-backend-agnostic-refactor.md): PoolClient no longer
+  // builds a PeerSsdManager or serves SSD reads, so this node advertises only
+  // its DRAM capacity — advertising SSD here without anything behind it would
+  // route Gets/Puts into a dead path.
   std::map<TierType, TierCapacity> tier_capacities = {
       {TierType::DRAM, {dram_pool_size_, dram_pool_size_}}};
-  PeerSsdConfig ssd_cfg;
-  if (config_.ssd.enabled) {
-    ssd_cfg.enabled = true;
-    ssd_cfg.ssd = config_.ssd;
-    const uint64_t ssd_cap = config_.ssd.capacity_bytes;
-    tier_capacities[TierType::SSD] = {ssd_cap, ssd_cap};
-  }
   auto pc_config = ToPoolClientConfig(dc,
                                       /*dram_buffers=*/{{dram_pool_, dram_pool_size_}},
-                                      std::move(tier_capacities), std::move(ssd_cfg));
+                                      std::move(tier_capacities));
   pc_config.copy_pipeline = config_.copy_pipeline;
 
   pool_client_ = std::make_unique<PoolClient>(std::move(pc_config));

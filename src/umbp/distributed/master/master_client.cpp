@@ -36,7 +36,7 @@
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/master/rpc_latency_timer.h"
 #include "umbp/distributed/peer/peer_dram_allocator.h"
-#include "umbp/distributed/peer/peer_ssd_manager.h"
+#include "umbp/distributed/peer/ssd/peer_ssd_manager.h"
 
 namespace mori::umbp {
 
@@ -408,8 +408,13 @@ void MasterClient::SetPeerDramAllocator(PeerDramAllocator* dram_alloc) {
 }
 
 void MasterClient::SetPeerSsdManager(PeerSsdManager* ssd_manager) {
+  // PeerSsdManager no longer implements OwnedLocationSource (backend-agnostic
+  // refactor Phase 0, see design-backend-agnostic-refactor.md): that wiring
+  // was exactly the coupling Phase 0 removes. Nothing calls this today (SSD
+  // is unwired from the distributed data plane), but the concrete pointer
+  // stays so a live capacity merge (see SnapshotAndCacheTierCapacities below)
+  // keeps working if a future caller re-wires it.
   ssd_manager_ = ssd_manager;
-  AddOwnedLocationSource(ssd_manager);
 }
 
 void MasterClient::AddOwnedLocationSource(OwnedLocationSource* source) {

@@ -35,7 +35,6 @@
 #include <vector>
 
 #include "umbp/distributed/config.h"  // PeerSsdConfig
-#include "umbp/distributed/peer/owned_location_source.h"
 #include "umbp/distributed/types.h"
 
 namespace mori::umbp {
@@ -55,7 +54,13 @@ struct SsdReadOutcome {
 // (SSDTier); it must NOT pull in LocalStorageManager / LocalBlockIndex (which
 // carry their own DRAM tier + demote/promote) — peer DRAM is owned by
 // PeerDramAllocator and two DRAM concepts would scramble ownership.
-class PeerSsdManager : public OwnedLocationSource {
+//
+// Dormant: unwired from the distributed data plane (see
+// design-backend-agnostic-refactor.md Phase 0). No longer implements
+// OwnedLocationSource — that wiring is exactly the coupling Phase 0 removes —
+// but keeps the same-shaped DrainPendingEvents / SnapshotOwnedKeys methods so
+// a future SsdBackend : MediumBackend adapter can forward to them directly.
+class PeerSsdManager {
  public:
   explicit PeerSsdManager(const PeerSsdConfig& cfg);
 
@@ -64,7 +69,7 @@ class PeerSsdManager : public OwnedLocationSource {
   // Production code must use the config constructor.
   PeerSsdManager(std::unique_ptr<TierBackend> backend, double high_watermark, double low_watermark);
 
-  ~PeerSsdManager() override;
+  ~PeerSsdManager();
 
   PeerSsdManager(const PeerSsdManager&) = delete;
   PeerSsdManager& operator=(const PeerSsdManager&) = delete;
@@ -125,13 +130,14 @@ class PeerSsdManager : public OwnedLocationSource {
   // in-flight (inflight_reads_) across that window so eviction skips it.
   SsdReadOutcome PrepareRead(const std::string& key, void* staging_ptr, size_t staging_cap);
 
-  // OwnedLocationSource — all events carry TierType::SSD.
-  std::vector<KvEvent> DrainPendingEvents() override;
-  std::vector<KvEvent> SnapshotOwnedKeys() const override;
+  // Same shape as OwnedLocationSource (see the class comment above) — all
+  // events carry TierType::SSD.
+  std::vector<KvEvent> DrainPendingEvents();
+  std::vector<KvEvent> SnapshotOwnedKeys() const;
 
   // Full-sync snapshot that also atomically drops the event outbox under the
-  // same lock.  See OwnedLocationSource.
-  std::vector<KvEvent> SnapshotOwnedKeysForFullSync() override;
+  // same lock.
+  std::vector<KvEvent> SnapshotOwnedKeysForFullSync();
 
   // Crash-restart leftover policy (discard): after a crash owned_ is empty but
   // physical SSD bytes may remain, diverging used capacity from owned_.  This
@@ -140,8 +146,10 @@ class PeerSsdManager : public OwnedLocationSource {
   // synchronized against Write/PrepareRead).  No-op when SSD is disabled.
   void DiscardLeftoverOnStartup();
 
-  // Prometheus-only observability snapshots (see metrics_ below); sampled once
-  // per metrics tick by PublishSsdMetrics(), never drive correctness.
+  // Prometheus-only observability snapshots (see metrics_ below); never drive
+  // correctness. Unread while dormant (PoolClient::PublishSsdMetrics, the
+  // former sampler, was removed with the rest of Phase 0's distributed-mode
+  // SSD wiring — see design-backend-agnostic-refactor.md).
   uint64_t ReadOk() const { return metrics_.read_ok.load(std::memory_order_relaxed); }
   uint64_t ReadNotFound() const { return metrics_.read_not_found.load(std::memory_order_relaxed); }
   uint64_t ReadSizeTooLarge() const {
