@@ -230,7 +230,8 @@ def main():
                 warp_num_per_block=WARP_NUM,
                 combine_block_num=COMB_BLOCK,
                 combine_warp_num_per_block=COMB_WARP,
-                schedule=None,
+                dispatch_schedule=None,
+                combine_schedule=None,
             )
         cfg = EpDispatchCombineConfig(**_cfg_kwargs)
         op = EpDispatchCombineOp(cfg, comm)
@@ -247,7 +248,8 @@ def main():
             comb_kern = op._combine_variants[_cspec]
             if rank == 0:
                 print(
-                    f"# AUTO tuned config: schedule={cfg.schedule} "
+                    f"# AUTO tuned config: disp_schedule={cfg.dispatch_schedule} "
+                    f"comb_schedule={cfg.combine_schedule} "
                     f"disp_default=({cfg.dispatch_block_num},{cfg.warp_num_per_block}) "
                     f"comb_default=({cfg.combine_block_num},{cfg.combine_warp_num_per_block}) "
                     f"disp_variants={sorted(op._dispatch_variants)} "

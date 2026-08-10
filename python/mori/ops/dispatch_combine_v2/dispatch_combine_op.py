@@ -134,11 +134,12 @@ class EpDispatchCombineConfig:
     combine_block_num: int = None
     warp_num_per_block: int = None
     combine_warp_num_per_block: int = None
-    # Optional per-token plan: tuple of (max_tok_inclusive | None, disp_block,
-    # disp_warp, comb_block, comb_warp) buckets. When set, the op precompiles the
-    # distinct (block, warp) variants and picks one at runtime from
+    # Optional per-token plans (dispatch and combine tuned independently): each a
+    # tuple of (max_tok_inclusive | None, block, warp) buckets. When set, the op
+    # precompiles the distinct (block, warp) variants and picks one at runtime from
     # cur_rank_num_token. None => auto (from tuning_configs) or single-shot fallback.
-    schedule: tuple = None
+    dispatch_schedule: tuple = None
+    combine_schedule: tuple = None
     enable_std_moe: bool = False
     max_total_recv_tokens: int = 0  # mori maxTotalRecvTokens; 0 = worst-case ws*M
 
@@ -209,13 +210,17 @@ class EpDispatchCombineConfig:
         tuned automatically — EpDispatchCombineConfig.tuned() is now just an
         explicit alias). If any field is pinned, honor it and fill the rest with
         the single-shot fallback (no schedule)."""
-        pinned = self.schedule is not None or any(
-            g is not None
-            for g in (
-                self.dispatch_block_num,
-                self.combine_block_num,
-                self.warp_num_per_block,
-                self.combine_warp_num_per_block,
+        pinned = (
+            self.dispatch_schedule is not None
+            or self.combine_schedule is not None
+            or any(
+                g is not None
+                for g in (
+                    self.dispatch_block_num,
+                    self.combine_block_num,
+                    self.warp_num_per_block,
+                    self.combine_warp_num_per_block,
+                )
             )
         )
         if not pinned:
@@ -231,7 +236,8 @@ class EpDispatchCombineConfig:
             self.combine_block_num = t["combine_block_num"]
             self.warp_num_per_block = t["warp_num_per_block"]
             self.combine_warp_num_per_block = t["combine_warp_num_per_block"]
-            self.schedule = t["schedule"]
+            self.dispatch_schedule = t["dispatch_schedule"]
+            self.combine_schedule = t["combine_schedule"]
         else:
             # explicit geometry: fill any unset field with the single-shot default
             if self.dispatch_block_num is None:
@@ -540,14 +546,15 @@ class EpDispatchCombineOp:
         # Distinct (block, warp) variants to precompile. With a per-token schedule
         # the op picks the best (block, warp) at runtime from cur_rank_num_token;
         # otherwise it is single-shot. Scatter combine is not schedule-tuned.
-        schedule = cfg.schedule
-        if schedule:
-            dispatch_specs = sorted({(db, dw) for (_, db, dw, _, _) in schedule})
-            combine_specs = sorted({(cb, cw) for (_, _, _, cb, cw) in schedule})
+        disp_sched = cfg.dispatch_schedule
+        comb_sched = cfg.combine_schedule
+        if disp_sched:
+            dispatch_specs = sorted({(b, w) for (_, b, w) in disp_sched})
         else:
             dispatch_specs = [(cfg.dispatch_block_num, cfg.warp_num_per_block)]
-            combine_specs = [(cfg.combine_block_num, cfg.combine_warp_num_per_block)]
-        if cfg.is_scatter:
+        if comb_sched and not cfg.is_scatter:
+            combine_specs = sorted({(b, w) for (_, b, w) in comb_sched})
+        else:
             combine_specs = [(cfg.combine_block_num, cfg.combine_warp_num_per_block)]
         self._dispatch_specs = dispatch_specs
         self._combine_specs = combine_specs
@@ -799,26 +806,28 @@ class EpDispatchCombineOp:
             torch.int32,
         )
 
+    @staticmethod
+    def _pick_bucket(schedule, num_tokens):
+        """(block, warp) for the first bucket whose max_tok covers num_tokens."""
+        for bucket in schedule:
+            max_tok = bucket[0]
+            if max_tok is None or num_tokens <= max_tok:
+                return (bucket[1], bucket[2])
+        return (schedule[-1][1], schedule[-1][2])
+
     def _pick(self, num_tokens):
         """((disp_block, disp_warp), (comb_block, comb_warp)) for a runtime token
-        count via the per-token schedule; falls back to the single-shot specs
-        otherwise. Returned specs are clamped to the precompiled variants."""
-        schedule = self.cfg.schedule
-        disp_spec = comb_spec = None
-        if schedule:
-            for bucket in schedule:
-                max_tok = bucket[0]
-                if max_tok is None or num_tokens <= max_tok:
-                    disp_spec, comb_spec = (bucket[1], bucket[2]), (
-                        bucket[3],
-                        bucket[4],
-                    )
-                    break
-            if disp_spec is None:
-                last = schedule[-1]
-                disp_spec, comb_spec = (last[1], last[2]), (last[3], last[4])
+        count. Dispatch and combine use their own per-token schedule (independent
+        buckets); each falls back to its single-shot spec otherwise. Returned specs
+        are clamped to the precompiled variants."""
+        if self.cfg.dispatch_schedule:
+            disp_spec = self._pick_bucket(self.cfg.dispatch_schedule, num_tokens)
         else:
-            disp_spec, comb_spec = self._dispatch_specs[0], self._combine_specs[0]
+            disp_spec = self._dispatch_specs[0]
+        if self.cfg.combine_schedule:
+            comb_spec = self._pick_bucket(self.cfg.combine_schedule, num_tokens)
+        else:
+            comb_spec = self._combine_specs[0]
         if disp_spec not in self._dispatch_variants:
             disp_spec = self._dispatch_specs[-1]
         if comb_spec not in self._combine_variants:

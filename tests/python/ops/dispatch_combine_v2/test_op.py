@@ -166,7 +166,9 @@ def main():
             from mori.ops.dispatch_combine_v2.tuning_configs import lookup
 
             _dt = "fp4" if _IS_FP4 else ("fp8" if _IS_FP8 else "bf16")
-            cfg.schedule = lookup(npes, HIDDEN, K, dtype=_dt)["schedule"]
+            _t = lookup(npes, HIDDEN, K, dtype=_dt)
+            cfg.dispatch_schedule = _t["dispatch_schedule"]
+            cfg.combine_schedule = _t["combine_schedule"]
         op = EpDispatchCombineOp(cfg, comm)
         comm.barrier()
 
