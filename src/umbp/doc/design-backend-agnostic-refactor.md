@@ -513,26 +513,67 @@ medium, all asserted by rewritten tests):
 were inverted; each inverted test names the expectation it replaces. Everything
 else passes untouched.
 
-### Phase 5 — lock it in
+### Phase 5 — lock it in *(Rules A and C done in Phase 6; Rule B lint outstanding)*
 
-- Cherry-pick `tools/umbp_backend_abstraction_lint.py` and its pre-commit hook
-  from `refactor/umbp-storage-backend-api`. It fails if anything outside the
-  backend directory names a concrete backend type or includes its header, and
-  its budget table may only shrink.
-- Add a ~150-line `MockBackend` for tests.
-- Enforce the layering boundary instead of collapsing it. `local/tiers/
-  tier_backend.h` and `LocalStorageManager` **stay** — they are local mode's
-  medium contract and local mode is still a shipping stack. The lint rule is
-  scoped: no file under `distributed/` may include `local/tiers/*`, and no file
-  outside a backend directory may name a concrete backend type — with
-  `distributed/peer/ssd/` exempted from both as the dormant-and-future adapter
-  directory.
-- One further rule, needed because §4 folds registration into `TransferEngine`
-  and so hands backends an object they could transfer with: **no file under a
-  backend directory may call `TransferEngine::{Plan,Submit,Wait}`.** Backends
-  register and publish descriptors; they do not move bytes. Adding the rule here
-  costs a few lines and replaces the compile-time guarantee a separate
-  registration interface would have given.
+The original plan was one lint script enforcing three rules. Two of the three
+are better enforced by the type system, so the lint shrinks to the one rule
+types cannot cheaply express.
+
+**Rule A — only one place may name a concrete backend.** *Types — done.*
+Phase 6 deleted `LocalBufferViews()`, the one call that forced `PoolClient` to
+hold a `PageBackend*`, so `PoolClient::Init` now builds through
+`MakePageBackend() -> unique_ptr<MediumBackend>`. The class stays in its header
+because `test_page_backend` drives the allocator bookkeeping through the
+`TierConfig` constructor directly; the rule as stated — one place names it — is
+satisfied, and that place is the composition root.
+
+The same rule now holds for the transfer layer, which did not exist when this
+was written: `PoolClient::Init` is also the only file naming `LocalCopyEngine`,
+`MoriIoEngine` or `CompositeTransferEngine`. Reaching mori-io's peer handshake
+(`EnsureRemoteEngine`, `CacheRemoteBuffers`, …) needed a `MoriIoEngine*` at
+first; those calls became the `PeerDirectory` interface instead, so a second
+remote transport implements an interface rather than editing `pool_client.cpp`.
+
+**Rule B — no file under `distributed/` may include `local/tiers/*`.** *Lint.*
+The obvious structural fix — split `umbp_common` into `umbp_local` and
+`umbp_distributed` so the include cannot resolve — does not work yet:
+`page_backend.h` needs `HostMemAllocator`, which lives under `local/`. Cutting
+that edge means relocating the allocator to `common/` first, a separate refactor.
+Until then this rule stays a lint rule, scoped to `local/tiers/*` (not all of
+`local/`), with `distributed/peer/ssd/` exempted as the dormant adapter — its
+three `local/tiers/*` includes are the only violations in tree.
+
+**Rule C — no backend may call `TransferEngine::{Plan,Submit,Wait}`.** *Types —
+done in Phase 6.* This rule existed only because §4 folded registration into
+`TransferEngine`, handing backends an object they could transfer with. That
+argument conflated *one class* with *one interface*; keeping one object and
+giving it two views turns the rule into a compile error at zero runtime cost:
+
+```cpp
+class MemoryRegistrar { /* RegisterMemory, Deregister */ };
+class TransferEngine : public MemoryRegistrar { /* + CanHandle, Plan, Submit */ };
+```
+
+`MediumBackend::Init` takes a `MemoryRegistrar*`. There is no `Submit` on it to
+call, and no accessor that hands back the engine.
+
+So what is left of Phase 5 is: cherry-pick
+`tools/umbp_backend_abstraction_lint.py` and its pre-commit hook, scoped to
+Rule B. **That is still outstanding** — the tool is not in tree. `MockBackend`
+already exists (Phase 2, test-only since Phase 3).
+
+**On the budget table.** The lint carries a per-file table of tolerated
+violations that "may only shrink". Prefer starting with none: the only Rule B
+violations are in `distributed/peer/ssd/`, which is exempted by directory
+anyway. A rule with no exceptions survives; a rule with a table of them drifts,
+because the escape hatch becomes the habit.
+
+*Acceptance test:* adding a backend = 1 new file + 1 registry line + 0 call-site
+edits. **No linter proves this — adding `SsdBackend` does**, and it is the cheap
+test, since it mostly forwards to the `PeerSsdManager` that has been dormant and
+under test since Phase 0. Phase 6 removed the blocker this paragraph named (the
+local path is no longer host-DRAM-only, and `BufferRef` is how a medium
+publishes local endpoints), so the test is now runnable; it has not been run.
 
 Two backend abstractions coexist by design, at different layers:
 `MediumBackend` is the *distributed storage* contract (publishes descriptors,
@@ -540,28 +581,121 @@ registry-dispatched); `TierBackend` is *local mode's* storage-medium contract
 (blocking read/write of bytes). The original coupling came from these two being
 tangled inside `PoolClient`, not from both existing.
 
-*Acceptance test:* adding a backend = 1 new file + 1 registry line + 0 call-site
-edits.
+### Phase 6 — abstract the transfer engine *(done)*
 
-### Phase 6 — abstract the transfer engine
+`TransferEngine` and `TransferRef` landed as specified (§4). `MoriIoEngine` is
+the first implementation and mori-io itself is not modified;
+`CompositeTransferEngine` replaced the Phase 2 registration shim. Moved from
+`PoolClient` into the engine: `GroupTransfersByPair` (now `MoriIoEngine::Plan`),
+the bounce buffer and its mutex, peer engine registration and desc caching.
+`RemoteDramScatterWrite` / `RemoteDramScatterRead` / `GroupPagesByBuffer` were
+deleted outright — dead since the batch path landed, and a second byte-moving
+path is exactly what §6 forbids.
 
-Introduce `TransferEngine` and `TransferRef` (§4). `MoriIoEngine` is the first
-implementation and mori-io itself is not modified; `CompositeTransferEngine`
-replaces the Phase 2 registration shim, so backends see no change. Move from
-`PoolClient` into the engine: `GroupTransfersByPair` (as `MoriIoEngine::Plan`),
-the submit-all-then-wait scheduler (base class), the bounce buffer and its mutex,
-peer engine registration and desc caching.
+The local fast path **did** fold in: `LocalPutPages` / `LocalGetPages` /
+`LocalCopyBlock` are gone, and `ExecuteLocalPut` / `ExecuteLocalGet` now build
+`TransferItem`s against `MediumBackend::BufferRef()` and hand them to the same
+planner as everything else. See "the measurement" below.
 
-This is what makes the local fast path stop being a special case: a local
-transfer is one whose endpoints are both local, and the planner picks a memcpy
-or pread engine. `LocalPutPages` / `LocalGetPages` / `LocalCopyBlock` and the
-`UMBP_DRAM_{WRITE,READ}_THREADS` knobs fold in here — **if and only if** a local
-transfer through the abstraction measures as cheap as today's direct `memcpy`
-(§2). Measure before committing to it; the fast path exists because that
-comparison once came out the other way.
+**Four deviations from §4, each deliberate:**
 
-*Gate:* `bench_pool_client_batch_get` and the local put/get microbenchmarks
-unchanged. Same argument as Phase 3 — this is a throughput property.
+- **`TransferRef` is a struct of merged handles, not a `std::variant`.**
+  Registration fans *out*: the same DRAM buffer is a raw pointer (memcpy-able)
+  and an RDMA MR (peer-readable) *at the same time*, and which one is used is a
+  property of the (src, dst) PAIR. A variant forces a buffer to be one or the
+  other and makes the local path — memcpy between two buffers that are also
+  registered — inexpressible. `mori::io::MemoryDesc` already resolves this the
+  same way, holding `ipcHandle` and `fabricHandle` side by side.
+- **No `FileRef` / `ObjectRef`, no `RegisterFile`.** No engine in tree consumes
+  one, and this plan has already refused an abstraction nothing exercises once
+  (§3, `BackendProperties`). The same test applies: `SsdBackend` is what needs a
+  file endpoint, so `SsdBackend` brings it — a `kind` tag plus a second handle
+  set in one header, with `CanHandle` already in place to route it.
+- **`Wait` lives on the handle, not on the engine.** `Submit` returns a
+  `unique_ptr<TransferHandle>` whose destructor drains. That is not cosmetic:
+  the RDMA backend holds raw `TransferStatus*` into the handle's status vector,
+  so the drain-on-early-destroy safety net that used to live in
+  `~RemoteDramGetInFlight` has to sit with the statuses themselves.
+- **The schedulers stayed in `PoolClient`.** §5 put submit-all-then-wait in the
+  base class, but the overlap that matters spans *several* `Submit` calls (one
+  per peer) with the local reads run in the gap — that is the client's schedule
+  over a batch, not one engine's over one call. Same for
+  `UMBP_DRAM_{WRITE,READ}_THREADS`, which §5 also listed as folding in: they
+  parallelize ACROSS the keys of one batch, and a batch is not a concept the
+  engine has. What is in the base class is `Transfer()`, the plan+submit+wait
+  convenience for callers with nothing to overlap.
+
+**Two behavior changes, both improvements, both asserted by tests:**
+
+| Situation | Before | After |
+|---|---|---|
+| Batch mixes registered and unregistered caller buffers | contract violation, batch failed | works; the engine stages the unregistered ones |
+| Staged batch needs more than the bounce buffer holds | whole peer batch failed | chunked into pool-sized round trips |
+
+Both fall out of moving staging into the engine. The old code reserved the
+whole batch's staging up front and held one mutex from submit to wait, so a
+submit-all over several staging peers would deadlock — hence `permit_staging`,
+the all-zero-copy-or-all-staging contract, and the two-armed fork in
+`ExecuteBatch{Put,Get}Plan`. All of it is gone: a plan that needs the pool
+completes *inside* `Submit`, so the lock is never held across a return.
+`test_cross_node_smoke`'s `PutStagingOverflowFailsBatchCleanly` asserted the old
+behavior and was replaced by `PutStagingLargerThanPoolIsChunkedNotFailed` plus
+`PutPageLargerThanStagingPoolFailsBatchCleanly` — the failure that is still a
+failure is a single *page* larger than the entire pool, which cannot be chunked.
+
+**Phase 5's two type-enforced rules closed here**, as §5 predicted:
+
+- *Rule C* — `MemoryRegistrar` (register/deregister) and
+  `TransferEngine : MemoryRegistrar` (+ `CanHandle`/`Plan`/`Submit`).
+  `MediumBackend::Init` takes a `MemoryRegistrar*`, so "a backend must not move
+  bytes" is a compile error, not a lint rule.
+- *Rule A* — deleting `LocalBufferViews()` removed the last concrete-typed call,
+  so `PoolClient::Init` builds through `MakePageBackend() -> unique_ptr<
+  MediumBackend>`. `PageBackend`'s class definition stays in its header because
+  its unit tests drive the allocator bookkeeping directly; what matters for the
+  acceptance test is that the production path names no concrete backend, and it
+  no longer does.
+
+`LocalBufferViews()` was replaced on the interface by `BufferRef(buffer_index)`
++ `BufferCount()`. The difference is the point: a `TransferRef` is
+medium-agnostic (§2), a raw base pointer is not. Publishing refs is what let
+`PoolClient` drop `local_copy_backend_` / `local_buffers_` / `CanCopyLocally`,
+and it is why a second medium's local access needs no tier branch in a copy loop.
+
+**Layout.** §3's three components are now three directories, so the boundary is
+visible in the tree rather than only in the prose — and so the Phase 5 lint
+rules can be scoped by directory, which is what Phase 0 already did for the
+dormant SSD adapter:
+
+```
+distributed/
+  master/ routing/                                     control plane
+  transfer/   transfer_engine  mori_io_engine  local_copy_engine  composite_*
+  peer/       peer_service.{h,cpp}  batch_resolve_codec.h    (the RPC surface)
+    backend/  medium_backend.h  page_backend  mock_backend  peer_page_allocator.h
+    ssd/      peer_ssd_manager  ssd_copy_pipeline            (dormant since Phase 0)
+```
+
+`transfer/` is a sibling of `peer/`, not a child of it, and the include graph is
+why: `peer_service` — the reason `peer/` exists — references the transfer layer
+**zero** times, because a peer hands out descriptors and the *initiator* moves
+the bytes. `transfer/` depends on nothing but `types.h`; `backend/` and
+`pool_client` depend on it. It is the lowest layer, so nesting it inside a
+higher-level sibling would invert the layering. `LocalCopyEngine` settles it
+from the other direction: a memcpy between two of this node's own buffers has no
+peer in it at all.
+
+`backend/` does belong under `peer/`: `PeerServiceServer` dispatches every
+Allocate/Commit/Resolve/Evict into `BackendRegistry`, and capacity, eviction and
+the heartbeat outbox are all statements about what this node holds *for the
+cluster*.
+
+Rule C is a type now, but "no file under `backend/` may name a transfer type
+other than `MemoryRegistrar`/`TransferRef`" is a one-line grep against a
+directory, and so is Rule B's `local/tiers/*` exemption.
+
+*Gate:* `bench_pool_client_batch_get` / `bench_pool_client_batch_put` unchanged;
+see §9.
 
 Only after this phase does Phase 2 option (a), real HBM, become a clean
 1-file change.
@@ -626,6 +760,19 @@ router's "SSD is not a direct-put target" rule, so SSD must re-assert it itself
 or the router will place direct puts on it. Drivers, SPDK env, allocator, proxy protocol, segment format,
 eviction policy, the peer-side ownership map and the copy-on-commit pipeline are
 reused as-is.
+
+Concretely, `SsdBackend` is now three things, none of which touch a call site:
+add a `kind` tag + file handle set to `TransferRef`; implement
+`BufferRef`/`BufferCount` over its extents; register it in `PoolClient::Init`.
+The engine that reads those extents (`PosixEngine` / `GdsEngine`) is a fourth
+file, and `CompositeTransferEngine::SelectEngine` routes to it with no edit.
+
+**One place still names a concrete type, deliberately: `PoolClient::Init`.**
+It constructs `LocalCopyEngine`, `MoriIoEngine`, `CompositeTransferEngine` and
+(via `MakePageBackend`) the DRAM backend. That is a composition root, not a
+leak — the test the acceptance criterion actually states is that *no other* file
+names one, and none does. Everything downstream holds `MediumBackend`,
+`TransferEngine`, `MemoryRegistrar`, or `PeerDirectory`.
 
 ---
 

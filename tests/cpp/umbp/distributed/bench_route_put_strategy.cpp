@@ -95,7 +95,7 @@
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/master/master_client.h"
 #include "umbp/distributed/master/master_server.h"
-#include "umbp/distributed/peer/page_backend.h"
+#include "umbp/distributed/peer/backend/page_backend.h"
 #include "umbp/distributed/pool_client.h"
 
 using mori::umbp::MasterServer;

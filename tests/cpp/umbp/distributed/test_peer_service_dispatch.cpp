@@ -47,8 +47,8 @@
 #include <string>
 #include <vector>
 
-#include "umbp/distributed/peer/medium_backend.h"
-#include "umbp/distributed/peer/mock_backend.h"
+#include "umbp/distributed/peer/backend/medium_backend.h"
+#include "umbp/distributed/peer/backend/mock_backend.h"
 #include "umbp/distributed/peer/peer_service.h"
 #include "umbp_peer.grpc.pb.h"
 

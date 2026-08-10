@@ -30,7 +30,7 @@
 #include <utility>
 #include <vector>
 
-#include "umbp/distributed/peer/medium_backend.h"
+#include "umbp/distributed/peer/backend/medium_backend.h"
 #include "umbp/distributed/types.h"
 
 namespace mori::umbp {
@@ -53,7 +53,7 @@ class MockBackend : public MediumBackend {
   TierType Tier() const override { return tier_; }
   const char* Name() const override { return "MockBackend"; }
 
-  bool Init(TransferEngine* /*engine*/) override {
+  bool Init(MemoryRegistrar* /*registrar*/) override {
     initialized_ = true;
     return true;
   }
@@ -185,6 +185,14 @@ class MockBackend : public MediumBackend {
 
   uint64_t PageSize() const override { return 1; }
   std::vector<BufferMemoryDescBytes> AllBufferDescs() const override { return {}; }
+
+  // This backend keeps each key in its own std::vector rather than in paged
+  // buffers, so it publishes no buffer endpoints and its ResolvedEntry carries
+  // no pages.  A caller that tries to transfer against it gets an invalid ref
+  // and must treat the key as unservable here — which is exactly the shape a
+  // real medium takes when a tier has no live backend on this node.
+  size_t BufferCount() const override { return 0; }
+  TransferRef BufferRef(uint32_t /*buffer_index*/) const override { return TransferRef{}; }
 
  private:
   struct PendingSlot {

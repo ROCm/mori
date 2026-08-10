@@ -173,8 +173,7 @@ include/umbp/
 ├── distributed/
 │   ├── config.h                       # MasterServerConfig, PoolClientConfig, ClientRegistryConfig
 │   ├── distributed_client.h           # DistributedClient (IUMBPClient impl)
-│   ├── pool_client.h                  # PoolClient (master + peer + IO engine glue)
-│   ├── pool_allocator.h
+│   ├── pool_client.h                  # PoolClient (master + peer + transfer engine glue)
 │   ├── obs_counters.h                 # MORI_UMBP_OBS_* / test-seam build switch
 │   ├── types.h                        # TierType, Location, KvEvent, ClientRecord, ...
 │   ├── master/
@@ -185,12 +184,23 @@ include/umbp/
 │   │   ├── external_kv_block_index.h
 │   │   ├── eviction_manager.h
 │   │   └── master_metrics.h           # MORI_UMBP_METRIC_* name/help strings
+│   ├── transfer/                      # the one byte-moving path; a sibling of
+│   │   │                              # peer/ because peer_service never uses it
+│   │   ├── transfer_engine.h          # TransferRef, MemoryRegistrar, PeerDirectory
+│   │   ├── mori_io_engine.h           # RDMA, via mori-io
+│   │   ├── local_copy_engine.h        # both endpoints local (no peer involved)
+│   │   └── composite_transfer_engine.h
 │   ├── peer/
-│   │   ├── peer_service.h             # UMBPPeer gRPC server
-│   │   ├── peer_dram_allocator.h      # canonical per-node DRAM/HBM owner
-│   │   ├── peer_ssd_manager.h         # canonical per-node SSD owner
-│   │   ├── ssd_copy_pipeline.h        # async copy-on-commit DRAM→SSD
-│   │   └── peer_page_allocator.h      # PageBitmapAllocator
+│   │   ├── peer_service.h             # UMBPPeer gRPC server (dispatches via BackendRegistry)
+│   │   ├── batch_resolve_codec.h      # BatchResolveKeys wire codec
+│   │   ├── backend/                   # storage media: own bytes, publish endpoints
+│   │   │   ├── medium_backend.h       # MediumBackend contract + BackendRegistry
+│   │   │   ├── page_backend.h         # canonical per-node DRAM/HBM owner
+│   │   │   ├── mock_backend.h         # second registered medium, test-only
+│   │   │   └── peer_page_allocator.h  # PageBitmapAllocator
+│   │   └── ssd/                       # dormant since Phase 0 of the backend refactor
+│   │       ├── peer_ssd_manager.h     # canonical per-node SSD owner
+│   │       └── ssd_copy_pipeline.h    # async copy-on-commit DRAM→SSD
 │   └── routing/
 │       ├── router.h
 │       ├── route_get_strategy.h       # TierPriorityRouteGetStrategy (default), RandomRouteGetStrategy

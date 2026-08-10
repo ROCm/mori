@@ -39,14 +39,14 @@
 #include "mori/io/engine.hpp"
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/master/master_client.h"
-#include "umbp/distributed/peer/medium_backend.h"
+#include "umbp/distributed/peer/backend/medium_backend.h"
+#include "umbp/distributed/transfer/transfer_engine.h"
 #include "umbp/distributed/types.h"
 #include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {
 
 class PeerServiceServer;
-class TransferEngine;
 
 // Short name for log output. Generic FAILED maps to "FAILED" — the
 // detailed reason for that case lives in the peer's allocator log.
@@ -169,42 +169,27 @@ class PoolClient {
   BackendRegistry registry_;
   std::unique_ptr<PeerServiceServer> peer_service_;
 
-  // The local (self-target) Put/Get fast path copies bytes with a raw memcpy,
-  // which needs a base pointer MediumBackend deliberately does not expose
-  // (design doc §2: bytes addressed by a raw pointer are medium-specific).  So
-  // PoolClient keeps a non-owning handle to the one backend whose bytes it can
-  // memcpy plus a snapshot of that backend's immutable bases; every other
-  // medium routes remotely.  Both go away in Phase 6, when a local transfer
-  // becomes just a transfer whose endpoints are both local.
-  struct LocalBufferView {
-    void* base = nullptr;
-    uint64_t size = 0;
-  };
-  MediumBackend* local_copy_backend_ = nullptr;
-  std::vector<LocalBufferView> local_buffers_;
-  bool CanCopyLocally(const MediumBackend* backend) const {
-    return backend != nullptr && backend == local_copy_backend_;
-  }
-
-  std::unique_ptr<mori::io::IOEngine> io_engine_;
-  // Registration shim handed to each backend's Init() (design doc §5 Phase 2 /
-  // §4): forwards to io_engine_ today; Phase 6 replaces it with
-  // CompositeTransferEngine without any backend-visible change.
+  // The one byte-moving path (design doc §4).  PoolClient owns the engine;
+  // backends receive it narrowed to MemoryRegistrar at Init, so they can
+  // publish endpoints but cannot transfer.
+  //
+  // `peers_` (below) is the control-plane half of talking to another node —
+  // the gRPC stub.  `peer_directory_` is the TRANSPORT half, and it is a
+  // non-owning pointer to the sub-engine that implements PeerDirectory, not to
+  // a concrete engine type: adding a second remote transport means implementing
+  // that interface, not editing this file.  Null when this node has no remote
+  // transport configured, in which case only local transfers are servicable.
   std::unique_ptr<TransferEngine> transfer_engine_;
-  mori::io::MemoryDesc staging_mem_{};
-  std::unique_ptr<char[]> staging_buffer_;
-  std::mutex staging_mutex_;
+  PeerDirectory* peer_directory_ = nullptr;
 
-  // Lazy peer connections (one per remote node).  Engine descs cached
-  // here; DRAM memory descs hydrated on first AllocateSlot/ResolveKey
-  // response that references their buffer_index.
+  // Lazy peer connections (one per remote node).  Purely control plane since
+  // Phase 6: the peer's engine desc and buffer descriptors moved into
+  // MoriIoEngine, which is the layer that uses them.
   struct PeerConnection {
+    std::string node_id;
     std::string peer_address;
-    mori::io::EngineDesc engine_desc;
-    std::vector<mori::io::MemoryDesc> dram_memories;  // indexed by buffer_index
-    bool engine_registered = false;
     std::unique_ptr<void, void (*)(void*)> peer_stub{nullptr, +[](void*) {}};
-    // Guards first-contact connection setup (stub creation + engine/dram-desc
+    // Guards first-contact connection setup (stub creation + engine/buffer-desc
     // hydration via GetPeerInfo) in EnsurePeerServiceConnection.
     std::mutex conn_mutex;
   };
@@ -213,42 +198,31 @@ class PoolClient {
 
   // Caller MUST NOT hold peers_mutex_; this helper acquires it.
   PeerConnection& GetOrConnectPeer(const std::string& node_id, const std::string& peer_address);
-  // Hydrate peer.dram_memories[bd.buffer_index] for every entry in
-  // `descs`.  Idempotent.  Acquires peers_mutex_ internally.
-  void EnsureBufferDescsCached(PeerConnection& peer,
-                               const std::vector<BufferMemoryDescBytes>& descs);
-  // Same as above, but the caller MUST already hold peers_mutex_.  Lets the
-  // Build* helpers hydrate AND snapshot remote descs inside a single lock
-  // window so a concurrent hydrate (which may resize dram_memories) cannot
-  // race the reads.
-  void EnsureBufferDescsCachedLocked(PeerConnection& peer,
-                                     const std::vector<BufferMemoryDescBytes>& descs);
-
-  // Same-tier RDMA scatter helpers (keep as much of the prior impl as
-  // possible — the IO engine call shape is unchanged).
-  bool RemoteDramScatterWrite(PeerConnection& peer, const std::vector<PageLocation>& pages,
-                              uint64_t page_size, const void* src, size_t size, bool zero_copy);
-  bool RemoteDramScatterRead(PeerConnection& peer, const std::vector<PageLocation>& pages,
-                             uint64_t page_size, void* dst, size_t size, bool zero_copy);
-
-  // Self-target fast paths (no RDMA, no peer RPC).
-  bool LocalPutPages(const std::vector<PageLocation>& pages, uint64_t page_size, const void* src,
-                     size_t size);
-  bool LocalGetPages(const std::vector<PageLocation>& pages, uint64_t page_size, void* dst,
-                     size_t size);
 
   bool EnsurePeerServiceConnection(PeerConnection& peer);
+
+  // Endpoint for a caller-supplied buffer, plus the offset of `ptr` within it:
+  // the registered region when RegisterMemory pinned it (zero copy, ref covers
+  // the whole region), otherwise a plain host-bytes ref at offset 0 that the
+  // engine will stage through its own bounce buffer.
+  //
+  // One ref instead of the old optional<MemoryDesc> + use_staging + staging
+  // offset triple, because whether a transfer needs staging is the transfer
+  // layer's decision, not the client's.
+  std::pair<TransferRef, uint64_t> UserBufferRef(void* ptr, size_t size) const;
 
   // Zero-copy registered memory regions.
   struct RegisteredRegion {
     void* base;
     size_t size;
-    mori::io::MemoryDesc mem_desc;
+    TransferRef ref;
   };
-  std::mutex registered_mem_mutex_;
+  mutable std::mutex registered_mem_mutex_;
   std::vector<RegisteredRegion> registered_regions_;
-  std::optional<std::pair<mori::io::MemoryDesc, size_t>> FindRegisteredMemory(const void* ptr,
-                                                                              size_t size);
+  // The registered ref covering [ptr, ptr+size) plus the offset of ptr within
+  // it, or nullopt when the region was never registered.
+  std::optional<std::pair<TransferRef, size_t>> FindRegisteredMemory(const void* ptr,
+                                                                     size_t size) const;
 
   // Single-attempt outcome from a peer call; mapped to PutEntryOutcome
   // by the caller (Partition / Allocate).
@@ -258,6 +232,15 @@ class PoolClient {
   PutAttemptOutcome ExecuteLocalPut(const std::string& key, const void* src, size_t size,
                                     TierType tier);
   GetAttemptOutcome ExecuteLocalGet(const std::string& key, void* dst, size_t size);
+
+  // One TransferItem per page between a caller buffer and `backend`'s own
+  // buffers.  `to_backend` is Put (user -> pages), false is Get (pages -> user).
+  // False when the backend publishes no in-process endpoint for a referenced
+  // buffer — that medium cannot serve the access here, and the caller routes
+  // elsewhere rather than reporting a miss.
+  bool BuildLocalPageTransfers(MediumBackend* backend, const std::vector<PageLocation>& pages,
+                               uint64_t page_size, void* user, size_t size, bool to_backend,
+                               std::vector<TransferItem>* items);
   // After a successful remote DRAM fetch, if cache_remote_fetches is enabled and
   // the admission gate admits the block, enqueue it for asynchronous install into
   // this node's local DRAM tier (see ReCacheWorkerLoop). The install (DRAM
@@ -347,43 +330,11 @@ class PoolClient {
                            const std::vector<void*>& dsts, const std::vector<size_t>& sizes,
                            std::vector<bool>* results);
 
-  struct TransferInstruction {
-    size_t entry_index;
-    mori::io::MemoryDesc local_desc;
-    uint64_t local_offset;
-    mori::io::MemoryDesc remote_desc;
-    uint64_t remote_offset;
-    uint64_t size;
-  };
-
-  // A set of page transfers sharing the same (localMR, remoteMR) pair.  All
-  // its pages collapse into ONE outer IO transfer whose inner offset/size
-  // vectors are scatter-gather segments, cutting CQE/status/post count vs
-  // one-transfer-per-page.  `entry_indices` is the de-duplicated list of
-  // entries contributing pages to this group (for per-key failure mapping).
-  struct PairGroup {
-    mori::io::MemoryDesc local_desc;
-    mori::io::MemoryDesc remote_desc;
-    std::vector<size_t> local_offsets;
-    std::vector<size_t> remote_offsets;
-    std::vector<size_t> sizes;
-    std::vector<size_t> entry_indices;
-  };
-  // Group `active` page transfers by (local_desc.id, remote_desc.id),
-  // preserving first-appearance order (stable).  Assumes a fixed page size
-  // per (localMR, remoteMR) pair (1 buffer == 1 page size in the current
-  // model); mixed page sizes would require folding page size into the key.
-  static std::vector<PairGroup> GroupTransfersByPair(
-      const std::vector<TransferInstruction>& active);
-
   struct RemotePutEntry {
     size_t result_index;
     const BatchPutItem* item;
     SlotPlan plan;
     uint64_t slot_id;
-    std::optional<std::pair<mori::io::MemoryDesc, size_t>> zero_copy;
-    bool use_staging = false;
-    uint64_t staging_offset = 0;
     bool failed = false;
   };
 
@@ -391,9 +342,6 @@ class PoolClient {
     size_t result_index;
     const BatchGetItem* item;
     SlotPlan plan;
-    std::optional<std::pair<mori::io::MemoryDesc, size_t>> zero_copy;
-    bool use_staging = false;
-    uint64_t staging_offset = 0;
     bool failed = false;
   };
 
@@ -401,9 +349,11 @@ class PoolClient {
                                 ::umbp::UMBPPeer::Stub* stub, std::vector<RemotePutEntry>* entries,
                                 std::vector<uint64_t>* abort_slots,
                                 std::vector<PutEntryOutcome>* results);
-  bool BuildRemotePutTransfers(std::vector<RemotePutEntry>& entries, PeerConnection& peer,
-                               std::vector<TransferInstruction>* transfers,
-                               uint64_t* staging_bytes);
+  // Build one TransferItem per page, tagged with the entry index.  Whether an
+  // item ends up zero-copy or staged, and how items group into wire transfers,
+  // are both the engine's business now — this only names endpoints.
+  bool BuildRemotePutTransfers(std::vector<RemotePutEntry>& entries, const std::string& node_id,
+                               std::vector<TransferItem>* items);
   void FinalizeRemotePutEntries(std::vector<RemotePutEntry>& entries,
                                 std::vector<uint64_t>& abort_slots,
                                 std::vector<PutEntryOutcome>* results,
@@ -412,110 +362,65 @@ class PoolClient {
   bool PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items, PeerConnection& peer,
                                ::umbp::UMBPPeer::Stub* stub, std::vector<RemoteGetEntry>* entries,
                                std::vector<bool>* results);
-  bool BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries, PeerConnection& peer,
-                               std::vector<TransferInstruction>* transfers,
-                               uint64_t* staging_bytes);
+  bool BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries, const std::string& node_id,
+                               std::vector<TransferItem>* items);
   void FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries, std::vector<bool>* results);
 
-  // One posted-but-not-yet-waited remote-DRAM read for a single peer; the
-  // scheduler waits it later. Owned by a unique_ptr and never moved after
-  // submit: the RDMA backend keeps a RAW TransferStatus* into `statuses`, so it
-  // must outlive BatchRead and never move (sized once to G, never resized).
-  struct RemoteDramGetInFlight {
+  // One posted-but-not-yet-waited remote read for a single peer; the scheduler
+  // waits it later.  The lifetime contract that used to live here — statuses
+  // sized once and never moved, drained by the destructor — moved into the
+  // engine's TransferHandle, which is where the raw TransferStatus* the RDMA
+  // backend holds actually live.
+  struct RemoteGetInFlight {
     PeerConnection* peer = nullptr;
     std::vector<RemoteGetEntry> entries;
-    std::vector<PairGroup> groups;
-    mori::io::MemDescVec local_descs;
-    mori::io::MemDescVec remote_descs;
-    mori::io::BatchSizeVec local_offsets;
-    mori::io::BatchSizeVec remote_offsets;
-    mori::io::BatchSizeVec sizes_v;
-    std::vector<mori::io::TransferStatus> statuses;  // size G; built once, never resized/moved
-    mori::io::TransferStatusPtrVec status_ptrs;      // &statuses[g]
-    mori::io::TransferUniqueIdVec ids;
-    bool drained = false;  // set once statuses have been Wait()ed (drain or WaitRemoteBatchGet)
-    // Staging (non-zero-copy) state; zero / unlocked for the zero-copy path.
-    uint64_t staging_bytes = 0;
-    std::unique_lock<std::mutex> staging_lock;  // holds staging_mutex_ submit..memcpy
-
-    // Safety net: BatchRead is posted (not waited) and the backend CQ callback
-    // holds raw TransferStatus* into `statuses`. On an early/exceptional destroy
-    // (before WaitRemoteBatchGet), drain so the callback never writes freed
-    // memory. No failure mapping / result backfill — that's WaitRemoteBatchGet.
-    ~RemoteDramGetInFlight() {
-      if (drained) return;
-      for (auto& s : statuses) s.Wait();
-    }
+    std::unique_ptr<TransferHandle> handle;
+    bool drained = false;
   };
 
   // Submit half: GetOrConnectPeer + EnsurePeerServiceConnection +
-  // PrepareRemoteGetEntries + BuildRemoteGetTransfers + GroupTransfersByPair +
-  // BatchRead (NOT waited).  Returns the in-flight handle, or nullptr if nothing
-  // is in flight (peer unreachable / resolve / build failure — failed keys
-  // already written to *results).  When `permit_staging` is false (the zero-copy
-  // submit-all path), a batch that needs staging is treated as a contract
-  // violation and failed rather than acquiring staging_mutex_ (a submit-all over
-  // multiple staging peers would deadlock on the single lock).  When true (the
-  // serial staging path), staging_mutex_ is acquired here and parked in the
-  // in-flight until WaitRemoteBatchGet copies staging -> dst.
-  std::unique_ptr<RemoteDramGetInFlight> SubmitRemoteBatchGet(
-      const std::vector<BatchGetItem>& items, std::vector<bool>* results, bool permit_staging);
-  // Wait half: wait every group (never break early), aggregate per-pair failure
-  // back to per-key (per-item AND); for a staging in-flight, copy staging_buffer_
-  // -> user dst and release staging_mutex_; then FinalizeRemoteGetEntries.
-  void WaitRemoteBatchGet(RemoteDramGetInFlight& inflight, std::vector<bool>* results);
+  // PrepareRemoteGetEntries + BuildRemoteGetTransfers + engine Plan/Submit (NOT
+  // waited).  Returns the in-flight handle, or nullptr if nothing is in flight
+  // (peer unreachable / resolve / build failure — failed keys already written
+  // to *results).
+  //
+  // There is no longer a permit_staging flag: a batch whose dst is unregistered
+  // is staged INSIDE the engine's Submit and comes back already settled, so a
+  // submit-all loop over several peers cannot deadlock on the bounce pool and a
+  // batch that mixes registered and unregistered buffers is no longer a
+  // contract violation — it just works.
+  std::unique_ptr<RemoteGetInFlight> SubmitRemoteBatchGet(const std::vector<BatchGetItem>& items,
+                                                          std::vector<bool>* results);
+  // Wait half: wait the handle (never breaks early), map per-plan failure back
+  // to per-key (per-item AND), then FinalizeRemoteGetEntries.
+  void WaitRemoteBatchGet(RemoteGetInFlight& inflight, std::vector<bool>* results);
 
-  // One posted-but-not-yet-waited remote-DRAM write for a single peer (same
-  // lifetime contract as RemoteDramGetInFlight: unique_ptr-owned, never moved
-  // after submit; the backend holds raw TransferStatus* into `statuses`, sized
-  // once to G).  Put also carries the slot lifecycle: `entries`/`abort_slots`
-  // feed FinalizeRemotePutEntries and `stub` issues its commit/abort RPCs.
-  struct RemoteDramPutInFlight {
+  // Put's counterpart.  Also carries the slot lifecycle: `entries` /
+  // `abort_slots` feed FinalizeRemotePutEntries and `stub` issues its
+  // commit/abort RPCs.
+  struct RemotePutInFlight {
     PeerConnection* peer = nullptr;
     ::umbp::UMBPPeer::Stub* stub = nullptr;
     std::vector<RemotePutEntry> entries;
     // Malformed slots from Allocate (not in `entries`); Finalize appends
     // entry.failed slots and aborts the union (peer Abort is idempotent).
     std::vector<uint64_t> abort_slots;
-    std::vector<PairGroup> groups;
-    mori::io::MemDescVec local_descs;
-    mori::io::MemDescVec remote_descs;
-    mori::io::BatchSizeVec local_offsets;
-    mori::io::BatchSizeVec remote_offsets;
-    mori::io::BatchSizeVec sizes_v;
-    std::vector<mori::io::TransferStatus> statuses;  // size G; built once, never resized/moved
-    mori::io::TransferStatusPtrVec status_ptrs;      // &statuses[g]
-    mori::io::TransferUniqueIdVec ids;
+    std::unique_ptr<TransferHandle> handle;
     bool drained = false;
-    uint64_t staging_bytes = 0;
-    std::unique_lock<std::mutex> staging_lock;  // holds staging_mutex_ submit(memcpy)..wait
-
-    // Safety net (mirror Get): drain posted statuses on an early destroy so the
-    // backend CQ callback never writes freed memory. Slots are NOT committed/
-    // aborted here — an un-committed slot never enters the master index, so it is
-    // correctness-neutral and the peer reaper reclaims it at pending_ttl.
-    ~RemoteDramPutInFlight() {
-      if (drained) return;
-      for (auto& s : statuses) s.Wait();
-    }
   };
 
-  // Submit half: allocate + build + (staging: memcpy src -> staging_buffer_ under
-  // staging_mutex_) + group + BatchWrite (NOT waited).  Returns the in-flight, or
-  // nullptr if nothing is posted — in which case any allocated slots are aborted
-  // and the keys written kFailed here.  Entries that fail during build but still
-  // post ride in the in-flight and are aborted by FinalizeRemotePutEntries at
-  // wait time (no early abort, avoids double-abort).  permit_staging=false on the
-  // zero-copy submit-all path (staging would deadlock the single lock); true on
-  // the serial staging path, which parks staging_mutex_ in the in-flight.
-  std::unique_ptr<RemoteDramPutInFlight> SubmitRemoteBatchPut(
-      const std::vector<BatchPutItem>& items, std::vector<PutEntryOutcome>* results,
-      bool permit_staging);
-  // Wait half: wait every group (never break early), aggregate per-pair failure
-  // back to per-key (per-item AND), release staging_mutex_ (Put has no
-  // staging->dst copy-out), then FinalizeRemotePutEntries (commit survivors,
-  // abort failures + malformed slots).
-  void WaitRemoteBatchPut(RemoteDramPutInFlight& inflight, std::vector<PutEntryOutcome>* results);
+  // Submit half: allocate + build + engine Plan/Submit (NOT waited).  Returns
+  // the in-flight, or nullptr if nothing is posted — in which case any
+  // allocated slots are aborted and the keys written kFailed here.  Entries
+  // that fail during build but still post ride in the in-flight and are aborted
+  // by FinalizeRemotePutEntries at wait time (no early abort, avoids
+  // double-abort).
+  std::unique_ptr<RemotePutInFlight> SubmitRemoteBatchPut(const std::vector<BatchPutItem>& items,
+                                                          std::vector<PutEntryOutcome>* results);
+  // Wait half: wait the handle, map per-plan failure back to per-key, then
+  // FinalizeRemotePutEntries (commit survivors, abort failures + malformed
+  // slots).
+  void WaitRemoteBatchPut(RemotePutInFlight& inflight, std::vector<PutEntryOutcome>* results);
 };
 
 }  // namespace mori::umbp
