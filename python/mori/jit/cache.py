@@ -83,9 +83,27 @@ def get_cache_dir(
     ccqe_suffix = "_ccqe" if ccqe else ""
     profiler_suffix = "_profiler" if profiler else ""
     cov_suffix = f"_cov{cov}" if cov is not None else ""
+    # There are no per-gate suffixes any more: the dispatch and combine transports are decided by
+    # the arch macros the device compiler defines, and `arch` is already the first component of this
+    # key. Both dispatch kernels are always built and the host selects one at runtime, so that choice
+    # does not split the cache either -- one .hsaco serves both paths.
+    #
+    # The hash below is what actually guarantees that: it covers the REAL -D list rather than a
+    # hand-maintained restatement of it, so a value-carrying flag added to _tunable_defines() later
+    # lands in its own directory without anyone having to remember to name it here. That is the bug
+    # this closes for good -- a gate that changed the emitted code but not the directory name handed
+    # one build the other one's binary, and the run that hit it reported "deleting the local quantise
+    # pass costs 0us", which reads as a fact about the kernel rather than about the cache. It survived
+    # review because 0 is a plausible-looking number, and two more gates added the same day repeated
+    # it. A second list cannot be kept in step by care; the fix that holds is not having one.
+    from .core import _tunable_defines
+
+    flag_hash = hashlib.sha256(
+        "|".join(sorted(_tunable_defines())).encode()
+    ).hexdigest()[:8]
     d = (
         get_cache_root()
-        / f"{arch}_{nic}{ccqe_suffix}{profiler_suffix}{cov_suffix}"
+        / f"{arch}_{nic}{ccqe_suffix}{profiler_suffix}{cov_suffix}_f{flag_hash}"
         / content_hash
     )
     d.mkdir(parents=True, exist_ok=True)

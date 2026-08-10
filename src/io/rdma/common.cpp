@@ -39,6 +39,7 @@
 
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
+#include "src/io/roctx_mori.hpp"  // ADDITIVE: MORI_ROCTX-gated host-I/O markers
 
 namespace mori {
 namespace io {
@@ -606,6 +607,16 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
                              TransferUniqueId id, bool isRead, int postBatchSize,
                              const RdmaTransferControl& control) {
   MORI_IO_FUNCTION_TIMER;
+  // ADDITIVE (MORI_ROCTX=1): brackets host submission for this generic RDMA I/O
+  // batch; both reads and writes route here.
+  // bytes= carries the whole-call payload (sum of the per-request sizes).
+  const uint64_t roctxBytes =
+      mori::io::MoriRoctxPostEnabled()
+          ? std::accumulate(sizes.begin(), sizes.end(), static_cast<uint64_t>(0))
+          : 0;
+  mori::io::MoriRoctxRange _mori_roctx_(
+      isRead ? "mori.rdma.batch_post.read" : "mori.rdma.batch_post.write",
+      static_cast<uint64_t>(id), roctxBytes);
 
   if ((localOffsets.size() != remoteOffsets.size()) || (sizes.size() != remoteOffsets.size())) {
     return {StatusCode::ERR_INVALID_ARGS,
@@ -883,6 +894,13 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
 
   epWrsSinceSignal.assign(epNum, 0);
   epMergedSinceSignal.assign(epNum, 0);
+  const bool roctxTransferEnabled = mori::io::MoriRoctxTransferEnabled();
+  // ADDITIVE (MORI_ROCTX_TRANSFER=1): payload bytes accumulated since the last
+  // signal on each EP (mirrors epMergedSinceSignal); attached to the signaled
+  // record's io_transfer range and reset on signal. The empty vector does not
+  // allocate when transfer markers are disabled.
+  std::vector<size_t> epBytesSinceSignal;
+  if (roctxTransferEnabled) epBytesSinceSignal.assign(epNum, 0);
 
   // Rotate the starting EP by transfer id so single-segment (single WR)
   // transfers spread evenly across all QPs instead of always landing on eps[0].
@@ -919,6 +937,13 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
 
     epWrsSinceSignal[epId] += batchWrNum;
     epMergedSinceSignal[epId] += mergedReqSize;
+    if (roctxTransferEnabled) {
+      size_t batchBytes = 0;
+      for (int j = st; j < end; ++j) {
+        batchBytes += mergedWrs[j].totalRemoteLength;
+      }
+      epBytesSinceSignal[epId] += batchBytes;
+    }
 
     bool isLastBatchForEp = ((i + epNum) >= numPostBatch);
     bool sqNearFull = eps[epId].sqDepth && (epWrsSinceSignal[epId] >= eps[epId].maxSqDepth);
@@ -936,6 +961,16 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
                                           static_cast<int>(epMergedSinceSignal[epId]));
       last.wr_id = recordId;
       last.send_flags = IBV_SEND_SIGNALED;
+      // ADDITIVE (MORI_ROCTX_TRANSFER=1): start an ASYNC post-to-completion range
+      // for this signaled WR, keyed by (ledger, recordId). It stops when the CQE
+      // is processed or, if this WR fails to post, in the cleanup below. The
+      // range includes submission/ibv_post_send, NIC/SQ queueing, transfer, CQ
+      // availability/polling, and software processing through marker stop.
+      if (roctxTransferEnabled) {
+        mori::io::MoriRoctxTransferStart(eps[epId].ledger.get(), recordId,
+                                         static_cast<uint64_t>(id), isRead,
+                                         static_cast<uint64_t>(epBytesSinceSignal[epId]));
+      }
     }
 
     struct ibv_send_wr* badWr = nullptr;
@@ -972,6 +1007,11 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
       } else if (needSignal) {
         int dummy = 0;
         eps[epId].ledger->ReleaseByCqe(recordId, nullptr, &dummy);
+        if (roctxTransferEnabled) {
+          // The signaled WR never posted, so no CQE will arrive. Stop its async
+          // range here to avoid a leaked range.
+          mori::io::MoriRoctxTransferStop(eps[epId].ledger.get(), recordId);
+        }
       }
 
       if (postedCount > 0 && (!needSignal || !lastWasPosted)) {
@@ -1022,6 +1062,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
     if (needSignal) {
       epWrsSinceSignal[epId] = 0;
       epMergedSinceSignal[epId] = 0;
+      if (roctxTransferEnabled) epBytesSinceSignal[epId] = 0;
     }
     MORI_IO_TRACE("ibv_post_send ep index {} batch index range [{}, {})", epId, st, end);
   }

@@ -346,9 +346,27 @@ def assert_worker_results(manager, world_size):
         rank, result = manager.result_queue.get()
         results.append((rank, result))
 
-    for _, result in sorted(results, key=lambda item: item[0]):
-        if result is not None:
-            pytest.assume(False, result)
+    failures = [
+        (rank, result)
+        for rank, result in sorted(results, key=lambda item: item[0])
+        if result is not None
+    ]
+    if not failures:
+        return
+
+    # pytest.assume needs pytest-assume, which requirements-build.txt asks for but a test
+    # environment can still be missing. Without this fallback its absence raises AttributeError
+    # from inside the reporting path, and the worker's message -- the only description of what
+    # actually failed -- is replaced by a complaint about the reporter. Reported once with every
+    # rank's message, so a failure that hits some ranks and not others is still legible.
+    assume = getattr(pytest, "assume", None)
+    if assume is None:
+        report = "\n".join(f"[rank {rank}] {result}" for rank, result in failures)
+        pytest.fail(
+            f"{len(failures)} of {world_size} ranks failed:\n{report}", pytrace=False
+        )
+    for _, result in failures:
+        assume(False, result)
 
 
 class EpDispatchCombineTestCase:
@@ -411,6 +429,24 @@ class EpDispatchCombineTestCase:
                     ) * self.config.num_experts_per_token
                     for j in range(self.config.num_experts_per_token):
                         indices[i, j] = (base + j) % total_experts
+            elif routing == "remote_round_robin":
+                # Balanced, no-skew round-robin over every destination rank
+                # except the local one, then round-robins over that rank's
+                # own experts to pick which one receives the token.
+                assert (
+                    self.config.world_size > 1
+                ), "remote_round_robin routing requires world_size > 1"
+                indices = torch.empty(
+                    n, self.config.num_experts_per_token, dtype=torch.int64
+                )
+                ws = self.config.world_size
+                nepr = self.config.num_experts_per_rank
+                for i in range(n):
+                    for j in range(self.config.num_experts_per_token):
+                        rec = i * self.config.num_experts_per_token + j
+                        dst = (r + 1 + (rec % (ws - 1))) % ws
+                        local_e = (rec // (ws - 1)) % nepr
+                        indices[i, j] = dst * nepr + local_e
             elif routing == "spread":
                 # Sends exactly one expert to every rank (requires num_experts_per_token ==
                 # world_size). After per-rank deduplication each rank receives every source

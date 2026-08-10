@@ -10,6 +10,7 @@ MORI-IO is AMD's point-to-point communication library that leverages GDR (GPU Di
 - [Python API Quick Reference](#python-api-quick-reference)
 - [Example: Basic Read/Write](#example-basic-readwrite)
 - [Environment & Configuration](#environment--configuration)
+- [Profiling MORI-IO with ROCTX Markers](#profiling-mori-io-with-roctx-markers)
 - [Source Files](#source-files)
 
 ## Design & Concepts
@@ -181,6 +182,38 @@ See `examples/io/example.py` for more complete examples including batch transfer
 UMBP (the upper-layer cache pool) exposes a separate set of runtime-tunable
 env vars for distributed master / pool client / SPDK proxy timing. Those are
 out of scope for MORI-IO; see [`src/umbp/doc/runtime-env-vars.md`](../src/umbp/doc/runtime-env-vars.md).
+
+## Profiling MORI-IO with ROCTX Markers
+
+MORI-IO provides optional, runtime-gated ROCTX timeline markers for use with
+`rocprofv3 --marker-trace`. The following variables are disabled by default and
+operate independently:
+
+- `MORI_ROCTX` enables same-thread host submission ranges around MORI-IO
+  batch-write dispatch and RDMA posting paths. They measure host-side submission
+  and post work only, not completion latency.
+- `MORI_ROCTX_TRANSFER` enables process-wide ranges that begin immediately
+  before posting a signaled RDMA work request and end on the CQ polling thread
+  after its CQE is observed. They measure post-to-completion latency.
+
+Marker fields `bytes=` and `id=` identify application payload bytes (not
+physical RoCE wire bytes) and MORI's logical transfer ID, respectively. Key host
+marker families are `mori.io.*` and `mori.rdma.batch_post.*`; transfer markers
+use `mori.rdma.io_transfer[.read]`.
+
+Although generic to MORI-IO, these markers can help observe KV-cache
+post-to-completion latency in prefill/decode-disaggregated vLLM or SGLang
+deployments configured to use MORI-IO.
+
+```bash
+export MORI_ROCTX=1
+export MORI_ROCTX_TRANSFER=1
+rocprofv3 --marker-trace -- <your MORI command>
+```
+
+Either variable can be enabled alone. Enabled values include `1`, `on`, and
+`true`; disable a variable by unsetting it or setting it to `0`, `off`, or
+`false`.
 
 ## Source Files
 
