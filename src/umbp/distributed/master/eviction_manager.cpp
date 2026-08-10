@@ -97,8 +97,8 @@ void EvictionManager::RunOnce() {
   for (const auto& client : clients) {
     for (const auto& [tier, cap] : client.tier_capacities) {
       // SSD eviction is purely peer-local.  Master must NOT turn an SSD
-      // overload into an EvictKey: EvictKey only acts on the peer's
-      // PeerDramAllocator, so it would wrongly evict the DRAM copy of the same
+      // overload into an EvictKey: EvictKey only acts on the peer's DRAM
+      // PageBackend, so it would wrongly evict the DRAM copy of the same
       // key while leaving SSD untouched.
       if (tier == TierType::SSD) continue;
       if (cap.total_bytes == 0) continue;

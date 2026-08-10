@@ -147,7 +147,7 @@ struct PageLocation {
 };
 
 // One peer-side buffer's RDMA MemoryDesc bytes plus the buffer_index it
-// belongs to.  Returned by PeerDramAllocator and the peer service in
+// belongs to.  Returned by PageBackend and the peer service in
 // AllocateSlot / ResolveKey / GetPeerInfo responses so the Client can
 // hydrate its peer-side buffer_index -> MemoryDesc cache in a single
 // batch.

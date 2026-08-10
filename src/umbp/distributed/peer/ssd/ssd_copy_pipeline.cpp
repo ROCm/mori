@@ -25,7 +25,7 @@
 #include <utility>
 
 #include "mori/utils/mori_log.hpp"
-#include "umbp/distributed/peer/peer_dram_allocator.h"
+#include "umbp/distributed/peer/page_backend.h"
 #include "umbp/distributed/peer/ssd/peer_ssd_manager.h"
 
 namespace mori::umbp {
@@ -37,7 +37,7 @@ namespace {
 // pages against eviction.
 class DramCopyPinGuard {
  public:
-  DramCopyPinGuard(PeerDramAllocator* dram, std::string key, uint64_t token)
+  DramCopyPinGuard(PageBackend* dram, std::string key, uint64_t token)
       : dram_(dram), key_(std::move(key)), token_(token) {}
   ~DramCopyPinGuard() { dram_->ReleaseDramCopyPin(key_, token_); }
 
@@ -45,14 +45,14 @@ class DramCopyPinGuard {
   DramCopyPinGuard& operator=(const DramCopyPinGuard&) = delete;
 
  private:
-  PeerDramAllocator* dram_;
+  PageBackend* dram_;
   std::string key_;
   uint64_t token_;
 };
 
 }  // namespace
 
-SsdCopyPipeline::SsdCopyPipeline(PeerDramAllocator* dram, PeerSsdManager* ssd, size_t queue_depth,
+SsdCopyPipeline::SsdCopyPipeline(PageBackend* dram, PeerSsdManager* ssd, size_t queue_depth,
                                  size_t worker_threads)
     : dram_(dram),
       ssd_(ssd),

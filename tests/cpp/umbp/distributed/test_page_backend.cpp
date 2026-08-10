@@ -29,7 +29,7 @@
 #include <thread>
 #include <vector>
 
-#include "umbp/distributed/peer/peer_dram_allocator.h"
+#include "umbp/distributed/peer/page_backend.h"
 
 namespace mori::umbp {
 
@@ -38,37 +38,40 @@ namespace {
 // 3 buffers x 4 pages of 1 KiB = 12 KiB total DRAM.
 constexpr uint64_t kPageSize = 1024;
 
-PeerDramAllocator::TierConfig MakeDramCfg() {
-  PeerDramAllocator::TierConfig cfg;
+PageBackend::TierConfig MakeDramCfg() {
+  PageBackend::TierConfig cfg;
   cfg.buffer_sizes = {kPageSize * 4, kPageSize * 4, kPageSize * 4};
   cfg.buffer_descs = {{0xA0, 0xA1}, {0xB0, 0xB1}, {0xC0, 0xC1}};
   return cfg;
 }
 
-PeerDramAllocator::TierConfig EmptyCfg() { return {}; }
-
-std::unique_ptr<PeerDramAllocator> MakeAllocator(
+std::unique_ptr<PageBackend> MakeAllocator(
     std::chrono::milliseconds pending_ttl = std::chrono::milliseconds{5000},
     std::chrono::milliseconds read_lease_ttl = std::chrono::milliseconds{500}) {
-  return std::make_unique<PeerDramAllocator>(kPageSize, MakeDramCfg(), EmptyCfg(), pending_ttl,
-                                             read_lease_ttl);
+  return std::make_unique<PageBackend>(TierType::DRAM, kPageSize, MakeDramCfg(), pending_ttl,
+                                       read_lease_ttl);
 }
 
-// Strip AllocateResult down to its slot for tests that don't exercise
-// the dedup outcome.
-std::optional<PeerDramAllocator::PendingSlot> AllocateOk(PeerDramAllocator& a,
-                                                         const std::string& key, uint64_t size,
-                                                         TierType tier) {
-  return a.Allocate(key, size, tier).slot;
+// True iff `r` carries a live allocated slot (mirrors the pre-refactor
+// AllocateResult::slot.has_value(), now folded into AllocateResult's own
+// fields — see medium_backend.h).
+bool HasSlot(const AllocateResult& r) { return r.outcome == AllocateOutcome::kSuccessAllocated; }
+
+// Strip AllocateResult down to itself for tests that don't exercise the
+// dedup outcome — nullopt unless the allocation actually landed a slot.
+std::optional<AllocateResult> AllocateOk(PageBackend& a, const std::string& key, uint64_t size) {
+  auto r = a.Allocate(key, size);
+  if (!HasSlot(r)) return std::nullopt;
+  return r;
 }
 
 }  // namespace
 
 // ---- Allocate / Commit / Resolve happy path ---------------------------------
 
-TEST(PeerDramAllocator, CommitMakesKeyResolvable) {
+TEST(PageBackend, CommitMakesKeyResolvable) {
   auto a = MakeAllocator();
-  auto pending = AllocateOk(*a, "key-1", kPageSize, TierType::DRAM);
+  auto pending = AllocateOk(*a, "key-1", kPageSize);
   ASSERT_TRUE(pending.has_value());
   EXPECT_EQ(pending->size, kPageSize);
   EXPECT_EQ(pending->pages.size(), 1u);
@@ -79,7 +82,6 @@ TEST(PeerDramAllocator, CommitMakesKeyResolvable) {
   auto r = a->Resolve("key-1");
   EXPECT_TRUE(r.found);
   EXPECT_EQ(r.size, kPageSize);
-  EXPECT_EQ(r.tier, TierType::DRAM);
   EXPECT_EQ(r.pages, pending->pages);
 
   auto events = a->DrainPendingEvents();
@@ -93,54 +95,54 @@ TEST(PeerDramAllocator, CommitMakesKeyResolvable) {
 // ---- Allocate-side dedup ----------------------------------------------------
 // Defensive layer for master-index lag (primary dedup is at BatchRoutePut).
 
-TEST(PeerDramAllocator, AllocateRejectsAlreadyOwnedKey) {
+TEST(PageBackend, AllocateRejectsAlreadyOwnedKey) {
   auto a = MakeAllocator();
 
-  auto first = AllocateOk(*a, "A", kPageSize, TierType::DRAM);
+  auto first = AllocateOk(*a, "A", kPageSize);
   ASSERT_TRUE(first.has_value());
   uint64_t committed_bytes = 0;
   ASSERT_TRUE(a->Commit(first->slot_id, "A", committed_bytes));
   a->DrainPendingEvents();
 
-  const auto cap_after_commit = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  const auto cap_after_commit = a->Capacity();
 
-  auto second = a->Allocate("A", kPageSize, TierType::DRAM);
-  EXPECT_EQ(second.outcome, PeerDramAllocator::Outcome::kSuccessAlreadyExists);
-  EXPECT_FALSE(second.slot.has_value());
+  auto second = a->Allocate("A", kPageSize);
+  EXPECT_EQ(second.outcome, AllocateOutcome::kSuccessAlreadyExists);
+  EXPECT_FALSE(HasSlot(second));
 
   // No pages reserved -> capacity unchanged.
-  const auto cap_after_dedup = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  const auto cap_after_dedup = a->Capacity();
   EXPECT_EQ(cap_after_dedup.available_bytes, cap_after_commit.available_bytes);
 }
 
-TEST(PeerDramAllocator, AllocateAllowsDifferentKey) {
+TEST(PageBackend, AllocateAllowsDifferentKey) {
   auto a = MakeAllocator();
 
-  auto first = AllocateOk(*a, "A", kPageSize, TierType::DRAM);
+  auto first = AllocateOk(*a, "A", kPageSize);
   ASSERT_TRUE(first.has_value());
   uint64_t committed_bytes = 0;
   ASSERT_TRUE(a->Commit(first->slot_id, "A", committed_bytes));
 
-  auto second = a->Allocate("B", kPageSize, TierType::DRAM);
-  EXPECT_EQ(second.outcome, PeerDramAllocator::Outcome::kSuccessAllocated);
-  ASSERT_TRUE(second.slot.has_value());
-  EXPECT_TRUE(a->Commit(second.slot->slot_id, "B", committed_bytes));
+  auto second = a->Allocate("B", kPageSize);
+  EXPECT_EQ(second.outcome, AllocateOutcome::kSuccessAllocated);
+  ASSERT_TRUE(HasSlot(second));
+  EXPECT_TRUE(a->Commit(second.slot_id, "B", committed_bytes));
 }
 
 // Lax mode: pending_ not checked.  Two same-key Allocates before any
 // Commit both succeed; race absorbed by Commit() (see
 // DuplicateCommitIsIdempotentAndKeepsFirst).
-TEST(PeerDramAllocator, AllocateDoesNotRejectOnPendingDuplicate) {
+TEST(PageBackend, AllocateDoesNotRejectOnPendingDuplicate) {
   auto a = MakeAllocator();
 
-  auto first = a->Allocate("A", kPageSize, TierType::DRAM);
-  EXPECT_EQ(first.outcome, PeerDramAllocator::Outcome::kSuccessAllocated);
-  ASSERT_TRUE(first.slot.has_value());
+  auto first = a->Allocate("A", kPageSize);
+  EXPECT_EQ(first.outcome, AllocateOutcome::kSuccessAllocated);
+  ASSERT_TRUE(HasSlot(first));
 
-  auto second = a->Allocate("A", kPageSize, TierType::DRAM);
-  EXPECT_EQ(second.outcome, PeerDramAllocator::Outcome::kSuccessAllocated);
-  ASSERT_TRUE(second.slot.has_value());
-  ASSERT_NE(second.slot->slot_id, first.slot->slot_id);
+  auto second = a->Allocate("A", kPageSize);
+  EXPECT_EQ(second.outcome, AllocateOutcome::kSuccessAllocated);
+  ASSERT_TRUE(HasSlot(second));
+  ASSERT_NE(second.slot_id, first.slot_id);
 }
 
 // ---- Duplicate Commit idempotency -------------------------------------------
@@ -148,12 +150,12 @@ TEST(PeerDramAllocator, AllocateDoesNotRejectOnPendingDuplicate) {
 // Commit — once owned_["dup-key"] is set, the new owned_-check in
 // Allocate would reject the second slot before it could reach Commit.
 
-TEST(PeerDramAllocator, DuplicateCommitIsIdempotentAndKeepsFirst) {
+TEST(PageBackend, DuplicateCommitIsIdempotentAndKeepsFirst) {
   auto a = MakeAllocator();
 
-  auto first = AllocateOk(*a, "dup-key", kPageSize, TierType::DRAM);
+  auto first = AllocateOk(*a, "dup-key", kPageSize);
   ASSERT_TRUE(first.has_value());
-  auto second = AllocateOk(*a, "dup-key", kPageSize, TierType::DRAM);
+  auto second = AllocateOk(*a, "dup-key", kPageSize);
   ASSERT_TRUE(second.has_value());
   ASSERT_NE(second->slot_id, first->slot_id);
 
@@ -169,7 +171,7 @@ TEST(PeerDramAllocator, DuplicateCommitIsIdempotentAndKeepsFirst) {
   EXPECT_EQ(events[0].key, "dup-key");
 
   // First owned (1 page) + second still pending (1 page) = 2 occupied.
-  const auto cap_after_first_commit = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  const auto cap_after_first_commit = a->Capacity();
   EXPECT_EQ(cap_after_first_commit.available_bytes,
             cap_after_first_commit.total_bytes - 2 * kPageSize);
 
@@ -189,7 +191,7 @@ TEST(PeerDramAllocator, DuplicateCommitIsIdempotentAndKeepsFirst) {
   EXPECT_EQ(r.size, kPageSize);
 
   // Second slot's pages freed -> only first occupies (1 page).
-  const auto cap_after_dup = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  const auto cap_after_dup = a->Capacity();
   EXPECT_EQ(cap_after_dup.available_bytes, cap_after_dup.total_bytes - kPageSize);
   EXPECT_EQ(cap_after_dup.total_bytes, cap_after_first_commit.total_bytes);
 
@@ -200,31 +202,26 @@ TEST(PeerDramAllocator, DuplicateCommitIsIdempotentAndKeepsFirst) {
 
 // ---- ENOSPC -----------------------------------------------------------------
 
-TEST(PeerDramAllocator, AllocateReturnsNulloptWhenFull) {
+TEST(PageBackend, AllocateReturnsNulloptWhenFull) {
   auto a = MakeAllocator();
   std::vector<uint64_t> slot_ids;
   for (int i = 0; i < 12; ++i) {
-    auto p = AllocateOk(*a, "k-" + std::to_string(i), kPageSize, TierType::DRAM);
+    auto p = AllocateOk(*a, "k-" + std::to_string(i), kPageSize);
     ASSERT_TRUE(p.has_value()) << "i=" << i;
     slot_ids.push_back(p->slot_id);
   }
-  EXPECT_FALSE(AllocateOk(*a, "k-overflow", kPageSize, TierType::DRAM).has_value());
+  EXPECT_FALSE(AllocateOk(*a, "k-overflow", kPageSize).has_value());
 
   EXPECT_TRUE(a->Abort(slot_ids.back()));
-  EXPECT_TRUE(AllocateOk(*a, "k-recovered", kPageSize, TierType::DRAM).has_value());
-}
-
-TEST(PeerDramAllocator, UnconfiguredTierReturnsNullopt) {
-  auto a = MakeAllocator();
-  EXPECT_FALSE(AllocateOk(*a, "k", kPageSize, TierType::HBM).has_value());
+  EXPECT_TRUE(AllocateOk(*a, "k-recovered", kPageSize).has_value());
 }
 
 // ---- Pending TTL ------------------------------------------------------------
 
-TEST(PeerDramAllocator, PendingSlotExpiresAfterTtl) {
-  auto a = std::make_unique<PeerDramAllocator>(kPageSize, MakeDramCfg(), EmptyCfg(),
-                                               /*pending_ttl=*/std::chrono::milliseconds{1});
-  auto pending = AllocateOk(*a, "key-late", kPageSize, TierType::DRAM);
+TEST(PageBackend, PendingSlotExpiresAfterTtl) {
+  auto a = std::make_unique<PageBackend>(TierType::DRAM, kPageSize, MakeDramCfg(),
+                                         /*pending_ttl=*/std::chrono::milliseconds{1});
+  auto pending = AllocateOk(*a, "key-late", kPageSize);
   ASSERT_TRUE(pending.has_value());
 
   std::this_thread::sleep_for(std::chrono::milliseconds{20});
@@ -235,15 +232,15 @@ TEST(PeerDramAllocator, PendingSlotExpiresAfterTtl) {
   EXPECT_EQ(committed_bytes, 0u);
   EXPECT_TRUE(a->DrainPendingEvents().empty());
 
-  auto cap = a->TierCapacitiesSnapshot();
-  EXPECT_EQ(cap[TierType::DRAM].available_bytes, cap[TierType::DRAM].total_bytes);
+  auto cap = a->Capacity();
+  EXPECT_EQ(cap.available_bytes, cap.total_bytes);
 }
 
 // ---- Abort idempotency ------------------------------------------------------
 
-TEST(PeerDramAllocator, AbortIsIdempotent) {
+TEST(PageBackend, AbortIsIdempotent) {
   auto a = MakeAllocator();
-  auto pending = AllocateOk(*a, "k", kPageSize, TierType::DRAM);
+  auto pending = AllocateOk(*a, "k", kPageSize);
   ASSERT_TRUE(pending.has_value());
   EXPECT_TRUE(a->Abort(pending->slot_id));
   EXPECT_TRUE(a->Abort(pending->slot_id));
@@ -253,9 +250,9 @@ TEST(PeerDramAllocator, AbortIsIdempotent) {
 
 // ---- Evict idempotency + REMOVE event ---------------------------------------
 
-TEST(PeerDramAllocator, EvictRemovesKeyAndQueuesEvent) {
+TEST(PageBackend, EvictRemovesKeyAndQueuesEvent) {
   auto a = MakeAllocator();
-  auto p = AllocateOk(*a, "k", kPageSize, TierType::DRAM);
+  auto p = AllocateOk(*a, "k", kPageSize);
   uint64_t committed_bytes = 0;
   ASSERT_TRUE(a->Commit(p->slot_id, "k", committed_bytes));
   EXPECT_EQ(committed_bytes, p->size);
@@ -282,11 +279,11 @@ TEST(PeerDramAllocator, EvictRemovesKeyAndQueuesEvent) {
 
 // ---- Resolve-during-Evict race ---------------------------------------------
 
-TEST(PeerDramAllocator, EvictDefersWhenReadLeaseActive) {
-  auto a = std::make_unique<PeerDramAllocator>(kPageSize, MakeDramCfg(), EmptyCfg(),
-                                               /*pending_ttl=*/std::chrono::milliseconds{5000},
-                                               /*read_lease_ttl=*/std::chrono::milliseconds{200});
-  auto p = AllocateOk(*a, "k", kPageSize, TierType::DRAM);
+TEST(PageBackend, EvictDefersWhenReadLeaseActive) {
+  auto a = std::make_unique<PageBackend>(TierType::DRAM, kPageSize, MakeDramCfg(),
+                                         /*pending_ttl=*/std::chrono::milliseconds{5000},
+                                         /*read_lease_ttl=*/std::chrono::milliseconds{200});
+  auto p = AllocateOk(*a, "k", kPageSize);
   uint64_t committed_bytes = 0;
   ASSERT_TRUE(a->Commit(p->slot_id, "k", committed_bytes));
   EXPECT_EQ(committed_bytes, p->size);
@@ -311,11 +308,11 @@ TEST(PeerDramAllocator, EvictDefersWhenReadLeaseActive) {
 
 // ---- Full-sync snapshot -----------------------------------------------------
 
-TEST(PeerDramAllocator, SnapshotOwnedKeysReturnsEveryAdd) {
+TEST(PageBackend, SnapshotOwnedKeysReturnsEveryAdd) {
   auto a = MakeAllocator();
   for (int i = 0; i < 5; ++i) {
     const std::string k = "k-" + std::to_string(i);
-    auto p = AllocateOk(*a, k, kPageSize, TierType::DRAM);
+    auto p = AllocateOk(*a, k, kPageSize);
     ASSERT_TRUE(p.has_value());
     uint64_t committed_bytes = 0;
     ASSERT_TRUE(a->Commit(p->slot_id, k, committed_bytes));
@@ -335,13 +332,13 @@ TEST(PeerDramAllocator, SnapshotOwnedKeysReturnsEveryAdd) {
 
 // ---- Buffer descs filtered to the page set ---------------------------------
 
-TEST(PeerDramAllocator, BufferDescsForPagesDedupAndOrder) {
+TEST(PageBackend, BufferDescsForPagesDedupAndOrder) {
   auto a = MakeAllocator();
-  auto p = AllocateOk(*a, "k", kPageSize * 5, TierType::DRAM);
+  auto p = AllocateOk(*a, "k", kPageSize * 5);
   ASSERT_TRUE(p.has_value());
   ASSERT_EQ(p->pages.size(), 5u);
 
-  auto descs = a->BufferDescsForPages(TierType::DRAM, p->pages);
+  auto descs = a->BufferDescsForPages(p->pages);
   ASSERT_EQ(descs.size(), 2u);
   EXPECT_EQ(descs[0].buffer_index, 0u);
   EXPECT_EQ(descs[1].buffer_index, 1u);
@@ -351,66 +348,63 @@ TEST(PeerDramAllocator, BufferDescsForPagesDedupAndOrder) {
 
 // ---- BatchAllocate / BatchCommit / BatchAbort -------------------------------
 
-TEST(PeerDramAllocator, BatchAllocateEmptyInputReturnsEmpty) {
+TEST(PageBackend, BatchAllocateEmptyInputReturnsEmpty) {
   auto a = MakeAllocator();
   EXPECT_TRUE(a->BatchAllocate({}).empty());
 }
 
-TEST(PeerDramAllocator, BatchAllocateMixedOutcomesAndDescs) {
+TEST(PageBackend, BatchAllocateMixedOutcomesAndDescs) {
   auto a = MakeAllocator();
-  auto owned = AllocateOk(*a, "owned", kPageSize, TierType::DRAM);
+  auto owned = AllocateOk(*a, "owned", kPageSize);
   ASSERT_TRUE(owned.has_value());
   uint64_t committed_bytes = 0;
   ASSERT_TRUE(a->Commit(owned->slot_id, "owned", committed_bytes));
   a->DrainPendingEvents();
 
-  std::vector<PeerDramAllocator::AllocateRequest> requests;
-  requests.push_back({"owned", kPageSize, TierType::DRAM});
-  requests.push_back({"ok", kPageSize * 5, TierType::DRAM});
-  requests.push_back({"bad-tier", kPageSize, TierType::HBM});
-  requests.push_back({"zero", 0, TierType::DRAM});
-  requests.push_back({"too-big", kPageSize * 20, TierType::DRAM});
+  std::vector<AllocateRequest> requests;
+  requests.push_back({"owned", kPageSize});
+  requests.push_back({"ok", kPageSize * 5});
+  requests.push_back({"zero", 0});
+  requests.push_back({"too-big", kPageSize * 20});
 
   auto results = a->BatchAllocate(requests);
   ASSERT_EQ(results.size(), requests.size());
 
-  EXPECT_EQ(results[0].outcome, PeerDramAllocator::Outcome::kSuccessAlreadyExists);
-  EXPECT_FALSE(results[0].slot.has_value());
+  EXPECT_EQ(results[0].outcome, AllocateOutcome::kSuccessAlreadyExists);
+  EXPECT_FALSE(HasSlot(results[0]));
   EXPECT_TRUE(results[0].descs.empty());
 
-  EXPECT_EQ(results[1].outcome, PeerDramAllocator::Outcome::kSuccessAllocated);
-  ASSERT_TRUE(results[1].slot.has_value());
-  EXPECT_EQ(results[1].slot->size, kPageSize * 5);
-  EXPECT_EQ(results[1].slot->pages.size(), 5u);
+  EXPECT_EQ(results[1].outcome, AllocateOutcome::kSuccessAllocated);
+  ASSERT_TRUE(HasSlot(results[1]));
+  EXPECT_EQ(results[1].size, kPageSize * 5);
+  EXPECT_EQ(results[1].pages.size(), 5u);
   ASSERT_EQ(results[1].descs.size(), 2u);
   EXPECT_EQ(results[1].descs[0].buffer_index, 0u);
   EXPECT_EQ(results[1].descs[1].buffer_index, 1u);
 
-  EXPECT_EQ(results[2].outcome, PeerDramAllocator::Outcome::kFailed);
-  EXPECT_FALSE(results[2].slot.has_value());
-  EXPECT_EQ(results[3].outcome, PeerDramAllocator::Outcome::kFailed);
-  EXPECT_FALSE(results[3].slot.has_value());
-  EXPECT_EQ(results[4].outcome, PeerDramAllocator::Outcome::kFailedNoSpace);
-  EXPECT_FALSE(results[4].slot.has_value());
+  EXPECT_EQ(results[2].outcome, AllocateOutcome::kFailed);
+  EXPECT_FALSE(HasSlot(results[2]));
+  EXPECT_EQ(results[3].outcome, AllocateOutcome::kFailedNoSpace);
+  EXPECT_FALSE(HasSlot(results[3]));
 }
 
-TEST(PeerDramAllocator, BatchCommitMixedSuccessAndFailure) {
+TEST(PageBackend, BatchCommitMixedSuccessAndFailure) {
   auto a = MakeAllocator();
   auto allocated = a->BatchAllocate({
-      {"dup", kPageSize, TierType::DRAM},
-      {"dup", kPageSize * 2, TierType::DRAM},
-      {"unique", kPageSize, TierType::DRAM},
+      {"dup", kPageSize},
+      {"dup", kPageSize * 2},
+      {"unique", kPageSize},
   });
   ASSERT_EQ(allocated.size(), 3u);
-  ASSERT_TRUE(allocated[0].slot.has_value());
-  ASSERT_TRUE(allocated[1].slot.has_value());
-  ASSERT_TRUE(allocated[2].slot.has_value());
+  ASSERT_TRUE(HasSlot(allocated[0]));
+  ASSERT_TRUE(HasSlot(allocated[1]));
+  ASSERT_TRUE(HasSlot(allocated[2]));
 
   auto committed = a->BatchCommit({
-      {allocated[0].slot->slot_id, "dup"},
+      {allocated[0].slot_id, "dup"},
       {999999, "missing"},
-      {allocated[1].slot->slot_id, "dup"},
-      {allocated[2].slot->slot_id, "unique"},
+      {allocated[1].slot_id, "dup"},
+      {allocated[2].slot_id, "unique"},
   });
   ASSERT_EQ(committed.size(), 4u);
   EXPECT_TRUE(committed[0].success);
@@ -424,7 +418,7 @@ TEST(PeerDramAllocator, BatchCommitMixedSuccessAndFailure) {
 
   auto dup = a->Resolve("dup");
   ASSERT_TRUE(dup.found);
-  EXPECT_EQ(dup.pages, allocated[0].slot->pages);
+  EXPECT_EQ(dup.pages, allocated[0].pages);
   EXPECT_EQ(dup.size, kPageSize);
   auto unique = a->Resolve("unique");
   ASSERT_TRUE(unique.found);
@@ -438,59 +432,58 @@ TEST(PeerDramAllocator, BatchCommitMixedSuccessAndFailure) {
   EXPECT_EQ(events[1].key, "unique");
 }
 
-TEST(PeerDramAllocator, BatchAbortMixedSlotsIsIdempotent) {
+TEST(PageBackend, BatchAbortMixedSlotsIsIdempotent) {
   auto a = MakeAllocator();
   auto allocated = a->BatchAllocate({
-      {"drop", kPageSize, TierType::DRAM},
-      {"keep", kPageSize, TierType::DRAM},
+      {"drop", kPageSize},
+      {"keep", kPageSize},
   });
   ASSERT_EQ(allocated.size(), 2u);
-  ASSERT_TRUE(allocated[0].slot.has_value());
-  ASSERT_TRUE(allocated[1].slot.has_value());
+  ASSERT_TRUE(HasSlot(allocated[0]));
+  ASSERT_TRUE(HasSlot(allocated[1]));
 
-  auto aborted = a->BatchAbort({allocated[0].slot->slot_id, 999999});
+  auto aborted = a->BatchAbort({allocated[0].slot_id, 999999});
   ASSERT_EQ(aborted.size(), 2u);
   EXPECT_TRUE(aborted[0]);
   EXPECT_TRUE(aborted[1]);
 
   uint64_t committed_bytes = 0;
-  EXPECT_FALSE(a->Commit(allocated[0].slot->slot_id, "drop", committed_bytes));
-  EXPECT_TRUE(a->Commit(allocated[1].slot->slot_id, "keep", committed_bytes));
+  EXPECT_FALSE(a->Commit(allocated[0].slot_id, "drop", committed_bytes));
+  EXPECT_TRUE(a->Commit(allocated[1].slot_id, "keep", committed_bytes));
   EXPECT_EQ(committed_bytes, kPageSize);
   EXPECT_TRUE(a->Resolve("keep").found);
 }
 
 // ---- BatchResolve ----------------------------------------------------------
 
-TEST(PeerDramAllocator, BatchResolveEmptyInputReturnsEmpty) {
+TEST(PageBackend, BatchResolveEmptyInputReturnsEmpty) {
   auto a = MakeAllocator();
-  EXPECT_TRUE(a->BatchResolve({}).empty());
+  EXPECT_TRUE(a->BatchResolve({}, /*include_descs=*/true).empty());
 }
 
-TEST(PeerDramAllocator, BatchResolveMixedHitsAndMisses) {
+TEST(PageBackend, BatchResolveMixedHitsAndMisses) {
   auto a = MakeAllocator();
   // 5 pages over 4-pages-per-buffer config -> exercises dedup'd descs.
-  auto p_hit = AllocateOk(*a, "hit", kPageSize * 5, TierType::DRAM);
+  auto p_hit = AllocateOk(*a, "hit", kPageSize * 5);
   ASSERT_TRUE(p_hit.has_value());
   uint64_t committed_bytes = 0;
   ASSERT_TRUE(a->Commit(p_hit->slot_id, "hit", committed_bytes));
-  auto p_small = AllocateOk(*a, "small", kPageSize, TierType::DRAM);
+  auto p_small = AllocateOk(*a, "small", kPageSize);
   ASSERT_TRUE(p_small.has_value());
   ASSERT_TRUE(a->Commit(p_small->slot_id, "small", committed_bytes));
   a->DrainPendingEvents();
 
   auto ref_hit = a->Resolve("hit");
-  auto ref_descs_hit = a->BufferDescsForPages(ref_hit.tier, ref_hit.pages);
+  auto ref_descs_hit = a->BufferDescsForPages(ref_hit.pages);
   auto ref_small = a->Resolve("small");
-  auto ref_descs_small = a->BufferDescsForPages(ref_small.tier, ref_small.pages);
+  auto ref_descs_small = a->BufferDescsForPages(ref_small.pages);
   ASSERT_TRUE(ref_hit.found);
   ASSERT_TRUE(ref_small.found);
 
-  auto results = a->BatchResolve({"hit", "ghost-a", "small", "ghost-b"});
+  auto results = a->BatchResolve({"hit", "ghost-a", "small", "ghost-b"}, /*include_descs=*/true);
   ASSERT_EQ(results.size(), 4u);
 
   EXPECT_TRUE(results[0].found);
-  EXPECT_EQ(results[0].tier, ref_hit.tier);
   EXPECT_EQ(results[0].pages, ref_hit.pages);
   EXPECT_EQ(results[0].size, ref_hit.size);
   ASSERT_EQ(results[0].descs.size(), ref_descs_hit.size());
@@ -505,7 +498,6 @@ TEST(PeerDramAllocator, BatchResolveMixedHitsAndMisses) {
   EXPECT_TRUE(results[1].descs.empty());
 
   EXPECT_TRUE(results[2].found);
-  EXPECT_EQ(results[2].tier, ref_small.tier);
   EXPECT_EQ(results[2].pages, ref_small.pages);
   EXPECT_EQ(results[2].size, ref_small.size);
   ASSERT_EQ(results[2].descs.size(), ref_descs_small.size());
@@ -517,20 +509,20 @@ TEST(PeerDramAllocator, BatchResolveMixedHitsAndMisses) {
   EXPECT_FALSE(results[3].found);
 }
 
-TEST(PeerDramAllocator, BatchResolveExtendsLeaseForHitsOnly) {
-  auto a = std::make_unique<PeerDramAllocator>(kPageSize, MakeDramCfg(), EmptyCfg(),
-                                               /*pending_ttl=*/std::chrono::milliseconds{5000},
-                                               /*read_lease_ttl=*/std::chrono::milliseconds{500});
-  auto p_x = AllocateOk(*a, "x", kPageSize, TierType::DRAM);
+TEST(PageBackend, BatchResolveExtendsLeaseForHitsOnly) {
+  auto a = std::make_unique<PageBackend>(TierType::DRAM, kPageSize, MakeDramCfg(),
+                                         /*pending_ttl=*/std::chrono::milliseconds{5000},
+                                         /*read_lease_ttl=*/std::chrono::milliseconds{500});
+  auto p_x = AllocateOk(*a, "x", kPageSize);
   ASSERT_TRUE(p_x.has_value());
   uint64_t committed_bytes = 0;
   ASSERT_TRUE(a->Commit(p_x->slot_id, "x", committed_bytes));
-  auto p_y = AllocateOk(*a, "y", kPageSize, TierType::DRAM);
+  auto p_y = AllocateOk(*a, "y", kPageSize);
   ASSERT_TRUE(p_y.has_value());
   ASSERT_TRUE(a->Commit(p_y->slot_id, "y", committed_bytes));
   a->DrainPendingEvents();
 
-  auto results = a->BatchResolve({"x", "missing", "y"});
+  auto results = a->BatchResolve({"x", "missing", "y"}, /*include_descs=*/true);
   ASSERT_EQ(results.size(), 3u);
   ASSERT_TRUE(results[0].found);
   ASSERT_FALSE(results[1].found);
@@ -546,7 +538,7 @@ TEST(PeerDramAllocator, BatchResolveExtendsLeaseForHitsOnly) {
 
   // Miss must not poison read_lease_until_: a subsequent
   // Allocate+Commit+Evict on the same key must free as if never touched.
-  auto p_miss = AllocateOk(*a, "missing", kPageSize, TierType::DRAM);
+  auto p_miss = AllocateOk(*a, "missing", kPageSize);
   ASSERT_TRUE(p_miss.has_value());
   ASSERT_TRUE(a->Commit(p_miss->slot_id, "missing", committed_bytes));
   a->DrainPendingEvents();
@@ -555,17 +547,17 @@ TEST(PeerDramAllocator, BatchResolveExtendsLeaseForHitsOnly) {
   EXPECT_EQ(evict_missing[0].bytes_freed, kPageSize);
 }
 
-TEST(PeerDramAllocator, BatchResolveLeaseExpiresLikeSingleKeyResolve) {
-  auto a = std::make_unique<PeerDramAllocator>(kPageSize, MakeDramCfg(), EmptyCfg(),
-                                               /*pending_ttl=*/std::chrono::milliseconds{5000},
-                                               /*read_lease_ttl=*/std::chrono::milliseconds{50});
-  auto p = AllocateOk(*a, "k", kPageSize, TierType::DRAM);
+TEST(PageBackend, BatchResolveLeaseExpiresLikeSingleKeyResolve) {
+  auto a = std::make_unique<PageBackend>(TierType::DRAM, kPageSize, MakeDramCfg(),
+                                         /*pending_ttl=*/std::chrono::milliseconds{5000},
+                                         /*read_lease_ttl=*/std::chrono::milliseconds{50});
+  auto p = AllocateOk(*a, "k", kPageSize);
   ASSERT_TRUE(p.has_value());
   uint64_t committed_bytes = 0;
   ASSERT_TRUE(a->Commit(p->slot_id, "k", committed_bytes));
   a->DrainPendingEvents();
 
-  auto results = a->BatchResolve({"k"});
+  auto results = a->BatchResolve({"k"}, /*include_descs=*/true);
   ASSERT_EQ(results.size(), 1u);
   ASSERT_TRUE(results[0].found);
 
@@ -577,37 +569,36 @@ TEST(PeerDramAllocator, BatchResolveLeaseExpiresLikeSingleKeyResolve) {
   EXPECT_EQ(evicted[0].bytes_freed, kPageSize);
 }
 
-// ---- Capacities snapshot ----------------------------------------------------
+// ---- Capacity snapshot ----------------------------------------------------
 
-TEST(PeerDramAllocator, TierCapacitiesReflectAllocations) {
+TEST(PageBackend, CapacityReflectsAllocations) {
   auto a = MakeAllocator();
-  auto cap0 = a->TierCapacitiesSnapshot();
-  ASSERT_EQ(cap0.count(TierType::DRAM), 1u);
-  const uint64_t total = cap0[TierType::DRAM].total_bytes;
-  EXPECT_EQ(cap0[TierType::DRAM].available_bytes, total);
+  auto cap0 = a->Capacity();
+  const uint64_t total = cap0.total_bytes;
+  EXPECT_EQ(cap0.available_bytes, total);
 
-  auto p = AllocateOk(*a, "k", kPageSize * 3, TierType::DRAM);
+  auto p = AllocateOk(*a, "k", kPageSize * 3);
   ASSERT_TRUE(p.has_value());
-  auto cap1 = a->TierCapacitiesSnapshot();
-  EXPECT_EQ(cap1[TierType::DRAM].available_bytes, total - 3 * kPageSize);
+  auto cap1 = a->Capacity();
+  EXPECT_EQ(cap1.available_bytes, total - 3 * kPageSize);
 
   uint64_t committed_bytes = 0;
   ASSERT_TRUE(a->Commit(p->slot_id, "k", committed_bytes));
   EXPECT_EQ(committed_bytes, p->size);
-  auto cap2 = a->TierCapacitiesSnapshot();
-  EXPECT_EQ(cap2[TierType::DRAM].available_bytes, total - 3 * kPageSize);
+  auto cap2 = a->Capacity();
+  EXPECT_EQ(cap2.available_bytes, total - 3 * kPageSize);
 
   ASSERT_EQ(a->Evict({"k"})[0].bytes_freed, 3 * kPageSize);
-  auto cap3 = a->TierCapacitiesSnapshot();
-  EXPECT_EQ(cap3[TierType::DRAM].available_bytes, total);
+  auto cap3 = a->Capacity();
+  EXPECT_EQ(cap3.available_bytes, total);
 }
 
 // ---- Commit after reap ------------------------------------------------------
 
-TEST(PeerDramAllocator, CommitAfterReapReturnsFalse) {
-  auto a = std::make_unique<PeerDramAllocator>(kPageSize, MakeDramCfg(), EmptyCfg(),
-                                               std::chrono::milliseconds{1});
-  auto p = AllocateOk(*a, "doomed", kPageSize, TierType::DRAM);
+TEST(PageBackend, CommitAfterReapReturnsFalse) {
+  auto a = std::make_unique<PageBackend>(TierType::DRAM, kPageSize, MakeDramCfg(),
+                                         std::chrono::milliseconds{1});
+  auto p = AllocateOk(*a, "doomed", kPageSize);
   ASSERT_TRUE(p.has_value());
   std::this_thread::sleep_for(std::chrono::milliseconds{20});
   a->RunReaperOnceForTest();
@@ -619,19 +610,19 @@ TEST(PeerDramAllocator, CommitAfterReapReturnsFalse) {
 
 // ---- Distributed Clear ------------------------------------------------------
 
-TEST(PeerDramAllocator, ClearLocalReleasesOwnedAndCancelsPending) {
+TEST(PageBackend, ClearLocalReleasesOwnedAndCancelsPending) {
   auto a = MakeAllocator();
 
-  auto pA = AllocateOk(*a, "A", kPageSize, TierType::DRAM);
+  auto pA = AllocateOk(*a, "A", kPageSize);
   ASSERT_TRUE(pA.has_value());
   uint64_t committed_bytes = 0;
   ASSERT_TRUE(a->Commit(pA->slot_id, "A", committed_bytes));
 
-  auto pB = AllocateOk(*a, "B", kPageSize * 2, TierType::DRAM);
+  auto pB = AllocateOk(*a, "B", kPageSize * 2);
   ASSERT_TRUE(pB.has_value());
   a->DrainPendingEvents();  // discard the A ADD
 
-  const auto cap_before = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  const auto cap_before = a->Capacity();
   ASSERT_LT(cap_before.available_bytes, cap_before.total_bytes);
 
   a->ClearLocal();
@@ -642,7 +633,7 @@ TEST(PeerDramAllocator, ClearLocalReleasesOwnedAndCancelsPending) {
   EXPECT_TRUE(a->DrainPendingEvents().empty());
 
   // Owned pages (A) returned immediately; pending pages (B) still held.
-  auto cap_after_clear = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  auto cap_after_clear = a->Capacity();
   EXPECT_EQ(cap_after_clear.available_bytes, cap_before.total_bytes - 2 * kPageSize);
 
   // Committing the cancelled pending fails AND releases its pages
@@ -652,24 +643,24 @@ TEST(PeerDramAllocator, ClearLocalReleasesOwnedAndCancelsPending) {
   EXPECT_TRUE(a->DrainPendingEvents().empty());
   EXPECT_FALSE(a->Resolve("B").found);
 
-  auto cap_final = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  auto cap_final = a->Capacity();
   EXPECT_EQ(cap_final.available_bytes, cap_final.total_bytes);
 }
 
-TEST(PeerDramAllocator, ClearLocalGatesAllocateUntilAcked) {
+TEST(PageBackend, ClearLocalGatesAllocateUntilAcked) {
   auto a = MakeAllocator();
 
   a->ClearLocal();
-  EXPECT_FALSE(AllocateOk(*a, "blocked", kPageSize, TierType::DRAM).has_value());
+  EXPECT_FALSE(AllocateOk(*a, "blocked", kPageSize).has_value());
 
   a->ClearFullSyncAcked();
   EXPECT_FALSE(a->IsClearFullSyncPending());
-  EXPECT_TRUE(AllocateOk(*a, "ok-after-ack", kPageSize, TierType::DRAM).has_value());
+  EXPECT_TRUE(AllocateOk(*a, "ok-after-ack", kPageSize).has_value());
 }
 
-TEST(PeerDramAllocator, ClearLocalDropsQueuedAdds) {
+TEST(PageBackend, ClearLocalDropsQueuedAdds) {
   auto a = MakeAllocator();
-  auto p = AllocateOk(*a, "k", kPageSize, TierType::DRAM);
+  auto p = AllocateOk(*a, "k", kPageSize);
   ASSERT_TRUE(p.has_value());
   uint64_t committed_bytes = 0;
   ASSERT_TRUE(a->Commit(p->slot_id, "k", committed_bytes));
@@ -681,9 +672,9 @@ TEST(PeerDramAllocator, ClearLocalDropsQueuedAdds) {
   EXPECT_TRUE(a->SnapshotOwnedKeys().empty());
 }
 
-TEST(PeerDramAllocator, AbortReleasesCancelledPending) {
+TEST(PageBackend, AbortReleasesCancelledPending) {
   auto a = MakeAllocator();
-  auto p = AllocateOk(*a, "p1", kPageSize, TierType::DRAM);
+  auto p = AllocateOk(*a, "p1", kPageSize);
   ASSERT_TRUE(p.has_value());
 
   a->ClearLocal();
@@ -691,17 +682,17 @@ TEST(PeerDramAllocator, AbortReleasesCancelledPending) {
   EXPECT_TRUE(a->Abort(p->slot_id));
   a->ClearFullSyncAcked();
 
-  auto cap = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  auto cap = a->Capacity();
   EXPECT_EQ(cap.available_bytes, cap.total_bytes);
 }
 
 // Pre-clear pending Commit fails; post-ack new Allocate+Commit succeeds.
-TEST(PeerDramAllocator, PendingGenerationRejectsPreClearCommit) {
+TEST(PageBackend, PendingGenerationRejectsPreClearCommit) {
   auto a = MakeAllocator();
 
-  auto pB = AllocateOk(*a, "B", kPageSize * 2, TierType::DRAM);
+  auto pB = AllocateOk(*a, "B", kPageSize * 2);
   ASSERT_TRUE(pB.has_value());
-  const auto cap_before = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  const auto cap_before = a->Capacity();
   EXPECT_EQ(cap_before.available_bytes, cap_before.total_bytes - 2 * kPageSize);
 
   a->ClearLocal();
@@ -710,12 +701,12 @@ TEST(PeerDramAllocator, PendingGenerationRejectsPreClearCommit) {
   EXPECT_FALSE(a->Commit(pB->slot_id, "B", committed_bytes));
   EXPECT_EQ(committed_bytes, 0u);
   EXPECT_TRUE(a->DrainPendingEvents().empty());
-  auto cap_after_reject = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  auto cap_after_reject = a->Capacity();
   EXPECT_EQ(cap_after_reject.available_bytes, cap_after_reject.total_bytes);
 
   a->ClearFullSyncAcked();
 
-  auto pC = AllocateOk(*a, "C", kPageSize, TierType::DRAM);
+  auto pC = AllocateOk(*a, "C", kPageSize);
   ASSERT_TRUE(pC.has_value());
   ASSERT_TRUE(a->Commit(pC->slot_id, "C", committed_bytes));
   EXPECT_EQ(committed_bytes, kPageSize);
@@ -723,10 +714,10 @@ TEST(PeerDramAllocator, PendingGenerationRejectsPreClearCommit) {
 }
 
 // Repeated Clears still reject the original pre-clear pending Commit.
-TEST(PeerDramAllocator, PendingGenerationSurvivesDoubleClear) {
+TEST(PageBackend, PendingGenerationSurvivesDoubleClear) {
   auto a = MakeAllocator();
 
-  auto pB = AllocateOk(*a, "B", kPageSize, TierType::DRAM);
+  auto pB = AllocateOk(*a, "B", kPageSize);
   ASSERT_TRUE(pB.has_value());
 
   a->ClearLocal();
@@ -734,28 +725,28 @@ TEST(PeerDramAllocator, PendingGenerationSurvivesDoubleClear) {
 
   uint64_t committed_bytes = 0;
   EXPECT_FALSE(a->Commit(pB->slot_id, "B", committed_bytes));
-  auto cap_after_reject = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  auto cap_after_reject = a->Capacity();
   EXPECT_EQ(cap_after_reject.available_bytes, cap_after_reject.total_bytes);
 
   a->ClearFullSyncAcked();
-  auto pC = AllocateOk(*a, "C", kPageSize, TierType::DRAM);
+  auto pC = AllocateOk(*a, "C", kPageSize);
   ASSERT_TRUE(pC.has_value());
   EXPECT_TRUE(a->Commit(pC->slot_id, "C", committed_bytes));
 }
 
 // Leased owned key: logically gone at Clear, pages freed by reaper after
 // the lease expires.
-TEST(PeerDramAllocator, ClearLocalDefersLeasedOwnedPages) {
+TEST(PageBackend, ClearLocalDefersLeasedOwnedPages) {
   auto a = MakeAllocator(/*pending_ttl=*/std::chrono::milliseconds{5000},
                          /*read_lease_ttl=*/std::chrono::milliseconds{200});
 
-  auto p = AllocateOk(*a, "A", kPageSize, TierType::DRAM);
+  auto p = AllocateOk(*a, "A", kPageSize);
   ASSERT_TRUE(p.has_value());
   uint64_t committed_bytes = 0;
   ASSERT_TRUE(a->Commit(p->slot_id, "A", committed_bytes));
   a->DrainPendingEvents();
 
-  const auto cap_committed = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  const auto cap_committed = a->Capacity();
   EXPECT_EQ(cap_committed.available_bytes, cap_committed.total_bytes - kPageSize);
 
   ASSERT_TRUE(a->Resolve("A").found);  // lease.
@@ -765,37 +756,37 @@ TEST(PeerDramAllocator, ClearLocalDefersLeasedOwnedPages) {
   EXPECT_FALSE(a->Resolve("A").found);
   EXPECT_TRUE(a->SnapshotOwnedKeys().empty());
 
-  auto cap_after_clear = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  auto cap_after_clear = a->Capacity();
   EXPECT_EQ(cap_after_clear.available_bytes, cap_committed.total_bytes - kPageSize);
 
   // Pre-TTL sweep: no-op.
   a->RunReaperOnceForTest();
-  auto cap_no_op_sweep = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  auto cap_no_op_sweep = a->Capacity();
   EXPECT_EQ(cap_no_op_sweep.available_bytes, cap_committed.total_bytes - kPageSize);
 
   // Past TTL: pages return to bitmap.
   std::this_thread::sleep_for(std::chrono::milliseconds{300});
   a->RunReaperOnceForTest();
-  auto cap_swept = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  auto cap_swept = a->Capacity();
   EXPECT_EQ(cap_swept.available_bytes, cap_swept.total_bytes);
 }
 
 // Leased owned A defers; pending B rejects via generation.
-TEST(PeerDramAllocator, ClearLocalMixedPendingAndLeased) {
+TEST(PageBackend, ClearLocalMixedPendingAndLeased) {
   auto a = MakeAllocator(/*pending_ttl=*/std::chrono::milliseconds{5000},
                          /*read_lease_ttl=*/std::chrono::milliseconds{200});
 
-  auto pA = AllocateOk(*a, "A", kPageSize, TierType::DRAM);
+  auto pA = AllocateOk(*a, "A", kPageSize);
   ASSERT_TRUE(pA.has_value());
   uint64_t committed_bytes = 0;
   ASSERT_TRUE(a->Commit(pA->slot_id, "A", committed_bytes));
   ASSERT_TRUE(a->Resolve("A").found);  // lease.
 
-  auto pB = AllocateOk(*a, "B", kPageSize * 2, TierType::DRAM);
+  auto pB = AllocateOk(*a, "B", kPageSize * 2);
   ASSERT_TRUE(pB.has_value());
   a->DrainPendingEvents();
 
-  const auto total = a->TierCapacitiesSnapshot()[TierType::DRAM].total_bytes;
+  const auto total = a->Capacity().total_bytes;
 
   a->ClearLocal();
 
@@ -803,115 +794,115 @@ TEST(PeerDramAllocator, ClearLocalMixedPendingAndLeased) {
   EXPECT_TRUE(a->SnapshotOwnedKeys().empty());
 
   // A deferred + B pending: 3 pages occupied.
-  auto cap_after_clear = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  auto cap_after_clear = a->Capacity();
   EXPECT_EQ(cap_after_clear.available_bytes, total - 3 * kPageSize);
 
   // Commit(B) fails on generation mismatch, releases B.
   EXPECT_FALSE(a->Commit(pB->slot_id, "B", committed_bytes));
-  auto cap_after_reject = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  auto cap_after_reject = a->Capacity();
   EXPECT_EQ(cap_after_reject.available_bytes, total - kPageSize);  // only A.
 
   // Past lease + sweep: A released.
   std::this_thread::sleep_for(std::chrono::milliseconds{300});
   a->RunReaperOnceForTest();
-  auto cap_final = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  auto cap_final = a->Capacity();
   EXPECT_EQ(cap_final.available_bytes, total);
 }
 
 // Sweeps are no-ops while the deferred lease is still active.
-TEST(PeerDramAllocator, ClearLocalSweepRespectsTtl) {
+TEST(PageBackend, ClearLocalSweepRespectsTtl) {
   auto a = MakeAllocator(/*pending_ttl=*/std::chrono::milliseconds{5000},
                          /*read_lease_ttl=*/std::chrono::milliseconds{10000});
 
-  auto p = AllocateOk(*a, "A", kPageSize, TierType::DRAM);
+  auto p = AllocateOk(*a, "A", kPageSize);
   ASSERT_TRUE(p.has_value());
   uint64_t committed_bytes = 0;
   ASSERT_TRUE(a->Commit(p->slot_id, "A", committed_bytes));
   ASSERT_TRUE(a->Resolve("A").found);
 
-  const auto cap_committed = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  const auto cap_committed = a->Capacity();
 
   a->ClearLocal();
 
   // Lease still live: every sweep is a no-op.
   for (int i = 0; i < 3; ++i) {
     a->RunReaperOnceForTest();
-    auto cap = a->TierCapacitiesSnapshot()[TierType::DRAM];
+    auto cap = a->Capacity();
     EXPECT_EQ(cap.available_bytes, cap_committed.available_bytes) << "sweep i=" << i;
   }
 }
 
-// ---- OwnedKeyCountByTier ----------------------------------------------------
+// ---- OwnedKeyCount -----------------------------------------------------------
 
-TEST(PeerDramAllocator, OwnedKeyCountByTierTracksCommitsAndEvicts) {
+TEST(PageBackend, OwnedKeyCountTracksCommitsAndEvicts) {
   auto a = MakeAllocator();
 
-  auto counts0 = a->OwnedKeyCountByTier();
-  EXPECT_EQ(counts0[TierType::DRAM], 0u);
-  EXPECT_EQ(counts0[TierType::HBM], 0u);
-  EXPECT_EQ(counts0[TierType::SSD], 0u);
+  EXPECT_EQ(a->OwnedKeyCount(), 0u);
 
   for (int i = 0; i < 3; ++i) {
     const std::string k = "key-dram-" + std::to_string(i);
-    auto p = AllocateOk(*a, k, kPageSize, TierType::DRAM);
+    auto p = AllocateOk(*a, k, kPageSize);
     ASSERT_TRUE(p.has_value()) << "i=" << i;
     uint64_t committed_bytes = 0;
     ASSERT_TRUE(a->Commit(p->slot_id, k, committed_bytes));
   }
-  auto counts1 = a->OwnedKeyCountByTier();
-  EXPECT_EQ(counts1[TierType::DRAM], 3u);
-  EXPECT_EQ(counts1[TierType::HBM], 0u);
-  EXPECT_EQ(counts1[TierType::SSD], 0u);
+  EXPECT_EQ(a->OwnedKeyCount(), 3u);
 
   a->Evict({"key-dram-0"});
-  auto counts2 = a->OwnedKeyCountByTier();
-  EXPECT_EQ(counts2[TierType::DRAM], 2u);
-  EXPECT_EQ(counts2[TierType::HBM], 0u);
+  EXPECT_EQ(a->OwnedKeyCount(), 2u);
 }
 
-TEST(PeerDramAllocator, OwnedKeyCountByTierMultiTier) {
-  PeerDramAllocator::TierConfig hbm_cfg;
+// A DRAM instance and an HBM instance are fully independent objects — one
+// instance == one medium (backend-agnostic refactor Phase 2), so there is no
+// shared multi-tier state to cross-check beyond each Tier() staying fixed.
+TEST(PageBackend, SeparateInstancesPerMediumAreIndependent) {
+  auto dram = MakeAllocator();
+  PageBackend::TierConfig hbm_cfg;
   hbm_cfg.buffer_sizes = {kPageSize * 4};
   hbm_cfg.buffer_descs = {{0xD0, 0xD1}};
-  auto a = std::make_unique<PeerDramAllocator>(kPageSize, MakeDramCfg(), hbm_cfg,
-                                               std::chrono::milliseconds{5000});
+  auto hbm = std::make_unique<PageBackend>(TierType::HBM, kPageSize, hbm_cfg,
+                                           std::chrono::milliseconds{5000});
+
+  EXPECT_EQ(dram->Tier(), TierType::DRAM);
+  EXPECT_EQ(hbm->Tier(), TierType::HBM);
 
   for (int i = 0; i < 2; ++i) {
     const std::string k = "d-" + std::to_string(i);
-    auto p = AllocateOk(*a, k, kPageSize, TierType::DRAM);
+    auto p = AllocateOk(*dram, k, kPageSize);
     ASSERT_TRUE(p.has_value());
     uint64_t committed_bytes = 0;
-    ASSERT_TRUE(a->Commit(p->slot_id, k, committed_bytes));
+    ASSERT_TRUE(dram->Commit(p->slot_id, k, committed_bytes));
   }
   {
-    auto p = AllocateOk(*a, "h-0", kPageSize, TierType::HBM);
+    auto p = AllocateOk(*hbm, "h-0", kPageSize);
     ASSERT_TRUE(p.has_value());
     uint64_t committed_bytes = 0;
-    ASSERT_TRUE(a->Commit(p->slot_id, "h-0", committed_bytes));
+    ASSERT_TRUE(hbm->Commit(p->slot_id, "h-0", committed_bytes));
   }
 
-  auto counts = a->OwnedKeyCountByTier();
-  EXPECT_EQ(counts[TierType::DRAM], 2u);
-  EXPECT_EQ(counts[TierType::HBM], 1u);
-  EXPECT_EQ(counts[TierType::SSD], 0u);
+  EXPECT_EQ(dram->OwnedKeyCount(), 2u);
+  EXPECT_EQ(hbm->OwnedKeyCount(), 1u);
+  // Neither instance sees the other's keys.
+  EXPECT_FALSE(dram->Resolve("h-0").found);
+  EXPECT_FALSE(hbm->Resolve("d-0").found);
 }
 
 // ---- Auto-flush: cb fires exactly when the outbox first reaches threshold ----
-TEST(PeerDramAllocatorAutoFlush, FiresAtThreshold) {
+TEST(PageBackendAutoFlush, FiresAtThreshold) {
   auto a = MakeAllocator();
   int fires = 0;
   a->SetAutoFlushHook(3, [&] { ++fires; });
 
   for (int i = 0; i < 2; ++i) {
     const std::string k = "af-" + std::to_string(i);
-    auto p = AllocateOk(*a, k, kPageSize, TierType::DRAM);
+    auto p = AllocateOk(*a, k, kPageSize);
     ASSERT_TRUE(p.has_value());
     uint64_t b = 0;
     ASSERT_TRUE(a->Commit(p->slot_id, k, b));
   }
   EXPECT_EQ(fires, 0);  // below threshold -> no fire
 
-  auto p = AllocateOk(*a, "af-2", kPageSize, TierType::DRAM);
+  auto p = AllocateOk(*a, "af-2", kPageSize);
   ASSERT_TRUE(p.has_value());
   uint64_t b = 0;
   ASSERT_TRUE(a->Commit(p->slot_id, "af-2", b));
@@ -919,11 +910,11 @@ TEST(PeerDramAllocatorAutoFlush, FiresAtThreshold) {
 }
 
 // ---- No hook registered -> auto-flush disabled by default (never fires) ----
-TEST(PeerDramAllocatorAutoFlush, NoHookNoFire) {
+TEST(PageBackendAutoFlush, NoHookNoFire) {
   auto a = MakeAllocator();
   for (int i = 0; i < 10; ++i) {
     const std::string k = "nh-" + std::to_string(i);
-    auto p = AllocateOk(*a, k, kPageSize, TierType::DRAM);
+    auto p = AllocateOk(*a, k, kPageSize);
     ASSERT_TRUE(p.has_value());
     uint64_t b = 0;
     ASSERT_TRUE(a->Commit(p->slot_id, k, b));
@@ -932,11 +923,11 @@ TEST(PeerDramAllocatorAutoFlush, NoHookNoFire) {
 }
 
 // ---- Full-sync snapshot returns all owned AND atomically clears the outbox ----
-TEST(PeerDramAllocatorAutoFlush, FullSyncSnapshotClearsOutbox) {
+TEST(PageBackendAutoFlush, FullSyncSnapshotClearsOutbox) {
   auto a = MakeAllocator();
   for (int i = 0; i < 3; ++i) {
     const std::string k = "fs-" + std::to_string(i);
-    auto p = AllocateOk(*a, k, kPageSize, TierType::DRAM);
+    auto p = AllocateOk(*a, k, kPageSize);
     ASSERT_TRUE(p.has_value());
     uint64_t b = 0;
     ASSERT_TRUE(a->Commit(p->slot_id, k, b));
@@ -949,7 +940,7 @@ TEST(PeerDramAllocatorAutoFlush, FullSyncSnapshotClearsOutbox) {
   EXPECT_TRUE(a->DrainPendingEvents().empty());
 
   // A commit AFTER the snapshot is a fresh delta (only genuinely new events).
-  auto p = AllocateOk(*a, "fs-new", kPageSize, TierType::DRAM);
+  auto p = AllocateOk(*a, "fs-new", kPageSize);
   ASSERT_TRUE(p.has_value());
   uint64_t b = 0;
   ASSERT_TRUE(a->Commit(p->slot_id, "fs-new", b));

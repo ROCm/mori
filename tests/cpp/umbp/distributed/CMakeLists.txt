@@ -261,12 +261,21 @@ target_link_libraries(test_in_memory_master_metadata_store
 target_compile_features(test_in_memory_master_metadata_store PRIVATE cxx_std_17)
 add_test(NAME test_in_memory_master_metadata_store COMMAND test_in_memory_master_metadata_store)
 
-# test_peer_dram_allocator
-add_executable(test_peer_dram_allocator test_peer_dram_allocator.cpp)
-target_link_libraries(test_peer_dram_allocator PRIVATE umbp_common
-                                                       GTest::gtest_main)
-target_compile_features(test_peer_dram_allocator PRIVATE cxx_std_17)
-add_test(NAME test_peer_dram_allocator COMMAND test_peer_dram_allocator)
+# test_page_backend — PageBackend (formerly PeerDramAllocator), one instance
+# == one medium (backend-agnostic refactor Phase 2)
+add_executable(test_page_backend test_page_backend.cpp)
+target_link_libraries(test_page_backend PRIVATE umbp_common
+                                                GTest::gtest_main)
+target_compile_features(test_page_backend PRIVATE cxx_std_17)
+add_test(NAME test_page_backend COMMAND test_page_backend)
+
+# test_mock_backend — MockBackend + BackendRegistry dispatch (Phase 2 default
+# option (b): a second registered backend proving the registry path)
+add_executable(test_mock_backend test_mock_backend.cpp)
+target_link_libraries(test_mock_backend PRIVATE umbp_common GTest::gtest_main)
+target_compile_features(test_mock_backend PRIVATE cxx_std_17)
+add_test(NAME test_mock_backend COMMAND test_mock_backend)
+
 
 # test_router_dedup — master-side BatchRoutePut dedup via IMasterMetadataStore
 add_executable(test_router_dedup test_router_dedup.cpp)

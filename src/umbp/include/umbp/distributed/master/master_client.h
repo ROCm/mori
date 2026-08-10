@@ -54,7 +54,7 @@ class HeartbeatResponse;
 
 namespace mori::umbp {
 
-class PeerDramAllocator;
+class PageBackend;
 class PeerSsdManager;
 
 inline constexpr std::size_t kMasterClientMaxPendingHistograms = 15000;
@@ -122,13 +122,13 @@ class MasterClient {
   grpc::Status BatchLookup(const std::vector<std::string>& keys, std::vector<bool>* out);
 
   // --- Heartbeat (event-driven) ---
-  // Bind a PeerDramAllocator whose outbox the heartbeat thread will
+  // Bind the DRAM PageBackend whose outbox the heartbeat thread will
   // drain.  Pass nullptr for SSD-only peers (skipped, not registered).
   // Also keeps the concrete pointer for DRAM-specific duties the
   // OwnedLocationSource interface does not cover (capacity snapshot,
   // owned-key counts, distributed-clear write gate).  Must be set before
   // StartHeartbeat() — the heartbeat thread reads sources once per tick.
-  void SetPeerDramAllocator(PeerDramAllocator* dram_alloc);
+  void SetPeerDramAllocator(PageBackend* dram_alloc);
 
   // Bind the SSD manager: registers it as an owned-location event source
   // AND keeps the concrete pointer so heartbeat can merge live SSD
@@ -152,7 +152,7 @@ class MasterClient {
   // handles this); SSD-only peers skip that step. Returns true only
   // after both the full-sync heartbeat and the external KV revoke RPC
   // are acknowledged by master; on any failure returns false and leaves
-  // PeerDramAllocator::clear_full_sync_pending_ closed for the caller
+  // PageBackend::clear_full_sync_pending_ closed for the caller
   // to retry.
   bool ClearFullSync();
 
@@ -227,7 +227,7 @@ class MasterClient {
   std::condition_variable hb_cv_;
 
   // Cached tier capacities — heartbeat reports the latest peer
-  // allocator snapshot when the bound PeerDramAllocator is non-null,
+  // allocator snapshot when the bound PageBackend is non-null,
   // else falls back to whatever was last set here.
   std::mutex caps_mutex_;
   std::map<TierType, TierCapacity> current_capacities_;
@@ -235,9 +235,9 @@ class MasterClient {
   // Peer-event source for the heartbeat thread.  Non-owning; lifetime
   // is managed by PoolClient.  Kept as a concrete pointer (in addition to
   // its slot in owned_sources_) for DRAM-specific duties the
-  // OwnedLocationSource interface does not cover: TierCapacitiesSnapshot,
-  // OwnedKeyCountByTier, ClearLocal/ClearFullSyncAcked.
-  PeerDramAllocator* peer_alloc_ = nullptr;
+  // OwnedLocationSource interface does not cover: Capacity(), OwnedKeyCount(),
+  // ClearLocal/ClearFullSyncAcked.
+  PageBackend* peer_alloc_ = nullptr;
 
   // Non-owning.  Kept concrete (in addition to owned_sources_) so heartbeat
   // can merge live SSD capacity into tier_capacities.

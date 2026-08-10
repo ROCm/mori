@@ -33,14 +33,14 @@ namespace mori::umbp {
 // implements this so MasterClient can aggregate every source into one
 // heartbeat bundle under a single monotonic sequence number — never one seq
 // per tier (that would break the ack / seq-gap full-sync recovery).
-// PeerDramAllocator (DRAM/HBM) is the only live implementer; PeerSsdManager
+// PageBackend (DRAM/HBM) is the only live implementer; PeerSsdManager
 // dropped this base in the backend-agnostic refactor Phase 0 (SSD is unwired
 // from the distributed data plane — see design-backend-agnostic-refactor.md)
 // but keeps the same-shaped methods for a future adapter to forward to.
 //
 // This interface deliberately covers ONLY events.  Per-tier capacity, owned-key
 // counts and the distributed-clear write gate stay on the concrete owner
-// (PeerDramAllocator) because they are tier-specific and not shared across all
+// (PageBackend) because they are tier-specific and not shared across all
 // sources.
 class OwnedLocationSource {
  public:

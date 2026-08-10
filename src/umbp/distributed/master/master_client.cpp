@@ -35,7 +35,7 @@
 #include "umbp/common/env_time.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/master/rpc_latency_timer.h"
-#include "umbp/distributed/peer/peer_dram_allocator.h"
+#include "umbp/distributed/peer/page_backend.h"
 #include "umbp/distributed/peer/ssd/peer_ssd_manager.h"
 
 namespace mori::umbp {
@@ -399,7 +399,7 @@ size_t AutoFlushEventThreshold() {
 }
 }  // namespace
 
-void MasterClient::SetPeerDramAllocator(PeerDramAllocator* dram_alloc) {
+void MasterClient::SetPeerDramAllocator(PageBackend* dram_alloc) {
   peer_alloc_ = dram_alloc;
   AddOwnedLocationSource(dram_alloc);
   if (dram_alloc != nullptr) {
@@ -428,7 +428,7 @@ bool MasterClient::ClearFullSync() {
 
   auto caps = SnapshotAndCacheTierCapacities();
   std::map<TierType, uint64_t> kv_counts;
-  if (peer_alloc_ != nullptr) kv_counts = peer_alloc_->OwnedKeyCountByTier();
+  if (peer_alloc_ != nullptr) kv_counts[peer_alloc_->Tier()] = peer_alloc_->OwnedKeyCount();
 
   ::umbp::HeartbeatRequest req;
   req.set_node_id(config_.node_id);
@@ -515,7 +515,7 @@ std::map<TierType, TierCapacity> MasterClient::SnapshotAndCacheTierCapacities() 
   std::map<TierType, TierCapacity> caps;
   bool have_live = false;
   if (peer_alloc_ != nullptr) {
-    caps = peer_alloc_->TierCapacitiesSnapshot();  // DRAM/HBM, bitmap-derived
+    caps[peer_alloc_->Tier()] = peer_alloc_->Capacity();  // DRAM/HBM, bitmap-derived
     have_live = true;
   }
   if (ssd_manager_ != nullptr) {
@@ -542,7 +542,7 @@ bool MasterClient::SendHeartbeatOnce() {
 
   auto caps = SnapshotAndCacheTierCapacities();
   std::map<TierType, uint64_t> kv_counts;
-  if (peer_alloc_ != nullptr) kv_counts = peer_alloc_->OwnedKeyCountByTier();
+  if (peer_alloc_ != nullptr) kv_counts[peer_alloc_->Tier()] = peer_alloc_->OwnedKeyCount();
 
   bool do_full_sync;
   {

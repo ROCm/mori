@@ -179,6 +179,7 @@ TEST_F(PeerSsdManagerTest, PrepareReadRejectsOverCapBeforeIo) {
   EXPECT_EQ(out.size, value.size());
 }
 
+}  // namespace
 // ---- Unified owned-location source aggregation ------------------------------
 
 // Minimal OwnedLocationSource that replays a fixed event list, used to verify
@@ -233,5 +234,4 @@ TEST(OwnedLocationSourceAgg, NullSourcesAreSkipped) {
   EXPECT_TRUE(SnapshotAllSourcesForFullSync({nullptr}).empty());
 }
 
-}  // namespace
 }  // namespace mori::umbp

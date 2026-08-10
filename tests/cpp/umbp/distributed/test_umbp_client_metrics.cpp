@@ -394,13 +394,10 @@ class PoolClientLocalByteTrackingTest : public ::testing::Test {
     metrics_port_ = alloc_unique_port({master_port_});
     io_port_ = alloc_unique_port({master_port_, metrics_port_});
 
-    buf_ = std::malloc(kLocalBufSize);
     src_ = std::malloc(kLocalPageSize);
     dst_ = std::malloc(kLocalPageSize);
-    ASSERT_NE(buf_, nullptr);
     ASSERT_NE(src_, nullptr);
     ASSERT_NE(dst_, nullptr);
-    std::memset(buf_, 0, kLocalBufSize);
     std::memset(src_, 0xAB, kLocalPageSize);
     std::memset(dst_, 0, kLocalPageSize);
 
@@ -420,8 +417,7 @@ class PoolClientLocalByteTrackingTest : public ::testing::Test {
     cfg.io_engine.host = "0.0.0.0";
     cfg.io_engine.port = io_port_;
     cfg.dram_page_size = kLocalPageSize;
-    cfg.dram_buffers = {{buf_, kLocalBufSize}};
-    cfg.tier_capacities = {{TierType::DRAM, {kLocalBufSize, kLocalBufSize}}};
+    cfg.dram.buffer_sizes = {kLocalBufSize};
     client_ = std::make_unique<PoolClient>(std::move(cfg));
     ASSERT_TRUE(client_->Init());
   }
@@ -430,7 +426,6 @@ class PoolClientLocalByteTrackingTest : public ::testing::Test {
     if (client_) client_->Shutdown();
     if (master_) master_->Shutdown();
     if (server_thread_.joinable()) server_thread_.join();
-    std::free(buf_);
     std::free(src_);
     std::free(dst_);
   }
@@ -438,7 +433,6 @@ class PoolClientLocalByteTrackingTest : public ::testing::Test {
   uint16_t master_port_ = 0;
   uint16_t metrics_port_ = 0;
   uint16_t io_port_ = 0;
-  void* buf_ = nullptr;
   void* src_ = nullptr;
   void* dst_ = nullptr;
   std::unique_ptr<MasterServer> master_;

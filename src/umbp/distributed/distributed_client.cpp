@@ -38,49 +38,29 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
 
   const auto& dc = config.distributed.value();
 
-  HostMemAllocator allocator;
-  HostBufferOptions opts;
-  opts.backing = config.dram.use_hugepages ? HostBufferBacking::kAnonymousHugetlb
-                                           : HostBufferBacking::kAnonymous;
-  opts.hugepage_size = config.dram.hugepage_size;
-  opts.numa_node = config.dram.numa_node;
-  opts.prefault = config.dram.prefault;
-
-  dram_pool_handle_ = allocator.Alloc(config.dram.capacity_bytes, opts);
-  if (!dram_pool_handle_.valid()) {
-    throw std::runtime_error("DistributedClient: memory allocation failed for DRAM pool");
-  }
-  dram_pool_ = dram_pool_handle_.ptr;
-  // Use mapped_size (>= capacity_bytes, rounded up to page/hugepage boundary)
-  // so that RDMA registration, PeerDramAllocator capacity, and master-reported
-  // tier_capacities all agree on a single value.  This means the effective
-  // pool size may exceed config.dram.capacity_bytes by up to one hugepage.
-  // NOTE: if hugepage_size is not a multiple of dram_page_size, the tail
-  // bytes that don't form a complete dram_page are reported in
-  // tier_capacities but never allocated by PeerDramAllocator; heartbeat's
-  // TierCapacitiesSnapshot() will correct master's view.  Both default to
-  // 2 MiB, so this only matters with non-default page size combinations.
-  dram_pool_size_ = dram_pool_handle_.mapped_size;
+  // Ownership (ptr, hugepages, NUMA, prefault) moved into PoolClient's DRAM
+  // PageBackend — it self-allocates at Init() instead of DistributedClient
+  // calling HostMemAllocator and handing over a buffer pointer
+  // (backend-agnostic refactor Phase 2b, design doc §1 item 4).  Only the
+  // sizing/policy knobs cross this boundary now.
+  DramOwnershipConfig dram_ownership;
+  dram_ownership.buffer_sizes = {config.dram.capacity_bytes};
+  dram_ownership.use_hugepages = config.dram.use_hugepages;
+  dram_ownership.hugepage_size = config.dram.hugepage_size;
+  dram_ownership.numa_node = config.dram.numa_node;
+  dram_ownership.prefault = config.dram.prefault;
 
   // SSD is unwired from the distributed data plane (backend-agnostic refactor
   // Phase 0, see design-backend-agnostic-refactor.md): PoolClient no longer
   // builds a PeerSsdManager or serves SSD reads, so this node advertises only
   // its DRAM capacity — advertising SSD here without anything behind it would
   // route Gets/Puts into a dead path.
-  std::map<TierType, TierCapacity> tier_capacities = {
-      {TierType::DRAM, {dram_pool_size_, dram_pool_size_}}};
-  auto pc_config = ToPoolClientConfig(dc,
-                                      /*dram_buffers=*/{{dram_pool_, dram_pool_size_}},
-                                      std::move(tier_capacities));
+  auto pc_config = ToPoolClientConfig(dc, std::move(dram_ownership));
   pc_config.copy_pipeline = config_.copy_pipeline;
 
   pool_client_ = std::make_unique<PoolClient>(std::move(pc_config));
   if (!pool_client_->Init()) {
     pool_client_.reset();
-    HostMemAllocator cleanup_allocator;
-    cleanup_allocator.Free(dram_pool_handle_);
-    dram_pool_ = nullptr;
-    dram_pool_size_ = 0;
     throw std::runtime_error("DistributedClient: PoolClient::Init() failed");
   }
 
@@ -97,7 +77,7 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
       "dram_page_size={}KB staging_buffer={}MB peer_port={} cache_remote={} "
       "io_engine={}:{} tags=[{}]",
       dc.master_config.node_id, dc.master_config.node_address, dc.master_config.master_address,
-      dram_pool_size_ / (1024 * 1024), config_.dram.use_hugepages,
+      config.dram.capacity_bytes / (1024 * 1024), config_.dram.use_hugepages,
       config_.dram.hugepage_size / (1024 * 1024), config_.dram.numa_node, dc.dram_page_size / 1024,
       dc.staging_buffer_size / (1024 * 1024), dc.peer_service_port, dc.cache_remote_fetches,
       dc.io_engine.host, dc.io_engine.port, tags_str);
@@ -266,13 +246,6 @@ void DistributedClient::Close() {
   if (pool_client_) {
     pool_client_->Shutdown();
     pool_client_.reset();
-  }
-
-  if (dram_pool_) {
-    HostMemAllocator allocator;
-    allocator.Free(dram_pool_handle_);
-    dram_pool_ = nullptr;
-    dram_pool_size_ = 0;
   }
 
   MORI_UMBP_INFO("[DistributedClient] closed");

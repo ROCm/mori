@@ -29,7 +29,7 @@
 
 namespace mori::umbp {
 
-class PeerDramAllocator;
+class PageBackend;
 class MasterClient;
 
 class PeerServiceServer {
@@ -41,7 +41,7 @@ class PeerServiceServer {
   // SSD read staging (PrepareSsdRead/ReleaseSsdLease) was removed in the
   // backend-agnostic refactor Phase 0 — SSD is unwired from the distributed
   // data plane (see design-backend-agnostic-refactor.md).
-  PeerServiceServer(PeerDramAllocator* dram_alloc, std::vector<uint8_t> engine_desc_bytes = {},
+  PeerServiceServer(PageBackend* dram_alloc, std::vector<uint8_t> engine_desc_bytes = {},
                     MasterClient* master_client = nullptr);
   ~PeerServiceServer();
 
@@ -51,10 +51,10 @@ class PeerServiceServer {
   // Read-only access for the heartbeat shipper (lives in MasterClient
   // / PoolClient).  Never null after construction with a non-null
   // allocator argument.
-  PeerDramAllocator* DramAllocator() const { return dram_alloc_; }
+  PageBackend* DramAllocator() const { return dram_alloc_; }
 
  private:
-  PeerDramAllocator* dram_alloc_;
+  PageBackend* dram_alloc_;
   MasterClient* master_client_;
 
   std::vector<uint8_t> engine_desc_bytes_;

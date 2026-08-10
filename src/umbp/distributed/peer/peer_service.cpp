@@ -31,7 +31,7 @@
 #include "umbp/distributed/master/master_client.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/peer/batch_resolve_codec.h"
-#include "umbp/distributed/peer/peer_dram_allocator.h"
+#include "umbp/distributed/peer/page_backend.h"
 #include "umbp/distributed/types.h"
 #include "umbp_peer.grpc.pb.h"
 
@@ -83,7 +83,7 @@ void FillPagesAndDescs(Response* resp, const std::vector<PageLocation>& pages, u
 
 class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Service {
  public:
-  UMBPPeerServiceImpl(PeerDramAllocator* dram_alloc, MasterClient* master_client,
+  UMBPPeerServiceImpl(PageBackend* dram_alloc, MasterClient* master_client,
                       const std::vector<uint8_t>& engine_desc_bytes)
       : dram_alloc_(dram_alloc),
         engine_desc_bytes_(engine_desc_bytes),
@@ -96,18 +96,14 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       response->set_engine_desc(std::string(engine_desc_bytes_.begin(), engine_desc_bytes_.end()));
     }
     if (dram_alloc_ != nullptr) {
-      // Ship every configured DRAM/HBM buffer's desc so first-contact
-      // writers can hydrate without a follow-up Allocate / Resolve.
-      // DRAM and HBM share a single page_size in this design, so the
-      // single field on the response is sufficient.
-      auto dram_descs = dram_alloc_->AllBufferDescs(TierType::DRAM);
-      auto hbm_descs = dram_alloc_->AllBufferDescs(TierType::HBM);
+      // Ship every configured buffer's desc so first-contact writers can
+      // hydrate without a follow-up Allocate / Resolve.  One PageBackend
+      // instance == one medium now (backend-agnostic refactor Phase 2), so
+      // this is just the DRAM backend's buffers; a live HBM backend would be
+      // shipped the same way if/when one is wired up (design doc §5 Phase 2
+      // option (a), blocked on Phase 6).
+      auto dram_descs = dram_alloc_->AllBufferDescs();
       for (const auto& d : dram_descs) {
-        auto* out = response->add_dram_memory_descs();
-        out->set_buffer_index(d.buffer_index);
-        out->set_desc(std::string(d.desc_bytes.begin(), d.desc_bytes.end()));
-      }
-      for (const auto& d : hbm_descs) {
         auto* out = response->add_dram_memory_descs();
         out->set_buffer_index(d.buffer_index);
         out->set_desc(std::string(d.desc_bytes.begin(), d.desc_bytes.end()));
@@ -124,30 +120,31 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
   grpc::Status AllocateSlot(grpc::ServerContext* /*ctx*/,
                             const ::umbp::AllocateSlotRequest* request,
                             ::umbp::AllocateSlotResponse* response) override {
-    if (dram_alloc_ == nullptr) {
+    // A request for a tier this peer has no live backend for (e.g. HBM, not
+    // wired up — design doc §5 Phase 2) fails the same way a null
+    // dram_alloc_ does: FAILED, not a crash.
+    if (dram_alloc_ == nullptr || FromProtoTier(request->tier()) != dram_alloc_->Tier()) {
       response->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_FAILED);
       return grpc::Status::OK;
     }
-    auto result =
-        dram_alloc_->Allocate(request->key(), request->size(), FromProtoTier(request->tier()));
+    auto result = dram_alloc_->Allocate(request->key(), request->size());
     switch (result.outcome) {
-      case PeerDramAllocator::Outcome::kSuccessAlreadyExists:
+      case AllocateOutcome::kSuccessAlreadyExists:
         response->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALREADY_EXISTS);
         return grpc::Status::OK;
-      case PeerDramAllocator::Outcome::kFailed:
+      case AllocateOutcome::kFailed:
         response->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_FAILED);
         return grpc::Status::OK;
-      case PeerDramAllocator::Outcome::kFailedNoSpace:
+      case AllocateOutcome::kFailedNoSpace:
         response->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_FAILED_NO_SPACE);
         return grpc::Status::OK;
-      case PeerDramAllocator::Outcome::kSuccessAllocated:
+      case AllocateOutcome::kSuccessAllocated:
         break;
     }
-    const auto& pending = *result.slot;
-    auto descs = dram_alloc_->BufferDescsForPages(pending.tier, pending.pages);
+    auto descs = dram_alloc_->BufferDescsForPages(result.pages);
     response->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
-    response->set_slot_id(pending.slot_id);
-    FillPagesAndDescs(response, pending.pages, dram_alloc_->PageSize(), descs);
+    response->set_slot_id(result.slot_id);
+    FillPagesAndDescs(response, result.pages, dram_alloc_->PageSize(), descs);
     response->set_pending_ttl_ms(dram_alloc_->PendingTtlMs());
     return grpc::Status::OK;
   }
@@ -186,7 +183,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     auto r = dram_alloc_->Resolve(request->key());
     response->set_found(r.found);
     if (!r.found) return grpc::Status::OK;
-    auto descs = dram_alloc_->BufferDescsForPages(r.tier, r.pages);
+    auto descs = dram_alloc_->BufferDescsForPages(r.pages);
     FillPagesAndDescs(response, r.pages, dram_alloc_->PageSize(), descs);
     response->set_size(r.size);
     RecordInboundGet(r.size, "remote");
@@ -222,36 +219,48 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       return grpc::Status::OK;
     }
 
-    std::vector<PeerDramAllocator::AllocateRequest> entries;
+    // Entries requesting a tier this backend does not serve are separated out
+    // up front so BatchAllocate (single-tier) only ever sees requests for
+    // dram_alloc_->Tier(); their responses are filled in as FAILED below,
+    // preserving per-entry result ordering.
+    std::vector<AllocateRequest> entries;
+    std::vector<bool> tier_ok(request->entries_size());
     entries.reserve(request->entries_size());
-    for (const auto& entry : request->entries()) {
-      PeerDramAllocator::AllocateRequest alloc_entry;
+    for (int i = 0; i < request->entries_size(); ++i) {
+      const auto& entry = request->entries(i);
+      tier_ok[i] = FromProtoTier(entry.tier()) == dram_alloc_->Tier();
+      if (!tier_ok[i]) continue;
+      AllocateRequest alloc_entry;
       alloc_entry.key = entry.key();
       alloc_entry.size = entry.size();
-      alloc_entry.tier = FromProtoTier(entry.tier());
       entries.push_back(std::move(alloc_entry));
     }
 
     auto results = dram_alloc_->BatchAllocate(entries);
-    for (const auto& result : results) {
+    size_t next_result = 0;
+    for (bool ok : tier_ok) {
       auto* out = response->add_entries();
+      if (!ok) {
+        out->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_FAILED);
+        continue;
+      }
+      const auto& result = results[next_result++];
       switch (result.outcome) {
-        case PeerDramAllocator::Outcome::kSuccessAlreadyExists:
+        case AllocateOutcome::kSuccessAlreadyExists:
           out->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALREADY_EXISTS);
           continue;
-        case PeerDramAllocator::Outcome::kFailed:
+        case AllocateOutcome::kFailed:
           out->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_FAILED);
           continue;
-        case PeerDramAllocator::Outcome::kFailedNoSpace:
+        case AllocateOutcome::kFailedNoSpace:
           out->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_FAILED_NO_SPACE);
           continue;
-        case PeerDramAllocator::Outcome::kSuccessAllocated:
+        case AllocateOutcome::kSuccessAllocated:
           break;
       }
-      const auto& pending = *result.slot;
       out->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
-      out->set_slot_id(pending.slot_id);
-      FillPagesAndDescs(out, pending.pages, dram_alloc_->PageSize(), result.descs);
+      out->set_slot_id(result.slot_id);
+      FillPagesAndDescs(out, result.pages, dram_alloc_->PageSize(), result.descs);
       out->set_pending_ttl_ms(dram_alloc_->PendingTtlMs());
     }
     return grpc::Status::OK;
@@ -265,10 +274,10 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       return grpc::Status::OK;
     }
 
-    std::vector<PeerDramAllocator::CommitRequest> entries;
+    std::vector<CommitRequest> entries;
     entries.reserve(request->entries_size());
     for (const auto& entry : request->entries()) {
-      PeerDramAllocator::CommitRequest commit_entry;
+      CommitRequest commit_entry;
       commit_entry.slot_id = entry.slot_id();
       commit_entry.key = entry.key();
       entries.push_back(std::move(commit_entry));
@@ -330,7 +339,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       ResolvedKeyEntry e;
       e.found = r.found;
       if (r.found) {
-        e.tier = r.tier;
+        e.tier = dram_alloc_->Tier();
         e.size = r.size;
         e.pages = std::move(r.pages);
         total_bytes += r.size;
@@ -367,12 +376,12 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
                                static_cast<double>(bytes));
   }
 
-  PeerDramAllocator* dram_alloc_;
+  PageBackend* dram_alloc_;
   const std::vector<uint8_t>& engine_desc_bytes_;
   MasterClient* master_client_;
 };
 
-PeerServiceServer::PeerServiceServer(PeerDramAllocator* dram_alloc,
+PeerServiceServer::PeerServiceServer(PageBackend* dram_alloc,
                                      std::vector<uint8_t> engine_desc_bytes,
                                      MasterClient* master_client)
     : dram_alloc_(dram_alloc),

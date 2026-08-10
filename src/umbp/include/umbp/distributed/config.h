@@ -131,9 +131,19 @@ struct MasterServerConfig {
   MasterServerConfig& operator=(MasterServerConfig&&) noexcept;
 };
 
-struct ExportableDram {
-  void* buffer = nullptr;
-  size_t size = 0;
+// Ownership config for this node's DRAM/HBM backend pool(s) — sizes only.
+// PageBackend::Init(TransferEngine*) self-allocates one HostMemAllocator
+// buffer per entry in `buffer_sizes` and registers it with the transfer
+// engine; PoolClientConfig never sees a buffer pointer (backend-agnostic
+// refactor Phase 2b — see design-backend-agnostic-refactor.md §1 item 4).
+// `buffer_sizes` usually holds exactly one entry (one pool); more than one
+// exercises PageBitmapAllocator's cross-buffer scatter/gather strategy.
+struct DramOwnershipConfig {
+  std::vector<uint64_t> buffer_sizes;
+  bool use_hugepages = false;
+  uint64_t hugepage_size = 2ULL * 1024 * 1024;
+  int numa_node = -1;
+  bool prefault = true;
 };
 
 // SSD-tier construction parameters lowered from the user-facing UMBPConfig.
@@ -165,10 +175,8 @@ struct PoolClientConfig {
   // must be >= the largest single-key page KV (61-layer MLA page ~= 4.5 MB).
   size_t ssd_staging_buffer_size = 268435456;  // 256 MiB
 
-  std::vector<ExportableDram> dram_buffers;
+  DramOwnershipConfig dram;
   PeerSsdConfig ssd;
-
-  std::map<TierType, TierCapacity> tier_capacities;
 
   uint16_t peer_service_port = 0;
 
@@ -197,12 +205,15 @@ struct PoolClientConfig {
 // Kept as a free function (not a member of UMBPDistributedConfig) so that
 // common/config.h does not need to include distributed/config.h — the
 // dependency is one-directional: distributed/config.h -> common/config.h.
-// DRAM buffers and tier capacities are caller-supplied because they live in
-// DistributedClient (pool mmap'd memory), not in the user-facing config.
+// `dram` is caller-supplied (sizes only, no pointer — see DramOwnershipConfig)
+// because DistributedClient is the one place that knows the top-level
+// UMBPConfig::dram ownership knobs (hugepages/numa/prefault), which sit
+// beside — not inside — UMBPDistributedConfig.  PoolClient's DRAM PageBackend
+// self-allocates from this at Init(); tier capacities are no longer
+// caller-supplied at all — they are derived from BackendRegistry::Capacity()
+// after Init (backend-agnostic refactor Phase 2).
 inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
-                                           std::vector<ExportableDram> dram_buffers,
-                                           std::map<TierType, TierCapacity> tier_capacities,
-                                           PeerSsdConfig ssd = {}) {
+                                           DramOwnershipConfig dram, PeerSsdConfig ssd = {}) {
   PoolClientConfig pc;
   pc.master_config = dc.master_config;
   pc.io_engine = dc.io_engine;
@@ -217,8 +228,7 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   // proto -> ClientRegistry, where it is interpreted as "use the
   // registry-wide default_dram_page_size".
   pc.dram_page_size = dc.dram_page_size;
-  pc.dram_buffers = std::move(dram_buffers);
-  pc.tier_capacities = std::move(tier_capacities);
+  pc.dram = std::move(dram);
   pc.ssd = std::move(ssd);
   return pc;
 }

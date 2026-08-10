@@ -35,12 +35,12 @@
 
 namespace mori::umbp {
 
-class PeerDramAllocator;
+class PageBackend;
 class PeerSsdManager;
 
 // One async SSD copy request, enqueued after a DRAM commit succeeds.  It
 // deliberately carries NO source pointer: the worker re-derives the readable
-// segments from `key` via PeerDramAllocator::AcquireDramCopyPin, so an
+// segments from `key` via PageBackend::AcquireDramCopyPin, so an
 // already-evicted key is simply dropped (the pin acquisition fails).
 struct SsdCopyTask {
   std::string key;
@@ -62,7 +62,7 @@ struct SsdCopyTask {
 //     emits ADD SSD.
 class SsdCopyPipeline {
  public:
-  SsdCopyPipeline(PeerDramAllocator* dram, PeerSsdManager* ssd, size_t queue_depth = 4096,
+  SsdCopyPipeline(PageBackend* dram, PeerSsdManager* ssd, size_t queue_depth = 4096,
                   size_t worker_threads = 1);
   ~SsdCopyPipeline();
 
@@ -110,7 +110,7 @@ class SsdCopyPipeline {
   void WorkerLoop();
   void RunTask(const SsdCopyTask& task);
 
-  PeerDramAllocator* dram_;
+  PageBackend* dram_;
   PeerSsdManager* ssd_;
   const size_t queue_depth_;
   const size_t worker_threads_;

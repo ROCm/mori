@@ -53,7 +53,7 @@ struct SsdReadOutcome {
 // local-eviction paths.  It deliberately reuses ONLY the low-level TierBackend
 // (SSDTier); it must NOT pull in LocalStorageManager / LocalBlockIndex (which
 // carry their own DRAM tier + demote/promote) — peer DRAM is owned by
-// PeerDramAllocator and two DRAM concepts would scramble ownership.
+// PageBackend and two DRAM concepts would scramble ownership.
 //
 // Dormant: unwired from the distributed data plane (see
 // design-backend-agnostic-refactor.md Phase 0). No longer implements
