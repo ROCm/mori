@@ -33,8 +33,8 @@
 #include <vector>
 
 #include "umbp/distributed/peer/peer_dram_allocator.h"
-#include "umbp/distributed/peer/peer_ssd_manager.h"
-#include "umbp/distributed/peer/ssd_copy_pipeline.h"
+#include "umbp/distributed/peer/ssd/peer_ssd_manager.h"
+#include "umbp/distributed/peer/ssd/ssd_copy_pipeline.h"
 #include "umbp/local/block_index/local_block_index.h"
 #include "umbp/local/tiers/copy_pipeline.h"
 #include "umbp/local/tiers/local_storage_manager.h"

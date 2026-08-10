@@ -158,15 +158,6 @@ add_test(NAME umbp_page_bitmap_allocator
 # Registered as CTest cases under the "integration" label.
 # --------------------------------------------------------------------------
 
-add_executable(test_umbp_peer_service test_peer_service.cpp)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_link_options(test_umbp_peer_service PRIVATE -Wl,--no-as-needed)
-endif()
-target_link_libraries(
-  test_umbp_peer_service PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB}
-                                 ${_TEST_GRPCPP_LIB} gtest_main)
-add_test(NAME umbp_peer_service COMMAND test_umbp_peer_service)
-
 add_executable(test_umbp_cross_node_smoke test_cross_node_smoke.cpp)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_link_options(test_umbp_cross_node_smoke PRIVATE -Wl,--no-as-needed)
@@ -189,8 +180,8 @@ target_link_libraries(
 add_test(NAME umbp_pool_client_batch_put
          COMMAND test_umbp_pool_client_batch_put)
 
-set_tests_properties(umbp_peer_service umbp_cross_node_smoke
-                     umbp_pool_client_batch_put PROPERTIES LABELS "integration")
+set_tests_properties(umbp_cross_node_smoke umbp_pool_client_batch_put
+                     PROPERTIES LABELS "integration")
 
 # --------------------------------------------------------------------------
 # Benchmarks (manual; built but NOT registered with add_test).
@@ -244,9 +235,8 @@ target_link_libraries(bench_umbp_route_strategy PRIVATE umbp_common)
 
 # ===========================================================================
 # Metadata-store / external-KV / SSD-tier suite (migrated from src/umbp/tests).
-# These link umbp_common (pure logic) except test_peer_ssd_read_rpc, which
-# exercises the gRPC peer service and links umbp_core + protobuf/gRPC. Each
-# binary is registered as a single ctest via add_test (see the NOTE above).
+# These link umbp_common (pure logic). Each binary is registered as a single
+# ctest via add_test (see the NOTE above).
 # ===========================================================================
 
 # test_master_metadata_store_interface — Phase 1 compile/instantiation gate for
@@ -284,7 +274,8 @@ target_link_libraries(test_router_dedup PRIVATE umbp_common GTest::gtest_main)
 target_compile_features(test_router_dedup PRIVATE cxx_std_17)
 add_test(NAME test_router_dedup COMMAND test_router_dedup)
 
-# test_peer_ssd_manager — SSD tier ownership + owned-location source
+# test_peer_ssd_manager — SSD tier ownership (dormant: unwired from the
+# distributed data plane, see design-backend-agnostic-refactor.md Phase 0)
 add_executable(test_peer_ssd_manager test_peer_ssd_manager.cpp)
 target_link_libraries(test_peer_ssd_manager PRIVATE umbp_common
                                                     GTest::gtest_main)
@@ -311,35 +302,6 @@ target_link_libraries(test_tier_priority_route_get PRIVATE umbp_common
                                                            GTest::gtest_main)
 target_compile_features(test_tier_priority_route_get PRIVATE cxx_std_17)
 add_test(NAME test_tier_priority_route_get COMMAND test_tier_priority_route_get)
-
-# test_peer_ssd_read_rpc — SSD read RPC over a gRPC loopback. Needs the gRPC
-# peer service + generated stubs (umbp_core) and protobuf/gRPC.
-add_executable(test_peer_ssd_read_rpc test_peer_ssd_read_rpc.cpp)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_link_options(test_peer_ssd_read_rpc PRIVATE -Wl,--no-as-needed)
-endif()
-target_link_libraries(
-  test_peer_ssd_read_rpc PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB}
-                                 ${_TEST_GRPCPP_LIB} GTest::gtest_main)
-target_compile_features(test_peer_ssd_read_rpc PRIVATE cxx_std_17)
-add_test(NAME test_peer_ssd_read_rpc COMMAND test_peer_ssd_read_rpc)
-
-# test_ssd_read_lease_gating — pure reader-side lease gating decision logic
-# (ssd_read_lease.h). Header-only under test (no gRPC / RDMA deps).
-add_executable(test_ssd_read_lease_gating test_ssd_read_lease_gating.cpp)
-target_link_libraries(test_ssd_read_lease_gating PRIVATE umbp_common
-                                                         GTest::gtest_main)
-target_compile_features(test_ssd_read_lease_gating PRIVATE cxx_std_17)
-add_test(NAME test_ssd_read_lease_gating COMMAND test_ssd_read_lease_gating)
-
-# test_ssd_reliability — cross-component reliability: owned-source DRAM+SSD
-# merge, SSD evict -> REMOVE -> master index convergence, tier-priority over the
-# real index, crash-restart discard, and observability counters.
-add_executable(test_ssd_reliability test_ssd_reliability.cpp)
-target_link_libraries(test_ssd_reliability PRIVATE umbp_common
-                                                   GTest::gtest_main)
-target_compile_features(test_ssd_reliability PRIVATE cxx_std_17)
-add_test(NAME test_ssd_reliability COMMAND test_ssd_reliability)
 
 # test_cache_remote_admission — cache_remote_fetches admission-gate unit test
 # (hermetic; no GPU/RDMA/master).

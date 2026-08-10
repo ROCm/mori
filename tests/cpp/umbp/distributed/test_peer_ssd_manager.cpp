@@ -31,7 +31,7 @@
 #include <vector>
 
 #include "umbp/distributed/peer/owned_location_source.h"
-#include "umbp/distributed/peer/peer_ssd_manager.h"
+#include "umbp/distributed/peer/ssd/peer_ssd_manager.h"
 
 namespace mori::umbp {
 namespace {
