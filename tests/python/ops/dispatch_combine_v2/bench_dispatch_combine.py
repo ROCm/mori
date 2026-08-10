@@ -109,6 +109,11 @@ QUANT = os.environ.get("QUANT", "none")  # none | fp8_direct_cast (scatter only)
 SCALE_DIM = int(os.environ.get("SCALE_DIM", 0))  # >0 = forward per-token scales
 HOIST_LSA_BASE = int(os.environ.get("HOIST_LSA_BASE", 0))
 GLOBAL_LSA_METADATA = int(os.environ.get("GLOBAL_LSA_METADATA", 0))
+PREFETCH_ROUTE_PAYLOAD = int(os.environ.get("PREFETCH_ROUTE_PAYLOAD", 0))
+DEFER_DEST_CTR_ATOMIC = int(os.environ.get("DEFER_DEST_CTR_ATOMIC", 0))
+ROTATE_DISPATCH_SLOT_ORDER = int(os.environ.get("ROTATE_DISPATCH_SLOT_ORDER", 0))
+ROTATE_COMBINE_PEER_ORDER = int(os.environ.get("ROTATE_COMBINE_PEER_ORDER", 0))
+ROUTING_PATTERN = os.environ.get("ROUTING_PATTERN", "random").lower()
 SWEEP = [int(x) for x in os.environ.get("SWEEP", "128,512,2048").split(",")]
 
 # fp8 flavor is arch-specific: OCP e4m3 on gfx950/gfx1250, fnuz on gfx942.
@@ -143,6 +148,37 @@ DISP_NB = HIDDEN // 2 if _disp_s == "fp4" else HIDDEN * DISP_ESZ  # dispatch byt
 COMB_NB = HIDDEN // 2 if _comb_s == "fp4" else HIDDEN * COMB_ESZ  # combine bytes/tok
 
 
+def _make_routing_idx(g, rank, max_tok, topk, npes, experts_per_rank):
+    num_experts = npes * experts_per_rank
+    if ROUTING_PATTERN == "random":
+        return torch.randint(
+            0, num_experts, (max_tok, topk), generator=g, dtype=torch.int32
+        )
+    if ROUTING_PATTERN == "aligned":
+        route_g = torch.Generator(device="cpu").manual_seed(20260807)
+        return torch.randint(
+            0, num_experts, (max_tok, topk), generator=route_g, dtype=torch.int32
+        )
+    if ROUTING_PATTERN not in ("round_robin", "hotspot"):
+        raise ValueError(
+            "ROUTING_PATTERN must be random|aligned|round_robin|hotspot, "
+            f"got {ROUTING_PATTERN!r}"
+        )
+
+    tok = torch.arange(max_tok, dtype=torch.int64).view(max_tok, 1)
+    slot = torch.arange(topk, dtype=torch.int64).view(1, topk)
+    local_expert = (tok * topk + slot) % experts_per_rank
+    if ROUTING_PATTERN == "round_robin":
+        peer = (tok + slot) % npes
+    elif npes == 1:
+        peer = torch.zeros((max_tok, topk), dtype=torch.int64)
+    else:
+        hot_slots = (topk + 1) // 2
+        spread_peer = 1 + ((tok + slot - hot_slots) % (npes - 1))
+        peer = torch.where(slot < hot_slots, torch.zeros_like(spread_peer), spread_peer)
+    return (peer * experts_per_rank + local_expert).to(torch.int32)
+
+
 def main():
     d = Dist()
     rank, npes = d.rank, d.world
@@ -170,9 +206,7 @@ def main():
             .to(DISP_DT)
             .to(dev)
         )
-    idx = torch.randint(
-        0, num_experts, (max_tok, K), generator=g, dtype=torch.int32
-    ).to(dev)
+    idx = _make_routing_idx(g, rank, max_tok, K, npes, EPR).to(dev)
     wts = torch.rand(max_tok, K, generator=g, dtype=torch.float32).to(dev)
     # per-token scales (int8 bytes): pattern = (rank*100003 + tok) per dword so
     # the recv side can verify the bijection (origin decoded from recv_to_src_token).
@@ -225,6 +259,10 @@ def main():
             enable_std_moe=bool(STDMOE),
             hoist_lsa_base=bool(HOIST_LSA_BASE),
             global_lsa_metadata=bool(GLOBAL_LSA_METADATA),
+            prefetch_route_payload=bool(PREFETCH_ROUTE_PAYLOAD),
+            defer_dest_ctr_atomic=bool(DEFER_DEST_CTR_ATOMIC),
+            rotate_dispatch_slot_order=bool(ROTATE_DISPATCH_SLOT_ORDER),
+            rotate_combine_peer_order=bool(ROTATE_COMBINE_PEER_ORDER),
         )
         if not AUTO:
             # pin the swept geometry (single-shot); AUTO => leave unset so the
@@ -522,7 +560,12 @@ def main():
                 f"# EP{npes} hidden={HIDDEN} topk={K} experts={num_experts} "
                 f"dtype={DTYPE} combine={COMBINE} quant={QUANT} scale_dim={SCALE_DIM} "
                 f"{_geom} hoist_lsa_base={bool(HOIST_LSA_BASE)} "
-                f"global_lsa_metadata={bool(GLOBAL_LSA_METADATA)} iters={ITERS}",
+                f"global_lsa_metadata={bool(GLOBAL_LSA_METADATA)} "
+                f"prefetch_route_payload={bool(PREFETCH_ROUTE_PAYLOAD)} "
+                f"defer_dest_ctr_atomic={bool(DEFER_DEST_CTR_ATOMIC)} "
+                f"rotate_dispatch={bool(ROTATE_DISPATCH_SLOT_ORDER)} "
+                f"rotate_combine={bool(ROTATE_COMBINE_PEER_ORDER)} "
+                f"routing={ROUTING_PATTERN} iters={ITERS}",
                 flush=True,
             )
         verify(min(SWEEP))  # correctness pass during warmup

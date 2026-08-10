@@ -112,6 +112,107 @@ def _cases():
         },
         id="bf16-gather-hoist-global-meta",
     )
+    peer_order_common = {
+        "DTYPE": "bf16",
+        "COMBINE": "gather",
+        "HOIST_LSA_BASE": 1,
+        "GLOBAL_LSA_METADATA": 1,
+    }
+    peer_order_variants = (
+        ("a", {}),
+        ("dispatch", {"ROTATE_DISPATCH_SLOT_ORDER": 1}),
+        ("combine", {"ROTATE_COMBINE_PEER_ORDER": 1}),
+        (
+            "combined",
+            {
+                "ROTATE_DISPATCH_SLOT_ORDER": 1,
+                "ROTATE_COMBINE_PEER_ORDER": 1,
+            },
+        ),
+    )
+    for k in (4, 8, 9):
+        for variant_name, variant_env in peer_order_variants:
+            if k == 8 and variant_name == "a":
+                continue  # bf16-gather-hoist-global-meta above is this baseline.
+            yield pytest.param(
+                {**peer_order_common, "TOPK": k, **variant_env},
+                id=f"bf16-peer-order-topk{k}-{variant_name}",
+            )
+    for routing_pattern in ("aligned", "round_robin", "hotspot"):
+        yield pytest.param(
+            {
+                **peer_order_common,
+                "ROTATE_DISPATCH_SLOT_ORDER": 1,
+                "ROTATE_COMBINE_PEER_ORDER": 1,
+                "ROUTING_PATTERN": routing_pattern,
+            },
+            id=f"bf16-peer-order-{routing_pattern}",
+        )
+    yield pytest.param(
+        {
+            "DTYPE": "bf16",
+            "COMBINE": "scatter",
+            "HOIST_LSA_BASE": 1,
+            "GLOBAL_LSA_METADATA": 1,
+            "ROTATE_DISPATCH_SLOT_ORDER": 1,
+        },
+        id="bf16-scatter-dispatch-slot-rotation",
+    )
+    yield pytest.param(
+        {
+            "DTYPE": "bf16",
+            "COMBINE": "gather",
+            "HOIST_LSA_BASE": 1,
+            "GLOBAL_LSA_METADATA": 1,
+            "PREFETCH_ROUTE_PAYLOAD": 1,
+        },
+        id="bf16-gather-prefetch",
+    )
+    yield pytest.param(
+        {
+            "DTYPE": "bf16",
+            "COMBINE": "gather",
+            "HOIST_LSA_BASE": 1,
+            "GLOBAL_LSA_METADATA": 1,
+            "DEFER_DEST_CTR_ATOMIC": 1,
+        },
+        id="bf16-gather-defer-ctr",
+    )
+    yield pytest.param(
+        {
+            "DTYPE": "bf16",
+            "COMBINE": "gather",
+            "HOIST_LSA_BASE": 1,
+            "GLOBAL_LSA_METADATA": 1,
+            "PREFETCH_ROUTE_PAYLOAD": 1,
+            "DEFER_DEST_CTR_ATOMIC": 1,
+        },
+        id="bf16-gather-prefetch-defer",
+    )
+    yield pytest.param(
+        {
+            "DTYPE": "bf16",
+            "COMBINE": "gather",
+            "HOIST_LSA_BASE": 1,
+            "GLOBAL_LSA_METADATA": 1,
+            "PREFETCH_ROUTE_PAYLOAD": 1,
+            "DEFER_DEST_CTR_ATOMIC": 1,
+            "REPLAY": 1,
+        },
+        id="bf16-gather-prefetch-defer-replay",
+    )
+    yield pytest.param(
+        {
+            "DTYPE": "bf16",
+            "COMBINE": "gather",
+            "HOIST_LSA_BASE": 1,
+            "GLOBAL_LSA_METADATA": 1,
+            "PREFETCH_ROUTE_PAYLOAD": 1,
+            "DEFER_DEST_CTR_ATOMIC": 1,
+            "SCALE_DIM": 32,
+        },
+        id="bf16-gather-prefetch-defer-scales",
+    )
     yield pytest.param({"DTYPE": "bf16", "COMBINE": "scatter"}, id="bf16-scatter")
     yield pytest.param({"DTYPE": "f32", "COMBINE": "gather"}, id="f32-gather")
     yield pytest.param({"DTYPE": "f32", "COMBINE": "scatter"}, id="f32-scatter")

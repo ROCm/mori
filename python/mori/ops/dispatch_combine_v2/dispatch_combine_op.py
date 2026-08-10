@@ -147,6 +147,15 @@ class EpDispatchCombineConfig:
     # Experimental nested A/B switch: load ccoWindowDevice metadata through
     # LLVM global addrspace(1), rather than the generic-pointer CCO extern.
     global_lsa_metadata: bool = False
+    # Dispatch stall A/B switches. Prefetch route payload before the slot
+    # allocation atomic; defer the local destination counter atomic until after
+    # route metadata/scales are published (but before the token copy).
+    prefetch_route_payload: bool = False
+    defer_dest_ctr_atomic: bool = False
+    # Peer-order A/B switches. Dispatch permutes each token's slot-to-warp
+    # assignment; gather combine phase-shifts expert reads across warps.
+    rotate_dispatch_slot_order: bool = False
+    rotate_combine_peer_order: bool = False
 
     def __post_init__(self):
         if self.global_lsa_metadata and not self.hoist_lsa_base:
@@ -170,6 +179,8 @@ class EpDispatchCombineConfig:
             )
         if self.quant_type != "none":
             self.combine_mode = "scatter"
+        if self.rotate_combine_peer_order and self.combine_mode != "gather":
+            raise ValueError("rotate_combine_peer_order requires combine_mode='gather'")
         # The dispatch grid barrier iterates peers as `range(lane, npes, 64)` and
         # resets the barrier inside the loop, which is only correct when each lane
         # runs it at most once (npes <= wavefront). Intranode is single-node so
@@ -575,6 +586,9 @@ class EpDispatchCombineOp:
             fp4=is_fp4,
             hoist_lsa_base=cfg.hoist_lsa_base,
             global_lsa_metadata=cfg.global_lsa_metadata,
+            prefetch_route_payload=cfg.prefetch_route_payload,
+            defer_dest_ctr_atomic=cfg.defer_dest_ctr_atomic,
+            rotate_dispatch_slot_order=cfg.rotate_dispatch_slot_order,
         )
         # (block, warp) -> compiled dispatch / combine kernel.
         self._dispatch_variants = {
@@ -629,6 +643,7 @@ class EpDispatchCombineOp:
                     off_out_wts=arena.offset("out_wts"),
                     reset_total_recv=True,
                     fp4=(cfg.combine_dtype == torch.float4_e2m1fn_x2),
+                    rotate_combine_peer_order=cfg.rotate_combine_peer_order,
                 )
                 for (b, w) in combine_specs
             }

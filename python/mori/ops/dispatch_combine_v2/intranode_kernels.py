@@ -125,6 +125,9 @@ def make_dispatch(
     fp4=False,
     hoist_lsa_base=False,
     global_lsa_metadata=False,
+    prefetch_route_payload=False,
+    defer_dest_ctr_atomic=False,
+    rotate_dispatch_slot_order=False,
 ):
     # fp4 (e2m1) packs 2 values per byte, so a token is hidden_dim/2 bytes; dispatch
     # is a pure byte mover (no fp4 decode), matching mori v1's plain-fp4 path.
@@ -171,9 +174,19 @@ def make_dispatch(
         rsrc_disp_bar = create_buffer_resource_from_addr(addr_disp_bar)
 
         # ── Phase 1: P2P-scatter each (src_tok, k_slot) to its dest PE ──
-        for work_idx in range(global_warp_id, work_limit, global_warp_num):
-            src_tok = work_idx // experts_per_token
-            k_slot = work_idx % experts_per_token
+        for logical_work_idx in range(global_warp_id, work_limit, global_warp_num):
+            src_tok = logical_work_idx // experts_per_token
+            logical_k_slot = logical_work_idx % experts_per_token
+            if const_expr(rotate_dispatch_slot_order):
+                # A per-token bijection: all original top-k slots are still
+                # processed exactly once, but concurrent ranks/tokens begin at
+                # different slots instead of issuing slot 0 in lockstep.
+                slot_phase = (src_tok + rank) % experts_per_token
+                k_slot = (logical_k_slot + slot_phase) % experts_per_token
+                work_idx = src_tok * experts_per_token + k_slot
+            else:
+                k_slot = logical_k_slot
+                work_idx = logical_work_idx
             dest_expert = buffer_load(
                 rsrc_inp_idx, work_idx, vec_width=1, dtype=T.i32()
             )
@@ -208,6 +221,27 @@ def make_dispatch(
             )
             dup_ballot = ballot(_BALLOT_INT(), dup_per_lane < WAVE)
             is_dup = dup_ballot != 0
+            prefetched_weight = arith.constant(0.0, type=T.f32())
+            prefetched_idx = arith.constant(0)
+            if const_expr(prefetch_route_payload):
+                # Issue the local route-payload reads before the remote slot
+                # allocation atomic. Skip work items already known to be
+                # duplicates; an overflow slot may still prefetch harmlessly.
+                if lane < experts_per_token:
+                    if dup_ballot == 0:
+                        prefetch_off = src_tok * experts_per_token + lane
+                        prefetched_weight = buffer_load(
+                            rsrc_inp_wts,
+                            prefetch_off,
+                            vec_width=1,
+                            dtype=T.f32(),
+                        )
+                        prefetched_idx = buffer_load(
+                            rsrc_inp_idx,
+                            prefetch_off,
+                            vec_width=1,
+                            dtype=T.i32(),
+                        )
 
             if const_expr(replay):
                 # decode dest_tok_id from cached tok_map (skip atomic alloc; same layout)
@@ -252,21 +286,35 @@ def make_dispatch(
                         create_buffer_resource_from_addr(peer_tis),
                         dest_tok_id,
                     )
-                    dest_ctr_addr = fx.Int64(addr_dest_pe_ctr) + fx.Int64(
-                        dest_pe
-                    ) * fx.Int64(4)
-                    P.atomic_add_global(dest_ctr_addr, fx.Int32(1))
+                    if const_expr(not defer_dest_ctr_atomic):
+                        dest_ctr_addr = fx.Int64(addr_dest_pe_ctr) + fx.Int64(
+                            dest_pe
+                        ) * fx.Int64(4)
+                        P.atomic_add_global(dest_ctr_addr, fx.Int32(1))
 
             # Per-lane (weight, expert-idx) scatter (lanes < k).
             if lane < experts_per_token:
                 if do_publish:
                     weight_src_off = src_tok * experts_per_token + lane
-                    weight_val = buffer_load(
-                        rsrc_inp_wts, weight_src_off, vec_width=1, dtype=T.f32()
-                    )
-                    idx_val = buffer_load(
-                        rsrc_inp_idx, weight_src_off, vec_width=1, dtype=T.i32()
-                    )
+                    if const_expr(prefetch_route_payload):
+                        # Values carried through the dynamic dedup branch are
+                        # FlyDSL expression wrappers; recover raw MLIR values
+                        # expected by bitcast/buffer_store.
+                        weight_val = arith.unwrap(prefetched_weight)
+                        idx_val = arith.unwrap(prefetched_idx)
+                    else:
+                        weight_val = buffer_load(
+                            rsrc_inp_wts,
+                            weight_src_off,
+                            vec_width=1,
+                            dtype=T.f32(),
+                        )
+                        idx_val = buffer_load(
+                            rsrc_inp_idx,
+                            weight_src_off,
+                            vec_width=1,
+                            dtype=T.i32(),
+                        )
                     dest_slot = dest_tok_id * experts_per_token + lane
                     peer_wts = (
                         peer_base + fx.Int64(off_out_wts)
@@ -311,6 +359,16 @@ def make_dispatch(
                             rsrc_peer_scales,
                             dest_tok_id * scale_num_i32 + k_off,
                         )
+
+            if const_expr(defer_dest_ctr_atomic):
+                # Keep the atomic ahead of the long token copy so its completion
+                # can overlap useful VMEM work before the Phase-2 barrier.
+                if lane == 0:
+                    if do_publish:
+                        dest_ctr_addr = fx.Int64(addr_dest_pe_ctr) + fx.Int64(
+                            dest_pe
+                        ) * fx.Int64(4)
+                        P.atomic_add_global(dest_ctr_addr, fx.Int32(1))
 
             # Token-embedding scatter: each lane owns 4 i32 (16B). Two vec4 streams
             # (chunk and chunk+_LANE_STRIDE_I32, stride _MAIN_STRIDE_I32) for
@@ -616,6 +674,7 @@ def make_combine(
     reset_total_recv=True,
     _s3_cache=2,
     _unroll=4,
+    rotate_combine_peer_order=False,
 ):
     # Transport dtype = external dtype, except fp8_direct_cast wires fp8 while
     # the output (comb_out) stays bf16 (2 i32 per fp8 i32 unit). fp4: i32 = 8 fp4.
@@ -720,8 +779,17 @@ def make_combine(
             expert_valids = []
             expert_pes = []
             expert_toks = []
+            tok_map_lane = lane
+            if const_expr(rotate_combine_peer_order):
+                # Match OPUS's communication-WG phase shift: each gather warp
+                # sees the same K entries through a different cyclic order.
+                peer_phase = (global_warp_id + rank) % experts_per_token
+                rotated_lane = (lane + peer_phase) % experts_per_token
+                tok_map_lane = arith.select(
+                    lane < experts_per_token, rotated_lane, arith.constant(0)
+                )
             encoded_my = buffer_load(
-                rsrc_tok_map, tok_map_base + lane, vec_width=1, dtype=T.i32()
+                rsrc_tok_map, tok_map_base + tok_map_lane, vec_width=1, dtype=T.i32()
             )
             for k_slot in range_constexpr(experts_per_token):
                 encoded_k = readlane(T.i32(), encoded_my, k_slot)

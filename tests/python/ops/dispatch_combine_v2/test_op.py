@@ -103,10 +103,46 @@ COMBINE = os.environ.get("COMBINE", "gather")  # gather | scatter
 QUANT = os.environ.get("QUANT", "none")  # none | fp8_direct_cast | fp8_blockwise
 HOIST_LSA_BASE = int(os.environ.get("HOIST_LSA_BASE", 0))
 GLOBAL_LSA_METADATA = int(os.environ.get("GLOBAL_LSA_METADATA", 0))
+PREFETCH_ROUTE_PAYLOAD = int(os.environ.get("PREFETCH_ROUTE_PAYLOAD", 0))
+DEFER_DEST_CTR_ATOMIC = int(os.environ.get("DEFER_DEST_CTR_ATOMIC", 0))
+ROTATE_DISPATCH_SLOT_ORDER = int(os.environ.get("ROTATE_DISPATCH_SLOT_ORDER", 0))
+ROTATE_COMBINE_PEER_ORDER = int(os.environ.get("ROTATE_COMBINE_PEER_ORDER", 0))
+ROUTING_PATTERN = os.environ.get("ROUTING_PATTERN", "random").lower()
 # Scale the input up so per-token/-block amax exceeds the fp8 max -> exercises the
 # fp8_blockwise per-block scaling branch (randn ~N(0,1) never triggers it).
 INSCALE = float(os.environ.get("INSCALE", 1))
 SWEEP = [int(x) for x in os.environ.get("SWEEP", "128,512").split(",")]
+
+
+def _make_routing_idx(g, max_tok, topk, npes, experts_per_rank):
+    num_experts = npes * experts_per_rank
+    if ROUTING_PATTERN == "random":
+        return torch.randint(
+            0, num_experts, (max_tok, topk), generator=g, dtype=torch.int32
+        )
+    if ROUTING_PATTERN == "aligned":
+        route_g = torch.Generator(device="cpu").manual_seed(20260807)
+        return torch.randint(
+            0, num_experts, (max_tok, topk), generator=route_g, dtype=torch.int32
+        )
+    if ROUTING_PATTERN not in ("round_robin", "hotspot"):
+        raise ValueError(
+            "ROUTING_PATTERN must be random|aligned|round_robin|hotspot, "
+            f"got {ROUTING_PATTERN!r}"
+        )
+
+    tok = torch.arange(max_tok, dtype=torch.int64).view(max_tok, 1)
+    slot = torch.arange(topk, dtype=torch.int64).view(1, topk)
+    local_expert = (tok * topk + slot) % experts_per_rank
+    if ROUTING_PATTERN == "round_robin":
+        peer = (tok + slot) % npes
+    elif npes == 1:
+        peer = torch.zeros((max_tok, topk), dtype=torch.int64)
+    else:
+        hot_slots = (topk + 1) // 2
+        spread_peer = 1 + ((tok + slot - hot_slots) % (npes - 1))
+        peer = torch.where(slot < hot_slots, torch.zeros_like(spread_peer), spread_peer)
+    return (peer * experts_per_rank + local_expert).to(torch.int32)
 
 
 def main():
@@ -129,7 +165,7 @@ def main():
         if INSCALE != 1.0:
             inp = inp * INSCALE
         inp = inp.to(DTYPE).to(dev)
-    idx = torch.randint(0, num_experts, (M, K), generator=g, dtype=torch.int32).to(dev)
+    idx = _make_routing_idx(g, M, K, npes, EPR).to(dev)
     wts = torch.rand(M, K, generator=g, dtype=torch.float32).to(dev)
 
     # Per-token scales (int8 bytes): pattern = rank*100003 + tok per dword, so the
@@ -165,6 +201,10 @@ def main():
             max_total_recv_tokens=int(os.environ.get("MAXRECV", 0)),
             hoist_lsa_base=bool(HOIST_LSA_BASE),
             global_lsa_metadata=bool(GLOBAL_LSA_METADATA),
+            prefetch_route_payload=bool(PREFETCH_ROUTE_PAYLOAD),
+            defer_dest_ctr_atomic=bool(DEFER_DEST_CTR_ATOMIC),
+            rotate_dispatch_slot_order=bool(ROTATE_DISPATCH_SLOT_ORDER),
+            rotate_combine_peer_order=bool(ROTATE_COMBINE_PEER_ORDER),
         )
         if int(os.environ.get("TUNED", 0)):
             from mori.ops.dispatch_combine_v2.tuning_configs import lookup
