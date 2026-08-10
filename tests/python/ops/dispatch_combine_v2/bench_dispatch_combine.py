@@ -107,7 +107,6 @@ DTYPE = os.environ.get("DTYPE", "bf16")  # bf16 | f32
 COMBINE = os.environ.get("COMBINE", "gather")  # gather | scatter
 QUANT = os.environ.get("QUANT", "none")  # none | fp8_direct_cast (scatter only)
 SCALE_DIM = int(os.environ.get("SCALE_DIM", 0))  # >0 = forward per-token scales
-HOIST_LSA_BASE = int(os.environ.get("HOIST_LSA_BASE", 0))
 PREFETCH_ROUTE_PAYLOAD = int(os.environ.get("PREFETCH_ROUTE_PAYLOAD", 0))
 DEFER_DEST_CTR_ATOMIC = int(os.environ.get("DEFER_DEST_CTR_ATOMIC", 0))
 ROTATE_DISPATCH_SLOT_ORDER = int(os.environ.get("ROTATE_DISPATCH_SLOT_ORDER", 0))
@@ -256,7 +255,6 @@ def main():
             scale_dim=SCALE_DIM,
             scale_type_size=1 if SCALE_DIM else 0,
             enable_std_moe=bool(STDMOE),
-            hoist_lsa_base=bool(HOIST_LSA_BASE),
             prefetch_route_payload=bool(PREFETCH_ROUTE_PAYLOAD),
             defer_dest_ctr_atomic=bool(DEFER_DEST_CTR_ATOMIC),
             rotate_dispatch_slot_order=bool(ROTATE_DISPATCH_SLOT_ORDER),
@@ -543,8 +541,8 @@ def main():
                     flush=True,
                 )
             # Keep running the performance section after validating scale
-            # forwarding so HOIST_LSA_BASE and other dispatch A/B options can be
-            # measured on the scale-carrying path as well.
+            # forwarding so dispatch A/B options can be measured on the
+            # scale-carrying path as well.
 
         eager = MODE in ("eager", "both")
         graph = MODE in ("graph", "both")
@@ -557,7 +555,7 @@ def main():
             print(
                 f"# EP{npes} hidden={HIDDEN} topk={K} experts={num_experts} "
                 f"dtype={DTYPE} combine={COMBINE} quant={QUANT} scale_dim={SCALE_DIM} "
-                f"{_geom} hoist_lsa_base={bool(HOIST_LSA_BASE)} "
+                f"{_geom} "
                 f"prefetch_route_payload={bool(PREFETCH_ROUTE_PAYLOAD)} "
                 f"defer_dest_ctr_atomic={bool(DEFER_DEST_CTR_ATOMIC)} "
                 f"rotate_dispatch={bool(ROTATE_DISPATCH_SLOT_ORDER)} "

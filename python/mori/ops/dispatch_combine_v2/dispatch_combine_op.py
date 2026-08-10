@@ -141,10 +141,6 @@ class EpDispatchCombineConfig:
     schedule: tuple = None
     enable_std_moe: bool = False
     max_total_recv_tokens: int = 0  # mori maxTotalRecvTokens; 0 = worst-case ws*M
-    # A/B switch for dispatch address generation. When enabled, load a peer's
-    # CCO window base/stride once per routing work item and derive all named
-    # region addresses with scalar adds, instead of calling lsa_ptr per region.
-    hoist_lsa_base: bool = False
     # Dispatch stall A/B switches. Prefetch route payload before the slot
     # allocation atomic; defer the local destination counter atomic until after
     # route metadata/scales are published (but before the token copy).
@@ -596,7 +592,6 @@ class EpDispatchCombineOp:
             scale_dim=cfg.scale_dim,
             scale_type_size=cfg.scale_type_size,
             fp4=is_fp4,
-            hoist_lsa_base=cfg.hoist_lsa_base,
             prefetch_route_payload=cfg.prefetch_route_payload,
             defer_dest_ctr_atomic=cfg.defer_dest_ctr_atomic,
             rotate_dispatch_slot_order=cfg.rotate_dispatch_slot_order,

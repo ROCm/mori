@@ -42,7 +42,7 @@ Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 |---|---|
 | `test_dispatch_combine_v2_intranode.py` | pytest wrapper: runs `test_op.py` under torchrun for the representative modes and asserts every line PASS |
 | `test_op.py` | EP8 op-layer test (gather/scatter, quant, StdMoE, recv-cap, scales, LEC, reset, replay) |
-| `bench_dispatch_combine.py` | eager + CUDA-graph perf bench + e2e correctness. Envs: `DTYPE=bf16\|f32\|fp8\|fp4`, `COMBINE=gather\|scatter`, `QUANT=none\|fp8_direct_cast\|fp8_blockwise`, `STDMOE=1`, `SCALE_DIM`, `SWEEP`, `DISP_BLOCK`/`COMB_BLOCK`, `WARP_NUM`/`COMB_WARP`, `MODE`, `TUNED`, `HOIST_LSA_BASE`, `PREFETCH_ROUTE_PAYLOAD`, `DEFER_DEST_CTR_ATOMIC`, `ROTATE_DISPATCH_SLOT_ORDER`, `ROTATE_COMBINE_PEER_ORDER`, `ROUTING_PATTERN` |
+| `bench_dispatch_combine.py` | eager + CUDA-graph perf bench + e2e correctness. Envs: `DTYPE=bf16\|f32\|fp8\|fp4`, `COMBINE=gather\|scatter`, `QUANT=none\|fp8_direct_cast\|fp8_blockwise`, `STDMOE=1`, `SCALE_DIM`, `SWEEP`, `DISP_BLOCK`/`COMB_BLOCK`, `WARP_NUM`/`COMB_WARP`, `MODE`, `TUNED`, `PREFETCH_ROUTE_PAYLOAD`, `DEFER_DEST_CTR_ATOMIC`, `ROTATE_DISPATCH_SLOT_ORDER`, `ROTATE_COMBINE_PEER_ORDER`, `ROUTING_PATTERN` |
 | `run_bench.sh` | bench launcher (runs `bench_dispatch_combine.py` in the container) |
 
 (Each script inlines a tiny torchrun/gloo `Dist` bootstrap — gloo only carries the cco unique-id and pass/fail counts.)
@@ -64,7 +64,10 @@ Config via env: `HIDDEN`, `TOPK`, `EPR`, `SWEEP`, `DTYPE`, `COMBINE`, `QUANT`,
 `DISP_BLOCK`/`COMB_BLOCK`, `WARP_NUM`/`COMB_WARP`, `MODE=eager|graph|both`, `TUNED`.
 CCO's `cco_lsa_ptr` restores the global address-space provenance erased by the
 scalar DSL ABI, so `{winBase, stride4G}` metadata loads use LLVM `addrspace(1)`.
-Set `HOIST_LSA_BASE=1` to reuse one peer base per dispatch work item. The
+Dispatch unconditionally reuses one peer base per work item. A 2026-08-10
+gfx950 rerun retained this path after measuring 1.8%-6.1% lower dispatch latency
+across BF16/FP8/FP4, top-k 4/8/9, gather/scatter, and scale forwarding at
+128-2048 tokens; 8-token medians showed no repeatable regression. The
 dispatch-stall experiments below are selected with `PREFETCH_ROUTE_PAYLOAD=1` and
 `DEFER_DEST_CTR_ATOMIC=1`. Peer-order experiments use
 `ROTATE_DISPATCH_SLOT_ORDER=1`, `ROTATE_COMBINE_PEER_ORDER=1`, and
@@ -87,8 +90,8 @@ dispatch-stall experiments below are selected with `PREFETCH_ROUTE_PAYLOAD=1` an
 ## Dispatch stall A/B (MI355X / gfx950, 2026-08-07)
 
 This experiment tested two low-risk scheduling changes suggested by source-mapped
-ATT. All variants kept `HOIST_LSA_BASE=1`, used CCO's addrspace(1) LSA accessor,
-EP8, hidden=7168, 256 experts, dispatch=64 blocks × 16 warps, and graph replay.
+ATT. All variants used the retained peer-base reuse and CCO's addrspace(1) LSA
+accessor, EP8, hidden=7168, 256 experts, dispatch=64 blocks × 16 warps, and graph replay.
 The switches remain **off by default**.
 
 | variant | `PREFETCH_ROUTE_PAYLOAD` | `DEFER_DEST_CTR_ATOMIC` | change |
@@ -172,8 +175,9 @@ approximation before adding a compact per-peer queue:
   `(rank + global_warp_id) % topk`.
 - DC: D + C.
 
-All variants kept `HOIST_LSA_BASE=1`, used CCO's addrspace(1) LSA accessor,
-disabled the prefetch/defer experiments above, and used EP8, hidden=7168, 64 blocks × 16
+All variants used the retained peer-base reuse and CCO's addrspace(1) LSA
+accessor, disabled the prefetch/defer experiments above, and used EP8,
+hidden=7168, 64 blocks × 16
 warps, graph replay, 20 warmups, and 300 timed iterations. The route generators
 are:
 
