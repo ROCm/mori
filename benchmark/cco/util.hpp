@@ -90,6 +90,9 @@ struct PerfArgs {
   std::size_t warmup = kDefaultWarmup;
   int nblocks = kDefaultNumBlocks;
   int threads_per_block = kDefaultThreadsPerBlock;
+  // Set by -c / -T. The SDMA bw kernels derive their own geometry unless asked.
+  bool nblocks_explicit = false;
+  bool threads_explicit = false;
   PutScope put_scope = PutScope::kBlock;
   bool put_scope_explicit = false;
   SdmaComp sdma_comp = SdmaComp::kQuiet;
