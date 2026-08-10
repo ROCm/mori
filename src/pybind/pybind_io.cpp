@@ -187,6 +187,9 @@ void RegisterMoriIo(pybind11::module_& m) {
         return out.get().as<mori::io::MemoryDesc>();
       });
 
+  py::class_<mori::io::PreparedTransfer, std::shared_ptr<mori::io::PreparedTransfer>>(
+      m, "PreparedTransfer");
+
   py::class_<mori::io::IOEngineSession>(m, "IOEngineSession")
       .def("AllocateTransferUniqueId", &mori::io::IOEngineSession::AllocateTransferUniqueId,
            py::call_guard<py::gil_scoped_release>())
@@ -195,6 +198,10 @@ void RegisterMoriIo(pybind11::module_& m) {
            py::call_guard<py::gil_scoped_release>())
       .def("Write", &mori::io::IOEngineSession::Write, py::call_guard<py::gil_scoped_release>())
       .def("BatchWrite", &mori::io::IOEngineSession::BatchWrite,
+           py::call_guard<py::gil_scoped_release>())
+      .def("PrepareBatch", &mori::io::IOEngineSession::PrepareBatch,
+           py::call_guard<py::gil_scoped_release>())
+      .def("PostPrepared", &mori::io::IOEngineSession::PostPrepared,
            py::call_guard<py::gil_scoped_release>())
       .def("Alive", &mori::io::IOEngineSession::Alive);
 
