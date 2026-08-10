@@ -172,6 +172,18 @@ _MI355X_DISP_TABLE = {
         "fp4": _MI355X_DISP_FP4,
     },
 }
+_MI355X_COMB_TABLE = {
+    (8, 7168, 8): {
+        "bf16": _MI355X_COMB,
+        "fp8": _MI355X_COMB,
+        "fp4": _MI355X_COMB_FP4,
+    },
+    (8, 7168, 6): {
+        "bf16": _MI355X_COMB,
+        "fp8": _MI355X_COMB,
+        "fp4": _MI355X_COMB_FP4,
+    },
+}
 
 _GFX1250_DISP_BF16 = (
     (256, 128, 16),  # <=128:  latency-bound
