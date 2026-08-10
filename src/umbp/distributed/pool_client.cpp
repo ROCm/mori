@@ -669,8 +669,23 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size) {
   for (auto& reg : registered_regions_) {
     if (reg.base == ptr) return true;
   }
-  auto mem_desc = io_engine_->RegisterMemory(ptr, size, -1, mori::io::MemoryLocationType::CPU);
+  // Unknown, not CPU: this region is caller-owned and may well be GPU HBM (an
+  // engine handing us a device-side KV buffer).  The IO engine classifies it
+  // with hipPointerGetAttributes and fills in the device ordinal.  Registering
+  // HBM as CPU appears to work where HBM is host-readable, but it misinforms
+  // NIC selection and sends DetectNumaNode() off to probe a device VA.
+  auto mem_desc = io_engine_->RegisterMemory(ptr, size, -1, mori::io::MemoryLocationType::Unknown);
+  if (mem_desc.loc == mori::io::MemoryLocationType::GPU) {
+    MORI_UMBP_DEBUG("[PoolClient] RegisterMemory: {} ({}B) is device memory on GPU {}", ptr, size,
+                    mem_desc.deviceId);
+  }
   registered_regions_.push_back({ptr, size, mem_desc});
+  // NOTE: true here means "the region is recorded and will be used zero-copy",
+  // not "an MR exists".  RegisterMemory has no failure channel to forward --
+  // IOEngine::RegisterMemory always returns a desc and the backends'
+  // RegisterMemory is void -- and the actual ibv_reg_mr is lazy, happening on
+  // the first transfer that touches this {NIC, region} pair.  A pointer that
+  // cannot be pinned therefore fails at that transfer, not here.
   return true;
 }
 

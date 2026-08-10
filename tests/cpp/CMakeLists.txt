@@ -47,6 +47,18 @@ if(BUILD_IO)
   target_include_directories(test_engine PUBLIC ${CMAKE_SOURCE_DIR})
   target_link_libraries(test_engine mori_application mori_io)
 
+  # gtest + ctest-registered, unlike the manual-run io tests above: it needs no
+  # NIC and no peer, so it can run in CI.
+  add_executable(test_memory_location_detect io/test_memory_location_detect.cpp)
+
+  target_include_directories(test_memory_location_detect
+                             PUBLIC ${CMAKE_SOURCE_DIR}/include)
+  target_include_directories(test_memory_location_detect
+                             PUBLIC ${CMAKE_SOURCE_DIR})
+  target_link_libraries(test_memory_location_detect mori_application mori_io
+                        hip::host GTest::gtest_main)
+  add_test(NAME test_memory_location_detect COMMAND test_memory_location_detect)
+
   add_executable(test_transfer_wait io/test_transfer_wait.cpp)
 
   target_include_directories(test_transfer_wait
