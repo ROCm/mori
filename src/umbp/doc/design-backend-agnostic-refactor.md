@@ -28,7 +28,7 @@ two instances of the same page-slot model.
 
 ## 1. What is actually coupled
 
-Three specific things, not a diffuse mess.
+Four specific things, not a diffuse mess.
 
 **1. `PoolClient` hardcodes two different data-plane shapes.**
 DRAM is async — `SubmitRemoteBatchGet` / `WaitRemoteBatchGet`, RDMA straight
@@ -55,11 +55,47 @@ staging base/size/`MemoryDesc` args. The SSD-only RPCs (`PrepareSsdRead`,
 orderings: `TierPriorityRouteGetStrategy`'s `HBM > DRAM > SSD`, and put's
 "HBM then DRAM, SSD is never a direct-put target."
 
+**4. Memory ownership lives entirely outside the backend.**
+This is the one the original plan missed, and it is the one that makes the
+Phase 5 acceptance test unreachable.
+
+| Concern | Where it lives today | Medium-specific? |
+|---|---|---|
+| Pool allocation | `distributed_client.cpp:41-53` — `HostMemAllocator`, hugepages, NUMA, prefault | yes |
+| Pool free | `distributed_client.cpp:271-276` | yes |
+| RDMA registration | `pool_client.cpp:360-366` — `MemoryLocationType::CPU` hardcoded | yes |
+| Desc/base marshalling into the allocator | `BuildDramTierConfig`, `pool_client.cpp:286-303` | yes |
+| Local put/get byte copy | `pool_client.cpp:559-599` + `LocalCopyBlock` `:181-190` (AVX2-NT / `memcpy`) | yes |
+| Buffer indexing | `config_.dram_buffers[p.buffer_index]` `:564`, `:585` — **no tier dimension** | yes |
+| Copy parallelism | `UMBP_DRAM_{WRITE,READ}_THREADS` `:836`, `:1435` | yes |
+| Capacity advertisement | `distributed_client.cpp:70-71` — `{DRAM, {size,size}}` literal | yes |
+| Re-cache install tier | `pool_client.cpp:718` — `TierType::DRAM` literal | yes |
+| Put tier filter | `pool_client.cpp:821` — `!= DRAM && != HBM` | yes |
+
+`PeerDramAllocator` owns only bookkeeping: the page bitmap, the key→slot map,
+pending slots and their reaper, read leases, copy pins, the event outbox, the
+clear generation. Everything about the memory itself arrives pre-cooked through
+`BuildDramTierConfig`.
+
+So §3's premise — that a backend owns the slots it publishes descriptors for —
+is aspirational. Today the client allocates, registers, and copies; the backend
+is a bookkeeper over memory it does not own. Adding HBM under this ownership needs
+a new config buffer list, a second `RegisterMemory` with `GPU`, a tier branch in
+`LocalCopyBlock`, and a fix for the missing tier dimension: four call-site edits
+before the registry line.
+
+**Not part of this** — a separate axis that must not be moved into a backend:
+`PoolClient::RegisterMemory` (`:526`) registers the **caller's** buffer as
+`MemoryLocationType::CPU` unconditionally. That is wrong for a GPU `src`/`dst`
+(SGLang HiCache KV pages), but it is a property of the caller's allocation, not
+of any storage medium. It needs a location parameter on the public API, not a
+backend.
+
 **Key observation:** `PeerDramAllocator` is *shaped* for multiple media — an
 internal `map<TierType, PageBitmapAllocator>` plus parallel `tier_descs_` /
 `tier_bases_` maps, with a `TierType` parameter threaded through every method —
 but it serves exactly **one** live tier. `PoolClient::Init` default-constructs an
-empty `hbm_cfg` (`pool_client.cpp:448`, "HBM not currently exposed via
+empty `hbm_cfg` (`pool_client.cpp:377`, "HBM not currently exposed via
 PoolClientConfig"), so no HBM buffer is ever passed in. `TierType::HBM`, its
 routing rank, and the tier map are unexercised scaffolding.
 
@@ -80,14 +116,64 @@ actually deleted is the *lease-shaped call sites*, not SSD code. That is why
 
 ---
 
-## 2. The abstraction
+## 2. The boundary
 
-New header: `include/umbp/distributed/peer/medium_backend.h`, ~80 lines.
+Everything below follows from one property of `mori::io::MemoryDesc`
+(`include/mori/io/common.hpp:100-127`): it is **self-describing about the
+medium**.
 
-The universal data-plane currency is the **RDMA-addressable page slot** —
-`PageLocation` + `BufferMemoryDescBytes` — which is exactly what DRAM and HBM
-already speak. A backend exposes its bytes as registered pages; everything else
-in the system moves bytes with the same code path.
+```cpp
+MemoryLocationType loc;          // CPU | GPU
+int deviceId; std::string deviceBusId; int numaNode;
+std::array<char, kIpcHandleSize>    ipcHandle;
+std::array<char, kFabricHandleSize> fabricHandle;  int vpodId;
+```
+
+Hence the criterion for deciding where any piece of code belongs:
+
+> **Bytes addressed by a descriptor are already medium-agnostic. Bytes addressed
+> by a raw pointer are medium-specific. Registration is the one-way conversion
+> between the two, and it belongs to whoever allocated the memory.**
+
+Three consequences, each checkable against the tree:
+
+**The remote path already works for a medium it was never written for.** A peer
+whose pages are HBM can be read today, unmodified, because that peer registered
+them and the desc carries `loc=GPU`. `RemoteDramScatterRead`,
+`GroupTransfersByPair`, `SubmitRemoteBatchGet` and the peer desc cache never
+dereference anything — they only pass descs to the IO engine. None of them
+needed this refactor and none of them change.
+
+**The local path breaks because it contains no descriptor at all.**
+`LocalCopyBlock(static_cast<char*>(dram.buffer) + off, ...)` (`:575`) operates on
+a raw `void*` out of `config_.dram_buffers`, bypassing the descriptor layer.
+
+**That is a deliberate performance choice, not an oversight.** The local fast
+path exists because a `memcpy` beats an engine round trip. Medium-awareness is
+the price already being paid for it. This matters for §4: the fast path folds
+back into the transfer layer only if a local transfer through the abstraction is
+genuinely as cheap, which is a measurement, not an argument.
+
+Practical form of the rule, usable in review: **if adding a new medium would
+force you to edit it, it belongs to the backend.**
+
+---
+
+## 3. The abstraction
+
+The system has three components. The refactor's job is to make the boundaries
+between them real.
+
+| Component | Owns | Knows about media? |
+|---|---|---|
+| **Control plane** — master, routing, heartbeat | who holds what, capacity, eviction, placement | only via advertised `BackendProperties` |
+| **Storage backends** — DRAM, HBM, SSD, … | bytes, the key→slot map, capacity, eviction | yes — this is the only layer that does |
+| **Transfer engine** (§4) | moving bytes between descriptors | no — descriptors are self-describing |
+
+New header: `include/umbp/distributed/peer/medium_backend.h`.
+
+A backend's job is to **publish descriptors** for the slots it owns, and to keep
+the key→slot bookkeeping around them. It does not move bytes.
 
 ```cpp
 class MediumBackend {
@@ -99,6 +185,13 @@ class MediumBackend {
   virtual const char* Name() const = 0;
   virtual BackendProperties Properties() const = 0;   // {read_rank, put_eligible}
 
+  // ---- ownership (new; see §1 item 4) ----
+  // The backend allocates its own pool with its own policy (hugepage/NUMA vs
+  // hipMalloc vs file extents) and registers it, choosing the location type
+  // itself.  PoolClient hands it the engine; it does not hand it memory.
+  virtual bool Init(TransferEngine*) = 0;
+  virtual void Shutdown() = 0;
+
   // ---- control plane (shipped by the heartbeat) ----
   virtual TierCapacity Capacity() const = 0;
   virtual uint64_t OwnedKeyCount() const = 0;
@@ -107,49 +200,161 @@ class MediumBackend {
   virtual std::vector<KvEvent> SnapshotOwnedKeysForFullSync() = 0;
   virtual void ClearLocal() = 0;
   virtual void ClearFullSyncAcked() = 0;
+  virtual bool IsClearFullSyncPending() const = 0;
 
-  // ---- data plane (peer-side; driven by PeerServiceServer handlers) ----
+  // ---- slot lifecycle (peer-side; driven by PeerServiceServer handlers) ----
   virtual std::vector<AllocateResult> BatchAllocate(const std::vector<AllocateRequest>&) = 0;
   virtual std::vector<CommitResult>   BatchCommit(const std::vector<CommitRequest>&) = 0;
-  virtual void                        BatchAbort(const std::vector<uint64_t>& slot_ids) = 0;
-  virtual std::vector<ResolvedEntry>  BatchResolve(const std::vector<std::string>& keys) = 0;
+  virtual std::vector<bool>           BatchAbort(const std::vector<uint64_t>& slot_ids) = 0;
+  virtual std::vector<ResolvedEntry>  BatchResolve(const std::vector<std::string>& keys,
+                                                   bool include_descs) = 0;
   virtual std::vector<EvictResult>    Evict(const std::vector<std::string>& keys) = 0;
+
+  // ---- bootstrap (GetPeerInfo) ----
+  virtual uint64_t PageSize() const = 0;
+  virtual std::vector<BufferMemoryDescBytes> AllBufferDescs() const = 0;
 };
 ```
 
-`AllocateResult` and `ResolvedEntry` carry `{pages, page_size, descs}`.
+`AllocateResult` and `ResolvedEntry` carry `{slot_id, pages, size, page_size,
+descs, pending_ttl_ms}`. No method takes a `TierType`: one instance is one
+medium, and the caller has already dispatched on it via the registry.
 
 `BackendProperties` is what removes the routing hardcode: read order and
 put-eligibility become *advertised* facts rather than a hand-written tier list
 in the strategies.
 
+**What is deliberately NOT on this interface**, and why — each of these was
+proposed and rejected once §4 was settled:
+
+- **`LocalCopyIn` / `LocalCopyOut`.** Local access is a transfer whose endpoints
+  are both local; §4 selects a memcpy or pread engine for it. Putting a copy
+  method on the backend would re-admit a second byte-moving path.
+- **A staging/bounce pool.** Belongs to the transfer layer, which is the only
+  layer that can observe transfer completion (§4).
+- **A "not ready / retry here" resolve state.** Only needed to express
+  staging-pool exhaustion, which is no longer a backend resource.
+
+All three were artifacts of a transfer engine that speaks only memory. They are
+listed here so they are not rediscovered and re-added.
+
 This interface absorbs the existing `OwnedLocationSource` — that type goes away.
 The dormant `PeerSsdManager` (Phase 0) keeps its `DrainPendingEvents` /
 `SnapshotOwnedKeys` methods but drops the `: public OwnedLocationSource` base and
-the `override`s — a ~4-line change. Those methods become part of what the future
-`SsdBackend` adapter forwards to `MediumBackend`.
+the `override`s — a ~4-line change.
 
 Ownership: a `BackendRegistry` (`map<TierType, unique_ptr<MediumBackend>>`) held
 by `PoolClient` is the single place in the tree where a concrete backend type is
-named.
+named. It exposes `Get(tier)`, `All()`, and `ByReadRank()` — the last being the
+peer-local counterpart of `RouteGetStrategy`'s cross-peer ranking, used when a
+key is mirrored across media.
 
 ---
 
-## 3. Phases
+## 4. The transfer engine
 
-### Phase 0 — unwire SSD from distributed mode
+`mori-io` is a **memory-to-memory** engine: `BackendType` is
+`{XGMI, RDMA, TCP, FABRIC}` and `MemoryLocationType` is `{CPU, GPU}`
+(`include/mori/io/enum.hpp:27-41`). There is no file or object endpoint.
+
+**Decision: do not change mori-io.** Abstract the transfer engine inside UMBP
+and make mori-io one implementation. UMBP defines its own descriptor variant, so
+mori-io never has to learn about files:
+
+```cpp
+struct TransferRef {
+  std::variant<MemoryRef,   // wraps mori::io::MemoryDesc verbatim
+               FileRef,     // fd/path + offset
+               ObjectRef>   // bucket + key
+  target;
+};
+
+class TransferEngine {
+ public:
+  virtual ~TransferEngine() = default;
+
+  // ---- registration ----
+  // The backend supplies the facts a descriptor cannot recover — location type,
+  // device, NUMA node — because it is the allocator (§6).
+  virtual TransferRef RegisterMemory(void* base, size_t size, MemoryLocationType, int device) = 0;
+  virtual TransferRef RegisterFile(int fd, uint64_t offset, uint64_t size) = 0;
+  virtual void        Deregister(const TransferRef&) = 0;
+
+  // ---- transfer ----
+  virtual bool CanHandle(const TransferRef& src, const TransferRef& dst) const = 0;
+  virtual std::vector<Plan> Plan(const std::vector<TransferItem>&) = 0;   // see below
+  virtual Handle Submit(const std::vector<Plan>&) = 0;
+  virtual bool   Wait(Handle&) = 0;
+};
+```
+
+`MoriIoEngine` accepts only the `MemoryRef` variant and unwraps straight to
+`mori::io::MemoryDesc`. A `PosixEngine` / `GdsEngine` accepts a `FileRef` on one
+side. Engine selection is a function of the `(src, dst)` pair.
+
+**One type, including registration.** Registration and transfer are different
+shapes — registering fans *out* across every transport that can reach an
+endpoint, while a transfer dispatches to exactly *one*. mori-io already carries
+that fan-out in its descriptor: `MemoryDesc` holds `ipcHandle` and
+`fabricHandle` side by side, "so XGMI and Fabric backends can register the same
+memory without clobbering each other's handle."
+
+That difference does not need a second class. `CompositeTransferEngine :
+TransferEngine` holds the concrete engines, implements `RegisterMemory` /
+`RegisterFile` by fanning out and merging the per-transport handles into one
+`TransferRef`, and implements `Plan` / `Submit` by selecting or chaining. The
+composite *is* a `TransferEngine`, so the rest of the system holds exactly one
+pointer to exactly one type: `PoolClient` owns it, and backends receive the same
+pointer at `Init`.
+
+The cost of folding registration in: a backend now holds something it *could*
+call `Submit` on. That invariant — backends do not move bytes — moves from the
+type system to Phase 5's lint, as one rule: no file under a backend directory may
+call `Submit` / `Plan` / `Wait`.
+
+**`Plan()` is virtual on purpose.** `GroupTransfersByPair` — collapsing a
+scatter into one transfer per `(localMR, remoteMR)` — is an RDMA optimization
+that cuts CQE and post count. A memcpy engine gains nothing from it; a file
+engine would rather group by file and merge adjacent offset ranges. Submit-all-
+then-wait *is* universal and belongs in the base class; the grouping strategy is
+not. Note the current implementation assumes one page size per MR pair, so
+pushing it down requires generalizing it first.
+
+**Bounce buffers belong here, not in a backend.** The transfer layer is the only
+layer with a completion signal (`TransferStatus::Wait()`). A staging pool inside
+a storage backend must guess with a TTL, because the backend cannot observe when
+a remote reader's RDMA finishes — that is exactly the shape of the
+`PrepareSsdRead` lease this refactor exists to delete. One pool, owned by the
+transfer layer, released on completion rather than on a timer.
+
+**Chaining.** When no single engine spans the pair — a 3FS file on node A, a
+reader on node B — the layer composes: a file engine fills a bounce buffer, the
+RDMA engine ships it. The extra hop is real, but it is an explicit plan in one
+place, and if mori-io ever grows a storage backend the planner simply stops
+chaining. Nothing above notices.
+
+**What stays in the client**, because it needs semantics the engine must not
+have: which node and tier to target; retry-elsewhere with an exclude set (needs
+to know replicas exist); the slot lifecycle, where `Commit` is what publishes a
+key; capacity, eviction, and leases.
+
+---
+
+## 5. Phases
+
+### Phase 0 — unwire SSD from distributed mode *(done — `ef081fd2`)*
 
 Cut at the adapter seam. Local mode is not touched; no storage-layer code is
 deleted.
 
-**Delete — the coupling only:**
+**Deleted — the coupling only:**
 
 - `include/umbp/distributed/ssd_read_lease.h` (76 LOC) and
   `test_ssd_read_lease_gating` — the lease *is* the coupling, and the re-added
-  backend will not use it (see the re-add note below)
+  backend will not use it
 - The construction and wiring of `PeerSsdManager` / `SsdCopyPipeline` in
   `distributed_client.cpp`, `pool_client.{h,cpp}`, `peer_service.{h,cpp}`, and
-  the `AddOwnedLocationSource(ssd_manager)` arm in `master_client.cpp:412`
+  the `AddOwnedLocationSource(ssd_manager)` arm in `master_client.cpp`
 - Every SSD member and method in `pool_client.{h,cpp}` — `ExecuteLocalSsdGet`,
   `RemoteSsdReadOnce`, `ReleaseSsdLeaseBestEffort`, `ProcessRemoteSsdBatchGet`,
   `PublishSsdMetrics`, `SsdMetricsLastShipped`, `SsdGetOutcome`, the SSD staging
@@ -163,113 +368,93 @@ deleted.
   `test_peer_ssd_read_rpc`, `test_ssd_read_lease_gating`, `test_ssd_reliability`,
   plus the SSD arms of `test_peer_service`
 
-Collapse `BatchGetPlan` from 4 buckets to 2 (`remote_groups`, `local_indices`).
+`BatchGetPlan` collapsed from 4 buckets to 2 (`remote_groups`, `local_indices`).
 
-Keep `TierType::SSD = 3` reserved in the enum so wire tags stay stable; delete
-every *live* distributed code path that produces or consumes it.
+`TierType::SSD = 3` stays reserved in the enum so wire tags stay stable; every
+*live* distributed code path that produces or consumes it is gone.
 
-**Keep — dormant but still compiled and still tested:**
+**Kept — dormant but still compiled and still tested:**
 
-- `distributed/peer/peer_ssd_manager.{h,cpp}` (665 LOC) and
-  `distributed/peer/ssd_copy_pipeline.{h,cpp}` (~250 LOC). Nothing constructs
-  them after this phase; they remain in the build. Move both under
+- `distributed/peer/ssd/peer_ssd_manager.{h,cpp}` (665 LOC) and
+  `distributed/peer/ssd/ssd_copy_pipeline.{h,cpp}` (~250 LOC). Nothing
+  constructs them; they remain in the build. Moved under
   `distributed/peer/ssd/` so "dormant" is legible in the tree and the Phase 5
   lint exemption can be a directory rather than a filename list.
-- `PeerSsdConfig` (`distributed/config.h`) — `peer_ssd_manager.h` needs it. Only
-  its construction in `distributed_client.cpp` goes away.
+- `PeerSsdConfig` (`distributed/config.h`) — `peer_ssd_manager.h` needs it.
 - Their 3 unit tests: `test_peer_ssd_manager`, `test_peer_ssd_eviction`,
   `test_ssd_copy_pipeline`. These test the adapter standalone and stay green.
 
-Two changes are needed to keep them compiling once the coupling is gone:
-`PeerSsdManager` drops `: public OwnedLocationSource` and its `override`s (§2),
-keeping the methods themselves; and `PrepareRead(key, staging_ptr, staging_cap)`
-stays as-is — it is a plain "read this key into this buffer", and only the lease
-and slot state machine *around* it in `peer_service` die.
-
-The dependency check that makes this cheap: `peer_ssd_manager.h` pulls in only
-`distributed/config.h`, `owned_location_source.h`, and `types.h`; the `.cpp`
-pulls in local tiers (kept) and `mori_log`. `ssd_copy_pipeline.h` pulls in only
-`types.h`. Neither includes `ssd_read_lease.h`. So nothing dormant depends on
-anything being deleted.
-
-**Keep — untouched, still built, still tested:**
-
-- `storage/io/**` — `storage_io_driver`, io_uring and posix drivers
-- `storage/spdk/**` — `spdk_env`, `offset_allocator`, `proxy/{spdk_proxy_daemon,
-  spdk_proxy_shm,spdk_proxy_protocol}` — and the `3rdparty/spdk` submodule
-- `local/tiers/{ssd_tier,spdk_ssd_tier,spdk_proxy_tier,dummy_ssd_tier,
-  copy_pipeline,tier_backend,local_storage_manager}.*`, **including
-  `LocalStorageManager`'s demote/promote and copy pipeline** — local mode's
-  tiering keeps working exactly as it does today
-- `UMBPSsdConfig` (`common/config.h`) and its Python binding export
-- The local SSD tests: `test_{ssd_tier,spdk_ssd_tier,spdk_proxy,spdk_env,
-  dummy_ssd_tier,follower_mode}`, `bench_spdk_raw`
-
-Scale: ~800 lines of coupling excised and ~80 LOC of headers deleted, against
-~6.4k LOC of SSD implementation preserved (~5.5k storage stack + ~0.9k dormant
-adapter).
+**Kept — untouched, still built, still tested:** `storage/io/**`,
+`storage/spdk/**` and the `3rdparty/spdk` submodule, `local/tiers/*` including
+`LocalStorageManager`'s demote/promote, `UMBPSsdConfig` and its Python binding,
+and the local SSD test suites.
 
 *Gate:* ctest green — **including the local SSD suites and the 3 dormant adapter
-tests**, which must all still pass unmodified. That is the check that the seam
-was cut in the right place.
+tests**, unmodified. That is the check that the seam was cut in the right place.
 
-**Re-add path (post-Phase 5, not in scope here).** SSD returns as
-`SsdBackend : MediumBackend`, and because `PeerSsdManager` is still in the tree
-and still tested, that adapter mostly *forwards*: `BatchResolve` → `PrepareRead`,
-`Evict` → `Evict`, `DrainPendingEvents` / `SnapshotOwnedKeys` → the same methods,
-`Capacity` → `Capacity`. One piece of design work is genuinely deferred, not
-solved by this plan: §4 requires backends to expose RDMA-addressable page slots,
-and SSD bytes are not directly registerable — so `SsdBackend` must own a pool of
-registered *staging* pages and hand them out through
-`BatchAllocate`/`BatchResolve`, with the read issued during resolve. That is a
-better shape than `PrepareSsdRead` + a client-held lease, which is why the lease
-and its two RPCs are the one part deleted rather than preserved: the re-added
-backend will not use them. Everything else — drivers, SPDK env, allocator, proxy
-protocol, segment format, eviction policy, the peer-side ownership map, the
-copy-on-commit pipeline — is reused as-is.
+### Phase 1 — write the interfaces
 
-### Phase 1 — write the interface
+Add `medium_backend.h` (§3). Nothing implements it yet.
 
-Add `medium_backend.h` as specified in §2. Nothing implements it yet.
+*Gate:* tree compiles. Note this gate is weak by construction — a header nothing
+includes is not in any translation unit. Verify self-containment explicitly
+(`-fsyntax-only` against the project's real flags) rather than relying on the
+build.
 
-*Gate:* tree compiles.
+### Phase 2 — DRAM becomes a backend, and takes ownership of its memory
 
-### Phase 2 — DRAM becomes a backend
+Two pieces, and the second is the one §1 item 4 added:
 
-Split `PeerDramAllocator`'s internal `map<TierType, ...>` into one instance per
-medium. Rename to `PageBackend : MediumBackend`. Every method loses its
-`TierType` parameter — this makes the file *smaller*.
+**(a) Split the map.** `PeerDramAllocator`'s internal `map<TierType, ...>`
+becomes one instance per medium. Rename to `PageBackend : MediumBackend`. Every
+method loses its `TierType` parameter — this makes the file *smaller*.
+
+**(b) Move ownership down.** The backend allocates its own pool and registers it,
+choosing `MemoryLocationType` itself. Consequences up the stack:
+`PoolClientConfig::dram_buffers` is deleted; `DistributedClient` stops calling
+`HostMemAllocator`; `BuildDramTierConfig` is deleted; the
+`{DRAM, {size,size}}` capacity literal is deleted in favour of `Capacity()`
+aggregated over the registry.
+
+This does **not** wait for Phase 6. The `TransferEngine` a backend receives at
+`Init` is, in this phase, a ~30-line `PoolClient`-owned shim whose registration
+methods forward to `io_engine_->RegisterMemory` and whose transfer methods are
+unimplemented — nothing calls them yet, since the remote path still runs through
+`PoolClient` until Phase 6. Phase 6 replaces the shim with
+`CompositeTransferEngine` and no backend changes. Phase 1's header only
+forward-declares the type, so it compiles with nothing behind it.
 
 Consequence to accept deliberately: `owned_`, the read lease, and the clear
 generation become per-medium, so a key may exist in both DRAM and HBM. The
 design already allows this (see the `NodeMatch` mirror comment in `types.h`).
 Peer-local tier selection at `Resolve` time becomes a small policy function
-driven by `BackendProperties::read_rank`.
+driven by `BackendRegistry::ByReadRank()`.
 
-Instantiate once, for DRAM, into the `BackendRegistry` owned by `PoolClient`.
+**The local fast path is NOT touched in this phase.** `LocalPutPages` /
+`LocalGetPages` stay in `PoolClient`, host-DRAM-only. That is sound as long as
+only one *real* medium is live, which is why option (b) below is the default.
 
 **HBM is not a free second backend.** It does not work today — no HBM buffer is
-ever allocated or registered (§1). Standing it up means allocating device memory,
-RDMA-registering it, and exposing it through `PoolClientConfig`: new work, not
-refactoring. Two options, pick one deliberately:
+ever allocated or registered (§1). Two options:
 
-- **(a) Wire HBM up for real** as the second `PageBackend` instance. This is the
-  genuine proof of the abstraction and is presumably wanted regardless — but
-  budget it as a feature (~2–3 days on top), not as a refactor gate.
-- **(b) Pull `MockBackend` forward from Phase 5** and use it as the second
-  registered backend. Cheap, proves the registry and dispatch paths, proves
-  nothing about a real second medium.
+- **(a) Wire HBM up for real.** This is the genuine proof of the abstraction,
+  but it is *blocked on Phase 6*: a second real medium makes the host-only local
+  copy path wrong, and `config_.dram_buffers[buffer_index]` has no tier
+  dimension. Doing it before Phase 6 means interim scaffolding that Phase 6 then
+  deletes.
+- **(b) `MockBackend` as the second registered backend.** Cheap, proves the
+  registry and dispatch paths, keeps the local path honestly single-medium.
 
-Default to (b) to keep the refactor honest about its own scope, then do (a)
-separately.
+Default to (b).
 
-*Gate:* DRAM behavior unchanged, with a second backend registered and dispatched
-to — whichever of (a) or (b) was chosen.
+*Gate:* DRAM behavior unchanged with a second backend registered and dispatched
+to; no buffer pointer crosses into `PoolClientConfig`.
 
 ### Phase 3 — peer server and pool client go agnostic
 
 `PeerServiceServer` takes a `BackendRegistry*` instead of typed pointers;
-handlers dispatch on the request's tier tag.
+handlers dispatch on the request's tier tag. Single-key RPCs are served by
+one-element batches.
 
 `PoolClient`'s local paths go through `registry_.Get(tier)`. The remote paths are
 already tier-tagged on the wire, so once the SSD special case is gone they become
@@ -284,7 +469,9 @@ not asserted.
 Delete both hardcoded tier orders. Derive read order and put-eligibility from
 `BackendProperties`, advertised through registration and heartbeat alongside
 `tier_capacities`. A backend that cannot accept puts advertises no put-eligible
-capacity, which deletes the put tier-order list rather than extending it.
+capacity, which deletes the put tier-order list rather than extending it. This
+also turns "can SSD accept direct puts" into a deployment choice a backend
+advertises, rather than the `kPutTierOrder` constant it is today.
 
 ~150 lines.
 
@@ -294,100 +481,170 @@ unmodified.
 ### Phase 5 — lock it in
 
 - Cherry-pick `tools/umbp_backend_abstraction_lint.py` and its pre-commit hook
-  from `refactor/umbp-storage-backend-api`. It already works: it fails if
-  anything outside the backend directory names a concrete backend type or
-  includes its header, and its budget table may only shrink.
+  from `refactor/umbp-storage-backend-api`. It fails if anything outside the
+  backend directory names a concrete backend type or includes its header, and
+  its budget table may only shrink.
 - Add a ~150-line `MockBackend` for tests.
 - Enforce the layering boundary instead of collapsing it. `local/tiers/
   tier_backend.h` and `LocalStorageManager` **stay** — they are local mode's
   medium contract and local mode is still a shipping stack. The lint rule is
-  therefore scoped: no file under `distributed/` may include `local/tiers/*`,
-  and no file outside a backend directory may name a concrete backend type —
-  with `distributed/peer/ssd/` exempted from both as the dormant-and-future
-  adapter directory. That single directory exemption is what lets the dormant
-  `PeerSsdManager` coexist with the lint from day one, and it becomes the home
-  of `ssd_backend.cpp` on re-add rather than a new carve-out.
+  scoped: no file under `distributed/` may include `local/tiers/*`, and no file
+  outside a backend directory may name a concrete backend type — with
+  `distributed/peer/ssd/` exempted from both as the dormant-and-future adapter
+  directory.
+- One further rule, needed because §4 folds registration into `TransferEngine`
+  and so hands backends an object they could transfer with: **no file under a
+  backend directory may call `TransferEngine::{Plan,Submit,Wait}`.** Backends
+  register and publish descriptors; they do not move bytes. Adding the rule here
+  costs a few lines and replaces the compile-time guarantee a separate
+  registration interface would have given.
 
 Two backend abstractions coexist by design, at different layers:
-`MediumBackend` is the *distributed data-plane* contract (RDMA page slots,
+`MediumBackend` is the *distributed storage* contract (publishes descriptors,
 registry-dispatched); `TierBackend` is *local mode's* storage-medium contract
 (blocking read/write of bytes). The original coupling came from these two being
-tangled inside `PoolClient`, not from both existing. Keeping them separated by a
-lint-enforced seam is what makes the SSD re-add a single adapter file.
+tangled inside `PoolClient`, not from both existing.
 
 *Acceptance test:* adding a backend = 1 new file + 1 registry line + 0 call-site
 edits.
 
+### Phase 6 — abstract the transfer engine
+
+Introduce `TransferEngine` and `TransferRef` (§4). `MoriIoEngine` is the first
+implementation and mori-io itself is not modified; `CompositeTransferEngine`
+replaces the Phase 2 registration shim, so backends see no change. Move from
+`PoolClient` into the engine: `GroupTransfersByPair` (as `MoriIoEngine::Plan`),
+the submit-all-then-wait scheduler (base class), the bounce buffer and its mutex,
+peer engine registration and desc caching.
+
+This is what makes the local fast path stop being a special case: a local
+transfer is one whose endpoints are both local, and the planner picks a memcpy
+or pread engine. `LocalPutPages` / `LocalGetPages` / `LocalCopyBlock` and the
+`UMBP_DRAM_{WRITE,READ}_THREADS` knobs fold in here — **if and only if** a local
+transfer through the abstraction measures as cheap as today's direct `memcpy`
+(§2). Measure before committing to it; the fast path exists because that
+comparison once came out the other way.
+
+*Gate:* `bench_pool_client_batch_get` and the local put/get microbenchmarks
+unchanged. Same argument as Phase 3 — this is a throughput property.
+
+Only after this phase does Phase 2 option (a), real HBM, become a clean
+1-file change.
+
 ---
 
-## 4. Decisions
+## 6. Decisions
 
 **Branch from `main`, not from `refactor/umbp-storage-backend-api`.**
 Most of that branch's remaining work — the `PeerTierBackend` async Submit/Wait
-API (§7.2) and the 4-way `BatchGetPlan` partition (§7.3) — exists specifically to
-preserve SSD's blocking data-plane shape alongside DRAM's async one. That shape
-is exactly what Phase 0 removes from the distributed path. Cherry-pick only the
-lint tool.
+API and the 4-way `BatchGetPlan` partition — exists specifically to preserve
+SSD's blocking data-plane shape alongside DRAM's async one. That shape is exactly
+what Phase 0 removes. Cherry-pick only the lint tool.
 
-**Backends must be RDMA-addressable page slots.**
-This is the constraint that makes the design simple. A medium whose own bytes
-are not registerable — SSD — participates by exposing registered *staging*
-pages, filled during `BatchResolve`. It does not get a second data-plane shape.
-Admitting one is what produced the current coupling.
+**Backends publish descriptors; the transfer layer decides how to move them.**
+This supersedes the earlier "backends must be RDMA-addressable page slots."
+The weaker requirement is the correct one: a backend's contract is to produce a
+`TransferRef`, not to produce registered memory. A medium whose bytes are not
+registerable produces a `FileRef` or `ObjectRef` and the transfer layer picks or
+composes an engine. The invariant that must not be broken is that there is one
+byte-moving path, chosen by the planner — admitting a second one at the backend
+level is what produced the original coupling.
+
+**The transfer engine is abstracted inside UMBP; mori-io is not modified.**
+UMBP owns `TransferRef`, so mori-io never needs a file or object endpoint type.
+This keeps the blast radius off mori-io's other consumers.
+
+**Staging belongs to the transfer layer.** It is the only layer that can observe
+completion. A staging pool in a storage backend must fall back to a TTL, which
+is the `PrepareSsdRead` lease under another name.
+
+**Allocation and registration belong to the backend.** Whoever allocates memory
+must supply the facts a descriptor cannot recover — hugepage/NUMA policy for
+DRAM, device and location type for HBM. Note this is why the caller-buffer
+registration at `pool_client.cpp:526` is a *different* bug on a different axis:
+same seam, different allocator, so the fix is a location parameter on the public
+API rather than a move into a backend.
 
 **The `local/` standalone stack is kept, not folded in.**
 It has its own `TierBackend`, is reachable through `UMBPClient`'s standalone mode
 and live in the Python bindings, and it is the only remaining consumer of the SSD
-storage stack after Phase 0. It is unchanged by this refactor; Phase 5 fences it
-off with lint rather than deleting it.
+storage stack after Phase 0. Phase 5 fences it off with lint rather than
+deleting it.
 
 **SSD is unwired from distributed mode, not deleted from it.**
-The alternative — carrying SSD live through the refactor — was estimated at 2.5
-weeks for Phases 2–3 alone, because every phase would have to design around the
-blocking lease shape. Unwiring it first and re-adding it through the finished
-`MediumBackend` interface is strictly less total work. Since neither the storage
-stack nor `PeerSsdManager` leaves the tree, and both stay under test, the re-add
-is an adapter, not a rewrite.
+Carrying SSD live through the refactor was estimated at 2.5 weeks for Phases 2–3
+alone, because every phase would have to design around the blocking lease shape.
+Since neither the storage stack nor `PeerSsdManager` leaves the tree, and both
+stay under test, the re-add is an adapter, not a rewrite.
 
 The one thing not preserved is the lease: `SsdReadLease`, `PrepareSsdRead`,
-`ReleaseSsdLease`, and the peer-side slot state machine. Preserving those would
-preserve the exact coupling this refactor exists to remove.
+`ReleaseSsdLease`, and the peer-side slot state machine.
+
+**Re-add path (post-Phase 6).** `SsdBackend : MediumBackend` mostly *forwards* to
+the still-tested `PeerSsdManager`: `BatchResolve` → `PrepareRead`, `Evict` →
+`Evict`, `DrainPendingEvents` / `SnapshotOwnedKeys` → the same methods,
+`Capacity` → `Capacity`. The piece the original plan deferred — owning a pool of
+registered staging pages — is **no longer the backend's problem**: it publishes a
+`FileRef` and the transfer layer supplies the bounce buffer if the chosen engine
+needs one. Drivers, SPDK env, allocator, proxy protocol, segment format,
+eviction policy, the peer-side ownership map and the copy-on-commit pipeline are
+reused as-is.
 
 ---
 
-## 5. Effort
-
-Roughly 1.5–2 weeks.
+## 7. Effort
 
 | Phase | Work |
 |---|---|
-| 0 — unwire SSD from distributed | 1–1.5 days |
-| 1 — interface | 0.5 day |
-| 2 — DRAM backend | 2–3 days |
+| 0 — unwire SSD from distributed | 1–1.5 days *(done)* |
+| 1 — interfaces | 0.5 day |
+| 2 — DRAM backend **+ ownership move** | 4–5 days |
 | 3 — peer + pool client | 2–3 days |
 | 4 — routing | 1 day |
 | 5 — lint + cleanup | 1 day |
+| 6 — transfer engine | 4–6 days |
+
+Phase 2 grew from the original 2–3 days: splitting the tier map is the small
+half, and relocating allocation, registration and capacity reaches up into
+`PoolClientConfig`, `DistributedClient` and `UMBPConfig`.
 
 Phase 2 assumes option (b) — `MockBackend` as the second registered backend.
-Standing HBM up for real instead adds ~2–3 days and is a feature, not part of
-this refactor.
+Real HBM is a feature on top, and is cleanest after Phase 6.
 
-Phase 0 is the highest-leverage step: it removes the constraint that every later
-phase would otherwise have to design around, and it is a seam cut rather than a
-teardown — no storage code is deleted, so the risk is confined to the distributed
-call sites.
-
-Not counted above: re-adding `SsdBackend : MediumBackend` afterwards, ~1.5–2 days
-— mostly the staging-page pool and the resolve path, since `PeerSsdManager` is
-still present and tested and the adapter largely forwards to it. It is a feature
-on top of the finished abstraction, and it is the real acceptance test for §5's
+Not counted: re-adding `SsdBackend`, ~1–1.5 days now that the staging pool moved
+to the transfer layer. It is the real acceptance test for Phase 5's
 *1 file + 1 registry line* claim.
 
-Keeping SSD alive does carry a standing cost, worth naming rather than hiding:
-the SPDK submodule, `storage/**`, the local SSD suites, and the dormant adapter
-plus its 3 tests all stay in build and CI while nothing in distributed mode calls
-them. Dormant compiled code also drifts — if `KvEvent` or `types.h` changes under
-it, someone must fix a file no one is using. Those 3 tests are what keeps that
-honest and turns "preserved source" into "preserved working behavior"; that is
-the difference between this and simply recovering the files from git history
-later, and it is the whole reason to keep rather than delete.
+Keeping SSD alive carries a standing cost worth naming: the SPDK submodule,
+`storage/**`, the local SSD suites, and the dormant adapter plus its 3 tests all
+stay in build and CI while nothing in distributed mode calls them. Dormant
+compiled code also drifts — if `KvEvent` or `types.h` changes under it, someone
+must fix a file no one is using. Those 3 tests are what turns "preserved source"
+into "preserved working behavior."
+
+---
+
+## 8. Open — shared media and node-scoped routing
+
+Not solved by anything above, and worth knowing before S3 or 3FS is attempted.
+
+The whole routing plane assumes a key lives on a *machine*:
+
+```cpp
+struct Location { std::string node_id; uint64_t size; TierType tier; };
+```
+
+True for DRAM, HBM and local SSD. Meaningless for S3 or 3FS, where every node
+can reach the same objects. Three concrete failures:
+
+- The master records whichever node happened to write an object and routes all
+  readers there, creating a hot spot for data any node could have fetched
+  directly.
+- Per-node `Capacity()` is wrong: the capacity is shared, so N nodes each
+  reporting the whole bucket lets the master over-commit it N times.
+- Eviction becomes a coordination problem — N nodes believe they own the same
+  object.
+
+Fixing this needs `Location` to express "reachable from anywhere" plus a
+shared-capacity rule in the master. It is control-plane work, orthogonal to
+`MediumBackend` and to §4, and it does not block any phase above.
