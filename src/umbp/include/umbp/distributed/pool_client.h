@@ -39,13 +39,15 @@
 #include "mori/io/engine.hpp"
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/master/master_client.h"
+#include "umbp/distributed/peer/medium_backend.h"
 #include "umbp/distributed/types.h"
 #include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {
 
-class PeerDramAllocator;
+class PageBackend;
 class PeerServiceServer;
+class TransferEngine;
 
 // Short name for log output. Generic FAILED maps to "FAILED" — the
 // detailed reason for that case lives in the peer's allocator log.
@@ -121,7 +123,7 @@ class PoolClient {
   std::vector<bool> BatchExists(const std::vector<std::string>& keys);
 
   MasterClient& Master();
-  PeerDramAllocator* DramAllocator();
+  PageBackend* DramAllocator();
 
   bool IsInitialized() const;
 
@@ -147,7 +149,7 @@ class PoolClient {
   // `kAlreadyExists` (master- or peer-side dedup) is success-to-caller
   // but excluded from bandwidth metrics — no bytes on the wire.
   // Aggregates all SUCCESS_* / FAILED_* variants of
-  // PeerDramAllocator::Outcome / proto AllocateSlotOutcome into 3 buckets;
+  // AllocateOutcome / proto AllocateSlotOutcome into 3 buckets;
   // the specific failure reason is logged at the call site, not propagated.
   enum class PutEntryOutcome { kFailed, kSucceeded, kAlreadyExists };
 
@@ -157,15 +159,22 @@ class PoolClient {
 
   std::unique_ptr<MasterClient> master_client_;
 
-  // Peer-side DRAM/HBM allocator.  Owned here because PoolClient is
-  // the natural lifetime anchor for the per-process IO engine + DRAM
-  // buffers; PeerServiceServer borrows it.
-  std::unique_ptr<PeerDramAllocator> peer_alloc_;
+  // Every storage medium live on this node.  Owned here because PoolClient
+  // is the natural lifetime anchor for the per-process IO engine + backend
+  // pools; PeerServiceServer borrows the DRAM backend.  One instance per
+  // medium (backend-agnostic refactor Phase 2) — dram_backend_ is a
+  // non-owning convenience pointer into registry_ for the local fast path
+  // and other DRAM-specific call sites that predate the registry.
+  BackendRegistry registry_;
+  PageBackend* dram_backend_ = nullptr;
   std::unique_ptr<PeerServiceServer> peer_service_;
 
   std::unique_ptr<mori::io::IOEngine> io_engine_;
+  // Registration shim handed to each backend's Init() (design doc §5 Phase 2 /
+  // §4): forwards to io_engine_ today; Phase 6 replaces it with
+  // CompositeTransferEngine without any backend-visible change.
+  std::unique_ptr<TransferEngine> transfer_engine_;
   mori::io::MemoryDesc staging_mem_{};
-  std::vector<mori::io::MemoryDesc> export_dram_mems_;
   std::unique_ptr<char[]> staging_buffer_;
   std::mutex staging_mutex_;
 

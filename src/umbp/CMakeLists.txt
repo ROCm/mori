@@ -340,7 +340,7 @@ add_library(
   distributed/routing/router.cpp
   distributed/routing/route_get_strategy.cpp
   distributed/routing/route_put_strategy.cpp
-  distributed/peer/peer_dram_allocator.cpp
+  distributed/peer/page_backend.cpp
   distributed/peer/ssd/peer_ssd_manager.cpp
   distributed/peer/ssd/ssd_copy_pipeline.cpp
   distributed/peer/peer_service.cpp

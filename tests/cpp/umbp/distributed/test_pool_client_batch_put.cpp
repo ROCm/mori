@@ -160,16 +160,10 @@ class BatchPutWarnTest : public ::testing::Test {
   void SetUp() override {
     caller_buf_ = std::malloc(kCallerBuf);
     registered_buf_ = std::malloc(kCallerBuf);
-    target_buf_ = std::malloc(kRemoteCap);
-    caller_local_ = std::malloc(kPageSize);
     ASSERT_NE(caller_buf_, nullptr);
     ASSERT_NE(registered_buf_, nullptr);
-    ASSERT_NE(target_buf_, nullptr);
-    ASSERT_NE(caller_local_, nullptr);
     std::memset(caller_buf_, 0, kCallerBuf);
     std::memset(registered_buf_, 0, kCallerBuf);
-    std::memset(target_buf_, 0, kRemoteCap);
-    std::memset(caller_local_, 0, kPageSize);
 
     MasterServerConfig master_cfg;
     master_cfg.listen_address = "0.0.0.0:0";
@@ -193,8 +187,7 @@ class BatchPutWarnTest : public ::testing::Test {
     cfg_caller.io_engine.port = 0;
     cfg_caller.peer_service_port = NextPeerServicePort();
     cfg_caller.dram_page_size = kPageSize;
-    cfg_caller.dram_buffers = {{caller_local_, kPageSize}};
-    cfg_caller.tier_capacities = {{TierType::DRAM, {kPageSize, kPageSize}}};
+    cfg_caller.dram.buffer_sizes = {kPageSize};
     caller_ = std::make_unique<PoolClient>(std::move(cfg_caller));
     ASSERT_TRUE(caller_->Init());
 
@@ -206,8 +199,7 @@ class BatchPutWarnTest : public ::testing::Test {
     cfg_target.io_engine.port = 0;
     cfg_target.peer_service_port = NextPeerServicePort();
     cfg_target.dram_page_size = kPageSize;
-    cfg_target.dram_buffers = {{target_buf_, kRemoteCap}};
-    cfg_target.tier_capacities = {{TierType::DRAM, {kRemoteCap, kRemoteCap}}};
+    cfg_target.dram.buffer_sizes = {kRemoteCap};
     target_ = std::make_unique<PoolClient>(std::move(cfg_target));
     ASSERT_TRUE(target_->Init());
   }
@@ -219,8 +211,6 @@ class BatchPutWarnTest : public ::testing::Test {
     if (server_thread_.joinable()) server_thread_.join();
     std::free(caller_buf_);
     std::free(registered_buf_);
-    std::free(caller_local_);
-    std::free(target_buf_);
   }
 
   // Build a batch backed by `base` (one slot per page).  Caller chooses
@@ -243,8 +233,6 @@ class BatchPutWarnTest : public ::testing::Test {
 
   void* caller_buf_ = nullptr;
   void* registered_buf_ = nullptr;
-  void* target_buf_ = nullptr;
-  void* caller_local_ = nullptr;
   std::unique_ptr<MasterServer> master_;
   std::thread server_thread_;
   std::unique_ptr<PoolClient> caller_;

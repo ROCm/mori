@@ -145,7 +145,6 @@ bool ParseArgs(int argc, char** argv, BenchOpts* o) {
 // multi_peer scenarios the caller pre-registers caller_buf_ as dst;
 // in all_stg it doesn't, so REMOTE_STG path activates.
 struct PeerNode {
-  std::vector<char> dram;  // master-managed exportable DRAM (data lives here)
   std::vector<char> seed;  // src for the seed BatchPut (registered for ZC Put)
   std::unique_ptr<PoolClient> client;
 };
@@ -154,7 +153,7 @@ class Cluster {
  public:
   Cluster(size_t page_bytes, size_t target_dram_bytes, size_t num_peers, size_t caller_buf_bytes,
           size_t caller_local_bytes, size_t seed_bytes_per_peer)
-      : page_bytes_(page_bytes), caller_buf_(caller_buf_bytes), caller_local_(caller_local_bytes) {
+      : page_bytes_(page_bytes), caller_buf_(caller_buf_bytes) {
     MasterServerConfig mcfg;
     mcfg.listen_address = "0.0.0.0:0";
     // The master index is eventually consistent: a committed key becomes
@@ -182,8 +181,7 @@ class Cluster {
     cc.io_engine.port = 0;
     cc.peer_service_port = NextPeerServicePort();
     cc.dram_page_size = page_bytes;
-    cc.dram_buffers = {{caller_local_.data(), caller_local_.size()}};
-    cc.tier_capacities = {{TierType::DRAM, {caller_local_.size(), caller_local_.size()}}};
+    cc.dram.buffer_sizes = {caller_local_bytes};
     caller_ = std::make_unique<PoolClient>(std::move(cc));
     if (!caller_->Init()) {
       std::cerr << "caller init failed\n";
@@ -192,7 +190,6 @@ class Cluster {
 
     peers_.resize(num_peers);
     for (size_t k = 0; k < num_peers; ++k) {
-      peers_[k].dram.assign(target_dram_bytes, 0);
       peers_[k].seed.assign(seed_bytes_per_peer, 0);
       PoolClientConfig tc;
       tc.master_config.node_id = "node-target-" + std::to_string(k);
@@ -202,8 +199,7 @@ class Cluster {
       tc.io_engine.port = 0;
       tc.peer_service_port = NextPeerServicePort();
       tc.dram_page_size = page_bytes;
-      tc.dram_buffers = {{peers_[k].dram.data(), peers_[k].dram.size()}};
-      tc.tier_capacities = {{TierType::DRAM, {peers_[k].dram.size(), peers_[k].dram.size()}}};
+      tc.dram.buffer_sizes = {target_dram_bytes};
       peers_[k].client = std::make_unique<PoolClient>(std::move(tc));
       if (!peers_[k].client->Init()) {
         std::cerr << "target " << k << " init failed\n";
@@ -233,7 +229,6 @@ class Cluster {
  private:
   size_t page_bytes_;
   std::vector<char> caller_buf_;
-  std::vector<char> caller_local_;
   std::unique_ptr<MasterServer> master_;
   std::thread server_thread_;
   std::unique_ptr<PoolClient> caller_;

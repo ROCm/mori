@@ -32,7 +32,7 @@
 namespace mori::umbp {
 
 // Page-granularity bitmap allocator, one instance per (node_id, tier) pair
-// (owned by Master on the control plane, or by PeerDramAllocator on the peer).
+// (owned by Master on the control plane, or by PageBackend on the peer).
 // Internally holds N BufferState entries (one per physical buffer registered
 // by the Client at RegisterClient time); each BufferState carries an
 // independent `vector<bool>` bitmap.
@@ -47,7 +47,7 @@ namespace mori::umbp {
 //
 // THREAD SAFETY: PageBitmapAllocator holds NO internal mutex.  Callers MUST
 // serialize every method via the owning object's mutex (e.g.
-// `ClientRegistry::mutex_` on master, `PeerDramAllocator::mutex_` on peer).
+// `ClientRegistry::mutex_` on master, `PageBackend::mutex_` on peer).
 class PageBitmapAllocator {
  public:
   struct BufferState {

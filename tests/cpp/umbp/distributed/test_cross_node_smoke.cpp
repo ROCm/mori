@@ -92,16 +92,10 @@ inline bool WaitForExists(PoolClient* client, const std::string& key,
 class CrossNodeSmoke : public ::testing::Test {
  protected:
   void SetUp() override {
-    buf_a_ = std::malloc(kBufSize);
-    buf_b_ = std::malloc(kBufSize);
     caller_buf_ = std::malloc(kBufSize);
     read_buf_ = std::malloc(kBufSize);
-    ASSERT_NE(buf_a_, nullptr);
-    ASSERT_NE(buf_b_, nullptr);
     ASSERT_NE(caller_buf_, nullptr);
     ASSERT_NE(read_buf_, nullptr);
-    std::memset(buf_a_, 0, kBufSize);
-    std::memset(buf_b_, 0, kBufSize);
     std::memset(caller_buf_, 0, kBufSize);
     std::memset(read_buf_, 0, kBufSize);
 
@@ -130,8 +124,7 @@ class CrossNodeSmoke : public ::testing::Test {
     cfg_a.io_engine.host = "0.0.0.0";
     cfg_a.io_engine.port = 0;
     cfg_a.peer_service_port = NextPeerServicePort();
-    cfg_a.dram_buffers = {{buf_a_, kBlockSize}};
-    cfg_a.tier_capacities = {{TierType::DRAM, {kBlockSize, kBlockSize}}};
+    cfg_a.dram.buffer_sizes = {kBlockSize};
     cfg_a.dram_page_size = kBlockSize;
     client_a_ = std::make_unique<PoolClient>(std::move(cfg_a));
     ASSERT_TRUE(client_a_->Init());
@@ -143,8 +136,7 @@ class CrossNodeSmoke : public ::testing::Test {
     cfg_b.io_engine.host = "0.0.0.0";
     cfg_b.io_engine.port = 0;
     cfg_b.peer_service_port = NextPeerServicePort();
-    cfg_b.dram_buffers = {{buf_b_, kBufSize}};
-    cfg_b.tier_capacities = {{TierType::DRAM, {kBufSize, kBufSize}}};
+    cfg_b.dram.buffer_sizes = {kBufSize};
     cfg_b.dram_page_size = kBlockSize;
     client_b_ = std::make_unique<PoolClient>(std::move(cfg_b));
     ASSERT_TRUE(client_b_->Init());
@@ -158,14 +150,10 @@ class CrossNodeSmoke : public ::testing::Test {
     if (client_a_) client_a_->Shutdown();
     if (master_) master_->Shutdown();
     if (server_thread_.joinable()) server_thread_.join();
-    std::free(buf_a_);
-    std::free(buf_b_);
     std::free(caller_buf_);
     std::free(read_buf_);
   }
 
-  void* buf_a_ = nullptr;
-  void* buf_b_ = nullptr;
   void* caller_buf_ = nullptr;
   void* read_buf_ = nullptr;
   std::unique_ptr<MasterServer> master_;
@@ -272,8 +260,7 @@ class CrossNodeMultiPage : public ::testing::Test {
 
   void TearDown() override { TearDownClients(); }
 
-  std::unique_ptr<PoolClient> MakeClient(const std::string& node_id, const NodeSetup& setup,
-                                         std::vector<void*>* owned_bufs) {
+  std::unique_ptr<PoolClient> MakeClient(const std::string& node_id, const NodeSetup& setup) {
     PoolClientConfig cfg;
     cfg.master_config.node_id = node_id;
     cfg.master_config.node_address = "127.0.0.1";
@@ -282,16 +269,7 @@ class CrossNodeMultiPage : public ::testing::Test {
     cfg.io_engine.port = 0;
     cfg.peer_service_port = NextPeerServicePort();
     cfg.dram_page_size = kPageSize;
-    uint64_t total = 0;
-    for (size_t sz : setup.buffer_sizes) {
-      void* p = std::malloc(sz);
-      EXPECT_NE(p, nullptr);
-      std::memset(p, 0, sz);
-      owned_bufs->push_back(p);
-      cfg.dram_buffers.push_back({p, sz});
-      total += sz;
-    }
-    cfg.tier_capacities = {{TierType::DRAM, {total, total}}};
+    cfg.dram.buffer_sizes = setup.buffer_sizes;
     auto cli = std::make_unique<PoolClient>(std::move(cfg));
     EXPECT_TRUE(cli->Init());
     return cli;
@@ -305,18 +283,12 @@ class CrossNodeMultiPage : public ::testing::Test {
     if (master_) master_->Shutdown();
     if (server_thread_.joinable()) server_thread_.join();
     master_.reset();
-    for (void* p : owned_a_) std::free(p);
-    for (void* p : owned_b_) std::free(p);
-    owned_a_.clear();
-    owned_b_.clear();
   }
 
   std::unique_ptr<MasterServer> master_;
   std::thread server_thread_;
   std::unique_ptr<PoolClient> client_a_;
   std::unique_ptr<PoolClient> client_b_;
-  std::vector<void*> owned_a_;
-  std::vector<void*> owned_b_;
 };
 
 TEST_F(CrossNodeMultiPage, MultiPageSameBufferPutGet) {
@@ -324,8 +296,8 @@ TEST_F(CrossNodeMultiPage, MultiPageSameBufferPutGet) {
   // page block.  node-a is sized so node-b is the obvious most-available
   // target; we then PUT 3 pages from a and GET them back from a.
   StartMaster();
-  client_a_ = MakeClient("node-a", NodeSetup{{kPageSize}}, &owned_a_);
-  client_b_ = MakeClient("node-b", NodeSetup{{kPageSize * 4}}, &owned_b_);
+  client_a_ = MakeClient("node-a", NodeSetup{{kPageSize}});
+  client_b_ = MakeClient("node-b", NodeSetup{{kPageSize * 4}});
 
   constexpr size_t kPayload = kPageSize * 3;
   std::vector<char> src(kPayload);
@@ -347,8 +319,8 @@ TEST_F(CrossNodeMultiPage, CrossBufferScatterPutGet) {
   StartMaster();
   // node-a is the source; sized so it cannot accept the Put itself
   // (single page) and routes go to node-b.
-  client_a_ = MakeClient("node-a", NodeSetup{{kPageSize}}, &owned_a_);
-  client_b_ = MakeClient("node-b", NodeSetup{{kPageSize, kPageSize}}, &owned_b_);
+  client_a_ = MakeClient("node-a", NodeSetup{{kPageSize}});
+  client_b_ = MakeClient("node-b", NodeSetup{{kPageSize, kPageSize}});
 
   constexpr size_t kPayload = kPageSize * 2;
   std::vector<char> src(kPayload);
@@ -375,10 +347,10 @@ TEST_F(CrossNodeMultiPage, CrossBufferScatterPutGet) {
 // every get is zero-copy (not staging).
 TEST_F(CrossNodeMultiPage, BatchGetZeroCopyMultiKeyCrossBuffer) {
   StartMaster();
-  client_a_ = MakeClient("node-a", NodeSetup{{kPageSize}}, &owned_a_);
+  client_a_ = MakeClient("node-a", NodeSetup{{kPageSize}});
   // Two 2-page buffers: the 4 single-page keys distribute across both, so
   // their pages span two distinct remote buffer_index values.
-  client_b_ = MakeClient("node-b", NodeSetup{{kPageSize * 2, kPageSize * 2}}, &owned_b_);
+  client_b_ = MakeClient("node-b", NodeSetup{{kPageSize * 2, kPageSize * 2}});
 
   constexpr size_t kN = 4;
   std::vector<std::string> keys;
@@ -416,8 +388,8 @@ TEST_F(CrossNodeMultiPage, BatchGetZeroCopyMultiKeyCrossBuffer) {
 // per-pair merge feeds via entry.failed.
 TEST_F(CrossNodeMultiPage, BatchGetZeroCopyFailureIsolation) {
   StartMaster();
-  client_a_ = MakeClient("node-a", NodeSetup{{kPageSize}}, &owned_a_);
-  client_b_ = MakeClient("node-b", NodeSetup{{kPageSize * 4}}, &owned_b_);
+  client_a_ = MakeClient("node-a", NodeSetup{{kPageSize}});
+  client_b_ = MakeClient("node-b", NodeSetup{{kPageSize * 4}});
 
   std::vector<std::string> keys = {"iso-0", "iso-1", "iso-2"};
   std::vector<std::vector<char>> srcs(3);
@@ -458,8 +430,8 @@ TEST_F(CrossNodeMultiPage, PartialTailSinglePage) {
   // size < page_size: single allocation, partial tail = size.  Covers the
   // N=1 fast path through both Put/Get and the scatter helper.
   StartMaster();
-  client_a_ = MakeClient("node-a", NodeSetup{{kPageSize / 2}}, &owned_a_);
-  client_b_ = MakeClient("node-b", NodeSetup{{kPageSize}}, &owned_b_);
+  client_a_ = MakeClient("node-a", NodeSetup{{kPageSize / 2}});
+  client_b_ = MakeClient("node-b", NodeSetup{{kPageSize}});
 
   constexpr size_t kPayload = 1234;  // arbitrary, < kPageSize
   std::vector<char> src(kPayload);
@@ -482,8 +454,8 @@ TEST_F(CrossNodeMultiPage, PartialTailSinglePage) {
 TEST_F(CrossNodeMultiPage, PartialTailMultiPageSameBuffer) {
   // 2 full pages + a partial tail in a single contiguous buffer (Strategy 1).
   StartMaster();
-  client_a_ = MakeClient("node-a", NodeSetup{{kPageSize / 2}}, &owned_a_);
-  client_b_ = MakeClient("node-b", NodeSetup{{kPageSize * 4}}, &owned_b_);
+  client_a_ = MakeClient("node-a", NodeSetup{{kPageSize / 2}});
+  client_b_ = MakeClient("node-b", NodeSetup{{kPageSize * 4}});
 
   constexpr size_t kTail = 333;
   constexpr size_t kPayload = kPageSize * 2 + kTail;
@@ -509,8 +481,8 @@ TEST_F(CrossNodeMultiPage, PartialTailCrossBufferScatter) {
   // Regression guard: scatter helpers must identify "last page" by spi
   // (global page index), not by the position inside a group.
   StartMaster();
-  client_a_ = MakeClient("node-a", NodeSetup{{kPageSize / 2}}, &owned_a_);
-  client_b_ = MakeClient("node-b", NodeSetup{{kPageSize, kPageSize}}, &owned_b_);
+  client_a_ = MakeClient("node-a", NodeSetup{{kPageSize / 2}});
+  client_b_ = MakeClient("node-b", NodeSetup{{kPageSize, kPageSize}});
 
   constexpr size_t kTail = 777;
   constexpr size_t kPayload = kPageSize + kTail;
@@ -535,8 +507,8 @@ TEST_F(CrossNodeMultiPage, PartialTailGetSizeMismatchRejected) {
   // (size < stored) or pull stale bytes from the unused tail of the last
   // page (size > stored, still inside the page window).
   StartMaster();
-  client_a_ = MakeClient("node-a", NodeSetup{{kPageSize / 2}}, &owned_a_);
-  client_b_ = MakeClient("node-b", NodeSetup{{kPageSize}}, &owned_b_);
+  client_a_ = MakeClient("node-a", NodeSetup{{kPageSize / 2}});
+  client_b_ = MakeClient("node-b", NodeSetup{{kPageSize}});
 
   constexpr size_t kPayload = 999;
   std::vector<char> src(kPayload, 'X');
@@ -597,16 +569,7 @@ class CrossNodeOverlap : public ::testing::Test {
     cfg.peer_service_port = NextPeerServicePort();
     cfg.dram_page_size = kPageSize;
     if (staging_buffer_size > 0) cfg.staging_buffer_size = staging_buffer_size;
-    uint64_t total = 0;
-    for (size_t sz : buffer_sizes) {
-      void* p = std::malloc(sz);
-      EXPECT_NE(p, nullptr);
-      std::memset(p, 0, sz);
-      owned_bufs_.push_back(p);
-      cfg.dram_buffers.push_back({p, sz});
-      total += sz;
-    }
-    cfg.tier_capacities = {{TierType::DRAM, {total, total}}};
+    cfg.dram.buffer_sizes = buffer_sizes;
     auto cli = std::make_unique<PoolClient>(std::move(cfg));
     EXPECT_TRUE(cli->Init());
     clients_.push_back(std::move(cli));
@@ -621,14 +584,11 @@ class CrossNodeOverlap : public ::testing::Test {
     if (master_) master_->Shutdown();
     if (server_thread_.joinable()) server_thread_.join();
     master_.reset();
-    for (void* p : owned_bufs_) std::free(p);
-    owned_bufs_.clear();
   }
 
   std::unique_ptr<MasterServer> master_;
   std::thread server_thread_;
   std::vector<std::unique_ptr<PoolClient>> clients_;
-  std::vector<void*> owned_bufs_;
 };
 
 TEST_F(CrossNodeOverlap, MultiPeerZeroCopyByteExact) {
