@@ -53,6 +53,7 @@
 namespace {
 using namespace mori::cco;
 using Gda = ccoGda<CCO_GDA_BUILD_PROVIDER>;
+using GlobalWindowDevice = ccoWindowDevice __attribute__((address_space(1)));
 #if BUILD_CCO_SDMA
 using Sdma = ccoSdma;
 #endif
@@ -61,6 +62,9 @@ inline __device__ const ccoDevComm* AsDevComm(uint64_t h) {
   return reinterpret_cast<const ccoDevComm*>(h);
 }
 inline __device__ ccoWindow_t AsWindow(uint64_t h) { return reinterpret_cast<ccoWindow_t>(h); }
+inline __device__ const GlobalWindowDevice* AsGlobalWindow(uint64_t h) {
+  return reinterpret_cast<const GlobalWindowDevice*>(h);
+}
 inline __device__ ccoGdaSignal_t AsSig(int id) { return static_cast<ccoGdaSignal_t>(id); }
 }  // namespace
 
@@ -93,8 +97,11 @@ inline __device__ ccoGdaSignal_t AsSig(int id) { return static_cast<ccoGdaSignal
 //    done directly on this pointer in the DSL kernel (examples 04/05) — cco does
 //    NOT move data for LSA. GDA below is opaque RDMA, so it IS exposed as ops.
 //    peer_va = winBase + peerLsaRank*(stride4G<<32) + offset
+// ccoWindow_t handles are allocated by hipMalloc in ccoWindowRegister. The
+// scalar DSL ABI erases that pointer provenance, so restore addrspace(1) here;
+// this keeps the public API unchanged and lowers metadata reads to global_load.
 CCO_DEV uint64_t cco_lsa_ptr(uint64_t window, int peer, uint64_t offset) {
-  ccoWindowDevice* w = AsWindow(window);
+  const GlobalWindowDevice* w = AsGlobalWindow(window);
   uint64_t stride = static_cast<uint64_t>(w->stride4G) << 32;
   return reinterpret_cast<uint64_t>(w->winBase) + static_cast<uint64_t>(peer) * stride + offset;
 }

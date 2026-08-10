@@ -145,9 +145,6 @@ class EpDispatchCombineConfig:
     # CCO window base/stride once per routing work item and derive all named
     # region addresses with scalar adds, instead of calling lsa_ptr per region.
     hoist_lsa_base: bool = False
-    # Experimental nested A/B switch: load ccoWindowDevice metadata through
-    # LLVM global addrspace(1), rather than the generic-pointer CCO extern.
-    global_lsa_metadata: bool = False
     # Dispatch stall A/B switches. Prefetch route payload before the slot
     # allocation atomic; defer the local destination counter atomic until after
     # route metadata/scales are published (but before the token copy).
@@ -159,8 +156,6 @@ class EpDispatchCombineConfig:
     rotate_combine_peer_order: bool = False
 
     def __post_init__(self):
-        if self.global_lsa_metadata and not self.hoist_lsa_base:
-            raise ValueError("global_lsa_metadata requires hoist_lsa_base=True")
         # all-or-none: setting only one silently defaults the other to data_type.
         if (self.dispatch_data_type is None) != (self.combine_data_type is None):
             raise ValueError(
@@ -592,7 +587,6 @@ class EpDispatchCombineOp:
             scale_type_size=cfg.scale_type_size,
             fp4=is_fp4,
             hoist_lsa_base=cfg.hoist_lsa_base,
-            global_lsa_metadata=cfg.global_lsa_metadata,
             prefetch_route_payload=cfg.prefetch_route_payload,
             defer_dest_ctr_atomic=cfg.defer_dest_ctr_atomic,
             rotate_dispatch_slot_order=cfg.rotate_dispatch_slot_order,

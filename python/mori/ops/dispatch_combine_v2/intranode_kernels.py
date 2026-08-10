@@ -129,7 +129,6 @@ def make_dispatch(
     replay=False,
     fp4=False,
     hoist_lsa_base=False,
-    global_lsa_metadata=False,
     prefetch_route_payload=False,
     defer_dest_ctr_atomic=False,
     rotate_dispatch_slot_order=False,
@@ -146,8 +145,6 @@ def make_dispatch(
     scale_bytes = scale_dim * scale_type_size
     scale_num_i32 = (scale_bytes + 3) // 4
     enable_scales = scale_bytes > 0
-    if global_lsa_metadata and not hoist_lsa_base:
-        raise ValueError("global_lsa_metadata requires hoist_lsa_base=True")
 
     @flyc.kernel(known_block_size=[warp_num_per_block * WAVE, 1, 1])
     def ep_dispatch(
@@ -213,11 +210,7 @@ def make_dispatch(
             # Hoist that metadata load once for all regions touched by this
             # (src token, destination PE) work item.
             peer_base = (
-                (
-                    P.lsa_ptr_global(arena, dest_pe, fx.Int64(0))
-                    if global_lsa_metadata
-                    else fx.Int64(window.lsa_ptr(dest_pe, 0))
-                )
+                fx.Int64(window.lsa_ptr(dest_pe, 0))
                 if hoist_lsa_base
                 else fx.Int64(0)
             )
@@ -225,6 +218,7 @@ def make_dispatch(
                 lane_dest_pe == dest_pe, arith.select(lane < k_slot, lane, WAVE), WAVE
             )
             dup_ballot = ballot(_BALLOT_INT(), dup_per_lane < WAVE)
+            no_dup = dup_ballot == 0
             is_dup = dup_ballot != 0
             prefetched_weight = arith.constant(0.0, type=T.f32())
             prefetched_idx = arith.constant(0)
@@ -233,7 +227,7 @@ def make_dispatch(
                 # allocation atomic. Skip work items already known to be
                 # duplicates; an overflow slot may still prefetch harmlessly.
                 if lane < experts_per_token:
-                    if dup_ballot == 0:
+                    if no_dup:
                         prefetch_off = src_tok * experts_per_token + lane
                         prefetched_weight = buffer_load(
                             rsrc_inp_wts,
@@ -257,7 +251,7 @@ def make_dispatch(
             else:
                 dest_tok_lane0 = arith.constant(0)
                 if lane == 0:
-                    if dup_ballot == 0:
+                    if no_dup:
                         peer_tok_off = (
                             peer_base + fx.Int64(off_tok_off)
                             if hoist_lsa_base
@@ -267,7 +261,6 @@ def make_dispatch(
                 dest_tok_id = readlane(T.i32(), dest_tok_lane0, 0)
                 overflow = dest_tok_id >= max_recv
                 is_dup_or_overflow = arith.select(is_dup, is_dup, overflow)
-                no_dup = dup_ballot == 0
                 in_cap = dest_tok_id < max_recv
                 do_publish = arith.select(no_dup, in_cap, no_dup)
                 tok_map_entry = arith.select(

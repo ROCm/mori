@@ -103,20 +103,10 @@ def _cases():
         {"DTYPE": "bf16", "COMBINE": "gather", "HOIST_LSA_BASE": 1},
         id="bf16-gather-hoist",
     )
-    yield pytest.param(
-        {
-            "DTYPE": "bf16",
-            "COMBINE": "gather",
-            "HOIST_LSA_BASE": 1,
-            "GLOBAL_LSA_METADATA": 1,
-        },
-        id="bf16-gather-hoist-global-meta",
-    )
     peer_order_common = {
         "DTYPE": "bf16",
         "COMBINE": "gather",
         "HOIST_LSA_BASE": 1,
-        "GLOBAL_LSA_METADATA": 1,
     }
     peer_order_variants = (
         ("a", {}),
@@ -133,7 +123,7 @@ def _cases():
     for k in (4, 8, 9):
         for variant_name, variant_env in peer_order_variants:
             if k == 8 and variant_name == "a":
-                continue  # bf16-gather-hoist-global-meta above is this baseline.
+                continue  # bf16-gather-hoist above is this baseline.
             yield pytest.param(
                 {**peer_order_common, "TOPK": k, **variant_env},
                 id=f"bf16-peer-order-topk{k}-{variant_name}",
@@ -153,7 +143,6 @@ def _cases():
             "DTYPE": "bf16",
             "COMBINE": "scatter",
             "HOIST_LSA_BASE": 1,
-            "GLOBAL_LSA_METADATA": 1,
             "ROTATE_DISPATCH_SLOT_ORDER": 1,
         },
         id="bf16-scatter-dispatch-slot-rotation",
@@ -163,7 +152,6 @@ def _cases():
             "DTYPE": "bf16",
             "COMBINE": "gather",
             "HOIST_LSA_BASE": 1,
-            "GLOBAL_LSA_METADATA": 1,
             "PREFETCH_ROUTE_PAYLOAD": 1,
         },
         id="bf16-gather-prefetch",
@@ -173,7 +161,6 @@ def _cases():
             "DTYPE": "bf16",
             "COMBINE": "gather",
             "HOIST_LSA_BASE": 1,
-            "GLOBAL_LSA_METADATA": 1,
             "DEFER_DEST_CTR_ATOMIC": 1,
         },
         id="bf16-gather-defer-ctr",
@@ -183,7 +170,6 @@ def _cases():
             "DTYPE": "bf16",
             "COMBINE": "gather",
             "HOIST_LSA_BASE": 1,
-            "GLOBAL_LSA_METADATA": 1,
             "PREFETCH_ROUTE_PAYLOAD": 1,
             "DEFER_DEST_CTR_ATOMIC": 1,
         },
@@ -194,7 +180,6 @@ def _cases():
             "DTYPE": "bf16",
             "COMBINE": "gather",
             "HOIST_LSA_BASE": 1,
-            "GLOBAL_LSA_METADATA": 1,
             "PREFETCH_ROUTE_PAYLOAD": 1,
             "DEFER_DEST_CTR_ATOMIC": 1,
             "REPLAY": 1,
@@ -206,7 +191,6 @@ def _cases():
             "DTYPE": "bf16",
             "COMBINE": "gather",
             "HOIST_LSA_BASE": 1,
-            "GLOBAL_LSA_METADATA": 1,
             "PREFETCH_ROUTE_PAYLOAD": 1,
             "DEFER_DEST_CTR_ATOMIC": 1,
             "SCALE_DIM": 32,

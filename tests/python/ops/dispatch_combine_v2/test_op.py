@@ -102,7 +102,6 @@ SCALE_DIM = int(
 COMBINE = os.environ.get("COMBINE", "gather")  # gather | scatter
 QUANT = os.environ.get("QUANT", "none")  # none | fp8_direct_cast | fp8_blockwise
 HOIST_LSA_BASE = int(os.environ.get("HOIST_LSA_BASE", 0))
-GLOBAL_LSA_METADATA = int(os.environ.get("GLOBAL_LSA_METADATA", 0))
 PREFETCH_ROUTE_PAYLOAD = int(os.environ.get("PREFETCH_ROUTE_PAYLOAD", 0))
 DEFER_DEST_CTR_ATOMIC = int(os.environ.get("DEFER_DEST_CTR_ATOMIC", 0))
 ROTATE_DISPATCH_SLOT_ORDER = int(os.environ.get("ROTATE_DISPATCH_SLOT_ORDER", 0))
@@ -200,7 +199,6 @@ def main():
             quant_type=QUANT,
             max_total_recv_tokens=int(os.environ.get("MAXRECV", 0)),
             hoist_lsa_base=bool(HOIST_LSA_BASE),
-            global_lsa_metadata=bool(GLOBAL_LSA_METADATA),
             prefetch_route_payload=bool(PREFETCH_ROUTE_PAYLOAD),
             defer_dest_ctr_atomic=bool(DEFER_DEST_CTR_ATOMIC),
             rotate_dispatch_slot_order=bool(ROTATE_DISPATCH_SLOT_ORDER),
