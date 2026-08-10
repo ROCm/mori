@@ -21,9 +21,13 @@
 // SOFTWARE.
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "umbp/distributed/peer/medium_backend.h"
@@ -101,6 +105,12 @@ class MockBackend : public MediumBackend {
   void ClearFullSyncAcked() override {}
   bool IsClearFullSyncPending() const override { return false; }
 
+  void SetAutoFlushHook(size_t threshold, std::function<void()> cb) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto_flush_threshold_ = threshold;
+    auto_flush_cb_ = std::move(cb);
+  }
+
   std::vector<AllocateResult> BatchAllocate(const std::vector<AllocateRequest>& entries) override {
     std::vector<AllocateResult> out(entries.size());
     std::lock_guard<std::mutex> lock(mutex_);
@@ -133,7 +143,7 @@ class MockBackend : public MediumBackend {
       if (it == pending_.end()) continue;
       const uint64_t committed_size = it->second.bytes.size();
       owned_[entries[i].key] = std::move(it->second.bytes);
-      pending_events_.push_back(KvEvent{KvEvent::Kind::ADD, entries[i].key, tier_, committed_size});
+      QueueEventLocked(KvEvent{KvEvent::Kind::ADD, entries[i].key, tier_, committed_size});
       out[i].success = true;
       out[i].bytes_committed = committed_size;
       pending_.erase(it);
@@ -171,7 +181,7 @@ class MockBackend : public MediumBackend {
       auto it = owned_.find(key);
       if (it != owned_.end()) {
         r.bytes_freed = it->second.size();
-        pending_events_.push_back(KvEvent{KvEvent::Kind::REMOVE, key, tier_, 0});
+        QueueEventLocked(KvEvent{KvEvent::Kind::REMOVE, key, tier_, 0});
         owned_.erase(it);
       }
       out.push_back(std::move(r));
@@ -187,6 +197,13 @@ class MockBackend : public MediumBackend {
     std::string key;
     std::vector<uint8_t> bytes;
   };
+
+  // Mirrors PageBackend::QueueEventLocked: the hook fires under the lock, so
+  // the callback must not re-enter.  Caller MUST hold `mutex_`.
+  void QueueEventLocked(KvEvent event) {
+    pending_events_.push_back(std::move(event));
+    if (auto_flush_cb_ && pending_events_.size() >= auto_flush_threshold_) auto_flush_cb_();
+  }
 
   std::vector<KvEvent> SnapshotLocked() const {
     std::vector<KvEvent> out;
@@ -204,6 +221,8 @@ class MockBackend : public MediumBackend {
   std::unordered_map<uint64_t, PendingSlot> pending_;
   std::unordered_map<std::string, std::vector<uint8_t>> owned_;
   std::vector<KvEvent> pending_events_;
+  size_t auto_flush_threshold_ = SIZE_MAX;  // events before a flush; default = never
+  std::function<void()> auto_flush_cb_;
 };
 
 }  // namespace mori::umbp

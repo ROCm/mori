@@ -269,13 +269,27 @@ target_link_libraries(test_page_backend PRIVATE umbp_common
 target_compile_features(test_page_backend PRIVATE cxx_std_17)
 add_test(NAME test_page_backend COMMAND test_page_backend)
 
-# test_mock_backend — MockBackend + BackendRegistry dispatch (Phase 2 default
-# option (b): a second registered backend proving the registry path)
+# test_mock_backend — MockBackend, BackendRegistry dispatch, and the heartbeat
+# event aggregation MediumBackend absorbed from OwnedLocationSource
 add_executable(test_mock_backend test_mock_backend.cpp)
 target_link_libraries(test_mock_backend PRIVATE umbp_common GTest::gtest_main)
 target_compile_features(test_mock_backend PRIVATE cxx_std_17)
 add_test(NAME test_mock_backend COMMAND test_mock_backend)
 
+# test_peer_service_dispatch — PeerServiceServer tier dispatch through
+# BackendRegistry (Phase 3): per-tier routing, the tier-tagged opaque slot_id
+# that makes Commit/Abort unambiguous, mixed-tier batch ordering, and the
+# read-rank walk / evict fan-out for the RPCs that carry no tier.  Drives the
+# real gRPC surface, so it needs the generated proto + protobuf.
+add_executable(test_peer_service_dispatch test_peer_service_dispatch.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_peer_service_dispatch PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_peer_service_dispatch PRIVATE umbp_common ${_TEST_PROTOBUF_LIB}
+                                     GTest::gtest_main)
+target_compile_features(test_peer_service_dispatch PRIVATE cxx_std_17)
+add_test(NAME test_peer_service_dispatch COMMAND test_peer_service_dispatch)
 
 # test_router_dedup — master-side BatchRoutePut dedup via IMasterMetadataStore
 add_executable(test_router_dedup test_router_dedup.cpp)

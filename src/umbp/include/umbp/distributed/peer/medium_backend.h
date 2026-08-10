@@ -24,6 +24,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <string>
@@ -241,6 +243,16 @@ class MediumBackend {
   // True between ClearLocal() and ClearFullSyncAcked().
   virtual bool IsClearFullSyncPending() const = 0;
 
+  // Register a hook the backend invokes once its unshipped-event outbox
+  // reaches `threshold`, so a batch of puts flushes the heartbeat instead of
+  // waiting for the next tick.  On the interface (rather than on the concrete
+  // backend) because every medium's outbox feeds the same single-bundle
+  // heartbeat: a newly registered backend must participate without MasterClient
+  // learning its type.  `cb` MUST be cheap and MUST NOT re-enter the backend —
+  // it should only signal the heartbeat thread.  Pass a very large threshold to
+  // disable.
+  virtual void SetAutoFlushHook(size_t threshold, std::function<void()> cb) = 0;
+
   // ---- slot lifecycle (peer-side; driven by PeerServiceServer handlers) ----
   //
   // Deliberately not called "data plane": these calls hand out and retire slots
@@ -264,7 +276,9 @@ class MediumBackend {
   virtual std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
                                                   bool include_descs) = 0;
 
-  // Master-driven eviction.  Idempotent; see EvictResult::bytes_freed.
+  // Master-driven eviction.  Idempotent; see EvictResult::bytes_freed.  One
+  // result per key, in request order — the peer service relies on that to sum
+  // freed bytes for a key mirrored across media.
   virtual std::vector<EvictResult> Evict(const std::vector<std::string>& keys) = 0;
 
   // ---- bootstrap (GetPeerInfo) ----
@@ -337,5 +351,45 @@ class BackendRegistry {
  private:
   std::map<TierType, std::unique_ptr<MediumBackend>> backends_;
 };
+
+// ---------------------------------------------------------------------------
+//  Heartbeat event aggregation
+//
+//  These absorb the deleted OwnedLocationSource free functions (design doc §3:
+//  "This interface absorbs the existing OwnedLocationSource — that type goes
+//  away").  Exposed rather than private to MasterClient so they can be unit
+//  tested against backends without standing up a master RPC.
+// ---------------------------------------------------------------------------
+
+// Drain every backend and concat into ONE event list, in the given order.  The
+// heartbeat shipper wraps the result in a SINGLE EventBundle under one
+// monotonic seq — concat here, never one bundle/seq per medium (that breaks the
+// ack / seq-gap full-sync recovery).  Null entries are skipped.
+inline std::vector<KvEvent> DrainAllBackends(const std::vector<MediumBackend*>& backends) {
+  std::vector<KvEvent> merged;
+  for (auto* backend : backends) {
+    if (backend == nullptr) continue;
+    auto events = backend->DrainPendingEvents();
+    merged.insert(merged.end(), std::make_move_iterator(events.begin()),
+                  std::make_move_iterator(events.end()));
+  }
+  return merged;
+}
+
+// Full-sync counterpart: snapshot every backend and concat, each backend ALSO
+// atomically clearing its outbox in the same critical section (the snapshot is
+// authoritative, so the queued delta is redundant and must not be re-shipped).
+// Null entries are skipped.  Non-const because it mutates the backends.
+inline std::vector<KvEvent> SnapshotAllBackendsForFullSync(
+    const std::vector<MediumBackend*>& backends) {
+  std::vector<KvEvent> merged;
+  for (auto* backend : backends) {
+    if (backend == nullptr) continue;
+    auto events = backend->SnapshotOwnedKeysForFullSync();
+    merged.insert(merged.end(), std::make_move_iterator(events.begin()),
+                  std::make_move_iterator(events.end()));
+  }
+  return merged;
+}
 
 }  // namespace mori::umbp

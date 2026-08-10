@@ -46,7 +46,6 @@
 #include "umbp/common/env_time.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/peer/batch_resolve_codec.h"
-#include "umbp/distributed/peer/mock_backend.h"
 #include "umbp/distributed/peer/page_backend.h"
 #include "umbp/distributed/peer/peer_service.h"
 #include "umbp/distributed/peer/transfer_engine.h"
@@ -346,10 +345,9 @@ bool PoolClient::Init() {
 
   // Peer-side backends: DRAM is the one real, self-allocated medium (design
   // doc §1 item 4 / Phase 2b — the backend now owns its memory, PoolClient no
-  // longer holds a buffer pointer).  HBM gets a MockBackend so the registry
-  // dispatches to more than one backend; it always advertises zero capacity
-  // so master-side routing never picks it (design doc Phase 2 default
-  // option b: "keeps the local path honestly single-medium").
+  // longer holds a buffer pointer).  This is the ONLY place in the tree that
+  // names a concrete backend type; everything downstream dispatches through
+  // registry_ (Phase 3), which is what the Phase 5 lint enforces.
   const uint64_t page_size =
       config_.dram_page_size > 0 ? config_.dram_page_size : 2ULL * 1024 * 1024;
   PageBackend::OwnershipConfig dram_ownership;
@@ -362,20 +360,19 @@ bool PoolClient::Init() {
   auto dram = std::make_unique<PageBackend>(TierType::DRAM, page_size, std::move(dram_ownership),
                                             /*pending_ttl=*/std::chrono::milliseconds{30000},
                                             /*read_lease_ttl=*/DramReadLeaseTtl());
-  dram_backend_ = dram.get();
-  if (!dram_backend_->Init(transfer_engine_.get())) {
+  PageBackend* dram_raw = dram.get();
+  if (!dram_raw->Init(transfer_engine_.get())) {
     MORI_UMBP_ERROR("[PoolClient] DRAM backend Init failed");
-    dram_backend_ = nullptr;
     initialized_ = false;
     return false;
   }
-  dram_backend_->StartReaper();
+  dram_raw->StartReaper();
+  // Snapshot the raw bases ONCE: they are immutable after Init, and the local
+  // copy loop must not take the backend's allocator lock per page.
+  for (const auto& b : dram_raw->LocalBufferViews()) local_buffers_.push_back({b.base, b.size});
+  local_copy_backend_ = dram_raw;
   registry_.Register(std::move(dram));
-  master_client_->SetPeerDramAllocator(dram_backend_);
-
-  auto hbm_mock = std::make_unique<MockBackend>(TierType::HBM);
-  hbm_mock->Init(transfer_engine_.get());
-  registry_.Register(std::move(hbm_mock));
+  master_client_->SetBackendRegistry(&registry_);
 
   // Pack engine_desc for master registration.
   std::vector<uint8_t> engine_desc_bytes;
@@ -387,7 +384,7 @@ bool PoolClient::Init() {
 
   if (config_.peer_service_port > 0) {
     peer_service_ =
-        std::make_unique<PeerServiceServer>(dram_backend_, engine_desc_bytes, master_client_.get());
+        std::make_unique<PeerServiceServer>(&registry_, engine_desc_bytes, master_client_.get());
     if (!peer_service_->Start(config_.peer_service_port)) {
       MORI_UMBP_ERROR("[PoolClient] PeerService failed to start on port {}",
                       config_.peer_service_port);
@@ -424,7 +421,7 @@ bool PoolClient::Init() {
 
   // Start the async re-cache worker only when the feature is on and this node has
   // an exportable local DRAM tier to install into.
-  if (config_.cache_remote_fetches && dram_backend_) {
+  if (config_.cache_remote_fetches && local_copy_backend_ != nullptr) {
     {
       std::lock_guard<std::mutex> lk(recache_mutex_);
       recache_stop_ = false;
@@ -441,7 +438,7 @@ void PoolClient::Shutdown() {
   initialized_ = false;
 
   // Stop the async re-cache worker first: it calls ExecuteLocalPut (which uses
-  // dram_backend_ + master_client_), so it must be joined before those are torn
+  // the registry + master_client_), so it must be joined before those are torn
   // down below.
   {
     std::lock_guard<std::mutex> lk(recache_mutex_);
@@ -468,10 +465,12 @@ void PoolClient::Shutdown() {
 
   peer_service_.reset();
 
-  // Every backend (including the DRAM one dram_backend_ points into)
-  // deregisters its memory with transfer_engine_ inside its own destructor —
-  // this MUST run before transfer_engine_ / io_engine_ are torn down below.
-  dram_backend_ = nullptr;
+  // Every backend deregisters its memory with transfer_engine_ inside its own
+  // destructor — this MUST run before transfer_engine_ / io_engine_ are torn
+  // down below.  MasterClient borrows the registry, so unbind it first.
+  if (master_client_) master_client_->SetBackendRegistry(nullptr);
+  local_copy_backend_ = nullptr;
+  local_buffers_.clear();
   registry_ = BackendRegistry{};
 
   if (io_engine_) {
@@ -494,7 +493,9 @@ bool PoolClient::Clear() {
   // clear and no master to notify.  Treat as success so callers in
   // shutdown / teardown paths do not surface a spurious error.
   if (!initialized_.load()) return true;
-  if (dram_backend_) dram_backend_->ClearLocal();
+  // Clear every medium, not just DRAM: a key mirrored across backends must
+  // disappear from all of them before the full-sync empty snapshot goes out.
+  for (auto* backend : registry_.All()) backend->ClearLocal();
 
   bool ok = true;
   if (master_client_) {
@@ -506,7 +507,7 @@ bool PoolClient::Clear() {
 
 bool PoolClient::IsInitialized() const { return initialized_; }
 MasterClient& PoolClient::Master() { return *master_client_; }
-PageBackend* PoolClient::DramAllocator() { return dram_backend_; }
+BackendRegistry& PoolClient::Backends() { return registry_; }
 
 // ---------------------------------------------------------------------------
 //  Memory registration
@@ -560,11 +561,14 @@ std::optional<std::pair<mori::io::MemoryDesc, size_t>> PoolClient::FindRegistere
 
 bool PoolClient::LocalPutPages(const std::vector<PageLocation>& pages, uint64_t page_size,
                                const void* src, size_t size) {
-  if (!dram_backend_) return false;
   const char* src_bytes = static_cast<const char*>(src);
   for (size_t i = 0; i < pages.size(); ++i) {
     const auto& p = pages[i];
-    auto buf = dram_backend_->LocalBufferView(p.buffer_index);
+    if (p.buffer_index >= local_buffers_.size()) {
+      MORI_UMBP_ERROR("[PoolClient] local Put: invalid buffer_index {}", p.buffer_index);
+      return false;
+    }
+    const auto& buf = local_buffers_[p.buffer_index];
     const uint64_t off = static_cast<uint64_t>(p.page_index) * page_size;
     if (!buf.base || page_size > buf.size || off > buf.size - page_size) {
       MORI_UMBP_ERROR("[PoolClient] local Put: OOB buf={} off={}", p.buffer_index, off);
@@ -578,11 +582,14 @@ bool PoolClient::LocalPutPages(const std::vector<PageLocation>& pages, uint64_t 
 
 bool PoolClient::LocalGetPages(const std::vector<PageLocation>& pages, uint64_t page_size,
                                void* dst, size_t size) {
-  if (!dram_backend_) return false;
   char* dst_bytes = static_cast<char*>(dst);
   for (size_t i = 0; i < pages.size(); ++i) {
     const auto& p = pages[i];
-    auto buf = dram_backend_->LocalBufferView(p.buffer_index);
+    if (p.buffer_index >= local_buffers_.size()) {
+      MORI_UMBP_ERROR("[PoolClient] local Get: invalid buffer_index {}", p.buffer_index);
+      return false;
+    }
+    const auto& buf = local_buffers_[p.buffer_index];
     const uint64_t off = static_cast<uint64_t>(p.page_index) * page_size;
     if (!buf.base || page_size > buf.size || off > buf.size - page_size) {
       MORI_UMBP_ERROR("[PoolClient] local Get: OOB buf={} off={}", p.buffer_index, off);
@@ -596,20 +603,20 @@ bool PoolClient::LocalGetPages(const std::vector<PageLocation>& pages, uint64_t 
 
 PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key, const void* src,
                                                           size_t size, TierType tier) {
-  if (!dram_backend_) {
-    MORI_UMBP_ERROR("[PoolClient] Local Put requested but DRAM backend unavailable");
+  if (registry_.Empty()) {
+    MORI_UMBP_ERROR("[PoolClient] Local Put requested but no storage backend is registered");
     return PutAttemptOutcome::kFatal;
   }
-  // The local fast path stays host-DRAM-only in this phase (design doc §5
-  // Phase 2): a tier this backend does not serve is rejected the same way
-  // the pre-refactor multi-tier allocator rejected an unconfigured tier
-  // (kRetry, i.e. try routing elsewhere) rather than treated as fatal.
-  if (tier != dram_backend_->Tier()) {
-    MORI_UMBP_WARN("[PoolClient] Local Put: tier={} not served by this backend (tier={})",
-                   static_cast<int>(tier), static_cast<int>(dram_backend_->Tier()));
+  // Dispatch on the routed tier (Phase 3) rather than assuming DRAM.  A tier
+  // with no live backend here is not fatal: kRetry routes the key elsewhere,
+  // the same way the pre-refactor allocator rejected an unconfigured tier.
+  auto* backend = registry_.Get(tier);
+  if (backend == nullptr || !CanCopyLocally(backend)) {
+    MORI_UMBP_WARN("[PoolClient] Local Put: tier={} has no locally-copyable backend",
+                   static_cast<int>(tier));
     return PutAttemptOutcome::kRetry;
   }
-  auto alloc_res = dram_backend_->Allocate(key, size);
+  auto alloc_res = backend->BatchAllocate({AllocateRequest{key, size}}).front();
   switch (alloc_res.outcome) {
     case AllocateOutcome::kSuccessAlreadyExists:
       return PutAttemptOutcome::kSuccessAlreadyExists;
@@ -620,13 +627,12 @@ PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key
     case AllocateOutcome::kSuccessAllocated:
       break;
   }
-  if (!LocalPutPages(alloc_res.pages, dram_backend_->PageSize(), src, size)) {
-    dram_backend_->Abort(alloc_res.slot_id);
+  if (!LocalPutPages(alloc_res.pages, alloc_res.page_size, src, size)) {
+    backend->BatchAbort({alloc_res.slot_id});
     return PutAttemptOutcome::kFatal;
   }
-  uint64_t committed_bytes = 0;
-  if (!dram_backend_->Commit(alloc_res.slot_id, key, committed_bytes)) {
-    dram_backend_->Abort(alloc_res.slot_id);
+  if (!backend->BatchCommit({CommitRequest{alloc_res.slot_id, key}}).front().success) {
+    backend->BatchAbort({alloc_res.slot_id});
     return PutAttemptOutcome::kFatal;
   }
   master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL,
@@ -640,16 +646,23 @@ PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key
 
 PoolClient::GetAttemptOutcome PoolClient::ExecuteLocalGet(const std::string& key, void* dst,
                                                           size_t size) {
-  if (!dram_backend_) {
-    MORI_UMBP_ERROR("[PoolClient] Local Get requested but DRAM backend unavailable");
+  if (registry_.Empty()) {
+    MORI_UMBP_ERROR("[PoolClient] Local Get requested but no storage backend is registered");
     return GetAttemptOutcome::kFatal;
   }
-  auto resolved = dram_backend_->Resolve(key);
-  if (!resolved.found) {
-    return GetAttemptOutcome::kRetry;
-  }
-  if (!LocalGetPages(resolved.pages, dram_backend_->PageSize(), dst, size)) {
-    return GetAttemptOutcome::kFatal;
+  // Get carries no tier — the key may be in any medium here, and mirrored
+  // across several.  Walk the peer-local read-rank order and take the first
+  // hit, matching what the peer service does for a remote reader.
+  for (auto* backend : registry_.ByReadRank()) {
+    auto resolved = backend->BatchResolve({key}, /*include_descs=*/false).front();
+    if (!resolved.found) continue;
+    // Only a locally-copyable medium can be served without the transfer
+    // engine; anything else degrades to kRetry (route elsewhere) until Phase 6.
+    if (!CanCopyLocally(backend)) return GetAttemptOutcome::kRetry;
+    if (!LocalGetPages(resolved.pages, resolved.page_size, dst, size)) {
+      return GetAttemptOutcome::kFatal;
+    }
+    break;
   }
   master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL,
                              MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL_HELP,
@@ -661,7 +674,7 @@ PoolClient::GetAttemptOutcome PoolClient::ExecuteLocalGet(const std::string& key
 }
 
 void PoolClient::MaybeReCacheAfterRemote(const std::string& key, const void* src, size_t size) {
-  if (!dram_backend_) return;  // no exportable local DRAM tier on this node
+  if (local_copy_backend_ == nullptr) return;  // no exportable local tier on this node
   // Admission gate (cache_remote_fetches / size==0 / NEVER / SIZE cap): shared
   // pure predicate, unit-tested in test_cache_remote_admission.cpp.
   if (!ShouldAdmitReCache(config_.cache_remote_fetches, config_.cache_remote_admission,
@@ -715,7 +728,7 @@ void PoolClient::ReCacheWorkerLoop() {
       job = std::move(recache_queue_.front());
       recache_queue_.pop_front();
     }
-    // Install into local DRAM. ExecuteLocalPut allocates a slot on dram_backend_,
+    // Install into local DRAM. ExecuteLocalPut allocates a slot on the routed backend,
     // copies the bytes, and Commit queues a KvEvent::ADD that reaches the master
     // via heartbeat — mirroring the local Put publish path. kSuccessAlreadyExists
     // makes this idempotent for a repeat remote read of the same key.
@@ -1405,7 +1418,7 @@ PoolClient::BatchGetPlan PoolClient::PartitionBatchGetTargets(
       continue;
     }
     if (i >= routes.size() || !routes[i].has_value()) {
-      if (dram_backend_) plan.local_indices.push_back(i);
+      if (local_copy_backend_ != nullptr) plan.local_indices.push_back(i);
       continue;
     }
     const auto& route = routes[i].value();

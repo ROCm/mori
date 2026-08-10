@@ -155,10 +155,16 @@ bool PageBackend::Init(TransferEngine* engine) {
     if (!handle.valid()) {
       MORI_UMBP_ERROR("[PageBackend] Init: host allocation failed for size={} tier={}", size,
                       static_cast<int>(tier_));
-      // Unwind whatever we already allocated in this call.
+      // Unwind whatever we already allocated in this call.  Deregister the
+      // MRs explicitly: owns_memory_ never becomes true on this path, so
+      // Shutdown() would early-return and leak them.
+      if (engine != nullptr) {
+        for (auto& mem : owned_mem_descs_) engine->Deregister(mem);
+      }
+      owned_mem_descs_.clear();
       for (auto& h : owned_buffer_handles_) allocator.Free(h);
       owned_buffer_handles_.clear();
-      owned_mem_descs_.clear();
+      engine_ = nullptr;
       return false;
     }
 
@@ -639,14 +645,19 @@ std::vector<BufferMemoryDescBytes> PageBackend::BufferDescsForPages(
   return BuildBufferDescsLocked(pages);
 }
 
-PageBackend::LocalBuffer PageBackend::LocalBufferView(uint32_t buffer_index) const {
+std::vector<PageBackend::LocalBuffer> PageBackend::LocalBufferViews() const {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (buffer_index >= buffer_bases_.size() || !allocator_) return {};
+  std::vector<LocalBuffer> out;
+  if (!allocator_) return out;
   const auto& buffers = allocator_->Buffers();
-  if (buffer_index >= buffers.size()) return {};
-  LocalBuffer out;
-  out.base = buffer_bases_[buffer_index];
-  out.size = static_cast<uint64_t>(buffers[buffer_index].total_pages) * page_size_;
+  const size_t n = std::min(buffer_bases_.size(), buffers.size());
+  out.reserve(n);
+  for (size_t i = 0; i < n; ++i) {
+    LocalBuffer view;
+    view.base = buffer_bases_[i];
+    view.size = static_cast<uint64_t>(buffers[i].total_pages) * page_size_;
+    out.push_back(view);
+  }
   return out;
 }
 
