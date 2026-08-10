@@ -100,9 +100,8 @@ TEST(BackendRegistryDispatch, RoutesByTierThroughTheInterfaceOnly) {
   hbm->BatchCommit({{allocated[0].slot_id, "key"}});
   EXPECT_EQ(hbm->OwnedKeyCount(), 1u);
 
-  EXPECT_EQ(registry.All().size(), 1u);
-  ASSERT_EQ(registry.ByReadRank().size(), 1u);
-  EXPECT_EQ(registry.ByReadRank()[0], hbm);
+  ASSERT_EQ(registry.All().size(), 1u);
+  EXPECT_EQ(registry.All()[0], hbm);
 }
 
 // ---- Heartbeat event aggregation -------------------------------------------

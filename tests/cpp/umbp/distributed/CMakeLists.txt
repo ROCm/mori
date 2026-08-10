@@ -319,12 +319,13 @@ target_link_libraries(test_ssd_copy_pipeline PRIVATE umbp_common
 target_compile_features(test_ssd_copy_pipeline PRIVATE cxx_std_17)
 add_test(NAME test_ssd_copy_pipeline COMMAND test_ssd_copy_pipeline)
 
-# test_tier_priority_route_get — RouteGet tier-priority strategy
-add_executable(test_tier_priority_route_get test_tier_priority_route_get.cpp)
-target_link_libraries(test_tier_priority_route_get PRIVATE umbp_common
+# test_local_preferring_route_get — RouteGet locality-preferring strategy
+# (replaces test_tier_priority_route_get: Phase 4 deleted the tier order)
+add_executable(test_local_preferring_route_get test_local_preferring_route_get.cpp)
+target_link_libraries(test_local_preferring_route_get PRIVATE umbp_common
                                                            GTest::gtest_main)
-target_compile_features(test_tier_priority_route_get PRIVATE cxx_std_17)
-add_test(NAME test_tier_priority_route_get COMMAND test_tier_priority_route_get)
+target_compile_features(test_local_preferring_route_get PRIVATE cxx_std_17)
+add_test(NAME test_local_preferring_route_get COMMAND test_local_preferring_route_get)
 
 # test_cache_remote_admission — cache_remote_fetches admission-gate unit test
 # (hermetic; no GPU/RDMA/master).

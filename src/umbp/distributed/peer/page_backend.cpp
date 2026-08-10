@@ -116,16 +116,6 @@ void PageBackend::InstallTierConfig(TierConfig cfg) {
 //  MediumBackend — identity + ownership
 // ---------------------------------------------------------------------------
 
-BackendProperties PageBackend::Properties() const {
-  BackendProperties p;
-  // HBM (rank 0) reads before DRAM (rank 1) when both are live and mirror a
-  // key — mirrors the pre-refactor TierPriorityRouteGetStrategy hardcode
-  // (HBM > DRAM > SSD); both tiers accept direct puts.
-  p.read_rank = (tier_ == TierType::HBM) ? 0 : 1;
-  p.put_eligible = true;
-  return p;
-}
-
 bool PageBackend::Init(TransferEngine* engine) {
   if (!ownership_.has_value()) {
     // Constructed with a pre-built TierConfig (test / legacy-direct path) —

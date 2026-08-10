@@ -96,11 +96,12 @@ void EvictionManager::RunOnce() {
 
   for (const auto& client : clients) {
     for (const auto& [tier, cap] : client.tier_capacities) {
-      // SSD eviction is purely peer-local.  Master must NOT turn an SSD
-      // overload into an EvictKey: EvictKey only acts on the peer's DRAM
-      // PageBackend, so it would wrongly evict the DRAM copy of the same
-      // key while leaving SSD untouched.
-      if (tier == TierType::SSD) continue;
+      // No tier is special-cased here any more (backend-agnostic refactor
+      // Phase 4).  The old `if (tier == SSD) continue` existed because EvictKey
+      // only ever reached the peer's DRAM allocator, so an SSD overload would
+      // have evicted the DRAM copy of the key instead; since Phase 3 EvictKey
+      // fans out to every backend by key, so an overloaded medium evicts from
+      // the medium that is actually overloaded.
       if (cap.total_bytes == 0) continue;
       uint64_t used = cap.total_bytes - cap.available_bytes;
       double usage = static_cast<double>(used) / static_cast<double>(cap.total_bytes);

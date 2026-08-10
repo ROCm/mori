@@ -133,7 +133,7 @@ TEST(CustomRouteGetStrategyTest, FallsBackToFirstWhenNoLocalReplica) {
 // ---- BatchSelect tests ----
 
 TEST(RouteGetBatchSelectTest, ReturnsOneResultPerKeyInOrder) {
-  TierPriorityRouteGetStrategy strategy;
+  LocalPreferringRouteGetStrategy strategy;
   std::vector<std::vector<Location>> per_key = {
       {MakeLoc("node-a", "loc-1")},
       {MakeLoc("node-b", "loc-2")},
@@ -162,17 +162,20 @@ TEST(RouteGetBatchSelectTest, EmptyCandidateListLeftAsDefault) {
   EXPECT_EQ(out[2].node_id, "node-c");
 }
 
-TEST(RouteGetBatchSelectTest, TierPriorityPicksFastestTierPerKey) {
-  TierPriorityRouteGetStrategy strategy;
-  Location hbm = MakeLoc("node-a", "loc-1");  // HBM by default in MakeLoc
-  Location ssd = MakeLoc("node-b", "loc-2");
-  ssd.tier = TierType::SSD;
+// Was TierPriorityPicksFastestTierPerKey.  Phase 4 deleted the tier order, so
+// what BatchSelect applies per key is the locality rule: the requester's own
+// replica wins even though it sits on the "slower" medium.
+TEST(RouteGetBatchSelectTest, AppliesLocalPreferencePerKey) {
+  LocalPreferringRouteGetStrategy strategy;
+  Location remote_hbm = MakeLoc("node-a", "loc-1");  // HBM by default in MakeLoc
+  Location local_ssd = MakeLoc("requester", "loc-2");
+  local_ssd.tier = TierType::SSD;
 
-  std::vector<std::vector<Location>> per_key = {{ssd, hbm}};
+  std::vector<std::vector<Location>> per_key = {{remote_hbm, local_ssd}};
   auto out = strategy.BatchSelect(per_key, "requester");
   ASSERT_EQ(out.size(), 1u);
-  EXPECT_EQ(out[0].tier, TierType::HBM);
-  EXPECT_EQ(out[0].node_id, "node-a");
+  EXPECT_EQ(out[0].node_id, "requester");
+  EXPECT_EQ(out[0].tier, TierType::SSD);
 }
 
 TEST(RouteGetBatchSelectTest, CustomStrategyUsesBaseDefaultLoop) {
