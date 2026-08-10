@@ -688,6 +688,10 @@ def make_combine(
     _unroll=4,
     rotate_combine_peer_order=False,
 ):
+    assert block_num <= xdb_flag_slots, (
+        f"combine block_num {block_num} exceeds xdb_flag_slots {xdb_flag_slots}: "
+        f"the per-block xdb flag array would overflow"
+    )
     # Transport dtype = external dtype, except fp8_direct_cast wires fp8 while
     # the output (comb_out) stays bf16 (2 i32 per fp8 i32 unit). fp4: i32 = 8 fp4.
     _to_accum2, _from_accum2, _zero_accum = _accum_funcs(

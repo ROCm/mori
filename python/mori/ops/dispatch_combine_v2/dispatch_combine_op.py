@@ -206,9 +206,14 @@ class EpDispatchCombineConfig:
                     "combine_data_type (asymmetric dtype) requires combine_mode=gather, "
                     "quant_type=none, enable_std_moe=False"
                 )
-            if torch.float4_e2m1fn_x2 in (self.dispatch_dtype, self.combine_dtype):
+            # fp4 DISPATCH + bf16 COMBINE (the SGLang/aiter fp4-asym path) is
+            # supported: dispatch is a plain byte-mover (hidden/2 B) with e8m0
+            # scales forwarded, combine stays bf16. fp4 on the combine side is
+            # not implemented for the asymmetric path.
+            if self.combine_dtype == torch.float4_e2m1fn_x2:
                 raise ValueError(
-                    "asymmetric dispatch/combine dtype does not support fp4"
+                    "asymmetric combine dtype does not support fp4 (fp4 dispatch "
+                    "+ bf16 combine is supported; fp4 combine is not)"
                 )
             if self.combine_token_nbytes % 16 != 0:
                 raise ValueError(
@@ -367,6 +372,11 @@ class EpDispatchCombineConfig:
     def dtype_str(self):
         """Token/dispatch dtype key for tuning_configs.lookup (fp4/fp8/default)."""
         if self.is_fp4:
+            # fp4 dispatch + non-fp4 combine (asymmetric) moves 2 B/elem on the
+            # combine side, so it needs the bf16 combine geometry, not the
+            # fp4-combine one -> its own "fp4_disp_bf16_comb" tuning key.
+            if self.combine_dtype != torch.float4_e2m1fn_x2:
+                return "fp4_disp_bf16_comb"
             return "fp4"
         if self.is_fp8:
             return "fp8"
