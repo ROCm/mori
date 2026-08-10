@@ -417,12 +417,23 @@ __device__ void EpDispatchIntraNodeSdmaKernel_body(EpDispatchCombineArgs<T> args
         unsigned long long groupMatchMask = matchMask & (0xffULL << groupBaseLane);
         bool groupHasTask = groupMatchMask != 0;
         int firstMatchLane = groupHasTask ? __ffsll(groupMatchMask) - 1 : -1;
+        bool taskLeader = groupLane == 0 && groupHasTask;
+        unsigned long long taskMask = __ballot(taskLeader);
+        int taskCount = __popcll(taskMask);
+        unsigned long long lowerLaneMask = laneId == 0 ? 0ULL : ((1ULL << laneId) - 1ULL);
+        int taskOffset = __popcll(taskMask & lowerLaneMask);
 
-        if (groupLane == 0 && groupHasTask) {
-          destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(queuePe), 1);
-          assert(destTokId < config.MaxNumTokensToRecv() &&
+        index_t baseDestTokId = 0;
+        if (laneId == 0 && taskCount > 0) {
+          baseDestTokId = atomicAdd(
+              args.dispTokOffsetMemObj->template GetAs<index_t*>(queuePe), taskCount);
+          assert(baseDestTokId + taskCount <= config.MaxNumTokensToRecv() &&
                  "Total recv token overflow: increase maxTotalRecvTokens");
-          atomicAdd(args.destPeTokenCounter + queuePe, 1);
+          atomicAdd(args.destPeTokenCounter + queuePe, taskCount);
+        }
+        baseDestTokId = __shfl(baseDestTokId, 0);
+        if (taskLeader) {
+          destTokId = baseDestTokId + taskOffset;
           args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(queuePe)[destTokId] =
               FlatTokenIndex(config, myPe, srcTokId);
         }
@@ -451,10 +462,6 @@ __device__ void EpDispatchIntraNodeSdmaKernel_body(EpDispatchCombineArgs<T> args
           }
         }
 
-        bool taskLeader = groupLane == 0 && groupHasTask;
-        unsigned long long taskMask = __ballot(taskLeader);
-        int taskCount = __popcll(taskMask);
-        int taskOffset = __popcll(taskMask & ((1ULL << laneId) - 1ULL));
         int tail = 0;
         if (laneId == 0 && taskCount > 0) {
           tail = __hip_atomic_load(producerTail + metadataWarpId, __ATOMIC_RELAXED,
