@@ -105,6 +105,17 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   MORI_TRACE_NEXT(seq, Slot::DispatchSendTokens);
 #ifdef ENABLE_PROFILER
   if (false) {
+    MORI_TRACE_INSTANT(profiler, Slot::DispatchSdmaActiveCountBit0);
+    MORI_TRACE_INSTANT(profiler, Slot::DispatchSdmaActiveCountBit1);
+    MORI_TRACE_INSTANT(profiler, Slot::DispatchSdmaActiveCountBit2);
+    MORI_TRACE_INSTANT(profiler, Slot::DispatchSdmaActiveCountBit3);
+    MORI_TRACE_INSTANT(profiler, Slot::DispatchSdmaActiveCountBit4);
+    MORI_TRACE_INSTANT(profiler, Slot::DispatchSdmaActiveCountBit5);
+    MORI_TRACE_INSTANT(profiler, Slot::DispatchSdmaSubmitCall);
+  }
+#endif
+#ifdef ENABLE_PROFILER
+  if (false) {
     MORI_TRACE_INSTANT(profiler, Slot::DispatchSdmaReserve);
     MORI_TRACE_INSTANT(profiler, Slot::DispatchSdmaPlacePacket);
     MORI_TRACE_INSTANT(profiler, Slot::DispatchSdmaSubmitPacket);
@@ -382,77 +393,86 @@ __device__ void EpDispatchIntraNodeSdmaKernel_body(EpDispatchCombineArgs<T> args
       int metadataWarpId = warpId - 1;
       int globalMetadataWarpId = blockIdxForQueuePe * metadataWarpNumPerBlock + metadataWarpId;
       int globalMetadataWarpNum = blocksForQueuePe * metadataWarpNumPerBlock;
-      for (int i = globalMetadataWarpId; i < args.curRankNumToken * config.numExpertPerToken;
-           i += globalMetadataWarpNum) {
-        index_t srcTokId = i / config.numExpertPerToken;
-        index_t destExpert = args.tokenIndices[i];
+      constexpr int kMetadataGroupSize = 8;
+      constexpr int kMetadataGroupsPerWarp = warpSize / kMetadataGroupSize;
+      static_assert(warpSize == 64, "subgroup metadata path requires wave64");
+      assert(config.numExpertPerToken == kMetadataGroupSize);
+      int groupId = laneId / kMetadataGroupSize;
+      int groupLane = laneId & (kMetadataGroupSize - 1);
+      int groupBaseLane = groupId * kMetadataGroupSize;
+      for (index_t srcTokBase = globalMetadataWarpId * kMetadataGroupsPerWarp;
+           srcTokBase < args.curRankNumToken;
+           srcTokBase += globalMetadataWarpNum * kMetadataGroupsPerWarp) {
+        index_t srcTokId = srcTokBase + groupId;
+        bool hasToken = srcTokId < args.curRankNumToken;
+        index_t i = srcTokId * config.numExpertPerToken + groupLane;
+        index_t destExpert = hasToken ? args.tokenIndices[i] : 0;
         index_t destPe = destExpert / config.numExpertPerRank;
         index_t destTokId = 0;
+        bool validDest = hasToken && destPe >= 0 && destPe < config.worldSize;
+        if (hasToken && !validDest)
+          args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
+        bool matchesQueue = validDest && destPe == queuePe;
+        unsigned long long matchMask = __ballot(matchesQueue);
+        unsigned long long groupMatchMask = matchMask & (0xffULL << groupBaseLane);
+        bool groupHasTask = groupMatchMask != 0;
+        int firstMatchLane = groupHasTask ? __ffsll(groupMatchMask) - 1 : -1;
 
-        if ((destPe < 0) || (destPe >= config.worldSize)) {
-          if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
-          continue;
-        }
-        if (destPe != queuePe) {
-          continue;
-        }
-
-        assert(config.numExpertPerToken < warpSize);
-        int condition = 0;
-        if (laneId < (i % config.numExpertPerToken)) {
-          condition = destPe == (args.tokenIndices[srcTokId * config.numExpertPerToken + laneId] /
-                                 config.numExpertPerRank);
-        }
-        if (__any(condition)) {
-          if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
-          continue;
-        }
-
-        if (laneId == 0) {
-          destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
+        if (groupLane == 0 && groupHasTask) {
+          destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(queuePe), 1);
           assert(destTokId < config.MaxNumTokensToRecv() &&
                  "Total recv token overflow: increase maxTotalRecvTokens");
-          atomicAdd(args.destPeTokenCounter + destPe, 1);
-          args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, destTokId);
-          args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
+          atomicAdd(args.destPeTokenCounter + queuePe, 1);
+          args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(queuePe)[destTokId] =
               FlatTokenIndex(config, myPe, srcTokId);
         }
-        destTokId = __shfl(destTokId, 0);
+        destTokId = __shfl(destTokId, groupBaseLane);
+        if (matchesQueue)
+          args.dispDestTokIdMap[i] = laneId == firstMatchLane
+                                         ? FlatTokenIndex(config, queuePe, destTokId)
+                                         : FlatTokenIndex(config, config.worldSize, 0);
 
-        if (laneId < config.numExpertPerToken) {
+        if (groupHasTask) {
           if (args.weightsBuf) {
             args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(
-                destPe)[destTokId * config.numExpertPerToken + laneId] =
-                args.weightsBuf[srcTokId * config.numExpertPerToken + laneId];
+                queuePe)[destTokId * config.numExpertPerToken + groupLane] =
+                args.weightsBuf[srcTokId * config.numExpertPerToken + groupLane];
           }
           args.shmemOutIndicesMemObj->template GetAs<index_t*>(
-              destPe)[destTokId * config.numExpertPerToken + laneId] =
-              args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
+              queuePe)[destTokId * config.numExpertPerToken + groupLane] =
+              args.tokenIndices[srcTokId * config.numExpertPerToken + groupLane];
+          if (args.scalesBuf && config.scaleDim > 0 && config.scaleTypeSize > 0) {
+            size_t scaleBytes = config.scaleDim * config.scaleTypeSize;
+            uint8_t* dst = args.shmemOutScalesMemObj->template GetAs<uint8_t*>(queuePe) +
+                           static_cast<size_t>(destTokId) * scaleBytes;
+            const uint8_t* src = args.scalesBuf + static_cast<size_t>(srcTokId) * scaleBytes;
+            for (size_t byte = groupLane; byte < scaleBytes; byte += kMetadataGroupSize)
+              dst[byte] = src[byte];
+          }
         }
 
-        if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
-          size_t destScaleOffset = static_cast<size_t>(destTokId) * config.scaleDim *
-                                   config.scaleTypeSize;
-          size_t srcScaleOffset = static_cast<size_t>(srcTokId) * config.scaleDim *
-                                  config.scaleTypeSize;
-          core::WarpCopy(
-              args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destScaleOffset,
-              args.scalesBuf + srcScaleOffset, config.scaleDim * config.scaleTypeSize);
-        }
-
-        if (laneId == 0) {
-          int tail = __hip_atomic_load(producerTail + metadataWarpId, __ATOMIC_RELAXED,
-                                       __HIP_MEMORY_SCOPE_WORKGROUP);
+        bool taskLeader = groupLane == 0 && groupHasTask;
+        unsigned long long taskMask = __ballot(taskLeader);
+        int taskCount = __popcll(taskMask);
+        int taskOffset = __popcll(taskMask & ((1ULL << laneId) - 1ULL));
+        int tail = 0;
+        if (laneId == 0 && taskCount > 0) {
+          tail = __hip_atomic_load(producerTail + metadataWarpId, __ATOMIC_RELAXED,
+                                   __HIP_MEMORY_SCOPE_WORKGROUP);
           int head = 0;
           do {
             head = __hip_atomic_load(producerHead + metadataWarpId, __ATOMIC_ACQUIRE,
                                      __HIP_MEMORY_SCOPE_WORKGROUP);
-          } while (tail - head >= kSlotsPerProducer);
-          sdmaTasks[metadataWarpId][tail % kSlotsPerProducer] = {
-              srcTokId, destTokId, static_cast<int>(destPe)};
-          __hip_atomic_store(producerTail + metadataWarpId, tail + 1, __ATOMIC_RELEASE,
-                             __HIP_MEMORY_SCOPE_WORKGROUP);
+          } while (tail + taskCount - head > kSlotsPerProducer);
         }
+        tail = __shfl(tail, 0);
+        if (taskLeader)
+          sdmaTasks[metadataWarpId][(tail + taskOffset) % kSlotsPerProducer] = {
+              srcTokId, destTokId, queuePe};
+        __builtin_amdgcn_wave_barrier();
+        if (laneId == 0 && taskCount > 0)
+          __hip_atomic_store(producerTail + metadataWarpId, tail + taskCount, __ATOMIC_RELEASE,
+                             __HIP_MEMORY_SCOPE_WORKGROUP);
       }
       if (laneId == 0) {
         __hip_atomic_store(producerDone + metadataWarpId, 1, __ATOMIC_RELEASE,
@@ -494,6 +514,15 @@ __device__ void EpDispatchIntraNodeSdmaKernel_body(EpDispatchCombineArgs<T> args
         int activeBefore = __popcll(selectedMask & lowerMask);
         if (activeCount > 0) {
           if (laneId == 0) submittedCount += activeCount;
+          if (laneId == 0) {
+            IF_ENABLE_PROFILER(MORI_TRACE_INSTANT(profiler, Slot::DispatchSdmaSubmitCall));
+            if (activeCount & 1) IF_ENABLE_PROFILER(MORI_TRACE_INSTANT(profiler, Slot::DispatchSdmaActiveCountBit0));
+            if (activeCount & 2) IF_ENABLE_PROFILER(MORI_TRACE_INSTANT(profiler, Slot::DispatchSdmaActiveCountBit1));
+            if (activeCount & 4) IF_ENABLE_PROFILER(MORI_TRACE_INSTANT(profiler, Slot::DispatchSdmaActiveCountBit2));
+            if (activeCount & 8) IF_ENABLE_PROFILER(MORI_TRACE_INSTANT(profiler, Slot::DispatchSdmaActiveCountBit3));
+            if (activeCount & 16) IF_ENABLE_PROFILER(MORI_TRACE_INSTANT(profiler, Slot::DispatchSdmaActiveCountBit4));
+            if (activeCount & 32) IF_ENABLE_PROFILER(MORI_TRACE_INSTANT(profiler, Slot::DispatchSdmaActiveCountBit5));
+          }
           IF_ENABLE_PROFILER(MORI_TRACE_SPAN(profiler, Slot::DispatchSdmaSubmit));
           EpDispatchIntraNodeSdmaSubmitMappedWave(args, queuePe, task.destPe, task.srcTokId,
                                                   task.destTokId, activeCount, activeBefore,
