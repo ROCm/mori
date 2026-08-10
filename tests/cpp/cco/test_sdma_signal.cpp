@@ -242,7 +242,10 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
             char what[96];
             snprintf(what, sizeof(what), "A[scope=%d q=%d agg=%d %zuB]", scope, q, agg, bytes);
             if (verbose) printf("[rank %d] %s\n", rank, what), fflush(stdout);
+            // hipMemset is async and ccoBarrierAll syncs hosts only; a late fill
+            // clobbers a peer's put.
             HIP_CHECK(hipMemset(recvBuf, 0xff, BUF_BYTES));
+            HIP_CHECK(hipDeviceSynchronize());
             mori::cco::ccoBarrierAll(comm);
 #define MATRIX_LAUNCH(FLAGS)                                            \
   do {                                                                  \
@@ -293,6 +296,7 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
       if (verbose) printf("[rank %d] %s\n", rank, tag), fflush(stdout);
       HIP_CHECK(hipMemset(recvBuf, 0xff, BUF_BYTES));
       HIP_CHECK(hipMemset(devRes, 0, sizeof(SignalResult)));
+      HIP_CHECK(hipDeviceSynchronize());
       mori::cco::ccoBarrierAll(comm);  // before the puts, not before the verify
       if (mode == 0)
         SdmaSignalKernel<false, true>
@@ -352,12 +356,16 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
     bool okE = true;
     if (strchr(parts, 'E')) {
       const size_t kChunk = 256;
+      hipDeviceProp_t props{};
+      HIP_CHECK(hipGetDeviceProperties(&props, rank % numDevices));
+      const int waveSize = props.warpSize;
       HSAuint64* slot = devComm.sdma.signalBuf + devComm.lsaRank * nq;  // queue 0
       for (int lanes : {1, 2, 8, 64}) {
         for (int perCopy = 0; perCopy < 2; perCopy++) {
           uint64_t before = 0, after = 0;
           HIP_CHECK(hipMemcpy(&before, slot, sizeof(before), hipMemcpyDeviceToHost));
           HIP_CHECK(hipMemset(recvBuf, 0xff, BUF_BYTES));
+          HIP_CHECK(hipDeviceSynchronize());
           mori::cco::ccoBarrierAll(comm);
           if (perCopy)
             SdmaGroupSignalKernel<mori::cco::ccoSdmaOptFlagsSignalPerCopy>
@@ -369,7 +377,10 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
           mori::cco::ccoBarrierAll(comm);
           HIP_CHECK(hipMemcpy(&after, slot, sizeof(after), hipMemcpyDeviceToHost));
 
-          const uint64_t want = perCopy ? static_cast<uint64_t>(lanes) : 1;
+          // One signal per wavefront, so a lane count above the wave width is
+          // several groups. wave64 folds this back to 1.
+          const uint64_t waves = (lanes + waveSize - 1) / waveSize;
+          const uint64_t want = perCopy ? static_cast<uint64_t>(lanes) : waves;
           if (after - before != want) {
             fprintf(stderr, "[rank %d] E[%s lanes=%d] signal advanced by %lu, want %lu\n", rank,
                     perCopy ? "per-copy" : "group", lanes, after - before, want);

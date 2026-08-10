@@ -30,6 +30,7 @@ from tests.python.ops.dispatch_combine_test_utils import (
     format_scale_stats_report,
 )
 from tests.python.utils import TorchDistContext, get_free_port
+from tests.python.perf_report import dtype_label, record_perf
 import torch
 import torch.distributed as dist
 import os
@@ -37,6 +38,46 @@ import os
 os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "6G")
 
 _BW_NOISE_MARGIN = 1.0
+
+
+def _emit_intra_perf(
+    bench_stats,
+    world_size,
+    max_num_inp_token_per_rank,
+    hidden_dim,
+    data_type,
+    combine_data_type,
+    quant_type,
+    zero_copy,
+    num_experts_per_rank,
+    num_experts_per_token,
+):
+    """Emit an intra-node EP dispatch/combine perf record (rank 0 only).
+
+    ``bench_stats`` is the tuple returned by ``EpDispatchCombineBenchmark.run``:
+    ``(max_disp_algo_bw, max_comb_algo_bw, min_disp_latency_us, min_comb_latency_us)``.
+    """
+    disp_bw, comb_bw, disp_lat, comb_lat = bench_stats
+    record_perf(
+        category="intra_ep",
+        params={
+            "world_size": world_size,
+            "max_tokens": max_num_inp_token_per_rank,
+            "hidden_dim": hidden_dim,
+            "dtype": dtype_label(data_type),
+            "combine_dtype": dtype_label(combine_data_type),
+            "quant_type": quant_type,
+            "zero_copy": bool(zero_copy),
+            "num_experts_per_rank": num_experts_per_rank,
+            "num_experts_per_token": num_experts_per_token,
+        },
+        metrics={
+            "dispatch_bw_gbps": round(float(disp_bw), 2),
+            "combine_bw_gbps": round(float(comb_bw), 2),
+            "dispatch_lat_us": round(float(disp_lat), 2),
+            "combine_lat_us": round(float(comb_lat), 2),
+        },
+    )
 
 
 class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
@@ -52,8 +93,10 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         force_scale_active=False,
         report_scale_stats=False,
         combine_scale_dim=None,
+        routing="random",
     ):
         super().__init__(config)
+        self.routing = routing
         self.combine_data_type = (
             combine_data_type if combine_data_type is not None else config.data_type
         )
@@ -83,6 +126,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         self.config.hidden_dim = self.dispatch_hidden_dim
         result = super().gen_test_data(
             use_max_token_num=True,
+            routing=self.routing,
             input_dist=self.input_dist,
             input_scale=self.input_scale,
             input_shift=self.input_shift,
@@ -481,6 +525,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         graph_replay_iters=10,
         skip_e2e=False,
         call_local_expert_count=False,
+        verify=True,
     ):
         test_data = self.gen_test_data()
         for _ in range(warmup):
@@ -491,6 +536,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 dispatch_warp_per_block,
                 combine_block_num,
                 combine_warp_per_block,
+                check=verify,
                 call_local_expert_count=call_local_expert_count,
             )
 
@@ -731,6 +777,8 @@ def _save_intranode_tuning_result(
     zero_copy=True,
     best_disp_lat=None,
     best_comb_lat=None,
+    kernel_type_str="IntraNode",
+    topk=None,
 ):
     from pathlib import Path
     from mori.ops.tuning_config import (
@@ -751,7 +799,7 @@ def _save_intranode_tuning_result(
     metadata = {
         "gpu_arch": gpu_arch,
         "gpu_model": gpu_model,
-        "kernel_type": "IntraNode",
+        "kernel_type": kernel_type_str,
         "ep_size": world_size,
     }
 
@@ -759,6 +807,7 @@ def _save_intranode_tuning_result(
         "dtype": disp_dtype_str,
         "num_tokens": max_num_inp_token_per_rank,
         "hidden_dim": dispatch_hidden_dim,
+        "topk": topk,
         "block_num": best_disp_config[0],
         "rdma_block_num": 0,
         "warp_per_block": best_disp_config[1],
@@ -770,6 +819,7 @@ def _save_intranode_tuning_result(
         "dtype": comb_dtype_str,
         "num_tokens": max_num_inp_token_per_rank,
         "hidden_dim": combine_hidden_dim,
+        "topk": topk,
         "zero_copy": bool(zero_copy),
         "quant_type": qt_str,
         "block_num": best_comb_config[0],
@@ -791,7 +841,7 @@ def _save_intranode_tuning_result(
             repo_tuning_dir
             / build_config_filename(
                 gpu_arch,
-                "IntraNode",
+                kernel_type_str,
                 world_size,
                 gpu_model,
                 "dispatch",
@@ -801,7 +851,7 @@ def _save_intranode_tuning_result(
             repo_tuning_dir
             / build_config_filename(
                 gpu_arch,
-                "IntraNode",
+                kernel_type_str,
                 world_size,
                 gpu_model,
                 "combine",
@@ -841,12 +891,65 @@ LaunchConfig = namedtuple(
 )
 
 
+def _optional_kwargs(**kwargs):
+    """Drop keys whose value is None, so the callee's own default applies."""
+    return {k: v for k, v in kwargs.items() if v is not None}
+
+
+def _fmt_geo(block_num, warp_per_block):
+    """Render a geometry for the banner, which prints before anything has been resolved.
+
+    0 is not a grid, it is the caller declining to pick one, and printing it as a number reads as
+    if the kernel were launched with no blocks. What the library chose instead is only known once
+    a launch has gone through, so it is reported after the run rather than guessed at here.
+    """
+    if block_num > 0 and warp_per_block > 0:
+        return f"{block_num}x{warp_per_block}"
+    return "library default"
+
+
+def _print_resolved_geo(op):
+    """The geometry a run actually used, read back from the launch path that resolved it.
+
+    Recomputing it here would mean restating _resolve_launch_params' inputs -- including the
+    is_push test, which reads use_ext, kernel_type and quant_type together -- and a restatement is
+    what put an unlaunchable 192x32 in the default table to begin with.
+    """
+    d = getattr(op, "_cached_dispatch_launch", None)
+    c = getattr(op, "_cached_combine_launch", None)
+    if d is None and c is None:
+        return
+    parts = []
+    if d is not None:
+        parts.append(f"dispatch {d[0]}x{d[2]}")
+    if c is not None:
+        parts.append(f"combine {c[0]}x{c[2]}")
+    print(f"Resolved launch geometry: {', '.join(parts)}")
+
+
 def _get_default_launch_config(
     world_size,
     max_num_inp_token_per_rank,
     use_external_inp_buf,
 ):
     zero_copy = not use_external_inp_buf
+    # Every number below was tuned on gfx942. gfx125x keeps its geometry in the library instead --
+    # _intranode_{dispatch,combine}_default_launch, keyed on the same arch test the kernel uses to
+    # pick its body -- and 0 is how a caller tells _resolve_launch_params it has no opinion and
+    # reaches them. So this table is not consulted there at all, rather than being consulted and
+    # then corrected in one of its cells.
+    #
+    # It was corrected in one cell, and both halves of that went wrong. The zero-copy cell was given
+    # 192x32, true when written, then dispatch moved to the TDM body that stages one token tile per
+    # warp and 32 warps became a 458,752 B request against a 327,680 B budget -- a default that
+    # cannot launch. The other cell was left alone and still hands gfx1250 a 256x14 combine, which
+    # measures 219.4us / 967.5 GB/s against the library default's 191.1us / 1111.0 GB/s at EP4 4K
+    # bf16 hidden 7168, both check-armed. A per-arch exception inside a per-arch table is the shape
+    # of the mistake; the arch owns its defaults or it does not.
+    from mori.ops.dispatch_combine import _is_gfx125x
+
+    if _is_gfx125x():
+        return LaunchConfig(0, 0, 0, 0)
     if world_size <= 4:
         if max_num_inp_token_per_rank > 128:
             return (
@@ -898,6 +1001,12 @@ def _bench_dispatch_combine(
     input_shift=0.0,
     force_scale_active=False,
     report_scale_stats=False,
+    kernel_type_str="IntraNode",
+    warmup=None,
+    iters=None,
+    verify=True,
+    routing="random",
+    graph_replay_iters=None,
 ):
     if combine_data_type is None:
         combine_data_type = data_type
@@ -908,6 +1017,12 @@ def _bench_dispatch_combine(
         combine_hidden_dim = hidden_dim // 2
     else:
         combine_hidden_dim = hidden_dim
+
+    _kernel_type_map = {
+        "IntraNode": mori.ops.EpDispatchCombineKernelType.IntraNode,
+        "IntraNodeLL": mori.ops.EpDispatchCombineKernelType.IntraNodeLL,
+    }
+    kernel_type_enum = _kernel_type_map[kernel_type_str]
 
     if quant_type == "fp8_direct_cast" and combine_data_type is not torch.bfloat16:
         raise ValueError(
@@ -940,9 +1055,11 @@ def _bench_dispatch_combine(
         use_external_inp_buf=not zero_copy,  # zero-copy mode requires use_external_inp_buf=False
         gpu_per_node=world_size,
         quant_type=quant_type,
+        kernel_type=kernel_type_enum,
     )
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
-        mori.shmem.shmem_torch_process_group_init("default")
+        if os.environ.get("MORI_EP_COMM", "").strip().lower() != "cco":
+            mori.shmem.shmem_torch_process_group_init("default")
         op = mori.ops.EpDispatchCombineOp(config)
         # For fp8_blockwise, plumb the kernel-internal scale_dim into the
         # benchmark so force_scale_active sentinels and report_scale_stats
@@ -963,6 +1080,7 @@ def _bench_dispatch_combine(
             force_scale_active=force_scale_active,
             report_scale_stats=report_scale_stats,
             combine_scale_dim=bench_combine_scale_dim,
+            routing=routing,
         )
 
         (
@@ -990,24 +1108,45 @@ def _bench_dispatch_combine(
             if rank == 0:
                 print(f"\n{'=' * 60}")
                 print(
-                    f"Benchmarking with dispatch_block_num={dispatch_block_num}, dispatch_warp_per_block={dispatch_warp_per_block} combine_block_num={combine_block_num}, combine_warp_per_block={combine_warp_per_block}"
+                    f"Benchmarking with dispatch {_fmt_geo(dispatch_block_num, dispatch_warp_per_block)}, "
+                    f"combine {_fmt_geo(combine_block_num, combine_warp_per_block)}"
                 )
                 print(f"{'=' * 60}")
-            benchmark.run(
+            bench_stats = benchmark.run(
                 op,
                 dispatch_block_num=dispatch_block_num,
                 dispatch_warp_per_block=dispatch_warp_per_block,
                 combine_block_num=combine_block_num,
                 combine_warp_per_block=combine_warp_per_block,
                 call_local_expert_count=call_local_expert_count,
+                verify=verify,
+                **_optional_kwargs(
+                    warmup=warmup, iters=iters, graph_replay_iters=graph_replay_iters
+                ),
             )
+            if rank == 0:
+                _print_resolved_geo(op)
+            if rank == 0 and bench_stats is not None:
+                _emit_intra_perf(
+                    bench_stats,
+                    world_size=world_size,
+                    max_num_inp_token_per_rank=max_num_inp_token_per_rank,
+                    hidden_dim=hidden_dim,
+                    data_type=data_type,
+                    combine_data_type=combine_data_type,
+                    quant_type=quant_type,
+                    zero_copy=zero_copy,
+                    num_experts_per_rank=num_experts_per_rank,
+                    num_experts_per_token=num_experts_per_token,
+                )
 
         elif cmd == "stress":
             # Stress test
             if rank == 0:
                 print(f"\n{'=' * 60}")
                 print(
-                    f"Stress testing with dispatch_block_num={dispatch_block_num}, dispatch_warp_per_block={dispatch_warp_per_block} combine_block_num={combine_block_num}, combine_warp_per_block={combine_warp_per_block}"
+                    f"Stress testing with dispatch {_fmt_geo(dispatch_block_num, dispatch_warp_per_block)}, "
+                    f"combine {_fmt_geo(combine_block_num, combine_warp_per_block)}"
                 )
                 print(f"{'=' * 60}")
             benchmark.stress(
@@ -1023,7 +1162,8 @@ def _bench_dispatch_combine(
             if rank == 0:
                 print(f"\n{'=' * 60}")
                 print(
-                    f"Profiling with dispatch_block_num={dispatch_block_num}, dispatch_warp_per_block={dispatch_warp_per_block} combine_block_num={combine_block_num}, combine_warp_per_block={combine_warp_per_block}"
+                    f"Profiling with dispatch {_fmt_geo(dispatch_block_num, dispatch_warp_per_block)}, "
+                    f"combine {_fmt_geo(combine_block_num, combine_warp_per_block)}"
                 )
                 print(f"{'=' * 60}")
             benchmark.profile(
@@ -1033,6 +1173,7 @@ def _bench_dispatch_combine(
                 combine_block_num=combine_block_num,
                 combine_warp_per_block=combine_warp_per_block,
                 call_local_expert_count=call_local_expert_count,
+                **_optional_kwargs(warmup=warmup, capture_iters=iters),
             )
 
         elif cmd == "tuning":
@@ -1205,6 +1346,8 @@ def _bench_dispatch_combine(
                         zero_copy=bool(zero_copy),
                         best_disp_lat=best_disp_lat,
                         best_comb_lat=best_comb_lat,
+                        kernel_type_str=kernel_type_str,
+                        topk=num_experts_per_token,
                     )
 
         else:
@@ -1236,6 +1379,12 @@ def bench_dispatch_combine(
     input_shift=0.0,
     force_scale_active=False,
     report_scale_stats=False,
+    kernel_type_str="IntraNode",
+    warmup=None,
+    iters=None,
+    verify=True,
+    routing="random",
+    graph_replay_iters=None,
 ):
     if combine_data_type is None:
         combine_data_type = dtype
@@ -1268,6 +1417,12 @@ def bench_dispatch_combine(
             input_shift,
             force_scale_active,
             report_scale_stats,
+            kernel_type_str,
+            warmup,
+            iters,
+            verify,
+            routing,
+            graph_replay_iters,
         ),
         nprocs=world_size,
         join=True,
@@ -1414,6 +1569,13 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--kernel-type",
+        type=str,
+        default="IntraNode",
+        choices=["IntraNode", "IntraNodeLL"],
+        help="Kernel type to tune (default: IntraNode)",
+    )
+    parser.add_argument(
         "--input-dist",
         type=str,
         default="normal",
@@ -1468,6 +1630,59 @@ if __name__ == "__main__":
             "p50/p90/p99/max) for the generated input."
         ),
     )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=None,
+        help=(
+            "Number of warmup iterations before timing. Applies to --cmd bench "
+            "(default: 1) and --cmd profile (default: 5);"
+        ),
+    )
+    parser.add_argument(
+        "--iters",
+        type=int,
+        default=None,
+        help=(
+            "Number of timed/captured iterations. Applies to --cmd bench "
+            "(default: 10) and --cmd profile (default: 3) "
+        ),
+    )
+    parser.add_argument(
+        "--graph-replay-iters",
+        type=int,
+        default=None,
+        help=(
+            "Number of times each captured CUDA graph is replayed per "
+            "timed --iters sample (default: 10). --cmd bench only"
+        ),
+    )
+    parser.add_argument(
+        "--routing",
+        type=str,
+        default="random",
+        choices=[
+            "random",
+            "round_robin",
+            "remote_round_robin",
+            "spread",
+            "all_to_one",
+        ],
+        help=(
+            "Token-to-expert routing pattern used to generate test data "
+            "(default: random)"
+        ),
+    )
+    parser.add_argument(
+        "--verify",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help=(
+            "When 1 (default), verify dispatch/combine correctness during "
+            "warmup. --cmd bench only"
+        ),
+    )
     args = parser.parse_args()
 
     if args.num_experts_per_rank is None:
@@ -1510,7 +1725,8 @@ if __name__ == "__main__":
         f"dispatch_block_num: {args.dispatch_block_num}, "
         f"dispatch_warp_per_block: {args.dispatch_warp_per_block}, "
         f"combine_block_num: {args.combine_block_num}, "
-        f"combine_warp_per_block: {args.combine_warp_per_block}"
+        f"combine_warp_per_block: {args.combine_warp_per_block}, "
+        f"graph_replay_iters: {args.graph_replay_iters}"
     )
     print("-" * 60)
     bench_dispatch_combine(
@@ -1537,4 +1753,10 @@ if __name__ == "__main__":
         input_shift=args.input_shift,
         force_scale_active=bool(args.force_scale_active),
         report_scale_stats=bool(args.report_scale_stats),
+        kernel_type_str=args.kernel_type,
+        warmup=args.warmup,
+        iters=args.iters,
+        verify=bool(args.verify),
+        routing=args.routing,
+        graph_replay_iters=args.graph_replay_iters,
     )

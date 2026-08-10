@@ -32,6 +32,7 @@ import flydsl.expr as fx
 from mori.tensor_utils import from_gpu_ptr
 
 from .intranode_kernels import (
+    xdb_flag_slots,
     make_dispatch,
     make_combine,
     make_combine_scatter,
@@ -528,7 +529,13 @@ class EpDispatchCombineOp:
         self.dispatch_barrier = torch.zeros(1, dtype=torch.int32, device=device)
         self.total_recv = torch.zeros(1, dtype=torch.int32, device=device)
         self.combine_barrier = torch.zeros(1, dtype=torch.int32, device=device)
-        self.cross_device_flag = torch.ones(1, dtype=torch.int64, device=device)
+        # Per-block xdb flag counters for the gather combine entry barrier: one
+        # i64 per block, fixed at xdb_flag_slots (== CU count, the max combine
+        # block_num). Every block owns a private counter and block 0 fills the
+        # unused tail so all stay in lockstep across calls with different block_num.
+        self.cross_device_flag = torch.ones(
+            xdb_flag_slots, dtype=torch.int64, device=device
+        )
         c_dt = cfg.combine_dtype  # combine output dtype
         c_elem = cfg.combine_elem_size
         if c_dt == torch.float4_e2m1fn_x2:  # fp4 combine outputs fp4 (hidden/2 B/token)
@@ -728,7 +735,14 @@ class EpDispatchCombineOp:
         )
 
     def combine_in_view(self):
-        """out_tok as combine dtype [max_recv, hidden] — combine()'s copy target."""
+        """Symmetric buffer [max_recv, hidden] that gather-mode combine reads
+        from via P2P.  Scatter mode uses a different staging layout (comb_inp)
+        and cannot use this buffer.
+
+        To skip the d2d copy inside combine(), write expert output directly
+        into this view (e.g. point the GEMM output pointer here), then pass
+        it as the ``input`` argument to combine().  combine() detects the
+        matching data_ptr and elides the copy."""
         cdt = self.cfg.combine_dtype
         cols = (
             self.cfg.hidden_dim // 2
@@ -886,12 +900,17 @@ class EpDispatchCombineOp:
                 stream,
             )
         else:
+            dest_map = (
+                torch.full_like(self.token_dest_map, -1)
+                if return_routing
+                else self.token_dest_map
+            )
             self._dispatch_variants[disp_spec](
                 self.arena.handle,
                 input.data_ptr(),
                 indices.data_ptr(),
                 weight_ptr,
-                self.token_dest_map.data_ptr(),
+                dest_map.data_ptr(),
                 self.dest_pe_counter.data_ptr(),
                 self.dispatch_barrier.data_ptr(),
                 self.total_recv.data_ptr(),
@@ -909,13 +928,11 @@ class EpDispatchCombineOp:
         if not return_routing:
             return base
 
-        # Pass a live arena view; the reverse map is cloned lazily on first
-        # access (post-barrier), see EpDispatchRoutingHandle.
         recv_to_src_view = from_gpu_ptr(
             self.arena.local_ptr("recv_to_src_token"), (self._recv_cap,), torch.int32
         )
         routing = EpDispatchRoutingHandle(
-            disp_dest_tok_id_map=self.token_dest_map.clone(),
+            disp_dest_tok_id_map=dest_map,
             inter_node_disp_dest_tok_id_map=self._empty_i32,
             inter_node_disp_send_map=self._empty_i32,
             total_recv_token_num=self.total_recv,
@@ -940,7 +957,6 @@ class EpDispatchCombineOp:
             # copy in the combine-dtype layout (not recv_tokens()'s dispatch view)
             dst = self.combine_in_view().view(-1)[: input.numel()]
             dst.copy_(input.reshape(-1))
-        self.combine_out.zero_()
         stream = fx.Stream(torch.cuda.current_stream())
         _, comb_spec = self._pick(routing.cur_rank_num_token)
         self._combine_variants[comb_spec](

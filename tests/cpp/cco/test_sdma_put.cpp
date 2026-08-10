@@ -157,7 +157,9 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
     const bool ok_thread = verify("thread");
 
     // warp scope: one warp per peer, transfer split across all of the peer's queues.
+    // hipMemset is async and ccoBarrierAll syncs hosts only; a late fill clobbers a peer's put.
     HIP_CHECK(hipMemset(recvBuf, 0xff, bufSize));
+    HIP_CHECK(hipDeviceSynchronize());
     mori::cco::ccoBarrierAll(comm);
     SdmaPutWarpKernel<<<nranks, 64, 0, stream>>>(sendWin, recvWin, COUNT, devComm);
     HIP_CHECK(hipStreamSynchronize(stream));

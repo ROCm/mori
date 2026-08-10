@@ -27,10 +27,17 @@ gpu_model, kernel_type, ep_size) combination:
   {arch}_{model}_{kernel}_ep{n}_dispatch.json
   {arch}_{model}_{kernel}_ep{n}_combine.json
 
-Dispatch files contain rules keyed by (dtype, num_tokens, hidden_dim).
-Combine files contain rules keyed by (dtype, num_tokens, hidden_dim,
+Dispatch files contain rules keyed by (dtype, num_tokens, hidden_dim, topk).
+Combine files contain rules keyed by (dtype, num_tokens, hidden_dim, topk,
 zero_copy, quant_type).  This separation allows dispatch rules to be
 shared across different quant_type / zero_copy configurations.
+
+``topk`` (num_experts_per_token) is optional: rules written before it was
+introduced have no ``topk`` field and act as wildcards, so old configs keep
+working.  It matters because two models can share a hidden_dim yet route a
+very different number of experts per token (DeepSeek-V4-Pro top-6 vs
+Kimi-K3 top-16 at hidden 7168), which changes the per-rank traffic and thus
+the best block/warp geometry.
 """
 from __future__ import annotations
 
@@ -43,6 +50,8 @@ from pathlib import Path
 from typing import ClassVar
 
 import torch
+
+from mori.ops import utils as gpu_utils
 
 logger = logging.getLogger(__name__)
 
@@ -129,25 +138,35 @@ _gpu_model_detected: bool = False
 
 
 def detect_gpu_model() -> str | None:
-    """Detect GPU model from device name, e.g. 'mi300x', 'mi308x'."""
+    """Detect GPU model, e.g. 'mi300x', 'mi308x'. KFD-sysfs PCI DID first (exact,
+    needs no HIP context); the torch device name is only parsed for parts the DID
+    table doesn't know yet."""
     global _gpu_model_cache, _gpu_model_detected
     if _gpu_model_detected:
         return _gpu_model_cache
     _gpu_model_detected = True
-    try:
-        name = torch.cuda.get_device_properties(0).name.lower()
-    except Exception:
-        return None
+
+    _gpu_model_cache = gpu_utils.detect_model()
+    if _gpu_model_cache is not None:
+        return _gpu_model_cache
+
     import re
 
-    m = re.search(r"\bmi\d+\w*", name)
-    if m:
-        _gpu_model_cache = m.group(0)
+    try:
+        name = torch.cuda.get_device_properties(0).name.lower()
+        m = re.search(r"\bmi\d+\w*", name)
+        if m:
+            _gpu_model_cache = m.group(0)
+    except Exception:
+        pass
     return _gpu_model_cache
 
 
 # ---------------------------------------------------------------------------
 # Rule validation — dispatch and combine have different required fields
+#
+# ``topk`` is deliberately NOT required: rules predating it are treated as
+# topk wildcards (see _match_rules).
 # ---------------------------------------------------------------------------
 
 _DISPATCH_RULE_REQUIRED = frozenset(
@@ -375,12 +394,20 @@ class TuningConfigManager:
             valid.append(rule)
 
         if phase == "dispatch":
-            valid.sort(key=lambda r: (r["dtype"], r["hidden_dim"], r["num_tokens"]))
+            valid.sort(
+                key=lambda r: (
+                    r["dtype"],
+                    r["hidden_dim"],
+                    r.get("topk") or 0,
+                    r["num_tokens"],
+                )
+            )
         else:
             valid.sort(
                 key=lambda r: (
                     r["dtype"],
                     r["hidden_dim"],
+                    r.get("topk") or 0,
                     r["zero_copy"],
                     r["quant_type"],
                     r["num_tokens"],
@@ -401,20 +428,28 @@ class TuningConfigManager:
         hidden_dim: int,
         zero_copy: bool | None,
         quant_type: str | None,
+        topk: int | None,
         *,
         require_hidden_match: bool,
+        require_topk_match: bool,
     ) -> LaunchParams | None:
-        """Inner lookup over *sorted_rules* with optional hidden_dim filtering.
+        """Inner lookup over *sorted_rules* with optional hidden_dim/topk filtering.
 
-        Rules are sorted by num_tokens ascending (within each dtype/hidden
+        Rules are sorted by num_tokens ascending (within each dtype/hidden/topk
         group).  We pick the tightest ceiling match, and if num_tokens
         exceeds the largest recorded value we clamp to that rule.
+
+        With ``require_topk_match`` a rule only matches when its ``topk``
+        equals the requested one; rules without a ``topk`` field never match in
+        that pass and are picked up by the relaxed pass instead.
         """
         last_match: dict | None = None
         for rule in sorted_rules:
             if rule["dtype"] != dtype_str:
                 continue
             if require_hidden_match and rule["hidden_dim"] != hidden_dim:
+                continue
+            if require_topk_match and rule.get("topk") != topk:
                 continue
             if zero_copy is not None and rule.get("zero_copy") != zero_copy:
                 continue
@@ -443,38 +478,44 @@ class TuningConfigManager:
         hidden_dim: int,
         zero_copy: bool | None = None,
         quant_type: str | None = None,
+        topk: int | None = None,
     ) -> LaunchParams | None:
         """Find the best matching launch params.
 
         Exact-matches dtype, and (for combine) zero_copy and quant_type.
         For num_tokens, picks the tightest ceiling match; if num_tokens
         exceeds the largest recorded value the largest rule is used (clamp).
-        Prefers an exact hidden_dim match; if none is found, falls back to
-        any matching rule ignoring hidden_dim.
+        Prefers an exact hidden_dim match, then an exact topk match, falling
+        back in that order to rules that don't record the dimension.  ``topk``
+        is only used as a filter when the caller supplies it.
         """
         dtype_str = DTYPE_TO_CONFIG_STR.get(dtype)
         if dtype_str is None:
             return None
-        result = TuningConfigManager._match_rules(
-            sorted_rules,
-            dtype_str,
-            num_tokens,
-            hidden_dim,
-            zero_copy,
-            quant_type,
-            require_hidden_match=True,
+        # (require_hidden, require_topk) in decreasing specificity.  hidden_dim
+        # is relaxed last: it sets the per-token transport volume, so a rule
+        # measured at the right hidden and a different top-k is a better guess
+        # than one measured at the right top-k and the wrong hidden.
+        passes = (
+            ((True, True), (True, False), (False, True), (False, False))
+            if topk is not None
+            else ((True, False), (False, False))
         )
-        if result is not None:
-            return result
-        return TuningConfigManager._match_rules(
-            sorted_rules,
-            dtype_str,
-            num_tokens,
-            hidden_dim,
-            zero_copy,
-            quant_type,
-            require_hidden_match=False,
-        )
+        for require_hidden, require_topk in passes:
+            result = TuningConfigManager._match_rules(
+                sorted_rules,
+                dtype_str,
+                num_tokens,
+                hidden_dim,
+                zero_copy,
+                quant_type,
+                topk,
+                require_hidden_match=require_hidden,
+                require_topk_match=require_topk,
+            )
+            if result is not None:
+                return result
+        return None
 
     # ------------------------------------------------------------------
     # Tuning result persistence
@@ -490,15 +531,18 @@ class TuningConfigManager:
         """Save or merge a single tuning rule into a phase JSON file.
 
         entry format for dispatch:
-            {"dtype": "fp4", "num_tokens": 128, "hidden_dim": 3584,
+            {"dtype": "fp4", "num_tokens": 128, "hidden_dim": 3584, "topk": 8,
              "block_num": 64, "rdma_block_num": 0, "warp_per_block": 16,
              "bandwidth_gbps": 41.5}
 
         entry format for combine (adds zero_copy + quant_type):
-            {"dtype": "bf16", "num_tokens": 128, "hidden_dim": 7168,
+            {"dtype": "bf16", "num_tokens": 128, "hidden_dim": 7168, "topk": 8,
              "zero_copy": true, "quant_type": "none",
              "block_num": 64, "rdma_block_num": 0, "warp_per_block": 16,
              "bandwidth_gbps": 97.75}
+
+        ``topk`` participates in the merge key, so tuning the same shape at a
+        different top-k adds a rule instead of overwriting the existing one.
         """
         path = Path(path)
 
@@ -517,24 +561,31 @@ class TuningConfigManager:
         rules: list[dict] = data.setdefault("rules", [])
 
         def _dispatch_key(r):
-            return (r.get("dtype"), r.get("num_tokens"), r.get("hidden_dim"))
+            return (
+                r.get("dtype"),
+                r.get("num_tokens"),
+                r.get("hidden_dim"),
+                r.get("topk"),
+            )
 
         def _combine_key(r):
             return (
                 r.get("dtype"),
                 r.get("num_tokens"),
                 r.get("hidden_dim"),
+                r.get("topk"),
                 r.get("zero_copy"),
                 r.get("quant_type"),
             )
 
         def _dispatch_sort(r):
-            return (r["dtype"], r["hidden_dim"], r["num_tokens"])
+            return (r["dtype"], r["hidden_dim"], r.get("topk") or 0, r["num_tokens"])
 
         def _combine_sort(r):
             return (
                 r["dtype"],
                 r["hidden_dim"],
+                r.get("topk") or 0,
                 r.get("zero_copy", False),
                 r.get("quant_type", ""),
                 r["num_tokens"],

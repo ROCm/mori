@@ -176,6 +176,14 @@ jobs:
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.socket_ifname }}
       NCCL_SOCKET_IFNAME: ${{ matrix.socket_ifname }}
+      # Perf dashboard capture (MI355X_AINIC only for now). Empty MORI_PERF_OUT
+      # makes tests/python/perf_report.record_perf a no-op, so other platforms
+      # are unaffected.
+      MORI_PERF_OUT: ${{ matrix.platform == 'MI355X_AINIC' && format('{0}/_perf/perf.jsonl', github.workspace) || '' }}
+      MORI_PERF_RUN_ID: ${{ github.run_id }}
+      MORI_PERF_COMMIT: ${{ github.sha }}
+      MORI_PERF_PLATFORM: ${{ matrix.platform }}
+      MORI_PERF_PYTHON: ${{ matrix.python }}
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -201,6 +209,12 @@ jobs:
             -e MORI_RDMA_TC=$MORI_RDMA_TC \
             ${MORI_SOCKET_IFNAME:+-e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME} \
             ${NCCL_SOCKET_IFNAME:+-e NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME} \
+            -e MORI_PERF_OUT=$MORI_PERF_OUT \
+            -e MORI_PERF_RUN_ID=$MORI_PERF_RUN_ID \
+            -e MORI_PERF_COMMIT=$MORI_PERF_COMMIT \
+            -e MORI_PERF_PLATFORM=$MORI_PERF_PLATFORM \
+            -e MORI_PERF_PYTHON=$MORI_PERF_PYTHON \
+            -e MORI_PERF_DATE=$(date -u +%Y-%m-%d) \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
@@ -247,7 +261,8 @@ jobs:
 
       - name: MORI-EP bench
         run: |
-          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE \
+            -e MORI_EP_LAUNCH_CONFIG_MODE=AUTO $CONTAINER bash -c "
             cd $GITHUB_WORKSPACE
             timeout 120 python3 tests/python/ops/bench_dispatch_combine.py
             timeout 120 python3 tests/python/ops/bench_dispatch_combine.py \
@@ -291,7 +306,8 @@ jobs:
 
       - name: MORI-EP async kernel bench (intranode)
         run: |
-          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE \
+            -e MORI_EP_LAUNCH_CONFIG_MODE=AUTO $CONTAINER bash -c "
             cd $GITHUB_WORKSPACE
             PORT=12390
             for TOKENS in 64 128; do
@@ -313,6 +329,22 @@ jobs:
             cd $GITHUB_WORKSPACE
             timeout 300 pytest tests/python/umbp/ -v
           "
+
+      - name: Fix perf data ownership
+        if: always() && matrix.platform == 'MI355X_AINIC'
+        run: |
+          $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $IMAGE \
+            chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE/_perf 2>/dev/null || true
+          ls -l $GITHUB_WORKSPACE/_perf 2>/dev/null || echo "no _perf dir"
+
+      - name: Upload perf data (intra EP)
+        if: always() && matrix.platform == 'MI355X_AINIC'
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-data-intra-${{ matrix.platform }}-py${{ matrix.python }}
+          path: ${{ github.workspace }}/_perf/*.jsonl
+          if-no-files-found: warn
+          retention-days: 45
 
       - name: Cleanup
         if: always()
@@ -386,6 +418,12 @@ jobs:
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
+      # Perf dashboard capture on node1/rank0 (MI355X_AINIC only for now).
+      MORI_PERF_OUT: ${{ matrix.platform == 'MI355X_AINIC' && format('{0}/_perf/perf.jsonl', github.workspace) || '' }}
+      MORI_PERF_RUN_ID: ${{ github.run_id }}
+      MORI_PERF_COMMIT: ${{ github.sha }}
+      MORI_PERF_PLATFORM: ${{ matrix.platform }}
+      MORI_PERF_PYTHON: ${{ matrix.python }}
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -412,6 +450,12 @@ jobs:
             -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
             -e GLOO_SOCKET_IFNAME=$NODE1_IFNAME \
             -e NCCL_SOCKET_IFNAME=$NODE1_IFNAME \
+            -e MORI_PERF_OUT=$MORI_PERF_OUT \
+            -e MORI_PERF_RUN_ID=$MORI_PERF_RUN_ID \
+            -e MORI_PERF_COMMIT=$MORI_PERF_COMMIT \
+            -e MORI_PERF_PLATFORM=$MORI_PERF_PLATFORM \
+            -e MORI_PERF_PYTHON=$MORI_PERF_PYTHON \
+            -e MORI_PERF_DATE=$(date -u +%Y-%m-%d) \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
@@ -469,30 +513,36 @@ jobs:
             $CT exec $CONTAINER bash $SCRIPT
             --rank 1 --master-addr $NODE1_HOST --master-port $PORT
             --ifname $NODE2_IFNAME
-            -- --op-type write --transfer-batch-size 128 --all
-            --sweep-start-size 1024 --sweep-max-size 16777216 --iters 4
-            --enable-sess --enable-batch-transfer
-            --num-qp-per-transfer 2 --num-worker-threads 2
+            -- --op-type write --buffer-size 65536 --transfer-batch-size 256 --all
+            --sweep-start-size 1024 --sweep-max-size 16777216 --iters 128
+            --batch-contiguous --enable-sess --enable-batch-transfer
+            --num-qp-per-transfer 8 --num-worker-threads 8
             --num-initiator-dev 8 --num-target-dev 8
           )
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
           $CT exec $CONTAINER bash $SCRIPT \
             --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
             --ifname $NODE1_IFNAME \
-            -- --op-type write --transfer-batch-size 128 --all \
-            --sweep-start-size 1024 --sweep-max-size 16777216 --iters 4 \
-            --enable-sess --enable-batch-transfer \
-            --num-qp-per-transfer 2 --num-worker-threads 2 \
+            -- --op-type write --buffer-size 65536 --transfer-batch-size 256 --all \
+            --sweep-start-size 1024 --sweep-max-size 16777216 --iters 128 \
+            --batch-contiguous --enable-sess --enable-batch-transfer \
+            --num-qp-per-transfer 8 --num-worker-threads 8 \
             --num-initiator-dev 8 --num-target-dev 8
           wait
 
+      # Correctness/smoke check only: a fixed 4KB single-point read, not a sweep.
+      # The numbers are far below what the write sweep reports, so this step runs
+      # with MORI_PERF_OUT cleared and contributes nothing to the perf report.
+      # Config intentionally matches ci.yml (2 QP, no --batch-contiguous, no
+      # --disable-chunking): merging the batch into one WR starves the
+      # `--poll_cq_mode event` CQ loop and the step hangs until the 600s timeout.
       - name: MORI-IO internode read
         run: |
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
           PORT=29121
           echo "=== MORI-IO internode benchmark: batch-session-read port=$PORT ==="
           NODE2_CMD=(
-            $CT exec $CONTAINER bash $SCRIPT
+            $CT exec -e MORI_PERF_OUT= $CONTAINER bash $SCRIPT
             --rank 1 --master-addr $NODE1_HOST --master-port $PORT
             --ifname $NODE2_IFNAME
             -- --op-type read --buffer-size 4096 --transfer-batch-size 128 --iters 8
@@ -501,7 +551,7 @@ jobs:
             --num-initiator-dev 8 --num-target-dev 8
           )
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
-          $CT exec $CONTAINER bash $SCRIPT \
+          $CT exec -e MORI_PERF_OUT= $CONTAINER bash $SCRIPT \
             --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
             --ifname $NODE1_IFNAME \
             -- --op-type read --buffer-size 4096 --transfer-batch-size 128 --iters 8 \
@@ -514,17 +564,19 @@ jobs:
         run: |
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
           PORT=29140
+          # Launch params auto-selected from tuning_configs via AUTO mode
+          # (bf16/fp8/fp4 rules per num_tokens/hidden_dim, dispatch & combine).
           for KERNEL in v1 v1_ll; do
             for TOKENS in 64 128 1024 2048 4096; do
               echo "=== bench kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
               NODE2_CMD=(
-                $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT
+                $CT exec -e MORI_INTERNODE_TIMEOUT=600 -e MORI_EP_LAUNCH_CONFIG_MODE=AUTO $CONTAINER bash $SCRIPT
                 --rank 1 --master-addr $NODE1_HOST --master-port $PORT
                 --ifname $NODE2_IFNAME
                 --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
               )
               ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
-              $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT \
+              $CT exec -e MORI_INTERNODE_TIMEOUT=600 -e MORI_EP_LAUNCH_CONFIG_MODE=AUTO $CONTAINER bash $SCRIPT \
                 --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
                 --ifname $NODE1_IFNAME \
                 --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
@@ -588,6 +640,24 @@ jobs:
             PORT=$((PORT + 1))
           done
 
+      - name: Fix perf data ownership (node1)
+        if: always() && matrix.platform == 'MI355X_AINIC'
+        run: |
+          if $CT image inspect $IMAGE &>/dev/null; then
+            $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $IMAGE \
+              chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE/_perf 2>/dev/null || true
+          fi
+          ls -l $GITHUB_WORKSPACE/_perf 2>/dev/null || echo "no _perf dir"
+
+      - name: Upload perf data (internode EP + IO)
+        if: always() && matrix.platform == 'MI355X_AINIC'
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-data-internode-${{ matrix.platform }}-py${{ matrix.python }}
+          path: ${{ github.workspace }}/_perf/*.jsonl
+          if-no-files-found: warn
+          retention-days: 45
+
       - name: Cleanup node1
         if: always()
         run: |
@@ -603,6 +673,68 @@ jobs:
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             -p $NODE2_PORT $(whoami)@$NODE2_HOST \
             "$CT rm -f $CONTAINER || true"
+
+  # ── Stage 2c: Performance report ───────────────────────────────────────────
+  # Aggregates the perf JSON emitted by the intra/internode/IO benchmarks into a
+  # Markdown report rendered directly in the run's job summary. Everything lives
+  # in build artifacts (no gh-pages / git commits): the current run's perf-data-*
+  # artifacts plus a best-effort pull of recent nightly runs' artifacts so the
+  # report can show a short per-metric trend across runs.
+  perf-report:
+    name: perf report
+    needs: [test-wheel, test-wheel-internode]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Download this run's perf data
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: perf-data-*
+          # No merge-multiple: every artifact contains a file named perf.jsonl,
+          # so merging into one dir would overwrite them. Keep each artifact in
+          # its own subdir; build_report.py globs *.jsonl recursively.
+          path: perf_in/current
+
+      - name: Fetch history from recent nightly runs (best-effort)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p perf_in/history
+          ids=$(gh run list --workflow nightly.yml \
+                  --branch "${{ github.ref_name }}" \
+                  --status completed --limit 15 \
+                  --json databaseId -q '.[].databaseId' || true)
+          for id in $ids; do
+            [ "$id" = "${{ github.run_id }}" ] && continue
+            echo "Fetching perf artifacts from run $id"
+            gh run download "$id" --pattern 'perf-data-*' \
+              --dir "perf_in/history/$id" || true
+          done
+          echo "History fetched:"; find perf_in/history -name '*.jsonl' 2>/dev/null || true
+
+      - name: Build report
+        run: |
+          python3 tools/perf/build_report.py \
+            --input-dir perf_in \
+            --output-dir perf_report
+          cat perf_report/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload perf report
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-report
+          path: perf_report
+          retention-days: 45
 
   # ── Stage 3: Test PyPI wheel (install + import verification) ────────────────
   test-pypi-wheel:

@@ -1,0 +1,118 @@
+{
+  "version": "1.0",
+  "gpu_arch": "gfx950",
+  "gpu_model": "mi350x",
+  "kernel_type": "IntraNodeLL",
+  "ep_size": 8,
+  "phase": "combine",
+  "rules": [
+    {
+      "dtype": "bf16",
+      "num_tokens": 1,
+      "hidden_dim": 7168,
+      "zero_copy": true,
+      "quant_type": "none",
+      "block_num": 32,
+      "rdma_block_num": 0,
+      "warp_per_block": 10,
+      "bandwidth_gbps": 3.42,
+      "latency_us": 19.35
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 32,
+      "hidden_dim": 7168,
+      "zero_copy": true,
+      "quant_type": "none",
+      "block_num": 56,
+      "rdma_block_num": 0,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 104.8,
+      "latency_us": 23.21
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 64,
+      "hidden_dim": 7168,
+      "zero_copy": true,
+      "quant_type": "none",
+      "block_num": 112,
+      "rdma_block_num": 0,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 169.92,
+      "latency_us": 28.72
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 128,
+      "hidden_dim": 7168,
+      "zero_copy": true,
+      "quant_type": "none",
+      "block_num": 64,
+      "rdma_block_num": 0,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 235.2,
+      "latency_us": 41.3
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 256,
+      "hidden_dim": 7168,
+      "zero_copy": true,
+      "quant_type": "none",
+      "block_num": 64,
+      "rdma_block_num": 0,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 299.48,
+      "latency_us": 65.15
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 512,
+      "hidden_dim": 7168,
+      "zero_copy": true,
+      "quant_type": "none",
+      "block_num": 64,
+      "rdma_block_num": 0,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 349.5,
+      "latency_us": 111.09
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 1024,
+      "hidden_dim": 7168,
+      "zero_copy": true,
+      "quant_type": "none",
+      "block_num": 56,
+      "rdma_block_num": 0,
+      "warp_per_block": 10,
+      "bandwidth_gbps": 380.06,
+      "latency_us": 204.71
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 2048,
+      "hidden_dim": 7168,
+      "zero_copy": true,
+      "quant_type": "none",
+      "block_num": 72,
+      "rdma_block_num": 0,
+      "warp_per_block": 10,
+      "bandwidth_gbps": 399.1,
+      "latency_us": 389.52
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 4096,
+      "hidden_dim": 7168,
+      "zero_copy": true,
+      "quant_type": "none",
+      "block_num": 56,
+      "rdma_block_num": 0,
+      "warp_per_block": 15,
+      "bandwidth_gbps": 408.0,
+      "latency_us": 761.44
+    }
+  ]
+}
