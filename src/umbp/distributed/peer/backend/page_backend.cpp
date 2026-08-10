@@ -19,7 +19,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "umbp/distributed/peer/page_backend.h"
+#include "umbp/distributed/peer/backend/page_backend.h"
 
 #include <algorithm>
 #include <cassert>
@@ -30,7 +30,7 @@
 #include <utility>
 
 #include "mori/utils/mori_log.hpp"
-#include "umbp/distributed/peer/transfer_engine.h"
+#include "umbp/distributed/transfer/transfer_engine.h"
 
 namespace mori::umbp {
 
@@ -110,13 +110,43 @@ void PageBackend::InstallTierConfig(TierConfig cfg) {
   allocator_ = std::make_unique<PageBitmapAllocator>(page_size_, cfg.buffer_sizes);
   buffer_descs_ = std::move(cfg.buffer_descs);
   buffer_bases_ = std::move(cfg.buffer_bases);
+  BuildBufferRefs();
+}
+
+// Materialize the per-buffer transfer endpoints once, so BufferRef() on the
+// local hot path is an index rather than an msgpack unpack.  The published size
+// is the ALLOCATABLE size (total_pages * page_size), not the mapped size: it is
+// the bound a same-process copy is checked against, and it is the tighter of
+// the two.
+void PageBackend::BuildBufferRefs() {
+  buffer_refs_.clear();
+  if (!allocator_) return;
+  const auto& buffers = allocator_->Buffers();
+  buffer_refs_.resize(buffers.size());
+  for (size_t i = 0; i < buffers.size(); ++i) {
+    TransferRef ref;
+    ref.size = static_cast<uint64_t>(buffers[i].total_pages) * page_size_;
+    ref.loc = mori::io::MemoryLocationType::CPU;
+    ref.device = -1;
+    if (i < buffer_bases_.size()) ref.host_ptr = buffer_bases_[i];
+    if (i < buffer_descs_.size() && !buffer_descs_[i].empty()) {
+      try {
+        auto handle = msgpack::unpack(reinterpret_cast<const char*>(buffer_descs_[i].data()),
+                                      buffer_descs_[i].size());
+        ref.mem = handle.get().as<mori::io::MemoryDesc>();
+      } catch (const std::exception& e) {
+        MORI_UMBP_ERROR("[PageBackend] BuildBufferRefs: bad desc for buffer {}: {}", i, e.what());
+      }
+    }
+    buffer_refs_[i] = std::move(ref);
+  }
 }
 
 // ---------------------------------------------------------------------------
 //  MediumBackend — identity + ownership
 // ---------------------------------------------------------------------------
 
-bool PageBackend::Init(TransferEngine* engine) {
+bool PageBackend::Init(MemoryRegistrar* registrar) {
   if (!ownership_.has_value()) {
     // Constructed with a pre-built TierConfig (test / legacy-direct path) —
     // already configured, nothing to do.
@@ -124,7 +154,7 @@ bool PageBackend::Init(TransferEngine* engine) {
   }
   if (owns_memory_) return true;  // idempotent
 
-  engine_ = engine;
+  registrar_ = registrar;
 
   HostMemAllocator allocator;
   HostBufferOptions opts;
@@ -145,28 +175,32 @@ bool PageBackend::Init(TransferEngine* engine) {
     if (!handle.valid()) {
       MORI_UMBP_ERROR("[PageBackend] Init: host allocation failed for size={} tier={}", size,
                       static_cast<int>(tier_));
-      // Unwind whatever we already allocated in this call.  Deregister the
-      // MRs explicitly: owns_memory_ never becomes true on this path, so
-      // Shutdown() would early-return and leak them.
-      if (engine != nullptr) {
-        for (auto& mem : owned_mem_descs_) engine->Deregister(mem);
+      // Unwind whatever we already allocated in this call.  Deregister
+      // explicitly: owns_memory_ never becomes true on this path, so
+      // Shutdown() would early-return and leak the registrations.
+      if (registrar != nullptr) {
+        for (const auto& ref : owned_refs_) registrar->Deregister(ref);
       }
-      owned_mem_descs_.clear();
+      owned_refs_.clear();
       for (auto& h : owned_buffer_handles_) allocator.Free(h);
       owned_buffer_handles_.clear();
-      engine_ = nullptr;
+      registrar_ = nullptr;
       return false;
     }
 
     std::vector<uint8_t> desc_bytes;
-    if (engine != nullptr) {
-      mori::io::MemoryDesc mem =
-          engine->RegisterMemory(handle.ptr, handle.mapped_size, mori::io::MemoryLocationType::CPU,
-                                 /*device=*/-1);
-      owned_mem_descs_.push_back(mem);
-      msgpack::sbuffer sbuf;
-      msgpack::pack(sbuf, mem);
-      desc_bytes.assign(sbuf.data(), sbuf.data() + sbuf.size());
+    if (registrar != nullptr) {
+      // The backend supplies the facts a descriptor cannot recover — location
+      // type and device — because the backend is the allocator (design doc §6).
+      TransferRef ref = registrar->RegisterMemory(handle.ptr, handle.mapped_size,
+                                                  mori::io::MemoryLocationType::CPU,
+                                                  /*device=*/-1);
+      owned_refs_.push_back(ref);
+      if (ref.HasMemoryDesc()) {
+        msgpack::sbuffer sbuf;
+        msgpack::pack(sbuf, ref.mem);
+        desc_bytes.assign(sbuf.data(), sbuf.data() + sbuf.size());
+      }
     }
 
     cfg.buffer_sizes.push_back(handle.mapped_size);
@@ -177,6 +211,7 @@ bool PageBackend::Init(TransferEngine* engine) {
 
   InstallTierConfig(std::move(cfg));
   owns_memory_ = true;
+  StartReaper();
   MORI_UMBP_INFO("[PageBackend] Init tier={} buffers={} total_bytes={}", static_cast<int>(tier_),
                  owned_buffer_handles_.size(), Capacity().total_bytes);
   return true;
@@ -184,17 +219,17 @@ bool PageBackend::Init(TransferEngine* engine) {
 
 void PageBackend::Shutdown() {
   if (!owns_memory_) return;
-  if (engine_ != nullptr) {
-    for (auto& mem : owned_mem_descs_) engine_->Deregister(mem);
+  if (registrar_ != nullptr) {
+    for (const auto& ref : owned_refs_) registrar_->Deregister(ref);
   }
-  owned_mem_descs_.clear();
+  owned_refs_.clear();
 
   HostMemAllocator allocator;
   for (auto& handle : owned_buffer_handles_) allocator.Free(handle);
   owned_buffer_handles_.clear();
 
   owns_memory_ = false;
-  engine_ = nullptr;
+  registrar_ = nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -635,20 +670,12 @@ std::vector<BufferMemoryDescBytes> PageBackend::BufferDescsForPages(
   return BuildBufferDescsLocked(pages);
 }
 
-std::vector<PageBackend::LocalBuffer> PageBackend::LocalBufferViews() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  std::vector<LocalBuffer> out;
-  if (!allocator_) return out;
-  const auto& buffers = allocator_->Buffers();
-  const size_t n = std::min(buffer_bases_.size(), buffers.size());
-  out.reserve(n);
-  for (size_t i = 0; i < n; ++i) {
-    LocalBuffer view;
-    view.base = buffer_bases_[i];
-    view.size = static_cast<uint64_t>(buffers[i].total_pages) * page_size_;
-    out.push_back(view);
-  }
-  return out;
+// No lock: buffer_refs_ is built once by InstallTierConfig and immutable
+// afterwards, and the local copy path must not contend for mutex_ (the same
+// lock every Allocate/Commit/Resolve and the heartbeat snapshot take) per page.
+TransferRef PageBackend::BufferRef(uint32_t buffer_index) const {
+  if (buffer_index >= buffer_refs_.size()) return TransferRef{};
+  return buffer_refs_[buffer_index];
 }
 
 std::vector<BufferMemoryDescBytes> PageBackend::BuildBufferDescsLocked(
@@ -758,6 +785,18 @@ void PageBackend::ReaperSweep() {
       ++it;
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+//  Factory
+// ---------------------------------------------------------------------------
+
+std::unique_ptr<MediumBackend> MakePageBackend(TierType tier, uint64_t page_size,
+                                               PageBackend::OwnershipConfig ownership,
+                                               std::chrono::milliseconds pending_ttl,
+                                               std::chrono::milliseconds read_lease_ttl) {
+  return std::make_unique<PageBackend>(tier, page_size, std::move(ownership), pending_ttl,
+                                       read_lease_ttl);
 }
 
 }  // namespace mori::umbp

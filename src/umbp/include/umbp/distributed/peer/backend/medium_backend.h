@@ -32,15 +32,10 @@
 #include <utility>
 #include <vector>
 
+#include "umbp/distributed/transfer/transfer_engine.h"
 #include "umbp/distributed/types.h"
 
 namespace mori::umbp {
-
-// Moves bytes between registered endpoints; also the registrar a backend uses
-// to publish its own memory.  Defined in Phase 6 — forward-declared here so
-// Init's signature is stable from the start.  See
-// doc/design-backend-agnostic-refactor.md §4.
-class TransferEngine;
 
 // One storage medium on a peer.
 //
@@ -99,9 +94,11 @@ class TransferEngine;
 //   * single-key Allocate/Commit/Abort/Resolve — the single-key RPCs are
 //     served by one-element batches
 //
-// Backends must also not call TransferEngine::{Plan,Submit,Wait}; registration
-// and transfer share one type (§4), so that boundary is enforced by the Phase 5
-// lint rather than by the type system.
+// A backend also must not move bytes itself, and since Phase 6 that is a
+// COMPILE ERROR rather than a lint rule: Init receives a MemoryRegistrar, which
+// has only RegisterMemory/Deregister on it.  The object behind that pointer is
+// the same TransferEngine everything else holds — one object, two views (design
+// doc §5 Rule C).
 
 // ---------------------------------------------------------------------------
 //  Data-plane value types
@@ -186,15 +183,16 @@ class MediumBackend {
   // ---- ownership ----
 
   // Allocate this medium's pool with its own policy (hugepage/NUMA for DRAM,
-  // hipMalloc for HBM, file extents for SSD) and register it with `engine`,
+  // hipMalloc for HBM, file extents for SSD) and register it with `registrar`,
   // supplying the facts a descriptor cannot recover: location type, device,
-  // NUMA node.  PoolClient hands over the engine; it does NOT hand over memory.
+  // NUMA node.  PoolClient hands over the registrar; it does NOT hand over
+  // memory.
   //
-  // This is the inversion the refactor turns on.  Today allocation lives in
-  // DistributedClient and registration in PoolClient::Init with
-  // MemoryLocationType::CPU hardcoded, so a "backend" is a bookkeeper over
-  // memory it does not own (design doc §1 item 4).
-  virtual bool Init(TransferEngine* engine) = 0;
+  // This is the inversion the refactor turns on.  Before Phase 2 allocation
+  // lived in DistributedClient and registration in PoolClient::Init with
+  // MemoryLocationType::CPU hardcoded, so a "backend" was a bookkeeper over
+  // memory it did not own (design doc §1 item 4).
+  virtual bool Init(MemoryRegistrar* registrar) = 0;
 
   // Deregister and release the pool.  Must tolerate being called after a failed
   // Init, and must not run concurrently with any other method.
@@ -280,6 +278,26 @@ class MediumBackend {
   // first-contact writer can hydrate its peer-side cache in one round trip
   // instead of learning buffers one allocation at a time.
   virtual std::vector<BufferMemoryDescBytes> AllBufferDescs() const = 0;
+
+  // ---- local (same-process) endpoints ----
+
+  // How many buffers this backend published; PageLocation::buffer_index is an
+  // index into that range.  Zero for a backend with no page-addressable
+  // buffers.
+  virtual size_t BufferCount() const = 0;
+
+  // The endpoint for one buffer, in the form a same-process transfer plans
+  // against — i.e. the UNPACKED, in-process counterpart of
+  // AllBufferDescs()[i], with no msgpack round trip on the local hot path.
+  // Returns an invalid ref for an out-of-range index.
+  //
+  // This is what replaced PageBackend::LocalBufferViews() in Phase 6, and the
+  // difference is the point: a TransferRef is medium-agnostic (§2: "bytes
+  // addressed by a descriptor are already medium-agnostic"), a raw base pointer
+  // was not.  Publishing refs instead of pointers is what let PoolClient stop
+  // naming a concrete backend type, and what makes a second medium's local
+  // access work with no tier branch in a copy loop.
+  virtual TransferRef BufferRef(uint32_t buffer_index) const = 0;
 
  protected:
   MediumBackend() = default;

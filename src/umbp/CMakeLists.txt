@@ -340,7 +340,11 @@ add_library(
   distributed/routing/router.cpp
   distributed/routing/route_get_strategy.cpp
   distributed/routing/route_put_strategy.cpp
-  distributed/peer/page_backend.cpp
+  distributed/peer/backend/page_backend.cpp
+  distributed/transfer/transfer_engine.cpp
+  distributed/transfer/mori_io_engine.cpp
+  distributed/transfer/local_copy_engine.cpp
+  distributed/transfer/composite_transfer_engine.cpp
   distributed/peer/ssd/peer_ssd_manager.cpp
   distributed/peer/ssd/ssd_copy_pipeline.cpp
   distributed/peer/peer_service.cpp

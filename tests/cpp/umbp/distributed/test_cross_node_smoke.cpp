@@ -848,10 +848,14 @@ TEST_F(CrossNodeOverlap, PutStagingMultiPeerByteExact) {
   VerifyReadback(caller, keys, srcs, kPageSize);
 }
 
-TEST_F(CrossNodeOverlap, PutStagingOverflowFailsBatchCleanly) {
-  // 1-page staging buffer + un-registered srcs -> BuildRemotePutTransfers
-  // overflow: the whole peer batch fails, every allocated slot is aborted (keys
-  // never visible), and the client stays usable for a later zero-copy Put.
+TEST_F(CrossNodeOverlap, PutStagingLargerThanPoolIsChunkedNotFailed) {
+  // REPLACES PutStagingOverflowFailsBatchCleanly, whose expectation Phase 6
+  // deliberately inverted.  Before, a batch needing more staging than the buffer
+  // held was failed wholesale by BuildRemotePutTransfers, because the client
+  // reserved the whole batch's staging up front under one lock.  The bounce pool
+  // now belongs to the transfer engine, which chunks a staged group into
+  // pool-sized plans and runs each to completion inside Submit — so 4 pages
+  // through a 1-page pool is 4 sequential round trips, not an error.
   StartMaster();
   constexpr size_t kN = 4;
   PoolClient* caller = MakeClient("node-a", {kPageSize}, /*staging_buffer_size=*/kPageSize);
@@ -869,7 +873,35 @@ TEST_F(CrossNodeOverlap, PutStagingOverflowFailsBatchCleanly) {
 
   auto put = caller->BatchPut(keys, psrcs, sizes);
   ASSERT_EQ(put.size(), kN);
-  for (size_t k = 0; k < kN; ++k) EXPECT_FALSE(put[k]) << "overflow key should fail " << keys[k];
+  for (size_t k = 0; k < kN; ++k) EXPECT_TRUE(put[k]) << "chunked staged put failed " << keys[k];
+  for (const auto& key : keys) ASSERT_TRUE(WaitForExists(caller, key));
+  // Chunking must not scramble which bytes went where.
+  VerifyReadback(caller, keys, srcs, kPageSize);
+}
+
+TEST_F(CrossNodeOverlap, PutPageLargerThanStagingPoolFailsBatchCleanly) {
+  // The failure that IS still a failure: one PAGE bigger than the whole bounce
+  // pool cannot be chunked, so the planner rejects it.  Every allocated slot is
+  // aborted (keys never visible) and the client stays usable for a later
+  // zero-copy Put.
+  StartMaster();
+  constexpr size_t kN = 4;
+  PoolClient* caller = MakeClient("node-a", {kPageSize}, /*staging_buffer_size=*/kPageSize / 2);
+  MakeClient("node-b", {kPageSize * 64});
+
+  std::vector<std::string> keys;
+  std::vector<std::vector<char>> srcs(kN);
+  std::vector<const void*> psrcs(kN);
+  std::vector<size_t> sizes(kN, kPageSize);
+  for (size_t k = 0; k < kN; ++k) {
+    keys.push_back("ptoobig-" + std::to_string(k));
+    srcs[k].assign(kPageSize, static_cast<char>(0x41 + k));  // un-registered -> staging
+    psrcs[k] = srcs[k].data();
+  }
+
+  auto put = caller->BatchPut(keys, psrcs, sizes);
+  ASSERT_EQ(put.size(), kN);
+  for (size_t k = 0; k < kN; ++k) EXPECT_FALSE(put[k]) << "oversized key should fail " << keys[k];
   // Slots were aborted, never committed -> keys must not be visible.
   auto present = caller->BatchExists(keys);
   ASSERT_EQ(present.size(), kN);
@@ -878,7 +910,7 @@ TEST_F(CrossNodeOverlap, PutStagingOverflowFailsBatchCleanly) {
   // Client is still usable: a registered (zero-copy) single Put succeeds.
   std::vector<char> ok_src(kPageSize, 0x7E);
   ASSERT_TRUE(caller->RegisterMemory(ok_src.data(), ok_src.size()));
-  EXPECT_TRUE(caller->Put("povf-ok", ok_src.data(), kPageSize));
+  EXPECT_TRUE(caller->Put("ptoobig-ok", ok_src.data(), kPageSize));
   caller->DeregisterMemory(ok_src.data());
 }
 

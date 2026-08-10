@@ -32,7 +32,7 @@
 #include <thread>
 #include <vector>
 
-#include "umbp/distributed/peer/page_backend.h"
+#include "umbp/distributed/peer/backend/page_backend.h"
 #include "umbp/distributed/peer/ssd/peer_ssd_manager.h"
 #include "umbp/distributed/peer/ssd/ssd_copy_pipeline.h"
 #include "umbp/local/block_index/local_block_index.h"

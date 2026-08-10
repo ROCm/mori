@@ -35,14 +35,12 @@
 #include <vector>
 
 #include "mori/io/engine.hpp"
-#include "umbp/distributed/peer/medium_backend.h"
-#include "umbp/distributed/peer/peer_page_allocator.h"
+#include "umbp/distributed/peer/backend/medium_backend.h"
+#include "umbp/distributed/peer/backend/peer_page_allocator.h"
 #include "umbp/distributed/types.h"
 #include "umbp/local/host_mem_allocator.h"
 
 namespace mori::umbp {
-
-class TransferEngine;
 
 // One medium's (DRAM or HBM) peer-owned allocator + key map.  One instance ==
 // one medium: the tier is the identity of the object (design doc §3), which is
@@ -133,9 +131,11 @@ class PageBackend : public MediumBackend {
   const char* Name() const override { return "PageBackend"; }
 
   // No-op success if constructed with a pre-built TierConfig (already
-  // configured).  Otherwise self-allocates OwnershipConfig::buffer_sizes via
-  // HostMemAllocator and registers each buffer with `engine`.
-  bool Init(TransferEngine* engine) override;
+  // configured; the caller drives the reaper itself via RunReaperOnceForTest).
+  // Otherwise self-allocates OwnershipConfig::buffer_sizes via HostMemAllocator,
+  // registers each buffer with `registrar`, and starts the reaper — a backend
+  // is fully live when Init returns, so no caller has to know it has a reaper.
+  bool Init(MemoryRegistrar* registrar) override;
   void Shutdown() override;
 
   TierCapacity Capacity() const override;
@@ -161,6 +161,9 @@ class PageBackend : public MediumBackend {
   uint64_t PageSize() const override { return page_size_; }
   std::vector<BufferMemoryDescBytes> AllBufferDescs() const override;
 
+  size_t BufferCount() const override { return buffer_refs_.size(); }
+  TransferRef BufferRef(uint32_t buffer_index) const override;
+
   // ==================== Single-key convenience ====================
   // NOT part of MediumBackend (design doc §3: "single-key Allocate/Commit/
   // Abort/Resolve — the single-key RPCs are served by one-element batches").
@@ -181,22 +184,6 @@ class PageBackend : public MediumBackend {
   // referenced by `pages`.
   std::vector<BufferMemoryDescBytes> BufferDescsForPages(
       const std::vector<PageLocation>& pages) const;
-
-  // Raw base pointer + size per buffer_index (index == position).  NOT part of
-  // MediumBackend (design doc §2: bytes addressed by a raw pointer are
-  // medium-specific) — this exists solely for PoolClient's local (self-target)
-  // Put/Get fast path, which design doc §5 Phase 2 explicitly leaves as a
-  // host-DRAM-only raw memcpy until Phase 6 folds it into the transfer engine.
-  //
-  // Returns ALL buffers in one call, deliberately: the bases are immutable
-  // after Init, so the copy loop snapshots them once instead of taking mutex_
-  // (the same lock every Allocate/Commit/Resolve and the heartbeat snapshot
-  // contend for) on every page it copies.
-  struct LocalBuffer {
-    void* base = nullptr;
-    uint64_t size = 0;
-  };
-  std::vector<LocalBuffer> LocalBufferViews() const;
 
   // ==================== DRAM copy pin (SSD copy-on-commit) ====================
 
@@ -232,13 +219,15 @@ class PageBackend : public MediumBackend {
 
   // ==================== Reaper ====================
 
-  void StartReaper();
-  void StopReaper();
-
   // Test seam: run one reaper sweep synchronously without the thread.
   void RunReaperOnceForTest() { ReaperSweep(); }
 
  private:
+  // Lifecycle is owned by Init/Shutdown, not by the caller.  Both are
+  // idempotent.
+  void StartReaper();
+  void StopReaper();
+
   struct PendingSlot {
     uint64_t slot_id = 0;
     std::vector<PageLocation> pages;
@@ -283,6 +272,10 @@ class PageBackend : public MediumBackend {
   std::vector<BufferMemoryDescBytes> BuildBufferDescsLocked(
       const std::vector<PageLocation>& pages) const;
 
+  // Build buffer_refs_ from the installed bases + descs.  Called once, from
+  // InstallTierConfig.
+  void BuildBufferRefs();
+
   // Install `cfg` as this backend's live buffers (used by both constructors:
   // directly for the TierConfig ctor, and from Init() after self-allocation
   // for the OwnershipConfig ctor).
@@ -309,8 +302,12 @@ class PageBackend : public MediumBackend {
   std::unique_ptr<PageBitmapAllocator> allocator_;
   std::vector<std::vector<uint8_t>> buffer_descs_;
   // Local host base pointer per buffer_index.  Source of truth for page ->
-  // local pointer used by AcquireDramCopyPin and the local fast path.
+  // local pointer, used by AcquireDramCopyPin.
   std::vector<void*> buffer_bases_;
+  // The same buffers as transfer endpoints, built once at InstallTierConfig so
+  // BufferRef() costs an index rather than an msgpack unpack.  Immutable after
+  // Init, hence readable without mutex_.
+  std::vector<TransferRef> buffer_refs_;
 
   std::unordered_map<uint64_t, PendingSlot> pending_;
   std::unordered_map<std::string, OwnedSlot> owned_;
@@ -354,8 +351,22 @@ class PageBackend : public MediumBackend {
   std::optional<OwnershipConfig> ownership_;
   bool owns_memory_ = false;  // true once Init() has self-allocated
   std::vector<HostBufferHandle> owned_buffer_handles_;
-  std::vector<mori::io::MemoryDesc> owned_mem_descs_;
-  TransferEngine* engine_ = nullptr;  // non-owning; set at Init(), used at Shutdown()
+  std::vector<TransferRef> owned_refs_;
+  MemoryRegistrar* registrar_ = nullptr;  // non-owning; set at Init(), used at Shutdown()
 };
+
+// The one place a caller outside this file obtains a PageBackend.
+//
+// Phase 5 Rule A ("only one place may name a concrete backend") was blocked on
+// PoolClient::Init needing LocalBufferViews() for the local memcpy path; Phase 6
+// deleted that call, so construction can go through a factory returning the
+// interface.  The class itself stays in this header because its unit tests
+// drive the allocator bookkeeping directly through the TierConfig constructor —
+// what matters for the acceptance test is that the PRODUCTION path names no
+// concrete type, and it no longer does.
+std::unique_ptr<MediumBackend> MakePageBackend(TierType tier, uint64_t page_size,
+                                               PageBackend::OwnershipConfig ownership,
+                                               std::chrono::milliseconds pending_ttl,
+                                               std::chrono::milliseconds read_lease_ttl);
 
 }  // namespace mori::umbp

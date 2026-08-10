@@ -29,7 +29,7 @@
 #include <thread>
 #include <vector>
 
-#include "umbp/distributed/peer/page_backend.h"
+#include "umbp/distributed/peer/backend/page_backend.h"
 
 namespace mori::umbp {
 

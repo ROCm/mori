@@ -25,7 +25,7 @@
 #include <utility>
 
 #include "mori/utils/mori_log.hpp"
-#include "umbp/distributed/peer/page_backend.h"
+#include "umbp/distributed/peer/backend/page_backend.h"
 #include "umbp/distributed/peer/ssd/peer_ssd_manager.h"
 
 namespace mori::umbp {

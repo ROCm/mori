@@ -42,7 +42,7 @@
 #include <vector>
 
 #include "umbp/distributed/config.h"
-#include "umbp/distributed/peer/medium_backend.h"
+#include "umbp/distributed/peer/backend/medium_backend.h"
 #include "umbp/distributed/routing/route_put_strategy.h"
 #include "umbp/distributed/types.h"
 
