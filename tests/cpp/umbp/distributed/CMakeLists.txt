@@ -285,6 +285,23 @@ target_link_libraries(test_transfer_engine PRIVATE umbp_common GTest::gtest_main
 target_compile_features(test_transfer_engine PRIVATE cxx_std_17)
 add_test(NAME test_transfer_engine COMMAND test_transfer_engine)
 
+# test_hbm_backend — the HBM medium and the engine that had to exist for it:
+# HbmCopyEngine's selection/planner (no GPU needed) plus real H2D/D2H/D2D bytes
+# and a Put/Get round trip against an hipMalloc'd pool (skipped without a GPU).
+add_executable(test_hbm_backend test_hbm_backend.cpp)
+target_link_libraries(test_hbm_backend PRIVATE umbp_common hip::host
+                                               GTest::gtest_main)
+target_compile_features(test_hbm_backend PRIVATE cxx_std_17)
+add_test(NAME test_hbm_backend COMMAND test_hbm_backend)
+
+# test_ssd_backend — SSD as a MediumBackend, staged through registered host
+# DRAM: Put spills to the tier, Get stages back under a read lease, and the
+# staging arena's exhaustion / reaping / eviction interactions.
+add_executable(test_ssd_backend test_ssd_backend.cpp)
+target_link_libraries(test_ssd_backend PRIVATE umbp_common GTest::gtest_main)
+target_compile_features(test_ssd_backend PRIVATE cxx_std_17)
+add_test(NAME test_ssd_backend COMMAND test_ssd_backend)
+
 # test_peer_service_dispatch — PeerServiceServer tier dispatch through
 # BackendRegistry (Phase 3): per-tier routing, the tier-tagged opaque slot_id
 # that makes Commit/Abort unambiguous, mixed-tier batch ordering, and the

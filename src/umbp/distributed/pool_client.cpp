@@ -42,10 +42,13 @@
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/env_time.h"
 #include "umbp/distributed/master/master_metrics.h"
+#include "umbp/distributed/peer/backend/hbm_backend.h"
 #include "umbp/distributed/peer/backend/page_backend.h"
+#include "umbp/distributed/peer/backend/ssd_backend.h"
 #include "umbp/distributed/peer/batch_resolve_codec.h"
 #include "umbp/distributed/peer/peer_service.h"
 #include "umbp/distributed/transfer/composite_transfer_engine.h"
+#include "umbp/distributed/transfer/hbm_copy_engine.h"
 #include "umbp/distributed/transfer/local_copy_engine.h"
 #include "umbp/distributed/transfer/mori_io_engine.h"
 #include "umbp_peer.grpc.pb.h"
@@ -265,6 +268,12 @@ bool PoolClient::Init() {
   // holds TransferEngine / MemoryRegistrar / PeerDirectory.
   auto composite = std::make_unique<CompositeTransferEngine>();
   composite->AddEngine(std::make_unique<LocalCopyEngine>());
+  // Both-local pairs with a GPU endpoint.  Disjoint from LocalCopyEngine (which
+  // requires both sides CPU) and from MoriIoEngine (which requires exactly one
+  // side remote), so this is registration order as documentation, not as a
+  // tie-break — but it must come before the wire engine on principle, since an
+  // HBM pair that reached mori-io would be refused rather than served slowly.
+  composite->AddEngine(std::make_unique<HbmCopyEngine>());
   if (!config_.io_engine.host.empty()) {
     mori::io::IOEngineConfig io_cfg;
     io_cfg.host = config_.io_engine.host;
@@ -308,6 +317,47 @@ bool PoolClient::Init() {
     return false;
   }
   registry_.Register(std::move(dram));
+
+  // HBM: the second medium, and the proof that adding one is a registration
+  // rather than an edit.  Everything below this block — routing, peer service,
+  // heartbeat, the batch executors — was written against BackendRegistry and
+  // needed no change to serve it.
+  if (config_.hbm.enabled && !config_.hbm.buffer_sizes.empty()) {
+    auto hbm = MakeHbmBackend(page_size, config_.hbm.device, config_.hbm.buffer_sizes,
+                              /*pending_ttl=*/std::chrono::milliseconds{30000},
+                              /*read_lease_ttl=*/DramReadLeaseTtl());
+    if (!hbm->Init(static_cast<MemoryRegistrar*>(transfer_engine_.get()))) {
+      MORI_UMBP_ERROR("[PoolClient] HBM backend Init failed on device {}", config_.hbm.device);
+      initialized_ = false;
+      return false;
+    }
+    registry_.Register(std::move(hbm));
+  }
+
+  // SSD: the third medium, and the one that is genuinely NOT like the others —
+  // its bytes are not addressable, so it publishes a registered host staging
+  // arena and spills behind it (see ssd_backend.h).  Phase 0 unwired SSD from
+  // the data plane precisely so it could come back as a backend rather than as
+  // a special case threaded through PoolClient; this block is that return, and
+  // it is the same three lines the other two media take.
+  if (config_.ssd.enabled) {
+    SsdBackend::Config ssd_cfg;
+    ssd_cfg.page_size = page_size;
+    ssd_cfg.staging_pages = config_.ssd_staging_buffer_slots > 0
+                                ? static_cast<uint32_t>(config_.ssd_staging_buffer_slots)
+                                : 16;
+    ssd_cfg.ssd = config_.ssd;
+    ssd_cfg.read_lease_ttl = DramReadLeaseTtl();
+
+    auto ssd = MakeSsdBackend(std::move(ssd_cfg));
+    if (!ssd->Init(static_cast<MemoryRegistrar*>(transfer_engine_.get()))) {
+      MORI_UMBP_ERROR("[PoolClient] SSD backend Init failed");
+      initialized_ = false;
+      return false;
+    }
+    registry_.Register(std::move(ssd));
+  }
+
   master_client_->SetBackendRegistry(&registry_);
 
   // Pack engine_desc for master registration.

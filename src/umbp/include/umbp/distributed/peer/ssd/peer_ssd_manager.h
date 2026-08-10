@@ -79,6 +79,12 @@ class PeerSsdManager {
 
   bool Exists(const std::string& key) const;
 
+  // Stored size of `key`, or 0 if unknown.  Needed by SsdBackend::BatchResolve:
+  // PrepareRead wants a staging buffer chosen BEFORE the read, so the reader has
+  // to know how big the key is while it still only holds the key's name.
+  // `owned_` has carried this all along; only the accessor was missing.
+  uint64_t SizeOf(const std::string& key) const;
+
   // Write the key's bytes (assembled from possibly non-contiguous DRAM source
   // segments) to the SSD backend.  On success records the SSD location and
   // queues an ADD SSD event; on failure records nothing and queues nothing
