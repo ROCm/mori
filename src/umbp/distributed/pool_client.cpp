@@ -403,8 +403,10 @@ bool PoolClient::Init() {
   // Master register.  In the new design master holds no DRAM-side
   // metadata; only membership + capacity-snapshot.  Capacity is aggregated
   // over every registered backend instead of a PoolClientConfig literal
-  // (design doc §1 item 4 / Phase 2b) — a backend with zero capacity (e.g.
-  // MockBackend) is omitted so it stays invisible to routing.
+  // (design doc §1 item 4 / Phase 2b).  A backend reporting zero capacity is
+  // omitted rather than advertised as a full tier: since Phase 4 the router
+  // treats every advertised tier as a valid put target, so advertising an
+  // empty one would invite placements it can never accept.
   std::map<TierType, TierCapacity> tier_caps;
   for (auto* backend : registry_.All()) {
     auto cap = backend->Capacity();
@@ -651,9 +653,9 @@ PoolClient::GetAttemptOutcome PoolClient::ExecuteLocalGet(const std::string& key
     return GetAttemptOutcome::kFatal;
   }
   // Get carries no tier — the key may be in any medium here, and mirrored
-  // across several.  Walk the peer-local read-rank order and take the first
-  // hit, matching what the peer service does for a remote reader.
-  for (auto* backend : registry_.ByReadRank()) {
+  // across several.  Walk this node's media and take the first hit, matching
+  // what the peer service does for a remote reader.
+  for (auto* backend : registry_.All()) {
     auto resolved = backend->BatchResolve({key}, /*include_descs=*/false).front();
     if (!resolved.found) continue;
     // Only a locally-copyable medium can be served without the transfer

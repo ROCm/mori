@@ -69,6 +69,14 @@ class TransferEngine;
 // single monotonic seq — never one seq per medium (that breaks the ack /
 // seq-gap full-sync recovery).
 //
+// Every medium is currently treated as EQUIVALENT: no read priority, no
+// put-eligibility flag.  Phase 4 deleted the routing plane's two hardcoded tier
+// orders outright rather than re-expressing them as advertised properties, so
+// there is deliberately no BackendProperties here.  A medium that genuinely
+// differs — SSD, which takes no direct puts — brings the trait back with it
+// (design doc §3 / §5 Phase 4); until one exists, an advertised order would be
+// scaffolding nothing exercises.
+//
 // Threading: implementations must be safe to call from the peer service's gRPC
 // handler threads and the heartbeat thread concurrently.
 //
@@ -94,24 +102,6 @@ class TransferEngine;
 // Backends must also not call TransferEngine::{Plan,Submit,Wait}; registration
 // and transfer share one type (§4), so that boundary is enforced by the Phase 5
 // lint rather than by the type system.
-
-// Read order and put-eligibility as *advertised* facts rather than a
-// hand-written tier list in the routing strategies.  Shipped alongside
-// tier_capacities at registration and on every heartbeat so the master-side
-// strategies can rank tiers they were never compiled against.
-struct BackendProperties {
-  // Lower rank = higher read priority.  Ties are broken by TierType so the
-  // order stays deterministic.  Used both by RouteGetStrategy (choosing among
-  // peers) and by peer-local resolve (choosing among this node's own backends
-  // when a key is mirrored across media).
-  int read_rank = 0;
-
-  // False for a medium that can never be a direct put target — its copies are
-  // filled asynchronously by a promote/demote path rather than by a writer's
-  // RDMA.  Such a backend advertises no put-eligible capacity, which *deletes*
-  // the put tier-order list instead of extending it.
-  bool put_eligible = true;
-};
 
 // ---------------------------------------------------------------------------
 //  Data-plane value types
@@ -192,7 +182,6 @@ class MediumBackend {
 
   virtual TierType Tier() const = 0;
   virtual const char* Name() const = 0;
-  virtual BackendProperties Properties() const = 0;
 
   // ---- ownership ----
 
@@ -300,8 +289,9 @@ class MediumBackend {
 // registration call sites are the single place in the tree where a concrete
 // backend type is named, which is what the Phase 5 lint enforces.
 //
-// std::map iterates in ascending TierType order; callers that need read order
-// must use ByReadRank(), not iteration order.
+// std::map iterates in ascending TierType order, so All() is both the
+// enumeration and the (deterministic, arbitrary) order callers walk media in —
+// with every medium equivalent there is no priority to express.
 class BackendRegistry {
  public:
   // Replaces any backend already registered for that tier.  Null is ignored.
@@ -327,24 +317,6 @@ class BackendRegistry {
     std::vector<MediumBackend*> out;
     out.reserve(backends_.size());
     for (const auto& [tier, backend] : backends_) out.push_back(backend.get());
-    return out;
-  }
-
-  // Every live backend in read-priority order (lowest read_rank first, ties
-  // broken by TierType for determinism).  This is the peer-local counterpart
-  // of RouteGetStrategy's cross-peer ranking: with a key possibly mirrored
-  // across media, resolve walks this order and the first hit wins.
-  std::vector<MediumBackend*> ByReadRank() const {
-    std::vector<std::pair<std::pair<int, TierType>, MediumBackend*>> ranked;
-    ranked.reserve(backends_.size());
-    for (const auto& [tier, backend] : backends_) {
-      ranked.push_back({{backend->Properties().read_rank, tier}, backend.get()});
-    }
-    std::sort(ranked.begin(), ranked.end(),
-              [](const auto& a, const auto& b) { return a.first < b.first; });
-    std::vector<MediumBackend*> out;
-    out.reserve(ranked.size());
-    for (const auto& [rank, backend] : ranked) out.push_back(backend);
     return out;
   }
 

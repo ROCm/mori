@@ -49,11 +49,12 @@ staging-slot shape.
 staging base/size/`MemoryDesc` args. The SSD-only RPCs (`PrepareSsdRead`,
 `ReleaseSsdLease`) and the read-slot lease state machine live in the handlers.
 
-**3. Routing is nearly agnostic already.**
+**3. Routing is nearly agnostic already.** *(resolved — Phase 4)*
 `RoutePutStrategy` and `RouteGetStrategy` only ever see
 `ClientRecord.tier_capacities` and `Location.tier`. The single hardcode is two
 orderings: `TierPriorityRouteGetStrategy`'s `HBM > DRAM > SSD`, and put's
-"HBM then DRAM, SSD is never a direct-put target."
+"HBM then DRAM, SSD is never a direct-put target." Both were **deleted** in
+Phase 4 rather than re-expressed as advertised properties — see §5 Phase 4.
 
 **4. Memory ownership lives entirely outside the backend.**
 This is the one the original plan missed, and it is the one that makes the
@@ -180,10 +181,9 @@ class MediumBackend {
  public:
   virtual ~MediumBackend() = default;
 
-  // ---- identity + routing advertisement ----
+  // ---- identity ----
   virtual TierType Tier() const = 0;
   virtual const char* Name() const = 0;
-  virtual BackendProperties Properties() const = 0;   // {read_rank, put_eligible}
 
   // ---- ownership (new; see §1 item 4) ----
   // The backend allocates its own pool with its own policy (hugepage/NUMA vs
@@ -220,9 +220,18 @@ class MediumBackend {
 descs, pending_ttl_ms}`. No method takes a `TierType`: one instance is one
 medium, and the caller has already dispatched on it via the registry.
 
-`BackendProperties` is what removes the routing hardcode: read order and
-put-eligibility become *advertised* facts rather than a hand-written tier list
-in the strategies.
+**`BackendProperties` was proposed here and then NOT adopted.** The idea was to
+make read order and put-eligibility *advertised* facts rather than a hand-written
+tier list in the strategies. Phase 4 found the simpler answer: every medium in
+the system today is equivalent, so the tier lists were **deleted outright** and
+nothing replaced them. An advertised order would have been scaffolding nothing
+exercises — exactly the mistake §1's "key observation" calls out about
+`PeerDramAllocator`'s unexercised tier map.
+
+The trait comes back when a medium that genuinely differs does. That is SSD:
+it takes no direct puts. `SsdBackend` reintroduces `put_eligible` *with* the
+backend that needs it, which is the same "1 file + 1 registry line" test Phase 5
+already applies.
 
 **What is deliberately NOT on this interface**, and why — each of these was
 proposed and rejected once §4 was settled:
@@ -464,19 +473,45 @@ generic with no further work.
 overlap is a throughput property that no assertion catches — it must be measured,
 not asserted.
 
-### Phase 4 — routing plane
+### Phase 4 — routing plane *(done)*
 
-Delete both hardcoded tier orders. Derive read order and put-eligibility from
-`BackendProperties`, advertised through registration and heartbeat alongside
-`tier_capacities`. A backend that cannot accept puts advertises no put-eligible
-capacity, which deletes the put tier-order list rather than extending it. This
-also turns "can SSD accept direct puts" into a deployment choice a backend
-advertises, rather than the `kPutTierOrder` constant it is today.
+Delete both hardcoded tier orders. **Scope decision: delete, do not replace.**
+The original plan derived read order and put-eligibility from an advertised
+`BackendProperties`; with every live medium equivalent there is nothing to rank,
+so the orders were removed and no mechanism took their place (see §3).
 
-~150 lines.
+What went:
 
-*Gate:* `test_tier_priority_route_get` and `test_route_put_strategy` pass
-unmodified.
+- `TierReadRank` and the `HBM > DRAM > SSD` read order.
+  `TierPriorityRouteGetStrategy` → `LocalPreferringRouteGetStrategy`: it keeps
+  the requester-local preference (the thing that makes `cache_remote_fetches`
+  pay off) and drops the ranking. The old name described the deleted half.
+- `kPutTierOrder = {HBM, DRAM}` and its "SSD is never a direct-put target"
+  exclusion. `SelectByAlgo` now scores every `(node, tier)` pair that has room,
+  on free space alone.
+- `BackendProperties`, `MediumBackend::Properties()`, and
+  `BackendRegistry::ByReadRank()` — the last became redundant with `All()`,
+  which already iterates in a deterministic (ascending-`TierType`) order.
+- `EvictionManager`'s `if (tier == SSD) continue`. It existed because `EvictKey`
+  only ever reached the peer's DRAM allocator; since Phase 3 it fans out to
+  every backend by key, so an overloaded medium now evicts from itself.
+
+**Behavior changes to know about** (all invisible while DRAM is the only live
+medium, all asserted by rewritten tests):
+
+| Situation | Before | After |
+|---|---|---|
+| Requester holds a replica on a "slower" tier | remote faster tier wins | local replica wins (no RDMA) |
+| Node advertises HBM 10G / DRAM 400G | HBM | DRAM (more room) |
+| Only SSD has room | unroutable | routed to SSD |
+| Same-node affinity, anchor's tier fills | spill to a remote node's faster tier | spill stays on the anchor node, changes tier |
+
+*Gate (revised):* the original gate — "`test_tier_priority_route_get` and
+`test_route_put_strategy` pass unmodified" — cannot hold, because those tests
+*are* the hardcode. `test_tier_priority_route_get` was replaced by
+`test_local_preferring_route_get`, and 6 assertions across the put/get suites
+were inverted; each inverted test names the expectation it replaces. Everything
+else passes untouched.
 
 ### Phase 5 — lock it in
 
@@ -586,7 +621,9 @@ the still-tested `PeerSsdManager`: `BatchResolve` → `PrepareRead`, `Evict` →
 `Capacity` → `Capacity`. The piece the original plan deferred — owning a pool of
 registered staging pages — is **no longer the backend's problem**: it publishes a
 `FileRef` and the transfer layer supplies the bounce buffer if the chosen engine
-needs one. Drivers, SPDK env, allocator, proxy protocol, segment format,
+needs one. It also brings back `put_eligible=false` (§3): Phase 4 deleted the
+router's "SSD is not a direct-put target" rule, so SSD must re-assert it itself
+or the router will place direct puts on it. Drivers, SPDK env, allocator, proxy protocol, segment format,
 eviction policy, the peer-side ownership map and the copy-on-commit pipeline are
 reused as-is.
 

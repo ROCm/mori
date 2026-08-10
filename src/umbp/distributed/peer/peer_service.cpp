@@ -116,12 +116,12 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
   UMBPPeerServiceImpl(BackendRegistry* registry, MasterClient* master_client,
                       const std::vector<uint8_t>& engine_desc_bytes)
       : registry_(registry),
-        // ByReadRank() allocates and sorts, and Resolve is the hot read path —
-        // so the order is snapshotted once here rather than rebuilt per RPC.
-        // This is why the registry MUST be fully populated before the peer
-        // service is constructed (PoolClient::Init registers every backend
-        // first, then starts this server).
-        ranked_(registry == nullptr ? std::vector<MediumBackend*>{} : registry->ByReadRank()),
+        // All() allocates, and Resolve is the hot read path — so the medium
+        // list is snapshotted once here rather than rebuilt per RPC.  This is
+        // why the registry MUST be fully populated before the peer service is
+        // constructed (PoolClient::Init registers every backend first, then
+        // starts this server).
+        media_(registry == nullptr ? std::vector<MediumBackend*>{} : registry->All()),
         engine_desc_bytes_(engine_desc_bytes),
         master_client_(master_client) {}
 
@@ -137,13 +137,13 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     // The bootstrap wire carries ONE medium: dram_memory_descs is a flat
     // buffer_index space and dram_page_size is a single field, while each
     // backend numbers its buffers from 0 with its own page size (design doc §1
-    // item 4 — "no tier dimension").  So descs come from the first backend in
-    // read-rank order that has any, and a second buffer-owning backend is
-    // reported rather than silently merged into a colliding index space.  A
+    // item 4 — "no tier dimension").  So descs come from the first backend that
+    // has any, and a second buffer-owning backend is reported rather than
+    // silently merged into a colliding index space.  A
     // tier dimension here is the prerequisite for a second live medium, which
     // the design doc defers to Phase 6 (§5 Phase 2 option (a)).
     MediumBackend* published = nullptr;
-    for (auto* backend : Ranked()) {
+    for (auto* backend : Media()) {
       auto descs = backend->AllBufferDescs();
       if (descs.empty()) continue;
       if (published != nullptr) {
@@ -240,10 +240,11 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
   grpc::Status ResolveKey(grpc::ServerContext* /*ctx*/, const ::umbp::ResolveKeyRequest* request,
                           ::umbp::ResolveKeyResponse* response) override {
     // Resolve carries no tier: the key may sit in any medium, and may be
-    // mirrored across several.  Walk the peer-local read-rank order and take
-    // the first hit — the same ranking RouteGetStrategy applies across peers
-    // (design doc §3, BackendRegistry::ByReadRank).
-    for (auto* backend : Ranked()) {
+    // mirrored across several.  Walk this peer's media and take the first hit.
+    // With every medium equivalent (Phase 4) the walk order is deterministic
+    // but arbitrary; a real preference would come from the backend advertising
+    // one, not from a tier list here.
+    for (auto* backend : Media()) {
       auto results = backend->BatchResolve({request->key()}, /*include_descs=*/true);
       const auto& r = results.front();
       if (!r.found) continue;
@@ -265,7 +266,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     std::vector<std::string> keys(request->keys().begin(), request->keys().end());
     if (keys.empty()) return grpc::Status::OK;
     std::vector<uint64_t> freed(keys.size(), 0);
-    for (auto* backend : Ranked()) {
+    for (auto* backend : Media()) {
       auto results = backend->Evict(keys);
       for (size_t i = 0; i < results.size() && i < freed.size(); ++i) {
         freed[i] += results[i].bytes_freed;
@@ -417,7 +418,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     // already relies on.
     std::vector<ResolvedEntry> resolved;
     MediumBackend* serving = nullptr;
-    for (auto* backend : Ranked()) {
+    for (auto* backend : Media()) {
       auto candidate = backend->BatchResolve(keys, /*include_descs=*/!omit_descs);
       const bool any_hit = std::any_of(candidate.begin(), candidate.end(),
                                        [](const ResolvedEntry& e) { return e.found; });
@@ -472,8 +473,10 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     return registry_ == nullptr ? nullptr : registry_->Get(tier);
   }
 
-  // Peer-local read order, snapshotted at construction (see ctor).
-  const std::vector<MediumBackend*>& Ranked() const { return ranked_; }
+  // Every medium on this peer, snapshotted at construction (see ctor).  The
+  // order is deterministic (ascending TierType) but carries no preference —
+  // every medium is equivalent (backend-agnostic refactor Phase 4).
+  const std::vector<MediumBackend*>& Media() const { return media_; }
 
   void RecordInboundPut(uint64_t bytes, const char* traffic) {
     if (master_client_ == nullptr || bytes == 0) return;
@@ -492,7 +495,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
   }
 
   BackendRegistry* registry_;
-  const std::vector<MediumBackend*> ranked_;
+  const std::vector<MediumBackend*> media_;
   const std::vector<uint8_t>& engine_desc_bytes_;
   MasterClient* master_client_;
 };

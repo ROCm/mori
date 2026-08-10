@@ -52,12 +52,6 @@ class MockBackend : public MediumBackend {
 
   TierType Tier() const override { return tier_; }
   const char* Name() const override { return "MockBackend"; }
-  BackendProperties Properties() const override {
-    BackendProperties p;
-    p.read_rank = 100;  // lowest priority; irrelevant since Capacity() is 0
-    p.put_eligible = true;
-    return p;
-  }
 
   bool Init(TransferEngine* /*engine*/) override {
     initialized_ = true;

@@ -131,7 +131,6 @@ class PageBackend : public MediumBackend {
 
   TierType Tier() const override { return tier_; }
   const char* Name() const override { return "PageBackend"; }
-  BackendProperties Properties() const override;
 
   // No-op success if constructed with a pre-built TierConfig (already
   // configured).  Otherwise self-allocates OwnershipConfig::buffer_sizes via

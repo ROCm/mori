@@ -67,7 +67,10 @@ std::optional<RoutePutResult> SelectOne(ConfigurableRoutePutStrategy& strat,
 // ---- most_available / none: single-key placement (migrated from the old
 //      TierAwareMostAvailableStrategy::Select coverage) ----
 
-TEST(MostAvailableNoneTest, PrefersHBMOverDRAM) {
+// INVERTS the old PrefersHBMOverDRAM.  Phase 4 deleted the HBM -> DRAM put
+// order, so on a node advertising both, most-available picks whichever tier
+// actually has more room — here DRAM's 400GB over HBM's 10GB.
+TEST(MostAvailableNoneTest, PicksTheRoomiestTierOnANodeRegardlessOfMedium) {
   ConfigurableRoutePutStrategy strategy(Algo::kMostAvailable, Affinity::kNone);
 
   std::vector<ClientRecord> clients = {
@@ -78,10 +81,11 @@ TEST(MostAvailableNoneTest, PrefersHBMOverDRAM) {
   auto result = SelectOne(strategy, clients, 4096, /*exclude=*/{});
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->node_id, "node-a");
-  EXPECT_EQ(result->tier, TierType::HBM);
+  EXPECT_EQ(result->tier, TierType::DRAM);
 }
 
-TEST(MostAvailableNoneTest, FallsThroughToDRAMWhenHBMFull) {
+// Unchanged by Phase 4: HBM has no room, so DRAM is the only eligible tier.
+TEST(MostAvailableNoneTest, PicksTheOnlyTierWithRoom) {
   ConfigurableRoutePutStrategy strategy(Algo::kMostAvailable, Affinity::kNone);
 
   std::vector<ClientRecord> clients = {
@@ -94,10 +98,12 @@ TEST(MostAvailableNoneTest, FallsThroughToDRAMWhenHBMFull) {
   EXPECT_EQ(result->tier, TierType::DRAM);
 }
 
-TEST(MostAvailableNoneTest, SsdIsNotADirectPutTarget) {
-  // SSD capacity is reported via heartbeat but RoutePut never steers a put at
-  // SSD: the SSD copy is filled asynchronously by copy-on-commit.  With HBM and
-  // DRAM full, placement must return nullopt even when SSD has ample space.
+// INVERTS the old SsdIsNotADirectPutTarget.  Phase 4 treats every medium as
+// equivalent, so a tier a node advertises capacity for is a tier it accepts
+// puts on.  When SSD returns as an SsdBackend that genuinely takes no direct
+// puts, it advertises that itself (design doc §3 put_eligible) — the router
+// does not assume it.
+TEST(MostAvailableNoneTest, EveryAdvertisedTierIsAValidPutTarget) {
   ConfigurableRoutePutStrategy strategy(Algo::kMostAvailable, Affinity::kNone);
 
   std::vector<ClientRecord> clients = {
@@ -108,7 +114,8 @@ TEST(MostAvailableNoneTest, SsdIsNotADirectPutTarget) {
   };
 
   auto result = SelectOne(strategy, clients, 4096, /*exclude=*/{});
-  EXPECT_FALSE(result.has_value());
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->tier, TierType::SSD);
 }
 
 TEST(MostAvailableNoneTest, ReturnsNulloptWhenAllFull) {
@@ -152,7 +159,9 @@ TEST(MostAvailableNoneTest, PicksMostAvailableOnSameTier) {
   EXPECT_EQ(result->tier, TierType::HBM);
 }
 
-TEST(MostAvailableNoneTest, HBMPreferredEvenIfDRAMHasMoreSpace) {
+// INVERTS the old HBMPreferredEvenIfDRAMHasMoreSpace: free space is now the
+// only signal, so the tier with more of it wins.
+TEST(MostAvailableNoneTest, MoreFreeSpaceWinsAcrossTiersOnTheSameNode) {
   ConfigurableRoutePutStrategy strategy(Algo::kMostAvailable, Affinity::kNone);
 
   std::vector<ClientRecord> clients = {
@@ -162,7 +171,7 @@ TEST(MostAvailableNoneTest, HBMPreferredEvenIfDRAMHasMoreSpace) {
 
   auto result = SelectOne(strategy, clients, 4096, /*exclude=*/{});
   ASSERT_TRUE(result.has_value());
-  EXPECT_EQ(result->tier, TierType::HBM);
+  EXPECT_EQ(result->tier, TierType::DRAM);
 }
 
 TEST(MostAvailableNoneTest, EmptyClientListReturnsNullopt) {
@@ -339,19 +348,24 @@ TEST(ConfigurableRoutePut, OrderAndDedupPreserved) {
   EXPECT_EQ(out[2]->outcome, RoutePutOutcome::kAlreadyExists);
 }
 
-TEST(ConfigurableRoutePut, NeverRoutesToSsd) {
+// INVERTS the old NeverRoutesToSsd.  Phase 4 removed the "SSD is not a direct
+// put target" rule from the router; a medium that cannot take direct puts will
+// advertise that itself when one exists (design doc §3 put_eligible).
+TEST(ConfigurableRoutePut, RoutesToSsdLikeAnyOtherAdvertisedTier) {
   ConfigurableRoutePutStrategy strat(Algo::kMostAvailable, Affinity::kNone);
   std::vector<ClientRecord> only_ssd{
       MakeClient("a", "a-addr", {{TierType::SSD, {100 * GB, 100 * GB}}})};
   auto out = strat.SelectBatch("req", {1 * GB}, NoDedup(1), only_ssd, {});
   ASSERT_EQ(out.size(), 1u);
-  EXPECT_FALSE(out[0].has_value());
+  ASSERT_TRUE(out[0].has_value());
+  EXPECT_EQ(out[0]->tier, TierType::SSD);
 
+  // Alongside DRAM it competes purely on free space, and wins here.
   std::vector<ClientRecord> ssd_and_dram{MakeClient(
       "a", "a-addr", {{TierType::SSD, {100 * GB, 100 * GB}}, {TierType::DRAM, {2 * GB, 2 * GB}}})};
   auto out2 = strat.SelectBatch("req", {1 * GB}, NoDedup(1), ssd_and_dram, {});
   ASSERT_TRUE(out2[0].has_value());
-  EXPECT_EQ(out2[0]->tier, TierType::DRAM);
+  EXPECT_EQ(out2[0]->tier, TierType::SSD);
 }
 
 // Strong, seed-independent: a node that cannot fit the block is never selected.
@@ -444,9 +458,11 @@ TEST(ConfigurableRoutePut, SameWholeBatchPinsNodeAndTier) {
   }
 }
 
-// same per-key fallback must not break tier priority: when the sticky anchor's
-// HBM is full, a remote node's HBM beats the anchor's own DRAM.
-TEST(ConfigurableRoutePut, SameFallbackPrefersRemoteHbmOverAnchorDram) {
+// INVERTS the old SameFallbackPrefersRemoteHbmOverAnchorDram.  With no tier
+// order there is nothing for node stickiness to break, so when the anchor's
+// first tier fills, the spill stays on the anchor node and changes tier rather
+// than jumping to a remote node's "faster" medium.
+TEST(ConfigurableRoutePut, SameFallbackKeepsTheAnchorNodeAndChangesTier) {
   ConfigurableRoutePutStrategy strat(Algo::kMostAvailable, Affinity::kSame);
   std::vector<ClientRecord> clients{
       MakeClient("a", "a-addr", {{TierType::HBM, {2 * GB, 2 * GB}}}),
@@ -458,13 +474,13 @@ TEST(ConfigurableRoutePut, SameFallbackPrefersRemoteHbmOverAnchorDram) {
   ASSERT_EQ(out.size(), 2u);
   ASSERT_TRUE(out[0].has_value());
   ASSERT_TRUE(out[1].has_value());
-  // key 0: most-available HBM -> b (3G > a 2G); anchor becomes b, b HBM -> 1G.
+  // key 0: most-available -> b (3G > a's 2G); anchor becomes b, b HBM -> 1G.
   EXPECT_EQ(out[0]->node_id, "b");
   EXPECT_EQ(out[0]->tier, TierType::HBM);
-  // key 1: anchor b's HBM (1G) cannot fit; instead of falling to b's DRAM, tier
-  // priority routes to a's HBM.
-  EXPECT_EQ(out[1]->node_id, "a");
-  EXPECT_EQ(out[1]->tier, TierType::HBM);
+  // key 1: anchor b's HBM (1G) cannot fit, so the spill takes b's DRAM (3G) —
+  // the sticky node is kept, which is the point of same-node affinity.
+  EXPECT_EQ(out[1]->node_id, "b");
+  EXPECT_EQ(out[1]->tier, TierType::DRAM);
 }
 
 // dedup keys consume no projected capacity and do not count toward the same-node

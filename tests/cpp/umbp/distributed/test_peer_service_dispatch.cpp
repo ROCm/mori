@@ -55,17 +55,17 @@
 namespace mori::umbp {
 namespace {
 
-// Both MockBackends advertise the same read_rank, so BackendRegistry breaks the
-// tie by TierType — HBM(1) sorts before DRAM(2).  The Resolve test depends on
-// that being the peer-local read order.
-constexpr TierType kFirstByReadRank = TierType::HBM;
-constexpr TierType kSecondByReadRank = TierType::DRAM;
+// Every medium is equivalent (Phase 4), so the registry walks them in ascending
+// TierType order — HBM(1) before DRAM(2).  The Resolve test depends only on
+// that order being deterministic, not on it meaning "faster".
+constexpr TierType kFirstByTier = TierType::HBM;
+constexpr TierType kSecondByTier = TierType::DRAM;
 
 class PeerServiceDispatchTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    registry_.Register(std::make_unique<MockBackend>(kFirstByReadRank));
-    registry_.Register(std::make_unique<MockBackend>(kSecondByReadRank));
+    registry_.Register(std::make_unique<MockBackend>(kFirstByTier));
+    registry_.Register(std::make_unique<MockBackend>(kSecondByTier));
 
     // OS-assigned ports are not reachable through PeerServiceServer::Start
     // (it does not report the bound port back), so probe a random high range
@@ -138,12 +138,12 @@ class PeerServiceDispatchTest : public ::testing::Test {
 // ---- Allocate ---------------------------------------------------------------
 
 TEST_F(PeerServiceDispatchTest, AllocateRoutesToTheBackendForItsTier) {
-  auto resp = Allocate("k", 128, kFirstByReadRank);
+  auto resp = Allocate("k", 128, kFirstByTier);
   ASSERT_EQ(resp.outcome(), ::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
   ASSERT_TRUE(Commit(resp.slot_id(), "k"));
 
-  EXPECT_EQ(Backend(kFirstByReadRank)->OwnedKeyCount(), 1u);
-  EXPECT_EQ(Backend(kSecondByReadRank)->OwnedKeyCount(), 0u);
+  EXPECT_EQ(Backend(kFirstByTier)->OwnedKeyCount(), 1u);
+  EXPECT_EQ(Backend(kSecondByTier)->OwnedKeyCount(), 0u);
 }
 
 TEST_F(PeerServiceDispatchTest, AllocateForATierWithNoBackendFailsCleanly) {
@@ -152,8 +152,8 @@ TEST_F(PeerServiceDispatchTest, AllocateForATierWithNoBackendFailsCleanly) {
   // whichever backend happens to exist.
   auto resp = Allocate("k", 128, TierType::SSD);
   EXPECT_EQ(resp.outcome(), ::umbp::ALLOCATE_SLOT_OUTCOME_FAILED);
-  EXPECT_EQ(Backend(kFirstByReadRank)->OwnedKeyCount(), 0u);
-  EXPECT_EQ(Backend(kSecondByReadRank)->OwnedKeyCount(), 0u);
+  EXPECT_EQ(Backend(kFirstByTier)->OwnedKeyCount(), 0u);
+  EXPECT_EQ(Backend(kSecondByTier)->OwnedKeyCount(), 0u);
 }
 
 // ---- The slot_id carries the tier -------------------------------------------
@@ -162,16 +162,16 @@ TEST_F(PeerServiceDispatchTest, ConcurrentSlotsOnTwoBackendsStayDistinct) {
   // Each backend numbers its own slots from 1, so without the tier tag these
   // two allocations would come back with the SAME opaque id and Commit could
   // not tell them apart.
-  auto first = Allocate("a", 8, kFirstByReadRank);
-  auto second = Allocate("b", 8, kSecondByReadRank);
+  auto first = Allocate("a", 8, kFirstByTier);
+  auto second = Allocate("b", 8, kSecondByTier);
   ASSERT_EQ(first.outcome(), ::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
   ASSERT_EQ(second.outcome(), ::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
   EXPECT_NE(first.slot_id(), second.slot_id());
 
   EXPECT_TRUE(Commit(first.slot_id(), "a"));
   EXPECT_TRUE(Commit(second.slot_id(), "b"));
-  EXPECT_EQ(Backend(kFirstByReadRank)->OwnedKeyCount(), 1u);
-  EXPECT_EQ(Backend(kSecondByReadRank)->OwnedKeyCount(), 1u);
+  EXPECT_EQ(Backend(kFirstByTier)->OwnedKeyCount(), 1u);
+  EXPECT_EQ(Backend(kSecondByTier)->OwnedKeyCount(), 1u);
 }
 
 TEST_F(PeerServiceDispatchTest, CommitOfAnUnknownSlotFails) {
@@ -189,7 +189,7 @@ TEST_F(PeerServiceDispatchTest, AbortOfAnUnknownSlotIsIdempotentlyTrue) {
 }
 
 TEST_F(PeerServiceDispatchTest, AbortReachesTheBackendThatOwnsTheSlot) {
-  auto allocated = Allocate("a", 8, kFirstByReadRank);
+  auto allocated = Allocate("a", 8, kFirstByTier);
   ASSERT_EQ(allocated.outcome(), ::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
 
   ::umbp::AbortSlotRequest req;
@@ -201,7 +201,7 @@ TEST_F(PeerServiceDispatchTest, AbortReachesTheBackendThatOwnsTheSlot) {
 
   // The slot is gone, so the commit that would have followed now fails.
   EXPECT_FALSE(Commit(allocated.slot_id(), "a"));
-  EXPECT_EQ(Backend(kFirstByReadRank)->OwnedKeyCount(), 0u);
+  EXPECT_EQ(Backend(kFirstByTier)->OwnedKeyCount(), 0u);
 }
 
 // ---- Mixed-tier batches -----------------------------------------------------
@@ -209,10 +209,10 @@ TEST_F(PeerServiceDispatchTest, AbortReachesTheBackendThatOwnsTheSlot) {
 TEST_F(PeerServiceDispatchTest, BatchAllocateGroupsByTierButAnswersInRequestOrder) {
   ::umbp::BatchAllocateSlotsRequest req;
   const std::vector<std::pair<std::string, TierType>> wanted = {
-      {"e0", kFirstByReadRank},
+      {"e0", kFirstByTier},
       {"e1", TierType::SSD},  // no backend -> FAILED, but keeps its slot in the answer
-      {"e2", kSecondByReadRank},
-      {"e3", kFirstByReadRank},
+      {"e2", kSecondByTier},
+      {"e3", kFirstByTier},
   };
   for (const auto& [key, tier] : wanted) {
     auto* entry = req.add_entries();
@@ -244,12 +244,12 @@ TEST_F(PeerServiceDispatchTest, BatchAllocateGroupsByTierButAnswersInRequestOrde
   for (int i = 0; i < 3; ++i) EXPECT_TRUE(commit_resp.success(i)) << "entry " << i;
 
   // e0 and e3 landed on the first backend, e2 on the second.
-  EXPECT_EQ(Backend(kFirstByReadRank)->OwnedKeyCount(), 2u);
-  EXPECT_EQ(Backend(kSecondByReadRank)->OwnedKeyCount(), 1u);
+  EXPECT_EQ(Backend(kFirstByTier)->OwnedKeyCount(), 2u);
+  EXPECT_EQ(Backend(kSecondByTier)->OwnedKeyCount(), 1u);
 }
 
 TEST_F(PeerServiceDispatchTest, BatchCommitOfAnUnroutableSlotReportsFalseInPlace) {
-  auto allocated = Allocate("a", 8, kSecondByReadRank);
+  auto allocated = Allocate("a", 8, kSecondByTier);
   ::umbp::BatchCommitSlotsRequest req;
   auto* bad = req.add_entries();
   bad->set_slot_id(0);  // tier UNKNOWN
@@ -268,11 +268,11 @@ TEST_F(PeerServiceDispatchTest, BatchCommitOfAnUnroutableSlotReportsFalseInPlace
 
 // ---- Resolve / Evict carry no tier ------------------------------------------
 
-TEST_F(PeerServiceDispatchTest, ResolveTakesTheFirstHitInReadRankOrder) {
+TEST_F(PeerServiceDispatchTest, ResolveTakesTheFirstHitInMediaOrder) {
   // Same key mirrored across both media with different sizes, so the response
   // says which one served it.
-  SeedKey(kFirstByReadRank, "mirrored", 111);
-  SeedKey(kSecondByReadRank, "mirrored", 222);
+  SeedKey(kFirstByTier, "mirrored", 111);
+  SeedKey(kSecondByTier, "mirrored", 222);
 
   ::umbp::ResolveKeyRequest req;
   req.set_key("mirrored");
@@ -284,7 +284,7 @@ TEST_F(PeerServiceDispatchTest, ResolveTakesTheFirstHitInReadRankOrder) {
 }
 
 TEST_F(PeerServiceDispatchTest, ResolveFindsAKeyHeldOnlyByALowerRankedMedium) {
-  SeedKey(kSecondByReadRank, "only-second", 77);
+  SeedKey(kSecondByTier, "only-second", 77);
 
   ::umbp::ResolveKeyRequest req;
   req.set_key("only-second");
@@ -305,7 +305,7 @@ TEST_F(PeerServiceDispatchTest, ResolveMissIsNotAnError) {
 }
 
 TEST_F(PeerServiceDispatchTest, BatchResolveReportsTheServingTier) {
-  SeedKey(kSecondByReadRank, "b-only", 55);
+  SeedKey(kSecondByTier, "b-only", 55);
 
   ::umbp::BatchResolveKeysRequest req;
   req.add_keys("absent");
@@ -317,15 +317,15 @@ TEST_F(PeerServiceDispatchTest, BatchResolveReportsTheServingTier) {
   EXPECT_FALSE(resp.found(0));
   EXPECT_TRUE(resp.found(1));
   ASSERT_EQ(resp.tier_size(), 2);
-  EXPECT_EQ(resp.tier(1), Proto(kSecondByReadRank));
+  EXPECT_EQ(resp.tier(1), Proto(kSecondByTier));
   EXPECT_EQ(resp.size(1), 55u);
 }
 
 TEST_F(PeerServiceDispatchTest, EvictFansOutAcrossEveryMedium) {
   // A key mirrored across media must disappear from ALL of them, and the freed
   // bytes master sizes its next round from are the sum.
-  SeedKey(kFirstByReadRank, "mirrored", 111);
-  SeedKey(kSecondByReadRank, "mirrored", 222);
+  SeedKey(kFirstByTier, "mirrored", 111);
+  SeedKey(kSecondByTier, "mirrored", 222);
 
   ::umbp::EvictKeyRequest req;
   req.add_keys("mirrored");
@@ -335,8 +335,8 @@ TEST_F(PeerServiceDispatchTest, EvictFansOutAcrossEveryMedium) {
   ASSERT_EQ(resp.evicted_size(), 1);
   EXPECT_EQ(resp.evicted(0).key(), "mirrored");
   EXPECT_EQ(resp.evicted(0).bytes_freed(), 333u);
-  EXPECT_EQ(Backend(kFirstByReadRank)->OwnedKeyCount(), 0u);
-  EXPECT_EQ(Backend(kSecondByReadRank)->OwnedKeyCount(), 0u);
+  EXPECT_EQ(Backend(kFirstByTier)->OwnedKeyCount(), 0u);
+  EXPECT_EQ(Backend(kSecondByTier)->OwnedKeyCount(), 0u);
 }
 
 TEST_F(PeerServiceDispatchTest, EvictOfAnAbsentKeyReportsZeroBytes) {
