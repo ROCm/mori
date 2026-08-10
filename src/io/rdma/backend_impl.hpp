@@ -280,6 +280,12 @@ class RdmaBackendSession : public BackendSession {
                       const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
                       bool isRead);
 
+  std::shared_ptr<PreparedTransfer> PrepareBatch(const SizeVec& localOffsets,
+                                                 const SizeVec& remoteOffsets, const SizeVec& sizes,
+                                                 bool isRead) override;
+  void PostPrepared(const std::shared_ptr<PreparedTransfer>& prepared, TransferStatus* status,
+                    TransferUniqueId id) override;
+
   bool Alive() const;
 
  private:

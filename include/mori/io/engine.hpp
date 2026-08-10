@@ -62,6 +62,18 @@ class IOEngineSession {
                  TransferStatus* status, TransferUniqueId id);
   void BatchWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets, const SizeVec& sizes,
                   TransferStatus* status, TransferUniqueId id);
+
+  // Prepared (build-once, post-many) transfers. PrepareBatch does the sort/merge/chunk
+  // work up front and returns a reusable handle, or nullptr if the backend does not
+  // support it. PostPrepared submits that handle again with a fresh status and id; the
+  // offsets and sizes are fixed at prepare time. Posts of one handle are serialized
+  // internally, so reuse across threads is safe but not concurrent.
+  std::shared_ptr<PreparedTransfer> PrepareBatch(const SizeVec& localOffsets,
+                                                 const SizeVec& remoteOffsets, const SizeVec& sizes,
+                                                 bool isRead);
+  void PostPrepared(const std::shared_ptr<PreparedTransfer>& prepared, TransferStatus* status,
+                    TransferUniqueId id);
+
   bool Alive();
 
   friend class IOEngine;
