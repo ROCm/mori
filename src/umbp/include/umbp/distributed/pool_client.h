@@ -45,7 +45,6 @@
 
 namespace mori::umbp {
 
-class PageBackend;
 class PeerServiceServer;
 class TransferEngine;
 
@@ -123,7 +122,11 @@ class PoolClient {
   std::vector<bool> BatchExists(const std::vector<std::string>& keys);
 
   MasterClient& Master();
-  PageBackend* DramAllocator();
+
+  // Every storage medium live on this node.  Callers reach a medium by tier
+  // (Backends().Get(TierType::DRAM)) and use it through MediumBackend — no
+  // concrete backend type is named outside PoolClient::Init.
+  BackendRegistry& Backends();
 
   bool IsInitialized() const;
 
@@ -159,15 +162,29 @@ class PoolClient {
 
   std::unique_ptr<MasterClient> master_client_;
 
-  // Every storage medium live on this node.  Owned here because PoolClient
-  // is the natural lifetime anchor for the per-process IO engine + backend
-  // pools; PeerServiceServer borrows the DRAM backend.  One instance per
-  // medium (backend-agnostic refactor Phase 2) — dram_backend_ is a
-  // non-owning convenience pointer into registry_ for the local fast path
-  // and other DRAM-specific call sites that predate the registry.
+  // Every storage medium live on this node.  Owned here because PoolClient is
+  // the natural lifetime anchor for the per-process IO engine + backend pools.
+  // PeerServiceServer and MasterClient both borrow the registry and dispatch
+  // through it (backend-agnostic refactor Phase 3).
   BackendRegistry registry_;
-  PageBackend* dram_backend_ = nullptr;
   std::unique_ptr<PeerServiceServer> peer_service_;
+
+  // The local (self-target) Put/Get fast path copies bytes with a raw memcpy,
+  // which needs a base pointer MediumBackend deliberately does not expose
+  // (design doc §2: bytes addressed by a raw pointer are medium-specific).  So
+  // PoolClient keeps a non-owning handle to the one backend whose bytes it can
+  // memcpy plus a snapshot of that backend's immutable bases; every other
+  // medium routes remotely.  Both go away in Phase 6, when a local transfer
+  // becomes just a transfer whose endpoints are both local.
+  struct LocalBufferView {
+    void* base = nullptr;
+    uint64_t size = 0;
+  };
+  MediumBackend* local_copy_backend_ = nullptr;
+  std::vector<LocalBufferView> local_buffers_;
+  bool CanCopyLocally(const MediumBackend* backend) const {
+    return backend != nullptr && backend == local_copy_backend_;
+  }
 
   std::unique_ptr<mori::io::IOEngine> io_engine_;
   // Registration shim handed to each backend's Init() (design doc §5 Phase 2 /

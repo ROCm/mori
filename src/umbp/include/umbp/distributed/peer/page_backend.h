@@ -36,7 +36,6 @@
 
 #include "mori/io/engine.hpp"
 #include "umbp/distributed/peer/medium_backend.h"
-#include "umbp/distributed/peer/owned_location_source.h"
 #include "umbp/distributed/peer/peer_page_allocator.h"
 #include "umbp/distributed/types.h"
 #include "umbp/local/host_mem_allocator.h"
@@ -69,16 +68,12 @@ class TransferEngine;
 //   3. For each key actually freed, a REMOVE event is queued.
 //   4. Heartbeat ships the REMOVE events and master drops the index entry.
 //
-// Multiple inheritance note: PageBackend implements both MediumBackend (the
-// distributed-storage contract, registry-dispatched) and OwnedLocationSource
-// (MasterClient's existing heartbeat event-source contract).  MediumBackend's
-// event methods (DrainPendingEvents/SnapshotOwnedKeys/SnapshotOwnedKeysForFullSync)
-// have identical signatures to OwnedLocationSource's, so ONE override below
-// satisfies both bases — this is a transitional bridge, not a design end
-// state: MediumBackend absorbs OwnedLocationSource's role (design doc §3), but
-// generalizing MasterClient to consume BackendRegistry directly is left to a
-// later phase so Phase 2 stays scoped to DRAM-becomes-a-backend.
-class PageBackend : public MediumBackend, public OwnedLocationSource {
+// MediumBackend is the only base: the Phase 2 transitional second base
+// (OwnedLocationSource) is gone, along with the type itself — MasterClient now
+// consumes BackendRegistry directly and MediumBackend carries the heartbeat
+// event contract (design doc §3, "this interface absorbs the existing
+// OwnedLocationSource").
+class PageBackend : public MediumBackend {
  public:
   // Buffers already known (bases/descs supplied by the caller at
   // construction).  Used directly by tests that want to exercise the
@@ -188,17 +183,21 @@ class PageBackend : public MediumBackend, public OwnedLocationSource {
   std::vector<BufferMemoryDescBytes> BufferDescsForPages(
       const std::vector<PageLocation>& pages) const;
 
-  // Raw base pointer + size for buffer_index, or {nullptr, 0} if out of
-  // range.  NOT part of MediumBackend (design doc §2: bytes addressed by a
-  // raw pointer are medium-specific) — this exists solely for PoolClient's
-  // local (self-target) Put/Get fast path, which design doc §5 Phase 2
-  // explicitly leaves as a host-DRAM-only raw memcpy until Phase 6 folds it
-  // into the transfer engine.
+  // Raw base pointer + size per buffer_index (index == position).  NOT part of
+  // MediumBackend (design doc §2: bytes addressed by a raw pointer are
+  // medium-specific) — this exists solely for PoolClient's local (self-target)
+  // Put/Get fast path, which design doc §5 Phase 2 explicitly leaves as a
+  // host-DRAM-only raw memcpy until Phase 6 folds it into the transfer engine.
+  //
+  // Returns ALL buffers in one call, deliberately: the bases are immutable
+  // after Init, so the copy loop snapshots them once instead of taking mutex_
+  // (the same lock every Allocate/Commit/Resolve and the heartbeat snapshot
+  // contend for) on every page it copies.
   struct LocalBuffer {
     void* base = nullptr;
     uint64_t size = 0;
   };
-  LocalBuffer LocalBufferView(uint32_t buffer_index) const;
+  std::vector<LocalBuffer> LocalBufferViews() const;
 
   // ==================== DRAM copy pin (SSD copy-on-commit) ====================
 
@@ -228,14 +227,9 @@ class PageBackend : public MediumBackend, public OwnedLocationSource {
 
   // ==================== Heartbeat auto-flush ====================
 
-  // Register a hook invoked (while the allocator lock is held) once the
-  // unshipped-event outbox reaches `threshold`, so the heartbeat is flushed
-  // automatically after a batch of puts instead of relying on the
-  // application to call FlushHeartbeat().  `cb` MUST be cheap and MUST NOT
-  // re-enter this object — it should only signal the heartbeat thread (set a
-  // flag + notify).  `threshold` should be >= 1; pass a very large value to
-  // disable.
-  void SetAutoFlushHook(size_t threshold, std::function<void()> cb);
+  // MediumBackend contract.  The hook is invoked while the allocator lock is
+  // held, so `cb` must not re-enter this object.  `threshold` should be >= 1.
+  void SetAutoFlushHook(size_t threshold, std::function<void()> cb) override;
 
   // ==================== Reaper ====================
 

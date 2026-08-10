@@ -35,7 +35,6 @@
 #include "umbp/common/env_time.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/master/rpc_latency_timer.h"
-#include "umbp/distributed/peer/page_backend.h"
 #include "umbp/distributed/peer/ssd/peer_ssd_manager.h"
 
 namespace mori::umbp {
@@ -399,27 +398,35 @@ size_t AutoFlushEventThreshold() {
 }
 }  // namespace
 
-void MasterClient::SetPeerDramAllocator(PageBackend* dram_alloc) {
-  peer_alloc_ = dram_alloc;
-  AddOwnedLocationSource(dram_alloc);
-  if (dram_alloc != nullptr) {
-    dram_alloc->SetAutoFlushHook(AutoFlushEventThreshold(), [this] { FlushHeartbeat(); });
+void MasterClient::SetBackendRegistry(BackendRegistry* registry) {
+  registry_ = registry;
+  // Every medium's outbox feeds the same single-bundle heartbeat, so each one
+  // gets the same auto-flush hook — a backend added to the registry starts
+  // flushing without any change here.
+  const size_t threshold = AutoFlushEventThreshold();
+  for (auto* backend : Backends()) {
+    backend->SetAutoFlushHook(threshold, [this] { FlushHeartbeat(); });
   }
 }
 
 void MasterClient::SetPeerSsdManager(PeerSsdManager* ssd_manager) {
-  // PeerSsdManager no longer implements OwnedLocationSource (backend-agnostic
-  // refactor Phase 0, see design-backend-agnostic-refactor.md): that wiring
-  // was exactly the coupling Phase 0 removes. Nothing calls this today (SSD
-  // is unwired from the distributed data plane), but the concrete pointer
-  // stays so a live capacity merge (see SnapshotAndCacheTierCapacities below)
-  // keeps working if a future caller re-wires it.
+  // PeerSsdManager is not a MediumBackend (backend-agnostic refactor Phase 0,
+  // see design-backend-agnostic-refactor.md): that wiring was exactly the
+  // coupling Phase 0 removes. Nothing calls this today (SSD is unwired from the
+  // distributed data plane), but the concrete pointer stays so a live capacity
+  // merge (see SnapshotAndCacheTierCapacities below) keeps working if a future
+  // caller re-wires it.
   ssd_manager_ = ssd_manager;
 }
 
-void MasterClient::AddOwnedLocationSource(OwnedLocationSource* source) {
-  if (source == nullptr) return;
-  owned_sources_.push_back(source);
+std::vector<MediumBackend*> MasterClient::Backends() const {
+  return registry_ == nullptr ? std::vector<MediumBackend*>{} : registry_->All();
+}
+
+std::map<TierType, uint64_t> MasterClient::OwnedKeyCountsByTier() const {
+  std::map<TierType, uint64_t> counts;
+  for (auto* backend : Backends()) counts[backend->Tier()] += backend->OwnedKeyCount();
+  return counts;
 }
 
 bool MasterClient::ClearFullSync() {
@@ -427,8 +434,7 @@ bool MasterClient::ClearFullSync() {
   if (!registered_) return false;
 
   auto caps = SnapshotAndCacheTierCapacities();
-  std::map<TierType, uint64_t> kv_counts;
-  if (peer_alloc_ != nullptr) kv_counts[peer_alloc_->Tier()] = peer_alloc_->OwnedKeyCount();
+  auto kv_counts = OwnedKeyCountsByTier();
 
   ::umbp::HeartbeatRequest req;
   req.set_node_id(config_.node_id);
@@ -454,9 +460,11 @@ bool MasterClient::ClearFullSync() {
     return false;
   }
 
-  if (peer_alloc_ != nullptr) {
-    peer_alloc_->ClearFullSyncAcked();
-    MORI_UMBP_INFO("[Client] Clear full-sync acked by master; allocator writes re-enabled");
+  auto backends = Backends();
+  for (auto* backend : backends) backend->ClearFullSyncAcked();
+  if (!backends.empty()) {
+    MORI_UMBP_INFO("[Client] Clear full-sync acked by master; writes re-enabled on {} backend(s)",
+                   backends.size());
   }
   return true;
 }
@@ -514,8 +522,8 @@ void MasterClient::HeartbeatLoop() {
 std::map<TierType, TierCapacity> MasterClient::SnapshotAndCacheTierCapacities() {
   std::map<TierType, TierCapacity> caps;
   bool have_live = false;
-  if (peer_alloc_ != nullptr) {
-    caps[peer_alloc_->Tier()] = peer_alloc_->Capacity();  // DRAM/HBM, bitmap-derived
+  for (auto* backend : Backends()) {
+    caps[backend->Tier()] = backend->Capacity();  // bitmap-derived, per medium
     have_live = true;
   }
   if (ssd_manager_ != nullptr) {
@@ -541,8 +549,7 @@ bool MasterClient::SendHeartbeatOnce() {
   if (!registered_) return false;
 
   auto caps = SnapshotAndCacheTierCapacities();
-  std::map<TierType, uint64_t> kv_counts;
-  if (peer_alloc_ != nullptr) kv_counts[peer_alloc_->Tier()] = peer_alloc_->OwnedKeyCount();
+  auto kv_counts = OwnedKeyCountsByTier();
 
   bool do_full_sync;
   {
@@ -573,7 +580,7 @@ bool MasterClient::SendFullSyncHeartbeatLocked(const std::map<TierType, TierCapa
     snapshot.seq = next_bundle_seq_ - 1;
     req.set_delta_seq_baseline(snapshot.seq);
   }
-  snapshot.events = SnapshotAllSourcesForFullSync(owned_sources_);
+  snapshot.events = SnapshotAllBackendsForFullSync(Backends());
   FillBundle(req.add_bundles(), snapshot);
 
   ::umbp::HeartbeatResponse resp;
@@ -590,7 +597,7 @@ bool MasterClient::SendDeltaHeartbeatLocked(const std::map<TierType, TierCapacit
   // Drain every owned-location source (DRAM allocator + SSD manager) and
   // concat into ONE bundle under ONE monotonic seq — never one seq per source,
   // which would break ack / seq-gap full-sync recovery.
-  auto new_events = DrainAllSources(owned_sources_);
+  auto new_events = DrainAllBackends(Backends());
   if (!new_events.empty()) {
     std::lock_guard state_lock(hb_state_mutex_);
     outbox_.push_back(EventBundle{next_bundle_seq_++, std::move(new_events)});

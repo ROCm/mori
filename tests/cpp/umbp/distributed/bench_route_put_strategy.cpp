@@ -330,7 +330,9 @@ class Cluster {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     for (auto& n : nodes_) {
       while (true) {
-        auto cap = n.client->DramAllocator()->Capacity();
+        auto* dram = n.client->Backends().Get(TierType::DRAM);
+        if (dram == nullptr) return false;
+        auto cap = dram->Capacity();
         const bool full = cap.available_bytes == cap.total_bytes;
         if (full) break;
         if (std::chrono::steady_clock::now() > deadline) return false;

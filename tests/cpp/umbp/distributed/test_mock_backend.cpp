@@ -105,4 +105,76 @@ TEST(BackendRegistryDispatch, RoutesByTierThroughTheInterfaceOnly) {
   EXPECT_EQ(registry.ByReadRank()[0], hbm);
 }
 
+// ---- Heartbeat event aggregation -------------------------------------------
+// These replace the OwnedLocationSourceAgg tests that lived in
+// test_peer_ssd_manager.cpp: OwnedLocationSource is gone and MediumBackend
+// carries the event contract (design doc §3, backend-agnostic refactor
+// Phase 3).  What matters is unchanged — every medium's events concat into ONE
+// list, in order, so the shipper can wrap them in a single bundle under one
+// monotonic seq.
+
+namespace {
+
+// Commit `key` on `b` so exactly one ADD lands in its outbox.
+void CommitOne(MediumBackend* b, const std::string& key, uint64_t size) {
+  auto allocated = b->BatchAllocate({{key, size}});
+  b->BatchCommit({{allocated[0].slot_id, key}});
+}
+
+}  // namespace
+
+TEST(BackendEventAgg, DrainAndSnapshotConcatAcrossBackendsInOrder) {
+  MockBackend hbm(TierType::HBM);
+  MockBackend ssd(TierType::SSD);
+  CommitOne(&hbm, "h1", 10);
+  CommitOne(&ssd, "s1", 30);
+
+  std::vector<MediumBackend*> backends = {&hbm, &ssd};
+
+  auto drained = DrainAllBackends(backends);
+  ASSERT_EQ(drained.size(), 2u);
+  EXPECT_EQ(drained[0].key, "h1");
+  EXPECT_EQ(drained[0].tier, TierType::HBM);
+  EXPECT_EQ(drained[1].key, "s1");
+  EXPECT_EQ(drained[1].tier, TierType::SSD);
+  // Drain cleared both outboxes.
+  EXPECT_TRUE(DrainAllBackends(backends).empty());
+
+  // The full-sync snapshot reports owned keys regardless of the drained outbox.
+  auto snap = SnapshotAllBackendsForFullSync(backends);
+  ASSERT_EQ(snap.size(), 2u);
+  EXPECT_EQ(snap[1].tier, TierType::SSD);
+}
+
+TEST(BackendEventAgg, FullSyncSnapshotAlsoDropsTheOutbox) {
+  MockBackend b(TierType::HBM);
+  CommitOne(&b, "x", 1);
+
+  // Snapshot is authoritative, so the still-queued ADD must not be re-shipped
+  // as a redundant delta afterwards.
+  auto snap = SnapshotAllBackendsForFullSync({&b});
+  ASSERT_EQ(snap.size(), 1u);
+  EXPECT_TRUE(DrainAllBackends({&b}).empty());
+}
+
+TEST(BackendEventAgg, NullBackendsAreSkipped) {
+  MockBackend only(TierType::SSD);
+  CommitOne(&only, "x", 1);
+  std::vector<MediumBackend*> backends = {nullptr, &only, nullptr};
+  auto drained = DrainAllBackends(backends);
+  ASSERT_EQ(drained.size(), 1u);
+  EXPECT_EQ(drained[0].key, "x");
+  EXPECT_TRUE(SnapshotAllBackendsForFullSync({nullptr}).empty());
+}
+
+TEST(BackendEventAgg, AutoFlushHookFiresAtThreshold) {
+  MockBackend b(TierType::HBM);
+  int fires = 0;
+  b.SetAutoFlushHook(2, [&] { ++fires; });
+  CommitOne(&b, "a", 1);
+  EXPECT_EQ(fires, 0);
+  CommitOne(&b, "b", 1);
+  EXPECT_EQ(fires, 1);
+}
+
 }  // namespace mori::umbp

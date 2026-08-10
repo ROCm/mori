@@ -29,32 +29,31 @@
 
 namespace mori::umbp {
 
-class PageBackend;
+class BackendRegistry;
 class MasterClient;
 
 class PeerServiceServer {
  public:
-  // `dram_alloc` is non-owning and may be null when the host process has no
-  // DRAM/HBM tier.  When null, the AllocateSlot/CommitSlot/AbortSlot/
-  // ResolveKey/EvictKey handlers respond with success=false / found=false.
+  // `registry` is non-owning (PoolClient outlives this server) and may be null
+  // when the host process has no storage medium at all.  Handlers dispatch on
+  // the request's tier tag through the registry — no concrete backend type is
+  // named here (backend-agnostic refactor Phase 3).  A request for a tier with
+  // no live backend responds success=false / found=false, exactly as a null
+  // registry does; it is never an error, since a node configured with DRAM
+  // only is a normal deployment.
   //
   // SSD read staging (PrepareSsdRead/ReleaseSsdLease) was removed in the
   // backend-agnostic refactor Phase 0 — SSD is unwired from the distributed
   // data plane (see design-backend-agnostic-refactor.md).
-  PeerServiceServer(PageBackend* dram_alloc, std::vector<uint8_t> engine_desc_bytes = {},
+  PeerServiceServer(BackendRegistry* registry, std::vector<uint8_t> engine_desc_bytes = {},
                     MasterClient* master_client = nullptr);
   ~PeerServiceServer();
 
   bool Start(uint16_t port);
   void Stop();
 
-  // Read-only access for the heartbeat shipper (lives in MasterClient
-  // / PoolClient).  Never null after construction with a non-null
-  // allocator argument.
-  PageBackend* DramAllocator() const { return dram_alloc_; }
-
  private:
-  PageBackend* dram_alloc_;
+  BackendRegistry* registry_;
   MasterClient* master_client_;
 
   std::vector<uint8_t> engine_desc_bytes_;

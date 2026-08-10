@@ -30,7 +30,6 @@
 #include <utility>
 #include <vector>
 
-#include "umbp/distributed/peer/owned_location_source.h"
 #include "umbp/distributed/peer/ssd/peer_ssd_manager.h"
 
 namespace mori::umbp {
@@ -180,58 +179,4 @@ TEST_F(PeerSsdManagerTest, PrepareReadRejectsOverCapBeforeIo) {
 }
 
 }  // namespace
-// ---- Unified owned-location source aggregation ------------------------------
-
-// Minimal OwnedLocationSource that replays a fixed event list, used to verify
-// MasterClient's multi-source concat logic without a live master.
-class FakeSource : public OwnedLocationSource {
- public:
-  explicit FakeSource(std::vector<KvEvent> events) : events_(std::move(events)) {}
-  std::vector<KvEvent> DrainPendingEvents() override {
-    auto out = events_;
-    drained_ = true;
-    return out;
-  }
-  std::vector<KvEvent> SnapshotOwnedKeys() const override { return events_; }
-  std::vector<KvEvent> SnapshotOwnedKeysForFullSync() override {
-    drained_ = true;  // outbox dropped by the authoritative full-sync snapshot
-    return events_;
-  }
-  bool drained_ = false;
-
- private:
-  std::vector<KvEvent> events_;
-};
-
-TEST(OwnedLocationSourceAgg, DrainAndSnapshotConcatAcrossSourcesInOrder) {
-  FakeSource dram({{KvEvent::Kind::ADD, "d1", TierType::DRAM, 10},
-                   {KvEvent::Kind::ADD, "d2", TierType::DRAM, 20}});
-  FakeSource ssd({{KvEvent::Kind::ADD, "s1", TierType::SSD, 30}});
-
-  std::vector<OwnedLocationSource*> sources = {&dram, &ssd};
-
-  auto drained = DrainAllSources(sources);
-  ASSERT_EQ(drained.size(), 3u);
-  EXPECT_EQ(drained[0].key, "d1");
-  EXPECT_EQ(drained[0].tier, TierType::DRAM);
-  EXPECT_EQ(drained[1].key, "d2");
-  EXPECT_EQ(drained[2].key, "s1");
-  EXPECT_EQ(drained[2].tier, TierType::SSD);
-  EXPECT_TRUE(dram.drained_);
-  EXPECT_TRUE(ssd.drained_);
-
-  auto snap = SnapshotAllSourcesForFullSync(sources);
-  ASSERT_EQ(snap.size(), 3u);
-  EXPECT_EQ(snap[2].tier, TierType::SSD);
-}
-
-TEST(OwnedLocationSourceAgg, NullSourcesAreSkipped) {
-  FakeSource only({{KvEvent::Kind::ADD, "x", TierType::SSD, 1}});
-  std::vector<OwnedLocationSource*> sources = {nullptr, &only, nullptr};
-  auto drained = DrainAllSources(sources);
-  ASSERT_EQ(drained.size(), 1u);
-  EXPECT_EQ(drained[0].key, "x");
-  EXPECT_TRUE(SnapshotAllSourcesForFullSync({nullptr}).empty());
-}
-
 }  // namespace mori::umbp
