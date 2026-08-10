@@ -186,7 +186,7 @@ def parse_args():
         "--transfer-batch-size",
         type=int,
         default=256,
-        help="Number of transfer per iteration, default: 64",
+        help="Number of transfer per iteration, default: 256",
     )
     parser.add_argument(
         "--enable-batch-transfer",
@@ -480,6 +480,11 @@ class MoriIoBenchmark:
             )
 
     def _setup_xgmi(self):
+        # XgmiBackend::CanHandle rejects any descriptor that is not GPU memory, so a
+        # host-memory run would only fail once the session is created. Reject it here,
+        # the same way fabric does below.
+        if self.mem_type != "gpu":
+            raise ValueError("xgmi backend supports GPU memory only")
         if self.xgmi_multiprocess:
             self.world_size = 2
             if self.node_rank == 0:
