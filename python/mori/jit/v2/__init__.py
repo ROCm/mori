@@ -19,20 +19,34 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-#
-# The dispatch/combine (v2) op. The base class and config live in
-# dispatch_combine_op and import no kernel backend, so this package imports
-# without FlyDSL: the flydsl backend (needs `pip install amd_mori[flydsl]`) and
-# the hip backend are each imported lazily, only when selected. mori.ops still
-# lazy-loads this submodule.
-from .dispatch_combine_op import (
-    EpDispatchCombineConfig,
-    EpDispatchCombineOp,
-    EpDispatchRoutingHandle,
+"""JIT v2: the Python binding to the C++ Cfg-as-NTTP / content-addressed JIT
+framework (libmori_jit.so, ``include/mori/jit`` + ``src/jit``).
+
+Distinct from the v1 ``mori.jit`` bitcode compiler (``mori.jit.core`` /
+``mori.jit.cache``): v1 drives hipcc from Python and assembles the cache key by
+hand; v2 renders a Cfg struct to source in C++ and the rendered text *is* the
+key. The two share the ``mori.jit`` namespace and the ``~/.mori/jit`` cache root
+on purpose (see docs/MORI_JIT_V2_DESIGN.md).
+
+Op-agnostic: an op registers its kernels by loading its library
+(``load_library("libmori_ops_v2.so")``), then ``make_plan("<kernel>")`` builds a
+Plan class from the C++-published schema.
+"""
+
+from mori.jit.v2.plan_api import (
+    DTYPES,
+    library_path,
+    load_library,
+    make_plan,
+    precompile,
+    registered_plans,
 )
 
 __all__ = [
-    "EpDispatchCombineConfig",
-    "EpDispatchCombineOp",
-    "EpDispatchRoutingHandle",
+    "DTYPES",
+    "library_path",
+    "load_library",
+    "make_plan",
+    "precompile",
+    "registered_plans",
 ]

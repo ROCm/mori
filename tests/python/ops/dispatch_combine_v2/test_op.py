@@ -186,11 +186,16 @@ def main():
             idx_c = idx[:ct].cpu().numpy()
             # local_expert_count: global sum over ranks == world*ct*K (every
             # (token,k) assignment is recorded on exactly the rank owning it).
-            lec_sum = int(op.local_expert_count().sum().cpu().item())
+            # Capability-gated: a backend that does not implement this says so
+            # through op.capabilities rather than by failing at the call.
+            has_lec = "local_expert_count" in getattr(op, "capabilities", frozenset())
+            lec_sum = (
+                int(op.local_expert_count().sum().cpu().item()) if has_lec else 0
+            )
             sync()
             comm.barrier()
             lec_total = d.allreduce_sum(lec_sum)
-            if rank == 0:
+            if rank == 0 and has_lec:
                 ok_lec = lec_total == npes * ct * K
                 print(
                     f"# OP-LEC ct={ct}: {'PASS' if ok_lec else 'FAIL'} "

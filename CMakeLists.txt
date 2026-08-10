@@ -271,6 +271,11 @@ if(BUILD_CCO)
   add_subdirectory(src/cco)
 endif()
 
+# JIT v2 host runtime. Host-only (HIP runtime API, no device code), so it needs
+# no hipcc at build time — see docs/MORI_JIT_V2_DESIGN.md.
+add_subdirectory(src/jit/v2)
+add_subdirectory(src/ops/dispatch_combine_v2)
+
 if(BUILD_OPS)
   add_subdirectory(src/ops)
 endif()

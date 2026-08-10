@@ -29,7 +29,28 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
+import ctypes
+
 import mori.cco.cco as _cco
+
+
+def _clear_hip_last_error() -> int:
+    """Consume the HIP runtime's per-thread sticky error and return it.
+
+    comm_create leaves hipErrorNotSupported (801) latched -- some probe inside it
+    fails benignly and nobody clears the flag. The next thing to call
+    hipGetLastError then reports it as its own failure: torch does exactly that
+    around every kernel launch, so the first torch GPU kernel after
+    Communicator.init dies with "HIP error: operation not supported" while
+    memcpys and non-torch launches sail through. It looks intermittent because
+    reading the flag also resets it, so only the first check ever sees it.
+
+    Clearing here is a boundary fix. The real one is to stop latching it.
+    """
+    try:
+        return int(ctypes.CDLL("libamdhip64.so").hipGetLastError())
+    except OSError:
+        return 0
 
 
 __all__ = [
@@ -354,6 +375,7 @@ class Communicator:
         comm._raw = _cco.comm_create(uid, nranks, rank, per_rank_vmm)
         comm._rank = rank
         comm._nranks = nranks
+        _clear_hip_last_error()
         return comm
 
     def destroy(self) -> None:

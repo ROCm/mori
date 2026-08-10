@@ -1,11 +1,17 @@
-# cco-LSA intranode MoE dispatch / combine (ops v2, FlyDSL)
+# cco-LSA intranode MoE dispatch / combine (ops v2)
 
 Intranode (single-node, EP8) MoE dispatch + combine built on **mori-cco LSA**
-(intra-node P2P over the flat symmetric VA) and **FlyDSL** device kernels. A
-mori-parity reimplementation that swaps the mori-shmem provider for cco-LSA:
-peer addresses are computed in-kernel via `cco.Window(arena).lsa_ptr(pe, off)`,
-no host P2P tables. Reference = ROCm/FlyDSL PR #522
-(`dispatch_combine_intranode_{kernel,op}.py`).
+(intra-node P2P over the flat symmetric VA). One op class, `EpDispatchCombineOp`,
+behind two interchangeable kernel backends:
+
+- **flydsl** (default): FlyDSL device kernels, the full feature set (gather +
+  scatter combine, fp8/fp4, quant, StdMoE, per-token scales, routing replay).
+- **hip**: C++/HIP kernels JIT-compiled by the v2 JIT framework (bf16/fp32 gather
+  only); works on a machine with no FlyDSL. See `docs/MORI_JIT_V2_DESIGN.md`.
+
+Select with `cfg.kernel_backend` or `MORI_V2_KERNEL_BACKEND`. Peer addresses are
+computed in-kernel over the flat LSA VA, no host P2P tables. Reference =
+ROCm/FlyDSL PR #522 (`dispatch_combine_intranode_{kernel,op}.py`).
 
 Supported token dtypes: **bf16**, **f32**, **fp8** (gather-only; OCP e4m3 on
 gfx950, e4m3**fnuz** max 240 on gfx942) and **fp4** (e2m1, gather-only,
@@ -18,23 +24,24 @@ keeps a bf16 external payload); per-token scales forwarding;
 `max_total_recv_tokens` cap; mori-parity host op-layer + per-device,
 dtype-aware tuning table. Not done: `skip_stage1` (FlyDSL-only).
 
-> **Test-only, not a mori API (yet).** These modules import each other by
-> top-level name (`from intranode_kernels import ...`, `import flydsl_prims as P`)
-> and have no `__init__.py`; they only resolve after the tests do
-> `sys.path.insert(0, <this dir>)`. There is no `mori.ops.dispatch_combine_v2`
-> package export, so `import mori.ops.dispatch_combine_v2.dispatch_combine_op`
-> will fail. Use it via the test/bench harnesses below. Wiring it in as a real
-> package (relative imports + `__init__.py` + `ops/__init__.py` export) is a
-> follow-up.
+This is a real package: `from mori.ops.dispatch_combine_v2 import
+EpDispatchCombineConfig, EpDispatchCombineOp`. Importing it pulls in **no** kernel
+backend — the base and config live in `dispatch_combine_op.py`; each backend is imported
+lazily, only when selected, so the package imports without FlyDSL installed.
 
 ## Layout
 
 | file | role |
 |---|---|
-| `flydsl_prims.py` | device primitives: system atomics / ordered stores / fences / volatile-spin waits |
-| `intranode_kernels.py` | all FlyDSL intranode kernel factories: `make_dispatch` (+scales/replay), `make_combine` (gather) / `make_combine_scatter` (`_nop2p`, bf16/f32/fp8/fp4), `make_convert_dispatch_output` / `make_convert_combine_input` (StdMoE), `make_local_expert_count` |
-| `dispatch_combine_op.py` | `SymmArena` + `EpDispatchCombineOp` / `EpDispatchCombineConfig` (+`.tuned()`) / `EpDispatchRoutingHandle` — mori-parity host op-layer (scales, scatter/quant combine, StdMoE, recv cap, LEC, reset, replay) |
-| `tuning_configs.py` | per-(world,hidden,topk) block/warp lookup |
+| `dispatch_combine_op.py` | backend-agnostic base + entry: `EpDispatchCombineConfig` (+`.tuned()`), `EpDispatchCombineOp` (backend selector + shared dispatch/combine/reset/lifecycle), `EpDispatchRoutingHandle`, `KernelSet` |
+| `flydsl_backend.py` | **flydsl** backend subclass (`EpDispatchCombineOpFlyDSL`): arena layout + FlyDSL kernel binding for the full feature set |
+| `hip_backend.py` | **hip** backend subclass (`EpDispatchCombineOpHip`): arena layout + C++/JIT plan binding, bf16/fp32 gather; rejects unsupported configs at construction |
+| `ep_plans.py` | EP-specific shim: loads `libmori_ops_v2.so` and exposes `EpDispatchPlan`/`EpCombinePlan`. The generic ctypes binding it calls lives in `mori.jit.v2.plan_api` (the plan_api C ABI), not here |
+| `symm_arena.py` | `SymmArena`: one cco-LSA window carved into named regions |
+| `flydsl_prims.py` | FlyDSL device primitives: system atomics / ordered stores / fences / volatile-spin waits |
+| `intranode_kernels.py` | FlyDSL kernel factories: `make_dispatch` (+scales/replay), `make_combine` (gather) / `make_combine_scatter` (`_nop2p`, bf16/f32/fp8/fp4), `make_convert_dispatch_output` / `make_convert_combine_input` (StdMoE), `make_local_expert_count` |
+| `tuning_configs.py` | **flydsl** kernel geometry: per-(world,hidden,topk) block/warp lookup |
+| `hip_tuning_configs.py` | **hip** kernel geometry, separate table (never borrows flydsl's); same `lookup` contract. Skeleton — schedules unfilled, returns hip single-shot default until the hip kernel is separately tuned |
 
 Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 

@@ -19,27 +19,52 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""mori-parity host op-layer for the cco-LSA intranode dispatch/combine kernels.
+"""Backend-agnostic base + entry point for the v2 EP op.
 
-One SymmArena window holds the symmetric staging; per-rank metadata are plain
-device tensors surfaced to the caller via from_gpu_ptr.
+This module owns the op class and its config; it imports no kernel backend. Two
+backends live beside it -- FlyDSL (``flydsl_backend``) and HIP/JIT
+(``hip_backend``) -- behind this one class. Callers keep writing::
+
+    op = EpDispatchCombineOp(cfg, comm)
+
+and get whichever backend ``cfg.kernel_backend`` (or ``MORI_V2_KERNEL_BACKEND``)
+names, defaulting to flydsl. ``EpDispatchCombineOpHip(cfg, comm)`` also works if
+you want to be explicit, and ``isinstance(op, EpDispatchCombineOp)`` holds either
+way.
+
+**This module imports neither backend.** Selecting one imports only that one, so
+the HIP backend is usable on a machine with no flydsl -- which is the whole point
+of having a seam rather than a fork.
+
+A subclass supplies exactly two things:
+
+    _regions(cfg)              -> [(name, nbytes)]   arena layout it needs
+    _build_kernels(cfg, arena) -> KernelSet          bound, ready-to-launch kernels
+
+Everything else -- the arena, the scratch buffers, variant selection, the
+lifecycle -- is here, because both backends agree on all of it. Behavioural
+differences between the two are *data* on the KernelSet, not methods to override;
+that shape is borrowed from aiter's ``MOEMetadata`` (aiter/fused_moe.py), which
+carries ``stage1``/``stage2`` callables next to the flags telling the caller how
+to feed them.
 """
-from dataclasses import dataclass
+
+from __future__ import annotations
+
+import importlib
+import os
+from dataclasses import dataclass, field
+from typing import Callable
 
 import torch
 
-import flydsl.expr as fx
 from mori.tensor_utils import from_gpu_ptr
 
-from .intranode_kernels import (
-    xdb_flag_slots,
-    make_dispatch,
-    make_combine,
-    make_combine_scatter,
-    make_convert_dispatch_output,
-    make_convert_combine_input,
-    make_local_expert_count,
-)
+# Where each backend lives. Imported lazily, on selection only.
+_BACKEND_MODULES = {"flydsl": "flydsl_backend", "hip": "hip_backend"}
+
+DEFAULT_BACKEND = "flydsl"
+
 
 _QUANT_TYPES = ("none", "fp8_direct_cast", "fp8_blockwise")
 
@@ -52,58 +77,6 @@ _DT = {
 _FP8_DTYPES = (torch.float8_e4m3fnuz, torch.float8_e4m3fn)
 
 
-def _align_up(x, a):
-    return (x + a - 1) // a * a
-
-
-class SymmArena:
-    """One cco symmetric window carved into named, aligned sub-regions. A kernel
-    reaches peer pe's copy of region R via cco.Window(handle).lsa_ptr(pe, off_R)."""
-
-    _ALIGN = 256
-
-    def __init__(self, comm, regions):
-        self._comm = comm
-        self._offsets = {}
-        self._sizes = {}
-        off = 0
-        for name, nbytes in regions:
-            off = _align_up(off, self._ALIGN)
-            self._offsets[name] = off
-            self._sizes[name] = nbytes
-            off += nbytes
-        self._total = max(_align_up(off, self._ALIGN), self._ALIGN)
-        self._mem = comm.alloc_mem(self._total)
-        self._win = comm.register_window(self._mem.ptr, self._total)
-
-    @property
-    def handle(self):
-        return self._win.handle
-
-    @property
-    def total_bytes(self):
-        return self._total
-
-    def offset(self, name):
-        return self._offsets[name]
-
-    def local_ptr(self, name):
-        return self._win.local_ptr + self._offsets[name]
-
-    def zero(self, name=None):
-        """Zero the whole window, or just region `name` if given. Wraps the raw
-        pointer as a zero-copy int8 torch view (borrowed via
-        __cuda_array_interface__ — no ownership taken) and memsets it."""
-        if name is None:
-            ptr, nbytes = self._win.local_ptr, self._total
-        else:
-            ptr, nbytes = self.local_ptr(name), self._sizes[name]
-        from_gpu_ptr(ptr, (nbytes,), torch.int8).zero_()
-
-    def close(self):
-        """Free the symmetric window (deregister before freeing the backing mem)."""
-        self._win.close()
-        self._mem.close()
 
 
 @dataclass
@@ -141,6 +114,11 @@ class EpDispatchCombineConfig:
     schedule: tuple = None
     enable_std_moe: bool = False
     max_total_recv_tokens: int = 0  # mori maxTotalRecvTokens; 0 = worst-case ws*M
+    # Which kernel backend serves this op: "flydsl" (default, full feature set)
+    # or "hip" (HIP/JIT, bf16/fp32 gather only). None = MORI_V2_KERNEL_BACKEND,
+    # else the default. Only consulted when constructing the BASE class; naming a
+    # subclass directly wins.
+    kernel_backend: str = None
 
     def __post_init__(self):
         # all-or-none: setting only one silently defaults the other to data_type.
@@ -210,10 +188,14 @@ class EpDispatchCombineConfig:
     def _resolve_geometry(self):
         """Fill block/warp/schedule. Tuned-by-default: when the caller pinned
         neither a schedule nor any block/warp, pull the tuned geometry for this
-        device/shape/dtype from tuning_configs.lookup (so the plain constructor is
-        tuned automatically — EpDispatchCombineConfig.tuned() is now just an
-        explicit alias). If any field is pinned, honor it and fill the rest with
-        the single-shot fallback (no schedule)."""
+        device/shape/dtype from the SELECTED BACKEND's tuning table (so the plain
+        constructor is tuned automatically — EpDispatchCombineConfig.tuned() is now
+        just an explicit alias). If any field is pinned, honor it and fill the rest
+        with the single-shot fallback (no schedule).
+
+        Each backend tunes its OWN kernel: the hip and flydsl kernels are different
+        implementations with different optima, so hip reads hip_tuning_configs and
+        flydsl reads tuning_configs -- they never share a table."""
         pinned = self.schedule is not None or any(
             g is not None
             for g in (
@@ -224,7 +206,15 @@ class EpDispatchCombineConfig:
             )
         )
         if not pinned:
-            from .tuning_configs import lookup
+            backend = (
+                self.kernel_backend
+                or os.environ.get("MORI_V2_KERNEL_BACKEND")
+                or DEFAULT_BACKEND
+            )
+            if backend == "hip":
+                from .hip_tuning_configs import lookup
+            else:
+                from .tuning_configs import lookup
 
             t = lookup(
                 self.world_size,
@@ -385,6 +375,39 @@ class EpDispatchCombineConfig:
         return self.world_size * self.effective_max_recv_per_rank
 
 
+@dataclass
+class KernelSet:
+    """What a backend hands back: the kernels, plus how it wants to be driven.
+
+    The flags exist so the shared op body can branch on *data* instead of the
+    base calling overridable hooks for every small difference. Adding a backend
+    with a new quirk adds a flag here, not a method to every subclass.
+    """
+
+    # (block_num, warp_num) -> callable. Keys must cover every spec the op's
+    # schedule can select; the op clamps to what is present.
+    dispatch: dict[tuple[int, int], Callable]
+    combine: dict[tuple[int, int], Callable]
+    # Replay-routing dispatch. None = this backend has no replay.
+    dispatch_replay: dict[tuple[int, int], Callable] | None = None
+
+    # True  -> combine's kernel stages the caller's tokens into out_tok itself.
+    # False -> the op must copy them in on the host first (one extra torch kernel).
+    stages_in_kernel: bool = False
+    # True  -> the kernels reset their own counters/barriers; the op must not
+    #          memset them, and on symmetric regions it MUST NOT (a peer may have
+    #          already delivered a signal, and wiping it hangs both ranks).
+    self_resets_counters: bool = True
+
+    # Advertised feature names, for callers that want to probe before asking.
+    capabilities: frozenset[str] = frozenset()
+    # Non-empty => this backend cannot serve the config it was built for. The op
+    # raises with these at construction, so a caller never holds an object that
+    # will fail later.
+    unsupported: tuple[str, ...] = ()
+
+
+
 class EpDispatchRoutingHandle:
     """Per-call routing snapshot (mori EpDispatchRoutingHandle parity).
 
@@ -447,258 +470,172 @@ class EpDispatchRoutingHandle:
 
 
 class EpDispatchCombineOp:
-    def __init__(self, cfg: EpDispatchCombineConfig, comm):
-        self.cfg = cfg
-        self.comm = comm
-        device = torch.device("cuda", torch.cuda.current_device())
-        self.dev = device
-        elem_size = cfg.elem_size
-        is_fp4 = cfg.is_fp4
-        is_fp8 = cfg.is_fp8
-        token_nbytes = cfg.token_nbytes  # per-token transport bytes (fp4 = hidden/2)
-        if (is_fp4 or is_fp8) and cfg.is_scatter:
+    """Base + backend selector. Instantiating this picks a subclass."""
+
+    _BACKENDS: dict[str, type] = {}
+    backend_name: str | None = None
+
+    # -- registration / selection -----------------------------------------
+
+    def __init_subclass__(cls, backend: str | None = None, **kw):
+        super().__init_subclass__(**kw)
+        if backend:
+            cls.backend_name = backend
+            EpDispatchCombineOp._BACKENDS[backend] = cls
+
+    @staticmethod
+    def _resolve_backend(name: str) -> type:
+        if name not in EpDispatchCombineOp._BACKENDS:
+            mod = _BACKEND_MODULES.get(name)
+            if mod is None:
+                raise ValueError(
+                    f"unknown kernel backend {name!r}; "
+                    f"known: {sorted(_BACKEND_MODULES)}"
+                )
+            try:
+                importlib.import_module("." + mod, __package__)
+            except ImportError as e:
+                raise ImportError(
+                    f"kernel backend {name!r} is not available: importing {mod!r} "
+                    f"failed with {e}. Pick another backend with "
+                    f"MORI_V2_KERNEL_BACKEND or cfg.kernel_backend."
+                ) from e
+            if name not in EpDispatchCombineOp._BACKENDS:
+                raise ImportError(
+                    f"module {mod!r} imported but registered no {name!r} backend"
+                )
+        return EpDispatchCombineOp._BACKENDS[name]
+
+    def __new__(cls, cfg=None, comm=None, *a, **kw):
+        # Only the base dispatches; instantiating a subclass directly is honoured.
+        if cls is EpDispatchCombineOp:
+            name = (
+                getattr(cfg, "kernel_backend", None)
+                or os.environ.get("MORI_V2_KERNEL_BACKEND")
+                or DEFAULT_BACKEND
+            )
+            cls = EpDispatchCombineOp._resolve_backend(name)
+        return super().__new__(cls)
+
+    @classmethod
+    def available_backends(cls) -> list[str]:
+        """Backends that actually import on this machine."""
+        out = []
+        for name in _BACKEND_MODULES:
+            try:
+                cls._resolve_backend(name)
+                out.append(name)
+            except (ImportError, ValueError):
+                pass
+        return out
+
+    # -- hooks a subclass must supply --------------------------------------
+    #
+    # Exactly three, and no more: the arena layout, the kernels, and (optionally)
+    # what the backend cannot do. Everything a caller touches -- dispatch(),
+    # combine(), the views, _pick, close -- is implemented once, here.
+
+    def _regions(self, cfg) -> list[tuple[str, int]]:
+        """[(region_name, nbytes)] this backend needs carved out of the arena.
+
+        The subclass maps region names to its own offset parameters itself; the
+        base never passes offsets around. That is deliberate -- FlyDSL's
+        `off_out_tok` means "disp_out" to make_dispatch and "out_tok" to
+        make_combine, so any shared offset-passing path silently wires one of
+        them to the wrong buffer.
+        """
+        raise NotImplementedError
+
+    def _build_kernels(self, cfg, arena) -> KernelSet:
+        """Compile/bind every variant and describe how they want to be driven.
+
+        The callables in the returned KernelSet MUST accept these keyword
+        arguments and nothing else -- the base calls them uniformly, so each
+        backend adapts its own convention here rather than the base learning
+        both:
+
+            dispatch(input, indices, weights, scales, dest_map, num_tokens)
+            combine (input, dest_map, total_recv, num_tokens)
+
+        Everything else a kernel needs (the window handle, counters, barriers,
+        rank, stream, output buffers) is backend-internal state the closure
+        captures. Compilation happens HERE and only here: `_pick` must never be
+        able to trigger one, or a capture would fork a compiler mid-graph.
+        """
+        raise NotImplementedError
+
+    def _unsupported(self, cfg) -> tuple[str, ...]:
+        """Reasons this backend cannot serve `cfg`. Empty = it can."""
+        return ()
+
+    # -- shared: capability gate -------------------------------------------
+
+    def _gate(self, kernels: KernelSet) -> None:
+        if kernels.unsupported:
             raise ValueError(
-                "plain fp4/fp8 token dtype is gather-only "
-                "(fp8 quant uses quant_type=fp8_direct_cast, not data_type)"
+                f"{self.backend_name} backend cannot serve this config:\n  "
+                + "\n  ".join(kernels.unsupported)
             )
-        topk = cfg.num_experts_per_token
-        hidden_dim = cfg.hidden_dim
-        max_tok_per_rank = cfg.max_num_inp_token_per_rank
-        recv_cap = cfg.effective_max_recv  # recv-slot cap (== ws*M unless capped)
-        self._recv_cap = recv_cap
 
-        self._scale_bytes = cfg.scale_dim * cfg.scale_type_size
-        self._scale_num_i32 = (self._scale_bytes + 3) // 4
-        self._enable_scales = self._scale_bytes > 0
+    @property
+    def capabilities(self) -> frozenset[str]:
+        return self._kernels.capabilities
 
-        regions = [
-            ("tok_off", 4),
-            ("recv_num", cfg.world_size * 4),
-            ("recv_to_src_token", recv_cap * 4),
-            ("out_idx", recv_cap * topk * 4),
-            ("out_wts", recv_cap * topk * 4),
-            # disp_out: dispatch scatter dest / expert-GEMM input (recv_x). Kept
-            # separate from out_tok so combine's copy-in never clobbers the
-            # dispatched tokens the expert still reads — callers can skip .clone().
-            ("disp_out", recv_cap * token_nbytes),
-            # out_tok: combine staging (post-expert results that peers gather).
-            ("out_tok", recv_cap * cfg.combine_token_nbytes),
-            ("cross_device_barrier", cfg.world_size * 8),
-        ]
-        if self._enable_scales:
-            regions.append(("out_scales", recv_cap * self._scale_num_i32 * 4))
-        # scatter combine needs its own staging regions
-        if cfg.is_scatter:
-            wire_elem_size = cfg.wire_elem_size
-            regions.append(
-                (
-                    "comb_inp",
-                    cfg.world_size * max_tok_per_rank * hidden_dim * wire_elem_size,
-                )
-            )
-            regions.append(("comb_wts", cfg.world_size * max_tok_per_rank * topk * 4))
-            if cfg.fp8_blockwise:
-                regions.append(
-                    (
-                        "comb_scales",
-                        cfg.world_size * max_tok_per_rank * cfg.combine_scale_dim * 4,
-                    )
-                )
-        self.arena = SymmArena(comm, regions)
-        self.arena.zero()
+    # -- shared: variant selection -----------------------------------------
 
-        self.token_dest_map = torch.full(
-            (max_tok_per_rank * topk,), -1, dtype=torch.int32, device=device
-        )
-        self._empty_i32 = torch.empty(
-            0, dtype=torch.int32, device=device
-        )  # inter-node placeholders
-        self.dest_pe_counter = torch.zeros(
-            cfg.world_size, dtype=torch.int32, device=device
-        )
-        self.dispatch_barrier = torch.zeros(1, dtype=torch.int32, device=device)
-        self.total_recv = torch.zeros(1, dtype=torch.int32, device=device)
-        self.combine_barrier = torch.zeros(1, dtype=torch.int32, device=device)
-        # Per-block xdb flag counters for the gather combine entry barrier: one
-        # i64 per block, fixed at xdb_flag_slots (== CU count, the max combine
-        # block_num). Every block owns a private counter and block 0 fills the
-        # unused tail so all stay in lockstep across calls with different block_num.
-        self.cross_device_flag = torch.ones(
-            xdb_flag_slots, dtype=torch.int64, device=device
-        )
-        c_dt = cfg.combine_dtype  # combine output dtype
-        c_elem = cfg.combine_elem_size
-        if c_dt == torch.float4_e2m1fn_x2:  # fp4 combine outputs fp4 (hidden/2 B/token)
-            self.combine_out = torch.zeros(
-                max_tok_per_rank * (hidden_dim // 2), dtype=torch.int8, device=device
-            )
-        elif c_dt in _FP8_DTYPES:  # fp8 combine outputs fp8 (1 byte/elem)
-            self.combine_out = torch.zeros(
-                max_tok_per_rank * hidden_dim, dtype=torch.int8, device=device
-            )
-        else:
-            self.combine_out = torch.zeros(
-                max_tok_per_rank * hidden_dim,
-                dtype=torch.int16 if c_elem == 2 else torch.int32,
-                device=device,
-            )
-        self.combine_out_weights = torch.zeros(
-            max_tok_per_rank * topk, dtype=torch.float32, device=device
-        )
-
-        arena = self.arena
-        # Distinct (block, warp) variants to precompile. With a per-token schedule
-        # the op picks the best (block, warp) at runtime from cur_rank_num_token;
-        # otherwise it is single-shot. Scatter combine is not schedule-tuned.
-        schedule = cfg.schedule
+    def _pick(self, num_tokens):
+        """((disp_block, disp_warp), (comb_block, comb_warp)) for a runtime token
+        count via the per-token schedule; falls back to the single-shot specs
+        otherwise. Clamped to variants that were actually built, so the hot path
+        can never trigger a compile."""
+        schedule = self.cfg.schedule
+        disp_spec = comb_spec = None
         if schedule:
-            dispatch_specs = sorted({(db, dw) for (_, db, dw, _, _) in schedule})
-            combine_specs = sorted({(cb, cw) for (_, _, _, cb, cw) in schedule})
+            for bucket in schedule:
+                max_tok = bucket[0]
+                if max_tok is None or num_tokens <= max_tok:
+                    disp_spec, comb_spec = (bucket[1], bucket[2]), (bucket[3], bucket[4])
+                    break
+            if disp_spec is None:
+                last = schedule[-1]
+                disp_spec, comb_spec = (last[1], last[2]), (last[3], last[4])
         else:
-            dispatch_specs = [(cfg.dispatch_block_num, cfg.warp_num_per_block)]
-            combine_specs = [(cfg.combine_block_num, cfg.combine_warp_num_per_block)]
-        if cfg.is_scatter:
-            combine_specs = [(cfg.combine_block_num, cfg.combine_warp_num_per_block)]
-        self._dispatch_specs = dispatch_specs
-        self._combine_specs = combine_specs
+            disp_spec, comb_spec = self._dispatch_specs[0], self._combine_specs[0]
+        if disp_spec not in self._kernels.dispatch:
+            disp_spec = self._dispatch_specs[-1]
+        if comb_spec not in self._kernels.combine:
+            comb_spec = self._combine_specs[-1]
+        return disp_spec, comb_spec
 
-        self._dispatch_kwargs = dict(
-            rank=cfg.rank,
-            npes=cfg.world_size,
-            experts_per_rank=cfg.num_experts_per_rank,
-            experts_per_token=topk,
-            hidden_dim=hidden_dim,
-            hidden_elem_size=elem_size,
-            max_tok_per_rank=max_tok_per_rank,
-            max_recv=recv_cap,
-            off_tok_off=arena.offset("tok_off"),
-            off_recv_num=arena.offset("recv_num"),
-            off_tis=arena.offset("recv_to_src_token"),
-            off_out_idx=arena.offset("out_idx"),
-            off_out_wts=arena.offset("out_wts"),
-            off_out_tok=arena.offset("disp_out"),
-            off_out_scales=arena.offset("out_scales") if self._enable_scales else 0,
-            scale_dim=cfg.scale_dim,
-            scale_type_size=cfg.scale_type_size,
-            fp4=is_fp4,
-        )
-        # (block, warp) -> compiled dispatch / combine kernel.
-        self._dispatch_variants = {
-            (b, w): make_dispatch(
-                block_num=b, warp_num_per_block=w, **self._dispatch_kwargs
-            )
-            for (b, w) in dispatch_specs
-        }
-        self._dispatch_replay_variants = {}  # lazily compiled per (block, warp)
-        if cfg.is_scatter:
-            self._combine_variants = {
-                (b, w): make_combine_scatter(
-                    rank=cfg.rank,
-                    npes=cfg.world_size,
-                    experts_per_token=topk,
-                    hidden_dim=hidden_dim,
-                    hidden_elem_size=elem_size,
-                    max_tok_per_rank=max_tok_per_rank,
-                    max_recv=recv_cap,
-                    block_num=b,
-                    warp_num_per_block=w,
-                    off_out_tok=arena.offset("out_tok"),
-                    off_comb_inp=arena.offset("comb_inp"),
-                    off_tis=arena.offset("recv_to_src_token"),
-                    off_xdb_mem=arena.offset("cross_device_barrier"),
-                    off_out_wts=arena.offset("out_wts"),
-                    off_comb_wts=arena.offset("comb_wts"),
-                    off_comb_scales=(
-                        arena.offset("comb_scales") if cfg.fp8_blockwise else 0
-                    ),
-                    fp8_direct_cast=cfg.fp8_direct_cast,
-                    fp8_blockwise=cfg.fp8_blockwise,
-                    scale_dim=cfg.combine_scale_dim,
-                    reset_total_recv=False,
-                )
-                for (b, w) in combine_specs
-            }
+    @staticmethod
+    def _specs_from(cfg):
+        """The (block, warp) variants to build, de-duplicated from the schedule."""
+        if cfg.schedule and not cfg.is_scatter:
+            disp = sorted({(db, dw) for (_, db, dw, _, _) in cfg.schedule})
+            comb = sorted({(cb, cw) for (_, _, _, cb, cw) in cfg.schedule})
+        elif cfg.schedule:
+            disp = sorted({(db, dw) for (_, db, dw, _, _) in cfg.schedule})
+            comb = [(cfg.combine_block_num, cfg.combine_warp_num_per_block)]
         else:
-            self._combine_variants = {
-                (b, w): make_combine(
-                    rank=cfg.rank,
-                    npes=cfg.world_size,
-                    experts_per_token=topk,
-                    hidden_dim=hidden_dim,
-                    hidden_elem_size=cfg.combine_elem_size,
-                    max_tok_per_rank=max_tok_per_rank,
-                    max_recv=recv_cap,
-                    block_num=b,
-                    warp_num_per_block=w,
-                    off_out_tok=arena.offset("out_tok"),
-                    off_xdb_mem=arena.offset("cross_device_barrier"),
-                    off_out_wts=arena.offset("out_wts"),
-                    reset_total_recv=True,
-                    fp4=(cfg.combine_dtype == torch.float4_e2m1fn_x2),
-                )
-                for (b, w) in combine_specs
-            }
+            disp = [(cfg.dispatch_block_num, cfg.warp_num_per_block)]
+            comb = [(cfg.combine_block_num, cfg.combine_warp_num_per_block)]
+        return disp, comb
 
-        self._local_expert_count_buf = torch.zeros(
-            cfg.num_experts_per_rank, dtype=torch.int32, device=device
-        )
-        self._local_expert_count = make_local_expert_count(
-            rank=cfg.rank,
-            experts_per_rank=cfg.num_experts_per_rank,
-            experts_per_token=topk,
-            block_num=cfg.dispatch_block_num,
-            warp_num_per_block=cfg.warp_num_per_block,
-        )
-
-        if cfg.enable_std_moe:
-            assert elem_size == 2, "StdMoE convert path is bf16-only"
-            experts_per_rank = cfg.num_experts_per_rank
-            max_tok_per_expert = cfg.world_size * max_tok_per_rank
-            self._max_tok_per_expert = max_tok_per_expert
-            self.packed_x = torch.zeros(
-                experts_per_rank * max_tok_per_expert * hidden_dim,
-                dtype=torch.int16,
-                device=device,
-            )
-            self.packed_count = torch.zeros(
-                experts_per_rank, dtype=torch.int32, device=device
-            )
-            self.packed_src = torch.zeros(
-                experts_per_rank * max_tok_per_expert, dtype=torch.int32, device=device
-            )
-            self.slot_map = torch.full(
-                (recv_cap * topk,), -1, dtype=torch.int64, device=device
-            )
-            self._convert_dispatch = make_convert_dispatch_output(
-                rank=cfg.rank,
-                experts_per_rank=experts_per_rank,
-                experts_per_token=topk,
-                hidden_dim=hidden_dim,
-                hidden_elem_size=elem_size,
-                max_tok_per_expert=max_tok_per_expert,
-                block_num=cfg.dispatch_block_num,
-                warp_num_per_block=cfg.warp_num_per_block,
-            )
-            self._convert_combine = make_convert_combine_input(
-                rank=cfg.rank,
-                experts_per_rank=experts_per_rank,
-                experts_per_token=topk,
-                hidden_dim=hidden_dim,
-                hidden_elem_size=elem_size,
-                max_tok_per_expert=max_tok_per_expert,
-                block_num=cfg.combine_block_num,
-                warp_num_per_block=cfg.combine_warp_num_per_block,
-            )
-        self._closed = False
+    # -- shared: lifecycle --------------------------------------------------
 
     def close(self):
         """Free this op's symmetric arena window. Call (or use as a context
-        manager) when the op is discarded but its Communicator lives on —
-        otherwise the arena stays in comm._resources until the comm is destroyed."""
-        if self._closed:
+        manager) when the op is discarded but its Communicator lives on."""
+        if getattr(self, "_closed", False):
             return
         self._closed = True
+        self._close_backend()
         self.arena.close()
+
+    def _close_backend(self):
+        """Release backend-owned handles BEFORE the arena goes away. The C++
+        plans hold the cco window and their kernels dereference it, so the order
+        is not cosmetic -- reversed, a late launch faults on freed device memory."""
 
     def __enter__(self):
         return self
@@ -706,285 +643,149 @@ class EpDispatchCombineOp:
     def __exit__(self, *exc):
         self.close()
 
-    def recv_tokens(self):
-        """Arena disp_out [max_recv, hidden] (dispatch dest / expert-GEMM input).
-        Separate from out_tok, so combine's copy-in never overwrites it — the
-        expert can read this in place without a defensive .clone().
-        fp4 packs 2 e2m1 per float4_e2m1fn_x2 element -> last dim is hidden/2."""
-        cols = self.cfg.hidden_dim // 2 if self.cfg.is_fp4 else self.cfg.hidden_dim
-        return from_gpu_ptr(
-            self.arena.local_ptr("disp_out"),
-            (self._recv_cap, cols),
-            self.cfg.dispatch_dtype,
-        )
+    # -- shared: scratch the base's own methods use -------------------------
 
-    def combine_in_view(self):
-        """Symmetric buffer [max_recv, hidden] that gather-mode combine reads
-        from via P2P.  Scatter mode uses a different staging layout (comb_inp)
-        and cannot use this buffer.
+    @property
+    def _empty_i32(self):
+        """Inter-node placeholders in the routing handle. Owned here because the
+        base's dispatch() is what puts them in the handle."""
+        cache = getattr(self, "_empty_i32_cache", None)
+        if cache is None:
+            cache = self._empty_i32_cache = torch.empty(
+                0, dtype=torch.int32, device=self.dev
+            )
+        return cache
 
-        To skip the d2d copy inside combine(), write expert output directly
-        into this view (e.g. point the GEMM output pointer here), then pass
-        it as the ``input`` argument to combine().  combine() detects the
-        matching data_ptr and elides the copy."""
-        cdt = self.cfg.combine_dtype
-        cols = (
-            self.cfg.hidden_dim // 2
-            if cdt == torch.float4_e2m1fn_x2
-            else self.cfg.hidden_dim
-        )
-        return from_gpu_ptr(
-            self.arena.local_ptr("out_tok"), (self._recv_cap, cols), cdt
-        )
+    # -- shared: the ops ---------------------------------------------------
 
-    def convert_dispatch_output(self):
-        """mori ConvertDispatchOutput: repack recv tokens into per-local-expert
-        buckets. Returns (packed_x, packed_count, packed_src); GEMM overwrites
-        packed_x in place."""
-        assert self.cfg.enable_std_moe, "op built without enable_std_moe"
-        self.packed_count.zero_()
-        self.slot_map.fill_(-1)
-        arena = self.arena
-        stream = fx.Stream(torch.cuda.current_stream())
-        self._convert_dispatch(
-            arena.local_ptr("disp_out"),
-            arena.local_ptr("out_idx"),
-            arena.local_ptr("recv_to_src_token"),
-            self.total_recv.data_ptr(),
-            self.packed_x.data_ptr(),
-            self.packed_count.data_ptr(),
-            self.packed_src.data_ptr(),
-            self.slot_map.data_ptr(),
-            stream,
-        )
-        experts_per_rank = self.cfg.num_experts_per_rank
-        max_tok_per_expert = self._max_tok_per_expert
-        hidden_dim = self.cfg.hidden_dim
-        packed_x_view = from_gpu_ptr(
-            self.packed_x.data_ptr(),
-            (experts_per_rank, max_tok_per_expert, hidden_dim),
-            self.cfg.dispatch_dtype,
-        )
-        return packed_x_view, self.packed_count, self.packed_src
-
-    def convert_combine_input(self, routing):
-        """mori ConvertCombineInput: weighted-reduce each recv token's local-expert
-        outputs from packed_x back into out_tok. Run after GEMM, before combine."""
-        assert self.cfg.enable_std_moe, "op built without enable_std_moe"
-        arena = self.arena
-        stream = fx.Stream(torch.cuda.current_stream())
-        self._convert_combine(
-            arena.local_ptr("out_tok"),
-            arena.local_ptr("out_wts"),
-            routing.total_recv_token_num.data_ptr(),
-            self.packed_x.data_ptr(),
-            self.slot_map.data_ptr(),
-            stream,
-        )
-
-    def recv_weights(self):
-        """Arena out_wts as [max_recv, topk] f32 (forwarded per-token weights)."""
-        return from_gpu_ptr(
-            self.arena.local_ptr("out_wts"),
-            (self._recv_cap, self.cfg.num_experts_per_token),
-            torch.float32,
-        )
-
-    def recv_indices(self):
-        """Arena out_idx as [max_recv, topk] i32 (forwarded expert indices)."""
-        return from_gpu_ptr(
-            self.arena.local_ptr("out_idx"),
-            (self._recv_cap, self.cfg.num_experts_per_token),
-            torch.int32,
-        )
-
-    def recv_scales(self):
-        """Forwarded per-token scales as opaque i32 dwords [max_recv, scale_num_i32],
-        or None if built without scales."""
-        if not self._enable_scales:
-            return None
-        return from_gpu_ptr(
-            self.arena.local_ptr("out_scales"),
-            (self._recv_cap, self._scale_num_i32),
-            torch.int32,
-        )
-
-    def _pick(self, num_tokens):
-        """((disp_block, disp_warp), (comb_block, comb_warp)) for a runtime token
-        count via the per-token schedule; falls back to the single-shot specs
-        otherwise. Returned specs are clamped to the precompiled variants."""
-        schedule = self.cfg.schedule
-        disp_spec = comb_spec = None
-        if schedule:
-            for bucket in schedule:
-                max_tok = bucket[0]
-                if max_tok is None or num_tokens <= max_tok:
-                    disp_spec, comb_spec = (bucket[1], bucket[2]), (
-                        bucket[3],
-                        bucket[4],
-                    )
-                    break
-            if disp_spec is None:
-                last = schedule[-1]
-                disp_spec, comb_spec = (last[1], last[2]), (last[3], last[4])
-        else:
-            disp_spec, comb_spec = self._dispatch_specs[0], self._combine_specs[0]
-        if disp_spec not in self._dispatch_variants:
-            disp_spec = self._dispatch_specs[-1]
-        if comb_spec not in self._combine_variants:
-            comb_spec = self._combine_specs[-1]
-        return disp_spec, comb_spec
-
-    def dispatch(
-        self, input, weights, scales, indices, *, routing=None, return_routing=False
-    ):
+    def dispatch(self, input, weights, scales, indices, *, routing=None, return_routing=False):
         """mori-parity dispatch. input [n_tok,hidden], weights [n_tok,topk] f32,
         scales [n_tok,scale_dim] (or None), indices [n_tok,topk] i32.
 
-        routing=: replay a prior handle (reuse cached dest-slot layout, skip
+        routing=: replay a prior handle (reuse the cached dest-slot layout, skip
         atomic routing). return_routing=: also return the handle. Mutually
         exclusive. Returns (out, out_weights, out_scales, out_indices,
-        total_recv[, routing]); out == arena disp_out (safe to read without
-        .clone() — combine stages into a separate out_tok buffer).
+        total_recv[, routing]); out == arena disp_out, safe to read without
+        .clone() because combine stages into a separate out_tok buffer.
+
+        total_recv is a DEVICE tensor. Reading it on the host is a full sync that
+        costs more than the kernel and makes the op uncapturable, so neither
+        backend does it.
         """
         if routing is not None and return_routing:
-            raise ValueError(
-                "pass either routing= (replay) or return_routing=True, not both"
-            )
-        num_input_tokens = input.shape[0]
-        disp_spec, _ = self._pick(num_input_tokens)
-        # total_recv is self-reset inside the dispatch kernel (warp 0, Phase 2).
-        scale_ptr = (
-            scales.data_ptr() if (scales is not None and self._enable_scales) else 0
-        )
-        stream = fx.Stream(torch.cuda.current_stream())
-        weight_ptr = weights.data_ptr() if weights is not None else 0
+            raise ValueError("pass either routing= (replay) or return_routing=True, not both")
+        n = input.shape[0]
+        cap = self.cfg.max_num_inp_token_per_rank
+        if n > cap:
+            raise ValueError(f"{n} tokens exceeds max_num_inp_token_per_rank={cap}")
+        disp_spec, _ = self._pick(n)
+
+        if not self._kernels.self_resets_counters:
+            # Local scratch only. The arena's tok_off and recv_num are NOT reset:
+            # peers write them, and an unsynchronised host memset would wipe a
+            # signal that already arrived and hang both ranks.
+            self.total_recv.zero_()
+            self.dest_pe_counter.zero_()
+            self.dispatch_barrier.zero_()
+
         if routing is not None:
-            kern = self._dispatch_replay_variants.get(disp_spec)
-            if kern is None:
-                kern = self._dispatch_replay_variants[disp_spec] = make_dispatch(
-                    replay=True,
-                    block_num=disp_spec[0],
-                    warp_num_per_block=disp_spec[1],
-                    **self._dispatch_kwargs,
+            table = self._kernels.dispatch_replay
+            if table is None:
+                raise NotImplementedError(
+                    f"the {self.backend_name} backend has no routing replay"
                 )
-            dest_map_ptr = routing.disp_dest_tok_id_map.data_ptr()
-            kern(
-                self.arena.handle,
-                input.data_ptr(),
-                indices.data_ptr(),
-                weight_ptr,
-                dest_map_ptr,
-                self.dest_pe_counter.data_ptr(),
-                self.dispatch_barrier.data_ptr(),
-                self.total_recv.data_ptr(),
-                scale_ptr,
-                self.cfg.rank,
-                num_input_tokens,
-                stream,
-            )
+            kern, dest_map = table[disp_spec], routing.disp_dest_tok_id_map
         else:
+            kern = self._kernels.dispatch[disp_spec]
+            # return_routing hands the handle its own dest_map (filled -1 so unset
+            # (tok,k) slots read as null); a plain dispatch reuses the scratch one.
             dest_map = (
                 torch.full_like(self.token_dest_map, -1)
                 if return_routing
                 else self.token_dest_map
             )
-            self._dispatch_variants[disp_spec](
-                self.arena.handle,
-                input.data_ptr(),
-                indices.data_ptr(),
-                weight_ptr,
-                dest_map.data_ptr(),
-                self.dest_pe_counter.data_ptr(),
-                self.dispatch_barrier.data_ptr(),
-                self.total_recv.data_ptr(),
-                scale_ptr,
-                self.cfg.rank,
-                num_input_tokens,
-                stream,
-            )
 
-        out = self.recv_tokens()
-        out_weights = self.recv_weights()
-        out_scales = self.recv_scales()
-        out_indices = self.recv_indices()
-        base = (out, out_weights, out_scales, out_indices, self.total_recv)
+        kern(
+            input=input,
+            indices=indices,
+            weights=weights,
+            scales=scales,
+            dest_map=dest_map,
+            num_tokens=n,
+        )
+
+        base = (
+            self.recv_tokens(),
+            self.recv_weights(),
+            self.recv_scales(),
+            self.recv_indices(),
+            self.total_recv,
+        )
         if not return_routing:
             return base
 
-        recv_to_src_view = from_gpu_ptr(
+        # A live arena view: the reverse map is cloned lazily on first access,
+        # which must happen after the caller's post-dispatch barrier (see
+        # EpDispatchRoutingHandle).
+        reverse = from_gpu_ptr(
             self.arena.local_ptr("recv_to_src_token"), (self._recv_cap,), torch.int32
         )
-        routing = EpDispatchRoutingHandle(
+        handle = EpDispatchRoutingHandle(
             disp_dest_tok_id_map=dest_map,
             inter_node_disp_dest_tok_id_map=self._empty_i32,
             inter_node_disp_send_map=self._empty_i32,
             total_recv_token_num=self.total_recv,
-            cur_rank_num_token=num_input_tokens,
-            reverse_src_view=recv_to_src_view,
+            cur_rank_num_token=n,
+            reverse_src_view=reverse,
         )
-        return base + (routing,)
+        return base + (handle,)
 
     def combine(self, input, weights=None, indices=None, *, routing):
-        """mori-parity combine. input [<=max_recv,hidden] post-expert tokens
-        (copied into arena out_tok if not already there). weights/indices are
-        accepted for API parity but unused (weights come from forwarded out_wts,
-        routing carries the mapping). Returns (out [ct,hidden], out_weights [ct,topk]).
-        """
-        out_tok_ptr = self.arena.local_ptr("out_tok")
-        # StdMoE: convert_combine_input() has already staged the weighted-reduced
-        # tokens into out_tok, so `input` is unused here — copying it in would
-        # clobber that result. (Non-StdMoE: `input` holds the post-expert tokens
-        # to combine; since the disp_out/out_tok split it no longer aliases out_tok,
-        # so the copy is required.)
-        if not self.cfg.enable_std_moe and input.data_ptr() != out_tok_ptr:
-            # copy in the combine-dtype layout (not recv_tokens()'s dispatch view)
-            dst = self.combine_in_view().view(-1)[: input.numel()]
-            dst.copy_(input.reshape(-1))
-        stream = fx.Stream(torch.cuda.current_stream())
-        _, comb_spec = self._pick(routing.cur_rank_num_token)
-        self._combine_variants[comb_spec](
-            self.arena.handle,
-            routing.disp_dest_tok_id_map.data_ptr(),
-            self.combine_barrier.data_ptr(),
-            self.cross_device_flag.data_ptr(),
-            routing.total_recv_token_num.data_ptr(),
-            self.combine_out.data_ptr(),
-            self.combine_out_weights.data_ptr(),
-            self.cfg.rank,
-            routing.cur_rank_num_token,
-            stream,
-        )
-        count = routing.cur_rank_num_token
-        hidden_dim = self.cfg.hidden_dim
-        topk = self.cfg.num_experts_per_token
-        cdt = self.cfg.combine_dtype
-        cols = (
-            hidden_dim // 2 if cdt == torch.float4_e2m1fn_x2 else hidden_dim
-        )  # fp4 out is hidden/2 float4 elems
-        out = self.combine_out[: count * cols].view(cdt).view(count, cols)
-        return out, self.combine_out_weights[: count * topk].view(count, topk)
+        """mori-parity combine. input [<=max_recv,hidden] post-expert tokens.
+        weights/indices are accepted for API parity but unused: weights come from
+        the forwarded out_wts and routing carries the mapping.
+        Returns (out [ct,hidden], out_weights [ct,topk])."""
+        ct = routing.cur_rank_num_token
+        _, comb_spec = self._pick(ct)
 
-    def local_expert_count(self):
-        """[num_experts_per_rank] i32: recv tokens per local expert. Call after
-        dispatch, before combine (gather resets total_recv)."""
-        self._local_expert_count_buf.zero_()
-        stream = fx.Stream(torch.cuda.current_stream())
-        self._local_expert_count(
-            self.arena.local_ptr("out_idx"),
-            self.total_recv.data_ptr(),
-            self._local_expert_count_buf.data_ptr(),
-            stream,
+        if not self._kernels.stages_in_kernel and not self.cfg.enable_std_moe:
+            # StdMoE has already written the weighted-reduced tokens into out_tok;
+            # copying `input` over them would clobber that result.
+            out_tok_ptr = self.arena.local_ptr("out_tok")
+            if input.data_ptr() != out_tok_ptr:
+                dst = self.combine_in_view().view(-1)[: input.numel()]
+                dst.copy_(input.reshape(-1))
+        if not self._kernels.self_resets_counters:
+            self.combine_barrier.zero_()
+        # No combine_out.zero_(): the kernel reduce-then-stores every token in
+        # [0, ct), so the prior contents of the returned slice never leak.
+
+        self._kernels.combine[comb_spec](
+            input=input,
+            dest_map=routing.disp_dest_tok_id_map,
+            total_recv=routing.total_recv_token_num,
+            num_tokens=ct,
         )
-        return self._local_expert_count_buf
+
+        cdt = self.cfg.combine_dtype
+        hidden = self.cfg.hidden_dim
+        topk = self.cfg.num_experts_per_token
+        cols = hidden // 2 if cdt == torch.float4_e2m1fn_x2 else hidden  # fp4 packs 2/elem
+        out = self.combine_out[: ct * cols].view(cdt).view(ct, cols)
+        return out, self.combine_out_weights[: ct * topk].view(ct, topk)
 
     def reset(self):
-        """Zero arena staging + per-rank counters/barriers (mori LaunchReset).
-        Kernels self-reset counters already; this forces a clean slate."""
+        """Zero the arena staging + per-rank counters (mori LaunchReset). The
+        kernels self-reset their counters already; this forces a clean slate."""
         self.arena.zero()
         self.token_dest_map.fill_(-1)
         self.dest_pe_counter.zero_()
         self.dispatch_barrier.zero_()
-        self.total_recv.zero_()
         self.combine_barrier.zero_()
-        self.cross_device_flag.fill_(1)
+
+    def __repr__(self):
+        return (
+            f"{type(self).__name__}(backend={self.backend_name}, "
+            f"rank={self.cfg.rank}/{self.cfg.world_size}, "
+            f"hidden={self.cfg.hidden_dim}, topk={self.cfg.num_experts_per_token})"
+        )
