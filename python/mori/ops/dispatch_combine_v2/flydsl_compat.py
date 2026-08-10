@@ -121,17 +121,37 @@ except ModuleNotFoundError:  # flydsl >= 0.3.0
             inttoptr(pty, addr_i64), num_records_bytes=num_records_bytes
         )
 
+    def _dwords(elem):
+        # The base ptr is i32, so pointer arithmetic steps 4 bytes; 0.2.x
+        # buffer_ops instead took `offset` in ELEMENTS. Convert element offsets
+        # to i32 units. An i64 access (the per-block xdb flag counters) is 2
+        # units — without this it would index at half its stride, read a spliced
+        # garbage flag, and hang the combine entry barrier.
+        n = elem.width // 32
+        if n < 1:
+            raise NotImplementedError(
+                f"0.3.0 shim indexes in 4-byte units; {elem} is unsupported"
+            )
+        return n
+
+    def _elem_type_of(data):
+        ty = _arith.unwrap(data).type
+        try:
+            return _ir.VectorType(ty).element_type
+        except (ValueError, TypeError):
+            return ty
+
     def buffer_load(rsrc, offset, vec_width=4, dtype=None, mask=None, cache_modifier=0):
         """Load `vec_width` x `dtype` at element `offset` of `rsrc`."""
         elem = dtype if dtype is not None else T.i32()
         ty = elem if vec_width == 1 else T.VectorType.get([vec_width], elem)
         # unwrap to an ArithValue, as 0.2.x returned: callers do arithmetic on
         # the result and also feed it to arith.* ops, which need an ir.Value.
-        return _arith.unwrap(ptr_load(rsrc + offset, result_type=ty))
+        return _arith.unwrap(ptr_load(rsrc + offset * _dwords(elem), result_type=ty))
 
     def buffer_store(data, rsrc, offset, mask=None, cache_modifier=0):
         """Store `data` at element `offset` of `rsrc`."""
-        return ptr_store(data, rsrc + offset)
+        return ptr_store(data, rsrc + offset * _dwords(_elem_type_of(data)))
 
 
 logger.debug(
