@@ -43,6 +43,20 @@ EPR = int(os.environ.get("EPR", 32))
 WARMUP = int(os.environ.get("WARMUP", 10))
 ITERS = int(os.environ.get("ITERS", 50))
 SWEEP = [int(x) for x in os.environ.get("SWEEP", "128,512,4096").split(",")]
+# What dispatch transports. Combine is always bf16, so anything but bf16 here is an
+# ASYMMETRIC op -- the case that matters for inference, where the payload is already
+# quantized and mori just moves it. fp4 packs 2 e2m1 per byte, so it moves half of
+# what fp8 does for the same hidden.
+_DISP_DT = {
+    "bf16": torch.bfloat16,
+    "fp8": torch.float8_e4m3fn,
+    "fp4": torch.float4_e2m1fn_x2,
+}[os.environ.get("DISP", "bf16")]
+_DISP_NBYTES = {torch.bfloat16: 2, torch.float8_e4m3fn: 1}.get(_DISP_DT, 0.5)
+# Geometry, same spelling as tools/ep_test.sh. Unset = the backend's tuned default,
+# i.e. what ships; setting any one of them pins the geometry for the whole run.
+_G = {k: (int(os.environ[k]) if os.environ.get(k) else None)
+      for k in ("DBN", "DWPB", "CBN", "CWPB")}
 
 
 def main():
@@ -67,13 +81,26 @@ def main():
         num_experts_per_rank=EPR,
         num_experts_per_token=TOPK,
         data_type=torch.bfloat16,
+        dispatch_data_type=None if _DISP_DT is torch.bfloat16 else _DISP_DT,
+        combine_data_type=None if _DISP_DT is torch.bfloat16 else torch.bfloat16,
         kernel_backend=BACKEND,
+        dispatch_block_num=_G["DBN"],
+        warp_num_per_block=_G["DWPB"],
+        combine_block_num=_G["CBN"],
+        combine_warp_num_per_block=_G["CWPB"],
     )
     op = EpDispatchCombineOp(cfg, comm)
 
     n_experts = world * EPR
     g = torch.Generator(device="cpu").manual_seed(1234 + rank)
-    inp = torch.randn(M, HIDDEN, generator=g, dtype=torch.float32).to(torch.bfloat16).to(dev)
+    if _DISP_DT is torch.float4_e2m1fn_x2:  # no torch cast; generate packed bytes
+        inp = torch.randint(
+            0, 256, (M, HIDDEN // 2), generator=g, dtype=torch.uint8
+        ).view(_DISP_DT).to(dev)
+    else:
+        inp = (
+            torch.randn(M, HIDDEN, generator=g, dtype=torch.float32).to(_DISP_DT).to(dev)
+        )
     wts = torch.rand(M, TOPK, generator=g, dtype=torch.float32).to(dev)
     idx = torch.stack(
         [torch.randperm(n_experts, generator=g)[:TOPK] for _ in range(M)]
@@ -81,7 +108,8 @@ def main():
 
     if rank == 0:
         print(
-            f"# EP [{op.backend_name}]  world={world} hidden={HIDDEN} topk={TOPK} "
+            f"# EP [{op.backend_name}]  disp={_DISP_DT} comb=bf16  "
+            f"world={world} hidden={HIDDEN} topk={TOPK} "
             f"epr={EPR} iters={ITERS}  variants "
             f"disp={sorted(op._kernels.dispatch)} comb={sorted(op._kernels.combine)}",
             flush=True,
@@ -132,12 +160,14 @@ def main():
         inplace = op.combine_in_view()[:total]
         c_us_ip = time_it(lambda: op.combine(inplace, routing=routing))
 
-        # Bytes actually moved off this rank: dispatch sends `total` tokens'
-        # worth in aggregate across the node; combine gathers the same back.
-        nbytes = total * HIDDEN * 2
-        d_bw = nbytes / (1000**3) / (d_us / 1e6)
-        c_bw = nbytes / (1000**3) / (c_us / 1e6)
-        ip_bw = nbytes / (1000**3) / (c_us_ip / 1e6)
+        # Bytes actually moved off this rank: dispatch sends `total` tokens' worth
+        # in aggregate across the node; combine gathers the same tokens back, but in
+        # the COMBINE dtype -- the two differ whenever dispatch is narrower.
+        d_bytes = total * HIDDEN * _DISP_NBYTES
+        c_bytes = total * HIDDEN * 2
+        d_bw = d_bytes / (1000**3) / (d_us / 1e6)
+        c_bw = c_bytes / (1000**3) / (c_us / 1e6)
+        ip_bw = c_bytes / (1000**3) / (c_us_ip / 1e6)
         got = torch.tensor([d_us, c_us, c_us_ip, float(total)], dtype=torch.float64)
         dist.all_reduce(got)
         if rank == 0:

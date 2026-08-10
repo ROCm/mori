@@ -304,9 +304,23 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                 {"gather", "scatter", "quant", "std_moe", "scales", "replay",
                  "local_expert_count", "asymmetric_dtype", "recv_cap"}
             ),
+            unsupported=self._unsupported(cfg),
         )
         self._gate(self._kernels)
         self._closed = False
+
+    def _unsupported(self, cfg) -> tuple[str, ...]:
+        """Reasons this backend cannot serve `cfg`. Empty = it can."""
+        if cfg.is_asymmetric_dtype and torch.float4_e2m1fn_x2 in (
+            cfg.dispatch_dtype,
+            cfg.combine_dtype,
+        ):
+            # Used to be a config-level error, which read as a property of the op.
+            # It is a gap in THIS backend's asymmetric path -- the hip backend moves
+            # an fp4 dispatch payload as bytes -- so it belongs with the rest of
+            # this backend's capability statements.
+            return ("fp4 with an asymmetric dispatch/combine dtype",)
+        return ()
 
     def recv_tokens(self):
         """Arena disp_out [max_recv, hidden] (dispatch dest / expert-GEMM input).
@@ -450,7 +464,11 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
         return run
 
     def _wrap_combine(self, spec):
-        def run(*, input, dest_map, total_recv, num_tokens):
+        # want_weights is accepted and ignored: the FlyDSL combine kernels take the
+        # out_weights pointer unconditionally and have no null gate for it, so the
+        # fold always runs here. The base still returns None when it was not asked
+        # for, so the two backends agree on what combine() hands back.
+        def run(*, input, dest_map, total_recv, num_tokens, want_weights=False):
             self._combine_variants[spec](
                 self.arena.handle,
                 dest_map.data_ptr(),

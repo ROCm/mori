@@ -24,8 +24,9 @@
 Same surface as the FlyDSL backend (``EpDispatchCombineOpFlyDSL``): same
 constructor, same ``dispatch``/``combine`` signatures and return shapes, same
 routing handle. What differs is where the kernels come from, and which configs
-can be served -- this backend implements the bf16/fp32 gather path and rejects
-everything else at CONSTRUCTION rather than at launch.
+can be served -- this backend implements the gather path with a bf16/fp32 combine
+and a bf16/fp32/fp8/fp4 dispatch, and rejects everything else at CONSTRUCTION
+rather than at launch.
 
 Imports ``ep_plans`` (the C++/JIT plans) but never flydsl, so it works where
 FlyDSL is not installed.
@@ -58,11 +59,28 @@ _REGIONS = {
 # Only what EpDType enumerates. fp16 is deliberately absent: the wire code for an
 # enum field comes from mori.jit.v2.plan_api.DTYPES, which has no fp16 entry, so
 # advertising it here would either raise or -- worse -- alias onto another code.
-_DTYPE_BYTES = {torch.bfloat16: 2, torch.float32: 4}
+#
+# The two legs differ. Dispatch only COPIES its payload, so anything with a fixed
+# byte width transports: fp8 as 1 B/elem, fp4 as 2 e2m1 per byte (hiddenDim halves).
+# Combine SUMS across sources, so it needs a real arithmetic type -- the C++ side
+# rejects a byte dtype there rather than silently reducing bytes.
+_DISPATCH_DTYPES = {
+    torch.bfloat16: 2,
+    torch.float32: 4,
+    torch.float8_e4m3fn: 1,
+    torch.float8_e4m3fnuz: 1,
+    torch.float4_e2m1fn_x2: 1,  # nominal: cfg.token_nbytes is what sizes buffers
+}
+_COMBINE_DTYPES = {torch.bfloat16: 2, torch.float32: 4}
 
 
 class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
-    """C++/JIT-kernel EP op: bf16/fp32, gather combine, no quant, no replay."""
+    """C++/JIT-kernel EP op: gather combine, no quant, no replay.
+
+    Dispatch transports bf16/fp32/fp8/fp4, combine reduces in bf16/fp32, and the
+    two need not match -- an fp8-in/bf16-out op is just two plans with different
+    dtypes. mori does no quantizing here: fp8/fp4 payloads arrive already packed.
+    """
 
     def __init__(self, cfg, comm):
         self.cfg = cfg
@@ -71,6 +89,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self.dev = dev
         self._recv_cap = cfg.effective_max_recv
         self._closed = False
+        # gfx125x routes to the TDM kernel, which needs a superset arena (plan A).
+        _arch = (getattr(torch.cuda.get_device_properties(dev), "gcnArchName", "") or "")
+        self._is1250 = _arch.split(":")[0].startswith("gfx125")
 
         # Gate FIRST: rejecting a config after taking a symmetric window would
         # leak it (the arena is registered with the communicator), and the whole
@@ -100,31 +121,39 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self.combine_out_weights = torch.zeros(
             max_tok * topk, dtype=torch.float32, device=dev
         )
+        # gfx1250 combine's intra-grid barrier fan-out (local scratch, 16 lines/block);
+        # size to the largest combine block_num any variant launches. Portable path
+        # never touches it -> left None (binds as 0).
+        self.combine_barrier_fan = None
+        if self._is1250:
+            max_comb_blocks = max(b for b, _ in self._combine_specs)
+            self.combine_barrier_fan = torch.zeros(max_comb_blocks * 16, **i32)
 
     # -- backend hooks -----------------------------------------------------
 
     def _regions(self, cfg):
-        elem = _DTYPE_BYTES.get(cfg.dispatch_dtype, 2)
-        celem = _DTYPE_BYTES.get(cfg.combine_dtype, 2)
+        # token_nbytes / combine_token_nbytes rather than elem*hidden: they are the
+        # only forms that are right for fp4, where 2 values share a byte.
         cap = cfg.effective_max_recv
         topk = cfg.num_experts_per_token
-        return [
+        regions = [
             ("tok_off", 4),
             ("recv_num", cfg.world_size * 4),
             ("recv_to_src_token", cap * 4),
             ("out_idx", cap * topk * 4),
             ("out_wts", cap * topk * 4),
-            ("disp_out", cap * cfg.hidden_dim * elem),
-            ("out_tok", cap * cfg.hidden_dim * celem),
+            ("disp_out", cap * cfg.token_nbytes),
+            ("out_tok", cap * cfg.combine_token_nbytes),
             ("cross_device_barrier", cfg.world_size * 8),
         ]
+        return regions
 
     def _unsupported(self, cfg) -> tuple[str, ...]:
         """Everything this backend cannot do, checked before anything is built."""
         bad = []
-        if cfg.dispatch_dtype not in _DTYPE_BYTES:
-            bad.append(f"dispatch dtype {cfg.dispatch_dtype} (have bf16, fp32)")
-        if cfg.combine_dtype not in _DTYPE_BYTES:
+        if cfg.dispatch_dtype not in _DISPATCH_DTYPES:
+            bad.append(f"dispatch dtype {cfg.dispatch_dtype} (have bf16, fp32, fp8, fp4)")
+        if cfg.combine_dtype not in _COMBINE_DTYPES:
             bad.append(f"combine dtype {cfg.combine_dtype} (have bf16, fp32)")
         if cfg.is_scatter:
             bad.append("combine_mode='scatter' (gather only)")
@@ -134,8 +163,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             bad.append("enable_std_moe")
         if cfg.scale_dim and cfg.scale_type_size:
             bad.append("per-token scales forwarding")
-        if cfg.is_asymmetric_dtype:
-            bad.append("asymmetric dispatch/combine dtype")
         # The C++ validator rejects a shrunk cap: the recv capacity is also the
         # flat-index stride, so an overflow re-encodes to the next peer instead
         # of merely overrunning the region.
@@ -157,27 +184,34 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
         common = dict(
             world_size=cfg.world_size,
-            hidden_dim=cfg.hidden_dim,
             max_tok_per_rank=cfg.max_num_inp_token_per_rank,
             num_expert_per_rank=cfg.num_experts_per_rank,
             num_expert_per_token=cfg.num_experts_per_token,
             max_recv=cfg.effective_max_recv,
-            dtype=cfg.dispatch_dtype,
             use_weights=True,
             arena=arena,
             region_names=_REGIONS,
         )
+        # The two legs are separate Plans, so each carries its own dtype and its own
+        # element count -- which is what makes an asymmetric config (fp8/fp4 in,
+        # bf16 out) just two ordinary kernels. hiddenDim is "elements of THIS leg's
+        # dtype", so fp4 halves it: 2 e2m1 live in one transported byte.
+        disp_cfg = dict(
+            hidden_dim=cfg.hidden_dim // 2 if cfg.is_fp4 else cfg.hidden_dim,
+            dtype=cfg.dispatch_dtype,
+        )
+        comb_cfg = dict(hidden_dim=cfg.hidden_dim, dtype=cfg.combine_dtype)
         # One plan per (block, warp) the schedule can select. Compilation happens
         # here and only here, so _pick never touches the compiler.
         dispatch, combine = {}, {}
         self._plans = []
         for b, w in self._dispatch_specs:
-            plan = cb.EpDispatchPlan(**common, block_num=b, warp_per_block=w)
+            plan = cb.EpDispatchPlan(**common, **disp_cfg, block_num=b, warp_per_block=w)
             plan.bind(rank=cfg.rank)
             self._plans.append(plan)
             dispatch[(b, w)] = self._wrap_dispatch(plan)
         for b, w in self._combine_specs:
-            plan = cb.EpCombinePlan(**common, block_num=b, warp_per_block=w)
+            plan = cb.EpCombinePlan(**common, **comb_cfg, block_num=b, warp_per_block=w)
             plan.bind(rank=cfg.rank)
             self._plans.append(plan)
             combine[(b, w)] = self._wrap_combine(plan)
@@ -202,9 +236,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     # -- views (same contract as the FlyDSL backend) -----------------------
 
     def recv_tokens(self):
+        # fp4 packs 2 e2m1 per element of the torch dtype -> last dim is hidden/2.
+        cols = self.cfg.hidden_dim // 2 if self.cfg.is_fp4 else self.cfg.hidden_dim
         return from_gpu_ptr(
             self.arena.local_ptr("disp_out"),
-            (self._recv_cap, self.cfg.hidden_dim),
+            (self._recv_cap, cols),
             self.cfg.dispatch_dtype,
         )
 
@@ -265,16 +301,18 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return run
 
     def _wrap_combine(self, plan):
-        def run(*, input, dest_map, total_recv, num_tokens):
+        def run(*, input, dest_map, total_recv, num_tokens, want_weights=False):
             plan.launch(
                 stream=torch.cuda.current_stream().cuda_stream,
                 inp_token_buf=input,
                 out_token_buf=self.combine_out,
-                out_weights_buf=self.combine_out_weights,
+                # Null == "skip the weight fold" (the kernel's only gate on it).
+                out_weights_buf=self.combine_out_weights if want_weights else None,
                 disp_dest_tok_id_map=dest_map,
                 total_recv_token_num=total_recv,
                 grid_barrier=self.combine_barrier,
                 xdb_flag=self.cross_device_flag,
+                combine_barrier_fan=self.combine_barrier_fan,  # None on non-gfx1250 -> 0
                 num_tokens=num_tokens,
             )
 

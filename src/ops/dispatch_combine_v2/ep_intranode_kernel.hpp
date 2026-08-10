@@ -99,6 +99,17 @@ template <EpCfg kCfg>
 __device__ __forceinline__ int EpFlatIndex(int pe, int localTokId) {
   return pe * EpFlatStride<kCfg>() + localTokId;
 }
+// The reverse map ("tis": recv slot -> global source token id) is a PUBLIC
+// output -- the routing handle hands it to callers -- and its stride is
+// maxTokPerRank, not the forward stride above. The two encode different pairs:
+// forward is (destPe, recv slot) with the slot ranging over maxRecv, reverse is
+// (srcPe, source token) with the token ranging over maxTokPerRank. The FlyDSL
+// backend publishes rank*maxTokPerRank + srcTok, so this must match it or the
+// same handle decodes differently depending on which backend produced it.
+template <EpCfg kCfg>
+__device__ __forceinline__ int EpSrcTokIndex(int pe, int srcTokId) {
+  return pe * kCfg.maxTokPerRank + srcTokId;
+}
 template <EpCfg kCfg>
 __device__ __forceinline__ int EpPeFromFlat(int flat) {
   return flat / EpFlatStride<kCfg>();
@@ -203,7 +214,7 @@ __device__ void EpDispatchBody(EpArgs args) {
         // Tell the destination which global source token owns that slot, so
         // combine can route the reduction back.
         EpPeer<int>(win, destPe, args.offRecvToSrc)[destTokId] =
-            EpFlatIndex<kCfg>(myPe, srcTokId);
+            EpSrcTokIndex<kCfg>(myPe, srcTokId);
       }
       destTokId = __shfl(destTokId, 0);
 

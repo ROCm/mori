@@ -82,6 +82,15 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
   c.blockNum = EnvInt(blkVar, c.blockNum);
   c.warpPerBlock = EnvInt(wrpVar, c.warpPerBlock);
 
+  // Byte8 is transport-only. Dispatch copies its payload untouched, but combine
+  // sums across sources, so a byte type there would compile and silently reduce
+  // garbage. Reject it here rather than let a Cfg like that reach hipcc.
+  if (!isDispatch && c.dtype == EpDType::Byte8) {
+    throw std::runtime_error(
+        "mori v2 ep: combine reduces its input, so it needs an arithmetic dtype; "
+        "fp8/fp4 are dispatch-transport only (pair them with a bf16/fp32 combine)");
+  }
+
   if (!EpCfgIsValid(c)) {
     throw std::runtime_error(
         "mori v2 ep: inconsistent config (world=" + std::to_string(c.worldSize) +
@@ -107,12 +116,26 @@ std::string EpRequestSchema() {
 // ---------------------------------------------------------------------------
 namespace {
 
-std::string RenderEpSource(const EpCfg& cfg, const char* bodyCall) {
+// gfx125x -> the TDM body + its LDS geometry.
+bool EpArchIs1250() { return mori::jit::v2::GetToolchain().arch.rfind("gfx125", 0) == 0; }
+
+// Host-side arch routing: gfx125x renders the TDM body (ep_intranode_1250x.hpp,
+// which pulls the gfx1250 TDM header), every other arch renders the portable one.
+// The render-time arch is the same GetToolchain().arch the toolchain compiles
+// with (--offload-arch), so host and device never disagree, and the choice is in
+// the rendered text -> in the cache key.
+std::string RenderEpSource(const EpCfg& cfg, const char* portableBody, const char* gfx1250Body) {
+  const bool is1250 = EpArchIs1250();
+  const char* header = is1250 ? "src/ops/dispatch_combine_v2/ep_intranode_1250x.hpp"
+                              : "src/ops/dispatch_combine_v2/ep_intranode_kernel.hpp";
+  const char* body = is1250 ? gfx1250Body : portableBody;
   return std::string(
              "// mori jit v2 — generated, do not edit.\n"
-             "#include \"src/ops/dispatch_combine_v2/ep_intranode_kernel.hpp\"\n"
-             "using namespace mori::ops::v2;\n"
-             "constexpr EpCfg kCfg = ") +
+             "#include \"") +
+         header +
+         "\"\n"
+         "using namespace mori::ops::v2;\n"
+         "constexpr EpCfg kCfg = " +
          Render(cfg) +
          ";\n"
          "using TokT = " +
@@ -120,7 +143,7 @@ std::string RenderEpSource(const EpCfg& cfg, const char* bodyCall) {
          ";\n"
          "extern \"C\" __global__ void __launch_bounds__(EpBlockThreads(kCfg))\n"
          "mori_jit_entry(EpArgs args) { " +
-         bodyCall + "<kCfg, TokT>(args); }\n";
+         body + "<kCfg, TokT>(args); }\n";
 }
 
 const std::vector<std::string>& EpSourceDeps() {
@@ -132,11 +155,11 @@ const std::vector<std::string>& EpSourceDeps() {
 }  // namespace
 
 std::string EpDispatchSpec::RenderSource(const Cfg& cfg) {
-  return RenderEpSource(cfg, "EpDispatchBody");
+  return RenderEpSource(cfg, "EpDispatchBody", "EpDispatch1250xBody");
 }
 
 std::string EpCombineSpec::RenderSource(const Cfg& cfg) {
-  return RenderEpSource(cfg, "EpCombineBody");
+  return RenderEpSource(cfg, "EpCombineBody", "EpCombine1250xBody");
 }
 
 const std::vector<std::string>& EpDispatchSpec::SourceDeps() { return EpSourceDeps(); }
@@ -146,7 +169,9 @@ mori::jit::v2::LaunchGeometry EpDispatchSpec::Geometry(const Cfg& cfg) {
   mori::jit::v2::LaunchGeometry g;
   g.gridX = static_cast<unsigned>(cfg.blockNum);
   g.blockX = static_cast<unsigned>(EpBlockThreads(cfg));
-  g.sharedBytes = 0;  // dispatch keeps everything in registers
+  // Portable dispatch keeps everything in registers; the gfx1250 TDM dispatch
+  // stages one hidden-dim token tile per warp in dynamic LDS.
+  g.sharedBytes = EpArchIs1250() ? static_cast<unsigned>(EpDispatch1250xLdsBytes(cfg)) : 0;
   return g;
 }
 
@@ -154,7 +179,10 @@ mori::jit::v2::LaunchGeometry EpCombineSpec::Geometry(const Cfg& cfg) {
   mori::jit::v2::LaunchGeometry g;
   g.gridX = static_cast<unsigned>(cfg.blockNum);
   g.blockX = static_cast<unsigned>(EpBlockThreads(cfg));
-  g.sharedBytes = static_cast<unsigned>(EpCombineSharedBytes(cfg));
+  // Portable combine only needs the per-warp pointer arrays; the gfx1250 PULL/QUAD
+  // paths size their tiles against the whole LDS budget at runtime.
+  g.sharedBytes = EpArchIs1250() ? static_cast<unsigned>(EpCombine1250xLdsBudget)
+                                 : static_cast<unsigned>(EpCombineSharedBytes(cfg));
   return g;
 }
 
@@ -204,7 +232,7 @@ int EpNoPrecompile(const std::string&) { return 0; }
   "offOutWts:u64,offDispOut:u64,offOutTok:u64,offXdb:u64,rank:i32,"              \
   "tokenIndices:p,inpTokenBuf:p,weightsBuf:p,outTokenBuf:p,outWeightsBuf:p,"     \
   "dispDestTokIdMap:p,destPeTokenCounter:p,totalRecvTokenNum:p,"                 \
-  "gridBarrier:p,xdbFlag:p,numTokens:i32"
+  "gridBarrier:p,xdbFlag:p,combineBarrierFan:p,numTokens:i32"
 
 MORI_JIT_DEFINE_PLAN(ep_dispatch, mori::ops::v2::EpDispatchSpec, EpDispatchFromFields,
                      mori::ops::v2::EpRequestSchema, mori::ops::v2::Describe, EpNoPrecompile,

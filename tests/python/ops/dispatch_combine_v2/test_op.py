@@ -254,7 +254,7 @@ def main():
                 op.convert_combine_input(routing)
                 sync()
                 comm.barrier()
-                out, out_w = op.combine(recv_x, routing=routing)
+                out, out_w = op.combine(recv_x, wts[:ct], routing=routing)
                 sync()
                 comm.barrier()
                 # telescopes to (sum_k wts)*input
@@ -267,7 +267,9 @@ def main():
                 tag = "OP-STDMOE"
             else:
                 # identity expert: recv_x already holds the dispatched tokens.
-                out, out_w = op.combine(recv_x, routing=routing)
+                # Weights passed because this test checks the weight fold; an
+                # inference caller passes None and the kernel skips it.
+                out, out_w = op.combine(recv_x, wts[:ct], routing=routing)
                 sync()
                 comm.barrier()
                 U = np.array(

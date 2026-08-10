@@ -76,7 +76,7 @@ def run_once(op, comm, ct, inp, wts, idx):
         # zeroes the op's live counter, the C++ one zeroes only the handle's copy.
         total = int(total_recv_t.cpu().item())
         # Identity expert: hand the received tokens straight back.
-        out, out_wts = op.combine(op.combine_in_view(), routing=routing)
+        out, out_wts = op.combine(op.combine_in_view(), wts[:ct], routing=routing)
         torch.cuda.synchronize()
         comm.barrier()
         return out.clone(), out_wts.clone(), total

@@ -213,15 +213,26 @@ class EpDispatchCombineConfig:
             )
             if backend == "hip":
                 from .hip_tuning_configs import lookup
+
+                # hip keys on the expert count too: it sizes dispatch's per-block
+                # expert counters, so it can move the geometry. FlyDSL's table has no
+                # such axis, hence the split call rather than a shared kwarg.
+                t = lookup(
+                    self.world_size,
+                    self.hidden_dim,
+                    self.num_experts_per_token,
+                    dtype=self.dtype_str,
+                    experts_per_rank=self.num_experts_per_rank,
+                )
             else:
                 from .tuning_configs import lookup
 
-            t = lookup(
-                self.world_size,
-                self.hidden_dim,
-                self.num_experts_per_token,
-                dtype=self.dtype_str,
-            )
+                t = lookup(
+                    self.world_size,
+                    self.hidden_dim,
+                    self.num_experts_per_token,
+                    dtype=self.dtype_str,
+                )
             self.dispatch_block_num = t["dispatch_block_num"]
             self.combine_block_num = t["combine_block_num"]
             self.warp_num_per_block = t["warp_num_per_block"]
@@ -742,9 +753,23 @@ class EpDispatchCombineOp:
 
     def combine(self, input, weights=None, indices=None, *, routing):
         """mori-parity combine. input [<=max_recv,hidden] post-expert tokens.
-        weights/indices are accepted for API parity but unused: weights come from
-        the forwarded out_wts and routing carries the mapping.
-        Returns (out [ct,hidden], out_weights [ct,topk])."""
+        indices are accepted for API parity but unused; routing carries the mapping.
+
+        `weights` is a REQUEST, not an input: pass the routing weights to also get
+        them folded back, and out_weights[t] comes back as weights[t] * (number of
+        distinct destination PEs). The values are gathered from the forwarded
+        out_wts, not from this argument -- what it selects is whether to do that
+        gather at all. That fold exists for TRAINING BACKWARD (mori a668e25e), where
+        the routing-weight gradient travels the same all-to-all route back; inference
+        combines with weights=None, because the expert has already applied the
+        weights and the fold would only echo them.
+
+        Not free: the fold is topk peer reads of 32B per token, ordinary loads that
+        this fabric serves far slower than the token tiles, and on gfx1250 asking for
+        it costs more than the whole token payload (385 vs 165us at EP4/4096/64x8).
+        v1 gates it the same way, on a null weights pointer.
+
+        Returns (out [ct,hidden], out_weights [ct,topk] or None)."""
         ct = routing.cur_rank_num_token
         _, comb_spec = self._pick(ct)
 
@@ -760,11 +785,13 @@ class EpDispatchCombineOp:
         # No combine_out.zero_(): the kernel reduce-then-stores every token in
         # [0, ct), so the prior contents of the returned slice never leak.
 
+        want_weights = weights is not None
         self._kernels.combine[comb_spec](
             input=input,
             dest_map=routing.disp_dest_tok_id_map,
             total_recv=routing.total_recv_token_num,
             num_tokens=ct,
+            want_weights=want_weights,
         )
 
         cdt = self.cfg.combine_dtype
@@ -772,7 +799,11 @@ class EpDispatchCombineOp:
         topk = self.cfg.num_experts_per_token
         cols = hidden // 2 if cdt == torch.float4_e2m1fn_x2 else hidden  # fp4 packs 2/elem
         out = self.combine_out[: ct * cols].view(cdt).view(ct, cols)
-        return out, self.combine_out_weights[: ct * topk].view(ct, topk)
+        # None rather than a stale buffer when the fold was not asked for: the
+        # kernel leaves combine_out_weights untouched, so returning it would hand
+        # back the previous call's values.
+        outw = self.combine_out_weights[: ct * topk].view(ct, topk) if want_weights else None
+        return out, outw
 
     def reset(self):
         """Zero the arena staging + per-rank counters (mori LaunchReset). The

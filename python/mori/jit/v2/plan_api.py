@@ -60,7 +60,10 @@ __all__ = [
 
 # Must match mori::ops::v2::EpDType. The v2 kernels share one dtype enum table;
 # an enum-tagged request field accepts a name from here as well as an int.
-DTYPES = {"bf16": 0, "fp32": 1}
+# "byte8" is the transport type both fp8 and fp4 map to: the dispatch leg copies
+# its payload, so a 1-byte element covers fp8 directly and fp4 as 2 e2m1 per byte
+# (the caller halves hiddenDim for fp4). Combine cannot use it -- C++ rejects that.
+DTYPES = {"bf16": 0, "fp32": 1, "byte8": 2}
 
 # The C ABI + the plan registry both live here; op-libraries register INTO it.
 _ABI_NAME = "libmori_jit.so"
@@ -332,7 +335,9 @@ def _enum_code(value) -> int:
         return value
     name = (getattr(value, "name", None) or str(value)).rsplit(".", 1)[-1].lower()
     name = {"bfloat16": "bf16", "float32": "fp32", "float": "fp32",
-            "float8_e4m3fn": "fp8", "float8_e4m3fnuz": "fp8"}.get(name, name)
+            # every sub-16-bit dtype is transported as raw bytes; see DTYPES
+            "float8_e4m3fn": "byte8", "float8_e4m3fnuz": "byte8",
+            "float4_e2m1fn_x2": "byte8"}.get(name, name)
     if name not in DTYPES:
         raise ValueError(f"unsupported dtype {value!r}; expected one of {sorted(DTYPES)}")
     return DTYPES[name]

@@ -57,17 +57,31 @@ namespace v2 {
 // caller asking for fp32 gets whatever this enum happens to call 1. Renumbering
 // either enum independently is a silent-wrong-answer change, not a refactor.
 // ---------------------------------------------------------------------------
-enum class EpDType : int { Bf16 = 0, Fp32 = 1 };
+// Byte8 is a TRANSPORT type, not an arithmetic one: the dispatch leg only ever
+// copies its payload (WarpCopy on gfx9xx, a TDM tile on gfx125x), so an fp8 token
+// and an fp4 token -- 2 e2m1 packed per byte, with the caller halving hiddenDim --
+// both move as plain bytes and need no conversion, no scale, and no new kernel.
+// Combine reduces, so it cannot use this; MakeEpCfg rejects it there.
+enum class EpDType : int { Bf16 = 0, Fp32 = 1, Byte8 = 2 };
 
 inline const char* EpDTypeName(EpDType d) {
-  return d == EpDType::Fp32 ? "float" : "hip_bfloat16";
+  switch (d) {
+    case EpDType::Fp32: return "float";
+    case EpDType::Byte8: return "unsigned char";
+    default: return "hip_bfloat16";
+  }
 }
 
-constexpr int EpElemSize(EpDType d) { return d == EpDType::Fp32 ? 4 : 2; }
+constexpr int EpElemSize(EpDType d) {
+  return d == EpDType::Fp32 ? 4 : (d == EpDType::Byte8 ? 1 : 2);
+}
 
 inline std::string RenderValue(EpDType d) {
-  return d == EpDType::Fp32 ? "::mori::ops::v2::EpDType::Fp32"
-                            : "::mori::ops::v2::EpDType::Bf16";
+  switch (d) {
+    case EpDType::Fp32: return "::mori::ops::v2::EpDType::Fp32";
+    case EpDType::Byte8: return "::mori::ops::v2::EpDType::Byte8";
+    default: return "::mori::ops::v2::EpDType::Bf16";
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -109,6 +123,7 @@ struct EpArgs {
   int* totalRecvTokenNum = nullptr;   // [1]
   unsigned int* gridBarrier = nullptr;  // [1] intra-kernel grid rendezvous
   unsigned long long* xdbFlag = nullptr;  // [1] monotone cross-device barrier epoch
+  int* combineBarrierFan = nullptr;  // [blockNum*16] gfx1250 combine intra-grid fan-out (local scratch)
 
   int numTokens = 0;  // tokens this rank contributes this call
 };
@@ -224,6 +239,15 @@ constexpr int EpCombineSharedBytes(const EpCfg& c) {
 }
 
 constexpr int EpTokenBytes(const EpCfg& c) { return c.hiddenDim * EpElemSize(c.dtype); }
+
+// gfx1250 launch LDS. Dispatch stages one hidden-dim token tile per warp through
+// the TDM engine; combine reserves the whole budget (its PULL/QUAD tiles size
+// against it at runtime). EpCombine1250xLdsBudget must match MORI_COMB_LDS_BUDGET
+// in ep_intranode_1250x.hpp.
+constexpr int EpCombine1250xLdsBudget = 327680;
+constexpr int EpDispatch1250xLdsBytes(const EpCfg& c) {
+  return c.warpPerBlock * c.hiddenDim * EpElemSize(c.dtype);
+}
 
 // A Cfg that cannot launch is a host-side error, not a kernel that misbehaves.
 constexpr bool EpCfgIsValid(const EpCfg& c) {
