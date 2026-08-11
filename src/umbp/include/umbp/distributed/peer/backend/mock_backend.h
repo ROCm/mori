@@ -153,7 +153,7 @@ class MockBackend : public MediumBackend {
   }
 
   std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
-                                          bool /*include_descs*/) override {
+                                          bool include_descs) override {
     std::vector<ResolvedEntry> out(keys.size());
     std::lock_guard<std::mutex> lock(mutex_);
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -161,6 +161,12 @@ class MockBackend : public MediumBackend {
       if (it == owned_.end()) continue;
       out[i].found = true;
       out[i].size = it->second.size();
+      if (published_buffers_ == 0) continue;
+      // Every published mock hands out buffer 0, which is the collision a real
+      // peer has too (each backend publishes exactly one buffer today).
+      out[i].pages = {PageLocation{0, 0}};
+      out[i].page_size = PageSize();
+      if (include_descs) out[i].descs = AllBufferDescsLocked();
     }
     return out;
   }
@@ -184,17 +190,52 @@ class MockBackend : public MediumBackend {
   }
 
   uint64_t PageSize() const override { return 1; }
-  std::vector<BufferMemoryDescBytes> AllBufferDescs() const override { return {}; }
 
-  // This backend keeps each key in its own std::vector rather than in paged
-  // buffers, so it publishes no buffer endpoints and its ResolvedEntry carries
-  // no pages.  A caller that tries to transfer against it gets an invalid ref
-  // and must treat the key as unservable here — which is exactly the shape a
-  // real medium takes when a tier has no live backend on this node.
-  size_t BufferCount() const override { return 0; }
+  // Publish `count` fake buffers, numbered from 0 — like every real backend,
+  // and the reason a bare buffer_index is not an address: two mocks that both
+  // publish will both claim buffer 0.  `desc_tag` is the first descriptor byte
+  // so a test can tell WHOSE buffer answered.  Off by default, so a mock that
+  // does not call this behaves exactly as before.
+  void PublishBuffers(uint32_t count, uint8_t desc_tag) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    published_buffers_ = count;
+    desc_tag_ = desc_tag;
+  }
+
+  std::vector<BufferMemoryDescBytes> AllBufferDescs() const override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return AllBufferDescsLocked();
+  }
+
+  // Zero unless PublishBuffers() was called; then each key resolves to a page in
+  // buffer 0.  A backend keeps each key in its own std::vector rather than in
+  // paged buffers, so with no published buffers a caller that tries to transfer
+  // against it gets an invalid ref and must treat the key as unservable here —
+  // which is exactly the shape a real medium takes when a tier has no live
+  // backend on this node.
+  size_t BufferCount() const override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return published_buffers_;
+  }
   TransferRef BufferRef(uint32_t /*buffer_index*/) const override { return TransferRef{}; }
 
  private:
+  // Backends leave backend_id at 0 — the peer service stamps the owner at the
+  // wire boundary (see BufferMemoryDescBytes).  The mock does the same so a
+  // test exercises the real stamping path rather than pre-tagging for it.
+  std::vector<BufferMemoryDescBytes> AllBufferDescsLocked() const {
+    std::vector<BufferMemoryDescBytes> out;
+    out.reserve(published_buffers_);
+    for (uint32_t i = 0; i < published_buffers_; ++i) {
+      out.push_back(
+          {i, std::vector<uint8_t>{desc_tag_, static_cast<uint8_t>(i)}, /*backend_id=*/0});
+    }
+    return out;
+  }
+
+  uint32_t published_buffers_ = 0;
+  uint8_t desc_tag_ = 0;
+
   struct PendingSlot {
     std::string key;
     std::vector<uint8_t> bytes;

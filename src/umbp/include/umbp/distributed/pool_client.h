@@ -150,6 +150,11 @@ class PoolClient {
     std::vector<PageLocation> pages;
     uint64_t page_size = 0;
     std::vector<BufferMemoryDescBytes> descs;
+    // Which of the peer's backends `pages` index into.  A slot lives entirely
+    // in one medium, so one id covers the whole plan; without it the
+    // backend-local buffer_index does not name a buffer (see
+    // BufferMemoryDescBytes).
+    uint32_t backend_id = 0;
   };
 
   // Per-entry outcome inside the Put pipeline; projected to `bool` at
