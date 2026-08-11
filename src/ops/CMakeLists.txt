@@ -10,8 +10,8 @@ target_link_libraries(mori_ops PUBLIC mori_application mori_shmem mori_logging
 
 set_target_properties(
   mori_ops
-  PROPERTIES BUILD_RPATH "$ORIGIN"
-             INSTALL_RPATH "$ORIGIN"
+  PROPERTIES BUILD_RPATH "$ORIGIN;${ROCM_PATH}/lib"
+             INSTALL_RPATH "$ORIGIN;${ROCM_PATH}/lib"
              BUILD_WITH_INSTALL_RPATH TRUE)
 
 if(ENABLE_PROFILER)
@@ -25,7 +25,7 @@ endif()
 # the top-level CMakeLists.
 # ---------------------------------------------------------------------------
 if(BUILD_OPS_DEVICE)
-  find_program(HIPCC_EXECUTABLE hipcc PATHS /opt/rocm/bin ENV ROCM_PATH)
+  find_program(HIPCC_EXECUTABLE hipcc PATHS ${ROCM_PATH}/bin /opt/rocm/bin ENV ROCM_PATH)
   if(NOT HIPCC_EXECUTABLE)
     message(
       FATAL_ERROR
