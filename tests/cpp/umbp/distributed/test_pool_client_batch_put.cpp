@@ -32,6 +32,7 @@
 // spdlog output by the substring "BatchPut: src not registered for key=".
 
 #include <gtest/gtest.h>
+#include <hip/hip_runtime_api.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -39,6 +40,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -361,6 +363,205 @@ TEST_F(BatchPutWarnTest, ZeroSizeGetEntriesFailOthersSucceed) {
   EXPECT_TRUE(gres[0]) << "key=" << gkeys[0];
   EXPECT_FALSE(gres[1]) << "zero-size get must be filtered to failure";
   EXPECT_TRUE(gres[2]) << "key=" << gkeys[2];
+}
+
+// ---------------------------------------------------------------------------
+// Multi-page objects exercise run coalescing in LocalCopyEngine. Every other
+// test here uses exactly one page per key, so the merge path never runs there.
+//
+// A wrong run boundary or a miscomputed run length still returns true, so these
+// assert bytes rather than status. The fill pattern varies per byte so a
+// shifted, duplicated or truncated run is visible.
+// ---------------------------------------------------------------------------
+
+namespace {
+void FillPattern(char* buf, size_t bytes, uint8_t seed) {
+  for (size_t i = 0; i < bytes; ++i) {
+    buf[i] = static_cast<char>((i * 31u + seed) & 0xFFu);
+  }
+}
+}  // namespace
+
+TEST_F(BatchPutWarnTest, MultiPageObjectRoundTripsByteExact) {
+  constexpr size_t kPages = 4;
+  constexpr size_t kSize = kPages * kPageSize;  // whole pages, no partial tail
+
+  std::vector<char> src(kSize);
+  FillPattern(src.data(), kSize, 0x5A);
+  std::vector<std::string> keys = {"mp-full"};
+  std::vector<const void*> srcs = {src.data()};
+  std::vector<size_t> sizes = {kSize};
+  auto pres = target_->BatchPut(keys, srcs, sizes);
+  ASSERT_EQ(pres.size(), 1u);
+  ASSERT_TRUE(pres[0]);
+
+  std::vector<char> dst(kSize, 0);
+  std::vector<void*> dsts = {dst.data()};
+  auto gres = target_->BatchGet(keys, dsts, sizes);
+  ASSERT_EQ(gres.size(), 1u);
+  ASSERT_TRUE(gres[0]);
+  EXPECT_EQ(std::memcmp(src.data(), dst.data(), kSize), 0)
+      << "multi-page object did not round trip byte-exact";
+}
+
+TEST_F(BatchPutWarnTest, MultiPageObjectWithPartialTailRoundTripsByteExact) {
+  // Deliberately not a page multiple: the final page is short, which is the
+  // one place LogicalPageBytes differs and the easiest boundary to get wrong
+  // when accumulating a run length.
+  constexpr size_t kSize = 3 * kPageSize + 1234;
+
+  std::vector<char> src(kSize);
+  FillPattern(src.data(), kSize, 0xA5);
+  std::vector<std::string> keys = {"mp-tail"};
+  std::vector<const void*> srcs = {src.data()};
+  std::vector<size_t> sizes = {kSize};
+  auto pres = target_->BatchPut(keys, srcs, sizes);
+  ASSERT_EQ(pres.size(), 1u);
+  ASSERT_TRUE(pres[0]);
+
+  // One extra byte of guard on each side catches a run that copies too much.
+  std::vector<char> dst(kSize + 2, 0x7E);
+  std::vector<void*> dsts = {dst.data() + 1};
+  auto gres = target_->BatchGet(keys, dsts, sizes);
+  ASSERT_EQ(gres.size(), 1u);
+  ASSERT_TRUE(gres[0]);
+  EXPECT_EQ(std::memcmp(src.data(), dst.data() + 1, kSize), 0)
+      << "partial-tail object did not round trip byte-exact";
+  EXPECT_EQ(dst.front(), static_cast<char>(0x7E)) << "run underran the destination";
+  EXPECT_EQ(dst.back(), static_cast<char>(0x7E)) << "run overran the destination";
+}
+
+// ---------------------------------------------------------------------------
+// GPU user buffers. Neither branch had coverage for a device pointer driven
+// through PoolClient, which is the whole point of the port: an unregistered
+// device pointer used to be described as host bytes and memcpy'd.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Device memory is not available on every machine that runs this suite (and is
+// not available at all in a container without /dev/kfd), so the GPU cases skip
+// rather than fail. A skip here is not a pass — it means the case did not run.
+bool DeviceMemoryAvailable() {
+  int count = 0;
+  if (hipGetDeviceCount(&count) != hipSuccess) {
+    (void)hipGetLastError();
+    return false;
+  }
+  return count > 0;
+}
+
+class DeviceBuffer {
+ public:
+  explicit DeviceBuffer(size_t bytes) {
+    if (hipMalloc(&ptr_, bytes) != hipSuccess) {
+      (void)hipGetLastError();
+      ptr_ = nullptr;
+    }
+  }
+  ~DeviceBuffer() {
+    if (ptr_ != nullptr) (void)hipFree(ptr_);
+  }
+  DeviceBuffer(const DeviceBuffer&) = delete;
+  DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+
+  void* get() const { return ptr_; }
+  bool Valid() const { return ptr_ != nullptr; }
+
+ private:
+  void* ptr_ = nullptr;
+};
+
+}  // namespace
+
+// The self-target path with a device source and destination. This is the case
+// BuildLocalPageTransfers used to mislabel: the user ref was built with
+// TransferRef::HostBytes directly, so LocalCopyEngine claimed the pair and
+// memcpy'd from device memory. Multi-page so it also covers coalescing on the
+// GPU side.
+TEST_F(BatchPutWarnTest, DeviceBufferRoundTripsByteExactOnLocalPath) {
+  if (!DeviceMemoryAvailable()) GTEST_SKIP() << "no HIP device available";
+
+  constexpr size_t kSize = 3 * kPageSize + 512;  // multi-page with a short tail
+  DeviceBuffer device_src(kSize);
+  DeviceBuffer device_dst(kSize);
+  if (!device_src.Valid() || !device_dst.Valid()) GTEST_SKIP() << "hipMalloc failed";
+
+  std::vector<char> host(kSize);
+  FillPattern(host.data(), kSize, 0x3C);
+  ASSERT_EQ(hipMemcpy(device_src.get(), host.data(), kSize, hipMemcpyHostToDevice), hipSuccess);
+  ASSERT_EQ(hipMemset(device_dst.get(), 0, kSize), hipSuccess);
+
+  std::vector<std::string> keys = {"gpu-local"};
+  std::vector<const void*> srcs = {device_src.get()};
+  std::vector<size_t> sizes = {kSize};
+  auto pres = target_->BatchPut(keys, srcs, sizes);
+  ASSERT_EQ(pres.size(), 1u);
+  ASSERT_TRUE(pres[0]) << "device-source put must be handled by HbmCopyEngine";
+
+  std::vector<void*> dsts = {device_dst.get()};
+  auto gres = target_->BatchGet(keys, dsts, sizes);
+  ASSERT_EQ(gres.size(), 1u);
+  ASSERT_TRUE(gres[0]) << "device-destination get must be handled by HbmCopyEngine";
+
+  std::vector<char> back(kSize, 0);
+  ASSERT_EQ(hipMemcpy(back.data(), device_dst.get(), kSize, hipMemcpyDeviceToHost), hipSuccess);
+  EXPECT_EQ(std::memcmp(host.data(), back.data(), kSize), 0)
+      << "device round trip through the local path was not byte-exact";
+}
+
+// An UNREGISTERED device source on a batch that can route remotely must never
+// be host-staged. Before the port the bounce predicate tested only
+// HasHostPtr(), so a remote-bound device buffer was std::memcpy'd out of device
+// memory — which faults rather than corrupting, so the old behaviour would take
+// the whole suite down here.
+//
+// The default route-put strategy has no local affinity, so which keys land on
+// caller_ and which on target_ is not fixed and this cannot assert a per-key
+// disposition. What it does assert is the invariant that holds either way: the
+// call returns, the result vector keeps its length, and any key reported as
+// succeeded really did move its bytes. A remote-bound key comes back false via
+// ApplyRejectedTags; a locally-routed one succeeds through HbmCopyEngine and
+// must then be byte-exact.
+TEST_F(BatchPutWarnTest, UnregisteredDeviceSourceIsNeverHostStagedOnRemotePath) {
+  if (!DeviceMemoryAvailable()) GTEST_SKIP() << "no HIP device available";
+
+  constexpr size_t kKeys = 4;
+  DeviceBuffer device_src(kKeys * kPerKey);
+  if (!device_src.Valid()) GTEST_SKIP() << "hipMalloc failed";
+
+  std::vector<char> host(kKeys * kPerKey);
+  FillPattern(host.data(), host.size(), 0x6B);
+  ASSERT_EQ(hipMemcpy(device_src.get(), host.data(), host.size(), hipMemcpyHostToDevice),
+            hipSuccess);
+
+  std::vector<std::string> keys;
+  std::vector<const void*> srcs;
+  std::vector<size_t> sizes;
+  for (size_t i = 0; i < kKeys; ++i) {
+    keys.push_back("gpu-remote-" + std::to_string(i));
+    srcs.push_back(static_cast<const char*>(device_src.get()) + i * kPerKey);
+    sizes.push_back(kPerKey);
+  }
+
+  auto results = caller_->BatchPut(keys, srcs, sizes);
+  ASSERT_EQ(results.size(), keys.size()) << "result vector length must be preserved";
+
+  // Read back only the keys the put claimed, through a host buffer, and require
+  // them to match. A key that was staged out of device memory could not produce
+  // the right bytes here even if it somehow reported success.
+  for (size_t i = 0; i < results.size(); ++i) {
+    if (!results[i]) continue;
+    std::vector<char> back(kPerKey, 0);
+    std::vector<std::string> gkeys = {keys[i]};
+    std::vector<void*> gdsts = {back.data()};
+    std::vector<size_t> gsizes = {kPerKey};
+    auto gres = caller_->BatchGet(gkeys, gdsts, gsizes);
+    ASSERT_EQ(gres.size(), 1u);
+    ASSERT_TRUE(gres[0]) << "key=" << keys[i] << " was put but cannot be read back";
+    EXPECT_EQ(std::memcmp(host.data() + i * kPerKey, back.data(), kPerKey), 0)
+        << "key=" << keys[i] << " reported success but the bytes are wrong";
+  }
 }
 
 }  // namespace
