@@ -20,10 +20,6 @@ add_executable(test_umbp_local_follower_mode test_follower_mode.cpp)
 target_link_libraries(test_umbp_local_follower_mode PRIVATE umbp_core)
 add_test(NAME umbp_local_follower_mode COMMAND test_umbp_local_follower_mode)
 
-add_executable(test_umbp_local_eviction test_prefix_aware_eviction.cpp)
-target_link_libraries(test_umbp_local_eviction PRIVATE umbp_core)
-add_test(NAME umbp_local_eviction COMMAND test_umbp_local_eviction)
-
 add_executable(test_prefix_aware_eviction test_prefix_aware_eviction.cpp)
 target_link_libraries(test_prefix_aware_eviction PRIVATE umbp_core)
 add_test(NAME test_prefix_aware_eviction COMMAND test_prefix_aware_eviction)

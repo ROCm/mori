@@ -54,8 +54,6 @@ class HeartbeatResponse;
 
 namespace mori::umbp {
 
-class PeerSsdManager;
-
 inline constexpr std::size_t kMasterClientMaxPendingHistograms = 15000;
 
 // Result of RouteGet — pure routing advisory.  The reader follows up
@@ -130,11 +128,6 @@ class MasterClient {
   // before StartHeartbeat() — the heartbeat thread reads the registry once per
   // tick.
   void SetBackendRegistry(BackendRegistry* registry);
-
-  // Bind the SSD manager: keeps the concrete pointer so heartbeat can merge
-  // live SSD capacity into tier_capacities.  Pass nullptr to skip.  Must be set
-  // before StartHeartbeat().
-  void SetPeerSsdManager(PeerSsdManager* ssd_manager);
 
   void StartHeartbeat();
   void StopHeartbeat();
@@ -230,10 +223,6 @@ class MasterClient {
   // gate.  Non-owning; lifetime is managed by PoolClient.  Bound before
   // StartHeartbeat(); read-only afterwards (no lock needed).
   BackendRegistry* registry_ = nullptr;
-
-  // Non-owning.  Kept concrete so heartbeat can merge live SSD capacity into
-  // tier_capacities.
-  PeerSsdManager* ssd_manager_ = nullptr;
 
   // Serializes the actual Heartbeat RPC: at most one full-sync or
   // delta heartbeat is on the wire at a time. ClearFullSync() takes
