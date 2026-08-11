@@ -391,6 +391,19 @@ bool IsRemoteMemory(const TransferRef& ref, const std::string& local_key) {
   return ref.HasMemoryDesc() && ref.mem.engineKey != local_key;
 }
 
+// Whether the local endpoint can be staged through the host bounce pool.
+//
+// Addressability is not enough: staging is a std::memcpy in and out of a
+// host-allocated region, so a GPU endpoint cannot take this path at all.  An
+// unregistered GPU buffer is therefore rejected by Plan and surfaces as a
+// per-key failure, rather than faulting inside the memcpy.  This is the single
+// place the decision is made, which is why it belongs here and not at each of
+// PoolClient's call sites — the transfer layer is the only layer that knows
+// whether staging is involved.
+bool IsBounceable(const TransferRef& local) {
+  return local.HasHostPtr() && local.loc == mori::io::MemoryLocationType::CPU;
+}
+
 }  // namespace
 
 bool MoriIoEngine::CanHandle(const TransferRef& src, const TransferRef& dst) const {
@@ -399,8 +412,8 @@ bool MoriIoEngine::CanHandle(const TransferRef& src, const TransferRef& dst) con
   const bool dst_remote = IsRemoteMemory(dst, local_engine_key_);
   if (src_remote == dst_remote) return false;  // both local or both remote
   const TransferRef& local = src_remote ? dst : src;
-  if (local.HasMemoryDesc()) return true;         // zero copy
-  return local.HasHostPtr() && bounce_size_ > 0;  // staged through the pool
+  if (local.HasMemoryDesc()) return true;          // zero copy
+  return IsBounceable(local) && bounce_size_ > 0;  // staged through the pool
 }
 
 TransferPlanSet MoriIoEngine::Plan(const std::vector<TransferItem>& items) const {
@@ -458,8 +471,8 @@ TransferPlanSet MoriIoEngine::Plan(const std::vector<TransferItem>& items) const
       continue;
     }
 
-    // Staged: the local endpoint is addressable but not registered.
-    if (bounce_size_ == 0 || !local.HasHostPtr() || item.size > bounce_size_) {
+    // Staged: the local endpoint is addressable host memory but not registered.
+    if (bounce_size_ == 0 || !IsBounceable(local) || item.size > bounce_size_) {
       out.rejected_tags.push_back(item.tag);
       continue;
     }

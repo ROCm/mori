@@ -41,6 +41,7 @@
 #include <unordered_map>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/device_copy.h"
 #include "umbp/common/env_time.h"
 #include "umbp/common/parallel_for.h"
 #include "umbp/distributed/master/master_metrics.h"
@@ -142,6 +143,21 @@ inline uint64_t LogicalPageBytes(size_t i, size_t num_pages, uint64_t page_size,
   return (i + 1 == num_pages) ? (total_size - i * page_size) : page_size;
 }
 
+// Classify a caller's buffer so engine selection can see what it really is.
+//
+// An unregistered pointer used to be described unconditionally as host bytes,
+// which is what CanHandle dispatches on: a device pointer would therefore be
+// claimed by LocalCopyEngine and memcpy'd, or staged through MoriIoEngine's
+// host bounce buffer.  Neither fails at the call site — they corrupt or fault
+// somewhere else — so the classification has to happen before any engine sees
+// the pair.  Registered buffers never come through here; their ref already
+// carries loc/device from RegisterMemory.
+TransferRef ClassifiedUserBytes(void* ptr, uint64_t size) {
+  const PointerLocation location = DetectPointerLocation(ptr);
+  if (!location.IsDevice()) return TransferRef::HostBytes(ptr, size);
+  return TransferRef::HostBytes(ptr, size, mori::io::MemoryLocationType::GPU, location.device_id);
+}
+
 bool SizeMatchesAllocation(uint64_t size, size_t num_pages, uint64_t page_size) {
   if (page_size == 0 || num_pages == 0 || size == 0) return false;
   if (size > num_pages * page_size) return false;
@@ -216,8 +232,10 @@ void ApplyTransferFailures(std::vector<Entry>& entries,
 }
 
 // Items no engine could carry.  Distinct from a failed transfer: these never
-// reached the wire, which usually means a peer descriptor was missing or the
-// item was larger than the engine's bounce pool.
+// reached the wire, which usually means a peer descriptor was missing, the item
+// was larger than the engine's bounce pool, or the caller's buffer is
+// unregistered GPU memory going to a remote peer — staging that would mean a
+// host memcpy from device memory, so MoriIoEngine rejects it instead.
 template <typename Entry>
 void ApplyRejectedTags(std::vector<Entry>& entries, const std::vector<size_t>& tags,
                        const char* what) {
@@ -508,10 +526,45 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size, mori::io::MemoryLocation
   }
   std::lock_guard<std::mutex> lock(registered_mem_mutex_);
   for (auto& reg : registered_regions_) {
-    if (reg.base == ptr) return true;
+    if (reg.base != ptr) continue;
+    // Re-registering the same base with a larger size is not idempotent: the
+    // existing registration covers fewer bytes, so FindRegisteredMemory would
+    // start rejecting the tail and silently fall back to unregistered bytes.
+    if (size <= reg.size) return true;
+    MORI_UMBP_ERROR(
+        "[PoolClient] RegisterMemory: ptr={} already registered with smaller size {}<{}", ptr,
+        reg.size, size);
+    return false;
   }
-  registered_regions_.push_back(
-      {ptr, size, transfer_engine_->RegisterMemory(ptr, size, loc, device)});
+
+  // The engine may throw (mori-io pinning can fail on a region the NIC cannot
+  // map).  A throw here would propagate out through the pybind boundary; the
+  // documented contract is a bool.
+  try {
+    TransferRef ref = transfer_engine_->RegisterMemory(ptr, size, loc, device);
+    // Validate what came back rather than trusting it. A ref whose location or
+    // device disagrees with what the caller allocated would send every later
+    // transfer to the wrong engine, and one that covers fewer bytes than asked
+    // would be used for the full range.
+    if (!ref.Valid() || ref.host_ptr != ptr || ref.size < size || ref.loc != loc ||
+        (loc == mori::io::MemoryLocationType::GPU && device >= 0 && ref.device != device)) {
+      MORI_UMBP_ERROR(
+          "[PoolClient] RegisterMemory: engine returned an inconsistent ref for ptr={}, size={}, "
+          "loc={}, device={}",
+          ptr, size, static_cast<uint32_t>(loc), device);
+      transfer_engine_->Deregister(ref);
+      return false;
+    }
+    registered_regions_.push_back({ptr, size, std::move(ref)});
+  } catch (const std::exception& error) {
+    MORI_UMBP_ERROR("[PoolClient] RegisterMemory failed for ptr={}, size={}: {}", ptr, size,
+                    error.what());
+    return false;
+  } catch (...) {
+    MORI_UMBP_ERROR("[PoolClient] RegisterMemory failed for ptr={}, size={}: unknown error", ptr,
+                    size);
+    return false;
+  }
   return true;
 }
 
@@ -542,7 +595,7 @@ std::optional<std::pair<TransferRef, size_t>> PoolClient::FindRegisteredMemory(c
 std::pair<TransferRef, uint64_t> PoolClient::UserBufferRef(void* ptr, size_t size) const {
   auto reg = FindRegisteredMemory(ptr, size);
   if (reg.has_value()) return {reg->first, reg->second};
-  return {TransferRef::HostBytes(ptr, size), 0};
+  return {ClassifiedUserBytes(ptr, size), 0};
 }
 
 // ---------------------------------------------------------------------------
@@ -574,7 +627,10 @@ bool PoolClient::BuildLocalPageTransfers(MediumBackend* backend,
                                          void* user, size_t size, bool to_backend,
                                          std::vector<TransferItem>* items) {
   if (pages.empty() || page_size == 0) return false;
-  const TransferRef user_ref = TransferRef::HostBytes(user, size);
+  // Classified, not assumed host: this is the self-target path, where a device
+  // user buffer paired with a host DRAM page must reach HbmCopyEngine rather
+  // than LocalCopyEngine.  One classification per batch, not per page.
+  const TransferRef user_ref = ClassifiedUserBytes(user, size);
   items->reserve(pages.size());
   for (size_t i = 0; i < pages.size(); ++i) {
     TransferRef buf = backend->BufferRef(pages[i].buffer_index);
