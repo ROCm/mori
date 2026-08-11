@@ -57,6 +57,15 @@ class StandaloneProcessClient : public IUMBPClient {
   std::vector<bool> BatchGet(const std::vector<std::string>& keys,
                              const std::vector<uintptr_t>& dsts,
                              const std::vector<size_t>& sizes) override;
+  std::vector<bool> BatchGetRanges(const std::vector<std::string>& keys,
+                                   const std::vector<std::vector<uintptr_t>>& dsts,
+                                   const std::vector<std::vector<size_t>>& sizes,
+                                   const std::vector<std::vector<size_t>>& src_offsets) override;
+  std::vector<bool> BatchPutRanges(const std::vector<std::string>& keys,
+                                   const std::vector<size_t>& object_sizes,
+                                   const std::vector<std::vector<uintptr_t>>& srcs,
+                                   const std::vector<std::vector<size_t>>& sizes,
+                                   const std::vector<std::vector<size_t>>& dst_offsets) override;
   std::vector<bool> BatchExists(const std::vector<std::string>& keys) const override;
   size_t BatchExistsConsecutive(const std::vector<std::string>& keys) const override;
 
@@ -89,6 +98,8 @@ class StandaloneProcessClient : public IUMBPClient {
   void MaybeAutoStart();
   std::string ClientId();
   void DeregisterMemoryLocked();
+  bool RegisterDeviceMemory(uintptr_t ptr, size_t size, int device_id);
+  bool RegisterHostShmMemory(uintptr_t ptr, size_t size);
 
   UMBPConfig config_;
   UMBPStandaloneProcessConfig standalone_config_;
@@ -101,14 +112,14 @@ class StandaloneProcessClient : public IUMBPClient {
   std::atomic<bool> closing_{false};
   bool closed_ = false;
 
-  // One registered host shared-memory region. A hybrid HiCache worker (e.g.
-  // DeepSeek-V4) registers several non-contiguous host pools per rank, so the
-  // client tracks N regions and resolves each data op to the one that owns its
-  // pointer. `base` is the worker VA base (== allocation->base), `size` its
-  // mapped size.
+  enum class RegionKind { kHostShm, kGpuIpc };
+
+  // A hybrid worker can register several non-contiguous host or GPU regions.
+  // `base` is the worker VA used as region_base in data requests.
   struct RegisteredRegion {
     uintptr_t base = 0;
     size_t size = 0;
+    RegionKind kind = RegionKind::kHostShm;
   };
 
   mutable std::mutex registration_mu_;

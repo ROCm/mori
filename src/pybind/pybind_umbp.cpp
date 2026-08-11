@@ -299,6 +299,12 @@ void RegisterMoriUmbp(py::module_& m) {
            py::call_guard<py::gil_scoped_release>())
       .def("batch_get_into_ptr", &IUMBPClient::BatchGet, py::arg("keys"), py::arg("ptrs"),
            py::arg("sizes"), py::call_guard<py::gil_scoped_release>())
+      .def("batch_get_ranges_into_ptr", &IUMBPClient::BatchGetRanges, py::arg("keys"),
+           py::arg("ptrs"), py::arg("sizes"), py::arg("src_offsets"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("batch_put_ranges_from_ptr", &IUMBPClient::BatchPutRanges, py::arg("keys"),
+           py::arg("object_sizes"), py::arg("ptrs"), py::arg("sizes"), py::arg("dst_offsets"),
+           py::call_guard<py::gil_scoped_release>())
       .def("batch_exists", &IUMBPClient::BatchExists, py::arg("keys"),
            py::call_guard<py::gil_scoped_release>())
       .def("batch_exists_consecutive", &IUMBPClient::BatchExistsConsecutive, py::arg("keys"),

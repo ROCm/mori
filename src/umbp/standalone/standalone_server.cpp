@@ -969,7 +969,8 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     entry.device_id = request.device_id();
     entry.alloc_base = request.alloc_base();
     entry.client_id = request.client_id();
-    if (!RegisterBackendMemory(entry.base, static_cast<size_t>(entry.size))) {
+    if (!RegisterBackendMemory(entry.base, static_cast<size_t>(entry.size),
+                               mori::io::MemoryLocationType::GPU, entry.device_id)) {
       ReleaseIpcMapping(key);
       SetBool(response, false, "inner backend RegisterMemory failed");
       return;
@@ -1045,10 +1046,17 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     for (const auto& mem : entries) ReleaseRegisteredMemory(mem);
   }
 
-  bool RegisterBackendMemory(void* base, size_t size) {
+  // `loc`/`device` describe the mapping this server made, not the worker's
+  // original allocation.  They must be passed through: a GPU-IPC region is
+  // device memory in this process too, and registering it as host memory would
+  // send it down the inner client's host paths — a memcpy from device memory in
+  // the local case, and a host staging bounce in the distributed one.
+  bool RegisterBackendMemory(void* base, size_t size,
+                             mori::io::MemoryLocationType loc = mori::io::MemoryLocationType::CPU,
+                             int device = -1) {
     std::unique_lock<std::shared_mutex> lock(client_mu_);
     if (shutdown_.load()) return false;
-    return client_->RegisterMemory(reinterpret_cast<uintptr_t>(base), size);
+    return client_->RegisterMemory(reinterpret_cast<uintptr_t>(base), size, loc, device);
   }
 
   void ReleaseRegisteredMemory(const RegisteredMemory& mem) {
