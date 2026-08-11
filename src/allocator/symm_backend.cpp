@@ -22,24 +22,15 @@
 
 // symm_backend.cpp -- expose the mori symmetric heap as a torch SymmetricMemory backend.
 //
-// c10d::symmetric_memory::register_availability() is torch's extension point for a
-// third-party backend. Once registered, torch drives everything:
+// register_availability() makes "MORI" selectable, after which torch drives everything:
+// symm_mem.empty -> alloc, symm_mem.rendezvous -> rendezvous, and torch.ops.symm_mem.*
+// run on mori memory. Registering means supplying rendezvous, not reusing torch's --
+// cheap here, since shmem already bootstrapped the mapping and rendezvous is just
+// ShmemPtrP2p() per PE.
 //
-//     import mori.allocator                      # registers "MORI"
-//     symm_mem.set_backend("MORI")
-//     t   = symm_mem.empty(...)                  -> MoriSymmAllocator::alloc
-//     hdl = symm_mem.rendezvous(t, group)        -> MoriSymmAllocator::rendezvous
-//     torch.ops.symm_mem.one_shot_all_reduce(t, "sum", group)
-//
-// Registering means *supplying* rendezvous, not reusing torch's -- torch calls ours.
-// Here that is nearly free, because shmem has already bootstrapped the peer mapping:
-// rendezvous is just ShmemPtrP2p() per PE, with no handle exchange.
-//
-// Scale-up vs scale-out falls out of that call. ShmemPtrP2p returns 0 for a PE reached
-// over RDMA rather than P2P, so buffer_ptrs()[pe] is null exactly for peers that are not
-// load/store accessible -- the same contract NCCL's backend uses via ncclGetLsaPointer.
-// world_within_direct_access() reports whether the whole group is directly mappable, so
-// a kernel can tell which regime it is in.
+// ShmemPtrP2p returns 0 for a PE reached over RDMA, so buffer_ptrs()[pe] is null exactly
+// for peers that are not load/store accessible -- the same contract NCCL expresses via
+// ncclGetLsaPointer, and what world_within_direct_access() aggregates.
 
 #include <hip/hip_runtime.h>
 #include <torch/csrc/distributed/c10d/symm_mem/SymmetricMemory.hpp>
@@ -66,15 +57,15 @@ using c10d::symmetric_memory::SymmetricMemoryAllocator;
     TORCH_CHECK(_e == hipSuccess, #expr, " failed: ", hipGetErrorString(_e)); \
   } while (0)
 
-// Matches torch's own signal pad size so layouts stay comparable across backends.
+// Match torch's signal pad size so layouts stay comparable across backends.
 constexpr size_t kSignalPadBytes = 9216;
 
 size_t RoundUp(size_t value, size_t multiple) {
   return ((value + multiple - 1) / multiple) * multiple;
 }
 
-// Raw HIP rather than c10::cuda/c10::hip: torch ships both trees and picking the wrong
-// one drags in cuda_runtime_api.h on a ROCm build. This target does not need either.
+// Raw HIP: torch ships both c10::cuda and c10::hip, and the wrong one drags
+// cuda_runtime_api.h into a ROCm build.
 class DeviceGuard {
  public:
   explicit DeviceGuard(int device_idx) {
@@ -130,8 +121,7 @@ class MoriSymmetricMemory : public SymmetricMemory {
   }
 
   ~MoriSymmetricMemory() override {
-    // The buffers themselves belong to the shmem heap; only the device-side index
-    // arrays are ours to release.
+    // Buffers belong to the shmem heap; only the device-side arrays are ours.
     if (buffers_dev_ != nullptr) (void)hipFree(buffers_dev_);
     if (signal_pads_dev_ != nullptr) (void)hipFree(signal_pads_dev_);
     if (rank_to_global_rank_dev_ != nullptr) (void)hipFree(rank_to_global_rank_dev_);
@@ -155,8 +145,7 @@ class MoriSymmetricMemory : public SymmetricMemory {
   const std::vector<int>& get_rank_to_global_rank() override { return rank_to_global_rank_; }
   int* get_rank_to_global_rank_dev() override { return rank_to_global_rank_dev_; }
 
-  // False when any peer is reachable only over RDMA, i.e. the group spans more than one
-  // load/store domain. Kernels that dereference buffer_ptrs must check this.
+  // False when any peer is RDMA-only. Kernels dereferencing buffer_ptrs must check it.
   bool world_within_direct_access() override {
     for (void* p : buffers_) {
       if (p == nullptr) return false;
@@ -164,9 +153,8 @@ class MoriSymmetricMemory : public SymmetricMemory {
     return true;
   }
 
-  // Host-side and collective, matching shmem semantics. Not the signal-pad spin that
-  // torch's own kernels use, so it is correct but coarser: it drains the device and
-  // synchronises the whole world rather than a channel.
+  // Coarser than torch's signal-pad spin: drains the device and syncs the whole world
+  // rather than a channel. Correct, but not channel-isolated.
   void barrier(int /*channel*/, size_t /*timeout_ms*/) override {
     MORI_HIP_CHECK(hipDeviceSynchronize());
     shmem::ShmemBarrierAll();
@@ -207,7 +195,7 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
 
     DeviceGuard guard(device_idx);
 
-    // Buffer and signal pad share one symmetric allocation, as torch's own backends do.
+    // Buffer and signal pad share one allocation, as torch's backends do.
     const size_t total = RoundUp(size + kSignalPadBytes, 256);
     void* ptr = shmem::ShmemMalloc(total);
     TORCH_CHECK(ptr != nullptr, "mori symm backend: ShmemMalloc(", total, ") failed");
@@ -260,7 +248,7 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
     const int rank = info.rank;
     const int world_size = info.world_size;
 
-    // shmem has already bootstrapped the mapping, so the group must be the shmem world.
+    // shmem already bootstrapped the mapping, so the group must be the shmem world.
     TORCH_CHECK(rank == shmem::ShmemMyPe() && world_size == shmem::ShmemNPes(),
                 "mori symm backend: group '", *name, "' is (rank ", rank, "/", world_size,
                 ") but shmem was initialised as (PE ", shmem::ShmemMyPe(), "/",
@@ -268,8 +256,7 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
 
     DeviceGuard guard(block->device_idx);
 
-    // Peer pointers come straight from shmem. A zero means that PE is reached over RDMA
-    // rather than P2P, i.e. it is not load/store accessible from here.
+    // Zero means that PE is RDMA-reached, i.e. not load/store accessible from here.
     std::vector<void*> buffers(world_size, nullptr);
     std::vector<void*> signal_pads(world_size, nullptr);
     for (int pe = 0; pe < world_size; ++pe) {
@@ -307,7 +294,7 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
 
 }  // namespace
 
-// Make "MORI" selectable via symm_mem.set_backend("MORI"). Idempotent.
+// Idempotent.
 void RegisterTorchSymmBackend() {
   static c10::intrusive_ptr<MoriSymmAllocator> allocator = c10::make_intrusive<MoriSymmAllocator>();
   static bool registered = [] {
@@ -320,7 +307,7 @@ void RegisterTorchSymmBackend() {
 }  // namespace allocator
 }  // namespace mori
 
-// Importing the extension is what makes "MORI" selectable; keep the surface tiny.
+// Importing the extension registers the backend.
 PYBIND11_MODULE(mori_torch_symm, m) {
   mori::allocator::RegisterTorchSymmBackend();
   m.def("register_backend", &mori::allocator::RegisterTorchSymmBackend,

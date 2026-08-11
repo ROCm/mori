@@ -22,19 +22,13 @@
 
 // torch_allocator.cpp -- back a torch.cuda.MemPool with the mori symmetric heap.
 //
-// torch.cuda.memory.CUDAPluggableAllocator dlopens a .so and binds two C symbols, so
-// tensors allocated inside `torch.cuda.use_mem_pool(pool)` come from ShmemMalloc instead
-// of the caching allocator. That matters for tensors an engine does not allocate by hand
-// -- a KV cache, or a GEMM output -- which otherwise have to be copied into symmetric
-// memory before they can be communicated.
+// CUDAPluggableAllocator dlopens this and binds two C symbols, so tensors allocated
+// inside torch.cuda.use_mem_pool() come from ShmemMalloc rather than the caching
+// allocator. That covers the tensors an engine never allocates by hand -- a KV cache, a
+// GEMM output -- which otherwise need a staging copy before they can be communicated.
 //
-// The expected signatures are fixed by torch:
-//     void* alloc(size_t size, int device, hipStream_t stream)
-//     void  free (void* ptr, size_t size, int device, hipStream_t stream)
-//
-// ShmemMalloc is collective and requires shmem to be initialised first, so every rank
-// must enter and leave the mem-pool context in the same order with the same sizes. See
-// python/mori/allocator for the wrapper and the usage notes.
+// ShmemMalloc is collective: ranks must enter and leave the pool context in the same
+// order with the same sizes. See python/mori/allocator.
 
 #include <hip/hip_runtime.h>
 
@@ -47,19 +41,15 @@ namespace {
 
 std::atomic<bool> g_warned_uninitialized{false};
 
-// ShmemMalloc dereferences runtime state that does not exist before ShmemInit, so probe
-// first and fail the allocation cleanly instead of taking the process down.
+// ShmemMalloc dereferences state that does not exist before ShmemInit.
 bool ShmemReady() { return mori::shmem::ShmemIsInitialized(); }
 
 }  // namespace
 
 extern "C" {
 
-// Is the mori symmetric heap usable in this process right now? Mirrors the probe symbol
-// convention other torch allocators use, so the Python side can degrade gracefully
-// rather than discovering the problem inside a tensor constructor.
-//   1  ready
-//   0  shmem present but not initialised
+// 1 if the symmetric heap can serve allocations now, else 0. Lets the Python side
+// degrade gracefully instead of discovering the problem inside a tensor constructor.
 int mori_allocator_probe() { return ShmemReady() ? 1 : 0; }
 
 void* mori_allocator_malloc(size_t size, int device, hipStream_t stream) {

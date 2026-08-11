@@ -21,49 +21,29 @@
 # SOFTWARE.
 """Torch integration for the mori symmetric heap.
 
-Two independent pieces live here.
+**SymmetricMemory backend** -- registers mori with torch as ``"MORI"``, so torch's own
+entry points drive it and ``torch.ops.symm_mem.*`` runs on mori memory::
 
-**SymmetricMemory backend** -- registers mori with torch as the ``"MORI"`` backend, so
-torch's own entry points drive it and ``torch.ops.symm_mem.*`` runs on mori memory::
-
-    import torch.distributed._symmetric_memory as symm_mem
-    import mori
-    from mori.allocator import register_symm_backend
-
-    mori.shmem.shmem_torch_process_group_init("default")
+    mori.shmem.shmem_torch_process_group_init(group_name)
     register_symm_backend()
     symm_mem.set_backend("MORI")
 
     t   = symm_mem.empty(1024, dtype=torch.bfloat16, device=device)
     hdl = symm_mem.rendezvous(t, group_name)
-    peer = hdl.get_buffer(1, (1024,), torch.bfloat16)   # None-safe: see below
 
 ``hdl.get_buffer_ptrs()[pe]`` is null for a PE reached over RDMA rather than P2P, and
-``world_within_direct_access()`` reports whether the whole group is load/store
-accessible -- the scale-up vs scale-out distinction, straight from ``ShmemPtrP2p``.
+``world_within_direct_access()`` aggregates that -- the scale-up vs scale-out
+distinction, straight from ``ShmemPtrP2p``.
 
-**MemPool allocator** -- a ``CUDAPluggableAllocator`` for tensors you do not allocate by
-hand, described below.
-
-Back a ``torch.cuda.MemPool`` with the mori symmetric heap.
-
-Tensors allocated inside the pool's context come from ``ShmemMalloc`` instead of the
-caching allocator, so they are symmetric and directly reachable by peers -- including
-tensors an engine never allocates by hand, such as a KV cache or a GEMM output.
-
-    import torch
-    import mori
-    from mori.allocator import MoriAllocator
-
-    mori.shmem.shmem_torch_process_group_init("default")
+**MemPool allocator** -- ``MoriAllocator`` backs a ``torch.cuda.MemPool``, so tensors you
+do not allocate by hand (a KV cache, a GEMM output) also come from the symmetric heap::
 
     pool = torch.cuda.MemPool(MoriAllocator.get_allocator(device).allocator())
     with torch.cuda.use_mem_pool(pool):
         kv_cache = torch.zeros(shape, dtype=torch.bfloat16, device=device)
 
-``ShmemMalloc`` is collective: every rank must enter and leave the pool context in the
-same order and allocate the same sizes, exactly as for ``shmem_malloc``. Allocations that
-are not symmetric across ranks will hang or corrupt the heap.
+Both paths allocate through ``ShmemMalloc``, which is collective: every rank must
+allocate the same sizes in the same order, or the heap will hang or corrupt.
 """
 
 import logging
@@ -105,10 +85,10 @@ def get_so_path() -> str:
 
 
 def is_available() -> bool:
-    """True if the symmetric heap is initialised and can serve allocations now.
+    """True if the symmetric heap can serve allocations now.
 
-    Allocation happens inside tensor constructors where raising is awkward, so callers
-    are encouraged to check here and fall back to the default pool instead.
+    Allocation happens inside tensor constructors where raising is awkward; check here
+    and fall back to the default pool instead.
     """
     import ctypes
 
@@ -128,8 +108,8 @@ def is_available() -> bool:
 class MoriAllocator:
     """``CUDAPluggableAllocator`` over the mori symmetric heap, one per device.
 
-    Mirrors the shape inference engines already expect from a pluggable allocator, so it
-    can be dropped in wherever a custom memory pool is selected.
+    Matches the shape inference engines already expect, so it drops in wherever a custom
+    memory pool is selected.
     """
 
     _instances: ClassVar[dict[torch_device, CUDAPluggableAllocator]] = {}
@@ -150,12 +130,10 @@ class MoriAllocator:
 
 
 def register_symm_backend() -> str:
-    """Register the mori SymmetricMemory backend with torch and return its name.
+    """Register the backend with torch and return its name. Idempotent.
 
-    Idempotent. After this, ``symm_mem.set_backend("MORI")`` routes ``symm_mem.empty``
-    and ``symm_mem.rendezvous`` into mori. Requires the extension to have been built
-    (``BUILD_TORCH_SYMM=ON``, the default when torch is importable at build time) and
-    shmem to be initialised before the first allocation.
+    Requires the extension (``BUILD_TORCH_SYMM=ON``, default when torch is importable at
+    build time) and shmem to be initialised before the first allocation.
     """
     try:
         from .. import mori_torch_symm
