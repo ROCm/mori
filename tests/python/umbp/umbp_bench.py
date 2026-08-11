@@ -27,6 +27,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from abc import ABC, abstractmethod
 
@@ -617,14 +618,82 @@ def _free_port():
 # --- split writer/reader rendezvous (TCP, hosted on the writer node) ---
 
 
-def _sync_recv_until(conn, token: bytes, timeout: float = 600.0):
+# Idle timeout, NOT a run-duration budget: the reader sends KEEPALIVE_INTERVAL
+# pings (see _SyncKeepalive), so this only expires when the peer has gone truly
+# silent. It used to be a flat 600s wait for b"DONE", which made the writer give
+# up on any sweep slower than 10 minutes -- and the writer's exit kills the
+# umbp_master it spawned (PR_SET_PDEATHSIG) and unregisters its keys, so the
+# still-running reader saw every subsequent read as a MISS with no error on
+# either side. A 4 GiB SSD sweep reads at ~190 MiB/s and takes ~14 minutes, so
+# it hit this every time while DRAM/HBM (seconds) never did.
+SYNC_IDLE_TIMEOUT = 300.0
+KEEPALIVE_INTERVAL = 30.0
+
+
+def _sync_recv_until(conn, token: bytes, timeout: float = SYNC_IDLE_TIMEOUT):
     conn.settimeout(timeout)
     buf = b""
     while token not in buf:
-        chunk = conn.recv(64)
+        try:
+            chunk = conn.recv(64)
+        except socket.timeout as exn:
+            # Loud and specific: the old silent death cost a long debugging
+            # session, because "writer vanished" surfaced only as 100% misses
+            # in the reader's RESULT lines.
+            raise TimeoutError(
+                f"no data from sync peer for {timeout:.0f}s while waiting for "
+                f"{token!r}. The peer is either dead or wedged; a slow-but-live "
+                f"reader should be sending keepalives every "
+                f"{KEEPALIVE_INTERVAL:.0f}s."
+            ) from exn
         if not chunk:
             raise ConnectionError(f"sync peer closed before sending {token!r}")
         buf += chunk
+
+
+class _SyncKeepalive:
+    """Reader-side liveness pings on the rendezvous socket.
+
+    The writer must hold its dataset until the reader is done, and the reader's
+    runtime is unbounded (it scales with medium speed x objects x passes). Rather
+    than guess a timeout large enough for the slowest medium, the reader proves
+    it is alive; any byte resets the writer's idle timer, and the writer's
+    accumulating buffer just ignores non-token bytes.
+
+    Shares the socket with the final b"DONE", so sends are serialized under a
+    lock and the thread is stopped before DONE goes out -- interleaved sendall()
+    from two threads could split the token.
+    """
+
+    def __init__(self, conn, interval: float = KEEPALIVE_INTERVAL):
+        self._conn = conn
+        self._interval = interval
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._thread = None
+
+    def __enter__(self):
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self._interval + 5.0)
+        return False
+
+    @property
+    def lock(self):
+        return self._lock
+
+    def _loop(self):
+        while not self._stop.wait(self._interval):
+            with self._lock:
+                try:
+                    self._conn.sendall(b"PING\n")
+                except OSError:
+                    return  # writer gone; the read path will surface it
 
 
 def _sync_listen(port: int):
@@ -914,6 +983,10 @@ if role == "reader":
     )
     _sync_recv_until(sync_conn, b"READY")
     print("writer signalled READY; starting reads", flush=True)
+    # Prove liveness for the whole read phase, however long the medium makes it.
+    sync_keepalive = _SyncKeepalive(sync_conn)
+    sync_keepalive.__enter__()
+    atexit.register(sync_keepalive.__exit__)
     reader = _build_reader()
 else:  # both
     write_all()
@@ -1032,8 +1105,12 @@ elif command == "batch_perf":
 # In a split run, tell the writer we're finished so it can release the dataset
 # and exit; the writer is blocked in _sync_recv_until(b"DONE") until this lands.
 if sync_conn is not None:
+    # Stop the keepalive first: it shares this socket, and two threads in
+    # sendall() can interleave bytes and split the token the writer greps for.
+    sync_keepalive.__exit__()
     try:
-        sync_conn.sendall(b"DONE\n")
+        with sync_keepalive.lock:
+            sync_conn.sendall(b"DONE\n")
         sync_conn.close()
     except OSError:
         pass
