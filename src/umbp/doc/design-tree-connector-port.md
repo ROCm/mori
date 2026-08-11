@@ -204,35 +204,72 @@ and `9d5e30f5` are EPv2 and build fixes that account for every `pyproject.toml`
 and `python/mori/ops/` line in the upstream branch diff. They come from main on
 their own schedule.
 
-## 6. Stages
+## 6. Stages — as landed
 
-Each stage is one commit, in this order.
+| Commit | Contents |
+|---|---|
+| `doc(umbp): plan the tree-connector port…` | this document |
+| `feat(umbp): take the tree-connector local and standalone half verbatim` | the 24-file take-verbatim set (§3); touches nothing the refactor modified, so it cannot regress the distributed data plane |
+| `feat(umbp): wire the ranged I/O interface and GPU-capable standalone registration` | `CMakeLists.txt`, `umbp_client.h`, `pybind_umbp.cpp`, `DistributedClient` stubs, local test CMake, and §4.4 both halves |
+| `feat(umbp): accept GPU user buffers in the distributed data plane` | §4.1, §4.2, §4.3 |
+| `test(umbp): cover multi-page runs and GPU user buffers through PoolClient` | upstream's two multi-page cases plus two GPU cases neither branch had |
+| `test(umbp): assert why the GPU remote-path put fails…` | strengthens the rejection case after measuring the fixture's real routing |
 
-1. **This document.**
-2. **Take-verbatim set** (§3) — the local/standalone half, plus the new common
-   headers and tests. Touches no file our branch has modified, so it cannot
-   break the distributed data plane.
-3. **Build wiring and the ranged interface** — `CMakeLists.txt`, `umbp_client.h`,
-   `pybind_umbp.cpp`, `distributed_client.{h,cpp}` stubs,
-   `tests/cpp/umbp/local/CMakeLists.txt`. After this the tree compiles with
-   ranged I/O live in Local and standalone-process-over-Local.
-4. **Standalone-process GPU buffers** — §4.4, both halves.
-5. **Distributed GPU buffers** — §4.1, §4.2, §4.3.
-6. **Tests** — upstream's two multi-page cases, plus a GPU-destination case
-   through `PoolClient`, which neither branch currently has.
+§4.4 was folded into the interface commit rather than kept separate: the ranged
+pure virtuals and the `RegisterMemory` signature live in the same two files, so
+splitting them would have produced a commit that does not compile.
 
-## 7. Verification
+## 7. Verification — what was actually run
 
-- `cmake --build` in the `rocm/mori-dev` container, `BUILD_UMBP=ON`.
-- `ctest` for the umbp local and distributed suites. Per the environment's known
-  constraint, the container needs `--privileged` and `/dev/infiniband` or every
-  live `PoolClient` test reports as a failure for reasons unrelated to the code.
-- `tests/python/umbp/test_umbp_client_ptr.py` covers the ranged API's shape
-  errors and a byte-exact scattered round trip; it is the closest thing to a
-  contract test for what the connector calls.
-- The two new dram-tier suites run twice by design — `umbp_dram_tier_gather` and
-  `umbp_dram_tier_gather_kernel_off` — because the gather kernel and the copy
-  engine must be indistinguishable in their results.
+Built and run in `rocm/mori-dev:…-rdmapush` with `/apps/ditian12` bind-mounted at
+the same path, so the existing `build_check/` cache stays valid. The image has
+`ENTRYPOINT ["bash"]`, so `--entrypoint bash` is required or the command is
+passed to bash as a filename.
+
+- **Build:** `umbp_core` (including `device_gather.hip`, compiled for gfx950 and
+  host), `umbp_client`, `umbp_standalone_server`, and every touched test target.
+  Clean apart from the pre-existing spdlog `-Wdeprecated-literal-operator`
+  warnings.
+- **pybind:** there is no cmake target for `src/pybind/pybind_umbp.cpp` — it is
+  built by `pip install`, so a plain `cmake --build` never compiles it and a
+  typo in a binding would surface only at install time. Checked directly with
+  `hipcc -fsyntax-only -std=c++17 -I . -I src/umbp/include -I include -I
+  3rdparty/spdlog/include -I build_check/src/umbp/proto_gen -I <pybind11> -I
+  <python>`; note `-I .` and the generated `proto_gen` directory are both
+  required.
+- **ctest:** 22 umbp tests pass (`-E 'cross_node|e2e|medium_selection'`, which
+  need a second node). This host has `/dev/kfd` and `/dev/dri` but **no**
+  `/dev/infiniband`; the live `PoolClient` tests nonetheless pass here, so the
+  known infiniband constraint applies to the multi-node suites rather than to
+  these.
+- **The gather suite runs twice by design** — `umbp_dram_tier_gather` and
+  `umbp_dram_tier_gather_kernel_off` — because the kernel and the copy engine
+  must be indistinguishable in their results. Both pass.
+- **The four new `PoolClient` cases were confirmed to run, not skip.** The GPU
+  cases skip when no HIP device is present, and a skip is not a pass, so they
+  were re-run under `--gtest_filter` and observed as `[ OK ]`.
+- **The rejection case was measured, not assumed.** Its first version allowed
+  either disposition per key; instrumenting it showed all four keys rejected,
+  because the fixture pins `caller_` to a single page to force remote routing.
+  It now asserts that, plus the `transfer unplannable` WARN (which pins the
+  reason to the transfer layer refusing the GPU endpoint) and that no key was
+  published. `UmbpLogCapture` forces the module to WARN, which is why that
+  message is observable in the test and invisible in a default-level run.
+- **Python:** `BUILD_UMBP=ON pip3 install --no-build-isolation .` from a copy of
+  the tree, then `pytest tests/python/umbp/test_umbp_client_ptr.py` — 5 passed.
+  This is the only check that exercises the two new pybind bindings end to end,
+  and `test_batch_put_get_ranges_round_trip_and_shape_failure` is the closest
+  thing to a contract test for what the connector calls: a 12-byte object
+  assembled from three scattered 4-byte buffers in shuffled offset order, read
+  back as two out-of-order sub-ranges, plus a ragged inner vector rejected as a
+  whole-call shape error. It needs a full install, so it is not part of the
+  ctest run above.
+
+**Not verified here.** The multi-node suites (`cross_node`, `e2e`,
+`medium_selection`) need a second node and were excluded. Nothing exercises
+GPU-IPC registration in standalone-process mode against a live server — §4.4 is
+covered by construction and by review, not by a test — and no measurement was
+taken of the GPU path's throughput.
 
 ## 8. Follow-ups this port deliberately leaves open
 
