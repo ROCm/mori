@@ -250,6 +250,15 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.dram_page_size = dc.dram_page_size;
   pc.dram = std::move(dram);
   pc.ssd = std::move(ssd);
+  // Unlike dram/ssd, UMBPHbmConfig carries no ownership knobs that live
+  // outside UMBPDistributedConfig (no hugepages/NUMA/prefault dimension for
+  // hipMalloc'd memory), so it can be lowered directly here instead of via a
+  // caller-supplied parameter.
+  if (dc.hbm.enabled && dc.hbm.capacity_bytes > 0) {
+    pc.hbm.enabled = true;
+    pc.hbm.device = dc.hbm.device;
+    pc.hbm.buffer_sizes = {dc.hbm.capacity_bytes};
+  }
   return pc;
 }
 

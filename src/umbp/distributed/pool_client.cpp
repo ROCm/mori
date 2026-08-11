@@ -491,7 +491,8 @@ BackendRegistry& PoolClient::Backends() { return registry_; }
 //  Memory registration
 // ---------------------------------------------------------------------------
 
-bool PoolClient::RegisterMemory(void* ptr, size_t size) {
+bool PoolClient::RegisterMemory(void* ptr, size_t size, mori::io::MemoryLocationType loc,
+                                int device) {
   if (!transfer_engine_) {
     MORI_UMBP_ERROR("[PoolClient] RegisterMemory: transfer engine not available");
     return false;
@@ -504,14 +505,8 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size) {
   for (auto& reg : registered_regions_) {
     if (reg.base == ptr) return true;
   }
-  // NOTE (design doc §2, "Not part of this"): CPU is hardcoded here, which is
-  // wrong for a GPU src/dst (SGLang HiCache KV pages).  That is a property of
-  // the CALLER's allocation, not of any storage medium, so the fix is a
-  // location parameter on this public API — a different axis from this phase.
   registered_regions_.push_back(
-      {ptr, size,
-       transfer_engine_->RegisterMemory(ptr, size, mori::io::MemoryLocationType::CPU,
-                                        /*device=*/-1)});
+      {ptr, size, transfer_engine_->RegisterMemory(ptr, size, loc, device)});
   return true;
 }
 

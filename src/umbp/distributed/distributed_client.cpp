@@ -55,6 +55,12 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   // builds a PeerSsdManager or serves SSD reads, so this node advertises only
   // its DRAM capacity — advertising SSD here without anything behind it would
   // route Gets/Puts into a dead path.
+  //
+  // HBM is different: dc.hbm carries everything PoolClient's HBM PageBackend
+  // needs (enabled/device/capacity), and ToPoolClientConfig lowers it
+  // directly from dc — no ownership struct crosses this boundary the way
+  // dram's hugepages/NUMA/prefault knobs do, because hipMalloc has none of
+  // those dimensions.
   auto pc_config = ToPoolClientConfig(dc, std::move(dram_ownership));
   pc_config.copy_pipeline = config_.copy_pipeline;
 
@@ -74,11 +80,14 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
       "[DistributedClient] initialized — "
       "node_id={} node_address={} master={} "
       "dram_pool={}MB hugepages={} hugepage_size={}MB numa_node={} "
+      "hbm_pool={}MB hbm_device={} "
       "dram_page_size={}KB staging_buffer={}MB peer_port={} cache_remote={} "
       "io_engine={}:{} tags=[{}]",
       dc.master_config.node_id, dc.master_config.node_address, dc.master_config.master_address,
       config.dram.capacity_bytes / (1024 * 1024), config_.dram.use_hugepages,
-      config_.dram.hugepage_size / (1024 * 1024), config_.dram.numa_node, dc.dram_page_size / 1024,
+      config_.dram.hugepage_size / (1024 * 1024), config_.dram.numa_node,
+      dc.hbm.enabled ? dc.hbm.capacity_bytes / (1024 * 1024) : 0,
+      dc.hbm.enabled ? dc.hbm.device : -1, dc.dram_page_size / 1024,
       dc.staging_buffer_size / (1024 * 1024), dc.peer_service_port, dc.cache_remote_fetches,
       dc.io_engine.host, dc.io_engine.port, tags_str);
 }
@@ -190,11 +199,12 @@ size_t DistributedClient::BatchExistsConsecutive(const std::vector<std::string>&
 // RegisterMemory / DeregisterMemory
 // ---------------------------------------------------------------------------
 
-bool DistributedClient::RegisterMemory(uintptr_t ptr, size_t size) {
+bool DistributedClient::RegisterMemory(uintptr_t ptr, size_t size, mori::io::MemoryLocationType loc,
+                                       int device) {
   if (closing_) return false;
   std::shared_lock lk(op_mutex_);
   if (closed_) return false;
-  return pool_client_->RegisterMemory(reinterpret_cast<void*>(ptr), size);
+  return pool_client_->RegisterMemory(reinterpret_cast<void*>(ptr), size, loc, device);
 }
 
 void DistributedClient::DeregisterMemory(uintptr_t ptr) {

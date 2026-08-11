@@ -30,6 +30,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "mori/io/enum.hpp"
 #include "umbp/common/config.h"
 #include "umbp/distributed/types.h"
 
@@ -127,7 +128,16 @@ class IUMBPClient {
   // that *do* require registration MUST override; callers may treat a
   // `true` return as "registered or not-needed", and `false` as a hard
   // failure that must be surfaced.
-  virtual bool RegisterMemory(uintptr_t /*ptr*/, size_t /*size*/) { return true; }
+  /// `loc`/`device` describe the CALLER's allocation (CPU or a GPU ordinal),
+  /// not any storage medium — a GPU-resident src/dst (e.g. sglang HiCache
+  /// device-resident KV pages) must be registered as such so the transfer
+  /// layer picks HbmCopyEngine instead of assuming host memory.
+  virtual bool RegisterMemory(
+      uintptr_t /*ptr*/, size_t /*size*/,
+      mori::io::MemoryLocationType /*loc*/ = mori::io::MemoryLocationType::CPU,
+      int /*device*/ = -1) {
+    return true;
+  }
   virtual void DeregisterMemory(uintptr_t /*ptr*/) {}
 
   // ---- External KV Events (for unmanaged L1/L2 cache blocks) ----
