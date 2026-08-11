@@ -99,8 +99,13 @@ class PoolClient {
 
   // Pin a caller-owned region for zero-copy RDMA.  Calls into the IO
   // engine's RegisterMemory; the descriptor is cached and looked up by
-  // (ptr, size) on the Put/Get hot paths.
-  bool RegisterMemory(void* ptr, size_t size);
+  // (ptr, size) on the Put/Get hot paths. `loc`/`device` describe the
+  // caller's allocation (CPU, or a GPU ordinal for a device-resident
+  // buffer) so the transfer layer can route to HbmCopyEngine instead of
+  // assuming host memory.
+  bool RegisterMemory(void* ptr, size_t size,
+                      mori::io::MemoryLocationType loc = mori::io::MemoryLocationType::CPU,
+                      int device = -1);
   void DeregisterMemory(void* ptr);
 
   // Hot paths.  Both retry up to `max_route_retries` times when the
@@ -145,6 +150,11 @@ class PoolClient {
     std::vector<PageLocation> pages;
     uint64_t page_size = 0;
     std::vector<BufferMemoryDescBytes> descs;
+    // Which of the peer's backends `pages` index into.  A slot lives entirely
+    // in one medium, so one id covers the whole plan; without it the
+    // backend-local buffer_index does not name a buffer (see
+    // BufferMemoryDescBytes).
+    uint32_t backend_id = 0;
   };
 
   // Per-entry outcome inside the Put pipeline; projected to `bool` at

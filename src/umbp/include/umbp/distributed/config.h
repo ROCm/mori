@@ -146,6 +146,25 @@ struct DramOwnershipConfig {
   bool prefault = true;
 };
 
+// HBM-tier ownership knobs.  Deliberately NOT a superset of the DRAM ones:
+// hipMalloc has no hugepage, NUMA or prefault dimension, and the device ordinal
+// it does have is meaningless for host memory.  That asymmetry is the reason
+// each medium brings its own PageMemorySource rather than sharing one options
+// struct with per-medium fields nobody else reads.
+//
+// `enabled` defaults to false so an existing deployment is bit-identical; a
+// node opts into HBM explicitly.  See PoolClient::Init for the one-live-medium
+// note — DRAM and HBM are both registerable today, but the routing plane treats
+// every medium as equivalent (medium_backend.h), so a node configured with both
+// will mirror rather than tier.
+struct HbmOwnershipConfig {
+  bool enabled = false;
+  // GPU ordinal the pool is allocated on.  Fixed at Init, not inherited from
+  // whichever thread allocates first (see HbmPageMemorySource).
+  int device = 0;
+  std::vector<uint64_t> buffer_sizes;
+};
+
 // SSD-tier construction parameters lowered from the user-facing UMBPConfig.
 // SSDTier depends on UMBPSsdConfig (io backend/queue_depth, segment_size,
 // durability, storage_dir, capacity, watermarks, backend selection), so the
@@ -176,6 +195,7 @@ struct PoolClientConfig {
   size_t ssd_staging_buffer_size = 268435456;  // 256 MiB
 
   DramOwnershipConfig dram;
+  HbmOwnershipConfig hbm;
   PeerSsdConfig ssd;
 
   uint16_t peer_service_port = 0;
@@ -230,6 +250,15 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.dram_page_size = dc.dram_page_size;
   pc.dram = std::move(dram);
   pc.ssd = std::move(ssd);
+  // Unlike dram/ssd, UMBPHbmConfig carries no ownership knobs that live
+  // outside UMBPDistributedConfig (no hugepages/NUMA/prefault dimension for
+  // hipMalloc'd memory), so it can be lowered directly here instead of via a
+  // caller-supplied parameter.
+  if (dc.hbm.enabled && dc.hbm.capacity_bytes > 0) {
+    pc.hbm.enabled = true;
+    pc.hbm.device = dc.hbm.device;
+    pc.hbm.buffer_sizes = {dc.hbm.capacity_bytes};
+  }
   return pc;
 }
 

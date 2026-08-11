@@ -50,12 +50,27 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   dram_ownership.numa_node = config.dram.numa_node;
   dram_ownership.prefault = config.dram.prefault;
 
-  // SSD is unwired from the distributed data plane (backend-agnostic refactor
-  // Phase 0, see design-backend-agnostic-refactor.md): PoolClient no longer
-  // builds a PeerSsdManager or serves SSD reads, so this node advertises only
-  // its DRAM capacity — advertising SSD here without anything behind it would
-  // route Gets/Puts into a dead path.
-  auto pc_config = ToPoolClientConfig(dc, std::move(dram_ownership));
+  // SSD came back to the distributed data plane as a MediumBackend: Phase 0
+  // unwired the old PeerSsdManager special case, and PoolClient::Init now
+  // registers an SsdBackend from PoolClientConfig::ssd the same way it
+  // registers DRAM and HBM.  All that was missing was this lowering, so the
+  // tier stayed dark no matter how UMBPConfig::ssd was set.
+  //
+  // Gated on dc.enable_ssd_tier, NOT config.ssd.enabled — the latter defaults
+  // to true, so keying off it would make every existing distributed deployment
+  // start advertising SSD capacity it had never opted into.
+  PeerSsdConfig ssd_ownership;
+  if (dc.enable_ssd_tier && config.ssd.enabled) {
+    ssd_ownership.enabled = true;
+    ssd_ownership.ssd = config.ssd;
+  }
+
+  // HBM is different again: dc.hbm carries everything PoolClient's HBM
+  // PageBackend needs (enabled/device/capacity), and ToPoolClientConfig lowers
+  // it directly from dc — no ownership struct crosses this boundary the way
+  // dram's hugepages/NUMA/prefault knobs do, because hipMalloc has none of
+  // those dimensions.
+  auto pc_config = ToPoolClientConfig(dc, std::move(dram_ownership), std::move(ssd_ownership));
   pc_config.copy_pipeline = config_.copy_pipeline;
 
   pool_client_ = std::make_unique<PoolClient>(std::move(pc_config));
@@ -74,13 +89,18 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
       "[DistributedClient] initialized — "
       "node_id={} node_address={} master={} "
       "dram_pool={}MB hugepages={} hugepage_size={}MB numa_node={} "
+      "hbm_pool={}MB hbm_device={} ssd_tier={} ssd_pool={}MB ssd_backend={} "
       "dram_page_size={}KB staging_buffer={}MB peer_port={} cache_remote={} "
       "io_engine={}:{} tags=[{}]",
       dc.master_config.node_id, dc.master_config.node_address, dc.master_config.master_address,
       config.dram.capacity_bytes / (1024 * 1024), config_.dram.use_hugepages,
-      config_.dram.hugepage_size / (1024 * 1024), config_.dram.numa_node, dc.dram_page_size / 1024,
-      dc.staging_buffer_size / (1024 * 1024), dc.peer_service_port, dc.cache_remote_fetches,
-      dc.io_engine.host, dc.io_engine.port, tags_str);
+      config_.dram.hugepage_size / (1024 * 1024), config_.dram.numa_node,
+      dc.hbm.enabled ? dc.hbm.capacity_bytes / (1024 * 1024) : 0,
+      dc.hbm.enabled ? dc.hbm.device : -1, dc.enable_ssd_tier && config_.ssd.enabled,
+      (dc.enable_ssd_tier && config_.ssd.enabled) ? config_.ssd.capacity_bytes / (1024 * 1024) : 0,
+      (dc.enable_ssd_tier && config_.ssd.enabled) ? config_.ssd.ssd_backend : std::string{"none"},
+      dc.dram_page_size / 1024, dc.staging_buffer_size / (1024 * 1024), dc.peer_service_port,
+      dc.cache_remote_fetches, dc.io_engine.host, dc.io_engine.port, tags_str);
 }
 
 DistributedClient::~DistributedClient() { Close(); }
@@ -190,11 +210,12 @@ size_t DistributedClient::BatchExistsConsecutive(const std::vector<std::string>&
 // RegisterMemory / DeregisterMemory
 // ---------------------------------------------------------------------------
 
-bool DistributedClient::RegisterMemory(uintptr_t ptr, size_t size) {
+bool DistributedClient::RegisterMemory(uintptr_t ptr, size_t size, mori::io::MemoryLocationType loc,
+                                       int device) {
   if (closing_) return false;
   std::shared_lock lk(op_mutex_);
   if (closed_) return false;
-  return pool_client_->RegisterMemory(reinterpret_cast<void*>(ptr), size);
+  return pool_client_->RegisterMemory(reinterpret_cast<void*>(ptr), size, loc, device);
 }
 
 void DistributedClient::DeregisterMemory(uintptr_t ptr) {

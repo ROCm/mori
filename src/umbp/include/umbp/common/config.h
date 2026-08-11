@@ -207,6 +207,22 @@ inline bool ShouldAdmitReCache(bool cache_remote_fetches, CacheRemoteAdmission p
   return true;  // ALWAYS, or SIZE within cap
 }
 
+// User-facing HBM-tier opt-in for distributed mode. Unlike dram/ssd, HBM has
+// no local (non-distributed) mode, so it lives only here rather than on the
+// top-level UMBPConfig. Mirrors HbmOwnershipConfig's shape (device +
+// buffer_sizes) deliberately: hipMalloc has no hugepage/NUMA/prefault
+// dimension the way host memory does, so there is nothing else to expose.
+// `enabled` defaults to false so an existing deployment is bit-identical; a
+// node opts into HBM explicitly. See PoolClient::Init for the one-live-medium
+// note — DRAM and HBM are both registerable, but the routing plane treats
+// every medium as equivalent, so a node configured with both will mirror
+// rather than tier.
+struct UMBPHbmConfig {
+  bool enabled = false;
+  int device = 0;               // GPU ordinal the pool is allocated on
+  uint64_t capacity_bytes = 0;  // single-buffer pool size; 0 keeps HBM off even if enabled=true
+};
+
 // User-facing distributed configuration. Set UMBPConfig::distributed to enable
 // distributed mode. Internally translated to PoolClientConfig by DistributedClient.
 struct UMBPDistributedConfig {
@@ -241,6 +257,19 @@ struct UMBPDistributedConfig {
   // 0 = delegate to Master's ClientRegistryConfig::default_dram_page_size
   // (2 MiB by default).  Set to an explicit byte count to override.
   uint64_t dram_page_size = 0;
+
+  UMBPHbmConfig hbm;
+
+  // Opt this node's distributed data plane into the SSD medium.  Unlike hbm,
+  // SSD needs no config struct of its own here: UMBPConfig::ssd already carries
+  // every knob SsdBackend takes (storage_dir, capacity, segment/layout, io,
+  // durability, ssd_backend selection), and DistributedClient lowers it into
+  // PoolClientConfig::ssd when this is set.  A separate bool rather than
+  // reusing UMBPConfig::ssd.enabled because THAT defaults to true — keying the
+  // distributed tier off it would silently make every existing deployment
+  // start advertising SSD capacity.  Defaults false: a node opts in
+  // explicitly, exactly as it does for HBM.
+  bool enable_ssd_tier = false;
 };
 
 // User-facing same-host standalone-process configuration.  Set

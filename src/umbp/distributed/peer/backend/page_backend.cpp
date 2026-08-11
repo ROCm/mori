@@ -73,8 +73,21 @@ PageBackend::PageBackend(TierType tier, uint64_t page_size, TierConfig cfg,
   InstallTierConfig(std::move(cfg));
 }
 
+// Sugar: build the host source these knobs describe and delegate, so there is
+// one self-allocating constructor body and one Init path.
 PageBackend::PageBackend(TierType tier, uint64_t page_size, OwnershipConfig ownership,
                          std::chrono::milliseconds pending_ttl,
+                         std::chrono::milliseconds read_lease_ttl,
+                         std::chrono::milliseconds reaper_interval)
+    : PageBackend(tier, page_size,
+                  std::make_unique<HostPageMemorySource>(HostPageMemorySource::Options{
+                      ownership.use_hugepages, ownership.hugepage_size, ownership.numa_node,
+                      ownership.prefault}),
+                  ownership.buffer_sizes, pending_ttl, read_lease_ttl, reaper_interval) {}
+
+PageBackend::PageBackend(TierType tier, uint64_t page_size,
+                         std::unique_ptr<PageMemorySource> source,
+                         std::vector<uint64_t> buffer_sizes, std::chrono::milliseconds pending_ttl,
                          std::chrono::milliseconds read_lease_ttl,
                          std::chrono::milliseconds reaper_interval)
     : tier_(tier),
@@ -82,10 +95,18 @@ PageBackend::PageBackend(TierType tier, uint64_t page_size, OwnershipConfig owne
       pending_ttl_(pending_ttl),
       read_lease_ttl_(read_lease_ttl),
       reaper_interval_(reaper_interval),
-      ownership_(std::move(ownership)) {
+      source_(std::move(source)),
+      source_buffer_sizes_(std::move(buffer_sizes)) {
   if (page_size == 0) {
     throw std::invalid_argument("PageBackend: page_size must be > 0");
   }
+  if (source_ == nullptr) {
+    throw std::invalid_argument("PageBackend: PageMemorySource must not be null");
+  }
+  // Captured now rather than read through source_ at BuildBufferRefs time: that
+  // runs for the TierConfig constructor too, where there is no source.
+  buffer_loc_ = source_->LocationType();
+  buffer_device_ = source_->Device();
   // Not yet configured — allocator_ stays null until Init() self-allocates.
 }
 
@@ -126,8 +147,11 @@ void PageBackend::BuildBufferRefs() {
   for (size_t i = 0; i < buffers.size(); ++i) {
     TransferRef ref;
     ref.size = static_cast<uint64_t>(buffers[i].total_pages) * page_size_;
-    ref.loc = mori::io::MemoryLocationType::CPU;
-    ref.device = -1;
+    // From the source that allocated these bytes, not assumed.  This is what
+    // makes a local transfer against this backend select the right engine:
+    // HbmCopyEngine claims the pair on loc == GPU, LocalCopyEngine on both CPU.
+    ref.loc = buffer_loc_;
+    ref.device = buffer_device_;
     if (i < buffer_bases_.size()) ref.host_ptr = buffer_bases_[i];
     if (i < buffer_descs_.size() && !buffer_descs_[i].empty()) {
       try {
@@ -147,7 +171,7 @@ void PageBackend::BuildBufferRefs() {
 // ---------------------------------------------------------------------------
 
 bool PageBackend::Init(MemoryRegistrar* registrar) {
-  if (!ownership_.has_value()) {
+  if (source_ == nullptr) {
     // Constructed with a pre-built TierConfig (test / legacy-direct path) —
     // already configured, nothing to do.
     return true;
@@ -156,45 +180,31 @@ bool PageBackend::Init(MemoryRegistrar* registrar) {
 
   registrar_ = registrar;
 
-  HostMemAllocator allocator;
-  HostBufferOptions opts;
-  opts.backing = ownership_->use_hugepages ? HostBufferBacking::kAnonymousHugetlb
-                                           : HostBufferBacking::kAnonymous;
-  opts.hugepage_size = ownership_->hugepage_size;
-  opts.numa_node = ownership_->numa_node;
-  opts.prefault = ownership_->prefault;
+  // The medium-specific half: what kind of memory, and where.  Everything after
+  // this call is identical for DRAM, HBM, or any future paged medium.
+  std::vector<PageMemorySource::Buffer> buffers;
+  if (!source_->Allocate(source_buffer_sizes_, &buffers)) {
+    MORI_UMBP_ERROR("[PageBackend] Init: {} allocation failed for tier={}", source_->Name(),
+                    static_cast<int>(tier_));
+    registrar_ = nullptr;
+    return false;
+  }
+
+  const mori::io::MemoryLocationType loc = source_->LocationType();
+  const int device = source_->Device();
 
   TierConfig cfg;
-  cfg.buffer_sizes.reserve(ownership_->buffer_sizes.size());
-  cfg.buffer_descs.reserve(ownership_->buffer_sizes.size());
-  cfg.buffer_bases.reserve(ownership_->buffer_sizes.size());
+  cfg.buffer_sizes.reserve(buffers.size());
+  cfg.buffer_descs.reserve(buffers.size());
+  cfg.buffer_bases.reserve(buffers.size());
 
-  for (uint64_t size : ownership_->buffer_sizes) {
-    if (size == 0) continue;
-    HostBufferHandle handle = allocator.Alloc(size, opts);
-    if (!handle.valid()) {
-      MORI_UMBP_ERROR("[PageBackend] Init: host allocation failed for size={} tier={}", size,
-                      static_cast<int>(tier_));
-      // Unwind whatever we already allocated in this call.  Deregister
-      // explicitly: owns_memory_ never becomes true on this path, so
-      // Shutdown() would early-return and leak the registrations.
-      if (registrar != nullptr) {
-        for (const auto& ref : owned_refs_) registrar->Deregister(ref);
-      }
-      owned_refs_.clear();
-      for (auto& h : owned_buffer_handles_) allocator.Free(h);
-      owned_buffer_handles_.clear();
-      registrar_ = nullptr;
-      return false;
-    }
-
+  for (const auto& buffer : buffers) {
     std::vector<uint8_t> desc_bytes;
     if (registrar != nullptr) {
       // The backend supplies the facts a descriptor cannot recover — location
       // type and device — because the backend is the allocator (design doc §6).
-      TransferRef ref = registrar->RegisterMemory(handle.ptr, handle.mapped_size,
-                                                  mori::io::MemoryLocationType::CPU,
-                                                  /*device=*/-1);
+      // They come from the source, which is the thing that actually knows.
+      TransferRef ref = registrar->RegisterMemory(buffer.base, buffer.size, loc, device);
       owned_refs_.push_back(ref);
       if (ref.HasMemoryDesc()) {
         msgpack::sbuffer sbuf;
@@ -203,17 +213,18 @@ bool PageBackend::Init(MemoryRegistrar* registrar) {
       }
     }
 
-    cfg.buffer_sizes.push_back(handle.mapped_size);
+    cfg.buffer_sizes.push_back(buffer.size);
     cfg.buffer_descs.push_back(std::move(desc_bytes));
-    cfg.buffer_bases.push_back(handle.ptr);
-    owned_buffer_handles_.push_back(handle);
+    cfg.buffer_bases.push_back(buffer.base);
   }
 
+  const size_t buffer_count = cfg.buffer_sizes.size();
   InstallTierConfig(std::move(cfg));
   owns_memory_ = true;
   StartReaper();
-  MORI_UMBP_INFO("[PageBackend] Init tier={} buffers={} total_bytes={}", static_cast<int>(tier_),
-                 owned_buffer_handles_.size(), Capacity().total_bytes);
+  MORI_UMBP_INFO("[PageBackend] Init tier={} source={} loc={} device={} buffers={} total_bytes={}",
+                 static_cast<int>(tier_), source_->Name(), static_cast<int>(loc), device,
+                 buffer_count, Capacity().total_bytes);
   return true;
 }
 
@@ -224,12 +235,53 @@ void PageBackend::Shutdown() {
   }
   owned_refs_.clear();
 
-  HostMemAllocator allocator;
-  for (auto& handle : owned_buffer_handles_) allocator.Free(handle);
-  owned_buffer_handles_.clear();
+  // Deregistration must precede release: the registrar may still hold an MR
+  // over these pages, and freeing under it is what the ordering here prevents.
+  if (source_ != nullptr) source_->Release();
 
   owns_memory_ = false;
   registrar_ = nullptr;
+}
+
+// ---------------------------------------------------------------------------
+//  HostPageMemorySource — host DRAM, verbatim what Init() used to do inline
+// ---------------------------------------------------------------------------
+
+bool HostPageMemorySource::Allocate(const std::vector<uint64_t>& sizes, std::vector<Buffer>* out) {
+  HostMemAllocator allocator;
+  HostBufferOptions opts;
+  opts.backing =
+      opts_.use_hugepages ? HostBufferBacking::kAnonymousHugetlb : HostBufferBacking::kAnonymous;
+  opts.hugepage_size = opts_.hugepage_size;
+  opts.numa_node = opts_.numa_node;
+  opts.prefault = opts_.prefault;
+
+  std::vector<HostBufferHandle> taken;
+  std::vector<Buffer> staged;
+  for (uint64_t size : sizes) {
+    if (size == 0) continue;
+    HostBufferHandle handle = allocator.Alloc(size, opts);
+    if (!handle.valid()) {
+      MORI_UMBP_ERROR("[HostPageMemorySource] host allocation failed for size={}", size);
+      // All-or-nothing: unwind only what THIS call took, leaving any earlier
+      // successful Allocate (and `out`) untouched.
+      for (auto& h : taken) allocator.Free(h);
+      return false;
+    }
+    // mapped_size, not the request: hugepage rounding makes the extra usable.
+    staged.push_back(Buffer{handle.ptr, handle.mapped_size});
+    taken.push_back(handle);
+  }
+
+  handles_.insert(handles_.end(), taken.begin(), taken.end());
+  out->insert(out->end(), staged.begin(), staged.end());
+  return true;
+}
+
+void HostPageMemorySource::Release() {
+  HostMemAllocator allocator;
+  for (auto& handle : handles_) allocator.Free(handle);
+  handles_.clear();
 }
 
 // ---------------------------------------------------------------------------

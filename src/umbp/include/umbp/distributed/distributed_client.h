@@ -66,7 +66,9 @@ class DistributedClient : public IUMBPClient {
   bool IsDistributed() const override;
   UMBPDeploymentMode GetDeploymentMode() const override { return UMBPDeploymentMode::Distributed; }
 
-  bool RegisterMemory(uintptr_t ptr, size_t size) override;
+  bool RegisterMemory(uintptr_t ptr, size_t size,
+                      mori::io::MemoryLocationType loc = mori::io::MemoryLocationType::CPU,
+                      int device = -1) override;
   void DeregisterMemory(uintptr_t ptr) override;
 
   bool ReportExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) override;

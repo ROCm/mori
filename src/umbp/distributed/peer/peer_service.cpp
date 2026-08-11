@@ -93,18 +93,25 @@ uint64_t LocalSlotId(uint64_t tagged) { return tagged & kSlotLocalMask; }
 // Drop a (pages, page_size, descs) tuple into a slot-shaped response
 // that exposes those fields directly.  Templated so the same body
 // covers AllocateSlotResponse and ResolveKeyResponse.
+//
+// `backend_id` is stamped here rather than inside the backend: a backend
+// numbers its buffers from 0 and knows nothing of its siblings, so the owning
+// backend is a fact only this boundary has.  See BufferMemoryDesc in
+// umbp.proto.
 template <typename Response>
 void FillPagesAndDescs(Response* resp, const std::vector<PageLocation>& pages, uint64_t page_size,
-                       const std::vector<BufferMemoryDescBytes>& descs) {
+                       const std::vector<BufferMemoryDescBytes>& descs, uint32_t backend_id) {
   for (const auto& p : pages) {
     auto* pl = resp->add_pages();
     pl->set_buffer_index(p.buffer_index);
     pl->set_page_index(p.page_index);
   }
   resp->set_page_size(page_size);
+  resp->set_backend_id(backend_id);
   for (const auto& d : descs) {
     auto* desc = resp->add_descs();
     desc->set_buffer_index(d.buffer_index);
+    desc->set_backend_id(backend_id);
     desc->set_desc(std::string(d.desc_bytes.begin(), d.desc_bytes.end()));
   }
 }
@@ -131,36 +138,34 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     if (!engine_desc_bytes_.empty()) {
       response->set_engine_desc(std::string(engine_desc_bytes_.begin(), engine_desc_bytes_.end()));
     }
-    // Ship every configured buffer's desc so first-contact writers can hydrate
+    // Ship EVERY backend's buffer descs so first-contact writers can hydrate
     // without a follow-up Allocate / Resolve.
     //
-    // The bootstrap wire carries ONE medium: dram_memory_descs is a flat
-    // buffer_index space and dram_page_size is a single field, while each
-    // backend numbers its buffers from 0 with its own page size (design doc §1
-    // item 4 — "no tier dimension").  So descs come from the first backend that
-    // has any, and a second buffer-owning backend is reported rather than
-    // silently merged into a colliding index space.  A
-    // tier dimension here is the prerequisite for a second live medium, which
-    // the design doc defers to Phase 6 (§5 Phase 2 option (a)).
-    MediumBackend* published = nullptr;
+    // This used to publish one medium and log an error about the rest, because
+    // the wire carried a flat buffer_index space with no way to say which
+    // backend an index belonged to.  That was not merely incomplete: the reader
+    // caches descriptors by index and asks the peer to omit them once it
+    // believes it has them (BatchResolveKeysRequest.omit_descs), so an
+    // unadvertised medium's pages were resolved against the advertised
+    // medium's memory — a hit, with bytes from the wrong pool.  Every backend
+    // publishes exactly one buffer today, so index 0 collided on every
+    // mixed-media node and the corruption was deterministic.
+    //
+    // BufferMemoryDesc.backend_id closes it.  buffer_index stays backend-local
+    // and no backend changed; the id is stamped here, at the boundary that
+    // knows it.
     for (auto* backend : Media()) {
-      auto descs = backend->AllBufferDescs();
-      if (descs.empty()) continue;
-      if (published != nullptr) {
-        MORI_UMBP_ERROR(
-            "[PeerService] GetPeerInfo: backend tier={} has buffers but the bootstrap wire "
-            "carries only one medium (published tier={}); its buffers are NOT advertised",
-            static_cast<int>(backend->Tier()), static_cast<int>(published->Tier()));
-        continue;
-      }
-      for (const auto& d : descs) {
-        auto* out = response->add_dram_memory_descs();
+      const uint32_t backend_id = registry_->BackendId(backend);
+      for (const auto& d : backend->AllBufferDescs()) {
+        auto* out = response->add_buffer_descs();
+        out->set_backend_id(backend_id);
         out->set_buffer_index(d.buffer_index);
         out->set_desc(std::string(d.desc_bytes.begin(), d.desc_bytes.end()));
       }
-      response->set_dram_page_size(backend->PageSize());
-      published = backend;
     }
+    // Uniform across backends; BackendRegistry::Register refuses a backend that
+    // disagrees, so there is one page size to report.
+    if (registry_ != nullptr) response->set_page_size(registry_->PageSize());
     return grpc::Status::OK;
   }
 
@@ -201,7 +206,8 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     }
     response->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
     response->set_slot_id(TagSlotId(backend->Tier(), result.slot_id));
-    FillPagesAndDescs(response, result.pages, result.page_size, result.descs);
+    FillPagesAndDescs(response, result.pages, result.page_size, result.descs,
+                      registry_->BackendId(backend));
     response->set_pending_ttl_ms(result.pending_ttl_ms);
     return grpc::Status::OK;
   }
@@ -249,7 +255,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       const auto& r = results.front();
       if (!r.found) continue;
       response->set_found(true);
-      FillPagesAndDescs(response, r.pages, r.page_size, r.descs);
+      FillPagesAndDescs(response, r.pages, r.page_size, r.descs, registry_->BackendId(backend));
       response->set_size(r.size);
       RecordInboundGet(r.size, "remote");
       return grpc::Status::OK;
@@ -330,7 +336,8 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
         }
         out->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
         out->set_slot_id(TagSlotId(tier, result.slot_id));
-        FillPagesAndDescs(out, result.pages, result.page_size, result.descs);
+        FillPagesAndDescs(out, result.pages, result.page_size, result.descs,
+                          registry_->BackendId(backend));
         out->set_pending_ttl_ms(result.pending_ttl_ms);
       }
     }
@@ -409,58 +416,58 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     const bool omit_descs = request->omit_descs();
     std::vector<std::string> keys(request->keys().begin(), request->keys().end());
 
-    // One response carries ONE medium: page_size is a single field and descs
-    // share a flat buffer_index space (same wire limitation as GetPeerInfo).
-    // So the first backend in read-rank order that has any hit serves the whole
-    // response.  A key held only by a lower-ranked medium reports found=false,
-    // which the client handles as a miss (it excludes the node and retries) —
-    // never as a corrupt read, the same safe direction the omit_descs contract
-    // already relies on.
-    std::vector<ResolvedEntry> resolved;
-    MediumBackend* serving = nullptr;
-    for (auto* backend : Media()) {
-      auto candidate = backend->BatchResolve(keys, /*include_descs=*/!omit_descs);
-      const bool any_hit = std::any_of(candidate.begin(), candidate.end(),
-                                       [](const ResolvedEntry& e) { return e.found; });
-      if (!any_hit) continue;
-      resolved = std::move(candidate);
-      serving = backend;
-      break;
-    }
-    if (serving == nullptr) {
-      std::vector<ResolvedKeyEntry> misses(request->keys_size());
-      EncodeBatchResolveResponse(misses, /*page_size=*/0, /*descs=*/{}, response);
-      return grpc::Status::OK;
-    }
-
-    // Project to the encoder's host shape and deduplicate the buffer
-    // descriptors once for the whole batch (their bytes are identical across
-    // keys for a given buffer_index).
-    std::vector<ResolvedKeyEntry> entries;
-    entries.reserve(resolved.size());
+    // Ask EVERY medium and merge, resolving each key independently.
+    //
+    // This used to let the first backend with ANY hit serve the whole response,
+    // because descs shared a flat buffer_index space with no way to say which
+    // backend an index belonged to.  That cost correctness twice over: a key
+    // held only by a later medium was reported found=false purely because some
+    // OTHER key in the same batch hit earlier (a silent hit-rate loss on any
+    // mixed-media node), and the descs that did ship were ambiguous.
+    // BufferMemoryDesc.backend_id and the per-key backend_id array remove both
+    // constraints — a batch may now span media and stay self-describing.
+    //
+    // Per KEY, the first medium in walk order still wins; a key mirrored across
+    // media is served from one of them, which is what the mirror design allows.
+    std::vector<ResolvedKeyEntry> entries(keys.size());
     std::vector<BufferMemoryDescBytes> batch_descs;
-    std::vector<bool> desc_seen;  // indexed by buffer_index
+    // Descriptor bytes are identical across keys for a given buffer, so ship
+    // each (backend_id, buffer_index) once per batch.
+    std::vector<std::vector<bool>> desc_seen(BackendRegistry::kMaxBackends);
     uint64_t total_bytes = 0;
-    for (auto& r : resolved) {
-      ResolvedKeyEntry e;
-      e.found = r.found;
-      if (r.found) {
-        e.tier = serving->Tier();
-        e.size = r.size;
-        e.pages = std::move(r.pages);
+
+    for (auto* backend : Media()) {
+      const uint32_t backend_id = registry_->BackendId(backend);
+      if (backend_id >= BackendRegistry::kMaxBackends) continue;  // not registered; cannot address
+
+      auto candidate = backend->BatchResolve(keys, /*include_descs=*/!omit_descs);
+      for (size_t i = 0; i < candidate.size() && i < entries.size(); ++i) {
+        auto& r = candidate[i];
+        if (!r.found || entries[i].found) continue;
+
+        entries[i].found = true;
+        entries[i].tier = backend->Tier();
+        entries[i].backend_id = backend_id;
+        entries[i].size = r.size;
+        entries[i].pages = std::move(r.pages);
         total_bytes += r.size;
-        if (!omit_descs) {
-          for (const auto& d : r.descs) {
-            if (d.buffer_index >= desc_seen.size()) desc_seen.resize(d.buffer_index + 1, false);
-            if (desc_seen[d.buffer_index]) continue;
-            desc_seen[d.buffer_index] = true;
-            batch_descs.push_back(d);
-          }
+
+        if (omit_descs) continue;
+        auto& seen = desc_seen[backend_id];
+        for (auto& d : r.descs) {
+          if (d.buffer_index >= seen.size()) seen.resize(d.buffer_index + 1, false);
+          if (seen[d.buffer_index]) continue;
+          seen[d.buffer_index] = true;
+          d.backend_id = backend_id;  // stamped here; the backend left it at 0
+          batch_descs.push_back(std::move(d));
         }
       }
-      entries.push_back(std::move(e));
     }
-    EncodeBatchResolveResponse(entries, serving->PageSize(), batch_descs, response);
+
+    // Page size is uniform across backends (BackendRegistry::Register), so a
+    // batch spanning media still has one to report.
+    EncodeBatchResolveResponse(entries, registry_ == nullptr ? 0 : registry_->PageSize(),
+                               batch_descs, response);
     RecordInboundGet(total_bytes, "remote");
     return grpc::Status::OK;
   }
@@ -515,6 +522,15 @@ bool PeerServiceServer::Start(uint16_t port) {
   std::string address = "0.0.0.0:" + std::to_string(port);
 
   grpc::ServerBuilder builder;
+  // gRPC turns SO_REUSEPORT ON by default for TCP servers on Linux, which means
+  // a SECOND server binding this same port SUCCEEDS and the kernel then splits
+  // incoming connections between the two.  For a peer service that is never
+  // right: a client dialing this address would be answered, some fraction of
+  // the time, by a different process's peer service with different backends
+  // registered — a wrong answer rather than a connection error.  It also made
+  // the "port may be in use" check below dead code, since BuildAndStart could
+  // not fail that way.  Exactly one peer service owns a port.
+  builder.AddChannelArgument(GRPC_ARG_ALLOW_REUSEPORT, 0);
   builder.AddListeningPort(address, grpc::InsecureServerCredentials());
   builder.RegisterService(service_.get());
   server_ = builder.BuildAndStart();

@@ -163,6 +163,42 @@ def _build_parser() -> argparse.ArgumentParser:
                 "and tear them down on exit (default: on; use --no-start-server "
                 "to reuse an already-running server).",
             )
+            if be_name == "umbp":
+                be_p.add_argument(
+                    "--tier",
+                    choices=["dram", "hbm", "ssd"],
+                    default="dram",
+                    help="Storage tier to benchmark (default: dram). All three are wired "
+                    "end-to-end through DistributedClient (distributed_client.cpp), which "
+                    "lowers UMBPDistributedConfig.hbm and (when enable_ssd_tier is set) "
+                    "UMBPConfig.ssd into PoolClientConfig, so PoolClient::Init registers "
+                    "the matching MediumBackend. Note DRAM is ALWAYS registered, so "
+                    "--tier hbm/ssd yields a two-backend node and the routing plane "
+                    "treats media as equivalent (medium_backend.h) -- it mirrors rather "
+                    "than tiers. Configure SSD via UMBP_SSD_STORAGE_DIR / "
+                    "UMBP_SSD_CAPACITY_BYTES / UMBP_SSD_BACKEND.",
+                )
+                be_p.add_argument(
+                    "--dst-loc",
+                    choices=["host", "gpu"],
+                    default="host",
+                    help="Where the GET/read destination buffer lives (default: host). "
+                    "'gpu' allocates it via hipMalloc and registers it as GPU-resident, "
+                    "so a read from an HBM-tier pool (--tier hbm) exercises "
+                    "HbmCopyEngine's device-to-device hipMemcpy path instead of "
+                    "device-to-host. Combine with --tier hbm for the two HBM bench "
+                    "cases: --dst-loc host = D2H, --dst-loc gpu = D2D. The write/seed "
+                    "path is always host-resident (an H2D put into the pool) "
+                    "regardless of this flag -- only the measured read side varies.",
+                )
+                be_p.add_argument(
+                    "--hbm-device",
+                    type=int,
+                    default=0,
+                    help="GPU ordinal for the HBM tier pool (--tier hbm) and, with "
+                    "--dst-loc gpu, the client's own read-destination buffer "
+                    "(default: 0). Overridable via UMBP_HBM_DEVICE.",
+                )
             if batch_perf:
                 be_p.add_argument("--passes", type=int, default=10)
                 be_p.add_argument("--batch-sizes", type=int, nargs="+", metavar="N")
@@ -206,7 +242,15 @@ if role != "both" and not args.key_prefix:
     )
     sys.exit(2)
 
+tier = getattr(args, "tier", "dram")
+dst_loc = getattr(args, "dst_loc", "host")
+hbm_device = getattr(args, "hbm_device", 0)
+if dst_loc == "gpu" and backend_name != "umbp":
+    print("ERROR: --dst-loc gpu is only supported for backend=umbp", file=sys.stderr)
+    sys.exit(2)
+
 if backend_name == "umbp":
+    from mori.io import MemoryLocationType
     from mori.umbp import UMBPClient, UMBPConfig, UMBPDistributedConfig
 
     master_address = args.master_address
@@ -259,8 +303,11 @@ class Backend(ABC):
     def flush(self): ...
 
     @abstractmethod
-    def register_memory(self, ptr: int, size: int):
-        """Register a memory region for RDMA (no-op for backends that don't need it)."""
+    def register_memory(self, ptr: int, size: int, loc: str = "cpu", device: int = -1):
+        """Register a memory region for RDMA (no-op for backends that don't need it).
+        loc/device describe the CALLER's allocation ("cpu" or "gpu" + ordinal),
+        not any storage medium -- needed so a GPU-resident buffer routes through
+        HbmCopyEngine instead of being treated as host memory."""
 
     @abstractmethod
     def get_into_ptr(self, key: str, ptr: int, size: int) -> bool:
@@ -321,8 +368,18 @@ class UMBPBackend(Backend):
         reader_port: int = None,
     ):
         cfg = UMBPConfig()
+        # PoolClient::Init ALWAYS registers DRAM, and the routing plane has no
+        # tier order -- ConfigurableRoutePutStrategy/kMostAvailable simply picks
+        # whichever medium advertises the most free bytes (route_put_strategy.h).
+        # So with the 8 GiB DRAM default a --tier hbm run (4 GiB) would route
+        # every put to DRAM and report it as HBM. Shrink DRAM to a floor well
+        # below the target pool so most-available can only pick the target.
+        # The bench's whole working set must also fit in that headroom.
+        default_dram = 8 * 1024 * 1024 * 1024
+        if tier != "dram":
+            default_dram = 256 * 1024 * 1024
         cfg.dram.capacity_bytes = int(
-            os.environ.get("UMBP_DRAM_CAPACITY_BYTES", 8 * 1024 * 1024 * 1024)
+            os.environ.get("UMBP_DRAM_CAPACITY_BYTES", default_dram)
         )
         cfg.dram.use_hugepages = os.environ.get("UMBP_DRAM_USE_HUGEPAGES", "1") not in (
             "0",
@@ -337,7 +394,57 @@ class UMBPBackend(Backend):
         dist.master_config.node_id = node_id
         dist.master_config.node_address = node_address
         dist.peer_service_port = port
+        # Re-caching remotely-fetched blocks into the LOCAL tier defaults on,
+        # which silently changes what a tier benchmark measures: the reader
+        # gets its own pool of the tier under test, so after pass 1 most reads
+        # are served from the reader's own memory (a local copy) instead of
+        # RDMA out of the writer's tier. Set UMBP_CACHE_REMOTE_FETCHES=0 to
+        # pin every pass to a genuine remote read. Default keeps the
+        # production behavior.
+        dist.cache_remote_fetches = os.environ.get(
+            "UMBP_CACHE_REMOTE_FETCHES", "1"
+        ) not in ("0", "false", "False", "")
         dist.io_engine.host = node_address
+        if tier == "hbm":
+            dist.hbm.enabled = True
+            dist.hbm.device = int(os.environ.get("UMBP_HBM_DEVICE", hbm_device))
+            dist.hbm.capacity_bytes = int(
+                os.environ.get("UMBP_HBM_CAPACITY_BYTES", 4 * 1024 * 1024 * 1024)
+            )
+        if tier == "ssd":
+            # enable_ssd_tier is the distributed-side opt-in; cfg.ssd carries the
+            # actual knobs (it already defaults enabled=True, which is why the
+            # opt-in is a separate flag -- see UMBPDistributedConfig).
+            dist.enable_ssd_tier = True
+            # SSD is not directly addressable: a remote read stages the value
+            # into a registered host arena of ssd_staging_buffer_slots pages.
+            # The default 16 slots caps read concurrency at 16 keys, and a
+            # slot stays pinned for UMBP_SSD_READ_LEASE_MS (3s) when the
+            # reader's best-effort ReleaseSsdLease is lost -- so a sweep over
+            # more than ~16 keys degrades the rest to MISSES, not slow hits
+            # (ssd_backend.cpp: "Sizing the arena for read concurrency is the
+            # mitigation"). Size the arena for the sweep instead.
+            dist.ssd_staging_buffer_slots = int(
+                os.environ.get("UMBP_SSD_STAGING_SLOTS", 512)
+            )
+            # Slot size = size / slots, and must be >= the largest single value.
+            dist.ssd_staging_buffer_size = int(
+                os.environ.get("UMBP_SSD_STAGING_BYTES", 2 * 1024 * 1024 * 1024)
+            )
+            cfg.ssd.enabled = True
+            cfg.ssd.storage_dir = os.environ.get(
+                "UMBP_SSD_STORAGE_DIR", f"/tmp/umbp_ssd_{node_id}"
+            )
+            cfg.ssd.capacity_bytes = int(
+                os.environ.get("UMBP_SSD_CAPACITY_BYTES", 32 * 1024 * 1024 * 1024)
+            )
+            cfg.ssd.ssd_backend = os.environ.get("UMBP_SSD_BACKEND", "file")
+            os.makedirs(cfg.ssd.storage_dir, exist_ok=True)
+        else:
+            # Keep the SSD tier dark for dram/hbm runs: cfg.ssd.enabled defaults
+            # to True, and leaving it on would let the local (non-distributed)
+            # SSD path allocate a 32 GB store nobody reads.
+            cfg.ssd.enabled = False
         cfg.distributed = dist
         self._client = UMBPClient(cfg)
         self._reader_node_id = reader_node_id
@@ -350,8 +457,9 @@ class UMBPBackend(Backend):
     def flush(self):
         self._client.flush()
 
-    def register_memory(self, ptr: int, size: int):
-        self._client.register_memory(ptr, size)
+    def register_memory(self, ptr: int, size: int, loc: str = "cpu", device: int = -1):
+        mori_loc = MemoryLocationType.GPU if loc == "gpu" else MemoryLocationType.CPU
+        self._client.register_memory(ptr, size, mori_loc, device)
 
     def get_into_ptr(self, key: str, ptr: int, size: int) -> bool:
         return self._client.get_into_ptr(key, ptr, size)
@@ -472,7 +580,11 @@ class MooncakeBackend(Backend):
     def flush(self):
         pass
 
-    def register_memory(self, ptr: int, size: int):
+    def register_memory(self, ptr: int, size: int, loc: str = "cpu", device: int = -1):
+        if loc != "cpu":
+            raise RuntimeError(
+                "MooncakeBackend.register_memory: only cpu buffers are supported"
+            )
         self._store.register_buffer(ptr, size)
 
     def get_into_ptr(self, key: str, ptr: int, size: int) -> bool:
@@ -601,8 +713,10 @@ if backend_name == "umbp":
             node_id, peer_service_port, reader_node_id, reader_peer_port
         )
         print(
-            f"backend=umbp role={role} writer_node_id={node_id} reader_node_id={reader_node_id} "
-            f"node_address={node_address} writer_port={peer_service_port} reader_port={reader_peer_port}",
+            f"backend=umbp tier={tier} dst_loc={dst_loc} role={role} "
+            f"writer_node_id={node_id} reader_node_id={reader_node_id} "
+            f"node_address={node_address} writer_port={peer_service_port} "
+            f"reader_port={reader_peer_port}",
             flush=True,
         )
 elif backend_name == "mooncake":
@@ -662,6 +776,83 @@ class HostBuffer:
             except Exception:
                 pass
             self._handle = None
+
+
+# --- device (GPU) buffer allocation for HBM D2D testing, via raw HIP calls ---
+#
+# ctypes + libamdhip64.so rather than a torch dependency: all that's needed is
+# an allocation + memset/memcpy primitive, and this keeps the bench usable in
+# a container without torch installed.
+
+_HIP_MEMCPY_DEVICE_TO_HOST = 2
+
+
+def _load_hip():
+    for name in ("libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6"):
+        try:
+            return ctypes.CDLL(name)
+        except OSError:
+            continue
+    raise RuntimeError(
+        "libamdhip64.so not found; ROCm/HIP runtime required for --dst-loc gpu"
+    )
+
+
+def _hip_check(rc: int, what: str):
+    if rc != 0:
+        raise RuntimeError(f"{what} failed: hipError_t={rc}")
+
+
+class DeviceBuffer:
+    """GPU-resident buffer allocated via raw HIP (hipMalloc), so a read from an
+    HBM-tier pool exercises HbmCopyEngine's device-to-device hipMemcpy path
+    from Python instead of device-to-host."""
+
+    def __init__(self, size: int, device: int = 0):
+        self._hip = _load_hip()
+        _hip_check(self._hip.hipSetDevice(ctypes.c_int(device)), "hipSetDevice")
+        raw_ptr = ctypes.c_void_p()
+        _hip_check(
+            self._hip.hipMalloc(ctypes.byref(raw_ptr), ctypes.c_size_t(size)),
+            f"hipMalloc({size})",
+        )
+        _hip_check(self._hip.hipMemset(raw_ptr, 0, ctypes.c_size_t(size)), "hipMemset")
+        self.ptr = raw_ptr.value
+        self.size = size
+        self.device = device
+
+    def zero(self):
+        _hip_check(
+            self._hip.hipMemset(
+                ctypes.c_void_p(self.ptr), 0, ctypes.c_size_t(self.size)
+            ),
+            "hipMemset",
+        )
+
+    def read_back(self, offset: int, size: int) -> bytes:
+        """Copy `size` bytes at `offset` back to host (D2H), for correctness
+        verification only -- never on the batch_perf hot path."""
+        host_buf = ctypes.create_string_buffer(size)
+        _hip_check(
+            self._hip.hipMemcpy(
+                host_buf,
+                ctypes.c_void_p(self.ptr + offset),
+                ctypes.c_size_t(size),
+                ctypes.c_int(_HIP_MEMCPY_DEVICE_TO_HOST),
+            ),
+            "hipMemcpy D2H (verify)",
+        )
+        return host_buf.raw
+
+    def __del__(self):
+        ptr = getattr(self, "ptr", None)
+        hip = getattr(self, "_hip", None)
+        if ptr and hip is not None:
+            try:
+                hip.hipFree(ctypes.c_void_p(ptr))
+            except Exception:
+                pass
+            self.ptr = None
 
 
 if role in ("both", "writer"):
@@ -731,18 +922,31 @@ else:  # both
 exit_code = 0
 
 if command == "correctness":
-    read_buf = HostBuffer(value_size)
-    read_ptr = read_buf.ptr
-    reader.register_memory(read_ptr, value_size)
+    if dst_loc == "gpu":
+        read_buf = DeviceBuffer(value_size, device=hbm_device)
+        read_ptr = read_buf.ptr
+        reader.register_memory(read_ptr, value_size, loc="gpu", device=hbm_device)
+    else:
+        read_buf = HostBuffer(value_size)
+        read_ptr = read_buf.ptr
+        reader.register_memory(read_ptr, value_size)
     hits = misses = mismatches = 0
     expected = expected_payload(value_size)
     for i in range(nr_objects):
-        ctypes.memset(read_ptr, 0, value_size)
+        if dst_loc == "gpu":
+            read_buf.zero()
+        else:
+            ctypes.memset(read_ptr, 0, value_size)
         if not reader.get_into_ptr(make_key(i), read_ptr, value_size):
             misses += 1
             continue
         hits += 1
-        if ctypes.string_at(read_ptr, value_size) != expected:
+        actual = (
+            read_buf.read_back(0, value_size)
+            if dst_loc == "gpu"
+            else ctypes.string_at(read_ptr, value_size)
+        )
+        if actual != expected:
             mismatches += 1
     print(
         f"CORRECTNESS hits={hits} misses={misses} mismatches={mismatches} total={nr_objects}",
@@ -760,7 +964,11 @@ elif command == "batch_perf":
 
     keys = [make_key(i) for i in range(nr_objects)]
     buf_total = value_size * nr_objects
-    whole = HostBuffer(buf_total)
+    whole = (
+        DeviceBuffer(buf_total, device=hbm_device)
+        if dst_loc == "gpu"
+        else HostBuffer(buf_total)
+    )
     base = whole.ptr
     # Destination slot for each key. 'contiguous' packs them back-to-back so the
     # IO engine can coalesce adjacent SGEs; 'shuffled' assigns each key a random
@@ -777,7 +985,10 @@ elif command == "batch_perf":
     ptrs = [base + slot * value_size for slot in slots]
     sizes = [value_size] * nr_objects
 
-    reader.register_memory(base, buf_total)
+    if dst_loc == "gpu":
+        reader.register_memory(base, buf_total, loc="gpu", device=hbm_device)
+    else:
+        reader.register_memory(base, buf_total)
 
     for batch_size in batch_sizes:
         batches = [keys[i : i + batch_size] for i in range(0, nr_objects, batch_size)]

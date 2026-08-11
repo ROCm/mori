@@ -223,6 +223,12 @@ void RegisterMoriUmbp(py::module_& m) {
       .value("NEVER", CacheRemoteAdmission::NEVER)
       .value("ALWAYS", CacheRemoteAdmission::ALWAYS);
 
+  py::class_<UMBPHbmConfig>(m, "UMBPHbmConfig")
+      .def(py::init<>())
+      .def_readwrite("enabled", &UMBPHbmConfig::enabled)
+      .def_readwrite("device", &UMBPHbmConfig::device)
+      .def_readwrite("capacity_bytes", &UMBPHbmConfig::capacity_bytes);
+
   py::class_<UMBPDistributedConfig>(m, "UMBPDistributedConfig")
       .def(py::init<>())
       .def_readwrite("master_config", &UMBPDistributedConfig::master_config)
@@ -234,7 +240,9 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("cache_remote_fetches", &UMBPDistributedConfig::cache_remote_fetches)
       .def_readwrite("cache_remote_admission", &UMBPDistributedConfig::cache_remote_admission)
       .def_readwrite("admission_max_block_bytes", &UMBPDistributedConfig::admission_max_block_bytes)
-      .def_readwrite("dram_page_size", &UMBPDistributedConfig::dram_page_size);
+      .def_readwrite("dram_page_size", &UMBPDistributedConfig::dram_page_size)
+      .def_readwrite("hbm", &UMBPDistributedConfig::hbm)
+      .def_readwrite("enable_ssd_tier", &UMBPDistributedConfig::enable_ssd_tier);
 
   py::class_<UMBPStandaloneProcessConfig>(m, "UMBPStandaloneProcessConfig")
       .def(py::init<>())
@@ -284,6 +292,7 @@ void RegisterMoriUmbp(py::module_& m) {
       .def("is_distributed", &IUMBPClient::IsDistributed)           // pure getter, no I/O
       .def("get_deployment_mode", &IUMBPClient::GetDeploymentMode)  // pure getter, no I/O
       .def("register_memory", &IUMBPClient::RegisterMemory, py::arg("ptr"), py::arg("size"),
+           py::arg("loc") = mori::io::MemoryLocationType::CPU, py::arg("device") = -1,
            py::call_guard<py::gil_scoped_release>())
       .def("deregister_memory", &IUMBPClient::DeregisterMemory, py::arg("ptr"),
            py::call_guard<py::gil_scoped_release>())

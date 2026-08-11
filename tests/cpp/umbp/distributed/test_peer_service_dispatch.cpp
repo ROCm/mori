@@ -42,6 +42,7 @@
 #include <grpcpp/grpcpp.h>
 #include <gtest/gtest.h>
 
+#include <map>
 #include <memory>
 #include <random>
 #include <string>
@@ -94,6 +95,10 @@ class PeerServiceDispatchTest : public ::testing::Test {
   }
 
   MediumBackend* Backend(TierType tier) { return registry_.Get(tier); }
+
+  // The registry hands out MediumBackend; PublishBuffers is test scaffolding
+  // that only the mock has.  Safe because SetUp registers nothing else.
+  MockBackend* Mock(TierType tier) { return static_cast<MockBackend*>(registry_.Get(tier)); }
 
   static ::umbp::TierType Proto(TierType t) { return static_cast<::umbp::TierType>(t); }
 
@@ -177,6 +182,93 @@ TEST_F(PeerServiceDispatchTest, ConcurrentSlotsOnTwoBackendsStayDistinct) {
 TEST_F(PeerServiceDispatchTest, CommitOfAnUnknownSlotFails) {
   // Slot 0 decodes to tier UNKNOWN, which has no backend: "slot unknown".
   EXPECT_FALSE(Commit(0, "nope"));
+}
+
+// ---- Two live media share one buffer_index space ----------------------------
+//
+// buffer_index is BACKEND-local: every backend numbers its buffers from 0, and
+// every real backend publishes exactly one buffer, so on a peer with two live
+// media both claim index 0.  These tests pin the two wire surfaces where that
+// used to lose data.  Both fail without BufferMemoryDesc.backend_id.
+
+TEST_F(PeerServiceDispatchTest, GetPeerInfoPublishesEveryBackendsBuffers) {
+  // Distinct first descriptor byte per backend so we can tell whose is whose.
+  constexpr uint8_t kFirstTag = 0xA1;
+  constexpr uint8_t kSecondTag = 0xB2;
+  Mock(kFirstByTier)->PublishBuffers(1, kFirstTag);
+  Mock(kSecondByTier)->PublishBuffers(1, kSecondTag);
+
+  ::umbp::GetPeerInfoRequest req;
+  ::umbp::GetPeerInfoResponse resp;
+  grpc::ClientContext ctx;
+  ASSERT_TRUE(stub_->GetPeerInfo(&ctx, req, &resp).ok());
+
+  // Both media must be advertised.  The bootstrap wire used to carry one, and
+  // dropping the other was not merely incomplete: the reader caches by index
+  // and then asks the peer to omit descriptors it believes it holds, so the
+  // unadvertised medium's pages were read against the advertised medium's
+  // memory — a hit, with the wrong bytes.
+  ASSERT_EQ(resp.buffer_descs_size(), 2);
+
+  std::map<uint8_t, uint32_t> backend_id_by_tag;
+  for (const auto& d : resp.buffer_descs()) {
+    ASSERT_FALSE(d.desc().empty());
+    // Every backend numbers from 0, so the indices collide by design; only the
+    // backend_id separates them.
+    EXPECT_EQ(d.buffer_index(), 0u);
+    backend_id_by_tag[static_cast<uint8_t>(d.desc()[0])] = d.backend_id();
+  }
+  ASSERT_EQ(backend_id_by_tag.count(kFirstTag), 1u) << "first medium was not advertised";
+  ASSERT_EQ(backend_id_by_tag.count(kSecondTag), 1u) << "second medium was not advertised";
+  EXPECT_NE(backend_id_by_tag[kFirstTag], backend_id_by_tag[kSecondTag])
+      << "two media sharing a backend_id collapses back into one address space";
+
+  // Uniform across backends, so one field still describes the whole peer.
+  EXPECT_EQ(resp.page_size(), Backend(kFirstByTier)->PageSize());
+}
+
+TEST_F(PeerServiceDispatchTest, BatchResolveAnswersKeysHeldByDifferentMedia) {
+  Mock(kFirstByTier)->PublishBuffers(1, 0xA1);
+  Mock(kSecondByTier)->PublishBuffers(1, 0xB2);
+  SeedKey(kFirstByTier, "in-first", 8);
+  SeedKey(kSecondByTier, "in-second", 8);
+
+  ::umbp::BatchResolveKeysRequest req;
+  req.add_keys("in-first");
+  req.add_keys("in-second");
+  ::umbp::BatchResolveKeysResponse resp;
+  grpc::ClientContext ctx;
+  ASSERT_TRUE(stub_->BatchResolveKeys(&ctx, req, &resp).ok());
+
+  // One response used to be served entirely by the FIRST medium with any hit,
+  // so "in-second" came back found=false purely because another key in the same
+  // batch hit earlier — a silent hit-rate loss on every mixed-media node.
+  ASSERT_EQ(resp.found_size(), 2);
+  ASSERT_EQ(resp.backend_id_size(), 2);
+  EXPECT_TRUE(resp.found(0)) << "key held by the first medium";
+  EXPECT_TRUE(resp.found(1)) << "key held by the second medium was reported missing";
+
+  // Each key names the medium that served it, so its backend-local pages can be
+  // resolved against the right buffers.
+  EXPECT_NE(resp.backend_id(0), resp.backend_id(1));
+  EXPECT_EQ(resp.tier(0), Proto(kFirstByTier));
+  EXPECT_EQ(resp.tier(1), Proto(kSecondByTier));
+}
+
+TEST_F(PeerServiceDispatchTest, AllocateNamesTheBackendItsPagesBelongTo) {
+  Mock(kFirstByTier)->PublishBuffers(1, 0xA1);
+  Mock(kSecondByTier)->PublishBuffers(1, 0xB2);
+
+  auto first = Allocate("a", 8, kFirstByTier);
+  auto second = Allocate("b", 8, kSecondByTier);
+  ASSERT_EQ(first.outcome(), ::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
+  ASSERT_EQ(second.outcome(), ::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
+
+  // Same reason Commit needs the tier tagged into slot_id: the writer has to
+  // know which buffers its pages index into before it can RDMA into them.
+  EXPECT_NE(first.backend_id(), second.backend_id());
+  for (const auto& d : first.descs()) EXPECT_EQ(d.backend_id(), first.backend_id());
+  for (const auto& d : second.descs()) EXPECT_EQ(d.backend_id(), second.backend_id());
 }
 
 TEST_F(PeerServiceDispatchTest, AbortOfAnUnknownSlotIsIdempotentlyTrue) {
@@ -383,6 +475,43 @@ TEST(PeerServiceNoRegistry, AnswersWithoutCrashing) {
   EXPECT_FALSE(resolve_resp.found());
 
   server.Stop();
+}
+
+// ---- One peer service owns a port -------------------------------------------
+//
+// gRPC enables SO_REUSEPORT by default for TCP servers on Linux, so before
+// PeerServiceServer::Start passed GRPC_ARG_ALLOW_REUSEPORT=0 a SECOND server
+// bound the same port successfully and the kernel split incoming connections
+// between the two.  A client dialing that address was then answered, some
+// fraction of the time, by a peer service with entirely different backends
+// registered — a wrong answer, not a connection error.
+//
+// That is a production hazard (two UMBP processes sharing a peer port silently
+// mis-serve each other's traffic) and it was also the cause of the umbp suite's
+// random cross-test flakiness: PeerServiceDispatchTest::SetUp picks a random
+// port in [20000,60000) and relies on Start() failing to detect a collision, so
+// with reuseport on it never retried and instead talked to the wrong server.
+TEST(PeerServicePortExclusivity, SecondServerCannotBindTheSamePort) {
+  BackendRegistry registry_a;
+  BackendRegistry registry_b;
+  PeerServiceServer first(&registry_a);
+  PeerServiceServer second(&registry_b);
+
+  std::mt19937 rng{std::random_device{}()};
+  std::uniform_int_distribution<int> pick(20000, 60000);
+  uint16_t port = 0;
+  for (int attempt = 0; attempt < 50 && port == 0; ++attempt) {
+    const uint16_t candidate = static_cast<uint16_t>(pick(rng));
+    if (first.Start(candidate)) port = candidate;
+  }
+  ASSERT_NE(port, 0) << "could not bind any port for the first server";
+
+  EXPECT_FALSE(second.Start(port))
+      << "a second peer service bound port " << port
+      << " — SO_REUSEPORT is on, so clients would be split between two servers";
+
+  second.Stop();
+  first.Stop();
 }
 
 }  // namespace
