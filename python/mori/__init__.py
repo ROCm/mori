@@ -36,6 +36,7 @@ _LAZY_SUBMODULES = {
     "ir",
     "kernel_profiler",
     "ccl",
+    "allocator",
 }
 
 

@@ -37,6 +37,7 @@ option(WITH_MPI
        ${_with_mpi_default})
 option(BUILD_APPLICATION "Whether to build application library" ON)
 option(BUILD_SHMEM "Whether to build shmem library" ON)
+option(BUILD_ALLOCATOR "Whether to build the torch pluggable allocator" ON)
 option(BUILD_CCO "Whether to build cco library" ON)
 
 if(BUILD_BENCHMARK)
@@ -265,6 +266,13 @@ endif()
 
 if(BUILD_SHMEM)
   add_subdirectory(src/shmem)
+endif()
+
+if(BUILD_ALLOCATOR)
+  if(NOT BUILD_SHMEM)
+    message(FATAL_ERROR "BUILD_ALLOCATOR=ON requires BUILD_SHMEM=ON")
+  endif()
+  add_subdirectory(src/allocator)
 endif()
 
 if(BUILD_CCO)
