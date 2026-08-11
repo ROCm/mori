@@ -35,6 +35,10 @@ ascending, and ``lookup`` merges the two into the op's
 
 An unswept shape returns schedule=None and the single-shot default below. Add one by
 sweeping with ``bench_ep.py``. fp32 combine is untuned and takes the bf16 buckets.
+
+dtype keys are whatever ``EpDispatchCombineConfig.dtype_str`` produces, hence
+"fp4_disp_bf16_comb": hip rejects an fp4 combine outright, so an fp4 dispatch here is
+always paired with bf16 -- which is the configuration the sweep measured.
 """
 
 from __future__ import annotations
@@ -95,8 +99,8 @@ _DISPATCH_TABLE: dict = {
     # makes topk matter in principle, and it does on gfx1250, so an unmeasured topk
     # should get the default instead of inheriting one that happened to agree.
     "mi355x": {
-        (8, 7168, 8, None): {None: ((None, 64, 8),), "fp4": ((None, 128, 8),)},
-        (8, 7168, 6, None): {None: ((None, 64, 8),), "fp4": ((None, 128, 8),)},
+        (8, 7168, 8, None): {None: ((None, 64, 8),), "fp4_disp_bf16_comb": ((None, 128, 8),)},
+        (8, 7168, 6, None): {None: ((None, 64, 8),), "fp4_disp_bf16_comb": ((None, 128, 8),)},
     },
     "gfx1250": {
         # topk 8 (256 experts at EP4). All three dtypes agree here.
@@ -116,7 +120,7 @@ _DISPATCH_TABLE: dict = {
         #   16384 551.7   518.5  478.5  470.7  | 423.8 303. 264.9 266.| 414.9 233.7 172.6 166.4
         (4, 7168, 6, None): {
             None: ((512, 64, 8), (4096, 64, 16), (None, 128, 16)),
-            "fp4": ((512, 64, 8), (1024, 64, 16), (None, 128, 16)),
+            "fp4_disp_bf16_comb": ((512, 64, 8), (1024, 64, 16), (None, 128, 16)),
         },
     },
 }

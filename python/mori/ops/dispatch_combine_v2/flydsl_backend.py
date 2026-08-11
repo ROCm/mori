@@ -303,21 +303,9 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                 {"gather", "scatter", "quant", "std_moe", "scales", "replay",
                  "local_expert_count", "asymmetric_dtype", "recv_cap"}
             ),
-            unsupported=self._unsupported(cfg),
         )
         self._gate(self._kernels)
         self._closed = False
-
-    def _unsupported(self, cfg) -> tuple[str, ...]:
-        """Reasons this backend cannot serve `cfg`. Empty = it can."""
-        if cfg.is_asymmetric_dtype and torch.float4_e2m1fn_x2 in (
-            cfg.dispatch_dtype,
-            cfg.combine_dtype,
-        ):
-            # Was a config-level error, which read as a property of the op; it is a
-            # gap in THIS backend's asymmetric path (hip moves fp4 as bytes).
-            return ("fp4 with an asymmetric dispatch/combine dtype",)
-        return ()
 
     def recv_tokens(self):
         """Arena disp_out [max_recv, hidden] (dispatch dest / expert-GEMM input).
