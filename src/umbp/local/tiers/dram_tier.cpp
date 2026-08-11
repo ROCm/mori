@@ -313,6 +313,79 @@ void RecordMergeability(const std::vector<CopyJob*>& jobs, hipMemcpyKind kind) {
       stats.gather_batches.load(std::memory_order_relaxed));
 }
 
+// Where a batch's time goes once it is inside the tier. Added because the
+// end-to-end loader was running at a small fraction of the copy path's
+// measured ceiling under 8-rank concurrency, and the copy itself was the only
+// part anyone had timed. Classification is called out separately because it
+// costs one hipPointerGetAttributes per range, which scales with objects times
+// layers rather than with bytes.
+struct PhaseStats {
+  const char* name;
+  std::atomic<uint64_t> batches{0};
+  std::atomic<uint64_t> ranges{0};
+  std::atomic<uint64_t> bytes{0};        // measured, not inferred from a mean range size
+  std::atomic<uint64_t> lookup_us{0};    // resolving keys to slots
+  std::atomic<uint64_t> classify_us{0};  // DetectPointerLocation per range
+  std::atomic<uint64_t> copy_us{0};      // the transfer itself
+};
+
+PhaseStats& ReadPhaseStats() {
+  static PhaseStats stats{"read"};
+  return stats;
+}
+
+PhaseStats& WritePhaseStats() {
+  static PhaseStats stats{"write"};
+  return stats;
+}
+
+void RecordPhases(PhaseStats& stats, size_t ranges, size_t bytes, uint64_t lookup_us,
+                  uint64_t classify_us, uint64_t copy_us) {
+  stats.ranges.fetch_add(ranges, std::memory_order_relaxed);
+  stats.bytes.fetch_add(bytes, std::memory_order_relaxed);
+  stats.lookup_us.fetch_add(lookup_us, std::memory_order_relaxed);
+  stats.classify_us.fetch_add(classify_us, std::memory_order_relaxed);
+  stats.copy_us.fetch_add(copy_us, std::memory_order_relaxed);
+  const uint64_t n = stats.batches.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n % kProfileReportEvery != 0) return;
+
+  const uint64_t lookup = stats.lookup_us.load(std::memory_order_relaxed);
+  const uint64_t classify = stats.classify_us.load(std::memory_order_relaxed);
+  const uint64_t copy = stats.copy_us.load(std::memory_order_relaxed);
+  const uint64_t moved = stats.bytes.load(std::memory_order_relaxed);
+  const uint64_t total = lookup + classify + copy;
+  MORI_UMBP_INFO(
+      "[DRAMTier/profile] phases {} batches={} ranges={} | per batch: KiB={} lookup={}us "
+      "classify={}us copy={}us | share: lookup={}% classify={}% copy={}% | copy_MBps={}",
+      stats.name, n, stats.ranges.load(std::memory_order_relaxed), moved / n / 1024, lookup / n,
+      classify / n, copy / n, total == 0 ? 0 : lookup * 100 / total,
+      total == 0 ? 0 : classify * 100 / total, total == 0 ? 0 : copy * 100 / total,
+      copy == 0 ? 0 : moved / copy);
+}
+
+// Reads the clock only when profiling is on: these sit on the per-batch path,
+// so an unconditional steady_clock::now() in the constructor would be a cost
+// paid by every batch in production to serve a switch that is normally off.
+class PhaseTimer {
+ public:
+  explicit PhaseTimer(bool enabled) : enabled_(enabled) {
+    if (enabled_) started_ = std::chrono::steady_clock::now();
+  }
+
+  uint64_t Lap() {
+    if (!enabled_) return 0;
+    const auto now = std::chrono::steady_clock::now();
+    const uint64_t elapsed =
+        std::chrono::duration_cast<std::chrono::microseconds>(now - started_).count();
+    started_ = now;
+    return elapsed;
+  }
+
+ private:
+  bool enabled_;
+  std::chrono::steady_clock::time_point started_{};
+};
+
 // Times mu_ acquisition and the critical section, then reports periodically.
 template <typename Lock>
 class ProfiledLock {
@@ -386,8 +459,9 @@ void CopyHostJobs(const std::vector<CopyJob*>& jobs, int num_threads) {
 // hipStreamSynchronize. Sharing one stream across threads makes every batch
 // wait for every other batch queued on that device -- loads behind loads, and
 // loads behind the offload path, which writes continuously under
-// write_through_threshold=1. That coupling, not the DMA, held the measured copy
-// phase to 1.7 GB/s against 49 GB/s for the same shape in isolation.
+// write_through_threshold=1. That coupling, not the DMA, was what held the
+// measured copy phase to 1.7 GB/s against 49 GB/s for the same shape in
+// isolation.
 //
 // The streams are intentionally never destroyed: tearing down HIP resources
 // from a thread or static destructor races with runtime teardown. The count is
@@ -572,8 +646,11 @@ void CopyDeviceJobs(const std::vector<CopyJob*>& jobs, int device_id, hipMemcpyK
 }
 
 void CopyJobs(std::vector<CopyJob>* jobs, int host_threads, hipMemcpyKind device_copy_kind,
-              const HostTierRegistration* registration) {
+              const HostTierRegistration* registration, uint64_t* out_classify_us = nullptr,
+              uint64_t* out_copy_us = nullptr) {
   if (jobs->empty()) return;
+  const bool profiling = ProfileEnabled();
+  PhaseTimer timer(profiling);
   std::vector<CopyJob*> host_jobs;
   std::map<int, std::vector<CopyJob*>> device_jobs;
   host_jobs.reserve(jobs->size());
@@ -585,11 +662,23 @@ void CopyJobs(std::vector<CopyJob>* jobs, int host_threads, hipMemcpyKind device
       host_jobs.push_back(&job);
     }
   }
+  if (out_classify_us != nullptr) *out_classify_us = timer.Lap();
+
+  if (profiling) {
+    // Sorting and re-planning every batch is profiling-only work. Do it before
+    // the copy measurement starts rather than inside the loop, where it would
+    // be charged to the copy it is supposed to describe.
+    for (auto& [device_id, grouped_jobs] : device_jobs) {
+      RecordMergeability(grouped_jobs, device_copy_kind);
+    }
+    timer.Lap();
+  }
+
   CopyHostJobs(host_jobs, host_threads);
   for (auto& [device_id, grouped_jobs] : device_jobs) {
-    if (ProfileEnabled()) RecordMergeability(grouped_jobs, device_copy_kind);
     CopyDeviceJobs(grouped_jobs, device_id, device_copy_kind, registration);
   }
+  if (out_copy_us != nullptr) *out_copy_us = timer.Lap();
 }
 
 }  // namespace
@@ -878,6 +967,9 @@ std::vector<bool> DRAMTier::ReadBatchRangesIntoPtr(
   ScopedInFlight in_flight;
   ProfiledSharedLock lock(mu_, ReadLockStats(), n);
 
+  const bool profiling = ProfileEnabled();
+  PhaseTimer phase(profiling);
+  size_t job_bytes = 0;
   std::vector<CopyJob> jobs;
   jobs.reserve(total_ranges);
   std::vector<size_t> expected(n, 0);
@@ -901,10 +993,18 @@ std::vector<bool> DRAMTier::ReadBatchRangesIntoPtr(
       void* dst = reinterpret_cast<void*>(dst_ptrs[i][j]);
       const void* src = static_cast<const char*>(base_ptr_) + it->second.offset + src_offsets[i][j];
       jobs.push_back({dst, src, dst, sizes[i][j], i, false});
+      job_bytes += sizes[i][j];
     }
   }
 
-  CopyJobs(&jobs, read_threads_, hipMemcpyHostToDevice, host_registration_.get());
+  const uint64_t lookup_us = phase.Lap();
+  uint64_t classify_us = 0;
+  uint64_t copy_us = 0;
+  CopyJobs(&jobs, read_threads_, hipMemcpyHostToDevice, host_registration_.get(), &classify_us,
+           &copy_us);
+  if (profiling) {
+    RecordPhases(ReadPhaseStats(), total_ranges, job_bytes, lookup_us, classify_us, copy_us);
+  }
   std::vector<size_t> copied(n, 0);
   for (const auto& job : jobs) {
     if (job.copied) ++copied[job.idx];
@@ -1022,6 +1122,9 @@ std::vector<bool> DRAMTier::BatchWriteRanges(const std::vector<std::string>& key
   ScopedInFlight in_flight;
   ProfiledUniqueLock lock(mu_, WriteLockStats(), n);
 
+  const bool profiling = ProfileEnabled();
+  PhaseTimer phase(profiling);
+  size_t job_bytes = 0;
   struct Reservation {
     size_t index;
     size_t offset;
@@ -1048,11 +1151,19 @@ std::vector<bool> DRAMTier::BatchWriteRanges(const std::vector<std::string>& key
     for (size_t j = 0; j < sizes[i].size(); ++j) {
       void* dst = static_cast<char*>(base_ptr_) + offset + dst_offsets[i][j];
       jobs.push_back({dst, src_ptrs[i][j], src_ptrs[i][j], sizes[i][j], i, false});
+      job_bytes += sizes[i][j];
     }
     reservations.push_back({i, offset, object_sizes[i], job_begin, sizes[i].size()});
   }
 
-  CopyJobs(&jobs, write_threads_, hipMemcpyDeviceToHost, host_registration_.get());
+  const uint64_t lookup_us = phase.Lap();
+  uint64_t classify_us = 0;
+  uint64_t copy_us = 0;
+  CopyJobs(&jobs, write_threads_, hipMemcpyDeviceToHost, host_registration_.get(), &classify_us,
+           &copy_us);
+  if (profiling) {
+    RecordPhases(WritePhaseStats(), total_ranges, job_bytes, lookup_us, classify_us, copy_us);
+  }
 
   std::lock_guard<std::mutex> lru_lock(lru_mu_);
   for (const Reservation& reservation : reservations) {
