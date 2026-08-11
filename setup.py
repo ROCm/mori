@@ -672,12 +672,6 @@ class CMakeBuild(build_ext):
                 (symm_backend_so, root_dir / "python/mori/mori_torch_symm.so")
             )
 
-        allocator_so = build_dir / "src/allocator/libmori_torch_allocator.so"
-        if allocator_so.exists():
-            files_to_copy.append(
-                (allocator_so, root_dir / "python/mori/libmori_torch_allocator.so")
-            )
-
         collective_so = build_dir / "src/collective/libmori_collective.so"
         if collective_so.exists():
             files_to_copy.append(
@@ -884,7 +878,6 @@ mori_package_data = [
     "libmori_application.so",
     "libmori_metrics.so",
     "libmori_collective.so",  # optional: only present when BUILD_COLLECTIVE=ON
-    "libmori_torch_allocator.so",  # optional: only present when BUILD_ALLOCATOR=ON
     "mori_torch_symm.so",  # optional: only present when BUILD_TORCH_SYMM=ON
     "umbp_master",
     "umbp_standalone_server",

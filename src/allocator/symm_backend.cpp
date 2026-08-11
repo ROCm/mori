@@ -20,31 +20,46 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// symm_backend.cpp -- expose the mori symmetric heap as a torch SymmetricMemory backend.
+// symm_backend.cpp -- a torch SymmetricMemory backend on plain HIP VMM.
 //
-// register_availability() makes "MORI" selectable, after which torch drives everything:
-// symm_mem.empty -> alloc, symm_mem.rendezvous -> rendezvous, and torch.ops.symm_mem.*
-// run on mori memory. Registering means supplying rendezvous, not reusing torch's --
-// cheap here, since shmem already bootstrapped the mapping and rendezvous is just
-// ShmemPtrP2p() per PE.
+// register_availability() makes "MORI" selectable; torch then drives everything:
+// symm_mem.empty -> alloc, symm_mem.rendezvous -> rendezvous, torch.ops.symm_mem.* on the
+// result.
 //
-// ShmemPtrP2p returns 0 for a PE reached over RDMA, so buffer_ptrs()[pe] is null exactly
-// for peers that are not load/store accessible -- the same contract NCCL expresses via
-// ncclGetLsaPointer, and what world_within_direct_access() aggregates.
+// Self-contained on purpose: it does not use mori's shmem or cco allocators. Both own a
+// symmetric heap whose peer offsets stay aligned only while every rank allocates AND frees
+// in the same order -- an invariant torch cannot hold, since tensors are freed by Python
+// GC, whose order is not synchronised across ranks. Here each allocation is an independent
+// VMM allocation with its own rendezvous, so divergent free order costs nothing.
+//
+// Peers are mapped into one flat span, so peer(r) == flat_base + r*stride: a kernel needs
+// a base pointer and a stride, not an N-entry pointer array.
+//
+// The handle type is probed per device -- fabric where supported, POSIX fd otherwise
+// (gfx9 has none; hipMemCreate itself returns "operation not supported"). Fabric handles
+// are 64 opaque bytes and ride the torch Store; fds cannot, so they go over a unix socket
+// with SCM_RIGHTS.
 
 #include <hip/hip_runtime.h>
 #include <pybind11/pybind11.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <torch/csrc/utils/pybind.h>  // at::Tensor <-> python caster
+#include <unistd.h>
 
+#include <cstring>
+#include <memory>
 #include <mutex>
+#include <string>
+#include <torch/csrc/distributed/c10d/symm_mem/CUDASymmetricMemoryUtils.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/SymmetricMemory.hpp>
 #include <unordered_map>
 #include <vector>
 
-#include "mori/shmem/shmem.hpp"
+#include "mori/utils/hip_compat.hpp"
 
 namespace mori {
 namespace allocator {
-
 namespace {
 
 using c10d::symmetric_memory::SymmetricMemory;
@@ -59,19 +74,15 @@ using c10d::symmetric_memory::SymmetricMemoryAllocator;
 // Match torch's signal pad size so layouts stay comparable across backends.
 constexpr size_t kSignalPadBytes = 9216;
 
-size_t RoundUp(size_t value, size_t multiple) {
-  return ((value + multiple - 1) / multiple) * multiple;
-}
+size_t RoundUp(size_t v, size_t m) { return ((v + m - 1) / m) * m; }
 
-// Raw HIP: torch ships both c10::cuda and c10::hip, and the wrong one drags
+// Raw HIP: torch ships both c10::cuda and c10::hip, and the wrong one pulls
 // cuda_runtime_api.h into a ROCm build.
 class DeviceGuard {
  public:
-  explicit DeviceGuard(int device_idx) {
+  explicit DeviceGuard(int dev) {
     if (hipGetDevice(&prev_) != hipSuccess) prev_ = -1;
-    if (prev_ >= 0 && prev_ != device_idx) {
-      restore_ = (hipSetDevice(device_idx) == hipSuccess);
-    }
+    if (prev_ >= 0 && prev_ != dev) restore_ = (hipSetDevice(dev) == hipSuccess);
   }
   ~DeviceGuard() {
     if (restore_) (void)hipSetDevice(prev_);
@@ -82,48 +93,200 @@ class DeviceGuard {
   bool restore_ = false;
 };
 
-// One symmetric allocation, before any rendezvous.
+// ROCm 7.1 and older spell this requestedHandleType; newer releases add a union that also
+// has requestedHandleTypes. The singular name exists in both.
+hipMemAllocationProp MakeProp(int dev, hipMemAllocationHandleType handle_type) {
+  hipMemAllocationProp prop = {};
+  prop.type = hipMemAllocationTypePinned;
+  prop.requestedHandleType = handle_type;
+  prop.location.type = hipMemLocationTypeDevice;
+  prop.location.id = dev;
+  return prop;
+}
+
+void SetRwAccess(void* ptr, size_t size, int dev) {
+  hipMemAccessDesc ad = {};
+  ad.location.type = hipMemLocationTypeDevice;
+  ad.location.id = dev;
+  ad.flags = hipMemAccessFlagsProtReadWrite;
+  MORI_HIP_CHECK(hipMemSetAccess(ptr, size, &ad, 1));
+}
+
+// Fabric where the device allows it, POSIX fd otherwise. Probed once per device with a
+// granularity-sized allocation, because the capability attribute enum is not stable
+// across HIP releases.
+hipMemAllocationHandleType ProbeHandleType(int dev) {
+  static std::mutex mu;
+  static std::unordered_map<int, hipMemAllocationHandleType> cache;
+  std::lock_guard<std::mutex> lock(mu);
+  if (auto it = cache.find(dev); it != cache.end()) return it->second;
+
+  hipMemAllocationHandleType chosen = hipMemHandleTypePosixFileDescriptor;
+  auto prop = MakeProp(dev, hipMemHandleTypeFabricCompat);
+  size_t gran = 0;
+  if (hipMemGetAllocationGranularity(&gran, &prop, hipMemAllocationGranularityRecommended) ==
+          hipSuccess &&
+      gran > 0) {
+    hipMemGenericAllocationHandle_t h{};
+    if (hipMemCreate(&h, gran, &prop, 0) == hipSuccess) {
+      hipMemFabricHandle_compat_t blob;
+      if (hipMemExportToShareableHandle(&blob, h, hipMemHandleTypeFabricCompat, 0) == hipSuccess) {
+        chosen = hipMemHandleTypeFabricCompat;
+      }
+      (void)hipMemRelease(h);
+    }
+  }
+  (void)hipGetLastError();  // the probe is expected to fail on gfx9
+  cache[dev] = chosen;
+  return chosen;
+}
+
+// fd passing. A fabric handle is portable bytes and rides the torch Store; an fd is an
+// index into one process's table, so it needs SCM_RIGHTS over a unix socket. torch has an
+// IpcChannel for this but does not export it, hence this small local equivalent.
+class FdChannel {
+ public:
+  explicit FdChannel(int rank) : path_(Path(getpid(), rank)) {
+    sock_ = ::socket(AF_UNIX, SOCK_DGRAM, 0);
+    TORCH_CHECK(sock_ >= 0, "mori symm backend: socket() failed");
+    ::unlink(path_.c_str());
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, path_.c_str(), sizeof(addr.sun_path) - 1);
+    TORCH_CHECK(::bind(sock_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0,
+                "mori symm backend: bind(", path_, ") failed");
+  }
+
+  ~FdChannel() {
+    if (sock_ >= 0) ::close(sock_);
+    ::unlink(path_.c_str());
+  }
+
+  static std::string Path(int pid, int rank) {
+    return "/tmp/mori_symm_" + std::to_string(pid) + "_" + std::to_string(rank);
+  }
+
+  void SendFd(const std::string& dst, int fd) {
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, dst.c_str(), sizeof(addr.sun_path) - 1);
+
+    char iobuf[1] = {0};
+    iovec iov{iobuf, sizeof(iobuf)};
+    char control[CMSG_SPACE(sizeof(int))] = {};
+    msghdr msg{};
+    msg.msg_name = &addr;
+    msg.msg_namelen = sizeof(addr);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
+
+    cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    std::memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
+
+    // The peer may not have bound its socket yet; retry rather than order the ranks.
+    ssize_t n = -1;
+    for (int retry = 0; retry < 400 && n < 0; ++retry) {
+      n = ::sendmsg(sock_, &msg, 0);
+      if (n < 0) ::usleep(5000);
+    }
+    TORCH_CHECK(n >= 0, "mori symm backend: sendmsg to ", dst, " failed");
+  }
+
+  int RecvFd() {
+    char iobuf[1] = {0};
+    iovec iov{iobuf, sizeof(iobuf)};
+    char control[CMSG_SPACE(sizeof(int))] = {};
+    msghdr msg{};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
+
+    TORCH_CHECK(::recvmsg(sock_, &msg, 0) >= 0, "mori symm backend: recvmsg failed");
+    cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+    TORCH_CHECK(cmsg && cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS,
+                "mori symm backend: no SCM_RIGHTS in received message");
+    int fd = -1;
+    std::memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
+    return fd;
+  }
+
+ private:
+  std::string path_;
+  int sock_ = -1;
+};
+
+// What each rank publishes through the torch Store.
+struct RendezvousReq {
+  size_t alloc_size;
+  size_t buffer_size;
+  int device_idx;
+  int pid;
+  hipMemFabricHandle_compat_t fabric;  // meaningful only on the fabric path
+};
+
 struct Block {
   void* ptr = nullptr;
-  size_t buffer_size = 0;  // what the caller asked for
-  size_t total_size = 0;   // buffer + signal pad
+  size_t buffer_size = 0;
+  size_t alloc_size = 0;
   int device_idx = 0;
+  hipMemGenericAllocationHandle_t handle{};
+  hipMemAllocationHandleType handle_type = hipMemHandleTypePosixFileDescriptor;
   std::optional<std::string> default_group_name;
-  c10::intrusive_ptr<SymmetricMemory> symm;  // cached; rendezvous is once per allocation
+  c10::intrusive_ptr<SymmetricMemory> symm;
 };
 
 class MoriSymmetricMemory : public SymmetricMemory {
  public:
-  MoriSymmetricMemory(std::vector<void*> buffers, std::vector<void*> signal_pads,
-                      size_t buffer_size, int rank, int world_size, int device_idx)
-      : buffers_(std::move(buffers)),
-        signal_pads_(std::move(signal_pads)),
+  MoriSymmetricMemory(char* flat_base, size_t span, size_t stride, size_t buffer_size,
+                      std::vector<hipMemGenericAllocationHandle_t> handles, int rank,
+                      int world_size, int device_idx)
+      : flat_base_(flat_base),
+        span_(span),
+        stride_(stride),
         buffer_size_(buffer_size),
+        handles_(std::move(handles)),
         rank_(rank),
         world_size_(world_size),
         device_(c10::DeviceType::CUDA, device_idx) {
     rank_to_global_rank_.resize(world_size_);
+    buffers_.reserve(world_size_);
+    signal_pads_.reserve(world_size_);
     for (int r = 0; r < world_size_; ++r) {
-      // mori PE numbering is the group's rank numbering
       rank_to_global_rank_[r] = r;
+      char* slot = flat_base_ + static_cast<size_t>(r) * stride_;
+      buffers_.push_back(slot);
+      signal_pads_.push_back(slot + buffer_size_);
     }
 
-    const size_t arr_bytes = world_size_ * sizeof(void*);
-    MORI_HIP_CHECK(hipMalloc(&buffers_dev_, arr_bytes));
-    MORI_HIP_CHECK(hipMalloc(&signal_pads_dev_, arr_bytes));
-    MORI_HIP_CHECK(hipMemcpy(buffers_dev_, buffers_.data(), arr_bytes, hipMemcpyHostToDevice));
-    MORI_HIP_CHECK(
-        hipMemcpy(signal_pads_dev_, signal_pads_.data(), arr_bytes, hipMemcpyHostToDevice));
+    const size_t arr = world_size_ * sizeof(void*);
+    MORI_HIP_CHECK(hipMalloc(&buffers_dev_, arr));
+    MORI_HIP_CHECK(hipMalloc(&signal_pads_dev_, arr));
+    MORI_HIP_CHECK(hipMemcpy(buffers_dev_, buffers_.data(), arr, hipMemcpyHostToDevice));
+    MORI_HIP_CHECK(hipMemcpy(signal_pads_dev_, signal_pads_.data(), arr, hipMemcpyHostToDevice));
     MORI_HIP_CHECK(hipMalloc(&rank_to_global_rank_dev_, world_size_ * sizeof(int)));
     MORI_HIP_CHECK(hipMemcpy(rank_to_global_rank_dev_, rank_to_global_rank_.data(),
                              world_size_ * sizeof(int), hipMemcpyHostToDevice));
   }
 
   ~MoriSymmetricMemory() override {
-    // Buffers belong to the shmem heap; only the device-side arrays are ours.
-    if (buffers_dev_ != nullptr) (void)hipFree(buffers_dev_);
-    if (signal_pads_dev_ != nullptr) (void)hipFree(signal_pads_dev_);
-    if (rank_to_global_rank_dev_ != nullptr) (void)hipFree(rank_to_global_rank_dev_);
+    // During interpreter shutdown the HIP runtime may already be gone, so calling into
+    // it segfaults. torch's own backend does the same: leak rather than crash.
+    if (c10d::symmetric_memory::is_finalizing()) return;
+    (void)hipDeviceSynchronize();
+    if (buffers_dev_) (void)hipFree(buffers_dev_);
+    if (signal_pads_dev_) (void)hipFree(signal_pads_dev_);
+    if (rank_to_global_rank_dev_) (void)hipFree(rank_to_global_rank_dev_);
+    for (int r = 0; r < world_size_; ++r) {
+      (void)hipMemUnmap(flat_base_ + static_cast<size_t>(r) * stride_, stride_);
+      (void)hipMemRelease(handles_[r]);
+    }
+    (void)hipMemAddressFree(flat_base_, span_);
   }
 
   std::vector<void*> get_buffer_ptrs() override { return buffers_; }
@@ -133,7 +296,6 @@ class MoriSymmetricMemory : public SymmetricMemory {
   size_t get_buffer_size() override { return buffer_size_; }
   size_t get_offset() override { return 0; }
 
-  // mori has no NVLS-style multicast object.
   bool has_multicast_support() override { return false; }
   void* get_multicast_ptr() override { return nullptr; }
 
@@ -144,41 +306,36 @@ class MoriSymmetricMemory : public SymmetricMemory {
   const std::vector<int>& get_rank_to_global_rank() override { return rank_to_global_rank_; }
   int* get_rank_to_global_rank_dev() override { return rank_to_global_rank_dev_; }
 
-  // False when any peer is RDMA-only. Kernels dereferencing buffer_ptrs must check it.
-  bool world_within_direct_access() override {
-    for (void* p : buffers_) {
-      if (p == nullptr) return false;
-    }
-    return true;
-  }
+  // Every rank is mapped for load/store; there is no RDMA fallback in this backend.
+  bool world_within_direct_access() override { return true; }
 
-  // Coarser than torch's signal-pad spin: drains the device and syncs the whole world
-  // rather than a channel. Correct, but not channel-isolated.
-  void barrier(int /*channel*/, size_t /*timeout_ms*/) override {
-    MORI_HIP_CHECK(hipDeviceSynchronize());
-    shmem::ShmemBarrierAll();
-  }
-
-  void put_signal(int /*dst_rank*/, int /*channel*/, size_t /*timeout_ms*/) override {
+  void barrier(int, size_t) override {
     TORCH_CHECK(false,
-                "mori symm backend: put_signal is not implemented yet; use barrier() for "
-                "synchronisation");
+                "mori symm backend: barrier is not implemented; synchronise on the host "
+                "with dist.barrier() for now");
+  }
+  void put_signal(int, int, size_t) override {
+    TORCH_CHECK(false, "mori symm backend: put_signal is not implemented");
+  }
+  void wait_signal(int, int, size_t) override {
+    TORCH_CHECK(false, "mori symm backend: wait_signal is not implemented");
   }
 
-  void wait_signal(int /*src_rank*/, int /*channel*/, size_t /*timeout_ms*/) override {
-    TORCH_CHECK(false,
-                "mori symm backend: wait_signal is not implemented yet; use barrier() for "
-                "synchronisation");
-  }
+  uintptr_t flat_base() const { return reinterpret_cast<uintptr_t>(flat_base_); }
+  size_t stride() const { return stride_; }
 
  private:
-  std::vector<void*> buffers_;
-  std::vector<void*> signal_pads_;
+  char* flat_base_;
+  size_t span_;
+  size_t stride_;
   size_t buffer_size_;
+  std::vector<hipMemGenericAllocationHandle_t> handles_;
   int rank_;
   int world_size_;
   c10::Device device_;
   std::vector<int> rank_to_global_rank_;
+  std::vector<void*> buffers_;
+  std::vector<void*> signal_pads_;
   void** buffers_dev_ = nullptr;
   void** signal_pads_dev_ = nullptr;
   int* rank_to_global_rank_dev_ = nullptr;
@@ -187,23 +344,31 @@ class MoriSymmetricMemory : public SymmetricMemory {
 class MoriSymmAllocator : public SymmetricMemoryAllocator {
  public:
   void* alloc(size_t size, int device_idx, const std::optional<std::string>& group_name) override {
-    TORCH_CHECK(shmem::ShmemIsInitialized(),
-                "mori symm backend: shmem is not initialised. Call "
-                "mori.shmem.shmem_torch_process_group_init() before allocating.");
-
     DeviceGuard guard(device_idx);
 
-    // Buffer and signal pad share one allocation, as torch's backends do.
-    const size_t total = RoundUp(size + kSignalPadBytes, 256);
-    void* ptr = shmem::ShmemMalloc(total);
-    TORCH_CHECK(ptr != nullptr, "mori symm backend: ShmemMalloc(", total, ") failed");
-    MORI_HIP_CHECK(hipMemset(ptr, 0, total));
+    const auto handle_type = ProbeHandleType(device_idx);
+    auto prop = MakeProp(device_idx, handle_type);
+    size_t gran = 0;
+    MORI_HIP_CHECK(
+        hipMemGetAllocationGranularity(&gran, &prop, hipMemAllocationGranularityRecommended));
+    const size_t alloc_size = RoundUp(size + kSignalPadBytes, gran);
+
+    hipMemGenericAllocationHandle_t handle{};
+    MORI_HIP_CHECK(hipMemCreate(&handle, alloc_size, &prop, 0));
+
+    void* ptr = nullptr;
+    MORI_HIP_CHECK(hipMemAddressReserve(&ptr, alloc_size, gran, nullptr, 0));
+    MORI_HIP_CHECK(hipMemMap(ptr, alloc_size, 0, handle, 0));
+    SetRwAccess(ptr, alloc_size, device_idx);
+    MORI_HIP_CHECK(hipMemset(ptr, 0, alloc_size));
 
     auto block = std::make_shared<Block>();
     block->ptr = ptr;
     block->buffer_size = size;
-    block->total_size = total;
+    block->alloc_size = alloc_size;
     block->device_idx = device_idx;
+    block->handle = handle;
+    block->handle_type = handle_type;
     block->default_group_name = group_name;
 
     std::lock_guard<std::mutex> lock(mutex_);
@@ -220,8 +385,12 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
       block = it->second;
       blocks_.erase(it);
     }
-    // ShmemFree is collective; ranks must release in the same order.
-    shmem::ShmemFree(block->ptr);
+    // Purely local. The flat span belongs to the SymmetricMemory object and holds its own
+    // references, so ranks freeing in different orders is harmless.
+    if (c10d::symmetric_memory::is_finalizing()) return;
+    (void)hipMemUnmap(block->ptr, block->alloc_size);
+    (void)hipMemAddressFree(block->ptr, block->alloc_size);
+    (void)hipMemRelease(block->handle);
   }
 
   size_t get_alloc_size(void* ptr) override {
@@ -234,67 +403,141 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
       void* ptr, const std::optional<std::string>& group_name) override {
     auto block = FindBlock(ptr);
     TORCH_CHECK(block != nullptr, "mori symm backend: pointer is not a mori allocation");
-    if (block->symm != nullptr) {
-      return block->symm;
-    }
+    if (block->symm != nullptr) return block->symm;
 
     auto name = group_name.has_value() ? group_name : block->default_group_name;
     TORCH_CHECK(name.has_value(),
                 "mori symm backend: group_name given neither at allocation nor rendezvous");
-
     auto& info = c10d::symmetric_memory::get_group_info(*name);
     const int rank = info.rank;
     const int world_size = info.world_size;
 
-    // shmem already bootstrapped the mapping, so the group must be the shmem world.
-    TORCH_CHECK(rank == shmem::ShmemMyPe() && world_size == shmem::ShmemNPes(),
-                "mori symm backend: group '", *name, "' is (rank ", rank, "/", world_size,
-                ") but shmem was initialised as (PE ", shmem::ShmemMyPe(), "/", shmem::ShmemNPes(),
-                "). The group must match the shmem world.");
-
     DeviceGuard guard(block->device_idx);
+    const bool use_fabric = (block->handle_type == hipMemHandleTypeFabricCompat);
 
-    // Zero means that PE is RDMA-reached, i.e. not load/store accessible from here.
-    std::vector<void*> buffers(world_size, nullptr);
-    std::vector<void*> signal_pads(world_size, nullptr);
-    for (int pe = 0; pe < world_size; ++pe) {
-      const uint64_t peer = shmem::ShmemPtrP2p(reinterpret_cast<uint64_t>(block->ptr), rank, pe);
-      if (peer == 0) continue;
-      buffers[pe] = reinterpret_cast<void*>(peer);
-      signal_pads[pe] = reinterpret_cast<void*>(peer + block->buffer_size);
+    RendezvousReq local{};
+    local.alloc_size = block->alloc_size;
+    local.buffer_size = block->buffer_size;
+    local.device_idx = block->device_idx;
+    local.pid = getpid();
+    if (use_fabric) {
+      MORI_HIP_CHECK(hipMemExportToShareableHandle(&local.fabric, block->handle,
+                                                   hipMemHandleTypeFabricCompat, 0));
     }
-    TORCH_CHECK(buffers[rank] != nullptr,
-                "mori symm backend: local peer pointer resolution failed");
+    auto reqs = store_exchange_.all_gather(info.store, rank, world_size, local);
+    for (int r = 0; r < world_size; ++r) {
+      TORCH_CHECK(
+          reqs[r].alloc_size == local.alloc_size && reqs[r].buffer_size == local.buffer_size,
+          "mori symm backend: rank ", r, " allocated ", reqs[r].buffer_size,
+          " bytes but this rank "
+          "allocated ",
+          local.buffer_size, "; symm_mem.empty must be symmetric across ranks");
+    }
 
-    auto symm = c10::make_intrusive<MoriSymmetricMemory>(std::move(buffers), std::move(signal_pads),
-                                                         block->buffer_size, rank, world_size,
-                                                         block->device_idx);
+    const size_t stride = block->alloc_size;
+    const size_t span = static_cast<size_t>(world_size) * stride;
+    auto prop = MakeProp(block->device_idx, block->handle_type);
+    size_t gran = 0;
+    MORI_HIP_CHECK(
+        hipMemGetAllocationGranularity(&gran, &prop, hipMemAllocationGranularityRecommended));
+
+    void* flat = nullptr;
+    MORI_HIP_CHECK(hipMemAddressReserve(&flat, span, gran, nullptr, 0));
+    auto map_slot = [&](int r, hipMemGenericAllocationHandle_t h) {
+      char* slot = static_cast<char*>(flat) + static_cast<size_t>(r) * stride;
+      MORI_HIP_CHECK(hipMemMap(slot, stride, 0, h, 0));
+      SetRwAccess(slot, stride, block->device_idx);
+    };
+
+    std::vector<hipMemGenericAllocationHandle_t> handles(world_size);
+
+    // Our own allocation gets a second alias inside the span, so the stride is uniform
+    // across every rank and peer(rank) is an ordinary slot.
+    MORI_HIP_CHECK(hipMemRetainAllocationHandle(&handles[rank], block->ptr));
+    map_slot(rank, handles[rank]);
+
+    if (use_fabric) {
+      for (int r = 0; r < world_size; ++r) {
+        if (r == rank) continue;
+        MORI_HIP_CHECK(hipMemImportFromShareableHandle(&handles[r], &reqs[r].fabric,
+                                                       hipMemHandleTypeFabricCompat));
+        map_slot(r, handles[r]);
+      }
+    } else {
+      // One round per owner: the owner exports its fd and sends it to every other rank.
+      FdChannel chan(rank);
+      for (int owner = 0; owner < world_size; ++owner) {
+        if (owner == rank) {
+          int fd = -1;
+          MORI_HIP_CHECK(hipMemExportToShareableHandle(&fd, block->handle,
+                                                       hipMemHandleTypePosixFileDescriptor, 0));
+          for (int peer = 0; peer < world_size; ++peer) {
+            if (peer != rank) chan.SendFd(FdChannel::Path(reqs[peer].pid, peer), fd);
+          }
+          ::close(fd);
+        } else {
+          int fd = chan.RecvFd();
+          MORI_HIP_CHECK(hipMemImportFromShareableHandle(
+              &handles[owner], reinterpret_cast<void*>(static_cast<intptr_t>(fd)),
+              hipMemHandleTypePosixFileDescriptor));
+          ::close(fd);
+          map_slot(owner, handles[owner]);
+        }
+      }
+    }
+
+    auto symm = c10::make_intrusive<MoriSymmetricMemory>(static_cast<char*>(flat), span, stride,
+                                                         block->buffer_size, std::move(handles),
+                                                         rank, world_size, block->device_idx);
     block->symm = symm;
     return symm;
   }
 
-  bool has_multicast_support(int /*device_idx*/) override { return false; }
+  bool has_multicast_support(int) override { return false; }
   c10::DeviceType supported_device_type() override { return c10::DeviceType::CUDA; }
   std::string name() override { return "MORI"; }
 
- private:
   std::shared_ptr<Block> FindBlock(void* ptr) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = blocks_.find(ptr);
     return it == blocks_.end() ? nullptr : it->second;
   }
 
+ private:
   std::mutex mutex_;
   std::unordered_map<void*, std::shared_ptr<Block>> blocks_;
+  c10d::symmetric_memory::StoreExchange store_exchange_{"mori_symm_backend"};
 };
+
+c10::intrusive_ptr<MoriSymmAllocator>& AllocatorSingleton() {
+  // Intentionally immortal. register_availability() parks a reference in a registry owned
+  // by libtorch, which outlives this extension's statics; letting our copy be destroyed at
+  // exit runs the allocator's destructors after the HIP runtime is gone.
+  static auto* inst =
+      new c10::intrusive_ptr<MoriSymmAllocator>(c10::make_intrusive<MoriSymmAllocator>());
+  return *inst;
+}
+
+// (flat_base, stride) for a rendezvous'd tensor -- the arithmetic peer addressing torch's
+// own interface has no place for.
+std::tuple<uintptr_t, int64_t> FlatLayout(const at::Tensor& t) {
+  auto block = AllocatorSingleton()->FindBlock(t.data_ptr());
+  TORCH_CHECK(block != nullptr, "not a mori symmetric allocation");
+  TORCH_CHECK(block->symm != nullptr, "rendezvous() has not been called on this tensor");
+  auto* symm = static_cast<MoriSymmetricMemory*>(block->symm.get());
+  return {symm->flat_base(), static_cast<int64_t>(symm->stride())};
+}
+
+std::string HandleTypeName(int dev) {
+  return ProbeHandleType(dev) == hipMemHandleTypeFabricCompat ? "fabric" : "posix_fd";
+}
 
 }  // namespace
 
 // Idempotent.
 void RegisterTorchSymmBackend() {
-  static c10::intrusive_ptr<MoriSymmAllocator> allocator = c10::make_intrusive<MoriSymmAllocator>();
   static bool registered = [] {
-    c10d::symmetric_memory::register_availability("MORI", allocator);
+    c10d::symmetric_memory::register_availability("MORI", AllocatorSingleton());
     return true;
   }();
   (void)registered;
@@ -308,5 +551,9 @@ PYBIND11_MODULE(mori_torch_symm, m) {
   mori::allocator::RegisterTorchSymmBackend();
   m.def("register_backend", &mori::allocator::RegisterTorchSymmBackend,
         "Register the MORI symmetric memory backend with torch (idempotent)");
+  m.def("flat_layout", &mori::allocator::FlatLayout,
+        "(flat_base, stride) of a rendezvous'd tensor");
+  m.def("handle_type", &mori::allocator::HandleTypeName,
+        "'fabric' or 'posix_fd' -- what this device can export");
   m.attr("backend_name") = "MORI";
 }

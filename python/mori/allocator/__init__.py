@@ -19,122 +19,43 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""Torch integration for the mori symmetric heap.
+"""Register mori as a torch SymmetricMemory backend.
 
-**SymmetricMemory backend** -- registers mori with torch as ``"MORI"``, so torch's own
-entry points drive it and ``torch.ops.symm_mem.*`` runs on mori memory::
+Self-contained: plain HIP VMM, no shmem or cco allocator involved, so no mori bootstrap
+is needed -- torch's process group is the only rendezvous::
 
-    mori.shmem.shmem_torch_process_group_init(group_name)
+    import torch.distributed._symmetric_memory as symm_mem
+    from mori.allocator import register_symm_backend
+
     register_symm_backend()
     symm_mem.set_backend("MORI")
 
     t   = symm_mem.empty(1024, dtype=torch.bfloat16, device=device)
     hdl = symm_mem.rendezvous(t, group_name)
+    peer = hdl.get_buffer(1, (1024,), torch.bfloat16)
 
-``hdl.get_buffer_ptrs()[pe]`` is null for a PE reached over RDMA rather than P2P, and
-``world_within_direct_access()`` aggregates that -- the scale-up vs scale-out
-distinction, straight from ``ShmemPtrP2p``.
+Every rank is mapped into one flat span, so ``hdl.get_buffer_ptrs()[r]`` is
+``flat_base + r*stride``. ``flat_layout(t)`` returns that pair for kernels that would
+rather do arithmetic than index a pointer array.
 
-**MemPool allocator** -- ``MoriAllocator`` backs a ``torch.cuda.MemPool``, so tensors you
-do not allocate by hand (a KV cache, a GEMM output) also come from the symmetric heap::
-
-    pool = torch.cuda.MemPool(MoriAllocator.get_allocator(device).allocator())
-    with torch.cuda.use_mem_pool(pool):
-        kv_cache = torch.zeros(shape, dtype=torch.bfloat16, device=device)
-
-Both paths allocate through ``ShmemMalloc``, which is collective: every rank must
-allocate the same sizes in the same order, or the heap will hang or corrupt.
+The handle type is probed per device: fabric where supported, POSIX fd otherwise. gfx9
+(MI300/MI355) has no fabric support -- ``hipMemCreate`` itself reports "operation not
+supported" -- so those fall back to fd, which needs no configuration.
 """
 
-import logging
-import os
-import threading
-from typing import ClassVar, Final
-
-from torch import device as torch_device
-from torch.cuda.memory import CUDAPluggableAllocator
-
-logger = logging.getLogger(__name__)
+from typing import Literal
 
 __all__ = [
     "SYMM_BACKEND_NAME",
-    "MoriAllocator",
-    "get_so_path",
-    "is_available",
+    "flat_layout",
+    "handle_type",
     "register_symm_backend",
 ]
 
 SYMM_BACKEND_NAME = "MORI"
 
-_SO_NAME = "libmori_torch_allocator.so"
-_ALLOC_FN = "mori_allocator_malloc"
-_FREE_FN = "mori_allocator_free"
-_PROBE_FN = "mori_allocator_probe"
 
-
-def get_so_path() -> str:
-    """Absolute path to the allocator shared library shipped with the package."""
-    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    so_path = os.path.join(here, _SO_NAME)
-    if not os.path.exists(so_path):
-        raise FileNotFoundError(
-            f"{_SO_NAME} not found at {so_path}. Build mori with BUILD_ALLOCATOR=ON "
-            "(the default when BUILD_SHMEM=ON)."
-        )
-    return so_path
-
-
-def is_available() -> bool:
-    """True if the symmetric heap can serve allocations now.
-
-    Allocation happens inside tensor constructors where raising is awkward; check here
-    and fall back to the default pool instead.
-    """
-    import ctypes
-
-    try:
-        lib = ctypes.CDLL(get_so_path())
-    except (OSError, FileNotFoundError) as exc:
-        logger.debug("mori torch allocator unavailable: %s", exc)
-        return False
-
-    probe = getattr(lib, _PROBE_FN, None)
-    if probe is None:
-        return False
-    probe.restype = ctypes.c_int
-    return probe() == 1
-
-
-class MoriAllocator:
-    """``CUDAPluggableAllocator`` over the mori symmetric heap, one per device.
-
-    Matches the shape inference engines already expect, so it drops in wherever a custom
-    memory pool is selected.
-    """
-
-    _instances: ClassVar[dict[torch_device, CUDAPluggableAllocator]] = {}
-    _lock: Final = threading.Lock()
-
-    @classmethod
-    def get_allocator(
-        cls, device: torch_device | None = None
-    ) -> CUDAPluggableAllocator:
-        """Return (and cache) the allocator for ``device``."""
-        key = torch_device(device) if device is not None else torch_device("cuda")
-        with cls._lock:
-            if key not in cls._instances:
-                cls._instances[key] = CUDAPluggableAllocator(
-                    get_so_path(), _ALLOC_FN, _FREE_FN
-                )
-            return cls._instances[key]
-
-
-def register_symm_backend() -> str:
-    """Register the backend with torch and return its name. Idempotent.
-
-    Requires the extension (``BUILD_TORCH_SYMM=ON``, default when torch is importable at
-    build time) and shmem to be initialised before the first allocation.
-    """
+def _ext():
     try:
         from .. import mori_torch_symm
     except ImportError as exc:  # pragma: no cover - depends on build flags
@@ -142,6 +63,25 @@ def register_symm_backend() -> str:
             "mori_torch_symm extension not found. Rebuild mori with BUILD_TORCH_SYMM=ON "
             "(requires torch at build time)."
         ) from exc
+    return mori_torch_symm
 
-    mori_torch_symm.register_backend()
+
+def register_symm_backend() -> str:
+    """Register the backend with torch and return its name. Idempotent.
+
+    After this, ``symm_mem.set_backend("MORI")`` routes ``symm_mem.empty`` and
+    ``symm_mem.rendezvous`` into mori.
+    """
+    _ext().register_backend()
     return SYMM_BACKEND_NAME
+
+
+def flat_layout(tensor) -> tuple[int, int]:
+    """``(flat_base, stride)`` of a rendezvous'd tensor: peer r lives at
+    ``flat_base + r*stride``."""
+    return _ext().flat_layout(tensor)
+
+
+def handle_type(device_index: int = 0) -> Literal["fabric", "posix_fd"]:
+    """Which shareable handle type this device can export."""
+    return _ext().handle_type(device_index)
