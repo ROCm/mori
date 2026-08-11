@@ -43,6 +43,7 @@
 #endif
 
 #include "device_copy_run.h"
+#include "host_registration.h"
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/device_copy.h"
 #include "umbp/common/range_utils.h"
@@ -530,6 +531,10 @@ DRAMTier::DRAMTier(size_t capacity, bool use_shm, const std::string& shm_name, b
   // Initialize free list with entire capacity
   free_list_.push_back({0, capacity_});
 
+  // Must come after base_ptr_ is final. Registering the region takes every
+  // hipMemcpy on this tier off the pageable staging path.
+  host_registration_ = std::make_unique<HostTierRegistration>(base_ptr_, mapped_size_);
+
   // Threads for parallel batch-read CopyBlock. Default 8, override via env,
   // capped to hardware concurrency. >1 breaks the single-core memcpy ceiling.
   if (const char* e = std::getenv("UMBP_DRAM_READ_THREADS")) {
@@ -548,6 +553,9 @@ DRAMTier::DRAMTier(size_t capacity, bool use_shm, const std::string& shm_name, b
 }
 
 DRAMTier::~DRAMTier() {
+  // Unregister before the mapping goes away, and before any in-flight
+  // background registration can touch an unmapped address.
+  host_registration_.reset();
   if (use_shm_) {
     if (base_ptr_ && base_ptr_ != MAP_FAILED) {
       munmap(base_ptr_, mapped_size_);

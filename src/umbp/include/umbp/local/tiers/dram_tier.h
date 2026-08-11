@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -36,6 +37,11 @@
 #include "umbp/local/tiers/tier_backend.h"
 
 namespace mori::umbp {
+
+// Implementation detail of this tier, declared in a source-private header so it
+// stays out of the installed API. `~DRAMTier` is defined out of line, which is
+// what lets the unique_ptr below hold an incomplete type.
+class HostTierRegistration;
 
 // DRAM Tier: mmap pre-allocated large memory block with offset allocator
 class DRAMTier : public TierBackend {
@@ -117,6 +123,10 @@ class DRAMTier : public TierBackend {
   bool use_shm_;
   std::string shm_name_;
   HostBufferHandle host_buf_handle_;  // owned handle for non-shm path
+
+  // Makes the region above addressable from GPU kernels. Destroyed first so it
+  // unregisters while the mapping is still alive.
+  std::unique_ptr<HostTierRegistration> host_registration_;
 
   // Simple offset allocator: key -> (offset, size)
   struct SlotInfo {
