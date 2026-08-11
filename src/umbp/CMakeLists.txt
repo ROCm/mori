@@ -104,6 +104,7 @@ set(UMBP_CORE_SRCS
     local/tiers/tier_backend.cpp
     local/tiers/dram_tier.cpp
     local/tiers/host_registration.cpp
+    local/tiers/device_gather.hip
     local/host_mem_allocator.cpp
     local/tiers/ssd_tier.cpp
     local/tiers/dummy_ssd_tier.cpp

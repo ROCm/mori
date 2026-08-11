@@ -43,6 +43,7 @@
 #endif
 
 #include "device_copy_run.h"
+#include "device_gather.h"
 #include "host_registration.h"
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/device_copy.h"
@@ -123,6 +124,7 @@ struct CopyJob {
 using detail::DeviceCopyRun;
 using detail::DeviceCopyRunKind;
 using detail::FindDeviceCopyRun;
+using detail::PitchedCopyEnabled;
 using detail::PointerAddress;
 
 // ---------------------------------------------------------------------------
@@ -232,6 +234,7 @@ struct MergeStats {
   std::atomic<uint64_t> runs_both{0};  // runs if both sides had to be adjacent
   std::atomic<uint64_t> actual_submissions{0};
   std::atomic<uint64_t> pitched_submissions{0};
+  std::atomic<uint64_t> gather_batches{0};  // batches carried by one kernel launch instead
 };
 
 MergeStats& OffloadMergeStats() {
@@ -287,7 +290,7 @@ void RecordMergeability(const std::vector<CopyJob*>& jobs, hipMemcpyKind kind) {
   uint64_t actual_submissions = 0;
   uint64_t pitched_submissions = 0;
   for (size_t begin = 0; begin < ordered.size();) {
-    const DeviceCopyRun run = FindDeviceCopyRun(ordered, begin);
+    const DeviceCopyRun run = FindDeviceCopyRun(ordered, begin, PitchedCopyEnabled());
     ++actual_submissions;
     if (run.kind == DeviceCopyRunKind::kPitched) ++pitched_submissions;
     begin = run.end;
@@ -303,9 +306,11 @@ void RecordMergeability(const std::vector<CopyJob*>& jobs, hipMemcpyKind kind) {
   };
   MORI_UMBP_INFO(
       "[DRAMTier/profile] mergeability {} batches={} objects={} | submissions kept: "
-      "gpu-side-only={}% dram-side-only={}% adjacent-both={}% actual={}% 2d_runs={}",
+      "gpu-side-only={}% dram-side-only={}% adjacent-both={}% actual={}% 2d_runs={} "
+      "gather_batches={}",
       stats.name, n, objs, pct(stats.runs_gpu), pct(stats.runs_dram), pct(stats.runs_both),
-      pct(stats.actual_submissions), stats.pitched_submissions.load(std::memory_order_relaxed));
+      pct(stats.actual_submissions), stats.pitched_submissions.load(std::memory_order_relaxed),
+      stats.gather_batches.load(std::memory_order_relaxed));
 }
 
 // Times mu_ acquisition and the critical section, then reports periodically.
@@ -376,12 +381,10 @@ void CopyHostJobs(const std::vector<CopyJob*>& jobs, int num_threads) {
 // Creating and destroying a stream around every batch costs ~6.5 ms per pair on
 // MI355X/ROCm 7.2 (measured), which dwarfs the copies themselves: a layer-wise
 // KV load issues 2 * num_layers batches per request, so the churn alone added
-// ~1 s per rank and, because ReadBatchIntoPtr holds mu_ for the whole batch,
-// ~8 s once 8 ranks serialize behind it. Reusing the stream removes that.
+// ~1 s per rank.
 //
 // The streams are intentionally never destroyed: tearing down HIP resources
-// from a static destructor races with runtime teardown. They are a fixed,
-// per-device cost that ends with the process.
+// from a static destructor races with runtime teardown.
 hipStream_t DeviceStream(int device_id) {
   static std::mutex stream_mu;
   static std::map<int, hipStream_t> streams;
@@ -401,7 +404,94 @@ hipStream_t DeviceStream(int device_id) {
   return stream;
 }
 
-void CopyDeviceJobs(const std::vector<CopyJob*>& jobs, int device_id, hipMemcpyKind kind) {
+// Circuit breaker for the gather kernel.
+//
+// Not a general retry policy -- it exists because the caller upstream cannot
+// distinguish a failed copy from a full tier (LocalStorageManager answers both
+// by evicting a victim and retrying), so any systematic data-path failure turns
+// into a tier-wide eviction storm. One latch, never reset: a kernel that has
+// failed once on this host is not something to keep probing on the request
+// path.
+std::atomic<bool>& GatherDisabled() {
+  static std::atomic<bool> disabled{false};
+  return disabled;
+}
+
+bool GatherPathHealthy() { return !GatherDisabled().load(std::memory_order_relaxed); }
+
+void DisableGatherPath() {
+  if (GatherDisabled().exchange(true, std::memory_order_relaxed)) return;
+  MORI_UMBP_ERROR(
+      "[DRAMTier] disabling the GPU gather path after a failed copy; "
+      "falling back to the copy engine for the rest of this process");
+}
+
+// The side of the copy that lives in the tier, and so the only side that
+// HostTierRegistration can vouch for.
+const void* TierSide(const CopyJob* job, hipMemcpyKind kind) {
+  return kind == hipMemcpyDeviceToHost ? job->dst : job->src;
+}
+
+// The copy engine still wins on a handful of large runs: measured break-even
+// with 8 ranks active is around 128 KiB per run, below which per-submission
+// cost dominates and above which one hipMemcpyAsync already amortizes it.
+constexpr size_t kGatherRunBytesThreshold = 128ull << 10;
+
+// Flattens the batch into one fragment per merged run and decides whether a
+// single kernel launch should carry them. Returns false to leave the batch on
+// the copy-engine path -- which is also what happens for any run whose tier
+// side is not registered, since a kernel would fault on it.
+bool PlanGatherFragments(const std::vector<CopyJob*>& ordered, hipMemcpyKind kind,
+                         const HostTierRegistration* registration,
+                         std::vector<DeviceGatherFragment>* fragments) {
+  if (registration == nullptr || !DeviceGatherEnabled()) return false;
+
+  fragments->clear();
+  fragments->reserve(ordered.size());
+  size_t total_bytes = 0;
+  for (size_t begin = 0; begin < ordered.size();) {
+    const DeviceCopyRun run = FindDeviceCopyRun(ordered, begin, /*allow_pitched=*/false);
+    const CopyJob* first = ordered[begin];
+    if (!registration->Covers(TierSide(first, kind), run.bytes)) return false;
+    fragments->push_back({first->src, first->dst, run.bytes});
+    total_bytes += run.bytes;
+    begin = run.end;
+  }
+  return fragments->size() > 1 && total_bytes / fragments->size() < kGatherRunBytesThreshold;
+}
+
+bool SubmitCopyRuns(const std::vector<CopyJob*>& ordered, int device_id, hipMemcpyKind kind,
+                    hipStream_t stream) {
+  for (size_t begin = 0; begin < ordered.size();) {
+    const DeviceCopyRun run = FindDeviceCopyRun(ordered, begin, PitchedCopyEnabled());
+    hipError_t status = hipSuccess;
+    if (run.kind == DeviceCopyRunKind::kPitched) {
+      status = hipMemcpy2DAsync(ordered[begin]->dst, run.dpitch, ordered[begin]->src, run.spitch,
+                                run.width, run.end - begin, kind, stream);
+    } else {
+      status = hipMemcpyAsync(ordered[begin]->dst, ordered[begin]->src, run.bytes, kind, stream);
+    }
+    if (status != hipSuccess) {
+      // Worth logging the tier side explicitly: the caller cannot tell a copy
+      // failure from a full tier, so it responds by evicting and retrying, and
+      // a systematic failure here turns into a tier-wide eviction storm.
+      MORI_UMBP_ERROR(
+          "[DRAMTier] device copy failed on device {} "
+          "(dir={} shape={} width={} rows={} spitch={} dpitch={} bytes={} tier_side={}): {}",
+          device_id, kind == hipMemcpyDeviceToHost ? "d2h" : "h2d",
+          run.kind == DeviceCopyRunKind::kPitched ? "2d" : "1d", run.width, run.end - begin,
+          run.spitch, run.dpitch, run.bytes, TierSide(ordered[begin], kind),
+          hipGetErrorString(status));
+      (void)hipGetLastError();
+      return false;
+    }
+    begin = run.end;
+  }
+  return true;
+}
+
+void CopyDeviceJobs(const std::vector<CopyJob*>& jobs, int device_id, hipMemcpyKind kind,
+                    const HostTierRegistration* registration) {
   if (jobs.empty()) return;
   ScopedHipDevice device_guard(device_id);
   if (!device_guard.IsValid()) {
@@ -414,37 +504,33 @@ void CopyDeviceJobs(const std::vector<CopyJob*>& jobs, int device_id, hipMemcpyK
   if (stream == nullptr) return;
 
   // Coalesce runs whose source AND destination are both adjacent into one
-  // submission. Submission cost (~10us) dominates the DMA itself (~1.5us for a
-  // 72 KiB KV object), so collapsing a run of k objects is close to a k-fold
-  // win on the layer-wise load path. This pays off only because the connector
-  // sends offloads in GPU-address order, which makes the tier's slot layout
-  // mirror the GPU layout -- see UMBP_STANDALONE_PROCESS_DESIGN.md 11.2.
+  // submission, which is worth doing on either path: it is what the copy engine
+  // needs to avoid paying submission cost per object, and it shortens the
+  // descriptor list the kernel walks. How much it finds depends on the object
+  // model -- with page-granular objects the tier side strides by the object
+  // size while reading one layer, so runs stay short and the kernel carries
+  // most batches.
   std::vector<CopyJob*> ordered(jobs.begin(), jobs.end());
   std::sort(ordered.begin(), ordered.end(), [](const CopyJob* a, const CopyJob* b) {
     return PointerAddress(a->src) < PointerAddress(b->src);
   });
 
-  hipError_t status = hipSuccess;
+  // Page-granular objects leave runs that no memcpy shape can merge: one layer
+  // per object means the tier side strides by the object size. One kernel
+  // launch is ~10x the per-fragment submissions and, unlike hipMemcpy2DAsync,
+  // does not collapse when the source pages are cold.
   bool enqueued_all = true;
-  for (size_t begin = 0; begin < ordered.size();) {
-    const DeviceCopyRun run = FindDeviceCopyRun(ordered, begin);
-    if (run.kind == DeviceCopyRunKind::kPitched) {
-      status = hipMemcpy2DAsync(ordered[begin]->dst, run.dpitch, ordered[begin]->src, run.spitch,
-                                run.width, run.end - begin, kind, stream);
-    } else {
-      status = hipMemcpyAsync(ordered[begin]->dst, ordered[begin]->src, run.bytes, kind, stream);
+  std::vector<DeviceGatherFragment> fragments;
+  const bool gathered = GatherPathHealthy() &&
+                        PlanGatherFragments(ordered, kind, registration, &fragments) &&
+                        LaunchDeviceGather(fragments.data(), fragments.size(), device_id, stream);
+  if (gathered) {
+    if (ProfileEnabled()) {
+      MergeStats& stats = kind == hipMemcpyDeviceToHost ? OffloadMergeStats() : LoadMergeStats();
+      stats.gather_batches.fetch_add(1, std::memory_order_relaxed);
     }
-    if (status != hipSuccess) {
-      MORI_UMBP_ERROR(
-          "[DRAMTier] device copy failed on device {} "
-          "(kind={} width={} rows={} spitch={} dpitch={} bytes={}): {}",
-          device_id, run.kind == DeviceCopyRunKind::kPitched ? "2d" : "1d", run.width,
-          run.end - begin, run.spitch, run.dpitch, run.bytes, hipGetErrorString(status));
-      (void)hipGetLastError();
-      enqueued_all = false;
-      break;
-    }
-    begin = run.end;
+  } else {
+    enqueued_all = SubmitCopyRuns(ordered, device_id, kind, stream);
   }
 
   const hipError_t sync_status = hipStreamSynchronize(stream);
@@ -453,6 +539,14 @@ void CopyDeviceJobs(const std::vector<CopyJob*>& jobs, int device_id, hipMemcpyK
                     hipGetErrorString(sync_status));
     (void)hipGetLastError();
     enqueued_all = false;
+    // The caller cannot tell a failed copy from a full tier: it answers both by
+    // evicting a victim and retrying, so a systematic data-path failure drains
+    // the tier one entry at a time. Taking the kernel out of service means the
+    // retry runs on the copy engine, which usually recovers before any eviction
+    // -- but it is a mitigation, not a guarantee: if the fault also left the
+    // context unusable the retry fails too. The complete fix is to distinguish
+    // the failure reasons at the tier/manager boundary.
+    if (gathered) DisableGatherPath();
   }
 
   if (enqueued_all) {
@@ -460,7 +554,8 @@ void CopyDeviceJobs(const std::vector<CopyJob*>& jobs, int device_id, hipMemcpyK
   }
 }
 
-void CopyJobs(std::vector<CopyJob>* jobs, int host_threads, hipMemcpyKind device_copy_kind) {
+void CopyJobs(std::vector<CopyJob>* jobs, int host_threads, hipMemcpyKind device_copy_kind,
+              const HostTierRegistration* registration) {
   if (jobs->empty()) return;
   std::vector<CopyJob*> host_jobs;
   std::map<int, std::vector<CopyJob*>> device_jobs;
@@ -473,11 +568,10 @@ void CopyJobs(std::vector<CopyJob>* jobs, int host_threads, hipMemcpyKind device
       host_jobs.push_back(&job);
     }
   }
-
   CopyHostJobs(host_jobs, host_threads);
   for (auto& [device_id, grouped_jobs] : device_jobs) {
     if (ProfileEnabled()) RecordMergeability(grouped_jobs, device_copy_kind);
-    CopyDeviceJobs(grouped_jobs, device_id, device_copy_kind);
+    CopyDeviceJobs(grouped_jobs, device_id, device_copy_kind, registration);
   }
 }
 
@@ -531,8 +625,9 @@ DRAMTier::DRAMTier(size_t capacity, bool use_shm, const std::string& shm_name, b
   // Initialize free list with entire capacity
   free_list_.push_back({0, capacity_});
 
-  // Must come after base_ptr_ is final. Registering the region takes every
-  // hipMemcpy on this tier off the pageable staging path.
+  // Must come after base_ptr_ is final. Registering the region is what lets the
+  // gather kernel dereference it, and it also moves every hipMemcpy on this
+  // tier off the pageable staging path.
   host_registration_ = std::make_unique<HostTierRegistration>(base_ptr_, mapped_size_);
 
   // Threads for parallel batch-read CopyBlock. Default 8, override via env,
@@ -735,7 +830,7 @@ std::vector<bool> DRAMTier::ReadBatchIntoPtr(const std::vector<std::string>& key
         {dst, static_cast<char*>(base_ptr_) + it->second.offset, dst, sizes[i], i, false});
   }
 
-  CopyJobs(&jobs, read_threads_, hipMemcpyHostToDevice);
+  CopyJobs(&jobs, read_threads_, hipMemcpyHostToDevice, host_registration_.get());
   if (!jobs.empty()) {
     // One acquisition per batch avoids recreating the per-object lock convoy
     // that the server-side range-resolution change removes.
@@ -792,7 +887,7 @@ std::vector<bool> DRAMTier::ReadBatchRangesIntoPtr(
     }
   }
 
-  CopyJobs(&jobs, read_threads_, hipMemcpyHostToDevice);
+  CopyJobs(&jobs, read_threads_, hipMemcpyHostToDevice, host_registration_.get());
   std::vector<size_t> copied(n, 0);
   for (const auto& job : jobs) {
     if (job.copied) ++copied[job.idx];
@@ -862,7 +957,7 @@ std::vector<bool> DRAMTier::BatchWrite(const std::vector<std::string>& keys,
   // device and submitted to one stream with one synchronization per device.
   copy_jobs.reserve(write_jobs.size());
   for (const auto& job : write_jobs) copy_jobs.push_back(job.copy);
-  CopyJobs(&copy_jobs, write_threads_, hipMemcpyDeviceToHost);
+  CopyJobs(&copy_jobs, write_threads_, hipMemcpyDeviceToHost, host_registration_.get());
 
   // Phase 3 (serial): register slots + LRU, mark successes.
   {
@@ -940,7 +1035,7 @@ std::vector<bool> DRAMTier::BatchWriteRanges(const std::vector<std::string>& key
     reservations.push_back({i, offset, object_sizes[i], job_begin, sizes[i].size()});
   }
 
-  CopyJobs(&jobs, write_threads_, hipMemcpyDeviceToHost);
+  CopyJobs(&jobs, write_threads_, hipMemcpyDeviceToHost, host_registration_.get());
 
   std::lock_guard<std::mutex> lru_lock(lru_mu_);
   for (const Reservation& reservation : reservations) {

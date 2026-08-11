@@ -25,7 +25,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
+#include <string>
 #include <vector>
 
 namespace mori::umbp::detail {
@@ -41,6 +43,23 @@ struct DeviceCopyRun {
   size_t dpitch{0};
 };
 
+// Off by default, and it should stay that way. Reading one layer out of
+// page-sized objects gives hipMemcpy2DAsync a pitch/width ratio in the tens,
+// and at that ratio it is bimodal: ~0.35 us per fragment once the source pages
+// have been through it, ~194 us the first time. A live tier recycles slots
+// constantly, so it only ever pays the cold price -- measured 133x slower than
+// per-fragment 1D copies end to end. The gather kernel covers this shape
+// instead. Set UMBP_DRAM_PITCHED_COPY=1 to measure the pitched path again.
+inline bool PitchedCopyEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("UMBP_DRAM_PITCHED_COPY");
+    if (value == nullptr) return false;
+    const std::string text(value);
+    return text == "1" || text == "on" || text == "true";
+  }();
+  return enabled;
+}
+
 inline uintptr_t PointerAddress(const void* ptr) { return reinterpret_cast<uintptr_t>(ptr); }
 
 inline bool Adjacent(uintptr_t base, size_t size, uintptr_t next) {
@@ -50,8 +69,15 @@ inline bool Adjacent(uintptr_t base, size_t size, uintptr_t next) {
 // Job must expose `src`, `dst`, and `size`. `ordered` must be sorted by source
 // address. Kept as a small pure planner so path selection can be regression-
 // tested without issuing HIP work.
+//
+// `allow_pitched` is false for the gather-kernel path, which wants only the
+// flat merges: a pitched run describes several fragments in one submission,
+// which is the copy engine's vocabulary, not the kernel's. Callers pass
+// PitchedCopyEnabled() rather than having it read here, so the planner stays a
+// pure function of its arguments and can be tested without the environment.
 template <typename Job>
-DeviceCopyRun FindDeviceCopyRun(const std::vector<Job*>& ordered, size_t begin) {
+DeviceCopyRun FindDeviceCopyRun(const std::vector<Job*>& ordered, size_t begin,
+                                bool allow_pitched = true) {
   const Job* first = ordered[begin];
   DeviceCopyRun run{DeviceCopyRunKind::kSingle, begin + 1, first->size, first->size, 0, 0};
 
@@ -77,7 +103,8 @@ DeviceCopyRun FindDeviceCopyRun(const std::vector<Job*>& ordered, size_t begin) 
     return run;
   }
 
-  if (begin + 1 >= ordered.size() || first->size == 0 || ordered[begin + 1]->size != first->size) {
+  if (!allow_pitched || begin + 1 >= ordered.size() || first->size == 0 ||
+      ordered[begin + 1]->size != first->size) {
     return run;
   }
   const uintptr_t src0 = PointerAddress(first->src);
