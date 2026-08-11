@@ -168,15 +168,12 @@ def _build_parser() -> argparse.ArgumentParser:
                     "--tier",
                     choices=["dram", "hbm", "ssd"],
                     default="dram",
-                    help="Storage tier to benchmark (default: dram). All three are wired "
-                    "end-to-end through DistributedClient (distributed_client.cpp), which "
-                    "lowers UMBPDistributedConfig.hbm and (when enable_ssd_tier is set) "
-                    "UMBPConfig.ssd into PoolClientConfig, so PoolClient::Init registers "
-                    "the matching MediumBackend. Note DRAM is ALWAYS registered, so "
-                    "--tier hbm/ssd yields a two-backend node and the routing plane "
-                    "treats media as equivalent (medium_backend.h) -- it mirrors rather "
-                    "than tiers. Configure SSD via UMBP_SSD_STORAGE_DIR / "
-                    "UMBP_SSD_CAPACITY_BYTES / UMBP_SSD_BACKEND.",
+                    help="Storage medium to benchmark (default: dram). Sets "
+                    "UMBPDistributedConfig.medium, which is the single selector for "
+                    "the ONE backend PoolClient::Init registers -- picking hbm or ssd "
+                    "means the node has no DRAM pool at all, so the numbers are the "
+                    "medium's own and not a mirror across two pools. Configure SSD via "
+                    "UMBP_SSD_STORAGE_DIR / UMBP_SSD_CAPACITY_BYTES / UMBP_SSD_BACKEND.",
                 )
                 be_p.add_argument(
                     "--dst-loc",
@@ -251,7 +248,12 @@ if dst_loc == "gpu" and backend_name != "umbp":
 
 if backend_name == "umbp":
     from mori.io import MemoryLocationType
-    from mori.umbp import UMBPClient, UMBPConfig, UMBPDistributedConfig
+    from mori.umbp import (
+        UMBPClient,
+        UMBPConfig,
+        UMBPDistributedConfig,
+        UMBPMedium,
+    )
 
     master_address = args.master_address
     _resolve_host = master_address.split(":")[0]
@@ -406,16 +408,16 @@ class UMBPBackend(Backend):
         ) not in ("0", "false", "False", "")
         dist.io_engine.host = node_address
         if tier == "hbm":
-            dist.hbm.enabled = True
+            dist.medium = UMBPMedium.HBM
             dist.hbm.device = int(os.environ.get("UMBP_HBM_DEVICE", hbm_device))
             dist.hbm.capacity_bytes = int(
                 os.environ.get("UMBP_HBM_CAPACITY_BYTES", 4 * 1024 * 1024 * 1024)
             )
         if tier == "ssd":
-            # enable_ssd_tier is the distributed-side opt-in; cfg.ssd carries the
-            # actual knobs (it already defaults enabled=True, which is why the
-            # opt-in is a separate flag -- see UMBPDistributedConfig).
-            dist.enable_ssd_tier = True
+            # medium is the distributed-side selector; cfg.ssd carries the actual
+            # knobs (its own `enabled` describes the LOCAL-mode tier and is not
+            # what turns the distributed medium on -- see UMBPDistributedConfig).
+            dist.medium = UMBPMedium.SSD
             # SSD is not directly addressable: a remote read stages the value
             # into a registered host arena of ssd_staging_buffer_slots pages.
             # The default 16 slots caps read concurrency at 16 keys, and a

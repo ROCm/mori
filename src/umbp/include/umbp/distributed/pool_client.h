@@ -128,10 +128,13 @@ class PoolClient {
 
   MasterClient& Master();
 
-  // Every storage medium live on this node.  Callers reach a medium by tier
-  // (Backends().Get(TierType::DRAM)) and use it through MediumBackend — no
-  // concrete backend type is named outside PoolClient::Init.
+  // The storage medium live on this node (exactly one — see PoolClient::Init).
+  // Callers reach it by tier (Backends().Get(Medium())) and use it through
+  // MediumBackend — no concrete backend type is named outside PoolClient::Init.
   BackendRegistry& Backends();
+
+  // Which medium this node serves.  Valid after Init.
+  TierType Medium() const { return medium_; }
 
   bool IsInitialized() const;
 
@@ -177,6 +180,14 @@ class PoolClient {
   // PeerServiceServer and MasterClient both borrow the registry and dispatch
   // through it (backend-agnostic refactor Phase 3).
   BackendRegistry registry_;
+
+  // The one tier registry_ holds, cached from the backend at Init.  Read by the
+  // few paths that must name a LOCAL destination with no route to dispatch on
+  // (the re-cache installer); everything with a route uses route.tier.  Kept in
+  // sync with config_.medium by construction — Init sets it from the backend it
+  // actually built, not from config.
+  TierType medium_ = TierType::DRAM;
+
   std::unique_ptr<PeerServiceServer> peer_service_;
 
   // The one byte-moving path (design doc §4).  PoolClient owns the engine;

@@ -769,10 +769,25 @@ file, and `CompositeTransferEngine::SelectEngine` routes to it with no edit.
 
 **One place still names a concrete type, deliberately: `PoolClient::Init`.**
 It constructs `LocalCopyEngine`, `MoriIoEngine`, `CompositeTransferEngine` and
-(via `MakePageBackend`) the DRAM backend. That is a composition root, not a
-leak — the test the acceptance criterion actually states is that *no other* file
-names one, and none does. Everything downstream holds `MediumBackend`,
-`TransferEngine`, `MemoryRegistrar`, or `PeerDirectory`.
+(via the `Make*Backend` factories) the node's one medium backend. That is a
+composition root, not a leak — the test the acceptance criterion actually states
+is that *no other* file names one, and none does. Everything downstream holds
+`MediumBackend`, `TransferEngine`, `MemoryRegistrar`, or `PeerDirectory`.
+
+**One medium per node — `UMBPDistributedConfig::medium` selects it.**
+Registering DRAM unconditionally and adding HBM/SSD beside it (as Phase 2b–7
+did) reads like a tier stack and is not one: since Phase 4 the master treats
+every advertised tier as an equally valid put target, so the second medium is
+*mirrored into by free capacity*, not demoted to. That costs capacity, splits a
+node's keys across two pools for no gain, and makes a "--tier ssd" measurement
+actually measure DRAM. Local tiering would be a routing-plane feature (a
+per-node tier order plus promote/demote), and nothing has asked for one:
+heterogeneity comes from different **nodes** picking different media, which the
+routing plane already handles. So the selector is a single enum, adding a medium
+is a `case` rather than an `if`, and the two data-plane leftovers §1 listed —
+the `TierType::DRAM` re-cache literal and the `!= DRAM && != HBM` put filter
+(which silently dropped every put master routed to a peer's SSD) — are gone
+rather than generalized to a list.
 
 ---
 

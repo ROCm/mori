@@ -207,20 +207,34 @@ inline bool ShouldAdmitReCache(bool cache_remote_fetches, CacheRemoteAdmission p
   return true;  // ALWAYS, or SIZE within cap
 }
 
-// User-facing HBM-tier opt-in for distributed mode. Unlike dram/ssd, HBM has
+// User-facing HBM-tier knobs for distributed mode. Unlike dram/ssd, HBM has
 // no local (non-distributed) mode, so it lives only here rather than on the
 // top-level UMBPConfig. Mirrors HbmOwnershipConfig's shape (device +
 // buffer_sizes) deliberately: hipMalloc has no hugepage/NUMA/prefault
 // dimension the way host memory does, so there is nothing else to expose.
-// `enabled` defaults to false so an existing deployment is bit-identical; a
-// node opts into HBM explicitly. See PoolClient::Init for the one-live-medium
-// note — DRAM and HBM are both registerable, but the routing plane treats
-// every medium as equivalent, so a node configured with both will mirror
-// rather than tier.
+// No `enabled` flag: UMBPDistributedConfig::medium is the single selector,
+// and these knobs are read only when it names HBM.
 struct UMBPHbmConfig {
-  bool enabled = false;
   int device = 0;               // GPU ordinal the pool is allocated on
-  uint64_t capacity_bytes = 0;  // single-buffer pool size; 0 keeps HBM off even if enabled=true
+  uint64_t capacity_bytes = 0;  // single-buffer pool size
+};
+
+// The one storage medium a distributed node serves.
+//
+// UMBP's routing plane does not tier: every advertised medium is an equally
+// valid put target (see medium_backend.h and Phase 4 of the backend-agnostic
+// refactor), so a node registering two backends MIRRORS across them rather
+// than promoting/demoting between them — which is not what "DRAM + SSD" reads
+// like, and costs capacity for nothing. Rather than build a local tiering
+// policy nobody asked for, a node picks exactly one medium and the cluster
+// gets its heterogeneity from having different nodes pick differently.
+//
+// The medium each key lands on is therefore a property of the node master
+// routed it to, not of a per-node tier order.
+enum class UMBPMedium {
+  DRAM,  // host memory (default; the pre-selector behaviour)
+  HBM,   // device memory on UMBPHbmConfig::device
+  SSD,   // local NVMe/file storage, staged through registered host memory
 };
 
 // User-facing distributed configuration. Set UMBPConfig::distributed to enable
@@ -231,7 +245,7 @@ struct UMBPDistributedConfig {
 
   size_t staging_buffer_size = 64ULL * 1024 * 1024;  // 64 MB
 
-  // Dedicated SSD read staging, allocated only when ssd.enabled. Per-slot
+  // Dedicated SSD read staging, allocated only when medium == SSD. Per-slot
   // (this / ssd_staging_buffer_slots) must be >= the largest single-key page KV
   // (61-layer MLA page ~= 4.5 MB).
   size_t ssd_staging_buffer_size = 268435456;  // 256 MiB
@@ -250,26 +264,26 @@ struct UMBPDistributedConfig {
   // 0 means unlimited (no size gate). Default 16 MB.
   size_t admission_max_block_bytes = 16ULL * 1024 * 1024;
 
-  // Page size used by Master's PageBitmapAllocator for this node's DRAM/HBM
-  // tier.  Reported via RegisterClient.  Same value applies to both DRAM
-  // and HBM.  Forwarded to PoolClientConfig::dram_page_size by
-  // DistributedClient unmodified.
+  // Page size used by Master's PageBitmapAllocator for this node's medium.
+  // Reported via RegisterClient.  Forwarded to PoolClientConfig::dram_page_size
+  // by DistributedClient unmodified.  (Named for DRAM because the wire field
+  // is; it applies to whichever medium this node serves.)
   // 0 = delegate to Master's ClientRegistryConfig::default_dram_page_size
   // (2 MiB by default).  Set to an explicit byte count to override.
   uint64_t dram_page_size = 0;
 
-  UMBPHbmConfig hbm;
+  // Which medium this node's distributed data plane serves — exactly one.
+  // Defaults to DRAM, so an existing deployment is bit-identical.
+  //
+  // The selected medium's sizing knobs come from the config it names:
+  //   DRAM -> UMBPConfig::dram   (capacity, hugepages, NUMA, prefault)
+  //   HBM  -> distributed.hbm    (device, capacity)
+  //   SSD  -> UMBPConfig::ssd    (storage_dir, capacity, layout, io, backend)
+  // The other two are ignored rather than validated, so a config that carries
+  // all three (a common deployment template) selects by this field alone.
+  UMBPMedium medium = UMBPMedium::DRAM;
 
-  // Opt this node's distributed data plane into the SSD medium.  Unlike hbm,
-  // SSD needs no config struct of its own here: UMBPConfig::ssd already carries
-  // every knob SsdBackend takes (storage_dir, capacity, segment/layout, io,
-  // durability, ssd_backend selection), and DistributedClient lowers it into
-  // PoolClientConfig::ssd when this is set.  A separate bool rather than
-  // reusing UMBPConfig::ssd.enabled because THAT defaults to true — keying the
-  // distributed tier off it would silently make every existing deployment
-  // start advertising SSD capacity.  Defaults false: a node opts in
-  // explicitly, exactly as it does for HBM.
-  bool enable_ssd_tier = false;
+  UMBPHbmConfig hbm;
 };
 
 // User-facing same-host standalone-process configuration.  Set
@@ -376,6 +390,29 @@ struct UMBPConfig {
         if (error_message)
           *error_message = "distributed.master_config.node_address must not be empty";
         return false;
+      }
+      // Only the selected medium's sizing is checked: a node that serves HBM
+      // still carries a defaulted dram/ssd block it never allocates from.
+      if (d.medium == UMBPMedium::HBM && d.hbm.capacity_bytes == 0) {
+        if (error_message)
+          *error_message =
+              "distributed.hbm.capacity_bytes must be > 0 when distributed.medium is HBM";
+        return false;
+      }
+      // Not ssd.Validate(): that returns early on ssd.enabled == false, and
+      // selecting SSD here IS the opt-in (DistributedClient enables the tier
+      // from `medium`, so an unset ssd.enabled must not skip the sizing check).
+      if (d.medium == UMBPMedium::SSD) {
+        if (ssd.capacity_bytes == 0) {
+          if (error_message)
+            *error_message = "ssd.capacity_bytes must be > 0 when distributed.medium is SSD";
+          return false;
+        }
+        if (ssd.segment_size_bytes == 0) {
+          if (error_message)
+            *error_message = "ssd.segment_size_bytes must be > 0 when distributed.medium is SSD";
+          return false;
+        }
       }
     }
     if (distributed.has_value() && standalone_process.has_value()) {
