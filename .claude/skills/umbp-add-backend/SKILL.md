@@ -108,30 +108,41 @@ all.
    }
    ```
 
-3. **Add a config struct** in `distributed/config.h`, with `enabled = false` so
-   existing deployments are bit-identical. Do **not** extend
-   `DramOwnershipConfig` — hugepages/NUMA/prefault are meaningless for HBM, and
-   a device ordinal is meaningless for host memory. Each medium brings its own
-   knobs; that asymmetry is why the seam is a class and not an options struct.
+3. **Add a config struct** in `distributed/config.h` holding your medium's own
+   knobs — no `enabled` flag: `PoolClientConfig::medium` is the single selector.
+   Do **not** extend `DramOwnershipConfig` — hugepages/NUMA/prefault are
+   meaningless for HBM, and a device ordinal is meaningless for host memory.
+   Each medium brings its own knobs; that asymmetry is why the seam is a class
+   and not an options struct.
 
-4. **Register it in `PoolClient::Init`**, next to the DRAM block. Three lines,
-   and this is the only file that changes outside your own:
+4. **Add a case to the medium switch in `PoolClient::Init`.** A node registers
+   **exactly one** backend, chosen by `config_.medium`, so you add a case rather
+   than another `if`. This is the only file that changes outside your own:
 
    ```cpp
-   if (config_.my.enabled && !config_.my.buffer_sizes.empty()) {
-     auto backend = MakeMyBackend(page_size, ...);
-     if (!backend->Init(static_cast<MemoryRegistrar*>(transfer_engine_.get()))) {
-       MORI_UMBP_ERROR("[PoolClient] MY backend Init failed");
-       initialized_ = false;
-       return false;
-     }
-     registry_.Register(std::move(backend));
+   case TierType::MY_TIER: {
+     backend = MakeMyBackend(page_size, config_.my, ...);
+     break;
    }
    ```
 
+   The shared `Init` / `Register` / error handling below the switch is written
+   once for every medium.
+
+   **Why one medium, not a tier stack.** The routing plane does not tier: master
+   treats every advertised tier as an equally valid put target (Phase 4 deleted
+   the hardcoded tier orders), so a node registering two backends *mirrors*
+   across them rather than promoting/demoting between them. Heterogeneity comes
+   from different **nodes** picking different media. If you find yourself
+   wanting two live backends on one node, you are asking for a local tiering
+   policy that does not exist yet — that is a routing-plane change, not a
+   backend one.
+
 5. **Add the tier to `TierType`** (`types.h`) if it is genuinely new. `HBM=1,
    DRAM=2, SSD=3` already exist. `BackendRegistry` is a `map<TierType, ...>`, so
-   one instance == one medium and the enum value is the identity.
+   one instance == one medium and the enum value is the identity. Also add a
+   matching `UMBPMedium` value in `common/config.h` and map it in `ToTierType`,
+   or no user-facing config can select your medium.
 
 That is the whole change. Routing, the peer service, the heartbeat and the batch
 executors were all written against `BackendRegistry` and need no edit.

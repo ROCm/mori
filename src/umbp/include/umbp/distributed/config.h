@@ -41,6 +41,23 @@ class RouteGetStrategy;
 class RoutePutStrategy;
 class MasterEvictStrategy;
 
+// The user-facing medium selector, lowered to the tier id the routing plane
+// and the wire already speak.  Two enums rather than one because the
+// dependency is one-directional (distributed/config.h -> common/config.h) and
+// UMBPMedium must be nameable by callers that never include the distributed
+// headers.
+inline TierType ToTierType(UMBPMedium medium) {
+  switch (medium) {
+    case UMBPMedium::HBM:
+      return TierType::HBM;
+    case UMBPMedium::SSD:
+      return TierType::SSD;
+    case UMBPMedium::DRAM:
+      break;
+  }
+  return TierType::DRAM;
+}
+
 struct ClientRegistryConfig {
   std::chrono::seconds heartbeat_ttl{10};
   std::chrono::seconds reaper_interval{5};
@@ -152,13 +169,9 @@ struct DramOwnershipConfig {
 // each medium brings its own PageMemorySource rather than sharing one options
 // struct with per-medium fields nobody else reads.
 //
-// `enabled` defaults to false so an existing deployment is bit-identical; a
-// node opts into HBM explicitly.  See PoolClient::Init for the one-live-medium
-// note — DRAM and HBM are both registerable today, but the routing plane treats
-// every medium as equivalent (medium_backend.h), so a node configured with both
-// will mirror rather than tier.
+// No `enabled` flag: PoolClientConfig::medium selects the one live medium, and
+// these knobs are read only when it names HBM.
 struct HbmOwnershipConfig {
-  bool enabled = false;
   // GPU ordinal the pool is allocated on.  Fixed at Init, not inherited from
   // whichever thread allocates first (see HbmPageMemorySource).
   int device = 0;
@@ -171,6 +184,10 @@ struct HbmOwnershipConfig {
 // peer only needs that subset — not the whole global config.  ssd_backend
 // (posix / spdk / spdk_proxy) lives inside UMBPSsdConfig, so PeerSsdManager
 // picks the backend from cfg.ssd directly.
+//
+// `enabled` stays because PeerSsdManager's own contract is written against it
+// (it refuses to open a tier that is off); PoolClient sets it from
+// PoolClientConfig::medium rather than from user config.
 struct PeerSsdConfig {
   bool enabled = false;
   UMBPSsdConfig ssd;
@@ -193,6 +210,13 @@ struct PoolClientConfig {
   // read fits one whole key value in a slot, so this / ssd_staging_buffer_slots
   // must be >= the largest single-key page KV (61-layer MLA page ~= 4.5 MB).
   size_t ssd_staging_buffer_size = 268435456;  // 256 MiB
+
+  // The one medium this node registers a backend for (design note in
+  // common/config.h's UMBPMedium: UMBP routes across nodes, it does not tier
+  // within one, so a second local backend would mirror rather than demote).
+  // PoolClient::Init reads exactly one of the three ownership blocks below,
+  // chosen by this field; the other two are ignored, not validated.
+  TierType medium = TierType::DRAM;
 
   DramOwnershipConfig dram;
   HbmOwnershipConfig hbm;
@@ -254,11 +278,11 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   // outside UMBPDistributedConfig (no hugepages/NUMA/prefault dimension for
   // hipMalloc'd memory), so it can be lowered directly here instead of via a
   // caller-supplied parameter.
-  if (dc.hbm.enabled && dc.hbm.capacity_bytes > 0) {
-    pc.hbm.enabled = true;
-    pc.hbm.device = dc.hbm.device;
-    pc.hbm.buffer_sizes = {dc.hbm.capacity_bytes};
-  }
+  pc.hbm.device = dc.hbm.device;
+  if (dc.hbm.capacity_bytes > 0) pc.hbm.buffer_sizes = {dc.hbm.capacity_bytes};
+  pc.medium = ToTierType(dc.medium);
+  // The medium is what opts the SSD tier in; PeerSsdManager keys off this.
+  pc.ssd.enabled = (pc.medium == TierType::SSD);
   return pc;
 }
 

@@ -223,9 +223,13 @@ void RegisterMoriUmbp(py::module_& m) {
       .value("NEVER", CacheRemoteAdmission::NEVER)
       .value("ALWAYS", CacheRemoteAdmission::ALWAYS);
 
+  py::enum_<UMBPMedium>(m, "UMBPMedium")
+      .value("DRAM", UMBPMedium::DRAM)
+      .value("HBM", UMBPMedium::HBM)
+      .value("SSD", UMBPMedium::SSD);
+
   py::class_<UMBPHbmConfig>(m, "UMBPHbmConfig")
       .def(py::init<>())
-      .def_readwrite("enabled", &UMBPHbmConfig::enabled)
       .def_readwrite("device", &UMBPHbmConfig::device)
       .def_readwrite("capacity_bytes", &UMBPHbmConfig::capacity_bytes);
 
@@ -241,8 +245,8 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("cache_remote_admission", &UMBPDistributedConfig::cache_remote_admission)
       .def_readwrite("admission_max_block_bytes", &UMBPDistributedConfig::admission_max_block_bytes)
       .def_readwrite("dram_page_size", &UMBPDistributedConfig::dram_page_size)
-      .def_readwrite("hbm", &UMBPDistributedConfig::hbm)
-      .def_readwrite("enable_ssd_tier", &UMBPDistributedConfig::enable_ssd_tier);
+      .def_readwrite("medium", &UMBPDistributedConfig::medium)
+      .def_readwrite("hbm", &UMBPDistributedConfig::hbm);
 
   py::class_<UMBPStandaloneProcessConfig>(m, "UMBPStandaloneProcessConfig")
       .def(py::init<>())
