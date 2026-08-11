@@ -22,6 +22,7 @@
 #include "umbp/distributed/distributed_client.h"
 
 #include <map>
+#include <mutex>
 #include <stdexcept>
 
 #include "mori/io/engine.hpp"
@@ -183,6 +184,29 @@ std::vector<bool> DistributedClient::BatchGet(const std::vector<std::string>& ke
     dst_ptrs[i] = reinterpret_cast<void*>(dsts[i]);
   }
   return pool_client_->BatchGet(keys, dst_ptrs, sizes);
+}
+
+std::vector<bool> DistributedClient::BatchGetRanges(
+    const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& /*dsts*/,
+    const std::vector<std::vector<size_t>>& /*sizes*/,
+    const std::vector<std::vector<size_t>>& /*src_offsets*/) {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    MORI_UMBP_WARN("[DistributedClient] ranged multi-buffer get is not supported yet");
+  });
+  return std::vector<bool>(keys.size(), false);
+}
+
+std::vector<bool> DistributedClient::BatchPutRanges(
+    const std::vector<std::string>& keys, const std::vector<size_t>& /*object_sizes*/,
+    const std::vector<std::vector<uintptr_t>>& /*srcs*/,
+    const std::vector<std::vector<size_t>>& /*sizes*/,
+    const std::vector<std::vector<size_t>>& /*dst_offsets*/) {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    MORI_UMBP_WARN("[DistributedClient] ranged multi-buffer put is not supported yet");
+  });
+  return std::vector<bool>(keys.size(), false);
 }
 
 std::vector<bool> DistributedClient::BatchExists(const std::vector<std::string>& keys) const {

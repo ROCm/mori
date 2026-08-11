@@ -43,8 +43,9 @@ enum class UMBPDeploymentMode : int {
 
 /// Abstract interface for UMBP storage clients.
 ///
-/// Two implementations exist behind this interface:
+/// Three implementations exist behind this interface:
 ///   - StandaloneClient: purely local DRAM+SSD storage, no networking.
+///   - StandaloneProcessClient: gRPC forwarding to a standalone server.
 ///   - DistributedClient: master-led global routing + RDMA data plane.
 ///
 /// Use CreateUMBPClient() to obtain the appropriate implementation based on
@@ -83,6 +84,21 @@ class IUMBPClient {
   virtual std::vector<bool> BatchGet(const std::vector<std::string>& keys,
                                      const std::vector<uintptr_t>& dsts,
                                      const std::vector<size_t>& sizes) = 0;
+
+  /// Read byte ranges of stored objects into scattered user buffers. Shape
+  /// errors fail the whole batch; data errors are reported per key.
+  virtual std::vector<bool> BatchGetRanges(const std::vector<std::string>& keys,
+                                           const std::vector<std::vector<uintptr_t>>& dsts,
+                                           const std::vector<std::vector<size_t>>& sizes,
+                                           const std::vector<std::vector<size_t>>& src_offsets) = 0;
+
+  /// Atomically publish objects assembled from scattered buffers. The ranges
+  /// for each key must exactly tile [0, object_sizes[i]).
+  virtual std::vector<bool> BatchPutRanges(const std::vector<std::string>& keys,
+                                           const std::vector<size_t>& object_sizes,
+                                           const std::vector<std::vector<uintptr_t>>& srcs,
+                                           const std::vector<std::vector<size_t>>& sizes,
+                                           const std::vector<std::vector<size_t>>& dst_offsets) = 0;
 
   virtual std::vector<bool> BatchExists(const std::vector<std::string>& keys) const = 0;
 

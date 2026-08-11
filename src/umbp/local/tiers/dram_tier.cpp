@@ -30,18 +30,22 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #endif
 
+#include "device_copy_run.h"
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/device_copy.h"
+#include "umbp/common/range_utils.h"
 
 namespace mori::umbp {
 
@@ -115,13 +119,17 @@ struct CopyJob {
   bool copied{false};
 };
 
+using detail::DeviceCopyRun;
+using detail::DeviceCopyRunKind;
+using detail::FindDeviceCopyRun;
+using detail::PointerAddress;
+
 // ---------------------------------------------------------------------------
 // Opt-in profiling (UMBP_DRAM_PROFILE=1). Answers the two questions that gate
 // the next round of optimization work:
 //   1. how much of a batch's wall time is spent waiting for mu_ (i.e. how much
 //      the 8 ranks serialize against each other);
-//   2. how many hipMemcpyAsync submissions would survive if adjacent objects
-//      were merged (i.e. whether contiguous merging is worth implementing).
+//   2. how many device-copy submissions survive 1D and pitched-2D merging.
 // Zero cost when disabled: one predictable branch per batch.
 // ---------------------------------------------------------------------------
 
@@ -220,7 +228,9 @@ struct MergeStats {
   std::atomic<uint64_t> objects{0};
   std::atomic<uint64_t> runs_gpu{0};   // runs if only the GPU side had to be adjacent
   std::atomic<uint64_t> runs_dram{0};  // runs if only the DRAM side had to be adjacent
-  std::atomic<uint64_t> runs_both{0};  // runs with both adjacent -- the real submission count
+  std::atomic<uint64_t> runs_both{0};  // runs if both sides had to be adjacent
+  std::atomic<uint64_t> actual_submissions{0};
+  std::atomic<uint64_t> pitched_submissions{0};
 };
 
 MergeStats& OffloadMergeStats() {
@@ -233,11 +243,9 @@ MergeStats& LoadMergeStats() {
   return stats;
 }
 
-// Counts how many contiguous runs the batch would collapse into. A run of k
-// objects becomes one hipMemcpyAsync, so runs_both/objects is exactly the
-// submission-count reduction that merging would buy. runs_gpu / runs_dram show
-// which side is the obstacle: the DRAM side is ours to control (slot placement
-// follows the order objects are sent), the GPU side is the tree allocator's.
+// Counts both the legacy adjacency-only view and the actual 1D/2D plan.
+// runs_gpu / runs_dram show which side blocks flat 1D merging; actual_submissions
+// includes pitched runs recognized by the same planner used for execution.
 void RecordMergeability(const std::vector<CopyJob*>& jobs, hipMemcpyKind kind) {
   if (jobs.empty()) return;
   const bool src_is_gpu = (kind == hipMemcpyDeviceToHost);
@@ -270,6 +278,21 @@ void RecordMergeability(const std::vector<CopyJob*>& jobs, hipMemcpyKind kind) {
   stats.runs_gpu.fetch_add(runs_gpu, std::memory_order_relaxed);
   stats.runs_dram.fetch_add(runs_dram, std::memory_order_relaxed);
   stats.runs_both.fetch_add(runs_both, std::memory_order_relaxed);
+
+  std::vector<CopyJob*> ordered(jobs.begin(), jobs.end());
+  std::sort(ordered.begin(), ordered.end(), [](const CopyJob* a, const CopyJob* b) {
+    return PointerAddress(a->src) < PointerAddress(b->src);
+  });
+  uint64_t actual_submissions = 0;
+  uint64_t pitched_submissions = 0;
+  for (size_t begin = 0; begin < ordered.size();) {
+    const DeviceCopyRun run = FindDeviceCopyRun(ordered, begin);
+    ++actual_submissions;
+    if (run.kind == DeviceCopyRunKind::kPitched) ++pitched_submissions;
+    begin = run.end;
+  }
+  stats.actual_submissions.fetch_add(actual_submissions, std::memory_order_relaxed);
+  stats.pitched_submissions.fetch_add(pitched_submissions, std::memory_order_relaxed);
   const uint64_t n = stats.batches.fetch_add(1, std::memory_order_relaxed) + 1;
   if (n % kProfileReportEvery != 0) return;
 
@@ -279,8 +302,9 @@ void RecordMergeability(const std::vector<CopyJob*>& jobs, hipMemcpyKind kind) {
   };
   MORI_UMBP_INFO(
       "[DRAMTier/profile] mergeability {} batches={} objects={} | submissions kept: "
-      "gpu-side-only={}% dram-side-only={}% both={}%",
-      stats.name, n, objs, pct(stats.runs_gpu), pct(stats.runs_dram), pct(stats.runs_both));
+      "gpu-side-only={}% dram-side-only={}% adjacent-both={}% actual={}% 2d_runs={}",
+      stats.name, n, objs, pct(stats.runs_gpu), pct(stats.runs_dram), pct(stats.runs_both),
+      pct(stats.actual_submissions), stats.pitched_submissions.load(std::memory_order_relaxed));
 }
 
 // Times mu_ acquisition and the critical section, then reports periodically.
@@ -395,35 +419,31 @@ void CopyDeviceJobs(const std::vector<CopyJob*>& jobs, int device_id, hipMemcpyK
   // sends offloads in GPU-address order, which makes the tier's slot layout
   // mirror the GPU layout -- see UMBP_STANDALONE_PROCESS_DESIGN.md 11.2.
   std::vector<CopyJob*> ordered(jobs.begin(), jobs.end());
-  std::sort(ordered.begin(), ordered.end(),
-            [](const CopyJob* a, const CopyJob* b) { return a->src < b->src; });
+  std::sort(ordered.begin(), ordered.end(), [](const CopyJob* a, const CopyJob* b) {
+    return PointerAddress(a->src) < PointerAddress(b->src);
+  });
 
   hipError_t status = hipSuccess;
   bool enqueued_all = true;
   for (size_t begin = 0; begin < ordered.size();) {
-    size_t end = begin + 1;
-    size_t bytes = ordered[begin]->size;
-    while (end < ordered.size()) {
-      const CopyJob* prev = ordered[end - 1];
-      const CopyJob* cur = ordered[end];
-      const bool src_adjacent =
-          static_cast<const char*>(prev->src) + prev->size == static_cast<const char*>(cur->src);
-      const bool dst_adjacent =
-          static_cast<char*>(prev->dst) + prev->size == static_cast<char*>(cur->dst);
-      if (!src_adjacent || !dst_adjacent) break;
-      bytes += cur->size;
-      ++end;
+    const DeviceCopyRun run = FindDeviceCopyRun(ordered, begin);
+    if (run.kind == DeviceCopyRunKind::kPitched) {
+      status = hipMemcpy2DAsync(ordered[begin]->dst, run.dpitch, ordered[begin]->src, run.spitch,
+                                run.width, run.end - begin, kind, stream);
+    } else {
+      status = hipMemcpyAsync(ordered[begin]->dst, ordered[begin]->src, run.bytes, kind, stream);
     }
-
-    status = hipMemcpyAsync(ordered[begin]->dst, ordered[begin]->src, bytes, kind, stream);
     if (status != hipSuccess) {
-      MORI_UMBP_ERROR("[DRAMTier] hipMemcpyAsync failed on device {} ({} bytes, {} objects): {}",
-                      device_id, bytes, end - begin, hipGetErrorString(status));
+      MORI_UMBP_ERROR(
+          "[DRAMTier] device copy failed on device {} "
+          "(kind={} width={} rows={} spitch={} dpitch={} bytes={}): {}",
+          device_id, run.kind == DeviceCopyRunKind::kPitched ? "2d" : "1d", run.width,
+          run.end - begin, run.spitch, run.dpitch, run.bytes, hipGetErrorString(status));
       (void)hipGetLastError();
       enqueued_all = false;
       break;
     }
-    begin = end;
+    begin = run.end;
   }
 
   const hipError_t sync_status = hipStreamSynchronize(stream);
@@ -721,6 +741,65 @@ std::vector<bool> DRAMTier::ReadBatchIntoPtr(const std::vector<std::string>& key
   return results;
 }
 
+std::vector<bool> DRAMTier::ReadBatchRangesIntoPtr(
+    const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dst_ptrs,
+    const std::vector<std::vector<size_t>>& sizes,
+    const std::vector<std::vector<size_t>>& src_offsets) {
+  const size_t n = keys.size();
+  std::vector<bool> results(n, false);
+  if (!RangeBatchShapeValid(n, dst_ptrs, sizes, src_offsets) || n == 0) return results;
+
+  size_t total_ranges = 0;
+  for (const auto& entry : sizes) {
+    if (entry.size() > std::numeric_limits<size_t>::max() - total_ranges) return results;
+    total_ranges += entry.size();
+  }
+
+  ScopedInFlight in_flight;
+  ProfiledSharedLock lock(mu_, ReadLockStats(), n);
+
+  std::vector<CopyJob> jobs;
+  jobs.reserve(total_ranges);
+  std::vector<size_t> expected(n, 0);
+  for (size_t i = 0; i < n; ++i) {
+    if (sizes[i].empty()) continue;
+    auto it = slots_.find(keys[i]);
+    if (it == slots_.end()) continue;
+
+    bool valid = true;
+    for (size_t j = 0; j < sizes[i].size(); ++j) {
+      if (sizes[i][j] == 0 ||
+          IsObjectRangeOverflow(src_offsets[i][j], sizes[i][j], it->second.size)) {
+        valid = false;
+        break;
+      }
+    }
+    if (!valid) continue;
+
+    expected[i] = sizes[i].size();
+    for (size_t j = 0; j < sizes[i].size(); ++j) {
+      void* dst = reinterpret_cast<void*>(dst_ptrs[i][j]);
+      const void* src = static_cast<const char*>(base_ptr_) + it->second.offset + src_offsets[i][j];
+      jobs.push_back({dst, src, dst, sizes[i][j], i, false});
+    }
+  }
+
+  CopyJobs(&jobs, read_threads_, hipMemcpyHostToDevice);
+  std::vector<size_t> copied(n, 0);
+  for (const auto& job : jobs) {
+    if (job.copied) ++copied[job.idx];
+  }
+
+  std::lock_guard<std::mutex> lru_lock(lru_mu_);
+  for (size_t i = 0; i < n; ++i) {
+    if (expected[i] != 0 && copied[i] == expected[i]) {
+      results[i] = true;
+      TouchLRU(keys[i]);
+    }
+  }
+  return results;
+}
+
 std::vector<bool> DRAMTier::BatchWrite(const std::vector<std::string>& keys,
                                        const std::vector<const void*>& data_ptrs,
                                        const std::vector<size_t>& sizes) {
@@ -792,6 +871,93 @@ std::vector<bool> DRAMTier::BatchWrite(const std::vector<std::string>& keys,
       TouchLRU(keys[copy_job.idx]);
       results[copy_job.idx] = true;
     }
+  }
+  return results;
+}
+
+std::vector<bool> DRAMTier::BatchWriteRanges(const std::vector<std::string>& keys,
+                                             const std::vector<size_t>& object_sizes,
+                                             const std::vector<std::vector<const void*>>& src_ptrs,
+                                             const std::vector<std::vector<size_t>>& sizes,
+                                             const std::vector<std::vector<size_t>>& dst_offsets) {
+  const size_t n = keys.size();
+  std::vector<bool> results(n, false);
+  if (object_sizes.size() != n || !RangeBatchShapeValid(n, src_ptrs, sizes, dst_offsets) ||
+      n == 0) {
+    return results;
+  }
+
+  size_t total_ranges = 0;
+  for (const auto& entry : sizes) {
+    if (entry.size() > std::numeric_limits<size_t>::max() - total_ranges) return results;
+    total_ranges += entry.size();
+  }
+
+  std::unordered_set<std::string> seen;
+  std::unordered_set<std::string> duplicates;
+  for (const auto& key : keys) {
+    if (!seen.insert(key).second) duplicates.insert(key);
+  }
+
+  ScopedInFlight in_flight;
+  ProfiledUniqueLock lock(mu_, WriteLockStats(), n);
+
+  struct Reservation {
+    size_t index;
+    size_t offset;
+    size_t object_size;
+    size_t job_begin;
+    size_t job_count;
+  };
+  std::vector<Reservation> reservations;
+  std::vector<CopyJob> jobs;
+  reservations.reserve(n);
+  jobs.reserve(total_ranges);
+
+  // Reserve new storage while any previous value remains published. This costs
+  // temporary extra space, but it is what makes replacement failure atomic.
+  for (size_t i = 0; i < n; ++i) {
+    if (duplicates.count(keys[i]) != 0 ||
+        !RangesTileObject(object_sizes[i], sizes[i], dst_offsets[i])) {
+      continue;
+    }
+    const size_t offset = Allocate(object_sizes[i]);
+    if (offset == static_cast<size_t>(-1)) continue;
+
+    const size_t job_begin = jobs.size();
+    for (size_t j = 0; j < sizes[i].size(); ++j) {
+      void* dst = static_cast<char*>(base_ptr_) + offset + dst_offsets[i][j];
+      jobs.push_back({dst, src_ptrs[i][j], src_ptrs[i][j], sizes[i][j], i, false});
+    }
+    reservations.push_back({i, offset, object_sizes[i], job_begin, sizes[i].size()});
+  }
+
+  CopyJobs(&jobs, write_threads_, hipMemcpyDeviceToHost);
+
+  std::lock_guard<std::mutex> lru_lock(lru_mu_);
+  for (const Reservation& reservation : reservations) {
+    bool copied = true;
+    for (size_t j = 0; j < reservation.job_count; ++j) {
+      if (!jobs[reservation.job_begin + j].copied) {
+        copied = false;
+        break;
+      }
+    }
+    if (!copied) {
+      Deallocate(reservation.offset, reservation.object_size);
+      continue;
+    }
+
+    const std::string& key = keys[reservation.index];
+    auto existing = slots_.find(key);
+    if (existing != slots_.end()) {
+      Deallocate(existing->second.offset, existing->second.size);
+      used_ -= existing->second.size;
+    }
+    slots_[key] = {reservation.offset, reservation.object_size};
+    used_ += reservation.object_size;
+    TouchLRU(key);
+    results[reservation.index] = true;
   }
   return results;
 }

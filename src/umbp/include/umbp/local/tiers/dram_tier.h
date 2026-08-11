@@ -68,6 +68,10 @@ class DRAMTier : public TierBackend {
   std::vector<bool> ReadBatchIntoPtr(const std::vector<std::string>& keys,
                                      const std::vector<uintptr_t>& dst_ptrs,
                                      const std::vector<size_t>& sizes) override;
+  std::vector<bool> ReadBatchRangesIntoPtr(
+      const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dst_ptrs,
+      const std::vector<std::vector<size_t>>& sizes,
+      const std::vector<std::vector<size_t>>& src_offsets) override;
   // Multi-threaded batch write: serial slot allocation (mutates free_list_)
   // followed by parallel non-temporal CopyBlock of each payload into its slot.
   // Mirrors ReadBatchIntoPtr to break the single-core memcpy ceiling on the
@@ -76,6 +80,11 @@ class DRAMTier : public TierBackend {
   std::vector<bool> BatchWrite(const std::vector<std::string>& keys,
                                const std::vector<const void*>& data_ptrs,
                                const std::vector<size_t>& sizes) override;
+  std::vector<bool> BatchWriteRanges(const std::vector<std::string>& keys,
+                                     const std::vector<size_t>& object_sizes,
+                                     const std::vector<std::vector<const void*>>& src_ptrs,
+                                     const std::vector<std::vector<size_t>>& sizes,
+                                     const std::vector<std::vector<size_t>>& dst_offsets) override;
   bool Exists(const std::string& key) const override;
   bool Evict(const std::string& key) override;
   std::pair<size_t, size_t> Capacity() const override;

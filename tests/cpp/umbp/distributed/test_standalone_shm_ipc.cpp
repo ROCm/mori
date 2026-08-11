@@ -359,6 +359,47 @@ TEST(StandaloneShmIpcTest, StandaloneClientResolvesAcrossMultipleRegions) {
   for (int i = 0; i < 8; ++i) EXPECT_EQ(bytes_a[300 + i], static_cast<unsigned char>(0xa0 + i));
   for (int i = 0; i < 8; ++i) EXPECT_EQ(bytes_b[300 + i], static_cast<unsigned char>(0xb0 + i));
 
+  // One object can be assembled from, and read back into, ranges belonging to
+  // different registered regions.
+  for (int i = 0; i < 8; ++i) bytes_a[400 + i] = static_cast<unsigned char>(0xc0 + i);
+  for (int i = 0; i < 8; ++i) bytes_b[400 + i] = static_cast<unsigned char>(0xd0 + i);
+  auto range_put = client->BatchPutRanges(
+      {"range-key"}, {16},
+      {{reinterpret_cast<uintptr_t>(bytes_b + 400), reinterpret_cast<uintptr_t>(bytes_a + 400)}},
+      {{8, 8}}, {{8, 0}});
+  ASSERT_EQ(range_put, std::vector<bool>({true}));
+  EXPECT_TRUE(client->Exists("range-key"));
+
+  std::memset(bytes_a + 500, 0, 8);
+  std::memset(bytes_b + 500, 0, 8);
+  auto range_get = client->BatchGetRanges(
+      {"range-key"},
+      {{reinterpret_cast<uintptr_t>(bytes_a + 500), reinterpret_cast<uintptr_t>(bytes_b + 500)}},
+      {{8, 8}}, {{8, 0}});
+  ASSERT_EQ(range_get, std::vector<bool>({true}));
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(bytes_a[500 + i], static_cast<unsigned char>(0xd0 + i));
+    EXPECT_EQ(bytes_b[500 + i], static_cast<unsigned char>(0xc0 + i));
+  }
+
+  // Malformed flattened range arrays are rejected before address resolution.
+  auto raw_stub = ::umbp::UMBPStandalone::NewStub(
+      grpc::CreateChannel(address, grpc::InsecureChannelCredentials()));
+  grpc::ClientContext malformed_context;
+  ::umbp::BatchRangeDataRequest malformed_request;
+  malformed_request.add_keys("malformed");
+  malformed_request.add_range_counts(1);
+  malformed_request.add_shm_offsets(0);
+  // region_bases is deliberately missing.
+  malformed_request.add_sizes(8);
+  malformed_request.add_object_offsets(0);
+  malformed_request.add_object_sizes(8);
+  ::umbp::BatchBoolResponse malformed_response;
+  ASSERT_TRUE(
+      raw_stub->BatchPutRanges(&malformed_context, malformed_request, &malformed_response).ok());
+  ASSERT_EQ(malformed_response.ok_size(), 1);
+  EXPECT_FALSE(malformed_response.ok(0));
+
   // A pointer outside every registered region fails cleanly (no crash, no hit).
   HostBufferHandle unregistered = allocator.Alloc(4096, opts);
   ASSERT_TRUE(unregistered.valid());

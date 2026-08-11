@@ -313,6 +313,54 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     return grpc::Status::OK;
   }
 
+  grpc::Status BatchPutRanges(grpc::ServerContext*, const ::umbp::BatchRangeDataRequest* request,
+                              ::umbp::BatchBoolResponse* response) override {
+    size_t total_ranges = 0;
+    if (!ValidateRangeRequest(*request, /*put=*/true, &total_ranges)) {
+      FillFalse(request->keys_size(), response);
+      return grpc::Status::OK;
+    }
+
+    std::vector<RangeQuery> queries;
+    queries.reserve(total_ranges);
+    for (size_t i = 0; i < total_ranges; ++i) {
+      queries.push_back({request->region_bases(static_cast<int>(i)),
+                         request->shm_offsets(static_cast<int>(i)),
+                         request->sizes(static_cast<int>(i))});
+    }
+
+    std::unique_lock<std::shared_mutex> lock(client_mu_);
+    std::vector<uintptr_t> flat_ptrs;
+    if (!ResolveRanges(request->client_id(), queries, &flat_ptrs, /*allow_zero=*/true) ||
+        shutdown_.load()) {
+      FillFalse(request->keys_size(), response);
+      return grpc::Status::OK;
+    }
+
+    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+    std::vector<size_t> object_sizes;
+    object_sizes.reserve(keys.size());
+    for (uint64_t size : request->object_sizes()) object_sizes.push_back(static_cast<size_t>(size));
+    std::vector<std::vector<uintptr_t>> ptrs(keys.size());
+    std::vector<std::vector<size_t>> sizes(keys.size());
+    std::vector<std::vector<size_t>> offsets(keys.size());
+    size_t cursor = 0;
+    for (size_t i = 0; i < keys.size(); ++i) {
+      const size_t count = request->range_counts(static_cast<int>(i));
+      ptrs[i].reserve(count);
+      sizes[i].reserve(count);
+      offsets[i].reserve(count);
+      for (size_t j = 0; j < count; ++j, ++cursor) {
+        ptrs[i].push_back(flat_ptrs[cursor]);
+        sizes[i].push_back(static_cast<size_t>(request->sizes(static_cast<int>(cursor))));
+        offsets[i].push_back(
+            static_cast<size_t>(request->object_offsets(static_cast<int>(cursor))));
+      }
+    }
+    FillResults(client_->BatchPutRanges(keys, object_sizes, ptrs, sizes, offsets), response);
+    return grpc::Status::OK;
+  }
+
   grpc::Status BatchPutWithDepth(grpc::ServerContext*,
                                  const ::umbp::BatchDataWithDepthRequest* request,
                                  ::umbp::BatchBoolResponse* response) override {
@@ -339,7 +387,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
 
     std::unique_lock<std::shared_mutex> lock(client_mu_);
     std::vector<uintptr_t> ptrs;
-    if (!ResolveRanges(request->client_id(), queries, &ptrs)) {
+    if (!ResolveRanges(request->client_id(), queries, &ptrs, /*allow_zero=*/false)) {
       FillFalse(request->keys_size(), response);
       return grpc::Status::OK;
     }
@@ -366,6 +414,51 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       return grpc::Status::OK;
     }
     FillResults(client_->BatchGet(keys, ptrs, sizes), response);
+    return grpc::Status::OK;
+  }
+
+  grpc::Status BatchGetRanges(grpc::ServerContext*, const ::umbp::BatchRangeDataRequest* request,
+                              ::umbp::BatchBoolResponse* response) override {
+    size_t total_ranges = 0;
+    if (!ValidateRangeRequest(*request, /*put=*/false, &total_ranges)) {
+      FillFalse(request->keys_size(), response);
+      return grpc::Status::OK;
+    }
+
+    std::vector<RangeQuery> queries;
+    queries.reserve(total_ranges);
+    for (size_t i = 0; i < total_ranges; ++i) {
+      queries.push_back({request->region_bases(static_cast<int>(i)),
+                         request->shm_offsets(static_cast<int>(i)),
+                         request->sizes(static_cast<int>(i))});
+    }
+
+    ConditionalReadLock lock(client_mu_, shared_reads_);
+    std::vector<uintptr_t> flat_ptrs;
+    if (!ResolveRanges(request->client_id(), queries, &flat_ptrs, /*allow_zero=*/true) ||
+        shutdown_.load()) {
+      FillFalse(request->keys_size(), response);
+      return grpc::Status::OK;
+    }
+
+    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+    std::vector<std::vector<uintptr_t>> ptrs(keys.size());
+    std::vector<std::vector<size_t>> sizes(keys.size());
+    std::vector<std::vector<size_t>> offsets(keys.size());
+    size_t cursor = 0;
+    for (size_t i = 0; i < keys.size(); ++i) {
+      const size_t count = request->range_counts(static_cast<int>(i));
+      ptrs[i].reserve(count);
+      sizes[i].reserve(count);
+      offsets[i].reserve(count);
+      for (size_t j = 0; j < count; ++j, ++cursor) {
+        ptrs[i].push_back(flat_ptrs[cursor]);
+        sizes[i].push_back(static_cast<size_t>(request->sizes(static_cast<int>(cursor))));
+        offsets[i].push_back(
+            static_cast<size_t>(request->object_offsets(static_cast<int>(cursor))));
+      }
+    }
+    FillResults(client_->BatchGetRanges(keys, ptrs, sizes, offsets), response);
     return grpc::Status::OK;
   }
 
@@ -980,13 +1073,14 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     std::shared_lock<std::shared_mutex> lock(memory_mu_);
     auto it = memory_.find(client_id);
     if (it == memory_.end()) return false;
-    return ResolveRangeInRegions(it->second, region_base, offset, size, out_ptr);
+    return ResolveRangeInRegions(it->second, region_base, offset, size, out_ptr,
+                                 /*allow_zero=*/false);
   }
 
   static bool ResolveRangeInRegions(const std::vector<RegisteredMemory>& regions,
                                     uint64_t region_base, uint64_t offset, uint64_t size,
-                                    uintptr_t* out_ptr) {
-    if (!out_ptr || size == 0) return false;
+                                    uintptr_t* out_ptr, bool allow_zero) {
+    if (!out_ptr || (!allow_zero && size == 0)) return false;
     for (const auto& mem : regions) {
       if (region_base != 0 && mem.worker_base != region_base) continue;
       if (offset > mem.size || size > mem.size - offset) {
@@ -1000,7 +1094,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   }
 
   bool ResolveRanges(const std::string& client_id, const std::vector<RangeQuery>& queries,
-                     std::vector<uintptr_t>* ptrs) {
+                     std::vector<uintptr_t>* ptrs, bool allow_zero) {
     if (!ptrs) return false;
     ptrs->clear();
     ptrs->reserve(queries.size());
@@ -1012,7 +1106,8 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
 
     for (const auto& query : queries) {
       uintptr_t ptr = 0;
-      if (!ResolveRangeInRegions(it->second, query.region_base, query.offset, query.size, &ptr)) {
+      if (!ResolveRangeInRegions(it->second, query.region_base, query.offset, query.size, &ptr,
+                                 allow_zero)) {
         ptrs->clear();
         return false;
       }
@@ -1036,7 +1131,42 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       uint64_t region_base = has_region_bases ? request.region_bases(i) : 0;
       queries.push_back({region_base, request.shm_offsets(i), request.sizes(i)});
     }
-    return ResolveRanges(request.client_id(), queries, ptrs);
+    return ResolveRanges(request.client_id(), queries, ptrs, /*allow_zero=*/false);
+  }
+
+  static bool ValidateRangeRequest(const ::umbp::BatchRangeDataRequest& request, bool put,
+                                   size_t* total_ranges) {
+    if (!total_ranges || request.range_counts_size() != request.keys_size()) return false;
+    if ((put && request.object_sizes_size() != request.keys_size()) ||
+        (!put && request.object_sizes_size() != 0)) {
+      return false;
+    }
+
+    size_t total = 0;
+    for (uint32_t count : request.range_counts()) {
+      if (count > std::numeric_limits<size_t>::max() - total) return false;
+      total += count;
+    }
+    if (total != static_cast<size_t>(request.shm_offsets_size()) ||
+        total != static_cast<size_t>(request.region_bases_size()) ||
+        total != static_cast<size_t>(request.sizes_size()) ||
+        total != static_cast<size_t>(request.object_offsets_size())) {
+      return false;
+    }
+
+    if constexpr (sizeof(size_t) < sizeof(uint64_t)) {
+      for (uint64_t value : request.sizes()) {
+        if (value > std::numeric_limits<size_t>::max()) return false;
+      }
+      for (uint64_t value : request.object_offsets()) {
+        if (value > std::numeric_limits<size_t>::max()) return false;
+      }
+      for (uint64_t value : request.object_sizes()) {
+        if (value > std::numeric_limits<size_t>::max()) return false;
+      }
+    }
+    *total_ranges = total;
+    return true;
   }
 
   static std::vector<size_t> Sizes(const ::umbp::BatchDataRequest& request) {

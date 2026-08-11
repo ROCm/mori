@@ -42,6 +42,7 @@
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/device_copy.h"
+#include "umbp/common/range_utils.h"
 #include "umbp/local/host_mem_allocator.h"
 #include "umbp/standalone/ipc.h"
 
@@ -403,6 +404,76 @@ std::vector<bool> StandaloneProcessClient::BatchGet(const std::vector<std::strin
   if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) {
     return std::vector<bool>(keys.size(), false);
   }
+  return std::vector<bool>(resp.ok().begin(), resp.ok().end());
+}
+
+std::vector<bool> StandaloneProcessClient::BatchGetRanges(
+    const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dsts,
+    const std::vector<std::vector<size_t>>& sizes,
+    const std::vector<std::vector<size_t>>& src_offsets) {
+  std::vector<bool> failed(keys.size(), false);
+  if (closing_) return failed;
+  std::shared_lock lk(op_mutex_);
+  if (closed_ || !RangeBatchShapeValid(keys.size(), dsts, sizes, src_offsets)) return failed;
+
+  ::umbp::BatchRangeDataRequest req;
+  req.set_client_id(ClientId());
+  for (size_t i = 0; i < keys.size(); ++i) {
+    if (dsts[i].size() > std::numeric_limits<uint32_t>::max()) return failed;
+    req.add_keys(keys[i]);
+    req.add_range_counts(static_cast<uint32_t>(dsts[i].size()));
+    for (size_t j = 0; j < dsts[i].size(); ++j) {
+      uint64_t shm_offset = 0;
+      uint64_t region_base = 0;
+      if (!OffsetFor(dsts[i][j], sizes[i][j], &shm_offset, &region_base)) return failed;
+      req.add_shm_offsets(shm_offset);
+      req.add_region_bases(region_base);
+      req.add_sizes(sizes[i][j]);
+      req.add_object_offsets(src_offsets[i][j]);
+    }
+  }
+
+  grpc::ClientContext ctx;
+  ::umbp::BatchBoolResponse resp;
+  const grpc::Status status = stub_->BatchGetRanges(&ctx, req, &resp);
+  if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) return failed;
+  return std::vector<bool>(resp.ok().begin(), resp.ok().end());
+}
+
+std::vector<bool> StandaloneProcessClient::BatchPutRanges(
+    const std::vector<std::string>& keys, const std::vector<size_t>& object_sizes,
+    const std::vector<std::vector<uintptr_t>>& srcs, const std::vector<std::vector<size_t>>& sizes,
+    const std::vector<std::vector<size_t>>& dst_offsets) {
+  std::vector<bool> failed(keys.size(), false);
+  if (closing_) return failed;
+  std::shared_lock lk(op_mutex_);
+  if (closed_ || object_sizes.size() != keys.size() ||
+      !RangeBatchShapeValid(keys.size(), srcs, sizes, dst_offsets)) {
+    return failed;
+  }
+
+  ::umbp::BatchRangeDataRequest req;
+  req.set_client_id(ClientId());
+  for (size_t i = 0; i < keys.size(); ++i) {
+    if (srcs[i].size() > std::numeric_limits<uint32_t>::max()) return failed;
+    req.add_keys(keys[i]);
+    req.add_object_sizes(object_sizes[i]);
+    req.add_range_counts(static_cast<uint32_t>(srcs[i].size()));
+    for (size_t j = 0; j < srcs[i].size(); ++j) {
+      uint64_t shm_offset = 0;
+      uint64_t region_base = 0;
+      if (!OffsetFor(srcs[i][j], sizes[i][j], &shm_offset, &region_base)) return failed;
+      req.add_shm_offsets(shm_offset);
+      req.add_region_bases(region_base);
+      req.add_sizes(sizes[i][j]);
+      req.add_object_offsets(dst_offsets[i][j]);
+    }
+  }
+
+  grpc::ClientContext ctx;
+  ::umbp::BatchBoolResponse resp;
+  const grpc::Status status = stub_->BatchPutRanges(&ctx, req, &resp);
+  if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) return failed;
   return std::vector<bool>(resp.ok().begin(), resp.ok().end());
 }
 
