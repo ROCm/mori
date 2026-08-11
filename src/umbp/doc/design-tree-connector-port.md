@@ -282,3 +282,36 @@ taken of the GPU path's throughput.
 4. SSD ranged reads will work through the staging buffer as soon as §5 lands,
    but without disk-side savings until `SsdCopyPipeline` learns sub-extent
    reads.
+5. **GPU buffers are not supported against the local SSD tier.** Inherited from
+   upstream, not introduced here. `SSDTier::ReadIntoPtr` passes the caller's
+   pointer straight into `ReadRecordLocked` (`ssd_tier.cpp:301`), which preads
+   at that address; neither `ssd_tier.cpp` nor `local_storage_manager.cpp` has
+   any device awareness, and `LocalStorageManager::ReadIntoPtrNoPromote` reads
+   from the owning tier directly rather than promoting to DRAM first. So in
+   Local mode (and standalone-process over a Local backend) a device
+   destination works for a DRAM hit and not for an SSD hit. It should fail
+   rather than corrupt, but that is untested and the behaviour may differ under
+   large-BAR host visibility.
+
+   Note the asymmetry, because it is the refactor paying off rather than an
+   accident: distributed mode has no equivalent hole. There every byte moves
+   through the transfer layer, so an SSD-resident object reaches a device buffer
+   via `SsdBackend`'s staging refs and `HbmCopyEngine` — device-awareness is one
+   property of `TransferRef` instead of a per-tier concern. Fixing the local
+   side means teaching `SSDTier` to stage, or promoting to DRAM before serving a
+   device destination.
+
+## 9. Mode support matrix
+
+Both features, as this branch leaves them.
+
+| Client | Backend | GPU buffers | Ranged I/O |
+|---|---|---|---|
+| `StandaloneClient` | — | DRAM tier only (§8.5) | DRAM tier only |
+| `StandaloneProcessClient` | Local | DRAM tier only (§8.5) | DRAM tier only |
+| `StandaloneProcessClient` | Distributed | yes, all media | no — inherits the §5 stub |
+| `DistributedClient` | — | yes, all media | no — §5 stub |
+
+Ranged I/O is DRAM-only even within Local mode: `TierBackend`'s default ranged
+methods return all-false (`tier_backend.cpp:52`, `:69`) and only `DRAMTier`
+overrides them.
