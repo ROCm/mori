@@ -394,6 +394,16 @@ class UMBPBackend(Backend):
         dist.master_config.node_id = node_id
         dist.master_config.node_address = node_address
         dist.peer_service_port = port
+        # Re-caching remotely-fetched blocks into the LOCAL tier defaults on,
+        # which silently changes what a tier benchmark measures: the reader
+        # gets its own pool of the tier under test, so after pass 1 most reads
+        # are served from the reader's own memory (a local copy) instead of
+        # RDMA out of the writer's tier. Set UMBP_CACHE_REMOTE_FETCHES=0 to
+        # pin every pass to a genuine remote read. Default keeps the
+        # production behavior.
+        dist.cache_remote_fetches = os.environ.get(
+            "UMBP_CACHE_REMOTE_FETCHES", "1"
+        ) not in ("0", "false", "False", "")
         dist.io_engine.host = node_address
         if tier == "hbm":
             dist.hbm.enabled = True
@@ -406,6 +416,21 @@ class UMBPBackend(Backend):
             # actual knobs (it already defaults enabled=True, which is why the
             # opt-in is a separate flag -- see UMBPDistributedConfig).
             dist.enable_ssd_tier = True
+            # SSD is not directly addressable: a remote read stages the value
+            # into a registered host arena of ssd_staging_buffer_slots pages.
+            # The default 16 slots caps read concurrency at 16 keys, and a
+            # slot stays pinned for UMBP_SSD_READ_LEASE_MS (3s) when the
+            # reader's best-effort ReleaseSsdLease is lost -- so a sweep over
+            # more than ~16 keys degrades the rest to MISSES, not slow hits
+            # (ssd_backend.cpp: "Sizing the arena for read concurrency is the
+            # mitigation"). Size the arena for the sweep instead.
+            dist.ssd_staging_buffer_slots = int(
+                os.environ.get("UMBP_SSD_STAGING_SLOTS", 512)
+            )
+            # Slot size = size / slots, and must be >= the largest single value.
+            dist.ssd_staging_buffer_size = int(
+                os.environ.get("UMBP_SSD_STAGING_BYTES", 2 * 1024 * 1024 * 1024)
+            )
             cfg.ssd.enabled = True
             cfg.ssd.storage_dir = os.environ.get(
                 "UMBP_SSD_STORAGE_DIR", f"/tmp/umbp_ssd_{node_id}"
