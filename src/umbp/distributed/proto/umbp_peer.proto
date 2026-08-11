@@ -39,11 +39,21 @@ message GetPeerInfoResponse {
                   // (Phase 0 of design-backend-agnostic-refactor.md)
   reserved "ssd_staging_mem_desc", "ssd_staging_size";
 
-  // DRAM/HBM buffer descriptors — peer-owned in the new design, exposed
-  // here so writers can hydrate first-contact peers without going through
-  // AllocateSlot or ResolveKey first.
-  repeated BufferMemoryDesc dram_memory_descs = 8;
-  uint64 dram_page_size                       = 9;
+  reserved 8, 9;  // dram_memory_descs, dram_page_size — a flat, single-medium
+                  // buffer_index space that could advertise only ONE backend's
+                  // buffers.  A peer with two live media dropped the rest, and
+                  // the reader then resolved the survivors' indices against the
+                  // wrong memory.  Replaced by buffer_descs, whose entries carry
+                  // backend_id.
+  reserved "dram_memory_descs", "dram_page_size";
+
+  // Buffer descriptors for EVERY live backend, so a first-contact writer can
+  // hydrate without going through AllocateSlot or ResolveKey first.  Each entry
+  // carries the backend_id its buffer_index belongs to; see BufferMemoryDesc.
+  repeated BufferMemoryDesc buffer_descs = 10;
+  // Uniform across backends — BackendRegistry refuses to register a backend
+  // that disagrees, because every wire carrying pages carries ONE page_size.
+  uint64 page_size                       = 11;
 }
 
 // ============================================================
@@ -77,8 +87,11 @@ message AllocateSlotResponse {
   uint64              slot_id        = 2;
   repeated PageLocation       pages  = 3;
   uint64              page_size      = 4;
-  repeated BufferMemoryDesc   descs  = 5;  // dedup'd by buffer_index
+  repeated BufferMemoryDesc   descs  = 5;  // dedup'd by (backend_id, buffer_index)
   uint64              pending_ttl_ms = 6;  // single TTL in the system
+  // Which backend `pages` index into.  One per response, not one per page: a
+  // slot lives entirely in one medium.
+  uint32              backend_id     = 7;
 }
 
 // Commit moves pending → owned.  After a successful commit the peer
@@ -112,6 +125,8 @@ message ResolveKeyResponse {
   uint64 page_size = 3;
   repeated BufferMemoryDesc descs = 4;
   uint64 size      = 5;
+  // Which backend `pages` index into; a key lives entirely in one medium.
+  uint32 backend_id = 6;
 }
 
 // Master-driven eviction.  Idempotent: already-evicted keys produce a
@@ -160,10 +175,13 @@ message BatchAbortSlotsResponse {
 message BatchResolveKeysRequest {
   repeated string keys = 1;
   // When set, the peer omits the per-buffer descriptors from the response: the
-  // client has already hydrated buffer_index -> MemoryDesc from GetPeerInfo
-  // (dram_memory_descs) and the read path looks descriptors up in that cache.
-  // A wrongly-omitted descriptor degrades to a cache miss on the client (the
-  // transfer-build guard rejects the entry), never to a corrupt read.
+  // client has already hydrated (backend_id, buffer_index) -> MemoryDesc from
+  // GetPeerInfo (buffer_descs) and the read path looks descriptors up in that
+  // cache.  A wrongly-omitted descriptor degrades to a cache miss on the client
+  // (the transfer-build guard rejects the entry), never to a corrupt read —
+  // which holds only because GetPeerInfo now publishes EVERY backend's buffers.
+  // While it published one medium's, this flag suppressed the descriptors that
+  // would have corrected the reader, and the miss became a wrong-memory read.
   bool omit_descs = 2;
 }
 // Struct-of-arrays layout.  The previous shape repeated a full ResolveKeyResponse
@@ -176,8 +194,10 @@ message BatchResolveKeysRequest {
 // buffer_index/page_index with page_count[i] delimiting key i's slice.  This
 // removes the per-key sub-message framing and the descriptor duplication.
 message BatchResolveKeysResponse {
-  // Deduplicated buffer descriptors, once per batch (empty when the request set
-  // omit_descs, or when no resolved key was found).
+  // Deduplicated buffer descriptors, once per batch, by (backend_id,
+  // buffer_index) (empty when the request set omit_descs, or when no resolved
+  // key was found).  A batch may now span media, so these are NOT all from one
+  // backend.
   repeated BufferMemoryDesc descs = 1;
   // Peer-global page size.
   uint64 page_size = 2;
@@ -186,6 +206,10 @@ message BatchResolveKeysResponse {
   repeated TierType tier       = 4;
   repeated uint64   size       = 5;
   repeated uint32   page_count = 6;
+  // Which backend key i's pages index into.  Per KEY, not per page: a key lives
+  // entirely in one medium, so this costs one uint32 per key rather than one
+  // per page on the hottest array in the protocol.
+  repeated uint32   backend_id = 9;
   // Flattened page locations across all keys: key i owns the next page_count[i]
   // (buffer_index, page_index) pairs, walking keys in order.
   repeated uint32 buffer_index = 7;

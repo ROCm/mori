@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -106,7 +107,8 @@ class MoriIoEngine final : public TransferEngine, public PeerDirectory {
   void CacheRemoteBuffers(const std::string& node_id,
                           const std::vector<BufferMemoryDescBytes>& descs) override;
   bool HasRemoteBuffers(const std::string& node_id) const override;
-  std::vector<TransferRef> RemoteBufferSnapshot(const std::string& node_id) const override;
+  std::vector<TransferRef> RemoteBufferSnapshot(const std::string& node_id,
+                                                uint32_t backend_id) const override;
 
   const std::string& LocalEngineKey() const { return local_engine_key_; }
 
@@ -116,7 +118,11 @@ class MoriIoEngine final : public TransferEngine, public PeerDirectory {
   struct RemoteNode {
     mori::io::EngineDesc engine_desc;
     bool engine_registered = false;
-    std::vector<TransferRef> buffers;  // indexed by buffer_index
+    // One shelf per peer-side backend, each indexed by that backend's own
+    // buffer_index.  A single flat vector here was the client half of the
+    // mixed-media corruption: two backends both publish a buffer 0, and
+    // whichever descriptor arrived first answered for both.
+    std::array<std::vector<TransferRef>, kMaxBackendsPerPeer> buffers;
   };
 
   // Post `plan` and hand the statuses to `handle`.  Caller owns sequencing.

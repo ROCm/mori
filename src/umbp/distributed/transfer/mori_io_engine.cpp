@@ -315,31 +315,69 @@ void MoriIoEngine::CacheRemoteBuffers(const std::string& node_id,
   std::lock_guard<std::mutex> lock(remotes_mutex_);
   auto& remote = remotes_[node_id];
   for (const auto& d : descs) {
-    if (remote.buffers.size() <= d.buffer_index) remote.buffers.resize(d.buffer_index + 1);
-    if (remote.buffers[d.buffer_index].HasMemoryDesc()) continue;  // already hydrated
+    if (d.backend_id >= kMaxBackendsPerPeer) {
+      MORI_UMBP_ERROR("[MoriIoEngine] CacheRemoteBuffers: bad backend_id={} from '{}' (max {})",
+                      d.backend_id, node_id, kMaxBackendsPerPeer);
+      continue;
+    }
+    auto& shelf = remote.buffers[d.backend_id];
+    if (shelf.size() <= d.buffer_index) shelf.resize(d.buffer_index + 1);
     if (d.desc_bytes.empty()) continue;
+
+    mori::io::MemoryDesc mem;
     try {
       auto handle =
           msgpack::unpack(reinterpret_cast<const char*>(d.desc_bytes.data()), d.desc_bytes.size());
-      remote.buffers[d.buffer_index] = TransferRef::Remote(handle.get().as<mori::io::MemoryDesc>());
+      mem = handle.get().as<mori::io::MemoryDesc>();
     } catch (const std::exception& e) {
-      MORI_UMBP_ERROR("[MoriIoEngine] CacheRemoteBuffers: bad desc from '{}' buffer_index={}: {}",
-                      node_id, d.buffer_index, e.what());
+      MORI_UMBP_ERROR(
+          "[MoriIoEngine] CacheRemoteBuffers: bad desc from '{}' backend={} buffer_index={}: {}",
+          node_id, d.backend_id, d.buffer_index, e.what());
+      continue;
     }
+
+    if (shelf[d.buffer_index].HasMemoryDesc()) {
+      // Already hydrated.  First-write-wins is only safe while a descriptor is
+      // immutable for a given address — a CHANGED descriptor means two buffers
+      // are claiming one address, which does not fail loudly on its own: the
+      // reader would keep planning RDMA against valid-looking memory and return
+      // the wrong bytes as a hit.  That is exactly how the pre-backend_id
+      // collision stayed invisible, so say so and keep the incumbent.
+      const auto& held = shelf[d.buffer_index].mem;
+      if (!(held == mem)) {
+        MORI_UMBP_ERROR(
+            "[MoriIoEngine] CacheRemoteBuffers: conflicting desc from '{}' backend={} "
+            "buffer_index={} (held id={} data={:#x} size={}, offered id={} data={:#x} size={}); "
+            "keeping the held one — the peer is publishing two buffers at one address",
+            node_id, d.backend_id, d.buffer_index, held.id, held.data, held.size, mem.id, mem.data,
+            mem.size);
+      }
+      continue;
+    }
+    shelf[d.buffer_index] = TransferRef::Remote(std::move(mem));
   }
 }
 
 bool MoriIoEngine::HasRemoteBuffers(const std::string& node_id) const {
   std::lock_guard<std::mutex> lock(remotes_mutex_);
   auto it = remotes_.find(node_id);
-  return it != remotes_.end() && !it->second.buffers.empty();
+  if (it == remotes_.end()) return false;
+  // True means "this peer's buffers are hydrated", which is what the caller
+  // turns into BatchResolveKeysRequest.omit_descs.  GetPeerInfo publishes every
+  // backend at once, so any non-empty shelf means the whole handshake landed.
+  for (const auto& shelf : it->second.buffers) {
+    if (!shelf.empty()) return true;
+  }
+  return false;
 }
 
-std::vector<TransferRef> MoriIoEngine::RemoteBufferSnapshot(const std::string& node_id) const {
+std::vector<TransferRef> MoriIoEngine::RemoteBufferSnapshot(const std::string& node_id,
+                                                            uint32_t backend_id) const {
+  if (backend_id >= kMaxBackendsPerPeer) return {};
   std::lock_guard<std::mutex> lock(remotes_mutex_);
   auto it = remotes_.find(node_id);
   if (it == remotes_.end()) return {};
-  return it->second.buffers;
+  return it->second.buffers[backend_id];
 }
 
 // ---------------------------------------------------------------------------

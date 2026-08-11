@@ -42,6 +42,93 @@
 
 namespace mori::umbp {
 
+// ---------------------------------------------------------------------------
+//  PageMemorySource — the ONE medium-specific part of a paged backend
+//
+//  PageBackend's class comment has always claimed it serves "DRAM or HBM", and
+//  everything below the ownership line genuinely was medium-agnostic: the
+//  bitmap allocator, slot lifecycle, event outbox, reaper, read leases and copy
+//  pins never look at the tier.  But Init/Shutdown/BuildBufferRefs hardcoded
+//  HostMemAllocator, MemoryLocationType::CPU and device=-1, so the claim did not
+//  survive contact with an actual second medium.
+//
+//  This interface is that hardcoding, lifted.  It holds exactly the three things
+//  that differ per medium, and nothing else:
+//    * how the pool is allocated and released
+//    * the location type a descriptor cannot recover
+//    * the device a descriptor cannot recover
+//
+//  This is the same rule the MediumBackend header states for the backend/
+//  transfer split, applied one level down: registration is the conversion from
+//  medium-specific to medium-agnostic, and belongs to whoever allocated.  A
+//  PageMemorySource is "whoever allocated"; PageBackend is everything after.
+//
+//  Adding a paged medium is therefore implementing FIVE methods, not
+//  reimplementing MediumBackend's twenty-three.
+class PageMemorySource {
+ public:
+  virtual ~PageMemorySource() = default;
+
+  PageMemorySource(const PageMemorySource&) = delete;
+  PageMemorySource& operator=(const PageMemorySource&) = delete;
+
+  struct Buffer {
+    void* base = nullptr;
+    // Usable size.  May EXCEED the requested size (host hugepage rounding) —
+    // PageBackend publishes this, not the request, so the extra is allocatable.
+    uint64_t size = 0;
+  };
+
+  // Allocate one buffer per entry of `sizes`, appending to `out`.  All or
+  // nothing: on failure the implementation must release whatever it took in
+  // this call and return false, leaving `out` untouched.  Zero-sized entries
+  // are skipped, so `out` may be shorter than `sizes`.
+  virtual bool Allocate(const std::vector<uint64_t>& sizes, std::vector<Buffer>* out) = 0;
+
+  // Free everything Allocate handed out.  Idempotent; must tolerate being
+  // called after a failed Allocate and without one.
+  virtual void Release() = 0;
+
+  // The facts a descriptor cannot recover, supplied to RegisterMemory and
+  // mirrored into every TransferRef this backend publishes.
+  virtual mori::io::MemoryLocationType LocationType() const = 0;
+  virtual int Device() const = 0;
+
+  virtual const char* Name() const = 0;
+
+ protected:
+  PageMemorySource() = default;
+};
+
+// Host DRAM: anonymous or hugetlb pages via HostMemAllocator, optionally
+// NUMA-bound and prefaulted.  loc=CPU, device=-1.  This is verbatim what
+// PageBackend::Init used to do inline.
+class HostPageMemorySource final : public PageMemorySource {
+ public:
+  struct Options {
+    bool use_hugepages = false;
+    uint64_t hugepage_size = 2ULL * 1024 * 1024;
+    int numa_node = -1;
+    bool prefault = true;
+  };
+
+  explicit HostPageMemorySource(Options opts) : opts_(opts) {}
+  ~HostPageMemorySource() override { Release(); }
+
+  bool Allocate(const std::vector<uint64_t>& sizes, std::vector<Buffer>* out) override;
+  void Release() override;
+
+  mori::io::MemoryLocationType LocationType() const override {
+    return mori::io::MemoryLocationType::CPU;
+  }
+  int Device() const override { return -1; }
+  const char* Name() const override { return "HostPageMemorySource"; }
+
+ private:
+  Options opts_;
+  std::vector<HostBufferHandle> handles_;
+};
+
 // One medium's (DRAM or HBM) peer-owned allocator + key map.  One instance ==
 // one medium: the tier is the identity of the object (design doc §3), which is
 // why no method below takes a TierType — PeerDramAllocator's internal
@@ -114,9 +201,20 @@ class PageBackend : public MediumBackend {
               std::chrono::milliseconds reaper_interval = std::chrono::milliseconds{200});
 
   // Production constructor: no memory yet.  Init(TransferEngine*) performs
-  // the actual self-allocation + registration.
+  // the actual self-allocation + registration.  Sugar for the
+  // PageMemorySource constructor below with a HostPageMemorySource — kept so
+  // existing DRAM call sites and their tests read unchanged.
   PageBackend(TierType tier, uint64_t page_size, OwnershipConfig ownership,
               std::chrono::milliseconds pending_ttl,
+              std::chrono::milliseconds read_lease_ttl = std::chrono::milliseconds{500},
+              std::chrono::milliseconds reaper_interval = std::chrono::milliseconds{200});
+
+  // General production constructor: any medium, supplied as a PageMemorySource.
+  // This is the one Init() actually works against; the OwnershipConfig overload
+  // funnels into it, so DRAM and HBM share a single allocation/registration
+  // path rather than two that must be kept in step.
+  PageBackend(TierType tier, uint64_t page_size, std::unique_ptr<PageMemorySource> source,
+              std::vector<uint64_t> buffer_sizes, std::chrono::milliseconds pending_ttl,
               std::chrono::milliseconds read_lease_ttl = std::chrono::milliseconds{500},
               std::chrono::milliseconds reaper_interval = std::chrono::milliseconds{200});
 
@@ -347,10 +445,20 @@ class PageBackend : public MediumBackend {
   std::mutex reaper_cv_mutex_;
   std::condition_variable reaper_cv_;
 
-  // ---- Ownership (only set when constructed via OwnershipConfig) ----
-  std::optional<OwnershipConfig> ownership_;
+  // ---- Ownership (only set by the self-allocating constructors) ----
+  // Null for the pre-configured TierConfig constructor, which is handed buffers
+  // it does not own.  Non-null for both production constructors, so Init() has
+  // exactly one path regardless of medium.
+  std::unique_ptr<PageMemorySource> source_;
+  std::vector<uint64_t> source_buffer_sizes_;
+
+  // Mirrored from source_ at construction (defaults suit the TierConfig ctor,
+  // which is host memory by convention).  Read by BuildBufferRefs, which runs
+  // for both constructors and so cannot reach through source_ unconditionally.
+  mori::io::MemoryLocationType buffer_loc_ = mori::io::MemoryLocationType::CPU;
+  int buffer_device_ = -1;
+
   bool owns_memory_ = false;  // true once Init() has self-allocated
-  std::vector<HostBufferHandle> owned_buffer_handles_;
   std::vector<TransferRef> owned_refs_;
   MemoryRegistrar* registrar_ = nullptr;  // non-owning; set at Init(), used at Shutdown()
 };

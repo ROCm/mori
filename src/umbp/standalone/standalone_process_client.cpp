@@ -467,7 +467,14 @@ void StandaloneProcessClient::Close() {
   channel_.reset();
 }
 
-bool StandaloneProcessClient::RegisterMemory(uintptr_t ptr, size_t size) {
+bool StandaloneProcessClient::RegisterMemory(uintptr_t ptr, size_t size,
+                                             mori::io::MemoryLocationType loc, int device) {
+  if (loc != mori::io::MemoryLocationType::CPU) {
+    throw std::runtime_error(
+        "StandaloneProcessClient::RegisterMemory: only CPU (AnonymousShm-backed host) buffers "
+        "are supported; got loc=" +
+        std::to_string(static_cast<uint32_t>(loc)) + " device=" + std::to_string(device));
+  }
   if (closing_) return false;
   std::unique_lock lk(op_mutex_);
   if (closed_) return false;

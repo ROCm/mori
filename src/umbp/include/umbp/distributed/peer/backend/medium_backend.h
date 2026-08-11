@@ -32,6 +32,7 @@
 #include <utility>
 #include <vector>
 
+#include "mori/utils/mori_log.hpp"
 #include "umbp/distributed/transfer/transfer_engine.h"
 #include "umbp/distributed/types.h"
 
@@ -312,12 +313,69 @@ class MediumBackend {
 // with every medium equivalent there is no priority to express.
 class BackendRegistry {
  public:
+  // Defined in types.h so the transfer layer can size its per-backend buffer
+  // shelves without depending on this header (see kMaxBackendsPerPeer).
+  static constexpr uint32_t kMaxBackends = kMaxBackendsPerPeer;
+
   // Replaces any backend already registered for that tier.  Null is ignored.
-  void Register(std::unique_ptr<MediumBackend> backend) {
-    if (backend == nullptr) return;
+  //
+  // Assigns the backend its peer-local id here.  The id is the missing half of
+  // a buffer address: buffer_index is backend-local (every backend numbers from
+  // 0, and each publishes exactly one buffer today, so index 0 collides across
+  // every live medium), and the wire and the reader's cache both key on the
+  // pair.  The backend is never told its id — the peer service stamps it at the
+  // wire boundary — so a new backend cannot get this wrong by forgetting to
+  // participate.
+  //
+  // Returns false when the backend cannot join this peer's address space, which
+  // PoolClient::Init treats as fatal.  Better a refused startup than a node
+  // that serves reads out of the wrong medium.
+  bool Register(std::unique_ptr<MediumBackend> backend) {
+    if (backend == nullptr) return true;
     const TierType tier = backend->Tier();
+
+    // Every wire that carries pages carries ONE page_size
+    // (GetPeerInfoResponse.page_size, BatchResolveKeysResponse.page_size), and
+    // SsdBackend::Config already documents that its page size must match the
+    // others.  Enforce that documented requirement instead of trusting it: a
+    // mismatch produces page arithmetic that looks consistent and reads that
+    // are not.
+    if (!backends_.empty() && backend->PageSize() != page_size_) {
+      MORI_UMBP_ERROR(
+          "[BackendRegistry] backend tier={} page_size={} disagrees with the peer's page_size={}; "
+          "every medium on a node must agree",
+          static_cast<int>(tier), backend->PageSize(), page_size_);
+      return false;
+    }
+
+    auto existing = id_by_tier_.find(tier);
+    uint32_t id;
+    if (existing != id_by_tier_.end()) {
+      id = existing->second;  // replacing a tier reuses its id, keeping ids dense
+    } else {
+      if (next_backend_id_ >= kMaxBackends) {
+        MORI_UMBP_ERROR("[BackendRegistry] too many backends (max {})", kMaxBackends);
+        return false;
+      }
+      id = next_backend_id_++;
+      id_by_tier_[tier] = id;
+    }
+
+    page_size_ = backend->PageSize();
     backends_[tier] = std::move(backend);
+    return true;
   }
+
+  // The backend's peer-local id, as stamped onto every buffer descriptor and
+  // page set it produces.  kMaxBackends for an unregistered backend.
+  uint32_t BackendId(const MediumBackend* backend) const {
+    if (backend == nullptr) return kMaxBackends;
+    auto it = id_by_tier_.find(backend->Tier());
+    return it == id_by_tier_.end() ? kMaxBackends : it->second;
+  }
+
+  // Uniform across every registered backend (see Register).  Zero when empty.
+  uint64_t PageSize() const { return page_size_; }
 
   // Null if the tier has no live backend on this peer — a normal condition
   // (e.g. a node configured with DRAM only), not an error.  Callers respond to
@@ -340,6 +398,9 @@ class BackendRegistry {
 
  private:
   std::map<TierType, std::unique_ptr<MediumBackend>> backends_;
+  std::map<TierType, uint32_t> id_by_tier_;
+  uint32_t next_backend_id_ = 0;
+  uint64_t page_size_ = 0;
 };
 
 // ---------------------------------------------------------------------------

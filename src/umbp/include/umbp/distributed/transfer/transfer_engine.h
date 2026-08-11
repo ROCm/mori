@@ -192,17 +192,27 @@ class PeerDirectory {
   // Drop everything known about a peer, so the next access re-handshakes.
   virtual void ForgetRemote(const std::string& node_id) = 0;
 
-  // Learn the endpoints a peer published, by buffer_index.  Idempotent: an
-  // index already known is left alone, so a stale descriptor cannot overwrite a
-  // live one.
+  // Learn the endpoints a peer published, by (backend_id, buffer_index).
+  // Idempotent: an address already known is left alone, so a stale descriptor
+  // cannot overwrite a live one.
+  //
+  // The address is the PAIR.  buffer_index is backend-local — every backend on
+  // a peer numbers from 0, and each publishes exactly one buffer today — so
+  // caching by index alone let one medium's descriptor stand in for another's
+  // and served reads out of the wrong memory.  See BufferMemoryDesc in
+  // umbp.proto.
   virtual void CacheRemoteBuffers(const std::string& node_id,
                                   const std::vector<BufferMemoryDescBytes>& descs) = 0;
   virtual bool HasRemoteBuffers(const std::string& node_id) const = 0;
 
-  // Every known endpoint for a peer, indexed by buffer_index.  Taken ONCE per
-  // batch so a transfer-build loop never locks per page; an index that was
-  // never learned comes back invalid and the caller degrades that key to a miss.
-  virtual std::vector<TransferRef> RemoteBufferSnapshot(const std::string& node_id) const = 0;
+  // Every known endpoint for ONE of a peer's backends, indexed by that
+  // backend's own buffer_index.  Taken ONCE per batch so a transfer-build loop
+  // never locks per page; a batch's pages may span backends, so it is taken per
+  // distinct backend_id in the batch rather than once per peer.  An index that
+  // was never learned comes back invalid and the caller degrades that key to a
+  // miss.
+  virtual std::vector<TransferRef> RemoteBufferSnapshot(const std::string& node_id,
+                                                        uint32_t backend_id) const = 0;
 
  protected:
   PeerDirectory() = default;

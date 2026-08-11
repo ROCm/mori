@@ -24,6 +24,7 @@
 #include <grpcpp/grpcpp.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -42,10 +43,13 @@
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/env_time.h"
 #include "umbp/distributed/master/master_metrics.h"
+#include "umbp/distributed/peer/backend/hbm_backend.h"
 #include "umbp/distributed/peer/backend/page_backend.h"
+#include "umbp/distributed/peer/backend/ssd_backend.h"
 #include "umbp/distributed/peer/batch_resolve_codec.h"
 #include "umbp/distributed/peer/peer_service.h"
 #include "umbp/distributed/transfer/composite_transfer_engine.h"
+#include "umbp/distributed/transfer/hbm_copy_engine.h"
 #include "umbp/distributed/transfer/local_copy_engine.h"
 #include "umbp/distributed/transfer/mori_io_engine.h"
 #include "umbp_peer.grpc.pb.h"
@@ -187,12 +191,14 @@ PoolClient::SlotPlan FromAllocateSlotResponse(const ::umbp::AllocateSlotResponse
   PoolClient::SlotPlan p;
   p.slot_id = resp.slot_id();
   p.page_size = resp.page_size();
+  p.backend_id = resp.backend_id();
   p.pages.reserve(resp.pages_size());
   for (const auto& pp : resp.pages()) p.pages.push_back({pp.buffer_index(), pp.page_index()});
   p.descs.reserve(resp.descs_size());
   for (const auto& d : resp.descs()) {
     BufferMemoryDescBytes b;
     b.buffer_index = d.buffer_index();
+    b.backend_id = d.backend_id();
     b.desc_bytes.assign(d.desc().begin(), d.desc().end());
     p.descs.push_back(std::move(b));
   }
@@ -265,6 +271,12 @@ bool PoolClient::Init() {
   // holds TransferEngine / MemoryRegistrar / PeerDirectory.
   auto composite = std::make_unique<CompositeTransferEngine>();
   composite->AddEngine(std::make_unique<LocalCopyEngine>());
+  // Both-local pairs with a GPU endpoint.  Disjoint from LocalCopyEngine (which
+  // requires both sides CPU) and from MoriIoEngine (which requires exactly one
+  // side remote), so this is registration order as documentation, not as a
+  // tie-break — but it must come before the wire engine on principle, since an
+  // HBM pair that reached mori-io would be refused rather than served slowly.
+  composite->AddEngine(std::make_unique<HbmCopyEngine>());
   if (!config_.io_engine.host.empty()) {
     mori::io::IOEngineConfig io_cfg;
     io_cfg.host = config_.io_engine.host;
@@ -307,7 +319,57 @@ bool PoolClient::Init() {
     initialized_ = false;
     return false;
   }
-  registry_.Register(std::move(dram));
+  if (!registry_.Register(std::move(dram))) {
+    initialized_ = false;
+    return false;
+  }
+
+  // HBM: the second medium, and the proof that adding one is a registration
+  // rather than an edit.  Everything below this block — routing, peer service,
+  // heartbeat, the batch executors — was written against BackendRegistry and
+  // needed no change to serve it.
+  if (config_.hbm.enabled && !config_.hbm.buffer_sizes.empty()) {
+    auto hbm = MakeHbmBackend(page_size, config_.hbm.device, config_.hbm.buffer_sizes,
+                              /*pending_ttl=*/std::chrono::milliseconds{30000},
+                              /*read_lease_ttl=*/DramReadLeaseTtl());
+    if (!hbm->Init(static_cast<MemoryRegistrar*>(transfer_engine_.get()))) {
+      MORI_UMBP_ERROR("[PoolClient] HBM backend Init failed on device {}", config_.hbm.device);
+      initialized_ = false;
+      return false;
+    }
+    if (!registry_.Register(std::move(hbm))) {
+      initialized_ = false;
+      return false;
+    }
+  }
+
+  // SSD: the third medium, and the one that is genuinely NOT like the others —
+  // its bytes are not addressable, so it publishes a registered host staging
+  // arena and spills behind it (see ssd_backend.h).  Phase 0 unwired SSD from
+  // the data plane precisely so it could come back as a backend rather than as
+  // a special case threaded through PoolClient; this block is that return, and
+  // it is the same three lines the other two media take.
+  if (config_.ssd.enabled) {
+    SsdBackend::Config ssd_cfg;
+    ssd_cfg.page_size = page_size;
+    ssd_cfg.staging_pages = config_.ssd_staging_buffer_slots > 0
+                                ? static_cast<uint32_t>(config_.ssd_staging_buffer_slots)
+                                : 16;
+    ssd_cfg.ssd = config_.ssd;
+    ssd_cfg.read_lease_ttl = DramReadLeaseTtl();
+
+    auto ssd = MakeSsdBackend(std::move(ssd_cfg));
+    if (!ssd->Init(static_cast<MemoryRegistrar*>(transfer_engine_.get()))) {
+      MORI_UMBP_ERROR("[PoolClient] SSD backend Init failed");
+      initialized_ = false;
+      return false;
+    }
+    if (!registry_.Register(std::move(ssd))) {
+      initialized_ = false;
+      return false;
+    }
+  }
+
   master_client_->SetBackendRegistry(&registry_);
 
   // Pack engine_desc for master registration.
@@ -441,7 +503,8 @@ BackendRegistry& PoolClient::Backends() { return registry_; }
 //  Memory registration
 // ---------------------------------------------------------------------------
 
-bool PoolClient::RegisterMemory(void* ptr, size_t size) {
+bool PoolClient::RegisterMemory(void* ptr, size_t size, mori::io::MemoryLocationType loc,
+                                int device) {
   if (!transfer_engine_) {
     MORI_UMBP_ERROR("[PoolClient] RegisterMemory: transfer engine not available");
     return false;
@@ -454,14 +517,8 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size) {
   for (auto& reg : registered_regions_) {
     if (reg.base == ptr) return true;
   }
-  // NOTE (design doc §2, "Not part of this"): CPU is hardcoded here, which is
-  // wrong for a GPU src/dst (SGLang HiCache KV pages).  That is a property of
-  // the CALLER's allocation, not of any storage medium, so the fix is a
-  // location parameter on this public API — a different axis from this phase.
   registered_regions_.push_back(
-      {ptr, size,
-       transfer_engine_->RegisterMemory(ptr, size, mori::io::MemoryLocationType::CPU,
-                                        /*device=*/-1)});
+      {ptr, size, transfer_engine_->RegisterMemory(ptr, size, loc, device)});
   return true;
 }
 
@@ -1082,14 +1139,27 @@ bool PoolClient::BuildRemotePutTransfers(std::vector<RemotePutEntry>& entries,
                                          std::vector<TransferItem>* items) {
   items->clear();
 
-  // Hydrate every entry's descs first, then snapshot the peer's buffers ONCE:
-  // the loop below indexes the snapshot instead of taking the engine's remote
-  // lock per page.  A concurrent hydrate can only add buffers, so a snapshot
-  // taken here is never stale for the indices these entries reference.
+  // Hydrate every entry's descs first, then snapshot the peer's buffers once
+  // PER BACKEND the batch touches: the loop below indexes a snapshot instead of
+  // taking the engine's remote lock per page.  A batch may span media (each
+  // item carries its own route.tier), and buffer_index is backend-local, so one
+  // snapshot per peer would index the wrong medium's buffers.  A concurrent
+  // hydrate can only add buffers, so a snapshot taken here is never stale for
+  // the indices these entries reference.
   for (const auto& entry : entries) {
     if (!entry.plan.descs.empty()) peer_directory_->CacheRemoteBuffers(node_id, entry.plan.descs);
   }
-  const std::vector<TransferRef> remote = peer_directory_->RemoteBufferSnapshot(node_id);
+  std::array<std::vector<TransferRef>, kMaxBackendsPerPeer> snapshots;
+  std::array<bool, kMaxBackendsPerPeer> snapped{};
+  auto buffers_for = [&](uint32_t backend_id) -> const std::vector<TransferRef>& {
+    static const std::vector<TransferRef> kNone;
+    if (backend_id >= kMaxBackendsPerPeer) return kNone;
+    if (!snapped[backend_id]) {
+      snapshots[backend_id] = peer_directory_->RemoteBufferSnapshot(node_id, backend_id);
+      snapped[backend_id] = true;
+    }
+    return snapshots[backend_id];
+  };
 
   for (size_t idx = 0; idx < entries.size(); ++idx) {
     auto& entry = entries[idx];
@@ -1097,6 +1167,7 @@ bool PoolClient::BuildRemotePutTransfers(std::vector<RemotePutEntry>& entries,
     // engine's decision; this only names the endpoint.
     const auto [src, src_base] =
         UserBufferRef(const_cast<void*>(entry.item->src), entry.item->size);
+    const std::vector<TransferRef>& remote = buffers_for(entry.plan.backend_id);
 
     std::vector<TransferItem> entry_items;
     entry_items.reserve(entry.plan.pages.size());
@@ -1105,9 +1176,9 @@ bool PoolClient::BuildRemotePutTransfers(std::vector<RemotePutEntry>& entries,
       if (page.buffer_index >= remote.size() || !remote[page.buffer_index].HasMemoryDesc()) {
         MORI_UMBP_ERROR(
             "[PoolClient] BuildRemotePutTransfers: peer published no buffer, "
-            "key='{}' buffer_index={} peer_buffers={} page_index={}",
+            "key='{}' backend={} buffer_index={} peer_buffers={} page_index={}",
             (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"},
-            page.buffer_index, remote.size(), page.page_index);
+            entry.plan.backend_id, page.buffer_index, remote.size(), page.page_index);
         entry.failed = true;
         entry_items.clear();
         break;
@@ -1498,6 +1569,9 @@ bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
     entry.result_index = item.index;
     entry.item = &item;
     entry.plan.page_size = decoded.page_size;
+    // Per key, because a resolve batch may now be served from several media at
+    // once; the pages below are indices into THIS backend's buffers.
+    entry.plan.backend_id = key.backend_id;
     entry.plan.pages = std::move(decoded.keys[i].pages);
     // Descriptors were hydrated batch-level above; the per-entry plan carries
     // none (BuildRemoteGetTransfers' EnsureBufferDescsCached call is a no-op on
@@ -1514,16 +1588,29 @@ bool PoolClient::BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries,
   items->clear();
 
   // Batch-level descs were already hydrated by PrepareRemoteGetEntries; any
-  // per-entry ones are folded in here before the single snapshot (see
-  // BuildRemotePutTransfers for why one snapshot beats a lock per page).
+  // per-entry ones are folded in here before the snapshots (see
+  // BuildRemotePutTransfers for why one snapshot per backend beats a lock per
+  // page — and why one snapshot per PEER would index the wrong medium now that
+  // a resolve batch can span media).
   for (const auto& entry : entries) {
     if (!entry.plan.descs.empty()) peer_directory_->CacheRemoteBuffers(node_id, entry.plan.descs);
   }
-  const std::vector<TransferRef> remote = peer_directory_->RemoteBufferSnapshot(node_id);
+  std::array<std::vector<TransferRef>, kMaxBackendsPerPeer> snapshots;
+  std::array<bool, kMaxBackendsPerPeer> snapped{};
+  auto buffers_for = [&](uint32_t backend_id) -> const std::vector<TransferRef>& {
+    static const std::vector<TransferRef> kNone;
+    if (backend_id >= kMaxBackendsPerPeer) return kNone;
+    if (!snapped[backend_id]) {
+      snapshots[backend_id] = peer_directory_->RemoteBufferSnapshot(node_id, backend_id);
+      snapped[backend_id] = true;
+    }
+    return snapshots[backend_id];
+  };
 
   for (size_t idx = 0; idx < entries.size(); ++idx) {
     auto& entry = entries[idx];
     const auto [dst, dst_base] = UserBufferRef(entry.item->dst, entry.item->size);
+    const std::vector<TransferRef>& remote = buffers_for(entry.plan.backend_id);
 
     std::vector<TransferItem> entry_items;
     entry_items.reserve(entry.plan.pages.size());
@@ -1532,9 +1619,9 @@ bool PoolClient::BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries,
       if (page.buffer_index >= remote.size() || !remote[page.buffer_index].HasMemoryDesc()) {
         MORI_UMBP_ERROR(
             "[PoolClient] BuildRemoteGetTransfers: peer published no buffer, "
-            "key='{}' buffer_index={} peer_buffers={} page_index={}",
+            "key='{}' backend={} buffer_index={} peer_buffers={} page_index={}",
             (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"},
-            page.buffer_index, remote.size(), page.page_index);
+            entry.plan.backend_id, page.buffer_index, remote.size(), page.page_index);
         entry.failed = true;
         entry_items.clear();
         break;
@@ -1683,12 +1770,19 @@ bool PoolClient::EnsurePeerServiceConnection(PeerConnection& peer) {
     if (peer_directory_ != nullptr) {
       if (!peer_directory_->EnsureRemoteEngine(peer.node_id, resp.engine_desc())) return false;
 
+      // Every backend's buffers arrive in one list, each entry naming the
+      // backend its buffer_index belongs to.  Before backend_id, this list held
+      // one medium's buffers and the rest were unreachable — yet HasRemoteBuffers
+      // still went true, so the next resolve asked the peer to omit descriptors
+      // and the missing media's pages were read against the published one's
+      // memory.
       std::vector<BufferMemoryDescBytes> descs;
-      descs.reserve(resp.dram_memory_descs_size());
-      for (const auto& d : resp.dram_memory_descs()) {
+      descs.reserve(resp.buffer_descs_size());
+      for (const auto& d : resp.buffer_descs()) {
         if (d.desc().empty()) continue;
         BufferMemoryDescBytes b;
         b.buffer_index = d.buffer_index();
+        b.backend_id = d.backend_id();
         b.desc_bytes.assign(d.desc().begin(), d.desc().end());
         descs.push_back(std::move(b));
       }

@@ -118,6 +118,12 @@ bool PeerSsdManager::Exists(const std::string& key) const {
   return owned_.find(key) != owned_.end();
 }
 
+uint64_t PeerSsdManager::SizeOf(const std::string& key) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = owned_.find(key);
+  return it == owned_.end() ? 0 : it->second.size;
+}
+
 void PeerSsdManager::TouchLocked(const std::string& key) {
   auto it = owned_.find(key);
   if (it == owned_.end()) return;
