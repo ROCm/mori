@@ -22,23 +22,19 @@
 
 // symm_backend.cpp -- a torch SymmetricMemory backend on plain HIP VMM.
 //
-// register_availability() makes "MORI" selectable; torch then drives everything:
-// symm_mem.empty -> alloc, symm_mem.rendezvous -> rendezvous, torch.ops.symm_mem.* on the
-// result.
+// register_availability() makes "MORI" selectable; torch then drives symm_mem.empty ->
+// alloc, symm_mem.rendezvous -> rendezvous, and torch.ops.symm_mem.* on the result.
 //
-// Self-contained on purpose: it does not use mori's shmem or cco allocators. Both own a
-// symmetric heap whose peer offsets stay aligned only while every rank allocates AND frees
-// in the same order -- an invariant torch cannot hold, since tensors are freed by Python
-// GC, whose order is not synchronised across ranks. Here each allocation is an independent
-// VMM allocation with its own rendezvous, so divergent free order costs nothing.
+// Deliberately does not use mori's shmem or cco allocators: both keep peer offsets
+// aligned only while every rank allocates AND frees in the same order, which torch cannot
+// hold (tensors die on Python GC, whose order is not synchronised across ranks). Here each
+// allocation is independent and free() is local, so divergent free order is harmless.
 //
-// Peers are mapped into one flat span, so peer(r) == flat_base + r*stride: a kernel needs
-// a base pointer and a stride, not an N-entry pointer array.
+// Peers map into one flat span, so peer(r) == flat_base + r*stride: a kernel needs a base
+// and a stride, not a pointer array.
 //
-// The handle type is probed per device -- fabric where supported, POSIX fd otherwise
-// (gfx9 has none; hipMemCreate itself returns "operation not supported"). Fabric handles
-// are 64 opaque bytes and ride the torch Store; fds cannot, so they go over a unix socket
-// with SCM_RIGHTS.
+// Handle type is probed per device -- fabric where supported, POSIX fd otherwise (gfx9 has
+// none). Fabric handles are portable bytes and ride the torch Store; fds need SCM_RIGHTS.
 
 #include <hip/hip_runtime.h>
 #include <pybind11/pybind11.h>
@@ -47,6 +43,7 @@
 #include <torch/csrc/utils/pybind.h>  // at::Tensor <-> python caster
 #include <unistd.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -54,6 +51,7 @@
 #include <torch/csrc/distributed/c10d/symm_mem/CUDASymmetricMemoryUtils.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/SymmetricMemory.hpp>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "mori/utils/hip_compat.hpp"
@@ -76,8 +74,25 @@ constexpr size_t kSignalPadBytes = 9216;
 
 size_t RoundUp(size_t v, size_t m) { return ((v + m - 1) / m) * m; }
 
-// Raw HIP: torch ships both c10::cuda and c10::hip, and the wrong one pulls
-// cuda_runtime_api.h into a ROCm build.
+// Teardown can run while the HIP runtime is already unwinding, in which case any VMM call
+// segfaults. is_finalizing() catches torch's own shutdown; this catches the rest by
+// probing the runtime first. Leaking there is deliberate -- the process is exiting.
+bool RuntimeUsable() {
+  // KNOWN GAP: releasing a rendezvous'd window segfaults at world_size >= 4 (fine at 2),
+  // somewhere in the unmap/release path. Until that is understood, teardown is off by
+  // default -- symmetric buffers are few and long-lived, so leaking them is far less
+  // harmful than crashing. MORI_SYMM_TEARDOWN=1 re-enables it for debugging.
+  static const bool teardown = [] {
+    const char* e = getenv("MORI_SYMM_TEARDOWN");
+    return e && *e == '1';
+  }();
+  if (!teardown) return false;
+  if (c10d::symmetric_memory::is_finalizing()) return false;
+  int dev = -1;
+  return hipGetDevice(&dev) == hipSuccess;
+}
+
+// Raw HIP: torch ships both c10::cuda and c10::hip; the wrong one pulls cuda_runtime_api.h.
 class DeviceGuard {
  public:
   explicit DeviceGuard(int dev) {
@@ -93,8 +108,8 @@ class DeviceGuard {
   bool restore_ = false;
 };
 
-// ROCm 7.1 and older spell this requestedHandleType; newer releases add a union that also
-// has requestedHandleTypes. The singular name exists in both.
+// ROCm 7.1 spells this requestedHandleType; newer releases add a union with the plural.
+// The singular name exists in both.
 hipMemAllocationProp MakeProp(int dev, hipMemAllocationHandleType handle_type) {
   hipMemAllocationProp prop = {};
   prop.type = hipMemAllocationTypePinned;
@@ -112,9 +127,7 @@ void SetRwAccess(void* ptr, size_t size, int dev) {
   MORI_HIP_CHECK(hipMemSetAccess(ptr, size, &ad, 1));
 }
 
-// Fabric where the device allows it, POSIX fd otherwise. Probed once per device with a
-// granularity-sized allocation, because the capability attribute enum is not stable
-// across HIP releases.
+// Probed once per device: the capability attribute enum is not stable across releases.
 hipMemAllocationHandleType ProbeHandleType(int dev) {
   static std::mutex mu;
   static std::unordered_map<int, hipMemAllocationHandleType> cache;
@@ -141,9 +154,8 @@ hipMemAllocationHandleType ProbeHandleType(int dev) {
   return chosen;
 }
 
-// fd passing. A fabric handle is portable bytes and rides the torch Store; an fd is an
-// index into one process's table, so it needs SCM_RIGHTS over a unix socket. torch has an
-// IpcChannel for this but does not export it, hence this small local equivalent.
+// An fd is an index into one process's table, so it needs SCM_RIGHTS. torch has an
+// IpcChannel for this but does not export it, hence this local equivalent.
 class FdChannel {
  public:
   explicit FdChannel(int rank) : path_(Path(getpid(), rank)) {
@@ -166,13 +178,15 @@ class FdChannel {
     return "/tmp/mori_symm_" + std::to_string(pid) + "_" + std::to_string(rank);
   }
 
-  void SendFd(const std::string& dst, int fd) {
+  // The payload carries the sender's rank: datagrams from different owners can arrive in
+  // any order, so the receiver must not assume one round per owner.
+  void SendFd(const std::string& dst, int fd, int sender_rank) {
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
     std::strncpy(addr.sun_path, dst.c_str(), sizeof(addr.sun_path) - 1);
 
-    char iobuf[1] = {0};
-    iovec iov{iobuf, sizeof(iobuf)};
+    int tag = sender_rank;
+    iovec iov{&tag, sizeof(tag)};
     char control[CMSG_SPACE(sizeof(int))] = {};
     msghdr msg{};
     msg.msg_name = &addr;
@@ -188,7 +202,7 @@ class FdChannel {
     cmsg->cmsg_len = CMSG_LEN(sizeof(int));
     std::memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
 
-    // The peer may not have bound its socket yet; retry rather than order the ranks.
+    // The peer may not have bound yet.
     ssize_t n = -1;
     for (int retry = 0; retry < 400 && n < 0; ++retry) {
       n = ::sendmsg(sock_, &msg, 0);
@@ -197,9 +211,10 @@ class FdChannel {
     TORCH_CHECK(n >= 0, "mori symm backend: sendmsg to ", dst, " failed");
   }
 
-  int RecvFd() {
-    char iobuf[1] = {0};
-    iovec iov{iobuf, sizeof(iobuf)};
+  // Returns (sender_rank, fd).
+  std::pair<int, int> RecvFd() {
+    int tag = -1;
+    iovec iov{&tag, sizeof(tag)};
     char control[CMSG_SPACE(sizeof(int))] = {};
     msghdr msg{};
     msg.msg_iov = &iov;
@@ -213,7 +228,7 @@ class FdChannel {
                 "mori symm backend: no SCM_RIGHTS in received message");
     int fd = -1;
     std::memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
-    return fd;
+    return {tag, fd};
   }
 
  private:
@@ -275,9 +290,7 @@ class MoriSymmetricMemory : public SymmetricMemory {
   }
 
   ~MoriSymmetricMemory() override {
-    // During interpreter shutdown the HIP runtime may already be gone, so calling into
-    // it segfaults. torch's own backend does the same: leak rather than crash.
-    if (c10d::symmetric_memory::is_finalizing()) return;
+    if (!RuntimeUsable()) return;  // leak rather than crash on the way out
     (void)hipDeviceSynchronize();
     if (buffers_dev_) (void)hipFree(buffers_dev_);
     if (signal_pads_dev_) (void)hipFree(signal_pads_dev_);
@@ -385,9 +398,8 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
       block = it->second;
       blocks_.erase(it);
     }
-    // Purely local. The flat span belongs to the SymmetricMemory object and holds its own
-    // references, so ranks freeing in different orders is harmless.
-    if (c10d::symmetric_memory::is_finalizing()) return;
+    // Local only: the flat span is owned by the SymmetricMemory object.
+    if (!RuntimeUsable()) return;
     (void)hipMemUnmap(block->ptr, block->alloc_size);
     (void)hipMemAddressFree(block->ptr, block->alloc_size);
     (void)hipMemRelease(block->handle);
@@ -451,8 +463,7 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
 
     std::vector<hipMemGenericAllocationHandle_t> handles(world_size);
 
-    // Our own allocation gets a second alias inside the span, so the stride is uniform
-    // across every rank and peer(rank) is an ordinary slot.
+    // A second alias of our own allocation, so the stride is uniform across all ranks.
     MORI_HIP_CHECK(hipMemRetainAllocationHandle(&handles[rank], block->ptr));
     map_slot(rank, handles[rank]);
 
@@ -464,25 +475,25 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
         map_slot(r, handles[r]);
       }
     } else {
-      // One round per owner: the owner exports its fd and sends it to every other rank.
+      // Send ours to everyone, then take world-1 fds in whatever order they land.
       FdChannel chan(rank);
-      for (int owner = 0; owner < world_size; ++owner) {
-        if (owner == rank) {
-          int fd = -1;
-          MORI_HIP_CHECK(hipMemExportToShareableHandle(&fd, block->handle,
-                                                       hipMemHandleTypePosixFileDescriptor, 0));
-          for (int peer = 0; peer < world_size; ++peer) {
-            if (peer != rank) chan.SendFd(FdChannel::Path(reqs[peer].pid, peer), fd);
-          }
-          ::close(fd);
-        } else {
-          int fd = chan.RecvFd();
-          MORI_HIP_CHECK(hipMemImportFromShareableHandle(
-              &handles[owner], reinterpret_cast<void*>(static_cast<intptr_t>(fd)),
-              hipMemHandleTypePosixFileDescriptor));
-          ::close(fd);
-          map_slot(owner, handles[owner]);
-        }
+      int fd = -1;
+      MORI_HIP_CHECK(hipMemExportToShareableHandle(&fd, block->handle,
+                                                   hipMemHandleTypePosixFileDescriptor, 0));
+      for (int peer = 0; peer < world_size; ++peer) {
+        if (peer != rank) chan.SendFd(FdChannel::Path(reqs[peer].pid, peer), fd, rank);
+      }
+      ::close(fd);
+
+      for (int i = 0; i < world_size - 1; ++i) {
+        auto [owner, peer_fd] = chan.RecvFd();
+        TORCH_CHECK(owner >= 0 && owner < world_size && owner != rank,
+                    "mori symm backend: bad owner tag ", owner, " in fd exchange");
+        MORI_HIP_CHECK(hipMemImportFromShareableHandle(
+            &handles[owner], reinterpret_cast<void*>(static_cast<intptr_t>(peer_fd)),
+            hipMemHandleTypePosixFileDescriptor));
+        ::close(peer_fd);
+        map_slot(owner, handles[owner]);
       }
     }
 
@@ -497,6 +508,24 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
   c10::DeviceType supported_device_type() override { return c10::DeviceType::CUDA; }
   std::string name() override { return "MORI"; }
 
+  // Drop every live allocation while python and HIP are still up. Registered as an
+  // atexit hook: destructors that run during interpreter shutdown are too late, and
+  // segfault even though is_finalizing() is still false.
+  void Shutdown() {
+    std::unordered_map<void*, std::shared_ptr<Block>> taken;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      taken.swap(blocks_);
+    }
+    if (!RuntimeUsable()) return;
+    for (auto& [ptr, block] : taken) {
+      block->symm.reset();  // unmaps the flat span
+      (void)hipMemUnmap(block->ptr, block->alloc_size);
+      (void)hipMemAddressFree(block->ptr, block->alloc_size);
+      (void)hipMemRelease(block->handle);
+    }
+  }
+
   std::shared_ptr<Block> FindBlock(void* ptr) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = blocks_.find(ptr);
@@ -510,16 +539,14 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
 };
 
 c10::intrusive_ptr<MoriSymmAllocator>& AllocatorSingleton() {
-  // Intentionally immortal. register_availability() parks a reference in a registry owned
-  // by libtorch, which outlives this extension's statics; letting our copy be destroyed at
-  // exit runs the allocator's destructors after the HIP runtime is gone.
+  // Immortal on purpose: register_availability() parks a reference in a libtorch-owned
+  // registry that outlives this extension's statics.
   static auto* inst =
       new c10::intrusive_ptr<MoriSymmAllocator>(c10::make_intrusive<MoriSymmAllocator>());
   return *inst;
 }
 
-// (flat_base, stride) for a rendezvous'd tensor -- the arithmetic peer addressing torch's
-// own interface has no place for.
+// Arithmetic peer addressing, which torch's interface has no place for.
 std::tuple<uintptr_t, int64_t> FlatLayout(const at::Tensor& t) {
   auto block = AllocatorSingleton()->FindBlock(t.data_ptr());
   TORCH_CHECK(block != nullptr, "not a mori symmetric allocation");
@@ -527,6 +554,8 @@ std::tuple<uintptr_t, int64_t> FlatLayout(const at::Tensor& t) {
   auto* symm = static_cast<MoriSymmetricMemory*>(block->symm.get());
   return {symm->flat_base(), static_cast<int64_t>(symm->stride())};
 }
+
+void Shutdown() { AllocatorSingleton()->Shutdown(); }
 
 std::string HandleTypeName(int dev) {
   return ProbeHandleType(dev) == hipMemHandleTypeFabricCompat ? "fabric" : "posix_fd";
@@ -553,6 +582,8 @@ PYBIND11_MODULE(mori_torch_symm, m) {
         "Register the MORI symmetric memory backend with torch (idempotent)");
   m.def("flat_layout", &mori::allocator::FlatLayout,
         "(flat_base, stride) of a rendezvous'd tensor");
+  m.def("shutdown", &mori::allocator::Shutdown,
+        "Release every live symmetric allocation (registered as an atexit hook)");
   m.def("handle_type", &mori::allocator::HandleTypeName,
         "'fabric' or 'posix_fd' -- what this device can export");
   m.attr("backend_name") = "MORI";

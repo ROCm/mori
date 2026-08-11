@@ -41,8 +41,14 @@ rather do arithmetic than index a pointer array.
 The handle type is probed per device: fabric where supported, POSIX fd otherwise. gfx9
 (MI300/MI355) has no fabric support -- ``hipMemCreate`` itself reports "operation not
 supported" -- so those fall back to fd, which needs no configuration.
+
+Known gap: releasing a rendezvous'd window segfaults at world_size >= 4 (2 ranks are
+fine), somewhere in the unmap/release path. Teardown is therefore disabled by default and
+the mappings are leaked -- symmetric buffers are few and long-lived, so that is much less
+harmful than crashing. Set ``MORI_SYMM_TEARDOWN=1`` to re-enable it while debugging.
 """
 
+import atexit
 from typing import Literal
 
 __all__ = [
@@ -53,6 +59,8 @@ __all__ = [
 ]
 
 SYMM_BACKEND_NAME = "MORI"
+
+_atexit_registered = False
 
 
 def _ext():
@@ -72,7 +80,14 @@ def register_symm_backend() -> str:
     After this, ``symm_mem.set_backend("MORI")`` routes ``symm_mem.empty`` and
     ``symm_mem.rendezvous`` into mori.
     """
-    _ext().register_backend()
+    ext = _ext()
+    ext.register_backend()
+    global _atexit_registered
+    if not _atexit_registered:
+        # Allocations still live at interpreter shutdown are torn down too late to touch
+        # HIP safely, so release them here instead.
+        atexit.register(ext.shutdown)
+        _atexit_registered = True
     return SYMM_BACKEND_NAME
 
 
