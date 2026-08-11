@@ -1,0 +1,247 @@
+# Porting the Tree-Connector Work onto the Backend-Agnostic Branch — Plan
+
+**Goal:** bring the GPU-buffer and ranged-multi-buffer-I/O work from
+`origin/feat/umbp-tree-connector` onto the backend-agnostic branch, so a
+GPU-resident sglang HiCache connector can drive UMBP without a host bounce.
+
+**Provenance.** Upstream branch `feat/umbp-tree-connector` at `1ab7e751`, nine
+UMBP commits on top of the common base `ae9635f7`. Our side is
+`integration/umbp-ssd-verify` at `ee4a5861`, ten UMBP commits on the same base
+(the Phase 0–6 backend-agnostic refactor, the HBM/SSD `MediumBackend`s, one
+medium per node, and the segment CRC work). This port lands on
+`feat/umbp-tree-connector-port`, branched from `ee4a5861`.
+
+**Method:** not a merge, and not nine cherry-picks. The two branches rewrote
+almost disjoint halves of `src/umbp`, so most upstream files can be taken
+verbatim; the small shared set is hand-merged, and the one file where the two
+designs actually collide is *reimplemented* rather than ported.
+
+**Scope:** `src/umbp/` (local tier stack, standalone server/client, distributed
+client, common helpers, proto), `src/pybind/`, `tests/`.
+
+---
+
+## 1. Why a merge is the wrong tool
+
+A trial merge of the upstream branch into ours reports exactly one conflicted
+file. That number is misleading in both directions.
+
+`src/umbp/distributed/pool_client.cpp` conflicts, and it is not resolvable by
+picking hunks: upstream's five edit sites are `LocalPutPages`, `LocalGetPages`,
+`RemoteDramScatterWrite`, `RemoteDramScatterRead` and `RemoteSsdReadOnce`, all
+deleted by Phase 6. `FindRegisteredMemory` survives but now returns
+`TransferRef`, not `mori::io::MemoryDesc`.
+
+Three files auto-merge *cleanly but wrongly*. The worst is
+`standalone/standalone_process_client.cpp`: our `RegisterMemory` throws when
+`loc != CPU`, and upstream's `7af295f6` implements exactly that case over GPU
+IPC. Git keeps both, the throw wins, and the feature is dead with no conflict
+marker to notice.
+
+So the merge would be silently wrong in the places that matter most.
+
+## 2. What the port does not need to do
+
+Three pieces of upstream work are already satisfied by the backend-agnostic
+refactor. Porting them would duplicate the abstraction they generalize.
+
+**GPU endpoint dispatch.** `HbmCopyEngine::CanHandle` claims any pair with at
+least one GPU endpoint, derives the `hipMemcpyKind` from the pair, and selects
+the device the copy runs on (`hbm_copy_engine.cpp:68–81, 111–118`). That is what
+upstream's `DeviceCopy` + `ScopedHipDevice` do at each call site, except ours is
+selected by `CompositeTransferEngine` instead of branched on inline. We still
+take `common/device_copy.{h,cpp}` — the *local* tier stack needs it, and
+`DetectPointerLocation` is needed at the API boundary (§4.1) — but no call site
+in `pool_client.cpp` gains a manual `hipMemcpy`.
+
+**Run coalescing.** Both local engines merge adjacent segments while building
+the plan (`local_copy_engine.cpp:177–186`, `hbm_copy_engine.cpp:160–163`). This
+is upstream's `BuildTierPageRuns` merge generalized: per endpoint pair, across
+keys, on host and GPU paths alike, and with no `UMBP_LOCAL_PAGE_MERGE` escape
+hatch because it is the only path. The distributed half of `500e186f` is
+therefore dropped; its local half is taken.
+
+**Pointer location in the API.** `IUMBPClient::RegisterMemory` already takes
+`loc` and `device` and plumbs them to `transfer_engine_->RegisterMemory`
+(`umbp_client.h:131–140`, `pool_client.cpp:509–526`). Upstream had to infer
+location from the pointer because the base signature could not express it. We
+keep our explicit parameters *and* add inference, because a connector written
+against upstream calls `register_memory(ptr, size)` with no location — see §4.1.
+
+## 3. File classification
+
+The rule: for any file where `git diff ae9635f7 HEAD -- <file>` is empty, our
+branch never touched it, so upstream's final state *is* the correct merge
+result. Take it verbatim. Everything else is hand-merged.
+
+**Take verbatim (25 files).** Local tier stack and its new source-private
+headers (`dram_tier.{h,cpp}`, `tier_backend.{h,cpp}`, `local_storage_manager.{h,cpp}`,
+`device_copy_run.h`, `device_gather.{h,hip}`, `host_registration.{h,cpp}`),
+`local/standalone_client.{h,cpp}`, `standalone/standalone_server.cpp`,
+`common/device_copy.{h,cpp}`, `common/range_utils.h`,
+`proto/umbp_standalone.proto`, and the tests
+(`test_dram_tier_{ranges,gather,concurrency}.cpp`, `test_umbp_client.cpp`,
+`test_standalone_shm_ipc.cpp`, `test_umbp_client_ptr.py`).
+
+`test_standalone_shm_ipc.cpp` already exists at the base and is already wired in
+`tests/cpp/umbp/distributed/CMakeLists.txt`; our branch rewrote that CMakeLists
+but kept the entry, so no build wiring is needed for it.
+
+**Hand-merge (9 files).**
+
+| File | Reconciliation |
+|---|---|
+| `include/umbp/umbp_client.h` | Add upstream's two pure virtuals; keep our four-argument `RegisterMemory`. |
+| `pybind/pybind_umbp.cpp` | Add the two ranged bindings next to ours. |
+| `src/umbp/CMakeLists.txt` | Add `common/device_copy.cpp`, `local/tiers/host_registration.cpp`, `local/tiers/device_gather.hip` to `UMBP_CORE_SRCS`; add `hip::host` as a PUBLIC link on `umbp_core`. |
+| `distributed/distributed_client.{h,cpp}` | Add the two warn-once stubs (see §5). |
+| `standalone/standalone_process_client.{h,cpp}` | Take upstream's GPU-IPC registration and ranged forwarding; delete our `loc != CPU` throw. |
+| `distributed/pool_client.cpp` | **Reimplemented, not ported** — §4. |
+| `tests/.../test_pool_client_batch_put.cpp` | Append upstream's two multi-page byte-exact cases; they drive the public API and exercise our coalescing. |
+| `tests/cpp/umbp/local/CMakeLists.txt` | Union of their three dram-tier test targets and our `test_segment_crc`. |
+
+## 4. The four gaps — the whole distributed-side port
+
+Upstream's 200-line `pool_client.cpp` diff exists to close these. In our
+architecture they close much smaller, because the transfer layer already carries
+pointer location and offsets.
+
+### 4.1 An unregistered device pointer is labelled host memory
+
+`PoolClient::UserBufferRef` (`pool_client.cpp:552–556`) falls back to
+`TransferRef::HostBytes(ptr, size)`, which stamps `loc = CPU`. An unregistered
+device pointer therefore routes to `LocalCopyEngine`, which `memcpy`s from
+device memory.
+
+Fix: classify the pointer in the fallback with `DetectPointerLocation` and build
+a GPU `TransferRef` when it is device memory, so `HbmCopyEngine` claims the
+pair. This is one function, and it is what makes an unmodified upstream-era
+connector — `register_memory(ptr, size)` with no location — correct on our
+branch instead of merely accepted.
+
+### 4.2 The remote bounce path stages GPU memory through a host buffer
+
+`MoriIoEngine` decides bounce eligibility on `local.HasHostPtr()` alone
+(`mori_io_engine.cpp:403`, `:462`) and then `std::memcpy`s in and out of the
+host staging region (`:592`, `:608`). A GPU local endpoint that misses zero-copy
+is therefore memcpy'd from device memory.
+
+Fix: require `local.loc == mori::io::MemoryLocationType::CPU` in both
+predicates, so a GPU endpoint that cannot be zero-copied is *rejected by Plan*
+and surfaces as a per-key failure. One predicate change at each of two sites is
+the single-point equivalent of upstream's five scattered "refusing host staging
+fallback" guards — and it is strictly better placed: the transfer layer is the
+only layer that knows whether staging is involved.
+
+### 4.3 `RegisterMemory` lacks upstream's hardening
+
+Ours returns `true` when a pointer is already registered regardless of the new
+size, does not validate the descriptor it got back, and does not catch
+(`pool_client.cpp:509–526`).
+
+Fix: port upstream's logic against `TransferRef` — reject a re-registration that
+grows the region, validate base/size/loc/device on the returned ref and
+deregister on mismatch, and convert throws into `false`.
+
+### 4.4 Standalone-process mode throws on the case upstream implements
+
+`StandaloneProcessClient::RegisterMemory` raises "only CPU (AnonymousShm-backed
+host) buffers are supported". Replace the throw with upstream's
+`RegisterDeviceMemory` path, keeping our explicit `loc`/`device` parameters and
+inferring them when the caller leaves them at the default.
+
+**The server-side half, which is not visible in the client diff:**
+`standalone_server.cpp:757` registers the mapped worker region with the
+two-argument `client_->RegisterMemory(base, size)`, which on our branch defaults
+to `loc = CPU, device = -1`. On the GPU-IPC path the server maps a *device*
+handle there, so that call must pass `loc = GPU` and the device ordinal —
+otherwise the region is registered as host memory and lands straight back in
+§4.1 and §4.2.
+
+## 5. Deliberate non-goals
+
+**Distributed ranged I/O stays a stub.** Upstream ships
+`DistributedClient::BatchGetRanges` / `BatchPutRanges` as warn-once all-false,
+and this port keeps that. It is not a regression and not laziness: implementing
+it is design work (object-range → page-range mapping, and whether the master's
+metadata needs to describe sub-object extents), and doing it inside a port would
+make both unreviewable.
+
+Worth recording for whoever picks it up: on our branch this is *much* closer
+than upstream's shape suggests. `MediumBackend` has no data-movement virtual at
+all — allocate, commit, resolve, evict, publish `TransferRef`s — and every byte
+moves as a `TransferItem`, which already carries `src_offset`, `dst_offset` and
+`size`. A `TransferItem` *is* a range. So no engine, backend or wire-format
+change is needed; what is needed is the mapping in `PoolClient`, and the
+whole-object path already computes it with the range pinned to `[0, size)`
+(`LogicalPageBytes` at `pool_client.cpp:597`, consumed by
+`BuildLocalPageTransfers`). Generalizing it is turning a constant into a
+parameter.
+
+Note also that the gating factor is the *backend*, not the client mode. The
+standalone server forwards ranged RPCs straight to its inner client, so
+standalone-process over a Local backend works while standalone-process over a
+Distributed backend inherits the stub. Implementing §5 lights up both
+distributed rows at once.
+
+**Whole-object I/O is not collapsed into ranged I/O.** Upstream added ranged ops
+as a parallel path at every layer — `ReadBatchRangesIntoPtr` beside
+`ReadBatchIntoPtr`, `BatchWriteRanges` beside `BatchWrite`, a second RPC pair, a
+second client method pair. Whole-object I/O *is* the degenerate single-range
+case, so those pairs could collapse into one primitive plus a thin adapter,
+halving the surface instead of doubling it.
+
+This port keeps upstream's parallel structure. Two reasons: a port that also
+redesigns is not reviewable against its source, and the collapse has a real
+cost — the whole-object path takes shortcuts a general ranged path cannot (the
+DRAM tier's parallel non-temporal write of one contiguous payload per key, and
+coalescing that assumes dense user offsets), which become "detect the
+single-full-range case and take the fast branch". Recommended as a follow-up,
+deliberately out of scope here.
+
+**The three unrelated upstream commits are not taken.** `01a5eaa6`, `3552d318`
+and `9d5e30f5` are EPv2 and build fixes that account for every `pyproject.toml`
+and `python/mori/ops/` line in the upstream branch diff. They come from main on
+their own schedule.
+
+## 6. Stages
+
+Each stage is one commit, in this order.
+
+1. **This document.**
+2. **Take-verbatim set** (§3) — the local/standalone half, plus the new common
+   headers and tests. Touches no file our branch has modified, so it cannot
+   break the distributed data plane.
+3. **Build wiring and the ranged interface** — `CMakeLists.txt`, `umbp_client.h`,
+   `pybind_umbp.cpp`, `distributed_client.{h,cpp}` stubs,
+   `tests/cpp/umbp/local/CMakeLists.txt`. After this the tree compiles with
+   ranged I/O live in Local and standalone-process-over-Local.
+4. **Standalone-process GPU buffers** — §4.4, both halves.
+5. **Distributed GPU buffers** — §4.1, §4.2, §4.3.
+6. **Tests** — upstream's two multi-page cases, plus a GPU-destination case
+   through `PoolClient`, which neither branch currently has.
+
+## 7. Verification
+
+- `cmake --build` in the `rocm/mori-dev` container, `BUILD_UMBP=ON`.
+- `ctest` for the umbp local and distributed suites. Per the environment's known
+  constraint, the container needs `--privileged` and `/dev/infiniband` or every
+  live `PoolClient` test reports as a failure for reasons unrelated to the code.
+- `tests/python/umbp/test_umbp_client_ptr.py` covers the ranged API's shape
+  errors and a byte-exact scattered round trip; it is the closest thing to a
+  contract test for what the connector calls.
+- The two new dram-tier suites run twice by design — `umbp_dram_tier_gather` and
+  `umbp_dram_tier_gather_kernel_off` — because the gather kernel and the copy
+  engine must be indistinguishable in their results.
+
+## 8. Follow-ups this port deliberately leaves open
+
+1. Implement `BatchGetRanges`/`BatchPutRanges` for distributed (§5).
+2. Collapse whole-object I/O into the degenerate ranged case (§5).
+3. `HbmCopyEngine` issues blocking `hipMemcpy` on the null stream. Upstream's
+   `549c14d5` found that sharing one stream per device serialized every batch in
+   the DRAM tier (1.7 → 4.9 GB/s once split); our engine has the same coupling
+   in a different shape. Measure once GPU buffers are live end-to-end.
+4. SSD ranged reads will work through the staging buffer as soon as §5 lands,
+   but without disk-side savings until `SsdCopyPipeline` learns sub-extent
+   reads.
