@@ -79,7 +79,7 @@ target_compile_options(mori_ibv_shim PRIVATE -fvisibility=hidden
 set_target_properties(mori_ibv_shim PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 set_source_files_properties(${MORI_APP_SOURCES} PROPERTIES LANGUAGE CXX)
-find_library(HSA_RUNTIME_LIB hsa-runtime64 HINTS /opt/rocm/lib REQUIRED)
+find_library(HSA_RUNTIME_LIB hsa-runtime64 HINTS ${ROCM_PATH}/lib /opt/rocm/lib REQUIRED)
 
 # Application sources are compiled once (PIC) into an OBJECT library, shared by:
 #   * mori_application (SHARED)         — the usual dependency for shmem/io/ops/…
@@ -122,6 +122,6 @@ endif()
 
 set_target_properties(
   mori_application
-  PROPERTIES BUILD_RPATH "$ORIGIN"
-             INSTALL_RPATH "$ORIGIN"
+  PROPERTIES BUILD_RPATH "$ORIGIN;${ROCM_PATH}/lib"
+             INSTALL_RPATH "$ORIGIN;${ROCM_PATH}/lib"
              BUILD_WITH_INSTALL_RPATH TRUE)

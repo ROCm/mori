@@ -1,10 +1,7 @@
-# Override with --build-arg BASE_IMAGE=... to switch ROCm/Python version.
-# Tested base images:
-#   rocm/pytorch:rocm6.4.3_ubuntu22.04_py3.10_pytorch_release_2.5.1
-#   rocm/pytorch:rocm7.1.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
-#   rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.8.0
-#   rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0
-ARG BASE_IMAGE=rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.8.0
+# Tested base image (the ROCm 7.14 install below assumes a 7.14/ubuntu24.04
+# base; an older one would end up with two ROCm installs stacked):
+#   rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+ARG BASE_IMAGE=rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
 FROM ${BASE_IMAGE}
 
 RUN apt-get update && \
@@ -15,3 +12,35 @@ RUN apt-get update && \
     libgrpc-dev libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc \
     cmake && \
     rm -rf /var/lib/apt/lists/*
+
+# ── ROCm 7.14 dev toolchain ──
+#
+# The rocm7.14 pytorch image has no /opt/rocm: ROCm comes from the pip
+# `rocm-sdk-core` wheel, which ships runtime .so files and headers but no CMake
+# package configs, so `project(... HIP)` cannot find hip-lang-config.cmake.
+# The apt ROCm 7.14 below installs under /opt/rocm/core-7.14 and registers
+# /opt/rocm/{bin,lib,include,...} via update-alternatives, the layout mori
+# expects. /usr/lib64/libc.so is for hsakmtTargets.cmake, which hardcodes that
+# RPM path — without it the link fails on "needed by libmori_application.so".
+RUN set -ex && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends wget gnupg ca-certificates && \
+    mkdir -p --mode=0755 /etc/apt/keyrings && \
+    wget -qO - https://repo.amd.com/rocm/packages-multi-arch/gpg/rocm.gpg \
+      | gpg --dearmor > /etc/apt/keyrings/amdrocm.gpg && \
+    echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://repo.amd.com/rocm/packages-multi-arch/ubuntu2404 stable main" \
+      > /etc/apt/sources.list.d/amdrocm.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+      amdrocm-core-dev7.14-gfx942 \
+      amdrocm-core-dev7.14-gfx950 && \
+    rm -rf /var/lib/apt/lists/* && \
+    # hsakmtTargets.cmake hardcodes /usr/lib64/libc.so (RPM path)
+    mkdir -p /usr/lib64 && \
+    ln -sf /usr/lib/x86_64-linux-gnu/libc.so /usr/lib64/libc.so
+
+ENV HIP_PATH=/opt/rocm
+ENV PATH=/opt/rocm/bin:/opt/rocm/llvm/bin:$PATH
+# Must come first: libgrpc-dev pulls Ubuntu's libhsa-runtime64-1 (ROCm 5.7) and
+# libhsakmt1 into /lib/x86_64-linux-gnu, shadowing the real ROCm runtime.
+ENV LD_LIBRARY_PATH=/opt/rocm/lib

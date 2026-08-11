@@ -52,8 +52,8 @@ done
 ## Step 1: Start the Docker container
 
 Use the container name from the user's args if provided; ask if not.
-Default image: `rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.10.0`
-(use unless the user specifies another).
+Default image: `rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0`
+(use unless the user specifies another) — same base the CI workflows build on.
 
 ```bash
 if sudo docker inspect $CONTAINER_NAME &>/dev/null; then
@@ -418,10 +418,54 @@ mst status -v
 
 ## Step 4: Install MORI
 
+### 4.0 — ROCm 7.14 dev toolchain (rocm7.14 base images only)
+
+**Skip on pre-7.14 images** — they already ship a full `/opt/rocm` and must not
+get a second ROCm stacked on top.
+
+The rocm7.14 pytorch image has **no `/opt/rocm` at all**: ROCm comes from the pip
+`rocm-sdk-core` wheel, which ships runtime `.so` files and headers but no CMake
+package configs. Without this step the build dies at configure time with
+`does not contain the HIP runtime CMake package ... hip-lang-config.cmake`.
+
+```bash
+sudo docker exec $CONTAINER_NAME bash -c '
+set -e
+[ -d /opt/rocm/bin ] && { echo "/opt/rocm already present — skipping"; exit 0; }
+apt-get install -y --no-install-recommends wget gnupg ca-certificates
+mkdir -p --mode=0755 /etc/apt/keyrings
+wget -qO - https://repo.amd.com/rocm/packages-multi-arch/gpg/rocm.gpg \
+  | gpg --dearmor > /etc/apt/keyrings/amdrocm.gpg
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://repo.amd.com/rocm/packages-multi-arch/ubuntu2404 stable main" \
+  > /etc/apt/sources.list.d/amdrocm.list
+apt-get update
+apt-get install -y --no-install-recommends amdrocm-core-dev7.14-gfx942 amdrocm-core-dev7.14-gfx950
+# hsakmtTargets.cmake hardcodes this RPM path; without it the link step fails
+# on "ninja: error: /usr/lib64/libc.so, needed by libmori_application.so"
+mkdir -p /usr/lib64 && ln -sf /usr/lib/x86_64-linux-gnu/libc.so /usr/lib64/libc.so
+hipconfig --version
+'
+```
+
+Then set the ROCm env for the rest of the session. The `docker/Dockerfile.dev`
+image bakes these in via `ENV`, but a plain `rocm/pytorch` container does not,
+so export them in each later `docker exec` (build *and* runtime):
+
+```bash
+export ROCM_ENV="HIP_PATH=/opt/rocm PATH=/opt/rocm/bin:/opt/rocm/llvm/bin:\$PATH LD_LIBRARY_PATH=/opt/rocm/lib"
+```
+
+`LD_LIBRARY_PATH=/opt/rocm/lib` is **required, not cosmetic**: `libgrpc-dev`
+from Step 2 pulls Ubuntu's `libhsa-runtime64-1` (ROCm 5.7) and `libhsakmt1`
+into `/lib/x86_64-linux-gnu`, which otherwise shadow the real ROCm runtime.
+
+### 4.1 — Build and install
+
 `pybind11` is a required build dep missing from `pyproject.toml`:
 
 ```bash
 sudo docker exec -w $MORI_REPO_DIR $CONTAINER_NAME bash -c "
+export $ROCM_ENV
 pip install pybind11 -q
 rm -rf build   # clear stale cmake cache — old build/ can hardcode a wrong ROCm version
 pip install .
@@ -432,7 +476,7 @@ pip install .
 Step 2). To skip the storage component and its gRPC dep:
 
 ```bash
-sudo docker exec -w $MORI_REPO_DIR $CONTAINER_NAME bash -c "BUILD_UMBP=OFF pip install ."
+sudo docker exec -w $MORI_REPO_DIR $CONTAINER_NAME bash -c "export $ROCM_ENV; BUILD_UMBP=OFF pip install ."
 ```
 
 ---
@@ -440,7 +484,7 @@ sudo docker exec -w $MORI_REPO_DIR $CONTAINER_NAME bash -c "BUILD_UMBP=OFF pip i
 ## Step 5: Verify
 
 ```bash
-sudo docker exec $CONTAINER_NAME python3 -c "import mori; print('mori version:', mori.__version__)"
+sudo docker exec $CONTAINER_NAME bash -c "export $ROCM_ENV; python3 -c \"import mori; print('mori version:', mori.__version__)\""
 ```
 
 On shared-library errors (`libpci.so`, `libibverbs.so`, …):
@@ -458,6 +502,7 @@ ldconfig
 
 ```bash
 sudo docker exec $CONTAINER_NAME bash -c "
+export $ROCM_ENV
 python3 -c \"
 from mori.jit.config import detect_build_config, detect_nic_type
 cfg = detect_build_config()
@@ -473,7 +518,7 @@ ibv_devinfo | head -20
 ## Step 7: Run `mori check` / `mori setup`
 
 ```bash
-sudo docker exec $CONTAINER_NAME bash -c "mori check"
+sudo docker exec $CONTAINER_NAME bash -c "export $ROCM_ENV; mori check"
 ```
 
 `mori check` validates the RDMA stack in 6 steps (vendor-specific variants,
@@ -517,11 +562,11 @@ cover every mlx5 device.
 
 If any step shows `[FAIL]`:
 
-- `sudo docker exec $CONTAINER_NAME bash -c "mori setup"` auto-applies
+- `sudo docker exec $CONTAINER_NAME bash -c "export $ROCM_ENV; mori setup"` auto-applies
   QoS/PFC/DCQCN on ionic/bnxt/mlx5. Env vars don't persist in the calling
   shell; use `source $(mori setup --path)` to export them. On mlx5, a
   DCQCN fix may need a firmware reset/reboot to take effect — see 3c.
-- Still failing: `sudo docker exec $CONTAINER_NAME bash -c "mori diagnose"`.
+- Still failing: `sudo docker exec $CONTAINER_NAME bash -c "export $ROCM_ENV; mori diagnose"`.
 
 ### mlx5 hardware faults (CQ errors / firmware health)
 
@@ -553,7 +598,8 @@ only `4: Warm Reboot` supported — a host reboot is the only recovery path.
 - Attach command (working directory set to the MORI source tree):
 
 ```bash
-sudo docker exec -it -w "$MORI_REPO_DIR" $CONTAINER_NAME bash
+sudo docker exec -it -e HIP_PATH=/opt/rocm -e LD_LIBRARY_PATH=/opt/rocm/lib \
+    -w "$MORI_REPO_DIR" $CONTAINER_NAME bash
 ```
 
 **Built-in tools:** `mori check`, `mori setup`, `mori diagnose` — see Step 7 for usage.

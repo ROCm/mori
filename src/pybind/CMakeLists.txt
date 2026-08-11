@@ -53,7 +53,7 @@ endif()
 target_include_directories(
   mori_pybinds PUBLIC ${PYTHON_INCLUDE_DIRS} ${PYBIND11_INCLUDE_DIR}
                       ${CMAKE_BINARY_DIR}/generated/include)
-target_link_directories(mori_pybinds PRIVATE /opt/rocm/lib)
+target_link_directories(mori_pybinds PRIVATE ${ROCM_PATH}/lib)
 target_link_libraries(mori_pybinds mori_ops mori_shmem mori_io hip::host)
 if(BUILD_COLLECTIVE)
   target_link_libraries(mori_pybinds mori_collective)
@@ -76,6 +76,6 @@ endif()
 # For python packages to find dependent libraries
 set_target_properties(
   mori_pybinds
-  PROPERTIES BUILD_RPATH "$ORIGIN"
-             INSTALL_RPATH "$ORIGIN"
+  PROPERTIES BUILD_RPATH "$ORIGIN;${ROCM_PATH}/lib"
+             INSTALL_RPATH "$ORIGIN;${ROCM_PATH}/lib"
              BUILD_WITH_INSTALL_RPATH TRUE)
