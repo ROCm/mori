@@ -241,7 +241,8 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("cache_remote_admission", &UMBPDistributedConfig::cache_remote_admission)
       .def_readwrite("admission_max_block_bytes", &UMBPDistributedConfig::admission_max_block_bytes)
       .def_readwrite("dram_page_size", &UMBPDistributedConfig::dram_page_size)
-      .def_readwrite("hbm", &UMBPDistributedConfig::hbm);
+      .def_readwrite("hbm", &UMBPDistributedConfig::hbm)
+      .def_readwrite("enable_ssd_tier", &UMBPDistributedConfig::enable_ssd_tier);
 
   py::class_<UMBPStandaloneProcessConfig>(m, "UMBPStandaloneProcessConfig")
       .def(py::init<>())

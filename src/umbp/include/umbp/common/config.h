@@ -259,6 +259,17 @@ struct UMBPDistributedConfig {
   uint64_t dram_page_size = 0;
 
   UMBPHbmConfig hbm;
+
+  // Opt this node's distributed data plane into the SSD medium.  Unlike hbm,
+  // SSD needs no config struct of its own here: UMBPConfig::ssd already carries
+  // every knob SsdBackend takes (storage_dir, capacity, segment/layout, io,
+  // durability, ssd_backend selection), and DistributedClient lowers it into
+  // PoolClientConfig::ssd when this is set.  A separate bool rather than
+  // reusing UMBPConfig::ssd.enabled because THAT defaults to true — keying the
+  // distributed tier off it would silently make every existing deployment
+  // start advertising SSD capacity.  Defaults false: a node opts in
+  // explicitly, exactly as it does for HBM.
+  bool enable_ssd_tier = false;
 };
 
 // User-facing same-host standalone-process configuration.  Set

@@ -168,15 +168,15 @@ def _build_parser() -> argparse.ArgumentParser:
                     "--tier",
                     choices=["dram", "hbm", "ssd"],
                     default="dram",
-                    help="Storage tier to benchmark (default: dram). 'dram' and 'hbm' are "
-                    "wired end-to-end: DistributedClient (distributed_client.cpp) lowers "
-                    "UMBPDistributedConfig.hbm into PoolClientConfig, so PoolClient::Init "
-                    "registers an HBM PageBackend on --hbm-device when --tier hbm is set. "
-                    "'ssd' is still refused -- it remains genuinely unwired from the "
-                    "distributed data plane (PeerSsdManager was removed in the "
-                    "backend-agnostic refactor; SsdBackend exists at the peer layer but "
-                    "DistributedClient never advertises it) -- see PeerSsdConfig in "
-                    "src/umbp/include/umbp/distributed/config.h.",
+                    help="Storage tier to benchmark (default: dram). All three are wired "
+                    "end-to-end through DistributedClient (distributed_client.cpp), which "
+                    "lowers UMBPDistributedConfig.hbm and (when enable_ssd_tier is set) "
+                    "UMBPConfig.ssd into PoolClientConfig, so PoolClient::Init registers "
+                    "the matching MediumBackend. Note DRAM is ALWAYS registered, so "
+                    "--tier hbm/ssd yields a two-backend node and the routing plane "
+                    "treats media as equivalent (medium_backend.h) -- it mirrors rather "
+                    "than tiers. Configure SSD via UMBP_SSD_STORAGE_DIR / "
+                    "UMBP_SSD_CAPACITY_BYTES / UMBP_SSD_BACKEND.",
                 )
                 be_p.add_argument(
                     "--dst-loc",
@@ -245,17 +245,6 @@ if role != "both" and not args.key_prefix:
 tier = getattr(args, "tier", "dram")
 dst_loc = getattr(args, "dst_loc", "host")
 hbm_device = getattr(args, "hbm_device", 0)
-if backend_name == "umbp" and tier == "ssd":
-    print(
-        "ERROR: --tier ssd is not wired end-to-end. SSD was explicitly unwired from "
-        "the distributed data plane in the backend-agnostic refactor -- PoolClient no "
-        "longer builds a PeerSsdManager or serves SSD reads there, even though "
-        "SsdBackend exists at the peer layer. Running this bench with --tier ssd "
-        "today would silently benchmark DRAM under the wrong label. Use --tier dram "
-        "or --tier hbm (both wired), or wire SSD through DistributedClient first.",
-        file=sys.stderr,
-    )
-    sys.exit(2)
 if dst_loc == "gpu" and backend_name != "umbp":
     print("ERROR: --dst-loc gpu is only supported for backend=umbp", file=sys.stderr)
     sys.exit(2)
@@ -379,8 +368,18 @@ class UMBPBackend(Backend):
         reader_port: int = None,
     ):
         cfg = UMBPConfig()
+        # PoolClient::Init ALWAYS registers DRAM, and the routing plane has no
+        # tier order -- ConfigurableRoutePutStrategy/kMostAvailable simply picks
+        # whichever medium advertises the most free bytes (route_put_strategy.h).
+        # So with the 8 GiB DRAM default a --tier hbm run (4 GiB) would route
+        # every put to DRAM and report it as HBM. Shrink DRAM to a floor well
+        # below the target pool so most-available can only pick the target.
+        # The bench's whole working set must also fit in that headroom.
+        default_dram = 8 * 1024 * 1024 * 1024
+        if tier != "dram":
+            default_dram = 256 * 1024 * 1024
         cfg.dram.capacity_bytes = int(
-            os.environ.get("UMBP_DRAM_CAPACITY_BYTES", 8 * 1024 * 1024 * 1024)
+            os.environ.get("UMBP_DRAM_CAPACITY_BYTES", default_dram)
         )
         cfg.dram.use_hugepages = os.environ.get("UMBP_DRAM_USE_HUGEPAGES", "1") not in (
             "0",
@@ -402,6 +401,25 @@ class UMBPBackend(Backend):
             dist.hbm.capacity_bytes = int(
                 os.environ.get("UMBP_HBM_CAPACITY_BYTES", 4 * 1024 * 1024 * 1024)
             )
+        if tier == "ssd":
+            # enable_ssd_tier is the distributed-side opt-in; cfg.ssd carries the
+            # actual knobs (it already defaults enabled=True, which is why the
+            # opt-in is a separate flag -- see UMBPDistributedConfig).
+            dist.enable_ssd_tier = True
+            cfg.ssd.enabled = True
+            cfg.ssd.storage_dir = os.environ.get(
+                "UMBP_SSD_STORAGE_DIR", f"/tmp/umbp_ssd_{node_id}"
+            )
+            cfg.ssd.capacity_bytes = int(
+                os.environ.get("UMBP_SSD_CAPACITY_BYTES", 32 * 1024 * 1024 * 1024)
+            )
+            cfg.ssd.ssd_backend = os.environ.get("UMBP_SSD_BACKEND", "file")
+            os.makedirs(cfg.ssd.storage_dir, exist_ok=True)
+        else:
+            # Keep the SSD tier dark for dram/hbm runs: cfg.ssd.enabled defaults
+            # to True, and leaving it on would let the local (non-distributed)
+            # SSD path allocate a 32 GB store nobody reads.
+            cfg.ssd.enabled = False
         cfg.distributed = dist
         self._client = UMBPClient(cfg)
         self._reader_node_id = reader_node_id
