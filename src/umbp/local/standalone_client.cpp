@@ -26,6 +26,7 @@
 #include <string>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/range_utils.h"
 #include "umbp/local/tiers/dram_tier.h"
 
 namespace mori::umbp {
@@ -184,6 +185,51 @@ std::vector<bool> StandaloneClient::BatchPut(const std::vector<std::string>& key
   return results;
 }
 
+std::vector<bool> StandaloneClient::BatchPutRanges(
+    const std::vector<std::string>& keys, const std::vector<size_t>& object_sizes,
+    const std::vector<std::vector<uintptr_t>>& srcs, const std::vector<std::vector<size_t>>& sizes,
+    const std::vector<std::vector<size_t>>& dst_offsets) {
+  const size_t n = keys.size();
+  std::vector<bool> results(n, false);
+  if (object_sizes.size() != n || !RangeBatchShapeValid(n, srcs, sizes, dst_offsets)) {
+    return results;
+  }
+  if (role_ == UMBPRole::SharedSSDFollower || config_.ssd.enabled) return results;
+
+  std::vector<size_t> write_map;
+  std::vector<std::string> write_keys;
+  std::vector<size_t> write_object_sizes;
+  std::vector<std::vector<uintptr_t>> write_srcs;
+  std::vector<std::vector<size_t>> write_sizes;
+  std::vector<std::vector<size_t>> write_offsets;
+  write_map.reserve(n);
+  for (size_t i = 0; i < n; ++i) {
+    if (!RangesTileObject(object_sizes[i], sizes[i], dst_offsets[i])) continue;
+    if (index_.MayExist(keys[i])) {
+      results[i] = true;
+      continue;
+    }
+    write_map.push_back(i);
+    write_keys.push_back(keys[i]);
+    write_object_sizes.push_back(object_sizes[i]);
+    write_srcs.push_back(srcs[i]);
+    write_sizes.push_back(sizes[i]);
+    write_offsets.push_back(dst_offsets[i]);
+  }
+
+  if (!write_keys.empty()) {
+    auto write_results = storage_.WriteBatchRangesFromPtr(write_keys, write_object_sizes,
+                                                          write_srcs, write_sizes, write_offsets);
+    for (size_t j = 0; j < write_map.size(); ++j) {
+      if (j >= write_results.size() || !write_results[j]) continue;
+      const size_t i = write_map[j];
+      index_.Insert(keys[i], {StorageTier::CPU_DRAM, 0, object_sizes[i]});
+      results[i] = true;
+    }
+  }
+  return results;
+}
+
 std::vector<bool> StandaloneClient::BatchPutWithDepth(const std::vector<std::string>& keys,
                                                       const std::vector<uintptr_t>& srcs,
                                                       const std::vector<size_t>& sizes,
@@ -270,6 +316,45 @@ std::vector<bool> StandaloneClient::BatchGet(const std::vector<std::string>& key
     results[i] = local_hit;
   }
 
+  return results;
+}
+
+std::vector<bool> StandaloneClient::BatchGetRanges(
+    const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dsts,
+    const std::vector<std::vector<size_t>>& sizes,
+    const std::vector<std::vector<size_t>>& src_offsets) {
+  const size_t n = keys.size();
+  std::vector<bool> results(n, false);
+  if (!RangeBatchShapeValid(n, dsts, sizes, src_offsets) || config_.ssd.enabled ||
+      role_ == UMBPRole::SharedSSDFollower) {
+    return results;
+  }
+
+  std::vector<size_t> read_map;
+  std::vector<std::string> read_keys;
+  std::vector<std::vector<uintptr_t>> read_dsts;
+  std::vector<std::vector<size_t>> read_sizes;
+  std::vector<std::vector<size_t>> read_offsets;
+  read_map.reserve(n);
+  for (size_t i = 0; i < n; ++i) {
+    if (sizes[i].empty() || !index_.MayExist(keys[i])) continue;
+    read_map.push_back(i);
+    read_keys.push_back(keys[i]);
+    read_dsts.push_back(dsts[i]);
+    read_sizes.push_back(sizes[i]);
+    read_offsets.push_back(src_offsets[i]);
+  }
+
+  if (!read_keys.empty()) {
+    auto read_results =
+        storage_.ReadBatchRangesIntoPtr(read_keys, read_dsts, read_sizes, read_offsets);
+    for (size_t j = 0; j < read_map.size(); ++j) {
+      const size_t i = read_map[j];
+      const bool ok = j < read_results.size() && read_results[j];
+      results[i] = ok;
+      if (!ok && !storage_.Exists(keys[i])) index_.Remove(keys[i]);
+    }
+  }
   return results;
 }
 

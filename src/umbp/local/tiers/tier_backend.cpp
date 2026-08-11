@@ -49,6 +49,13 @@ std::vector<bool> TierBackend::ReadBatchIntoPtr(const std::vector<std::string>& 
   return results;
 }
 
+std::vector<bool> TierBackend::ReadBatchRangesIntoPtr(
+    const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& /*dst_ptrs*/,
+    const std::vector<std::vector<size_t>>& /*sizes*/,
+    const std::vector<std::vector<size_t>>& /*src_offsets*/) {
+  return std::vector<bool>(keys.size(), false);
+}
+
 std::vector<bool> TierBackend::BatchWrite(const std::vector<std::string>& keys,
                                           const std::vector<const void*>& data_ptrs,
                                           const std::vector<size_t>& sizes) {
@@ -57,6 +64,14 @@ std::vector<bool> TierBackend::BatchWrite(const std::vector<std::string>& keys,
     results[i] = Write(keys[i], data_ptrs[i], sizes[i]);
   }
   return results;
+}
+
+std::vector<bool> TierBackend::BatchWriteRanges(
+    const std::vector<std::string>& keys, const std::vector<size_t>& /*object_sizes*/,
+    const std::vector<std::vector<const void*>>& /*src_ptrs*/,
+    const std::vector<std::vector<size_t>>& /*sizes*/,
+    const std::vector<std::vector<size_t>>& /*dst_offsets*/) {
+  return std::vector<bool>(keys.size(), false);
 }
 
 std::vector<bool> TierBackend::BatchReadIntoPtr(const std::vector<std::string>& keys,

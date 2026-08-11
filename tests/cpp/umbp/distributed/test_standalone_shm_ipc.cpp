@@ -22,6 +22,7 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
 //
 // MIT License
+#include <grpcpp/grpcpp.h>
 #include <gtest/gtest.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -32,15 +33,18 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "umbp/local/host_mem_allocator.h"
 #include "umbp/standalone/ipc.h"
 #include "umbp/standalone/standalone_server.h"
 #include "umbp/umbp_client.h"
+#include "umbp_standalone.grpc.pb.h"
 
 namespace mori::umbp {
 namespace {
@@ -179,6 +183,46 @@ TEST(StandaloneShmIpcTest, RawUdsFdRegistrationTransfersFd) {
   EXPECT_TRUE(receiver_ok.load());
 }
 
+TEST(StandaloneShmIpcTest, GpuRegistrationRejectsSsdBackedServer) {
+  const std::string suffix = std::to_string(getpid());
+  const std::string address = "unix:///tmp/umbp_standalone_gpu_reject_" + suffix + ".sock";
+  const std::string grpc_path = standalone::UnixPathFromGrpcAddress(address);
+  const std::string fd_path = standalone::DeriveFdSocketPath(address);
+  const std::string ssd_path = "/tmp/umbp_standalone_gpu_reject_ssd_" + suffix;
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+  std::filesystem::remove_all(ssd_path);
+
+  UMBPConfig config;
+  config.dram.capacity_bytes = 1 << 20;
+  config.ssd.enabled = true;
+  config.ssd.storage_dir = ssd_path;
+  config.ssd.capacity_bytes = 1 << 20;
+  standalone::StandaloneServer server(config, address);
+  ASSERT_TRUE(server.Start());
+  std::thread server_thread([&]() { server.Run(); });
+
+  auto channel = grpc::CreateChannel(address, grpc::InsecureChannelCredentials());
+  auto stub = ::umbp::UMBPStandalone::NewStub(channel);
+  grpc::ClientContext context;
+  ::umbp::RegisterMemoryRequest request;
+  request.set_kind(::umbp::MEMORY_KIND_GPU_IPC);
+  request.set_client_id("gpu-client");
+  request.set_worker_base(0x1000);
+  request.set_size(4096);
+  ::umbp::BoolResponse response;
+  const grpc::Status status = stub->RegisterMemory(&context, request, &response);
+  ASSERT_TRUE(status.ok());
+  EXPECT_FALSE(response.ok());
+  EXPECT_NE(response.error().find("SSD"), std::string::npos);
+
+  server.Shutdown();
+  server_thread.join();
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+  std::filesystem::remove_all(ssd_path);
+}
+
 TEST(StandaloneShmIpcTest, StandaloneClientUsesNonZeroOffsetsAndCanReregister) {
   const std::string address =
       "unix:///tmp/umbp_standalone_e2e_" + std::to_string(getpid()) + ".grpc.sock";
@@ -315,6 +359,47 @@ TEST(StandaloneShmIpcTest, StandaloneClientResolvesAcrossMultipleRegions) {
   for (int i = 0; i < 8; ++i) EXPECT_EQ(bytes_a[300 + i], static_cast<unsigned char>(0xa0 + i));
   for (int i = 0; i < 8; ++i) EXPECT_EQ(bytes_b[300 + i], static_cast<unsigned char>(0xb0 + i));
 
+  // One object can be assembled from, and read back into, ranges belonging to
+  // different registered regions.
+  for (int i = 0; i < 8; ++i) bytes_a[400 + i] = static_cast<unsigned char>(0xc0 + i);
+  for (int i = 0; i < 8; ++i) bytes_b[400 + i] = static_cast<unsigned char>(0xd0 + i);
+  auto range_put = client->BatchPutRanges(
+      {"range-key"}, {16},
+      {{reinterpret_cast<uintptr_t>(bytes_b + 400), reinterpret_cast<uintptr_t>(bytes_a + 400)}},
+      {{8, 8}}, {{8, 0}});
+  ASSERT_EQ(range_put, std::vector<bool>({true}));
+  EXPECT_TRUE(client->Exists("range-key"));
+
+  std::memset(bytes_a + 500, 0, 8);
+  std::memset(bytes_b + 500, 0, 8);
+  auto range_get = client->BatchGetRanges(
+      {"range-key"},
+      {{reinterpret_cast<uintptr_t>(bytes_a + 500), reinterpret_cast<uintptr_t>(bytes_b + 500)}},
+      {{8, 8}}, {{8, 0}});
+  ASSERT_EQ(range_get, std::vector<bool>({true}));
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(bytes_a[500 + i], static_cast<unsigned char>(0xd0 + i));
+    EXPECT_EQ(bytes_b[500 + i], static_cast<unsigned char>(0xc0 + i));
+  }
+
+  // Malformed flattened range arrays are rejected before address resolution.
+  auto raw_stub = ::umbp::UMBPStandalone::NewStub(
+      grpc::CreateChannel(address, grpc::InsecureChannelCredentials()));
+  grpc::ClientContext malformed_context;
+  ::umbp::BatchRangeDataRequest malformed_request;
+  malformed_request.add_keys("malformed");
+  malformed_request.add_range_counts(1);
+  malformed_request.add_shm_offsets(0);
+  // region_bases is deliberately missing.
+  malformed_request.add_sizes(8);
+  malformed_request.add_object_offsets(0);
+  malformed_request.add_object_sizes(8);
+  ::umbp::BatchBoolResponse malformed_response;
+  ASSERT_TRUE(
+      raw_stub->BatchPutRanges(&malformed_context, malformed_request, &malformed_response).ok());
+  ASSERT_EQ(malformed_response.ok_size(), 1);
+  EXPECT_FALSE(malformed_response.ok(0));
+
   // A pointer outside every registered region fails cleanly (no crash, no hit).
   HostBufferHandle unregistered = allocator.Alloc(4096, opts);
   ASSERT_TRUE(unregistered.valid());
@@ -326,6 +411,246 @@ TEST(StandaloneShmIpcTest, StandaloneClientResolvesAcrossMultipleRegions) {
   allocator.Free(region_a);
   allocator.Free(region_b);
   allocator.Free(unregistered);
+  server.Shutdown();
+  server_thread.join();
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+}
+
+TEST(StandaloneShmIpcTest, DeregistrationCannotUnmapAnInFlightDataOperation) {
+  constexpr size_t kValueSize = 32ULL << 20;
+  const std::string suffix = std::to_string(getpid());
+  const std::string address =
+      "unix:///tmp/umbp_standalone_deregister_race_" + suffix + ".grpc.sock";
+  const std::string grpc_path = standalone::UnixPathFromGrpcAddress(address);
+  const std::string fd_path = standalone::DeriveFdSocketPath(address);
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+
+  UMBPConfig config;
+  config.dram.capacity_bytes = 2 * kValueSize;
+  config.ssd.enabled = false;
+  standalone::StandaloneServer server(config, address);
+  ASSERT_TRUE(server.Start());
+  std::thread server_thread([&]() { server.Run(); });
+
+  HostMemAllocator allocator;
+  HostBufferOptions options;
+  options.backing = HostBufferBacking::kAnonymousShm;
+  options.prefault = false;
+  HostBufferHandle handle = allocator.Alloc(2 * kValueSize, options);
+  ASSERT_TRUE(handle.valid());
+  auto* bytes = static_cast<unsigned char*>(handle.ptr);
+  std::memset(bytes, 0x5a, kValueSize);
+  std::memset(bytes + kValueSize, 0, kValueSize);
+
+  auto allocation = HostMemAllocator::LookupShmAllocation(reinterpret_cast<uintptr_t>(handle.ptr),
+                                                          handle.mapped_size);
+  ASSERT_TRUE(allocation.has_value());
+  constexpr char kClientId[] = "deregister-race-client";
+  std::string registration_error;
+  ASSERT_EQ(standalone::SendFdRegistration(fd_path, allocation->fd, kClientId,
+                                           reinterpret_cast<uintptr_t>(handle.ptr),
+                                           allocation->mapped_size, 5000, &registration_error),
+            0)
+      << registration_error;
+
+  auto channel = grpc::CreateChannel(address, grpc::InsecureChannelCredentials());
+  auto stub = ::umbp::UMBPStandalone::NewStub(channel);
+  {
+    grpc::ClientContext context;
+    ::umbp::RegisterMemoryRequest request;
+    request.set_kind(::umbp::MEMORY_KIND_HOST_SHM);
+    request.set_client_id(kClientId);
+    request.set_worker_base(reinterpret_cast<uintptr_t>(handle.ptr));
+    request.set_size(allocation->mapped_size);
+    ::umbp::BoolResponse response;
+    const grpc::Status status = stub->RegisterMemory(&context, request, &response);
+    ASSERT_TRUE(status.ok());
+    ASSERT_TRUE(response.ok()) << response.error();
+  }
+
+  {
+    grpc::ClientContext context;
+    ::umbp::PutRequest request;
+    request.set_key("large-value");
+    request.set_client_id(kClientId);
+    request.set_region_base(reinterpret_cast<uintptr_t>(handle.ptr));
+    request.set_shm_offset(0);
+    request.set_size(kValueSize);
+    ::umbp::BoolResponse response;
+    const grpc::Status status = stub->Put(&context, request, &response);
+    ASSERT_TRUE(status.ok());
+    ASSERT_TRUE(response.ok()) << response.error();
+  }
+
+  std::atomic<bool> get_started{false};
+  grpc::Status get_status;
+  ::umbp::BoolResponse get_response;
+  std::thread getter([&]() {
+    grpc::ClientContext context;
+    ::umbp::GetRequest request;
+    request.set_key("large-value");
+    request.set_client_id(kClientId);
+    request.set_region_base(reinterpret_cast<uintptr_t>(handle.ptr));
+    request.set_shm_offset(kValueSize);
+    request.set_size(kValueSize);
+    get_started.store(true, std::memory_order_release);
+    get_status = stub->Get(&context, request, &get_response);
+  });
+
+  while (!get_started.load(std::memory_order_acquire)) std::this_thread::yield();
+  std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  grpc::Status deregister_status;
+  {
+    grpc::ClientContext context;
+    ::umbp::DeregisterMemoryRequest request;
+    request.set_client_id(kClientId);
+    ::umbp::Empty response;
+    deregister_status = stub->DeregisterMemory(&context, request, &response);
+  }
+  getter.join();
+
+  ASSERT_TRUE(deregister_status.ok());
+  ASSERT_TRUE(get_status.ok());
+  if (get_response.ok()) {
+    EXPECT_EQ(std::memcmp(bytes, bytes + kValueSize, kValueSize), 0);
+  }
+
+  // Once deregistration returns, new operations must fail resolution rather
+  // than reaching a stale server-side mapping.
+  {
+    grpc::ClientContext context;
+    ::umbp::GetRequest request;
+    request.set_key("large-value");
+    request.set_client_id(kClientId);
+    request.set_region_base(reinterpret_cast<uintptr_t>(handle.ptr));
+    request.set_shm_offset(kValueSize);
+    request.set_size(kValueSize);
+    ::umbp::BoolResponse response;
+    const grpc::Status status = stub->Get(&context, request, &response);
+    EXPECT_TRUE(status.ok());
+    EXPECT_FALSE(response.ok());
+  }
+
+  allocator.Free(handle);
+  server.Shutdown();
+  server_thread.join();
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+}
+
+TEST(StandaloneShmIpcTest, WritersCompleteUnderContinuousReaderLoad) {
+  constexpr int kReaderCount = 8;
+  constexpr size_t kValueSize = 2ULL << 20;
+  const std::string address =
+      "unix:///tmp/umbp_standalone_writer_liveness_" + std::to_string(getpid()) + ".grpc.sock";
+  const std::string grpc_path = standalone::UnixPathFromGrpcAddress(address);
+  const std::string fd_path = standalone::DeriveFdSocketPath(address);
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+
+  UMBPConfig config;
+  config.dram.capacity_bytes = 8 * kValueSize;
+  config.ssd.enabled = false;
+  UMBPStandaloneProcessConfig standalone_config;
+  standalone_config.address = address;
+  standalone_config.startup_timeout_ms = 5000;
+  config.standalone_process = standalone_config;
+
+  standalone::StandaloneServer server(config, address);
+  ASSERT_TRUE(server.Start());
+  std::thread server_thread([&]() { server.Run(); });
+
+  HostMemAllocator allocator;
+  HostBufferOptions options;
+  options.backing = HostBufferBacking::kAnonymousShm;
+  options.prefault = false;
+
+  std::vector<std::unique_ptr<IUMBPClient>> readers;
+  std::vector<HostBufferHandle> reader_buffers;
+  readers.reserve(kReaderCount);
+  reader_buffers.reserve(kReaderCount);
+  for (int i = 0; i < kReaderCount; ++i) {
+    reader_buffers.push_back(allocator.Alloc(kValueSize, options));
+    ASSERT_TRUE(reader_buffers.back().valid());
+    auto client = CreateUMBPClient(config);
+    ASSERT_TRUE(client->RegisterMemory(reinterpret_cast<uintptr_t>(reader_buffers.back().ptr),
+                                       reader_buffers.back().mapped_size));
+    readers.push_back(std::move(client));
+  }
+
+  HostBufferHandle writer_buffer = allocator.Alloc(2 * kValueSize, options);
+  ASSERT_TRUE(writer_buffer.valid());
+  auto writer = CreateUMBPClient(config);
+  ASSERT_TRUE(writer->RegisterMemory(reinterpret_cast<uintptr_t>(writer_buffer.ptr),
+                                     writer_buffer.mapped_size));
+  auto* writer_bytes = static_cast<unsigned char*>(writer_buffer.ptr);
+  std::memset(writer_bytes, 0x31, kValueSize);
+  std::memset(writer_bytes + kValueSize, 0x72, kValueSize);
+  ASSERT_TRUE(writer->Put("read-hot-key", reinterpret_cast<uintptr_t>(writer_bytes), kValueSize));
+
+  std::atomic<bool> stop{false};
+  std::atomic<int> readers_started{0};
+  std::vector<std::thread> reader_threads;
+  reader_threads.reserve(kReaderCount);
+  for (int i = 0; i < kReaderCount; ++i) {
+    reader_threads.emplace_back([&, i]() {
+      readers_started.fetch_add(1, std::memory_order_release);
+      while (!stop.load(std::memory_order_acquire)) {
+        readers[i]->Get("read-hot-key", reinterpret_cast<uintptr_t>(reader_buffers[i].ptr),
+                        kValueSize);
+      }
+    });
+  }
+  while (readers_started.load(std::memory_order_acquire) != kReaderCount) {
+    std::this_thread::yield();
+  }
+  // Let every synchronous reader enter its steady RPC loop before introducing
+  // a writer; otherwise this could accidentally test an uncontended lock.
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  auto run_with_deadline = [&](auto operation) {
+    std::atomic<bool> done{false};
+    std::atomic<bool> ok{false};
+    std::thread operation_thread([&]() {
+      ok.store(operation(), std::memory_order_relaxed);
+      done.store(true, std::memory_order_release);
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!done.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool completed_in_time = done.load(std::memory_order_acquire);
+    if (!completed_in_time) stop.store(true, std::memory_order_release);
+    operation_thread.join();
+    return std::pair{completed_in_time, ok.load(std::memory_order_relaxed)};
+  };
+
+  const auto put_result = run_with_deadline([&]() {
+    return writer->Put("writer-liveness-key",
+                       reinterpret_cast<uintptr_t>(writer_bytes + kValueSize), kValueSize);
+  });
+  EXPECT_TRUE(put_result.first) << "Put starved behind continuous readers";
+  EXPECT_TRUE(put_result.second);
+
+  std::pair<bool, bool> clear_result{false, false};
+  if (put_result.first) clear_result = run_with_deadline([&]() { return writer->Clear(); });
+  EXPECT_TRUE(clear_result.first) << "Clear starved behind continuous readers";
+  EXPECT_TRUE(clear_result.second);
+
+  stop.store(true, std::memory_order_release);
+  for (auto& thread : reader_threads) thread.join();
+
+  for (size_t i = 0; i < readers.size(); ++i) {
+    readers[i]->DeregisterMemory(reinterpret_cast<uintptr_t>(reader_buffers[i].ptr));
+    readers[i]->Close();
+    allocator.Free(reader_buffers[i]);
+  }
+  writer->DeregisterMemory(reinterpret_cast<uintptr_t>(writer_buffer.ptr));
+  writer->Close();
+  allocator.Free(writer_buffer);
+
   server.Shutdown();
   server_thread.join();
   unlink(grpc_path.c_str());
