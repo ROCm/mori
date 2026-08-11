@@ -376,19 +376,29 @@ void CopyHostJobs(const std::vector<CopyJob*>& jobs, int num_threads) {
   for (auto& thread : pool) thread.join();
 }
 
-// One reusable stream per device.
+// One reusable stream per (thread, device).
 //
-// Creating and destroying a stream around every batch costs ~6.5 ms per pair on
-// MI355X/ROCm 7.2 (measured), which dwarfs the copies themselves: a layer-wise
-// KV load issues 2 * num_layers batches per request, so the churn alone added
-// ~1 s per rank.
+// Reusing a stream is what makes the batch path affordable: creating and
+// destroying one around every batch costs ~6.5 ms per pair on MI355X/ROCm 7.2
+// (measured), which dwarfs the copies themselves.
+//
+// Per thread, not just per device, because a batch ends with
+// hipStreamSynchronize. Sharing one stream across threads makes every batch
+// wait for every other batch queued on that device -- loads behind loads, and
+// loads behind the offload path, which writes continuously under
+// write_through_threshold=1. That coupling, not the DMA, held the measured copy
+// phase to 1.7 GB/s against 49 GB/s for the same shape in isolation.
 //
 // The streams are intentionally never destroyed: tearing down HIP resources
-// from a static destructor races with runtime teardown.
+// from a thread or static destructor races with runtime teardown. The count is
+// bounded by the server's worker threads times the devices they touch.
+std::map<int, hipStream_t>& DeviceStreamCache() {
+  static thread_local std::map<int, hipStream_t>* streams = new std::map<int, hipStream_t>();
+  return *streams;
+}
+
 hipStream_t DeviceStream(int device_id) {
-  static std::mutex stream_mu;
-  static std::map<int, hipStream_t> streams;
-  std::lock_guard<std::mutex> lock(stream_mu);
+  std::map<int, hipStream_t>& streams = DeviceStreamCache();
   auto it = streams.find(device_id);
   if (it != streams.end()) return it->second;
 
@@ -403,6 +413,12 @@ hipStream_t DeviceStream(int device_id) {
   streams.emplace(device_id, stream);
   return stream;
 }
+
+// Forget a stream that reported a failure so the next batch builds a fresh one.
+// The old handle is intentionally not destroyed, for the same reason the cache
+// never destroys any of them. This does not repair a context that a fault has
+// already made unusable; it only avoids reusing a stream known to have failed.
+void DiscardDeviceStream(int device_id) { DeviceStreamCache().erase(device_id); }
 
 // Circuit breaker for the gather kernel.
 //
@@ -547,6 +563,7 @@ void CopyDeviceJobs(const std::vector<CopyJob*>& jobs, int device_id, hipMemcpyK
     // context unusable the retry fails too. The complete fix is to distinguish
     // the failure reasons at the tier/manager boundary.
     if (gathered) DisableGatherPath();
+    DiscardDeviceStream(device_id);
   }
 
   if (enqueued_all) {
