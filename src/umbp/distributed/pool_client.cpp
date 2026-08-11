@@ -294,80 +294,83 @@ bool PoolClient::Init() {
   }
   transfer_engine_ = std::move(composite);
 
-  // Peer-side backends: DRAM is the one real, self-allocated medium (design
-  // doc §1 item 4 / Phase 2b — the backend owns its memory, PoolClient holds no
-  // buffer pointer).  This is the ONLY place in the tree that decides which
-  // media are live; everything downstream dispatches through registry_ (Phase
-  // 3).  Note it no longer NAMES a concrete backend type either: MakePageBackend
-  // hands back a MediumBackend, which is what closes Phase 5 Rule A.
+  // Peer-side backend: ONE medium, chosen by config_.medium.
+  //
+  // This is the ONLY place in the tree that decides which medium is live;
+  // everything downstream dispatches through registry_ (Phase 3) and never
+  // names a tier.  It does not name a concrete backend TYPE either — each
+  // factory hands back a MediumBackend, which is what closes Phase 5 Rule A.
+  //
+  // WHY ONE.  The registry holds a map keyed by tier and would happily take
+  // all three, but UMBP's routing plane does not tier: master treats every
+  // advertised tier as an equally valid put target (Phase 4 deleted the
+  // hardcoded tier orders), so a node registering DRAM *and* SSD does not get
+  // "DRAM in front of SSD" — it gets two independent pools that master picks
+  // between by free capacity, i.e. mirroring, not promotion.  Local tiering is
+  // a policy nobody has asked for; heterogeneity comes from different NODES
+  // picking different media, which the routing plane already handles.  See
+  // UMBPMedium in common/config.h.
   const uint64_t page_size =
       config_.dram_page_size > 0 ? config_.dram_page_size : 2ULL * 1024 * 1024;
-  PageBackend::OwnershipConfig dram_ownership;
-  dram_ownership.buffer_sizes = config_.dram.buffer_sizes;
-  dram_ownership.use_hugepages = config_.dram.use_hugepages;
-  dram_ownership.hugepage_size = config_.dram.hugepage_size;
-  dram_ownership.numa_node = config_.dram.numa_node;
-  dram_ownership.prefault = config_.dram.prefault;
 
-  auto dram = MakePageBackend(TierType::DRAM, page_size, std::move(dram_ownership),
-                              /*pending_ttl=*/std::chrono::milliseconds{30000},
-                              /*read_lease_ttl=*/DramReadLeaseTtl());
+  std::unique_ptr<MediumBackend> backend;
+  switch (config_.medium) {
+    case TierType::DRAM: {
+      // Self-allocated at Init from sizing knobs only — PoolClient holds no
+      // buffer pointer (design doc §1 item 4 / Phase 2b).
+      PageBackend::OwnershipConfig dram_ownership;
+      dram_ownership.buffer_sizes = config_.dram.buffer_sizes;
+      dram_ownership.use_hugepages = config_.dram.use_hugepages;
+      dram_ownership.hugepage_size = config_.dram.hugepage_size;
+      dram_ownership.numa_node = config_.dram.numa_node;
+      dram_ownership.prefault = config_.dram.prefault;
+      backend = MakePageBackend(TierType::DRAM, page_size, std::move(dram_ownership),
+                                /*pending_ttl=*/std::chrono::milliseconds{30000},
+                                /*read_lease_ttl=*/DramReadLeaseTtl());
+      break;
+    }
+    case TierType::HBM: {
+      backend = MakeHbmBackend(page_size, config_.hbm.device, config_.hbm.buffer_sizes,
+                               /*pending_ttl=*/std::chrono::milliseconds{30000},
+                               /*read_lease_ttl=*/DramReadLeaseTtl());
+      break;
+    }
+    case TierType::SSD: {
+      // The one medium that is genuinely NOT like the others: its bytes are not
+      // addressable, so it publishes a registered host staging arena and spills
+      // behind it (see ssd_backend.h).  Everything outside that class — routing,
+      // peer service, heartbeat, the batch executors — sees ordinary pages.
+      SsdBackend::Config ssd_cfg;
+      ssd_cfg.page_size = page_size;
+      ssd_cfg.staging_pages = config_.ssd_staging_buffer_slots > 0
+                                  ? static_cast<uint32_t>(config_.ssd_staging_buffer_slots)
+                                  : 16;
+      ssd_cfg.ssd = config_.ssd;
+      ssd_cfg.ssd.enabled = true;  // selecting SSD IS the opt-in
+      ssd_cfg.read_lease_ttl = DramReadLeaseTtl();
+      backend = MakeSsdBackend(std::move(ssd_cfg));
+      break;
+    }
+    case TierType::UNKNOWN:
+      break;  // falls into the null check below
+  }
+  if (backend == nullptr) {
+    MORI_UMBP_ERROR("[PoolClient] unknown medium {}", static_cast<int>(config_.medium));
+    initialized_ = false;
+    return false;
+  }
+
   // Narrowed to MemoryRegistrar: a backend publishes endpoints, it does not
   // move bytes, and that is now a compile-time fact (design doc §5 Rule C).
-  if (!dram->Init(static_cast<MemoryRegistrar*>(transfer_engine_.get()))) {
-    MORI_UMBP_ERROR("[PoolClient] DRAM backend Init failed");
+  medium_ = backend->Tier();
+  if (!backend->Init(static_cast<MemoryRegistrar*>(transfer_engine_.get()))) {
+    MORI_UMBP_ERROR("[PoolClient] {} backend Init failed", TierTypeName(medium_));
     initialized_ = false;
     return false;
   }
-  if (!registry_.Register(std::move(dram))) {
+  if (!registry_.Register(std::move(backend))) {
     initialized_ = false;
     return false;
-  }
-
-  // HBM: the second medium, and the proof that adding one is a registration
-  // rather than an edit.  Everything below this block — routing, peer service,
-  // heartbeat, the batch executors — was written against BackendRegistry and
-  // needed no change to serve it.
-  if (config_.hbm.enabled && !config_.hbm.buffer_sizes.empty()) {
-    auto hbm = MakeHbmBackend(page_size, config_.hbm.device, config_.hbm.buffer_sizes,
-                              /*pending_ttl=*/std::chrono::milliseconds{30000},
-                              /*read_lease_ttl=*/DramReadLeaseTtl());
-    if (!hbm->Init(static_cast<MemoryRegistrar*>(transfer_engine_.get()))) {
-      MORI_UMBP_ERROR("[PoolClient] HBM backend Init failed on device {}", config_.hbm.device);
-      initialized_ = false;
-      return false;
-    }
-    if (!registry_.Register(std::move(hbm))) {
-      initialized_ = false;
-      return false;
-    }
-  }
-
-  // SSD: the third medium, and the one that is genuinely NOT like the others —
-  // its bytes are not addressable, so it publishes a registered host staging
-  // arena and spills behind it (see ssd_backend.h).  Phase 0 unwired SSD from
-  // the data plane precisely so it could come back as a backend rather than as
-  // a special case threaded through PoolClient; this block is that return, and
-  // it is the same three lines the other two media take.
-  if (config_.ssd.enabled) {
-    SsdBackend::Config ssd_cfg;
-    ssd_cfg.page_size = page_size;
-    ssd_cfg.staging_pages = config_.ssd_staging_buffer_slots > 0
-                                ? static_cast<uint32_t>(config_.ssd_staging_buffer_slots)
-                                : 16;
-    ssd_cfg.ssd = config_.ssd;
-    ssd_cfg.read_lease_ttl = DramReadLeaseTtl();
-
-    auto ssd = MakeSsdBackend(std::move(ssd_cfg));
-    if (!ssd->Init(static_cast<MemoryRegistrar*>(transfer_engine_.get()))) {
-      MORI_UMBP_ERROR("[PoolClient] SSD backend Init failed");
-      initialized_ = false;
-      return false;
-    }
-    if (!registry_.Register(std::move(ssd))) {
-      initialized_ = false;
-      return false;
-    }
   }
 
   master_client_->SetBackendRegistry(&registry_);
@@ -415,9 +418,9 @@ bool PoolClient::Init() {
 
   if (config_.master_config.auto_heartbeat) master_client_->StartHeartbeat();
 
-  // Start the async re-cache worker only when the feature is on and this node has
-  // an exportable local DRAM tier to install into.
-  if (config_.cache_remote_fetches && registry_.Get(TierType::DRAM) != nullptr) {
+  // Start the async re-cache worker only when the feature is on and this node
+  // has an exportable local medium to install into.
+  if (config_.cache_remote_fetches && registry_.Get(medium_) != nullptr) {
     {
       std::lock_guard<std::mutex> lk(recache_mutex_);
       recache_stop_ = false;
@@ -708,8 +711,8 @@ PoolClient::GetAttemptOutcome PoolClient::ExecuteLocalGet(const std::string& key
 }
 
 void PoolClient::MaybeReCacheAfterRemote(const std::string& key, const void* src, size_t size) {
-  auto* dram = registry_.Get(TierType::DRAM);
-  if (dram == nullptr || dram->BufferCount() == 0) return;  // no exportable local tier here
+  auto* local = registry_.Get(medium_);
+  if (local == nullptr || local->BufferCount() == 0) return;  // no exportable local medium here
   // Admission gate (cache_remote_fetches / size==0 / NEVER / SIZE cap): shared
   // pure predicate, unit-tested in test_cache_remote_admission.cpp.
   if (!ShouldAdmitReCache(config_.cache_remote_fetches, config_.cache_remote_admission,
@@ -718,9 +721,9 @@ void PoolClient::MaybeReCacheAfterRemote(const std::string& key, const void* src
                     size);
     return;
   }
-  // ALWAYS and SIZE both delegate DRAM-capacity enforcement to the peer
-  // allocator: Allocate returns kFailedNoSpace when the tier is full, which we
-  // treat as a best-effort miss (the remote read result is unaffected).
+  // ALWAYS and SIZE both delegate capacity enforcement to the peer allocator:
+  // Allocate returns kFailedNoSpace when the medium is full, which we treat as
+  // a best-effort miss (the remote read result is unaffected).
 
   // Prepare the job outside the queue lock: the source buffer is valid for this
   // call, but copying a multi-MiB block while holding recache_mutex_ would
@@ -763,11 +766,12 @@ void PoolClient::ReCacheWorkerLoop() {
       job = std::move(recache_queue_.front());
       recache_queue_.pop_front();
     }
-    // Install into local DRAM. ExecuteLocalPut allocates a slot on the routed backend,
-    // copies the bytes, and Commit queues a KvEvent::ADD that reaches the master
-    // via heartbeat — mirroring the local Put publish path. kSuccessAlreadyExists
-    // makes this idempotent for a repeat remote read of the same key.
-    switch (ExecuteLocalPut(job.key, job.bytes.get(), job.size, TierType::DRAM)) {
+    // Install into this node's medium. ExecuteLocalPut allocates a slot on that
+    // backend, copies the bytes, and Commit queues a KvEvent::ADD that reaches
+    // the master via heartbeat — mirroring the local Put publish path.
+    // kSuccessAlreadyExists makes this idempotent for a repeat remote read of
+    // the same key.
+    switch (ExecuteLocalPut(job.key, job.bytes.get(), job.size, medium_)) {
       case PutAttemptOutcome::kSuccess:
         MORI_UMBP_DEBUG("[PoolClient] ReCacheWorker: re-cached key='{}' size={}", job.key,
                         job.size);
@@ -870,7 +874,10 @@ PoolClient::BatchPutPlan PoolClient::PartitionBatchPutTargets(
           .index = i, .key = &keys[i], .src = srcs[i], .size = sizes[i], .route = route});
       continue;
     }
-    if (route.tier != TierType::DRAM && route.tier != TierType::HBM) continue;
+    // No tier filter: every medium a peer advertises publishes registered
+    // pages (SSD's are its staging arena — see ssd_backend.h), so the remote
+    // put path is the same for all of them.  The old DRAM/HBM allowlist here
+    // silently dropped puts master routed to a peer's SSD.
     plan.remote_groups[route.node_id].push_back(BatchPutItem{
         .index = i, .key = &keys[i], .src = srcs[i], .size = sizes[i], .route = route});
   }

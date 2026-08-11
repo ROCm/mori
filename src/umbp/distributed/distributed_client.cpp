@@ -23,6 +23,7 @@
 
 #include <map>
 #include <stdexcept>
+#include <string>
 
 #include "mori/io/engine.hpp"
 #include "mori/utils/mori_log.hpp"
@@ -38,6 +39,12 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
 
   const auto& dc = config.distributed.value();
 
+  // All three ownership blocks are lowered unconditionally; dc.medium selects
+  // the one PoolClient::Init actually builds a backend from (exactly one medium
+  // per node — see UMBPMedium in common/config.h).  Lowering all three keeps
+  // this function free of medium branching and lets one deployment template
+  // carry dram/hbm/ssd sizing while choosing between them with a single field.
+  //
   // Ownership (ptr, hugepages, NUMA, prefault) moved into PoolClient's DRAM
   // PageBackend — it self-allocates at Init() instead of DistributedClient
   // calling HostMemAllocator and handing over a buffer pointer
@@ -51,25 +58,22 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   dram_ownership.prefault = config.dram.prefault;
 
   // SSD came back to the distributed data plane as a MediumBackend: Phase 0
-  // unwired the old PeerSsdManager special case, and PoolClient::Init now
-  // registers an SsdBackend from PoolClientConfig::ssd the same way it
-  // registers DRAM and HBM.  All that was missing was this lowering, so the
-  // tier stayed dark no matter how UMBPConfig::ssd was set.
+  // unwired the old PeerSsdManager special case, and PoolClient::Init builds an
+  // SsdBackend from PoolClientConfig::ssd the same way it builds DRAM and HBM.
   //
-  // Gated on dc.enable_ssd_tier, NOT config.ssd.enabled — the latter defaults
-  // to true, so keying off it would make every existing distributed deployment
-  // start advertising SSD capacity it had never opted into.
+  // PeerSsdConfig::enabled is set by ToPoolClientConfig from dc.medium, NOT
+  // from config.ssd.enabled — that flag defaults to true and describes the
+  // LOCAL-mode tier, so keying the distributed medium off it would make every
+  // existing distributed deployment start advertising SSD capacity it had never
+  // opted into.
   PeerSsdConfig ssd_ownership;
-  if (dc.enable_ssd_tier && config.ssd.enabled) {
-    ssd_ownership.enabled = true;
-    ssd_ownership.ssd = config.ssd;
-  }
+  ssd_ownership.ssd = config.ssd;
 
   // HBM is different again: dc.hbm carries everything PoolClient's HBM
-  // PageBackend needs (enabled/device/capacity), and ToPoolClientConfig lowers
-  // it directly from dc — no ownership struct crosses this boundary the way
-  // dram's hugepages/NUMA/prefault knobs do, because hipMalloc has none of
-  // those dimensions.
+  // PageBackend needs (device/capacity), and ToPoolClientConfig lowers it
+  // directly from dc — no ownership struct crosses this boundary the way dram's
+  // hugepages/NUMA/prefault knobs do, because hipMalloc has none of those
+  // dimensions.
   auto pc_config = ToPoolClientConfig(dc, std::move(dram_ownership), std::move(ssd_ownership));
   pc_config.copy_pipeline = config_.copy_pipeline;
 
@@ -85,22 +89,39 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
     tags_str += t;
   }
 
+  // Only the live medium's sizing is logged: the other two blocks were lowered
+  // but never allocated from, and printing them invites reading a config that
+  // is not in effect (the exact confusion the single selector removes).
+  const auto mb = [](uint64_t bytes) { return std::to_string(bytes / (1024 * 1024)); };
+  std::string medium_desc;
+  switch (dc.medium) {
+    case UMBPMedium::DRAM:
+      medium_desc = "DRAM pool=" + mb(config_.dram.capacity_bytes) +
+                    "MB hugepages=" + (config_.dram.use_hugepages ? "true" : "false") +
+                    " hugepage_size=" + mb(config_.dram.hugepage_size) +
+                    "MB numa_node=" + std::to_string(config_.dram.numa_node);
+      break;
+    case UMBPMedium::HBM:
+      medium_desc =
+          "HBM pool=" + mb(dc.hbm.capacity_bytes) + "MB device=" + std::to_string(dc.hbm.device);
+      break;
+    case UMBPMedium::SSD:
+      medium_desc = "SSD pool=" + mb(config_.ssd.capacity_bytes) +
+                    "MB backend=" + config_.ssd.ssd_backend + " dir=" + config_.ssd.storage_dir +
+                    " staging=" + mb(dc.ssd_staging_buffer_size) + "MB/" +
+                    std::to_string(dc.ssd_staging_buffer_slots) + "slots";
+      break;
+  }
+
   MORI_UMBP_INFO(
       "[DistributedClient] initialized — "
-      "node_id={} node_address={} master={} "
-      "dram_pool={}MB hugepages={} hugepage_size={}MB numa_node={} "
-      "hbm_pool={}MB hbm_device={} ssd_tier={} ssd_pool={}MB ssd_backend={} "
-      "dram_page_size={}KB staging_buffer={}MB peer_port={} cache_remote={} "
+      "node_id={} node_address={} master={} medium=[{}] "
+      "page_size={}KB staging_buffer={}MB peer_port={} cache_remote={} "
       "io_engine={}:{} tags=[{}]",
       dc.master_config.node_id, dc.master_config.node_address, dc.master_config.master_address,
-      config.dram.capacity_bytes / (1024 * 1024), config_.dram.use_hugepages,
-      config_.dram.hugepage_size / (1024 * 1024), config_.dram.numa_node,
-      dc.hbm.enabled ? dc.hbm.capacity_bytes / (1024 * 1024) : 0,
-      dc.hbm.enabled ? dc.hbm.device : -1, dc.enable_ssd_tier && config_.ssd.enabled,
-      (dc.enable_ssd_tier && config_.ssd.enabled) ? config_.ssd.capacity_bytes / (1024 * 1024) : 0,
-      (dc.enable_ssd_tier && config_.ssd.enabled) ? config_.ssd.ssd_backend : std::string{"none"},
-      dc.dram_page_size / 1024, dc.staging_buffer_size / (1024 * 1024), dc.peer_service_port,
-      dc.cache_remote_fetches, dc.io_engine.host, dc.io_engine.port, tags_str);
+      medium_desc, dc.dram_page_size / 1024, dc.staging_buffer_size / (1024 * 1024),
+      dc.peer_service_port, dc.cache_remote_fetches, dc.io_engine.host, dc.io_engine.port,
+      tags_str);
 }
 
 DistributedClient::~DistributedClient() { Close(); }
