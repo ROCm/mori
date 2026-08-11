@@ -35,7 +35,6 @@
 #include "umbp/common/env_time.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/master/rpc_latency_timer.h"
-#include "umbp/distributed/peer/ssd/peer_ssd_manager.h"
 
 namespace mori::umbp {
 
@@ -409,16 +408,6 @@ void MasterClient::SetBackendRegistry(BackendRegistry* registry) {
   }
 }
 
-void MasterClient::SetPeerSsdManager(PeerSsdManager* ssd_manager) {
-  // PeerSsdManager is not a MediumBackend (backend-agnostic refactor Phase 0,
-  // see design-backend-agnostic-refactor.md): that wiring was exactly the
-  // coupling Phase 0 removes. Nothing calls this today (SSD is unwired from the
-  // distributed data plane), but the concrete pointer stays so a live capacity
-  // merge (see SnapshotAndCacheTierCapacities below) keeps working if a future
-  // caller re-wires it.
-  ssd_manager_ = ssd_manager;
-}
-
 std::vector<MediumBackend*> MasterClient::Backends() const {
   return registry_ == nullptr ? std::vector<MediumBackend*>{} : registry_->All();
 }
@@ -525,14 +514,6 @@ std::map<TierType, TierCapacity> MasterClient::SnapshotAndCacheTierCapacities() 
   for (auto* backend : Backends()) {
     caps[backend->Tier()] = backend->Capacity();  // bitmap-derived, per medium
     have_live = true;
-  }
-  if (ssd_manager_ != nullptr) {
-    auto [used, total] = ssd_manager_->Capacity();
-    if (total > 0) {
-      const uint64_t avail = used < total ? total - used : 0;
-      caps[TierType::SSD] = TierCapacity{total, avail};
-      have_live = true;
-    }
   }
   std::lock_guard lock(caps_mutex_);
   if (!have_live) return current_capacities_;
