@@ -124,6 +124,35 @@ def _hip_default() -> dict:
 #     bites at topk 6, where fp4 wants the wider grid two buckets earlier (ct=2048:
 #     128x16 64.2us against 64x16 67.9).
 _DISPATCH_TABLE: dict = {
+    # MI355X / gfx950, EP8 hidden 7168, 2026-08-11: same grid, 64..16384 tokens x
+    # {64x8, 64x16, 128x8, 128x16, 256x8} x {bf16, fp8, fp4} x {topk 8 / 32 experts,
+    # topk 6 / 48 experts}, ITERS=50.
+    #
+    # THE ANSWER IS NOT gfx1250'S, and not because the numbers came out differently --
+    # the shape of the problem is different. There is no TDM here: the portable dispatch
+    # reserves no LDS (sharedBytes is 0) and moves its payload with plain vector copies,
+    # so bf16 and fp8 are bandwidth-bound and the grid barely registers. Cost of taking
+    # the smallest geometry, 64x8, against the best of the five at each token count:
+    #
+    #   bf16   0-2% everywhere, both topk        -> flat, take the smallest
+    #   fp8    1-2% from ct>=512, both topk      -> same (the 4-16% at ct<=128 is noise:
+    #                                               the ITERS=20 pass had it the other way)
+    #   fp4    6-69% from ct>=128                -> the one dtype that cares
+    #
+    # fp4 is 1/4 the payload, which is what tips it out of bandwidth-bound and into
+    # caring about how many blocks are issuing -- the same mechanism as on gfx1250, at a
+    # different threshold. It wants 128x8 flat; at ct=64 that costs nothing (32.4 against
+    # 32.5), so it gets one bucket rather than an edge.
+    #
+    # topk 6 and 8 came out identical here, unlike gfx1250 where _tpi moves the edges.
+    # Written as two entries rather than a topk wildcard on purpose: the MECHANISM says
+    # topk should matter (it sets tokens-per-warp-iteration), and it demonstrably does on
+    # the other arch, so an unmeasured topk should fall back to the single-shot default
+    # rather than inherit a schedule from a topk that happened to agree.
+    "mi355x": {
+        (8, 7168, 8, None): {None: ((None, 64, 8),), "fp4": ((None, 128, 8),)},
+        (8, 7168, 6, None): {None: ((None, 64, 8),), "fp4": ((None, 128, 8),)},
+    },
     "gfx1250": {
         # topk 8 (256 experts at EP4). All three dtypes agree here.
         #   ct     64x8   64x16  128x16 256x16      (bf16 / fp8 / fp4)
@@ -158,6 +187,16 @@ _DISPATCH_TABLE: dict = {
 #   16384  574.1   565.0  524.9  996.3   |  564.4 542.7 469.2 1027.0
 # 256x8 is not a near miss at the top end, it is a 2x collapse; 128x4 never wins.
 _COMBINE_TABLE: dict = {
+    # MI355X / gfx950 EP8: 64x8 wins at every token count and both topk, against
+    # 32x8 / 48x8 / 64x16 / 80x8 (us at ct=4096, topk 8: 991.6 / 750.5 / 724.3 / 738.5 /
+    # 745.2). Note this REPLACES the 80x8 that MakeEpCfg still uses as its arch default
+    # and that _hip_default() mirrors -- 80x8 was measured once, on a narrower grid; 64x8
+    # is 2-3% faster with 16 fewer blocks. Fewer blocks than 64 is not free here: 32x8
+    # costs 37% at ct=4096, so this is a real optimum, not just the smallest thing tried.
+    "mi355x": {
+        (8, 7168, 8, None): ((None, 64, 8),),
+        (8, 7168, 6, None): ((None, 64, 8),),
+    },
     "gfx1250": {
         (4, 7168, 8, None): ((512, 64, 8), (None, 128, 8)),
         (4, 7168, 6, None): ((512, 64, 8), (None, 128, 8)),
