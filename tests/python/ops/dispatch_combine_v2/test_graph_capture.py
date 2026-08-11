@@ -22,21 +22,13 @@
 # SOFTWARE.
 """HIP-graph capture of a whole dispatch -> expert -> combine step.
 
-The Prepare/Launch split exists for this: every plan is compiled and its module
-loaded at construction, so a launch is only hipModuleLaunchKernel and nothing in
-the steady-state path can fork a compiler mid-capture. This test is what makes
-that claim checkable, because two things could still break it and neither shows
-up in eager runs:
+Two things could break capture and neither shows up in eager runs: a host->device
+sync inside the op aborts it, and the cross-device barrier epoch has to advance ON
+DEVICE (dispatch ends with atomicAdd(xdbFlag, 1)) or capture freezes one value into
+the graph and every replay after the first spins or passes vacuously.
 
-  * a host->device sync inside the op (a `.item()` on a counter) aborts a capture;
-  * the cross-device barrier epoch has to advance ON DEVICE. It does --
-    dispatch ends with atomicAdd(xdbFlag, 1) -- so a replay bumps it like a fresh
-    launch. Had the host computed the epoch, capture would freeze one value into
-    the graph and every replay after the first would spin or pass vacuously.
-
-Identity expert, so the reference is U[t] * inp[t] (U = distinct dest PEs), the
-same invariant test_op checks; what is verified here is that REPLAY reproduces it
-and keeps reproducing it, not just that the first launch works.
+Identity expert, so the reference is U[t] * inp[t] (U = distinct dest PEs). What is
+verified is that REPLAY keeps reproducing it, not just the first launch.
 
     torchrun --standalone --nproc_per_node=4 test_graph_capture.py
 """
@@ -178,7 +170,7 @@ def main():
         # Replay. Every rank replays the same number of times; the kernels' own
         # cross-device barrier keeps them together exactly as it does eagerly.
         bad = 0
-        for i in range(REPLAYS):
+        for _ in range(REPLAYS):
             comm.barrier()
             graph.replay()
             sync()

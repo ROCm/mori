@@ -57,11 +57,9 @@ namespace v2 {
 // caller asking for fp32 gets whatever this enum happens to call 1. Renumbering
 // either enum independently is a silent-wrong-answer change, not a refactor.
 // ---------------------------------------------------------------------------
-// Byte8 is a TRANSPORT type, not an arithmetic one: the dispatch leg only ever
-// copies its payload (WarpCopy on gfx9xx, a TDM tile on gfx125x), so an fp8 token
-// and an fp4 token -- 2 e2m1 packed per byte, with the caller halving hiddenDim --
-// both move as plain bytes and need no conversion, no scale, and no new kernel.
-// Combine reduces, so it cannot use this; MakeEpCfg rejects it there.
+// Byte8 is a TRANSPORT type: dispatch only copies its payload, so fp8 and fp4 (2
+// e2m1 per byte, caller halves hiddenDim) both move as bytes. Combine reduces and
+// cannot use it -- MakeEpCfg rejects it there.
 enum class EpDType : int { Bf16 = 0, Fp32 = 1, Byte8 = 2 };
 
 inline const char* EpDTypeName(EpDType d) {

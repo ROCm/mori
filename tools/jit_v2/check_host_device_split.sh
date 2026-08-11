@@ -67,10 +67,8 @@ done
 DEVICE_ONLY_HEADERS=("ep_intranode_kernel.hpp" "ep_intranode_1250x.hpp")
 pattern=$(printf '|%s' "${DEVICE_ONLY_HEADERS[@]}")
 pattern=${pattern:1}
-# The rule is that no HOST source may include one, so the device headers are not
-# themselves candidates: ep_intranode_1250x.hpp legitimately includes the portable
-# header for the EpPeer/EpWait*/EpMultiWarpIter helpers it reuses. Filter them out
-# by path, or the guard reports the device side including itself.
+# Only HOST sources are candidates -- a device header may include another one
+# (1250x reuses the portable EpPeer/EpWait* helpers), so filter them out by path.
 leaks=$(grep -rnE "^[[:space:]]*#[[:space:]]*include[[:space:]]*\"[^\"]*($pattern)\"" \
           "$ROOT/src" "$ROOT/include" --include=*.cpp --include=*.hpp 2>/dev/null \
         | grep -vE "/($pattern):" || true)

@@ -24,7 +24,6 @@
 One SymmArena window holds the symmetric staging; per-rank metadata are plain
 device tensors surfaced to the caller via from_gpu_ptr.
 """
-from dataclasses import dataclass
 
 import torch
 
@@ -315,10 +314,8 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
             cfg.dispatch_dtype,
             cfg.combine_dtype,
         ):
-            # Used to be a config-level error, which read as a property of the op.
-            # It is a gap in THIS backend's asymmetric path -- the hip backend moves
-            # an fp4 dispatch payload as bytes -- so it belongs with the rest of
-            # this backend's capability statements.
+            # Was a config-level error, which read as a property of the op; it is a
+            # gap in THIS backend's asymmetric path (hip moves fp4 as bytes).
             return ("fp4 with an asymmetric dispatch/combine dtype",)
         return ()
 

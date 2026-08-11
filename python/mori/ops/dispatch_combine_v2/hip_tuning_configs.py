@@ -21,49 +21,20 @@
 # SOFTWARE.
 """Launch-geometry tuning for the HIP/JIT EP kernels — separate from FlyDSL's.
 
-The C++/HIP kernels are a different implementation from the FlyDSL ones: different
-register pressure, occupancy, and best warp count (e.g. HIP combine peaks at 8
-warps on gfx950 EP8 where FlyDSL uses 4). So they carry their OWN tuned geometry
-and never borrow FlyDSL's schedule. This module deliberately does NOT import
-``tuning_configs`` (FlyDSL's table); it shares only the hardware-detection
-primitive (``mori.ops.utils``), the same one FlyDSL's table uses.
+Different kernels, different optima, so never borrow FlyDSL's schedule. This module
+does not import ``tuning_configs``; it shares only ``mori.ops.utils`` for device
+detection.
 
-THE TWO KERNELS ARE TUNED SEPARATELY, in two independent tables, because they are
-not tuned by the same things:
+Dispatch and combine get INDEPENDENT tables: dispatch depends on the dtype it
+transports, combine does not (it only ever reduces the bf16/fp32 staging region).
+Both are keyed by (world_size, hidden_dim, topk, experts_per_rank); an
+``experts_per_rank`` of None is a wildcard, used only where a sweep showed the expert
+count does not move the optimum. A bucket is (max_tok_inclusive | None, block, warp),
+ascending, and ``lookup`` merges the two into the op's
+(max_tok, disp_block, disp_warp, comb_block, comb_warp) schedule.
 
-  * dispatch depends on the DTYPE it transports (2 B, 1 B, or 2 e2m1 to a byte, which
-    changes both the LDS tile per warp and how much payload there is to hide behind)
-    and on topk, through the round rule below;
-  * combine does NOT depend on the dispatch dtype at all. It only ever reduces the
-    bf16/fp32 staging region, whatever dispatch carried. Giving it a dtype axis would
-    invent a dimension and then oblige three copies of one answer to stay in sync.
-
-Both are keyed by (world_size, hidden_dim, topk, experts_per_rank), with
-``experts_per_rank=None`` meaning "any" -- use that until a sweep shows the expert
-count actually moves the optimum, so the wildcard is a measured claim and not an
-assumption nobody wrote down. A bucket is (max_tok_inclusive | None, block, warp),
-ascending; lookup composes the two into the op's schedule.
-
-Return contract matches ``tuning_configs.lookup`` so the op's ``_resolve_geometry``
-treats both backends uniformly:
-
-    {dispatch_block_num, combine_block_num, warp_num_per_block,
-     combine_warp_num_per_block, schedule}
-
-``schedule`` (or None) is a per-token-count launch plan: a tuple of
-(max_tok_inclusive | None, disp_block, disp_warp, comb_block, comb_warp) buckets,
-ascending; the op precompiles the distinct (block, warp) variants and picks a
-bucket at runtime from cur_rank_num_token. When schedule is None the single-shot
-block/warp fields are used. That the op wants the two halves interleaved is a detail
-of its variant selector, not a reason to tune them together.
-
-Unswept shapes fall back to HIP's single-shot default (schedule=None), whose values
-mirror the C++ ``MakeEpCfg`` arch default so a bare C++ caller and this path agree.
-Add a shape by sweeping it with ``bench_ep.py``; do NOT paste FlyDSL's
-``tuning_configs`` numbers in -- different kernel, different optimum.
-
-The combine table assumes a 2-byte combine dtype. An fp32 combine moves twice the
-bytes and is untuned; it will take the bf16 buckets, which is a guess, not a result.
+An unswept shape returns schedule=None and the single-shot default below. Add one by
+sweeping with ``bench_ep.py``. fp32 combine is untuned and takes the bf16 buckets.
 """
 
 from __future__ import annotations
@@ -87,9 +58,9 @@ def _device_key():
 
 
 def _hip_default() -> dict:
-    """HIP single-shot default (no tuned schedule). Mirrors the C++ MakeEpCfg arch
-    default: dispatch 64 blocks / 16 warps, combine 80 blocks / 8 warps -- the
-    latter measured for the HIP combine kernel on gfx950 EP8."""
+    """Fallback for an unswept shape, mirroring the C++ MakeEpCfg arch default so a
+    bare C++ caller and this path agree. Not a tuned answer: every device in the
+    tables above beats it (mi355x combine wants 64x8, not this 80x8)."""
     return dict(
         dispatch_block_num=64,
         combine_block_num=80,
@@ -105,50 +76,24 @@ def _hip_default() -> dict:
 # means "measured not to matter here", and an exact key wins over the wildcard.
 # ---------------------------------------------------------------------------
 
-# MEASURED on 4x gfx1250, hidden 7168, 2026-08-11: 64..16384 tokens x {64x8, 64x16,
-# 128x16, 256x16} x {bf16, fp8, fp4} x {topk 8 / 64 experts, topk 6 / 96 experts},
-# plus an expert-count isolation pass. Rule for picking: take the SMALLEST geometry
-# within ~3% of the best, because fewer blocks means fewer CUs held and this overlaps
-# an expert GEMM in production. Every entry below is at most 3.1% off its column's best.
+# 4x gfx1250 EP8-equivalent (EP4) hidden 7168, 2026-08-11, same grid. Entries are the
+# smallest geometry within ~3% of the best -- fewer blocks means fewer CUs held, which
+# matters when this overlaps an expert GEMM. Those ties are policy, not measurement: a
+# single bench point can be off 20%. The bucket EDGES come from 10-40% effects.
 #
-# WHAT MOVES THE ANSWER, and what does not:
-#   * topk does, a lot -- it sets _tpi = warpSize/topk, the tokens one warp consumes
-#     per iteration, so it moves where a geometry stops covering the token count in one
-#     round. At topk 8, 64x8 is 75.0us at ct=512 against 92.7 for 64x16; at topk 6 the
-#     same pair is 54.6 vs 55.8, a tie. Hence separate entries per topk.
-#   * the expert count does NOT. Measured at 64 and 96 experts/rank across both topk
-#     values, both a wide and a narrow dtype, and all four geometries: every pair agrees
-#     within ~2%, i.e. noise. That is what the None wildcard below records -- a result,
-#     not an assumption.
-#   * the dtype mostly does not, which is why most rows use the None dtype key. It only
-#     bites at topk 6, where fp4 wants the wider grid two buckets earlier (ct=2048:
-#     128x16 64.2us against 64x16 67.9).
+# topk moves the edges here (it sets _tpi), the expert count does not (64 vs 96
+# agreed within ~2%), and the dtype only does for fp4 at topk 6.
 _DISPATCH_TABLE: dict = {
-    # MI355X / gfx950, EP8 hidden 7168, 2026-08-11: same grid, 64..16384 tokens x
-    # {64x8, 64x16, 128x8, 128x16, 256x8} x {bf16, fp8, fp4} x {topk 8 / 32 experts,
-    # topk 6 / 48 experts}, ITERS=50.
+    # MI355X/gfx950 EP8 hidden 7168, 2026-08-11. No TDM here: the portable dispatch
+    # reserves no LDS and copies with plain vectors, so bf16/fp8 are bandwidth-bound and
+    # the grid barely registers. Cost of the smallest geometry (64x8) vs the best of
+    # {64x8, 64x16, 128x8, 128x16, 256x8} over 64..16384 tokens: bf16 0-2%, fp8 1-2%
+    # from ct>=512, fp4 6-69% from ct>=128. Only fp4 cares -- a quarter of the payload
+    # tips it out of bandwidth-bound -- and it wants 128x8 flat.
     #
-    # THE ANSWER IS NOT gfx1250'S, and not because the numbers came out differently --
-    # the shape of the problem is different. There is no TDM here: the portable dispatch
-    # reserves no LDS (sharedBytes is 0) and moves its payload with plain vector copies,
-    # so bf16 and fp8 are bandwidth-bound and the grid barely registers. Cost of taking
-    # the smallest geometry, 64x8, against the best of the five at each token count:
-    #
-    #   bf16   0-2% everywhere, both topk        -> flat, take the smallest
-    #   fp8    1-2% from ct>=512, both topk      -> same (the 4-16% at ct<=128 is noise:
-    #                                               the ITERS=20 pass had it the other way)
-    #   fp4    6-69% from ct>=128                -> the one dtype that cares
-    #
-    # fp4 is 1/4 the payload, which is what tips it out of bandwidth-bound and into
-    # caring about how many blocks are issuing -- the same mechanism as on gfx1250, at a
-    # different threshold. It wants 128x8 flat; at ct=64 that costs nothing (32.4 against
-    # 32.5), so it gets one bucket rather than an edge.
-    #
-    # topk 6 and 8 came out identical here, unlike gfx1250 where _tpi moves the edges.
-    # Written as two entries rather than a topk wildcard on purpose: the MECHANISM says
-    # topk should matter (it sets tokens-per-warp-iteration), and it demonstrably does on
-    # the other arch, so an unmeasured topk should fall back to the single-shot default
-    # rather than inherit a schedule from a topk that happened to agree.
+    # topk 6 and 8 measured identical. Two entries rather than a topk wildcard: _tpi
+    # makes topk matter in principle, and it does on gfx1250, so an unmeasured topk
+    # should get the default instead of inheriting one that happened to agree.
     "mi355x": {
         (8, 7168, 8, None): {None: ((None, 64, 8),), "fp4": ((None, 128, 8),)},
         (8, 7168, 6, None): {None: ((None, 64, 8),), "fp4": ((None, 128, 8),)},
@@ -176,16 +121,13 @@ _DISPATCH_TABLE: dict = {
     },
 }
 
-# No dtype axis on purpose: combine reduces the bf16 staging region no matter what
-# dispatch transported, and the sweep ran it three times per shape (once per dispatch
-# dtype) with the three agreeing to 1-5%. Both topk values also land on the same
-# buckets, so these two entries are equal today and kept apart only because topk is
-# part of the key -- do not merge them into a wildcard without measuring a third topk.
-#   ct      64x8   128x4  128x8  256x8       (topk 8 / topk 6, us)
-#   512     36.8    38.9   38.0   45.8   |   36.5  39.1  37.2  42.7
-#   4096   160.4   161.2  146.1  154.7   |  157.5 155.1 135.8 146.0
-#   16384  574.1   565.0  524.9  996.3   |  564.4 542.7 469.2 1027.0
-# 256x8 is not a near miss at the top end, it is a 2x collapse; 128x4 never wins.
+# No dtype axis: combine reduces the bf16 staging region whatever dispatch carried,
+# and three runs per shape (one per dispatch dtype) agreed to 1-5%.
+#
+# mi355x 64x8 wins at every size and both topk, and REPLACES the 80x8 that MakeEpCfg
+# and _hip_default() still carry (2-3% faster, 16 fewer blocks). It is a real optimum,
+# not just the smallest tried: 32x8 costs 37% at ct=4096. On gfx1250, 128x4 never wins
+# and 256x8 collapses 2x at 16384.
 _COMBINE_TABLE: dict = {
     # MI355X / gfx950 EP8: 64x8 wins at every token count and both topk, against
     # 32x8 / 48x8 / 64x16 / 80x8 (us at ct=4096, topk 8: 991.6 / 750.5 / 724.3 / 738.5 /
@@ -203,19 +145,14 @@ _COMBINE_TABLE: dict = {
     },
 }
 
-# THE ROUND RULE, which outranks every shape choice above. _tpi = warpSize/topk
-# tokens are consumed per warp-iteration, so one round covers block*warp*_tpi tokens;
-# coming up one round short costs more than any geometry difference. At topk=8 on
-# wave32 that is 4 tokens per warp-iteration, so 64x8 covers 2048 -- exactly where its
-# bucket ends above. Measured at ct=4096, dispatch us: fp4 64x8 (one round short) 121.4
-# against 64x16 80.5, and at ct=16384 it is 418.8 against 174.6. A new topk moves _tpi
-# and therefore moves every edge; do not copy a bucket across topk without re-measuring.
+# THE ROUND RULE outranks every shape choice above: _tpi = warpSize/topk tokens are
+# consumed per warp-iteration, so one round covers block*warp*_tpi tokens and coming up
+# short costs more than any geometry difference (gfx1250 fp4 at ct=4096: 64x8 121.4us
+# against 64x16 80.5). A new topk moves _tpi and every edge with it.
 #
-# HEALTH-CHECK THE BOX BEFORE RE-TUNING. An earlier pass ran on a degraded machine and
-# produced a self-consistent, entirely wrong answer (fp8/fp4 at 128x8, "+12%"), because
-# the fault also flipped bf16's own optimum. Canary: bf16 dispatch at ct=4096 / 64x16 is
-# ~157us healthy and ~172 degraded, while combine sits at ~145 either way -- combine
-# being unchanged is what distinguishes a broken box from a busy one.
+# Health-check the box before re-tuning: a degraded machine once produced a
+# self-consistent, entirely wrong answer. Canary: gfx1250 bf16 dispatch at ct=4096/64x16
+# is ~157us healthy and ~172 degraded, while combine sits at ~145 either way.
 
 def _bucket_key(table, world_size, hidden_dim, topk, experts_per_rank):
     """Exact expert count first, then the "any expert count" wildcard."""

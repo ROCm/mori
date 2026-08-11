@@ -43,10 +43,8 @@ EPR = int(os.environ.get("EPR", 32))
 WARMUP = int(os.environ.get("WARMUP", 10))
 ITERS = int(os.environ.get("ITERS", 50))
 SWEEP = [int(x) for x in os.environ.get("SWEEP", "128,512,4096").split(",")]
-# What dispatch transports. Combine is always bf16, so anything but bf16 here is an
-# ASYMMETRIC op -- the case that matters for inference, where the payload is already
-# quantized and mori just moves it. fp4 packs 2 e2m1 per byte, so it moves half of
-# what fp8 does for the same hidden.
+# What dispatch transports; combine is always bf16, so anything else here is the
+# asymmetric case. fp4 packs 2 e2m1 per byte, half of what fp8 moves.
 _DISP_DT = {
     "bf16": torch.bfloat16,
     "fp8": torch.float8_e4m3fn,
@@ -160,9 +158,7 @@ def main():
         inplace = op.combine_in_view()[:total]
         c_us_ip = time_it(lambda: op.combine(inplace, routing=routing))
 
-        # Bytes actually moved off this rank: dispatch sends `total` tokens' worth
-        # in aggregate across the node; combine gathers the same tokens back, but in
-        # the COMBINE dtype -- the two differ whenever dispatch is narrower.
+        # Bytes off this rank. The two legs differ whenever dispatch is narrower.
         d_bytes = total * HIDDEN * _DISP_NBYTES
         c_bytes = total * HIDDEN * 2
         d_bw = d_bytes / (1000**3) / (d_us / 1e6)

@@ -53,7 +53,7 @@ from __future__ import annotations
 
 import importlib
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable
 
 import torch
@@ -755,19 +755,11 @@ class EpDispatchCombineOp:
         """mori-parity combine. input [<=max_recv,hidden] post-expert tokens.
         indices are accepted for API parity but unused; routing carries the mapping.
 
-        `weights` is a REQUEST, not an input: pass the routing weights to also get
-        them folded back, and out_weights[t] comes back as weights[t] * (number of
-        distinct destination PEs). The values are gathered from the forwarded
-        out_wts, not from this argument -- what it selects is whether to do that
-        gather at all. That fold exists for TRAINING BACKWARD (mori a668e25e), where
-        the routing-weight gradient travels the same all-to-all route back; inference
-        combines with weights=None, because the expert has already applied the
-        weights and the fold would only echo them.
-
-        Not free: the fold is topk peer reads of 32B per token, ordinary loads that
-        this fabric serves far slower than the token tiles, and on gfx1250 asking for
-        it costs more than the whole token payload (385 vs 165us at EP4/4096/64x8).
-        v1 gates it the same way, on a null weights pointer.
+        `weights` is a REQUEST, not an input: passing it asks for the weight fold,
+        whose values come from the forwarded out_wts, not from this argument. The
+        fold is for training backward (mori a668e25e) and costs more than the whole
+        token payload on gfx1250, so inference passes None -- as v1 does, gating on
+        the same null pointer.
 
         Returns (out [ct,hidden], out_weights [ct,topk] or None)."""
         ct = routing.cur_rank_num_token

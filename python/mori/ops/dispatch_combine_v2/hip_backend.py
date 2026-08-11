@@ -56,14 +56,9 @@ _REGIONS = {
     "xdb": "cross_device_barrier",
 }
 
-# Only what EpDType enumerates. fp16 is deliberately absent: the wire code for an
-# enum field comes from mori.jit.v2.plan_api.DTYPES, which has no fp16 entry, so
-# advertising it here would either raise or -- worse -- alias onto another code.
-#
-# The two legs differ. Dispatch only COPIES its payload, so anything with a fixed
-# byte width transports: fp8 as 1 B/elem, fp4 as 2 e2m1 per byte (hiddenDim halves).
-# Combine SUMS across sources, so it needs a real arithmetic type -- the C++ side
-# rejects a byte dtype there rather than silently reducing bytes.
+# Only what EpDType enumerates -- fp16 is absent because plan_api.DTYPES has no code
+# for it, and advertising it here would alias onto another one. Dispatch only copies,
+# so any fixed-width type transports; combine sums, so it needs an arithmetic one.
 _DISPATCH_DTYPES = {
     torch.bfloat16: 2,
     torch.float32: 4,

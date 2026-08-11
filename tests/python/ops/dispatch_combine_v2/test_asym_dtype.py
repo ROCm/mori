@@ -53,9 +53,8 @@ from mori.cco import Communicator  # noqa: E402
 
 FP8 = torch.float8_e4m3fn  # gfx1250/gfx950 OCP e4m3
 FP4 = torch.float4_e2m1fn_x2  # 2 e2m1 per byte
-# Which dtype dispatch transports; combine is always bf16, since the ASYMMETRIC
-# pair is the point. mori does no quantizing -- the payload arrives already packed
-# and moves byte-exact, so fp4 exercises the same path as fp8 at half the width.
+# Which dtype dispatch transports; combine is always bf16. mori does no quantizing --
+# the payload arrives packed and moves byte-exact.
 DISP = {"fp8": FP8, "fp4": FP4}[os.environ.get("DISP", "fp8")]
 _IS_FP4 = DISP == FP4
 _TAG = "fp4" if _IS_FP4 else "fp8"

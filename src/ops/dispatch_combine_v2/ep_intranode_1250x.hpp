@@ -756,13 +756,10 @@ __device__ void EpCombine1250xBody(EpArgs args) {
           const int _slot = __popcll(_mask & ((1ULL << laneId) - 1));
           srcPtrs[_slot] = _myPtr;
         }
-        // The weight fold. topk peer reads of 32B, ORDINARY loads -- this fabric
-        // serves those far slower than a TDM tile, and only _qLane 0 runs them while
-        // the group's other warps wait on the LDS barrier, so asking for it costs
-        // more than the whole token payload (385 vs 165us at EP4/4096/64x8). It is
-        // training-backward only; inference combines with weights=None, which leaves
-        // outWeightsBuf null and skips this. Placement is v1's: issuing it after the
-        // TDM load, or hoisting it to one warp per token, both measured no better.
+        // The weight fold: topk peer reads of 32B, ordinary loads, on one warp while
+        // the group waits -- 385 vs 165us at EP4/4096/64x8. Training-backward only;
+        // inference leaves outWeightsBuf null. Placement is v1's (issuing it after the
+        // TDM load, and hoisting it per token, both measured no better).
         if constexpr (kCfg.useWeights) {
           if (args.outWeightsBuf != nullptr && _qLane == 0) {
             core::WarpAccum<float, 4>(args.outWeightsBuf + (size_t)_tok * topk, srcWeightsPtr,
