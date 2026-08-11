@@ -510,30 +510,28 @@ TEST_F(BatchPutWarnTest, DeviceBufferRoundTripsByteExactOnLocalPath) {
       << "device round trip through the local path was not byte-exact";
 }
 
-// An UNREGISTERED device source on a batch that can route remotely must never
-// be host-staged. Before the port the bounce predicate tested only
-// HasHostPtr(), so a remote-bound device buffer was std::memcpy'd out of device
-// memory — which faults rather than corrupting, so the old behaviour would take
-// the whole suite down here.
+// An UNREGISTERED device source on a remote-bound batch must be rejected, not
+// host-staged. Before the port the bounce predicate tested only HasHostPtr(),
+// so this std::memcpy'd out of hipMalloc'd memory — which faults rather than
+// corrupting, so the old behaviour would take the whole suite down here.
 //
-// The default route-put strategy has no local affinity, so which keys land on
-// caller_ and which on target_ is not fixed and this cannot assert a per-key
-// disposition. What it does assert is the invariant that holds either way: the
-// call returns, the result vector keeps its length, and any key reported as
-// succeeded really did move its bytes. A remote-bound key comes back false via
-// ApplyRejectedTags; a locally-routed one succeeds through HbmCopyEngine and
-// must then be byte-exact.
-TEST_F(BatchPutWarnTest, UnregisteredDeviceSourceIsNeverHostStagedOnRemotePath) {
+// The fixture pins caller_ to a single page precisely to force remote routing,
+// which is what StagingFallbackSucceedsWithoutWarn depends on: the same shape
+// with a HOST buffer succeeds for every key by staging. So the contrast is the
+// assertion — identical batch, device memory instead of host memory, and every
+// key must now fail.
+//
+// The log check is what makes the failure meaningful rather than incidental: it
+// pins the reason to MoriIoEngine finding no engine for the pair. UmbpLogCapture
+// forces the module to WARN, which is why the message is observable here and
+// not in a default-level run.
+TEST_F(BatchPutWarnTest, UnregisteredDeviceSourceIsRejectedNotHostStaged) {
   if (!DeviceMemoryAvailable()) GTEST_SKIP() << "no HIP device available";
 
   constexpr size_t kKeys = 4;
   DeviceBuffer device_src(kKeys * kPerKey);
   if (!device_src.Valid()) GTEST_SKIP() << "hipMalloc failed";
-
-  std::vector<char> host(kKeys * kPerKey);
-  FillPattern(host.data(), host.size(), 0x6B);
-  ASSERT_EQ(hipMemcpy(device_src.get(), host.data(), host.size(), hipMemcpyHostToDevice),
-            hipSuccess);
+  ASSERT_EQ(hipMemset(device_src.get(), 0x6B, kKeys * kPerKey), hipSuccess);
 
   std::vector<std::string> keys;
   std::vector<const void*> srcs;
@@ -544,23 +542,22 @@ TEST_F(BatchPutWarnTest, UnregisteredDeviceSourceIsNeverHostStagedOnRemotePath) 
     sizes.push_back(kPerKey);
   }
 
+  UmbpLogCapture cap;
   auto results = caller_->BatchPut(keys, srcs, sizes);
   ASSERT_EQ(results.size(), keys.size()) << "result vector length must be preserved";
-
-  // Read back only the keys the put claimed, through a host buffer, and require
-  // them to match. A key that was staged out of device memory could not produce
-  // the right bytes here even if it somehow reported success.
   for (size_t i = 0; i < results.size(); ++i) {
-    if (!results[i]) continue;
-    std::vector<char> back(kPerKey, 0);
-    std::vector<std::string> gkeys = {keys[i]};
-    std::vector<void*> gdsts = {back.data()};
-    std::vector<size_t> gsizes = {kPerKey};
-    auto gres = caller_->BatchGet(gkeys, gdsts, gsizes);
-    ASSERT_EQ(gres.size(), 1u);
-    ASSERT_TRUE(gres[0]) << "key=" << keys[i] << " was put but cannot be read back";
-    EXPECT_EQ(std::memcmp(host.data() + i * kPerKey, back.data(), kPerKey), 0)
-        << "key=" << keys[i] << " reported success but the bytes are wrong";
+    EXPECT_FALSE(results[i]) << "key=" << keys[i]
+                             << ": unregistered device memory must not be host-staged";
+  }
+  EXPECT_GE(cap.CountSubstring("transfer unplannable"), 1u)
+      << "the batch failed, but not because the transfer layer refused the GPU endpoint";
+
+  // None of the keys may have been published either, or a later Get would hand
+  // back whatever the staging buffer happened to hold.
+  auto exists = caller_->BatchExists(keys);
+  ASSERT_EQ(exists.size(), keys.size());
+  for (size_t i = 0; i < exists.size(); ++i) {
+    EXPECT_FALSE(exists[i]) << "key=" << keys[i] << " was published despite a failed put";
   }
 }
 
