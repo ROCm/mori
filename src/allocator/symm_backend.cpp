@@ -33,13 +33,12 @@
 // ncclGetLsaPointer, and what world_within_direct_access() aggregates.
 
 #include <hip/hip_runtime.h>
-#include <torch/csrc/distributed/c10d/symm_mem/SymmetricMemory.hpp>
+#include <pybind11/pybind11.h>
 
 #include <mutex>
+#include <torch/csrc/distributed/c10d/symm_mem/SymmetricMemory.hpp>
 #include <unordered_map>
 #include <vector>
-
-#include <pybind11/pybind11.h>
 
 #include "mori/shmem/shmem.hpp"
 
@@ -187,8 +186,7 @@ class MoriSymmetricMemory : public SymmetricMemory {
 
 class MoriSymmAllocator : public SymmetricMemoryAllocator {
  public:
-  void* alloc(size_t size, int device_idx,
-              const std::optional<std::string>& group_name) override {
+  void* alloc(size_t size, int device_idx, const std::optional<std::string>& group_name) override {
     TORCH_CHECK(shmem::ShmemIsInitialized(),
                 "mori symm backend: shmem is not initialised. Call "
                 "mori.shmem.shmem_torch_process_group_init() before allocating.");
@@ -251,8 +249,8 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
     // shmem already bootstrapped the mapping, so the group must be the shmem world.
     TORCH_CHECK(rank == shmem::ShmemMyPe() && world_size == shmem::ShmemNPes(),
                 "mori symm backend: group '", *name, "' is (rank ", rank, "/", world_size,
-                ") but shmem was initialised as (PE ", shmem::ShmemMyPe(), "/",
-                shmem::ShmemNPes(), "). The group must match the shmem world.");
+                ") but shmem was initialised as (PE ", shmem::ShmemMyPe(), "/", shmem::ShmemNPes(),
+                "). The group must match the shmem world.");
 
     DeviceGuard guard(block->device_idx);
 
@@ -260,8 +258,7 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
     std::vector<void*> buffers(world_size, nullptr);
     std::vector<void*> signal_pads(world_size, nullptr);
     for (int pe = 0; pe < world_size; ++pe) {
-      const uint64_t peer =
-          shmem::ShmemPtrP2p(reinterpret_cast<uint64_t>(block->ptr), rank, pe);
+      const uint64_t peer = shmem::ShmemPtrP2p(reinterpret_cast<uint64_t>(block->ptr), rank, pe);
       if (peer == 0) continue;
       buffers[pe] = reinterpret_cast<void*>(peer);
       signal_pads[pe] = reinterpret_cast<void*>(peer + block->buffer_size);
@@ -269,8 +266,7 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
     TORCH_CHECK(buffers[rank] != nullptr,
                 "mori symm backend: local peer pointer resolution failed");
 
-    auto symm = c10::make_intrusive<MoriSymmetricMemory>(std::move(buffers),
-                                                         std::move(signal_pads),
+    auto symm = c10::make_intrusive<MoriSymmetricMemory>(std::move(buffers), std::move(signal_pads),
                                                          block->buffer_size, rank, world_size,
                                                          block->device_idx);
     block->symm = symm;
