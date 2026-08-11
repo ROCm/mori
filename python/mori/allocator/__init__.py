@@ -19,7 +19,33 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""Back a ``torch.cuda.MemPool`` with the mori symmetric heap.
+"""Torch integration for the mori symmetric heap.
+
+Two independent pieces live here.
+
+**SymmetricMemory backend** -- registers mori with torch as the ``"MORI"`` backend, so
+torch's own entry points drive it and ``torch.ops.symm_mem.*`` runs on mori memory::
+
+    import torch.distributed._symmetric_memory as symm_mem
+    import mori
+    from mori.allocator import register_symm_backend
+
+    mori.shmem.shmem_torch_process_group_init("default")
+    register_symm_backend()
+    symm_mem.set_backend("MORI")
+
+    t   = symm_mem.empty(1024, dtype=torch.bfloat16, device=device)
+    hdl = symm_mem.rendezvous(t, group_name)
+    peer = hdl.get_buffer(1, (1024,), torch.bfloat16)   # None-safe: see below
+
+``hdl.get_buffer_ptrs()[pe]`` is null for a PE reached over RDMA rather than P2P, and
+``world_within_direct_access()`` reports whether the whole group is load/store
+accessible -- the scale-up vs scale-out distinction, straight from ``ShmemPtrP2p``.
+
+**MemPool allocator** -- a ``CUDAPluggableAllocator`` for tensors you do not allocate by
+hand, described below.
+
+Back a ``torch.cuda.MemPool`` with the mori symmetric heap.
 
 Tensors allocated inside the pool's context come from ``ShmemMalloc`` instead of the
 caching allocator, so they are symmetric and directly reachable by peers -- including
@@ -50,7 +76,15 @@ from torch.cuda.memory import CUDAPluggableAllocator
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["MoriAllocator", "get_so_path", "is_available"]
+__all__ = [
+    "SYMM_BACKEND_NAME",
+    "MoriAllocator",
+    "get_so_path",
+    "is_available",
+    "register_symm_backend",
+]
+
+SYMM_BACKEND_NAME = "MORI"
 
 _SO_NAME = "libmori_torch_allocator.so"
 _ALLOC_FN = "mori_allocator_malloc"
@@ -113,3 +147,23 @@ class MoriAllocator:
                     get_so_path(), _ALLOC_FN, _FREE_FN
                 )
             return cls._instances[key]
+
+
+def register_symm_backend() -> str:
+    """Register the mori SymmetricMemory backend with torch and return its name.
+
+    Idempotent. After this, ``symm_mem.set_backend("MORI")`` routes ``symm_mem.empty``
+    and ``symm_mem.rendezvous`` into mori. Requires the extension to have been built
+    (``BUILD_TORCH_SYMM=ON``, the default when torch is importable at build time) and
+    shmem to be initialised before the first allocation.
+    """
+    try:
+        from .. import mori_torch_symm
+    except ImportError as exc:  # pragma: no cover - depends on build flags
+        raise ImportError(
+            "mori_torch_symm extension not found. Rebuild mori with BUILD_TORCH_SYMM=ON "
+            "(requires torch at build time)."
+        ) from exc
+
+    mori_torch_symm.register_backend()
+    return SYMM_BACKEND_NAME

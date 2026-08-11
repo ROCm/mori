@@ -542,6 +542,17 @@ class CMakeBuild(build_ext):
         build_benchmark = os.environ.get("BUILD_BENCHMARK", "OFF")
         build_tests = os.environ.get("BUILD_TESTS", "OFF")
         build_umbp = "ON" if build_umbp_enabled else "OFF"
+        # The SymmetricMemory backend links libtorch, so only build it when torch is
+        # importable. BUILD_TORCH_SYMM=OFF disables it explicitly.
+        if "BUILD_TORCH_SYMM" in os.environ:
+            build_torch_symm = "ON" if _env_flag("BUILD_TORCH_SYMM", "OFF") else "OFF"
+        else:
+            try:
+                import torch  # noqa: F401
+
+                build_torch_symm = "ON"
+            except ImportError:
+                build_torch_symm = "OFF"
         build_umbp_spdk = "ON" if build_umbp_spdk_enabled else "OFF"
         use_redis_backend = os.environ.get("USE_REDIS_BACKEND", "OFF")
         build_xla_ffi_ops = os.environ.get("BUILD_XLA_FFI_OPS", "OFF")
@@ -588,6 +599,7 @@ class CMakeBuild(build_ext):
             f"-DUSE_SPDK={build_umbp_spdk}",
             f"-DWITH_MPI={with_mpi}",
             "-DBUILD_TORCH_BOOTSTRAP=OFF",
+            f"-DBUILD_TORCH_SYMM={build_torch_symm}",
             f"-DBUILD_XLA_FFI_OPS={build_xla_ffi_ops}",
             f"-DBUILD_OPS_DEVICE={build_ops_device}",
             f"-DBUILD_CCO_SDMA={BUILD_CCO_SDMA}",
@@ -654,6 +666,12 @@ class CMakeBuild(build_ext):
                 root_dir / "python/mori/libmori_metrics.so",
             ),
         ]
+        symm_backend_so = build_dir / "src/allocator/mori_torch_symm.so"
+        if symm_backend_so.exists():
+            files_to_copy.append(
+                (symm_backend_so, root_dir / "python/mori/mori_torch_symm.so")
+            )
+
         allocator_so = build_dir / "src/allocator/libmori_torch_allocator.so"
         if allocator_so.exists():
             files_to_copy.append(
@@ -867,6 +885,7 @@ mori_package_data = [
     "libmori_metrics.so",
     "libmori_collective.so",  # optional: only present when BUILD_COLLECTIVE=ON
     "libmori_torch_allocator.so",  # optional: only present when BUILD_ALLOCATOR=ON
+    "mori_torch_symm.so",  # optional: only present when BUILD_TORCH_SYMM=ON
     "umbp_master",
     "umbp_standalone_server",
     "_jit-sources/include/**/*.hpp",
