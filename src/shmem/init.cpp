@@ -631,10 +631,28 @@ void GpuStateInit(ShmemStates* states) {
     states->proxyGpuState.numQpPerPe = states->rdmaStates->commContext->GetNumQpPerPe();
     MORI_SHMEM_INFO("Proxy: {} rings allocated for {} NICs, localGpuIdx={}",
                     allocated, numNics, states->proxyGpuState.localGpuIdx);
+
   }
 
-  // Copy communication metadata to GPU
-  CopyTransportTypesToGpu(states);
+  // Copy communication metadata to GPU — override RDMA → PROXY when proxy active
+  if (states->proxyGpuState.active) {
+    int worldSize = states->bootStates->worldSize;
+    std::vector<application::TransportType> types(
+        states->rdmaStates->commContext->GetTransportTypes().begin(),
+        states->rdmaStates->commContext->GetTransportTypes().end());
+    for (int i = 0; i < worldSize; i++) {
+      if (types[i] == application::TransportType::RDMA)
+        types[i] = application::TransportType::PROXY;
+    }
+    HIP_RUNTIME_CHECK(
+        hipMalloc(&states->gpuStates.transportTypes,
+                  sizeof(application::TransportType) * worldSize));
+    HIP_RUNTIME_CHECK(hipMemcpy(
+        states->gpuStates.transportTypes, types.data(),
+        sizeof(application::TransportType) * worldSize, hipMemcpyHostToDevice));
+  } else {
+    CopyTransportTypesToGpu(states);
+  }
   CopyRdmaEndpointsToGpu(states);
 
   // Configure heap information for GPU access
