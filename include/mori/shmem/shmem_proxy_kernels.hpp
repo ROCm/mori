@@ -112,8 +112,10 @@ inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::PROX
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe,
     int qpId) {
-  ShmemPutMemNbiThreadKernel<application::TransportType::PROXY>(
-      dest, destOffset, source, sourceOffset, bytes, pe, qpId);
+  if ((threadIdx.x & (warpSize - 1)) == 0) {
+    ShmemPutMemNbiThreadKernel<application::TransportType::PROXY>(
+        dest, destOffset, source, sourceOffset, bytes, pe, qpId);
+  }
 }
 
 template <>
@@ -121,8 +123,10 @@ inline __device__ void ShmemPutMemNbiBlockKernel<application::TransportType::PRO
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe,
     int qpId) {
-  ShmemPutMemNbiThreadKernel<application::TransportType::PROXY>(
-      dest, destOffset, source, sourceOffset, bytes, pe, qpId);
+  if (core::FlatBlockThreadId() == 0) {
+    ShmemPutMemNbiThreadKernel<application::TransportType::PROXY>(
+        dest, destOffset, source, sourceOffset, bytes, pe, qpId);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -153,8 +157,10 @@ template <>
 inline __device__ void ShmemPutSizeImmNbiWarpKernel<application::TransportType::PROXY>(
     const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes,
     int pe, int qpId) {
-  ShmemPutSizeImmNbiThreadKernel<application::TransportType::PROXY>(
-      dest, destOffset, val, bytes, pe, qpId);
+  if ((threadIdx.x & (warpSize - 1)) == 0) {
+    ShmemPutSizeImmNbiThreadKernel<application::TransportType::PROXY>(
+        dest, destOffset, val, bytes, pe, qpId);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -200,9 +206,11 @@ inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType
     const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
     const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
     core::atomicType signalOp, int pe, int qpId) {
-  ShmemPutMemNbiSignalThreadKernel<application::TransportType::PROXY, true>(
-      dest, destOffset, source, sourceOffset, bytes,
-      signalDest, signalDestOffset, signalValue, signalOp, pe, qpId);
+  if ((threadIdx.x & (warpSize - 1)) == 0) {
+    ShmemPutMemNbiSignalThreadKernel<application::TransportType::PROXY, true>(
+        dest, destOffset, source, sourceOffset, bytes,
+        signalDest, signalDestOffset, signalValue, signalOp, pe, qpId);
+  }
 }
 
 template <>
@@ -211,9 +219,11 @@ inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType
     const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
     const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
     core::atomicType signalOp, int pe, int qpId) {
-  ShmemPutMemNbiSignalThreadKernel<application::TransportType::PROXY, true>(
-      dest, destOffset, source, sourceOffset, bytes,
-      signalDest, signalDestOffset, signalValue, signalOp, pe, qpId);
+  if ((threadIdx.x & (warpSize - 1)) == 0) {
+    ShmemPutMemNbiSignalThreadKernel<application::TransportType::PROXY, true>(
+        dest, destOffset, source, sourceOffset, bytes,
+        signalDest, signalDestOffset, signalValue, signalOp, pe, qpId);
+  }
 }
 
 template <>
@@ -222,9 +232,11 @@ inline __device__ void ShmemPutMemNbiSignalBlockKernel<application::TransportTyp
     const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
     const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
     core::atomicType signalOp, int pe, int qpId) {
-  ShmemPutMemNbiSignalThreadKernel<application::TransportType::PROXY, true>(
-      dest, destOffset, source, sourceOffset, bytes,
-      signalDest, signalDestOffset, signalValue, signalOp, pe, qpId);
+  if (core::FlatBlockThreadId() == 0) {
+    ShmemPutMemNbiSignalThreadKernel<application::TransportType::PROXY, true>(
+        dest, destOffset, source, sourceOffset, bytes,
+        signalDest, signalDestOffset, signalValue, signalOp, pe, qpId);
+  }
 }
 
 template <>
@@ -233,9 +245,11 @@ inline __device__ void ShmemPutMemNbiSignalBlockKernel<application::TransportTyp
     const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
     const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
     core::atomicType signalOp, int pe, int qpId) {
-  ShmemPutMemNbiSignalThreadKernel<application::TransportType::PROXY, true>(
-      dest, destOffset, source, sourceOffset, bytes,
-      signalDest, signalDestOffset, signalValue, signalOp, pe, qpId);
+  if (core::FlatBlockThreadId() == 0) {
+    ShmemPutMemNbiSignalThreadKernel<application::TransportType::PROXY, true>(
+        dest, destOffset, source, sourceOffset, bytes,
+        signalDest, signalDestOffset, signalValue, signalOp, pe, qpId);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -268,8 +282,10 @@ template <>
 inline __device__ void ShmemAtomicSizeNonFetchWarpKernel<application::TransportType::PROXY>(
     const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes,
     core::atomicType amoType, int pe, int qpId) {
-  ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::PROXY>(
-      dest, destOffset, val, bytes, amoType, pe, qpId);
+  if ((threadIdx.x & (warpSize - 1)) == 0) {
+    ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::PROXY>(
+        dest, destOffset, val, bytes, amoType, pe, qpId);
+  }
 }
 
 // ---------------------------------------------------------------------------
