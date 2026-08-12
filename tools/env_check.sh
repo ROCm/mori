@@ -679,6 +679,12 @@ rail_check() {
     for (( i=0; i<n; i++ )); do R+=("${_rr[$i]}"); C+=("${_cc[$i]}"); done
 
     log_ok "$label: GPU-memory pass over $n rail-aligned pair(s) via ${MESH_GPU_MODE:-unknown}, timeouts x$MESH_GPU_TIME_SCALE for HIP init"
+    # Serially, unlike the mesh above. The mesh only has to answer "is this pair
+    # reachable", which survives contention; these are the numbers a user would
+    # actually quote, and running 8 rails at once oversubscribes the host badly
+    # enough that one or two land at a third of line rate every run. n rails at
+    # a few seconds each is a cheap price for numbers that mean something.
+    local MESH_PARALLEL=1
     mesh_gpu_on
     local -A RCELL=()
     mesh_execute RCELL "$tool" "$peer" false "$( [[ "$tool" == ib_write_bw ]] && echo 1000 )" \
@@ -688,12 +694,28 @@ rail_check() {
     # Report the diagonal as a list; a mostly-empty NxN matrix would just be noise.
     # R/C are the first n entries of the same arrays the host mesh ran over, so
     # rail i is host cell [i,i].
-    local ok=0 bad_gpu=0 bad_both=0 v gpu h
+    # Judge the numbers, do not just print them. BW_THRESHOLD/LAT_THRESHOLD have
+    # been dead config since they were introduced, so a rail at a third of line
+    # rate reported as "passed". Serial execution above makes them meaningful:
+    # measured spread across rails is now ~1 Gbps and ~0.3 us.
+    local thr dir
+    if [[ "$tool" == "ib_write_bw" ]]; then thr="$BW_THRESHOLD"; dir=min
+    else                                    thr="$LAT_THRESHOLD"; dir=max; fi
+
+    local ok=0 slow=0 bad_gpu=0 bad_both=0 v gpu h
     for (( i=0; i<n; i++ )); do
         v="${RCELL[$i,$i]:-x}"; gpu="${MESH_RGPU[${R[$i]}]:-?}"
         if [[ "$v" =~ ^[0-9.]+$ ]]; then
-            ok=$(( ok + 1 ))
-            printf "  %-12s <-> %-12s (gpu %s) : %s %s\n" "${R[$i]}" "${C[$i]}" "$gpu" "$v" "$unit"
+            if awk -v v="$v" -v t="$thr" -v d="$dir" \
+                   'BEGIN{exit !((d=="min" && v<t) || (d=="max" && v>t))}'; then
+                slow=$(( slow + 1 ))
+                printf "  %-12s <-> %-12s (gpu %s) : %s %s  <-- %s threshold %s %s\n" \
+                       "${R[$i]}" "${C[$i]}" "$gpu" "$v" "$unit" \
+                       "$( [[ $dir == min ]] && echo below || echo above )" "$thr" "$unit"
+            else
+                ok=$(( ok + 1 ))
+                printf "  %-12s <-> %-12s (gpu %s) : %s %s\n" "${R[$i]}" "${C[$i]}" "$gpu" "$v" "$unit"
+            fi
             continue
         fi
         # Only a rail that passed on host memory implicates GPUDirect. One that
@@ -711,10 +733,12 @@ rail_check() {
                    "${R[$i]}" "${C[$i]}" "$gpu"
         fi
     done
-    if (( bad_gpu == 0 && bad_both == 0 )); then
-        log_ok "$label GPU memory: all $ok rail(s) passed"
+    if (( bad_gpu == 0 && bad_both == 0 && slow == 0 )); then
+        log_ok "$label GPU memory: all $ok rail(s) passed (threshold $dir $thr $unit)"
         return 0
     fi
+    (( slow )) && log_fail \
+        "$label GPU memory: $slow/$n rail(s) completed but missed the $thr $unit threshold"
     (( bad_gpu )) && log_fail \
         "$label GPU memory: $bad_gpu/$n rail(s) passed on host memory but failed on GPU -- GPUDirect RDMA problem"
     # The mode was proven by a loopback on THIS host only, so a peer missing the
