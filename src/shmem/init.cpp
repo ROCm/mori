@@ -603,7 +603,7 @@ void GpuStateInit(ShmemStates* states) {
     if (states->rdmaStates && states->rdmaStates->commContext) {
       numNics = static_cast<int>(states->rdmaStates->commContext->GetAllRdmaDeviceContexts().size());
       if (numNics < 1) numNics = 1;
-      if (numNics > shmem::PROXY_STATE_MAX_NICS) numNics = shmem::PROXY_STATE_MAX_NICS;
+      if (numNics > shmem::PROXY_MAX_NICS) numNics = shmem::PROXY_MAX_NICS;
     }
 
     // Allocate one ProxyRing per NIC. Each ring has its own gpu_head so
@@ -812,7 +812,7 @@ static void FinalizeGpuStates(ShmemStates* states) {
     if (t) t->Shutdown();
   }
   proxyThreads.clear();
-  for (int n = 0; n < shmem::PROXY_STATE_MAX_NICS; n++) {
+  for (int n = 0; n < shmem::PROXY_MAX_NICS; n++) {
     if (states->proxyGpuStates.rings[n]) {
       hipHostUnregister(states->proxyGpuStates.rings[n]);
       free(states->proxyGpuStates.rings[n]);
