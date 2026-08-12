@@ -27,6 +27,7 @@
 #include "mori/application/application_device_types.hpp"
 #include "mori/core/utils/utils.hpp"
 #include "mori/hip_compat.hpp"
+#include "mori/shmem/shmem_proxy_state.hpp"
 #include "mori/utils/limits.hpp"
 
 // Host-only includes: STL, ibverbs, application management classes.
@@ -158,9 +159,6 @@ struct RemoteAddrInfo {
 #include <memory>
 
 }  // namespace shmem
-}  // namespace mori
-#include "mori/shmem/shmem_proxy_state.hpp"
-namespace mori {
 namespace core { class ProxyThread; }
 namespace shmem {
 
