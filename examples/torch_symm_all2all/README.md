@@ -29,7 +29,7 @@ per-peer handshake — just one barrier afterwards, before anyone reads what lan
 register_symm_backend()
 symm_mem.set_backend("MORI")
 
-recv = symm_mem.empty(world * elems, dtype=torch.int32, device=device)
+recv = symm_mem.empty(world_size * elems, dtype=torch.int32, device=device)
 hdl  = symm_mem.rendezvous(recv, group_name)
 base, stride = flat_layout(recv)
 
