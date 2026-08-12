@@ -774,11 +774,15 @@ __device__ void EpDispatchIntraNodeKernel_1250x_body(EpDispatchCombineArgs<T> ar
 
 namespace warpspec {
 using named_barrier_t = __amdgpu_named_workgroup_barrier_t;
-__device__ __forceinline__ void named_barrier_init(named_barrier_t* bar, uint32_t wave_cnt) {
-  __builtin_amdgcn_s_barrier_init(bar, wave_cnt);
+__device__ __forceinline__ void named_barrier_init(named_barrier_t* bar, uint32_t member_count) {
+  __builtin_amdgcn_s_barrier_init(bar, member_count);
+}
+__device__ __forceinline__ void named_barrier_join(named_barrier_t* bar) {
+  __builtin_amdgcn_s_barrier_join(bar);
 }
 __device__ __forceinline__ void named_barrier_arrive_and_wait(named_barrier_t* bar) {
-  __builtin_amdgcn_s_barrier_join(bar);
+  __builtin_amdgcn_s_barrier_signal_var(bar, 0);
+  __builtin_amdgcn_s_barrier_wait(0);
 }
 // Reusable TDM descriptor — build once with make(), each load()/store() only
 // rewrites the 3 address dwords so the shape stays resident in SGPRs.
@@ -877,14 +881,13 @@ __device__ void EpDispatchIntraNodeKernel_1250x_warpspec_body(EpDispatchCombineA
   for (int p = thread_id; p < num_ranks; p += static_cast<int>(blockDim.x))
     total_count[p] = 0;
 
-  __shared__ warpspec::named_barrier_t bar_all;
   __shared__ warpspec::named_barrier_t bar_meta;
-  if (thread_id == 0) {
-    warpspec::named_barrier_init(&bar_all, num_warps);
+  if (thread_id == 0)
     warpspec::named_barrier_init(&bar_meta, kMetaWarps);
-  }
-  __builtin_amdgcn_s_barrier_signal(-1);
-  __builtin_amdgcn_s_barrier_wait(-1);
+  __syncthreads();
+
+  if (is_meta)
+    warpspec::named_barrier_join(&bar_meta);
 
   if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
     constexpr int kBatchSize = 32;
@@ -1095,7 +1098,7 @@ __device__ void EpDispatchIntraNodeKernel_1250x_warpspec_body(EpDispatchCombineA
       }
 
       if (meta_b < num_batches)
-        warpspec::named_barrier_arrive_and_wait(&bar_all);
+        __syncthreads();
     }
 
     if (is_meta) {
