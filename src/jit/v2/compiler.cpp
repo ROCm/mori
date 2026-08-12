@@ -210,8 +210,8 @@ std::string Compiler::EnsureCompiled(const std::string& name, const std::string&
   if (!CacheEntryValid(dir)) {
     // Build into a private directory, then publish the whole thing by rename.
     const std::string tmp = MakeUniqueTempDir(tc.cacheRoot + "/tmp", name);
-    if (tmp.empty()) throw std::runtime_error("mori jit: cannot create temp dir under " +
-                                              tc.cacheRoot + "/tmp");
+    if (tmp.empty())
+      throw std::runtime_error("mori jit: cannot create temp dir under " + tc.cacheRoot + "/tmp");
 
     const std::string srcPath = tmp + "/" + kSourceFile;
     const std::string objPath = tmp + "/" + kObjectFile;
@@ -237,9 +237,9 @@ std::string Compiler::EnsureCompiled(const std::string& name, const std::string&
 
     const auto t0 = std::chrono::steady_clock::now();
     CommandResult r = RunProgram(argv);
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - t0)
-                        .count();
+    const auto ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
+            .count();
 
     if (r.exitCode != 0 || !fs::is_regular_file(objPath)) {
       // Keep the offending source when asked; it is the only way to see what
@@ -253,8 +253,8 @@ std::string Compiler::EnsureCompiled(const std::string& name, const std::string&
       }
       if (keep.empty()) SafeRemoveAll(tmp);
       throw std::runtime_error("mori jit: hipcc failed for '" + name + "' (exit " +
-                               std::to_string(r.exitCode) + ")\ncommand: " + JoinArgv(argv) +
-                               "\n" + r.output +
+                               std::to_string(r.exitCode) + ")\ncommand: " + JoinArgv(argv) + "\n" +
+                               r.output +
                                (keep.empty() ? "\n(set MORI_JIT_KEEP_FAILED=1 to retain the source)"
                                              : "\nsource kept at " + keep));
     }

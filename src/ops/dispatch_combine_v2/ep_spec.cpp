@@ -105,9 +105,9 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
   if (!EpCfgIsValid(c)) {
     throw std::runtime_error(
         "mori v2 ep: inconsistent config (world=" + std::to_string(c.worldSize) +
-        " hidden=" + std::to_string(c.hiddenDim) +
-        " topk=" + std::to_string(c.numExpertPerToken) + " wave=" + std::to_string(c.waveSize) +
-        " warps=" + std::to_string(c.warpPerBlock) + " blocks=" + std::to_string(c.blockNum) +
+        " hidden=" + std::to_string(c.hiddenDim) + " topk=" + std::to_string(c.numExpertPerToken) +
+        " wave=" + std::to_string(c.waveSize) + " warps=" + std::to_string(c.warpPerBlock) +
+        " blocks=" + std::to_string(c.blockNum) +
         "); token bytes must be 16 B aligned, topk and worldSize must fit in a wavefront");
   }
   return c;
@@ -214,8 +214,9 @@ mori::ops::v2::EpCfg EpCfgFromFields(const mori::jit::v2::FieldBag& f,
                                      mori::ops::v2::EpKernelKind kind) {
   using namespace mori::ops::v2;
   EpRequest req;
-  EpApplyFields(req, /*prefix=*/"", [&](const std::string& n) { return f.Has(n.c_str()); },
-                [&](const std::string& n) { return f.Get(n.c_str(), 0); });
+  EpApplyFields(
+      req, /*prefix=*/"", [&](const std::string& n) { return f.Has(n.c_str()); },
+      [&](const std::string& n) { return f.Get(n.c_str(), 0); });
   return MakeEpCfg(mori::jit::v2::GetToolchain().arch, req, kind);
 }
 
@@ -237,12 +238,12 @@ int EpNoPrecompile(const std::string&) { return 0; }
 // Field order and types must match EpArgs; the binding builds its ctypes struct
 // from this string and asserts sizeof against the vtable, so drift is a startup
 // error rather than silent corruption.
-#define MORI_EP_ARGS_SCHEMA                                                     \
-  "window:u64,"                                                                  \
-  "offTokOff:u64,offRecvNum:u64,offRecvToSrc:u64,offOutIdx:u64,"                 \
-  "offOutWts:u64,offDispOut:u64,offOutTok:u64,offXdb:u64,rank:i32,"              \
-  "tokenIndices:p,inpTokenBuf:p,weightsBuf:p,outTokenBuf:p,outWeightsBuf:p,"     \
-  "dispDestTokIdMap:p,destPeTokenCounter:p,totalRecvTokenNum:p,"                 \
+#define MORI_EP_ARGS_SCHEMA                                                  \
+  "window:u64,"                                                              \
+  "offTokOff:u64,offRecvNum:u64,offRecvToSrc:u64,offOutIdx:u64,"             \
+  "offOutWts:u64,offDispOut:u64,offOutTok:u64,offXdb:u64,rank:i32,"          \
+  "tokenIndices:p,inpTokenBuf:p,weightsBuf:p,outTokenBuf:p,outWeightsBuf:p," \
+  "dispDestTokIdMap:p,destPeTokenCounter:p,totalRecvTokenNum:p,"             \
   "gridBarrier:p,xdbFlag:p,combineBarrierFan:p,numTokens:i32"
 
 MORI_JIT_DEFINE_PLAN(ep_dispatch, mori::ops::v2::EpDispatchSpec, EpDispatchFromFields,

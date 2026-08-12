@@ -64,9 +64,12 @@ enum class EpDType : int { Bf16 = 0, Fp32 = 1, Byte8 = 2 };
 
 inline const char* EpDTypeName(EpDType d) {
   switch (d) {
-    case EpDType::Fp32: return "float";
-    case EpDType::Byte8: return "unsigned char";
-    default: return "hip_bfloat16";
+    case EpDType::Fp32:
+      return "float";
+    case EpDType::Byte8:
+      return "unsigned char";
+    default:
+      return "hip_bfloat16";
   }
 }
 
@@ -76,9 +79,12 @@ constexpr int EpElemSize(EpDType d) {
 
 inline std::string RenderValue(EpDType d) {
   switch (d) {
-    case EpDType::Fp32: return "::mori::ops::v2::EpDType::Fp32";
-    case EpDType::Byte8: return "::mori::ops::v2::EpDType::Byte8";
-    default: return "::mori::ops::v2::EpDType::Bf16";
+    case EpDType::Fp32:
+      return "::mori::ops::v2::EpDType::Fp32";
+    case EpDType::Byte8:
+      return "::mori::ops::v2::EpDType::Byte8";
+    default:
+      return "::mori::ops::v2::EpDType::Bf16";
   }
 }
 
@@ -116,12 +122,13 @@ struct EpArgs {
   void* outTokenBuf = nullptr;        // combine output, local
   float* outWeightsBuf = nullptr;     // combine weight output, local
 
-  int* dispDestTokIdMap = nullptr;    // [numTokens * topk] flat dest index per (token, k)
-  int* destPeTokenCounter = nullptr;  // [worldSize] per-dest send count
-  int* totalRecvTokenNum = nullptr;   // [1]
-  unsigned int* gridBarrier = nullptr;  // [1] intra-kernel grid rendezvous
+  int* dispDestTokIdMap = nullptr;        // [numTokens * topk] flat dest index per (token, k)
+  int* destPeTokenCounter = nullptr;      // [worldSize] per-dest send count
+  int* totalRecvTokenNum = nullptr;       // [1]
+  unsigned int* gridBarrier = nullptr;    // [1] intra-kernel grid rendezvous
   unsigned long long* xdbFlag = nullptr;  // [1] monotone cross-device barrier epoch
-  int* combineBarrierFan = nullptr;  // [blockNum*16] gfx1250 combine intra-grid fan-out (local scratch)
+  int* combineBarrierFan =
+      nullptr;  // [blockNum*16] gfx1250 combine intra-grid fan-out (local scratch)
 
   int numTokens = 0;  // tokens this rank contributes this call
 };
@@ -134,10 +141,10 @@ struct EpCfg {
   // ---- topology / shape ----
   int worldSize = 8;
   int hiddenDim = 7168;
-  int maxTokPerRank = 128;      // per-rank input token capacity
+  int maxTokPerRank = 128;  // per-rank input token capacity
   int numExpertPerRank = 8;
-  int numExpertPerToken = 8;    // topk
-  int maxRecv = 0;              // 0 = worldSize * maxTokPerRank
+  int numExpertPerToken = 8;  // topk
+  int maxRecv = 0;            // 0 = worldSize * maxTokPerRank
   EpDType dtype = EpDType::Bf16;
 
   // ---- launch geometry (host-derived; see MakeEpCfg) ----
@@ -251,10 +258,9 @@ constexpr int EpDispatch1250xLdsBytes(const EpCfg& c) {
 constexpr bool EpCfgIsValid(const EpCfg& c) {
   // rank is not checked here any more -- it is a launch argument, so the op
   // layer owns that bound (it is the rank it was constructed for).
-  return c.worldSize > 0 && c.hiddenDim > 0 &&
-         c.maxTokPerRank > 0 && c.numExpertPerToken > 0 && c.numExpertPerRank > 0 &&
-         c.blockNum > 0 && (c.waveSize == 32 || c.waveSize == 64) && c.warpPerBlock > 0 &&
-         EpBlockThreads(c) <= 1024 &&
+  return c.worldSize > 0 && c.hiddenDim > 0 && c.maxTokPerRank > 0 && c.numExpertPerToken > 0 &&
+         c.numExpertPerRank > 0 && c.blockNum > 0 && (c.waveSize == 32 || c.waveSize == 64) &&
+         c.warpPerBlock > 0 && EpBlockThreads(c) <= 1024 &&
          // The recv capacity must cover the worst case. The dispatch slot
          // counter is unbounded on the device (v1 asserted, which NDEBUG strips
          // anyway), and because EpMaxRecv is ALSO the flat-index stride, an

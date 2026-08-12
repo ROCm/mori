@@ -77,8 +77,6 @@ _DT = {
 _FP8_DTYPES = (torch.float8_e4m3fnuz, torch.float8_e4m3fn)
 
 
-
-
 @dataclass
 class EpDispatchCombineConfig:
     rank: int
@@ -418,7 +416,6 @@ class KernelSet:
     unsupported: tuple[str, ...] = ()
 
 
-
 class EpDispatchRoutingHandle:
     """Per-call routing snapshot (mori EpDispatchRoutingHandle parity).
 
@@ -605,7 +602,10 @@ class EpDispatchCombineOp:
             for bucket in schedule:
                 max_tok = bucket[0]
                 if max_tok is None or num_tokens <= max_tok:
-                    disp_spec, comb_spec = (bucket[1], bucket[2]), (bucket[3], bucket[4])
+                    disp_spec, comb_spec = (bucket[1], bucket[2]), (
+                        bucket[3],
+                        bucket[4],
+                    )
                     break
             if disp_spec is None:
                 last = schedule[-1]
@@ -669,7 +669,9 @@ class EpDispatchCombineOp:
 
     # -- shared: the ops ---------------------------------------------------
 
-    def dispatch(self, input, weights, scales, indices, *, routing=None, return_routing=False):
+    def dispatch(
+        self, input, weights, scales, indices, *, routing=None, return_routing=False
+    ):
         """mori-parity dispatch. input [n_tok,hidden], weights [n_tok,topk] f32,
         scales [n_tok,scale_dim] (or None), indices [n_tok,topk] i32.
 
@@ -684,7 +686,9 @@ class EpDispatchCombineOp:
         backend does it.
         """
         if routing is not None and return_routing:
-            raise ValueError("pass either routing= (replay) or return_routing=True, not both")
+            raise ValueError(
+                "pass either routing= (replay) or return_routing=True, not both"
+            )
         n = input.shape[0]
         cap = self.cfg.max_num_inp_token_per_rank
         if n > cap:
@@ -789,12 +793,18 @@ class EpDispatchCombineOp:
         cdt = self.cfg.combine_dtype
         hidden = self.cfg.hidden_dim
         topk = self.cfg.num_experts_per_token
-        cols = hidden // 2 if cdt == torch.float4_e2m1fn_x2 else hidden  # fp4 packs 2/elem
+        cols = (
+            hidden // 2 if cdt == torch.float4_e2m1fn_x2 else hidden
+        )  # fp4 packs 2/elem
         out = self.combine_out[: ct * cols].view(cdt).view(ct, cols)
         # None rather than a stale buffer when the fold was not asked for: the
         # kernel leaves combine_out_weights untouched, so returning it would hand
         # back the previous call's values.
-        outw = self.combine_out_weights[: ct * topk].view(ct, topk) if want_weights else None
+        outw = (
+            self.combine_out_weights[: ct * topk].view(ct, topk)
+            if want_weights
+            else None
+        )
         return out, outw
 
     def reset(self):

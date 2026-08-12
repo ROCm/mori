@@ -189,9 +189,7 @@ def main():
             # Capability-gated: a backend that does not implement this says so
             # through op.capabilities rather than by failing at the call.
             has_lec = "local_expert_count" in getattr(op, "capabilities", frozenset())
-            lec_sum = (
-                int(op.local_expert_count().sum().cpu().item()) if has_lec else 0
-            )
+            lec_sum = int(op.local_expert_count().sum().cpu().item()) if has_lec else 0
             sync()
             comm.barrier()
             lec_total = d.allreduce_sum(lec_sum)

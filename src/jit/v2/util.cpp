@@ -125,7 +125,6 @@ std::vector<std::string> SplitWhitespace(const std::string& s) {
   return out;
 }
 
-
 // ---------------------------------------------------------------------------
 // Filesystem
 // ---------------------------------------------------------------------------
@@ -181,8 +180,8 @@ std::string MakeUniqueTempDir(const std::string& root, const std::string& prefix
   static std::atomic<uint64_t> counter{0};
   for (int attempt = 0; attempt < 64; ++attempt) {
     std::ostringstream name;
-    name << prefix << '.' << ::getpid() << '.'
-         << counter.fetch_add(1, std::memory_order_relaxed) << '.' << attempt;
+    name << prefix << '.' << ::getpid() << '.' << counter.fetch_add(1, std::memory_order_relaxed)
+         << '.' << attempt;
     fs::path cand = fs::path(root) / name.str();
     std::error_code ec;
     if (fs::create_directory(cand, ec) && !ec) return cand.string();

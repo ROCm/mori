@@ -85,13 +85,15 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._recv_cap = cfg.effective_max_recv
         self._closed = False
         # gfx125x routes to the TDM kernel, which needs a superset arena (plan A).
-        _arch = (getattr(torch.cuda.get_device_properties(dev), "gcnArchName", "") or "")
+        _arch = getattr(torch.cuda.get_device_properties(dev), "gcnArchName", "") or ""
         self._is1250 = _arch.split(":")[0].startswith("gfx125")
 
         # Gate FIRST: rejecting a config after taking a symmetric window would
         # leak it (the arena is registered with the communicator), and the whole
         # point of the gate is that an unsupported config never gets that far.
-        self._gate(KernelSet(dispatch={}, combine={}, unsupported=self._unsupported(cfg)))
+        self._gate(
+            KernelSet(dispatch={}, combine={}, unsupported=self._unsupported(cfg))
+        )
 
         self.arena = SymmArena(comm, self._regions(cfg))
         self.arena.zero()
@@ -147,7 +149,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         """Everything this backend cannot do, checked before anything is built."""
         bad = []
         if cfg.dispatch_dtype not in _DISPATCH_DTYPES:
-            bad.append(f"dispatch dtype {cfg.dispatch_dtype} (have bf16, fp32, fp8, fp4)")
+            bad.append(
+                f"dispatch dtype {cfg.dispatch_dtype} (have bf16, fp32, fp8, fp4)"
+            )
         if cfg.combine_dtype not in _COMBINE_DTYPES:
             bad.append(f"combine dtype {cfg.combine_dtype} (have bf16, fp32)")
         if cfg.is_scatter:
@@ -201,7 +205,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         dispatch, combine = {}, {}
         self._plans = []
         for b, w in self._dispatch_specs:
-            plan = cb.EpDispatchPlan(**common, **disp_cfg, block_num=b, warp_per_block=w)
+            plan = cb.EpDispatchPlan(
+                **common, **disp_cfg, block_num=b, warp_per_block=w
+            )
             plan.bind(rank=cfg.rank)
             self._plans.append(plan)
             dispatch[(b, w)] = self._wrap_dispatch(plan)
@@ -267,7 +273,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return None
 
     def local_expert_count(self):
-        raise NotImplementedError("local_expert_count is flydsl-only; use backend='flydsl'")
+        raise NotImplementedError(
+            "local_expert_count is flydsl-only; use backend='flydsl'"
+        )
 
     def convert_dispatch_output(self):
         raise NotImplementedError("StdMoE is flydsl-only; use backend='flydsl'")

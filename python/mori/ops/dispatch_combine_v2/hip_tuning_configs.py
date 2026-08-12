@@ -101,8 +101,14 @@ _DISPATCH_TABLE: dict = {
     # makes topk matter in principle, and it does on gfx1250, so an unmeasured topk
     # should get the default instead of inheriting one that happened to agree.
     "mi355x": {
-        (8, 7168, 8, None): {None: ((None, 64, 8),), "fp4_disp_bf16_comb": ((None, 128, 8),)},
-        (8, 7168, 6, None): {None: ((None, 64, 8),), "fp4_disp_bf16_comb": ((None, 128, 8),)},
+        (8, 7168, 8, None): {
+            None: ((None, 64, 8),),
+            "fp4_disp_bf16_comb": ((None, 128, 8),),
+        },
+        (8, 7168, 6, None): {
+            None: ((None, 64, 8),),
+            "fp4_disp_bf16_comb": ((None, 128, 8),),
+        },
     },
     "gfx1250": {
         # topk 8 (256 experts at EP4). All three dtypes agree here.
@@ -160,6 +166,7 @@ _COMBINE_TABLE: dict = {
 # self-consistent, entirely wrong answer. Canary: gfx1250 bf16 dispatch at ct=4096/64x16
 # is ~157us healthy and ~172 degraded, while combine sits at ~145 either way.
 
+
 def _bucket_key(table, world_size, hidden_dim, topk, experts_per_rank):
     """Exact expert count first, then the "any expert count" wildcard."""
     for epr in (experts_per_rank, None):
@@ -176,7 +183,8 @@ def _merge(disp, comb):
     half keeps whatever it asked for on either side of the other's edge.
     """
     edges = sorted(
-        {b[0] for b in disp if b[0] is not None} | {b[0] for b in comb if b[0] is not None}
+        {b[0] for b in disp if b[0] is not None}
+        | {b[0] for b in comb if b[0] is not None}
     ) + [None]
 
     def pick(buckets, edge):
@@ -185,9 +193,7 @@ def _merge(disp, comb):
                 return blk, wrp
         return buckets[-1][1], buckets[-1][2]
 
-    return tuple(
-        (edge,) + pick(disp, edge) + pick(comb, edge) for edge in edges
-    )
+    return tuple((edge,) + pick(disp, edge) + pick(comb, edge) for edge in edges)
 
 
 def lookup(world_size, hidden_dim, topk, dtype="bf16", experts_per_rank=None) -> dict:
@@ -199,10 +205,12 @@ def lookup(world_size, hidden_dim, topk, dtype="bf16", experts_per_rank=None) ->
     """
     base = _hip_default()
     dev = _device_key()
-    disp = _bucket_key(_DISPATCH_TABLE.get(dev, {}), world_size, hidden_dim, topk,
-                       experts_per_rank)
-    comb = _bucket_key(_COMBINE_TABLE.get(dev, {}), world_size, hidden_dim, topk,
-                       experts_per_rank)
+    disp = _bucket_key(
+        _DISPATCH_TABLE.get(dev, {}), world_size, hidden_dim, topk, experts_per_rank
+    )
+    comb = _bucket_key(
+        _COMBINE_TABLE.get(dev, {}), world_size, hidden_dim, topk, experts_per_rank
+    )
     if disp is None or comb is None:
         return base  # half a schedule is not a schedule
     # None is the "every dtype measured the same" key; an exact dtype overrides it.

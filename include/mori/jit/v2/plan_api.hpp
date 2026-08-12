@@ -124,52 +124,51 @@ std::string FormatPlanInfo(unsigned grid, unsigned block, unsigned sharedBytes,
 //   InfoFn    : Spec::Cfg -> "k=v\n..."         (usually Describe(cfg))
 //   PrecompFn : arch      -> kernel count
 // ---------------------------------------------------------------------------
-#define MORI_JIT_DEFINE_PLAN(NAME, SPEC, REQUEST_FN, REQUEST_SCHEMA_FN, INFO_FN,      \
-                             PRECOMPILE_FN, ARGS_T, ARGS_SCHEMA)                                            \
-  namespace {                                                                        \
-  struct NAME##PlanHandle {                                                          \
-    SPEC::Plan plan;                                                                  \
-    std::string cfgText;                                                              \
-    std::string cacheDir;                                                             \
-    std::string cfgKeyValues;                                                         \
-  };                                                                                  \
-                                                                                      \
-  void* NAME##PlanCreate(const ::mori::jit::v2::FieldBag& f) {                            \
-    auto* h = new NAME##PlanHandle();                                                  \
-    const auto cfg = REQUEST_FN(f);                                                    \
-    h->cfgText = Render(cfg);                                                           \
-    h->cfgKeyValues = INFO_FN(cfg);                                                     \
-    /* Same deps Prepare compiles with. Defaulting them here would report a     \
-       directory nobody ever writes for any Spec that overrides SourceDeps. */  \
-    h->cacheDir = ::mori::jit::v2::Compiler::Instance().CacheDirFor(                 \
-        SPEC::kName, SPEC::RenderSource(cfg), SPEC::SourceDeps());               \
-    h->plan = SPEC::Prepare(cfg);                                                        \
-    return h;                                                                            \
-  }                                                                                      \
-  void NAME##PlanDestroy(void* p) { delete static_cast<NAME##PlanHandle*>(p); }           \
-  void NAME##PlanLaunch(void* p, const void* buf, size_t size, void* stream) {            \
-    auto* h = static_cast<NAME##PlanHandle*>(p);                                           \
-    if (size != sizeof(ARGS_T))                                                            \
-      throw std::runtime_error("args size " + std::to_string(size) + " != " +              \
-                               std::to_string(sizeof(ARGS_T)) +                            \
-                               "; the binding's schema is stale");                         \
-    SPEC::LaunchRaw(h->plan, buf, size, static_cast<hipStream_t>(stream));                 \
-  }                                                                                        \
-  std::string NAME##PlanInfo(void* p) {                                                    \
-    auto* h = static_cast<NAME##PlanHandle*>(p);                                            \
-    return ::mori::jit::v2::detail::FormatPlanInfo(h->plan.geom.gridX, h->plan.geom.blockX,     \
-                                               h->plan.geom.sharedBytes, h->cfgKeyValues,   \
-                                               h->cfgText, h->cacheDir);                    \
-  }                                                                                          \
-  const struct NAME##PlanRegistrar {                                                         \
-    NAME##PlanRegistrar() {                                                                  \
-      ::mori::jit::v2::RegisterPlan(#NAME, ::mori::jit::v2::PlanVTable{                              \
-                                           &NAME##PlanCreate, &NAME##PlanDestroy,            \
-                                           &NAME##PlanLaunch, &NAME##PlanInfo,               \
-                                           &PRECOMPILE_FN, &REQUEST_SCHEMA_FN,               \
-                                           ARGS_SCHEMA, sizeof(ARGS_T)});                    \
-    }                                                                                         \
-  } NAME##PlanRegistrarInstance;                                                              \
+#define MORI_JIT_DEFINE_PLAN(NAME, SPEC, REQUEST_FN, REQUEST_SCHEMA_FN, INFO_FN, PRECOMPILE_FN,  \
+                             ARGS_T, ARGS_SCHEMA)                                                \
+  namespace {                                                                                    \
+  struct NAME##PlanHandle {                                                                      \
+    SPEC::Plan plan;                                                                             \
+    std::string cfgText;                                                                         \
+    std::string cacheDir;                                                                        \
+    std::string cfgKeyValues;                                                                    \
+  };                                                                                             \
+                                                                                                 \
+  void* NAME##PlanCreate(const ::mori::jit::v2::FieldBag& f) {                                   \
+    auto* h = new NAME##PlanHandle();                                                            \
+    const auto cfg = REQUEST_FN(f);                                                              \
+    h->cfgText = Render(cfg);                                                                    \
+    h->cfgKeyValues = INFO_FN(cfg);                                                              \
+    /* Same deps Prepare compiles with. Defaulting them here would report a                      \
+       directory nobody ever writes for any Spec that overrides SourceDeps. */                   \
+    h->cacheDir = ::mori::jit::v2::Compiler::Instance().CacheDirFor(                             \
+        SPEC::kName, SPEC::RenderSource(cfg), SPEC::SourceDeps());                               \
+    h->plan = SPEC::Prepare(cfg);                                                                \
+    return h;                                                                                    \
+  }                                                                                              \
+  void NAME##PlanDestroy(void* p) { delete static_cast<NAME##PlanHandle*>(p); }                  \
+  void NAME##PlanLaunch(void* p, const void* buf, size_t size, void* stream) {                   \
+    auto* h = static_cast<NAME##PlanHandle*>(p);                                                 \
+    if (size != sizeof(ARGS_T))                                                                  \
+      throw std::runtime_error("args size " + std::to_string(size) +                             \
+                               " != " + std::to_string(sizeof(ARGS_T)) +                         \
+                               "; the binding's schema is stale");                               \
+    SPEC::LaunchRaw(h->plan, buf, size, static_cast<hipStream_t>(stream));                       \
+  }                                                                                              \
+  std::string NAME##PlanInfo(void* p) {                                                          \
+    auto* h = static_cast<NAME##PlanHandle*>(p);                                                 \
+    return ::mori::jit::v2::detail::FormatPlanInfo(h->plan.geom.gridX, h->plan.geom.blockX,      \
+                                                   h->plan.geom.sharedBytes, h->cfgKeyValues,    \
+                                                   h->cfgText, h->cacheDir);                     \
+  }                                                                                              \
+  const struct NAME##PlanRegistrar {                                                             \
+    NAME##PlanRegistrar() {                                                                      \
+      ::mori::jit::v2::RegisterPlan(                                                             \
+          #NAME, ::mori::jit::v2::PlanVTable{&NAME##PlanCreate, &NAME##PlanDestroy,              \
+                                             &NAME##PlanLaunch, &NAME##PlanInfo, &PRECOMPILE_FN, \
+                                             &REQUEST_SCHEMA_FN, ARGS_SCHEMA, sizeof(ARGS_T)});  \
+    }                                                                                            \
+  } NAME##PlanRegistrarInstance;                                                                 \
   }  // namespace
 
 }  // namespace v2

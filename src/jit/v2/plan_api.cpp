@@ -226,8 +226,9 @@ MORI_JIT_API void* mori_jit_plan_create(const char* kernel, const char* arch,
                                         int count) {
   try {
     const PlanVTable* vt = FindPlan(kernel);
-    if (!vt) throw std::runtime_error(std::string("unknown kernel '") +
-                                      (kernel ? kernel : "(null)") + "'");
+    if (!vt)
+      throw std::runtime_error(std::string("unknown kernel '") + (kernel ? kernel : "(null)") +
+                               "'");
     ResolveArch(arch);
     FieldBag bag(names, values, count);
     void* impl = vt->create(bag);
@@ -258,8 +259,7 @@ MORI_JIT_API void mori_jit_plan_destroy(void* plan) {
   delete h;
 }
 
-MORI_JIT_API int mori_jit_plan_launch(void* plan, const void* argBuf, int argSize,
-                                      void* stream) {
+MORI_JIT_API int mori_jit_plan_launch(void* plan, const void* argBuf, int argSize, void* stream) {
   auto* h = static_cast<PlanHandle*>(plan);
   if (!h) {
     SetPlanError("null plan");
@@ -299,8 +299,9 @@ MORI_JIT_API int mori_jit_plan_info(void* plan, char* buf, int len) {
 MORI_JIT_API int mori_jit_precompile(const char* kernel, const char* arch) {
   try {
     const PlanVTable* vt = FindPlan(kernel);
-    if (!vt) throw std::runtime_error(std::string("unknown kernel '") +
-                                      (kernel ? kernel : "(null)") + "'");
+    if (!vt)
+      throw std::runtime_error(std::string("unknown kernel '") + (kernel ? kernel : "(null)") +
+                               "'");
     return vt->precompile(ResolveArch(arch));
   } catch (const std::exception& e) {
     SetPlanError(e.what());

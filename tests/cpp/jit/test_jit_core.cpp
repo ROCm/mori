@@ -107,18 +107,39 @@ TEST(Render, EveryScalarFieldReachesTheText) {
     EXPECT_NE(Render(c), Render(base)) << what << " does not reach the rendered text";
   };
   EpCfg c;
-  c = base; c.worldSize = 4;           differs(c, "worldSize");
-  c = base; c.hiddenDim = 1024;        differs(c, "hiddenDim");
-  c = base; c.maxTokPerRank = 256;     differs(c, "maxTokPerRank");
-  c = base; c.numExpertPerRank = 16;   differs(c, "numExpertPerRank");
-  c = base; c.numExpertPerToken = 4;   differs(c, "numExpertPerToken");
-  c = base; c.maxRecv = 2048;          differs(c, "maxRecv");
-  c = base; c.dtype = EpDType::Fp32;   differs(c, "dtype");
-  c = base; c.blockNum = 32;           differs(c, "blockNum");
-  c = base; c.warpPerBlock = 4;        differs(c, "warpPerBlock");
-  c = base; c.waveSize = 32;           differs(c, "waveSize");
-  c = base; c.useWeights = false;      differs(c, "useWeights");
-
+  c = base;
+  c.worldSize = 4;
+  differs(c, "worldSize");
+  c = base;
+  c.hiddenDim = 1024;
+  differs(c, "hiddenDim");
+  c = base;
+  c.maxTokPerRank = 256;
+  differs(c, "maxTokPerRank");
+  c = base;
+  c.numExpertPerRank = 16;
+  differs(c, "numExpertPerRank");
+  c = base;
+  c.numExpertPerToken = 4;
+  differs(c, "numExpertPerToken");
+  c = base;
+  c.maxRecv = 2048;
+  differs(c, "maxRecv");
+  c = base;
+  c.dtype = EpDType::Fp32;
+  differs(c, "dtype");
+  c = base;
+  c.blockNum = 32;
+  differs(c, "blockNum");
+  c = base;
+  c.warpPerBlock = 4;
+  differs(c, "warpPerBlock");
+  c = base;
+  c.waveSize = 32;
+  differs(c, "waveSize");
+  c = base;
+  c.useWeights = false;
+  differs(c, "useWeights");
 }
 
 TEST(Geometry, BlockThreadsIsWarpsTimesWave) {
@@ -134,7 +155,7 @@ TEST(Geometry, CombineSharedMemCoversOnePointerArrayPerWarp) {
   EpCfg c;
   c.warpPerBlock = 8;
   c.numExpertPerToken = 8;
-  c.useWeights = true;   // srcPtrs + srcWeightPtrs
+  c.useWeights = true;  // srcPtrs + srcWeightPtrs
   EXPECT_EQ(EpCombineSharedBytes(c), int(sizeof(void*)) * 8 * 8 * 2);
   c.useWeights = false;  // srcPtrs only
   EXPECT_EQ(EpCombineSharedBytes(c), int(sizeof(void*)) * 8 * 8);
@@ -168,10 +189,8 @@ TEST(Geometry, ValidityRejectsWhatTheKernelCannotRun) {
 }
 
 TEST(Sha256, KnownVectors) {
-  EXPECT_EQ(HexDigest(""),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
-  EXPECT_EQ(HexDigest("abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+  EXPECT_EQ(HexDigest(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+  EXPECT_EQ(HexDigest("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
 }
 
 TEST(Sha256, SurvivesBlockBoundaries) {
@@ -329,7 +348,8 @@ struct ToolchainOverride {
 
 std::string CacheDirWith(const std::string& arch, const std::string& nic) {
   ToolchainOverride guard(FakeToolchain(arch, nic));
-  return mori::jit::v2::Compiler::Instance().CacheDirFor("combine_reduce", "constexpr int x = 1;", {});
+  return mori::jit::v2::Compiler::Instance().CacheDirFor("combine_reduce", "constexpr int x = 1;",
+                                                         {});
 }
 }  // namespace
 

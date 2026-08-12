@@ -59,9 +59,8 @@ namespace v2 {
 // ---------------------------------------------------------------------------
 template <typename T>
 __device__ __forceinline__ T* EpPeer(unsigned long long win, int peer, unsigned long long off) {
-  return reinterpret_cast<T*>(
-      ::mori::cco::ccoGetLsaPeerPtr(reinterpret_cast<::mori::cco::ccoWindow_t>(win), peer,
-                                    static_cast<size_t>(off)));
+  return reinterpret_cast<T*>(::mori::cco::ccoGetLsaPeerPtr(
+      reinterpret_cast<::mori::cco::ccoWindow_t>(win), peer, static_cast<size_t>(off)));
 }
 
 template <typename T>
@@ -246,10 +245,9 @@ __device__ void EpDispatchBody(EpArgs args) {
       __hip_atomic_store(args.gridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 
       // +1 so a zero-token destination still sees a distinct "signal arrived".
-      const int numTokenSignal =
-          __hip_atomic_load(args.destPeTokenCounter + destPe, __ATOMIC_RELAXED,
-                            __HIP_MEMORY_SCOPE_AGENT) +
-          1;
+      const int numTokenSignal = __hip_atomic_load(args.destPeTokenCounter + destPe,
+                                                   __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) +
+                                 1;
       int* signal = EpPeer<int>(win, destPe, args.offRecvNum) + myPe;
       EpWaitEq(signal, 0);
       __threadfence_system();
@@ -364,8 +362,7 @@ __device__ void EpCombineBody(EpArgs args) {
   T** srcPtrs = reinterpret_cast<T**>(epSharedMem) + warpId * kTopk;
   float** srcWeightPtrs = nullptr;
   if constexpr (kCfg.useWeights) {
-    srcWeightPtrs =
-        reinterpret_cast<float**>(epSharedMem) + warpNum * kTopk + warpId * kTopk;
+    srcWeightPtrs = reinterpret_cast<float**>(epSharedMem) + warpNum * kTopk + warpId * kTopk;
   }
 
   EpMultiWarpIter mwIter(globalWarpNum, args.numTokens, kHidden);

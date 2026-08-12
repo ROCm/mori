@@ -100,7 +100,11 @@ def main():
 
     n_experts = world * EPR
     g = torch.Generator(device="cpu").manual_seed(1234 + rank)
-    inp = torch.randn(M, HIDDEN, generator=g, dtype=torch.float32).to(torch.bfloat16).to(dev)
+    inp = (
+        torch.randn(M, HIDDEN, generator=g, dtype=torch.float32)
+        .to(torch.bfloat16)
+        .to(dev)
+    )
     wts = torch.rand(M, TOPK, generator=g, dtype=torch.float32).to(dev)
     idx = (
         torch.stack([torch.randperm(n_experts, generator=g)[:TOPK] for _ in range(M)])

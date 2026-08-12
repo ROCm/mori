@@ -110,7 +110,6 @@ class Fields {
     items_.emplace_back(std::string(".") + name + "=" + rendered);
   }
 
-
   std::string Join() const {
     std::string out;
     for (size_t i = 0; i < items_.size(); ++i) {

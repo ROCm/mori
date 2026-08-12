@@ -63,8 +63,8 @@ namespace v2 {
 using index_t = int32_t;
 
 // Shipping gfx1250 combine config (were env gates in v1; production has one).
-#define MORI_COMB_TDM 2       // token push goes through the TDM engine, 2 chunks
-#define MORI_COMB_QUAD 2      // one warp per source, whole-token peer reads, 2 buffers
+#define MORI_COMB_TDM 2              // token push goes through the TDM engine, 2 chunks
+#define MORI_COMB_QUAD 2             // one warp per source, whole-token peer reads, 2 buffers
 #define MORI_COMB_LDS_BUDGET 327680  // dynamic LDS a combine block may reserve
 #define MORI_COMB_BARSLEEP 15        // s_sleep units between cross-device flag polls
 #define MORI_COMB_BARSPREAD 16       // stride (uint32 lines) of the per-block fan-out slots
@@ -369,13 +369,13 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
         int gTok = __shfl(tok, sl);
         if (srcLane < 0) continue;
         if (dt < 0 || dt >= _stgCap) continue;
-        index_t* sIdx = _cusplit_stgIdx + (size_t)d * _stgCap * CUSPLIT_MAX_TOPK + (size_t)dt * topk;
+        index_t* sIdx =
+            _cusplit_stgIdx + (size_t)d * _stgCap * CUSPLIT_MAX_TOPK + (size_t)dt * topk;
         float* sWt = _cusplit_stgWt + (size_t)d * _stgCap * CUSPLIT_MAX_TOPK + (size_t)dt * topk;
         for (int e = myE; e < topk; e += gsz) sIdx[e] = args.tokenIndices[(size_t)gTok * topk + e];
         if constexpr (kCfg.useWeights) {
           if (args.weightsBuf) {
-            for (int e = myE; e < topk; e += gsz)
-              sWt[e] = args.weightsBuf[(size_t)gTok * topk + e];
+            for (int e = myE; e < topk; e += gsz) sWt[e] = args.weightsBuf[(size_t)gTok * topk + e];
           }
         }
       }
@@ -410,8 +410,8 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
         for (index_t cs = 0; cs < myCnt; cs += tokCapM) {
           int cc = (int)((cs + tokCapM <= myCnt) ? tokCapM : (myCnt - cs));
           index_t ab = baseAll + myBeg + cs;
-          if (ab + cc > recvCapM) continue;   // OOB guard (peer slot capacity)
-          if (ab + cc > _stgCapM) continue;    // OOB guard (our staging region)
+          if (ab + cc > recvCapM) continue;  // OOB guard (peer slot capacity)
+          if (ab + cc > _stgCapM) continue;  // OOB guard (our staging region)
           const int nIdxB = cc * tkM, nWtB = cc * tkM;
           index_t* sI =
               _cusplit_stgIdx + (size_t)peer * _stgCapM * CUSPLIT_MAX_TOPK + (size_t)ab * tkM;
@@ -441,10 +441,10 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
           if (spW.body) TdmIssueLoad<int>(tW, reinterpret_cast<int*>(sW + spW.head), gW);
           if (spR.body) TdmIssueLoad<int>(tR, reinterpret_cast<int*>(sR + spR.head), gR);
           // Unaligned head/tail (and fields too small for 2 rows) go global->global.
-#define _MHT_REM(dstp, glbp, hd, bd, ntot)                                               \
-  do {                                                                                   \
-    for (int i = laneId; i < (hd); i += WS) (dstp)[i] = (glbp)[i];                       \
-    for (int i = (hd) + (bd) + laneId; i < (ntot); i += WS) (dstp)[i] = (glbp)[i];       \
+#define _MHT_REM(dstp, glbp, hd, bd, ntot)                                         \
+  do {                                                                             \
+    for (int i = laneId; i < (hd); i += WS) (dstp)[i] = (glbp)[i];                 \
+    for (int i = (hd) + (bd) + laneId; i < (ntot); i += WS) (dstp)[i] = (glbp)[i]; \
   } while (0)
           _MHT_REM(reinterpret_cast<int*>(dI), reinterpret_cast<int*>(sI), spI.head, spI.body,
                    nIdxB);
@@ -501,12 +501,13 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
       for (int _sub = 0; _sub < _tpi; ++_sub) {
         int tok = tokBase + _sub;
         if (tok >= args.numTokens) break;
-        index_t flatMe =
-            (laneId < topk) ? args.dispDestTokIdMap[(size_t)tok * topk + laneId] : EpNullFlat<kCfg>();
+        index_t flatMe = (laneId < topk) ? args.dispDestTokIdMap[(size_t)tok * topk + laneId]
+                                         : EpNullFlat<kCfg>();
         index_t peMe = EpPeFromFlat<kCfg>(flatMe);
         int validMe = (laneId < topk && peMe < (index_t)npes) ? 1 : 0;
         if (!__any(validMe)) continue;
-        TdmIssueLoad<T>(_tdmTile, reinterpret_cast<const T*>(args.inpTokenBuf) + (size_t)tok * hiddenDim,
+        TdmIssueLoad<T>(_tdmTile,
+                        reinterpret_cast<const T*>(args.inpTokenBuf) + (size_t)tok * hiddenDim,
                         _tdmG1);
         bool loadWaited = false;
         for (int l = 0; l < topk; ++l) {
@@ -534,10 +535,9 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     for (int destPe = laneId; destPe < npes; destPe += WS) {
       EpWaitEq(args.gridBarrier, static_cast<unsigned int>(gridDim.x));
       __hip_atomic_store(args.gridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      index_t numTokenSignal =
-          __hip_atomic_load(args.destPeTokenCounter + destPe, __ATOMIC_RELAXED,
-                            __HIP_MEMORY_SCOPE_AGENT) +
-          1;
+      index_t numTokenSignal = __hip_atomic_load(args.destPeTokenCounter + destPe, __ATOMIC_RELAXED,
+                                                 __HIP_MEMORY_SCOPE_AGENT) +
+                               1;
       index_t* signal = EpPeer<index_t>(win, destPe, args.offRecvNum) + myPe;
       EpWaitEq(signal, 0);
       __threadfence_system();
@@ -600,8 +600,8 @@ __device__ __forceinline__ void EpCrossDeviceBarrier1250x(EpArgs args, unsigned 
     }
   } else {
     if (thdId == 0) {
-      while (__hip_atomic_load(fanLines + (size_t)blockIdx.x * MORI_COMB_BARSPREAD, __ATOMIC_RELAXED,
-                               __HIP_MEMORY_SCOPE_AGENT) != fanEpoch) {
+      while (__hip_atomic_load(fanLines + (size_t)blockIdx.x * MORI_COMB_BARSPREAD,
+                               __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != fanEpoch) {
         __builtin_amdgcn_s_sleep(MORI_COMB_BARSLEEP);
       }
     }
@@ -833,16 +833,36 @@ __device__ void EpCombine1250xBody(EpArgs args) {
             __builtin_amdgcn_s_wait_tensorcnt(_qWaitLd);
         } else {
           switch ((_qUnits - 1 - _u) + (_qStIssuer ? _qTstOps : 0)) {
-            case 1: __builtin_amdgcn_s_wait_tensorcnt(1); break;
-            case 2: __builtin_amdgcn_s_wait_tensorcnt(2); break;
-            case 3: __builtin_amdgcn_s_wait_tensorcnt(3); break;
-            case 4: __builtin_amdgcn_s_wait_tensorcnt(4); break;
-            case 5: __builtin_amdgcn_s_wait_tensorcnt(5); break;
-            case 6: __builtin_amdgcn_s_wait_tensorcnt(6); break;
-            case 7: __builtin_amdgcn_s_wait_tensorcnt(7); break;
-            case 8: __builtin_amdgcn_s_wait_tensorcnt(8); break;
-            case 9: __builtin_amdgcn_s_wait_tensorcnt(9); break;
-            default: __builtin_amdgcn_s_wait_tensorcnt(0); break;
+            case 1:
+              __builtin_amdgcn_s_wait_tensorcnt(1);
+              break;
+            case 2:
+              __builtin_amdgcn_s_wait_tensorcnt(2);
+              break;
+            case 3:
+              __builtin_amdgcn_s_wait_tensorcnt(3);
+              break;
+            case 4:
+              __builtin_amdgcn_s_wait_tensorcnt(4);
+              break;
+            case 5:
+              __builtin_amdgcn_s_wait_tensorcnt(5);
+              break;
+            case 6:
+              __builtin_amdgcn_s_wait_tensorcnt(6);
+              break;
+            case 7:
+              __builtin_amdgcn_s_wait_tensorcnt(7);
+              break;
+            case 8:
+              __builtin_amdgcn_s_wait_tensorcnt(8);
+              break;
+            case 9:
+              __builtin_amdgcn_s_wait_tensorcnt(9);
+              break;
+            default:
+              __builtin_amdgcn_s_wait_tensorcnt(0);
+              break;
           }
         }
         _Q_BARRIER();
@@ -955,11 +975,10 @@ __device__ void EpCombine1250xBody(EpArgs args) {
         index_t destPe = EpPeFromFlat<kCfg>(destTokId);
         if (destPe < npes) {
           index_t destLocalTokId = EpLocalTokFromFlat<kCfg>(destTokId);
-          srcPtrs[j] =
-              EpPeer<TokT>(win, destPe, args.offOutTok) + destLocalTokId * hiddenDim + hiddenDimOffset;
+          srcPtrs[j] = EpPeer<TokT>(win, destPe, args.offOutTok) + destLocalTokId * hiddenDim +
+                       hiddenDimOffset;
           if constexpr (kCfg.useWeights) {
-            srcWeightsPtr[j] =
-                EpPeer<float>(win, destPe, args.offOutWts) + destLocalTokId * topk;
+            srcWeightsPtr[j] = EpPeer<float>(win, destPe, args.offOutWts) + destLocalTokId * topk;
           }
         } else {
           srcPtrs[j] = nullptr;

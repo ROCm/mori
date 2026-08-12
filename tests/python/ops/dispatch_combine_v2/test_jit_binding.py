@@ -79,7 +79,13 @@ def test_plan_classes_materialise_from_the_registry():
 
 def test_constructor_signature_comes_from_the_cpp_request_schema():
     doc = cb.EpDispatchPlan.__doc__
-    for field in ("world_size", "hidden_dim", "num_expert_per_token", "max_recv", "dtype"):
+    for field in (
+        "world_size",
+        "hidden_dim",
+        "num_expert_per_token",
+        "max_recv",
+        "dtype",
+    ):
         assert field in doc, f"{field} missing from the generated signature"
 
 
@@ -150,7 +156,14 @@ def test_closed_plan_refuses_to_launch():
 def test_info_reports_every_cfg_field_and_the_resolved_geometry():
     p = _plan()
     info = p.info
-    for field in ("worldSize", "hiddenDim", "maxRecv", "waveSize", "blockNum", "warpPerBlock"):
+    for field in (
+        "worldSize",
+        "hiddenDim",
+        "maxRecv",
+        "waveSize",
+        "blockNum",
+        "warpPerBlock",
+    ):
         assert field in info, f"{field} missing from info"
     assert info["blockX"] == info["warpPerBlock"] * info["waveSize"]
     assert info["gridX"] == info["blockNum"]

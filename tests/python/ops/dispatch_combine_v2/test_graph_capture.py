@@ -88,9 +88,11 @@ def main():
     num_experts = npes * EPR
 
     g = torch.Generator(device="cpu").manual_seed(1234 + rank)
-    inp = torch.randn(CT, HIDDEN, generator=g, dtype=torch.float32).to(
-        torch.bfloat16
-    ).to(dev)
+    inp = (
+        torch.randn(CT, HIDDEN, generator=g, dtype=torch.float32)
+        .to(torch.bfloat16)
+        .to(dev)
+    )
     idx = torch.randint(0, num_experts, (CT, K), generator=g, dtype=torch.int32).to(dev)
     wts = torch.rand(CT, K, generator=g, dtype=torch.float32).to(dev)
 
@@ -127,10 +129,7 @@ def main():
         comm.barrier()
 
         U = np.array(
-            [
-                len({int(i) // EPR for i in idx[t].cpu().tolist()})
-                for t in range(CT)
-            ]
+            [len({int(i) // EPR for i in idx[t].cpu().tolist()}) for t in range(CT)]
         )
         exp = (torch.from_numpy(U).view(CT, 1).float() * inp.float().cpu()).to(
             torch.bfloat16

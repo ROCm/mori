@@ -287,21 +287,33 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                 warp_num_per_block=cfg.combine_warp_num_per_block,
             )
         self._kernels = KernelSet(
-            dispatch={k: self._wrap_dispatch(k, replay=False) for k in self._dispatch_variants},
+            dispatch={
+                k: self._wrap_dispatch(k, replay=False) for k in self._dispatch_variants
+            },
             combine={k: self._wrap_combine(k) for k in self._combine_variants},
             # Replay variants stay lazily compiled -- building all of them
             # eagerly would cost every op a compile it usually never uses. The
             # wrapper keeps that laziness inside the backend instead of on the
             # base's hot path.
-            dispatch_replay={k: self._wrap_dispatch(k, replay=True)
-                             for k in self._dispatch_variants},
+            dispatch_replay={
+                k: self._wrap_dispatch(k, replay=True) for k in self._dispatch_variants
+            },
             # FlyDSL stages combine's input on the host (see combine()), and its
             # kernels reset their own counters.
             stages_in_kernel=False,
             self_resets_counters=True,
             capabilities=frozenset(
-                {"gather", "scatter", "quant", "std_moe", "scales", "replay",
-                 "local_expert_count", "asymmetric_dtype", "recv_cap"}
+                {
+                    "gather",
+                    "scatter",
+                    "quant",
+                    "std_moe",
+                    "scales",
+                    "replay",
+                    "local_expert_count",
+                    "asymmetric_dtype",
+                    "recv_cap",
+                }
             ),
         )
         self._gate(self._kernels)
@@ -440,7 +452,11 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                 self.dest_pe_counter.data_ptr(),
                 self.dispatch_barrier.data_ptr(),
                 self.total_recv.data_ptr(),
-                scales.data_ptr() if (scales is not None and self._enable_scales) else 0,
+                (
+                    scales.data_ptr()
+                    if (scales is not None and self._enable_scales)
+                    else 0
+                ),
                 self.cfg.rank,
                 num_tokens,
                 fx.Stream(torch.cuda.current_stream()),

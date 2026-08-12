@@ -53,8 +53,10 @@ _DISP_DT = {
 _DISP_NBYTES = {torch.bfloat16: 2, torch.float8_e4m3fn: 1}.get(_DISP_DT, 0.5)
 # Geometry, same spelling as tools/ep_test.sh. Unset = the backend's tuned default,
 # i.e. what ships; setting any one of them pins the geometry for the whole run.
-_G = {k: (int(os.environ[k]) if os.environ.get(k) else None)
-      for k in ("DBN", "DWPB", "CBN", "CWPB")}
+_G = {
+    k: (int(os.environ[k]) if os.environ.get(k) else None)
+    for k in ("DBN", "DWPB", "CBN", "CWPB")
+}
 
 
 def main():
@@ -92,17 +94,23 @@ def main():
     n_experts = world * EPR
     g = torch.Generator(device="cpu").manual_seed(1234 + rank)
     if _DISP_DT is torch.float4_e2m1fn_x2:  # no torch cast; generate packed bytes
-        inp = torch.randint(
-            0, 256, (M, HIDDEN // 2), generator=g, dtype=torch.uint8
-        ).view(_DISP_DT).to(dev)
+        inp = (
+            torch.randint(0, 256, (M, HIDDEN // 2), generator=g, dtype=torch.uint8)
+            .view(_DISP_DT)
+            .to(dev)
+        )
     else:
         inp = (
-            torch.randn(M, HIDDEN, generator=g, dtype=torch.float32).to(_DISP_DT).to(dev)
+            torch.randn(M, HIDDEN, generator=g, dtype=torch.float32)
+            .to(_DISP_DT)
+            .to(dev)
         )
     wts = torch.rand(M, TOPK, generator=g, dtype=torch.float32).to(dev)
-    idx = torch.stack(
-        [torch.randperm(n_experts, generator=g)[:TOPK] for _ in range(M)]
-    ).to(torch.int32).to(dev)
+    idx = (
+        torch.stack([torch.randperm(n_experts, generator=g)[:TOPK] for _ in range(M)])
+        .to(torch.int32)
+        .to(dev)
+    )
 
     if rank == 0:
         print(

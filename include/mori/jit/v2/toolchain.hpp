@@ -38,8 +38,8 @@ namespace v2 {
 int WaveSizeForArch(const std::string& arch);
 
 struct Toolchain {
-  std::string arch;        // "gfx942" / "gfx950" / "gfx1250", no :xnack suffix
-  std::string hipcc;       // absolute path
+  std::string arch;   // "gfx942" / "gfx950" / "gfx1250", no :xnack suffix
+  std::string hipcc;  // absolute path
   std::string rocmPath;
   std::string sourceRoot;  // repo root, or the packaged _jit-sources dir
   std::string cacheRoot;   // ~/.mori/jit  (MORI_JIT_CACHE_DIR overrides)

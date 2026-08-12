@@ -207,7 +207,10 @@ def _bind(lib: ctypes.CDLL) -> None:
 
     lib.mori_jit_plan_launch.restype = ctypes.c_int
     lib.mori_jit_plan_launch.argtypes = [
-        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
     ]
 
     lib.mori_jit_plan_info.restype = ctypes.c_int
@@ -255,7 +258,9 @@ def _as_ptr(x) -> int:
         return int(x.data_ptr())
     if isinstance(x, int):
         return x
-    raise TypeError(f"expected a tensor, an int pointer, or None; got {type(x).__name__}")
+    raise TypeError(
+        f"expected a tensor, an int pointer, or None; got {type(x).__name__}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -308,7 +313,9 @@ def _args_struct(kernel: str):
     for item in raw.decode().split(","):
         name, _, tag = item.partition(":")
         if tag not in _CTYPE:
-            raise RuntimeError(f"mori jit: kernel '{kernel}' schema has unknown type '{tag}'")
+            raise RuntimeError(
+                f"mori jit: kernel '{kernel}' schema has unknown type '{tag}'"
+            )
         fields.append((name, _CTYPE[tag]))
 
     struct = type(f"_{kernel}Args", (ctypes.Structure,), {"_fields_": fields})
@@ -334,12 +341,19 @@ def _enum_code(value) -> int:
     if isinstance(value, int):
         return value
     name = (getattr(value, "name", None) or str(value)).rsplit(".", 1)[-1].lower()
-    name = {"bfloat16": "bf16", "float32": "fp32", "float": "fp32",
-            # every sub-16-bit dtype is transported as raw bytes; see DTYPES
-            "float8_e4m3fn": "byte8", "float8_e4m3fnuz": "byte8",
-            "float4_e2m1fn_x2": "byte8"}.get(name, name)
+    name = {
+        "bfloat16": "bf16",
+        "float32": "fp32",
+        "float": "fp32",
+        # every sub-16-bit dtype is transported as raw bytes; see DTYPES
+        "float8_e4m3fn": "byte8",
+        "float8_e4m3fnuz": "byte8",
+        "float4_e2m1fn_x2": "byte8",
+    }.get(name, name)
     if name not in DTYPES:
-        raise ValueError(f"unsupported dtype {value!r}; expected one of {sorted(DTYPES)}")
+        raise ValueError(
+            f"unsupported dtype {value!r}; expected one of {sorted(DTYPES)}"
+        )
     return DTYPES[name]
 
 
@@ -354,8 +368,11 @@ def make_plan(kernel: str) -> type:
     # `arena=`. A launch argument named `off<Region>` is an arena region offset;
     # passing `arena=` binds it once instead of repeating it every call.
     snake_to_wire = {_camel_to_snake(n): n for n in req_schema}
-    arg_regions = {n: n[3].lower() + n[4:] for n in arg_names
-                   if len(n) > 3 and n.startswith("off") and n[3].isupper()}
+    arg_regions = {
+        n: n[3].lower() + n[4:]
+        for n in arg_names
+        if len(n) > 3 and n.startswith("off") and n[3].isupper()
+    }
     arg_snake_to_wire = {_camel_to_snake(n): n for n in arg_names}
     _all_regions = sorted(arg_regions.values())
 
@@ -432,8 +449,10 @@ def make_plan(kernel: str) -> type:
                 if name in merged:
                     setattr(buf, name, _as_ptr(merged[name]))
             rc = _load().mori_jit_plan_launch(
-                self._handle, ctypes.byref(buf), ctypes.sizeof(buf),
-                ctypes.c_void_p(_as_ptr(stream))
+                self._handle,
+                ctypes.byref(buf),
+                ctypes.sizeof(buf),
+                ctypes.c_void_p(_as_ptr(stream)),
             )
             if rc != 0:
                 raise RuntimeError(f"mori jit [{kernel}] launch: {_error()}")
@@ -481,8 +500,10 @@ def make_plan(kernel: str) -> type:
 
         def __repr__(self) -> str:
             i = self.info
-            return (f"{type(self).__name__}(grid={i.get('gridX')}, block={i.get('blockX')}, "
-                    f"lds={i.get('sharedBytes')}B)")
+            return (
+                f"{type(self).__name__}(grid={i.get('gridX')}, block={i.get('blockX')}, "
+                f"lds={i.get('sharedBytes')}B)"
+            )
 
     Plan.__name__ = "".join(w.capitalize() for w in kernel.split("_")) + "Plan"
     Plan.__qualname__ = Plan.__name__
