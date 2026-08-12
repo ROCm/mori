@@ -195,32 +195,28 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
       break;
     }
   }
-  if (context.IsProxyEnabled() && rdmaDeviceContext && anyRdmaPeer) {
-    if (heap_begin) {
-      application::RdmaMemoryRegion mr =
-          rdmaDeviceContext->RegisterRdmaMemoryRegionAuto(localPtr, size);
-      cpuMemObj->lkey = mr.lkey;
-      cpuMemObj->peerRkeys[rank] = mr.rkey;
-      bootNet.Allgather(&cpuMemObj->peerRkeys[rank], cpuMemObj->peerRkeys, sizeof(uint32_t));
-      heapLkey_ = mr.lkey;
+  // SDMA/P2P-only transits pass rdmaRegister=false to skip ibv_reg_mr (the
+  // buffer is never an RDMA src/dst). This dodges the ionic single-MR limit
+  // (ibv_reg_mr fails at >=~2 GiB) for the hierarchical AllGather's intra
+  // node-block. The rkey stays 0 and the Allgather below still runs, so the
+  // collective register stays in lockstep.
+  if (rdmaDeviceContext && anyRdmaPeer && rdmaRegister) {
+    application::RdmaMemoryRegion mr =
+        rdmaDeviceContext->RegisterRdmaMemoryRegionAuto(localPtr, size);
+    cpuMemObj->lkey = mr.lkey;
+    cpuMemObj->peerRkeys[rank] = mr.rkey;
+  }
+  bootNet.Allgather(&cpuMemObj->peerRkeys[rank], cpuMemObj->peerRkeys, sizeof(uint32_t));
+
+  if (context.IsProxyEnabled()) {
+    if (rdmaDeviceContext && anyRdmaPeer && heap_begin) {
+      heapLkey_ = cpuMemObj->lkey;
       heapRkeys_.assign(cpuMemObj->peerRkeys, cpuMemObj->peerRkeys + worldSize);
-    } else {
+    } else if (!heap_begin && !heapRkeys_.empty()) {
       cpuMemObj->lkey = heapLkey_;
       memcpy(cpuMemObj->peerRkeys, heapRkeys_.data(), worldSize * sizeof(uint32_t));
     }
-  } else {
-    // Original path: register MR and Allgather rkeys
-    if (rdmaDeviceContext && anyRdmaPeer && rdmaRegister) {
-      application::RdmaMemoryRegion mr =
-          rdmaDeviceContext->RegisterRdmaMemoryRegionAuto(localPtr, size);
-      cpuMemObj->lkey = mr.lkey;
-      cpuMemObj->peerRkeys[rank] = mr.rkey;
-    }
-    bootNet.Allgather(&cpuMemObj->peerRkeys[rank], cpuMemObj->peerRkeys, sizeof(uint32_t));
-  }
 
-  // Per-NIC MR registration for proxy mode only.
-  if (context.IsProxyEnabled()) {
     const auto& allCtxs = context.GetAllRdmaDeviceContexts();
     int numNics = static_cast<int>(allCtxs.size());
     if (numNics > 1 && anyRdmaPeer && heap_begin) {
