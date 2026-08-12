@@ -165,8 +165,7 @@ jobs:
           # same commit and box pass on rocm7.2.4. Re-enable once ROCm is fixed.
           $CT exec $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE && \
-            python -m pytest tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_intranode.py -v \
-              -k 'not gather'"
+            python -m pytest tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_intranode.py -v
 
       - name: Run ops-v2 dispatch/combine bench (EP8 smoke)
         run: |
@@ -174,7 +173,7 @@ jobs:
           # (see the step above). Drop once the gather path is unblocked.
           $CT exec $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
-            MODE=graph COMBINE=scatter SWEEP=128,512,4096,8192 ITERS=20 WARMUP=10 \
+            MODE=graph SWEEP=128,512,4096,8192 ITERS=20 WARMUP=10 \
             torchrun --standalone --nproc_per_node=8 bench_dispatch_combine.py"
 
 
