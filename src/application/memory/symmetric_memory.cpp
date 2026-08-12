@@ -200,8 +200,7 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
       break;
     }
   }
-  bool useProxy = (std::getenv("MORI_EP_OVER_RDMA") && std::string(std::getenv("MORI_EP_OVER_RDMA")) == "1") ||
-                  (std::getenv("MORI_USE_IBGDA_PROXY") && std::string(std::getenv("MORI_USE_IBGDA_PROXY")) == "1");
+  bool useProxy = (std::getenv("MORI_EP_OVER_RDMA") && std::string(std::getenv("MORI_EP_OVER_RDMA")) == "1");
 
   if (useProxy && rdmaDeviceContext && anyRdmaPeer) {
     if (heap_begin) {

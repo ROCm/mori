@@ -246,8 +246,7 @@ void Context::InitializeTopologyAndTransports() {
   }
 
   // Build per-rail device contexts for proxy mode (rail-isolated fabrics).
-  bool useProxy = (std::getenv("MORI_EP_OVER_RDMA") && std::string(std::getenv("MORI_EP_OVER_RDMA")) == "1") ||
-                  (std::getenv("MORI_USE_IBGDA_PROXY") && std::string(std::getenv("MORI_USE_IBGDA_PROXY")) == "1");
+  bool useProxy = (std::getenv("MORI_EP_OVER_RDMA") && std::string(std::getenv("MORI_EP_OVER_RDMA")) == "1");
   if (useProxy) {
     allRdmaDeviceContexts.clear();
     for (const auto& dp : activeDevicePortList) {
@@ -399,8 +398,7 @@ void Context::EnsureSdmaTransport(int requestedChannels) {
 /* ------------------------------------------------------------------------ */
 
 void Context::BuildAndConnectInitialEndpoints() {
-  bool useProxy = (std::getenv("MORI_EP_OVER_RDMA") && std::string(std::getenv("MORI_EP_OVER_RDMA")) == "1") ||
-                  (std::getenv("MORI_USE_IBGDA_PROXY") && std::string(std::getenv("MORI_USE_IBGDA_PROXY")) == "1");
+  bool useProxy = (std::getenv("MORI_EP_OVER_RDMA") && std::string(std::getenv("MORI_EP_OVER_RDMA")) == "1");
 
   const int numRailContexts = useProxy ? static_cast<int>(allRdmaDeviceContexts.size()) : 0;
   const int myLocalGpu = LocalRankInNode();

@@ -595,8 +595,8 @@ void GpuStateInit(ShmemStates* states) {
   states->gpuStates.numQpPerPe = states->rdmaStates->commContext->GetNumQpPerPe();
 
   // Check if IBGDA proxy mode is requested
-  const char* proxyEnv = std::getenv("MORI_USE_IBGDA_PROXY");
-  if (proxyEnv && (std::string(proxyEnv) == "1" || std::string(proxyEnv) == "true")) {
+  const char* proxyEnv = std::getenv("MORI_EP_OVER_RDMA");
+  if (proxyEnv && std::string(proxyEnv) == "1") {
     // Determine number of NICs for per-NIC ring allocation
     int numNics = 1;
     if (states->rdmaStates && states->rdmaStates->commContext) {

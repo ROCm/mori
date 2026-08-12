@@ -480,8 +480,8 @@ void IonicDeviceContext::create_parent_domain(ibv_context* context, struct ibv_p
 
 IonicDeviceContext::IonicDeviceContext(RdmaDevice* rdma_device, ibv_context* context, ibv_pd* in_pd)
     : RdmaDeviceContext(rdma_device, in_pd) {
-  const char* proxyEnvPD = std::getenv("MORI_USE_IBGDA_PROXY");
-  bool useProxyPD = proxyEnvPD && (std::string(proxyEnvPD) == "1" || std::string(proxyEnvPD) == "true");
+  const char* proxyEnvPD = std::getenv("MORI_EP_OVER_RDMA");
+  bool useProxyPD = proxyEnvPD && std::string(proxyEnvPD) == "1";
   if (!useProxyPD) {
     create_parent_domain(context, in_pd);
   }
@@ -505,8 +505,8 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
 
   assert(!config.withCompChannel && !config.enableSrq && "not implemented");
 
-  const char* proxyEnvQP = std::getenv("MORI_USE_IBGDA_PROXY");
-  bool useProxyQP = proxyEnvQP && (std::string(proxyEnvQP) == "1" || std::string(proxyEnvQP) == "true");
+  const char* proxyEnvQP = std::getenv("MORI_EP_OVER_RDMA");
+  bool useProxyQP = proxyEnvQP && std::string(proxyEnvQP) == "1";
 
   if (useProxyQP) {
     ibv_pd* basePd = GetIbvPd();
@@ -551,8 +551,8 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
     return endpoint;
   }
 
-  const char* proxyEnv = std::getenv("MORI_USE_IBGDA_PROXY");
-  bool useProxy = proxyEnv && (std::string(proxyEnv) == "1" || std::string(proxyEnv) == "true");
+  const char* proxyEnv = std::getenv("MORI_EP_OVER_RDMA");
+  bool useProxy = proxyEnv && std::string(proxyEnv) == "1";
 
   if (useProxy) {
     ibv_pd* basePd = GetIbvPd();
