@@ -77,11 +77,34 @@ inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::PR
   GpuStates* gs = GetGlobalGpuStatesPtr();
   int epIndex = pe * gs->numQpPerPe + (qpId % gs->numQpPerPe);
   volatile core::ProxyRing* ring = ProxyRingForEp(ps, epIndex);
-  uint32_t lkey = source->lkey;
-  uintptr_t srcAddr = reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset;
-  uintptr_t raddr = dest->peerPtrs[pe] + destOffset;
-  uint32_t rkey = dest->peerRkeys[pe];
-  core::ProxyPostWrite(ring, epIndex, srcAddr, lkey, raddr, rkey, bytes);
+
+  size_t currentOffset = 0;
+  size_t remaining = bytes;
+  while (remaining > 0) {
+    uint32_t lkey;
+    uint32_t rkey;
+    uintptr_t srcAddr;
+    uintptr_t raddr;
+    size_t transfer_size;
+    if (gs->useVMMHeap) {
+      srcAddr = reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset + currentOffset;
+      size_t src_chunk_size;
+      VmmQueryLocalKey(srcAddr, remaining, lkey, src_chunk_size);
+      uintptr_t dstAddr = reinterpret_cast<uintptr_t>(dest->localPtr) + destOffset + currentOffset;
+      size_t dst_chunk_size;
+      VmmQueryRemoteAddr(dstAddr, pe, remaining, raddr, rkey, dst_chunk_size);
+      transfer_size = src_chunk_size < dst_chunk_size ? src_chunk_size : dst_chunk_size;
+    } else {
+      lkey = source->lkey;
+      srcAddr = reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset + currentOffset;
+      raddr = dest->peerPtrs[pe] + destOffset + currentOffset;
+      rkey = dest->peerRkeys[pe];
+      transfer_size = remaining;
+    }
+    core::ProxyPostWrite(ring, epIndex, srcAddr, lkey, raddr, rkey, transfer_size);
+    remaining -= transfer_size;
+    currentOffset += transfer_size;
+  }
 }
 
 template <>
@@ -113,8 +136,15 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernel<application::TransportType
   GpuStates* gs = GetGlobalGpuStatesPtr();
   int epIndex = pe * gs->numQpPerPe + (qpId % gs->numQpPerPe);
   volatile core::ProxyRing* ring = ProxyRingForEp(ps, epIndex);
-  uintptr_t raddr = dest->peerPtrs[pe] + destOffset;
-  uint32_t rkey = dest->peerRkeys[pe];
+  uintptr_t raddr;
+  uint32_t rkey;
+  if (gs->useVMMHeap) {
+    uintptr_t dstAddr = reinterpret_cast<uintptr_t>(dest->localPtr) + destOffset;
+    VmmLookupRemote(dstAddr, pe, raddr, rkey);
+  } else {
+    raddr = dest->peerPtrs[pe] + destOffset;
+    rkey = dest->peerRkeys[pe];
+  }
   core::ProxyPostWriteInline(ring, epIndex,
                              reinterpret_cast<uint64_t>(val), 0, raddr, rkey, bytes);
 }
