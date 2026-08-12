@@ -168,6 +168,11 @@ struct PlanHandle {
 
 }  // namespace
 
+// EVERY entry below must be noexcept in practice: an exception crossing extern "C"
+// into ctypes is undefined behaviour, and in practice terminates the interpreter with
+// no traceback. Anything that allocates -- and the schema getters do, if only to build
+// an error string -- therefore catches. Failure is reported the way the rest of the
+// ABI reports it: a null/negative return plus mori_jit_last_error().
 extern "C" {
 
 #define MORI_JIT_API __attribute__((visibility("default")))
@@ -175,33 +180,45 @@ extern "C" {
 MORI_JIT_API const char* mori_jit_last_error() { return mori::jit::v2::PlanError(); }
 
 MORI_JIT_API const char* mori_jit_plan_args_schema(const char* kernel) {
-  const PlanVTable* vt = FindPlan(kernel);
-  if (!vt) {
-    SetPlanError(std::string("unknown kernel '") + (kernel ? kernel : "(null)") + "'");
+  try {
+    const PlanVTable* vt = FindPlan(kernel);
+    if (!vt) {
+      SetPlanError(std::string("unknown kernel '") + (kernel ? kernel : "(null)") + "'");
+      return nullptr;
+    }
+    return vt->argsSchema;
+  } catch (...) {
     return nullptr;
   }
-  return vt->argsSchema;
 }
 
 // "name:tag=default,..." — the binding builds its constructor from this.
 MORI_JIT_API const char* mori_jit_plan_request_schema(const char* kernel) {
   static thread_local std::string s;
-  const PlanVTable* vt = FindPlan(kernel);
-  if (!vt) {
-    SetPlanError(std::string("unknown kernel '") + (kernel ? kernel : "(null)") + "'");
+  try {
+    const PlanVTable* vt = FindPlan(kernel);
+    if (!vt) {
+      SetPlanError(std::string("unknown kernel '") + (kernel ? kernel : "(null)") + "'");
+      return nullptr;
+    }
+    s = vt->requestSchema();
+    return s.c_str();
+  } catch (...) {
     return nullptr;
   }
-  s = vt->requestSchema();
-  return s.c_str();
 }
 
 MORI_JIT_API int mori_jit_plan_args_size(const char* kernel) {
-  const PlanVTable* vt = FindPlan(kernel);
-  if (!vt) {
-    SetPlanError(std::string("unknown kernel '") + (kernel ? kernel : "(null)") + "'");
+  try {
+    const PlanVTable* vt = FindPlan(kernel);
+    if (!vt) {
+      SetPlanError(std::string("unknown kernel '") + (kernel ? kernel : "(null)") + "'");
+      return -1;
+    }
+    return static_cast<int>(vt->argsSize);
+  } catch (...) {
     return -1;
   }
-  return static_cast<int>(vt->argsSize);
 }
 
 MORI_JIT_API void* mori_jit_plan_create(const char* kernel, const char* arch,
@@ -232,7 +249,12 @@ MORI_JIT_API void* mori_jit_plan_create(const char* kernel, const char* arch,
 MORI_JIT_API void mori_jit_plan_destroy(void* plan) {
   auto* h = static_cast<PlanHandle*>(plan);
   if (!h) return;
-  h->vt->destroy(h->impl);
+  try {
+    h->vt->destroy(h->impl);
+  } catch (...) {
+    // Swallow: this is the teardown path, the caller has no way to react, and
+    // letting it out of extern "C" would turn a leak into a terminate.
+  }
   delete h;
 }
 
@@ -289,12 +311,16 @@ MORI_JIT_API int mori_jit_precompile(const char* kernel, const char* arch) {
 // Comma-separated names of every registered kernel.
 MORI_JIT_API const char* mori_jit_registered_plans() {
   static thread_local std::string s;
-  s.clear();
-  for (const auto& n : mori::jit::v2::RegisteredPlans()) {
-    if (!s.empty()) s += ",";
-    s += n;
+  try {
+    s.clear();
+    for (const auto& n : mori::jit::v2::RegisteredPlans()) {
+      if (!s.empty()) s += ",";
+      s += n;
+    }
+    return s.c_str();
+  } catch (...) {
+    return nullptr;
   }
-  return s.c_str();
 }
 
 #undef MORI_JIT_API

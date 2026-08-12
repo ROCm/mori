@@ -63,11 +63,13 @@ def _device_key():
 
 def _hip_default() -> dict:
     """Fallback for an unswept shape, mirroring the C++ MakeEpCfg arch default so a
-    bare C++ caller and this path agree. Not a tuned answer: every device in the
-    tables above beats it (mi355x combine wants 64x8, not this 80x8)."""
+    bare C++ caller and this path agree. Still not a tuned answer -- it is one shape
+    for every device, token count and dtype -- but it is no longer a known-worse one:
+    combine moved 80x8 -> 64x8 in both places once the sweep showed 64 wins at every
+    size on mi355x."""
     return dict(
         dispatch_block_num=64,
-        combine_block_num=80,
+        combine_block_num=64,
         warp_num_per_block=16,
         combine_warp_num_per_block=8,
         schedule=None,
@@ -128,16 +130,16 @@ _DISPATCH_TABLE: dict = {
 # No dtype axis: combine reduces the bf16 staging region whatever dispatch carried,
 # and three runs per shape (one per dispatch dtype) agreed to 1-5%.
 #
-# mi355x 64x8 wins at every size and both topk, and REPLACES the 80x8 that MakeEpCfg
-# and _hip_default() still carry (2-3% faster, 16 fewer blocks). It is a real optimum,
-# not just the smallest tried: 32x8 costs 37% at ct=4096. On gfx1250, 128x4 never wins
-# and 256x8 collapses 2x at 16384.
+# mi355x 64x8 wins at every size and both topk, 2-3% over the 80x8 v1 carried and with
+# 16 fewer blocks; MakeEpCfg and _hip_default() were moved to 64 to match, so the
+# untuned fallback is no longer a geometry the tables already knew was worse. It is a
+# real optimum, not just the smallest tried: 32x8 costs 37% at ct=4096. On gfx1250,
+# 128x4 never wins and 256x8 collapses 2x at 16384.
 _COMBINE_TABLE: dict = {
     # MI355X / gfx950 EP8: 64x8 wins at every token count and both topk, against
     # 32x8 / 48x8 / 64x16 / 80x8 (us at ct=4096, topk 8: 991.6 / 750.5 / 724.3 / 738.5 /
-    # 745.2). Note this REPLACES the 80x8 that MakeEpCfg still uses as its arch default
-    # and that _hip_default() mirrors -- 80x8 was measured once, on a narrower grid; 64x8
-    # is 2-3% faster with 16 fewer blocks. Fewer blocks than 64 is not free here: 32x8
+    # 745.2). 80x8 was v1's value, measured once on a narrower grid; both MakeEpCfg and
+    # _hip_default() now say 64 as well. Fewer blocks than 64 is not free here: 32x8
     # costs 37% at ct=4096, so this is a real optimum, not just the smallest thing tried.
     "mi355x": {
         (8, 7168, 8, None): ((None, 64, 8),),

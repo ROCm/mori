@@ -372,8 +372,11 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
         index_t* sIdx = _cusplit_stgIdx + (size_t)d * _stgCap * CUSPLIT_MAX_TOPK + (size_t)dt * topk;
         float* sWt = _cusplit_stgWt + (size_t)d * _stgCap * CUSPLIT_MAX_TOPK + (size_t)dt * topk;
         for (int e = myE; e < topk; e += gsz) sIdx[e] = args.tokenIndices[(size_t)gTok * topk + e];
-        if (args.weightsBuf) {
-          for (int e = myE; e < topk; e += gsz) sWt[e] = args.weightsBuf[(size_t)gTok * topk + e];
+        if constexpr (kCfg.useWeights) {
+          if (args.weightsBuf) {
+            for (int e = myE; e < topk; e += gsz)
+              sWt[e] = args.weightsBuf[(size_t)gTok * topk + e];
+          }
         }
       }
     }
@@ -416,7 +419,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
               _cusplit_stgWt + (size_t)peer * _stgCapM * CUSPLIT_MAX_TOPK + (size_t)ab * tkM;
           index_t* sR = _cusplit_stgSrc + (size_t)peer * _stgCapM + (size_t)ab;
           index_t* dI = EpPeer<index_t>(win, peer, args.offOutIdx) + (size_t)ab * tkM;
-          float* dW = args.weightsBuf
+          float* dW = (kCfg.useWeights && args.weightsBuf)
                           ? (EpPeer<float>(win, peer, args.offOutWts) + (size_t)ab * tkM)
                           : nullptr;
           index_t* dR = EpPeer<index_t>(win, peer, args.offRecvToSrc) + (size_t)ab;
@@ -465,7 +468,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
       for (int item = warpId; item < nItems; item += warpNum) {
         int peer = item / kMetaFields;
         int field = item - peer * kMetaFields;  // 0=idx, 1=wt, 2=srcmap
-        if (field == 1 && !args.weightsBuf) continue;
+        if (field == 1 && !(kCfg.useWeights && args.weightsBuf)) continue;
         index_t cnt = _cusplit_blkCount[(size_t)blockIdx.x * npes + peer];
         if (cnt <= 0) continue;
         index_t ab = _cusplit_blkBase[(size_t)blockIdx.x * npes + peer];

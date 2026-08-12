@@ -63,14 +63,25 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
 
   // Geometry defaults, split by kernel because the two are bound by different
   // things: dispatch is a copy engine and wants warps, combine's per-token
-  // reduction saturates sooner. Block counts are v1's tuned single-shot values.
+  // reduction saturates sooner.
   //
   // Combine's 8 warps is measured, not inherited: on gfx950 EP8 at
   // hidden=7168/topk=8, combine runs 75.4/164.1/978 us at 8 warps against
   // 87.8/173.2/1008 at v1's 4 and 102.8/201.3/1100 at 16 (128/512/4096 tokens).
-  // One shape only -- this is a default, not a tuning table.
+  //
+  // Combine's 64 blocks replaces v1's 80. The full sweep behind
+  // hip_tuning_configs measured 64x8 as the winner at every token count and both
+  // topk on mi355x -- 2-3% over 80x8 with 16 fewer blocks -- and 80 was never a
+  // measured optimum, just the value v1 carried. Fewer blocks is not free either:
+  // 32x8 costs 37% at ct=4096, so this is the optimum and not merely the smallest
+  // thing tried. The Python path takes the tuning table and never sees this; what
+  // it fixes is the bare C++ caller, who was getting a geometry the tables already
+  // knew was worse.
+  //
+  // Still one shape -- a default, not a tuning table. Anything tuned belongs in
+  // hip_tuning_configs, which is keyed by device, shape, topk and dtype.
   const bool isDispatch = kind == EpKernelKind::Dispatch;
-  c.blockNum = isDispatch ? 64 : 80;
+  c.blockNum = 64;
   c.warpPerBlock = isDispatch ? 16 : 8;
 
   if (req.blockNum > 0) c.blockNum = req.blockNum;
