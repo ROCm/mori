@@ -8,7 +8,7 @@ HIP** — it does not use mori's shmem or cco. The only thing it needs from the 
 recv slot of rank p, chunk from rank r  ==  flat_base + p*stride + r*chunk_bytes
 ```
 
-so the kernel takes two pointers and three integers rather than an N-entry pointer array,
+so the kernel takes two pointers and a few integers rather than an N-entry pointer array,
 and the destination rank can be computed at run time.
 
 ```bash
@@ -36,24 +36,40 @@ base, stride = flat_layout(recv)
 all2all_kernel.all2all_push(send, base, stride, chunk_bytes, rank, world)
 ```
 
-## Measured — 8x MI355X (gfx950), ROCm 7.2.4, 256 KiB per peer
-
-```
-world=8  handle=posix_fd  chunk=256 KiB
-peer(r) == base + r*stride: True
-correctness: OK (8x8 chunks)
-push all-to-all: 17.0 us/iter, 795.1 GB/s aggregate
-```
-
-| ranks | aggregate |
-|---|---|
-| 2 | 20.1 GB/s |
-| 4 | 153.4 GB/s |
-| 8 | 795.1 GB/s |
+## Measured
 
 Aggregate counts only the `(world-1)` chunks that leave the device; the self chunk stays
-local. gfx9 has no fabric support, so the backend falls back to POSIX fd here — the kernel
-neither knows nor cares.
+local. Correctness and `peer(r) == base + r*stride` hold on every configuration below.
+
+4 MiB per peer:
+
+| ranks | MI355X / gfx950 | MI355X-class / gfx1250 | MI308X / gfx942 |
+|---|---|---|---|
+| 2 | 103.8 GB/s | 435.2 GB/s | 54.1 GB/s |
+| 4 | 517.8 GB/s | 1499.1 GB/s | 112.2 GB/s |
+| 8 | 1858.5 GB/s | — | 184.8 GB/s |
+
+256 KiB per peer, where launch and barrier cost still shows:
+
+| ranks | gfx950 | gfx1250 | gfx942 |
+|---|---|---|---|
+| 2 | 67.7 GB/s | 75.8 GB/s | 40.3 GB/s |
+| 4 | 428.0 GB/s | 289.8 GB/s | 139.4 GB/s |
+| 8 | 1459.0 GB/s | — | 250.0 GB/s |
+
+gfx1250 exports **fabric** handles; gfx950 and gfx942 have no fabric support at
+`hipMemCreate` and fall back to POSIX fd. The kernel neither knows nor cares — it sees the
+same flat window either way. The gfx1250 box has 4 GPUs, hence no 8-rank column.
+
+Grid shape dominates these numbers far more than the handle type does. An earlier version
+launched one block per destination rank, which left all but `world` CUs idle and could not
+keep enough writes in flight to cover interconnect latency; it measured 15.8 GB/s on
+gfx1250 and 745 GB/s on gfx950 at the same 4 MiB payload. Splitting each chunk across
+`blocks_per_peer` blocks is worth ~2.5x on gfx950 and ~95x on gfx1250.
+
+Allocating the window as uncached/fine-grained (as mori's cco windows are) was measured
+and rejected: on gfx1250 it costs about half the bandwidth (712 vs 1499 GB/s at 4 ranks),
+and it changes nothing on gfx950. The backend uses ordinary coarse-grained pinned memory.
 
 ## Notes
 

@@ -28,7 +28,7 @@
 //
 //     recv slot of rank p, chunk from rank r  ==  flat_base + p*stride + r*chunk_bytes
 //
-// so the kernel takes two pointers and three integers rather than an N-entry pointer
+// so the kernel takes two pointers and a few integers rather than an N-entry pointer
 // array, and the destination rank can be computed at run time.
 //
 // Push semantics: each rank writes its own chunk into every peer's receive window. That
@@ -39,28 +39,31 @@
 #include <hip/hip_runtime.h>
 #include <torch/extension.h>
 
+#include <algorithm>
+
 namespace {
 
 constexpr int kThreads = 256;
 
-// Vectorised copy of one chunk. uint4 is 16 B, the widest single global access.
-__device__ inline void CopyChunk(uint4* __restrict__ dst, const uint4* __restrict__ src,
-                                 size_t n_vec) {
-  for (size_t i = threadIdx.x; i < n_vec; i += blockDim.x) {
-    dst[i] = src[i];
-  }
-}
-
-// One block per destination rank; grid-stride if the world is larger than the grid.
+// Grid is 2-D over (peer, slice of chunk): blocks_per_peer blocks cooperate on each
+// destination. One block per peer would leave all but `world` CUs idle and, on a remote
+// write, cannot keep enough requests in flight to cover interconnect latency.
 __global__ void All2AllPush(const uint4* __restrict__ send, char* __restrict__ flat_base,
-                            size_t stride, size_t chunk_bytes, int rank, int world) {
+                            size_t stride, size_t chunk_bytes, int rank, int world,
+                            int blocks_per_peer) {
   const size_t n_vec = chunk_bytes / sizeof(uint4);
-  for (int peer = blockIdx.x; peer < world; peer += gridDim.x) {
-    // Our chunk destined for `peer` goes into peer's window, in the slot reserved for us.
-    auto* dst = reinterpret_cast<uint4*>(flat_base + static_cast<size_t>(peer) * stride +
-                                         static_cast<size_t>(rank) * chunk_bytes);
-    const uint4* src = send + static_cast<size_t>(peer) * n_vec;
-    CopyChunk(dst, src, n_vec);
+  const int peer = blockIdx.x / blocks_per_peer;
+  const int sub = blockIdx.x % blocks_per_peer;
+  if (peer >= world) return;
+
+  // Our chunk destined for `peer` goes into peer's window, in the slot reserved for us.
+  auto* dst = reinterpret_cast<uint4*>(flat_base + static_cast<size_t>(peer) * stride +
+                                       static_cast<size_t>(rank) * chunk_bytes);
+  const uint4* src = send + static_cast<size_t>(peer) * n_vec;
+
+  const size_t span = static_cast<size_t>(blocks_per_peer) * blockDim.x;
+  for (size_t i = static_cast<size_t>(sub) * blockDim.x + threadIdx.x; i < n_vec; i += span) {
+    dst[i] = src[i];
   }
 }
 
@@ -76,12 +79,24 @@ void all2all_push(const at::Tensor& send, int64_t flat_base, int64_t stride, int
   TORCH_CHECK(send.nbytes() == static_cast<size_t>(world * chunk_bytes), "send holds ",
               send.nbytes(), " bytes, expected world*chunk_bytes = ", world * chunk_bytes);
 
-  const int blocks = static_cast<int>(world);
+  // Spread over the device: aim for a couple of blocks per CU, split evenly across peers,
+  // but never more slices than there is data for.
+  static const int cus = [] {
+    int v = 64, dev = 0;
+    hipGetDevice(&dev);
+    hipDeviceGetAttribute(&v, hipDeviceAttributeMultiprocessorCount, dev);
+    return v;
+  }();
+  const int64_t n_vec = chunk_bytes / static_cast<int64_t>(sizeof(uint4));
+  int blocks_per_peer = std::max<int64_t>(1, cus * 2 / std::max<int64_t>(1, world));
+  blocks_per_peer = std::min<int64_t>(blocks_per_peer, std::max<int64_t>(1, n_vec / kThreads));
+  const int blocks = static_cast<int>(world * blocks_per_peer);
+
   hipLaunchKernelGGL(All2AllPush, dim3(blocks), dim3(kThreads), 0, c10::hip::getCurrentHIPStream(),
                      reinterpret_cast<const uint4*>(send.data_ptr()),
                      reinterpret_cast<char*>(flat_base), static_cast<size_t>(stride),
                      static_cast<size_t>(chunk_bytes), static_cast<int>(rank),
-                     static_cast<int>(world));
+                     static_cast<int>(world), blocks_per_peer);
   hipError_t err = hipGetLastError();
   TORCH_CHECK(err == hipSuccess, "all2all_push launch failed: ", hipGetErrorString(err));
 }
