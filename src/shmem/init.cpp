@@ -45,6 +45,8 @@
 namespace mori {
 namespace shmem {
 
+static std::vector<std::unique_ptr<core::ProxyThread>> proxyThreads;
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                      ShmemStatesSingleton                                     */
 /* ---------------------------------------------------------------------------------------------- */
@@ -634,7 +636,7 @@ void GpuStateInit(ShmemStates* states) {
   }
 
   // Copy communication metadata to GPU — override RDMA → PROXY when proxy active
-  if (states->proxyGpuState.active) {
+  if (states->rdmaStates->commContext->IsProxyEnabled()) {
     int worldSize = states->bootStates->worldSize;
     std::vector<application::TransportType> types(
         states->rdmaStates->commContext->GetTransportTypes().begin(),
@@ -749,7 +751,7 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
   GpuStateInit(states);
 
   // Start per-NIC proxy threads if proxy mode is enabled
-  if (states->proxyGpuState.active && states->proxyGpuState.numRings > 0) {
+  if (states->rdmaStates->commContext->IsProxyEnabled() && states->proxyGpuState.numRings > 0) {
     auto* ctx = states->rdmaStates->commContext;
     const auto& hostEndpoints = ctx->GetRdmaEndpoints();
     int numNics = states->proxyGpuState.numNics;
@@ -786,10 +788,10 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
         auto thread = std::make_unique<core::ProxyThread>();
         thread->Init(static_cast<core::ProxyRing*>(states->proxyGpuState.rings[n]), std::move(nicQps), gpuId);
         thread->Start();
-        states->proxyThreads.push_back(std::move(thread));
+        proxyThreads.push_back(std::move(thread));
       }
     }
-    MORI_SHMEM_INFO("Proxy: {} threads started for {} NICs", states->proxyThreads.size(), numNics);
+    MORI_SHMEM_INFO("Proxy: {} threads started for {} NICs", proxyThreads.size(), numNics);
   }
 
   states->status = ShmemStatesStatus::Initialized;
@@ -807,10 +809,10 @@ bool ShmemIsInitialized() {
 
 static void FinalizeGpuStates(ShmemStates* states) {
   // Shutdown all per-NIC proxy threads before freeing rings
-  for (auto& t : states->proxyThreads) {
+  for (auto& t : proxyThreads) {
     if (t) t->Shutdown();
   }
-  states->proxyThreads.clear();
+  proxyThreads.clear();
   for (int n = 0; n < shmem::PROXY_STATE_MAX_NICS; n++) {
     if (states->proxyGpuState.rings[n]) {
       hipHostUnregister(states->proxyGpuState.rings[n]);

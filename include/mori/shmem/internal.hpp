@@ -43,7 +43,6 @@
 #endif
 
 namespace mori {
-namespace core { class ProxyThread; }
 namespace shmem {
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -133,13 +132,14 @@ struct GpuStates {
 
 static constexpr int PROXY_MAX_NICS = 8;
 
-struct ProxyGpuStates : GpuStates {
+struct ProxyGpuStates {
   bool active{false};
   void* rings[PROXY_MAX_NICS]{};
   uint32_t quietHead[PROXY_MAX_NICS]{};
   int numRings{0};
   int numNics{0};
   int localGpuIdx{0};
+  int numQpPerPe{4};
 };
 
 // Changed from __constant__ to __device__ to allow hipMemcpyToSymbol updates (like rocshmem)
@@ -191,7 +191,6 @@ struct ShmemStates {
   MemoryStates* memoryStates{nullptr};
   ModuleStates moduleStates;  // JIT module state for this GPU
   ProxyGpuStates gpuStates;
-  std::vector<std::unique_ptr<core::ProxyThread>> proxyThreads;  // per-NIC CPU proxy threads
 
   // Asserts that ShmemInit has been called and the slot is currently usable.
   // Used by APIs that touch GPU state (allocation, barrier, module init)
