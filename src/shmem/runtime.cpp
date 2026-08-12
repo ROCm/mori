@@ -92,7 +92,7 @@ int LoadShmemModule(const char* hsaco_path) {
 
 void CopyGpuStatesToDevice(ShmemStates* states) {
   const auto* gpuStates = &states->gpuStates;
-  const size_t copySize = gpuStates->active ? sizeof(ProxyGpuStates) : sizeof(GpuStates);
+  const size_t copySize = states->rdmaStates->commContext->IsProxyEnabled() ? sizeof(ProxyGpuStates) : sizeof(GpuStates);
   ModuleStates& ms = states->moduleStates;
 
   if (ms.gpuStatesPtr != nullptr) {
