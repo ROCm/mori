@@ -395,6 +395,63 @@ perftest_has_rocm() {
     grep -q -- '--use_rocm' <<<"$help"
 }
 
+# perftest_has_rocm_dmabuf <abs_bin> [host]
+#   True if the binary was also built with --enable-rocm-dmabuf. perftest only
+#   advertises --use_rocm_dmabuf in --help when that build option was on.
+perftest_has_rocm_dmabuf() {
+    local bin="$1" host="${2:-}" help=""
+    [[ -n "$bin" ]] || return 1
+    if [[ -z "$host" || "$host" == "localhost" || "$host" == "127.0.0.1" ]]; then
+        help=$("$bin" --help 2>&1 || true)
+    else
+        help=$("${SSH_PREFIX[@]}" ssh $SSH_OPTS "$SSH_USER@$host" \
+               "$bin --help 2>&1 || true" 2>/dev/null)
+    fi
+    grep -q -- '--use_rocm_dmabuf' <<<"$help"
+}
+
+# probe_gpu_mem_mode <dev> <hip_id>
+#   Works out how perftest can actually reach GPU memory, by trying it rather
+#   than inferring it, and sets MESH_GPU_MODE / MESH_GPU_DMABUF. Returns 1 if
+#   neither path works.
+#
+#   --use_rocm alone does hipMalloc + ordinary ibv_reg_mr, which needs a
+#   peer-memory client in the kernel; --use_rocm_dmabuf registers via
+#   ibv_reg_dmabuf_mr instead and needs none. Which one is available cannot be
+#   detected reliably: /sys/kernel/mm/memory_peers is a Mellanox-OFED artefact
+#   that the in-tree AMD peer-memory client never creates (amdgpu registers
+#   through ib_uverbs with no sysfs trace), and /proc/kallsyms is routinely
+#   restricted inside containers. One tiny loopback transfer settles it.
+#
+#   Sets globals rather than echoing: a $(...) capture would run this in a
+#   subshell and throw the result away.
+probe_gpu_mem_mode() {
+    local dev="$1" gpu="$2" gid port=$(( IB_PORT + 900 )) variant
+    MESH_GPU_MODE=""; MESH_GPU_DMABUF=""
+    gid=$(gid_index "$dev" "")
+    for variant in peer_mem dma-buf; do
+        local extra=""
+        if [[ "$variant" == "dma-buf" ]]; then
+            [[ -n "$MESH_GPU_DMABUF_OK" ]] || continue
+            extra=" --use_rocm_dmabuf"
+        fi
+        local args="-d $dev -p $port -x $gid -s 4096 -n 5 --use_rocm=$gpu$extra"
+        local sp rc=0
+        timeout "$MESH_SRV_TIMEOUT" $MESH_CLI_BIN $args &>/dev/null &
+        sp=$!
+        sleep "$MESH_SRV_WAIT_LOCAL"
+        timeout "$MESH_CLI_TIMEOUT" $MESH_CLI_BIN $args localhost &>/dev/null || rc=$?
+        kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
+        port=$(( port + 1 ))
+        if (( rc == 0 )); then
+            MESH_GPU_MODE="$variant"
+            [[ "$variant" == "dma-buf" ]] && MESH_GPU_DMABUF=1
+            return 0
+        fi
+    done
+    return 1
+}
+
 # build_gpu_map <assoc_name> [host]
 #   Fills the named assoc array: ib_dev -> HIP device id. One round trip per
 #   host (not per device pair), so calling it per mesh step is cheap.
@@ -434,10 +491,18 @@ install_perftest() {
     if ! git clone --depth 1 "$PERFTEST_REPO" "$src/perftest" >/dev/null 2>&1; then
         log_fail "git clone $PERFTEST_REPO failed"; rm -rf "$src"; return 1
     fi
+    # Try with dma-buf first: without it the check has no fallback when the
+    # kernel has no peer-memory client. Older kernels/ROCm lack the headers it
+    # needs, so drop back rather than failing the whole install.
     (
         cd "$src/perftest" || exit 1
-        ./autogen.sh &&
-        ./configure --enable-rocm --with-rocm="$rocm" --prefix="$prefix" &&
+        ./autogen.sh || exit 1
+        if ! ./configure --enable-rocm --enable-rocm-dmabuf \
+                         --with-rocm="$rocm" --prefix="$prefix"; then
+            echo "=== configure with --enable-rocm-dmabuf failed, retrying without ==="
+            make distclean >/dev/null 2>&1 || true
+            ./configure --enable-rocm --with-rocm="$rocm" --prefix="$prefix" || exit 1
+        fi
         make -j"$(nproc)" &&
         make install
     ) >"$src/build.log" 2>&1
@@ -462,6 +527,9 @@ MESH_CLI_BIN=""          # absolute path to the client-side binary (this host)
 MESH_SRV_BIN=""          # absolute path to the server-side binary (may be remote)
 MESH_USE_GPU=""          # per-run toggle: non-empty => append --use_rocm
 MESH_GPU_READY=""        # non-empty => GPU memory is *available* (capability + maps)
+MESH_GPU_DMABUF_OK=""    # non-empty => binary was built with --enable-rocm-dmabuf
+MESH_GPU_DMABUF=""       # non-empty => reach GPU memory via dma-buf, not peer_mem
+MESH_GPU_MODE=""         # "peer_mem" | "dma-buf", as proven by probe_gpu_mem_mode
 declare -A MESH_RGPU=()  # row/client  ib_dev -> HIP id
 declare -A MESH_CGPU=()  # col/server  ib_dev -> HIP id
 
@@ -537,6 +605,30 @@ mesh_prepare() {
         log_warn "no GPUs found on $peer -- skipping the GPU-memory pass"
         MESH_RGPU=(); return 0
     fi
+
+    # How to reach GPU memory: peer_mem if it works, dma-buf otherwise.
+    perftest_has_rocm_dmabuf "$MESH_CLI_BIN" && MESH_GPU_DMABUF_OK=1
+    if [[ -n "$peer" && -n "$MESH_GPU_DMABUF_OK" ]] && \
+       ! perftest_has_rocm_dmabuf "$MESH_SRV_BIN" "$peer"; then
+        MESH_GPU_DMABUF_OK=""   # both ends must agree on the registration path
+    fi
+    local pdev="" pgpu=""
+    for pdev in "${!MESH_RGPU[@]}"; do pgpu="${MESH_RGPU[$pdev]}"; break; done
+    mesh_gpu_on                 # probe under the GPU timeout budget (HIP init)
+    if ! probe_gpu_mem_mode "$pdev" "$pgpu"; then
+        mesh_gpu_off
+        if [[ -n "$MESH_GPU_DMABUF_OK" ]]; then
+            log_warn "GPU memory unreachable via peer_mem or dma-buf -- skipping the GPU-memory pass"
+        else
+            log_warn "GPU memory unreachable via peer_mem, and this perftest has no dma-buf support"
+            log_warn "  rebuild with --enable-rocm-dmabuf (or rerun with --install-perftest)"
+        fi
+        MESH_RGPU=(); MESH_CGPU=(); return 0
+    fi
+    mesh_gpu_off
+    if [[ "$MESH_GPU_MODE" == "dma-buf" ]]; then
+        log_warn "peer_mem unavailable -- using dma-buf (ibv_reg_dmabuf_mr) for GPU memory"
+    fi
     MESH_GPU_READY=1
     return 0
 }
@@ -560,7 +652,7 @@ rail_check() {
     local -a R=() C=(); local i
     for (( i=0; i<n; i++ )); do R+=("${_rr[$i]}"); C+=("${_cc[$i]}"); done
 
-    log_ok "$label: GPU-memory pass over $n rail-aligned pair(s), timeouts x$MESH_GPU_TIME_SCALE for HIP init"
+    log_ok "$label: GPU-memory pass over $n rail-aligned pair(s) via ${MESH_GPU_MODE:-unknown}, timeouts x$MESH_GPU_TIME_SCALE for HIP init"
     mesh_gpu_on
     local -A RCELL=()
     mesh_execute RCELL "$tool" "$peer" false "$( [[ "$tool" == ib_write_bw ]] && echo 1000 )" \
@@ -658,10 +750,13 @@ mesh_execute() {
                 # dead NICs don't waste attempts.
                 # GPU memory: each side binds the GPU paired with its own NIC, so
                 # the two ids normally differ. Empty when running on host memory.
-                local sgpu="" cgpu=""
+                local sgpu="" cgpu="" dmabuf=""
                 if [[ -n "$MESH_USE_GPU" ]]; then
-                    [[ -n "${MESH_CGPU[${_col[$j]}]:-}" ]] && sgpu=" --use_rocm=${MESH_CGPU[${_col[$j]}]}"
-                    [[ -n "${MESH_RGPU[${_row[$i]}]:-}" ]] && cgpu=" --use_rocm=${MESH_RGPU[${_row[$i]}]}"
+                    # --use_rocm_dmabuf modifies --use_rocm, it does not replace
+                    # it: the device id still comes from --use_rocm.
+                    [[ -n "$MESH_GPU_DMABUF" ]] && dmabuf=" --use_rocm_dmabuf"
+                    [[ -n "${MESH_CGPU[${_col[$j]}]:-}" ]] && sgpu=" --use_rocm=${MESH_CGPU[${_col[$j]}]}$dmabuf"
+                    [[ -n "${MESH_RGPU[${_row[$i]}]:-}" ]] && cgpu=" --use_rocm=${MESH_RGPU[${_row[$i]}]}$dmabuf"
                 fi
                 for (( try=0; try<=MESH_RETRIES; try++ )); do
                     tport=$(( port + try * nr * nc ))   # fresh port each try (old server may linger)

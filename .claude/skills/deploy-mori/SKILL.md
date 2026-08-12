@@ -515,6 +515,19 @@ the host-memory mesh keeps its original budget. If perftest lacks ROCm support
 or no GPUs are visible, the GPU pass is skipped with a single warning and the
 host mesh still runs. `--no-gpu-mem` forces host memory everywhere.
 
+**peer_mem vs dma-buf.** `--use_rocm` registers GPU memory with an ordinary
+`ibv_reg_mr`, which needs a peer-memory client in the kernel; `--use_rocm_dmabuf`
+registers via `ibv_reg_dmabuf_mr` and needs none. `mori check` picks between
+them by *trying* one tiny loopback transfer, then reports which it used
+(`... via peer_mem` / `... via dma-buf`), warning when it had to fall back.
+Static detection is not used on purpose: `/sys/kernel/mm/memory_peers` is a
+Mellanox-OFED artefact that the in-tree AMD client never creates (amdgpu
+registers through `ib_uverbs` leaving no sysfs trace), and `/proc/kallsyms` is
+routinely restricted in containers — both would misreport a working peer_mem
+as absent. The dma-buf fallback needs perftest built with
+`--enable-rocm-dmabuf`, which `--install-perftest` attempts and silently drops
+on kernels/ROCm too old for it.
+
 ```bash
 # build a ROCm-capable perftest into $MORI_PERFTEST_PREFIX (default
 # ~/.local/mori-perftest); opt-in, never triggered implicitly
