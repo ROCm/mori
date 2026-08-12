@@ -4,7 +4,6 @@
 
 #include "mori/core/transport/rdma/proxy/proxy_device_primitives.hpp"
 #include "mori/shmem/internal.hpp"
-#include "mori/shmem/shmem_proxy_state.hpp"
 
 #if defined(__HIPCC__) && defined(MORI_PROXY_ENABLED)
 
