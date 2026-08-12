@@ -601,6 +601,7 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
   endpoint.ibvHandle.qp = qp->qp;
   endpoint.ibvHandle.cq = cq->cq;
 
+  // cqPool.insert({cq->cqn, cq});
   qpPool.insert({qp->qpn, qp});
 
   MORI_APP_TRACE(
