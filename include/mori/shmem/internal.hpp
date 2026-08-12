@@ -129,7 +129,17 @@ struct GpuStates {
   uintptr_t heapEndAddr{0};                   // End address of symmetric heap (base + size)
   application::SymmMemObj* heapObj{nullptr};  // Pointer to the heap's SymmMemObj on device
   uint64_t* internalSyncPtr{nullptr};         // Pointer to the internal synchronization object
+};
 
+static constexpr int PROXY_MAX_NICS = 8;
+
+struct ProxyGpuStates : GpuStates {
+  bool active{false};
+  void* rings[PROXY_MAX_NICS]{};
+  uint32_t quietHead[PROXY_MAX_NICS]{};
+  int numRings{0};
+  int numNics{0};
+  int localGpuIdx{0};
 };
 
 // Changed from __constant__ to __device__ to allow hipMemcpyToSymbol updates (like rocshmem)
