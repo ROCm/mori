@@ -6,7 +6,7 @@
 #include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem_proxy_state.hpp"
 
-#ifdef __HIPCC__
+#if defined(__HIPCC__) && defined(MORI_PROXY_ENABLED)
 
 namespace mori {
 namespace shmem {
@@ -408,4 +408,4 @@ inline __device__ void ShmemGetMemNbiBlockKernel<application::TransportType::PRO
 }  // namespace shmem
 }  // namespace mori
 
-#endif  // __HIPCC__
+#endif  // __HIPCC__ && MORI_PROXY_ENABLED

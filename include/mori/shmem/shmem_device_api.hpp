@@ -35,6 +35,25 @@
 namespace mori {
 namespace shmem {
 
+#ifdef MORI_PROXY_ENABLED
+#define _PROXY_ELSE(func, ...)                                                    \
+  else if (transportType == application::TransportType::PROXY) {                  \
+    func<application::TransportType::PROXY>(__VA_ARGS__);                         \
+  }
+#define _PROXY_ELSE_BOOL(func, bp, ...)                                           \
+  else if (transportType == application::TransportType::PROXY) {                  \
+    func<application::TransportType::PROXY, bp>(__VA_ARGS__);                     \
+  }
+#define _PROXY_ELSE_RET(func, type, ...)                                          \
+  else if (transportType == application::TransportType::PROXY) {                  \
+    return func<application::TransportType::PROXY, type>(__VA_ARGS__);            \
+  }
+#else
+#define _PROXY_ELSE(func, ...)
+#define _PROXY_ELSE_BOOL(func, bp, ...)
+#define _PROXY_ELSE_RET(func, type, ...)
+#endif
+
 #define DISPATCH_TRANSPORT_TYPE(func, pe, ...)                                    \
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();                           \
   application::TransportType transportType = globalGpuStates->transportTypes[pe]; \
@@ -44,11 +63,8 @@ namespace shmem {
     func<application::TransportType::P2P>(__VA_ARGS__);                           \
   } else if (transportType == application::TransportType::SDMA) {                 \
     func<application::TransportType::SDMA>(__VA_ARGS__);                          \
-  } else if (transportType == application::TransportType::PROXY) {                \
-    func<application::TransportType::PROXY>(__VA_ARGS__);                         \
-  } else {                                                                        \
-    assert(false);                                                                \
-  }
+  }                                                                               \
+  _PROXY_ELSE(func, __VA_ARGS__)
 
 #define DISPATCH_TRANSPORT_TYPE_WITH_BOOL(func, boolParam, pe, ...)               \
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();                           \
@@ -57,11 +73,8 @@ namespace shmem {
     func<application::TransportType::RDMA, boolParam>(__VA_ARGS__);               \
   } else if (transportType == application::TransportType::P2P) {                  \
     func<application::TransportType::P2P, boolParam>(__VA_ARGS__);                \
-  } else if (transportType == application::TransportType::PROXY) {                \
-    func<application::TransportType::PROXY, boolParam>(__VA_ARGS__);              \
-  } else {                                                                        \
-    assert(false);                                                                \
-  }
+  }                                                                               \
+  _PROXY_ELSE_BOOL(func, boolParam, __VA_ARGS__)
 
 #define DISPATCH_TRANSPORT_DATA_TYPE_WITH_RETURN(func, pe, type, ...)               \
   [&]() {                                                                           \
@@ -71,9 +84,9 @@ namespace shmem {
       return func<application::TransportType::RDMA, type>(__VA_ARGS__);             \
     } else if (transportType == application::TransportType::P2P) {                  \
       return func<application::TransportType::P2P, type>(__VA_ARGS__);              \
-    } else if (transportType == application::TransportType::PROXY) {                \
-      return func<application::TransportType::PROXY, type>(__VA_ARGS__);            \
-    } else {                                                                        \
+    }                                                                               \
+    _PROXY_ELSE_RET(func, type, __VA_ARGS__)                                        \
+    else {                                                                          \
       assert(false);                                                                \
       return type{};                                                                \
     }                                                                               \
@@ -83,6 +96,7 @@ namespace shmem {
 /*                                         Synchronization                                        */
 /* ---------------------------------------------------------------------------------------------- */
 inline __device__ void ShmemQuietThread() {
+#ifdef MORI_PROXY_ENABLED
   GpuStates* gs = GetGlobalGpuStatesPtr();
   for (int pe = 0; pe < gs->worldSize; pe++) {
     if (pe != gs->rank && gs->transportTypes[pe] == application::TransportType::PROXY) {
@@ -90,6 +104,7 @@ inline __device__ void ShmemQuietThread() {
       return;
     }
   }
+#endif
   ShmemQuietThreadKernel<application::TransportType::RDMA>();
 }
 
