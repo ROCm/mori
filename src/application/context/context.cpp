@@ -53,6 +53,7 @@ Context::Context(BootstrapNetwork& bootNet) : bootNet(bootNet) {
   // uncached SDMA buffers, leading to cache/IPC inconsistency hangs.
   sdmaEnabled = env::IsEnvVarEnabled("MORI_ENABLE_SDMA");
   p2pDisabled = env::IsEnvVarEnabled("MORI_DISABLE_P2P");
+  proxyEnabled = env::IsEnvVarEnabled("MORI_EP_OVER_RDMA");
   CollectHostNames();
   // Lightweight: topology, NIC selection, transport type decision, SDMA queues.
   // No QP creation, no AllToAll. Modules that need the initial RDMA endpoint
@@ -246,7 +247,7 @@ void Context::InitializeTopologyAndTransports() {
   }
 
   // Build per-rail device contexts for proxy mode (rail-isolated fabrics).
-  bool useProxy = (std::getenv("MORI_EP_OVER_RDMA") && std::string(std::getenv("MORI_EP_OVER_RDMA")) == "1");
+  bool useProxy = proxyEnabled;
   if (useProxy) {
     allRdmaDeviceContexts.clear();
     for (const auto& dp : activeDevicePortList) {
@@ -398,7 +399,7 @@ void Context::EnsureSdmaTransport(int requestedChannels) {
 /* ------------------------------------------------------------------------ */
 
 void Context::BuildAndConnectInitialEndpoints() {
-  bool useProxy = (std::getenv("MORI_EP_OVER_RDMA") && std::string(std::getenv("MORI_EP_OVER_RDMA")) == "1");
+  bool useProxy = proxyEnabled;
 
   const int numRailContexts = useProxy ? static_cast<int>(allRdmaDeviceContexts.size()) : 0;
   const int myLocalGpu = LocalRankInNode();

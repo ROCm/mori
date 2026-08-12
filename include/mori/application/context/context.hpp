@@ -115,6 +115,7 @@ class Context {
   // in a test function after the workers had already been spawned.
   bool IsSdmaEnabled() const { return sdmaEnabled; }
   bool IsP2PDisabled() const { return p2pDisabled; }
+  bool IsProxyEnabled() const { return proxyEnabled; }
 
   // Returns the initial RDMA endpoint set. Empty until BuildInitialEndpoints()
   // has been called. SHMEM consumes this set; CCO does not (it creates its own
@@ -191,6 +192,7 @@ class Context {
   // Snapshotted at construction; see IsSdmaEnabled() / IsP2PDisabled() above.
   bool sdmaEnabled{false};
   bool p2pDisabled{false};
+  bool proxyEnabled{false};
   std::string myHostname;
   std::vector<PeerInfo> peerInfos;
   std::vector<PeerCapabilities> peerCaps;     // raw capability discovery
@@ -198,8 +200,8 @@ class Context {
 
   std::unique_ptr<RdmaContext> rdmaContext{nullptr};
   std::unique_ptr<RdmaDeviceContext> rdmaDeviceContext{nullptr};
-  // One context per available RDMA device (rail). Index = QP slot index.
-  // For non-rail-isolated fabrics this has exactly one entry (same as rdmaDeviceContext).
+  // One context per available RDMA device/port, indexed by NIC index (0..numNics-1).
+  // QP-to-NIC mapping is via the agreed-rail formula, not a direct index.
   std::vector<std::unique_ptr<RdmaDeviceContext>> allRdmaDeviceContexts;
 
   std::vector<RdmaEndpoint> rdmaEps;
