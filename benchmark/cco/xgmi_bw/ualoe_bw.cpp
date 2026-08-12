@@ -292,9 +292,22 @@ static const uint32_t RTD0=RTD0N, RTD1=RTD1N; static const int RPIPE=RPIPEN;
 // CU-staged copy. Inference, not yet tested: the staged loop is a load batch, a drain, a store batch and
 // a drain, and several waves interleave their loads and stores into one tensor queue, which the
 // CU-staged copy cannot do because its loads go down the vector path and never enter the queue.
+//
+// That measurement is a full grid on a fixed tile, and it also asks the wrong question. What sets the
+// wide-grid ceiling is MWSISS*MWSPIPE*tile, the bytes a block pushes per round, not how many waves issue
+// them. At 16 GB / 512 blocks: 32 KB per round reads 1642 (both at 1x4 and 2x2), 64 KB reads 1645 (both
+// at 4x2 and 8x1), 128 KB reads 1570 at 8x2 and 1568 at 4x2 on a 16 KB tile -- different issuer counts
+// and tiles, 0.1% apart -- and 256 KB recovers to 1632. The 4x2-on-16 KB row issues the same 8
+// descriptors as the 4x2-on-8 KB row that reads 1645, so descriptor rate is not it either.
+//
+// 64 KB per round is the optimum, and MWSISS=8 with MWSPIPE=1 is the way to reach it that also keeps the
+// narrow-grid gain: 17.98 GB/s at one block against the single issuer's 8.3, 1613 at 128 blocks, 1645.2
+// at 512, and the best 64 MB column measured (1412/1404/1371 at 128/256/512). LDS is 64 KB per block.
 #ifndef MWSPIPE
 #define MWSPIPE 2
 #endif
+// Left at 2 because every recorded TDMms column was taken with it; the fast build is -DMWSISS=8
+// -DMWSPIPE=1 -DMWSSPAN=8192.
 #ifndef MWSISS
 #define MWSISS 2
 #endif

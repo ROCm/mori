@@ -83,6 +83,11 @@ rounded down to a power of two. Six matrices over the same SIZE x BLOCK axes are
 [`results/tilegeom_gfx1250.csv`](results/tilegeom_gfx1250.csv), 540 cells: the single-issuer baseline
 plus five multi-issuer configurations, all in one batch with identical build flags, because the tables
 from earlier batches do not subtract against these -- one of them reads exactly 2x on the same cell.
+The same file carries the 512-block extension and the issuer-count sweep both described below.
+
+The tile comparison below holds MWSISS at 8 and MWSPIPE at 2, which is 128 KB per block per round. The
+next section shows that number is itself the main knob, and that halving it to 64 KB is worth another
+4.8% at a wide grid.
 
 Against that baseline, at 8 GB, dynamic sizing with 8 issuing waves is worth a flat **2.1x from 1 to 64
 blocks** (8.3 -> 17.9 at one block, 506 -> 1061 at 64), +56% at 128, and nothing at 256, where both are
@@ -113,6 +118,51 @@ fixed-8 KB one only by the switch, so that pair isolates the sizing itself.
 A 16 KB tile is not worth its LDS. It costs 9% at 64 MB and 5% at 256 MB -- the sizing formula lands
 exactly on 16 KB there -- and only pays above 4 GB, by 2.7%, for twice the LDS and one block per CU.
 
+### The ceiling is set by bytes per block per round, not by the issuer count
+
+Both configurations were also run out to 512 blocks and up to a 16 GB payload, which is the payload
+the block sweep uses -- that sweep is this row, measured on its own. The baseline column reproduces it
+to within 0.2% at every shared point (999 / 1582 / 1641 against 998.7 / 1580.2 / 1641.7 at 128 / 256 /
+512 blocks), which is also the evidence that the two harnesses are comparable despite the different
+iteration counts.
+
+At 512 blocks the eight-issuer configuration flattens at ~1570 while the baseline climbs past it to
+1642, which reads as a ceiling on multi-issue. It is not. Sweeping issuer count, pipe depth and tile at
+16 GB / 512 blocks, one block per CU, sorted by what a block pushes out per round -- MWSISS * MWSPIPE *
+tile, which is also its LDS:
+
+| per block per round | configuration | 16 GB @ 512 blocks |
+|---|---|---|
+| 32 KB | baseline, 1 wave x 4 x 8 KB | 1642 |
+| 32 KB | 2 waves x 2 x 8 KB | 1642 |
+| **64 KB** | 4 waves x 2 x 8 KB | **1645** |
+| **64 KB** | **8 waves x 1 x 8 KB** | **1645** |
+| 128 KB | 8 waves x 2 x 8 KB | 1570 |
+| 128 KB | 4 waves x 2 x 16 KB | 1568 |
+| 256 KB | 8 waves x 2 x 16 KB | 1632 |
+
+The two 128 KB rows have different issuer counts and different tiles and land 0.1% apart, and one of
+them issues the same 8 descriptors per round as the 1645 row above it. Neither issuer count nor
+descriptor count separates these; the round size does. 64 KB is the optimum, 128 KB costs 4.6%, and a
+16 KB tile only "rescues" eight issuers by pushing them from 128 KB over that dip to 256 KB -- 1632,
+still short of 64 KB's 1645, for twice the LDS and 8% at 64 MB.
+
+So issuer count and tile size are two factors of one number, and it is the number that matters.
+
+**Use 8 issuing waves with MWSPIPE=1 on an 8 KB tile.** It is at or within 0.1% of the best measured
+value at every point on the axis: 17.98 GB/s at one block against the baseline's 8.3, 1063 at 64
+blocks, 1613 at 128 where the baseline needs 512 to match, and 1645.2 at 512 -- the highest number in
+the file and the same 1645 the block sweep gets at a full grid. It also wins the mid sizes outright:
+64 MB reads 1412 / 1404 / 1371 at 128 / 256 / 512 blocks, 3% over 4 waves x 2 and 6-8% over 8 waves x 2.
+LDS is 64 KB per block, half of what the eight-issuer configuration used to ask for.
+
+Payload does not enter into the issuer choice -- at 1 MB every multi-issuer configuration reads ~190
+regardless -- because what matters there is the tile being divided evenly, not who issues it.
+
+Why 64 KB and not 128 is not established here. Whatever it is is not the descriptor rate, which the two
+128 KB rows rule out, and it is not occupancy, since these all run one block per CU well inside the
+320 KB budget.
+
 The floor stays at one row. Dropping it to 256 B, which makes the descriptor narrow its row rather
 than drop rows, lets 256 KB reach 64 blocks instead of 16 and changes the bandwidth by nothing
 (50.35 vs 50.37). Everything at or below ~256 KB is bounded by per-transfer fixed cost, not by tile
@@ -133,6 +183,22 @@ A single re-run cannot separate run-to-run drift from a systematic shift, so the
 in the matrix comparison (the axis-8 column reads ~1.5% low, the 64-256 MB cells at wide grids ~1-2%
 high) are not attributed to anything here.
 
+Routing both scripts through `tools/build_ualoe.sh` added `-D__HIP_PLATFORM_AMD__` and
+`-DHIP_ENABLE_WARP_SYNC_BUILTINS` to a build that had neither, so everything above was measured again on
+that path:
+
+- Block sweep, TDM column: mean -0.00%, nothing over 3%.
+- Matrix, TDM column: mean -0.09%. Five CU-column cells read 3.3-4.9% high, all on one axis; the TDM
+  column at the same cells does not move.
+- Recommended build (8 issuers, one tile deep, even split), at 16 GB against the pre-unification run:
+  17.985 / 138.305 / 1063.259 / 1612.436 / 1644.482 at 1 / 8 / 64 / 128 / 512 blocks, the largest gap
+  0.07%. The gain over the single issuer survives intact: 2.1x from 1 to 64 blocks, 1.61x at 128.
+
+The two added `-D`s do not reach the device code. Disassembling the code object out of each fatbin gives
+3697 identical lines; the 210 differing bytes sit in ELF notes at fatbin offsets 36089 and 67365, and
+`.text` is unchanged. So the five CU cells are node state, not the flags -- the same wide-grid cells were
+already running 1-2% high in the comparison above, before any of this.
+
 ## Running it
 
 ```bash
@@ -145,6 +211,18 @@ Both refuse to start if a previous run is still alive or if the LDS preflight fa
 `GRID`, `BASEX`, `GPUA`/`GPUB` or `GSRC`/`GDST`, `ARCH`; plus `ROUNDS`/`BLKS` for the block sweep and
 `CUS`/`SZS`/`CUMUL`/`TDMMUL`/`BUDGET`/`MAXB` for the matrix. `PREFLIGHT_ONLY=1` stops after the check.
 
+The tile and issuer results above come from `TDMKIND=9 DYNTILE=1` with `-DMWSISS=` in `GRID`, which
+points the TDM column at the multi-issue kernel and sizes its tile per cell. The recommended build:
+
+```bash
+GRID="-DBLKMUL=64 -DWTH=512 -DTWBLK=32 -DTWTH=256 -DRTD0N=256 -DRTD1N=8 -DRPIPEN=4 \
+      -DMWSPIPE=1 -DMWSISS=8 -DMWSSPAN=8192 -DLDSPART=16384" \
+TDMKIND=9 DYNTILE=1 CUMUL=1 TDMMUL=1 bash tools/uamatrix.sh
+```
+
+`MWSSPAN` is the per-issuing-wave span and is what shrinks to 8 KB here; `LDSPART` sizes a different
+kernel's partition and stays at 16384, or the preflight refuses the build.
+
 To build by hand:
 
 ```bash
@@ -152,6 +230,24 @@ hipcc -std=c++17 -O3 --offload-arch=gfx1250 ualoe_bw.cpp -o ualoe_bw
 ./ualoe_bw listen  -port=55637 -gpu=0 &     # omit -gpu to use every local GPU as a pair
 ./ualoe_bw connect 127.0.0.1 -port=55637 -gpu=1
 ```
+
+## How this gets compiled
+
+`ualoe_bw.cpp` is built two ways on purpose, and `tools/build_ualoe.sh` is the only place that holds
+the flags:
+
+- **Through CMake**, as target `ualoe_bw` (`BUILD_BENCHMARK=ON`, and `GPU_TARGETS` has to contain a
+  gfx125x or the target is skipped with a STATUS line -- the tensor-DMA builtins do not exist elsewhere).
+  It builds alongside the `cco_p2p_*` benchmarks. This is what keeps the TU from silently rotting.
+- **By the sweep scripts**, which call `tools/build_ualoe.sh` directly, because tile, pipe depth and
+  issuer count are compile time and a sweep recompiles between configurations. They also have to run on
+  a node with two idle GPUs, which is not where the package gets installed.
+
+The flag set is `-std=c++17 -O3 --offload-arch=<gfx125x> -D__HIP_PLATFORM_AMD__
+-DHIP_ENABLE_WARP_SYNC_BUILTINS`. `-O3` differs from the library's `-O2` deliberately: every table in
+`results/` was measured at `-O3` and the TDM issue loop is tight enough that the two do not agree. The
+two `-D`s came from the library build so that both paths speak one dialect; they change no instruction
+(see Reproduction). Keep `benchmark/CMakeLists.txt` and `build_ualoe.sh` in step -- both say so in a note.
 
 ## Before changing the geometry
 
@@ -177,3 +273,9 @@ exactly this reason: `LOOP`, build flags and clock state move the absolute numbe
 differences being tested. Two tables built with different `LOOP` values are not comparable even when
 they came from the same source file -- the block sweep uses `LOOP=10`, the matrix derives its
 iteration count from `BUDGET`, and neither is comparable to a `LOOP=50` table.
+
+The `config` column in `results/` carries the batch, which is why near-duplicate names exist. In
+`tilegeom_gfx1250.csv`, `_full` is the 110-cell sweep the tile and issuer sections are written from,
+`_pilot` is the earlier partial run at the same settings, and `_unified` is the re-measurement after the
+build moved to `tools/build_ualoe.sh`. They agree to 0.07% at 16 GB, but that is a result, not a licence
+to subtract rows across suffixes.

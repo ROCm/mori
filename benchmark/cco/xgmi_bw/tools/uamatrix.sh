@@ -25,7 +25,10 @@ ARCH="${ARCH:-gfx1250}"
 OUT="${OUT:-/tmp/uamatrix.txt}"
 BIN="${BIN:-/tmp/umx}"
 
-if pgrep -f 'ualoe|umx' >/dev/null 2>&1; then
+# Zombies count as alive to pgrep, and a container whose PID 1 is `sleep infinity` never reaps them, so
+# one leftover [umx] <defunct> is enough to make every later sweep refuse to start forever. Skip state Z,
+# and match the binary names only -- a plain 'ualoe' also matches tools/build_ualoe.sh.
+if ps -eo stat=,args= | grep -Eq '^[^Z].*(ualoe_b[w]|um[x])'; then
   echo "REFUSING: a previous ualoe/umx process is still alive"; exit 1
 fi
 # The matrix runs the same kernels as the block sweep, so it is gated on the same preflight. Its
@@ -34,8 +37,8 @@ GRID_ENV=$(printf '%s\n' $GRID | sed -n 's/^-D\([A-Z0-9_]*\)=\(.*\)$/\1=\2/p' | 
 env $GRID_ENV bash tools/lds_preflight.sh || { echo "REFUSING: LDS preflight failed"; exit 1; }
 [ -n "${PREFLIGHT_ONLY:-}" ] && { echo "PREFLIGHT_ONLY set, not running"; exit 0; }
 
-hipcc -std=c++17 -O3 --offload-arch="$ARCH" $BASEX -DMATRIX_MAXB="${MAXB}UL" $GRID \
-      ualoe_bw.cpp -o "$BIN" || { echo "COMPILE FAILED"; exit 1; }
+ARCH="$ARCH" BASEX="$BASEX" GRID="$GRID" EXTRAX="-DMATRIX_MAXB=${MAXB}UL" BIN="$BIN" \
+  bash tools/build_ualoe.sh || exit 1
 
 # ulimit -c 0: a crash here would otherwise drop a multi-GB core into /tmp, which has filled the
 # node's disk before and taken dockerd down with it.

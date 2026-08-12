@@ -28,7 +28,10 @@ OUT="${OUT:-/tmp}"
 # The sweep allocates 16 GB per side and drives one xGMI link flat out for ~10 minutes. Anything
 # already on these two GPUs will be perturbed by it and will perturb it back, so refuse to start
 # rather than produce a number nobody can interpret.
-if pgrep -f 'ualoe|ubk' >/dev/null 2>&1; then
+# Zombies count as alive to pgrep, and a container whose PID 1 is `sleep infinity` never reaps them, so
+# one leftover [ubk] <defunct> is enough to make every later sweep refuse to start forever. Skip state Z,
+# and match the binary names only -- a plain 'ualoe' also matches tools/build_ualoe.sh.
+if ps -eo stat=,args= | grep -Eq '^[^Z].*(ualoe_b[w]|ub[k])'; then
   echo "REFUSING: a previous ualoe/ubk process is still alive"; exit 1
 fi
 # The partition-stride half of this check is silent at launch; skipping it is how a node gets wedged.
@@ -38,8 +41,8 @@ GRID_ENV=$(printf '%s\n' $GRID | sed -n 's/^-D\([A-Z0-9_]*\)=\(.*\)$/\1=\2/p' | 
 env $GRID_ENV bash tools/lds_preflight.sh || { echo "REFUSING: LDS preflight failed"; exit 1; }
 [ -n "${PREFLIGHT_ONLY:-}" ] && { echo "PREFLIGHT_ONLY set, not running"; exit 0; }
 
-hipcc -std=c++17 -O3 --offload-arch="$ARCH" $BASEX $GRID -DAB_ROUNDS="$ROUNDS" \
-      ualoe_bw.cpp -o "$OUT/ubk" || { echo "COMPILE FAILED"; exit 1; }
+ARCH="$ARCH" BASEX="$BASEX" GRID="$GRID" EXTRAX="-DAB_ROUNDS=$ROUNDS" BIN="$OUT/ubk" \
+  bash tools/build_ualoe.sh || exit 1
 
 BLKSWEEP=$BLKS "$OUT/ubk" listen -port="$PORT" -gpu="$GPUA" > "$OUT/bk_listen.log" 2>&1 &
 LP=$!
