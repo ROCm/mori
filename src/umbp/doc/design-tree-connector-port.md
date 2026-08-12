@@ -4,17 +4,23 @@
 `origin/feat/umbp-tree-connector` onto the backend-agnostic branch, so a
 GPU-resident sglang HiCache connector can drive UMBP without a host bounce.
 
-**Provenance.** Upstream branch `feat/umbp-tree-connector` at `1ab7e751`, nine
-UMBP commits on top of the common base `ae9635f7`. Our side is
+**Provenance.** Upstream branch `feat/umbp-tree-connector`, originally at
+`1ab7e751` with nine UMBP commits on the common base `ae9635f7`. Our side is
 `integration/umbp-ssd-verify` at `ee4a5861`, ten UMBP commits on the same base
 (the Phase 0–6 backend-agnostic refactor, the HBM/SSD `MediumBackend`s, one
 medium per node, and the segment CRC work). This port lands on
 `feat/umbp-tree-connector-port`, branched from `ee4a5861`.
 
-**Method:** not a merge, and not nine cherry-picks. The two branches rewrote
-almost disjoint halves of `src/umbp`, so most upstream files can be taken
-verbatim; the small shared set is hand-merged, and the one file where the two
-designs actually collide is *reimplemented* rather than ported.
+Upstream has since been rebased onto a newer main and grown three more UMBP
+commits; it is now at `875d4ac3` with twelve. The rebase left the original nine
+byte-identical (`git range-diff 9d5e30f5..1ab7e751 f185c5f0..362cd22c` reports
+`=` for all nine), so the second round of porting is exactly those three
+commits and nothing else — see §8.
+
+**Method:** not a merge, and not a series of cherry-picks. The two branches
+rewrote almost disjoint halves of `src/umbp`, so most upstream files can be
+taken verbatim; the small shared set is hand-merged, and the files where the
+two designs actually collide are *reimplemented* rather than ported.
 
 **Scope:** `src/umbp/` (local tier stack, standalone server/client, distributed
 client, common helpers, proto), `src/pybind/`, `tests/`.
@@ -160,12 +166,18 @@ otherwise the region is registered as host memory and lands straight back in
 
 ## 5. Deliberate non-goals
 
-**Distributed ranged I/O stays a stub.** Upstream ships
+**Distributed ranged I/O stayed a stub — in round one only.** ~~Upstream ships
 `DistributedClient::BatchGetRanges` / `BatchPutRanges` as warn-once all-false,
-and this port keeps that. It is not a regression and not laziness: implementing
-it is design work (object-range → page-range mapping, and whether the master's
-metadata needs to describe sub-object extents), and doing it inside a port would
-make both unreviewable.
+and this port keeps that.~~ **Superseded by §10.3:** upstream implemented it in
+`875d4ac3` and this branch has now ported it. The reasoning below is kept
+because it was the design note the implementation was written against, and it
+held up — the prediction that "generalizing it is turning a constant into a
+parameter" is what the ported code actually does.
+
+The original note: implementing it is design work (object-range → page-range
+mapping, and whether the master's metadata needs to describe sub-object
+extents), and doing it inside the first round of the port would make both
+unreviewable.
 
 Worth recording for whoever picks it up: on our branch this is *much* closer
 than upstream's shape suggests. `MediumBackend` has no data-movement virtual at
@@ -174,15 +186,14 @@ moves as a `TransferItem`, which already carries `src_offset`, `dst_offset` and
 `size`. A `TransferItem` *is* a range. So no engine, backend or wire-format
 change is needed; what is needed is the mapping in `PoolClient`, and the
 whole-object path already computes it with the range pinned to `[0, size)`
-(`LogicalPageBytes` at `pool_client.cpp:597`, consumed by
-`BuildLocalPageTransfers`). Generalizing it is turning a constant into a
-parameter.
+(`LogicalPageBytes`, consumed by `BuildLocalPageTransfers`). Generalizing it is
+turning a constant into a parameter.
 
 Note also that the gating factor is the *backend*, not the client mode. The
 standalone server forwards ranged RPCs straight to its inner client, so
 standalone-process over a Local backend works while standalone-process over a
-Distributed backend inherits the stub. Implementing §5 lights up both
-distributed rows at once.
+Distributed backend inherited the stub. Implementing this lit up both
+distributed rows at once, as predicted.
 
 **Whole-object I/O is not collapsed into ranged I/O.** Upstream added ranged ops
 as a parallel path at every layer — `ReadBatchRangesIntoPtr` beside
@@ -214,10 +225,20 @@ their own schedule.
 | `feat(umbp): accept GPU user buffers in the distributed data plane` | §4.1, §4.2, §4.3 |
 | `test(umbp): cover multi-page runs and GPU user buffers through PoolClient` | upstream's two multi-page cases plus two GPU cases neither branch had |
 | `test(umbp): assert why the GPU remote-path put fails…` | strengthens the rejection case after measuring the fixture's real routing |
+| `doc(umbp): record what the port actually built, ran and found` | §7, §8 |
+| `doc(umbp): record the mode support matrix and the local SSD device-buffer hole` | §9 |
 
 §4.4 was folded into the interface commit rather than kept separate: the ranged
 pure virtuals and the `RegisterMemory` signature live in the same two files, so
 splitting them would have produced a commit that does not compile.
+
+**Round two** (§10), one commit per upstream commit, in upstream order:
+
+| Commit | Contents |
+|---|---|
+| `refactor(umbp): share host registration and gather helpers` | §10.1 — upstream `93f2998a` |
+| `fix(umbp): bound heartbeat event batches` | §10.2 — upstream `1d3c859e` |
+| `feat(umbp): support ranged I/O in the distributed data plane` | §10.3 — upstream `875d4ac3`, plus the `HbmCopyEngine` gather path it needs |
 
 ## 7. Verification — what was actually run
 
@@ -303,15 +324,143 @@ taken of the GPU path's throughput.
 
 ## 9. Mode support matrix
 
-Both features, as this branch leaves them.
+Both features, as this branch leaves them (updated after §10).
 
 | Client | Backend | GPU buffers | Ranged I/O |
 |---|---|---|---|
 | `StandaloneClient` | — | DRAM tier only (§8.5) | DRAM tier only |
 | `StandaloneProcessClient` | Local | DRAM tier only (§8.5) | DRAM tier only |
-| `StandaloneProcessClient` | Distributed | yes, all media | no — inherits the §5 stub |
-| `DistributedClient` | — | yes, all media | no — §5 stub |
+| `StandaloneProcessClient` | Distributed | yes, all media | yes, except SSD (§10.3) |
+| `DistributedClient` | — | yes, all media | yes, except SSD (§10.3) |
 
-Ranged I/O is DRAM-only even within Local mode: `TierBackend`'s default ranged
+Ranged I/O is DRAM-only within Local mode: `TierBackend`'s default ranged
 methods return all-false (`tier_backend.cpp:52`, `:69`) and only `DRAMTier`
 overrides them.
+
+In distributed mode the excluded medium is SSD, for a different reason: ranged
+access maps object ranges onto pages a backend publishes as *in-process*
+endpoints, and `SsdBackend` publishes storage refs. `SupportsRangedIO()` is
+keyed on the selected medium, so a client reports the truth rather than the
+caller discovering it as a failed batch.
+
+A client can now ask instead of assuming: `GetBackendMode()` reports what is
+behind a forwarding client, and `SupportsRangedIO()` reports the capability.
+Both are exposed to Python (`get_backend_mode`, `supports_ranged_io`).
+
+---
+
+## 10. Round two — upstream's three later commits
+
+Ported after upstream's rebase. In upstream order:
+
+### 10.1 `93f2998a` — share host registration and gather helpers
+
+Moves `HostTierRegistration` and `LaunchDeviceGather` from DRAM-tier-private
+headers into `src/umbp/include/umbp/common/`, leaving forwarding shims at the
+old paths. Our branch had never touched those four files, so this cherry-picked
+clean.
+
+One deliberate deviation: upstream's move rewrote both headers' comments down to
+a few lines. This branch keeps the original rationale — the measured
+per-fragment costs that justify a kernel over `hipMemcpy` / `hipMemcpy2DAsync`,
+the ~128 KiB crossover, and why registration is single-shot and all-or-nothing.
+Those numbers are why the code has the shape it has, and §10.3 depends on the
+crossover being written down.
+
+### 10.2 `1d3c859e` — bound heartbeat event batches
+
+A real bug fix, not a feature: a large offload burst shipped every unacked
+bundle in each heartbeat, so once a request exceeded the RPC deadline nothing
+was acked and the next heartbeat resent the backlog plus new events. Upstream
+saw 921 `DEADLINE_EXCEEDED` failures on an 8-rank run.
+
+`master_client.cpp` took upstream's change as-is; the only reconciliation is
+that the drain reads `DrainAllBackends(Backends())` rather than the deleted
+`DrainAllSources(owned_sources_)`.
+
+The **test** is the interesting half, and a good example of the §1 hazard.
+Upstream's fake implements `OwnedLocationSource` and attaches via
+`AddOwnedLocationSource` — both deleted by Phase 3. The cherry-pick auto-merges
+without a conflict marker and does not compile. It was rebuilt to drive a
+`MockBackend` (a full `MediumBackend` already in the tree) through a
+`BackendRegistry`, which exercises the same `DrainAllBackends` path production
+uses. The registry is attached *after* the commits that build the backlog, since
+`SetBackendRegistry` installs the auto-flush hook that would otherwise drain it
+before it accumulates.
+
+### 10.3 `875d4ac3` — ranged I/O in the distributed data plane
+
+The one that retires §5. §5's prediction held: the object-range → page-range
+mapping is one function, `BuildLocalRangeTransfers`, and no backend, engine or
+wire-format change was needed.
+
+What upstream's 780-line `pool_client.cpp` diff spends its length on, and why
+none of it is here: a `RangeCopyRun` planner with adjacency merging, a
+per-endpoint `hipMemcpyKind`, `ScopedHipDevice` at each call site, and a manual
+gather/`hipMemcpyAsync` fork. Every one of those is a thing the transfer layer
+already does — §2's three "already ours" items, applied to a second feature.
+
+Four differences worth reviewing against the source:
+
+1. **A locally-routed ranged put needs no assembly buffer.** Upstream assembles
+   scattered ranges into the scratch arena and writes the object; here the
+   ranges are written straight into the slot's pages, because a `TransferItem`
+   carries offsets. The arena is needed only for the remote direction, where the
+   object must be contiguous on the wire.
+2. **A remote object is served from the arena, and the local install is a
+   caching side effect.** Upstream installs into the tier first and serves
+   through it, so an install failure loses a fetch it already paid for. The
+   install-failure metric is kept and now counts exactly what its name says: a
+   missed caching opportunity, not a failed read.
+3. **No DRAM/HBM tier filter on remote ranged reads.** Upstream needs one
+   because its remote path is a hand-written DRAM RDMA read. Ours fetches the
+   whole object through `ExecuteBatchGetPlan`, which reaches any medium the
+   owning peer publishes.
+4. **Per-key results instead of all-or-nothing.** Items are tagged with the
+   caller's key index, so the engine's failed tags map back per key.
+
+**Where the gather kernel went, and why.** Upstream calls `LaunchDeviceGather`
+from `pool_client.cpp`. Here it lives in `HbmCopyEngine`, for the §4.2 reason:
+the engine is the only layer that sees the segment shape a copy decomposes
+into, so it is the only one that can decide when a kernel beats `hipMemcpy`.
+
+The load-bearing detail is that bucketing is **per device across the whole
+batch, not per plan**. A plan is one `(src base, dst base)` pair, so a caller
+reading three ranges into three separate GPU allocations produces three
+single-segment plans — nothing to gather within any of them, and together
+exactly the scattered small-fragment batch the kernel wins on. Getting this
+wrong is not a correctness bug, which is why it is recorded: the first version
+bucketed per plan, produced correct bytes, and silently never launched a kernel.
+The same insight is why the local ranged put batches across keys — one kernel
+for the batch rather than one per key.
+
+Consequence beyond ranged I/O: `PoolClient` declares the live medium's host
+buffers and the scratch arena as gather regions, so *every* GPU transfer in the
+tree gets the fast path, not just ranged ones.
+
+**The test** is upstream's `test_pool_client_ranges.cpp` rebuilt against this
+architecture: the fixture drives `BackendRegistry` / `MediumBackend` instead of
+the deleted `PeerDramAllocator`, and the backend self-allocates its pool
+(Phase 2b) so the test passes a size rather than a buffer. All four cases pass,
+including the two that assert the gather kernel actually ran — which is what
+caught the per-plan bucketing mistake.
+
+---
+
+## 11. Verification — round two
+
+Same container and constraints as §7.
+
+- **Build:** whole tree clean, plus the `pybind_umbp.cpp` syntax check (still
+  not covered by any cmake target — see §7 for the exact invocation).
+- **ctest:** `-R umbp -E 'cross_node|e2e|medium_selection'`, 22 of 23 pass.
+  `umbp_pool_client_ranges` is new and passes all four cases; this host needs
+  `--privileged --device=/dev/infiniband` for it, unlike the suites §7 ran.
+- **One failure, pre-existing and unrelated:** `umbp_local_client` aborts on
+  `test_gpu_put_get`'s `batch_a == host_a` when `umbp_host_mem_allocator` has
+  run first in the same ctest invocation. It passes standalone, and it fails
+  identically at `b1176b61` — the commit *before* any round-two data-plane work
+  — so it is not a regression from this round. It is a cross-test interaction
+  through shared host state, and it is worth chasing separately: the two tests
+  are separate processes, so the coupling has to be the filesystem or hugepages
+  rather than anything in the library.
