@@ -29,16 +29,39 @@
 
 namespace mori {
 
+// First line of a sysfs/procfs file with trailing whitespace stripped, or empty
+// if the file is absent or unreadable.
+inline std::string ReadSysfsLine(const std::string& path) {
+  std::ifstream f(path);
+  std::string line;
+  if (f && std::getline(f, line)) {
+    while (!line.empty() && std::isspace(static_cast<unsigned char>(line.back()))) line.pop_back();
+    return line;
+  }
+  return {};
+}
+
 // Identical for all processes on one physical node, distinct across nodes;
 // empty if unavailable.
 inline std::string ReadKernelBootId() {
-  std::ifstream f("/proc/sys/kernel/random/boot_id");
-  std::string id;
-  if (f && std::getline(f, id)) {
-    while (!id.empty() && std::isspace(static_cast<unsigned char>(id.back()))) id.pop_back();
-    return id;
-  }
-  return {};
+  return ReadSysfsLine("/proc/sys/kernel/random/boot_id");
+}
+
+// Firmware version of an RDMA device as reported by the kernel. Every vendor
+// (bnxt_re, mlx5, ionic) exposes it at the same path, so this needs no
+// per-provider special casing.
+inline std::string ReadNicFirmware(const std::string& ibDev) {
+  return ReadSysfsLine("/sys/class/infiniband/" + ibDev + "/fw_ver");
+}
+
+// MEC (MicroEngine Compute) firmware of the GPU at a PCI BDF such as
+// "0000:e8:00.0" -- the form hipDeviceGetPCIBusId returns, which already
+// matches the sysfs spelling. Keyed on BDF rather than a drm card index,
+// because XCP-partitioned GPUs do not map onto /sys/class/drm/card<N> in any
+// straightforward order. Returned as the raw hex sysfs value (e.g. 0x00000022),
+// which rocm-smi renders in decimal as "MEC firmware version: 34".
+inline std::string ReadGpuMecFirmware(const std::string& pciBdf) {
+  return ReadSysfsLine("/sys/bus/pci/devices/" + pciBdf + "/fw_version/mec_fw_version");
 }
 
 // Per-physical-node identity, by priority: MORI_NODE_ID override, boot_id, then
