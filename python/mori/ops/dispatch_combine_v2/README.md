@@ -42,7 +42,7 @@ Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 |---|---|
 | `test_dispatch_combine_v2_intranode.py` | pytest wrapper: runs `test_op.py` under torchrun for the representative modes and asserts every line PASS |
 | `test_op.py` | EP8 op-layer test (gather/scatter, quant, StdMoE, recv-cap, scales, LEC, reset, replay) |
-| `bench_dispatch_combine.py` | eager + CUDA-graph perf bench + e2e correctness. Envs: `DTYPE=bf16\|f32\|fp8\|fp4`, `COMBINE=gather\|scatter`, `QUANT=none\|fp8_direct_cast\|fp8_blockwise`, `STDMOE=1`, `SCALE_DIM`, `SWEEP`, `DISP_BLOCK`/`COMB_BLOCK`, `WARP_NUM`/`COMB_WARP`, `MODE`, `TUNED`, `PREFETCH_ROUTE_PAYLOAD`, `DEFER_DEST_CTR_ATOMIC`, `ROTATE_DISPATCH_SLOT_ORDER`, `ROTATE_COMBINE_PEER_ORDER`, `ROUTING_PATTERN` |
+| `bench_dispatch_combine.py` | eager + CUDA-graph perf bench + e2e correctness. Envs: `DTYPE=bf16\|f32\|fp8\|fp4`, `COMBINE=gather\|scatter`, `QUANT=none\|fp8_direct_cast\|fp8_blockwise`, `STDMOE=1`, `SCALE_DIM`, `SWEEP`, `DISP_BLOCK`/`COMB_BLOCK`, `WARP_NUM`/`COMB_WARP`, `MODE`, `TUNED`, `USE_TOK_OFF_TOTAL_RECV`, `UNCACHED_TOKEN_STORE`, `UNCACHED_METADATA_STORE`, `REPLAY_FAST_PATH`, `REPLAY_BENCH`, `PREFETCH_ROUTE_PAYLOAD`, `DEFER_DEST_CTR_ATOMIC`, `ROTATE_DISPATCH_SLOT_ORDER`, `ROTATE_COMBINE_PEER_ORDER`, `ROUTING_PATTERN` |
 | `run_bench.sh` | bench launcher (runs `bench_dispatch_combine.py` in the container) |
 
 (Each script inlines a tiny torchrun/gloo `Dist` bootstrap — gloo only carries the cco unique-id and pass/fail counts.)
@@ -69,7 +69,9 @@ gfx950 rerun retained this path after measuring 1.8%-6.1% lower dispatch latency
 across BF16/FP8/FP4, top-k 4/8/9, gather/scatter, and scale forwarding at
 128-2048 tokens; 8-token medians showed no repeatable regression. The
 dispatch-stall experiments below are selected with `PREFETCH_ROUTE_PAYLOAD=1` and
-`DEFER_DEST_CTR_ATOMIC=1`. Peer-order experiments use
+`DEFER_DEST_CTR_ATOMIC=1`. The 2026-08-11 atomic/cache experiments use
+`USE_TOK_OFF_TOTAL_RECV`, `UNCACHED_TOKEN_STORE`,
+`UNCACHED_METADATA_STORE`, `REPLAY_FAST_PATH`, and `REPLAY_BENCH`. Peer-order experiments use
 `ROTATE_DISPATCH_SLOT_ORDER=1`, `ROTATE_COMBINE_PEER_ORDER=1`, and
 `ROUTING_PATTERN=random|aligned|round_robin|hotspot`.
 
@@ -86,6 +88,87 @@ dispatch-stall experiments below are selected with `PREFETCH_ROUTE_PAYLOAD=1` an
   dispatch's posted writes saturate at ~64 blocks (half the CUs).
 - Self-written volatile/atomic spin-waits (`flydsl_prims.spin_until_*`) — mori-shmem's
   `wait_until_*` assert on a cco-only stack. Counters self-reset in-kernel → CUDAGraph-safe.
+
+## Dispatch atomic/cache A/B (MI355X / gfx950, 2026-08-11)
+
+Six independent ideas were tested against the same BF16/top-k=8 baseline. The
+fast gate used pinned geometry (128: 64x8, 512: 96x8, 2048: 160x8), random
+routing, 20 warmups, 300 graph iterations, and three forward/reverse-interleaved
+process runs. Rejected paths were removed after recording the result.
+
+### Independent results
+
+Latency is dispatch µs; percentages are relative to each row's baseline.
+
+| experiment | 128 tokens | 512 tokens | 2048 tokens | decision |
+|---|---:|---:|---:|---|
+| baseline | 45.01 | 122.32 | 417.93 | control |
+| `tok_off` as `total_recv` | 43.28 (-3.85%) | 120.88 (-1.18%) | 415.10 (-0.68%) | keep |
+| reuse one top-k index load | 45.21 (-0.20%) | 122.10 (-0.07%) | 417.70 (+0.09%) | remove |
+| uncached token stores | 43.07 (-4.98%) | 117.90 (-4.05%) | 428.81 (+2.67%) | token-gated |
+| uncached token + metadata stores | 41.67 (-8.08%) | 118.24 (-3.77%) | 427.62 (+2.39%) | token-gated |
+| replay fast decode | 43.69 (-2.01%) | 117.61 (+0.02%) | 408.81 (+0.35%) | replay-only |
+| LDS token staging | 44.57 (-1.29%) | 120.78 (-1.31%) | 413.41 (-1.28%) | remove (<2% gate) |
+
+The two-pass source-count/prefix allocator was also correct (including top-k=6
+and capped receive buffers), but its extra route pass and cross-rank handshake
+cost 148.91 vs 122.46 us at 512 tokens (+21.6%) and 528.55 vs 416.91 us at
+2048 (+26.8%). It was removed.
+
+`tok_off` already counts all destination slot allocations. After every source's
+ready flag is observed, normal dispatch can set
+`total_recv=min(tok_off,max_recv)` and remove both the per-publish
+`dest_pe_ctr` atomic and the Phase-3 count reduction. Replay still uses its
+cached layout. The replay fast path decodes PE/slot/sentinel directly from
+`tok_map`, avoiding redundant route/dedup loads.
+
+For LSA peer stores, FlyDSL cache modifier 3 lowers to `sc0 nt` on gfx950.
+Bypassing cache helps latency at small/mid payloads but loses large-message
+write combining. Boundary measurements with `tok_off` enabled were:
+
+| tokens | cached | uncached token | uncached token+metadata |
+|---:|---:|---:|---:|
+| 256 | 69.80 | 66.69 (-4.46%) | 66.17 (-5.20%) |
+| 1024 | 218.16 | 221.59 (+1.57%) | 220.82 (+1.22%) |
+
+The tuned policy therefore uses uncached token stores through 512 tokens,
+uncached metadata stores through 256, and cached stores above 512. These
+variants compile lazily and are selected from the actual runtime token count.
+FlyDSL >=0.3 currently ignores this cache hint, so it keeps the pre-cache-policy
+geometry and disables the cache thresholds while retaining the `tok_off` fix.
+
+### Winner interaction and re-tuning
+
+| tokens | old baseline | selected combination | change |
+|---:|---:|---:|---:|
+| 128 | 45.35 | 39.86 (`tok_off` + all uncached) | -12.11% |
+| 512 | 122.59 | 116.85 (`tok_off` + token uncached) | -4.69% |
+| 2048 | 417.11 | 417.24 (`tok_off`, cached) | +0.03% |
+
+After the dependency chain changed, the 109-128 BF16/top-k=8 bucket was
+re-tuned. `96x4` averaged 39.56 us, versus 39.79 for `80x4`, 40.22 for the old
+`64x8`, and 40.25 for `64x4`; the schedule now uses `96x4`. Top-k=6 and
+untuned shapes keep their old schedule/options.
+
+Correctness passed BF16 top-k=6/8, FP8, FP4, gather/scatter, hotspot routing,
+scale forwarding, replay, local expert count, and capped receive tests.
+
+### Final ATT
+
+Source-mapped traces use the same 96x4 geometry:
+
+- baseline: `profiles/ep-v2-att-final-baseline`
+- optimized: `profiles/ep-v2-att-final-optimized`
+
+The optimized ISA removes the non-returning `dest_pe_ctr`
+`global_atomic_add`, and peer payload stores change from plain
+`buffer_store_dwordx4` to `buffer_store_dwordx4 ... sc0 nt`. Normalized
+weight/index publish wait fell from 2127 to 539 cycles/hit (-74.7%), while the
+Phase-2 barrier fell from 3164 to 2531 (-20.0%). Token-copy and slot-allocation
+waits moved upward, confirming that the gain comes from removing the second
+atomic/queue dependency and changing store policy rather than making the
+remaining remote fetch-add faster. Both kernels remain at or below `v17` and
+emit no scratch loads/stores.
 
 ## Dispatch stall A/B (MI355X / gfx950, 2026-08-07)
 

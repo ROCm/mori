@@ -30,6 +30,7 @@ gfx950 — all from KFD sysfs, no torch/HIP dependency. block_num must stay
 """
 
 from mori.ops import utils as gpu_utils
+from .flydsl_compat import HAS_BUFFER_OPS
 
 
 # ── MI308X (gfx942, 80 CU) — EP8. Per-token SCHEDULE of
@@ -85,10 +86,33 @@ _MI300X_DEFAULT = None  # None => derive from CU count (see _cu_scaled_default)
 _MI300X_TABLE = {}
 
 # ── MI355X (gfx950, wave64) — EP8, vec4 combine gather. combine wants a small
-# block (32-48) + warp up to 16; dispatch grows block 96->160. wave64 => warp <= 16
-# (1024-thread block). Geometry is topk-independent.
-# bf16 dispatch + bf16 combine:
+# block (32-48) + warp up to 16; dispatch uses 64-160 blocks. wave64 => warp <= 16
+# (1024-thread block).
+# bf16 dispatch + bf16 combine, topk=8. Re-tuned 2026-08-11: after the dispatch
+# atomic/cache-policy optimizations, 96x4 wins the 109-128 bucket; <=108 and
+# topk=6 still prefer their pre-existing plan, so keep the topk=6/default
+# schedule separate.
 _MI355X_SCHED_BF16 = (
+    (108, 128, 8, 32, 8),
+    (128, 96, 4, 32, 8),
+    (256, 96, 8, 64, 8),
+    (1024, 96, 8, 32, 16),
+    (4096, 160, 8, 32, 16),
+    (None, 128, 16, 48, 16),
+)
+# FlyDSL >=0.3 ignores buffer cache modifiers. Keep the pre-cache-policy
+# geometry there; 96x4 was tuned together with SC0|NT stores.
+_MI355X_SCHED_BF16_NO_CACHE_HINT = (
+    (108, 128, 8, 32, 8),
+    (128, 64, 8, 32, 8),
+    (256, 96, 8, 64, 8),
+    (1024, 96, 8, 32, 16),
+    (4096, 160, 8, 32, 16),
+    (None, 128, 16, 48, 16),
+)
+# Preserve the pre-existing plan for topk=6 and untuned shapes. On the measured
+# topk=6 / 384-expert shape, 64x8 regresses 112-token dispatch by 3.5%.
+_MI355X_SCHED_BF16_BASE = (
     (128, 128, 8, 32, 8),
     (256, 96, 8, 64, 8),
     (1024, 96, 8, 32, 16),
@@ -147,17 +171,34 @@ _MI355X_DEFAULT = dict(
     combine_block_num=48,
     warp_num_per_block=16,
     combine_warp_num_per_block=16,
-    schedule=_MI355X_SCHED_BF16,
+    schedule=_MI355X_SCHED_BF16_BASE,
 )
 _MI355X_TABLE = {
     (8, 7168, 8): {
-        "bf16": _MI355X_SCHED_BF16,
+        "bf16": (
+            _MI355X_SCHED_BF16
+            if HAS_BUFFER_OPS
+            else _MI355X_SCHED_BF16_NO_CACHE_HINT
+        ),
         "fp8": _MI355X_SCHED_FP8,
         "fp4": _MI355X_SCHED_FP4,
         "fp4_disp_bf16_comb": _MI355X_SCHED_FP4_DISP_BF16_COMB,
+        # BF16 dispatch A/B, 2026-08-11: tok_off counting plus SC0|SC1 peer
+        # stores wins at <=512 tokens; metadata bypass remains useful through
+        # 256. Cached stores recover the large-message write-combining path.
+        "_options": {
+            "bf16": {
+                "use_tok_off_total_recv": True,
+                "replay_fast_path": True,
+                "uncached_token_store_max_tokens": 512 if HAS_BUFFER_OPS else 0,
+                "uncached_metadata_store_max_tokens": (
+                    256 if HAS_BUFFER_OPS else 0
+                ),
+            }
+        },
     },
     (8, 7168, 6): {
-        "bf16": _MI355X_SCHED_BF16,
+        "bf16": _MI355X_SCHED_BF16_BASE,
         "fp8": _MI355X_SCHED_FP8,
         "fp4": _MI355X_SCHED_FP4,
         "fp4_disp_bf16_comb": _MI355X_SCHED_FP4_DISP_BF16_COMB_T6,
@@ -265,7 +306,8 @@ def _cu_scaled_default():
 
 def lookup(world_size, hidden_dim, topk, dtype="fp8"):
     """Return {dispatch_block_num, combine_block_num, warp_num_per_block,
-    combine_warp_num_per_block, schedule} for the current GPU, shape, and dtype.
+    combine_warp_num_per_block, schedule, ...optional dispatch policy fields}
+    for the current GPU, shape, and dtype.
 
     `dtype` (the token / dispatch dtype: "bf16" | "fp8" | "fp4") selects the
     per-dtype schedule, because dtype sets the communication volume (fp4 = 0.5 B,
@@ -287,4 +329,6 @@ def lookup(world_size, hidden_dim, topk, dtype="fp8"):
     entry = dev_table.get((world_size, hidden_dim, topk))
     if entry:
         base["schedule"] = entry.get(dtype) or entry.get("fp8") or base["schedule"]
+        options = entry.get("_options", {}).get(dtype, {})
+        base.update(options)
     return base

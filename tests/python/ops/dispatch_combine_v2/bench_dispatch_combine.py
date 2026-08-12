@@ -109,6 +109,11 @@ QUANT = os.environ.get("QUANT", "none")  # none | fp8_direct_cast (scatter only)
 SCALE_DIM = int(os.environ.get("SCALE_DIM", 0))  # >0 = forward per-token scales
 PREFETCH_ROUTE_PAYLOAD = int(os.environ.get("PREFETCH_ROUTE_PAYLOAD", 0))
 DEFER_DEST_CTR_ATOMIC = int(os.environ.get("DEFER_DEST_CTR_ATOMIC", 0))
+USE_TOK_OFF_TOTAL_RECV = int(os.environ.get("USE_TOK_OFF_TOTAL_RECV", 0))
+UNCACHED_TOKEN_STORE = int(os.environ.get("UNCACHED_TOKEN_STORE", 0))
+UNCACHED_METADATA_STORE = int(os.environ.get("UNCACHED_METADATA_STORE", 0))
+REPLAY_FAST_PATH = int(os.environ.get("REPLAY_FAST_PATH", 0))
+REPLAY_BENCH = int(os.environ.get("REPLAY_BENCH", 0))
 ROTATE_DISPATCH_SLOT_ORDER = int(os.environ.get("ROTATE_DISPATCH_SLOT_ORDER", 0))
 ROTATE_COMBINE_PEER_ORDER = int(os.environ.get("ROTATE_COMBINE_PEER_ORDER", 0))
 ROUTING_PATTERN = os.environ.get("ROUTING_PATTERN", "random").lower()
@@ -257,6 +262,10 @@ def main():
             enable_std_moe=bool(STDMOE),
             prefetch_route_payload=bool(PREFETCH_ROUTE_PAYLOAD),
             defer_dest_ctr_atomic=bool(DEFER_DEST_CTR_ATOMIC),
+            use_tok_off_total_recv=bool(USE_TOK_OFF_TOTAL_RECV),
+            uncached_token_store=bool(UNCACHED_TOKEN_STORE),
+            uncached_metadata_store=bool(UNCACHED_METADATA_STORE),
+            replay_fast_path=bool(REPLAY_FAST_PATH),
             rotate_dispatch_slot_order=bool(ROTATE_DISPATCH_SLOT_ORDER),
             rotate_combine_peer_order=bool(ROTATE_COMBINE_PEER_ORDER),
         )
@@ -281,7 +290,7 @@ def main():
         tok_map = op.token_dest_map
         if AUTO:
             _dspec, _cspec = op._pick(min(SWEEP))
-            disp_kern = op._dispatch_variants[_dspec]
+            disp_kern = op._get_dispatch_variant(_dspec, min(SWEEP))
             comb_kern = op._combine_variants[_cspec]
             if rank == 0:
                 print(
@@ -289,7 +298,11 @@ def main():
                     f"disp_default=({cfg.dispatch_block_num},{cfg.warp_num_per_block}) "
                     f"comb_default=({cfg.combine_block_num},{cfg.combine_warp_num_per_block}) "
                     f"disp_variants={sorted(op._dispatch_variants)} "
-                    f"comb_variants={sorted(op._combine_variants)}",
+                    f"comb_variants={sorted(op._combine_variants)} "
+                    f"tok_off_total={cfg.use_tok_off_total_recv} "
+                    f"replay_fast={cfg.replay_fast_path} "
+                    f"uncached_token_max={cfg.uncached_token_store_max_tokens} "
+                    f"uncached_metadata_max={cfg.uncached_metadata_store_max_tokens}",
                     flush=True,
                 )
         else:
@@ -558,6 +571,10 @@ def main():
                 f"{_geom} "
                 f"prefetch_route_payload={bool(PREFETCH_ROUTE_PAYLOAD)} "
                 f"defer_dest_ctr_atomic={bool(DEFER_DEST_CTR_ATOMIC)} "
+                f"tok_off_total={bool(USE_TOK_OFF_TOTAL_RECV)} "
+                f"uncached_token={bool(UNCACHED_TOKEN_STORE)} "
+                f"uncached_metadata={bool(UNCACHED_METADATA_STORE)} "
+                f"replay_fast={bool(REPLAY_FAST_PATH)} "
                 f"rotate_dispatch={bool(ROTATE_DISPATCH_SLOT_ORDER)} "
                 f"rotate_combine={bool(ROTATE_COMBINE_PEER_ORDER)} "
                 f"routing={ROUTING_PATTERN} iters={ITERS}",
@@ -568,7 +585,7 @@ def main():
         for ct in SWEEP:
             if AUTO:  # pick this bucket's tuned variant (dispatch + combine)
                 _ds, _cs = op._pick(ct)
-                disp_kern = op._dispatch_variants[_ds]
+                disp_kern = op._get_dispatch_variant(_ds, ct)
                 comb_kern = op._combine_variants[_cs]
             # clean dispatch to set total_recv (combine reads it; not reset)
             total_recv.zero_()
@@ -585,9 +602,35 @@ def main():
             # combine first (needs total_recv == recv; combine doesn't reset it)
             cb_e = time_eager(run_comb, ct) if eager else 0.0
             cb_g = time_graph(run_comb, ct) if graph else 0.0
-            # dispatch next (accumulates total_recv, but combine already timed)
-            dp_e = time_eager(run_disp, ct) if eager else 0.0
-            dp_g = time_graph(run_disp, ct) if graph else 0.0
+            # Dispatch next (accumulates total_recv, but combine already timed).
+            # Replay timing first snapshots a normal route, then repeatedly
+            # launches the replay-specialized kernel with the cached map.
+            timed_disp = run_disp
+            if REPLAY_BENCH:
+                replay_scales = scales if SCALE_DIM else None
+                replay_result = op.dispatch(
+                    inp[:ct],
+                    wts[:ct],
+                    replay_scales,
+                    idx[:ct],
+                    return_routing=True,
+                )
+                replay_routing = replay_result[-1]
+                sync()
+                comm.barrier()
+
+                def run_replay(_ct):
+                    op.dispatch(
+                        inp[:ct],
+                        wts[:ct],
+                        replay_scales,
+                        idx[:ct],
+                        routing=replay_routing,
+                    )
+
+                timed_disp = run_replay
+            dp_e = time_eager(timed_disp, ct) if eager else 0.0
+            dp_g = time_graph(timed_disp, ct) if graph else 0.0
 
             if rank == 0:
                 # payload shown = disp/comb bytes (same unless asymmetric dtype)
@@ -596,16 +639,26 @@ def main():
                     if _ASYM
                     else f"payload {comb_payload/1e6:7.2f}MB"
                 )
-                _g = f"  [disp {_ds} comb {_cs}]" if AUTO else ""
+                if AUTO:
+                    _tu, _mu = op._dispatch_cache_policy(ct)
+                    _g = (
+                        f"  [disp {_ds} comb {_cs} "
+                        f"uncached(token={_tu},meta={_mu})]"
+                    )
+                else:
+                    _g = ""
+                disp_label = "replay" if REPLAY_BENCH else "disp"
                 parts = [f"tok/rank {ct:5d}  recv {recv:6d}  {pl}{_g}"]
                 if eager:
                     parts.append(
-                        f"| EAGER disp {dp_e:8.2f}us/{bw(disp_payload,dp_e):6.1f}GB/s "
+                        f"| EAGER {disp_label} {dp_e:8.2f}us/"
+                        f"{bw(disp_payload,dp_e):6.1f}GB/s "
                         f"comb {cb_e:8.2f}us/{bw(comb_payload,cb_e):6.1f}GB/s"
                     )
                 if graph:
                     parts.append(
-                        f"| GRAPH disp {dp_g:8.2f}us/{bw(disp_payload,dp_g):6.1f}GB/s "
+                        f"| GRAPH {disp_label} {dp_g:8.2f}us/"
+                        f"{bw(disp_payload,dp_g):6.1f}GB/s "
                         f"comb {cb_g:8.2f}us/{bw(comb_payload,cb_g):6.1f}GB/s"
                     )
                 print("  ".join(parts), flush=True)

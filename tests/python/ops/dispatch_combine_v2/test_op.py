@@ -103,6 +103,10 @@ COMBINE = os.environ.get("COMBINE", "gather")  # gather | scatter
 QUANT = os.environ.get("QUANT", "none")  # none | fp8_direct_cast | fp8_blockwise
 PREFETCH_ROUTE_PAYLOAD = int(os.environ.get("PREFETCH_ROUTE_PAYLOAD", 0))
 DEFER_DEST_CTR_ATOMIC = int(os.environ.get("DEFER_DEST_CTR_ATOMIC", 0))
+USE_TOK_OFF_TOTAL_RECV = int(os.environ.get("USE_TOK_OFF_TOTAL_RECV", 0))
+UNCACHED_TOKEN_STORE = int(os.environ.get("UNCACHED_TOKEN_STORE", 0))
+UNCACHED_METADATA_STORE = int(os.environ.get("UNCACHED_METADATA_STORE", 0))
+REPLAY_FAST_PATH = int(os.environ.get("REPLAY_FAST_PATH", 0))
 ROTATE_DISPATCH_SLOT_ORDER = int(os.environ.get("ROTATE_DISPATCH_SLOT_ORDER", 0))
 ROTATE_COMBINE_PEER_ORDER = int(os.environ.get("ROTATE_COMBINE_PEER_ORDER", 0))
 ROUTING_PATTERN = os.environ.get("ROUTING_PATTERN", "random").lower()
@@ -199,6 +203,10 @@ def main():
             max_total_recv_tokens=int(os.environ.get("MAXRECV", 0)),
             prefetch_route_payload=bool(PREFETCH_ROUTE_PAYLOAD),
             defer_dest_ctr_atomic=bool(DEFER_DEST_CTR_ATOMIC),
+            use_tok_off_total_recv=bool(USE_TOK_OFF_TOTAL_RECV),
+            uncached_token_store=bool(UNCACHED_TOKEN_STORE),
+            uncached_metadata_store=bool(UNCACHED_METADATA_STORE),
+            replay_fast_path=bool(REPLAY_FAST_PATH),
             rotate_dispatch_slot_order=bool(ROTATE_DISPATCH_SLOT_ORDER),
             rotate_combine_peer_order=bool(ROTATE_COMBINE_PEER_ORDER),
         )

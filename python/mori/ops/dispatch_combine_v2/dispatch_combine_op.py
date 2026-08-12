@@ -146,6 +146,20 @@ class EpDispatchCombineConfig:
     # route metadata/scales are published (but before the token copy).
     prefetch_route_payload: bool = False
     defer_dest_ctr_atomic: bool = False
+    # Normal-dispatch A/B: use the destination's slot-allocation counter as the
+    # final receive count, eliminating the redundant per-source counter atomics.
+    # Replay does not allocate slots and therefore keeps the legacy count path.
+    use_tok_off_total_recv: bool = False
+    # Remote LSA store cache-policy A/B switches (SC0|SC1 on FlyDSL 0.2.x).
+    uncached_token_store: bool = False
+    uncached_metadata_store: bool = False
+    # Optional tuned runtime thresholds. The op lazily compiles cache-policy
+    # variants and selects them by actual token count; 0 disables auto selection.
+    uncached_token_store_max_tokens: int = 0
+    uncached_metadata_store_max_tokens: int = 0
+    # Replay-only A/B: decode destination PE/slot from the cached token map and
+    # skip route loads plus duplicate detection.
+    replay_fast_path: bool = False
     # Peer-order A/B switches. Dispatch permutes each token's slot-to-warp
     # assignment; gather combine phase-shifts expert reads across warps.
     rotate_dispatch_slot_order: bool = False
@@ -248,6 +262,20 @@ class EpDispatchCombineConfig:
             self.warp_num_per_block = t["warp_num_per_block"]
             self.combine_warp_num_per_block = t["combine_warp_num_per_block"]
             self.schedule = t["schedule"]
+            self.use_tok_off_total_recv = self.use_tok_off_total_recv or bool(
+                t.get("use_tok_off_total_recv", False)
+            )
+            self.replay_fast_path = self.replay_fast_path or bool(
+                t.get("replay_fast_path", False)
+            )
+            self.uncached_token_store_max_tokens = max(
+                self.uncached_token_store_max_tokens,
+                int(t.get("uncached_token_store_max_tokens", 0)),
+            )
+            self.uncached_metadata_store_max_tokens = max(
+                self.uncached_metadata_store_max_tokens,
+                int(t.get("uncached_metadata_store_max_tokens", 0)),
+            )
         else:
             # explicit geometry: fill any unset field with the single-shot default
             if self.dispatch_block_num is None:
@@ -595,6 +623,10 @@ class EpDispatchCombineOp:
             prefetch_route_payload=cfg.prefetch_route_payload,
             defer_dest_ctr_atomic=cfg.defer_dest_ctr_atomic,
             rotate_dispatch_slot_order=cfg.rotate_dispatch_slot_order,
+            use_tok_off_total_recv=cfg.use_tok_off_total_recv,
+            uncached_token_store=cfg.uncached_token_store,
+            uncached_metadata_store=cfg.uncached_metadata_store,
+            replay_fast_path=cfg.replay_fast_path,
         )
         # (block, warp) -> compiled dispatch / combine kernel.
         self._dispatch_variants = {
@@ -603,7 +635,10 @@ class EpDispatchCombineOp:
             )
             for (b, w) in dispatch_specs
         }
-        self._dispatch_replay_variants = {}  # lazily compiled per (block, warp)
+        # Cache-policy variants are compiled lazily because only small-token
+        # buckets use uncached peer stores.
+        self._dispatch_policy_variants = {}
+        self._dispatch_replay_variants = {}
         if cfg.is_scatter:
             self._combine_variants = {
                 (b, w): make_combine_scatter(
@@ -850,6 +885,48 @@ class EpDispatchCombineOp:
             comb_spec = self._combine_specs[-1]
         return disp_spec, comb_spec
 
+    def _dispatch_cache_policy(self, num_tokens):
+        token_uncached = self.cfg.uncached_token_store or (
+            self.cfg.uncached_token_store_max_tokens > 0
+            and num_tokens <= self.cfg.uncached_token_store_max_tokens
+        )
+        metadata_uncached = self.cfg.uncached_metadata_store or (
+            self.cfg.uncached_metadata_store_max_tokens > 0
+            and num_tokens <= self.cfg.uncached_metadata_store_max_tokens
+        )
+        return bool(token_uncached), bool(metadata_uncached)
+
+    def _get_dispatch_variant(self, spec, num_tokens, *, replay=False):
+        """Select/compile the cache-policy specialization for this token bucket."""
+        token_uncached, metadata_uncached = self._dispatch_cache_policy(num_tokens)
+        if (
+            not replay
+            and token_uncached == self.cfg.uncached_token_store
+            and metadata_uncached == self.cfg.uncached_metadata_store
+        ):
+            return self._dispatch_variants[spec]
+
+        variants = (
+            self._dispatch_replay_variants
+            if replay
+            else self._dispatch_policy_variants
+        )
+        key = (spec, token_uncached, metadata_uncached)
+        kern = variants.get(key)
+        if kern is None:
+            kwargs = dict(self._dispatch_kwargs)
+            kwargs.update(
+                uncached_token_store=token_uncached,
+                uncached_metadata_store=metadata_uncached,
+            )
+            kern = variants[key] = make_dispatch(
+                replay=replay,
+                block_num=spec[0],
+                warp_num_per_block=spec[1],
+                **kwargs,
+            )
+        return kern
+
     def dispatch(
         self, input, weights, scales, indices, *, routing=None, return_routing=False
     ):
@@ -875,14 +952,9 @@ class EpDispatchCombineOp:
         stream = fx.Stream(torch.cuda.current_stream())
         weight_ptr = weights.data_ptr() if weights is not None else 0
         if routing is not None:
-            kern = self._dispatch_replay_variants.get(disp_spec)
-            if kern is None:
-                kern = self._dispatch_replay_variants[disp_spec] = make_dispatch(
-                    replay=True,
-                    block_num=disp_spec[0],
-                    warp_num_per_block=disp_spec[1],
-                    **self._dispatch_kwargs,
-                )
+            kern = self._get_dispatch_variant(
+                disp_spec, num_input_tokens, replay=True
+            )
             dest_map_ptr = routing.disp_dest_tok_id_map.data_ptr()
             kern(
                 self.arena.handle,
@@ -904,7 +976,7 @@ class EpDispatchCombineOp:
                 if return_routing
                 else self.token_dest_map
             )
-            self._dispatch_variants[disp_spec](
+            self._get_dispatch_variant(disp_spec, num_input_tokens)(
                 self.arena.handle,
                 input.data_ptr(),
                 indices.data_ptr(),
