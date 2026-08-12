@@ -196,8 +196,7 @@ struct ShmemStates {
   RdmaStates* rdmaStates{nullptr};
   MemoryStates* memoryStates{nullptr};
   ModuleStates moduleStates;  // JIT module state for this GPU
-  GpuStates gpuStates;        // host-side copy of device GpuStates for this GPU
-  ProxyGpuState proxyGpuState;
+  ProxyGpuStates gpuStates;
   std::vector<std::unique_ptr<core::ProxyThread>> proxyThreads;  // per-NIC CPU proxy threads
 
   // Asserts that ShmemInit has been called and the slot is currently usable.
