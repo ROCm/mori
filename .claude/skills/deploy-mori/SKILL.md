@@ -147,10 +147,11 @@ Non-obvious package roles:
   steps 5/6 needs a build with ROCm support (`--use_rocm`), which distro
   builds generally lack — build it yourself or use
   `mori check --install-perftest` (Step 7). `mori check` resolves the binary
-  from `$PATH`, then `$MORI_PERFTEST_PREFIX/bin` (default
-  `~/.local/mori-perftest`), and needs it on the **peer** as well for steps
-  5/6. On a cluster with shared `/home`, the default prefix covers both nodes
-  at once.
+  from `$MORI_PERFTEST_PREFIX/bin` (default `~/.local/mori-perftest`) **first**,
+  and only then `$PATH` — the prefix is only ever populated deliberately, so it
+  outranks a distro perftest sitting on `$PATH` without ROCm support. It is
+  needed on the **peer** as well for steps 5/6; on a cluster with shared
+  `/home`, the default prefix covers both nodes at once.
 - `iproute2` — provides `dcb`, needed by `mori setup` on bnxt.
 - `libgrpc++-dev` + protobuf packages — build defaults to `BUILD_UMBP=ON`,
   whose CMake step needs gRPC headers. (`cmake`/`ninja`/`pybind11` come from

@@ -92,7 +92,7 @@ Options:
   -h, --help              show this help
 
 Environment:
-  MORI_PERFTEST_PREFIX    where to find/install perftest (searched after \$PATH)
+  MORI_PERFTEST_PREFIX    where to find/install perftest (searched before \$PATH)
   ROCM_PATH               ROCm install used to build perftest (default /opt/rocm)
   SSH_USER                user for peer access (default \$SUDO_USER, else \$(whoami))
 EOF
@@ -369,7 +369,9 @@ for nd in /sys/class/infiniband/*; do
 done'
 
 # resolve_perftest <tool> [host]  -> absolute path, or empty if not found.
-#   Search order: $PATH, then $MORI_PERFTEST_PREFIX/bin. Resolved per host,
+#   Search order: $MORI_PERFTEST_PREFIX/bin, then $PATH -- the prefix is only
+#   ever populated deliberately, so it outranks a distro perftest on $PATH
+#   that was built without ROCm support. Resolved per host,
 #   since a peer may have it installed somewhere else.
 resolve_perftest() {
     local tool="$1" host="${2:-}"
@@ -377,7 +379,7 @@ resolve_perftest() {
         bash -c "$_PERFTEST_RESOLVE_SNIPPET" _ "$tool" "$MORI_PERFTEST_PREFIX" 2>/dev/null
     else
         "${SSH_PREFIX[@]}" ssh $SSH_OPTS "$SSH_USER@$host" \
-            "echo __BIN__; bash -c '$_PERFTEST_RESOLVE_SNIPPET' _ $tool $MORI_PERFTEST_PREFIX" 2>/dev/null \
+            "echo __BIN__; bash -c '$_PERFTEST_RESOLVE_SNIPPET' _ $tool '$MORI_PERFTEST_PREFIX'" 2>/dev/null \
             | sed -n '/^__BIN__$/,$p' | sed -n '2p'
     fi
 }
@@ -514,7 +516,8 @@ install_perftest() {
     ) >"$src/build.log" 2>&1
     local rc=$?
     if (( rc != 0 )); then
-        log_fail "perftest build failed; last lines of $src/build.log:"
+        log_fail "perftest build failed; build tree kept at $src for inspection"
+        log_fail "last lines of $src/build.log:"
         tail -15 "$src/build.log" >&2
         return 1
     fi
@@ -571,12 +574,13 @@ mesh_gpu_off() {
 mesh_prepare() {
     local tool="$1" peer="${2:-}" want_gpu="${3:-true}"
     MESH_CLI_BIN=""; MESH_SRV_BIN=""; MESH_GPU_READY=""
+    MESH_GPU_DMABUF_OK=""; MESH_GPU_DMABUF=""; MESH_GPU_MODE=""
     MESH_RGPU=(); MESH_CGPU=()
     mesh_gpu_off
 
     MESH_CLI_BIN=$(resolve_perftest "$tool")
     if [[ -z "$MESH_CLI_BIN" ]]; then
-        log_warn "$tool not found (searched \$PATH and $MORI_PERFTEST_PREFIX/bin), skipping"
+        log_warn "$tool not found (searched $MORI_PERFTEST_PREFIX/bin and \$PATH), skipping"
         perftest_hint; return 1
     fi
     if [[ -n "$peer" ]]; then
@@ -584,7 +588,7 @@ mesh_prepare() {
         # peer without perftest showed up as every pair being unreachable.
         MESH_SRV_BIN=$(resolve_perftest "$tool" "$peer")
         if [[ -z "$MESH_SRV_BIN" ]]; then
-            log_warn "$tool not found on $peer (searched \$PATH and $MORI_PERFTEST_PREFIX/bin), skipping"
+            log_warn "$tool not found on $peer (searched $MORI_PERFTEST_PREFIX/bin and \$PATH), skipping"
             perftest_hint; return 1
         fi
     else
@@ -619,8 +623,19 @@ mesh_prepare() {
        ! perftest_has_rocm_dmabuf "$MESH_SRV_BIN" "$peer"; then
         MESH_GPU_DMABUF_OK=""   # both ends must agree on the registration path
     fi
-    local pdev="" pgpu=""
-    for pdev in "${!MESH_RGPU[@]}"; do pgpu="${MESH_RGPU[$pdev]}"; break; done
+    # Probe with a NIC the mesh actually tests. MESH_RGPU covers every device
+    # under /sys/class/infiniband, which on a mixed host includes management
+    # NICs carrying no RDMA traffic; iterating ${!assoc[@]} picks one in bash
+    # hash order, so the loopback could fail on an untested NIC and skip the
+    # whole GPU pass on a host where every rail works.
+    local pdev="" pgpu="" _d
+    for _d in "${LOCAL_DEVS[@]}"; do
+        if [[ -n "${MESH_RGPU[$_d]:-}" ]]; then pdev="$_d"; pgpu="${MESH_RGPU[$_d]}"; break; fi
+    done
+    if [[ -z "$pdev" ]]; then
+        log_warn "none of the tested NICs has a paired GPU -- skipping the GPU-memory pass"
+        MESH_RGPU=(); MESH_CGPU=(); return 0
+    fi
     mesh_gpu_on                 # probe under the GPU timeout budget (HIP init)
     if ! probe_gpu_mem_mode "$pdev" "$pgpu"; then
         mesh_gpu_off
@@ -702,6 +717,11 @@ rail_check() {
     fi
     (( bad_gpu )) && log_fail \
         "$label GPU memory: $bad_gpu/$n rail(s) passed on host memory but failed on GPU -- GPUDirect RDMA problem"
+    # The mode was proven by a loopback on THIS host only, so a peer missing the
+    # same registration path looks identical from here. Say so rather than
+    # pinning it on the local GPUDirect stack.
+    (( bad_gpu > 0 )) && [[ -n "$peer" && "$MESH_GPU_MODE" == "peer_mem" ]] && \
+        log_warn "  $MESH_GPU_MODE was proven on this host only; a peer without it fails the same way"
     (( bad_both )) && log_warn \
         "$label GPU memory: $bad_both/$n rail(s) failed on host memory too -- no fabric path, not a GPUDirect fault"
     return 0
@@ -900,6 +920,9 @@ version_ge() {
 check_ainic_version_recommendation() {
     local ver="$1"
     [[ -n "$ver" ]] || { log_warn "cannot verify AINIC firmware version against requirement (empty)"; return; }
+    # Same reasoning as the Broadcom path: unparseable means undetectable.
+    [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || {
+        log_warn "cannot parse AINIC firmware version '$ver' against requirement"; return; }
     if [[ "$ver" =~ ^1\.117\.1([.-]|$) ]]; then
         log_fail "AINIC firmware $ver is on the 1.117.1 branch, which does NOT support IBGDA — upgrade to >= $AINIC_MIN_VER"
     elif version_ge "$ver" "$AINIC_MIN_VER"; then
@@ -919,6 +942,10 @@ check_ainic_version_recommendation() {
 check_bnxt_version_recommendation() {
     local ver="$1" major="${1%%.*}" min=""
     [[ -n "$ver" ]] || { log_warn "cannot verify Broadcom firmware version against requirement (empty)"; return; }
+    # An unparseable string (niccli reports "N/A" for RoCE firmware on some
+    # cards) is an undetectable version, not a bad one -- warn, do not fail.
+    [[ "$ver" =~ ^[0-9]+(\.[0-9]+)+$ ]] || {
+        log_warn "cannot parse Broadcom firmware version '$ver' against requirement"; return; }
     case "$major" in
         231) log_fail "Broadcom firmware $ver is on the 231.x branch, which is too old for IBGDA — upgrade to >= $BNXT_MIN_VER_235 or >= $BNXT_MIN_VER_237"; return ;;
         235) min="$BNXT_MIN_VER_235" ;;
