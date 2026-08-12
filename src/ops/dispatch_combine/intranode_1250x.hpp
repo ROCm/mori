@@ -761,6 +761,388 @@ __device__ void EpDispatchIntraNodeKernel_1250x_body(EpDispatchCombineArgs<T> ar
 }
 
 /* ---------------------------------------------------------------------------------------------- */
+/*       EpDispatchIntraNodeKernel_1250x_warpspec_body (meta/payload warp specialization)        */
+/* ---------------------------------------------------------------------------------------------- */
+// Warp-specialized variant of the dispatch body. Meta warps (0..kMetaWarps-1) run FINALIZE and
+// meta store concurrently with payload warps (kMetaWarps..warpNum-1) doing TDM token copies,
+// synchronized batch-by-batch through a named barrier. Falls back to the sequential body when
+// per-block token count is too small for the split to help.
+//
+// Launch geometry: same 64 blocks x 8 warps. 2 meta warps + 6 payload warps.
+
+#if (defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)) && (__clang_major__ >= 22)
+
+namespace warpspec {
+using named_barrier_t = __amdgpu_named_workgroup_barrier_t;
+__device__ __forceinline__ void named_barrier_init(named_barrier_t* bar, uint32_t wave_cnt) {
+  __builtin_amdgcn_s_barrier_init(bar, wave_cnt);
+}
+__device__ __forceinline__ void named_barrier_arrive_and_wait(named_barrier_t* bar) {
+  __builtin_amdgcn_s_barrier_join(bar);
+}
+// Reusable TDM descriptor — build once with make(), each load()/store() only
+// rewrites the 3 address dwords so the shape stays resident in SGPRs.
+template <typename T>
+struct TdmDesc {
+  using v4i = int __attribute__((ext_vector_type(4)));
+  using v8i = int __attribute__((ext_vector_type(8)));
+
+  uint32_t sg0[4];
+  uint32_t sg1[8];
+
+  __device__ __forceinline__ void make(int hidden_dim) {
+    sg0[0] = 1u;
+    sg0[1] = 0u;
+    sg0[2] = 0u;
+    sg0[3] = 0x80000000u;
+    const uint32_t ds = (sizeof(T) == 4) ? 2u : ((sizeof(T) == 2) ? 1u : 0u);
+    sg1[0] = ds << 16;
+    sg1[1] = static_cast<uint32_t>(hidden_dim) << 16;
+    sg1[2] = (static_cast<uint32_t>(hidden_dim) >> 16) | (1u << 16);
+    sg1[3] = static_cast<uint32_t>(hidden_dim & 0xFFFF) << 16;
+    sg1[4] = 1u;
+    sg1[5] = static_cast<uint32_t>(hidden_dim);
+    sg1[6] = 1u << 16;
+    sg1[7] = 0u;
+  }
+
+  __device__ __forceinline__ void set_addr(const void* lds, const void* global) {
+    sg0[1] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(lds));
+    const auto g = reinterpret_cast<uintptr_t>(global);
+    sg0[2] = static_cast<uint32_t>(g);
+    sg0[3] = (sg0[3] & 0xFE000000u) | static_cast<uint32_t>((g >> 32) & 0x01FFFFFFu);
+  }
+
+  __device__ __forceinline__ void load(const T* gsrc, T* lds_dst) {
+    set_addr(lds_dst, gsrc);
+    __builtin_amdgcn_tensor_load_to_lds(
+        __builtin_bit_cast(v4i, sg0), __builtin_bit_cast(v8i, sg1),
+        v4i{0, 0, 0, 0}, v4i{0, 0, 0, 0}, v8i{0, 0, 0, 0, 0, 0, 0, 0}, 0);
+  }
+
+  __device__ __forceinline__ void store(T* gdst, T* lds_src) {
+    set_addr(lds_src, gdst);
+    __builtin_amdgcn_tensor_store_from_lds(
+        __builtin_bit_cast(v4i, sg0), __builtin_bit_cast(v8i, sg1),
+        v4i{0, 0, 0, 0}, v4i{0, 0, 0, 0}, v8i{0, 0, 0, 0, 0, 0, 0, 0}, 0);
+  }
+};
+
+}  // namespace warpspec
+
+template <typename T, bool EnableStdMoE = false>
+__device__ void EpDispatchIntraNodeKernel_1250x_warpspec_body(EpDispatchCombineArgs<T> args) {
+  const auto& config = args.config;
+  const auto thread_id = static_cast<int>(threadIdx.x);
+  const auto lane_id = thread_id & (warpSize - 1);
+  const auto warp_id = thread_id / warpSize;
+  const auto num_warps = static_cast<int>(blockDim.x) / warpSize;
+  const auto global_warp_id = static_cast<int>(blockIdx.x) * num_warps + warp_id;
+  const auto rank = config.rank;
+  const auto num_ranks = config.worldSize;
+  const auto hidden = config.HiddenDimSz();
+  const auto num_topk = config.numExpertPerToken;
+
+  constexpr int kMetaWarps = 4;
+  const auto num_payload_warps = num_warps - kMetaWarps;
+  const auto is_meta = (warp_id < kMetaWarps);
+
+  // Contiguous block partition: block B owns tokens [block_start, block_end).
+  const auto num_sms = static_cast<int>(gridDim.x);
+  const auto block_tokens = (args.curRankNumToken + num_sms - 1) / num_sms;
+  const auto block_start = static_cast<int>(blockIdx.x) * block_tokens;
+  auto block_end = block_start + block_tokens;
+  if (block_end > args.curRankNumToken) block_end = args.curRankNumToken;
+  const auto block_count = (block_end > block_start) ? (block_end - block_start) : 0;
+
+
+  // Lane packing: pack multiple tokens per warp iteration when topk divides warpSize.
+  const auto tokens_per_iter = (num_topk > 0 && num_topk <= warpSize && (warpSize % num_topk) == 0)
+                                   ? (warpSize / num_topk) : 1;
+  const auto sub_lane = (tokens_per_iter > 1) ? (lane_id / num_topk) : 0;
+  const auto expert_lane = (tokens_per_iter > 1) ? (lane_id - sub_lane * num_topk) : lane_id;
+  const auto lane_active = (tokens_per_iter > 1) ? (sub_lane < tokens_per_iter) : (lane_id < num_topk);
+
+  extern __shared__ char smem_buffer[];
+  warpspec::TdmDesc<T> tdm;
+  tdm.make(static_cast<int>(hidden));
+
+  constexpr int kMaxNpes = MAX_GPUS_PER_NODE;
+  constexpr int kMaxRouteEntries = 4096;
+  __shared__ index_t batch_count[kMaxNpes];
+  __shared__ index_t batch_base[kMaxNpes];
+  __shared__ index_t batch_running[kMaxNpes];
+  __shared__ index_t total_count[kMaxNpes];
+  __shared__ int8_t route_cache[kMaxRouteEntries];
+  for (int p = thread_id; p < num_ranks; p += static_cast<int>(blockDim.x))
+    total_count[p] = 0;
+
+  __shared__ warpspec::named_barrier_t bar_all;
+  __shared__ warpspec::named_barrier_t bar_meta;
+  if (thread_id == 0) {
+    warpspec::named_barrier_init(&bar_all, num_warps);
+    warpspec::named_barrier_init(&bar_meta, kMetaWarps);
+  }
+  __builtin_amdgcn_s_barrier_signal(-1);
+  __builtin_amdgcn_s_barrier_wait(-1);
+
+  if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
+    constexpr int kBatchSize = 32;
+    const auto num_batches = (block_count + kBatchSize - 1) / kBatchSize;
+    const auto batch_size = (block_count + num_batches - 1) / num_batches;
+
+    const auto scale_bytes = config.scaleDim * config.scaleTypeSize;
+    const auto has_scales = (args.scalesBuf && config.scaleDim > 0 && config.scaleTypeSize > 0);
+    const auto num_scale_vec = scale_bytes >> 4;
+    const auto recv_capacity = static_cast<index_t>(config.MaxNumTokensToRecv());
+    auto group_size_req = (num_topk > num_scale_vec) ? num_topk : num_scale_vec;
+    if (group_size_req < 1) group_size_req = 1;
+    int group_size_p2 = 1;
+    while (group_size_p2 < group_size_req) group_size_p2 <<= 1;
+    const auto group_size = (group_size_p2 <= warpSize) ? group_size_p2 : warpSize;
+    const auto num_groups = warpSize / group_size;
+    const auto my_group = lane_id / group_size;
+    const auto my_elem = lane_id - my_group * group_size;
+
+    constexpr int kSlotsPerWarp = 4;
+    const auto payload_id = warp_id - kMetaWarps;
+    T* slots[kSlotsPerWarp];
+    if (!is_meta) {
+      auto base = reinterpret_cast<T*>(smem_buffer) +
+                  static_cast<size_t>(payload_id) * kSlotsPerWarp * hidden;
+      #pragma unroll
+      for (int s = 0; s < kSlotsPerWarp; ++s)
+        slots[s] = base + static_cast<size_t>(s) * hidden;
+    }
+
+    // Cross-batch pipeline: phase p has meta working on batch p while
+    // payload stores batch p-1.  Saves one meta-phase latency when num_batches > 1.
+    for (int phase = 0; phase <= num_batches; ++phase) {
+      const auto meta_b = phase;
+      const auto payload_b = phase - 1;
+
+      if (is_meta && meta_b < num_batches) {
+        const auto m_offset = meta_b * batch_size;
+        const auto m_count = (m_offset + batch_size <= block_count)
+                                 ? batch_size : (block_count - m_offset);
+
+        // Pass 1: COUNT + cache routing decisions to LDS
+        for (int p = warp_id; p < num_ranks; p += kMetaWarps)
+          batch_count[p] = 0;
+        warpspec::named_barrier_arrive_and_wait(&bar_meta);
+
+        for (int i = warp_id * tokens_per_iter; i < m_count; i += kMetaWarps * tokens_per_iter) {
+          const auto tok = block_start + m_offset + i + sub_lane;
+          const auto act = lane_active && (i + sub_lane < m_count);
+          auto my_expert = act ? args.tokenIndices[static_cast<size_t>(tok) * num_topk + expert_lane]
+                               : static_cast<index_t>(-1);
+          int my_dest_pe = -1;
+          if (my_expert >= 0) {
+            auto d = static_cast<int>(my_expert / config.numExpertPerRank);
+            if (d < config.worldSize) my_dest_pe = d;
+          }
+          auto mv = (my_dest_pe >= 0)
+                        ? ((static_cast<unsigned>(sub_lane) << 8) | static_cast<unsigned>(my_dest_pe))
+                        : 0xFFFFFFFFu;
+          auto grp = __match_any_sync(0xFFFFFFFFFFFFFFFFull, mv);
+          auto keep = (my_dest_pe >= 0 && lane_id == (__ffsll(static_cast<long long>(grp)) - 1)) ? 1 : 0;
+          if (act) {
+            route_cache[(i + sub_lane) * num_topk + expert_lane] =
+                keep ? static_cast<int8_t>(my_dest_pe) : -1;
+            if (keep)
+              atomicAdd(&batch_count[my_dest_pe], 1);
+            else
+              args.dispDestTokIdMap[static_cast<size_t>(tok) * num_topk + expert_lane] =
+                  FlatTokenIndex(config, config.worldSize, 0);
+          }
+        }
+        warpspec::named_barrier_arrive_and_wait(&bar_meta);
+
+        // RESERVE: one remote fetch_add per peer
+        for (int p = warp_id; p < num_ranks; p += kMetaWarps) {
+          batch_running[p] = 0;
+          if (batch_count[p] > 0) {
+            batch_base[p] = __hip_atomic_fetch_add(
+                args.dispTokOffsetMemObj->template GetAs<index_t*>(p), batch_count[p],
+                __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            atomicAdd(&total_count[p], batch_count[p]);
+          }
+        }
+        warpspec::named_barrier_arrive_and_wait(&bar_meta);
+
+        // Pass 2: FINALIZE using cached routing (no tokenIndices reload, no dedup)
+        for (int i = warp_id * tokens_per_iter; i < m_count; i += kMetaWarps * tokens_per_iter) {
+          const auto tok = block_start + m_offset + i + sub_lane;
+          const auto act = lane_active && (i + sub_lane < m_count);
+          auto cached_pe = act ? route_cache[(i + sub_lane) * num_topk + expert_lane]
+                               : static_cast<int8_t>(-1);
+          int my_dest_pe = cached_pe;
+          int keep = (cached_pe >= 0) ? 1 : 0;
+          index_t my_dest_tok_id = -1;
+          if (keep) {
+            auto j = atomicAdd(&batch_running[my_dest_pe], 1);
+            my_dest_tok_id = batch_base[my_dest_pe] + j;
+            args.dispDestTokIdMap[static_cast<size_t>(tok) * num_topk + expert_lane] =
+                FlatTokenIndex(config, my_dest_pe, my_dest_tok_id);
+            if (my_dest_tok_id < recv_capacity)
+              args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(my_dest_pe)[my_dest_tok_id] =
+                  FlatTokenIndex(config, rank, tok);
+          }
+          // Group-parallel direct write of indices/weights/scales to peer
+          auto keep_mask = __ballot(keep);
+          while (keep_mask) {
+            int src_lane = -1;
+            auto t = keep_mask;
+            for (int g = 0; g < num_groups; ++g) {
+              if (!t) break;
+              auto l = __ffsll(static_cast<long long>(t)) - 1;
+              t &= t - 1;
+              if (g == my_group) src_lane = l;
+            }
+            keep_mask = t;
+            const auto sl = (src_lane < 0) ? 0 : src_lane;
+            const auto dest_pe = __shfl(my_dest_pe, sl);
+            const auto dest_tok = __shfl(my_dest_tok_id, sl);
+            const auto g_tok = __shfl(tok, sl);
+            if (src_lane < 0) continue;
+            if (dest_tok >= recv_capacity) continue;
+            auto dst_idx =
+                args.shmemOutIndicesMemObj->template GetAs<index_t*>(dest_pe) +
+                static_cast<size_t>(dest_tok) * num_topk;
+            auto dst_wt = args.weightsBuf
+                              ? (args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(dest_pe) +
+                                 static_cast<size_t>(dest_tok) * num_topk)
+                              : nullptr;
+            auto dst_sc = has_scales
+                              ? (args.shmemOutScalesMemObj->template GetAs<uint8_t*>(dest_pe) +
+                                 static_cast<size_t>(dest_tok) * scale_bytes)
+                              : nullptr;
+            for (int e = my_elem; e < num_topk; e += group_size)
+              dst_idx[e] = args.tokenIndices[static_cast<size_t>(g_tok) * num_topk + e];
+            if (dst_wt) {
+              for (int e = my_elem; e < num_topk; e += group_size)
+                dst_wt[e] = args.weightsBuf[static_cast<size_t>(g_tok) * num_topk + e];
+            }
+            if (dst_sc) {
+              const auto src_sc = args.scalesBuf + static_cast<size_t>(g_tok) * scale_bytes;
+              for (int c = my_elem; c < num_scale_vec; c += group_size)
+                reinterpret_cast<uint4*>(dst_sc)[c] = reinterpret_cast<const uint4*>(src_sc)[c];
+            }
+          }
+        }
+      }
+
+      if (!is_meta) {
+        // TDM store for previous batch (skip phase 0)
+        if (payload_b >= 0) {
+          const auto p_offset = payload_b * batch_size;
+          const auto p_count = (p_offset + batch_size <= block_count)
+                                   ? batch_size : (block_count - p_offset);
+          const auto tokens_per_chunk = kSlotsPerWarp * num_payload_warps;
+          for (int chunk = 0; chunk < p_count; chunk += tokens_per_chunk) {
+            __builtin_amdgcn_s_wait_tensorcnt(0);
+
+            #pragma unroll
+            for (int s = 0; s < kSlotsPerWarp; ++s) {
+              const auto idx = chunk + payload_id + s * num_payload_warps;
+              if (idx >= p_count) break;
+              const auto tok = block_start + p_offset + idx;
+              auto flat_me = (lane_id < num_topk)
+                                 ? args.dispDestTokIdMap[static_cast<size_t>(tok) * num_topk + lane_id]
+                                 : FlatTokenIndex(config, config.worldSize, 0);
+              auto pe_me = PeFromFlatTokenIndex(config, flat_me);
+              auto valid_me = (lane_id < num_topk && pe_me < static_cast<index_t>(num_ranks)) ? 1 : 0;
+              for (int l = 0; l < num_topk; ++l) {
+                if (!__shfl(valid_me, l)) continue;
+                auto flat = __shfl(flat_me, l);
+                auto dest_pe = PeFromFlatTokenIndex(config, flat);
+                auto dest_tok_id = LocalTokIdFromFlatTokenIndex(config, flat);
+                auto peer_buf = args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(dest_pe);
+                tdm.store(peer_buf + static_cast<size_t>(dest_tok_id) * hidden,
+                          slots[s]);
+              }
+            }
+
+            // Drain stores before reusing slots (WAR: store reads LDS, load overwrites it)
+            __builtin_amdgcn_s_wait_tensorcnt(0);
+
+            // Load next chunk within this batch
+            const auto next_chunk = chunk + tokens_per_chunk;
+            #pragma unroll
+            for (int s = 0; s < kSlotsPerWarp; ++s) {
+              const auto idx = next_chunk + payload_id + s * num_payload_warps;
+              if (idx < p_count)
+                tdm.load(args.inpTokenBuf + static_cast<size_t>(block_start + p_offset + idx) * hidden,
+                         slots[s]);
+            }
+          }
+          __builtin_amdgcn_s_wait_tensorcnt(0);
+        }
+
+        // Pre-load first chunk of upcoming batch (skip last phase)
+        if (meta_b < num_batches) {
+          const auto m_offset = meta_b * batch_size;
+          const auto m_count = (m_offset + batch_size <= block_count)
+                                   ? batch_size : (block_count - m_offset);
+          #pragma unroll
+          for (int s = 0; s < kSlotsPerWarp; ++s) {
+            const auto idx = payload_id + s * num_payload_warps;
+            if (idx < m_count)
+              tdm.load(args.inpTokenBuf + static_cast<size_t>(block_start + m_offset + idx) * hidden,
+                       slots[s]);
+          }
+        }
+      }
+
+      if (meta_b < num_batches)
+        warpspec::named_barrier_arrive_and_wait(&bar_all);
+    }
+
+    if (is_meta) {
+      for (int p = warp_id; p < num_ranks; p += kMetaWarps) {
+        if (total_count[p] > 0)
+          atomicAdd(&args.destPeTokenCounter[p], total_count[p]);
+      }
+    }
+  }
+
+  __syncthreads();
+
+  if (thread_id == 0) atomicAdd(args.dispatchGridBarrier, 1);
+  auto recv_token_nums = args.recvTokenNumMemObj->template GetAs<index_t*>();
+  if (global_warp_id == 0) {
+    for (int dest_pe = lane_id; dest_pe < num_ranks; dest_pe += warpSize) {
+      shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, static_cast<unsigned>(num_sms));
+      __hip_atomic_store(args.dispatchGridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      auto num_token_signal = core::AtomicLoadRelaxed(args.destPeTokenCounter + dest_pe) + 1;
+      auto signal = args.recvTokenNumMemObj->template GetAs<index_t*>(dest_pe) + rank;
+      shmem::ShmemInt32WaitUntilEquals(signal, 0);
+      __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+      core::AtomicStoreRelaxedSystem(signal, num_token_signal);
+    }
+  }
+  if (global_warp_id == 0) {
+    for (int dest_pe = lane_id; dest_pe < num_ranks; dest_pe += warpSize) {
+      auto signal = recv_token_nums + dest_pe;
+      auto recv_token_num = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
+      __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM);
+      core::AtomicStoreRelaxedSystem(signal, 0);
+      atomicAdd(args.totalRecvTokenNum, recv_token_num);
+      args.destPeTokenCounter[dest_pe] = 0;
+    }
+    if (lane_id == 0)
+      args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
+  }
+#ifdef ENABLE_STANDARD_MOE_ADAPT
+  if constexpr (EnableStdMoE) {
+    InvokeConvertDispatchOutput<T>(args, rank);
+  }
+#endif
+}
+
+#endif  // gfx1250 && clang >= 22
+
+/* ---------------------------------------------------------------------------------------------- */
 /*                              EpCombineIntraNodeKernel_1250x_body                               */
 /* ---------------------------------------------------------------------------------------------- */
 // The combine body for this architecture. Note what it still contains: the peer vector-load gather.

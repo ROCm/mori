@@ -47,7 +47,11 @@ namespace moe {
 template <typename T, bool EnableStdMoE = false>
 __device__ __forceinline__ void EpDispatchIntraNodeKernel_entry(EpDispatchCombineArgs<T> args) {
 #if defined(__gfx1250__) || defined(__gfx1251__)
+  #if (__clang_major__ >= 22)
+  EpDispatchIntraNodeKernel_1250x_warpspec_body<T, EnableStdMoE>(args);
+  #else
   EpDispatchIntraNodeKernel_1250x_body<T, EnableStdMoE>(args);
+  #endif
 #else
   EpDispatchIntraNodeKernel_body<T, EnableStdMoE>(args);
 #endif
