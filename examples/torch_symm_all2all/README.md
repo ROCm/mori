@@ -83,8 +83,13 @@ writing 256 MiB with a `uint4` kernel:
 | self + 4 peers | 54.8 GB/s | 55.2 GB/s | 6543.6 GB/s |
 
 One peer grant is enough; adding more costs nothing further. Reads and writes degrade
-equally, which is what an uncached mapping looks like — the pages appear to lose local
-cacheability once they become peer-visible. gfx950 shows no effect at all.
+equally. gfx950 shows no effect at all.
+
+The obvious explanation — that the owner's pages get re-typed uncached — is wrong. Tracing
+`amdgpu:amdgpu_vm_set_ptes` while granting 0..3 peers shows `MTYPE_RW` constant at +492 MiB
+regardless of peer count, with each peer adding its own 256 MiB of `MTYPE_NC` and 256 MiB
+of `MTYPE_UC`. The owner's page-table entries are never re-typed, so whatever costs the
+bandwidth is not the owner's PTE memory type.
 
 It is specific to the VMM path, not to sharing. On the same box, ordinary `hipMalloc`
 memory with `hipDeviceEnablePeerAccess` enabled for **all 7** peers keeps full bandwidth
