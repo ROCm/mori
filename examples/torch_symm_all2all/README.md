@@ -86,11 +86,20 @@ One peer grant is enough; adding more costs nothing further. Reads and writes de
 equally, which is what an uncached mapping looks like — the pages appear to lose local
 cacheability once they become peer-visible. gfx950 shows no effect at all.
 
+It is specific to the VMM path, not to sharing. On the same box, ordinary `hipMalloc`
+memory with `hipDeviceEnablePeerAccess` enabled for **all 7** peers keeps full bandwidth
+(2668.5 -> 2665.2 GB/s). So the hardware sustains peer-visible memory at full local speed;
+only `hipMemCreate` + `hipMemSetAccess` loses it.
+
 Everything else is innocent, and measured to be so on both parts: plain VMM matches
 `hipMalloc` (2670 vs 2536 GB/s on gfx942), a flat reservation with 8 mapped slots matches
 a single slot, mapping a slot twice as a self alias costs nothing, and Pinned matches
-Uncached. So the flat window design is not what costs gfx942 its bandwidth — making the
-memory shareable at all is, and no symmetric-memory backend can avoid that.
+Uncached. The flat window design is not what costs gfx942 its bandwidth.
+
+The escape hatch, if this matters on gfx942, is the trade mori's shmem already makes:
+`hipMalloc` + hipIpc keeps full bandwidth but gives scattered peer pointers instead of a
+flat `base + rank*stride` window, so the kernel needs an N-entry pointer array. Whether
+IPC-imported memory behaves like the `EnablePeerAccess` case above is untested here.
 
 Allocating the window as uncached/fine-grained (as mori's cco windows are) was measured
 and rejected: on gfx1250 it costs about half the bandwidth (712 vs 1499 GB/s at 4 ranks),
