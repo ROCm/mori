@@ -1127,6 +1127,9 @@ class EpDispatchCombineOp:
         stream = _current_stream()
         self._dispatch_dtype = input.dtype
         sfx = _DTYPE_SUFFIX[input.dtype]
+        # Held (not just the pointer) so the matching combine can reduce over the
+        # very routing this dispatch scattered with.
+        self._dispatch_indices = indices
 
         mori_cpp.prepare_inference_args(
             self._handle,
@@ -1359,6 +1362,13 @@ class EpDispatchCombineOp:
         *,
         routing: "EpDispatchRoutingHandle | None" = None,
     ):
+        """Reduce post-expert tokens back onto this rank's tokens.
+
+        ``indices`` is this rank's own [num_token, topk] routing, the same
+        tensor handed to ``dispatch()`` -- not the received-token indices that
+        ``dispatch()`` returned. When a preceding ``dispatch()`` is on record
+        its indices are used and this argument is ignored.
+        """
         if routing is not None and not self._supports_routing_handle():
             raise NotImplementedError(
                 f"routing handle path not supported for kernel_type="
@@ -1418,6 +1428,21 @@ class EpDispatchCombineOp:
         self._combine_dtype = input.dtype
         sfx = _DTYPE_SUFFIX[input.dtype]
 
+        # The InterNodeV1 combine indexes these by this rank's own token id to
+        # decide which nodes a token was routed to, so they have to be the
+        # indices dispatch scattered with. Callers routinely hand back the
+        # received-token indices that dispatch returned instead, which reduces
+        # cross-node tokens against an unrelated token's routing and silently
+        # corrupts the result (ROCm/mori#475), so prefer the dispatched ones.
+        combine_indices = getattr(self, "_dispatch_indices", None)
+        if combine_indices is None:
+            combine_indices = indices
+        if int(combine_indices.size(0)) < cur_n:
+            raise ValueError(
+                f"combine indices has {int(combine_indices.size(0))} tokens but "
+                f"this rank dispatched {cur_n}"
+            )
+
         mori_cpp.prepare_inference_args(
             self._handle,
             inp_ptr=input.data_ptr(),
@@ -1425,7 +1450,7 @@ class EpDispatchCombineOp:
             num_tokens=cur_n,
             weight_ptr=weight_ptr,
             scale_ptr=0,
-            indices_ptr=indices.data_ptr(),
+            indices_ptr=combine_indices.data_ptr(),
         )
         if routing is not None:
             args_ptr = self._build_args_routing(
@@ -1811,6 +1836,7 @@ class EpDispatchCombineOp:
 
         set_fn(self._handle, packed_recv_x.data_ptr(), packed_recv_src_info.data_ptr())
 
+        self._dispatch_indices = indices
         mori_cpp.prepare_inference_args(
             self._handle,
             inp_ptr=input.data_ptr(),
@@ -1911,6 +1937,9 @@ class EpDispatchCombineOp:
 
         set_fn(self._handle, input.data_ptr(), 0)
 
+        combine_indices = getattr(self, "_dispatch_indices", None)
+        if combine_indices is None:
+            combine_indices = indices
         mori_cpp.prepare_inference_args(
             self._handle,
             inp_ptr=input.data_ptr(),
@@ -1922,7 +1951,7 @@ class EpDispatchCombineOp:
                 else 0
             ),
             scale_ptr=0,
-            indices_ptr=indices.data_ptr(),
+            indices_ptr=combine_indices.data_ptr(),
         )
         args_ptr = mori_cpp.build_args(
             self._handle,

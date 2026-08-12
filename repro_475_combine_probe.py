@@ -219,7 +219,7 @@ def main():
         combined = op.combine(
             out,
             None,
-            out_idx,
+            idx if os.environ.get("COMBINE_IDX", "dispatch") == "orig" else out_idx,
             block_num=block_num,
             rdma_block_num=rdma_block_num,
             warp_per_block=cwarps,
