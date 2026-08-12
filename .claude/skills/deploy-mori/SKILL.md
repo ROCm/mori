@@ -440,9 +440,6 @@ echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://repo.amd.
   > /etc/apt/sources.list.d/amdrocm.list
 apt-get update
 apt-get install -y --no-install-recommends amdrocm-core-dev7.14-gfx942 amdrocm-core-dev7.14-gfx950
-# hsakmtTargets.cmake hardcodes this RPM path; without it the link step fails
-# on "ninja: error: /usr/lib64/libc.so, needed by libmori_application.so"
-mkdir -p /usr/lib64 && ln -sf /usr/lib/x86_64-linux-gnu/libc.so /usr/lib64/libc.so
 hipconfig --version
 '
 ```

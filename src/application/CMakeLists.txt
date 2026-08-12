@@ -10,11 +10,13 @@ if(WITH_MPI)
 endif()
 find_package(hsa-runtime64 REQUIRED)
 
-# ROCm 7.14's hsakmt cmake config declares a link dependency on the imported
-# target `numa::numa` but never provides it (no FindNUMA / find_package(NUMA)).
-# Without it, find_package(hsakmt) fails at generate time: "The link interface
-# of target hsakmt::hsakmt contains: numa::numa but the target was not found."
-# Define it ourselves from the system libnuma before pulling in hsakmt.
+# ROCm 7.14's hsakmtTargets.cmake leaks its build machine into
+# hsakmt::hsakmt's INTERFACE_LINK_LIBRARIES; undone here and after
+# find_package(hsakmt) below (both no-ops on 7.2.4, which is clean).
+#
+# It links the imported target `numa::numa` but never defines it, so
+# find_package(hsakmt) would fail at generate time: "The link interface of
+# target hsakmt::hsakmt contains: numa::numa but the target was not found."
 if(NOT TARGET numa::numa)
   find_library(NUMA_LIBRARY NAMES numa)
   find_path(NUMA_INCLUDE_DIR NAMES numa.h)
@@ -33,6 +35,17 @@ if(NOT TARGET numa::numa)
 endif()
 
 find_package(hsakmt REQUIRED)
+
+# Same leak: a hardcoded /usr/lib64/libc.so (RPM path, absent on Ubuntu) breaks
+# the link of every hsakmt::hsakmt consumer. libc is implicit, so just drop it —
+# better than symlinking the RPM path, which would only fix our own images.
+get_target_property(MORI_HSAKMT_LINK_LIBS hsakmt::hsakmt
+                    INTERFACE_LINK_LIBRARIES)
+if(MORI_HSAKMT_LINK_LIBS)
+  list(FILTER MORI_HSAKMT_LINK_LIBS EXCLUDE REGEX "^/usr/lib64/libc\\.so$")
+  set_target_properties(hsakmt::hsakmt PROPERTIES INTERFACE_LINK_LIBRARIES
+                                                  "${MORI_HSAKMT_LINK_LIBS}")
+endif()
 # find_library(IONIC_LIBRARY NAMES ionic HINTS /lib/x86_64-linux-gnu REQUIRED )
 
 set(MORI_APP_SOURCES bootstrap/socket_bootstrap.cpp
