@@ -110,6 +110,7 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
                                                  bool rdmaRegister) {
   int worldSize = bootNet.GetWorldSize();
   int rank = bootNet.GetLocalRank();
+  fprintf(stderr, "[MoRI-DBG] RegisterSymmMemObj rank=%d heap=%d rdmaReg=%d size=%zu\n", rank, heap_begin, rdmaRegister, size);
 
   SymmMemObj* cpuMemObj = new SymmMemObj();
   cpuMemObj->localPtr = localPtr;
@@ -196,6 +197,7 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
     }
   }
   if (context.IsProxyEnabled() && rdmaDeviceContext && anyRdmaPeer) {
+    fprintf(stderr, "[MoRI-DBG] RegisterSymmMemObj rank=%d proxy path, heap=%d\n", rank, heap_begin);
     if (heap_begin) {
       application::RdmaMemoryRegion mr =
           rdmaDeviceContext->RegisterRdmaMemoryRegionAuto(localPtr, size);
