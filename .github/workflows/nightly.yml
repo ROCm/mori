@@ -24,7 +24,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # py3.10 dropped: ROCm 7.14 ships no py3.10/ubuntu22.04 image.
+          # py3.10 stays on 7.2.4: ROCm 7.14 ships no py3.10/ubuntu22.04 image.
+          # Dockerfile.dev skips its apt ROCm 7.14 install when the base already
+          # has a dev stack, so both lanes build from the same file.
+          - python: "3.10"
+            base_image: rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.8.0
           - python: "3.12"
             base_image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
     steps:
@@ -768,6 +772,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - python: "3.10"
+            base_image: rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.8.0
           - python: "3.12"
             base_image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
     env:
