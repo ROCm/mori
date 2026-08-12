@@ -73,6 +73,7 @@ class StandaloneClient : public IUMBPClient {
   void Close() override;
   bool IsDistributed() const override;
   UMBPDeploymentMode GetDeploymentMode() const override { return UMBPDeploymentMode::Local; }
+  bool SupportsRangedIO() const override { return !config_.ssd.enabled; }
 
   bool ReportExternalKvBlocks(const std::vector<std::string>& /*hashes*/,
                               TierType /*tier*/) override {

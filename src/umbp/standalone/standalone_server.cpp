@@ -173,7 +173,8 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   Impl(const UMBPConfig& config, std::string address)
       : backend_config_(NormalizeBackendConfig(config)),
         client_(CreateUMBPClient(backend_config_)),
-        shared_reads_(client_->GetDeploymentMode() == UMBPDeploymentMode::Local &&
+        shared_reads_((client_->GetDeploymentMode() == UMBPDeploymentMode::Local ||
+                       client_->GetDeploymentMode() == UMBPDeploymentMode::Distributed) &&
                       !backend_config_.ssd.enabled),
         address_(std::move(address)),
         fd_socket_path_(DeriveFdSocketPath(address_)) {}
@@ -218,8 +219,9 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     chmod(grpc_path.c_str(), 0600);
     MORI_UMBP_INFO("[StandaloneServer] listening grpc={} fd_socket={}", address_, fd_socket_path_);
     if (shared_reads_) {
-      MORI_UMBP_INFO(
-          "[StandaloneServer] data plane: concurrent reads (local backend, SSD disabled)");
+      MORI_UMBP_INFO("[StandaloneServer] data plane: concurrent reads ({} backend, SSD disabled)",
+                     client_->GetDeploymentMode() == UMBPDeploymentMode::Distributed ? "distributed"
+                                                                                     : "local");
     } else if (client_->GetDeploymentMode() != UMBPDeploymentMode::Local) {
       MORI_UMBP_INFO("[StandaloneServer] data plane: serialized reads (non-local backend)");
     } else {
@@ -258,6 +260,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
                     ::umbp::PingResponse* response) override {
     response->set_ready(!shutdown_.load());
     response->set_deployment_mode(BackendModeToProto(client_->GetDeploymentMode()));
+    response->set_supports_ranged_io(!backend_config_.ssd.enabled && client_->SupportsRangedIO());
     return grpc::Status::OK;
   }
 
@@ -526,7 +529,14 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       return grpc::Status::OK;
     }
     if (request->kind() == ::umbp::MEMORY_KIND_GPU_IPC) {
+      std::lock_guard<std::mutex> lifecycle_lock(external_identity_lifecycle_mu_);
       RegisterGpuIpc(*request, response);
+      if (response->ok() && !EnsureExternalIdentity(*request)) {
+        MORI_UMBP_WARN(
+            "[StandaloneServer] external-KV identity registration failed for client_id={} "
+            "worker_node_id={}; continuing with core GPU registration",
+            request->client_id(), request->worker_node_id());
+      }
       return grpc::Status::OK;
     }
     std::lock_guard<std::mutex> lifecycle_lock(external_identity_lifecycle_mu_);
@@ -905,8 +915,9 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
 
   void RegisterGpuIpc(const ::umbp::RegisterMemoryRequest& request,
                       ::umbp::BoolResponse* response) {
-    if (client_->GetDeploymentMode() != UMBPDeploymentMode::Local) {
-      SetBool(response, false, "GPU IPC registration requires a Local inner backend");
+    const UMBPDeploymentMode mode = client_->GetDeploymentMode();
+    if (mode != UMBPDeploymentMode::Local && mode != UMBPDeploymentMode::Distributed) {
+      SetBool(response, false, "GPU IPC registration requires a Local or Distributed backend");
       return;
     }
     if (backend_config_.ssd.enabled) {
@@ -969,7 +980,15 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     entry.device_id = request.device_id();
     entry.alloc_base = request.alloc_base();
     entry.client_id = request.client_id();
-    if (!RegisterBackendMemory(entry.base, static_cast<size_t>(entry.size),
+    // Only the Local backend registers the imported mapping. Ranged distributed
+    // I/O stages remote objects through a registered host arena instead: the
+    // imported worker mapping is a local HIP copy endpoint only, so an RDMA MR
+    // for it buys nothing and the dmabuf fallback is unsafe for IPC-imported
+    // ROCm mappings. Skipping it is safe here because an unregistered device
+    // pointer is classified, not assumed host (ClassifiedUserBytes), so
+    // HbmCopyEngine still claims the pair.
+    if (mode == UMBPDeploymentMode::Local &&
+        !RegisterBackendMemory(entry.base, static_cast<size_t>(entry.size),
                                mori::io::MemoryLocationType::GPU, entry.device_id)) {
       ReleaseIpcMapping(key);
       SetBool(response, false, "inner backend RegisterMemory failed");

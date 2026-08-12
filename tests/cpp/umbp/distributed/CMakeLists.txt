@@ -193,8 +193,22 @@ target_link_libraries(
           gtest_main)
 add_test(NAME umbp_medium_selection COMMAND test_umbp_medium_selection)
 
+# test_umbp_pool_client_ranges — ranged multi-buffer I/O through PoolClient:
+# local range reads/writes against the node's own medium, the remote path via
+# the scratch arena, range validation, and GPU caller buffers.
+add_executable(test_umbp_pool_client_ranges test_pool_client_ranges.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_pool_client_ranges PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_pool_client_ranges
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+add_test(NAME umbp_pool_client_ranges COMMAND test_umbp_pool_client_ranges)
+
 set_tests_properties(umbp_cross_node_smoke umbp_pool_client_batch_put
-                     umbp_medium_selection PROPERTIES LABELS "integration")
+                     umbp_medium_selection umbp_pool_client_ranges
+                     PROPERTIES LABELS "integration")
 
 # --------------------------------------------------------------------------
 # Benchmarks (manual; built but NOT registered with add_test).

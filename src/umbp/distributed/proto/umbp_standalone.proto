@@ -35,6 +35,7 @@ message Empty {}
 message PingResponse {
   bool ready = 1;
   StandaloneBackendMode deployment_mode = 2;
+  bool supports_ranged_io = 3;
 }
 
 message BoolResponse {

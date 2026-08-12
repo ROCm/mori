@@ -44,6 +44,7 @@
 #include "umbp/common/device_copy.h"
 #include "umbp/common/env_time.h"
 #include "umbp/common/parallel_for.h"
+#include "umbp/common/range_utils.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/peer/backend/hbm_backend.h"
 #include "umbp/distributed/peer/backend/page_backend.h"
@@ -165,6 +166,47 @@ bool SizeMatchesAllocation(uint64_t size, size_t num_pages, uint64_t page_size) 
   return true;
 }
 
+// Read-side range validity: inside the object and non-overlapping.  Weaker than
+// RangesTileObject, which the write side needs — a read may take any subset of
+// an object, but a write must account for every byte it commits.
+bool RangesAreDisjointAndInBounds(size_t object_size, const std::vector<size_t>& sizes,
+                                  const std::vector<size_t>& offsets) {
+  if (object_size == 0 || sizes.empty() || sizes.size() != offsets.size()) return false;
+  std::vector<size_t> order(sizes.size());
+  std::iota(order.begin(), order.end(), size_t{0});
+  std::sort(order.begin(), order.end(),
+            [&](size_t a, size_t b) { return offsets[a] < offsets[b]; });
+  size_t previous_end = 0;
+  bool first = true;
+  for (size_t index : order) {
+    if (sizes[index] == 0 || IsObjectRangeOverflow(offsets[index], sizes[index], object_size)) {
+      return false;
+    }
+    if (!first && offsets[index] < previous_end) return false;
+    previous_end = offsets[index] + sizes[index];
+    first = false;
+  }
+  return true;
+}
+
+// Scratch-arena slice alignment.  Objects are packed back-to-back into the
+// arena; 64 B keeps each slice on a cache line so two concurrently-filled
+// slices never share one.
+constexpr size_t kRangedScratchAlignment = 64;
+
+bool AlignUpChecked(size_t value, size_t alignment, size_t* out) {
+  if (!out || alignment == 0) return false;
+  const size_t remainder = value % alignment;
+  if (remainder == 0) {
+    *out = value;
+    return true;
+  }
+  const size_t add = alignment - remainder;
+  if (value > std::numeric_limits<size_t>::max() - add) return false;
+  *out = value + add;
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 //  Lease env knobs
 // ---------------------------------------------------------------------------
@@ -276,7 +318,13 @@ bool PoolClient::Init() {
   // side remote), so this is registration order as documentation, not as a
   // tie-break — but it must come before the wire engine on principle, since an
   // HBM pair that reached mori-io would be refused rather than served slowly.
-  composite->AddEngine(std::make_unique<HbmCopyEngine>());
+  auto hbm = std::make_unique<HbmCopyEngine>();
+  // Kept as a raw observer so the live medium's host buffers can be declared
+  // kernel-addressable once it has allocated them, below.  This is the one
+  // engine-specific reference PoolClient holds, and it carries no data-plane
+  // call: everything that moves bytes still goes through transfer_engine_.
+  hbm_engine_ = hbm.get();
+  composite->AddEngine(std::move(hbm));
   if (!config_.io_engine.host.empty()) {
     mori::io::IOEngineConfig io_cfg;
     io_cfg.host = config_.io_engine.host;
@@ -373,6 +421,28 @@ bool PoolClient::Init() {
   if (!registry_.Register(std::move(backend))) {
     initialized_ = false;
     return false;
+  }
+
+  // Declare every host region the gather kernel may dereference: the live
+  // medium's own buffers, and the ranged scratch arena.  Both are copied
+  // fragment-wise against GPU callers, which is the shape the kernel exists
+  // for.  Registration is best-effort and asynchronous for large pools, so
+  // until it lands the engine just takes hipMemcpy — no ordering requirement
+  // here beyond the buffers existing.
+  if (hbm_engine_ != nullptr) {
+    if (auto* live = registry_.Get(medium_); live != nullptr) {
+      for (uint32_t i = 0; i < live->BufferCount(); ++i) {
+        const TransferRef ref = live->BufferRef(i);
+        // Only host buffers: a device-resident medium is already addressable
+        // from a kernel, and hipHostRegister on it would fail.
+        if (ref.HasHostPtr() && ref.loc == mori::io::MemoryLocationType::CPU) {
+          hbm_engine_->AddHostGatherRegion(ref.host_ptr, ref.size);
+        }
+      }
+    }
+    if (config_.ranged_scratch_buffer != nullptr && config_.ranged_scratch_size > 0) {
+      hbm_engine_->AddHostGatherRegion(config_.ranged_scratch_buffer, config_.ranged_scratch_size);
+    }
   }
 
   master_client_->SetBackendRegistry(&registry_);
@@ -472,6 +542,11 @@ void PoolClient::Shutdown() {
 
   peer_service_.reset();
 
+  // hipHostUnregister the gather regions before their backing memory goes
+  // away: the medium's buffers die with the registry below, and the scratch
+  // arena is caller-owned and freed after Shutdown returns.
+  if (hbm_engine_ != nullptr) hbm_engine_->ClearHostGatherRegions();
+
   // Every backend deregisters its memory through transfer_engine_ inside its
   // own destructor — this MUST run before transfer_engine_ is torn down below.
   // MasterClient borrows the registry, so unbind it first.
@@ -484,6 +559,7 @@ void PoolClient::Shutdown() {
     registered_regions_.clear();
   }
   peer_directory_ = nullptr;
+  hbm_engine_ = nullptr;
   transfer_engine_.reset();
 
   master_client_.reset();
@@ -754,6 +830,185 @@ PoolClient::GetAttemptOutcome PoolClient::ExecuteLocalGet(const std::string& key
                              MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP,
                              {{"traffic", "local"}}, static_cast<double>(size));
   return GetAttemptOutcome::kSuccess;
+}
+
+// ---------------------------------------------------------------------------
+//  Ranged I/O — object ranges onto tier pages
+// ---------------------------------------------------------------------------
+
+bool PoolClient::BuildLocalRangeTransfers(MediumBackend* backend,
+                                          const std::vector<PageLocation>& pages,
+                                          uint64_t page_size, uint64_t stored_size,
+                                          const std::vector<ObjectRange>& ranges, bool to_backend,
+                                          size_t tag, std::vector<TransferItem>* items) {
+  if (pages.empty() || page_size == 0) return false;
+  if (!SizeMatchesAllocation(stored_size, pages.size(), page_size)) return false;
+
+  for (const auto& range : ranges) {
+    if (range.size == 0 || range.user == nullptr) return false;
+    if (IsObjectRangeOverflow(range.object_offset, range.size, static_cast<size_t>(stored_size))) {
+      return false;
+    }
+    // Classified once per range, not per page: an unregistered device pointer
+    // must reach HbmCopyEngine, and the whole range lives in one buffer.
+    const TransferRef user_ref = ClassifiedUserBytes(range.user, range.size);
+
+    size_t object_offset = range.object_offset;
+    size_t copied = 0;
+    while (copied < range.size) {
+      const size_t page_index = static_cast<size_t>(object_offset / page_size);
+      const size_t within_page = static_cast<size_t>(object_offset % page_size);
+      if (page_index >= pages.size()) return false;
+
+      TransferRef buf = backend->BufferRef(pages[page_index].buffer_index);
+      if (!buf.HasHostPtr()) {
+        MORI_UMBP_WARN("[PoolClient] ranged transfer: tier={} publishes no endpoint for buffer {}",
+                       static_cast<int>(backend->Tier()), pages[page_index].buffer_index);
+        return false;
+      }
+      // The last page of an object is short; a range must not run off its end
+      // into whatever the slot's final partial page does not own.
+      const uint64_t page_bytes =
+          LogicalPageBytes(page_index, pages.size(), page_size, static_cast<size_t>(stored_size));
+      if (within_page >= page_bytes) return false;
+      const size_t fragment =
+          std::min<size_t>(range.size - copied, static_cast<size_t>(page_bytes - within_page));
+      const uint64_t tier_offset = PageOffset(pages[page_index], page_size) + within_page;
+
+      TransferItem item;
+      item.size = fragment;
+      item.tag = tag;
+      if (to_backend) {
+        item.src = user_ref;
+        item.src_offset = copied;
+        item.dst = std::move(buf);
+        item.dst_offset = tier_offset;
+      } else {
+        item.src = std::move(buf);
+        item.src_offset = tier_offset;
+        item.dst = user_ref;
+        item.dst_offset = copied;
+      }
+      items->push_back(std::move(item));
+
+      object_offset += fragment;
+      copied += fragment;
+    }
+  }
+  return true;
+}
+
+bool PoolClient::CopyContiguousToRanges(const void* src, size_t object_size,
+                                        const std::vector<ObjectRange>& ranges) {
+  // The arena is plain host memory this client owns, so it is described
+  // directly rather than resolved through a backend's published endpoints.
+  const TransferRef object_ref = TransferRef::HostBytes(const_cast<void*>(src), object_size);
+  std::vector<TransferItem> items;
+  items.reserve(ranges.size());
+  for (const auto& range : ranges) {
+    if (range.size == 0 || range.user == nullptr) return false;
+    if (IsObjectRangeOverflow(range.object_offset, range.size, object_size)) return false;
+    TransferItem item;
+    item.size = range.size;
+    item.tag = 0;
+    item.src = object_ref;
+    item.src_offset = range.object_offset;
+    item.dst = ClassifiedUserBytes(range.user, range.size);
+    item.dst_offset = 0;
+    items.push_back(std::move(item));
+  }
+  return !items.empty() && transfer_engine_->Transfer(items, /*failed_tags=*/nullptr);
+}
+
+bool PoolClient::CopyRangesToContiguous(const std::vector<ObjectRange>& ranges, void* dst,
+                                        size_t object_size) {
+  const TransferRef object_ref = TransferRef::HostBytes(dst, object_size);
+  std::vector<TransferItem> items;
+  items.reserve(ranges.size());
+  for (const auto& range : ranges) {
+    if (range.size == 0 || range.user == nullptr) return false;
+    if (IsObjectRangeOverflow(range.object_offset, range.size, object_size)) return false;
+    TransferItem item;
+    item.size = range.size;
+    item.tag = 0;
+    item.src = ClassifiedUserBytes(range.user, range.size);
+    item.src_offset = 0;
+    item.dst = object_ref;
+    item.dst_offset = range.object_offset;
+    items.push_back(std::move(item));
+  }
+  return !items.empty() && transfer_engine_->Transfer(items, /*failed_tags=*/nullptr);
+}
+
+void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteRequest>& requests,
+                                            std::vector<bool>* results) {
+  if (requests.empty()) return;
+  if (registry_.Empty()) {
+    MORI_UMBP_ERROR("[PoolClient] Local ranged Put requested but no storage backend is registered");
+    return;
+  }
+
+  struct PendingWrite {
+    size_t request_index = 0;
+    MediumBackend* backend = nullptr;
+    uint64_t slot_id = 0;
+  };
+  std::vector<PendingWrite> pending;
+  std::vector<TransferItem> items;
+  pending.reserve(requests.size());
+
+  for (size_t r = 0; r < requests.size(); ++r) {
+    const auto& request = requests[r];
+    auto* backend = registry_.Get(request.tier);
+    if (backend == nullptr || backend->BufferCount() == 0) {
+      MORI_UMBP_WARN("[PoolClient] Local ranged Put: tier={} has no in-process-addressable backend",
+                     static_cast<int>(request.tier));
+      continue;
+    }
+    auto alloc_res =
+        backend->BatchAllocate({AllocateRequest{*request.key, request.object_size}}).front();
+    if (alloc_res.outcome == AllocateOutcome::kSuccessAlreadyExists) {
+      (*results)[request.result_index] = true;
+      continue;
+    }
+    if (alloc_res.outcome != AllocateOutcome::kSuccessAllocated) continue;
+
+    // tag = index into `requests`, so the engine's failed tags map straight
+    // back to the slot that has to be aborted.
+    const size_t before = items.size();
+    if (!BuildLocalRangeTransfers(backend, alloc_res.pages, alloc_res.page_size,
+                                  request.object_size, request.ranges, /*to_backend=*/true,
+                                  /*tag=*/r, &items)) {
+      items.resize(before);
+      backend->BatchAbort({alloc_res.slot_id});
+      continue;
+    }
+    pending.push_back({r, backend, alloc_res.slot_id});
+  }
+  if (pending.empty()) return;
+
+  std::vector<size_t> failed_tags;
+  transfer_engine_->Transfer(items, &failed_tags);
+  const std::unordered_set<size_t> failed(failed_tags.begin(), failed_tags.end());
+
+  for (const auto& write : pending) {
+    const auto& request = requests[write.request_index];
+    if (failed.count(write.request_index) != 0) {
+      write.backend->BatchAbort({write.slot_id});
+      continue;
+    }
+    if (!write.backend->BatchCommit({CommitRequest{write.slot_id, *request.key}}).front().success) {
+      write.backend->BatchAbort({write.slot_id});
+      continue;
+    }
+    (*results)[request.result_index] = true;
+    master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL,
+                               MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL_HELP,
+                               {{"traffic", "local"}}, static_cast<double>(request.object_size));
+    master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL,
+                               MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL_HELP,
+                               {{"traffic", "local"}}, static_cast<double>(request.object_size));
+  }
 }
 
 void PoolClient::MaybeReCacheAfterRemote(const std::string& key, const void* src, size_t size) {
@@ -1381,6 +1636,378 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
   return results;
 }
 
+// ---------------------------------------------------------------------------
+//  Ranged batch entry points
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::vector<PoolClient::ObjectRange> MakeReadRanges(const std::vector<void*>& dsts,
+                                                    const std::vector<size_t>& sizes,
+                                                    const std::vector<size_t>& offsets) {
+  std::vector<PoolClient::ObjectRange> out;
+  out.reserve(dsts.size());
+  for (size_t r = 0; r < dsts.size(); ++r) out.push_back({dsts[r], sizes[r], offsets[r]});
+  return out;
+}
+
+std::vector<PoolClient::ObjectRange> MakeWriteRanges(const std::vector<const void*>& srcs,
+                                                     const std::vector<size_t>& sizes,
+                                                     const std::vector<size_t>& offsets) {
+  std::vector<PoolClient::ObjectRange> out;
+  out.reserve(srcs.size());
+  for (size_t r = 0; r < srcs.size(); ++r) {
+    out.push_back({const_cast<void*>(srcs[r]), sizes[r], offsets[r]});
+  }
+  return out;
+}
+
+}  // namespace
+
+std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& keys,
+                                             const std::vector<std::vector<void*>>& dsts,
+                                             const std::vector<std::vector<size_t>>& sizes,
+                                             const std::vector<std::vector<size_t>>& src_offsets) {
+  const size_t n = keys.size();
+  std::vector<bool> results(n, false);
+  if (!initialized_ || n == 0 || !RangeBatchShapeValid(n, dsts, sizes, src_offsets)) {
+    return results;
+  }
+
+  auto record_local_get = [&](size_t index) {
+    const double bytes =
+        static_cast<double>(std::accumulate(sizes[index].begin(), sizes[index].end(), size_t{0}));
+    master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL,
+                               MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL_HELP,
+                               {{"traffic", "local"}}, bytes);
+    master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL,
+                               MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP,
+                               {{"traffic", "local"}}, bytes);
+  };
+
+  // ---- Phase 1: everything this node already holds, in one submit ----
+  //
+  // Every key's items carry tag = key index, so the engine reports failures per
+  // key and one bad key does not fail the batch.  This is why the local half
+  // needs no per-key threading the way whole-object BatchGet does: the copies
+  // are already batched into a single plan set.
+  std::vector<TransferItem> local_items;
+  std::vector<size_t> local_keys;
+  std::vector<size_t> missed;
+  missed.reserve(n);
+  for (size_t i = 0; i < n; ++i) {
+    if (sizes[i].empty()) continue;  // asked for nothing; stays false
+
+    MediumBackend* holder = nullptr;
+    ResolvedEntry resolved;
+    for (auto* backend : registry_.All()) {
+      auto candidate = backend->BatchResolve({keys[i]}, /*include_descs=*/false).front();
+      if (!candidate.found) continue;
+      holder = backend;
+      resolved = std::move(candidate);
+      break;
+    }
+    if (holder == nullptr) {
+      missed.push_back(i);
+      continue;
+    }
+    if (!RangesAreDisjointAndInBounds(static_cast<size_t>(resolved.size), sizes[i],
+                                      src_offsets[i])) {
+      MORI_UMBP_ERROR("[PoolClient] BatchGetRanges: invalid local ranges for key='{}' size={}",
+                      keys[i], resolved.size);
+      continue;  // a caller bug, not a miss — do not go looking for a replica
+    }
+    const size_t before = local_items.size();
+    if (!BuildLocalRangeTransfers(holder, resolved.pages, resolved.page_size, resolved.size,
+                                  MakeReadRanges(dsts[i], sizes[i], src_offsets[i]),
+                                  /*to_backend=*/false, /*tag=*/i, &local_items)) {
+      // The medium holds the key but cannot be read in-process.  Same call as
+      // ExecuteLocalGet's kRetry: look for it on another node rather than
+      // reporting a miss the caller cannot distinguish from absence.
+      local_items.resize(before);
+      missed.push_back(i);
+      continue;
+    }
+    local_keys.push_back(i);
+  }
+  if (!local_items.empty()) {
+    std::vector<size_t> failed_tags;
+    transfer_engine_->Transfer(local_items, &failed_tags);
+    const std::unordered_set<size_t> failed(failed_tags.begin(), failed_tags.end());
+    for (size_t i : local_keys) {
+      if (failed.count(i) != 0) continue;
+      results[i] = true;
+      record_local_get(i);
+    }
+  }
+  if (missed.empty()) return results;
+
+  // ---- Phase 2: the rest, through the scratch arena ----
+  if (config_.ranged_scratch_buffer == nullptr || config_.ranged_scratch_size == 0 ||
+      !FindRegisteredMemory(config_.ranged_scratch_buffer, config_.ranged_scratch_size)
+           .has_value()) {
+    MORI_UMBP_ERROR("[PoolClient] BatchGetRanges: ranged scratch is absent or not registered");
+    return results;
+  }
+  // Only the arena users serialize; the local hits above were fully concurrent.
+  std::unique_lock<std::mutex> scratch_lock(ranged_scratch_mutex_);
+
+  std::vector<std::string> route_keys;
+  route_keys.reserve(missed.size());
+  for (size_t index : missed) route_keys.push_back(keys[index]);
+  std::vector<std::optional<RouteGetResult>> routes;
+  std::unordered_set<std::string> excludes{config_.master_config.node_id};
+  auto route_status = master_client_->BatchRouteGet(route_keys, excludes, &routes);
+  if (!route_status.ok()) {
+    MORI_UMBP_ERROR("[PoolClient] BatchGetRanges: BatchRouteGet failed: {}",
+                    route_status.error_message());
+    return results;
+  }
+  routes.resize(route_keys.size());
+
+  // No tier filter here.  Upstream restricts remote ranged reads to DRAM/HBM
+  // because its remote path is a hand-written DRAM RDMA read; ours fetches the
+  // whole object through ExecuteBatchGetPlan, which reaches any medium the
+  // owning peer publishes — including SSD.
+  std::vector<size_t> eligible;
+  eligible.reserve(missed.size());
+  for (size_t r = 0; r < missed.size(); ++r) {
+    const size_t original = missed[r];
+    if (!routes[r].has_value()) continue;  // genuinely nowhere in the cluster
+    const auto& route = *routes[r];
+    if (route.node_id == config_.master_config.node_id || route.size == 0 ||
+        route.size > std::numeric_limits<size_t>::max() ||
+        !RangesAreDisjointAndInBounds(static_cast<size_t>(route.size), sizes[original],
+                                      src_offsets[original])) {
+      MORI_UMBP_ERROR("[PoolClient] BatchGetRanges: invalid route/ranges for key='{}' size={}",
+                      keys[original], route.size);
+      continue;
+    }
+    eligible.push_back(r);
+  }
+
+  // Pack as many objects into the arena as fit, fetch that group, then repeat.
+  size_t pos = 0;
+  while (pos < eligible.size()) {
+    std::vector<size_t> scratch_offsets;
+    size_t cursor = 0;
+    size_t end = pos;
+    for (; end < eligible.size(); ++end) {
+      const size_t object_size = static_cast<size_t>(routes[eligible[end]]->size);
+      size_t aligned = 0;
+      if (!AlignUpChecked(cursor, kRangedScratchAlignment, &aligned) ||
+          object_size > config_.ranged_scratch_size ||
+          aligned > config_.ranged_scratch_size - object_size) {
+        break;
+      }
+      scratch_offsets.push_back(aligned);
+      cursor = aligned + object_size;
+    }
+    if (end == pos) {
+      // Not even one fits: this object is larger than the whole arena.
+      const size_t original = missed[eligible[pos]];
+      MORI_UMBP_ERROR(
+          "[PoolClient] BatchGetRanges: object exceeds ranged scratch key='{}' size={} scratch={}",
+          keys[original], routes[eligible[pos]]->size, config_.ranged_scratch_size);
+      ++pos;
+      continue;
+    }
+
+    const size_t count = end - pos;
+    std::vector<std::string> sub_keys;
+    std::vector<void*> sub_dsts;
+    std::vector<size_t> sub_sizes;
+    std::vector<std::optional<RouteGetResult>> sub_routes;
+    sub_keys.reserve(count);
+    sub_dsts.reserve(count);
+    sub_sizes.reserve(count);
+    sub_routes.reserve(count);
+    for (size_t j = 0; j < count; ++j) {
+      const size_t route_index = eligible[pos + j];
+      sub_keys.push_back(keys[missed[route_index]]);
+      sub_dsts.push_back(static_cast<char*>(config_.ranged_scratch_buffer) + scratch_offsets[j]);
+      sub_sizes.push_back(static_cast<size_t>(routes[route_index]->size));
+      sub_routes.push_back(routes[route_index]);
+    }
+
+    std::vector<bool> fetched(count, false);
+    BatchGetPlan plan = PartitionBatchGetTargets(sub_keys, sub_dsts, sub_sizes, sub_routes);
+    // recache_remote=false: this loop installs synchronously below, and the
+    // async re-cache would queue a second install of the same bytes.
+    ExecuteBatchGetPlan(plan, sub_keys, sub_dsts, sub_sizes, &fetched, /*recache_remote=*/false);
+
+    for (size_t j = 0; j < count; ++j) {
+      const size_t original = missed[eligible[pos + j]];
+      if (!fetched[j]) continue;
+
+      // Serve the caller from the arena copy we already have.  Installing into
+      // the local medium is a caching side effect: it makes the *next* ranged
+      // read of this key a local hit, and its failure must not fail this read.
+      results[original] = CopyContiguousToRanges(
+          sub_dsts[j], sub_sizes[j],
+          MakeReadRanges(dsts[original], sizes[original], src_offsets[original]));
+
+      const auto installed = ExecuteLocalPut(sub_keys[j], sub_dsts[j], sub_sizes[j], medium_);
+      if (installed != PutAttemptOutcome::kSuccess &&
+          installed != PutAttemptOutcome::kSuccessAlreadyExists) {
+        master_client_->AddCounter(MORI_UMBP_METRIC_RANGED_REMOTE_INSTALL_FAILURES_TOTAL,
+                                   MORI_UMBP_METRIC_RANGED_REMOTE_INSTALL_FAILURES_TOTAL_HELP, {},
+                                   1.0);
+      }
+    }
+    pos = end;
+  }
+  return results;
+}
+
+std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& keys,
+                                             const std::vector<size_t>& object_sizes,
+                                             const std::vector<std::vector<const void*>>& srcs,
+                                             const std::vector<std::vector<size_t>>& sizes,
+                                             const std::vector<std::vector<size_t>>& dst_offsets) {
+  const size_t n = keys.size();
+  std::vector<bool> results(n, false);
+  if (!initialized_ || n == 0 || object_sizes.size() != n ||
+      !RangeBatchShapeValid(n, srcs, sizes, dst_offsets)) {
+    return results;
+  }
+
+  // A put must account for every byte of the object it commits, so the ranges
+  // have to tile it — being merely disjoint and in bounds would leave gaps of
+  // whatever the slot happened to hold.
+  std::vector<size_t> valid;
+  std::vector<std::string> route_keys;
+  std::vector<uint64_t> route_sizes;
+  valid.reserve(n);
+  route_keys.reserve(n);
+  route_sizes.reserve(n);
+  for (size_t i = 0; i < n; ++i) {
+    if (!RangesTileObject(object_sizes[i], sizes[i], dst_offsets[i])) {
+      MORI_UMBP_ERROR("[PoolClient] BatchPutRanges: ranges do not tile key='{}' size={}", keys[i],
+                      object_sizes[i]);
+      continue;
+    }
+    valid.push_back(i);
+    route_keys.push_back(keys[i]);
+    route_sizes.push_back(object_sizes[i]);
+  }
+  if (valid.empty()) return results;
+
+  std::vector<std::optional<RoutePutResult>> routes;
+  std::unordered_set<std::string> excludes;
+  auto route_status = master_client_->BatchRoutePut(route_keys, route_sizes, excludes, &routes);
+  if (!route_status.ok()) {
+    MORI_UMBP_ERROR("[PoolClient] BatchPutRanges: BatchRoutePut failed: {}",
+                    route_status.error_message());
+    return results;
+  }
+  routes.resize(valid.size());
+
+  std::vector<size_t> remote;
+  std::vector<LocalRangeWriteRequest> local_writes;
+  remote.reserve(valid.size());
+  local_writes.reserve(valid.size());
+  for (size_t r = 0; r < valid.size(); ++r) {
+    const size_t original = valid[r];
+    if (!routes[r].has_value()) continue;
+    const auto& route = *routes[r];
+    if (route.outcome == RoutePutOutcome::kAlreadyExists) {
+      results[original] = true;
+      continue;
+    }
+    if (route.node_id != config_.master_config.node_id) {
+      remote.push_back(r);
+      continue;
+    }
+    // Routed here: write the ranges straight into the slot's pages.  No
+    // assembly buffer — a TransferItem is a range, so the scattered sources
+    // land where they belong.
+    local_writes.push_back({original, &keys[original], object_sizes[original],
+                            MakeWriteRanges(srcs[original], sizes[original], dst_offsets[original]),
+                            route.tier});
+  }
+  // One transfer for every locally-routed key in the batch, not one per key.
+  ExecuteLocalPutRangesBatch(local_writes, &results);
+  if (remote.empty()) return results;
+
+  // A key routed to another node has to be one contiguous object on the wire,
+  // so this is the one direction that needs the arena.
+  if (config_.ranged_scratch_buffer == nullptr || config_.ranged_scratch_size == 0 ||
+      !FindRegisteredMemory(config_.ranged_scratch_buffer, config_.ranged_scratch_size)
+           .has_value()) {
+    MORI_UMBP_ERROR("[PoolClient] BatchPutRanges: ranged scratch is absent or not registered");
+    return results;
+  }
+  std::unique_lock<std::mutex> scratch_lock(ranged_scratch_mutex_);
+
+  size_t pos = 0;
+  while (pos < remote.size()) {
+    std::vector<size_t> scratch_offsets;
+    size_t cursor = 0;
+    size_t end = pos;
+    for (; end < remote.size(); ++end) {
+      const size_t object_size = object_sizes[valid[remote[end]]];
+      size_t aligned = 0;
+      if (!AlignUpChecked(cursor, kRangedScratchAlignment, &aligned) ||
+          object_size > config_.ranged_scratch_size ||
+          aligned > config_.ranged_scratch_size - object_size) {
+        break;
+      }
+      scratch_offsets.push_back(aligned);
+      cursor = aligned + object_size;
+    }
+    if (end == pos) {
+      const size_t original = valid[remote[pos]];
+      MORI_UMBP_ERROR(
+          "[PoolClient] BatchPutRanges: object exceeds ranged scratch key='{}' size={} scratch={}",
+          keys[original], object_sizes[original], config_.ranged_scratch_size);
+      ++pos;
+      continue;
+    }
+
+    const size_t count = end - pos;
+    std::vector<std::string> sub_keys;
+    std::vector<const void*> sub_srcs;
+    std::vector<size_t> sub_sizes;
+    std::vector<std::optional<RoutePutResult>> sub_routes;
+    std::vector<size_t> sub_originals;
+    sub_keys.reserve(count);
+    sub_srcs.reserve(count);
+    sub_sizes.reserve(count);
+    sub_routes.reserve(count);
+    sub_originals.reserve(count);
+    for (size_t j = 0; j < count; ++j) {
+      const size_t route_index = remote[pos + j];
+      const size_t original = valid[route_index];
+      void* slice = static_cast<char*>(config_.ranged_scratch_buffer) + scratch_offsets[j];
+      if (!CopyRangesToContiguous(
+              MakeWriteRanges(srcs[original], sizes[original], dst_offsets[original]), slice,
+              object_sizes[original])) {
+        MORI_UMBP_ERROR("[PoolClient] BatchPutRanges: assembly failed for key='{}'",
+                        keys[original]);
+        continue;
+      }
+      sub_keys.push_back(keys[original]);
+      sub_srcs.push_back(slice);
+      sub_sizes.push_back(object_sizes[original]);
+      sub_routes.push_back(routes[route_index]);
+      sub_originals.push_back(original);
+    }
+
+    if (!sub_keys.empty()) {
+      std::vector<PutEntryOutcome> outcomes(sub_keys.size(), PutEntryOutcome::kFailed);
+      BatchPutPlan plan =
+          PartitionBatchPutTargets(sub_keys, sub_srcs, sub_sizes, sub_routes, &outcomes);
+      ExecuteBatchPutPlan(plan, &outcomes);
+      for (size_t j = 0; j < outcomes.size(); ++j) {
+        results[sub_originals[j]] = outcomes[j] != PutEntryOutcome::kFailed;
+      }
+    }
+    pos = end;
+  }
+  return results;
+}
+
 PoolClient::BatchGetPlan PoolClient::PartitionBatchGetTargets(
     const std::vector<std::string>& keys, const std::vector<void*>& dsts,
     const std::vector<size_t>& sizes, const std::vector<std::optional<RouteGetResult>>& routes) {
@@ -1417,7 +2044,8 @@ PoolClient::BatchGetPlan PoolClient::PartitionBatchGetTargets(
 
 void PoolClient::ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector<std::string>& keys,
                                      const std::vector<void*>& dsts,
-                                     const std::vector<size_t>& sizes, std::vector<bool>* results) {
+                                     const std::vector<size_t>& sizes, std::vector<bool>* results,
+                                     bool recache_remote) {
   // Parallel local reads: different threads handle different keys. Resolve
   // is mutex-serialized in the allocator; the per-key memcpy in
   // ExecuteLocalGet->LocalGetPages runs lock-free in parallel. results is
@@ -1466,7 +2094,7 @@ void PoolClient::ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector
     if (auto f = SubmitRemoteBatchGet(items, results)) inflights.push_back(std::move(f));
   }
   run_local();
-  for (auto& f : inflights) WaitRemoteBatchGet(*f, results);
+  for (auto& f : inflights) WaitRemoteBatchGet(*f, results, recache_remote);
 }
 
 std::unique_ptr<PoolClient::RemoteGetInFlight> PoolClient::SubmitRemoteBatchGet(
@@ -1542,7 +2170,8 @@ std::unique_ptr<PoolClient::RemoteGetInFlight> PoolClient::SubmitRemoteBatchGet(
   return inflight;
 }
 
-void PoolClient::WaitRemoteBatchGet(RemoteGetInFlight& f, std::vector<bool>* results) {
+void PoolClient::WaitRemoteBatchGet(RemoteGetInFlight& f, std::vector<bool>* results,
+                                    bool recache_remote) {
   if (f.drained) return;
   f.drained = true;
   std::vector<TransferFailure> failures;
@@ -1550,7 +2179,7 @@ void PoolClient::WaitRemoteBatchGet(RemoteGetInFlight& f, std::vector<bool>* res
   ApplyTransferFailures(f.entries, failures, "RemoteGet");
   // Nothing to copy out here even for a staged read: the engine owns its bounce
   // pool and lands the bytes in the user's dst before its Wait returns.
-  FinalizeRemoteGetEntries(f.entries, results);
+  FinalizeRemoteGetEntries(f.entries, results, recache_remote);
 }
 
 bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
@@ -1699,7 +2328,7 @@ bool PoolClient::BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries,
 }
 
 void PoolClient::FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries,
-                                          std::vector<bool>* results) {
+                                          std::vector<bool>* results, bool recache_remote) {
   for (auto& entry : entries) {
     if (entry.failed) {
       (*results)[entry.result_index] = false;
@@ -1716,7 +2345,7 @@ void PoolClient::FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries,
     // Re-cache the remotely-fetched block into local DRAM (best-effort): the
     // user dst is already populated (staging copy-out and zero-copy both land
     // before Finalize runs), so subsequent reads of this key route local.
-    if (entry.item) {
+    if (recache_remote && entry.item) {
       MaybeReCacheAfterRemote(*entry.item->key, entry.item->dst, entry.item->size);
     }
   }

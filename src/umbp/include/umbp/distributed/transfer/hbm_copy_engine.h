@@ -23,8 +23,10 @@
 
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <vector>
 
+#include "umbp/common/host_registration.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
 
 namespace mori::umbp {
@@ -82,6 +84,23 @@ class HbmCopyEngine final : public TransferEngine {
   }
   void Deregister(const TransferRef&) override {}
 
+  // Declare a host region as kernel-addressable, enabling the gather fast path
+  // for plans whose host side lies inside it.
+  //
+  // A gather kernel cannot dereference plain mmap memory — it faults the GPU —
+  // so the region must be hipHostRegister'd first, which is what
+  // HostTierRegistration does (asynchronously for large pools).  Registration
+  // is best-effort and this is purely an optimisation hint: until it completes,
+  // and forever if it fails, Submit simply takes the hipMemcpy path it took
+  // before.
+  //
+  // PoolClient calls this once per buffer each medium publishes, after Init.
+  // It belongs on the engine rather than at the call sites because the engine
+  // is the only layer that sees the segment shape a copy actually decomposes
+  // into, which is what decides whether a kernel beats the copy engine.
+  void AddHostGatherRegion(void* base, size_t bytes);
+  void ClearHostGatherRegions();
+
   // Both endpoints addressable in this process, at least one of them GPU.
   bool CanHandle(const TransferRef& src, const TransferRef& dst) const override;
 
@@ -104,6 +123,21 @@ class HbmCopyEngine final : public TransferEngine {
   // worker threads concurrently — cost with no matching win at KV-block sizes,
   // where a multi-MiB copy dwarfs the per-call launch overhead.
   std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan> plans) override;
+
+ private:
+  // Run the gather kernel over the batch's eligible segments, bucketed by
+  // device.  Returns a per-plan flag: 1 means fully copied by the kernel, 0
+  // means "not taken" and never "failed" — Submit then runs its hipMemcpy loop
+  // for it, which reaches the same result whether or not fragments landed.
+  // May leave the current HIP device changed.
+  std::vector<char> GatherEligiblePlans(const std::vector<TransferPlan>& plans);
+
+  // True when [ptr, ptr + size) is inside a completed registration, and so safe
+  // to hand to a kernel.  False is always the safe answer.
+  bool HostRegionCovers(const void* ptr, size_t size) const;
+
+  mutable std::mutex host_regions_mutex_;
+  std::vector<std::unique_ptr<HostTierRegistration>> host_regions_;
 };
 
 }  // namespace mori::umbp

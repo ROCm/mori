@@ -246,6 +246,8 @@ TEST(StandaloneShmIpcTest, StandaloneClientUsesNonZeroOffsetsAndCanReregister) {
   UMBPConfig client_cfg = server_cfg;
   auto client = CreateUMBPClient(client_cfg);
   ASSERT_EQ(client->GetDeploymentMode(), UMBPDeploymentMode::StandaloneProcess);
+  EXPECT_EQ(client->GetBackendMode(), UMBPDeploymentMode::Local);
+  EXPECT_TRUE(client->SupportsRangedIO());
 
   HostMemAllocator allocator;
   HostBufferOptions opts;

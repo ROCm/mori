@@ -307,6 +307,13 @@ struct UMBPDistributedConfig {
 
   size_t staging_buffer_size = 64ULL * 1024 * 1024;  // 64 MB
 
+  // Registered host arena used by ranged multi-buffer I/O. Remote objects are
+  // fetched into disjoint slices here before being installed into the local
+  // medium; ranged puts routed to another node assemble their scattered ranges
+  // into the same arena. Purely a remote-path resource — ranged I/O served by
+  // this node's own medium never touches it.
+  size_t ranged_scratch_size = 256ULL * 1024 * 1024;  // 256 MiB
+
   // Dedicated SSD read staging, allocated only when medium == SSD. Per-slot
   // (this / ssd_staging_buffer_slots) must be >= the largest single-key page KV
   // (61-layer MLA page ~= 4.5 MB).
@@ -447,6 +454,10 @@ struct UMBPConfig {
     }
     if (distributed.has_value()) {
       const auto& d = distributed.value();
+      if (d.ranged_scratch_size == 0) {
+        if (error_message) *error_message = "distributed.ranged_scratch_size must be > 0";
+        return false;
+      }
       if (d.master_config.master_address.empty()) {
         if (error_message)
           *error_message = "distributed.master_config.master_address must not be empty";

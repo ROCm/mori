@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "umbp/distributed/pool_client.h"
+#include "umbp/local/host_mem_allocator.h"
 #include "umbp/umbp_client.h"
 
 namespace mori::umbp {
@@ -78,6 +79,12 @@ class DistributedClient : public IUMBPClient {
   void Close() override;
   bool IsDistributed() const override;
   UMBPDeploymentMode GetDeploymentMode() const override { return UMBPDeploymentMode::Distributed; }
+  // Keyed on the selected medium, not on the mode. Ranged I/O maps object
+  // ranges onto tier pages a backend publishes as in-process endpoints; SSD
+  // publishes storage refs instead, so it is the one medium this cannot serve.
+  // Upstream spells the same rule as `!ssd.enabled` because it predates the
+  // single-medium selector.
+  bool SupportsRangedIO() const override;
 
   bool RegisterMemory(uintptr_t ptr, size_t size,
                       mori::io::MemoryLocationType loc = mori::io::MemoryLocationType::CPU,
@@ -94,6 +101,13 @@ class DistributedClient : public IUMBPClient {
 
  private:
   UMBPConfig config_;
+  // The only buffer this class still allocates. Phase 2b moved medium pools
+  // into the backends, but the ranged scratch arena is not a medium: it is a
+  // client-side staging region for objects fetched from, or assembled for,
+  // another node, so it belongs to whoever owns the PoolClient.
+  void* ranged_scratch_ = nullptr;
+  size_t ranged_scratch_size_ = 0;
+  HostBufferHandle ranged_scratch_handle_;
   std::unique_ptr<PoolClient> pool_client_;
   std::atomic<bool> closing_{false};
   mutable std::shared_mutex op_mutex_;

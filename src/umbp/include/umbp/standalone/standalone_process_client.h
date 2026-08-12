@@ -76,6 +76,8 @@ class StandaloneProcessClient : public IUMBPClient {
   UMBPDeploymentMode GetDeploymentMode() const override {
     return UMBPDeploymentMode::StandaloneProcess;
   }
+  UMBPDeploymentMode GetBackendMode() const override { return backend_mode_; }
+  bool SupportsRangedIO() const override { return supports_ranged_io_; }
 
   bool RegisterMemory(uintptr_t ptr, size_t size,
                       mori::io::MemoryLocationType loc = mori::io::MemoryLocationType::CPU,
@@ -94,7 +96,9 @@ class StandaloneProcessClient : public IUMBPClient {
   // Resolves `ptr` against the registered host regions. On success writes the
   // region-relative `offset` and the matched region's worker VA `region_base`.
   bool OffsetFor(uintptr_t ptr, size_t size, uint64_t* offset, uint64_t* region_base) const;
-  bool WaitReady(int timeout_ms) const;
+  // Not const: a successful Ping is where the server's backend mode and ranged
+  // capability become known, and they are cached on the client.
+  bool WaitReady(int timeout_ms);
   void MaybeAutoStart();
   std::string ClientId();
   void DeregisterMemoryLocked();
@@ -111,6 +115,8 @@ class StandaloneProcessClient : public IUMBPClient {
   mutable std::shared_mutex op_mutex_;
   std::atomic<bool> closing_{false};
   bool closed_ = false;
+  UMBPDeploymentMode backend_mode_ = UMBPDeploymentMode::StandaloneProcess;
+  bool supports_ranged_io_ = false;
 
   enum class RegionKind { kHostShm, kGpuIpc };
 
