@@ -281,8 +281,6 @@ DEFINE_PROXY_ATOMIC_FETCH_THREAD(uint32_t)
 DEFINE_PROXY_ATOMIC_FETCH_THREAD(uint64_t)
 DEFINE_PROXY_ATOMIC_FETCH_THREAD(int32_t)
 DEFINE_PROXY_ATOMIC_FETCH_THREAD(int64_t)
-DEFINE_PROXY_ATOMIC_FETCH_THREAD(long)
-DEFINE_PROXY_ATOMIC_FETCH_THREAD(unsigned long)
 #undef DEFINE_PROXY_ATOMIC_FETCH_THREAD
 
 #define DEFINE_PROXY_ATOMIC_FETCH_WARP(T)                                                      \
@@ -299,8 +297,6 @@ DEFINE_PROXY_ATOMIC_FETCH_WARP(uint32_t)
 DEFINE_PROXY_ATOMIC_FETCH_WARP(uint64_t)
 DEFINE_PROXY_ATOMIC_FETCH_WARP(int32_t)
 DEFINE_PROXY_ATOMIC_FETCH_WARP(int64_t)
-DEFINE_PROXY_ATOMIC_FETCH_WARP(long)
-DEFINE_PROXY_ATOMIC_FETCH_WARP(unsigned long)
 #undef DEFINE_PROXY_ATOMIC_FETCH_WARP
 
 // ---------------------------------------------------------------------------
@@ -335,7 +331,7 @@ inline __device__ void ShmemGetMemNbiBlockKernel<application::TransportType::PRO
 // ---------------------------------------------------------------------------
 template <>
 inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::PROXY>(
-    void* dest, const void* source, size_t bytes, int pe, int qpId) {
+    const void* dest, const void* source, size_t bytes, int pe, int qpId) {
   GpuStates* gs = GetGlobalGpuStatesPtr();
   uintptr_t offset = reinterpret_cast<uintptr_t>(dest) - gs->heapBaseAddr;
   ShmemPutMemNbiThreadKernel<application::TransportType::PROXY>(
@@ -346,13 +342,13 @@ inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::PR
 
 template <>
 inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::PROXY>(
-    void* dest, const void* source, size_t bytes, int pe, int qpId) {
+    const void* dest, const void* source, size_t bytes, int pe, int qpId) {
   ShmemPutMemNbiThreadKernel<application::TransportType::PROXY>(dest, source, bytes, pe, qpId);
 }
 
 template <>
 inline __device__ void ShmemPutMemNbiBlockKernel<application::TransportType::PROXY>(
-    void* dest, const void* source, size_t bytes, int pe, int qpId) {
+    const void* dest, const void* source, size_t bytes, int pe, int qpId) {
   ShmemPutMemNbiThreadKernel<application::TransportType::PROXY>(dest, source, bytes, pe, qpId);
 }
 
@@ -373,7 +369,7 @@ inline __device__ void ShmemPutSizeImmNbiWarpKernel<application::TransportType::
 
 template <>
 inline __device__ void ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::PROXY>(
-    void* dest, void* val, size_t bytes, core::atomicType amoType, int pe, int qpId) {
+    const void* dest, void* val, size_t bytes, core::atomicType amoType, int pe, int qpId) {
   GpuStates* gs = GetGlobalGpuStatesPtr();
   uintptr_t offset = reinterpret_cast<uintptr_t>(dest) - gs->heapBaseAddr;
   ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::PROXY>(
@@ -382,22 +378,22 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernel<application::Transpor
 
 template <>
 inline __device__ void ShmemAtomicSizeNonFetchWarpKernel<application::TransportType::PROXY>(
-    void* dest, void* val, size_t bytes, core::atomicType amoType, int pe, int qpId) {
+    const void* dest, void* val, size_t bytes, core::atomicType amoType, int pe, int qpId) {
   ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::PROXY>(
       dest, val, bytes, amoType, pe, qpId);
 }
 
 template <>
 inline __device__ void ShmemGetMemNbiThreadKernel<application::TransportType::PROXY>(
-    void* dest, const void* source, size_t bytes, int pe, int qpId) {
-  assert(false);
-}
+    void* dest, const void* source, size_t bytes, int pe, int qpId) { assert(false); }
 
 template <>
 inline __device__ void ShmemGetMemNbiWarpKernel<application::TransportType::PROXY>(
-    void* dest, const void* source, size_t bytes, int pe, int qpId) {
-  assert(false);
-}
+    void* dest, const void* source, size_t bytes, int pe, int qpId) { assert(false); }
+
+template <>
+inline __device__ void ShmemGetMemNbiBlockKernel<application::TransportType::PROXY>(
+    void* dest, const void* source, size_t bytes, int pe, int qpId) { assert(false); }
 
 template <>
 inline __device__ void ShmemGetMemNbiBlockKernel<application::TransportType::PROXY>(
