@@ -19,8 +19,6 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "device_gather.h"
-
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -32,6 +30,7 @@
 #include <string>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/device_gather.h"
 
 namespace mori::umbp {
 namespace {
@@ -159,9 +158,9 @@ bool LaunchDeviceGather(const DeviceGatherFragment* fragments, size_t count, int
   if (staging == nullptr) return false;
 
   std::memcpy(staging->host, fragments, count * sizeof(DeviceGatherFragment));
-  hipError_t status = hipMemcpyAsync(staging->device, staging->host,
-                                     count * sizeof(DeviceGatherFragment), hipMemcpyHostToDevice,
-                                     stream);
+  hipError_t status =
+      hipMemcpyAsync(staging->device, staging->host, count * sizeof(DeviceGatherFragment),
+                     hipMemcpyHostToDevice, stream);
   if (status != hipSuccess) {
     MORI_UMBP_ERROR("[DRAMTier] gather descriptor upload failed on device {}: {}", device_id,
                     hipGetErrorString(status));
