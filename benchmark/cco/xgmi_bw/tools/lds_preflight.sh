@@ -14,12 +14,30 @@
 set -uo pipefail
 
 # Defaults are the ones compiled into ualoe_bw.cpp; override to match the GRID the sweep is built with.
-RTD0N="${RTD0N:-256}"; RTD1N="${RTD1N:-8}"; RPIPEN="${RPIPEN:-4}"
-LDSPART="${LDSPART:-16384}"; MWSSPAN="${MWSSPAN:-8192}"
-MWSPIPE="${MWSPIPE:-1}"; MWSISS="${MWSISS:-8}"
-TWTH="${TWTH:-256}"; WARP="${WARP:-32}"      # gfx1250 is wave32
+D_RTD0N=256; D_RTD1N=8; D_RPIPEN=4; D_LDSPART=16384
+D_MWSSPAN=8192; D_MWSPIPE=1; D_MWSISS=8; D_TWTH=256
+
+RTD0N="${RTD0N:-$D_RTD0N}"; RTD1N="${RTD1N:-$D_RTD1N}"; RPIPEN="${RPIPEN:-$D_RPIPEN}"
+LDSPART="${LDSPART:-$D_LDSPART}"; MWSSPAN="${MWSSPAN:-$D_MWSSPAN}"
+MWSPIPE="${MWSPIPE:-$D_MWSPIPE}"; MWSISS="${MWSISS:-$D_MWSISS}"
+TWTH="${TWTH:-$D_TWTH}"; WARP="${WARP:-32}"  # gfx1250 is wave32
 TDM_NBUF="${TDM_NBUF:-2}"
 LIMIT="${LIMIT:-327680}"                     # 320 KB per CU
+
+# The values above are a second copy of numbers that live in the source, which is how a preflight ends
+# up certifying a build that does not exist. Compare them against the source and say so on a mismatch.
+# A read that finds nothing is ignored rather than fatal: this check must not be able to block a sweep
+# because the file was reformatted.
+SRC="$(dirname "$0")/../ualoe_bw.cpp"
+if [ -r "$SRC" ]; then
+  for m in RTD0N RTD1N RPIPEN LDSPART MWSSPAN MWSPIPE MWSISS TWTH; do
+    dv="D_$m"
+    sv=$(sed -n "s/^#define $m[[:space:]]\{1,\}\([0-9]\{1,\}\)[[:space:]]*\$/\1/p" "$SRC" | head -1)
+    if [ -n "$sv" ] && [ "$sv" != "${!dv}" ]; then
+      echo "[WARN] $m: preflight assumes ${!dv}, ualoe_bw.cpp compiles $sv -- fix tools/lds_preflight.sh"
+    fi
+  done
+fi
 
 TILE=$((RTD0N*RTD1N*4))
 MW_SPAN=$(( LDSPART > RPIPEN*TILE ? LDSPART : RPIPEN*TILE ))

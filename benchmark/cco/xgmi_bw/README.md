@@ -207,6 +207,9 @@ bash tools/blksweep.sh
 bash tools/uamatrix.sh
 ```
 
+With no arguments the matrix is 1KB doubling to 8GB against 1..512 blocks, 240 cells, roughly 15
+minutes.
+
 Both refuse to start if a previous run is still alive or if the LDS preflight fails. Knobs:
 `GRID`, `BASEX`, `GPUA`/`GPUB` or `GSRC`/`GDST`, `ARCH`; plus `ROUNDS`/`BLKS` for the block sweep and
 `CUS`/`SZS`/`CUMUL`/`TDMMUL`/`BUDGET`/`MAXB` for the matrix. `PREFLIGHT_ONLY=1` stops after the check.
@@ -216,21 +219,31 @@ Both refuse to start if a previous run is still alive or if the LDS preflight fa
 pointed at `tdmmws` (`MATRIX_TDMKIND=9`) and its tile sized per cell (`MATRIX_DYNTILE=1`). That is 64 KB
 per block per round and 64 KB of LDS per block. `MXCFG` prints all of it at the top of a run.
 
+The matrix axis is also 1:1 by default (`CUMUL=1 TDMMUL=1`), so a column headed 64 launched 64 blocks.
+It is a grid width either way, not a CU count: 512 is two blocks per CU on a 256-CU device.
+
 `MWSSPAN` is the per-issuing-wave span; `LDSPART` sizes a different kernel's partition and stays at
 16384, or the preflight refuses the build.
+
+Geometry defaults (`BLKMUL`, `WTH`, `TWBLK`, `TWTH`, `RTD0N`, `RTD1N`, `RPIPEN`) live in `ualoe_bw.cpp`
+alone. The sweeps used to carry a second copy in `GRID`, which quietly made a CMake build and a script
+build two different programs; `GRID` is now empty unless you override something. `tools/lds_preflight.sh`
+still needs its own copy to do arithmetic before anything is compiled, so it greps the source and warns
+if the two have drifted.
 
 The single-issuer fixed-tile configuration the older tables were taken with has to be asked for now:
 
 ```bash
-GRID="-DBLKMUL=64 -DWTH=512 -DTWBLK=32 -DTWTH=256 -DRTD0N=256 -DRTD1N=8 -DRPIPEN=4 \
-      -DMWSPIPE=2 -DMWSISS=2 -DMWSSPAN=16384 -DLDSPART=16384" \
-TDMKIND=1 DYNTILE=0 bash tools/uamatrix.sh
+GRID="-DMWSPIPE=2 -DMWSISS=2 -DMWSSPAN=16384" \
+TDMKIND=1 DYNTILE=0 CUMUL=64 TDMMUL=32 CUS="1,2,4,8,16,32,64,128,256" \
+bash tools/uamatrix.sh
 ```
 
 Which tables need it: everything in `results/` except the `tile256x8_pipe1_iss8*` rows of
 `tilegeom_gfx1250.csv`. The block sweep and matrix sections at the top of this file are single-issuer
 measurements, and re-running them on the current defaults will read higher at narrow grids rather than
-reproducing them.
+reproducing them. The block sweep drives its own grid widths, so for it only the `GRID`, `TDMKIND` and
+`DYNTILE` part applies.
 
 To build by hand (also 8 issuers, since that is now the file's default):
 

@@ -236,8 +236,11 @@ static constexpr uint32_t DESC_G1W0=((TDM_DSZ&0x3u)<<16)|((DESC_WGM)&0xFFFFu)
 #ifndef RTD1N
 #define RTD1N 8
 #endif
+// Tiles the single-issuer staged kernel keeps in flight per round. 4 is what every sweep and every
+// recorded table was built with; it used to live only in the scripts' GRID string, which meant a build
+// that did not go through them ran a different kernel than the one the tables describe.
 #ifndef RPIPEN
-#define RPIPEN 2
+#define RPIPEN 4
 #endif
 static const uint32_t RTD0=RTD0N, RTD1=RTD1N; static const int RPIPE=RPIPEN;
 // How many tensor stores may stay in flight across the loop boundary. The operand of s_wait_tensorcnt
@@ -662,14 +665,18 @@ int main(int argc,char**argv){
         ad.location.id=list[i]; HIPCHECK(hipMemSetAccess(R[i],psz[i],&ad,1));
     }
 
+// Blocks per CU each transport launches when neither sweep is driving the grid width. Both sweeps
+// override these -- the matrix from CUMUL/TDMMUL, the block sweep from its own list -- so these only
+// decide the plain run and the full-grid reference row the block sweep prints. 64 and 32 are what the
+// scripts have always passed; they live here now so a build outside the scripts matches.
 #ifndef BLKMUL
-#define BLKMUL 16
+#define BLKMUL 64
 #endif
 #ifndef WTH
 #define WTH 512
 #endif
 #ifndef TWBLK
-#define TWBLK 8
+#define TWBLK 32
 #endif
 #ifndef TWTH
 #define TWTH 256

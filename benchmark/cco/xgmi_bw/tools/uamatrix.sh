@@ -4,20 +4,23 @@
 # each transport need"; this one answers the same question at every transfer size, which is what
 # decides whether a given message is large enough for TDM to be worth using at all.
 #
-# The CU axis is a grid width, not a physical CU count: the sweep launches CUMUL blocks per unit on
-# the CU side and TDMMUL on the TDM side, so the two sides are deliberately not the same amount of
-# hardware. CUMUL=64 / TDMMUL=32 reproduces the recorded tables. Set MATRIX_CUMASK=1 to turn the axis
-# into an actual CU count instead.
+# The axis is a grid width, not a physical CU count. CUMUL and TDMMUL are how many blocks each unit of
+# the axis launches on the CU and TDM sides; at 1 and 1 the axis is the block count itself, which is
+# what the column headings then mean. The recorded tables that predate this default were taken at
+# CUMUL=64 / TDMMUL=32 and need those spelled out. Set MATRIX_CUMASK=1 to turn the axis into an actual
+# CU count instead.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-GRID="$(printf '%s' "${GRID:--DBLKMUL=64+-DWTH=512+-DTWBLK=32+-DTWTH=256+-DRTD0N=256+-DRTD1N=8+-DRPIPEN=4}" | tr '+' ' ')"
+# Geometry defaults live in ualoe_bw.cpp, not here: two copies of them meant a build through CMake and
+# a build through this script were different programs. Pass GRID only to override.
+GRID="$(printf '%s' "${GRID:-}" | tr '+' ' ')"
 BASEX="${BASEX:--DSWEEP_MATRIX -DONLY_1WAY}"
-CUS="${CUS:-1,2,4,8,16,32,64,128,256}"
+CUS="${CUS:-1,2,4,8,16,32,64,128,256,512}"
 SZS="${SZS:-}"                      # empty => 1KB doubling up to the allocation
 BUDGET="${BUDGET:-34359738368}"     # bytes moved per cell; iteration count follows from it
 MINIT="${MINIT:-5}"; MAXIT="${MAXIT:-200}"
-CUMUL="${CUMUL:-64}"; TDMMUL="${TDMMUL:-32}"
+CUMUL="${CUMUL:-1}"; TDMMUL="${TDMMUL:-1}"
 MAXB="${MAXB:-8589934592}"          # allocation = largest cell the sweep may ask for
 GSRC="${GSRC:-0}"; GDST="${GDST:-1}"
 PORT="${PORT:-55643}"
@@ -33,6 +36,8 @@ if ps -eo stat=,args= | grep -Eq '^[^Z].*(ualoe_b[w]|um[x])'; then
 fi
 # The matrix runs the same kernels as the block sweep, so it is gated on the same preflight. Its
 # partition-stride half is silent at launch; skipping it is how a node gets wedged.
+# Anything GRID overrides is handed to the preflight so it checks the build being made; with GRID empty
+# the preflight falls back on the source's own defaults, which it cross-checks itself.
 GRID_ENV=$(printf '%s\n' $GRID | sed -n 's/^-D\([A-Z0-9_]*\)=\(.*\)$/\1=\2/p' | tr '\n' ' ')
 env $GRID_ENV bash tools/lds_preflight.sh || { echo "REFUSING: LDS preflight failed"; exit 1; }
 [ -n "${PREFLIGHT_ONLY:-}" ] && { echo "PREFLIGHT_ONLY set, not running"; exit 0; }

@@ -16,7 +16,8 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-GRID="$(printf '%s' "${GRID:--DBLKMUL=64+-DWTH=512+-DTWBLK=32+-DTWTH=256+-DRTD0N=256+-DRTD1N=8+-DRPIPEN=4}" | tr '+' ' ')"
+# Geometry defaults live in ualoe_bw.cpp, not here. Pass GRID only to override.
+GRID="$(printf '%s' "${GRID:-}" | tr '+' ' ')"
 BASEX="${BASEX:--DSWEEP_16 -DONLY_1WAY -DBLKONLY -DNOVERIFY -DLOOP=10 -DWARMUP=3}"
 ROUNDS="${ROUNDS:-2}"
 BLKS="${BLKS:-16,32,64,128,256,512,1024,2048,4096,8192,16384}"
@@ -35,8 +36,8 @@ if ps -eo stat=,args= | grep -Eq '^[^Z].*(ualoe_b[w]|ub[k])'; then
   echo "REFUSING: a previous ualoe/ubk process is still alive"; exit 1
 fi
 # The partition-stride half of this check is silent at launch; skipping it is how a node gets wedged.
-# The -D flags are the single source of truth for the geometry, so the preflight is fed from them
-# rather than from a second copy of the same constants that could drift out of sync.
+# Anything GRID overrides is handed to the preflight so it checks the build being made; with GRID empty
+# the preflight falls back on the source's own defaults, which it cross-checks itself.
 GRID_ENV=$(printf '%s\n' $GRID | sed -n 's/^-D\([A-Z0-9_]*\)=\(.*\)$/\1=\2/p' | tr '\n' ' ')
 env $GRID_ENV bash tools/lds_preflight.sh || { echo "REFUSING: LDS preflight failed"; exit 1; }
 [ -n "${PREFLIGHT_ONLY:-}" ] && { echo "PREFLIGHT_ONLY set, not running"; exit 0; }
