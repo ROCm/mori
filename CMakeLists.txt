@@ -37,7 +37,6 @@ option(WITH_MPI
        ${_with_mpi_default})
 option(BUILD_APPLICATION "Whether to build application library" ON)
 option(BUILD_SHMEM "Whether to build shmem library" ON)
-option(BUILD_TORCH_SYMM "Whether to build the torch SymmetricMemory backend (links libtorch)" OFF)
 option(BUILD_CCO "Whether to build cco library" ON)
 
 if(BUILD_BENCHMARK)
@@ -268,19 +267,6 @@ if(BUILD_SHMEM)
   add_subdirectory(src/shmem)
 endif()
 
-if(BUILD_TORCH_SYMM)
-  # symm_backend.cpp is a python extension module, so it needs the interpreter and
-  # headers that src/pybind also resolves.
-  if(NOT DEFINED PYTHON_EXECUTABLE)
-    execute_process(
-      COMMAND python3 -c "import sys; print(sys.executable)"
-      OUTPUT_VARIABLE PYTHON_EXECUTABLE
-      OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-  endif()
-  set(Python_EXECUTABLE ${PYTHON_EXECUTABLE})
-  find_package(Python REQUIRED COMPONENTS Interpreter Development)
-  add_subdirectory(src/allocator)
-endif()
 
 if(BUILD_CCO)
   add_subdirectory(src/cco)

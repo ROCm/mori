@@ -64,12 +64,19 @@ _atexit_registered = False
 
 
 def _ext():
+    # torch must be imported first: the extension links libtorch, and nothing on its
+    # RUNPATH resolves those, so they have to already be in the process.
+    try:
+        import torch  # noqa: F401
+    except ImportError as exc:
+        raise ImportError("mori.allocator requires torch") from exc
     try:
         from .. import mori_torch_symm
     except ImportError as exc:  # pragma: no cover - depends on build flags
         raise ImportError(
-            "mori_torch_symm extension not found. Rebuild mori with BUILD_TORCH_SYMM=ON "
-            "(requires torch at build time)."
+            "mori_torch_symm extension not found. It is built by torch's cpp_extension, "
+            "so torch must be installed when mori is built; reinstall mori with torch "
+            f"present. ({exc})"
         ) from exc
     return mori_torch_symm
 

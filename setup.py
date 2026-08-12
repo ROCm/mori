@@ -30,6 +30,18 @@ from setuptools.command.build import build as _build
 from setuptools.command.build_ext import build_ext
 
 try:
+    from torch.utils.cpp_extension import BuildExtension as _TorchBuildExtension
+    from torch.utils.cpp_extension import CppExtension as _TorchCppExtension
+except ImportError:  # torch is optional at build time
+    _TorchBuildExtension = None
+    _TorchCppExtension = None
+
+# Torch-linked extensions must be built by torch's own build_ext: it derives
+# _GLIBCXX_USE_CXX11_ABI, torch's bundled pybind11 and the Python ABI tag from the
+# installed torch, none of which CMake would get right on its own.
+_ExtBuildBase = _TorchBuildExtension if _TorchBuildExtension is not None else build_ext
+
+try:
     from Cython.Build import cythonize as _cythonize
 
     _HAVE_CYTHON = True
@@ -439,7 +451,7 @@ def _setup_spdk(root_dir: Path) -> None:
     )
 
 
-class CMakeBuild(build_ext):
+class CMakeBuild(_ExtBuildBase):
     def run(self) -> None:
         try:
             subprocess.check_output(["cmake", "--version"])
@@ -455,45 +467,63 @@ class CMakeBuild(build_ext):
         if mpi_enabled:
             _REQUIRED_SYSTEM_DEPS.extend(_MPI_SYSTEM_DEPS)
         _check_system_deps()
+        torch_exts = [
+            e for e in self.extensions if getattr(e, "_mori_torch_ext", False)
+        ]
         for ext in self.extensions:
-            self.build_extension(ext)
+            if ext not in torch_exts:
+                self.build_extension(ext)
+        if torch_exts:
+            # BuildExtension.build_extensions() patches the compiler and injects torch's
+            # flags, then loops back into our build_extension() for the actual compile.
+            self._ensure_compiler()
+            saved, self.extensions = self.extensions, torch_exts
+            try:
+                super().build_extensions()
+            finally:
+                self.extensions = saved
+
+    def _ensure_compiler(self) -> None:
+        """Set up self.compiler if nothing has yet. build_ext.run() normally does
+        this, but run() below drives the extensions itself."""
+        if self.compiler is None:
+            self.ensure_finalized()
+            from setuptools._distutils.ccompiler import new_compiler
+            from setuptools._distutils.sysconfig import customize_compiler
+
+            try:
+                # distutils / older setuptools signature
+                self.compiler = new_compiler(
+                    verbose=self.verbose,
+                    dry_run=self.dry_run,
+                    force=self.force,
+                )
+            except TypeError:
+                # setuptools >= ~80 dropped verbose/dry_run/force kwargs
+                self.compiler = new_compiler()
+                for _attr in ("verbose", "dry_run", "force"):
+                    setattr(self.compiler, _attr, getattr(self, _attr))
+            customize_compiler(self.compiler)
+            if self.include_dirs is not None:
+                self.compiler.set_include_dirs(self.include_dirs)
+            if self.define is not None:
+                for name, value in self.define:
+                    self.compiler.define_macro(name, value)
+            if self.undef is not None:
+                for name in self.undef:
+                    self.compiler.undefine_macro(name)
+            if self.libraries is not None:
+                self.compiler.set_libraries(self.libraries)
+            if self.library_dirs is not None:
+                self.compiler.set_library_dirs(self.library_dirs)
+            if self.rpath is not None:
+                self.compiler.set_runtime_library_dirs(self.rpath)
+            if self.link_objects is not None:
+                self.compiler.set_link_objects(self.link_objects)
 
     def build_extension(self, ext: Extension) -> None:
         if ext.sources and any(s.endswith((".pyx", ".cpp")) for s in ext.sources):
-            if self.compiler is None:
-                self.ensure_finalized()
-                from setuptools._distutils.ccompiler import new_compiler
-                from setuptools._distutils.sysconfig import customize_compiler
-
-                try:
-                    # distutils / older setuptools signature
-                    self.compiler = new_compiler(
-                        verbose=self.verbose,
-                        dry_run=self.dry_run,
-                        force=self.force,
-                    )
-                except TypeError:
-                    # setuptools >= ~80 dropped verbose/dry_run/force kwargs
-                    self.compiler = new_compiler()
-                    for _attr in ("verbose", "dry_run", "force"):
-                        setattr(self.compiler, _attr, getattr(self, _attr))
-                customize_compiler(self.compiler)
-                if self.include_dirs is not None:
-                    self.compiler.set_include_dirs(self.include_dirs)
-                if self.define is not None:
-                    for name, value in self.define:
-                        self.compiler.define_macro(name, value)
-                if self.undef is not None:
-                    for name in self.undef:
-                        self.compiler.undefine_macro(name)
-                if self.libraries is not None:
-                    self.compiler.set_libraries(self.libraries)
-                if self.library_dirs is not None:
-                    self.compiler.set_library_dirs(self.library_dirs)
-                if self.rpath is not None:
-                    self.compiler.set_runtime_library_dirs(self.rpath)
-                if self.link_objects is not None:
-                    self.compiler.set_link_objects(self.link_objects)
+            self._ensure_compiler()
             super().build_extension(ext)
             return
 
@@ -542,17 +572,6 @@ class CMakeBuild(build_ext):
         build_benchmark = os.environ.get("BUILD_BENCHMARK", "OFF")
         build_tests = os.environ.get("BUILD_TESTS", "OFF")
         build_umbp = "ON" if build_umbp_enabled else "OFF"
-        # The SymmetricMemory backend links libtorch, so only build it when torch is
-        # importable. BUILD_TORCH_SYMM=OFF disables it explicitly.
-        if "BUILD_TORCH_SYMM" in os.environ:
-            build_torch_symm = "ON" if _env_flag("BUILD_TORCH_SYMM", "OFF") else "OFF"
-        else:
-            try:
-                import torch  # noqa: F401
-
-                build_torch_symm = "ON"
-            except ImportError:
-                build_torch_symm = "OFF"
         build_umbp_spdk = "ON" if build_umbp_spdk_enabled else "OFF"
         use_redis_backend = os.environ.get("USE_REDIS_BACKEND", "OFF")
         build_xla_ffi_ops = os.environ.get("BUILD_XLA_FFI_OPS", "OFF")
@@ -599,7 +618,6 @@ class CMakeBuild(build_ext):
             f"-DUSE_SPDK={build_umbp_spdk}",
             f"-DWITH_MPI={with_mpi}",
             "-DBUILD_TORCH_BOOTSTRAP=OFF",
-            f"-DBUILD_TORCH_SYMM={build_torch_symm}",
             f"-DBUILD_XLA_FFI_OPS={build_xla_ffi_ops}",
             f"-DBUILD_OPS_DEVICE={build_ops_device}",
             f"-DBUILD_CCO_SDMA={BUILD_CCO_SDMA}",
@@ -666,12 +684,6 @@ class CMakeBuild(build_ext):
                 root_dir / "python/mori/libmori_metrics.so",
             ),
         ]
-        symm_backend_so = build_dir / "src/allocator/mori_torch_symm.so"
-        if symm_backend_so.exists():
-            files_to_copy.append(
-                (symm_backend_so, root_dir / "python/mori/mori_torch_symm.so")
-            )
-
         collective_so = build_dir / "src/collective/libmori_collective.so"
         if collective_so.exists():
             files_to_copy.append(
@@ -860,14 +872,37 @@ def _cco_extension() -> list:
     )
 
 
-extensions = [
-    Extension(
-        "mori",
-        sources=[],
-        # extra_compile_args=['-ggdb', '-O0'],
-        # extra_link_args=['-g'],
-    ),
-] + _cco_extension()
+def _torch_symm_extension():
+    """SymmetricMemory backend. Built by torch's cpp_extension, not CMake: it is the
+    only target that links libtorch, and torch's build_ext is what keeps the ABI flag,
+    pybind11 copy and module suffix consistent with the installed torch."""
+    if _TorchCppExtension is None:
+        return []
+    rocm = os.environ.get("ROCM_PATH", "/opt/rocm")
+    ext = _TorchCppExtension(
+        name="mori.mori_torch_symm",
+        sources=["src/allocator/symm_backend.cpp"],
+        include_dirs=[str(_root_dir / "include"), f"{rocm}/include"],
+        library_dirs=[f"{rocm}/lib"],
+        libraries=["amdhip64", "c10_hip", "torch_hip"],
+        extra_compile_args=["-std=c++17"],
+    )
+    ext._mori_torch_ext = True
+    return [ext]
+
+
+extensions = (
+    [
+        Extension(
+            "mori",
+            sources=[],
+            # extra_compile_args=['-ggdb', '-O0'],
+            # extra_link_args=['-g'],
+        ),
+    ]
+    + _cco_extension()
+    + _torch_symm_extension()
+)
 
 mori_package_data = [
     "libmori_cco.so",
@@ -878,7 +913,6 @@ mori_package_data = [
     "libmori_application.so",
     "libmori_metrics.so",
     "libmori_collective.so",  # optional: only present when BUILD_COLLECTIVE=ON
-    "mori_torch_symm.so",  # optional: only present when BUILD_TORCH_SYMM=ON
     "umbp_master",
     "umbp_standalone_server",
     "_jit-sources/include/**/*.hpp",
