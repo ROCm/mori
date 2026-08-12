@@ -68,7 +68,6 @@ __device__ __attribute__((visibility("default"), weak)) GpuStates globalGpuState
 namespace mori {
 namespace shmem {
 __device__ __attribute__((visibility("default"), weak)) ProxyGpuState globalProxyState;
-static __device__ ProxyGpuState* GetGlobalProxyStatePtr() { return &globalProxyState; }
 #endif
 
 namespace _static_init {
