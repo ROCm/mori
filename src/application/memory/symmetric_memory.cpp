@@ -200,7 +200,10 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
       break;
     }
   }
-  if (rdmaDeviceContext && anyRdmaPeer) {
+  bool useProxy = (std::getenv("MORI_EP_OVER_RDMA") && std::string(std::getenv("MORI_EP_OVER_RDMA")) == "1") ||
+                  (std::getenv("MORI_USE_IBGDA_PROXY") && std::string(std::getenv("MORI_USE_IBGDA_PROXY")) == "1");
+
+  if (useProxy && rdmaDeviceContext && anyRdmaPeer) {
     if (heap_begin) {
       application::RdmaMemoryRegion mr =
           rdmaDeviceContext->RegisterRdmaMemoryRegionAuto(localPtr, size);
@@ -214,29 +217,33 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
       memcpy(cpuMemObj->peerRkeys, heapRkeys_.data(), worldSize * sizeof(uint32_t));
     }
   } else {
+    // Original path: register MR and Allgather rkeys
+    if (rdmaDeviceContext && anyRdmaPeer && rdmaRegister) {
+      application::RdmaMemoryRegion mr =
+          rdmaDeviceContext->RegisterRdmaMemoryRegionAuto(localPtr, size);
+      cpuMemObj->lkey = mr.lkey;
+      cpuMemObj->peerRkeys[rank] = mr.rkey;
+    }
     bootNet.Allgather(&cpuMemObj->peerRkeys[rank], cpuMemObj->peerRkeys, sizeof(uint32_t));
   }
 
-  // Per-NIC MR registration for send-side routing (proxy mode).
-  // Register the buffer on each NIC's PD and exchange rkeys.
-  const auto& allCtxs = context.GetAllRdmaDeviceContexts();
-  int numNics = static_cast<int>(allCtxs.size());
-  // Per-NIC MR registration only for the heap (heap_begin=true).
-  // Sub-allocations within the heap share the heap's MR — re-registering
-  // them wastes time (8 barriers × 8 Allgathers per call) and overwrites
-  // the heap's perNicLkeys/perNicPeerRkeys with sub-allocation keys.
-  if (numNics > 1 && anyRdmaPeer && heap_begin) {
-    perNicLkeys.resize(numNics, 0);
-    perNicPeerRkeys.resize(numNics);
-    for (int n = 0; n < numNics; n++) {
-      bootNet.Barrier();
-      perNicPeerRkeys[n].resize(worldSize, 0);
-      if (allCtxs[n]) {
-        auto mr = allCtxs[n]->RegisterRdmaMemoryRegionAuto(localPtr, size);
-        perNicLkeys[n] = mr.lkey;
-        perNicPeerRkeys[n][rank] = mr.rkey;
+  // Per-NIC MR registration for proxy mode only.
+  if (useProxy) {
+    const auto& allCtxs = context.GetAllRdmaDeviceContexts();
+    int numNics = static_cast<int>(allCtxs.size());
+    if (numNics > 1 && anyRdmaPeer && heap_begin) {
+      perNicLkeys.resize(numNics, 0);
+      perNicPeerRkeys.resize(numNics);
+      for (int n = 0; n < numNics; n++) {
+        bootNet.Barrier();
+        perNicPeerRkeys[n].resize(worldSize, 0);
+        if (allCtxs[n]) {
+          auto mr = allCtxs[n]->RegisterRdmaMemoryRegionAuto(localPtr, size);
+          perNicLkeys[n] = mr.lkey;
+          perNicPeerRkeys[n][rank] = mr.rkey;
+        }
+        bootNet.Allgather(&perNicPeerRkeys[n][rank], perNicPeerRkeys[n].data(), sizeof(uint32_t));
       }
-      bootNet.Allgather(&perNicPeerRkeys[n][rank], perNicPeerRkeys[n].data(), sizeof(uint32_t));
     }
   }
 
