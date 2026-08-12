@@ -33,7 +33,7 @@ recv = symm_mem.empty(world * elems, dtype=torch.int32, device=device)
 hdl  = symm_mem.rendezvous(recv, group_name)
 base, stride = flat_layout(recv)
 
-all2all_kernel.all2all_push(send, base, stride, chunk_bytes, rank, world)
+all2all_kernel.all2all_push(send, base, stride, chunk_bytes, rank_id, world_size)
 ```
 
 ## Measured
