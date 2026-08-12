@@ -423,7 +423,7 @@ void Context::BuildAndConnectInitialEndpoints() {
   int totalEps = WorldSize() * numQpPerPe;
   std::vector<RdmaEndpointHandle> localToPeerEpHandles(totalEps);
   std::vector<RdmaEndpointHandle> peerToLocalEpHandles(totalEps);
-  for (int i = 0; i < (int)rdmaEps.size(); i++) {
+  for (int i = 0; i < rdmaEps.size(); i++) {
     localToPeerEpHandles[i] = rdmaEps[i].handle;
   }
   bootNet.AllToAll(localToPeerEpHandles.data(), peerToLocalEpHandles.data(),
