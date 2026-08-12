@@ -64,7 +64,8 @@ namespace shmem {
   } else if (transportType == application::TransportType::SDMA) {                 \
     func<application::TransportType::SDMA>(__VA_ARGS__);                          \
   }                                                                               \
-  _PROXY_ELSE(func, __VA_ARGS__)
+  _PROXY_ELSE(func, __VA_ARGS__)                                                  \
+  else { assert(false); }
 
 #define DISPATCH_TRANSPORT_TYPE_WITH_BOOL(func, boolParam, pe, ...)               \
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();                           \
@@ -74,7 +75,8 @@ namespace shmem {
   } else if (transportType == application::TransportType::P2P) {                  \
     func<application::TransportType::P2P, boolParam>(__VA_ARGS__);                \
   }                                                                               \
-  _PROXY_ELSE_BOOL(func, boolParam, __VA_ARGS__)
+  _PROXY_ELSE_BOOL(func, boolParam, __VA_ARGS__)                                  \
+  else { assert(false); }
 
 #define DISPATCH_TRANSPORT_DATA_TYPE_WITH_RETURN(func, pe, type, ...)               \
   [&]() {                                                                           \
