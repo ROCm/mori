@@ -634,6 +634,8 @@ void GpuStateInit(ShmemStates* states) {
 
   }
 
+  fprintf(stderr, "[MoRI-DBG] proxy rings setup done, rank=%d\n", states->gpuStates.rank);
+
   // Copy communication metadata to GPU — override RDMA → PROXY when proxy active
   if (states->rdmaStates->commContext->IsProxyEnabled()) {
     int worldSize = states->bootStates->worldSize;
@@ -663,6 +665,7 @@ void GpuStateInit(ShmemStates* states) {
 
   // Copy complete state to device
   CopyGpuStatesToDevice(states);
+  fprintf(stderr, "[MoRI-DBG] CopyGpuStatesToDevice done, rank=%d\n", states->gpuStates.rank);
 }
 
 /* ---------------------------------------------------------------------------------------------- */

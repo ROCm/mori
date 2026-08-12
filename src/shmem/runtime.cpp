@@ -123,6 +123,9 @@ void CopyGpuStatesToDevice(ShmemStates* states) {
       if (err == hipSuccess && deviceProxyPtr != nullptr) {
         HIP_RUNTIME_CHECK(
             hipMemcpy(deviceProxyPtr, proxyStates, sizeof(ProxyGpuStates), hipMemcpyHostToDevice));
+        fprintf(stderr, "[MoRI-DBG] CopyGpuStates: proxy state copied to device (%zu bytes)\n", sizeof(ProxyGpuStates));
+      } else {
+        fprintf(stderr, "[MoRI-DBG] CopyGpuStates: proxy symbol NOT FOUND (err=%d)\n", err);
       }
     }
   }
@@ -178,9 +181,13 @@ int ShmemModuleInit(void* hipModule) {
     if (perr == hipSuccess && moduleProxyAddr != nullptr) {
       HIP_RUNTIME_CHECK(hipMemcpy(moduleProxyAddr, &states->proxyGpuStates,
                                   sizeof(ProxyGpuStates), hipMemcpyHostToDevice));
+      fprintf(stderr, "[MoRI-DBG] ShmemModuleInit: proxy state copied to module (%zu bytes)\n", sizeof(ProxyGpuStates));
+    } else {
+      fprintf(stderr, "[MoRI-DBG] ShmemModuleInit: proxy symbol NOT FOUND (err=%d)\n", perr);
     }
   }
 
+  fprintf(stderr, "[MoRI-DBG] ShmemModuleInit done, rank=%d\n", states->gpuStates.rank);
   return 0;
 }
 
