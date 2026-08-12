@@ -46,19 +46,19 @@ namespace {
 constexpr int kThreads = 256;
 
 // Grid is 2-D over (peer, slice of chunk): blocks_per_peer blocks cooperate on each
-// destination. One block per peer would leave all but `world` CUs idle and, on a remote
+// destination. One block per peer would leave all but `world_size` CUs idle and, on a remote
 // write, cannot keep enough requests in flight to cover interconnect latency.
 __global__ void All2AllPush(const uint4* __restrict__ send, char* __restrict__ flat_base,
-                            size_t stride, size_t chunk_bytes, int rank, int world,
+                            size_t stride, size_t chunk_bytes, int rank_id, int world_size,
                             int blocks_per_peer) {
   const size_t n_vec = chunk_bytes / sizeof(uint4);
   const int peer = blockIdx.x / blocks_per_peer;
   const int sub = blockIdx.x % blocks_per_peer;
-  if (peer >= world) return;
+  if (peer >= world_size) return;
 
   // Our chunk destined for `peer` goes into peer's window, in the slot reserved for us.
   auto* dst = reinterpret_cast<uint4*>(flat_base + static_cast<size_t>(peer) * stride +
-                                       static_cast<size_t>(rank) * chunk_bytes);
+                                       static_cast<size_t>(rank_id) * chunk_bytes);
   const uint4* src = send + static_cast<size_t>(peer) * n_vec;
 
   const size_t span = static_cast<size_t>(blocks_per_peer) * blockDim.x;
@@ -69,15 +69,16 @@ __global__ void All2AllPush(const uint4* __restrict__ send, char* __restrict__ f
 
 }  // namespace
 
-// send: local, world*chunk_bytes. flat_base/stride come from mori.allocator.flat_layout()
+// send: local, world_size*chunk_bytes. flat_base/stride come from mori.allocator.flat_layout()
 // on the rendezvous'd receive tensor. Caller barriers afterwards.
 void all2all_push(const at::Tensor& send, int64_t flat_base, int64_t stride, int64_t chunk_bytes,
-                  int64_t rank, int64_t world) {
+                  int64_t rank_id, int64_t world_size) {
   TORCH_CHECK(send.is_contiguous(), "send must be contiguous");
   TORCH_CHECK(chunk_bytes % sizeof(uint4) == 0, "chunk_bytes must be a multiple of 16, got ",
               chunk_bytes);
-  TORCH_CHECK(send.nbytes() == static_cast<size_t>(world * chunk_bytes), "send holds ",
-              send.nbytes(), " bytes, expected world*chunk_bytes = ", world * chunk_bytes);
+  TORCH_CHECK(send.nbytes() == static_cast<size_t>(world_size * chunk_bytes), "send holds ",
+              send.nbytes(),
+              " bytes, expected world_size*chunk_bytes = ", world_size * chunk_bytes);
 
   // Spread over the device: aim for a couple of blocks per CU, split evenly across peers,
   // but never more slices than there is data for.
@@ -88,15 +89,15 @@ void all2all_push(const at::Tensor& send, int64_t flat_base, int64_t stride, int
     return v;
   }();
   const int64_t n_vec = chunk_bytes / static_cast<int64_t>(sizeof(uint4));
-  int blocks_per_peer = std::max<int64_t>(1, cus * 2 / std::max<int64_t>(1, world));
+  int blocks_per_peer = std::max<int64_t>(1, cus * 2 / std::max<int64_t>(1, world_size));
   blocks_per_peer = std::min<int64_t>(blocks_per_peer, std::max<int64_t>(1, n_vec / kThreads));
-  const int blocks = static_cast<int>(world * blocks_per_peer);
+  const int blocks = static_cast<int>(world_size * blocks_per_peer);
 
   hipLaunchKernelGGL(All2AllPush, dim3(blocks), dim3(kThreads), 0, c10::hip::getCurrentHIPStream(),
                      reinterpret_cast<const uint4*>(send.data_ptr()),
                      reinterpret_cast<char*>(flat_base), static_cast<size_t>(stride),
-                     static_cast<size_t>(chunk_bytes), static_cast<int>(rank),
-                     static_cast<int>(world), blocks_per_peer);
+                     static_cast<size_t>(chunk_bytes), static_cast<int>(rank_id),
+                     static_cast<int>(world_size), blocks_per_peer);
   hipError_t err = hipGetLastError();
   TORCH_CHECK(err == hipSuccess, "all2all_push launch failed: ", hipGetErrorString(err));
 }

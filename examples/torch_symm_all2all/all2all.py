@@ -54,8 +54,8 @@ def main():
     import all2all_kernel
 
     args = parse_args()
-    rank = int(os.environ.get("RANK", "0"))
-    world = int(os.environ.get("WORLD_SIZE", "1"))
+    rank_id = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
 
     dist.init_process_group("gloo")
@@ -71,27 +71,31 @@ def main():
     elems_per_chunk = chunk_bytes // 4
 
     # Receive window: one chunk per source rank. Symmetric, so peers can write into it.
-    recv = symm_mem.empty(world * elems_per_chunk, dtype=torch.int32, device=device)
+    recv = symm_mem.empty(
+        world_size * elems_per_chunk, dtype=torch.int32, device=device
+    )
     recv.zero_()
     # Send buffer is ordinary local memory. Chunk p carries a value identifying (me -> p).
-    send = torch.empty(world * elems_per_chunk, dtype=torch.int32, device=device)
-    for p in range(world):
-        send[p * elems_per_chunk : (p + 1) * elems_per_chunk] = rank * 1000 + p
+    send = torch.empty(world_size * elems_per_chunk, dtype=torch.int32, device=device)
+    for p in range(world_size):
+        send[p * elems_per_chunk : (p + 1) * elems_per_chunk] = rank_id * 1000 + p
     torch.cuda.synchronize()
 
     hdl = symm_mem.rendezvous(recv, group_name)
     base, stride = flat_layout(recv)
 
-    if rank == 0:
+    if rank_id == 0:
         print(
-            f"world={world}  handle={handle_type(local_rank)}  chunk={args.chunk_kib} KiB"
+            f"world={world_size}  handle={handle_type(local_rank)}  chunk={args.chunk_kib} KiB"
         )
         print(f"flat window: base={base:#x} stride={stride >> 20} MiB")
         strided = all(p == base + r * stride for r, p in enumerate(hdl.buffer_ptrs))
         print(f"peer(r) == base + r*stride: {strided}")
 
     def run_once():
-        all2all_kernel.all2all_push(send, base, stride, chunk_bytes, rank, world)
+        all2all_kernel.all2all_push(
+            send, base, stride, chunk_bytes, rank_id, world_size
+        )
         torch.cuda.synchronize()
         # The backend has no device-side barrier yet, so ranks meet on the host before
         # anyone reads what the peers wrote.
@@ -101,14 +105,14 @@ def main():
 
     # Chunk r of our receive window must hold what rank r sent us: r*1000 + our rank.
     errors = 0
-    for r in range(world):
+    for r in range(world_size):
         got = recv[r * elems_per_chunk].item()
-        want = r * 1000 + rank
+        want = r * 1000 + rank_id
         if got != want:
             errors += 1
-            print(f"[rank {rank}] chunk {r}: got {got}, expected {want}", flush=True)
-    if rank == 0 and errors == 0:
-        print(f"correctness: OK ({world}x{world} chunks)")
+            print(f"[rank {rank_id}] chunk {r}: got {got}, expected {want}", flush=True)
+    if rank_id == 0 and errors == 0:
+        print(f"correctness: OK ({world_size}x{world_size} chunks)")
 
     for _ in range(args.warmup):
         run_once()
@@ -117,17 +121,19 @@ def main():
     torch.cuda.synchronize()
     start.record()
     for _ in range(args.iters):
-        all2all_kernel.all2all_push(send, base, stride, chunk_bytes, rank, world)
+        all2all_kernel.all2all_push(
+            send, base, stride, chunk_bytes, rank_id, world_size
+        )
     end.record()
     torch.cuda.synchronize()
     ms = start.elapsed_time(end) / args.iters
 
-    # Each rank pushes (world-1) chunks off-device; the self chunk stays local.
-    remote_bytes = (world - 1) * chunk_bytes
+    # Each rank pushes (world_size-1) chunks off-device; the self chunk stays local.
+    remote_bytes = (world_size - 1) * chunk_bytes
     gbps = remote_bytes / (ms / 1e3) / 1e9
     totals = torch.tensor([gbps], dtype=torch.float64)
     dist.all_reduce(totals, op=dist.ReduceOp.SUM)
-    if rank == 0:
+    if rank_id == 0:
         print(
             f"push all-to-all: {ms * 1e3:.1f} us/iter, {totals.item():.1f} GB/s aggregate"
         )
