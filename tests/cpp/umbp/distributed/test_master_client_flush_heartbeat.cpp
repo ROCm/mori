@@ -46,9 +46,11 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "umbp.grpc.pb.h"
 #include "umbp/distributed/master/master_client.h"
+#include "umbp/distributed/peer/backend/mock_backend.h"
 
 namespace mori::umbp {
 namespace {
@@ -77,12 +79,21 @@ class RecordingMasterService final : public ::umbp::UMBPMaster::Service {
     return grpc::Status::OK;
   }
 
-  grpc::Status Heartbeat(grpc::ServerContext* ctx, const ::umbp::HeartbeatRequest*,
+  grpc::Status Heartbeat(grpc::ServerContext* ctx, const ::umbp::HeartbeatRequest* req,
                          ::umbp::HeartbeatResponse* resp) override {
     {
       std::lock_guard<std::mutex> lock(mu_);
       ++count_;
       last_time_ = std::chrono::steady_clock::now();
+      size_t event_count = 0;
+      uint64_t highest_seq = 0;
+      for (const auto& bundle : req->bundles()) {
+        event_count += static_cast<size_t>(bundle.events_size());
+        highest_seq = std::max(highest_seq, bundle.seq());
+      }
+      heartbeat_event_counts_.push_back(event_count);
+      resp->set_acked_seq(highest_seq);
+      resp->set_status(::umbp::CLIENT_STATUS_ALIVE);
       entered_cv_.notify_all();
     }
     if (block_heartbeats_) {
@@ -95,7 +106,6 @@ class RecordingMasterService final : public ::umbp::UMBPMaster::Service {
                              [&] { return released_ || ctx->IsCancelled(); });
       }
     }
-    resp->set_acked_seq(0);
     return grpc::Status::OK;
   }
 
@@ -133,6 +143,11 @@ class RecordingMasterService final : public ::umbp::UMBPMaster::Service {
     return last_time_;
   }
 
+  std::vector<size_t> HeartbeatEventCounts() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return heartbeat_event_counts_;
+  }
+
  private:
   const int interval_ms_;
   const bool block_heartbeats_;
@@ -141,9 +156,42 @@ class RecordingMasterService final : public ::umbp::UMBPMaster::Service {
   std::condition_variable entered_cv_;
   std::condition_variable release_cv_;
   int count_ = 0;
+  std::vector<size_t> heartbeat_event_counts_;
   std::chrono::steady_clock::time_point last_time_;
   bool released_ = false;
 };
+
+// Upstream drove this through a bespoke OwnedLocationSource holding a vector of
+// events. That type is gone — MediumBackend absorbed it — so the backlog is
+// built the way a real one arises: commit `count` keys into a backend and let
+// its outbox fill. MockBackend is a full MediumBackend, so this exercises the
+// same DrainAllBackends path production uses.
+//
+// The registry must be attached to the client only AFTER the commits, because
+// SetBackendRegistry installs the auto-flush hook: with it installed, the
+// commits themselves would flush and the backlog would never accumulate.
+std::unique_ptr<BackendRegistry> MakeRegistryWithBacklog(size_t count) {
+  auto backend = std::make_unique<MockBackend>(TierType::DRAM);
+
+  std::vector<AllocateRequest> allocs;
+  allocs.reserve(count);
+  for (size_t i = 0; i < count; ++i) {
+    allocs.push_back(AllocateRequest{"heartbeat-key-" + std::to_string(i), /*size=*/4096});
+  }
+  auto allocated = backend->BatchAllocate(allocs);
+
+  std::vector<CommitRequest> commits;
+  commits.reserve(count);
+  for (size_t i = 0; i < count; ++i) {
+    EXPECT_EQ(allocated[i].outcome, AllocateOutcome::kSuccessAllocated);
+    commits.push_back(CommitRequest{allocated[i].slot_id, allocs[i].key});
+  }
+  backend->BatchCommit(commits);
+
+  auto registry = std::make_unique<BackendRegistry>();
+  registry->Register(std::move(backend));
+  return registry;
+}
 
 // --------------------------------------------------------------------------
 // Test fixture
@@ -280,6 +328,28 @@ TEST_F(FlushHeartbeatTest, FlushWhileRPCInFlightFiresNextTickImmediately) {
   EXPECT_LT(gap_ms, kDeadlineMs)
       << "Second heartbeat arrived " << gap_ms << " ms after release (budget " << kDeadlineMs
       << " ms); flush_requested_ may not have been preserved across the in-flight RPC";
+}
+
+TEST_F(FlushHeartbeatTest, LargeEventBacklogIsSplitAcrossBoundedImmediateHeartbeats) {
+  constexpr size_t kEvents = 20'000;
+  constexpr size_t kDefaultMaxEventsPerRpc = 16 * 1024;
+  ASSERT_NO_FATAL_FAILURE(BuildServer(/*interval_ms=*/10'000));
+  // Declared before the client so it outlives it: MasterClient holds the
+  // registry by raw pointer and touches it while shutting the heartbeat down.
+  auto registry = MakeRegistryWithBacklog(kEvents);
+  auto client = MakeRegisteredClient();
+  client->SetBackendRegistry(registry.get());
+  client->StartHeartbeat();
+
+  client->FlushHeartbeat();
+  ASSERT_TRUE(service_->WaitForCount(2, std::chrono::milliseconds(2000)));
+  client->StopHeartbeat();
+
+  const auto counts = service_->HeartbeatEventCounts();
+  ASSERT_GE(counts.size(), 2u);
+  EXPECT_LE(counts[0], kDefaultMaxEventsPerRpc);
+  EXPECT_LE(counts[1], kDefaultMaxEventsPerRpc);
+  EXPECT_EQ(counts[0] + counts[1], kEvents);
 }
 
 }  // namespace
