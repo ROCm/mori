@@ -25,7 +25,6 @@
 #include <cassert>  // assert() — used in device code below, needed in both host/device compiles
 
 #include "mori/application/application_device_types.hpp"
-#include "mori/core/transport/rdma/proxy/proxy_types.hpp"
 #include "mori/core/utils/utils.hpp"
 #include "mori/hip_compat.hpp"
 #include "mori/utils/limits.hpp"
@@ -130,12 +129,6 @@ struct GpuStates {
   application::SymmMemObj* heapObj{nullptr};  // Pointer to the heap's SymmMemObj on device
   uint64_t* internalSyncPtr{nullptr};         // Pointer to the internal synchronization object
 
-  bool useProxy{false};
-  core::ProxyRing* proxyRings[core::PROXY_MAX_NICS]{};
-  uint32_t proxyQuietHead[core::PROXY_MAX_NICS]{};
-  int numProxyRings{0};
-  int numNics{0};
-  int localGpuIdx{0};
 };
 
 // Changed from __constant__ to __device__ to allow hipMemcpyToSymbol updates (like rocshmem)
@@ -165,6 +158,9 @@ struct RemoteAddrInfo {
 #include <memory>
 
 }  // namespace shmem
+}  // namespace mori
+#include "mori/shmem/shmem_proxy_state.hpp"
+namespace mori {
 namespace core { class ProxyThread; }
 namespace shmem {
 
@@ -193,6 +189,7 @@ struct ShmemStates {
   MemoryStates* memoryStates{nullptr};
   ModuleStates moduleStates;  // JIT module state for this GPU
   GpuStates gpuStates;        // host-side copy of device GpuStates for this GPU
+  ProxyGpuState proxyGpuState;
   std::vector<std::unique_ptr<core::ProxyThread>> proxyThreads;  // per-NIC CPU proxy threads
 
   // Asserts that ShmemInit has been called and the slot is currently usable.

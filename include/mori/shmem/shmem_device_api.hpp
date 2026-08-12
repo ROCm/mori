@@ -28,6 +28,9 @@
 #include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem_device_kernels.hpp"
 #include "mori/shmem/shmem_ibgda_kernels.hpp"
+#if defined(MORI_PROXY_ENABLED) && !defined(MORI_SHMEM_ENABLE_WEAK_GLOBAL_GPU_STATES)
+#include "mori/shmem/shmem_proxy_kernels.hpp"
+#endif
 #include "mori/shmem/shmem_p2p_kernels.hpp"
 #include "mori/shmem/shmem_sdma_kernels.hpp"
 
@@ -76,14 +79,23 @@ namespace shmem {
 /*                                         Synchronization                                        */
 /* ---------------------------------------------------------------------------------------------- */
 inline __device__ void ShmemQuietThread() {
+#if defined(MORI_PROXY_ENABLED) && !defined(MORI_SHMEM_ENABLE_WEAK_GLOBAL_GPU_STATES)
+  if (GetGlobalProxyStatePtr()->active) { ShmemQuietAllProxy(); return; }
+#endif
   ShmemQuietThreadKernel<application::TransportType::RDMA>();
 }
 
 inline __device__ void ShmemQuietThread(int pe) {
+#if defined(MORI_PROXY_ENABLED) && !defined(MORI_SHMEM_ENABLE_WEAK_GLOBAL_GPU_STATES)
+  if (GetGlobalProxyStatePtr()->active) { ShmemQuietThreadKernelPsdImpl_proxy(pe, 0); return; }
+#endif
   DISPATCH_TRANSPORT_TYPE(ShmemQuietThreadKernel, pe, pe);
 }
 
 inline __device__ void ShmemQuietThread(int pe, int qpId) {
+#if defined(MORI_PROXY_ENABLED) && !defined(MORI_SHMEM_ENABLE_WEAK_GLOBAL_GPU_STATES)
+  if (GetGlobalProxyStatePtr()->active) { ShmemQuietThreadKernelPsdImpl_proxy(pe, qpId); return; }
+#endif
   DISPATCH_TRANSPORT_TYPE(ShmemQuietThreadKernel, pe, pe, qpId);
 }
 
@@ -172,7 +184,20 @@ inline __device__ uint64_t ShmemPtrP2p(const application::SymmMemObjPtr& memObjP
                             sourceOffset, bytes, pe, qpId);                               \
   }
 
-DEFINE_SHMEM_PUT_MEM_NBI_API_TEMPLATE(Thread)
+inline __device__ void ShmemPutMemNbiThread(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe,
+    int qpId = 0) {
+#if defined(MORI_PROXY_ENABLED) && !defined(MORI_SHMEM_ENABLE_WEAK_GLOBAL_GPU_STATES)
+  if (GetGlobalProxyStatePtr()->active) {
+    ShmemPutMemNbiThreadKernelImpl_proxy(
+        dest, destOffset, source, sourceOffset, bytes, pe, qpId);
+    return;
+  }
+#endif
+  DISPATCH_TRANSPORT_TYPE(ShmemPutMemNbiThreadKernel, pe, dest, destOffset, source,
+                          sourceOffset, bytes, pe, qpId);
+}
 DEFINE_SHMEM_PUT_MEM_NBI_API_TEMPLATE(Warp)
 DEFINE_SHMEM_PUT_MEM_NBI_API_TEMPLATE(Block)
 
@@ -397,7 +422,19 @@ DEFINE_SHMEM_GET_TYPE_API(Double, double, Block)
                             pe, qpId);                                                           \
   }
 
-SHMEM_PUT_SIZE_IMM_NBI_API(Thread)
+inline __device__ void ShmemPutSizeImmNbiThread(const application::SymmMemObjPtr dest,
+                                                 size_t destOffset, void* val, size_t bytes,
+                                                 int pe, int qpId = 0) {
+#if defined(MORI_PROXY_ENABLED) && !defined(MORI_SHMEM_ENABLE_WEAK_GLOBAL_GPU_STATES)
+  if (GetGlobalProxyStatePtr()->active) {
+    ShmemPutSizeImmNbiThreadKernelImpl_proxy(
+        dest, destOffset, val, bytes, pe, qpId);
+    return;
+  }
+#endif
+  DISPATCH_TRANSPORT_TYPE(ShmemPutSizeImmNbiThreadKernel, pe, dest, destOffset, val, bytes,
+                          pe, qpId);
+}
 SHMEM_PUT_SIZE_IMM_NBI_API(Warp)
 
 #define SHMEM_PUT_TYPE_IMM_NBI_API_TEMPLATE(Scope)                                             \
@@ -454,7 +491,24 @@ DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Int64, int64_t, Warp)
                                       signalDestOffset, signalValue, signalOp, pe, qpId);         \
   }
 
-DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_API_TEMPLATE(Thread)
+template <bool onlyOneSignal = true>
+inline __device__ void ShmemPutMemNbiSignalThread(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId = 0) {
+#if defined(MORI_PROXY_ENABLED) && !defined(MORI_SHMEM_ENABLE_WEAK_GLOBAL_GPU_STATES)
+  if (GetGlobalProxyStatePtr()->active) {
+    ShmemPutMemNbiSignalThreadKernelImpl_proxy<onlyOneSignal>(
+        dest, destOffset, source, sourceOffset, bytes,
+        signalDest, signalDestOffset, signalValue, signalOp, pe, qpId);
+    return;
+  }
+#endif
+  DISPATCH_TRANSPORT_TYPE_WITH_BOOL(ShmemPutMemNbiSignalThreadKernel, onlyOneSignal, pe,
+                                    dest, destOffset, source, sourceOffset, bytes, signalDest,
+                                    signalDestOffset, signalValue, signalOp, pe, qpId);
+}
 DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_API_TEMPLATE(Warp)
 DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_API_TEMPLATE(Block)
 
@@ -533,7 +587,19 @@ DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Double, double, Block)
                             bytes, amoType, pe, qpId);                                         \
   }
 
-SHMEM_ATOMIC_SIZE_NONFETCH_API_TEMPLATE(Thread)
+inline __device__ void ShmemAtomicSizeNonFetchThread(
+    const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes,
+    core::atomicType amoType, int pe, int qpId = 0) {
+#if defined(MORI_PROXY_ENABLED) && !defined(MORI_SHMEM_ENABLE_WEAK_GLOBAL_GPU_STATES)
+  if (GetGlobalProxyStatePtr()->active) {
+    ShmemAtomicSizeNonFetchThreadKernelImpl_proxy(
+        dest, destOffset, val, bytes, amoType, pe, qpId);
+    return;
+  }
+#endif
+  DISPATCH_TRANSPORT_TYPE(ShmemAtomicSizeNonFetchThreadKernel, pe, dest, destOffset, val,
+                          bytes, amoType, pe, qpId);
+}
 SHMEM_ATOMIC_SIZE_NONFETCH_API_TEMPLATE(Warp)
 
 #define SHMEM_ATOMIC_TYPE_NONFETCH_API_TEMPLATE(Scope)                                           \
@@ -582,7 +648,21 @@ DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Ulong, unsigned long, Warp)
     return result;                                                                               \
   }
 
-SHMEM_ATOMIC_TYPE_FETCH_API_TEMPLATE(Thread)
+template <typename T>
+inline __device__ T ShmemAtomicTypeFetchThread(
+    const application::SymmMemObjPtr dest, size_t destOffset, T val, T compare,
+    core::atomicType amoType, int pe, int qpId = 0) {
+#if defined(MORI_PROXY_ENABLED) && !defined(MORI_SHMEM_ENABLE_WEAK_GLOBAL_GPU_STATES)
+  if (GetGlobalProxyStatePtr()->active) {
+    return ShmemAtomicTypeFetchThreadKernelImpl_proxy<T>(
+        dest, destOffset, &val, sizeof(T), amoType, pe, qpId);
+  }
+#endif
+  T result = DISPATCH_TRANSPORT_DATA_TYPE_WITH_RETURN(ShmemAtomicTypeFetchThreadKernel, pe,
+                                                      T, dest, destOffset, &val, &compare,
+                                                      sizeof(T), amoType, pe, qpId);
+  return result;
+}
 SHMEM_ATOMIC_TYPE_FETCH_API_TEMPLATE(Warp)
 
 #define DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(TypeName, T, Scope)                                \

@@ -61,6 +61,15 @@ namespace shmem {
 
 #if !defined(MORI_SHMEM_NO_STATIC_INIT) || defined(MORI_SHMEM_ENABLE_WEAK_GLOBAL_GPU_STATES)
 __device__ __attribute__((visibility("default"), weak)) GpuStates globalGpuStates;
+#ifdef MORI_PROXY_ENABLED
+}  // namespace shmem
+}  // namespace mori
+#include "mori/shmem/shmem_proxy_state.hpp"
+namespace mori {
+namespace shmem {
+__device__ __attribute__((visibility("default"), weak)) ProxyGpuState globalProxyState;
+static __device__ ProxyGpuState* GetGlobalProxyStatePtr() { return &globalProxyState; }
+#endif
 
 namespace _static_init {
 

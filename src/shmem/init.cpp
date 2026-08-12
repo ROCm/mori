@@ -602,7 +602,7 @@ void GpuStateInit(ShmemStates* states) {
     if (states->rdmaStates && states->rdmaStates->commContext) {
       numNics = static_cast<int>(states->rdmaStates->commContext->GetAllRdmaDeviceContexts().size());
       if (numNics < 1) numNics = 1;
-      if (numNics > core::PROXY_MAX_NICS) numNics = core::PROXY_MAX_NICS;
+      if (numNics > shmem::PROXY_STATE_MAX_NICS) numNics = shmem::PROXY_STATE_MAX_NICS;
     }
 
     // Allocate one ProxyRing per NIC. Each ring has its own gpu_head so
@@ -617,19 +617,20 @@ void GpuStateInit(ShmemStates* states) {
                                             hipHostRegisterMapped | hipHostRegisterPortable);
         if (regErr == hipSuccess) {
           memset(ring, 0, sizeof(core::ProxyRing));
-          states->gpuStates.proxyRings[n] = ring;
+          states->proxyGpuState.rings[n] = static_cast<void*>(ring);
           allocated++;
         } else {
           free(ringPtr);
         }
       }
     }
-    states->gpuStates.numProxyRings = allocated;
-    states->gpuStates.numNics = numNics;
-    states->gpuStates.localGpuIdx = states->gpuStates.rank % numNics;
-    states->gpuStates.useProxy = true;
+    states->proxyGpuState.numRings = allocated;
+    states->proxyGpuState.numNics = numNics;
+    states->proxyGpuState.localGpuIdx = states->gpuStates.rank % numNics;
+    states->proxyGpuState.active = true;
+    states->proxyGpuState.numQpPerPe = states->rdmaStates->commContext->GetNumQpPerPe();
     MORI_SHMEM_INFO("Proxy: {} rings allocated for {} NICs, localGpuIdx={}",
-                    allocated, numNics, states->gpuStates.localGpuIdx);
+                    allocated, numNics, states->proxyGpuState.localGpuIdx);
   }
 
   fprintf(stderr, "[MoRI] SHMEM init: proxy setup done, rank=%d\n", states->gpuStates.rank);
@@ -733,18 +734,18 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
   GpuStateInit(states);
 
   // Start per-NIC proxy threads if proxy mode is enabled
-  if (states->gpuStates.useProxy && states->gpuStates.numProxyRings > 0) {
+  if (states->proxyGpuState.active && states->proxyGpuState.numRings > 0) {
     auto* ctx = states->rdmaStates->commContext;
     const auto& hostEndpoints = ctx->GetRdmaEndpoints();
-    int numNics = states->gpuStates.numNics;
+    int numNics = states->proxyGpuState.numNics;
     int numQpPerPe = ctx->GetNumQpPerPe();
     const auto& perNicLkeys = states->memoryStates->symmMemMgr->perNicLkeys;
     const auto& perNicRkeys = states->memoryStates->symmMemMgr->perNicPeerRkeys;
-    int myLocalGpu = states->gpuStates.localGpuIdx;
+    int myLocalGpu = states->proxyGpuState.localGpuIdx;
     int gpuId = states->gpuStates.rank % numNics;
 
     for (int n = 0; n < numNics; n++) {
-      if (!states->gpuStates.proxyRings[n]) continue;
+      if (!states->proxyGpuState.rings[n]) continue;
 
       // Build QP vector for this NIC only (full size, nulls for other NICs' QPs)
       std::vector<core::ProxyQpHandle> nicQps(hostEndpoints.size());
@@ -768,14 +769,16 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
       }
       if (nicQpCount > 0) {
         auto thread = std::make_unique<core::ProxyThread>();
-        thread->Init(states->gpuStates.proxyRings[n], std::move(nicQps), gpuId);
+        thread->Init(static_cast<core::ProxyRing*>(states->proxyGpuState.rings[n]), std::move(nicQps), gpuId);
         thread->Start();
         states->proxyThreads.push_back(std::move(thread));
       }
     }
     MORI_SHMEM_INFO("Proxy: {} threads started for {} NICs", states->proxyThreads.size(), numNics);
+    fprintf(stderr, "[PROXY] %zu threads started\n", states->proxyThreads.size());
   }
 
+  fprintf(stderr, "[SHMEM-INIT] rank=%d complete\n", states->gpuStates.rank);
   states->status = ShmemStatesStatus::Initialized;
   MORI_SHMEM_INFO("Shmem initialization completed");
   return 0;
@@ -795,11 +798,11 @@ static void FinalizeGpuStates(ShmemStates* states) {
     if (t) t->Shutdown();
   }
   states->proxyThreads.clear();
-  for (int n = 0; n < core::PROXY_MAX_NICS; n++) {
-    if (states->gpuStates.proxyRings[n]) {
-      hipHostUnregister(states->gpuStates.proxyRings[n]);
-      free(states->gpuStates.proxyRings[n]);
-      states->gpuStates.proxyRings[n] = nullptr;
+  for (int n = 0; n < shmem::PROXY_STATE_MAX_NICS; n++) {
+    if (states->proxyGpuState.rings[n]) {
+      hipHostUnregister(states->proxyGpuState.rings[n]);
+      free(states->proxyGpuState.rings[n]);
+      states->proxyGpuState.rings[n] = nullptr;
     }
   }
 

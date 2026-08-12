@@ -442,7 +442,10 @@ def _tunable_defines() -> list[str]:
     cannot end up in the compile without being in the key -- which is the bug that made a run with
     the quantise pass deleted load the full build's object and report the full build's time.
     """
-    return []
+    defs: list[str] = []
+    if os.environ.get("MORI_EP_OVER_RDMA") == "1" or os.environ.get("MORI_USE_IBGDA_PROXY") == "1":
+        defs.append("-DMORI_PROXY_ENABLED")
+    return defs
 
 
 def _hipcc_genco(

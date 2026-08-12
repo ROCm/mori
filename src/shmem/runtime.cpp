@@ -111,6 +111,24 @@ void CopyGpuStatesToDevice(ShmemStates* states) {
 
   MORI_SHMEM_TRACE("Successfully copied GpuStates to device (rank={}, worldSize={})",
                    gpuStates->rank, gpuStates->worldSize);
+
+  if (states->proxyGpuState.active) {
+    const ProxyGpuState* proxyState = &states->proxyGpuState;
+    if (ms.module != nullptr) {
+      ProxyGpuState* deviceProxyPtr = nullptr;
+      size_t symbolSize = 0;
+      hipError_t err = hipModuleGetGlobal(reinterpret_cast<hipDeviceptr_t*>(&deviceProxyPtr),
+                                          &symbolSize, ms.module,
+                                          "_ZN4mori5shmem16globalProxyStateE");
+      if (err == hipSuccess && deviceProxyPtr != nullptr) {
+        HIP_RUNTIME_CHECK(
+            hipMemcpy(deviceProxyPtr, proxyState, sizeof(ProxyGpuState), hipMemcpyHostToDevice));
+      }
+    }
+    for (auto& provider : GpuStatesProviders()) {
+      (void)provider;
+    }
+  }
 }
 
 void FinalizeRuntime(ShmemStates* states) {
@@ -153,6 +171,19 @@ int ShmemModuleInit(void* hipModule) {
 
   MORI_SHMEM_TRACE("Successfully initialized globalGpuStates in module (rank={}, worldSize={})",
                    states->gpuStates.rank, states->gpuStates.worldSize);
+
+  if (states->proxyGpuState.active) {
+    ProxyGpuState* moduleProxyAddr = nullptr;
+    size_t proxySymSize = 0;
+    hipError_t perr = hipModuleGetGlobal(reinterpret_cast<hipDeviceptr_t*>(&moduleProxyAddr),
+                                         &proxySymSize, module,
+                                         "_ZN4mori5shmem16globalProxyStateE");
+    fprintf(stderr, "[PROXY-MODULE] rank=%d addr=%p size=%zu err=%d\n", states->gpuStates.rank, (void*)moduleProxyAddr, proxySymSize, (int)perr);
+    if (perr == hipSuccess && moduleProxyAddr != nullptr) {
+      HIP_RUNTIME_CHECK(hipMemcpy(moduleProxyAddr, &states->proxyGpuState,
+                                  sizeof(ProxyGpuState), hipMemcpyHostToDevice));
+    }
+  }
 
   return 0;
 }
