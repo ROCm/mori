@@ -79,9 +79,22 @@ A compiled-in tile also decides how much of the grid has anything to do. The pay
 8 blocks, which is exactly where the 1 MB row stops responding to the grid.
 
 `DYNTILE=1` sizes the tile per cell instead: `clamp(bytes/(blocks*MWSISS*MWSPIPE), DYNMIN, tile)`,
-rounded down to a power of two. Five matrices over the same SIZE x BLOCK axes are in
-[`results/tilegeom_gfx1250.csv`](results/tilegeom_gfx1250.csv), 450 cells, all with 8 issuing waves in
-a 256-thread block. At 256 blocks:
+rounded down to a power of two. Six matrices over the same SIZE x BLOCK axes are in
+[`results/tilegeom_gfx1250.csv`](results/tilegeom_gfx1250.csv), 540 cells: the single-issuer baseline
+plus five multi-issuer configurations, all in one batch with identical build flags, because the tables
+from earlier batches do not subtract against these -- one of them reads exactly 2x on the same cell.
+
+Against that baseline, at 8 GB, dynamic sizing with 8 issuing waves is worth a flat **2.1x from 1 to 64
+blocks** (8.3 -> 17.9 at one block, 506 -> 1061 at 64), +56% at 128, and nothing at 256, where both are
+at the link ceiling and the baseline is 1.3% ahead (1579 vs 1559). The ceiling was never the thing that
+moved; what moved is how few blocks are needed to reach it.
+
+The two changes have to ship together. Eight issuing waves on a *fixed* tile is a regression at mid
+sizes -- 1 MB at 256 blocks is 89 GB/s against the baseline's 181 -- because a block consumes
+MWSISS*MWSPIPE = 16 tiles per round, so 1 MB feeds 8 blocks, while the single-issuer kernel takes 4 and
+feeds 32. Dynamic sizing brings it to 189.
+
+At 256 blocks, across tile policies:
 
 | payload | fixed 8 KB | dynamic, cap 8 KB | fixed 16 KB | dynamic, cap 16 KB |
 |---|---|---|---|---|
