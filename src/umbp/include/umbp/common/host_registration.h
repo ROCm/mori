@@ -21,6 +21,33 @@
 // SOFTWARE.
 #pragma once
 
-// Backward-compatible source-tree include. New shared users include the common
-// header directly.
-#include "umbp/common/host_registration.h"
+#include <atomic>
+#include <cstddef>
+#include <thread>
+
+namespace mori::umbp {
+
+// Makes a host tier addressable from GPU kernels via one whole-region
+// hipHostRegister call. Registration is best-effort: Covers() remains false
+// until it succeeds, allowing callers to fall back to the copy engine.
+class HostTierRegistration {
+ public:
+  HostTierRegistration(void* base, size_t bytes);
+  ~HostTierRegistration();
+
+  HostTierRegistration(const HostTierRegistration&) = delete;
+  HostTierRegistration& operator=(const HostTierRegistration&) = delete;
+
+  bool Covers(const void* ptr, size_t size) const;
+  size_t RegisteredBytes() const { return registered_bytes_.load(std::memory_order_acquire); }
+
+ private:
+  void Register();
+
+  char* base_{nullptr};
+  size_t bytes_{0};
+  std::atomic<size_t> registered_bytes_{0};
+  std::thread worker_;
+};
+
+}  // namespace mori::umbp

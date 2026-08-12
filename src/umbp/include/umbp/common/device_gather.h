@@ -21,6 +21,25 @@
 // SOFTWARE.
 #pragma once
 
-// Backward-compatible source-tree include. New shared users include the common
-// header directly.
-#include "umbp/common/host_registration.h"
+#include <hip/hip_runtime_api.h>
+
+#include <cstddef>
+#include <cstdint>
+
+namespace mori::umbp {
+
+struct DeviceGatherFragment {
+  const void* src;
+  void* dst;
+  size_t bytes;
+};
+
+// Copies independent fragments between a HostTierRegistration-covered region
+// and one GPU in a single kernel launch. Returns false before enqueueing work
+// when the kernel path is unavailable, allowing a hipMemcpy fallback.
+bool LaunchDeviceGather(const DeviceGatherFragment* fragments, size_t count, int device_id,
+                        hipStream_t stream);
+bool DeviceGatherEnabled();
+uint64_t DeviceGatherLaunchCount();
+
+}  // namespace mori::umbp
