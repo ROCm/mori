@@ -25,6 +25,8 @@ import torch
 from tests.python.ops.dispatch_combine_test_utils import (
     _all_data_types,
     _is_fp4x2_dtype,
+    cross_dtype_hidden_dims,
+    cross_dtype_skip_reason,
     EpDispatchCombineTestCase,
     assert_worker_results,
     run_ep_dispatch_combine_test,
@@ -54,12 +56,16 @@ def _make_intranode_config(
     max_total_recv_tokens=0,
     quant_type="none",
     kernel_type=mori.ops.EpDispatchCombineKernelType.IntraNode,
+    combine_data_type=None,
 ):
+    _, _, config_hidden_dim = cross_dtype_hidden_dims(
+        hidden_dim, data_type, combine_data_type or data_type
+    )
     return mori.ops.EpDispatchCombineConfig(
         data_type=data_type,
         rank=rank,
         world_size=world_size,
-        hidden_dim=hidden_dim // 2 if _is_fp4x2_dtype(data_type) else hidden_dim,
+        hidden_dim=config_hidden_dim,
         scale_dim=scale_dim,
         scale_type_size=scale_type_size,
         max_num_inp_token_per_rank=max_num_inp_token_per_rank,
@@ -222,6 +228,103 @@ def test_dispatch_combine(
                     use_external_inp_buf,
                     scale_dim,
                     scale_type_size,
+                    quant_type,
+                ],
+            )
+        )
+
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
+def _test_dispatch_combine_cross_dtype(
+    rank,
+    world_size,
+    kernel_type,
+    data_type,
+    combine_data_type,
+    hidden_dim,
+    max_num_inp_token_per_rank,
+    num_experts_per_rank,
+    num_experts_per_token,
+    quant_type,
+):
+    dispatch_hidden_dim, combine_hidden_dim, _ = cross_dtype_hidden_dims(
+        hidden_dim, data_type, combine_data_type
+    )
+    config = _make_intranode_config(
+        rank=rank,
+        world_size=world_size,
+        data_type=data_type,
+        hidden_dim=hidden_dim,
+        max_num_inp_token_per_rank=max_num_inp_token_per_rank,
+        num_experts_per_rank=num_experts_per_rank,
+        num_experts_per_token=num_experts_per_token,
+        use_external_inp_buf=True,
+        quant_type=quant_type,
+        kernel_type=kernel_type,
+        combine_data_type=combine_data_type,
+    )
+    run_ep_dispatch_combine_test(
+        config,
+        EpDispatchCombineTestCase,
+        combine_data_type=combine_data_type,
+        combine_hidden_dim=combine_hidden_dim,
+        dispatch_hidden_dim=dispatch_hidden_dim,
+    )
+
+
+# Cross-dtype coverage: dispatch and combine transport different element types.
+# The quantized serving configurations dispatch narrow (FP4 / FP8) and combine in
+# BF16, optionally casting the BF16 combine payload back down to FP8 on the wire
+# (fp8_direct_cast). The same-dtype tests above cannot reach these cells because
+# they derive the combine type from config.data_type.
+@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize(
+    "kernel_type",
+    (
+        mori.ops.EpDispatchCombineKernelType.IntraNode,
+        mori.ops.EpDispatchCombineKernelType.IntraNodeLL,
+    ),
+    ids=("IntraNode", "IntraNodeLL"),
+)
+@pytest.mark.parametrize("data_type", _all_data_types())
+@pytest.mark.parametrize("combine_data_type", (torch.bfloat16,), ids=("combine_bf16",))
+@pytest.mark.parametrize("hidden_dim", (7168, 4096))
+@pytest.mark.parametrize("max_num_inp_token_per_rank", (128,))
+@pytest.mark.parametrize("num_experts_per_rank", (32,))
+@pytest.mark.parametrize("num_experts_per_token", (8,))
+@pytest.mark.parametrize("quant_type", ("none", "fp8_direct_cast"))
+def test_dispatch_combine_cross_dtype(
+    torch_dist_process_manager,
+    world_size,
+    kernel_type,
+    data_type,
+    combine_data_type,
+    hidden_dim,
+    max_num_inp_token_per_rank,
+    num_experts_per_rank,
+    num_experts_per_token,
+    quant_type,
+):
+    skip = cross_dtype_skip_reason(quant_type, data_type, combine_data_type)
+    if skip:
+        pytest.skip(skip)
+    if _is_fp4x2_dtype(data_type) and not _combine_fp4_supported():
+        pytest.skip("FP4 dispatch requires a gfx950 GPU (OCP FP4 instructions)")
+
+    for i in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (
+                _test_dispatch_combine_cross_dtype,
+                [
+                    world_size,
+                    kernel_type,
+                    data_type,
+                    combine_data_type,
+                    hidden_dim,
+                    max_num_inp_token_per_rank,
+                    num_experts_per_rank,
+                    num_experts_per_token,
                     quant_type,
                 ],
             )
