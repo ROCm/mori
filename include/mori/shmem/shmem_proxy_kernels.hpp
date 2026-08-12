@@ -326,6 +326,67 @@ inline __device__ void ShmemGetMemNbiBlockKernel<application::TransportType::PRO
   assert(false);
 }
 
+// ---------------------------------------------------------------------------
+// Address-based overloads — stubs (EP uses SymmMemObjPtr APIs, not these)
+// ---------------------------------------------------------------------------
+template <> inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::PROXY>(
+    const void* d, const void* s, size_t b, int pe, int q) { assert(false); }
+template <> inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::PROXY>(
+    const void* d, const void* s, size_t b, int pe, int q) { assert(false); }
+template <> inline __device__ void ShmemPutMemNbiBlockKernel<application::TransportType::PROXY>(
+    const void* d, const void* s, size_t b, int pe, int q) { assert(false); }
+template <> inline __device__ void ShmemPutSizeImmNbiThreadKernel<application::TransportType::PROXY>(
+    const void* d, void* v, size_t b, int pe, int q) { assert(false); }
+template <> inline __device__ void ShmemPutSizeImmNbiWarpKernel<application::TransportType::PROXY>(
+    const void* d, void* v, size_t b, int pe, int q) { assert(false); }
+template <> inline __device__ void ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::PROXY>(
+    const void* d, void* v, size_t b, core::atomicType a, int pe, int q) { assert(false); }
+template <> inline __device__ void ShmemAtomicSizeNonFetchWarpKernel<application::TransportType::PROXY>(
+    const void* d, void* v, size_t b, core::atomicType a, int pe, int q) { assert(false); }
+template <> inline __device__ void ShmemGetMemNbiThreadKernel<application::TransportType::PROXY>(
+    void* d, const void* s, size_t b, int pe, int q) { assert(false); }
+template <> inline __device__ void ShmemGetMemNbiWarpKernel<application::TransportType::PROXY>(
+    void* d, const void* s, size_t b, int pe, int q) { assert(false); }
+template <> inline __device__ void ShmemGetMemNbiBlockKernel<application::TransportType::PROXY>(
+    void* d, const void* s, size_t b, int pe, int q) { assert(false); }
+
+// Signal address-based stubs
+template <> inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportType::PROXY, true>(
+    const void* d, const void* s, size_t b, const void* sd, uint64_t sv,
+    core::atomicType so, int pe, int q) { assert(false); }
+template <> inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportType::PROXY, false>(
+    const void* d, const void* s, size_t b, const void* sd, uint64_t sv,
+    core::atomicType so, int pe, int q) { assert(false); }
+template <> inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType::PROXY, true>(
+    const void* d, const void* s, size_t b, const void* sd, uint64_t sv,
+    core::atomicType so, int pe, int q) { assert(false); }
+template <> inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType::PROXY, false>(
+    const void* d, const void* s, size_t b, const void* sd, uint64_t sv,
+    core::atomicType so, int pe, int q) { assert(false); }
+template <> inline __device__ void ShmemPutMemNbiSignalBlockKernel<application::TransportType::PROXY, true>(
+    const void* d, const void* s, size_t b, const void* sd, uint64_t sv,
+    core::atomicType so, int pe, int q) { assert(false); }
+template <> inline __device__ void ShmemPutMemNbiSignalBlockKernel<application::TransportType::PROXY, false>(
+    const void* d, const void* s, size_t b, const void* sd, uint64_t sv,
+    core::atomicType so, int pe, int q) { assert(false); }
+
+// AtomicFetch address-based stubs
+#define DEFINE_PROXY_ATOMIC_FETCH_ADDR_STUB(Scope, T)                                          \
+  template <> inline __device__ T                                                              \
+  ShmemAtomicTypeFetch##Scope##Kernel<application::TransportType::PROXY, T>(                   \
+      const void* d, void* v, void* c, size_t b, core::atomicType a, int pe, int q) {          \
+    assert(false); return T{}; }
+
+DEFINE_PROXY_ATOMIC_FETCH_ADDR_STUB(Thread, uint32_t)
+DEFINE_PROXY_ATOMIC_FETCH_ADDR_STUB(Thread, uint64_t)
+DEFINE_PROXY_ATOMIC_FETCH_ADDR_STUB(Thread, int32_t)
+DEFINE_PROXY_ATOMIC_FETCH_ADDR_STUB(Thread, int64_t)
+DEFINE_PROXY_ATOMIC_FETCH_ADDR_STUB(Warp, uint32_t)
+DEFINE_PROXY_ATOMIC_FETCH_ADDR_STUB(Warp, uint64_t)
+DEFINE_PROXY_ATOMIC_FETCH_ADDR_STUB(Warp, int32_t)
+DEFINE_PROXY_ATOMIC_FETCH_ADDR_STUB(Warp, int64_t)
+#undef DEFINE_PROXY_ATOMIC_FETCH_ADDR_STUB
+
 }  // namespace shmem
 }  // namespace mori
 
