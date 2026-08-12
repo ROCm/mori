@@ -28,7 +28,7 @@
 #include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem_device_kernels.hpp"
 #include "mori/shmem/shmem_ibgda_kernels.hpp"
-#if defined(MORI_PROXY_ENABLED) && !defined(MORI_SHMEM_ENABLE_WEAK_GLOBAL_GPU_STATES)
+#if defined(MORI_PROXY_ENABLED)
 #include "mori/shmem/shmem_proxy_kernels.hpp"
 #endif
 #include "mori/shmem/shmem_p2p_kernels.hpp"
@@ -37,7 +37,7 @@
 namespace mori {
 namespace shmem {
 
-#if defined(MORI_PROXY_ENABLED) && !defined(MORI_SHMEM_ENABLE_WEAK_GLOBAL_GPU_STATES)
+#if defined(MORI_PROXY_ENABLED)
 #define PROXY_DISPATCH_GUARD(proxy_call)                    \
   if (GetGlobalProxyStatePtr()->active) { proxy_call; return; }
 #define PROXY_DISPATCH_GUARD_RET(proxy_call)                \
