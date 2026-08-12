@@ -179,7 +179,7 @@ inline __device__ uint64_t ShmemPtrP2p(const application::SymmMemObjPtr& memObjP
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        PutNbi APIs                                             */
 /* ---------------------------------------------------------------------------------------------- */
-#define DEFINE_SHMEM_PUT_MEM_NBI_API_IMPL(Scope)                                          \
+#define DEFINE_SHMEM_PUT_MEM_NBI_API_TEMPLATE(Scope)                                      \
   inline __device__ void ShmemPutMemNbi##Scope(                                           \
       const application::SymmMemObjPtr dest, size_t destOffset,                           \
       const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, \
@@ -190,9 +190,9 @@ inline __device__ uint64_t ShmemPtrP2p(const application::SymmMemObjPtr& memObjP
                             sourceOffset, bytes, pe, qpId);                               \
   }
 
-DEFINE_SHMEM_PUT_MEM_NBI_API_IMPL(Thread)
-DEFINE_SHMEM_PUT_MEM_NBI_API_IMPL(Warp)
-DEFINE_SHMEM_PUT_MEM_NBI_API_IMPL(Block)
+DEFINE_SHMEM_PUT_MEM_NBI_API_TEMPLATE(Thread)
+DEFINE_SHMEM_PUT_MEM_NBI_API_TEMPLATE(Warp)
+DEFINE_SHMEM_PUT_MEM_NBI_API_TEMPLATE(Block)
 
 #define DEFINE_SHMEM_PUT_TYPE_NBI_API_TEMPLATE(Scope)                                      \
   template <typename T>                                                                    \
@@ -462,7 +462,7 @@ DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Int64, int64_t, Warp)
 /*                                      PutNbi with Signal APIs                                   */
 /* ---------------------------------------------------------------------------------------------- */
 // PutNbi with Signal - Memory version
-#define DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_API_IMPL(Scope)                                           \
+#define DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_API_TEMPLATE(Scope)                                       \
   template <bool onlyOneSignal = true>                                                            \
   inline __device__ void ShmemPutMemNbiSignal##Scope(                                             \
       const application::SymmMemObjPtr dest, size_t destOffset,                                   \
@@ -477,9 +477,9 @@ DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Int64, int64_t, Warp)
                                       signalDestOffset, signalValue, signalOp, pe, qpId);         \
   }
 
-DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_API_IMPL(Thread)
-DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_API_IMPL(Warp)
-DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_API_IMPL(Block)
+DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_API_TEMPLATE(Thread)
+DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_API_TEMPLATE(Warp)
+DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_API_TEMPLATE(Block)
 
 // PutNbi with Signal - Typed version
 #define DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API_TEMPLATE(Scope)                                      \
@@ -548,7 +548,7 @@ DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Int64, int64_t, Block)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Float, float, Block)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Double, double, Block)
 
-#define SHMEM_ATOMIC_SIZE_NONFETCH_API_IMPL(Scope)                                              \
+#define SHMEM_ATOMIC_SIZE_NONFETCH_API_TEMPLATE(Scope)                                         \
   inline __device__ void ShmemAtomicSizeNonFetch##Scope(                                       \
       const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes,       \
       core::atomicType amoType, int pe, int qpId = 0) {                                        \
@@ -558,8 +558,8 @@ DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Double, double, Block)
                             bytes, amoType, pe, qpId);                                         \
   }
 
-SHMEM_ATOMIC_SIZE_NONFETCH_API_IMPL(Thread)
-SHMEM_ATOMIC_SIZE_NONFETCH_API_IMPL(Warp)
+SHMEM_ATOMIC_SIZE_NONFETCH_API_TEMPLATE(Thread)
+SHMEM_ATOMIC_SIZE_NONFETCH_API_TEMPLATE(Warp)
 
 #define SHMEM_ATOMIC_TYPE_NONFETCH_API_TEMPLATE(Scope)                                           \
   template <typename T>                                                                          \
@@ -596,7 +596,7 @@ DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Ulong, unsigned long, Warp)
 /* ---------------------------------------------------------------------------------------------- */
 /*                                       Atomic Fetch APIs                                        */
 /* ---------------------------------------------------------------------------------------------- */
-#define SHMEM_ATOMIC_TYPE_FETCH_API_IMPL(Scope)                                                  \
+#define SHMEM_ATOMIC_TYPE_FETCH_API_TEMPLATE(Scope)                                              \
   template <typename T>                                                                          \
   inline __device__ T ShmemAtomicTypeFetch##Scope(                                               \
       const application::SymmMemObjPtr dest, size_t destOffset, T val, T compare,                \
@@ -609,8 +609,8 @@ DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Ulong, unsigned long, Warp)
     return result;                                                                               \
   }
 
-SHMEM_ATOMIC_TYPE_FETCH_API_IMPL(Thread)
-SHMEM_ATOMIC_TYPE_FETCH_API_IMPL(Warp)
+SHMEM_ATOMIC_TYPE_FETCH_API_TEMPLATE(Thread)
+SHMEM_ATOMIC_TYPE_FETCH_API_TEMPLATE(Warp)
 
 #define DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(TypeName, T, Scope)                                \
   inline __device__ T ShmemAtomic##TypeName##Fetch##Scope(                                    \
