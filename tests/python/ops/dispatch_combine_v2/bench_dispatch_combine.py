@@ -114,6 +114,10 @@ UNCACHED_TOKEN_STORE = int(os.environ.get("UNCACHED_TOKEN_STORE", 0))
 UNCACHED_METADATA_STORE = int(os.environ.get("UNCACHED_METADATA_STORE", 0))
 REPLAY_FAST_PATH = int(os.environ.get("REPLAY_FAST_PATH", 0))
 REPLAY_BENCH = int(os.environ.get("REPLAY_BENCH", 0))
+TOKEN_CENTRIC_DISPATCH = int(os.environ.get("TOKEN_CENTRIC_DISPATCH", 0))
+TOKEN_CENTRIC_ROTATE_PEERS = int(
+    os.environ.get("TOKEN_CENTRIC_ROTATE_PEERS", 0)
+)
 ROTATE_DISPATCH_SLOT_ORDER = int(os.environ.get("ROTATE_DISPATCH_SLOT_ORDER", 0))
 ROTATE_COMBINE_PEER_ORDER = int(os.environ.get("ROTATE_COMBINE_PEER_ORDER", 0))
 ROUTING_PATTERN = os.environ.get("ROUTING_PATTERN", "random").lower()
@@ -266,6 +270,8 @@ def main():
             uncached_token_store=bool(UNCACHED_TOKEN_STORE),
             uncached_metadata_store=bool(UNCACHED_METADATA_STORE),
             replay_fast_path=bool(REPLAY_FAST_PATH),
+            token_centric_dispatch=bool(TOKEN_CENTRIC_DISPATCH),
+            token_centric_rotate_peer_order=bool(TOKEN_CENTRIC_ROTATE_PEERS),
             rotate_dispatch_slot_order=bool(ROTATE_DISPATCH_SLOT_ORDER),
             rotate_combine_peer_order=bool(ROTATE_COMBINE_PEER_ORDER),
         )
@@ -301,6 +307,10 @@ def main():
                     f"comb_variants={sorted(op._combine_variants)} "
                     f"tok_off_total={cfg.use_tok_off_total_recv} "
                     f"replay_fast={cfg.replay_fast_path} "
+                    f"token_centric={cfg.token_centric_dispatch} "
+                    f"token_peer_rotate={cfg.token_centric_rotate_peer_order} "
+                    f"token_centric_range=({cfg.token_centric_min_tokens},"
+                    f"{cfg.token_centric_max_tokens}) "
                     f"uncached_token_max={cfg.uncached_token_store_max_tokens} "
                     f"uncached_metadata_max={cfg.uncached_metadata_store_max_tokens}",
                     flush=True,
@@ -575,6 +585,8 @@ def main():
                 f"uncached_token={bool(UNCACHED_TOKEN_STORE)} "
                 f"uncached_metadata={bool(UNCACHED_METADATA_STORE)} "
                 f"replay_fast={bool(REPLAY_FAST_PATH)} "
+                f"token_centric={bool(TOKEN_CENTRIC_DISPATCH)} "
+                f"token_peer_rotate={bool(TOKEN_CENTRIC_ROTATE_PEERS)} "
                 f"rotate_dispatch={bool(ROTATE_DISPATCH_SLOT_ORDER)} "
                 f"rotate_combine={bool(ROTATE_COMBINE_PEER_ORDER)} "
                 f"routing={ROUTING_PATTERN} iters={ITERS}",
@@ -643,6 +655,7 @@ def main():
                     _tu, _mu = op._dispatch_cache_policy(ct)
                     _g = (
                         f"  [disp {_ds} comb {_cs} "
+                        f"token_centric={op._use_token_centric(ct)} "
                         f"uncached(token={_tu},meta={_mu})]"
                     )
                 else:

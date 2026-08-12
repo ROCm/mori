@@ -107,6 +107,10 @@ USE_TOK_OFF_TOTAL_RECV = int(os.environ.get("USE_TOK_OFF_TOTAL_RECV", 0))
 UNCACHED_TOKEN_STORE = int(os.environ.get("UNCACHED_TOKEN_STORE", 0))
 UNCACHED_METADATA_STORE = int(os.environ.get("UNCACHED_METADATA_STORE", 0))
 REPLAY_FAST_PATH = int(os.environ.get("REPLAY_FAST_PATH", 0))
+TOKEN_CENTRIC_DISPATCH = int(os.environ.get("TOKEN_CENTRIC_DISPATCH", 0))
+TOKEN_CENTRIC_ROTATE_PEERS = int(
+    os.environ.get("TOKEN_CENTRIC_ROTATE_PEERS", 0)
+)
 ROTATE_DISPATCH_SLOT_ORDER = int(os.environ.get("ROTATE_DISPATCH_SLOT_ORDER", 0))
 ROTATE_COMBINE_PEER_ORDER = int(os.environ.get("ROTATE_COMBINE_PEER_ORDER", 0))
 ROUTING_PATTERN = os.environ.get("ROUTING_PATTERN", "random").lower()
@@ -207,6 +211,8 @@ def main():
             uncached_token_store=bool(UNCACHED_TOKEN_STORE),
             uncached_metadata_store=bool(UNCACHED_METADATA_STORE),
             replay_fast_path=bool(REPLAY_FAST_PATH),
+            token_centric_dispatch=bool(TOKEN_CENTRIC_DISPATCH),
+            token_centric_rotate_peer_order=bool(TOKEN_CENTRIC_ROTATE_PEERS),
             rotate_dispatch_slot_order=bool(ROTATE_DISPATCH_SLOT_ORDER),
             rotate_combine_peer_order=bool(ROTATE_COMBINE_PEER_ORDER),
         )

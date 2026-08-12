@@ -34,6 +34,7 @@ from mori.tensor_utils import from_gpu_ptr
 from .intranode_kernels import (
     xdb_flag_slots,
     make_dispatch,
+    make_dispatch_token_centric,
     make_combine,
     make_combine_scatter,
     make_convert_dispatch_output,
@@ -160,6 +161,12 @@ class EpDispatchCombineConfig:
     # Replay-only A/B: decode destination PE/slot from the cached token map and
     # skip route loads plus duplicate detection.
     replay_fast_path: bool = False
+    # Workgroup-per-token load-once/store-many dispatch A/B.
+    token_centric_dispatch: bool = False
+    token_centric_rotate_peer_order: bool = False
+    token_centric_min_tokens: int = 0
+    token_centric_max_tokens: int = 0
+    token_centric_schedule: tuple = None
     # Peer-order A/B switches. Dispatch permutes each token's slot-to-warp
     # assignment; gather combine phase-shifts expert reads across warps.
     rotate_dispatch_slot_order: bool = False
@@ -275,6 +282,20 @@ class EpDispatchCombineConfig:
             self.uncached_metadata_store_max_tokens = max(
                 self.uncached_metadata_store_max_tokens,
                 int(t.get("uncached_metadata_store_max_tokens", 0)),
+            )
+            self.token_centric_min_tokens = max(
+                self.token_centric_min_tokens,
+                int(t.get("token_centric_min_tokens", 0)),
+            )
+            self.token_centric_max_tokens = max(
+                self.token_centric_max_tokens,
+                int(t.get("token_centric_max_tokens", 0)),
+            )
+            if self.token_centric_schedule is None:
+                self.token_centric_schedule = t.get("token_centric_schedule")
+            self.token_centric_rotate_peer_order = (
+                self.token_centric_rotate_peer_order
+                or bool(t.get("token_centric_rotate_peer_order", False))
             )
         else:
             # explicit geometry: fill any unset field with the single-shot default
@@ -627,6 +648,7 @@ class EpDispatchCombineOp:
             uncached_token_store=cfg.uncached_token_store,
             uncached_metadata_store=cfg.uncached_metadata_store,
             replay_fast_path=cfg.replay_fast_path,
+            token_centric_rotate_peer_order=cfg.token_centric_rotate_peer_order,
         )
         # (block, warp) -> compiled dispatch / combine kernel.
         self._dispatch_variants = {
@@ -859,6 +881,22 @@ class EpDispatchCombineOp:
             torch.int32,
         )
 
+    def _use_token_centric(self, num_tokens):
+        if self.cfg.token_centric_dispatch:
+            return True
+        lo = self.cfg.token_centric_min_tokens
+        hi = self.cfg.token_centric_max_tokens
+        return lo > 0 and num_tokens >= lo and (hi <= 0 or num_tokens <= hi)
+
+    def _token_centric_spec(self, num_tokens, fallback):
+        schedule = self.cfg.token_centric_schedule
+        if not schedule:
+            return fallback
+        for max_tok, block, warp in schedule:
+            if max_tok is None or num_tokens <= max_tok:
+                return block, warp
+        return schedule[-1][1], schedule[-1][2]
+
     def _pick(self, num_tokens):
         """((disp_block, disp_warp), (comb_block, comb_warp)) for a runtime token
         count via the per-token schedule; falls back to the single-shot specs
@@ -879,7 +917,10 @@ class EpDispatchCombineOp:
                 disp_spec, comb_spec = (last[1], last[2]), (last[3], last[4])
         else:
             disp_spec, comb_spec = self._dispatch_specs[0], self._combine_specs[0]
-        if disp_spec not in self._dispatch_variants:
+        use_token_centric = self._use_token_centric(num_tokens)
+        if use_token_centric:
+            disp_spec = self._token_centric_spec(num_tokens, disp_spec)
+        elif disp_spec not in self._dispatch_variants:
             disp_spec = self._dispatch_specs[-1]
         if comb_spec not in self._combine_variants:
             comb_spec = self._combine_specs[-1]
@@ -899,8 +940,10 @@ class EpDispatchCombineOp:
     def _get_dispatch_variant(self, spec, num_tokens, *, replay=False):
         """Select/compile the cache-policy specialization for this token bucket."""
         token_uncached, metadata_uncached = self._dispatch_cache_policy(num_tokens)
+        token_centric = self._use_token_centric(num_tokens)
         if (
             not replay
+            and not token_centric
             and token_uncached == self.cfg.uncached_token_store
             and metadata_uncached == self.cfg.uncached_metadata_store
         ):
@@ -911,7 +954,7 @@ class EpDispatchCombineOp:
             if replay
             else self._dispatch_policy_variants
         )
-        key = (spec, token_uncached, metadata_uncached)
+        key = (spec, token_uncached, metadata_uncached, token_centric)
         kern = variants.get(key)
         if kern is None:
             kwargs = dict(self._dispatch_kwargs)
@@ -919,7 +962,10 @@ class EpDispatchCombineOp:
                 uncached_token_store=token_uncached,
                 uncached_metadata_store=metadata_uncached,
             )
-            kern = variants[key] = make_dispatch(
+            factory = (
+                make_dispatch_token_centric if token_centric else make_dispatch
+            )
+            kern = variants[key] = factory(
                 replay=replay,
                 block_num=spec[0],
                 warp_num_per_block=spec[1],

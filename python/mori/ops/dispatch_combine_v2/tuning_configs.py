@@ -110,6 +110,11 @@ _MI355X_SCHED_BF16_NO_CACHE_HINT = (
     (4096, 160, 8, 32, 16),
     (None, 128, 16, 48, 16),
 )
+_MI355X_TOKEN_CENTRIC_BF16 = (
+    (512, 64, 8),
+    (1024, 96, 8),
+    (4096, 160, 8),
+)
 # Preserve the pre-existing plan for topk=6 and untuned shapes. On the measured
 # topk=6 / 384-expert shape, 64x8 regresses 112-token dispatch by 3.5%.
 _MI355X_SCHED_BF16_BASE = (
@@ -194,6 +199,17 @@ _MI355X_TABLE = {
                 "uncached_metadata_store_max_tokens": (
                     256 if HAS_BUFFER_OPS else 0
                 ),
+                # Workgroup-per-token load-once/store-many wins from 512
+                # through the largest measured bucket. Keep small tokens and
+                # >4096 on the work-centric kernel.
+                "token_centric_min_tokens": 512 if HAS_BUFFER_OPS else 0,
+                "token_centric_max_tokens": 4096 if HAS_BUFFER_OPS else 0,
+                "token_centric_schedule": (
+                    _MI355X_TOKEN_CENTRIC_BF16
+                    if HAS_BUFFER_OPS
+                    else None
+                ),
+                "token_centric_rotate_peer_order": HAS_BUFFER_OPS,
             }
         },
     },

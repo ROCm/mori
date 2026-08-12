@@ -42,7 +42,7 @@ Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 |---|---|
 | `test_dispatch_combine_v2_intranode.py` | pytest wrapper: runs `test_op.py` under torchrun for the representative modes and asserts every line PASS |
 | `test_op.py` | EP8 op-layer test (gather/scatter, quant, StdMoE, recv-cap, scales, LEC, reset, replay) |
-| `bench_dispatch_combine.py` | eager + CUDA-graph perf bench + e2e correctness. Envs: `DTYPE=bf16\|f32\|fp8\|fp4`, `COMBINE=gather\|scatter`, `QUANT=none\|fp8_direct_cast\|fp8_blockwise`, `STDMOE=1`, `SCALE_DIM`, `SWEEP`, `DISP_BLOCK`/`COMB_BLOCK`, `WARP_NUM`/`COMB_WARP`, `MODE`, `TUNED`, `USE_TOK_OFF_TOTAL_RECV`, `UNCACHED_TOKEN_STORE`, `UNCACHED_METADATA_STORE`, `REPLAY_FAST_PATH`, `REPLAY_BENCH`, `PREFETCH_ROUTE_PAYLOAD`, `DEFER_DEST_CTR_ATOMIC`, `ROTATE_DISPATCH_SLOT_ORDER`, `ROTATE_COMBINE_PEER_ORDER`, `ROUTING_PATTERN` |
+| `bench_dispatch_combine.py` | eager + CUDA-graph perf bench + e2e correctness. Envs: `DTYPE=bf16\|f32\|fp8\|fp4`, `COMBINE=gather\|scatter`, `QUANT=none\|fp8_direct_cast\|fp8_blockwise`, `STDMOE=1`, `SCALE_DIM`, `SWEEP`, `DISP_BLOCK`/`COMB_BLOCK`, `WARP_NUM`/`COMB_WARP`, `MODE`, `TUNED`, `USE_TOK_OFF_TOTAL_RECV`, `UNCACHED_TOKEN_STORE`, `UNCACHED_METADATA_STORE`, `REPLAY_FAST_PATH`, `REPLAY_BENCH`, `TOKEN_CENTRIC_DISPATCH`, `TOKEN_CENTRIC_ROTATE_PEERS`, `PREFETCH_ROUTE_PAYLOAD`, `DEFER_DEST_CTR_ATOMIC`, `ROTATE_DISPATCH_SLOT_ORDER`, `ROTATE_COMBINE_PEER_ORDER`, `ROUTING_PATTERN` |
 | `run_bench.sh` | bench launcher (runs `bench_dispatch_combine.py` in the container) |
 
 (Each script inlines a tiny torchrun/gloo `Dist` bootstrap — gloo only carries the cco unique-id and pass/fail counts.)
@@ -71,7 +71,9 @@ across BF16/FP8/FP4, top-k 4/8/9, gather/scatter, and scale forwarding at
 dispatch-stall experiments below are selected with `PREFETCH_ROUTE_PAYLOAD=1` and
 `DEFER_DEST_CTR_ATOMIC=1`. The 2026-08-11 atomic/cache experiments use
 `USE_TOK_OFF_TOTAL_RECV`, `UNCACHED_TOKEN_STORE`,
-`UNCACHED_METADATA_STORE`, `REPLAY_FAST_PATH`, and `REPLAY_BENCH`. Peer-order experiments use
+`UNCACHED_METADATA_STORE`, `REPLAY_FAST_PATH`, and `REPLAY_BENCH`. Token-centric
+experiments use `TOKEN_CENTRIC_DISPATCH` and `TOKEN_CENTRIC_ROTATE_PEERS`.
+Peer-order experiments use
 `ROTATE_DISPATCH_SLOT_ORDER=1`, `ROTATE_COMBINE_PEER_ORDER=1`, and
 `ROUTING_PATTERN=random|aligned|round_robin|hotspot`.
 
@@ -169,6 +171,122 @@ waits moved upward, confirming that the gain comes from removing the second
 atomic/queue dependency and changing store policy rather than making the
 remaining remote fetch-add faster. Both kernels remain at or below `v17` and
 emit no scratch loads/stores.
+
+## Token-centric dispatch A/B (MI355X / gfx950, 2026-08-12)
+
+The work-centric kernel assigns one wave to each `(token, top-k slot)`, so the
+same local token row is loaded once per unique destination PE. The token-centric
+variant assigns one workgroup to a token:
+
+1. wave 0 loads the full top-k row once, deduplicates by PE, and allocates one
+   destination slot per unique PE;
+2. a small PE-indexed LDS table publishes `(valid, recv_slot)` to the workgroup;
+3. every thread loads one 16-byte token chunk once and stores that value to all
+   valid peers; waves phase-shift their peer order to avoid synchronized incast;
+4. the existing grid/rank completion and `tok_off` total-count path is reused.
+
+The kernel keeps normal/replay, sentinel/overflow, TIS, idx/wts, scales,
+scatter, and StdMoE semantics. `TOKEN_CENTRIC_DISPATCH=1` forces it for A/B;
+add `TOKEN_CENTRIC_ROTATE_PEERS=1` to reproduce the measured phase-shifted
+variant. The tuned policy only enables both for measured BF16/top-k=8 buckets.
+
+### Correctness
+
+Correctness passed random/aligned/round-robin/hotspot routing at 8/128/512
+tokens, BF16 top-k=6/8, FP8, FP4, gather/scatter, scales, replay, StdMoE,
+local-expert-count, and capped receives. Capped runs intentionally print the
+full-count LEC mismatch while their dedicated `OP-CAP` checks pass.
+
+### Geometry and latency
+
+Baseline and token-centric measurements use identical `tok_off` and cache
+policies. Values are means of three interleaved 20-warmup/300-iteration graph
+runs, with each kernel using its best measured geometry.
+
+| routing / tokens | work-centric | token-centric | change | token geometry |
+|---|---:|---:|---:|---:|
+| random / 128 | 40.42 us | 42.85 us | +6.00% | 128x8 |
+| random / 512 | 116.59 us | 113.58 us | -2.58% | 64x8 |
+| random / 1024 | 218.18 us | 215.42 us | -1.26% | 96x8 |
+| random / 2048 | 415.31 us | 409.59 us | -1.38% | 160x8 |
+| hotspot / 512 | 148.15 us | 145.81 us | -1.58% | 64x8 |
+| hotspot / 2048 | 558.97 us | 559.27 us | +0.05% | 160x8 |
+
+Single expansion runs also showed aligned/512 -3.15%, BF16 top-k=6/512
+-3.28%, and FP8/512 -0.99%. At 256 tokens the gain was only 0.81%; at 128
+tokens insufficient active token workgroups make the new route barriers and
+larger kernel more expensive than the saved loads. Phase-shifting peer order
+across workgroup waves improved random/512 by another 0.59%.
+
+The tuned MI355X BF16/top-k=8 policy therefore uses:
+
+| token range | kernel | dispatch geometry |
+|---:|---|---:|
+| <=256 | work-centric | existing schedule |
+| 257-511 | work-centric | existing schedule |
+| 512 | token-centric | 64x8 |
+| 513-1024 | token-centric | 96x8 |
+| 1025-4096 | token-centric | 160x8 |
+| >4096 | work-centric | existing schedule (unmeasured) |
+
+FlyDSL >=0.3 currently ignores the cache hints used by this measured policy, so
+both the cache thresholds and automatic token-centric schedule remain disabled
+there; the explicit A/B flag remains available.
+
+### ATT
+
+Source-mapped 512-token traces use the same 64x8 geometry:
+
+- baseline: `profiles/ep-v2-att-token-centric-baseline`
+- variant: `profiles/ep-v2-att-token-centric-variant`
+
+The sampled payload `buffer_load_dwordx4` hit count fell from 2051 to 784
+(-61.8%). Baseline token-copy wait was about 2340 cycles/hit; the token-centric
+store-many sequence moved corresponding waits to roughly 1200-1700 cycles/hit.
+The work-centric final Phase-2 barrier was about 45118 cycles/hit; the
+token-centric final barrier fell to 368, but it adds per-token route and LDS
+reuse barriers at about 3106 and 8816 cycles/hit. Its remote slot atomic wait
+rose from about 3517 to 4721 cycles/hit, and register use rose from `v17` to
+`v55`, but neither kernel emitted scratch traffic. The wall-clock win therefore
+comes from fewer local payload loads and better workgroup balance, partially
+offset by route barriers, serial store-many waits, and higher VGPR pressure.
+
+### Follow-up optimization A/B
+
+Five follow-up directions were implemented as isolated compile-time variants,
+tested, and then removed because none produced a stable wall-clock win. All
+512-token values below use BF16/top-k=8, random routing, 64x8, the same
+`tok_off`/cache policy, and interleaved graph runs.
+
+| experiment | baseline | variant | result |
+|---|---:|---:|---:|
+| raw addrspace(1) global payload store | 114.89 us | 115.49 us | +0.52% |
+| fixed peer order | 115.21 us | 115.39 us | +0.16% |
+| even/odd forward-reverse peer order | 115.21 us | 115.67 us | +0.40% |
+| fixed order + peer-base hoist | 115.21 us | 115.38 us | +0.15% |
+| explicit wave-uniform peer scalarization | 115.99 us | 115.60 us | -0.33% |
+| weight load after slot atomic | 115.81 us | 115.23 us | -0.50% |
+| skip final LDS-reuse barrier | 115.81 us | 115.62 us | -0.16% |
+| weight reorder + barrier skip | 115.81 us | 115.66 us | -0.13% |
+| two-chunk software pipeline | 115.45 us | 115.44 us | -0.01% |
+| four-chunk software pipeline | 115.45 us | 115.54 us | +0.08% |
+| ping-pong route double buffer | 115.45 us | 115.48 us | +0.03% |
+
+The raw-store path did generate `global_store_dwordx4` and removed the buffer
+descriptor form, but LLVM did not preserve the requested gfx950 `sc0 nt` policy;
+the lost cache policy offset the removed descriptor waterfall. It was neutral at
+2048 (-0.14%) and regressed 1024 by 0.26%.
+
+Moving weight behind the atomic showed only 0.31% at 1024 and was neutral at
+2048. Chunk streams 1/2/4 were indistinguishable, including combinations with
+the raw-store path. The route ping-pong implementation correctly overlapped
+wave-0 routing of token N+1 with data-wave copy of token N and passed
+replay/scales, but losing wave 0 from the copy team and its larger kernel
+cancelled the removed barrier.
+
+Conclusion: retain cyclic peer rotation and the original one-chunk,
+buffer-store token-centric implementation. The remaining ATT stalls are not
+independently removable at useful wall-clock scale on this workload.
 
 ## Dispatch stall A/B (MI355X / gfx950, 2026-08-07)
 
