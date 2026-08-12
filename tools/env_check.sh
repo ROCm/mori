@@ -1106,14 +1106,45 @@ check_bnxt_versions() {
     done
 
     # --- RoCE userspace library ---
-    local roce_lib_dir="/usr/local/lib"
-    local found_ver
-    found_ver=$(find "$roce_lib_dir" -maxdepth 2 -name 'libbnxt_re-*.so' 2>/dev/null \
-        | sed -n 's|.*libbnxt_re-\([0-9][0-9.]*\)\.so$|\1|p' | sort -V | tail -1)
-    if [[ -n "$found_ver" ]]; then
-        log_ok "libbnxt_re userspace : $found_ver"
+    # Two provider shapes exist and both are valid:
+    #   - Broadcom out-of-tree: libbnxt_re-<fw-style ver>.so, usually in
+    #     /usr/local/lib; its version is expected to track the kernel driver.
+    #   - rdma-core in-tree   : libbnxt_re-rdmav<abi>.so in a libibverbs
+    #     provider dir; versioned by rdma-core ABI, not by firmware.
+    # Searching only /usr/local/lib for only the first shape reported a
+    # perfectly functional in-tree provider as missing.
+    local lib_dirs=() d
+    for d in /usr/local/lib /usr/lib64/libibverbs \
+             /usr/lib/x86_64-linux-gnu/libibverbs /usr/lib/libibverbs; do
+        [[ -d "$d" ]] && lib_dirs+=("$d")
+    done
+    # Containers commonly stage the host provider somewhere non-standard and
+    # point at it with LD_LIBRARY_PATH; honour that rather than hardcoding paths.
+    local _ldp=()
+    IFS=: read -ra _ldp <<< "${LD_LIBRARY_PATH:-}"
+    for d in "${_ldp[@]}"; do
+        [[ -n "$d" && -d "$d" ]] && lib_dirs+=("$d")
+        [[ -n "$d" && -d "$d/libibverbs" ]] && lib_dirs+=("$d/libibverbs")
+    done
+
+    if [[ ${#lib_dirs[@]} -eq 0 ]]; then
+        log_warn "no library directory to search for a libbnxt_re provider"
     else
-        log_warn "libbnxt_re-<ver>.so not found under $roce_lib_dir"
+        local oot_ver intree
+        oot_ver=$(find "${lib_dirs[@]}" -maxdepth 2 -name 'libbnxt_re-[0-9]*.so' 2>/dev/null \
+            | sed -n 's|.*libbnxt_re-\([0-9][0-9.]*\)\.so$|\1|p' | sort -V | tail -1)
+        intree=$(find "${lib_dirs[@]}" -maxdepth 2 -name 'libbnxt_re-rdmav*.so' 2>/dev/null \
+            | sort -u | head -1)
+        if [[ -n "$oot_ver" ]]; then
+            log_ok "libbnxt_re userspace : $oot_ver (Broadcom out-of-tree)"
+        elif [[ -n "$intree" ]]; then
+            local core_ver
+            core_ver=$(rpm -q --qf '%{VERSION}-%{RELEASE}' rdma-core 2>/dev/null \
+                    || dpkg-query -W -f='${Version}' rdma-core 2>/dev/null || true)
+            log_ok "libbnxt_re userspace : $(basename "$intree") (rdma-core in-tree${core_ver:+ $core_ver})"
+        else
+            log_warn "no libbnxt_re provider found (searched: ${lib_dirs[*]})"
+        fi
     fi
 
     # --- firmware version via niccli -i <idx> show per NIC ---
