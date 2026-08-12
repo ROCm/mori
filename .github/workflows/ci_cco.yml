@@ -167,14 +167,21 @@ jobs:
             cd $GITHUB_WORKSPACE/build && \
             timeout 600 ctest --output-on-failure -R '^jit_'"
 
-      - name: Run JIT v2 Python binding tests (1 rank)
+      - name: Run JIT v2 Python binding tests (1 rank, outside the repo)
         run: |
           # 18 tests over the ctypes/C-ABI seam -- schema-vs-sizeof, request coercion,
           # unknown-field rejection. Single rank on purpose: EpDispatchPlan(world_size=1)
           # needs no communicator, which is what makes this cheap enough to always run.
+          #
+          # Run from /tmp, not the checkout, and that is the point: building a plan
+          # needs libmori_jit.so, libmori_ops_v2.so and the v2 kernel sources, and from
+          # a repo cwd every one of those resolves out of build/ and src/ even when the
+          # INSTALL ships none of them. Both halves of exactly that bug were live until
+          # this commit's siblings. Outside the repo only the packaged copies can answer.
           $CT exec $CONTAINER bash -c "\
-            cd $GITHUB_WORKSPACE && \
-            timeout 600 python -m pytest tests/python/ops/dispatch_combine_v2/test_jit_binding.py -v"
+            cd /tmp && \
+            timeout 600 python -m pytest \
+              $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2/test_jit_binding.py -v"
 
       - name: Run ops-v2 dispatch/combine test (EP8, 8 ranks)
         run: |

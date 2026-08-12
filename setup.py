@@ -661,6 +661,21 @@ class CMakeBuild(build_ext):
                 build_dir / "src/metrics/libmori_metrics.so",
                 root_dir / "python/mori/libmori_metrics.so",
             ),
+            # JIT v2. Both targets are built unconditionally (root CMakeLists), and
+            # mori.jit.v2.plan_api looks for them next to the mori package first, so
+            # this is where they have to land. Without them a wheel raises
+            # "libmori_ops_v2.so not found" the moment anyone selects the hip backend;
+            # a dev tree hides it because plan_api also probes build/src/**.
+            # mori_logging is an INTERFACE target and hip::host is the system runtime,
+            # so these two plus $ORIGIN (set in their CMakeLists) close the chain.
+            (
+                build_dir / "src/jit/v2/libmori_jit.so",
+                root_dir / "python/mori/libmori_jit.so",
+            ),
+            (
+                build_dir / "src/ops/dispatch_combine_v2/libmori_ops_v2.so",
+                root_dir / "python/mori/libmori_ops_v2.so",
+            ),
         ]
         collective_so = build_dir / "src/collective/libmori_collective.so"
         if collective_so.exists():
@@ -868,6 +883,8 @@ mori_package_data = [
     "libmori_application.so",
     "libmori_metrics.so",
     "libmori_collective.so",  # optional: only present when BUILD_COLLECTIVE=ON
+    "libmori_jit.so",  # JIT v2 C ABI + plan registry
+    "libmori_ops_v2.so",  # v2 EP kernels' host side; registers into libmori_jit
     "umbp_master",
     "umbp_standalone_server",
     "_jit-sources/include/**/*.hpp",
