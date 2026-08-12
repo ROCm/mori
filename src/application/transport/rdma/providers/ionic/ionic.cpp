@@ -548,52 +548,6 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
     return endpoint;
   }
 
-  if (proxyEnabled) {
-    ibv_pd* basePd = GetIbvPd();
-
-    ibv_cq* plainCq = ibv_create_cq(context, config.maxMsgsNum * 2, nullptr, nullptr, 0);
-    assert(plainCq);
-
-    ibv_qp_init_attr qa{};
-    qa.send_cq = plainCq; qa.recv_cq = plainCq; qa.qp_type = IBV_QPT_RC;
-    qa.cap.max_send_wr = config.maxMsgsNum;
-    qa.cap.max_recv_wr = config.maxRecvWr != 0 ? config.maxRecvWr : config.maxMsgsNum;
-    qa.cap.max_send_sge = 1; qa.cap.max_recv_sge = 1; qa.cap.max_inline_data = 64;
-    ibv_qp* plainQp = ibv_create_qp(basePd, &qa);
-    assert(plainQp);
-
-    RdmaEndpoint endpoint;
-    endpoint.handle.psn = 0;
-    endpoint.handle.portId = config.portId;
-    endpoint.handle.qpn = plainQp->qp_num;
-
-    const ibv_port_attr* gidPortAttr = GetRdmaDevice()->GetPortAttr(config.portId);
-    assert(gidPortAttr);
-    GidSelectionResult gidSel = AutoSelectGidIndex(context, config.portId, gidPortAttr, config.gidIdx);
-    memcpy(endpoint.handle.eth.gid, gidSel.gid.raw, sizeof(endpoint.handle.eth.gid));
-    endpoint.handle.eth.gidIdx = gidSel.gidIdx;
-    endpoint.vendorId = RdmaDeviceVendorId::Pensando;
-    endpoint.ibvHandle.qp = plainQp;
-    endpoint.ibvHandle.cq = plainCq;
-
-    size_t ibufSlots = RoundUpPowOfTwo(config.atomicIbufSlots);
-    size_t ibufSize = (ibufSlots + 1) * 8;
-    void* ibufAddr = nullptr;
-    int ae = posix_memalign(&ibufAddr, 4096, ibufSize);
-    assert(ae == 0 && ibufAddr);
-    memset(ibufAddr, 0, ibufSize);
-    ibv_mr* ibufMr = ibv_reg_mr(basePd, ibufAddr, ibufSize,
-        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
-    assert(ibufMr);
-    endpoint.atomicIbuf.addr = reinterpret_cast<uintptr_t>(ibufAddr);
-    endpoint.atomicIbuf.lkey = ibufMr->lkey;
-    endpoint.atomicIbuf.rkey = ibufMr->rkey;
-    endpoint.atomicIbuf.nslots = ibufSlots;
-
-    proxyQpPool[plainQp->qp_num] = plainQp;
-    return endpoint;
-  }
-
   struct ibv_pd* pd = pd_uxdma[qp_counter & 1];
   qp_counter++;
   IonicCqContainer* cq = new IonicCqContainer(context, config, pd);
