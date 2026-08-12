@@ -67,6 +67,18 @@ keep enough writes in flight to cover interconnect latency; it measured 15.8 GB/
 gfx1250 and 745 GB/s on gfx950 at the same 4 MiB payload. Splitting each chunk across
 `blocks_per_peer` blocks is worth ~2.5x on gfx950 and ~95x on gfx1250.
 
+The gfx942 column is limited by the allocator, not the fabric. `ubench/06` measures that
+box's XGMI at 48.4 GB/s per link unidirectional (76% of theoretical) and 2637 GB/s
+aggregate all-to-all via `hipMemcpyPeer`, so 185 GB/s is ~7% of what the interconnect can
+carry. The cause is local: writing the VMM window runs at ~50 GB/s against ~880 GB/s for a
+plain `hipMalloc` tensor. A GPU's *own* slot is as slow as a peer's, torch's `data_ptr`
+mapping is as slow as the flat alias, `copy_()` is as slow as our kernel, and Uncached
+matches Pinned — so it is the `hipMemCreate` memory itself on this ROCm build, not the
+aliasing, the handle type, or anything crossing XGMI. gfx1250 shows no such penalty
+(window and plain tensor both 9.7 GB/s under an identical probe). This is also why mori's
+shmem uses `hipMalloc` + hipIpc on gfx9, at the cost of scattered rather than flat peer
+pointers.
+
 Allocating the window as uncached/fine-grained (as mori's cco windows are) was measured
 and rejected: on gfx1250 it costs about half the bandwidth (712 vs 1499 GB/s at 4 ranks),
 and it changes nothing on gfx950. The backend uses ordinary coarse-grained pinned memory.
