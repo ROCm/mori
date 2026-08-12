@@ -403,15 +403,16 @@ void Context::BuildAndConnectInitialEndpoints() {
   for (int i = 0; i < WorldSize(); i++) {
     if (transportTypes[i] == TransportType::RDMA) {
       for (int qp = 0; qp < numQpPerPe; qp++) {
-        RdmaDeviceContext* ctx = rdmaDeviceContext.get();
         if (proxyEnabled) {
           const int numRailContexts = static_cast<int>(allRdmaDeviceContexts.size());
           int peerLocalGpu = i % numRailContexts;
           int agreedRail = std::max(myLocalGpu, peerLocalGpu) % numRailContexts;
-          ctx = allRdmaDeviceContexts[agreedRail].get();
+          RdmaEndpoint ep = allRdmaDeviceContexts[agreedRail]->CreateRdmaEndpoint(savedEpConfig);
+          rdmaEps.push_back(ep);
+        } else {
+          RdmaEndpoint ep = rdmaDeviceContext->CreateRdmaEndpoint(savedEpConfig);
+          rdmaEps.push_back(ep);
         }
-        RdmaEndpoint ep = ctx->CreateRdmaEndpoint(savedEpConfig);
-        rdmaEps.push_back(ep);
       }
     } else {
       for (int qp = 0; qp < numQpPerPe; qp++) {
@@ -435,16 +436,13 @@ void Context::BuildAndConnectInitialEndpoints() {
     }
     for (int qp = 0; qp < numQpPerPe; qp++) {
       int epIndex = peer * numQpPerPe + qp;
-      RdmaDeviceContext* ctx = rdmaDeviceContext.get();
       if (proxyEnabled) {
         const int numRailContexts = static_cast<int>(allRdmaDeviceContexts.size());
         int peerLocalGpu = peer % numRailContexts;
         int agreedRail = std::max(myLocalGpu, peerLocalGpu) % numRailContexts;
-        ctx = allRdmaDeviceContexts[agreedRail].get();
-      }
-      ctx->ConnectEndpoint(localToPeerEpHandles[epIndex],
-                           peerToLocalEpHandles[epIndex], qp);
-      if (proxyEnabled) {
+        RdmaDeviceContext* ctx = allRdmaDeviceContexts[agreedRail].get();
+        ctx->ConnectEndpoint(localToPeerEpHandles[epIndex],
+                             peerToLocalEpHandles[epIndex], qp);
         auto* ionic = dynamic_cast<IonicDeviceContext*>(ctx);
         if (ionic) {
           auto ri = ionic->GetProxyRecvInfo(rdmaEps[epIndex].handle.qpn);
@@ -452,6 +450,9 @@ void Context::BuildAndConnectInitialEndpoints() {
           rdmaEps[epIndex].ibvHandle.recvLkey = ri.lkey;
           rdmaEps[epIndex].ibvHandle.recvCount = ri.count;
         }
+      } else {
+        rdmaDeviceContext->ConnectEndpoint(localToPeerEpHandles[epIndex],
+                                           peerToLocalEpHandles[epIndex], qp);
       }
     }
   }
