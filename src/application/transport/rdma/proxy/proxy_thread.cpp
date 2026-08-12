@@ -34,6 +34,8 @@ void ProxyThread::Shutdown() {
   if (ring_) ring_->shutdown = 1;
   running_.store(false);
   pthread_join(thread_, nullptr);
+  fprintf(stderr, "[MoRI-DBG] ProxyThread gpu=%d: total posted=%lu completed=%lu\n",
+          gpu_id_, ops_posted_, ops_completed_);
 }
 
 void* ProxyThread::ThreadFunc(void* arg) {
