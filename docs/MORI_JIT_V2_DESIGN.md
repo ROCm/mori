@@ -51,7 +51,7 @@ mori 特有的简化：走 `.hsaco` + `hipModuleGetFunction` 而非链接，所�
 | | 文件 | 内容 | 谁编译 |
 |---|---|---|---|
 | ① Cfg | `ep_cfg.hpp` | Cfg + Args + `VisitFields` + 共享几何 constexpr | **两侧**（HIP-free） |
-| ② body | `ep_intranode_kernel.hpp` | `template <EpCfg kCfg, typename T> __device__ void Body(EpArgs)` | 只有生成的 TU |
+| ② body | `ep_intranode_kernel.hpp`（portable）<br>`ep_intranode_1250x.hpp`（gfx125x TDM） | `template <EpCfg kCfg, typename T> __device__ void Body(EpArgs)` | 只有生成的 TU |
 | ③ Spec | `ep_spec.hpp/.cpp` | Request + `RenderSource` + `Geometry` + 注册宏 | host |
 
 新增一个 kernel 就是写这三样。**Python 侧零行**——Plan 类由 C++ 发布的 schema 生成。
@@ -119,6 +119,10 @@ mori_jit_entry(EpArgs args) { EpDispatchBody<kCfg, TokT>(args); }
 - **入口名恒定** → 不需要符号枚举、不需要链接期解析，Python 侧的名字拼接彻底消失。
 - **文本即 key** → 配置不可能不进 key。
 - **`__launch_bounds__` 是表达式不是数字** → 由 host/device 共用的同一个 constexpr 算出。
+- **arch 路由在 host 侧**：include 哪个 body、调哪个函数，由 `RenderSource` 按
+  `GetToolchain().arch` 决定——gfx125x 渲染 `ep_intranode_1250x.hpp` 的 TDM 版本，其余渲染 portable
+  版。不是 device `#if`：渲染时看到的 arch 就是 `--offload-arch` 的 arch，两侧不可能不一致；而这个
+  选择写在源码文本里，所以自动进 key，两种 body 各有自己的缓存条目。
 
 **为什么生成不能放 Python**：Cfg 同时是 NTTP 类型，Python 渲染就要自己维护一份字段列表和默认值
 → 两张清单的问题原样回来。几何算术同理——device 侧也要调它。
@@ -180,6 +184,23 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
 `MakeEpCfg` 末尾是**唯一**读 `MORI_V2_EP_*` 的地方，而且只做覆盖不做决定。覆盖后的 Cfg 自动进 key，
 所以 A/B 不可能复用错的二进制——`NOQUANT` 那个 bug 在结构上不可能发生。
 
+### 3.7 dtype 是传输属性，不是算术属性
+
+dispatch 只**搬运**它的载荷（gfx9xx 是 `WarpCopy`，gfx125x 是一发 TDM tile），从不对元素做算术。
+combine 要**归约**。这个不对称决定了 dtype 怎么建模：
+
+```cpp
+enum class EpDType : int { Bf16 = 0, Fp32 = 1, Byte8 = 2 };
+```
+
+`Byte8` 是传输类型，渲染成 `unsigned char`：fp8 直接用它，fp4 也用它、由调用方把 hiddenDim 减半
+（2 个 e2m1 挤一个字节）。所以支持 fp8/fp4 dispatch **没有新增 kernel**，只是打通 dtype 这条链。
+`MakeEpCfg` 在 combine 那条腿上拒绝 `Byte8`——它要求和，字节类型在那里能编过但会静默把字节加起来。
+
+两条腿本来就是两个独立的 Plan，各带各的 dtype 和元素数，所以「非对称」（fp8/fp4 进、bf16 出）不是
+一个特例路径，就是两个普通 kernel。arena 按 `token_nbytes` / `combine_token_nbytes` 分别定尺寸——
+这是 fp4 唯一正确的算法。mori 在这里**不做量化**：载荷进来时就已经是打包好的。
+
 ## 4. op 层
 
 op 在 Python，因为它持有的全是状态。C++ 侧没有对应的类。
@@ -205,6 +226,12 @@ comm → arena → 每变体一个 Plan（编译）→ launch
 - **变体表在 `Pick` 前编全**：`Pick` 只查表，关键路径上绝不触发编译。与 opus_gemm 那条
   「启发式能返回的 kid 必须在编译子集里」是同一个不变量，只是靠 map 查而非 codegen 期 assert。
 
+捕获已实测（`tests/python/ops/dispatch_combine_v2/test_graph_capture.py`）：dispatch → identity
+expert → combine 整步捕成一张图，replay 反复复现同一结果。能成立还差一个条件，而它在 kernel 里：
+**跨设备 barrier 的 epoch 由设备侧自增**（dispatch 结尾 `atomicAdd(xdbFlag, 1)`）。若由 host 算好写
+下去，捕获会把一个定值冻进图里，第一次之后每次 replay 要么空转要么白过——这正是那个测试要抓的东西，
+另一个是 op 里混进 host 同步（`.item()`/`.cpu()`）会直接让捕获失败。
+
 ## 5. 两个后端共用一个 op
 
 `EpDispatchCombineOp(cfg, comm)` 按 `cfg.kernel_backend`（或 `MORI_V2_KERNEL_BACKEND`，默认
@@ -225,13 +252,32 @@ kernel 内还是 host 侧）、`self_resets_counters`、`capabilities`/`unsuppor
 唯一没法变成数据的是**调用约定**，所以它被吸收进 `_build_kernels`：返回的 callable 已经是父类的
 具名签名，FlyDSL 的 11 个位置参数和 ctypes plan 的关键字参数各自在 `_wrap_*` 里适配。
 
-**特性面是真包含不是交集**：HIP 后端只有 bf16/fp32 gather。能力门在**构造期**跑、且在分配 arena
-之前——问它要 fp8 会当场报错并列出缺什么，不是发射时给出错误数字。
+**特性面是真包含不是交集**：HIP 后端做 gather combine，dispatch 收 bf16/fp32/fp8/fp4、combine 出
+bf16/fp32（§3.7），其余一概不接：scatter、量化（`quant_type`，与直接传已量化载荷是两回事）、
+StdMoE、per-token scales、routing replay、`local_expert_count`。能力门在**构造期**跑、且在分配 arena
+之前——问它要 scatter 会当场报错并列出缺什么，不是发射时给出错误数字。
 
 `_regions` 归子类还消掉一个陷阱：FlyDSL 的 `off_out_tok` 对 dispatch 指 `disp_out`、对 combine 指
 `out_tok`，任何共享的 offset 传递路径都会静默接错 buffer。
 
 **选后端只 import 那一个**：选 `hip` 不会拉进 flydsl，所以它在没装 FlyDSL 的机器上能跑。
+
+### 5.1 几何调优表：每个后端一份，dispatch 和 combine 再分开
+
+调优表也归后端。`hip_tuning_configs.py` 不 import FlyDSL 的 `tuning_configs`——不同 kernel、不同最优点，
+借过来只会得到一个看起来合理的错答案。
+
+表内再拆成两张：`_DISPATCH_TABLE` 带 dtype 键，`_COMBINE_TABLE` 不带。因为 **combine 根本不依赖
+dispatch 的 dtype**——它只归约 bf16/fp32 的暂存区，不管前面搬来的是什么。合成一张表就必须给 combine
+挂一个假的 dtype 轴，然后维护三份相同的答案。`lookup()` 把两张表合成 op 要的那条 schedule，能处理两边
+桶边界不对齐的情况，所以任一半都能单独重调。
+
+键是 `(world_size, hidden_dim, topk, experts_per_rank)`。实测结论直接编码在键里：**topk 会移动桶边界**
+（它决定 `_tpi = warpSize/topk`，也就是一个几何在多少 token 内能一轮盖完），**专家数不会**（64 vs 96
+在所有几何/dtype/topk 上都在 2% 以内），所以后者用 `None` 通配——那个通配是个结论，不是省事。
+
+取值规则：**性能接近时取更小的几何**，因为少占 CU 在与专家 GEMM 重叠时是真收益。这类 3% 以内的取舍是
+**策略不是测量**（单次 bench 偶尔会偏 20%）；真正由数据定的是桶的**边界**，它们来自 10~40% 的差异。
 
 ## 6. Python 绑定
 
@@ -291,6 +337,19 @@ run 新增 16 份而不是 2 份，AOT 也无从谈起。旁证：gfx942 上 8 �
 4096 上 combine 快 12%，差在暂存拷贝：FlyDSL 在 kernel 前单独发一发 311MB 的 torch copy，
 HIP 在 kernel 内做、与 barrier 等待重叠——104µs 变 ~1µs。
 
+4×gfx1250（MI450）EP4，hidden=7168 topk=8，对照 v1 `tools/ep_test.sh` 的出厂默认，µs：
+
+| tok/rank | 64 | 512 | 2048 | 4096 | 16384 |
+|---|---|---|---|---|---|
+| dispatch v1 → v2 | 80.9 → **73.1** | 82.8 → **74.7** | 104.6 → **97.4** | 171.4 → **152.0** | 584.5 → **519.6** |
+| combine v1 → v2 | 26.9 → **21.3** | 41.7 → **36.9** | 96.7 → **83.8** | 169.6 → **146.4** | 588.7 → **523.0** |
+
+每档都快（dispatch 7~12%，combine 11~23%）。同几何下的那部分来自 Cfg 是编译期 NTTP：ISA 里整数除法
+dispatch 41→3、combine 57→10（`/maxRecv`、`%numExpertPerRank` 变成移位），combine 的 load 数 225→120
+（peer 地址是 window 算术，不是穿过 `SymmMemObj` 的三次相关联 load）。其余来自调优表。
+
+窄 dtype 的收益更大：4096 档 dispatch bf16 156.6 → fp8 98.5 → fp4 80.0，16384 档 fp4 是 bf16 的约 3 倍快。
+
 单实例编译 1.6s，对照 debug-aa 整文件 115s（90 个 kernel，gfx1250）。这个比值才是按需编译成立的前提。
 
 ## 9. 移植来源与已知缺口
@@ -306,8 +365,17 @@ memObj->GetAs<T*>(pe)  →  ccoGetLsaPeerPtr(win, pe, args.offRegion)
 13 个 `SymmMemObjPtr` 塌成一个 window handle + 8 个 offset。生成的 TU 不 include `mori/shmem`，
 所以没有设备全局变量、不需要 per-module init。
 
-**HIP 后端未实现**（由能力门在构造期拒绝）：scatter combine、fp8/fp4 量化、StdMoE、per-token scales
-转发、routing replay、`local_expert_count`。这些在 FlyDSL 后端都有。
+gfx125x 的 TDM body 同样是机械移植（`intranode_1250x.hpp` → `ep_intranode_1250x.hpp`）：v1 的 cco 路径
+本来就把每块对称 buffer 从同一个 LSA window 里 bump 分配，和 SymmArena 是同一个内存模型，源码里的
+`shmem` 命名空间只是那层抽象加几个与后端无关的自旋。TDM 那套机器（`amd_gfx1250_TDM.h` builtin、
+`_cusplit_*` 设备全局暂存池）原样保留。范围收到 hip 后端能服务的部分：非量化的 TDM dispatch +
+PULL/QUAD gather combine。
+
+**HIP 后端未实现**（由能力门在构造期拒绝）：scatter combine、`quant_type` 量化、StdMoE、per-token
+scales 转发、routing replay、`local_expert_count`。这些在 FlyDSL 后端都有。注意 fp8/fp4 **dispatch**
+已经支持（§3.7）——那是搬运已量化的载荷，和让 mori 自己量化的 `quant_type` 是两回事。
+
+**cross-node 没有**：v2 只有 intranode 两个 body，op 里也没有 `kernel_type` 的概念。
 
 **debug-aa 的 69 个 gate 尚未归置**。计划是三分：调优参数升格为 Cfg 字段；诊断开关进一个默认全 false
 的 `Diag` 子结构（因为只发非默认字段，正常运行的源码里根本不会出现它，一开诊断就自动是另一个缓存

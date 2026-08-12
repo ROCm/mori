@@ -157,11 +157,54 @@ jobs:
             cd $GITHUB_WORKSPACE && \
             timeout 300 pytest tests/python/cco/test_sdma_api.py -v"
 
+      - name: Run JIT v2 C++ tests + host/device split guard
+        run: |
+          # Registered by tests/cpp/jit/CMakeLists.txt but selected by nothing until
+          # now, so the whole C++ JIT framework was shipping untested. Neither needs a
+          # GPU peer: jit_core exercises render/cache/schema, and the guard only checks
+          # that the Cfg headers still compile without hipcc.
+          $CT exec $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE/build && \
+            timeout 600 ctest --output-on-failure -R '^jit_'"
+
+      - name: Run JIT v2 Python binding tests (1 rank)
+        run: |
+          # 18 tests over the ctypes/C-ABI seam -- schema-vs-sizeof, request coercion,
+          # unknown-field rejection. Single rank on purpose: EpDispatchPlan(world_size=1)
+          # needs no communicator, which is what makes this cheap enough to always run.
+          $CT exec $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE && \
+            timeout 600 python -m pytest tests/python/ops/dispatch_combine_v2/test_jit_binding.py -v"
+
       - name: Run ops-v2 dispatch/combine test (EP8, 8 ranks)
         run: |
           $CT exec $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE && \
             python -m pytest tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_intranode.py -v"
+
+      - name: Run ops-v2 HIP backend (EP8, 8 ranks)
+        run: |
+          # The step above drives the FlyDSL backend; nothing covered the HIP one. Both
+          # are worth running because they are separate kernels behind one op: test_op
+          # checks the op layer against the HIP kernels, and the parity test then
+          # compares the two backends element for element on the same input.
+          # test_op.py reports per-case PASS/FAIL and does not set a non-zero exit
+          # code for a failed CHECK, so grep the output as well as the status -- and
+          # treat "no PASS at all" as a failure, or a run that died before the first
+          # case would read as green.
+          $CT exec -e MORI_V2_KERNEL_BACKEND=hip $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
+            out=\$(timeout 900 torchrun --standalone --nproc_per_node=8 test_op.py 2>&1) || \
+              { echo \"\$out\"; exit 1; }; \
+            echo \"\$out\"; \
+            case \"\$out\" in *FAIL*) exit 1;; esac; \
+            case \"\$out\" in *PASS*) ;; *) echo 'no PASS line: nothing ran'; exit 1;; esac"
+
+      - name: Run ops-v2 backend parity (FlyDSL vs HIP, EP8)
+        run: |
+          $CT exec $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
+            timeout 900 torchrun --standalone --nproc_per_node=8 test_ep_backend_parity.py"
 
       - name: Run ops-v2 dispatch/combine bench (EP8 smoke)
         run: |
