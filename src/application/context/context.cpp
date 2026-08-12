@@ -246,9 +246,7 @@ void Context::InitializeTopologyAndTransports() {
                   devicePortId, device->Name());
   }
 
-  // Build per-rail device contexts for proxy mode (rail-isolated fabrics).
-  bool useProxy = proxyEnabled;
-  if (useProxy) {
+  if (proxyEnabled) {
     allRdmaDeviceContexts.clear();
     for (const auto& dp : activeDevicePortList) {
       RdmaDeviceContext* ctx = dp.first->CreateRdmaDeviceContext();
@@ -399,9 +397,6 @@ void Context::EnsureSdmaTransport(int requestedChannels) {
 /* ------------------------------------------------------------------------ */
 
 void Context::BuildAndConnectInitialEndpoints() {
-  bool useProxy = proxyEnabled;
-
-  const int numRailContexts = useProxy ? static_cast<int>(allRdmaDeviceContexts.size()) : 0;
   const int myLocalGpu = LocalRankInNode();
 
   rdmaEps.reserve(static_cast<size_t>(WorldSize()) * numQpPerPe);
@@ -409,7 +404,8 @@ void Context::BuildAndConnectInitialEndpoints() {
     if (transportTypes[i] == TransportType::RDMA) {
       for (int qp = 0; qp < numQpPerPe; qp++) {
         RdmaDeviceContext* ctx = rdmaDeviceContext.get();
-        if (useProxy && numRailContexts > 1) {
+        if (proxyEnabled) {
+          const int numRailContexts = static_cast<int>(allRdmaDeviceContexts.size());
           int peerLocalGpu = i % numRailContexts;
           int agreedRail = std::max(myLocalGpu, peerLocalGpu) % numRailContexts;
           ctx = allRdmaDeviceContexts[agreedRail].get();
@@ -440,14 +436,15 @@ void Context::BuildAndConnectInitialEndpoints() {
     for (int qp = 0; qp < numQpPerPe; qp++) {
       int epIndex = peer * numQpPerPe + qp;
       RdmaDeviceContext* ctx = rdmaDeviceContext.get();
-      if (useProxy && numRailContexts > 1) {
+      if (proxyEnabled) {
+        const int numRailContexts = static_cast<int>(allRdmaDeviceContexts.size());
         int peerLocalGpu = peer % numRailContexts;
         int agreedRail = std::max(myLocalGpu, peerLocalGpu) % numRailContexts;
         ctx = allRdmaDeviceContexts[agreedRail].get();
       }
       ctx->ConnectEndpoint(localToPeerEpHandles[epIndex],
                            peerToLocalEpHandles[epIndex], qp);
-      if (useProxy) {
+      if (proxyEnabled) {
         auto* ionic = dynamic_cast<IonicDeviceContext*>(ctx);
         if (ionic) {
           auto ri = ionic->GetProxyRecvInfo(rdmaEps[epIndex].handle.qpn);
@@ -486,8 +483,8 @@ std::vector<RdmaEndpoint> Context::CreateAdditionalEndpoints(int qpPerPe,
     }
     for (int qp = 0; qp < qpPerPe; qp++) {
       RdmaDeviceContext* ctx = rdmaDeviceContext.get();
-      const int nCtx = static_cast<int>(allRdmaDeviceContexts.size());
-      if (nCtx > 1) {
+      if (proxyEnabled) {
+        const int nCtx = static_cast<int>(allRdmaDeviceContexts.size());
         int peerLocalGpu = i % nCtx;
         int agreedRail = std::max(LocalRankInNode(), peerLocalGpu) % nCtx;
         ctx = allRdmaDeviceContexts[agreedRail].get();
@@ -516,8 +513,8 @@ void Context::ConnectAdditionalEndpoints(std::vector<RdmaEndpoint>& endpoints, i
     for (int qp = 0; qp < qpPerPe; qp++) {
       int idx = peer * qpPerPe + qp;
       RdmaDeviceContext* ctx = rdmaDeviceContext.get();
-      const int nCtx = static_cast<int>(allRdmaDeviceContexts.size());
-      if (nCtx > 1) {
+      if (proxyEnabled) {
+        const int nCtx = static_cast<int>(allRdmaDeviceContexts.size());
         int peerLocalGpu = peer % nCtx;
         int agreedRail = std::max(LocalRankInNode(), peerLocalGpu) % nCtx;
         ctx = allRdmaDeviceContexts[agreedRail].get();
