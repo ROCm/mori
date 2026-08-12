@@ -160,6 +160,7 @@ class IonicDeviceContext : public RdmaDeviceContext {
   }
 
  private:
+  bool proxyEnabled{false};
   uint32_t pdn;
   struct ibv_pd* pd_uxdma[2];
 

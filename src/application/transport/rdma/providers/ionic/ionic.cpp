@@ -480,9 +480,9 @@ void IonicDeviceContext::create_parent_domain(ibv_context* context, struct ibv_p
 }
 
 IonicDeviceContext::IonicDeviceContext(RdmaDevice* rdma_device, ibv_context* context, ibv_pd* in_pd)
-    : RdmaDeviceContext(rdma_device, in_pd) {
-  bool useProxyPD = env::IsEnvVarEnabled("MORI_EP_OVER_RDMA");
-  if (!useProxyPD) {
+    : RdmaDeviceContext(rdma_device, in_pd),
+      proxyEnabled(env::IsEnvVarEnabled("MORI_EP_OVER_RDMA")) {
+  if (!proxyEnabled) {
     create_parent_domain(context, in_pd);
   }
 }
@@ -505,9 +505,7 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
 
   assert(!config.withCompChannel && !config.enableSrq && "not implemented");
 
-  bool useProxyQP = env::IsEnvVarEnabled("MORI_EP_OVER_RDMA");
-
-  if (useProxyQP) {
+  if (proxyEnabled) {
     ibv_pd* basePd = GetIbvPd();
     ibv_cq* plainCq = ibv_create_cq(context, config.maxMsgsNum * 2, nullptr, nullptr, 0);
     assert(plainCq);
@@ -550,9 +548,7 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
     return endpoint;
   }
 
-  bool useProxy = env::IsEnvVarEnabled("MORI_EP_OVER_RDMA");
-
-  if (useProxy) {
+  if (proxyEnabled) {
     ibv_pd* basePd = GetIbvPd();
 
     ibv_cq* plainCq = ibv_create_cq(context, config.maxMsgsNum * 2, nullptr, nullptr, 0);
