@@ -77,6 +77,18 @@ TierType TierFromProto(::umbp::TierType tier) {
   }
 }
 
+UMBPDeploymentMode BackendModeFromProto(::umbp::StandaloneBackendMode mode) {
+  switch (mode) {
+    case ::umbp::STANDALONE_BACKEND_LOCAL:
+      return UMBPDeploymentMode::Local;
+    case ::umbp::STANDALONE_BACKEND_DISTRIBUTED:
+      return UMBPDeploymentMode::Distributed;
+    case ::umbp::STANDALONE_BACKEND_UNKNOWN:
+    default:
+      return UMBPDeploymentMode::StandaloneProcess;
+  }
+}
+
 bool IsLocalRankZero() {
   for (const char* name :
        {"LOCAL_RANK", "OMPI_COMM_WORLD_LOCAL_RANK", "SLURM_LOCALID", "MPI_LOCALRANKID"}) {
@@ -207,7 +219,7 @@ std::string StandaloneProcessClient::ClientId() {
   return client_id_;
 }
 
-bool StandaloneProcessClient::WaitReady(int timeout_ms) const {
+bool StandaloneProcessClient::WaitReady(int timeout_ms) {
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
   while (std::chrono::steady_clock::now() < deadline) {
     grpc::ClientContext ctx;
@@ -215,7 +227,11 @@ bool StandaloneProcessClient::WaitReady(int timeout_ms) const {
     ::umbp::Empty req;
     ::umbp::PingResponse resp;
     grpc::Status status = stub_->Ping(&ctx, req, &resp);
-    if (status.ok() && resp.ready()) return true;
+    if (status.ok() && resp.ready()) {
+      backend_mode_ = BackendModeFromProto(resp.deployment_mode());
+      supports_ranged_io_ = resp.supports_ranged_io();
+      return true;
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
   return false;

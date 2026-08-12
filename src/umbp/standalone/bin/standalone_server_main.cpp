@@ -157,6 +157,12 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
   if (!ParseUint16Env("UMBP_PEER_SERVICE_PORT", &dist.peer_service_port, error)) return false;
   if (!ParseSizeEnv("UMBP_DISTRIBUTED_STAGING_BUFFER_SIZE", &dist.staging_buffer_size, error))
     return false;
+  if (!ParseSizeEnv("UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES", &dist.ranged_scratch_size, error))
+    return false;
+  if (dist.ranged_scratch_size == 0) {
+    *error = "UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES must be > 0";
+    return false;
+  }
   if (!ParseSizeEnv("UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SIZE", &dist.ssd_staging_buffer_size,
                     error)) {
     return false;
@@ -174,6 +180,10 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
   size_t dram_page_size = static_cast<size_t>(dist.dram_page_size);
   if (!ParseSizeEnv("UMBP_DISTRIBUTED_DRAM_PAGE_SIZE", &dram_page_size, error)) return false;
   dist.dram_page_size = static_cast<uint64_t>(dram_page_size);
+  if (dist.dram_page_size == 0) {
+    *error = "UMBP_DISTRIBUTED_DRAM_PAGE_SIZE must be explicitly set to > 0";
+    return false;
+  }
 
   config->distributed = dist;
   return true;

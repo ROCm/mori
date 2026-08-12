@@ -48,6 +48,7 @@ class PeerDramAllocator;
 class PeerServiceServer;
 class PeerSsdManager;
 class SsdCopyPipeline;
+class HostTierRegistration;
 
 // Short name for log output. Generic FAILED maps to "FAILED" — the
 // detailed reason for that case lives in the peer's allocator log.
@@ -117,6 +118,21 @@ class PoolClient {
   std::vector<bool> BatchGet(const std::vector<std::string>& keys, const std::vector<void*>& dsts,
                              const std::vector<size_t>& sizes);
 
+  // Ranged multi-buffer I/O. One stored object may be backed by scattered tier
+  // pages while each caller supplies multiple disjoint ranges. Ranged gets
+  // probe the local peer allocator first; remote misses are fetched as whole
+  // objects into the registered host scratch arena, synchronously installed in
+  // the local tier, then served through the same local range-copy routine.
+  std::vector<bool> BatchGetRanges(const std::vector<std::string>& keys,
+                                   const std::vector<std::vector<void*>>& dsts,
+                                   const std::vector<std::vector<size_t>>& sizes,
+                                   const std::vector<std::vector<size_t>>& src_offsets);
+  std::vector<bool> BatchPutRanges(const std::vector<std::string>& keys,
+                                   const std::vector<size_t>& object_sizes,
+                                   const std::vector<std::vector<const void*>>& srcs,
+                                   const std::vector<std::vector<size_t>>& sizes,
+                                   const std::vector<std::vector<size_t>>& dst_offsets);
+
   // Cluster-wide existence check — issues a RouteGet and reports
   // whether master surfaced any replica.  No RDMA, no lease bump.
   bool Exists(const std::string& key);
@@ -178,10 +194,16 @@ class PoolClient {
   std::unique_ptr<PeerServiceServer> peer_service_;
 
   std::unique_ptr<mori::io::IOEngine> io_engine_;
+  std::vector<std::unique_ptr<HostTierRegistration>> dram_host_registrations_;
   mori::io::MemoryDesc staging_mem_{};
   std::vector<mori::io::MemoryDesc> export_dram_mems_;
   std::unique_ptr<char[]> staging_buffer_;
   std::mutex staging_mutex_;
+
+  // Caller-owned, registered host arena used only by ranged operations. One
+  // mutex deliberately serializes arena users in phase 1; local-only ranged
+  // reads do not take it and remain concurrent.
+  std::mutex ranged_scratch_mutex_;
 
   std::unique_ptr<char[]> ssd_staging_buffer_;
   mori::io::MemoryDesc ssd_staging_mem_{};
@@ -228,6 +250,32 @@ class PoolClient {
                      size_t size);
   bool LocalGetPages(const std::vector<PageLocation>& pages, uint64_t page_size, void* dst,
                      size_t size);
+  bool LocalGetRanges(const std::vector<PageLocation>& pages, uint64_t page_size,
+                      uint64_t stored_size, const std::vector<void*>& dsts,
+                      const std::vector<size_t>& sizes, const std::vector<size_t>& src_offsets);
+  struct LocalRangeReadRequest {
+    const std::vector<PageLocation>* pages = nullptr;
+    uint64_t stored_size = 0;
+    const std::vector<void*>* dsts = nullptr;
+    const std::vector<size_t>* sizes = nullptr;
+    const std::vector<size_t>* src_offsets = nullptr;
+  };
+  bool LocalGetRangesBatch(const std::vector<LocalRangeReadRequest>& requests, uint64_t page_size);
+  bool CopyContiguousToRanges(const void* src, size_t object_size, const std::vector<void*>& dsts,
+                              const std::vector<size_t>& sizes,
+                              const std::vector<size_t>& src_offsets);
+  bool CopyRangesToContiguous(const std::vector<const void*>& srcs,
+                              const std::vector<size_t>& sizes,
+                              const std::vector<size_t>& dst_offsets, void* dst,
+                              size_t object_size);
+  struct RangeAssemblyRequest {
+    const std::vector<const void*>* srcs = nullptr;
+    const std::vector<size_t>* sizes = nullptr;
+    const std::vector<size_t>* dst_offsets = nullptr;
+    void* dst = nullptr;
+    size_t object_size = 0;
+  };
+  bool CopyRangesToContiguousBatch(const std::vector<RangeAssemblyRequest>& requests);
 
   bool EnsurePeerServiceConnection(PeerConnection& peer);
 
@@ -263,6 +311,20 @@ class PoolClient {
 
   PutAttemptOutcome ExecuteLocalPut(const std::string& key, const void* src, size_t size,
                                     TierType tier, bool enqueue_ssd_copy = true);
+  PutAttemptOutcome ExecuteLocalPutRanges(const std::string& key, size_t object_size,
+                                          const std::vector<const void*>& srcs,
+                                          const std::vector<size_t>& sizes,
+                                          const std::vector<size_t>& dst_offsets, TierType tier);
+  struct LocalRangeWriteRequest {
+    const std::string* key = nullptr;
+    size_t object_size = 0;
+    const std::vector<const void*>* srcs = nullptr;
+    const std::vector<size_t>* sizes = nullptr;
+    const std::vector<size_t>* dst_offsets = nullptr;
+    TierType tier = TierType::UNKNOWN;
+  };
+  std::vector<PutAttemptOutcome> ExecuteLocalPutRangesBatch(
+      const std::vector<LocalRangeWriteRequest>& requests);
   GetAttemptOutcome ExecuteLocalGet(const std::string& key, void* dst, size_t size);
   // After a successful remote DRAM fetch, if cache_remote_fetches is enabled and
   // the admission gate admits the block, enqueue it for asynchronous install into
@@ -357,7 +419,7 @@ class PoolClient {
   // (submit -> wait).  Reads the plan; writes per-key outcomes into *results.
   void ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector<std::string>& keys,
                            const std::vector<void*>& dsts, const std::vector<size_t>& sizes,
-                           std::vector<bool>* results);
+                           std::vector<bool>* results, bool recache_remote = true);
 
   struct TransferInstruction {
     size_t entry_index;
@@ -449,7 +511,8 @@ class PoolClient {
   bool BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries, PeerConnection& peer,
                                std::vector<TransferInstruction>* transfers,
                                uint64_t* staging_bytes);
-  void FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries, std::vector<bool>* results);
+  void FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries, std::vector<bool>* results,
+                                bool recache_remote);
 
   // One posted-but-not-yet-waited remote-DRAM read for a single peer; the
   // scheduler waits it later. Owned by a unique_ptr and never moved after
@@ -497,7 +560,8 @@ class PoolClient {
   // Wait half: wait every group (never break early), aggregate per-pair failure
   // back to per-key (per-item AND); for a staging in-flight, copy staging_buffer_
   // -> user dst and release staging_mutex_; then FinalizeRemoteGetEntries.
-  void WaitRemoteBatchGet(RemoteDramGetInFlight& inflight, std::vector<bool>* results);
+  void WaitRemoteBatchGet(RemoteDramGetInFlight& inflight, std::vector<bool>* results,
+                          bool recache_remote);
 
   // One posted-but-not-yet-waited remote-DRAM write for a single peer (same
   // lifetime contract as RemoteDramGetInFlight: unique_ptr-owned, never moved

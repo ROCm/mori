@@ -75,6 +75,7 @@ class DistributedClient : public IUMBPClient {
   void Close() override;
   bool IsDistributed() const override;
   UMBPDeploymentMode GetDeploymentMode() const override { return UMBPDeploymentMode::Distributed; }
+  bool SupportsRangedIO() const override { return true; }
 
   bool RegisterMemory(uintptr_t ptr, size_t size) override;
   void DeregisterMemory(uintptr_t ptr) override;
@@ -92,6 +93,9 @@ class DistributedClient : public IUMBPClient {
   void* dram_pool_ = nullptr;
   size_t dram_pool_size_ = 0;
   HostBufferHandle dram_pool_handle_;
+  void* ranged_scratch_ = nullptr;
+  size_t ranged_scratch_size_ = 0;
+  HostBufferHandle ranged_scratch_handle_;
   std::unique_ptr<PoolClient> pool_client_;
   std::atomic<bool> closing_{false};
   mutable std::shared_mutex op_mutex_;

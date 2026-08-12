@@ -63,6 +63,16 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   // 2 MiB, so this only matters with non-default page size combinations.
   dram_pool_size_ = dram_pool_handle_.mapped_size;
 
+  ranged_scratch_handle_ = allocator.Alloc(dc.ranged_scratch_size, opts);
+  if (!ranged_scratch_handle_.valid()) {
+    allocator.Free(dram_pool_handle_);
+    dram_pool_ = nullptr;
+    dram_pool_size_ = 0;
+    throw std::runtime_error("DistributedClient: memory allocation failed for ranged scratch");
+  }
+  ranged_scratch_ = ranged_scratch_handle_.ptr;
+  ranged_scratch_size_ = ranged_scratch_handle_.mapped_size;
+
   // Lower SSD config to the peer.  When ssd.enabled, the peer builds a
   // PeerSsdManager (SSDTier backend) from the SSD config (UMBPSsdConfig) and
   // reports SSD capacity via TierType::SSD; when disabled, behavior is exactly
@@ -79,16 +89,33 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   auto pc_config = ToPoolClientConfig(dc,
                                       /*dram_buffers=*/{{dram_pool_, dram_pool_size_}},
                                       std::move(tier_capacities), std::move(ssd_cfg));
+  pc_config.ranged_scratch_buffer = ranged_scratch_;
+  pc_config.ranged_scratch_size = ranged_scratch_size_;
   pc_config.copy_pipeline = config_.copy_pipeline;
 
   pool_client_ = std::make_unique<PoolClient>(std::move(pc_config));
   if (!pool_client_->Init()) {
     pool_client_.reset();
     HostMemAllocator cleanup_allocator;
+    cleanup_allocator.Free(ranged_scratch_handle_);
+    ranged_scratch_ = nullptr;
+    ranged_scratch_size_ = 0;
     cleanup_allocator.Free(dram_pool_handle_);
     dram_pool_ = nullptr;
     dram_pool_size_ = 0;
     throw std::runtime_error("DistributedClient: PoolClient::Init() failed");
+  }
+  if (!pool_client_->RegisterMemory(ranged_scratch_, ranged_scratch_size_)) {
+    pool_client_->Shutdown();
+    pool_client_.reset();
+    HostMemAllocator cleanup_allocator;
+    cleanup_allocator.Free(ranged_scratch_handle_);
+    ranged_scratch_ = nullptr;
+    ranged_scratch_size_ = 0;
+    cleanup_allocator.Free(dram_pool_handle_);
+    dram_pool_ = nullptr;
+    dram_pool_size_ = 0;
+    throw std::runtime_error("DistributedClient: ranged scratch registration failed");
   }
 
   std::string tags_str;
@@ -101,13 +128,14 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
       "[DistributedClient] initialized — "
       "node_id={} node_address={} master={} "
       "dram_pool={}MB hugepages={} hugepage_size={}MB numa_node={} "
-      "dram_page_size={}KB staging_buffer={}MB peer_port={} cache_remote={} "
+      "dram_page_size={}KB staging_buffer={}MB ranged_scratch={}MB peer_port={} cache_remote={} "
       "io_engine={}:{} tags=[{}]",
       dc.master_config.node_id, dc.master_config.node_address, dc.master_config.master_address,
       dram_pool_size_ / (1024 * 1024), config_.dram.use_hugepages,
       config_.dram.hugepage_size / (1024 * 1024), config_.dram.numa_node, dc.dram_page_size / 1024,
-      dc.staging_buffer_size / (1024 * 1024), dc.peer_service_port, dc.cache_remote_fetches,
-      dc.io_engine.host, dc.io_engine.port, tags_str);
+      dc.staging_buffer_size / (1024 * 1024), ranged_scratch_size_ / (1024 * 1024),
+      dc.peer_service_port, dc.cache_remote_fetches, dc.io_engine.host, dc.io_engine.port,
+      tags_str);
 }
 
 DistributedClient::~DistributedClient() { Close(); }
@@ -187,26 +215,33 @@ std::vector<bool> DistributedClient::BatchGet(const std::vector<std::string>& ke
 }
 
 std::vector<bool> DistributedClient::BatchGetRanges(
-    const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& /*dsts*/,
-    const std::vector<std::vector<size_t>>& /*sizes*/,
-    const std::vector<std::vector<size_t>>& /*src_offsets*/) {
-  static std::once_flag once;
-  std::call_once(once, [] {
-    MORI_UMBP_WARN("[DistributedClient] ranged multi-buffer get is not supported yet");
-  });
-  return std::vector<bool>(keys.size(), false);
+    const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dsts,
+    const std::vector<std::vector<size_t>>& sizes,
+    const std::vector<std::vector<size_t>>& src_offsets) {
+  if (closing_) return std::vector<bool>(keys.size(), false);
+  std::shared_lock lk(op_mutex_);
+  if (closed_ || !pool_client_) return std::vector<bool>(keys.size(), false);
+  std::vector<std::vector<void*>> dst_ptrs(dsts.size());
+  for (size_t i = 0; i < dsts.size(); ++i) {
+    dst_ptrs[i].reserve(dsts[i].size());
+    for (uintptr_t ptr : dsts[i]) dst_ptrs[i].push_back(reinterpret_cast<void*>(ptr));
+  }
+  return pool_client_->BatchGetRanges(keys, dst_ptrs, sizes, src_offsets);
 }
 
 std::vector<bool> DistributedClient::BatchPutRanges(
-    const std::vector<std::string>& keys, const std::vector<size_t>& /*object_sizes*/,
-    const std::vector<std::vector<uintptr_t>>& /*srcs*/,
-    const std::vector<std::vector<size_t>>& /*sizes*/,
-    const std::vector<std::vector<size_t>>& /*dst_offsets*/) {
-  static std::once_flag once;
-  std::call_once(once, [] {
-    MORI_UMBP_WARN("[DistributedClient] ranged multi-buffer put is not supported yet");
-  });
-  return std::vector<bool>(keys.size(), false);
+    const std::vector<std::string>& keys, const std::vector<size_t>& object_sizes,
+    const std::vector<std::vector<uintptr_t>>& srcs, const std::vector<std::vector<size_t>>& sizes,
+    const std::vector<std::vector<size_t>>& dst_offsets) {
+  if (closing_) return std::vector<bool>(keys.size(), false);
+  std::shared_lock lk(op_mutex_);
+  if (closed_ || !pool_client_) return std::vector<bool>(keys.size(), false);
+  std::vector<std::vector<const void*>> src_ptrs(srcs.size());
+  for (size_t i = 0; i < srcs.size(); ++i) {
+    src_ptrs[i].reserve(srcs[i].size());
+    for (uintptr_t ptr : srcs[i]) src_ptrs[i].push_back(reinterpret_cast<const void*>(ptr));
+  }
+  return pool_client_->BatchPutRanges(keys, object_sizes, src_ptrs, sizes, dst_offsets);
 }
 
 std::vector<bool> DistributedClient::BatchExists(const std::vector<std::string>& keys) const {
@@ -296,6 +331,13 @@ void DistributedClient::Close() {
   if (pool_client_) {
     pool_client_->Shutdown();
     pool_client_.reset();
+  }
+
+  if (ranged_scratch_) {
+    HostMemAllocator allocator;
+    allocator.Free(ranged_scratch_handle_);
+    ranged_scratch_ = nullptr;
+    ranged_scratch_size_ = 0;
   }
 
   if (dram_pool_) {

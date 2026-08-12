@@ -134,6 +134,14 @@ class IUMBPClient {
     return IsDistributed() ? UMBPDeploymentMode::Distributed : UMBPDeploymentMode::Local;
   }
 
+  /// Returns the backend behind a forwarding client. For direct clients this
+  /// equals GetDeploymentMode(); StandaloneProcessClient overrides it with the
+  /// mode reported by the server's Ping response.
+  virtual UMBPDeploymentMode GetBackendMode() const { return GetDeploymentMode(); }
+
+  /// Whether this concrete backend implements ranged multi-buffer I/O.
+  virtual bool SupportsRangedIO() const { return false; }
+
   // ---- Optional zero-copy hooks ----
   //
   // Register a host buffer for zero-copy RDMA transfers.  Standalone

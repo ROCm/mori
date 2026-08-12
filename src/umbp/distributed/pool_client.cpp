@@ -42,10 +42,14 @@
 #endif
 #include <unordered_map>
 
+#include "../local/tiers/device_copy_run.h"
 #include "mori/io/backend.hpp"
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/device_copy.h"
+#include "umbp/common/device_gather.h"
 #include "umbp/common/env_time.h"
+#include "umbp/common/host_registration.h"
+#include "umbp/common/range_utils.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/peer/batch_resolve_codec.h"
 #include "umbp/distributed/peer/peer_dram_allocator.h"
@@ -243,6 +247,21 @@ uint64_t AlignUp(uint64_t value, uint64_t alignment) {
   return remainder == 0 ? value : (value + alignment - remainder);
 }
 
+bool AlignUpChecked(size_t value, size_t alignment, size_t* out) {
+  if (!out || alignment == 0) return false;
+  const size_t remainder = value % alignment;
+  if (remainder == 0) {
+    *out = value;
+    return true;
+  }
+  const size_t add = alignment - remainder;
+  if (value > std::numeric_limits<size_t>::max() - add) return false;
+  *out = value + add;
+  return true;
+}
+
+constexpr size_t kRangedScratchAlignment = 64;
+
 // Group `pages` by buffer_index, preserving first-seen ordering so
 // IOEngine BatchWrite/BatchRead pair indexing stays predictable.
 struct ScatterGroup {
@@ -405,6 +424,19 @@ bool PoolClient::Init() {
   if (!initialized_.compare_exchange_strong(expected, true)) return true;
 
   master_client_ = std::make_unique<MasterClient>(config_.master_config);
+
+  // Register each exported host tier for device access before data-plane use.
+  // Registration may complete asynchronously for large pools; ranged copies
+  // safely fall back to the copy engine until Covers() starts returning true.
+  dram_host_registrations_.reserve(config_.dram_buffers.size());
+  for (const auto& dram : config_.dram_buffers) {
+    dram_host_registrations_.push_back(
+        std::make_unique<HostTierRegistration>(dram.buffer, dram.size));
+  }
+  if (config_.ranged_scratch_buffer && config_.ranged_scratch_size > 0) {
+    dram_host_registrations_.push_back(std::make_unique<HostTierRegistration>(
+        config_.ranged_scratch_buffer, config_.ranged_scratch_size));
+  }
 
   // IO Engine setup (RDMA data plane).
   if (!config_.io_engine.host.empty()) {
@@ -622,6 +654,11 @@ void PoolClient::Shutdown() {
     staging_buffer_.reset();
   }
 
+  // The backing buffers are caller-owned and still alive here. Unregister only
+  // after RDMA has been quiesced/deregistered, before DistributedClient frees
+  // its HostBufferHandle.
+  dram_host_registrations_.clear();
+
   master_client_.reset();
 }
 
@@ -741,11 +778,162 @@ std::optional<std::pair<mori::io::MemoryDesc, size_t>> PoolClient::FindRegistere
 // strategy 1), so in the common case an object collapses to exactly one run --
 // turning ceil(size / page_size) synchronous hipMemcpy round trips into one.
 struct TierPageRun {
-  size_t first_page = 0;      // index into `pages`, also the user-side page index
+  size_t first_page = 0;  // index into `pages`, also the user-side page index
   uint32_t buffer_index = 0;
-  uint64_t tier_offset = 0;   // byte offset inside that tier buffer
+  uint64_t tier_offset = 0;  // byte offset inside that tier buffer
   uint64_t bytes = 0;
 };
+
+struct RangeCopyRun {
+  const void* src = nullptr;
+  void* dst = nullptr;
+  size_t size = 0;
+};
+
+bool LocalPageMergeEnabled();
+
+uintptr_t AddressOf(const void* ptr) { return reinterpret_cast<uintptr_t>(ptr); }
+
+void AppendRangeCopyRun(std::vector<RangeCopyRun>* runs, const void* src, void* dst, size_t bytes) {
+  if (bytes == 0) return;
+  if (!runs->empty() && LocalPageMergeEnabled()) {
+    RangeCopyRun& last = runs->back();
+    const uintptr_t last_src = AddressOf(last.src);
+    const uintptr_t last_dst = AddressOf(last.dst);
+    if (last.size <= std::numeric_limits<uintptr_t>::max() - last_src &&
+        last.size <= std::numeric_limits<uintptr_t>::max() - last_dst &&
+        last_src + last.size == AddressOf(src) && last_dst + last.size == AddressOf(dst)) {
+      last.size += bytes;
+      return;
+    }
+  }
+  runs->push_back({src, dst, bytes});
+}
+
+std::map<int, hipStream_t>& RangedDeviceStreams() {
+  static thread_local std::map<int, hipStream_t>* streams = new std::map<int, hipStream_t>();
+  return *streams;
+}
+
+hipStream_t RangedDeviceStream(int device_id) {
+  auto& streams = RangedDeviceStreams();
+  auto it = streams.find(device_id);
+  if (it != streams.end()) return it->second;
+  hipStream_t stream = nullptr;
+  if (hipStreamCreateWithFlags(&stream, hipStreamNonBlocking) != hipSuccess) {
+    (void)hipGetLastError();
+    return nullptr;
+  }
+  streams.emplace(device_id, stream);
+  return stream;
+}
+
+std::atomic<bool>& RangedGatherDisabled() {
+  static std::atomic<bool> disabled{false};
+  return disabled;
+}
+
+bool CoveredByRegistration(
+    const void* ptr, size_t size,
+    const std::vector<std::unique_ptr<HostTierRegistration>>& registrations) {
+  for (const auto& registration : registrations) {
+    if (registration && registration->Covers(ptr, size)) return true;
+  }
+  return false;
+}
+
+bool ExecuteRangeCopyRuns(const std::vector<RangeCopyRun>& runs, hipMemcpyKind device_kind,
+                          bool classify_source,
+                          const std::vector<std::unique_ptr<HostTierRegistration>>& registrations) {
+  std::vector<const RangeCopyRun*> host_runs;
+  std::map<int, std::vector<RangeCopyRun*>> device_runs;
+  // The executor never mutates run fields, but the shared run planner accepts
+  // pointer-to-non-const jobs. Keep one local view rather than const_casting the
+  // caller-owned vector.
+  std::vector<RangeCopyRun> jobs(runs.begin(), runs.end());
+  for (auto& run : jobs) {
+    const PointerLocation location = DetectPointerLocation(classify_source ? run.src : run.dst);
+    if (location.IsDevice()) {
+      device_runs[location.device_id].push_back(&run);
+    } else {
+      host_runs.push_back(&run);
+    }
+  }
+  for (const auto* run : host_runs) LocalCopyBlock(run->dst, run->src, run->size);
+
+  constexpr size_t kGatherThreshold = 128ULL << 10;
+  for (auto& [device_id, grouped] : device_runs) {
+    ScopedHipDevice device_guard(device_id);
+    if (!device_guard.IsValid()) return false;
+    hipStream_t stream = RangedDeviceStream(device_id);
+    if (!stream) return false;
+    std::sort(grouped.begin(), grouped.end(), [](const RangeCopyRun* a, const RangeCopyRun* b) {
+      return detail::PointerAddress(a->src) < detail::PointerAddress(b->src);
+    });
+
+    std::vector<DeviceGatherFragment> fragments;
+    size_t total_bytes = 0;
+    bool host_covered = true;
+    for (size_t begin = 0; begin < grouped.size();) {
+      const auto run = detail::FindDeviceCopyRun(grouped, begin, /*allow_pitched=*/false);
+      const RangeCopyRun* first = grouped[begin];
+      const void* tier_side = device_kind == hipMemcpyDeviceToHost ? first->dst : first->src;
+      host_covered = host_covered && CoveredByRegistration(tier_side, run.bytes, registrations);
+      fragments.push_back({first->src, first->dst, run.bytes});
+      total_bytes += run.bytes;
+      begin = run.end;
+    }
+
+    const bool use_gather = !RangedGatherDisabled().load(std::memory_order_relaxed) &&
+                            DeviceGatherEnabled() && host_covered && fragments.size() > 1 &&
+                            total_bytes / fragments.size() < kGatherThreshold;
+    bool enqueued = false;
+    if (use_gather) {
+      enqueued = LaunchDeviceGather(fragments.data(), fragments.size(), device_id, stream);
+    }
+    if (!enqueued) {
+      enqueued = true;
+      for (size_t begin = 0; begin < grouped.size();) {
+        const auto run = detail::FindDeviceCopyRun(grouped, begin, /*allow_pitched=*/false);
+        if (hipMemcpyAsync(grouped[begin]->dst, grouped[begin]->src, run.bytes, device_kind,
+                           stream) != hipSuccess) {
+          (void)hipGetLastError();
+          enqueued = false;
+          break;
+        }
+        begin = run.end;
+      }
+    }
+    const hipError_t sync = hipStreamSynchronize(stream);
+    if (!enqueued || sync != hipSuccess) {
+      (void)hipGetLastError();
+      if (use_gather) RangedGatherDisabled().store(true, std::memory_order_relaxed);
+      RangedDeviceStreams().erase(device_id);
+      return false;
+    }
+  }
+  return true;
+}
+
+bool RangesAreDisjointAndInBounds(size_t object_size, const std::vector<size_t>& sizes,
+                                  const std::vector<size_t>& offsets) {
+  if (object_size == 0 || sizes.empty() || sizes.size() != offsets.size()) return false;
+  std::vector<size_t> order(sizes.size());
+  std::iota(order.begin(), order.end(), size_t{0});
+  std::sort(order.begin(), order.end(),
+            [&](size_t a, size_t b) { return offsets[a] < offsets[b]; });
+  size_t previous_end = 0;
+  bool first = true;
+  for (size_t index : order) {
+    if (sizes[index] == 0 || IsObjectRangeOverflow(offsets[index], sizes[index], object_size)) {
+      return false;
+    }
+    if (!first && offsets[index] < previous_end) return false;
+    previous_end = offsets[index] + sizes[index];
+    first = false;
+  }
+  return true;
+}
 
 // Merging can be turned off with UMBP_LOCAL_PAGE_MERGE=0 to A/B the win
 // without rebuilding, mirroring UMBP_DRAM_NT_COPY in the DRAM tier.
@@ -815,8 +1003,7 @@ bool PoolClient::LocalPutPages(const std::vector<PageLocation>& pages, uint64_t 
     void* dst = static_cast<char*>(config_.dram_buffers[run.buffer_index].buffer) + run.tier_offset;
     const void* page_src = src_bytes + run.first_page * page_size;
     if (source_location.IsDevice()) {
-      if (!DeviceCopy(dst, page_src, run.bytes, hipMemcpyDeviceToHost,
-                      source_location.device_id)) {
+      if (!DeviceCopy(dst, page_src, run.bytes, hipMemcpyDeviceToHost, source_location.device_id)) {
         return false;
       }
     } else {
@@ -859,6 +1046,217 @@ bool PoolClient::LocalGetPages(const std::vector<PageLocation>& pages, uint64_t 
     }
   }
   return true;
+}
+
+bool PoolClient::LocalGetRanges(const std::vector<PageLocation>& pages, uint64_t page_size,
+                                uint64_t stored_size, const std::vector<void*>& dsts,
+                                const std::vector<size_t>& sizes,
+                                const std::vector<size_t>& src_offsets) {
+  LocalRangeReadRequest request{&pages, stored_size, &dsts, &sizes, &src_offsets};
+  return LocalGetRangesBatch({request}, page_size);
+}
+
+bool PoolClient::LocalGetRangesBatch(const std::vector<LocalRangeReadRequest>& requests,
+                                     uint64_t page_size) {
+  std::vector<RangeCopyRun> runs;
+  for (const auto& request : requests) {
+    if (!request.pages || !request.dsts || !request.sizes || !request.src_offsets ||
+        request.dsts->size() != request.sizes->size() ||
+        request.dsts->size() != request.src_offsets->size() ||
+        !SizeMatchesAllocation(request.stored_size, request.pages->size(), page_size) ||
+        !RangesAreDisjointAndInBounds(request.stored_size, *request.sizes, *request.src_offsets)) {
+      return false;
+    }
+    runs.reserve(runs.size() + request.sizes->size() + request.pages->size());
+    for (size_t r = 0; r < request.sizes->size(); ++r) {
+      size_t object_offset = (*request.src_offsets)[r];
+      size_t copied = 0;
+      while (copied < (*request.sizes)[r]) {
+        const size_t page_index = object_offset / page_size;
+        const size_t within_page = object_offset % page_size;
+        if (page_index >= request.pages->size()) return false;
+        const auto& page = (*request.pages)[page_index];
+        if (page.buffer_index >= config_.dram_buffers.size()) return false;
+        const auto& dram = config_.dram_buffers[page.buffer_index];
+        const uint64_t tier_page_offset = static_cast<uint64_t>(page.page_index) * page_size;
+        if (!dram.buffer || page_size > dram.size || tier_page_offset > dram.size - page_size) {
+          return false;
+        }
+        const size_t fragment = std::min<size_t>((*request.sizes)[r] - copied,
+                                                 static_cast<size_t>(page_size - within_page));
+        const void* src = static_cast<const char*>(dram.buffer) + tier_page_offset + within_page;
+        void* dst = static_cast<char*>((*request.dsts)[r]) + copied;
+        AppendRangeCopyRun(&runs, src, dst, fragment);
+        object_offset += fragment;
+        copied += fragment;
+      }
+    }
+  }
+  if (runs.empty()) {
+    if (requests.empty()) return true;
+    for (const auto& request : requests) {
+      if (request.sizes && !request.sizes->empty()) {
+        return false;
+      }
+    }
+    return true;
+  }
+  return ExecuteRangeCopyRuns(runs, hipMemcpyHostToDevice, /*classify_source=*/false,
+                              dram_host_registrations_);
+}
+
+PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPutRanges(
+    const std::string& key, size_t object_size, const std::vector<const void*>& srcs,
+    const std::vector<size_t>& sizes, const std::vector<size_t>& dst_offsets, TierType tier) {
+  LocalRangeWriteRequest request{&key, object_size, &srcs, &sizes, &dst_offsets, tier};
+  auto outcomes = ExecuteLocalPutRangesBatch({request});
+  return outcomes.empty() ? PutAttemptOutcome::kFatal : outcomes.front();
+}
+
+std::vector<PoolClient::PutAttemptOutcome> PoolClient::ExecuteLocalPutRangesBatch(
+    const std::vector<LocalRangeWriteRequest>& requests) {
+  std::vector<PutAttemptOutcome> outcomes(requests.size(), PutAttemptOutcome::kFatal);
+  if (!peer_alloc_) return outcomes;
+  struct PendingRangeWrite {
+    size_t request_index;
+    uint64_t slot_id;
+  };
+  std::vector<PendingRangeWrite> pending_writes;
+  std::vector<RangeCopyRun> runs;
+  const uint64_t page_size = peer_alloc_->PageSize();
+
+  for (size_t i = 0; i < requests.size(); ++i) {
+    const auto& request = requests[i];
+    if (!request.key || !request.srcs || !request.sizes || !request.dst_offsets ||
+        request.srcs->size() != request.sizes->size() ||
+        request.srcs->size() != request.dst_offsets->size() ||
+        !RangesTileObject(request.object_size, *request.sizes, *request.dst_offsets)) {
+      continue;
+    }
+    auto alloc_res = peer_alloc_->Allocate(*request.key, request.object_size, request.tier);
+    if (alloc_res.outcome == PeerDramAllocator::Outcome::kSuccessAlreadyExists) {
+      outcomes[i] = PutAttemptOutcome::kSuccessAlreadyExists;
+      continue;
+    }
+    if (alloc_res.outcome == PeerDramAllocator::Outcome::kFailed ||
+        alloc_res.outcome == PeerDramAllocator::Outcome::kFailedNoSpace) {
+      outcomes[i] = PutAttemptOutcome::kRetry;
+      continue;
+    }
+    auto slot = std::move(*alloc_res.slot);
+    if (!SizeMatchesAllocation(request.object_size, slot.pages.size(), page_size)) {
+      peer_alloc_->Abort(slot.slot_id);
+      continue;
+    }
+
+    const size_t run_begin = runs.size();
+    bool valid = true;
+    for (size_t r = 0; r < request.sizes->size() && valid; ++r) {
+      size_t object_offset = (*request.dst_offsets)[r];
+      size_t copied = 0;
+      while (copied < (*request.sizes)[r]) {
+        const size_t page_index = object_offset / page_size;
+        const size_t within_page = object_offset % page_size;
+        if (page_index >= slot.pages.size()) {
+          valid = false;
+          break;
+        }
+        const auto& page = slot.pages[page_index];
+        if (page.buffer_index >= config_.dram_buffers.size()) {
+          valid = false;
+          break;
+        }
+        const auto& dram = config_.dram_buffers[page.buffer_index];
+        const uint64_t tier_page_offset = static_cast<uint64_t>(page.page_index) * page_size;
+        if (!dram.buffer || page_size > dram.size || tier_page_offset > dram.size - page_size) {
+          valid = false;
+          break;
+        }
+        const size_t fragment = std::min<size_t>((*request.sizes)[r] - copied,
+                                                 static_cast<size_t>(page_size - within_page));
+        const void* src = static_cast<const char*>((*request.srcs)[r]) + copied;
+        void* dst = static_cast<char*>(dram.buffer) + tier_page_offset + within_page;
+        AppendRangeCopyRun(&runs, src, dst, fragment);
+        object_offset += fragment;
+        copied += fragment;
+      }
+    }
+    if (!valid) {
+      runs.resize(run_begin);
+      peer_alloc_->Abort(slot.slot_id);
+      continue;
+    }
+    pending_writes.push_back({i, slot.slot_id});
+  }
+
+  if (!pending_writes.empty() &&
+      !ExecuteRangeCopyRuns(runs, hipMemcpyDeviceToHost, /*classify_source=*/true,
+                            dram_host_registrations_)) {
+    for (const auto& pending : pending_writes) peer_alloc_->Abort(pending.slot_id);
+    return outcomes;
+  }
+
+  for (const auto& pending : pending_writes) {
+    const auto& request = requests[pending.request_index];
+    uint64_t committed_bytes = 0;
+    if (!peer_alloc_->Commit(pending.slot_id, *request.key, committed_bytes)) {
+      peer_alloc_->Abort(pending.slot_id);
+      continue;
+    }
+    outcomes[pending.request_index] = PutAttemptOutcome::kSuccess;
+    master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL,
+                               MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL_HELP,
+                               {{"traffic", "local"}}, static_cast<double>(request.object_size));
+    master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL,
+                               MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL_HELP,
+                               {{"traffic", "local"}}, static_cast<double>(request.object_size));
+  }
+  return outcomes;
+}
+
+bool PoolClient::CopyContiguousToRanges(const void* src, size_t object_size,
+                                        const std::vector<void*>& dsts,
+                                        const std::vector<size_t>& sizes,
+                                        const std::vector<size_t>& src_offsets) {
+  if (dsts.size() != sizes.size() || dsts.size() != src_offsets.size() ||
+      !RangesAreDisjointAndInBounds(object_size, sizes, src_offsets)) {
+    return false;
+  }
+  std::vector<RangeCopyRun> runs;
+  runs.reserve(sizes.size());
+  for (size_t i = 0; i < sizes.size(); ++i) {
+    AppendRangeCopyRun(&runs, static_cast<const char*>(src) + src_offsets[i], dsts[i], sizes[i]);
+  }
+  return ExecuteRangeCopyRuns(runs, hipMemcpyHostToDevice, /*classify_source=*/false,
+                              dram_host_registrations_);
+}
+
+bool PoolClient::CopyRangesToContiguous(const std::vector<const void*>& srcs,
+                                        const std::vector<size_t>& sizes,
+                                        const std::vector<size_t>& dst_offsets, void* dst,
+                                        size_t object_size) {
+  RangeAssemblyRequest request{&srcs, &sizes, &dst_offsets, dst, object_size};
+  return CopyRangesToContiguousBatch({request});
+}
+
+bool PoolClient::CopyRangesToContiguousBatch(const std::vector<RangeAssemblyRequest>& requests) {
+  std::vector<RangeCopyRun> runs;
+  for (const auto& request : requests) {
+    if (!request.srcs || !request.sizes || !request.dst_offsets || !request.dst ||
+        request.srcs->size() != request.sizes->size() ||
+        request.srcs->size() != request.dst_offsets->size() ||
+        !RangesTileObject(request.object_size, *request.sizes, *request.dst_offsets)) {
+      return false;
+    }
+    runs.reserve(runs.size() + request.sizes->size());
+    for (size_t i = 0; i < request.sizes->size(); ++i) {
+      AppendRangeCopyRun(&runs, (*request.srcs)[i],
+                         static_cast<char*>(request.dst) + (*request.dst_offsets)[i],
+                         (*request.sizes)[i]);
+    }
+  }
+  return ExecuteRangeCopyRuns(runs, hipMemcpyDeviceToHost, /*classify_source=*/true,
+                              dram_host_registrations_);
 }
 
 PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key, const void* src,
@@ -1706,6 +2104,365 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
   return results;
 }
 
+std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& keys,
+                                             const std::vector<std::vector<void*>>& dsts,
+                                             const std::vector<std::vector<size_t>>& sizes,
+                                             const std::vector<std::vector<size_t>>& src_offsets) {
+  const size_t n = keys.size();
+  std::vector<bool> results(n, false);
+  if (!initialized_ || !RangeBatchShapeValid(n, dsts, sizes, src_offsets) || n == 0 ||
+      !peer_alloc_) {
+    return results;
+  }
+
+  auto record_local_get = [&](size_t index) {
+    const size_t bytes = std::accumulate(sizes[index].begin(), sizes[index].end(), size_t{0});
+    master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL,
+                               MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL_HELP,
+                               {{"traffic", "local"}}, static_cast<double>(bytes));
+    master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL,
+                               MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP,
+                               {{"traffic", "local"}}, static_cast<double>(bytes));
+  };
+
+  std::vector<size_t> missed;
+  missed.reserve(n);
+  std::vector<size_t> local_indices;
+  std::vector<PeerDramAllocator::ResolveResult> local_resolved;
+  local_indices.reserve(n);
+  local_resolved.reserve(n);
+  for (size_t i = 0; i < n; ++i) {
+    if (sizes[i].empty()) continue;
+    auto resolved = peer_alloc_->Resolve(keys[i]);
+    if (!resolved.found) {
+      missed.push_back(i);
+      continue;
+    }
+    if (!RangesAreDisjointAndInBounds(resolved.size, sizes[i], src_offsets[i])) {
+      MORI_UMBP_ERROR("[PoolClient] BatchGetRanges: invalid local ranges for key='{}' size={}",
+                      keys[i], resolved.size);
+      continue;
+    }
+    local_indices.push_back(i);
+    local_resolved.push_back(std::move(resolved));
+  }
+  if (!local_indices.empty()) {
+    std::vector<LocalRangeReadRequest> local_requests;
+    local_requests.reserve(local_indices.size());
+    for (size_t k = 0; k < local_indices.size(); ++k) {
+      const size_t i = local_indices[k];
+      local_requests.push_back(
+          {&local_resolved[k].pages, local_resolved[k].size, &dsts[i], &sizes[i], &src_offsets[i]});
+    }
+    if (LocalGetRangesBatch(local_requests, peer_alloc_->PageSize())) {
+      for (size_t i : local_indices) {
+        results[i] = true;
+        record_local_get(i);
+      }
+    }
+  }
+  if (missed.empty()) return results;
+
+  if (!config_.ranged_scratch_buffer || config_.ranged_scratch_size == 0 ||
+      !FindRegisteredMemory(config_.ranged_scratch_buffer, config_.ranged_scratch_size)
+           .has_value()) {
+    MORI_UMBP_ERROR("[PoolClient] BatchGetRanges: ranged scratch is absent or not registered");
+    return results;
+  }
+
+  // Serialize only the remote portion. Local hits above remain fully concurrent.
+  std::unique_lock<std::mutex> scratch_lock(ranged_scratch_mutex_);
+
+  std::vector<std::string> route_keys;
+  route_keys.reserve(missed.size());
+  for (size_t index : missed) route_keys.push_back(keys[index]);
+  std::vector<std::optional<RouteGetResult>> routes;
+  std::unordered_set<std::string> excludes{config_.master_config.node_id};
+  auto route_status = master_client_->BatchRouteGet(route_keys, excludes, &routes);
+  if (!route_status.ok()) {
+    MORI_UMBP_ERROR("[PoolClient] BatchGetRanges: BatchRouteGet failed: {}",
+                    route_status.error_message());
+    return results;
+  }
+  routes.resize(route_keys.size());
+
+  std::vector<size_t> eligible;
+  eligible.reserve(missed.size());
+  for (size_t r = 0; r < missed.size(); ++r) {
+    const size_t original = missed[r];
+    if (!routes[r].has_value()) continue;
+    const auto& route = *routes[r];
+    if (route.node_id == config_.master_config.node_id ||
+        (route.tier != TierType::DRAM && route.tier != TierType::HBM) || route.size == 0 ||
+        route.size > std::numeric_limits<size_t>::max() ||
+        !RangesAreDisjointAndInBounds(static_cast<size_t>(route.size), sizes[original],
+                                      src_offsets[original])) {
+      MORI_UMBP_ERROR("[PoolClient] BatchGetRanges: invalid route/ranges for key='{}' size={}",
+                      keys[original], route.size);
+      continue;
+    }
+    eligible.push_back(r);
+  }
+
+  size_t pos = 0;
+  while (pos < eligible.size()) {
+    std::vector<size_t> scratch_offsets;
+    size_t cursor = 0;
+    size_t end = pos;
+    for (; end < eligible.size(); ++end) {
+      const auto& route = *routes[eligible[end]];
+      const size_t object_size = static_cast<size_t>(route.size);
+      size_t aligned = 0;
+      if (!AlignUpChecked(cursor, kRangedScratchAlignment, &aligned) ||
+          object_size > config_.ranged_scratch_size ||
+          aligned > config_.ranged_scratch_size - object_size) {
+        break;
+      }
+      scratch_offsets.push_back(aligned);
+      cursor = aligned + object_size;
+    }
+    if (end == pos) {
+      const size_t original = missed[eligible[pos]];
+      MORI_UMBP_ERROR(
+          "[PoolClient] BatchGetRanges: object exceeds ranged scratch key='{}' size={} "
+          "scratch={}",
+          keys[original], routes[eligible[pos]]->size, config_.ranged_scratch_size);
+      ++pos;
+      continue;
+    }
+
+    const size_t count = end - pos;
+    std::vector<std::string> sub_keys;
+    std::vector<void*> sub_dsts;
+    std::vector<size_t> sub_sizes;
+    std::vector<std::optional<RouteGetResult>> sub_routes;
+    sub_keys.reserve(count);
+    sub_dsts.reserve(count);
+    sub_sizes.reserve(count);
+    sub_routes.reserve(count);
+    for (size_t j = 0; j < count; ++j) {
+      const size_t route_index = eligible[pos + j];
+      const size_t original = missed[route_index];
+      sub_keys.push_back(keys[original]);
+      sub_dsts.push_back(static_cast<char*>(config_.ranged_scratch_buffer) + scratch_offsets[j]);
+      sub_sizes.push_back(static_cast<size_t>(routes[route_index]->size));
+      sub_routes.push_back(routes[route_index]);
+    }
+
+    std::vector<bool> fetched(count, false);
+    BatchGetPlan plan = PartitionBatchGetTargets(sub_keys, sub_dsts, sub_sizes, sub_routes);
+    ExecuteBatchGetPlan(plan, sub_keys, sub_dsts, sub_sizes, &fetched,
+                        /*recache_remote=*/false);
+
+    std::vector<size_t> installed_js;
+    std::vector<PeerDramAllocator::ResolveResult> installed_resolved;
+    installed_js.reserve(count);
+    installed_resolved.reserve(count);
+    for (size_t j = 0; j < count; ++j) {
+      const size_t route_index = eligible[pos + j];
+      const size_t original = missed[route_index];
+      if (!fetched[j]) continue;
+
+      const void* object = sub_dsts[j];
+      const auto installed = ExecuteLocalPut(sub_keys[j], object, sub_sizes[j], TierType::DRAM,
+                                             /*enqueue_ssd_copy=*/false);
+      if (installed == PutAttemptOutcome::kSuccess ||
+          installed == PutAttemptOutcome::kSuccessAlreadyExists) {
+        auto resolved = peer_alloc_->Resolve(sub_keys[j]);
+        if (resolved.found && resolved.size == sub_sizes[j]) {
+          installed_js.push_back(j);
+          installed_resolved.push_back(std::move(resolved));
+          continue;
+        }
+      }
+      if (installed != PutAttemptOutcome::kSuccess &&
+          installed != PutAttemptOutcome::kSuccessAlreadyExists) {
+        master_client_->AddCounter(MORI_UMBP_METRIC_RANGED_REMOTE_INSTALL_FAILURES_TOTAL,
+                                   MORI_UMBP_METRIC_RANGED_REMOTE_INSTALL_FAILURES_TOTAL_HELP, {},
+                                   1.0);
+      }
+      results[original] = CopyContiguousToRanges(object, sub_sizes[j], dsts[original],
+                                                 sizes[original], src_offsets[original]);
+    }
+
+    if (!installed_js.empty()) {
+      std::vector<LocalRangeReadRequest> requests;
+      requests.reserve(installed_js.size());
+      for (size_t k = 0; k < installed_js.size(); ++k) {
+        const size_t j = installed_js[k];
+        const size_t original = missed[eligible[pos + j]];
+        requests.push_back({&installed_resolved[k].pages, installed_resolved[k].size,
+                            &dsts[original], &sizes[original], &src_offsets[original]});
+      }
+      const bool copied_batch = LocalGetRangesBatch(requests, peer_alloc_->PageSize());
+      for (size_t k = 0; k < installed_js.size(); ++k) {
+        const size_t j = installed_js[k];
+        const size_t original = missed[eligible[pos + j]];
+        results[original] = copied_batch;
+        if (copied_batch) {
+          record_local_get(original);
+        } else {
+          results[original] = CopyContiguousToRanges(sub_dsts[j], sub_sizes[j], dsts[original],
+                                                     sizes[original], src_offsets[original]);
+        }
+      }
+    }
+    pos = end;
+  }
+  return results;
+}
+
+std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& keys,
+                                             const std::vector<size_t>& object_sizes,
+                                             const std::vector<std::vector<const void*>>& srcs,
+                                             const std::vector<std::vector<size_t>>& sizes,
+                                             const std::vector<std::vector<size_t>>& dst_offsets) {
+  const size_t n = keys.size();
+  std::vector<bool> results(n, false);
+  if (!initialized_ || object_sizes.size() != n ||
+      !RangeBatchShapeValid(n, srcs, sizes, dst_offsets) || n == 0 || !peer_alloc_) {
+    return results;
+  }
+
+  std::vector<size_t> valid;
+  std::vector<std::string> route_keys;
+  std::vector<uint64_t> route_sizes;
+  valid.reserve(n);
+  route_keys.reserve(n);
+  route_sizes.reserve(n);
+  for (size_t i = 0; i < n; ++i) {
+    if (!RangesTileObject(object_sizes[i], sizes[i], dst_offsets[i])) {
+      MORI_UMBP_ERROR("[PoolClient] BatchPutRanges: ranges do not tile key='{}' size={}", keys[i],
+                      object_sizes[i]);
+      continue;
+    }
+    valid.push_back(i);
+    route_keys.push_back(keys[i]);
+    route_sizes.push_back(object_sizes[i]);
+  }
+  if (valid.empty()) return results;
+
+  std::vector<std::optional<RoutePutResult>> routes;
+  std::unordered_set<std::string> excludes;
+  auto route_status = master_client_->BatchRoutePut(route_keys, route_sizes, excludes, &routes);
+  if (!route_status.ok()) {
+    MORI_UMBP_ERROR("[PoolClient] BatchPutRanges: BatchRoutePut failed: {}",
+                    route_status.error_message());
+    return results;
+  }
+  routes.resize(valid.size());
+
+  std::vector<size_t> remote;
+  std::vector<size_t> local_originals;
+  std::vector<LocalRangeWriteRequest> local_requests;
+  remote.reserve(valid.size());
+  local_originals.reserve(valid.size());
+  local_requests.reserve(valid.size());
+  for (size_t r = 0; r < valid.size(); ++r) {
+    const size_t original = valid[r];
+    if (!routes[r].has_value()) continue;
+    const auto& route = *routes[r];
+    if (route.outcome == RoutePutOutcome::kAlreadyExists) {
+      results[original] = true;
+      continue;
+    }
+    if (route.node_id == config_.master_config.node_id) {
+      local_originals.push_back(original);
+      local_requests.push_back({&keys[original], object_sizes[original], &srcs[original],
+                                &sizes[original], &dst_offsets[original], route.tier});
+      continue;
+    }
+    if (route.tier == TierType::DRAM || route.tier == TierType::HBM) remote.push_back(r);
+  }
+  if (!local_requests.empty()) {
+    auto local_outcomes = ExecuteLocalPutRangesBatch(local_requests);
+    for (size_t i = 0; i < local_outcomes.size(); ++i) {
+      results[local_originals[i]] = local_outcomes[i] == PutAttemptOutcome::kSuccess ||
+                                    local_outcomes[i] == PutAttemptOutcome::kSuccessAlreadyExists;
+    }
+  }
+  if (remote.empty()) return results;
+
+  if (!config_.ranged_scratch_buffer || config_.ranged_scratch_size == 0 ||
+      !FindRegisteredMemory(config_.ranged_scratch_buffer, config_.ranged_scratch_size)
+           .has_value()) {
+    MORI_UMBP_ERROR("[PoolClient] BatchPutRanges: ranged scratch is absent or not registered");
+    return results;
+  }
+  std::unique_lock<std::mutex> scratch_lock(ranged_scratch_mutex_);
+
+  size_t pos = 0;
+  while (pos < remote.size()) {
+    std::vector<size_t> scratch_offsets;
+    size_t cursor = 0;
+    size_t end = pos;
+    for (; end < remote.size(); ++end) {
+      const size_t original = valid[remote[end]];
+      const size_t object_size = object_sizes[original];
+      size_t aligned = 0;
+      if (!AlignUpChecked(cursor, kRangedScratchAlignment, &aligned) ||
+          object_size > config_.ranged_scratch_size ||
+          aligned > config_.ranged_scratch_size - object_size) {
+        break;
+      }
+      scratch_offsets.push_back(aligned);
+      cursor = aligned + object_size;
+    }
+    if (end == pos) {
+      const size_t original = valid[remote[pos]];
+      MORI_UMBP_ERROR(
+          "[PoolClient] BatchPutRanges: object exceeds ranged scratch key='{}' size={} "
+          "scratch={}",
+          keys[original], object_sizes[original], config_.ranged_scratch_size);
+      ++pos;
+      continue;
+    }
+
+    std::vector<std::string> sub_keys;
+    std::vector<const void*> sub_srcs;
+    std::vector<size_t> sub_sizes;
+    std::vector<std::optional<RoutePutResult>> sub_routes;
+    std::vector<size_t> sub_originals;
+    std::vector<RangeAssemblyRequest> assemblies;
+    std::vector<const void*> assembled_slices;
+    assemblies.reserve(end - pos);
+    assembled_slices.reserve(end - pos);
+    for (size_t j = 0; j < end - pos; ++j) {
+      const size_t route_index = remote[pos + j];
+      const size_t original = valid[route_index];
+      void* slice = static_cast<char*>(config_.ranged_scratch_buffer) + scratch_offsets[j];
+      assemblies.push_back({&srcs[original], &sizes[original], &dst_offsets[original], slice,
+                            object_sizes[original]});
+      assembled_slices.push_back(slice);
+      sub_originals.push_back(original);
+    }
+
+    if (CopyRangesToContiguousBatch(assemblies)) {
+      sub_keys.reserve(sub_originals.size());
+      sub_srcs.reserve(sub_originals.size());
+      sub_sizes.reserve(sub_originals.size());
+      sub_routes.reserve(sub_originals.size());
+      for (size_t j = 0; j < sub_originals.size(); ++j) {
+        const size_t route_index = remote[pos + j];
+        const size_t original = sub_originals[j];
+        sub_keys.push_back(keys[original]);
+        sub_srcs.push_back(assembled_slices[j]);
+        sub_sizes.push_back(object_sizes[original]);
+        sub_routes.push_back(routes[route_index]);
+      }
+      std::vector<PutEntryOutcome> outcomes(sub_keys.size(), PutEntryOutcome::kFailed);
+      BatchPutPlan plan =
+          PartitionBatchPutTargets(sub_keys, sub_srcs, sub_sizes, sub_routes, &outcomes);
+      ExecuteBatchPutPlan(plan, &outcomes);
+      for (size_t j = 0; j < outcomes.size(); ++j) {
+        results[sub_originals[j]] = outcomes[j] != PutEntryOutcome::kFailed;
+      }
+    }
+    pos = end;
+  }
+  return results;
+}
+
 PoolClient::BatchGetPlan PoolClient::PartitionBatchGetTargets(
     const std::vector<std::string>& keys, const std::vector<void*>& dsts,
     const std::vector<size_t>& sizes, const std::vector<std::optional<RouteGetResult>>& routes) {
@@ -1750,7 +2507,8 @@ PoolClient::BatchGetPlan PoolClient::PartitionBatchGetTargets(
 
 void PoolClient::ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector<std::string>& keys,
                                      const std::vector<void*>& dsts,
-                                     const std::vector<size_t>& sizes, std::vector<bool>* results) {
+                                     const std::vector<size_t>& sizes, std::vector<bool>* results,
+                                     bool recache_remote) {
   // Parallel local DRAM reads: different threads handle different keys. Resolve
   // is mutex-serialized in the allocator; the per-key memcpy in
   // ExecuteLocalGet->LocalGetPages runs lock-free in parallel. results is
@@ -1823,7 +2581,7 @@ void PoolClient::ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector
     run_local_dram();
     for (const auto& [node_id, items] : remote_dram_groups) {
       if (auto f = SubmitRemoteBatchGet(items, results, /*permit_staging=*/true)) {
-        WaitRemoteBatchGet(*f, results);  // immediate; releases staging_mutex_
+        WaitRemoteBatchGet(*f, results, recache_remote);  // immediate; releases staging_mutex_
       }
     }
     run_remote_ssd();
@@ -1846,7 +2604,7 @@ void PoolClient::ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector
   run_local_ssd();
   // TODO(perf): remote SSD is still per-key serial (not yet optimized).
   run_remote_ssd();
-  for (auto& f : inflights) WaitRemoteBatchGet(*f, results);
+  for (auto& f : inflights) WaitRemoteBatchGet(*f, results, recache_remote);
 }
 
 std::unique_ptr<PoolClient::RemoteDramGetInFlight> PoolClient::SubmitRemoteBatchGet(
@@ -1959,7 +2717,8 @@ std::unique_ptr<PoolClient::RemoteDramGetInFlight> PoolClient::SubmitRemoteBatch
   return inflight;
 }
 
-void PoolClient::WaitRemoteBatchGet(RemoteDramGetInFlight& f, std::vector<bool>* results) {
+void PoolClient::WaitRemoteBatchGet(RemoteDramGetInFlight& f, std::vector<bool>* results,
+                                    bool recache_remote) {
   if (f.drained) return;
   f.drained = true;
   // Wait every group (never break early): IN_PROGRESS groups complete here;
@@ -1999,7 +2758,7 @@ void PoolClient::WaitRemoteBatchGet(RemoteDramGetInFlight& f, std::vector<bool>*
     f.staging_lock.unlock();
   }
 
-  FinalizeRemoteGetEntries(f.entries, results);
+  FinalizeRemoteGetEntries(f.entries, results, recache_remote);
 }
 
 bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
@@ -2180,7 +2939,7 @@ bool PoolClient::BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries, P
 }
 
 void PoolClient::FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries,
-                                          std::vector<bool>* results) {
+                                          std::vector<bool>* results, bool recache_remote) {
   for (auto& entry : entries) {
     if (entry.failed) {
       (*results)[entry.result_index] = false;
@@ -2197,7 +2956,7 @@ void PoolClient::FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries,
     // Re-cache the remotely-fetched block into local DRAM (best-effort): the
     // user dst is already populated (staging copy-out and zero-copy both land
     // before Finalize runs), so subsequent reads of this key route local.
-    if (entry.item) {
+    if (recache_remote && entry.item) {
       MaybeReCacheAfterRemote(*entry.item->key, entry.item->dst, entry.item->size);
     }
   }
