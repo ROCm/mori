@@ -32,7 +32,7 @@
   namespace mori {                                                                 \
   namespace shmem {                                                                \
   __device__ __attribute__((visibility("default"))) GpuStates globalGpuStates;     \
-  __device__ __attribute__((visibility("default"))) ProxyGpuState globalProxyState; \
+  __device__ __attribute__((visibility("default"))) ProxyGpuStates globalProxyState; \
   }                                                                                \
   }
 #else

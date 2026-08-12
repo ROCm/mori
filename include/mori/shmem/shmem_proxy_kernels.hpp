@@ -9,11 +9,9 @@
 
 namespace mori {
 namespace shmem {
-extern __device__ __attribute__((visibility("default"))) ProxyGpuState globalProxyState;
-static __device__ ProxyGpuState* GetGlobalProxyStatePtr() { return &globalProxyState; }
 
 inline __device__ volatile core::ProxyRing* ProxyRingForEp(
-    ProxyGpuState* ps, uint32_t epIndex) {
+    ProxyGpuStates* ps, uint32_t epIndex) {
   int pe = epIndex / ps->numQpPerPe;
   int peerLocal = pe % ps->numNics;
   int nicIdx = (ps->localGpuIdx > peerLocal ? ps->localGpuIdx : peerLocal) % ps->numNics;
@@ -21,7 +19,7 @@ inline __device__ volatile core::ProxyRing* ProxyRingForEp(
 }
 
 inline __device__ void ShmemQuietAllProxy() {
-  ProxyGpuState* ps = GetGlobalProxyStatePtr();
+  ProxyGpuStates* ps = GetGlobalProxyStatePtr();
   for (int n = 0; n < ps->numRings; n++) {
     volatile core::ProxyRing* ring = static_cast<volatile core::ProxyRing*>(ps->rings[n]);
     if (!ring) continue;
@@ -44,7 +42,7 @@ inline __device__ void ShmemQuietThreadKernel<application::TransportType::PROXY>
 
 template <>
 inline __device__ void ShmemQuietThreadKernel<application::TransportType::PROXY>(int pe) {
-  ProxyGpuState* ps = GetGlobalProxyStatePtr();
+  ProxyGpuStates* ps = GetGlobalProxyStatePtr();
   GpuStates* gs = GetGlobalGpuStatesPtr();
   int epIndex = pe * gs->numQpPerPe;
   int peerLocal = pe % ps->numNics;
@@ -75,7 +73,7 @@ inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::PR
     const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe,
     int qpId) {
   if (bytes == 0) return;
-  ProxyGpuState* ps = GetGlobalProxyStatePtr();
+  ProxyGpuStates* ps = GetGlobalProxyStatePtr();
   GpuStates* gs = GetGlobalGpuStatesPtr();
   int epIndex = pe * gs->numQpPerPe + (qpId % gs->numQpPerPe);
   volatile core::ProxyRing* ring = ProxyRingForEp(ps, epIndex);
@@ -111,7 +109,7 @@ template <>
 inline __device__ void ShmemPutSizeImmNbiThreadKernel<application::TransportType::PROXY>(
     const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes,
     int pe, int qpId) {
-  ProxyGpuState* ps = GetGlobalProxyStatePtr();
+  ProxyGpuStates* ps = GetGlobalProxyStatePtr();
   GpuStates* gs = GetGlobalGpuStatesPtr();
   int epIndex = pe * gs->numQpPerPe + (qpId % gs->numQpPerPe);
   volatile core::ProxyRing* ring = ProxyRingForEp(ps, epIndex);
@@ -139,7 +137,7 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportTy
     const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
     core::atomicType signalOp, int pe, int qpId) {
   if (bytes == 0) return;
-  ProxyGpuState* ps = GetGlobalProxyStatePtr();
+  ProxyGpuStates* ps = GetGlobalProxyStatePtr();
   GpuStates* gs = GetGlobalGpuStatesPtr();
   int epIndex = pe * gs->numQpPerPe + (qpId % gs->numQpPerPe);
   volatile core::ProxyRing* ring = ProxyRingForEp(ps, epIndex);
@@ -217,7 +215,7 @@ template <>
 inline __device__ void ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::PROXY>(
     const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes,
     core::atomicType amoType, int pe, int qpId) {
-  ProxyGpuState* ps = GetGlobalProxyStatePtr();
+  ProxyGpuStates* ps = GetGlobalProxyStatePtr();
   GpuStates* gs = GetGlobalGpuStatesPtr();
   int epIndex = pe * gs->numQpPerPe + (qpId % gs->numQpPerPe);
   volatile core::ProxyRing* ring = ProxyRingForEp(ps, epIndex);
@@ -253,7 +251,7 @@ inline __device__ void ShmemAtomicSizeNonFetchWarpKernel<application::TransportT
   ShmemAtomicTypeFetchThreadKernel<application::TransportType::PROXY, T>(                      \
       const application::SymmMemObjPtr dest, size_t destOffset, void* val, void* compare,      \
       size_t bytes, core::atomicType amoType, int pe, int qpId) {                               \
-    ProxyGpuState* ps = GetGlobalProxyStatePtr();                                              \
+    ProxyGpuStates* ps = GetGlobalProxyStatePtr();                                              \
     GpuStates* gs = GetGlobalGpuStatesPtr();                                                   \
     int epIndex = pe * gs->numQpPerPe + (qpId % gs->numQpPerPe);                               \
     volatile core::ProxyRing* ring = ProxyRingForEp(ps, epIndex);                              \

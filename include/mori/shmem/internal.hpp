@@ -145,8 +145,14 @@ struct ProxyGpuStates {
 // Changed from __constant__ to __device__ to allow hipMemcpyToSymbol updates (like rocshmem)
 // Default visibility so JIT EP (MORI_DEFINE_GPU_STATES) matches this declaration.
 extern __device__ __attribute__((visibility("default"))) GpuStates globalGpuStates;
+#ifdef MORI_PROXY_ENABLED
+extern __device__ __attribute__((visibility("default"))) ProxyGpuStates globalProxyState;
+#endif
 
 static __device__ GpuStates* GetGlobalGpuStatesPtr() { return &globalGpuStates; }
+#ifdef MORI_PROXY_ENABLED
+static __device__ ProxyGpuStates* GetGlobalProxyStatePtr() { return &globalProxyState; }
+#endif
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                Address to Remote Address Translation                           */
