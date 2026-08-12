@@ -885,7 +885,14 @@ def _torch_symm_extension():
         include_dirs=[str(_root_dir / "include"), f"{rocm}/include"],
         library_dirs=[f"{rocm}/lib"],
         libraries=["amdhip64", "c10_hip", "torch_hip"],
-        extra_compile_args=["-std=c++17"],
+        extra_compile_args=["-std=c++17"]
+        # barrier/put_signal/wait_signal are unimplemented, so the signal pad is not
+        # reserved by default; it would cost a whole 2 MiB page on a page-aligned window.
+        + (
+            ["-DMORI_SYMM_SIGNAL_PAD=1"]
+            if _env_flag("MORI_SYMM_SIGNAL_PAD", "OFF")
+            else []
+        ),
     )
     ext._mori_torch_ext = True
     return [ext]

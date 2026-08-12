@@ -118,5 +118,8 @@ pointer array instead of a flat window.
 ## Notes
 
 `dist.barrier()` is used between the kernel and the reads because the backend has no
-device-side barrier yet (`put_signal`/`wait_signal` raise). A real workload would want
+device-side barrier yet (`barrier`/`put_signal`/`wait_signal` raise). Since none of them
+are implemented, the signal pad is not reserved either — appending torch's 9216-byte pad
+to a page-aligned window would cost a whole extra 2 MiB page, physical backing being
+2 MiB-paged. Build with `MORI_SYMM_SIGNAL_PAD=ON` to reserve it. A real workload would want
 signal-pad synchronisation instead, which is why the timed loop measures the kernel alone.

@@ -42,6 +42,10 @@ The handle type is probed per device: fabric where supported, POSIX fd otherwise
 (MI300/MI355) has no fabric support -- ``hipMemCreate`` itself reports "operation not
 supported" -- so those fall back to fd, which needs no configuration.
 
+``barrier``/``put_signal``/``wait_signal`` are not implemented and raise, so no signal
+pad is reserved in the window -- torch's 9216-byte pad would cost a whole extra 2 MiB page
+on a page-aligned allocation. Build with ``MORI_SYMM_SIGNAL_PAD=ON`` to reserve it.
+
 Known gap: releasing a rendezvous'd window segfaults at world_size >= 4 (2 ranks are
 fine), somewhere in the unmap/release path. Teardown is therefore disabled by default and
 the mappings are leaked -- symmetric buffers are few and long-lived, so that is much less

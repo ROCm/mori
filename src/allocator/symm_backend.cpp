@@ -69,7 +69,19 @@ using c10d::symmetric_memory::SymmetricMemoryAllocator;
   } while (0)
 
 // Match torch's signal pad size so layouts stay comparable across backends.
+// Signal-pad support. barrier()/put_signal()/wait_signal() are unimplemented, so by
+// default no pad is reserved: the ops report unsupported and every window costs exactly
+// its buffer. Physical backing is 2 MiB-paged, so a 9216 B pad appended to a page-aligned
+// request costs a whole extra page -- 2 MiB on a 64 MiB window. Build with
+// -DMORI_SYMM_SIGNAL_PAD=1 to reserve torch's pad once the ops exist.
+#ifndef MORI_SYMM_SIGNAL_PAD
+#define MORI_SYMM_SIGNAL_PAD 0
+#endif
+#if MORI_SYMM_SIGNAL_PAD
 constexpr size_t kSignalPadBytes = 9216;
+#else
+constexpr size_t kSignalPadBytes = 0;
+#endif
 
 size_t RoundUp(size_t v, size_t m) { return ((v + m - 1) / m) * m; }
 
@@ -255,6 +267,10 @@ struct Block {
   c10::intrusive_ptr<SymmetricMemory> symm;
 };
 
+constexpr const char* kNoSignalPad =
+    "Signal-pad support is compiled out (MORI_SYMM_SIGNAL_PAD=0), so no pad is reserved "
+    "in the window; rebuild with -DMORI_SYMM_SIGNAL_PAD=1 to allocate it.";
+
 class MoriSymmetricMemory : public SymmetricMemory {
  public:
   MoriSymmetricMemory(char* flat_base, size_t span, size_t stride, size_t buffer_size,
@@ -275,14 +291,16 @@ class MoriSymmetricMemory : public SymmetricMemory {
       rank_to_global_rank_[r] = r;
       char* slot = flat_base_ + static_cast<size_t>(r) * stride_;
       buffers_.push_back(slot);
-      signal_pads_.push_back(slot + buffer_size_);
+      signal_pads_.push_back(kSignalPadBytes ? slot + buffer_size_ : nullptr);
     }
 
     const size_t arr = world_size_ * sizeof(void*);
     MORI_HIP_CHECK(hipMalloc(&buffers_dev_, arr));
-    MORI_HIP_CHECK(hipMalloc(&signal_pads_dev_, arr));
     MORI_HIP_CHECK(hipMemcpy(buffers_dev_, buffers_.data(), arr, hipMemcpyHostToDevice));
-    MORI_HIP_CHECK(hipMemcpy(signal_pads_dev_, signal_pads_.data(), arr, hipMemcpyHostToDevice));
+    if (kSignalPadBytes) {
+      MORI_HIP_CHECK(hipMalloc(&signal_pads_dev_, arr));
+      MORI_HIP_CHECK(hipMemcpy(signal_pads_dev_, signal_pads_.data(), arr, hipMemcpyHostToDevice));
+    }
     MORI_HIP_CHECK(hipMalloc(&rank_to_global_rank_dev_, world_size_ * sizeof(int)));
     MORI_HIP_CHECK(hipMemcpy(rank_to_global_rank_dev_, rank_to_global_rank_.data(),
                              world_size_ * sizeof(int), hipMemcpyHostToDevice));
@@ -302,9 +320,15 @@ class MoriSymmetricMemory : public SymmetricMemory {
   }
 
   std::vector<void*> get_buffer_ptrs() override { return buffers_; }
-  std::vector<void*> get_signal_pad_ptrs() override { return signal_pads_; }
+  std::vector<void*> get_signal_pad_ptrs() override {
+    TORCH_CHECK(kSignalPadBytes != 0, kNoSignalPad);
+    return signal_pads_;
+  }
   void** get_buffer_ptrs_dev() override { return buffers_dev_; }
-  void** get_signal_pad_ptrs_dev() override { return signal_pads_dev_; }
+  void** get_signal_pad_ptrs_dev() override {
+    TORCH_CHECK(kSignalPadBytes != 0, kNoSignalPad);
+    return signal_pads_dev_;
+  }
   size_t get_buffer_size() override { return buffer_size_; }
   size_t get_offset() override { return 0; }
 
@@ -323,14 +347,15 @@ class MoriSymmetricMemory : public SymmetricMemory {
 
   void barrier(int, size_t) override {
     TORCH_CHECK(false,
-                "mori symm backend: barrier is not implemented; synchronise on the host "
-                "with dist.barrier() for now");
+                "mori symm backend: barrier is not implemented; synchronise on the "
+                "host with dist.barrier() for now. ",
+                kNoSignalPad);
   }
   void put_signal(int, int, size_t) override {
-    TORCH_CHECK(false, "mori symm backend: put_signal is not implemented");
+    TORCH_CHECK(false, "mori symm backend: put_signal is not implemented. ", kNoSignalPad);
   }
   void wait_signal(int, int, size_t) override {
-    TORCH_CHECK(false, "mori symm backend: wait_signal is not implemented");
+    TORCH_CHECK(false, "mori symm backend: wait_signal is not implemented. ", kNoSignalPad);
   }
 
   uintptr_t flat_base() const { return reinterpret_cast<uintptr_t>(flat_base_); }
