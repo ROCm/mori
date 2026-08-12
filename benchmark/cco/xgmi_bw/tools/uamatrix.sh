@@ -46,16 +46,18 @@ ulimit -c 0
 export MATRIX=1 MATRIX_BYTES=$BUDGET MATRIX_MINIT=$MINIT MATRIX_MAXIT=$MAXIT
 export MATRIX_CUMUL=$CUMUL MATRIX_TDMMUL=$TDMMUL
 export MATRIX_HYB=${HYB:-0} MATRIX_C2=${C2:-0} MATRIX_NT=${NT:-0}
-# Which kernel the TDM column reports: 1 = tdm_write, one issuing wave per block (every recorded
-# table); 9 = tdmmws, MWSISS waves per block. Issuer count and per-wave LDS span are compile time, so
-# this has to travel with GRID rather than be set on its own.
-export MATRIX_TDMKIND=${TDMKIND:-1}
+# Which kernel the TDM column reports: 9 = tdmmws, MWSISS waves per block, the default; 1 = tdm_write,
+# one issuing wave per block, which the tables recorded before this default changed were taken with.
+# Issuer count and per-wave LDS span are compile time, so changing this to something the build does not
+# match has to travel with GRID rather than be set on its own.
+export MATRIX_TDMKIND=${TDMKIND:-9}
 export MATRIX_CUMASK=${CUMASK:-0} MATRIX_SO=${SO:-0}
 # DYNTILE=1 sizes the tdmmws tile per cell from bytes/(blocks*MWSISS*MWSPIPE) instead of using the
-# compiled one, capped by it and floored at DYNMIN. It changes what the column measures, so it is off
-# by default and reported in MXCFG when on. Below one row (RTD0N*4 bytes) the descriptor narrows its
-# row rather than dropping rows, which measured no better than stopping at one row.
-export MATRIX_DYNTILE=${DYNTILE:-0} MATRIX_DYNMIN=${DYNMIN:-1024}
+# compiled one, capped by it and floored at DYNMIN, so the payload splits evenly across the issuing
+# waves. On by default and reported in MXCFG either way; set DYNTILE=0 for a fixed-tile table. Below
+# one row (RTD0N*4 bytes) the descriptor narrows its row rather than dropping rows, which measured no
+# better than stopping at one row.
+export MATRIX_DYNTILE=${DYNTILE:-1} MATRIX_DYNMIN=${DYNMIN:-1024}
 # Each CU-masked stream takes a dedicated hardware queue and the sweep rebuilds one per row; the
 # default allowance of 4 ran out on the second row.
 export GPU_MAX_HW_QUEUES=${HWQ:-16}

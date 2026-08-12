@@ -15,8 +15,8 @@ set -uo pipefail
 
 # Defaults are the ones compiled into ualoe_bw.cpp; override to match the GRID the sweep is built with.
 RTD0N="${RTD0N:-256}"; RTD1N="${RTD1N:-8}"; RPIPEN="${RPIPEN:-4}"
-LDSPART="${LDSPART:-16384}"; MWSSPAN="${MWSSPAN:-16384}"
-MWSPIPE="${MWSPIPE:-2}"; MWSISS="${MWSISS:-2}"
+LDSPART="${LDSPART:-16384}"; MWSSPAN="${MWSSPAN:-8192}"
+MWSPIPE="${MWSPIPE:-1}"; MWSISS="${MWSISS:-8}"
 TWTH="${TWTH:-256}"; WARP="${WARP:-32}"      # gfx1250 is wave32
 TDM_NBUF="${TDM_NBUF:-2}"
 LIMIT="${LIMIT:-327680}"                     # 320 KB per CU

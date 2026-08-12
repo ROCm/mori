@@ -303,16 +303,19 @@ static const uint32_t RTD0=RTD0N, RTD1=RTD1N; static const int RPIPE=RPIPEN;
 // 64 KB per round is the optimum, and MWSISS=8 with MWSPIPE=1 is the way to reach it that also keeps the
 // narrow-grid gain: 17.98 GB/s at one block against the single issuer's 8.3, 1613 at 128 blocks, 1645.2
 // at 512, and the best 64 MB column measured (1412/1404/1371 at 128/256/512). LDS is 64 KB per block.
+// These three default to the optimum above: 8 issuers, one tile deep, an 8 KB span each. Building
+// without any -D gives 64 KB per block per round and 64 KB of LDS per block, which is the fast
+// configuration rather than something a caller has to know to ask for.
+// The earlier default was 2:2:16K, and the recorded TDMms columns that predate this were taken with it
+// -- reproducing those needs -DMWSISS=2 -DMWSPIPE=2 -DMWSSPAN=16384 spelled out.
 #ifndef MWSPIPE
-#define MWSPIPE 2
+#define MWSPIPE 1
 #endif
-// Left at 2 because every recorded TDMms column was taken with it; the fast build is -DMWSISS=8
-// -DMWSPIPE=1 -DMWSSPAN=8192.
 #ifndef MWSISS
-#define MWSISS 2
+#define MWSISS 8
 #endif
 #ifndef MWSSPAN
-#define MWSSPAN 16384
+#define MWSSPAN 8192
 #endif
 #define MWS_SPAN ((MWSSPAN) > (MWSPIPE*MW_TILEB) ? (MWSSPAN) : (MWSPIPE*MW_TILEB))
 // Prefetch depth and buffer count of the deep-pipelined staged copy. NBUF >= 2*D is required for the
@@ -1048,8 +1051,10 @@ static int g_hsplit=HSPLIT;
         bool cumask=env_sz("MATRIX_CUMASK",0)!=0;
         g_storeonly=(int)env_sz("MATRIX_SO",0);
         // MATRIX_DYNTILE=1 lets the tdmmws column pick its tile per cell instead of using the compiled
-        // one. It changes what the column measures, so it is reported in MXCFG and left off by default.
-        g_dyntile=(int)env_sz("MATRIX_DYNTILE",0);
+        // one, so the payload divides evenly across the issuing waves instead of leaving most of them
+        // without a tile at the smaller sizes. On by default; MXCFG reports which way it ran. Set it to 0
+        // to reproduce a table taken with a fixed tile.
+        g_dyntile=(int)env_sz("MATRIX_DYNTILE",1);
         g_dyntile_min=env_sz("MATRIX_DYNMIN",1024);
         // MATRIX_HYB=1 adds the two-stream variant to each cell. It is off by default because it doubles
         // the cell cost and because it is not one transport: it splits the payload between the CU kernel
@@ -1058,13 +1063,14 @@ static int g_hsplit=HSPLIT;
         bool hyb=env_sz("MATRIX_HYB",0)!=0;
         bool c2=env_sz("MATRIX_C2",0)!=0;
         bool nt=env_sz("MATRIX_NT",0)!=0;
-        // Which kernel the TDM column reports. 1 is tdm_write: one issuing wave per block, PIPE tiles per
-        // round, which is what every recorded matrix was taken with. 9 is tdmmws_all: MWSISS waves per
-        // block, each driving its own tile stream out of its own LDS partition, MWSPIPE tiles per round.
+        // Which kernel the TDM column reports. 9 is tdmmws_all and the default: MWSISS waves per block,
+        // each driving its own tile stream out of its own LDS partition, MWSPIPE tiles per round. 1 is
+        // tdm_write, one issuing wave per block, which is what the matrices recorded before this default
+        // changed were taken with, so reproducing those needs MATRIX_TDMKIND=1.
         // Both are verified full copies, so the column stays the same kind of measurement; what changes is
         // how many waves inside one block issue descriptors, which the BLOCK axis cannot express -- a block
         // is one issuer at kind 1 no matter how wide it is launched.
-        int tdmkind=(int)env_sz("MATRIX_TDMKIND",1);
+        int tdmkind=(int)env_sz("MATRIX_TDMKIND",9);
         // Block width as an innermost axis rather than a compile-time constant, one list per transport.
         // This is a lever on the per-launch fixed cost rather than on steady-state bandwidth: the same
         // number of threads delivered as fewer, wider blocks is less for the dispatcher to walk. Sweeping

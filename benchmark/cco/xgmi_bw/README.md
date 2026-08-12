@@ -211,19 +211,28 @@ Both refuse to start if a previous run is still alive or if the LDS preflight fa
 `GRID`, `BASEX`, `GPUA`/`GPUB` or `GSRC`/`GDST`, `ARCH`; plus `ROUNDS`/`BLKS` for the block sweep and
 `CUS`/`SZS`/`CUMUL`/`TDMMUL`/`BUDGET`/`MAXB` for the matrix. `PREFLIGHT_ONLY=1` stops after the check.
 
-The tile and issuer results above come from `TDMKIND=9 DYNTILE=1` with `-DMWSISS=` in `GRID`, which
-points the TDM column at the multi-issue kernel and sizes its tile per cell. The recommended build:
+**The defaults are the 8-issuer even-split configuration**, so the commands above already measure it:
+`MWSISS=8` waves per block each issuing, `MWSPIPE=1` tile deep, `MWSSPAN=8192` per wave, the TDM column
+pointed at `tdmmws` (`MATRIX_TDMKIND=9`) and its tile sized per cell (`MATRIX_DYNTILE=1`). That is 64 KB
+per block per round and 64 KB of LDS per block. `MXCFG` prints all of it at the top of a run.
+
+`MWSSPAN` is the per-issuing-wave span; `LDSPART` sizes a different kernel's partition and stays at
+16384, or the preflight refuses the build.
+
+The single-issuer fixed-tile configuration the older tables were taken with has to be asked for now:
 
 ```bash
 GRID="-DBLKMUL=64 -DWTH=512 -DTWBLK=32 -DTWTH=256 -DRTD0N=256 -DRTD1N=8 -DRPIPEN=4 \
-      -DMWSPIPE=1 -DMWSISS=8 -DMWSSPAN=8192 -DLDSPART=16384" \
-TDMKIND=9 DYNTILE=1 CUMUL=1 TDMMUL=1 bash tools/uamatrix.sh
+      -DMWSPIPE=2 -DMWSISS=2 -DMWSSPAN=16384 -DLDSPART=16384" \
+TDMKIND=1 DYNTILE=0 bash tools/uamatrix.sh
 ```
 
-`MWSSPAN` is the per-issuing-wave span and is what shrinks to 8 KB here; `LDSPART` sizes a different
-kernel's partition and stays at 16384, or the preflight refuses the build.
+Which tables need it: everything in `results/` except the `tile256x8_pipe1_iss8*` rows of
+`tilegeom_gfx1250.csv`. The block sweep and matrix sections at the top of this file are single-issuer
+measurements, and re-running them on the current defaults will read higher at narrow grids rather than
+reproducing them.
 
-To build by hand:
+To build by hand (also 8 issuers, since that is now the file's default):
 
 ```bash
 hipcc -std=c++17 -O3 --offload-arch=gfx1250 ualoe_bw.cpp -o ualoe_bw
