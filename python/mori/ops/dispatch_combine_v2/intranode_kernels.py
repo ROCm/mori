@@ -722,8 +722,14 @@ def make_combine(
             expert_valids = []
             expert_pes = []
             expert_toks = []
+            # Idle lanes (>= experts_per_token) are never read back by
+            # readlane, but their tok_map_base+lane can overrun the
+            # allocation on the last tokens of a batch. Fold onto slot 0.
+            tok_map_lane = arith.select(
+                lane < experts_per_token, lane, arith.constant(0)
+            )
             encoded_my = buffer_load(
-                rsrc_tok_map, tok_map_base + lane, vec_width=1, dtype=T.i32()
+                rsrc_tok_map, tok_map_base + tok_map_lane, vec_width=1, dtype=T.i32()
             )
             for k_slot in range_constexpr(experts_per_token):
                 encoded_k = readlane(T.i32(), encoded_my, k_slot)
