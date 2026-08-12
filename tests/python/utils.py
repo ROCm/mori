@@ -140,18 +140,30 @@ class TorchDistProcessManager:
         with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
             if init_shmem:
                 mori.shmem.shmem_torch_process_group_init("default")
+            trace_path = os.environ.get("MORI_WORKER_TRACE")
+
+            def _trace(line):
+                if trace_path:
+                    with open("%s_%d.log" % (trace_path, rank), "a") as f:
+                        f.write(line + "\n")
+
             while True:
                 task = task_queue.get()
                 if task == "STOP":
+                    _trace("STOP")
                     if init_shmem:
                         mori.shmem.shmem_finalize()
                     break
                 func, args = task
+                _trace("START %s" % getattr(func, "__name__", func))
                 try:
                     result = func(rank, *args)
+                    _trace("OK    %s -> %r" % (getattr(func, "__name__", func), result))
                     result_queue.put((rank, result))
                 except Exception:
-                    result_queue.put((rank, traceback.format_exc()))
+                    tb = traceback.format_exc()
+                    _trace("EXC   %s\n%s" % (getattr(func, "__name__", func), tb))
+                    result_queue.put((rank, tb))
 
     def start_workers(self, world_size):
         port = get_free_port()

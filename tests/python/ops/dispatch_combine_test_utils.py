@@ -19,6 +19,9 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+import os
+import queue
+
 import pytest
 from tests.python.utils import TorchDistProcessManager, data_type_supported
 import mori
@@ -340,11 +343,40 @@ def start_torch_dist_process_manager(world_size=8, disable_p2p=False):
     return manager
 
 
-def assert_worker_results(manager, world_size):
+# Long enough for the slowest legitimate case (large-token-num on a cold JIT
+# cache), short enough to report before a CI job-level timeout kills the run.
+WORKER_RESULT_TIMEOUT_S = 600
+
+
+def assert_worker_results(manager, world_size, timeout=WORKER_RESULT_TIMEOUT_S):
+    # Bound the wait: if a rank dies or wanders off without posting a result, the
+    # ranks still inside a device-side barrier will never return either. Blocking
+    # forever here turns that into a bare CI timeout with no diagnosis, so give up
+    # and report whatever the ranks that did answer had to say.
     results = []
-    for _ in range(world_size):
-        rank, result = manager.result_queue.get()
-        results.append((rank, result))
+    try:
+        for _ in range(world_size):
+            results.append(manager.result_queue.get(timeout=timeout))
+    except queue.Empty:
+        missing = sorted(set(range(world_size)) - {rank for rank, _ in results})
+        report = "\n".join(
+            f"[rank {rank}] {result}"
+            for rank, result in sorted(results, key=lambda item: item[0])
+            if result
+        )
+        pytest.fail(
+            f"only {len(results)} of {world_size} ranks reported within {timeout}s; "
+            f"no result from rank(s) {missing}. Ranks that did report:\n"
+            f"{report or '(all reported success)'}",
+            pytrace=False,
+        )
+
+    answered = [rank for rank, _ in results]
+    if len(set(answered)) != world_size:
+        pytest.fail(
+            f"expected one result per rank, got results from ranks {sorted(answered)}",
+            pytrace=False,
+        )
 
     failures = [
         (rank, result)
@@ -589,6 +621,68 @@ class EpDispatchCombineTestCase:
         ) = test_data
         src_token_pos = op.get_dispatch_src_token_pos()
 
+        # Every rank records where it believes it placed each of its tokens. When a receiver later
+        # reports a hole, these files show whether the missing sender targeted the empty slot (a
+        # lost write) or was handed a slot another sender also got (a duplicate allocation).
+        if os.environ.get("MORI_SEND_MAP_TRACE"):
+            from mori.tensor_utils import from_gpu_ptr
+            from mori.ops.dispatch_combine import TOPK_IDX_DTYPE
+
+            sm_ptr, sm_size = op._get_dispatch_sender_token_idx_map_func(op._handle)
+            send_map = from_gpu_ptr(sm_ptr, (sm_size,), TOPK_IDX_DTYPE).tolist()
+            with open("/tmp/sendmap_%d.log" % self.config.rank, "w") as f:
+                f.write(
+                    "rank=%d send_stride=%d dispDestTokIdMap=%s\n"
+                    % (self.config.rank, op.max_num_tokens_to_send(), send_map)
+                )
+
+        stride = op.max_num_tokens_to_send()
+        num_token_per_rank = [int(t.shape[0]) for t in all_rank_input]
+        bad = [
+            (i, int(pos))
+            for i, pos in enumerate(src_token_pos.tolist())
+            if not (0 <= pos // stride < len(num_token_per_rank))
+            or pos % stride >= num_token_per_rank[pos // stride]
+        ]
+        if bad:
+            # Read past recv_num_token to tell the two candidate causes apart. If the slots
+            # beyond the reported count hold valid entries, the senders allocated from a stale
+            # base -- the destination's slot counter was not back at zero. If they are all zero,
+            # the entry was simply never written.
+            from mori.tensor_utils import from_gpu_ptr
+            from mori.ops.dispatch_combine import TOPK_IDX_DTYPE
+
+            ptr, size = op._get_dispatch_src_token_pos_func(op._handle)
+            overrun = from_gpu_ptr(ptr, (size + 16,), TOPK_IDX_DTYPE).tolist()
+
+            # Recompute from the routing indices how many tokens this rank must receive: one per
+            # source token whose (deduplicated) expert set touches this rank. Comparing against
+            # recv_num_token separates an inflated count from a genuinely lost write.
+            nepr = self.config.num_experts_per_rank
+            expected_recv = 0
+            expected_from = []
+            for src, idx in enumerate(all_rank_indices):
+                hits = 0
+                for tok in range(num_token_per_rank[src]):
+                    pes = {
+                        int(e) // nepr for e in idx[tok].tolist() if int(e) >= 0
+                    }
+                    if self.config.rank in pes:
+                        hits += 1
+                expected_recv += hits
+                expected_from.append(hits)
+            raise AssertionError(
+                f"rank {self.config.rank}: {len(bad)} of {len(src_token_pos)} received "
+                f"tokens decode to a source slot that was never sent.\n"
+                f"  recv_num_token={int(dispatch_recv_num_token[0])} "
+                f"send_stride={stride}\n"
+                f"  tokens_sent_per_rank={num_token_per_rank}\n"
+                f"  bad (recv_slot, flat_src_idx)={bad[:16]}\n"
+                f"  src_token_pos={src_token_pos.tolist()}\n"
+                f"  slots[0:{size + 16}] (past recv_num_token)={overrun}\n"
+                f"  expected_recv={expected_recv} (per source rank {expected_from})"
+            )
+
         for i, pos in enumerate(src_token_pos):
             src_rank, src_id = op.decode_send_flat_idx(pos)
             if _is_fp4x2_dtype(self.config.data_type):
@@ -754,25 +848,34 @@ class EpDispatchCombineTestCase:
             all_rank_indices[self.config.rank],
         )
         self.sync()
-        if check_results:
-            self.check_dispatch_result(
-                op,
-                test_data,
-                dispatch_output,
-                dispatch_weights,
-                dispatch_scales,
-                dispatch_indices,
-                dispatch_recv_num_token,
-            )
+        # op.combine() below opens a device-side cross-device barrier that every
+        # rank must enter. Raising out of this block would leave the peers
+        # spinning in that barrier until the CI job times out, hiding the real
+        # error, so record the failure and re-raise once all ranks are through.
+        deferred = None
+        try:
+            if check_results:
+                self.check_dispatch_result(
+                    op,
+                    test_data,
+                    dispatch_output,
+                    dispatch_weights,
+                    dispatch_scales,
+                    dispatch_indices,
+                    dispatch_recv_num_token,
+                )
 
-        total_recv_num_token = dispatch_recv_num_token[0].item()
-        if not self.config.use_external_inp_buf:
-            combine_input = op.get_registered_combine_input_buffer(
-                self.config.data_type
-            )
-            combine_input[:total_recv_num_token, :].copy_(
-                dispatch_output[:total_recv_num_token, :]
-            )
+            total_recv_num_token = dispatch_recv_num_token[0].item()
+            if not self.config.use_external_inp_buf:
+                combine_input = op.get_registered_combine_input_buffer(
+                    self.config.data_type
+                )
+                combine_input[:total_recv_num_token, :].copy_(
+                    dispatch_output[:total_recv_num_token, :]
+                )
+        except Exception as exc:
+            deferred = exc
+
         combine_output, combine_output_weight = op.combine(
             dispatch_output,
             None if weightless else dispatch_weights,
@@ -780,10 +883,19 @@ class EpDispatchCombineTestCase:
             call_reset=False,
         )
         self.sync()
-        if check_results:
-            self.check_combine_result(
-                op, test_data, combine_output, combine_output_weight
-            )
+        # check_combine_result() opens with its own sync(), so every rank has to
+        # reach it for the same reason: bail out here and the peers wait in that
+        # barrier forever. Report the first failure once the last one is done.
+        try:
+            if check_results:
+                self.check_combine_result(
+                    op, test_data, combine_output, combine_output_weight
+                )
+        except Exception as exc:
+            if deferred is None:
+                deferred = exc
+        if deferred is not None:
+            raise deferred
 
 
 def check_local_expert_count(op, dispatch_indices, dispatch_recv_num_token):
