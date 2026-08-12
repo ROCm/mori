@@ -71,6 +71,41 @@ sit within 30% of each other, TDM ahead at 1 MB (182 vs 195 GB/s at the wide end
 actually the faster of the two). Above 16 MB the picture is the one the block sweep shows: TDM is at
 the ceiling on half the blocks.
 
+## Tile size: what decides how many blocks can participate
+
+A compiled-in tile also decides how much of the grid has anything to do. The payload is cut into
+`bytes/tile` tiles, an issuing wave takes `MWSPIPE` of them per round, so a launch can only occupy
+`bytes/(tile*MWSISS*MWSPIPE)` blocks no matter how wide it is. At 1 MB and an 8 KB tile that is
+8 blocks, which is exactly where the 1 MB row stops responding to the grid.
+
+`DYNTILE=1` sizes the tile per cell instead: `clamp(bytes/(blocks*MWSISS*MWSPIPE), DYNMIN, tile)`,
+rounded down to a power of two. Five matrices over the same SIZE x BLOCK axes are in
+[`results/tilegeom_gfx1250.csv`](results/tilegeom_gfx1250.csv), 450 cells, all with 8 issuing waves in
+a 256-thread block. At 256 blocks:
+
+| payload | fixed 8 KB | dynamic, cap 8 KB | fixed 16 KB | dynamic, cap 16 KB |
+|---|---|---|---|---|
+| 256 KB | 23.0 | **50.4** | 14.3 | 51.2 |
+| 1 MB | 89.3 | **189.3** | 55.3 | 189.7 |
+| 4 MB | 337 | **546** | 217 | 548 |
+| 16 MB | 895 | **1010** | 794 | 1034 |
+| 64 MB | 1318 | **1318** | 1201 | 1200 |
+| 256 MB | 1474 | **1476** | 1405 | 1402 |
+| 8 GB | 1559 | **1559** | 1602 | 1601 |
+
+Dynamic sizing at an 8 KB cap is the one to use: it doubles 256 KB and 1 MB, gains 62% at 4 MB and
+13% at 16 MB, and gives up nothing anywhere, at the same 128 KB of LDS. The build differs from the
+fixed-8 KB one only by the switch, so that pair isolates the sizing itself.
+
+A 16 KB tile is not worth its LDS. It costs 9% at 64 MB and 5% at 256 MB -- the sizing formula lands
+exactly on 16 KB there -- and only pays above 4 GB, by 2.7%, for twice the LDS and one block per CU.
+
+The floor stays at one row. Dropping it to 256 B, which makes the descriptor narrow its row rather
+than drop rows, lets 256 KB reach 64 blocks instead of 16 and changes the bandwidth by nothing
+(50.35 vs 50.37). Everything at or below ~256 KB is bounded by per-transfer fixed cost, not by tile
+granularity: 64 KB at 13 GB/s is 4.9 us, which is the same order as the launch cost this path pays.
+Small messages get faster by being batched into fewer launches, not by being cut differently.
+
 ## Reproduction
 
 Both tables were re-measured on 2026-08-12 against the earlier runs, on an idle f01-2, after a

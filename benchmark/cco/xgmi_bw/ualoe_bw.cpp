@@ -128,6 +128,13 @@ __global__ void copyk_u(uint4* __restrict__ d, const uint4* __restrict__ s, size
 }
 static int g_unroll=1;
 static int g_storeonly=0;
+// Size the multi-issuer copy's tile to the payload and the grid rather than to the compiled constant.
+// Off by default so every recorded table stays reproducible from its build flags alone.
+static int g_dyntile=0;
+// Floor on the tile. One row is 1 KB at RTD0=256, and below that the row has to narrow instead, which
+// is a different descriptor shape -- so how far down it pays to go is a measurement, not a constant.
+static size_t g_dyntile_min=1024;
+static size_t g_dyntile_bytes=0;    // tile the last call settled on, for the [MX] line to report
 // Same copy on non-temporal accesses. The reason to have it is not steady-state bandwidth -- copyk
 // already reaches the link's asymptote -- but the fixed per-launch cost measured on top of it, which is
 // ~21 us for copyk against ~11 us for the TDM store path on the same link and the same bytes, and which
@@ -387,10 +394,16 @@ __global__ void tdm_write(float* __restrict__ rem, const float* __restrict__ loc
 // costs nothing in correctness because nothing reads the source and the bytes are already meaningless.
 // Holding LDS constant matters: growing it per wave would trade occupancy for issue width and confound
 // the answer. ISS=1 reproduces the single-issuer case in the same binary, as the control.
+// td0_elems/td1_rows shrink the tile at launch; 0 keeps the compiled extent. A payload too small to fill
+// blocks*ISS*PIPE tiles otherwise leaves most of the grid with nothing to issue, and cutting rows only
+// reaches down to one row -- 1 KB at TD0=256 -- so the row itself has to be narrowable as well. Both only
+// ever shrink the tile, so PIPE of them still fit the SPAN the launch reserved.
 template<uint32_t TD0,uint32_t TD1,int PIPE,int ISS,int WAITN,bool NOLOAD=true,uint32_t SPAN=MW_SPAN>
-__global__ void tdm_write_mw(float* __restrict__ rem, const float* __restrict__ loc, uint32_t num_tiles){
+__global__ void tdm_write_mw(float* __restrict__ rem, const float* __restrict__ loc, uint32_t num_tiles,
+                             uint32_t td0_elems, uint32_t td1_rows){
     extern __shared__ char smem[];
-    const uint32_t TILE=TD0*TD1, TB=TILE*4;
+    const uint32_t D0=td0_elems?td0_elems:TD0, TD1R=td1_rows?td1_rows:TD1;
+    const uint32_t TILE=D0*TD1R, TB=TILE*4;
     const uint32_t W=warpSize, wv=threadIdx.x/W, lane=threadIdx.x-wv*W;
     if(wv>=ISS||lane!=0) return;
     for(uint32_t base=(blockIdx.x*ISS+wv)*PIPE; base<num_tiles; base+=gridDim.x*ISS*PIPE){
@@ -399,14 +412,14 @@ __global__ void tdm_write_mw(float* __restrict__ rem, const float* __restrict__ 
         if constexpr (!NOLOAD){
             #pragma unroll
             for(int k=0;k<PIPE;k++){ uint32_t t=base+k; if(t<num_tiles){
-                uint32_t a[4],b[8]; tdm_desc2d(a,b,wv*SPAN+k*TB, loc+(size_t)t*TILE, TD0,TD1);
+                uint32_t a[4],b[8]; tdm_desc2d(a,b,wv*SPAN+k*TB, loc+(size_t)t*TILE, D0,TD1R);
                 __builtin_amdgcn_tensor_load_to_lds(__builtin_bit_cast(sg0v,a),__builtin_bit_cast(sg1v,b),
                     sg2v{0,0,0,0},sg3v{0,0,0,0},sgxv{0,0,0,0,0,0,0,0},TDM_CPOL); }}
             s_wait_tensorcnt(0);
         }
         #pragma unroll
         for(int k=0;k<PIPE;k++){ uint32_t t=base+k; if(t<num_tiles){
-            uint32_t a[4],b[8]; tdm_desc2d(a,b,wv*SPAN+k*TB, rem+(size_t)t*TILE, TD0,TD1);
+            uint32_t a[4],b[8]; tdm_desc2d(a,b,wv*SPAN+k*TB, rem+(size_t)t*TILE, D0,TD1R);
             __builtin_amdgcn_tensor_store_from_lds(__builtin_bit_cast(sg0v,a),__builtin_bit_cast(sg1v,b),
                 sg2v{0,0,0,0},sg3v{0,0,0,0},sgxv{0,0,0,0,0,0,0,0},TDM_CPOL); }}
         // With staging, the next round's loads target the same partition, so the stores must have
@@ -741,7 +754,7 @@ static int g_hsplit=HSPLIT;
 
     auto tdmmw_all=[&](size_t S)->double{
         uint32_t nt=(uint32_t)(S/RTB); if(nt==0) return 0;
-        auto Wk=[&](int i){ tdm_write_mw<RTD0,RTD1,RPIPE,MWISS,TDM_WAITN><<<wblocks,wTH,(size_t)MWISS*MW_SPAN,st[i]>>>((float*)R[i],(const float*)l_src[i],nt); };
+        auto Wk=[&](int i){ tdm_write_mw<RTD0,RTD1,RPIPE,MWISS,TDM_WAITN><<<wblocks,wTH,(size_t)MWISS*MW_SPAN,st[i]>>>((float*)R[i],(const float*)l_src[i],nt,0,0); };
         for(int i=0;i<NG;i++){ HIPCHECK(hipSetDevice(list[i])); for(int w=0;w<WARMUP;++w) Wk(i); HIPCHECK(hipGetLastError()); }
         for(int i=0;i<NG;i++){ HIPCHECK(hipSetDevice(list[i])); HIPCHECK(hipStreamSynchronize(st[i])); }
         auto t0=std::chrono::high_resolution_clock::now();
@@ -753,16 +766,34 @@ static int g_hsplit=HSPLIT;
     // Staged copy with MWSISS waves per block issuing, each out of its own LDS span. Same kernel as the
     // probe above with the staging load switched back on, so it is a real copy and the verify covers it.
     auto tdmmws_all=[&](size_t S)->double{
-        uint32_t nt=(uint32_t)(S/RTB); if(nt==0) return 0;
+        // A fixed tile decides how many blocks can participate, and for anything but the largest payloads
+        // that number is below the grid: at 1 MB and an 8 KB tile there are 128 tiles, MWSPIPE of them per
+        // issuing wave, so 64 waves -- 8 blocks -- and the rest of the grid idles no matter how wide the
+        // launch is. Sizing the tile to the payload instead keeps every block fed; the compiled tile stays
+        // the cap, since a larger one would need LDS the launch did not reserve.
+        uint32_t rows=RTD1, d0=RTD0; size_t tileB=RTB;
+        if(g_dyntile){
+            const size_t rowB=(size_t)RTD0*4, want=(size_t)wblocks*MWSISS*MWSPIPE;
+            size_t tb=S/(want?want:1);                 // bytes per issuing slot if the payload is split evenly
+            if(tb>RTB) tb=RTB;                         // the compiled tile is the cap: LDS is reserved for it
+            if(tb<g_dyntile_min) tb=g_dyntile_min;
+            size_t p=g_dyntile_min; while(p*2<=tb) p*=2;  // power of two so the payload divides evenly
+            tileB=p;
+            if(tileB>=rowB){ d0=RTD0; rows=(uint32_t)(tileB/rowB); }
+            else           { rows=1;  d0=(uint32_t)(tileB/4); }   // narrower than one row
+        }
+        uint32_t nt=(uint32_t)(S/tileB); if(nt==0) return 0;
+        const uint32_t rowarg=(rows==RTD1)?0u:rows, d0arg=(d0==RTD0)?0u:d0;
         size_t sh=(size_t)MWSISS*MWS_SPAN;
-        auto Wk=[&](int i){ tdm_write_mw<RTD0,RTD1,MWSPIPE,MWSISS,0,false,MWS_SPAN><<<wblocks,wTH,sh,st[i]>>>((float*)R[i],(const float*)l_src[i],nt); };
+        auto Wk=[&](int i){ tdm_write_mw<RTD0,RTD1,MWSPIPE,MWSISS,0,false,MWS_SPAN><<<wblocks,wTH,sh,st[i]>>>((float*)R[i],(const float*)l_src[i],nt,d0arg,rowarg); };
         for(int i=0;i<NG;i++){ HIPCHECK(hipSetDevice(list[i])); for(int w=0;w<WARMUP;++w) Wk(i); HIPCHECK(hipGetLastError()); }
         for(int i=0;i<NG;i++){ HIPCHECK(hipSetDevice(list[i])); HIPCHECK(hipStreamSynchronize(st[i])); }
         auto t0=std::chrono::high_resolution_clock::now();
         for(int i=0;i<NG;i++){ HIPCHECK(hipSetDevice(list[i])); for(int l=0;l<LOOP;++l) Wk(i); }
         for(int i=0;i<NG;i++){ HIPCHECK(hipSetDevice(list[i])); HIPCHECK(hipStreamSynchronize(st[i])); }
         auto t1=std::chrono::high_resolution_clock::now();
-        return gbps((size_t)NG*(size_t)nt*RTB,std::chrono::duration<double,std::milli>(t1-t0).count()/LOOP);
+        g_dyntile_bytes=tileB;
+        return gbps((size_t)NG*(size_t)nt*tileB,std::chrono::duration<double,std::milli>(t1-t0).count()/LOOP);
     };
     auto tdmdp_all=[&](size_t S)->double{
         uint32_t nt=(uint32_t)(S/RTB); if(nt==0) return 0;
@@ -1003,6 +1034,10 @@ static int g_hsplit=HSPLIT;
         // and differs only in how deep its queue is.
         bool cumask=env_sz("MATRIX_CUMASK",0)!=0;
         g_storeonly=(int)env_sz("MATRIX_SO",0);
+        // MATRIX_DYNTILE=1 lets the tdmmws column pick its tile per cell instead of using the compiled
+        // one. It changes what the column measures, so it is reported in MXCFG and left off by default.
+        g_dyntile=(int)env_sz("MATRIX_DYNTILE",0);
+        g_dyntile_min=env_sz("MATRIX_DYNMIN",1024);
         // MATRIX_HYB=1 adds the two-stream variant to each cell. It is off by default because it doubles
         // the cell cost and because it is not one transport: it splits the payload between the CU kernel
         // and the CU-staged TDM one, so it is the answer to "does a second initiator help", which only
@@ -1055,6 +1090,10 @@ static int g_hsplit=HSPLIT;
                 printf("[MXCFG] tdm column = tdmmws: %d waves x %d tiles x %zuB = %zuB per block per round,"
                        " LDS %zuKB/block, block is %d waves of %d threads\n",
                        MWSISS,MWSPIPE,(size_t)MW_TILEB,(size_t)MWSISS*span,lds/1024,waves,dp.warpSize);
+            if(reporter&&g_dyntile)
+                printf("[MXCFG] dyntile=1: tile = clamp(bytes/(blocks*%d*%d), %zuB, %zuB) rounded down to a"
+                       " power of two; below one %dB row the row narrows instead\n",
+                       MWSISS,MWSPIPE,g_dyntile_min,(size_t)MW_TILEB,RTD0N*4);
             if(waves<MWSISS){
                 if(reporter) printf("[FATAL] block holds %d waves but %d must issue: the missing issuers'"
                                     " tiles would never be copied. Raise TWTH.\n",waves,MWSISS);
@@ -1130,6 +1169,7 @@ static int g_hsplit=HSPLIT;
                     if(reporter){
                         printf("[MX] cu=%zu cublk=%d cuth=%d tdmblk=%d tdmth=%d un=%d bytes=%zu iters=%d CU=%.3f TDM=%.3f",
                                cul[ci],blocks,TH,wblocks,wTH,g_unroll,S,g_loop,cv,tv);
+                        if(g_dyntile) printf(" tileB=%zu",g_dyntile_bytes);
                         if(c2)  printf(" C2=%.3f",xv);
                         if(nt)  printf(" NT=%.3f",nv);
                         if(hyb) printf(" HYB=%.3f",hv);
