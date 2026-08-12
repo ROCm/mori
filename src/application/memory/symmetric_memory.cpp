@@ -111,11 +111,6 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   int worldSize = bootNet.GetWorldSize();
   int rank = bootNet.GetLocalRank();
 
-  static int regCount = 0;
-  if (regCount < 3 || heap_begin)
-    fprintf(stderr, "[MoRI] RegisterSymmMemObj #%d rank=%d heap=%d size=%zu\n", regCount, rank, heap_begin, size);
-  regCount++;
-
   SymmMemObj* cpuMemObj = new SymmMemObj();
   cpuMemObj->localPtr = localPtr;
   cpuMemObj->size = size;
@@ -200,9 +195,7 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
       break;
     }
   }
-  bool useProxy = context.IsProxyEnabled();
-
-  if (useProxy && rdmaDeviceContext && anyRdmaPeer) {
+  if (context.IsProxyEnabled() && rdmaDeviceContext && anyRdmaPeer) {
     if (heap_begin) {
       application::RdmaMemoryRegion mr =
           rdmaDeviceContext->RegisterRdmaMemoryRegionAuto(localPtr, size);
@@ -227,7 +220,7 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   }
 
   // Per-NIC MR registration for proxy mode only.
-  if (useProxy) {
+  if (context.IsProxyEnabled()) {
     const auto& allCtxs = context.GetAllRdmaDeviceContexts();
     int numNics = static_cast<int>(allCtxs.size());
     if (numNics > 1 && anyRdmaPeer && heap_begin) {
