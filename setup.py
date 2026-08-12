@@ -30,16 +30,9 @@ from setuptools.command.build import build as _build
 from setuptools.command.build_ext import build_ext
 
 try:
-    from torch.utils.cpp_extension import BuildExtension as _TorchBuildExtension
     from torch.utils.cpp_extension import CppExtension as _TorchCppExtension
 except ImportError:  # torch is optional at build time
-    _TorchBuildExtension = None
     _TorchCppExtension = None
-
-# Torch-linked extensions must be built by torch's own build_ext: it derives
-# _GLIBCXX_USE_CXX11_ABI, torch's bundled pybind11 and the Python ABI tag from the
-# installed torch, none of which CMake would get right on its own.
-_ExtBuildBase = _TorchBuildExtension if _TorchBuildExtension is not None else build_ext
 
 try:
     from Cython.Build import cythonize as _cythonize
@@ -451,7 +444,7 @@ def _setup_spdk(root_dir: Path) -> None:
     )
 
 
-class CMakeBuild(_ExtBuildBase):
+class CMakeBuild(build_ext):
     def run(self) -> None:
         try:
             subprocess.check_output(["cmake", "--version"])
@@ -474,56 +467,63 @@ class CMakeBuild(_ExtBuildBase):
             if ext not in torch_exts:
                 self.build_extension(ext)
         if torch_exts:
-            # BuildExtension.build_extensions() patches the compiler and injects torch's
-            # flags, then loops back into our build_extension() for the actual compile.
-            self._ensure_compiler()
-            saved, self.extensions = self.extensions, torch_exts
-            try:
-                super().build_extensions()
-            finally:
-                self.extensions = saved
+            self._build_with_torch(torch_exts)
 
-    def _ensure_compiler(self) -> None:
-        """Set up self.compiler if nothing has yet. build_ext.run() normally does
-        this, but run() below drives the extensions itself."""
-        if self.compiler is None:
-            self.ensure_finalized()
-            from setuptools._distutils.ccompiler import new_compiler
-            from setuptools._distutils.sysconfig import customize_compiler
+    def _build_with_torch(self, exts: list) -> None:
+        """Build torch-linked extensions with torch's own build_ext, in a separate
+        command instance so nothing else in this build sees torch's compiler patches.
 
-            try:
-                # distutils / older setuptools signature
-                self.compiler = new_compiler(
-                    verbose=self.verbose,
-                    dry_run=self.dry_run,
-                    force=self.force,
-                )
-            except TypeError:
-                # setuptools >= ~80 dropped verbose/dry_run/force kwargs
-                self.compiler = new_compiler()
-                for _attr in ("verbose", "dry_run", "force"):
-                    setattr(self.compiler, _attr, getattr(self, _attr))
-            customize_compiler(self.compiler)
-            if self.include_dirs is not None:
-                self.compiler.set_include_dirs(self.include_dirs)
-            if self.define is not None:
-                for name, value in self.define:
-                    self.compiler.define_macro(name, value)
-            if self.undef is not None:
-                for name in self.undef:
-                    self.compiler.undefine_macro(name)
-            if self.libraries is not None:
-                self.compiler.set_libraries(self.libraries)
-            if self.library_dirs is not None:
-                self.compiler.set_library_dirs(self.library_dirs)
-            if self.rpath is not None:
-                self.compiler.set_runtime_library_dirs(self.rpath)
-            if self.link_objects is not None:
-                self.compiler.set_link_objects(self.link_objects)
+        torch derives _GLIBCXX_USE_CXX11_ABI, its bundled pybind11 and the module's ABI
+        tag from the installed torch; hand-rolling those is what we are avoiding."""
+        from torch.utils.cpp_extension import BuildExtension
+
+        cmd = BuildExtension(self.distribution)
+        cmd.initialize_options()
+        cmd.inplace = self.inplace
+        cmd.build_lib = self.build_lib
+        cmd.build_temp = self.build_temp
+        cmd.force = self.force
+        cmd.finalize_options()
+        # after finalize_options, which would otherwise reset this to all ext_modules
+        cmd.extensions = exts
+        cmd.run()
 
     def build_extension(self, ext: Extension) -> None:
         if ext.sources and any(s.endswith((".pyx", ".cpp")) for s in ext.sources):
-            self._ensure_compiler()
+            if self.compiler is None:
+                self.ensure_finalized()
+                from setuptools._distutils.ccompiler import new_compiler
+                from setuptools._distutils.sysconfig import customize_compiler
+
+                try:
+                    # distutils / older setuptools signature
+                    self.compiler = new_compiler(
+                        verbose=self.verbose,
+                        dry_run=self.dry_run,
+                        force=self.force,
+                    )
+                except TypeError:
+                    # setuptools >= ~80 dropped verbose/dry_run/force kwargs
+                    self.compiler = new_compiler()
+                    for _attr in ("verbose", "dry_run", "force"):
+                        setattr(self.compiler, _attr, getattr(self, _attr))
+                customize_compiler(self.compiler)
+                if self.include_dirs is not None:
+                    self.compiler.set_include_dirs(self.include_dirs)
+                if self.define is not None:
+                    for name, value in self.define:
+                        self.compiler.define_macro(name, value)
+                if self.undef is not None:
+                    for name in self.undef:
+                        self.compiler.undefine_macro(name)
+                if self.libraries is not None:
+                    self.compiler.set_libraries(self.libraries)
+                if self.library_dirs is not None:
+                    self.compiler.set_library_dirs(self.library_dirs)
+                if self.rpath is not None:
+                    self.compiler.set_runtime_library_dirs(self.rpath)
+                if self.link_objects is not None:
+                    self.compiler.set_link_objects(self.link_objects)
             super().build_extension(ext)
             return
 
