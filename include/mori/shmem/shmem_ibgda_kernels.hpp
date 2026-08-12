@@ -30,9 +30,6 @@
 namespace mori {
 namespace shmem {
 
-#ifdef __HIPCC__
-#endif
-
 #ifdef MORI_DEVICE_NIC_BNXT
 #define DISPATCH_MLX5 0
 #define DISPATCH_BNXT 1
@@ -260,9 +257,6 @@ inline __device__ void ShmemQuietThreadKernelSerialImpl(int pe, int qpId) {
 
 inline __device__ void ShmemQuietThreadKernelPsdImpl(int pe, int qpId) {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-
-  // Proxy path: wait only for ops posted since the last quiet.
-
   const int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle& wqHandle = globalGpuStates->rdmaEndpoints[epIndex].wqHandle;
   core::CompletionQueueHandle& cqHandle = globalGpuStates->rdmaEndpoints[epIndex].cqHandle;
@@ -552,9 +546,6 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
     }
     MORI_PRINTF("blockIdx.x=%d, threadIdx.x=%d, remaining=%zu, transfer_size=%zu\n", blockIdx.x,
                 threadIdx.x, remaining, transfer_size);
-
-    // Proxy path: bypass IBGDA, use per-NIC CPU proxy thread for RDMA posting
-
     // Post RDMA write (unified code for both fast and slow paths)
     uint32_t warp_sq_counter{0};
     uint32_t warp_msntbl_counter{0}, warp_psn_counter{0};
@@ -735,8 +726,6 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::Sym
     raddr = dest->peerPtrs[pe] + destOffset;
     rkey = dest->peerRkeys[pe];
   }
-  // Proxy path for inline writes
-
   ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
@@ -875,9 +864,6 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
   // assert(sourceOffset + bytes <= source->size && destOffset + bytes <= dest->size);
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-
-  // Proxy path: data write + signal as two proxy commands on the same NIC ring
-
   ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
@@ -1230,26 +1216,25 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelImpl(
   // assert(destOffset + bytes <= dest->size);
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-
-  // Get correct rkey for VMM heap or use direct rkey for Isolation/Static Heap
-  uintptr_t raddr;
-  uint32_t rkey;
-  if (globalGpuStates->useVMMHeap) {
-    uintptr_t dstAddr = reinterpret_cast<uintptr_t>(dest->localPtr) + destOffset;
-    VmmLookupRemote(dstAddr, pe, raddr, rkey);
-  } else {
-    raddr = dest->peerPtrs[pe] + destOffset;
-    rkey = dest->peerRkeys[pe];
-  }
-
-  // Proxy path for non-fetch atomic
-
   ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
   core::CompletionQueueHandle* cq = &ep[epIndex].cqHandle;
   uint32_t qpn = ep[epIndex].qpn;
   core::IbufHandle* ibuf = &ep[epIndex].atomicIbuf;
+
+  // Get correct rkey for VMM heap or use direct rkey for Isolation/Static Heap
+  uintptr_t raddr;
+  uint32_t rkey;
+  if (globalGpuStates->useVMMHeap) {
+    // VMM Heap: atomic data is small (≤8 bytes), won't cross chunk boundary
+    uintptr_t dstAddr = reinterpret_cast<uintptr_t>(dest->localPtr) + destOffset;
+    VmmLookupRemote(dstAddr, pe, raddr, rkey);
+  } else {
+    // Isolation or Static Heap: direct access
+    raddr = dest->peerPtrs[pe] + destOffset;
+    rkey = dest->peerRkeys[pe];
+  }
 
   uintptr_t laddr = ibuf->addr;
   uintptr_t lkey = ibuf->lkey;
@@ -1408,9 +1393,6 @@ inline __device__ T ShmemAtomicTypeFetchThreadKernelImpl(const application::Symm
                                                          int qpId) {
   // assert(destOffset + bytes <= dest->size);
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-
-  // Proxy path for fetch atomic
-
   ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
