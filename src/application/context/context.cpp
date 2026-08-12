@@ -243,6 +243,26 @@ void Context::InitializeTopologyAndTransports() {
                   devicePortId, device->Name());
   }
 
+  // Firmware provenance for the NIC/GPU pair this rank actually uses. NIC
+  // firmware is a common cause of cross-node RDMA misbehaviour and the GPU MEC
+  // firmware pins down the compute-engine microcode in play; both are among the
+  // first things asked for in a bug report. `mori check` reports the same
+  // values, but that is a separate tool users may never run.
+  {
+    int gpuId = -1;
+    char pciBusId[32] = {};
+    std::string mecFw;
+    if ((hipGetDevice(&gpuId) == hipSuccess) &&
+        (hipDeviceGetPCIBusId(pciBusId, sizeof(pciBusId), gpuId) == hipSuccess)) {
+      mecFw = ReadGpuMecFirmware(pciBusId);
+    }
+    std::string nicFw = (device != nullptr) ? ReadNicFirmware(device->Name()) : std::string{};
+    MORI_APP_INFO("rank {} firmware: nic {} fw_ver {} | gpu {} [{}] mec_fw {}", LocalRank(),
+                  (device != nullptr) ? device->Name() : "none",
+                  nicFw.empty() ? "unknown" : nicFw, gpuId,
+                  (pciBusId[0] != '\0') ? pciBusId : "unknown", mecFw.empty() ? "unknown" : mecFw);
+  }
+
   int numQpPerPe = 4;
   const char* envNumQp = std::getenv("MORI_NUM_QP_PER_PE");
   if (envNumQp != nullptr) {
