@@ -67,17 +67,30 @@ keep enough writes in flight to cover interconnect latency; it measured 15.8 GB/
 gfx1250 and 745 GB/s on gfx950 at the same 4 MiB payload. Splitting each chunk across
 `blocks_per_peer` blocks is worth ~2.5x on gfx950 and ~95x on gfx1250.
 
-The gfx942 column is limited by the allocator, not the fabric. `ubench/06` measures that
-box's XGMI at 48.4 GB/s per link unidirectional (76% of theoretical) and 2637 GB/s
-aggregate all-to-all via `hipMemcpyPeer`, so 185 GB/s is ~7% of what the interconnect can
-carry. The cause is local: writing the VMM window runs at ~50 GB/s against ~880 GB/s for a
-plain `hipMalloc` tensor. A GPU's *own* slot is as slow as a peer's, torch's `data_ptr`
-mapping is as slow as the flat alias, `copy_()` is as slow as our kernel, and Uncached
-matches Pinned — so it is the `hipMemCreate` memory itself on this ROCm build, not the
-aliasing, the handle type, or anything crossing XGMI. gfx1250 shows no such penalty
-(window and plain tensor both 9.7 GB/s under an identical probe). This is also why mori's
-shmem uses `hipMalloc` + hipIpc on gfx9, at the cost of scattered rather than flat peer
-pointers.
+The gfx942 column is a platform limitation, not a fabric or allocator one. That box's
+XGMI is healthy — `ubench/06` measures 48.4 GB/s per link unidirectional (76% of
+theoretical) and 2637 GB/s aggregate all-to-all via `hipMemcpyPeer`.
+
+The cause is that on gfx942, granting **any** other GPU access to a VMM allocation
+collapses the owner's own bandwidth to it. A standalone HIP program (no torch, no mori)
+writing 256 MiB with a `uint4` kernel:
+
+| `hipMemSetAccess` grants | gfx942 local write | gfx942 local read | gfx950 local write |
+|---|---|---|---|
+| self only | 2671.5 GB/s | 1987.4 GB/s | 6515.5 GB/s |
+| self + 1 peer | **55.8 GB/s** | **55.2 GB/s** | 6541.4 GB/s |
+| self + 2 peers | 55.8 GB/s | 55.2 GB/s | 6553.5 GB/s |
+| self + 4 peers | 54.8 GB/s | 55.2 GB/s | 6543.6 GB/s |
+
+One peer grant is enough; adding more costs nothing further. Reads and writes degrade
+equally, which is what an uncached mapping looks like — the pages appear to lose local
+cacheability once they become peer-visible. gfx950 shows no effect at all.
+
+Everything else is innocent, and measured to be so on both parts: plain VMM matches
+`hipMalloc` (2670 vs 2536 GB/s on gfx942), a flat reservation with 8 mapped slots matches
+a single slot, mapping a slot twice as a self alias costs nothing, and Pinned matches
+Uncached. So the flat window design is not what costs gfx942 its bandwidth — making the
+memory shareable at all is, and no symmetric-memory backend can avoid that.
 
 Allocating the window as uncached/fine-grained (as mori's cco windows are) was measured
 and rejected: on gfx1250 it costs about half the bandwidth (712 vs 1499 GB/s at 4 ranks),
