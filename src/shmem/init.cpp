@@ -793,7 +793,8 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
         proxyThreads.push_back(std::move(thread));
       }
     }
-    MORI_SHMEM_INFO("Proxy: {} threads started for {} NICs", proxyThreads.size(), numNics);
+    fprintf(stderr, "[MoRI-DBG] rank=%d: %zu proxy threads started for %d NICs\n",
+            states->gpuStates.rank, proxyThreads.size(), numNics);
   }
 
   states->status = ShmemStatesStatus::Initialized;
