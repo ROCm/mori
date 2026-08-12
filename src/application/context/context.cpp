@@ -404,10 +404,7 @@ void Context::BuildAndConnectInitialEndpoints() {
     if (transportTypes[i] == TransportType::RDMA) {
       for (int qp = 0; qp < numQpPerPe; qp++) {
         if (proxyEnabled) {
-          const int numRailContexts = static_cast<int>(allRdmaDeviceContexts.size());
-          int peerLocalGpu = i % numRailContexts;
-          int agreedRail = std::max(myLocalGpu, peerLocalGpu) % numRailContexts;
-          RdmaEndpoint ep = allRdmaDeviceContexts[agreedRail]->CreateRdmaEndpoint(savedEpConfig);
+          RdmaEndpoint ep = GetRailContext(i)->CreateRdmaEndpoint(savedEpConfig);
           rdmaEps.push_back(ep);
         } else {
           RdmaEndpoint ep = rdmaDeviceContext->CreateRdmaEndpoint(savedEpConfig);
@@ -437,10 +434,7 @@ void Context::BuildAndConnectInitialEndpoints() {
     for (int qp = 0; qp < numQpPerPe; qp++) {
       int epIndex = peer * numQpPerPe + qp;
       if (proxyEnabled) {
-        const int numRailContexts = static_cast<int>(allRdmaDeviceContexts.size());
-        int peerLocalGpu = peer % numRailContexts;
-        int agreedRail = std::max(myLocalGpu, peerLocalGpu) % numRailContexts;
-        RdmaDeviceContext* ctx = allRdmaDeviceContexts[agreedRail].get();
+        RdmaDeviceContext* ctx = GetRailContext(peer);
         ctx->ConnectEndpoint(localToPeerEpHandles[epIndex],
                              peerToLocalEpHandles[epIndex], qp);
         auto* ionic = dynamic_cast<IonicDeviceContext*>(ctx);
@@ -483,13 +477,7 @@ std::vector<RdmaEndpoint> Context::CreateAdditionalEndpoints(int qpPerPe,
       continue;
     }
     for (int qp = 0; qp < qpPerPe; qp++) {
-      RdmaDeviceContext* ctx = rdmaDeviceContext.get();
-      if (proxyEnabled) {
-        const int nCtx = static_cast<int>(allRdmaDeviceContexts.size());
-        int peerLocalGpu = i % nCtx;
-        int agreedRail = std::max(LocalRankInNode(), peerLocalGpu) % nCtx;
-        ctx = allRdmaDeviceContexts[agreedRail].get();
-      }
+      RdmaDeviceContext* ctx = proxyEnabled ? GetRailContext(i) : rdmaDeviceContext.get();
       RdmaEndpoint ep = ctx->CreateRdmaEndpoint(savedEpConfig);
       eps.push_back(ep);
     }
@@ -513,13 +501,7 @@ void Context::ConnectAdditionalEndpoints(std::vector<RdmaEndpoint>& endpoints, i
     if (!ShouldCreateQpForPeer(peer, LocalRank(), peerCaps, peerMask)) continue;
     for (int qp = 0; qp < qpPerPe; qp++) {
       int idx = peer * qpPerPe + qp;
-      RdmaDeviceContext* ctx = rdmaDeviceContext.get();
-      if (proxyEnabled) {
-        const int nCtx = static_cast<int>(allRdmaDeviceContexts.size());
-        int peerLocalGpu = peer % nCtx;
-        int agreedRail = std::max(LocalRankInNode(), peerLocalGpu) % nCtx;
-        ctx = allRdmaDeviceContexts[agreedRail].get();
-      }
+      RdmaDeviceContext* ctx = proxyEnabled ? GetRailContext(peer) : rdmaDeviceContext.get();
       ctx->ConnectEndpoint(localHandles[idx], peerHandles[idx], qp);
     }
   }

@@ -101,6 +101,12 @@ class Context {
     return allRdmaDeviceContexts;
   }
   bool RdmaTransportEnabled() const { return GetRdmaDeviceContext() != nullptr; }
+  RdmaDeviceContext* GetRailContext(int peerRank) const {
+    const int nCtx = static_cast<int>(allRdmaDeviceContexts.size());
+    int peerLocalGpu = peerRank % nCtx;
+    int agreedRail = std::max(LocalRankInNode(), peerLocalGpu) % nCtx;
+    return allRdmaDeviceContexts[agreedRail].get();
+  }
 
   // Check if P2P connection is possible with a peer (same node)
   bool CanUseP2P(int destRank) const;
