@@ -4,6 +4,12 @@
 ARG BASE_IMAGE=rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
 FROM ${BASE_IMAGE}
 
+# Space-separated gfx targets to pull ROCm device packages for. The CCO CI
+# image uses "gfx950 gfx1250".
+ARG GPU_ARCHS="gfx942 gfx950"
+# 1 installs flydsl, which only the cco Python examples need.
+ARG WITH_FLYDSL=0
+
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     git ibverbs-utils libibverbs-dev \
@@ -30,9 +36,8 @@ RUN set -ex && \
     echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://repo.amd.com/rocm/packages-multi-arch/ubuntu2404 stable main" \
       > /etc/apt/sources.list.d/amdrocm.list && \
     apt-get update && \
-    apt-get install -y --no-install-recommends \
-      amdrocm-core-dev7.14-gfx942 \
-      amdrocm-core-dev7.14-gfx950 && \
+    for arch in ${GPU_ARCHS}; do pkgs="${pkgs} amdrocm-core-dev7.14-${arch}"; done && \
+    apt-get install -y --no-install-recommends ${pkgs} && \
     rm -rf /var/lib/apt/lists/*
 
 ENV HIP_PATH=/opt/rocm
@@ -40,3 +45,13 @@ ENV PATH=/opt/rocm/bin:/opt/rocm/llvm/bin:$PATH
 # Must come first: libgrpc-dev pulls Ubuntu's libhsa-runtime64-1 (ROCm 5.7) and
 # libhsakmt1 into /lib/x86_64-linux-gnu, shadowing the real ROCm runtime.
 ENV LD_LIBRARY_PATH=/opt/rocm/lib
+# Force the apt ROCr over the pip-wheel one, which still carries the two VMM
+# bugs the symmetric heap trips over: hipMemSetAccess mis-validating one
+# reserve + many hipMemMap, and a MappedHandle DRM FD leak that fails hipMemMap
+# after ~500 mappings. Only preload libhsa-runtime64 — preloading libamdhip64
+# too triggers an LLVM "spirv-expand-step registered more than once" abort.
+ENV LD_PRELOAD=/opt/rocm/lib/libhsa-runtime64.so.1
+
+# Pinned <0.3: 0.3.x dropped `flydsl.expr.buffer_ops`, still imported directly
+# by the cco examples (04/05/07/08). Unpin once they move to the 0.3.x API.
+RUN if [ "${WITH_FLYDSL}" = "1" ]; then pip install --no-cache-dir "flydsl<0.3"; fi

@@ -41,7 +41,10 @@ jobs:
           submodules: true
 
       - name: Build CI image
-        run: $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.cco .
+        run: |
+          $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE \
+            --build-arg GPU_ARCHS="gfx950 gfx1250" --build-arg WITH_FLYDSL=1 \
+            -t $IMAGE -f docker/Dockerfile.dev .
 
       - name: Start container
         run: |
