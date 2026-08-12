@@ -600,10 +600,6 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
   // cqPool.insert({cq->cqn, cq});
   qpPool.insert({qp->qpn, qp});
 
-  // Expose ibv handles for CPU proxy path (IBGDA proxy on AINIC)
-  endpoint.ibvHandle.qp = qp->qp;
-  endpoint.ibvHandle.cq = cq->cq;
-
   MORI_APP_TRACE(
       "Ionic endpoint created: qpn={}, cqn={}, portId={}, gidIdx={}, atomicIbuf addr=0x{:x}, "
       "nslots={}",
