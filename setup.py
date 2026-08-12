@@ -335,6 +335,14 @@ def _copy_jit_sources(root_dir: Path) -> None:
         root_dir / "src" / "ops" / "dispatch_combine",
         jit_dir / "src" / "ops" / "dispatch_combine",
     )
+    # JIT v2 device bodies. The rendered TU includes one of these by path
+    # ("src/ops/dispatch_combine_v2/ep_intranode_kernel.hpp"), so leaving them out
+    # of the wheel does not degrade the v2 hip backend -- it stops it compiling at
+    # all, and only off a repo checkout would anyone notice.
+    _copytree(
+        root_dir / "src" / "ops" / "dispatch_combine_v2",
+        jit_dir / "src" / "ops" / "dispatch_combine_v2",
+    )
 
     io_kernels_src = root_dir / "src" / "io" / "kernels"
     if io_kernels_src.is_dir():
