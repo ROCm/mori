@@ -304,9 +304,15 @@ build_gid_map() {
 # leg runs over non-interactive ssh, whose PATH is a bare
 # /usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin -- a bare tool name can never
 # resolve there even when the local shell finds it fine.
+#
+# $MORI_PERFTEST_PREFIX wins over $PATH. Distros ship a perftest built without
+# ROCm, and it sits on PATH: searching PATH first means --install-perftest builds
+# a ROCm-capable binary that is then never used, and the GPU pass is skipped
+# advising the reader to run --install-perftest, which they just did. The prefix
+# is only populated deliberately, so treat it as the stronger signal.
 _PERFTEST_RESOLVE_SNIPPET='t="$1"; p="$2";
-c=$(command -v "$t" 2>/dev/null);
-if [ -n "$c" ]; then readlink -f "$c"; elif [ -x "$p/bin/$t" ]; then echo "$p/bin/$t"; fi'
+if [ -x "$p/bin/$t" ]; then echo "$p/bin/$t";
+else c=$(command -v "$t" 2>/dev/null); if [ -n "$c" ]; then readlink -f "$c"; fi; fi'
 
 # Pair every RDMA device with its PCIe-closest GPU, printing "<ib_dev> <hip_id>"
 # per line. Mirrors the ordering MORI itself uses in MatchGpuAndNic
@@ -477,7 +483,7 @@ build_gpu_map() {
 install_perftest() {
     local prefix="$MORI_PERFTEST_PREFIX" rocm="${ROCM_PATH:-/opt/rocm}"
     local missing=() c
-    for c in git autoconf automake libtool make gcc; do
+    for c in git autoconf automake libtoolize make gcc; do
         command -v "$c" >/dev/null 2>&1 || missing+=("$c")
     done
     [[ -d "$rocm" ]] || missing+=("rocm at $rocm (set ROCM_PATH)")
@@ -519,7 +525,8 @@ install_perftest() {
 perftest_hint() {
     log_warn "  install with: $(basename "$0") --install-perftest"
     log_warn "  or manually : git clone $PERFTEST_REPO && cd perftest && ./autogen.sh &&"
-    log_warn "                ./configure --enable-rocm --with-rocm=${ROCM_PATH:-/opt/rocm} && make -j && make install"
+    log_warn "                ./configure --enable-rocm --enable-rocm-dmabuf --with-rocm=${ROCM_PATH:-/opt/rocm} &&"
+    log_warn "                make -j && make install     (drop --enable-rocm-dmabuf if configure rejects it)"
 }
 
 # State shared with mesh_execute. Set by mesh_prepare, read in the pair loop.
@@ -633,7 +640,11 @@ mesh_prepare() {
     return 0
 }
 
-# rail_check <tool> <peer> <row_arr> <col_arr> <rgid_assoc> <cgid_assoc> <label> <unit> <fmt>
+# rail_check <tool> <peer> <row_arr> <col_arr> <rgid_assoc> <cgid_assoc>
+#            <host_cell_assoc> <label> <unit> <fmt>
+#   host_cell_assoc is the matrix the host-memory mesh just filled in, keyed
+#   "<row>,<col>". A GPU-memory failure only means GPUDirect if that same rail
+#   passed on host memory, so the verdict needs both results.
 #   GPU-memory pass over the rail-aligned pairs only: row[i] <-> col[i].
 #   Rationale: the full mesh above already established reachability on host
 #   memory; what GPU memory adds is whether GPUDirect works on the rails MORI
@@ -641,8 +652,8 @@ mesh_prepare() {
 #   to re-answer a question already answered.
 rail_check() {
     local tool="$1" peer="$2"
-    local -n _rr="$3" _cc="$4" _rg="$5" _cg="$6"
-    local label="$7" unit="$8" fmt="$9"
+    local -n _rr="$3" _cc="$4" _rg="$5" _cg="$6" _hc="$7"
+    local label="$8" unit="$9" fmt="${10}"
 
     [[ -n "$MESH_GPU_READY" ]] || return 0
     local n=${#_rr[@]}; (( ${#_cc[@]} < n )) && n=${#_cc[@]}
@@ -660,22 +671,40 @@ rail_check() {
     mesh_gpu_off
 
     # Report the diagonal as a list; a mostly-empty NxN matrix would just be noise.
-    local ok=0 bad=0 v gpu
+    # R/C are the first n entries of the same arrays the host mesh ran over, so
+    # rail i is host cell [i,i].
+    local ok=0 bad_gpu=0 bad_both=0 v gpu h
     for (( i=0; i<n; i++ )); do
         v="${RCELL[$i,$i]:-x}"; gpu="${MESH_RGPU[${R[$i]}]:-?}"
         if [[ "$v" =~ ^[0-9.]+$ ]]; then
             ok=$(( ok + 1 ))
             printf "  %-12s <-> %-12s (gpu %s) : %s %s\n" "${R[$i]}" "${C[$i]}" "$gpu" "$v" "$unit"
+            continue
+        fi
+        # Only a rail that passed on host memory implicates GPUDirect. One that
+        # failed there too has no fabric path at all (a management NIC that is not
+        # on the RDMA fabric is the common case), and calling that a GPU fault
+        # sends the reader after amdgpu/peer_mem for a NIC that never worked.
+        h="${_hc[$i,$i]:-x}"
+        if [[ "$h" =~ ^[0-9.]+$ ]]; then
+            bad_gpu=$(( bad_gpu + 1 ))
+            printf "  %-12s <-> %-12s (gpu %s) : FAILED (host memory passed)\n" \
+                   "${R[$i]}" "${C[$i]}" "$gpu"
         else
-            bad=$(( bad + 1 ))
-            printf "  %-12s <-> %-12s (gpu %s) : FAILED\n" "${R[$i]}" "${C[$i]}" "$gpu"
+            bad_both=$(( bad_both + 1 ))
+            printf "  %-12s <-> %-12s (gpu %s) : FAILED (host memory failed too)\n" \
+                   "${R[$i]}" "${C[$i]}" "$gpu"
         fi
     done
-    if (( bad == 0 )); then
+    if (( bad_gpu == 0 && bad_both == 0 )); then
         log_ok "$label GPU memory: all $ok rail(s) passed"
-    else
-        log_fail "$label GPU memory: $bad/$n rail(s) failed -- GPUDirect RDMA problem (host memory worked)"
+        return 0
     fi
+    (( bad_gpu )) && log_fail \
+        "$label GPU memory: $bad_gpu/$n rail(s) passed on host memory but failed on GPU -- GPUDirect RDMA problem"
+    (( bad_both )) && log_warn \
+        "$label GPU memory: $bad_both/$n rail(s) failed on host memory too -- no fabric path, not a GPUDirect fault"
+    return 0
 }
 
 # nic_ipv4 <dev>   -> first IPv4 of the device's netdev (empty if none)
@@ -1163,7 +1192,7 @@ check_inter_node_bw() {
     # The mesh above ran on host memory. MORI transfers VRAM-to-VRAM, so follow
     # up with a GPU-memory pass over the rail-aligned pairs: if those fail while
     # the host-memory mesh passed, the fault is GPUDirect, not the fabric.
-    rail_check ib_write_bw "$PEER_IP" LOCAL_DEVS REMOTE_DEVS LGID RGID \
+    rail_check ib_write_bw "$PEER_IP" LOCAL_DEVS REMOTE_DEVS LGID RGID CELL \
                "inter-node BW" "Gbps" int
 }
 
@@ -1806,7 +1835,7 @@ check_inter_node_lat() {
     mesh_execute CELL ib_write_lat "$PEER_IP" false "" LGID RGID LOCAL_DEVS REMOTE_DEVS
     mesh_report CELL LOCAL_DEVS REMOTE_DEVS "inter-node latency" "us" f1 no
 
-    rail_check ib_write_lat "$PEER_IP" LOCAL_DEVS REMOTE_DEVS LGID RGID \
+    rail_check ib_write_lat "$PEER_IP" LOCAL_DEVS REMOTE_DEVS LGID RGID CELL \
                "inter-node latency" "us" f1
 }
 

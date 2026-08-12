@@ -535,8 +535,15 @@ sudo docker exec $CONTAINER_NAME bash -c "mori check --install-perftest"
 ```
 
 That builds upstream `linux-rdma/perftest` with
-`--enable-rocm --with-rocm=$ROCM_PATH`. Prefer it over `ROCm/rdma-perftest`,
+`--enable-rocm --enable-rocm-dmabuf --with-rocm=$ROCM_PATH`, retrying without
+`--enable-rocm-dmabuf` if configure rejects it. Prefer it over `ROCm/rdma-perftest`,
 which exposes the same flags but has not moved since 2025-05.
+
+The build needs `libtoolize` (not the `libtool` wrapper — `configure` generates
+that), plus `git autoconf automake make gcc` and ibverbs headers. Note the
+resolved binary comes from `$MORI_PERFTEST_PREFIX/bin` in preference to `$PATH`:
+distros ship a perftest built without ROCm, and letting it win would mean
+`--install-perftest` silently has no effect.
 
 **mlx5 note:** native IB ports don't use PFC/DSCP/DCQCN (IB has its own
 credit-based flow control managed by the fabric SM) — steps 2/3 only run
