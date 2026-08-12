@@ -76,6 +76,26 @@ Uncached/fine-grained windows, as mori's cco windows are, were measured and reje
 the bandwidth on gfx1250 (712 vs 1499 GB/s at 4 ranks) and no change on gfx950. The backend
 uses coarse-grained pinned memory.
 
+### Addressing: flat window vs pointer array
+
+The kernel is built both ways so they can be compared — `flat_base + peer*stride`, and the
+N-entry peer pointer array that `hdl.buffer_ptrs_dev()` provides and that torch's own
+backends force, since they map each peer at an unrelated address. `--addressing
+flat|ptrs|both` selects; both are correctness-checked.
+
+| | gfx950, 8 ranks, 4 MiB | gfx1250, 4 ranks, 4 MiB |
+|---|---|---|
+| `base + rank*stride` | 1912.0 GB/s | 1714.7 GB/s |
+| peer pointer array | 1909.4 GB/s | 1702.9 GB/s |
+
+**There is no measurable performance difference.** The gap is under 1% here and under 4%
+at 256 KiB, and it does not consistently favour either form — the pointer load is issued
+once per block and amortised, while the flat form pays two extra 64-bit multiplies. So the
+flat window is worth having for kernel ergonomics (two scalars, no device-side array to
+plumb or keep alive, destination computable at run time), not for speed. Anyone choosing
+between them for throughput reasons should measure first; on these two parts it does not
+matter.
+
 ### Why gfx942 is slow
 
 A driver limitation, not a fabric or allocator one. That box's XGMI is healthy: `ubench/06`

@@ -45,6 +45,12 @@ def parse_args():
     p.add_argument("--chunk-kib", type=int, default=256, help="bytes sent to each peer")
     p.add_argument("--iters", type=int, default=20, help="timed iterations")
     p.add_argument("--warmup", type=int, default=5)
+    p.add_argument(
+        "--addressing",
+        choices=("flat", "ptrs", "both"),
+        default="both",
+        help="flat_base + peer*stride, an N-entry peer pointer array, or both",
+    )
     return p.parse_args()
 
 
@@ -83,6 +89,18 @@ def main():
 
     hdl = symm_mem.rendezvous(recv, group_name)
     base, stride = flat_layout(hdl)
+    # The same peers, as the N-entry device array torch's API always provides.
+    peers_dev = hdl.buffer_ptrs_dev
+
+    modes = ("flat", "ptrs") if args.addressing == "both" else (args.addressing,)
+    launch = {
+        "flat": lambda: all2all_kernel.all2all_push(
+            send, base, stride, chunk_bytes, rank_id, world_size
+        ),
+        "ptrs": lambda: all2all_kernel.all2all_push_ptrs(
+            send, peers_dev, chunk_bytes, rank_id, world_size
+        ),
+    }
 
     if rank_id == 0:
         print(
@@ -92,50 +110,60 @@ def main():
         strided = all(p == base + r * stride for r, p in enumerate(hdl.buffer_ptrs))
         print(f"peer(r) == base + r*stride: {strided}")
 
-    def run_once():
-        all2all_kernel.all2all_push(
-            send, base, stride, chunk_bytes, rank_id, world_size
-        )
+    def run_once(mode):
+        launch[mode]()
         torch.cuda.synchronize()
         # No device-side barrier in the backend yet, so ranks meet on the host.
         dist.barrier()
 
-    run_once()
-
-    # Chunk r must hold what rank r sent us: r*1000 + our rank.
     errors = 0
-    for r in range(world_size):
-        got = recv[r * elems_per_chunk].item()
-        want = r * 1000 + rank_id
-        if got != want:
-            errors += 1
-            print(f"[rank {rank_id}] chunk {r}: got {got}, expected {want}", flush=True)
-    if rank_id == 0 and errors == 0:
-        print(f"correctness: OK ({world_size}x{world_size} chunks)")
-
-    for _ in range(args.warmup):
-        run_once()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    torch.cuda.synchronize()
-    start.record()
-    for _ in range(args.iters):
-        all2all_kernel.all2all_push(
-            send, base, stride, chunk_bytes, rank_id, world_size
-        )
-    end.record()
-    torch.cuda.synchronize()
-    ms = start.elapsed_time(end) / args.iters
+    for mode in modes:
+        # Zeroing is local, but peers write into this window: everyone must finish
+        # clearing before anyone starts pushing, or a late zero wipes an early write.
+        recv.zero_()
+        torch.cuda.synchronize()
+        dist.barrier()
+        run_once(mode)
+        # Chunk r must hold what rank r sent us: r*1000 + our rank.
+        bad = 0
+        for r in range(world_size):
+            got = recv[r * elems_per_chunk].item()
+            want = r * 1000 + rank_id
+            if got != want:
+                bad += 1
+                print(
+                    f"[rank {rank_id}] {mode} chunk {r}: got {got}, want {want}",
+                    flush=True,
+                )
+        errors += bad
+        if rank_id == 0 and bad == 0:
+            print(f"correctness ({mode}): OK ({world_size}x{world_size} chunks)")
 
     # Only (world_size-1) chunks leave the device; the self chunk stays local.
     remote_bytes = (world_size - 1) * chunk_bytes
-    gbps = remote_bytes / (ms / 1e3) / 1e9
-    totals = torch.tensor([gbps], dtype=torch.float64)
-    dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+    for mode in modes:
+        for _ in range(args.warmup):
+            run_once(mode)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        torch.cuda.synchronize()
+        dist.barrier()
+        start.record()
+        for _ in range(args.iters):
+            launch[mode]()
+        end.record()
+        torch.cuda.synchronize()
+        ms = start.elapsed_time(end) / args.iters
+        gbps = remote_bytes / (ms / 1e3) / 1e9
+        totals = torch.tensor([gbps], dtype=torch.float64)
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+        if rank_id == 0:
+            label = "base + rank*stride" if mode == "flat" else "peer pointer array"
+            print(
+                f"{label:<20}: {ms * 1e3:7.1f} us/iter, {totals.item():8.1f} GB/s aggregate"
+            )
+
     if rank_id == 0:
-        print(
-            f"push all-to-all: {ms * 1e3:.1f} us/iter, {totals.item():.1f} GB/s aggregate"
-        )
         print("SUCCESS" if errors == 0 else "FAILED")
 
     dist.barrier()
