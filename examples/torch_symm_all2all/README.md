@@ -36,6 +36,11 @@ base, stride = flat_layout(recv)
 all2all_kernel.all2all_push(send, base, stride, chunk_bytes, rank_id, world_size)
 ```
 
+`flat_layout()` is a convenience. torch already publishes the peer pointers, so the same
+two numbers are just `hdl.buffer_ptrs[0]` and `hdl.buffer_ptrs[1] - hdl.buffer_ptrs[0]`;
+the helper only adds a check that the stride is uniform, which torch's API does not
+promise and which backends handing back scattered per-rank pointers would fail.
+
 ## Measured
 
 Aggregate counts only the `(world_size-1)` chunks that leave the device; the self chunk stays

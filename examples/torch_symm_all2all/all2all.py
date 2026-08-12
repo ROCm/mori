@@ -82,7 +82,7 @@ def main():
     torch.cuda.synchronize()
 
     hdl = symm_mem.rendezvous(recv, group_name)
-    base, stride = flat_layout(recv)
+    base, stride = flat_layout(hdl)
 
     if rank_id == 0:
         print(

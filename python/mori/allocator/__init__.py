@@ -34,9 +34,9 @@ is needed -- torch's process group is the only rendezvous::
     hdl = symm_mem.rendezvous(t, group_name)
     peer = hdl.get_buffer(1, (1024,), torch.bfloat16)
 
-Every rank is mapped into one flat span, so ``hdl.get_buffer_ptrs()[r]`` is
-``flat_base + r*stride``. ``flat_layout(t)`` returns that pair for kernels that would
-rather do arithmetic than index a pointer array.
+Every rank is mapped into one flat span, so ``hdl.buffer_ptrs[r]`` is
+``flat_base + r*stride`` -- a kernel can take a base and a stride instead of an N-entry
+pointer array. ``flat_layout(hdl)`` returns that pair and checks the stride is uniform.
 
 The handle type is probed per device: fabric where supported, POSIX fd otherwise. gfx9
 (MI300/MI355) has no fabric support -- ``hipMemCreate`` itself reports "operation not
@@ -98,10 +98,25 @@ def register_symm_backend() -> str:
     return SYMM_BACKEND_NAME
 
 
-def flat_layout(tensor) -> tuple[int, int]:
-    """``(flat_base, stride)`` of a rendezvous'd tensor: peer r lives at
-    ``flat_base + r*stride``."""
-    return _ext().flat_layout(tensor)
+def flat_layout(handle) -> tuple[int, int]:
+    """``(flat_base, stride)`` of a rendezvous'd window: peer r lives at
+    ``flat_base + r*stride``.
+
+    torch already publishes the peer pointers, so this is only
+    ``ptrs[0], ptrs[1] - ptrs[0]``. What it adds is the check that the window really
+    is evenly strided -- a guarantee this allocator makes and torch's API does not,
+    since other backends hand back scattered per-rank pointers. Pointing a kernel at
+    ``base + rank*stride`` on one of those would silently corrupt memory.
+    """
+    ptrs = handle.buffer_ptrs
+    base = ptrs[0]
+    stride = ptrs[1] - ptrs[0] if len(ptrs) > 1 else 0
+    if any(p != base + r * stride for r, p in enumerate(ptrs)):
+        raise RuntimeError(
+            "symmetric window is not evenly strided; flat_layout() is only meaningful "
+            f"for the {SYMM_BACKEND_NAME} backend. peers={[hex(p) for p in ptrs]}"
+        )
+    return base, stride
 
 
 def handle_type(device_index: int = 0) -> Literal["fabric", "posix_fd"]:

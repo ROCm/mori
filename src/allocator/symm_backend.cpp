@@ -40,7 +40,6 @@
 #include <pybind11/pybind11.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <torch/csrc/utils/pybind.h>  // at::Tensor <-> python caster
 #include <unistd.h>
 
 #include <cstdlib>
@@ -547,13 +546,6 @@ c10::intrusive_ptr<MoriSymmAllocator>& AllocatorSingleton() {
 }
 
 // Arithmetic peer addressing, which torch's interface has no place for.
-std::tuple<uintptr_t, int64_t> FlatLayout(const at::Tensor& t) {
-  auto block = AllocatorSingleton()->FindBlock(t.data_ptr());
-  TORCH_CHECK(block != nullptr, "not a mori symmetric allocation");
-  TORCH_CHECK(block->symm != nullptr, "rendezvous() has not been called on this tensor");
-  auto* symm = static_cast<MoriSymmetricMemory*>(block->symm.get());
-  return {symm->flat_base(), static_cast<int64_t>(symm->stride())};
-}
 
 void Shutdown() { AllocatorSingleton()->Shutdown(); }
 
@@ -580,8 +572,6 @@ PYBIND11_MODULE(mori_torch_symm, m) {
   mori::allocator::RegisterTorchSymmBackend();
   m.def("register_backend", &mori::allocator::RegisterTorchSymmBackend,
         "Register the MORI symmetric memory backend with torch (idempotent)");
-  m.def("flat_layout", &mori::allocator::FlatLayout,
-        "(flat_base, stride) of a rendezvous'd tensor");
   m.def("shutdown", &mori::allocator::Shutdown,
         "Release every live symmetric allocation (registered as an atexit hook)");
   m.def("handle_type", &mori::allocator::HandleTypeName,

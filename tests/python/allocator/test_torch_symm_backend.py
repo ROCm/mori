@@ -50,7 +50,7 @@ def _run(rank, world_size, port):
         assert hdl.world_size == world_size and hdl.rank == rank
 
         # Peers land in one flat span: buffer_ptrs[r] == flat_base + r*stride.
-        base, stride = flat_layout(t)
+        base, stride = flat_layout(hdl)
         for r, p in enumerate(hdl.buffer_ptrs):
             assert p == base + r * stride, f"rank {r} not at base + r*stride"
 
