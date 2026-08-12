@@ -173,9 +173,10 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   Impl(const UMBPConfig& config, std::string address)
       : backend_config_(NormalizeBackendConfig(config)),
         client_(CreateUMBPClient(backend_config_)),
-        shared_reads_((client_->GetDeploymentMode() == UMBPDeploymentMode::Local ||
-                       client_->GetDeploymentMode() == UMBPDeploymentMode::Distributed) &&
-                      !backend_config_.ssd.enabled),
+        shared_reads_(!backend_config_.ssd.enabled &&
+                      (client_->GetDeploymentMode() == UMBPDeploymentMode::Local ||
+                       (client_->GetDeploymentMode() == UMBPDeploymentMode::Distributed &&
+                        client_->SupportsRangedIO()))),
         address_(std::move(address)),
         fd_socket_path_(DeriveFdSocketPath(address_)) {}
 

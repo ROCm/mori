@@ -63,15 +63,17 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   // 2 MiB, so this only matters with non-default page size combinations.
   dram_pool_size_ = dram_pool_handle_.mapped_size;
 
-  ranged_scratch_handle_ = allocator.Alloc(dc.ranged_scratch_size, opts);
-  if (!ranged_scratch_handle_.valid()) {
-    allocator.Free(dram_pool_handle_);
-    dram_pool_ = nullptr;
-    dram_pool_size_ = 0;
-    throw std::runtime_error("DistributedClient: memory allocation failed for ranged scratch");
+  if (dc.ranged_scratch_size > 0) {
+    ranged_scratch_handle_ = allocator.Alloc(dc.ranged_scratch_size, opts);
+    if (!ranged_scratch_handle_.valid()) {
+      allocator.Free(dram_pool_handle_);
+      dram_pool_ = nullptr;
+      dram_pool_size_ = 0;
+      throw std::runtime_error("DistributedClient: memory allocation failed for ranged scratch");
+    }
+    ranged_scratch_ = ranged_scratch_handle_.ptr;
+    ranged_scratch_size_ = ranged_scratch_handle_.mapped_size;
   }
-  ranged_scratch_ = ranged_scratch_handle_.ptr;
-  ranged_scratch_size_ = ranged_scratch_handle_.mapped_size;
 
   // Lower SSD config to the peer.  When ssd.enabled, the peer builds a
   // PeerSsdManager (SSDTier backend) from the SSD config (UMBPSsdConfig) and
@@ -97,15 +99,17 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   if (!pool_client_->Init()) {
     pool_client_.reset();
     HostMemAllocator cleanup_allocator;
-    cleanup_allocator.Free(ranged_scratch_handle_);
-    ranged_scratch_ = nullptr;
-    ranged_scratch_size_ = 0;
+    if (ranged_scratch_) {
+      cleanup_allocator.Free(ranged_scratch_handle_);
+      ranged_scratch_ = nullptr;
+      ranged_scratch_size_ = 0;
+    }
     cleanup_allocator.Free(dram_pool_handle_);
     dram_pool_ = nullptr;
     dram_pool_size_ = 0;
     throw std::runtime_error("DistributedClient: PoolClient::Init() failed");
   }
-  if (!pool_client_->RegisterMemory(ranged_scratch_, ranged_scratch_size_)) {
+  if (ranged_scratch_ && !pool_client_->RegisterMemory(ranged_scratch_, ranged_scratch_size_)) {
     pool_client_->Shutdown();
     pool_client_.reset();
     HostMemAllocator cleanup_allocator;

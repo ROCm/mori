@@ -75,7 +75,7 @@ class DistributedClient : public IUMBPClient {
   void Close() override;
   bool IsDistributed() const override;
   UMBPDeploymentMode GetDeploymentMode() const override { return UMBPDeploymentMode::Distributed; }
-  bool SupportsRangedIO() const override { return true; }
+  bool SupportsRangedIO() const override { return ranged_scratch_size_ > 0; }
 
   bool RegisterMemory(uintptr_t ptr, size_t size) override;
   void DeregisterMemory(uintptr_t ptr) override;

@@ -43,6 +43,7 @@
 #include "umbp/distributed/master/master_server.h"
 #include "umbp/distributed/peer/peer_dram_allocator.h"
 #include "umbp/distributed/pool_client.h"
+#include "umbp/umbp_client.h"
 
 namespace mori::umbp {
 namespace {
@@ -80,6 +81,17 @@ bool WaitForExists(PoolClient* client, const std::string& key) {
     std::this_thread::sleep_for(std::chrono::milliseconds(25));
   }
   return client->Exists(key);
+}
+
+bool WaitForExists(IUMBPClient* client, const std::string& key) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (std::chrono::steady_clock::now() < deadline) {
+    const auto found = client->BatchExists({key});
+    if (found.size() == 1 && found[0]) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
+  const auto found = client->BatchExists({key});
+  return found.size() == 1 && found[0];
 }
 
 class PoolClientRangesTest : public ::testing::Test {
@@ -139,6 +151,27 @@ class PoolClientRangesTest : public ::testing::Test {
     EXPECT_TRUE(client->Init());
     EXPECT_TRUE(client->RegisterMemory(scratch.data(), scratch.size()));
     return client;
+  }
+
+  UMBPConfig DistributedConfig(const std::string& node_id, size_t ranged_scratch_size) {
+    UMBPConfig config;
+    config.dram.capacity_bytes = 4 * kTargetCapacity;
+    config.dram.use_hugepages = false;
+    config.ssd.enabled = false;
+
+    UMBPDistributedConfig distributed;
+    distributed.master_config.node_id = node_id;
+    distributed.master_config.node_address = "127.0.0.1";
+    distributed.master_config.master_address = master_address_;
+    distributed.io_engine.host = "0.0.0.0";
+    distributed.io_engine.port = 0;
+    distributed.peer_service_port = FreePort();
+    distributed.dram_page_size = kPageSize;
+    distributed.staging_buffer_size = 4 * kObjectSize;
+    distributed.ranged_scratch_size = ranged_scratch_size;
+    distributed.cache_remote_fetches = false;
+    config.distributed = std::move(distributed);
+    return config;
   }
 
   void PutLocalReplica(PoolClient* client, std::vector<char>& dram, const std::string& key,
@@ -261,6 +294,51 @@ TEST_F(PoolClientRangesTest, InvalidRangesFailWithoutPublishing) {
   EXPECT_EQ(result, std::vector<bool>({false, false}));
   EXPECT_FALSE(caller_->Exists(keys[0]));
   EXPECT_FALSE(caller_->Exists(keys[1]));
+}
+
+TEST_F(PoolClientRangesTest, DistributedScratchIsExplicitlyOptedIn) {
+  EXPECT_EQ(UMBPDistributedConfig{}.ranged_scratch_size, 0u);
+
+  auto config = DistributedConfig("ranges-no-scratch", /*ranged_scratch_size=*/0);
+  std::string validation_error;
+  ASSERT_TRUE(config.Validate(&validation_error)) << validation_error;
+  auto client = CreateUMBPClient(config);
+  ASSERT_NE(client, nullptr);
+  EXPECT_EQ(client->GetDeploymentMode(), UMBPDeploymentMode::Distributed);
+  EXPECT_FALSE(client->SupportsRangedIO());
+
+  const std::string key = "ordinary-io-without-ranged-scratch";
+  std::vector<char> source(kObjectSize);
+  for (size_t i = 0; i < source.size(); ++i) {
+    source[i] = static_cast<char>((i * 17 + 3) & 0xff);
+  }
+  auto put = client->BatchPut({key}, {reinterpret_cast<uintptr_t>(source.data())}, {source.size()});
+  ASSERT_EQ(put, std::vector<bool>({true}));
+  ASSERT_TRUE(client->Flush());
+  ASSERT_TRUE(WaitForExists(client.get(), key));
+
+  std::vector<char> restored(source.size(), 0);
+  auto get =
+      client->BatchGet({key}, {reinterpret_cast<uintptr_t>(restored.data())}, {restored.size()});
+  ASSERT_EQ(get, std::vector<bool>({true}));
+  EXPECT_EQ(restored, source);
+
+  // Bypassing the advertised capability remains a safe per-key failure. Use a
+  // missing key so the call reaches the remote-scratch guard after its local probe.
+  std::vector<char> ranged_out(16, 0);
+  auto ranged = client->BatchGetRanges({"missing-without-ranged-scratch"},
+                                       {{reinterpret_cast<uintptr_t>(ranged_out.data())}},
+                                       {{ranged_out.size()}}, {{0}});
+  EXPECT_EQ(ranged, std::vector<bool>({false}));
+  client->Close();
+  client.reset();
+
+  auto opted_in_config = DistributedConfig("ranges-with-scratch", kScratchSize);
+  ASSERT_TRUE(opted_in_config.Validate(&validation_error)) << validation_error;
+  auto opted_in = CreateUMBPClient(opted_in_config);
+  ASSERT_NE(opted_in, nullptr);
+  EXPECT_TRUE(opted_in->SupportsRangedIO());
+  opted_in->Close();
 }
 
 TEST_F(PoolClientRangesTest, StaleSelfLocationIsExcludedBeforeRemoteFetch) {
