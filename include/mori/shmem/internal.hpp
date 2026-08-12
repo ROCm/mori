@@ -133,7 +133,6 @@ struct GpuStates {
 static constexpr int PROXY_MAX_NICS = 8;
 
 struct ProxyGpuStates {
-  bool active{false};
   void* rings[PROXY_MAX_NICS]{};
   uint32_t quietHead[PROXY_MAX_NICS]{};
   int numRings{0};

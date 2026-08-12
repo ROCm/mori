@@ -628,7 +628,6 @@ void GpuStateInit(ShmemStates* states) {
     states->proxyGpuStates.numRings = allocated;
     states->proxyGpuStates.numNics = numNics;
     states->proxyGpuStates.localGpuIdx = states->gpuStates.rank % numNics;
-    states->proxyGpuStates.active = true;
     states->proxyGpuStates.numQpPerPe = states->rdmaStates->commContext->GetNumQpPerPe();
     MORI_SHMEM_INFO("Proxy: {} rings allocated for {} NICs, localGpuIdx={}",
                     allocated, numNics, states->proxyGpuStates.localGpuIdx);
