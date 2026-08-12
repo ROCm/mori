@@ -178,7 +178,6 @@ int ShmemModuleInit(void* hipModule) {
     hipError_t perr = hipModuleGetGlobal(reinterpret_cast<hipDeviceptr_t*>(&moduleProxyAddr),
                                          &proxySymSize, module,
                                          "_ZN4mori5shmem16globalProxyStateE");
-    fprintf(stderr, "[PROXY-MODULE] rank=%d addr=%p size=%zu err=%d\n", states->gpuStates.rank, (void*)moduleProxyAddr, proxySymSize, (int)perr);
     if (perr == hipSuccess && moduleProxyAddr != nullptr) {
       HIP_RUNTIME_CHECK(hipMemcpy(moduleProxyAddr, &states->proxyGpuState,
                                   sizeof(ProxyGpuState), hipMemcpyHostToDevice));

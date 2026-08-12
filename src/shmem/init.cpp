@@ -633,8 +633,6 @@ void GpuStateInit(ShmemStates* states) {
                     allocated, numNics, states->proxyGpuState.localGpuIdx);
   }
 
-  fprintf(stderr, "[MoRI] SHMEM init: proxy setup done, rank=%d\n", states->gpuStates.rank);
-
   // Copy communication metadata to GPU
   CopyTransportTypesToGpu(states);
   CopyRdmaEndpointsToGpu(states);
@@ -775,10 +773,8 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
       }
     }
     MORI_SHMEM_INFO("Proxy: {} threads started for {} NICs", states->proxyThreads.size(), numNics);
-    fprintf(stderr, "[PROXY] %zu threads started\n", states->proxyThreads.size());
   }
 
-  fprintf(stderr, "[SHMEM-INIT] rank=%d complete\n", states->gpuStates.rank);
   states->status = ShmemStatesStatus::Initialized;
   MORI_SHMEM_INFO("Shmem initialization completed");
   return 0;
