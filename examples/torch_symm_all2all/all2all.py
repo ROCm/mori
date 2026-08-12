@@ -26,7 +26,7 @@
     torchrun --nnodes=1 --nproc_per_node=<gpus> all2all.py
 
 The receive buffer is an ordinary symm_mem tensor; the kernel reaches peers purely as
-flat_base + rank*stride. No mori shmem or cco involved.
+flat_base + rank*stride. No mori shmem or cco.
 """
 
 import argparse
@@ -49,8 +49,8 @@ def parse_args():
 
 
 def main():
-    # Imported here, not at module scope: the extension links libc10, so torch must be
-    # loaded first. Module-level import sorting would put it ahead of torch.
+    # Not at module scope: the extension links libc10, so torch must load first, and
+    # import sorting would hoist it above torch.
     import all2all_kernel
 
     args = parse_args()
@@ -70,12 +70,12 @@ def main():
     chunk_bytes = args.chunk_kib * 1024
     elems_per_chunk = chunk_bytes // 4
 
-    # Receive window: one chunk per source rank. Symmetric, so peers can write into it.
+    # Receive window: one chunk per source rank, writable by peers.
     recv = symm_mem.empty(
         world_size * elems_per_chunk, dtype=torch.int32, device=device
     )
     recv.zero_()
-    # Send buffer is ordinary local memory. Chunk p carries a value identifying (me -> p).
+    # Ordinary local memory. Chunk p carries a value identifying (me -> p).
     send = torch.empty(world_size * elems_per_chunk, dtype=torch.int32, device=device)
     for p in range(world_size):
         send[p * elems_per_chunk : (p + 1) * elems_per_chunk] = rank_id * 1000 + p
@@ -97,13 +97,12 @@ def main():
             send, base, stride, chunk_bytes, rank_id, world_size
         )
         torch.cuda.synchronize()
-        # The backend has no device-side barrier yet, so ranks meet on the host before
-        # anyone reads what the peers wrote.
+        # No device-side barrier in the backend yet, so ranks meet on the host.
         dist.barrier()
 
     run_once()
 
-    # Chunk r of our receive window must hold what rank r sent us: r*1000 + our rank.
+    # Chunk r must hold what rank r sent us: r*1000 + our rank.
     errors = 0
     for r in range(world_size):
         got = recv[r * elems_per_chunk].item()
@@ -128,7 +127,7 @@ def main():
     torch.cuda.synchronize()
     ms = start.elapsed_time(end) / args.iters
 
-    # Each rank pushes (world_size-1) chunks off-device; the self chunk stays local.
+    # Only (world_size-1) chunks leave the device; the self chunk stays local.
     remote_bytes = (world_size - 1) * chunk_bytes
     gbps = remote_bytes / (ms / 1e3) / 1e9
     totals = torch.tensor([gbps], dtype=torch.float64)

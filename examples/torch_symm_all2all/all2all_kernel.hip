@@ -20,20 +20,16 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// all2all_kernel.hip -- one-shot all-to-all written against a flat symmetric window.
+// all2all_kernel.hip -- one-shot all-to-all against a flat symmetric window.
 //
-// Pure HIP. It does not use mori's shmem or cco; the only thing it needs from the
-// symmetric memory backend is (flat_base, stride), after which every peer is addressed
-// arithmetically:
+// Pure HIP: no mori shmem or cco. All it needs from the backend is (flat_base, stride),
+// after which peers are addressed arithmetically, so no N-entry pointer array is needed
+// and the destination is computed at run time:
 //
 //     recv slot of rank p, chunk from rank r  ==  flat_base + p*stride + r*chunk_bytes
 //
-// so the kernel takes two pointers and a few integers rather than an N-entry pointer
-// array, and the destination rank can be computed at run time.
-//
-// Push semantics: each rank writes its own chunk into every peer's receive window. That
-// needs no reads from remote memory and no per-peer handshake -- just one barrier after
-// the kernel, before anyone reads what landed.
+// Push semantics: each rank writes its own chunk into every peer's window. No remote
+// reads, no per-peer handshake -- just one barrier before anyone reads what landed.
 
 #include <c10/hip/HIPStream.h>
 #include <hip/hip_runtime.h>
@@ -45,9 +41,8 @@ namespace {
 
 constexpr int kThreads = 256;
 
-// Grid is 2-D over (peer, slice of chunk): blocks_per_peer blocks cooperate on each
-// destination. One block per peer would leave all but `world_size` CUs idle and, on a remote
-// write, cannot keep enough requests in flight to cover interconnect latency.
+// Grid is 2-D over (peer, slice of chunk). One block per peer would idle all but
+// `world_size` CUs and keep too few writes in flight to cover interconnect latency.
 __global__ void All2AllPush(const uint4* __restrict__ send, char* __restrict__ flat_base,
                             size_t stride, size_t chunk_bytes, int rank_id, int world_size,
                             int blocks_per_peer) {
@@ -69,8 +64,8 @@ __global__ void All2AllPush(const uint4* __restrict__ send, char* __restrict__ f
 
 }  // namespace
 
-// send: local, world_size*chunk_bytes. flat_base/stride come from mori.allocator.flat_layout()
-// on the rendezvous'd receive tensor. Caller barriers afterwards.
+// send is local, world_size*chunk_bytes. flat_base/stride come from flat_layout() on the
+// rendezvous'd receive tensor. Caller barriers afterwards.
 void all2all_push(const at::Tensor& send, int64_t flat_base, int64_t stride, int64_t chunk_bytes,
                   int64_t rank_id, int64_t world_size) {
   TORCH_CHECK(send.is_contiguous(), "send must be contiguous");
@@ -80,8 +75,7 @@ void all2all_push(const at::Tensor& send, int64_t flat_base, int64_t stride, int
               send.nbytes(),
               " bytes, expected world_size*chunk_bytes = ", world_size * chunk_bytes);
 
-  // Spread over the device: aim for a couple of blocks per CU, split evenly across peers,
-  // but never more slices than there is data for.
+  // Two blocks per CU, split across peers, capped by how much data there is to slice.
   static const int cus = [] {
     int v = 64, dev = 0;
     hipGetDevice(&dev);

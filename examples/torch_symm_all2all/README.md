@@ -38,7 +38,7 @@ all2all_kernel.all2all_push(send, base, stride, chunk_bytes, rank_id, world_size
 
 ## Measured
 
-Aggregate counts only the `(world-1)` chunks that leave the device; the self chunk stays
+Aggregate counts only the `(world_size-1)` chunks that leave the device; the self chunk stays
 local. Correctness and `peer(r) == base + r*stride` hold on every configuration below.
 
 4 MiB per peer:
@@ -57,58 +57,58 @@ local. Correctness and `peer(r) == base + r*stride` hold on every configuration 
 | 4 | 428.0 GB/s | 289.8 GB/s | 139.4 GB/s |
 | 8 | 1459.0 GB/s | — | 250.0 GB/s |
 
-gfx1250 exports **fabric** handles; gfx950 and gfx942 have no fabric support at
-`hipMemCreate` and fall back to POSIX fd. The kernel neither knows nor cares — it sees the
-same flat window either way. The gfx1250 box has 4 GPUs, hence no 8-rank column.
+gfx1250 exports **fabric** handles; gfx950 and gfx942 fall back to POSIX fd, having no
+fabric support at `hipMemCreate`. The kernel sees the same flat window either way. The
+gfx1250 box has 4 GPUs, hence no 8-rank column.
 
-Grid shape dominates these numbers far more than the handle type does. An earlier version
-launched one block per destination rank, which left all but `world` CUs idle and could not
-keep enough writes in flight to cover interconnect latency; it measured 15.8 GB/s on
-gfx1250 and 745 GB/s on gfx950 at the same 4 MiB payload. Splitting each chunk across
-`blocks_per_peer` blocks is worth ~2.5x on gfx950 and ~95x on gfx1250.
+Grid shape matters more than the handle type. An earlier version launched one block per
+destination rank, leaving all but `world_size` CUs idle and unable to keep enough writes in
+flight to cover interconnect latency: 15.8 GB/s on gfx1250 and 745 GB/s on gfx950 at the
+same 4 MiB payload. Splitting each chunk across `blocks_per_peer` blocks is worth ~2.5x on
+gfx950 and ~95x on gfx1250.
 
-The gfx942 column is a platform limitation, not a fabric or allocator one. That box's
-XGMI is healthy — `ubench/06` measures 48.4 GB/s per link unidirectional (76% of
-theoretical) and 2637 GB/s aggregate all-to-all via `hipMemcpyPeer`.
+Uncached/fine-grained windows, as mori's cco windows are, were measured and rejected: half
+the bandwidth on gfx1250 (712 vs 1499 GB/s at 4 ranks) and no change on gfx950. The backend
+uses coarse-grained pinned memory.
 
-The cause is that on gfx942, granting **any** other GPU access to a VMM allocation
-collapses the owner's own bandwidth to it. A standalone HIP program (no torch, no mori)
-writing 256 MiB with a `uint4` kernel:
+### Why gfx942 is slow
 
-| `hipMemSetAccess` grants | gfx942 local write | gfx942 local read | gfx950 local write |
+A driver limitation, not a fabric or allocator one. That box's XGMI is healthy: `ubench/06`
+measures 48.4 GB/s per link and 2637 GB/s aggregate all-to-all via `hipMemcpyPeer`.
+
+Granting one peer re-maps the buffer, **in the owner's own page tables**, as
+`AMDGPU_PTE_SYSTEM | MTYPE_UC` — uncached, addressed as bus memory rather than local VRAM.
+The owner's access to its own HBM then leaves the chip, and 55.8 GB/s is PCIe 5 x16, which
+this box measures at 54-56 GB/s h2d/d2h. A standalone HIP program (no torch, no mori)
+writing 256 MiB:
+
+| `hipMemSetAccess` grants | gfx942 write | gfx942 read | gfx950 write |
 |---|---|---|---|
 | self only | 2671.5 GB/s | 1987.4 GB/s | 6515.5 GB/s |
 | self + 1 peer | **55.8 GB/s** | **55.2 GB/s** | 6541.4 GB/s |
-| self + 2 peers | 55.8 GB/s | 55.2 GB/s | 6553.5 GB/s |
 | self + 4 peers | 54.8 GB/s | 55.2 GB/s | 6543.6 GB/s |
 
-One peer grant is enough; adding more costs nothing further. Reads and writes degrade
-equally. gfx950 shows no effect at all.
+One grant is enough; more cost nothing further. Confirmed by tracing
+`amdgpu:amdgpu_vm_set_ptes` against a size-fingerprinted buffer: a `SYSTEM|MTYPE_UC` group
+tracking the allocation exactly (100 pages at 200 MiB, 156 at 314 MiB) appears only once a
+peer is granted. The pages never move — `hipMemGetInfo` is flat across the grant — so it is
+the mapping, not migration.
 
-The obvious explanation — that the owner's pages get re-typed uncached — is wrong. Tracing
-`amdgpu:amdgpu_vm_set_ptes` while granting 0..3 peers shows `MTYPE_RW` constant at +492 MiB
-regardless of peer count, with each peer adding its own 256 MiB of `MTYPE_NC` and 256 MiB
-of `MTYPE_UC`. The owner's page-table entries are never re-typed, so whatever costs the
-bandwidth is not the owner's PTE memory type.
+It is specific to the VMM path. `hipMalloc` with `hipDeviceEnablePeerAccess` for all 7
+peers keeps full bandwidth on the same box (2668.5 -> 2665.2 GB/s), because the two paths
+use different kernel interfaces: `hipMemSetAccess` reaches libdrm `amdgpu_bo_va_op`, the
+DRM path, while ordinary allocations go through `hsaKmtMapMemoryToGPUNodes`, the KFD one.
+Plain VMM, flat multi-slot reservations, self-aliasing and Pinned-vs-Uncached are all free,
+so the flat window design is not what costs gfx942 its bandwidth.
 
-It is specific to the VMM path, not to sharing. On the same box, ordinary `hipMalloc`
-memory with `hipDeviceEnablePeerAccess` enabled for **all 7** peers keeps full bandwidth
-(2668.5 -> 2665.2 GB/s). So the hardware sustains peer-visible memory at full local speed;
-only `hipMemCreate` + `hipMemSetAccess` loses it.
+Possibly a missing kernel option rather than silicon: this box runs a 5.10 kernel with a
+DKMS backport and has `CONFIG_PCI_P2PDMA` and `CONFIG_DMABUF_MOVE_NOTIFY` unset, both of
+which the DRM cross-device path wants, while the unaffected gfx950 box (6.8) has both.
+Untested — it needs a rebuilt kernel or a modern-kernel MI300.
 
-Everything else is innocent, and measured to be so on both parts: plain VMM matches
-`hipMalloc` (2670 vs 2536 GB/s on gfx942), a flat reservation with 8 mapped slots matches
-a single slot, mapping a slot twice as a self alias costs nothing, and Pinned matches
-Uncached. The flat window design is not what costs gfx942 its bandwidth.
-
-The escape hatch, if this matters on gfx942, is the trade mori's shmem already makes:
-`hipMalloc` + hipIpc keeps full bandwidth but gives scattered peer pointers instead of a
-flat `base + rank*stride` window, so the kernel needs an N-entry pointer array. Whether
-IPC-imported memory behaves like the `EnablePeerAccess` case above is untested here.
-
-Allocating the window as uncached/fine-grained (as mori's cco windows are) was measured
-and rejected: on gfx1250 it costs about half the bandwidth (712 vs 1499 GB/s at 4 ranks),
-and it changes nothing on gfx950. The backend uses ordinary coarse-grained pinned memory.
+The escape hatch is what aiter's custom allreduce does: `hipMalloc` + hipIpc stays on the
+KFD path and keeps full bandwidth, at the cost of scattered peer pointers and an N-entry
+pointer array instead of a flat window.
 
 ## Notes
 
