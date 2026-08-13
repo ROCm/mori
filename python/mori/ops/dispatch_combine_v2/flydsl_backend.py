@@ -497,5 +497,3 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
             stream,
         )
         return self._local_expert_count_buf
-
-        self.cross_device_flag.fill_(1)

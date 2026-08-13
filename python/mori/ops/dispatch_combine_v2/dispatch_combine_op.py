@@ -809,12 +809,18 @@ class EpDispatchCombineOp:
 
     def reset(self):
         """Zero the arena staging + per-rank counters (mori LaunchReset). The
-        kernels self-reset their counters already; this forces a clean slate."""
+        kernels self-reset their counters already; this forces a clean slate.
+
+        Collective, like every other call here: cross_device_flag is the local
+        half of the cross-device barrier and arena.zero() has just wiped the peer
+        half, so one rank resetting alone would leave the two disagreeing."""
         self.arena.zero()
         self.token_dest_map.fill_(-1)
         self.dest_pe_counter.zero_()
         self.dispatch_barrier.zero_()
         self.combine_barrier.zero_()
+        self.total_recv.zero_()
+        self.cross_device_flag.fill_(1)
 
     def __repr__(self):
         return (
