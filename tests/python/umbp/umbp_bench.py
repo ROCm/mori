@@ -442,7 +442,38 @@ class UMBPBackend(Backend):
                 os.environ.get("UMBP_SSD_CAPACITY_BYTES", 32 * 1024 * 1024 * 1024)
             )
             cfg.ssd.ssd_backend = os.environ.get("UMBP_SSD_BACKEND", "file")
-            os.makedirs(cfg.ssd.storage_dir, exist_ok=True)
+            # This bench builds UMBPConfig directly and never calls
+            # UMBPConfig::FromEnvironment(), so the UMBP_SSD_* env vars that
+            # configure the tier do NOT reach it on their own -- they have to be
+            # applied here through the pybind fields. Leaving direct_io unset is
+            # the trap this block exists to avoid: buffered reads can be served
+            # entirely from page cache, moving zero bytes to the device, which
+            # makes any drive-count or DRAM-vs-SSD comparison meaningless.
+            cfg.ssd.direct_io = os.environ.get("UMBP_SSD_DIRECT_IO", "0") not in (
+                "0",
+                "",
+            )
+            cfg.ssd.verify_crc = os.environ.get("UMBP_SSD_VERIFY_CRC", "1") not in (
+                "0",
+                "",
+            )
+            cfg.ssd.tier_io_threads = int(os.environ.get("UMBP_SSD_TIER_IO_THREADS", 4))
+            cfg.ssd.shard_io_threads = int(
+                os.environ.get("UMBP_SSD_SHARD_IO_THREADS", 0)
+            )
+            cfg.ssd.single_flight_reads = os.environ.get(
+                "UMBP_SSD_SINGLE_FLIGHT", "1"
+            ) not in ("0", "")
+            dist.ssd_staging_use_hugepages = os.environ.get(
+                "UMBP_SSD_STAGING_HUGEPAGES", "0"
+            ) not in ("0", "")
+            # storage_dir is comma-separated for a multi-drive tier (one entry
+            # per physical drive), so each entry needs its own mkdir -- a single
+            # makedirs would create one literal directory named "a,b".
+            for _d in cfg.ssd.storage_dir.split(","):
+                _d = _d.strip()
+                if _d:
+                    os.makedirs(_d, exist_ok=True)
         else:
             # Keep the SSD tier dark for dram/hbm runs: cfg.ssd.enabled defaults
             # to True, and leaving it on would let the local (non-distributed)
