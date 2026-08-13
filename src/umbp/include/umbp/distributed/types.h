@@ -256,6 +256,21 @@ inline const char* TierTypeName(TierType t) {
   }
 }
 
+// Stable name used when legacy one-backend configuration is lowered into the
+// named multi-backend model.
+inline const char* DefaultBackendInstanceName(TierType t) {
+  switch (t) {
+    case TierType::HBM:
+      return "hbm";
+    case TierType::DRAM:
+      return "dram";
+    case TierType::SSD:
+      return "ssd";
+    default:
+      return "unknown";
+  }
+}
+
 inline const char* ClientStatusName(ClientStatus s) {
   switch (s) {
     case ClientStatus::ALIVE:

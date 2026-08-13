@@ -193,6 +193,18 @@ struct PeerSsdConfig {
   UMBPSsdConfig ssd;
 };
 
+// One named backend instance on a peer. Only the ownership block selected by
+// `tier` is read. Page size remains peer-global because the RPC wire carries a
+// single page_size for batches that may span instances.
+struct BackendInstanceConfig {
+  std::string name;
+  TierType tier = TierType::UNKNOWN;
+  DramOwnershipConfig dram;
+  HbmOwnershipConfig hbm;
+  PeerSsdConfig ssd;
+  int ssd_staging_buffer_slots = 16;
+};
+
 struct PoolClientConfig {
   UMBPMasterClientConfig master_config;
   UMBPIoEngineConfig io_engine;
@@ -211,16 +223,18 @@ struct PoolClientConfig {
   // must be >= the largest single-key page KV (61-layer MLA page ~= 4.5 MB).
   size_t ssd_staging_buffer_size = 268435456;  // 256 MiB
 
-  // The one medium this node registers a backend for (design note in
-  // common/config.h's UMBPMedium: UMBP routes across nodes, it does not tier
-  // within one, so a second local backend would mirror rather than demote).
-  // PoolClient::Init reads exactly one of the three ownership blocks below,
-  // chosen by this field; the other two are ignored, not validated.
+  // Legacy one-medium selector. Used only when `backends` is empty; in that
+  // mode PoolClient::Init reads exactly one ownership block below.
   TierType medium = TierType::DRAM;
 
   DramOwnershipConfig dram;
   HbmOwnershipConfig hbm;
   PeerSsdConfig ssd;
+
+  // Named multi-backend configuration. Empty selects the legacy fields above;
+  // PoolClient lowers them at Init time so mutations made after
+  // ToPoolClientConfig() remain authoritative.
+  std::vector<BackendInstanceConfig> backends;
 
   uint16_t peer_service_port = 0;
 
@@ -283,6 +297,8 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.medium = ToTierType(dc.medium);
   // The medium is what opts the SSD tier in; PeerSsdManager keys off this.
   pc.ssd.enabled = (pc.medium == TierType::SSD);
+  // Deliberately leave pc.backends empty. PoolClient synthesizes the legacy
+  // instance at Init so callers may still mutate medium/dram/hbm/ssd afterward.
   return pc;
 }
 

@@ -512,7 +512,12 @@ std::map<TierType, TierCapacity> MasterClient::SnapshotAndCacheTierCapacities() 
   std::map<TierType, TierCapacity> caps;
   bool have_live = false;
   for (auto* backend : Backends()) {
-    caps[backend->Tier()] = backend->Capacity();  // bitmap-derived, per medium
+    // Until placement policy can name an instance, advertise only the first
+    // backend for each tier (registry id order) rather than summing capacity
+    // the router cannot independently address.
+    if (caps.find(backend->Tier()) == caps.end()) {
+      caps[backend->Tier()] = backend->Capacity();
+    }
     have_live = true;
   }
   std::lock_guard lock(caps_mutex_);

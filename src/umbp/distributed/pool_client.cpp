@@ -181,6 +181,41 @@ std::chrono::milliseconds DramReadLeaseTtl() {
   return v;
 }
 
+std::unique_ptr<MediumBackend> MakeBackend(const BackendInstanceConfig& instance,
+                                           uint64_t page_size) {
+  switch (instance.tier) {
+    case TierType::DRAM: {
+      PageBackend::OwnershipConfig ownership;
+      ownership.buffer_sizes = instance.dram.buffer_sizes;
+      ownership.use_hugepages = instance.dram.use_hugepages;
+      ownership.hugepage_size = instance.dram.hugepage_size;
+      ownership.numa_node = instance.dram.numa_node;
+      ownership.prefault = instance.dram.prefault;
+      return MakePageBackend(TierType::DRAM, page_size, std::move(ownership),
+                             /*pending_ttl=*/std::chrono::milliseconds{30000},
+                             /*read_lease_ttl=*/DramReadLeaseTtl());
+    }
+    case TierType::HBM:
+      return MakeHbmBackend(page_size, instance.hbm.device, instance.hbm.buffer_sizes,
+                            /*pending_ttl=*/std::chrono::milliseconds{30000},
+                            /*read_lease_ttl=*/DramReadLeaseTtl());
+    case TierType::SSD: {
+      SsdBackend::Config cfg;
+      cfg.page_size = page_size;
+      cfg.staging_pages = instance.ssd_staging_buffer_slots > 0
+                              ? static_cast<uint32_t>(instance.ssd_staging_buffer_slots)
+                              : 16;
+      cfg.ssd = instance.ssd;
+      cfg.ssd.enabled = true;
+      cfg.read_lease_ttl = DramReadLeaseTtl();
+      return MakeSsdBackend(std::move(cfg));
+    }
+    case TierType::UNKNOWN:
+      return nullptr;
+  }
+  return nullptr;
+}
+
 // ---------------------------------------------------------------------------
 //  Config / proto translation
 // ---------------------------------------------------------------------------
@@ -261,6 +296,10 @@ bool PoolClient::Init() {
   bool expected = false;
   if (!initialized_.compare_exchange_strong(expected, true)) return true;
 
+  auto fail = [this] {
+    Shutdown();
+    return false;
+  };
   master_client_ = std::make_unique<MasterClient>(config_.master_config);
 
   // The one byte-moving path (design doc §4).  Order is preference order:
@@ -286,91 +325,57 @@ bool PoolClient::Init() {
     if (!rdma->Init()) {
       MORI_UMBP_ERROR("[PoolClient] MoriIoEngine init failed on {}:{}", config_.io_engine.host,
                       config_.io_engine.port);
-      initialized_ = false;
-      return false;
+      return fail();
     }
     peer_directory_ = rdma.get();
     composite->AddEngine(std::move(rdma));
   }
   transfer_engine_ = std::move(composite);
 
-  // Peer-side backend: ONE medium, chosen by config_.medium.
-  //
-  // This is the ONLY place in the tree that decides which medium is live;
-  // everything downstream dispatches through registry_ (Phase 3) and never
-  // names a tier.  It does not name a concrete backend TYPE either — each
-  // factory hands back a MediumBackend, which is what closes Phase 5 Rule A.
-  //
-  // WHY ONE.  The registry holds a map keyed by tier and would happily take
-  // all three, but UMBP's routing plane does not tier: master treats every
-  // advertised tier as an equally valid put target (Phase 4 deleted the
-  // hardcoded tier orders), so a node registering DRAM *and* SSD does not get
-  // "DRAM in front of SSD" — it gets two independent pools that master picks
-  // between by free capacity, i.e. mirroring, not promotion.  Local tiering is
-  // a policy nobody has asked for; heterogeneity comes from different NODES
-  // picking different media, which the routing plane already handles.  See
-  // UMBPMedium in common/config.h.
+  // Lower legacy configuration at runtime, not in ToPoolClientConfig: callers
+  // historically mutate these fields after lowering and those changes must
+  // remain authoritative.
   const uint64_t page_size =
       config_.dram_page_size > 0 ? config_.dram_page_size : 2ULL * 1024 * 1024;
-
-  std::unique_ptr<MediumBackend> backend;
-  switch (config_.medium) {
-    case TierType::DRAM: {
-      // Self-allocated at Init from sizing knobs only — PoolClient holds no
-      // buffer pointer (design doc §1 item 4 / Phase 2b).
-      PageBackend::OwnershipConfig dram_ownership;
-      dram_ownership.buffer_sizes = config_.dram.buffer_sizes;
-      dram_ownership.use_hugepages = config_.dram.use_hugepages;
-      dram_ownership.hugepage_size = config_.dram.hugepage_size;
-      dram_ownership.numa_node = config_.dram.numa_node;
-      dram_ownership.prefault = config_.dram.prefault;
-      backend = MakePageBackend(TierType::DRAM, page_size, std::move(dram_ownership),
-                                /*pending_ttl=*/std::chrono::milliseconds{30000},
-                                /*read_lease_ttl=*/DramReadLeaseTtl());
-      break;
-    }
-    case TierType::HBM: {
-      backend = MakeHbmBackend(page_size, config_.hbm.device, config_.hbm.buffer_sizes,
-                               /*pending_ttl=*/std::chrono::milliseconds{30000},
-                               /*read_lease_ttl=*/DramReadLeaseTtl());
-      break;
-    }
-    case TierType::SSD: {
-      // The one medium that is genuinely NOT like the others: its bytes are not
-      // addressable, so it publishes a registered host staging arena and spills
-      // behind it (see ssd_backend.h).  Everything outside that class — routing,
-      // peer service, heartbeat, the batch executors — sees ordinary pages.
-      SsdBackend::Config ssd_cfg;
-      ssd_cfg.page_size = page_size;
-      ssd_cfg.staging_pages = config_.ssd_staging_buffer_slots > 0
-                                  ? static_cast<uint32_t>(config_.ssd_staging_buffer_slots)
-                                  : 16;
-      ssd_cfg.ssd = config_.ssd;
-      ssd_cfg.ssd.enabled = true;  // selecting SSD IS the opt-in
-      ssd_cfg.read_lease_ttl = DramReadLeaseTtl();
-      backend = MakeSsdBackend(std::move(ssd_cfg));
-      break;
-    }
-    case TierType::UNKNOWN:
-      break;  // falls into the null check below
-  }
-  if (backend == nullptr) {
-    MORI_UMBP_ERROR("[PoolClient] unknown medium {}", static_cast<int>(config_.medium));
-    initialized_ = false;
-    return false;
+  std::vector<BackendInstanceConfig> instances = config_.backends;
+  if (instances.empty()) {
+    BackendInstanceConfig legacy;
+    legacy.name = DefaultBackendInstanceName(config_.medium);
+    legacy.tier = config_.medium;
+    legacy.dram = config_.dram;
+    legacy.hbm = config_.hbm;
+    legacy.ssd = config_.ssd;
+    legacy.ssd_staging_buffer_slots = config_.ssd_staging_buffer_slots;
+    instances.push_back(std::move(legacy));
   }
 
-  // Narrowed to MemoryRegistrar: a backend publishes endpoints, it does not
-  // move bytes, and that is now a compile-time fact (design doc §5 Rule C).
-  medium_ = backend->Tier();
-  if (!backend->Init(static_cast<MemoryRegistrar*>(transfer_engine_.get()))) {
-    MORI_UMBP_ERROR("[PoolClient] {} backend Init failed", TierTypeName(medium_));
-    initialized_ = false;
-    return false;
+  std::unordered_set<std::string> names;
+  for (const auto& instance : instances) {
+    if (instance.name.empty() || !names.insert(instance.name).second) {
+      MORI_UMBP_ERROR("[PoolClient] backend names must be non-empty and unique: '{}'",
+                      instance.name);
+      return fail();
+    }
   }
-  if (!registry_.Register(std::move(backend))) {
-    initialized_ = false;
-    return false;
+
+  medium_ = instances.front().tier;
+  for (const auto& instance : instances) {
+    auto backend = MakeBackend(instance, page_size);
+    if (backend == nullptr) {
+      MORI_UMBP_ERROR("[PoolClient] unknown medium {} for backend '{}'",
+                      static_cast<int>(instance.tier), instance.name);
+      return fail();
+    }
+    if (!registry_.Register(instance.name, std::move(backend))) return fail();
+
+    // Register first so every failure can unwind through one Shutdown path;
+    // MediumBackend::Shutdown must tolerate a partially failed Init.
+    auto* registered = registry_.Get(instance.name);
+    if (!registered->Init(static_cast<MemoryRegistrar*>(transfer_engine_.get()))) {
+      MORI_UMBP_ERROR("[PoolClient] backend '{}' ({}) Init failed", instance.name,
+                      TierTypeName(instance.tier));
+      return fail();
+    }
   }
 
   master_client_->SetBackendRegistry(&registry_);
@@ -386,8 +391,7 @@ bool PoolClient::Init() {
       MORI_UMBP_ERROR("[PoolClient] PeerService failed to start on port {}",
                       config_.peer_service_port);
       peer_service_.reset();
-      initialized_ = false;
-      return false;
+      return fail();
     }
   }
 
@@ -405,15 +409,16 @@ bool PoolClient::Init() {
   // treats every advertised tier as a valid put target, so advertising an
   // empty one would invite placements it can never accept.
   std::map<TierType, TierCapacity> tier_caps;
+  std::unordered_set<TierType> capacity_tiers;
   for (auto* backend : registry_.All()) {
+    if (!capacity_tiers.insert(backend->Tier()).second) continue;
     auto cap = backend->Capacity();
     if (cap.total_bytes > 0) tier_caps[backend->Tier()] = cap;
   }
   auto status = master_client_->RegisterSelf(tier_caps, peer_address, engine_desc_bytes);
   if (!status.ok()) {
     MORI_UMBP_ERROR("[PoolClient] RegisterSelf failed: {}", status.error_message());
-    initialized_ = false;
-    return false;
+    return fail();
   }
 
   if (config_.master_config.auto_heartbeat) master_client_->StartHeartbeat();
@@ -464,10 +469,10 @@ void PoolClient::Shutdown() {
 
   peer_service_.reset();
 
-  // Every backend deregisters its memory through transfer_engine_ inside its
-  // own destructor — this MUST run before transfer_engine_ is torn down below.
-  // MasterClient borrows the registry, so unbind it first.
+  // Backends deregister their memory while the transfer engine is still live.
+  // Shutdown is explicit because Init may have failed partway through.
   if (master_client_) master_client_->SetBackendRegistry(nullptr);
+  for (auto* backend : registry_.All()) backend->Shutdown();
   registry_ = BackendRegistry{};
 
   if (transfer_engine_) {

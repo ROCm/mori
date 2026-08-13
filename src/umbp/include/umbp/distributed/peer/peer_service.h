@@ -36,11 +36,9 @@ class PeerServiceServer {
  public:
   // `registry` is non-owning (PoolClient outlives this server) and may be null
   // when the host process has no storage medium at all.  Handlers dispatch on
-  // the request's tier tag through the registry — no concrete backend type is
-  // named here (backend-agnostic refactor Phase 3).  A request for a tier with
-  // no live backend responds success=false / found=false, exactly as a null
-  // registry does; it is never an error, since a node configured with DRAM
-  // only is a normal deployment.
+  // an explicit backend name when present, otherwise the first instance for the
+  // requested tier. No concrete backend type is named here. A request with no
+  // matching instance responds success=false / found=false.
   //
   // SSD read staging (PrepareSsdRead/ReleaseSsdLease) was removed in the
   // backend-agnostic refactor Phase 0 — SSD is unwired from the distributed

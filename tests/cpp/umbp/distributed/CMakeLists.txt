@@ -315,10 +315,9 @@ target_link_libraries(test_ssd_backend PRIVATE umbp_common GTest::gtest_main)
 target_compile_features(test_ssd_backend PRIVATE cxx_std_17)
 add_test(NAME test_ssd_backend COMMAND test_ssd_backend)
 
-# test_peer_service_dispatch — PeerServiceServer tier dispatch through
-# BackendRegistry (Phase 3): per-tier routing, the tier-tagged opaque slot_id
-# that makes Commit/Abort unambiguous, mixed-tier batch ordering, and the
-# read-rank walk / evict fan-out for the RPCs that carry no tier.  Drives the
+# test_peer_service_dispatch — PeerServiceServer instance dispatch through
+# BackendRegistry: named same-tier routing, backend-id-tagged opaque slot ids,
+# mixed-instance batch ordering, and resolve walk / evict fan-out. Drives the
 # real gRPC surface, so it needs the generated proto + protobuf.
 add_executable(test_peer_service_dispatch test_peer_service_dispatch.cpp)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

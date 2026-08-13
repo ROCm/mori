@@ -65,29 +65,26 @@ TierType FromProtoTier(::umbp::TierType t) {
 }
 
 // ---------------------------------------------------------------------------
-//  Slot-id tier tagging
+//  Slot-id backend tagging
 //
-//  Commit / Abort carry only a slot_id — the proto has no tier field on them,
-//  and umbp_peer.proto documents the id as "opaque; echoed back by Commit /
-//  Abort".  Every backend numbers its own slots from 1 independently, so a bare
-//  id is ambiguous the moment a second medium is live.
+//  Commit / Abort carry only a slot_id. Every backend numbers its own slots
+//  from 1 independently, including two instances of the same tier.
 //
-//  So the peer service tags the tier into the high byte on the way out and
-//  strips it on the way back in.  Dispatch then works with NO proto change and
-//  NO client change: the client only ever echoes the value it was given.  The
-//  tag is peer-local — PoolClient's local fast path talks to a backend directly
-//  and never sees a tagged id.
+//  The peer service tags the dense backend id into the high byte on the way out
+//  and strips it on the way back in. The client only echoes the opaque value.
 //
 //  next_slot_id_ is a per-backend counter starting at 1, so the low 56 bits
 //  cannot reach the tag in any realistic process lifetime.
 // ---------------------------------------------------------------------------
-constexpr int kSlotTierShift = 56;
-constexpr uint64_t kSlotLocalMask = (1ULL << kSlotTierShift) - 1;
+constexpr int kSlotBackendShift = 56;
+constexpr uint64_t kSlotLocalMask = (1ULL << kSlotBackendShift) - 1;
 
-uint64_t TagSlotId(TierType tier, uint64_t local_id) {
-  return (static_cast<uint64_t>(tier) << kSlotTierShift) | (local_id & kSlotLocalMask);
+uint64_t TagSlotId(uint32_t backend_id, uint64_t local_id) {
+  return (static_cast<uint64_t>(backend_id) << kSlotBackendShift) | (local_id & kSlotLocalMask);
 }
-TierType TierFromSlotId(uint64_t tagged) { return static_cast<TierType>(tagged >> kSlotTierShift); }
+uint32_t BackendIdFromSlotId(uint64_t tagged) {
+  return static_cast<uint32_t>(tagged >> kSlotBackendShift);
+}
 uint64_t LocalSlotId(uint64_t tagged) { return tagged & kSlotLocalMask; }
 
 // Drop a (pages, page_size, descs) tuple into a slot-shaped response
@@ -181,11 +178,12 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
                             ::umbp::AllocateSlotResponse* response) override {
     // A tier with no live backend on this peer is a normal condition (a
     // DRAM-only node), not an error: FAILED, not a crash.
-    auto* backend = Backend(FromProtoTier(request->tier()));
-    if (backend == nullptr) {
+    const auto* selected = SelectBackend(*request);
+    if (selected == nullptr) {
       response->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_FAILED);
       return grpc::Status::OK;
     }
+    auto* backend = selected->backend.get();
     AllocateRequest entry;
     entry.key = request->key();
     entry.size = request->size();
@@ -205,16 +203,15 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
         break;
     }
     response->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
-    response->set_slot_id(TagSlotId(backend->Tier(), result.slot_id));
-    FillPagesAndDescs(response, result.pages, result.page_size, result.descs,
-                      registry_->BackendId(backend));
+    response->set_slot_id(TagSlotId(selected->backend_id, result.slot_id));
+    FillPagesAndDescs(response, result.pages, result.page_size, result.descs, selected->backend_id);
     response->set_pending_ttl_ms(result.pending_ttl_ms);
     return grpc::Status::OK;
   }
 
   grpc::Status CommitSlot(grpc::ServerContext* /*ctx*/, const ::umbp::CommitSlotRequest* request,
                           ::umbp::CommitSlotResponse* response) override {
-    auto* backend = Backend(TierFromSlotId(request->slot_id()));
+    auto* backend = Backend(BackendIdFromSlotId(request->slot_id()));
     if (backend == nullptr) {
       response->set_success(false);
       return grpc::Status::OK;
@@ -233,7 +230,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
 
   grpc::Status AbortSlot(grpc::ServerContext* /*ctx*/, const ::umbp::AbortSlotRequest* request,
                          ::umbp::AbortSlotResponse* response) override {
-    auto* backend = Backend(TierFromSlotId(request->slot_id()));
+    auto* backend = Backend(BackendIdFromSlotId(request->slot_id()));
     if (backend == nullptr) {
       response->set_success(true);  // idempotent: nothing to drop
       return grpc::Status::OK;
@@ -296,17 +293,18 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       response->add_entries()->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_FAILED);
     }
 
-    // Group by requested tier so each backend still sees ONE batched call —
-    // splitting a mixed batch into per-entry calls would give up the batching
-    // the RPC exists for.  Entries whose tier has no live backend keep the
+    // Group by selected backend id so same-tier named instances each see one
+    // batched call. Splitting a mixed batch into per-entry calls would give up
+    // the batching the RPC exists for. Entries with no selected backend keep the
     // pre-filled FAILED, which is what preserves per-entry result ordering.
-    std::map<TierType, std::vector<int>> by_tier;
+    std::map<uint32_t, std::vector<int>> by_backend;
     for (int i = 0; i < n; ++i) {
-      by_tier[FromProtoTier(request->entries(i).tier())].push_back(i);
+      const auto* selected = SelectBackend(request->entries(i));
+      if (selected != nullptr) by_backend[selected->backend_id].push_back(i);
     }
 
-    for (const auto& [tier, indices] : by_tier) {
-      auto* backend = Backend(tier);
+    for (const auto& [backend_id, indices] : by_backend) {
+      auto* backend = Backend(backend_id);
       if (backend == nullptr) continue;
       std::vector<AllocateRequest> entries;
       entries.reserve(indices.size());
@@ -335,9 +333,8 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
             break;
         }
         out->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
-        out->set_slot_id(TagSlotId(tier, result.slot_id));
-        FillPagesAndDescs(out, result.pages, result.page_size, result.descs,
-                          registry_->BackendId(backend));
+        out->set_slot_id(TagSlotId(backend_id, result.slot_id));
+        FillPagesAndDescs(out, result.pages, result.page_size, result.descs, backend_id);
         out->set_pending_ttl_ms(result.pending_ttl_ms);
       }
     }
@@ -350,17 +347,15 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     const int n = request->entries_size();
     for (int i = 0; i < n; ++i) response->add_success(false);
 
-    // The tier rides in the slot_id the peer handed out at Allocate (see
-    // TagSlotId) — a commit for a tier that has since gone away keeps the
-    // pre-filled false, which is exactly "slot unknown".
-    std::map<TierType, std::vector<int>> by_tier;
+    // The backend id rides in the slot token handed out at Allocate.
+    std::map<uint32_t, std::vector<int>> by_backend;
     for (int i = 0; i < n; ++i) {
-      by_tier[TierFromSlotId(request->entries(i).slot_id())].push_back(i);
+      by_backend[BackendIdFromSlotId(request->entries(i).slot_id())].push_back(i);
     }
 
     uint64_t total_committed = 0;
-    for (const auto& [tier, indices] : by_tier) {
-      auto* backend = Backend(tier);
+    for (const auto& [backend_id, indices] : by_backend) {
+      auto* backend = Backend(backend_id);
       if (backend == nullptr) continue;
       std::vector<CommitRequest> entries;
       entries.reserve(indices.size());
@@ -389,11 +384,13 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     // live backend) reports true — there is nothing left to drop.
     for (int i = 0; i < n; ++i) response->add_success(true);
 
-    std::map<TierType, std::vector<int>> by_tier;
-    for (int i = 0; i < n; ++i) by_tier[TierFromSlotId(request->slot_ids(i))].push_back(i);
+    std::map<uint32_t, std::vector<int>> by_backend;
+    for (int i = 0; i < n; ++i) {
+      by_backend[BackendIdFromSlotId(request->slot_ids(i))].push_back(i);
+    }
 
-    for (const auto& [tier, indices] : by_tier) {
-      auto* backend = Backend(tier);
+    for (const auto& [backend_id, indices] : by_backend) {
+      auto* backend = Backend(backend_id);
       if (backend == nullptr) continue;
       std::vector<uint64_t> slot_ids;
       slot_ids.reserve(indices.size());
@@ -473,16 +470,23 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
   }
 
  private:
-  // Null when the registry is absent or has no backend for `tier` — both are
-  // normal (a DRAM-only node), and every caller answers with the RPC's
-  // not-here response rather than an error.
-  MediumBackend* Backend(TierType tier) const {
-    return registry_ == nullptr ? nullptr : registry_->Get(tier);
+  const BackendRegistry::Entry* SelectBackend(const ::umbp::AllocateSlotRequest& request) const {
+    if (registry_ == nullptr) return nullptr;
+    const TierType requested_tier = FromProtoTier(request.tier());
+    if (request.has_backend_name()) {
+      const auto* entry = registry_->GetEntry(request.backend_name());
+      return entry != nullptr && entry->tier == requested_tier ? entry : nullptr;
+    }
+    auto* backend = registry_->Get(requested_tier);
+    return registry_->GetEntry(backend);
   }
 
-  // Every medium on this peer, snapshotted at construction (see ctor).  The
-  // order is deterministic (ascending TierType) but carries no preference —
-  // every medium is equivalent (backend-agnostic refactor Phase 4).
+  MediumBackend* Backend(uint32_t backend_id) const {
+    return registry_ == nullptr ? nullptr : registry_->Get(backend_id);
+  }
+
+  // Every instance on this peer, snapshotted at construction in backend-id
+  // order. The order is deterministic but carries no placement preference.
   const std::vector<MediumBackend*>& Media() const { return media_; }
 
   void RecordInboundPut(uint64_t bytes, const char* traffic) {

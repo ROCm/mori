@@ -82,6 +82,8 @@ UMBPDistributedConfig MinimalDistributedConfig() {
 TEST(MediumLoweringTest, DefaultsToDram) {
   auto pc = ToPoolClientConfig(MinimalDistributedConfig(), DramOwnershipConfig{}, PeerSsdConfig{});
   EXPECT_EQ(pc.medium, TierType::DRAM);
+  EXPECT_TRUE(pc.backends.empty())
+      << "legacy lowering must defer backend synthesis until PoolClient::Init";
   // The SSD tier stays shut unless the selector names it, whatever the SSD
   // block says — UMBPSsdConfig::enabled defaults to true and describes the
   // LOCAL-mode tier, so keying off it would opt every deployment in.
@@ -101,6 +103,7 @@ TEST(MediumLoweringTest, SelectorPicksTierAndOptsSsdIn) {
   dc.hbm.capacity_bytes = 1 << 20;
   auto hbm = ToPoolClientConfig(dc, DramOwnershipConfig{}, PeerSsdConfig{});
   EXPECT_EQ(hbm.medium, TierType::HBM);
+  EXPECT_TRUE(hbm.backends.empty());
   EXPECT_EQ(hbm.hbm.device, 3);
   ASSERT_EQ(hbm.hbm.buffer_sizes.size(), 1u);
   EXPECT_EQ(hbm.hbm.buffer_sizes[0], 1u << 20);

@@ -29,6 +29,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -304,65 +305,78 @@ class MediumBackend {
   MediumBackend() = default;
 };
 
-// Owns every medium live on this peer, keyed by tier.  Held by PoolClient; the
-// registration call sites are the single place in the tree where a concrete
-// backend type is named, which is what the Phase 5 lint enforces.
-//
-// std::map iterates in ascending TierType order, so All() is both the
-// enumeration and the (deterministic, arbitrary) order callers walk media in —
-// with every medium equivalent there is no priority to express.
+// Owns every backend instance live on this peer. Names are stable
+// configuration identities; backend ids are dense peer-local wire identities.
 class BackendRegistry {
  public:
   // Defined in types.h so the transfer layer can size its per-backend buffer
   // shelves without depending on this header (see kMaxBackendsPerPeer).
   static constexpr uint32_t kMaxBackends = kMaxBackendsPerPeer;
 
-  // Replaces any backend already registered for that tier.  Null is ignored.
-  //
-  // Assigns the backend its peer-local id here.  The id is the missing half of
-  // a buffer address: buffer_index is backend-local (every backend numbers from
-  // 0, and each publishes exactly one buffer today, so index 0 collides across
-  // every live medium), and the wire and the reader's cache both key on the
-  // pair.  The backend is never told its id — the peer service stamps it at the
-  // wire boundary — so a new backend cannot get this wrong by forgetting to
-  // participate.
-  //
-  // Returns false when the backend cannot join this peer's address space, which
-  // PoolClient::Init treats as fatal.  Better a refused startup than a node
-  // that serves reads out of the wrong medium.
+  struct Entry {
+    uint32_t backend_id = 0;
+    std::string name;
+    TierType tier = TierType::UNKNOWN;
+    std::unique_ptr<MediumBackend> backend;
+  };
+
+  // Legacy registration keeps one conventional name per tier. Registering the
+  // same name again replaces that instance and preserves its backend id.
   bool Register(std::unique_ptr<MediumBackend> backend) {
     if (backend == nullptr) return true;
-    const TierType tier = backend->Tier();
+    return Register(DefaultBackendInstanceName(backend->Tier()), std::move(backend));
+  }
 
-    // Every wire that carries pages carries ONE page_size
-    // (GetPeerInfoResponse.page_size, BatchResolveKeysResponse.page_size), and
-    // SsdBackend::Config already documents that its page size must match the
-    // others.  Enforce that documented requirement instead of trusting it: a
-    // mismatch produces page arithmetic that looks consistent and reads that
-    // are not.
-    if (!backends_.empty() && backend->PageSize() != page_size_) {
-      MORI_UMBP_ERROR(
-          "[BackendRegistry] backend tier={} page_size={} disagrees with the peer's page_size={}; "
-          "every medium on a node must agree",
-          static_cast<int>(tier), backend->PageSize(), page_size_);
+  bool Register(std::string name, std::unique_ptr<MediumBackend> backend) {
+    if (backend == nullptr) return true;
+    if (name.empty()) {
+      MORI_UMBP_ERROR("[BackendRegistry] backend instance name must not be empty");
       return false;
     }
 
-    auto existing = id_by_tier_.find(tier);
-    uint32_t id;
-    if (existing != id_by_tier_.end()) {
-      id = existing->second;  // replacing a tier reuses its id, keeping ids dense
-    } else {
-      if (next_backend_id_ >= kMaxBackends) {
-        MORI_UMBP_ERROR("[BackendRegistry] too many backends (max {})", kMaxBackends);
-        return false;
-      }
-      id = next_backend_id_++;
-      id_by_tier_[tier] = id;
+    const TierType tier = backend->Tier();
+    auto existing = id_by_name_.find(name);
+    const uint32_t replacing_id =
+        existing == id_by_name_.end() ? kMaxBackends : existing->second;
+
+    // Every wire carrying pages has one peer-global page size. When replacing
+    // an entry, compare against the other live instances so replacing the sole
+    // backend may legitimately establish a new size.
+    uint64_t expected_page_size = 0;
+    for (const auto& entry : entries_) {
+      if (entry->backend_id == replacing_id) continue;
+      expected_page_size = entry->backend->PageSize();
+      break;
+    }
+    if (expected_page_size != 0 && backend->PageSize() != expected_page_size) {
+      MORI_UMBP_ERROR(
+          "[BackendRegistry] backend '{}' tier={} page_size={} disagrees with the peer's "
+          "page_size={}; every instance on a node must agree",
+          name, static_cast<int>(tier), backend->PageSize(), expected_page_size);
+      return false;
     }
 
-    page_size_ = backend->PageSize();
-    backends_[tier] = std::move(backend);
+    if (existing != id_by_name_.end()) {
+      auto& entry = entries_[existing->second];
+      entry->tier = tier;
+      entry->backend = std::move(backend);
+      page_size_ = entries_.front()->backend->PageSize();
+      return true;
+    }
+
+    if (entries_.size() >= kMaxBackends) {
+      MORI_UMBP_ERROR("[BackendRegistry] too many backends (max {})", kMaxBackends);
+      return false;
+    }
+    const uint32_t id = static_cast<uint32_t>(entries_.size());
+    auto entry = std::make_unique<Entry>();
+    entry->backend_id = id;
+    entry->name = std::move(name);
+    entry->tier = tier;
+    entry->backend = std::move(backend);
+    id_by_name_[entry->name] = id;
+    entries_.push_back(std::move(entry));
+    page_size_ = entries_.front()->backend->PageSize();
     return true;
   }
 
@@ -370,8 +384,10 @@ class BackendRegistry {
   // page set it produces.  kMaxBackends for an unregistered backend.
   uint32_t BackendId(const MediumBackend* backend) const {
     if (backend == nullptr) return kMaxBackends;
-    auto it = id_by_tier_.find(backend->Tier());
-    return it == id_by_tier_.end() ? kMaxBackends : it->second;
+    for (const auto& entry : entries_) {
+      if (entry->backend.get() == backend) return entry->backend_id;
+    }
+    return kMaxBackends;
   }
 
   // Uniform across every registered backend (see Register).  Zero when empty.
@@ -381,25 +397,58 @@ class BackendRegistry {
   // (e.g. a node configured with DRAM only), not an error.  Callers respond to
   // a request for an absent tier with found=false / success=false.
   MediumBackend* Get(TierType tier) const {
-    auto it = backends_.find(tier);
-    return it == backends_.end() ? nullptr : it->second.get();
+    for (const auto& entry : entries_) {
+      if (entry->tier == tier) return entry->backend.get();
+    }
+    return nullptr;
   }
 
-  bool Empty() const { return backends_.empty(); }
-  size_t Size() const { return backends_.size(); }
+  MediumBackend* Get(const std::string& name) const {
+    const Entry* entry = GetEntry(name);
+    return entry == nullptr ? nullptr : entry->backend.get();
+  }
 
-  // Every live backend, ascending by TierType.
+  MediumBackend* Get(uint32_t backend_id) const {
+    const Entry* entry = GetEntry(backend_id);
+    return entry == nullptr ? nullptr : entry->backend.get();
+  }
+
+  const Entry* GetEntry(const std::string& name) const {
+    auto it = id_by_name_.find(name);
+    return it == id_by_name_.end() ? nullptr : GetEntry(it->second);
+  }
+
+  Entry* GetEntry(const std::string& name) {
+    return const_cast<Entry*>(std::as_const(*this).GetEntry(name));
+  }
+
+  const Entry* GetEntry(uint32_t backend_id) const {
+    return backend_id < entries_.size() ? entries_[backend_id].get() : nullptr;
+  }
+
+  Entry* GetEntry(uint32_t backend_id) {
+    return const_cast<Entry*>(std::as_const(*this).GetEntry(backend_id));
+  }
+
+  const Entry* GetEntry(const MediumBackend* backend) const {
+    const uint32_t id = BackendId(backend);
+    return id == kMaxBackends ? nullptr : GetEntry(id);
+  }
+
+  bool Empty() const { return entries_.empty(); }
+  size_t Size() const { return entries_.size(); }
+
+  // Every live backend in dense backend-id order.
   std::vector<MediumBackend*> All() const {
     std::vector<MediumBackend*> out;
-    out.reserve(backends_.size());
-    for (const auto& [tier, backend] : backends_) out.push_back(backend.get());
+    out.reserve(entries_.size());
+    for (const auto& entry : entries_) out.push_back(entry->backend.get());
     return out;
   }
 
  private:
-  std::map<TierType, std::unique_ptr<MediumBackend>> backends_;
-  std::map<TierType, uint32_t> id_by_tier_;
-  uint32_t next_backend_id_ = 0;
+  std::vector<std::unique_ptr<Entry>> entries_;
+  std::unordered_map<std::string, uint32_t> id_by_name_;
   uint64_t page_size_ = 0;
 };
 

@@ -104,6 +104,33 @@ TEST(BackendRegistryDispatch, RoutesByTierThroughTheInterfaceOnly) {
   EXPECT_EQ(registry.All()[0], hbm);
 }
 
+TEST(BackendRegistryDispatch, NamedSameTierInstancesKeepDenseStableIds) {
+  BackendRegistry registry;
+  ASSERT_TRUE(
+      registry.Register("dram-primary", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(
+      registry.Register("dram-secondary", std::make_unique<MockBackend>(TierType::DRAM)));
+
+  ASSERT_EQ(registry.Size(), 2u);
+  EXPECT_EQ(registry.Get(TierType::DRAM), registry.Get("dram-primary"));
+  EXPECT_EQ(registry.Get(0u), registry.Get("dram-primary"));
+  EXPECT_EQ(registry.Get(1u), registry.Get("dram-secondary"));
+  EXPECT_EQ(registry.BackendId(registry.Get("dram-secondary")), 1u);
+
+  auto allocated = registry.Get("dram-primary")->BatchAllocate({{"old-state", 8}});
+  registry.Get("dram-primary")
+      ->BatchCommit({{allocated.front().slot_id, "old-state"}});
+  ASSERT_EQ(registry.Get("dram-primary")->OwnedKeyCount(), 1u);
+  ASSERT_TRUE(
+      registry.Register("dram-primary", std::make_unique<MockBackend>(TierType::DRAM)));
+  EXPECT_EQ(registry.Get("dram-primary")->OwnedKeyCount(), 0u);
+  EXPECT_EQ(registry.Size(), 2u);
+  EXPECT_EQ(registry.BackendId(registry.Get("dram-primary")), 0u);
+  ASSERT_EQ(registry.All().size(), 2u);
+  EXPECT_EQ(registry.All()[0], registry.Get("dram-primary"));
+  EXPECT_EQ(registry.All()[1], registry.Get("dram-secondary"));
+}
+
 // ---- Heartbeat event aggregation -------------------------------------------
 // These replace the OwnedLocationSourceAgg tests that lived in
 // test_peer_ssd_manager.cpp: OwnedLocationSource is gone and MediumBackend
