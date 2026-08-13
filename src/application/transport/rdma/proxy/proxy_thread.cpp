@@ -155,9 +155,13 @@ void ProxyThread::MainLoop() {
 
   uint64_t total_cmds = 0;
   uint64_t total_errors = 0;
-  uint64_t total_recvs = 0;
-  uint64_t total_quiet = 0;
+  uint64_t idle_loops = 0;
   while (!ring_->shutdown) {
+    idle_loops++;
+    if (idle_loops % 50000000 == 0)
+      fprintf(stderr, "[PROXY-HB] gpu_id=%d posted=%lu completed=%lu pending=%u head=%u next=%u\n",
+              gpu_id_, total_cmds, ops_completed_, ring_->gpu_head - next_slot_,
+              ring_->gpu_head, next_slot_);
     batch_count = 0;
 
     uint32_t head = ring_->gpu_head;
