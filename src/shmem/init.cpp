@@ -634,7 +634,6 @@ void GpuStateInit(ShmemStates* states) {
 
   }
 
-  fprintf(stderr, "[MoRI-DBG] proxy rings setup done, rank=%d\n", states->gpuStates.rank);
 
   // Copy communication metadata to GPU — override RDMA → PROXY when proxy active
   if (states->rdmaStates->commContext->IsProxyEnabled()) {
@@ -665,7 +664,6 @@ void GpuStateInit(ShmemStates* states) {
 
   // Copy complete state to device
   CopyGpuStatesToDevice(states);
-  fprintf(stderr, "[MoRI-DBG] CopyGpuStatesToDevice done, rank=%d\n", states->gpuStates.rank);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -793,7 +791,6 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
         proxyThreads.push_back(std::move(thread));
       }
     }
-    fprintf(stderr, "[MoRI-DBG] rank=%d: %zu proxy threads started for %d NICs\n",
             states->gpuStates.rank, proxyThreads.size(), numNics);
   }
 
