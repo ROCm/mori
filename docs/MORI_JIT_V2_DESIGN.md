@@ -1,21 +1,26 @@
 # MORI JIT v2
 
-`python/mori/ops/dispatch_combine_v2/` 的 HIP kernel 后端：kernel 在 C++ 侧生成、编译、发射，
-基于 cco-LSA，不依赖 mori-shmem。与既有的 FlyDSL 后端并列，同一个 op 类下可切换。
+`python/mori/ops/dispatch_combine_v2/` 的 HIP kernel 后端，以及它底下那套通用的 JIT 框架：
+kernel 在 C++ 侧生成、编译、发射，基于 cco-LSA，不依赖 mori-shmem。与既有的 FlyDSL 后端并列，
+同一个 op 类下可切换。
 
-## 1. 要解决什么
+## 1. 核心不变量
 
-debug-aa 的 kernel 有 69 个环境变量 gate、323 处 `#if`，缓存 key 在 `cache.py` 里人工拼接。
+整套设计围绕一条链：
 
-| 伤 | 表现 |
-|---|---|
-| 配置在带外 | gate 经 `-D` 进编译，不进 key |
-| key 靠人工复述 | `NOQUANT` 漏进 key → A/B 复用满配二进制 → 读出"省 0us" |
-| 常量有四份 | Python `_combine_shared_mem` / `_tunable_defines` / kernel `#if` / FlyDSL `_detect_wave_size` |
-| 名字有两份 | `.hip` 宏拼符号名 + Python f-string 重建，无校验 |
+```
+Cfg 值  =  特化身份  =  渲染出的源码文本  =  sha256 缓存 key
+```
 
-这套设计消掉的是**这类 bug 的可能性**，不是它的实例：Cfg 值就是特化身份，渲染出的文本就是源码，
-源码文本就是缓存 key。配置想进编译器，只能经过这段文本，而这段文本进了 sha256。
+一个配置想影响生成的二进制，只有一条路——变成 `EpCfg` 的字段、被渲染进源码文本；而那段文本
+整个进了缓存 key。没有第二条通道（没有带外的 `-D`，没有人工拼接的 key 片段），所以「配置变了
+但复用了旧二进制」在结构上不成立，而不是靠纪律维持。
+
+三条推论，后面各节都是它们的展开：
+
+- **配置是一个具名的 struct 值**，不是一串位置模板参数，也不是预处理器宏（§3.1）。
+- **字段列表只有一份**，渲染、schema、apply、describe 都走同一次遍历，漏字段是编译期错误（§3.2）。
+- **host 和 device 共用同一份算术**，而 host 侧不需要 hipcc（§3.5）。
 
 ## 2. 分层
 
@@ -41,36 +46,37 @@ Python 拥有 op 的**状态**（arena、scratch、变体表、routing handle）
 C++ 拥有**一个 kernel 长什么样**（Cfg → 源码 → 编译 → 几何）。
 Python 不算发射几何、不拼 kernel 名、不决定一个 Cfg 编成什么；`plan.info` 只能读回 C++ 的决定。
 
-借鉴：**CK ck_tile** 的声明式实例模型、**DeepEP** 的内容寻址缓存与目录级原子发布、
+参考过的实现：**CK ck_tile** 的声明式实例模型、**DeepEP** 的内容寻址缓存与目录级原子发布、
 **aiter opus_gemm** 的「绑好的 callable + 行为标志」选择器（§5）。
-mori 特有的简化：走 `.hsaco` + `hipModuleGetFunction` 而非链接，所以入口名恒定，
-不需要 DeepEP 的符号枚举，也不需要 CK 的链接期解析。
+mori 特有的简化：走 `.hsaco` + `hipModuleGetFunction` 而非链接，所以不需要 DeepEP 的符号枚举，
+也不需要 CK 的链接期解析。
 
 ## 3. 一个 kernel 的三件套
 
 | | 文件 | 内容 | 谁编译 |
 |---|---|---|---|
-| ① Cfg | `ep_cfg.hpp` | Cfg + Args + `VisitFields` + 共享几何 constexpr | **两侧**（HIP-free） |
-| ② body | `ep_intranode_kernel.hpp`（portable）<br>`ep_intranode_1250x.hpp`（gfx125x TDM） | `template <EpCfg kCfg, typename T> __device__ void Body(EpArgs)` | 只有生成的 TU |
-| ③ Spec | `ep_spec.hpp/.cpp` | Request + `RenderSource` + `Geometry` + 注册宏 | host |
+| ① Cfg | `include/mori/ops/dispatch_combine_v2/ep_cfg.hpp` | Cfg + Args + `VisitFields` + 共享几何 constexpr | **两侧**（HIP-free） |
+| ② body | `src/ops/dispatch_combine_v2/ep_intranode_kernel.hpp`（portable）<br>`src/ops/dispatch_combine_v2/ep_intranode_1250x.hpp`（gfx125x TDM） | `template <EpCfg kCfg, typename T> __device__ void Body(EpArgs)` | 只有生成的 TU |
+| ③ Spec | `ep_spec.hpp` / `ep_spec.cpp` | Request + `EntryName` + `RenderSource` + `Geometry` + 注册宏 | host |
 
 新增一个 kernel 就是写这三样。**Python 侧零行**——Plan 类由 C++ 发布的 schema 生成。
+
+框架本身在 `include/mori/jit/v2/` + `src/jit/v2/`（`compiler` / `toolchain` / `spec` / `render` /
+`util` / `plan_api`），不认识任何具体 kernel。
 
 ### 3.1 Cfg 作为单一模板参数（C++20 structural NTTP）
 
 ```cpp
-// debug-aa：位置绑定，9 个参数，调换两个照样编过、静默出错
-template <typename T, bool UseP2PRead, bool EnableStdMoE, ...>
-__device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args);
-
-// v2：一个具名 struct 值
 template <EpCfg kCfg, typename T>
 __device__ void EpCombineBody(EpArgs args);
 ```
 
-kernel 内所有 `#if MORI_COMB_XXX` 变成 `if constexpr (kCfg.xxx)`。差别不是语法糖：`#if` 的条件
-来自命令行 `-D`（带外、不进 key、323 处散落），`if constexpr` 的条件来自 Cfg 字段（进 key、有守护、
-IDE 能跳转）。DeepEP 和 CK 都用全 `int` 的位置展开，具名字段没有那个隐患。
+`EpCfg` 是一个 structural type，整个 struct 值作为非类型模板参数传进去。kernel 内部所有开关都是
+`if constexpr (kCfg.xxx)`，不是 `#if`。
+
+差别不是语法糖。`#if` 的条件来自命令行 `-D`——带外、不进缓存 key、散落在源码各处；`if constexpr`
+的条件来自 Cfg 字段——进 key、有类型、有守护、IDE 能跳转。相对于一长串位置绑定的模板参数
+（DeepEP 和 CK 都是全 `int` 的位置展开），具名字段还消掉了「调换两个同类型参数照样编过」这一类隐患。
 
 ### 3.2 字段列表的完整性是承重的
 
@@ -101,14 +107,16 @@ MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 11, "加了字段就要同步 VisitFields");
 **一次遍历，四个消费者**：`Render`（缓存 key）、`Describe`（`info`）、request schema（发给 Python）、
 `EpApplyFields`（请求 → struct）。所以加字段 Python 自动看得见。
 
-`EpArgs` 的 wire schema 同理由一份 `MORI_EP_ARGS_FIELDS(X)` 生成，并按该顺序取 `offsetof` 断言递增。
-只对 `sizeof` 设防是不够的：22 个字段里 8 个是裸指针，调换两个同类型字段所有尺寸校验都过，
-kernel 安静地读错 buffer。
-
 **只发非默认字段**：加一个默认不改行为的字段，已有实例的文本不变 → 缓存不失效。若新字段在默认值下
 也改了 kernel 代码，文本虽没变但 include 哈希会变，照样重编。两级哈希各管一头。
 
+**`EpArgs` 同理**。它的 wire schema 由一份 `MORI_EP_ARGS_FIELDS(X)` 生成，并按同一顺序取 `offsetof`
+断言递增。只对 `sizeof` 设防不够：22 个字段里 8 个是裸指针，调换两个同类型字段所有尺寸校验都过，
+kernel 安静地读错 buffer。按 schema 顺序取的 offset 序列一旦不再递增，就是编译期错误。
+
 ### 3.3 生成的源码
+
+`RenderSource` 产出的就是完整的一个 TU：
 
 ```cpp
 // mori jit v2 — generated, do not edit.
@@ -124,7 +132,8 @@ mori_ep_dispatch_bf16_ws8_h2048_k8_64x16(EpArgs args) { EpDispatchBody<kCfg, Tok
   否则 profile 里 dispatch、combine 和调优表为每个 token 档选出的每组几何全是同一行。
   要守的不变量不是「名字是常量」而是「**Python 不拼 kernel 名**」：名字在 C++ 里只写一处，
   渲染器把它写进源码、`Prepare` 把**同一个字符串**交给 `hipModuleGetFunction`，改名不可能漏改查找。
-  名字里的字段都已在 Cfg 里，不给缓存 key 增加新维度。
+  名字里的字段都已在 Cfg 里，不给缓存 key 增加新维度。不覆盖 `EntryName` 的 Spec 退回匿名的
+  `mori_jit_entry`。
 - **文本即 key** → 配置不可能不进 key。
 - **`__launch_bounds__` 是表达式不是数字** → 由 host/device 共用的同一个 constexpr 算出。
 - **arch 路由在 host 侧**：include 哪个 body、调哪个函数，由 `RenderSource` 按
@@ -142,15 +151,23 @@ mori_ep_dispatch_bf16_ws8_h2048_k8_64x16(EpArgs args) { EpDispatchBody<kCfg, Tok
 hash = sha256(name $$ hipcc签名 $$ nic $$ flags $$ include哈希 $$ 源码文本)
 ```
 
-发布无锁（抄 DeepEP）：编到 `tmp/<uuid>/` → 递归 fsync → 目录级 `rename`。抢输的删自己的、用赢家的。
+`include 哈希`是对 `SourceDeps()` 列出的目录做一次排序递归遍历，把每个头文件的**相对路径和内容**
+都摘进去。粗粒度是刻意的：它可能过度失效，但不会漏失效。EP 的依赖集是
+`include/mori`、`src/ops/dispatch_combine_v2`、`src/cco`。
 
-`<arch>_<nic>` 只为人读，正确性不依赖它。**NIC 必须进 key**：intranode LSA 不链 NIC 相关的东西，
-但设备侧 GDA 会——`libmori_cco_device.bc` 本身就按 arch+NIC 现编。NIC 是进程级事实，读
-`MORI_DEVICE_NIC`（与 CMake、`python/mori/jit/config.py` 同一个权威），不在 JIT 层另做探测。
+发布无锁（抄 DeepEP）：编到 `tmp/<uuid>/` → 递归 fsync → 目录级 `rename`。抢输的删自己的、用赢家的
+——赢家的内容一定字节相同，因为目录名就是内容哈希。
+
+`<arch>_<nic>` 只为人读，正确性不依赖它，两者都已在摘要里。**NIC 必须进 key**：intranode LSA 不链
+NIC 相关的东西，但设备侧 GDA 会——`libmori_cco_device.bc` 本身就按 arch+NIC 现编。NIC 是进程级事实，
+读 `MORI_DEVICE_NIC`（与 CMake、`python/mori/jit/config.py` 同一个权威），不在 JIT 层另做探测。
 
 > **纪律：凡是以二进制形式进入编译的东西，哈希它的字节，不是它的路径。**
 > `-mlink-builtin-bitcode=.../libmori_cco_device.bc` 的路径会随 flags 进 key，但那份 `.bc` 的
 > 内容不会——而它自己就是 JIT 产物。GDA 落地时必须按 include 哈希同样的办法处理。
+
+进程内还有一层 module 缓存，按 `(device, 缓存目录)` 索引：`hipModuleLoad` 绑定调用线程的当前设备，
+一个进程可能驱动多张卡。
 
 ### 3.5 host/device 常量只有一份，且 host 不需要 hipcc
 
@@ -160,8 +177,9 @@ hash = sha256(name $$ hipcc签名 $$ nic $$ flags $$ include哈希 $$ 源码文�
 | JIT 运行时 | `compiler`/`toolchain`/`spec`/`plan_api` | 普通 C++ 编译器（只用 `hip_runtime_api.h`） |
 | kernel body | HIP intrinsic、`__global__` | 只有**生成的 TU** |
 
-三条约束，违反了照样编过、只是悄悄把 host 拖进 hipcc，所以有 CI 守护
-（`tools/jit_v2/check_host_device_split.sh`，已接入 ctest）：
+`mori_jit` 和 `mori_ops_v2` 只链 `hip::host`，构建期不需要 hipcc——需要它的时刻是运行期第一次
+`Prepare`。三条约束保证这点，而违反了照样编过、只是悄悄把 host 拖进 hipcc，所以有 CI 守护
+（`tools/jit_v2/check_host_device_split.sh`，已接入 ctest 的 `jit_host_device_split`）：
 
 1. Cfg 头**不得 include 任何 HIP 头**。dtype 用 `enum class EpDType` 标签，渲染时才展开成真实类型名。
 2. 共享算术用**无属性 `constexpr`**，不写 `__host__ __device__`——后者会强制 host TU 走 hipcc。
@@ -169,14 +187,14 @@ hash = sha256(name $$ hipcc签名 $$ nic $$ flags $$ include哈希 $$ 源码文�
 3. host 侧不用 C++20 指派初始化。
 
 **C++20 的范围**：`FieldCount` 的探测必须用 requires-expression——C++17 下 gcc 和 clang 都把
-"初始化器过多"当硬错误而非替换失败。所以持有 Cfg 的目标（`mori_jit`/`mori_ops_v2`/测试）按 C++20 编，
-生成的设备 TU 无条件 C++20，mori 其余部分保持 C++17。**"host 不需要 hipcc"不受影响**。
+"初始化器过多"当硬错误而非替换失败。所以持有 Cfg 的三个目标（`mori_jit`/`mori_ops_v2`/`test_jit_core`）
+按 C++20 编，生成的设备 TU 无条件 C++20，mori 其余部分保持 C++17。**"host 不需要 hipcc"不受影响**。
 
 ```cpp
 // ep_cfg.hpp —— 两侧共用
 constexpr int EpBlockThreads(const EpCfg& c) { return c.warpPerBlock * c.waveSize; }
 constexpr int EpMaxRecv(const EpCfg& c);            // 也是 flat index 的 stride
-constexpr bool EpCfgIsValid(const EpCfg& c);
+constexpr bool EpCfgIsValid(const EpCfg& c);        // 编不出来的 Cfg 是 host 侧错误
 
 // ep_spec.cpp —— host 侧，arch 默认集中在这里
 EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind) {
@@ -187,10 +205,18 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
 }
 ```
 
+`MakeEpCfg` 也是拒绝非法组合的地方：`EpCfgIsValid` 不过就抛（token 字节数必须 16B 对齐、
+topk 和 worldSize 必须装进一个 wavefront、recv 容量必须覆盖最坏情况），combine 那条腿上的 `Byte8`
+单独拒绝（§3.7）。一个编不出来或跑错的 Cfg 是构造期错误，不是运行期的错误数字。
+
 ### 3.6 环境变量
 
-`MakeEpCfg` 末尾是**唯一**读 `MORI_V2_EP_*` 的地方，而且只做覆盖不做决定。覆盖后的 Cfg 自动进 key，
-所以 A/B 不可能复用错的二进制——`NOQUANT` 那个 bug 在结构上不可能发生。
+`MakeEpCfg` 末尾是**唯一**读 `MORI_V2_EP_*`（几何覆盖）的地方，而且只做覆盖不做决定。覆盖后的 Cfg
+照常进 key，所以拿环境变量做 A/B 不会复用到对方的二进制。
+
+工具链层另有一组只影响解析的变量：`MORI_JIT_ARCH`、`MORI_JIT_HIPCC`、`MORI_SOURCE_ROOT`、
+`MORI_JIT_CACHE_DIR`、`MORI_JIT_EXTRA_FLAGS`（进 flags，所以进 key）、`MORI_DEVICE_NIC`，
+以及两个诊断用的 `MORI_JIT_VERBOSE` / `MORI_JIT_KEEP_FAILED`。
 
 ### 3.7 dtype 是传输属性，不是算术属性
 
@@ -219,7 +245,12 @@ class EpDispatchCombineOp:          # dispatch_combine_op.py —— 后端无关
     def dispatch(self, input, weights, scales, indices, *, routing=None, return_routing=False)
     def combine(self, input, weights=None, indices=None, *, routing)
     def _pick(self, num_tokens)     # 在**已编好的**变体里挑
+    def reset(self) / close(self)
 ```
+
+对称内存由 `SymmArena` 管：一个 cco window 按 256B 对齐切成具名 region，peer 的同名 region 用
+`cco.Window(handle).lsa_ptr(pe, off)` 取。两个后端共用同一套 region 名，所以任一后端的 kernel
+都能读另一方布出来的 arena。
 
 三条时序约束，顺序不能换：
 
@@ -231,8 +262,9 @@ comm → arena → 每变体一个 Plan（编译）→ launch
 - **arena 在编译前**：kernel 要 window handle，它只有 arena 建好才存在。
 - **编译在 graph 捕获前**：捕获期不能 fork hipcc。所以 `Prepare`/`Launch` 是两个接口，
   而不是 DeepEP 那样每次 launch 都 generate+build 靠内存 map 兜。
-- **变体表在 `Pick` 前编全**：`Pick` 只查表，关键路径上绝不触发编译。与 opus_gemm 那条
-  「启发式能返回的 kid 必须在编译子集里」是同一个不变量，只是靠 map 查而非 codegen 期 assert。
+- **变体表在 `_pick` 前编全**：`_pick` 只查表并 clamp 到真编出来的变体，关键路径上绝不触发编译。
+  与 opus_gemm 那条「启发式能返回的 kid 必须在编译子集里」是同一个不变量，只是靠 map 查而非
+  codegen 期 assert。
 
 捕获已实测（`tests/python/ops/dispatch_combine_v2/test_graph_capture.py`）：dispatch → identity
 expert → combine 整步捕成一张图，replay 反复复现同一结果。能成立还差一个条件，而它在 kernel 里：
@@ -254,21 +286,23 @@ _unsupported(cfg)           # 它做不到什么
 ```
 
 **行为差异是数据，不是 override。** `KernelSet` 上挂 `stages_in_kernel`（combine 的暂存拷贝在
-kernel 内还是 host 侧）、`self_resets_counters`、`capabilities`/`unsupported`。形状抄自 aiter 的
+kernel 内还是 host 侧）、`self_resets_counters`、`capabilities` / `unsupported`。形状抄自 aiter 的
 `MOEMetadata`——但不抄它事后拆 `functools.partial` 反查身份那一手，那是把身份丢掉又猜回来。
 
 唯一没法变成数据的是**调用约定**，所以它被吸收进 `_build_kernels`：返回的 callable 已经是父类的
-具名签名，FlyDSL 的 11 个位置参数和 ctypes plan 的关键字参数各自在 `_wrap_*` 里适配。
+具名签名，FlyDSL 的位置参数和 ctypes plan 的关键字参数各自在 `_wrap_*` 里适配。
 
 **特性面是真包含不是交集**：HIP 后端做 gather combine，dispatch 收 bf16/fp32/fp8/fp4、combine 出
 bf16/fp32（§3.7），其余一概不接：scatter、量化（`quant_type`，与直接传已量化载荷是两回事）、
 StdMoE、per-token scales、routing replay、`local_expert_count`。能力门在**构造期**跑、且在分配 arena
-之前——问它要 scatter 会当场报错并列出缺什么，不是发射时给出错误数字。
+之前——问它要 scatter 会当场报错并列出缺什么，而不是发射时给出错误数字，也不会先占住一个对称 window
+再失败。
 
 `_regions` 归子类还消掉一个陷阱：FlyDSL 的 `off_out_tok` 对 dispatch 指 `disp_out`、对 combine 指
 `out_tok`，任何共享的 offset 传递路径都会静默接错 buffer。
 
-**选后端只 import 那一个**：选 `hip` 不会拉进 flydsl，所以它在没装 FlyDSL 的机器上能跑。
+**选后端只 import 那一个**：`dispatch_combine_op` 不 import 任何后端，选 `hip` 不会拉进 flydsl，
+所以它在没装 FlyDSL 的机器上能跑。
 
 ### 5.1 几何调优表：每个后端一份，dispatch 和 combine 再分开
 
@@ -280,9 +314,11 @@ dispatch 的 dtype**——它只归约 bf16/fp32 的暂存区，不管前面搬�
 挂一个假的 dtype 轴，然后维护三份相同的答案。`lookup()` 把两张表合成 op 要的那条 schedule，能处理两边
 桶边界不对齐的情况，所以任一半都能单独重调。
 
-键是 `(world_size, hidden_dim, topk, experts_per_rank)`。实测结论直接编码在键里：**topk 会移动桶边界**
-（它决定 `_tpi = warpSize/topk`，也就是一个几何在多少 token 内能一轮盖完），**专家数不会**（64 vs 96
-在所有几何/dtype/topk 上都在 2% 以内），所以后者用 `None` 通配——那个通配是个结论，不是省事。
+键是 `(world_size, hidden_dim, topk, experts_per_rank)`，值是一串
+`(max_tok_inclusive|None, block, warp)` 的桶。实测结论直接编码在键里：**topk 会移动桶边界**
+（它决定 `_tpi = warpSize/topk`，也就是一个几何在多少 token 内能一轮盖完），**专家数不会**
+（64 vs 96 在所有几何/dtype/topk 上都在 2% 以内），所以后者用 `None` 通配——那个通配是个结论，
+不是省事。没扫过的形状拿不到 schedule，退回单档默认值。
 
 取值规则：**性能接近时取更小的几何**，因为少占 CU 在与专家 GEMM 重叠时是真收益。这类 3% 以内的取舍是
 **策略不是测量**（单次 bench 偶尔会偏 20%）；真正由数据定的是桶的**边界**，它们来自 10~40% 的差异。
@@ -302,11 +338,14 @@ mori_jit_precompile / mori_jit_registered_plans / mori_jit_last_error
 | **请求** | 以 `(name, value)` 对穿过边界。**没有结构体要声明两次**；未知字段名报错（拼错的旋钮悄悄不生效，正是测量描述错二进制的成因），缺失字段取 C++ 默认 |
 | **参数** | C++ 发布 schema（字段表 + `sizeof`），Python **据此构造** ctypes 结构并断言大小。只有一份声明 |
 
-通用绑定 `mori.jit.v2.plan_api`(即 libmori_jit.so 的 `mori_jit_*` C ABI 的 Python 侧,与
-`src/jit/v2/plan_api.cpp` 对应)里没有任何 kernel 名字:`make_plan(kernel)` 由 schema 生成 Plan 类。
+十个入口全部 `noexcept`：异常穿过 `extern "C"` 进 ctypes 是 UB，实测会不留 traceback 地干掉解释器。
+所以每个入口都 catch，并按 ABI 的方式报告——返回 null/负值，细节留在 `mori_jit_last_error()`。
+
+通用绑定 `mori.jit.v2.plan_api`（即 libmori_jit.so 的 `mori_jit_*` C ABI 的 Python 侧，与
+`src/jit/v2/plan_api.cpp` 对应）里没有任何 kernel 名字：`make_plan(kernel)` 由 schema 生成 Plan 类。
 EP 专用的只有薄 shim `ops/dispatch_combine_v2/ep_plans.py`——它 `load_library("libmori_ops_v2.so")`
-触发注册,再暴露 `EpDispatchPlan`/`EpCombinePlan`。约定两条:标为 `e` 的字段接受 dtype 名或 torch
-dtype;launch 参数里 `off<Region>` 是 arena region 偏移,传 `arena=` 就绑定一次。
+触发注册，再暴露 `EpDispatchPlan`/`EpCombinePlan`。约定两条：标为 `e` 的字段接受 dtype 名或 torch
+dtype；launch 参数里 `off<Region>` 是 arena region 偏移，传 `arena=` 就绑定一次。
 
 **为什么是 ctypes**：边界只传指针和标量，没有类型转换可做。pybind11 的代价是编译期（aiter 实测
 libtorch+pybind11 的设备 pass 解析 ~15s）。绑定层里**没有 `import torch`**，靠鸭子类型取 `.data_ptr()`。
@@ -332,7 +371,7 @@ run 新增 16 份而不是 2 份，AOT 也无从谈起。旁证：gfx942 上 8 �
 `mori.jit.v2.plan_api.DTYPES` 是一张表管所有 kernel 的所有枚举字段。独立编号 = 静默给错 kernel。
 
 **AOT 预编译暂时没有。** 发射几何来自 Python 的调度表，所以 C++ 侧的预编译表永远渲染不出活的 op
-会渲染的 Cfg。要预热缓存，就是构建期把 op 构造一次。
+会渲染的 Cfg。要预热缓存，就是构建期把 op 构造一次。单实例编译约 1.6s，这个量级才是按需编译成立的前提。
 
 ## 8. 性能
 
@@ -359,9 +398,7 @@ dispatch 41→3、combine 57→10（`/maxRecv`、`%numExpertPerRank` 变成移�
 
 窄 dtype 的收益更大：4096 档 dispatch bf16 156.6 → fp8 98.5 → fp4 80.0，16384 档 fp4 是 bf16 的约 3 倍快。
 
-单实例编译 1.6s，对照 debug-aa 整文件 115s（90 个 kernel，gfx1250）。这个比值才是按需编译成立的前提。
-
-## 9. 移植来源与已知缺口
+## 9. 移植来源与覆盖范围
 
 kernel 从 `origin/main` 的 intranode MoE kernel 移植（bf16 gather 路径）。移植是机械的，因为 v1 的
 **整个**对称内存面只有两样：`SymmMemObjPtr::GetAs<T*>(pe)`（30 处，两次相关联的 load 查表）和三个
@@ -386,6 +423,19 @@ scales 转发、routing replay、`local_expert_count`。这些在 FlyDSL 后端�
 
 **cross-node 没有**：v2 只有 intranode 两个 body，op 里也没有 `kernel_type` 的概念。
 
-**debug-aa 的 69 个 gate 尚未归置**。归置的形状是三分：调优参数升格为 Cfg 字段；诊断开关进一个默认
-全 false 的 `Diag` 子结构（只发非默认字段，所以正常运行的源码里根本不会出现它，一开诊断自动是另一个
-缓存条目）；已有定论的删掉代码、结论留在注释里。
+## 10. 测试
+
+| | 位置 | 覆盖 |
+|---|---|---|
+| `jit_core`（ctest） | `tests/cpp/jit/test_jit_core.cpp` | 渲染、字段计数、缓存 key、入口名、schema；用假工具链，不碰 GPU |
+| `jit_host_device_split`（ctest） | `tools/jit_v2/check_host_device_split.sh` | Cfg 头仍能不经 hipcc 编译 |
+| `test_jit_binding.py` | 单 rank，不需要 communicator | ctypes/C-ABI 缝：schema vs `sizeof`、请求强制转换、未知字段拒绝 |
+| `test_op.py` | EP8，`MORI_V2_KERNEL_BACKEND=hip` 切后端 | op 层对着两套 kernel 各跑一遍 |
+| `test_ep_backend_parity.py` | EP8，一个进程内两个后端 | 同一输入逐元素比对 |
+| `test_graph_capture.py` | EP8 | dispatch → identity expert → combine 整步捕成一张图并 replay |
+| `test_asym_dtype.py` | EP8 | fp8/fp4 dispatch + bf16 combine |
+| `bench_ep.py` | EP4/EP8 | `hip_tuning_configs` 的几何扫描 |
+
+`test_jit_binding.py` 在 CI 里**从 `/tmp` 跑**，不是从 checkout 跑：建一个 plan 需要
+`libmori_jit.so`、`libmori_ops_v2.so` 和 v2 的 kernel 源码，而在仓库目录下这三样都能从 `build/`
+和 `src/` 解析到——哪怕安装包一样都没带。只有在仓库外，答得上来的才是真正打进包里的那份。
