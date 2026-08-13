@@ -488,7 +488,10 @@ jobs:
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
-    timeout-minutes: 45
+    # 45 -> 60: the fabric preflight below adds a full mesh plus a serial per-rail
+    # pass, and builds perftest the first time it runs on a fresh runner. A job
+    # timeout is not covered by the step's continue-on-error, so leave headroom.
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -554,6 +557,27 @@ jobs:
         run: |
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
             "$CT exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable && (command -v numactl >/dev/null || (apt-get update && apt-get install -y numactl))'"
+
+      # Fabric preflight. Every step below assumes the RDMA fabric between the two
+      # nodes is healthy; when it is not, they fail as MORI bugs and someone spends
+      # an afternoon bisecting a firmware regression. Run the same checks a human
+      # would run first, so the log says so up front.
+      #
+      # On the runner host, not in the container: env_check.sh needs an ssh client
+      # and perftest, neither of which is in Dockerfile.dev, and it reads host
+      # sysfs, driver and firmware state anyway. The runner already has passwordless
+      # ssh to node2 -- the same trust every step below uses for the rank-1 leg.
+      # env_check.sh assigns its own SSH_OPTS internally, so the job-level value
+      # does not leak into it. Its ssh port is hardcoded to 22, which matches
+      # node2_port for every active matrix entry.
+      #
+      # Non-gating on purpose: the bandwidth/latency thresholds only just started
+      # being enforced, and a noisy-neighbour run should not redden a PR that never
+      # touched the fabric. Promote to gating once we have seen it stay green.
+      - name: Fabric preflight (mori check)
+        continue-on-error: true
+        run: |
+          bash "$GITHUB_WORKSPACE/tools/env_check.sh" --install-perftest "$NODE2_HOST"
 
       - name: MORI-IO internode write sweep
         run: |

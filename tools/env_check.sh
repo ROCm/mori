@@ -64,9 +64,19 @@ YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+# Aggregate verdict. log_fail is the single choke point for "a check found
+# something wrong", so counting here gives the script an exit status without
+# auditing thirty call sites. Until now it exited 0 no matter how many [FAIL]
+# lines it printed, which made it unusable as a gate: CI could run it and always
+# go green. die() still exits 1 immediately for fatal prerequisites.
+# A plain variable is enough -- every log_fail runs in the main shell. The
+# parallel niccli and mesh work writes to temp files and reports after `wait`,
+# so no increment happens in a subshell where it would be lost.
+FAIL_COUNT=0
+
 step()      { STEP=$((STEP + 1)); echo ""; echo -e "${CYAN}=== Step $STEP: $* ===${NC}"; }
 log_ok()    { echo -e "${GREEN}[OK]${NC}   $*"; }
-log_fail()  { echo -e "${RED}[FAIL]${NC} $*"; }
+log_fail()  { FAIL_COUNT=$((FAIL_COUNT + 1)); echo -e "${RED}[FAIL]${NC} $*"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_skip()  { echo -e "${YELLOW}[SKIP]${NC} $*"; }
 
@@ -95,6 +105,13 @@ Environment:
   MORI_PERFTEST_PREFIX    where to find/install perftest (searched before \$PATH)
   ROCM_PATH               ROCm install used to build perftest (default /opt/rocm)
   SSH_USER                user for peer access (default \$SUDO_USER, else \$(whoami))
+
+Exit status:
+  0   every check passed, or was skipped for a missing tool
+  1   at least one check FAILed, or a fatal prerequisite was missing
+
+  A skipped check is not a failure: a missing perftest or nicctl leaves the
+  status at 0, since the check could not run rather than having found a fault.
 EOF
 }
 
@@ -1984,4 +2001,8 @@ check_inter_node_bw
 check_inter_node_lat
 
 echo ""
-echo "=== All checks completed ==="
+if (( FAIL_COUNT > 0 )); then
+    echo -e "=== All checks completed — ${RED}${FAIL_COUNT} failure(s)${NC} ==="
+    exit 1
+fi
+echo -e "=== All checks completed — ${GREEN}no failures${NC} ==="
