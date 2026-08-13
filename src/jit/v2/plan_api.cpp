@@ -187,7 +187,11 @@ MORI_JIT_API const char* mori_jit_plan_args_schema(const char* kernel) {
       return nullptr;
     }
     return vt->argsSchema;
+  } catch (const std::exception& e) {
+    SetPlanError(e.what());
+    return nullptr;
   } catch (...) {
+    SetPlanError("mori_jit_plan_args_schema: unknown exception");
     return nullptr;
   }
 }
@@ -203,7 +207,11 @@ MORI_JIT_API const char* mori_jit_plan_request_schema(const char* kernel) {
     }
     s = vt->requestSchema();
     return s.c_str();
+  } catch (const std::exception& e) {
+    SetPlanError(e.what());
+    return nullptr;
   } catch (...) {
+    SetPlanError("mori_jit_plan_request_schema: unknown exception");
     return nullptr;
   }
 }
@@ -216,7 +224,11 @@ MORI_JIT_API int mori_jit_plan_args_size(const char* kernel) {
       return -1;
     }
     return static_cast<int>(vt->argsSize);
+  } catch (const std::exception& e) {
+    SetPlanError(e.what());
+    return -1;
   } catch (...) {
+    SetPlanError("mori_jit_plan_args_size: unknown exception");
     return -1;
   }
 }
@@ -319,7 +331,11 @@ MORI_JIT_API const char* mori_jit_registered_plans() {
       s += n;
     }
     return s.c_str();
+  } catch (const std::exception& e) {
+    SetPlanError(e.what());
+    return nullptr;
   } catch (...) {
+    SetPlanError("mori_jit_registered_plans: unknown exception");
     return nullptr;
   }
 }
