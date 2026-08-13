@@ -146,8 +146,6 @@ endif()
 # Add an $ORIGIN-relative rpath (kept alongside the build-tree rpath) so the
 # binaries still find libmori_*.so after `pip install .` copies them to
 # site-packages/mori/examples/cco/ (the libs live at site-packages/mori/).
-# ${ROCM_PATH}/lib: this overrides the global CMAKE_BUILD_RPATH, so the ROCm
-# libdir has to be repeated here or the binaries cannot find libamdhip64.
 set_target_properties(cco_lsa_put cco_gda_put
                       PROPERTIES BUILD_RPATH "$ORIGIN/../..;${ROCM_PATH}/lib")
 

@@ -53,7 +53,7 @@ RUN set -ex; \
 # reserve + many hipMemMap, and a MappedHandle DRM FD leak that fails hipMemMap
 # after ~500 mappings. Only preload libhsa-runtime64 — preloading libamdhip64
 # too triggers an LLVM "spirv-expand-step registered more than once" abort.
-# ENV LD_PRELOAD=/opt/rocm/lib/libhsa-runtime64.so.1
+ENV LD_PRELOAD=/opt/rocm/lib/libhsa-runtime64.so.1
 
 # Pinned <0.3: 0.3.x dropped `flydsl.expr.buffer_ops`, still imported directly
 # by the cco examples (04/05/07/08). Unpin once they move to the 0.3.x API.
