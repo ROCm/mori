@@ -1,24 +1,27 @@
 # All-to-all over the mori torch SymmetricMemory backend
 
-A custom HIP kernel doing one-shot all-to-all against a symmetric window. **Pure HIP** — it
-does not use mori's shmem or cco. The only thing it needs from the backend is the peer
-pointers torch publishes:
+One-shot all-to-all against a symmetric window, written twice: as a HIP kernel
+(`all2all_kernel.hip`) and as a Triton kernel (`all2all_triton.py`). Neither uses mori's
+shmem or cco. The only thing either needs from the backend is the peer pointers torch
+publishes:
 
 ```
 recv slot of rank p, chunk from rank r  ==  peers[p] + r*chunk_bytes
 ```
 
-A second copy of the same kernel takes `(base, stride)` and computes `peers[p]` as
+A second copy of the HIP kernel takes `(base, stride)` and computes `peers[p]` as
 `base + p*stride` instead, so the two addressing forms can be measured against each other.
 That comparison is what the cco-window stage in [ROCm/mori#557](https://github.com/ROCm/mori/issues/557)
 turns into an API; the allocator itself exposes only the torch form today.
 
 ```bash
-python3 setup.py build_ext --inplace
+python3 setup.py build_ext --inplace          # for the HIP kernel only
 torchrun --nnodes=1 --nproc_per_node=8 all2all.py --chunk-kib 256
 ```
 
-The extension is built here, not by mori's CMake — the example is self-contained.
+`--kernel hip|triton|both` picks the implementation, `--addressing ptrs|flat|both` the
+addressing form; Triton appears under `ptrs` only. `--kernel triton` needs no build step at
+all. The HIP extension is built here, not by mori's CMake — the example is self-contained.
 
 ## What it does
 
@@ -44,11 +47,35 @@ they are `hdl.buffer_ptrs[0]` and `hdl.buffer_ptrs[1] - hdl.buffer_ptrs[0]`, plu
 that the stride is uniform — which torch's API does not promise, and which a backend
 handing back scattered per-rank pointers would fail.
 
+## The Triton version
+
+`all2all_triton.py` does the same push through the same array, in the idiom torch's own
+symmetric-memory Triton kernels use: `buffer_ptrs_dev` goes in as a plain integer and
+becomes a pointer inside the kernel.
+
+```python
+peers = peer_ptrs.to(tl.pointer_type(tl.uint64))   # peer_ptrs is hdl.buffer_ptrs_dev
+dst = tl.load(peers + peer).to(tl.pointer_type(tl.int32))
+```
+
+That is the entire interface to the backend, which is why this path needs no extension
+build — torch already hands out the array, so no C++ is involved. The grid is the same
+`(world_size * blocks_per_peer,)`, and `BLOCK=1024` int32 over 4 warps is the same
+dwordx4-per-lane store the HIP kernel does.
+
+One Triton detail worth knowing: the kernel is declared
+`@triton.jit(do_not_specialize=["chunk_elems", "rank_id", "blocks_per_peer"])`. Triton
+turns an `int` argument that happens to equal `1` into a `constexpr`, so without that,
+**rank 1 alone** fails to compile — a Python `int` arrives where the kernel casts to
+`tl.int64`.
+
 ## Measured
 
 Aggregate counts only the `(world_size-1)` chunks that leave the device; the self chunk stays
-local. Both addressing modes are correctness-checked on every configuration below, and
-`peer(r) == base + r*stride` holds throughout.
+local. Every variant that runs is correctness-checked first, and `peer(r) == base + r*stride`
+holds throughout.
+
+The two tables below are the HIP kernel; HIP vs Triton is further down.
 
 4 MiB per peer:
 
@@ -109,6 +136,24 @@ Every serious library builds the flat window underneath regardless: NCCL's
 NVSHMEM reserves `npes * heap_size` in one go and then hides it behind an array because its
 slots are rotated from `mype+1`. [ROCm/mori#557](https://github.com/ROCm/mori/issues/557)
 is where this backend adopts cco's version of it rather than inventing a third.
+
+### HIP vs Triton
+
+Same grid, same block size, same pointer array, 8×gfx950 in one run:
+
+| chunk per peer | HIP, pointer array | HIP, `base + rank*stride` | Triton, pointer array |
+|---|---|---|---|
+| 4 MiB | 1843.3 GB/s | 1848.4 GB/s | 1818.3 GB/s |
+| 1 MiB | 1784.0 GB/s | — | 1769.5 GB/s |
+| 256 KiB | 1536.3 GB/s | 1519.1 GB/s | 1256.6 GB/s |
+
+Triton matches HIP once the kernel is long enough to hide the launch: within a couple of
+percent at 4 MiB and 1 MiB, either side depending on the run — a repeat of the 4 MiB row
+put Triton ahead, 1852.2 vs 1832.2, which is the run-to-run spread on this box.
+
+At 256 KiB it is 18% behind, and that gap is a near-constant ~1.3 us per launch rather
+than anything in the kernel: the same 512 blocks each store the same 1024 int32 in both
+versions, so what shows at 9-10 us of work is Triton's host-side launcher, not its codegen.
 
 ### Why gfx942 is slow
 

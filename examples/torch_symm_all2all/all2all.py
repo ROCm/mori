@@ -20,15 +20,16 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""All-to-all with a custom HIP kernel over mori's torch SymmetricMemory backend.
+"""All-to-all over mori's torch SymmetricMemory backend, in HIP and in Triton.
 
-    python3 setup.py build_ext --inplace
+    python3 setup.py build_ext --inplace          # for the HIP kernel only
     torchrun --nnodes=1 --nproc_per_node=<gpus> all2all.py
 
 The receive buffer is an ordinary symm_mem tensor and the kernel reaches peers through
-torch's peer pointer array. No mori shmem or cco.
+torch's peer pointer array. No mori shmem or cco. The Triton version in
+``all2all_triton.py`` does the same work through the same array and needs no build step.
 
-The same kernel is also built against a flat base + rank*stride window, so the two
+The HIP kernel is additionally built against a flat base + rank*stride window, so the two
 addressing forms can be measured against each other -- that comparison is what motivates
 the cco-window stage in ROCm/mori#557. The flat form is derived here in the example, not
 offered by the allocator's API.
@@ -56,6 +57,12 @@ def parse_args():
         default="both",
         help="the N-entry peer pointer array, flat base + peer*stride, or both",
     )
+    p.add_argument(
+        "--kernel",
+        choices=("hip", "triton", "both"),
+        default="both",
+        help="which implementation to run; Triton is pointer-array only",
+    )
     return p.parse_args()
 
 
@@ -76,12 +83,28 @@ def flat_view(handle):
     return base, stride
 
 
-def main():
-    # Not at module scope: the extension links libc10, so torch must load first, and
-    # import sorting would hoist it above torch.
-    import all2all_kernel
+VARIANTS = {
+    ("hip", "ptrs"): "HIP    peer pointer array",
+    ("hip", "flat"): "HIP    base + rank*stride",
+    ("triton", "ptrs"): "Triton peer pointer array",
+}
 
+
+def main():
     args = parse_args()
+    # Not at module scope: the HIP extension links libc10, so torch must load first, and
+    # import sorting would hoist it above torch. Triton is imported the same way just to
+    # keep the two symmetrical, and so --kernel hip runs on a box without Triton.
+    impls = {}
+    if args.kernel in ("hip", "both"):
+        import all2all_kernel
+
+        impls["hip"] = all2all_kernel
+    if args.kernel in ("triton", "both"):
+        import all2all_triton
+
+        impls["triton"] = all2all_triton
+
     rank_id = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -116,35 +139,41 @@ def main():
 
     modes = ("ptrs", "flat") if args.addressing == "both" else (args.addressing,)
     launch = {
-        "ptrs": lambda: all2all_kernel.all2all_push_ptrs(
+        # Same call for HIP and Triton: both take the pointer array torch publishes.
+        ("hip", "ptrs"): lambda: impls["hip"].all2all_push_ptrs(
             send, peers_dev, chunk_bytes, rank_id, world_size
         ),
-        "flat": lambda: all2all_kernel.all2all_push(
+        ("triton", "ptrs"): lambda: impls["triton"].all2all_push_ptrs(
+            send, peers_dev, chunk_bytes, rank_id, world_size
+        ),
+        ("hip", "flat"): lambda: impls["hip"].all2all_push(
             send, base, stride, chunk_bytes, rank_id, world_size
         ),
     }
+    # Triton appears under "ptrs" only: the flat form is a HIP-side comparison.
+    variants = [(i, m) for (i, m) in VARIANTS if i in impls and m in modes]
 
     if rank_id == 0:
         print(
             f"world={world_size}  handle={handle_type(local_rank)}  chunk={args.chunk_kib} KiB"
         )
         print(f"peers: {' '.join(hex(p) for p in hdl.buffer_ptrs)}")
-        print(f"same as base={base:#x} + rank*{stride >> 20} MiB")
+        print(f"same as base={base:#x} + rank*{stride / 1024:.0f} KiB")
 
-    def run_once(mode):
-        launch[mode]()
+    def run_once(variant):
+        launch[variant]()
         torch.cuda.synchronize()
         # No device-side barrier in the backend yet, so ranks meet on the host.
         dist.barrier()
 
     errors = 0
-    for mode in modes:
+    for variant in variants:
         # Zeroing is local, but peers write into this window: everyone must finish
         # clearing before anyone starts pushing, or a late zero wipes an early write.
         recv.zero_()
         torch.cuda.synchronize()
         dist.barrier()
-        run_once(mode)
+        run_once(variant)
         # Chunk r must hold what rank r sent us: r*1000 + our rank.
         bad = 0
         for r in range(world_size):
@@ -153,25 +182,28 @@ def main():
             if got != want:
                 bad += 1
                 print(
-                    f"[rank {rank_id}] {mode} chunk {r}: got {got}, want {want}",
+                    f"[rank {rank_id}] {VARIANTS[variant]} chunk {r}: "
+                    f"got {got}, want {want}",
                     flush=True,
                 )
         errors += bad
         if rank_id == 0 and bad == 0:
-            print(f"correctness ({mode}): OK ({world_size}x{world_size} chunks)")
+            print(
+                f"correctness ({VARIANTS[variant]}): OK ({world_size}x{world_size} chunks)"
+            )
 
     # Only (world_size-1) chunks leave the device; the self chunk stays local.
     remote_bytes = (world_size - 1) * chunk_bytes
-    for mode in modes:
+    for variant in variants:
         for _ in range(args.warmup):
-            run_once(mode)
+            run_once(variant)
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         torch.cuda.synchronize()
         dist.barrier()
         start.record()
         for _ in range(args.iters):
-            launch[mode]()
+            launch[variant]()
         end.record()
         torch.cuda.synchronize()
         ms = start.elapsed_time(end) / args.iters
@@ -179,9 +211,9 @@ def main():
         totals = torch.tensor([gbps], dtype=torch.float64)
         dist.all_reduce(totals, op=dist.ReduceOp.SUM)
         if rank_id == 0:
-            label = "peer pointer array" if mode == "ptrs" else "base + rank*stride"
             print(
-                f"{label:<20}: {ms * 1e3:7.1f} us/iter, {totals.item():8.1f} GB/s aggregate"
+                f"{VARIANTS[variant]:<26}: {ms * 1e3:7.1f} us/iter, "
+                f"{totals.item():8.1f} GB/s aggregate"
             )
 
     if rank_id == 0:
