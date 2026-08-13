@@ -153,10 +153,11 @@ void ProxyThread::MainLoop() {
   uint32_t wr_qp[kMaxBatch];
   int batch_count = 0;
 
+  uint64_t total_cmds = 0;
+  uint64_t total_errors = 0;
   while (!ring_->shutdown) {
     batch_count = 0;
 
-    // Collect up to kMaxBatch pending commands from the ring
     uint32_t head = ring_->gpu_head;
     while (next_slot_ < head && batch_count < kMaxBatch) {
       uint32_t slot = next_slot_ & PROXY_RING_MASK;
@@ -166,7 +167,11 @@ void ProxyThread::MainLoop() {
 
       uint32_t qi = cmd->qp_idx;
       if (qi >= qps_.size() || qps_[qi].qp == nullptr) {
+        if (total_errors < 5)
+          fprintf(stderr, "[PROXY-THREAD] gpu_id=%d slot=%u qp_idx=%u op=%u ERROR: null QP (qps_.size=%zu)\n",
+                  gpu_id_, slot, qi, cmd->op, qps_.size());
         cmd->status = PROXY_ERROR;
+        total_errors++;
         next_slot_++;
         continue;
       }
@@ -221,6 +226,10 @@ void ProxyThread::MainLoop() {
 
           if (ret == 0) {
             ops_posted_++;
+            total_cmds++;
+            if (total_cmds <= 3 || (total_cmds % 10000 == 0))
+              fprintf(stderr, "[PROXY-THREAD] gpu_id=%d posted=%lu errs=%lu\n",
+                      gpu_id_, total_cmds, total_errors);
             break;
           }
 
@@ -244,7 +253,8 @@ void ProxyThread::MainLoop() {
             }
           }
 
-          // Fatal error: mark remaining WRs as error
+          fprintf(stderr, "[PROXY-THREAD] gpu_id=%d ibv_post_send FATAL ret=%d qi=%u\n",
+                  gpu_id_, ret, qi);
           ibv_send_wr* w = to_post;
           while (w) {
             uint32_t slot = static_cast<uint32_t>(w->wr_id) & PROXY_RING_MASK;

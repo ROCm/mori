@@ -783,6 +783,8 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
           nicQpCount++;
         }
       }
+      fprintf(stderr, "[PROXY-INIT] rank=%d nic=%d nicQpCount=%d\n",
+              states->gpuStates.rank, n, nicQpCount);
       if (nicQpCount > 0) {
         auto thread = std::make_unique<core::ProxyThread>();
         thread->Init(static_cast<core::ProxyRing*>(states->gpuStates.proxyRings[n]), std::move(nicQps), gpuId);
@@ -790,6 +792,8 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
         proxyThreads.push_back(std::move(thread));
       }
     }
+    fprintf(stderr, "[PROXY-INIT] rank=%d total threads=%zu numNics=%d\n",
+            states->gpuStates.rank, proxyThreads.size(), numNics);
   }
 
   states->status = ShmemStatesStatus::Initialized;
