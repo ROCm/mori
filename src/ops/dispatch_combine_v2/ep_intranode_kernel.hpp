@@ -23,18 +23,13 @@
 // DEVICE ONLY. Included by the generated TU, never by a host source.
 //
 // EP intranode dispatch + combine on cco-LSA, ported from
-// origin/main:src/ops/dispatch_combine/intranode.hpp (the bf16 gather path).
-// The port is mechanical: every `memObj->GetAs<T*>(pe)` became EpPeer<T>() and
-// every `GetAs<T*>()` became EpLocal<T>(), both offsets into one cco window.
-// Nothing else about the algorithm changed.
+// src/ops/dispatch_combine/intranode.hpp (the bf16 gather path). Mechanical:
+// `memObj->GetAs<T*>(pe)` became EpPeer<T>(), `GetAs<T*>()` became EpLocal<T>(),
+// both offsets into one cco window. The algorithm is unchanged.
 //
-// The offsets and the rank are LAUNCH arguments, not Cfg fields: as Cfg they
-// made every arena layout and every rank a separate binary, and the micro-
-// benchmark measured the constant form as a VGPR regression anyway.
-//
-// Deliberately NOT included: mori/shmem. Its three WaitUntil* helpers are plain
-// spin loops with no shmem state, reproduced here as EpWaitEq/EpWaitGt, so this
-// TU carries no device global variables and needs no per-module init.
+// mori/shmem is deliberately not included: its WaitUntil* helpers are plain spin
+// loops, reproduced here as EpWaitEq/EpWaitGt, so this TU carries no device
+// globals and needs no per-module init.
 
 #pragma once
 
@@ -98,13 +93,11 @@ template <EpCfg kCfg>
 __device__ __forceinline__ int EpFlatIndex(int pe, int localTokId) {
   return pe * EpFlatStride<kCfg>() + localTokId;
 }
-// The reverse map ("tis": recv slot -> global source token id) is a PUBLIC
-// output -- the routing handle hands it to callers -- and its stride is
-// maxTokPerRank, not the forward stride above. The two encode different pairs:
-// forward is (destPe, recv slot) with the slot ranging over maxRecv, reverse is
-// (srcPe, source token) with the token ranging over maxTokPerRank. The FlyDSL
-// backend publishes rank*maxTokPerRank + srcTok, so this must match it or the
-// same handle decodes differently depending on which backend produced it.
+// The reverse map ("tis": recv slot -> global source token id) is a PUBLIC output
+// and its stride is maxTokPerRank, NOT the forward stride above: forward encodes
+// (destPe, recv slot) over maxRecv, reverse (srcPe, source token) over
+// maxTokPerRank. FlyDSL publishes rank*maxTokPerRank + srcTok, so this must match
+// or one handle decodes differently per backend.
 template <EpCfg kCfg>
 __device__ __forceinline__ int EpSrcTokIndex(int pe, int srcTokId) {
   return pe * kCfg.maxTokPerRank + srcTokId;
@@ -281,12 +274,10 @@ __device__ __forceinline__ void EpCrossDeviceBarrier(EpArgs args, unsigned long 
   const unsigned long long win = args.window;
 
   __syncthreads();
-  // Release THIS block's staging writes before announcing arrival. v1's comment
-  // says a per-block release was tried and is not needed given the acquire
-  // below, and to add one only against a failure that reproduces -- which this
-  // is: without it, exactly half the tokens came back wrong at 80 blocks. Both
-  // fences are kept because that failure was found with NEITHER present, so
-  // which one alone would have sufficed was never isolated.
+  // Release THIS block's staging writes before announcing arrival. v1 calls this
+  // unnecessary given the acquire below; without it exactly half the tokens came
+  // back wrong at 80 blocks. Both are kept -- that failure was found with neither
+  // present, so which one alone sufficed was never isolated.
   __threadfence_system();
   if (thdId == 0) atomicAdd(args.gridBarrier, 1u);
 
@@ -306,14 +297,10 @@ __device__ __forceinline__ void EpCrossDeviceBarrier(EpArgs args, unsigned long 
     while (__hip_atomic_load(localBarrier + thdId, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) !=
            flag) {
     }
-    // ACQUIRE. The poll above is a relaxed load, so seeing the flag orders
-    // nothing: without this the block's vector L1 still holds what it cached
-    // before the barrier, and the fold reads pre-staging zeros for slots another
-    // block just filled -- silently dropping whole contributions. v1 measured
-    // exactly this (see CrossDeviceBarrierIntraNodeKernel in
-    // src/ops/dispatch_combine/intranode.hpp) and calls it the fix that made
-    // combine numerically correct. worldSize <= waveSize, so these threads are
-    // one wave and this is one invalidate, not worldSize of them.
+    // ACQUIRE. The poll is a relaxed load and orders nothing, so without this the
+    // block's vector L1 still holds pre-barrier data and the fold reads
+    // pre-staging zeros for slots another block just filled -- dropping whole
+    // contributions silently. worldSize <= waveSize, so this is one invalidate.
     __threadfence_system();
   }
   __syncthreads();

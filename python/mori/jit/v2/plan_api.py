@@ -58,11 +58,10 @@ __all__ = [
     "DTYPES",
 ]
 
-# Must match mori::ops::v2::EpDType. The v2 kernels share one dtype enum table;
-# an enum-tagged request field accepts a name from here as well as an int.
-# "byte8" is the transport type both fp8 and fp4 map to: the dispatch leg copies
-# its payload, so a 1-byte element covers fp8 directly and fp4 as 2 e2m1 per byte
-# (the caller halves hiddenDim for fp4). Combine cannot use it -- C++ rejects that.
+# Must match mori::ops::v2::EpDType; an enum-tagged request field accepts a name
+# from here as well as an int. "byte8" is the transport type fp8 and fp4 both map
+# to -- dispatch only copies, so one byte covers fp8 directly and fp4 as 2 e2m1
+# (the caller halves hiddenDim). Combine cannot use it; C++ rejects that.
 DTYPES = {"bf16": 0, "fp32": 1, "byte8": 2}
 
 # The C ABI + the plan registry both live here; op-libraries register INTO it.
@@ -264,15 +263,11 @@ def _as_ptr(x) -> int:
 
 
 # ---------------------------------------------------------------------------
-# The factory
+# The factory. Nothing below knows about any particular kernel: the REQUEST schema
+# gives the constructor its parameters, the ARGS schema gives launch its struct
+# layout, and both come from C++ -- so registering a kernel there is the whole job.
 #
-# Nothing below knows about any particular kernel. Both schemas come from C++:
-# the REQUEST schema gives the constructor its parameters, defaults and types;
-# the ARGS schema gives launch its parameters and the struct layout. Registering
-# a kernel in C++ is therefore the whole job -- `make_plan("dispatch")` will work
-# the moment a `dispatch` plan registers, with no edit here.
-#
-# Two naming conventions, and they are the only conventions:
+# The only two conventions:
 #   * a request field tagged `e` (enum) accepts a name from DTYPES as well as an int
 #   * request fields under `off.` are region offsets: pass `arena=` and they are
 #     bound once from arena.offset(region)

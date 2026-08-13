@@ -62,11 +62,9 @@ def _device_key():
 
 
 def _hip_default() -> dict:
-    """Fallback for an unswept shape, mirroring the C++ MakeEpCfg arch default so a
-    bare C++ caller and this path agree. Still not a tuned answer -- it is one shape
-    for every device, token count and dtype -- but it is no longer a known-worse one:
-    combine moved 80x8 -> 64x8 in both places once the sweep showed 64 wins at every
-    size on mi355x."""
+    """Fallback for an unswept shape, mirroring the C++ MakeEpCfg default so a bare
+    C++ caller and this path agree. One shape for every device, token count and
+    dtype -- not a tuned answer."""
     return dict(
         dispatch_block_num=64,
         combine_block_num=64,
@@ -82,24 +80,20 @@ def _hip_default() -> dict:
 # means "measured not to matter here", and an exact key wins over the wildcard.
 # ---------------------------------------------------------------------------
 
-# 4x gfx1250 EP8-equivalent (EP4) hidden 7168, 2026-08-11, same grid. Entries are the
-# smallest geometry within ~3% of the best -- fewer blocks means fewer CUs held, which
-# matters when this overlaps an expert GEMM. Those ties are policy, not measurement: a
-# single bench point can be off 20%. The bucket EDGES come from 10-40% effects.
-#
-# topk moves the edges here (it sets _tpi), the expert count does not (64 vs 96
-# agreed within ~2%), and the dtype only does for fp4 at topk 6.
+# Entries are the smallest geometry within ~3% of the best: fewer blocks holds fewer
+# CUs, which matters when this overlaps an expert GEMM. Those ties are policy, not
+# measurement -- a single bench point can be off 20% -- while the bucket EDGES come
+# from 10-40% effects.
 _DISPATCH_TABLE: dict = {
     # MI355X/gfx950 EP8 hidden 7168, 2026-08-11. No TDM here: the portable dispatch
-    # reserves no LDS and copies with plain vectors, so bf16/fp8 are bandwidth-bound and
-    # the grid barely registers. Cost of the smallest geometry (64x8) vs the best of
-    # {64x8, 64x16, 128x8, 128x16, 256x8} over 64..16384 tokens: bf16 0-2%, fp8 1-2%
-    # from ct>=512, fp4 6-69% from ct>=128. Only fp4 cares -- a quarter of the payload
-    # tips it out of bandwidth-bound -- and it wants 128x8 flat.
+    # reserves no LDS and copies with plain vectors, so bf16/fp8 stay bandwidth-bound
+    # and the grid barely registers. Cost of 64x8 against the best of {64x8, 64x16,
+    # 128x8, 128x16, 256x8} over 64..16384 tokens: bf16 0-2%, fp8 1-2% from ct>=512,
+    # fp4 6-69% from ct>=128. Only fp4 cares -- a quarter of the payload tips it out
+    # of bandwidth-bound -- and it wants 128x8 flat.
     #
-    # topk 6 and 8 measured identical. Two entries rather than a topk wildcard: _tpi
-    # makes topk matter in principle, and it does on gfx1250, so an unmeasured topk
-    # should get the default instead of inheriting one that happened to agree.
+    # topk 6 and 8 measured identical; listed twice rather than wildcarded, so an
+    # unmeasured topk gets the default instead of inheriting an agreement by accident.
     "mi355x": {
         (8, 7168, 8, None): {
             None: ((None, 64, 8),),
@@ -110,6 +104,9 @@ _DISPATCH_TABLE: dict = {
             "fp4_disp_bf16_comb": ((None, 128, 8),),
         },
     },
+    # 4x gfx1250 at EP4, hidden 7168, 2026-08-11. topk moves the edges (it sets _tpi),
+    # the expert count does not (64 vs 96 agreed within ~2%), and the dtype only does
+    # for fp4 at topk 6.
     "gfx1250": {
         # topk 8 (256 experts at EP4). All three dtypes agree here.
         #   ct     64x8   64x16  128x16 256x16      (bf16 / fp8 / fp4)
@@ -135,18 +132,12 @@ _DISPATCH_TABLE: dict = {
 
 # No dtype axis: combine reduces the bf16 staging region whatever dispatch carried,
 # and three runs per shape (one per dispatch dtype) agreed to 1-5%.
-#
-# mi355x 64x8 wins at every size and both topk, 2-3% over the 80x8 v1 carried and with
-# 16 fewer blocks; MakeEpCfg and _hip_default() were moved to 64 to match, so the
-# untuned fallback is no longer a geometry the tables already knew was worse. It is a
-# real optimum, not just the smallest tried: 32x8 costs 37% at ct=4096. On gfx1250,
-# 128x4 never wins and 256x8 collapses 2x at 16384.
 _COMBINE_TABLE: dict = {
-    # MI355X / gfx950 EP8: 64x8 wins at every token count and both topk, against
+    # MI355X/gfx950 EP8: 64x8 wins at every token count and both topk against
     # 32x8 / 48x8 / 64x16 / 80x8 (us at ct=4096, topk 8: 991.6 / 750.5 / 724.3 / 738.5 /
-    # 745.2). 80x8 was v1's value, measured once on a narrower grid; both MakeEpCfg and
-    # _hip_default() now say 64 as well. Fewer blocks than 64 is not free here: 32x8
-    # costs 37% at ct=4096, so this is a real optimum, not just the smallest thing tried.
+    # 745.2). Not merely the smallest tried -- 32x8 costs 37% at ct=4096 -- so MakeEpCfg
+    # and _hip_default() moved off v1's 80 to match. On gfx1250, 128x4 never wins and
+    # 256x8 collapses 2x at 16384.
     "mi355x": {
         (8, 7168, 8, None): ((None, 64, 8),),
         (8, 7168, 6, None): ((None, 64, 8),),

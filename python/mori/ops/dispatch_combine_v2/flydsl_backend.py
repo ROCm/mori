@@ -291,10 +291,8 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                 k: self._wrap_dispatch(k, replay=False) for k in self._dispatch_variants
             },
             combine={k: self._wrap_combine(k) for k in self._combine_variants},
-            # Replay variants stay lazily compiled -- building all of them
-            # eagerly would cost every op a compile it usually never uses. The
-            # wrapper keeps that laziness inside the backend instead of on the
-            # base's hot path.
+            # Lazily compiled: building every replay variant eagerly would cost
+            # each op a compile it usually never uses.
             dispatch_replay={
                 k: self._wrap_dispatch(k, replay=True) for k in self._dispatch_variants
             },
@@ -465,10 +463,9 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
         return run
 
     def _wrap_combine(self, spec):
-        # want_weights is accepted and ignored: the FlyDSL combine kernels take the
-        # out_weights pointer unconditionally and have no null gate for it, so the
-        # fold always runs here. The base still returns None when it was not asked
-        # for, so the two backends agree on what combine() hands back.
+        # want_weights is accepted and ignored: the FlyDSL combine kernels take
+        # out_weights unconditionally with no null gate, so the fold always runs.
+        # The base still returns None when it was not asked for.
         def run(*, input, dest_map, total_recv, num_tokens, want_weights=False):
             self._combine_variants[spec](
                 self.arena.handle,

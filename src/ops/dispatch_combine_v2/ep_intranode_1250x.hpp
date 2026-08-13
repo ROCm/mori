@@ -23,29 +23,24 @@
 // DEVICE ONLY, gfx125x only. Included by the generated TU, never by host.
 //
 // gfx1250 TDM intranode dispatch + combine on cco-LSA, ported from
-// origin:src/ops/dispatch_combine/intranode_1250x.hpp (bf16/fp32 gather path only).
-// Same mechanical mapping as the portable v2 port: memObj->GetAs<T*>(pe) became
-// EpPeer<T>(), GetAs<T*>() became EpLocal<T>(), both offsets into one cco window;
-// the EpPeer/EpLocal/EpWait*/EpFlat*/EpMultiWarpIter helpers are reused from
-// ep_intranode_kernel.hpp. The TDM engine machinery (amd_gfx1250_TDM.h builtins,
-// the Tdm* / Mori* helpers, and the _cusplit_* module-global staging pools) is
-// kept verbatim from v1.
+// src/ops/dispatch_combine/intranode_1250x.hpp (bf16/fp32 gather path). Same
+// mechanical mapping as the portable body, whose EpPeer/EpLocal/EpWait*/EpFlat*/
+// EpMultiWarpIter helpers are reused; the TDM machinery (amd_gfx1250_TDM.h
+// builtins, the Tdm*/Mori* helpers, the _cusplit_* staging pools) is v1 verbatim.
 //
-// SCOPE: unquantized only. No fp8/fp4/scale/StdMoE. Dispatch drops scale staging;
-// combine keeps the UseP2PRead PULL + QUAD gather and drops the PUSH/_nop2p and
-// convert paths. Same arena as the portable body; the only extra EpArgs field is
-// combineBarrierFan (local scratch for the intra-grid barrier fan-out).
+// SCOPE: unquantized only. Combine keeps the UseP2PRead PULL + QUAD gather and
+// drops the PUSH/_nop2p and convert paths. Same arena as the portable body; the
+// only extra EpArgs field is combineBarrierFan (local barrier scratch).
 //
-// Unlike the portable port this TU DOES carry device global variables (the
-// _cusplit_* pools); they are pure scratch and need no host init.
+// Unlike the portable body this TU does carry device globals (the _cusplit_*
+// pools); they are pure scratch and need no host init.
 
 #pragma once
 
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
-// The TDM header pulls hip/driver_types.h which uses hipMemoryType, so the HIP
-// runtime types must be included first (v1 got them transitively via earlier
-// includes; here this TU includes 1250x first, so order it explicitly).
+// The TDM header pulls hip/driver_types.h, which uses hipMemoryType: the HIP
+// runtime types must come first.
 #include <hip/amd_detail/amd_gfx1250_TDM.h>
 
 #include <type_traits>

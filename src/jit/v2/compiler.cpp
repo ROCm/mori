@@ -126,10 +126,9 @@ int CurrentDevice() {
 }  // namespace
 
 const std::vector<std::string>& DefaultSourceDeps() {
-  // Directory walks, not prefixes: "src/ops/dispatch_combine" does NOT cover the
-  // sibling "src/ops/dispatch_combine_v2", where the v2 kernel bodies live. Both
-  // are listed, or editing a kernel body would leave the cache entry valid and
-  // the next run would load the stale .hsaco.
+  // Directory walks, not prefixes: "src/ops/dispatch_combine" does not cover the
+  // sibling "_v2" where the v2 bodies live, and a missing dir means editing a
+  // kernel leaves the cache entry valid and loads a stale .hsaco.
   static const std::vector<std::string> deps{"include/mori", "src/ops/dispatch_combine",
                                              "src/ops/dispatch_combine_v2", "src/ops/kernels",
                                              "src/cco"};
@@ -182,11 +181,9 @@ std::string Compiler::CacheDirFor(const std::string& name, const std::string& co
   h.Update("$$");
   h.Update(tc.signature);
   h.Update("$$");
-  // The NIC is not in Flags() today because the intranode LSA path links no NIC
-  // bitcode -- but a GDA build does, and a binary that gets linked in is a
-  // codegen input like any other. Hashing it here rather than waiting for it to
-  // show up in a flag is what keeps "config cannot reach the compiler without
-  // reaching the key" true in advance instead of in hindsight.
+  // Not in Flags() today -- the intranode LSA path links no NIC bitcode -- but a
+  // GDA build does, and linked bitcode is a codegen input. Hashed here so the key
+  // does not have to wait for it to surface as a flag.
   h.Update(tc.nic.empty() ? "none" : tc.nic);
   h.Update("$$");
   for (const auto& f : tc.Flags()) {

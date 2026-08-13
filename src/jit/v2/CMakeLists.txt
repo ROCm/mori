@@ -6,7 +6,7 @@ target_include_directories(mori_jit PUBLIC ${CMAKE_SOURCE_DIR}/)
 target_include_directories(mori_jit PUBLIC ${CMAKE_SOURCE_DIR}/include)
 
 # hip::host only — the HIP runtime API, no device compilation. mori_jit must
-# keep building with a plain C++ compiler; see docs/MORI_JIT_V2_DESIGN.md §3.5.1.
+# keep building with a plain C++ compiler; see docs/MORI_JIT_V2_DESIGN.md §3.5.
 target_link_libraries(mori_jit PUBLIC mori_logging hip::host)
 
 # Development builds can find the kernel sources without an env var. Wheel

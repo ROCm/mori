@@ -61,25 +61,11 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
 
   c.waveSize = mori::jit::v2::WaveSizeForArch(arch);
 
-  // Geometry defaults, split by kernel because the two are bound by different
-  // things: dispatch is a copy engine and wants warps, combine's per-token
-  // reduction saturates sooner.
-  //
-  // Combine's 8 warps is measured, not inherited: on gfx950 EP8 at
-  // hidden=7168/topk=8, combine runs 75.4/164.1/978 us at 8 warps against
-  // 87.8/173.2/1008 at v1's 4 and 102.8/201.3/1100 at 16 (128/512/4096 tokens).
-  //
-  // Combine's 64 blocks replaces v1's 80. The full sweep behind
-  // hip_tuning_configs measured 64x8 as the winner at every token count and both
-  // topk on mi355x -- 2-3% over 80x8 with 16 fewer blocks -- and 80 was never a
-  // measured optimum, just the value v1 carried. Fewer blocks is not free either:
-  // 32x8 costs 37% at ct=4096, so this is the optimum and not merely the smallest
-  // thing tried. The Python path takes the tuning table and never sees this; what
-  // it fixes is the bare C++ caller, who was getting a geometry the tables already
-  // knew was worse.
-  //
-  // Still one shape -- a default, not a tuning table. Anything tuned belongs in
-  // hip_tuning_configs, which is keyed by device, shape, topk and dtype.
+  // Defaults for the bare C++ caller only -- the Python path uses the tuning
+  // table (hip_tuning_configs) and never sees these. Split by kernel because
+  // dispatch is copy-bound and wants warps while combine's reduction saturates
+  // sooner; 64x8 measured best for combine at every token count and topk on
+  // mi355x, so it replaces v1's 80x4.
   const bool isDispatch = kind == EpKernelKind::Dispatch;
   c.blockNum = 64;
   c.warpPerBlock = isDispatch ? 16 : 8;
@@ -130,20 +116,9 @@ namespace {
 // gfx125x -> the TDM body + its LDS geometry.
 bool EpArchIs1250() { return mori::jit::v2::GetToolchain().arch.rfind("gfx125", 0) == 0; }
 
-// Host-side arch routing: gfx125x renders the TDM body (ep_intranode_1250x.hpp,
-// which pulls the gfx1250 TDM header), every other arch renders the portable one.
-// The render-time arch is the same GetToolchain().arch the toolchain compiles
-// with (--offload-arch), so host and device never disagree, and the choice is in
-// the rendered text -> in the cache key.
-// The exported symbol, and so the name a profile shows. Everything in it is a
-// dimension you would otherwise have to guess at when reading a trace: which of the
-// two kernels, which body (the gfx125x TDM one is a different implementation, not a
-// recompile), the transported dtype, the shape, and the launch geometry -- which the
-// tuning schedule varies per token count, so one op contributes several rows.
-//
-// Adds nothing to the cache key that was not already in it: every field here is a Cfg
-// field except the body, and that follows the arch, which is already in the cache
-// directory and the compiler flags.
+// The exported symbol, and the name a profile shows: which kernel, which body,
+// the transported dtype, the shape, the launch geometry. The tuning schedule
+// varies geometry per token count, so one op contributes several rows.
 std::string EpEntryName(const EpCfg& cfg, const char* kind) {
   std::string s = "mori_ep_";
   s += kind;
@@ -157,6 +132,10 @@ std::string EpEntryName(const EpCfg& cfg, const char* kind) {
   return s;
 }
 
+// Arch routing: gfx125x renders the TDM body, every other arch the portable one.
+// The render-time arch is the same GetToolchain().arch the compile uses
+// (--offload-arch), so host and device cannot disagree, and the choice is in the
+// rendered text and therefore in the cache key.
 std::string RenderEpSource(const EpCfg& cfg, const std::string& entry, const char* portableBody,
                            const char* gfx1250Body) {
   const bool is1250 = EpArchIs1250();
@@ -252,10 +231,9 @@ mori::ops::v2::EpCfg EpCombineFromFields(const mori::jit::v2::FieldBag& f) {
   return EpCfgFromFields(f, mori::ops::v2::EpKernelKind::Combine);
 }
 
-// No C++-side AOT for these kernels, and it is not an oversight: a precompiled
-// entry only helps if it renders the Cfg a live op renders, and the launch
-// geometry comes from the Python tuning schedule. Warming the cache therefore
-// means constructing the op once at build time, which needs no table here.
+// No C++-side AOT: a precompiled entry only helps if it renders the Cfg a live op
+// renders, and the geometry comes from the Python tuning schedule. Warming the
+// cache means constructing the op once at build time, which needs no table here.
 int EpNoPrecompile(const std::string&) { return 0; }
 
 }  // namespace

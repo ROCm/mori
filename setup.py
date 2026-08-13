@@ -335,10 +335,9 @@ def _copy_jit_sources(root_dir: Path) -> None:
         root_dir / "src" / "ops" / "dispatch_combine",
         jit_dir / "src" / "ops" / "dispatch_combine",
     )
-    # JIT v2 device bodies. The rendered TU includes one of these by path
-    # ("src/ops/dispatch_combine_v2/ep_intranode_kernel.hpp"), so leaving them out
-    # of the wheel does not degrade the v2 hip backend -- it stops it compiling at
-    # all, and only off a repo checkout would anyone notice.
+    # JIT v2 device bodies. The rendered TU includes one of these by path, so
+    # without them the v2 hip backend does not compile at all -- and only off a
+    # repo checkout would anyone notice.
     _copytree(
         root_dir / "src" / "ops" / "dispatch_combine_v2",
         jit_dir / "src" / "ops" / "dispatch_combine_v2",
@@ -661,13 +660,10 @@ class CMakeBuild(build_ext):
                 build_dir / "src/metrics/libmori_metrics.so",
                 root_dir / "python/mori/libmori_metrics.so",
             ),
-            # JIT v2. Both targets are built unconditionally (root CMakeLists), and
-            # mori.jit.v2.plan_api looks for them next to the mori package first, so
-            # this is where they have to land. Without them a wheel raises
-            # "libmori_ops_v2.so not found" the moment anyone selects the hip backend;
-            # a dev tree hides it because plan_api also probes build/src/**.
-            # mori_logging is an INTERFACE target and hip::host is the system runtime,
-            # so these two plus $ORIGIN (set in their CMakeLists) close the chain.
+            # JIT v2. plan_api looks for these next to the mori package first, so
+            # this is where they have to land; without them a wheel raises
+            # "libmori_ops_v2.so not found" on the hip backend, which a dev tree
+            # hides because plan_api also probes build/src/**.
             (
                 build_dir / "src/jit/v2/libmori_jit.so",
                 root_dir / "python/mori/libmori_jit.so",

@@ -45,11 +45,9 @@ struct Toolchain {
   std::string cacheRoot;   // ~/.mori/jit  (MORI_JIT_CACHE_DIR overrides)
   std::string signature;   // compiler identity; part of every cache key
 
-  // "mlx5"/"bnxt"/"ionic" (default mlx5, matching v1's detect_nic_type() fallback).
-  // A device-side GDA build links NIC-specific cco bitcode, so this is a codegen
-  // input on the same footing as arch and belongs in every cache key. Not probed
-  // in C++: the v2 Python layer resolves it via mori.jit.config.detect_nic_type()
-  // and hands it over through MORI_DEVICE_NIC, so there is one detector, not two.
+  // "mlx5"/"bnxt"/"ionic". A GDA build links NIC-specific cco bitcode, so this is
+  // a codegen input and belongs in the cache key. Detected in Python
+  // (mori.jit.config.detect_nic_type -> MORI_DEVICE_NIC), not here: one detector.
   std::string nic;
 
   // -I flags, derived from sourceRoot.
@@ -72,11 +70,9 @@ struct Toolchain {
 // Process-wide singleton. Throws std::runtime_error if it cannot be resolved.
 const Toolchain& GetToolchain();
 
-// Ask for an arch before the toolchain resolves, from a caller that has one in
-// hand (the plan API's `arch` argument). Deliberately NOT setenv: the resolver
-// reads the environment, and setenv/getenv from two threads is a POSIX data
-// race -- a multi-threaded server creating plans concurrently would hit it. Has
-// no effect once GetToolchain() has resolved; ResolveArch() reports that.
+// Ask for an arch before the toolchain resolves. Not setenv: the resolver reads
+// the environment, and setenv/getenv from two threads is a POSIX data race. No
+// effect once GetToolchain() has resolved; ResolveArch() reports that.
 void SetArchOverride(const std::string& arch);
 
 // Test seam: override the resolved toolchain. Pass an empty arch to reset.

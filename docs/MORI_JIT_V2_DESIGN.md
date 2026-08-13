@@ -101,6 +101,10 @@ MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 11, "加了字段就要同步 VisitFields");
 **一次遍历，四个消费者**：`Render`（缓存 key）、`Describe`（`info`）、request schema（发给 Python）、
 `EpApplyFields`（请求 → struct）。所以加字段 Python 自动看得见。
 
+`EpArgs` 的 wire schema 同理由一份 `MORI_EP_ARGS_FIELDS(X)` 生成，并按该顺序取 `offsetof` 断言递增。
+只对 `sizeof` 设防是不够的：22 个字段里 8 个是裸指针，调换两个同类型字段所有尺寸校验都过，
+kernel 安静地读错 buffer。
+
 **只发非默认字段**：加一个默认不改行为的字段，已有实例的文本不变 → 缓存不失效。若新字段在默认值下
 也改了 kernel 代码，文本虽没变但 include 哈希会变，照样重编。两级哈希各管一头。
 
@@ -116,14 +120,11 @@ extern "C" __global__ void __launch_bounds__(EpBlockThreads(kCfg))
 mori_ep_dispatch_bf16_ws8_h2048_k8_64x16(EpArgs args) { EpDispatchBody<kCfg, TokT>(args); }
 ```
 
-- **入口名由 `Spec::EntryName(cfg)` 生成，描述这个 kernel 是什么**：哪个 kernel、哪个 body、
-  什么 dtype、什么形状、什么几何。曾经所有 kernel 都叫 `mori_jit_entry`，代价是 profile 里
-  dispatch、combine、以及调优表为不同 token 数选出的每一组几何**全都是同一行**，读不出任何东西。
-  要守的不变量其实不是「名字是个常量」，而是「**Python 不拼 kernel 名**」——v1 用 f-string 重建
-  宏拼出来的符号名、两边没有任何校验，这才是那条纪律的来由。现在名字在 C++ 里只写一处：
-  `EntryName` 生成它，渲染器把它写进源码，`Prepare` 把**同一个字符串**交给
-  `hipModuleGetFunction`，所以改名不可能忘了改查找。一个不在意的 Spec 不覆盖它就退回匿名的
-  `mori_jit_entry`。名字里的字段全都已经在 Cfg 里，所以它不给缓存 key 增加任何新维度。
+- **入口名由 `Spec::EntryName(cfg)` 生成**，描述哪个 kernel、哪个 body、什么 dtype、形状和几何——
+  否则 profile 里 dispatch、combine 和调优表为每个 token 档选出的每组几何全是同一行。
+  要守的不变量不是「名字是常量」而是「**Python 不拼 kernel 名**」：名字在 C++ 里只写一处，
+  渲染器把它写进源码、`Prepare` 把**同一个字符串**交给 `hipModuleGetFunction`，改名不可能漏改查找。
+  名字里的字段都已在 Cfg 里，不给缓存 key 增加新维度。
 - **文本即 key** → 配置不可能不进 key。
 - **`__launch_bounds__` 是表达式不是数字** → 由 host/device 共用的同一个 constexpr 算出。
 - **arch 路由在 host 侧**：include 哪个 body、调哪个函数，由 `RenderSource` 按
@@ -180,7 +181,7 @@ constexpr bool EpCfgIsValid(const EpCfg& c);
 // ep_spec.cpp —— host 侧，arch 默认集中在这里
 EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind) {
   c.waveSize = mori::jit::v2::WaveSizeForArch(arch);    // gfx12* = 32，其余 64
-  c.blockNum     = isDispatch ? 64 : 80;            // dispatch 搬运，combine 归约
+  c.blockNum     = 64;                              // dispatch 搬运，combine 归约
   c.warpPerBlock = isDispatch ? 16 : 8;
   ...                                               // env 覆盖，唯一读环境变量的地方
 }
@@ -310,8 +311,9 @@ dtype;launch 参数里 `off<Region>` 是 arena region 偏移,传 `arena=` 就绑
 **为什么是 ctypes**：边界只传指针和标量，没有类型转换可做。pybind11 的代价是编译期（aiter 实测
 libtorch+pybind11 的设备 pass 解析 ~15s）。绑定层里**没有 `import torch`**，靠鸭子类型取 `.data_ptr()`。
 
-**交叉编译是进程级模式**：`arch=` 通过 `MORI_JIT_ARCH` 生效，工具链只解析一次；与已解析的不一致会
-**报错**而不是静默地"按 A 渲染、按 B 编译"。
+**交叉编译是进程级模式**：工具链只解析一次 arch，`arch=` 在那之前经 `SetArchOverride()` 落到一个
+带锁的进程变量（不是 `setenv`——解析侧用 `getenv` 读，两线程并发建 plan 就是 POSIX 数据竞争）；
+`MORI_JIT_ARCH` 仍作为静态覆盖有效。与已解析的不一致会**报错**，不是静默地"按 A 渲染、按 B 编译"。
 
 ## 7. 几个有证据的决定
 
@@ -384,7 +386,6 @@ scales 转发、routing replay、`local_expert_count`。这些在 FlyDSL 后端�
 
 **cross-node 没有**：v2 只有 intranode 两个 body，op 里也没有 `kernel_type` 的概念。
 
-**debug-aa 的 69 个 gate 尚未归置**。计划是三分：调优参数升格为 Cfg 字段；诊断开关进一个默认全 false
-的 `Diag` 子结构（因为只发非默认字段，正常运行的源码里根本不会出现它，一开诊断就自动是另一个缓存
-条目）；已有定论的（`FOLDVEC` settled negative、`BARFAN` 更慢、`PAY2D` measured null）删掉代码、
-把结论留在注释里。要和分支作者过一遍再动手。
+**debug-aa 的 69 个 gate 尚未归置**。归置的形状是三分：调优参数升格为 Cfg 字段；诊断开关进一个默认
+全 false 的 `Diag` 子结构（只发非默认字段，所以正常运行的源码里根本不会出现它，一开诊断自动是另一个
+缓存条目）；已有定论的删掉代码、结论留在注释里。

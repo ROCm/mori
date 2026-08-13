@@ -6,8 +6,10 @@ behind two interchangeable kernel backends:
 
 - **flydsl** (default): FlyDSL device kernels, the full feature set (gather +
   scatter combine, fp8/fp4, quant, StdMoE, per-token scales, routing replay).
-- **hip**: C++/HIP kernels JIT-compiled by the v2 JIT framework (bf16/fp32 gather
-  only); works on a machine with no FlyDSL. See `docs/MORI_JIT_V2_DESIGN.md`.
+- **hip**: C++/HIP kernels JIT-compiled by the v2 JIT framework. Gather combine
+  only, in bf16/fp32; the dispatch leg also carries fp8 and fp4 (transport only —
+  it moves an already-quantized payload). A dedicated gfx125x TDM body is selected
+  by arch. Works on a machine with no FlyDSL. See `docs/MORI_JIT_V2_DESIGN.md`.
 
 Select with `cfg.kernel_backend` or `MORI_V2_KERNEL_BACKEND`. Peer addresses are
 computed in-kernel over the flat LSA VA, no host P2P tables. Reference =
@@ -35,21 +37,26 @@ lazily, only when selected, so the package imports without FlyDSL installed.
 |---|---|
 | `dispatch_combine_op.py` | backend-agnostic base + entry: `EpDispatchCombineConfig` (+`.tuned()`), `EpDispatchCombineOp` (backend selector + shared dispatch/combine/reset/lifecycle), `EpDispatchRoutingHandle`, `KernelSet` |
 | `flydsl_backend.py` | **flydsl** backend subclass (`EpDispatchCombineOpFlyDSL`): arena layout + FlyDSL kernel binding for the full feature set |
-| `hip_backend.py` | **hip** backend subclass (`EpDispatchCombineOpHip`): arena layout + C++/JIT plan binding, bf16/fp32 gather; rejects unsupported configs at construction |
+| `hip_backend.py` | **hip** backend subclass (`EpDispatchCombineOpHip`): arena layout + C++/JIT plan binding, gather only; rejects unsupported configs at construction |
 | `ep_plans.py` | EP-specific shim: loads `libmori_ops_v2.so` and exposes `EpDispatchPlan`/`EpCombinePlan`. The generic ctypes binding it calls lives in `mori.jit.v2.plan_api` (the plan_api C ABI), not here |
 | `symm_arena.py` | `SymmArena`: one cco-LSA window carved into named regions |
 | `flydsl_prims.py` | FlyDSL device primitives: system atomics / ordered stores / fences / volatile-spin waits |
 | `intranode_kernels.py` | FlyDSL kernel factories: `make_dispatch` (+scales/replay), `make_combine` (gather) / `make_combine_scatter` (`_nop2p`, bf16/f32/fp8/fp4), `make_convert_dispatch_output` / `make_convert_combine_input` (StdMoE), `make_local_expert_count` |
 | `tuning_configs.py` | **flydsl** kernel geometry: per-(world,hidden,topk) block/warp lookup |
-| `hip_tuning_configs.py` | **hip** kernel geometry, separate table (never borrows flydsl's); same `lookup` contract. Skeleton — schedules unfilled, returns hip single-shot default until the hip kernel is separately tuned |
+| `hip_tuning_configs.py` | **hip** kernel geometry, separate table (never borrows flydsl's); same `lookup` contract. Independent dispatch/combine tables, keyed by device, shape, topk and (dispatch only) dtype; an unswept shape gets a single-shot default |
 
 Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 
 | file | role |
 |---|---|
 | `test_dispatch_combine_v2_intranode.py` | pytest wrapper: runs `test_op.py` under torchrun for the representative modes and asserts every line PASS |
-| `test_op.py` | EP8 op-layer test (gather/scatter, quant, StdMoE, recv-cap, scales, LEC, reset, replay) |
+| `test_op.py` | EP8 op-layer test (gather/scatter, quant, StdMoE, recv-cap, scales, LEC, reset, replay). `MORI_V2_KERNEL_BACKEND=hip` runs it against the HIP kernels |
+| `test_ep_backend_parity.py` | runs both backends in one process on the same input and compares element for element |
+| `test_jit_binding.py` | JIT plan binding: schemas, request/args round-trip, cache behaviour. No GPU peers needed |
+| `test_graph_capture.py` | captures dispatch → identity expert → combine as one HIP graph and replays it |
+| `test_asym_dtype.py` | asymmetric dtype legs (fp8/fp4 dispatch + bf16 combine) |
 | `bench_dispatch_combine.py` | eager + CUDA-graph perf bench + e2e correctness. Envs: `DTYPE=bf16\|f32\|fp8\|fp4`, `COMBINE=gather\|scatter`, `QUANT=none\|fp8_direct_cast\|fp8_blockwise`, `STDMOE=1`, `SCALE_DIM`, `SWEEP`, `DISP_BLOCK`/`COMB_BLOCK`, `WARP_NUM`/`COMB_WARP`, `MODE`, `TUNED` |
+| `bench_ep.py` | geometry sweep for `hip_tuning_configs`: one backend, a grid of (block, warp) over a token sweep |
 | `run_bench.sh` | bench launcher (runs `bench_dispatch_combine.py` in the container) |
 
 (Each script inlines a tiny torchrun/gloo `Dist` bootstrap — gloo only carries the cco unique-id and pass/fail counts.)

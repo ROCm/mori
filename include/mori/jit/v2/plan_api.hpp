@@ -21,19 +21,12 @@
 // SOFTWARE.
 //
 // One C ABI for every JIT kernel, and the registration macro that plugs a Spec
-// into it.
+// into it. Nothing on either side declares the other's layout:
 //
-// Before this existed, each kernel carried ~190 lines of hand-written
-// create/destroy/launch/info plus a matching ctypes struct on the Python side --
-// and nothing checked that the two declarations of that struct agreed. That is
-// the same class of bug as the old EpDispatchCombineArgsRaw layout, reintroduced
-// at the language boundary. Two mechanisms remove it:
-//
-//   * The REQUEST crosses as (name, value) pairs. There is no struct to match,
-//     an unknown name is an error, and a missing one takes the C++ default.
-//   * The ARGS struct crosses by SCHEMA. C++ publishes its own field list and
-//     byte size; Python builds its ctypes type from that string and asserts the
-//     size. One declaration, so there is nothing to keep in step.
+//   * The REQUEST crosses as (name, value) pairs. No struct to match, an unknown
+//     name is an error, a missing one takes the C++ default.
+//   * The ARGS struct crosses by SCHEMA. C++ publishes its field list and byte
+//     size; Python builds its ctypes type from that string and asserts the size.
 
 #pragma once
 
@@ -56,9 +49,8 @@ class FieldBag {
   bool Has(const char* name) const;
   long long Get(const char* name, long long fallback) const;
 
-  // Names supplied by the caller that no Get() asked for. Reported as an error
-  // rather than ignored: a typo'd knob that silently does nothing is exactly how
-  // a measurement ends up describing the wrong binary.
+  // Names no Get() asked for. An error, not ignored: a typo'd knob that silently
+  // does nothing is how a measurement ends up describing the wrong binary.
   std::vector<std::string> Unread() const;
 
  private:
@@ -81,13 +73,11 @@ struct PlanVTable {
   // Fill the disk cache for the declared coverage; no GPU touched.
   int (*precompile)(const std::string& arch);
   // "name:tag=default,..." for the request; nested flattened as parent.child.
-  // The binding generates its constructor from this, so a new request field
-  // needs no Python edit at all.
+  // The binding generates its constructor from this.
   std::string (*requestSchema)();
   // "name:type,name:type,..."  type in {p,u64,i64,i32,f32}
   const char* argsSchema;
-  // sizeof the args struct. The binding builds its own struct from the schema
-  // and asserts this -- the check the hand-written ctypes struct never had.
+  // sizeof the args struct; the binding asserts its schema-built struct against it.
   size_t argsSize;
 };
 
@@ -95,10 +85,9 @@ void RegisterPlan(const char* name, const PlanVTable& vt);
 const PlanVTable* FindPlan(const char* name);
 std::vector<std::string> RegisteredPlans();
 
-// Cross-compiling is a whole-process mode, not a per-call parameter: the
-// toolchain resolves its arch once and every compile uses it. An explicit arch
-// is applied before that resolution; disagreeing with an already-resolved
-// toolchain is an error rather than a silent "rendered for A, compiled for B".
+// Cross-compiling is a whole-process mode: the toolchain resolves its arch once.
+// An explicit arch is applied before that; disagreeing with an already-resolved
+// toolchain is an error, not a silent "rendered for A, compiled for B".
 std::string ResolveArch(const char* arch);
 
 void SetPlanError(const std::string& what);

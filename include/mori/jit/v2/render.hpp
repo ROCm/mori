@@ -37,13 +37,10 @@
 #include <type_traits>
 #include <vector>
 
-// Field-count guard (merged here from the former field_count.hpp -- both are the
-// HIP-free Cfg-introspection header, and a Cfg header always includes both).
-// A Cfg field that Render() forgets to emit would silently select the default --
-// a wrong kernel, not just a stale cache; pinning the count makes it a compile
-// error. Needs C++20 concepts; #include-safe under C++17 (macro is a no-op there,
-// and the JIT device TU is C++20, so the assert fires at the latest on first
-// compile of the kernel). See docs/MORI_JIT_V2_DESIGN.md §3.5.
+// Field-count guard. A Cfg field that Render() forgets to emit silently selects
+// the default -- a wrong kernel, not just a stale cache -- so the count is pinned.
+// Needs C++20 concepts; a no-op under C++17, where the device TU (C++20) still
+// catches it on first compile.
 #if defined(__cpp_concepts) && __cpp_concepts >= 201907L
 #define MORI_JIT_HAS_FIELD_COUNT 1
 #else
@@ -129,12 +126,8 @@ inline std::string BraceInit(const char* type, const Fields& f) {
 }
 
 // ---------------------------------------------------------------------------
-// Wire schema + generic apply.
-//
-// Both are driven by the SAME VisitFields walk that Render uses, so the binding
-// learns the request shape from the one field list rather than from a second
-// declaration someone has to keep in step. That second declaration is what made
-// the hand-written ctypes struct a layout hazard.
+// Wire schema + generic apply. Driven by the same VisitFields walk as Render, so
+// the binding learns the request shape from the one field list.
 // ---------------------------------------------------------------------------
 
 // Scalar type tags as they appear on the wire.

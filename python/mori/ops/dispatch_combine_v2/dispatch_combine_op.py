@@ -21,32 +21,23 @@
 # SOFTWARE.
 """Backend-agnostic base + entry point for the v2 EP op.
 
-This module owns the op class and its config; it imports no kernel backend. Two
-backends live beside it -- FlyDSL (``flydsl_backend``) and HIP/JIT
-(``hip_backend``) -- behind this one class. Callers keep writing::
+Two backends live beside this module -- FlyDSL (``flydsl_backend``) and HIP/JIT
+(``hip_backend``) -- behind one class. ``EpDispatchCombineOp(cfg, comm)`` returns
+whichever ``cfg.kernel_backend`` (or ``MORI_V2_KERNEL_BACKEND``) names, defaulting
+to flydsl; ``EpDispatchCombineOpHip(cfg, comm)`` is the explicit form, and
+``isinstance(op, EpDispatchCombineOp)`` holds either way.
 
-    op = EpDispatchCombineOp(cfg, comm)
+Neither backend is imported here. Selecting one imports only that one, so the HIP
+backend works on a machine with no flydsl.
 
-and get whichever backend ``cfg.kernel_backend`` (or ``MORI_V2_KERNEL_BACKEND``)
-names, defaulting to flydsl. ``EpDispatchCombineOpHip(cfg, comm)`` also works if
-you want to be explicit, and ``isinstance(op, EpDispatchCombineOp)`` holds either
-way.
-
-**This module imports neither backend.** Selecting one imports only that one, so
-the HIP backend is usable on a machine with no flydsl -- which is the whole point
-of having a seam rather than a fork.
-
-A subclass supplies exactly two things:
+A subclass supplies exactly two things::
 
     _regions(cfg)              -> [(name, nbytes)]   arena layout it needs
     _build_kernels(cfg, arena) -> KernelSet          bound, ready-to-launch kernels
 
-Everything else -- the arena, the scratch buffers, variant selection, the
-lifecycle -- is here, because both backends agree on all of it. Behavioural
-differences between the two are *data* on the KernelSet, not methods to override;
-that shape is borrowed from aiter's ``MOEMetadata`` (aiter/fused_moe.py), which
-carries ``stage1``/``stage2`` callables next to the flags telling the caller how
-to feed them.
+Everything else -- arena, scratch buffers, variant selection, lifecycle -- is here.
+Behavioural differences between the backends are *data* on the KernelSet, not
+methods to override, after aiter's ``MOEMetadata``.
 """
 
 from __future__ import annotations
@@ -97,10 +88,9 @@ class EpDispatchCombineConfig:
     # "gather" (UseP2PRead) or "scatter" (mori _nop2p, fp8 compression home).
     combine_mode: str = "gather"
     quant_type: str = "none"  # none | fp8_direct_cast | fp8_blockwise
-    # Geometry: None => auto (pull the tuned schedule for this device/shape/dtype
-    # from tuning_configs in __post_init__). Pin any of these to opt out and use a
-    # fixed geometry instead. Combine wants few warps (K-deep per-lane MLP already
-    # saturates), kept separate from dispatch's warp count.
+    # Geometry: None => the tuned schedule for this device/shape/dtype; pin any of
+    # these to opt out. Combine keeps its own warp count -- its K-deep per-lane MLP
+    # saturates sooner than dispatch's copy.
     dispatch_block_num: int = None
     combine_block_num: int = None
     warp_num_per_block: int = None
@@ -138,10 +128,8 @@ class EpDispatchCombineConfig:
             )
         if self.quant_type != "none":
             self.combine_mode = "scatter"
-        # The dispatch grid barrier iterates peers as `range(lane, npes, 64)` and
-        # resets the barrier inside the loop, which is only correct when each lane
-        # runs it at most once (npes <= wavefront). Intranode is single-node so
-        # this always holds, but make the assumption explicit.
+        # The dispatch grid barrier resets inside a `range(lane, npes, 64)` loop,
+        # correct only while each lane runs it once (npes <= wavefront).
         if self.world_size > 64:
             raise ValueError(
                 f"intranode op supports world_size <= 64, got {self.world_size}"
@@ -167,10 +155,8 @@ class EpDispatchCombineConfig:
                     "combine_data_type (asymmetric dtype) requires combine_mode=gather, "
                     "quant_type=none, enable_std_moe=False"
                 )
-            # fp4 DISPATCH + bf16 COMBINE (the SGLang/aiter fp4-asym path) is
-            # supported: dispatch is a plain byte-mover (hidden/2 B) with e8m0
-            # scales forwarded, combine stays bf16. fp4 on the combine side is
-            # not implemented for the asymmetric path.
+            # fp4 dispatch + bf16 combine (the SGLang/aiter fp4-asym path) is
+            # supported; fp4 on the combine side is not.
             if self.combine_dtype == torch.float4_e2m1fn_x2:
                 raise ValueError(
                     "asymmetric combine dtype does not support fp4 (fp4 dispatch "

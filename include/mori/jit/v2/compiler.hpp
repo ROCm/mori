@@ -22,12 +22,9 @@
 //
 // Content-addressed JIT compile + cache.
 //
-// The cache key is  name $$ compiler $$ flags $$ include-hash $$ source-text.
-// Every input that can change the produced binary is in there by construction:
-// the configuration IS the source text, so there is no second list of "things
-// that must also go in the key" to keep in step. That second list is exactly
-// what silently reused a full build's .hsaco for a MORI_COMB_NOQUANT run and
-// made a deleted pass read as free.
+// Key: name $$ compiler $$ flags $$ include-hash $$ source-text. The
+// configuration IS the source text, so every codegen input is in the key by
+// construction -- there is no second list to keep in step.
 
 #pragma once
 
@@ -42,10 +39,8 @@ namespace mori {
 namespace jit {
 namespace v2 {
 
-// Fallback entry name, for a spec that does not name its kernel. Specs SHOULD
-// name it: every kernel exporting one symbol makes a profile unreadable, since
-// dispatch, combine and every Cfg of each show up as the same row. What must not
-// come back is Python rebuilding the name -- see KernelSpec::EntryName.
+// Fallback entry name. Specs should override it: one symbol for every kernel
+// makes a profile unreadable. See KernelSpec::EntryName.
 inline constexpr const char* kEntryName = "mori_jit_entry";
 
 class Module {
@@ -85,16 +80,14 @@ class Compiler {
                                 const std::vector<std::string>& sourceDeps = DefaultSourceDeps(),
                                 const std::string& entry = kEntryName);
 
-  // Compile and publish without loading. Touches no HIP device, so it works on a
-  // build machine with no GPU and cross-compiles for another arch via
-  // MORI_JIT_ARCH -- which is how the wheel's precompile step and the
-  // compile-only check on a machine we must not run on both work.
-  // Returns the cache directory.
+  // Compile and publish without loading; returns the cache directory. Touches no
+  // HIP device, so it runs on a GPU-less build machine and cross-compiles via
+  // MORI_JIT_ARCH.
   std::string EnsureCompiled(const std::string& name, const std::string& code,
                              const std::vector<std::string>& sourceDeps = DefaultSourceDeps());
 
-  // Cache directory this (name, source) maps to. Exposed for tests and for
-  // reporting; calling it has no side effects beyond resolving the toolchain.
+  // Cache directory this (name, source) maps to. No side effects beyond
+  // resolving the toolchain.
   std::string CacheDirFor(const std::string& name, const std::string& code,
                           const std::vector<std::string>& sourceDeps = DefaultSourceDeps()) const;
 

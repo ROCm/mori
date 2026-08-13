@@ -146,11 +146,9 @@ std::string FormatPlanInfo(unsigned grid, unsigned block, unsigned sharedBytes,
 }  // namespace mori
 
 // ===========================================================================
-// C ABI — seven symbols, for every kernel, forever.
-//
-// ctypes rather than pybind11 or the CPython C API: this carries only pointers
-// and scalars, so there is nothing for a type-conversion layer to do, and it
-// keeps torch out of every header on this side (MORI_JIT_V2_DESIGN §3.5).
+// C ABI — ten symbols, the same for every kernel. ctypes rather than pybind11: this
+// carries only pointers and scalars, and it keeps torch out of every header on
+// this side (MORI_JIT_V2_DESIGN §3.5).
 // ===========================================================================
 
 using mori::jit::v2::FieldBag;
@@ -168,11 +166,9 @@ struct PlanHandle {
 
 }  // namespace
 
-// EVERY entry below must be noexcept in practice: an exception crossing extern "C"
-// into ctypes is undefined behaviour, and in practice terminates the interpreter with
-// no traceback. Anything that allocates -- and the schema getters do, if only to build
-// an error string -- therefore catches. Failure is reported the way the rest of the
-// ABI reports it: a null/negative return plus mori_jit_last_error().
+// Every entry below must be noexcept in practice: an exception crossing extern "C"
+// into ctypes is UB, and terminates the interpreter with no traceback. So each one
+// catches and reports the ABI way -- null/negative return plus mori_jit_last_error().
 extern "C" {
 
 #define MORI_JIT_API __attribute__((visibility("default")))

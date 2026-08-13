@@ -93,15 +93,12 @@ def main():
     dist.broadcast_object_list(obj, src=0)
     M = max(SWEEP)
 
-    # Inputs BEFORE the communicator, which is not a style choice: comm_create
-    # leaves a HIP error latched, and torch reports whatever is latched on the next
-    # GPU call it makes, so a .to(dev) after Communicator.init dies with someone
-    # else's error (hipErrorInvalidValue here, hipErrorNotSupported elsewhere). Every
-    # other test in this directory happens to build its tensors first and none of them
-    # sees it. The bug is cco's and the fix belongs there -- next to whichever
-    # tolerated call sets the flag, as src/application/memory/symmetric_memory.cpp
-    # already does with (void)hipGetLastError() -- not in a boundary that swallows
-    # every error indiscriminately.
+    # Inputs BEFORE the communicator, and not as a style choice: comm_create leaves
+    # a HIP error latched, and torch reports whatever is latched on its next GPU
+    # call, so a .to(dev) after Communicator.init dies with someone else's error.
+    # The bug is cco's and the fix belongs next to whichever tolerated call sets the
+    # flag, as src/application/memory/symmetric_memory.cpp already does with
+    # (void)hipGetLastError().
     n_experts = world * EPR
     g = torch.Generator(device="cpu").manual_seed(1234 + rank)
     inp = (

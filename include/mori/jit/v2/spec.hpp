@@ -66,16 +66,12 @@ class KernelSpec {
     explicit operator bool() const { return module != nullptr; }
   };
 
-  // The symbol the generated TU exports, and the one a profile will show. A spec
-  // overrides this to describe the kernel -- kind, dtype, shape, geometry -- so a
-  // trace can tell dispatch from combine and one Cfg from another; the default is
-  // the anonymous fallback.
+  // The symbol the generated TU exports and a profile shows. Specs override it to
+  // describe the kernel (kind, dtype, shape, geometry).
   //
-  // The rule this must not break is that PYTHON never spells a kernel name: v1
-  // rebuilt symbol names with f-strings against macro-pasted ones, with nothing
-  // checking the two agreed. Here the name is produced once, in C++, and the same
-  // string is both interpolated into the source and passed to hipModuleGetFunction
-  // below -- so a spec that renames its kernel cannot forget to update the lookup.
+  // The invariant: the name is produced once, here, and the SAME string is both
+  // interpolated into the source and passed to hipModuleGetFunction, so a rename
+  // cannot desync the two. Python never spells a kernel name.
   static std::string EntryName(const Cfg&) { return kEntryName; }
 
   // Compiles if needed. Call outside HIP graph capture.

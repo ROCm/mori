@@ -151,13 +151,10 @@ std::string DetectSourceRoot() {
   return "";
 }
 
-// The NIC is told to us, not probed here: MORI_DEVICE_NIC is the single authority
-// (same variable CMake and python/mori/jit/config.py use). The v2 Python layer
-// fills it from mori.jit.config.detect_nic_type() (env -> /sys/class/infiniband ->
-// lspci -> lib -> mlx5) before the first JIT call, so this normally just reads the
-// resolved value. The default matches v1's detect_nic_type() fallback -- mlx5 --
-// rather than a bare "none", so a pure-C++ caller still gets a sane NIC instead of
-// what reads like "detection failed".
+// Told, not probed: MORI_DEVICE_NIC is the single authority, filled by the Python
+// layer from mori.jit.config.detect_nic_type() before the first JIT call. The
+// mlx5 default matches v1's fallback, so a pure-C++ caller gets a usable NIC
+// rather than something that reads as "detection failed".
 std::string DetectNic() {
   std::string v = EnvOr("MORI_DEVICE_NIC", "mlx5");
   for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));

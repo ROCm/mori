@@ -23,15 +23,10 @@
 // EP intranode dispatch/combine: the specialisation identity, the runtime
 // arguments, and the arithmetic both sides share.
 //
-// Ported from origin/main src/ops/dispatch_combine/intranode.hpp. That kernel's
-// whole symmetric-memory surface is `SymmMemObjPtr::GetAs<T*>(pe)`, a two-load
-// table lookup into a per-region peer-pointer array. Here it is one arena, one
-// cco window, and a compile-time offset per region:
-//
-//     memObj->GetAs<T*>(pe)  ->  ccoGetLsaPeerPtr(win, pe, args.offRegion)
-//
-// so the 13 SymmMemObjPtr fields of EpDispatchCombineArgs collapse to a single
-// window handle plus eight offsets, all runtime arguments.
+// Ported from src/ops/dispatch_combine/intranode.hpp, whose symmetric-memory
+// surface is `memObj->GetAs<T*>(pe)`. Here that is
+// `ccoGetLsaPeerPtr(win, pe, args.offRegion)`: one arena, one window, one offset
+// per region, so 13 SymmMemObjPtr fields become a handle plus eight offsets.
 //
 // HIP-free and attribute-free: host compiles this with a plain C++ compiler,
 // the generated device TU with hipcc. See MORI_JIT_V2_DESIGN.md §3.5.
@@ -51,12 +46,10 @@ namespace v2 {
 // dtype tag. The generated source expands it to a real type name; nothing here
 // includes a HIP header.
 //
-// The VALUES are load-bearing: an `e`-tagged field crosses the boundary as a
-// bare integer, and the binding has exactly ONE dtype name->int table
-// (mori.jit.v2.plan_api DTYPES) that it applies to every enum field of every kernel.
-// So this enumeration must agree with mori::ops::v2::DType numerically, or a
-// caller asking for fp32 gets whatever this enum happens to call 1. Renumbering
-// either enum independently is a silent-wrong-answer change, not a refactor.
+// The VALUES are load-bearing: an `e`-tagged field crosses as a bare integer and
+// the binding has one dtype name->int table (plan_api.DTYPES) for every kernel,
+// so this must agree numerically with mori::ops::v2::DType. Renumbering either
+// alone is a silent wrong answer, not a refactor.
 // ---------------------------------------------------------------------------
 // Byte8 is a TRANSPORT type: dispatch only copies its payload, so fp8 and fp4 (2
 // e2m1 per byte, caller halves hiddenDim) both move as bytes. Combine reduces and
@@ -113,11 +106,10 @@ struct EpArgs {
   // only known once the arena exists, and it differs per rank.
   unsigned long long window = 0;
 
-  // Arena region byte offsets, matching the region list the Python op builds
-  // (see SymmArena). RUNTIME, not Cfg: baking them in made every arena layout a
-  // separate binary and every rank compile its own, and the gfx942 micro-benchmark
-  // measured the constant form as a REGRESSION (VGPR 9 -> 22, because the compiler
-  // loses "the base is uniform" and rematerialises the address per lane).
+  // Arena region byte offsets, matching the region list SymmArena builds. Runtime,
+  // not Cfg: as constants they made every arena layout a separate binary AND
+  // measured slower on gfx942 (VGPR 9 -> 22 -- the compiler loses "the base is
+  // uniform" and rematerialises the address per lane).
   unsigned long long offTokOff = 0;     // index_t[1]            slot allocator
   unsigned long long offRecvNum = 0;    // index_t[worldSize]    recv-count signal
   unsigned long long offRecvToSrc = 0;  // index_t[maxRecv]      slot -> src token
@@ -148,13 +140,11 @@ struct EpArgs {
   int numTokens = 0;  // tokens this rank contributes this call
 };
 
-// The wire schema, as one list rather than a hand-kept parallel string. The
-// binding builds its ctypes struct from `name:tag` in this order and checks the
-// total against sizeof(EpArgs) -- but sizeof cannot see two same-type fields
-// swapped, and a swapped pointer pair is a kernel reading the wrong buffer with
-// no diagnostic at all. The static_asserts below take the offsets in SCHEMA
-// order, so any disagreement with the declaration order above stops the
-// sequence increasing and fails the build.
+// The wire schema, generated from the field list rather than kept parallel to it.
+// The binding builds its ctypes struct from `name:tag` in this order and checks
+// sizeof -- which cannot see two same-type fields swapped, and 8 of the 22 are
+// bare pointers. So the static_asserts below take the offsets in SCHEMA order:
+// any disagreement with the declaration order stops the sequence increasing.
 #define MORI_EP_ARGS_FIELDS(X) \
   X(window, "u64")             \
   X(offTokOff, "u64")          \
@@ -273,11 +263,8 @@ inline std::string Describe(const EpCfg& c) {
 
 // ---------------------------------------------------------------------------
 // Wire schema + generic apply, driven by the same VisitFields walk Render uses.
-//
-// Deliberately Ep-prefixed rather than overloading combine's EmitSchema /
-// ApplyFields: those live in this same namespace, and an unqualified call with
-// an Ep type would pick them up by ADL. Two kernels sharing a namespace should
-// not have to reason about which overload set wins.
+// Ep-prefixed rather than overloading combine's EmitSchema / ApplyFields: those
+// share this namespace, so an unqualified call would find them by ADL.
 // ---------------------------------------------------------------------------
 template <typename T>
 inline void EpEmitSchema(mori::jit::v2::SchemaBuilder& sb, const std::string& name, const T& v) {
@@ -285,8 +272,7 @@ inline void EpEmitSchema(mori::jit::v2::SchemaBuilder& sb, const std::string& na
   using mori::jit::v2::WireValue;
   sb.Add(name, WireTag(v), WireValue(v));
 }
-// Apply named request values onto a struct. EpRequest is all scalars, so this is
-// one flat walk -- no nested-aggregate recursion to arrange.
+// Apply named request values onto a struct. EpRequest is all scalars: one flat walk.
 template <typename T, typename Has, typename Get>
 inline void EpApplyFields(T& dst, const std::string& prefix, const Has& has, const Get& get) {
   using mori::jit::v2::WireAssign;
@@ -319,29 +305,24 @@ constexpr int EpCombineSharedBytes(const EpCfg& c) {
 
 constexpr int EpTokenBytes(const EpCfg& c) { return c.hiddenDim * EpElemSize(c.dtype); }
 
-// gfx1250 launch LDS. Dispatch stages one hidden-dim token tile per warp through
-// the TDM engine; combine reserves the whole budget (its PULL/QUAD tiles size
-// against it at runtime). EpCombine1250xLdsBudget must match MORI_COMB_LDS_BUDGET
-// in ep_intranode_1250x.hpp.
+// gfx1250 launch LDS. Dispatch stages one token tile per warp through the TDM
+// engine; combine reserves the whole budget and sizes its tiles at runtime.
+// EpCombine1250xLdsBudget must match MORI_COMB_LDS_BUDGET in ep_intranode_1250x.hpp.
 constexpr int EpCombine1250xLdsBudget = 327680;
 constexpr int EpDispatch1250xLdsBytes(const EpCfg& c) {
   return c.warpPerBlock * c.hiddenDim * EpElemSize(c.dtype);
 }
 
 // A Cfg that cannot launch is a host-side error, not a kernel that misbehaves.
+// rank is not checked: it is a launch argument, so the op layer owns that bound.
 constexpr bool EpCfgIsValid(const EpCfg& c) {
-  // rank is not checked here any more -- it is a launch argument, so the op
-  // layer owns that bound (it is the rank it was constructed for).
   return c.worldSize > 0 && c.hiddenDim > 0 && c.maxTokPerRank > 0 && c.numExpertPerToken > 0 &&
          c.numExpertPerRank > 0 && c.blockNum > 0 && (c.waveSize == 32 || c.waveSize == 64) &&
          c.warpPerBlock > 0 && EpBlockThreads(c) <= 1024 &&
-         // The recv capacity must cover the worst case. The dispatch slot
-         // counter is unbounded on the device (v1 asserted, which NDEBUG strips
-         // anyway), and because EpMaxRecv is ALSO the flat-index stride, an
-         // overflow does not just overrun the region -- it re-encodes to the
-         // next peer and combine folds in a stranger's token. Reject the
-         // under-sized cap at construction instead: dropping tokens is a
-         // feature this port does not implement.
+         // The recv capacity must cover the worst case: the device slot counter is
+         // unbounded, and since EpMaxRecv is also the flat-index stride an overflow
+         // re-encodes to the next peer and combine folds in a stranger's token.
+         // Token dropping is not implemented, so reject the cap at construction.
          EpMaxRecv(c) >= c.worldSize * c.maxTokPerRank &&
          // The dedup ballot and the grid-barrier peer loop both assume one lane
          // per peer / per top-k slot within a single wavefront.

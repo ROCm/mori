@@ -159,25 +159,22 @@ jobs:
 
       - name: Run JIT v2 C++ tests + host/device split guard
         run: |
-          # Registered by tests/cpp/jit/CMakeLists.txt but selected by nothing until
-          # now, so the whole C++ JIT framework was shipping untested. Neither needs a
-          # GPU peer: jit_core exercises render/cache/schema, and the guard only checks
-          # that the Cfg headers still compile without hipcc.
+          # Registered by tests/cpp/jit/CMakeLists.txt but selected by no job before
+          # this one. Neither needs a GPU peer: jit_core exercises render/cache/schema,
+          # the guard only checks the Cfg headers still compile without hipcc.
           $CT exec $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE/build && \
             timeout 600 ctest --output-on-failure -R '^jit_'"
 
       - name: Run JIT v2 Python binding tests (1 rank, outside the repo)
         run: |
-          # 18 tests over the ctypes/C-ABI seam -- schema-vs-sizeof, request coercion,
-          # unknown-field rejection. Single rank on purpose: EpDispatchPlan(world_size=1)
-          # needs no communicator, which is what makes this cheap enough to always run.
+          # The ctypes/C-ABI seam: schema-vs-sizeof, request coercion, unknown-field
+          # rejection. Single rank -- EpDispatchPlan(world_size=1) needs no communicator.
           #
-          # Run from /tmp, not the checkout, and that is the point: building a plan
-          # needs libmori_jit.so, libmori_ops_v2.so and the v2 kernel sources, and from
-          # a repo cwd every one of those resolves out of build/ and src/ even when the
-          # INSTALL ships none of them. Both halves of exactly that bug were live until
-          # this commit's siblings. Outside the repo only the packaged copies can answer.
+          # Run from /tmp rather than the checkout, and that is the point: a plan needs
+          # libmori_jit.so, libmori_ops_v2.so and the v2 kernel sources, all of which
+          # resolve out of build/ and src/ from a repo cwd even when the install ships
+          # none of them. Outside the repo only the packaged copies can answer.
           $CT exec $CONTAINER bash -c "\
             cd /tmp && \
             timeout 600 python -m pytest \
@@ -191,14 +188,10 @@ jobs:
 
       - name: Run ops-v2 HIP backend (EP8, 8 ranks)
         run: |
-          # The step above drives the FlyDSL backend; nothing covered the HIP one. Both
-          # are worth running because they are separate kernels behind one op: test_op
-          # checks the op layer against the HIP kernels, and the parity test then
-          # compares the two backends element for element on the same input.
-          # test_op.py reports per-case PASS/FAIL and does not set a non-zero exit
-          # code for a failed CHECK, so grep the output as well as the status -- and
-          # treat "no PASS at all" as a failure, or a run that died before the first
-          # case would read as green.
+          # The step above drives the FlyDSL backend; this one drives the HIP kernels
+          # behind the same op. test_op.py reports per-case PASS/FAIL and does not exit
+          # non-zero on a failed CHECK, so grep the output too -- and treat "no PASS at
+          # all" as failure, or a run that died before the first case reads as green.
           $CT exec -e MORI_V2_KERNEL_BACKEND=hip $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
             out=\$(timeout 900 torchrun --standalone --nproc_per_node=8 test_op.py 2>&1) || \
