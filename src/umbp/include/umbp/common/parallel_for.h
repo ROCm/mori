@@ -21,21 +21,38 @@
 // SOFTWARE.
 #pragma once
 
-#include <memory>
-
-#include "umbp/common/config.h"
-#include "umbp/local/tiers/ssd_tier.h"
-#include "umbp/local/tiers/tier_backend.h"
+#include <algorithm>
+#include <atomic>
+#include <cstddef>
+#include <thread>
+#include <vector>
 
 namespace mori::umbp {
 
-// Build the `file`-backend SSD tier: one storage directory yields a plain
-// SSDTier, several (comma-separated, one mount per drive) a ShardedSsdTier.
-// capacity_bytes is the total budget, split evenly across the directories.
-// Both PeerSsdManager and LocalStorageManager go through here, so multi-drive
-// behaves identically in either deployment.  SPDK backends are unaffected —
-// they get multi-device support from SpdkEnv's RAID0 one level down.
-std::unique_ptr<TierBackend> MakeFileSsdBackend(
-    const UMBPSsdConfig& ssd_config, SSDAccessMode access_mode = SSDAccessMode::ReadWrite);
+// Run fn(i) for i in [0, n), on up to `threads` workers, work-stealing so an
+// uneven index cost cannot strand a worker.  Each index runs exactly once, so
+// fn may write result[i] without locking.  The caller's thread takes part and
+// the call returns only once every index is done.
+template <typename Fn>
+void ParallelFor(size_t n, int threads, Fn&& fn) {
+  if (n == 0) return;
+  const size_t workers = std::min<size_t>(n, static_cast<size_t>(std::max(threads, 1)));
+  if (workers <= 1) {
+    for (size_t i = 0; i < n; ++i) fn(i);
+    return;
+  }
+  std::atomic<size_t> next{0};
+  auto worker = [&]() {
+    for (size_t i = next.fetch_add(1, std::memory_order_relaxed); i < n;
+         i = next.fetch_add(1, std::memory_order_relaxed)) {
+      fn(i);
+    }
+  };
+  std::vector<std::thread> pool;
+  pool.reserve(workers - 1);
+  for (size_t w = 0; w + 1 < workers; ++w) pool.emplace_back(worker);
+  worker();
+  for (auto& t : pool) t.join();
+}
 
 }  // namespace mori::umbp

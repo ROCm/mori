@@ -31,13 +31,10 @@
 
 namespace mori::umbp {
 
-// Heap buffer whose base address is aligned to segment::kRecordAlign.
-//
-// O_DIRECT requires the user buffer, the file offset and the length to all be
-// alignment multiples; std::vector<char> only guarantees max_align_t (16 B), so
-// it cannot back a direct read or write.  Size is rounded up to the alignment as
-// well, which is what lets a caller hand the whole buffer to a direct I/O op
-// without a separate length check.
+// Heap buffer aligned to segment::kRecordAlign, with the size rounded up to the
+// same boundary.  O_DIRECT requires buffer address, file offset and length to all
+// be alignment multiples; std::vector<char> only guarantees max_align_t (16 B),
+// so it cannot back a direct read or write.
 class AlignedBuffer {
  public:
   AlignedBuffer() = default;

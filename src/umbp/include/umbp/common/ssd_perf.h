@@ -21,25 +21,12 @@
 // SOFTWARE.
 #pragma once
 
-// Stage-by-stage timing for the SSD batch put/get path.
-//
-// Enabled by setting UMBP_SSD_TIMING (any non-empty value other than 0/false/off).
-// When off, every helper here compiles down to a single cached bool test and no
-// clock is read, so the instrumentation can stay in the hot path permanently.
-//
-// The breakdown is emitted at INFO level (module UMBP) at four layers, so a slow
-// batch can be attributed without a profiler:
-//
-//   [SsdPerf/tier]   one physical drive: index lookup | device IO | CRC verify
-//   [SsdPerf/shard]  the multi-drive fan-out: per-drive key counts and wall time
-//   [SsdPerf/peer]   PeerSsdManager: metadata passes vs. backend IO
-//   [SsdPerf/remote] PoolClient: prepare RPC | RDMA | lease release
-//
-// Every line reports keys, bytes, elapsed_ms and the implied GB/s for the stage
-// that moved the bytes, so the drive-count scaling question is answerable
-// directly from the logs.
+// Stage-by-stage timing for the SSD batch put/get path, enabled by UMBP_SSD_TIMING.
+// When off every helper is a cached bool test and no clock is read, so this can
+// stay in the hot path.  Emitted at INFO (module UMBP) as [SsdPerf/tier] (one
+// drive: lookup | IO | CRC), [SsdPerf/shard] (per-drive fan-out), [SsdPerf/peer]
+// and [SsdPerf/remote], each with keys, bytes, ms and the implied GB/s.
 
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -50,8 +37,7 @@ namespace mori::umbp::ssdperf {
 using Clock = std::chrono::steady_clock;
 using TimePoint = Clock::time_point;
 
-// Cached once: the env is read on first use and never re-read, so the check on
-// the hot path is a relaxed load of a bool.
+// Env is read once; the hot-path check is a load of a cached bool.
 inline bool Enabled() {
   static const bool enabled = [] {
     const char* v = std::getenv("UMBP_SSD_TIMING");
@@ -62,8 +48,7 @@ inline bool Enabled() {
   return enabled;
 }
 
-// Clock reads are skipped entirely when timing is off; the returned value is
-// then meaningless but is only ever consumed inside an Enabled() branch.
+// Meaningless when timing is off, but only ever consumed inside an Enabled() branch.
 inline TimePoint Now() { return Enabled() ? Clock::now() : TimePoint{}; }
 
 inline double MsBetween(TimePoint a, TimePoint b) {
@@ -72,32 +57,13 @@ inline double MsBetween(TimePoint a, TimePoint b) {
 
 inline double MsSince(TimePoint a) { return Enabled() ? MsBetween(a, Clock::now()) : 0.0; }
 
-// GB/s (10^9) for `bytes` moved in `ms`; 0 when no time elapsed, so a log line
-// never prints inf.
+// Guarded against a zero denominator so a log line never prints inf.
 inline double GbPerSec(uint64_t bytes, double ms) {
   return ms > 0.0 ? static_cast<double>(bytes) / (ms * 1.0e6) : 0.0;
 }
 
-// Percentage of `total_ms` taken by `part_ms`, guarded against a zero total.
 inline double Pct(double part_ms, double total_ms) {
   return total_ms > 0.0 ? part_ms * 100.0 / total_ms : 0.0;
 }
-
-// Accumulates elapsed time across repeated start/stop pairs (used where a stage
-// runs once per key inside a loop).  No-op when timing is disabled.
-class Accumulator {
- public:
-  void Start() {
-    if (Enabled()) start_ = Clock::now();
-  }
-  void Stop() {
-    if (Enabled()) ms_ += MsBetween(start_, Clock::now());
-  }
-  double ms() const { return ms_; }
-
- private:
-  TimePoint start_{};
-  double ms_ = 0.0;
-};
 
 }  // namespace mori::umbp::ssdperf

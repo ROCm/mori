@@ -35,44 +35,13 @@
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/aligned_buffer.h"
+#include "umbp/common/parallel_for.h"
 #include "umbp/common/ssd_perf.h"
 #include "umbp/local/tiers/segment/segment_format.h"
 
 namespace fs = std::filesystem;
 
 namespace mori::umbp {
-
-namespace {
-
-// Run fn(i) for i in [0, n), spreading contiguous ranges over `threads` workers
-// and running the last range inline.  Used for the tier's CPU-bound phases
-// (checksum verify, record assembly), which touch disjoint indices and need no
-// locking.  Falls back to a plain loop when there is too little work to be worth
-// a thread hand-off.
-template <typename Fn>
-void ParallelFor(size_t n, int threads, Fn&& fn) {
-  if (n == 0) return;
-  const size_t workers = std::min<size_t>(n, static_cast<size_t>(std::max(threads, 1)));
-  if (workers <= 1) {
-    for (size_t i = 0; i < n; ++i) fn(i);
-    return;
-  }
-  const size_t chunk = (n + workers - 1) / workers;
-  std::vector<std::thread> pool;
-  pool.reserve(workers - 1);
-  for (size_t w = 0; w + 1 < workers; ++w) {
-    const size_t lo = w * chunk;
-    const size_t hi = std::min(n, lo + chunk);
-    if (lo >= hi) break;
-    pool.emplace_back([&fn, lo, hi]() {
-      for (size_t i = lo; i < hi; ++i) fn(i);
-    });
-  }
-  for (size_t i = (workers - 1) * chunk; i < n; ++i) fn(i);
-  for (auto& t : pool) t.join();
-}
-
-}  // namespace
 
 SSDTier::SSDTier(const std::string& dir, size_t capacity, const UMBPSsdConfig& ssd_config,
                  SSDAccessMode access_mode)

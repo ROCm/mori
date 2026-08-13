@@ -33,29 +33,22 @@
 
 namespace mori::umbp {
 
-// Fan one logical SSD tier across N independent drives (one sub-backend per
-// mount point / device), so a batch of keys is written to and read from every
-// drive at once and the tier delivers the drives' AGGREGATE bandwidth.
+// Fan one logical SSD tier across N drives (one sub-backend per mount point), so
+// a batch is written to and read from every drive at once for their AGGREGATE
+// bandwidth.
 //
-// Why this and not just SPDK RAID0?  RAID0 (SpdkEnv builds one when
-// UMBP_SPDK_NVME_PCI names >1 controller) stripes at the block layer and needs
-// the whole set behind SPDK, uniform drives, and a device-wide rebuild to
-// change membership.  ShardedSsdTier sits one level up: it works with the plain
-// `file` backend over ordinary mounts, tolerates differently-sized drives
-// (placement is capacity-aware), and keeps each key whole on one drive so a
-// single-key read costs exactly one drive's IO instead of a strip-split.  The
-// two compose — a shard may itself be a RAID0 bdev.
+// Not SPDK RAID0: that stripes at the block layer and needs the whole set behind
+// SPDK, uniform drives, and a device-wide rebuild to change membership.  This
+// sits one level up - works over ordinary mounts, tolerates differently-sized
+// drives, and keeps each key whole on one drive so a single-key read costs one
+// drive's IO instead of a strip-split.  The two compose; a shard may be a RAID0.
 //
-// Placement is *balanced*, not hashed: each write goes to the shard with the
-// most free space, which degenerates to exact round-robin for uniform-size
-// values on uniform drives (the 1000-keys-over-2-drives → 500/500 case) and
-// still fills correctly when drives or values differ in size.  The chosen shard
-// is recorded in `key_shard_`, so a re-put of a live key always lands back on
-// its own shard (never duplicated across two drives).
+// Placement is balanced, not hashed: each write goes to the shard with the most
+// free space, degenerating to round-robin for uniform values on uniform drives.
+// key_shard_ records the choice, so a re-put lands back on the same drive.
 //
-// Concurrency: `key_shard_` is guarded by a shared_mutex (read-mostly on the
-// get path).  Sub-backends are internally synchronized and are called WITHOUT
-// this class's lock held, so shard IO runs fully in parallel.
+// Concurrency: key_shard_ is guarded by a shared_mutex; sub-backends are called
+// WITHOUT it held, so shard IO runs fully in parallel.
 class ShardedSsdTier : public TierBackend {
  public:
   // @p shards must be non-empty; every element non-null.  @p io_threads caps

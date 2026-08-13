@@ -78,12 +78,10 @@ struct UMBPDurabilityConfig {
 
 struct UMBPSsdConfig {
   bool enabled = true;
-  // One or more storage directories, comma-separated — the same convention as
-  // spdk_nvme_pci_addr.  Naming >1 directory (normally one mount point per
-  // physical drive) fans the tier across them via ShardedSsdTier, so a batch of
-  // keys is written to and read from every drive concurrently and the tier
-  // delivers their aggregate bandwidth.  capacity_bytes is the TOTAL across all
-  // directories and is split evenly among them.
+  // Comma-separated (same convention as spdk_nvme_pci_addr).  Naming >1 directory
+  // — normally one mount point per drive — fans the tier across them via
+  // ShardedSsdTier for their aggregate bandwidth.  capacity_bytes is the TOTAL,
+  // split evenly among the directories.
   std::string storage_dir = "/tmp/umbp_ssd";
   size_t capacity_bytes = 32ULL * 1024 * 1024 * 1024;
   UMBPSsdLayoutMode layout_mode = UMBPSsdLayoutMode::SegmentedLog;
@@ -91,59 +89,35 @@ struct UMBPSsdConfig {
   UMBPIoConfig io;
   UMBPDurabilityConfig durability;
 
-  // Worker threads used by the sharded tier's batch paths.  0 = one per shard,
-  // which is what saturates N drives.  Ignored with a single directory.
+  // Threads for the sharded tier's batch paths, i.e. ACROSS drives.  0 = one per
+  // shard, which is what saturates N drives.  Ignored with a single directory.
   int shard_io_threads = 0;
 
-  // Worker threads for the CPU-bound phases *inside* one SSDTier: checksum
-  // verification on read, checksum + record assembly on write.  Distinct from
-  // shard_io_threads, which fans out across drives — this fans out within a
-  // single drive's batch and is what makes a 1-drive SSD tier comparable to the
-  // DRAM tier, whose read_threads_/write_threads_ default to 4.  Matching that
-  // default keeps a DRAM-vs-SSD comparison from silently measuring 4 threads
-  // against 1.
+  // Threads for the CPU-bound phases WITHIN one SSDTier (CRC verify on read, CRC
+  // + record assembly on write).  Defaults to 4 to match the DRAM tier, so a
+  // DRAM-vs-SSD comparison is not silently 4 threads against 1.
   int tier_io_threads = 4;
 
-  // Bypass the page cache (O_DIRECT) for all segment I/O.  ON by default.
-  //
-  // The tier is itself a cache, so buffered I/O gives it a second, unmanaged
-  // DRAM cache underneath: reads are served from RAM at many times device
-  // bandwidth, the node reports DRAM it is actually consuming as free, and any
-  // measurement of drive behaviour is meaningless.  That second cache is not
-  // free either — it evicts host memory the DRAM tier and the engine are also
-  // competing for, which is why the default is to do without it rather than to
-  // treat it as a bonus.  With this on, reported tier bandwidth is the device's.
-  //
-  // Requires a filesystem that supports O_DIRECT (ext4/xfs do; tmpfs and
-  // overlayfs do not) — the tier probes at startup and falls back to buffered
-  // with a warning rather than failing to come up, so a default of `true` is
-  // safe on any filesystem.  It pairs with the io.backend default (io_uring):
-  // forcing POSIX alongside direct I/O gives one blocking pread per key and
-  // warns, because that combination is queue-depth 1.
-  //
-  // Set to false to deliberately measure or exploit the page cache.
+  // Bypass the page cache (O_DIRECT).  On by default: the tier is itself a cache,
+  // so buffered I/O adds a second unmanaged DRAM cache that steals host memory
+  // from the DRAM tier and makes any drive measurement meaningless (a run can be
+  // served entirely from RAM, moving zero bytes to the device).  Safe as a default
+  // because the tier probes O_DIRECT at startup and falls back to buffered with a
+  // warning on tmpfs/overlayfs.  Set false to deliberately exploit the page cache.
   bool direct_io = true;
 
-  // Coalesce concurrent reads of the same key ("single flight").  When several
-  // requesters ask for one key while a device read is already outstanding, only
-  // the first touches the drive; the rest are served by memcpy from its buffer.
-  //
-  // This exists for MLA + TP, where every attention-TP rank GETs a
-  // byte-identical key, so one logical page is read tp_size times over.  MHA
-  // keys carry a per-rank suffix and never collide, so this is a no-op there.
-  // NOTE: UMBP_SSD_SINGLE_FLIGHT only reaches configs built by
-  // UMBPConfig::FromEnvironment(), i.e. the standalone server binary.  sglang's
-  // UMBPStore constructs UMBPConfig directly, so turning this off there goes
-  // through the pybind def_readwrite plus an extra_config allow-list/parser
-  // entry in umbp_store.py.  The [SsdPerf/peer] GET line reports merged= and
-  // merged_total=, which is what actually tells you whether it fired.
+  // Coalesce concurrent reads of the same key: only the first touches the drive,
+  // the rest are served by memcpy from its buffer.  For MLA + TP, where every
+  // attention-TP rank GETs a byte-identical key; MHA keys carry a per-rank suffix
+  // and never collide, so it is a no-op there.  NOTE: UMBP_SSD_SINGLE_FLIGHT only
+  // reaches configs built by FromEnvironment() (the standalone server); sglang
+  // constructs UMBPConfig directly and needs the pybind field.  [SsdPerf/peer]
+  // reports merged=/merged_total=, which is what tells you it fired.
   bool single_flight_reads = true;
 
-  // Compute checksums on write and verify them on read.  On by default; turning
-  // it off is for isolating how much of the SSD path's cost is integrity work
-  // rather than storage, since the DRAM tier does no checksumming at all and an
-  // unqualified DRAM-vs-SSD comparison otherwise conflates the two.  Records
-  // written with it off are marked kFlagNoCrc and stay readable either way.
+  // Checksum on write, verify on read.  Turning it off isolates how much of the
+  // SSD path's cost is integrity work (the DRAM tier does none).  Records written
+  // with it off are marked kFlagNoCrc and stay readable either way.
   bool verify_crc = true;
 
   // Split storage_dir on ',' — one entry per drive.  Always returns at least

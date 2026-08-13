@@ -47,19 +47,15 @@ struct SsdReadOutcome {
   size_t size = 0;
 };
 
-// Peer-side owner of the local SSD tier in the master-as-advisor design.
-// Single responsibility: manage one SSD TierBackend + the key->SSD-location
-// map + capacity + the owned-location event outbox + the read-prepare and
-// local-eviction paths.  It deliberately reuses ONLY the low-level TierBackend
-// (SSDTier); it must NOT pull in LocalStorageManager / LocalBlockIndex (which
-// carry their own DRAM tier + demote/promote) — peer DRAM is owned by
-// PageBackend and two DRAM concepts would scramble ownership.
+// Peer-side owner of the local SSD tier: one SSD TierBackend + the
+// key->SSD-location map, capacity, the owned-location event outbox, and the
+// read-prepare and local-eviction paths.  Reached from the distributed data
+// plane through SsdBackend : MediumBackend, which forwards to it.
 //
-// Dormant: unwired from the distributed data plane (see
-// design-backend-agnostic-refactor.md Phase 0). No longer implements
-// OwnedLocationSource — that wiring is exactly the coupling Phase 0 removes —
-// but keeps the same-shaped DrainPendingEvents / SnapshotOwnedKeys methods so
-// a future SsdBackend : MediumBackend adapter can forward to them directly.
+// It deliberately reuses ONLY the low-level TierBackend (SSDTier); it must NOT
+// pull in LocalStorageManager / LocalBlockIndex, which carry their own DRAM
+// tier + demote/promote — peer DRAM is owned by PageBackend, and two DRAM
+// concepts would scramble ownership.
 class PeerSsdManager {
  public:
   explicit PeerSsdManager(const PeerSsdConfig& cfg);

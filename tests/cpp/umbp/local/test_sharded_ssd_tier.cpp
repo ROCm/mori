@@ -25,6 +25,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -41,9 +42,7 @@ std::string MakeDirs(const std::string& stem, int n) {
   std::string joined;
   for (int i = 0; i < n; ++i) {
     const std::string dir = "/tmp/umbp_test_" + stem + "_d" + std::to_string(i);
-    std::string cmd = "rm -rf " + dir;
-    if (system(cmd.c_str()) != 0) { /* fresh tree either way */
-    }
+    std::filesystem::remove_all(dir);
     if (!joined.empty()) joined += ',';
     joined += dir;
   }

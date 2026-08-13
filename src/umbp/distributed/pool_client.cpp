@@ -42,6 +42,7 @@
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/env_time.h"
+#include "umbp/common/parallel_for.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/peer/backend/hbm_backend.h"
 #include "umbp/distributed/peer/backend/page_backend.h"
@@ -134,25 +135,6 @@ inline int LocalCopyThreads(const char* env_name) {
   if (hc > 0 && t > static_cast<int>(hc)) t = static_cast<int>(hc);
   if (t < 1) t = 1;
   return t;
-}
-
-template <typename Fn>
-inline void LocalParallelFor(size_t n, int num_threads, Fn&& fn) {
-  if (n == 0) return;
-  if (num_threads > static_cast<int>(n)) num_threads = static_cast<int>(n);
-  if (num_threads <= 1) {
-    for (size_t i = 0; i < n; ++i) fn(i);
-    return;
-  }
-  std::atomic<size_t> next{0};
-  auto worker = [&]() {
-    size_t i;
-    while ((i = next.fetch_add(1)) < n) fn(i);
-  };
-  std::vector<std::thread> pool;
-  pool.reserve(num_threads);
-  for (int t = 0; t < num_threads; ++t) pool.emplace_back(worker);
-  for (auto& th : pool) th.join();
 }
 
 inline uint64_t LogicalPageBytes(size_t i, size_t num_pages, uint64_t page_size,
@@ -902,7 +884,7 @@ void PoolClient::ExecuteBatchPutPlan(const BatchPutPlan& plan,
     if (local.empty()) return;
     const int nthr = LocalCopyThreads("UMBP_DRAM_WRITE_THREADS");
     const auto t0 = std::chrono::steady_clock::now();
-    LocalParallelFor(local.size(), nthr, [&](size_t k) {
+    ParallelFor(local.size(), nthr, [&](size_t k) {
       const auto& item = local[k];
       switch (ExecuteLocalPut(*item.key, item.src, item.size, item.route.tier)) {
         case PutAttemptOutcome::kSuccess:
@@ -1390,7 +1372,7 @@ void PoolClient::ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector
     const int nthr = LocalCopyThreads("UMBP_DRAM_READ_THREADS");
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<char> ok(idx.size(), 0);
-    LocalParallelFor(idx.size(), nthr, [&](size_t k) {
+    ParallelFor(idx.size(), nthr, [&](size_t k) {
       const size_t i = idx[k];
       if (ExecuteLocalGet(keys[i], const_cast<void*>(dsts[i]), sizes[i]) ==
           GetAttemptOutcome::kSuccess) {

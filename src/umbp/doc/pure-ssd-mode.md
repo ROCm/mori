@@ -1,9 +1,5 @@
 # Pure-SSD mode and multi-drive SSD tiers
 
-> New to this? [pure-ssd-multi-drive-explained.md](pure-ssd-multi-drive-explained.md)
-> covers the same mechanisms — multi-drive sharding, same-key single-flight,
-> and CPU/thread contention — without assuming storage or RDMA background.
-
 Run a UMBP node with **no host-DRAM tier**, SSD carrying the whole cache, with
 one node's SSD tier spanning **several drives** at once.
 
@@ -199,6 +195,27 @@ for HiCache's L3 path to initialize, but `random` routing skips any node that
 | Reads keep missing after killing/relaunching a node several times | Master registry doesn't expire dead clients — stale entries stay capacity-weighted and `random` can still pick them. Restart `umbp_master` along with every engine/worker whenever node topology (count, capacity, drives) changes |
 | Near-100% misses (`NO_SLOT`/lease-expired in the log) right after adding capacity per node | Staging slots didn't scale with the new concurrent load. `ssd_staging_buffer_slots` needs to grow with how many concurrent callers can hit one node, not just with data volume |
 | Resend right after a write misses instead of hitting | Write-through acks drain asynchronously; a flush/resend that lands before the SSD write actually completes evicts the key with no L3 trace. Give it a moment (scales with value size) before flushing/resending |
+
+## Measured: L1 vs L2 vs L3
+
+sglang HiCache, Kimi-K2.6-MXFP4, TP8, one fixed-length request per round. "Request
+length" is the **prefix**; every request appends and generates exactly 1 token on
+top, so the number **is** TTFT. Each tier isolated by forcing a resend to hit only
+that tier, verified against `/metrics` per-tier hit counters rather than timing.
+8 physical drives / 4 shards, 2 local + 6 remote across 3 standalone workers on a
+second node. The engine's own SSD capacity was shrunk to 1 MB so it can never be
+capacity-selected as a put target and leak reads back to its own idle disk.
+
+| Request length | Cold recompute | L1 hit | L2 hit | L3 hit |
+|---|---|---|---|---|
+| 4K | ≈0.18s | ≈0.10s | ≈0.20s | ≈0.14s |
+| 16K | ≈0.73s | ≈0.12s | ≈0.20s | ≈0.20s |
+| 32K | ≈1.42s | ≈0.14s | ≈0.21s | ≈0.27s |
+| 128K | ≈7.7s | ≈0.29s | ≈0.45s | ≈0.84s |
+
+L1 always wins. L3 closes almost all the way to L2 at small sizes — beating it at
+4K — but the gap widens with length, since an L3 hit still pays an SSD round trip.
+L3 is ~1.3x faster than cold recompute at 4K and ~9x by 128K.
 
 ## Notes
 
