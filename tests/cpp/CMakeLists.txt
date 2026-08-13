@@ -101,3 +101,6 @@ endif()
 if(BUILD_METRICS)
   add_subdirectory(metrics)
 endif()
+
+# JIT v2 — always built: mori_jit is host-only and needs no hipcc.
+add_subdirectory(jit)
