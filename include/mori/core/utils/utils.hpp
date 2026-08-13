@@ -38,7 +38,7 @@
 #define warpSize 32
 #endif
 #endif
-#endif   // __HIPCC__ || __CUDACC__
+#endif  // __HIPCC__ || __CUDACC__
 
 #if defined(__GNUC__) || defined(__clang__)
 #define MORI_LIKELY(expr) __builtin_expect(!!(expr), 1)
