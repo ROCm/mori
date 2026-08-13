@@ -55,6 +55,9 @@ void ProxyThread::DrainCq(ProxyQpHandle& qph) {
             struct { uint64_t addr; uint64_t val; } payload;
             memcpy(&payload, reinterpret_cast<char*>(qph.recv_buf) + recv_idx * 64, 16);
             volatile uint64_t* target = reinterpret_cast<volatile uint64_t*>(payload.addr);
+            fprintf(stderr, "[PROXY-RECV] gpu_id=%d target=%p val=%lu byte_len=%u qi=%u\n",
+                    gpu_id_, (void*)target, payload.val, wc[i].byte_len,
+                    qph.qp ? qph.qp->qp_num : 0);
             __atomic_fetch_add(target, payload.val, __ATOMIC_SEQ_CST);
             asm volatile("clflush (%0)" :: "r"(target) : "memory");
             asm volatile("sfence" ::: "memory");
