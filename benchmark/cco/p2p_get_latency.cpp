@@ -22,8 +22,9 @@
 
 // CCO p2p get latency — PE 0 pulls from PE 1, one op per iteration.
 //
-//   -T lsa   : single flat-VA load of the whole buffer per iteration.
-//   -T ibgda : single RDMA read + flush per iteration.
+//   -t lsa   : single flat-VA load of the whole buffer per iteration.
+//   -t sdma  : single copy-engine get + completion wait.
+//   -t ibgda : single RDMA read + flush per iteration.
 
 #include <cstdio>
 #include <cstdlib>

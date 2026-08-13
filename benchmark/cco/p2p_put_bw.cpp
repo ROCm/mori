@@ -22,11 +22,13 @@
 
 // CCO p2p put bandwidth — unidirectional, PE 0 → PE 1.
 //
-//   -T lsa   : intra-node flat-VA store loop (no NIC).
-//   -T ibgda : cross-node one-sided RDMA write via ccoGda<PrvdType>.
+//   -t lsa   : intra-node flat-VA store loop (no NIC).
+//   -t sdma  : intra-node copy engine via ccoSdma.
+//   -t ibgda : cross-node one-sided RDMA write via ccoGda<PrvdType>.
 //
-// The buffer is split into `nblocks` chunks (one per block); scope controls
-// the per-chunk cooperation granularity (block/warp/thread).
+// lsa/ibgda split the buffer into `nblocks` chunks (one per block); scope sets
+// the per-chunk cooperation granularity (block/warp/thread). sdma splits over
+// issue units instead -- see launch_sdma.
 
 #include <cstdio>
 #include <cstdlib>
