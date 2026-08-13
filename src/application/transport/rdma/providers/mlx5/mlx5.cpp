@@ -565,7 +565,7 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
     GidSelectionResult gidSel = AutoSelectGidIndex(context, config.portId, gidPortAttr, config.gidIdx);
     memcpy(endpoint.handle.eth.gid, gidSel.gid.raw, sizeof(endpoint.handle.eth.gid));
     endpoint.handle.eth.gidIdx = gidSel.gidIdx;
-    endpoint.vendorId = RdmaDeviceVendorId::Mlx5;
+    endpoint.vendorId = RdmaDeviceVendorId::Mellanox;
     endpoint.ibvHandle.qp = plainQp;
     endpoint.ibvHandle.cq = plainCq;
 
