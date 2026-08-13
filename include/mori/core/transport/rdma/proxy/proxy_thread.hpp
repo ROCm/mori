@@ -27,6 +27,7 @@ struct ProxyQpHandle {
   void* recv_buf{nullptr};
   uint32_t recv_lkey{0};
   uint32_t recv_count{0};
+  bool use_native_atomics{false};
 };
 
 class ProxyThread {

@@ -130,13 +130,23 @@ bool ProxyThread::BuildWr(volatile ProxyCmd* cmd, ProxyQpHandle& qph,
     }
     case PROXY_ATOMIC_FETCH_ADD:
     case PROXY_ATOMIC_CMP_SWAP: {
-      ibuf.data[0] = cmd->dst_addr;
-      ibuf.data[1] = cmd->atomic_arg;
-      sge.addr = reinterpret_cast<uintptr_t>(&ibuf.data[0]);
-      sge.length = 16;
-      wr.opcode = IBV_WR_SEND_WITH_IMM;
-      wr.imm_data = htonl(0xA70C);
-      wr.send_flags |= IBV_SEND_FENCE | IBV_SEND_INLINE;
+      if (qph.use_native_atomics) {
+        wr.opcode = IBV_WR_ATOMIC_FETCH_AND_ADD;
+        wr.wr.atomic.remote_addr = cmd->dst_addr;
+        wr.wr.atomic.rkey = (qph.rkey_override != 0) ? qph.rkey_override : cmd->rkey;
+        wr.wr.atomic.compare_add = cmd->atomic_arg;
+        sge.addr = cmd->src_addr;
+        sge.length = 8;
+        sge.lkey = cmd->lkey;
+      } else {
+        ibuf.data[0] = cmd->dst_addr;
+        ibuf.data[1] = cmd->atomic_arg;
+        sge.addr = reinterpret_cast<uintptr_t>(&ibuf.data[0]);
+        sge.length = 16;
+        wr.opcode = IBV_WR_SEND_WITH_IMM;
+        wr.imm_data = htonl(0xA70C);
+        wr.send_flags |= IBV_SEND_INLINE;
+      }
       break;
     }
     default:

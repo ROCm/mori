@@ -777,9 +777,10 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
           if (nicIdx < (int)perNicRkeys.size() && pe < (int)perNicRkeys[nicIdx].size()) {
             rkey = perNicRkeys[nicIdx][pe];
           }
+          bool nativeAtomics = (hostEndpoints[i].vendorId == application::RdmaDeviceVendorId::Mellanox);
           nicQps[i] = {hostEndpoints[i].ibvHandle.qp, hostEndpoints[i].ibvHandle.cq, lkey, rkey,
                        hostEndpoints[i].ibvHandle.recvBuf, hostEndpoints[i].ibvHandle.recvLkey,
-                       hostEndpoints[i].ibvHandle.recvCount};
+                       hostEndpoints[i].ibvHandle.recvCount, nativeAtomics};
           nicQpCount++;
         }
       }
