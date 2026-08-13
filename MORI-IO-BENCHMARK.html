@@ -270,6 +270,13 @@
 <li class="toctree-l3"><a class="reference internal" href="#fabric-cross-node-scale-up-ualink-super-node">Fabric (cross-node scale-up UALink super-node)</a></li>
 </ul>
 </li>
+<li class="toctree-l2"><a class="reference internal" href="#c-benchmark-nixlbench-matching">C++ Benchmark (nixlbench-matching)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#build">Build</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#run-two-nodes">Run (two nodes)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#sweep-modes">Sweep modes</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#differences-from-the-python-flags">Differences from the Python flags</a></li>
+</ul>
+</li>
 <li class="toctree-l2"><a class="reference internal" href="#benchmark-arguments">Benchmark Arguments</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#results-thor2-rdma-read">Results: Thor2 RDMA Read</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#results-thor2-rdma-write">Results: Thor2 RDMA Write</a><ul>
@@ -355,7 +362,19 @@
 <section id="table-of-contents">
 <h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading"></a></h2>
 <ul class="simple">
-<li><p><a class="reference internal" href="#benchmark-commands"><span class="xref myst">Benchmark Commands</span></a></p></li>
+<li><p><a class="reference internal" href="#benchmark-commands"><span class="xref myst">Benchmark Commands</span></a></p>
+<ul>
+<li><p><a class="reference internal" href="#fabric-cross-node-scale-up-ualink-super-node"><span class="xref myst">Fabric (cross-node scale-up UALink super-node)</span></a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#c-benchmark-nixlbench-matching"><span class="xref myst">C++ Benchmark (nixlbench-matching)</span></a></p>
+<ul>
+<li><p><a class="reference internal" href="#build"><span class="xref myst">Build</span></a></p></li>
+<li><p><a class="reference internal" href="#run-two-nodes"><span class="xref myst">Run (two nodes)</span></a></p></li>
+<li><p><a class="reference internal" href="#sweep-modes"><span class="xref myst">Sweep modes</span></a></p></li>
+<li><p><a class="reference internal" href="#differences-from-the-python-flags"><span class="xref myst">Differences from the Python flags</span></a></p></li>
+</ul>
+</li>
 <li><p><a class="reference internal" href="#benchmark-arguments"><span class="xref myst">Benchmark Arguments</span></a></p></li>
 <li><p><a class="reference internal" href="#results-thor2-rdma-read"><span class="xref myst">Results: Thor2 RDMA Read</span></a></p></li>
 <li><p><a class="reference internal" href="#results-thor2-rdma-write"><span class="xref myst">Results: Thor2 RDMA Write</span></a></p>
@@ -368,6 +387,15 @@
 <ul>
 <li><p><a class="reference internal" href="#write"><span class="xref myst">Write</span></a></p></li>
 <li><p><a class="reference internal" href="#read"><span class="xref myst">Read</span></a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#benchmark-tuning-guide"><span class="xref myst">Benchmark Tuning Guide</span></a></p>
+<ul>
+<li><p><a class="reference internal" href="#recommended-starting-config"><span class="xref myst">Recommended starting config</span></a></p></li>
+<li><p><a class="reference internal" href="#parameters-that-help"><span class="xref myst">Parameters that help</span></a></p></li>
+<li><p><a class="reference internal" href="#the-merged-wr-size-limit"><span class="xref myst">The merged-WR size limit</span></a></p></li>
+<li><p><a class="reference internal" href="#parameters-that-usually-do-not-help-or-can-hurt"><span class="xref myst">Parameters that usually do not help (or can hurt)</span></a></p></li>
+<li><p><a class="reference internal" href="#host-cpu-vs-gpu-memory"><span class="xref myst">Host (CPU) vs GPU memory</span></a></p></li>
 </ul>
 </li>
 </ul>
@@ -405,6 +433,208 @@ torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">
 <div><p>Requires ROCm ≥ 7.15 (HIP fabric VMM APIs). Only GPU memory is supported
 (<code class="docutils literal notranslate"><span class="pre">--mem-type</span> <span class="pre">gpu</span></code>). If the two nodes are not in the same vPOD, session creation
 fails fast with a clear error.</p>
+</div></blockquote>
+</section>
+</section>
+<section id="c-benchmark-nixlbench-matching">
+<h2>C++ Benchmark (nixlbench-matching)<a class="headerlink" href="#c-benchmark-nixlbench-matching" title="Link to this heading"></a></h2>
+<p>The commands above use the <strong>Python</strong> benchmark (<code class="docutils literal notranslate"><span class="pre">tests/python/io/benchmark.py</span></code>).
+There is also a native <strong>C++</strong> benchmark, <code class="docutils literal notranslate"><span class="pre">tests/cpp/io/bench_engine.cpp</span></code>, whose
+measurement loop is written to <strong>match <a class="reference external" href="https://github.com/ai-dynamo/nixl">nixlbench</a></strong>
+(NVIDIA NIXL’s <code class="docutils literal notranslate"><span class="pre">xferbench</span></code>) exactly, so MORI-IO and NIXL RDMA numbers are
+apples-to-apples on the same fabric. Use it when you want a head-to-head
+comparison against NIXL, or a benchmark with no Python-interpreter overhead in the
+measurement loop (which the Python bench pays per iteration, so it shows up most
+at small message sizes).</p>
+<p>What “nixl-matching” means here:</p>
+<ul class="simple">
+<li><p><strong>One whole-loop timer</strong> around the entire iteration loop (not a per-iteration
+sum), identical to nixlbench’s <code class="docutils literal notranslate"><span class="pre">total_timer</span></code>.</p></li>
+<li><p><strong>Latency is reported per single transfer</strong>: <code class="docutils literal notranslate"><span class="pre">total_us</span> <span class="pre">/</span> <span class="pre">(iters</span> <span class="pre">×</span> <span class="pre">batch)</span></code>,
+matching nixl’s <code class="docutils literal notranslate"><span class="pre">avg_latency</span> <span class="pre">=</span> <span class="pre">total_duration</span> <span class="pre">/</span> <span class="pre">(per_thread_iter</span> <span class="pre">×</span> <span class="pre">batch_size)</span></code>.</p></li>
+<li><p><strong>Bandwidth</strong> <code class="docutils literal notranslate"><span class="pre">=</span> <span class="pre">msg</span> <span class="pre">×</span> <span class="pre">batch</span> <span class="pre">×</span> <span class="pre">iters</span> <span class="pre">/</span> <span class="pre">1e9</span> <span class="pre">/</span> <span class="pre">(total_us</span> <span class="pre">/</span> <span class="pre">1e6)</span></code> (GB = 10⁹), same
+units as nixl.</p></li>
+<li><p><strong>Completion is always an inline spin-poll</strong> in the benchmark thread (mirroring
+nixl’s <code class="docutils literal notranslate"><span class="pre">getXferStatus</span></code> scan); there is no cv-blocking wait that would add wakeup
+latency and make numbers non-comparable.</p></li>
+<li><p><strong>Strict stop-and-wait</strong> (one request outstanding at a time, == nixl
+<code class="docutils literal notranslate"><span class="pre">--pipeline_depth</span> <span class="pre">1</span></code>): post one request, spin until it completes, then post the
+next.</p></li>
+<li><p><strong>Warmup</strong> iterations are excluded from timing (<code class="docutils literal notranslate"><span class="pre">--warmup-iters</span></code>, nixl
+<code class="docutils literal notranslate"><span class="pre">--warmup_iter</span></code>).</p></li>
+</ul>
+<section id="build">
+<h3>Build<a class="headerlink" href="#build" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">bench_engine</span></code> builds with the C++ tests (both options default <code class="docutils literal notranslate"><span class="pre">ON</span></code>):</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>/path/to/mori
+cmake<span class="w"> </span>-B<span class="w"> </span>build<span class="w"> </span>-DBUILD_IO<span class="o">=</span>ON<span class="w"> </span>-DBUILD_TESTS<span class="o">=</span>ON
+cmake<span class="w"> </span>--build<span class="w"> </span>build<span class="w"> </span>--target<span class="w"> </span>bench_engine<span class="w"> </span>-j
+<span class="c1"># binary: build/tests/cpp/bench_engine</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">bench_engine</span> <span class="pre">--help</span></code> prints the full flag list, grouped by rendezvous,
+workload, sweep, memory, and backend tuning.</p>
+<p>The MORI shared libraries must be discoverable at runtime — from the build tree
+above, or from <code class="docutils literal notranslate"><span class="pre">python/mori</span></code> after an editable install:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">LD_LIBRARY_PATH</span><span class="o">=</span><span class="nv">$PWD</span>/build/src/io:<span class="nv">$PWD</span>/build/src/application:<span class="nv">$LD_LIBRARY_PATH</span>
+<span class="c1"># or, after an editable install:</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">LD_LIBRARY_PATH</span><span class="o">=</span>/path/to/mori/python/mori:<span class="nv">$LD_LIBRARY_PATH</span>
+</pre></div>
+</div>
+</section>
+<section id="run-two-nodes">
+<h3>Run (two nodes)<a class="headerlink" href="#run-two-nodes" title="Link to this heading"></a></h3>
+<p>Unlike the Python benchmark (which uses <code class="docutils literal notranslate"><span class="pre">torchrun</span></code> for the out-of-band
+rendezvous), the C++ benchmark brings the two processes together over MORI’s own
+socket bootstrap — the same layer that starts multi-node CCO and SHMEM jobs, so
+connect and accept are retried over the <code class="docutils literal notranslate"><span class="pre">MORI_BOOTSTRAP_TIMEOUT</span></code> budget (seconds,
+default <code class="docutils literal notranslate"><span class="pre">300</span></code>). <strong>Rank 0 is the initiator</strong> and drives every transfer; <strong>rank 1
+is the target</strong> and only keeps its memory registered. Start the target first as a
+habit — rank 0 is the rendezvous root, so either order works and the two retry at
+each other, but the second process has to arrive within the budget.
+<code class="docutils literal notranslate"><span class="pre">--master-ip</span></code> is rank 0’s IP and is passed identically on both ranks; <code class="docutils literal notranslate"><span class="pre">--self-ip</span></code>
+is the address each rank advertises to its peer.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># On the TARGET node (rank 1) — start this FIRST:</span>
+<span class="nv">MORI_DISABLE_AUTO_XGMI</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>build/tests/cpp/bench_engine<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--rank<span class="w"> </span><span class="m">1</span><span class="w"> </span>--master-ip<span class="w"> </span><span class="m">10</span>.190.162.0<span class="w"> </span>--self-ip<span class="w"> </span><span class="m">10</span>.190.162.1<span class="w"> </span>--port<span class="w"> </span><span class="m">18515</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--op<span class="w"> </span>write<span class="w"> </span>--all<span class="w"> </span>--sweep-start<span class="w"> </span><span class="m">1048576</span><span class="w"> </span>--sweep-max<span class="w"> </span><span class="m">33554432</span><span class="w"> </span>--sweep-step<span class="w"> </span><span class="m">1048576</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--iters<span class="w"> </span><span class="m">500</span><span class="w"> </span>--warmup-iters<span class="w"> </span><span class="m">50</span><span class="w"> </span>--num-qp-per-transfer<span class="w"> </span><span class="m">4</span><span class="w"> </span>--enable-sess
+
+<span class="c1"># On the INITIATOR node (rank 0) — start this SECOND (prints the results table):</span>
+<span class="nv">MORI_DISABLE_AUTO_XGMI</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>build/tests/cpp/bench_engine<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--rank<span class="w"> </span><span class="m">0</span><span class="w"> </span>--master-ip<span class="w"> </span><span class="m">10</span>.190.162.0<span class="w"> </span>--self-ip<span class="w"> </span><span class="m">10</span>.190.162.0<span class="w"> </span>--port<span class="w"> </span><span class="m">18515</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--op<span class="w"> </span>write<span class="w"> </span>--all<span class="w"> </span>--sweep-start<span class="w"> </span><span class="m">1048576</span><span class="w"> </span>--sweep-max<span class="w"> </span><span class="m">33554432</span><span class="w"> </span>--sweep-step<span class="w"> </span><span class="m">1048576</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--iters<span class="w"> </span><span class="m">500</span><span class="w"> </span>--warmup-iters<span class="w"> </span><span class="m">50</span><span class="w"> </span>--num-qp-per-transfer<span class="w"> </span><span class="m">4</span><span class="w"> </span>--enable-sess
+</pre></div>
+</div>
+<p>Both ranks must be given the <strong>same</strong> benchmark args (op, sweep, batch, etc.).
+Only rank 0 (initiator) prints the results table:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">MsgSize</span><span class="p">(</span><span class="n">B</span><span class="p">)</span>  <span class="n">Batch</span>  <span class="n">Iters</span>  <span class="n">AvgBW</span><span class="p">(</span><span class="n">GB</span><span class="o">/</span><span class="n">s</span><span class="p">)</span>  <span class="n">AvgLat</span><span class="p">(</span><span class="n">us</span><span class="p">)</span>  <span class="n">TotalDur</span><span class="p">(</span><span class="n">us</span><span class="p">)</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">--port</span></code> is not the only TCP port in play, which matters behind a firewall:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Endpoint</p></th>
+<th class="head"><p>Bound by</p></th>
+<th class="head"><p>Address</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Bootstrap rendezvous</p></td>
+<td><p>rank 0 only</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--master-ip</span></code> : <code class="docutils literal notranslate"><span class="pre">--port</span></code> (<code class="docutils literal notranslate"><span class="pre">18515</span></code> above)</p></td>
+</tr>
+<tr class="row-odd"><td><p>Engine control plane</p></td>
+<td><p>both ranks</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--self-ip</span></code> : <code class="docutils literal notranslate"><span class="pre">--port</span> <span class="pre">+</span> <span class="pre">1</span> <span class="pre">+</span> <span class="pre">rank</span></code> (<code class="docutils literal notranslate"><span class="pre">18516</span></code> / <code class="docutils literal notranslate"><span class="pre">18517</span></code> above)</p></td>
+</tr>
+<tr class="row-even"><td><p>Bootstrap ring / allgather</p></td>
+<td><p>both ranks</p></td>
+<td><p>chosen interface, kernel-assigned ephemeral port</p></td>
+</tr>
+</tbody>
+</table>
+<p>The engine control plane is a plain TCP channel: the initiator dials the target’s
+advertised <code class="docutils literal notranslate"><span class="pre">EngineDesc</span></code> address to run the QP handshake and to look up the remote
+memory region. No RDMA payload crosses it.</p>
+</section>
+<section id="sweep-modes">
+<h3>Sweep modes<a class="headerlink" href="#sweep-modes" title="Link to this heading"></a></h3>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">--all</span></code> — sweep message size. Geometric ×2 by default, or linear when
+<code class="docutils literal notranslate"><span class="pre">--sweep-step</span> <span class="pre">&gt;</span> <span class="pre">0</span></code>, from <code class="docutils literal notranslate"><span class="pre">--sweep-start</span></code> to <code class="docutils literal notranslate"><span class="pre">--sweep-max</span></code>; batch stays at
+<code class="docutils literal notranslate"><span class="pre">--transfer-batch-size</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">--all-batch</span></code> — fix message size at <code class="docutils literal notranslate"><span class="pre">--buffer-size</span></code> and sweep batch
+<code class="docutils literal notranslate"><span class="pre">1,2,4,…,32768</span></code>.</p></li>
+<li><p>neither — a single <code class="docutils literal notranslate"><span class="pre">(--buffer-size,</span> <span class="pre">--transfer-batch-size)</span></code> point.</p></li>
+</ul>
+</section>
+<section id="differences-from-the-python-flags">
+<h3>Differences from the Python flags<a class="headerlink" href="#differences-from-the-python-flags" title="Link to this heading"></a></h3>
+<p>Most flags share names with the Python benchmark (<code class="docutils literal notranslate"><span class="pre">--op-type</span></code>/<code class="docutils literal notranslate"><span class="pre">--op</span></code>,
+<code class="docutils literal notranslate"><span class="pre">--num-qp-per-transfer</span></code>, <code class="docutils literal notranslate"><span class="pre">--num-worker-threads</span></code>, <code class="docutils literal notranslate"><span class="pre">--transfer-batch-size</span></code>,
+<code class="docutils literal notranslate"><span class="pre">--enable-sess</span></code>, <code class="docutils literal notranslate"><span class="pre">--batch-contiguous</span></code>, <code class="docutils literal notranslate"><span class="pre">--disable-chunking</span></code>, <code class="docutils literal notranslate"><span class="pre">--chunk-bytes</span></code>,
+<code class="docutils literal notranslate"><span class="pre">--poll_cq_mode</span></code>, <code class="docutils literal notranslate"><span class="pre">--mem-type</span></code>, <code class="docutils literal notranslate"><span class="pre">--iters</span></code>, <code class="docutils literal notranslate"><span class="pre">--sweep-step</span></code>, <code class="docutils literal notranslate"><span class="pre">--all</span></code>,
+<code class="docutils literal notranslate"><span class="pre">--all-batch</span></code>), but note:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Python</p></th>
+<th class="head"><p>C++ (nixl-style)</p></th>
+<th class="head"><p>Notes</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">torchrun</span> <span class="pre">...</span> <span class="pre">--node_rank</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--rank</span> <span class="pre">0</span></code> / <code class="docutils literal notranslate"><span class="pre">--rank</span> <span class="pre">1</span></code></p></td>
+<td><p>C++ rendezvous runs over MORI’s socket bootstrap; rank 0 is the root, and the second process must arrive within <code class="docutils literal notranslate"><span class="pre">MORI_BOOTSTRAP_TIMEOUT</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--host</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--master-ip</span></code> + <code class="docutils literal notranslate"><span class="pre">--self-ip</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--host</span></code> is accepted as a spelling of <code class="docutils literal notranslate"><span class="pre">--master-ip</span></code>. <code class="docutils literal notranslate"><span class="pre">--master-ip</span></code> = rank 0’s IP, same on both ranks; <code class="docutils literal notranslate"><span class="pre">--self-ip</span></code> = the control-plane IP each rank advertises to the peer, which Python does not need because torchrun supplies it.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--src-gpu</span></code> / <code class="docutils literal notranslate"><span class="pre">--dst-gpu</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--gpu</span></code> / <code class="docutils literal notranslate"><span class="pre">--target-dev-offset</span></code></p></td>
+<td><p>Python’s names are accepted: <code class="docutils literal notranslate"><span class="pre">--src-gpu</span></code> is <code class="docutils literal notranslate"><span class="pre">--gpu</span></code>, and <code class="docutils literal notranslate"><span class="pre">--dst-gpu</span> <span class="pre">N</span></code> sets <code class="docutils literal notranslate"><span class="pre">--target-dev-offset</span></code> to <code class="docutils literal notranslate"><span class="pre">N</span> <span class="pre">-</span> <span class="pre">gpu</span></code> (passing both a conflicting <code class="docutils literal notranslate"><span class="pre">--dst-gpu</span></code> and <code class="docutils literal notranslate"><span class="pre">--target-dev-offset</span></code> is rejected). Under <code class="docutils literal notranslate"><span class="pre">--xgmi-single-process</span></code> they are the two local GPUs directly.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--num-initiator-dev</span></code> / <code class="docutils literal notranslate"><span class="pre">--num-target-dev</span></code></p></td>
+<td><p>same</p></td>
+<td><p>One process per GPU on each side, forked before any HIP call; initiator local <em>i</em> pairs with target local <em>i</em>, driving GPU <code class="docutils literal notranslate"><span class="pre">--gpu</span> <span class="pre">+</span> <span class="pre">i</span></code>. The two counts must be equal, as Python asserts. Each pair prints its own <code class="docutils literal notranslate"><span class="pre">[gpu</span> <span class="pre">N]</span></code>-prefixed row and rank 0 adds an <code class="docutils literal notranslate"><span class="pre">[AGGREGATE]</span></code> line summing bandwidth across pairs — Python prints per-rank tables with no aggregate.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--enable-batch-transfer</span></code> (default OFF)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--enable-batch-transfer</span></code> / <code class="docutils literal notranslate"><span class="pre">--disable-batch-transfer</span></code> (C++ default <strong>ON</strong>)</p></td>
+<td><p>Same meaning as Python: <strong>ON</strong> = one N-descriptor batch request (the nixl-equivalent; nixl always batches); <strong>OFF</strong> = <code class="docutils literal notranslate"><span class="pre">--transfer-batch-size</span></code> N <em>individual</em> single-transfer submissions per iteration (Python <code class="docutils literal notranslate"><span class="pre">run_single_once</span></code>). The C++ tool defaults <strong>ON</strong> so the out-of-the-box run and <code class="docutils literal notranslate"><span class="pre">--all-batch</span></code> sweep are nixl-comparable; pass <code class="docutils literal notranslate"><span class="pre">--disable-batch-transfer</span></code> for the Python single-submission path.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--iters</span></code> (default <code class="docutils literal notranslate"><span class="pre">128</span></code>)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--iters</span></code> (default <code class="docutils literal notranslate"><span class="pre">500</span></code>), plus <code class="docutils literal notranslate"><span class="pre">--warmup-iters</span></code></p></td>
+<td><p>Only the warmup flag is new: it runs untimed iterations before the timed region, matching nixl’s <code class="docutils literal notranslate"><span class="pre">--warmup_iter</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--sweep-start-size</span></code> / <code class="docutils literal notranslate"><span class="pre">--sweep-max-size</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--sweep-start</span></code> / <code class="docutils literal notranslate"><span class="pre">--sweep-max</span></code> (long names also accepted)</p></td>
+<td><p>Names only; <code class="docutils literal notranslate"><span class="pre">--sweep-step</span></code> (<code class="docutils literal notranslate"><span class="pre">0</span></code> = geometric ×2, <code class="docutils literal notranslate"><span class="pre">&gt;0</span></code> = linear) behaves the same in both.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--backend</span> <span class="pre">rdma|xgmi|fabric</span></code></p></td>
+<td><p>same</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--num-streams</span></code> / <code class="docutils literal notranslate"><span class="pre">--num-events</span></code> size the XGMI <strong>and</strong> FABRIC HIP pools, as in Python. <code class="docutils literal notranslate"><span class="pre">fabric</span></code> (UALink scale-up, GPU memory only) needs a host whose GPUs expose <code class="docutils literal notranslate"><span class="pre">/sys/bus/pci/devices/*/ualink</span></code>; on RoCE-only hardware the engine reports <code class="docutils literal notranslate"><span class="pre">No</span> <span class="pre">available</span> <span class="pre">backend</span> <span class="pre">found</span></code> at the first transfer.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--xgmi-multiprocess</span></code> (default OFF)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--xgmi-single-process</span></code> (default OFF, i.e. multiprocess)</p></td>
+<td><p>The defaults are <strong>opposite</strong>. The C++ tool’s two-rank path is already Python’s <code class="docutils literal notranslate"><span class="pre">--xgmi-multiprocess</span></code>: two processes with distinct engine keys, so the backend takes its <code class="docutils literal notranslate"><span class="pre">hipIpc*</span></code> route. <code class="docutils literal notranslate"><span class="pre">--xgmi-single-process</span></code> adds Python’s <em>default</em> instead — one process owning both GPUs, no rendezvous and no IPC. <code class="docutils literal notranslate"><span class="pre">--xgmi-multiprocess</span></code> is accepted to document intent but is a no-op.</p></td>
+</tr>
+<tr class="row-odd"><td><p><em>(always on)</em></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--skip-validate</span></code></p></td>
+<td><p>Both tools verify transferred data as part of the run. Python compares the target’s buffer byte-for-byte over gloo; the C++ tool seeds a rank- and offset-dependent pattern and exchanges one checksum per transferred slot after the sweep (so the check is O(batch) on the wire but still covers every byte), printing <code class="docutils literal notranslate"><span class="pre">validation:</span> <span class="pre">OK</span></code> or naming the first mismatching slot and exiting non-zero. <code class="docutils literal notranslate"><span class="pre">--skip-validate</span></code> opts out; passing it to only one rank is safe — that rank contributes nothing and the run reports <code class="docutils literal notranslate"><span class="pre">validation:</span> <span class="pre">skipped</span></code> rather than hanging.</p></td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<div><p><code class="docutils literal notranslate"><span class="pre">--self-ip</span></code> must be an address the peer can reach over TCP, since it becomes the
+<code class="docutils literal notranslate"><span class="pre">EngineDesc</span></code> host the peer dials for the QP handshake and remote-MR lookup.
+<code class="docutils literal notranslate"><span class="pre">0.0.0.0</span></code> does not work: the peer ends up dialing its own loopback and fails with
+<code class="docutils literal notranslate"><span class="pre">connect(...):</span> <span class="pre">Connection</span> <span class="pre">refused</span></code>. It does <strong>not</strong> choose the RDMA device that
+carries the data — that stays rail/NUMA-aware (override with
+<code class="docutils literal notranslate"><span class="pre">MORI_RDMA_DEVICES</span></code>) — so the control IP need not be the RoCE interface’s. The
+bootstrap picks its local interface independently of both, so set
+<code class="docutils literal notranslate"><span class="pre">MORI_SOCKET_IFNAME</span></code> when that choice has no route to the peer.</p>
+<p><code class="docutils literal notranslate"><span class="pre">MORI_DISABLE_AUTO_XGMI</span></code> gates only the RDMA→XGMI <em>fallback</em> for hosts with no
+active RDMA device, and that fallback is off unless the variable is literally
+<code class="docutils literal notranslate"><span class="pre">0</span></code>. The <code class="docutils literal notranslate"><span class="pre">=1</span></code> above is therefore belt-and-braces, worth keeping only where
+something in the environment sets it to <code class="docutils literal notranslate"><span class="pre">0</span></code>.</p>
+<p>For <code class="docutils literal notranslate"><span class="pre">--backend</span> <span class="pre">xgmi</span></code>, run both ranks on the <strong>same</strong> host with different <code class="docutils literal notranslate"><span class="pre">--gpu</span></code>
+(XGMI is intra-node) and the same <code class="docutils literal notranslate"><span class="pre">--master-ip</span></code>/<code class="docutils literal notranslate"><span class="pre">--self-ip</span></code>; their engine control
+ports still differ because those are derived from the rank. The backend is
+created explicitly, so no env var is needed. That two-rank form measures the
+<em>cross-process</em> XGMI path (distinct engine keys ⇒ <code class="docutils literal notranslate"><span class="pre">hipIpc*</span></code>). To measure what the
+Python benchmark measures by default, pass <code class="docutils literal notranslate"><span class="pre">--xgmi-single-process</span></code> with
+<code class="docutils literal notranslate"><span class="pre">--src-gpu</span></code>/<code class="docutils literal notranslate"><span class="pre">--dst-gpu</span></code>: one process owns both GPUs, there is no rendezvous and no
+IPC, so <code class="docutils literal notranslate"><span class="pre">--rank</span></code>/<code class="docutils literal notranslate"><span class="pre">--master-ip</span></code> are not needed and small-message numbers become
+directly comparable to Python’s.</p>
+<p>For multi-GPU runs (<code class="docutils literal notranslate"><span class="pre">--num-initiator-dev</span> <span class="pre">N</span> <span class="pre">--num-target-dev</span> <span class="pre">N</span></code>) the bootstrap
+world is <code class="docutils literal notranslate"><span class="pre">2N</span></code> ranks, laid out initiators first. Engine control ports are derived
+from the <strong>global</strong> rank, so <code class="docutils literal notranslate"><span class="pre">--port</span> <span class="pre">P</span></code> reserves <code class="docutils literal notranslate"><span class="pre">P</span></code> for the bootstrap and
+<code class="docutils literal notranslate"><span class="pre">P+1</span> <span class="pre">…</span> <span class="pre">P+2N</span></code> for the engines — leave that range free. Each side forks <code class="docutils literal notranslate"><span class="pre">N-1</span></code>
+children before touching HIP, so a failure in one pair still reaps the others
+rather than leaving them holding ports.</p>
 </div></blockquote>
 </section>
 </section>
@@ -726,7 +956,9 @@ defaults. Tune from here.</p>
 </section>
 <section id="the-merged-wr-size-limit">
 <h3>The merged-WR size limit<a class="headerlink" href="#the-merged-wr-size-limit" title="Link to this heading"></a></h3>
-<p>A single RDMA WR cannot exceed the backend’s <code class="docutils literal notranslate"><span class="pre">max_msg_sz</span></code> (commonly <strong>2 GiB</strong>).
+<p>A single RDMA WR cannot exceed the NIC port’s reported <code class="docutils literal notranslate"><span class="pre">max_msg_sz</span></code> (<code class="docutils literal notranslate"><span class="pre">ibv_port_attr</span></code>,
+<strong>2 GiB</strong> on the usual mlx5 and <code class="docutils literal notranslate"><span class="pre">bnxt_re</span></code> parts), taken as the minimum across the
+endpoints a transfer uses.
 With <code class="docutils literal notranslate"><span class="pre">--batch-contiguous</span> <span class="pre">--disable-chunking</span></code> and a <strong>single</strong> worker, an entire
 batch can merge into one WR of <code class="docutils literal notranslate"><span class="pre">message_size</span> <span class="pre">×</span> <span class="pre">transfer_batch_size</span></code>. If that
 exceeds <code class="docutils literal notranslate"><span class="pre">max_msg_sz</span></code> the run aborts with:</p>
