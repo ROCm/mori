@@ -25,6 +25,7 @@ One SymmArena window holds the symmetric staging; per-rank metadata are plain
 device tensors surfaced to the caller via from_gpu_ptr.
 """
 from dataclasses import dataclass
+import os
 
 import torch
 
@@ -127,6 +128,8 @@ class EpDispatchCombineConfig:
     # "gather" (UseP2PRead) or "scatter" (mori _nop2p, fp8 compression home).
     combine_mode: str = "gather"
     quant_type: str = "none"  # none | fp8_direct_cast | fp8_blockwise
+    # Experimental BF16-input -> FP8-wire blockwise quantization in dispatch.
+    dispatch_fp8_blockwise: bool = False
     # Geometry: None => auto (pull the tuned schedule for this device/shape/dtype
     # from tuning_configs in __post_init__). Pin any of these to opt out and use a
     # fixed geometry instead. Combine wants few warps (K-deep per-lane MLP already
@@ -140,6 +143,7 @@ class EpDispatchCombineConfig:
     # distinct (block, warp) variants and picks one at runtime from
     # cur_rank_num_token. None => auto (from tuning_configs) or single-shot fallback.
     schedule: tuple = None
+    geometry_mode: str = "hybrid"  # table | analytical | hybrid
     enable_std_moe: bool = False
     max_total_recv_tokens: int = 0  # mori maxTotalRecvTokens; 0 = worst-case ws*M
     # Dispatch stall A/B switches. Prefetch route payload before the slot
@@ -190,6 +194,20 @@ class EpDispatchCombineConfig:
             raise ValueError(
                 f"combine_mode must be gather|scatter, got {self.combine_mode!r}"
             )
+        if self.dispatch_fp8_blockwise:
+            if (
+                self.data_type != torch.bfloat16
+                or self.dispatch_data_type is not None
+                or self.combine_data_type is not None
+                or self.combine_mode != "gather"
+                or self.quant_type != "none"
+                or self.enable_std_moe
+            ):
+                raise ValueError(
+                    "dispatch_fp8_blockwise requires symmetric BF16 input/output, "
+                    "combine_mode='gather', quant_type='none', and StdMoE disabled"
+                )
+            self.token_centric_dispatch = True
         if self.quant_type != "none":
             self.combine_mode = "scatter"
         if self.rotate_combine_peer_order and self.combine_mode != "gather":
@@ -256,14 +274,57 @@ class EpDispatchCombineConfig:
             )
         )
         if not pinned:
-            from .tuning_configs import lookup
+            from .tuning_configs import (
+                has_tuned_entry,
+                lookup,
+                lookup_analytical,
+            )
 
-            t = lookup(
+            mode = os.environ.get("MORI_EPV2_GEOMETRY", self.geometry_mode)
+            if mode not in ("table", "analytical", "hybrid"):
+                raise ValueError(
+                    f"MORI_EPV2_GEOMETRY must be table|analytical|hybrid, got {mode!r}"
+                )
+            use_analytical = mode == "analytical" or (
+                mode == "hybrid"
+                and not has_tuned_entry(
+                    self.world_size,
+                    self.hidden_dim,
+                    self.num_experts_per_token,
+                    dtype=self.dtype_str,
+                )
+            )
+            resolver = lookup_analytical if use_analytical else lookup
+            t = resolver(
                 self.world_size,
                 self.hidden_dim,
                 self.num_experts_per_token,
                 dtype=self.dtype_str,
             )
+            if use_analytical:
+                # Isolate geometry in A/B: retain any orthogonal tuned kernel
+                # policies (tok_off/cache/token-centric) for known shapes.
+                table_cfg = lookup(
+                    self.world_size,
+                    self.hidden_dim,
+                    self.num_experts_per_token,
+                    dtype=self.dtype_str,
+                )
+                geometry_keys = {
+                    "dispatch_block_num",
+                    "combine_block_num",
+                    "warp_num_per_block",
+                    "combine_warp_num_per_block",
+                    "schedule",
+                }
+                t.update(
+                    {
+                        k: v
+                        for k, v in table_cfg.items()
+                        if k not in geometry_keys
+                    }
+                )
+            self.geometry_mode = mode
             self.dispatch_block_num = t["dispatch_block_num"]
             self.combine_block_num = t["combine_block_num"]
             self.warp_num_per_block = t["warp_num_per_block"]
@@ -384,7 +445,25 @@ class EpDispatchCombineConfig:
     @property
     def token_nbytes(self):
         """Per-token transport bytes (fp4 packs 2 e2m1/byte -> hidden/2)."""
+        if self.dispatch_fp8_blockwise:
+            return self.hidden_dim
         return self.hidden_dim // 2 if self.is_fp4 else self.hidden_dim * self.elem_size
+
+    @property
+    def dispatch_wire_dtype(self):
+        if self.dispatch_fp8_blockwise:
+            from .tuning_configs import _topology
+
+            return (
+                torch.float8_e4m3fn
+                if _topology()[1] in (90500, 120500)
+                else torch.float8_e4m3fnuz
+            )
+        return self.dispatch_dtype
+
+    @property
+    def dispatch_quant_scale_dim(self):
+        return self.hidden_dim // 128 if self.dispatch_fp8_blockwise else 0
 
     @property
     def combine_dtype(self):
@@ -416,6 +495,8 @@ class EpDispatchCombineConfig:
     @property
     def dtype_str(self):
         """Token/dispatch dtype key for tuning_configs.lookup (fp4/fp8/default)."""
+        if self.dispatch_fp8_blockwise:
+            return "bf16_disp_fp8bw"
         if self.is_fp4:
             # fp4 dispatch + non-fp4 combine (asymmetric) moves 2 B/elem on the
             # combine side, so it needs the bf16 combine geometry, not the
@@ -547,6 +628,13 @@ class EpDispatchCombineOp:
         ]
         if self._enable_scales:
             regions.append(("out_scales", recv_cap * self._scale_num_i32 * 4))
+        if cfg.dispatch_fp8_blockwise:
+            regions.append(
+                (
+                    "disp_quant_scales",
+                    recv_cap * cfg.dispatch_quant_scale_dim * 4,
+                )
+            )
         # scatter combine needs its own staging regions
         if cfg.is_scatter:
             wire_elem_size = cfg.wire_elem_size
@@ -649,6 +737,13 @@ class EpDispatchCombineOp:
             uncached_metadata_store=cfg.uncached_metadata_store,
             replay_fast_path=cfg.replay_fast_path,
             token_centric_rotate_peer_order=cfg.token_centric_rotate_peer_order,
+            dispatch_fp8_blockwise=cfg.dispatch_fp8_blockwise,
+            off_disp_quant_scales=(
+                arena.offset("disp_quant_scales")
+                if cfg.dispatch_fp8_blockwise
+                else 0
+            ),
+            dispatch_quant_scale_dim=cfg.dispatch_quant_scale_dim,
         )
         # (block, warp) -> compiled dispatch / combine kernel.
         self._dispatch_variants = {
@@ -787,7 +882,17 @@ class EpDispatchCombineOp:
         return from_gpu_ptr(
             self.arena.local_ptr("disp_out"),
             (self._recv_cap, cols),
-            self.cfg.dispatch_dtype,
+            self.cfg.dispatch_wire_dtype,
+        )
+
+    def recv_quant_scales(self):
+        """FP32 blockwise dispatch scales [max_recv, hidden/128], or None."""
+        if not self.cfg.dispatch_fp8_blockwise:
+            return None
+        return from_gpu_ptr(
+            self.arena.local_ptr("disp_quant_scales"),
+            (self._recv_cap, self.cfg.dispatch_quant_scale_dim),
+            torch.float32,
         )
 
     def combine_in_view(self):
@@ -808,6 +913,17 @@ class EpDispatchCombineOp:
         return from_gpu_ptr(
             self.arena.local_ptr("out_tok"), (self._recv_cap, cols), cdt
         )
+
+    def expert_output_buffer(self, total_recv=None):
+        """Gather-combine destination for direct expert GEMM output.
+
+        Writing expert results into this view and passing the same view to
+        combine() elides the otherwise-required D2D staging copy.
+        """
+        if self.cfg.combine_mode != "gather":
+            raise ValueError("expert_output_buffer is gather-mode only")
+        view = self.combine_in_view()
+        return view if total_recv is None else view[:total_recv]
 
     def convert_dispatch_output(self):
         """mori ConvertDispatchOutput: repack recv tokens into per-local-expert

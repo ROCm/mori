@@ -42,7 +42,7 @@ Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 |---|---|
 | `test_dispatch_combine_v2_intranode.py` | pytest wrapper: runs `test_op.py` under torchrun for the representative modes and asserts every line PASS |
 | `test_op.py` | EP8 op-layer test (gather/scatter, quant, StdMoE, recv-cap, scales, LEC, reset, replay) |
-| `bench_dispatch_combine.py` | eager + CUDA-graph perf bench + e2e correctness. Envs: `DTYPE=bf16\|f32\|fp8\|fp4`, `COMBINE=gather\|scatter`, `QUANT=none\|fp8_direct_cast\|fp8_blockwise`, `STDMOE=1`, `SCALE_DIM`, `SWEEP`, `DISP_BLOCK`/`COMB_BLOCK`, `WARP_NUM`/`COMB_WARP`, `MODE`, `TUNED`, `USE_TOK_OFF_TOTAL_RECV`, `UNCACHED_TOKEN_STORE`, `UNCACHED_METADATA_STORE`, `REPLAY_FAST_PATH`, `REPLAY_BENCH`, `TOKEN_CENTRIC_DISPATCH`, `TOKEN_CENTRIC_ROTATE_PEERS`, `PREFETCH_ROUTE_PAYLOAD`, `DEFER_DEST_CTR_ATOMIC`, `ROTATE_DISPATCH_SLOT_ORDER`, `ROTATE_COMBINE_PEER_ORDER`, `ROUTING_PATTERN` |
+| `bench_dispatch_combine.py` | eager + CUDA-graph perf bench + e2e correctness. Envs: `DTYPE=bf16\|f32\|fp8\|fp4`, `COMBINE=gather\|scatter`, `QUANT=none\|fp8_direct_cast\|fp8_blockwise`, `DISPATCH_FP8_BLOCKWISE`, `ZERO_COPY_EXPERT_OUTPUT`, `E2E_PIPELINE`, `GEOMETRY=table\|analytical\|hybrid`, `STDMOE=1`, `SCALE_DIM`, `SWEEP`, `DISP_BLOCK`/`COMB_BLOCK`, `WARP_NUM`/`COMB_WARP`, `MODE`, `TUNED`, `USE_TOK_OFF_TOTAL_RECV`, `UNCACHED_TOKEN_STORE`, `UNCACHED_METADATA_STORE`, `REPLAY_FAST_PATH`, `REPLAY_BENCH`, `TOKEN_CENTRIC_DISPATCH`, `TOKEN_CENTRIC_ROTATE_PEERS`, `PREFETCH_ROUTE_PAYLOAD`, `DEFER_DEST_CTR_ATOMIC`, `ROTATE_DISPATCH_SLOT_ORDER`, `ROTATE_COMBINE_PEER_ORDER`, `ROUTING_PATTERN` |
 | `run_bench.sh` | bench launcher (runs `bench_dispatch_combine.py` in the container) |
 
 (Each script inlines a tiny torchrun/gloo `Dist` bootstrap — gloo only carries the cco unique-id and pass/fail counts.)
@@ -287,6 +287,67 @@ cancelled the removed barrier.
 Conclusion: retain cyclic peer rotation and the original one-chunk,
 buffer-store token-centric implementation. The remaining ATT stalls are not
 independently removable at useful wall-clock scale on this workload.
+
+## DeepEP-local optimization A/B (MI355X / gfx950, 2026-08-13)
+
+Four DeepEP-inspired ideas that can be evaluated inside EPv2 were tested:
+fused dispatch quantization, formal zero-copy expert output, CCO-SDMA payload
+offload, and an analytical geometry fallback.
+
+### Fused BF16 to FP8 blockwise dispatch
+
+`DISPATCH_FP8_BLOCKWISE=1` takes BF16 input, computes one FP32 scale per 128
+elements in the token-centric kernel, sends E4M3 payload plus scales, and leaves
+combine/expert output in BF16. The scale convention matches EPv2 combine
+blockwise quantization; dispatch wire bytes at hidden=7168 fall from 14336 to
+7392 bytes/token.
+
+Three-run graph means with tuned geometry:
+
+| tokens | BF16 dispatch | fused FP8 blockwise | change | prequantized FP8 lower bound |
+|---:|---:|---:|---:|---:|
+| 512 | 113.67 us | 73.11 us | -35.7% | 71.75 us |
+| 2048 | 409.62 us | 227.87 us | -44.4% | 217.60 us |
+
+The fused path uses token-centric `128x16`, uncached token stores through 4096,
+and passes normal/replay plus scale-active (`INSCALE=500`) correctness. The
+prequantized arm excludes external quantization cost, so it is a lower bound;
+fused dispatch is within about 2-5% while removing the separate quant kernel.
+
+### Zero-copy expert output to combine
+
+`expert_output_buffer()` formalizes the existing `out_tok` arena view. Expert
+GEMM/synthetic expert writes directly into it and passes the same view to
+`combine()`, avoiding the extra external-output to `out_tok` D2D copy.
+
+| tokens | external output + staging copy | direct expert output | change |
+|---:|---:|---:|---:|
+| 512 | 274.62 us | 257.77 us | -6.1% |
+| 2048 | 1092.98 us | 1019.95 us | -6.7% |
+
+These are full graph `dispatch -> identity expert -> combine` times. The API is
+gather-only; scatter retains its dedicated staging layout.
+
+### Analytical geometry fallback
+
+`GEOMETRY=analytical` scales MI355X block/warp bucket thresholds by expected
+unique-peer bytes (`world_size`, top-k, hidden and dtype). `hybrid`—now the
+default—uses measured table entries when present and analytical sizing only for
+missing gfx950 shapes; other architectures retain their old fallback.
+
+On the tuned hidden=7168 matrix analytical sizing stayed within about 1.3% of
+the table. On the previously untuned hidden=4096, top-k=8, 400-token point it
+selected combine `64x8` instead of `32x16`: combine latency fell from 97.18 to
+62.06 us (-36.1%), while dispatch improved about 0.8%.
+
+### CCO-SDMA payload experiment
+
+The build has `BUILD_CCO_SDMA=True`, and the two-rank FlyDSL SDMA all-gather
+example passes with eight queues. EP8 DevComm initialization, however, fails
+before kernel launch with `hipErrorPeerAccessAlreadyEnabled` / invalid IPC
+handle errors, both with P2P enabled and disabled. No valid EP8 performance
+number is reported. The temporary EPv2 SDMA kernel path was removed; resolving
+multi-rank peer-access initialization is a prerequisite for revisiting it.
 
 ## Dispatch stall A/B (MI355X / gfx950, 2026-08-07)
 

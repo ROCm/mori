@@ -219,6 +219,24 @@ def _cases():
         },
         id="bf16-scatter-fp8blockwise-scaled",
     )
+    yield pytest.param(
+        {
+            "DTYPE": "bf16",
+            "COMBINE": "gather",
+            "DISPATCH_FP8_BLOCKWISE": 1,
+            "REPLAY": 1,
+        },
+        id="bf16-gather-dispatch-fp8blockwise",
+    )
+    yield pytest.param(
+        {
+            "DTYPE": "bf16",
+            "COMBINE": "gather",
+            "DISPATCH_FP8_BLOCKWISE": 1,
+            "INSCALE": 500,
+        },
+        id="bf16-gather-dispatch-fp8blockwise-scaled",
+    )
     # per-token scale forwarding (v1 uses scale_dim=32), on both combine modes
     yield pytest.param(
         {"DTYPE": "bf16", "COMBINE": "gather", "SCALE_DIM": 32}, id="bf16-gather-scales"
@@ -238,6 +256,14 @@ def _cases():
     )
     yield pytest.param(
         {"DTYPE": "bf16", "COMBINE": "gather", "REPLAY": 1}, id="bf16-gather-replay"
+    )
+    yield pytest.param(
+        {
+            "DTYPE": "bf16",
+            "COMBINE": "gather",
+            "ZERO_COPY_EXPERT_OUTPUT": 1,
+        },
+        id="bf16-gather-zero-copy-expert",
     )
     yield pytest.param(
         {"DTYPE": "bf16", "COMBINE": "gather", "STDMOE": 1}, id="bf16-stdmoe"

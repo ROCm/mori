@@ -99,6 +99,7 @@ COMB_WARP = int(os.environ.get("COMB_WARP", WARP_NUM))
 # AUTO=1: build the plain config (no pinned geometry) so __post_init__ auto-pulls
 # the tuned schedule, and pick the disp/comb variant per token count via op._pick.
 AUTO = int(os.environ.get("AUTO", 0))
+GEOMETRY_MODE = os.environ.get("GEOMETRY", "hybrid")
 WARMUP = int(os.environ.get("WARMUP", 10))
 ITERS = int(os.environ.get("ITERS", 50))
 MODE = os.environ.get("MODE", "both")  # eager | graph | both
@@ -106,6 +107,7 @@ STDMOE = int(os.environ.get("STDMOE", 0))  # 1 = run StdMoE convert pipeline
 DTYPE = os.environ.get("DTYPE", "bf16")  # bf16 | f32
 COMBINE = os.environ.get("COMBINE", "gather")  # gather | scatter
 QUANT = os.environ.get("QUANT", "none")  # none | fp8_direct_cast (scatter only)
+DISPATCH_FP8_BLOCKWISE = int(os.environ.get("DISPATCH_FP8_BLOCKWISE", 0))
 SCALE_DIM = int(os.environ.get("SCALE_DIM", 0))  # >0 = forward per-token scales
 PREFETCH_ROUTE_PAYLOAD = int(os.environ.get("PREFETCH_ROUTE_PAYLOAD", 0))
 DEFER_DEST_CTR_ATOMIC = int(os.environ.get("DEFER_DEST_CTR_ATOMIC", 0))
@@ -114,6 +116,8 @@ UNCACHED_TOKEN_STORE = int(os.environ.get("UNCACHED_TOKEN_STORE", 0))
 UNCACHED_METADATA_STORE = int(os.environ.get("UNCACHED_METADATA_STORE", 0))
 REPLAY_FAST_PATH = int(os.environ.get("REPLAY_FAST_PATH", 0))
 REPLAY_BENCH = int(os.environ.get("REPLAY_BENCH", 0))
+ZERO_COPY_EXPERT_OUTPUT = int(os.environ.get("ZERO_COPY_EXPERT_OUTPUT", 0))
+E2E_PIPELINE = int(os.environ.get("E2E_PIPELINE", 0))
 TOKEN_CENTRIC_DISPATCH = int(os.environ.get("TOKEN_CENTRIC_DISPATCH", 0))
 TOKEN_CENTRIC_ROTATE_PEERS = int(
     os.environ.get("TOKEN_CENTRIC_ROTATE_PEERS", 0)
@@ -151,7 +155,9 @@ _ASYM = (DISPATCH_DT is not None) or (COMBINE_DT is not None)
 _disp_s, _comb_s = DISPATCH_DT or DTYPE, COMBINE_DT or DTYPE
 DISP_DT, DISP_ESZ = _DT[_disp_s]
 COMB_DT, COMB_ESZ = _DT[_comb_s]
-DISP_NB = HIDDEN // 2 if _disp_s == "fp4" else HIDDEN * DISP_ESZ  # dispatch bytes/tok
+DISP_NB = HIDDEN // 2 if _disp_s == "fp4" else HIDDEN * DISP_ESZ
+if DISPATCH_FP8_BLOCKWISE:
+    DISP_NB = HIDDEN + (HIDDEN // 128) * 4
 COMB_NB = HIDDEN // 2 if _comb_s == "fp4" else HIDDEN * COMB_ESZ  # combine bytes/tok
 
 
@@ -241,8 +247,13 @@ def main():
     ) as comm:
         _fp8 = QUANT == "fp8_direct_cast"
         _bw = QUANT == "fp8_blockwise"
+        _disp_bw = bool(DISPATCH_FP8_BLOCKWISE)
         if _bw:
             inp.mul_(float(os.environ.get("BW_INSCALE", 200)))  # >448 exercises scaling
+        if _disp_bw:
+            disp_scale = float(os.environ.get("BW_INSCALE", 1))
+            if disp_scale != 1:
+                inp.copy_((inp.float() * disp_scale).to(inp.dtype))
         # Build kernels + arena THROUGH the op-layer (single source of truth for
         # dtype/mode support — the bench can no longer test a config the op can't
         # express). schedule=None + explicit block/warp => the op precompiles
@@ -261,9 +272,11 @@ def main():
             combine_data_type=(COMB_DT if _ASYM else None),
             combine_mode=COMBINE,
             quant_type=QUANT,
+            dispatch_fp8_blockwise=_disp_bw,
             scale_dim=SCALE_DIM,
             scale_type_size=1 if SCALE_DIM else 0,
             enable_std_moe=bool(STDMOE),
+            geometry_mode=GEOMETRY_MODE,
             prefetch_route_payload=bool(PREFETCH_ROUTE_PAYLOAD),
             defer_dest_ctr_atomic=bool(DEFER_DEST_CTR_ATOMIC),
             use_tok_off_total_recv=bool(USE_TOK_OFF_TOTAL_RECV),
@@ -294,6 +307,12 @@ def main():
         comb_out = op.combine_out
         comb_out_wts = op.combine_out_weights
         tok_map = op.token_dest_map
+        expert_output = (
+            op.expert_output_buffer()
+            if COMBINE == "gather"
+            else op.combine_in_view()
+        )
+        expert_scratch = torch.empty_like(expert_output)
         if AUTO:
             _dspec, _cspec = op._pick(min(SWEEP))
             disp_kern = op._get_dispatch_variant(_dspec, min(SWEEP))
@@ -305,6 +324,7 @@ def main():
                     f"comb_default=({cfg.combine_block_num},{cfg.combine_warp_num_per_block}) "
                     f"disp_variants={sorted(op._dispatch_variants)} "
                     f"comb_variants={sorted(op._combine_variants)} "
+                    f"geometry_mode={cfg.geometry_mode} "
                     f"tok_off_total={cfg.use_tok_off_total_recv} "
                     f"replay_fast={cfg.replay_fast_path} "
                     f"token_centric={cfg.token_centric_dispatch} "
@@ -316,7 +336,9 @@ def main():
                     flush=True,
                 )
         else:
-            disp_kern = op._dispatch_variants[(DISP_BLOCK, WARP_NUM)]
+            disp_kern = op._get_dispatch_variant(
+                (DISP_BLOCK, WARP_NUM), min(SWEEP)
+            )
             comb_kern = op._combine_variants[(COMB_BLOCK, COMB_WARP)]
 
         # Launch on the CURRENT stream each call: under torch.cuda.graph capture
@@ -354,8 +376,22 @@ def main():
         def mock_fmoe():
             # expert-op stand-in: dequant dispatched tokens to the combine dtype in
             # out_tok. Via a scratch — in-place would alias (differing strides).
-            scratch = op.recv_tokens().to(COMB_DT)
-            op.combine_in_view().view(-1).copy_(scratch.view(-1))
+            if _disp_bw:
+                scale = op.recv_quant_scales().abs().repeat_interleave(
+                    128, dim=1
+                )
+                scratch = (op.recv_tokens().float() * scale).to(COMB_DT)
+                expert_output.copy_(scratch)
+            elif ZERO_COPY_EXPERT_OUTPUT:
+                expert_output.copy_(op.recv_tokens())
+            else:
+                expert_scratch.copy_(op.recv_tokens())
+                expert_output.copy_(expert_scratch)
+
+        def run_pipeline(ct):
+            run_disp(ct)
+            mock_fmoe()
+            run_comb(ct)
 
         def time_eager(fn, ct):
             for _ in range(WARMUP):
@@ -443,10 +479,14 @@ def main():
                 COMB_DT
             )
             # fp8 (quant wire, plain fp8 token, or asymmetric fp8 side) is lossy.
-            lossy = _fp8 or _bw or "fp8" in (DTYPE, _disp_s, _comb_s)
+            lossy = _fp8 or _bw or _disp_bw or "fp8" in (
+                DTYPE,
+                _disp_s,
+                _comb_s,
+            )
             _atol, _rtol = (1.0, 1.5e-1) if lossy else (2e-2, 2e-2)
             got_dt = (
-                torch.bfloat16 if (_fp8 or _bw) else COMB_DT
+                torch.bfloat16 if (_fp8 or _bw or _disp_bw) else COMB_DT
             )  # quant paths output bf16
             got = comb_out[: ct * HIDDEN].cpu().view(got_dt).view(ct, HIDDEN)
             ok = torch.allclose(got.float(), exp.float(), atol=_atol, rtol=_rtol)
@@ -577,7 +617,8 @@ def main():
             )
             print(
                 f"# EP{npes} hidden={HIDDEN} topk={K} experts={num_experts} "
-                f"dtype={DTYPE} combine={COMBINE} quant={QUANT} scale_dim={SCALE_DIM} "
+                f"dtype={DTYPE} combine={COMBINE} quant={QUANT} "
+                f"dispatch_fp8bw={_disp_bw} scale_dim={SCALE_DIM} "
                 f"{_geom} "
                 f"prefetch_route_payload={bool(PREFETCH_ROUTE_PAYLOAD)} "
                 f"defer_dest_ctr_atomic={bool(DEFER_DEST_CTR_ATOMIC)} "
@@ -585,6 +626,7 @@ def main():
                 f"uncached_token={bool(UNCACHED_TOKEN_STORE)} "
                 f"uncached_metadata={bool(UNCACHED_METADATA_STORE)} "
                 f"replay_fast={bool(REPLAY_FAST_PATH)} "
+                f"zero_copy_expert={bool(ZERO_COPY_EXPERT_OUTPUT)} "
                 f"token_centric={bool(TOKEN_CENTRIC_DISPATCH)} "
                 f"token_peer_rotate={bool(TOKEN_CENTRIC_ROTATE_PEERS)} "
                 f"rotate_dispatch={bool(ROTATE_DISPATCH_SLOT_ORDER)} "
@@ -643,6 +685,11 @@ def main():
                 timed_disp = run_replay
             dp_e = time_eager(timed_disp, ct) if eager else 0.0
             dp_g = time_graph(timed_disp, ct) if graph else 0.0
+            pipe_g = (
+                time_graph(run_pipeline, ct)
+                if graph and E2E_PIPELINE and not REPLAY_BENCH
+                else 0.0
+            )
 
             if rank == 0:
                 # payload shown = disp/comb bytes (same unless asymmetric dtype)
@@ -674,6 +721,8 @@ def main():
                         f"{bw(disp_payload,dp_g):6.1f}GB/s "
                         f"comb {cb_g:8.2f}us/{bw(comb_payload,cb_g):6.1f}GB/s"
                     )
+                if pipe_g:
+                    parts.append(f"| PIPELINE {pipe_g:8.2f}us")
                 print("  ".join(parts), flush=True)
     d.shutdown()
 

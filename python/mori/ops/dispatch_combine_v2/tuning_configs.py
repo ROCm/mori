@@ -132,6 +132,11 @@ _MI355X_SCHED_FP8 = (
     (4096, 160, 8, 32, 16),
     (None, 128, 16, 48, 16),
 )
+# BF16 input fused to FP8 blockwise wire in token-centric dispatch.
+_MI355X_SCHED_BF16_DISP_FP8BW = (
+    (128, 128, 16, 32, 8),
+    (None, 128, 16, 32, 16),
+)
 # fp4 dispatch + fp4 combine (0.5 B/elem):
 _MI355X_SCHED_FP4 = (
     (256, 128, 4, 32, 8),
@@ -186,6 +191,7 @@ _MI355X_TABLE = {
             else _MI355X_SCHED_BF16_NO_CACHE_HINT
         ),
         "fp8": _MI355X_SCHED_FP8,
+        "bf16_disp_fp8bw": _MI355X_SCHED_BF16_DISP_FP8BW,
         "fp4": _MI355X_SCHED_FP4,
         "fp4_disp_bf16_comb": _MI355X_SCHED_FP4_DISP_BF16_COMB,
         # BF16 dispatch A/B, 2026-08-11: tok_off counting plus SC0|SC1 peer
@@ -210,7 +216,14 @@ _MI355X_TABLE = {
                     else None
                 ),
                 "token_centric_rotate_peer_order": HAS_BUFFER_OPS,
-            }
+            },
+            "bf16_disp_fp8bw": {
+                "use_tok_off_total_recv": True,
+                "replay_fast_path": True,
+                "uncached_token_store_max_tokens": 4096,
+                "uncached_metadata_store_max_tokens": 256,
+                "token_centric_rotate_peer_order": True,
+            },
         },
     },
     (8, 7168, 6): {
@@ -318,6 +331,71 @@ def _cu_scaled_default():
         combine_warp_num_per_block=4,
         schedule=None,
     )
+
+
+def _round_blocks(value, cu):
+    return max(16, min(cu, int(round(value / 16.0)) * 16))
+
+
+def expected_unique_peers(world_size, topk):
+    """Balanced-gate expectation for unique destination peers per token."""
+    if world_size <= 1:
+        return 1.0
+    return world_size * (1.0 - (1.0 - 1.0 / world_size) ** topk)
+
+
+def lookup_analytical(world_size, hidden_dim, topk, dtype="bf16"):
+    """Volume-scaled gfx9 fallback modeled after DeepEP's bandwidth sizing.
+
+    The block fractions are calibrated once from the MI355X roofline; token
+    thresholds scale with expected unique-peer bytes so hidden/top-k/dtype
+    variants do not blindly reuse the 7168/BF16 schedule.
+    """
+    # The calibrated fractions below are gfx950/wave64-specific. Other
+    # architectures retain their existing CU-scaled fallback until calibrated.
+    if _topology()[1] != 90500:
+        return _cu_scaled_default()
+    cu = _cu_count() or 80
+    elem_bytes = {"bf16": 2.0, "fp8": 1.0, "fp4": 0.5}.get(dtype, 1.0)
+    expected = expected_unique_peers(world_size, topk)
+    ref_expected = expected_unique_peers(8, 8)
+    volume_scale = (
+        hidden_dim * elem_bytes * expected
+    ) / (7168.0 * 2.0 * ref_expected)
+    volume_scale = max(volume_scale, 1.0 / 16.0)
+
+    def threshold(ref):
+        scaled = max(8, int(round(ref / volume_scale / 8.0)) * 8)
+        return scaled
+
+    d_half = _round_blocks(cu * 0.50, cu)
+    d_mid = _round_blocks(cu * 0.375, cu)
+    d_large = _round_blocks(cu * 0.625, cu)
+    c_small = _round_blocks(cu * 0.125, cu)
+    c_mid = _round_blocks(cu * 0.25, cu)
+    c_large = _round_blocks(cu * 0.1875, cu)
+    schedule = (
+        (threshold(128), d_half, 8, c_small, 8),
+        (threshold(256), d_mid, 8, c_mid, 8),
+        (threshold(1024), d_mid, 8, c_small, 16),
+        (threshold(4096), d_large, 8, c_small, 16),
+        (None, d_half, 16, c_large, 16),
+    )
+    return dict(
+        dispatch_block_num=d_half,
+        combine_block_num=c_large,
+        warp_num_per_block=16,
+        combine_warp_num_per_block=16,
+        schedule=schedule,
+    )
+
+
+def has_tuned_entry(world_size, hidden_dim, topk, dtype="bf16"):
+    key = _device_key()
+    if key is None or key not in _DEVICES:
+        return False
+    entry = _DEVICES[key][1].get((world_size, hidden_dim, topk))
+    return bool(entry and (entry.get(dtype) or entry.get("fp8")))
 
 
 def lookup(world_size, hidden_dim, topk, dtype="fp8"):

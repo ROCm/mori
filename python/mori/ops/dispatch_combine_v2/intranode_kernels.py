@@ -136,8 +136,16 @@ def make_dispatch(
     uncached_metadata_store=False,
     replay_fast_path=False,
     token_centric_rotate_peer_order=False,
+    dispatch_fp8_blockwise=False,
+    off_disp_quant_scales=0,
+    dispatch_quant_scale_dim=0,
 ):
-    del token_centric_rotate_peer_order
+    del (
+        token_centric_rotate_peer_order,
+        dispatch_fp8_blockwise,
+        off_disp_quant_scales,
+        dispatch_quant_scale_dim,
+    )
     # fp4 (e2m1) packs 2 values per byte, so a token is hidden_dim/2 bytes; dispatch
     # is a pure byte mover (no fp4 decode), matching mori v1's plain-fp4 path.
     nbytes = hidden_dim // 2 if fp4 else hidden_dim * hidden_elem_size
@@ -614,6 +622,9 @@ def make_dispatch_token_centric(
     uncached_metadata_store=False,
     replay_fast_path=False,
     token_centric_rotate_peer_order=False,
+    dispatch_fp8_blockwise=False,
+    off_disp_quant_scales=0,
+    dispatch_quant_scale_dim=0,
 ):
     """Workgroup-per-token dispatch A/B kernel.
 
@@ -621,7 +632,8 @@ def make_dispatch_token_centric(
     each 16-byte token chunk once and stores that value to all unique peers.
     """
     del prefetch_route_payload, rotate_dispatch_slot_order, replay_fast_path
-    nbytes = hidden_dim // 2 if fp4 else hidden_dim * hidden_elem_size
+    input_nbytes = hidden_dim // 2 if fp4 else hidden_dim * hidden_elem_size
+    nbytes = hidden_dim if dispatch_fp8_blockwise else input_nbytes
     n_i32 = nbytes // 4
     sentinel_val = npes * max_recv
     scale_bytes = scale_dim * scale_type_size
@@ -631,6 +643,18 @@ def make_dispatch_token_centric(
     token_store_cache_modifier = 3 if uncached_token_store else 0
     metadata_store_cache_modifier = 3 if uncached_metadata_store else 0
     direct_tok_off_total = use_tok_off_total_recv and not replay
+    if dispatch_fp8_blockwise:
+        if WAVE != 64:
+            raise NotImplementedError(
+                "dispatch_fp8_blockwise requires wave64"
+            )
+        if (
+            hidden_elem_size != 2
+            or dispatch_quant_scale_dim != hidden_dim // 128
+        ):
+            raise ValueError(
+                "dispatch_fp8_blockwise requires BF16 input and hidden/128 scales"
+            )
 
     @flyc.kernel(known_block_size=[block_threads, 1, 1])
     def ep_dispatch_token_centric(
@@ -824,6 +848,7 @@ def make_dispatch_token_centric(
             route_slots = []
             route_token_rsrcs = []
             route_scale_rsrcs = []
+            route_quant_scale_rsrcs = []
             for route_step in range_constexpr(npes):
                 # Phase-shift peer order by wave so workgroup waves do not all
                 # inject into the same peer at the same instant.
@@ -854,23 +879,100 @@ def make_dispatch_token_centric(
                             peer_base + fx.Int64(off_out_scales)
                         )
                     )
+                if const_expr(dispatch_fp8_blockwise):
+                    route_quant_scale_rsrcs.append(
+                        create_buffer_resource_from_addr(
+                            peer_base
+                            + fx.Int64(off_disp_quant_scales)
+                            + fx.Int64(peer_slot)
+                            * fx.Int64(dispatch_quant_scale_dim * 4)
+                        )
+                    )
 
             local_tok_addr = fx.Int64(addr_inp_tok) + fx.Int64(src_tok) * fx.Int64(
-                nbytes
+                input_nbytes
             )
             rsrc_src = create_buffer_resource_from_addr(local_tok_addr)
-            for chunk in range(tid * 4, n_i32, block_threads * 4):
-                token_vec = buffer_load(
-                    rsrc_src, chunk, vec_width=4, dtype=T.i32()
-                )
-                for route_step in range_constexpr(npes):
-                    if route_valids[route_step] != 0:
-                        buffer_store(
-                            token_vec,
-                            route_token_rsrcs[route_step],
-                            chunk,
-                            cache_modifier=token_store_cache_modifier,
+            if const_expr(dispatch_fp8_blockwise):
+                fp8max = arith.constant(_FP8_MAX, type=T.f32())
+                nlim = arith.constant(-_FP8_MAX, type=T.f32())
+                for scale_block in range(
+                    warp, dispatch_quant_scale_dim, warp_num_per_block
+                ):
+                    v2 = _bf16x2(
+                        buffer_load(
+                            rsrc_src,
+                            scale_block * 64 + lane,
+                            vec_width=1,
+                            dtype=T.i32(),
                         )
+                    )
+                    e0 = vector.extract(v2, static_position=[0])
+                    e1 = vector.extract(v2, static_position=[1])
+                    amax = _warp_amax(
+                        lane, arith.maximumf(_fabs(e0), _fabs(e1))
+                    )
+                    scaled = amax > fp8max
+                    scale = arith.select(
+                        scaled,
+                        arith.divf(amax, fp8max),
+                        arith.constant(1.0, type=T.f32()),
+                    )
+                    inv = arith.select(
+                        scaled,
+                        arith.divf(fp8max, amax),
+                        arith.constant(1.0, type=T.f32()),
+                    )
+                    f0 = fmed3(T.f32(), arith.mulf(e0, inv), fp8max, nlim)
+                    f1 = fmed3(T.f32(), arith.mulf(e1, inv), fp8max, nlim)
+                    my_packed = cvt_pk_fp8_f32(
+                        res=T.i32(),
+                        src_a=f0,
+                        src_b=f1,
+                        old=arith.constant(0, type=T.i32()),
+                        word_sel=False,
+                    )
+                    nbr_packed = ds_bpermute(
+                        T.i32(),
+                        arith.unwrap(
+                            (lane ^ arith.constant(1)) * arith.constant(4)
+                        ),
+                        arith.unwrap(my_packed),
+                    )
+                    packed_pair = (my_packed & arith.constant(0xFFFF)) | (
+                        (nbr_packed & arith.constant(0xFFFF))
+                        << arith.constant(16)
+                    )
+                    for route_step in range_constexpr(npes):
+                        if route_valids[route_step] != 0:
+                            if lane == 0:
+                                buffer_store(
+                                    scale,
+                                    route_quant_scale_rsrcs[route_step],
+                                    scale_block,
+                                    cache_modifier=metadata_store_cache_modifier,
+                                )
+                            if (lane & arith.constant(1)) == arith.constant(0):
+                                buffer_store(
+                                    packed_pair,
+                                    route_token_rsrcs[route_step],
+                                    scale_block * 32
+                                    + (lane >> arith.constant(1)),
+                                    cache_modifier=token_store_cache_modifier,
+                                )
+            else:
+                for chunk in range(tid * 4, n_i32, block_threads * 4):
+                    token_vec = buffer_load(
+                        rsrc_src, chunk, vec_width=4, dtype=T.i32()
+                    )
+                    for route_step in range_constexpr(npes):
+                        if route_valids[route_step] != 0:
+                            buffer_store(
+                                token_vec,
+                                route_token_rsrcs[route_step],
+                                chunk,
+                                cache_modifier=token_store_cache_modifier,
+                            )
 
             if const_expr(enable_scales):
                 rsrc_inp_scales = create_buffer_resource_from_addr(addr_inp_scales)

@@ -101,6 +101,8 @@ SCALE_DIM = int(
 )  # >0 = also verify per-token scales forwarding
 COMBINE = os.environ.get("COMBINE", "gather")  # gather | scatter
 QUANT = os.environ.get("QUANT", "none")  # none | fp8_direct_cast | fp8_blockwise
+DISPATCH_FP8_BLOCKWISE = int(os.environ.get("DISPATCH_FP8_BLOCKWISE", 0))
+ZERO_COPY_EXPERT_OUTPUT = int(os.environ.get("ZERO_COPY_EXPERT_OUTPUT", 0))
 PREFETCH_ROUTE_PAYLOAD = int(os.environ.get("PREFETCH_ROUTE_PAYLOAD", 0))
 DEFER_DEST_CTR_ATOMIC = int(os.environ.get("DEFER_DEST_CTR_ATOMIC", 0))
 USE_TOK_OFF_TOTAL_RECV = int(os.environ.get("USE_TOK_OFF_TOTAL_RECV", 0))
@@ -204,6 +206,7 @@ def main():
             scale_type_size=1 if SCALE_DIM else 0,
             combine_mode=COMBINE,
             quant_type=QUANT,
+            dispatch_fp8_blockwise=bool(DISPATCH_FP8_BLOCKWISE),
             max_total_recv_tokens=int(os.environ.get("MAXRECV", 0)),
             prefetch_route_payload=bool(PREFETCH_ROUTE_PAYLOAD),
             defer_dest_ctr_atomic=bool(DEFER_DEST_CTR_ATOMIC),
@@ -280,11 +283,23 @@ def main():
                         f"reverse-map ok)",
                         flush=True,
                     )
+            combine_input = recv_x
+            if DISPATCH_FP8_BLOCKWISE:
+                quant_scale = op.recv_quant_scales().abs().repeat_interleave(
+                    128, dim=1
+                )
+                combine_input = op.combine_in_view()
+                combine_input.copy_(
+                    (recv_x.float() * quant_scale).to(torch.bfloat16)
+                )
+            elif ZERO_COPY_EXPERT_OUTPUT:
+                combine_input = op.expert_output_buffer()
+                combine_input.copy_(recv_x)
             if cap is not None:
                 # Capped run: over-cap tokens are intentionally dropped (mori
                 # parity), so identity-verify won't hold. Validate the cap is
                 # respected and nothing OOB/crashed.
-                op.combine(recv_x, routing=routing)
+                op.combine(combine_input, routing=routing)
                 sync()
                 comm.barrier()
                 ok = total_recv <= cap
@@ -316,7 +331,7 @@ def main():
                 tag = "OP-STDMOE"
             else:
                 # identity expert: recv_x already holds the dispatched tokens.
-                out, out_w = op.combine(recv_x, routing=routing)
+                out, out_w = op.combine(combine_input, routing=routing)
                 sync()
                 comm.barrier()
                 U = np.array(
@@ -335,14 +350,22 @@ def main():
                         torch.from_numpy(U).view(ct, 1).float() * inp[:ct].float().cpu()
                     ).to(DTYPE)
                     # fp8 paths (quant or plain fp8 token) lose precision; relax.
-                    lossy = QUANT != "none" or _IS_FP8
+                    lossy = (
+                        QUANT != "none"
+                        or _IS_FP8
+                        or bool(DISPATCH_FP8_BLOCKWISE)
+                    )
                     atol = 3e-1 if lossy else 2e-2
                     rtol = 1e-1 if lossy else 2e-2
                     ok = torch.allclose(
                         out.float().cpu(), exp.float(), atol=atol, rtol=rtol
                     )
                 ok_w = torch.allclose(out_w.cpu(), exp_w, atol=2e-3, rtol=2e-3)
-                tag = f"OP-{COMBINE}" + (f"-{QUANT}" if QUANT != "none" else "")
+                tag = f"OP-{COMBINE}" + (
+                    "-disp-fp8bw"
+                    if DISPATCH_FP8_BLOCKWISE
+                    else (f"-{QUANT}" if QUANT != "none" else "")
+                )
             errs = d.allreduce_sum(0 if (ok and ok_w) else 1)
             if rank == 0:
                 print(
