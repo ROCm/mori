@@ -92,12 +92,16 @@ def main():
     obj = [cco.Communicator.get_unique_id() if rank == 0 else None]
     dist.broadcast_object_list(obj, src=0)
     M = max(SWEEP)
-    # Six ops are built and closed in sequence (2 backends x len(SWEEP)),
-    # so the reservation has to survive the repeated alloc/free, not just
-    # hold one arena.
-    vmm = 4 * (world * M * HIDDEN * 2 * 2 + (16 << 20)) + (2 << 30)
-    comm = cco.Communicator.init(world, rank, obj[0], vmm)
 
+    # Inputs BEFORE the communicator, which is not a style choice: comm_create
+    # leaves a HIP error latched, and torch reports whatever is latched on the next
+    # GPU call it makes, so a .to(dev) after Communicator.init dies with someone
+    # else's error (hipErrorInvalidValue here, hipErrorNotSupported elsewhere). Every
+    # other test in this directory happens to build its tensors first and none of them
+    # sees it. The bug is cco's and the fix belongs there -- next to whichever
+    # tolerated call sets the flag, as src/application/memory/symmetric_memory.cpp
+    # already does with (void)hipGetLastError() -- not in a boundary that swallows
+    # every error indiscriminately.
     n_experts = world * EPR
     g = torch.Generator(device="cpu").manual_seed(1234 + rank)
     inp = (
@@ -111,6 +115,12 @@ def main():
         .to(torch.int32)
         .to(dev)
     )
+
+    # Six ops are built and closed in sequence (2 backends x len(SWEEP)),
+    # so the reservation has to survive the repeated alloc/free, not just
+    # hold one arena.
+    vmm = 4 * (world * M * HIDDEN * 2 * 2 + (16 << 20)) + (2 << 30)
+    comm = cco.Communicator.init(world, rank, obj[0], vmm)
 
     if rank == 0:
         print(f"# backends: {EpDispatchCombineOp.available_backends()}", flush=True)
