@@ -38,6 +38,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <string>
 
 #include "mori/jit/v2/render.hpp"
@@ -146,6 +147,65 @@ struct EpArgs {
 
   int numTokens = 0;  // tokens this rank contributes this call
 };
+
+// The wire schema, as one list rather than a hand-kept parallel string. The
+// binding builds its ctypes struct from `name:tag` in this order and checks the
+// total against sizeof(EpArgs) -- but sizeof cannot see two same-type fields
+// swapped, and a swapped pointer pair is a kernel reading the wrong buffer with
+// no diagnostic at all. The static_asserts below take the offsets in SCHEMA
+// order, so any disagreement with the declaration order above stops the
+// sequence increasing and fails the build.
+#define MORI_EP_ARGS_FIELDS(X) \
+  X(window, "u64")             \
+  X(offTokOff, "u64")          \
+  X(offRecvNum, "u64")         \
+  X(offRecvToSrc, "u64")       \
+  X(offOutIdx, "u64")          \
+  X(offOutWts, "u64")          \
+  X(offDispOut, "u64")         \
+  X(offOutTok, "u64")          \
+  X(offXdb, "u64")             \
+  X(rank, "i32")               \
+  X(tokenIndices, "p")         \
+  X(inpTokenBuf, "p")          \
+  X(weightsBuf, "p")           \
+  X(outTokenBuf, "p")          \
+  X(outWeightsBuf, "p")        \
+  X(dispDestTokIdMap, "p")     \
+  X(destPeTokenCounter, "p")   \
+  X(totalRecvTokenNum, "p")    \
+  X(gridBarrier, "p")          \
+  X(xdbFlag, "p")              \
+  X(combineBarrierFan, "p")    \
+  X(numTokens, "i32")
+
+#define MORI_EP_ARGS_SCHEMA_ENTRY(name, tag) #name ":" tag ","
+// Trailing comma: the binding skips empty items, and a separator rule that does
+// not special-case the last element is one less thing to get wrong.
+#define MORI_EP_ARGS_SCHEMA MORI_EP_ARGS_FIELDS(MORI_EP_ARGS_SCHEMA_ENTRY)
+
+namespace detail {
+
+#define MORI_EP_ARGS_OFFSET(name, tag) offsetof(::mori::ops::v2::EpArgs, name),
+inline constexpr size_t kEpArgsOffsets[] = {MORI_EP_ARGS_FIELDS(MORI_EP_ARGS_OFFSET)};
+#undef MORI_EP_ARGS_OFFSET
+
+constexpr size_t kEpArgsFieldCount = sizeof(kEpArgsOffsets) / sizeof(kEpArgsOffsets[0]);
+
+constexpr bool EpArgsOffsetsAscend() {
+  for (size_t i = 1; i < kEpArgsFieldCount; ++i)
+    if (kEpArgsOffsets[i] <= kEpArgsOffsets[i - 1]) return false;
+  return true;
+}
+
+}  // namespace detail
+
+static_assert(detail::kEpArgsFieldCount == 22,
+              "added an EpArgs field -- add it to MORI_EP_ARGS_FIELDS in the same position "
+              "and bump this count");
+static_assert(detail::EpArgsOffsetsAscend(),
+              "MORI_EP_ARGS_FIELDS is not in EpArgs declaration order -- the binding would "
+              "write each argument into the wrong slot");
 
 // ---------------------------------------------------------------------------
 // Cfg. Shared by dispatch and combine: they run over the same arena and the

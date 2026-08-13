@@ -260,17 +260,8 @@ int EpNoPrecompile(const std::string&) { return 0; }
 
 }  // namespace
 
-// Field order and types must match EpArgs; the binding builds its ctypes struct
-// from this string and asserts sizeof against the vtable, so drift is a startup
-// error rather than silent corruption.
-#define MORI_EP_ARGS_SCHEMA                                                  \
-  "window:u64,"                                                              \
-  "offTokOff:u64,offRecvNum:u64,offRecvToSrc:u64,offOutIdx:u64,"             \
-  "offOutWts:u64,offDispOut:u64,offOutTok:u64,offXdb:u64,rank:i32,"          \
-  "tokenIndices:p,inpTokenBuf:p,weightsBuf:p,outTokenBuf:p,outWeightsBuf:p," \
-  "dispDestTokIdMap:p,destPeTokenCounter:p,totalRecvTokenNum:p,"             \
-  "gridBarrier:p,xdbFlag:p,combineBarrierFan:p,numTokens:i32"
-
+// MORI_EP_ARGS_SCHEMA is generated from MORI_EP_ARGS_FIELDS next to the struct
+// (ep_cfg.hpp), which also static_asserts that the list is in declaration order.
 MORI_JIT_DEFINE_PLAN(ep_dispatch, mori::ops::v2::EpDispatchSpec, EpDispatchFromFields,
                      mori::ops::v2::EpRequestSchema, mori::ops::v2::Describe, EpNoPrecompile,
                      mori::ops::v2::EpArgs, MORI_EP_ARGS_SCHEMA)

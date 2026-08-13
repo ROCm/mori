@@ -311,6 +311,8 @@ def _args_struct(kernel: str):
         raise RuntimeError(f"mori jit: {_error()}")
     fields = []
     for item in raw.decode().split(","):
+        if not item:
+            continue
         name, _, tag = item.partition(":")
         if tag not in _CTYPE:
             raise RuntimeError(
