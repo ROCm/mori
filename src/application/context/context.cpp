@@ -400,6 +400,8 @@ void Context::EnsureSdmaTransport(int requestedChannels) {
 void Context::BuildAndConnectInitialEndpoints() {
   const int myLocalGpu = LocalRankInNode();
 
+  // Build the worldSize × numQpPerPe rdmaEps vector. Non-RDMA peer slots are
+  // populated with empty stubs to keep the indexing uniform.
   rdmaEps.reserve(static_cast<size_t>(WorldSize()) * numQpPerPe);
   for (int i = 0; i < WorldSize(); i++) {
     if (transportTypes[i] == TransportType::RDMA) {
@@ -419,6 +421,7 @@ void Context::BuildAndConnectInitialEndpoints() {
     }
   }
 
+  // Exchange endpoint handles via AllToAll (worldSize × numQpPerPe handles).
   int totalEps = WorldSize() * numQpPerPe;
   std::vector<RdmaEndpointHandle> localToPeerEpHandles(totalEps);
   std::vector<RdmaEndpointHandle> peerToLocalEpHandles(totalEps);
@@ -428,6 +431,7 @@ void Context::BuildAndConnectInitialEndpoints() {
   bootNet.AllToAll(localToPeerEpHandles.data(), peerToLocalEpHandles.data(),
                    sizeof(RdmaEndpointHandle) * numQpPerPe);
 
+  // Connect each RDMA peer's QPs (INIT -> RTR -> RTS).
   for (int peer = 0; peer < WorldSize(); peer++) {
     if (transportTypes[peer] != TransportType::RDMA) {
       continue;
