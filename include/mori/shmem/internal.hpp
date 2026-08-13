@@ -131,7 +131,6 @@ struct GpuStates {
   uint64_t* internalSyncPtr{nullptr};         // Pointer to the internal synchronization object
 
   // Proxy fields — used when MORI_EP_OVER_RDMA=1
-  bool useProxy{false};
   core::ProxyRing* proxyRings[core::PROXY_MAX_NICS]{};
   uint32_t proxyQuietHead[core::PROXY_MAX_NICS]{};
   int numProxyRings{0};

@@ -630,7 +630,6 @@ void GpuStateInit(ShmemStates* states) {
     states->proxyGpuStates.numNics = numNics;
     states->proxyGpuStates.localGpuIdx = states->gpuStates.rank % numNics;
     states->proxyGpuStates.numQpPerPe = states->rdmaStates->commContext->GetNumQpPerPe();
-    states->gpuStates.useProxy = true;
     states->gpuStates.numProxyRings = allocated;
     states->gpuStates.numNics = numNics;
     states->gpuStates.localGpuIdx = states->gpuStates.rank % numNics;
