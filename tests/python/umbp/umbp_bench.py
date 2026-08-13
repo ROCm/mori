@@ -449,7 +449,7 @@ class UMBPBackend(Backend):
             # the trap this block exists to avoid: buffered reads can be served
             # entirely from page cache, moving zero bytes to the device, which
             # makes any drive-count or DRAM-vs-SSD comparison meaningless.
-            cfg.ssd.direct_io = os.environ.get("UMBP_SSD_DIRECT_IO", "0") not in (
+            cfg.ssd.direct_io = os.environ.get("UMBP_SSD_DIRECT_IO", "1") not in (
                 "0",
                 "",
             )

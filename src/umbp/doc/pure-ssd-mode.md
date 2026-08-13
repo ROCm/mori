@@ -47,7 +47,6 @@ HiCache.
 **Env vars, on each engine:**
 
 ```bash
-export UMBP_SSD_DIRECT_IO=1          # bypass the page cache -- see "Direct I/O"
 export UMBP_SSD_VERIFY_CRC=0         # skip checksums, matching the DRAM tier
 export UMBP_SSD_TIER_IO_THREADS=4
 export UMBP_SSD_DURABILITY=strict    # ~free once direct I/O is on
@@ -135,7 +134,7 @@ a 512 B value occupies 8 KiB. Negligible for multi-MiB KV pages, but size
 
 ## Direct I/O
 
-**Set `UMBP_SSD_DIRECT_IO=1` for any deployment whose numbers you intend to
+**Direct I/O is the default.**  Keep it on for any deployment whose numbers you intend to
 believe.** Without it the tier opens buffered, and reads are served from the
 page cache — a whole working set can be served while moving *zero* bytes to the
 device, which makes drive-count and DRAM-vs-SSD comparisons meaningless.
@@ -145,7 +144,7 @@ far slower, and the tier warns about it.
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `UMBP_SSD_DIRECT_IO` | `0` | `1` = `O_DIRECT`, bypassing the page cache |
+| `UMBP_SSD_DIRECT_IO` | `1` | `O_DIRECT`, bypassing the page cache.  On by default; `0` restores buffered |
 | `UMBP_SSD_VERIFY_CRC` | `1` | `0` = skip checksum verification. Checksumming is 51–67% of GET time and the DRAM tier does none, so turn it off to compare the two without that confound. |
 | `UMBP_SSD_TIER_IO_THREADS` | `4` | Parallelism **within one drive's** batch. Worth ~42% on reads versus 1. |
 | `UMBP_SSD_SHARD_IO_THREADS` | `0` | Parallelism **across drives**. `0` = one per drive; leave it there unless CPU-bound. |
@@ -188,7 +187,7 @@ for HiCache's L3 path to initialize, but `random` routing skips any node that
 
 | Symptom | Likely cause |
 |---|---|
-| Absurd read bandwidth, `iostat` shows ~1% device utilisation | `UMBP_SSD_DIRECT_IO` not set — you are reading the page cache |
+| Absurd read bandwidth, `iostat` shows ~1% device utilisation | You are reading the page cache: either `UMBP_SSD_DIRECT_IO=0`, or the startup probe fell back to buffered (the filesystem rejects `O_DIRECT`).  Check for `direct_io=true` on the `[SSDTier]` init line — requested is not the same as active |
 | Adding drives or nodes doesn't add bandwidth | Writes are skewed. Set `UMBP_ROUTE_PUT_SELECT_ALGO=random`, check `UMBP_ROUTE_PUT_NODE_AFFINITY=none` |
 | `random` set but still skewed | It was set on the engine instead of `umbp_master`. Check the master's startup strategy line |
 | Reads report misses under load | Read staging slots exhausted. Raise `ssd_staging_buffer_slots` or `UMBP_SSD_GET_MAX_ATTEMPTS` |

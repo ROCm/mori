@@ -104,18 +104,25 @@ struct UMBPSsdConfig {
   // against 1.
   int tier_io_threads = 4;
 
-  // Bypass the page cache (O_DIRECT) for all segment I/O.
+  // Bypass the page cache (O_DIRECT) for all segment I/O.  ON by default.
   //
   // The tier is itself a cache, so buffered I/O gives it a second, unmanaged
   // DRAM cache underneath: reads are served from RAM at many times device
   // bandwidth, the node reports DRAM it is actually consuming as free, and any
-  // measurement of drive behaviour is meaningless.  With this on, reported tier
-  // bandwidth is the device's.
+  // measurement of drive behaviour is meaningless.  That second cache is not
+  // free either — it evicts host memory the DRAM tier and the engine are also
+  // competing for, which is why the default is to do without it rather than to
+  // treat it as a bonus.  With this on, reported tier bandwidth is the device's.
   //
   // Requires a filesystem that supports O_DIRECT (ext4/xfs do; tmpfs and
   // overlayfs do not) — the tier probes at startup and falls back to buffered
-  // with a warning rather than failing to come up.
-  bool direct_io = false;
+  // with a warning rather than failing to come up, so a default of `true` is
+  // safe on any filesystem.  It pairs with the io.backend default (io_uring):
+  // forcing POSIX alongside direct I/O gives one blocking pread per key and
+  // warns, because that combination is queue-depth 1.
+  //
+  // Set to false to deliberately measure or exploit the page cache.
+  bool direct_io = true;
 
   // Coalesce concurrent reads of the same key ("single flight").  When several
   // requesters ask for one key while a device read is already outstanding, only
