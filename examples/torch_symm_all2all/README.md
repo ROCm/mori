@@ -26,7 +26,7 @@ writes its own chunk into every peer's receive window, so there are no remote re
 per-peer handshake — just one barrier afterwards, before anyone reads what landed.
 
 ```python
-register_symm_backend()
+import mori.allocator          # importing registers the "MORI" backend
 symm_mem.set_backend("MORI")
 
 recv = symm_mem.empty(world_size * elems, dtype=torch.int32, device=device)

@@ -24,7 +24,7 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 import torch.multiprocessing as mp
-from mori.allocator import flat_layout, handle_type, register_symm_backend
+from mori.allocator import flat_layout, handle_type  # importing registers "MORI"
 
 from tests.python.utils import TorchDistContext, get_free_port
 
@@ -35,7 +35,6 @@ def _run(rank, world_size, port):
         torch.cuda.set_device(device)
         group_name = dist.group.WORLD.group_name
 
-        register_symm_backend()
         symm_mem.set_backend("MORI")
         assert symm_mem.get_backend(device) == "MORI"
         symm_mem.enable_symm_mem_for_group(group_name)

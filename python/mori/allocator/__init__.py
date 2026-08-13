@@ -27,8 +27,7 @@ is needed -- torch's process group is the only rendezvous::
     import torch.distributed._symmetric_memory as symm_mem
     from mori.allocator import register_symm_backend
 
-    register_symm_backend()
-    symm_mem.set_backend("MORI")
+    symm_mem.set_backend("MORI")   # importing mori.allocator registers it
 
     t   = symm_mem.empty(1024, dtype=torch.bfloat16, device=device)
     hdl = symm_mem.rendezvous(t, group_name)
@@ -88,8 +87,10 @@ def _ext():
 def register_symm_backend() -> str:
     """Register the backend with torch and return its name. Idempotent.
 
-    After this, ``symm_mem.set_backend("MORI")`` routes ``symm_mem.empty`` and
-    ``symm_mem.rendezvous`` into mori.
+    Importing this module already does this, so calling it is only needed to force
+    a clear error when the extension is missing. Registering makes ``"MORI"``
+    *selectable*; ``symm_mem.set_backend("MORI")`` is what makes it active, and that
+    stays an explicit choice because other backends may also be available.
     """
     ext = _ext()
     ext.register_backend()
@@ -126,3 +127,19 @@ def flat_layout(handle) -> tuple[int, int]:
 def handle_type(device_index: int = 0) -> Literal["fabric", "posix_fd"]:
     """Which shareable handle type this device can export."""
     return _ext().handle_type(device_index)
+
+
+def _register_on_import() -> None:
+    """Make "MORI" selectable as soon as the module is imported.
+
+    Best effort: if torch or the extension is missing there is nothing to register,
+    and the first real call raises with a useful message instead of turning
+    ``import mori.allocator`` into an error.
+    """
+    try:
+        register_symm_backend()
+    except Exception:  # pragma: no cover - depends on build/runtime environment
+        pass
+
+
+_register_on_import()

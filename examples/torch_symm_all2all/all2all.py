@@ -37,7 +37,7 @@ import sys
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
-from mori.allocator import flat_layout, handle_type, register_symm_backend
+from mori.allocator import flat_layout, handle_type  # importing registers "MORI"
 
 
 def parse_args():
@@ -69,7 +69,6 @@ def main():
     device = torch.device("cuda", local_rank)
     group_name = dist.group.WORLD.group_name
 
-    register_symm_backend()
     symm_mem.set_backend("MORI")
     symm_mem.enable_symm_mem_for_group(group_name)
 
