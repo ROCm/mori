@@ -791,7 +791,6 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
         proxyThreads.push_back(std::move(thread));
       }
     }
-            states->gpuStates.rank, proxyThreads.size(), numNics);
   }
 
   states->status = ShmemStatesStatus::Initialized;
