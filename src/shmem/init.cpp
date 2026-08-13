@@ -631,11 +631,7 @@ void GpuStateInit(ShmemStates* states) {
     MORI_SHMEM_INFO("Proxy: {} rings allocated for {} NICs, localGpuIdx={}",
                     allocated, numNics, states->gpuStates.localGpuIdx);
 
-  }
-
-
-  // Copy communication metadata to GPU — override RDMA → PROXY when proxy active
-  if (states->rdmaStates->commContext->IsProxyEnabled()) {
+    // Copy transport types to GPU — override RDMA → PROXY for inter-node peers
     int worldSize = states->bootStates->worldSize;
     std::vector<application::TransportType> types(
         states->rdmaStates->commContext->GetTransportTypes().begin(),
@@ -651,6 +647,7 @@ void GpuStateInit(ShmemStates* states) {
         states->gpuStates.transportTypes, types.data(),
         sizeof(application::TransportType) * worldSize, hipMemcpyHostToDevice));
   } else {
+    // Copy communication metadata to GPU
     CopyTransportTypesToGpu(states);
   }
   CopyRdmaEndpointsToGpu(states);
