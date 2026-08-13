@@ -49,17 +49,14 @@ void ProxyThread::DrainCq(ProxyQpHandle& qph) {
   while ((n = ibv_poll_cq(qph.cq, 64, wc)) > 0) {
     for (int i = 0; i < n; i++) {
       if (wc[i].opcode == IBV_WC_RECV || wc[i].opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
-        fprintf(stderr, "[PROXY-RECV-CQE] gpu_id=%d opcode=%d status=%d byte_len=%u wr_id=%lu\n",
-                gpu_id_, wc[i].opcode, wc[i].status, wc[i].byte_len, wc[i].wr_id);
         if (wc[i].status == IBV_WC_SUCCESS && wc[i].byte_len >= 16) {
           uint32_t recv_idx = static_cast<uint32_t>(wc[i].wr_id);
+          fprintf(stderr, "[PROXY-RECV] gpu_id=%d recv_idx=%u recv_count=%u recv_buf=%p\n",
+                  gpu_id_, recv_idx, qph.recv_count, qph.recv_buf);
           if (recv_idx < qph.recv_count && qph.recv_buf) {
             struct { uint64_t addr; uint64_t val; } payload;
             memcpy(&payload, reinterpret_cast<char*>(qph.recv_buf) + recv_idx * 64, 16);
             volatile uint64_t* target = reinterpret_cast<volatile uint64_t*>(payload.addr);
-            fprintf(stderr, "[PROXY-RECV] gpu_id=%d target=%p val=%lu byte_len=%u qi=%u\n",
-                    gpu_id_, (void*)target, payload.val, wc[i].byte_len,
-                    qph.qp ? qph.qp->qp_num : 0);
             __atomic_fetch_add(target, payload.val, __ATOMIC_SEQ_CST);
             asm volatile("clflush (%0)" :: "r"(target) : "memory");
             asm volatile("sfence" ::: "memory");
@@ -160,13 +157,7 @@ void ProxyThread::MainLoop() {
 
   uint64_t total_cmds = 0;
   uint64_t total_errors = 0;
-  uint64_t idle_loops = 0;
   while (!ring_->shutdown) {
-    idle_loops++;
-    if (idle_loops % 50000000 == 0)
-      fprintf(stderr, "[PROXY-HB] gpu_id=%d posted=%lu completed=%lu pending=%u head=%u next=%u\n",
-              gpu_id_, total_cmds, ops_completed_, ring_->gpu_head - next_slot_,
-              ring_->gpu_head, next_slot_);
     batch_count = 0;
 
     uint32_t head = ring_->gpu_head;
