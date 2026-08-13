@@ -173,6 +173,16 @@ class PoolClient {
   PoolClientConfig config_;
   std::atomic<bool> initialized_{false};
 
+  // Sample every registered backend's MediumBackend::Counters() and ship the
+  // delta since the last tick.  Registered as a MasterClient metrics provider,
+  // so it runs on the metrics thread, not on any data-plane path.
+  void PublishBackendCounters();
+
+  // Last value shipped, per (backend name, metric name, label set).  Keyed by a
+  // flattened string because the identity is exactly those three things and the
+  // map is touched once per tick — the counters themselves live in the backends.
+  std::unordered_map<std::string, uint64_t> backend_counter_last_;
+
   std::unique_ptr<MasterClient> master_client_;
 
   // Every storage medium live on this node.  Owned here because PoolClient is

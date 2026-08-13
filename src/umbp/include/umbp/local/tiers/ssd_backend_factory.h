@@ -21,22 +21,25 @@
 // SOFTWARE.
 #pragma once
 
-#include <string>
+#include <memory>
 
-#include "umbp/local/tiers/segment/segment_index.h"
-#include "umbp/storage/io/storage_io_driver.h"
+#include "umbp/common/config.h"
+#include "umbp/local/tiers/ssd_tier.h"
+#include "umbp/local/tiers/tier_backend.h"
 
-namespace mori::umbp::segment {
+namespace mori::umbp {
 
-class Scanner {
- public:
-  // `extra_open_flags` is OR'd into open() for segments the scanner discovers —
-  // O_DIRECT when the tier runs unbuffered, so the fds it installs in the index
-  // match the ones SSDTier opens itself.  All of the scanner's own reads are
-  // issued in aligned kRecordAlign blocks so they are legal on such an fd.
-  bool RefreshFromDisk(const std::string& dir, StorageIoDriver& io_driver, Index& index,
-                       bool read_only_shared, bool force_full_rescan, std::string* error_message,
-                       int extra_open_flags = 0) const;
-};
+// Build the `file`-backend SSD tier from @p ssd_config.  One storage directory
+// yields a plain SSDTier; several (comma-separated storage_dir, normally one
+// mount per physical drive) yield a ShardedSsdTier that spreads keys across the
+// drives and drives their IO in parallel.  capacity_bytes is the total budget
+// and is split evenly across the directories.
+//
+// Both the distributed PeerSsdManager and the standalone LocalStorageManager
+// go through here so multi-drive behaves identically in either deployment.
+// The SPDK backends are unaffected: they get multi-device support one level
+// down, from SpdkEnv's RAID0 over a comma-separated UMBP_SPDK_NVME_PCI.
+std::unique_ptr<TierBackend> MakeFileSsdBackend(
+    const UMBPSsdConfig& ssd_config, SSDAccessMode access_mode = SSDAccessMode::ReadWrite);
 
-}  // namespace mori::umbp::segment
+}  // namespace mori::umbp

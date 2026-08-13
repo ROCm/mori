@@ -531,6 +531,27 @@ bool PeerServiceServer::Start(uint16_t port) {
   // the "port may be in use" check below dead code, since BuildAndStart could
   // not fail that way.  Exactly one peer service owns a port.
   builder.AddChannelArgument(GRPC_ARG_ALLOW_REUSEPORT, 0);
+
+  // gRPC's default sync poller pool is small, and every peer RPC that stages
+  // SSD bytes occupies one of those threads for the whole device read.  On a
+  // loopback read (reader and owner are the same node) the default pool is the
+  // binding constraint rather than the drive — the same head-of-line blocking
+  // the master server widens its pool for.  Tunable for large deployments.
+  {
+    auto env_pollers = [](const char* name, int def) -> int {
+      const char* v = std::getenv(name);
+      if (v == nullptr) return def;
+      char* end = nullptr;
+      long n = std::strtol(v, &end, 10);
+      return (end == v || n <= 0) ? def : static_cast<int>(n);
+    };
+    const int min_pollers = env_pollers("UMBP_PEER_MIN_POLLERS", 8);
+    int max_pollers = env_pollers("UMBP_PEER_MAX_POLLERS", 64);
+    if (max_pollers < min_pollers) max_pollers = min_pollers;
+    builder.SetSyncServerOption(grpc::ServerBuilder::SyncServerOption::MIN_POLLERS, min_pollers);
+    builder.SetSyncServerOption(grpc::ServerBuilder::SyncServerOption::MAX_POLLERS, max_pollers);
+  }
+
   builder.AddListeningPort(address, grpc::InsecureServerCredentials());
   builder.RegisterService(service_.get());
   server_ = builder.BuildAndStart();

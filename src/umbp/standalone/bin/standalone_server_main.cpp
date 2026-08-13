@@ -169,6 +169,31 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
     *error = "UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS must be > 0";
     return false;
   }
+  if (!ParseBoolEnv("UMBP_DISTRIBUTED_SSD_STAGING_USE_HUGEPAGES", &dist.ssd_staging_use_hugepages,
+                    error)) {
+    return false;
+  }
+  if (!ParseSizeEnv("UMBP_DISTRIBUTED_SSD_STAGING_HUGEPAGE_SIZE", &dist.ssd_staging_hugepage_size,
+                    error)) {
+    return false;
+  }
+  // The one medium this node serves.  Selecting SSD here is the whole opt-in
+  // for a storage node — there is no separate "pure-SSD mode" flag.  Unknown
+  // values are rejected rather than silently defaulting to DRAM, since serving
+  // the wrong medium is not something a node should discover at runtime.
+  if (const char* medium_env = std::getenv("UMBP_DISTRIBUTED_MEDIUM")) {
+    const std::string m(medium_env);
+    if (m == "DRAM" || m == "dram") {
+      dist.medium = mori::umbp::UMBPMedium::DRAM;
+    } else if (m == "HBM" || m == "hbm") {
+      dist.medium = mori::umbp::UMBPMedium::HBM;
+    } else if (m == "SSD" || m == "ssd") {
+      dist.medium = mori::umbp::UMBPMedium::SSD;
+    } else {
+      *error = "UMBP_DISTRIBUTED_MEDIUM must be one of: DRAM, HBM, SSD";
+      return false;
+    }
+  }
   if (!ParseBoolEnv("UMBP_DISTRIBUTED_CACHE_REMOTE_FETCHES", &dist.cache_remote_fetches, error))
     return false;
   size_t dram_page_size = static_cast<size_t>(dist.dram_page_size);

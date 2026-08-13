@@ -345,6 +345,8 @@ bool PoolClient::Init() {
       ssd_cfg.staging_pages = config_.ssd_staging_buffer_slots > 0
                                   ? static_cast<uint32_t>(config_.ssd_staging_buffer_slots)
                                   : 16;
+      ssd_cfg.staging_use_hugepages = config_.ssd_staging_use_hugepages;
+      ssd_cfg.staging_hugepage_size = config_.ssd_staging_hugepage_size;
       ssd_cfg.ssd = config_.ssd;
       ssd_cfg.ssd.enabled = true;  // selecting SSD IS the opt-in
       ssd_cfg.read_lease_ttl = DramReadLeaseTtl();
@@ -374,6 +376,12 @@ bool PoolClient::Init() {
   }
 
   master_client_->SetBackendRegistry(&registry_);
+
+  // Medium-specific counters (SSD read outcomes, single-flight coalescing,
+  // eviction, staging pressure) ride the existing metrics tick.  Backend-
+  // agnostic by construction: PoolClient forwards whatever each backend names
+  // and never learns which medium produced it.
+  master_client_->AddMetricsProvider([this] { PublishBackendCounters(); });
 
   // Pack engine_desc for master registration.
   std::vector<uint8_t> engine_desc_bytes;
@@ -1822,6 +1830,39 @@ bool PoolClient::EnsurePeerServiceConnection(PeerConnection& peer) {
   peer.peer_stub = std::unique_ptr<void, void (*)(void*)>(
       stub.release(), +[](void* p) { delete static_cast<::umbp::UMBPPeer::Stub*>(p); });
   return true;
+}
+
+void PoolClient::PublishBackendCounters() {
+  if (!master_client_) return;
+
+  for (MediumBackend* backend : registry_.All()) {
+    if (backend == nullptr) continue;
+    const char* backend_name = backend->Name();
+    for (auto& c : backend->Counters()) {
+      if (c.name == nullptr) continue;
+
+      // Identity = backend + metric + labels.  Two backends reporting the same
+      // metric name must not share a delta baseline, or one would cancel the
+      // other's progress out.
+      std::string id = backend_name;
+      id += '\0';
+      id += c.name;
+      for (const auto& [k, v] : c.labels) {
+        id += '\0';
+        id += k;
+        id += '=';
+        id += v;
+      }
+
+      uint64_t& last = backend_counter_last_[id];
+      // Monotonic by contract; a decrease means the backend was rebuilt, so
+      // rebase instead of shipping a negative delta.
+      if (c.value > last) {
+        master_client_->AddCounter(c.name, c.help, c.labels, static_cast<double>(c.value - last));
+      }
+      last = c.value;
+    }
+  }
 }
 
 }  // namespace mori::umbp
