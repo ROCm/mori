@@ -1,0 +1,898 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MORI JIT v2 &mdash; MORI 0.1.0 documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=01f34227"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search"  style="background: #C00000" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            MORI
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#installation-methods">Installation Methods</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#from-source">From Source</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#verification">Verification</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#troubleshooting">Troubleshooting</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-ep-dispatch-and-combine">MORI-EP: Dispatch and Combine</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-io-point-to-point-transfers">MORI-IO: Point-to-Point Transfers</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-shmem-symmetric-memory">MORI Shmem: Symmetric Memory</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-ir-device-bitcode-for-gpu-kernels">MORI-IR: Device Bitcode for GPU Kernels</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#profiling-with-mori-viz">Profiling with MORI-VIZ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#next-steps">Next Steps</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">User Guides</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-GUIDE.html">MORI-EP User Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#kernel-types">1. Kernel Types</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#configuration">2. Configuration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#epdispatchcombineconfig">EpDispatchCombineConfig</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#operator-api">3. Operator API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#epdispatchcombineop">EpDispatchCombineOp</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#dispatch">dispatch()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#combine">combine()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#split-dispatch-combine-send-recv">Split dispatch/combine (send + recv)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#reset">reset()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#get-dispatch-src-token-pos">get_dispatch_src_token_pos()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#get-registered-combine-input-buffer">get_registered_combine_input_buffer()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#standard-moe-compatibility-deepep">4. Standard MoE Compatibility (DeepEP)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#dispatch-standard-moe">dispatch_standard_moe()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#combine-standard-moe">combine_standard_moe()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#convert-dispatch-output">convert_dispatch_output()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#convert-combine-input">convert_combine_input()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#initialization">5. Initialization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#launch-configuration">6. Launch Configuration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#manual-mode-default">Manual Mode (Default)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#auto-mode">Auto Mode</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#complete-example">7. Complete Example</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#environment-variables">8. Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#benchmarking">9. Benchmarking</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#intra-node">Intra-node</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#inter-node">Inter-node</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#reference-performance-deepseek-v3-config">Reference Performance (DeepSeek V3 config)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#tuning">10. Tuning</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#overview">Overview</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#tuning-config-files">Tuning Config Files</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#intra-node-tuning">Intra-node Tuning</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#inter-node-tuning">Inter-node Tuning</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#tuning-on-a-new-gpu-platform">Tuning on a New GPU Platform</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#profiling-with-mori-viz">11. Profiling with MORI-VIZ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#framework-integration">12. Framework Integration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#build-options">Build Options</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-SHMEM-GUIDE.html">MORI Shmem Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#concepts">1. Concepts</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#symmetric-memory">Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#processing-element-pe">Processing Element (PE)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#symmetric-heap">Symmetric Heap</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization">2. Initialization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-3-mpi-communicator-c-mpi-environments">Method 3: MPI Communicator (C++ / MPI environments)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization-comparison">Initialization Comparison</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#finalization">Finalization</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#query-apis">3. Query APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#memory-management">4. Memory Management</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#allocating-symmetric-memory">Allocating Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#freeing-symmetric-memory">Freeing Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#registering-existing-buffers">Registering Existing Buffers</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#p2p-address-translation">5. P2P Address Translation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#synchronization">6. Synchronization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#hip-module-init-triton-integration">7. HIP Module Init (Triton Integration)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization-flags">8. Initialization Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-CCO-GUIDE.html">MORI CCO Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#concepts">1. Concepts</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-CCO-GUIDE.html#communicator-ccocomm">Communicator (<code class="docutils literal notranslate"><span class="pre">ccoComm</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-CCO-GUIDE.html#symmetric-memory-and-windows">Symmetric memory and windows</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-CCO-GUIDE.html#device-communicator-ccodevcomm">Device communicator (<code class="docutils literal notranslate"><span class="pre">ccoDevComm</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-CCO-GUIDE.html#teams">Teams</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#initialization">2. Initialization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#memory-and-windows">3. Memory and Windows</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#device-communicator">4. Device Communicator</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#host-barrier">5. Host Barrier</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#device-side-programming">6. Device-Side Programming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#examples">7. Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#c-api">8. C++ API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#environment-variables">9. Environment Variables</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IR-GUIDE.html">MORI-IR Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#architecture">Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#host-side-python-api">1. Host-Side Python API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#mori-ir-framework-agnostic"><code class="docutils literal notranslate"><span class="pre">mori.ir</span></code> (framework-agnostic)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#mori-ir-triton-triton-specific-reference-backend"><code class="docutils literal notranslate"><span class="pre">mori.ir.triton</span></code> (Triton-specific reference backend)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#device-bitcode">2. Device Bitcode</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#device-functions">3. Device Functions</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#query">Query</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#point-to-point">Point-to-Point</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#putnbi-thread-warp-block">PutNbi (Thread / Warp / Block)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#putnbi-with-signal">PutNbi with Signal</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#immediate-put">Immediate Put</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#atomics">Atomics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#wait">Wait</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#synchronization">Synchronization</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#integration-example-triton">4. Integration Example: Triton</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#integration-example-raw-bitcode-no-framework">5. Integration Example: Raw Bitcode (no framework)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#bitcode-jit-compilation">6. Bitcode JIT Compilation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#examples">7. Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#testing">8. Testing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#known-limitations">Known Limitations</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-GUIDE.html">MORI-IO Introduction</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#design-concepts">Design &amp; Concepts</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#workflow">Workflow</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#architecture">Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#python-api-quick-reference">Python API Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#example-basic-read-write">Example: Basic Read/Write</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#environment-configuration">Environment &amp; Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#profiling-mori-io-with-roctx-markers">Profiling MORI-IO with ROCTX Markers</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="PROFILER.html">MORI-VIZ (Visualizer)</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#instrumentation">Instrumentation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#include-headers">1. Include Headers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#define-profiler-context">2. Define Profiler Context</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#add-trace-points">3. Add Trace Points</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#build-code-generation">Build &amp; Code Generation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#enabling-the-profiler">Enabling the Profiler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#code-generation">Code Generation</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#python-analysis">Python Analysis</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#device-side-elapsed-time-measurement">Device-side Elapsed Time Measurement</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#viewing-the-trace">Viewing the Trace</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#best-practices">Best Practices</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-BENCHMARK.html">MORI-EP Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#intra-node">Intra-node</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#profiling-intranode-kernels">Profiling intranode kernels</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#inter-node">Inter-node</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#nic-selection">NIC Selection</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#bandwidth-computation">Bandwidth Computation</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#rdma-bandwidth">RDMA bandwidth</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="MORI-EP-BENCHMARK.html#algo-bw-vs-physical-bw">Algo BW vs Physical BW</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#nvl-xgmi-bandwidth">NVL / XGMI bandwidth</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#why-deepep-and-mori-rdma-token-counts-are-equivalent">Why DeepEP and Mori RDMA token counts are equivalent</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#combine">Combine</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#reference-print-bw-values-py">Reference: <code class="docutils literal notranslate"><span class="pre">print_bw_values.py</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#profiling-internode-kernels">Profiling Internode Kernels</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#analyzing-traces-with-analyze-ep-kernel-trace-py">Analyzing traces with <code class="docutils literal notranslate"><span class="pre">analyze_ep_kernel_trace.py</span></code></a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-BENCHMARK.html">MORI-IO Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#benchmark-commands">Benchmark Commands</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#fabric-cross-node-scale-up-ualink-super-node">Fabric (cross-node scale-up UALink super-node)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#c-benchmark-nixlbench-matching">C++ Benchmark (nixlbench-matching)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#build">Build</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#run-two-nodes">Run (two nodes)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#sweep-modes">Sweep modes</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#differences-from-the-python-flags">Differences from the Python flags</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#benchmark-arguments">Benchmark Arguments</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-thor2-rdma-read">Results: Thor2 RDMA Read</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-thor2-rdma-write">Results: Thor2 RDMA Write</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#message-size-sweep">Message Size Sweep</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#batch-size-sweep">Batch Size Sweep</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-cx7-rdma-batch-size-1">Results: CX7 RDMA (Batch Size = 1)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#write">Write</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#read">Read</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#benchmark-tuning-guide">Benchmark Tuning Guide</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#recommended-starting-config">Recommended starting config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#parameters-that-help">Parameters that help</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#the-merged-wr-size-limit">The merged-WR size limit</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#parameters-that-usually-do-not-help-or-can-hurt">Parameters that usually do not help (or can hurt)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#host-cpu-vs-gpu-memory">Host (CPU) vs GPU memory</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="api/communication.html">Communication APIs</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-ep-expert-parallelism">MORI-EP (Expert Parallelism)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-shmem-symmetric-memory">MORI Shmem (Symmetric Memory)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-io-point-to-point-i-o">MORI-IO (Point-to-Point I/O)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-ir-device-bitcode-integration">MORI-IR (Device Bitcode Integration)</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api/profiler.html">MORI-VIZ Kernel Profiler</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#usage">Usage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#export-to-perfetto">export_to_perfetto</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#c-profiler-apis">C++ Profiler APIs</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api/umbp.html">UMBP Master Client</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#starting-the-master-server">Starting the Master Server</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbptiertype">UMBPTierType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbpexternalkvnodematch">UMBPExternalKvNodeMatch</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbpmasterclient">UMBPMasterClient</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#cache-hit-tracking">Cache Hit Tracking</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="api/umbp.html#finding-hot-kv-blocks-the-typical-workflow">Finding hot KV blocks (the typical workflow)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="api/umbp.html#lifetime-cumulative-not-a-rate">Lifetime cumulative — not a rate</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbpexternalkvhitcountentry">UMBPExternalKvHitCountEntry</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#usage-examples">Usage Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#end-to-end-example">End-to-End Example</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu"  style="background: #C00000" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">MORI</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">MORI JIT v2</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/MORI_JIT_V2_DESIGN.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="mori-jit-v2">
+<h1>MORI JIT v2<a class="headerlink" href="#mori-jit-v2" title="Link to this heading"></a></h1>
+<p><code class="docutils literal notranslate"><span class="pre">python/mori/ops/dispatch_combine_v2/</span></code> 的 HIP kernel 后端，以及它底下那套通用的 JIT 框架：
+kernel 在 C++ 侧生成、编译、发射，基于 cco-LSA，不依赖 mori-shmem。与既有的 FlyDSL 后端并列，
+同一个 op 类下可切换。</p>
+<section id="id1">
+<h2>1. 核心不变量<a class="headerlink" href="#id1" title="Link to this heading"></a></h2>
+<p>整套设计围绕一条链：</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">Cfg</span> <span class="n">值</span>  <span class="o">=</span>  <span class="n">特化身份</span>  <span class="o">=</span>  <span class="n">渲染出的源码文本</span>  <span class="o">=</span>  <span class="n">sha256</span> <span class="n">缓存</span> <span class="n">key</span>
+</pre></div>
+</div>
+<p>一个配置想影响生成的二进制，只有一条路——变成 <code class="docutils literal notranslate"><span class="pre">EpCfg</span></code> 的字段、被渲染进源码文本；而那段文本
+整个进了缓存 key。没有第二条通道（没有带外的 <code class="docutils literal notranslate"><span class="pre">-D</span></code>，没有人工拼接的 key 片段），所以「配置变了
+但复用了旧二进制」在结构上不成立，而不是靠纪律维持。</p>
+<p>三条推论，后面各节都是它们的展开：</p>
+<ul class="simple">
+<li><p><strong>配置是一个具名的 struct 值</strong>，不是一串位置模板参数，也不是预处理器宏（§3.1）。</p></li>
+<li><p><strong>字段列表只有一份</strong>，渲染、schema、apply、describe 都走同一次遍历，漏字段是编译期错误（§3.2）。</p></li>
+<li><p><strong>host 和 device 共用同一份算术</strong>，而 host 侧不需要 hipcc（§3.5）。</p></li>
+</ul>
+</section>
+<section id="id2">
+<h2>2. 分层<a class="headerlink" href="#id2" title="Link to this heading"></a></h2>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span> Python                              │  C++
+ ────────────────────────────────────┼──────────────────────────────────
+ EpDispatchCombineOp（父类）         │
+   ├─ …OpFlyDSL   backend=&quot;flydsl&quot;   │
+   └─ …OpHip      backend=&quot;hip&quot;  ────┼─► Spec: ep_dispatch / ep_combine
+   arena · scratch · 变体表 · _pick   │        │
+                                     │        ▼
+        ctypes：名值对 / 裸指针       │   Cfg 值 = 特化身份 = 缓存 key
+        ──────────────────────────►  │        │ Render(cfg) → 源码文本
+                                     │        ▼
+                                     │   hipcc --genco → 内容寻址缓存
+                                     │        │ .hsaco
+                                     │        ▼
+                                     │   GetFunction(Spec::EntryName(cfg))
+                                     │   hipModuleLaunchKernel
+</pre></div>
+</div>
+<p>Python 拥有 op 的<strong>状态</strong>（arena、scratch、变体表、routing handle）和调度。
+C++ 拥有<strong>一个 kernel 长什么样</strong>（Cfg → 源码 → 编译 → 几何）。
+Python 不算发射几何、不拼 kernel 名、不决定一个 Cfg 编成什么；<code class="docutils literal notranslate"><span class="pre">plan.info</span></code> 只能读回 C++ 的决定。</p>
+<p>参考过的实现：<strong>CK ck_tile</strong> 的声明式实例模型、<strong>DeepEP</strong> 的内容寻址缓存与目录级原子发布、
+<strong>aiter opus_gemm</strong> 的「绑好的 callable + 行为标志」选择器（§5）。
+mori 特有的简化：走 <code class="docutils literal notranslate"><span class="pre">.hsaco</span></code> + <code class="docutils literal notranslate"><span class="pre">hipModuleGetFunction</span></code> 而非链接，所以不需要 DeepEP 的符号枚举，
+也不需要 CK 的链接期解析。</p>
+</section>
+<section id="kernel">
+<h2>3. 一个 kernel 的三件套<a class="headerlink" href="#kernel" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p></p></th>
+<th class="head"><p>文件</p></th>
+<th class="head"><p>内容</p></th>
+<th class="head"><p>谁编译</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>① Cfg</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">include/mori/ops/dispatch_combine_v2/ep_cfg.hpp</span></code></p></td>
+<td><p>Cfg + Args + <code class="docutils literal notranslate"><span class="pre">VisitFields</span></code> + 共享几何 constexpr</p></td>
+<td><p><strong>两侧</strong>（HIP-free）</p></td>
+</tr>
+<tr class="row-odd"><td><p>② body</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">src/ops/dispatch_combine_v2/ep_intranode_kernel.hpp</span></code>（portable）<br><code class="docutils literal notranslate"><span class="pre">src/ops/dispatch_combine_v2/ep_intranode_1250x.hpp</span></code>（gfx125x TDM）</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">template</span> <span class="pre">&lt;EpCfg</span> <span class="pre">kCfg,</span> <span class="pre">typename</span> <span class="pre">T&gt;</span> <span class="pre">__device__</span> <span class="pre">void</span> <span class="pre">Body(EpArgs)</span></code></p></td>
+<td><p>只有生成的 TU</p></td>
+</tr>
+<tr class="row-even"><td><p>③ Spec</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ep_spec.hpp</span></code> / <code class="docutils literal notranslate"><span class="pre">ep_spec.cpp</span></code></p></td>
+<td><p>Request + <code class="docutils literal notranslate"><span class="pre">EntryName</span></code> + <code class="docutils literal notranslate"><span class="pre">RenderSource</span></code> + <code class="docutils literal notranslate"><span class="pre">Geometry</span></code> + 注册宏</p></td>
+<td><p>host</p></td>
+</tr>
+</tbody>
+</table>
+<p>新增一个 kernel 就是写这三样。<strong>Python 侧零行</strong>——Plan 类由 C++ 发布的 schema 生成。</p>
+<p>框架本身在 <code class="docutils literal notranslate"><span class="pre">include/mori/jit/v2/</span></code> + <code class="docutils literal notranslate"><span class="pre">src/jit/v2/</span></code>（<code class="docutils literal notranslate"><span class="pre">compiler</span></code> / <code class="docutils literal notranslate"><span class="pre">toolchain</span></code> / <code class="docutils literal notranslate"><span class="pre">spec</span></code> / <code class="docutils literal notranslate"><span class="pre">render</span></code> /
+<code class="docutils literal notranslate"><span class="pre">util</span></code> / <code class="docutils literal notranslate"><span class="pre">plan_api</span></code>），不认识任何具体 kernel。</p>
+<section id="cfg-c-20-structural-nttp">
+<h3>3.1 Cfg 作为单一模板参数（C++20 structural NTTP）<a class="headerlink" href="#cfg-c-20-structural-nttp" title="Link to this heading"></a></h3>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="k">template</span><span class="w"> </span><span class="o">&lt;</span><span class="n">EpCfg</span><span class="w"> </span><span class="n">kCfg</span><span class="p">,</span><span class="w"> </span><span class="k">typename</span><span class="w"> </span><span class="nc">T</span><span class="o">&gt;</span>
+<span class="n">__device__</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="n">EpCombineBody</span><span class="p">(</span><span class="n">EpArgs</span><span class="w"> </span><span class="n">args</span><span class="p">);</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">EpCfg</span></code> 是一个 structural type，整个 struct 值作为非类型模板参数传进去。kernel 内部所有开关都是
+<code class="docutils literal notranslate"><span class="pre">if</span> <span class="pre">constexpr</span> <span class="pre">(kCfg.xxx)</span></code>，不是 <code class="docutils literal notranslate"><span class="pre">#if</span></code>。</p>
+<p>差别不是语法糖。<code class="docutils literal notranslate"><span class="pre">#if</span></code> 的条件来自命令行 <code class="docutils literal notranslate"><span class="pre">-D</span></code>——带外、不进缓存 key、散落在源码各处；<code class="docutils literal notranslate"><span class="pre">if</span> <span class="pre">constexpr</span></code>
+的条件来自 Cfg 字段——进 key、有类型、有守护、IDE 能跳转。相对于一长串位置绑定的模板参数
+（DeepEP 和 CK 都是全 <code class="docutils literal notranslate"><span class="pre">int</span></code> 的位置展开），具名字段还消掉了「调换两个同类型参数照样编过」这一类隐患。</p>
+</section>
+<section id="id3">
+<h3>3.2 字段列表的完整性是承重的<a class="headerlink" href="#id3" title="Link to this heading"></a></h3>
+<p>渲染器漏一个字段，生成的源码里就没有它，kernel 拿到默认值 → <strong>静默跑错的 kernel</strong>，比缓存失效严重。</p>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="k">struct</span><span class="w"> </span><span class="nc">EpCfg</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="n">worldSize</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8</span><span class="p">;</span><span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="n">hiddenDim</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">7168</span><span class="p">;</span><span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="n">maxTokPerRank</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">128</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="n">numExpertPerRank</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8</span><span class="p">;</span><span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="n">numExpertPerToken</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="n">maxRecv</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w">              </span><span class="c1">// 0 = worldSize*maxTokPerRank；同时是 flat index 的 stride</span>
+<span class="w">  </span><span class="n">EpDType</span><span class="w"> </span><span class="n">dtype</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">EpDType</span><span class="o">::</span><span class="n">Bf16</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="n">blockNum</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">64</span><span class="p">;</span><span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="n">warpPerBlock</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">16</span><span class="p">;</span><span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="n">waveSize</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">64</span><span class="p">;</span><span class="w">   </span><span class="c1">// 几何，host 算（§3.5）</span>
+<span class="w">  </span><span class="kt">bool</span><span class="w"> </span><span class="n">useWeights</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">true</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">template</span><span class="w"> </span><span class="o">&lt;</span><span class="k">typename</span><span class="w"> </span><span class="nc">Self</span><span class="p">,</span><span class="w"> </span><span class="k">typename</span><span class="w"> </span><span class="nc">Visit</span><span class="o">&gt;</span>
+<span class="kr">inline</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="n">VisitFields</span><span class="p">(</span><span class="n">Self</span><span class="o">&amp;</span><span class="w"> </span><span class="n">c</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="n">EpCfg</span><span class="o">&amp;</span><span class="w"> </span><span class="n">d</span><span class="p">,</span><span class="w"> </span><span class="n">Visit</span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">v</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="cp">#define MORI_FIELD(x) v(#x, c.x, d.x)</span>
+<span class="w">  </span><span class="n">MORI_FIELD</span><span class="p">(</span><span class="n">worldSize</span><span class="p">);</span><span class="w"> </span><span class="p">...</span><span class="w"> </span><span class="n">MORI_FIELD</span><span class="p">(</span><span class="n">useWeights</span><span class="p">);</span>
+<span class="cp">#undef MORI_FIELD</span>
+<span class="p">}</span>
+<span class="n">MORI_JIT_ASSERT_FIELD_COUNT</span><span class="p">(</span><span class="n">EpCfg</span><span class="p">,</span><span class="w"> </span><span class="mi">11</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;加了字段就要同步 VisitFields&quot;</span><span class="p">);</span>
+</pre></div>
+</div>
+<p>加字段 = 三处编辑（struct、<code class="docutils literal notranslate"><span class="pre">MORI_FIELD</span></code>、计数），漏掉任何一处都是<strong>编译期红字</strong>。
+<code class="docutils literal notranslate"><span class="pre">FieldCount&lt;T&gt;()</span></code> 用 <code class="docutils literal notranslate"><span class="pre">requires</span></code> 递归探测 aggregate 成员数，嵌套 struct 计为 1。</p>
+<p><strong>一次遍历，四个消费者</strong>：<code class="docutils literal notranslate"><span class="pre">Render</span></code>（缓存 key）、<code class="docutils literal notranslate"><span class="pre">Describe</span></code>（<code class="docutils literal notranslate"><span class="pre">info</span></code>）、request schema（发给 Python）、
+<code class="docutils literal notranslate"><span class="pre">EpApplyFields</span></code>（请求 → struct）。所以加字段 Python 自动看得见。</p>
+<p><strong>只发非默认字段</strong>：加一个默认不改行为的字段，已有实例的文本不变 → 缓存不失效。若新字段在默认值下
+也改了 kernel 代码，文本虽没变但 include 哈希会变，照样重编。两级哈希各管一头。</p>
+<p><strong><code class="docutils literal notranslate"><span class="pre">EpArgs</span></code> 同理</strong>。它的 wire schema 由一份 <code class="docutils literal notranslate"><span class="pre">MORI_EP_ARGS_FIELDS(X)</span></code> 生成，并按同一顺序取 <code class="docutils literal notranslate"><span class="pre">offsetof</span></code>
+断言递增。只对 <code class="docutils literal notranslate"><span class="pre">sizeof</span></code> 设防不够：22 个字段里 8 个是裸指针，调换两个同类型字段所有尺寸校验都过，
+kernel 安静地读错 buffer。按 schema 顺序取的 offset 序列一旦不再递增，就是编译期错误。</p>
+</section>
+<section id="id4">
+<h3>3.3 生成的源码<a class="headerlink" href="#id4" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">RenderSource</span></code> 产出的就是完整的一个 TU：</p>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="c1">// mori jit v2 — generated, do not edit.</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;src/ops/dispatch_combine_v2/ep_intranode_kernel.hpp&quot;</span>
+<span class="k">using</span><span class="w"> </span><span class="k">namespace</span><span class="w"> </span><span class="nn">mori</span><span class="o">::</span><span class="nn">ops</span><span class="o">::</span><span class="nn">v2</span><span class="p">;</span>
+<span class="k">constexpr</span><span class="w"> </span><span class="n">EpCfg</span><span class="w"> </span><span class="n">kCfg</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">EpCfg</span><span class="p">{.</span><span class="n">hiddenDim</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span><span class="w"> </span><span class="p">.</span><span class="n">maxTokPerRank</span><span class="o">=</span><span class="mi">512</span><span class="p">,</span><span class="w"> </span><span class="p">.</span><span class="n">maxRecv</span><span class="o">=</span><span class="mi">4096</span><span class="p">};</span>
+<span class="k">using</span><span class="w"> </span><span class="n">TokT</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">hip_bfloat16</span><span class="p">;</span>
+<span class="k">extern</span><span class="w"> </span><span class="s">&quot;C&quot;</span><span class="w"> </span><span class="n">__global__</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="n">__launch_bounds__</span><span class="p">(</span><span class="n">EpBlockThreads</span><span class="p">(</span><span class="n">kCfg</span><span class="p">))</span>
+<span class="n">mori_ep_dispatch_bf16_ws8_h2048_k8_64x16</span><span class="p">(</span><span class="n">EpArgs</span><span class="w"> </span><span class="n">args</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">EpDispatchBody</span><span class="o">&lt;</span><span class="n">kCfg</span><span class="p">,</span><span class="w"> </span><span class="n">TokT</span><span class="o">&gt;</span><span class="p">(</span><span class="n">args</span><span class="p">);</span><span class="w"> </span><span class="p">}</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p><strong>入口名由 <code class="docutils literal notranslate"><span class="pre">Spec::EntryName(cfg)</span></code> 生成</strong>，描述哪个 kernel、哪个 body、什么 dtype、形状和几何——
+否则 profile 里 dispatch、combine 和调优表为每个 token 档选出的每组几何全是同一行。
+要守的不变量不是「名字是常量」而是「<strong>Python 不拼 kernel 名</strong>」：名字在 C++ 里只写一处，
+渲染器把它写进源码、<code class="docutils literal notranslate"><span class="pre">Prepare</span></code> 把<strong>同一个字符串</strong>交给 <code class="docutils literal notranslate"><span class="pre">hipModuleGetFunction</span></code>，改名不可能漏改查找。
+名字里的字段都已在 Cfg 里，不给缓存 key 增加新维度。不覆盖 <code class="docutils literal notranslate"><span class="pre">EntryName</span></code> 的 Spec 退回匿名的
+<code class="docutils literal notranslate"><span class="pre">mori_jit_entry</span></code>。</p></li>
+<li><p><strong>文本即 key</strong> → 配置不可能不进 key。</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">__launch_bounds__</span></code> 是表达式不是数字</strong> → 由 host/device 共用的同一个 constexpr 算出。</p></li>
+<li><p><strong>arch 路由在 host 侧</strong>：include 哪个 body、调哪个函数，由 <code class="docutils literal notranslate"><span class="pre">RenderSource</span></code> 按
+<code class="docutils literal notranslate"><span class="pre">GetToolchain().arch</span></code> 决定——gfx125x 渲染 <code class="docutils literal notranslate"><span class="pre">ep_intranode_1250x.hpp</span></code> 的 TDM 版本，其余渲染 portable
+版。不是 device <code class="docutils literal notranslate"><span class="pre">#if</span></code>：渲染时看到的 arch 就是 <code class="docutils literal notranslate"><span class="pre">--offload-arch</span></code> 的 arch，两侧不可能不一致；而这个
+选择写在源码文本里，所以自动进 key，两种 body 各有自己的缓存条目。</p></li>
+</ul>
+<p><strong>为什么生成不能放 Python</strong>：Cfg 同时是 NTTP 类型，Python 渲染就要自己维护一份字段列表和默认值
+→ 两张清单的问题原样回来。几何算术同理——device 侧也要调它。</p>
+</section>
+<section id="id5">
+<h3>3.4 缓存<a class="headerlink" href="#id5" title="Link to this heading"></a></h3>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>~/.mori/jit/&lt;arch&gt;_&lt;nic&gt;/kernel.&lt;name&gt;.&lt;hash&gt;/{kernel.hip, kernel.hsaco}
+hash = sha256(name $$ hipcc签名 $$ nic $$ flags $$ include哈希 $$ 源码文本)
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">include</span> <span class="pre">哈希</span></code>是对 <code class="docutils literal notranslate"><span class="pre">SourceDeps()</span></code> 列出的目录做一次排序递归遍历，把每个头文件的<strong>相对路径和内容</strong>
+都摘进去。粗粒度是刻意的：它可能过度失效，但不会漏失效。EP 的依赖集是
+<code class="docutils literal notranslate"><span class="pre">include/mori</span></code>、<code class="docutils literal notranslate"><span class="pre">src/ops/dispatch_combine_v2</span></code>、<code class="docutils literal notranslate"><span class="pre">src/cco</span></code>。</p>
+<p>发布无锁（抄 DeepEP）：编到 <code class="docutils literal notranslate"><span class="pre">tmp/&lt;uuid&gt;/</span></code> → 递归 fsync → 目录级 <code class="docutils literal notranslate"><span class="pre">rename</span></code>。抢输的删自己的、用赢家的
+——赢家的内容一定字节相同，因为目录名就是内容哈希。</p>
+<p><code class="docutils literal notranslate"><span class="pre">&lt;arch&gt;_&lt;nic&gt;</span></code> 只为人读，正确性不依赖它，两者都已在摘要里。<strong>NIC 必须进 key</strong>：intranode LSA 不链
+NIC 相关的东西，但设备侧 GDA 会——<code class="docutils literal notranslate"><span class="pre">libmori_cco_device.bc</span></code> 本身就按 arch+NIC 现编。NIC 是进程级事实，
+读 <code class="docutils literal notranslate"><span class="pre">MORI_DEVICE_NIC</span></code>（与 CMake、<code class="docutils literal notranslate"><span class="pre">python/mori/jit/config.py</span></code> 同一个权威），不在 JIT 层另做探测。</p>
+<blockquote>
+<div><p><strong>纪律：凡是以二进制形式进入编译的东西，哈希它的字节，不是它的路径。</strong>
+<code class="docutils literal notranslate"><span class="pre">-mlink-builtin-bitcode=.../libmori_cco_device.bc</span></code> 的路径会随 flags 进 key，但那份 <code class="docutils literal notranslate"><span class="pre">.bc</span></code> 的
+内容不会——而它自己就是 JIT 产物。GDA 落地时必须按 include 哈希同样的办法处理。</p>
+</div></blockquote>
+<p>进程内还有一层 module 缓存，按 <code class="docutils literal notranslate"><span class="pre">(device,</span> <span class="pre">缓存目录)</span></code> 索引：<code class="docutils literal notranslate"><span class="pre">hipModuleLoad</span></code> 绑定调用线程的当前设备，
+一个进程可能驱动多张卡。</p>
+</section>
+<section id="host-device-host-hipcc">
+<h3>3.5 host/device 常量只有一份，且 host 不需要 hipcc<a class="headerlink" href="#host-device-host-hipcc" title="Link to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>层</p></th>
+<th class="head"><p>内容</p></th>
+<th class="head"><p>谁编译</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Cfg + 共享算术</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ep_cfg.hpp</span></code></p></td>
+<td><p><strong>两侧</strong>：host <code class="docutils literal notranslate"><span class="pre">g++</span></code>，device <code class="docutils literal notranslate"><span class="pre">hipcc</span> <span class="pre">-std=c++20</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>JIT 运行时</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">compiler</span></code>/<code class="docutils literal notranslate"><span class="pre">toolchain</span></code>/<code class="docutils literal notranslate"><span class="pre">spec</span></code>/<code class="docutils literal notranslate"><span class="pre">plan_api</span></code></p></td>
+<td><p>普通 C++ 编译器（只用 <code class="docutils literal notranslate"><span class="pre">hip_runtime_api.h</span></code>）</p></td>
+</tr>
+<tr class="row-even"><td><p>kernel body</p></td>
+<td><p>HIP intrinsic、<code class="docutils literal notranslate"><span class="pre">__global__</span></code></p></td>
+<td><p>只有<strong>生成的 TU</strong></p></td>
+</tr>
+</tbody>
+</table>
+<p><code class="docutils literal notranslate"><span class="pre">mori_jit</span></code> 和 <code class="docutils literal notranslate"><span class="pre">mori_ops_v2</span></code> 只链 <code class="docutils literal notranslate"><span class="pre">hip::host</span></code>，构建期不需要 hipcc——需要它的时刻是运行期第一次
+<code class="docutils literal notranslate"><span class="pre">Prepare</span></code>。三条约束保证这点，而违反了照样编过、只是悄悄把 host 拖进 hipcc，所以有 CI 守护
+（<code class="docutils literal notranslate"><span class="pre">tools/jit_v2/check_host_device_split.sh</span></code>，已接入 ctest 的 <code class="docutils literal notranslate"><span class="pre">jit_host_device_split</span></code>）：</p>
+<ol class="arabic simple">
+<li><p>Cfg 头<strong>不得 include 任何 HIP 头</strong>。dtype 用 <code class="docutils literal notranslate"><span class="pre">enum</span> <span class="pre">class</span> <span class="pre">EpDType</span></code> 标签，渲染时才展开成真实类型名。</p></li>
+<li><p>共享算术用<strong>无属性 <code class="docutils literal notranslate"><span class="pre">constexpr</span></code></strong>，不写 <code class="docutils literal notranslate"><span class="pre">__host__</span> <span class="pre">__device__</span></code>——后者会强制 host TU 走 hipcc。
+DeepEP 的 <code class="docutils literal notranslate"><span class="pre">TokenLayout</span></code> 是 <code class="docutils literal notranslate"><span class="pre">__device__</span> <span class="pre">__host__</span></code> 的（它 host 侧本来就过 nvcc），这点不能照抄。</p></li>
+<li><p>host 侧不用 C++20 指派初始化。</p></li>
+</ol>
+<p><strong>C++20 的范围</strong>：<code class="docutils literal notranslate"><span class="pre">FieldCount</span></code> 的探测必须用 requires-expression——C++17 下 gcc 和 clang 都把
+“初始化器过多”当硬错误而非替换失败。所以持有 Cfg 的三个目标（<code class="docutils literal notranslate"><span class="pre">mori_jit</span></code>/<code class="docutils literal notranslate"><span class="pre">mori_ops_v2</span></code>/<code class="docutils literal notranslate"><span class="pre">test_jit_core</span></code>）
+按 C++20 编，生成的设备 TU 无条件 C++20，mori 其余部分保持 C++17。<strong>”host 不需要 hipcc”不受影响</strong>。</p>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="c1">// ep_cfg.hpp —— 两侧共用</span>
+<span class="k">constexpr</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="nf">EpBlockThreads</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="n">EpCfg</span><span class="o">&amp;</span><span class="w"> </span><span class="n">c</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="n">c</span><span class="p">.</span><span class="n">warpPerBlock</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">c</span><span class="p">.</span><span class="n">waveSize</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="k">constexpr</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="nf">EpMaxRecv</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="n">EpCfg</span><span class="o">&amp;</span><span class="w"> </span><span class="n">c</span><span class="p">);</span><span class="w">            </span><span class="c1">// 也是 flat index 的 stride</span>
+<span class="k">constexpr</span><span class="w"> </span><span class="kt">bool</span><span class="w"> </span><span class="nf">EpCfgIsValid</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="n">EpCfg</span><span class="o">&amp;</span><span class="w"> </span><span class="n">c</span><span class="p">);</span><span class="w">        </span><span class="c1">// 编不出来的 Cfg 是 host 侧错误</span>
+
+<span class="c1">// ep_spec.cpp —— host 侧，arch 默认集中在这里</span>
+<span class="n">EpCfg</span><span class="w"> </span><span class="nf">MakeEpCfg</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="o">&amp;</span><span class="w"> </span><span class="n">arch</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="n">EpRequest</span><span class="o">&amp;</span><span class="w"> </span><span class="n">req</span><span class="p">,</span><span class="w"> </span><span class="n">EpKernelKind</span><span class="w"> </span><span class="n">kind</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="n">c</span><span class="p">.</span><span class="n">waveSize</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">mori</span><span class="o">::</span><span class="n">jit</span><span class="o">::</span><span class="n">v2</span><span class="o">::</span><span class="n">WaveSizeForArch</span><span class="p">(</span><span class="n">arch</span><span class="p">);</span><span class="w">    </span><span class="c1">// gfx12* = 32，其余 64</span>
+<span class="w">  </span><span class="n">c</span><span class="p">.</span><span class="n">blockNum</span><span class="w">     </span><span class="o">=</span><span class="w"> </span><span class="mi">64</span><span class="p">;</span><span class="w">                              </span><span class="c1">// dispatch 搬运，combine 归约</span>
+<span class="w">  </span><span class="n">c</span><span class="p">.</span><span class="n">warpPerBlock</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">isDispatch</span><span class="w"> </span><span class="o">?</span><span class="w"> </span><span class="mi">16</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="mi">8</span><span class="p">;</span>
+<span class="w">  </span><span class="p">...</span><span class="w">                                               </span><span class="c1">// env 覆盖，唯一读环境变量的地方</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">MakeEpCfg</span></code> 也是拒绝非法组合的地方：<code class="docutils literal notranslate"><span class="pre">EpCfgIsValid</span></code> 不过就抛（token 字节数必须 16B 对齐、
+topk 和 worldSize 必须装进一个 wavefront、recv 容量必须覆盖最坏情况），combine 那条腿上的 <code class="docutils literal notranslate"><span class="pre">Byte8</span></code>
+单独拒绝（§3.7）。一个编不出来或跑错的 Cfg 是构造期错误，不是运行期的错误数字。</p>
+</section>
+<section id="id6">
+<h3>3.6 环境变量<a class="headerlink" href="#id6" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">MakeEpCfg</span></code> 末尾是<strong>唯一</strong>读 <code class="docutils literal notranslate"><span class="pre">MORI_V2_EP_*</span></code>（几何覆盖）的地方，而且只做覆盖不做决定。覆盖后的 Cfg
+照常进 key，所以拿环境变量做 A/B 不会复用到对方的二进制。</p>
+<p>工具链层另有一组只影响解析的变量：<code class="docutils literal notranslate"><span class="pre">MORI_JIT_ARCH</span></code>、<code class="docutils literal notranslate"><span class="pre">MORI_JIT_HIPCC</span></code>、<code class="docutils literal notranslate"><span class="pre">MORI_SOURCE_ROOT</span></code>、
+<code class="docutils literal notranslate"><span class="pre">MORI_JIT_CACHE_DIR</span></code>、<code class="docutils literal notranslate"><span class="pre">MORI_JIT_EXTRA_FLAGS</span></code>（进 flags，所以进 key）、<code class="docutils literal notranslate"><span class="pre">MORI_DEVICE_NIC</span></code>，
+以及两个诊断用的 <code class="docutils literal notranslate"><span class="pre">MORI_JIT_VERBOSE</span></code> / <code class="docutils literal notranslate"><span class="pre">MORI_JIT_KEEP_FAILED</span></code>。</p>
+</section>
+<section id="dtype">
+<h3>3.7 dtype 是传输属性，不是算术属性<a class="headerlink" href="#dtype" title="Link to this heading"></a></h3>
+<p>dispatch 只<strong>搬运</strong>它的载荷（gfx9xx 是 <code class="docutils literal notranslate"><span class="pre">WarpCopy</span></code>，gfx125x 是一发 TDM tile），从不对元素做算术。
+combine 要<strong>归约</strong>。这个不对称决定了 dtype 怎么建模：</p>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="k">enum</span><span class="w"> </span><span class="k">class</span><span class="w"> </span><span class="nc">EpDType</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">Bf16</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">Fp32</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="n">Byte8</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="w"> </span><span class="p">};</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">Byte8</span></code> 是传输类型，渲染成 <code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">char</span></code>：fp8 直接用它，fp4 也用它、由调用方把 hiddenDim 减半
+（2 个 e2m1 挤一个字节）。所以支持 fp8/fp4 dispatch <strong>没有新增 kernel</strong>，只是打通 dtype 这条链。
+<code class="docutils literal notranslate"><span class="pre">MakeEpCfg</span></code> 在 combine 那条腿上拒绝 <code class="docutils literal notranslate"><span class="pre">Byte8</span></code>——它要求和，字节类型在那里能编过但会静默把字节加起来。</p>
+<p>两条腿本来就是两个独立的 Plan，各带各的 dtype 和元素数，所以「非对称」（fp8/fp4 进、bf16 出）不是
+一个特例路径，就是两个普通 kernel。arena 按 <code class="docutils literal notranslate"><span class="pre">token_nbytes</span></code> / <code class="docutils literal notranslate"><span class="pre">combine_token_nbytes</span></code> 分别定尺寸——
+这是 fp4 唯一正确的算法。mori 在这里<strong>不做量化</strong>：载荷进来时就已经是打包好的。</p>
+</section>
+</section>
+<section id="op">
+<h2>4. op 层<a class="headerlink" href="#op" title="Link to this heading"></a></h2>
+<p>op 在 Python，因为它持有的全是状态。C++ 侧没有对应的类。</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">EpDispatchCombineOp</span><span class="p">:</span>          <span class="c1"># dispatch_combine_op.py —— 后端无关 + 入口</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__new__</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">cfg</span><span class="p">,</span> <span class="n">comm</span><span class="p">)</span>     <span class="c1"># 按 cfg.kernel_backend 分发到子类</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">dispatch</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="nb">input</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="n">scales</span><span class="p">,</span> <span class="n">indices</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">routing</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">return_routing</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">combine</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="nb">input</span><span class="p">,</span> <span class="n">weights</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">indices</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">routing</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_pick</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">num_tokens</span><span class="p">)</span>     <span class="c1"># 在**已编好的**变体里挑</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">reset</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">/</span> <span class="n">close</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>对称内存由 <code class="docutils literal notranslate"><span class="pre">SymmArena</span></code> 管：一个 cco window 按 256B 对齐切成具名 region，peer 的同名 region 用
+<code class="docutils literal notranslate"><span class="pre">cco.Window(handle).lsa_ptr(pe,</span> <span class="pre">off)</span></code> 取。两个后端共用同一套 region 名，所以任一后端的 kernel
+都能读另一方布出来的 arena。</p>
+<p>三条时序约束，顺序不能换：</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>comm → arena → 每变体一个 Plan（编译）→ launch
+                       ↑  graph capture 必须在这之后
+</pre></div>
+</div>
+<ul class="simple">
+<li><p><strong>arena 在编译前</strong>：kernel 要 window handle，它只有 arena 建好才存在。</p></li>
+<li><p><strong>编译在 graph 捕获前</strong>：捕获期不能 fork hipcc。所以 <code class="docutils literal notranslate"><span class="pre">Prepare</span></code>/<code class="docutils literal notranslate"><span class="pre">Launch</span></code> 是两个接口，
+而不是 DeepEP 那样每次 launch 都 generate+build 靠内存 map 兜。</p></li>
+<li><p><strong>变体表在 <code class="docutils literal notranslate"><span class="pre">_pick</span></code> 前编全</strong>：<code class="docutils literal notranslate"><span class="pre">_pick</span></code> 只查表并 clamp 到真编出来的变体，关键路径上绝不触发编译。
+与 opus_gemm 那条「启发式能返回的 kid 必须在编译子集里」是同一个不变量，只是靠 map 查而非
+codegen 期 assert。</p></li>
+</ul>
+<p>捕获已实测（<code class="docutils literal notranslate"><span class="pre">tests/python/ops/dispatch_combine_v2/test_graph_capture.py</span></code>）：dispatch → identity
+expert → combine 整步捕成一张图，replay 反复复现同一结果。能成立还差一个条件，而它在 kernel 里：
+<strong>跨设备 barrier 的 epoch 由设备侧自增</strong>（dispatch 结尾 <code class="docutils literal notranslate"><span class="pre">atomicAdd(xdbFlag,</span> <span class="pre">1)</span></code>）。若由 host 算好写
+下去，捕获会把一个定值冻进图里，第一次之后每次 replay 要么空转要么白过——这正是那个测试要抓的东西，
+另一个是 op 里混进 host 同步（<code class="docutils literal notranslate"><span class="pre">.item()</span></code>/<code class="docutils literal notranslate"><span class="pre">.cpu()</span></code>）会直接让捕获失败。</p>
+</section>
+<section id="id7">
+<h2>5. 两个后端共用一个 op<a class="headerlink" href="#id7" title="Link to this heading"></a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">EpDispatchCombineOp(cfg,</span> <span class="pre">comm)</span></code> 按 <code class="docutils literal notranslate"><span class="pre">cfg.kernel_backend</span></code>（或 <code class="docutils literal notranslate"><span class="pre">MORI_V2_KERNEL_BACKEND</span></code>，默认
+<code class="docutils literal notranslate"><span class="pre">flydsl</span></code>）选出子类；也可直接实例化 <code class="docutils literal notranslate"><span class="pre">EpDispatchCombineOpHip</span></code>，<code class="docutils literal notranslate"><span class="pre">isinstance</span></code> 对两者都成立。</p>
+<p><strong>父类拥有 op 本身</strong>——<code class="docutils literal notranslate"><span class="pre">dispatch()</span></code>/<code class="docutils literal notranslate"><span class="pre">combine()</span></code>/<code class="docutils literal notranslate"><span class="pre">_pick</span></code>/视图/生命周期各只有一份。子类填三样：</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">_regions</span><span class="p">(</span><span class="n">cfg</span><span class="p">)</span>               <span class="c1"># 这个后端要哪些 arena region</span>
+<span class="n">_build_kernels</span><span class="p">(</span><span class="n">cfg</span><span class="p">,</span> <span class="n">arena</span><span class="p">)</span>  <span class="c1"># 编好的变体 + KernelSet</span>
+<span class="n">_unsupported</span><span class="p">(</span><span class="n">cfg</span><span class="p">)</span>           <span class="c1"># 它做不到什么</span>
+</pre></div>
+</div>
+<p><strong>行为差异是数据，不是 override。</strong> <code class="docutils literal notranslate"><span class="pre">KernelSet</span></code> 上挂 <code class="docutils literal notranslate"><span class="pre">stages_in_kernel</span></code>（combine 的暂存拷贝在
+kernel 内还是 host 侧）、<code class="docutils literal notranslate"><span class="pre">self_resets_counters</span></code>、<code class="docutils literal notranslate"><span class="pre">capabilities</span></code> / <code class="docutils literal notranslate"><span class="pre">unsupported</span></code>。形状抄自 aiter 的
+<code class="docutils literal notranslate"><span class="pre">MOEMetadata</span></code>——但不抄它事后拆 <code class="docutils literal notranslate"><span class="pre">functools.partial</span></code> 反查身份那一手，那是把身份丢掉又猜回来。</p>
+<p>唯一没法变成数据的是<strong>调用约定</strong>，所以它被吸收进 <code class="docutils literal notranslate"><span class="pre">_build_kernels</span></code>：返回的 callable 已经是父类的
+具名签名，FlyDSL 的位置参数和 ctypes plan 的关键字参数各自在 <code class="docutils literal notranslate"><span class="pre">_wrap_*</span></code> 里适配。</p>
+<p><strong>特性面是真包含不是交集</strong>：HIP 后端做 gather combine，dispatch 收 bf16/fp32/fp8/fp4、combine 出
+bf16/fp32（§3.7），其余一概不接：scatter、量化（<code class="docutils literal notranslate"><span class="pre">quant_type</span></code>，与直接传已量化载荷是两回事）、
+StdMoE、per-token scales、routing replay、<code class="docutils literal notranslate"><span class="pre">local_expert_count</span></code>。能力门在<strong>构造期</strong>跑、且在分配 arena
+之前——问它要 scatter 会当场报错并列出缺什么，而不是发射时给出错误数字，也不会先占住一个对称 window
+再失败。</p>
+<p><code class="docutils literal notranslate"><span class="pre">_regions</span></code> 归子类还消掉一个陷阱：FlyDSL 的 <code class="docutils literal notranslate"><span class="pre">off_out_tok</span></code> 对 dispatch 指 <code class="docutils literal notranslate"><span class="pre">disp_out</span></code>、对 combine 指
+<code class="docutils literal notranslate"><span class="pre">out_tok</span></code>，任何共享的 offset 传递路径都会静默接错 buffer。</p>
+<p><strong>选后端只 import 那一个</strong>：<code class="docutils literal notranslate"><span class="pre">dispatch_combine_op</span></code> 不 import 任何后端，选 <code class="docutils literal notranslate"><span class="pre">hip</span></code> 不会拉进 flydsl，
+所以它在没装 FlyDSL 的机器上能跑。</p>
+<section id="dispatch-combine">
+<h3>5.1 几何调优表：每个后端一份，dispatch 和 combine 再分开<a class="headerlink" href="#dispatch-combine" title="Link to this heading"></a></h3>
+<p>调优表也归后端。<code class="docutils literal notranslate"><span class="pre">hip_tuning_configs.py</span></code> 不 import FlyDSL 的 <code class="docutils literal notranslate"><span class="pre">tuning_configs</span></code>——不同 kernel、不同最优点，
+借过来只会得到一个看起来合理的错答案。</p>
+<p>表内再拆成两张：<code class="docutils literal notranslate"><span class="pre">_DISPATCH_TABLE</span></code> 带 dtype 键，<code class="docutils literal notranslate"><span class="pre">_COMBINE_TABLE</span></code> 不带。因为 <strong>combine 根本不依赖
+dispatch 的 dtype</strong>——它只归约 bf16/fp32 的暂存区，不管前面搬来的是什么。合成一张表就必须给 combine
+挂一个假的 dtype 轴，然后维护三份相同的答案。<code class="docutils literal notranslate"><span class="pre">lookup()</span></code> 把两张表合成 op 要的那条 schedule，能处理两边
+桶边界不对齐的情况，所以任一半都能单独重调。</p>
+<p>键是 <code class="docutils literal notranslate"><span class="pre">(world_size,</span> <span class="pre">hidden_dim,</span> <span class="pre">topk,</span> <span class="pre">experts_per_rank)</span></code>，值是一串
+<code class="docutils literal notranslate"><span class="pre">(max_tok_inclusive|None,</span> <span class="pre">block,</span> <span class="pre">warp)</span></code> 的桶。实测结论直接编码在键里：<strong>topk 会移动桶边界</strong>
+（它决定 <code class="docutils literal notranslate"><span class="pre">_tpi</span> <span class="pre">=</span> <span class="pre">warpSize/topk</span></code>，也就是一个几何在多少 token 内能一轮盖完），<strong>专家数不会</strong>
+（64 vs 96 在所有几何/dtype/topk 上都在 2% 以内），所以后者用 <code class="docutils literal notranslate"><span class="pre">None</span></code> 通配——那个通配是个结论，
+不是省事。没扫过的形状拿不到 schedule，退回单档默认值。</p>
+<p>取值规则：<strong>性能接近时取更小的几何</strong>，因为少占 CU 在与专家 GEMM 重叠时是真收益。这类 3% 以内的取舍是
+<strong>策略不是测量</strong>（单次 bench 偶尔会偏 20%）；真正由数据定的是桶的<strong>边界</strong>，它们来自 10~40% 的差异。</p>
+</section>
+</section>
+<section id="python">
+<h2>6. Python 绑定<a class="headerlink" href="#python" title="Link to this heading"></a></h2>
+<p>C ABI 是<strong>十个符号，对所有 kernel 永久有效</strong>：</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">mori_jit_plan_create</span> <span class="o">/</span> <span class="n">_launch</span> <span class="o">/</span> <span class="n">_destroy</span> <span class="o">/</span> <span class="n">_info</span>
+<span class="n">mori_jit_plan_args_schema</span> <span class="o">/</span> <span class="n">_args_size</span> <span class="o">/</span> <span class="n">_request_schema</span>
+<span class="n">mori_jit_precompile</span> <span class="o">/</span> <span class="n">mori_jit_registered_plans</span> <span class="o">/</span> <span class="n">mori_jit_last_error</span>
+</pre></div>
+</div>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p></p></th>
+<th class="head"><p>机制</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><strong>请求</strong></p></td>
+<td><p>以 <code class="docutils literal notranslate"><span class="pre">(name,</span> <span class="pre">value)</span></code> 对穿过边界。<strong>没有结构体要声明两次</strong>；未知字段名报错（拼错的旋钮悄悄不生效，正是测量描述错二进制的成因），缺失字段取 C++ 默认</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>参数</strong></p></td>
+<td><p>C++ 发布 schema（字段表 + <code class="docutils literal notranslate"><span class="pre">sizeof</span></code>），Python <strong>据此构造</strong> ctypes 结构并断言大小。只有一份声明</p></td>
+</tr>
+</tbody>
+</table>
+<p>十个入口全部 <code class="docutils literal notranslate"><span class="pre">noexcept</span></code>：异常穿过 <code class="docutils literal notranslate"><span class="pre">extern</span> <span class="pre">&quot;C&quot;</span></code> 进 ctypes 是 UB，实测会不留 traceback 地干掉解释器。
+所以每个入口都 catch，并按 ABI 的方式报告——返回 null/负值，细节留在 <code class="docutils literal notranslate"><span class="pre">mori_jit_last_error()</span></code>。</p>
+<p>通用绑定 <code class="docutils literal notranslate"><span class="pre">mori.jit.v2.plan_api</span></code>（即 libmori_jit.so 的 <code class="docutils literal notranslate"><span class="pre">mori_jit_*</span></code> C ABI 的 Python 侧，与
+<code class="docutils literal notranslate"><span class="pre">src/jit/v2/plan_api.cpp</span></code> 对应）里没有任何 kernel 名字：<code class="docutils literal notranslate"><span class="pre">make_plan(kernel)</span></code> 由 schema 生成 Plan 类。
+EP 专用的只有薄 shim <code class="docutils literal notranslate"><span class="pre">ops/dispatch_combine_v2/ep_plans.py</span></code>——它 <code class="docutils literal notranslate"><span class="pre">load_library(&quot;libmori_ops_v2.so&quot;)</span></code>
+触发注册，再暴露 <code class="docutils literal notranslate"><span class="pre">EpDispatchPlan</span></code>/<code class="docutils literal notranslate"><span class="pre">EpCombinePlan</span></code>。约定两条：标为 <code class="docutils literal notranslate"><span class="pre">e</span></code> 的字段接受 dtype 名或 torch
+dtype；launch 参数里 <code class="docutils literal notranslate"><span class="pre">off&lt;Region&gt;</span></code> 是 arena region 偏移，传 <code class="docutils literal notranslate"><span class="pre">arena=</span></code> 就绑定一次。</p>
+<p><strong>为什么是 ctypes</strong>：边界只传指针和标量，没有类型转换可做。pybind11 的代价是编译期（aiter 实测
+libtorch+pybind11 的设备 pass 解析 ~15s）。绑定层里<strong>没有 <code class="docutils literal notranslate"><span class="pre">import</span> <span class="pre">torch</span></code></strong>，靠鸭子类型取 <code class="docutils literal notranslate"><span class="pre">.data_ptr()</span></code>。</p>
+<p><strong>交叉编译是进程级模式</strong>：工具链只解析一次 arch，<code class="docutils literal notranslate"><span class="pre">arch=</span></code> 在那之前经 <code class="docutils literal notranslate"><span class="pre">SetArchOverride()</span></code> 落到一个
+带锁的进程变量（不是 <code class="docutils literal notranslate"><span class="pre">setenv</span></code>——解析侧用 <code class="docutils literal notranslate"><span class="pre">getenv</span></code> 读，两线程并发建 plan 就是 POSIX 数据竞争）；
+<code class="docutils literal notranslate"><span class="pre">MORI_JIT_ARCH</span></code> 仍作为静态覆盖有效。与已解析的不一致会<strong>报错</strong>，不是静默地”按 A 渲染、按 B 编译”。</p>
+</section>
+<section id="id8">
+<h2>7. 几个有证据的决定<a class="headerlink" href="#id8" title="Link to this heading"></a></h2>
+<p><strong>arena offsets 和 rank 是运行时参数，不是 Cfg 字段。</strong></p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p></p></th>
+<th class="head"><p>dispatch 128/512 tok</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>运行时参数</p></td>
+<td><p>48.0 / 131.3 µs</p></td>
+</tr>
+<tr class="row-odd"><td><p>编译期常量</p></td>
+<td><p>49.5 / 130.6 µs</p></td>
+</tr>
+</tbody>
+</table>
+<p>噪声以内，而代价实打实：进 Cfg 就进 key，于是每套 arena 布局、每个 rank 各编一份二进制——一次 8 卡
+run 新增 16 份而不是 2 份，AOT 也无从谈起。旁证：gfx942 上 8 条载入的微基准测出朴素常量化是<strong>负收益</strong>
+（VGPR 9→22，编译器丢掉”基址均匀”，把地址重新物化成向量形式；VGPR 通常才是占用率瓶颈）。</p>
+<p><strong><code class="docutils literal notranslate"><span class="pre">EpDType</span></code> 的枚举值必须与绑定的 dtype 表数值一致。</strong> <code class="docutils literal notranslate"><span class="pre">e</span></code> 标签的字段以裸整数过边界，而
+<code class="docutils literal notranslate"><span class="pre">mori.jit.v2.plan_api.DTYPES</span></code> 是一张表管所有 kernel 的所有枚举字段。独立编号 = 静默给错 kernel。</p>
+<p><strong>AOT 预编译暂时没有。</strong> 发射几何来自 Python 的调度表，所以 C++ 侧的预编译表永远渲染不出活的 op
+会渲染的 Cfg。要预热缓存，就是构建期把 op 构造一次。单实例编译约 1.6s，这个量级才是按需编译成立的前提。</p>
+</section>
+<section id="id9">
+<h2>8. 性能<a class="headerlink" href="#id9" title="Link to this heading"></a></h2>
+<p>8×MI355 gfx950，EP8，hidden=7168 topk=8，eager，µs / 128·512·4096 tok/rank：</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p></p></th>
+<th class="head"><p>hip</p></th>
+<th class="head"><p>flydsl</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>dispatch</p></td>
+<td><p><strong>47.5</strong> / 128.8 / 857.4</p></td>
+<td><p>76.0 / <strong>127.8</strong> / 857.5</p></td>
+</tr>
+<tr class="row-odd"><td><p>combine</p></td>
+<td><p><strong>57.8</strong> / <strong>124.4</strong> / <strong>781.8</strong></p></td>
+<td><p>82.7 / 133.6 / 888.8</p></td>
+</tr>
+</tbody>
+</table>
+<p>4096 上 combine 快 12%，差在暂存拷贝：FlyDSL 在 kernel 前单独发一发 311MB 的 torch copy，
+HIP 在 kernel 内做、与 barrier 等待重叠——104µs 变 ~1µs。</p>
+<p>4×gfx1250（MI450）EP4，hidden=7168 topk=8，对照 v1 <code class="docutils literal notranslate"><span class="pre">tools/ep_test.sh</span></code> 的出厂默认，µs：</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>tok/rank</p></th>
+<th class="head"><p>64</p></th>
+<th class="head"><p>512</p></th>
+<th class="head"><p>2048</p></th>
+<th class="head"><p>4096</p></th>
+<th class="head"><p>16384</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>dispatch v1 → v2</p></td>
+<td><p>80.9 → <strong>73.1</strong></p></td>
+<td><p>82.8 → <strong>74.7</strong></p></td>
+<td><p>104.6 → <strong>97.4</strong></p></td>
+<td><p>171.4 → <strong>152.0</strong></p></td>
+<td><p>584.5 → <strong>519.6</strong></p></td>
+</tr>
+<tr class="row-odd"><td><p>combine v1 → v2</p></td>
+<td><p>26.9 → <strong>21.3</strong></p></td>
+<td><p>41.7 → <strong>36.9</strong></p></td>
+<td><p>96.7 → <strong>83.8</strong></p></td>
+<td><p>169.6 → <strong>146.4</strong></p></td>
+<td><p>588.7 → <strong>523.0</strong></p></td>
+</tr>
+</tbody>
+</table>
+<p>每档都快（dispatch 7~12%，combine 11~23%）。同几何下的那部分来自 Cfg 是编译期 NTTP：ISA 里整数除法
+dispatch 41→3、combine 57→10（<code class="docutils literal notranslate"><span class="pre">/maxRecv</span></code>、<code class="docutils literal notranslate"><span class="pre">%numExpertPerRank</span></code> 变成移位），combine 的 load 数 225→120
+（peer 地址是 window 算术，不是穿过 <code class="docutils literal notranslate"><span class="pre">SymmMemObj</span></code> 的三次相关联 load）。其余来自调优表。</p>
+<p>窄 dtype 的收益更大：4096 档 dispatch bf16 156.6 → fp8 98.5 → fp4 80.0，16384 档 fp4 是 bf16 的约 3 倍快。</p>
+</section>
+<section id="id10">
+<h2>9. 移植来源与覆盖范围<a class="headerlink" href="#id10" title="Link to this heading"></a></h2>
+<p>kernel 从 <code class="docutils literal notranslate"><span class="pre">origin/main</span></code> 的 intranode MoE kernel 移植（bf16 gather 路径）。移植是机械的，因为 v1 的
+<strong>整个</strong>对称内存面只有两样：<code class="docutils literal notranslate"><span class="pre">SymmMemObjPtr::GetAs&lt;T*&gt;(pe)</span></code>（30 处，两次相关联的 load 查表）和三个
+不带任何 shmem 状态的自旋等待。于是</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>memObj-&gt;GetAs&lt;T*&gt;(pe)  →  ccoGetLsaPeerPtr(win, pe, args.offRegion)
+</pre></div>
+</div>
+<p>13 个 <code class="docutils literal notranslate"><span class="pre">SymmMemObjPtr</span></code> 塌成一个 window handle + 8 个 offset。生成的 TU 不 include <code class="docutils literal notranslate"><span class="pre">mori/shmem</span></code>，
+所以没有设备全局变量、不需要 per-module init。</p>
+<p>gfx125x 的 TDM body 同样是机械移植（<code class="docutils literal notranslate"><span class="pre">intranode_1250x.hpp</span></code> → <code class="docutils literal notranslate"><span class="pre">ep_intranode_1250x.hpp</span></code>）：v1 的 cco 路径
+本来就把每块对称 buffer 从同一个 LSA window 里 bump 分配，和 SymmArena 是同一个内存模型，源码里的
+<code class="docutils literal notranslate"><span class="pre">shmem</span></code> 命名空间只是那层抽象加几个与后端无关的自旋。TDM 那套机器（<code class="docutils literal notranslate"><span class="pre">amd_gfx1250_TDM.h</span></code> builtin、
+<code class="docutils literal notranslate"><span class="pre">_cusplit_*</span></code> 设备全局暂存池）原样保留。范围收到 hip 后端能服务的部分：非量化的 TDM dispatch +
+PULL/QUAD gather combine。</p>
+<p><strong>HIP 后端未实现</strong>（由能力门在构造期拒绝）：scatter combine、<code class="docutils literal notranslate"><span class="pre">quant_type</span></code> 量化、StdMoE、per-token
+scales 转发、routing replay、<code class="docutils literal notranslate"><span class="pre">local_expert_count</span></code>。这些在 FlyDSL 后端都有。注意 fp8/fp4 <strong>dispatch</strong>
+已经支持（§3.7）——那是搬运已量化的载荷，和让 mori 自己量化的 <code class="docutils literal notranslate"><span class="pre">quant_type</span></code> 是两回事。</p>
+<p><strong>cross-node 没有</strong>：v2 只有 intranode 两个 body，op 里也没有 <code class="docutils literal notranslate"><span class="pre">kernel_type</span></code> 的概念。</p>
+</section>
+<section id="id11">
+<h2>10. 测试<a class="headerlink" href="#id11" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p></p></th>
+<th class="head"><p>位置</p></th>
+<th class="head"><p>覆盖</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">jit_core</span></code>（ctest）</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">tests/cpp/jit/test_jit_core.cpp</span></code></p></td>
+<td><p>渲染、字段计数、缓存 key、入口名、schema；用假工具链，不碰 GPU</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">jit_host_device_split</span></code>（ctest）</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">tools/jit_v2/check_host_device_split.sh</span></code></p></td>
+<td><p>Cfg 头仍能不经 hipcc 编译</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">test_jit_binding.py</span></code></p></td>
+<td><p>单 rank，不需要 communicator</p></td>
+<td><p>ctypes/C-ABI 缝：schema vs <code class="docutils literal notranslate"><span class="pre">sizeof</span></code>、请求强制转换、未知字段拒绝</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">test_op.py</span></code></p></td>
+<td><p>EP8，<code class="docutils literal notranslate"><span class="pre">MORI_V2_KERNEL_BACKEND=hip</span></code> 切后端</p></td>
+<td><p>op 层对着两套 kernel 各跑一遍</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">test_ep_backend_parity.py</span></code></p></td>
+<td><p>EP8，一个进程内两个后端</p></td>
+<td><p>同一输入逐元素比对</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">test_graph_capture.py</span></code></p></td>
+<td><p>EP8</p></td>
+<td><p>dispatch → identity expert → combine 整步捕成一张图并 replay</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">test_asym_dtype.py</span></code></p></td>
+<td><p>EP8</p></td>
+<td><p>fp8/fp4 dispatch + bf16 combine</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">bench_ep.py</span></code></p></td>
+<td><p>EP4/EP8</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">hip_tuning_configs</span></code> 的几何扫描</p></td>
+</tr>
+</tbody>
+</table>
+<p><code class="docutils literal notranslate"><span class="pre">test_jit_binding.py</span></code> 在 CI 里<strong>从 <code class="docutils literal notranslate"><span class="pre">/tmp</span></code> 跑</strong>，不是从 checkout 跑：建一个 plan 需要
+<code class="docutils literal notranslate"><span class="pre">libmori_jit.so</span></code>、<code class="docutils literal notranslate"><span class="pre">libmori_ops_v2.so</span></code> 和 v2 的 kernel 源码，而在仓库目录下这三样都能从 <code class="docutils literal notranslate"><span class="pre">build/</span></code>
+和 <code class="docutils literal notranslate"><span class="pre">src/</span></code> 解析到——哪怕安装包一样都没带。只有在仓库外，答得上来的才是真正打进包里的那份。</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, AMD.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>
