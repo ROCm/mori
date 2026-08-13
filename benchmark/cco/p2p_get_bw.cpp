@@ -23,8 +23,9 @@
 // CCO p2p get bandwidth — PE 0 pulls from PE 1's send window into its recv
 // window.
 //
-//   -T lsa   : intra-node flat-VA load loop (read peer slot → local).
-//   -T ibgda : cross-node one-sided RDMA read via ccoGda<PrvdType>.
+//   -t lsa   : intra-node flat-VA load loop (read peer slot → local).
+//   -t sdma  : intra-node copy engine via ccoSdma.
+//   -t ibgda : cross-node one-sided RDMA read via ccoGda<PrvdType>.
 
 #include <cstdio>
 #include <cstdlib>
