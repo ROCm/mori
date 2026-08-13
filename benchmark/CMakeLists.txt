@@ -64,7 +64,9 @@ function(add_mori_benchmark_cco name)
   # $ORIGIN-relative rpath (kept alongside the build-tree rpath) so the binaries
   # resolve libmori_*.so after `BUILD_BENCHMARK=ON pip install .` copies them to
   # site-packages/mori/benchmarks/cco/ (the libs live at site-packages/mori/).
-  set_target_properties(${name} PROPERTIES BUILD_RPATH "$ORIGIN/../..")
+  # ${ROCM_PATH}/lib: this overrides the global CMAKE_BUILD_RPATH, so the ROCm
+  # libdir has to be repeated here or the binaries cannot find libamdhip64.
+  set_target_properties(${name} PROPERTIES BUILD_RPATH "$ORIGIN/../..;${ROCM_PATH}/lib")
   if(DEFINED GPU_TARGETS)
     set_target_properties(${name} PROPERTIES HIP_ARCHITECTURES "${GPU_TARGETS}")
   endif()
