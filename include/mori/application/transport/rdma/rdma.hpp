@@ -201,6 +201,11 @@ bool ReadIoTrafficClassDisableEnv();
 bool ReadIbEnableRelaxedOrderingEnv();
 int MaybeAddRelaxedOrderingFlag(int accessFlag);
 
+// Export a dmabuf fd for the GPU buffer at `ptr`, and report the offset of `ptr`
+// within the exported dmabuf via `*offset`. Returns -1 if unsupported; the caller
+// owns the fd and should close it once the kernel holds its own reference.
+int TryExportDmabufFd(void* ptr, size_t size, uint64_t* offset);
+
 /* -------------------------------------------------------------------------- */
 /*                              RdmaDeviceContext                             */
 /* -------------------------------------------------------------------------- */

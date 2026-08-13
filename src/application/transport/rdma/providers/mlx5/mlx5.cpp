@@ -23,7 +23,9 @@
 
 #include <hip/hip_runtime_api.h>
 #include <infiniband/verbs.h>
+#include <unistd.h>
 
+#include <cstdint>
 #include <iostream>
 
 #include "mori/application/transport/rdma/providers/mlx5/mlx5_ifc.hpp"
@@ -69,6 +71,78 @@ HcaCapability QueryHcaCap(ibv_context* context) {
 }
 
 /* ---------------------------------------------------------------------------------------------- */
+/*                                     Device Memory Registration                                 */
+/* ---------------------------------------------------------------------------------------------- */
+// Registering device memory by virtual address needs the kernel peer-memory API,
+// which is absent on inbox ib_uverbs and unusable even with MLNX_OFED on kernels
+// >= 6.3: OFED exports ib_register_peer_memory_client as a non-GPL symbol, and
+// symbol_get() refuses those, so amdgpu's peer-direct bridge never registers.
+// Without a peer-memory client the CQ/QP/DBR umems and the atomic ibuf MR all fail
+// with EFAULT. Exporting the allocation as a dmabuf instead routes the pinning
+// through ib_umem_dmabuf_get_pinned, which needs no peer-memory client at all.
+//
+// Both helpers fall back to the by-address call so hosts that do have a working
+// peer-memory client (or lack dmabuf export) keep their previous behaviour.
+
+// Granularity rdma-core's own mlx5dv_devx_umem_reg wrapper asks the adapter for.
+static constexpr uint64_t kMlx5AdapterPageSize = 4096;
+
+static mlx5dv_devx_umem* RegisterUmem(ibv_context* context, void* addr, size_t size,
+                                      uint32_t access, bool onGpu) {
+  auto& api = Mlx5DvApi::Instance();
+  if (onGpu && api.devx_umem_reg_ex) {
+    uint64_t dmabufOffset = 0;
+    int dmabufFd = TryExportDmabufFd(addr, size, &dmabufOffset);
+    if (dmabufFd >= 0) {
+      // With MLX5DV_UMEM_MASK_DMABUF the kernel reads `addr` as an offset into the
+      // dmabuf, not as a virtual address.
+      mlx5dv_devx_umem_in in = {};
+      in.addr = reinterpret_cast<void*>(dmabufOffset);
+      in.size = size;
+      in.access = access;
+      in.pgsz_bitmap = UINT64_MAX & ~(kMlx5AdapterPageSize - 1);
+      in.comp_mask = MLX5DV_UMEM_MASK_DMABUF;
+      in.dmabuf_fd = dmabufFd;
+
+      mlx5dv_devx_umem* umem = api.devx_umem_reg_ex(context, &in);
+      close(dmabufFd);
+      if (umem) {
+        MORI_APP_TRACE("MLX5 umem registered via dmabuf: addr=0x{:x}, size={}, offset={}",
+                       reinterpret_cast<uintptr_t>(addr), size, dmabufOffset);
+        return umem;
+      }
+      MORI_APP_WARN(
+          "MLX5 dmabuf umem registration failed, falling back to registration by address: "
+          "addr=0x{:x}, size={}, offset={}, errno={} ({})",
+          reinterpret_cast<uintptr_t>(addr), size, dmabufOffset, errno, strerror(errno));
+    }
+  }
+  return api.devx_umem_reg(context, addr, size, access);
+}
+
+static ibv_mr* RegisterMr(ibv_pd* pd, void* addr, size_t size, int access, bool onGpu) {
+  if (onGpu) {
+    uint64_t dmabufOffset = 0;
+    int dmabufFd = TryExportDmabufFd(addr, size, &dmabufOffset);
+    if (dmabufFd >= 0) {
+      ibv_mr* mr = ibv_reg_dmabuf_mr(pd, dmabufOffset, size, reinterpret_cast<uint64_t>(addr),
+                                     dmabufFd, access);
+      close(dmabufFd);
+      if (mr) {
+        MORI_APP_TRACE("MLX5 MR registered via dmabuf: addr=0x{:x}, size={}, offset={}",
+                       reinterpret_cast<uintptr_t>(addr), size, dmabufOffset);
+        return mr;
+      }
+      MORI_APP_WARN(
+          "MLX5 dmabuf MR registration failed, falling back to registration by address: "
+          "addr=0x{:x}, size={}, offset={}, errno={} ({})",
+          reinterpret_cast<uintptr_t>(addr), size, dmabufOffset, errno, strerror(errno));
+    }
+  }
+  return ibv_reg_mr(pd, addr, size, access);
+}
+
+/* ---------------------------------------------------------------------------------------------- */
 /*                                          Mlx5CqContainer */
 /* ---------------------------------------------------------------------------------------------- */
 Mlx5CqContainer::Mlx5CqContainer(ibv_context* context, const RdmaEndpointConfig& config)
@@ -99,7 +173,7 @@ Mlx5CqContainer::Mlx5CqContainer(ibv_context* context, const RdmaEndpointConfig&
     assert(!status);
   }
 
-  cqUmem = Mlx5DvApi::Instance().devx_umem_reg(context, cqUmemAddr, cqSize, IBV_ACCESS_LOCAL_WRITE);
+  cqUmem = RegisterUmem(context, cqUmemAddr, cqSize, IBV_ACCESS_LOCAL_WRITE, config.onGpu);
   assert(cqUmem);
 
   // Allocate user memory for CQ DBR (doorbell?)
@@ -112,8 +186,7 @@ Mlx5CqContainer::Mlx5CqContainer(ibv_context* context, const RdmaEndpointConfig&
     assert(!status);
   }
 
-  cqDbrUmem =
-      Mlx5DvApi::Instance().devx_umem_reg(context, cqDbrUmemAddr, 8, IBV_ACCESS_LOCAL_WRITE);
+  cqDbrUmem = RegisterUmem(context, cqDbrUmemAddr, 8, IBV_ACCESS_LOCAL_WRITE, config.onGpu);
   assert(cqDbrUmem);
 
   // Allocate user access region
@@ -241,8 +314,7 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
     assert(!status);
   }
 
-  qpUmem =
-      Mlx5DvApi::Instance().devx_umem_reg(context, qpUmemAddr, qpTotalSize, IBV_ACCESS_LOCAL_WRITE);
+  qpUmem = RegisterUmem(context, qpUmemAddr, qpTotalSize, IBV_ACCESS_LOCAL_WRITE, config.onGpu);
   assert(qpUmem);
 
   // Allocate user memory for DBR (doorbell?)
@@ -255,8 +327,7 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
     assert(!status);
   }
 
-  qpDbrUmem =
-      Mlx5DvApi::Instance().devx_umem_reg(context, qpDbrUmemAddr, 8, IBV_ACCESS_LOCAL_WRITE);
+  qpDbrUmem = RegisterUmem(context, qpDbrUmemAddr, 8, IBV_ACCESS_LOCAL_WRITE, config.onGpu);
   assert(qpDbrUmem);
 
   // Allocate and register atomic internal buffer (ibuf)
@@ -275,8 +346,8 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
   int atomicIbufAccessFlag =
       MaybeAddRelaxedOrderingFlag(IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
                                   IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
-  atomicIbufMr =
-      ibv_reg_mr(device_context->GetIbvPd(), atomicIbufAddr, atomicIbufSize, atomicIbufAccessFlag);
+  atomicIbufMr = RegisterMr(device_context->GetIbvPd(), atomicIbufAddr, atomicIbufSize,
+                            atomicIbufAccessFlag, config.onGpu);
   assert(atomicIbufMr);
 
   MORI_APP_TRACE(
@@ -290,8 +361,16 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
   assert(qpUar->page_id != 0);
 
   if (config.onGpu) {
+    // Multiple qp may share the same uar address, and hipHostRegister maps at page
+    // granularity, so a sibling qp may have mapped this page already. Mirrors the
+    // unregister-once handling in DestroyQueuePair.
     uint32_t flag = hipHostRegisterPortable | hipHostRegisterMapped;
-    HIP_RUNTIME_CHECK(hipHostRegister(qpUar->reg_addr, QueryHcaCap(context).dbrRegSize, flag));
+    hipError_t err = hipHostRegister(qpUar->reg_addr, QueryHcaCap(context).dbrRegSize, flag);
+    if (err == hipErrorHostMemoryAlreadyRegistered) {
+      (void)hipGetLastError();
+    } else {
+      HIP_RUNTIME_CHECK(err);
+    }
     HIP_RUNTIME_CHECK(hipHostGetDevicePointer(&qpUarPtr, qpUar->reg_addr, 0));
   } else {
     qpUarPtr = qpUar->reg_addr;

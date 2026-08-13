@@ -440,9 +440,6 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabufI
   return handle;
 }
 
-// Export a dmabuf fd for the GPU buffer at `ptr`, and report the offset of `ptr`
-// within the exported dmabuf via `*offset`. Returns -1 if unsupported.
-//
 // hipMemGetHandleForAddressRange exports an fd for the *backing* allocation but
 // does not report where `ptr` sits inside it; callers previously assumed offset
 // 0. That is wrong when `ptr` is a sub-region of a larger allocation (e.g. a
@@ -452,7 +449,7 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabufI
 // silent writes to the wrong address). hsa_amd_portable_export_dmabuf reports the
 // true byte offset, so prefer it and fall back to the hip path (offset 0, correct
 // only for whole-allocation exports) when HSA export is unavailable.
-static int TryExportDmabufFd(void* ptr, size_t size, uint64_t* offset) {
+int TryExportDmabufFd(void* ptr, size_t size, uint64_t* offset) {
   int fd = -1;
   uint64_t off = 0;
   hsa_status_t hs = hsa_amd_portable_export_dmabuf(ptr, size, &fd, &off);

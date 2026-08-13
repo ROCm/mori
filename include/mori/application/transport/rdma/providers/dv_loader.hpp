@@ -43,6 +43,8 @@ struct Mlx5DvApi {
   using devx_general_cmd_t = int (*)(struct ibv_context*, const void*, size_t, void*, size_t);
   using devx_umem_reg_t = struct mlx5dv_devx_umem* (*)(struct ibv_context*, void*, size_t,
                                                        uint32_t);
+  using devx_umem_reg_ex_t = struct mlx5dv_devx_umem* (*)(struct ibv_context*,
+                                                          struct mlx5dv_devx_umem_in*);
   using devx_umem_dereg_t = int (*)(struct mlx5dv_devx_umem*);
   using devx_alloc_uar_t = struct mlx5dv_devx_uar* (*)(struct ibv_context*, uint32_t);
   using devx_free_uar_t = void (*)(struct mlx5dv_devx_uar*);
@@ -55,6 +57,7 @@ struct Mlx5DvApi {
 
   devx_general_cmd_t devx_general_cmd = nullptr;
   devx_umem_reg_t devx_umem_reg = nullptr;
+  devx_umem_reg_ex_t devx_umem_reg_ex = nullptr;
   devx_umem_dereg_t devx_umem_dereg = nullptr;
   devx_alloc_uar_t devx_alloc_uar = nullptr;
   devx_free_uar_t devx_free_uar = nullptr;
@@ -72,6 +75,7 @@ struct Mlx5DvApi {
 
     devx_general_cmd = (devx_general_cmd_t)DvLoadSymbol(handle, "mlx5dv_devx_general_cmd");
     devx_umem_reg = (devx_umem_reg_t)DvLoadSymbol(handle, "mlx5dv_devx_umem_reg");
+    devx_umem_reg_ex = (devx_umem_reg_ex_t)DvLoadSymbol(handle, "mlx5dv_devx_umem_reg_ex");
     devx_umem_dereg = (devx_umem_dereg_t)DvLoadSymbol(handle, "mlx5dv_devx_umem_dereg");
     devx_alloc_uar = (devx_alloc_uar_t)DvLoadSymbol(handle, "mlx5dv_devx_alloc_uar");
     devx_free_uar = (devx_free_uar_t)DvLoadSymbol(handle, "mlx5dv_devx_free_uar");
