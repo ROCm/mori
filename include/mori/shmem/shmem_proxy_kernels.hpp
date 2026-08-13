@@ -11,23 +11,23 @@ namespace mori {
 namespace shmem {
 
 inline __device__ volatile core::ProxyRing* ProxyRingForEp(
-    ProxyGpuStates* ps, uint32_t epIndex) {
-  int pe = epIndex / ps->numQpPerPe;
-  int peerLocal = pe % ps->numNics;
-  int nicIdx = (ps->localGpuIdx > peerLocal ? ps->localGpuIdx : peerLocal) % ps->numNics;
-  return static_cast<volatile core::ProxyRing*>(ps->rings[nicIdx]);
+    GpuStates* gs, uint32_t epIndex) {
+  int pe = epIndex / gs->numQpPerPe;
+  int peerLocal = pe % gs->numNics;
+  int nicIdx = (gs->localGpuIdx > peerLocal ? gs->localGpuIdx : peerLocal) % gs->numNics;
+  return gs->proxyRings[nicIdx];
 }
 
 inline __device__ void ShmemQuietAllProxy() {
-  ProxyGpuStates* ps = GetGlobalProxyStatePtr();
-  for (int n = 0; n < ps->numRings; n++) {
-    volatile core::ProxyRing* ring = static_cast<volatile core::ProxyRing*>(ps->rings[n]);
+  GpuStates* gs = GetGlobalGpuStatesPtr();
+  for (int n = 0; n < gs->numProxyRings; n++) {
+    volatile core::ProxyRing* ring = gs->proxyRings[n];
     if (!ring) continue;
     uint32_t head = ring->gpu_head;
-    uint32_t lastQuiet = ps->quietHead[n];
+    uint32_t lastQuiet = gs->proxyQuietHead[n];
     if (head != lastQuiet) {
       core::ProxyQuiet(ring, lastQuiet, head - lastQuiet);
-      ps->quietHead[n] = head;
+      gs->proxyQuietHead[n] = head;
     }
   }
 }
@@ -42,18 +42,17 @@ inline __device__ void ShmemQuietThreadKernel<application::TransportType::PROXY>
 
 template <>
 inline __device__ void ShmemQuietThreadKernel<application::TransportType::PROXY>(int pe) {
-  ProxyGpuStates* ps = GetGlobalProxyStatePtr();
   GpuStates* gs = GetGlobalGpuStatesPtr();
   int epIndex = pe * gs->numQpPerPe;
-  int peerLocal = pe % ps->numNics;
-  int nicIdx = (ps->localGpuIdx > peerLocal ? ps->localGpuIdx : peerLocal) % ps->numNics;
-  volatile core::ProxyRing* ring = static_cast<volatile core::ProxyRing*>(ps->rings[nicIdx]);
+  int peerLocal = pe % gs->numNics;
+  int nicIdx = (gs->localGpuIdx > peerLocal ? gs->localGpuIdx : peerLocal) % gs->numNics;
+  volatile core::ProxyRing* ring = gs->proxyRings[nicIdx];
   if (ring) {
     uint32_t head = ring->gpu_head;
-    uint32_t lastQuiet = ps->quietHead[nicIdx];
+    uint32_t lastQuiet = gs->proxyQuietHead[nicIdx];
     if (head != lastQuiet) {
       core::ProxyQuiet(ring, lastQuiet, head - lastQuiet);
-      ps->quietHead[nicIdx] = head;
+      gs->proxyQuietHead[nicIdx] = head;
     }
   }
 }
@@ -73,10 +72,9 @@ inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::PR
     const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe,
     int qpId) {
   if (bytes == 0) return;
-  ProxyGpuStates* ps = GetGlobalProxyStatePtr();
   GpuStates* gs = GetGlobalGpuStatesPtr();
   int epIndex = pe * gs->numQpPerPe + (qpId % gs->numQpPerPe);
-  volatile core::ProxyRing* ring = ProxyRingForEp(ps, epIndex);
+  volatile core::ProxyRing* ring = ProxyRingForEp(gs, epIndex);
 
   size_t currentOffset = 0;
   size_t remaining = bytes;
@@ -138,10 +136,9 @@ template <>
 inline __device__ void ShmemPutSizeImmNbiThreadKernel<application::TransportType::PROXY>(
     const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes,
     int pe, int qpId) {
-  ProxyGpuStates* ps = GetGlobalProxyStatePtr();
   GpuStates* gs = GetGlobalGpuStatesPtr();
   int epIndex = pe * gs->numQpPerPe + (qpId % gs->numQpPerPe);
-  volatile core::ProxyRing* ring = ProxyRingForEp(ps, epIndex);
+  volatile core::ProxyRing* ring = ProxyRingForEp(gs, epIndex);
   uintptr_t raddr;
   uint32_t rkey;
   if (gs->useVMMHeap) {
@@ -176,10 +173,9 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportTy
     const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
     core::atomicType signalOp, int pe, int qpId) {
   if (bytes == 0) return;
-  ProxyGpuStates* ps = GetGlobalProxyStatePtr();
   GpuStates* gs = GetGlobalGpuStatesPtr();
   int epIndex = pe * gs->numQpPerPe + (qpId % gs->numQpPerPe);
-  volatile core::ProxyRing* ring = ProxyRingForEp(ps, epIndex);
+  volatile core::ProxyRing* ring = ProxyRingForEp(gs, epIndex);
   uint32_t lkey = source->lkey;
   uintptr_t srcAddr = reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset;
   uintptr_t raddr = dest->peerPtrs[pe] + destOffset;
@@ -266,10 +262,9 @@ template <>
 inline __device__ void ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::PROXY>(
     const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes,
     core::atomicType amoType, int pe, int qpId) {
-  ProxyGpuStates* ps = GetGlobalProxyStatePtr();
   GpuStates* gs = GetGlobalGpuStatesPtr();
   int epIndex = pe * gs->numQpPerPe + (qpId % gs->numQpPerPe);
-  volatile core::ProxyRing* ring = ProxyRingForEp(ps, epIndex);
+  volatile core::ProxyRing* ring = ProxyRingForEp(gs, epIndex);
   uintptr_t raddr;
   uint32_t rkey;
   if (gs->useVMMHeap) {
@@ -305,10 +300,9 @@ inline __device__ void ShmemAtomicSizeNonFetchWarpKernel<application::TransportT
   ShmemAtomicTypeFetchThreadKernel<application::TransportType::PROXY, T>(                      \
       const application::SymmMemObjPtr dest, size_t destOffset, void* val, void* compare,      \
       size_t bytes, core::atomicType amoType, int pe, int qpId) {                               \
-    ProxyGpuStates* ps = GetGlobalProxyStatePtr();                                              \
     GpuStates* gs = GetGlobalGpuStatesPtr();                                                   \
     int epIndex = pe * gs->numQpPerPe + (qpId % gs->numQpPerPe);                               \
-    volatile core::ProxyRing* ring = ProxyRingForEp(ps, epIndex);                              \
+    volatile core::ProxyRing* ring = ProxyRingForEp(gs, epIndex);                              \
     uintptr_t raddr;                                                                           \
     uint32_t rkey;                                                                             \
     if (gs->useVMMHeap) {                                                                      \
