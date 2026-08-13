@@ -27,18 +27,10 @@
 
 // globalGpuStates is defined per-file via MORI_DEFINE_GPU_STATES macro.
 // Each .hsaco needs its own copy, initialized via ShmemModuleInit.
-#ifdef MORI_PROXY_ENABLED
-#define _MORI_DEFINE_PROXY_STATE \
-  __device__ __attribute__((visibility("default"))) ProxyGpuStates globalProxyState;
-#else
-#define _MORI_DEFINE_PROXY_STATE
-#endif
-
 #define MORI_DEFINE_GPU_STATES                                                 \
   namespace mori {                                                             \
   namespace shmem {                                                            \
   __device__ __attribute__((visibility("default"))) GpuStates globalGpuStates; \
-  _MORI_DEFINE_PROXY_STATE                                                     \
   }                                                                            \
   }
 

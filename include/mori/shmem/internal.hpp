@@ -138,28 +138,11 @@ struct GpuStates {
   int localGpuIdx{0};
 };
 
-static constexpr int PROXY_MAX_NICS = 8;
-
-struct ProxyGpuStates {
-  void* rings[PROXY_MAX_NICS]{};
-  uint32_t quietHead[PROXY_MAX_NICS]{};
-  int numRings{0};
-  int numNics{0};
-  int localGpuIdx{0};
-  int numQpPerPe{4};
-};
-
 // Changed from __constant__ to __device__ to allow hipMemcpyToSymbol updates (like rocshmem)
 // Default visibility so JIT EP (MORI_DEFINE_GPU_STATES) matches this declaration.
 extern __device__ __attribute__((visibility("default"))) GpuStates globalGpuStates;
-#ifdef MORI_PROXY_ENABLED
-extern __device__ __attribute__((visibility("default"))) ProxyGpuStates globalProxyState;
-#endif
 
 static __device__ GpuStates* GetGlobalGpuStatesPtr() { return &globalGpuStates; }
-#ifdef MORI_PROXY_ENABLED
-static __device__ ProxyGpuStates* GetGlobalProxyStatePtr() { return &globalProxyState; }
-#endif
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                Address to Remote Address Translation                           */
@@ -204,7 +187,6 @@ struct ShmemStates {
   MemoryStates* memoryStates{nullptr};
   ModuleStates moduleStates;  // JIT module state for this GPU
   GpuStates gpuStates;
-  ProxyGpuStates proxyGpuStates;
 
   // Asserts that ShmemInit has been called and the slot is currently usable.
   // Used by APIs that touch GPU state (allocation, barrier, module init)
