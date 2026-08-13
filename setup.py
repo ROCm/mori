@@ -36,7 +36,7 @@ try:
 except ImportError:
     _HAVE_CYTHON = False
 
-_supported_arch_list = ["gfx942", "gfx950"]
+_supported_arch_list = ["gfx942", "gfx950", "gfx1250"]
 
 _REQUIRED_SYSTEM_DEPS: list = []
 
