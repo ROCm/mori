@@ -27,9 +27,11 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <cctype>
 #include <filesystem>
 #include <set>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "mori/jit/v2/compiler.hpp"
@@ -37,6 +39,7 @@
 #include "mori/jit/v2/toolchain.hpp"
 #include "mori/jit/v2/util.hpp"
 #include "mori/ops/dispatch_combine_v2/ep_cfg.hpp"
+#include "mori/ops/dispatch_combine_v2/ep_spec.hpp"
 
 namespace fs = std::filesystem;
 using namespace mori::jit::v2;
@@ -352,6 +355,62 @@ std::string CacheDirWith(const std::string& arch, const std::string& nic) {
                                                          {});
 }
 }  // namespace
+
+// --------------------------------------------------------------------------
+// The exported symbol name. One symbol per kernel used to be the design; it made
+// every row in a profile read "mori_jit_entry", so dispatch, combine and each
+// tuned geometry of both were indistinguishable.
+// --------------------------------------------------------------------------
+
+TEST(EntryName, RenderedSourceExportsTheNameTheLoaderAsksFor) {
+  // The invariant that replaces "the name is a fixed literal": whatever EntryName
+  // says is what the TU defines, because Prepare() passes the same string to
+  // hipModuleGetFunction. If these two ever drift, every launch fails with
+  // "not found" -- but only on a machine with a GPU, which is late.
+  ToolchainOverride guard(FakeToolchain("gfx942", "mlx5"));
+  const EpCfg cfg;
+  for (const auto& [entry, src] : {std::pair{mori::ops::v2::EpDispatchSpec::EntryName(cfg),
+                                             mori::ops::v2::EpDispatchSpec::RenderSource(cfg)},
+                                   std::pair{mori::ops::v2::EpCombineSpec::EntryName(cfg),
+                                             mori::ops::v2::EpCombineSpec::RenderSource(cfg)}}) {
+    EXPECT_NE(src.find(entry + "(EpArgs args)"), std::string::npos)
+        << "rendered TU does not define " << entry;
+  }
+}
+
+TEST(EntryName, DistinguishesWhatAProfileNeedsToTellApart) {
+  ToolchainOverride guard(FakeToolchain("gfx942", "mlx5"));
+  const EpCfg base;
+  const std::string dispatch = mori::ops::v2::EpDispatchSpec::EntryName(base);
+  EXPECT_NE(dispatch, mori::ops::v2::EpCombineSpec::EntryName(base));
+
+  // Geometry is the one that matters most in practice: the tuning schedule picks a
+  // different (block, warp) per token count, so a single op contributes several
+  // kernels to one trace and they are not interchangeable.
+  auto renamed = [&](auto mutate, const char* what) {
+    EpCfg c = base;
+    mutate(c);
+    EXPECT_NE(mori::ops::v2::EpDispatchSpec::EntryName(c), dispatch)
+        << what << " is not visible in the kernel name";
+  };
+  renamed([](EpCfg& c) { c.blockNum *= 2; }, "blockNum");
+  renamed([](EpCfg& c) { c.warpPerBlock *= 2; }, "warpPerBlock");
+  renamed([](EpCfg& c) { c.worldSize = 4; }, "worldSize");
+  renamed([](EpCfg& c) { c.hiddenDim = 1024; }, "hiddenDim");
+  renamed([](EpCfg& c) { c.numExpertPerToken = 4; }, "numExpertPerToken");
+  renamed([](EpCfg& c) { c.dtype = mori::ops::v2::EpDType::Byte8; }, "dtype");
+}
+
+TEST(EntryName, IsALegalSymbol) {
+  ToolchainOverride guard(FakeToolchain("gfx942", "mlx5"));
+  const std::string n = mori::ops::v2::EpDispatchSpec::EntryName(EpCfg{});
+  ASSERT_FALSE(n.empty());
+  EXPECT_FALSE(std::isdigit(static_cast<unsigned char>(n[0])));
+  for (char ch : n) {
+    EXPECT_TRUE(std::isalnum(static_cast<unsigned char>(ch)) || ch == '_')
+        << "'" << ch << "' cannot appear in a C identifier: " << n;
+  }
+}
 
 TEST(Nic, ForksTheCacheKey) {
   // Same source, same arch, different NIC -> different digest, not just a

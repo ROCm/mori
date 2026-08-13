@@ -42,13 +42,17 @@ namespace mori {
 namespace jit {
 namespace v2 {
 
-// The entry point name every generated TU must use.
+// Fallback entry name, for a spec that does not name its kernel. Specs SHOULD
+// name it: every kernel exporting one symbol makes a profile unreadable, since
+// dispatch, combine and every Cfg of each show up as the same row. What must not
+// come back is Python rebuilding the name -- see KernelSpec::EntryName.
 inline constexpr const char* kEntryName = "mori_jit_entry";
 
 class Module {
  public:
-  // Loads `hsacoPath` on the current device. Throws std::runtime_error on failure.
-  explicit Module(const std::string& hsacoPath);
+  // Loads `hsacoPath` on the current device and resolves `entry`. Throws
+  // std::runtime_error on failure.
+  explicit Module(const std::string& hsacoPath, std::string entry = kEntryName);
   ~Module();
 
   Module(const Module&) = delete;
@@ -60,6 +64,7 @@ class Module {
   hipModule_t module_ = nullptr;
   hipFunction_t entry_ = nullptr;
   std::string path_;
+  std::string entryName_;
 };
 
 // Hash over the kernel header tree. Coarse on purpose: it covers whole
@@ -77,7 +82,8 @@ class Compiler {
   // Cached module for this (name, source). Compiles and publishes on miss.
   // Throws std::runtime_error if compilation fails.
   std::shared_ptr<Module> Build(const std::string& name, const std::string& code,
-                                const std::vector<std::string>& sourceDeps = DefaultSourceDeps());
+                                const std::vector<std::string>& sourceDeps = DefaultSourceDeps(),
+                                const std::string& entry = kEntryName);
 
   // Compile and publish without loading. Touches no HIP device, so it works on a
   // build machine with no GPU and cross-compiles for another arch via

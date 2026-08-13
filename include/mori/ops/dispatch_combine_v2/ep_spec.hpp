@@ -86,6 +86,7 @@ class EpDispatchSpec : public mori::jit::v2::KernelSpec<EpDispatchSpec, EpCfg> {
  public:
   using Args = EpArgs;
   static constexpr const char* kName = "ep_dispatch";
+  static std::string EntryName(const Cfg& cfg);
   static std::string RenderSource(const Cfg& cfg);
   static mori::jit::v2::LaunchGeometry Geometry(const Cfg& cfg);
   static const std::vector<std::string>& SourceDeps();
@@ -95,6 +96,7 @@ class EpCombineSpec : public mori::jit::v2::KernelSpec<EpCombineSpec, EpCfg> {
  public:
   using Args = EpArgs;
   static constexpr const char* kName = "ep_combine";
+  static std::string EntryName(const Cfg& cfg);
   static std::string RenderSource(const Cfg& cfg);
   static mori::jit::v2::LaunchGeometry Geometry(const Cfg& cfg);
   static const std::vector<std::string>& SourceDeps();

@@ -47,18 +47,19 @@ namespace fs = std::filesystem;
 // Module
 // ---------------------------------------------------------------------------
 
-Module::Module(const std::string& hsacoPath) : path_(hsacoPath) {
+Module::Module(const std::string& hsacoPath, std::string entry)
+    : path_(hsacoPath), entryName_(std::move(entry)) {
   hipError_t err = hipModuleLoad(&module_, hsacoPath.c_str());
   if (err != hipSuccess) {
     throw std::runtime_error("mori jit: hipModuleLoad(" + hsacoPath +
                              ") failed: " + hipGetErrorString(err));
   }
-  err = hipModuleGetFunction(&entry_, module_, kEntryName);
+  err = hipModuleGetFunction(&entry_, module_, entryName_.c_str());
   if (err != hipSuccess) {
     (void)hipModuleUnload(module_);
     module_ = nullptr;
-    throw std::runtime_error(std::string("mori jit: '") + kEntryName + "' not found in " +
-                             hsacoPath + " (" + hipGetErrorString(err) +
+    throw std::runtime_error("mori jit: '" + entryName_ + "' not found in " + hsacoPath + " (" +
+                             hipGetErrorString(err) +
                              "). The generated TU must export exactly this symbol.");
   }
 }
@@ -272,7 +273,8 @@ std::string Compiler::EnsureCompiled(const std::string& name, const std::string&
 }
 
 std::shared_ptr<Module> Compiler::Build(const std::string& name, const std::string& code,
-                                        const std::vector<std::string>& sourceDeps) {
+                                        const std::vector<std::string>& sourceDeps,
+                                        const std::string& entry) {
   const int dev = CurrentDevice();
   Impl& impl = GetImpl();
 
@@ -287,7 +289,7 @@ std::shared_ptr<Module> Compiler::Build(const std::string& name, const std::stri
 
   const std::string dir = EnsureCompiled(name, code, sourceDeps);
 
-  auto mod = std::make_shared<Module>(dir + "/" + kObjectFile);
+  auto mod = std::make_shared<Module>(dir + "/" + kObjectFile, entry);
   std::lock_guard<std::mutex> lock(impl.mu);
   auto [it, inserted] = impl.modules.emplace(std::make_pair(dev, dir), std::move(mod));
   return it->second;

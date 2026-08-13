@@ -33,7 +33,7 @@ debug-aa 的 kernel 有 69 个环境变量 gate、323 处 `#if`，缓存 key 在
                                      │   hipcc --genco → 内容寻址缓存
                                      │        │ .hsaco
                                      │        ▼
-                                     │   GetFunction("mori_jit_entry")
+                                     │   GetFunction(Spec::EntryName(cfg))
                                      │   hipModuleLaunchKernel
 ```
 
@@ -113,10 +113,17 @@ using namespace mori::ops::v2;
 constexpr EpCfg kCfg = EpCfg{.hiddenDim=2048, .maxTokPerRank=512, .maxRecv=4096};
 using TokT = hip_bfloat16;
 extern "C" __global__ void __launch_bounds__(EpBlockThreads(kCfg))
-mori_jit_entry(EpArgs args) { EpDispatchBody<kCfg, TokT>(args); }
+mori_ep_dispatch_bf16_ws8_h2048_k8_64x16(EpArgs args) { EpDispatchBody<kCfg, TokT>(args); }
 ```
 
-- **入口名恒定** → 不需要符号枚举、不需要链接期解析，Python 侧的名字拼接彻底消失。
+- **入口名由 `Spec::EntryName(cfg)` 生成，描述这个 kernel 是什么**：哪个 kernel、哪个 body、
+  什么 dtype、什么形状、什么几何。曾经所有 kernel 都叫 `mori_jit_entry`，代价是 profile 里
+  dispatch、combine、以及调优表为不同 token 数选出的每一组几何**全都是同一行**，读不出任何东西。
+  要守的不变量其实不是「名字是个常量」，而是「**Python 不拼 kernel 名**」——v1 用 f-string 重建
+  宏拼出来的符号名、两边没有任何校验，这才是那条纪律的来由。现在名字在 C++ 里只写一处：
+  `EntryName` 生成它，渲染器把它写进源码，`Prepare` 把**同一个字符串**交给
+  `hipModuleGetFunction`，所以改名不可能忘了改查找。一个不在意的 Spec 不覆盖它就退回匿名的
+  `mori_jit_entry`。名字里的字段全都已经在 Cfg 里，所以它不给缓存 key 增加任何新维度。
 - **文本即 key** → 配置不可能不进 key。
 - **`__launch_bounds__` 是表达式不是数字** → 由 host/device 共用的同一个 constexpr 算出。
 - **arch 路由在 host 侧**：include 哪个 body、调哪个函数，由 `RenderSource` 按

@@ -135,7 +135,30 @@ bool EpArchIs1250() { return mori::jit::v2::GetToolchain().arch.rfind("gfx125", 
 // The render-time arch is the same GetToolchain().arch the toolchain compiles
 // with (--offload-arch), so host and device never disagree, and the choice is in
 // the rendered text -> in the cache key.
-std::string RenderEpSource(const EpCfg& cfg, const char* portableBody, const char* gfx1250Body) {
+// The exported symbol, and so the name a profile shows. Everything in it is a
+// dimension you would otherwise have to guess at when reading a trace: which of the
+// two kernels, which body (the gfx125x TDM one is a different implementation, not a
+// recompile), the transported dtype, the shape, and the launch geometry -- which the
+// tuning schedule varies per token count, so one op contributes several rows.
+//
+// Adds nothing to the cache key that was not already in it: every field here is a Cfg
+// field except the body, and that follows the arch, which is already in the cache
+// directory and the compiler flags.
+std::string EpEntryName(const EpCfg& cfg, const char* kind) {
+  std::string s = "mori_ep_";
+  s += kind;
+  if (EpArchIs1250()) s += "_tdm";
+  s += '_';
+  s += EpDTypeTag(cfg.dtype);
+  s += "_ws" + std::to_string(cfg.worldSize);
+  s += "_h" + std::to_string(cfg.hiddenDim);
+  s += "_k" + std::to_string(cfg.numExpertPerToken);
+  s += '_' + std::to_string(cfg.blockNum) + 'x' + std::to_string(cfg.warpPerBlock);
+  return s;
+}
+
+std::string RenderEpSource(const EpCfg& cfg, const std::string& entry, const char* portableBody,
+                           const char* gfx1250Body) {
   const bool is1250 = EpArchIs1250();
   const char* header = is1250 ? "src/ops/dispatch_combine_v2/ep_intranode_1250x.hpp"
                               : "src/ops/dispatch_combine_v2/ep_intranode_kernel.hpp";
@@ -152,9 +175,8 @@ std::string RenderEpSource(const EpCfg& cfg, const char* portableBody, const cha
          "using TokT = " +
          EpDTypeName(cfg.dtype) +
          ";\n"
-         "extern \"C\" __global__ void __launch_bounds__(EpBlockThreads(kCfg))\n"
-         "mori_jit_entry(EpArgs args) { " +
-         body + "<kCfg, TokT>(args); }\n";
+         "extern \"C\" __global__ void __launch_bounds__(EpBlockThreads(kCfg))\n" +
+         entry + "(EpArgs args) { " + body + "<kCfg, TokT>(args); }\n";
 }
 
 const std::vector<std::string>& EpSourceDeps() {
@@ -165,12 +187,15 @@ const std::vector<std::string>& EpSourceDeps() {
 
 }  // namespace
 
+std::string EpDispatchSpec::EntryName(const Cfg& cfg) { return EpEntryName(cfg, "dispatch"); }
+std::string EpCombineSpec::EntryName(const Cfg& cfg) { return EpEntryName(cfg, "combine"); }
+
 std::string EpDispatchSpec::RenderSource(const Cfg& cfg) {
-  return RenderEpSource(cfg, "EpDispatchBody", "EpDispatch1250xBody");
+  return RenderEpSource(cfg, EntryName(cfg), "EpDispatchBody", "EpDispatch1250xBody");
 }
 
 std::string EpCombineSpec::RenderSource(const Cfg& cfg) {
-  return RenderEpSource(cfg, "EpCombineBody", "EpCombine1250xBody");
+  return RenderEpSource(cfg, EntryName(cfg), "EpCombineBody", "EpCombine1250xBody");
 }
 
 const std::vector<std::string>& EpDispatchSpec::SourceDeps() { return EpSourceDeps(); }

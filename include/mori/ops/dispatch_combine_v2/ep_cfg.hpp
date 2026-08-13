@@ -73,6 +73,20 @@ inline const char* EpDTypeName(EpDType d) {
   }
 }
 
+// Identifier-safe short tag, for the kernel symbol name. Separate from
+// EpDTypeName, which yields a C++ type -- "unsigned char" has a space in it and
+// would not be a legal symbol.
+inline const char* EpDTypeTag(EpDType d) {
+  switch (d) {
+    case EpDType::Fp32:
+      return "fp32";
+    case EpDType::Byte8:
+      return "byte8";
+    default:
+      return "bf16";
+  }
+}
+
 constexpr int EpElemSize(EpDType d) {
   return d == EpDType::Fp32 ? 4 : (d == EpDType::Byte8 ? 1 : 2);
 }
