@@ -24,7 +24,7 @@
 AllReduce SDMA Test using torch.distributed and multiprocessing.
 
 Tests four modes:
-  1. SDMA out-of-place (copy_output_to_user=False, read from transit buffer)
+  1. SDMA out-of-place (legacy copy_output_to_user=False compatibility)
   2. SDMA in-place     (allreduce_inplace)
   3. RCCL out-of-place (torch.distributed.all_reduce, copy + reduce)
   4. RCCL in-place     (torch.distributed.all_reduce, refill + reduce)
@@ -177,9 +177,9 @@ def _test_outplace(
     iterations,
     warmup,
 ):
-    """Test 1: out-of-place (copy_output_to_user=False)."""
+    """Test 1: direct caller-output out-of-place."""
     if rank == 0:
-        print(f"\n>>> Test 1: Out-of-place (copy_output_to_user=False, {dtype_name})")
+        print(f"\n>>> Test 1: Direct caller-output out-of-place ({dtype_name})")
 
     ar = AllreduceSdma(
         my_pe,
@@ -209,20 +209,10 @@ def _test_outplace(
         rank,
     )
 
-    transit_buf = ar.get_output_transit_buffer(dtype=input_tensor.dtype)
-    transit_cpu = _to_numpy(transit_buf.cpu())
+    output_cpu = _to_numpy(output_tensor.cpu())
     ok = _verify_allreduce_result(
-        transit_cpu, elems, my_pe, npes, f"outplace/{dtype_name}", dtype=dtype
+        output_cpu, elems, my_pe, npes, f"outplace/{dtype_name}", dtype=dtype
     )
-
-    out_cpu = _to_numpy(output_tensor.cpu())
-    zero_check = (
-        np.allclose(out_cpu, 0)
-        if dtype not in (torch.uint32, torch.int32)
-        else np.all(out_cpu == 0)
-    )
-    if zero_check and rank == 0:
-        print(f"  PE {rank}: output_tensor correctly untouched (all zeros)")
 
     dist.barrier()
     _print_stats(times, data_bytes, npes, rank, f"Out-of-place ({dtype_name})")

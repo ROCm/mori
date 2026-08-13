@@ -93,7 +93,7 @@ static void printStats(const std::vector<double>& times, size_t bytesPerPe, int 
 }
 
 // =========================================================================
-// Test 1: Out-of-place (copy_output_to_user=False, read from transit buffer)
+// Test 1: Out-of-place (legacy copy_output_to_user=False compatibility)
 // =========================================================================
 static bool testOutplace(int myPe, int npes, int elemsPerPe, size_t bytesPerPe,
                          size_t outputBufSize, uint32_t fillValue, hipStream_t stream,
@@ -130,17 +130,9 @@ static bool testOutplace(int myPe, int npes, int elemsPerPe, size_t bytesPerPe,
       printf("  Warmup %d/%d: %.3f ms\n", i + 1, warmup, (t1 - t0) * 1000);
   }
 
-  // Verify from transit buffer (outBuf should remain zeros)
-  void* transitPtr = ar->getOutputTransitBuffer();
-  std::vector<uint32_t> transitData(elemsPerPe);
-  CHECK_HIP(hipMemcpy(transitData.data(), transitPtr, bytesPerPe, hipMemcpyDeviceToHost));
-  bool ok = verifyResult(transitData.data(), elemsPerPe, computeExpected(npes), myPe);
-
   std::vector<uint32_t> outData(elemsPerPe);
   CHECK_HIP(hipMemcpy(outData.data(), outBuf, bytesPerPe, hipMemcpyDeviceToHost));
-  bool allZero = std::all_of(outData.begin(), outData.end(), [](uint32_t v) { return v == 0; });
-  if (allZero && myPe == 0)
-    printf("  PE %d: output_tensor correctly untouched (all zeros)\n", myPe);
+  bool ok = verifyResult(outData.data(), elemsPerPe, computeExpected(npes), myPe);
 
   MPI_Barrier(MPI_COMM_WORLD);
   if (myPe == 0) printf("\n--- Out-of-place Performance ---\n");

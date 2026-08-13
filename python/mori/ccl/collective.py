@@ -1030,6 +1030,8 @@ _HANDLE_MAP = {
 
 
 class AllreduceSdma:
+    _ONESHOT_MAX_BYTES = 1 << 20
+
     def __init__(
         self,
         my_pe: int,
@@ -1046,6 +1048,8 @@ class AllreduceSdma:
         self.my_pe = my_pe
         self.npes = npes
         self.dtype = dtype
+        self._element_size = torch.empty((), dtype=dtype).element_size()
+        self._async_oneshot = False
         self.mode = mode
         self._type_suffix = _DTYPE_TO_SUFFIX.get(dtype)
         if self._type_suffix is None:
@@ -1086,15 +1090,21 @@ class AllreduceSdma:
             input_data.data_ptr(), output_data.data_ptr(), count, s
         )
         blocks, threads = self._handle.get_reduce_scatter_grid(count)
-        _get_ccl_func(f"SdmaReduceScatterKernel_{sfx}").launch_struct(
+        oneshot = count * self._element_size <= self._ONESHOT_MAX_BYTES
+        kernel = "SdmaOneShotAllreduceKernel" if oneshot else "SdmaReduceScatterKernel"
+        _get_ccl_func(f"{kernel}_{sfx}").launch_struct(
             (blocks,), (threads,), 0, s, args
         )
+        if oneshot:
+            self._handle.finish_sync(
+                output_data.data_ptr(), count, s, force_copy_output, True
+            )
+            return True
         # Step 2: AllGather
         args = self._handle.prepare_allgather(count, s)
-        _get_ccl_func(f"AllGatherSdmaKernel_{sfx}").launch_struct(
+        _get_ccl_func(f"AllGatherSdmaFromProtectedKernel_{sfx}").launch_struct(
             (1,), (512,), 0, s, args
         )
-        # Sync + copy output
         self._handle.finish_sync(output_data.data_ptr(), count, s, force_copy_output)
         return True
 
@@ -1112,25 +1122,30 @@ class AllreduceSdma:
             input_data.data_ptr(), output_data.data_ptr(), count, s
         )
         blocks, threads = self._handle.get_reduce_scatter_grid(count)
-        _get_ccl_func(f"SdmaReduceScatterKernel_{sfx}").launch_struct(
+        self._async_oneshot = count * self._element_size <= self._ONESHOT_MAX_BYTES
+        kernel = (
+            "SdmaOneShotAllreduceKernel"
+            if self._async_oneshot
+            else "SdmaReduceScatterKernel"
+        )
+        _get_ccl_func(f"{kernel}_{sfx}").launch_struct(
             (blocks,), (threads,), 0, s, args
         )
-        # AllGather PUT
-        args = self._handle.prepare_async_allgather_put(count, s)
-        _get_ccl_func(f"AllGatherAsyncPutKernel_{sfx}").launch_struct(
-            (1,), (512,), 0, s, args
-        )
-        self._handle.after_async_start()
+        if not self._async_oneshot:
+            args = self._handle.prepare_async_allgather_put(count, s)
+            _get_ccl_func(
+                f"AllGatherSdmaFromProtectedKernel_{sfx}"
+            ).launch_struct((1,), (512,), 0, s, args)
+        capturing = torch.cuda.is_current_stream_capturing()
+        self._handle.after_async_start(capturing)
         return True
 
     def wait_async(self, stream=None) -> float:
         s = _stream_to_int(stream)
-        sfx = self._type_suffix
-        args = self._handle.prepare_async_wait(s)
-        _get_ccl_func(f"AllGatherAsyncWaitKernel_{sfx}").launch_struct(
-            (1,), (64,), 0, s, args
-        )
-        return self._handle.finish_async_wait(s)
+        capturing = torch.cuda.is_current_stream_capturing()
+        if self._async_oneshot:
+            return self._handle.finish_async_wait(s, capturing, True)
+        return self._handle.finish_async_wait(s, capturing)
 
     def is_async_in_progress(self) -> bool:
         return self._handle.is_async_in_progress()
@@ -1140,8 +1155,3 @@ class AllreduceSdma:
 
     def reset_flags(self):
         self._handle.reset_flags()
-
-    def get_output_transit_buffer(self, dtype=None, device=None):
-        dtype, device = _resolve_transit_view_args(dtype, device, self.dtype)
-        ptr, size_bytes = self._handle.get_output_transit_buffer()
-        return _ptr_to_tensor(ptr, size_bytes, dtype, device)
