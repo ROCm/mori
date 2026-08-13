@@ -435,14 +435,16 @@ class ScopedTimer {
 // Cache the (module -> logger) resolution in a function-local static so the
 // unordered_map<string, logger> lookup runs once per call-site instead of on
 // every invocation of the timed function.
-#define MORI_TIMER(name, module)                                    \
-  static const std::shared_ptr<spdlog::logger> _mori_timer_logger = \
-      ::mori::ModuleLogger::GetInstance().GetLogger(module);        \
-  ::mori::ScopedTimer timer_instance(name, _mori_timer_logger.get())
-#define MORI_FUNCTION_TIMER(module)                                 \
-  static const std::shared_ptr<spdlog::logger> _mori_timer_logger = \
-      ::mori::ModuleLogger::GetInstance().GetLogger(module);        \
-  ::mori::ScopedTimer timer_instance(__PRETTY_FUNCTION__, _mori_timer_logger.get())
+#define MORI_TIMER(name, module)                                                       \
+  ::mori::ScopedTimer timer_instance((name), [] {                                      \
+    static const auto _logger = ::mori::ModuleLogger::GetInstance().GetLogger(module); \
+    return _logger.get();                                                              \
+  }())
+#define MORI_FUNCTION_TIMER(module)                                                    \
+  ::mori::ScopedTimer timer_instance(__PRETTY_FUNCTION__, [] {                         \
+    static const auto _logger = ::mori::ModuleLogger::GetInstance().GetLogger(module); \
+    return _logger.get();                                                              \
+  }())
 
 // Initialization helper functions
 inline void InitializeLogging() {
