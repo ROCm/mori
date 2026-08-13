@@ -773,7 +773,7 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
         if (hostEndpoints[i].ibvHandle.qp != nullptr) {
           int pe = i / numQpPerPe;
           int peerLocalGpu = pe % numNics;
-          int nicIdx = (numNics > 1) ? ((myLocalGpu + peerLocalGpu) % numNics) : 0;
+          int nicIdx = (numNics > 1) ? (std::max(myLocalGpu, peerLocalGpu) % numNics) : 0;
           if (nicIdx != n) continue;
           uint32_t lkey = (nicIdx < (int)perNicLkeys.size()) ? perNicLkeys[nicIdx] : 0;
           uint32_t rkey = 0;

@@ -14,7 +14,7 @@ inline __device__ volatile core::ProxyRing* ProxyRingForEp(
     ProxyGpuStates* ps, uint32_t epIndex) {
   int pe = epIndex / ps->numQpPerPe;
   int peerLocal = pe % ps->numNics;
-  int nicIdx = (ps->localGpuIdx + peerLocal) % ps->numNics;
+  int nicIdx = (ps->localGpuIdx > peerLocal ? ps->localGpuIdx : peerLocal) % ps->numNics;
   return static_cast<volatile core::ProxyRing*>(ps->rings[nicIdx]);
 }
 
@@ -46,7 +46,7 @@ inline __device__ void ShmemQuietThreadKernel<application::TransportType::PROXY>
   GpuStates* gs = GetGlobalGpuStatesPtr();
   int epIndex = pe * gs->numQpPerPe;
   int peerLocal = pe % ps->numNics;
-  int nicIdx = (ps->localGpuIdx + peerLocal) % ps->numNics;
+  int nicIdx = (ps->localGpuIdx > peerLocal ? ps->localGpuIdx : peerLocal) % ps->numNics;
   volatile core::ProxyRing* ring = static_cast<volatile core::ProxyRing*>(ps->rings[nicIdx]);
   if (ring) {
     uint32_t head = ring->gpu_head;
