@@ -49,6 +49,8 @@ void ProxyThread::DrainCq(ProxyQpHandle& qph) {
   while ((n = ibv_poll_cq(qph.cq, 64, wc)) > 0) {
     for (int i = 0; i < n; i++) {
       if (wc[i].opcode == IBV_WC_RECV || wc[i].opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+        fprintf(stderr, "[PROXY-RECV-CQE] gpu_id=%d opcode=%d status=%d byte_len=%u wr_id=%lu\n",
+                gpu_id_, wc[i].opcode, wc[i].status, wc[i].byte_len, wc[i].wr_id);
         if (wc[i].status == IBV_WC_SUCCESS && wc[i].byte_len >= 16) {
           uint32_t recv_idx = static_cast<uint32_t>(wc[i].wr_id);
           if (recv_idx < qph.recv_count && qph.recv_buf) {
