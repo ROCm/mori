@@ -25,8 +25,13 @@
     python3 setup.py build_ext --inplace
     torchrun --nnodes=1 --nproc_per_node=<gpus> all2all.py
 
-The receive buffer is an ordinary symm_mem tensor; the kernel reaches peers purely as
-flat_base + rank*stride. No mori shmem or cco.
+The receive buffer is an ordinary symm_mem tensor and the kernel reaches peers through
+torch's peer pointer array. No mori shmem or cco.
+
+The same kernel is also built against a flat base + rank*stride window, so the two
+addressing forms can be measured against each other -- that comparison is what motivates
+the cco-window stage in ROCm/mori#557. The flat form is derived here in the example, not
+offered by the allocator's API.
 """
 
 import argparse
@@ -37,7 +42,7 @@ import sys
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
-from mori.allocator import flat_layout, handle_type  # importing registers "MORI"
+from mori.allocator import handle_type  # importing registers "MORI"
 
 
 def parse_args():
@@ -47,11 +52,28 @@ def parse_args():
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument(
         "--addressing",
-        choices=("flat", "ptrs", "both"),
+        choices=("ptrs", "flat", "both"),
         default="both",
-        help="flat_base + peer*stride, an N-entry peer pointer array, or both",
+        help="the N-entry peer pointer array, flat base + peer*stride, or both",
     )
     return p.parse_args()
+
+
+def flat_view(handle):
+    """``(base, stride)`` for the flat form, derived from the pointers torch publishes.
+
+    Only valid because this backend maps every rank into one span; a backend handing
+    back scattered per-rank pointers would fail the check, and pointing a kernel at
+    ``base + rank*stride`` on one of those would silently corrupt memory.
+    """
+    ptrs = handle.buffer_ptrs
+    base = ptrs[0]
+    stride = ptrs[1] - ptrs[0] if len(ptrs) > 1 else 0
+    if any(p != base + r * stride for r, p in enumerate(ptrs)):
+        raise RuntimeError(
+            f"window is not evenly strided; peers={[hex(p) for p in ptrs]}"
+        )
+    return base, stride
 
 
 def main():
@@ -87,17 +109,18 @@ def main():
     torch.cuda.synchronize()
 
     hdl = symm_mem.rendezvous(recv, group_name)
-    base, stride = flat_layout(hdl)
-    # The same peers, as the N-entry device array torch's API always provides.
+    # The N-entry device array torch's API always provides.
     peers_dev = hdl.buffer_ptrs_dev
+    # The same peers as two scalars, for the comparison only.
+    base, stride = flat_view(hdl)
 
-    modes = ("flat", "ptrs") if args.addressing == "both" else (args.addressing,)
+    modes = ("ptrs", "flat") if args.addressing == "both" else (args.addressing,)
     launch = {
-        "flat": lambda: all2all_kernel.all2all_push(
-            send, base, stride, chunk_bytes, rank_id, world_size
-        ),
         "ptrs": lambda: all2all_kernel.all2all_push_ptrs(
             send, peers_dev, chunk_bytes, rank_id, world_size
+        ),
+        "flat": lambda: all2all_kernel.all2all_push(
+            send, base, stride, chunk_bytes, rank_id, world_size
         ),
     }
 
@@ -105,9 +128,8 @@ def main():
         print(
             f"world={world_size}  handle={handle_type(local_rank)}  chunk={args.chunk_kib} KiB"
         )
-        print(f"flat window: base={base:#x} stride={stride >> 20} MiB")
-        strided = all(p == base + r * stride for r, p in enumerate(hdl.buffer_ptrs))
-        print(f"peer(r) == base + r*stride: {strided}")
+        print(f"peers: {' '.join(hex(p) for p in hdl.buffer_ptrs)}")
+        print(f"same as base={base:#x} + rank*{stride >> 20} MiB")
 
     def run_once(mode):
         launch[mode]()
@@ -157,7 +179,7 @@ def main():
         totals = torch.tensor([gbps], dtype=torch.float64)
         dist.all_reduce(totals, op=dist.ReduceOp.SUM)
         if rank_id == 0:
-            label = "base + rank*stride" if mode == "flat" else "peer pointer array"
+            label = "peer pointer array" if mode == "ptrs" else "base + rank*stride"
             print(
                 f"{label:<20}: {ms * 1e3:7.1f} us/iter, {totals.item():8.1f} GB/s aggregate"
             )

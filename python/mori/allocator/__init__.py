@@ -33,9 +33,14 @@ is needed -- torch's process group is the only rendezvous::
     hdl = symm_mem.rendezvous(t, group_name)
     peer = hdl.get_buffer(1, (1024,), torch.bfloat16)
 
-Every rank is mapped into one flat span, so ``hdl.buffer_ptrs[r]`` is
-``flat_base + r*stride`` -- a kernel can take a base and a stride instead of an N-entry
-pointer array. ``flat_layout(hdl)`` returns that pair and checks the stride is uniform.
+Peers are exposed the way torch's model expects, as the ``buffer_ptrs`` /
+``buffer_ptrs_dev`` array -- one base address per rank, same as every other backend.
+
+Internally the ranks are mapped into one flat span, so those pointers happen to be evenly
+strided (``buffer_ptrs[r] == buffer_ptrs[0] + r*stride``). That is deliberately not public
+yet: exposing it belongs with mori's cco window, whose ``ccoWindowDevice`` already defines
+the layout (``winBase``, 4 GiB-quantised ``stride4G``, LSA-rank indexing). See ROCm/mori#557
+for the staged plan.
 
 The handle type is probed per device: fabric where supported, POSIX fd otherwise. gfx9
 (MI300/MI355) has no fabric support -- ``hipMemCreate`` itself reports "operation not
@@ -43,7 +48,10 @@ supported" -- so those fall back to fd, which needs no configuration.
 
 ``barrier``/``put_signal``/``wait_signal`` are not implemented and raise, so no signal
 pad is reserved in the window -- torch's 9216-byte pad would cost a whole extra 2 MiB page
-on a page-aligned allocation. Build with ``MORI_SYMM_SIGNAL_PAD=ON`` to reserve it.
+on a page-aligned allocation. Build with ``MORI_SYMM_SIGNAL_PAD=ON`` to reserve it, and
+check ``signal_pad_supported()`` at run time. torch's own ``symm_mem`` collectives
+synchronise through the pad, so they need that build; ``dist.barrier()`` is the stand-in
+without it.
 
 Known gap: releasing a rendezvous'd window segfaults at world_size >= 4 (2 ranks are
 fine), somewhere in the unmap/release path. Teardown is therefore disabled by default and
@@ -52,14 +60,17 @@ harmful than crashing. Set ``MORI_SYMM_TEARDOWN=1`` to re-enable it while debugg
 """
 
 import atexit
+import logging
 from typing import Literal
 
 __all__ = [
     "SYMM_BACKEND_NAME",
-    "flat_layout",
     "handle_type",
     "register_symm_backend",
+    "signal_pad_supported",
 ]
+
+logger = logging.getLogger(__name__)
 
 SYMM_BACKEND_NAME = "MORI"
 
@@ -70,7 +81,7 @@ def _ext():
     # torch must be imported first: the extension links libtorch, and nothing on its
     # RUNPATH resolves those, so they have to already be in the process.
     try:
-        import torch  # noqa: F401
+        import torch
     except ImportError as exc:
         raise ImportError("mori.allocator requires torch") from exc
     try:
@@ -103,30 +114,20 @@ def register_symm_backend() -> str:
     return SYMM_BACKEND_NAME
 
 
-def flat_layout(handle) -> tuple[int, int]:
-    """``(flat_base, stride)`` of a rendezvous'd window: peer r lives at
-    ``flat_base + r*stride``.
-
-    torch already publishes the peer pointers, so this is only
-    ``ptrs[0], ptrs[1] - ptrs[0]``. What it adds is the check that the window really
-    is evenly strided -- a guarantee this allocator makes and torch's API does not,
-    since other backends hand back scattered per-rank pointers. Pointing a kernel at
-    ``base + rank*stride`` on one of those would silently corrupt memory.
-    """
-    ptrs = handle.buffer_ptrs
-    base = ptrs[0]
-    stride = ptrs[1] - ptrs[0] if len(ptrs) > 1 else 0
-    if any(p != base + r * stride for r, p in enumerate(ptrs)):
-        raise RuntimeError(
-            "symmetric window is not evenly strided; flat_layout() is only meaningful "
-            f"for the {SYMM_BACKEND_NAME} backend. peers={[hex(p) for p in ptrs]}"
-        )
-    return base, stride
-
-
 def handle_type(device_index: int = 0) -> Literal["fabric", "posix_fd"]:
     """Which shareable handle type this device can export."""
     return _ext().handle_type(device_index)
+
+
+def signal_pad_supported() -> bool:
+    """Whether windows carry torch's signal pad.
+
+    False unless built with ``MORI_SYMM_SIGNAL_PAD=ON``. Without the pad, torch's own
+    ``symm_mem`` collectives raise -- their kernels synchronise through it -- and
+    ``dist.barrier()`` is the stand-in. With it they work, since they use the pad
+    directly; this backend's ``barrier``/``put_signal``/``wait_signal`` raise either way.
+    """
+    return bool(_ext().signal_pad_supported)
 
 
 def _register_on_import() -> None:
@@ -138,8 +139,11 @@ def _register_on_import() -> None:
     """
     try:
         register_symm_backend()
-    except Exception:  # pragma: no cover - depends on build/runtime environment
-        pass
+    except (
+        ImportError,
+        RuntimeError,
+    ) as exc:  # pragma: no cover - build/runtime dependent
+        logger.debug("%s backend not registered: %s", SYMM_BACKEND_NAME, exc)
 
 
 _register_on_import()

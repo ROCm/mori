@@ -1,15 +1,17 @@
 # All-to-all over the mori torch SymmetricMemory backend
 
-A custom HIP kernel doing one-shot all-to-all against a flat symmetric window. **Pure
-HIP** — it does not use mori's shmem or cco. The only thing it needs from the backend is
-`(flat_base, stride)`, after which every peer is addressed arithmetically:
+A custom HIP kernel doing one-shot all-to-all against a symmetric window. **Pure HIP** — it
+does not use mori's shmem or cco. The only thing it needs from the backend is the peer
+pointers torch publishes:
 
 ```
-recv slot of rank p, chunk from rank r  ==  flat_base + p*stride + r*chunk_bytes
+recv slot of rank p, chunk from rank r  ==  peers[p] + r*chunk_bytes
 ```
 
-so the kernel takes two pointers and a few integers rather than an N-entry pointer array,
-and the destination rank can be computed at run time.
+A second copy of the same kernel takes `(base, stride)` and computes `peers[p]` as
+`base + p*stride` instead, so the two addressing forms can be measured against each other.
+That comparison is what the cco-window stage in [ROCm/mori#557](https://github.com/ROCm/mori/issues/557)
+turns into an API; the allocator itself exposes only the torch form today.
 
 ```bash
 python3 setup.py build_ext --inplace
@@ -31,20 +33,22 @@ symm_mem.set_backend("MORI")
 
 recv = symm_mem.empty(world_size * elems, dtype=torch.int32, device=device)
 hdl  = symm_mem.rendezvous(recv, group_name)
-base, stride = flat_layout(recv)
 
-all2all_kernel.all2all_push(send, base, stride, chunk_bytes, rank_id, world_size)
+all2all_kernel.all2all_push_ptrs(
+    send, hdl.buffer_ptrs_dev, chunk_bytes, rank_id, world_size
+)
 ```
 
-`flat_layout()` is a convenience. torch already publishes the peer pointers, so the same
-two numbers are just `hdl.buffer_ptrs[0]` and `hdl.buffer_ptrs[1] - hdl.buffer_ptrs[0]`;
-the helper only adds a check that the stride is uniform, which torch's API does not
-promise and which backends handing back scattered per-rank pointers would fail.
+The flat form's two numbers are derived in `all2all.py`, not handed out by the allocator:
+they are `hdl.buffer_ptrs[0]` and `hdl.buffer_ptrs[1] - hdl.buffer_ptrs[0]`, plus a check
+that the stride is uniform — which torch's API does not promise, and which a backend
+handing back scattered per-rank pointers would fail.
 
 ## Measured
 
 Aggregate counts only the `(world_size-1)` chunks that leave the device; the self chunk stays
-local. Correctness and `peer(r) == base + r*stride` hold on every configuration below.
+local. Both addressing modes are correctness-checked on every configuration below, and
+`peer(r) == base + r*stride` holds throughout.
 
 4 MiB per peer:
 
@@ -63,8 +67,8 @@ local. Correctness and `peer(r) == base + r*stride` hold on every configuration 
 | 8 | 1459.0 GB/s | — | 250.0 GB/s |
 
 gfx1250 exports **fabric** handles; gfx950 and gfx942 fall back to POSIX fd, having no
-fabric support at `hipMemCreate`. The kernel sees the same flat window either way. The
-gfx1250 box has 4 GPUs, hence no 8-rank column.
+fabric support at `hipMemCreate`. The kernel sees the same window either way. The gfx1250
+box has 4 GPUs, hence no 8-rank column.
 
 Grid shape matters more than the handle type. An earlier version launched one block per
 destination rank, leaving all but `world_size` CUs idle and unable to keep enough writes in
@@ -76,25 +80,35 @@ Uncached/fine-grained windows, as mori's cco windows are, were measured and reje
 the bandwidth on gfx1250 (712 vs 1499 GB/s at 4 ranks) and no change on gfx950. The backend
 uses coarse-grained pinned memory.
 
-### Addressing: flat window vs pointer array
+### Addressing: pointer array vs flat window
 
-The kernel is built both ways so they can be compared — `flat_base + peer*stride`, and the
-N-entry peer pointer array that `hdl.buffer_ptrs_dev()` provides and that torch's own
-backends force, since they map each peer at an unrelated address. `--addressing
-flat|ptrs|both` selects; both are correctness-checked.
+The kernel is built both ways so they can be compared — the N-entry array from
+`hdl.buffer_ptrs_dev`, which is what torch's model provides and what its own backends force
+(they map each peer at an unrelated address), and `base + peer*stride`. `--addressing
+ptrs|flat|both` selects; both are correctness-checked.
 
 | | gfx950, 8 ranks, 4 MiB | gfx1250, 4 ranks, 4 MiB |
 |---|---|---|
-| `base + rank*stride` | 1912.0 GB/s | 1714.7 GB/s |
 | peer pointer array | 1909.4 GB/s | 1702.9 GB/s |
+| `base + rank*stride` | 1912.0 GB/s | 1714.7 GB/s |
+
+Re-measured after this example was reorganised, on a second 8×gfx950 box: 1814.5 (array)
+vs 1803.7 (flat) at 4 MiB, and 1639.9 vs 1623.2 at 256 KiB — same conclusion, with the
+array marginally ahead this time rather than behind.
 
 **There is no measurable performance difference.** The gap is under 1% here and under 4%
 at 256 KiB, and it does not consistently favour either form — the pointer load is issued
 once per block and amortised, while the flat form pays two extra 64-bit multiplies. So the
-flat window is worth having for kernel ergonomics (two scalars, no device-side array to
-plumb or keep alive, destination computable at run time), not for speed. Anyone choosing
-between them for throughput reasons should measure first; on these two parts it does not
-matter.
+pointer array, which is what this backend exposes, costs nothing; the flat form is worth
+pursuing for kernel ergonomics (two scalars, no device-side array to plumb or keep alive,
+destination computable at run time), not for speed.
+
+Every serious library builds the flat window underneath regardless: NCCL's
+`ncclGetLsaPointer` is `add4G(lsaFlatBase, peer*stride4G) + offset`, mori's own
+`ccoWindowDevice` is `winBase + ((uint64_t)peerLsaRank * stride4G << 32) + offset`, and
+NVSHMEM reserves `npes * heap_size` in one go and then hides it behind an array because its
+slots are rotated from `mype+1`. [ROCm/mori#557](https://github.com/ROCm/mori/issues/557)
+is where this backend adopts cco's version of it rather than inventing a third.
 
 ### Why gfx942 is slow
 
@@ -124,7 +138,8 @@ peers keeps full bandwidth on the same box (2668.5 -> 2665.2 GB/s), because the 
 use different kernel interfaces: `hipMemSetAccess` reaches libdrm `amdgpu_bo_va_op`, the
 DRM path, while ordinary allocations go through `hsaKmtMapMemoryToGPUNodes`, the KFD one.
 Plain VMM, flat multi-slot reservations, self-aliasing and Pinned-vs-Uncached are all free,
-so the flat window design is not what costs gfx942 its bandwidth.
+so neither the window layout nor the addressing form is what costs gfx942 its bandwidth —
+the peer grant is.
 
 Possibly a missing kernel option rather than silicon: this box runs a 5.10 kernel with a
 DKMS backport and has `CONFIG_PCI_P2PDMA` and `CONFIG_DMABUF_MOVE_NOTIFY` unset, both of
@@ -132,8 +147,8 @@ which the DRM cross-device path wants, while the unaffected gfx950 box (6.8) has
 Untested — it needs a rebuilt kernel or a modern-kernel MI300.
 
 The escape hatch is what aiter's custom allreduce does: `hipMalloc` + hipIpc stays on the
-KFD path and keeps full bandwidth, at the cost of scattered peer pointers and an N-entry
-pointer array instead of a flat window.
+KFD path and keeps full bandwidth, at the cost of scattered peer pointers — which, since
+this backend exposes the pointer array anyway, kernels would not notice.
 
 ## Notes
 
@@ -141,5 +156,8 @@ pointer array instead of a flat window.
 device-side barrier yet (`barrier`/`put_signal`/`wait_signal` raise). Since none of them
 are implemented, the signal pad is not reserved either — appending torch's 9216-byte pad
 to a page-aligned window would cost a whole extra 2 MiB page, physical backing being
-2 MiB-paged. Build with `MORI_SYMM_SIGNAL_PAD=ON` to reserve it. A real workload would want
-signal-pad synchronisation instead, which is why the timed loop measures the kernel alone.
+2 MiB-paged. Build with `MORI_SYMM_SIGNAL_PAD=ON` to reserve it and
+`mori.allocator.signal_pad_supported()` to check at run time; torch's own `symm_mem`
+collectives synchronise through that pad, so they need the flag even though they never call
+this backend's `barrier()`. A real workload would want signal-pad synchronisation instead,
+which is why the timed loop measures the kernel alone.

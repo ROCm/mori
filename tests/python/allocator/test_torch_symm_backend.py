@@ -24,7 +24,10 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 import torch.multiprocessing as mp
-from mori.allocator import flat_layout, handle_type  # importing registers "MORI"
+from mori.allocator import (  # importing registers "MORI"
+    handle_type,
+    signal_pad_supported,
+)
 
 from tests.python.utils import TorchDistContext, get_free_port
 
@@ -48,21 +51,31 @@ def _run(rank, world_size, port):
         hdl = symm_mem.rendezvous(t, group_name)
         assert hdl.world_size == world_size and hdl.rank == rank
 
-        # Peers land in one flat span: buffer_ptrs[r] == flat_base + r*stride.
-        base, stride = flat_layout(hdl)
-        for r, p in enumerate(hdl.buffer_ptrs):
-            assert p == base + r * stride, f"rank {r} not at base + r*stride"
+        # Peers come back the torch way, as one base address per rank.
+        ptrs = hdl.buffer_ptrs
+        assert len(ptrs) == world_size and all(p for p in ptrs)
+        # An implementation detail rather than an API promise, but worth pinning: the
+        # ranks share one flat span, so the pointers are evenly strided. ROCm/mori#557
+        # is where that becomes a first-class cco window.
+        stride = ptrs[1] - ptrs[0]
+        for r, p in enumerate(ptrs):
+            assert p == ptrs[0] + r * stride, f"rank {r} not at base + r*stride"
 
         # Read every peer and check its sentinel.
         for pe in range(world_size):
             peer = hdl.get_buffer(pe, (4,), torch.float32)
             assert abs(peer[0].item() - (pe + 1)) < 1e-6, f"peer {pe} mismatch"
 
-        # torch's own collective, on mori memory.
+        # torch's own collective, on mori memory. It barriers on the device, so it needs
+        # the signal pad; without it the backend must say so rather than corrupt memory.
         expect = float(sum(r + 1 for r in range(world_size)))
-        out = torch.ops.symm_mem.one_shot_all_reduce(t, "sum", group_name)
-        torch.cuda.synchronize()
-        assert abs(out[0].item() - expect) < 1e-3
+        if signal_pad_supported():
+            out = torch.ops.symm_mem.one_shot_all_reduce(t, "sum", group_name)
+            torch.cuda.synchronize()
+            assert abs(out[0].item() - expect) < 1e-3
+        else:
+            with pytest.raises(RuntimeError, match="MORI_SYMM_SIGNAL_PAD"):
+                torch.ops.symm_mem.one_shot_all_reduce(t, "sum", group_name)
 
         dist.barrier()
 

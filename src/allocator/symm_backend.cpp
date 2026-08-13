@@ -30,8 +30,10 @@
 // hold (tensors die on Python GC, whose order is not synchronised across ranks). Here each
 // allocation is independent and free() is local, so divergent free order is harmless.
 //
-// Peers map into one flat span, so peer(r) == flat_base + r*stride: a kernel needs a base
-// and a stride, not a pointer array.
+// Peers are published torch's way, as the buffer_ptrs / buffer_ptrs_dev array. They happen
+// to sit in one flat span (peer(r) == flat_base + r*stride) because that is the cheapest
+// way to map them, but that layout is not part of the API here: exposing it belongs with
+// mori's cco window, which already defines it. See ROCm/mori#557.
 //
 // Handle type is probed per device -- fabric where supported, POSIX fd otherwise (gfx9 has
 // none). Fabric handles are portable bytes and ride the torch Store; fds need SCM_RIGHTS.
@@ -358,9 +360,6 @@ class MoriSymmetricMemory : public SymmetricMemory {
     TORCH_CHECK(false, "mori symm backend: wait_signal is not implemented. ", kNoSignalPad);
   }
 
-  uintptr_t flat_base() const { return reinterpret_cast<uintptr_t>(flat_base_); }
-  size_t stride() const { return stride_; }
-
  private:
   char* flat_base_;
   size_t span_;
@@ -602,4 +601,8 @@ PYBIND11_MODULE(mori_torch_symm, m) {
   m.def("handle_type", &mori::allocator::HandleTypeName,
         "'fabric' or 'posix_fd' -- what this device can export");
   m.attr("backend_name") = "MORI";
+  // Whether the window carries torch's signal pad. False by default, and then anything
+  // that synchronises on the device -- barrier(), put/wait_signal(), and torch's own
+  // symm_mem collectives, which barrier internally -- raises instead.
+  m.attr("signal_pad_supported") = mori::allocator::kSignalPadBytes != 0;
 }

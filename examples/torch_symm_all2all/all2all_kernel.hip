@@ -20,20 +20,18 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// all2all_kernel.hip -- one-shot all-to-all against a flat symmetric window.
+// all2all_kernel.hip -- one-shot all-to-all against a symmetric window.
 //
-// Pure HIP: no mori shmem or cco. All it needs from the backend is (flat_base, stride),
-// after which peers are addressed arithmetically, so no N-entry pointer array is needed
-// and the destination is computed at run time:
+// Pure HIP: no mori shmem or cco. All it needs from the backend is the peer pointers:
 //
-//     recv slot of rank p, chunk from rank r  ==  flat_base + p*stride + r*chunk_bytes
+//     recv slot of rank p, chunk from rank r  ==  peers[p] + r*chunk_bytes
 //
 // Push semantics: each rank writes its own chunk into every peer's window. No remote
 // reads, no per-peer handshake -- just one barrier before anyone reads what landed.
 //
-// Both addressing modes are built so they can be compared: the flat form above, and the
-// N-entry pointer array that torch's buffer_ptrs_dev() forces when a backend maps peers
-// at unrelated addresses. The kernels are otherwise identical.
+// A second copy of the kernel takes (base, stride) instead and computes the peer address
+// arithmetically -- two scalars, no device-side array to plumb. The two are otherwise
+// identical, and exist to be measured against each other; see ROCm/mori#557.
 
 #include <c10/hip/HIPStream.h>
 #include <hip/hip_runtime.h>
@@ -109,8 +107,8 @@ void CheckArgs(const at::Tensor& send, int64_t chunk_bytes, int64_t world_size) 
 
 }  // namespace
 
-// send is local, world_size*chunk_bytes. flat_base/stride come from flat_layout() on the
-// rendezvous'd receive tensor. Caller barriers afterwards.
+// send is local, world_size*chunk_bytes. flat_base/stride are derived from the
+// rendezvous'd tensor's buffer_ptrs by the caller. Caller barriers afterwards.
 void all2all_push(const at::Tensor& send, int64_t flat_base, int64_t stride, int64_t chunk_bytes,
                   int64_t rank_id, int64_t world_size) {
   CheckArgs(send, chunk_bytes, world_size);
@@ -139,7 +137,7 @@ void all2all_push_ptrs(const at::Tensor& send, int64_t peers_dev, int64_t chunk_
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("all2all_push", &all2all_push, "One-shot all-to-all addressed as flat_base + peer*stride");
   m.def("all2all_push_ptrs", &all2all_push_ptrs,
-        "Same, addressed through an N-entry peer pointer array");
+        "One-shot all-to-all addressed through an N-entry peer pointer array");
+  m.def("all2all_push", &all2all_push, "Same, addressed as flat_base + peer*stride");
 }
