@@ -111,7 +111,6 @@ void CopyGpuStatesToDevice(ShmemStates* states) {
 
   MORI_SHMEM_TRACE("Successfully copied GpuStates to device (rank={}, worldSize={})",
                    gpuStates->rank, gpuStates->worldSize);
-
 }
 
 void FinalizeRuntime(ShmemStates* states) {
@@ -149,8 +148,8 @@ int ShmemModuleInit(void* hipModule) {
   MORI_SHMEM_TRACE("Module globalGpuStates address: {:p} (JIT module address: {:p})",
                    (void*)moduleGlobalGpuStatesAddr, (void*)states->moduleStates.gpuStatesPtr);
 
-  HIP_RUNTIME_CHECK(hipMemcpy(moduleGlobalGpuStatesAddr, &states->gpuStates,
-                              sizeof(GpuStates), hipMemcpyHostToDevice));
+  HIP_RUNTIME_CHECK(hipMemcpy(moduleGlobalGpuStatesAddr, &states->gpuStates, sizeof(GpuStates),
+                              hipMemcpyHostToDevice));
 
   MORI_SHMEM_TRACE("Successfully initialized globalGpuStates in module (rank={}, worldSize={})",
                    states->gpuStates.rank, states->gpuStates.worldSize);
