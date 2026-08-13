@@ -155,6 +155,8 @@ void ProxyThread::MainLoop() {
 
   uint64_t total_cmds = 0;
   uint64_t total_errors = 0;
+  uint64_t total_recvs = 0;
+  uint64_t total_quiet = 0;
   while (!ring_->shutdown) {
     batch_count = 0;
 
@@ -227,9 +229,10 @@ void ProxyThread::MainLoop() {
           if (ret == 0) {
             ops_posted_++;
             total_cmds++;
-            if (total_cmds <= 3 || (total_cmds % 10000 == 0))
-              fprintf(stderr, "[PROXY-THREAD] gpu_id=%d posted=%lu errs=%lu\n",
-                      gpu_id_, total_cmds, total_errors);
+            if (total_cmds <= 5 || (total_cmds % 1000 == 0))
+              fprintf(stderr, "[PROXY-THREAD] gpu_id=%d posted=%lu errs=%lu op=%d qi=%u\n",
+                      gpu_id_, total_cmds, total_errors,
+                      wrs[chain_head[c]].opcode, qi);
             break;
           }
 
