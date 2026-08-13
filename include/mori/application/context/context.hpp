@@ -104,7 +104,7 @@ class Context {
   RdmaDeviceContext* GetRailContext(int peerRank) const {
     const int nCtx = static_cast<int>(allRdmaDeviceContexts.size());
     int peerLocalGpu = peerRank % nCtx;
-    int agreedRail = std::max(LocalRankInNode(), peerLocalGpu) % nCtx;
+    int agreedRail = (LocalRankInNode() + peerLocalGpu) % nCtx;
     return allRdmaDeviceContexts[agreedRail].get();
   }
 
