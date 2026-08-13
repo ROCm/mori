@@ -51,8 +51,6 @@ void ProxyThread::DrainCq(ProxyQpHandle& qph) {
       if (wc[i].opcode == IBV_WC_RECV || wc[i].opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
         if (wc[i].status == IBV_WC_SUCCESS && wc[i].byte_len >= 16) {
           uint32_t recv_idx = static_cast<uint32_t>(wc[i].wr_id);
-          fprintf(stderr, "[PROXY-RECV] gpu_id=%d recv_idx=%u recv_count=%u recv_buf=%p\n",
-                  gpu_id_, recv_idx, qph.recv_count, qph.recv_buf);
           if (recv_idx < qph.recv_count && qph.recv_buf) {
             struct { uint64_t addr; uint64_t val; } payload;
             memcpy(&payload, reinterpret_cast<char*>(qph.recv_buf) + recv_idx * 64, 16);
@@ -165,8 +163,6 @@ void ProxyThread::MainLoop() {
   uint32_t wr_qp[kMaxBatch];
   int batch_count = 0;
 
-  uint64_t total_cmds = 0;
-  uint64_t total_errors = 0;
   while (!ring_->shutdown) {
     batch_count = 0;
 
@@ -179,11 +175,7 @@ void ProxyThread::MainLoop() {
 
       uint32_t qi = cmd->qp_idx;
       if (qi >= qps_.size() || qps_[qi].qp == nullptr) {
-        if (total_errors < 5)
-          fprintf(stderr, "[PROXY-THREAD] gpu_id=%d slot=%u qp_idx=%u op=%u ERROR: null QP (qps_.size=%zu)\n",
-                  gpu_id_, slot, qi, cmd->op, qps_.size());
         cmd->status = PROXY_ERROR;
-        total_errors++;
         next_slot_++;
         continue;
       }
@@ -238,11 +230,6 @@ void ProxyThread::MainLoop() {
 
           if (ret == 0) {
             ops_posted_++;
-            total_cmds++;
-            if (total_cmds <= 5 || (total_cmds % 1000 == 0))
-              fprintf(stderr, "[PROXY-THREAD] gpu_id=%d posted=%lu errs=%lu op=%d qi=%u\n",
-                      gpu_id_, total_cmds, total_errors,
-                      wrs[chain_head[c]].opcode, qi);
             break;
           }
 
@@ -266,8 +253,6 @@ void ProxyThread::MainLoop() {
             }
           }
 
-          fprintf(stderr, "[PROXY-THREAD] gpu_id=%d ibv_post_send FATAL ret=%d qi=%u\n",
-                  gpu_id_, ret, qi);
           ibv_send_wr* w = to_post;
           while (w) {
             uint32_t slot = static_cast<uint32_t>(w->wr_id) & PROXY_RING_MASK;
