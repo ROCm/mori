@@ -90,7 +90,21 @@ std::string EnvOr(const char* name, const std::string& fallback) {
   return (v && *v) ? std::string(v) : fallback;
 }
 
+// Programmatic arch override. Read once, under the lock, before the environment.
+std::mutex& ArchOverrideMutex() {
+  static std::mutex m;
+  return m;
+}
+std::string& ArchOverrideStorage() {
+  static std::string s;
+  return s;
+}
+
 std::string DetectArch() {
+  {
+    std::lock_guard<std::mutex> lock(ArchOverrideMutex());
+    if (!ArchOverrideStorage().empty()) return ArchOverrideStorage();
+  }
   if (const char* v = std::getenv("MORI_JIT_ARCH"); v && *v) return v;
   hipDeviceProp_t props{};
   if (hipGetDeviceProperties(&props, 0) != hipSuccess) return "";
@@ -183,6 +197,11 @@ void SetToolchainForTesting(const Toolchain& tc) {
   }
   storage = tc;
   g_override = &storage;
+}
+
+void SetArchOverride(const std::string& arch) {
+  std::lock_guard<std::mutex> lock(ArchOverrideMutex());
+  ArchOverrideStorage() = arch;
 }
 
 const Toolchain& GetToolchain() {

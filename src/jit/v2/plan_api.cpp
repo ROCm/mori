@@ -118,7 +118,7 @@ void SetPlanError(const std::string& what) { g_lastError = what; }
 const char* PlanError() { return g_lastError.c_str(); }
 
 std::string ResolveArch(const char* arch) {
-  if (arch && *arch) setenv("MORI_JIT_ARCH", arch, /*overwrite=*/1);
+  if (arch && *arch) SetArchOverride(arch);
   const std::string resolved = GetToolchain().arch;
   if (arch && *arch && resolved != arch) {
     throw std::runtime_error("toolchain already resolved for '" + resolved +

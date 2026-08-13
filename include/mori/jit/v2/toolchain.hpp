@@ -72,6 +72,13 @@ struct Toolchain {
 // Process-wide singleton. Throws std::runtime_error if it cannot be resolved.
 const Toolchain& GetToolchain();
 
+// Ask for an arch before the toolchain resolves, from a caller that has one in
+// hand (the plan API's `arch` argument). Deliberately NOT setenv: the resolver
+// reads the environment, and setenv/getenv from two threads is a POSIX data
+// race -- a multi-threaded server creating plans concurrently would hit it. Has
+// no effect once GetToolchain() has resolved; ResolveArch() reports that.
+void SetArchOverride(const std::string& arch);
+
 // Test seam: override the resolved toolchain. Pass an empty arch to reset.
 void SetToolchainForTesting(const Toolchain& tc);
 
