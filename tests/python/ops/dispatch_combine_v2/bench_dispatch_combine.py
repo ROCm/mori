@@ -108,6 +108,9 @@ DTYPE = os.environ.get("DTYPE", "bf16")  # bf16 | f32
 COMBINE = os.environ.get("COMBINE", "gather")  # gather | scatter
 QUANT = os.environ.get("QUANT", "none")  # none | fp8_direct_cast (scatter only)
 DISPATCH_FP8_BLOCKWISE = int(os.environ.get("DISPATCH_FP8_BLOCKWISE", 0))
+SDMA_TOKEN_COPY = int(os.environ.get("SDMA_TOKEN_COPY", 0))
+SDMA_QUEUES = int(os.environ.get("SDMA_QUEUES", 8))
+SDMA_DEBUG = int(os.environ.get("SDMA_DEBUG", 0))
 SCALE_DIM = int(os.environ.get("SCALE_DIM", 0))  # >0 = forward per-token scales
 PREFETCH_ROUTE_PAYLOAD = int(os.environ.get("PREFETCH_ROUTE_PAYLOAD", 0))
 DEFER_DEST_CTR_ATOMIC = int(os.environ.get("DEFER_DEST_CTR_ATOMIC", 0))
@@ -273,6 +276,8 @@ def main():
             combine_mode=COMBINE,
             quant_type=QUANT,
             dispatch_fp8_blockwise=_disp_bw,
+            sdma_token_copy=bool(SDMA_TOKEN_COPY),
+            sdma_queue_count=SDMA_QUEUES,
             scale_dim=SCALE_DIM,
             scale_type_size=1 if SCALE_DIM else 0,
             enable_std_moe=bool(STDMOE),
@@ -356,6 +361,7 @@ def main():
                 scales.data_ptr(),
                 rank,
                 ct,
+                op._dev_comm_ptr,
                 fx.Stream(torch.cuda.current_stream()),
             )
 
@@ -452,6 +458,39 @@ def main():
             run_disp(ct)
             sync()
             comm.barrier()
+            if SDMA_TOKEN_COPY and SDMA_DEBUG:
+                staging = from_gpu_ptr(
+                    arena.local_ptr("tok_staging"), (M, HIDDEN), DISP_DT
+                )[:ct]
+                stage_ok = torch.equal(staging, inp[:ct])
+                recv = int(total_recv.cpu().item())
+                tis = from_gpu_ptr(
+                    arena.local_ptr("recv_to_src_token"),
+                    (max_recv,),
+                    torch.int32,
+                )[:recv].cpu()
+                local_inp = inp[:ct].cpu()
+                all_inp = [torch.empty_like(local_inp) for _ in range(npes)]
+                dist.all_gather(all_inp, local_inp)
+                all_inp = torch.stack(all_inp)
+                expected_recv = all_inp[tis // M, tis % M]
+                actual_recv = op.recv_tokens()[:recv].cpu()
+                recv_ok = torch.equal(actual_recv, expected_recv)
+                if not stage_ok or not recv_ok:
+                    diff = (actual_recv.float() - expected_recv.float()).abs()
+                    first_actual = (
+                        actual_recv[0, :8].tolist() if actual_recv.numel() else []
+                    )
+                    first_expected = (
+                        expected_recv[0, :8].tolist() if expected_recv.numel() else []
+                    )
+                    print(
+                        f"[rank {rank}] SDMA debug stage_ok={stage_ok} "
+                        f"recv_ok={recv_ok} recv={recv} "
+                        f"max_abs={float(diff.max()) if diff.numel() else 0.0} "
+                        f"actual0={first_actual} expected0={first_expected}",
+                        flush=True,
+                    )
             # Identity expert: stage the dispatched tokens (disp_out) into out_tok,
             # the combine input. Since the disp_out/out_tok arena split, dispatch no
             # longer writes out_tok directly, so this copy is required for ALL dtypes
@@ -495,6 +534,13 @@ def main():
             exp_w = torch.from_numpy(U).view(ct, 1).float() * wts[:ct].float().cpu()
             got_w = comb_out_wts[: ct * K].cpu().view(ct, K)
             ok_w = torch.allclose(got_w, exp_w, atol=2e-3, rtol=2e-3)
+            if SDMA_TOKEN_COPY and SDMA_DEBUG and (not ok or not ok_w):
+                print(
+                    f"[rank {rank}] SDMA combine debug "
+                    f"got0={got[0, :8].tolist()} exp0={exp[0, :8].tolist()} "
+                    f"got_w0={got_w[0].tolist()} exp_w0={exp_w[0].tolist()}",
+                    flush=True,
+                )
             errs = d.allreduce_sum(0 if (ok and ok_w) else 1)
             if rank == 0:
                 print(
@@ -618,7 +664,8 @@ def main():
             print(
                 f"# EP{npes} hidden={HIDDEN} topk={K} experts={num_experts} "
                 f"dtype={DTYPE} combine={COMBINE} quant={QUANT} "
-                f"dispatch_fp8bw={_disp_bw} scale_dim={SCALE_DIM} "
+                f"dispatch_fp8bw={_disp_bw} sdma_token={bool(SDMA_TOKEN_COPY)} "
+                f"sdma_queues={SDMA_QUEUES} scale_dim={SCALE_DIM} "
                 f"{_geom} "
                 f"prefetch_route_payload={bool(PREFETCH_ROUTE_PAYLOAD)} "
                 f"defer_dest_ctr_atomic={bool(DEFER_DEST_CTR_ATOMIC)} "

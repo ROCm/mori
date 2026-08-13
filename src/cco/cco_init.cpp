@@ -1892,7 +1892,15 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
       } else {
         // Cross-process: standard IPC open.
         void* mapped = nullptr;
-        HIP_RUNTIME_CHECK(hipIpcOpenMemHandle(&mapped, handles[pe], hipIpcMemLazyEnablePeerAccess));
+        hipError_t ipcErr =
+            hipIpcOpenMemHandle(&mapped, handles[pe], hipIpcMemLazyEnablePeerAccess);
+        // hipIpcOpenMemHandle's lazy peer-access path can leave the benign
+        // hipErrorPeerAccessAlreadyEnabled as the runtime's sticky last error
+        // even when the mapping succeeds.  A later Torch allocation checks
+        // hipGetLastError and otherwise reports the stale setup error at an
+        // unrelated call site (the EPv2 SDMA experiment hit this on every rank).
+        (void)hipGetLastError();
+        HIP_RUNTIME_CHECK(ipcErr);
         peerPtrs_host[lsa] = reinterpret_cast<uint64_t*>(mapped);
       }
     }

@@ -139,12 +139,18 @@ def make_dispatch(
     dispatch_fp8_blockwise=False,
     off_disp_quant_scales=0,
     dispatch_quant_scale_dim=0,
+    sdma_token_copy=False,
+    off_tok_staging=0,
+    sdma_queue_count=8,
 ):
     del (
         token_centric_rotate_peer_order,
         dispatch_fp8_blockwise,
         off_disp_quant_scales,
         dispatch_quant_scale_dim,
+        sdma_token_copy,
+        off_tok_staging,
+        sdma_queue_count,
     )
     # fp4 (e2m1) packs 2 values per byte, so a token is hidden_dim/2 bytes; dispatch
     # is a pure byte mover (no fp4 decode), matching mori v1's plain-fp4 path.
@@ -188,6 +194,8 @@ def make_dispatch(
         my_lsa_rank: Int32,
         # Actual number of source tokens in this invocation (<= max_tok_per_rank).
         inp_cur_tok: Int32,
+        # Device-resident ccoDevComm pointer; 0 on the normal LSA path.
+        dev_comm: Int64,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -567,6 +575,7 @@ def make_dispatch(
         addr_inp_scales: Int64,
         my_lsa_rank: Int32,
         inp_cur_tok: Int32,
+        dev_comm: Int64,
         stream=fx.Stream(None),
     ):
         ep_dispatch(
@@ -581,6 +590,7 @@ def make_dispatch(
             addr_inp_scales,
             my_lsa_rank,
             inp_cur_tok,
+            dev_comm,
         ).launch(
             grid=(block_num, 1, 1),
             block=[warp_num_per_block * WAVE, 1, 1],
@@ -625,6 +635,9 @@ def make_dispatch_token_centric(
     dispatch_fp8_blockwise=False,
     off_disp_quant_scales=0,
     dispatch_quant_scale_dim=0,
+    sdma_token_copy=False,
+    off_tok_staging=0,
+    sdma_queue_count=8,
 ):
     """Workgroup-per-token dispatch A/B kernel.
 
@@ -655,6 +668,13 @@ def make_dispatch_token_centric(
             raise ValueError(
                 "dispatch_fp8_blockwise requires BF16 input and hidden/128 scales"
             )
+    if sdma_token_copy:
+        if fp4 or dispatch_fp8_blockwise or hidden_elem_size not in (2, 4):
+            raise ValueError(
+                "sdma_token_copy supports plain BF16/F32 token payloads only"
+            )
+        if sdma_queue_count <= 0:
+            raise ValueError("sdma_queue_count must be positive")
 
     @flyc.kernel(known_block_size=[block_threads, 1, 1])
     def ep_dispatch_token_centric(
@@ -669,6 +689,7 @@ def make_dispatch_token_centric(
         addr_inp_scales: Int64,
         my_lsa_rank: Int32,
         inp_cur_tok: Int32,
+        dev_comm: Int64,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -846,6 +867,7 @@ def make_dispatch_token_centric(
 
             route_valids = []
             route_slots = []
+            route_peers = []
             route_token_rsrcs = []
             route_scale_rsrcs = []
             route_quant_scale_rsrcs = []
@@ -870,6 +892,7 @@ def make_dispatch_token_centric(
                 )
                 route_valids.append(peer_valid)
                 route_slots.append(peer_slot)
+                route_peers.append(peer)
                 route_token_rsrcs.append(
                     create_buffer_resource_from_addr(peer_tok_addr)
                 )
@@ -960,6 +983,82 @@ def make_dispatch_token_centric(
                                     + (lane >> arith.constant(1)),
                                     cache_modifier=token_store_cache_modifier,
                                 )
+            elif const_expr(sdma_token_copy):
+                # SDMA can only source registered window memory, while the input
+                # tensor is an external Torch allocation. Stage each token once
+                # into this rank's arena, then let one issuer per workgroup post
+                # the whole contiguous token to every unique destination PE.
+                staging_addr = fx.Int64(
+                    window.lsa_ptr(my_lsa_rank, off_tok_staging)
+                ) + fx.Int64(src_tok) * fx.Int64(nbytes)
+                rsrc_staging = create_buffer_resource_from_addr(staging_addr)
+                for chunk in range(tid * 4, n_i32, block_threads * 4):
+                    token_vec = buffer_load(
+                        rsrc_src, chunk, vec_width=4, dtype=T.i32()
+                    )
+                    buffer_store(token_vec, rsrc_staging, chunk)
+                P.waitcnt_all()
+                # The SDMA engine is a system-scope observer. waitcnt only
+                # retires each lane's VMEM stores; release every lane's staged
+                # chunks before lane 0 rings the copy-engine doorbell.
+                P.fence_system_release()
+                fx.barrier()
+
+                # Anvil queues connect GPU pairs; there is no SDMA peer queue
+                # for self. Preserve local routes with the normal CU copy.
+                for route_step in range_constexpr(npes):
+                    if route_valids[route_step] != 0:
+                        if route_peers[route_step] == my_lsa_rank:
+                            for chunk in range(
+                                tid * 4, n_i32, block_threads * 4
+                            ):
+                                token_vec = buffer_load(
+                                    rsrc_staging,
+                                    chunk,
+                                    vec_width=4,
+                                    dtype=T.i32(),
+                                )
+                                buffer_store(
+                                    token_vec,
+                                    route_token_rsrcs[route_step],
+                                    chunk,
+                                    cache_modifier=token_store_cache_modifier,
+                                )
+
+                if warp == 0:
+                    if lane == 0:
+                        sdma = cco.DevComm(dev_comm).sdma()
+                        # A block is the issuing unit. Stripe blocks, not peers,
+                        # over queues: (peer,qid) identifies a queue, so peer%N
+                        # would put every block targeting one peer on queue peer.
+                        qid = fx.Int32(bid % sdma_queue_count)
+                        src_off = fx.Int64(off_tok_staging) + fx.Int64(
+                            src_tok
+                        ) * fx.Int64(nbytes)
+                        for route_step in range_constexpr(npes):
+                            if route_valids[route_step] != 0:
+                                if route_peers[route_step] != my_lsa_rank:
+                                    dst_off = fx.Int64(off_out_tok) + fx.Int64(
+                                        route_slots[route_step]
+                                    ) * fx.Int64(nbytes)
+                                    sdma.put(
+                                        route_peers[route_step],
+                                        arena,
+                                        dst_off,
+                                        arena,
+                                        src_off,
+                                        nbytes,
+                                        qid,
+                                        coop=cco.CoopScope.THREAD,
+                                    )
+                        # Drain exactly the queues used above before this block
+                        # reuses its staging slot or publishes dispatch-ready.
+                        for route_step in range_constexpr(npes):
+                            if route_valids[route_step] != 0:
+                                if route_peers[route_step] != my_lsa_rank:
+                                    sdma.quiet_queue(
+                                        route_peers[route_step], qid
+                                    )
             else:
                 for chunk in range(tid * 4, n_i32, block_threads * 4):
                     token_vec = buffer_load(
@@ -1106,6 +1205,7 @@ def make_dispatch_token_centric(
         addr_inp_scales: Int64,
         my_lsa_rank: Int32,
         inp_cur_tok: Int32,
+        dev_comm: Int64,
         stream=fx.Stream(None),
     ):
         ep_dispatch_token_centric(
@@ -1120,6 +1220,7 @@ def make_dispatch_token_centric(
             addr_inp_scales,
             my_lsa_rank,
             inp_cur_tok,
+            dev_comm,
         ).launch(
             grid=(block_num, 1, 1),
             block=[block_threads, 1, 1],

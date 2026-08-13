@@ -42,7 +42,7 @@ Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 |---|---|
 | `test_dispatch_combine_v2_intranode.py` | pytest wrapper: runs `test_op.py` under torchrun for the representative modes and asserts every line PASS |
 | `test_op.py` | EP8 op-layer test (gather/scatter, quant, StdMoE, recv-cap, scales, LEC, reset, replay) |
-| `bench_dispatch_combine.py` | eager + CUDA-graph perf bench + e2e correctness. Envs: `DTYPE=bf16\|f32\|fp8\|fp4`, `COMBINE=gather\|scatter`, `QUANT=none\|fp8_direct_cast\|fp8_blockwise`, `DISPATCH_FP8_BLOCKWISE`, `ZERO_COPY_EXPERT_OUTPUT`, `E2E_PIPELINE`, `GEOMETRY=table\|analytical\|hybrid`, `STDMOE=1`, `SCALE_DIM`, `SWEEP`, `DISP_BLOCK`/`COMB_BLOCK`, `WARP_NUM`/`COMB_WARP`, `MODE`, `TUNED`, `USE_TOK_OFF_TOTAL_RECV`, `UNCACHED_TOKEN_STORE`, `UNCACHED_METADATA_STORE`, `REPLAY_FAST_PATH`, `REPLAY_BENCH`, `TOKEN_CENTRIC_DISPATCH`, `TOKEN_CENTRIC_ROTATE_PEERS`, `PREFETCH_ROUTE_PAYLOAD`, `DEFER_DEST_CTR_ATOMIC`, `ROTATE_DISPATCH_SLOT_ORDER`, `ROTATE_COMBINE_PEER_ORDER`, `ROUTING_PATTERN` |
+| `bench_dispatch_combine.py` | eager + CUDA-graph perf bench + e2e correctness. Envs: `DTYPE=bf16\|f32\|fp8\|fp4`, `COMBINE=gather\|scatter`, `QUANT=none\|fp8_direct_cast\|fp8_blockwise`, `DISPATCH_FP8_BLOCKWISE`, `SDMA_TOKEN_COPY`, `SDMA_QUEUES`, `SDMA_DEBUG`, `ZERO_COPY_EXPERT_OUTPUT`, `E2E_PIPELINE`, `GEOMETRY=table\|analytical\|hybrid`, `STDMOE=1`, `SCALE_DIM`, `SWEEP`, `DISP_BLOCK`/`COMB_BLOCK`, `WARP_NUM`/`COMB_WARP`, `MODE`, `TUNED`, `USE_TOK_OFF_TOTAL_RECV`, `UNCACHED_TOKEN_STORE`, `UNCACHED_METADATA_STORE`, `REPLAY_FAST_PATH`, `REPLAY_BENCH`, `TOKEN_CENTRIC_DISPATCH`, `TOKEN_CENTRIC_ROTATE_PEERS`, `PREFETCH_ROUTE_PAYLOAD`, `DEFER_DEST_CTR_ATOMIC`, `ROTATE_DISPATCH_SLOT_ORDER`, `ROTATE_COMBINE_PEER_ORDER`, `ROUTING_PATTERN` |
 | `run_bench.sh` | bench launcher (runs `bench_dispatch_combine.py` in the container) |
 
 (Each script inlines a tiny torchrun/gloo `Dist` bootstrap — gloo only carries the cco unique-id and pass/fail counts.)
@@ -342,12 +342,30 @@ selected combine `64x8` instead of `32x16`: combine latency fell from 97.18 to
 
 ### CCO-SDMA payload experiment
 
-The build has `BUILD_CCO_SDMA=True`, and the two-rank FlyDSL SDMA all-gather
-example passes with eight queues. EP8 DevComm initialization, however, fails
-before kernel launch with `hipErrorPeerAccessAlreadyEnabled` / invalid IPC
-handle errors, both with P2P enabled and disabled. No valid EP8 performance
-number is reported. The temporary EPv2 SDMA kernel path was removed; resolving
-multi-rank peer-access initialization is a prerequisite for revisiting it.
+The original EP8 failure was not a device-queue deadlock: `ccoDevCommCreate`
+successfully opened every peer signal IPC mapping, but
+`hipIpcOpenMemHandle(..., hipIpcMemLazyEnablePeerAccess)` left the benign
+`hipErrorPeerAccessAlreadyEnabled` in HIP's sticky last-error slot. The next
+Torch allocation reported that stale setup error. `ccoDevCommCreate` now
+consumes the sticky error immediately after each IPC open; an EP8 regression
+test creates an SDMA DevComm and then performs a Torch allocation.
+
+The restored opt-in `SDMA_TOKEN_COPY=1` path also needs two data-plane rules:
+
+- every lane system-releases its staged token before lane 0 rings the SDMA
+  doorbell (`waitcnt` alone only retires VMEM and allowed the engine to copy
+  stale zeros);
+- self-routes use the normal CU copy because anvil queues represent GPU pairs;
+  remote blocks are striped across `SDMA_QUEUES` by block id and drain only
+  their `(peer, queue)` pairs.
+
+EP8 correctness passes at 8, 128, 512, and 2048 tokens/rank, including
+`MORI_DISABLE_P2P=1`; the 2048-token stress run completes without a hang.
+The path remains off by default because this token-granular shape is a poor
+SDMA workload: at 512 BF16 tokens it measured 1725.20 us versus 123.29 us for
+the matched LSA token-centric path. Each roughly 14 KiB token/peer transfer pays
+the copy-engine packet cost, plus a local staging copy and system fence. A useful
+SDMA design would first pack many tokens per peer into large contiguous batches.
 
 ## Dispatch stall A/B (MI355X / gfx950, 2026-08-07)
 

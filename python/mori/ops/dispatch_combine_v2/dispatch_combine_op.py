@@ -30,6 +30,7 @@ import os
 import torch
 
 import flydsl.expr as fx
+from mori.cco import CCODevCommRequirements, GDA_CONNECTION_NONE
 from mori.tensor_utils import from_gpu_ptr
 
 from .intranode_kernels import (
@@ -130,6 +131,9 @@ class EpDispatchCombineConfig:
     quant_type: str = "none"  # none | fp8_direct_cast | fp8_blockwise
     # Experimental BF16-input -> FP8-wire blockwise quantization in dispatch.
     dispatch_fp8_blockwise: bool = False
+    # Experimental token-centric payload offload through the CCO SDMA engine.
+    sdma_token_copy: bool = False
+    sdma_queue_count: int = 8
     # Geometry: None => auto (pull the tuned schedule for this device/shape/dtype
     # from tuning_configs in __post_init__). Pin any of these to opt out and use a
     # fixed geometry instead. Combine wants few warps (K-deep per-lane MLP already
@@ -207,6 +211,17 @@ class EpDispatchCombineConfig:
                     "dispatch_fp8_blockwise requires symmetric BF16 input/output, "
                     "combine_mode='gather', quant_type='none', and StdMoE disabled"
                 )
+            self.token_centric_dispatch = True
+        if self.sdma_token_copy:
+            if (
+                self.dispatch_dtype not in (torch.bfloat16, torch.float32)
+                or self.dispatch_fp8_blockwise
+            ):
+                raise ValueError(
+                    "sdma_token_copy supports plain BF16/F32 dispatch payloads only"
+                )
+            if not 1 <= self.sdma_queue_count <= 8:
+                raise ValueError("sdma_queue_count must be in [1, 8]")
             self.token_centric_dispatch = True
         if self.quant_type != "none":
             self.combine_mode = "scatter"
@@ -608,6 +623,25 @@ class EpDispatchCombineOp:
         recv_cap = cfg.effective_max_recv  # recv-slot cap (== ws*M unless capped)
         self._recv_cap = recv_cap
 
+        if cfg.sdma_token_copy:
+            enabled = os.environ.get("MORI_ENABLE_SDMA", "").strip().lower() in (
+                "1",
+                "true",
+                "on",
+                "yes",
+            )
+            if not enabled:
+                raise RuntimeError(
+                    "sdma_token_copy requires MORI_ENABLE_SDMA=1 before "
+                    "Communicator.init()"
+                )
+            from mori.cco.device._build_flags import BUILD_CCO_SDMA
+
+            if not BUILD_CCO_SDMA:
+                raise RuntimeError(
+                    "sdma_token_copy requires a BUILD_CCO_SDMA=ON installation"
+                )
+
         self._scale_bytes = cfg.scale_dim * cfg.scale_type_size
         self._scale_num_i32 = (self._scale_bytes + 3) // 4
         self._enable_scales = self._scale_bytes > 0
@@ -635,6 +669,8 @@ class EpDispatchCombineOp:
                     recv_cap * cfg.dispatch_quant_scale_dim * 4,
                 )
             )
+        if cfg.sdma_token_copy:
+            regions.append(("tok_staging", max_tok_per_rank * token_nbytes))
         # scatter combine needs its own staging regions
         if cfg.is_scatter:
             wire_elem_size = cfg.wire_elem_size
@@ -654,6 +690,23 @@ class EpDispatchCombineOp:
                 )
         self.arena = SymmArena(comm, regions)
         self.arena.zero()
+
+        self._dev_comm = None
+        self._dev_comm_ptr = 0
+        if cfg.sdma_token_copy:
+            reqs = CCODevCommRequirements()
+            reqs.gda_connection_type = GDA_CONNECTION_NONE
+            reqs.gda_context_count = 0
+            reqs.gda_signal_count = 0
+            reqs.gda_counter_count = 0
+            reqs.lsa_barrier_count = 0
+            reqs.sdma_queue_count = cfg.sdma_queue_count
+            try:
+                self._dev_comm = comm.create_dev_comm(reqs)
+            except Exception:
+                self.arena.close()
+                raise
+            self._dev_comm_ptr = self._dev_comm.ptr
 
         self.token_dest_map = torch.full(
             (max_tok_per_rank * topk,), -1, dtype=torch.int32, device=device
@@ -744,6 +797,11 @@ class EpDispatchCombineOp:
                 else 0
             ),
             dispatch_quant_scale_dim=cfg.dispatch_quant_scale_dim,
+            sdma_token_copy=cfg.sdma_token_copy,
+            off_tok_staging=(
+                arena.offset("tok_staging") if cfg.sdma_token_copy else 0
+            ),
+            sdma_queue_count=cfg.sdma_queue_count,
         )
         # (block, warp) -> compiled dispatch / combine kernel.
         self._dispatch_variants = {
@@ -859,12 +917,16 @@ class EpDispatchCombineOp:
         self._closed = False
 
     def close(self):
-        """Free this op's symmetric arena window. Call (or use as a context
-        manager) when the op is discarded but its Communicator lives on —
-        otherwise the arena stays in comm._resources until the comm is destroyed."""
+        """Free this op's DevComm (if any) and symmetric arena. Call (or use as
+        a context manager) when the op is discarded but its Communicator lives
+        on, otherwise these resources remain tracked until comm destruction."""
         if self._closed:
             return
         self._closed = True
+        if self._dev_comm is not None:
+            self._dev_comm.close()
+            self._dev_comm = None
+            self._dev_comm_ptr = 0
         self.arena.close()
 
     def __enter__(self):
@@ -1130,6 +1192,7 @@ class EpDispatchCombineOp:
                 scale_ptr,
                 self.cfg.rank,
                 num_input_tokens,
+                self._dev_comm_ptr,
                 stream,
             )
         else:
@@ -1150,6 +1213,7 @@ class EpDispatchCombineOp:
                 scale_ptr,
                 self.cfg.rank,
                 num_input_tokens,
+                self._dev_comm_ptr,
                 stream,
             )
 

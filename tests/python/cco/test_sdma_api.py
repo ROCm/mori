@@ -583,6 +583,45 @@ def _worker_put_aggregate(rank, world_size, uid_path, coop_name, results_path):
         f.write(err or "")
 
 
+def _worker_dev_comm_torch_interop(rank, world_size, uid_path, coop_name, results_path):
+    """Create an SDMA DevComm, then make a Torch allocation.
+
+    hipIpcOpenMemHandle may internally observe already-enabled peer access and
+    leave hipErrorPeerAccessAlreadyEnabled as the sticky HIP error even when the
+    IPC mapping succeeded.  Torch checks that sticky error on its next runtime
+    call, so this reproduces the EPv2 initialization failure where DevComm
+    creation was followed by torch.full().
+    """
+    del coop_name
+    err = None
+    try:
+        mods = _worker_imports()
+        CCODevCommRequirements = mods["CCODevCommRequirements"]
+        GDA_CONNECTION_NONE = mods["GDA_CONNECTION_NONE"]
+
+        comm = _init_comm(rank, world_size, uid_path)
+        mem = comm.alloc_mem(4 * 1024 * 1024)
+        win = comm.register_window(mem.ptr, mem.size)
+        mods["zero"](win.local_ptr, win.size)
+
+        reqs = CCODevCommRequirements()
+        reqs.gda_connection_type = GDA_CONNECTION_NONE
+        reqs.gda_signal_count = 0
+        reqs.gda_counter_count = 0
+        reqs.sdma_queue_count = 8
+        comm.create_dev_comm(reqs)
+
+        # This is the first Torch runtime operation after DevComm creation and
+        # must not inherit a benign error from HIP peer-access setup.
+        probe = torch.full((16,), rank, dtype=torch.int32, device=f"cuda:{rank}")
+        assert int(probe.sum().cpu()) == rank * probe.numel()
+        comm.destroy()
+    except Exception:
+        err = traceback.format_exc()
+    with open(results_path % rank, "w") as f:
+        f.write(err or "")
+
+
 # ── spawn harness ──────────────────────────────────────────────────────────
 
 
@@ -659,3 +698,8 @@ def test_sdma_put_nosignal():
 def test_sdma_put_aggregate():
     """Aggregate puts batch into the SQ; one commit rings the doorbell for all."""
     _run(_worker_put_aggregate, world_size=2, coop_name="THREAD")
+
+
+def test_sdma_dev_comm_does_not_poison_torch():
+    """SDMA setup must consume benign sticky HIP peer-access errors."""
+    _run(_worker_dev_comm_torch_interop, world_size=8, coop_name="THREAD")

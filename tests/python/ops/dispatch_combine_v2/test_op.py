@@ -102,6 +102,8 @@ SCALE_DIM = int(
 COMBINE = os.environ.get("COMBINE", "gather")  # gather | scatter
 QUANT = os.environ.get("QUANT", "none")  # none | fp8_direct_cast | fp8_blockwise
 DISPATCH_FP8_BLOCKWISE = int(os.environ.get("DISPATCH_FP8_BLOCKWISE", 0))
+SDMA_TOKEN_COPY = int(os.environ.get("SDMA_TOKEN_COPY", 0))
+SDMA_QUEUES = int(os.environ.get("SDMA_QUEUES", 8))
 ZERO_COPY_EXPERT_OUTPUT = int(os.environ.get("ZERO_COPY_EXPERT_OUTPUT", 0))
 PREFETCH_ROUTE_PAYLOAD = int(os.environ.get("PREFETCH_ROUTE_PAYLOAD", 0))
 DEFER_DEST_CTR_ATOMIC = int(os.environ.get("DEFER_DEST_CTR_ATOMIC", 0))
@@ -207,6 +209,8 @@ def main():
             combine_mode=COMBINE,
             quant_type=QUANT,
             dispatch_fp8_blockwise=bool(DISPATCH_FP8_BLOCKWISE),
+            sdma_token_copy=bool(SDMA_TOKEN_COPY),
+            sdma_queue_count=SDMA_QUEUES,
             max_total_recv_tokens=int(os.environ.get("MAXRECV", 0)),
             prefetch_route_payload=bool(PREFETCH_ROUTE_PAYLOAD),
             defer_dest_ctr_atomic=bool(DEFER_DEST_CTR_ATOMIC),
