@@ -261,6 +261,24 @@ void Context::InitializeTopologyAndTransports() {
                   (device != nullptr) ? device->Name() : "none",
                   nicFw.empty() ? "unknown" : nicFw, gpuId,
                   (pciBusId[0] != '\0') ? pciBusId : "unknown", mecFw.empty() ? "unknown" : mecFw);
+
+    // Judge the version, do not just print it. `mori check` applies this table
+    // in Step 1, but it is a separate tool users may never run -- and the wrong
+    // NIC firmware is a leading cause of cross-node RDMA misbehaviour, which
+    // then surfaces as a MORI bug rather than as a firmware problem. WARN rather
+    // than INFO so it survives MORI_GLOBAL_LOG_LEVEL=warn; note the default
+    // level is ERROR, so neither line shows until the level is lowered.
+    // Advisory only: MORI still runs, and nothing here knows whether this rank
+    // will actually issue the cross-node IBGDA traffic the minimum is about.
+    if (device != nullptr) {
+      const auto fwCheck = CheckNicFirmware(ReadNicVendorId(device->Name()), nicFw);
+      if (fwCheck.verdict == FwVerdict::Bad) {
+        MORI_APP_WARN("rank {} nic {}: {}", LocalRank(), device->Name(), fwCheck.detail);
+      } else if (fwCheck.verdict == FwVerdict::Unknown) {
+        MORI_APP_WARN("rank {} nic {}: {}, cannot verify against the known-good table",
+                      LocalRank(), device->Name(), fwCheck.detail);
+      }
+    }
   }
 
   int numQpPerPe = 4;

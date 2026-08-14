@@ -243,8 +243,10 @@ nicctl --version
 
 > **Recommended version**: for cross-node MORI (EP over RDMA / IBGDA), Broadcom firmware
 > is solid on `237.1.137.x` (official Broadcom release) and `235.2.86.x` (customer-specific
-> build). `231.x` is too old for IBGDA — if the host is on that branch, flag it to the user
-> and recommend upgrading. The userspace library (`libbnxt_re`, 3b.2) must match the kernel
+> build). Known bad: `231.x` is too old for IBGDA, and `232.x` does not work on Thor2 — if
+> the host is on either branch, flag it to the user and recommend upgrading. Any other
+> branch is unverified and treated the same way.
+> The userspace library (`libbnxt_re`, 3b.2) must match the kernel
 > driver version detected in 3b.1.
 
 The bnxt path of `mori check` / `mori setup` needs two NIC-specific pieces installed
