@@ -298,8 +298,7 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
             },
             # FlyDSL stages combine's input on the host (see combine()), and its
             # kernels reset their own counters.
-            stages_in_kernel=False,
-            self_resets_counters=True,
+            combine_stages_in_kernel=False,
             capabilities=frozenset(
                 {
                     "gather",

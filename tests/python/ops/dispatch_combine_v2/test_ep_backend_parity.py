@@ -19,9 +19,9 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""Backend parity: the FlyDSL and C++/JIT kernels must agree, element for element.
+"""Backend parity: the FlyDSL, C++/JIT, and hybrid kernels must agree.
 
-The same problem is run through both backends in one process, on the same input,
+The same problem is run through all backends in one process, on the same input,
 and the outputs are compared directly. That is a stronger check than each backend
 matching the analytic reference separately: it catches a difference the reference
 tolerates (a routing tie broken the other way, a weight forwarded from the wrong
@@ -122,34 +122,43 @@ def main():
     if rank == 0:
         print(f"# backends: {EpDispatchCombineOp.available_backends()}", flush=True)
 
-    # Both ops built once and kept alive: rebuilding per token count churns the
+    # All ops built once and kept alive: rebuilding per token count churns the
     # cco VMM reservation for no benefit, and reuse is what a real caller does.
-    ops = {n: make_op(n, comm, rank, world, M) for n in ("flydsl", "hip")}
+    backends = ("flydsl", "hip", "hybrid")
+    ops = {n: make_op(n, comm, rank, world, M) for n in backends}
 
     failures = 0
     for ct in SWEEP:
-        a_out, a_w, a_recv = run_once(ops["flydsl"], comm, ct, inp, wts, idx)
-        b_out, b_w, b_recv = run_once(ops["hip"], comm, ct, inp, wts, idx)
+        results = {
+            n: run_once(ops[n], comm, ct, inp, wts, idx) for n in backends
+        }
+        ref_out, ref_w, ref_recv = results["flydsl"]
 
-        # Routing is deterministic given the same indices, so the recv counts must
-        # match exactly; the payload is the same bf16 sum in the same order.
-        ok_recv = a_recv == b_recv
-        ok_out = torch.allclose(
-            a_out.to(torch.float32), b_out.to(torch.float32), atol=2e-2, rtol=2e-2
-        )
-        ok_w = torch.allclose(a_w, b_w, atol=2e-3, rtol=2e-3)
-        ok = ok_recv and ok_out and ok_w
-        failures += 0 if ok else 1
-        if not ok:
-            print(
-                f"[rank {rank}] ct={ct}: PARITY FAIL "
-                f"recv={a_recv}/{b_recv} "
-                f"out_max_diff={(a_out.to(torch.float32) - b_out.to(torch.float32)).abs().max():.4f} "
-                f"wts_max_diff={(a_w - b_w).abs().max():.5f}",
-                flush=True,
+        for other in ("hip", "hybrid"):
+            b_out, b_w, b_recv = results[other]
+            ok_recv = ref_recv == b_recv
+            ok_out = torch.allclose(
+                ref_out.to(torch.float32),
+                b_out.to(torch.float32),
+                atol=2e-2,
+                rtol=2e-2,
             )
-        elif rank == 0:
-            print(f"# PARITY ct={ct}: PASS (recv={a_recv}, flydsl == hip)", flush=True)
+            ok_w = torch.allclose(ref_w, b_w, atol=2e-3, rtol=2e-3)
+            ok = ok_recv and ok_out and ok_w
+            failures += 0 if ok else 1
+            if not ok:
+                print(
+                    f"[rank {rank}] ct={ct}: PARITY FAIL flydsl vs {other} "
+                    f"recv={ref_recv}/{b_recv} "
+                    f"out_max_diff={(ref_out.to(torch.float32) - b_out.to(torch.float32)).abs().max():.4f} "
+                    f"wts_max_diff={(ref_w - b_w).abs().max():.5f}",
+                    flush=True,
+                )
+            elif rank == 0:
+                print(
+                    f"# PARITY ct={ct}: PASS (recv={ref_recv}, flydsl == {other})",
+                    flush=True,
+                )
 
     counts = torch.tensor([failures], dtype=torch.int32)
     dist.all_reduce(counts)

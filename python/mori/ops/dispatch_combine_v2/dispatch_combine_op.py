@@ -52,9 +52,47 @@ import torch
 from mori.tensor_utils import from_gpu_ptr
 
 # Where each backend lives. Imported lazily, on selection only.
-_BACKEND_MODULES = {"flydsl": "flydsl_backend", "hip": "hip_backend"}
+_BACKEND_MODULES = {
+    "flydsl": "flydsl_backend",
+    "hip": "hip_backend",
+    "hybrid": "hybrid_backend",
+}
 
 DEFAULT_BACKEND = "flydsl"
+
+
+def _hybrid_tuning(
+    hip_lookup, fly_lookup, world_size, hidden_dim, topk, *, dtype, experts_per_rank
+):
+    """Cross-backend tuning: dispatch geometry from HIP, combine from FlyDSL."""
+    hip = hip_lookup(
+        world_size, hidden_dim, topk,
+        dtype=dtype, experts_per_rank=experts_per_rank,
+    )
+    fly = fly_lookup(world_size, hidden_dim, topk, dtype=dtype)
+    if hip["schedule"] is None or fly["schedule"] is None:
+        return dict(
+            dispatch_block_num=hip["dispatch_block_num"],
+            combine_block_num=fly["combine_block_num"],
+            warp_num_per_block=hip["warp_num_per_block"],
+            combine_warp_num_per_block=fly["combine_warp_num_per_block"],
+            schedule=None,
+        )
+    from .hip_tuning_configs import merge_buckets
+
+    disp_buckets = [
+        (b[0], b[1], b[2]) for b in hip["schedule"]
+    ]
+    comb_buckets = [
+        (b[0], b[3], b[4]) for b in fly["schedule"]
+    ]
+    return dict(
+        dispatch_block_num=hip["dispatch_block_num"],
+        combine_block_num=fly["combine_block_num"],
+        warp_num_per_block=hip["warp_num_per_block"],
+        combine_warp_num_per_block=fly["combine_warp_num_per_block"],
+        schedule=merge_buckets(disp_buckets, comb_buckets),
+    )
 
 
 _QUANT_TYPES = ("none", "fp8_direct_cast", "fp8_blockwise")
@@ -202,6 +240,19 @@ class EpDispatchCombineConfig:
                 # expert counters, so it can move the geometry. FlyDSL's table has no
                 # such axis, hence the split call rather than a shared kwarg.
                 t = lookup(
+                    self.world_size,
+                    self.hidden_dim,
+                    self.num_experts_per_token,
+                    dtype=self.dtype_str,
+                    experts_per_rank=self.num_experts_per_rank,
+                )
+            elif backend == "hybrid":
+                from .hip_tuning_configs import lookup as hip_lookup
+                from .tuning_configs import lookup as fly_lookup
+
+                t = _hybrid_tuning(
+                    hip_lookup,
+                    fly_lookup,
                     self.world_size,
                     self.hidden_dim,
                     self.num_experts_per_token,
@@ -388,11 +439,13 @@ class KernelSet:
 
     # True  -> combine's kernel stages the caller's tokens into out_tok itself.
     # False -> the op must copy them in on the host first (one extra torch kernel).
-    stages_in_kernel: bool = False
-    # True  -> the kernels reset their own counters/barriers; the op must not
-    #          memset them, and on symmetric regions it MUST NOT (a peer may have
-    #          already delivered a signal, and wiping it hangs both ranks).
-    self_resets_counters: bool = True
+    combine_stages_in_kernel: bool = False
+    # Per-leg counter/barrier reset policy. True -> the kernel resets its own
+    # counters; the op must NOT memset them (on symmetric regions a peer may have
+    # already delivered a signal, and wiping it hangs both ranks). False -> the op
+    # must zero the local scratch before each launch.
+    dispatch_resets_counters: bool = True
+    combine_resets_counters: bool = True
 
     # Advertised feature names, for callers that want to probe before asking.
     capabilities: frozenset[str] = frozenset()
@@ -681,7 +734,7 @@ class EpDispatchCombineOp:
             raise ValueError(f"{n} tokens exceeds max_num_inp_token_per_rank={cap}")
         disp_spec, _ = self._pick(n)
 
-        if not self._kernels.self_resets_counters:
+        if not self._kernels.dispatch_resets_counters:
             # Local scratch only. The arena's tok_off and recv_num are NOT reset:
             # peers write them, and an unsynchronised host memset would wipe a
             # signal that already arrived and hang both ranks.
@@ -755,14 +808,14 @@ class EpDispatchCombineOp:
         ct = routing.cur_rank_num_token
         _, comb_spec = self._pick(ct)
 
-        if not self._kernels.stages_in_kernel and not self.cfg.enable_std_moe:
+        if not self._kernels.combine_stages_in_kernel and not self.cfg.enable_std_moe:
             # StdMoE has already written the weighted-reduced tokens into out_tok;
             # copying `input` over them would clobber that result.
             out_tok_ptr = self.arena.local_ptr("out_tok")
             if input.data_ptr() != out_tok_ptr:
                 dst = self.combine_in_view().view(-1)[: input.numel()]
                 dst.copy_(input.reshape(-1))
-        if not self._kernels.self_resets_counters:
+        if not self._kernels.combine_resets_counters:
             self.combine_barrier.zero_()
         # No combine_out.zero_(): the kernel reduce-then-stores every token in
         # [0, ct), so the prior contents of the returned slice never leak.

@@ -167,7 +167,7 @@ def _bucket_key(table, world_size, hidden_dim, topk, experts_per_rank):
     return None
 
 
-def _merge(disp, comb):
+def merge_buckets(disp, comb):
     """Interleave two independent bucket lists into the op's one schedule.
 
     The edges need not line up: the merged list breaks at the union of both, and each
@@ -208,5 +208,5 @@ def lookup(world_size, hidden_dim, topk, dtype="bf16", experts_per_rank=None) ->
     disp = disp.get(dtype) or disp.get(None)
     if disp is None:
         return base
-    base["schedule"] = _merge(disp, comb)
+    base["schedule"] = merge_buckets(disp, comb)
     return base
