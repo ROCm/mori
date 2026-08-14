@@ -7,7 +7,8 @@
 # has never been validated. Only an undetectable version downgrades to a warning.
 #   - AINIC     : >= 1.117.5-a-45 is solid. The 1.117.1 major does NOT support IBGDA.
 #   - Broadcom  : solid on 237.1.137.x (official release) and 235.2.86.x
-#                 (customer-specific build); 231.x is too old for IBGDA.
+#                 (customer-specific build). Known bad: 231.x is too old for
+#                 IBGDA, and 232.x does not work on Thor2.
 #   - Mellanox  : good backward compatibility, no known minimum version.
 # For all NICs, the userspace library must match the corresponding kernel driver.
 
@@ -813,11 +814,11 @@ assess_fabric_topology() {
 }
 
 # report_fabric_topology
-#   One line at the end of the run. MORI-EP does not support a rail-only fabric
-#   today, and that is invisible in the per-step output: every step passes,
-#   because a rail-only fabric is not broken -- it just is not what MORI-EP
-#   needs. A WARN, not a FAIL: the check reports what the fabric is, and whether
-#   that suits MORI-EP is a fact about MORI-EP.
+#   One line at the end of the run. MORI-EP v1 does not support a rail-only
+#   fabric today, and that is invisible in the per-step output: every step
+#   passes, because a rail-only fabric is not broken -- it just is not what
+#   MORI-EP v1 needs. A WARN, not a FAIL: the check reports what the fabric is,
+#   and whether that suits a given consumer is a fact about the consumer.
 report_fabric_topology() {
     [[ -n "$FABRIC_TOPOLOGY" ]] || return 0
     case "$FABRIC_TOPOLOGY" in
@@ -825,7 +826,7 @@ report_fabric_topology() {
             # Say so rather than staying silent: a reader cannot tell "classified
             # as fully routed" from "the classifier never ran", and this is the
             # line that tells them MORI-EP has the paths it needs.
-            log_ok "fabric is fully routed ($FABRIC_TOPO_DETAIL) — MORI-EP cross-rail paths present"
+            log_ok "fabric is fully routed ($FABRIC_TOPO_DETAIL) — MORI-EP v1 cross-rail paths present"
             ;;
         none)
             log_warn "no inter-node RDMA path on any NIC pair ($FABRIC_TOPO_DETAIL)"
@@ -834,15 +835,16 @@ report_fabric_topology() {
             ;;
         rail-only)
             log_warn "fabric looks rail-only ($FABRIC_TOPO_DETAIL)"
-            log_warn "  MORI-EP does not support rail-only fabrics at this time: dispatch/combine"
-            log_warn "  sends cross-rail (NIC i -> NIC j), which has no path here. MORI-IO with"
-            log_warn "  MORI_IO_RAIL_AFFINITY=1 stays on-rail and is expected to work."
+            log_warn "  MORI-EP v1 does not support rail-only clusters currently: dispatch/combine"
+            log_warn "  sends cross-rail (NIC i -> NIC j), which has no path here. Rail-only"
+            log_warn "  support for the internode-v1 and v1_ll kernels is in progress."
+            log_warn "  MORI-IO with MORI_IO_RAIL_AFFINITY=1 stays on-rail and is expected to work."
             ;;
         partial)
             log_warn "fabric is partially connected ($FABRIC_TOPO_DETAIL)"
             log_warn "  neither a clean rail-only nor a fully routed fabric -- cross-rail traffic"
             log_warn "  works for some NIC pairs and not others. Check the x cells in Step 5;"
-            log_warn "  MORI-EP needs cross-rail paths and will fail on the missing ones."
+            log_warn "  MORI-EP v1 needs cross-rail paths and will fail on the missing ones."
             ;;
     esac
 }
@@ -1228,9 +1230,10 @@ check_bnxt_version_recommendation() {
         log_warn "cannot parse Broadcom firmware version '$ver' against requirement"; return; }
     case "$major" in
         231) log_fail "Broadcom firmware $ver is on the 231.x branch, which is too old for IBGDA — upgrade to >= $BNXT_MIN_VER_235 or >= $BNXT_MIN_VER_237"; return ;;
+        232) log_fail "Broadcom firmware $ver is on the 232.x branch, which is known not to work on Thor2 — upgrade to >= $BNXT_MIN_VER_235 or >= $BNXT_MIN_VER_237"; return ;;
         235) min="$BNXT_MIN_VER_235" ;;
         237) min="$BNXT_MIN_VER_237" ;;
-        *)   log_fail "Broadcom firmware $ver is on an unverified branch ($major.x) — required: >= $BNXT_MIN_VER_235 on 235.x or >= $BNXT_MIN_VER_237 on 237.x; known-bad: 231.x"; return ;;
+        *)   log_fail "Broadcom firmware $ver is on an unverified branch ($major.x) — required: >= $BNXT_MIN_VER_235 on 235.x or >= $BNXT_MIN_VER_237 on 237.x; known-bad: 231.x, 232.x"; return ;;
     esac
     if version_ge "$ver" "$min"; then
         log_ok "Broadcom firmware $ver is solid (>= $min on the $major.x branch)"

@@ -219,8 +219,22 @@ cd mori && docker build -t rocm/mori:dev -f docker/Dockerfile.dev .
 | Vendor | Recommendation |
 |--------|-----------------|
 | AMD Pollara (AINIC) | `>= 1.117.5-a-45` (`1.117.1` major lacks IBGDA support) |
-| Broadcom (Thor2) | `237.1.137.x` / `235.2.86.x`; `231.x` too old for IBGDA |
+| Broadcom (Thor2) | `237.1.137.x` / `235.2.86.x`; known bad: `231.x` (too old for IBGDA), `232.x` (does not work on Thor2) |
 | Mellanox (ConnectX, mlx5) | No known minimum; tested on `ConnectX-7` |
+
+### Validate the environment
+
+Before a cross-node run, check the fabric:
+
+```bash
+mori check <peer_ip>          # or: tools/env_check.sh <peer_ip>
+```
+
+Six steps — NIC firmware and driver, QoS/PFC, DCQCN, then intra-node,
+inter-node bandwidth and latency meshes over every NIC pair, on host memory and
+on GPU memory. Exits non-zero if any check failed, and reports the fabric
+topology, which decides what can run on it (see the
+[EP guide](docs/MORI-EP-GUIDE.md)).
 
 ### Install
 

@@ -46,6 +46,16 @@ Traces land as `trace_intranode_rank<rank>_<timestamp>.json` in the current work
 
 ## Inter-node
 
+Validate the fabric first:
+
+```bash
+mori check <peer_ip>          # or: tools/env_check.sh <peer_ip>
+```
+
+It exits non-zero if any check failed, and reports the fabric topology and NIC
+firmware — both of which decide whether the numbers below are obtainable at all.
+See the [fabric requirement](MORI-EP-GUIDE.md) in the EP guide.
+
 Run the following command on each node and replace `node_rank` with its actual rank. `master_addr` should be the hostname or IP of the rank 0 node. `GLOO_SOCKET_IFNAME` should be set to the TCP socket interface you want to use.
 
 ```bash
