@@ -55,15 +55,6 @@
 namespace mori::umbp {
 namespace {
 
-static uint16_t AllocPort() {
-  static std::atomic<uint16_t> next{0};
-  if (next.load() == 0) {
-    std::srand(static_cast<unsigned>(std::time(nullptr)));
-    next.store(static_cast<uint16_t>(55500 + (std::rand() % 1500)));
-  }
-  return next.fetch_add(7);
-}
-
 // --------------------------------------------------------------------------
 // Fake master: records heartbeat arrival times; optionally blocks each
 // Heartbeat RPC until ReleaseAll() is called.
@@ -200,14 +191,20 @@ class FlushHeartbeatTest : public ::testing::Test {
  protected:
   void BuildServer(int interval_ms, bool block = false) {
     service_ = std::make_unique<RecordingMasterService>(interval_ms, block);
-    uint16_t port = AllocPort();
-    address_ = "127.0.0.1:" + std::to_string(port);
 
+    // Port 0 asks the OS for a free one and reports it back. A guessed port
+    // collides on a busy host — these tests run in a --network host container
+    // alongside everything else on the node — and BuildAndStart signals that
+    // by returning nullptr, so the collision surfaces as an unrelated
+    // assertion failure rather than as EADDRINUSE.
+    int selected_port = 0;
     grpc::ServerBuilder builder;
-    builder.AddListeningPort(address_, grpc::InsecureServerCredentials());
+    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &selected_port);
     builder.RegisterService(service_.get());
     server_ = builder.BuildAndStart();
     ASSERT_NE(server_, nullptr);
+    ASSERT_NE(selected_port, 0);
+    address_ = "127.0.0.1:" + std::to_string(selected_port);
   }
 
   std::unique_ptr<MasterClient> MakeRegisteredClient() {
