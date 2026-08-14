@@ -46,6 +46,23 @@ bool GatherKernelExpected() {
   return value == nullptr || (std::string(value) != "0");
 }
 
+// The tier registers itself the same way. Without it the kernel path cannot
+// engage whatever the batch looks like, so the launch counter would be
+// measuring the machine rather than the planner.
+bool GatherPathAvailable() {
+  static const bool available = [] {
+    std::vector<char> probe(64 * 1024);
+    return HostTierRegistration(probe.data(), probe.size()).RegisteredBytes() != 0;
+  }();
+  return available;
+}
+
+bool GatherKernelReachable() { return !GatherKernelExpected() || GatherPathAvailable(); }
+
+constexpr const char* kGatherPathUnreachable =
+    "host memory cannot be registered for GPU access here, so the tier stays on the copy engine; "
+    "rerun with MORI_UMBP_LOG_LEVEL=warn for the reason";
+
 bool HasDevice() {
   int count = 0;
   if (hipGetDeviceCount(&count) != hipSuccess) {
@@ -127,6 +144,7 @@ class PageObjectTier {
 
 TEST(DeviceGatherTest, StridedLayerReadIsByteCorrect) {
   if (!HasDevice()) GTEST_SKIP() << "No HIP device available";
+  if (!GatherKernelReachable()) GTEST_SKIP() << kGatherPathUnreachable;
 
   constexpr size_t kObjects = 32;
   constexpr size_t kLayers = 8;
@@ -161,6 +179,7 @@ TEST(DeviceGatherTest, StridedLayerReadIsByteCorrect) {
 
 TEST(DeviceGatherTest, UnalignedFragmentsAreByteCorrect) {
   if (!HasDevice()) GTEST_SKIP() << "No HIP device available";
+  if (!GatherKernelReachable()) GTEST_SKIP() << kGatherPathUnreachable;
 
   // Neither the size nor the resulting offsets are multiples of 16, which sends
   // the kernel down its byte loop instead of the vectorized one.
@@ -186,6 +205,7 @@ TEST(DeviceGatherTest, UnalignedFragmentsAreByteCorrect) {
 
 TEST(DeviceGatherTest, StridedOffloadWriteIsByteCorrect) {
   if (!HasDevice()) GTEST_SKIP() << "No HIP device available";
+  if (!GatherKernelReachable()) GTEST_SKIP() << kGatherPathUnreachable;
 
   // The offload direction: contiguous device source scattered into one layer
   // slot of each page object.
@@ -312,3 +332,12 @@ TEST(HostTierRegistrationTest, CoversOnlyRegisteredBytesAndRejectsOverflow) {
 
 }  // namespace
 }  // namespace mori::umbp
+
+// 77 is SKIP_RETURN_CODE in CMakeLists.txt: gtest exits 0 on a skip, so without
+// this ctest reports a pass.
+int main(int argc, char** argv) {
+  ::testing::InitGoogleTest(&argc, argv);
+  const int status = RUN_ALL_TESTS();
+  if (status != 0) return status;
+  return mori::umbp::GatherKernelReachable() ? 0 : 77;
+}

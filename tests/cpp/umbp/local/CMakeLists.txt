@@ -34,14 +34,15 @@ add_test(NAME umbp_dram_tier_ranges COMMAND test_umbp_dram_tier_ranges)
 # Run the same byte-level expectations against both copy paths, since the
 # kernel and the copy engine must be indistinguishable in their results.
 add_executable(test_umbp_dram_tier_gather test_dram_tier_gather.cpp)
-target_link_libraries(test_umbp_dram_tier_gather PRIVATE umbp_core
-                                                         GTest::gtest_main)
+# Own main(), to exit with SKIP_RETURN_CODE where the kernel path is unreachable.
+target_link_libraries(test_umbp_dram_tier_gather PRIVATE umbp_core GTest::gtest)
 # The gather and registration headers are source-private to the tier, like the
 # run planner; the test reaches them the same way rather than installing them.
 target_include_directories(test_umbp_dram_tier_gather
                            PRIVATE ${PROJECT_SOURCE_DIR}/src/umbp/local/tiers)
 target_compile_features(test_umbp_dram_tier_gather PRIVATE cxx_std_17)
 add_test(NAME umbp_dram_tier_gather COMMAND test_umbp_dram_tier_gather)
+set_tests_properties(umbp_dram_tier_gather PROPERTIES SKIP_RETURN_CODE 77)
 add_test(NAME umbp_dram_tier_gather_kernel_off
          COMMAND test_umbp_dram_tier_gather)
 set_tests_properties(umbp_dram_tier_gather_kernel_off
