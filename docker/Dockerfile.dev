@@ -48,12 +48,21 @@ RUN set -ex; \
       rm -rf /var/lib/apt/lists/*; \
     fi
 
-# Force the apt ROCr over the pip-wheel one, which still carries the two VMM
-# bugs the symmetric heap trips over: hipMemSetAccess mis-validating one
-# reserve + many hipMemMap, and a MappedHandle DRM FD leak that fails hipMemMap
-# after ~500 mappings. Only preload libhsa-runtime64 — preloading libamdhip64
-# too triggers an LLVM "spirv-expand-step registered more than once" abort.
-# ENV LD_PRELOAD=/opt/rocm/lib/libhsa-runtime64.so.1
+# Works around an amdgpu kernel bug that makes the symmetric heap's hipMemCreate
+# fail with hipErrorOutOfMemory while VRAM is nearly empty. VMM allocations carry
+# no VA yet, so the thunk passes va_addr=0, but kfd_ioctl_alloc_memory_of_gpu
+# still runs its SVM-overlap check over [va_addr, va_addr+size) — with va_addr=0
+# that degenerates into "is anything SVM-registered below <size>?". A pageable
+# host tensor that ROCr registers as SVM for an H2D copy lands on the brk heap at
+# a low VA, hits that window, and the kernel returns EADDRINUSE. Pinning glibc's
+# mmap threshold (i.e. disabling the dynamic one) keeps such buffers in the mmap
+# region, well above any plausible allocation size.
+#
+# Upstream fix is 93aa919 ("drm/amdkfd: fix vram allocation failure for a special
+# case"), in 6.18 and stable 6.17.8 / 6.12.58 / 6.6.117 / 6.1.159. Drop this once
+# the runners' amdgpu-dkms carries it — note the DKMS module overrides the
+# distro kernel's amdgpu, so bumping the Ubuntu kernel alone does nothing.
+ENV MALLOC_MMAP_THRESHOLD_=131072
 
 # Pinned <0.3: 0.3.x dropped `flydsl.expr.buffer_ops`, still imported directly
 # by the cco examples (04/05/07/08). Unpin once they move to the 0.3.x API.
