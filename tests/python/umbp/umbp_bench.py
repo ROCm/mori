@@ -247,6 +247,42 @@ if dst_loc == "gpu" and backend_name != "umbp":
     print("ERROR: --dst-loc gpu is only supported for backend=umbp", file=sys.stderr)
     sys.exit(2)
 
+
+# --- SSD read-staging arena sizing ------------------------------------------
+# A remote SSD read is not served in place: the owner stages the value into a
+# registered host arena of `slots` pages and the reader RDMAs it out. A key that
+# finds no free slot does NOT retry and does NOT block -- it is reported as a
+# plain cache MISS (ssd_backend.cpp bumps slot_full_rejects_ and gives up;
+# UMBP_SSD_GET_MAX_ATTEMPTS is described in doc/pure-ssd-mode.md but is not
+# implemented on this branch, so there is no retry lever).
+#
+# That makes a fixed default arena actively dangerous for a sweep: with 512
+# slots a batch of 2048 keys returns exactly 512 hits and 1536 misses, every
+# pass, and the run still prints a perfectly healthy-looking MiB/s -- computed
+# only over the keys that got a slot. The drives are never the bottleneck, so
+# drive-count scaling comes out flat and the whole comparison is silently
+# meaningless. Size the arena from the sweep instead of from a constant.
+def _staging_plan(nr_objects_: int, value_size_: int, batch_sizes_):
+    """Slots/bytes the SSD tier needs so the largest batch can be fully staged.
+
+    Returns (slots, total_bytes, max_batch). Slot size is total_bytes // slots
+    and must be >= the largest single value, so bytes are derived from slots.
+    """
+    max_batch = max(batch_sizes_) if batch_sizes_ else nr_objects_
+    max_batch = max(1, min(max_batch, nr_objects_))
+    # Headroom: a slot stays pinned for the read lease (UMBP_DRAM_READ_LEASE_MS,
+    # 500ms default) when the reader's best-effort release is lost, so batch N+1
+    # can start while stragglers from batch N still hold pages.
+    slots = max(64, max_batch + max(64, max_batch // 8))
+    # Pad the per-slot page to the 4 KiB the on-disk records are aligned to.
+    slot_bytes = ((value_size_ + 4095) // 4096) * 4096
+    return slots, slots * slot_bytes, max_batch
+
+
+_auto_slots, _auto_staging_bytes, _auto_max_batch = _staging_plan(
+    nr_objects, value_size, getattr(args, "batch_sizes", None)
+)
+
 if backend_name == "umbp":
     from mori.io import MemoryLocationType
     from mori.umbp import (
@@ -421,19 +457,64 @@ class UMBPBackend(Backend):
             dist.medium = UMBPMedium.SSD
             # SSD is not directly addressable: a remote read stages the value
             # into a registered host arena of ssd_staging_buffer_slots pages.
-            # The default 16 slots caps read concurrency at 16 keys, and a
-            # slot stays pinned for UMBP_SSD_READ_LEASE_MS (3s) when the
-            # reader's best-effort ReleaseSsdLease is lost -- so a sweep over
-            # more than ~16 keys degrades the rest to MISSES, not slow hits
-            # (ssd_backend.cpp: "Sizing the arena for read concurrency is the
-            # mitigation"). Size the arena for the sweep instead.
+            # Too few slots does not slow the sweep down, it turns the keys that
+            # miss out on a slot into cache MISSES -- see _staging_plan above for
+            # why that is silent and why the default is computed, not constant.
+            # The env vars stay as escape hatches, but an explicit value that is
+            # too small for the sweep is now called out instead of obeyed quietly.
             dist.ssd_staging_buffer_slots = int(
-                os.environ.get("UMBP_SSD_STAGING_SLOTS", 512)
+                os.environ.get("UMBP_SSD_STAGING_SLOTS", _auto_slots)
             )
             # Slot size = size / slots, and must be >= the largest single value.
             dist.ssd_staging_buffer_size = int(
-                os.environ.get("UMBP_SSD_STAGING_BYTES", 2 * 1024 * 1024 * 1024)
+                os.environ.get("UMBP_SSD_STAGING_BYTES", _auto_staging_bytes)
             )
+            _slot_bytes = (
+                dist.ssd_staging_buffer_size // dist.ssd_staging_buffer_slots
+                if dist.ssd_staging_buffer_slots
+                else 0
+            )
+            print(
+                f"[staging] slots={dist.ssd_staging_buffer_slots} "
+                f"arena={dist.ssd_staging_buffer_size / 2**30:.2f}GiB "
+                f"slot={_slot_bytes / 2**20:.2f}MiB "
+                f"(auto: slots={_auto_slots} arena={_auto_staging_bytes / 2**30:.2f}GiB "
+                f"for max_batch={_auto_max_batch})",
+                flush=True,
+            )
+            if dist.ssd_staging_buffer_slots < _auto_max_batch:
+                print(
+                    f"WARNING: staging slots ({dist.ssd_staging_buffer_slots}) < largest "
+                    f"batch ({_auto_max_batch}). Keys past the slot count return as "
+                    f"MISSES, not slow hits, and the reported MiB/s is computed only "
+                    f"over the keys that got a slot -- the sweep will look fast and "
+                    f"scale flat. Unset UMBP_SSD_STAGING_SLOTS to auto-size.",
+                    flush=True,
+                )
+            if _slot_bytes < value_size:
+                print(
+                    f"WARNING: staging slot ({_slot_bytes}B) < value_size "
+                    f"({value_size}B); values cannot be staged and every read will "
+                    f"miss. Unset UMBP_SSD_STAGING_BYTES to auto-size.",
+                    flush=True,
+                )
+            # The other half of the trap: an arena at least as big as the whole
+            # dataset means a repeated pass finds every key still staged from the
+            # previous one (SsdBackend::Resolve serves a live lease straight from
+            # the arena and renews it), so passes 2..N are timed against host DRAM
+            # and never touch a drive. That reads as a several-fold speedup and
+            # flattens drive-count scaling just as effectively as the miss bug.
+            _dataset_bytes = nr_objects * value_size
+            if dist.ssd_staging_buffer_size >= _dataset_bytes:
+                print(
+                    f"WARNING: staging arena "
+                    f"({dist.ssd_staging_buffer_size / 2**30:.2f}GiB) >= dataset "
+                    f"({_dataset_bytes / 2**30:.2f}GiB), so repeated passes are served "
+                    f"from the staging arena in host DRAM rather than from the drives. "
+                    f"For a real SSD number raise --nr-objects (>= ~4x the largest "
+                    f"batch) or lower --batch-sizes, and cross-check with iostat.",
+                    flush=True,
+                )
             cfg.ssd.enabled = True
             cfg.ssd.storage_dir = os.environ.get(
                 "UMBP_SSD_STORAGE_DIR", f"/tmp/umbp_ssd_{node_id}"
