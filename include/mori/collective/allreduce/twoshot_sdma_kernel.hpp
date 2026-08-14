@@ -243,8 +243,7 @@ __device__ void SdmaReduceScatterKernel_body(int myPe, int npes, const T* __rest
           dstMemObj->deviceHandles_d + destPe * dstMemObj->sdmaNumQueue;
       HSAuint64* sig = dstMemObj->signalPtrs + destPe * dstMemObj->sdmaNumQueue;
       HSAuint64* esig = dstMemObj->expectSignalsPtr + destPe * dstMemObj->sdmaNumQueue;
-      core::SdmaPutThread(srcPtr, remoteDst, chunkBytes, dh, sig, esig,
-                          dstMemObj->sdmaNumQueue, 0);
+      core::SdmaPutThread(srcPtr, remoteDst, chunkBytes, dh, sig, esig, dstMemObj->sdmaNumQueue, 0);
     }
 
     // Notify remote PEs that our data has landed
@@ -505,9 +504,8 @@ __device__ void AllGatherSdmaKernel_body(int myPe, int npes,
     // enter the collective reuse rendezvous.
     const size_t slotStrideBytes = slotStrideElements * bytesPerElement;
     barrier->reuseSafeChunkBytes =
-        outputBaseOffsetBytes == 0
-            ? 0
-            : slotStrideBytes - static_cast<size_t>(npes - 1) * agSendBytes;
+        outputBaseOffsetBytes == 0 ? 0
+                                   : slotStrideBytes - static_cast<size_t>(npes - 1) * agSendBytes;
   }
 
   // Flags are monotonic generation tokens (AMO_SET), so no reset is needed.

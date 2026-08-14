@@ -20,7 +20,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""Regression test for graph-captured asynchronous SDMA AllReduce."""
+"""Regression tests for graph-captured and cross-stream asynchronous SDMA AllReduce."""
 
 import argparse
 import os
@@ -50,6 +50,7 @@ def _run_rank(
     sizes: list[int],
     replays: int,
     expect_baseline_failure: bool,
+    cross_stream: bool,
 ) -> None:
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
         shmem.shmem_torch_process_group_init("default")
@@ -67,6 +68,7 @@ def _run_rank(
         )
 
         captures = []
+        start_stream = torch.cuda.Stream(device=device) if cross_stream else None
         capture_error = None
         try:
             for size_bytes in sizes:
@@ -77,9 +79,13 @@ def _run_rank(
                 torch.cuda.synchronize(device)
                 dist.barrier()
                 with torch.cuda.graph(graph):
-                    stream = torch.cuda.current_stream(device)
-                    allreduce.start_async(inp, out, elems, stream)
-                    allreduce.wait_async(stream)
+                    wait_stream = torch.cuda.current_stream(device)
+                    if start_stream is not None:
+                        start_stream.wait_stream(wait_stream)
+                        allreduce.start_async(inp, out, elems, start_stream)
+                    else:
+                        allreduce.start_async(inp, out, elems, wait_stream)
+                    allreduce.wait_async(wait_stream)
                 captures.append((size_bytes, inp, out, graph))
         except RuntimeError as exc:
             capture_error = str(exc)
@@ -125,7 +131,8 @@ def _run_rank(
         if rank == 0:
             print(
                 "PASSED: MORI async graph replay "
-                f"TP={world_size}, sizes={sizes}, replays={replays}",
+                f"TP={world_size}, sizes={sizes}, replays={replays}, "
+                f"cross_stream={cross_stream}",
                 flush=True,
             )
 
@@ -136,6 +143,11 @@ def main() -> None:
     parser.add_argument("--sizes", default="128M,32M,128M,1M,16K,16M,64M")
     parser.add_argument("--replays", type=int, default=20)
     parser.add_argument("--expect-baseline-failure", action="store_true")
+    parser.add_argument(
+        "--cross-stream",
+        action="store_true",
+        help="Launch start_async on a side stream and wait_async on the capture stream.",
+    )
     args = parser.parse_args()
     os.environ.setdefault("MORI_ENABLE_SDMA", "1")
     sizes = [_parse_size(value) for value in args.sizes.split(",")]
@@ -147,6 +159,7 @@ def main() -> None:
             sizes,
             args.replays,
             args.expect_baseline_failure,
+            args.cross_stream,
         ),
         nprocs=args.world_size,
         join=True,

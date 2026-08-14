@@ -94,16 +94,12 @@ def _run_rank(
                 operation = replay * len(captures) + capture_index
                 value_offset = operation % 32
                 inp.fill_(rank + 2 + value_offset)
-                expected_value = sum(
-                    pe + 2 + value_offset for pe in range(world_size)
-                )
+                expected_value = sum(pe + 2 + value_offset for pe in range(world_size))
                 dist.barrier()
                 graph.replay()
                 torch.cuda.synchronize(device)
 
-                mismatch_count = int(
-                    torch.count_nonzero(out != expected_value).item()
-                )
+                mismatch_count = int(torch.count_nonzero(out != expected_value).item())
                 if mismatch_count:
                     shard_elems = elems // world_size
                     shard_mismatches = [
@@ -119,9 +115,7 @@ def _run_rank(
                         float(out[pe * shard_elems].float().item())
                         for pe in range(world_size)
                     ]
-                    max_abs = float(
-                        (out.float() - expected_value).abs().max().item()
-                    )
+                    max_abs = float((out.float() - expected_value).abs().max().item())
                     failure = (
                         f"rank={rank}, bytes={size_bytes}, replay={replay}, "
                         f"capture_index={capture_index}, "

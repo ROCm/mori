@@ -71,6 +71,8 @@ class AllreduceSdma {
   T* async_output_;
   size_t async_total_count_;
   hipStream_t async_stream_;
+  // Marks completion of work enqueued by start_async for cross-stream waits.
+  hipEvent_t async_start_event_;
   double async_start_time_;
 
   // Kept for source compatibility. Results are always materialized in the

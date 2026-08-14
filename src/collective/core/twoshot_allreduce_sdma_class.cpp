@@ -92,6 +92,7 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t input_buffer_size,
       async_output_(nullptr),
       async_total_count_(0),
       async_stream_(nullptr),
+      async_start_event_(nullptr),
       async_start_time_(0.0),
       copy_output_to_user_(copy_output_to_user) {
   (void)output_buffer_size;
@@ -127,6 +128,10 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t input_buffer_size,
   if (!input_transit_buffer_obj_.IsValid())
     throw std::runtime_error("Failed to register input transit buffer");
 
+  hipError_t event_err = hipEventCreateWithFlags(&async_start_event_, hipEventDisableTiming);
+  if (event_err != hipSuccess)
+    throw std::runtime_error("Failed to create async stream-ordering event");
+
   printf("AllreduceSdma(SDMA) initialized: PE %d of %d, max_blocks=%d\n", myPe_, npes_,
          max_blocks_);
   printf("  Flags: %zu bytes at %p\n", flagsSize, flags_.get());
@@ -140,6 +145,9 @@ template <typename T>
 AllreduceSdma<T>::~AllreduceSdma() {
   if (async_in_progress_) {
     cancel_async();
+  }
+  if (async_start_event_ != nullptr) {
+    (void)hipEventDestroy(async_start_event_);
   }
   if (flags_) {
     printf("AllreduceSdma destroyed: PE %d\n", myPe_);
@@ -366,11 +374,17 @@ int64_t AllreduceSdma<T>::prepare_async_allgather_put(size_t total_count, hipStr
 
 template <typename T>
 void AllreduceSdma<T>::after_async_start(bool capturing) {
-  if (capturing) return;
-  hipError_t err = hipGetLastError();
+  if (!capturing) {
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+      async_in_progress_ = false;
+      throw std::runtime_error("Async kernel launch failed");
+    }
+  }
+  hipError_t err = hipEventRecord(async_start_event_, async_stream_);
   if (err != hipSuccess) {
     async_in_progress_ = false;
-    throw std::runtime_error("Async kernel launch failed");
+    throw std::runtime_error("Failed to record async start event");
   }
 }
 
@@ -392,6 +406,10 @@ int64_t AllreduceSdma<T>::prepare_async_wait(hipStream_t stream) {
 template <typename T>
 double AllreduceSdma<T>::finish_async_wait(hipStream_t stream, bool capturing, bool direct_output) {
   hipStream_t ws = (stream != nullptr) ? stream : async_stream_;
+  if (ws != async_stream_) {
+    hipError_t err = hipStreamWaitEvent(ws, async_start_event_, 0);
+    if (err != hipSuccess) throw std::runtime_error("Failed to order async wait stream");
+  }
   if (!direct_output) {
     auto* source = static_cast<uint8_t*>(input_transit_buffer_) + jit_args_.outputBaseOffsetBytes;
     hipError_t err = hipMemcpyAsync(async_output_, source, async_total_count_ * dtype_size_,

@@ -1133,9 +1133,9 @@ class AllreduceSdma:
         )
         if not self._async_oneshot:
             args = self._handle.prepare_async_allgather_put(count, s)
-            _get_ccl_func(
-                f"AllGatherSdmaFromProtectedKernel_{sfx}"
-            ).launch_struct((1,), (512,), 0, s, args)
+            _get_ccl_func(f"AllGatherSdmaFromProtectedKernel_{sfx}").launch_struct(
+                (1,), (512,), 0, s, args
+            )
         capturing = torch.cuda.is_current_stream_capturing()
         self._handle.after_async_start(capturing)
         return True
