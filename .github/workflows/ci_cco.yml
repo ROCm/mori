@@ -180,6 +180,15 @@ jobs:
             timeout 600 python -m pytest \
               $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2/test_jit_binding.py -v"
 
+      - name: Run ops-v2 config geometry tests (1 rank)
+        run: |
+          # Config arithmetic: which tuning table a config resolves against. No
+          # communicator and no peers, so it costs nothing to always run.
+          $CT exec $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE && \
+            timeout 300 python -m pytest \
+              tests/python/ops/dispatch_combine_v2/test_config_geometry.py -v"
+
       - name: Run ops-v2 dispatch/combine test (EP8, 8 ranks)
         run: |
           $CT exec $CONTAINER bash -c "\
@@ -202,9 +211,15 @@ jobs:
 
       - name: Run ops-v2 backend parity (FlyDSL vs HIP, EP8)
         run: |
-          $CT exec $CONTAINER bash -c "\
-            cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
-            timeout 900 torchrun --standalone --nproc_per_node=8 test_ep_backend_parity.py"
+          # All three dispatch dtypes. fp8 and fp4 are the asymmetric configuration --
+          # two plans with different dtypes on the two legs -- which is where the
+          # backends are most likely to disagree, and bf16 alone would not see it.
+          for dt in bf16 fp8 fp4; do
+            $CT exec -e DISP=$dt $CONTAINER bash -c "\
+              cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
+              timeout 900 torchrun --standalone --nproc_per_node=8 test_ep_backend_parity.py" \
+              || exit 1
+          done
 
       - name: Run ops-v2 dispatch/combine bench (EP8 smoke)
         run: |

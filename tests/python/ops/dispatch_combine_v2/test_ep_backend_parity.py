@@ -44,9 +44,24 @@ HIDDEN = int(os.environ.get("HIDDEN", 2048))
 TOPK = int(os.environ.get("TOPK", 4))
 EPR = int(os.environ.get("EPR", 4))
 SWEEP = [int(x) for x in os.environ.get("SWEEP", "8,64,512").split(",")]
+# What dispatch transports. Combine is bf16 in every case, so fp8 and fp4 are the
+# asymmetric configuration -- the one where the two legs are separate plans with
+# different dtypes, and so the one most likely to have the backends disagree.
+_DISP = {
+    "bf16": torch.bfloat16,
+    "fp8": torch.float8_e4m3fn,
+    "fp4": torch.float4_e2m1fn_x2,
+}[os.environ.get("DISP", "bf16")]
+_TAG = os.environ.get("DISP", "bf16")
+_ASYM = _DISP is not torch.bfloat16
 
 
 def make_op(name, comm, rank, world, M):
+    kw = (
+        dict(dispatch_data_type=_DISP, combine_data_type=torch.bfloat16)
+        if _ASYM
+        else dict(data_type=torch.bfloat16)
+    )
     cfg = EpDispatchCombineConfig(
         rank=rank,
         world_size=world,
@@ -54,12 +69,25 @@ def make_op(name, comm, rank, world, M):
         max_num_inp_token_per_rank=M,
         num_experts_per_rank=EPR,
         num_experts_per_token=TOPK,
-        data_type=torch.bfloat16,
         kernel_backend=name,
+        **kw,
     )
     op = EpDispatchCombineOp(cfg, comm)
     assert op.backend_name == name, f"{op.backend_name} != {name}"
     return op
+
+
+def gen_inp(M, seed, dev):
+    """Dispatch-dtype input. fp4 has no torch cast from float, so it is generated
+    as the packed bytes it already is -- the dispatch leg moves bytes either way."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    if _DISP is torch.float4_e2m1fn_x2:
+        return (
+            torch.randint(0, 256, (M, HIDDEN // 2), generator=g, dtype=torch.uint8)
+            .view(_DISP)
+            .to(dev)
+        )
+    return torch.randn(M, HIDDEN, generator=g, dtype=torch.float32).to(_DISP).to(dev)
 
 
 def run_once(op, comm, ct, inp, wts, idx):
@@ -101,11 +129,7 @@ def main():
     # (void)hipGetLastError().
     n_experts = world * EPR
     g = torch.Generator(device="cpu").manual_seed(1234 + rank)
-    inp = (
-        torch.randn(M, HIDDEN, generator=g, dtype=torch.float32)
-        .to(torch.bfloat16)
-        .to(dev)
-    )
+    inp = gen_inp(M, 1234 + rank, dev)
     wts = torch.rand(M, TOPK, generator=g, dtype=torch.float32).to(dev)
     idx = (
         torch.stack([torch.randperm(n_experts, generator=g)[:TOPK] for _ in range(M)])
@@ -116,11 +140,16 @@ def main():
     # Six ops are built and closed in sequence (2 backends x len(SWEEP)),
     # so the reservation has to survive the repeated alloc/free, not just
     # hold one arena.
+    # Sized for bf16 (the widest), so the fp8/fp4 runs are covered by the same figure.
     vmm = 4 * (world * M * HIDDEN * 2 * 2 + (16 << 20)) + (2 << 30)
     comm = cco.Communicator.init(world, rank, obj[0], vmm)
 
     if rank == 0:
-        print(f"# backends: {EpDispatchCombineOp.available_backends()}", flush=True)
+        print(
+            f"# backends: {EpDispatchCombineOp.available_backends()}  "
+            f"dispatch={_TAG} combine=bf16",
+            flush=True,
+        )
 
     # Both ops built once and kept alive: rebuilding per token count churns the
     # cco VMM reservation for no benefit, and reuse is what a real caller does.
@@ -142,14 +171,17 @@ def main():
         failures += 0 if ok else 1
         if not ok:
             print(
-                f"[rank {rank}] ct={ct}: PARITY FAIL "
+                f"[rank {rank}] {_TAG} ct={ct}: PARITY FAIL "
                 f"recv={a_recv}/{b_recv} "
                 f"out_max_diff={(a_out.to(torch.float32) - b_out.to(torch.float32)).abs().max():.4f} "
                 f"wts_max_diff={(a_w - b_w).abs().max():.5f}",
                 flush=True,
             )
         elif rank == 0:
-            print(f"# PARITY ct={ct}: PASS (recv={a_recv}, flydsl == hip)", flush=True)
+            print(
+                f"# PARITY({_TAG}) ct={ct}: PASS (recv={a_recv}, flydsl == hip)",
+                flush=True,
+            )
 
     counts = torch.tensor([failures], dtype=torch.int32)
     dist.all_reduce(counts)

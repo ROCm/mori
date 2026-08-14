@@ -323,6 +323,11 @@ dispatch 的 dtype**——它只归约 bf16/fp32 的暂存区，不管前面搬�
 取值规则：**性能接近时取更小的几何**，因为少占 CU 在与专家 GEMM 重叠时是真收益。这类 3% 以内的取舍是
 **策略不是测量**（单次 bench 偶尔会偏 20%）；真正由数据定的是桶的**边界**，它们来自 10~40% 的差异。
 
+查表发生在 `EpDispatchCombineConfig.__post_init__`，**早于 op 存在**，所以那时只能按
+`cfg.kernel_backend or MORI_V2_KERNEL_BACKEND or 默认` 猜一个后端——而直接实例化子类会绕开这三者。
+所以 op 在 `__new__` 里拿到真正的后端类之后调一次 `cfg.retune_for(backend)`：两者一致就什么都不做，
+不一致就换表重算。调用方显式钉过的 block/warp/schedule 不受影响，钉死永远压过任何表。
+
 ## 6. Python 绑定
 
 C ABI 是**十个符号，对所有 kernel 永久有效**：

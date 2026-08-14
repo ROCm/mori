@@ -189,12 +189,18 @@ class EpDispatchCombineConfig:
                 self.combine_warp_num_per_block,
             )
         )
+        # Which backend this geometry was tuned for, and whether it is ours to
+        # re-derive. Both are needed by retune_for(): this runs before the op
+        # exists, so it can only guess the backend from the same chain __new__
+        # will walk -- and naming a subclass directly bypasses that chain.
+        self._auto_geometry = not pinned
+        backend = (
+            self.kernel_backend
+            or os.environ.get("MORI_V2_KERNEL_BACKEND")
+            or DEFAULT_BACKEND
+        )
+        self._tuned_for = backend
         if not pinned:
-            backend = (
-                self.kernel_backend
-                or os.environ.get("MORI_V2_KERNEL_BACKEND")
-                or DEFAULT_BACKEND
-            )
             if backend == "hip":
                 from .hip_tuning_configs import lookup
 
@@ -232,6 +238,31 @@ class EpDispatchCombineConfig:
                 self.warp_num_per_block = 16
             if self.combine_warp_num_per_block is None:
                 self.combine_warp_num_per_block = 4
+
+    def retune_for(self, backend: str) -> None:
+        """Re-derive the tuned geometry for the backend actually being built.
+
+        __post_init__ runs before any op exists, so it picks a table from
+        cfg.kernel_backend or MORI_V2_KERNEL_BACKEND or the default. Naming a
+        backend subclass directly bypasses all three, which would leave the HIP
+        kernels running FlyDSL's schedule -- correct, but the wrong geometry.
+        The op calls this once, from __new__.
+
+        Nothing happens if the caller pinned a geometry: an explicit block/warp
+        or schedule outranks any table, whichever backend ends up serving it.
+        """
+        if backend is None or backend == self._tuned_for:
+            return
+        self.kernel_backend = backend
+        self._tuned_for = backend
+        if not self._auto_geometry:
+            return
+        self.schedule = None
+        self.dispatch_block_num = None
+        self.combine_block_num = None
+        self.warp_num_per_block = None
+        self.combine_warp_num_per_block = None
+        self._resolve_geometry()
 
     @property
     def is_scatter(self):
@@ -509,6 +540,12 @@ class EpDispatchCombineOp:
                 or DEFAULT_BACKEND
             )
             cls = EpDispatchCombineOp._resolve_backend(name)
+        # The config resolved its tuned geometry before this point and had to
+        # guess the backend to do it. Now we know. Outside the branch above on
+        # purpose: naming a subclass directly is exactly the case that guessed.
+        retune = getattr(cfg, "retune_for", None)
+        if retune is not None:
+            retune(cls.backend_name)
         return super().__new__(cls)
 
     @classmethod
