@@ -141,7 +141,26 @@ std::string DetectSourceRoot() {
       fs::path cand = fs::path(selfDir) / rel;
       std::error_code ec;
       cand = fs::weakly_canonical(cand, ec);
-      if (!ec && LooksLikeSourceRoot(cand)) return cand.string();
+      if (!ec && LooksLikeSourceRoot(cand)) {
+#ifdef MORI_JIT_SOURCE_DIR
+        // An editable install leaves BOTH: a snapshot of the kernel sources
+        // beside the .so, and a repo that the build baked in. The snapshot wins
+        // here, and must keep winning -- it is the only thing the packaged tree
+        // is ever tested through. But it is frozen at install time, so editing a
+        // kernel header in the repo then changes nothing at all, silently, and
+        // the next measurement describes the old kernel. Say so.
+        if (fs::path(cand) != fs::path(MORI_JIT_SOURCE_DIR) &&
+            LooksLikeSourceRoot(MORI_JIT_SOURCE_DIR)) {
+          MORI_WARN(mori::modules::OPS,
+                    "[jit] compiling from the packaged snapshot {}, not the build tree {}. "
+                    "Edits to kernel sources there will NOT take effect -- set "
+                    "MORI_SOURCE_ROOT={} to use them, or reinstall to refresh the snapshot.",
+                    cand.string(), std::string(MORI_JIT_SOURCE_DIR),
+                    std::string(MORI_JIT_SOURCE_DIR));
+        }
+#endif
+        return cand.string();
+      }
     }
   }
 #ifdef MORI_JIT_SOURCE_DIR
