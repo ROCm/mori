@@ -31,10 +31,11 @@
 //   * a request routes to the backend registered for its tier, and a tier with
 //     no backend fails cleanly instead of hitting whichever one happens to be
 //     there
-//   * Commit / Abort carry NO backend name on the wire, yet still reach the
-//     instance that handed the slot out — the peer tags backend_id into the
-//     opaque slot_id
-//   * a mixed-instance batch is grouped per backend but answered in request order
+//   * Commit / Abort carry NO backend selector on the wire, yet still reach the
+//     backend that handed the slot out — the peer tags backend_id into the opaque
+//     slot_id (this is what makes two backends numbering their slots from 1
+//     unambiguous)
+//   * a mixed-tier batch is grouped per backend but answered in request order
 //   * Resolve / Evict, which carry no tier either, walk the peer-local
 //     read-rank order and fan out respectively
 
@@ -50,24 +51,24 @@
 #include "umbp/distributed/peer/backend/medium_backend.h"
 #include "umbp/distributed/peer/backend/mock_backend.h"
 #include "umbp/distributed/peer/peer_service.h"
+#include "umbp/distributed/pool/peer_pool.h"
 #include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {
 namespace {
 
-// Every medium is equivalent (Phase 4), so the registry walks backend-id order.
-// The fixture registers HBM first; Resolve depends only on deterministic order.
+// Every medium is equivalent (Phase 4), so the registry walks them in ascending
+// TierType order — HBM(1) before DRAM(2).  The Resolve test depends only on
+// that order being deterministic, not on it meaning "faster".
 constexpr TierType kFirstByTier = TierType::HBM;
 constexpr TierType kSecondByTier = TierType::DRAM;
-constexpr char kPrimaryHbm[] = "hbm-primary";
-constexpr char kSecondaryHbm[] = "hbm-secondary";
 
 class PeerServiceDispatchTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    registry_.Register(kPrimaryHbm, std::make_unique<MockBackend>(kFirstByTier));
-    registry_.Register(kSecondaryHbm, std::make_unique<MockBackend>(kFirstByTier));
+    registry_.Register(std::make_unique<MockBackend>(kFirstByTier));
     registry_.Register(std::make_unique<MockBackend>(kSecondByTier));
+    pool_ = std::make_unique<PeerPool>(&registry_, MakeSingleBackendPolicy());
 
     // OS-assigned ports are not reachable through PeerServiceServer::Start
     // (it does not report the bound port back), so probe a random high range
@@ -76,7 +77,7 @@ class PeerServiceDispatchTest : public ::testing::Test {
     std::uniform_int_distribution<int> pick(20000, 60000);
     for (int attempt = 0; attempt < 50 && !started_; ++attempt) {
       const uint16_t port = static_cast<uint16_t>(pick(rng));
-      server_ = std::make_unique<PeerServiceServer>(&registry_);
+      server_ = std::make_unique<PeerServiceServer>(*pool_);
       if (server_->Start(port)) {
         started_ = true;
         auto channel = grpc::CreateChannel("127.0.0.1:" + std::to_string(port),
@@ -96,25 +97,19 @@ class PeerServiceDispatchTest : public ::testing::Test {
   }
 
   MediumBackend* Backend(TierType tier) { return registry_.Get(tier); }
-  MediumBackend* Backend(const std::string& name) { return registry_.Get(name); }
 
   // The registry hands out MediumBackend; PublishBuffers is test scaffolding
   // that only the mock has.  Safe because SetUp registers nothing else.
   MockBackend* Mock(TierType tier) { return static_cast<MockBackend*>(registry_.Get(tier)); }
-  MockBackend* Mock(const std::string& name) {
-    return static_cast<MockBackend*>(registry_.Get(name));
-  }
 
   static ::umbp::TierType Proto(TierType t) { return static_cast<::umbp::TierType>(t); }
 
-  // Allocate one slot and return the opaque backend-tagged slot_id.
-  ::umbp::AllocateSlotResponse Allocate(const std::string& key, uint64_t size, TierType tier,
-                                        const std::string& backend_name = {}) {
+  // Allocate one slot and return the opaque, backend-tagged slot_id.
+  ::umbp::AllocateSlotResponse Allocate(const std::string& key, uint64_t size, TierType tier) {
     ::umbp::AllocateSlotRequest req;
     req.set_key(key);
     req.set_size(size);
     req.set_tier(Proto(tier));
-    if (!backend_name.empty()) req.set_backend_name(backend_name);
     ::umbp::AllocateSlotResponse resp;
     grpc::ClientContext ctx;
     EXPECT_TRUE(stub_->AllocateSlot(&ctx, req, &resp).ok());
@@ -142,6 +137,7 @@ class PeerServiceDispatchTest : public ::testing::Test {
   }
 
   BackendRegistry registry_;
+  std::unique_ptr<PeerPool> pool_;
   std::unique_ptr<PeerServiceServer> server_;
   std::unique_ptr<::umbp::UMBPPeer::Stub> stub_;
   bool started_ = false;
@@ -168,30 +164,10 @@ TEST_F(PeerServiceDispatchTest, AllocateForATierWithNoBackendFailsCleanly) {
   EXPECT_EQ(Backend(kSecondByTier)->OwnedKeyCount(), 0u);
 }
 
-TEST_F(PeerServiceDispatchTest, NamedSameTierInstancesAllocateAndCommitIndependently) {
-  auto primary = Allocate("primary-key", 8, TierType::HBM, kPrimaryHbm);
-  auto secondary = Allocate("secondary-key", 8, TierType::HBM, kSecondaryHbm);
-  ASSERT_EQ(primary.outcome(), ::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
-  ASSERT_EQ(secondary.outcome(), ::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
-  EXPECT_NE(primary.backend_id(), secondary.backend_id());
-  EXPECT_NE(primary.slot_id(), secondary.slot_id());
-
-  EXPECT_TRUE(Commit(primary.slot_id(), "primary-key"));
-  EXPECT_TRUE(Commit(secondary.slot_id(), "secondary-key"));
-  EXPECT_EQ(Backend(kPrimaryHbm)->OwnedKeyCount(), 1u);
-  EXPECT_EQ(Backend(kSecondaryHbm)->OwnedKeyCount(), 1u);
-}
-
-TEST_F(PeerServiceDispatchTest, NamedBackendMustMatchRequestedTier) {
-  auto resp = Allocate("wrong-tier", 8, TierType::DRAM, kSecondaryHbm);
-  EXPECT_EQ(resp.outcome(), ::umbp::ALLOCATE_SLOT_OUTCOME_FAILED);
-  EXPECT_EQ(Backend(kSecondaryHbm)->OwnedKeyCount(), 0u);
-}
-
-// ---- The slot_id carries the backend id ------------------------------------
+// ---- The slot_id carries the backend id -------------------------------------
 
 TEST_F(PeerServiceDispatchTest, ConcurrentSlotsOnTwoBackendsStayDistinct) {
-  // Each backend numbers its own slots from 1, so without the backend-id tag these
+  // Each backend numbers its own slots from 1, so without the backend tag these
   // two allocations would come back with the SAME opaque id and Commit could
   // not tell them apart.
   auto first = Allocate("a", 8, kFirstByTier);
@@ -291,7 +267,7 @@ TEST_F(PeerServiceDispatchTest, AllocateNamesTheBackendItsPagesBelongTo) {
   ASSERT_EQ(first.outcome(), ::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
   ASSERT_EQ(second.outcome(), ::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
 
-  // Same reason Commit needs the tier tagged into slot_id: the writer has to
+  // Same reason Commit needs the backend tagged into slot_id: the writer has to
   // know which buffers its pages index into before it can RDMA into them.
   EXPECT_NE(first.backend_id(), second.backend_id());
   for (const auto& d : first.descs()) EXPECT_EQ(d.backend_id(), first.backend_id());
@@ -325,7 +301,7 @@ TEST_F(PeerServiceDispatchTest, AbortReachesTheBackendThatOwnsTheSlot) {
 
 // ---- Mixed-tier batches -----------------------------------------------------
 
-TEST_F(PeerServiceDispatchTest, BatchAllocateGroupsByBackendButAnswersInRequestOrder) {
+TEST_F(PeerServiceDispatchTest, BatchAllocateGroupsByTierButAnswersInRequestOrder) {
   ::umbp::BatchAllocateSlotsRequest req;
   const std::vector<std::pair<std::string, TierType>> wanted = {
       {"e0", kFirstByTier},
@@ -367,47 +343,11 @@ TEST_F(PeerServiceDispatchTest, BatchAllocateGroupsByBackendButAnswersInRequestO
   EXPECT_EQ(Backend(kSecondByTier)->OwnedKeyCount(), 1u);
 }
 
-TEST_F(PeerServiceDispatchTest, BatchAllocateGroupsNamedSameTierInstancesByBackendId) {
-  ::umbp::BatchAllocateSlotsRequest req;
-  for (const auto& [key, name] :
-       std::vector<std::pair<std::string, std::string>>{{"primary", kPrimaryHbm},
-                                                        {"secondary", kSecondaryHbm}}) {
-    auto* entry = req.add_entries();
-    entry->set_key(key);
-    entry->set_size(16);
-    entry->set_tier(Proto(TierType::HBM));
-    entry->set_backend_name(name);
-  }
-
-  ::umbp::BatchAllocateSlotsResponse resp;
-  grpc::ClientContext ctx;
-  ASSERT_TRUE(stub_->BatchAllocateSlots(&ctx, req, &resp).ok());
-  ASSERT_EQ(resp.entries_size(), 2);
-  ASSERT_EQ(resp.entries(0).outcome(), ::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
-  ASSERT_EQ(resp.entries(1).outcome(), ::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
-  EXPECT_NE(resp.entries(0).backend_id(), resp.entries(1).backend_id());
-
-  ::umbp::BatchCommitSlotsRequest commit_req;
-  for (int i = 0; i < 2; ++i) {
-    auto* entry = commit_req.add_entries();
-    entry->set_slot_id(resp.entries(i).slot_id());
-    entry->set_key(req.entries(i).key());
-  }
-  ::umbp::BatchCommitSlotsResponse commit_resp;
-  grpc::ClientContext commit_ctx;
-  ASSERT_TRUE(stub_->BatchCommitSlots(&commit_ctx, commit_req, &commit_resp).ok());
-  ASSERT_EQ(commit_resp.success_size(), 2);
-  EXPECT_TRUE(commit_resp.success(0));
-  EXPECT_TRUE(commit_resp.success(1));
-  EXPECT_EQ(Backend(kPrimaryHbm)->OwnedKeyCount(), 1u);
-  EXPECT_EQ(Backend(kSecondaryHbm)->OwnedKeyCount(), 1u);
-}
-
 TEST_F(PeerServiceDispatchTest, BatchCommitOfAnUnroutableSlotReportsFalseInPlace) {
   auto allocated = Allocate("a", 8, kSecondByTier);
   ::umbp::BatchCommitSlotsRequest req;
   auto* bad = req.add_entries();
-  bad->set_slot_id(0);  // tier UNKNOWN
+  bad->set_slot_id(0);  // backend 0, local slot 0: unknown
   bad->set_key("bad");
   auto* good = req.add_entries();
   good->set_slot_id(allocated.slot_id());
@@ -504,6 +444,64 @@ TEST_F(PeerServiceDispatchTest, EvictOfAnAbsentKeyReportsZeroBytes) {
   EXPECT_EQ(resp.evicted(0).bytes_freed(), 0u);
 }
 
+TEST(PeerServiceSameTierDispatch, NamedInstancesAllocateAndCommitIndependently) {
+  BackendRegistry registry;
+  ASSERT_TRUE(
+      registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(
+      registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
+
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+  PeerServiceServer server(pool);
+  std::mt19937 rng{std::random_device{}()};
+  std::uniform_int_distribution<int> pick(20000, 60000);
+  uint16_t bound = 0;
+  for (int attempt = 0; attempt < 50 && bound == 0; ++attempt) {
+    const uint16_t candidate = static_cast<uint16_t>(pick(rng));
+    if (server.Start(candidate)) bound = candidate;
+  }
+  ASSERT_NE(bound, 0);
+
+  auto channel =
+      grpc::CreateChannel("127.0.0.1:" + std::to_string(bound), grpc::InsecureChannelCredentials());
+  auto stub = ::umbp::UMBPPeer::NewStub(channel);
+  const auto allocate = [&](const std::string& key, const std::string& backend_name) {
+    ::umbp::AllocateSlotRequest request;
+    request.set_key(key);
+    request.set_size(8);
+    request.set_tier(::umbp::TIER_DRAM);
+    request.set_backend_name(backend_name);
+    ::umbp::AllocateSlotResponse response;
+    grpc::ClientContext context;
+    EXPECT_TRUE(stub->AllocateSlot(&context, request, &response).ok());
+    return response;
+  };
+  const auto commit = [&](uint64_t slot_id, const std::string& key) {
+    ::umbp::CommitSlotRequest request;
+    request.set_slot_id(slot_id);
+    request.set_key(key);
+    ::umbp::CommitSlotResponse response;
+    grpc::ClientContext context;
+    EXPECT_TRUE(stub->CommitSlot(&context, request, &response).ok());
+    return response.success();
+  };
+
+  auto first = allocate("a", "dram_a");
+  auto second = allocate("b", "dram_b");
+  ASSERT_EQ(first.outcome(), ::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
+  ASSERT_EQ(second.outcome(), ::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
+  EXPECT_NE(first.backend_id(), second.backend_id());
+  EXPECT_NE(first.slot_id(), second.slot_id());
+  EXPECT_TRUE(commit(first.slot_id(), "a"));
+  EXPECT_TRUE(commit(second.slot_id(), "b"));
+  EXPECT_EQ(registry.Get("dram_a")->OwnedKeyCount(), 1u);
+  EXPECT_EQ(registry.Get("dram_b")->OwnedKeyCount(), 1u);
+
+  auto missing_backend = allocate("c", "missing");
+  EXPECT_EQ(missing_backend.outcome(), ::umbp::ALLOCATE_SLOT_OUTCOME_FAILED);
+  server.Stop();
+}
+
 // ---- A registry-less peer still answers -------------------------------------
 
 TEST(PeerServiceNoRegistry, AnswersWithoutCrashing) {
@@ -557,8 +555,10 @@ TEST(PeerServiceNoRegistry, AnswersWithoutCrashing) {
 TEST(PeerServicePortExclusivity, SecondServerCannotBindTheSamePort) {
   BackendRegistry registry_a;
   BackendRegistry registry_b;
-  PeerServiceServer first(&registry_a);
-  PeerServiceServer second(&registry_b);
+  PeerPool pool_a(&registry_a, MakeSingleBackendPolicy());
+  PeerPool pool_b(&registry_b, MakeSingleBackendPolicy());
+  PeerServiceServer first(pool_a);
+  PeerServiceServer second(pool_b);
 
   std::mt19937 rng{std::random_device{}()};
   std::uniform_int_distribution<int> pick(20000, 60000);

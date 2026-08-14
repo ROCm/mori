@@ -289,6 +289,13 @@ target_link_libraries(test_mock_backend PRIVATE umbp_common GTest::gtest_main)
 target_compile_features(test_mock_backend PRIVATE cxx_std_17)
 add_test(NAME test_mock_backend COMMAND test_mock_backend)
 
+# test_peer_pool — implicit default Pool, SingleBackendPolicy compatibility,
+# logical key placement, named same-tier backend dispatch, and recovery fallback.
+add_executable(test_peer_pool test_peer_pool.cpp)
+target_link_libraries(test_peer_pool PRIVATE umbp_common GTest::gtest_main)
+target_compile_features(test_peer_pool PRIVATE cxx_std_17)
+add_test(NAME test_peer_pool COMMAND test_peer_pool)
+
 # test_transfer_engine — the Phase 6 transfer layer without gRPC or RDMA:
 # LocalCopyEngine's planner/executor and CompositeTransferEngine's fan-out
 # registration + per-pair engine selection.  MoriIoEngine needs a real fabric
@@ -315,10 +322,11 @@ target_link_libraries(test_ssd_backend PRIVATE umbp_common GTest::gtest_main)
 target_compile_features(test_ssd_backend PRIVATE cxx_std_17)
 add_test(NAME test_ssd_backend COMMAND test_ssd_backend)
 
-# test_peer_service_dispatch — PeerServiceServer instance dispatch through
-# BackendRegistry: named same-tier routing, backend-id-tagged opaque slot ids,
-# mixed-instance batch ordering, and resolve walk / evict fan-out. Drives the
-# real gRPC surface, so it needs the generated proto + protobuf.
+# test_peer_service_dispatch — PeerServiceServer dispatch through
+# BackendRegistry: tier compatibility, named same-tier instances, the
+# backend-id-tagged opaque slot_id that makes Commit/Abort unambiguous,
+# mixed-backend batch ordering, and resolve/evict fan-out. Drives the real gRPC
+# surface, so it needs the generated proto + protobuf.
 add_executable(test_peer_service_dispatch test_peer_service_dispatch.cpp)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_link_options(test_peer_service_dispatch PRIVATE -Wl,--no-as-needed)

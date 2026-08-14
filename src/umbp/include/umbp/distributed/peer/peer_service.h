@@ -31,18 +31,21 @@ namespace mori::umbp {
 
 class BackendRegistry;
 class MasterClient;
+class PeerPool;
 
 class PeerServiceServer {
  public:
-  // `registry` is non-owning (PoolClient outlives this server) and may be null
-  // when the host process has no storage medium at all.  Handlers dispatch on
-  // an explicit backend name when present, otherwise the first instance for the
-  // requested tier. No concrete backend type is named here. A request with no
-  // matching instance responds success=false / found=false.
+  // `pool` is non-owning (PoolClient outlives this server). Handlers delegate
+  // logical placement and backend dispatch to it; no concrete backend type is
+  // named here.
   //
   // SSD read staging (PrepareSsdRead/ReleaseSsdLease) was removed in the
   // backend-agnostic refactor Phase 0 — SSD is unwired from the distributed
   // data plane (see design-backend-agnostic-refactor.md).
+  PeerServiceServer(PeerPool& pool, std::vector<uint8_t> engine_desc_bytes = {},
+                    MasterClient* master_client = nullptr);
+  // Source-compatible adapter for embedders that have not created a Pool yet.
+  // The server owns an implicit SingleBackendPolicy PeerPool over `registry`.
   PeerServiceServer(BackendRegistry* registry, std::vector<uint8_t> engine_desc_bytes = {},
                     MasterClient* master_client = nullptr);
   ~PeerServiceServer();
@@ -51,7 +54,8 @@ class PeerServiceServer {
   void Stop();
 
  private:
-  BackendRegistry* registry_;
+  std::unique_ptr<PeerPool> owned_pool_;
+  PeerPool* pool_;
   MasterClient* master_client_;
 
   std::vector<uint8_t> engine_desc_bytes_;

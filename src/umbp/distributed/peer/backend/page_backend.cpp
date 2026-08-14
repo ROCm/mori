@@ -480,6 +480,11 @@ std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::stri
   return out;
 }
 
+bool PageBackend::Contains(const std::string& key) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return owned_.find(key) != owned_.end();
+}
+
 // ---------------------------------------------------------------------------
 //  Eviction (skips leased / copy-pinned keys; emits REMOVE)
 // ---------------------------------------------------------------------------

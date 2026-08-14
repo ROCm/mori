@@ -47,6 +47,7 @@
 namespace mori::umbp {
 
 class PeerServiceServer;
+class PeerPool;
 
 // Short name for log output. Generic FAILED maps to "FAILED" — the
 // detailed reason for that case lives in the peer's allocator log.
@@ -128,11 +129,12 @@ class PoolClient {
 
   MasterClient& Master();
 
-  // Every named storage backend live on this node.
+  // The storage medium live on this node (exactly one — see PoolClient::Init).
+  // Callers reach it by tier (Backends().Get(Medium())) and use it through
+  // MediumBackend — no concrete backend type is named outside PoolClient::Init.
   BackendRegistry& Backends();
 
-  // Legacy default medium: the first configured backend's tier. Valid after
-  // Init and retained for callers that have not adopted named instances.
+  // Which medium this node serves.  Valid after Init.
   TierType Medium() const { return medium_; }
 
   bool IsInitialized() const;
@@ -176,12 +178,16 @@ class PoolClient {
 
   // Every storage medium live on this node.  Owned here because PoolClient is
   // the natural lifetime anchor for the per-process IO engine + backend pools.
-  // PeerServiceServer and MasterClient both borrow the registry and dispatch
-  // through it (backend-agnostic refactor Phase 3).
+  // MasterClient borrows it for heartbeat aggregation; default_pool_ borrows it
+  // for logical placement and peer/local dispatch.
   BackendRegistry registry_;
 
-  // The first configured backend's tier, retained as the legacy default for
-  // paths (such as re-cache) that have no named placement policy yet.
+  // The implicit default logical pool. It borrows registry_, owns placement
+  // state and policy, and is the dispatch surface for local and peer RPC paths.
+  std::unique_ptr<PeerPool> default_pool_;
+
+  // Legacy default tier, cached from the first configured backend. Read by
+  // re-cache paths that do not yet carry a PoolPolicy decision.
   TierType medium_ = TierType::DRAM;
 
   std::unique_ptr<PeerServiceServer> peer_service_;

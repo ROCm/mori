@@ -408,6 +408,10 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
   return results;
 }
 
+bool SsdBackend::Contains(const std::string& key) const {
+  return ssd_ != nullptr && ssd_->Exists(key);
+}
+
 std::vector<EvictResult> SsdBackend::Evict(const std::vector<std::string>& keys) {
   std::vector<EvictResult> results;
   results.reserve(keys.size());

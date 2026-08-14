@@ -265,6 +265,11 @@ class MediumBackend {
   virtual std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
                                                   bool include_descs) = 0;
 
+  // Authoritative metadata lookup with no staging, descriptor construction, or
+  // read-lease side effects. Pool placement validation must use this instead of
+  // interpreting a temporarily unresolvable object as absent.
+  virtual bool Contains(const std::string& key) const = 0;
+
   // Master-driven eviction.  Idempotent; see EvictResult::bytes_freed.  One
   // result per key, in request order — the peer service relies on that to sum
   // freed bytes for a key mirrored across media.

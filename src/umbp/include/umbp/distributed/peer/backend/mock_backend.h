@@ -171,6 +171,11 @@ class MockBackend : public MediumBackend {
     return out;
   }
 
+  bool Contains(const std::string& key) const override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return owned_.find(key) != owned_.end();
+  }
+
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys) override {
     std::vector<EvictResult> out;
     out.reserve(keys.size());
