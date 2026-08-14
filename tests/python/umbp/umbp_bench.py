@@ -270,10 +270,23 @@ def _staging_plan(nr_objects_: int, value_size_: int, batch_sizes_):
     """
     max_batch = max(batch_sizes_) if batch_sizes_ else nr_objects_
     max_batch = max(1, min(max_batch, nr_objects_))
-    # Headroom: a slot stays pinned for the read lease (UMBP_DRAM_READ_LEASE_MS,
-    # 500ms default) when the reader's best-effort release is lost, so batch N+1
-    # can start while stragglers from batch N still hold pages.
-    slots = max(64, max_batch + max(64, max_batch // 8))
+    # Occupancy is NOT just the batch width. A staged page is freed when the
+    # reader's best-effort release lands, and otherwise only when the read lease
+    # expires -- so in steady state the arena also holds roughly
+    # (completed reads/sec x lease). Measured on n06-21 with a 2304-slot arena:
+    #
+    #   1 drive,  batch 128:  3042 req/s -> 1521 + 128  = 1649 slots -> 0 misses
+    #   2 drives, batch 128:  4699 req/s -> 2350 + 128  = 2478 slots -> 23% misses
+    #   1 drive,  batch 2048: 2939 req/s -> 1470 + 2048 = 3518 slots -> 44% misses
+    #
+    # The throughput term is what makes this bite harder as drives are added:
+    # faster media completes more reads per second, so it needs a BIGGER arena,
+    # which is the opposite of the intuition that fewer drives are the tight case.
+    # Two levers: keep the lease short (see _SSD_LEASE_MS -- it only has to cover
+    # one sub-ms RDMA round trip, so the 500ms default is ~1000x more than needed)
+    # and budget two batches of burst plus a fixed throughput margin.
+    lease_slots = 1024  # ~20 GB/s of 2 MiB values at a 50 ms lease
+    slots = max(64, 2 * max_batch + lease_slots)
     # Pad the per-slot page to the 4 KiB the on-disk records are aligned to.
     slot_bytes = ((value_size_ + 4095) // 4096) * 4096
     return slots, slots * slot_bytes, max_batch
@@ -282,6 +295,18 @@ def _staging_plan(nr_objects_: int, value_size_: int, batch_sizes_):
 _auto_slots, _auto_staging_bytes, _auto_max_batch = _staging_plan(
     nr_objects, value_size, getattr(args, "batch_sizes", None)
 )
+
+# The peer holds a staged page under this lease until the reader's release lands
+# (pool_client.cpp DramReadLeaseTtl, UMBP_DRAM_READ_LEASE_MS, 500ms default). The
+# lease only has to outlive one RDMA round trip, which is sub-millisecond, but it
+# is what bounds how fast slots recycle -- at 500ms a fast multi-drive tier keeps
+# thousands of pages pinned purely waiting for it. Default it down for the bench
+# so arena sizing stays a function of the sweep instead of the media speed. Must
+# be in the environment before the client is built: the C++ side caches it in a
+# function-local static on first read.
+_SSD_LEASE_MS = "50"
+if tier == "ssd":
+    os.environ.setdefault("UMBP_DRAM_READ_LEASE_MS", _SSD_LEASE_MS)
 
 if backend_name == "umbp":
     from mori.io import MemoryLocationType
@@ -479,7 +504,8 @@ class UMBPBackend(Backend):
                 f"arena={dist.ssd_staging_buffer_size / 2**30:.2f}GiB "
                 f"slot={_slot_bytes / 2**20:.2f}MiB "
                 f"(auto: slots={_auto_slots} arena={_auto_staging_bytes / 2**30:.2f}GiB "
-                f"for max_batch={_auto_max_batch})",
+                f"for max_batch={_auto_max_batch}) "
+                f"read_lease_ms={os.environ.get('UMBP_DRAM_READ_LEASE_MS')}",
                 flush=True,
             )
             if dist.ssd_staging_buffer_slots < _auto_max_batch:
