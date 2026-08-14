@@ -439,20 +439,6 @@ jobs:
               -R '^(umbp_|test_dummy_ssd_tier|test_prefix_aware_eviction|test_ssd_tier)'
           "
 
-      # The GPU gather path needs the DRAM tier registered for GPU access, which
-      # is best-effort: where the registration does not take, the tier falls back
-      # to the copy engine and the gather tests skip rather than fail. Report the
-      # outcome either way, so a runner losing the path shows up here instead of
-      # as an unexplained performance difference later.
-      - name: UMBP GPU gather path availability
-        if: always()
-        run: |
-          $CT exec -e MORI_UMBP_LOG_LEVEL=warn $CONTAINER bash -c "
-            cd $GITHUB_WORKSPACE/build
-            timeout 120 ctest -V -R umbp_dram_tier_gather -E kernel_off > /tmp/gather.log 2>&1 || true
-            grep -E 'DRAMTier|SKIPPED|OK \]' /tmp/gather.log || cat /tmp/gather.log
-          "
-
       - name: Cleanup
         if: always()
         run: |

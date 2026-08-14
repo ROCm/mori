@@ -24,9 +24,7 @@
 // once with UMBP_DRAM_GATHER_KERNEL=0, so the same byte-level expectations are
 // enforced against both the kernel and the copy engine. The launch counter
 // assertions are what stop this from passing when the kernel silently never
-// runs -- on any machine that can register host memory for GPU access, which is
-// the one precondition the kernel path has and the one thing a test cannot
-// assert its way into.
+// runs.
 #include <gtest/gtest.h>
 #include <hip/hip_runtime_api.h>
 
@@ -48,12 +46,9 @@ bool GatherKernelExpected() {
   return value == nullptr || (std::string(value) != "0");
 }
 
-// Whether this machine can make host memory GPU-addressable at all. The tier
-// registers itself exactly this way, and where the registration does not take
-// the tier falls back to the copy engine on purpose -- so the launch counter
-// below would be measuring the machine rather than the planner's decision.
-// Probed once; the reason for a failure is logged by the registration itself at
-// warn level.
+// The tier registers itself the same way. Without it the kernel path cannot
+// engage whatever the batch looks like, so the launch counter would be
+// measuring the machine rather than the planner.
 bool GatherPathAvailable() {
   static const bool available = [] {
     std::vector<char> probe(64 * 1024);
@@ -62,13 +57,11 @@ bool GatherPathAvailable() {
   return available;
 }
 
-// The kernel-off variant asserts the absence of launches and holds anywhere;
-// only the kernel-on variant needs the registration to have taken.
 bool GatherKernelReachable() { return !GatherKernelExpected() || GatherPathAvailable(); }
 
 constexpr const char* kGatherPathUnreachable =
-    "host memory cannot be registered for GPU access on this machine, so the tier stays on the "
-    "copy engine; rerun with MORI_UMBP_LOG_LEVEL=warn for the reason the registration failed";
+    "host memory cannot be registered for GPU access here, so the tier stays on the copy engine; "
+    "rerun with MORI_UMBP_LOG_LEVEL=warn for the reason";
 
 bool HasDevice() {
   int count = 0;
@@ -339,3 +332,12 @@ TEST(HostTierRegistrationTest, CoversOnlyRegisteredBytesAndRejectsOverflow) {
 
 }  // namespace
 }  // namespace mori::umbp
+
+// 77 is SKIP_RETURN_CODE in CMakeLists.txt: gtest exits 0 on a skip, so without
+// this ctest reports a pass.
+int main(int argc, char** argv) {
+  ::testing::InitGoogleTest(&argc, argv);
+  const int status = RUN_ALL_TESTS();
+  if (status != 0) return status;
+  return mori::umbp::GatherKernelReachable() ? 0 : 77;
+}

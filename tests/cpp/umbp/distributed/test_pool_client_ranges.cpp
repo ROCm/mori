@@ -55,10 +55,8 @@ constexpr size_t kCallerCapacity = 16 * kPageSize;
 constexpr size_t kTargetCapacity = 256 * kPageSize;
 constexpr size_t kScratchSize = kObjectSize;  // Forces one object per sub-batch.
 
-// The gather kernel dereferences the tier directly, so it can only run where the
-// host region registers for GPU access. That is best-effort by design and the
-// client falls back to the copy engine without it, which leaves the byte
-// expectations valid but the launch counter flat.
+// The kernel dereferences the tier directly, so it needs the host region
+// registered for GPU access; without it the client uses the copy engine.
 bool GatherPathAvailable() {
   static const bool available = [] {
     std::vector<char> probe(64 * 1024);
@@ -409,8 +407,6 @@ TEST_F(PoolClientRangesTest, GpuRangesUseGatherKernel) {
     src_ptrs.push_back(gpu_src[i].ptr);
   }
 
-  // Checked only where the kernel can run at all; the round trip below is the
-  // part that has to hold on every machine.
   const bool gather_available = DeviceGatherEnabled() && GatherPathAvailable();
   const uint64_t launches_before = DeviceGatherLaunchCount();
   const std::vector<std::string> gpu_keys = {"gpu-range-object-0", "gpu-range-object-1"};
