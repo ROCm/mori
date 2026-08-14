@@ -285,8 +285,19 @@ def _staging_plan(nr_objects_: int, value_size_: int, batch_sizes_):
     # Two levers: keep the lease short (see _SSD_LEASE_MS -- it only has to cover
     # one sub-ms RDMA round trip, so the 500ms default is ~1000x more than needed)
     # and budget two batches of burst plus a fixed throughput margin.
-    lease_slots = 1024  # ~20 GB/s of 2 MiB values at a 50 ms lease
-    slots = max(64, 2 * max_batch + lease_slots)
+    # The hold time is NOT just the lease: measured on 4x KIOXIA CD8 at ~15k
+    # reads/s, clearing misses needed 4096 slots for a 512-wide batch, implying
+    # ~200ms of hold per page against a 50ms lease -- the RDMA round trip and the
+    # asynchronous release dominate. Calibrated empirically at the fastest media
+    # available (30 GB/s), since under-sizing is silent and over-sizing only
+    # costs host memory:
+    #
+    #   4 drives, batch 512, 2048 slots -> 20% misses (13.4 GB/s reported)
+    #   4 drives, batch 512, 4096 slots ->  0% misses (30.0 GB/s)
+    #   4 drives, batch 512, 8192 slots ->  0% misses (29.0 GB/s -- no gain,
+    #                                       so 4096 is genuinely sufficient and
+    #                                       the number is not cache-inflated)
+    slots = max(4096, 4 * max_batch + 2048)
     # Pad the per-slot page to the 4 KiB the on-disk records are aligned to.
     slot_bytes = ((value_size_ + 4095) // 4096) * 4096
     return slots, slots * slot_bytes, max_batch
