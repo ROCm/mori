@@ -113,9 +113,8 @@ def main():
         .to(dev)
     )
 
-    # Six ops are built and closed in sequence (2 backends x len(SWEEP)),
-    # so the reservation has to survive the repeated alloc/free, not just
-    # hold one arena.
+    # Three arenas live simultaneously (one per backend), so the reservation
+    # must hold all of them at once.
     vmm = 4 * (world * M * HIDDEN * 2 * 2 + (16 << 20)) + (2 << 30)
     comm = cco.Communicator.init(world, rank, obj[0], vmm)
 

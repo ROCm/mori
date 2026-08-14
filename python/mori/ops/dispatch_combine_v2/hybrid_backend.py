@@ -125,11 +125,17 @@ class EpDispatchCombineOpHybrid(EpDispatchCombineOp, backend="hybrid"):
             ("cross_device_barrier", cfg.world_size * 8),
         ]
 
+    _COMBINE_DTYPES = {torch.bfloat16, torch.float32}
+
     def _unsupported(self, cfg) -> tuple[str, ...]:
         bad = []
         if cfg.dispatch_dtype not in _HIP_DISPATCH_DTYPES:
             bad.append(
                 f"dispatch dtype {cfg.dispatch_dtype} (have bf16, fp32, fp8, fp4)"
+            )
+        if cfg.combine_dtype not in self._COMBINE_DTYPES:
+            bad.append(
+                f"combine dtype {cfg.combine_dtype} (have bf16, fp32)"
             )
         if cfg.is_scatter:
             bad.append("combine_mode='scatter' (gather only)")
