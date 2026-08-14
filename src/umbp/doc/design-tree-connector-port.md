@@ -17,6 +17,13 @@ byte-identical (`git range-diff 9d5e30f5..1ab7e751 f185c5f0..362cd22c` reports
 `=` for all nine), so the second round of porting is exactly those three
 commits and nothing else — see §8.
 
+**Round three.** Upstream is now at `c0044f87` with thirteen, and was *not*
+rebased this time (`git range-diff f185c5f0..362cd22c 7f6effc5..c0044f87`
+reports `=` for all twelve carried commits), so the third round is exactly one
+commit — see §12. This branch was at the same time rebased off `ee4a5861` onto
+`c12c68e8`, the backend-agnostic branch's current head, which added the
+pure-SSD/multi-drive work; see §12.1 for what that cost.
+
 **Method:** not a merge, and not a series of cherry-picks. The two branches
 rewrote almost disjoint halves of `src/umbp`, so most upstream files can be
 taken verbatim; the small shared set is hand-merged, and the files where the
@@ -324,24 +331,26 @@ taken of the GPU path's throughput.
 
 ## 9. Mode support matrix
 
-Both features, as this branch leaves them (updated after §10).
+Both features, as this branch leaves them (updated after §12).
 
 | Client | Backend | GPU buffers | Ranged I/O |
 |---|---|---|---|
 | `StandaloneClient` | — | DRAM tier only (§8.5) | DRAM tier only |
 | `StandaloneProcessClient` | Local | DRAM tier only (§8.5) | DRAM tier only |
-| `StandaloneProcessClient` | Distributed | yes, all media | yes, except SSD (§10.3) |
-| `DistributedClient` | — | yes, all media | yes, except SSD (§10.3) |
+| `StandaloneProcessClient` | Distributed | yes, all media | opt-in (§12), except SSD (§10.3) |
+| `DistributedClient` | — | yes, all media | opt-in (§12), except SSD (§10.3) |
 
 Ranged I/O is DRAM-only within Local mode: `TierBackend`'s default ranged
 methods return all-false (`tier_backend.cpp:52`, `:69`) and only `DRAMTier`
 overrides them.
 
-In distributed mode the excluded medium is SSD, for a different reason: ranged
-access maps object ranges onto pages a backend publishes as *in-process*
-endpoints, and `SsdBackend` publishes storage refs. `SupportsRangedIO()` is
-keyed on the selected medium, so a client reports the truth rather than the
-caller discovering it as a failed batch.
+In distributed mode two independent conditions must both hold, and
+`SupportsRangedIO()` tests both, so a client reports the truth rather than the
+caller discovering it as a failed batch. The medium must be able to serve it —
+ranged access maps object ranges onto pages a backend publishes as *in-process*
+endpoints, and `SsdBackend` publishes storage refs — and the deployment must
+have opted in by configuring a ranged scratch arena (§12), which defaults to
+zero.
 
 A client can now ask instead of assuming: `GetBackendMode()` reports what is
 behind a forwarding client, and `SupportsRangedIO()` reports the capability.
@@ -464,3 +473,130 @@ Same container and constraints as §7.
   through shared host state, and it is worth chasing separately: the two tests
   are separate processes, so the coupling has to be the filesystem or hugepages
   rather than anything in the library.
+
+---
+
+## 12. Round three — rebase onto `c12c68e8`, and upstream's one later commit
+
+Two independent movements, done together because the second lands on top of the
+first.
+
+### 12.1 The rebase — `ee4a5861` → `c12c68e8`
+
+The backend-agnostic branch grew one commit, `c12c68e8` ("port the pure-SSD /
+multi-drive work onto the backend-agnostic SSD path", #554): `ShardedSSDTier`
+and its factory, O_DIRECT with the 4 KiB-aligned record format v3, hardware
+CRC-32C, `PeerSsdManager` single-flight, and a `parallel_for` helper.
+
+Replaying the twelve port commits over it produced **one conflict, in one file,
+of one line**: `pool_client.cpp`'s include block, where `c12c68e8` added
+`umbp/common/parallel_for.h` and the ranged commit added
+`umbp/common/range_utils.h`. Both were kept. `git range-diff` over the twelve
+shows only context shifts — no hunk was rewritten and no resolution changed
+anyone's semantics.
+
+That is worth recording rather than just being lucky, because it is §1's
+argument holding a second time from the other side: the SSD work is a
+`MediumBackend` and a local tier, the tree-connector work is the client-side
+data plane and the DRAM tier, and the two barely intersect.
+
+Two interactions were checked rather than assumed:
+
+- **`ShardedSSDTier` inherits the ranged stubs, not the DRAM overrides.** It
+  derives from `TierBackend`, whose default ranged methods return all-false
+  (§9), so the new sharded tier reports exactly what the single-drive tier
+  reports. §8.5's local-SSD device-buffer hole is unchanged by it — wider, in
+  that it now covers N drives instead of one, but not different.
+- **The new SSD tests build and pass under the port's CMake wiring.**
+  `test_sharded_ssd_tier`, `test_ssd_direct_io`, `test_segment_crc` and
+  `test_peer_ssd_single_flight` were the risk, because the port rewrote both
+  test `CMakeLists.txt` files. See §13.
+
+### 12.2 `c0044f87` — make the distributed ranged scratch opt-in
+
+The arena defaulted to 256 MiB, so every distributed client allocated and
+RDMA-registered it whether or not it ever issued a ranged operation. Zero is now
+the default and means "this deployment does not do ranged I/O": no allocation,
+no registration, `SupportsRangedIO()` false. `UMBPConfig::Validate` no longer
+rejects zero, and neither does `UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES`.
+
+Two deviations from upstream, both because our side already differs at the site:
+
+1. **`SupportsRangedIO()` gains the arena test rather than being replaced by
+   it.** Upstream's is now exactly `ranged_scratch_size_ > 0`; ours keeps the
+   medium test as well (§9). The conditions are independent and neither implies
+   the other — the arena is what the *remote* direction lands in, and the medium
+   is what decides whether object ranges can map onto published in-process
+   endpoints at all. Upstream has no medium selector, so it cannot express the
+   second half.
+
+2. **`StandaloneServer`'s `shared_reads_` keeps our predicate.** Upstream now
+   gates concurrent standalone reads on `SupportsRangedIO()`. Taken verbatim
+   here that would serialize *every* read of a distributed SSD-medium
+   deployment — the pure-SSD mode §12.1 just merged in — because our
+   `SupportsRangedIO()` also excludes that medium. The gate buys nothing
+   either: the RPCs under that lock are whole-object reads, and the only two
+   paths that touch the arena (`BatchGetRanges` / `BatchPutRanges` in
+   `pool_client.cpp`) already serialize on `ranged_scratch_mutex_` and bail out
+   cleanly when it is absent.
+
+Upstream's cleanup paths null the DRAM pool alongside the arena and guard the
+frees with `if (ranged_scratch_)`. Neither carries over: the DRAM backend has
+owned its own pool since Phase 2b, and `HostMemAllocator::Free` is already a
+no-op on an unallocated handle (`host_mem_allocator.cpp:452`), so `Close()` and
+the constructor's `release_scratch` are correct unchanged.
+
+The test is upstream's, adapted to drive a real `DistributedClient` through
+`CreateUMBPClient` rather than the file's bare `PoolClient` fixture — the opt-in
+lives in the constructor and in `SupportsRangedIO()`, neither of which
+`PoolClient` sees.
+
+**Consequence for a connector.** Ranged I/O is now off by default in
+distributed mode. A GPU-resident HiCache connector that wants it must set
+`distributed.ranged_scratch_size` (Python: `ranged_scratch_size` on
+`UMBPDistributedConfig`; `UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES` for the
+standalone server) and should read `supports_ranged_io()` back rather than
+assume it took effect.
+
+---
+
+## 13. Verification — round three
+
+Same container as §7 (`rocm/mori-dev:…-rdmapush`, `--entrypoint bash`,
+`/apps/ditian12` bind-mounted at the same path), on a host with `/dev/kfd`,
+`/dev/dri` and `/dev/infiniband`.
+
+- **Build:** whole tree clean, incremental over the existing `build_check/`.
+- **pybind:** `pybind_umbp.cpp` still has no cmake target, so it was
+  syntax-checked directly again — see §7 for the invocation. Clean apart from
+  the pre-existing spdlog `-Wdeprecated-literal-operator` warnings.
+- **ctest: the whole suite this time, not the `-R umbp` subset.** That filter,
+  used in §7 and §11, silently skips 18 targets whose names begin `test_` —
+  including every SSD target `c12c68e8` added, which are exactly the ones this
+  round needed to see. With `-E 'cross_node|e2e|medium_selection'` only,
+  **46 of 47 pass**: `test_sharded_ssd_tier`, `test_ssd_direct_io`,
+  `test_segment_crc` and `test_peer_ssd_single_flight` among them, and
+  `umbp_pool_client_ranges` passing all five cases including the new opt-in one.
+
+**The one failure is `umbp_local_client`, and §11's account of it was wrong.**
+§11 recorded it as an ordering artefact that "passes standalone". Measured
+properly — 12 runs of the binary from a neutral working directory — it aborts on
+`test_gpu_put_get`'s `batch_a == host_a` in 4 of 12 runs at HEAD, with
+`UMBP_DRAM_GATHER_KERNEL=0` as well as with the kernel on. So it is **flaky, not
+order-dependent, and not the gather kernel**; the single-item `Put`/`Get`
+immediately above it never fails, only the batched device path does.
+
+It is not a regression from this round. The same measurement against
+`99fa37d5` — the pre-rebase branch head, built from its own worktree — gives 4
+of 12 on the identical assertion. Same test, same rate, before any of this
+round's work.
+
+(That comparison build also fails `test_batch_get_follower` in the runs that get
+past the GPU test, which HEAD's `build_check` never does. That is a property of
+the throwaway build directory, not of the commit: follower mode depends on
+on-disk state the fresh tree does not have. It is noted only so the raw counts
+above are not mistaken for a second finding.)
+
+Chasing the `test_gpu_put_get` flake belongs with the round-one verbatim import
+that introduced it, and wants a look at the DRAM tier's batched device path
+rather than at anything ranged.
