@@ -19,6 +19,7 @@ message TierCapacity {
   TierType tier                     = 1;
   uint64   total_capacity_bytes     = 2;   // Total capacity on this tier
   uint64   available_capacity_bytes = 3;   // Current free capacity on this tier
+  uint64   max_allocatable_bytes    = 4;   // Largest value one backend can admit
 }
 
 // One page slot inside one of a node's DRAM/HBM buffers.  Carried by the
@@ -76,6 +77,7 @@ message RegisterClientRequest {
 message RegisterClientResponse {
   uint64 heartbeat_interval_ms = 1;  // Recommended heartbeat interval
   uint64 ack_seq               = 2;  // Initial heartbeat seq peer should send (= 0)
+  bool supports_max_allocatable_bytes = 3;
 }
 
 message UnregisterClientRequest {

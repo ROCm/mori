@@ -707,6 +707,7 @@ TierCapacity PageBackend::Capacity() const {
   if (allocator_) {
     cap.total_bytes = allocator_->TotalBytes();
     cap.available_bytes = allocator_->AvailableBytes();
+    cap.max_allocatable_bytes = cap.available_bytes;
   }
   return cap;
 }

@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include "umbp/distributed/peer/backend/ssd_backend.h"
 
+#include <algorithm>
 #include <msgpack.hpp>
 #include <stdexcept>
 #include <utility>
@@ -161,6 +162,7 @@ TierCapacity SsdBackend::Capacity() const {
   TierCapacity cap;
   cap.total_bytes = static_cast<uint64_t>(total);
   cap.available_bytes = total > used ? static_cast<uint64_t>(total - used) : 0;
+  cap.max_allocatable_bytes = std::min<uint64_t>(cap.available_bytes, cfg_.page_size);
   return cap;
 }
 

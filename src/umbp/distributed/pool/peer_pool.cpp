@@ -18,7 +18,10 @@ std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
   std::vector<PoolAllocateResult> out(requests.size());
   if (backends_ == nullptr || policy_ == nullptr) return out;
 
-  std::map<uint32_t, std::vector<size_t>> by_backend;
+  std::vector<std::vector<uint32_t>> put_orders(requests.size());
+  std::vector<size_t> next_candidate(requests.size(), 0);
+  std::vector<size_t> active;
+  active.reserve(requests.size());
   for (size_t i = 0; i < requests.size(); ++i) {
     auto existing = placements_.find(requests[i].key);
     if (existing != placements_.end()) {
@@ -64,59 +67,92 @@ std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
     }
     if (already_exists) continue;
 
-    auto selected = policy_->SelectPutBackend(*backends_, requests[i]);
-    if (selected.has_value()) {
+    put_orders[i] = policy_->PutOrder(*backends_, requests[i]);
+    if (!put_orders[i].empty()) {
+      const uint32_t selected = put_orders[i].front();
       pending_keys_[requests[i].key] =
-          PendingPlacement{*selected, 0, std::chrono::steady_clock::time_point::max()};
-      by_backend[*selected].push_back(i);
+          PendingPlacement{selected, 0, std::chrono::steady_clock::time_point::max()};
+      active.push_back(i);
     }
   }
 
-  for (const auto& [backend_id, indices] : by_backend) {
-    auto* backend = backends_->Get(backend_id);
-    if (backend == nullptr) {
-      for (size_t index : indices) pending_keys_.erase(requests[index].key);
-      continue;
+  // Each round batches the requests targeting the same candidate. Only
+  // NO_SPACE advances to the next deterministic policy candidate; generic
+  // failures preserve their meaning and do not hide backend errors.
+  while (!active.empty()) {
+    std::map<uint32_t, std::vector<size_t>> by_backend;
+    for (size_t index : active) {
+      by_backend[put_orders[index][next_candidate[index]]].push_back(index);
     }
+    std::vector<size_t> retry;
 
-    std::vector<AllocateRequest> backend_requests;
-    backend_requests.reserve(indices.size());
-    for (size_t index : indices) {
-      backend_requests.push_back(AllocateRequest{requests[index].key, requests[index].size});
-    }
-
-    auto results = backend->BatchAllocate(backend_requests);
-    for (size_t i = 0; i < indices.size(); ++i) {
-      const size_t index = indices[i];
-      if (i >= results.size()) {
-        pending_keys_.erase(requests[index].key);
+    for (const auto& [backend_id, indices] : by_backend) {
+      auto* backend = backends_->Get(backend_id);
+      if (backend == nullptr) {
+        for (size_t index : indices) {
+          ++next_candidate[index];
+          if (next_candidate[index] < put_orders[index].size()) {
+            const uint32_t next_backend = put_orders[index][next_candidate[index]];
+            pending_keys_[requests[index].key] = PendingPlacement{
+                next_backend, 0, std::chrono::steady_clock::time_point::max()};
+            retry.push_back(index);
+          } else {
+            pending_keys_.erase(requests[index].key);
+          }
+        }
         continue;
       }
-      out[index].backend_id = backend_id;
-      out[index].allocation = std::move(results[i]);
-      switch (out[index].allocation.outcome) {
-        case AllocateOutcome::kSuccessAllocated: {
-          const uint64_t slot_id = out[index].allocation.slot_id;
-          const auto ttl_ms = out[index].allocation.pending_ttl_ms;
-          const auto expires_at =
-              ttl_ms == 0
-                  ? std::chrono::steady_clock::time_point::max()
-                  : std::chrono::steady_clock::now() + std::chrono::milliseconds(ttl_ms);
-          pending_keys_[requests[index].key] =
-              PendingPlacement{backend_id, slot_id, expires_at};
-          pending_slots_[{backend_id, slot_id}] = requests[index].key;
-          break;
+
+      std::vector<AllocateRequest> backend_requests;
+      backend_requests.reserve(indices.size());
+      for (size_t index : indices) {
+        backend_requests.push_back(AllocateRequest{requests[index].key, requests[index].size});
+      }
+
+      auto results = backend->BatchAllocate(backend_requests);
+      for (size_t i = 0; i < indices.size(); ++i) {
+        const size_t index = indices[i];
+        if (i >= results.size()) {
+          pending_keys_.erase(requests[index].key);
+          continue;
         }
-        case AllocateOutcome::kSuccessAlreadyExists:
-        placements_[requests[index].key] = backend_id;
-          pending_keys_.erase(requests[index].key);
-          break;
-        case AllocateOutcome::kFailed:
-        case AllocateOutcome::kFailedNoSpace:
-          pending_keys_.erase(requests[index].key);
-          break;
+        out[index].backend_id = backend_id;
+        out[index].allocation = std::move(results[i]);
+        switch (out[index].allocation.outcome) {
+          case AllocateOutcome::kSuccessAllocated: {
+            const uint64_t slot_id = out[index].allocation.slot_id;
+            const auto ttl_ms = out[index].allocation.pending_ttl_ms;
+            const auto expires_at =
+                ttl_ms == 0
+                    ? std::chrono::steady_clock::time_point::max()
+                    : std::chrono::steady_clock::now() + std::chrono::milliseconds(ttl_ms);
+            pending_keys_[requests[index].key] =
+                PendingPlacement{backend_id, slot_id, expires_at};
+            pending_slots_[{backend_id, slot_id}] = requests[index].key;
+            break;
+          }
+          case AllocateOutcome::kSuccessAlreadyExists:
+            placements_[requests[index].key] = backend_id;
+            pending_keys_.erase(requests[index].key);
+            break;
+          case AllocateOutcome::kFailed:
+            pending_keys_.erase(requests[index].key);
+            break;
+          case AllocateOutcome::kFailedNoSpace:
+            ++next_candidate[index];
+            if (next_candidate[index] < put_orders[index].size()) {
+              const uint32_t next_backend = put_orders[index][next_candidate[index]];
+              pending_keys_[requests[index].key] = PendingPlacement{
+                  next_backend, 0, std::chrono::steady_clock::time_point::max()};
+              retry.push_back(index);
+            } else {
+              pending_keys_.erase(requests[index].key);
+            }
+            break;
+        }
       }
     }
+    active = std::move(retry);
   }
   return out;
 }

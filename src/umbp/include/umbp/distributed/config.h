@@ -193,6 +193,11 @@ struct PeerSsdConfig {
   UMBPSsdConfig ssd;
 };
 
+enum class PoolPlacementPolicy {
+  SINGLE_BACKEND = 0,
+  WEIGHTED = 1,
+};
+
 // One named backend instance on a peer. Only the ownership block selected by
 // `tier` is read. Page size remains peer-global because the RPC wire carries a
 // single page_size for batches that may span instances.
@@ -203,6 +208,10 @@ struct BackendInstanceConfig {
   HbmOwnershipConfig hbm;
   PeerSsdConfig ssd;
   int ssd_staging_buffer_slots = 16;
+  // Relative admission share within this tier when WEIGHTED placement is
+  // enabled. Must be positive; legacy and SINGLE_BACKEND paths ignore it.
+  // Appended to preserve existing positional aggregate initializers.
+  uint32_t placement_weight = 1;
 };
 
 struct PoolClientConfig {
@@ -257,6 +266,11 @@ struct PoolClientConfig {
     c.worker_threads = 1;
     return c;
   }();
+
+  // Compatibility is the default. WEIGHTED distributes new keys among all
+  // configured same-tier instances according to placement_weight. Appended to
+  // preserve existing positional aggregate initializers.
+  PoolPlacementPolicy placement_policy = PoolPlacementPolicy::SINGLE_BACKEND;
 };
 
 // Lower a user-facing UMBPDistributedConfig to the internal PoolClientConfig.

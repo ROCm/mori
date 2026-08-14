@@ -234,6 +234,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
         TierCapacity c;
         c.total_bytes = tc.total_capacity_bytes();
         c.available_bytes = tc.available_capacity_bytes();
+        c.max_allocatable_bytes = tc.max_allocatable_bytes();
         caps[static_cast<TierType>(tc.tier())] = c;
       }
 
@@ -265,6 +266,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
           static_cast<uint64_t>(config_.heartbeat_ttl.count() * 1000) / HeartbeatIntervalDivisor();
       response->set_heartbeat_interval_ms(interval_ms);
       response->set_ack_seq(0);
+      response->set_supports_max_allocatable_bytes(true);
       return grpc::Status::OK;
     });
   }
@@ -289,6 +291,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
         TierCapacity c;
         c.total_bytes = tc.total_capacity_bytes();
         c.available_bytes = tc.available_capacity_bytes();
+        c.max_allocatable_bytes = tc.max_allocatable_bytes();
         caps[static_cast<TierType>(tc.tier())] = c;
       }
 

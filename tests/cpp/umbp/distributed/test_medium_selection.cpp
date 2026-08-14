@@ -82,6 +82,7 @@ UMBPDistributedConfig MinimalDistributedConfig() {
 TEST(MediumLoweringTest, DefaultsToDram) {
   auto pc = ToPoolClientConfig(MinimalDistributedConfig(), DramOwnershipConfig{}, PeerSsdConfig{});
   EXPECT_EQ(pc.medium, TierType::DRAM);
+  EXPECT_EQ(pc.placement_policy, PoolPlacementPolicy::SINGLE_BACKEND);
   EXPECT_TRUE(pc.backends.empty())
       << "legacy lowering must defer backend synthesis until PoolClient::Init";
   // The SSD tier stays shut unless the selector names it, whatever the SSD

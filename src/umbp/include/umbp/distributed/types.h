@@ -56,6 +56,9 @@ inline constexpr uint32_t kMaxBackendsPerPeer = 8;
 struct TierCapacity {
   uint64_t total_bytes = 0;
   uint64_t available_bytes = 0;
+  // Largest single value the tier can currently admit. Zero means
+  // available_bytes for backward-compatible single-backend reports.
+  uint64_t max_allocatable_bytes = 0;
 };
 
 struct ExternalKvHitCountEntry {

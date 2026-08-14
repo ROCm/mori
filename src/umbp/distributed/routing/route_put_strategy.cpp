@@ -50,6 +50,11 @@ struct PlacementSlot {
   uint64_t available;
 };
 
+uint64_t AllocatableBytes(const TierCapacity& capacity) {
+  if (capacity.max_allocatable_bytes == 0) return capacity.available_bytes;
+  return std::min(capacity.available_bytes, capacity.max_allocatable_bytes);
+}
+
 std::string JoinStrings(const std::vector<std::string>& items) {
   if (items.empty()) return "";
   std::ostringstream oss;
@@ -102,7 +107,7 @@ std::vector<PlacementSlot> CollectEligibleSlots(
     const auto& client = candidates[i];
     if (exclude_nodes.count(client.node_id)) continue;
     for (const auto& [tier, cap] : client.tier_capacities) {
-      if (cap.available_bytes < block_size) continue;
+      if (AllocatableBytes(cap) < block_size) continue;
       slots.push_back({i, tier, cap.available_bytes});
     }
   }
@@ -209,7 +214,7 @@ std::optional<RoutePutResult> ConfigurableRoutePutStrategy::TrySelectOnNodeTier(
                          [&](const ClientRecord& c) { return c.node_id == node_id; });
   if (it == candidates.end()) return std::nullopt;
   auto cap = it->tier_capacities.find(tier);
-  if (cap == it->tier_capacities.end() || cap->second.available_bytes < block_size) {
+  if (cap == it->tier_capacities.end() || AllocatableBytes(cap->second) < block_size) {
     return std::nullopt;
   }
   return MakeRouted(*it, tier);
@@ -228,7 +233,7 @@ std::optional<RoutePutResult> ConfigurableRoutePutStrategy::TrySelectOnNode(
   const TierCapacity* best = nullptr;
   TierType best_tier = TierType::UNKNOWN;
   for (const auto& [tier, cap] : it->tier_capacities) {
-    if (cap.available_bytes < block_size) continue;
+    if (AllocatableBytes(cap) < block_size) continue;
     if (best == nullptr || cap.available_bytes > best->available_bytes) {
       best = &cap;
       best_tier = tier;

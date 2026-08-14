@@ -254,17 +254,17 @@ std::vector<BackendInstanceConfig> EffectiveBackendConfigs(const PoolClientConfi
 
   BackendInstanceConfig legacy;
   legacy.name = DefaultBackendInstanceName(config.medium);
-  legacy.type = config.medium;
+  legacy.tier = config.medium;
   legacy.dram = config.dram;
   legacy.hbm = config.hbm;
   legacy.ssd = config.ssd;
+  legacy.ssd_staging_buffer_slots = config.ssd_staging_buffer_slots;
   return {std::move(legacy)};
 }
 
 std::unique_ptr<MediumBackend> MakeConfiguredBackend(const BackendInstanceConfig& config,
-                                                     uint64_t page_size,
-                                                     int ssd_staging_buffer_slots) {
-  switch (config.type) {
+                                                     uint64_t page_size) {
+  switch (config.tier) {
     case TierType::DRAM: {
       PageBackend::OwnershipConfig ownership;
       ownership.buffer_sizes = config.dram.buffer_sizes;
@@ -283,8 +283,9 @@ std::unique_ptr<MediumBackend> MakeConfiguredBackend(const BackendInstanceConfig
     case TierType::SSD: {
       SsdBackend::Config ssd_cfg;
       ssd_cfg.page_size = page_size;
-      ssd_cfg.staging_pages =
-          ssd_staging_buffer_slots > 0 ? static_cast<uint32_t>(ssd_staging_buffer_slots) : 16;
+      ssd_cfg.staging_pages = config.ssd_staging_buffer_slots > 0
+                                  ? static_cast<uint32_t>(config.ssd_staging_buffer_slots)
+                                  : 16;
       ssd_cfg.ssd = config.ssd;
       ssd_cfg.ssd.enabled = true;
       ssd_cfg.read_lease_ttl = DramReadLeaseTtl();
@@ -292,6 +293,28 @@ std::unique_ptr<MediumBackend> MakeConfiguredBackend(const BackendInstanceConfig
     }
     case TierType::UNKNOWN:
       return nullptr;
+  }
+  return nullptr;
+}
+
+std::unique_ptr<PoolPolicy> MakeConfiguredPoolPolicy(
+    const PoolClientConfig& config, const std::vector<BackendInstanceConfig>& backends) {
+  switch (config.placement_policy) {
+    case PoolPlacementPolicy::SINGLE_BACKEND:
+      return MakeSingleBackendPolicy();
+    case PoolPlacementPolicy::WEIGHTED: {
+      std::vector<BackendPlacementWeight> weights;
+      weights.reserve(backends.size());
+      for (const auto& backend : backends) {
+        if (backend.placement_weight == 0) {
+          MORI_UMBP_ERROR("[PoolClient] weighted backend '{}' has zero placement weight",
+                          backend.name);
+          return nullptr;
+        }
+        weights.push_back(BackendPlacementWeight{backend.name, backend.placement_weight});
+      }
+      return MakeWeightedPlacementPolicy(std::move(weights));
+    }
   }
   return nullptr;
 }
@@ -346,8 +369,7 @@ bool PoolClient::Init() {
   // synthesized into one entry here; topology-aware callers may
   // supply several named instances, including several of the same TierType.
   // This composition root remains the only place concrete backend factories
-  // are named.  Placement across the instances is deliberately not decided
-  // here — a later PoolPolicy layer owns that behavior.
+  // are named. The configured PoolPolicy below owns placement among them.
   const uint64_t page_size =
       config_.dram_page_size > 0 ? config_.dram_page_size : 2ULL * 1024 * 1024;
 
@@ -357,7 +379,7 @@ bool PoolClient::Init() {
     Shutdown();
     return false;
   }
-  medium_ = backend_configs.front().type;  // legacy default until PoolPolicy selects an instance
+  medium_ = backend_configs.front().tier;  // legacy default for paths without a routed tier
   for (const auto& backend_config : backend_configs) {
     if (backend_config.name.empty() || registry_.Get(backend_config.name) != nullptr) {
       MORI_UMBP_ERROR("[PoolClient] backend instance name '{}' is empty or duplicated",
@@ -365,11 +387,10 @@ bool PoolClient::Init() {
       Shutdown();
       return false;
     }
-    auto backend =
-        MakeConfiguredBackend(backend_config, page_size, config_.ssd_staging_buffer_slots);
+    auto backend = MakeConfiguredBackend(backend_config, page_size);
     if (backend == nullptr) {
       MORI_UMBP_ERROR("[PoolClient] backend '{}' has unknown medium {}",
-                      backend_config.name, static_cast<int>(backend_config.type));
+                      backend_config.name, static_cast<int>(backend_config.tier));
       Shutdown();
       return false;
     }
@@ -378,7 +399,7 @@ bool PoolClient::Init() {
     // move bytes, and that is a compile-time fact (design doc §5 Rule C).
     if (!backend->Init(static_cast<MemoryRegistrar*>(transfer_engine_.get()))) {
       MORI_UMBP_ERROR("[PoolClient] backend '{}' ({}) Init failed", backend_config.name,
-                      TierTypeName(backend_config.type));
+                      TierTypeName(backend_config.tier));
       backend->Shutdown();
       Shutdown();
       return false;
@@ -389,7 +410,16 @@ bool PoolClient::Init() {
     }
   }
 
-  default_pool_ = std::make_unique<PeerPool>(&registry_, MakeSingleBackendPolicy());
+  auto placement_policy = MakeConfiguredPoolPolicy(config_, backend_configs);
+  if (placement_policy == nullptr) {
+    MORI_UMBP_ERROR("[PoolClient] invalid placement policy configuration");
+    Shutdown();
+    return false;
+  }
+  default_pool_ = std::make_unique<PeerPool>(&registry_, std::move(placement_policy));
+  const bool weighted_placement =
+      config_.placement_policy == PoolPlacementPolicy::WEIGHTED;
+  master_client_->SetAggregateBackendCapacities(weighted_placement);
   master_client_->SetBackendRegistry(&registry_);
 
   // Pack engine_desc for master registration.
@@ -414,24 +444,26 @@ bool PoolClient::Init() {
     peer_address = host + ":" + std::to_string(config_.peer_service_port);
   }
 
-  // Master register. Master holds membership + a capacity snapshot, not
-  // per-page state. Until PoolPolicy can select named instances, only the first
-  // instance of each tier contributes routable capacity. A zero-capacity
-  // default is omitted rather than advertised as a target it cannot accept.
+  // Register conservatively with one instance per tier. Once the Master
+  // confirms max_allocatable_bytes support, weighted heartbeats advertise the
+  // full aggregate without making rolling upgrades over-admit large values.
   std::map<TierType, TierCapacity> tier_caps;
   for (auto* backend : registry_.All()) {
-    // The legacy router can address only a TierType, which resolves to the
-    // first instance of that tier. Do not advertise capacity that it cannot
-    // select yet; PoolPolicy will replace this projection in the next layer.
     if (registry_.Get(backend->Tier()) != backend) continue;
     auto cap = backend->Capacity();
-    if (cap.total_bytes > 0) tier_caps[backend->Tier()] = cap;
+    if (cap.total_bytes == 0) continue;
+    tier_caps[backend->Tier()] = cap;
   }
   auto status = master_client_->RegisterSelf(tier_caps, peer_address, engine_desc_bytes);
   if (!status.ok()) {
     MORI_UMBP_ERROR("[PoolClient] RegisterSelf failed: {}", status.error_message());
     Shutdown();
     return false;
+  }
+  if (weighted_placement && !master_client_->SupportsMaxAllocatableCapacity()) {
+    MORI_UMBP_WARN(
+        "[PoolClient] Master lacks max_allocatable_bytes support; weighted placement remains "
+        "enabled but capacity advertisement is limited to the first instance per tier");
   }
 
   if (config_.master_config.auto_heartbeat) master_client_->StartHeartbeat();

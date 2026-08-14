@@ -22,6 +22,18 @@ PoolPlacementRequest PutRequest(std::string key, std::string backend_name = {}) 
   return request;
 }
 
+class NoSpaceBackend final : public MockBackend {
+ public:
+  explicit NoSpaceBackend(TierType tier) : MockBackend(tier) {}
+
+  std::vector<AllocateResult> BatchAllocate(
+      const std::vector<AllocateRequest>& entries) override {
+    std::vector<AllocateResult> results(entries.size());
+    for (auto& result : results) result.outcome = AllocateOutcome::kFailedNoSpace;
+    return results;
+  }
+};
+
 TEST(PeerPool, DefaultPolicyPreservesTierOnlySelection) {
   BackendRegistry registry;
   ASSERT_TRUE(
@@ -207,6 +219,112 @@ TEST(PeerPool, StalePlacementDoesNotSuppressNewAllocation) {
   auto replacement = pool.BatchAllocate({PutRequest("stale", "dram_b")}).front();
   EXPECT_EQ(replacement.allocation.outcome, AllocateOutcome::kSuccessAllocated);
   EXPECT_EQ(replacement.backend_id, registry.BackendId(registry.Get("dram_b")));
+}
+
+TEST(WeightedPlacementPolicy, DistributesDeterministicallyWithinRequestedTier) {
+  BackendRegistry registry;
+  ASSERT_TRUE(
+      registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(
+      registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(
+      registry.Register("ssd_a", std::make_unique<MockBackend>(TierType::SSD)));
+  auto policy = MakeWeightedPlacementPolicy(
+      {{"dram_a", 3}, {"dram_b", 7}, {"ssd_a", 100}});
+
+  const uint32_t dram_a = registry.BackendId(registry.Get("dram_a"));
+  const uint32_t dram_b = registry.BackendId(registry.Get("dram_b"));
+  size_t on_a = 0;
+  size_t on_b = 0;
+  for (size_t i = 0; i < 10000; ++i) {
+    auto request = PutRequest("weighted-" + std::to_string(i * 2654435761ULL));
+    auto selected = policy->SelectPutBackend(registry, request);
+    ASSERT_TRUE(selected.has_value());
+    if (*selected == dram_a) ++on_a;
+    if (*selected == dram_b) ++on_b;
+  }
+
+  EXPECT_EQ(on_a + on_b, 10000u);
+  EXPECT_NEAR(static_cast<double>(on_a) / 10000.0, 0.3, 0.03);
+
+  auto repeated = PutRequest("stable-key");
+  auto first = policy->SelectPutBackend(registry, repeated);
+  for (int i = 0; i < 10; ++i) {
+    EXPECT_EQ(policy->SelectPutBackend(registry, repeated), first);
+  }
+}
+
+TEST(WeightedPlacementPolicy, ExplicitBackendNameOverridesWeightedSelection) {
+  BackendRegistry registry;
+  ASSERT_TRUE(
+      registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(
+      registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
+  auto policy = MakeWeightedPlacementPolicy({{"dram_a", 1}, {"dram_b", 100}});
+
+  auto selected =
+      policy->SelectPutBackend(registry, PutRequest("forced", "dram_a"));
+  ASSERT_TRUE(selected.has_value());
+  EXPECT_EQ(*selected, registry.BackendId(registry.Get("dram_a")));
+}
+
+TEST(PeerPool, WeightedPolicyPlacesNewKeysOnMultipleBackends) {
+  BackendRegistry registry;
+  ASSERT_TRUE(
+      registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(
+      registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
+  PeerPool pool(
+      &registry, MakeWeightedPlacementPolicy({{"dram_a", 1}, {"dram_b", 1}}));
+
+  std::vector<PoolPlacementRequest> requests;
+  for (size_t i = 0; i < 128; ++i) {
+    requests.push_back(PutRequest("pool-weighted-" + std::to_string(i)));
+  }
+  auto results = pool.BatchAllocate(requests);
+
+  const uint32_t dram_a = registry.BackendId(registry.Get("dram_a"));
+  const uint32_t dram_b = registry.BackendId(registry.Get("dram_b"));
+  size_t on_a = 0;
+  size_t on_b = 0;
+  std::vector<PoolSlotRef> slots;
+  for (const auto& result : results) {
+    ASSERT_EQ(result.allocation.outcome, AllocateOutcome::kSuccessAllocated);
+    if (result.backend_id == dram_a) ++on_a;
+    if (result.backend_id == dram_b) ++on_b;
+    slots.push_back(PoolSlotRef{result.backend_id, result.allocation.slot_id});
+  }
+  EXPECT_GT(on_a, 0u);
+  EXPECT_GT(on_b, 0u);
+  pool.BatchAbort(slots);
+}
+
+TEST(PeerPool, WeightedPolicyFallsBackWhenPrimaryHasNoSpace) {
+  BackendRegistry registry;
+  ASSERT_TRUE(
+      registry.Register("dram_a", std::make_unique<NoSpaceBackend>(TierType::DRAM)));
+  ASSERT_TRUE(
+      registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
+  auto policy = MakeWeightedPlacementPolicy({{"dram_a", 1}, {"dram_b", 1}});
+
+  PoolPlacementRequest request;
+  bool found_primary = false;
+  for (size_t i = 0; i < 100; ++i) {
+    request = PutRequest("fallback-" + std::to_string(i));
+    auto order = policy->PutOrder(registry, request);
+    if (!order.empty() && order.front() == registry.BackendId(registry.Get("dram_a"))) {
+      found_primary = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(found_primary);
+  ASSERT_EQ(policy->PutOrder(registry, request).front(),
+            registry.BackendId(registry.Get("dram_a")));
+
+  PeerPool pool(&registry, std::move(policy));
+  auto result = pool.BatchAllocate({request}).front();
+  EXPECT_EQ(result.allocation.outcome, AllocateOutcome::kSuccessAllocated);
+  EXPECT_EQ(result.backend_id, registry.BackendId(registry.Get("dram_b")));
 }
 
 }  // namespace

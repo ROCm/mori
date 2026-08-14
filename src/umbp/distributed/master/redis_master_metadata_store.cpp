@@ -82,7 +82,8 @@ std::chrono::system_clock::time_point FromEpochMs(int64_t ms) {
   return std::chrono::system_clock::time_point(std::chrono::milliseconds(ms));
 }
 
-// caps: "tier:total:avail;tier:total:avail;..."
+// caps: "tier:total:avail:max_alloc;tier:total:avail:max_alloc;..."
+// Decode also accepts the legacy three-field form.
 std::string EncodeCaps(const std::map<TierType, TierCapacity>& caps) {
   std::string out;
   for (const auto& [tier, cap] : caps) {
@@ -91,6 +92,8 @@ std::string EncodeCaps(const std::map<TierType, TierCapacity>& caps) {
     out += std::to_string(cap.total_bytes);
     out += ':';
     out += std::to_string(cap.available_bytes);
+    out += ':';
+    out += std::to_string(cap.max_allocatable_bytes);
     out += ';';
   }
   return out;
@@ -107,12 +110,16 @@ std::map<TierType, TierCapacity> DecodeCaps(const std::string& blob) {
     if (tok.empty()) continue;
     const size_t c1 = tok.find(':');
     const size_t c2 = (c1 == std::string::npos) ? std::string::npos : tok.find(':', c1 + 1);
+    const size_t c3 = (c2 == std::string::npos) ? std::string::npos : tok.find(':', c2 + 1);
     if (c1 == std::string::npos || c2 == std::string::npos) continue;
     try {
       const int tier = std::stoi(tok.substr(0, c1));
       const uint64_t total = std::stoull(tok.substr(c1 + 1, c2 - c1 - 1));
-      const uint64_t avail = std::stoull(tok.substr(c2 + 1));
-      caps[static_cast<TierType>(tier)] = TierCapacity{total, avail};
+      const uint64_t avail =
+          std::stoull(tok.substr(c2 + 1, c3 == std::string::npos ? c3 : c3 - c2 - 1));
+      const uint64_t max_alloc =
+          c3 == std::string::npos ? 0 : std::stoull(tok.substr(c3 + 1));
+      caps[static_cast<TierType>(tier)] = TierCapacity{total, avail, max_alloc};
     } catch (const std::exception&) {
       // best-effort decode; skip malformed token
     }

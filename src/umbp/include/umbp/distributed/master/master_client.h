@@ -129,6 +129,18 @@ class MasterClient {
   // tick.
   void SetBackendRegistry(BackendRegistry* registry);
 
+  // Weighted placement makes every same-tier instance reachable through one
+  // tier route, so capacity heartbeats may aggregate them. Must be configured
+  // before StartHeartbeat().
+  void SetAggregateBackendCapacities(bool enabled) {
+    aggregate_backend_capacities_requested_ = enabled;
+    aggregate_backend_capacities_ =
+        enabled && supports_max_allocatable_capacity_;
+  }
+  bool SupportsMaxAllocatableCapacity() const {
+    return supports_max_allocatable_capacity_;
+  }
+
   void StartHeartbeat();
   void StopHeartbeat();
   // Wake the heartbeat thread immediately to drain pending KV events.
@@ -223,6 +235,14 @@ class MasterClient {
   // gate.  Non-owning; lifetime is managed by PoolClient.  Bound before
   // StartHeartbeat(); read-only afterwards (no lock needed).
   BackendRegistry* registry_ = nullptr;
+  bool aggregate_backend_capacities_requested_ = false;
+  bool aggregate_backend_capacities_ = false;
+  bool supports_max_allocatable_capacity_ = false;
+  // Initial conservative registration payload, retained so an UNKNOWN response
+  // can rebuild the full peer record after Master state loss.
+  std::map<TierType, TierCapacity> registration_capacities_;
+  std::string registered_peer_address_;
+  std::vector<uint8_t> registered_engine_desc_bytes_;
 
   // Serializes the actual Heartbeat RPC: at most one full-sync or
   // delta heartbeat is on the wire at a time. ClearFullSync() takes

@@ -143,6 +143,27 @@ TEST(MostAvailableNoneTest, ReturnsNulloptWhenBlockTooLarge) {
   EXPECT_FALSE(result.has_value());
 }
 
+TEST(MostAvailableNoneTest, RejectsValueLargerThanAnyBackendInAggregatedTier) {
+  ConfigurableRoutePutStrategy strategy(Algo::kMostAvailable, Affinity::kNone);
+  std::vector<ClientRecord> clients = {
+      MakeClient("node-a", "addr-a",
+                 {{TierType::DRAM, TierCapacity{20 * GB, 20 * GB, 10 * GB}}}),
+  };
+
+  EXPECT_FALSE(SelectOne(strategy, clients, 11 * GB, /*exclude=*/{}).has_value());
+  EXPECT_TRUE(SelectOne(strategy, clients, 10 * GB, /*exclude=*/{}).has_value());
+}
+
+TEST(MostAvailableNoneTest, ZeroMaxAllocatablePreservesLegacyCapacitySemantics) {
+  ConfigurableRoutePutStrategy strategy(Algo::kMostAvailable, Affinity::kNone);
+  std::vector<ClientRecord> clients = {
+      MakeClient("node-a", "addr-a",
+                 {{TierType::DRAM, TierCapacity{20 * GB, 20 * GB}}}),
+  };
+
+  EXPECT_TRUE(SelectOne(strategy, clients, 15 * GB, /*exclude=*/{}).has_value());
+}
+
 TEST(MostAvailableNoneTest, PicksMostAvailableOnSameTier) {
   ConfigurableRoutePutStrategy strategy(Algo::kMostAvailable, Affinity::kNone);
 

@@ -23,10 +23,12 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdlib>
 #include <iterator>
+#include <limits>
 #include <set>
 #include <system_error>
 
@@ -64,6 +66,12 @@ uint64_t MetricsReportIntervalMs() {
 ::umbp::TierType ToProtoTier(TierType t) { return static_cast<::umbp::TierType>(t); }
 TierType FromProtoTier(::umbp::TierType t) { return static_cast<TierType>(t); }
 
+uint64_t SaturatingAdd(uint64_t lhs, uint64_t rhs) {
+  return rhs > std::numeric_limits<uint64_t>::max() - lhs
+             ? std::numeric_limits<uint64_t>::max()
+             : lhs + rhs;
+}
+
 ::umbp::KvEvent::Kind ToProtoEventKind(KvEvent::Kind kind) {
   switch (kind) {
     case KvEvent::Kind::ADD:
@@ -81,6 +89,7 @@ void FillTierCapacities(::google::protobuf::RepeatedPtrField<::umbp::TierCapacit
     tc->set_tier(ToProtoTier(tier));
     tc->set_total_capacity_bytes(cap.total_bytes);
     tc->set_available_capacity_bytes(cap.available_bytes);
+    tc->set_max_allocatable_bytes(cap.max_allocatable_bytes);
   }
 }
 
@@ -158,6 +167,9 @@ grpc::Status MasterClient::RegisterSelf(const std::map<TierType, TierCapacity>& 
   }
 
   if (resp.heartbeat_interval_ms() > 0) heartbeat_interval_ms_ = resp.heartbeat_interval_ms();
+  supports_max_allocatable_capacity_ = resp.supports_max_allocatable_bytes();
+  aggregate_backend_capacities_ =
+      aggregate_backend_capacities_requested_ && supports_max_allocatable_capacity_;
   {
     std::lock_guard lock(hb_state_mutex_);
     hb_last_acked_seq_ = 0;
@@ -169,6 +181,9 @@ grpc::Status MasterClient::RegisterSelf(const std::map<TierType, TierCapacity>& 
     std::lock_guard lock(caps_mutex_);
     current_capacities_ = tier_capacities;
   }
+  registration_capacities_ = tier_capacities;
+  registered_peer_address_ = peer_address;
+  registered_engine_desc_bytes_ = engine_desc_bytes;
   registered_ = true;
   MORI_UMBP_INFO("[Client] Registered with master (heartbeat={}ms)", heartbeat_interval_ms_);
   StartMetricsReporting();
@@ -512,11 +527,20 @@ std::map<TierType, TierCapacity> MasterClient::SnapshotAndCacheTierCapacities() 
   std::map<TierType, TierCapacity> caps;
   bool have_live = false;
   for (auto* backend : Backends()) {
-    // Until placement policy can name an instance, advertise only the first
-    // backend for each tier (registry id order) rather than summing capacity
-    // the router cannot independently address.
-    if (caps.find(backend->Tier()) == caps.end()) {
-      caps[backend->Tier()] = backend->Capacity();
+    auto backend_cap = backend->Capacity();
+    if (aggregate_backend_capacities_) {
+      backend_cap.max_allocatable_bytes =
+          backend_cap.max_allocatable_bytes == 0
+              ? backend_cap.available_bytes
+              : std::min(backend_cap.max_allocatable_bytes, backend_cap.available_bytes);
+    }
+    auto [it, inserted] = caps.try_emplace(backend->Tier(), backend_cap);
+    if (!inserted && aggregate_backend_capacities_) {
+      it->second.total_bytes = SaturatingAdd(it->second.total_bytes, backend_cap.total_bytes);
+      it->second.available_bytes =
+          SaturatingAdd(it->second.available_bytes, backend_cap.available_bytes);
+      it->second.max_allocatable_bytes =
+          std::max(it->second.max_allocatable_bytes, backend_cap.max_allocatable_bytes);
     }
     have_live = true;
   }
@@ -615,7 +639,21 @@ bool MasterClient::SendDeltaHeartbeatLocked(const std::map<TierType, TierCapacit
     ::umbp::RegisterClientRequest re_req;
     re_req.set_node_id(config_.node_id);
     re_req.set_node_address(config_.node_address);
-    FillTierCapacities(re_req.mutable_tier_capacities(), caps);
+    re_req.set_peer_address(registered_peer_address_);
+    re_req.set_engine_desc(registered_engine_desc_bytes_.data(),
+                           registered_engine_desc_bytes_.size());
+    // Re-register conservatively until the replacement Master confirms support
+    // for aggregate-tier single-allocation limits.
+    const auto live_backends = Backends();
+    std::map<TierType, TierCapacity> conservative_caps;
+    if (live_backends.empty()) {
+      conservative_caps = registration_capacities_;
+    } else {
+      for (auto* backend : live_backends) {
+        conservative_caps.try_emplace(backend->Tier(), backend->Capacity());
+      }
+    }
+    FillTierCapacities(re_req.mutable_tier_capacities(), conservative_caps);
     for (const auto& tag : config_.tags) re_req.add_tags(tag);
     ::umbp::RegisterClientResponse re_resp;
     grpc::ClientContext re_ctx;
@@ -626,6 +664,10 @@ bool MasterClient::SendDeltaHeartbeatLocked(const std::map<TierType, TierCapacit
       _rpc_timer.SetStatus(re_status);
     }
     if (re_status.ok() || re_status.error_code() == grpc::StatusCode::ALREADY_EXISTS) {
+      supports_max_allocatable_capacity_ =
+          re_status.ok() && re_resp.supports_max_allocatable_bytes();
+      aggregate_backend_capacities_ =
+          aggregate_backend_capacities_requested_ && supports_max_allocatable_capacity_;
       registered_ = true;
       std::lock_guard state_lock(hb_state_mutex_);
       hb_last_acked_seq_ = 0;
