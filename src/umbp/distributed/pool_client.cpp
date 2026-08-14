@@ -42,6 +42,7 @@
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/env_time.h"
+#include "umbp/common/parallel_for.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/peer/backend/hbm_backend.h"
 #include "umbp/distributed/peer/backend/page_backend.h"
@@ -134,25 +135,6 @@ inline int LocalCopyThreads(const char* env_name) {
   if (hc > 0 && t > static_cast<int>(hc)) t = static_cast<int>(hc);
   if (t < 1) t = 1;
   return t;
-}
-
-template <typename Fn>
-inline void LocalParallelFor(size_t n, int num_threads, Fn&& fn) {
-  if (n == 0) return;
-  if (num_threads > static_cast<int>(n)) num_threads = static_cast<int>(n);
-  if (num_threads <= 1) {
-    for (size_t i = 0; i < n; ++i) fn(i);
-    return;
-  }
-  std::atomic<size_t> next{0};
-  auto worker = [&]() {
-    size_t i;
-    while ((i = next.fetch_add(1)) < n) fn(i);
-  };
-  std::vector<std::thread> pool;
-  pool.reserve(num_threads);
-  for (int t = 0; t < num_threads; ++t) pool.emplace_back(worker);
-  for (auto& th : pool) th.join();
 }
 
 inline uint64_t LogicalPageBytes(size_t i, size_t num_pages, uint64_t page_size,
@@ -345,6 +327,8 @@ bool PoolClient::Init() {
       ssd_cfg.staging_pages = config_.ssd_staging_buffer_slots > 0
                                   ? static_cast<uint32_t>(config_.ssd_staging_buffer_slots)
                                   : 16;
+      ssd_cfg.staging_use_hugepages = config_.ssd_staging_use_hugepages;
+      ssd_cfg.staging_hugepage_size = config_.ssd_staging_hugepage_size;
       ssd_cfg.ssd = config_.ssd;
       ssd_cfg.ssd.enabled = true;  // selecting SSD IS the opt-in
       ssd_cfg.read_lease_ttl = DramReadLeaseTtl();
@@ -374,6 +358,12 @@ bool PoolClient::Init() {
   }
 
   master_client_->SetBackendRegistry(&registry_);
+
+  // Medium-specific counters (SSD read outcomes, single-flight coalescing,
+  // eviction, staging pressure) ride the existing metrics tick.  Backend-
+  // agnostic by construction: PoolClient forwards whatever each backend names
+  // and never learns which medium produced it.
+  master_client_->AddMetricsProvider([this] { PublishBackendCounters(); });
 
   // Pack engine_desc for master registration.
   std::vector<uint8_t> engine_desc_bytes;
@@ -894,7 +884,7 @@ void PoolClient::ExecuteBatchPutPlan(const BatchPutPlan& plan,
     if (local.empty()) return;
     const int nthr = LocalCopyThreads("UMBP_DRAM_WRITE_THREADS");
     const auto t0 = std::chrono::steady_clock::now();
-    LocalParallelFor(local.size(), nthr, [&](size_t k) {
+    ParallelFor(local.size(), nthr, [&](size_t k) {
       const auto& item = local[k];
       switch (ExecuteLocalPut(*item.key, item.src, item.size, item.route.tier)) {
         case PutAttemptOutcome::kSuccess:
@@ -1382,7 +1372,7 @@ void PoolClient::ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector
     const int nthr = LocalCopyThreads("UMBP_DRAM_READ_THREADS");
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<char> ok(idx.size(), 0);
-    LocalParallelFor(idx.size(), nthr, [&](size_t k) {
+    ParallelFor(idx.size(), nthr, [&](size_t k) {
       const size_t i = idx[k];
       if (ExecuteLocalGet(keys[i], const_cast<void*>(dsts[i]), sizes[i]) ==
           GetAttemptOutcome::kSuccess) {
@@ -1822,6 +1812,39 @@ bool PoolClient::EnsurePeerServiceConnection(PeerConnection& peer) {
   peer.peer_stub = std::unique_ptr<void, void (*)(void*)>(
       stub.release(), +[](void* p) { delete static_cast<::umbp::UMBPPeer::Stub*>(p); });
   return true;
+}
+
+void PoolClient::PublishBackendCounters() {
+  if (!master_client_) return;
+
+  for (MediumBackend* backend : registry_.All()) {
+    if (backend == nullptr) continue;
+    const char* backend_name = backend->Name();
+    for (auto& c : backend->Counters()) {
+      if (c.name == nullptr) continue;
+
+      // Identity = backend + metric + labels.  Two backends reporting the same
+      // metric name must not share a delta baseline, or one would cancel the
+      // other's progress out.
+      std::string id = backend_name;
+      id += '\0';
+      id += c.name;
+      for (const auto& [k, v] : c.labels) {
+        id += '\0';
+        id += k;
+        id += '=';
+        id += v;
+      }
+
+      uint64_t& last = backend_counter_last_[id];
+      // Monotonic by contract; a decrease means the backend was rebuilt, so
+      // rebase instead of shipping a negative delta.
+      if (c.value > last) {
+        master_client_->AddCounter(c.name, c.help, c.labels, static_cast<double>(c.value - last));
+      }
+      last = c.value;
+    }
+  }
 }
 
 }  // namespace mori::umbp

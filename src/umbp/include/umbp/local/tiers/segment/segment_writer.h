@@ -25,6 +25,7 @@
 #include <string>
 #include <vector>
 
+#include "umbp/common/aligned_buffer.h"
 #include "umbp/local/tiers/segment/segment_format.h"
 #include "umbp/local/tiers/segment/segment_index.h"
 #include "umbp/storage/io/storage_io_driver.h"
@@ -32,14 +33,22 @@
 namespace mori::umbp::segment {
 
 struct PreparedRecord {
-  std::vector<char> record;
+  // Aligned rather than std::vector<char>: with O_DIRECT the source buffer of a
+  // write must sit on a kRecordAlign boundary, which the default allocator does
+  // not guarantee.  Build() sizes it to RecordBytes(), already an alignment
+  // multiple, so the whole buffer can go to the device in one op.
+  AlignedBuffer record;
   WriteReservation reservation;
-  uint32_t crc32 = 0;  // set by Build, consumed by Reserve
+  uint32_t crc32 = 0;     // set by Build, consumed by Reserve
+  bool crc_valid = true;  // false when checksumming was skipped
 };
 
 class Writer {
  public:
-  explicit Writer(StorageIoDriver& io_driver) : io_driver_(io_driver) {}
+  // `compute_crc` false skips checksumming on this store's writes and stamps
+  // kFlagNoCrc, so readers know to skip verification for these records.
+  explicit Writer(StorageIoDriver& io_driver, bool compute_crc = true)
+      : io_driver_(io_driver), compute_crc_(compute_crc) {}
 
   // Phase 1a (NO lock held): checksum the record and assemble its on-disk bytes.
   // Pure CPU over caller-owned memory — it touches no Index or Meta state, so it
@@ -61,13 +70,19 @@ class Writer {
                Index& index, PreparedRecord* out) const;
 
   // Phase 2 (caller holds io_mu_ only): write the prepared record to disk.
-  IoStatus WriteRecord(int fd, const PreparedRecord& pr, bool should_sync) const;
+  // `sync_ms_out`, when non-null, receives the milliseconds spent in the
+  // durability flush alone, so a caller can bill the flush separately from the
+  // device write (see ssd_perf.h); it is left untouched when should_sync=false.
+  IoStatus WriteRecord(int fd, const PreparedRecord& pr, bool should_sync,
+                       double* sync_ms_out = nullptr) const;
 
   // Phase 2 batch variant: write multiple prepared records to disk.
-  IoStatus WriteRecords(int fd, const std::vector<PreparedRecord>& records, bool should_sync) const;
+  IoStatus WriteRecords(int fd, const std::vector<PreparedRecord>& records, bool should_sync,
+                        double* sync_ms_out = nullptr) const;
 
  private:
   StorageIoDriver& io_driver_;
+  bool compute_crc_ = true;
 };
 
 }  // namespace mori::umbp::segment

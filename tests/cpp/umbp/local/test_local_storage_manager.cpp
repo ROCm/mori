@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "umbp/local/tiers/local_storage_manager.h"
+#include "umbp/local/tiers/segment/segment_format.h"
 
 using namespace mori::umbp;
 
@@ -251,7 +252,11 @@ void test_ssd_full_evicts_with_index_sync() {
   config.dram.capacity_bytes = 1 * 1024 * 1024;
   config.ssd.enabled = true;
   config.ssd.storage_dir = "/tmp/umbp_test_ssd_idxsync";
-  config.ssd.capacity_bytes = 1024;  // tiny: 1 KB
+  // Room for exactly two records, so the third write forces an eviction.
+  // Expressed in on-disk record footprint rather than raw value bytes: the v3
+  // layout pads each record to a kRecordAlign boundary, and capacity is charged
+  // in those padded bytes.
+  config.ssd.capacity_bytes = 2 * mori::umbp::segment::RecordBytes(sizeof("ssd1") - 1, 512);
 
   mori::umbp::LocalBlockIndex index;
   LocalStorageManager mgr(config, &index);

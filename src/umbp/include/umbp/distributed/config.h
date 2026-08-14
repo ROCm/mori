@@ -211,6 +211,14 @@ struct PoolClientConfig {
   // must be >= the largest single-key page KV (61-layer MLA page ~= 4.5 MB).
   size_t ssd_staging_buffer_size = 268435456;  // 256 MiB
 
+  // Back the SSD staging arena with hugetlbfs pages.  Every byte the SSD
+  // backend moves crosses that arena twice (device <-> arena, arena <-> wire),
+  // so its TLB behaviour sits on the critical path in a way an ordinary
+  // buffer's does not.  Falls back to 4 KiB pages when no hugetlb pages are
+  // free — a node must still come up.
+  bool ssd_staging_use_hugepages = false;
+  size_t ssd_staging_hugepage_size = 2ULL * 1024 * 1024;  // 2 MiB
+
   // The one medium this node registers a backend for (design note in
   // common/config.h's UMBPMedium: UMBP routes across nodes, it does not tier
   // within one, so a second local backend would mirror rather than demote).
@@ -264,6 +272,8 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.staging_buffer_size = dc.staging_buffer_size;
   pc.ssd_staging_buffer_size = dc.ssd_staging_buffer_size;
   pc.ssd_staging_buffer_slots = dc.ssd_staging_buffer_slots;
+  pc.ssd_staging_use_hugepages = dc.ssd_staging_use_hugepages;
+  pc.ssd_staging_hugepage_size = dc.ssd_staging_hugepage_size;
   pc.peer_service_port = dc.peer_service_port;
   pc.cache_remote_fetches = dc.cache_remote_fetches;
   pc.cache_remote_admission = dc.cache_remote_admission;
