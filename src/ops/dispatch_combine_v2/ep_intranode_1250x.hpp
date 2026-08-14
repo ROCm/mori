@@ -254,9 +254,15 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
 
   // Tokens per warp iteration: WS/topk lets COUNT read tokenIndices with all lanes.
   const int _tpi = (topk > 0 && topk <= WS && (WS % topk) == 0) ? (WS / topk) : 1;
-  const int _sLane = (_tpi > 1) ? (laneId / topk) : 0;
-  const int _eLane = (_tpi > 1) ? (laneId - _sLane * topk) : laneId;
-  const bool _laneAct = (_tpi > 1) ? (_sLane < _tpi) : (laneId < topk);
+  // Cap the quota so a scarce batch covers the grid; see EpWarpTokenQuota. (v1 #562.)
+  // The quota arithmetic lives in ep_cfg.hpp so it can be tested without a gfx125x.
+  const int _etpi = EpWarpTokenQuota(args.numTokens, aWarps, _tpi);
+  // These follow _etpi, not _tpi: the lane grouping IS the token batching. Left on _tpi they
+  // would activate lanes for tokens the loops below never hand out, and those lanes would
+  // route tokens belonging to another warp.
+  const int _sLane = (_etpi > 1) ? (laneId / topk) : 0;
+  const int _eLane = (_etpi > 1) ? (laneId - _sLane * topk) : laneId;
+  const bool _laneAct = (_etpi > 1) ? (_sLane < _etpi) : (laneId < topk);
 
   extern __shared__ char _tdmBatchSmem[];
   T* _tdmTile = reinterpret_cast<T*>(_tdmBatchSmem) + (size_t)warpId * hiddenDim;
@@ -274,7 +280,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
 
   // ---- Phase 1: block-local count (LDS atomic histogram) ----
   if (args.tokenIndices && args.inpTokenBuf) {
-    for (int tokBase = aWarp * _tpi; tokBase < args.numTokens; tokBase += aWarps * _tpi) {
+    for (int tokBase = aWarp * _etpi; tokBase < args.numTokens; tokBase += aWarps * _etpi) {
       int tok = tokBase + _sLane;
       bool act = _laneAct && (tok < args.numTokens);
       index_t myExpert = act ? args.tokenIndices[(size_t)tok * topk + _eLane] : (index_t)-1;
@@ -323,7 +329,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     const int ngrp = WS / gsz;
     const int myGrp = laneId / gsz;
     const int myE = laneId - myGrp * gsz;
-    for (int tokBase = aWarp * _tpi; tokBase < args.numTokens; tokBase += aWarps * _tpi) {
+    for (int tokBase = aWarp * _etpi; tokBase < args.numTokens; tokBase += aWarps * _etpi) {
       int tok = tokBase + _sLane;
       bool act = _laneAct && (tok < args.numTokens);
       index_t myExpert = act ? args.tokenIndices[(size_t)tok * topk + _eLane] : (index_t)-1;
@@ -492,8 +498,8 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
 
   // ---- Phase 3b: payload copy, driven by dispDestTokIdMap (own-block). ----
   if (args.tokenIndices && args.inpTokenBuf) {
-    for (int tokBase = aWarp * _tpi; tokBase < args.numTokens; tokBase += aWarps * _tpi) {
-      for (int _sub = 0; _sub < _tpi; ++_sub) {
+    for (int tokBase = aWarp * _etpi; tokBase < args.numTokens; tokBase += aWarps * _etpi) {
+      for (int _sub = 0; _sub < _etpi; ++_sub) {
         int tok = tokBase + _sub;
         if (tok >= args.numTokens) break;
         index_t flatMe = (laneId < topk) ? args.dispDestTokIdMap[(size_t)tok * topk + laneId]

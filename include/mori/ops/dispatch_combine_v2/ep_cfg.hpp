@@ -305,6 +305,23 @@ constexpr int EpCombineSharedBytes(const EpCfg& c) {
 
 constexpr int EpTokenBytes(const EpCfg& c) { return c.hiddenDim * EpElemSize(c.dtype); }
 
+// Tokens a warp takes per iteration on the gfx125x dispatch path. `tpi` is the
+// natural quota (waveSize/topk, which lets COUNT read tokenIndices with every
+// lane); it only fills the grid once there are aWarps*tpi tokens to go round,
+// so below that the work piles onto the low warps and most blocks send nothing.
+// Capping at ceil(numTokens/aWarps) spreads a scarce batch over every warp.
+//
+// Here rather than inline in the kernel so the two properties that matter can be
+// tested on a host with no gfx125x: the result is never < 1 (a step of
+// `aWarps * 0` never advances -- an unkillable hang, and no correctness check
+// can report it because the check hangs too), and above the threshold it is
+// exactly `tpi`, so the large-token path is identical and not merely close.
+constexpr int EpWarpTokenQuota(int numTokens, int aWarps, int tpi) {
+  if (tpi <= 1 || aWarps <= 0) return tpi;
+  const int q = static_cast<int>((static_cast<long long>(numTokens) + aWarps - 1) / aWarps);
+  return (q >= 1 && q < tpi) ? q : tpi;
+}
+
 // gfx1250 launch LDS. Dispatch stages one token tile per warp through the TDM
 // engine; combine reserves the whole budget and sizes its tiles at runtime.
 // EpCombine1250xLdsBudget must match MORI_COMB_LDS_BUDGET in ep_intranode_1250x.hpp.

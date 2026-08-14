@@ -191,6 +191,44 @@ TEST(Geometry, ValidityRejectsWhatTheKernelCannotRun) {
   EXPECT_FALSE(EpCfgIsValid(c));
 }
 
+// The gfx125x dispatch quota. The kernel body needs a gfx125x toolchain to
+// compile at all, so this is the only place the arithmetic can be checked on an
+// ordinary box -- which is why it lives in ep_cfg.hpp rather than inline.
+TEST(WarpTokenQuota, NeverStallsTheLoop) {
+  // A quota of 0 makes the token loop step by `aWarps * 0` and never advance:
+  // an unkillable hang, and no correctness check can report it because the
+  // check hangs with it. Every degenerate input must still yield >= 1.
+  for (int n : {-1, 0, 1, 3}) {
+    for (int aWarps : {-1, 0, 1, 512}) {
+      for (int tpi : {1, 4, 8}) {
+        EXPECT_GE(EpWarpTokenQuota(n, aWarps, tpi), 1)
+            << "n=" << n << " aWarps=" << aWarps << " tpi=" << tpi;
+      }
+    }
+  }
+}
+
+TEST(WarpTokenQuota, IsInactiveOnceTheGridIsFull) {
+  // Above the threshold the large-token path must be IDENTICAL, not merely
+  // close: aWarps * tpi tokens is exactly where the natural quota fills the
+  // grid, and anything at or above it keeps tpi untouched.
+  const int aWarps = 512, tpi = 4;
+  EXPECT_EQ(EpWarpTokenQuota(aWarps * tpi, aWarps, tpi), tpi);
+  EXPECT_EQ(EpWarpTokenQuota(aWarps * tpi + 1, aWarps, tpi), tpi);
+  EXPECT_EQ(EpWarpTokenQuota(16384, aWarps, tpi), tpi);
+}
+
+TEST(WarpTokenQuota, SpreadsAScarceBatchOverEveryWarp) {
+  const int aWarps = 512, tpi = 4;
+  // 512 tokens over 512 warps: one each, instead of four to the first 128.
+  EXPECT_EQ(EpWarpTokenQuota(512, aWarps, tpi), 1);
+  EXPECT_EQ(EpWarpTokenQuota(64, aWarps, tpi), 1);
+  // ceil, not floor -- flooring would leave the tail tokens to no warp at all.
+  EXPECT_EQ(EpWarpTokenQuota(1025, aWarps, tpi), 3);
+  // tpi == 1 has nothing to cap.
+  EXPECT_EQ(EpWarpTokenQuota(64, aWarps, 1), 1);
+}
+
 TEST(Sha256, KnownVectors) {
   EXPECT_EQ(HexDigest(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
   EXPECT_EQ(HexDigest("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
