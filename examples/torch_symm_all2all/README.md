@@ -81,17 +81,21 @@ The two tables below are the HIP kernel; HIP vs Triton is further down.
 
 | ranks | MI355X / gfx950 | MI355X-class / gfx1250 | MI308X / gfx942 |
 |---|---|---|---|
-| 2 | 103.8 GB/s | 435.2 GB/s | 54.1 GB/s |
-| 4 | 517.8 GB/s | 1499.1 GB/s | 112.2 GB/s |
+| 2 | 103.8 GB/s | 514.6 GB/s | 54.1 GB/s |
+| 4 | 517.8 GB/s | 1705.1 GB/s | 112.2 GB/s |
 | 8 | 1858.5 GB/s | — | 184.8 GB/s |
 
 256 KiB per peer, where launch and barrier cost still shows:
 
 | ranks | gfx950 | gfx1250 | gfx942 |
 |---|---|---|---|
-| 2 | 67.7 GB/s | 75.8 GB/s | 40.3 GB/s |
-| 4 | 428.0 GB/s | 289.8 GB/s | 139.4 GB/s |
+| 2 | 67.7 GB/s | 92.9 GB/s | 40.3 GB/s |
+| 4 | 428.0 GB/s | 516.8 GB/s | 139.4 GB/s |
 | 8 | 1459.0 GB/s | — | 250.0 GB/s |
+
+The gfx1250 column is from an idle box. Earlier figures for it, taken while another tenant
+held all 4 GPUs, ran 12% low at 4 MiB and 44% low at 256 KiB — worth knowing before
+comparing anything measured here across machines.
 
 gfx1250 exports **fabric** handles; gfx950 and gfx942 fall back to POSIX fd, having no
 fabric support at `hipMemCreate`. The kernel sees the same window either way. The gfx1250
@@ -116,19 +120,24 @@ ptrs|flat|both` selects; both are correctness-checked.
 
 | | gfx950, 8 ranks, 4 MiB | gfx1250, 4 ranks, 4 MiB |
 |---|---|---|
-| peer pointer array | 1909.4 GB/s | 1702.9 GB/s |
-| `base + rank*stride` | 1912.0 GB/s | 1714.7 GB/s |
+| peer pointer array | 1909.4 GB/s | 1705.1 GB/s |
+| `base + rank*stride` | 1912.0 GB/s | 1730.3 GB/s |
 
 Re-measured after this example was reorganised, on a second 8×gfx950 box: 1814.5 (array)
 vs 1803.7 (flat) at 4 MiB, and 1639.9 vs 1623.2 at 256 KiB — same conclusion, with the
 array marginally ahead this time rather than behind.
 
-**There is no measurable performance difference.** The gap is under 1% here and under 4%
-at 256 KiB, and it does not consistently favour either form — the pointer load is issued
-once per block and amortised, while the flat form pays two extra 64-bit multiplies. So the
-pointer array, which is what this backend exposes, costs nothing; the flat form is worth
-pursuing for kernel ergonomics (two scalars, no device-side array to plumb or keep alive,
-destination computable at run time), not for speed.
+**The difference is at most a couple of percent, and it is not the same sign everywhere.**
+On gfx950 the two are within 0.2% and the array is ahead as often as behind. On an idle
+gfx1250 the flat form is consistently ahead, by a near-constant 0.3-0.6 us — 2% at 4 MiB
+and 3-7% at 256 KiB, across six runs and whether the modes run together or alone, so it is
+not warm-up ordering. Constant in absolute terms rather than proportional is what a
+per-block cost looks like: the array's extra dependent load sits on the critical path
+before the first store can issue, while the flat form's two 64-bit multiplies do not. So
+the pointer array, which is what this backend exposes, costs a fixed sliver of launch-to-
+first-store latency and nothing per byte; the flat form is worth pursuing mainly for kernel
+ergonomics (two scalars, no device-side array to plumb or keep alive, destination
+computable at run time).
 
 Every serious library builds the flat window underneath regardless: NCCL's
 `ncclGetLsaPointer` is `add4G(lsaFlatBase, peer*stride4G) + offset`, mori's own
@@ -149,15 +158,13 @@ than the summed bandwidth; the range is across three runs.
 | 4 MiB | 113.2-140.0 us (1861-1938 GB/s) | 114.7-137.3 us (1875-1983 GB/s) |
 | 256 KiB | 9.3-9.8 us (1497-1547 GB/s) | 9.4-10.3 us (1435-1538 GB/s) |
 
-4×gfx1250, torch 2.11 / Triton 3.8, **fabric** handles. This box's GPUs were busy with
-another tenant, so compare the columns to each other, not to the table above — and one
-4 MiB run got hit hard enough (65.3 / 156.4 us) to be dropped as contention:
+4×gfx1250, torch 2.11 / Triton 3.8, **fabric** handles, idle box, range over three runs:
 
 | chunk per peer | HIP, pointer array | Triton, pointer array |
 |---|---|---|
-| 4 MiB | 30.1-30.4 us (1666-1668 GB/s) | 32.2-33.5 us (1498-1556 GB/s) |
-| 1 MiB | 10.3 us (1240 GB/s) | 14.7 us (866 GB/s) |
-| 256 KiB | 6.0-6.5 us (508-527 GB/s) | 14.0-15.0 us (213-221 GB/s) |
+| 4 MiB | 29.6-30.5 us (1694-1705 GB/s) | 32.2-32.5 us (1515-1567 GB/s) |
+| 1 MiB | 10.0-10.1 us (1258-1260 GB/s) | 11.9-12.6 us (995-998 GB/s) |
+| 256 KiB | 5.9-6.2 us (517-531 GB/s) | 12.0-12.1 us (239-247 GB/s) |
 
 All three variants are correctness-checked on both machines, and the Triton kernel needs no
 change between them — wave64 gfx950 and wave32 gfx1250 both just work, and forcing 256
@@ -170,13 +177,15 @@ larger of the two for a long way up. Timing the launch call alone, 500 calls wit
 | | HIP, pybind | Triton |
 |---|---|---|
 | gfx950, torch 2.10 / Triton 3.7 | 2.90 us | 9.01 us |
-| gfx1250, torch 2.11 / Triton 3.8 | 2.44 us | 12.83 us |
+| gfx1250, torch 2.11 / Triton 3.8 | 2.44-3.03 us | 10.84-10.94 us |
 
-That predicts both tables. On gfx1250 the Triton row is pinned near 14 us at 256 KiB *and*
+That predicts both tables. On gfx1250 the Triton row is pinned near 12 us at 256 KiB *and*
 at 1 MiB despite 4x the data — it is not moving data, it is waiting on the launcher — and
-only at 4 MiB, where the kernel itself runs ~30 us, does it come within 10%. On gfx950 the
-9 us launcher sits just under the 9-10 us kernel, so the two are indistinguishable at every
-size measured, Triton ahead as often as behind.
+only at 4 MiB, where the kernel itself runs ~30 us, does it come within 10%. Adding a
+`torch.cuda.synchronize()` to the launch benchmark costs Triton 0.03 us and HIP 1.7-1.9 us:
+the device is already idle when the Triton loop ends, because the host cannot feed it fast
+enough to build a queue. On gfx950 the 9 us launcher sits just under the 9-10 us kernel, so
+the two are indistinguishable at every size measured, Triton ahead as often as behind.
 
 The kernels themselves are equivalent. Worth remembering before reading anything into a
 small-message Triton number on a symmetric-memory benchmark: it may be measuring
