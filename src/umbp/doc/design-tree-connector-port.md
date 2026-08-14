@@ -24,6 +24,11 @@ commit — see §12. This branch was at the same time rebased off `ee4a5861` ont
 `c12c68e8`, the backend-agnostic branch's current head, which added the
 pure-SSD/multi-drive work; see §12.1 for what that cost.
 
+**Round four.** Both branches moved again within hours of round three landing.
+Upstream `c0044f87` → `0a174274`, two test-quality commits; backend-agnostic
+`c12c68e8` → `9febaeaa`, one commit touching only `tests/python/umbp/
+umbp_bench.py`. See §14.
+
 **Method:** not a merge, and not a series of cherry-picks. The two branches
 rewrote almost disjoint halves of `src/umbp`, so most upstream files can be
 taken verbatim; the small shared set is hand-merged, and the files where the
@@ -600,3 +605,111 @@ above are not mistaken for a second finding.)
 Chasing the `test_gpu_put_get` flake belongs with the round-one verbatim import
 that introduced it, and wants a look at the DRAM tier's batched device path
 rather than at anything ranged.
+
+---
+
+## 14. Round four — both branches moved again
+
+Recorded because the cost is the interesting part: rounds one to three each
+needed real design work, and this one needed almost none. That is the port
+converging, not luck.
+
+### 14.1 Rebase `c12c68e8` → `9febaeaa`
+
+One commit, "Bench/umbp staging autosize (#564)", touching only
+`tests/python/umbp/umbp_bench.py` — a file no port commit has ever touched.
+Replaying the sixteen produced no conflict and `git range-diff` reports `=` for
+all sixteen: not merely resolvable, but byte-identical after the move.
+
+### 14.2 Upstream `ec72ec17` + `0a174274` — gather assertions state their precondition
+
+Taken as one commit here, because the second replaces a temporary CI step the
+first adds; landing them separately would add and remove the same block.
+
+The launch-counter assertions (§10.3) need the DRAM tier's host memory
+registered for GPU access. That registration is best-effort by design: where
+`hipHostRegister` does not take, `Covers()` stays false, the planner leaves the
+batch on the copy engine, and the counter never moves while every byte
+expectation still holds. Asserting it is asserting a machine capability — which
+is how three `DeviceGatherTest` cases and
+`PoolClientRangesTest.GpuRangesUseGatherKernel` came to fail upstream's MI355X
+runner on `0 vs 0` with nothing actually wrong.
+
+Both files now probe the registration once and gate only the counter checks on
+it. `test_dram_tier_gather.cpp` gains its own `main()` so a skip exits 77 and
+lands in the ctest summary rather than reading as a pass — gtest exits 0 on
+`GTEST_SKIP`, so without it ctest saw a pass wherever the path was unreachable.
+
+Both applied without conflict, including into this branch's *rebuilt*
+`test_pool_client_ranges.cpp` (§10.3): the probe sits beside `FreePort()` and
+the two guards land on the assertions our version kept from upstream's.
+
+**The check that mattered.** A commit whose entire content is "skip this
+assertion sometimes" is §1's "auto-merges cleanly but wrongly" hazard wearing
+its friendliest disguise: if the probe returned false here, the port would
+still build, the suite would still be green, and the gather coverage would be
+silently gone. Verified under `ctest -V` that it is not: all five
+`DeviceGatherTest` / `HostTierRegistrationTest` cases and all five
+`PoolClientRangesTest` cases report `[ OK ]` and not `SKIPPED`, on both the
+kernel and `kernel_off` variants. The registration takes on this host, so the
+launch counters are still enforced.
+
+### 14.3 Verification
+
+Same container and host as §13 (n06-21). Incremental build clean; the umbp test
+project **46 of 46, five consecutive runs**, with the port-flake work of §15
+already in. No new failures, and `umbp_local_client` — flaky on n09-29 (§13) —
+has still never reproduced here.
+
+---
+
+## 15. Test ports: guessed, raced, and fixed
+
+Not a port concern, but it surfaced running §13's suite on a loaded node and
+the fix landed on this branch, so it belongs in the record.
+
+`umbp_master_client_flush_heartbeat` failed once in 20 runs and passed in
+isolation. Its fixture guessed a port from `55500 + rand() % 1500`. These tests
+run in a `--network host` container sharing the host's port space with every
+other container on the machine, so the guess collides — and the collision
+surfaces as `ASSERT_NE(server_, nullptr)` with the real `EADDRINUSE` visible
+only in gRPC's log noise above it.
+
+The five affected tests did not have one problem, so they did not get one fix:
+
+| Test | Was | Now |
+|---|---|---|
+| `flush_heartbeat`, `batch_route_get_columnar`, `master_client_lifecycle` | guessed from a time-seeded range | `AddListeningPort(":0", &selected_port)` |
+| `umbp_tags` (E2E suite) | `AllocPort()` — bind :0, read, close | same, via the builder's out-param |
+| `umbp_tags`, `client_metrics` (MasterServer) | `AllocPort()` for the gRPC port | `listen_address ":0"` + `GetBoundPort()` |
+| `client_metrics` (IO engine) | `AllocPort()`, plus a retry-until-unique helper | `io_engine.port = 0` |
+| `umbp_tags`, `client_metrics` (metrics port) | `AllocPort()` — unavoidable | retry the server on a fresh port |
+
+The last row is the one that cannot be fixed by asking the OS.
+`MasterServerConfig::metrics_port` is a number, `0` already means "no metrics
+server", and nothing reports what it bound, so it must be chosen before
+`MasterServer::Run()` binds it. Losing that race is not a test failure but a
+`std::terminate` — `MetricsServer`'s constructor throws on the `Run()` thread:
+
+```
+terminate called after throwing an instance of 'std::runtime_error'
+  what():  [metrics] bind() on port 46077 failed: Address already in use
+```
+
+which is exactly how it presented: `umbp_tags` aborting in roughly one
+full-suite run in six while passing 30 of 30 standalone. It needs the rest of
+the suite competing for ephemeral ports to reproduce. Both fixtures now run
+`Run()` under a `try`/`catch` and retry the whole server on a fresh metrics
+port.
+
+The clean fix is a bound-metrics-port accessor on `MetricsServer` and
+`MasterServer`, mirroring `GetBoundPort()`. Deliberately not taken: that is a
+production API change for a test problem, and this branch is a port.
+
+Also: `test_umbp_tags`' `AllocPort` returned a hardcoded `50400` on failure —
+with two callers, precisely the collision the helper exists to prevent. It
+throws now.
+
+Measured on n06-21 alongside a dozen other containers: 30 standalone runs each
+of the four fast targets, 10 of `client_metrics`, then 10 consecutive
+full-suite runs, all clean.
