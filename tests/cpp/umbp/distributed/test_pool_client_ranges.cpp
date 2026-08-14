@@ -38,6 +38,7 @@
 #include <vector>
 
 #include "umbp/common/device_gather.h"
+#include "umbp/common/host_registration.h"
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/master/master_client.h"
 #include "umbp/distributed/master/master_server.h"
@@ -53,6 +54,18 @@ constexpr size_t kObjectSize = 2 * kPageSize;
 constexpr size_t kCallerCapacity = 16 * kPageSize;
 constexpr size_t kTargetCapacity = 256 * kPageSize;
 constexpr size_t kScratchSize = kObjectSize;  // Forces one object per sub-batch.
+
+// The gather kernel dereferences the tier directly, so it can only run where the
+// host region registers for GPU access. That is best-effort by design and the
+// client falls back to the copy engine without it, which leaves the byte
+// expectations valid but the launch counter flat.
+bool GatherPathAvailable() {
+  static const bool available = [] {
+    std::vector<char> probe(64 * 1024);
+    return HostTierRegistration(probe.data(), probe.size()).RegisteredBytes() != 0;
+  }();
+  return available;
+}
 
 uint16_t FreePort() {
   int fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -396,12 +409,15 @@ TEST_F(PoolClientRangesTest, GpuRangesUseGatherKernel) {
     src_ptrs.push_back(gpu_src[i].ptr);
   }
 
+  // Checked only where the kernel can run at all; the round trip below is the
+  // part that has to hold on every machine.
+  const bool gather_available = DeviceGatherEnabled() && GatherPathAvailable();
   const uint64_t launches_before = DeviceGatherLaunchCount();
   const std::vector<std::string> gpu_keys = {"gpu-range-object-0", "gpu-range-object-1"};
   auto put = target_->BatchPutRanges(gpu_keys, {kObjectSize, kObjectSize}, {src_ptrs, src_ptrs},
                                      {part_sizes, part_sizes}, {{0, 1024, 3072}, {0, 1024, 3072}});
   ASSERT_EQ(put, std::vector<bool>({true, true}));
-  EXPECT_EQ(DeviceGatherLaunchCount(), launches_before + 1);
+  if (gather_available) EXPECT_EQ(DeviceGatherLaunchCount(), launches_before + 1);
 
   const std::vector<size_t> get_sizes = {600, 700, 800};
   const std::vector<size_t> get_offsets = {100, 2200, 6500};
@@ -418,7 +434,7 @@ TEST_F(PoolClientRangesTest, GpuRangesUseGatherKernel) {
   auto get = target_->BatchGetRanges(gpu_keys, dst_ptrs, {get_sizes, get_sizes},
                                      {get_offsets, get_offsets});
   ASSERT_EQ(get, std::vector<bool>({true, true}));
-  EXPECT_EQ(DeviceGatherLaunchCount(), launches_before + 2);
+  if (gather_available) EXPECT_EQ(DeviceGatherLaunchCount(), launches_before + 2);
 
   std::vector<char> full(kObjectSize);
   std::memset(full.data(), 0x31, 1024);

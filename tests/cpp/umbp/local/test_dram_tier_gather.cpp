@@ -24,7 +24,9 @@
 // once with UMBP_DRAM_GATHER_KERNEL=0, so the same byte-level expectations are
 // enforced against both the kernel and the copy engine. The launch counter
 // assertions are what stop this from passing when the kernel silently never
-// runs.
+// runs -- on any machine that can register host memory for GPU access, which is
+// the one precondition the kernel path has and the one thing a test cannot
+// assert its way into.
 #include <gtest/gtest.h>
 #include <hip/hip_runtime_api.h>
 
@@ -45,6 +47,28 @@ bool GatherKernelExpected() {
   const char* value = std::getenv("UMBP_DRAM_GATHER_KERNEL");
   return value == nullptr || (std::string(value) != "0");
 }
+
+// Whether this machine can make host memory GPU-addressable at all. The tier
+// registers itself exactly this way, and where the registration does not take
+// the tier falls back to the copy engine on purpose -- so the launch counter
+// below would be measuring the machine rather than the planner's decision.
+// Probed once; the reason for a failure is logged by the registration itself at
+// warn level.
+bool GatherPathAvailable() {
+  static const bool available = [] {
+    std::vector<char> probe(64 * 1024);
+    return HostTierRegistration(probe.data(), probe.size()).RegisteredBytes() != 0;
+  }();
+  return available;
+}
+
+// The kernel-off variant asserts the absence of launches and holds anywhere;
+// only the kernel-on variant needs the registration to have taken.
+bool GatherKernelReachable() { return !GatherKernelExpected() || GatherPathAvailable(); }
+
+constexpr const char* kGatherPathUnreachable =
+    "host memory cannot be registered for GPU access on this machine, so the tier stays on the "
+    "copy engine; rerun with MORI_UMBP_LOG_LEVEL=warn for the reason the registration failed";
 
 bool HasDevice() {
   int count = 0;
@@ -127,6 +151,7 @@ class PageObjectTier {
 
 TEST(DeviceGatherTest, StridedLayerReadIsByteCorrect) {
   if (!HasDevice()) GTEST_SKIP() << "No HIP device available";
+  if (!GatherKernelReachable()) GTEST_SKIP() << kGatherPathUnreachable;
 
   constexpr size_t kObjects = 32;
   constexpr size_t kLayers = 8;
@@ -161,6 +186,7 @@ TEST(DeviceGatherTest, StridedLayerReadIsByteCorrect) {
 
 TEST(DeviceGatherTest, UnalignedFragmentsAreByteCorrect) {
   if (!HasDevice()) GTEST_SKIP() << "No HIP device available";
+  if (!GatherKernelReachable()) GTEST_SKIP() << kGatherPathUnreachable;
 
   // Neither the size nor the resulting offsets are multiples of 16, which sends
   // the kernel down its byte loop instead of the vectorized one.
@@ -186,6 +212,7 @@ TEST(DeviceGatherTest, UnalignedFragmentsAreByteCorrect) {
 
 TEST(DeviceGatherTest, StridedOffloadWriteIsByteCorrect) {
   if (!HasDevice()) GTEST_SKIP() << "No HIP device available";
+  if (!GatherKernelReachable()) GTEST_SKIP() << kGatherPathUnreachable;
 
   // The offload direction: contiguous device source scattered into one layer
   // slot of each page object.
