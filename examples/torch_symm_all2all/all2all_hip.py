@@ -20,19 +20,18 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""One-shot all-to-all over mori's torch SymmetricMemory backend, in Triton.
+"""One-shot all-to-all over mori's torch SymmetricMemory backend, in HIP.
 
-    torchrun --nnodes=1 --nproc_per_node=<gpus> all2all_triton.py --chunk-kib 256
+    torchrun --nnodes=1 --nproc_per_node=<gpus> all2all_hip.py --chunk-kib 256
 
-Nothing here is mori-specific: it is the pointer-array idiom torch's own symmetric-memory
-Triton kernels use. ``hdl.buffer_ptrs_dev`` goes in as a plain integer and becomes a
-pointer inside the kernel, so no C++ is involved at all.
+The kernel below is JIT-built on first run, so there is nothing to build first. All it
+needs from the backend is the peer pointer array torch publishes: the chunk rank r owes
+rank p lands at ``peers[p] + r*chunk_bytes``. No mori shmem, no cco.
 
-``all2all_hip.py`` is the same example in HIP.
+``all2all_triton.py`` is the same example in Triton.
 """
 
 import argparse
-import functools
 import gc
 import os
 import sys
@@ -40,82 +39,82 @@ import sys
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
-import triton
-import triton.language as tl
 from mori.allocator import handle_type  # importing registers the "MORI" backend
+from torch.utils.cpp_extension import load_inline
 
-# 256 lanes on a wave64 part, 4 int32 each -- the dwordx4 store the HIP kernel does.
-BLOCK = 1024
-NUM_WARPS = 4
+HIP_SOURCE = r"""
+#include <c10/hip/HIPStream.h>
+
+#include <algorithm>
+
+constexpr int kThreads = 256;
+
+// Grid flattens (peer, slice of chunk). One block per peer would idle all but world_size
+// CUs and keep too few writes in flight to cover interconnect latency.
+__global__ void All2AllPushPtrs(const uint4* __restrict__ send, void** __restrict__ peers,
+                                size_t chunk_bytes, int rank_id, int world_size,
+                                int blocks_per_peer) {
+  const size_t n_vec = chunk_bytes / sizeof(uint4);
+  const int peer = blockIdx.x / blocks_per_peer;
+  const int sub = blockIdx.x % blocks_per_peer;
+  if (peer >= world_size) return;
+
+  auto* dst = reinterpret_cast<uint4*>(static_cast<char*>(peers[peer]) +
+                                       static_cast<size_t>(rank_id) * chunk_bytes);
+  const uint4* src = send + static_cast<size_t>(peer) * n_vec;
+
+  const size_t span = static_cast<size_t>(blocks_per_peer) * blockDim.x;
+  for (size_t i = static_cast<size_t>(sub) * blockDim.x + threadIdx.x; i < n_vec; i += span) {
+    dst[i] = src[i];
+  }
+}
+
+// Two blocks per CU across peers, capped by how much there is to slice.
+static int BlocksPerPeer(int64_t chunk_bytes, int64_t world_size) {
+  static const int cus = [] {
+    int v = 64, dev = 0;
+    hipGetDevice(&dev);
+    hipDeviceGetAttribute(&v, hipDeviceAttributeMultiprocessorCount, dev);
+    return v;
+  }();
+  const int64_t n_vec = chunk_bytes / static_cast<int64_t>(sizeof(uint4));
+  const int64_t bpp = std::max<int64_t>(1, cus * 2 / std::max<int64_t>(1, world_size));
+  return static_cast<int>(std::min<int64_t>(bpp, std::max<int64_t>(1, n_vec / kThreads)));
+}
+
+// peers_dev is hdl.buffer_ptrs_dev; send is local, world_size*chunk_bytes. Push semantics:
+// no remote reads and no per-peer handshake, so the caller barriers before reading.
+void all2all_push_ptrs(const at::Tensor& send, int64_t peers_dev, int64_t chunk_bytes,
+                       int64_t rank_id, int64_t world_size) {
+  TORCH_CHECK(send.is_contiguous(), "send must be contiguous");
+  TORCH_CHECK(chunk_bytes % sizeof(uint4) == 0, "chunk_bytes must be a multiple of 16, got ",
+              chunk_bytes);
+  TORCH_CHECK(send.nbytes() == static_cast<size_t>(world_size * chunk_bytes), "send holds ",
+              send.nbytes(), " bytes, expected ", world_size * chunk_bytes);
+
+  const int bpp = BlocksPerPeer(chunk_bytes, world_size);
+  hipLaunchKernelGGL(All2AllPushPtrs, dim3(world_size * bpp), dim3(kThreads), 0,
+                     c10::hip::getCurrentHIPStream(),
+                     reinterpret_cast<const uint4*>(send.data_ptr()),
+                     reinterpret_cast<void**>(peers_dev), static_cast<size_t>(chunk_bytes),
+                     static_cast<int>(rank_id), static_cast<int>(world_size), bpp);
+  hipError_t err = hipGetLastError();
+  TORCH_CHECK(err == hipSuccess, "all2all_push_ptrs launch failed: ", hipGetErrorString(err));
+}
+"""
 
 
-# do_not_specialize: Triton folds an int argument that happens to equal 1 into a constexpr,
-# so without it rank 1 alone gets a plain Python int where the kernel casts to tl.int64.
-@triton.jit(do_not_specialize=["chunk_elems", "rank_id", "blocks_per_peer"])
-def _all2all_push_ptrs(
-    send_ptr,  # *i32, local, world_size*chunk_elems
-    peer_ptrs,  # i64 address of the world_size-entry peer pointer array
-    chunk_elems,
-    rank_id,
-    blocks_per_peer,
-    BLOCK: tl.constexpr,
-):
-    # Grid flattens (peer, slice of chunk). One block per peer would idle all but
-    # world_size CUs and keep too few writes in flight to cover interconnect latency.
-    pid = tl.program_id(0)
-    peer = pid // blocks_per_peer
-    sub = pid % blocks_per_peer
-
-    peers = peer_ptrs.to(tl.pointer_type(tl.uint64))
-    dst = tl.load(peers + peer).to(tl.pointer_type(tl.int32))
-
-    # 64-bit from here on: chunk_elems*world_size overflows i32 past 8 GiB of window.
-    chunk = chunk_elems.to(tl.int64)
-    dst += rank_id.to(tl.int64) * chunk  # the slot that peer reserves for us
-    src = send_ptr + peer.to(tl.int64) * chunk  # what we owe that peer
-
-    span = blocks_per_peer * BLOCK
-    for start in range(sub * BLOCK, chunk_elems, span):
-        offs = start + tl.arange(0, BLOCK)
-        mask = offs < chunk_elems
-        tl.store(dst + offs, tl.load(src + offs, mask=mask), mask=mask)
-
-
-@functools.cache
-def _blocks_per_peer(chunk_elems: int, world_size: int, device) -> int:
-    """Two blocks per CU across peers, capped by how much there is to slice.
-
-    Cached because it is on the launch path, where microseconds are the whole story:
-    ``get_device_properties`` costs ~0.9 us against a Triton launch of ~9-13 us.
-    """
-    cus = torch.cuda.get_device_properties(device).multi_processor_count
-    bpp = max(1, cus * 2 // max(1, world_size))
-    return min(bpp, max(1, chunk_elems // BLOCK))
-
-
-def all2all_push_ptrs(send, peers_dev, chunk_bytes, rank_id, world_size):
-    """``peers_dev`` is hdl.buffer_ptrs_dev. Push only; the caller barriers afterwards."""
-    if not send.is_contiguous():
-        raise ValueError("send must be contiguous")
-    if send.dtype != torch.int32:
-        raise ValueError(f"send must be int32, got {send.dtype}")
-    if chunk_bytes % 4:
-        raise ValueError(f"chunk_bytes must be a multiple of 4, got {chunk_bytes}")
-    chunk_elems = chunk_bytes // 4
-    if send.numel() != world_size * chunk_elems:
-        raise ValueError(
-            f"send holds {send.numel()} elements, expected {world_size * chunk_elems}"
-        )
-
-    bpp = _blocks_per_peer(chunk_elems, world_size, send.device)
-    _all2all_push_ptrs[(world_size * bpp,)](
-        send,
-        peers_dev,
-        chunk_elems,
-        rank_id,
-        bpp,
-        BLOCK=BLOCK,
-        num_warps=NUM_WARPS,
+def build():
+    """JIT the kernel. Concurrent torchrun ranks share one build: torch holds a file lock."""
+    return load_inline(
+        name="all2all_hip_kernel",
+        cpp_sources=(
+            "void all2all_push_ptrs(const at::Tensor&, int64_t, int64_t, int64_t, int64_t);"
+        ),
+        cuda_sources=HIP_SOURCE,
+        functions=["all2all_push_ptrs"],
+        extra_cflags=["-O3"],
+        extra_cuda_cflags=["-O3"],
     )
 
 
@@ -131,6 +130,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    push = build().all2all_push_ptrs
 
     # Defaults so a bare `python3 all2all_*.py` is a 1-rank smoke test; torchrun sets them.
     for key, val in (
@@ -170,13 +170,13 @@ def main():
 
     if rank_id == 0:
         print(
-            f"kernel=Triton  world={world_size}  handle={handle_type(local_rank)}  "
+            f"kernel=HIP  world={world_size}  handle={handle_type(local_rank)}  "
             f"chunk={args.chunk_kib} KiB"
         )
         print(f"peers: {' '.join(hex(p) for p in hdl.buffer_ptrs)}")
 
     def run_once():
-        all2all_push_ptrs(send, peers_dev, chunk_bytes, rank_id, world_size)
+        push(send, peers_dev, chunk_bytes, rank_id, world_size)
         torch.cuda.synchronize()
         dist.barrier()  # no device-side barrier in the backend yet
 
@@ -203,7 +203,7 @@ def main():
     dist.barrier()
     start.record()
     for _ in range(args.iters):
-        all2all_push_ptrs(send, peers_dev, chunk_bytes, rank_id, world_size)
+        push(send, peers_dev, chunk_bytes, rank_id, world_size)
     end.record()
     torch.cuda.synchronize()
     ms = start.elapsed_time(end) / args.iters

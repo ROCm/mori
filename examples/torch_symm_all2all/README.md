@@ -1,34 +1,28 @@
 # All-to-all over the mori torch SymmetricMemory backend
 
-One-shot all-to-all against a symmetric window, written twice: as a HIP kernel
-(`all2all_kernel.hip`) and as a Triton kernel (`all2all_triton.py`). Neither uses mori's
-shmem or cco. The only thing either needs from the backend is the peer pointers torch
-publishes:
+One-shot all-to-all against a symmetric window, written twice — `all2all_hip.py` and
+`all2all_triton.py`. Each is self-contained and runs on its own; neither uses mori's shmem
+or cco. The only thing either needs from the backend is the peer pointers torch publishes:
 
 ```
 recv slot of rank p, chunk from rank r  ==  peers[p] + r*chunk_bytes
 ```
 
-A second copy of the HIP kernel takes `(base, stride)` and computes `peers[p]` as
-`base + p*stride` instead, so the two addressing forms can be measured against each other.
-That comparison is what the cco-window stage in [ROCm/mori#557](https://github.com/ROCm/mori/issues/557)
-turns into an API; the allocator itself exposes only the torch form today.
-
 ```bash
-python3 setup.py build_ext --inplace          # for the HIP kernel only
-torchrun --nnodes=1 --nproc_per_node=8 all2all.py --chunk-kib 256
+torchrun --nnodes=1 --nproc_per_node=8 all2all_hip.py --chunk-kib 256
+torchrun --nnodes=1 --nproc_per_node=8 all2all_triton.py --chunk-kib 256
 ```
 
-`--kernel hip|triton|both` picks the implementation, `--addressing ptrs|flat|both` the
-addressing form; Triton appears under `ptrs` only. `--kernel triton` needs no build step at
-all. The HIP extension is built here, not by mori's CMake — the example is self-contained.
+There is no build step. The HIP kernel is a string in `all2all_hip.py`, JIT-built by
+torch's `cpp_extension` on first run (concurrent ranks share one build — torch holds a file
+lock), and the Triton kernel needs no C++ at all.
 
 ## What it does
 
-`recv` is an ordinary `symm_mem.empty()` tensor, made symmetric by
-`symm_mem.rendezvous()`. `send` is plain local memory. The kernel **pushes**: each rank
-writes its own chunk into every peer's receive window, so there are no remote reads and no
-per-peer handshake — just one barrier afterwards, before anyone reads what landed.
+`recv` is an ordinary `symm_mem.empty()` tensor made symmetric by `symm_mem.rendezvous()`.
+`send` is plain local memory. The kernel **pushes**: each rank writes its own chunk into
+every peer's receive window, so there are no remote reads and no per-peer handshake — just
+one barrier afterwards, before anyone reads what landed.
 
 ```python
 import mori.allocator          # importing registers the "MORI" backend
@@ -37,69 +31,60 @@ symm_mem.set_backend("MORI")
 recv = symm_mem.empty(world_size * elems, dtype=torch.int32, device=device)
 hdl  = symm_mem.rendezvous(recv, group_name)
 
-all2all_kernel.all2all_push_ptrs(
-    send, hdl.buffer_ptrs_dev, chunk_bytes, rank_id, world_size
-)
+all2all_push_ptrs(send, hdl.buffer_ptrs_dev, chunk_bytes, rank_id, world_size)
 ```
 
-The flat form's two numbers are derived in `all2all.py`, not handed out by the allocator:
-they are `hdl.buffer_ptrs[0]` and `hdl.buffer_ptrs[1] - hdl.buffer_ptrs[0]`, plus a check
-that the stride is uniform — which torch's API does not promise, and which a backend
-handing back scattered per-rank pointers would fail.
+`hdl.buffer_ptrs_dev` is the N-entry device array, which is what torch's model provides and
+what its own backends force — they map each peer at an unrelated address. This backend does
+map every rank into one evenly-strided span, but `base + rank*stride` is deliberately not
+exposed: [ROCm/mori#557](https://github.com/ROCm/mori/issues/557) is where the flat window
+arrives, as cco's `ccoWindowDevice` rather than as a third scheme invented here. An earlier
+version of this example implemented both forms to compare them; they measured within a
+couple of percent of each other, so nothing is given up by shipping only the array.
 
 ## The Triton version
 
-`all2all_triton.py` does the same push through the same array, in the idiom torch's own
-symmetric-memory Triton kernels use: `buffer_ptrs_dev` goes in as a plain integer and
-becomes a pointer inside the kernel.
+Same push through the same array, in the idiom torch's own symmetric-memory Triton kernels
+use: `buffer_ptrs_dev` goes in as a plain integer and becomes a pointer inside the kernel.
 
 ```python
-peers = peer_ptrs.to(tl.pointer_type(tl.uint64))   # peer_ptrs is hdl.buffer_ptrs_dev
+peers = peer_ptrs.to(tl.pointer_type(tl.uint64))
 dst = tl.load(peers + peer).to(tl.pointer_type(tl.int32))
 ```
 
-That is the entire interface to the backend, which is why this path needs no extension
-build — torch already hands out the array, so no C++ is involved. The grid is the same
-`(world_size * blocks_per_peer,)`, and `BLOCK=1024` int32 over 4 warps is the same
-dwordx4-per-lane store the HIP kernel does.
-
-One Triton detail worth knowing: the kernel is declared
-`@triton.jit(do_not_specialize=["chunk_elems", "rank_id", "blocks_per_peer"])`. Triton
-turns an `int` argument that happens to equal `1` into a `constexpr`, so without that,
-**rank 1 alone** fails to compile — a Python `int` arrives where the kernel casts to
-`tl.int64`.
+The grid is the same `(world_size * blocks_per_peer,)`, and `BLOCK=1024` int32 over 4 warps
+is the same dwordx4-per-lane store the HIP kernel does. One Triton detail worth knowing:
+the kernel is declared `@triton.jit(do_not_specialize=["chunk_elems", "rank_id",
+"blocks_per_peer"])`, because Triton turns an `int` argument that happens to equal `1` into
+a `constexpr` — without it, **rank 1 alone** fails to compile.
 
 ## Measured
 
-Aggregate counts only the `(world_size-1)` chunks that leave the device; the self chunk stays
-local. Every variant that runs is correctness-checked first, and `peer(r) == base + r*stride`
-holds throughout.
-
-The two tables below are the HIP kernel; HIP vs Triton is further down.
+Aggregate counts only the `(world_size-1)` chunks that leave the device; the self chunk
+stays local. Every run is correctness-checked first.
 
 4 MiB per peer:
 
 | ranks | MI355X / gfx950 | MI355X-class / gfx1250 | MI308X / gfx942 |
 |---|---|---|---|
-| 2 | 103.8 GB/s | 514.6 GB/s | 54.1 GB/s |
-| 4 | 517.8 GB/s | 1705.1 GB/s | 112.2 GB/s |
-| 8 | 1858.5 GB/s | — | 184.8 GB/s |
+| 2 | 107.8 GB/s | 514.6 GB/s | 54.1 GB/s |
+| 4 | 500-567 GB/s | 1705.1 GB/s | 112.2 GB/s |
+| 8 | 1746-1874 GB/s | — | 184.8 GB/s |
 
 256 KiB per peer, where launch and barrier cost still shows:
 
 | ranks | gfx950 | gfx1250 | gfx942 |
 |---|---|---|---|
-| 2 | 67.7 GB/s | 92.9 GB/s | 40.3 GB/s |
-| 4 | 428.0 GB/s | 516.8 GB/s | 139.4 GB/s |
-| 8 | 1459.0 GB/s | — | 250.0 GB/s |
+| 2 | 76-84 GB/s | 92.9 GB/s | 40.3 GB/s |
+| 4 | 461-485 GB/s | 516.8 GB/s | 139.4 GB/s |
+| 8 | 1522-1829 GB/s | — | 250.0 GB/s |
 
-The gfx1250 column is from an idle box. Earlier figures for it, taken while another tenant
-held all 4 GPUs, ran 12% low at 4 MiB and 44% low at 256 KiB — worth knowing before
-comparing anything measured here across machines.
-
-gfx1250 exports **fabric** handles; gfx950 and gfx942 fall back to POSIX fd, having no
-fabric support at `hipMemCreate`. The kernel sees the same window either way. The gfx1250
-box has 4 GPUs, hence no 8-rank column.
+Ranges are across repeats: anything above 2 ranks moves 6-13% run to run, so read the
+single-value columns as ±10% too. The gfx950 column is from the code as it stands; gfx1250
+and gfx942 were measured before the example was split in two, with the same kernel and grid.
+gfx1250 exports **fabric** handles and its column is from an idle box; gfx950 and gfx942
+fall back to POSIX fd, having no fabric support at `hipMemCreate`. The kernel sees the same
+window either way. The gfx1250 box has 4 GPUs, hence no 8-rank column.
 
 Grid shape matters more than the handle type. An earlier version launched one block per
 destination rank, leaving all but `world_size` CUs idle and unable to keep enough writes in
@@ -111,64 +96,28 @@ Uncached/fine-grained windows, as mori's cco windows are, were measured and reje
 the bandwidth on gfx1250 (712 vs 1499 GB/s at 4 ranks) and no change on gfx950. The backend
 uses coarse-grained pinned memory.
 
-### Addressing: pointer array vs flat window
-
-The kernel is built both ways so they can be compared — the N-entry array from
-`hdl.buffer_ptrs_dev`, which is what torch's model provides and what its own backends force
-(they map each peer at an unrelated address), and `base + peer*stride`. `--addressing
-ptrs|flat|both` selects; both are correctness-checked.
-
-| | gfx950, 8 ranks, 4 MiB | gfx1250, 4 ranks, 4 MiB |
-|---|---|---|
-| peer pointer array | 1909.4 GB/s | 1705.1 GB/s |
-| `base + rank*stride` | 1912.0 GB/s | 1730.3 GB/s |
-
-Re-measured after this example was reorganised, on a second 8×gfx950 box: 1814.5 (array)
-vs 1803.7 (flat) at 4 MiB, and 1639.9 vs 1623.2 at 256 KiB — same conclusion, with the
-array marginally ahead this time rather than behind.
-
-**The difference is at most a couple of percent, and it is not the same sign everywhere.**
-On gfx950 the two are within 0.2% and the array is ahead as often as behind. On an idle
-gfx1250 the flat form is consistently ahead, by a near-constant 0.3-0.6 us — 2% at 4 MiB
-and 3-7% at 256 KiB, across six runs and whether the modes run together or alone, so it is
-not warm-up ordering. Constant in absolute terms rather than proportional is what a
-per-block cost looks like: the array's extra dependent load sits on the critical path
-before the first store can issue, while the flat form's two 64-bit multiplies do not. So
-the pointer array, which is what this backend exposes, costs a fixed sliver of launch-to-
-first-store latency and nothing per byte; the flat form is worth pursuing mainly for kernel
-ergonomics (two scalars, no device-side array to plumb or keep alive, destination
-computable at run time).
-
-Every serious library builds the flat window underneath regardless: NCCL's
-`ncclGetLsaPointer` is `add4G(lsaFlatBase, peer*stride4G) + offset`, mori's own
-`ccoWindowDevice` is `winBase + ((uint64_t)peerLsaRank * stride4G << 32) + offset`, and
-NVSHMEM reserves `npes * heap_size` in one go and then hides it behind an array because its
-slots are rotated from `mype+1`. [ROCm/mori#557](https://github.com/ROCm/mori/issues/557)
-is where this backend adopts cco's version of it rather than inventing a third.
-
 ### HIP vs Triton
 
-Same grid, same block size, same pointer array. Reported as us/iter, which is steadier
-than the summed bandwidth; the range is across three runs.
+Same grid, same block size, same pointer array. us/iter, range over repeats.
 
 8×gfx950, torch 2.10 / Triton 3.7, POSIX-fd handles:
 
-| chunk per peer | HIP, pointer array | Triton, pointer array |
+| chunk per peer | HIP | Triton |
 |---|---|---|
-| 4 MiB | 113.2-140.0 us (1861-1938 GB/s) | 114.7-137.3 us (1875-1983 GB/s) |
-| 256 KiB | 9.3-9.8 us (1497-1547 GB/s) | 9.4-10.3 us (1435-1538 GB/s) |
+| 4 MiB | 128.9-140.6 us | 118.6-139.7 us |
+| 1 MiB | 29.7-30.3 us | 30.1-33.4 us |
+| 256 KiB | 7.9-9.6 us | 9.1-10.0 us |
 
-4×gfx1250, torch 2.11 / Triton 3.8, **fabric** handles, idle box, range over three runs:
+4×gfx1250, torch 2.11 / Triton 3.8, fabric handles, idle box:
 
-| chunk per peer | HIP, pointer array | Triton, pointer array |
+| chunk per peer | HIP | Triton |
 |---|---|---|
-| 4 MiB | 29.6-30.5 us (1694-1705 GB/s) | 32.2-32.5 us (1515-1567 GB/s) |
-| 1 MiB | 10.0-10.1 us (1258-1260 GB/s) | 11.9-12.6 us (995-998 GB/s) |
-| 256 KiB | 5.9-6.2 us (517-531 GB/s) | 12.0-12.1 us (239-247 GB/s) |
+| 4 MiB | 29.6-30.5 us | 32.2-32.5 us |
+| 1 MiB | 10.0-10.1 us | 11.9-12.6 us |
+| 256 KiB | 5.9-6.2 us | 12.0-12.1 us |
 
-All three variants are correctness-checked on both machines, and the Triton kernel needs no
-change between them — wave64 gfx950 and wave32 gfx1250 both just work, and forcing 256
-lanes on gfx1250 with `num_warps=8` moves nothing (32.2 vs 33.2 us at 4 MiB).
+The Triton kernel needs no change between the two — wave64 gfx950 and wave32 gfx1250 both
+just work, and forcing 256 lanes on gfx1250 with `num_warps=8` moves nothing.
 
 **Where Triton loses, it loses on the host, not on the device.** Launches are asynchronous,
 so a steady-state iteration costs `max(kernel, launch)`, and the Python launcher is the
@@ -181,16 +130,15 @@ larger of the two for a long way up. Timing the launch call alone, 500 calls wit
 
 That predicts both tables. On gfx1250 the Triton row is pinned near 12 us at 256 KiB *and*
 at 1 MiB despite 4x the data — it is not moving data, it is waiting on the launcher — and
-only at 4 MiB, where the kernel itself runs ~30 us, does it come within 10%. Adding a
+only at 4 MiB, where the kernel runs ~30 us, does it come within 10%. Adding a
 `torch.cuda.synchronize()` to the launch benchmark costs Triton 0.03 us and HIP 1.7-1.9 us:
 the device is already idle when the Triton loop ends, because the host cannot feed it fast
-enough to build a queue. On gfx950 the 9 us launcher sits just under the 9-10 us kernel, so
-the two are indistinguishable at every size measured, Triton ahead as often as behind.
+enough to build a queue. On gfx950 the 9 us launcher sits just under the 8-10 us kernel, so
+the two are close at every size measured.
 
-The kernels themselves are equivalent. Worth remembering before reading anything into a
-small-message Triton number on a symmetric-memory benchmark: it may be measuring
-`triton.JITFunction.run`. Real uses amortise that — CUDA graphs, or a persistent kernel
-that does many transfers per launch.
+Worth remembering before reading anything into a small-message Triton number on a
+symmetric-memory benchmark: it may be measuring `triton.JITFunction.run`. Real uses amortise
+that — CUDA graphs, or a persistent kernel that does many transfers per launch.
 
 ### Why gfx942 is slow
 
@@ -219,9 +167,6 @@ It is specific to the VMM path. `hipMalloc` with `hipDeviceEnablePeerAccess` for
 peers keeps full bandwidth on the same box (2668.5 -> 2665.2 GB/s), because the two paths
 use different kernel interfaces: `hipMemSetAccess` reaches libdrm `amdgpu_bo_va_op`, the
 DRM path, while ordinary allocations go through `hsaKmtMapMemoryToGPUNodes`, the KFD one.
-Plain VMM, flat multi-slot reservations, self-aliasing and Pinned-vs-Uncached are all free,
-so neither the window layout nor the addressing form is what costs gfx942 its bandwidth —
-the peer grant is.
 
 Possibly a missing kernel option rather than silicon: this box runs a 5.10 kernel with a
 DKMS backport and has `CONFIG_PCI_P2PDMA` and `CONFIG_DMABUF_MOVE_NOTIFY` unset, both of
