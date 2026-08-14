@@ -58,7 +58,12 @@ class InterNodeDispatchCombineTestCase(EpDispatchCombineTestCase):
             print(f"Invalid expert id: {max_expert_idx}")
             assert False
 
-        op.combine(dispatch_output, dispatch_weights, dispatch_indices, call_reset=True)
+        op.combine(
+            dispatch_output,
+            dispatch_weights,
+            all_rank_indices[self.config.rank],
+            call_reset=True,
+        )
         self.sync()
 
 

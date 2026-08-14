@@ -298,7 +298,7 @@ class EpDispatchCombineTestCase:
         combine_output, combine_output_weight = op.combine(
             combine_input.to(torch.bfloat16),
             dispatch_weights,
-            dispatch_indices,
+            indices,
             block_num=80,
             warp_per_block=8,
         )
