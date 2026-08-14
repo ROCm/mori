@@ -21,22 +21,38 @@
 // SOFTWARE.
 #pragma once
 
-#include <string>
+#include <algorithm>
+#include <atomic>
+#include <cstddef>
+#include <thread>
+#include <vector>
 
-#include "umbp/local/tiers/segment/segment_index.h"
-#include "umbp/storage/io/storage_io_driver.h"
+namespace mori::umbp {
 
-namespace mori::umbp::segment {
+// Run fn(i) for i in [0, n), on up to `threads` workers, work-stealing so an
+// uneven index cost cannot strand a worker.  Each index runs exactly once, so
+// fn may write result[i] without locking.  The caller's thread takes part and
+// the call returns only once every index is done.
+template <typename Fn>
+void ParallelFor(size_t n, int threads, Fn&& fn) {
+  if (n == 0) return;
+  const size_t workers = std::min<size_t>(n, static_cast<size_t>(std::max(threads, 1)));
+  if (workers <= 1) {
+    for (size_t i = 0; i < n; ++i) fn(i);
+    return;
+  }
+  std::atomic<size_t> next{0};
+  auto worker = [&]() {
+    for (size_t i = next.fetch_add(1, std::memory_order_relaxed); i < n;
+         i = next.fetch_add(1, std::memory_order_relaxed)) {
+      fn(i);
+    }
+  };
+  std::vector<std::thread> pool;
+  pool.reserve(workers - 1);
+  for (size_t w = 0; w + 1 < workers; ++w) pool.emplace_back(worker);
+  worker();
+  for (auto& t : pool) t.join();
+}
 
-class Scanner {
- public:
-  // `extra_open_flags` is OR'd into open() for segments the scanner discovers —
-  // O_DIRECT when the tier runs unbuffered, so the fds it installs in the index
-  // match the ones SSDTier opens itself.  All of the scanner's own reads are
-  // issued in aligned kRecordAlign blocks so they are legal on such an fd.
-  bool RefreshFromDisk(const std::string& dir, StorageIoDriver& io_driver, Index& index,
-                       bool read_only_shared, bool force_full_rescan, std::string* error_message,
-                       int extra_open_flags = 0) const;
-};
-
-}  // namespace mori::umbp::segment
+}  // namespace mori::umbp

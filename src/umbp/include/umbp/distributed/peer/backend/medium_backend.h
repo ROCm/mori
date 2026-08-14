@@ -169,6 +169,18 @@ struct EvictResult {
   uint64_t bytes_freed = 0;
 };
 
+// One medium-specific Prometheus counter, sampled per metrics tick (see
+// MediumBackend::Counters).  `name`/`help` are the Prometheus metric identity
+// and must be string literals with static storage duration — the same counter
+// reported under different label sets shares both.  `value` is MONOTONIC; the
+// caller ships the delta since the previous tick.
+struct MediumCounter {
+  const char* name = nullptr;
+  const char* help = nullptr;
+  std::vector<std::pair<std::string, std::string>> labels;
+  uint64_t value = 0;
+};
+
 class MediumBackend {
  public:
   virtual ~MediumBackend() = default;
@@ -240,6 +252,21 @@ class MediumBackend {
   // it should only signal the heartbeat thread.  Pass a very large threshold to
   // disable.
   virtual void SetAutoFlushHook(size_t threshold, std::function<void()> cb) = 0;
+
+  // ---- observability ----
+  //
+  // Monotonic, medium-specific counters, sampled once per MasterClient metrics
+  // tick and shipped as deltas.  On the interface (rather than on the concrete
+  // backend) for the same reason SetAutoFlushHook is: PoolClient must be able to
+  // publish a backend's counters without knowing which backend it is — the
+  // alternative is a `dynamic_cast<SsdBackend*>` in the metrics path, which is
+  // exactly the type-switching this refactor removed.
+  //
+  // Defaulted to empty so a backend with nothing medium-specific to report (and
+  // every test double) needs no code.  Values must be monotonic: the caller
+  // ships `current - last` and a decrease is read as no delta.  Never called
+  // under any backend lock — treat it as a plain read of relaxed atomics.
+  virtual std::vector<MediumCounter> Counters() const { return {}; }
 
   // ---- slot lifecycle (peer-side; driven by PeerServiceServer handlers) ----
   //

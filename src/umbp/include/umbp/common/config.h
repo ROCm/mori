@@ -78,12 +78,67 @@ struct UMBPDurabilityConfig {
 
 struct UMBPSsdConfig {
   bool enabled = true;
+  // Comma-separated (same convention as spdk_nvme_pci_addr).  Naming >1 directory
+  // — normally one mount point per drive — fans the tier across them via
+  // ShardedSsdTier for their aggregate bandwidth.  capacity_bytes is the TOTAL,
+  // split evenly among the directories.
   std::string storage_dir = "/tmp/umbp_ssd";
   size_t capacity_bytes = 32ULL * 1024 * 1024 * 1024;
   UMBPSsdLayoutMode layout_mode = UMBPSsdLayoutMode::SegmentedLog;
   size_t segment_size_bytes = 256ULL * 1024 * 1024;
   UMBPIoConfig io;
   UMBPDurabilityConfig durability;
+
+  // Threads for the sharded tier's batch paths, i.e. ACROSS drives.  0 = one per
+  // shard, which is what saturates N drives.  Ignored with a single directory.
+  int shard_io_threads = 0;
+
+  // Threads for the CPU-bound phases WITHIN one SSDTier (CRC verify on read, CRC
+  // + record assembly on write).  Defaults to 4 to match the DRAM tier, so a
+  // DRAM-vs-SSD comparison is not silently 4 threads against 1.
+  int tier_io_threads = 4;
+
+  // Bypass the page cache (O_DIRECT).  On by default: the tier is itself a cache,
+  // so buffered I/O adds a second unmanaged DRAM cache that steals host memory
+  // from the DRAM tier and makes any drive measurement meaningless (a run can be
+  // served entirely from RAM, moving zero bytes to the device).  Safe as a default
+  // because the tier probes O_DIRECT at startup and falls back to buffered with a
+  // warning on tmpfs/overlayfs.  Set false to deliberately exploit the page cache.
+  bool direct_io = true;
+
+  // Coalesce concurrent reads of the same key: only the first touches the drive,
+  // the rest are served by memcpy from its buffer.  For MLA + TP, where every
+  // attention-TP rank GETs a byte-identical key; MHA keys carry a per-rank suffix
+  // and never collide, so it is a no-op there.  NOTE: UMBP_SSD_SINGLE_FLIGHT only
+  // reaches configs built by FromEnvironment() (the standalone server); sglang
+  // constructs UMBPConfig directly and needs the pybind field.  [SsdPerf/peer]
+  // reports merged=/merged_total=, which is what tells you it fired.
+  bool single_flight_reads = true;
+
+  // Checksum on write, verify on read.  Turning it off isolates how much of the
+  // SSD path's cost is integrity work (the DRAM tier does none).  Records written
+  // with it off are marked kFlagNoCrc and stay readable either way.
+  bool verify_crc = true;
+
+  // Split storage_dir on ',' — one entry per drive.  Always returns at least
+  // one element (falls back to the default when the string is empty).
+  std::vector<std::string> StorageDirs() const {
+    std::vector<std::string> dirs;
+    size_t start = 0;
+    while (start <= storage_dir.size()) {
+      size_t comma = storage_dir.find(',', start);
+      if (comma == std::string::npos) comma = storage_dir.size();
+      std::string part = storage_dir.substr(start, comma - start);
+      // Trim surrounding whitespace so "a, b" works as well as "a,b".
+      size_t b = part.find_first_not_of(" \t");
+      size_t e = part.find_last_not_of(" \t");
+      if (b != std::string::npos) dirs.push_back(part.substr(b, e - b + 1));
+      if (comma == storage_dir.size()) break;
+      start = comma + 1;
+    }
+    if (dirs.empty()) dirs.push_back("/tmp/umbp_ssd");
+    return dirs;
+  }
 
   // Local SSD-tier capacity watermarks for the distributed PeerSsdManager's
   // local eviction.  When used/total crosses high_watermark the owner
@@ -139,6 +194,13 @@ struct UMBPSsdConfig {
     }
     if (segment_size_bytes == 0) {
       if (error_message) *error_message = "ssd.segment_size_bytes must be > 0";
+      return false;
+    }
+    // Records are padded to segment::kRecordAlign (4096), so a segment whose
+    // size is not a multiple of it would leave the append cursor unaligned at
+    // the roll-over and break direct I/O on the next segment.
+    if (segment_size_bytes % 4096 != 0) {
+      if (error_message) *error_message = "ssd.segment_size_bytes must be a multiple of 4096";
       return false;
     }
     // Watermarks must satisfy 0 < low < high <= 1.  Fail fast on a misconfigured
@@ -252,6 +314,14 @@ struct UMBPDistributedConfig {
 
   // Remote SSD read staging slots; per-slot = ssd_staging_buffer_size / this.
   int ssd_staging_buffer_slots = 16;
+
+  // Back the SSD staging arena with hugetlbfs pages.  Every byte the SSD
+  // backend moves crosses that arena twice (device <-> arena, arena <-> wire),
+  // so its TLB behaviour sits on the critical path in a way an ordinary
+  // buffer's does not.  Falls back to 4 KiB pages when no hugetlb pages are
+  // free — a node must still come up.
+  bool ssd_staging_use_hugepages = false;
+  size_t ssd_staging_hugepage_size = 2ULL * 1024 * 1024;  // 2 MiB
 
   uint16_t peer_service_port = 0;  // gRPC peer service port
 
@@ -457,6 +527,30 @@ struct UMBPConfig {
     cfg.ssd.enabled = getenv_int("UMBP_SSD_ENABLED", cfg.ssd.enabled ? 1 : 0) != 0;
     cfg.ssd.storage_dir = getenv_str("UMBP_SSD_DIR", cfg.ssd.storage_dir);
     cfg.ssd.capacity_bytes = getenv_size("UMBP_SSD_CAPACITY", cfg.ssd.capacity_bytes);
+    cfg.ssd.shard_io_threads = getenv_int("UMBP_SSD_SHARD_IO_THREADS", cfg.ssd.shard_io_threads);
+    cfg.ssd.tier_io_threads = getenv_int("UMBP_SSD_TIER_IO_THREADS", cfg.ssd.tier_io_threads);
+    cfg.ssd.direct_io = getenv_int("UMBP_SSD_DIRECT_IO", cfg.ssd.direct_io ? 1 : 0) != 0;
+    cfg.ssd.single_flight_reads =
+        getenv_int("UMBP_SSD_SINGLE_FLIGHT", cfg.ssd.single_flight_reads ? 1 : 0) != 0;
+    cfg.ssd.verify_crc = getenv_int("UMBP_SSD_VERIFY_CRC", cfg.ssd.verify_crc ? 1 : 0) != 0;
+    // Durability of the SSD cache tier.  "strict" (default) fdatasync()s every
+    // batch write; "relaxed" leaves the data in the page cache and lets the
+    // kernel flush it.  Relaxed is safe for a pure cache — the bytes are
+    // re-fetchable, and the distributed peer discards leftover segments at
+    // startup anyway (see PeerSsdManager::DiscardLeftoverOnStartup) — so the
+    // flush buys nothing there while costing a large share of write time.
+    {
+      const std::string durability =
+          getenv_str("UMBP_SSD_DURABILITY",
+                     cfg.ssd.durability.mode == UMBPDurabilityMode::Relaxed ? "relaxed" : "strict");
+      if (durability == "relaxed" || durability == "RELAXED") {
+        cfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
+      } else if (durability == "strict" || durability == "STRICT") {
+        cfg.ssd.durability.mode = UMBPDurabilityMode::Strict;
+      }
+      // Any other value leaves the configured mode untouched; Validate() does
+      // not police this field, so silently keeping the default beats guessing.
+    }
     cfg.eviction.policy = getenv_str("UMBP_EVICTION_POLICY", cfg.eviction.policy);
     cfg.dram.high_watermark = getenv_double("UMBP_DRAM_HIGH_WM", cfg.dram.high_watermark);
     cfg.dram.low_watermark = getenv_double("UMBP_DRAM_LOW_WM", cfg.dram.low_watermark);

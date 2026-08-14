@@ -336,13 +336,20 @@ target_link_libraries(test_router_dedup PRIVATE umbp_common GTest::gtest_main)
 target_compile_features(test_router_dedup PRIVATE cxx_std_17)
 add_test(NAME test_router_dedup COMMAND test_router_dedup)
 
-# test_peer_ssd_manager — SSD tier ownership (dormant: unwired from the
-# distributed data plane, see design-backend-agnostic-refactor.md Phase 0)
+# test_peer_ssd_manager — SSD tier ownership (reachable again: SsdBackend is the
+# MediumBackend adapter that drives it)
 add_executable(test_peer_ssd_manager test_peer_ssd_manager.cpp)
 target_link_libraries(test_peer_ssd_manager PRIVATE umbp_common
                                                     GTest::gtest_main)
 target_compile_features(test_peer_ssd_manager PRIVATE cxx_std_17)
 add_test(NAME test_peer_ssd_manager COMMAND test_peer_ssd_manager)
+
+# test_peer_ssd_single_flight — same-key read coalescing (leader/follower)
+add_executable(test_peer_ssd_single_flight test_peer_ssd_single_flight.cpp)
+target_link_libraries(test_peer_ssd_single_flight PRIVATE umbp_common
+                                                          GTest::gtest_main)
+target_compile_features(test_peer_ssd_single_flight PRIVATE cxx_std_17)
+add_test(NAME test_peer_ssd_single_flight COMMAND test_peer_ssd_single_flight)
 
 # test_peer_ssd_eviction — LRU + watermark eviction + in-flight guard
 add_executable(test_peer_ssd_eviction test_peer_ssd_eviction.cpp)

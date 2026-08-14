@@ -209,9 +209,53 @@
   "(see kMasterClientMaxPendingHistograms in master_client.h)"
 
 // --- SSD tier metrics -------------------------------------------------------
-// Removed in the backend-agnostic refactor Phase 0: SSD is unwired from the
-// distributed data plane (copy-on-commit pipeline, peer reads, read-staging
-// slots, the reader-side transient-retry counter, and the
-// mori_umbp_client_capacity_{used,total}_bytes{tier="SSD"} advertisement all
-// went with it — see design-backend-agnostic-refactor.md). Local (standalone)
-// mode is unaffected: it has no master/heartbeat and never shipped these.
+// These come back through MediumBackend::Counters(), which PoolClient samples
+// once per metrics tick and ships as deltas.  Nothing here is SSD-specific to
+// the publisher: a backend names its own counters and PoolClient forwards them,
+// so re-landing SSD did not re-introduce a type switch in the metrics path.
+//
+// The copy-on-commit pipeline counters (mori_umbp_ssd_copy_{enqueued,succeeded,
+// failed,dropped}_total) are still absent: SsdCopyPipeline is not wired into the
+// data plane on this branch, so there is nothing to report.
+
+#define MORI_UMBP_METRIC_SSD_READ_TOTAL "mori_umbp_ssd_read_total"
+#define MORI_UMBP_METRIC_SSD_READ_TOTAL_HELP                                             \
+  "Peer-side SSD read outcomes by status. ok/not_found/size_too_large/error are "        \
+  "read results; lead/dup/merged are single-flight accounting (a dup is a concurrent "   \
+  "request for a key already being read, merged is the subset served from the leader's " \
+  "buffer instead of the drive)"
+
+#define MORI_UMBP_METRIC_SSD_COPY_BYTES_TOTAL "mori_umbp_ssd_copy_bytes_total"
+#define MORI_UMBP_METRIC_SSD_COPY_BYTES_TOTAL_HELP \
+  "Bytes written to the local SSD tier (rate() gives write bandwidth)"
+
+#define MORI_UMBP_METRIC_SSD_READ_BYTES_TOTAL "mori_umbp_ssd_read_bytes_total"
+#define MORI_UMBP_METRIC_SSD_READ_BYTES_TOTAL_HELP                                      \
+  "Bytes read from the local SSD device (rate() gives read bandwidth). Excludes reads " \
+  "served by single-flight merge, so this stays a true measure of device traffic"
+
+#define MORI_UMBP_METRIC_SSD_EVICTION_ROUNDS_TOTAL "mori_umbp_ssd_eviction_rounds_total"
+#define MORI_UMBP_METRIC_SSD_EVICTION_ROUNDS_TOTAL_HELP \
+  "Local SSD eviction rounds run (high watermark crossed)"
+
+#define MORI_UMBP_METRIC_SSD_EVICTION_VICTIMS_TOTAL "mori_umbp_ssd_eviction_victims_total"
+#define MORI_UMBP_METRIC_SSD_EVICTION_VICTIMS_TOTAL_HELP "Keys evicted from the local SSD tier"
+
+#define MORI_UMBP_METRIC_SSD_EVICTION_BYTES_FREED_TOTAL "mori_umbp_ssd_eviction_bytes_freed_total"
+#define MORI_UMBP_METRIC_SSD_EVICTION_BYTES_FREED_TOTAL_HELP "Bytes freed by local SSD eviction"
+
+#define MORI_UMBP_METRIC_SSD_EVICTION_BACKEND_FAILED_TOTAL \
+  "mori_umbp_ssd_eviction_backend_failed_total"
+#define MORI_UMBP_METRIC_SSD_EVICTION_BACKEND_FAILED_TOTAL_HELP \
+  "Local SSD evictions where the backend delete failed (the key is kept, not orphaned)"
+
+#define MORI_UMBP_METRIC_SSD_STAGING_SLOT_FULL_REJECTS_TOTAL \
+  "mori_umbp_ssd_staging_slot_full_rejects_total"
+#define MORI_UMBP_METRIC_SSD_STAGING_SLOT_FULL_REJECTS_TOTAL_HELP                        \
+  "Resolves degraded to a miss because the staging arena was exhausted. Non-zero means " \
+  "the arena is undersized for the read concurrency, not that the keys are absent"
+
+#define MORI_UMBP_METRIC_SSD_STAGING_EXPIRED_RECLAIMS_TOTAL \
+  "mori_umbp_ssd_staging_expired_reclaims_total"
+#define MORI_UMBP_METRIC_SSD_STAGING_EXPIRED_RECLAIMS_TOTAL_HELP \
+  "Staging pages reclaimed by the reaper after their read lease or pending-write TTL expired"
