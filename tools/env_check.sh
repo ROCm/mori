@@ -30,6 +30,11 @@ MORI_PERFTEST_PREFIX="${MORI_PERFTEST_PREFIX:-$HOME/.local/mori-perftest}"
 PERFTEST_REPO="https://github.com/linux-rdma/perftest.git"
 BW_THRESHOLD=300    # Gbps
 LAT_THRESHOLD=10    # microseconds
+# A single QP tops out around half of line rate on the ionic GPUDirect path
+# (measured ~162 Gbps vs ~340 Gbps at 4 QPs on GPU memory); the fabric is fine,
+# one QP just cannot fill the pipe. Fan the bandwidth test across a few QPs so
+# the per-rail numbers reflect what MORI actually achieves.
+BW_QP=4             # -q for ib_write_bw (>1 to saturate the ionic NIC)
 MSG_SIZE=65536      # 64K
 LAT_MSG_SIZE=2      # bytes (small message for latency)
 IB_PORT=18515       # base port for ib_write_bw / ib_write_lat
@@ -548,9 +553,18 @@ perftest_has_rocm_dmabuf() {
 #   subshell and throw the result away.
 probe_gpu_mem_mode() {
     local dev="$1" gpu="$2" gid port=$(( IB_PORT + 900 )) variant
+    local prefer="${3:-peer_mem}"   # which registration path to try first
     MESH_GPU_MODE=""; MESH_GPU_DMABUF=""
     gid=$(gid_index "$dev" "")
-    for variant in peer_mem dma-buf; do
+    # This loopback proves a mode on THIS host only. peer_mem needs a kernel
+    # peer-memory client that a heterogeneous peer may lack, so a local pass
+    # does not generalize; dma-buf registers via ibv_reg_dmabuf_mr with no such
+    # client and is symmetric. When a peer is in play we therefore try dma-buf
+    # first (prefer="dma-buf"): picking a locally-proven peer_mem the remote
+    # cannot use would flag every otherwise-valid GPU pair as a failure.
+    local order="peer_mem dma-buf"
+    [[ "$prefer" == "dma-buf" ]] && order="dma-buf peer_mem"
+    for variant in $order; do
         local extra=""
         if [[ "$variant" == "dma-buf" ]]; then
             [[ -n "$MESH_GPU_DMABUF_OK" ]] || continue
@@ -710,6 +724,17 @@ mesh_prepare() {
 
     [[ "$want_gpu" == "true" && "$USE_GPU_MEM" == "true" ]] || return 0
 
+    # _GPU_PAIR_SNIPPET numbers GPUs by KFD topology node (every physical GPU),
+    # but perftest reads --use_rocm=<id> in the process-visible HIP ordinal
+    # space. If HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES restricts or reorders
+    # the set, those two numbering schemes diverge and the ids select the wrong
+    # GPU or run out of range -- false failures. Clear the filter for the probe
+    # so the two agree; a diagnostic wants every rail anyway, not a subset.
+    if [[ -n "${HIP_VISIBLE_DEVICES:-}${ROCR_VISIBLE_DEVICES:-}${CUDA_VISIBLE_DEVICES:-}" ]]; then
+        log_warn "clearing HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES for the GPU-memory pass (KFD ordinals must match HIP's)"
+        unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
+    fi
+
     # Both ends must agree on memory type, so a one-sided capability is useless.
     local rocm_ok=true
     perftest_has_rocm "$MESH_CLI_BIN" || rocm_ok=false
@@ -749,13 +774,22 @@ mesh_prepare() {
         log_warn "none of the tested NICs has a paired GPU -- skipping the GPU-memory pass"
         MESH_RGPU=(); MESH_CGPU=(); return 0
     fi
+    # Against a peer, prefer the symmetric dma-buf path when both ends support
+    # it: a local peer_mem pass says nothing about whether the remote can use
+    # it (see probe_gpu_mem_mode). Solo runs keep the peer_mem-first default.
+    local gpu_mode_pref="peer_mem"
+    [[ -n "$peer" && -n "$MESH_GPU_DMABUF_OK" ]] && gpu_mode_pref="dma-buf"
     mesh_gpu_on                 # probe under the GPU timeout budget (HIP init)
-    if ! probe_gpu_mem_mode "$pdev" "$pgpu"; then
+    if ! probe_gpu_mem_mode "$pdev" "$pgpu" "$gpu_mode_pref"; then
         mesh_gpu_off
+        # A ROCm-capable perftest and a paired GPU are both present, so this is
+        # not a missing prerequisite we can skip past: the GPUDirect path this
+        # check exists to validate is genuinely unusable. Fail rather than warn,
+        # or `mori check` goes green on a host where GPU transfers cannot run.
         if [[ -n "$MESH_GPU_DMABUF_OK" ]]; then
-            log_warn "GPU memory unreachable via peer_mem or dma-buf -- skipping the GPU-memory pass"
+            log_fail "GPU memory unreachable via peer_mem or dma-buf -- GPUDirect RDMA unusable"
         else
-            log_warn "GPU memory unreachable via peer_mem, and this perftest has no dma-buf support"
+            log_fail "GPU memory unreachable via peer_mem, and this perftest has no dma-buf support"
             log_warn "  rebuild with --enable-rocm-dmabuf (or rerun with --install-perftest)"
         fi
         MESH_RGPU=(); MESH_CGPU=(); return 0
@@ -1044,6 +1078,7 @@ mesh_execute() {
     local extra key col
     if [[ "$tool" == "ib_write_bw" ]]; then
         extra="-s $MSG_SIZE --report_gbits"; key="$MSG_SIZE"; col='$(NF-1)'
+        [[ "$BW_QP" -gt 1 ]] && extra="$extra -q $BW_QP"
     else
         extra="-s $LAT_MSG_SIZE"; key="$LAT_MSG_SIZE"; col='$6'
     fi
@@ -1954,8 +1989,10 @@ check_mlx5_versions() {
 
     # Only Ethernet/RoCE ports must be ACTIVE; native IB ports may legitimately
     # be Down on a RoCE-only host.
-    local dev state link fw_ver eth_dev devid inactive_devs=()
-    local -A fw_by_model=()  # PCI device id -> space-separated fw versions
+    local dev state link fw_ver eth_dev devid rate inactive_devs=()
+    local -A fw_by_model=()    # PCI device id -> space-separated fw versions
+    local -A devs_by_model=()  # PCI device id -> space-separated device names
+    local -A rate_by_model=()  # PCI device id -> link rate of the last dev seen
     for dev in "${MLX5_DEVS[@]}"; do
         state=$(awk -F': *' '{print $2}' "$ib_root/$dev/ports/1/state" 2>/dev/null)
         link=$(cat "$ib_root/$dev/ports/1/link_layer" 2>/dev/null)
@@ -1963,7 +2000,10 @@ check_mlx5_versions() {
         eth_dev=$(basename "$(readlink -f "$ib_root/$dev/device/net/"* 2>/dev/null)" 2>/dev/null)
         devid=$(cat "$ib_root/$dev/device/device" 2>/dev/null)
 
+        rate=$(awk '{print $1" "$2}' "$ib_root/$dev/ports/1/rate" 2>/dev/null)
         [[ -n "$fw_ver" ]] && fw_by_model["${devid:-?}"]+="$fw_ver "
+        devs_by_model["${devid:-?}"]+="$dev "
+        [[ -n "$rate" ]] && rate_by_model["${devid:-?}"]="$rate"
         if [[ "$link" == "Ethernet" ]]; then
             MLX5_ROCE_DEVS+=("$dev")
             [[ -n "$eth_dev" ]] && MLX5_ROCE_ETH+=("$eth_dev")
@@ -1986,6 +2026,22 @@ check_mlx5_versions() {
         read -ra fws <<< "${fw_by_model[$model]}"
         report_uniform "mlx5 firmware (${devname:-PCI id $model})" "${fws[@]}"
     done
+
+    # More than one card model on the host. Legitimate -- the usual layout is a
+    # fast fabric NIC plus a slower management NIC -- but every step from here on
+    # meshes all mlx5 devices together, so the slow ones show up as unreachable
+    # cells and as rails that miss the bandwidth threshold. Name them once, up
+    # front, so those later failures read as expected rather than as faults.
+    if (( ${#devs_by_model[@]} > 1 )); then
+        log_warn "host has ${#devs_by_model[@]} mlx5 card models -- they are meshed together below:"
+        local m dname
+        for m in "${!devs_by_model[@]}"; do
+            dname=$(lspci -d "15b3:$m" -mm 2>/dev/null | head -1 | awk -F'"' '{print $6}')
+            log_warn "  ${dname:-PCI id $m} @ ${rate_by_model[$m]:-unknown rate} : ${devs_by_model[$m]% }"
+        done
+        log_warn "  a lower-rate model is usually the management NIC, not fabric: expect it to"
+        log_warn "  fail the ${BW_THRESHOLD} Gbps rail threshold and to show x cells in steps 4-6"
+    fi
 
     # If native IB ports outnumber RoCE ports, the RoCE port(s) are likely an
     # incidental management NIC, not MORI's fabric. Clear MLX5_ROCE_DEVS so
