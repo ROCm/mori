@@ -139,21 +139,49 @@ is where this backend adopts cco's version of it rather than inventing a third.
 
 ### HIP vs Triton
 
-Same grid, same block size, same pointer array, 8×gfx950 in one run:
+Same grid, same block size, same pointer array. Reported as us/iter, which is steadier
+than the summed bandwidth; the range is across three runs.
 
-| chunk per peer | HIP, pointer array | HIP, `base + rank*stride` | Triton, pointer array |
-|---|---|---|---|
-| 4 MiB | 1843.3 GB/s | 1848.4 GB/s | 1818.3 GB/s |
-| 1 MiB | 1784.0 GB/s | — | 1769.5 GB/s |
-| 256 KiB | 1536.3 GB/s | 1519.1 GB/s | 1256.6 GB/s |
+8×gfx950, torch 2.10 / Triton 3.7, POSIX-fd handles:
 
-Triton matches HIP once the kernel is long enough to hide the launch: within a couple of
-percent at 4 MiB and 1 MiB, either side depending on the run — a repeat of the 4 MiB row
-put Triton ahead, 1852.2 vs 1832.2, which is the run-to-run spread on this box.
+| chunk per peer | HIP, pointer array | Triton, pointer array |
+|---|---|---|
+| 4 MiB | 113.2-140.0 us (1861-1938 GB/s) | 114.7-137.3 us (1875-1983 GB/s) |
+| 256 KiB | 9.3-9.8 us (1497-1547 GB/s) | 9.4-10.3 us (1435-1538 GB/s) |
 
-At 256 KiB it is 18% behind, and that gap is a near-constant ~1.3 us per launch rather
-than anything in the kernel: the same 512 blocks each store the same 1024 int32 in both
-versions, so what shows at 9-10 us of work is Triton's host-side launcher, not its codegen.
+4×gfx1250, torch 2.11 / Triton 3.8, **fabric** handles. This box's GPUs were busy with
+another tenant, so compare the columns to each other, not to the table above — and one
+4 MiB run got hit hard enough (65.3 / 156.4 us) to be dropped as contention:
+
+| chunk per peer | HIP, pointer array | Triton, pointer array |
+|---|---|---|
+| 4 MiB | 30.1-30.4 us (1666-1668 GB/s) | 32.2-33.5 us (1498-1556 GB/s) |
+| 1 MiB | 10.3 us (1240 GB/s) | 14.7 us (866 GB/s) |
+| 256 KiB | 6.0-6.5 us (508-527 GB/s) | 14.0-15.0 us (213-221 GB/s) |
+
+All three variants are correctness-checked on both machines, and the Triton kernel needs no
+change between them — wave64 gfx950 and wave32 gfx1250 both just work, and forcing 256
+lanes on gfx1250 with `num_warps=8` moves nothing (32.2 vs 33.2 us at 4 MiB).
+
+**Where Triton loses, it loses on the host, not on the device.** Launches are asynchronous,
+so a steady-state iteration costs `max(kernel, launch)`, and the Python launcher is the
+larger of the two for a long way up. Timing the launch call alone, 500 calls with no sync:
+
+| | HIP, pybind | Triton |
+|---|---|---|
+| gfx950, torch 2.10 / Triton 3.7 | 2.90 us | 9.01 us |
+| gfx1250, torch 2.11 / Triton 3.8 | 2.44 us | 12.83 us |
+
+That predicts both tables. On gfx1250 the Triton row is pinned near 14 us at 256 KiB *and*
+at 1 MiB despite 4x the data — it is not moving data, it is waiting on the launcher — and
+only at 4 MiB, where the kernel itself runs ~30 us, does it come within 10%. On gfx950 the
+9 us launcher sits just under the 9-10 us kernel, so the two are indistinguishable at every
+size measured, Triton ahead as often as behind.
+
+The kernels themselves are equivalent. Worth remembering before reading anything into a
+small-message Triton number on a symmetric-memory benchmark: it may be measuring
+`triton.JITFunction.run`. Real uses amortise that — CUDA graphs, or a persistent kernel
+that does many transfers per launch.
 
 ### Why gfx942 is slow
 

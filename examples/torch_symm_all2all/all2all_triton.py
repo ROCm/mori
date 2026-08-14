@@ -35,6 +35,8 @@ extension build: torch already hands out the array, so no C++ is involved.
 Run it through ``all2all.py --kernel triton``.
 """
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
@@ -81,8 +83,13 @@ def _all2all_push_ptrs(
         tl.store(dst + offs, tl.load(src + offs, mask=mask), mask=mask)
 
 
+@functools.cache
 def _blocks_per_peer(chunk_elems: int, world_size: int, device) -> int:
-    """Two blocks per CU split across peers, capped by how much there is to slice."""
+    """Two blocks per CU split across peers, capped by how much there is to slice.
+
+    Cached because it is on the launch path, where microseconds are the whole story:
+    ``get_device_properties`` costs ~0.9 us, against a Triton launch of ~9-13 us.
+    """
     cus = torch.cuda.get_device_properties(device).multi_processor_count
     bpp = max(1, cus * 2 // max(1, world_size))
     return min(bpp, max(1, chunk_elems // BLOCK))
