@@ -77,8 +77,9 @@ class EpDispatchCombineOpHybrid(EpDispatchCombineOp, backend="hybrid"):
         self.dev = dev
         self._recv_cap = cfg.effective_max_recv
         self._closed = False
-        _arch = getattr(torch.cuda.get_device_properties(dev), "gcnArchName", "") or ""
-        self._is1250 = _arch.split(":")[0].startswith("gfx125")
+        # No gfx1250 arch probe here: the HIP dispatch plan selects its own
+        # portable-vs-TDM body at render time, and the gfx1250 combine's fan
+        # buffer is unused because combine is FlyDSL, not the TDM kernel.
 
         self._gate(
             KernelSet(dispatch={}, combine={}, unsupported=self._unsupported(cfg))
