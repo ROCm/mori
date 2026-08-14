@@ -682,12 +682,9 @@ class EpDispatchCombineOp:
         disp_spec, _ = self._pick(n)
 
         if not self._kernels.self_resets_counters:
-            # Local scratch only. The arena's tok_off and recv_num are NOT reset:
-            # peers write them, and an unsynchronised host memset would wipe a
-            # signal that already arrived and hang both ranks.
+            # Only this one: the kernels self-clear dest_pe_counter and the grid
+            # barrier, but total_recv is cleared in COMBINE, not in dispatch.
             self.total_recv.zero_()
-            self.dest_pe_counter.zero_()
-            self.dispatch_barrier.zero_()
 
         if routing is not None:
             table = self._kernels.dispatch_replay
@@ -762,8 +759,7 @@ class EpDispatchCombineOp:
             if input.data_ptr() != out_tok_ptr:
                 dst = self.combine_in_view().view(-1)[: input.numel()]
                 dst.copy_(input.reshape(-1))
-        if not self._kernels.self_resets_counters:
-            self.combine_barrier.zero_()
+        # No combine_barrier.zero_(): the cross-device barrier clears it itself.
         # No combine_out.zero_(): the kernel reduce-then-stores every token in
         # [0, ct), so the prior contents of the returned slice never leak.
 
