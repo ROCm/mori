@@ -260,6 +260,101 @@ query_rdma_devices() {
     fi
 }
 
+# Self-contained snippet printing "<dev> <state> <phys_state> <link_layer>" for
+# every local IB device. `state` reads as "4: ACTIVE" and phys_state as
+# "5: LinkUp", hence the cut on the second space-separated field. Like the other
+# snippets here it is embedded in a single-quoted ssh command line, so it must
+# stay free of single quotes.
+_LINK_STATE_SNIPPET='for d in /sys/class/infiniband/*; do
+[ -d "$d" ] || continue; n=${d##*/}; p="$d/ports/1";
+s=$(cut -d" " -f2 "$p/state" 2>/dev/null); y=$(cut -d" " -f2 "$p/phys_state" 2>/dev/null);
+l=$(cat "$p/link_layer" 2>/dev/null);
+echo "$n ${s:-unknown} ${y:-unknown} ${l:-unknown}"; done'
+
+# query_link_states <assoc_name> [host]
+#   fills the named assoc array: dev -> "<state> <phys_state> <link_layer>".
+#   One round trip for all devices, not one per device.
+#   The nameref is __qls_st, not _st: bash rejects `local -n x="x"` as a circular
+#   reference, and a caller naturally wants to name its own array _st. That
+#   failure is silent -- the array stays empty and every device looks unknown --
+#   so keep this name distinct from anything a caller would pick.
+query_link_states() {
+    local -n __qls_st="$1"; local host="${2:-}" out n s y l
+    if [[ -z "$host" || "$host" == "localhost" || "$host" == "127.0.0.1" ]]; then
+        out=$(bash -c "$_LINK_STATE_SNIPPET" 2>/dev/null)
+    else
+        out=$("${SSH_PREFIX[@]}" ssh $SSH_OPTS "$SSH_USER@$host" \
+              "echo __LNK__; bash -c '$_LINK_STATE_SNIPPET'" 2>/dev/null \
+              | sed -n '/^__LNK__$/,$p' | tail -n +2)
+    fi
+    while read -r n s y l; do
+        [[ -n "$n" ]] && __qls_st["$n"]="$s $y $l"
+    done <<< "$out"
+}
+
+# filter_fabric_devs <out_array_name> <host> <dev...>
+#   Keeps only the devices that can actually carry mesh traffic. ibv_devices
+#   already excludes non-RDMA interfaces, but says nothing about whether a port
+#   is up: a DOWN port still entered the mesh and contributed a whole row and
+#   column of ✗, inflating the "N/M reachable" warning on a host where every
+#   live rail worked. Step 1 computes the same liveness and then discards it.
+#
+#   Every exclusion is reported. Shrinking the mesh silently would turn a dead
+#   fabric NIC into a clean-looking matrix covering fewer pairs than the reader
+#   assumes -- the opposite failure, and the harder one to notice.
+#
+#   Not covered: a NIC that is ACTIVE but not on the fabric (a management port
+#   of the same vendor). No sysfs field distinguishes it; that needs the subnet
+#   reasoning in intra_reachable(), deliberately left out here.
+filter_fabric_devs() {
+    local -n _out="$1"; local host="$2"; shift 2
+    local -A _st=(); query_link_states _st "$host"
+    local where="local"; [[ -n "$host" ]] && where="$host"
+    local d state phys link
+    local -a alive=()
+
+    for d in "$@"; do
+        # No sysfs row for it: keep it. An actual mesh probe is a better
+        # authority than a file we could not read.
+        [[ -n "${_st[$d]:-}" ]] || { alive+=("$d"); continue; }
+        read -r state phys link <<< "${_st[$d]}"
+        if [[ "$state" != "ACTIVE" ]]; then
+            log_warn "$d ($where) excluded from mesh: port state=$state"; continue
+        fi
+        if [[ "$phys" != "LinkUp" && "$phys" != "unknown" ]]; then
+            log_warn "$d ($where) excluded from mesh: phys_state=$phys"; continue
+        fi
+        alive+=("$d")
+    done
+
+    # ib_write_bw cannot pair an InfiniBand port with a RoCE one, so keep the
+    # majority link layer and drop the rest rather than filling the matrix with
+    # pairs that were never going to work.
+    local -A _ll=(); local -a _ll_order=(); local best="" bc=0
+    for d in "${alive[@]}"; do
+        read -r state phys link <<< "${_st[$d]:-unknown unknown unknown}"
+        [[ -n "${_ll[$link]:-}" ]] || _ll_order+=("$link")
+        _ll["$link"]=$(( ${_ll[$link]:-0} + 1 ))
+    done
+    # First-seen order with a strict >, so a tie goes to whichever link layer
+    # appeared first in the caller's device list. Iterating "${!_ll[@]}" would
+    # decide ties in bash hash order: on a 1-1 split the winner flips between
+    # runs, and the run that picks InfiniBand drops every RoCE fabric NIC.
+    for link in "${_ll_order[@]}"; do
+        (( ${_ll[$link]} > bc )) && { bc=${_ll[$link]}; best="$link"; }
+    done
+
+    _out=()
+    for d in "${alive[@]}"; do
+        read -r state phys link <<< "${_st[$d]:-unknown unknown unknown}"
+        if [[ -n "$best" && "$link" != "unknown" && "$link" != "$best" ]]; then
+            log_warn "$d ($where) excluded from mesh: link_layer=$link, mesh is $best"
+            continue
+        fi
+        _out+=("$d")
+    done
+}
+
 # Self-contained snippet ($1=ib device) that prints the best GID index for that
 # device, mirroring MORI's ScoreGidCandidate (rdma.cpp): RoCEv2 (+1000) over
 # RoCEv1 (+500); IPv4-mapped (+200) over global IPv6 (+100) over link-local (+0);
@@ -672,35 +767,187 @@ mesh_prepare() {
     return 0
 }
 
-# rail_check <tool> <peer> <row_arr> <col_arr> <rgid_assoc> <cgid_assoc>
-#            <host_cell_assoc> <label> <unit> <fmt>
-#   host_cell_assoc is the matrix the host-memory mesh just filled in, keyed
-#   "<row>,<col>". A GPU-memory failure only means GPUDirect if that same rail
-#   passed on host memory, so the verdict needs both results.
-#   GPU-memory pass over the rail-aligned pairs only: row[i] <-> col[i].
-#   Rationale: the full mesh above already established reachability on host
-#   memory; what GPU memory adds is whether GPUDirect works on the rails MORI
-#   actually transfers over. Probing all NxN pairs would pay a HIP init per cell
-#   to re-answer a question already answered.
-rail_check() {
+# Fabric topology, derived from the inter-node host-memory mesh. Set by
+# assess_fabric_topology() and reported once at the end of the run, because it
+# is a property of the cluster rather than of any single step.
+FABRIC_TOPOLOGY=""      # "" (unknown) | rail-only | partial | full
+FABRIC_TOPO_DETAIL=""
+
+# assess_fabric_topology <cell_assoc> <nrows> <ncols>
+#   Classify the fabric from which cells carried traffic. On a rail-only cluster
+#   NIC i reaches only NIC i on the peer, so the mesh is diagonal: that is the
+#   expected shape there, not a fault, and mesh_report already declines to fail
+#   on it. What it cannot do is tell the reader what the shape *means* for MORI.
+assess_fabric_topology() {
+    local -n _c="$1"; local nr="$2" nc="$3"
+    local i j n=$nr diag_ok=0 off_ok=0 off_total=0
+    (( nc < n )) && n=$nc
+    (( n > 0 )) || return 0
+    for (( i=0; i<nr; i++ )); do
+        for (( j=0; j<nc; j++ )); do
+            if (( i == j )); then
+                [[ "${_c[$i,$j]:-x}" =~ ^[0-9.]+$ ]] && diag_ok=$(( diag_ok + 1 ))
+            else
+                off_total=$(( off_total + 1 ))
+                [[ "${_c[$i,$j]:-x}" =~ ^[0-9.]+$ ]] && off_ok=$(( off_ok + 1 ))
+            fi
+        done
+    done
+    (( off_total > 0 )) || return 0
+    if (( off_ok == 0 && diag_ok == 0 )); then
+        # Nothing carried traffic at all. Distinct from rail-only, which needs
+        # the rails to actually be up -- calling this "partially connected" would
+        # tell the reader some pairs work when none do.
+        FABRIC_TOPOLOGY="none"
+        FABRIC_TOPO_DETAIL="0/$n rails up, 0/$off_total cross-rail pairs reachable"
+    elif (( off_ok == 0 && diag_ok > 0 )); then
+        FABRIC_TOPOLOGY="rail-only"
+        FABRIC_TOPO_DETAIL="$diag_ok/$n rails up, 0/$off_total cross-rail pairs reachable"
+    elif (( off_ok == off_total )); then
+        FABRIC_TOPOLOGY="full"
+        FABRIC_TOPO_DETAIL="all $off_total cross-rail pairs reachable"
+    else
+        FABRIC_TOPOLOGY="partial"
+        FABRIC_TOPO_DETAIL="$diag_ok/$n rails up, $off_ok/$off_total cross-rail pairs reachable"
+    fi
+}
+
+# report_fabric_topology
+#   One line at the end of the run. MORI-EP does not support a rail-only fabric
+#   today, and that is invisible in the per-step output: every step passes,
+#   because a rail-only fabric is not broken -- it just is not what MORI-EP
+#   needs. A WARN, not a FAIL: the check reports what the fabric is, and whether
+#   that suits MORI-EP is a fact about MORI-EP.
+report_fabric_topology() {
+    [[ -n "$FABRIC_TOPOLOGY" ]] || return 0
+    case "$FABRIC_TOPOLOGY" in
+        full)
+            # Say so rather than staying silent: a reader cannot tell "classified
+            # as fully routed" from "the classifier never ran", and this is the
+            # line that tells them MORI-EP has the paths it needs.
+            log_ok "fabric is fully routed ($FABRIC_TOPO_DETAIL) — MORI-EP cross-rail paths present"
+            ;;
+        none)
+            log_warn "no inter-node RDMA path on any NIC pair ($FABRIC_TOPO_DETAIL)"
+            log_warn "  neither MORI-EP nor MORI-IO can run cross-node here. Step 5 shows the"
+            log_warn "  whole matrix failing, which is a fabric or QoS problem, not a topology."
+            ;;
+        rail-only)
+            log_warn "fabric looks rail-only ($FABRIC_TOPO_DETAIL)"
+            log_warn "  MORI-EP does not support rail-only fabrics at this time: dispatch/combine"
+            log_warn "  sends cross-rail (NIC i -> NIC j), which has no path here. MORI-IO with"
+            log_warn "  MORI_IO_RAIL_AFFINITY=1 stays on-rail and is expected to work."
+            ;;
+        partial)
+            log_warn "fabric is partially connected ($FABRIC_TOPO_DETAIL)"
+            log_warn "  neither a clean rail-only nor a fully routed fabric -- cross-rail traffic"
+            log_warn "  works for some NIC pairs and not others. Check the x cells in Step 5;"
+            log_warn "  MORI-EP needs cross-rail paths and will fail on the missing ones."
+            ;;
+    esac
+}
+
+# gpu_mesh_check <tool> <peer> <row_arr> <col_arr> <rgid_assoc> <cgid_assoc>
+#                <host_cell_assoc> <label> <unit> <fmt>
+#   Full NxM GPU-memory mesh, mirroring the host-memory mesh that just ran.
+#   host_cell_assoc is that host matrix, keyed "<row>,<col>": a GPU failure only
+#   implicates GPUDirect if the same pair passed on host memory.
+#
+#   This used to probe the rail-aligned diagonal only, on the argument that the
+#   host mesh had already established reachability and GPU memory only needed to
+#   confirm the rails MORI transfers over. That assumed cross-NIC GPUDirect
+#   follows from the diagonal, which nothing verifies -- peer-memory registration
+#   and the ToR path are not the same question. The full mesh costs NxM HIP inits
+#   instead of N; that is the price of measuring it rather than assuming it.
+#   mesh_execute already keys the GPU per cell (MESH_RGPU[row] / MESH_CGPU[col]),
+#   so off-diagonal pairs use each side's own NIC-local GPU with no extra work.
+gpu_mesh_check() {
     local tool="$1" peer="$2"
     local -n _rr="$3" _cc="$4" _rg="$5" _cg="$6" _hc="$7"
+    local hc_name="$7"
     local label="$8" unit="$9" fmt="${10}"
 
     [[ -n "$MESH_GPU_READY" ]] || return 0
-    local n=${#_rr[@]}; (( ${#_cc[@]} < n )) && n=${#_cc[@]}
-    (( n > 0 )) || return 0
+    local nr=${#_rr[@]} nc=${#_cc[@]}
+    (( nr > 0 && nc > 0 )) || return 0
+    local n=$nr; (( nc < n )) && n=$nc
 
-    # Rails only, so build 1:1 slices and let mesh_execute do the probing.
-    local -a R=() C=(); local i
-    for (( i=0; i<n; i++ )); do R+=("${_rr[$i]}"); C+=("${_cc[$i]}"); done
+    # Probe only what host memory already proved. A pair with no fabric path
+    # cannot say anything about GPUDirect, and re-probing it costs a full GPU
+    # timeout (MESH_CLI_TIMEOUT x MESH_GPU_TIME_SCALE) to rediscover Step 5's
+    # answer. On a rail-only cluster that is 56 of 64 pairs, ~84s of pure
+    # timeout. Gating also means every failure below genuinely implicates
+    # GPUDirect, so the verdict needs no "unless the fabric was already broken"
+    # caveat.
+    local i j gated=0 gated_off=0
+    for (( i=0; i<nr; i++ )); do
+        for (( j=0; j<nc; j++ )); do
+            if [[ "${_hc[$i,$j]:-x}" =~ ^[0-9.]+$ ]]; then
+                gated=$(( gated + 1 )); (( i != j )) && gated_off=$(( gated_off + 1 ))
+            fi
+        done
+    done
+    if (( gated == 0 )); then
+        log_warn "$label: no pair reachable on host memory, skipping the GPU-memory pass"
+        return 0
+    fi
 
-    log_ok "$label: GPU-memory pass over $n rail-aligned pair(s) via ${MESH_GPU_MODE:-unknown}, timeouts x$MESH_GPU_TIME_SCALE for HIP init"
-    # Serially, unlike the mesh above. The mesh only has to answer "is this pair
-    # reachable", which survives contention; these are the numbers a user would
-    # actually quote, and running 8 rails at once oversubscribes the host badly
-    # enough that one or two land at a third of line rate every run. n rails at
-    # a few seconds each is a cheap price for numbers that mean something.
+    # ---- Phase A: cross-rail coverage, concurrent ----------------------------
+    # Skipped when host memory only proved the diagonal (a rail-only fabric):
+    # Phase B covers those same pairs, and serially, so running both would just
+    # measure the diagonal twice.
+    if (( gated_off > 0 )); then
+        log_ok "$label: GPU-memory mesh over the $gated pair(s) reachable on host memory, via ${MESH_GPU_MODE:-unknown}, timeouts x$MESH_GPU_TIME_SCALE for HIP init"
+        mesh_gpu_on
+        local -A GCELL=()
+        mesh_execute GCELL "$tool" "$peer" false "$( [[ "$tool" == ib_write_bw ]] && echo 1000 )" \
+                     _rg _cg _rr _cc false "$hc_name"
+        mesh_gpu_off
+        mesh_report GCELL _rr _cc "$label GPU memory" "$unit" "$fmt" no
+
+        # Reachability only -- no threshold. Concurrent probes do not produce
+        # numbers worth judging: measured on cv350, the same healthy fabric
+        # flagged 10/64 then 6/64 pairs below BW_THRESHOLD across two runs, a
+        # different set each time, while reachability stayed 64/64. Contention
+        # moves the numbers, not the connectivity. Phase B does the judging.
+        local bad=0
+        for (( i=0; i<nr; i++ )); do
+            for (( j=0; j<nc; j++ )); do
+                [[ "${_hc[$i,$j]:-x}" =~ ^[0-9.]+$ ]] || continue
+                [[ "${GCELL[$i,$j]:-x}" =~ ^[0-9.]+$ ]] || bad=$(( bad + 1 ))
+            done
+        done
+        if (( bad == 0 )); then
+            log_ok "$label GPU memory: all $gated pair(s) reachable on GPU memory"
+        else
+            log_fail "$label GPU memory: $bad/$gated pair(s) reachable on host memory but not on GPU -- GPUDirect RDMA problem"
+            # The mode was proven by a loopback on THIS host only, so a peer
+            # missing the same registration path looks identical from here.
+            [[ -n "$peer" && "$MESH_GPU_MODE" == "peer_mem" ]] && \
+                log_warn "  $MESH_GPU_MODE was proven on this host only; a peer without it fails the same way"
+        fi
+    fi
+
+    # ---- Phase B: the numbers, serially --------------------------------------
+    # The rail-aligned pairs are what MORI actually transfers over, and these are
+    # the figures a user would quote, so they run one at a time: 8 rails at once
+    # oversubscribes the host badly enough that some land at a third of line rate
+    # (69a3027b). n probes at a few seconds each is a cheap price for numbers
+    # that mean something -- and unlike Phase A, these are worth judging.
+    local -a R=() C=(); local diag_gated=0
+    for (( i=0; i<n; i++ )); do
+        [[ "${_hc[$i,$i]:-x}" =~ ^[0-9.]+$ ]] || continue
+        R+=("${_rr[$i]}"); C+=("${_cc[$i]}"); diag_gated=$(( diag_gated + 1 ))
+    done
+    if (( diag_gated == 0 )); then
+        log_warn "$label GPU memory: no rail-aligned pair reachable on host memory, skipping the serial pass"
+        return 0
+    fi
+    if (( ${#_rr[@]} != ${#_cc[@]} )); then
+        log_warn "$label: ${#_rr[@]} local vs ${#_cc[@]} remote device(s) -- pairing by index, which may not be rail-aligned"
+    fi
+
+    log_ok "$label: GPU-memory serial pass over $diag_gated rail-aligned pair(s) for per-rail numbers"
     local MESH_PARALLEL=1
     mesh_gpu_on
     local -A RCELL=()
@@ -708,19 +955,12 @@ rail_check() {
                  _rg _cg R C true
     mesh_gpu_off
 
-    # Report the diagonal as a list; a mostly-empty NxN matrix would just be noise.
-    # R/C are the first n entries of the same arrays the host mesh ran over, so
-    # rail i is host cell [i,i].
-    # Judge the numbers, do not just print them. BW_THRESHOLD/LAT_THRESHOLD have
-    # been dead config since they were introduced, so a rail at a third of line
-    # rate reported as "passed". Serial execution above makes them meaningful:
-    # measured spread across rails is now ~1 Gbps and ~0.3 us.
     local thr dir
     if [[ "$tool" == "ib_write_bw" ]]; then thr="$BW_THRESHOLD"; dir=min
     else                                    thr="$LAT_THRESHOLD"; dir=max; fi
 
-    local ok=0 slow=0 bad_gpu=0 bad_both=0 v gpu h
-    for (( i=0; i<n; i++ )); do
+    local ok=0 slow=0 dead=0 v gpu
+    for (( i=0; i<diag_gated; i++ )); do
         v="${RCELL[$i,$i]:-x}"; gpu="${MESH_RGPU[${R[$i]}]:-?}"
         if [[ "$v" =~ ^[0-9.]+$ ]]; then
             if awk -v v="$v" -v t="$thr" -v d="$dir" \
@@ -733,38 +973,20 @@ rail_check() {
                 ok=$(( ok + 1 ))
                 printf "  %-12s <-> %-12s (gpu %s) : %s %s\n" "${R[$i]}" "${C[$i]}" "$gpu" "$v" "$unit"
             fi
-            continue
-        fi
-        # Only a rail that passed on host memory implicates GPUDirect. One that
-        # failed there too has no fabric path at all (a management NIC that is not
-        # on the RDMA fabric is the common case), and calling that a GPU fault
-        # sends the reader after amdgpu/peer_mem for a NIC that never worked.
-        h="${_hc[$i,$i]:-x}"
-        if [[ "$h" =~ ^[0-9.]+$ ]]; then
-            bad_gpu=$(( bad_gpu + 1 ))
-            printf "  %-12s <-> %-12s (gpu %s) : FAILED (host memory passed)\n" \
-                   "${R[$i]}" "${C[$i]}" "$gpu"
         else
-            bad_both=$(( bad_both + 1 ))
-            printf "  %-12s <-> %-12s (gpu %s) : FAILED (host memory failed too)\n" \
+            dead=$(( dead + 1 ))
+            printf "  %-12s <-> %-12s (gpu %s) : FAILED (host memory passed)\n" \
                    "${R[$i]}" "${C[$i]}" "$gpu"
         fi
     done
-    if (( bad_gpu == 0 && bad_both == 0 && slow == 0 )); then
+    if (( slow == 0 && dead == 0 )); then
         log_ok "$label GPU memory: all $ok rail(s) passed (threshold $dir $thr $unit)"
         return 0
     fi
     (( slow )) && log_fail \
-        "$label GPU memory: $slow/$n rail(s) completed but missed the $thr $unit threshold"
-    (( bad_gpu )) && log_fail \
-        "$label GPU memory: $bad_gpu/$n rail(s) passed on host memory but failed on GPU -- GPUDirect RDMA problem"
-    # The mode was proven by a loopback on THIS host only, so a peer missing the
-    # same registration path looks identical from here. Say so rather than
-    # pinning it on the local GPUDirect stack.
-    (( bad_gpu > 0 )) && [[ -n "$peer" && "$MESH_GPU_MODE" == "peer_mem" ]] && \
-        log_warn "  $MESH_GPU_MODE was proven on this host only; a peer without it fails the same way"
-    (( bad_both )) && log_warn \
-        "$label GPU memory: $bad_both/$n rail(s) failed on host memory too -- no fabric path, not a GPUDirect fault"
+        "$label GPU memory: $slow/$diag_gated rail(s) completed but missed the $thr $unit threshold"
+    (( dead )) && log_fail \
+        "$label GPU memory: $dead/$diag_gated rail(s) passed on host memory but failed on GPU -- GPUDirect RDMA problem"
     return 0
 }
 
@@ -811,6 +1033,11 @@ mesh_execute() {
     local -n _cell="$1" _rgid="$6" _cgid="$7" _row="$8" _col="$9"
     local tool="$2" shost="$3" self_skip="$4" iters="$5"
     local diag_only="${10:-false}"   # true => probe only row[i] <-> col[i]
+    # Optional: name of an assoc array keyed "<i>,<j>". When given, probe only
+    # the cells that hold a number there. Used to run the GPU pass over exactly
+    # the pairs host memory already proved, so a pair with no fabric path is not
+    # re-probed at the GPU timeout budget to learn what Step 5 already reported.
+    local gate_name="${11:-}"
     local nr=${#_row[@]} nc=${#_col[@]}
     local extra key col
     if [[ "$tool" == "ib_write_bw" ]]; then
@@ -827,6 +1054,10 @@ mesh_execute() {
             if [[ "$self_skip" == "true" && "${_row[$i]}" == "${_col[$j]}" ]] \
                || [[ "$diag_only" == "true" && $i -ne $j ]]; then
                 printf -- '-' > "$tmpd/$i.$j"; continue
+            fi
+            if [[ -n "$gate_name" ]]; then
+                local _gk="${gate_name}[$i,$j]"
+                [[ "${!_gk:-x}" =~ ^[0-9.]+$ ]] || { printf -- '-' > "$tmpd/$i.$j"; continue; }
             fi
             port=$(( IB_PORT + i * nc + j ))   # unique per pair
             (
@@ -923,7 +1154,15 @@ mesh_report() {
     done
 
     echo ""
-    echo "  $title $unit matrix"
+    # Qualify the numbers when they were measured concurrently. Up to
+    # MESH_PARALLEL pairs run at once, which moves the throughput a lot: the same
+    # healthy fabric measured 84-386 Gbps in one run and 243-386 in the next,
+    # against 345-387 serially. Reachability survives contention -- that is what
+    # the mesh is for, and nothing here judges the figures -- but a bare "Gbps
+    # matrix" invites the reader to quote them. Serial callers get no qualifier.
+    local qual=""
+    (( MESH_PARALLEL > 1 )) && qual="   (concurrent x$MESH_PARALLEL — reachability probe, not a benchmark)"
+    echo "  $title $unit matrix$qual"
     echo "$hdr"
     for (( i=0; i<nr; i++ )); do
         local row; row=$(printf "  %-10s" "$(echo "${_row[$i]}" | sed 's/bnxt_//')")
@@ -1211,6 +1450,10 @@ check_intra_node_bw() {
     else
         dominant_group LOCAL_DEVS "${all_devs[@]}"
     fi
+    # Drop ports that cannot carry traffic before the mesh sees them. LOCAL_DEVS
+    # is global and reused by steps 5 and 6, so filtering once here covers all
+    # three mesh steps.
+    filter_fabric_devs LOCAL_DEVS "" "${LOCAL_DEVS[@]}"
     if (( ${#all_devs[@]} != ${#LOCAL_DEVS[@]} )); then
         log_warn "mixed NIC vendors detected; using ${#LOCAL_DEVS[@]} devices for tests: ${LOCAL_DEVS[*]}"
     fi
@@ -1220,8 +1463,16 @@ check_intra_node_bw() {
     # RDMA writes per pair scales with the test size (number of devices squared).
     local iters=$(( n * n ))
     # Intra-node pairs are all local (no ssh), so they aren't bound by sshd
-    # MaxSessions -> use more parallelism than the inter-node mesh.
-    local MESH_PARALLEL=$(( MESH_PARALLEL * 4 ))
+    # MaxSessions -- but they are bound by the host. This used to run at
+    # MESH_PARALLEL * 4 on the theory that reachability survives contention the
+    # way 69a3027b argued for the rail pass. It does not: 32 concurrent
+    # ib_write_bw server+client pairs on one host push server bind past
+    # MESH_SRV_WAIT_LOCAL, the client times out, and the cell is recorded
+    # unreachable. Measured on cv350 gfx950 -- 7/56 "reachable" at x4, every one
+    # of the 49 failures a false negative (the same pairs run serially at
+    # ~312 Gbps, and all 56 IP paths ping clean). MESH_RETRIES=2 did not absorb
+    # it. Contention degrades the rail pass into bad numbers; here it degrades
+    # into wrong answers, which is worse.
     log_ok "full mesh over $n devices ($((n*(n-1))) ordered pairs, ${iters} writes/pair, parallel=$MESH_PARALLEL)"
 
     local -A GID=(); build_gid_map GID "" "${LOCAL_DEVS[@]}"
@@ -1246,6 +1497,10 @@ check_inter_node_bw() {
     mapfile -t all_remote < <(query_rdma_devices "$PEER_IP")
     [[ ${#all_remote[@]} -gt 0 ]] || { log_fail "no RDMA devices on $PEER_IP (check ibv_devices / ssh)"; return 1; }
     local REMOTE_DEVS=(); dominant_group REMOTE_DEVS "${all_remote[@]}"
+    # A down port on the peer costs a whole column of ✗, exactly as a local one
+    # costs a row. Filter both ends.
+    filter_fabric_devs REMOTE_DEVS "$PEER_IP" "${REMOTE_DEVS[@]}"
+    [[ ${#REMOTE_DEVS[@]} -gt 0 ]] || { log_fail "no usable RDMA devices on $PEER_IP after filtering"; return 1; }
     [[ ${#LOCAL_DEVS[@]} -gt 0 ]] || { log_fail "no local RDMA devices available"; return 1; }
     log_ok "local ${#LOCAL_DEVS[@]} x remote ${#REMOTE_DEVS[@]} mesh (parallel=$MESH_PARALLEL): ${REMOTE_DEVS[*]}"
 
@@ -1256,12 +1511,13 @@ check_inter_node_bw() {
     # just makes each working pair ~5x slower. no self-skip (distinct hosts).
     mesh_execute CELL ib_write_bw "$PEER_IP" false 1000 LGID RGID LOCAL_DEVS REMOTE_DEVS
     mesh_report CELL LOCAL_DEVS REMOTE_DEVS "inter-node BW" "Gbps" int
+    assess_fabric_topology CELL "${#LOCAL_DEVS[@]}" "${#REMOTE_DEVS[@]}"
 
-    # The mesh above ran on host memory. MORI transfers VRAM-to-VRAM, so follow
-    # up with a GPU-memory pass over the rail-aligned pairs: if those fail while
-    # the host-memory mesh passed, the fault is GPUDirect, not the fabric.
-    rail_check ib_write_bw "$PEER_IP" LOCAL_DEVS REMOTE_DEVS LGID RGID CELL \
-               "inter-node BW" "Gbps" int
+    # The mesh above ran on host memory. MORI transfers VRAM-to-VRAM, so repeat
+    # it on GPU memory: a pair that passed on host memory and fails here is a
+    # GPUDirect fault, not a fabric one.
+    gpu_mesh_check ib_write_bw "$PEER_IP" LOCAL_DEVS REMOTE_DEVS LGID RGID CELL \
+                   "inter-node BW" "Gbps" int
 }
 
 # =================== bnxt_re (Broadcom) checks =================
@@ -1353,9 +1609,35 @@ check_bnxt_versions() {
     local niccli_list
     niccli_list=$(sudo niccli --list 2>/dev/null || true)
 
-    # get list of NIC indices from niccli --list (first column, skip header)
-    local nic_indices=()
-    mapfile -t nic_indices < <(awk 'NR>1 && /^[[:space:]]*[0-9]/{gsub(/[^0-9]/,"",$1); print $1}' <<< "$niccli_list")
+    # Build a PCI->niccli_index map from the "niccli --list" output fetched above:
+    #   "  1) BCM57608  <mac>  235.2.40.0  0000:06:00.0  NIC  PCI"
+    declare -A _pci2idx=()
+    while IFS= read -r line; do
+        local _idx _pci
+        _idx=$(echo "$line" | awk '/^[[:space:]]*[0-9]+\)/{gsub(/[^0-9]/,"",$1); print $1}')
+        _pci=$(echo "$line" | grep -oiE '[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9]' | tr '[:upper:]' '[:lower:]')
+        [[ -n "$_idx" && -n "$_pci" ]] && _pci2idx["$_pci"]="$_idx"
+    done < <(echo "$niccli_list")
+
+    # Poll only the NICs that actually back a bnxt_re device. niccli lists every
+    # Broadcom NIC in the box, including ones with no RoCE: those report
+    # "RoCE Firmware Version: 0.0.0.0", which is a well-shaped version string, so
+    # it slips past the N/A guard from 7a7c8f7e and gets classified as an
+    # unverified 0.x branch -- a FAIL, plus a bogus "RoCE firmware inconsistent"
+    # warning. Measured on cv350: 12 NICs listed, 8 with bnxt_re; the 4 without
+    # (two dual-port cards) all read 0.0.0.0. Restricting the set also drops 12
+    # slow per-NIC firmware round trips to 8.
+    local nic_indices=() _d _pci
+    for _d in "${BNXT_DEVS[@]}"; do
+        _pci=$(basename "$(readlink -f "$ib_root/$_d/device")" 2>/dev/null || true)
+        [[ -n "${_pci2idx[$_pci]+x}" ]] && nic_indices+=("${_pci2idx[$_pci]}")
+    done
+    if [[ ${#nic_indices[@]} -eq 0 ]]; then
+        # No PCI matched (unexpected niccli --list format): fall back to every
+        # listed index rather than checking nothing at all.
+        mapfile -t nic_indices < <(awk 'NR>1 && /^[[:space:]]*[0-9]/{gsub(/[^0-9]/,"",$1); print $1}' <<< "$niccli_list")
+        (( ${#nic_indices[@]} )) && log_warn "could not map any bnxt_re device to a niccli index; checking all ${#nic_indices[@]} listed NICs"
+    fi
     if [[ ${#nic_indices[@]} -eq 0 ]]; then
         log_warn "niccli --list returned no devices; defaulting to index 1"
         nic_indices=(1)
@@ -1416,16 +1698,8 @@ check_bnxt_versions() {
     fi
 
     # --- port state, net device, and niccli index mapping via sysfs ---
-    # Build a PCI->niccli_index map from the "niccli --list" output fetched above:
-    #   "  1) BCM57608  <mac>  235.2.40.0  0000:06:00.0  NIC  PCI"
-    declare -A _pci2idx=()
-    while IFS= read -r line; do
-        local idx pci
-        idx=$(echo "$line" | awk '/^[[:space:]]*[0-9]+\)/{gsub(/[^0-9]/,"",$1); print $1}')
-        pci=$(echo "$line" | grep -oiE '[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9]' | tr '[:upper:]' '[:lower:]')
-        [[ -n "$idx" && -n "$pci" ]] && _pci2idx["$pci"]="$idx"
-    done < <(echo "$niccli_list")
-
+    # _pci2idx was built above, before the firmware query used it to pick which
+    # NICs to poll.
     local first_idx_set=false
     local dev state link eth_dev pci_addr
     local active_count=0 inactive_devs=()
@@ -1892,6 +2166,8 @@ check_inter_node_lat() {
     mapfile -t all_remote < <(query_rdma_devices "$PEER_IP")
     [[ ${#all_remote[@]} -gt 0 ]] || { log_fail "no RDMA devices on $PEER_IP"; return 1; }
     local REMOTE_DEVS=(); dominant_group REMOTE_DEVS "${all_remote[@]}"
+    filter_fabric_devs REMOTE_DEVS "$PEER_IP" "${REMOTE_DEVS[@]}"
+    [[ ${#REMOTE_DEVS[@]} -gt 0 ]] || { log_fail "no usable RDMA devices on $PEER_IP after filtering"; return 1; }
     [[ ${#LOCAL_DEVS[@]} -gt 0 ]]  || { log_fail "no local RDMA devices available"; return 1; }
     log_ok "local ${#LOCAL_DEVS[@]} x remote ${#REMOTE_DEVS[@]} latency mesh (parallel=$MESH_PARALLEL)"
 
@@ -1903,8 +2179,15 @@ check_inter_node_lat() {
     mesh_execute CELL ib_write_lat "$PEER_IP" false "" LGID RGID LOCAL_DEVS REMOTE_DEVS
     mesh_report CELL LOCAL_DEVS REMOTE_DEVS "inter-node latency" "us" f1 no
 
-    rail_check ib_write_lat "$PEER_IP" LOCAL_DEVS REMOTE_DEVS LGID RGID CELL \
-               "inter-node latency" "us" f1
+    # No GPU-memory pass here. Step 5 already answers whether GPUDirect works on
+    # every NIC pair, and it answers it on bandwidth, where the signal is large
+    # and the threshold is meaningful. Repeating it on latency measured the same
+    # registration path again and added only LAT_THRESHOLD, which does not hold
+    # up: measured serially on cv350 every rail sits at 10.9-11.7 us against a
+    # 10 us bar, so the pass failed a fabric running at line rate. 69a3027b read
+    # 6.77-7.10 us on different hardware and concluded the threshold was usable;
+    # it is not portable, and a bar that fires on healthy clusters trains readers
+    # to ignore the check.
 }
 
 # ============================= main =============================
@@ -1999,6 +2282,9 @@ minority_note
 check_intra_node_bw
 check_inter_node_bw
 check_inter_node_lat
+
+# Cluster-level findings the per-step output cannot express, reported once here.
+report_fabric_topology
 
 echo ""
 if (( FAIL_COUNT > 0 )); then
