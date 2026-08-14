@@ -159,10 +159,6 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
     return false;
   if (!ParseSizeEnv("UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES", &dist.ranged_scratch_size, error))
     return false;
-  if (dist.ranged_scratch_size == 0) {
-    *error = "UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES must be > 0";
-    return false;
-  }
   if (!ParseSizeEnv("UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SIZE", &dist.ssd_staging_buffer_size,
                     error)) {
     return false;

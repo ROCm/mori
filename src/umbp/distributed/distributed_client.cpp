@@ -79,14 +79,20 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   // the transfer engine below, and unlike a medium pool it has no hugepage/NUMA
   // policy to honour — it is touched once per remote ranged operation, not held
   // as a cache.
+  //
+  // Zero-sized is the default and means "this deployment does not do ranged
+  // I/O": no arena, no registration, and SupportsRangedIO() reports false, so
+  // a client that never issues ranged operations stops paying for the arena.
   HostMemAllocator allocator;
   HostBufferOptions scratch_opts;
-  ranged_scratch_handle_ = allocator.Alloc(dc.ranged_scratch_size, scratch_opts);
-  if (!ranged_scratch_handle_.valid()) {
-    throw std::runtime_error("DistributedClient: memory allocation failed for ranged scratch");
+  if (dc.ranged_scratch_size > 0) {
+    ranged_scratch_handle_ = allocator.Alloc(dc.ranged_scratch_size, scratch_opts);
+    if (!ranged_scratch_handle_.valid()) {
+      throw std::runtime_error("DistributedClient: memory allocation failed for ranged scratch");
+    }
+    ranged_scratch_ = ranged_scratch_handle_.ptr;
+    ranged_scratch_size_ = ranged_scratch_handle_.mapped_size;
   }
-  ranged_scratch_ = ranged_scratch_handle_.ptr;
-  ranged_scratch_size_ = ranged_scratch_handle_.mapped_size;
 
   auto pc_config = ToPoolClientConfig(dc, std::move(dram_ownership), std::move(ssd_ownership));
   pc_config.ranged_scratch_buffer = ranged_scratch_;
@@ -108,8 +114,8 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   }
   // Registered explicitly rather than through a backend: the arena is a remote
   // endpoint for RDMA reads and writes, so it needs a memory region even though
-  // no medium owns it.
-  if (!pool_client_->RegisterMemory(ranged_scratch_, ranged_scratch_size_)) {
+  // no medium owns it. Skipped entirely when the deployment did not opt in.
+  if (ranged_scratch_ && !pool_client_->RegisterMemory(ranged_scratch_, ranged_scratch_size_)) {
     pool_client_->Shutdown();
     pool_client_.reset();
     release_scratch();
@@ -378,6 +384,7 @@ void DistributedClient::Close() {
 bool DistributedClient::IsDistributed() const { return true; }
 
 bool DistributedClient::SupportsRangedIO() const {
+  if (ranged_scratch_size_ == 0) return false;
   return config_.distributed.has_value() && config_.distributed->medium != UMBPMedium::SSD;
 }
 

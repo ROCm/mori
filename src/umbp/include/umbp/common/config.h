@@ -312,7 +312,12 @@ struct UMBPDistributedConfig {
   // medium; ranged puts routed to another node assemble their scattered ranges
   // into the same arena. Purely a remote-path resource — ranged I/O served by
   // this node's own medium never touches it.
-  size_t ranged_scratch_size = 256ULL * 1024 * 1024;  // 256 MiB
+  //
+  // Zero keeps ranged remote I/O disabled without allocating or registering
+  // additional host memory; callers that need it must opt in explicitly. An
+  // existing distributed deployment that never issues ranged I/O therefore
+  // stops paying for an arena it does not use.
+  size_t ranged_scratch_size = 0;
 
   // Dedicated SSD read staging, allocated only when medium == SSD. Per-slot
   // (this / ssd_staging_buffer_slots) must be >= the largest single-key page KV
@@ -454,10 +459,6 @@ struct UMBPConfig {
     }
     if (distributed.has_value()) {
       const auto& d = distributed.value();
-      if (d.ranged_scratch_size == 0) {
-        if (error_message) *error_message = "distributed.ranged_scratch_size must be > 0";
-        return false;
-      }
       if (d.master_config.master_address.empty()) {
         if (error_message)
           *error_message = "distributed.master_config.master_address must not be empty";

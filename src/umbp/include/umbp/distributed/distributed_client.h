@@ -79,11 +79,13 @@ class DistributedClient : public IUMBPClient {
   void Close() override;
   bool IsDistributed() const override;
   UMBPDeploymentMode GetDeploymentMode() const override { return UMBPDeploymentMode::Distributed; }
-  // Keyed on the selected medium, not on the mode. Ranged I/O maps object
-  // ranges onto tier pages a backend publishes as in-process endpoints; SSD
-  // publishes storage refs instead, so it is the one medium this cannot serve.
-  // Upstream spells the same rule as `!ssd.enabled` because it predates the
-  // single-medium selector.
+  // Two independent conditions, both required. The arena must exist, because
+  // the remote direction has nowhere to land otherwise — that is upstream's
+  // opt-in rule. And the selected medium must be able to serve it: ranged I/O
+  // maps object ranges onto tier pages a backend publishes as in-process
+  // endpoints, and SSD publishes storage refs instead, so it is the one medium
+  // this cannot serve. Upstream spells the medium half as `!ssd.enabled`
+  // because it predates the single-medium selector.
   bool SupportsRangedIO() const override;
 
   bool RegisterMemory(uintptr_t ptr, size_t size,
