@@ -1043,6 +1043,24 @@ class EpDispatchCombineOp:
             )
         return n
 
+    @staticmethod
+    def _check_combine_indices(indices, cur_n: int) -> None:
+        """Reject recv-slot-layout indices in combine.
+
+        The InterNodeV1 combine indexes tokenIndices by this rank's own token id,
+        the same key as interNodeDispSendMap, so anything but this rank's own
+        [num_token, topk] routing reduces cross-node tokens against an unrelated
+        token's routing and silently corrupts the result (ROCm/mori#475).
+        """
+        n = int(indices.size(0))
+        if n != cur_n:
+            raise ValueError(
+                f"combine() indices has {n} rows but this rank dispatched {cur_n} "
+                f"tokens. Pass this rank's own [num_tokens, topk] routing -- the "
+                f"tensor given to dispatch() -- not dispatch()'s returned "
+                f"out_idx (ROCm/mori#475)."
+            )
+
     def _build_args_routing(
         self,
         routing,
@@ -1127,9 +1145,6 @@ class EpDispatchCombineOp:
         stream = _current_stream()
         self._dispatch_dtype = input.dtype
         sfx = _DTYPE_SUFFIX[input.dtype]
-        # Held (not just the pointer) so the matching combine can reduce over the
-        # very routing this dispatch scattered with.
-        self._dispatch_indices = indices
 
         mori_cpp.prepare_inference_args(
             self._handle,
@@ -1366,8 +1381,7 @@ class EpDispatchCombineOp:
 
         ``indices`` is this rank's own [num_token, topk] routing, the same
         tensor handed to ``dispatch()`` -- not the received-token indices that
-        ``dispatch()`` returned. When a preceding ``dispatch()`` is on record
-        its indices are used and this argument is ignored.
+        ``dispatch()`` returned.
         """
         if routing is not None and not self._supports_routing_handle():
             raise NotImplementedError(
@@ -1375,14 +1389,6 @@ class EpDispatchCombineOp:
                 f"{self.config.kernel_type}; only IntraNode and InterNodeV1 "
                 "currently consume routing handles in combine."
             )
-
-        if routing is not None:
-            routing_n = self._routing_source_token_count(routing)
-            if int(indices.size(0)) != routing_n:
-                raise ValueError(
-                    f"combine indices has {int(indices.size(0))} tokens but "
-                    f"routing.cur_rank_num_token={routing_n}"
-                )
 
         hidden_dim = input.size(1)
         weight_ptr = (
@@ -1399,6 +1405,7 @@ class EpDispatchCombineOp:
             if routing is not None
             else self._get_cur_rank_num_token(self._handle)
         )
+        self._check_combine_indices(indices, cur_n)
         # The width default follows the TRANSPORT. Same three conditions the _nop2p suffix is
         # chosen by at the launch below, and deliberately not "actual_use_ext" alone -- blockwise
         # and direct_cast own their input too, reach the gather by other routes, and have no
@@ -1428,21 +1435,6 @@ class EpDispatchCombineOp:
         self._combine_dtype = input.dtype
         sfx = _DTYPE_SUFFIX[input.dtype]
 
-        # The InterNodeV1 combine indexes these by this rank's own token id to
-        # decide which nodes a token was routed to, so they have to be the
-        # indices dispatch scattered with. Callers routinely hand back the
-        # received-token indices that dispatch returned instead, which reduces
-        # cross-node tokens against an unrelated token's routing and silently
-        # corrupts the result (ROCm/mori#475), so prefer the dispatched ones.
-        combine_indices = getattr(self, "_dispatch_indices", None)
-        if combine_indices is None:
-            combine_indices = indices
-        if int(combine_indices.size(0)) < cur_n:
-            raise ValueError(
-                f"combine indices has {int(combine_indices.size(0))} tokens but "
-                f"this rank dispatched {cur_n}"
-            )
-
         mori_cpp.prepare_inference_args(
             self._handle,
             inp_ptr=input.data_ptr(),
@@ -1450,7 +1442,7 @@ class EpDispatchCombineOp:
             num_tokens=cur_n,
             weight_ptr=weight_ptr,
             scale_ptr=0,
-            indices_ptr=combine_indices.data_ptr(),
+            indices_ptr=indices.data_ptr(),
         )
         if routing is not None:
             args_ptr = self._build_args_routing(
@@ -1836,7 +1828,6 @@ class EpDispatchCombineOp:
 
         set_fn(self._handle, packed_recv_x.data_ptr(), packed_recv_src_info.data_ptr())
 
-        self._dispatch_indices = indices
         mori_cpp.prepare_inference_args(
             self._handle,
             inp_ptr=input.data_ptr(),
@@ -1921,11 +1912,13 @@ class EpDispatchCombineOp:
                 "Rebuild with ENABLE_STANDARD_MOE_ADAPT=ON."
             )
         hidden_dim = input.size(2)
+        cur_n = self._get_cur_rank_num_token(self._handle)
+        self._check_combine_indices(indices, cur_n)
         actual_bn, actual_rbn, actual_wpb = self._resolve_launch_params(
             block_num,
             rdma_block_num,
             warp_per_block,
-            num_tokens=self._get_cur_rank_num_token(self._handle),
+            num_tokens=cur_n,
             hidden_dim=hidden_dim,
             dtype=input.dtype,
             tuning_rules=self._combine_rules,
@@ -1937,21 +1930,18 @@ class EpDispatchCombineOp:
 
         set_fn(self._handle, input.data_ptr(), 0)
 
-        combine_indices = getattr(self, "_dispatch_indices", None)
-        if combine_indices is None:
-            combine_indices = indices
         mori_cpp.prepare_inference_args(
             self._handle,
             inp_ptr=input.data_ptr(),
             dtype=dtype_to_int(input.dtype),
-            num_tokens=self._get_cur_rank_num_token(self._handle),
+            num_tokens=cur_n,
             weight_ptr=(
                 weights.data_ptr()
                 if weights is not None and weights.size(0) != 0
                 else 0
             ),
             scale_ptr=0,
-            indices_ptr=combine_indices.data_ptr(),
+            indices_ptr=indices.data_ptr(),
         )
         args_ptr = mori_cpp.build_args(
             self._handle,
