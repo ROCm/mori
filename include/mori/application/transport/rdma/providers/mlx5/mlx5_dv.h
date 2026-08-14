@@ -85,15 +85,6 @@ struct mlx5dv_devx_umem {
   uint32_t umem_id;
 };
 
-struct mlx5dv_devx_umem_in {
-  void* addr;
-  size_t size;
-  uint32_t access;
-  uint64_t pgsz_bitmap;
-  uint64_t comp_mask;
-  int dmabuf_fd;
-};
-
 struct mlx5dv_devx_uar {
   void* reg_addr;
   void* base_addr;
@@ -121,9 +112,29 @@ enum mlx5dv_obj_type {
 #define MLX5DV_UAR_ALLOC_TYPE_NC 0x1
 #endif
 
-// mlx5dv_devx_umem_in::comp_mask flags
-enum mlx5dv_devx_umem_mask {
-  MLX5DV_UMEM_MASK_DMABUF = 1 << 0,
+#endif  // __has_include(<infiniband/mlx5dv.h>)
+
+/* -------------------------------------------------------------------------- */
+/*  DEVX umem registration input (dmabuf capable)                             */
+/* -------------------------------------------------------------------------- */
+
+// rdma-core only grew dmabuf support for DEVX umem in v43, but mori still has to
+// build against older system headers: Ubuntu 22.04 ships v39, whose
+// mlx5dv_devx_umem_in has neither dmabuf_fd nor MLX5DV_UMEM_MASK_DMABUF. Carry our
+// own copy of the current layout under a distinct name and hand it across the
+// dlopen boundary, so what we can compile no longer depends on the installed
+// rdma-core version. Whether the *runtime* libmlx5 honours the dmabuf mask is a
+// separate matter: older ones reject the unknown comp_mask bit with EOPNOTSUPP, so
+// callers must be prepared to fall back to registration by address.
+struct Mlx5DevxUmemIn {
+  void* addr;
+  size_t size;
+  uint32_t access;
+  uint64_t pgsz_bitmap;
+  uint64_t comp_mask;
+  int dmabuf_fd;
 };
 
-#endif  // __has_include(<infiniband/mlx5dv.h>)
+enum mori_mlx5_devx_umem_mask {
+  MORI_MLX5_UMEM_MASK_DMABUF = 1 << 0,
+};

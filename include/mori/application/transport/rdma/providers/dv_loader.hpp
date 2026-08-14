@@ -44,7 +44,7 @@ struct Mlx5DvApi {
   using devx_umem_reg_t = struct mlx5dv_devx_umem* (*)(struct ibv_context*, void*, size_t,
                                                        uint32_t);
   using devx_umem_reg_ex_t = struct mlx5dv_devx_umem* (*)(struct ibv_context*,
-                                                          struct mlx5dv_devx_umem_in*);
+                                                          struct Mlx5DevxUmemIn*);
   using devx_umem_dereg_t = int (*)(struct mlx5dv_devx_umem*);
   using devx_alloc_uar_t = struct mlx5dv_devx_uar* (*)(struct ibv_context*, uint32_t);
   using devx_free_uar_t = void (*)(struct mlx5dv_devx_uar*);

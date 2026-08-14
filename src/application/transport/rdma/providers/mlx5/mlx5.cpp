@@ -94,14 +94,14 @@ static mlx5dv_devx_umem* RegisterUmem(ibv_context* context, void* addr, size_t s
     uint64_t dmabufOffset = 0;
     int dmabufFd = TryExportDmabufFd(addr, size, &dmabufOffset);
     if (dmabufFd >= 0) {
-      // With MLX5DV_UMEM_MASK_DMABUF the kernel reads `addr` as an offset into the
+      // With the dmabuf mask set the kernel reads `addr` as an offset into the
       // dmabuf, not as a virtual address.
-      mlx5dv_devx_umem_in in = {};
+      Mlx5DevxUmemIn in = {};
       in.addr = reinterpret_cast<void*>(dmabufOffset);
       in.size = size;
       in.access = access;
       in.pgsz_bitmap = UINT64_MAX & ~(kMlx5AdapterPageSize - 1);
-      in.comp_mask = MLX5DV_UMEM_MASK_DMABUF;
+      in.comp_mask = MORI_MLX5_UMEM_MASK_DMABUF;
       in.dmabuf_fd = dmabufFd;
 
       mlx5dv_devx_umem* umem = api.devx_umem_reg_ex(context, &in);
