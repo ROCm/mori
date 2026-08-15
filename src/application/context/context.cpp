@@ -258,9 +258,9 @@ void Context::InitializeTopologyAndTransports() {
     }
     std::string nicFw = (device != nullptr) ? ReadNicFirmware(device->Name()) : std::string{};
     MORI_APP_INFO("rank {} firmware: nic {} fw_ver {} | gpu {} [{}] mec_fw {}", LocalRank(),
-                  (device != nullptr) ? device->Name() : "none",
-                  nicFw.empty() ? "unknown" : nicFw, gpuId,
-                  (pciBusId[0] != '\0') ? pciBusId : "unknown", mecFw.empty() ? "unknown" : mecFw);
+                  (device != nullptr) ? device->Name() : "none", nicFw.empty() ? "unknown" : nicFw,
+                  gpuId, (pciBusId[0] != '\0') ? pciBusId : "unknown",
+                  mecFw.empty() ? "unknown" : mecFw);
 
     // Judge the version, do not just print it. `mori check` applies this table
     // in Step 1, but it is a separate tool users may never run -- and the wrong
@@ -275,8 +275,8 @@ void Context::InitializeTopologyAndTransports() {
       if (fwCheck.verdict == FwVerdict::Bad) {
         MORI_APP_WARN("rank {} nic {}: {}", LocalRank(), device->Name(), fwCheck.detail);
       } else if (fwCheck.verdict == FwVerdict::Unknown) {
-        MORI_APP_WARN("rank {} nic {}: {}, cannot verify against the known-good table",
-                      LocalRank(), device->Name(), fwCheck.detail);
+        MORI_APP_WARN("rank {} nic {}: {}, cannot verify against the known-good table", LocalRank(),
+                      device->Name(), fwCheck.detail);
       }
     }
   }

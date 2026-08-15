@@ -45,9 +45,7 @@ inline std::string ReadSysfsLine(const std::string& path) {
 
 // Identical for all processes on one physical node, distinct across nodes;
 // empty if unavailable.
-inline std::string ReadKernelBootId() {
-  return ReadSysfsLine("/proc/sys/kernel/random/boot_id");
-}
+inline std::string ReadKernelBootId() { return ReadSysfsLine("/proc/sys/kernel/random/boot_id"); }
 
 // Firmware version of an RDMA device as reported by the kernel. Every vendor
 // (bnxt_re, mlx5, ionic) exposes it at the same path, so this needs no
@@ -70,7 +68,10 @@ inline int CompareFwVersion(const std::string& a, const std::string& b) {
   auto parts = [](const std::string& s) {
     std::vector<long> v;
     for (size_t i = 0; i < s.size();) {
-      if (std::isdigit(static_cast<unsigned char>(s[i])) == 0) { ++i; continue; }
+      if (std::isdigit(static_cast<unsigned char>(s[i])) == 0) {
+        ++i;
+        continue;
+      }
       size_t j = i;
       while (j < s.size() && std::isdigit(static_cast<unsigned char>(s[j])) != 0) ++j;
       v.push_back(std::stol(s.substr(i, j - i)));
@@ -117,7 +118,8 @@ inline FwCheck CheckNicFirmware(const std::string& vendorId, const std::string& 
     if (fw.rfind("1.117.1", 0) == 0 && (fw.size() == 7 || fw[7] == '.' || fw[7] == '-')) {
       return {FwVerdict::Bad, "AINIC firmware " + fw +
                                   " is on the 1.117.1 branch, which does NOT support IBGDA "
-                                  "-- upgrade to >= " + kAinicMin};
+                                  "-- upgrade to >= " +
+                                  kAinicMin};
     }
     if (CompareFwVersion(fw, kAinicMin) >= 0) return {FwVerdict::Ok, ""};
     return {FwVerdict::Bad, "AINIC firmware " + fw + " is below the required minimum (>= " +
@@ -129,12 +131,14 @@ inline FwCheck CheckNicFirmware(const std::string& vendorId, const std::string& 
     if (major == "231") {
       return {FwVerdict::Bad, "Broadcom firmware " + fw +
                                   " is on the 231.x branch, which is too old for IBGDA "
-                                  "-- upgrade to >= " + kBnxtMin235 + " or >= " + kBnxtMin237};
+                                  "-- upgrade to >= " +
+                                  kBnxtMin235 + " or >= " + kBnxtMin237};
     }
     if (major == "232") {
       return {FwVerdict::Bad, "Broadcom firmware " + fw +
                                   " is on the 232.x branch, which is known not to work on Thor2 "
-                                  "-- upgrade to >= " + kBnxtMin235 + " or >= " + kBnxtMin237};
+                                  "-- upgrade to >= " +
+                                  kBnxtMin235 + " or >= " + kBnxtMin237};
     }
     const char* min = major == "235" ? kBnxtMin235 : (major == "237" ? kBnxtMin237 : nullptr);
     if (min == nullptr) {
@@ -143,9 +147,8 @@ inline FwCheck CheckNicFirmware(const std::string& vendorId, const std::string& 
                                   kBnxtMin237 + " on 237.x; known-bad: 231.x, 232.x"};
     }
     if (CompareFwVersion(fw, min) >= 0) return {FwVerdict::Ok, ""};
-    return {FwVerdict::Bad, "Broadcom firmware " + fw +
-                                " is below the required minimum on the " + major +
-                                ".x branch (>= " + min + ")"};
+    return {FwVerdict::Bad, "Broadcom firmware " + fw + " is below the required minimum on the " +
+                                major + ".x branch (>= " + min + ")"};
   }
 
   // mlx5 (0x15b3) and anything else: no minimum MORI knows of.
