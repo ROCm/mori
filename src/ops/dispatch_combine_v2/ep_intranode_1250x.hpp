@@ -254,9 +254,24 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
 
   // Tokens per warp iteration: WS/topk lets COUNT read tokenIndices with all lanes.
   const int _tpi = (topk > 0 && topk <= WS && (WS % topk) == 0) ? (WS / topk) : 1;
-  const int _sLane = (_tpi > 1) ? (laneId / topk) : 0;
-  const int _eLane = (_tpi > 1) ? (laneId - _sLane * topk) : laneId;
-  const bool _laneAct = (_tpi > 1) ? (_sLane < _tpi) : (laneId < topk);
+  // One round of the token loops covers aWarps * _tpi tokens, so a batch short of that
+  // leaves the tail of the grid idle: at 512 tokens on 64x8 with topk 8 every token
+  // lands on aWarp < 128 and 48 of the 64 blocks send no payload, which is why 64 and
+  // 512 tokens cost the same. Cap the quota at what the batch can fill. It only ever
+  // shrinks, so COUNT reads tokenIndices with whole lanes wherever it did before, and
+  // above the threshold _etpi == _tpi and this is the original partition.
+  //
+  // The lower bound is load-bearing: ceil(n / aWarps) is 0 for n <= 0, and a step of
+  // aWarps * 0 never advances -- an unkillable D-state hang still holding the GPU.
+  //
+  // All three token loops must use _etpi. COUNT sizes the per-block reservation that
+  // FINALIZE hands slots out of, so any disagreement over which tokens a warp owns
+  // puts payload in another block's slots.
+  const int _qTok = (aWarps > 0) ? (int)(((long long)args.numTokens + aWarps - 1) / aWarps) : _tpi;
+  const int _etpi = (_tpi > 1 && _qTok >= 1 && _qTok < _tpi) ? _qTok : _tpi;
+  const int _sLane = (_etpi > 1) ? (laneId / topk) : 0;
+  const int _eLane = (_etpi > 1) ? (laneId - _sLane * topk) : laneId;
+  const bool _laneAct = (_etpi > 1) ? (_sLane < _etpi) : (laneId < topk);
 
   extern __shared__ char _tdmBatchSmem[];
   T* _tdmTile = reinterpret_cast<T*>(_tdmBatchSmem) + (size_t)warpId * hiddenDim;
@@ -274,7 +289,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
 
   // ---- Phase 1: block-local count (LDS atomic histogram) ----
   if (args.tokenIndices && args.inpTokenBuf) {
-    for (int tokBase = aWarp * _tpi; tokBase < args.numTokens; tokBase += aWarps * _tpi) {
+    for (int tokBase = aWarp * _etpi; tokBase < args.numTokens; tokBase += aWarps * _etpi) {
       int tok = tokBase + _sLane;
       bool act = _laneAct && (tok < args.numTokens);
       index_t myExpert = act ? args.tokenIndices[(size_t)tok * topk + _eLane] : (index_t)-1;
@@ -323,7 +338,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     const int ngrp = WS / gsz;
     const int myGrp = laneId / gsz;
     const int myE = laneId - myGrp * gsz;
-    for (int tokBase = aWarp * _tpi; tokBase < args.numTokens; tokBase += aWarps * _tpi) {
+    for (int tokBase = aWarp * _etpi; tokBase < args.numTokens; tokBase += aWarps * _etpi) {
       int tok = tokBase + _sLane;
       bool act = _laneAct && (tok < args.numTokens);
       index_t myExpert = act ? args.tokenIndices[(size_t)tok * topk + _eLane] : (index_t)-1;
@@ -492,8 +507,8 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
 
   // ---- Phase 3b: payload copy, driven by dispDestTokIdMap (own-block). ----
   if (args.tokenIndices && args.inpTokenBuf) {
-    for (int tokBase = aWarp * _tpi; tokBase < args.numTokens; tokBase += aWarps * _tpi) {
-      for (int _sub = 0; _sub < _tpi; ++_sub) {
+    for (int tokBase = aWarp * _etpi; tokBase < args.numTokens; tokBase += aWarps * _etpi) {
+      for (int _sub = 0; _sub < _etpi; ++_sub) {
         int tok = tokBase + _sub;
         if (tok >= args.numTokens) break;
         index_t flatMe = (laneId < topk) ? args.dispDestTokIdMap[(size_t)tok * topk + laneId]
