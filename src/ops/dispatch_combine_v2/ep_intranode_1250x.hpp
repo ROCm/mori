@@ -199,23 +199,23 @@ __device__ __forceinline__ int TdmCheapDim1(int nElems) {
 // Cover the WHOLE run with ONE tile so it carries no scalar head/tail.
 //
 // THE 128B ROW FLOOR IS A BANDWIDTH RESULT, NOT A LEGALITY ONE, and treating it as legality is what
-// used to push small metadata fields off TDM entirely. The evidence behind the floor is per-byte: 224B
-// rows at ~500 GB/s against 256B rows at ~1500. A metadata field at 512 tokens is 64B..512B, so half
-// bandwidth on it is worth nothing measurable -- while being off the TDM path costs the whole pipeline,
-// because with only the scale field clearing the floor a warp has exactly ONE op to issue before its
-// s_wait_tensorcnt(0) and both the load latency and the cross-card store completion are fully exposed
-// (measured: 8 TDM ops per block at 512 against 24 at 4096, metasend 13.91us against 10.53us for 8x the
-// bytes).
+// used to push small metadata fields off TDM entirely. The evidence behind the floor is per-byte:
+// 224B rows at ~500 GB/s against 256B rows at ~1500. A metadata field at 512 tokens is 64B..512B,
+// so half bandwidth on it is worth nothing measurable -- while being off the TDM path costs the
+// whole pipeline, because with only the scale field clearing the floor a warp has exactly ONE op to
+// issue before its s_wait_tensorcnt(0) and both the load latency and the cross-card store
+// completion are fully exposed (measured: 8 TDM ops per block at 512 against 24 at 4096,
+// metasend 13.91us against 10.53us for 8x the bytes).
 //
-// So when no 128B-legal tile exists, fall back to the narrowest legal-by-construction shape rather than
-// giving up: (nElems/2, 2) for even nElems. d0*d1 == nElems exactly, so the descriptor footprint is
-// still precisely the run and cannot write outside it. Isolated A/B on the v1 body this was ported from:
-// +10.0% at 512 and neutral at 4096, which only ever clears the floor anyway. The figure for all four
-// changes together on THIS body is in the commit that added them.
+// So when no 128B-legal tile exists, fall back to the narrowest legal-by-construction shape rather
+// than giving up: (nElems/2, 2) for even nElems. d0*d1 == nElems exactly, so the descriptor
+// footprint is still precisely the run and cannot write outside it. Isolated A/B on the v1 body
+// this was ported from: +10.0% at 512 and neutral at 4096, which only ever clears the floor anyway.
+// The figure for all four changes together on THIS body is in the commit that added them.
 //
-// It deliberately does NOT test d1 == 1. That is a separate unknown: TdmShape2D's contract says gfx1250
-// has no 1xN wedge, while the payload has always sent 1 x hiddenDim -- two records that contradict each
-// other, and mixing that question in here would make this change unfalsifiable.
+// It deliberately does NOT test d1 == 1. That is a separate unknown: TdmShape2D's contract says
+// gfx1250 has no 1xN wedge, while the payload has always sent 1 x hiddenDim -- two records that
+// contradict each other, and mixing that question in here would make this change unfalsifiable.
 __device__ __forceinline__ TdmSplit128 TdmWholeOrSplit128(size_t phase, int nElems) {
   const TdmSplit128 sp = TdmAlignSplit128(phase, nElems);
   if (sp.head == 0 && sp.body == nElems) return sp;
@@ -431,21 +431,22 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
       uint8_t* _m4 = reinterpret_cast<uint8_t*>(_tdmBatchSmem) + (size_t)warpId * mtileBytesM;
       // ONE WARP PER PEER when the runs are short, warpNum/npes warps per peer otherwise.
       //
-      // What a coarser cut buys is ROW WIDTH with the load still perfectly balanced. At 512 tokens the
-      // default split of 2 gives a warp 3.6 tokens x 196B = 706B with rows of 32/48/64B -- under the
-      // 128B floor, so those runs land on the narrow fallback above. Merging the halves makes it 7.2
-      // tokens x 1412B with rows of 96/112/128B. Isolated A/B on the v1 body: +5.4% at 512.
+      // What a coarser cut buys is ROW WIDTH with the load still perfectly balanced. At 512 tokens
+      // the default split of 2 gives a warp 3.6 tokens x 196B = 706B with rows of 32/48/64B --
+      // under the 128B floor, so those runs land on the narrow fallback above. Merging the halves
+      // makes it 7.2 tokens x 1412B with rows of 96/112/128B. Isolated A/B on the v1 body: +5.4% at
+      // 512.
       //
-      // ADAPTIVE, because unconditional split==1 was MEASURED to lose at 4096: 1296.2 against 1304.2,
-      // -0.6%, with all four ranks below all four baseline ranks. The gain is row width and 4096 does
-      // not need it -- a run there is ~58 tokens, so even cut in half the idx field is 232 ints and
-      // TdmCheapDim1's `nElems/d1 >= 32` is satisfied with room to spare. That shape would pay the cost
-      // of warps npes..warpNum-1 sitting idle and buy nothing.
+      // ADAPTIVE, because unconditional split==1 was MEASURED to lose at 4096: 1296.2 against
+      // 1304.2, -0.6%, with all four ranks below all four baseline ranks. The gain is row width and
+      // 4096 does not need it -- a run there is ~58 tokens, so even cut in half the idx field is
+      // 232 ints and TdmCheapDim1's `nElems/d1 >= 32` is satisfied with room to spare. That shape
+      // would pay the cost of warps npes..warpNum-1 sitting idle and buy nothing.
       //
-      // The test is TOKENS PER WARP rather than a token-count constant so it follows the launch geometry
-      // instead of hard-coding the two shapes that happen to have been benchmarked. At 512 tokens over
-      // 512 warps this is 1 token/warp and takes split 1; at 4096 it is 8 and takes split 2, which is
-      // byte-for-byte the old behaviour.
+      // The test is TOKENS PER WARP rather than a token-count constant so it follows the launch
+      // geometry instead of hard-coding the two shapes that happen to have been benchmarked. At 512
+      // tokens over 512 warps this is 1 token/warp and takes split 1; at 4096 it is 8 and takes
+      // split 2, which is byte-for-byte the old behaviour.
       const int _peerSplit = (npes > 0 && warpNum >= npes) ? (warpNum / npes) : 1;
       const int split = (aWarps > 0 && args.numTokens <= (index_t)aWarps * 2) ? 1 : _peerSplit;
       const int nRuns = npes * split;
@@ -543,16 +544,16 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
       }
     }
   }
-  // NO BARRIER BETWEEN META AND PAYLOAD. There used to be a __syncthreads() here whose only stated job
-  // was the tile reuse the wait below covers, and that dependency is WITHIN a warp rather than across
-  // them: _m4 is _tdmBatchSmem + warpId*mtileBytesM and the payload's _tdmTile is _tdmBatchSmem +
-  // warpId*hiddenDim, i.e. the SAME per-warp address, so the warp that must not clobber the tile is the
-  // warp that issued the stores -- which is exactly what `if (_mPend)` guarantees. Cross-warp visibility
-  // of FINALIZE's writes (dispDestTokIdMap, staging, s_base) comes from the barrier after FINALIZE, not
-  // from this one.
+  // NO BARRIER BETWEEN META AND PAYLOAD. There used to be a __syncthreads() here whose only stated
+  // job was the tile reuse the wait below covers, and that dependency is WITHIN a warp rather than
+  // across them: _m4 is _tdmBatchSmem + warpId*mtileBytesM and the payload's _tdmTile is
+  // _tdmBatchSmem + warpId*hiddenDim, i.e. the SAME per-warp address, so the warp that must not
+  // clobber the tile is the warp that issued the stores -- which is exactly what `if (_mPend)`
+  // guarantees. Cross-warp visibility of FINALIZE's writes (dispDestTokIdMap, staging, s_base)
+  // comes from the barrier after FINALIZE, not from this one.
   //
-  // With it gone a warp enters payload as soon as its own stores are issued, instead of waiting for the
-  // slowest meta warp in its block. Isolated A/B on the v1 body: +4.8% at 512, +0.8% at 4096.
+  // With it gone a warp enters payload as soon as its own stores are issued, instead of waiting for
+  // the slowest meta warp in its block. Isolated A/B on the v1 body: +4.8% at 512, +0.8% at 4096.
   if (_mPend) __builtin_amdgcn_s_wait_tensorcnt(0);
 
   // ---- Phase 3b: payload copy, driven by dispDestTokIdMap (own-block). ----
@@ -594,20 +595,22 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   if (globalWarpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += WS) {
       // THESE TWO WAITS ARE INDEPENDENT, WHICH IS WHY THE SLOT ONE GOES FIRST.
-      // Whether the peer has drained last launch's mailbox has nothing to do with whether this rank's
-      // slowest block has finished, so running them in that order used to cost cbar + cslot where it can
-      // cost max(cbar, cslot). Instrumented on the v1 body at 512: cbar 6.60 -> 1.50 and cslot 3.38 ->
-      // 4.55, i.e. the sum 9.98 became 6.05; isolated A/B there was +8.7% at 512 and +1.6% at 4096.
+      // Whether the peer has drained last launch's mailbox has nothing to do with whether this
+      // rank's slowest block has finished, so running them in that order used to cost cbar + cslot
+      // where it can cost max(cbar, cslot). Instrumented on the v1 body at 512: cbar 6.60 -> 1.50
+      // and cslot 3.38 -> 4.55, i.e. the sum 9.98 became 6.05; isolated A/B there was +8.7% at 512
+      // and +1.6% at 4096.
       //
-      // The slot read is against uncached peer memory, so it pays a full fabric round trip even when the
-      // slot has long been zero -- issuing it while the grid barrier is still spinning is what hides it.
-      // Its address depends only on destPe, so nothing here needs the barrier to have been satisfied.
+      // The slot read is against uncached peer memory, so it pays a full fabric round trip even
+      // when the slot has long been zero -- issuing it while the grid barrier is still spinning is
+      // what hides it. Its address depends only on destPe, so nothing here needs the barrier to
+      // have been satisfied.
       //
       // THE WIRE FORMAT IS BYTE-FOR-BYTE UNCHANGED: both of these are pure spin-waits that write
       // nothing, and the signal store below still happens after BOTH. This is only the order of two
-      // reads, which is what makes it safe to enable unconditionally -- unlike a depth-2 mailbox, which
-      // buys an amount that cannot be measured (597.0 against 595.7 at 512, inside a 22 GB/s per-rank
-      // spread) at the price of a format every rank must agree on.
+      // reads, which is what makes it safe to enable unconditionally -- unlike a depth-2 mailbox,
+      // which buys an amount that cannot be measured (597.0 against 595.7 at 512, inside a 22 GB/s
+      // per-rank spread) at the price of a format every rank must agree on.
       index_t* signal = EpPeer<index_t>(win, destPe, args.offRecvNum) + myPe;
       EpWaitEq(signal, 0);
       EpWaitEq(args.gridBarrier, static_cast<unsigned int>(gridDim.x));
