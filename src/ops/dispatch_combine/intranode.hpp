@@ -97,6 +97,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   int myPe = config.rank;
   int npes = config.worldSize;
   size_t hiddenDim = config.HiddenDimSz();
+  const int topK = config.numExpertPerToken;
 
   IF_ENABLE_PROFILER(
       INTRANODE_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
@@ -104,107 +105,134 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   MORI_TRACE_NEXT(seq, Slot::DispatchSendTokens);
 
   if (args.tokenIndices && args.inpTokenBuf) {
-    // Phase1: send token
-    // Each warp compute token offset on destinition PE
-    for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken;
-         i += globalWarpNum) {
-      index_t srcTokId = i / config.numExpertPerToken;
-      index_t destPe;
-      index_t destTokId = 0;
+    // Iterate per source token (not per token×expert) to enable load-once-write-many.
+    // For each token, collect all unique destination PEs via lane-based dedup,
+    // write metadata, then load the token payload from HBM once and broadcast
+    // to all destinations via XGMI.
+    extern __shared__ char sharedMem[];
+    T** warpDestPtrs = reinterpret_cast<T**>(sharedMem) + warpId * kMaxGpusPerNode;
+
+    for (int srcTokId = globalWarpId; srcTokId < args.curRankNumToken; srcTokId += globalWarpNum) {
+      int numDests = 0;
+      T* dstPtrReg = nullptr;
 
       if (!args.replayMode) {
-        // Cache routing: decide where this (token, top-k) pair goes via
-        // atomicAdd-based slot assignment. Records the routing into dispDestTokIdMap
-        // (and the symmetric local view via dispTokIdToSrcTokIdMemObj on the
-        // destination PE) so a later replay-routing dispatch / combine can reuse
-        // the same layout deterministically.
-        index_t destExpert = args.tokenIndices[i];
-        // Routing sentinel: a negative expert id means "drop this top-k slot".
-        // Skip the dispatch entirely and write the existing combine-side null sentinel
-        // (PE == worldSize) into dispDestTokIdMap so combine treats this slot as nullptr.
-        if (destExpert < 0) {
-          if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
-          continue;
-        }
-        destPe = destExpert / config.numExpertPerRank;
-        // Out-of-range expert id guard: destPe is warp-uniform here (one
-        // token-expert per warp) and indexes GetAs(destPe) / destPeTokenCounter
-        // below. An out-of-range id (e.g. an EPLB physical id
-        // >= worldSize*numExpertPerRank) would index those out of bounds (the
-        // assert at dispatch is stripped under NDEBUG) -> HSA page fault. Drop it
-        // via the same overflow sentinel the dedup path uses; the whole warp
-        // skips coherently.
-        if (destPe < 0 || destPe >= config.worldSize) {
-          if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
-          continue;
+        // Expert-slot lanes compute target PE
+        int warpTargetPe = -1;
+        if (laneId < topK) {
+          index_t expertId = args.tokenIndices[srcTokId * topK + laneId];
+          if (expertId >= 0) {
+            int pe = expertId / config.numExpertPerRank;
+            if (pe >= 0 && pe < npes) warpTargetPe = pe;
+          }
         }
 
-        // Deduplicate
-        assert(config.numExpertPerToken < warpSize);
-        int condition = 0;
-        if (laneId < (i % config.numExpertPerToken)) {
-          index_t otherExpert = args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
-          condition = (otherExpert >= 0) && (destPe == (otherExpert / config.numExpertPerRank));
-        }
-        if (__any(condition)) {
-          // Indicate that this token is already sent to the destination PE by setting an overflow
-          // token index
-          if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
-          continue;
+        // PE-indexed dedup via readlane: each PE lane scans all expert slots
+        int expertSlotForMe = -1;
+        if (laneId < npes) {
+#pragma unroll
+          for (int k = 0; k < kMaxGpusPerNode; ++k) {
+            if (k < topK) {
+              int pe_k = __builtin_amdgcn_readlane(warpTargetPe, k);
+              if (pe_k == laneId) expertSlotForMe = k;
+            }
+          }
         }
 
-        if (laneId == 0) {
-          // decide token id in dest pe
-          destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
-          assert(destTokId < config.MaxNumTokensToRecv() &&
+        // PE lanes that matched allocate recv slots
+        int didAlloc = (laneId < npes && expertSlotForMe >= 0) ? 1 : 0;
+        index_t warpDestTokId = 0;
+        if (didAlloc) {
+          warpDestTokId = atomicAdd(
+              args.dispTokOffsetMemObj->template GetAs<index_t*>(laneId), 1);
+          assert(warpDestTokId < config.MaxNumTokensToRecv() &&
                  "Total recv token overflow: increase maxTotalRecvTokens");
-          atomicAdd(args.destPeTokenCounter + destPe, 1);
-          // In dispDestTokIdMap, record the destination slot for this token-expert pair (flat index
-          // into the dest PE's recv buffer) In dispTokIdToSrcTokIdMemObj on the dest PE, record
-          // which global source token occupies this slot (for combine-phase routing)
-          args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, destTokId);
-          args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
+          atomicAdd(args.destPeTokenCounter + laneId, 1);
+          args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(laneId)[warpDestTokId] =
               FlatTokenIndex(config, myPe, srcTokId);
         }
-        destTokId = __shfl(destTokId, 0);
-      } else {
-        // Replay routing: caller already supplied a populated dispDestTokIdMap
-        // from a matching cache-routing dispatch. Recover (destPe, destTokId) directly
-        // and skip CAS / dedup / cross-rank src-id writes. The sentinel slot
-        // (destPe == worldSize) means the original cache-routing dispatch dropped or deduped
-        // this top-k slot, so we skip transmitting payload as well.
-        index_t flat = args.dispDestTokIdMap[i];
-        destPe = PeFromFlatTokenIndex(config, flat);
-        if (destPe >= config.worldSize) continue;
-        destTokId = LocalTokIdFromFlatTokenIndex(config, flat);
-      }
 
-      // Write weights and indices
-      if (laneId < config.numExpertPerToken) {
-        if (args.weightsBuf) {
-          args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(
-              destPe)[destTokId * config.numExpertPerToken + laneId] =
-              args.weightsBuf[srcTokId * config.numExpertPerToken + laneId];
+        // Write dispDestTokIdMap: null sentinel for all, then valid entries
+        if (laneId < topK) {
+          args.dispDestTokIdMap[srcTokId * topK + laneId] =
+              FlatTokenIndex(config, npes, 0);
         }
-        args.shmemOutIndicesMemObj->template GetAs<index_t*>(
-            destPe)[destTokId * config.numExpertPerToken + laneId] =
-            args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
+        if (didAlloc) {
+          args.dispDestTokIdMap[srcTokId * topK + expertSlotForMe] =
+              FlatTokenIndex(config, laneId, warpDestTokId);
+        }
+
+        // Compact dest pointers via shared memory
+        unsigned long long activeMask = __ballot(didAlloc);
+        numDests = __popcll(activeMask);
+
+        if (didAlloc) {
+          int compactPos = __popcll(activeMask & ((1ULL << laneId) - 1));
+          warpDestPtrs[compactPos] =
+              args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(laneId) +
+              warpDestTokId * hiddenDim;
+
+          // Write metadata: weights + indices per destination
+          index_t* indicesOut = args.shmemOutIndicesMemObj->template GetAs<index_t*>(laneId);
+          for (int k = 0; k < topK; ++k) {
+            indicesOut[warpDestTokId * topK + k] = args.tokenIndices[srcTokId * topK + k];
+          }
+          if (args.weightsBuf) {
+            float* weightsOut =
+                args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(laneId);
+            for (int k = 0; k < topK; ++k) {
+              weightsOut[warpDestTokId * topK + k] = args.weightsBuf[srcTokId * topK + k];
+            }
+          }
+          // Write scales
+          if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
+            size_t destScaleOffset =
+                (size_t)warpDestTokId * config.scaleDim * config.scaleTypeSize;
+            size_t srcScaleOffset =
+                (size_t)srcTokId * config.scaleDim * config.scaleTypeSize;
+            // Per-lane scale copy (only active PE lanes participate, not full warp)
+            uint8_t* dstScale =
+                args.shmemOutScalesMemObj->template GetAs<uint8_t*>(laneId) + destScaleOffset;
+            const uint8_t* srcScale = args.scalesBuf + srcScaleOffset;
+            size_t scaleSize = config.scaleDim * config.scaleTypeSize;
+            for (size_t s = 0; s < scaleSize; ++s) {
+              dstScale[s] = srcScale[s];
+            }
+          }
+        }
+        __syncwarp();
+
+        if (laneId < numDests) dstPtrReg = warpDestPtrs[laneId];
+
+      } else {
+        // Replay mode: recover routing from dispDestTokIdMap
+        int destPe = npes;
+        index_t destTokId = 0;
+        if (laneId < topK) {
+          index_t flat = args.dispDestTokIdMap[srcTokId * topK + laneId];
+          destPe = PeFromFlatTokenIndex(config, flat);
+          destTokId = LocalTokIdFromFlatTokenIndex(config, flat);
+        }
+        int isValid = (laneId < topK && destPe >= 0 && destPe < npes) ? 1 : 0;
+        unsigned long long validMask = __ballot(isValid);
+        numDests = __popcll(validMask);
+
+        if (isValid) {
+          int compactPos = __popcll(validMask & ((1ULL << laneId) - 1));
+          warpDestPtrs[compactPos] =
+              args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) +
+              destTokId * hiddenDim;
+        }
+        __syncwarp();
+
+        if (laneId < numDests) dstPtrReg = warpDestPtrs[laneId];
       }
 
-      // Write scales
-      if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
-        size_t destScaleOffset = (size_t)destTokId * config.scaleDim * config.scaleTypeSize;
-        size_t srcScaleOffset = (size_t)srcTokId * config.scaleDim * config.scaleTypeSize;
-        core::WarpCopy(
-            args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destScaleOffset,
-            args.scalesBuf + srcScaleOffset, config.scaleDim * config.scaleTypeSize);
+      // Load token payload from HBM ONCE, write to all destinations via XGMI
+      if (numDests > 0) {
+        WarpLoadBroadcastStore<T>(dstPtrReg, numDests,
+                                  args.inpTokenBuf + srcTokId * hiddenDim, hiddenDim);
       }
-
-      size_t srcTokOffset = srcTokId * hiddenDim;
-      size_t destTokOffset = destTokId * hiddenDim;
-
-      core::WarpCopy(args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
-                     args.inpTokenBuf + srcTokOffset, hiddenDim);
     }
   }
   __syncthreads();

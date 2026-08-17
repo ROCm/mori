@@ -423,12 +423,15 @@ class EpDispatchCombineOp:
         return self._hip_module.get_function(name)
 
     def _dispatch_shared_mem(self, warp_per_block):
-        """Shared memory for dispatch kernels (worldSize + numExpertPerRank per warp + numExpertPerRank) * sizeof(index_t)."""
-        return (
+        """Shared memory for dispatch kernels."""
+        routing_bytes = (
             self.config.world_size * warp_per_block
             + self.config.num_experts_per_rank * warp_per_block
             + self.config.num_experts_per_rank
         ) * 4  # sizeof(index_t)
+        # dest pointer array for load-once-write-many: 8 pointers per warp
+        dest_ptr_bytes = warp_per_block * 8 * 8  # kMaxGpusPerNode * sizeof(T*)
+        return max(routing_bytes, dest_ptr_bytes)
 
     def _combine_shared_mem(self, warp_per_block, use_weights=True):
         """Shared memory for combine kernels."""
