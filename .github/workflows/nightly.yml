@@ -504,6 +504,16 @@ jobs:
               pip install prettytable
             '"
 
+      # The IO benchmark runner defaults to the native C++ engine
+      # (tools/run_internode_io_benchmark.sh --engine cpp), which needs the
+      # bench_engine binary built on BOTH nodes. The wheel install above does not
+      # produce it, so build it explicitly into build/tests/cpp/bench_engine.
+      - name: Build MORI-IO C++ bench_engine (both nodes)
+        run: |
+          BUILD_CMD="cd $GITHUB_WORKSPACE && cmake -B build -DBUILD_IO=ON -DBUILD_TESTS=ON -DBUILD_EXAMPLES=OFF && cmake --build build --target bench_engine -j && ls -la build/tests/cpp/bench_engine"
+          $CT exec $CONTAINER bash -c "$BUILD_CMD"
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "$CT exec $CONTAINER bash -c \"$BUILD_CMD\""
+
       - name: MORI-IO internode write sweep
         run: |
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
@@ -559,28 +569,6 @@ jobs:
             --num-qp-per-transfer 2 --num-worker-threads 2 \
             --num-initiator-dev 8 --num-target-dev 8
           wait
-
-      - name: Build MORI-IO C++ bench_engine (both nodes)
-        run: |
-          BUILD_CMD="cd $GITHUB_WORKSPACE && cmake -B build -DBUILD_IO=ON -DBUILD_TESTS=ON -DBUILD_EXAMPLES=OFF && cmake --build build --target bench_engine -j && ls -la build/tests/cpp/bench_engine"
-          $CT exec $CONTAINER bash -c "$BUILD_CMD"
-          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "$CT exec $CONTAINER bash -c \"$BUILD_CMD\""
-
-      - name: MORI-IO C++ bench_engine write sweep (batch 1 and 64)
-        run: |
-          BIN=$GITHUB_WORKSPACE/build/tests/cpp/bench_engine
-          LDP="LD_LIBRARY_PATH=$GITHUB_WORKSPACE/build/src/io:$GITHUB_WORKSPACE/build/src/application"
-          PORT=29130
-          for BATCH in 1 64; do
-            echo "=== C++ bench_engine GPU write sweep, batch=$BATCH, port=$PORT ==="
-            ARGS="--op write --mem-type gpu --all --sweep-start 1048576 --sweep-max 33554432 --sweep-step 1048576 --transfer-batch-size $BATCH --enable-sess --enable-batch-transfer --num-initiator-dev 1 --num-target-dev 1 --num-qp-per-transfer 8 --iters 200 --warmup-iters 5"
-            R1="cd $GITHUB_WORKSPACE && $LDP $BIN --rank 1 --master-ip $NODE1_HOST --self-ip $NODE2_HOST --port $PORT $ARGS"
-            R0="cd $GITHUB_WORKSPACE && $LDP $BIN --rank 0 --master-ip $NODE1_HOST --self-ip $NODE1_HOST --port $PORT $ARGS"
-            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "$CT exec $CONTAINER bash -c \"$R1\"" &
-            $CT exec $CONTAINER bash -c "$R0"
-            wait
-            PORT=$((PORT + 1))
-          done
 
       - name: MORI-EP internode normal kernel bench
         run: |

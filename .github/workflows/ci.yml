@@ -555,6 +555,16 @@ jobs:
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
             "$CT exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable && (command -v numactl >/dev/null || (apt-get update && apt-get install -y numactl))'"
 
+      # The IO benchmark runner defaults to the native C++ engine
+      # (tools/run_internode_io_benchmark.sh --engine cpp), which needs the
+      # bench_engine binary built on BOTH nodes. pip install above does not
+      # produce it, so build it explicitly into build/tests/cpp/bench_engine.
+      - name: Build MORI-IO C++ bench_engine (both nodes)
+        run: |
+          BUILD_CMD="cd $GITHUB_WORKSPACE && cmake -B build -DBUILD_IO=ON -DBUILD_TESTS=ON -DBUILD_EXAMPLES=OFF && cmake --build build --target bench_engine -j && ls -la build/tests/cpp/bench_engine"
+          $CT exec $CONTAINER bash -c "$BUILD_CMD"
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "$CT exec $CONTAINER bash -c \"$BUILD_CMD\""
+
       - name: MORI-IO internode write sweep
         run: |
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
