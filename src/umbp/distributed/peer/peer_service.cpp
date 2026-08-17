@@ -24,6 +24,7 @@
 #include <grpcpp/grpcpp.h>
 
 #include <chrono>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -486,7 +487,8 @@ bool PeerServiceServer::Start(uint16_t port) {
   // the "port may be in use" check below dead code, since BuildAndStart could
   // not fail that way.  Exactly one peer service owns a port.
   builder.AddChannelArgument(GRPC_ARG_ALLOW_REUSEPORT, 0);
-  builder.AddListeningPort(address, grpc::InsecureServerCredentials());
+  int selected_port = 0;
+  builder.AddListeningPort(address, grpc::InsecureServerCredentials(), &selected_port);
   builder.RegisterService(service_.get());
   server_ = builder.BuildAndStart();
 
@@ -494,7 +496,15 @@ bool PeerServiceServer::Start(uint16_t port) {
     MORI_UMBP_ERROR("[PeerService] Failed to start on {} (port may be in use)", address);
     return false;
   }
-  MORI_UMBP_INFO("[PeerService] Listening on {}", address);
+  if (selected_port <= 0 || selected_port > std::numeric_limits<uint16_t>::max()) {
+    MORI_UMBP_ERROR("[PeerService] invalid selected port {} for {}", selected_port, address);
+    server_->Shutdown();
+    server_->Wait();
+    server_.reset();
+    return false;
+  }
+  bound_port_ = static_cast<uint16_t>(selected_port);
+  MORI_UMBP_INFO("[PeerService] Listening on 0.0.0.0:{}", bound_port_);
   return true;
 }
 
@@ -509,6 +519,7 @@ void PeerServiceServer::Stop() {
     // returns, so PoolClient can safely tear it down next.
     server_->Wait();
     server_.reset();
+    bound_port_ = 0;
   }
 }
 

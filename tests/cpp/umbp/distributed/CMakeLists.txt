@@ -120,6 +120,19 @@ add_executable(test_umbp_types test_types.cpp)
 target_link_libraries(test_umbp_types PRIVATE umbp_common gtest_main)
 add_test(NAME umbp_types COMMAND test_umbp_types)
 
+# Versioned workload trace codec, deterministic payloads, synthetic generators,
+# and the transport-neutral replay scheduler. These are hermetic unit tests;
+# the real PoolClient adapter is covered by the integration smoke below.
+add_executable(test_umbp_workload_trace test_umbp_workload_trace.cpp)
+add_dependencies(test_umbp_workload_trace umbp_workload_proto)
+target_link_libraries(test_umbp_workload_trace PRIVATE umbp_common gtest_main)
+add_test(NAME umbp_workload_trace COMMAND test_umbp_workload_trace)
+
+add_executable(test_umbp_workload_runner test_umbp_workload_runner.cpp)
+add_dependencies(test_umbp_workload_runner umbp_workload_proto)
+target_link_libraries(test_umbp_workload_runner PRIVATE umbp_common gtest_main)
+add_test(NAME umbp_workload_runner COMMAND test_umbp_workload_runner)
+
 # env_time helpers are header-only; tests only exercise the parser path. NOTE:
 # Production callers cache results in function-local statics that cannot be
 # reset mid-process; any multi-value business test must fork.
@@ -180,6 +193,19 @@ target_link_libraries(
 add_test(NAME umbp_pool_client_batch_put
          COMMAND test_umbp_pool_client_batch_put)
 
+# End-to-end workload replay through a live in-process master, two PoolClients,
+# and weighted same-tier backends. This needs the real gRPC + transfer path.
+add_executable(test_umbp_tier_benchmark test_umbp_tier_benchmark.cpp)
+add_dependencies(test_umbp_tier_benchmark umbp_workload_proto)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_tier_benchmark PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_tier_benchmark
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+add_test(NAME umbp_tier_benchmark COMMAND test_umbp_tier_benchmark)
+
 # test_umbp_medium_selection — one medium per node: the UMBPMedium -> TierType
 # lowering, the per-medium validation, and (live, 2-node) the registry holding
 # exactly one backend plus a cross-node BatchPut onto an SSD-only peer.
@@ -194,7 +220,8 @@ target_link_libraries(
 add_test(NAME umbp_medium_selection COMMAND test_umbp_medium_selection)
 
 set_tests_properties(umbp_cross_node_smoke umbp_pool_client_batch_put
-                     umbp_medium_selection PROPERTIES LABELS "integration")
+                     umbp_medium_selection umbp_tier_benchmark
+                     PROPERTIES LABELS "integration")
 
 # --------------------------------------------------------------------------
 # Benchmarks (manual; built but NOT registered with add_test).

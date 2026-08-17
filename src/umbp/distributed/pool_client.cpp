@@ -426,7 +426,7 @@ bool PoolClient::Init() {
   std::vector<uint8_t> engine_desc_bytes;
   if (peer_directory_ != nullptr) engine_desc_bytes = peer_directory_->PackedLocalEngineDesc();
 
-  if (config_.peer_service_port > 0) {
+  if (config_.peer_service_port > 0 || config_.auto_peer_service_port) {
     peer_service_ = std::make_unique<PeerServiceServer>(*default_pool_, engine_desc_bytes,
                                                         master_client_.get());
     if (!peer_service_->Start(config_.peer_service_port)) {
@@ -436,10 +436,11 @@ bool PoolClient::Init() {
       Shutdown();
       return false;
     }
+    config_.peer_service_port = peer_service_->BoundPort();
   }
 
   std::string peer_address;
-  if (config_.peer_service_port > 0) {
+  if (peer_service_ != nullptr) {
     std::string host = config_.master_config.node_address;
     peer_address = host + ":" + std::to_string(config_.peer_service_port);
   }

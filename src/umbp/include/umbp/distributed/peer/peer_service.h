@@ -52,6 +52,7 @@ class PeerServiceServer {
 
   bool Start(uint16_t port);
   void Stop();
+  uint16_t BoundPort() const { return bound_port_; }
 
  private:
   std::unique_ptr<PeerPool> owned_pool_;
@@ -61,6 +62,7 @@ class PeerServiceServer {
   std::vector<uint8_t> engine_desc_bytes_;
 
   std::unique_ptr<grpc::Server> server_;
+  uint16_t bound_port_ = 0;
 
   class UMBPPeerServiceImpl;
   std::unique_ptr<UMBPPeerServiceImpl> service_;

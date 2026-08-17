@@ -121,15 +121,16 @@ void EvictionManager::RunOnce() {
   // Ask the store for eviction-eligible candidates in the overloaded buckets.
   // The store is policy-neutral: it returns rows ordered by the hint (LRU here,
   // so an indexed backend can push the ordering down) but makes no eviction
-  // decision and never sees the byte budget.  max_per_bucket=0 → no cap, so the
-  // strategy gets full candidate visibility.
+  // decision and never sees the byte budget. Limit each bucket to the configured
+  // round size; a still-overloaded bucket is revisited on the next interval.
   std::vector<NodeTierKey> buckets;
   buckets.reserve(bytes_to_free.size());
   for (const auto& [ntk, _bytes] : bytes_to_free) buckets.push_back(ntk);
 
   auto candidates_by_bucket =
       store_.EnumerateEvictionCandidates(buckets, EvictionOrder::kLeastRecentlyAccessed,
-                                         /*max_per_bucket=*/0, std::chrono::system_clock::now());
+                                         config_.evict_batch_size,
+                                         std::chrono::system_clock::now());
   if (candidates_by_bucket.empty()) {
     MORI_UMBP_DEBUG("[EvictionManager] No eviction candidates found");
     return;

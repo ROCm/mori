@@ -264,6 +264,7 @@ set(UMBP_PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/distributed/proto")
 set(UMBP_PROTO_FILE "${UMBP_PROTO_DIR}/umbp.proto")
 set(UMBP_PEER_PROTO_FILE "${UMBP_PROTO_DIR}/umbp_peer.proto")
 set(UMBP_STANDALONE_PROTO_FILE "${UMBP_PROTO_DIR}/umbp_standalone.proto")
+set(UMBP_WORKLOAD_PROTO_FILE "${UMBP_PROTO_DIR}/umbp_workload.proto")
 set(UMBP_PROTO_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/proto_gen")
 file(MAKE_DIRECTORY ${UMBP_PROTO_GEN_DIR})
 
@@ -281,6 +282,9 @@ set(UMBP_STANDALONE_PROTO_SRCS "${UMBP_PROTO_GEN_DIR}/umbp_standalone.pb.cc")
 set(UMBP_STANDALONE_PROTO_HDRS "${UMBP_PROTO_GEN_DIR}/umbp_standalone.pb.h")
 set(UMBP_STANDALONE_GRPC_SRCS "${UMBP_PROTO_GEN_DIR}/umbp_standalone.grpc.pb.cc")
 set(UMBP_STANDALONE_GRPC_HDRS "${UMBP_PROTO_GEN_DIR}/umbp_standalone.grpc.pb.h")
+
+set(UMBP_WORKLOAD_PROTO_SRCS "${UMBP_PROTO_GEN_DIR}/umbp_workload.pb.cc")
+set(UMBP_WORKLOAD_PROTO_HDRS "${UMBP_PROTO_GEN_DIR}/umbp_workload.pb.h")
 
 add_custom_command(
   OUTPUT ${UMBP_PROTO_SRCS} ${UMBP_PROTO_HDRS} ${UMBP_GRPC_SRCS}
@@ -319,6 +323,18 @@ add_custom_command(
   COMMENT "Generating UMBP Standalone protobuf/gRPC C++ sources"
   VERBATIM)
 
+add_custom_command(
+  OUTPUT ${UMBP_WORKLOAD_PROTO_SRCS} ${UMBP_WORKLOAD_PROTO_HDRS}
+  COMMAND
+    ${_PROTOBUF_PROTOC} --proto_path=${UMBP_PROTO_DIR}
+    --cpp_out=${UMBP_PROTO_GEN_DIR} ${UMBP_WORKLOAD_PROTO_FILE}
+  DEPENDS ${UMBP_WORKLOAD_PROTO_FILE}
+  COMMENT "Generating UMBP workload trace protobuf C++ sources"
+  VERBATIM)
+add_custom_target(umbp_workload_proto
+                  DEPENDS ${UMBP_WORKLOAD_PROTO_SRCS}
+                          ${UMBP_WORKLOAD_PROTO_HDRS})
+
 # ---------- Static library: umbp_common ---------------------------------------
 # Shared between PoolClient integration and standalone control-plane tools.
 
@@ -330,6 +346,11 @@ add_library(
   ${UMBP_PEER_GRPC_SRCS}
   ${UMBP_STANDALONE_PROTO_SRCS}
   ${UMBP_STANDALONE_GRPC_SRCS}
+  ${UMBP_WORKLOAD_PROTO_SRCS}
+  distributed/benchmark/payload.cpp
+  distributed/benchmark/workload_trace.cpp
+  distributed/benchmark/workload_source.cpp
+  distributed/benchmark/workload_runner.cpp
   distributed/master/in_memory_master_metadata_store.cpp
   distributed/master/master_metadata_store_factory.cpp
   distributed/master/master_server.cpp
@@ -358,6 +379,7 @@ add_library(
   standalone/ipc.cpp
   standalone/standalone_process_client.cpp
   standalone/standalone_server.cpp)
+add_dependencies(umbp_common umbp_workload_proto)
 
 target_include_directories(
   umbp_common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${UMBP_PROTO_GEN_DIR}
@@ -467,6 +489,21 @@ target_link_libraries(umbp_client PRIVATE umbp_common ${_PROTOBUF_LIBS}
 set_target_properties(umbp_client PROPERTIES BUILD_RPATH "$ORIGIN"
                                              INSTALL_RPATH "$ORIGIN"
                                              BUILD_WITH_INSTALL_RPATH TRUE)
+
+# ---------- Distributed tier-management benchmark ---------------------------
+# Manual synthetic/trace-replay tool. It starts an in-process master and real
+# PoolClients, so it exercises routing, peer placement, transfer, heartbeat,
+# capacity, and eviction without depending on an inference framework.
+add_executable(umbp_tier_bench distributed/bin/tier_benchmark_main.cpp)
+add_dependencies(umbp_tier_bench umbp_workload_proto)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(umbp_tier_bench PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(umbp_tier_bench PRIVATE umbp_common ${_PROTOBUF_LIBS}
+                                               ${_GRPCPP_LIB})
+set_target_properties(umbp_tier_bench PROPERTIES BUILD_RPATH "$ORIGIN"
+                                                  INSTALL_RPATH "$ORIGIN"
+                                                  BUILD_WITH_INSTALL_RPATH TRUE)
 
 # ---------- Standalone-process executable ------------------------------------
 

@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package umbp.benchmark;
+
+// This schema is persisted on disk. Existing field numbers and meanings must
+// never be changed; add new fields when the format evolves.
+message WorkloadTraceHeader {
+  enum TimeUnit {
+    TIME_UNIT_UNSPECIFIED = 0;
+    TIME_UNIT_NANOSECONDS = 1;
+  }
+
+  uint32 schema_version = 1;
+  TimeUnit time_unit = 2;
+  uint64 seed = 3;
+  map<string, string> metadata = 4;
+}
+
+message WorkloadEvent {
+  enum Operation {
+    OPERATION_UNSPECIFIED = 0;
+    PUT = 1;
+    GET = 2;
+  }
+
+  uint64 relative_timestamp_ns = 1;
+  uint32 client_id = 2;
+  uint64 operation_id = 3;
+  Operation operation = 4;
+  string key = 5;
+  uint64 value_size = 6;
+  uint64 batch_id = 7;
+}

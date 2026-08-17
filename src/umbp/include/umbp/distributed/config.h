@@ -271,6 +271,11 @@ struct PoolClientConfig {
   // configured same-tier instances according to placement_weight. Appended to
   // preserve existing positional aggregate initializers.
   PoolPlacementPolicy placement_policy = PoolPlacementPolicy::SINGLE_BACKEND;
+
+  // Opt-in ephemeral peer service for test/benchmark harnesses. When true,
+  // PoolClient starts the service even when peer_service_port is zero and
+  // advertises the port selected atomically by gRPC, avoiding probe/bind races.
+  bool auto_peer_service_port = false;
 };
 
 // Lower a user-facing UMBPDistributedConfig to the internal PoolClientConfig.
