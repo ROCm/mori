@@ -408,8 +408,8 @@
 
 <span class="c1"># Run on two nodes (replace node_rank and master_addr)</span>
 torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--node_rank<span class="o">=</span><span class="m">0</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">&quot;10.194.129.65&quot;</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>tests/python/io/benchmark.py<span class="w"> </span>--host<span class="o">=</span><span class="s2">&quot;10.194.129.65&quot;</span>
+<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">"10.194.129.65"</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>tests/python/io/benchmark.py<span class="w"> </span>--host<span class="o">=</span><span class="s2">"10.194.129.65"</span>
 </pre></div>
 </div>
 <section id="fabric-cross-node-scale-up-ualink-super-node">
@@ -421,7 +421,7 @@ fabric-exportable VMM memory internally, so no <code class="docutils literal not
 OOB metadata is still exchanged over gloo (torchrun).</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># node A (initiator)</span>
 torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--node_rank<span class="o">=</span><span class="m">0</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">&quot;&lt;nodeA_ip&gt;&quot;</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">"&lt;nodeA_ip&gt;"</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>tests/python/io/benchmark.py<span class="w"> </span>--backend<span class="w"> </span>fabric<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--all<span class="w"> </span>--enable-sess<span class="w"> </span>--enable-batch-transfer<span class="w"> </span>--transfer-batch-size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--sweep-start-size<span class="w"> </span><span class="m">1048576</span><span class="w"> </span>--sweep-max-size<span class="w"> </span><span class="m">268435456</span><span class="w"> </span>--op-type<span class="w"> </span><span class="nb">read</span>
@@ -717,8 +717,8 @@ rather than leaving them holding ports.</p>
 <h2>Results: Thor2 RDMA Read<a class="headerlink" href="#results-thor2-rdma-read" title="Link to this heading"></a></h2>
 <p><strong>Config:</strong> 8 initiator + 8 target devices, session enabled, batch transfer, 2 QPs per transfer</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--node_rank<span class="o">=</span><span class="m">1</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">&quot;10.235.192.57&quot;</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>tests/python/io/benchmark.py<span class="w"> </span>--host<span class="o">=</span><span class="s2">&quot;10.235.192.60&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">"10.235.192.57"</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>tests/python/io/benchmark.py<span class="w"> </span>--host<span class="o">=</span><span class="s2">"10.235.192.60"</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--all<span class="w"> </span>--enable-sess<span class="w"> </span>--enable-batch-transfer<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--num-qp-per-transfer<span class="w"> </span><span class="m">2</span><span class="w"> </span>--num-target-dev<span class="w"> </span><span class="m">8</span><span class="w"> </span>--num-initiator-dev<span class="w"> </span><span class="m">8</span>
 </pre></div>
@@ -757,8 +757,8 @@ rather than leaving them holding ports.</p>
 <p><strong>Config:</strong> 1 initiator + 1 target device, session enabled, batch transfer (128), 4 QPs, polling mode</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>numactl<span class="w"> </span>--cpunodebind<span class="o">=</span><span class="m">0</span><span class="w"> </span>--membind<span class="o">=</span><span class="m">0</span><span class="w"> </span>--physcpubind<span class="o">=</span><span class="m">0</span>-47,96-143<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--node_rank<span class="o">=</span><span class="m">0</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">&quot;10.235.192.60&quot;</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>tests/python/io/benchmark.py<span class="w"> </span>--host<span class="o">=</span><span class="s2">&quot;10.235.192.60&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">"10.235.192.60"</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>tests/python/io/benchmark.py<span class="w"> </span>--host<span class="o">=</span><span class="s2">"10.235.192.60"</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--enable-batch-transfer<span class="w"> </span>--enable-sess<span class="w"> </span>--buffer-size<span class="w"> </span><span class="m">1024</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--transfer-batch-size<span class="w"> </span><span class="m">128</span><span class="w"> </span>--num-initiator-dev<span class="w"> </span><span class="m">1</span><span class="w"> </span>--num-target-dev<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--num-qp-per-transfer<span class="w"> </span><span class="m">4</span><span class="w"> </span>--all<span class="w"> </span>--num-worker-threads<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
@@ -797,8 +797,8 @@ rather than leaving them holding ports.</p>
 <p><strong>Config:</strong> 1 initiator + 1 target device, 1024B messages, session enabled, 16 QPs, polling mode</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>numactl<span class="w"> </span>--cpunodebind<span class="o">=</span><span class="m">0</span><span class="w"> </span>--membind<span class="o">=</span><span class="m">0</span><span class="w"> </span>--physcpubind<span class="o">=</span><span class="m">0</span>-47,96-143<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--node_rank<span class="o">=</span><span class="m">0</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">&quot;10.235.192.60&quot;</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>tests/python/io/benchmark.py<span class="w"> </span>--host<span class="o">=</span><span class="s2">&quot;10.235.192.60&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">"10.235.192.60"</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>tests/python/io/benchmark.py<span class="w"> </span>--host<span class="o">=</span><span class="s2">"10.235.192.60"</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--enable-batch-transfer<span class="w"> </span>--enable-sess<span class="w"> </span>--buffer-size<span class="w"> </span><span class="m">1024</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--transfer-batch-size<span class="w"> </span><span class="m">128</span><span class="w"> </span>--num-initiator-dev<span class="w"> </span><span class="m">1</span><span class="w"> </span>--num-target-dev<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--num-qp-per-transfer<span class="w"> </span><span class="m">16</span><span class="w"> </span>--all-batch<span class="w"> </span>--num-worker-threads<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
@@ -837,8 +837,8 @@ rather than leaving them holding ports.</p>
 <h3>Write<a class="headerlink" href="#write" title="Link to this heading"></a></h3>
 <p><strong>Config:</strong> 1 initiator + 1 target device, single transfer, session enabled, message sweep 1KB-64MB</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--node_rank<span class="o">=</span><span class="m">0</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">&quot;10.194.132.29&quot;</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>tests/python/io/benchmark.py<span class="w"> </span>--host<span class="o">=</span><span class="s2">&quot;10.194.132.29&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">"10.194.132.29"</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>tests/python/io/benchmark.py<span class="w"> </span>--host<span class="o">=</span><span class="s2">"10.194.132.29"</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--transfer-batch-size<span class="w"> </span><span class="m">1</span><span class="w"> </span>--all<span class="w"> </span>--sweep-start-size<span class="o">=</span><span class="m">1024</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--sweep-max-size<span class="o">=</span><span class="m">67108864</span><span class="w"> </span>--op-type<span class="w"> </span>write<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--enable-sess<span class="w"> </span>--enable-batch-transfer
@@ -874,8 +874,8 @@ rather than leaving them holding ports.</p>
 <h3>Read<a class="headerlink" href="#read" title="Link to this heading"></a></h3>
 <p><strong>Config:</strong> Same as write, but with <code class="docutils literal notranslate"><span class="pre">--op-type</span> <span class="pre">read</span></code></p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--node_rank<span class="o">=</span><span class="m">0</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">&quot;10.194.132.29&quot;</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>tests/python/io/benchmark.py<span class="w"> </span>--host<span class="o">=</span><span class="s2">&quot;10.194.132.29&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">"10.194.132.29"</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>tests/python/io/benchmark.py<span class="w"> </span>--host<span class="o">=</span><span class="s2">"10.194.132.29"</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--transfer-batch-size<span class="w"> </span><span class="m">1</span><span class="w"> </span>--all<span class="w"> </span>--sweep-start-size<span class="o">=</span><span class="m">1024</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--sweep-max-size<span class="o">=</span><span class="m">67108864</span><span class="w"> </span>--op-type<span class="w"> </span><span class="nb">read</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--enable-sess<span class="w"> </span>--enable-batch-transfer

@@ -461,7 +461,7 @@ across <code class="docutils literal notranslate"><span class="pre">numQpPerPe</
 
 <span class="c1"># Compare to link rating, e.g. 400 Gb/s = 50 GB/s per port</span>
 <span class="c1"># With numQpPerPe QPs the effective ceiling is still the NIC BW</span>
-<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Observed RDMA send BW: </span><span class="si">{</span><span class="n">observed_bw_GBps</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> GB/s&quot;</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Observed RDMA send BW: </span><span class="si">{</span><span class="n">observed_bw_GBps</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> GB/s"</span><span class="p">)</span>
 </pre></div>
 </div>
 </section>
@@ -523,8 +523,8 @@ ep_combine_all                  760.00    810.00    50.00   ← final accumulati
 <span class="n">dispatch_bw_GBps</span> <span class="o">=</span> <span class="n">dispatch_bytes</span> <span class="o">/</span> <span class="p">(</span><span class="n">send_dur_us</span> <span class="o">*</span> <span class="mf">1e-6</span><span class="p">)</span> <span class="o">/</span> <span class="mf">1e9</span>
 <span class="n">combine_bw_GBps</span>  <span class="o">=</span> <span class="n">combine_bytes</span>  <span class="o">/</span> <span class="p">(</span><span class="n">combine_dur_us</span> <span class="o">*</span> <span class="mf">1e-6</span><span class="p">)</span> <span class="o">/</span> <span class="mf">1e9</span>
 
-<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Dispatch RDMA BW: </span><span class="si">{</span><span class="n">dispatch_bw_GBps</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> GB/s&quot;</span><span class="p">)</span>
-<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Combine  RDMA BW: </span><span class="si">{</span><span class="n">combine_bw_GBps</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> GB/s&quot;</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Dispatch RDMA BW: </span><span class="si">{</span><span class="n">dispatch_bw_GBps</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> GB/s"</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Combine  RDMA BW: </span><span class="si">{</span><span class="n">combine_bw_GBps</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> GB/s"</span><span class="p">)</span>
 </pre></div>
 </div>
 </section>
@@ -596,7 +596,7 @@ ep_combine_all                  760.00    810.00    50.00   ← final accumulati
 <h2>Sanity Checks from Hardware Counters (optional)<a class="headerlink" href="#sanity-checks-from-hardware-counters-optional" title="Link to this heading"></a></h2>
 <p>If you have access to <code class="docutils literal notranslate"><span class="pre">rocprof</span></code> or equivalent:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>rocprof<span class="w"> </span>--stats<span class="w"> </span>--hip-trace<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--counter<span class="w"> </span><span class="s2">&quot;TCC_EA_RDREQ_sum,TCC_EA_WRREQ_sum&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--counter<span class="w"> </span><span class="s2">"TCC_EA_RDREQ_sum,TCC_EA_WRREQ_sum"</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>python<span class="w"> </span>run_dispatch_combine.py
 </pre></div>
 </div>

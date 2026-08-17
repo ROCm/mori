@@ -369,7 +369,7 @@ of the runtime machine. Compiled artifacts are cached to <code class="docutils l
 pip<span class="w"> </span>install<span class="w"> </span>.
 
 <span class="c1"># 2. (Optional) Pre-compile all device kernels (~22s parallel, needs hipcc)</span>
-<span class="nv">MORI_PRECOMPILE</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;import mori&quot;</span>
+<span class="nv">MORI_PRECOMPILE</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"import mori"</span>
 
 <span class="c1"># 3. Run — kernels are JIT-compiled on first use if not pre-compiled</span>
 torchrun<span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">8</span><span class="w"> </span>my_app.py
@@ -599,8 +599,8 @@ with 7 parallel hipcc invocations + 1 bitcode build).</p>
   ├── args_ptr = mori_cpp.build_args(handle, rdma_block_num, hidden_dim, ...)
   │     └── C++: new EpDispatchCombineArgsRaw(GetArgsRaw(handle, ...))
   │
-  ├── sfx = _DTYPE_SUFFIX[input.dtype]                   # &quot;bf16&quot;, &quot;f32&quot;, ...
-  ├── kernel_name = f&quot;EpDispatchIntraNodeKernel_{sfx}&quot;    # Python selects
+  ├── sfx = _DTYPE_SUFFIX[input.dtype]                   # "bf16", "f32", ...
+  ├── kernel_name = f"EpDispatchIntraNodeKernel_{sfx}"    # Python selects
   ├── grid  = (block_num,)                                # Python computes
   ├── block = (WARP_SIZE * warp_per_block,)
   ├── shared_mem = dispatch_shared_mem(warp_per_block)
@@ -772,14 +772,14 @@ rm<span class="w"> </span>-rf<span class="w"> </span>build
 pip<span class="w"> </span>install<span class="w"> </span>.<span class="w"> </span>--no-build-isolation
 
 <span class="c1"># Verify _jit_sources bundled in site-packages</span>
-python<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;</span>
+python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"</span>
 <span class="s2">from mori.jit.config import get_mori_source_root</span>
 <span class="s2">root = get_mori_source_root()</span>
-<span class="s2">print(f&#39;Source root: {root}&#39;)</span>
-<span class="s2">assert root is not None, &#39;JIT source root not found&#39;</span>
-<span class="s2">assert (root / &#39;src/ops/kernels/ep_intranode.hip&#39;).is_file()</span>
-<span class="s2">print(&#39;OK: JIT sources are packaged&#39;)</span>
-<span class="s2">&quot;</span>
+<span class="s2">print(f'Source root: {root}')</span>
+<span class="s2">assert root is not None, 'JIT source root not found'</span>
+<span class="s2">assert (root / 'src/ops/kernels/ep_intranode.hip').is_file()</span>
+<span class="s2">print('OK: JIT sources are packaged')</span>
+<span class="s2">"</span>
 </pre></div>
 </div>
 </section>
@@ -794,44 +794,44 @@ pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </s
 <section id="pre-compile-all-kernels">
 <h3>3. Pre-compile All Kernels<a class="headerlink" href="#pre-compile-all-kernels" title="Link to this heading"></a></h3>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>rm<span class="w"> </span>-rf<span class="w"> </span>~/.mori/jit
-<span class="nv">MORI_PRECOMPILE</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;import mori&quot;</span>
+<span class="nv">MORI_PRECOMPILE</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"import mori"</span>
 <span class="c1"># Expected: ~22s, 6 .hsaco files + 1 .bc + 1 cast_kernel.hsaco</span>
 </pre></div>
 </div>
 </section>
 <section id="verify-jit-configuration">
 <h3>4. Verify JIT Configuration<a class="headerlink" href="#verify-jit-configuration" title="Link to this heading"></a></h3>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"</span>
 <span class="s2">from mori.jit.config import detect_build_config, detect_nic_type, get_mori_source_root</span>
 <span class="s2">cfg = detect_build_config()</span>
-<span class="s2">print(f&#39;GPU:    {cfg.arch}&#39;)</span>
-<span class="s2">print(f&#39;NIC:    {detect_nic_type()}&#39;)</span>
-<span class="s2">print(f&#39;Root:   {get_mori_source_root()}&#39;)</span>
-<span class="s2">print(f&#39;hipcc:  {cfg.hipcc}&#39;)</span>
-<span class="s2">&quot;</span>
+<span class="s2">print(f'GPU:    {cfg.arch}')</span>
+<span class="s2">print(f'NIC:    {detect_nic_type()}')</span>
+<span class="s2">print(f'Root:   {get_mori_source_root()}')</span>
+<span class="s2">print(f'hipcc:  {cfg.hipcc}')</span>
+<span class="s2">"</span>
 </pre></div>
 </div>
 </section>
 <section id="verify-compilation-separation">
 <h3>5. Verify Compilation Separation<a class="headerlink" href="#verify-compilation-separation" title="Link to this heading"></a></h3>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Only works with editable install (build/ directory present)</span>
-python<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;</span>
+python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"</span>
 <span class="s2">import json</span>
-<span class="s2">with open(&#39;build/compile_commands.json&#39;) as f:</span>
+<span class="s2">with open('build/compile_commands.json') as f:</span>
 <span class="s2">    data = json.load(f)</span>
 <span class="s2">cxx, hip = [], []</span>
 <span class="s2">for e in data:</span>
-<span class="s2">    fn = e[&#39;file&#39;].split(&#39;/&#39;)[-1]</span>
-<span class="s2">    fp = e[&#39;file&#39;]</span>
-<span class="s2">    if &#39;/3rdparty/&#39; in fp or &#39;/examples/&#39; in fp or &#39;/benchmarks/&#39; in fp:</span>
+<span class="s2">    fn = e['file'].split('/')[-1]</span>
+<span class="s2">    fp = e['file']</span>
+<span class="s2">    if '/3rdparty/' in fp or '/examples/' in fp or '/benchmarks/' in fp:</span>
 <span class="s2">        continue</span>
-<span class="s2">    if any(x in e[&#39;command&#39;] for x in [&#39;-x hip&#39;, &#39;--offload-arch&#39;]):</span>
+<span class="s2">    if any(x in e['command'] for x in ['-x hip', '--offload-arch']):</span>
 <span class="s2">        hip.append(fn)</span>
 <span class="s2">    else:</span>
 <span class="s2">        cxx.append(fn)</span>
-<span class="s2">print(f&#39;CXX: {len(cxx)} files | HIP: {len(hip)} files&#39;)</span>
-<span class="s2">print(f&#39;HIP files: {sorted(hip)}&#39;)</span>
-<span class="s2">&quot;</span>
+<span class="s2">print(f'CXX: {len(cxx)} files | HIP: {len(hip)} files')</span>
+<span class="s2">print(f'HIP files: {sorted(hip)}')</span>
+<span class="s2">"</span>
 <span class="c1"># Expected: CXX ~34 | HIP ~1</span>
 <span class="c1"># HIP: device_link_stub.hip (shmem device code is now JIT-compiled)</span>
 </pre></div>
@@ -840,7 +840,7 @@ python<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;<
 <section id="dispatch-combine-correctness">
 <h3>6. Dispatch/Combine Correctness<a class="headerlink" href="#dispatch-combine-correctness" title="Link to this heading"></a></h3>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Single test (IntraNode, bf16, 8 GPUs, ~20s)</span>
-pytest<span class="w"> </span><span class="s1">&#39;tests/python/ops/test_dispatch_combine.py::test_dispatch_combine[none-True-8-32-1-1-0-7168-data_type0-8]&#39;</span><span class="w"> </span>-x<span class="w"> </span>-v
+pytest<span class="w"> </span><span class="s1">'tests/python/ops/test_dispatch_combine.py::test_dispatch_combine[none-True-8-32-1-1-0-7168-data_type0-8]'</span><span class="w"> </span>-x<span class="w"> </span>-v
 
 <span class="c1"># Full suite (256 cases: 80 pass, 176 skip on gfx942, ~26s)</span>
 pytest<span class="w"> </span>tests/python/ops/test_dispatch_combine.py<span class="w"> </span>-q
@@ -879,7 +879,7 @@ torchrun<span class="w"> </span>--nproc_per_node<span class="o">=</span><span cl
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>rm<span class="w"> </span>-rf<span class="w"> </span>build<span class="w"> </span>~/.mori/jit
 pip<span class="w"> </span>install<span class="w"> </span>.<span class="w"> </span>--no-build-isolation
 <span class="nb">cd</span><span class="w"> </span>/tmp<span class="w">  </span><span class="c1"># leave source tree to verify wheel is self-contained</span>
-<span class="nv">MORI_PRECOMPILE</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;import mori&quot;</span>
+<span class="nv">MORI_PRECOMPILE</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"import mori"</span>
 <span class="nb">cd</span><span class="w"> </span>/path/to/mori
 <span class="nb">export</span><span class="w"> </span><span class="nv">PYTHONPATH</span><span class="o">=</span>/path/to/mori:<span class="nv">$PYTHONPATH</span>
 pytest<span class="w"> </span>tests/python/ops/test_dispatch_combine.py<span class="w"> </span>-q
@@ -920,7 +920,7 @@ without duplicating code.</p>
 <ol class="arabic simple" start="2">
 <li><p>Add <code class="docutils literal notranslate"><span class="pre">extern</span> <span class="pre">&quot;C&quot;</span></code> wrappers in a <code class="docutils literal notranslate"><span class="pre">.hip</span></code> file under <code class="docutils literal notranslate"><span class="pre">src/ops/kernels/</span></code>:</p></li>
 </ol>
-<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;src/ops/kernels/ep_common.hip&quot;</span>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="cp">#include</span><span class="w"> </span><span class="cpf">"src/ops/kernels/ep_common.hip"</span>
 <span class="n">MORI_DEFINE_GPU_STATES</span>
 <span class="n">WRAP_ALL_TYPES</span><span class="p">(</span><span class="n">MyKernel</span><span class="p">)</span>
 </pre></div>
@@ -930,7 +930,7 @@ without duplicating code.</p>
 </ol>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># In dispatch_combine.py or your own module:</span>
 <span class="n">args_ptr</span> <span class="o">=</span> <span class="n">mori_cpp</span><span class="o">.</span><span class="n">build_args</span><span class="p">(</span><span class="n">handle</span><span class="p">,</span> <span class="n">rdma_block_num</span><span class="o">=</span><span class="n">rbn</span><span class="p">,</span> <span class="n">hidden_dim</span><span class="o">=</span><span class="n">dim</span><span class="p">)</span>
-<span class="n">func</span> <span class="o">=</span> <span class="n">hip_module</span><span class="o">.</span><span class="n">get_function</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;MyKernel_</span><span class="si">{</span><span class="n">sfx</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+<span class="n">func</span> <span class="o">=</span> <span class="n">hip_module</span><span class="o">.</span><span class="n">get_function</span><span class="p">(</span><span class="sa">f</span><span class="s2">"MyKernel_</span><span class="si">{</span><span class="n">sfx</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
 <span class="n">func</span><span class="o">.</span><span class="n">launch_struct</span><span class="p">(</span><span class="n">grid</span><span class="p">,</span> <span class="n">block</span><span class="p">,</span> <span class="n">shared_mem</span><span class="p">,</span> <span class="n">stream</span><span class="p">,</span> <span class="n">args_ptr</span><span class="p">)</span>
 <span class="n">mori_cpp</span><span class="o">.</span><span class="n">free_args</span><span class="p">(</span><span class="n">args_ptr</span><span class="p">)</span>
 </pre></div>

@@ -392,7 +392,7 @@
 <section id="include-headers">
 <h3>1. Include Headers<a class="headerlink" href="#include-headers" title="Link to this heading"></a></h3>
 <p>Ensure you have the profiler headers available. The main entry point is typically:</p>
-<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;mori/core/profiler/kernel_profiler.hpp&quot;</span>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="cp">#include</span><span class="w"> </span><span class="cpf">"mori/core/profiler/kernel_profiler.hpp"</span>
 </pre></div>
 </div>
 </section>
@@ -421,7 +421,7 @@
 <blockquote>
 <div><p><strong>Note</strong>: For filenames with underscores like <code class="docutils literal notranslate"><span class="pre">internode_v1.cpp</span></code>, the CamelCase conversion produces <code class="docutils literal notranslate"><span class="pre">InternodeV1</span></code>, so the Python module would be <code class="docutils literal notranslate"><span class="pre">mori.cpp.InternodeV1Slots</span></code>.</p>
 </div></blockquote>
-<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="c1">// Example: in a file named &#39;my_kernel.cpp&#39;</span>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="c1">// Example: in a file named 'my_kernel.cpp'</span>
 <span class="k">template</span><span class="w"> </span><span class="o">&lt;</span><span class="k">typename</span><span class="w"> </span><span class="nc">T</span><span class="o">&gt;</span>
 <span class="n">__global__</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="n">MyKernelLaunch</span><span class="p">(</span><span class="n">MyKernelArgs</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="w"> </span><span class="n">args</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
 <span class="w">  </span><span class="c1">// Calculate warp and lane IDs</span>
@@ -518,18 +518,18 @@ cmake<span class="w"> </span>--build<span class="w"> </span>build
 <span class="c1"># ... run dispatch/combine ...</span>
 
 <span class="c1"># Get debug buffer from handle (only available when ENABLE_PROFILER=ON)</span>
-<span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">mori</span><span class="o">.</span><span class="n">cpp</span><span class="p">,</span> <span class="s2">&quot;get_debug_time_buf&quot;</span><span class="p">):</span>
+<span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">mori</span><span class="o">.</span><span class="n">cpp</span><span class="p">,</span> <span class="s2">"get_debug_time_buf"</span><span class="p">):</span>
     <span class="n">trace_buffer</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">cpp</span><span class="o">.</span><span class="n">get_debug_time_buf</span><span class="p">(</span><span class="n">op</span><span class="o">.</span><span class="n">_handle</span><span class="p">)</span>
 
     <span class="c1"># Option 1: Auto-discover all slots (simplest, recommended)</span>
-    <span class="n">export_to_perfetto</span><span class="p">(</span><span class="n">trace_buffer</span><span class="p">,</span> <span class="s2">&quot;trace.json&quot;</span><span class="p">)</span>
+    <span class="n">export_to_perfetto</span><span class="p">(</span><span class="n">trace_buffer</span><span class="p">,</span> <span class="s2">"trace.json"</span><span class="p">)</span>
 
     <span class="c1"># Option 2: Use the merged ALL_PROFILER_SLOTS (explicit)</span>
-    <span class="n">export_to_perfetto</span><span class="p">(</span><span class="n">trace_buffer</span><span class="p">,</span> <span class="s2">&quot;trace.json&quot;</span><span class="p">,</span> <span class="n">mori</span><span class="o">.</span><span class="n">cpp</span><span class="o">.</span><span class="n">ALL_PROFILER_SLOTS</span><span class="p">)</span>
+    <span class="n">export_to_perfetto</span><span class="p">(</span><span class="n">trace_buffer</span><span class="p">,</span> <span class="s2">"trace.json"</span><span class="p">,</span> <span class="n">mori</span><span class="o">.</span><span class="n">cpp</span><span class="o">.</span><span class="n">ALL_PROFILER_SLOTS</span><span class="p">)</span>
 
     <span class="c1"># Option 3: Use specific module slots (if you know which module)</span>
     <span class="c1"># Module name is derived from filename: internode_v1.cpp -&gt; InternodeV1Slots</span>
-    <span class="n">export_to_perfetto</span><span class="p">(</span><span class="n">trace_buffer</span><span class="p">,</span> <span class="s2">&quot;trace.json&quot;</span><span class="p">,</span> <span class="n">mori</span><span class="o">.</span><span class="n">cpp</span><span class="o">.</span><span class="n">InternodeV1Slots</span><span class="p">)</span>
+    <span class="n">export_to_perfetto</span><span class="p">(</span><span class="n">trace_buffer</span><span class="p">,</span> <span class="s2">"trace.json"</span><span class="p">,</span> <span class="n">mori</span><span class="o">.</span><span class="n">cpp</span><span class="o">.</span><span class="n">InternodeV1Slots</span><span class="p">)</span>
 </pre></div>
 </div>
 <p>The first option is recommended as it automatically discovers all profiler slots from your build.</p>
@@ -537,7 +537,7 @@ cmake<span class="w"> </span>--build<span class="w"> </span>build
 <h3>Device-side Elapsed Time Measurement<a class="headerlink" href="#device-side-elapsed-time-measurement" title="Link to this heading"></a></h3>
 <p>MORI-VIZ uses <code class="docutils literal notranslate"><span class="pre">wall_clock64</span></code> to measure device-side elapsed time. The <code class="docutils literal notranslate"><span class="pre">gpu_freq_ghz</span></code> parameter can be used to set the hardware frequency for <code class="docutils literal notranslate"><span class="pre">wall_clock64</span></code>. By default, MORI queries it through the <code class="docutils literal notranslate"><span class="pre">hipDeviceGetAttribute(&amp;rate,</span> <span class="pre">hipDeviceAttributeWallClockRate,</span> <span class="pre">device)</span></code> API. To override it:</p>
 <p>Pass the value to <code class="docutils literal notranslate"><span class="pre">export_to_perfetto</span></code>:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">export_to_perfetto</span><span class="p">(</span><span class="n">trace_buffer</span><span class="p">,</span> <span class="s2">&quot;trace.json&quot;</span><span class="p">,</span> <span class="n">gpu_freq_ghz</span><span class="o">=</span><span class="mf">0.1</span><span class="p">)</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">export_to_perfetto</span><span class="p">(</span><span class="n">trace_buffer</span><span class="p">,</span> <span class="s2">"trace.json"</span><span class="p">,</span> <span class="n">gpu_freq_ghz</span><span class="o">=</span><span class="mf">0.1</span><span class="p">)</span>
 </pre></div>
 </div>
 </section>
@@ -560,7 +560,7 @@ cmake<span class="w"> </span>--build<span class="w"> </span>build
 <span class="n">trace_buffer</span><span class="o">.</span><span class="n">zero_</span><span class="p">()</span>  <span class="c1"># Clear before next profiled iteration</span>
 
 <span class="c1"># Also clear the offset buffer if needed</span>
-<span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">mori</span><span class="o">.</span><span class="n">cpp</span><span class="p">,</span> <span class="s2">&quot;get_debug_time_offset&quot;</span><span class="p">):</span>
+<span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">mori</span><span class="o">.</span><span class="n">cpp</span><span class="p">,</span> <span class="s2">"get_debug_time_offset"</span><span class="p">):</span>
     <span class="n">offset_buffer</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">cpp</span><span class="o">.</span><span class="n">get_debug_time_offset</span><span class="p">(</span><span class="n">handle</span><span class="p">)</span>
     <span class="n">offset_buffer</span><span class="o">.</span><span class="n">zero_</span><span class="p">()</span>
 </pre></div>

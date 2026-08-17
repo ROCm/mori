@@ -533,8 +533,8 @@ routing decisions; use <code class="docutils literal notranslate"><span class="p
 <p><strong>Constructor:</strong></p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">UMBPMasterClient</span><span class="p">(</span>
     <span class="n">master_address</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
-    <span class="n">node_id</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span><span class="p">,</span>
-    <span class="n">node_address</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span><span class="p">,</span>
+    <span class="n">node_id</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">""</span><span class="p">,</span>
+    <span class="n">node_address</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">""</span><span class="p">,</span>
 <span class="p">)</span>
 </pre></div>
 </div>
@@ -747,8 +747,8 @@ time ranking — snapshot the counter at two points and diff:</p>
     <span class="k">if</span> <span class="n">after</span><span class="p">[</span><span class="n">h</span><span class="p">]</span> <span class="o">-</span> <span class="n">before</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">h</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span>
 <span class="p">}</span>
 <span class="n">recent_hottest</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">delta</span><span class="o">.</span><span class="n">items</span><span class="p">(),</span> <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">kv</span><span class="p">:</span> <span class="n">kv</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="n">reverse</span><span class="o">=</span><span class="kc">True</span><span class="p">)[:</span><span class="mi">32</span><span class="p">]</span>
-<span class="c1"># delta[h] is &quot;hits during the 5-minute window&quot;.  Hashes absent from</span>
-<span class="c1"># `after` either had zero traffic in the window or were GC&#39;d from the</span>
+<span class="c1"># delta[h] is "hits during the 5-minute window".  Hashes absent from</span>
+<span class="c1"># `after` either had zero traffic in the window or were GC'd from the</span>
 <span class="c1"># hit index after UMBP_HIT_INDEX_TTL_SEC of inactivity.</span>
 </pre></div>
 </div>
@@ -882,9 +882,9 @@ inactivity or if the master restarts.</p></td>
 <span class="n">_1GB</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span>
 
 <span class="n">client</span> <span class="o">=</span> <span class="n">UMBPMasterClient</span><span class="p">(</span>
-    <span class="s2">&quot;127.0.0.1:15558&quot;</span><span class="p">,</span>
-    <span class="n">node_id</span><span class="o">=</span><span class="s2">&quot;worker-0&quot;</span><span class="p">,</span>
-    <span class="n">node_address</span><span class="o">=</span><span class="s2">&quot;worker-0:8080&quot;</span><span class="p">,</span>
+    <span class="s2">"127.0.0.1:15558"</span><span class="p">,</span>
+    <span class="n">node_id</span><span class="o">=</span><span class="s2">"worker-0"</span><span class="p">,</span>
+    <span class="n">node_address</span><span class="o">=</span><span class="s2">"worker-0:8080"</span><span class="p">,</span>
 <span class="p">)</span>
 
 <span class="c1"># Register with available DRAM capacity</span>
@@ -900,14 +900,14 @@ inactivity or if the master restarts.</p></td>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mori.cpp</span><span class="w"> </span><span class="kn">import</span> <span class="n">UMBPMasterClient</span><span class="p">,</span> <span class="n">UMBPTierType</span>
 
 <span class="n">_1GB</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span>
-<span class="n">master</span> <span class="o">=</span> <span class="s2">&quot;127.0.0.1:15558&quot;</span>
+<span class="n">master</span> <span class="o">=</span> <span class="s2">"127.0.0.1:15558"</span>
 
 <span class="c1"># Node A reports that it holds some KV blocks in DRAM</span>
-<span class="n">node_a</span> <span class="o">=</span> <span class="n">UMBPMasterClient</span><span class="p">(</span><span class="n">master</span><span class="p">,</span> <span class="n">node_id</span><span class="o">=</span><span class="s2">&quot;node-a&quot;</span><span class="p">,</span> <span class="n">node_address</span><span class="o">=</span><span class="s2">&quot;node-a:8080&quot;</span><span class="p">)</span>
+<span class="n">node_a</span> <span class="o">=</span> <span class="n">UMBPMasterClient</span><span class="p">(</span><span class="n">master</span><span class="p">,</span> <span class="n">node_id</span><span class="o">=</span><span class="s2">"node-a"</span><span class="p">,</span> <span class="n">node_address</span><span class="o">=</span><span class="s2">"node-a:8080"</span><span class="p">)</span>
 <span class="n">node_a</span><span class="o">.</span><span class="n">register_self</span><span class="p">({</span><span class="n">UMBPTierType</span><span class="o">.</span><span class="n">DRAM</span><span class="p">:</span> <span class="p">(</span><span class="n">_1GB</span><span class="p">,</span> <span class="n">_1GB</span><span class="p">)})</span>
 
-<span class="n">hashes</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;sha256-abc&quot;</span><span class="p">,</span> <span class="s2">&quot;sha256-def&quot;</span><span class="p">,</span> <span class="s2">&quot;sha256-ghi&quot;</span><span class="p">]</span>
-<span class="n">node_a</span><span class="o">.</span><span class="n">report_external_kv_blocks</span><span class="p">(</span><span class="s2">&quot;node-a&quot;</span><span class="p">,</span> <span class="n">hashes</span><span class="p">,</span> <span class="n">UMBPTierType</span><span class="o">.</span><span class="n">DRAM</span><span class="p">)</span>
+<span class="n">hashes</span> <span class="o">=</span> <span class="p">[</span><span class="s2">"sha256-abc"</span><span class="p">,</span> <span class="s2">"sha256-def"</span><span class="p">,</span> <span class="s2">"sha256-ghi"</span><span class="p">]</span>
+<span class="n">node_a</span><span class="o">.</span><span class="n">report_external_kv_blocks</span><span class="p">(</span><span class="s2">"node-a"</span><span class="p">,</span> <span class="n">hashes</span><span class="p">,</span> <span class="n">UMBPTierType</span><span class="o">.</span><span class="n">DRAM</span><span class="p">)</span>
 
 <span class="c1"># Node B queries which nodes hold these blocks</span>
 <span class="n">node_b</span> <span class="o">=</span> <span class="n">UMBPMasterClient</span><span class="p">(</span><span class="n">master</span><span class="p">)</span>
@@ -915,30 +915,30 @@ inactivity or if the master restarts.</p></td>
 
 <span class="k">for</span> <span class="n">m</span> <span class="ow">in</span> <span class="n">matches</span><span class="p">:</span>
     <span class="n">per_tier</span> <span class="o">=</span> <span class="p">{</span><span class="n">t</span><span class="o">.</span><span class="n">name</span><span class="p">:</span> <span class="nb">len</span><span class="p">(</span><span class="n">hs</span><span class="p">)</span> <span class="k">for</span> <span class="n">t</span><span class="p">,</span> <span class="n">hs</span> <span class="ow">in</span> <span class="n">m</span><span class="o">.</span><span class="n">hashes_by_tier</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span>
-    <span class="n">peer</span> <span class="o">=</span> <span class="n">m</span><span class="o">.</span><span class="n">peer_address</span> <span class="ow">or</span> <span class="s2">&quot;&lt;no PeerService&gt;&quot;</span>
-    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;node </span><span class="si">{</span><span class="n">m</span><span class="o">.</span><span class="n">node_id</span><span class="si">}</span><span class="s2"> @ </span><span class="si">{</span><span class="n">peer</span><span class="si">}</span><span class="s2"> has </span><span class="si">{</span><span class="n">m</span><span class="o">.</span><span class="n">matched_hash_count</span><span class="p">()</span><span class="si">}</span><span class="s2"> blocks: </span><span class="si">{</span><span class="n">per_tier</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
-    <span class="c1"># → &quot;node node-a @ &lt;no PeerService&gt; has 3 blocks: {&#39;DRAM&#39;: 3}&quot;</span>
+    <span class="n">peer</span> <span class="o">=</span> <span class="n">m</span><span class="o">.</span><span class="n">peer_address</span> <span class="ow">or</span> <span class="s2">"&lt;no PeerService&gt;"</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"node </span><span class="si">{</span><span class="n">m</span><span class="o">.</span><span class="n">node_id</span><span class="si">}</span><span class="s2"> @ </span><span class="si">{</span><span class="n">peer</span><span class="si">}</span><span class="s2"> has </span><span class="si">{</span><span class="n">m</span><span class="o">.</span><span class="n">matched_hash_count</span><span class="p">()</span><span class="si">}</span><span class="s2"> blocks: </span><span class="si">{</span><span class="n">per_tier</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+    <span class="c1"># → "node node-a @ &lt;no PeerService&gt; has 3 blocks: {'DRAM': 3}"</span>
 </pre></div>
 </div>
 <p><strong>Revoking blocks when one tier is evicted:</strong></p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># GPU was evicted but the host (DRAM) mirror is still alive — drop only</span>
 <span class="c1"># the HBM bucket; node-a stays in the index with its DRAM bucket intact.</span>
-<span class="n">evicted</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;sha256-abc&quot;</span><span class="p">,</span> <span class="s2">&quot;sha256-def&quot;</span><span class="p">]</span>
-<span class="n">node_a</span><span class="o">.</span><span class="n">revoke_external_kv_blocks</span><span class="p">(</span><span class="s2">&quot;node-a&quot;</span><span class="p">,</span> <span class="n">evicted</span><span class="p">,</span> <span class="n">UMBPTierType</span><span class="o">.</span><span class="n">HBM</span><span class="p">)</span>
+<span class="n">evicted</span> <span class="o">=</span> <span class="p">[</span><span class="s2">"sha256-abc"</span><span class="p">,</span> <span class="s2">"sha256-def"</span><span class="p">]</span>
+<span class="n">node_a</span><span class="o">.</span><span class="n">revoke_external_kv_blocks</span><span class="p">(</span><span class="s2">"node-a"</span><span class="p">,</span> <span class="n">evicted</span><span class="p">,</span> <span class="n">UMBPTierType</span><span class="o">.</span><span class="n">HBM</span><span class="p">)</span>
 </pre></div>
 </div>
 <p><strong>Bulk revoke when an entire tier is wiped:</strong></p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Storage backend was cleared — drop every SSD bucket this node has in</span>
 <span class="c1"># one RPC.  HBM and DRAM buckets are untouched.</span>
-<span class="n">node_a</span><span class="o">.</span><span class="n">revoke_all_external_kv_blocks_at_tier</span><span class="p">(</span><span class="s2">&quot;node-a&quot;</span><span class="p">,</span> <span class="n">UMBPTierType</span><span class="o">.</span><span class="n">SSD</span><span class="p">)</span>
+<span class="n">node_a</span><span class="o">.</span><span class="n">revoke_all_external_kv_blocks_at_tier</span><span class="p">(</span><span class="s2">"node-a"</span><span class="p">,</span> <span class="n">UMBPTierType</span><span class="o">.</span><span class="n">SSD</span><span class="p">)</span>
 </pre></div>
 </div>
 <p><strong>Same node holding the same blocks on multiple tiers:</strong></p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># write_through created a CPU mirror while the GPU copy is still alive</span>
 <span class="c1"># — report both tiers; the master keeps both buckets.</span>
-<span class="n">hashes</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;sha256-prefix-0&quot;</span><span class="p">,</span> <span class="s2">&quot;sha256-prefix-1&quot;</span><span class="p">]</span>
-<span class="n">node_a</span><span class="o">.</span><span class="n">report_external_kv_blocks</span><span class="p">(</span><span class="s2">&quot;node-a&quot;</span><span class="p">,</span> <span class="n">hashes</span><span class="p">,</span> <span class="n">UMBPTierType</span><span class="o">.</span><span class="n">HBM</span><span class="p">)</span>
-<span class="n">node_a</span><span class="o">.</span><span class="n">report_external_kv_blocks</span><span class="p">(</span><span class="s2">&quot;node-a&quot;</span><span class="p">,</span> <span class="n">hashes</span><span class="p">,</span> <span class="n">UMBPTierType</span><span class="o">.</span><span class="n">DRAM</span><span class="p">)</span>
+<span class="n">hashes</span> <span class="o">=</span> <span class="p">[</span><span class="s2">"sha256-prefix-0"</span><span class="p">,</span> <span class="s2">"sha256-prefix-1"</span><span class="p">]</span>
+<span class="n">node_a</span><span class="o">.</span><span class="n">report_external_kv_blocks</span><span class="p">(</span><span class="s2">"node-a"</span><span class="p">,</span> <span class="n">hashes</span><span class="p">,</span> <span class="n">UMBPTierType</span><span class="o">.</span><span class="n">HBM</span><span class="p">)</span>
+<span class="n">node_a</span><span class="o">.</span><span class="n">report_external_kv_blocks</span><span class="p">(</span><span class="s2">"node-a"</span><span class="p">,</span> <span class="n">hashes</span><span class="p">,</span> <span class="n">UMBPTierType</span><span class="o">.</span><span class="n">DRAM</span><span class="p">)</span>
 
 <span class="n">matches</span> <span class="o">=</span> <span class="n">node_a</span><span class="o">.</span><span class="n">match_external_kv</span><span class="p">(</span><span class="n">hashes</span><span class="p">)</span>
 <span class="n">m</span> <span class="o">=</span> <span class="n">matches</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
@@ -948,21 +948,21 @@ inactivity or if the master restarts.</p></td>
 </div>
 <p><strong>Multiple nodes holding the same blocks (different tiers):</strong></p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">_1GB</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span>
-<span class="n">hashes</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;sha256-shared-0&quot;</span><span class="p">,</span> <span class="s2">&quot;sha256-shared-1&quot;</span><span class="p">]</span>
+<span class="n">hashes</span> <span class="o">=</span> <span class="p">[</span><span class="s2">"sha256-shared-0"</span><span class="p">,</span> <span class="s2">"sha256-shared-1"</span><span class="p">]</span>
 
-<span class="n">node_a</span> <span class="o">=</span> <span class="n">UMBPMasterClient</span><span class="p">(</span><span class="n">master</span><span class="p">,</span> <span class="n">node_id</span><span class="o">=</span><span class="s2">&quot;node-a&quot;</span><span class="p">,</span> <span class="n">node_address</span><span class="o">=</span><span class="s2">&quot;node-a:8080&quot;</span><span class="p">)</span>
+<span class="n">node_a</span> <span class="o">=</span> <span class="n">UMBPMasterClient</span><span class="p">(</span><span class="n">master</span><span class="p">,</span> <span class="n">node_id</span><span class="o">=</span><span class="s2">"node-a"</span><span class="p">,</span> <span class="n">node_address</span><span class="o">=</span><span class="s2">"node-a:8080"</span><span class="p">)</span>
 <span class="n">node_a</span><span class="o">.</span><span class="n">register_self</span><span class="p">({</span><span class="n">UMBPTierType</span><span class="o">.</span><span class="n">DRAM</span><span class="p">:</span> <span class="p">(</span><span class="n">_1GB</span><span class="p">,</span> <span class="n">_1GB</span><span class="p">)})</span>
-<span class="n">node_a</span><span class="o">.</span><span class="n">report_external_kv_blocks</span><span class="p">(</span><span class="s2">&quot;node-a&quot;</span><span class="p">,</span> <span class="n">hashes</span><span class="p">,</span> <span class="n">UMBPTierType</span><span class="o">.</span><span class="n">DRAM</span><span class="p">)</span>
+<span class="n">node_a</span><span class="o">.</span><span class="n">report_external_kv_blocks</span><span class="p">(</span><span class="s2">"node-a"</span><span class="p">,</span> <span class="n">hashes</span><span class="p">,</span> <span class="n">UMBPTierType</span><span class="o">.</span><span class="n">DRAM</span><span class="p">)</span>
 
-<span class="n">node_b</span> <span class="o">=</span> <span class="n">UMBPMasterClient</span><span class="p">(</span><span class="n">master</span><span class="p">,</span> <span class="n">node_id</span><span class="o">=</span><span class="s2">&quot;node-b&quot;</span><span class="p">,</span> <span class="n">node_address</span><span class="o">=</span><span class="s2">&quot;node-b:8080&quot;</span><span class="p">)</span>
+<span class="n">node_b</span> <span class="o">=</span> <span class="n">UMBPMasterClient</span><span class="p">(</span><span class="n">master</span><span class="p">,</span> <span class="n">node_id</span><span class="o">=</span><span class="s2">"node-b"</span><span class="p">,</span> <span class="n">node_address</span><span class="o">=</span><span class="s2">"node-b:8080"</span><span class="p">)</span>
 <span class="n">node_b</span><span class="o">.</span><span class="n">register_self</span><span class="p">({</span><span class="n">UMBPTierType</span><span class="o">.</span><span class="n">HBM</span><span class="p">:</span> <span class="p">(</span><span class="n">_1GB</span><span class="p">,</span> <span class="n">_1GB</span><span class="p">)})</span>
-<span class="n">node_b</span><span class="o">.</span><span class="n">report_external_kv_blocks</span><span class="p">(</span><span class="s2">&quot;node-b&quot;</span><span class="p">,</span> <span class="n">hashes</span><span class="p">,</span> <span class="n">UMBPTierType</span><span class="o">.</span><span class="n">HBM</span><span class="p">)</span>
+<span class="n">node_b</span><span class="o">.</span><span class="n">report_external_kv_blocks</span><span class="p">(</span><span class="s2">"node-b"</span><span class="p">,</span> <span class="n">hashes</span><span class="p">,</span> <span class="n">UMBPTierType</span><span class="o">.</span><span class="n">HBM</span><span class="p">)</span>
 
 <span class="c1"># match_external_kv returns one entry per node; each entry breaks the</span>
 <span class="c1"># matched hashes down by every tier they live on for that node.</span>
 <span class="n">matches</span> <span class="o">=</span> <span class="n">node_a</span><span class="o">.</span><span class="n">match_external_kv</span><span class="p">(</span><span class="n">hashes</span><span class="p">)</span>
 <span class="n">matched_nodes</span> <span class="o">=</span> <span class="p">{</span><span class="n">m</span><span class="o">.</span><span class="n">node_id</span><span class="p">:</span> <span class="nb">list</span><span class="p">(</span><span class="n">m</span><span class="o">.</span><span class="n">hashes_by_tier</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span> <span class="k">for</span> <span class="n">m</span> <span class="ow">in</span> <span class="n">matches</span><span class="p">}</span>
-<span class="c1"># → {&quot;node-a&quot;: [UMBPTierType.DRAM], &quot;node-b&quot;: [UMBPTierType.HBM]}</span>
+<span class="c1"># → {"node-a": [UMBPTierType.DRAM], "node-b": [UMBPTierType.HBM]}</span>
 </pre></div>
 </div>
 <p><strong>Using ``match_external_kv`` for KV-cache-aware scheduling:</strong></p>
@@ -972,14 +972,14 @@ and per-hash source locations from this response.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">collections</span><span class="w"> </span><span class="kn">import</span> <span class="n">defaultdict</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mori.cpp</span><span class="w"> </span><span class="kn">import</span> <span class="n">UMBPMasterClient</span><span class="p">,</span> <span class="n">UMBPTierType</span>
 
-<span class="n">master</span> <span class="o">=</span> <span class="s2">&quot;127.0.0.1:15558&quot;</span>
+<span class="n">master</span> <span class="o">=</span> <span class="s2">"127.0.0.1:15558"</span>
 <span class="n">query_client</span> <span class="o">=</span> <span class="n">UMBPMasterClient</span><span class="p">(</span><span class="n">master</span><span class="p">)</span>
 
 <span class="n">query_hashes</span> <span class="o">=</span> <span class="p">[</span>
-    <span class="s2">&quot;sha256-prefix-0&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;sha256-prefix-1&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;sha256-prefix-2&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;sha256-prefix-3&quot;</span><span class="p">,</span>
+    <span class="s2">"sha256-prefix-0"</span><span class="p">,</span>
+    <span class="s2">"sha256-prefix-1"</span><span class="p">,</span>
+    <span class="s2">"sha256-prefix-2"</span><span class="p">,</span>
+    <span class="s2">"sha256-prefix-3"</span><span class="p">,</span>
 <span class="p">]</span>
 <span class="n">matches</span> <span class="o">=</span> <span class="n">query_client</span><span class="o">.</span><span class="n">match_external_kv</span><span class="p">(</span><span class="n">query_hashes</span><span class="p">)</span>
 
@@ -991,9 +991,9 @@ and per-hash source locations from this response.</p>
         <span class="k">for</span> <span class="n">h</span> <span class="ow">in</span> <span class="n">hashes</span><span class="p">:</span>
             <span class="n">locations_by_hash</span><span class="p">[</span><span class="n">h</span><span class="p">]</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
                 <span class="p">{</span>
-                    <span class="s2">&quot;node_id&quot;</span><span class="p">:</span> <span class="n">m</span><span class="o">.</span><span class="n">node_id</span><span class="p">,</span>
-                    <span class="s2">&quot;peer_address&quot;</span><span class="p">:</span> <span class="n">m</span><span class="o">.</span><span class="n">peer_address</span><span class="p">,</span>
-                    <span class="s2">&quot;tier&quot;</span><span class="p">:</span> <span class="n">tier</span><span class="p">,</span>
+                    <span class="s2">"node_id"</span><span class="p">:</span> <span class="n">m</span><span class="o">.</span><span class="n">node_id</span><span class="p">,</span>
+                    <span class="s2">"peer_address"</span><span class="p">:</span> <span class="n">m</span><span class="o">.</span><span class="n">peer_address</span><span class="p">,</span>
+                    <span class="s2">"tier"</span><span class="p">:</span> <span class="n">tier</span><span class="p">,</span>
                 <span class="p">}</span>
             <span class="p">)</span>
 
@@ -1008,19 +1008,19 @@ and per-hash source locations from this response.</p>
 
     <span class="n">summaries</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
         <span class="p">{</span>
-            <span class="s2">&quot;node_id&quot;</span><span class="p">:</span> <span class="n">m</span><span class="o">.</span><span class="n">node_id</span><span class="p">,</span>
-            <span class="s2">&quot;matched_blocks&quot;</span><span class="p">:</span> <span class="nb">len</span><span class="p">(</span><span class="n">best_tier_by_hash</span><span class="p">),</span>  <span class="c1"># distinct hashes</span>
-            <span class="s2">&quot;per_tier_blocks&quot;</span><span class="p">:</span> <span class="p">{</span>
+            <span class="s2">"node_id"</span><span class="p">:</span> <span class="n">m</span><span class="o">.</span><span class="n">node_id</span><span class="p">,</span>
+            <span class="s2">"matched_blocks"</span><span class="p">:</span> <span class="nb">len</span><span class="p">(</span><span class="n">best_tier_by_hash</span><span class="p">),</span>  <span class="c1"># distinct hashes</span>
+            <span class="s2">"per_tier_blocks"</span><span class="p">:</span> <span class="p">{</span>
                 <span class="n">tier</span><span class="o">.</span><span class="n">name</span><span class="p">:</span> <span class="nb">len</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="n">hashes</span><span class="p">))</span>
                 <span class="k">for</span> <span class="n">tier</span><span class="p">,</span> <span class="n">hashes</span> <span class="ow">in</span> <span class="n">m</span><span class="o">.</span><span class="n">hashes_by_tier</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
             <span class="p">},</span>
             <span class="c1"># Fastest tier for each matched hash on this node.</span>
-            <span class="s2">&quot;best_tier_by_hash&quot;</span><span class="p">:</span> <span class="n">best_tier_by_hash</span><span class="p">,</span>
+            <span class="s2">"best_tier_by_hash"</span><span class="p">:</span> <span class="n">best_tier_by_hash</span><span class="p">,</span>
         <span class="p">}</span>
     <span class="p">)</span>
 
 <span class="n">not_found</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">query_hashes</span><span class="p">)</span> <span class="o">-</span> <span class="nb">set</span><span class="p">(</span><span class="n">locations_by_hash</span><span class="p">)</span>
-<span class="n">best_node</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">summaries</span><span class="p">,</span> <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">s</span><span class="p">:</span> <span class="n">s</span><span class="p">[</span><span class="s2">&quot;matched_blocks&quot;</span><span class="p">],</span> <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+<span class="n">best_node</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">summaries</span><span class="p">,</span> <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">s</span><span class="p">:</span> <span class="n">s</span><span class="p">[</span><span class="s2">"matched_blocks"</span><span class="p">],</span> <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
 
 <span class="c1"># Example policy sketch:</span>
 <span class="c1"># - HBM hits are best routed to the same worker/rank.</span>
@@ -1035,7 +1035,7 @@ and per-hash source locations from this response.</p>
 <span class="k">def</span><span class="w"> </span><span class="nf">estimated_fetch_cost</span><span class="p">(</span><span class="n">summary</span><span class="p">):</span>
     <span class="k">return</span> <span class="nb">sum</span><span class="p">(</span>
         <span class="n">tier_cost</span><span class="p">[</span><span class="n">tier</span><span class="p">]</span>
-        <span class="k">for</span> <span class="n">tier</span> <span class="ow">in</span> <span class="n">summary</span><span class="p">[</span><span class="s2">&quot;best_tier_by_hash&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">values</span><span class="p">()</span>
+        <span class="k">for</span> <span class="n">tier</span> <span class="ow">in</span> <span class="n">summary</span><span class="p">[</span><span class="s2">"best_tier_by_hash"</span><span class="p">]</span><span class="o">.</span><span class="n">values</span><span class="p">()</span>
     <span class="p">)</span>
 
 <span class="n">cost_aware_node</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">summaries</span><span class="p">,</span> <span class="n">key</span><span class="o">=</span><span class="n">estimated_fetch_cost</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
@@ -1051,7 +1051,7 @@ with <code class="docutils literal notranslate"><span class="pre">count_as_hit=T
 gets one increment on the master:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mori.cpp</span><span class="w"> </span><span class="kn">import</span> <span class="n">UMBPMasterClient</span>
 
-<span class="n">router</span> <span class="o">=</span> <span class="n">UMBPMasterClient</span><span class="p">(</span><span class="s2">&quot;127.0.0.1:15558&quot;</span><span class="p">)</span>
+<span class="n">router</span> <span class="o">=</span> <span class="n">UMBPMasterClient</span><span class="p">(</span><span class="s2">"127.0.0.1:15558"</span><span class="p">)</span>
 
 <span class="k">def</span><span class="w"> </span><span class="nf">route_request</span><span class="p">(</span><span class="n">prefix_hashes</span><span class="p">):</span>
     <span class="c1"># count_as_hit=True is the ONLY thing that feeds the hit index.</span>
@@ -1073,7 +1073,7 @@ universe in your caller; the master has no scan / top-N RPC.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mori.cpp</span><span class="w"> </span><span class="kn">import</span> <span class="n">UMBPMasterClient</span>
 
-<span class="n">monitor</span> <span class="o">=</span> <span class="n">UMBPMasterClient</span><span class="p">(</span><span class="s2">&quot;127.0.0.1:15558&quot;</span><span class="p">)</span>
+<span class="n">monitor</span> <span class="o">=</span> <span class="n">UMBPMasterClient</span><span class="p">(</span><span class="s2">"127.0.0.1:15558"</span><span class="p">)</span>
 
 <span class="c1"># The set of hashes you want to observe — typically the union of</span>
 <span class="c1"># hashes your workers have reported, or the prefix hashes your</span>
@@ -1093,9 +1093,9 @@ universe in your caller; the master has no scan / top-N RPC.</p>
 <span class="k">while</span> <span class="kc">True</span><span class="p">:</span>
     <span class="n">counts</span> <span class="o">=</span> <span class="n">fetch_counts</span><span class="p">(</span><span class="n">monitor</span><span class="p">,</span> <span class="n">tracked_hashes</span><span class="p">)</span>
     <span class="c1"># Hashes with no recorded routing hit are absent — that is NOT the</span>
-    <span class="c1"># same as hit_count_total == 0.  Treat absent as &quot;no counted</span>
-    <span class="c1"># routing lookup yet&quot; / &quot;GC&#39;d after UMBP_HIT_INDEX_TTL_SEC of</span>
-    <span class="c1"># inactivity&quot;.</span>
+    <span class="c1"># same as hit_count_total == 0.  Treat absent as "no counted</span>
+    <span class="c1"># routing lookup yet" / "GC'd after UMBP_HIT_INDEX_TTL_SEC of</span>
+    <span class="c1"># inactivity".</span>
     <span class="n">hottest</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">counts</span><span class="o">.</span><span class="n">items</span><span class="p">(),</span> <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">kv</span><span class="p">:</span> <span class="n">kv</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="n">reverse</span><span class="o">=</span><span class="kc">True</span><span class="p">)[:</span><span class="mi">32</span><span class="p">]</span>
 
     <span class="c1"># What you do with `hottest` is entirely up to you — UMBP does not</span>
@@ -1182,9 +1182,9 @@ lose tier information or double-count hits.</p>
             <span class="n">client</span><span class="o">.</span><span class="n">unregister_self</span><span class="p">()</span>
 
 <span class="n">_1GB</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span>
-<span class="k">with</span> <span class="n">registered_client</span><span class="p">(</span><span class="s2">&quot;127.0.0.1:15558&quot;</span><span class="p">,</span> <span class="s2">&quot;worker-0&quot;</span><span class="p">,</span> <span class="p">{</span><span class="n">UMBPTierType</span><span class="o">.</span><span class="n">DRAM</span><span class="p">:</span> <span class="p">(</span><span class="n">_1GB</span><span class="p">,</span> <span class="n">_1GB</span><span class="p">)})</span> <span class="k">as</span> <span class="n">c</span><span class="p">:</span>
-    <span class="n">c</span><span class="o">.</span><span class="n">report_external_kv_blocks</span><span class="p">(</span><span class="s2">&quot;worker-0&quot;</span><span class="p">,</span> <span class="p">[</span><span class="s2">&quot;sha256-abc&quot;</span><span class="p">],</span> <span class="n">UMBPTierType</span><span class="o">.</span><span class="n">DRAM</span><span class="p">)</span>
-    <span class="n">matches</span> <span class="o">=</span> <span class="n">c</span><span class="o">.</span><span class="n">match_external_kv</span><span class="p">([</span><span class="s2">&quot;sha256-abc&quot;</span><span class="p">])</span>
+<span class="k">with</span> <span class="n">registered_client</span><span class="p">(</span><span class="s2">"127.0.0.1:15558"</span><span class="p">,</span> <span class="s2">"worker-0"</span><span class="p">,</span> <span class="p">{</span><span class="n">UMBPTierType</span><span class="o">.</span><span class="n">DRAM</span><span class="p">:</span> <span class="p">(</span><span class="n">_1GB</span><span class="p">,</span> <span class="n">_1GB</span><span class="p">)})</span> <span class="k">as</span> <span class="n">c</span><span class="p">:</span>
+    <span class="n">c</span><span class="o">.</span><span class="n">report_external_kv_blocks</span><span class="p">(</span><span class="s2">"worker-0"</span><span class="p">,</span> <span class="p">[</span><span class="s2">"sha256-abc"</span><span class="p">],</span> <span class="n">UMBPTierType</span><span class="o">.</span><span class="n">DRAM</span><span class="p">)</span>
+    <span class="n">matches</span> <span class="o">=</span> <span class="n">c</span><span class="o">.</span><span class="n">match_external_kv</span><span class="p">([</span><span class="s2">"sha256-abc"</span><span class="p">])</span>
 </pre></div>
 </div>
 </section>

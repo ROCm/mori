@@ -381,7 +381,7 @@
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">mori</span>
 
 <span class="c1"># Initialize from PyTorch process group</span>
-<span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_torch_process_group_init</span><span class="p">(</span><span class="s2">&quot;default&quot;</span><span class="p">)</span>
+<span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_torch_process_group_init</span><span class="p">(</span><span class="s2">"default"</span><span class="p">)</span>
 
 <span class="c1"># Query</span>
 <span class="n">my_rank</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_mype</span><span class="p">()</span>
@@ -457,17 +457,17 @@
 <span class="c1"># Standard PyTorch distributed init</span>
 <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">set_device</span><span class="p">(</span><span class="n">rank</span><span class="p">)</span>
 <span class="n">dist</span><span class="o">.</span><span class="n">init_process_group</span><span class="p">(</span>
-    <span class="n">backend</span><span class="o">=</span><span class="s2">&quot;cpu:gloo,cuda:nccl&quot;</span><span class="p">,</span>
+    <span class="n">backend</span><span class="o">=</span><span class="s2">"cpu:gloo,cuda:nccl"</span><span class="p">,</span>
     <span class="n">rank</span><span class="o">=</span><span class="n">rank</span><span class="p">,</span> <span class="n">world_size</span><span class="o">=</span><span class="n">world_size</span><span class="p">,</span>
-    <span class="n">device_id</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">&quot;cuda&quot;</span><span class="p">,</span> <span class="n">rank</span><span class="p">),</span>
+    <span class="n">device_id</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">rank</span><span class="p">),</span>
 <span class="p">)</span>
 
 <span class="c1"># Register the process group with a name</span>
 <span class="n">world_group</span> <span class="o">=</span> <span class="n">dist</span><span class="o">.</span><span class="n">group</span><span class="o">.</span><span class="n">WORLD</span>
-<span class="n">torch</span><span class="o">.</span><span class="n">_C</span><span class="o">.</span><span class="n">_distributed_c10d</span><span class="o">.</span><span class="n">_register_process_group</span><span class="p">(</span><span class="s2">&quot;default&quot;</span><span class="p">,</span> <span class="n">world_group</span><span class="p">)</span>
+<span class="n">torch</span><span class="o">.</span><span class="n">_C</span><span class="o">.</span><span class="n">_distributed_c10d</span><span class="o">.</span><span class="n">_register_process_group</span><span class="p">(</span><span class="s2">"default"</span><span class="p">,</span> <span class="n">world_group</span><span class="p">)</span>
 
 <span class="c1"># Initialize shmem from the registered process group</span>
-<span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_torch_process_group_init</span><span class="p">(</span><span class="s2">&quot;default&quot;</span><span class="p">)</span>
+<span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_torch_process_group_init</span><span class="p">(</span><span class="s2">"default"</span><span class="p">)</span>
 </pre></div>
 </div>
 <blockquote>
@@ -496,15 +496,15 @@
 <p>Example using file-based broadcast (for single-node testing):</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">os</span><span class="o">,</span><span class="w"> </span><span class="nn">time</span>
 
-<span class="n">uid_file</span> <span class="o">=</span> <span class="s2">&quot;/tmp/mori_unique_id&quot;</span>
+<span class="n">uid_file</span> <span class="o">=</span> <span class="s2">"/tmp/mori_unique_id"</span>
 <span class="k">if</span> <span class="n">rank</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
     <span class="n">unique_id</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_get_unique_id</span><span class="p">()</span>
-    <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">uid_file</span><span class="p">,</span> <span class="s1">&#39;wb&#39;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+    <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">uid_file</span><span class="p">,</span> <span class="s1">'wb'</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
         <span class="n">f</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">unique_id</span><span class="p">)</span>
 <span class="k">else</span><span class="p">:</span>
     <span class="k">while</span> <span class="ow">not</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="n">uid_file</span><span class="p">):</span>
         <span class="n">time</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="mf">0.1</span><span class="p">)</span>
-    <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">uid_file</span><span class="p">,</span> <span class="s1">&#39;rb&#39;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+    <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">uid_file</span><span class="p">,</span> <span class="s1">'rb'</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
         <span class="n">unique_id</span> <span class="o">=</span> <span class="n">f</span><span class="o">.</span><span class="n">read</span><span class="p">()</span>
 
 <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_init_attr</span><span class="p">(</span>
@@ -603,7 +603,7 @@
 <h3>Registering Existing Buffers<a class="headerlink" href="#registering-existing-buffers" title="Link to this heading"></a></h3>
 <p>Register a PyTorch tensor or other existing GPU memory for RDMA operations without allocating new symmetric memory:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Register</span>
-<span class="n">tensor</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">1024</span><span class="p">,</span> <span class="mi">7168</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">&quot;cuda&quot;</span><span class="p">)</span>
+<span class="n">tensor</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">1024</span><span class="p">,</span> <span class="mi">7168</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
 <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_buffer_register</span><span class="p">(</span><span class="n">tensor</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">(),</span> <span class="n">tensor</span><span class="o">.</span><span class="n">nbytes</span><span class="p">)</span>
 
 <span class="c1"># ... use tensor in MORI operations ...</span>

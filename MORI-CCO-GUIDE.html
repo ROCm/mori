@@ -532,7 +532,7 @@ with the same size.</p></li>
 <ul>
 <li><p><strong>LSA (intra-node):</strong> get a peer’s directly-addressable pointer and
 load/store it in the kernel.</p>
-<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;mori/cco/cco.hpp&quot;</span>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="cp">#include</span><span class="w"> </span><span class="cpf">"mori/cco/cco.hpp"</span>
 <span class="c1">// win: ccoWindow_t obtained on the host</span>
 <span class="kt">void</span><span class="o">*</span><span class="w"> </span><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ccoGetLsaPeerPtr</span><span class="p">(</span><span class="n">win</span><span class="p">,</span><span class="w"> </span><span class="n">peerLsaRank</span><span class="p">,</span><span class="w"> </span><span class="n">offset</span><span class="p">);</span>
 <span class="c1">// *peer is a normal load/store target</span>
@@ -541,7 +541,7 @@ load/store it in the kernel.</p>
 </li>
 <li><p><strong>GDA (cross-node):</strong> GPU-initiated RDMA put/get with signalling, via the
 scale-out header. Provider dispatch is compile-time (per NIC).</p>
-<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;mori/cco/cco_scale_out.hpp&quot;</span><span class="c1">   // pulls in cco.hpp + RDMA core</span>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="cp">#include</span><span class="w"> </span><span class="cpf">"mori/cco/cco_scale_out.hpp"</span><span class="w">   </span><span class="c1">// pulls in cco.hpp + RDMA core</span>
 </pre></div>
 </div>
 </li>
@@ -601,7 +601,7 @@ granularity (<code class="docutils literal notranslate"><span class="pre">ccoCoo
 <h2>8. C++ API<a class="headerlink" href="#c-api" title="Link to this heading"></a></h2>
 <p>The host control plane and device layer are a self-contained header pair;
 include <code class="docutils literal notranslate"><span class="pre">cco.hpp</span></code> for host + LSA, or <code class="docutils literal notranslate"><span class="pre">cco_scale_out.hpp</span></code> for GDA.</p>
-<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;mori/cco/cco.hpp&quot;</span>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="cp">#include</span><span class="w"> </span><span class="cpf">"mori/cco/cco.hpp"</span>
 
 <span class="n">ccoUniqueId</span><span class="w"> </span><span class="n">id</span><span class="p">;</span>
 <span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">rank</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="n">ccoGetUniqueId</span><span class="p">(</span><span class="o">&amp;</span><span class="n">id</span><span class="p">);</span>

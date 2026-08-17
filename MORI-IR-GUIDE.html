@@ -471,10 +471,10 @@ device function can be called, the application must:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mori.ir</span><span class="w"> </span><span class="kn">import</span> <span class="n">MORI_DEVICE_FUNCTIONS</span>
 
 <span class="c1"># Inspect a device function</span>
-<span class="n">func</span> <span class="o">=</span> <span class="n">MORI_DEVICE_FUNCTIONS</span><span class="p">[</span><span class="s2">&quot;putmem_nbi_thread&quot;</span><span class="p">]</span>
-<span class="nb">print</span><span class="p">(</span><span class="n">func</span><span class="p">[</span><span class="s2">&quot;symbol&quot;</span><span class="p">])</span>  <span class="c1"># &quot;mori_shmem_putmem_nbi_thread&quot;</span>
-<span class="nb">print</span><span class="p">(</span><span class="n">func</span><span class="p">[</span><span class="s2">&quot;args&quot;</span><span class="p">])</span>    <span class="c1"># [&quot;uint64&quot;, &quot;uint64&quot;, &quot;uint64&quot;, &quot;int32&quot;, &quot;int32&quot;]</span>
-<span class="nb">print</span><span class="p">(</span><span class="n">func</span><span class="p">[</span><span class="s2">&quot;ret&quot;</span><span class="p">])</span>     <span class="c1"># &quot;int32&quot;</span>
+<span class="n">func</span> <span class="o">=</span> <span class="n">MORI_DEVICE_FUNCTIONS</span><span class="p">[</span><span class="s2">"putmem_nbi_thread"</span><span class="p">]</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">func</span><span class="p">[</span><span class="s2">"symbol"</span><span class="p">])</span>  <span class="c1"># "mori_shmem_putmem_nbi_thread"</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">func</span><span class="p">[</span><span class="s2">"args"</span><span class="p">])</span>    <span class="c1"># ["uint64", "uint64", "uint64", "int32", "int32"]</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">func</span><span class="p">[</span><span class="s2">"ret"</span><span class="p">])</span>     <span class="c1"># "int32"</span>
 
 <span class="c1"># Your framework can iterate MORI_DEVICE_FUNCTIONS to auto-generate</span>
 <span class="c1"># wrappers for all 50+ device functions</span>
@@ -510,20 +510,20 @@ device function can be called, the application must:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mori.ir</span><span class="w"> </span><span class="kn">import</span> <span class="n">find_bitcode</span>
 
 <span class="n">bc_path</span> <span class="o">=</span> <span class="n">find_bitcode</span><span class="p">()</span>
-<span class="c1"># bc_path is e.g. &quot;~/.mori/jit/&lt;arch&gt;/&lt;hash&gt;/libmori_shmem_device.bc&quot;</span>
+<span class="c1"># bc_path is e.g. "~/.mori/jit/&lt;arch&gt;/&lt;hash&gt;/libmori_shmem_device.bc"</span>
 </pre></div>
 </div>
 <p>Then link it into your GPU kernel using your framework’s mechanism:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Example: raw LLVM toolchain</span>
-llvm-link<span class="w"> </span>my_kernel.bc<span class="w"> </span><span class="k">$(</span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;from mori.ir import find_bitcode; print(find_bitcode())&quot;</span><span class="k">)</span><span class="w"> </span>-o<span class="w"> </span>linked.bc
+llvm-link<span class="w"> </span>my_kernel.bc<span class="w"> </span><span class="k">$(</span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"from mori.ir import find_bitcode; print(find_bitcode())"</span><span class="k">)</span><span class="w"> </span>-o<span class="w"> </span>linked.bc
 clang<span class="w"> </span>-target<span class="w"> </span>amdgcn-amd-amdhsa<span class="w"> </span>-mcpu<span class="o">=</span>gfx942<span class="w"> </span>linked.bc<span class="w"> </span>-o<span class="w"> </span>kernel.hsaco
 </pre></div>
 </div>
 <p>Your device code can then call any function from the bitcode directly:</p>
 <div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="c1">// In your HIP/device code</span>
-<span class="k">extern</span><span class="w"> </span><span class="s">&quot;C&quot;</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">mori_shmem_my_pe</span><span class="p">();</span>
-<span class="k">extern</span><span class="w"> </span><span class="s">&quot;C&quot;</span><span class="w"> </span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">mori_shmem_ptr_p2p</span><span class="p">(</span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">dest_ptr</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">my_pe</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">dest_pe</span><span class="p">);</span>
-<span class="k">extern</span><span class="w"> </span><span class="s">&quot;C&quot;</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">mori_shmem_putmem_nbi_thread</span><span class="p">(</span><span class="kt">void</span><span class="o">*</span><span class="w"> </span><span class="n">dest</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">void</span><span class="o">*</span><span class="w"> </span><span class="n">src</span><span class="p">,</span><span class="w"> </span><span class="kt">size_t</span><span class="w"> </span><span class="n">n</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">pe</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">qp</span><span class="p">);</span>
+<span class="k">extern</span><span class="w"> </span><span class="s">"C"</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">mori_shmem_my_pe</span><span class="p">();</span>
+<span class="k">extern</span><span class="w"> </span><span class="s">"C"</span><span class="w"> </span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">mori_shmem_ptr_p2p</span><span class="p">(</span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">dest_ptr</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">my_pe</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">dest_pe</span><span class="p">);</span>
+<span class="k">extern</span><span class="w"> </span><span class="s">"C"</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">mori_shmem_putmem_nbi_thread</span><span class="p">(</span><span class="kt">void</span><span class="o">*</span><span class="w"> </span><span class="n">dest</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">void</span><span class="o">*</span><span class="w"> </span><span class="n">src</span><span class="p">,</span><span class="w"> </span><span class="kt">size_t</span><span class="w"> </span><span class="n">n</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">pe</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">qp</span><span class="p">);</span>
 </pre></div>
 </div>
 </section>
@@ -727,7 +727,7 @@ clang<span class="w"> </span>-target<span class="w"> </span>amdgcn-amd-amdhsa<sp
 <span class="kn">from</span><span class="w"> </span><span class="nn">mori.ir.triton</span><span class="w"> </span><span class="kn">import</span> <span class="n">get_extern_libs</span><span class="p">,</span> <span class="n">install_hook</span>
 
 <span class="c1"># Host: initialize shmem</span>
-<span class="n">ms</span><span class="o">.</span><span class="n">shmem_torch_process_group_init</span><span class="p">(</span><span class="s2">&quot;default&quot;</span><span class="p">)</span>
+<span class="n">ms</span><span class="o">.</span><span class="n">shmem_torch_process_group_init</span><span class="p">(</span><span class="s2">"default"</span><span class="p">)</span>
 <span class="n">buf</span> <span class="o">=</span> <span class="n">ms</span><span class="o">.</span><span class="n">mori_shmem_create_tensor</span><span class="p">((</span><span class="n">N</span><span class="p">,),</span> <span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
 <span class="n">install_hook</span><span class="p">()</span>
 
@@ -754,11 +754,11 @@ clang<span class="w"> </span>-target<span class="w"> </span>amdgcn-amd-amdhsa<sp
 
 <span class="c1"># Generate your own wrappers from ABI metadata</span>
 <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">meta</span> <span class="ow">in</span> <span class="n">MORI_DEVICE_FUNCTIONS</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
-    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">meta</span><span class="p">[</span><span class="s1">&#39;ret&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">meta</span><span class="p">[</span><span class="s1">&#39;symbol&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2">(</span><span class="si">{</span><span class="s1">&#39;, &#39;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">meta</span><span class="p">[</span><span class="s1">&#39;args&#39;</span><span class="p">])</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">meta</span><span class="p">[</span><span class="s1">'ret'</span><span class="p">]</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">meta</span><span class="p">[</span><span class="s1">'symbol'</span><span class="p">]</span><span class="si">}</span><span class="s2">(</span><span class="si">{</span><span class="s1">', '</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">meta</span><span class="p">[</span><span class="s1">'args'</span><span class="p">])</span><span class="si">}</span><span class="s2">)"</span><span class="p">)</span>
 </pre></div>
 </div>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Link bitcode into your kernel</span>
-llvm-link<span class="w"> </span>my_kernel.bc<span class="w"> </span><span class="k">$(</span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;from mori.ir import find_bitcode; print(find_bitcode())&quot;</span><span class="k">)</span><span class="w"> </span>-o<span class="w"> </span>linked.bc
+llvm-link<span class="w"> </span>my_kernel.bc<span class="w"> </span><span class="k">$(</span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"from mori.ir import find_bitcode; print(find_bitcode())"</span><span class="k">)</span><span class="w"> </span>-o<span class="w"> </span>linked.bc
 clang<span class="w"> </span>-target<span class="w"> </span>amdgcn-amd-amdhsa<span class="w"> </span>-mcpu<span class="o">=</span>gfx942<span class="w"> </span>linked.bc<span class="w"> </span>-o<span class="w"> </span>kernel.hsaco
 </pre></div>
 </div>
@@ -768,7 +768,7 @@ clang<span class="w"> </span>-target<span class="w"> </span>amdgcn-amd-amdhsa<sp
 <p>The bitcode is <strong>automatically JIT-compiled</strong> on first use — no manual build step required. <code class="docutils literal notranslate"><span class="pre">find_bitcode()</span></code> compiles <code class="docutils literal notranslate"><span class="pre">shmem_device_api_wrapper.cpp</span></code> with <code class="docutils literal notranslate"><span class="pre">hipcc</span> <span class="pre">--cuda-device-only</span></code> and caches the result to <code class="docutils literal notranslate"><span class="pre">~/.mori/jit/</span></code>.</p>
 <p>The NIC type (BNXT / AINIC / MLX5) and GPU architecture are auto-detected at runtime.</p>
 <p>To precompile ahead of time:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">MORI_PRECOMPILE</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;import mori&quot;</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">MORI_PRECOMPILE</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"import mori"</span>
 </pre></div>
 </div>
 </section>

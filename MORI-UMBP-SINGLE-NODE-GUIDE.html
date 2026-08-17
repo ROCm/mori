@@ -519,7 +519,7 @@ for the full env-var inventory see
 </div>
 </li>
 <li><p><strong>Review script constants</strong>:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sed<span class="w"> </span>-n<span class="w"> </span><span class="s1">&#39;1,120p&#39;</span><span class="w"> </span>run_umbp_single_node_hicache.sh
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sed<span class="w"> </span>-n<span class="w"> </span><span class="s1">'1,120p'</span><span class="w"> </span>run_umbp_single_node_hicache.sh
 </pre></div>
 </div>
 <p>Update <code class="docutils literal notranslate"><span class="pre">USER_HOME</span></code>, <code class="docutils literal notranslate"><span class="pre">NFS_BASE</span></code>, <code class="docutils literal notranslate"><span class="pre">EXTRA_MOUNTS</span></code>, and <code class="docutils literal notranslate"><span class="pre">DOCKER_IMAGE</span></code> if the defaults do not match your environment.</p>
@@ -534,7 +534,7 @@ for the full env-var inventory see
 <span class="nb">export</span><span class="w"> </span><span class="nv">EP_SIZE</span><span class="o">=</span>&lt;ep-size&gt;
 <span class="nb">export</span><span class="w"> </span><span class="nv">TP_SIZE</span><span class="o">=</span>&lt;tp-size&gt;
 <span class="nb">export</span><span class="w"> </span><span class="nv">START_UMBP_MASTER</span><span class="o">=</span><span class="nb">true</span>
-<span class="nb">export</span><span class="w"> </span><span class="nv">UMBP_NODE_ADDRESS</span><span class="o">=</span><span class="k">$(</span>hostname<span class="w"> </span>-I<span class="w"> </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span><span class="s1">&#39;{print $1}&#39;</span><span class="k">)</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">UMBP_NODE_ADDRESS</span><span class="o">=</span><span class="k">$(</span>hostname<span class="w"> </span>-I<span class="w"> </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span><span class="s1">'{print $1}'</span><span class="k">)</span>
 <span class="nb">export</span><span class="w"> </span><span class="nv">USE_DUMMY_WEIGHTS</span><span class="o">=</span><span class="nb">false</span>
 </pre></div>
 </div>

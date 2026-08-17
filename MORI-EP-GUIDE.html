@@ -394,7 +394,7 @@
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">mori</span>
 
 <span class="c1"># 1. Initialize shmem (required before any EP operations)</span>
-<span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_torch_process_group_init</span><span class="p">(</span><span class="s2">&quot;default&quot;</span><span class="p">)</span>
+<span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_torch_process_group_init</span><span class="p">(</span><span class="s2">"default"</span><span class="p">)</span>
 
 <span class="c1"># 2. Configure</span>
 <span class="n">config</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">EpDispatchCombineConfig</span><span class="p">(</span>
@@ -877,16 +877,16 @@
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch.distributed</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">dist</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">mori</span>
 
-<span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s2">&quot;MORI_SHMEM_HEAP_SIZE&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;6G&quot;</span>
+<span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s2">"MORI_SHMEM_HEAP_SIZE"</span><span class="p">]</span> <span class="o">=</span> <span class="s2">"6G"</span>
 
 <span class="c1"># Initialize PyTorch distributed</span>
 <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">set_device</span><span class="p">(</span><span class="n">rank</span><span class="p">)</span>
-<span class="n">dist</span><span class="o">.</span><span class="n">init_process_group</span><span class="p">(</span><span class="n">backend</span><span class="o">=</span><span class="s2">&quot;cpu:gloo,cuda:nccl&quot;</span><span class="p">,</span> <span class="n">rank</span><span class="o">=</span><span class="n">rank</span><span class="p">,</span> <span class="n">world_size</span><span class="o">=</span><span class="n">world_size</span><span class="p">)</span>
+<span class="n">dist</span><span class="o">.</span><span class="n">init_process_group</span><span class="p">(</span><span class="n">backend</span><span class="o">=</span><span class="s2">"cpu:gloo,cuda:nccl"</span><span class="p">,</span> <span class="n">rank</span><span class="o">=</span><span class="n">rank</span><span class="p">,</span> <span class="n">world_size</span><span class="o">=</span><span class="n">world_size</span><span class="p">)</span>
 
 <span class="c1"># Register process group and initialize shmem</span>
 <span class="n">world_group</span> <span class="o">=</span> <span class="n">dist</span><span class="o">.</span><span class="n">group</span><span class="o">.</span><span class="n">WORLD</span>
-<span class="n">torch</span><span class="o">.</span><span class="n">_C</span><span class="o">.</span><span class="n">_distributed_c10d</span><span class="o">.</span><span class="n">_register_process_group</span><span class="p">(</span><span class="s2">&quot;default&quot;</span><span class="p">,</span> <span class="n">world_group</span><span class="p">)</span>
-<span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_torch_process_group_init</span><span class="p">(</span><span class="s2">&quot;default&quot;</span><span class="p">)</span>
+<span class="n">torch</span><span class="o">.</span><span class="n">_C</span><span class="o">.</span><span class="n">_distributed_c10d</span><span class="o">.</span><span class="n">_register_process_group</span><span class="p">(</span><span class="s2">"default"</span><span class="p">,</span> <span class="n">world_group</span><span class="p">)</span>
+<span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_torch_process_group_init</span><span class="p">(</span><span class="s2">"default"</span><span class="p">)</span>
 
 <span class="c1"># ... use MORI-EP ...</span>
 
@@ -968,20 +968,20 @@
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch.distributed</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">dist</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">mori</span>
 
-<span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s2">&quot;MORI_SHMEM_HEAP_SIZE&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;4G&quot;</span>
+<span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s2">"MORI_SHMEM_HEAP_SIZE"</span><span class="p">]</span> <span class="o">=</span> <span class="s2">"4G"</span>
 
 <span class="k">def</span><span class="w"> </span><span class="nf">run_ep</span><span class="p">(</span><span class="n">rank</span><span class="p">,</span> <span class="n">world_size</span><span class="p">):</span>
     <span class="c1"># Setup</span>
     <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">set_device</span><span class="p">(</span><span class="n">rank</span><span class="p">)</span>
-    <span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">&quot;cuda&quot;</span><span class="p">,</span> <span class="n">rank</span><span class="p">)</span>
+    <span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">rank</span><span class="p">)</span>
     <span class="n">dist</span><span class="o">.</span><span class="n">init_process_group</span><span class="p">(</span>
-        <span class="n">backend</span><span class="o">=</span><span class="s2">&quot;cpu:gloo,cuda:nccl&quot;</span><span class="p">,</span>
+        <span class="n">backend</span><span class="o">=</span><span class="s2">"cpu:gloo,cuda:nccl"</span><span class="p">,</span>
         <span class="n">rank</span><span class="o">=</span><span class="n">rank</span><span class="p">,</span> <span class="n">world_size</span><span class="o">=</span><span class="n">world_size</span><span class="p">,</span>
         <span class="n">device_id</span><span class="o">=</span><span class="n">device</span><span class="p">,</span>
     <span class="p">)</span>
     <span class="n">world_group</span> <span class="o">=</span> <span class="n">dist</span><span class="o">.</span><span class="n">group</span><span class="o">.</span><span class="n">WORLD</span>
-    <span class="n">torch</span><span class="o">.</span><span class="n">_C</span><span class="o">.</span><span class="n">_distributed_c10d</span><span class="o">.</span><span class="n">_register_process_group</span><span class="p">(</span><span class="s2">&quot;default&quot;</span><span class="p">,</span> <span class="n">world_group</span><span class="p">)</span>
-    <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_torch_process_group_init</span><span class="p">(</span><span class="s2">&quot;default&quot;</span><span class="p">)</span>
+    <span class="n">torch</span><span class="o">.</span><span class="n">_C</span><span class="o">.</span><span class="n">_distributed_c10d</span><span class="o">.</span><span class="n">_register_process_group</span><span class="p">(</span><span class="s2">"default"</span><span class="p">,</span> <span class="n">world_group</span><span class="p">)</span>
+    <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_torch_process_group_init</span><span class="p">(</span><span class="s2">"default"</span><span class="p">)</span>
 
     <span class="c1"># Configuration</span>
     <span class="n">config</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">EpDispatchCombineConfig</span><span class="p">(</span>
@@ -1022,7 +1022,7 @@
     <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
 
     <span class="n">total_recv</span> <span class="o">=</span> <span class="n">recv_count</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
-    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Rank </span><span class="si">{</span><span class="n">rank</span><span class="si">}</span><span class="s2">: sent </span><span class="si">{</span><span class="n">num_tokens</span><span class="si">}</span><span class="s2"> tokens, received </span><span class="si">{</span><span class="n">total_recv</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Rank </span><span class="si">{</span><span class="n">rank</span><span class="si">}</span><span class="s2">: sent </span><span class="si">{</span><span class="n">num_tokens</span><span class="si">}</span><span class="s2"> tokens, received </span><span class="si">{</span><span class="n">total_recv</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
 
     <span class="c1"># Simulate expert computation (identity for testing)</span>
     <span class="n">expert_output</span> <span class="o">=</span> <span class="n">dispatch_out</span><span class="p">[:</span><span class="n">total_recv</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
@@ -1040,9 +1040,9 @@
     <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_finalize</span><span class="p">()</span>
     <span class="n">dist</span><span class="o">.</span><span class="n">destroy_process_group</span><span class="p">()</span>
 
-<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;__main__&quot;</span><span class="p">:</span>
-    <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s2">&quot;MASTER_ADDR&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;localhost&quot;</span>
-    <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s2">&quot;MASTER_PORT&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;12355&quot;</span>
+<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">"__main__"</span><span class="p">:</span>
+    <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s2">"MASTER_ADDR"</span><span class="p">]</span> <span class="o">=</span> <span class="s2">"localhost"</span>
+    <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s2">"MASTER_PORT"</span><span class="p">]</span> <span class="o">=</span> <span class="s2">"12355"</span>
     <span class="n">world_size</span> <span class="o">=</span> <span class="mi">8</span>
     <span class="n">torch</span><span class="o">.</span><span class="n">multiprocessing</span><span class="o">.</span><span class="n">spawn</span><span class="p">(</span><span class="n">run_ep</span><span class="p">,</span> <span class="n">args</span><span class="o">=</span><span class="p">(</span><span class="n">world_size</span><span class="p">,),</span> <span class="n">nprocs</span><span class="o">=</span><span class="n">world_size</span><span class="p">,</span> <span class="n">join</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 </pre></div>
@@ -1107,7 +1107,7 @@ python3<span class="w"> </span>tests/python/ops/bench_dispatch_combine.py
 <span class="nb">export</span><span class="w"> </span><span class="nv">MORI_RDMA_DEVICES</span><span class="o">=</span>^mlx5_0,mlx5_1<span class="w">  </span><span class="c1"># Optional: exclude specific NICs</span>
 
 torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--node_rank<span class="o">=</span><span class="m">0</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">&quot;10.194.129.65&quot;</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">"10.194.129.65"</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>examples/ops/dispatch_combine/test_dispatch_combine_internode.py<span class="w"> </span>--bench
 </pre></div>
 </div>
@@ -1178,24 +1178,24 @@ torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">
 <p>For example: <code class="docutils literal notranslate"><span class="pre">gfx942_mi308x_InterNodeV1_ep16_dispatch.json</span></code></p>
 <p>Each file contains rules sorted by (dtype, hidden_dim, num_tokens):</p>
 <div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
-<span class="w">  </span><span class="nt">&quot;version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;1.0&quot;</span><span class="p">,</span>
-<span class="w">  </span><span class="nt">&quot;gpu_arch&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;gfx942&quot;</span><span class="p">,</span>
-<span class="w">  </span><span class="nt">&quot;gpu_model&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;mi308x&quot;</span><span class="p">,</span>
-<span class="w">  </span><span class="nt">&quot;kernel_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;InterNodeV1&quot;</span><span class="p">,</span>
-<span class="w">  </span><span class="nt">&quot;ep_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">16</span><span class="p">,</span>
-<span class="w">  </span><span class="nt">&quot;phase&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;dispatch&quot;</span><span class="p">,</span>
-<span class="w">  </span><span class="nt">&quot;rules&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">  </span><span class="nt">"version"</span><span class="p">:</span><span class="w"> </span><span class="s2">"1.0"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"gpu_arch"</span><span class="p">:</span><span class="w"> </span><span class="s2">"gfx942"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"gpu_model"</span><span class="p">:</span><span class="w"> </span><span class="s2">"mi308x"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"kernel_type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"InterNodeV1"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"ep_size"</span><span class="p">:</span><span class="w"> </span><span class="mi">16</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"phase"</span><span class="p">:</span><span class="w"> </span><span class="s2">"dispatch"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"rules"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
 <span class="w">    </span><span class="p">{</span>
-<span class="w">      </span><span class="nt">&quot;dtype&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;fp4&quot;</span><span class="p">,</span>
-<span class="w">      </span><span class="nt">&quot;num_tokens&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">128</span><span class="p">,</span>
-<span class="w">      </span><span class="nt">&quot;hidden_dim&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">3584</span><span class="p">,</span>
-<span class="w">      </span><span class="nt">&quot;block_num&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">64</span><span class="p">,</span>
-<span class="w">      </span><span class="nt">&quot;rdma_block_num&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">32</span><span class="p">,</span>
-<span class="w">      </span><span class="nt">&quot;warp_per_block&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span>
-<span class="w">      </span><span class="nt">&quot;bandwidth_gbps&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">4.13</span><span class="p">,</span>
-<span class="w">      </span><span class="nt">&quot;rdma_bandwidth_gbps&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">4.13</span><span class="p">,</span>
-<span class="w">      </span><span class="nt">&quot;xgmi_bandwidth_gbps&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">13.2</span><span class="p">,</span>
-<span class="w">      </span><span class="nt">&quot;ll_bandwidth_gbps&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">16.5</span>
+<span class="w">      </span><span class="nt">"dtype"</span><span class="p">:</span><span class="w"> </span><span class="s2">"fp4"</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"num_tokens"</span><span class="p">:</span><span class="w"> </span><span class="mi">128</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"hidden_dim"</span><span class="p">:</span><span class="w"> </span><span class="mi">3584</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"block_num"</span><span class="p">:</span><span class="w"> </span><span class="mi">64</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"rdma_block_num"</span><span class="p">:</span><span class="w"> </span><span class="mi">32</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"warp_per_block"</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"bandwidth_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">4.13</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"rdma_bandwidth_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">4.13</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"xgmi_bandwidth_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">13.2</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"ll_bandwidth_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">16.5</span>
 <span class="w">    </span><span class="p">}</span>
 <span class="w">  </span><span class="p">]</span>
 <span class="p">}</span>
@@ -1253,7 +1253,7 @@ torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">
 bash<span class="w"> </span>tools/batch_intranode_tuning.sh<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--world-size<span class="w"> </span><span class="m">8</span><span class="w"> </span>--dtype<span class="w"> </span>fp4<span class="w"> </span>--combine-dtype<span class="w"> </span>bf16<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--quant-type<span class="w"> </span>fp8_direct_cast<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--tokens-list<span class="w"> </span><span class="s2">&quot;128,4096&quot;</span><span class="w"> </span>--tuning-scope<span class="w"> </span>full
+<span class="w">    </span>--tokens-list<span class="w"> </span><span class="s2">"128,4096"</span><span class="w"> </span>--tuning-scope<span class="w"> </span>full
 </pre></div>
 </div>
 <p>Compare the best config from full mode with a quick run on the same tokens. If they match (same block_num/warp), quick mode is safe for the full sweep.</p>
@@ -1349,7 +1349,7 @@ bash<span class="w"> </span>tools/run_all_intranode_tuning.sh<span class="w"> </
 <span class="w">    </span>--master-addr<span class="w"> </span>&lt;HOST0&gt;<span class="w"> </span>--peer-host<span class="w"> </span>&lt;USER&gt;@&lt;HOST1&gt;<span class="w"> </span>--ifname<span class="w"> </span>&lt;IFNAME&gt;<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--kernel-type<span class="w"> </span>v1<span class="w"> </span>--num-qp<span class="w"> </span><span class="m">2</span><span class="w"> </span>--dtype<span class="w"> </span>fp4<span class="w"> </span>--combine-dtype<span class="w"> </span>bf16<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--quant-type<span class="w"> </span>fp8_direct_cast<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--tokens-list<span class="w"> </span><span class="s2">&quot;128,4096&quot;</span><span class="w"> </span>--tuning-scope<span class="w"> </span>full
+<span class="w">    </span>--tokens-list<span class="w"> </span><span class="s2">"128,4096"</span><span class="w"> </span>--tuning-scope<span class="w"> </span>full
 </pre></div>
 </div>
 <p><strong>Step 2: Quick sweep</strong></p>
@@ -1421,9 +1421,9 @@ bash<span class="w"> </span>tools/run_all_internode_tuning.sh<span class="w"> </
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mori.kernel_profiler</span><span class="w"> </span><span class="kn">import</span> <span class="n">export_to_perfetto</span>
 
 <span class="c1"># Run dispatch/combine, then:</span>
-<span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">mori</span><span class="o">.</span><span class="n">cpp</span><span class="p">,</span> <span class="s2">&quot;get_debug_time_buf&quot;</span><span class="p">):</span>
+<span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">mori</span><span class="o">.</span><span class="n">cpp</span><span class="p">,</span> <span class="s2">"get_debug_time_buf"</span><span class="p">):</span>
     <span class="n">trace_buffer</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">cpp</span><span class="o">.</span><span class="n">get_debug_time_buf</span><span class="p">(</span><span class="n">op</span><span class="o">.</span><span class="n">_handle</span><span class="p">)</span>
-    <span class="n">export_to_perfetto</span><span class="p">(</span><span class="n">trace_buffer</span><span class="p">,</span> <span class="s2">&quot;ep_trace.json&quot;</span><span class="p">)</span>
+    <span class="n">export_to_perfetto</span><span class="p">(</span><span class="n">trace_buffer</span><span class="p">,</span> <span class="s2">"ep_trace.json"</span><span class="p">)</span>
 </pre></div>
 </div>
 <p>Visualize at <a class="reference external" href="https://ui.perfetto.dev/">ui.perfetto.dev</a>. See <a class="reference internal" href="PROFILER.html"><span class="std std-doc">PROFILER.md</span></a> for full profiler documentation.</p>

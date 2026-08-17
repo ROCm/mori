@@ -374,9 +374,9 @@
 <span class="kn">from</span><span class="w"> </span><span class="nn">mori.kernel_profiler</span><span class="w"> </span><span class="kn">import</span> <span class="n">export_to_perfetto</span>
 
 <span class="c1"># Run dispatch/combine operations first, then:</span>
-<span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">mori</span><span class="o">.</span><span class="n">cpp</span><span class="p">,</span> <span class="s2">&quot;get_debug_time_buf&quot;</span><span class="p">):</span>
+<span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">mori</span><span class="o">.</span><span class="n">cpp</span><span class="p">,</span> <span class="s2">"get_debug_time_buf"</span><span class="p">):</span>
     <span class="n">trace_buffer</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">cpp</span><span class="o">.</span><span class="n">get_debug_time_buf</span><span class="p">(</span><span class="n">op</span><span class="o">.</span><span class="n">_handle</span><span class="p">)</span>
-    <span class="n">export_to_perfetto</span><span class="p">(</span><span class="n">trace_buffer</span><span class="p">,</span> <span class="s2">&quot;ep_trace.json&quot;</span><span class="p">)</span>
+    <span class="n">export_to_perfetto</span><span class="p">(</span><span class="n">trace_buffer</span><span class="p">,</span> <span class="s2">"ep_trace.json"</span><span class="p">)</span>
 </pre></div>
 </div>
 <p><strong>Visualize:</strong> Open the JSON file at <a class="reference external" href="https://ui.perfetto.dev/">ui.perfetto.dev</a>.</p>
@@ -385,7 +385,7 @@
 <h2>export_to_perfetto<a class="headerlink" href="#export-to-perfetto" title="Link to this heading"></a></h2>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">export_to_perfetto</span><span class="p">(</span>
     <span class="n">trace_buffer</span><span class="p">,</span>
-    <span class="n">filename</span><span class="o">=</span><span class="s2">&quot;trace.json&quot;</span><span class="p">,</span>
+    <span class="n">filename</span><span class="o">=</span><span class="s2">"trace.json"</span><span class="p">,</span>
     <span class="n">slot_map</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
     <span class="n">gpu_freq_ghz</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
     <span class="n">validate_pairs</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
