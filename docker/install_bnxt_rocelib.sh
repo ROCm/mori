@@ -1,14 +1,6 @@
 #!/bin/bash
 # Install Broadcom's RoCE userspace provider (libbnxt_re) for Thor/Thor2 NICs.
-#
-# The inbox bnxt_re provider that ships with rdma-core only speaks kernel ABI 1
-# (still true as of rdma-core 50 on noble). Hosts running the 237.x bnxt_re
-# driver expose ABI 8, so without this package libibverbs rejects every device
-# and the container sees no RDMA hardware at all.
-#
-# Usage: install_bnxt_rocelib.sh <bnxt-rocelib version>   e.g. 235.2.86.0
-# Pick the version matching the host's bnxt_re driver; list the available ones
-# with `apt-cache madison bnxt-rocelib`.
+
 set -euo pipefail
 
 VERSION="${1:?usage: install_bnxt_rocelib.sh <bnxt-rocelib version>}"
