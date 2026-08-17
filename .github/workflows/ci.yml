@@ -42,9 +42,9 @@ jobs:
         include:
           - platform: MI355X_AINIC
             runner: [self-hosted, MI355X-AINIC-TW]
-          # Runner 325_bnxt_108 is decommissioned.
-          # - platform: MI325X_BNXT
-          #   runner: [self-hosted, 325_bnxt_108]
+          - platform: MI300X_BNXT
+            runner: [self-hosted, 300_bnxt_tw010]
+            bnxt_rocelib: 235.2.86.0
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -53,7 +53,7 @@ jobs:
           submodules: true
 
       - name: Build CI image
-        run: $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev .
+        run: $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE --build-arg BNXT_ROCELIB_VERSION=${{ matrix.bnxt_rocelib }} -t $IMAGE -f docker/Dockerfile.dev .
 
       - name: Start container
         run: |
@@ -94,13 +94,13 @@ jobs:
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
-          # Runner 325_bnxt_108 is decommissioned.
-          # - platform: MI325X_BNXT
-          #   runner: [self-hosted, 325_bnxt_108]
-          #   rdma_devices: bnxt_re0,bnxt_re1,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8
-          #   rdma_sl: 3
-          #   rdma_tc: 104
-          #   socket_ifname: enp49s0f1np1
+          - platform: MI300X_BNXT
+            runner: [self-hosted, 300_bnxt_tw010]
+            rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+            rdma_sl: 3
+            rdma_tc: 104
+            socket_ifname: ens41np0
+            bnxt_rocelib: 235.2.86.0
     env:
       MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
@@ -115,7 +115,7 @@ jobs:
           submodules: true
 
       - name: Build CI image
-        run: $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev .
+        run: $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE --build-arg BNXT_ROCELIB_VERSION=${{ matrix.bnxt_rocelib }} -t $IMAGE -f docker/Dockerfile.dev .
 
       - name: Start container
         run: |
@@ -334,11 +334,11 @@ jobs:
             runner: [self-hosted, MI355X-AINIC-TW]
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             gpu_arch: gfx950
-          # Runner 325_bnxt_108 is decommissioned.
-          # - platform: MI325X_BNXT
-          #   runner: [self-hosted, 325_bnxt_108]
-          #   rdma_devices: bnxt_re0,bnxt_re1,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8
-          #   gpu_arch: gfx942
+          - platform: MI300X_BNXT
+            runner: [self-hosted, 300_bnxt_tw010]
+            rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+            gpu_arch: gfx942
+            bnxt_rocelib: 235.2.86.0
     timeout-minutes: 90
     steps:
       - name: Checkout
@@ -349,6 +349,7 @@ jobs:
       - name: Build JAX CI image
         run: |
           BUILD_ARGS="--network=host --build-arg GPU_TARGET=${{ matrix.gpu_arch }}"
+          BUILD_ARGS="$BUILD_ARGS --build-arg BNXT_ROCELIB_VERSION=${{ matrix.bnxt_rocelib }}"
           if [ "$CT" = "podman" ]; then
             BUILD_ARGS="$BUILD_ARGS --isolation=chroot"
           fi
@@ -464,18 +465,18 @@ jobs:
             rdma_sl: 3
             rdma_tc: 104
             ct: podman
-          # Runner 325_bnxt_108 is decommissioned.
-          # - platform: MI325X_BNXT
-          #   runner: [self-hosted, 325_bnxt_108]
-          #   node1_host: 10.162.224.131
-          #   node2_host: 10.162.224.162
-          #   node2_port: 22
-          #   node1_ifname: enp49s0f1np1
-          #   node2_ifname: enp49s0f1np1
-          #   rdma_devices: bnxt_re0,bnxt_re1,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8
-          #   rdma_sl: 3
-          #   rdma_tc: 104
-          #   ct: docker
+          - platform: MI300X_BNXT
+            runner: [self-hosted, 300_bnxt_tw010]
+            node1_host: 172.16.10.10
+            node2_host: 172.16.10.22
+            node2_port: 22
+            node1_ifname: ens41np0
+            node2_ifname: ens41np0
+            rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+            rdma_sl: 3
+            rdma_tc: 104
+            ct: docker
+            bnxt_rocelib: 235.2.86.0
     env:
       CT: ${{ matrix.ct }}
       SSH_OPTS: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
@@ -488,6 +489,7 @@ jobs:
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
+      BNXT_ROCELIB: ${{ matrix.bnxt_rocelib }}
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -500,7 +502,7 @@ jobs:
         run: podman system migrate || true
 
       - name: Build CI image
-        run: $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev .
+        run: $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE --build-arg BNXT_ROCELIB_VERSION=$BNXT_ROCELIB -t $IMAGE -f docker/Dockerfile.dev .
 
       - name: Start container on node1
         run: |
@@ -530,7 +532,7 @@ jobs:
             $(whoami)@$NODE2_HOST:$GITHUB_WORKSPACE/
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "
             cd $GITHUB_WORKSPACE &&
-            $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev . &&
+            $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE --build-arg BNXT_ROCELIB_VERSION=$BNXT_ROCELIB -t $IMAGE -f docker/Dockerfile.dev . &&
             CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
               -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
               -e MORI_RDMA_SL=$MORI_RDMA_SL \
