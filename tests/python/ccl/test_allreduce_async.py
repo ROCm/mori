@@ -128,11 +128,7 @@ def _test_allreduce_async(
 
         expected_value = sum((pe + 1) * 1000 for pe in range(npes))
 
-        if copy_output:
-            verify_tensor = output_tensor.cpu()
-        else:
-            transit_buf = allreduce.get_output_transit_buffer(device=input_tensor)
-            verify_tensor = transit_buf.cpu()[:elems]
+        verify_tensor = output_tensor.cpu()
 
         if dtype in (torch.float16, torch.bfloat16):
             verify_cpu = verify_tensor.float().numpy()
@@ -142,7 +138,7 @@ def _test_allreduce_async(
             match = np.all(verify_cpu == expected_value)
 
         success = True
-        src = "output_tensor" if copy_output else "transit_buffer"
+        src = "caller_output"
         if match:
             print(
                 f"PE {rank}: PASSED ({src}, {dtype_name}), all {elems} elements = {expected_value}"
