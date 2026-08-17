@@ -47,6 +47,7 @@
 namespace mori::umbp {
 
 class PeerServiceServer;
+class HbmCopyEngine;
 
 // Short name for log output. Generic FAILED maps to "FAILED" — the
 // detailed reason for that case lives in the peer's allocator log.
@@ -120,6 +121,46 @@ class PoolClient {
 
   std::vector<bool> BatchGet(const std::vector<std::string>& keys, const std::vector<void*>& dsts,
                              const std::vector<size_t>& sizes);
+
+  // Ranged multi-buffer I/O.  One stored object is backed by scattered tier
+  // pages while the caller supplies several disjoint object-relative ranges,
+  // each with its own buffer.  This is what a KV connector wants: read layer k
+  // of every block without materializing the blocks.
+  //
+  // Both directions map a range onto pages the same way the whole-object path
+  // does, because a TransferItem already carries src_offset/dst_offset/size —
+  // it *is* a range.  Whole-object I/O is the degenerate case with the range
+  // pinned to [0, size); nothing in the backend, the engine or the wire format
+  // changes to support this.
+  //
+  // Get: ranges must be disjoint and inside the stored object.  Keys held by
+  // this node are served straight out of its medium; the rest are fetched whole
+  // into the registered scratch arena, installed locally, and served from
+  // there.
+  //
+  // Put: ranges must *tile* the object — disjoint and covering [0, object_size)
+  // exactly — since a partial write would commit a slot with undefined gaps.
+  // A key routed to this node is written range-by-range directly into its
+  // pages, with no assembly step; a key routed elsewhere is assembled in the
+  // scratch arena and sent as one object.
+  // One caller range against one stored object.  `user` is the caller's buffer
+  // for this range (the whole of it — the range's own base), `object_offset`
+  // where the range starts inside the stored object.
+  struct ObjectRange {
+    void* user = nullptr;
+    size_t size = 0;
+    size_t object_offset = 0;
+  };
+
+  std::vector<bool> BatchGetRanges(const std::vector<std::string>& keys,
+                                   const std::vector<std::vector<void*>>& dsts,
+                                   const std::vector<std::vector<size_t>>& sizes,
+                                   const std::vector<std::vector<size_t>>& src_offsets);
+  std::vector<bool> BatchPutRanges(const std::vector<std::string>& keys,
+                                   const std::vector<size_t>& object_sizes,
+                                   const std::vector<std::vector<const void*>>& srcs,
+                                   const std::vector<std::vector<size_t>>& sizes,
+                                   const std::vector<std::vector<size_t>>& dst_offsets);
 
   // Cluster-wide existence check — issues a RouteGet and reports
   // whether master surfaced any replica.  No RDMA, no lease bump.
@@ -212,6 +253,9 @@ class PoolClient {
   // transport configured, in which case only local transfers are servicable.
   std::unique_ptr<TransferEngine> transfer_engine_;
   PeerDirectory* peer_directory_ = nullptr;
+  // Observer into transfer_engine_'s composite, used only to declare which
+  // host regions the gather kernel may dereference.  Not a second data path.
+  HbmCopyEngine* hbm_engine_ = nullptr;
 
   // Lazy peer connections (one per remote node).  Purely control plane since
   // Phase 6: the peer's engine desc and buffer descriptors moved into
@@ -272,6 +316,54 @@ class PoolClient {
   bool BuildLocalPageTransfers(MediumBackend* backend, const std::vector<PageLocation>& pages,
                                uint64_t page_size, void* user, size_t size, bool to_backend,
                                std::vector<TransferItem>* items);
+
+  // ---- ranged I/O internals ----
+
+  // The ranged counterpart of BuildLocalPageTransfers, and the only place the
+  // object-range -> page-range mapping lives.  Emits one TransferItem per
+  // (range x page) intersection; the engines coalesce adjacent ones back into
+  // single copies while planning, so a range spanning N contiguous pages costs
+  // one copy, not N.  Every item carries `tag` = the caller's key index, so a
+  // partial failure comes back per key rather than failing the batch.
+  //
+  // Appends to `items`; returns false if the medium publishes no endpoint for a
+  // referenced buffer, or a range falls outside the stored object.
+  bool BuildLocalRangeTransfers(MediumBackend* backend, const std::vector<PageLocation>& pages,
+                                uint64_t page_size, uint64_t stored_size,
+                                const std::vector<ObjectRange>& ranges, bool to_backend, size_t tag,
+                                std::vector<TransferItem>* items);
+
+  // Copy between one contiguous host object and a set of caller ranges, through
+  // the transfer engine so a device-resident caller buffer is handled by
+  // HbmCopyEngine rather than memcpy'd.  Used for the scratch arena, which is
+  // not a medium and so has no PageLocations to map.
+  bool CopyContiguousToRanges(const void* src, size_t object_size,
+                              const std::vector<ObjectRange>& ranges);
+  bool CopyRangesToContiguous(const std::vector<ObjectRange>& ranges, void* dst,
+                              size_t object_size);
+
+  // One locally-routed ranged put.  `result_index` is the caller's key index,
+  // which is what gets written back into the results vector.
+  struct LocalRangeWriteRequest {
+    size_t result_index = 0;
+    const std::string* key = nullptr;
+    size_t object_size = 0;
+    std::vector<ObjectRange> ranges;
+    TierType tier = TierType::UNKNOWN;
+  };
+
+  // Allocate a slot per request, write the ranges straight into its pages, and
+  // commit.  No assembly buffer: the ranges are written where they belong.
+  //
+  // Batched across keys deliberately.  Every request's items go into ONE
+  // transfer, so a batch of GPU-sourced puts becomes a single gather kernel
+  // instead of one per key — the difference the kernel exists to make.  Slots
+  // are held allocated across the transfer and committed or aborted per key
+  // afterwards, keyed off the engine's failed tags.
+  //
+  // Ranges must already have been validated as tiling their object.
+  void ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteRequest>& requests,
+                                  std::vector<bool>* results);
   // After a successful remote DRAM fetch, if cache_remote_fetches is enabled and
   // the admission gate admits the block, enqueue it for asynchronous install into
   // this node's local DRAM tier (see ReCacheWorkerLoop). The install (DRAM
@@ -295,6 +387,11 @@ class PoolClient {
   };
   std::deque<ReCacheJob> recache_queue_;
   std::mutex recache_mutex_;
+
+  // Serializes users of the caller-owned ranged scratch arena.  Only the remote
+  // half of a ranged operation takes it — keys served by this node's own medium
+  // never touch the arena and stay fully concurrent.
+  std::mutex ranged_scratch_mutex_;
   std::condition_variable recache_cv_;
   std::thread recache_worker_;
   bool recache_stop_ = false;
@@ -357,9 +454,13 @@ class PoolClient {
   // INSIDE that submit..wait gap (so they overlap the DRAM wire), then waits
   // all peers.  Staging (non-zero-copy) runs per peer serially (submit ->
   // wait).  Reads the plan; writes per-key outcomes into *results.
+  // `recache_remote=false` suppresses the asynchronous re-cache of remotely
+  // fetched blocks.  BatchGetRanges passes false because it installs the object
+  // synchronously itself; leaving it on would queue a second, redundant install
+  // of bytes that are already in the local medium.
   void ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector<std::string>& keys,
                            const std::vector<void*>& dsts, const std::vector<size_t>& sizes,
-                           std::vector<bool>* results);
+                           std::vector<bool>* results, bool recache_remote = true);
 
   struct RemotePutEntry {
     size_t result_index;
@@ -395,7 +496,8 @@ class PoolClient {
                                std::vector<bool>* results);
   bool BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries, const std::string& node_id,
                                std::vector<TransferItem>* items);
-  void FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries, std::vector<bool>* results);
+  void FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries, std::vector<bool>* results,
+                                bool recache_remote);
 
   // One posted-but-not-yet-waited remote read for a single peer; the scheduler
   // waits it later.  The lifetime contract that used to live here — statuses
@@ -424,7 +526,8 @@ class PoolClient {
                                                           std::vector<bool>* results);
   // Wait half: wait the handle (never breaks early), map per-plan failure back
   // to per-key (per-item AND), then FinalizeRemoteGetEntries.
-  void WaitRemoteBatchGet(RemoteGetInFlight& inflight, std::vector<bool>* results);
+  void WaitRemoteBatchGet(RemoteGetInFlight& inflight, std::vector<bool>* results,
+                          bool recache_remote);
 
   // Put's counterpart.  Also carries the slot lifecycle: `entries` /
   // `abort_slots` feed FinalizeRemotePutEntries and `stub` issues its
