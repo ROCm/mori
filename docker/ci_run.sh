@@ -186,12 +186,18 @@ else
     EXTRA_ARGS+=(--ulimit nproc=100000:100000 --pids-limit=-1 --init)
 fi
 
+# RCCL treats a missing HSA_NO_SCRATCH_RECLAIM as a fatal error on some
+# runtime/firmware combinations (seen on MI300X with ROCm 7.2.x, GPU firmware
+# 166): ncclCommInitRank aborts, rank 0 dies and every other rank then fails
+# fetching the ncclUniqueId. tools/bench_ep_*.sh already export it; do the same
+# for every CI container so the test jobs get the same environment.
 exec "$RUNTIME" run \
     --group-add video \
     --network=host \
     --device=/dev/kfd \
     --device=/dev/dri \
     --device=/dev/infiniband \
+    -e HSA_NO_SCRATCH_RECLAIM=1 \
     -d --ipc=host --privileged \
     "${EXTRA_ARGS[@]}" \
     "${NIC_MOUNTS[@]}" \
