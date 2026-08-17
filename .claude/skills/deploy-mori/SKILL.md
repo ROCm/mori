@@ -505,11 +505,14 @@ same intent):
 
 Steps 5/6 are skipped without a peer IP — run from both nodes to test cross-node connectivity.
 
-**GPU memory.** Steps 5/6 run the host-memory mesh first (reachability across
-all NIC pairs), then a second pass over the **rail-aligned pairs only**
-(`local[i]` ↔ `remote[i]`) on **GPU memory** via `--use_rocm`, with each NIC
-paired to its PCIe-closest GPU. That is the path MORI actually transfers over,
-so a rail failing here while the host mesh passed points at GPUDirect rather
+**GPU memory.** Only **Step 5 (inter-node bandwidth)** runs a GPU-memory pass;
+Step 6 (latency) is host-memory only. Step 5 first runs the host-memory mesh
+(reachability across all NIC pairs), then a GPU-memory pass over the pairs host
+memory already proved reachable via `--use_rocm` (each NIC paired to its
+PCIe-closest GPU), and finally a **serial pass over the rail-aligned pairs**
+(`local[i]` ↔ `remote[i]`) for the per-rail numbers that carry the bandwidth
+threshold. That rail-aligned diagonal is the path MORI actually transfers over,
+so a rail failing there while the host mesh passed points at GPUDirect rather
 than the fabric. Step 4 stays on host memory deliberately: it is a fabric
 reachability probe, and MORI moves data intra-node over XGMI, not RDMA.
 
