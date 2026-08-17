@@ -63,6 +63,7 @@
 #include <hip/hip_runtime.h>
 #include <signal.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -890,6 +891,27 @@ void WritePerfRecords(const Args& a, const std::vector<SweepResult>& rows) {
     payload << line.str();
   }
 
+  // Create the parent directory if it does not exist, matching Python's
+  // record_perf (os.makedirs(parent, exist_ok=True)). On a clean nightly
+  // workspace MORI_PERF_OUT points at $WORKSPACE/_perf/perf.jsonl and no earlier
+  // step creates _perf, so without this fopen fails and every IO row is silently
+  // dropped from the uploaded perf data. mkdir each path component in turn.
+  const auto slash = out.find_last_of('/');
+  if (slash != std::string::npos && slash > 0) {
+    const std::string dir = out.substr(0, slash);
+    std::string partial;
+    for (size_t i = 0; i < dir.size(); ++i) {
+      partial += dir[i];
+      if (dir[i] == '/' || i + 1 == dir.size()) {
+        if (partial != "/" && ::mkdir(partial.c_str(), 0755) != 0 && errno != EEXIST) {
+          std::fprintf(stderr, "[perf_report] failed to create %s: %s\n", partial.c_str(),
+                       std::strerror(errno));
+          break;
+        }
+      }
+    }
+  }
+
   std::FILE* fh = std::fopen(out.c_str(), "a");
   if (fh == nullptr) {
     std::fprintf(stderr, "[perf_report] failed to open %s: %s\n", out.c_str(),
@@ -1285,7 +1307,11 @@ int RunXgmiSingleProcess(const Args& a) {
 
   std::cout << "XGMI single-process: GPU" << src << " -> GPU" << dst << std::endl;
   std::cout << "MsgSize(B)  Batch  Iters  AvgBW(GB/s)  AvgLat(us)  TotalDur(us)" << std::endl;
-  RunSweep(a, engine, srcBuf.Desc(), dstBuf.Desc(), plan, "");
+  const auto results = RunSweep(a, engine, srcBuf.Desc(), dstBuf.Desc(), plan, "");
+  // Emit perf records here too: this path returns before the distributed writer,
+  // and the equivalent Python XGMI mode records perf. No-op unless MORI_PERF_OUT
+  // is set.
+  WritePerfRecords(a, results);
 
   // Both buffers are local, so the checksums compare directly -- no exchange.
   const auto& last = plan.back();
