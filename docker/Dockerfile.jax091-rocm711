@@ -63,6 +63,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libpci-dev && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# Broadcom RoCE userspace, required on Thor/Thor2 hosts whose bnxt_re driver is
+# newer than the inbox provider's ABI. Leave empty on every other NIC vendor.
+ARG BNXT_ROCELIB_VERSION=""
+COPY docker/install_bnxt_rocelib.sh /tmp/install_bnxt_rocelib.sh
+RUN if [ -n "$BNXT_ROCELIB_VERSION" ]; then \
+        /tmp/install_bnxt_rocelib.sh "$BNXT_ROCELIB_VERSION"; \
+    fi && \
+    rm -f /tmp/install_bnxt_rocelib.sh
+
 # Sanity check (CPU-only at build time, GPU visible at runtime)
 RUN python${PYTHON_VERSION} -c \
         "import jax; print('JAX', jax.__version__); print('Devices:', jax.devices())" \

@@ -11,6 +11,7 @@ set -euo pipefail
 # Environment:
 #   MORI_NIC_TYPE        — Override auto-detection (mlx5 | bnxt | ionic)
 #   CONTAINER_RUNTIME    — Override runtime (docker | podman); auto-detected
+#   MORI_NIC_LIB_MOUNT   — auto (default) | always | never; see below
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -72,6 +73,7 @@ find_host_ibverbs() {
 
 nic_mount_flags() {
     local nic_type="$1"
+    local want_provider="$2"
     local flags=()
 
     case "$nic_type" in
@@ -80,6 +82,10 @@ nic_mount_flags() {
             host_ibverbs=$(find_host_ibverbs)
             if [[ -n "$host_ibverbs" ]]; then
                 flags+=(-v "$host_ibverbs:/lib/x86_64-linux-gnu/libibverbs.so.1")
+            fi
+            if (( ! want_provider )); then
+                echo "${flags[@]}"
+                return
             fi
             local bnxt_dir=""
             for dir in /usr/local/lib/x86_64-linux-gnu /usr/local/lib /usr/lib/x86_64-linux-gnu; do
@@ -110,6 +116,10 @@ nic_mount_flags() {
             host_ibverbs=$(find_host_ibverbs)
             if [[ -n "$host_ibverbs" ]]; then
                 flags+=(-v "$host_ibverbs:/lib/x86_64-linux-gnu/libibverbs.so.1")
+            fi
+            if (( ! want_provider )); then
+                echo "${flags[@]}"
+                return
             fi
             local ionic_dirs=(/usr/local/lib /usr/lib/x86_64-linux-gnu)
             for dir in "${ionic_dirs[@]}"; do
@@ -143,6 +153,57 @@ nic_mount_flags() {
     echo "${flags[@]}"
 }
 
+# ── Which half of the RDMA userspace comes from the host? ────────────────────
+#
+# libibverbs always comes from the host. Broadcom ships a single prebuilt
+# libbnxt_re for every Ubuntu codename, built against rdma-core 39; pairing it
+# with the 24.04 base image's rdma-core 50 shifts the provider op table, so
+# ibv_create_qp returns a bogus pointer and the first session creation
+# segfaults. The hosts run 22.04, so their libibverbs matches what Broadcom
+# built against.
+#
+# The provider itself only comes from the host when the image has none. An
+# image built with BNXT_ROCELIB_VERSION already carries one, and overwriting it
+# makes the same image behave differently per node: tw010 has libbnxt_re
+# 236.1.165.0 and works, tw022 has 232.0.155.5 which only speaks kernel ABI 6
+# against a driver exposing 8, so every device vanishes and the internode job
+# has no RDMA on node2. Probe the bare image and leave a working provider alone.
+
+first_positional_arg() {
+    local value_flags=(
+        --name -v --volume -e --env --env-file -w --workdir -p --publish
+        --network --net --device --entrypoint -u --user --ulimit --shm-size
+        --label -l --hostname -h --cpus --memory -m --mount --add-host
+        --group-add --security-opt --restart --log-driver --log-opt --pid
+        --ipc --tmpfs --cap-add --cap-drop --init-path --runtime --gpus
+        --pids-limit --stop-signal --stop-timeout --health-cmd
+    )
+    while (( $# )); do
+        case "$1" in
+            -*=*) shift ;;
+            -*)
+                local takes_value=0 flag
+                for flag in "${value_flags[@]}"; do
+                    if [[ "$1" == "$flag" ]]; then takes_value=1; break; fi
+                done
+                if (( takes_value )); then shift 2 || shift; else shift; fi
+                ;;
+            *) echo "$1"; return ;;
+        esac
+    done
+}
+
+image_enumerates_rdma_devices() {
+    local image="$1"
+    local host_ibverbs="$2"
+    [[ -n "$image" && -d /dev/infiniband ]] || return 1
+    local mount=()
+    [[ -n "$host_ibverbs" ]] && mount=(-v "$host_ibverbs:/lib/x86_64-linux-gnu/libibverbs.so.1")
+    timeout 120 "$RUNTIME" run --rm --privileged --network=host \
+        --device=/dev/infiniband "${mount[@]}" "$image" ibv_devinfo -l 2>/dev/null \
+        | grep -qE '^[1-9][0-9]* HCAs found'
+}
+
 # ── Container runtime detection ───────────────────────────────────────────────
 
 detect_runtime() {
@@ -167,7 +228,20 @@ RUNTIME=$(detect_runtime)
 NIC_TYPE=$(detect_nic_type)
 echo "[ci_run] Runtime: $RUNTIME | NIC type: $NIC_TYPE"
 
-read -ra NIC_MOUNTS <<< "$(nic_mount_flags "$NIC_TYPE")"
+NIC_MOUNTS=()
+MOUNT_MODE="${MORI_NIC_LIB_MOUNT:-auto}"
+if [[ "$NIC_TYPE" != "mlx5" && "$MOUNT_MODE" != "never" ]]; then
+    IMAGE_ARG=$(first_positional_arg "$@")
+    WANT_PROVIDER=1
+    if [[ "$MOUNT_MODE" != "always" ]] &&
+       image_enumerates_rdma_devices "$IMAGE_ARG" "$(find_host_ibverbs)"; then
+        WANT_PROVIDER=0
+        echo "[ci_run] $IMAGE_ARG ships a working $NIC_TYPE provider; mounting host libibverbs only"
+    else
+        echo "[ci_run] Mounting host $NIC_TYPE userspace into the container"
+    fi
+    read -ra NIC_MOUNTS <<< "$(nic_mount_flags "$NIC_TYPE" "$WANT_PROVIDER")"
+fi
 
 # --init (tini/catatonit as PID 1) reaps exited child processes so zombies don't
 # keep KFD contexts / VRAM alive, and forwards SIGTERM from `stop` to the group.
@@ -186,12 +260,18 @@ else
     EXTRA_ARGS+=(--ulimit nproc=100000:100000 --pids-limit=-1 --init)
 fi
 
+# RCCL treats a missing HSA_NO_SCRATCH_RECLAIM as a fatal error on some
+# runtime/firmware combinations (seen on MI300X with ROCm 7.2.x, GPU firmware
+# 166): ncclCommInitRank aborts, rank 0 dies and every other rank then fails
+# fetching the ncclUniqueId. tools/bench_ep_*.sh already export it; do the same
+# for every CI container so the test jobs get the same environment.
 exec "$RUNTIME" run \
     --group-add video \
     --network=host \
     --device=/dev/kfd \
     --device=/dev/dri \
     --device=/dev/infiniband \
+    -e HSA_NO_SCRATCH_RECLAIM=1 \
     -d --ipc=host --privileged \
     "${EXTRA_ARGS[@]}" \
     "${NIC_MOUNTS[@]}" \
