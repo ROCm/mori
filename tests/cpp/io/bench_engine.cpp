@@ -62,6 +62,7 @@
 
 #include <hip/hip_runtime.h>
 #include <signal.h>
+#include <sys/file.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -72,10 +73,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <exception>
+#include <fstream>
 #include <iostream>
+#include <limits>
 #include <msgpack.hpp>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -784,8 +789,119 @@ struct SweepResult {
   double bw;   // GB/s, GB=10^9
   double lat;  // us per single transfer
   double dur;  // us, whole timed loop
-  MSGPACK_DEFINE(msg, batch, bw, lat, dur);
+  // Python-benchmark-format metrics for the perf report (tests/python/perf_report.py).
+  // Python times each iteration separately and reports bandwidth/latency PER
+  // ITERATION (whole batch), deriving max_bw/min_lat from the FASTEST iteration.
+  // The nixl fields above (bw/lat) are per-single-transfer over one whole-loop
+  // timer, so they are NOT interchangeable -- these mirror what benchmark.py emits.
+  double avg_bw_gbps;  // total_mem_mb/1e3 / avg_iter_duration_s
+  double max_bw_gbps;  // total_mem_mb/1e3 / min_iter_duration_s
+  double avg_lat_us;   // mean per-iteration duration
+  double min_lat_us;   // fastest per-iteration duration
+  double total_mb;     // msg * batch / 1e6
+  MSGPACK_DEFINE(msg, batch, bw, lat, dur, avg_bw_gbps, max_bw_gbps, avg_lat_us, min_lat_us,
+                 total_mb);
 };
+
+// Minimal JSON string escaper for the perf record. Only the characters that can
+// appear in our values (backslash, quote, control chars) need handling.
+std::string JsonEscape(const std::string& s) {
+  std::string out;
+  out.reserve(s.size() + 2);
+  for (char c : s) {
+    switch (c) {
+      case '"':
+        out += "\\\"";
+        break;
+      case '\\':
+        out += "\\\\";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        out += c;
+    }
+  }
+  return out;
+}
+
+std::string EnvOr(const char* name, const std::string& dflt = "") {
+  const char* v = std::getenv(name);
+  return v ? std::string(v) : dflt;
+}
+
+// Append perf records for the whole sweep to $MORI_PERF_OUT as JSON lines,
+// matching tests/python/perf_report.py::record_perf exactly so the C++ bench
+// and the Python bench feed one report pipeline (tools/perf/build_report.py).
+// No-op unless MORI_PERF_OUT is set. Call from the initiator root only, so a
+// record is not written once per rank. Any error is swallowed -- perf reporting
+// must never fail a benchmark run.
+void WritePerfRecords(const Args& a, const std::vector<SweepResult>& rows) {
+  const std::string out = EnvOr("MORI_PERF_OUT");
+  if (out.empty() || rows.empty()) return;
+
+  const std::string run_id = EnvOr("MORI_PERF_RUN_ID");
+  const std::string commit = EnvOr("MORI_PERF_COMMIT");
+  const std::string platform = EnvOr("MORI_PERF_PLATFORM");
+  const std::string python = EnvOr("MORI_PERF_PYTHON");
+  const std::string date = EnvOr("MORI_PERF_DATE");
+  const double ts = static_cast<double>(std::time(nullptr));
+
+  // Build the whole payload first, then take the lock once and write it, so a
+  // concurrent writer never sees a half-written record. Keys are emitted in
+  // sorted order to match Python's json.dumps(sort_keys=True).
+  std::ostringstream payload;
+  for (const auto& r : rows) {
+    std::ostringstream line;
+    line.setf(std::ios::fixed);
+    line.precision(6);
+    line << '{' << "\"category\": \"io\", "
+         << "\"commit\": \"" << JsonEscape(commit) << "\", "
+         << "\"date\": \"" << JsonEscape(date) << "\", "
+         << "\"metrics\": {"
+         << "\"avg_bw_gbps\": " << r.avg_bw_gbps << ", "
+         << "\"avg_lat_us\": " << r.avg_lat_us << ", "
+         << "\"max_bw_gbps\": " << r.max_bw_gbps << ", "
+         << "\"min_lat_us\": " << r.min_lat_us << ", "
+         << "\"total_mb\": " << r.total_mb << "}, "
+         << "\"params\": {"
+         << "\"backend\": \"" << JsonEscape(a.backend) << "\", "
+         << "\"batch_size\": " << r.batch << ", "
+         << "\"enable_batch_transfer\": " << (a.enable_batch_transfer ? "true" : "false") << ", "
+         << "\"enable_sess\": " << (a.enable_sess ? "true" : "false") << ", "
+         << "\"msg_size\": " << r.msg << ", "
+         << "\"num_initiator_dev\": " << a.num_initiator_dev << ", "
+         << "\"num_qp_per_transfer\": " << a.qp_per_transfer << ", "
+         << "\"num_target_dev\": " << a.num_target_dev << ", "
+         << "\"num_worker_threads\": " << a.worker_threads << ", "
+         << "\"op_type\": \"" << JsonEscape(a.op) << "\", "
+         << "\"transfer_batch_size\": " << a.batch << "}, "
+         << "\"platform\": \"" << JsonEscape(platform) << "\", "
+         << "\"python\": \"" << JsonEscape(python) << "\", "
+         << "\"run_id\": \"" << JsonEscape(run_id) << "\", "
+         << "\"ts\": " << ts << "}\n";
+    payload << line.str();
+  }
+
+  std::FILE* fh = std::fopen(out.c_str(), "a");
+  if (fh == nullptr) {
+    std::fprintf(stderr, "[perf_report] failed to open %s: %s\n", out.c_str(),
+                 std::strerror(errno));
+    return;
+  }
+  int fd = fileno(fh);
+  if (fd >= 0) flock(fd, LOCK_EX);
+  std::fputs(payload.str().c_str(), fh);
+  if (fd >= 0) flock(fd, LOCK_UN);
+  std::fclose(fh);
+}
 
 // Drive every point in `plan` from localMem into peerMem and print one row each.
 // `label` prefixes every row, so N initiator processes writing to the same
@@ -917,9 +1033,14 @@ std::vector<SweepResult> RunSweep(const Args& a, IOEngine& engine, const MemoryD
     // ---- timed region: ONE whole-loop timer, nixl-style ----
     // Strict stop-and-wait (nixl --pipeline_depth 1): post one request, spin
     // until it completes, then post the next.
+    // A per-iteration clock read is also taken so we can emit the Python
+    // benchmark's per-iteration metrics (min/avg) to the perf report without
+    // disturbing the whole-loop nixl figure (t1-t0 stays authoritative).
+    double min_iter_us = std::numeric_limits<double>::max();
     auto t0 = Clock::now();
 
     for (int completed = 0; completed < a.iters; ++completed) {
+      auto it0 = Clock::now();
       post();
       // spin-poll, mirroring nixl's "check status, if IN_PROG continue" scan
       // (status flags stored by MORI's CQ worker thread)
@@ -928,6 +1049,10 @@ std::vector<SweepResult> RunSweep(const Args& a, IOEngine& engine, const MemoryD
       if (TransferStatus* f = reqFailed()) {
         throw std::runtime_error("transfer failed: " + f->Message());
       }
+      double iter_us =
+          std::chrono::duration_cast<std::chrono::duration<double, std::micro>>(Clock::now() - it0)
+              .count();
+      if (iter_us < min_iter_us) min_iter_us = iter_us;
     }
     auto t1 = Clock::now();
 
@@ -948,7 +1073,18 @@ std::vector<SweepResult> RunSweep(const Args& a, IOEngine& engine, const MemoryD
     std::printf("%s%-11zu %-6d %-6d %-12.2f %-11.2f %-.1f\n", label.c_str(), msg, curBatch, a.iters,
                 avg_bw, avg_lat, total_us);
     std::fflush(stdout);
-    results.push_back(SweepResult{msg, curBatch, avg_bw, avg_lat, total_us});
+
+    // Python-benchmark-format metrics (tests/python/io/benchmark.py _run_and_compute):
+    // per-iteration timing, bandwidth/latency PER ITERATION (whole batch), with
+    // max_bw/min_lat taken from the fastest iteration. avg iteration duration is
+    // the whole-loop time / iters (identical to averaging the per-iter samples,
+    // minus the negligible gap between the loop timer and the first/last sample).
+    const double total_mb = static_cast<double>(msg) * curBatch / 1e6;
+    const double avg_iter_us = total_us / a.iters;
+    const double avg_bw_gbps = (total_mb / 1e3) / (avg_iter_us / 1e6);
+    const double max_bw_gbps = (total_mb / 1e3) / (min_iter_us / 1e6);
+    results.push_back(SweepResult{msg, curBatch, avg_bw, avg_lat, total_us, avg_bw_gbps,
+                                  max_bw_gbps, avg_iter_us, min_iter_us, total_mb});
   }
 
   return results;
@@ -1083,6 +1219,11 @@ int RunDistributed(const Args& a, int localRank) {
     }
     std::fflush(stdout);
   }
+
+  // Perf report: each initiator appends its own rows (matches the Python bench's
+  // per-rank _emit_io_perf; build_report.py dedups by op/backend/msg/batch).
+  // No-op unless MORI_PERF_OUT is set.
+  if (isInitiator) WritePerfRecords(a, mine);
 
   // Correctness check on the last sweep point, matching the Python benchmark's
   // always-on validation. Runs after the timed region so it cannot perturb the
