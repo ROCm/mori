@@ -73,6 +73,7 @@ find_host_ibverbs() {
 
 nic_mount_flags() {
     local nic_type="$1"
+    local want_provider="$2"
     local flags=()
 
     case "$nic_type" in
@@ -81,6 +82,10 @@ nic_mount_flags() {
             host_ibverbs=$(find_host_ibverbs)
             if [[ -n "$host_ibverbs" ]]; then
                 flags+=(-v "$host_ibverbs:/lib/x86_64-linux-gnu/libibverbs.so.1")
+            fi
+            if (( ! want_provider )); then
+                echo "${flags[@]}"
+                return
             fi
             local bnxt_dir=""
             for dir in /usr/local/lib/x86_64-linux-gnu /usr/local/lib /usr/lib/x86_64-linux-gnu; do
@@ -111,6 +116,10 @@ nic_mount_flags() {
             host_ibverbs=$(find_host_ibverbs)
             if [[ -n "$host_ibverbs" ]]; then
                 flags+=(-v "$host_ibverbs:/lib/x86_64-linux-gnu/libibverbs.so.1")
+            fi
+            if (( ! want_provider )); then
+                echo "${flags[@]}"
+                return
             fi
             local ionic_dirs=(/usr/local/lib /usr/lib/x86_64-linux-gnu)
             for dir in "${ionic_dirs[@]}"; do
@@ -144,15 +153,21 @@ nic_mount_flags() {
     echo "${flags[@]}"
 }
 
-# ── Should we graft the host libraries in at all? ────────────────────────────
+# ── Which half of the RDMA userspace comes from the host? ────────────────────
 #
-# The mounts above exist for images that ship no out-of-tree provider. Once an
-# image carries its own (Dockerfile.dev with BNXT_ROCELIB_VERSION), overwriting
-# it with whatever the host happens to have makes the same image behave
-# differently per node: tw010 carries libbnxt_re 236.1.165.0 and works, tw022
-# carries 232.0.155.5 which only speaks kernel ABI 6 against a driver exposing
-# 8, so every device vanishes and the internode job has no RDMA on node2.
-# Probe the bare image and leave a working stack alone.
+# libibverbs always comes from the host. Broadcom ships a single prebuilt
+# libbnxt_re for every Ubuntu codename, built against rdma-core 39; pairing it
+# with the 24.04 base image's rdma-core 50 shifts the provider op table, so
+# ibv_create_qp returns a bogus pointer and the first session creation
+# segfaults. The hosts run 22.04, so their libibverbs matches what Broadcom
+# built against.
+#
+# The provider itself only comes from the host when the image has none. An
+# image built with BNXT_ROCELIB_VERSION already carries one, and overwriting it
+# makes the same image behave differently per node: tw010 has libbnxt_re
+# 236.1.165.0 and works, tw022 has 232.0.155.5 which only speaks kernel ABI 6
+# against a driver exposing 8, so every device vanishes and the internode job
+# has no RDMA on node2. Probe the bare image and leave a working provider alone.
 
 first_positional_arg() {
     local value_flags=(
@@ -180,9 +195,12 @@ first_positional_arg() {
 
 image_enumerates_rdma_devices() {
     local image="$1"
+    local host_ibverbs="$2"
     [[ -n "$image" && -d /dev/infiniband ]] || return 1
+    local mount=()
+    [[ -n "$host_ibverbs" ]] && mount=(-v "$host_ibverbs:/lib/x86_64-linux-gnu/libibverbs.so.1")
     timeout 120 "$RUNTIME" run --rm --privileged --network=host \
-        --device=/dev/infiniband "$image" ibv_devinfo -l 2>/dev/null \
+        --device=/dev/infiniband "${mount[@]}" "$image" ibv_devinfo -l 2>/dev/null \
         | grep -qE '^[1-9][0-9]* HCAs found'
 }
 
@@ -214,12 +232,15 @@ NIC_MOUNTS=()
 MOUNT_MODE="${MORI_NIC_LIB_MOUNT:-auto}"
 if [[ "$NIC_TYPE" != "mlx5" && "$MOUNT_MODE" != "never" ]]; then
     IMAGE_ARG=$(first_positional_arg "$@")
-    if [[ "$MOUNT_MODE" != "always" ]] && image_enumerates_rdma_devices "$IMAGE_ARG"; then
-        echo "[ci_run] $IMAGE_ARG ships a working $NIC_TYPE provider; keeping host libs out"
+    WANT_PROVIDER=1
+    if [[ "$MOUNT_MODE" != "always" ]] &&
+       image_enumerates_rdma_devices "$IMAGE_ARG" "$(find_host_ibverbs)"; then
+        WANT_PROVIDER=0
+        echo "[ci_run] $IMAGE_ARG ships a working $NIC_TYPE provider; mounting host libibverbs only"
     else
         echo "[ci_run] Mounting host $NIC_TYPE userspace into the container"
-        read -ra NIC_MOUNTS <<< "$(nic_mount_flags "$NIC_TYPE")"
     fi
+    read -ra NIC_MOUNTS <<< "$(nic_mount_flags "$NIC_TYPE" "$WANT_PROVIDER")"
 fi
 
 # --init (tini/catatonit as PID 1) reaps exited child processes so zombies don't
