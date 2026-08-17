@@ -11,6 +11,7 @@ set -euo pipefail
 # Environment:
 #   MORI_NIC_TYPE        — Override auto-detection (mlx5 | bnxt | ionic)
 #   CONTAINER_RUNTIME    — Override runtime (docker | podman); auto-detected
+#   MORI_NIC_LIB_MOUNT   — auto (default) | always | never; see below
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -143,6 +144,48 @@ nic_mount_flags() {
     echo "${flags[@]}"
 }
 
+# ── Should we graft the host libraries in at all? ────────────────────────────
+#
+# The mounts above exist for images that ship no out-of-tree provider. Once an
+# image carries its own (Dockerfile.dev with BNXT_ROCELIB_VERSION), overwriting
+# it with whatever the host happens to have makes the same image behave
+# differently per node: tw010 carries libbnxt_re 236.1.165.0 and works, tw022
+# carries 232.0.155.5 which only speaks kernel ABI 6 against a driver exposing
+# 8, so every device vanishes and the internode job has no RDMA on node2.
+# Probe the bare image and leave a working stack alone.
+
+first_positional_arg() {
+    local value_flags=(
+        --name -v --volume -e --env --env-file -w --workdir -p --publish
+        --network --net --device --entrypoint -u --user --ulimit --shm-size
+        --label -l --hostname -h --cpus --memory -m --mount --add-host
+        --group-add --security-opt --restart --log-driver --log-opt --pid
+        --ipc --tmpfs --cap-add --cap-drop --init-path --runtime --gpus
+        --pids-limit --stop-signal --stop-timeout --health-cmd
+    )
+    while (( $# )); do
+        case "$1" in
+            -*=*) shift ;;
+            -*)
+                local takes_value=0 flag
+                for flag in "${value_flags[@]}"; do
+                    if [[ "$1" == "$flag" ]]; then takes_value=1; break; fi
+                done
+                if (( takes_value )); then shift 2 || shift; else shift; fi
+                ;;
+            *) echo "$1"; return ;;
+        esac
+    done
+}
+
+image_enumerates_rdma_devices() {
+    local image="$1"
+    [[ -n "$image" && -d /dev/infiniband ]] || return 1
+    timeout 120 "$RUNTIME" run --rm --privileged --network=host \
+        --device=/dev/infiniband "$image" ibv_devinfo -l 2>/dev/null \
+        | grep -qE '^[1-9][0-9]* HCAs found'
+}
+
 # ── Container runtime detection ───────────────────────────────────────────────
 
 detect_runtime() {
@@ -167,7 +210,17 @@ RUNTIME=$(detect_runtime)
 NIC_TYPE=$(detect_nic_type)
 echo "[ci_run] Runtime: $RUNTIME | NIC type: $NIC_TYPE"
 
-read -ra NIC_MOUNTS <<< "$(nic_mount_flags "$NIC_TYPE")"
+NIC_MOUNTS=()
+MOUNT_MODE="${MORI_NIC_LIB_MOUNT:-auto}"
+if [[ "$NIC_TYPE" != "mlx5" && "$MOUNT_MODE" != "never" ]]; then
+    IMAGE_ARG=$(first_positional_arg "$@")
+    if [[ "$MOUNT_MODE" != "always" ]] && image_enumerates_rdma_devices "$IMAGE_ARG"; then
+        echo "[ci_run] $IMAGE_ARG ships a working $NIC_TYPE provider; keeping host libs out"
+    else
+        echo "[ci_run] Mounting host $NIC_TYPE userspace into the container"
+        read -ra NIC_MOUNTS <<< "$(nic_mount_flags "$NIC_TYPE")"
+    fi
+fi
 
 # --init (tini/catatonit as PID 1) reaps exited child processes so zombies don't
 # keep KFD contexts / VRAM alive, and forwards SIGTERM from `stop` to the group.
