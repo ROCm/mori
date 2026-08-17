@@ -863,7 +863,11 @@ report_fabric_topology() {
             log_ok "fabric is fully routed ($FABRIC_TOPO_DETAIL) — MORI-EP v1 cross-rail paths present"
             ;;
         none)
-            log_warn "no inter-node RDMA path on any NIC pair ($FABRIC_TOPO_DETAIL)"
+            # A completely dead fabric is a failure, not a topology note: no MORI
+            # cross-node workload can run. Fail so the script's exit status
+            # reflects it even when firmware/QoS pass (mesh_report only warns on
+            # unreachable pairs, so nothing else fails the run here).
+            log_fail "no inter-node RDMA path on any NIC pair ($FABRIC_TOPO_DETAIL)"
             log_warn "  neither MORI-EP nor MORI-IO can run cross-node here. Step 5 shows the"
             log_warn "  whole matrix failing, which is a fabric or QoS problem, not a topology."
             ;;
@@ -970,17 +974,34 @@ gpu_mesh_check() {
     # oversubscribes the host badly enough that some land at a third of line rate
     # (69a3027b). n probes at a few seconds each is a cheap price for numbers
     # that mean something -- and unlike Phase A, these are worth judging.
+    #
+    # A rail is the reachable pair for local NIC i, not blindly local[i] <->
+    # remote[i]: if the two nodes enumerate their devices in different orders the
+    # physical rail is a permuted pair, and the diagonal would either skip a good
+    # rail (rail-only fabric) or measure a cross-rail pair as if it were on-rail
+    # (fully routed). So take the diagonal when it is reachable, else fall back to
+    # the single reachable pair in that row -- which on a rail-only fabric is the
+    # actual rail. When a row has several reachable pairs (fully routed) the
+    # diagonal is reachable too, so the ambiguous case never reaches the fallback.
     local -a R=() C=(); local diag_gated=0
-    for (( i=0; i<n; i++ )); do
-        [[ "${_hc[$i,$i]:-x}" =~ ^[0-9.]+$ ]] || continue
-        R+=("${_rr[$i]}"); C+=("${_cc[$i]}"); diag_gated=$(( diag_gated + 1 ))
+    for (( i=0; i<${#_rr[@]}; i++ )); do
+        local jsel=-1
+        if [[ "${_hc[$i,$i]:-x}" =~ ^[0-9.]+$ ]]; then
+            jsel=$i
+        else
+            local jreach=-1 nreach=0 jj
+            for (( jj=0; jj<${#_cc[@]}; jj++ )); do
+                [[ "${_hc[$i,$jj]:-x}" =~ ^[0-9.]+$ ]] || continue
+                jreach=$jj; nreach=$(( nreach + 1 ))
+            done
+            (( nreach == 1 )) && jsel=$jreach
+        fi
+        (( jsel >= 0 )) || continue
+        R+=("${_rr[$i]}"); C+=("${_cc[$jsel]}"); diag_gated=$(( diag_gated + 1 ))
     done
     if (( diag_gated == 0 )); then
         log_warn "$label GPU memory: no rail-aligned pair reachable on host memory, skipping the serial pass"
         return 0
-    fi
-    if (( ${#_rr[@]} != ${#_cc[@]} )); then
-        log_warn "$label: ${#_rr[@]} local vs ${#_cc[@]} remote device(s) -- pairing by index, which may not be rail-aligned"
     fi
 
     log_ok "$label: GPU-memory serial pass over $diag_gated rail-aligned pair(s) for per-rail numbers"
