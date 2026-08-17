@@ -456,6 +456,7 @@ jobs:
             -e MORI_PERF_PLATFORM=$MORI_PERF_PLATFORM \
             -e MORI_PERF_PYTHON=$MORI_PERF_PYTHON \
             -e MORI_PERF_DATE=$(date -u +%Y-%m-%d) \
+            -e MORI_IO_BENCH_ENGINE_BIN=$GITHUB_WORKSPACE/build_bench/tests/cpp/bench_engine \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
@@ -482,6 +483,7 @@ jobs:
               -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
               -e GLOO_SOCKET_IFNAME=$NODE2_IFNAME \
               -e NCCL_SOCKET_IFNAME=$NODE2_IFNAME \
+              -e MORI_IO_BENCH_ENGINE_BIN=$GITHUB_WORKSPACE/build_bench/tests/cpp/bench_engine \
               -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
               -w $GITHUB_WORKSPACE \
               $IMAGE sleep infinity &&
@@ -503,6 +505,19 @@ jobs:
               pip install $GITHUB_WORKSPACE/_wheels/amd_mori-*.whl
               pip install prettytable
             '"
+
+      # The IO benchmark runner defaults to the native C++ engine
+      # (tools/run_internode_io_benchmark.sh --engine cpp), which needs the
+      # bench_engine binary built on BOTH nodes. The wheel install above does not
+      # produce it. Build into a SEPARATE build_bench/ dir, not the build/ that
+      # the wheel build created inside pip's build-isolation env (ephemeral ninja
+      # + pybind11 that no longer exist), which would fail to reconfigure. The
+      # runner picks up the binary via MORI_IO_BENCH_ENGINE_BIN.
+      - name: Build MORI-IO C++ bench_engine (both nodes)
+        run: |
+          BUILD_CMD="cd $GITHUB_WORKSPACE && cmake -B build_bench -DBUILD_IO=ON -DBUILD_TESTS=ON -DBUILD_EXAMPLES=OFF -DBUILD_PYBINDS=OFF -DBUILD_OPS=OFF -DBUILD_SHMEM=OFF -DBUILD_CCO=OFF -DBUILD_COLLECTIVE=OFF -DBUILD_METRICS=OFF && cmake --build build_bench --target bench_engine -j && ls -la build_bench/tests/cpp/bench_engine"
+          $CT exec $CONTAINER bash -c "$BUILD_CMD"
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "$CT exec $CONTAINER bash -c \"$BUILD_CMD\""
 
       - name: MORI-IO internode write sweep
         run: |
@@ -559,28 +574,6 @@ jobs:
             --num-qp-per-transfer 2 --num-worker-threads 2 \
             --num-initiator-dev 8 --num-target-dev 8
           wait
-
-      - name: Build MORI-IO C++ bench_engine (both nodes)
-        run: |
-          BUILD_CMD="cd $GITHUB_WORKSPACE && cmake -B build -DBUILD_IO=ON -DBUILD_TESTS=ON -DBUILD_EXAMPLES=OFF && cmake --build build --target bench_engine -j && ls -la build/tests/cpp/bench_engine"
-          $CT exec $CONTAINER bash -c "$BUILD_CMD"
-          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "$CT exec $CONTAINER bash -c \"$BUILD_CMD\""
-
-      - name: MORI-IO C++ bench_engine write sweep (batch 1 and 64)
-        run: |
-          BIN=$GITHUB_WORKSPACE/build/tests/cpp/bench_engine
-          LDP="LD_LIBRARY_PATH=$GITHUB_WORKSPACE/build/src/io:$GITHUB_WORKSPACE/build/src/application"
-          PORT=29130
-          for BATCH in 1 64; do
-            echo "=== C++ bench_engine GPU write sweep, batch=$BATCH, port=$PORT ==="
-            ARGS="--op write --mem-type gpu --all --sweep-start 1048576 --sweep-max 33554432 --sweep-step 1048576 --transfer-batch-size $BATCH --enable-sess --enable-batch-transfer --num-initiator-dev 1 --num-target-dev 1 --num-qp-per-transfer 8 --iters 200 --warmup-iters 5"
-            R1="cd $GITHUB_WORKSPACE && $LDP $BIN --rank 1 --master-ip $NODE1_HOST --self-ip $NODE2_HOST --port $PORT $ARGS"
-            R0="cd $GITHUB_WORKSPACE && $LDP $BIN --rank 0 --master-ip $NODE1_HOST --self-ip $NODE1_HOST --port $PORT $ARGS"
-            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "$CT exec $CONTAINER bash -c \"$R1\"" &
-            $CT exec $CONTAINER bash -c "$R0"
-            wait
-            PORT=$((PORT + 1))
-          done
 
       - name: MORI-EP internode normal kernel bench
         run: |

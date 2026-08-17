@@ -512,6 +512,7 @@ jobs:
             -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
             -e GLOO_SOCKET_IFNAME=$NODE1_IFNAME \
             -e NCCL_SOCKET_IFNAME=$NODE1_IFNAME \
+            -e MORI_IO_BENCH_ENGINE_BIN=$GITHUB_WORKSPACE/build_bench/tests/cpp/bench_engine \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
@@ -538,6 +539,7 @@ jobs:
               -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
               -e GLOO_SOCKET_IFNAME=$NODE2_IFNAME \
               -e NCCL_SOCKET_IFNAME=$NODE2_IFNAME \
+              -e MORI_IO_BENCH_ENGINE_BIN=$GITHUB_WORKSPACE/build_bench/tests/cpp/bench_engine \
               -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
               -w $GITHUB_WORKSPACE \
               $IMAGE sleep infinity &&
@@ -554,6 +556,21 @@ jobs:
         run: |
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
             "$CT exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable && (command -v numactl >/dev/null || (apt-get update && apt-get install -y numactl))'"
+
+      # The IO benchmark runner defaults to the native C++ engine
+      # (tools/run_internode_io_benchmark.sh --engine cpp), which needs the
+      # bench_engine binary built on BOTH nodes. pip install above does not
+      # produce it. Build into a SEPARATE build_bench/ dir, not the build/ that
+      # `pip install .` created: that cache was configured inside pip's
+      # build-isolation env (ephemeral ninja + pybind11 that no longer exist), so
+      # reconfiguring it here fails. The runner picks up the binary via
+      # MORI_IO_BENCH_ENGINE_BIN (set on both containers at start) and derives the
+      # matching LD_LIBRARY_PATH from it.
+      - name: Build MORI-IO C++ bench_engine (both nodes)
+        run: |
+          BUILD_CMD="cd $GITHUB_WORKSPACE && cmake -B build_bench -DBUILD_IO=ON -DBUILD_TESTS=ON -DBUILD_EXAMPLES=OFF -DBUILD_PYBINDS=OFF -DBUILD_OPS=OFF -DBUILD_SHMEM=OFF -DBUILD_CCO=OFF -DBUILD_COLLECTIVE=OFF -DBUILD_METRICS=OFF && cmake --build build_bench --target bench_engine -j && ls -la build_bench/tests/cpp/bench_engine"
+          $CT exec $CONTAINER bash -c "$BUILD_CMD"
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "$CT exec $CONTAINER bash -c \"$BUILD_CMD\""
 
       - name: MORI-IO internode write sweep
         run: |
