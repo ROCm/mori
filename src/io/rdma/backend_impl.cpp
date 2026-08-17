@@ -1480,9 +1480,9 @@ struct RdmaPreparedTransfer : public PreparedTransfer {
 };
 
 std::shared_ptr<PreparedTransfer> RdmaBackendSession::PrepareBatch(const SizeVec& localOffsets,
-                                                                  const SizeVec& remoteOffsets,
-                                                                  const SizeVec& sizes,
-                                                                  bool isRead) {
+                                                                   const SizeVec& remoteOffsets,
+                                                                   const SizeVec& sizes,
+                                                                   bool isRead) {
   MORI_IO_FUNCTION_TIMER;
   if (eps.empty() || localMrPerEp.empty() || remoteMrPerEp.empty()) {
     MORI_IO_WARN("PrepareBatch: session has no endpoints or memory regions");
@@ -1499,10 +1499,9 @@ std::shared_ptr<PreparedTransfer> RdmaBackendSession::PrepareBatch(const SizeVec
   control.creditByWrCount = chunk;
 
   auto handle = std::make_shared<RdmaPreparedTransfer>(this);
-  RdmaOpRet ret =
-      BuildPreparedRdmaBatch(eps, localMrPerEp.front(), remoteMrPerEp.front(), localOffsets,
-                             remoteOffsets, sizes, isRead, control, config.postBatchSize,
-                             handle->batch);
+  RdmaOpRet ret = BuildPreparedRdmaBatch(eps, localMrPerEp.front(), remoteMrPerEp.front(),
+                                         localOffsets, remoteOffsets, sizes, isRead, control,
+                                         config.postBatchSize, handle->batch);
   if (ret.Failed()) {
     MORI_IO_WARN("PrepareBatch failed to build work requests: {}", ret.message);
     return nullptr;

@@ -843,9 +843,9 @@ void CasePreparedBatchMergesContiguousRequests() {
   SizeVec sizes{1024, 1024, 1024, 1024};
 
   PreparedRdmaBatch batch;
-  RdmaOpRet ret = BuildPreparedRdmaBatch(eps, MakePreparedLocalMr(4096), MakePreparedRemoteMr(4096),
-                                         offsets, offsets, sizes, false /* isRead */,
-                                         RdmaTransferControl{}, -1, batch);
+  RdmaOpRet ret =
+      BuildPreparedRdmaBatch(eps, MakePreparedLocalMr(4096), MakePreparedRemoteMr(4096), offsets,
+                             offsets, sizes, false /* isRead */, RdmaTransferControl{}, -1, batch);
 
   Require(ret.Succeeded(), "contiguous prepared build should succeed: " + ret.message);
   Require(batch.valid, "successful build must mark the batch valid");
@@ -880,13 +880,13 @@ void CasePreparedBatchKeepsNonMergeableRequestsSeparate() {
   SizeVec sizes{1024, 1024, 1024, 1024};
 
   PreparedRdmaBatch batch;
-  RdmaOpRet ret = BuildPreparedRdmaBatch(eps, MakePreparedLocalMr(8192), MakePreparedRemoteMr(8192),
-                                         offsets, offsets, sizes, false, RdmaTransferControl{}, -1,
-                                         batch);
+  RdmaOpRet ret =
+      BuildPreparedRdmaBatch(eps, MakePreparedLocalMr(8192), MakePreparedRemoteMr(8192), offsets,
+                             offsets, sizes, false, RdmaTransferControl{}, -1, batch);
 
   Require(ret.Succeeded(), "strided prepared build should succeed: " + ret.message);
-  Require(batch.wrs.size() == 4, "strided requests should stay as four WRs, got " +
-                                     std::to_string(batch.wrs.size()));
+  Require(batch.wrs.size() == 4,
+          "strided requests should stay as four WRs, got " + std::to_string(batch.wrs.size()));
   for (const PreparedWorkRequest& wr : batch.wrs) {
     Require(wr.mergedRequests == 1, "each strided WR should carry exactly one request");
     Require(wr.totalRemoteLength == 1024, "each strided WR length mismatch");
@@ -902,9 +902,9 @@ void CasePreparedBatchSortsUnsortedOffsets() {
   SizeVec sizes{1024, 1024, 1024, 1024};
 
   PreparedRdmaBatch batch;
-  RdmaOpRet ret = BuildPreparedRdmaBatch(eps, MakePreparedLocalMr(4096), MakePreparedRemoteMr(4096),
-                                         offsets, offsets, sizes, false, RdmaTransferControl{}, -1,
-                                         batch);
+  RdmaOpRet ret =
+      BuildPreparedRdmaBatch(eps, MakePreparedLocalMr(4096), MakePreparedRemoteMr(4096), offsets,
+                             offsets, sizes, false, RdmaTransferControl{}, -1, batch);
 
   Require(ret.Succeeded(), "unsorted prepared build should succeed: " + ret.message);
   Require(batch.wrs.size() == 1, "a reversed contiguous run should still merge into one WR, got " +
@@ -925,8 +925,8 @@ void CasePreparedBatchDisableMergeKeepsOneWrPerRequest() {
                                          offsets, offsets, sizes, false, control, -1, batch);
 
   Require(ret.Succeeded(), "disableMerge prepared build should succeed: " + ret.message);
-  Require(batch.wrs.size() == 4, "disableMerge should keep one WR per request, got " +
-                                     std::to_string(batch.wrs.size()));
+  Require(batch.wrs.size() == 4,
+          "disableMerge should keep one WR per request, got " + std::to_string(batch.wrs.size()));
 }
 
 void CasePreparedBatchGathersNonContiguousLocalIntoSges() {
@@ -939,14 +939,13 @@ void CasePreparedBatchGathersNonContiguousLocalIntoSges() {
   SizeVec sizes{100, 100, 100, 100};
 
   PreparedRdmaBatch batch;
-  RdmaOpRet ret =
-      BuildPreparedRdmaBatch(eps, MakePreparedLocalMr(32768), MakePreparedRemoteMr(4096),
-                             localOffsets, remoteOffsets, sizes, false, RdmaTransferControl{}, -1,
-                             batch);
+  RdmaOpRet ret = BuildPreparedRdmaBatch(eps, MakePreparedLocalMr(32768),
+                                         MakePreparedRemoteMr(4096), localOffsets, remoteOffsets,
+                                         sizes, false, RdmaTransferControl{}, -1, batch);
 
   Require(ret.Succeeded(), "gather prepared build should succeed: " + ret.message);
-  Require(batch.wrs.size() == 1, "the gather should fit in a single WR, got " +
-                                     std::to_string(batch.wrs.size()));
+  Require(batch.wrs.size() == 1,
+          "the gather should fit in a single WR, got " + std::to_string(batch.wrs.size()));
   Require(batch.wrs[0].sges.size() == kMaxSge, "one SGE per non-contiguous local segment");
   Require(batch.wrs[0].totalRemoteLength == 400, "gathered remote length mismatch");
   RequirePreparedWrPointers(batch);
@@ -960,10 +959,9 @@ void CasePreparedBatchStopsGatheringAtMaxSge() {
   SizeVec sizes{100, 100, 100, 100, 100, 100};
 
   PreparedRdmaBatch batch;
-  RdmaOpRet ret =
-      BuildPreparedRdmaBatch(eps, MakePreparedLocalMr(65536), MakePreparedRemoteMr(4096),
-                             localOffsets, remoteOffsets, sizes, false, RdmaTransferControl{}, -1,
-                             batch);
+  RdmaOpRet ret = BuildPreparedRdmaBatch(eps, MakePreparedLocalMr(65536),
+                                         MakePreparedRemoteMr(4096), localOffsets, remoteOffsets,
+                                         sizes, false, RdmaTransferControl{}, -1, batch);
 
   Require(ret.Succeeded(), "maxSge prepared build should succeed: " + ret.message);
   Require(batch.wrs.size() == 3, "six segments at maxSge=2 should need three WRs, got " +
@@ -982,14 +980,13 @@ void CasePreparedBatchChunksOversizedRequest() {
   control.creditByWrCount = true;
 
   PreparedRdmaBatch batch;
-  RdmaOpRet ret =
-      BuildPreparedRdmaBatch(eps, MakePreparedLocalMr(1024 * 1024),
-                             MakePreparedRemoteMr(1024 * 1024), SizeVec{0}, SizeVec{0},
-                             SizeVec{65536}, false, control, -1, batch);
+  RdmaOpRet ret = BuildPreparedRdmaBatch(eps, MakePreparedLocalMr(1024 * 1024),
+                                         MakePreparedRemoteMr(1024 * 1024), SizeVec{0}, SizeVec{0},
+                                         SizeVec{65536}, false, control, -1, batch);
 
   Require(ret.Succeeded(), "chunked prepared build should succeed: " + ret.message);
-  Require(batch.wrs.size() == 16, "64KiB at 4KiB chunks should expand to 16 WRs, got " +
-                                      std::to_string(batch.wrs.size()));
+  Require(batch.wrs.size() == 16,
+          "64KiB at 4KiB chunks should expand to 16 WRs, got " + std::to_string(batch.wrs.size()));
   for (const PreparedWorkRequest& wr : batch.wrs) {
     Require(wr.sges.size() == 1, "chunked WRs should be single-SGE");
     Require(wr.totalRemoteLength <= control.chunkBytes, "chunk length exceeds chunkBytes");
@@ -1006,9 +1003,8 @@ void CasePreparedBatchRejectsOversizedWithoutChunking() {
 
   PreparedRdmaBatch batch;
   RdmaOpRet ret =
-      BuildPreparedRdmaBatch(eps, MakePreparedLocalMr(8192), MakePreparedRemoteMr(8192),
-                             SizeVec{0}, SizeVec{0}, SizeVec{4096}, false, RdmaTransferControl{},
-                             -1, batch);
+      BuildPreparedRdmaBatch(eps, MakePreparedLocalMr(8192), MakePreparedRemoteMr(8192), SizeVec{0},
+                             SizeVec{0}, SizeVec{4096}, false, RdmaTransferControl{}, -1, batch);
 
   Require(ret.Failed(), "a request above max_msg_sz must be rejected when chunking is off");
   Require(ret.code == StatusCode::ERR_INVALID_ARGS, "unexpected status for oversized prepared WR");
@@ -1024,9 +1020,8 @@ void CasePreparedBatchUsesSmallestEndpointMaxMsgSize() {
 
   PreparedRdmaBatch batch;
   RdmaOpRet ret =
-      BuildPreparedRdmaBatch(eps, MakePreparedLocalMr(8192), MakePreparedRemoteMr(8192),
-                             SizeVec{0}, SizeVec{0}, SizeVec{4096}, false, RdmaTransferControl{},
-                             -1, batch);
+      BuildPreparedRdmaBatch(eps, MakePreparedLocalMr(8192), MakePreparedRemoteMr(8192), SizeVec{0},
+                             SizeVec{0}, SizeVec{4096}, false, RdmaTransferControl{}, -1, batch);
 
   Require(ret.Failed(), "the smallest endpoint max_msg_sz should bound the prepared batch");
   Require(ret.message.find("max_msg_sz") != std::string::npos,
@@ -1078,9 +1073,9 @@ void CasePreparedBatchRejectsInvalidArguments() {
 void CasePreparedBatchEmptyIsValid() {
   EpPairVec eps{MakeRejectingEp(1024 * 1024)};
   PreparedRdmaBatch batch;
-  RdmaOpRet ret = BuildPreparedRdmaBatch(eps, MakePreparedLocalMr(4096), MakePreparedRemoteMr(4096),
-                                         SizeVec{}, SizeVec{}, SizeVec{}, false,
-                                         RdmaTransferControl{}, -1, batch);
+  RdmaOpRet ret =
+      BuildPreparedRdmaBatch(eps, MakePreparedLocalMr(4096), MakePreparedRemoteMr(4096), SizeVec{},
+                             SizeVec{}, SizeVec{}, false, RdmaTransferControl{}, -1, batch);
 
   Require(ret.Succeeded(), "an empty prepared batch should build successfully: " + ret.message);
   Require(batch.valid, "an empty batch is still a valid handle");
@@ -1102,9 +1097,9 @@ void CasePreparedBatchRebuildReplacesPreviousState() {
   const auto remoteMr = MakePreparedRemoteMr(8192);
   PreparedRdmaBatch batch;
 
-  RdmaOpRet ret = BuildPreparedRdmaBatch(eps, localMr, remoteMr, SizeVec{0, 1025, 2050},
-                                         SizeVec{0, 1025, 2050}, SizeVec{1024, 1024, 1024}, false,
-                                         RdmaTransferControl{}, -1, batch);
+  RdmaOpRet ret =
+      BuildPreparedRdmaBatch(eps, localMr, remoteMr, SizeVec{0, 1025, 2050}, SizeVec{0, 1025, 2050},
+                             SizeVec{1024, 1024, 1024}, false, RdmaTransferControl{}, -1, batch);
   Require(ret.Succeeded(), "first prepared build should succeed: " + ret.message);
   Require(batch.wrs.size() == 3, "first build should produce three WRs");
 
@@ -1112,8 +1107,8 @@ void CasePreparedBatchRebuildReplacesPreviousState() {
   ret = BuildPreparedRdmaBatch(eps, localMr, remoteMr, SizeVec{0, 1024}, SizeVec{0, 1024},
                                SizeVec{1024, 1024}, true, RdmaTransferControl{}, -1, batch);
   Require(ret.Succeeded(), "rebuild should succeed: " + ret.message);
-  Require(batch.wrs.size() == 1, "rebuild should replace the WR list, got " +
-                                     std::to_string(batch.wrs.size()));
+  Require(batch.wrs.size() == 1,
+          "rebuild should replace the WR list, got " + std::to_string(batch.wrs.size()));
   Require(batch.batchSize == 2, "rebuild should record the new request count");
   Require(batch.isRead, "rebuild should record the new direction");
   RequirePreparedWrPointers(batch);
@@ -1277,10 +1272,10 @@ void CasePreparedPostRejectsInvalidHandles() {
 
   // One memory region per endpoint is required; a short vector would be read out of
   // bounds while re-arming keys.
-  ret = PostPreparedRdmaBatch(
-      EpPairVec{MakeRejectingEp(1024 * 1024), MakeRejectingEp(1024 * 1024)},
-      std::vector<mori::application::RdmaMemoryRegion>{localMr},
-      std::vector<mori::application::RdmaMemoryRegion>{remoteMr}, batch, meta, 141);
+  ret = PostPreparedRdmaBatch(EpPairVec{MakeRejectingEp(1024 * 1024), MakeRejectingEp(1024 * 1024)},
+                              std::vector<mori::application::RdmaMemoryRegion>{localMr},
+                              std::vector<mori::application::RdmaMemoryRegion>{remoteMr}, batch,
+                              meta, 141);
   Require(ret.Failed(), "memory-region vectors that do not match the endpoints must be rejected");
   Require(ret.code == StatusCode::ERR_INVALID_ARGS, "MR/endpoint mismatch status mismatch");
 
@@ -1332,10 +1327,9 @@ void CasePreparedTransferSessionEndToEnd() {
     std::string err;
     Require(WaitTransferDone(&status, 3000, &err),
             "prepared transfer timeout on post " + std::to_string(iter) + ": " + err);
-    Require(status.Succeeded(),
-            "prepared transfer failed on post " + std::to_string(iter) +
-                ": code=" + std::to_string(status.CodeUint32()) + ", msg='" + status.Message() +
-                "'");
+    Require(status.Succeeded(), "prepared transfer failed on post " + std::to_string(iter) +
+                                    ": code=" + std::to_string(status.CodeUint32()) + ", msg='" +
+                                    status.Message() + "'");
 
     std::vector<uint8_t> actual(kBufBytes, 0);
     HIP_RUNTIME_CHECK(hipMemcpy(actual.data(), dst.ptr, kBufBytes, hipMemcpyDeviceToHost));
