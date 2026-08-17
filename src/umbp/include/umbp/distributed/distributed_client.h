@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "umbp/distributed/pool_client.h"
+#include "umbp/local/host_mem_allocator.h"
 #include "umbp/umbp_client.h"
 
 namespace mori::umbp {
@@ -57,6 +58,19 @@ class DistributedClient : public IUMBPClient {
   std::vector<bool> BatchGet(const std::vector<std::string>& keys,
                              const std::vector<uintptr_t>& dsts,
                              const std::vector<size_t>& sizes) override;
+  // Not implemented — see src/umbp/doc/design-tree-connector-port.md §5.  The
+  // transfer layer can already express a range (TransferItem carries
+  // src_offset/dst_offset/size); what is missing is the object-range to
+  // page-range mapping and the master-side metadata question.
+  std::vector<bool> BatchGetRanges(const std::vector<std::string>& keys,
+                                   const std::vector<std::vector<uintptr_t>>& dsts,
+                                   const std::vector<std::vector<size_t>>& sizes,
+                                   const std::vector<std::vector<size_t>>& src_offsets) override;
+  std::vector<bool> BatchPutRanges(const std::vector<std::string>& keys,
+                                   const std::vector<size_t>& object_sizes,
+                                   const std::vector<std::vector<uintptr_t>>& srcs,
+                                   const std::vector<std::vector<size_t>>& sizes,
+                                   const std::vector<std::vector<size_t>>& dst_offsets) override;
   std::vector<bool> BatchExists(const std::vector<std::string>& keys) const override;
   size_t BatchExistsConsecutive(const std::vector<std::string>& keys) const override;
 
@@ -65,6 +79,14 @@ class DistributedClient : public IUMBPClient {
   void Close() override;
   bool IsDistributed() const override;
   UMBPDeploymentMode GetDeploymentMode() const override { return UMBPDeploymentMode::Distributed; }
+  // Two independent conditions, both required. The arena must exist, because
+  // the remote direction has nowhere to land otherwise — that is upstream's
+  // opt-in rule. And the selected medium must be able to serve it: ranged I/O
+  // maps object ranges onto tier pages a backend publishes as in-process
+  // endpoints, and SSD publishes storage refs instead, so it is the one medium
+  // this cannot serve. Upstream spells the medium half as `!ssd.enabled`
+  // because it predates the single-medium selector.
+  bool SupportsRangedIO() const override;
 
   bool RegisterMemory(uintptr_t ptr, size_t size,
                       mori::io::MemoryLocationType loc = mori::io::MemoryLocationType::CPU,
@@ -81,6 +103,13 @@ class DistributedClient : public IUMBPClient {
 
  private:
   UMBPConfig config_;
+  // The only buffer this class still allocates. Phase 2b moved medium pools
+  // into the backends, but the ranged scratch arena is not a medium: it is a
+  // client-side staging region for objects fetched from, or assembled for,
+  // another node, so it belongs to whoever owns the PoolClient.
+  void* ranged_scratch_ = nullptr;
+  size_t ranged_scratch_size_ = 0;
+  HostBufferHandle ranged_scratch_handle_;
   std::unique_ptr<PoolClient> pool_client_;
   std::atomic<bool> closing_{false};
   mutable std::shared_mutex op_mutex_;
