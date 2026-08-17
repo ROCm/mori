@@ -251,21 +251,5 @@ TEST(WorkloadRunnerTest, RejectsDuplicatePutsSoTransferredBytesStayExact) {
   EXPECT_THROW(runner.Run(&source), std::invalid_argument);
 }
 
-TEST(WorkloadRunnerTest, AggregatesOptionalTimeWindows) {
-  VectorSource source({
-      MakeEvent(0, 1, Event::PUT, "one"),
-      MakeEvent(0, 2, Event::PUT, "two"),
-  });
-  FakeClient client;
-  auto options = MaxThroughputOptions();
-  options.window_ns = 1'000'000'000;
-  WorkloadRunner runner(&client, options);
-  const auto metrics = runner.Run(&source);
-  ASSERT_EQ(metrics.windows.size(), 1u);
-  EXPECT_EQ(metrics.windows[0].index, 0u);
-  EXPECT_EQ(metrics.windows[0].total.attempted, 2u);
-  EXPECT_EQ(metrics.windows[0].total.succeeded, 2u);
-}
-
 }  // namespace
 }  // namespace mori::umbp::benchmark

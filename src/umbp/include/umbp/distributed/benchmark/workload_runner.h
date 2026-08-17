@@ -61,13 +61,6 @@ struct WorkloadMetrics {
   uint64_t get_validation_failures = 0;
   DistributionMetrics latency;
   DistributionMetrics schedule_lag;
-  struct Window {
-    uint64_t index = 0;
-    uint64_t start_ns = 0;
-    uint64_t end_ns = 0;
-    OperationMetrics total;
-  };
-  std::vector<Window> windows;
 };
 
 struct WorkloadRunnerOptions {
@@ -76,8 +69,6 @@ struct WorkloadRunnerOptions {
   // Trace intervals are multiplied by this value. Must be finite and positive.
   double time_scale = 1.0;
   bool validate_get_payloads = true;
-  // Zero disables time-window aggregation.
-  uint64_t window_ns = 0;
 };
 
 class WorkloadRunner {

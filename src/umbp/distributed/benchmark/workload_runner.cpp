@@ -53,17 +53,6 @@ void MergeOperation(const OperationMetrics& source, OperationMetrics* destinatio
   destination->succeeded_bytes += source.succeeded_bytes;
 }
 
-void AddWindowResult(const Event& event, bool success, OperationMetrics* metrics) {
-  ++metrics->attempted;
-  metrics->attempted_bytes += event.value_size();
-  if (success) {
-    ++metrics->succeeded;
-    metrics->succeeded_bytes += event.value_size();
-  } else {
-    ++metrics->failed;
-  }
-}
-
 void MergeMetrics(const WorkloadMetrics& source, WorkloadMetrics* destination) {
   MergeOperation(source.total, &destination->total);
   MergeOperation(source.puts, &destination->puts);
@@ -182,7 +171,6 @@ WorkloadMetrics WorkloadRunner::Run(WorkloadSource* source) {
   const uint64_t payload_seed = source->seed();
   WorkloadMetrics metrics;
   std::mutex metrics_mutex;
-  std::map<uint64_t, OperationMetrics> window_totals;
   std::exception_ptr worker_error;
   std::vector<std::thread> workers;
   workers.reserve(client_events.size());
@@ -192,7 +180,6 @@ WorkloadMetrics WorkloadRunner::Run(WorkloadSource* source) {
     workers.emplace_back([&, client_id, events = std::move(entry.second)] {
       try {
         WorkloadMetrics local;
-        std::map<uint64_t, OperationMetrics> local_windows;
         size_t begin = 0;
         while (begin < events.size()) {
           size_t end = begin + 1;
@@ -252,7 +239,6 @@ WorkloadMetrics WorkloadRunner::Run(WorkloadSource* source) {
             results = client_->BatchGet(client_id, keys, sizes, &values);
           }
           const uint64_t latency = Nanoseconds(Clock::now() - operation_start);
-          const uint64_t completion_ns = Nanoseconds(Clock::now() - start);
 
           for (size_t i = begin; i < end; ++i) {
             const size_t result_index = i - begin;
@@ -275,18 +261,11 @@ WorkloadMetrics WorkloadRunner::Run(WorkloadSource* source) {
             }
             AddResult(events[i], success, &local);
             local.latency.samples_ns.push_back(latency);
-            if (options_.window_ns != 0) {
-              AddWindowResult(events[i], success,
-                              &local_windows[completion_ns / options_.window_ns]);
-            }
           }
           begin = end;
         }
         std::lock_guard<std::mutex> lock(metrics_mutex);
         MergeMetrics(local, &metrics);
-        for (const auto& [index, totals] : local_windows) {
-          MergeOperation(totals, &window_totals[index]);
-        }
       } catch (...) {
         std::lock_guard<std::mutex> lock(metrics_mutex);
         if (!worker_error) worker_error = std::current_exception();
@@ -298,15 +277,6 @@ WorkloadMetrics WorkloadRunner::Run(WorkloadSource* source) {
   if (worker_error) std::rethrow_exception(worker_error);
   FinalizeDistribution(&metrics.latency);
   FinalizeDistribution(&metrics.schedule_lag);
-  metrics.windows.reserve(window_totals.size());
-  for (const auto& [index, totals] : window_totals) {
-    WorkloadMetrics::Window window;
-    window.index = index;
-    window.start_ns = index * options_.window_ns;
-    window.end_ns = window.start_ns + options_.window_ns;
-    window.total = totals;
-    metrics.windows.push_back(window);
-  }
   return metrics;
 }
 
