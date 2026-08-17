@@ -186,7 +186,7 @@ def parse_args():
         "--transfer-batch-size",
         type=int,
         default=256,
-        help="Number of transfer per iteration, default: 256",
+        help="Number of transfer per iteration, default: 64",
     )
     parser.add_argument(
         "--enable-batch-transfer",
@@ -202,11 +202,6 @@ def parse_args():
         "--enable-sess",
         action="store_true",
         help="Whether to use session, default: False",
-    )
-    parser.add_argument(
-        "--prepare-once",
-        action="store_true",
-        help="Build the batch work requests once and re-post them every iteration, so the sort/merge/chunk cost is hoisted out of the timed loop (the NIXL createXferReq / postXferReq split). Requires --enable-batch-transfer, --enable-sess and the rdma backend. Default: False",
     )
     parser.add_argument(
         "--num-initiator-dev",
@@ -337,7 +332,6 @@ class MoriIoBenchmark:
         enable_batch_transfer: bool = False,
         batch_contiguous: bool = False,
         enable_sess: bool = False,
-        prepare_once: bool = False,
         iters: int = 128,
         sweep: bool = False,
         sweep_batch: bool = False,
@@ -376,10 +370,6 @@ class MoriIoBenchmark:
         self.enable_batch_transfer = enable_batch_transfer
         self.batch_contiguous = batch_contiguous
         self.enable_sess = enable_sess
-        self.prepare_once = prepare_once
-        # Prepared handles are cached per (buffer_size, transfer_batch_size) so a
-        # sweep builds one handle per point instead of one per iteration.
-        self._prepared_cache = {}
         self.iters = iters
         self.sweep = sweep
         self.sweep_batch = sweep_batch
@@ -415,18 +405,6 @@ class MoriIoBenchmark:
         self.num_streams = num_streams
         self.num_events = num_events
         self.xgmi_multiprocess = xgmi_multiprocess
-
-        if self.prepare_once:
-            if self.backend_type != "rdma":
-                raise ValueError(
-                    f"--prepare-once requires the rdma backend (got {self.backend_type})"
-                )
-            if not self.enable_batch_transfer:
-                raise ValueError("--prepare-once requires --enable-batch-transfer")
-            if not self.enable_sess:
-                raise ValueError(
-                    "--prepare-once requires --enable-sess (prepared handles live on a session)"
-                )
 
         if self.sweep:
             if self.sweep_start_size <= 0 or self.sweep_max_size <= 0:
@@ -480,11 +458,6 @@ class MoriIoBenchmark:
             )
 
     def _setup_xgmi(self):
-        # XgmiBackend::CanHandle rejects any descriptor that is not GPU memory, so a
-        # host-memory run would only fail once the session is created. Reject it here,
-        # the same way fabric does below.
-        if self.mem_type != "gpu":
-            raise ValueError("xgmi backend supports GPU memory only")
         if self.xgmi_multiprocess:
             self.world_size = 2
             if self.node_rank == 0:
@@ -607,7 +580,6 @@ class MoriIoBenchmark:
         print(f"  enable_batch_transfer: {self.enable_batch_transfer}")
         print(f"  batch_contiguous: {self.batch_contiguous}")
         print(f"  enable_sess: {self.enable_sess}")
-        print(f"  prepare_once: {self.prepare_once}")
         print(f"  iters: {self.iters}")
         print()
 
@@ -1060,44 +1032,8 @@ class MoriIoBenchmark:
         ), f"Batch transfer failed: {transfer_status.Message()}"
         return duration
 
-    def run_prepared_batch_once(self, buffer_size, transfer_batch_size):
-        assert buffer_size <= self.buffer_size
-        if self.role is EngineRole.TARGET:
-            return 0
-
-        key = (buffer_size, transfer_batch_size)
-        prepared = self._prepared_cache.get(key)
-        if prepared is None:
-            offsets = self._get_transfer_offsets(
-                buffer_size, transfer_batch_size, batched=True
-            )
-            sizes = [buffer_size for _ in range(transfer_batch_size)]
-            prepared = self.sess.prepare_batch(
-                offsets, offsets, sizes, self.op_type == "read"
-            )
-            if prepared is None:
-                raise RuntimeError(
-                    "prepare_batch returned None: the backend does not support prepared transfers"
-                )
-            self._prepared_cache[key] = prepared
-
-        transfer_uid = self.engine.allocate_transfer_uid()
-
-        # Only the post is timed; the work-request build happened above, once.
-        st = time.time()
-        transfer_status = self.sess.post_prepared(prepared, transfer_uid)
-        transfer_status.Wait()
-        duration = time.time() - st
-
-        assert (
-            transfer_status.Succeeded()
-        ), f"Prepared transfer failed: {transfer_status.Message()}"
-        return duration
-
     def run_once(self, buffer_size, transfer_batch_size):
-        if self.prepare_once:
-            return self.run_prepared_batch_once(buffer_size, transfer_batch_size)
-        elif self.enable_batch_transfer:
+        if self.enable_batch_transfer:
             return self.run_batch_once(buffer_size, transfer_batch_size)
         else:
             return self.run_single_once(buffer_size, transfer_batch_size)
@@ -1359,7 +1295,6 @@ def benchmark_xgmi_worker(local_rank, node_rank, args):
         enable_batch_transfer=args.enable_batch_transfer,
         batch_contiguous=args.batch_contiguous,
         enable_sess=args.enable_sess,
-        prepare_once=args.prepare_once,
         iters=args.iters,
         sweep=args.all,
         sweep_batch=args.all_batch,
@@ -1395,7 +1330,6 @@ def benchmark_engine(local_rank, node_rank, args):
         enable_batch_transfer=args.enable_batch_transfer,
         batch_contiguous=args.batch_contiguous,
         enable_sess=args.enable_sess,
-        prepare_once=args.prepare_once,
         iters=args.iters,
         sweep=args.all,
         sweep_batch=args.all_batch,
@@ -1470,7 +1404,6 @@ def benchmark_xgmi(args):
             enable_batch_transfer=args.enable_batch_transfer,
             batch_contiguous=args.batch_contiguous,
             enable_sess=args.enable_sess,
-            prepare_once=args.prepare_once,
             iters=args.iters,
             sweep=args.all,
             sweep_batch=args.all_batch,

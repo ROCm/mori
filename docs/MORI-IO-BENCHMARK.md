@@ -168,14 +168,14 @@ memory region. No RDMA payload crosses it.
 
 ### Prepared transfers (`--prepare-once`)
 
-Both benchmarks accept `--prepare-once`, which splits a batch into the two halves
-nixl reports separately as `createXferReq` and `postXferReq`. Normally every
-iteration re-derives the batch's RDMA work requests — sorting the descriptors by
-remote offset, merging the contiguous ones, then chunking whatever still exceeds
-the NIC's message limit — even though the offsets and sizes never change between
-iterations. With the flag, that build happens **once per sweep point** and each
-iteration only re-posts the resulting handle, so the reported latency covers the
-post alone.
+The **C++** benchmark accepts `--prepare-once` (the Python benchmark does not),
+which splits a batch into the two halves nixl reports separately as
+`createXferReq` and `postXferReq`. Normally every iteration re-derives the RDMA
+work requests — sorting the descriptors by remote offset, merging the contiguous
+ones, then chunking whatever still exceeds the NIC's message limit — even though
+the offsets and sizes never change between iterations. With the flag, that build
+happens **once per sweep point** and each iteration only re-posts the resulting
+handle, so the reported latency covers the post alone.
 
 Run the same command with and without it to separate work-request construction
 from the transfer itself:
@@ -188,18 +188,21 @@ build/tests/cpp/bench_engine --rank 0 --master-ip <ip> \
 
 The flag needs `--backend rdma` (the only backend that builds a prepared handle;
 the others report the lack of support rather than quietly falling back) together
-with `--enable-sess` (the handle is owned by a session) and
-`--enable-batch-transfer`, and is rejected at startup otherwise. It is
-independent of `--batch-contiguous`: contiguous offsets still merge, they just
-merge once.
+with `--enable-sess` (the handle is owned by a session), and is rejected at
+startup otherwise. It works with **both** submission modes:
+`--enable-batch-transfer` prepares one N-descriptor handle, while
+`--disable-batch-transfer` prepares one single-descriptor handle per transfer and
+posts each individually — either way the build is hoisted out of the timed loop.
+It is independent of `--batch-contiguous`: contiguous offsets still merge, they
+just merge once.
 
 ### Differences from the Python flags
 
 Most flags share names with the Python benchmark (`--op-type`/`--op`,
 `--num-qp-per-transfer`, `--num-worker-threads`, `--transfer-batch-size`,
-`--enable-sess`, `--prepare-once`, `--batch-contiguous`, `--disable-chunking`,
+`--enable-sess`, `--batch-contiguous`, `--disable-chunking`,
 `--chunk-bytes`, `--poll_cq_mode`, `--mem-type`, `--iters`, `--sweep-step`,
-`--all`, `--all-batch`), but note:
+`--all`, `--all-batch`), but note (`--prepare-once` is C++ only):
 
 | Python | C++ (nixl-style) | Notes |
 |--------|------------------|-------|
@@ -259,7 +262,7 @@ Most flags share names with the Python benchmark (`--op-type`/`--op`,
 | `--transfer-batch-size` | Number of consecutive transfers |
 | `--enable-batch-transfer` | Enable batch transfer mode |
 | `--enable-sess` | Enable session transfer (lower latency) |
-| `--prepare-once` | Build the batch's work requests once and re-post them, timing only the post (needs `rdma` + `--enable-sess` + `--enable-batch-transfer`) |
+| `--prepare-once` | C++ only. Build the work requests once and re-post them, timing only the post (needs `rdma` + `--enable-sess`; works with batched or non-batch submission) |
 | `--num-initiator-dev` | Number of initiator devices |
 | `--num-target-dev` | Number of target devices |
 | `--num-qp-per-transfer` | Number of queue pairs used (default `4`) |

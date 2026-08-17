@@ -1381,6 +1381,31 @@ RdmaOpRet PostPreparedRdmaBatch(const EpPairVec& eps,
     if (!TryReserveSqDepth(eps[epId], batchWrNum, epId, "prepared", &reserveErr, &reserveFailure)) {
       AppendHint(&reserveErr, BuildSqDepthHint(eps[epId], epNum, postBatchSize,
                                                PostSendOpKind::BatchData, reserveFailure));
+      // Earlier post batches in this transfer may have been posted unsignaled on
+      // one or more EPs, each holding an SQ-depth reservation that only a signaled
+      // ledger tail would release. This batch never posts, so those reservations
+      // have no tail to free them -- orphan the pending WRs (as the ibv_post_send
+      // failure path does below) or the EPs leak SQ depth and eventually SQ-full.
+      for (size_t leakEp = 0; leakEp < epNum; ++leakEp) {
+        if (epWrsSinceSignal[leakEp] <= 0) continue;
+        MORI_IO_WARN(
+            "prepared SQ reservation failed on ep {}: moving pending unsignaled WRs on ep {} "
+            "(wrCount={}, mergedReq={}) to orphaned and marking degraded",
+            epId, leakEp, epWrsSinceSignal[leakEp], epMergedSinceSignal[leakEp]);
+        if (eps[leakEp].ledger) {
+          eps[leakEp].ledger->InsertOrphaned(epWrsSinceSignal[leakEp], callbackMeta,
+                                             static_cast<int>(epMergedSinceSignal[leakEp]));
+        } else {
+          MORI_IO_WARN(
+              "EP {} has pending unsignaled WRs but no submission ledger; "
+              "sqDepth may remain stale until endpoint restart",
+              leakEp);
+        }
+        if (eps[leakEp].degraded) {
+          eps[leakEp].degraded->store(true, kSqAdmissionOrder);
+        }
+        NotifySqStateChanged(eps[leakEp]);
+      }
       return {StatusCode::ERR_RDMA_OP, reserveErr};
     }
 
