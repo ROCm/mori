@@ -134,14 +134,17 @@ fi
 BENCH_BIN="${MORI_IO_BENCH_ENGINE_BIN:-$REPO_ROOT/build/tests/cpp/bench_engine}"
 if [[ ! -x "$BENCH_BIN" ]]; then
   echo "[run_internode_io_benchmark] ERROR: C++ bench_engine not found at $BENCH_BIN" >&2
-  echo "  build it with: cmake -B build -DBUILD_IO=ON -DBUILD_TESTS=ON &&" \
-       "cmake --build build --target bench_engine -j" >&2
+  echo "  build it with: cmake -B build_bench -DBUILD_IO=ON -DBUILD_TESTS=ON &&" \
+       "cmake --build build_bench --target bench_engine -j" >&2
   echo "  or set MORI_IO_BENCH_ENGINE_BIN, or pass --engine python" >&2
   exit 1
 fi
 
-# The engine's shared libraries must be discoverable at runtime.
-export LD_LIBRARY_PATH="$REPO_ROOT/build/src/io:$REPO_ROOT/build/src/application${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# The engine's shared libraries must be discoverable at runtime. Derive the build
+# tree from the binary path (tests/cpp/bench_engine -> <build>/src/io etc.) so a
+# custom MORI_IO_BENCH_ENGINE_BIN in a non-default build dir still finds its libs.
+BENCH_BUILD_DIR="$(cd "$(dirname "$BENCH_BIN")/../.." && pwd)"
+export LD_LIBRARY_PATH="$BENCH_BUILD_DIR/src/io:$BENCH_BUILD_DIR/src/application${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 exec "${NUMACTL[@]}" timeout "$BENCH_TIMEOUT_SEC" "$BENCH_BIN" \
   --rank "$RANK" \

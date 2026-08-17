@@ -456,6 +456,7 @@ jobs:
             -e MORI_PERF_PLATFORM=$MORI_PERF_PLATFORM \
             -e MORI_PERF_PYTHON=$MORI_PERF_PYTHON \
             -e MORI_PERF_DATE=$(date -u +%Y-%m-%d) \
+            -e MORI_IO_BENCH_ENGINE_BIN=$GITHUB_WORKSPACE/build_bench/tests/cpp/bench_engine \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
@@ -482,6 +483,7 @@ jobs:
               -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
               -e GLOO_SOCKET_IFNAME=$NODE2_IFNAME \
               -e NCCL_SOCKET_IFNAME=$NODE2_IFNAME \
+              -e MORI_IO_BENCH_ENGINE_BIN=$GITHUB_WORKSPACE/build_bench/tests/cpp/bench_engine \
               -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
               -w $GITHUB_WORKSPACE \
               $IMAGE sleep infinity &&
@@ -507,10 +509,13 @@ jobs:
       # The IO benchmark runner defaults to the native C++ engine
       # (tools/run_internode_io_benchmark.sh --engine cpp), which needs the
       # bench_engine binary built on BOTH nodes. The wheel install above does not
-      # produce it, so build it explicitly into build/tests/cpp/bench_engine.
+      # produce it. Build into a SEPARATE build_bench/ dir, not the build/ that
+      # the wheel build created inside pip's build-isolation env (ephemeral ninja
+      # + pybind11 that no longer exist), which would fail to reconfigure. The
+      # runner picks up the binary via MORI_IO_BENCH_ENGINE_BIN.
       - name: Build MORI-IO C++ bench_engine (both nodes)
         run: |
-          BUILD_CMD="cd $GITHUB_WORKSPACE && cmake -B build -DBUILD_IO=ON -DBUILD_TESTS=ON -DBUILD_EXAMPLES=OFF && cmake --build build --target bench_engine -j && ls -la build/tests/cpp/bench_engine"
+          BUILD_CMD="cd $GITHUB_WORKSPACE && cmake -B build_bench -DBUILD_IO=ON -DBUILD_TESTS=ON -DBUILD_EXAMPLES=OFF -DBUILD_PYBINDS=OFF -DBUILD_OPS=OFF -DBUILD_SHMEM=OFF -DBUILD_CCO=OFF -DBUILD_COLLECTIVE=OFF -DBUILD_METRICS=OFF && cmake --build build_bench --target bench_engine -j && ls -la build_bench/tests/cpp/bench_engine"
           $CT exec $CONTAINER bash -c "$BUILD_CMD"
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "$CT exec $CONTAINER bash -c \"$BUILD_CMD\""
 
