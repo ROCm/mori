@@ -24,13 +24,16 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 
+#include "mori/core/utils/utils.hpp"
 #include "spdlog/sinks/basic_file_sink.h"
 #include "spdlog/sinks/stdout_color_sinks.h"
 #include "spdlog/spdlog.h"
@@ -54,12 +57,26 @@ class ModuleLogger {
       globalLevel_ = LevelFromString(std::string(globalEnvLevel));
       globalLevelSet_ = true;
     }
+    // Eagerly create every known module logger while we are still single
+    // threaded: the Meyers singleton guarantees this ctor runs exactly once and
+    // blocks other threads until it returns, so loggers_ is fully populated
+    // before any GetLogger() call can touch the map.
+    for (const char* moduleName : kKnownModules) {
+      InitModuleLocked(moduleName);
+    }
   }
 
  public:
-  // Initialize a module-specific logger
+  // Initialize a module-specific logger.
   void InitModule(const std::string& moduleName, Level level = Level::ERROR) {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(mutex_);
+    InitModuleLocked(moduleName, level);
+  }
+
+ private:
+  // Body of InitModule; callers must hold mutex_ (or be the constructor, which
+  // runs before the instance is observable).
+  void InitModuleLocked(const std::string& moduleName, Level level = Level::ERROR) {
     // Check if logger already exists
     auto existing_logger = spdlog::get(moduleName);
     std::shared_ptr<spdlog::logger> logger;
@@ -95,7 +112,6 @@ class ModuleLogger {
       std::transform(envVar.begin(), envVar.end(), envVar.begin(), ::toupper);
     }
     const char* envLevel = std::getenv(envVar.c_str());
-
     if (envLevel) {
       finalLevel = LevelFromString(std::string(envLevel));
       envOverrides_[moduleName] = finalLevel;
@@ -103,54 +119,47 @@ class ModuleLogger {
       // Use global setting if no env var and global level is set
       finalLevel = globalLevel_;
     }
-
     logger->set_level(ConvertLevel(finalLevel));
     loggers_[moduleName] = logger;
   }
 
-  // Get logger for a specific module
+ public:
+  // Get logger for a specific module. Never returns null: unknown modules are
+  // created on demand, and if creation ever fails we log a fatal message and
+  // abort(), rather than returning null and letting callers silently drop logs.
   std::shared_ptr<spdlog::logger> GetLogger(const std::string& moduleName) {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-    auto it = loggers_.find(moduleName);
-    if (it != loggers_.end()) {
-      return it->second;
-    }
-    // If not found, create with default settings
-    InitModule(moduleName);
-    return loggers_[moduleName];
+    std::lock_guard<std::mutex> lock(mutex_);
+    return GetLoggerLocked(moduleName);
   }
 
   // Set log level for a specific module
   void SetModuleLevel(const std::string& moduleName, Level level) {
-    std::shared_ptr<spdlog::logger> appLogger;
-    {
-      std::lock_guard<std::recursive_mutex> lock(mutex_);
-      // Check if this module is protected by environment variable
-      if (HasEnvOverride(moduleName)) {
-        appLogger = GetLogger("application");  // Use application logger for warnings
-      } else {
-        auto logger = GetLogger(moduleName);
-        logger->set_level(ConvertLevel(level));
-        return;
-      }
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Check if this module is protected by environment variable
+    if (HasEnvOverrideLocked(moduleName)) {
+      // Log a warning but don't change the level
+      auto logger = GetLoggerLocked("application");  // Use application logger for warnings
+      logger->warn(
+          "Attempted to change log level for module '{}' which is controlled by environment "
+          "variable. Use ForceSetModuleLevel() to override.",
+          moduleName);
+      return;
     }
-    // Warn outside the lock: this is I/O, not map access.
-    appLogger->warn(
-        "Attempted to change log level for module '{}' which is controlled by environment "
-        "variable. Use ForceSetModuleLevel() to override.",
-        moduleName);
+
+    auto logger = GetLoggerLocked(moduleName);
+    logger->set_level(ConvertLevel(level));
   }
 
   // Set log level for all modules (global control)
   void SetGlobalLevel(Level level) {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(mutex_);
     globalLevel_ = level;
     globalLevelSet_ = true;
 
     // Apply to all existing loggers
     for (auto& [name, logger] : loggers_) {
       // Skip modules controlled by environment variables
-      if (!HasEnvOverride(name)) {
+      if (!HasEnvOverrideLocked(name)) {
         logger->set_level(ConvertLevel(level));
       }
     }
@@ -158,8 +167,8 @@ class ModuleLogger {
 
   // Set log level with priority check (used internally for env vars)
   void SetModuleLevelInternal(const std::string& moduleName, Level level, bool fromEnv = false) {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-    auto logger = GetLogger(moduleName);
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto logger = GetLoggerLocked(moduleName);
     logger->set_level(ConvertLevel(level));
     if (fromEnv) {
       envOverrides_[moduleName] = level;
@@ -168,38 +177,38 @@ class ModuleLogger {
 
   // Check if a module has environment override
   bool HasEnvOverride(const std::string& moduleName) const {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-    return envOverrides_.find(moduleName) != envOverrides_.end();
+    std::lock_guard<std::mutex> lock(mutex_);
+    return HasEnvOverrideLocked(moduleName);
   }
 
   // Clear environment overrides for a module
   void ClearEnvOverride(const std::string& moduleName) {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(mutex_);
     envOverrides_.erase(moduleName);
   }
 
   // Force set log level (ignores env protection)
   void ForceSetModuleLevel(const std::string& moduleName, Level level) {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-    auto logger = GetLogger(moduleName);
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto logger = GetLoggerLocked(moduleName);
     logger->set_level(ConvertLevel(level));
   }
 
   // Get current global level
   Level GetGlobalLevel() const {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(mutex_);
     return globalLevel_;
   }
 
   // Check if global level is set
   bool IsGlobalLevelSet() const {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(mutex_);
     return globalLevelSet_;
   }
 
   // Clear global level setting (revert to individual module control)
   void ClearGlobalLevel() {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(mutex_);
     globalLevelSet_ = false;
   }
 
@@ -221,18 +230,43 @@ class ModuleLogger {
   // rehash mid-iteration.
   template <typename F>
   void ForEachLogger(F&& fn) {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(mutex_);
     for (auto& [name, lg] : loggers_) fn(name, lg);
   }
 
  private:
+  // Body of GetLogger; callers must hold mutex_. Never returns null.
+  std::shared_ptr<spdlog::logger> GetLoggerLocked(const std::string& moduleName) {
+    for (int i = 0; i < 2; i++) {
+      auto it = loggers_.find(moduleName);
+      if (it != loggers_.end() && it->second) {
+        return it->second;
+      }
+      InitModuleLocked(moduleName);  // Create on demand
+    }
+    // The logging system is fundamentally broken, so we abort loudly.
+    std::fprintf(stderr,
+                 "FATAL: ModuleLogger failed to resolve or create a logger for module '%s' "
+                 "after retrying; aborting.\n",
+                 moduleName.c_str());
+    std::abort();
+  }
+
+  // Body of HasEnvOverride; callers must hold mutex_.
+  bool HasEnvOverrideLocked(const std::string& moduleName) const {
+    return envOverrides_.find(moduleName) != envOverrides_.end();
+  }
+
+  // Known modules created eagerly by the constructor. Kept in sync with the
+  // mori::modules namespace below (this class is defined before it).
+  static constexpr const char* kKnownModules[] = {"application", "io",   "shmem",  "core",
+                                                  "ops",         "umbp", "metrics"};
+
+  mutable std::mutex mutex_;
   std::unordered_map<std::string, std::shared_ptr<spdlog::logger>> loggers_;
   std::unordered_map<std::string, Level> envOverrides_;  // Track env variable overrides
   Level globalLevel_ = Level::ERROR;
   bool globalLevelSet_ = false;
-  // Guards loggers_, envOverrides_, globalLevel_, globalLevelSet_. Recursive
-  // since methods call each other while holding it (e.g. GetLogger -> InitModule).
-  mutable std::recursive_mutex mutex_;
 
   spdlog::level::level_enum ConvertLevel(Level level) {
     switch (level) {
@@ -267,8 +301,22 @@ constexpr const char* METRICS = "metrics";
 // Macro helpers
 #define MORI_GET_LOGGER(module) mori::ModuleLogger::GetInstance().GetLogger(module)
 
-// General MORI logging macros
-#define MORI_LOG(module, level, ...) MORI_GET_LOGGER(module)->level(__VA_ARGS__)
+// General MORI logging macros.
+//
+// Hot-path note: MORI_GET_LOGGER() resolves the logger by a string-hashed
+// unordered_map lookup. Doing that on every call — even when the level is
+// disabled and spdlog drops the message — shows up on hot paths (e.g. a
+// per-batch MORI_IO_TRACE). We cache the resolved logger pointer in a
+// function-local static so the map lookup happens once per call-site, ever.
+// spdlog's own logger->level(...) already checks the level and skips
+// formatting when disabled, and it reads the level on each call, so runtime
+// level changes are still honored.
+#define MORI_LOG(module, level, ...)                                 \
+  do {                                                               \
+    static ::spdlog::logger* _mori_log_logger =                      \
+        ::mori::ModuleLogger::GetInstance().GetLogger(module).get(); \
+    _mori_log_logger->level(__VA_ARGS__);                            \
+  } while (0)
 
 #define MORI_TRACE(module, ...) MORI_LOG(module, trace, __VA_ARGS__)
 #define MORI_DEBUG(module, ...) MORI_LOG(module, debug, __VA_ARGS__)
@@ -327,19 +375,55 @@ constexpr const char* METRICS = "metrics";
 #define MORI_METRICS_ERROR(...) MORI_ERROR(mori::modules::METRICS, __VA_ARGS__)
 #define MORI_METRICS_CRITICAL(...) MORI_CRITICAL(mori::modules::METRICS, __VA_ARGS__)
 
-// Scoped Timer class
+// Scoped Timer class.
+//
+// Hot-path note: the timer only logs at DEBUG level, so on any normal run
+// (INFO/WARN/ERROR) it must be a true no-op. We resolve the logger once and
+// check the level in the constructor; when disabled we skip the string copy,
+// both clock reads, the per-call GetLogger() hashtable lookup, and the log
+// call entirely. The macros cache the (module -> logger) lookup in a
+// function-local static so the hashtable probe happens once per call-site.
 class ScopedTimer {
  public:
   using Clock = std::chrono::steady_clock;
 
+  // Fast path used by the MORI_TIMER / MORI_FUNCTION_TIMER macros: the logger
+  // is pre-resolved and cached by the call-site, so nothing is allocated or
+  // sampled unless DEBUG logging is actually enabled for this module.
+  ScopedTimer(const char* name, spdlog::logger* logger)
+      : logger_(logger),
+        enabled_(logger != nullptr && logger->should_log(spdlog::level::debug)),
+        cname_(name) {
+    if (MORI_UNLIKELY(enabled_)) start_ = Clock::now();
+  }
+
+  ScopedTimer(const std::string& name, spdlog::logger* logger)
+      : logger_(logger), enabled_(logger != nullptr && logger->should_log(spdlog::level::debug)) {
+    if (MORI_UNLIKELY(enabled_)) {
+      name_ = name;
+      start_ = Clock::now();
+    }
+  }
+
+  // Legacy path: resolves the logger by module name. Still early-outs when the
+  // level is disabled so it never copies strings or reads the clock needlessly.
   explicit ScopedTimer(const std::string& name,
                        const std::string& module = mori::modules::APPLICATION)
-      : name_(name), module_(module), start_(Clock::now()) {}
+      : logger_(ModuleLogger::GetInstance().GetLogger(module).get()),
+        enabled_(logger_ != nullptr && logger_->should_log(spdlog::level::debug)) {
+    if (MORI_UNLIKELY(enabled_)) {
+      name_ = name;
+      start_ = Clock::now();
+    }
+  }
 
   ~ScopedTimer() {
-    auto end = Clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start_).count();
-    MORI_DEBUG(module_, "ScopedTimer [{}] took {} ns", name_, duration);
+    if (MORI_UNLIKELY(enabled_)) {
+      auto end = Clock::now();
+      auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start_).count();
+      logger_->debug("ScopedTimer [{}] took {} ns", cname_ != nullptr ? cname_ : name_.c_str(),
+                     duration);
+    }
   }
 
   double ElapsedSeconds() const {
@@ -350,13 +434,24 @@ class ScopedTimer {
   ScopedTimer& operator=(const ScopedTimer&) = delete;
 
  private:
+  spdlog::logger* logger_ = nullptr;
+  bool enabled_ = false;
+  const char* cname_ = nullptr;
   std::string name_;
-  std::string module_;
-  Clock::time_point start_;
+  Clock::time_point start_{};
 };
 
-#define MORI_TIMER(name, module) ScopedTimer timer_instance(name, module)
-#define MORI_FUNCTION_TIMER(module) ScopedTimer timer_instance(__PRETTY_FUNCTION__, module)
+// Cache the (module -> logger) resolution in a function-local static so the
+// unordered_map<string, logger> lookup runs once per call-site instead of on
+// every invocation of the timed function.
+#define MORI_TIMER(name, module)                                    \
+  static const std::shared_ptr<spdlog::logger> _mori_timer_logger = \
+      ::mori::ModuleLogger::GetInstance().GetLogger(module);        \
+  ::mori::ScopedTimer timer_instance(name, _mori_timer_logger.get())
+#define MORI_FUNCTION_TIMER(module)                                 \
+  static const std::shared_ptr<spdlog::logger> _mori_timer_logger = \
+      ::mori::ModuleLogger::GetInstance().GetLogger(module);        \
+  ::mori::ScopedTimer timer_instance(__PRETTY_FUNCTION__, _mori_timer_logger.get())
 
 // Initialization helper functions
 inline void InitializeLogging() {

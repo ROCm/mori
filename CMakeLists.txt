@@ -220,10 +220,23 @@ add_subdirectory(3rdparty/spdlog)
 # MORI's .so files.
 set_target_properties(spdlog PROPERTIES CXX_VISIBILITY_PRESET hidden
                                         VISIBILITY_INLINES_HIDDEN ON)
+# Silence the deprecated `operator"" _a` warning from the bundled fmt while
+# compiling spdlog's own sources (see mori_logging below for consumers).
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag("-Wno-deprecated-literal-operator"
+                        HAVE_WNO_DEPRECATED_LITERAL_OPERATOR)
+if(HAVE_WNO_DEPRECATED_LITERAL_OPERATOR)
+  target_compile_options(spdlog PRIVATE -Wno-deprecated-literal-operator)
+endif()
 
 add_library(mori_logging INTERFACE)
 target_include_directories(mori_logging INTERFACE include)
 target_link_libraries(mori_logging INTERFACE spdlog::spdlog)
+
+if(HAVE_WNO_DEPRECATED_LITERAL_OPERATOR)
+  target_compile_options(mori_logging
+                         INTERFACE -Wno-deprecated-literal-operator)
+endif()
 
 if(ENABLE_PROFILER)
   find_package(

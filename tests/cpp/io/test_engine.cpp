@@ -247,6 +247,59 @@ void CaseSubmissionLedgerBasic() {
   Require(sqDepth2.load(std::memory_order_relaxed) == 5, "sq depth after posted CQE release");
 }
 
+void CaseSubmissionLedgerRingWraparound() {
+  // Small SQ depth -> small ring, so a modest number of insert/release cycles
+  // laps the ring several times and exercises slot reuse.
+  constexpr uint32_t kNotifPerQp = 16;
+  constexpr int kMaxSqDepth = 32;
+  SubmissionLedger ledger(kNotifPerQp, kMaxSqDepth);
+  TransferStatus status;
+
+  // Insert then immediately release, one record at a time, across many laps of
+  // the ring. Each id must round-trip to the correct record.
+  uint64_t expectedId = kNotifPerQp;
+  for (int i = 0; i < 4096; ++i) {
+    std::atomic<int> sqDepth{1};
+    auto meta = std::make_shared<CqCallbackMeta>(&status, 1000 + i, 1);
+    const uint64_t id = ledger.Insert(1, true, meta, /*batchSize=*/i + 1);
+    Require(id == expectedId, "recordId must be monotonic across wraparound");
+    ++expectedId;
+
+    // Releasing a stale/never-inserted id (the slot's current occupant differs)
+    // must return nullptr without disturbing the live record.
+    Require(ledger.ReleaseByCqe(id + 1, &sqDepth, nullptr) == nullptr,
+            "stale recordId should not resolve to a live slot");
+
+    int batchSize = 0;
+    auto released = ledger.ReleaseByCqe(id, &sqDepth, &batchSize);
+    Require(released != nullptr, "wraparound release should find the live record");
+    Require(released->id == static_cast<uint64_t>(1000 + i),
+            "wraparound release returned the wrong record");
+    Require(batchSize == i + 1, "wraparound release batch size mismatch");
+    Require(sqDepth.load(std::memory_order_relaxed) == 0, "wraparound release should free 1 WR");
+
+    // Double release of the same id is a no-op (slot already empty).
+    Require(ledger.ReleaseByCqe(id, &sqDepth, nullptr) == nullptr,
+            "double release of the same recordId should return nullptr");
+  }
+
+  // Keep several records live simultaneously (up to the SQ depth), spanning a
+  // ring boundary, then release them out of order.
+  std::vector<uint64_t> liveIds;
+  for (int i = 0; i < kMaxSqDepth; ++i) {
+    auto meta = std::make_shared<CqCallbackMeta>(&status, 5000 + i, 1);
+    liveIds.push_back(ledger.Insert(1, true, meta, /*batchSize=*/1));
+  }
+  std::atomic<int> sqDepth{kMaxSqDepth};
+  // Release in reverse order.
+  for (auto it = liveIds.rbegin(); it != liveIds.rend(); ++it) {
+    Require(ledger.ReleaseByCqe(*it, &sqDepth, nullptr) != nullptr,
+            "each concurrently-live record should release cleanly");
+  }
+  Require(sqDepth.load(std::memory_order_relaxed) == 0,
+          "all concurrently-live records should be released");
+}
+
 EpPair MakeSqAdmissionEp(int maxSqDepth, int currentDepth, bool withAdmission = true) {
   EpPair ep{};
   ep.sqDepth = std::make_shared<std::atomic<int>>(currentDepth);
@@ -1809,6 +1862,7 @@ int main(int argc, char* argv[]) {
   SetLogLevel("info");
   std::vector<TestCase> cases = {
       {"submission_ledger_basic", CaseSubmissionLedgerBasic},
+      {"submission_ledger_ring_wraparound", CaseSubmissionLedgerRingWraparound},
       {"sq_admission_release_wakes_waiter", CaseSqAdmissionReleaseWakesWaiter},
       {"sq_admission_degraded_wakes_waiter", CaseSqAdmissionDegradedWakesWaiter},
       {"sq_admission_negative_depth_reserve_repairs_counter",

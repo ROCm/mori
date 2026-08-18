@@ -29,13 +29,14 @@
 // host (non-hipcc) parse working for the __device__/__host__-tagged helpers.
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #include <hip/hip_runtime.h>
-#endif
-
+// `warpSize` is only used by the __device__ helpers below. Define it as a macro
+// solely under device compilation.
 #ifndef warpSize
 #if defined(__GFX8__) || defined(__GFX9__)
 #define warpSize 64
 #else
 #define warpSize 32
+#endif
 #endif
 #endif
 
@@ -46,6 +47,14 @@
 #define MORI_PRINTF(...) printf(__VA_ARGS__)
 #else
 #define MORI_PRINTF(...) ((void)0)
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#define MORI_LIKELY(expr) __builtin_expect(!!(expr), 1)
+#define MORI_UNLIKELY(expr) __builtin_expect(!!(expr), 0)
+#else
+#define MORI_LIKELY(expr) (!!(expr))
+#define MORI_UNLIKELY(expr) (!!(expr))
 #endif
 
 namespace mori {
