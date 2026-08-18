@@ -28,11 +28,14 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <string>
 #include <vector>
 
+#include "mori/application/transport/rdma/providers/ionic/ionic.hpp"
+#include "mori/application/transport/rdma/providers/mlx5/mlx5.hpp"
 #include "mori/application/transport/sdma/anvil.hpp"
 #include "mori/application/utils/check.hpp"
 #include "mori/utils/env_utils.hpp"
@@ -51,6 +54,7 @@ Context::Context(BootstrapNetwork& bootNet) : bootNet(bootNet) {
   // uncached SDMA buffers, leading to cache/IPC inconsistency hangs.
   sdmaEnabled = env::IsEnvVarEnabled("MORI_ENABLE_SDMA");
   p2pDisabled = env::IsEnvVarEnabled("MORI_DISABLE_P2P");
+  proxyEnabled = env::IsEnvVarEnabled("MORI_EP_OVER_RDMA");
   CollectHostNames();
   // Lightweight: topology, NIC selection, transport type decision, SDMA queues.
   // No QP creation, no AllToAll. Modules that need the initial RDMA endpoint
@@ -243,6 +247,22 @@ void Context::InitializeTopologyAndTransports() {
                   devicePortId, device->Name());
   }
 
+  if (proxyEnabled) {
+    allRdmaDeviceContexts.clear();
+    for (const auto& dp : activeDevicePortList) {
+      RdmaDeviceContext* ctx = dp.first->CreateRdmaDeviceContext();
+      if (ctx != nullptr) {
+        allRdmaDeviceContexts.emplace_back(ctx);
+      }
+    }
+    if (allRdmaDeviceContexts.empty() && rdmaDeviceContext) {
+      allRdmaDeviceContexts.emplace_back(
+          rdmaDeviceContext->GetRdmaDevice()->CreateRdmaDeviceContext());
+    }
+    MORI_APP_INFO("rank {} allRdmaDeviceContexts size: {}", LocalRank(),
+                  allRdmaDeviceContexts.size());
+  }
+
   int numQpPerPe = 4;
   const char* envNumQp = std::getenv("MORI_NUM_QP_PER_PE");
   if (envNumQp != nullptr) {
@@ -378,14 +398,21 @@ void Context::EnsureSdmaTransport(int requestedChannels) {
 /* ------------------------------------------------------------------------ */
 
 void Context::BuildAndConnectInitialEndpoints() {
+  const int myLocalGpu = LocalRankInNode();
+
   // Build the worldSize × numQpPerPe rdmaEps vector. Non-RDMA peer slots are
   // populated with empty stubs to keep the indexing uniform.
   rdmaEps.reserve(static_cast<size_t>(WorldSize()) * numQpPerPe);
   for (int i = 0; i < WorldSize(); i++) {
     if (transportTypes[i] == TransportType::RDMA) {
       for (int qp = 0; qp < numQpPerPe; qp++) {
-        RdmaEndpoint ep = rdmaDeviceContext->CreateRdmaEndpoint(savedEpConfig);
-        rdmaEps.push_back(ep);
+        if (proxyEnabled) {
+          RdmaEndpoint ep = GetRailContext(i)->CreateRdmaEndpoint(savedEpConfig);
+          rdmaEps.push_back(ep);
+        } else {
+          RdmaEndpoint ep = rdmaDeviceContext->CreateRdmaEndpoint(savedEpConfig);
+          rdmaEps.push_back(ep);
+        }
       }
     } else {
       for (int qp = 0; qp < numQpPerPe; qp++) {
@@ -411,8 +438,27 @@ void Context::BuildAndConnectInitialEndpoints() {
     }
     for (int qp = 0; qp < numQpPerPe; qp++) {
       int epIndex = peer * numQpPerPe + qp;
-      rdmaDeviceContext->ConnectEndpoint(localToPeerEpHandles[epIndex],
-                                         peerToLocalEpHandles[epIndex], qp);
+      if (proxyEnabled) {
+        RdmaDeviceContext* ctx = GetRailContext(peer);
+        ctx->ConnectEndpoint(localToPeerEpHandles[epIndex],
+                             peerToLocalEpHandles[epIndex], qp);
+        auto* ionic = dynamic_cast<IonicDeviceContext*>(ctx);
+        auto* mlx5 = dynamic_cast<Mlx5DeviceContext*>(ctx);
+        if (ionic) {
+          auto ri = ionic->GetProxyRecvInfo(rdmaEps[epIndex].handle.qpn);
+          rdmaEps[epIndex].ibvHandle.recvBuf = ri.buf;
+          rdmaEps[epIndex].ibvHandle.recvLkey = ri.lkey;
+          rdmaEps[epIndex].ibvHandle.recvCount = ri.count;
+        } else if (mlx5) {
+          auto ri = mlx5->GetProxyRecvInfo(rdmaEps[epIndex].handle.qpn);
+          rdmaEps[epIndex].ibvHandle.recvBuf = ri.buf;
+          rdmaEps[epIndex].ibvHandle.recvLkey = ri.lkey;
+          rdmaEps[epIndex].ibvHandle.recvCount = ri.count;
+        }
+      } else {
+        rdmaDeviceContext->ConnectEndpoint(localToPeerEpHandles[epIndex],
+                                           peerToLocalEpHandles[epIndex], qp);
+      }
     }
   }
 }
@@ -442,7 +488,8 @@ std::vector<RdmaEndpoint> Context::CreateAdditionalEndpoints(int qpPerPe,
       continue;
     }
     for (int qp = 0; qp < qpPerPe; qp++) {
-      RdmaEndpoint ep = rdmaDeviceContext->CreateRdmaEndpoint(savedEpConfig);
+      RdmaDeviceContext* ctx = proxyEnabled ? GetRailContext(i) : rdmaDeviceContext.get();
+      RdmaEndpoint ep = ctx->CreateRdmaEndpoint(savedEpConfig);
       eps.push_back(ep);
     }
   }
@@ -465,7 +512,8 @@ void Context::ConnectAdditionalEndpoints(std::vector<RdmaEndpoint>& endpoints, i
     if (!ShouldCreateQpForPeer(peer, LocalRank(), peerCaps, peerMask)) continue;
     for (int qp = 0; qp < qpPerPe; qp++) {
       int idx = peer * qpPerPe + qp;
-      rdmaDeviceContext->ConnectEndpoint(localHandles[idx], peerHandles[idx], qp);
+      RdmaDeviceContext* ctx = proxyEnabled ? GetRailContext(peer) : rdmaDeviceContext.get();
+      ctx->ConnectEndpoint(localHandles[idx], peerHandles[idx], qp);
     }
   }
 }

@@ -1,0 +1,438 @@
+// Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
+// MIT License
+#pragma once
+
+#include "mori/core/transport/rdma/proxy/proxy_device_primitives.hpp"
+#include "mori/shmem/internal.hpp"
+
+#if defined(__HIPCC__) && defined(MORI_PROXY_ENABLED)
+
+namespace mori {
+namespace shmem {
+
+inline __device__ volatile core::ProxyRing* ProxyRingForEp(
+    GpuStates* gs, uint32_t epIndex) {
+  int pe = epIndex / gs->numQpPerPe;
+  int peerLocal = pe % gs->numNics;
+  int nicIdx = (gs->localGpuIdx > peerLocal ? gs->localGpuIdx : peerLocal) % gs->numNics;
+  return gs->proxyRings[nicIdx];
+}
+
+inline __device__ void ShmemQuietAllProxy() {
+  GpuStates* gs = GetGlobalGpuStatesPtr();
+  for (int n = 0; n < gs->numProxyRings; n++) {
+    volatile core::ProxyRing* ring = gs->proxyRings[n];
+    if (!ring) continue;
+    uint32_t head = ring->gpu_head;
+    uint32_t lastQuiet = gs->proxyQuietHead[n];
+    if (head != lastQuiet) {
+      core::ProxyQuiet(ring, lastQuiet, head - lastQuiet);
+      gs->proxyQuietHead[n] = head;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ShmemQuietThreadKernel<PROXY>
+// ---------------------------------------------------------------------------
+template <>
+inline __device__ void ShmemQuietThreadKernel<application::TransportType::PROXY>() {
+  ShmemQuietAllProxy();
+}
+
+template <>
+inline __device__ void ShmemQuietThreadKernel<application::TransportType::PROXY>(int pe) {
+  GpuStates* gs = GetGlobalGpuStatesPtr();
+  int epIndex = pe * gs->numQpPerPe;
+  int peerLocal = pe % gs->numNics;
+  int nicIdx = (gs->localGpuIdx > peerLocal ? gs->localGpuIdx : peerLocal) % gs->numNics;
+  volatile core::ProxyRing* ring = gs->proxyRings[nicIdx];
+  if (ring) {
+    uint32_t head = ring->gpu_head;
+    uint32_t lastQuiet = gs->proxyQuietHead[nicIdx];
+    if (head != lastQuiet) {
+      core::ProxyQuiet(ring, lastQuiet, head - lastQuiet);
+      gs->proxyQuietHead[nicIdx] = head;
+    }
+  }
+}
+
+template <>
+inline __device__ void ShmemQuietThreadKernel<application::TransportType::PROXY>(
+    int pe, int qpId) {
+  ShmemQuietThreadKernel<application::TransportType::PROXY>(pe);
+}
+
+// ---------------------------------------------------------------------------
+// ShmemPutMemNbiThreadKernel<PROXY> (SymmMemObjPtr)
+// ---------------------------------------------------------------------------
+template <>
+inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::PROXY>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe,
+    int qpId) {
+  if (bytes == 0) return;
+  GpuStates* gs = GetGlobalGpuStatesPtr();
+  int epIndex = pe * gs->numQpPerPe + (qpId % gs->numQpPerPe);
+  volatile core::ProxyRing* ring = ProxyRingForEp(gs, epIndex);
+
+  size_t currentOffset = 0;
+  size_t remaining = bytes;
+  while (remaining > 0) {
+    uint32_t lkey;
+    uint32_t rkey;
+    uintptr_t srcAddr;
+    uintptr_t raddr;
+    size_t transfer_size;
+    if (gs->useVMMHeap) {
+      srcAddr = reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset + currentOffset;
+      size_t src_chunk_size;
+      VmmQueryLocalKey(srcAddr, remaining, lkey, src_chunk_size);
+      uintptr_t dstAddr = reinterpret_cast<uintptr_t>(dest->localPtr) + destOffset + currentOffset;
+      size_t dst_chunk_size;
+      VmmQueryRemoteAddr(dstAddr, pe, remaining, raddr, rkey, dst_chunk_size);
+      transfer_size = src_chunk_size < dst_chunk_size ? src_chunk_size : dst_chunk_size;
+    } else {
+      lkey = source->lkey;
+      srcAddr = reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset + currentOffset;
+      raddr = dest->peerPtrs[pe] + destOffset + currentOffset;
+      rkey = dest->peerRkeys[pe];
+      transfer_size = remaining;
+    }
+    core::ProxyPostWrite(ring, epIndex, srcAddr, lkey, raddr, rkey, transfer_size);
+    remaining -= transfer_size;
+    currentOffset += transfer_size;
+  }
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::PROXY>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe,
+    int qpId) {
+  int laneId = threadIdx.x & (warpSize - 1);
+  if (laneId == 0) {
+    ShmemPutMemNbiThreadKernel<application::TransportType::PROXY>(
+        dest, destOffset, source, sourceOffset, bytes, pe, qpId);
+  }
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiBlockKernel<application::TransportType::PROXY>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe,
+    int qpId) {
+  int threadId = core::FlatBlockThreadId();
+  if (threadId == 0) {
+    ShmemPutMemNbiThreadKernel<application::TransportType::PROXY>(
+        dest, destOffset, source, sourceOffset, bytes, pe, qpId);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ShmemPutSizeImmNbiThreadKernel<PROXY> (SymmMemObjPtr)
+// ---------------------------------------------------------------------------
+template <>
+inline __device__ void ShmemPutSizeImmNbiThreadKernel<application::TransportType::PROXY>(
+    const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes,
+    int pe, int qpId) {
+  GpuStates* gs = GetGlobalGpuStatesPtr();
+  int epIndex = pe * gs->numQpPerPe + (qpId % gs->numQpPerPe);
+  volatile core::ProxyRing* ring = ProxyRingForEp(gs, epIndex);
+  uintptr_t raddr;
+  uint32_t rkey;
+  if (gs->useVMMHeap) {
+    uintptr_t dstAddr = reinterpret_cast<uintptr_t>(dest->localPtr) + destOffset;
+    VmmLookupRemote(dstAddr, pe, raddr, rkey);
+  } else {
+    raddr = dest->peerPtrs[pe] + destOffset;
+    rkey = dest->peerRkeys[pe];
+  }
+  core::ProxyPostWriteInline(ring, epIndex,
+                             reinterpret_cast<uint64_t>(val), 0, raddr, rkey, bytes);
+}
+
+template <>
+inline __device__ void ShmemPutSizeImmNbiWarpKernel<application::TransportType::PROXY>(
+    const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes,
+    int pe, int qpId) {
+  int laneId = threadIdx.x & (warpSize - 1);
+  if (laneId == 0) {
+    ShmemPutSizeImmNbiThreadKernel<application::TransportType::PROXY>(
+        dest, destOffset, val, bytes, pe, qpId);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ShmemPutMemNbiSignalThreadKernel<PROXY> (SymmMemObjPtr)
+// ---------------------------------------------------------------------------
+template <>
+inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportType::PROXY, true>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  if (bytes == 0) return;
+  GpuStates* gs = GetGlobalGpuStatesPtr();
+  int epIndex = pe * gs->numQpPerPe + (qpId % gs->numQpPerPe);
+  volatile core::ProxyRing* ring = ProxyRingForEp(gs, epIndex);
+  uint32_t lkey = source->lkey;
+  uintptr_t srcAddr = reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset;
+  uintptr_t raddr = dest->peerPtrs[pe] + destOffset;
+  uint32_t rkey = dest->peerRkeys[pe];
+  core::ProxyPostWrite(ring, epIndex, srcAddr, lkey, raddr, rkey, bytes);
+  uintptr_t sigRaddr = signalDest->peerPtrs[pe] + signalDestOffset;
+  uint32_t sigRkey = signalDest->peerRkeys[pe];
+  core::IbufHandle& ibuf = gs->rdmaEndpoints[epIndex].atomicIbuf;
+  core::ProxyPostSignalWrite(ring, epIndex, sigRaddr, sigRkey, signalValue,
+                             ibuf.lkey, ibuf.addr);
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportType::PROXY, false>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  ShmemPutMemNbiSignalThreadKernel<application::TransportType::PROXY, true>(
+      dest, destOffset, source, sourceOffset, bytes,
+      signalDest, signalDestOffset, signalValue, signalOp, pe, qpId);
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType::PROXY, true>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  int laneId = threadIdx.x & (warpSize - 1);
+  if (laneId == 0) {
+    ShmemPutMemNbiSignalThreadKernel<application::TransportType::PROXY, true>(
+        dest, destOffset, source, sourceOffset, bytes,
+        signalDest, signalDestOffset, signalValue, signalOp, pe, qpId);
+  }
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType::PROXY, false>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  int laneId = threadIdx.x & (warpSize - 1);
+  if (laneId == 0) {
+    ShmemPutMemNbiSignalThreadKernel<application::TransportType::PROXY, true>(
+        dest, destOffset, source, sourceOffset, bytes,
+        signalDest, signalDestOffset, signalValue, signalOp, pe, qpId);
+  }
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalBlockKernel<application::TransportType::PROXY, true>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  int threadId = core::FlatBlockThreadId();
+  if (threadId == 0) {
+    ShmemPutMemNbiSignalThreadKernel<application::TransportType::PROXY, true>(
+        dest, destOffset, source, sourceOffset, bytes,
+        signalDest, signalDestOffset, signalValue, signalOp, pe, qpId);
+  }
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalBlockKernel<application::TransportType::PROXY, false>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  int threadId = core::FlatBlockThreadId();
+  if (threadId == 0) {
+    ShmemPutMemNbiSignalThreadKernel<application::TransportType::PROXY, true>(
+        dest, destOffset, source, sourceOffset, bytes,
+        signalDest, signalDestOffset, signalValue, signalOp, pe, qpId);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ShmemAtomicSizeNonFetchThreadKernel<PROXY> (SymmMemObjPtr)
+// ---------------------------------------------------------------------------
+template <>
+inline __device__ void ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::PROXY>(
+    const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes,
+    core::atomicType amoType, int pe, int qpId) {
+  GpuStates* gs = GetGlobalGpuStatesPtr();
+  int epIndex = pe * gs->numQpPerPe + (qpId % gs->numQpPerPe);
+  volatile core::ProxyRing* ring = ProxyRingForEp(gs, epIndex);
+  uintptr_t raddr;
+  uint32_t rkey;
+  if (gs->useVMMHeap) {
+    uintptr_t dstAddr = reinterpret_cast<uintptr_t>(dest->localPtr) + destOffset;
+    VmmLookupRemote(dstAddr, pe, raddr, rkey);
+  } else {
+    raddr = dest->peerPtrs[pe] + destOffset;
+    rkey = dest->peerRkeys[pe];
+  }
+  core::IbufHandle& ibuf = gs->rdmaEndpoints[epIndex].atomicIbuf;
+  uint64_t atomicVal = 0;
+  memcpy(&atomicVal, val, bytes <= 8 ? bytes : 8);
+  core::ProxyPostAtomicNonFetch(ring, epIndex, raddr, rkey, atomicVal, ibuf.lkey, ibuf.addr);
+}
+
+template <>
+inline __device__ void ShmemAtomicSizeNonFetchWarpKernel<application::TransportType::PROXY>(
+    const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes,
+    core::atomicType amoType, int pe, int qpId) {
+  int laneId = threadIdx.x & (warpSize - 1);
+  if (laneId == 0) {
+    ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::PROXY>(
+        dest, destOffset, val, bytes, amoType, pe, qpId);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ShmemAtomicTypeFetchThreadKernel<PROXY, T> (SymmMemObjPtr)
+// ---------------------------------------------------------------------------
+#define DEFINE_PROXY_ATOMIC_FETCH_THREAD(T)                                                    \
+  template <>                                                                                  \
+  inline __device__ T                                                                          \
+  ShmemAtomicTypeFetchThreadKernel<application::TransportType::PROXY, T>(                      \
+      const application::SymmMemObjPtr dest, size_t destOffset, void* val, void* compare,      \
+      size_t bytes, core::atomicType amoType, int pe, int qpId) {                               \
+    GpuStates* gs = GetGlobalGpuStatesPtr();                                                   \
+    int epIndex = pe * gs->numQpPerPe + (qpId % gs->numQpPerPe);                               \
+    volatile core::ProxyRing* ring = ProxyRingForEp(gs, epIndex);                              \
+    uintptr_t raddr;                                                                           \
+    uint32_t rkey;                                                                             \
+    if (gs->useVMMHeap) {                                                                      \
+      uintptr_t dstAddr = reinterpret_cast<uintptr_t>(dest->localPtr) + destOffset;            \
+      VmmLookupRemote(dstAddr, pe, raddr, rkey);                                               \
+    } else {                                                                                   \
+      raddr = dest->peerPtrs[pe] + destOffset;                                                 \
+      rkey = dest->peerRkeys[pe];                                                              \
+    }                                                                                          \
+    core::IbufHandle& ibuf = gs->rdmaEndpoints[epIndex].atomicIbuf;                            \
+    uint64_t atomicVal = 0;                                                                    \
+    memcpy(&atomicVal, val, bytes <= 8 ? bytes : 8);                                           \
+    uint64_t result = core::ProxyPostAtomicFetch(ring, epIndex, raddr, rkey,                   \
+                                                  atomicVal, ibuf.lkey, ibuf.addr);            \
+    T retVal;                                                                                  \
+    memcpy(&retVal, &result, sizeof(T));                                                       \
+    return retVal;                                                                             \
+  }
+
+DEFINE_PROXY_ATOMIC_FETCH_THREAD(uint32_t)
+DEFINE_PROXY_ATOMIC_FETCH_THREAD(uint64_t)
+DEFINE_PROXY_ATOMIC_FETCH_THREAD(int32_t)
+DEFINE_PROXY_ATOMIC_FETCH_THREAD(int64_t)
+#undef DEFINE_PROXY_ATOMIC_FETCH_THREAD
+
+#define DEFINE_PROXY_ATOMIC_FETCH_WARP(T)                                                      \
+  template <>                                                                                  \
+  inline __device__ T                                                                          \
+  ShmemAtomicTypeFetchWarpKernel<application::TransportType::PROXY, T>(                        \
+      const application::SymmMemObjPtr dest, size_t destOffset, void* val, void* compare,      \
+      size_t bytes, core::atomicType amoType, int pe, int qpId) {                               \
+    return ShmemAtomicTypeFetchThreadKernel<application::TransportType::PROXY, T>(              \
+        dest, destOffset, val, compare, bytes, amoType, pe, qpId);                             \
+  }
+
+DEFINE_PROXY_ATOMIC_FETCH_WARP(uint32_t)
+DEFINE_PROXY_ATOMIC_FETCH_WARP(uint64_t)
+DEFINE_PROXY_ATOMIC_FETCH_WARP(int32_t)
+DEFINE_PROXY_ATOMIC_FETCH_WARP(int64_t)
+#undef DEFINE_PROXY_ATOMIC_FETCH_WARP
+
+// ---------------------------------------------------------------------------
+// ShmemGetMemNbi<PROXY> — not supported (proxy is write-only)
+// ---------------------------------------------------------------------------
+template <>
+inline __device__ void ShmemGetMemNbiThreadKernel<application::TransportType::PROXY>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe,
+    int qpId) {
+  assert(false);
+}
+
+template <>
+inline __device__ void ShmemGetMemNbiWarpKernel<application::TransportType::PROXY>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe,
+    int qpId) {
+  assert(false);
+}
+
+template <>
+inline __device__ void ShmemGetMemNbiBlockKernel<application::TransportType::PROXY>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe,
+    int qpId) {
+  assert(false);
+}
+
+// ---------------------------------------------------------------------------
+// Address-based overloads — stubs (EP uses SymmMemObjPtr APIs, not these)
+// ---------------------------------------------------------------------------
+template <> inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::PROXY>(
+    const void* d, const void* s, size_t b, int pe, int q) { assert(false); }
+template <> inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::PROXY>(
+    const void* d, const void* s, size_t b, int pe, int q) { assert(false); }
+template <> inline __device__ void ShmemPutMemNbiBlockKernel<application::TransportType::PROXY>(
+    const void* d, const void* s, size_t b, int pe, int q) { assert(false); }
+template <> inline __device__ void ShmemPutSizeImmNbiThreadKernel<application::TransportType::PROXY>(
+    const void* d, void* v, size_t b, int pe, int q) { assert(false); }
+template <> inline __device__ void ShmemPutSizeImmNbiWarpKernel<application::TransportType::PROXY>(
+    const void* d, void* v, size_t b, int pe, int q) { assert(false); }
+template <> inline __device__ void ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::PROXY>(
+    const void* d, void* v, size_t b, core::atomicType a, int pe, int q) { assert(false); }
+template <> inline __device__ void ShmemAtomicSizeNonFetchWarpKernel<application::TransportType::PROXY>(
+    const void* d, void* v, size_t b, core::atomicType a, int pe, int q) { assert(false); }
+template <> inline __device__ void ShmemGetMemNbiThreadKernel<application::TransportType::PROXY>(
+    void* d, const void* s, size_t b, int pe, int q) { assert(false); }
+template <> inline __device__ void ShmemGetMemNbiWarpKernel<application::TransportType::PROXY>(
+    void* d, const void* s, size_t b, int pe, int q) { assert(false); }
+template <> inline __device__ void ShmemGetMemNbiBlockKernel<application::TransportType::PROXY>(
+    void* d, const void* s, size_t b, int pe, int q) { assert(false); }
+
+// Signal address-based stubs
+template <> inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportType::PROXY, true>(
+    const void* d, const void* s, size_t b, const void* sd, uint64_t sv,
+    core::atomicType so, int pe, int q) { assert(false); }
+template <> inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportType::PROXY, false>(
+    const void* d, const void* s, size_t b, const void* sd, uint64_t sv,
+    core::atomicType so, int pe, int q) { assert(false); }
+template <> inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType::PROXY, true>(
+    const void* d, const void* s, size_t b, const void* sd, uint64_t sv,
+    core::atomicType so, int pe, int q) { assert(false); }
+template <> inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType::PROXY, false>(
+    const void* d, const void* s, size_t b, const void* sd, uint64_t sv,
+    core::atomicType so, int pe, int q) { assert(false); }
+template <> inline __device__ void ShmemPutMemNbiSignalBlockKernel<application::TransportType::PROXY, true>(
+    const void* d, const void* s, size_t b, const void* sd, uint64_t sv,
+    core::atomicType so, int pe, int q) { assert(false); }
+template <> inline __device__ void ShmemPutMemNbiSignalBlockKernel<application::TransportType::PROXY, false>(
+    const void* d, const void* s, size_t b, const void* sd, uint64_t sv,
+    core::atomicType so, int pe, int q) { assert(false); }
+
+// AtomicFetch address-based stubs
+#define DEFINE_PROXY_ATOMIC_FETCH_ADDR_STUB(Scope, T)                                          \
+  template <> inline __device__ T                                                              \
+  ShmemAtomicTypeFetch##Scope##Kernel<application::TransportType::PROXY, T>(                   \
+      const void* d, void* v, void* c, size_t b, core::atomicType a, int pe, int q) {          \
+    assert(false); return T{}; }
+
+DEFINE_PROXY_ATOMIC_FETCH_ADDR_STUB(Thread, uint32_t)
+DEFINE_PROXY_ATOMIC_FETCH_ADDR_STUB(Thread, uint64_t)
+DEFINE_PROXY_ATOMIC_FETCH_ADDR_STUB(Thread, int32_t)
+DEFINE_PROXY_ATOMIC_FETCH_ADDR_STUB(Thread, int64_t)
+DEFINE_PROXY_ATOMIC_FETCH_ADDR_STUB(Warp, uint32_t)
+DEFINE_PROXY_ATOMIC_FETCH_ADDR_STUB(Warp, uint64_t)
+DEFINE_PROXY_ATOMIC_FETCH_ADDR_STUB(Warp, int32_t)
+DEFINE_PROXY_ATOMIC_FETCH_ADDR_STUB(Warp, int64_t)
+#undef DEFINE_PROXY_ATOMIC_FETCH_ADDR_STUB
+
+}  // namespace shmem
+}  // namespace mori
+
+#endif  // __HIPCC__ && MORI_PROXY_ENABLED
