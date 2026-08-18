@@ -302,7 +302,6 @@ if(BUILD_SHMEM)
   add_subdirectory(src/shmem)
 endif()
 
-
 if(BUILD_CCO)
   add_subdirectory(src/cco)
 endif()
