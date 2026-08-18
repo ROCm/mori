@@ -58,9 +58,8 @@ one client and GET from another (see `test_umbp_tier_benchmark`).
 
 **RDMA QP depth.** `mori_io` defaults `max_send_wr=8192`. On some mlx5 devices
 that depth times SGE/inline exceeds the per-QP work-queue budget, so
-`ibv_create_qp` returns EINVAL even though `max_qp_wr` is larger. The runtime
-retries with a halved send depth down to 256 and logs the chosen value. To pin
-a depth:
+`ibv_create_qp` returns EINVAL even though `max_qp_wr` is larger. Set a smaller
+depth before running multi-client benchmarks or integration tests:
 
 ```bash
 export MORI_IO_QP_MAX_SEND_WR=1024

@@ -237,7 +237,10 @@ add_test(NAME umbp_medium_selection COMMAND test_umbp_medium_selection)
 set_tests_properties(umbp_cross_node_smoke umbp_pool_client_batch_put
                      umbp_medium_selection umbp_tier_benchmark
                      umbp_client_metrics_pool_bytes umbp_tags_real_master
-                     PROPERTIES LABELS "integration")
+                     PROPERTIES
+                       LABELS "integration"
+                       ENVIRONMENT
+                         "MORI_IO_QP_MAX_SEND_WR=1024;MORI_IO_QP_MAX_CQE=4096")
 
 # --------------------------------------------------------------------------
 # Benchmarks (manual; built but NOT registered with add_test).

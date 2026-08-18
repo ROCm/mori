@@ -542,32 +542,11 @@ application::RdmaEndpoint RdmaManager::CreateEndpoint(int devId) {
   std::unique_lock<std::shared_mutex> lock(mu);
 
   application::RdmaDeviceContext* devCtx = GetOrCreateDeviceContext(devId);
-  application::RdmaEndpointConfig epConfig = GetRdmaEndpointConfig(devId);
-  const uint32_t requested_send_wr = epConfig.maxMsgsNum;
-  constexpr uint32_t kMinSendWr = 256;
-  for (;;) {
-    try {
-      application::RdmaEndpoint rdmaEp = devCtx->CreateRdmaEndpoint(epConfig);
-      if (epConfig.maxMsgsNum != requested_send_wr) {
-        MORI_IO_WARN(
-            "ibv_create_qp could not honor max_send_wr={}; using {}. Device max_qp_wr is not "
-            "the limiting field — the WQE footprint (sge + inline) exceeded the per-QP budget. "
-            "Set MORI_IO_QP_MAX_SEND_WR to pin a depth.",
-            requested_send_wr, epConfig.maxMsgsNum);
-      }
-      if (config.pollCqMode == PollCqMode::EVENT)
-        SYSCALL_RETURN_ZERO(ibv_req_notify_cq(rdmaEp.ibvHandle.cq, 0));
-      return rdmaEp;
-    } catch (const std::exception& error) {
-      const char* what = error.what();
-      const bool qp_create_failed = std::strstr(what, "ibv_create_qp") != nullptr;
-      if (!qp_create_failed || epConfig.maxMsgsNum <= kMinSendWr) throw;
-      const uint32_t next = std::max(kMinSendWr, epConfig.maxMsgsNum / 2);
-      MORI_IO_WARN("ibv_create_qp failed for max_send_wr={}: {}; retrying with {}",
-                   epConfig.maxMsgsNum, what, next);
-      epConfig.maxMsgsNum = next;
-    }
-  }
+
+  application::RdmaEndpoint rdmaEp = devCtx->CreateRdmaEndpoint(GetRdmaEndpointConfig(devId));
+  if (config.pollCqMode == PollCqMode::EVENT)
+    SYSCALL_RETURN_ZERO(ibv_req_notify_cq(rdmaEp.ibvHandle.cq, 0));
+  return rdmaEp;
 }
 
 bool RdmaManager::DestroyEndpointNoThrow(int devId, const application::RdmaEndpoint& ep) noexcept {
