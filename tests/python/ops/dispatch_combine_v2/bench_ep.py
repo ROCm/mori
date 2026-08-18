@@ -28,7 +28,6 @@ comparable: cuda events around ITERS launches, warmup in lock-step.
     HIDDEN=7168 TOPK=8 EPR=32 SWEEP=128,512,4096 ITERS=50 torchrun ... bench_ep_cpp.py
 """
 
-import ctypes
 import os
 
 import torch
@@ -63,7 +62,6 @@ def main():
     dist.init_process_group("gloo")
     rank, world = dist.get_rank(), dist.get_world_size()
     torch.cuda.set_device(rank)
-    ctypes.CDLL("libamdhip64.so").hipSetDevice(ctypes.c_int(rank))
     dev = torch.device("cuda", rank)
 
     obj = [cco.Communicator.get_unique_id() if rank == 0 else None]

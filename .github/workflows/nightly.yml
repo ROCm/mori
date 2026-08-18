@@ -24,10 +24,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # py3.10 stays on 7.2.4: ROCm 7.14 ships no py3.10/ubuntu22.04 image.
+          # Dockerfile.dev skips its apt ROCm 7.14 install when the base already
+          # has a dev stack, so both lanes build from the same file.
           - python: "3.10"
             base_image: rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.8.0
           - python: "3.12"
-            base_image: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0
+            base_image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -153,10 +156,11 @@ jobs:
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
+
           - platform: MI355X_AINIC
             python: "3.12"
             runner: [self-hosted, MI355X-AINIC-TW]
-            base_image: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0
+            base_image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
@@ -381,7 +385,7 @@ jobs:
           - platform: MI355X_AINIC
             python: "3.12"
             runner: [self-hosted, MI355X-AINIC]
-            base_image: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0
+            base_image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
             node1_host: 10.2.80.22
             node2_host: 10.2.80.20
             node2_port: 22
@@ -771,7 +775,7 @@ jobs:
           - python: "3.10"
             base_image: rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.8.0
           - python: "3.12"
-            base_image: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0
+            base_image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
     env:
       IMAGE: rocm/mori:ci-py${{ matrix.python }}
     steps:

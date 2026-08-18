@@ -632,6 +632,22 @@ class EpDispatchCombineOp:
                 f"invalid MORI_EP_LAUNCH_CONFIG_MODE, must be ['MANUAL', 'AUTO'], got '{self.launch_config_mode}'"
             )
 
+        # Buffers are zeroed as they are allocated, and peers do not wait for that: once
+        # a peer reaches dispatch, its kernel writes straight into our buffers. A rank a
+        # few milliseconds behind then zeroes a buffer a peer already wrote to:
+        #
+        #   rank 0  [barrier] alloc+zero, dispatch kernel --+
+        #                                                   |  writes rank 1's
+        #                                                   v  recvTokenNum, payload
+        #   rank 1  [barrier] alloc+zero . . . . . . . . . -X  zeroed here, write lost
+        #
+        # A lost recvTokenNum hangs rank 1, and everyone waiting on it. The barrier at
+        # the top of __init__ runs before the allocation, so it only makes ranks start
+        # together; the sync finishes our zeroing, the barrier makes peers wait for it.
+        if dist.is_initialized():
+            torch.cuda.synchronize()
+            dist.barrier()
+
     # ------------------------------------------------------------------
     # Kernel launch helpers
     # ------------------------------------------------------------------

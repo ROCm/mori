@@ -30,7 +30,6 @@ slot) and it is the property the backend switch actually promises.
     torchrun --standalone --nproc_per_node=8 test_ep_backend_parity.py
 """
 
-import ctypes
 import os
 import sys
 
@@ -86,7 +85,6 @@ def main():
     dist.init_process_group("gloo")
     rank, world = dist.get_rank(), dist.get_world_size()
     torch.cuda.set_device(rank)
-    ctypes.CDLL("libamdhip64.so").hipSetDevice(ctypes.c_int(rank))
     dev = torch.device("cuda", rank)
 
     obj = [cco.Communicator.get_unique_id() if rank == 0 else None]

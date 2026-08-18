@@ -32,6 +32,6 @@ target_link_libraries(mori_cco PUBLIC mori_logging hip::host)
 
 set_target_properties(
   mori_cco
-  PROPERTIES BUILD_RPATH "$ORIGIN"
-             INSTALL_RPATH "$ORIGIN"
+  PROPERTIES BUILD_RPATH "$ORIGIN;${ROCM_PATH}/lib"
+             INSTALL_RPATH "$ORIGIN;${ROCM_PATH}/lib"
              BUILD_WITH_INSTALL_RPATH TRUE)

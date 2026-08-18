@@ -40,7 +40,10 @@ import tempfile
 import torch
 import torch.distributed as dist
 
-_hip = ctypes.CDLL("libamdhip64.so")
+# From the runtime the torch import already loaded, not a dlopen by name: the
+# ROCm 7.14 image serves HIP out of the rocm-sdk-core wheel, which is off the
+# loader path, and the only libamdhip64 in the ld cache is a stale ROCm 5 one.
+_hip = ctypes.CDLL(None)
 
 
 def _check(err, msg=""):
