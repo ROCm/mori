@@ -175,6 +175,12 @@ struct ResolvedEntry {
   // Empty when the caller passed include_descs=false (it already hydrated them
   // from GetPeerInfo), or when found=false.
   std::vector<BufferMemoryDescBytes> descs;
+
+  // Set instead of `pages` when the backend serves this key by a zero-copy file
+  // range (SsdBackend + GdsEngine): a File TransferRef the reader DMAs straight
+  // into device memory, with `pages` left empty.  A memory-backed medium leaves
+  // this invalid and publishes pages as before.
+  TransferRef file_ref{};
 };
 
 inline ResolveOutcome EffectiveResolveOutcome(const ResolvedEntry& entry) {
