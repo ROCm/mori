@@ -129,12 +129,12 @@ class PoolClient {
 
   MasterClient& Master();
 
-  // The storage medium live on this node (exactly one — see PoolClient::Init).
-  // Callers reach it by tier (Backends().Get(Medium())) and use it through
+  // Every named storage backend live on this node.  Callers use them through
   // MediumBackend — no concrete backend type is named outside PoolClient::Init.
   BackendRegistry& Backends();
 
-  // Which medium this node serves.  Valid after Init.
+  // Legacy default medium: the first configured backend's tier.  Valid after
+  // Init and retained for callers that have not adopted named instances.
   TierType Medium() const { return medium_; }
 
   bool IsInitialized() const;

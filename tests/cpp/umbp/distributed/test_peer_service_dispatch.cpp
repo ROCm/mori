@@ -23,10 +23,10 @@
 // PeerServiceServer tier dispatch (backend-agnostic refactor Phase 3).
 //
 // The peer service used to hold one typed PageBackend* and serve every RPC from
-// it.  It now holds a BackendRegistry* and dispatches on the request's tier
-// tag.  These tests drive the real gRPC surface with two MockBackends
-// registered, so they assert the wire-visible contract rather than the
-// handlers' internals:
+// it.  It now holds a PeerPool*, which owns logical placement and dispatches to
+// the backend the policy picked.  These tests drive the real gRPC surface with
+// two MockBackends registered, so they assert the wire-visible contract rather
+// than the handlers' internals:
 //
 //   * a request routes to the backend registered for its tier, and a tier with
 //     no backend fails cleanly instead of hitting whichever one happens to be
@@ -57,9 +57,10 @@
 namespace mori::umbp {
 namespace {
 
-// Every medium is equivalent (Phase 4), so the registry walks them in ascending
-// TierType order — HBM(1) before DRAM(2).  The Resolve test depends only on
-// that order being deterministic, not on it meaning "faster".
+// Every medium is equivalent (Phase 4), so the registry walks them in dense
+// backend-id order, i.e. the order SetUp registers them — HBM before DRAM here.
+// The Resolve test depends only on that order being deterministic, not on it
+// meaning "faster".
 constexpr TierType kFirstByTier = TierType::HBM;
 constexpr TierType kSecondByTier = TierType::DRAM;
 
