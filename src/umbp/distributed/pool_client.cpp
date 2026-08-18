@@ -55,6 +55,9 @@
 #include "umbp/distributed/transfer/hbm_copy_engine.h"
 #include "umbp/distributed/transfer/local_copy_engine.h"
 #include "umbp/distributed/transfer/mori_io_engine.h"
+#ifdef UMBP_ENABLE_GDS
+#include "umbp/distributed/transfer/gds_engine.h"
+#endif
 #include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {
@@ -325,6 +328,12 @@ bool PoolClient::Init() {
   // call: everything that moves bytes still goes through transfer_engine_.
   hbm_engine_ = hbm.get();
   composite->AddEngine(std::move(hbm));
+#ifdef UMBP_ENABLE_GDS
+  // The file->GPU engine for SsdBackend's FileRefs.  It claims only (file,
+  // device) pairs, which no memory engine touches, so registration order is
+  // documentation.  Present only when the build found hipfile.
+  composite->AddEngine(std::make_unique<GdsEngine>());
+#endif
   if (!config_.io_engine.host.empty()) {
     mori::io::IOEngineConfig io_cfg;
     io_cfg.host = config_.io_engine.host;
