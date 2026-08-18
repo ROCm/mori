@@ -1437,8 +1437,17 @@ PoolClient::GetAttemptOutcome PoolClient::ExecuteLocalGet(const std::string& key
       return GetAttemptOutcome::kRetry;
     }
     std::vector<TransferItem> items;
-    if (!BuildLocalPageTransfers(backend, resolved.pages, resolved.page_size, dst, size,
-                                 /*to_backend=*/false, &items)) {
+    if (resolved.file_ref.IsFile()) {
+      // Zero-copy GDS path: the backend published a file range, not a staged
+      // host page.  Read it straight into the caller's (device) buffer; the
+      // planner routes the (file, GPU) pair to GdsEngine.
+      TransferItem item;
+      item.src = resolved.file_ref;
+      item.dst = ClassifiedUserBytes(dst, size);
+      item.size = size;
+      items.push_back(std::move(item));
+    } else if (!BuildLocalPageTransfers(backend, resolved.pages, resolved.page_size, dst, size,
+                                        /*to_backend=*/false, &items)) {
       // This medium holds the key but cannot be read in-process (no published
       // endpoint for its buffers).  Route elsewhere rather than reporting a
       // miss, which would make the client exclude a node that does hold it.
