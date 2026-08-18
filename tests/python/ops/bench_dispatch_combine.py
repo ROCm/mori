@@ -623,6 +623,9 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         call_local_expert_count=False,
     ):
         """Warmup, then capture capture_iters dispatch+combine iters and export per-warp Perfetto traces."""
+        capture_iters = int(os.environ.get("MORI_PROFILE_CAPTURE_ITERS", capture_iters))
+        if capture_iters <= 0:
+            raise ValueError("MORI_PROFILE_CAPTURE_ITERS must be greater than zero")
         if not hasattr(op, "get_debug_time_buf"):
             raise RuntimeError(
                 "To use --cmd profile, re-compile Mori with ENABLE_PROFILER=ON"
@@ -642,23 +645,31 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 call_local_expert_count=call_local_expert_count,
             )
 
-        # Clear the trace buffer, then run capture_iters profiled iterations
+        # Capture split graphs before clearing the trace. Replay them without
+        # per-iteration synchronization so profile mode applies the same
+        # back-to-back queue pressure as benchmark graph replay.
+        dispatch_graph, combine_graph = self._capture_split_graphs(
+            op,
+            test_data,
+            dispatch_block_num,
+            dispatch_warp_per_block,
+            combine_block_num,
+            combine_warp_per_block,
+            call_local_expert_count=call_local_expert_count,
+        )
+
+        # Clear the trace buffer, then run capture_iters profiled iterations.
         trace_buf = op.get_debug_time_buf()
         trace_buf.zero_()
         if hasattr(mori.cpp, "get_debug_time_offset"):
             op.get_debug_time_offset().zero_()
 
+        dist.barrier()
         for _ in range(capture_iters):
-            self.run_once_test(
-                op,
-                test_data,
-                dispatch_block_num,
-                dispatch_warp_per_block,
-                combine_block_num,
-                combine_warp_per_block,
-                check=False,
-                call_local_expert_count=call_local_expert_count,
-            )
+            dispatch_graph.replay()
+            combine_graph.replay()
+        torch.cuda.synchronize()
+        dist.barrier()
 
         import time
 
