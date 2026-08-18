@@ -39,6 +39,7 @@
 #include "mori/io/engine.hpp"
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/master/master_client.h"
+#include "umbp/distributed/metrics/component_metrics.h"
 #include "umbp/distributed/peer/backend/medium_backend.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
 #include "umbp/distributed/types.h"
@@ -214,15 +215,21 @@ class PoolClient {
   PoolClientConfig config_;
   std::atomic<bool> initialized_{false};
 
-  // Sample every registered backend's MediumBackend::Counters() and ship the
-  // delta since the last tick.  Registered as a MasterClient metrics provider,
-  // so it runs on the metrics thread, not on any data-plane path.
-  void PublishBackendCounters();
+  // Sample every instrumented component on this node — each registered storage
+  // backend, plus the transfer engine — and ship the result.  Registered as a
+  // MasterClient metrics provider, so it runs on the metrics thread and never
+  // on a data-plane path.
+  //
+  // There is no per-component code here and no place to add any: a component is
+  // a MetricSource, the labels that identify it come from its own Tier()/Name(),
+  // and MetricPublisher does the differencing.  That is what makes a new backend
+  // or a new transfer engine visible in Grafana without touching this file.
+  void PublishComponentMetrics();
 
-  // Last value shipped, per (backend name, metric name, label set).  Keyed by a
-  // flattened string because the identity is exactly those three things and the
-  // map is touched once per tick — the counters themselves live in the backends.
-  std::unordered_map<std::string, uint64_t> backend_counter_last_;
+  // Holds the delta baselines for every component published above, keyed by
+  // (component, metric, labels).  Touched once per tick; the counters
+  // themselves live in the components.
+  MetricPublisher metric_publisher_;
 
   std::unique_ptr<MasterClient> master_client_;
 

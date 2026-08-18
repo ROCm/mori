@@ -871,8 +871,8 @@ void MasterClient::MetricsLoop() {
   // Final flush: ship the last sub-interval of provider deltas before the
   // thread exits.  PoolClient::Shutdown calls StopMetricsReporting() BEFORE
   // UnregisterSelf, so the master is still reachable here; without this final
-  // flush the last (<metrics_interval_ms_) of SSD counter deltas would be
-  // dropped at shutdown.
+  // flush the last (<metrics_interval_ms_) of every component's counter deltas
+  // would be dropped at shutdown.
   FlushMetricsOnce();
 }
 

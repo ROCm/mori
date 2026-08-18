@@ -536,6 +536,96 @@ TEST_F(PoolClientLocalByteTrackingTest, LocalPutGetBytesCounted) {
       << "Unexpected remote batch-get bandwidth series in single-node setup";
 }
 
+// End-to-end proof that the refactored data plane is still wired to Prometheus:
+// a Put and a Get on the live path must show up as the GENERIC backend and
+// transfer series, carrying the medium and the engine as labels.
+//
+// This is the test that fails if someone unwires the instrumentation decorator
+// in PoolClient::Init, or reintroduces medium-specific metric names — either of
+// which leaves the dashboard rendering an empty panel while the system runs
+// perfectly, which is exactly how the SSD panels ended up dead.
+TEST_F(PoolClientLocalByteTrackingTest, BackendAndTransferSeriesReachPrometheus) {
+  ASSERT_TRUE(client_->Put("generic-metrics-key", src_, kLocalPageSize));
+  ASSERT_TRUE(client_->Get("generic-metrics-key", dst_, kLocalPageSize));
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+
+  const std::string body = FetchPrometheusMetrics(metrics_port_);
+  ASSERT_FALSE(body.empty()) << "Could not fetch Prometheus metrics from port " << metrics_port_;
+
+  // ParseMetricValue matches ONE substring, and label order in the rendered
+  // line follows insertion order (node, tags, source labels, sample labels), so
+  // match every label independently rather than betting on that order.
+  auto value_with = [&body](const std::string& name,
+                            const std::vector<std::string>& label_substrs) -> double {
+    size_t pos = 0;
+    while (pos < body.size()) {
+      const size_t nl = body.find('\n', pos);
+      const std::string line =
+          body.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+      pos = (nl == std::string::npos) ? body.size() : nl + 1;
+      if (line.empty() || line.front() == '#') continue;
+      if (line.rfind(name, 0) != 0) continue;  // metric name starts the line
+      bool all = true;
+      for (const auto& sub : label_substrs) {
+        if (line.find(sub) == std::string::npos) {
+          all = false;
+          break;
+        }
+      }
+      if (!all) continue;
+      const size_t sp = line.rfind(' ');
+      if (sp == std::string::npos) continue;
+      try {
+        return std::stod(line.substr(sp + 1));
+      } catch (...) {
+      }
+    }
+    return -1.0;
+  };
+
+  // The medium is a LABEL on a shared metric name.  DRAM is what this fixture
+  // configures; no assertion here knows anything else about it, which is the
+  // property that lets a new backend reuse these series and these panels.
+  const std::vector<std::string> dram = {"tier=\"DRAM\"", "backend=\"PageBackend\""};
+
+  auto with = [&dram](std::vector<std::string> extra) {
+    std::vector<std::string> out = dram;
+    out.insert(out.end(), extra.begin(), extra.end());
+    return out;
+  };
+
+  EXPECT_GE(value_with("mori_umbp_backend_ops_total", with({"op=\"allocate\"", "status=\"ok\""})),
+            1.0)
+      << "no allocate recorded for the live medium";
+  EXPECT_GE(value_with("mori_umbp_backend_ops_total", with({"op=\"commit\"", "status=\"ok\""})),
+            1.0);
+  EXPECT_GE(value_with("mori_umbp_backend_ops_total", with({"op=\"resolve\"", "status=\"ok\""})),
+            1.0);
+  EXPECT_GE(value_with("mori_umbp_backend_bytes_total", with({"op=\"commit\""})),
+            static_cast<double>(kLocalPageSize));
+  EXPECT_GE(value_with("mori_umbp_backend_bytes_total", with({"op=\"resolve\""})),
+            static_cast<double>(kLocalPageSize));
+  EXPECT_GE(value_with("mori_umbp_backend_batches_total", with({"op=\"commit\""})), 1.0);
+  EXPECT_GT(value_with("mori_umbp_backend_op_seconds_total", with({"op=\"commit\""})), 0.0);
+
+  // The transfer layer, charged to whichever engine carried the plans.  Both
+  // endpoints are on this node, so the local engine took them.
+  EXPECT_GE(value_with("mori_umbp_transfer_bytes_total",
+                       {"engine=\"LocalCopyEngine\"", "direction=\"local\""}),
+            static_cast<double>(kLocalPageSize));
+  EXPECT_GE(value_with("mori_umbp_transfer_ops_total",
+                       {"engine=\"LocalCopyEngine\"", "direction=\"local\"", "status=\"ok\""}),
+            1.0);
+
+  // Nothing may be published under a name that spells the medium: such a metric
+  // needs its own panel, and one panel per medium is the arrangement the single
+  // dashboard replaced.
+  EXPECT_EQ(body.find("mori_umbp_dram_"), std::string::npos);
+  EXPECT_EQ(body.find("mori_umbp_ssd_"), std::string::npos);
+  EXPECT_EQ(body.find("mori_umbp_hbm_"), std::string::npos);
+}
+
 // Verifies that the four per-(node,tier) capacity gauges (total / available /
 // used / utilization_ratio) reach Prometheus via the heartbeat path, and that
 // available/used/utilization react to an allocation.

@@ -21,6 +21,8 @@
 // SOFTWARE.
 #pragma once
 
+#include <atomic>
+#include <cstddef>
 #include <memory>
 #include <vector>
 
@@ -49,6 +51,12 @@ namespace mori::umbp {
 // layer composes two hops through a bounce buffer (§4's "3FS file on node A,
 // reader on node B").  It cannot arise while every endpoint is memory; it
 // arrives with the first non-memory endpoint, which is SsdBackend's FileRef.
+// It is also the transfer layer's OBSERVABILITY point, for the same reason it
+// is the dispatch point: it is the one place that knows which engine carried
+// which plan.  Bytes, plan counts, failures and in-flight time are measured
+// here and published under engine= / direction= labels, so an engine added
+// with AddEngine() shows up in the existing dashboard panels without writing
+// or wiring a single metric (see component_metrics.h).
 class CompositeTransferEngine final : public TransferEngine {
  public:
   // Order is preference order.  Null is ignored.
@@ -75,10 +83,47 @@ class CompositeTransferEngine final : public TransferEngine {
   // a whole item list.
   TransferEngine* SelectEngine(const TransferRef& src, const TransferRef& dst) const;
 
+  // The generic per-engine series measured above, followed by whatever each
+  // sub-engine publishes about its own internals (engine= already stamped on
+  // both).  One source for the whole transfer layer, so PoolClient publishes it
+  // with the same call it uses for a backend.
+  std::vector<MetricSample> SampleMetrics() const override;
+
  private:
   class FanOutHandle;
 
+  // Per (engine, direction) accumulators.  Indexed by the engine's position in
+  // engines_, which is fixed after composition, so the hot path is an array
+  // index and never a lookup.  Relaxed atomics: read once per metrics tick,
+  // never correctness state.
+  struct DirectionCounters {
+    std::atomic<uint64_t> plans{0};
+    std::atomic<uint64_t> failed_plans{0};
+    std::atomic<uint64_t> bytes{0};
+    std::atomic<uint64_t> nanos{0};
+  };
+  // kPush / kPull / kLocal, indexed by TransferDirection.
+  static constexpr size_t kDirectionCount = 3;
+  struct EngineCounters {
+    DirectionCounters by_direction[kDirectionCount];
+  };
+
+  static size_t DirectionIndex(TransferDirection dir) { return static_cast<size_t>(dir); }
+  // Position of `engine` in engines_, or engines_.size() when it is not ours.
+  size_t IndexOf(const TransferEngine* engine) const;
+  // Charge a settled plan back to the engine that carried it.  Called from
+  // FanOutHandle::Wait, which is why the counters outlive any single submit.
+  void RecordSettled(size_t engine_index, TransferDirection dir, uint64_t bytes, uint64_t nanos,
+                     uint64_t failed_plans);
+
   std::vector<std::unique_ptr<TransferEngine>> engines_;
+  // One per engine, in engines_ order.  Held by unique_ptr because the atomics
+  // inside are neither copyable nor movable and engines_ grows during
+  // composition.
+  std::vector<std::unique_ptr<EngineCounters>> counters_;
+  // Items Plan() could not route to any engine.  Not charged to an engine —
+  // there was none — so it rides engine="none", status="rejected".
+  mutable std::atomic<uint64_t> rejected_items_{0};
 };
 
 }  // namespace mori::umbp

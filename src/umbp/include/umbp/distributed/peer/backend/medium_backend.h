@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/distributed/metrics/component_metrics.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
 #include "umbp/distributed/types.h"
 
@@ -169,19 +170,7 @@ struct EvictResult {
   uint64_t bytes_freed = 0;
 };
 
-// One medium-specific Prometheus counter, sampled per metrics tick (see
-// MediumBackend::Counters).  `name`/`help` are the Prometheus metric identity
-// and must be string literals with static storage duration — the same counter
-// reported under different label sets shares both.  `value` is MONOTONIC; the
-// caller ships the delta since the previous tick.
-struct MediumCounter {
-  const char* name = nullptr;
-  const char* help = nullptr;
-  std::vector<std::pair<std::string, std::string>> labels;
-  uint64_t value = 0;
-};
-
-class MediumBackend {
+class MediumBackend : public MetricSource {
  public:
   virtual ~MediumBackend() = default;
 
@@ -255,18 +244,20 @@ class MediumBackend {
 
   // ---- observability ----
   //
-  // Monotonic, medium-specific counters, sampled once per MasterClient metrics
-  // tick and shipped as deltas.  On the interface (rather than on the concrete
-  // backend) for the same reason SetAutoFlushHook is: PoolClient must be able to
-  // publish a backend's counters without knowing which backend it is — the
-  // alternative is a `dynamic_cast<SsdBackend*>` in the metrics path, which is
-  // exactly the type-switching this refactor removed.
+  // A backend does NOT report its own operation counts, byte volumes or
+  // latencies.  InstrumentedBackend sits on this interface and derives all of
+  // those from the calls below, which is why a new medium is fully observable
+  // the moment PoolClient composes it in — see instrumented_backend.h.
   //
-  // Defaulted to empty so a backend with nothing medium-specific to report (and
-  // every test double) needs no code.  Values must be monotonic: the caller
-  // ships `current - last` and a decrease is read as no delta.  Never called
-  // under any backend lock — treat it as a plain read of relaxed atomics.
-  virtual std::vector<MediumCounter> Counters() const { return {}; }
+  // MetricSource::SampleMetrics(), inherited here, is for the one thing a
+  // decorator cannot see: state INSIDE the medium (the drive's own read
+  // outcomes, single-flight coalescing, a staging arena's occupancy).  Publish
+  // those under the generic MORI_UMBP_METRIC_BACKEND_MEDIUM_* names with the
+  // specifics in an event=/state= label, never under a name that spells the
+  // medium — a metric called mori_umbp_ssd_something forces a second dashboard,
+  // which is exactly what the single-dashboard layout removed.
+  //
+  // tier= and backend= are added by the publisher; do not set them here.
 
   // ---- slot lifecycle (peer-side; driven by PeerServiceServer handlers) ----
   //

@@ -49,9 +49,13 @@
 #include <unistd.h>
 
 #include <cctype>
+#include <cmath>
 #include <cstring>
+#include <iomanip>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 
 #include "mori/utils/mori_log.hpp"
 
@@ -137,7 +141,7 @@ void MetricsServer::setGauge(std::string_view name, std::string_view help, doubl
   entry.value = value;
 }
 
-void MetricsServer::addCounter(std::string_view name, std::string_view help, uint64_t delta) {
+void MetricsServer::addCounter(std::string_view name, std::string_view help, double delta) {
   std::lock_guard<std::mutex> lk(mutex_);
   auto& entry = counters_[std::string(name)];
   entry.help = help;
@@ -256,8 +260,28 @@ static std::string FormatLabels(const mori::metrics::MetricsServer::Labels& labe
   return s;
 }
 
+namespace {
+
+// Render a metric value for the exposition format.
+//
+// `ostream <<` on a double defaults to six significant digits, which turns a
+// byte total into 8.58993e+09 and throws away everything past the seventh
+// digit.  Counters and gauges here carry exact byte counts and key counts, so
+// an integral value is printed as an integer and only a genuinely fractional
+// one (a *_seconds_total) falls back to full round-trip precision.
+std::string FormatValue(double v) {
+  if (std::isfinite(v) && v == std::floor(v) && std::fabs(v) < 1e18) {
+    return std::to_string(static_cast<long long>(v));
+  }
+  std::ostringstream ss;
+  ss << std::setprecision(std::numeric_limits<double>::max_digits10) << v;
+  return ss.str();
+}
+
+}  // namespace
+
 void MetricsServer::addCounter(std::string_view name, std::string_view help, const Labels& labels,
-                               uint64_t delta) {
+                               double delta) {
   auto label_str = FormatLabels(labels);
   std::lock_guard<std::mutex> lk(mutex_);
   auto& family = labeled_counters_[std::string(name)];
@@ -291,14 +315,14 @@ std::string MetricsServer::SerializeMaps(
   for (const auto& [name, g] : gauges) {
     out << "# HELP " << name << " " << g.help << "\n";
     out << "# TYPE " << name << " gauge\n";
-    out << name << " " << g.value << "\n\n";
+    out << name << " " << FormatValue(g.value) << "\n\n";
   }
 
   // Counters
   for (const auto& [name, c] : counters) {
     out << "# HELP " << name << " " << c.help << "\n";
     out << "# TYPE " << name << " counter\n";
-    out << name << " " << c.value << "\n\n";
+    out << name << " " << FormatValue(c.value) << "\n\n";
   }
 
   // Labeled gauges
@@ -306,7 +330,7 @@ std::string MetricsServer::SerializeMaps(
     out << "# HELP " << name << " " << family.help << "\n";
     out << "# TYPE " << name << " gauge\n";
     for (const auto& [label_str, value] : family.series) {
-      out << name << label_str << " " << value << "\n";
+      out << name << label_str << " " << FormatValue(value) << "\n";
     }
     out << "\n";
   }
@@ -316,7 +340,7 @@ std::string MetricsServer::SerializeMaps(
     out << "# HELP " << name << " " << family.help << "\n";
     out << "# TYPE " << name << " counter\n";
     for (const auto& [label_str, value] : family.series) {
-      out << name << label_str << " " << value << "\n";
+      out << name << label_str << " " << FormatValue(value) << "\n";
     }
     out << "\n";
   }
@@ -332,7 +356,7 @@ std::string MetricsServer::SerializeMaps(
     }
     // +Inf bucket == total observation count.
     out << name << "_bucket{le=\"+Inf\"} " << h.count << "\n";
-    out << name << "_sum " << h.sum << "\n";
+    out << name << "_sum " << FormatValue(h.sum) << "\n";
     out << name << "_count " << h.count << "\n\n";
   }
 
@@ -349,7 +373,7 @@ std::string MetricsServer::SerializeMaps(
             << h.bucket_counts[i] << "\n";
       }
       out << name << "_bucket" << bucket_prefix << "le=\"+Inf\"} " << h.count << "\n";
-      out << name << "_sum" << label_str << " " << h.sum << "\n";
+      out << name << "_sum" << label_str << " " << FormatValue(h.sum) << "\n";
       out << name << "_count" << label_str << " " << h.count << "\n";
     }
     out << "\n";

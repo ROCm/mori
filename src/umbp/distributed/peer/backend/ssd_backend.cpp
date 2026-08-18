@@ -150,12 +150,16 @@ uint32_t SsdBackend::AcquireStagingPageLocked() {
   if (free_pages_.empty()) return kNoPage;
   const uint32_t page = free_pages_.back();
   free_pages_.pop_back();
+  // Mirrored for the metrics tick, which must not take mutex_ (see the member's
+  // declaration).  Correctness still lives entirely in free_pages_.
+  staging_pages_in_use_.fetch_add(1, std::memory_order_relaxed);
   return page;
 }
 
 void SsdBackend::ReleaseStagingPageLocked(uint32_t page_index) {
   if (page_index == kNoPage) return;
   free_pages_.push_back(page_index);
+  staging_pages_in_use_.fetch_sub(1, std::memory_order_relaxed);
 }
 
 void* SsdBackend::StagingPagePtr(uint32_t page_index) const {
@@ -572,52 +576,77 @@ std::unique_ptr<MediumBackend> MakeSsdBackend(SsdBackend::Config cfg) {
   return std::make_unique<SsdBackend>(std::move(cfg));
 }
 
-std::vector<MediumCounter> SsdBackend::Counters() const {
-  // Every value here is a monotonic snapshot; PoolClient ships the delta since
-  // its last tick.  Read outcomes and single-flight accounting share one metric
-  // name and separate by label, so a dashboard can sum reads or split them
-  // without knowing which statuses exist.
-  std::vector<MediumCounter> out;
+std::vector<MetricSample> SsdBackend::SampleMetrics() const {
+  // Everything a caller can see from OUTSIDE this class — resolve hits and
+  // misses, bytes handed out, eviction volume, per-call latency — is already
+  // measured by InstrumentedBackend against the MediumBackend interface, and is
+  // NOT repeated here.  What is left is exactly what the interface hides: what
+  // the drive itself did, and how full the staging arena is.
+  //
+  // These go out under the generic MORI_UMBP_METRIC_BACKEND_MEDIUM_* names with
+  // the specifics in an event= / state= label, which is what lets one dashboard
+  // panel render this medium beside every other one.  tier= and backend= are
+  // added by the publisher.
+  std::vector<MetricSample> out;
   if (ssd_ == nullptr) return out;
 
-  auto read = [&](const char* status, uint64_t v) {
-    out.push_back(MediumCounter{MORI_UMBP_METRIC_SSD_READ_TOTAL,
-                                MORI_UMBP_METRIC_SSD_READ_TOTAL_HELP,
-                                {{"status", status}},
-                                v});
+  auto event = [&out](const char* name, uint64_t v) {
+    if (v == 0) return;
+    out.push_back(MetricSample{MORI_UMBP_METRIC_BACKEND_MEDIUM_EVENTS_TOTAL,
+                               MORI_UMBP_METRIC_BACKEND_MEDIUM_EVENTS_TOTAL_HELP,
+                               {{"event", name}},
+                               v});
   };
-  read("ok", ssd_->ReadOk());
-  read("not_found", ssd_->ReadNotFound());
-  read("size_too_large", ssd_->ReadSizeTooLarge());
-  read("error", ssd_->ReadError());
+  auto bytes = [&out](const char* name, uint64_t v) {
+    if (v == 0) return;
+    out.push_back(MetricSample{MORI_UMBP_METRIC_BACKEND_MEDIUM_BYTES_TOTAL,
+                               MORI_UMBP_METRIC_BACKEND_MEDIUM_BYTES_TOTAL_HELP,
+                               {{"event", name}},
+                               v});
+  };
+  auto state = [&out](const char* name, uint64_t v) {
+    out.push_back(MetricSample{MORI_UMBP_METRIC_BACKEND_MEDIUM_STATE,
+                               MORI_UMBP_METRIC_BACKEND_MEDIUM_STATE_HELP,
+                               {{"state", name}},
+                               v,
+                               MetricKind::kGauge});
+  };
+
+  // Drive-level read outcomes.  These differ from the resolve counts the
+  // decorator produces: a resolve that a single-flight merge served never
+  // reached the drive, and a size_too_large never became a miss upstream.
+  event("device_read_ok", ssd_->ReadOk());
+  event("device_read_not_found", ssd_->ReadNotFound());
+  event("device_read_size_too_large", ssd_->ReadSizeTooLarge());
+  event("device_read_error", ssd_->ReadError());
+
   // Single-flight: dup is the opportunity, merged is what was actually taken.
   // dup - merged flatlining at dup means coalescing is off or the merge window
   // is being missed, which is invisible from the read outcomes alone.
-  read("lead", ssd_->ReadLead());
-  read("dup", ssd_->ReadDup());
-  read("merged", ssd_->ReadMerged());
+  event("single_flight_lead", ssd_->ReadLead());
+  event("single_flight_dup", ssd_->ReadDup());
+  event("single_flight_merged", ssd_->ReadMerged());
 
-  auto simple = [&](const char* name, const char* help, uint64_t v) {
-    out.push_back(MediumCounter{name, help, {}, v});
-  };
-  simple(MORI_UMBP_METRIC_SSD_COPY_BYTES_TOTAL, MORI_UMBP_METRIC_SSD_COPY_BYTES_TOTAL_HELP,
-         ssd_->CopyBytes());
-  simple(MORI_UMBP_METRIC_SSD_READ_BYTES_TOTAL, MORI_UMBP_METRIC_SSD_READ_BYTES_TOTAL_HELP,
-         ssd_->ReadBytes());
-  simple(MORI_UMBP_METRIC_SSD_EVICTION_ROUNDS_TOTAL,
-         MORI_UMBP_METRIC_SSD_EVICTION_ROUNDS_TOTAL_HELP, ssd_->EvictionRounds());
-  simple(MORI_UMBP_METRIC_SSD_EVICTION_VICTIMS_TOTAL,
-         MORI_UMBP_METRIC_SSD_EVICTION_VICTIMS_TOTAL_HELP, ssd_->EvictionVictims());
-  simple(MORI_UMBP_METRIC_SSD_EVICTION_BYTES_FREED_TOTAL,
-         MORI_UMBP_METRIC_SSD_EVICTION_BYTES_FREED_TOTAL_HELP, ssd_->EvictionBytesFreed());
-  simple(MORI_UMBP_METRIC_SSD_EVICTION_BACKEND_FAILED_TOTAL,
-         MORI_UMBP_METRIC_SSD_EVICTION_BACKEND_FAILED_TOTAL_HELP, ssd_->EvictionBackendFailures());
-  simple(MORI_UMBP_METRIC_SSD_STAGING_SLOT_FULL_REJECTS_TOTAL,
-         MORI_UMBP_METRIC_SSD_STAGING_SLOT_FULL_REJECTS_TOTAL_HELP,
-         slot_full_rejects_.load(std::memory_order_relaxed));
-  simple(MORI_UMBP_METRIC_SSD_STAGING_EXPIRED_RECLAIMS_TOTAL,
-         MORI_UMBP_METRIC_SSD_STAGING_EXPIRED_RECLAIMS_TOTAL_HELP,
-         staging_expired_reclaims_.load(std::memory_order_relaxed));
+  // Local high-watermark eviction.  The victims and the freed bytes are the
+  // decorator's (Evict is an interface call); the ROUNDS are not — master never
+  // asked for them — and neither is a backend delete that refused.
+  event("eviction_round", ssd_->EvictionRounds());
+  event("eviction_backend_failed", ssd_->EvictionBackendFailures());
+
+  // Staging pressure.  slot_full_reject is the one to watch: it counts resolves
+  // that reported a miss for a key this node HOLDS, purely because the arena
+  // was full — indistinguishable from a real miss anywhere else.
+  event("staging_slot_full_reject", slot_full_rejects_.load(std::memory_order_relaxed));
+  event("staging_expired_reclaim", staging_expired_reclaims_.load(std::memory_order_relaxed));
+
+  // Bytes that actually crossed the device boundary, as opposed to the logical
+  // bytes in mori_umbp_backend_bytes_total.  Reads exclude single-flight merges,
+  // so this stays a true measure of device traffic.
+  bytes("device_write", ssd_->CopyBytes());
+  bytes("device_read", ssd_->ReadBytes());
+
+  state("staging_pages_in_use", staging_pages_in_use_.load(std::memory_order_relaxed));
+  state("staging_pages_total", cfg_.staging_pages);
   return out;
 }
 
