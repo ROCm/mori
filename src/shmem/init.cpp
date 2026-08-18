@@ -36,9 +36,9 @@
 #include "mori/application/application.hpp"
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/application/utils/cpu_affinity.hpp"
+#include "mori/core/utils/utils.hpp"
 #include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem_api.hpp"
-#include "mori/core/utils/utils.hpp"
 #include "mori/utils/mori_log.hpp"
 
 namespace mori {

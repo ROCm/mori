@@ -304,18 +304,17 @@ constexpr const char* METRICS = "metrics";
 //
 // Hot-path note: GetLogger() resolves the logger by a string-hashed
 // unordered_map lookup. Doing that on every call — even when the level is
-// disabled and spdlog drops the message — shows up on hot paths. 
-// We cache the resolved logger shared_ptr in a  function-local static so the 
-// map lookup happens once per call-site, ever. spdlog's own logger->level(...) 
-// already checks the level and skips formatting when disabled, and it reads the 
-// level on each call, so runtime level changes are still honored. 
-// Matches MORI_TIMER and avoids a dangling pointer if a logger is 
+// disabled and spdlog drops the message — shows up on hot paths.
+// We cache the resolved logger shared_ptr in a  function-local static so the
+// map lookup happens once per call-site, ever. spdlog's own logger->level(...)
+// already checks the level and skips formatting when disabled, and it reads the
+// level on each call, so runtime level changes are still honored.
+// Matches MORI_TIMER and avoids a dangling pointer if a logger is
 // spdlog::drop()-ed or torn down during static destruction.
-#define MORI_LOG(module, level, ...)                            \
-  do {                                                          \
-    static const auto _mori_log_logger =                        \
-        ::mori::ModuleLogger::GetInstance().GetLogger(module);  \
-    _mori_log_logger->level(__VA_ARGS__);                       \
+#define MORI_LOG(module, level, ...)                                                            \
+  do {                                                                                          \
+    static const auto _mori_log_logger = ::mori::ModuleLogger::GetInstance().GetLogger(module); \
+    _mori_log_logger->level(__VA_ARGS__);                                                       \
   } while (0)
 
 #define MORI_TRACE(module, ...) MORI_LOG(module, trace, __VA_ARGS__)
@@ -389,7 +388,7 @@ class ScopedTimer {
 
   // Fast path used by the MORI_TIMER / MORI_FUNCTION_TIMER macros: the logger
   // is pre-resolved and cached by the call-site, so nothing is allocated or
-  // sampled unless DEBUG logging is actually enabled for this module. 
+  // sampled unless DEBUG logging is actually enabled for this module.
   ScopedTimer(std::string_view name, spdlog::logger& logger) {
     if (MORI_UNLIKELY(logger.should_log(spdlog::level::debug))) {
       logger_ = &logger;
@@ -401,8 +400,8 @@ class ScopedTimer {
   // Legacy path: resolves the logger by module name. Still early-outs when the
   // level is disabled so it never copies strings or reads the clock needlessly.
   explicit ScopedTimer(const std::string& name,
-                       const std::string& module = mori::modules::APPLICATION) 
-    : ScopedTimer(name, *ModuleLogger::GetInstance().GetLogger(module)) {}
+                       const std::string& module = mori::modules::APPLICATION)
+      : ScopedTimer(name, *ModuleLogger::GetInstance().GetLogger(module)) {}
 
   ~ScopedTimer() {
     if (MORI_UNLIKELY(logger_ != nullptr)) {
