@@ -772,4 +772,25 @@ std::optional<std::string> SSDTier::GetLocationId(const std::string& key) const 
   return "seg" + std::to_string(meta->segment_id) + ":" + std::to_string(meta->value_offset);
 }
 
+std::optional<RecordLocation> SSDTier::LocateRecord(const std::string& key) const {
+  std::lock_guard<std::mutex> lock(mu_);
+  const auto* meta = index_.FindKey(key);
+  if (!meta && IsReadOnlyShared()) {
+    const_cast<SSDTier*>(this)->RefreshFromDiskLocked(false);
+    meta = index_.FindKey(key);
+  }
+  if (!meta) return std::nullopt;
+  const auto* seg = GetSegmentLocked(meta->segment_id);
+  if (!seg || seg->fd < 0) return std::nullopt;
+  RecordLocation loc;
+  loc.fd = seg->fd;
+  loc.value_offset = meta->value_offset;
+  // v3 pads every value to kRecordAlign, so the padded length is what a GDS read
+  // must move; the reader trims to value_size afterwards.
+  loc.readable_size = segment::AlignUp(meta->size);
+  loc.value_size = meta->size;
+  loc.direct_io = direct_io_;
+  return loc;
+}
+
 }  // namespace mori::umbp
