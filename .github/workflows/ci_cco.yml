@@ -209,12 +209,15 @@ jobs:
             cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
             timeout 900 torchrun --standalone --nproc_per_node=8 test_ep_backend_parity.py"
 
-      - name: Run ops-v2 dispatch/combine bench (EP8 smoke)
+      - name: Run ops-v2 dispatch/combine bench (EP8 smoke, both backends)
         run: |
+          # bench_ep.py gates every point on an identity-expert check and exits
+          # non-zero if one fails, so this is a smoke test as well as a bench.
           $CT exec $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
-            MODE=graph SWEEP=128,512,4096,8192 ITERS=20 WARMUP=10 \
-            torchrun --standalone --nproc_per_node=8 bench_dispatch_combine.py"
+            BACKENDS=flydsl,hip MODES=graph SWEEP=128,512,4096,8192 \
+            ITERS=20 WARMUP=10 \
+            torchrun --standalone --nproc_per_node=8 bench_ep.py"
 
 
       - name: Cleanup
