@@ -250,6 +250,17 @@ __device__ __forceinline__ void WriteAtomicInc32Packet(uint32_t* dw, HSAuint64* 
   dw[7] = 0;  // LOOP/interval (unused)
 }
 
+// Broadcast `v` from `srcLane` of this wave. ds_bpermute is lane-addressed;
+// srcLane must be < warpSize (64 on gfx950, 32 on gfx1250).
+__device__ __forceinline__ uint32_t shfl_u32(uint32_t v, int srcLane) {
+  return __builtin_amdgcn_ds_bpermute(srcLane << 2, v);
+}
+__device__ __forceinline__ uint64_t shfl_u64(uint64_t v, int srcLane) {
+  const uint32_t lo = shfl_u32(static_cast<uint32_t>(v), srcLane);
+  const uint32_t hi = shfl_u32(static_cast<uint32_t>(v >> 32), srcLane);
+  return (static_cast<uint64_t>(hi) << 32) | lo;
+}
+
 // SDMA queue handle augmented with collective-specific ring writers. It adds no
 // data members (same layout as the base), so a base handle can be used through it
 // via a reinterpret_cast -- mirroring anvil::SdmaQueueSingleProducerDeviceHandle.
@@ -285,30 +296,57 @@ struct SdmaCollectiveHandle : anvil::SdmaQueueDeviceHandle {
     }
   }
 
-    // Sole-producer reservation: no CAS. Valid only when this queue has exactly
+  // Sole-producer reservation: no CAS. Valid only when this queue has exactly
   // one producing thread for the lifetime of the reservation (e.g. one leader
-  // lane per distinct queue). Keeps the wrap-pad + back-pressure (CanWriteUpto)
-  // logic, drops the compare-exchange arbitration.
+  // lane per distinct queue). Claim-then-wait like cco ReserveSlot: fetch_add
+  // first, then poll rptr if occupancy exceeds the ring. Wrap pad is a rare
+  // second fetch_add of `offset` (safe only because we are the sole producer).
+  // `this` is the shared device handle, so updating cachedHwReadIndex publishes
+  // the rptr hint for the next caller.
   __device__ __forceinline__ uint64_t ReserveQueueSpaceCASFree(
       const size_t size_in_bytes, uint64_t& offset) {
     constexpr uint64_t q_size = anvil::SDMA_QUEUE_SIZE;
-    uint64_t cur_index =
-        __hip_atomic_load(cachedWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    uint64_t base =
+        __hip_atomic_fetch_add(cachedWptr, size_in_bytes, __ATOMIC_RELAXED,
+                               __HIP_MEMORY_SCOPE_AGENT);
     offset = 0;
-    if (auto w = WrapIntoRing(cur_index); w + size_in_bytes > q_size) {
-      offset = q_size - w;
+    if (const uint64_t pos = WrapIntoRing(base); pos + size_in_bytes > q_size) {
+      offset = q_size - pos;
+      __hip_atomic_fetch_add(cachedWptr, offset, __ATOMIC_RELAXED,
+                             __HIP_MEMORY_SCOPE_AGENT);
     }
-    const uint64_t new_index = cur_index + size_in_bytes + offset;
-    // Back-pressure only (not CAS): spin until the ring has room. CanWriteUpto
-    // refreshes cachedHwReadIndex from the hardware rptr.
+    const uint64_t end = base + size_in_bytes + offset;
+    if (end - cachedHwReadIndex > q_size) {
+      int64_t retries = 0;
+      do {
+        cachedHwReadIndex =
+            __hip_atomic_load(rptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+#if BREAK_ON_RETRIES
+        if (retries++ == anvil::MAX_RETRIES) __builtin_trap();
+#endif
+      } while (end - cachedHwReadIndex > q_size);
+    }
+    return base;
+  }
+
+  // CCO-style doorbell: one s_waitcnt, then wptr / doorbell / committedWptr.
+  // No wave_barrier — slice-0 leaders in one warp ring different queues and
+  // would make an inner barrier divergent. Caller publishes other lanes' ring
+  // stores (per-lane waitcnt + wave_barrier) before calling.
+  __device__ __forceinline__ void submitPacket(uint64_t base, uint64_t pendingWptr) {
     int64_t retries = 0;
-    while (!CanWriteUpto(new_index)) {
+    while (__hip_atomic_load(committedWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != base) {
+      __builtin_amdgcn_s_sleep(1);
 #if BREAK_ON_RETRIES
       if (retries++ == anvil::MAX_RETRIES) __builtin_trap();
 #endif
     }
-    __hip_atomic_store(cachedWptr, new_index, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    return cur_index;
+    anvil::PublishStores();
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    __hip_atomic_store(wptr, pendingWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    __hip_atomic_store(doorbell, pendingWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    __hip_atomic_store(committedWptr, pendingWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
   }
 };
 
@@ -344,12 +382,16 @@ inline __device__ void SdmaBroadcastSliceWarp(const void* src, size_t dstOff, si
 
 // ---------------------------------------------------------------------------
 // Fused SDMA "push" scatter shared by the push collectives (reduce-scatter and
-// all-gather). Every block calls it but it no-ops on all but block 0, so the
-// internal __syncthreads() are still reached by all of block 0's threads.
+// all-gather). Warp 0 of the calling block posts; other warps return (no block
+// barrier). Packet-strided: i = peer*S + slice, one fused 64B copy+atomic per
+// lane. S divides warpSize (1/2/4/8 | 32 or 64), so a peer's group never
+// straddles a stride iteration — slice 0 reserves, shuffles base, every active
+// lane writes its ring slot, then slice 0 rings. npes*S only sets the iter
+// count (two iters at 16*8 on wave64).
 //
 // Each shard is split into S = 1<<logS slices. Lane (peer,slice) issues an SDMA
 // copy of slice `slice` from srcOf(peer) into peer's heap at byte offset
-// dstOffOf(peer), followed by an ADD64 of 1 into peer's per-slice completion
+// dstOffOf(peer), followed by an ADD32(1) into peer's per-slice completion
 // counter signalPtrs[slice]. The atomic targets the *receiver's* counter, so
 // completion is observed on the receive side -- fire-and-forget, no local quiet,
 // no cross-PE barrier. Per-slice counters make slice order irrelevant; the
@@ -372,20 +414,22 @@ inline __device__ void SdmaBroadcastSliceWarp(const void* src, size_t dstOff, si
 //
 // srcOf(peer)/dstOffOf(peer) MUST reference the symmetric static heap (ShmemMalloc)
 // so the address-based SDMA put can translate local->peer (offset from
-// heapBaseAddr). The SDMA fast path caps npes <= 8 (one warp issues all peers).
+// heapBaseAddr).
 // ---------------------------------------------------------------------------
 template <class ActiveFn, class SrcFn, class DstOffFn>
 __device__ __forceinline__ void StartSdmaScatter(
     int myPe, int npes, int logS, size_t chunkElems, size_t elemBytes,
     ActiveFn activeOf, SrcFn srcOf, DstOffFn dstOffOf, int signalSlotBase = 0) {
 
-  // Element type is irrelevant to the byte-oriented SDMA copy: the caller passes
-  // elemBytes (bytes per element) so the slice split stays VecBytes-aligned.
   const size_t vecSize = VecBytes / elemBytes;
   const int S = 1 << logS;
-  // vecSize-aligned slice length; the last slice absorbs the remainder.
   const size_t sliceLen = ((chunkElems >> logS) / vecSize) * vecSize;
-  const int tid = threadIdx.x;
+  const int tid = static_cast<int>(threadIdx.x);
+  constexpr int W = warpSize;
+  if (tid >= W) return;
+#if BREAK_ON_RETRIES
+  if (W % S != 0) __builtin_trap();
+#endif
 
   auto* heapObj = shmem::GetGlobalGpuStatesPtr()->heapObj;
   const int numSdmaQ = static_cast<int>(heapObj->sdmaNumQueue);
@@ -393,88 +437,62 @@ __device__ __forceinline__ void StartSdmaScatter(
   const size_t sliceBytes = sliceLen * elemBytes;
   const size_t lastBytes = (chunkElems - (sliceLen << logS) + sliceLen) * elemBytes;
 
-  // due to LDS capacity: (npes << logS) <= kRSPushMaxPeers * kRSPushMaxSlices 
   constexpr size_t packetSize = sizeof(SDMA_PKT_COPY_WITH_ATOMIC);
-  // --- Fast path (LDS-staged): build packets into bank-conflict-free LDS ----
-  // slots, then flush them to the rings with up to npes*S*4 threads (one
-  // coalesced b128 store per thread). The build write uses one lane per packet
-  // at a 17-dword slot stride (coprime to the 32 LDS banks) so the 16-dword
-  // packet write is conflict-free. The flush spans multiple warps, so the ring
-  // writes need a block-wide fence + barrier before any leader rings a doorbell
-  // (the submitter's own s_waitcnt(0) only drains its own wave).
+  const int nWork = npes * S;
+  const int nIters = (nWork + W - 1) / W;
+  const int lane = tid;
 
-  uint64_t start_base = 0;
-  SdmaCollectiveHandle *handle_base = nullptr;
-  using QueuePtr = decltype(handle_base->queueBuf);
-  __shared__ uint32_t pktBuf[kRSPushMaxPeers * kRSPushMaxSlices * kRSPushSlotDwords];
-  __shared__ uint64_t sPktStart[kRSPushMaxPeers];
-  __shared__ QueuePtr sQueuePtr[kRSPushMaxPeers];
+  for (int iter = 0; iter < nIters; ++iter) {
+    const int i = lane + iter * W;
+    const int peer = i >> logS;
+    const int slice = i & (S - 1);
+    const bool valid = i < nWork;
+    const bool active = valid && activeOf(peer);
+    const int leader = lane & ~(S - 1);
 
-  // -- Build phase: one lane per packet (peer = tid/S, slice = tid%S). --
-  const int npesS = npes << logS, peer = tid >> logS, slice = tid & (S - 1);
-  const bool bactive = (tid < npesS) && activeOf(peer);
-  if (bactive) {
-    if (slice == 0) {
-      // deviceHandles_d is addressed by GLOBAL pe (deviceHandles_d + pe * numQ),
-      // so distinct peers always map to distinct handle slots (no collision).
-      auto** handles = heapObj->deviceHandles_d + peer * numSdmaQ;
-      handle_base = static_cast<SdmaCollectiveHandle*>(*(handles + 0));
-      // Leader reserves the whole S-packet block and publishes base/pad to LDS.
-      // Peers map to distinct queues (per global pe) and only the slice-0 lane
-      // reserves, so each queue has exactly one producer here -- use the CAS-free
-      // single-producer reserve.
+    uint64_t base = 0, pktStart = 0;
+    SdmaCollectiveHandle* shared = nullptr;
+    if (active && slice == 0) {
+      shared = static_cast<SdmaCollectiveHandle*>(
+          *(heapObj->deviceHandles_d + peer * numSdmaQ));
       uint64_t offset = 0;
-      start_base = handle_base->ReserveQueueSpaceCASFree(packetSize << logS, offset);
-      if (offset) handle_base->fillNops(start_base, offset);
-      sPktStart[peer] = start_base + offset;
-      sQueuePtr[peer] = handle_base->queueBuf;
+      base = shared->ReserveQueueSpaceCASFree(packetSize * static_cast<size_t>(S), offset);
+      if (offset) shared->fillNops(base, offset);
+      pktStart = base + offset;
     }
-    const size_t off = dstOffOf(peer);
-    auto* s = srcOf(peer) + slice * sliceBytes;
-    auto* d =
+    pktStart = shfl_u64(pktStart, leader);
+    base = shfl_u64(base, leader);
+
+    if (active) {
+      auto& h = *static_cast<SdmaCollectiveHandle*>(
+          *(heapObj->deviceHandles_d + peer * numSdmaQ));
+      const size_t off = dstOffOf(peer);
+      auto* s = srcOf(peer) + slice * sliceBytes;
+      auto* d =
           reinterpret_cast<uint8_t*>(heapObj->peerPtrs[peer] + off) + slice * sliceBytes;
-    size_t sz = (slice == S - 1) ? lastBytes : sliceBytes;
-    // Build the fused copy+atomic packet DIRECTLY into the LDS slot (dword
-    // stores via the DW_x unions), skipping the register-resident struct and
-    // the reg->LDS copy. Layout: copy = dwords 0..6, atomic = dwords 7..14,
-    // trailing single-dword NOP = dword 15. Per-field cross-lane stride stays
-    // kRSPushSlotDwords (17, coprime to 32 banks) so the build is conflict-free.
-    uint32_t* dw = &pktBuf[tid * kRSPushSlotDwords];  // slot == peer*S + slice == tid
-    WriteCopyPacket(dw, s, d, sz);
-    WriteAtomicInc32Packet(dw + 8,
-                       heapObj->peerSignalPtrs[peer] + signalSlotBase + slice);
-  }
-  __syncthreads();
+      const size_t sz = (slice == S - 1) ? lastBytes : sliceBytes;
 
-  // -- Flush phase: one thread per b128 (packet = fb/4, b128 = fb%4), block-
-  // strided so it is robust to any blockDim (<= npes*S*4 total b128s). --
-  const int totalB128 = npes << (logS + 2);
-  for (int fb = tid; fb < totalB128; fb += blockDim.x) {
-    const int fpkt = fb / 4, bb = fb % 4,
-               fpeer = fpkt >> logS, fslice = fpkt & (S - 1);
-    if (!activeOf(fpeer)) continue;  // uniform across the warp (peer-granular)
-    const uint64_t idx = sPktStart[fpeer] + fslice * packetSize,
-                 baseDword = SdmaCollectiveHandle::WrapIntoRing(idx) / sizeof(uint32_t);
-    // Read the b128 from LDS as 4 dwords (stride-17 slot is 4B- but not
-    // 16B-aligned, so avoid ds_read_b128), then store it coalesced to the ring.
-    const int slot = fpkt * kRSPushSlotDwords + bb * 4;
-    TVecType<16> v = {pktBuf[slot + 0], pktBuf[slot + 1], pktBuf[slot + 2],
-                        pktBuf[slot + 3]};
-    StreamStore<EAgentScope, 16>(sQueuePtr[fpeer] + baseDword + bb * 4, v);
-  }
-  // All flush warps must finish + their ring stores be visible to the on-die
-  // SDMA engine before any doorbell. The ring lives in local HBM and is
-  // consumed by this GPU's own SDMA agent, so an agent-scope RELEASE fence is
-  // the exact match for the "agent"-scoped b128 ring stores (the doorbell
-  // store inside submitPacket carries its own system-scope push). __syncthreads
-  // (workgroup scope) alone is one scope short of what the SDMA agent needs.
-  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
-  __syncthreads();
+      auto* signal = heapObj->peerSignalPtrs[peer] + signalSlotBase + slice;
+      uint32_t dw[16];
+      WriteCopyPacket(dw, s, d, sz);  // copy: dw[0..6]
+      WriteAtomicInc32Packet(dw + 8, signal);    // atomic: dw[7..14]
+      const uint64_t Xbase = anvil::SdmaQueueDeviceHandle::WrapIntoRing(
+                        pktStart + slice * packetSize) / sizeof(uint32_t);
+  #pragma unroll
+      for (int j = 0; j < 16; j += 4) {
+        const V128 v = {dw[j], dw[j + 1], dw[j + 2], dw[j + 3]};
+        StreamStore<EAgentScope, 16>(h.queueBuf + Xbase + j, v);
+      }
+    }
 
-  // -- Submit phase: each peer's leader rings one doorbell on its own queue. --
-  if (bactive && slice == 0) {
-    handle_base->submitPacket(start_base, sPktStart[peer] + (packetSize << logS));
+    anvil::PublishStores();
+    __builtin_amdgcn_wave_barrier();
+
+    if (active && slice == 0) {
+      shared->submitPacket(base, pktStart + packetSize * static_cast<size_t>(S));
+    }
   }
+  (void)myPe;
 }
 
 #endif  // __HIPCC__ || __HIP__
