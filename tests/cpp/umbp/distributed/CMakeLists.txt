@@ -324,12 +324,12 @@ target_link_libraries(test_page_backend PRIVATE umbp_common
 target_compile_features(test_page_backend PRIVATE cxx_std_17)
 add_test(NAME test_page_backend COMMAND test_page_backend)
 
-# test_mock_backend — MockBackend, BackendRegistry dispatch, and the heartbeat
-# event aggregation MediumBackend absorbed from OwnedLocationSource
-add_executable(test_mock_backend test_mock_backend.cpp)
-target_link_libraries(test_mock_backend PRIVATE umbp_common GTest::gtest_main)
-target_compile_features(test_mock_backend PRIVATE cxx_std_17)
-add_test(NAME test_mock_backend COMMAND test_mock_backend)
+# BackendRegistry dispatch and the heartbeat event aggregation MediumBackend
+# absorbed from OwnedLocationSource. MockBackend is only the test double.
+add_executable(test_backend_registry test_backend_registry.cpp)
+target_link_libraries(test_backend_registry PRIVATE umbp_common GTest::gtest_main)
+target_compile_features(test_backend_registry PRIVATE cxx_std_17)
+add_test(NAME test_backend_registry COMMAND test_backend_registry)
 
 # test_peer_pool — implicit default Pool, SingleBackendPolicy compatibility,
 # logical key placement, named same-tier backend dispatch, and recovery fallback.
@@ -406,14 +406,6 @@ target_link_libraries(test_ssd_copy_pipeline PRIVATE umbp_common
                                                      GTest::gtest_main)
 target_compile_features(test_ssd_copy_pipeline PRIVATE cxx_std_17)
 add_test(NAME test_ssd_copy_pipeline COMMAND test_ssd_copy_pipeline)
-
-# test_local_preferring_route_get — RouteGet locality-preferring strategy
-# (replaces test_tier_priority_route_get: Phase 4 deleted the tier order)
-add_executable(test_local_preferring_route_get test_local_preferring_route_get.cpp)
-target_link_libraries(test_local_preferring_route_get PRIVATE umbp_common
-                                                           GTest::gtest_main)
-target_compile_features(test_local_preferring_route_get PRIVATE cxx_std_17)
-add_test(NAME test_local_preferring_route_get COMMAND test_local_preferring_route_get)
 
 # test_cache_remote_admission — cache_remote_fetches admission-gate unit test
 # (hermetic; no GPU/RDMA/master).
