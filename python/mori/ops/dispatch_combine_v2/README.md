@@ -15,6 +15,20 @@ Select with `cfg.kernel_backend` or `MORI_V2_KERNEL_BACKEND`. Peer addresses are
 computed in-kernel over the flat LSA VA, no host P2P tables. Reference =
 ROCm/FlyDSL PR #522 (`dispatch_combine_intranode_{kernel,op}.py`).
 
+The flydsl backend's dispatch leg has two payload transports, chosen with
+`cfg.dispatch_transport`:
+
+- **vector** (default): per-lane vec4 copies. Every dtype and feature above.
+- **tdm**: the gfx1250 tensor data mover, a FlyDSL port of the C++
+  `intranode_1250x.hpp` path. bf16/f32 payload only — no scales, no fp4, no
+  replay — and it produces the same state as vector, so combine and the routing
+  handle do not care which ran. It costs ~12us more fixed overhead and moves
+  roughly 3x the bandwidth once the payload dominates: at hidden 7168 EP4,
+  32768 tokens, 540 GB/s -> 1690 (3.1x); on perfectly balanced routing, 630 ->
+  1640 (2.6x). Below about a thousand tokens both sit on the same cross-rank
+  rendezvous floor and the fixed cost puts TDM ~10% behind, so `auto` resolves
+  to vector; `MORI_EP_DISPATCH_TDM=1` flips that default for A/B runs.
+
 Supported token dtypes: **bf16**, **f32**, **fp8** (gather-only; OCP e4m3 on
 gfx950, e4m3**fnuz** max 240 on gfx942) and **fp4** (e2m1, gather-only,
 **gfx950-only** — the `cvt_scalef32_*_fp4` intrinsics don't exist on gfx942).
@@ -42,6 +56,8 @@ lazily, only when selected, so the package imports without FlyDSL installed.
 | `symm_arena.py` | `SymmArena`: one cco-LSA window carved into named regions |
 | `flydsl_prims.py` | FlyDSL device primitives: system atomics / ordered stores / fences / volatile-spin waits |
 | `intranode_kernels.py` | FlyDSL kernel factories: `make_dispatch` (+scales/replay), `make_combine` (gather) / `make_combine_scatter` (`_nop2p`, bf16/f32/fp8/fp4), `make_convert_dispatch_output` / `make_convert_combine_input` (StdMoE), `make_local_expert_count` |
+| `tdm_prims.py` | gfx1250 TDM descriptor construction: the GROUP0/GROUP1 bit layouts and the `tdm_load`/`tdm_store`/`tdm_wait` wrappers |
+| `intranode_kernels_tdm.py` | `make_dispatch_tdm`: the TDM dispatch transport, plus the host-side sizing helpers the op layer needs (`tdm_stage_capacity`, `tdm_max_warps`, `tdm_lds_bytes`) |
 | `tuning_configs.py` | **flydsl** kernel geometry: per-(world,hidden,topk) block/warp lookup |
 | `hip_tuning_configs.py` | **hip** kernel geometry, separate table (never borrows flydsl's); same `lookup` contract. Independent dispatch/combine tables, keyed by device, shape, topk and (dispatch only) dtype; an unswept shape gets a single-shot default |
 
@@ -55,6 +71,8 @@ Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 | `test_jit_binding.py` | JIT plan binding: schemas, request/args round-trip, cache behaviour. No GPU peers needed |
 | `test_graph_capture.py` | captures dispatch → identity expert → combine as one HIP graph and replays it |
 | `test_asym_dtype.py` | asymmetric dtype legs (fp8/fp4 dispatch + bf16 combine) |
+| `test_dispatch_tdm.py` | runs one routing through both dispatch transports, checks each against a CPU model and prints an A/B latency + bandwidth table. Envs: `HIDDEN`/`TOPK`/`EPR`/`SWEEP`, `BENCH=1`, `ITERS`/`WARMUP`, `BALANCED=1` (perfectly balanced routing), `DISPATCH_BW="1,8"` to pin the grid |
+| `compile_dispatch_tdm.py` | compile-only check of `make_dispatch_tdm` across five geometries. No GPU, seconds not minutes — the first thing to run after touching the kernel |
 | `bench_ep.py` | the perf bench, for every backend. Alternating dispatch/combine pairs, eager + CUDA graph, each point gated on an identity-expert check and non-zero exit on failure. Envs: `BACKENDS=flydsl,hip`, `MODES=eager,graph`, `SWEEP`, `ITERS`, `DISP=bf16\|fp8\|fp4`, `COMBINE_IN=inplace\|staged`, `CHECK=0`, `DBN`/`DWPB`/`CBN`/`CWPB` to pin geometry, `HIDDEN`/`TOPK`/`EPR` |
 
 (Each script inlines a tiny torchrun/gloo `Dist` bootstrap — gloo only carries the cco unique-id and pass/fail counts.)
@@ -70,6 +88,10 @@ cd tests/python/ops/dispatch_combine_v2
 pytest test_dispatch_combine_v2_intranode.py -v                       # EP8 correctness (all modes)
 torchrun --standalone --nproc_per_node=8 test_op.py                   # op-layer correctness (env-driven)
 BACKENDS=flydsl,hip torchrun --standalone --nproc_per_node=8 bench_ep.py   # perf, both backends
+
+python compile_dispatch_tdm.py                                        # TDM kernel, compile only
+HIDDEN=7168 EPR=32 SWEEP=2048,8192,32768 BENCH=1 \
+  torchrun --standalone --nproc_per_node=4 test_dispatch_tdm.py       # TDM vs vector, correctness + A/B
 ```
 
 Config via env: `HIDDEN`, `TOPK`, `EPR`, `SWEEP`, `DISP`, `COMBINE`, `QUANT`,
