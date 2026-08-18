@@ -207,6 +207,12 @@ class SsdBackend : public MediumBackend {
   // Local address of a staging page.  Valid after Init.
   void* StagingPagePtr(uint32_t page_index) const;
 
+  // hipFile handle for a segment fd, obtained lazily from the registrar's file
+  // engine (GdsEngine) and shared by every key on that segment.  Returns nullptr
+  // when no file engine is configured; that result is cached so a fd is probed
+  // at most once.  Deregistered in Shutdown.
+  void* GdsHandleForFd(int fd);
+
   // Caller MUST hold mutex_.  Bumps the unshipped-event count and fires the
   // auto-flush hook once it crosses the threshold.
   void NoteEventQueuedLocked();
@@ -234,6 +240,12 @@ class SsdBackend : public MediumBackend {
 
   std::unordered_map<uint64_t, PendingSlot> pending_;
   std::unordered_map<std::string, ReadLease> read_leases_;
+
+  // GDS file handles by segment fd (see GdsHandleForFd).  On its own lock, off
+  // mutex_, so a resolve holding mutex_ can register a handle without widening
+  // what mutex_ guards.
+  std::mutex gds_mutex_;
+  std::unordered_map<int, void*> gds_handles_;
 
   size_t unshipped_events_ = 0;
   size_t auto_flush_threshold_ = SIZE_MAX;
