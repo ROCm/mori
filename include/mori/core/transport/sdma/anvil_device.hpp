@@ -96,43 +96,6 @@ __device__ __forceinline__ SDMA_PKT_ATOMIC CreateAtomicIncPacket(HSAuint64* sign
   return packet;
 }
 
-// Emit SDMA_PKT_COPY_LINEAR into dw[0..6].
-__device__ __forceinline__ void WriteCopyPacket(uint32_t* dw, 
-           const void* srcBuf, const void* dstBuf, size_t packetSize) {
-  // Header depends only on constants; a scalar-replaceable local keeps the
-  // bitfield layout authoritative and constant-folds (no address taken).
-  decltype(SDMA_PKT_COPY_LINEAR::HEADER_UNION) hdr;
-  hdr.DW_0_DATA = 0;
-  hdr.op = SDMA_OP_COPY;
-  hdr.sub_op = SDMA_SUBOP_COPY_LINEAR;
-  dw[0] = hdr.DW_0_DATA;
-  dw[1] = static_cast<uint32_t>(packetSize - 1);  // COUNT_UNION.count (reserved bits 0)
-  dw[2] = 0;                                       // PARAMETER_UNION (unused)
-  dw[3] = (uint32_t)(uintptr_t)srcBuf;
-  dw[4] = (uint32_t)((uintptr_t)srcBuf >> 32);
-  dw[5] = (uint32_t)(uintptr_t)dstBuf;
-  dw[6] = (uint32_t)((uintptr_t)dstBuf >> 32);
-}
-
-// Emit SDMA_PKT_ATOMIC (ADD32) into dw[0..7]. A 32-bit atomic add touches only
-// the low dword of the 8-byte-aligned target (little-endian), which is what the
-// 64-bit waiter load reads as long as the high dword stays zero (resets clear the
-// full 64-bit slot and the counter never exceeds npes).
-__device__ __forceinline__ void WriteAtomicInc32Packet(uint32_t* dw, HSAuint64* signal) {
-  decltype(SDMA_PKT_ATOMIC::HEADER_UNION) hdr;
-  hdr.DW_0_DATA = 0;
-  hdr.op = SDMA_OP_ATOMIC;
-  hdr.operation = SDMA_ATOMIC_ADD32;
-  dw[0] = hdr.DW_0_DATA;
-  dw[1] = (uint32_t)((uintptr_t)signal);
-  dw[2] = (uint32_t)((uintptr_t)signal >> 32);
-  dw[3] = 1;
-  dw[4] = 0;  // SRC_DATA_HI (unused for 32-bit ADD)
-  dw[5] = 0;  // CMP_DATA_LO (unused for ADD)
-  dw[6] = 0;  // CMP_DATA_HI (unused for ADD)
-  dw[7] = 0;  // LOOP/interval (unused)
-}
-
 __device__ __forceinline__ SDMA_PKT_FENCE CreateFencePacket(HSAuint64* address, uint32_t data = 1) {
   SDMA_PKT_FENCE packet = {};
 

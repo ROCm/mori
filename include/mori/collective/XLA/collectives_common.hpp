@@ -212,6 +212,44 @@ __device__ __forceinline__ void BufferStore128(BufRsrc r, V128 v, uint32_t voff)
                                      /*soffset=*/0, RS_BUF_AUX);
 }
 
+// Emit SDMA_PKT_COPY_LINEAR into dw[0..6] + NOP.
+__device__ __forceinline__ void WriteCopyPacket(uint32_t* dw, 
+           const void* srcBuf, const void* dstBuf, size_t packetSize) {
+  // Header depends only on constants; a scalar-replaceable local keeps the
+  // bitfield layout authoritative and constant-folds (no address taken).
+  decltype(SDMA_PKT_COPY_LINEAR::HEADER_UNION) hdr;
+  hdr.DW_0_DATA = 0;
+  hdr.op = SDMA_OP_COPY;
+  hdr.sub_op = SDMA_SUBOP_COPY_LINEAR;
+  dw[0] = hdr.DW_0_DATA;
+  dw[1] = static_cast<uint32_t>(packetSize - 1);  // COUNT_UNION.count (reserved bits 0)
+  dw[2] = 0;                                       // PARAMETER_UNION (unused)
+  dw[3] = (uint32_t)(uintptr_t)srcBuf;
+  dw[4] = (uint32_t)((uintptr_t)srcBuf >> 32);
+  dw[5] = (uint32_t)(uintptr_t)dstBuf;
+  dw[6] = (uint32_t)((uintptr_t)dstBuf >> 32);
+  dw[7] = 0;  // trailing single-dword NOP (must be 0)
+} 
+
+// Emit SDMA_PKT_ATOMIC (ADD32) into dw[0..7]. A 32-bit atomic add touches only
+// the low dword of the 8-byte-aligned target (little-endian), which is what the
+// 64-bit waiter load reads as long as the high dword stays zero (resets clear the
+// full 64-bit slot and the counter never exceeds npes).
+__device__ __forceinline__ void WriteAtomicInc32Packet(uint32_t* dw, HSAuint64* signal) {
+  decltype(SDMA_PKT_ATOMIC::HEADER_UNION) hdr;
+  hdr.DW_0_DATA = 0;
+  hdr.op = SDMA_OP_ATOMIC;
+  hdr.operation = SDMA_ATOMIC_ADD32;
+  dw[0] = hdr.DW_0_DATA;
+  dw[1] = (uint32_t)((uintptr_t)signal);
+  dw[2] = (uint32_t)((uintptr_t)signal >> 32);
+  dw[3] = 1;
+  dw[4] = 0;  // SRC_DATA_HI (unused for 32-bit ADD)
+  dw[5] = 0;  // CMP_DATA_LO (unused for ADD)
+  dw[6] = 0;  // CMP_DATA_HI (unused for ADD)
+  dw[7] = 0;  // LOOP/interval (unused)
+}
+
 // SDMA queue handle augmented with collective-specific ring writers. It adds no
 // data members (same layout as the base), so a base handle can be used through it
 // via a reinterpret_cast -- mirroring anvil::SdmaQueueSingleProducerDeviceHandle.
@@ -227,9 +265,8 @@ struct SdmaCollectiveHandle : anvil::SdmaQueueDeviceHandle {
                                                           size_t copyBytes, HSAuint64* signal,
                                                           uint64_t wptrIndex) {
     uint32_t dw[16];
-    anvil::WriteCopyPacket(dw, srcBuf, dstBuf, copyBytes);  // copy: dw[0..6]
-    anvil::WriteAtomicInc32Packet(dw + 7, signal);    // atomic: dw[7..14]
-    dw[15] = 0;                                       // trailing single-dword NOP
+    WriteCopyPacket(dw, srcBuf, dstBuf, copyBytes);  // copy: dw[0..6]
+    WriteAtomicInc32Packet(dw + 8, signal);    // atomic: dw[7..14]
     const uint64_t base = WrapIntoRing(wptrIndex) / sizeof(uint32_t);
 #pragma unroll
     for (int i = 0; i < 16; i += 4) {
@@ -254,12 +291,12 @@ struct SdmaCollectiveHandle : anvil::SdmaQueueDeviceHandle {
   // logic, drops the compare-exchange arbitration.
   __device__ __forceinline__ uint64_t ReserveQueueSpaceCASFree(
       const size_t size_in_bytes, uint64_t& offset) {
-    const uint64_t queue_size_in_bytes = anvil::SDMA_QUEUE_SIZE;
+    constexpr uint64_t q_size = anvil::SDMA_QUEUE_SIZE;
     uint64_t cur_index =
         __hip_atomic_load(cachedWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     offset = 0;
-    if (WrapIntoRing(cur_index) + size_in_bytes > queue_size_in_bytes) {
-      offset = (queue_size_in_bytes - WrapIntoRing(cur_index));
+    if (auto w = WrapIntoRing(cur_index); w + size_in_bytes > q_size) {
+      offset = q_size - w;
     }
     const uint64_t new_index = cur_index + size_in_bytes + offset;
     // Back-pressure only (not CAS): spin until the ring has room. CanWriteUpto
@@ -403,10 +440,9 @@ __device__ __forceinline__ void StartSdmaScatter(
     // trailing single-dword NOP = dword 15. Per-field cross-lane stride stays
     // kRSPushSlotDwords (17, coprime to 32 banks) so the build is conflict-free.
     uint32_t* dw = &pktBuf[tid * kRSPushSlotDwords];  // slot == peer*S + slice == tid
-    anvil::WriteCopyPacket(dw, s, d, sz);
-    anvil::WriteAtomicInc32Packet(dw + 7,
-                                heapObj->peerSignalPtrs[peer] + signalSlotBase + slice);
-    dw[15] = 0;  // trailing single-dword SDMA NOP (must be 0)
+    WriteCopyPacket(dw, s, d, sz);
+    WriteAtomicInc32Packet(dw + 8,
+                       heapObj->peerSignalPtrs[peer] + signalSlotBase + slice);
   }
   __syncthreads();
 
