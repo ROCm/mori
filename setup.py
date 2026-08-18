@@ -898,10 +898,12 @@ def _torch_symm_extension():
     if _TorchCppExtension is None:
         return []
     rocm = os.environ.get("ROCM_PATH", "/opt/rocm")
+    # Absolute: torch's ninja compiler writes its build file into build_temp and runs
+    # ninja from there, so a relative -I would resolve against the wrong directory.
     ext = _TorchCppExtension(
         name="mori.mori_torch_symm",
         sources=["src/allocator/symm_backend.cpp"],
-        include_dirs=[str(_root_dir / "include"), f"{rocm}/include"],
+        include_dirs=[str(_root_dir.resolve() / "include"), f"{rocm}/include"],
         library_dirs=[f"{rocm}/lib"],
         libraries=["amdhip64", "c10_hip", "torch_hip"],
         extra_compile_args=["-std=c++17"]
