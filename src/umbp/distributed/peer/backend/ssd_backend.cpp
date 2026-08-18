@@ -74,6 +74,14 @@ bool SsdBackend::Init(MemoryRegistrar* registrar) {
 
   registrar_ = registrar;
 
+  // Runtime kill-switch for the file->GPU (GDS) read path.  On by default when
+  // the build has hipfile; UMBP_ENABLE_GDS=0 forces every SSD read back onto the
+  // staging arena without a rebuild (for A/B against GDS, or as a safety valve).
+  if (const char* env = std::getenv("UMBP_ENABLE_GDS")) {
+    const std::string v(env);
+    gds_enabled_ = !(v == "0" || v == "false" || v == "FALSE");
+  }
+
   // ONE buffer covering every staging page, so each page is contiguous and a
   // single registration serves the arena.  Host memory deliberately: this is
   // what the backend publishes, and publishing ordinary registered DRAM is the
@@ -507,10 +515,11 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
         continue;
       }
 
-      // Zero-copy GDS: when a file engine is configured and the record sits on
-      // an O_DIRECT fd, publish a FileRef and skip the staging arena entirely —
-      // the reader (GdsEngine) DMAs the range straight into device memory.
-      if (auto loc = ssd_->LocateRecord(keys[i]); loc && loc->direct_io && loc->fd >= 0) {
+      // Zero-copy GDS (UMBP_ENABLE_GDS): when enabled, a file engine is present,
+      // and the record is on an O_DIRECT fd, publish a FileRef and skip the
+      // staging arena — the reader (GdsEngine) DMAs the range into device memory.
+      std::optional<RecordLocation> loc;
+      if (gds_enabled_ && (loc = ssd_->LocateRecord(keys[i])) && loc->direct_io && loc->fd >= 0) {
         if (void* handle = GdsHandleForFd(loc->fd)) {
           results[i].outcome = ResolveOutcome::kFound;
           results[i].found = true;

@@ -250,6 +250,12 @@ class SsdBackend : public MediumBackend {
   std::unordered_map<std::string, ReadLease> read_leases_;
   std::unordered_map<std::string, ReadLease> migration_reads_;
 
+  // Runtime kill-switch (UMBP_ENABLE_GDS=0): keep every SSD read on the staging
+  // arena even when the build has hipfile and a GdsEngine is registered.  Read
+  // once at Init; correctness never depends on it (hipfile's own compat mode
+  // already covers fastpath misses), so this is for A/B and operational safety.
+  bool gds_enabled_ = true;
+
   // GDS file handles by segment fd (see GdsHandleForFd).  On its own lock, off
   // mutex_, so a resolve holding mutex_ can register a handle without widening
   // what mutex_ guards.
