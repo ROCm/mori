@@ -36,6 +36,7 @@
 #include "mori/application/application.hpp"
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/application/utils/cpu_affinity.hpp"
+#include "mori/core/utils/utils.hpp"
 #include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem_api.hpp"
 #include "mori/utils/mori_log.hpp"
@@ -62,7 +63,7 @@ ShmemStates* ShmemStatesSingleton::GetInstance() {
   static ShmemStatesSingleton s_inst;
   int id = -1;
   HIP_RUNTIME_CHECK(hipGetDevice(&id));
-  if (__builtin_expect(id < 0 || id >= mori::kMaxGpusPerNode, 0)) {
+  if (MORI_UNLIKELY(id < 0 || id >= mori::kMaxGpusPerNode)) {
     MORI_SHMEM_ERROR("hipGetDevice() returned out-of-range id {}, max supported is {}", id,
                      mori::kMaxGpusPerNode - 1);
     assert(false);
@@ -704,7 +705,7 @@ bool ShmemIsInitialized() {
 /* ---------------------------------------------------------------------------------------------- */
 
 static void FinalizeGpuStates(ShmemStates* states) {
-  hipDeviceSynchronize();
+  (void)hipDeviceSynchronize();
   (void)hipGetLastError();
   HIP_RUNTIME_CHECK(hipFree(states->gpuStates.transportTypes));
   HIP_RUNTIME_CHECK(hipFree(states->gpuStates.rdmaEndpoints));
