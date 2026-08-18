@@ -266,7 +266,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
           static_cast<uint64_t>(config_.heartbeat_ttl.count() * 1000) / HeartbeatIntervalDivisor();
       response->set_heartbeat_interval_ms(interval_ms);
       response->set_ack_seq(0);
-      response->set_supports_max_allocatable_bytes(true);
+      response->set_supports_max_allocatable_bytes(config_.advertise_max_allocatable_bytes);
       return grpc::Status::OK;
     });
   }

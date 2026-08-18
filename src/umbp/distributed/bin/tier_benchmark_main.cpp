@@ -44,7 +44,7 @@ using mori::umbp::RandomRouteGetStrategy;
 using mori::umbp::TierType;
 constexpr uint64_t kDefaultCapacity = 256ULL << 20;
 constexpr uint64_t kDefaultPageSize = 2ULL << 20;
-constexpr auto kPublicationTimeout = std::chrono::seconds(2);
+constexpr auto kPublicationTimeout = std::chrono::seconds(5);
 constexpr auto kServerStartTimeout = std::chrono::seconds(10);
 struct Options {
   std::string command;

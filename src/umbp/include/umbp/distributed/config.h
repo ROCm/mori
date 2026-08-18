@@ -83,6 +83,13 @@ struct ClientRegistryConfig {
   // (UMBPDistributedConfig / PoolClientConfig) default their
   // `dram_page_size` to 0 and rely on this value to materialize.
   uint64_t default_dram_page_size = 2ULL * 1024 * 1024;  // 2 MiB
+
+  // Current Masters advertise this so weighted peers may heartbeat aggregate
+  // same-tier capacity together with max_allocatable_bytes. A pre-weighted
+  // Master leaves it false (proto3 default); peers then keep heartbeats at the
+  // first instance per tier so rolling upgrades cannot over-admit a value no
+  // single backend can hold. Tests set this false to emulate that Master.
+  bool advertise_max_allocatable_bytes = true;
 };
 
 struct EvictionConfig {

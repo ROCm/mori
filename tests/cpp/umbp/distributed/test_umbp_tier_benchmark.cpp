@@ -8,12 +8,14 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 
+#include "umbp/distributed/benchmark/payload.h"
 #include "umbp/distributed/benchmark/workload_runner.h"
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/master/master_server.h"
@@ -30,6 +32,53 @@ using Event = ::umbp::benchmark::WorkloadEvent;
 constexpr size_t kPageSize = 4096;
 constexpr size_t kKeysPerClient = 12;
 constexpr size_t kBackendCapacity = kPageSize * 64;
+
+uint64_t AdvertisedDramTotal(MasterServer* master, const std::string& node_id) {
+  if (master == nullptr) return 0;
+  const auto record = master->GetClient(node_id);
+  if (!record.has_value()) return 0;
+  const auto found = record->tier_capacities.find(TierType::DRAM);
+  return found == record->tier_capacities.end() ? 0 : found->second.total_bytes;
+}
+
+std::string AdvertisedDramDebug(MasterServer* master, const std::string& node_id) {
+  if (master == nullptr) return "master=null";
+  const auto record = master->GetClient(node_id);
+  if (!record.has_value()) return "no ClientRecord";
+  const auto found = record->tier_capacities.find(TierType::DRAM);
+  if (found == record->tier_capacities.end()) return "no DRAM tier";
+  return "total=" + std::to_string(found->second.total_bytes) +
+         " available=" + std::to_string(found->second.available_bytes) +
+         " max_alloc=" + std::to_string(found->second.max_allocatable_bytes);
+}
+
+bool WaitForAdvertisedDram(MasterServer* master, const std::string& node_id, uint64_t expected_total,
+                           std::optional<uint64_t> expected_available = std::nullopt) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  do {
+    const auto record = master == nullptr ? std::nullopt : master->GetClient(node_id);
+    if (record.has_value()) {
+      const auto found = record->tier_capacities.find(TierType::DRAM);
+      if (found != record->tier_capacities.end() && found->second.total_bytes == expected_total &&
+          (!expected_available.has_value() ||
+           found->second.available_bytes == *expected_available)) {
+        return true;
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  } while (std::chrono::steady_clock::now() < deadline);
+  ADD_FAILURE() << node_id << " " << AdvertisedDramDebug(master, node_id)
+                << " expected_total=" << expected_total
+                << (expected_available.has_value()
+                        ? " expected_available=" + std::to_string(*expected_available)
+                        : "");
+  return false;
+}
+
+bool WaitForAdvertisedDramTotal(MasterServer* master, const std::string& node_id,
+                                uint64_t expected) {
+  return WaitForAdvertisedDram(master, node_id, expected);
+}
 
 class VectorSource final : public bench::WorkloadSource {
  public:
@@ -310,6 +359,297 @@ TEST_F(TierBenchmarkSmokeTest, ReplaysValidatedBatchesAcrossWeightedDramBackends
       EXPECT_EQ(backend->OwnedKeyCount(), 0u);
     }
   }
+}
+
+TEST_F(TierBenchmarkSmokeTest, ClientBReadsClientAKeysWithPayloadValidation) {
+  constexpr size_t kRemoteKeys = 8;
+  constexpr uint64_t kPayloadSeed = 0xA11CE;
+  PoolClient* writer = clients_[0].get();
+  PoolClient* reader = clients_[1].get();
+  ASSERT_NE(writer, nullptr);
+  ASSERT_NE(reader, nullptr);
+
+  std::vector<std::string> keys;
+  keys.reserve(kRemoteKeys);
+  for (size_t i = 0; i < kRemoteKeys; ++i) {
+    const std::string key = "tier-remote-" + std::to_string(i);
+    auto payload = bench::GenerateDeterministicPayload(key, i + 1, kPayloadSeed, kPageSize);
+    ASSERT_TRUE(writer->Put(key, payload.data(), payload.size())) << key;
+    keys.push_back(key);
+  }
+  writer->Master().FlushHeartbeat();
+
+  for (size_t i = 0; i < kRemoteKeys; ++i) {
+    std::vector<uint8_t> got(kPageSize, 0);
+    bool ok = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    do {
+      if (reader->Get(keys[i], got.data(), got.size())) {
+        ok = true;
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    } while (std::chrono::steady_clock::now() < deadline);
+    ASSERT_TRUE(ok) << "client B missed client A's key " << keys[i];
+    EXPECT_TRUE(bench::ValidateDeterministicPayload(keys[i], i + 1, kPayloadSeed, got.data(),
+                                                    got.size()));
+  }
+}
+
+class TinyWeightedPoolTest : public ::testing::Test {
+ protected:
+  static constexpr size_t kTinyPages = 4;
+  static constexpr size_t kTinyCapacity = kPageSize * kTinyPages;
+
+  void SetUp() override {
+    MasterServerConfig config;
+    config.listen_address = "127.0.0.1:0";
+    config.metrics_port = 0;
+    config.registry_config.default_dram_page_size = kPageSize;
+    config.registry_config.heartbeat_ttl = std::chrono::seconds(1);
+    config.put_strategy = std::make_unique<ConfigurableRoutePutStrategy>(
+        ConfigurableRoutePutStrategy::SelectAlgo::kMostAvailable,
+        ConfigurableRoutePutStrategy::NodeAffinity::kLocal, 17);
+    master_ = std::make_unique<MasterServer>(std::move(config));
+    master_thread_ = std::thread([this] { master_->Run(); });
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (master_->GetBoundPort() == 0 && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_NE(master_->GetBoundPort(), 0);
+
+    PoolClientConfig client_config;
+    client_config.master_config.master_address =
+        "127.0.0.1:" + std::to_string(master_->GetBoundPort());
+    client_config.master_config.node_id = "tier-tiny-node-0";
+    client_config.master_config.node_address = "127.0.0.1";
+    client_config.master_config.auto_heartbeat = true;
+    client_config.io_engine.host = "127.0.0.1";
+    client_config.io_engine.port = 0;
+    client_config.auto_peer_service_port = true;
+    client_config.dram_page_size = kPageSize;
+    client_config.cache_remote_fetches = false;
+    client_config.placement_policy = PoolPlacementPolicy::WEIGHTED;
+
+    for (uint32_t backend_id = 0; backend_id < 2; ++backend_id) {
+      BackendInstanceConfig backend;
+      backend.name = "dram-" + std::to_string(backend_id);
+      backend.tier = TierType::DRAM;
+      backend.dram.buffer_sizes = {kTinyCapacity};
+      backend.placement_weight = backend_id == 0 ? 100u : 1u;
+      client_config.backends.push_back(std::move(backend));
+    }
+
+    client_ = std::make_unique<PoolClient>(std::move(client_config));
+    ASSERT_TRUE(client_->Init());
+    client_->Master().FlushHeartbeat();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+
+  void TearDown() override {
+    if (client_) {
+      client_->Clear();
+      client_->Shutdown();
+    }
+    client_.reset();
+    if (master_) master_->Shutdown();
+    if (master_thread_.joinable()) master_thread_.join();
+    master_.reset();
+  }
+
+  std::unique_ptr<MasterServer> master_;
+  std::thread master_thread_;
+  std::unique_ptr<PoolClient> client_;
+};
+
+TEST_F(TinyWeightedPoolTest, FallsBackThenFailsWithoutLeakingSlots) {
+  MediumBackend* primary = client_->Backends().Get("dram-0");
+  MediumBackend* fallback = client_->Backends().Get("dram-1");
+  ASSERT_NE(primary, nullptr);
+  ASSERT_NE(fallback, nullptr);
+
+  std::vector<uint8_t> value(kPageSize, 0x5A);
+  size_t succeeded = 0;
+  size_t failed = 0;
+  constexpr size_t kAttempts = kTinyPages * 2 + 4;
+  for (size_t i = 0; i < kAttempts; ++i) {
+    const std::string key = "tiny-" + std::to_string(i);
+    if (client_->Put(key, value.data(), value.size())) {
+      ++succeeded;
+    } else {
+      ++failed;
+    }
+  }
+
+  EXPECT_EQ(succeeded, 2 * kTinyPages);
+  EXPECT_EQ(failed, 4u);
+  EXPECT_EQ(primary->OwnedKeyCount(), kTinyPages)
+      << "weight 100:1 should fill dram-0 first";
+  EXPECT_EQ(fallback->OwnedKeyCount(), kTinyPages)
+      << "no-space on the primary must fall back to dram-1";
+  EXPECT_EQ(primary->OwnedKeyCount() + fallback->OwnedKeyCount(), succeeded);
+
+  const auto primary_cap = primary->Capacity();
+  const auto fallback_cap = fallback->Capacity();
+  EXPECT_EQ(primary_cap.available_bytes, 0u);
+  EXPECT_EQ(fallback_cap.available_bytes, 0u);
+  EXPECT_EQ(primary_cap.max_allocatable_bytes, 0u);
+  EXPECT_EQ(fallback_cap.max_allocatable_bytes, 0u);
+  EXPECT_EQ(primary_cap.total_bytes, kTinyCapacity);
+  EXPECT_EQ(fallback_cap.total_bytes, kTinyCapacity);
+  EXPECT_EQ(primary_cap.available_bytes + primary->OwnedKeyCount() * kPageSize,
+            primary_cap.total_bytes);
+  EXPECT_EQ(fallback_cap.available_bytes + fallback->OwnedKeyCount() * kPageSize,
+            fallback_cap.total_bytes);
+
+  ASSERT_TRUE(client_->Clear());
+  EXPECT_EQ(primary->OwnedKeyCount(), 0u);
+  EXPECT_EQ(fallback->OwnedKeyCount(), 0u);
+  EXPECT_EQ(primary->Capacity().available_bytes, kTinyCapacity);
+  EXPECT_EQ(fallback->Capacity().available_bytes, kTinyCapacity);
+}
+
+class UnequalDramWeightedPoolTest : public ::testing::Test {
+ protected:
+  static constexpr size_t kPrimaryPages = 4;
+  static constexpr size_t kSecondaryPages = 12;
+  static constexpr size_t kPrimaryCapacity = kPageSize * kPrimaryPages;
+  static constexpr size_t kSecondaryCapacity = kPageSize * kSecondaryPages;
+  static constexpr size_t kPooledCapacity = kPrimaryCapacity + kSecondaryCapacity;
+  static constexpr const char* kNodeId = "tier-cap-node-0";
+
+  void StartCluster(bool advertise_max_allocatable_bytes) {
+    MasterServerConfig config;
+    config.listen_address = "127.0.0.1:0";
+    config.metrics_port = 0;
+    config.registry_config.default_dram_page_size = kPageSize;
+    config.registry_config.heartbeat_ttl = std::chrono::seconds(1);
+    config.registry_config.advertise_max_allocatable_bytes = advertise_max_allocatable_bytes;
+    config.put_strategy = std::make_unique<ConfigurableRoutePutStrategy>(
+        ConfigurableRoutePutStrategy::SelectAlgo::kMostAvailable,
+        ConfigurableRoutePutStrategy::NodeAffinity::kLocal, 17);
+    master_ = std::make_unique<MasterServer>(std::move(config));
+    master_thread_ = std::thread([this] { master_->Run(); });
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (master_->GetBoundPort() == 0 && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_NE(master_->GetBoundPort(), 0);
+
+    PoolClientConfig client_config;
+    client_config.master_config.master_address =
+        "127.0.0.1:" + std::to_string(master_->GetBoundPort());
+    client_config.master_config.node_id = kNodeId;
+    client_config.master_config.node_address = "127.0.0.1";
+    client_config.master_config.auto_heartbeat = true;
+    client_config.io_engine.host = "127.0.0.1";
+    client_config.io_engine.port = 0;
+    client_config.auto_peer_service_port = true;
+    client_config.dram_page_size = kPageSize;
+    client_config.cache_remote_fetches = false;
+    client_config.placement_policy = PoolPlacementPolicy::WEIGHTED;
+
+    BackendInstanceConfig primary;
+    primary.name = "dram-0";
+    primary.tier = TierType::DRAM;
+    primary.dram.buffer_sizes = {kPrimaryCapacity};
+    primary.placement_weight = 1;
+    client_config.backends.push_back(std::move(primary));
+
+    BackendInstanceConfig secondary;
+    secondary.name = "dram-1";
+    secondary.tier = TierType::DRAM;
+    secondary.dram.buffer_sizes = {kSecondaryCapacity};
+    secondary.placement_weight = 1;
+    client_config.backends.push_back(std::move(secondary));
+
+    client_ = std::make_unique<PoolClient>(std::move(client_config));
+    ASSERT_TRUE(client_->Init());
+    client_->Master().FlushHeartbeat();
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    client_->Master().FlushHeartbeat();
+  }
+
+  void TearDown() override {
+    if (client_) {
+      client_->Clear();
+      client_->Shutdown();
+    }
+    client_.reset();
+    if (master_) master_->Shutdown();
+    if (master_thread_.joinable()) master_thread_.join();
+    master_.reset();
+  }
+
+  size_t FillLocalPool(const std::string& key_prefix) {
+    std::vector<uint8_t> value(kPageSize, 0x3C);
+    size_t succeeded = 0;
+    const size_t attempts = kPrimaryPages + kSecondaryPages;
+    for (size_t i = 0; i < attempts; ++i) {
+      if (client_->Put(key_prefix + std::to_string(i), value.data(), value.size())) ++succeeded;
+    }
+    return succeeded;
+  }
+
+  std::unique_ptr<MasterServer> master_;
+  std::thread master_thread_;
+  std::unique_ptr<PoolClient> client_;
+};
+
+class NewMasterWeightedPoolTest : public UnequalDramWeightedPoolTest {
+ protected:
+  void SetUp() override { StartCluster(/*advertise_max_allocatable_bytes=*/true); }
+};
+
+class LegacyMasterWeightedPoolTest : public UnequalDramWeightedPoolTest {
+ protected:
+  void SetUp() override { StartCluster(/*advertise_max_allocatable_bytes=*/false); }
+};
+
+TEST_F(NewMasterWeightedPoolTest, NegotiatesMaxAllocatableAndSumsSameTierCapacity) {
+  EXPECT_TRUE(client_->Master().SupportsMaxAllocatableCapacity())
+      << "current Master must advertise supports_max_allocatable_bytes so weighted "
+         "peers can aggregate same-tier capacity";
+
+  MediumBackend* primary = client_->Backends().Get("dram-0");
+  MediumBackend* secondary = client_->Backends().Get("dram-1");
+  ASSERT_NE(primary, nullptr);
+  ASSERT_NE(secondary, nullptr);
+  EXPECT_EQ(primary->Capacity().total_bytes + secondary->Capacity().total_bytes, kPooledCapacity);
+
+  EXPECT_EQ(FillLocalPool("new-master-"), kPrimaryPages + kSecondaryPages);
+  EXPECT_GT(primary->OwnedKeyCount(), 0u);
+  EXPECT_GT(secondary->OwnedKeyCount(), 0u);
+
+  client_->Master().FlushHeartbeat();
+  EXPECT_TRUE(WaitForAdvertisedDram(master_.get(), kNodeId, kPooledCapacity, /*available=*/0))
+      << "new Master must store the aggregated same-tier pool, not the first instance";
+  EXPECT_NE(AdvertisedDramTotal(master_.get(), kNodeId), kPrimaryCapacity);
+}
+
+TEST_F(LegacyMasterWeightedPoolTest, KeepsFirstInstanceCapacityAndStillPlacesOnBothBackends) {
+  EXPECT_FALSE(client_->Master().SupportsMaxAllocatableCapacity())
+      << "omitting supports_max_allocatable_bytes must disable aggregate heartbeats";
+
+  MediumBackend* primary = client_->Backends().Get("dram-0");
+  MediumBackend* secondary = client_->Backends().Get("dram-1");
+  ASSERT_NE(primary, nullptr);
+  ASSERT_NE(secondary, nullptr);
+
+  EXPECT_EQ(FillLocalPool("legacy-"), kPrimaryPages + kSecondaryPages);
+  EXPECT_GT(primary->OwnedKeyCount(), 0u);
+  EXPECT_GT(secondary->OwnedKeyCount(), 0u);
+  EXPECT_EQ(primary->OwnedKeyCount() + secondary->OwnedKeyCount(), kPrimaryPages + kSecondaryPages)
+      << "weighted placement remains enabled under a legacy Master; only advertisement shrinks";
+
+  client_->Master().FlushHeartbeat();
+  EXPECT_TRUE(WaitForAdvertisedDram(master_.get(), kNodeId, kPrimaryCapacity, /*available=*/0))
+      << "heartbeats stay at the first same-tier instance so the old Master cannot "
+         "over-admit a value larger than any single backend";
+  EXPECT_EQ(AdvertisedDramTotal(master_.get(), kNodeId), kPrimaryCapacity);
+  EXPECT_NE(AdvertisedDramTotal(master_.get(), kNodeId), kPooledCapacity);
 }
 
 }  // namespace

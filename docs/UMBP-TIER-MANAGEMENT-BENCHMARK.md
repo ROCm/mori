@@ -43,6 +43,36 @@ Generate a reusable trace and replay it under another policy:
 
 Use `umbp_tier_bench <subcommand> --help` for the complete option list.
 
+**Page size vs value size.** Each value occupies a whole page. The defaults
+(`page_size=2MiB`, `backend_capacity=256MiB`) only hold 128 keys per backend.
+A 4KiB value still consumes 2MiB. For small-value policy sweeps use
+`--page-size 64KiB --backend-capacity 2GiB` (or size capacity as
+`page_size * key_count`).
+
+**GET affinity.** Synthetic PUT/GET pairs for one key stay on one client
+stream. `--affinity none` plus `--get-strategy local` can still miss: Master
+`most_available` may place the PUT on another node, and the producing client's
+local GET then waits out the publication retry. For GET-heavy same-client
+profiles use `--affinity local`. To exercise the remote RDMA path, PUT from
+one client and GET from another (see `test_umbp_tier_benchmark`).
+
+**RDMA QP depth.** `mori_io` defaults `max_send_wr=8192`. On some mlx5 devices
+that depth times SGE/inline exceeds the per-QP work-queue budget, so
+`ibv_create_qp` returns EINVAL even though `max_qp_wr` is larger. The runtime
+retries with a halved send depth down to 256 and logs the chosen value. To pin
+a depth:
+
+```bash
+export MORI_IO_QP_MAX_SEND_WR=1024
+export MORI_IO_QP_MAX_CQE=4096
+```
+
+Also set `LD_LIBRARY_PATH` to the build tree (`build/src/application:build/src/io:build/src/metrics`)
+when running binaries from `build/`.
+
+**SSD.** Values must not exceed `--page-size`. `max_allocatable_bytes` for an
+SSD backend is `min(available_bytes, page_size)`.
+
 The workload controls are profile, seed, operation and key counts, minimum and
 maximum value size, value-size distribution, read ratio, client count, batch
 size, and QPS. Cluster controls select DRAM, HBM, or SSD; backend count,
@@ -88,7 +118,7 @@ sequence. Disable checking with `--no-payload-validation` when replaying a
 future externally recorded trace without payload identity.
 
 Successful PUTs flush heartbeat publication. A GET for a key produced by the
-same run retries for a fixed two seconds while that publication is pending, so
+same run retries for a fixed five seconds while that publication is pending, so
 asynchronous Master visibility is not reported as a storage miss.
 
 ## Results

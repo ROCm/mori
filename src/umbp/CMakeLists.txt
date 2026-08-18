@@ -255,6 +255,18 @@ elseif(NOT _PROTOBUF_MM)
   message(FATAL_ERROR "[UMBP] cannot determine libprotobuf header version.")
 endif()
 
+# umbp_peer.proto declares a proto3 `optional` field. protoc only accepts that
+# behind an opt-in flag before 3.15, and Dockerfile.dev still pins Ubuntu
+# jammy's 3.12.
+set(_PROTOC_PROTO3_OPTIONAL_ARGS)
+if(_PROTOC_MM VERSION_LESS "3.15")
+  list(APPEND _PROTOC_PROTO3_OPTIONAL_ARGS --experimental_allow_proto3_optional)
+  message(
+    STATUS
+      "[UMBP] protoc ${_PROTOC_MM} < 3.15 — enabling --experimental_allow_proto3_optional"
+  )
+endif()
+
 message(
   STATUS "[UMBP] gRPC + Protobuf found — distributed control plane ENABLED")
 
@@ -292,7 +304,8 @@ add_custom_command(
   COMMAND
     ${_PROTOBUF_PROTOC} --proto_path=${UMBP_PROTO_DIR}
     --cpp_out=${UMBP_PROTO_GEN_DIR} --grpc_out=${UMBP_PROTO_GEN_DIR}
-    --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN} ${UMBP_PROTO_FILE}
+    --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN}
+    ${_PROTOC_PROTO3_OPTIONAL_ARGS} ${UMBP_PROTO_FILE}
   DEPENDS ${UMBP_PROTO_FILE}
   COMMENT "Generating UMBP protobuf/gRPC C++ sources"
   VERBATIM)
@@ -303,7 +316,8 @@ add_custom_command(
   COMMAND
     ${_PROTOBUF_PROTOC} --proto_path=${UMBP_PROTO_DIR}
     --cpp_out=${UMBP_PROTO_GEN_DIR} --grpc_out=${UMBP_PROTO_GEN_DIR}
-    --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN} ${UMBP_PEER_PROTO_FILE}
+    --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN}
+    ${_PROTOC_PROTO3_OPTIONAL_ARGS} ${UMBP_PEER_PROTO_FILE}
   # umbp_peer.proto imports umbp.proto for shared types (TierType, PageLocation,
   # BufferMemoryDesc) — protoc reads it at generation time and the generated
   # peer headers include "umbp.pb.h", so the peer generation depends on the
@@ -318,7 +332,8 @@ add_custom_command(
   COMMAND
     ${_PROTOBUF_PROTOC} --proto_path=${UMBP_PROTO_DIR}
     --cpp_out=${UMBP_PROTO_GEN_DIR} --grpc_out=${UMBP_PROTO_GEN_DIR}
-    --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN} ${UMBP_STANDALONE_PROTO_FILE}
+    --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN}
+    ${_PROTOC_PROTO3_OPTIONAL_ARGS} ${UMBP_STANDALONE_PROTO_FILE}
   DEPENDS ${UMBP_STANDALONE_PROTO_FILE} ${UMBP_PROTO_FILE} ${UMBP_PROTO_HDRS}
   COMMENT "Generating UMBP Standalone protobuf/gRPC C++ sources"
   VERBATIM)
@@ -327,7 +342,8 @@ add_custom_command(
   OUTPUT ${UMBP_WORKLOAD_PROTO_SRCS} ${UMBP_WORKLOAD_PROTO_HDRS}
   COMMAND
     ${_PROTOBUF_PROTOC} --proto_path=${UMBP_PROTO_DIR}
-    --cpp_out=${UMBP_PROTO_GEN_DIR} ${UMBP_WORKLOAD_PROTO_FILE}
+    --cpp_out=${UMBP_PROTO_GEN_DIR} ${_PROTOC_PROTO3_OPTIONAL_ARGS}
+    ${UMBP_WORKLOAD_PROTO_FILE}
   DEPENDS ${UMBP_WORKLOAD_PROTO_FILE}
   COMMENT "Generating UMBP workload trace protobuf C++ sources"
   VERBATIM)
