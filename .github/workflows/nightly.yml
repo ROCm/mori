@@ -566,7 +566,7 @@ jobs:
 
       - name: Build MORI-IO C++ bench_engine (both nodes)
         run: |
-          BUILD_CMD="cd $GITHUB_WORKSPACE && cmake -B build -DBUILD_IO=ON -DBUILD_TESTS=ON -DBUILD_EXAMPLES=OFF && cmake --build build --target bench_engine -j && ls -la build/tests/cpp/bench_engine"
+          BUILD_CMD="cd $GITHUB_WORKSPACE && cmake -B build -DBUILD_IO=ON -DBUILD_TESTS=ON -DBUILD_EXAMPLES=OFF -DBUILD_PYBINDS=OFF&& cmake --build build --target bench_engine -j && ls -la build/tests/cpp/bench_engine"
           $CT exec $CONTAINER bash -c "$BUILD_CMD"
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "$CT exec $CONTAINER bash -c \"$BUILD_CMD\""
 
