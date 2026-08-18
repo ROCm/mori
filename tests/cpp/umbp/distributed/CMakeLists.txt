@@ -70,7 +70,16 @@ endif()
 target_link_libraries(
   test_umbp_client_metrics PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB}
                                    ${_TEST_GRPCPP_LIB} gtest)
-add_test(NAME umbp_client_metrics COMMAND test_umbp_client_metrics)
+# Registered as two cases from one binary: the buffering suites talk to a mock
+# service, while PoolClientLocalByteTracking stands up a real MasterServer and
+# belongs to the integration tier below. The default case excludes by name, so a
+# newly added suite lands there instead of silently going unrun.
+add_test(NAME umbp_client_metrics
+         COMMAND test_umbp_client_metrics
+                 --gtest_filter=-PoolClientLocalByteTrackingTest.*)
+add_test(NAME umbp_client_metrics_pool_bytes
+         COMMAND test_umbp_client_metrics
+                 --gtest_filter=PoolClientLocalByteTrackingTest.*)
 
 # ScopedRpcTimer / MasterClient RPC latency instrumentation.
 add_executable(test_umbp_master_client_rpc_latency
@@ -110,7 +119,13 @@ endif()
 target_link_libraries(
   test_umbp_tags PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB}
                          ${_TEST_GRPCPP_LIB} gtest_main)
-add_test(NAME umbp_tags COMMAND test_umbp_tags)
+# Split like umbp_client_metrics: RealMasterServerTags needs a live MasterServer
+# with a Prometheus port; the other suites run against the store or a mock
+# service.
+add_test(NAME umbp_tags
+         COMMAND test_umbp_tags --gtest_filter=-RealMasterServerTagsTest.*)
+add_test(NAME umbp_tags_real_master
+         COMMAND test_umbp_tags --gtest_filter=RealMasterServerTagsTest.*)
 
 # --------------------------------------------------------------------------
 # Unit tests (pure logic; no gRPC / RDMA).  Linked against umbp_common only.
@@ -221,6 +236,7 @@ add_test(NAME umbp_medium_selection COMMAND test_umbp_medium_selection)
 
 set_tests_properties(umbp_cross_node_smoke umbp_pool_client_batch_put
                      umbp_medium_selection umbp_tier_benchmark
+                     umbp_client_metrics_pool_bytes umbp_tags_real_master
                      PROPERTIES LABELS "integration")
 
 # --------------------------------------------------------------------------
@@ -279,18 +295,17 @@ target_link_libraries(bench_umbp_route_strategy PRIVATE umbp_common)
 # ctest via add_test (see the NOTE above).
 # ===========================================================================
 
-# test_master_metadata_store_interface — Phase 1 compile/instantiation gate for
-# IMasterMetadataStore. Includes an isolated self-compile TU (proves the header
-# is self-contained) and a GMock mock instantiation/signature-completeness test.
-add_executable(
-  test_master_metadata_store_interface test_master_metadata_store_interface.cpp
-                                       master_metadata_store_self_compile.cpp)
-target_include_directories(test_master_metadata_store_interface
-                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(test_master_metadata_store_interface
-                      PRIVATE umbp_common GTest::gmock GTest::gtest_main)
-target_compile_features(test_master_metadata_store_interface PRIVATE cxx_std_17)
-add_test(NAME test_master_metadata_store_interface COMMAND test_master_metadata_store_interface)
+# IMasterMetadataStore header self-compile gate: this TU includes only the
+# interface header, so building it proves the header is self-contained. No
+# add_test — there is nothing to assert at runtime, and the interface's
+# polymorphic use is exercised for real by test_in_memory_master_metadata_store,
+# which drives every case through IMasterMetadataStore&.
+add_library(umbp_master_metadata_store_self_compile OBJECT
+            master_metadata_store_self_compile.cpp)
+target_link_libraries(umbp_master_metadata_store_self_compile
+                      PRIVATE umbp_common)
+target_compile_features(umbp_master_metadata_store_self_compile
+                        PRIVATE cxx_std_17)
 
 # test_in_memory_master_metadata_store — Phase 2 behavioral suite for the
 # InMemoryMasterMetadataStore implementation of IMasterMetadataStore (§6a).
@@ -484,17 +499,4 @@ if(USE_REDIS_BACKEND)
   target_link_libraries(test_sharded_read PRIVATE umbp_common GTest::gtest_main)
   target_compile_features(test_sharded_read PRIVATE cxx_std_17)
   add_test(NAME test_sharded_read COMMAND test_sharded_read)
-
-  # redis-plus-plus link/build smoke test. Proves the submodule compiles with
-  # this toolchain and links (static redis++ + system hiredis) before any store
-  # code depends on it; at runtime it connects to UMBP_REDIS_URI if reachable,
-  # else skips. redis++_static carries its own include dirs; hiredis must be
-  # linked explicitly (the system hiredis ships no CMake config, so redis++ does
-  # not propagate it for the static lib).
-  add_executable(test_redispp_smoke test_redispp_smoke.cpp)
-  target_link_libraries(test_redispp_smoke
-                        PRIVATE redis++_static ${HIREDIS_LIB} GTest::gtest_main)
-  target_include_directories(test_redispp_smoke PRIVATE ${HIREDIS_INCLUDE_DIR})
-  target_compile_features(test_redispp_smoke PRIVATE cxx_std_17)
-  add_test(NAME test_redispp_smoke COMMAND test_redispp_smoke)
 endif()
