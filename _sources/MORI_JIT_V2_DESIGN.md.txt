@@ -434,7 +434,7 @@ scales 转发、routing replay、`local_expert_count`。这些在 FlyDSL 后端�
 | `test_ep_backend_parity.py` | EP8，一个进程内两个后端 | 同一输入逐元素比对 |
 | `test_graph_capture.py` | EP8 | dispatch → identity expert → combine 整步捕成一张图并 replay |
 | `test_asym_dtype.py` | EP8 | fp8/fp4 dispatch + bf16 combine |
-| `bench_ep.py` | EP4/EP8 | `hip_tuning_configs` 的几何扫描 |
+| `bench_ep.py` | EP4/EP8 | 性能 bench（各后端通用）；`DBN`/`DWPB`/`CBN`/`CWPB` 钉住几何即用于 `hip_tuning_configs` 调优 |
 
 `test_jit_binding.py` 在 CI 里**从 `/tmp` 跑**，不是从 checkout 跑：建一个 plan 需要
 `libmori_jit.so`、`libmori_ops_v2.so` 和 v2 的 kernel 源码，而在仓库目录下这三样都能从 `build/`
