@@ -47,6 +47,7 @@
 #include "umbp/common/range_utils.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/peer/backend/hbm_backend.h"
+#include "umbp/distributed/peer/backend/instrumented_backend.h"
 #include "umbp/distributed/peer/backend/page_backend.h"
 #include "umbp/distributed/peer/backend/ssd_backend.h"
 #include "umbp/distributed/peer/batch_resolve_codec.h"
@@ -410,6 +411,15 @@ bool PoolClient::Init() {
     return false;
   }
 
+  // Instrumentation goes on HERE, once, for whatever the switch above built.
+  // This single line is why "add a backend" is not also "add its metrics": the
+  // decorator derives the generic series from the MediumBackend interface, so a
+  // medium added tomorrow reports the same ops / bytes / latency as DRAM does
+  // today and lands in the dashboard panels that already exist.  The medium
+  // itself only publishes what the interface cannot show (see
+  // instrumented_backend.h and MediumBackend's observability section).
+  backend = MakeInstrumentedBackend(std::move(backend));
+
   // Narrowed to MemoryRegistrar: a backend publishes endpoints, it does not
   // move bytes, and that is now a compile-time fact (design doc §5 Rule C).
   medium_ = backend->Tier();
@@ -452,11 +462,13 @@ bool PoolClient::Init() {
 
   master_client_->SetBackendRegistry(&registry_);
 
-  // Medium-specific counters (SSD read outcomes, single-flight coalescing,
-  // eviction, staging pressure) ride the existing metrics tick.  Backend-
-  // agnostic by construction: PoolClient forwards whatever each backend names
-  // and never learns which medium produced it.
-  master_client_->AddMetricsProvider([this] { PublishBackendCounters(); });
+  // Every instrumented component on this node rides the existing metrics tick:
+  // the storage backend (generic slot-lifecycle series from the decorator, plus
+  // whatever the medium says about its own internals) and the transfer engine
+  // (per-engine bytes, plans and in-flight time).  Backend-agnostic by
+  // construction — PoolClient forwards what each component samples and never
+  // learns which medium or transport produced it.
+  master_client_->AddMetricsProvider([this] { PublishComponentMetrics(); });
 
   // Pack engine_desc for master registration.
   std::vector<uint8_t> engine_desc_bytes;
@@ -2508,36 +2520,33 @@ bool PoolClient::EnsurePeerServiceConnection(PeerConnection& peer) {
   return true;
 }
 
-void PoolClient::PublishBackendCounters() {
+void PoolClient::PublishComponentMetrics() {
   if (!master_client_) return;
 
+  MetricPublisher::Sink sink{
+      [this](const char* name, const char* help, const MetricLabels& labels, double delta) {
+        master_client_->AddCounter(name, help, labels, delta);
+      },
+      [this](const char* name, const char* help, const MetricLabels& labels, double value) {
+        master_client_->SetGauge(name, help, labels, value);
+      }};
+
+  // Storage backends.  tier= and backend= come from the component's own
+  // identity, so this loop never names a medium and a fourth one needs no edit
+  // here.  Both halves of a backend's metrics — the generic series
+  // InstrumentedBackend measured and whatever the medium publishes about its
+  // own internals — arrive through the one SampleMetrics() call.
   for (MediumBackend* backend : registry_.All()) {
     if (backend == nullptr) continue;
-    const char* backend_name = backend->Name();
-    for (auto& c : backend->Counters()) {
-      if (c.name == nullptr) continue;
+    const MetricLabels labels = {{"tier", TierTypeName(backend->Tier())},
+                                 {"backend", backend->Name()}};
+    metric_publisher_.Publish(std::string("backend:") + backend->Name(), labels, *backend, sink);
+  }
 
-      // Identity = backend + metric + labels.  Two backends reporting the same
-      // metric name must not share a delta baseline, or one would cancel the
-      // other's progress out.
-      std::string id = backend_name;
-      id += '\0';
-      id += c.name;
-      for (const auto& [k, v] : c.labels) {
-        id += '\0';
-        id += k;
-        id += '=';
-        id += v;
-      }
-
-      uint64_t& last = backend_counter_last_[id];
-      // Monotonic by contract; a decrease means the backend was rebuilt, so
-      // rebase instead of shipping a negative delta.
-      if (c.value > last) {
-        master_client_->AddCounter(c.name, c.help, c.labels, static_cast<double>(c.value - last));
-      }
-      last = c.value;
-    }
+  // The transfer layer.  Its samples already carry engine=, stamped by the
+  // composite that dispatched them, so there is nothing to add at this level.
+  if (transfer_engine_ != nullptr) {
+    metric_publisher_.Publish("transfer", {}, *transfer_engine_, sink);
   }
 }
 

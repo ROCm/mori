@@ -262,6 +262,20 @@ New external dependencies are usually already transitively available —
 `HbmCopyEngine` could call `hipMemcpy` with no CMake change beyond the source
 listing.
 
+That `AddEngine` call is also all the observability wiring there is.
+`CompositeTransferEngine` is the dispatch point, so it is the measurement point:
+it charges bytes, plan counts, failures and in-flight time to whichever engine
+carried each plan and publishes them under `engine=<your Name()>,
+direction=push|pull|local`. Your engine appears in the transfer panels of
+`examples/monitoring/grafana/dashboards/umbp_backends.json` without a line of
+metrics code.
+
+Override `SampleMetrics()` (from `MetricSource`) only for transport-internal
+state the dispatcher cannot see — bounce-pool pressure, queue depth. Name the
+metric generically and put the specifics in a label, the way a storage backend
+does; `engine=` is stamped for you. See
+`umbp/distributed/metrics/component_metrics.h`.
+
 ## Testing
 
 Split the suite the way the layer splits:

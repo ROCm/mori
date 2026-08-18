@@ -187,7 +187,7 @@ for HiCache's L3 path to initialize, but `random` routing skips any node that
 | Adding drives or nodes doesn't add bandwidth | Writes are skewed. Set `UMBP_ROUTE_PUT_SELECT_ALGO=random`, check `UMBP_ROUTE_PUT_NODE_AFFINITY=none` |
 | `random` set but still skewed | It was set on the engine instead of `umbp_master`. Check the master's startup strategy line |
 | Reads report misses under load | Read staging slots exhausted. Raise `ssd_staging_buffer_slots` or `UMBP_SSD_GET_MAX_ATTEMPTS` |
-| Puts fail on an SSD node | The staging arena is exhausted, so `BatchAllocate` had no page to hand out. Check `mori_umbp_ssd_staging_slot_full_rejects_total` and raise `ssd_staging_buffer_slots` |
+| Puts fail on an SSD node | The staging arena is exhausted, so `BatchAllocate` had no page to hand out. Check `mori_umbp_backend_medium_events_total{tier="SSD", event="staging_slot_full_reject"}` and raise `ssd_staging_buffer_slots` |
 | Node comes up with an empty cache after an upgrade | On-disk record format changed; older records are dropped on version mismatch |
 | Tier fills far earlier than expected | Capacity is charged in padded bytes — small values pay up to 16× |
 | Startup rejects `medium: SSD` | `ssd.capacity_bytes` or `ssd.segment_size_bytes` is 0 — the selected medium must be sized |

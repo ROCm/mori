@@ -173,7 +173,7 @@ class SsdBackend : public MediumBackend {
 
   // PeerSsdManager's read/eviction counters plus this class's own staging-arena
   // counters, as monotonic values.  PoolClient ships the deltas.
-  std::vector<MediumCounter> Counters() const override;
+  std::vector<MetricSample> SampleMetrics() const override;
 
   uint64_t PageSize() const override { return cfg_.page_size; }
   std::vector<BufferMemoryDescBytes> AllBufferDescs() const override;
@@ -248,6 +248,9 @@ class SsdBackend : public MediumBackend {
   // (see the class comment on why exhaustion has to surface that way).
   std::atomic<uint64_t> slot_full_rejects_{0};
   std::atomic<uint64_t> staging_expired_reclaims_{0};
+  // Live arena occupancy, mirrored out of free_pages_ so SampleMetrics can read
+  // it without taking mutex_ (the metrics tick must never contend with a read).
+  std::atomic<uint64_t> staging_pages_in_use_{0};
   bool initialized_ = false;
   MemoryRegistrar* registrar_ = nullptr;
 

@@ -755,8 +755,10 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
         for (const auto& l : s.labels()) labels.push_back({l.name(), l.value()});
         switch (s.value_case()) {
           case ::umbp::MetricSample::kCounterDelta:
-            metrics_->addCounter(s.name(), s.help(), labels,
-                                 static_cast<uint64_t>(s.counter_delta()));
+            // No cast: the wire already carries a double, and flooring it here
+            // is what silently zeroed every fractional counter a component
+            // reported (a *_seconds_total never survives a uint64 truncation).
+            metrics_->addCounter(s.name(), s.help(), labels, s.counter_delta());
             break;
           case ::umbp::MetricSample::kGaugeValue:
             metrics_->setGauge(s.name(), s.help(), labels, s.gauge_value());

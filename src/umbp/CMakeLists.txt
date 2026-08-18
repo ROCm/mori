@@ -349,9 +349,11 @@ add_library(
   distributed/routing/router.cpp
   distributed/routing/route_get_strategy.cpp
   distributed/routing/route_put_strategy.cpp
+  distributed/metrics/component_metrics.cpp
   distributed/peer/backend/page_backend.cpp
   distributed/peer/backend/hbm_backend.cpp
   distributed/peer/backend/ssd_backend.cpp
+  distributed/peer/backend/instrumented_backend.cpp
   distributed/transfer/transfer_engine.cpp
   distributed/transfer/mori_io_engine.cpp
   distributed/transfer/local_copy_engine.cpp

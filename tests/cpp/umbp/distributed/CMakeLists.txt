@@ -312,6 +312,17 @@ target_link_libraries(test_transfer_engine PRIVATE umbp_common GTest::gtest_main
 target_compile_features(test_transfer_engine PRIVATE cxx_std_17)
 add_test(NAME test_transfer_engine COMMAND test_transfer_engine)
 
+# test_component_metrics — the observability seam: MetricPublisher's delta /
+# gauge / baseline rules, InstrumentedBackend deriving the generic backend
+# series from the MediumBackend interface alone (asserted against MockBackend,
+# which carries no metrics code — that is the genericity guarantee), and the
+# composite transfer engine's per-engine byte/plan accounting.
+add_executable(test_component_metrics test_component_metrics.cpp)
+target_link_libraries(test_component_metrics PRIVATE umbp_common
+                                                     GTest::gtest_main)
+target_compile_features(test_component_metrics PRIVATE cxx_std_17)
+add_test(NAME test_component_metrics COMMAND test_component_metrics)
+
 # test_hbm_backend — the HBM medium and the engine that had to exist for it:
 # HbmCopyEngine's selection/planner (no GPU needed) plus real H2D/D2H/D2D bytes
 # and a Put/Get round trip against an hipMalloc'd pool (skipped without a GPU).

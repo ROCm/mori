@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "mori/io/common.hpp"
+#include "umbp/distributed/metrics/component_metrics.h"
 #include "umbp/distributed/types.h"
 
 namespace mori::umbp {
@@ -319,9 +320,16 @@ class TransferHandle {
 // ---------------------------------------------------------------------------
 //  TransferEngine
 // ---------------------------------------------------------------------------
-class TransferEngine : public MemoryRegistrar {
+class TransferEngine : public MemoryRegistrar, public MetricSource {
  public:
   virtual const char* Name() const = 0;
+
+  // Observability, same split as MediumBackend: an engine does NOT count its
+  // own plans, bytes or in-flight time — CompositeTransferEngine derives those
+  // from the dispatch it already performs, so a new engine added with
+  // AddEngine() is measured without a line of metrics code.  SampleMetrics()
+  // (from MetricSource) is only for transport-internal state a dispatcher
+  // cannot see, e.g. bounce-pool pressure.  engine= is added by the publisher.
 
   // Can this engine move bytes from `src` to `dst`?  Engine selection is a
   // function of the PAIR, never of either endpoint alone.
