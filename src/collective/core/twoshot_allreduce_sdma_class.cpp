@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 
 #include "mori/shmem/shmem.hpp"
@@ -35,19 +36,44 @@
 namespace mori {
 namespace collective {
 
+namespace {
+template <typename T>
+size_t FixedSlotElements(size_t input_buffer_size, int npes) {
+  if (npes <= 0) throw std::invalid_argument("npes must be positive");
+  if (input_buffer_size == 0 || input_buffer_size % sizeof(T) != 0)
+    throw std::invalid_argument("input_buffer_size must be a positive whole number of elements");
+  constexpr size_t pack_size = 16 / sizeof(T);
+  const size_t elements = input_buffer_size / sizeof(T);
+  const size_t shard = (elements + static_cast<size_t>(npes) - 1) / static_cast<size_t>(npes);
+  const size_t rounded = ((shard + pack_size - 1) / pack_size) * pack_size;
+  if (rounded > std::numeric_limits<size_t>::max() - 64)
+    throw std::overflow_error("AllReduce scratch size overflow");
+  return rounded + 64;
+}
+
+template <typename T>
+size_t FixedScratchBytes(size_t input_buffer_size, int npes) {
+  const size_t slot = FixedSlotElements<T>(input_buffer_size, npes);
+  if (slot > std::numeric_limits<size_t>::max() / (static_cast<size_t>(npes) + 1) / sizeof(T))
+    throw std::overflow_error("AllReduce scratch size overflow");
+  return (static_cast<size_t>(npes) + 1) * slot * sizeof(T);
+}
+}  // namespace
+
 // ---------------------------------------------------------------------------
 // Delegating constructor
 // ---------------------------------------------------------------------------
 template <typename T>
 AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t transit_buffer_size,
                                 bool copy_output_to_user, bool /*use_graph_mode*/)
-    : AllreduceSdma(myPe, npes, 0, transit_buffer_size, copy_output_to_user, false) {}
+    : AllreduceSdma(myPe, npes, transit_buffer_size, transit_buffer_size, copy_output_to_user,
+                    false) {}
 
 // ---------------------------------------------------------------------------
 // Main constructor
 // ---------------------------------------------------------------------------
 template <typename T>
-AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t /*input_buffer_size*/,
+AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t input_buffer_size,
                                 size_t output_buffer_size, bool copy_output_to_user,
                                 bool /*use_graph_mode*/)
     : myPe_(myPe),
@@ -58,20 +84,23 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t /*input_buffer_size*/
       barrierPtr_(nullptr),
       barrierMem_(nullptr, ShmemDeleter()),
       input_transit_buffer_(nullptr),
-      input_transit_buffer_size_(0),
+      input_transit_buffer_size_(FixedScratchBytes<T>(input_buffer_size, npes)),
+      slot_stride_elements_(FixedSlotElements<T>(input_buffer_size, npes)),
       input_transit_buffer_ptr_(nullptr, ShmemDeleter()),
-      output_transit_buffer_(nullptr),
-      output_transit_buffer_size_(output_buffer_size),
-      output_transit_buffer_ptr_(nullptr, ShmemDeleter()),
       async_in_progress_(false),
       async_input_(nullptr),
       async_output_(nullptr),
       async_total_count_(0),
       async_stream_(nullptr),
+      async_start_event_(nullptr),
       async_start_time_(0.0),
       copy_output_to_user_(copy_output_to_user) {
+  (void)output_buffer_size;
+  if (myPe_ < 0 || myPe_ >= npes_) throw std::invalid_argument("myPe must be in [0, npes)");
+  if (max_blocks_ > kSdmaMaxBlocks)
+    throw std::runtime_error("GPU block count exceeds one-shot barrier capacity");
   // 1. Allocate SDMA completion flags
-  size_t flagsSize = npes_ * sizeof(uint64_t);
+  size_t flagsSize = 2 * npes_ * sizeof(uint64_t);
   void* flags = shmem::ShmemMalloc(flagsSize);
   if (!flags) throw std::runtime_error("Failed to allocate flags memory");
   flags_.reset(static_cast<uint64_t*>(flags));
@@ -88,22 +117,27 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t /*input_buffer_size*/
   hipError_t me = hipMemset(bMem, 0, barrierSize);
   if (me != hipSuccess) throw std::runtime_error("Failed to zero-init barrier memory");
 
-  // 3. Allocate output transit buffer (gather + reduce + allgather)
-  output_transit_buffer_ = shmem::ShmemMalloc(output_transit_buffer_size_);
-  if (!output_transit_buffer_) throw std::runtime_error("Failed to allocate output transit buffer");
-  output_transit_buffer_ptr_.reset(output_transit_buffer_);
+  // 3. Allocate a fixed-stride reduce-scatter scratch buffer. Keeping rank
+  // slots at stable offsets prevents a region written by a prior CU reduce
+  // from becoming an SDMA-written peer slot when graph message sizes change.
+  input_transit_buffer_ = shmem::ShmemMalloc(input_transit_buffer_size_);
+  if (!input_transit_buffer_) throw std::runtime_error("Failed to allocate input transit buffer");
+  input_transit_buffer_ptr_.reset(input_transit_buffer_);
+  input_transit_buffer_obj_ =
+      shmem::ShmemSymmetricRegister(input_transit_buffer_, input_transit_buffer_size_);
+  if (!input_transit_buffer_obj_.IsValid())
+    throw std::runtime_error("Failed to register input transit buffer");
 
-  output_transit_buffer_obj_ =
-      shmem::ShmemSymmetricRegister(output_transit_buffer_, output_transit_buffer_size_);
-  if (!output_transit_buffer_obj_.IsValid())
-    throw std::runtime_error("Failed to register output transit buffer");
+  hipError_t event_err = hipEventCreateWithFlags(&async_start_event_, hipEventDisableTiming);
+  if (event_err != hipSuccess)
+    throw std::runtime_error("Failed to create async stream-ordering event");
 
   printf("AllreduceSdma(SDMA) initialized: PE %d of %d, max_blocks=%d\n", myPe_, npes_,
          max_blocks_);
   printf("  Flags: %zu bytes at %p\n", flagsSize, flags_.get());
   printf("  Barrier: %zu bytes at %p\n", barrierSize, bMem);
-  printf("  Output transit buffer: %.2f MB at %p\n",
-         output_transit_buffer_size_ / (1024.0 * 1024.0), output_transit_buffer_);
+  printf("  Reduce scratch buffer: %.2f MB at %p\n", input_transit_buffer_size_ / (1024.0 * 1024.0),
+         input_transit_buffer_);
 }
 
 // ---------------------------------------------------------------------------
@@ -112,49 +146,12 @@ AllreduceSdma<T>::~AllreduceSdma() {
   if (async_in_progress_) {
     cancel_async();
   }
+  if (async_start_event_ != nullptr) {
+    (void)hipEventDestroy(async_start_event_);
+  }
   if (flags_) {
     printf("AllreduceSdma destroyed: PE %d\n", myPe_);
   }
-}
-
-// ---------------------------------------------------------------------------
-template <typename T>
-bool AllreduceSdma<T>::ensure_buffer_size(void*& buffer,
-                                          std::unique_ptr<void, ShmemDeleter>& buffer_ptr,
-                                          size_t& current_size,
-                                          application::SymmMemObjPtr& buffer_obj,
-                                          size_t required_size, const char* buffer_name) {
-  if (required_size <= current_size) {
-    return true;
-  }
-
-  // If buffer is not large enough, reallocate
-  printf("PE %d: %s too small: required %.2f MB, current %.2f MB\n", myPe_, buffer_name,
-         required_size / (1024.0 * 1024.0), current_size / (1024.0 * 1024.0));
-
-  // First release the old one
-  buffer_ptr.reset();
-
-  // Allocate new one
-  current_size = required_size;
-  buffer = shmem::ShmemMalloc(current_size);
-  if (buffer == nullptr) {
-    fprintf(stderr, "PE %d: Failed to reallocate %s of size %.2f MB\n", myPe_, buffer_name,
-            current_size / (1024.0 * 1024.0));
-    return false;
-  }
-  buffer_ptr.reset(buffer);
-
-  // Re-register
-  buffer_obj = shmem::ShmemSymmetricRegister(buffer, current_size);
-  if (!buffer_obj.IsValid()) {
-    fprintf(stderr, "PE %d: Failed to re-register %s\n", myPe_, buffer_name);
-    return false;
-  }
-
-  printf("PE %d: %s reallocated to %.2f MB\n", myPe_, buffer_name,
-         current_size / (1024.0 * 1024.0));
-  return true;
 }
 
 // copy_input_to_transit implementation
@@ -187,24 +184,6 @@ void AllreduceSdma<T>::copy_input_to_transit(T* input, size_t total_count, hipSt
     fprintf(stderr, "PE %d: Failed to copy input to transit buffer: %s\n", myPe_,
             hipGetErrorString(err));
     throw std::runtime_error("Input copy failed");
-  }
-}
-
-// copy_output_to_user implementation
-// For AllReduce: output is total_count elements (same size as input, NOT npes * total_count)
-template <typename T>
-void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStream_t stream) {
-  size_t bytes = total_count * dtype_size_;
-  if (!output) throw std::runtime_error("Output pointer is null");
-  if (!output_transit_buffer_) throw std::runtime_error("Output transit buffer is null");
-
-  hipError_t err =
-      stream
-          ? hipMemcpyAsync(output, output_transit_buffer_, bytes, hipMemcpyDeviceToDevice, stream)
-          : hipMemcpy(output, output_transit_buffer_, bytes, hipMemcpyDeviceToDevice);
-  if (err != hipSuccess) {
-    fprintf(stderr, "PE %d: copy_output_to_user failed: %s\n", myPe_, hipGetErrorString(err));
-    throw std::runtime_error("Output copy failed");
   }
 }
 
@@ -264,7 +243,7 @@ bool AllreduceSdma<T>::allreduce_inplace(T* /*data*/, size_t /*total_count*/,
 template <typename T>
 void AllreduceSdma<T>::resetFlags() {
   if (flags_) {
-    memset(flags_.get(), 0, npes_ * sizeof(uint64_t));
+    memset(flags_.get(), 0, 2 * npes_ * sizeof(uint64_t));
   }
 }
 
@@ -276,19 +255,33 @@ void AllreduceSdma<T>::fill_jit_args_(const T* input, size_t total_count) {
   jit_args_.myPe = myPe_;
   jit_args_.npes = npes_;
   jit_args_.input = input;
-  jit_args_.dstMemObj = output_transit_buffer_obj_;
+  jit_args_.output = nullptr;
+  jit_args_.dstMemObj = input_transit_buffer_obj_;
+  jit_args_.outputMemObj = input_transit_buffer_obj_;
   jit_args_.flagsMemObj = flagsObj_;
   jit_args_.barrier = barrierPtr_;
   jit_args_.elementCount = total_count;
+  jit_args_.slotStrideElements = slot_stride_elements_;
+  jit_args_.outputBaseOffsetBytes = 0;
 }
 
 template <typename T>
 int64_t AllreduceSdma<T>::prepare_reduce_scatter(const T* input, T* output, size_t total_count,
                                                  hipStream_t stream) {
   if (async_in_progress_) throw std::runtime_error("Async operation in progress");
-  (void)output;
   (void)stream;
+  constexpr size_t pack_size = 16 / sizeof(T);
+  const size_t collective_pack = static_cast<size_t>(npes_) * pack_size;
+  if (input == nullptr || output == nullptr) throw std::invalid_argument("input/output is null");
+  if (total_count == 0 || total_count % collective_pack != 0)
+    throw std::invalid_argument("AllReduce count must be divisible by npes * pack_size");
+  if (total_count > std::numeric_limits<size_t>::max() / dtype_size_)
+    throw std::overflow_error("AllReduce byte count overflow");
+  const size_t required_slot = total_count / npes_;
+  if (required_slot > slot_stride_elements_)
+    throw std::runtime_error("AllReduce input exceeds fixed reduce scratch capacity");
   fill_jit_args_(input, total_count);
+  jit_args_.output = output;
   return reinterpret_cast<int64_t>(&jit_args_);
 }
 
@@ -296,24 +289,38 @@ template <typename T>
 std::tuple<int, int> AllreduceSdma<T>::get_reduce_scatter_grid(size_t total_count) const {
   constexpr size_t pack_size = 16 / sizeof(T);
   size_t packedPerRank = (total_count / npes_ + pack_size - 1) / pack_size;
-  int threads = 512;
+  const size_t total_bytes = total_count * dtype_size_;
+  int threads = total_bytes <= (1U << 20) || total_bytes > (16U << 20)
+                    ? (packedPerRank >= 1024 ? 1024 : 512)
+                    : 512;
   int blocks = std::min(max_blocks_, static_cast<int>((packedPerRank + threads - 1) / threads));
   if (blocks < 1) blocks = 1;
   return {blocks, threads};
 }
 
 template <typename T>
-int64_t AllreduceSdma<T>::prepare_allgather(size_t total_count, hipStream_t /*stream*/) {
+int64_t AllreduceSdma<T>::prepare_allgather(size_t total_count, hipStream_t stream) {
   jit_args_.input = nullptr;
   jit_args_.elementCount = total_count;
+  const size_t shard_bytes = total_count / npes_ * dtype_size_;
+  const size_t output_bytes = total_count * dtype_size_;
+  const size_t slot_bytes = slot_stride_elements_ * dtype_size_;
+  jit_args_.outputBaseOffsetBytes =
+      output_bytes <= slot_bytes
+          ? static_cast<size_t>(npes_) * slot_bytes - static_cast<size_t>(myPe_) * shard_bytes
+          : 0;
   return reinterpret_cast<int64_t>(&jit_args_);
 }
 
 template <typename T>
 double AllreduceSdma<T>::finish_sync(T* output, size_t total_count, hipStream_t stream,
-                                     bool force_copy_output_to_user) {
-  if (copy_output_to_user_ || force_copy_output_to_user) {
-    copy_output_to_user(output, total_count, stream);
+                                     bool force_copy_output_to_user, bool direct_output) {
+  (void)force_copy_output_to_user;
+  if (!direct_output) {
+    auto* source = static_cast<uint8_t*>(input_transit_buffer_) + jit_args_.outputBaseOffsetBytes;
+    hipError_t err =
+        hipMemcpyAsync(output, source, total_count * dtype_size_, hipMemcpyDeviceToDevice, stream);
+    if (err != hipSuccess) throw std::runtime_error("Failed to copy AllReduce output");
   }
   return 0.0;
 }
@@ -331,15 +338,23 @@ int64_t AllreduceSdma<T>::prepare_async_reduce_scatter(const T* input, T* output
   async_stream_ = stream;
   async_start_time_ = CollectiveWallTime();
 
-  size_t required = (total_count / npes_) * npes_ * dtype_size_;
-  if (!ensure_buffer_size(output_transit_buffer_, output_transit_buffer_ptr_,
-                          output_transit_buffer_size_, output_transit_buffer_obj_, required,
-                          "output transit buffer")) {
+  try {
+    constexpr size_t pack_size = 16 / sizeof(T);
+    const size_t collective_pack = static_cast<size_t>(npes_) * pack_size;
+    if (input == nullptr || output == nullptr) throw std::invalid_argument("input/output is null");
+    if (total_count == 0 || total_count % collective_pack != 0)
+      throw std::invalid_argument("AllReduce count must be divisible by npes * pack_size");
+    if (total_count > std::numeric_limits<size_t>::max() / dtype_size_)
+      throw std::overflow_error("AllReduce byte count overflow");
+    const size_t required_slot = total_count / npes_;
+    if (required_slot > slot_stride_elements_)
+      throw std::runtime_error("AllReduce input exceeds fixed reduce scratch capacity");
+    fill_jit_args_(input, total_count);
+    jit_args_.output = output;
+  } catch (...) {
     async_in_progress_ = false;
-    throw std::runtime_error("Buffer allocation failed");
+    throw;
   }
-
-  fill_jit_args_(input, total_count);
   return reinterpret_cast<int64_t>(&jit_args_);
 }
 
@@ -347,35 +362,63 @@ template <typename T>
 int64_t AllreduceSdma<T>::prepare_async_allgather_put(size_t total_count, hipStream_t /*stream*/) {
   jit_args_.input = nullptr;
   jit_args_.elementCount = total_count;
+  const size_t shard_bytes = total_count / npes_ * dtype_size_;
+  const size_t output_bytes = total_count * dtype_size_;
+  const size_t slot_bytes = slot_stride_elements_ * dtype_size_;
+  jit_args_.outputBaseOffsetBytes =
+      output_bytes <= slot_bytes
+          ? static_cast<size_t>(npes_) * slot_bytes - static_cast<size_t>(myPe_) * shard_bytes
+          : 0;
   return reinterpret_cast<int64_t>(&jit_args_);
 }
 
 template <typename T>
-void AllreduceSdma<T>::after_async_start() {
-  hipError_t err = hipGetLastError();
+void AllreduceSdma<T>::after_async_start(bool capturing) {
+  if (!capturing) {
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+      async_in_progress_ = false;
+      throw std::runtime_error("Async kernel launch failed");
+    }
+  }
+  hipError_t err = hipEventRecord(async_start_event_, async_stream_);
   if (err != hipSuccess) {
     async_in_progress_ = false;
-    throw std::runtime_error("Async kernel launch failed");
+    throw std::runtime_error("Failed to record async start event");
   }
 }
 
 template <typename T>
 int64_t AllreduceSdma<T>::prepare_async_wait(hipStream_t stream) {
   if (!async_in_progress_) throw std::runtime_error("No async operation in progress");
-  (void)stream;
   jit_args_.input = nullptr;
   jit_args_.elementCount = async_total_count_;
+  const size_t shard_bytes = async_total_count_ / npes_ * dtype_size_;
+  const size_t output_bytes = async_total_count_ * dtype_size_;
+  const size_t slot_bytes = slot_stride_elements_ * dtype_size_;
+  jit_args_.outputBaseOffsetBytes =
+      output_bytes <= slot_bytes
+          ? static_cast<size_t>(npes_) * slot_bytes - static_cast<size_t>(myPe_) * shard_bytes
+          : 0;
   return reinterpret_cast<int64_t>(&jit_args_);
 }
 
 template <typename T>
-double AllreduceSdma<T>::finish_async_wait(hipStream_t stream) {
+double AllreduceSdma<T>::finish_async_wait(hipStream_t stream, bool capturing, bool direct_output) {
   hipStream_t ws = (stream != nullptr) ? stream : async_stream_;
-  hipError_t err = ws ? hipStreamSynchronize(ws) : hipDeviceSynchronize();
-  if (err != hipSuccess) throw std::runtime_error("Synchronization failed");
-
-  if (copy_output_to_user_) {
-    copy_output_to_user(async_output_, async_total_count_, ws);
+  if (ws != async_stream_) {
+    hipError_t err = hipStreamWaitEvent(ws, async_start_event_, 0);
+    if (err != hipSuccess) throw std::runtime_error("Failed to order async wait stream");
+  }
+  if (!direct_output) {
+    auto* source = static_cast<uint8_t*>(input_transit_buffer_) + jit_args_.outputBaseOffsetBytes;
+    hipError_t err = hipMemcpyAsync(async_output_, source, async_total_count_ * dtype_size_,
+                                    hipMemcpyDeviceToDevice, ws);
+    if (err != hipSuccess) throw std::runtime_error("Failed to copy async AllReduce output");
+  }
+  if (!capturing) {
+    hipError_t err = ws ? hipStreamSynchronize(ws) : hipDeviceSynchronize();
+    if (err != hipSuccess) throw std::runtime_error("Synchronization failed");
   }
 
   double duration = CollectiveWallTime() - async_start_time_;

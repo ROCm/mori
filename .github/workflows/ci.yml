@@ -28,7 +28,7 @@ concurrency:
 
 env:
   IMAGE: rocm/mori:ci
-  BASE_IMAGE: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0
+  BASE_IMAGE: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
   CONTAINER: mori_ci_${{ github.run_id }}
   CT: docker
 
@@ -496,8 +496,20 @@ jobs:
           submodules: true
 
       - name: Recover podman if needed
-        if: ${{ matrix.ct == 'podman' }}
-        run: podman system migrate || true
+        run: |
+          build() {
+            $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev .
+          }
+          build && exit 0
+          if [ "$CT" = podman ]; then
+            # 'system migrate' stops every container owned by this user, not just
+            # this job's, so keep it on the failure path only.
+            echo "::warning::podman build failed; retrying after 'system migrate'"
+            podman ps --format 'will be stopped: {{.Names}}' || true
+            podman system migrate || true
+          fi
+          build
+
 
       - name: Build CI image
         run: $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev .

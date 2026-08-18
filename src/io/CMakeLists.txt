@@ -26,6 +26,6 @@ target_link_libraries(mori_io mori_application hip::host mori_logging
 target_compile_definitions(mori_io PUBLIC MSGPACK_NO_BOOST)
 set_target_properties(
   mori_io
-  PROPERTIES BUILD_RPATH "$ORIGIN"
-             INSTALL_RPATH "$ORIGIN"
+  PROPERTIES BUILD_RPATH "$ORIGIN;${ROCM_PATH}/lib"
+             INSTALL_RPATH "$ORIGIN;${ROCM_PATH}/lib"
              BUILD_WITH_INSTALL_RPATH TRUE)

@@ -97,23 +97,32 @@ using namespace mori::collective;
 #define CCL_WRAP_ALLREDUCE_RS(kernel, suffix, T)                              \
   extern "C" __global__ void kernel##_##suffix(CclAllreduceArgs<T> args) {   \
     kernel##_body<T>(args.myPe, args.npes, args.input, args.dstMemObj,       \
-                     args.flagsMemObj, args.barrier, args.elementCount);     \
+                     args.flagsMemObj, args.barrier, args.elementCount,      \
+                     args.slotStrideElements);                               \
   }
 
-// AllReduce allgather / async-put: (myPe, npes, dstMemObj, flagsMemObj,
-//                                   barrier, elementCount)
+#define CCL_WRAP_ALLREDUCE_ONESHOT(kernel, suffix, T)                         \
+  extern "C" __global__ void kernel##_##suffix(CclAllreduceArgs<T> args) {   \
+    SdmaReduceScatterKernel_body<T>(                                          \
+        args.myPe, args.npes, args.input, args.dstMemObj, args.flagsMemObj,   \
+        args.barrier, args.elementCount, args.slotStrideElements, args.output); \
+  }
+
+// AllReduce allgather: fixed-stride reduce scratch -> compact output transit.
 #define CCL_WRAP_ALLREDUCE_AG(kernel, suffix, T)                              \
   extern "C" __global__ void kernel##_##suffix(CclAllreduceArgs<T> args) {   \
-    kernel##_body<T>(args.myPe, args.npes, args.dstMemObj, args.flagsMemObj, \
-                     args.barrier, args.elementCount);                       \
+    kernel##_body<T>(args.myPe, args.npes, args.dstMemObj, args.outputMemObj, \
+                     args.flagsMemObj, args.barrier, args.elementCount,      \
+                     args.slotStrideElements, args.outputBaseOffsetBytes);   \
   }
 
-// AllReduce async wait (non-template): (myPe, npes, flagsMemObj, barrier,
-//                                       elementCount)
-#define CCL_WRAP_ALLREDUCE_AG_WAIT(kernel, suffix, T)                         \
+#define CCL_WRAP_ALLREDUCE_PROTECTED_AG(kernel, suffix, T)                    \
   extern "C" __global__ void kernel##_##suffix(CclAllreduceArgs<T> args) {   \
-    kernel##_body(args.myPe, args.npes, args.flagsMemObj, args.barrier,      \
-                  args.elementCount);                                        \
+    AllGatherSdmaKernel_body<T>(                                              \
+        args.myPe, args.npes, args.dstMemObj, args.dstMemObj,                 \
+        args.flagsMemObj, args.barrier, args.elementCount,                    \
+        args.slotStrideElements, args.outputBaseOffsetBytes,                  \
+        static_cast<size_t>(args.npes) * args.slotStrideElements);            \
   }
 
 // Async RS SDMA put: (myPe, npes, input, dstMemObj, elementCount)
@@ -209,6 +218,9 @@ extern "C" __global__ void OneShotBroadcastSdmaSubGroupKernel_u32(
 // --- SdmaReduceScatterKernel ---
 CCL_ALLREDUCE_ALL_TYPES(CCL_WRAP_ALLREDUCE_RS, SdmaReduceScatterKernel)
 
+// --- Fused SDMA reduce-scatter + pull AllGather for small messages ---
+CCL_ALLREDUCE_ALL_TYPES(CCL_WRAP_ALLREDUCE_ONESHOT, SdmaOneShotAllreduceKernel)
+
 // --- AllGatherSdmaKernel ---
 CCL_ALLREDUCE_ALL_TYPES(CCL_WRAP_ALLREDUCE_AG, AllGatherSdmaKernel)
 
@@ -221,11 +233,9 @@ CCL_ALLREDUCE_ALL_TYPES(CCL_WRAP_ALLREDUCE_LOCAL_REDUCE, ReduceScatterLocalReduc
 // --- AllGatherReducedSdmaPutKernel (SDMA put of reduced shard) ---
 CCL_ALLREDUCE_ALL_TYPES(CCL_WRAP_ALLREDUCE_AG_REDUCED_PUT, AllGatherReducedSdmaPutKernel)
 
-// --- AllGatherAsyncPutKernel ---
-CCL_ALLREDUCE_ALL_TYPES(CCL_WRAP_ALLREDUCE_AG, AllGatherAsyncPutKernel)
-
-// --- AllGatherAsyncWaitKernel (non-template) ---
-CCL_ALLREDUCE_ALL_TYPES(CCL_WRAP_ALLREDUCE_AG_WAIT, AllGatherAsyncWaitKernel)
+// --- SDMA gather from protected reduced shard into compact scratch output ---
+CCL_ALLREDUCE_ALL_TYPES(CCL_WRAP_ALLREDUCE_PROTECTED_AG,
+                        AllGatherSdmaFromProtectedKernel)
 
 // ============================================================================
 // Inter-node RDMA ring AllGather

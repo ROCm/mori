@@ -1,0 +1,33 @@
+# Block sweep, one xGMI link, 16 GB per measurement, one-way, GB/s (decimal).
+# gfx1250, 4-card node, GPU0 -> GPU1, measured on the pushing GPU.
+# Date 2026-08-12. Build: -DSWEEP_16 -DONLY_1WAY -DBLKONLY -DNOVERIFY -DLOOP=10 -DWARMUP=3
+#   -DAB_ROUNDS=2 -DBLKMUL=64 -DWTH=512 -DTWBLK=32 -DTWTH=256 -DRTD0N=256 -DRTD1N=8 -DRPIPEN=4
+# Grid: CU 16384 x 512 threads, TDM 8192 x 256 threads, tile 256x8 = 8 KB, pipe 4 (32 KB per round).
+# Both rounds are inside one process; round-to-round spread is the drift, not the error bar.
+# Columns: CU = vector copy, TDM = tdm_write, TDMc2 = tdm_store_cuload, TDMms = tdmmws.
+blocks,round,CU,TDM,TDMc2,TDMms
+16,0,42.9,128.5,58.2,134.9
+32,0,85.4,255.8,115.9,268.0
+64,0,169.9,507.3,230.4,530.1
+128,0,337.1,999.1,456.6,1041.0
+256,0,666.2,1581.6,899.2,1608.4
+512,0,1283.1,1641.1,1594.3,1641.0
+1024,0,1523.6,1643.2,1614.0,1645.3
+2048,0,1590.7,1642.5,1640.3,1621.9
+4096,0,1619.5,1643.1,1630.9,1639.9
+8192,0,1632.7,1645.2,1632.1,1636.0
+16384,0,1638.8,1645.7,1633.9,1644.6
+16,1,42.9,128.5,58.2,135.0
+32,1,85.4,256.1,116.0,268.2
+64,1,170.0,507.8,230.6,530.7
+128,1,337.2,999.6,456.9,1041.4
+256,1,666.5,1581.8,899.2,1610.5
+512,1,1283.8,1640.9,1592.4,1642.6
+1024,1,1526.8,1643.3,1613.1,1646.2
+2048,1,1592.6,1642.5,1639.5,1618.9
+4096,1,1625.4,1645.0,1632.0,1638.7
+8192,1,1632.1,1645.3,1632.1,1631.8
+16384,1,1639.3,1645.1,1634.6,1644.7
+# Full-grid reference measured in the same process (BLKONLY row, CU 16384 blocks / TDM 8192 blocks):
+# round 0: CU=1638.5 TDM=1644.8 TDMc2=1631.9
+# round 1: CU=1637.9 TDM=1644.2 TDMc2=1633.9

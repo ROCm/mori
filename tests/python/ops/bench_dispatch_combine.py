@@ -226,7 +226,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 combine_input,
                 # dispatch_weights,
                 None,
-                dispatch_indices,
+                all_rank_indices[self.config.rank],
                 block_num=combine_block_num,
                 warp_per_block=combine_warp_per_block,
             )
@@ -278,7 +278,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                     e2e_combine_arg,
                     # dispatch_weights,
                     None,
-                    e2e_dispatch_indices,
+                    all_rank_indices[self.config.rank],
                     block_num=combine_block_num,
                     warp_per_block=combine_warp_per_block,
                 )
@@ -355,7 +355,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         combine_output, _ = op.combine(
             combine_input,
             None,
-            dispatch_indices,
+            all_rank_indices[self.config.rank],
             block_num=combine_block_num,
             warp_per_block=combine_warp_per_block,
         )

@@ -322,6 +322,55 @@ def _all_data_types():
     return types
 
 
+def cross_dtype_hidden_dims(logical_hidden_dim, data_type, combine_data_type):
+    """Resolve the hidden dims for a (possibly cross-dtype) dispatch/combine pair.
+
+    ``logical_hidden_dim`` is the unpacked element count (e.g. 7168). A packed
+    FP4 side carries two E2M1 values per byte and so addresses half as many
+    elements. ``config.hidden_dim`` sizes the shmem staging buffers and must
+    cover whichever direction is wider.
+
+    Returns ``(dispatch_hidden_dim, combine_hidden_dim, config_hidden_dim)``.
+    """
+    dispatch_hidden_dim = (
+        logical_hidden_dim // 2 if _is_fp4x2_dtype(data_type) else logical_hidden_dim
+    )
+    combine_hidden_dim = (
+        logical_hidden_dim // 2
+        if _is_fp4x2_dtype(combine_data_type)
+        else logical_hidden_dim
+    )
+    return (
+        dispatch_hidden_dim,
+        combine_hidden_dim,
+        max(dispatch_hidden_dim, combine_hidden_dim),
+    )
+
+
+def cross_dtype_skip_reason(quant_type, data_type, combine_data_type):
+    """Return why a (quant, dispatch dtype, combine dtype) triple is unsupported.
+
+    Returns ``None`` when the combination is expected to work. Centralized here
+    so every kernel-type test file agrees on which cells of the matrix are
+    legitimately out of scope rather than genuine failures.
+
+    Note that the FP8/FP4 quant types constrain the *combine* element type, not
+    the dispatch one: ``fp8_direct_cast`` casts the bf16 combine payload to FP8
+    on the wire and is orthogonal to what dispatch transported.
+    """
+    if _is_fp4x2_dtype(combine_data_type):
+        # unpack-and-compare has no packed-FP4 reference; combine verification
+        # early-returns, so such a case would assert nothing.
+        return "packed FP4 combine output is not verifiable by this harness"
+    if quant_type == "fp8_direct_cast" and combine_data_type is not torch.bfloat16:
+        return "fp8_direct_cast requires a bfloat16 combine dtype"
+    if quant_type in ("fp8_blockwise", "fp4_blockwise") and (
+        data_type is not torch.bfloat16 or combine_data_type is not torch.bfloat16
+    ):
+        return f"{quant_type} requires bfloat16 dispatch and combine dtypes"
+    return None
+
+
 def start_torch_dist_process_manager(world_size=8, disable_p2p=False):
     if disable_p2p:
         torch.cuda.empty_cache()
@@ -370,15 +419,71 @@ def assert_worker_results(manager, world_size):
 
 
 class EpDispatchCombineTestCase:
-    def __init__(self, config):
+    def __init__(
+        self,
+        config,
+        combine_data_type=None,
+        combine_hidden_dim=None,
+        dispatch_hidden_dim=None,
+    ):
         self.config = config
         self.device = torch.device("cuda", self.config.rank)
         self.rng = torch.Generator(device=self.device)
         self.rng.manual_seed(123)
+        # Cross-dtype support: dispatch and combine may transport different
+        # element types (e.g. FP4 dispatch + BF16 combine), in which case the
+        # two directions also have different hidden dims because FP4 packs two
+        # values per byte. ``config.hidden_dim`` sizes the shmem staging
+        # buffers and must therefore be the max of the two.
+        self.combine_data_type = (
+            combine_data_type if combine_data_type is not None else config.data_type
+        )
+        self.combine_hidden_dim = (
+            combine_hidden_dim if combine_hidden_dim is not None else config.hidden_dim
+        )
+        self.dispatch_hidden_dim = (
+            dispatch_hidden_dim
+            if dispatch_hidden_dim is not None
+            else config.hidden_dim
+        )
+
+    @property
+    def is_cross_dtype(self):
+        return self.combine_data_type != self.config.data_type
 
     def sync(self):
         torch.cuda.synchronize()
         dist.barrier()
+
+    def _get_combine_input(self, op, dispatch_output, num_token=None):
+        """Return the tensor to pass as combine input.
+
+        In external-input-buffer mode the data tensor is passed straight
+        through (converted first when dispatch and combine dtypes differ). In
+        zero-copy mode the kernel reads from the registered shmem buffer, so
+        the converted data has to be copied into it instead.
+        """
+        if self.config.use_external_inp_buf:
+            if self.is_cross_dtype:
+                return self._to_combine_dtype(dispatch_output)
+            return dispatch_output
+
+        combine_input = op.get_registered_combine_input_buffer(
+            self.combine_data_type, hidden_dim=self.combine_hidden_dim
+        )
+        n = dispatch_output.size(0) if num_token is None else num_token
+        src = dispatch_output[:n]
+        combine_input[:n, :].copy_(
+            self._to_combine_dtype(src) if self.is_cross_dtype else src
+        )
+        return combine_input
+
+    def _to_combine_dtype(self, tensor):
+        """Convert a dispatch-side tensor to the combine element type."""
+        if _is_fp4x2_dtype(self.config.data_type):
+            # Unpacking doubles the hidden dim: 2 x E2M1 per byte.
+            return unpack_fp4x2(tensor, dtype=self.combine_data_type)
+        return tensor.to(self.combine_data_type)
 
     def gen_test_data(
         self,
@@ -527,10 +632,13 @@ class EpDispatchCombineTestCase:
         partition_scale_dim = (
             combine_scale_dim if combine_scale_dim else self.config.scale_dim
         )
+        # Inputs are generated at the dispatch hidden dim, which differs from
+        # config.hidden_dim only in cross-dtype runs (see __init__).
+        dispatch_hidden_dim = self.dispatch_hidden_dim
         block_elems = (
-            (self.config.hidden_dim + partition_scale_dim - 1) // partition_scale_dim
+            (dispatch_hidden_dim + partition_scale_dim - 1) // partition_scale_dim
             if partition_scale_dim > 0
-            else self.config.hidden_dim
+            else dispatch_hidden_dim
         )
 
         all_rank_input = []
@@ -540,7 +648,7 @@ class EpDispatchCombineTestCase:
                 fp4_bytes = torch.randint(
                     0,
                     256,
-                    (n_r, self.config.hidden_dim),
+                    (n_r, dispatch_hidden_dim),
                     dtype=torch.uint8,
                     generator=self.rng,
                     device=self.device,
@@ -549,7 +657,7 @@ class EpDispatchCombineTestCase:
             else:
                 all_rank_input.append(
                     _generate_input_tensor(
-                        (n_r, self.config.hidden_dim),
+                        (n_r, dispatch_hidden_dim),
                         dtype=self.config.data_type,
                         device=self.device,
                         generator=self.rng,
@@ -766,15 +874,11 @@ class EpDispatchCombineTestCase:
             )
 
         total_recv_num_token = dispatch_recv_num_token[0].item()
-        if not self.config.use_external_inp_buf:
-            combine_input = op.get_registered_combine_input_buffer(
-                self.config.data_type
-            )
-            combine_input[:total_recv_num_token, :].copy_(
-                dispatch_output[:total_recv_num_token, :]
-            )
+        combine_input = self._get_combine_input(
+            op, dispatch_output, num_token=total_recv_num_token
+        )
         combine_output, combine_output_weight = op.combine(
-            dispatch_output,
+            combine_input,
             None if weightless else dispatch_weights,
             all_rank_indices[self.config.rank],
             call_reset=False,
@@ -782,7 +886,11 @@ class EpDispatchCombineTestCase:
         self.sync()
         if check_results:
             self.check_combine_result(
-                op, test_data, combine_output, combine_output_weight
+                op,
+                test_data,
+                combine_output,
+                combine_output_weight,
+                combine_data_type=self.combine_data_type,
             )
 
 
@@ -860,9 +968,19 @@ def run_ep_dispatch_combine_test(
     sentinel_pattern=None,
     weightless=False,
     expect_combine_kernel_substr=None,
+    combine_data_type=None,
+    combine_hidden_dim=None,
+    dispatch_hidden_dim=None,
 ):
     op = mori.ops.EpDispatchCombineOp(config)
-    test_case = test_case_cls(config)
+    case_kwargs = {}
+    if combine_data_type is not None:
+        case_kwargs["combine_data_type"] = combine_data_type
+    if combine_hidden_dim is not None:
+        case_kwargs["combine_hidden_dim"] = combine_hidden_dim
+    if dispatch_hidden_dim is not None:
+        case_kwargs["dispatch_hidden_dim"] = dispatch_hidden_dim
+    test_case = test_case_cls(config, **case_kwargs)
     gen_kwargs = {}
     if use_max_token_num:
         gen_kwargs["use_max_token_num"] = True

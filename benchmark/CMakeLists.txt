@@ -64,7 +64,7 @@ function(add_mori_benchmark_cco name)
   # $ORIGIN-relative rpath (kept alongside the build-tree rpath) so the binaries
   # resolve libmori_*.so after `BUILD_BENCHMARK=ON pip install .` copies them to
   # site-packages/mori/benchmarks/cco/ (the libs live at site-packages/mori/).
-  set_target_properties(${name} PROPERTIES BUILD_RPATH "$ORIGIN/../..")
+  set_target_properties(${name} PROPERTIES BUILD_RPATH "$ORIGIN/../..;${ROCM_PATH}/lib")
   if(DEFINED GPU_TARGETS)
     set_target_properties(${name} PROPERTIES HIP_ARCHITECTURES "${GPU_TARGETS}")
   endif()
@@ -126,4 +126,36 @@ if(WITH_MPI AND BUILD_CCO)
 elseif(WITH_MPI AND NOT BUILD_CCO)
   message(WARNING
     "BUILD_BENCHMARK=ON with BUILD_CCO=OFF: CCO p2p benchmark targets skipped")
+endif()
+
+# --- xGMI transport probe (cco/xgmi_bw) ---
+# One self-contained HIP TU: it opens its own socket and talks to the HIP runtime
+# directly, so it links no mori library. It calls the gfx125x tensor-DMA builtins
+# (__builtin_amdgcn_tensor_load_to_lds and friends), which do not exist on other
+# targets, hence the arch filter rather than an unconditional target.
+#
+# The sweeps under cco/xgmi_bw/tools/ compile this same TU themselves, because
+# tile, pipe depth and issuer count are compile time and a sweep changes them per
+# configuration. cco/xgmi_bw/tools/build_ualoe.sh owns the flag set both paths
+# use; keep the compile options below in step with it, or the numbers this target
+# produces stop matching the recorded tables in cco/xgmi_bw/results/.
+if(DEFINED GPU_TARGETS)
+  set(_xgmi_archs "")
+  foreach(_arch IN LISTS GPU_TARGETS)
+    if(_arch MATCHES "^gfx125")
+      list(APPEND _xgmi_archs ${_arch})
+    endif()
+  endforeach()
+  if(_xgmi_archs)
+    add_executable(ualoe_bw cco/xgmi_bw/ualoe_bw.cpp)
+    set_source_files_properties(cco/xgmi_bw/ualoe_bw.cpp PROPERTIES LANGUAGE HIP)
+    target_link_libraries(ualoe_bw PRIVATE hip::host hip::device)
+    # -O3, not the library's -O2: the recorded tables were measured at -O3 and
+    # the TDM issue loop is tight enough that the two do not agree.
+    target_compile_options(ualoe_bw PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-O3>)
+    set_target_properties(ualoe_bw PROPERTIES HIP_ARCHITECTURES "${_xgmi_archs}")
+  else()
+    message(STATUS
+      "xgmi_bw: no gfx125x in GPU_TARGETS (${GPU_TARGETS}), ualoe_bw skipped")
+  endif()
 endif()
