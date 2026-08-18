@@ -309,5 +309,93 @@ TEST(CompositeTransferEngine, FailsTagsWhenASubEngineSubmitsNothing) {
   EXPECT_EQ(std::vector<size_t>({5}), failed);
 }
 
+// ---------------------------------------------------------------------------
+//  File endpoints (GdsEngine's shape, without HIP)
+// ---------------------------------------------------------------------------
+
+// Stands in for GdsEngine: the only engine that registers and claims files.
+class FakeFileEngine final : public TransferEngine {
+ public:
+  const char* Name() const override { return "FakeFileEngine"; }
+  TransferRef RegisterMemory(void*, size_t, mori::io::MemoryLocationType, int) override {
+    return TransferRef{};  // not a memory engine
+  }
+  TransferRef RegisterFile(int fd, uint64_t offset, uint64_t size) override {
+    ++file_registrations;
+    return TransferRef::File(fd, offset, size, reinterpret_cast<void*>(0xF11E));
+  }
+  void Deregister(const TransferRef& ref) override {
+    if (ref.IsFile()) ++file_deregistrations;
+  }
+  bool CanHandle(const TransferRef& src, const TransferRef& dst) const override {
+    return src.IsFile() && dst.loc == mori::io::MemoryLocationType::GPU;
+  }
+  TransferPlanSet Plan(const std::vector<TransferItem>&) const override { return {}; }
+  std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan>) override { return nullptr; }
+
+  int file_registrations = 0;
+  int file_deregistrations = 0;
+};
+
+TEST(TransferRef, FileEndpointIsValidAndIgnoredByMemoryEngines) {
+  TransferRef f = TransferRef::File(/*fd=*/7, /*offset=*/4096, /*n=*/65536);
+  EXPECT_TRUE(f.IsFile());
+  EXPECT_TRUE(f.Valid());
+  EXPECT_FALSE(f.HasHostPtr());
+  EXPECT_FALSE(f.HasMemoryDesc());
+  EXPECT_EQ(7, f.file_fd);
+  EXPECT_EQ(4096u, f.file_offset);
+  EXPECT_EQ(65536u, f.size);
+
+  // A memory engine never claims a file endpoint, so per-pair selection leaves
+  // it for the file engine.
+  LocalCopyEngine mem;
+  std::vector<char> stub(64);
+  TransferRef gpu =
+      TransferRef::HostBytes(stub.data(), stub.size(), mori::io::MemoryLocationType::GPU, 0);
+  EXPECT_FALSE(mem.CanHandle(f, gpu));
+}
+
+TEST(CompositeTransferEngine, RegisterFileFansOutToTheFileEngine) {
+  auto composite = std::make_unique<CompositeTransferEngine>();
+  composite->AddEngine(std::make_unique<LocalCopyEngine>());
+  auto file_owned = std::make_unique<FakeFileEngine>();
+  FakeFileEngine* file = file_owned.get();
+  composite->AddEngine(std::move(file_owned));
+
+  TransferRef ref = composite->RegisterFile(/*fd=*/9, /*offset=*/8192, /*size=*/4096);
+  EXPECT_EQ(1, file->file_registrations);
+  ASSERT_TRUE(ref.IsFile());
+  EXPECT_EQ(9, ref.file_fd);
+  EXPECT_EQ(8192u, ref.file_offset);
+  EXPECT_EQ(reinterpret_cast<void*>(0xF11E), ref.gds_handle);
+
+  composite->Deregister(ref);
+  EXPECT_EQ(1, file->file_deregistrations);
+}
+
+TEST(CompositeTransferEngine, RegisterFileIsInvalidWithoutAFileEngine) {
+  auto composite = std::make_unique<CompositeTransferEngine>();
+  composite->AddEngine(std::make_unique<LocalCopyEngine>());
+  TransferRef ref = composite->RegisterFile(/*fd=*/3, /*offset=*/0, /*size=*/4096);
+  EXPECT_FALSE(ref.IsFile());
+  EXPECT_FALSE(ref.Valid());
+}
+
+TEST(CompositeTransferEngine, SelectsTheFileEngineForAFileToGpuPair) {
+  auto composite = std::make_unique<CompositeTransferEngine>();
+  composite->AddEngine(std::make_unique<LocalCopyEngine>());
+  composite->AddEngine(std::make_unique<FakeFileEngine>());
+
+  TransferRef src =
+      TransferRef::File(/*fd=*/5, /*offset=*/0, /*n=*/4096, reinterpret_cast<void*>(0x1));
+  std::vector<char> gpu(4096);
+  TransferRef dst =
+      TransferRef::HostBytes(gpu.data(), gpu.size(), mori::io::MemoryLocationType::GPU, 0);
+  TransferEngine* sel = composite->SelectEngine(src, dst);
+  ASSERT_NE(nullptr, sel);
+  EXPECT_STREQ("FakeFileEngine", sel->Name());
+}
+
 }  // namespace
 }  // namespace mori::umbp
