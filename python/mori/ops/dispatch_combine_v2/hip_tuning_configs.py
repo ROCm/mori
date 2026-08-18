@@ -144,7 +144,21 @@ _COMBINE_TABLE: dict = {
     },
     "gfx1250": {
         (4, 7168, 8, None): ((512, 64, 8), (None, 128, 8)),
-        (4, 7168, 6, None): ((512, 64, 8), (None, 128, 8)),
+        # topk 6 re-swept 2026-08-17, after the entry barrier stopped charging for a
+        # wide grid. A QUAD group is worldSize warps and takes one token per round, so
+        # block*warp/worldSize groups want to match the token count exactly -- one
+        # round, no loop. Below that the extra blocks only add barrier work.
+        #   ct     64x8   128x8  256x8      groups at 256x8 = 512
+        #   64     15.9    16.5   18.1
+        #   128    16.6    17.7   19.3
+        #   256    24.3    21.2   23.1   <- 128x8 is 256 groups
+        #   512    32.0    31.1   29.0   <- 256x8 is 512 groups
+        #   1024   49.9    44.6   45.7
+        #   2048   85.4    74.7   74.3
+        #   4096  155.5   132.6  133.5
+        # The tail is a tie, so it keeps the smaller grid. topk 8 is left alone: topk
+        # sets the tokens consumed per round, so its edges need their own sweep.
+        (4, 7168, 6, None): ((128, 64, 8), (256, 128, 8), (512, 256, 8), (None, 128, 8)),
     },
 }
 

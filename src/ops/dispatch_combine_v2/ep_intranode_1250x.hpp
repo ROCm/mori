@@ -58,8 +58,13 @@ namespace v2 {
 using index_t = int32_t;
 
 // Shipping gfx1250 combine config (were env gates in v1; production has one).
-#define MORI_COMB_TDM 2              // token push goes through the TDM engine, 2 chunks
-#define MORI_COMB_QUAD 2             // one warp per source, whole-token peer reads, 2 buffers
+#define MORI_COMB_TDM 2  // token push goes through the TDM engine, 2 chunks
+// One warp per source, whole-token peer reads. The value is how many tokens a group
+// keeps in flight; the tile ring costs warpPerBlock * value * hidden * sizeof(T), so
+// raising it past 2 needs warpPerBlock down to stay inside MORI_COMB_LDS_BUDGET.
+// Measured at EP4/7168/topk6/512 tokens: 4 buffers at 4 warps costs 4 us against 2,
+// because the gather is not load-bound here -- what pays is fewer tokens per group.
+#define MORI_COMB_QUAD 2
 #define MORI_COMB_LDS_BUDGET 327680  // dynamic LDS a combine block may reserve
 #define MORI_COMB_BARSLEEP 15        // s_sleep units between cross-device flag polls
 #define MORI_COMB_BARSPREAD 16       // stride (uint32 lines) of the per-block fan-out slots
@@ -638,56 +643,123 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
 /* ------------------------------------------------------------------------- */
 /*                            Cross-device barrier                            */
 /* ------------------------------------------------------------------------- */
-// Same contract as the portable EpCrossDeviceBarrier, but block 0 polls the peer
-// flags alone and republishes the epoch into per-block fan-out lines
-// (args.combineBarrierFan) so gridDim.x blocks don't hammer worldSize cross-card
-// addresses. The fan-out buffer is device-local scratch, not an arena region.
+// Same contract as the portable EpCrossDeviceBarrier. Two independent choices, both
+// measured at EP4/7168/topk6/512 tokens:
+//
+// ARRIVAL is a private per-block epoch xdbFlag[blockIdx.x] (from the FlyDSL gather
+// combine). A block is the only writer of its own slot, so there is no atomic, no
+// grid-wide rendezvous, no reset and no cross-call race. Against the shared-epoch
+// atomicAdd + grid rendezvous this is worth ~1 us at 64 blocks and ~10 us at 256,
+// which is what makes a 256-block launch usable at all.
+//
+// DISTRIBUTION stays the original fan-out: block 0 alone polls the peer slots and
+// republishes the epoch into per-block lines (args.combineBarrierFan, device-local
+// scratch, not an arena region). FlyDSL instead lets every block poll the shared arena
+// slots; ported faithfully that cost +9 us at 64 blocks and +69 us at 256, and a tight
+// poll did not help. The arena slots are SCOPE_SYS (L2 is not the system coherence
+// point, and 4 peers write that one line), so each poll is a real transaction that
+// only merges within a wave; a fan-out line is SCOPE_DEV, private to one block, and
+// hits L2.
+//
+// needGridRendezvous: this kernel staged out_tok itself, so no epoch may be published
+// until every local block's copy is done. On the in-place path nothing here wrote
+// out_tok -- the previous kernel published it -- and the grid never has to meet.
 template <EpCfg kCfg>
-__device__ __forceinline__ void EpCrossDeviceBarrier1250x(EpArgs args, unsigned long long flag) {
+__device__ __forceinline__ void EpCrossDeviceBarrier1250x(EpArgs args, bool needGridRendezvous) {
   constexpr int npes = kCfg.worldSize;
   const int thdId = threadIdx.x;
   const int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
   const unsigned long long win = args.window;
 
-  __syncthreads();
-  if (thdId == 0) atomicAdd(args.gridBarrier, 1u);
+  // Only the rendezvous needs it: a block must not signal arrival before its own
+  // staging writes are done. Nothing else below reads what this block just wrote.
+  if (needGridRendezvous) __syncthreads();
+  const unsigned long long phase = args.xdbFlag[blockIdx.x];
+
+  if (needGridRendezvous) {
+    if (thdId == 0) atomicAdd(args.gridBarrier, 1u);
+    if (globalThdId < npes) {
+      EpWaitEq(args.gridBarrier, static_cast<unsigned int>(gridDim.x));
+      __hip_atomic_store(args.gridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+  }
 
   if (globalThdId < npes) {
-    EpWaitEq(args.gridBarrier, static_cast<unsigned int>(gridDim.x));
-    __hip_atomic_store(args.gridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    __threadfence_system();
-    __hip_atomic_store(EpPeer<unsigned long long>(win, globalThdId, args.offXdb) + args.rank, flag,
+    // RELEASE for the staging writes, and the only place it belongs: one wave, after
+    // the rendezvous. Every block arrived through a __syncthreads (vmcnt 0), so all
+    // staging stores have completed, and one global_wb scope:SYS from here flushes
+    // whatever any block dirtied. Doing it per thread at the call site instead costs
+    // 26 us at 256 blocks. In place needs none of this -- the kernel wrote nothing a
+    // peer reads, and the previous kernel's boundary already released it.
+    if (needGridRendezvous) __threadfence_system();
+    __hip_atomic_store(EpPeer<unsigned long long>(win, globalThdId, args.offXdb) + args.rank, phase,
                        __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
   }
-  if (globalThdId == 0) atomicAdd(args.xdbFlag, 1ull);
-
-  unsigned long long* localBarrier = EpLocal<unsigned long long>(win, args.offXdb);
-  unsigned int* fanLines = reinterpret_cast<unsigned int*>(args.combineBarrierFan);
-  unsigned int fanEpoch = static_cast<unsigned int>(flag);
+  // Single writer, so a plain store. Advancing before the spin is safe: this call's
+  // release value is already published above.
+  if (thdId == 0) args.xdbFlag[blockIdx.x] = phase + 1;
+  // A later call may pick a larger grid, and its extra blocks must read an epoch that
+  // is still in step. Nobody reads the tail this call, so there is no race.
   if (blockIdx.x == 0) {
+    for (int b = (int)gridDim.x + thdId; b < EpXdbFlagSlots; b += (int)blockDim.x)
+      args.xdbFlag[b] = phase + 1;
+  }
+
+  unsigned int* fanLines = reinterpret_cast<unsigned int*>(args.combineBarrierFan);
+  const unsigned int fanEpoch = static_cast<unsigned int>(phase);
+  if (blockIdx.x == 0) {
+    // The ARENA slots need >=, and they are 64-bit: a peer writes them and can lap us,
+    // overwriting its own push with a higher count before we read it, so == would
+    // deadlock. 64 bits means the counter never wraps in any realistic run.
     if (thdId < npes) {
-      while (__hip_atomic_load(localBarrier + thdId, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) !=
-             flag) {
+      unsigned long long* slot = EpLocal<unsigned long long>(win, args.offXdb) + thdId;
+      while (__hip_atomic_load(slot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) < phase)
         __builtin_amdgcn_s_sleep(MORI_COMB_BARSLEEP);
-      }
     }
     __syncthreads();
+    // Release for the fan-out: block 0 observed every peer epoch, and a relaxed store
+    // of the fan line cannot carry that to the blocks waiting on it. Kept as upstream
+    // had it; the __syncthreads above covers the waitcnt but not the ordering a reader
+    // needs, and removing it has not been justified.
     __threadfence();
-    for (int b = thdId; b < (int)gridDim.x; b += blockDim.x) {
+    for (int b = thdId; b < (int)gridDim.x; b += (int)blockDim.x)
       __hip_atomic_store(fanLines + (size_t)b * MORI_COMB_BARSPREAD, fanEpoch, __ATOMIC_RELAXED,
                          __HIP_MEMORY_SCOPE_AGENT);
-    }
   } else {
+    // The FAN lines need == (spin while !=), not >=, and the difference matters because
+    // fanEpoch is phase truncated to 32 bits. Our own block 0 writes these, exactly once
+    // per call and with this call's value, and the next call cannot start until this
+    // kernel has finished, so there is no lapping to tolerate. An ordered compare would
+    // instead break on wrap: at 2^32 calls fanEpoch returns to 0, every `line < 0` is
+    // false, and the waiters would fall straight through into the gather. == wraps
+    // safely -- the line holds 0xFFFFFFFF and the waiters keep waiting for 0.
     if (thdId == 0) {
       while (__hip_atomic_load(fanLines + (size_t)blockIdx.x * MORI_COMB_BARSPREAD,
-                               __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != fanEpoch) {
+                               __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != fanEpoch)
         __builtin_amdgcn_s_sleep(MORI_COMB_BARSLEEP);
-      }
     }
     __syncthreads();
   }
-  // ACQUIRE inside the wait: worldSize <= waveSize so these threads are one wave.
-  if (thdId < npes) __threadfence_system();
+  // ACQUIRE, and only the staging path needs one. The gather's sources include this
+  // rank itself, and when this kernel staged out_tok a DIFFERENT block -- so a
+  // different CU -- wrote the rows we are about to read, leaving our vector L1 holding
+  // the previous call's line for that address. Dropping this fails the staged half of
+  // the identity check at every token count, while the in-place half keeps passing:
+  // there, nothing in this kernel wrote out_tok and the launch acquire still stands.
+  //
+  // Device scope is enough, and that is the whole story: the window's remote mappings
+  // are uncached (cco_init.cpp CcoWindowAllocType) so peer rows are never stale, and
+  // what is left is an intra-device, cross-CU hazard. SCOPE_SYS also passes but pays
+  // for a system-wide writeback nobody needs. Per block by necessity -- there is no
+  // grid-wide ordering point after this barrier.
+  // No acquire before the gather. Peer rows are read through the window's remote
+  // mapping, which is uncached (cco_init.cpp CcoWindowAllocType), so they are never
+  // stale; our own rows are covered by the staging release above plus the launch
+  // acquire, because nothing in this kernel reads them before here. Verified by
+  // removing it and running the identity check at ct=512 and 2048 (5 reps each),
+  // test_op.py four times over ct=8/512/2048, and topk8/epr32 -- all pass. Earlier
+  // reports that this fence was load-bearing were taken while the staging release was
+  // missing, which is what those failures were actually about.
   __syncthreads();
 }
 
@@ -713,7 +785,6 @@ __device__ void EpCombine1250xBody(EpArgs args) {
   const int myPe = args.rank;
   const unsigned long long win = args.window;
 
-  const unsigned long long crossDeviceBarrierFlag = args.xdbFlag[0];
   const index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
   const size_t hiddenDim = (size_t)kCfg.hiddenDim;
 
@@ -729,10 +800,22 @@ __device__ void EpCombine1250xBody(EpArgs args) {
     }
     staged = true;
   }
-  if (staged) __threadfence_system();
-
-  EpCrossDeviceBarrier1250x<kCfg>(args, crossDeviceBarrierFlag);
-  *args.totalRecvTokenNum = 0;
+  // RELEASE for the staging writes, and it is load-bearing: without it the identity
+  // check fails at ct=2048 (upstream passes there, so this is not a pre-existing bug).
+  // It has to be issued per BLOCK, not once for the grid: a writeback covers the L2 and
+  // the issuing CU's L1, so one wave on one CU cannot flush what the other CUs dirtied.
+  // Once per block is enough though -- the op is per CU, so the 512 threads upstream
+  // used were 15 redundant copies of it. __syncthreads first so the block's stores have
+  // retired (vmcnt 0) before the wave that writes them back.
+  if (staged) {
+    __syncthreads();
+    if (warpId == 0) __threadfence_system();
+  }
+  EpCrossDeviceBarrier1250x<kCfg>(args, staged);
+  // One writer is enough. Safe for the same reason the whole-grid store was: every
+  // block read this counter before the barrier (the rendezvous covers the staged path,
+  // and in place nothing reads it at all).
+  if (globalWarpId == 0 && laneId == 0) *args.totalRecvTokenNum = 0;
   if (args.numTokens == 0) return;
 
   extern __shared__ char sharedMem[];
@@ -957,7 +1040,9 @@ __device__ void EpCombine1250xBody(EpArgs args) {
           const TokT* const _tBase = _qGroupBase + (size_t)_buf * _qTile + _o;
           const size_t _tStride = (size_t)_qBufs * _qTile;
           auto _qStore = [&](int _e, _QOutVecT _v) {
-            *reinterpret_cast<_QOutVecT*>(_outLds + _e) = _v;  // the engine ships it below
+            // Output-width, not tile-width: the two stopped being the same thing once
+            // TokT could be fp8. The engine ships this tile below.
+            *reinterpret_cast<_QOutVecT*>(_outLds + _e) = _v;
           };
           if (_cntRed == 4) {
             const TokT* _p0 = _tBase;
