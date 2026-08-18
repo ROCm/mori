@@ -206,7 +206,7 @@ class CollectivesFacade {
   // Collective-permute: send my buffer to each target PE, recv from srcPe
   // (srcPe < 0 means no source). Dummy no-op.
   hipError_t RunCollectivePermute(const void* sendBuf, void* recvBuf, size_t numBytes,
-                                  int srcPe, const int* dstPes, int numDst,
+                                  int srcPe, const std::vector<int>& dstPes,
                                   hipStream_t stream);
 
   // Drain outstanding operations on `stream`. Dummy no-op.
@@ -409,8 +409,7 @@ hipError_t CollectivesFacade::RunRecv(void* /*recvBuf*/, size_t /*numBytes*/,
 hipError_t CollectivesFacade::RunCollectivePermute(const void* /*sendBuf*/,
                                                    void* /*recvBuf*/,
                                                    size_t /*numBytes*/, int /*srcPe*/,
-                                                   const int* /*dstPes*/,
-                                                   int /*numDst*/,
+                                                   const std::vector<int>& /*dstPes*/,
                                                    hipStream_t /*stream*/) {
   // TODO: dummy placeholder; real collective-permute kernel goes here.
   return hipSuccess;
