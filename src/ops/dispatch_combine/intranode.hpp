@@ -140,7 +140,10 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
         continue;
       }
-      if (laneId == 0) atomicAdd(&s_N[destPe], 1);
+      if (laneId == 0) {
+        atomicAdd(&s_N[destPe], 1);
+        args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, 0) | 0x40000000;
+      }
     }
   }
   __syncthreads();
@@ -155,24 +158,20 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   }
   __syncthreads();
 
-  // ---- Phase 3: distribute LOCAL slots + copy metadata and payload, per (token, peer) pair ----
+  // ---- Phase 3: distribute LOCAL slots + copy metadata and payload ----
   if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
     for (int i = globalWarpId; i < Npair; i += globalWarpNum) {
-      index_t destExpert = args.tokenIndices[i];
-      if (destExpert < 0) continue;
-      index_t destPe = destExpert / config.numExpertPerRank;
-      if (destPe < 0 || destPe >= config.worldSize) continue;
+      index_t cached = 0;
+      if (laneId == 0) cached = args.dispDestTokIdMap[i];
+      cached = __shfl(cached, 0);
+      if (!(cached & 0x40000000)) continue;
+
+      index_t destPe = PeFromFlatTokenIndex(config, cached & ~0x40000000);
       index_t srcTokId = i / topk;
-      int condition = 0;
-      if (laneId < (i % topk)) {
-        index_t otherExpert = args.tokenIndices[srcTokId * topk + laneId];
-        condition = (otherExpert >= 0) && (destPe == (otherExpert / config.numExpertPerRank));
-      }
-      if (__any(condition)) continue;
 
       index_t destTokId = 0;
       if (laneId == 0) {
-        index_t j = atomicAdd(&s_run[destPe], 1);  // fast LDS slot (was remote)
+        index_t j = atomicAdd(&s_run[destPe], 1);
         destTokId = s_base[destPe] + j;
         args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, destTokId);
         args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
@@ -180,16 +179,18 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       }
       destTokId = __shfl(destTokId, 0);
 
-      if (laneId < config.numExpertPerToken) {
-        if (args.weightsBuf) {
-          args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(
-              destPe)[destTokId * config.numExpertPerToken + laneId] =
-              args.weightsBuf[srcTokId * config.numExpertPerToken + laneId];
-        }
-        args.shmemOutIndicesMemObj->template GetAs<index_t*>(
-            destPe)[destTokId * config.numExpertPerToken + laneId] =
-            args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
+      if (args.weightsBuf) {
+        core::WarpCopy(
+            args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(destPe) +
+                (size_t)destTokId * config.numExpertPerToken,
+            args.weightsBuf + (size_t)srcTokId * config.numExpertPerToken,
+            (size_t)config.numExpertPerToken);
       }
+      core::WarpCopy(
+          args.shmemOutIndicesMemObj->template GetAs<index_t*>(destPe) +
+              (size_t)destTokId * config.numExpertPerToken,
+          args.tokenIndices + (size_t)srcTokId * config.numExpertPerToken,
+          (size_t)config.numExpertPerToken);
       if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
         size_t destScaleOffset = (size_t)destTokId * config.scaleDim * config.scaleTypeSize;
         size_t srcScaleOffset = (size_t)srcTokId * config.scaleDim * config.scaleTypeSize;
@@ -198,22 +199,22 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
             args.scalesBuf + srcScaleOffset, config.scaleDim * config.scaleTypeSize);
       }
       size_t destTokOffset = (size_t)destTokId * hiddenDim;
-      core::WarpCopy<T, 8>(
+      core::WarpCopy<T, 2>(
           args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
           args.inpTokenBuf + (size_t)srcTokId * hiddenDim, hiddenDim);
     }
   }
   __syncthreads();
-  // ---- Completion: all blocks arrive, then per-peer release-signal ----------------------------
+  // ---- Completion: overlap slot drain with grid barrier ----
   if (thdId == 0) atomicAdd(args.dispatchGridBarrier, 1);
   index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
   if (globalWarpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
+      index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
+      shmem::ShmemInt32WaitUntilEquals(signal, 0);
       shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, gridDim.x);
       __hip_atomic_store(args.dispatchGridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
-      index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
-      shmem::ShmemInt32WaitUntilEquals(signal, 0);
       __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
       core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
     }
