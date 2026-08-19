@@ -54,13 +54,9 @@ RUN python${PYTHON_VERSION} -m pip install --break-system-packages \
         /tmp/wheels/*.whl && \
     rm -rf /tmp/wheels
 
-# Common runtime and test dependencies. The mori wheel is built with
-# --no-build-isolation (so CMake can see the container's jax to resolve the XLA
-# FFI headers), which means every build-system requirement from pyproject.toml
-# must be preinstalled here.
+# Common runtime and test dependencies
 RUN python${PYTHON_VERSION} -m pip install --break-system-packages \
-        numpy scipy cmake pybind11 pytest \
-        "setuptools>=61,<84" setuptools_scm wheel ninja Cython
+        numpy scipy cmake pybind11 pytest
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libibverbs-dev \
