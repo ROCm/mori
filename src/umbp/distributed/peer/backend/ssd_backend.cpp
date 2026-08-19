@@ -74,12 +74,12 @@ bool SsdBackend::Init(MemoryRegistrar* registrar) {
 
   registrar_ = registrar;
 
-  // Runtime kill-switch for the file->GPU (GDS) read path.  On by default when
-  // the build has hipfile; UMBP_ENABLE_GDS=0 forces every SSD read back onto the
-  // staging arena without a rebuild (for A/B against GDS, or as a safety valve).
+  // Opt-in switch for the file->GPU (GDS) read path.  Off by default even when
+  // the build has hipfile; set UMBP_ENABLE_GDS=1 to route O_DIRECT SSD reads
+  // through the GdsEngine instead of the staging arena (no rebuild needed).
   if (const char* env = std::getenv("UMBP_ENABLE_GDS")) {
     const std::string v(env);
-    gds_enabled_ = !(v == "0" || v == "false" || v == "FALSE");
+    gds_enabled_ = (v == "1" || v == "true" || v == "TRUE" || v == "on" || v == "ON");
   }
 
   // ONE buffer covering every staging page, so each page is contiguous and a

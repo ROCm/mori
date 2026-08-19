@@ -33,6 +33,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -559,6 +560,14 @@ TEST_F(SsdBackendTest, ShutdownDeregistersTheArena) {
 // reads the segment range straight into GPU memory. Point TMPDIR at ext4/xfs
 // (e.g. /mnt/gds); skips without a GPU or where the filesystem rejects O_DIRECT.
 TEST(SsdBackendGds, ResolvePublishesFileRefAndReadsIntoDeviceMemory) {
+  // GDS is opt-in at runtime (default off).  Enable it for this test only and
+  // restore on every exit path (including GTEST_SKIP), so sibling staging tests
+  // in this binary keep their default-off behaviour.
+  struct GdsEnvGuard {
+    GdsEnvGuard() { ::setenv("UMBP_ENABLE_GDS", "1", /*overwrite=*/1); }
+    ~GdsEnvGuard() { ::unsetenv("UMBP_ENABLE_GDS"); }
+  } gds_env_guard;
+
   int ndev = 0;
   if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) GTEST_SKIP() << "no HIP device";
 
