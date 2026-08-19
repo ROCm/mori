@@ -369,8 +369,11 @@ jobs:
 
       - name: Install mori (XLA FFI)
         run: |
+          # --no-build-isolation so the build runs against the container's real
+          # site-packages, where jax lives; CMake can then resolve the XLA FFI
+          # headers via `jax.ffi.include_dir()` at configure time.
           $CT exec ${CONTAINER}_jax bash -c \
-            "cd $GITHUB_WORKSPACE && BUILD_UMBP=OFF BUILD_XLA_FFI_OPS=ON pip install --break-system-packages ."
+            "cd $GITHUB_WORKSPACE && BUILD_UMBP=OFF BUILD_XLA_FFI_OPS=ON pip install --break-system-packages --no-build-isolation ."
 
       - name: MORI-EP JAX test
         run: |
