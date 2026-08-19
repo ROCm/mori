@@ -347,6 +347,17 @@ __device__ index_t _cusplit_stgSrc[CUSPLIT_POOL_SLOTS];
 // _cusplit_blkCount = its token count (0 if none).
 __device__ index_t _cusplit_blkBase[CUSPLIT_MAX_BLOCKS * MAX_GPUS_PER_NODE];
 __device__ index_t _cusplit_blkCount[CUSPLIT_MAX_BLOCKS * MAX_GPUS_PER_NODE];
+
+#if defined(MORI_DISP_TIMING)
+// [CUSPLIT] phase table: skip cold launches, sample a warm one instead.
+__device__ unsigned long long _cusplit_timing_call_idx = 0;
+// Busiest block payload-phase duration (post _pbStart stamp).
+__device__ unsigned long long _pb_maxdur = 0ull;
+// Max meta-send span and deferred drain wait, for the metasend bucket breakdown.
+__device__ unsigned long long _meta_blk_maxdur = 0ull;
+__device__ unsigned long long _meta_drain_maxdur = 0ull;
+#endif
+
 // The four staged fields moved per (block, peer) run: idx, weights, scale, srcmap.
 constexpr int kMetaFields = 4;
 
@@ -405,6 +416,22 @@ __device__ void EpDispatchIntraNodeKernel_1250x_body(EpDispatchCombineArgs<T> ar
   const int _eLane = (_etpi > 1) ? (laneId - _sLane * topk) : laneId;
   const bool _laneAct = (_etpi > 1) ? (_sLane < _etpi) : (laneId < topk);
 
+#if defined(MORI_DISP_TIMING)
+  // _BPTS stamps are one scalar read per block by thread 0; they are the [CUSPLIT] segment table.
+  long long _pt[10];
+  long long _pbStart = 0;
+  const bool _ptOn = (blockIdx.x == 0 && thdId == 0);
+#define _BPTS(i) \
+  do {           \
+    if (_ptOn) _pt[i] = clock64(); \
+  } while (0)
+#else
+#define _BPTS(i) \
+  do {           \
+  } while (0)
+#endif
+  _BPTS(0);  // kernel entry
+
   extern __shared__ char _tdmBatchSmem[];
   T* _tdmTile = reinterpret_cast<T*>(_tdmBatchSmem) + (size_t)warpId * hiddenDim;
   const gfx1250_TDM_GROUP1 _tdmG1 = TdmShape<T>(static_cast<int>(hiddenDim));
@@ -455,6 +482,8 @@ __device__ void EpDispatchIntraNodeKernel_1250x_body(EpDispatchCombineArgs<T> ar
     }
   }
   __syncthreads();  // all warps in this block done counting before pushing s_N to global
+  _BPTS(1);         // <- phase1 count (block-local LDS histogram)
+
   // ---- Phase 2: per-block RESERVE. Each block does ONE remote atomic per active peer against
   // dispTokOffsetMemObj[p], the returned old value is this block's own contiguous slot base on that
   // peer (s_base[p]) -- fully decentralized like CLEAN, so NO grid barrier is needed here
@@ -470,6 +499,8 @@ __device__ void EpDispatchIntraNodeKernel_1250x_body(EpDispatchCombineArgs<T> ar
     }
   }
   __syncthreads();  // s_base visible to all threads in this block
+  _BPTS(2);         // <- reserve bucket: per-block remote atomic (no barrier)
+
   // ---- FINALIZE: recompute routing (cheap ALU); destTokId = this block's remote base (s_base)
   // plus a block-local running index (s_run, LDS atomic). No cross-block collision: each block
   // owns a disjoint [s_base, s_base+s_N) range carved out by its own remote atomic above. ----
@@ -562,6 +593,7 @@ __device__ void EpDispatchIntraNodeKernel_1250x_body(EpDispatchCombineArgs<T> ar
   // then sends only those tokens' meta+payload, reading only its OWN dispDestTokIdMap / staging /
   // blkBase / blkCount (same aWarps stride).
   __syncthreads();
+  _BPTS(7);  // <- finalize done (all blocks), right before meta/payload
 
   // META FIRST, THEN PAYLOAD: the payload phase that follows (~116-133us) serves as the DRAIN
   // WINDOW for meta's cross-GPU writes, so by the time the completion cross-rank signal fires, meta
@@ -569,6 +601,10 @@ __device__ void EpDispatchIntraNodeKernel_1250x_body(EpDispatchCombineArgs<T> ar
   // sender's outbound fabric -- which is what made cwait spin ~ms when meta trailed payload into
   // completion.
   bool _mPend = false;
+#if defined(MORI_DISP_TIMING)
+  long long _mt0b = clock64();
+  unsigned long long _mDrain = 0ull;
+#endif
   if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
     const int tkM = config.numExpertPerToken;
     const int sBytesM = config.scaleDim * config.scaleTypeSize;
@@ -745,6 +781,9 @@ __device__ void EpDispatchIntraNodeKernel_1250x_body(EpDispatchCombineArgs<T> ar
       }
     }
   }
+#if defined(MORI_DISP_TIMING)
+  if (laneId == 0) atomicMax(&_meta_blk_maxdur, (unsigned long long)(clock64() - _mt0b));
+#endif
   // NO BARRIER BETWEEN META AND PAYLOAD. There used to be a __syncthreads() here whose only stated
   // job was the tile reuse the wait below already covers, and that dependency is WITHIN a warp
   // rather than across them: _m4 is _tdmBatchSmem + warpId*mtileBytesM with mtileBytesM ==
@@ -760,8 +799,21 @@ __device__ void EpDispatchIntraNodeKernel_1250x_body(EpDispatchCombineArgs<T> ar
   // Pay whatever is left of the deferred drain, before the payload phase's first TdmIssueLoad
   // overwrites the tile these stores are still reading.
   if (_mPend) {
+#if defined(MORI_DISP_TIMING)
+    long long _md1 = clock64();
+#endif
     __builtin_amdgcn_s_wait_tensorcnt(0);
+#if defined(MORI_DISP_TIMING)
+    _mDrain += (unsigned long long)(clock64() - _md1);
+#endif
   }
+#if defined(MORI_DISP_TIMING)
+  if (blockIdx.x == 0 && laneId == 0) atomicMax(&_meta_drain_maxdur, _mDrain);
+#endif
+
+#if defined(MORI_DISP_TIMING)
+  if (thdId == 0) _pbStart = clock64();  // payload send start
+#endif
 
   // ---- Phase 3b: payload copy, driven by the slot map (dispDestTokIdMap, own-block). ----
   if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
@@ -802,6 +854,14 @@ __device__ void EpDispatchIntraNodeKernel_1250x_body(EpDispatchCombineArgs<T> ar
     }
   }
   __syncthreads();
+  _BPTS(3);  // <- phase3 payload copy (Part B: 1D TDM)
+#if defined(MORI_DISP_TIMING)
+  if (thdId == 0) {
+    const unsigned long long _pbEnd = (unsigned long long)clock64();
+    atomicMax(&_pb_maxdur, _pbEnd - (unsigned long long)_pbStart);
+  }
+#endif
+
   // ---- Completion (identical to legacy): all blocks arrive, then per-peer release-signal ---- One
   // shared counter, not per-block flags.
   if (thdId == 0) atomicAdd(args.dispatchGridBarrier, 1);
@@ -823,13 +883,17 @@ __device__ void EpDispatchIntraNodeKernel_1250x_body(EpDispatchCombineArgs<T> ar
       // and the signal store below still happens after BOTH. This is only the order of two reads.
       index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
       shmem::ShmemInt32WaitUntilEquals(signal, 0);
+      _BPTS(4);  // <- slot wait done (SLOTEARLY: peer slots cleared)
       shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, gridDim.x);
+      _BPTS(8);  // <- grid barrier satisfied
       __hip_atomic_store(args.dispatchGridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       // Must stay AFTER the grid barrier: this is the sum every block contributed to.
       index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
       __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+      _BPTS(9);  // <- release fence retired
       core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
     }
+    _BPTS(5);  // <- all per-peer completion signals sent
   }
   if (globalWarpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
@@ -843,7 +907,47 @@ __device__ void EpDispatchIntraNodeKernel_1250x_body(EpDispatchCombineArgs<T> ar
     if (laneId == 0) {
       args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
     }
+    _BPTS(6);  // <- all peers' signals received (completion done)
   }
+#if defined(MORI_DISP_TIMING)
+  if (blockIdx.x == 0 && thdId == 0 && !args.replayMode && myPe == 0) {
+    __threadfence();
+    long long tot = _pt[6] - _pt[0];
+    unsigned long long _callIdx = atomicAdd(&_cusplit_timing_call_idx, 1ull);
+    if (_callIdx == 2ull) {
+      int _bWarps = (int)((args.curRankNumToken + _etpi - 1) / _etpi);
+      if (_bWarps > aWarps) _bWarps = aWarps;
+      printf("[GEOM] rank=%d gridDim=%d blockDim=%d warpSize=%d warpNum=%d aWarps=%d numToken=%d "
+             "topk=%d npes=%d eprk=%d tpi=%d etpi=%d busyWarps=%d busyBlocks=%d tokPerWarp=%.2f\n",
+             myPe, (int)gridDim.x, (int)blockDim.x, (int)warpSize, warpNum, aWarps,
+             (int)args.curRankNumToken, topk, npes, config.numExpertPerRank, _tpi, _etpi, _bWarps,
+             (_bWarps + warpNum - 1) / warpNum, (double)args.curRankNumToken / (double)aWarps);
+    }
+    const double _dSlot = (_pt[4] - _pt[3]) / 2270.0, _dBar = (_pt[8] - _pt[4]) / 2270.0;
+    if (_callIdx >= 2ull && _callIdx < 13ull)
+      printf("[DIAG] rank=%d call=%llu order=slot,bar partB=%.1fus metablk=%.1fus cbar=%.2fus "
+             "cslot=%.2fus cfence=%.2fus cstore=%.2fus cwait=%.2fus compl=%.2fus tot=%.1fus\n",
+             myPe, _callIdx, _pb_maxdur / 2270.0, _meta_blk_maxdur / 2270.0, _dBar, _dSlot,
+             (_pt[9] - _pt[8]) / 2270.0, (_pt[5] - _pt[9]) / 2270.0, (_pt[6] - _pt[5]) / 2270.0,
+             (_pt[6] - _pt[3]) / 2270.0, tot / 2270.0);
+    if (tot > 0 && tot < 20000000LL && _callIdx >= 3ull && _callIdx < 13ull) {
+      long long p1 = _pt[1] - _pt[0], p2 = _pt[2] - _pt[1];
+      long long cpl = _pt[6] - _pt[3];
+      long long cbar = _pt[4] - _pt[3], csig = _pt[5] - _pt[4], cwait = _pt[6] - _pt[5];
+      long long p3assign = _pt[7] - _pt[2], p3meta = _pbStart - _pt[7], p3own = _pt[3] - _pbStart;
+      double frac = (double)_pb_maxdur / (double)tot;
+      printf("[CUSPLIT] rank=%d count=%lld reserve=%lld assign=%lld metasend=%lld own3b=%lld "
+             "partB_maxdur=%llu compl=%lld kernel=%lld frac=%.4f => PARTB_BW=dispatch_BW/%.4f | "
+             "compl(barrier=%lld sigsend=%lld waitpeer=%lld) | meta(send_maxdur=%llu drain=%llu)\n",
+             myPe, p1, p2, p3assign, p3meta, p3own, _pb_maxdur, cpl, tot, frac, frac, cbar, csig,
+             cwait, _meta_blk_maxdur, _meta_drain_maxdur);
+    }
+    _pb_maxdur = 0ull;
+    _meta_blk_maxdur = 0ull;
+    _meta_drain_maxdur = 0ull;
+  }
+#endif
+#undef _BPTS
 #ifdef ENABLE_STANDARD_MOE_ADAPT
   if constexpr (EnableStdMoE) {
     InvokeConvertDispatchOutput<T>(args, myPe);

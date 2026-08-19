@@ -432,6 +432,20 @@ def _build_bitcode(
     print(f"[mori-jit] Cached: {output}")
 
 
+def _disp_timing_defines() -> list[str]:
+    """Diagnostic: -DMORI_DISP_TIMING enables the in-kernel phase breakdown ([CUSPLIT]/[GEOM]/[DIAG]).
+    Gated by MORI_DISP_TIMING so production builds stay unperturbed.
+
+    MORI_DISP_TIMING_COARSE (implies TIMING) is the default recommendation: only the ~12 _BPTS phase
+    stamps per block survive, so the segment table sums to roughly the untimed kernel."""
+    val = os.environ.get("MORI_DISP_TIMING", "")
+    coarse = os.environ.get("MORI_DISP_TIMING_COARSE", "")
+    on = ("1", "true", "on", "yes")
+    if coarse.lower() in on:
+        return ["-DMORI_DISP_TIMING", "-DMORI_DISP_TIMING_COARSE"]
+    return ["-DMORI_DISP_TIMING"] if val.lower() in on else []
+
+
 def _tunable_defines() -> list[str]:
     """Every -D whose value depends on the environment or the target arch.
 
@@ -442,7 +456,7 @@ def _tunable_defines() -> list[str]:
     cannot end up in the compile without being in the key -- which is the bug that made a run with
     the quantise pass deleted load the full build's object and report the full build's time.
     """
-    return []
+    return [*_disp_timing_defines()]
 
 
 def _hipcc_genco(
