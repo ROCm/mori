@@ -73,7 +73,9 @@ class StandaloneClient : public IUMBPClient {
   void Close() override;
   bool IsDistributed() const override;
   UMBPDeploymentMode GetDeploymentMode() const override { return UMBPDeploymentMode::Local; }
-  bool SupportsRangedIO() const override { return !config_.ssd.enabled; }
+  // Both media behind LocalStorageManager implement ranged I/O now; only the
+  // read-only follower role is still whole-object.
+  bool SupportsRangedIO() const override { return role_ != UMBPRole::SharedSSDFollower; }
 
   bool ReportExternalKvBlocks(const std::vector<std::string>& /*hashes*/,
                               TierType /*tier*/) override {

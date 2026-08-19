@@ -260,7 +260,9 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
                     ::umbp::PingResponse* response) override {
     response->set_ready(!shutdown_.load());
     response->set_deployment_mode(BackendModeToProto(client_->GetDeploymentMode()));
-    response->set_supports_ranged_io(!backend_config_.ssd.enabled && client_->SupportsRangedIO());
+    // The inner client is the authority now that local SSD serves ranges; the
+    // extra ssd.enabled veto here would keep refusing a backend that can.
+    response->set_supports_ranged_io(client_->SupportsRangedIO());
     return grpc::Status::OK;
   }
 

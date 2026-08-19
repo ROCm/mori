@@ -194,7 +194,10 @@ std::vector<bool> StandaloneClient::BatchPutRanges(
   if (object_sizes.size() != n || !RangeBatchShapeValid(n, srcs, sizes, dst_offsets)) {
     return results;
   }
-  if (role_ == UMBPRole::SharedSSDFollower || config_.ssd.enabled) return results;
+  // Ranged writes always land in CPU_DRAM (see the index_.Insert below); a
+  // configured SSD tier fills from there by ordinary whole-object demotion, so
+  // ssd.enabled no longer has to disable this path.
+  if (role_ == UMBPRole::SharedSSDFollower) return results;
 
   std::vector<size_t> write_map;
   std::vector<std::string> write_keys;
@@ -325,8 +328,11 @@ std::vector<bool> StandaloneClient::BatchGetRanges(
     const std::vector<std::vector<size_t>>& src_offsets) {
   const size_t n = keys.size();
   std::vector<bool> results(n, false);
-  if (!RangeBatchShapeValid(n, dsts, sizes, src_offsets) || config_.ssd.enabled ||
-      role_ == UMBPRole::SharedSSDFollower) {
+  // SSD is no longer excluded: SSDTier serves ranges directly out of the
+  // segment file, and LocalStorageManager routes each key to whichever tier
+  // holds it.  The follower role stays out -- its SSD view is a read-only
+  // mirror refreshed on miss, which the ranged path does not model yet.
+  if (!RangeBatchShapeValid(n, dsts, sizes, src_offsets) || role_ == UMBPRole::SharedSSDFollower) {
     return results;
   }
 

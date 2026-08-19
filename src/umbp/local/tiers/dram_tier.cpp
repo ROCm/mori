@@ -1228,6 +1228,7 @@ TierCapabilities DRAMTier::Capabilities() const {
   caps.zero_copy_read = true;
   caps.batch_read = true;   // use the multi-threaded ReadBatchIntoPtr above
   caps.batch_write = true;  // use the multi-threaded BatchWrite below
+  caps.ranged_read = true;
   return caps;
 }
 

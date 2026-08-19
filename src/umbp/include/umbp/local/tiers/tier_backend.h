@@ -36,6 +36,11 @@ struct TierCapabilities {
   bool zero_copy_read = false;
   bool batch_write = false;
   bool batch_read = false;
+  // Whether ReadBatchRangesIntoPtr is really implemented.  The base class
+  // provides an all-false default, which is indistinguishable from "every key
+  // missed"; callers route on this flag instead so an unsupported tier falls
+  // through to another one rather than reporting a phantom miss.
+  bool ranged_read = false;
 };
 
 // Abstract base class for storage tier backends (DRAM, SSD, NVM, ...).
