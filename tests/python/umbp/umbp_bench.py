@@ -97,18 +97,35 @@ def _spawn(argv, log_path, env=None) -> subprocess.Popen:
     return proc
 
 
+# Backends that ranged_perf cannot drive.  Mooncake has no ranged/sub-object
+# get in its client API at all, so offering the combination would only produce
+# a runtime failure one flag later.
+_RANGED_ONLY_EXCLUDED = {"mooncake"}
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="umbp_bench.py")
     cmd_sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
-    def _add_backend_sub(cmd_parser, *, batch_perf: bool = False):
+    def _add_backend_sub(
+        cmd_parser, *, batch_perf: bool = False, ranged_perf: bool = False
+    ):
         be_sub = cmd_parser.add_subparsers(
             dest="backend", required=True, metavar="BACKEND"
         )
-        for be_name in ("umbp", "mooncake"):
+        for be_name in ("umbp", "umbp-local", "umbp-server", "mooncake"):
+            if be_name in _RANGED_ONLY_EXCLUDED and ranged_perf:
+                continue
             be_p = be_sub.add_parser(be_name)
             if be_name == "umbp":
                 be_p.add_argument("master_address", help="e.g. ip:port")
+            elif be_name == "umbp-server":
+                be_p.add_argument(
+                    "server_address",
+                    help="standalone UMBP server, e.g. unix:///tmp/umbp.sock or ip:port",
+                )
+            elif be_name == "umbp-local":
+                pass  # in-process: no address to connect to
             else:
                 be_p.add_argument(
                     "metadata_server", help="e.g. http://ip:8080/metadata"
@@ -164,7 +181,7 @@ def _build_parser() -> argparse.ArgumentParser:
                 "and tear them down on exit (default: on; use --no-start-server "
                 "to reuse an already-running server).",
             )
-            if be_name == "umbp":
+            if be_name.startswith("umbp"):
                 be_p.add_argument(
                     "--tier",
                     choices=["dram", "hbm", "ssd"],
@@ -197,8 +214,113 @@ def _build_parser() -> argparse.ArgumentParser:
                     "--dst-loc gpu, the client's own read-destination buffer "
                     "(default: 0). Overridable via UMBP_HBM_DEVICE.",
                 )
+            # --- SSD tier knobs, shared by every umbp deployment -------------
+            #
+            # UMBPBackend builds UMBPConfig by hand and never calls
+            # FromEnvironment(), so these are applied by exporting the same
+            # UMBP_SSD_* names the config block already reads (see
+            # _apply_tier_env).  That keeps one code path -- and all of its
+            # sizing warnings -- rather than a second, divergent one.
+            if be_name.startswith("umbp"):
+                be_p.add_argument(
+                    "--ssd-dir",
+                    default=None,
+                    help="SSD tier directory. COMMA-SEPARATE for a multi-drive "
+                    "sharded tier (one entry per physical drive) -- this is the "
+                    "pure-ssd-mode production topology. Sets "
+                    "UMBP_SSD_STORAGE_DIR.",
+                )
+                be_p.add_argument("--ssd-capacity-bytes", type=int, default=None)
+                be_p.add_argument("--segment-bytes", type=int, default=None)
+                be_p.add_argument(
+                    "--dram-bytes",
+                    type=int,
+                    default=None,
+                    help="DRAM tier capacity. For an SSD run keep it "
+                    "far below the dataset so objects really demote.",
+                )
+                be_p.add_argument(
+                    "--direct-io",
+                    action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="O_DIRECT on the SSD tier (default: on). Off measures "
+                    "the page cache, not the device.",
+                )
+                be_p.add_argument(
+                    "--verify-crc",
+                    choices=["on", "off", "both"],
+                    default=None,
+                    help="Whole-object checksum verification. Ranged reads never "
+                    "verify, so 'both' (ranged_perf only) separates the byte "
+                    "saving from the checksum saving.",
+                )
+                be_p.add_argument(
+                    "--io-backend",
+                    choices=["io_uring", "posix"],
+                    default=None,
+                    help="SSD I/O driver (default: io_uring). posix reports "
+                    "batch_read=false, so every read is a separate blocking "
+                    "pread -- a contrast, not the headline number.",
+                )
+                be_p.add_argument("--queue-depth", type=int, default=None)
+                be_p.add_argument("--tier-io-threads", type=int, default=None)
+                be_p.add_argument(
+                    "--ranged-scratch-bytes",
+                    type=int,
+                    default=None,
+                    help="Registered host arena for ranged multi-buffer I/O. It "
+                    "is the ENTIRE opt-in: at 0 (the default) the client reports "
+                    "supports_ranged_io()=False on every medium. Only the remote "
+                    "path uses it. ranged_perf auto-sizes it when unset.",
+                )
+                be_p.add_argument(
+                    "--buffer-backing",
+                    choices=["auto", "shm", "hugetlb", "anon"],
+                    default="auto",
+                    help="Backing for the bench's own DMA buffers (default: auto). "
+                    "auto = shm for umbp-server (the standalone server must map "
+                    "the caller's memory, and an ordinary page returns a per-key "
+                    "false that looks like the store refusing the op), hugetlb "
+                    "otherwise.",
+                )
+            if ranged_perf:
+                be_p.add_argument(
+                    "--layers",
+                    type=int,
+                    default=32,
+                    help="Layers per stored object (default: 32). object_size = "
+                    "layers * layer_bytes and overrides --value-size.",
+                )
+                be_p.add_argument(
+                    "--layer-bytes",
+                    type=int,
+                    default=36864,
+                    help="Bytes of one layer of one page (default: 36864 = 9x4KiB, "
+                    "MLA page_size=64 at 576B/token).",
+                )
+                be_p.add_argument(
+                    "--groups",
+                    type=int,
+                    nargs="+",
+                    default=[1, 2, 4, 8, 16, 32],
+                    help="Layer-group widths to sweep. The full layer count is "
+                    "always added as the whole-object-via-ranges case.",
+                )
+                be_p.add_argument(
+                    "--first-layer",
+                    type=int,
+                    default=0,
+                    help="First layer of the group read (default: 0).",
+                )
+                be_p.add_argument(
+                    "--batch",
+                    type=int,
+                    default=32,
+                    help="Objects per ranged/whole call (default: 32).",
+                )
+            if batch_perf or ranged_perf:
+                be_p.add_argument("--passes", type=int, default=10 if batch_perf else 7)
             if batch_perf:
-                be_p.add_argument("--passes", type=int, default=10)
                 be_p.add_argument("--batch-sizes", type=int, nargs="+", metavar="N")
                 be_p.add_argument(
                     "--dest-layout",
@@ -221,16 +343,48 @@ def _build_parser() -> argparse.ArgumentParser:
 
     _add_backend_sub(cmd_sub.add_parser("correctness"))
     _add_backend_sub(cmd_sub.add_parser("batch_perf"), batch_perf=True)
+    _add_backend_sub(cmd_sub.add_parser("ranged_perf"), ranged_perf=True)
     return parser
 
 
 args = _build_parser().parse_args()
 command = args.command
-backend_name = args.backend
+
+# One UMBP client class, three ways to reach it.  `backend_name` stays the
+# family so every existing `backend_name == "umbp"` test keeps its meaning, and
+# `deployment` carries which one:
+#   distributed        -- DistributedClient in this process, talks to a master
+#   local              -- StandaloneClient in this process, no network at all
+#   standalone-server  -- forwards over gRPC/shm to a standalone UMBP server,
+#                         which itself may be local- or distributed-backed
+_DEPLOYMENT_OF = {
+    "umbp": "distributed",
+    "umbp-local": "local",
+    "umbp-server": "standalone-server",
+    "mooncake": "distributed",
+}
+deployment = _DEPLOYMENT_OF[args.backend]
+backend_name = "umbp" if args.backend.startswith("umbp") else args.backend
+
+command = args.command
 nr_objects = args.nr_objects
-value_size = args.value_size
 role = args.role
 numa_node = args.numa_node
+
+# ranged_perf sizes an object as layers x layer_bytes; batch_perf/correctness
+# size it as --value-size.  One `value_size` downstream either way, so the
+# staging/pool planners below need no ranged special case.
+layers = getattr(args, "layers", 0)
+layer_bytes = getattr(args, "layer_bytes", 0)
+if command == "ranged_perf":
+    value_size = layers * layer_bytes
+    if value_size <= 0:
+        print(
+            "ERROR: --layers and --layer-bytes must both be positive", file=sys.stderr
+        )
+        sys.exit(2)
+else:
+    value_size = args.value_size
 
 if role != "both" and not args.key_prefix:
     print(
@@ -243,6 +397,52 @@ if role != "both" and not args.key_prefix:
 tier = getattr(args, "tier", "dram")
 dst_loc = getattr(args, "dst_loc", "host")
 hbm_device = getattr(args, "hbm_device", 0)
+
+
+def _apply_tier_env(a) -> None:
+    """Lower the SSD/DRAM CLI flags onto the UMBP_* names the config block reads.
+
+    UMBPBackend builds UMBPConfig by hand rather than through
+    FromEnvironment(), and every tier knob it honours is already spelled as an
+    os.environ lookup with its own sizing warnings attached.  Routing the new
+    flags through the same names keeps ONE configuration path: a flag and its
+    env var cannot drift, and nothing bypasses the "staging arena >= dataset"
+    or "slot < value_size" warnings that make an SSD number trustworthy.
+
+    An explicitly exported env var still wins, so existing runbooks that set
+    UMBP_SSD_* directly behave exactly as before.
+    """
+    mapping = {
+        "ssd_dir": "UMBP_SSD_STORAGE_DIR",
+        "ssd_capacity_bytes": "UMBP_SSD_CAPACITY_BYTES",
+        "tier_io_threads": "UMBP_SSD_TIER_IO_THREADS",
+        "dram_bytes": "UMBP_DRAM_CAPACITY_BYTES",
+    }
+    for attr, env in mapping.items():
+        val = getattr(a, attr, None)
+        if val is not None and env not in os.environ:
+            os.environ[env] = str(val)
+    direct = getattr(a, "direct_io", None)
+    if direct is not None and "UMBP_SSD_DIRECT_IO" not in os.environ:
+        os.environ["UMBP_SSD_DIRECT_IO"] = "1" if direct else "0"
+    crc = getattr(a, "verify_crc", None)
+    # "both" is a ranged_perf sweep, not a single setting; the sweep sets the
+    # var per iteration, so leave it alone here.
+    if crc in ("on", "off") and "UMBP_SSD_VERIFY_CRC" not in os.environ:
+        os.environ["UMBP_SSD_VERIFY_CRC"] = "1" if crc == "on" else "0"
+
+
+_apply_tier_env(args)
+
+if getattr(args, "verify_crc", None) == "both" and command != "ranged_perf":
+    print(
+        "ERROR: --verify-crc both is a ranged_perf sweep; pass on/off elsewhere",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+if command == "ranged_perf" and backend_name != "umbp":
+    print("ERROR: ranged_perf requires a umbp backend", file=sys.stderr)
+    sys.exit(2)
 if dst_loc == "gpu" and backend_name != "umbp":
     print("ERROR: --dst-loc gpu is only supported for backend=umbp", file=sys.stderr)
     sys.exit(2)
@@ -408,6 +608,23 @@ _dram_capacity_bytes = (
 )
 _ssd_entry_bytes = ((value_size + 4095) // 4096) * 4096
 
+_buffer_backing = getattr(args, "buffer_backing", "auto")
+_io_backend = getattr(args, "io_backend", None)
+_queue_depth = getattr(args, "queue_depth", None)
+_segment_bytes = getattr(args, "segment_bytes", None)
+
+# Ranged scratch: only the remote half of a ranged operation uses it, and it
+# must hold a whole sub-batch of objects at once (an object larger than the
+# arena fails that key).  Auto-size to the batch with headroom; zero elsewhere,
+# which is what keeps ranged I/O off for deployments that never ask for it.
+_ranged_scratch_bytes = getattr(args, "ranged_scratch_bytes", None)
+if _ranged_scratch_bytes is None:
+    _ranged_scratch_bytes = (
+        max(4, getattr(args, "batch", 32)) * value_size * 2
+        if command == "ranged_perf"
+        else 0
+    )
+
 
 # --- hugepage preflight ------------------------------------------------------
 # The DRAM pool, the SSD staging arena and the bench's own read buffer are all
@@ -483,11 +700,27 @@ if backend_name == "umbp":
         UMBPClient,
         UMBPConfig,
         UMBPDistributedConfig,
+        UMBPIoBackend,
         UMBPMedium,
+        UMBPStandaloneProcessConfig,
     )
 
-    master_address = args.master_address
-    _resolve_host = master_address.split(":")[0]
+    if deployment == "distributed":
+        master_address = args.master_address
+        _resolve_host = master_address.split(":")[0]
+    elif deployment == "standalone-server":
+        master_address = ""
+        server_address = args.server_address
+        # A unix socket has no host to rendezvous against; a split run over one
+        # would be two processes on the same node anyway, so localhost is right.
+        _resolve_host = (
+            "127.0.0.1"
+            if server_address.startswith("unix:")
+            else server_address.split("//")[-1].split(":")[0]
+        )
+    else:  # local
+        master_address = ""
+        _resolve_host = "127.0.0.1"
 else:
     from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
@@ -551,6 +784,35 @@ class Backend(ABC):
         """Batch read into ptrs. Returns bytes_read per key (0 = miss)."""
 
     @abstractmethod
+    def wait_visible(self, keys: list, timeout: float = 30.0) -> int:
+        """Block until the store reports `keys` present, returning how many are.
+
+        A put is not necessarily readable the moment it returns. In distributed
+        mode a peer publishes its ADDs to the master on the heartbeat, and the
+        size-based auto-flush that would ship them sooner only trips at
+        UMBP_AUTO_FLUSH_EVENT_THRESHOLD (default 128) completed puts -- and on
+        the SSD medium not even then, since those events always wait for the
+        interval. So a small dataset written and immediately read comes back as
+        a total miss that looks exactly like a broken read path.
+
+        Default is a no-op for backends whose writes are synchronously visible.
+        """
+        return len(keys)
+
+    def supports_ranged_io(self) -> bool:
+        """Whether this backend can serve sub-object reads.
+
+        Advisory on the UMBP side: the ranged entry points forward
+        unconditionally, so this is what a caller ASKS, not a guard the data
+        path enforces (see doc/design-ssd-ranged-io.md 3.1).  ranged_perf
+        asserts it before timing anything, so a run cannot silently measure a
+        path the deployment claims not to have.
+        """
+        return False
+
+    def batch_get_ranges_into_ptr(self, keys, ptrs, sizes, offsets) -> list:
+        raise NotImplementedError(f"{type(self).__name__} has no ranged I/O")
+
     def make_reader(self) -> "Backend":
         """Return a backend instance for reading (may be self)."""
 
@@ -582,6 +844,20 @@ class UMBPBackend(Backend):
             sys.exit(1)
         env = dict(os.environ)
         env.setdefault("MORI_UMBP_LOG_LEVEL", "DEBUG")
+        # umbp_master links libmori_io / libmori_application straight out of the
+        # build tree and nothing installs them, so in a container where mori was
+        # only pip-installed (not system-installed) the spawn dies with
+        # "libmori_io.so: cannot open shared object file". The failure surfaces
+        # only as "umbp_master failed to start", so put the tree on the loader
+        # path rather than leaving that to the caller's environment.
+        _libdirs = [
+            os.path.join(mori_root, f"build_{fqdn}", sub)
+            for sub in ("src/io", "src/application", "src/metrics", "src/shmem")
+        ]
+        env["LD_LIBRARY_PATH"] = ":".join(
+            [d for d in _libdirs if os.path.isdir(d)]
+            + ([env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH") else [])
+        )
         proc = _spawn([binary, f"0.0.0.0:{port}", "0"], "/tmp/umbp_master.log", env)
         if not _wait_for_port(port):
             print(
@@ -637,6 +913,12 @@ class UMBPBackend(Backend):
             "UMBP_CACHE_REMOTE_FETCHES", "1"
         ) not in ("0", "false", "False", "")
         dist.io_engine.host = node_address
+        # The ranged scratch arena is the whole opt-in for ranged I/O, on every
+        # medium including SSD, and it defaults to zero.  ranged_perf sizes it
+        # from the batch when the flag is unset; other commands leave it off so
+        # a deployment that never issues ranged operations allocates and
+        # registers nothing.
+        dist.ranged_scratch_size = _ranged_scratch_bytes
         if tier == "hbm":
             dist.medium = UMBPMedium.HBM
             dist.hbm.device = int(os.environ.get("UMBP_HBM_DEVICE", hbm_device))
@@ -747,6 +1029,21 @@ class UMBPBackend(Backend):
                 "",
             )
             cfg.ssd.tier_io_threads = int(os.environ.get("UMBP_SSD_TIER_IO_THREADS", 4))
+            # posix reports batch_read=false, so a batch degrades to one
+            # blocking pread at a time -- which penalises exactly the
+            # many-small-reads shape ranged I/O produces.  io_uring is the
+            # production setting and the only one where a batch is submitted
+            # as a batch.
+            if _io_backend is not None:
+                cfg.ssd.io.backend = (
+                    UMBPIoBackend.IoUring
+                    if _io_backend == "io_uring"
+                    else UMBPIoBackend.Posix
+                )
+            if _queue_depth is not None:
+                cfg.ssd.io.queue_depth = _queue_depth
+            if _segment_bytes is not None:
+                cfg.ssd.segment_size_bytes = _segment_bytes
             cfg.ssd.shard_io_threads = int(
                 os.environ.get("UMBP_SSD_SHARD_IO_THREADS", 0)
             )
@@ -803,6 +1100,15 @@ class UMBPBackend(Backend):
     def batch_get_into_ptr(self, keys: list, ptrs: list, sizes: list) -> list:
         raw = self._client.batch_get_into_ptr(keys, ptrs, sizes)
         return [sz if hit else 0 for hit, sz in zip(raw, sizes)]
+
+    def wait_visible(self, keys: list, timeout: float = 30.0) -> int:
+        return _wait_visible_via_exists(self._client, keys, timeout)
+
+    def supports_ranged_io(self) -> bool:
+        return self._client.supports_ranged_io()
+
+    def batch_get_ranges_into_ptr(self, keys, ptrs, sizes, offsets) -> list:
+        return self._client.batch_get_ranges_into_ptr(keys, ptrs, sizes, offsets)
 
     def make_reader(self) -> "UMBPBackend":
         return UMBPBackend(self._reader_node_id, self._reader_port)
@@ -939,7 +1245,189 @@ class MooncakeBackend(Backend):
 
 # --- backend init ---
 
-_BACKENDS = {"umbp": UMBPBackend, "mooncake": MooncakeBackend}
+
+def _wait_visible_via_exists(client, keys: list, timeout: float) -> int:
+    deadline = time.time() + timeout
+    seen = 0
+    while True:
+        found = client.batch_exists(keys)
+        seen = sum(1 for f in found if f)
+        if seen == len(keys) or time.time() >= deadline:
+            return seen
+        time.sleep(0.25)
+
+
+class UMBPLocalBackend(Backend):
+    """Local mode: a StandaloneClient in this process.  No master, no network.
+
+    The point of keeping this alongside the networked deployments is that it is
+    the only configuration where a measurement is purely the storage tier --
+    no RDMA, no gRPC, no staging arena -- so it is the baseline that says
+    whether a distributed number is bounded by the medium or by the transport.
+    """
+
+    @classmethod
+    def start_server(cls, args):
+        return None  # nothing to start
+
+    def __init__(self, verify_crc: bool = None):
+        cfg = UMBPConfig()
+        # Must be far smaller than the dataset, or Put keeps everything in the
+        # fast tier and the SSD is never read.
+        cfg.dram.capacity_bytes = int(
+            os.environ.get("UMBP_DRAM_CAPACITY_BYTES", 64 << 20)
+        )
+        cfg.dram.use_hugepages = os.environ.get("UMBP_DRAM_USE_HUGEPAGES", "0") not in (
+            "0",
+            "",
+        )
+        if tier == "ssd":
+            cfg.ssd.enabled = True
+            cfg.ssd.storage_dir = os.environ.get(
+                "UMBP_SSD_STORAGE_DIR", f"/tmp/umbp_ssd_local_{os.getpid()}"
+            )
+            cfg.ssd.capacity_bytes = int(
+                os.environ.get("UMBP_SSD_CAPACITY_BYTES", 64 << 30)
+            )
+            cfg.ssd.direct_io = os.environ.get("UMBP_SSD_DIRECT_IO", "1") not in (
+                "0",
+                "",
+            )
+            cfg.ssd.tier_io_threads = int(os.environ.get("UMBP_SSD_TIER_IO_THREADS", 8))
+            if _segment_bytes is not None:
+                cfg.ssd.segment_size_bytes = _segment_bytes
+            if _io_backend is not None:
+                cfg.ssd.io.backend = (
+                    UMBPIoBackend.IoUring
+                    if _io_backend == "io_uring"
+                    else UMBPIoBackend.Posix
+                )
+            if _queue_depth is not None:
+                cfg.ssd.io.queue_depth = _queue_depth
+            # verify_crc is swept by ranged_perf, so the caller may override the
+            # env-derived value per iteration.
+            cfg.ssd.verify_crc = (
+                verify_crc
+                if verify_crc is not None
+                else os.environ.get("UMBP_SSD_VERIFY_CRC", "1") not in ("0", "")
+            )
+            for _d in cfg.ssd.storage_dir.split(","):
+                _d = _d.strip()
+                if _d:
+                    os.makedirs(_d, exist_ok=True)
+        else:
+            cfg.ssd.enabled = False
+            cfg.dram.capacity_bytes = _dram_capacity_bytes
+        # Promotion would pull an object into DRAM on its first read, so every
+        # later measurement would be a DRAM hit rather than a tier hit.
+        cfg.eviction.auto_promote_on_read = os.environ.get(
+            "UMBP_AUTO_PROMOTE_ON_READ", "0"
+        ) not in ("0", "")
+        self._client = UMBPClient(cfg)
+
+    def put(self, key: str, payload: bytes, ptr: int, size: int) -> bool:
+        ctypes.memmove(ptr, payload, size)
+        return self._client.batch_put_from_ptr([key], [ptr], [size])[0]
+
+    def flush(self):
+        self._client.flush()
+
+    def register_memory(self, ptr: int, size: int, loc: str = "cpu", device: int = -1):
+        return True  # local mode is a CPU-local memcpy; nothing to pin
+
+    def get_into_ptr(self, key: str, ptr: int, size: int) -> bool:
+        return self._client.batch_get_into_ptr([key], [ptr], [size])[0]
+
+    def batch_get_into_ptr(self, keys: list, ptrs: list, sizes: list) -> list:
+        res = self._client.batch_get_into_ptr(keys, ptrs, sizes)
+        return [sizes[i] if r else 0 for i, r in enumerate(res)]
+
+    def wait_visible(self, keys: list, timeout: float = 30.0) -> int:
+        return _wait_visible_via_exists(self._client, keys, timeout)
+
+    def supports_ranged_io(self) -> bool:
+        return self._client.supports_ranged_io()
+
+    def batch_get_ranges_into_ptr(self, keys, ptrs, sizes, offsets) -> list:
+        return self._client.batch_get_ranges_into_ptr(keys, ptrs, sizes, offsets)
+
+    def make_reader(self) -> "UMBPLocalBackend":
+        return self  # one process, one client: reads come from the same store
+
+
+class UMBPServerBackend(Backend):
+    """Standalone-process mode: forwards to a UMBP server over gRPC + shm.
+
+    This is the deployment the tree connector actually runs, and the only one
+    where the client and the pool are different processes.  The server may be
+    local- or distributed-backed; get_backend_mode() reports which, and with a
+    distributed-backed server a read leaves this node over RDMA.
+    """
+
+    @classmethod
+    def start_server(cls, args):
+        # The server is long-lived and externally managed (it owns the node's
+        # pool), so the bench never starts or stops one.
+        return None
+
+    def __init__(self, address: str):
+        cfg = UMBPConfig()
+        sp = UMBPStandaloneProcessConfig()
+        sp.address = address
+        sp.startup_timeout_ms = int(os.environ.get("UMBP_STANDALONE_TIMEOUT_MS", 15000))
+        # standalone_process ONLY: the factory tests `distributed` first, so a
+        # config carrying both silently builds a second DistributedClient
+        # instead of a client that forwards to the server.
+        cfg.standalone_process = sp
+        self._client = UMBPClient(cfg)
+        print(
+            f"connected to standalone server {address}: "
+            f"mode={self._client.get_deployment_mode()} "
+            f"backend={self._client.get_backend_mode()} "
+            f"ranged={self._client.supports_ranged_io()}",
+            flush=True,
+        )
+
+    def put(self, key: str, payload: bytes, ptr: int, size: int) -> bool:
+        ctypes.memmove(ptr, payload, size)
+        return self._client.batch_put_from_ptr([key], [ptr], [size])[0]
+
+    def flush(self):
+        self._client.flush()
+
+    def register_memory(self, ptr: int, size: int, loc: str = "cpu", device: int = -1):
+        mori_loc = MemoryLocationType.GPU if loc == "gpu" else MemoryLocationType.CPU
+        return self._client.register_memory(ptr, size, mori_loc, device)
+
+    def get_into_ptr(self, key: str, ptr: int, size: int) -> bool:
+        return self._client.batch_get_into_ptr([key], [ptr], [size])[0]
+
+    def batch_get_into_ptr(self, keys: list, ptrs: list, sizes: list) -> list:
+        res = self._client.batch_get_into_ptr(keys, ptrs, sizes)
+        return [sizes[i] if r else 0 for i, r in enumerate(res)]
+
+    def wait_visible(self, keys: list, timeout: float = 30.0) -> int:
+        return _wait_visible_via_exists(self._client, keys, timeout)
+
+    def supports_ranged_io(self) -> bool:
+        return self._client.supports_ranged_io()
+
+    def batch_get_ranges_into_ptr(self, keys, ptrs, sizes, offsets) -> list:
+        return self._client.batch_get_ranges_into_ptr(keys, ptrs, sizes, offsets)
+
+    def make_reader(self) -> "UMBPServerBackend":
+        # The dataset lives in the SERVER, not in this process, so a reader is
+        # just another client of the same socket -- and unlike the distributed
+        # case the writer may exit without taking the data with it.
+        return self
+
+
+_BACKENDS = {
+    "umbp": UMBPBackend,
+    "umbp-local": UMBPLocalBackend,
+    "umbp-server": UMBPServerBackend,
+    "mooncake": MooncakeBackend,
+}
 
 
 def _free_port():
@@ -1083,8 +1571,10 @@ def _bind_numa_cpus(node: int):
 
 # Only the writer (or a combined both) owns the master/metadata server(s); the
 # reader connects to the writer's already-running master, so it never starts one.
-if args.start_server and role != "reader":
-    _resolved = _BACKENDS[backend_name].start_server(args)
+# local mode has no server at all, and a standalone server is long-lived and
+# externally managed (it owns the node's pool), so neither is started here.
+if args.start_server and role != "reader" and deployment == "distributed":
+    _resolved = _BACKENDS[args.backend].start_server(args)
     # The server may have been moved to an auto-picked free port; point the
     # client at the address(es) it actually bound.
     if backend_name == "umbp":
@@ -1101,7 +1591,30 @@ _bind_numa_cpus(numa_node)
 # backend lazily (role=reader uses _build_reader; role=both uses
 # writer.make_reader() so the two clients still share one process).
 writer = None
-if backend_name == "umbp":
+if deployment == "local":
+
+    def _build_reader():
+        return UMBPLocalBackend()
+
+    if role in ("both", "writer"):
+        writer = UMBPLocalBackend()
+        print(
+            f"backend=umbp-local tier={tier} role={role} "
+            f"ranged={writer.supports_ranged_io()}",
+            flush=True,
+        )
+elif deployment == "standalone-server":
+
+    def _build_reader():
+        return UMBPServerBackend(server_address)
+
+    if role in ("both", "writer"):
+        writer = UMBPServerBackend(server_address)
+        print(
+            f"backend=umbp-server tier={tier} role={role} server={server_address}",
+            flush=True,
+        )
+elif backend_name == "umbp":
 
     def _build_reader():
         rid = f"reader_{os.getpid()}_{int(time.time())}"
@@ -1154,13 +1667,41 @@ class HostBuffer:
             HostBuffer._allocator = UMBPHostMemAllocator()
         use_hp = os.environ.get("UMBP_DRAM_USE_HUGEPAGES", "1") not in ("0", "")
         hp_size = int(os.environ.get("UMBP_DRAM_HUGEPAGE_SIZE", 2 * 1024 * 1024))
-        backing = (
-            UMBPHostBufferBacking.AnonymousHugetlb
-            if use_hp
-            else UMBPHostBufferBacking.Anonymous
-        )
+        # Standalone-process mode resolves (region_base, offset) triples against
+        # the SERVER's mapping of this memory, so the buffer has to be shm-backed
+        # or nothing can map it.  Getting this wrong is quiet: the call returns a
+        # per-key false, which at the call site is indistinguishable from the
+        # store refusing the operation.
+        want = _buffer_backing
+        if want == "auto":
+            want = (
+                "shm"
+                if deployment == "standalone-server"
+                else ("hugetlb" if use_hp else "anon")
+            )
+        backing = {
+            "shm": (
+                UMBPHostBufferBacking.AnonymousShmHugetlb
+                if use_hp
+                else UMBPHostBufferBacking.AnonymousShm
+            ),
+            "hugetlb": UMBPHostBufferBacking.AnonymousHugetlb,
+            "anon": UMBPHostBufferBacking.Anonymous,
+        }[want]
         numa = int(os.environ.get("UMBP_DRAM_NUMA_NODE", numa_node))
         self._handle = HostBuffer._allocator.alloc(size, backing, hp_size, numa, True)
+        if not self._handle and want == "shm" and use_hp:
+            # Reserved hugetlb shm is the common thing to be missing; plain shm
+            # still satisfies the mapping requirement above.
+            backing = UMBPHostBufferBacking.AnonymousShm
+            self._handle = HostBuffer._allocator.alloc(
+                size, backing, hp_size, numa, True
+            )
+            if self._handle:
+                print(
+                    "NOTE: hugetlb shm unavailable, using 4 KiB shm pages",
+                    file=sys.stderr,
+                )
         if not self._handle:
             raise RuntimeError(f"UMBPHostMemAllocator.alloc({size}) failed")
         if use_hp and self._handle.actual_backing == UMBPHostBufferBacking.Anonymous:
@@ -1173,11 +1714,16 @@ class HostBuffer:
         self.size = size
 
     def __del__(self):
+        # At interpreter shutdown module globals are torn down first, so the
+        # class object this method references can already be None. Bail out
+        # rather than raising an "Exception ignored in __del__" per buffer,
+        # which is pure noise that hides real errors in the same output.
         handle = getattr(self, "_handle", None)
-        if handle is not None and HostBuffer._allocator is not None:
+        cls = globals().get("HostBuffer")
+        if handle is not None and cls is not None and cls._allocator is not None:
             try:
-                HostBuffer._allocator.free(handle)
-            except Exception:
+                cls._allocator.free(handle)
+            except Exception:  # noqa: BLE001 - teardown must never raise
                 pass
             self._handle = None
 
@@ -1278,6 +1824,22 @@ def write_all() -> bool:
             fail += 1
     print(f"WRITE_DONE ok={ok} fail={fail} total={nr_objects}", flush=True)
     writer.flush()
+    # See Backend.wait_visible: flush() does not guarantee the master has the
+    # ADDs yet, and reading too early reports a total miss that is
+    # indistinguishable from a broken read path.
+    _keys = [make_key(i) for i in range(nr_objects)]
+    _seen = writer.wait_visible(
+        _keys, float(os.environ.get("UMBP_VISIBLE_TIMEOUT_S", 30))
+    )
+    if _seen != nr_objects:
+        print(
+            f"WARNING: only {_seen}/{nr_objects} keys visible after the write "
+            f"barrier; reads will under-count. Raise UMBP_VISIBLE_TIMEOUT_S or "
+            f"check the peer's heartbeat.",
+            flush=True,
+        )
+    else:
+        print(f"WRITE_VISIBLE {_seen}/{nr_objects}", flush=True)
     return fail == 0
 
 
@@ -1432,6 +1994,141 @@ elif command == "batch_perf":
             f"req_per_s={total_reqs / elapsed:.2f} batch_per_s={total_batches / elapsed:.2f} "
             f"MiB_per_s={(total_bytes / 1024 / 1024) / elapsed:.2f} "
             f"avg_latency_ms={(elapsed / total_reqs) * 1000:.3f}",
+            flush=True,
+        )
+
+elif command == "ranged_perf":
+    # Ranged (sub-object) vs whole-object over the SAME keys in the SAME
+    # process.  The headline is the RATIO at each fetched fraction: it cancels
+    # the node's load, which absolute MiB/s on a shared machine does not.
+    #
+    # Useful bandwidth counts only the bytes the caller asked for.  Whole-object
+    # moves object_size per key regardless, so its useful figure is deliberately
+    # the smaller one -- that gap IS the thing being measured.
+    import statistics
+
+    if not reader.supports_ranged_io():
+        print(
+            "ABORT: backend reports supports_ranged_io()=False. Pass "
+            "--ranged-scratch-bytes (or set UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES "
+            "on the standalone server) and retry.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    passes = args.passes
+    batch = min(args.batch, nr_objects)
+    first = args.first_layer
+    groups = sorted(
+        {g for g in args.groups if 0 < g <= layers - first} | {layers - first}
+    )
+    keys = [make_key(i) for i in range(nr_objects)]
+
+    # Destinations are laid out LAYER-MAJOR (buffer[layer][object]) on purpose,
+    # so one object's slices land batch*layer_bytes apart.  The tree connector
+    # keeps one buffer per layer, and a destination-contiguous layout would
+    # flatter the ranged path by making its scattered writes adjacent.
+    ranged_dst = HostBuffer(layers * batch * layer_bytes)
+    whole_dst = HostBuffer(batch * value_size)
+    reader.register_memory(ranged_dst.ptr, layers * batch * layer_bytes)
+    reader.register_memory(whole_dst.ptr, batch * value_size)
+
+    def _slot(layer: int, obj: int) -> int:
+        return ranged_dst.ptr + (layer * batch + obj) * layer_bytes
+
+    def _windows(n_passes: int):
+        # Walk the dataset rather than re-reading key 0..batch every pass: a
+        # fixed window is served from whatever the tier staged last time.
+        span = max(1, nr_objects - batch + 1)
+        return [keys[(i * batch) % span :][:batch] for i in range(n_passes + 1)]
+
+    def _time_ranged(group, n_passes):
+        sizes_v = [[layer_bytes] * len(group)] * batch
+        offs_v = [[ly * layer_bytes for ly in group]] * batch
+        out = []
+        for w in _windows(n_passes):
+            dsts = [[_slot(ly, o) for ly in group] for o in range(len(w))]
+            t0 = time.perf_counter()
+            res = reader.batch_get_ranges_into_ptr(
+                w, dsts, sizes_v[: len(w)], offs_v[: len(w)]
+            )
+            dt = time.perf_counter() - t0
+            if not all(res):
+                raise RuntimeError(
+                    f"ranged get missed {list(res).count(False)}/{len(res)} keys"
+                )
+            out.append(dt)
+        return out[1:]  # drop the untimed warmup
+
+    def _time_whole(n_passes):
+        out = []
+        for w in _windows(n_passes):
+            dsts = [whole_dst.ptr + o * value_size for o in range(len(w))]
+            t0 = time.perf_counter()
+            res = reader.batch_get_into_ptr(w, dsts, [value_size] * len(w))
+            dt = time.perf_counter() - t0
+            if not all(r > 0 for r in res):
+                raise RuntimeError("whole-object get missed keys")
+            out.append(dt)
+        return out[1:]
+
+    # Correctness before timing: a fast wrong answer is the failure mode ranged
+    # I/O makes easy, and it is invisible in a bandwidth number.
+    _probe = list(range(first, min(first + 4, layers)))
+    _w = keys[:batch]
+    _res = reader.batch_get_ranges_into_ptr(
+        _w,
+        [[_slot(ly, o) for ly in _probe] for o in range(len(_w))],
+        [[layer_bytes] * len(_probe)] * len(_w),
+        [[ly * layer_bytes for ly in _probe]] * len(_w),
+    )
+    _expected = expected_payload(value_size)
+    _bad = 0
+    for o in range(min(len(_w), 8)):
+        for ly in _probe:
+            got = ctypes.string_at(_slot(ly, o), min(64, layer_bytes))
+            want = _expected[ly * layer_bytes : ly * layer_bytes + len(got)]
+            if got != want:
+                _bad += 1
+    if not all(_res) or _bad:
+        print(
+            f"ABORT: ranged correctness failed (misses={list(_res).count(False)} "
+            f"mismatched_slices={_bad})",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    print("CORRECTNESS_OK (ranged bytes match the whole-object payload)", flush=True)
+
+    whole_med = statistics.median(_time_whole(passes))
+    print(
+        f"\nobject={value_size}B layers={layers} layer={layer_bytes}B "
+        f"batch={batch} passes={passes} tier={tier} deployment={deployment}\n",
+        flush=True,
+    )
+    hdr = (
+        f"{'G':>4} {'fetched':>8} {'ranged_ms':>10} {'whole_ms':>10} "
+        f"{'ranged_MiB/s':>13} {'whole_MiB/s':>12} {'speedup':>8}"
+    )
+    print(hdr)
+    print("-" * len(hdr), flush=True)
+    for g in groups:
+        group = list(range(first, first + g))
+        med = statistics.median(_time_ranged(group, passes))
+        useful = batch * g * layer_bytes
+        frac = g / layers
+        r_bw = useful / med / (1 << 20)
+        w_bw = useful / whole_med / (1 << 20)
+        print(
+            f"{g:>4} {frac * 100:>7.1f}% {med * 1e3:>10.2f} {whole_med * 1e3:>10.2f} "
+            f"{r_bw:>13.1f} {w_bw:>12.1f} {whole_med / med:>7.2f}x",
+            flush=True,
+        )
+        print(
+            f"RESULT group={g} fetched_frac={frac:.4f} ranged_ms={med * 1e3:.3f} "
+            f"whole_ms={whole_med * 1e3:.3f} ranged_useful_MiB_s={r_bw:.1f} "
+            f"whole_useful_MiB_s={w_bw:.1f} speedup={whole_med / med:.3f} "
+            f"ranged_wire_MiB={useful / (1 << 20):.1f} "
+            f"whole_wire_MiB={batch * value_size / (1 << 20):.1f}",
             flush=True,
         )
 

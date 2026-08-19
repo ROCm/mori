@@ -79,13 +79,18 @@ class DistributedClient : public IUMBPClient {
   void Close() override;
   bool IsDistributed() const override;
   UMBPDeploymentMode GetDeploymentMode() const override { return UMBPDeploymentMode::Distributed; }
-  // Two independent conditions, both required. The arena must exist, because
-  // the remote direction has nowhere to land otherwise — that is upstream's
-  // opt-in rule. And the selected medium must be able to serve it: ranged I/O
-  // maps object ranges onto tier pages a backend publishes as in-process
-  // endpoints, and SSD publishes storage refs instead, so it is the one medium
-  // this cannot serve. Upstream spells the medium half as `!ssd.enabled`
-  // because it predates the single-medium selector.
+  // One condition: the scratch arena must exist, because the remote direction
+  // has nowhere to land otherwise — that is upstream's opt-in rule, and it
+  // defaults to off.
+  //
+  // There is deliberately no medium condition. This used to also exclude SSD,
+  // on the reasoning that ranged I/O maps object ranges onto pages a backend
+  // publishes as in-process endpoints and SSD publishes storage refs instead.
+  // That describes a backend nobody built: ssd_backend.h weighs a file endpoint
+  // against staging and picks staging, so SsdBackend publishes ordinary
+  // registered host pages like every other medium. Every ranged path works on
+  // an SSD node. See the definition for what the medium does still change (the
+  // device read is whole-object until D1) and doc/design-ssd-ranged-io.md.
   bool SupportsRangedIO() const override;
 
   bool RegisterMemory(uintptr_t ptr, size_t size,

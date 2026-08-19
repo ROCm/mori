@@ -405,8 +405,29 @@ void DistributedClient::Close() {
 bool DistributedClient::IsDistributed() const { return true; }
 
 bool DistributedClient::SupportsRangedIO() const {
-  if (ranged_get_scratch_size_ == 0 || ranged_put_scratch_size_ == 0) return false;
-  return config_.distributed.has_value() && config_.distributed->medium != UMBPMedium::SSD;
+  // The scratch arenas are the whole opt-in.  They are purely a remote-path
+  // resource -- remote gets are staged in them, remote puts assembled in them --
+  // and they default to zero, so a deployment that never issues ranged I/O
+  // allocates and registers nothing.
+  //
+  // Deliberately NOT gated on the medium.  SSD used to be excluded here on the
+  // reasoning that its bytes are not addressable by the transfer layer, but
+  // that is exactly what SsdBackend already solves for every other operation:
+  // it publishes a registered host staging arena and spills behind it, so a
+  // resolved SSD key reaches BuildLocalRangeTransfers as ordinary pages and the
+  // object-range -> page-range arithmetic never learns which medium it is
+  // walking (ssd_backend.h).  All four ranged paths therefore work on an SSD
+  // node: get and put, each local and remote.
+  //
+  // What the medium changes is the saving, not the correctness.  A resolve
+  // stages the whole object before anyone says which bytes they want, so a
+  // ranged get off SSD still reads the full object from the device and saves
+  // only the final copy into the caller's buffers.  Ranged put is unaffected:
+  // it tiles its object, so the single whole-object write was always going to
+  // happen.  Making the device read follow the requested extent needs an extent
+  // on the resolve path and is a separate change (doc/design-ssd-ranged-io.md,
+  // D1) -- this flag was never what stood in its way.
+  return ranged_get_scratch_size_ != 0 && ranged_put_scratch_size_ != 0;
 }
 
 bool DistributedClient::ReportExternalKvBlocks(const std::vector<std::string>& hashes,
