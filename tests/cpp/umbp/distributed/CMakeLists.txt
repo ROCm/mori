@@ -135,6 +135,12 @@ add_executable(test_umbp_types test_types.cpp)
 target_link_libraries(test_umbp_types PRIVATE umbp_common gtest_main)
 add_test(NAME umbp_types COMMAND test_umbp_types)
 
+add_executable(test_umbp_backend_policy_config test_backend_policy_config.cpp)
+target_link_libraries(test_umbp_backend_policy_config PRIVATE umbp_common
+                                                              gtest_main)
+add_test(NAME umbp_backend_policy_config
+         COMMAND test_umbp_backend_policy_config)
+
 # Versioned workload trace codec, deterministic payloads, synthetic generators,
 # and the transport-neutral replay scheduler. These are hermetic unit tests;
 # the real PoolClient adapter is covered by the integration smoke below.

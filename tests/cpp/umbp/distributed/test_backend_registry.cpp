@@ -132,6 +132,25 @@ TEST(BackendEventAgg, FullSyncSnapshotAlsoDropsTheOutbox) {
   EXPECT_TRUE(DrainAllBackends({&b}).empty());
 }
 
+TEST(BackendEventAgg, SameTierRelocationKeepsMasterLocation) {
+  MockBackend source(TierType::SSD);
+  MockBackend target(TierType::SSD);
+  CommitOne(&source, "moved", 8);
+  ASSERT_EQ(DrainAllBackends({&source, &target}).size(), 1u);
+
+  CommitOne(&target, "moved", 8);
+  source.Evict({"moved"});
+  auto relocated = DrainAllBackends({&source, &target});
+  ASSERT_EQ(relocated.size(), 1u);
+  EXPECT_EQ(relocated.front().kind, KvEvent::Kind::ADD);
+  EXPECT_EQ(relocated.front().tier, TierType::SSD);
+
+  target.Evict({"moved"});
+  auto removed = DrainAllBackends({&source, &target});
+  ASSERT_EQ(removed.size(), 1u);
+  EXPECT_EQ(removed.front().kind, KvEvent::Kind::REMOVE);
+}
+
 TEST(BackendEventAgg, NullBackendsAreSkipped) {
   MockBackend only(TierType::SSD);
   CommitOne(&only, "x", 1);

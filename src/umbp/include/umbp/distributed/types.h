@@ -61,6 +61,20 @@ struct TierCapacity {
   uint64_t max_allocatable_bytes = 0;
 };
 
+struct LogicalTierCapacity {
+  TierType representative_tier = TierType::UNKNOWN;
+  TierCapacity capacity;
+  bool put_eligible = false;
+};
+
+struct TierTransitionMetrics {
+  uint64_t attempted = 0;
+  uint64_t succeeded = 0;
+  uint64_t failed = 0;
+  uint64_t offloaded_bytes = 0;
+  uint64_t promoted_bytes = 0;
+};
+
 struct ExternalKvHitCountEntry {
   std::string hash;
   uint64_t hit_count_total = 0;
@@ -74,9 +88,11 @@ struct Location {
   std::string node_id;
   uint64_t size = 0;
   TierType tier = TierType::UNKNOWN;
+  std::string logical_tier;
 
   bool operator==(const Location& other) const {
-    return node_id == other.node_id && size == other.size && tier == other.tier;
+    return node_id == other.node_id && size == other.size && tier == other.tier &&
+           logical_tier == other.logical_tier;
   }
 };
 
@@ -189,6 +205,7 @@ struct KvEvent {
   std::string key;
   TierType tier = TierType::UNKNOWN;
   uint64_t size = 0;  // ADD only; REMOVE leaves this 0
+  std::string logical_tier;
 };
 
 struct EventBundle {
@@ -208,6 +225,7 @@ struct ClientRecord {
   std::chrono::system_clock::time_point last_heartbeat;
   std::chrono::system_clock::time_point registered_at;
   std::map<TierType, TierCapacity> tier_capacities;
+  std::map<std::string, LogicalTierCapacity> logical_tier_capacities;
 
   std::string peer_address;
   std::vector<uint8_t> engine_desc_bytes;
@@ -229,6 +247,7 @@ struct ClientRegistration {
   std::string node_id;
   std::string node_address;
   std::map<TierType, TierCapacity> tier_capacities;
+  std::map<std::string, LogicalTierCapacity> logical_tier_capacities;
   std::string peer_address;
   std::vector<uint8_t> engine_desc_bytes;
   std::vector<std::string> tags;

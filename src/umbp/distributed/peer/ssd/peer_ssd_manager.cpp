@@ -124,6 +124,20 @@ uint64_t PeerSsdManager::SizeOf(const std::string& key) const {
   return it == owned_.end() ? 0 : it->second.size;
 }
 
+bool PeerSsdManager::PinForMigration(const std::string& key) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (owned_.find(key) == owned_.end() || evicting_.count(key) != 0) return false;
+  ++inflight_reads_[key];
+  return true;
+}
+
+void PeerSsdManager::UnpinForMigration(const std::string& key) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = inflight_reads_.find(key);
+  if (it != inflight_reads_.end() && --it->second <= 0) inflight_reads_.erase(it);
+  if (inflight_reads_.empty()) reads_drained_cv_.notify_all();
+}
+
 void PeerSsdManager::TouchLocked(const std::string& key) {
   auto it = owned_.find(key);
   if (it == owned_.end()) return;
@@ -206,6 +220,9 @@ bool PeerSsdManager::Write(const std::string& key,
       owned_.emplace(key, OwnedEntry{total_size, lru_.begin()});
       pending_events_.push_back(KvEvent{KvEvent::Kind::ADD, key, TierType::SSD, total_size});
     }
+    // Keep the just-written key out of this write's own watermark victim set.
+    // A successful Write must imply the key still exists when it returns.
+    ++inflight_reads_[key];
   }
 
   // Check-after-write trigger, on this copy worker (no dedicated thread).
@@ -213,6 +230,7 @@ bool PeerSsdManager::Write(const std::string& key,
   if (total > 0 && static_cast<double>(used) >= high_watermark_ * static_cast<double>(total)) {
     EvictToLowWatermark();
   }
+  UnpinForMigration(key);
   return true;
 }
 

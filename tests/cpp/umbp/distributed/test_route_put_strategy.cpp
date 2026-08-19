@@ -84,6 +84,23 @@ TEST(MostAvailableNoneTest, PicksTheRoomiestTierOnANodeRegardlessOfMedium) {
   EXPECT_EQ(result->tier, TierType::DRAM);
 }
 
+TEST(MostAvailableNoneTest, RoutesOnlyToNamedEntryPool) {
+  ConfigurableRoutePutStrategy strategy(Algo::kMostAvailable, Affinity::kNone);
+  auto client = MakeClient(
+      "node-a", "addr-a", {{TierType::DRAM, TierCapacity{100 * GB, 90 * GB}}});
+  client.logical_tier_capacities["hot"] =
+      LogicalTierCapacity{TierType::HBM, TierCapacity{20 * GB, 10 * GB, 10 * GB},
+                          true};
+  client.logical_tier_capacities["warm"] =
+      LogicalTierCapacity{TierType::DRAM, TierCapacity{80 * GB, 40 * GB, 40 * GB},
+                          false};
+
+  auto result = SelectOne(strategy, {client}, 4096, {});
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->logical_tier, "hot");
+  EXPECT_EQ(result->tier, TierType::HBM);
+}
+
 // Unchanged by Phase 4: HBM has no room, so DRAM is the only eligible tier.
 TEST(MostAvailableNoneTest, PicksTheOnlyTierWithRoom) {
   ConfigurableRoutePutStrategy strategy(Algo::kMostAvailable, Affinity::kNone);

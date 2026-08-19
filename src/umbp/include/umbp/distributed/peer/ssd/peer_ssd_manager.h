@@ -85,6 +85,11 @@ class PeerSsdManager {
   // `owned_` has carried this all along; only the accessor was missing.
   uint64_t SizeOf(const std::string& key) const;
 
+  // Hold a key against local watermark eviction across a peer-local migration.
+  // Uses the same refcount as active reads so eviction has one protection rule.
+  bool PinForMigration(const std::string& key);
+  void UnpinForMigration(const std::string& key);
+
   // Write the key's bytes (assembled from possibly non-contiguous DRAM source
   // segments) to the SSD backend.  On success records the SSD location and
   // queues an ADD SSD event; on failure records nothing and queues nothing

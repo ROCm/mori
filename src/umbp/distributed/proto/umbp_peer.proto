@@ -71,6 +71,7 @@ message AllocateSlotRequest {
   // Optional explicit instance. When absent, the peer selects the first
   // backend registered for `tier`.
   optional string backend_name = 4;
+  string logical_tier = 5;
 }
 // AllocateSlot / BatchAllocateSlots per-entry outcome.
 // FAILED_NO_SPACE is split out so the writer can keep retrying with

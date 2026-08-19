@@ -365,6 +365,7 @@ add_library(
   ${UMBP_WORKLOAD_PROTO_SRCS}
   distributed/benchmark/payload.cpp
   distributed/benchmark/workload_trace.cpp
+  distributed/benchmark/workload_trace_recorder.cpp
   distributed/benchmark/workload_source.cpp
   distributed/benchmark/workload_runner.cpp
   distributed/master/in_memory_master_metadata_store.cpp
@@ -387,6 +388,9 @@ add_library(
   distributed/transfer/composite_transfer_engine.cpp
   distributed/peer/ssd/peer_ssd_manager.cpp
   distributed/peer/ssd/ssd_copy_pipeline.cpp
+  distributed/pool/policy_config.cpp
+  distributed/pool/tier_graph.cpp
+  distributed/pool/tier_transition.cpp
   distributed/pool/peer_pool.cpp
   distributed/peer/peer_service.cpp
   distributed/pool_client.cpp

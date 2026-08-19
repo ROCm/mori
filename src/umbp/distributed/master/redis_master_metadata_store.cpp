@@ -22,6 +22,7 @@
 #include "umbp/distributed/master/redis_master_metadata_store.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <future>
 #include <stdexcept>
@@ -127,6 +128,61 @@ std::map<TierType, TierCapacity> DecodeCaps(const std::string& blob) {
   return caps;
 }
 
+std::string EncodeLogicalCaps(
+    const std::map<std::string, LogicalTierCapacity>& caps) {
+  std::string out;
+  for (const auto& [name, logical] : caps) {
+    out += std::to_string(name.size()) + ':' + name + ':';
+    out += std::to_string(static_cast<int>(logical.representative_tier)) + ':';
+    out += std::to_string(logical.capacity.total_bytes) + ':';
+    out += std::to_string(logical.capacity.available_bytes) + ':';
+    out += std::to_string(logical.capacity.max_allocatable_bytes) + ':';
+    out += logical.put_eligible ? "1;" : "0;";
+  }
+  return out;
+}
+
+std::map<std::string, LogicalTierCapacity> DecodeLogicalCaps(
+    const std::string& blob) {
+  std::map<std::string, LogicalTierCapacity> caps;
+  size_t pos = 0;
+  while (pos < blob.size()) {
+    try {
+      const size_t length_end = blob.find(':', pos);
+      if (length_end == std::string::npos) break;
+      const size_t name_size =
+          std::stoull(blob.substr(pos, length_end - pos));
+      const size_t name_begin = length_end + 1;
+      if (name_size > blob.size() - name_begin ||
+          name_begin + name_size >= blob.size() ||
+          blob[name_begin + name_size] != ':') {
+        break;
+      }
+      const std::string name = blob.substr(name_begin, name_size);
+      pos = name_begin + name_size + 1;
+      std::array<std::string, 5> fields;
+      for (size_t i = 0; i < fields.size(); ++i) {
+        const char delimiter = i + 1 == fields.size() ? ';' : ':';
+        const size_t end = blob.find(delimiter, pos);
+        if (end == std::string::npos) throw std::invalid_argument("logical caps");
+        fields[i] = blob.substr(pos, end - pos);
+        pos = end + 1;
+      }
+      LogicalTierCapacity logical;
+      logical.representative_tier =
+          static_cast<TierType>(std::stoi(fields[0]));
+      logical.capacity.total_bytes = std::stoull(fields[1]);
+      logical.capacity.available_bytes = std::stoull(fields[2]);
+      logical.capacity.max_allocatable_bytes = std::stoull(fields[3]);
+      logical.put_eligible = fields[4] == "1";
+      caps[name] = logical;
+    } catch (const std::exception&) {
+      break;
+    }
+  }
+  return caps;
+}
+
 std::string JoinTags(const std::vector<std::string>& tags) {
   std::string out;
   for (size_t i = 0; i < tags.size(); ++i) {
@@ -211,6 +267,9 @@ ClientRecord DecodeRecord(const std::string& node_id,
     }
   }
   if (auto* v = get("caps")) rec.tier_capacities = DecodeCaps(*v);
+  if (auto* v = get("lcaps")) {
+    rec.logical_tier_capacities = DecodeLogicalCaps(*v);
+  }
   if (auto* v = get("engine")) rec.engine_desc_bytes.assign(v->begin(), v->end());
   if (auto* v = get("tags")) rec.tags = SplitTags(*v);
   return rec;
@@ -319,7 +378,7 @@ void RedisMasterMetadataStore::ApplyBlockEventsMulti(const std::string& node_id,
     if (!is_full_sync && shard_events.empty()) continue;
 
     std::vector<std::string> args;
-    args.reserve(5 + shard_events.size() * 4);
+    args.reserve(5 + shard_events.size() * 5);
     args.push_back(keys_.NodeBlocks(node_id, shard));
     args.push_back(node_prefix);
     args.push_back(is_full_sync ? "1" : "0");
@@ -330,6 +389,7 @@ void RedisMasterMetadataStore::ApplyBlockEventsMulti(const std::string& node_id,
       args.push_back(keys_.Block(ev->key));
       args.push_back(std::to_string(static_cast<int>(ev->tier)));
       args.push_back(std::to_string(ev->size));
+      args.push_back(ev->logical_tier);
     }
     // KEYS[1] = this shard's reverse-index key (a shard-tag key) so the cluster
     // client can route to the shard's slot; the script reads all its keys from
@@ -399,7 +459,8 @@ bool RedisMasterMetadataStore::RegisterClient(const ClientRegistration& registra
       redis::kRegisterClientLua, {keys_.Node(registration.node_id)},
       {keys_.Tag(), registration.node_id, std::to_string(ToEpochMs(now)),
        std::to_string(ToMs(stale_after)), registration.node_address, registration.peer_address,
-       EncodeCaps(registration.tier_capacities), engine, JoinTags(registration.tags)});
+       EncodeCaps(registration.tier_capacities), engine, JoinTags(registration.tags),
+       EncodeLogicalCaps(registration.logical_tier_capacities)});
   if (r.is_error()) throw std::runtime_error("[RedisStore] RegisterClient: " + r.str);
   return r.integer == 1;
 }
@@ -431,19 +492,21 @@ void RedisMasterMetadataStore::UnregisterClient(const std::string& node_id) {
 HeartbeatResult RedisMasterMetadataStore::ApplyHeartbeat(
     const std::string& node_id, uint64_t seq, std::chrono::system_clock::time_point now,
     const std::map<TierType, TierCapacity>& caps, const std::vector<KvEvent>& events,
-    bool is_full_sync) {
+    bool is_full_sync,
+    const std::map<std::string, LogicalTierCapacity>& logical_caps) {
   ScopedStoreOp _op(metrics_, "ApplyHeartbeat");
   RespValue r;
   if (!split_writes()) {
     // Single instance: one atomic script does seq-CAS + record + blocks.
     std::vector<std::string> args;
-    args.reserve(7 + events.size() * 4);
+    args.reserve(8 + events.size() * 5);
     args.push_back(keys_.Tag());
     args.push_back(node_id);
     args.push_back(std::to_string(seq));
     args.push_back(std::to_string(ToEpochMs(now)));
     args.push_back(is_full_sync ? "1" : "0");
     args.push_back(EncodeCaps(caps));
+    args.push_back(EncodeLogicalCaps(logical_caps));
     args.push_back(std::to_string(events.size()));
     for (const auto& ev : events) {
       args.push_back(ev.kind == KvEvent::Kind::ADD ? "0" : "1");
@@ -452,6 +515,7 @@ HeartbeatResult RedisMasterMetadataStore::ApplyHeartbeat(
       args.push_back(keys_.Block(ev.key));
       args.push_back(std::to_string(static_cast<int>(ev.tier)));
       args.push_back(std::to_string(ev.size));
+      args.push_back(ev.logical_tier);
     }
     r = control().Eval(redis::kApplyHeartbeatLua, {keys_.Node(node_id)}, args);
   } else {
@@ -459,7 +523,8 @@ HeartbeatResult RedisMasterMetadataStore::ApplyHeartbeat(
     // events are applied per shard afterwards if this heartbeat is APPLIED.
     r = control().Eval(redis::kApplyHeartbeatControlLua, {keys_.Node(node_id)},
                        {keys_.Tag(), node_id, std::to_string(seq), std::to_string(ToEpochMs(now)),
-                        is_full_sync ? "1" : "0", EncodeCaps(caps)});
+                        is_full_sync ? "1" : "0", EncodeCaps(caps),
+                        EncodeLogicalCaps(logical_caps)});
   }
 
   if (r.is_error()) throw std::runtime_error("[RedisStore] ApplyHeartbeat: " + r.str);
@@ -667,8 +732,14 @@ std::vector<Location> RedisMasterMetadataStore::LookupBlock(const std::string& k
     if (sep == std::string::npos) continue;
     Location loc;
     loc.node_id = rest.substr(0, sep);
+    const std::string tier_and_logical = rest.substr(sep + 1);
+    const size_t logical_sep = tier_and_logical.find('|');
+    const std::string tier_text = tier_and_logical.substr(0, logical_sep);
+    if (logical_sep != std::string::npos) {
+      loc.logical_tier = tier_and_logical.substr(logical_sep + 1);
+    }
     try {
-      loc.tier = static_cast<TierType>(std::stoi(rest.substr(sep + 1)));
+      loc.tier = static_cast<TierType>(std::stoi(tier_text));
       loc.size = std::stoull(r.elements[i + 1].str);
     } catch (...) {
       continue;
@@ -709,12 +780,13 @@ std::vector<std::vector<Location>> RedisMasterMetadataStore::BatchLookupBlockFor
       [&](size_t group) { return &client_for_shard(batch.shard_of_group[group]); },
       [&](size_t orig_index, const RespValue& locs) {
         if (!locs.is_array()) return;
-        for (size_t j = 0; j + 3 <= locs.elements.size(); j += 3) {
+        for (size_t j = 0; j + 4 <= locs.elements.size(); j += 4) {
           Location loc;
           loc.node_id = locs.elements[j].str;
           try {
             loc.size = std::stoull(locs.elements[j + 1].str);
             loc.tier = static_cast<TierType>(std::stoi(locs.elements[j + 2].str));
+            loc.logical_tier = locs.elements[j + 3].str;
           } catch (...) {
             continue;
           }

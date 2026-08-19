@@ -63,7 +63,7 @@ Read by the **master process** (`bin/master_main.cpp` via
 | `UMBP_HIT_INDEX_TTL_SEC` | `7200` | sec | External KV hit-count entry TTL. A hash with no counted match for longer than this is removed from the hit index. |
 | `UMBP_HIT_INDEX_GC_INTERVAL_SEC` | `60` | sec | External KV hit-count GC sweep interval. |
 | `UMBP_HIT_QUERY_MAX_BATCH` | `4096` | count | Maximum hashes accepted by one `GetExternalKvHitCounts` request. Oversized requests return gRPC `INVALID_ARGUMENT`; the server does not truncate. |
-| `UMBP_ROUTE_PUT_SELECT_ALGO` | `most_available` | enum | Base RoutePut placement algorithm over eligible nodes (HBM before DRAM; SSD never a direct-put target). `most_available` = pick the node with the most projected free space; `random` = capacity-weighted random (probability proportional to projected `available_bytes`, never picks a node that cannot fit). Unknown value → default + one WARN. |
+| `UMBP_ROUTE_PUT_SELECT_ALGO` | `most_available` | enum | Base RoutePut placement algorithm over eligible node entry pools. `most_available` = pick the node with the most projected free space; `random` = capacity-weighted random (probability proportional to projected `available_bytes`, never picks a node that cannot fit). Unknown value → default + one WARN. |
 | `UMBP_ROUTE_PUT_NODE_AFFINITY` | `none` | enum | Node-affinity bias layered on top of the base algorithm. `none` = pure base algorithm; `same` = try to place the whole batch on one node that fits the non-dedup total, else per-key sticky to the first picked node; `local` = per-key prefer the requester's local node. All three fall back to the base algorithm so affinity never makes a key fail that the base algorithm could route. Unknown value → default + one WARN. |
 | `UMBP_MASTER_INDEX_SHARDS` | `32` | count | Number of independently-locked, key-hashed shards backing the block-location index inside `InMemoryMasterMetadataStore` (the block lock domain, separate from the single `meta_mutex_` that guards client records + external-KV). A heartbeat's event batch only takes the exclusive lock on the shards its keys hash into, so unrelated `RoutePut` / `BatchLookup` readers on other shards don't block behind a large apply; full-sync likewise becomes N small critical sections instead of one giant one. Read once at store construction via `std::strtol`; unset / unparseable / `< 1` → default `32` (a WARN is logged on unparseable input), clamped to a max of `4096`. `1` reproduces the old single-lock block index. Production guidance for heavy heartbeat fan-out (hundreds of clients): `64`. |
 
@@ -85,6 +85,9 @@ that has loaded `libmori_pybinds.so`).
 | `UMBP_RELEASE_LEASE_TIMEOUT_MS` | `1000` | ms | Per-attempt gRPC deadline for the best-effort `ReleaseSsdLease` RPC so a slow peer can't stall the reader. `min_allowed=1`. |
 | `UMBP_SSD_PREPARE_TIMEOUT_MS` | `0` | ms | Per-call gRPC deadline for `PrepareSsdRead` so a hung/slow peer can't stall the serial batch. `0` = fall back to `UMBP_SSD_READ_LEASE_MS` (cluster-homogeneous). A timed-out / failed prepare is a hard not-served outcome (NOT retried, and never a miss). `min_allowed=0`. |
 | `UMBP_AUTO_FLUSH_EVENT_THRESHOLD` | `128` | count | Peer-side unshipped `KvEvent` outbox size at which a completed batch of puts auto-triggers a heartbeat flush (`FlushHeartbeat`), so the ADDs become visible at the master without waiting for the heartbeat interval or an explicit `Flush()`. Counted on `PeerDramAllocator` only (SSD events still wait for the interval). Parsed via `std::strtoull` (no WARN on bad input); unset / unparseable -> default `128`; `0` disables size-based auto-flush entirely (ADDs then ship only on the heartbeat interval or an explicit `Flush()`); set to a very large value to keep auto-flush armed but effectively never fire on size. Cached on first use in `MasterClient::SetPeerDramAllocator`. |
+| `UMBP_WORKLOAD_TRACE_PATH` | empty | path | Records successful production PUT/GET calls in the benchmark trace format. Empty disables recording. |
+| `UMBP_WORKLOAD_TRACE_CLIENT_ID` | `0` | id | Logical client stream written into production trace events. |
+| `UMBP_WORKLOAD_TRACE_SEED` | `0` | seed | Payload seed stored in the trace header for deterministic replay. |
 
 ## SPDK proxy
 
@@ -154,6 +157,7 @@ operators can find them in one place.
 | Env var | Description |
 |---|---|
 | `UMBP_MASTER_ADDRESS` | `host:port` of the master to connect to (e.g. `10.0.0.1:15558`). |
+| `UMBP_BACKEND_POLICY` | JSON backend/tier policy used by a distributed-backed standalone server. |
 | `UMBP_MASTER_LISTEN` | `host:port` the master should listen on (when starting it locally). |
 | `UMBP_MASTER_AUTO_START` | `true`/`false`: auto-spawn `umbp_master` on this node before connecting. |
 | `UMBP_MASTER_BIN` | Path to the `umbp_master` binary. The Python `mori.umbp` package auto-fills this from the packaged binary; override to point at a custom build. |

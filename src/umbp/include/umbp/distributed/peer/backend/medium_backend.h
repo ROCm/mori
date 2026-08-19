@@ -28,6 +28,7 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -66,13 +67,10 @@ namespace mori::umbp {
 // single monotonic seq — never one seq per medium (that breaks the ack /
 // seq-gap full-sync recovery).
 //
-// Every medium is currently treated as EQUIVALENT: no read priority, no
-// put-eligibility flag.  Phase 4 deleted the routing plane's two hardcoded tier
-// orders outright rather than re-expressing them as advertised properties, so
-// there is deliberately no BackendProperties here.  A medium that genuinely
-// differs — SSD, which takes no direct puts — brings the trait back with it
-// (design doc §3 / §5 Phase 4); until one exists, an advertised order would be
-// scaffolding nothing exercises.
+// The backend contract treats media as equivalent: it has no built-in read
+// priority or put-eligibility flag. Legacy policies retain that behavior. The
+// optional JSON TieredPlacementPolicy supplies ordering and offload topology
+// above this interface, keeping physical storage implementations policy-free.
 //
 // Threading: implementations must be safe to call from the peer service's gRPC
 // handler threads and the heartbeat thread concurrently.
@@ -264,6 +262,16 @@ class MediumBackend {
   // supplies a bounce buffer if the chosen path needs one.
   virtual std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
                                                   bool include_descs) = 0;
+
+  // Acquire a peer-local migration pin and resolve the key without changing or
+  // cancelling normal RPC read leases. The caller must release a successful
+  // acquisition after its synchronous transfer completes.
+  virtual bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved) {
+    (void)key;
+    (void)resolved;
+    return false;
+  }
+  virtual void ReleaseMigrationRead(const std::string& key) { (void)key; }
 
   // Authoritative metadata lookup with no staging, descriptor construction, or
   // read-lease side effects. Pool placement validation must use this instead of
@@ -471,12 +479,44 @@ class BackendRegistry {
 // monotonic seq — concat here, never one bundle/seq per medium (that breaks the
 // ack / seq-gap full-sync recovery).  Null entries are skipped.
 inline std::vector<KvEvent> DrainAllBackends(const std::vector<MediumBackend*>& backends) {
-  std::vector<KvEvent> merged;
+  std::vector<KvEvent> raw;
   for (auto* backend : backends) {
     if (backend == nullptr) continue;
     auto events = backend->DrainPendingEvents();
-    merged.insert(merged.end(), std::make_move_iterator(events.begin()),
-                  std::make_move_iterator(events.end()));
+    raw.insert(raw.end(), std::make_move_iterator(events.begin()),
+               std::make_move_iterator(events.end()));
+  }
+
+  // Master locations are (node, physical tier), not backend instances. A
+  // same-tier migration therefore must not publish the source REMOVE after the
+  // target ADD as if the node had lost the key. Coalesce by (tier,key) against
+  // authoritative current ownership across all instances.
+  struct EventState {
+    std::optional<KvEvent> add;
+    bool saw_remove = false;
+  };
+  std::map<std::pair<TierType, std::string>, EventState> states;
+  for (auto& event : raw) {
+    auto& state = states[{event.tier, event.key}];
+    if (event.kind == KvEvent::Kind::ADD) {
+      state.add = std::move(event);
+    } else {
+      state.saw_remove = true;
+    }
+  }
+  std::vector<KvEvent> merged;
+  merged.reserve(states.size());
+  for (auto& [identity, state] : states) {
+    const auto& [tier, key] = identity;
+    const bool still_owned = std::any_of(
+        backends.begin(), backends.end(), [&](MediumBackend* backend) {
+          return backend != nullptr && backend->Tier() == tier && backend->Contains(key);
+        });
+    if (state.add.has_value() && (still_owned || !state.saw_remove)) {
+      merged.push_back(std::move(*state.add));
+    } else if (state.saw_remove && !still_owned) {
+      merged.push_back(KvEvent{KvEvent::Kind::REMOVE, key, tier, 0});
+    }
   }
   return merged;
 }

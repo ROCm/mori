@@ -3,6 +3,7 @@
 // MIT License
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -12,6 +13,7 @@
 #include <vector>
 
 #include "umbp/distributed/peer/backend/medium_backend.h"
+#include "umbp/distributed/pool/tier_graph.h"
 
 namespace mori::umbp {
 
@@ -23,6 +25,7 @@ struct PoolPlacementRequest {
   uint64_t size = 0;
   TierType tier = TierType::UNKNOWN;
   std::string backend_name;
+  std::string logical_tier;
 };
 
 // Decision-only interface. A policy returns backend ids; PeerPool owns slot
@@ -45,6 +48,7 @@ class PoolPolicy {
   }
 
   virtual std::vector<uint32_t> ReadOrder(const BackendRegistry& backends) const = 0;
+  virtual std::shared_ptr<const LogicalTierGraph> TierGraph() const { return {}; }
 };
 
 // Compatibility policy for the implicit default pool. An explicit backend name
@@ -110,41 +114,14 @@ class WeightedPlacementPolicy final : public PoolPolicy {
                                                 : std::vector<uint32_t>{};
     }
 
-    struct Candidate {
-      uint32_t backend_id;
-      uint32_t weight;
-    };
-    std::vector<Candidate> candidates;
+    std::vector<LogicalTierBackendConfig> candidates;
     candidates.reserve(weights_.size());
-    uint64_t total_weight = 0;
     for (const auto& configured : weights_) {
-      if (configured.weight == 0) continue;
       auto* backend = backends.Get(configured.backend_name);
       if (backend == nullptr || backend->Tier() != request.tier) continue;
-      const uint32_t id = backends.BackendId(backend);
-      if (id >= BackendRegistry::kMaxBackends) continue;
-      candidates.push_back(Candidate{id, configured.weight});
-      total_weight += configured.weight;
+      candidates.push_back({configured.backend_name, configured.weight});
     }
-    if (candidates.empty() || total_weight == 0) return {};
-
-    uint64_t bucket = StableHash(request.key) % total_weight;
-    size_t primary = 0;
-    for (size_t i = 0; i < candidates.size(); ++i) {
-      const auto& candidate = candidates[i];
-      if (bucket < candidate.weight) {
-        primary = i;
-        break;
-      }
-      bucket -= candidate.weight;
-    }
-
-    std::vector<uint32_t> order;
-    order.reserve(candidates.size());
-    for (size_t offset = 0; offset < candidates.size(); ++offset) {
-      order.push_back(candidates[(primary + offset) % candidates.size()].backend_id);
-    }
-    return order;
+    return WeightedBackendOrder(candidates, backends, request.key);
   }
 
   std::vector<uint32_t> ReadOrder(const BackendRegistry& backends) const override {
@@ -158,23 +135,52 @@ class WeightedPlacementPolicy final : public PoolPolicy {
   }
 
  private:
-  static uint64_t StableHash(std::string_view key) {
-    // FNV-1a is deliberately fixed here rather than std::hash, whose output is
-    // not a cross-process contract.
-    uint64_t hash = 14695981039346656037ULL;
-    for (unsigned char byte : key) {
-      hash ^= byte;
-      hash *= 1099511628211ULL;
-    }
-    return hash;
-  }
-
   std::vector<BackendPlacementWeight> weights_;
 };
 
 inline std::unique_ptr<PoolPolicy> MakeWeightedPlacementPolicy(
     std::vector<BackendPlacementWeight> weights) {
   return std::make_unique<WeightedPlacementPolicy>(std::move(weights));
+}
+
+class TieredPlacementPolicy final : public PoolPolicy {
+ public:
+  explicit TieredPlacementPolicy(std::shared_ptr<const LogicalTierGraph> graph)
+      : graph_(std::move(graph)) {}
+
+  std::optional<uint32_t> SelectPutBackend(
+      const BackendRegistry& backends, const PoolPlacementRequest& request) const override {
+    auto order = PutOrder(backends, request);
+    return order.empty() ? std::nullopt : std::optional<uint32_t>{order.front()};
+  }
+
+  std::vector<uint32_t> PutOrder(
+      const BackendRegistry& backends, const PoolPlacementRequest& request) const override {
+    if (!request.backend_name.empty()) {
+      auto* backend = backends.Get(request.backend_name);
+      if (backend == nullptr) return {};
+      const uint32_t id = backends.BackendId(backend);
+      return id < BackendRegistry::kMaxBackends ? std::vector<uint32_t>{id}
+                                                : std::vector<uint32_t>{};
+    }
+    if (graph_ == nullptr) return {};
+    return request.logical_tier.empty()
+               ? graph_->PutOrder(request.key)
+               : graph_->PutOrderFromTier(request.logical_tier, request.key);
+  }
+
+  std::vector<uint32_t> ReadOrder(const BackendRegistry&) const override {
+    return graph_ == nullptr ? std::vector<uint32_t>{} : graph_->ReadOrder();
+  }
+  std::shared_ptr<const LogicalTierGraph> TierGraph() const override { return graph_; }
+
+ private:
+  std::shared_ptr<const LogicalTierGraph> graph_;
+};
+
+inline std::unique_ptr<PoolPolicy> MakeTieredPlacementPolicy(
+    std::shared_ptr<const LogicalTierGraph> graph) {
+  return std::make_unique<TieredPlacementPolicy>(std::move(graph));
 }
 
 }  // namespace mori::umbp

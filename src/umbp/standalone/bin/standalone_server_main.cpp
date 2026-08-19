@@ -174,6 +174,9 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
   size_t dram_page_size = static_cast<size_t>(dist.dram_page_size);
   if (!ParseSizeEnv("UMBP_DISTRIBUTED_DRAM_PAGE_SIZE", &dram_page_size, error)) return false;
   dist.dram_page_size = static_cast<uint64_t>(dram_page_size);
+  if (auto policy = EnvString("UMBP_BACKEND_POLICY"); policy.has_value()) {
+    dist.backend_policy_path = *policy;
+  }
 
   config->distributed = dist;
   return true;

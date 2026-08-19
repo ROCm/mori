@@ -21,6 +21,8 @@
 // SOFTWARE.
 #include "umbp/distributed/pool_client.h"
 
+#include "umbp/distributed/benchmark/workload_trace_recorder.h"
+
 #include <grpcpp/grpcpp.h>
 
 #include <algorithm>
@@ -298,7 +300,9 @@ std::unique_ptr<MediumBackend> MakeConfiguredBackend(const BackendInstanceConfig
 }
 
 std::unique_ptr<PoolPolicy> MakeConfiguredPoolPolicy(
-    const PoolClientConfig& config, const std::vector<BackendInstanceConfig>& backends) {
+    const PoolClientConfig& config, const std::vector<BackendInstanceConfig>& backends,
+    const BackendRegistry& registry,
+    std::shared_ptr<const LogicalTierGraph>* tier_graph) {
   switch (config.placement_policy) {
     case PoolPlacementPolicy::SINGLE_BACKEND:
       return MakeSingleBackendPolicy();
@@ -315,6 +319,21 @@ std::unique_ptr<PoolPolicy> MakeConfiguredPoolPolicy(
       }
       return MakeWeightedPlacementPolicy(std::move(weights));
     }
+    case PoolPlacementPolicy::TIERED:
+      if (config.logical_tiers.empty()) {
+        MORI_UMBP_ERROR("[PoolClient] tiered placement has no logical tiers");
+        return nullptr;
+      }
+      if (tier_graph == nullptr) return nullptr;
+      {
+        auto compiled = LogicalTierGraph::Compile(config.logical_tiers, registry);
+        if (!compiled.ok()) {
+          MORI_UMBP_ERROR("[PoolClient] invalid logical tier graph: {}", compiled.error);
+          return nullptr;
+        }
+        *tier_graph = std::move(compiled.graph);
+        return MakeTieredPlacementPolicy(*tier_graph);
+      }
   }
   return nullptr;
 }
@@ -331,6 +350,31 @@ PoolClient::~PoolClient() { Shutdown(); }
 bool PoolClient::Init() {
   bool expected = false;
   if (!initialized_.compare_exchange_strong(expected, true)) return true;
+
+  if (config_.workload_trace_path.empty()) {
+    if (const char* path = std::getenv("UMBP_WORKLOAD_TRACE_PATH")) {
+      config_.workload_trace_path = path;
+    }
+  }
+  if (const char* value = std::getenv("UMBP_WORKLOAD_TRACE_CLIENT_ID")) {
+    config_.workload_trace_client_id =
+        static_cast<uint32_t>(std::strtoull(value, nullptr, 10));
+  }
+  if (const char* value = std::getenv("UMBP_WORKLOAD_TRACE_SEED")) {
+    config_.workload_trace_seed = std::strtoull(value, nullptr, 10);
+  }
+
+  if (!config_.policy_config_path.empty()) {
+    auto loaded = LoadBackendPolicyFile(config_.policy_config_path);
+    std::string error;
+    if (!loaded.ok() || !ApplyBackendPolicy(*loaded.config, &config_, &error)) {
+      MORI_UMBP_ERROR("[PoolClient] failed to load backend policy '{}': {}",
+                      config_.policy_config_path,
+                      loaded.ok() ? error : loaded.error);
+      initialized_.store(false);
+      return false;
+    }
+  }
 
   master_client_ = std::make_unique<MasterClient>(config_.master_config);
 
@@ -410,17 +454,22 @@ bool PoolClient::Init() {
     }
   }
 
-  auto placement_policy = MakeConfiguredPoolPolicy(config_, backend_configs);
+  std::shared_ptr<const LogicalTierGraph> tier_graph;
+  auto placement_policy =
+      MakeConfiguredPoolPolicy(config_, backend_configs, registry_, &tier_graph);
   if (placement_policy == nullptr) {
     MORI_UMBP_ERROR("[PoolClient] invalid placement policy configuration");
     Shutdown();
     return false;
   }
-  default_pool_ = std::make_unique<PeerPool>(&registry_, std::move(placement_policy));
+  default_pool_ = std::make_unique<PeerPool>(
+      &registry_, std::move(placement_policy), transfer_engine_.get());
   const bool weighted_placement =
-      config_.placement_policy == PoolPlacementPolicy::WEIGHTED;
+      config_.placement_policy == PoolPlacementPolicy::WEIGHTED ||
+      config_.placement_policy == PoolPlacementPolicy::TIERED;
   master_client_->SetAggregateBackendCapacities(weighted_placement);
   master_client_->SetBackendRegistry(&registry_);
+  master_client_->SetPeerPool(default_pool_.get());
 
   // Pack engine_desc for master registration.
   std::vector<uint8_t> engine_desc_bytes;
@@ -455,7 +504,11 @@ bool PoolClient::Init() {
     if (cap.total_bytes == 0) continue;
     tier_caps[backend->Tier()] = cap;
   }
-  auto status = master_client_->RegisterSelf(tier_caps, peer_address, engine_desc_bytes);
+  const auto logical_caps =
+      default_pool_ == nullptr ? std::map<std::string, LogicalTierCapacity>{}
+                               : default_pool_->LogicalTierCapacities();
+  auto status = master_client_->RegisterSelf(tier_caps, peer_address, engine_desc_bytes,
+                                             logical_caps);
   if (!status.ok()) {
     MORI_UMBP_ERROR("[PoolClient] RegisterSelf failed: {}", status.error_message());
     Shutdown();
@@ -479,6 +532,24 @@ bool PoolClient::Init() {
     recache_worker_ = std::thread([this] { ReCacheWorkerLoop(); });
   }
 
+  if (!config_.workload_trace_path.empty()) {
+    try {
+      benchmark::WorkloadTraceRecorderOptions options;
+      options.path = config_.workload_trace_path;
+      options.client_id = config_.workload_trace_client_id;
+      options.seed = config_.workload_trace_seed;
+      options.node_id = config_.master_config.node_id;
+      options.backend_policy = config_.policy_config_path;
+      workload_recorder_ =
+          std::make_unique<benchmark::WorkloadTraceRecorder>(std::move(options));
+    } catch (const std::exception& exception) {
+      MORI_UMBP_ERROR("[PoolClient] failed to open workload trace '{}': {}",
+                      config_.workload_trace_path, exception.what());
+      Shutdown();
+      return false;
+    }
+  }
+
   MORI_UMBP_INFO("[PoolClient] Initialized node_id='{}'", config_.master_config.node_id);
   return true;
 }
@@ -497,6 +568,15 @@ void PoolClient::Shutdown() {
   }
   recache_cv_.notify_all();
   if (recache_worker_.joinable()) recache_worker_.join();
+  if (workload_recorder_ != nullptr) {
+    try {
+      workload_recorder_->Close();
+    } catch (const std::exception& exception) {
+      MORI_UMBP_ERROR("[PoolClient] workload trace is incomplete: {}",
+                      exception.what());
+    }
+    workload_recorder_.reset();
+  }
 
   if (master_client_) {
     master_client_->StopHeartbeat();
@@ -518,7 +598,10 @@ void PoolClient::Shutdown() {
   // Every backend deregisters its memory through transfer_engine_ inside its
   // own destructor — this MUST run before transfer_engine_ is torn down below.
   // MasterClient borrows the registry, so unbind it first.
-  if (master_client_) master_client_->SetBackendRegistry(nullptr);
+  if (master_client_) {
+    master_client_->SetPeerPool(nullptr);
+    master_client_->SetBackendRegistry(nullptr);
+  }
   default_pool_.reset();
   registry_ = BackendRegistry{};
 
@@ -553,6 +636,10 @@ bool PoolClient::Clear() {
 bool PoolClient::IsInitialized() const { return initialized_; }
 MasterClient& PoolClient::Master() { return *master_client_; }
 BackendRegistry& PoolClient::Backends() { return registry_; }
+TierTransitionMetrics PoolClient::TransitionMetrics() const {
+  return default_pool_ == nullptr ? TierTransitionMetrics{}
+                                  : default_pool_->TransitionMetrics();
+}
 
 // ---------------------------------------------------------------------------
 //  Memory registration
@@ -665,7 +752,8 @@ bool PoolClient::BuildLocalPageTransfers(MediumBackend* backend,
 }
 
 PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key, const void* src,
-                                                          size_t size, TierType tier) {
+                                                          size_t size, TierType tier,
+                                                          const std::string& logical_tier) {
   if (default_pool_ == nullptr || registry_.Empty()) {
     MORI_UMBP_ERROR("[PoolClient] Local Put requested but no default pool is initialized");
     return PutAttemptOutcome::kFatal;
@@ -674,6 +762,7 @@ PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key
   request.key = key;
   request.size = size;
   request.tier = tier;
+  request.logical_tier = logical_tier;
   auto pool_alloc = default_pool_->BatchAllocate({request}).front();
   auto* backend = registry_.Get(pool_alloc.backend_id);
   // A medium that publishes no buffer endpoints cannot be reached in-process at
@@ -903,6 +992,9 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
   for (size_t i = 0; i < outcomes.size(); ++i) {
     results[i] = (outcomes[i] != PutEntryOutcome::kFailed);
   }
+  if (workload_recorder_ != nullptr) {
+    workload_recorder_->RecordBatchPut(keys, sizes, results);
+  }
   return results;
 }
 
@@ -954,7 +1046,8 @@ void PoolClient::ExecuteBatchPutPlan(const BatchPutPlan& plan,
     const auto t0 = std::chrono::steady_clock::now();
     LocalParallelFor(local.size(), nthr, [&](size_t k) {
       const auto& item = local[k];
-      switch (ExecuteLocalPut(*item.key, item.src, item.size, item.route.tier)) {
+      switch (ExecuteLocalPut(*item.key, item.src, item.size, item.route.tier,
+                              item.route.logical_tier)) {
         case PutAttemptOutcome::kSuccess:
           (*results)[item.index] = PutEntryOutcome::kSucceeded;
           break;
@@ -1121,6 +1214,7 @@ bool PoolClient::AllocateRemotePutEntries(const std::vector<BatchPutItem>& items
     entry->set_size(item.size);
     entry->set_tier(static_cast<::umbp::TierType>(item.route.tier));
     entry->set_key(*item.key);
+    entry->set_logical_tier(item.route.logical_tier);
   }
 
   ::umbp::BatchAllocateSlotsResponse alloc_resp;
@@ -1389,6 +1483,9 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
     ObserveBatchBandwidth(*master_client_, split.remote, seconds,
                           MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH,
                           MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH_HELP, "remote");
+  }
+  if (workload_recorder_ != nullptr) {
+    workload_recorder_->RecordBatchGet(keys, sizes, results);
   }
   return results;
 }

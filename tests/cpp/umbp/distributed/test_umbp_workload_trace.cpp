@@ -10,6 +10,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <unistd.h>
@@ -17,6 +18,7 @@
 #include "umbp/distributed/benchmark/payload.h"
 #include "umbp/distributed/benchmark/workload_source.h"
 #include "umbp/distributed/benchmark/workload_trace.h"
+#include "umbp/distributed/benchmark/workload_trace_recorder.h"
 
 namespace mori::umbp::benchmark {
 namespace {
@@ -219,6 +221,34 @@ TEST(WorkloadTraceTest, CapacityPressureUsesUniqueWritesAndBatchTimestamps) {
     if (!inserted) EXPECT_EQ(event.relative_timestamp_ns(), it->second);
   }
   EXPECT_EQ(keys.size(), config.operation_count);
+}
+
+TEST(WorkloadTraceRecorderTest, VersionsOverwritesAndLinksGets) {
+  const std::string path = TempPath(".trace");
+  {
+    WorkloadTraceRecorderOptions options;
+    options.path = path;
+    options.client_id = 7;
+    options.seed = 42;
+    WorkloadTraceRecorder recorder(std::move(options));
+    recorder.RecordBatchPut({"key"}, {64}, {true});
+    recorder.RecordBatchPut({"key"}, {64}, {true});
+    recorder.RecordBatchGet({"key", "missing"}, {64, 64}, {true, true});
+    EXPECT_EQ(recorder.event_count(), 3u);
+    recorder.Close();
+  }
+
+  TraceReader reader(path);
+  std::vector<::umbp::benchmark::WorkloadEvent> events;
+  ::umbp::benchmark::WorkloadEvent event;
+  while (reader.ReadNext(&event)) events.push_back(event);
+  ASSERT_EQ(events.size(), 3u);
+  EXPECT_NE(events[0].key(), events[1].key());
+  EXPECT_EQ(events[2].key(), events[1].key());
+  EXPECT_EQ(events[2].operation_id(), events[1].operation_id());
+  EXPECT_LE(events[0].relative_timestamp_ns(), events[1].relative_timestamp_ns());
+  EXPECT_LE(events[1].relative_timestamp_ns(), events[2].relative_timestamp_ns());
+  std::filesystem::remove(path);
 }
 
 }  // namespace

@@ -2,10 +2,8 @@
 
 `umbp_tier_bench` runs deterministic synthetic or recorded workloads through an
 in-process Master and one or more PoolClients. It measures the distributed UMBP
-PUT/GET path, including routing, same-tier backend placement, payload
-validation, throughput, latency, and backend capacity.
-
-It does not exercise the standalone DRAM-to-SSD promotion/demotion stack.
+PUT/GET path, including routing, named backend placement, peer-local offload,
+payload validation, throughput, latency, and backend capacity.
 
 ## Build
 
@@ -42,6 +40,78 @@ Generate a reusable trace and replay it under another policy:
 ```
 
 Use `umbp_tier_bench <subcommand> --help` for the complete option list.
+
+## JSON backend and tier policy
+
+`--config` replaces the legacy `--tier`, `--backends-per-peer`,
+`--placement`, and `--placement-weights` cluster topology:
+
+```bash
+./build/src/umbp/umbp_tier_bench run --config policy.json \
+  --profile capacity-pressure --operations 1000 --page-size 2MiB
+```
+
+```json
+{
+  "schema_version": 1,
+  "entry_tier": "hot",
+  "backends": {
+    "hbm":   { "type": "hbm", "capacity": "80GiB", "devices": [0, 1] },
+    "dram":  { "type": "dram", "capacity": "512GiB", "numa_node": 0 },
+    "ssd_a": { "type": "ssd", "capacity": "1TiB", "path": "/mnt/kvcache/hot" },
+    "ssd_b": { "type": "ssd", "capacity": "3TiB", "path": "/mnt/kvcache/cold" }
+  },
+  "tiers": [
+    {
+      "name": "hot",
+      "backends": { "hbm": 100 },
+      "offload_to": ["warm"],
+      "offload_trigger": "on_evict"
+    },
+    {
+      "name": "warm",
+      "backends": { "dram": 70, "ssd_a": 30 },
+      "offload_to": ["cold"],
+      "offload_trigger": "watermark",
+      "high_watermark": 0.9,
+      "low_watermark": 0.7,
+      "candidate_policy": "lru"
+    },
+    {
+      "name": "cold",
+      "backends": { "ssd_b": 100 },
+      "promote_on_read": true,
+      "promotion_mode": "copy"
+    }
+  ]
+}
+```
+
+New PUTs use `entry_tier` (the first tier when omitted) and its deterministic
+backend weights. `NO_SPACE` recursively spills through `offload_to`; every
+destination tier applies its own weights.
+`on_evict` copies the key to the first available target before deleting its
+source copy. `watermark` queues asynchronous LRU offload after aggregate tier
+use reaches `high_watermark`. Migration continues toward `low_watermark` and
+retries transient failures with bounded backoff. `promote_on_read` copies or
+moves a cold hit into the fastest reachable upstream tier.
+
+Backend and logical-tier names must be unique, and every backend must belong to
+exactly one logical tier. Offload targets may name a backend or logical tier
+and must resolve to a later tier, which makes the
+topology acyclic. A multi-device HBM definition expands to one backend per
+device while preserving the logical backend's aggregate weight and capacity.
+The current per-peer limit is eight concrete backends.
+
+Production distributed clients may set
+`UMBPDistributedConfig::backend_policy_path`; Python exposes the same
+`backend_policy_path` property. Distributed-backed standalone servers also
+accept `UMBP_BACKEND_POLICY`.
+
+Each benchmark run prints `backend_placement` and `tier_transitions` CSV
+sections. Production clients can record successful PUT/GET traffic with
+`UMBP_WORKLOAD_TRACE_PATH`; replay it with payload validation disabled because
+production payload bytes are not embedded in the trace.
 
 **Page size vs value size.** Each value occupies a whole page. The defaults
 (`page_size=2MiB`, `backend_capacity=256MiB`) only hold 128 keys per backend.

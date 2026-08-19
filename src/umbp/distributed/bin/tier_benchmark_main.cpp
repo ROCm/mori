@@ -14,6 +14,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -49,6 +50,7 @@ constexpr auto kServerStartTimeout = std::chrono::seconds(10);
 struct Options {
   std::string command;
   std::string trace_path;
+  std::string policy_path;
   bench::SyntheticWorkloadConfig workload;
   bench::WorkloadRunnerOptions runner;
   std::string profile = "mixed";
@@ -82,6 +84,7 @@ Workload:
   --size-distribution fixed|uniform|log-uniform
   --read-ratio R  --clients N  --batch N  --qps Q
 Cluster:
+  --config PATH
   --tier dram|hbm|ssd  --backends-per-peer N  --backend-capacity SIZE
   --page-size SIZE  --placement single|weighted  --placement-weights LIST
   --ssd-dir-prefix PATH  --put-strategy most_available|random
@@ -199,6 +202,8 @@ Options ParseOptions(int argc, char** argv) {
       options.runner.validate_get_payloads = false;
     } else if (name == "--trace") {
       options.trace_path = value();
+    } else if (name == "--config") {
+      options.policy_path = value();
     } else if (name == "--profile") {
       options.profile = value();
     } else if (name == "--seed") {
@@ -308,24 +313,46 @@ void ValidateOptions(Options* options) {
   if (options->get_strategy != "local" && options->get_strategy != "random") {
     UsageError("--get-strategy must be local or random");
   }
-  if (options->placement != "single" && options->placement != "weighted") {
-    UsageError("--placement must be single or weighted");
-  }
-  ParseTier(options->tier);
-  if (options->backends_per_peer == 0 ||
-      options->backends_per_peer > mori::umbp::kMaxBackendsPerPeer) {
-    UsageError("--backends-per-peer is out of range");
-  }
-  if (!options->placement_weights.empty() &&
-      options->placement_weights.size() != options->backends_per_peer) {
-    UsageError("--placement-weights must have one entry per backend");
-  }
-  if (options->backend_capacity < options->page_size || options->page_size == 0) {
-    UsageError("--backend-capacity must be at least the positive --page-size");
-  }
-  if (options->tier == "ssd" && options->command != "replay" &&
-      options->workload.max_value_size > options->page_size) {
-    UsageError("SSD values must not exceed --page-size");
+  if (options->page_size == 0) UsageError("--page-size must be positive");
+  if (!options->policy_path.empty()) {
+    auto loaded = mori::umbp::LoadBackendPolicyFile(options->policy_path);
+    if (!loaded.ok()) UsageError("invalid --config: " + loaded.error);
+    PoolClientConfig lowered;
+    lowered.dram_page_size = options->page_size;
+    std::string error;
+    if (!mori::umbp::ApplyBackendPolicy(*loaded.config, &lowered, &error)) {
+      UsageError("invalid --config: " + error);
+    }
+    if (lowered.backends.size() > mori::umbp::kMaxBackendsPerPeer) {
+      UsageError("--config expands beyond the per-peer backend limit");
+    }
+    const bool has_ssd = std::any_of(
+        lowered.backends.begin(), lowered.backends.end(),
+        [](const BackendInstanceConfig& backend) { return backend.tier == TierType::SSD; });
+    if (has_ssd && options->command != "replay" &&
+        options->workload.max_value_size > options->page_size) {
+      UsageError("SSD values must not exceed --page-size");
+    }
+  } else {
+    if (options->placement != "single" && options->placement != "weighted") {
+      UsageError("--placement must be single or weighted");
+    }
+    ParseTier(options->tier);
+    if (options->backends_per_peer == 0 ||
+        options->backends_per_peer > mori::umbp::kMaxBackendsPerPeer) {
+      UsageError("--backends-per-peer is out of range");
+    }
+    if (!options->placement_weights.empty() &&
+        options->placement_weights.size() != options->backends_per_peer) {
+      UsageError("--placement-weights must have one entry per backend");
+    }
+    if (options->backend_capacity < options->page_size || options->page_size == 0) {
+      UsageError("--backend-capacity must be at least the positive --page-size");
+    }
+    if (options->tier == "ssd" && options->command != "replay" &&
+        options->workload.max_value_size > options->page_size) {
+      UsageError("SSD values must not exceed --page-size");
+    }
   }
 }
 void AddTraceMetadata(const Options& options,
@@ -452,6 +479,12 @@ BackendInstanceConfig MakeBackend(const Options& options, uint32_t node,
 std::vector<std::unique_ptr<PoolClient>> StartClients(
     const Options& options, const std::string& master_address) {
   std::vector<std::unique_ptr<PoolClient>> clients;
+  std::optional<mori::umbp::BackendPolicyConfig> policy;
+  if (!options.policy_path.empty()) {
+    auto loaded = mori::umbp::LoadBackendPolicyFile(options.policy_path);
+    if (!loaded.ok()) throw std::runtime_error("invalid backend policy: " + loaded.error);
+    policy = std::move(*loaded.config);
+  }
   for (uint32_t node = 0; node < options.workload.client_count; ++node) {
     PoolClientConfig config;
     config.master_config.master_address = master_address;
@@ -465,11 +498,19 @@ std::vector<std::unique_ptr<PoolClient>> StartClients(
     }
     config.dram_page_size = options.page_size;
     config.cache_remote_fetches = false;
-    config.placement_policy = options.placement == "weighted"
-                                  ? PoolPlacementPolicy::WEIGHTED
-                                  : PoolPlacementPolicy::SINGLE_BACKEND;
-    for (uint32_t i = 0; i < options.backends_per_peer; ++i) {
-      config.backends.push_back(MakeBackend(options, node, i));
+    if (policy.has_value()) {
+      std::string error;
+      if (!mori::umbp::ApplyBackendPolicy(
+              *policy, &config, &error, "-tier-benchmark-node-" + std::to_string(node))) {
+        throw std::runtime_error("failed to apply backend policy: " + error);
+      }
+    } else {
+      config.placement_policy = options.placement == "weighted"
+                                    ? PoolPlacementPolicy::WEIGHTED
+                                    : PoolPlacementPolicy::SINGLE_BACKEND;
+      for (uint32_t i = 0; i < options.backends_per_peer; ++i) {
+        config.backends.push_back(MakeBackend(options, node, i));
+      }
     }
     auto client = std::make_unique<PoolClient>(std::move(config));
     if (!client->Init()) {
@@ -621,12 +662,13 @@ void PrintSummary(const Options& options, const bench::WorkloadMetrics& metrics,
                                 seconds;
   std::cout
       << "config\n"
-      << "command,trace,seed,profile,operations,keys,min_value_bytes,max_value_bytes,"
+      << "command,trace,policy,seed,profile,operations,keys,min_value_bytes,max_value_bytes,"
          "size_distribution,read_ratio,clients,batch,qps,tier,"
          "backends_per_peer,backend_capacity,page_size,placement,weights,"
          "put_strategy,affinity,get_strategy,scheduling,time_scale,payload_validation,"
          "settle_ms\n"
-      << Csv(options.command) << ',' << Csv(options.trace_path) << ',' << seed << ','
+      << Csv(options.command) << ',' << Csv(options.trace_path) << ','
+      << Csv(options.policy_path) << ',' << seed << ','
       << Csv(options.profile) << ',' << options.workload.operation_count << ','
       << options.workload.key_count << ',' << options.workload.min_value_size << ','
       << options.workload.max_value_size << ',' << Csv(options.size_distribution) << ','
@@ -669,6 +711,14 @@ void PrintBackendPlacement(const std::vector<std::unique_ptr<PoolClient>>& clien
                 << backend->OwnedKeyCount() << ',' << capacity.total_bytes << ','
                 << capacity.available_bytes << ',' << capacity.max_allocatable_bytes << '\n';
     }
+  }
+  std::cout << "tier_transitions\n"
+            << "node,attempted,succeeded,failed,offloaded_bytes,promoted_bytes\n";
+  for (const auto& client : clients) {
+    const auto metrics = client->TransitionMetrics();
+    std::cout << Csv(client->NodeId()) << ',' << metrics.attempted << ','
+              << metrics.succeeded << ',' << metrics.failed << ','
+              << metrics.offloaded_bytes << ',' << metrics.promoted_bytes << '\n';
   }
 }
 void InspectReplayTrace(Options* options) {

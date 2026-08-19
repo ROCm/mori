@@ -46,6 +46,10 @@
 
 namespace mori::umbp {
 
+namespace benchmark {
+class WorkloadTraceRecorder;
+}
+
 class PeerServiceServer;
 class PeerPool;
 
@@ -132,6 +136,7 @@ class PoolClient {
   // Every named storage backend live on this node.  Callers use them through
   // MediumBackend — no concrete backend type is named outside PoolClient::Init.
   BackendRegistry& Backends();
+  TierTransitionMetrics TransitionMetrics() const;
 
   // Legacy default medium: the first configured backend's tier.  Valid after
   // Init and retained for callers that have not adopted named instances.
@@ -185,6 +190,7 @@ class PoolClient {
   // The implicit default logical pool. It borrows registry_, owns placement
   // state and policy, and is the dispatch surface for local and peer RPC paths.
   std::unique_ptr<PeerPool> default_pool_;
+  std::unique_ptr<benchmark::WorkloadTraceRecorder> workload_recorder_;
 
   // Legacy default tier, cached from the first configured backend. Read by
   // re-cache paths that do not yet carry a PoolPolicy decision.
@@ -253,7 +259,7 @@ class PoolClient {
   enum class GetAttemptOutcome { kSuccess, kRetry, kFatal };
 
   PutAttemptOutcome ExecuteLocalPut(const std::string& key, const void* src, size_t size,
-                                    TierType tier);
+                                    TierType tier, const std::string& logical_tier = {});
   GetAttemptOutcome ExecuteLocalGet(const std::string& key, void* dst, size_t size);
 
   // One TransferItem per page between a caller buffer and `backend`'s own
