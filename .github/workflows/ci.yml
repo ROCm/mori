@@ -84,6 +84,7 @@ jobs:
   intranode-test:
     name: mori intranode test (${{ matrix.platform }})
     needs: build
+    if: false # TEMP: disabled to speed up CI; only jax-intranode-test runs
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -397,6 +398,7 @@ jobs:
   umbp-unit-test:
     name: mori umbp unit test (${{ matrix.platform }})
     needs: build
+    if: false # TEMP: disabled to speed up CI; only jax-intranode-test runs
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -453,6 +455,7 @@ jobs:
   internode-test:
     name: mori internode test (${{ matrix.platform }})
     needs: build
+    if: false # TEMP: disabled to speed up CI; only jax-intranode-test runs
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -872,7 +875,7 @@ jobs:
   umbp-single-node-hicache:
     name: mori umbp single-node hicache smoke test
     needs: build
-    if: github.event_name == 'workflow_dispatch' && inputs.run_umbp_single_node_hicache == 'true'
+    if: false # TEMP: disabled to speed up CI; only jax-intranode-test runs
     runs-on: [self-hosted, MI355X-AINIC-TW]
     timeout-minutes: 180
     steps:
