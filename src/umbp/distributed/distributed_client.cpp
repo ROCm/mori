@@ -85,25 +85,35 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   // a client that never issues ranged operations stops paying for the arena.
   HostMemAllocator allocator;
   HostBufferOptions scratch_opts;
+  // Two separate arenas — GET and PUT — each of ranged_scratch_size, so the two
+  // directions never share a buffer or a lock and can run concurrently.
   if (dc.ranged_scratch_size > 0) {
-    ranged_scratch_handle_ = allocator.Alloc(dc.ranged_scratch_size, scratch_opts);
-    if (!ranged_scratch_handle_.valid()) {
+    ranged_get_scratch_handle_ = allocator.Alloc(dc.ranged_scratch_size, scratch_opts);
+    ranged_put_scratch_handle_ = allocator.Alloc(dc.ranged_scratch_size, scratch_opts);
+    if (!ranged_get_scratch_handle_.valid() || !ranged_put_scratch_handle_.valid()) {
       throw std::runtime_error("DistributedClient: memory allocation failed for ranged scratch");
     }
-    ranged_scratch_ = ranged_scratch_handle_.ptr;
-    ranged_scratch_size_ = ranged_scratch_handle_.mapped_size;
+    ranged_get_scratch_ = ranged_get_scratch_handle_.ptr;
+    ranged_get_scratch_size_ = ranged_get_scratch_handle_.mapped_size;
+    ranged_put_scratch_ = ranged_put_scratch_handle_.ptr;
+    ranged_put_scratch_size_ = ranged_put_scratch_handle_.mapped_size;
   }
 
   auto pc_config = ToPoolClientConfig(dc, std::move(dram_ownership), std::move(ssd_ownership));
-  pc_config.ranged_scratch_buffer = ranged_scratch_;
-  pc_config.ranged_scratch_size = ranged_scratch_size_;
+  pc_config.ranged_get_scratch_buffer = ranged_get_scratch_;
+  pc_config.ranged_get_scratch_size = ranged_get_scratch_size_;
+  pc_config.ranged_put_scratch_buffer = ranged_put_scratch_;
+  pc_config.ranged_put_scratch_size = ranged_put_scratch_size_;
   pc_config.copy_pipeline = config_.copy_pipeline;
 
   auto release_scratch = [this] {
     HostMemAllocator cleanup;
-    cleanup.Free(ranged_scratch_handle_);
-    ranged_scratch_ = nullptr;
-    ranged_scratch_size_ = 0;
+    cleanup.Free(ranged_get_scratch_handle_);
+    cleanup.Free(ranged_put_scratch_handle_);
+    ranged_get_scratch_ = nullptr;
+    ranged_get_scratch_size_ = 0;
+    ranged_put_scratch_ = nullptr;
+    ranged_put_scratch_size_ = 0;
   };
 
   pool_client_ = std::make_unique<PoolClient>(std::move(pc_config));
@@ -112,10 +122,13 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
     release_scratch();
     throw std::runtime_error("DistributedClient: PoolClient::Init() failed");
   }
-  // Registered explicitly rather than through a backend: the arena is a remote
+  // Registered explicitly rather than through a backend: each arena is a remote
   // endpoint for RDMA reads and writes, so it needs a memory region even though
   // no medium owns it. Skipped entirely when the deployment did not opt in.
-  if (ranged_scratch_ && !pool_client_->RegisterMemory(ranged_scratch_, ranged_scratch_size_)) {
+  if ((ranged_get_scratch_ &&
+       !pool_client_->RegisterMemory(ranged_get_scratch_, ranged_get_scratch_size_)) ||
+      (ranged_put_scratch_ &&
+       !pool_client_->RegisterMemory(ranged_put_scratch_, ranged_put_scratch_size_))) {
     pool_client_->Shutdown();
     pool_client_.reset();
     release_scratch();
@@ -369,13 +382,16 @@ void DistributedClient::Close() {
     pool_client_.reset();
   }
 
-  // Only after Shutdown has deregistered the region — the arena is caller-owned
-  // and PoolClient holds a memory region over it until then.
-  if (ranged_scratch_) {
+  // Only after Shutdown has deregistered the regions — the arenas are
+  // caller-owned and PoolClient holds a memory region over each until then.
+  if (ranged_get_scratch_ || ranged_put_scratch_) {
     HostMemAllocator allocator;
-    allocator.Free(ranged_scratch_handle_);
-    ranged_scratch_ = nullptr;
-    ranged_scratch_size_ = 0;
+    allocator.Free(ranged_get_scratch_handle_);
+    allocator.Free(ranged_put_scratch_handle_);
+    ranged_get_scratch_ = nullptr;
+    ranged_get_scratch_size_ = 0;
+    ranged_put_scratch_ = nullptr;
+    ranged_put_scratch_size_ = 0;
   }
 
   MORI_UMBP_INFO("[DistributedClient] closed");
@@ -384,7 +400,7 @@ void DistributedClient::Close() {
 bool DistributedClient::IsDistributed() const { return true; }
 
 bool DistributedClient::SupportsRangedIO() const {
-  if (ranged_scratch_size_ == 0) return false;
+  if (ranged_get_scratch_size_ == 0 || ranged_put_scratch_size_ == 0) return false;
   return config_.distributed.has_value() && config_.distributed->medium != UMBPMedium::SSD;
 }
 

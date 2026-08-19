@@ -440,8 +440,13 @@ bool PoolClient::Init() {
         }
       }
     }
-    if (config_.ranged_scratch_buffer != nullptr && config_.ranged_scratch_size > 0) {
-      hbm_engine_->AddHostGatherRegion(config_.ranged_scratch_buffer, config_.ranged_scratch_size);
+    if (config_.ranged_get_scratch_buffer != nullptr && config_.ranged_get_scratch_size > 0) {
+      hbm_engine_->AddHostGatherRegion(config_.ranged_get_scratch_buffer,
+                                       config_.ranged_get_scratch_size);
+    }
+    if (config_.ranged_put_scratch_buffer != nullptr && config_.ranged_put_scratch_size > 0) {
+      hbm_engine_->AddHostGatherRegion(config_.ranged_put_scratch_buffer,
+                                       config_.ranged_put_scratch_size);
     }
   }
 
@@ -1742,15 +1747,18 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   }
   if (missed.empty()) return results;
 
-  // ---- Phase 2: the rest, through the scratch arena ----
-  if (config_.ranged_scratch_buffer == nullptr || config_.ranged_scratch_size == 0 ||
-      !FindRegisteredMemory(config_.ranged_scratch_buffer, config_.ranged_scratch_size)
-           .has_value()) {
+  // ---- Phase 2: the rest, through the GET scratch arena ----
+  // GET has its own arena and mutex, so it overlaps a concurrent remote PUT
+  // (which uses the separate PUT arena/mutex).
+  char* const scratch_base = static_cast<char*>(config_.ranged_get_scratch_buffer);
+  const size_t scratch_size = config_.ranged_get_scratch_size;
+  if (scratch_base == nullptr || scratch_size == 0 ||
+      !FindRegisteredMemory(scratch_base, scratch_size).has_value()) {
     MORI_UMBP_ERROR("[PoolClient] BatchGetRanges: ranged scratch is absent or not registered");
     return results;
   }
   // Only the arena users serialize; the local hits above were fully concurrent.
-  std::unique_lock<std::mutex> scratch_lock(ranged_scratch_mutex_);
+  std::unique_lock<std::mutex> scratch_lock(ranged_get_scratch_mutex_);
 
   std::vector<std::string> route_keys;
   route_keys.reserve(missed.size());
@@ -1796,8 +1804,7 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
       const size_t object_size = static_cast<size_t>(routes[eligible[end]]->size);
       size_t aligned = 0;
       if (!AlignUpChecked(cursor, kRangedScratchAlignment, &aligned) ||
-          object_size > config_.ranged_scratch_size ||
-          aligned > config_.ranged_scratch_size - object_size) {
+          object_size > scratch_size || aligned > scratch_size - object_size) {
         break;
       }
       scratch_offsets.push_back(aligned);
@@ -1808,7 +1815,7 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
       const size_t original = missed[eligible[pos]];
       MORI_UMBP_ERROR(
           "[PoolClient] BatchGetRanges: object exceeds ranged scratch key='{}' size={} scratch={}",
-          keys[original], routes[eligible[pos]]->size, config_.ranged_scratch_size);
+          keys[original], routes[eligible[pos]]->size, scratch_size);
       ++pos;
       continue;
     }
@@ -1825,7 +1832,7 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
     for (size_t j = 0; j < count; ++j) {
       const size_t route_index = eligible[pos + j];
       sub_keys.push_back(keys[missed[route_index]]);
-      sub_dsts.push_back(static_cast<char*>(config_.ranged_scratch_buffer) + scratch_offsets[j]);
+      sub_dsts.push_back(scratch_base + scratch_offsets[j]);
       sub_sizes.push_back(static_cast<size_t>(routes[route_index]->size));
       sub_routes.push_back(routes[route_index]);
     }
@@ -1931,14 +1938,17 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
   if (remote.empty()) return results;
 
   // A key routed to another node has to be one contiguous object on the wire,
-  // so this is the one direction that needs the arena.
-  if (config_.ranged_scratch_buffer == nullptr || config_.ranged_scratch_size == 0 ||
-      !FindRegisteredMemory(config_.ranged_scratch_buffer, config_.ranged_scratch_size)
-           .has_value()) {
+  // so this is the one direction that needs the arena.  PUT has its own arena
+  // and mutex, so it overlaps a concurrent remote GET (which uses the separate
+  // GET arena/mutex).
+  char* const scratch_base = static_cast<char*>(config_.ranged_put_scratch_buffer);
+  const size_t scratch_size = config_.ranged_put_scratch_size;
+  if (scratch_base == nullptr || scratch_size == 0 ||
+      !FindRegisteredMemory(scratch_base, scratch_size).has_value()) {
     MORI_UMBP_ERROR("[PoolClient] BatchPutRanges: ranged scratch is absent or not registered");
     return results;
   }
-  std::unique_lock<std::mutex> scratch_lock(ranged_scratch_mutex_);
+  std::unique_lock<std::mutex> scratch_lock(ranged_put_scratch_mutex_);
 
   size_t pos = 0;
   while (pos < remote.size()) {
@@ -1949,8 +1959,7 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
       const size_t object_size = object_sizes[valid[remote[end]]];
       size_t aligned = 0;
       if (!AlignUpChecked(cursor, kRangedScratchAlignment, &aligned) ||
-          object_size > config_.ranged_scratch_size ||
-          aligned > config_.ranged_scratch_size - object_size) {
+          object_size > scratch_size || aligned > scratch_size - object_size) {
         break;
       }
       scratch_offsets.push_back(aligned);
@@ -1960,7 +1969,7 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
       const size_t original = valid[remote[pos]];
       MORI_UMBP_ERROR(
           "[PoolClient] BatchPutRanges: object exceeds ranged scratch key='{}' size={} scratch={}",
-          keys[original], object_sizes[original], config_.ranged_scratch_size);
+          keys[original], object_sizes[original], scratch_size);
       ++pos;
       continue;
     }
@@ -1979,7 +1988,7 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
     for (size_t j = 0; j < count; ++j) {
       const size_t route_index = remote[pos + j];
       const size_t original = valid[route_index];
-      void* slice = static_cast<char*>(config_.ranged_scratch_buffer) + scratch_offsets[j];
+      void* slice = scratch_base + scratch_offsets[j];
       if (!CopyRangesToContiguous(
               MakeWriteRanges(srcs[original], sizes[original], dst_offsets[original]), slice,
               object_sizes[original])) {

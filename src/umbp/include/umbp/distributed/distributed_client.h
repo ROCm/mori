@@ -103,13 +103,22 @@ class DistributedClient : public IUMBPClient {
 
  private:
   UMBPConfig config_;
-  // The only buffer this class still allocates. Phase 2b moved medium pools
-  // into the backends, but the ranged scratch arena is not a medium: it is a
-  // client-side staging region for objects fetched from, or assembled for,
-  // another node, so it belongs to whoever owns the PoolClient.
-  void* ranged_scratch_ = nullptr;
-  size_t ranged_scratch_size_ = 0;
-  HostBufferHandle ranged_scratch_handle_;
+  // The only buffers this class still allocates. Phase 2b moved medium pools
+  // into the backends, but the ranged scratch arenas are not a medium: they are
+  // client-side staging regions for objects fetched from, or assembled for,
+  // another node, so they belong to whoever owns the PoolClient.
+  //
+  // Two separate arenas — one for remote ranged GET, one for remote ranged PUT
+  // — each RDMA-registered and each under its own mutex in PoolClient, so a
+  // remote get and a remote put run concurrently instead of serializing on one
+  // lock (the load/offload overlap sglang's direct linker wants). Each is sized
+  // to config.distributed.ranged_scratch_size; allocated only when that is > 0.
+  void* ranged_get_scratch_ = nullptr;
+  size_t ranged_get_scratch_size_ = 0;
+  HostBufferHandle ranged_get_scratch_handle_;
+  void* ranged_put_scratch_ = nullptr;
+  size_t ranged_put_scratch_size_ = 0;
+  HostBufferHandle ranged_put_scratch_handle_;
   std::unique_ptr<PoolClient> pool_client_;
   std::atomic<bool> closing_{false};
   mutable std::shared_mutex op_mutex_;
