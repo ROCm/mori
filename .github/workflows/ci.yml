@@ -18,7 +18,7 @@ env:
 
 jobs:
   io-bench-engine-internode:
-    name: bench_engine internode (${{ matrix.platform }})
+    name: MORI-IO internode perf (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -45,7 +45,7 @@ jobs:
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -98,61 +98,82 @@ jobs:
               git config --global --add safe.directory $GITHUB_WORKSPACE
           "
 
-      - name: Build bench_engine (both nodes)
+      - name: Install mori and build bench_engine (both nodes)
         run: |
-          BUILD_CMD="cd $GITHUB_WORKSPACE && cmake -B build \
-            -DBUILD_IO=ON \
-            -DBUILD_TESTS=ON \
-            -DBUILD_EXAMPLES=OFF \
-            -DBUILD_PYBINDS=OFF \
-            -DBUILD_OPS=OFF \
-            -DBUILD_SHMEM=OFF \
-            -DBUILD_CCO=OFF \
-            -DBUILD_COLLECTIVE=OFF \
-            -DBUILD_METRICS=OFF \
-            -DBUILD_UMBP=OFF \
-            && cmake --build build --target bench_engine -j \
-            && ls -la build/tests/cpp/bench_engine"
-          $CT exec $CONTAINER bash -c "$BUILD_CMD"
+          INSTALL_CMD="cd $GITHUB_WORKSPACE && \
+            BUILD_TESTS=ON BUILD_EXAMPLES=OFF BUILD_OPS=OFF BUILD_SHMEM=OFF \
+            BUILD_CCO=OFF BUILD_COLLECTIVE=OFF BUILD_UMBP=OFF BUILD_METRICS=OFF \
+            pip install . && ls -la build/tests/cpp/bench_engine"
+          $CT exec $CONTAINER bash -c "$INSTALL_CMD"
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
-            "$CT exec $CONTAINER bash -c \"$BUILD_CMD\""
+            "$CT exec $CONTAINER bash -c \"$INSTALL_CMD\""
 
-      - name: MORI-IO C++ bench_engine write sweep (batch 1 and 64)
+      - name: MORI-IO C++ and Python write sweeps (batch 1 and 64)
         run: |
           mkdir -p $GITHUB_WORKSPACE/_perf
-          RESULTS=$GITHUB_WORKSPACE/_perf/bench_engine_results.txt
+          CPP_RESULTS=$GITHUB_WORKSPACE/_perf/bench_engine_results.txt
+          PY_RESULTS=$GITHUB_WORKSPACE/_perf/python_benchmark_results.txt
           BIN=$GITHUB_WORKSPACE/build/tests/cpp/bench_engine
           LDP="LD_LIBRARY_PATH=$GITHUB_WORKSPACE/build/src/io:$GITHUB_WORKSPACE/build/src/application"
-          PORT=29130
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
+          chmod +x "$SCRIPT"
+
+          # Shared workload for C++ bench_engine and Python benchmark.py.
+          # batch=1: 512 iters (chunking ON by default; no --batch-contiguous).
+          # batch=64: 128 iters.
           COMMON="--op-type write --mem-type gpu --all \
             --sweep-start-size 1048576 --sweep-max-size 33554432 --sweep-step 1048576 \
-            --num-qp-per-transfer 4 --batch-contiguous \
-            --num-initiator-dev 1 --num-target-dev 1 \
-            --warmup-iters 10 --log-level info"
+            --num-qp-per-transfer 8 --enable-sess --poll_cq_mode polling \
+            --num-initiator-dev 1 --num-target-dev 1 --target-dev-offset 0 \
+            --log-level info"
+
+          CPP_PORT=29130
+          PY_PORT=29230
           for BATCH in 1 64; do
             ITERS=128
             if [ "$BATCH" -eq 1 ]; then ITERS=512; fi
-            echo "=== C++ bench_engine GPU write sweep, batch=$BATCH, iters=$ITERS, port=$PORT ===" | tee -a "$RESULTS"
             ARGS="$COMMON --transfer-batch-size $BATCH --iters $ITERS"
+
+            echo "=== C++ bench_engine GPU write sweep, batch=$BATCH, iters=$ITERS, port=$CPP_PORT ===" \
+              | tee -a "$CPP_RESULTS"
             R1="cd $GITHUB_WORKSPACE && MORI_DISABLE_AUTO_XGMI=1 $LDP $BIN \
-              --rank 1 --master-ip $NODE1_HOST --self-ip $NODE2_HOST --port $PORT \
-              --target-dev-offset 0 $ARGS"
+              --rank 1 --master-ip $NODE1_HOST --self-ip $NODE2_HOST --port $CPP_PORT \
+              --target-dev-offset 0 --warmup-iters 10 $ARGS"
             R0="cd $GITHUB_WORKSPACE && MORI_DISABLE_AUTO_XGMI=1 $LDP $BIN \
-              --rank 0 --master-ip $NODE1_HOST --self-ip $NODE1_HOST --port $PORT \
-              --target-dev-offset 0 $ARGS"
+              --rank 0 --master-ip $NODE1_HOST --self-ip $NODE1_HOST --port $CPP_PORT \
+              --target-dev-offset 0 --warmup-iters 10 $ARGS"
             ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
-              "$CT exec $CONTAINER bash -c \"$R1\"" >> "$RESULTS" 2>&1 &
-            $CT exec $CONTAINER bash -c "$R0" | tee -a "$RESULTS"
+              "$CT exec $CONTAINER bash -c \"$R1\"" >> "$CPP_RESULTS" 2>&1 &
+            $CT exec $CONTAINER bash -c "$R0" | tee -a "$CPP_RESULTS"
             wait
-            PORT=$((PORT + 1))
+            CPP_PORT=$((CPP_PORT + 1))
+
+            echo "=== Python benchmark.py GPU write sweep, batch=$BATCH, iters=$ITERS, port=$PY_PORT ===" \
+              | tee -a "$PY_RESULTS"
+            PY_ARGS="$ARGS --enable-batch-transfer"
+            NODE2_CMD=(
+              $CT exec -e MORI_DISABLE_AUTO_XGMI=1 $CONTAINER bash $SCRIPT
+              --rank 1 --master-addr $NODE1_HOST --master-port $PY_PORT
+              --ifname $NODE2_IFNAME
+              -- $PY_ARGS
+            )
+            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" >> "$PY_RESULTS" 2>&1 &
+            $CT exec -e MORI_DISABLE_AUTO_XGMI=1 $CONTAINER bash $SCRIPT \
+              --rank 0 --master-addr $NODE1_HOST --master-port $PY_PORT \
+              --ifname $NODE1_IFNAME \
+              -- $PY_ARGS | tee -a "$PY_RESULTS"
+            wait
+            PY_PORT=$((PY_PORT + 1))
           done
 
-      - name: Upload bench_engine results
+      - name: Upload perf results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bench-engine-perf-${{ github.run_id }}
-          path: ${{ github.workspace }}/_perf/bench_engine_results.txt
+          name: mori-io-perf-${{ github.run_id }}
+          path: |
+            ${{ github.workspace }}/_perf/bench_engine_results.txt
+            ${{ github.workspace }}/_perf/python_benchmark_results.txt
           if-no-files-found: warn
 
       - name: Cleanup node1
