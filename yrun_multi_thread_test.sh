@@ -85,6 +85,10 @@ MAX_SIZE=${MAX_SIZE:-1024*1024*128}
 
 TEST=./build/examples/$TEST_NAME
 rm -f zzout_*.log
+
+# /data/mori/perf record --call-graph fp -F 2999 -m 128M \
+#   -- $TEST $NUM_GPUS 1024*1024*128 "$@"
+
 for ((size = MIN_SIZE; size <= MAX_SIZE; size = size * 2)); do
   $TEST $NUM_GPUS $size $@ 2>&1 | tee -a zzout_0.log
 done

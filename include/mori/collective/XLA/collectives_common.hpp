@@ -40,24 +40,13 @@
 namespace mori {
 namespace collective {
 
-// A copy-linear packet immediately followed by its completion atomic, then one
-// trailing zero dword. Both SDMA packet structs are made entirely of 4-byte
-// fields, so copy (dwords 0..6) and atomic (7..14) land in the ring as two
-// adjacent packets; the `nop` dword (15, value 0) is a single-dword SDMA NOP the
-// engine skips. The padding rounds the packet to 64 bytes and `alignas(16)` makes
-// each ring slot 16-byte aligned, so the body can be written with b128 stores.
-struct alignas(16) SDMA_PKT_COPY_WITH_ATOMIC {
-  SDMA_PKT_COPY_LINEAR copy;  // 28B
-  SDMA_PKT_ATOMIC atomic;     // 32B
-  uint32_t nop;               // 4B trailing single-dword NOP (must be 0)
-};
-static_assert(sizeof(SDMA_PKT_COPY_WITH_ATOMIC) == 64,
-              "fused copy+atomic packet must be 64B (16B-aligned) for b128 stores");
+static constexpr size_t kSDMACopyAtomicPktSize = 64;
+static_assert(sizeof(SDMA_PKT_COPY_LINEAR) + sizeof(SDMA_PKT_ATOMIC) 
+                                  + sizeof(uint32_t) == kSDMACopyAtomicPktSize,
+              "Packet size mismatch: copy+atomic must be 64B");
 
 static constexpr int kRSPushMaxPeers = 16;
 static constexpr int kRSPushMaxSlices = 8;
-static constexpr int kRSPushPktDwords = sizeof(SDMA_PKT_COPY_WITH_ATOMIC)/4;
-static constexpr int kRSPushSlotDwords = kRSPushPktDwords + 1; // padded stride
 
 // Per-peer all-to-all endpoints: chunk sent from `source` to peer p / received
 // into `dest` from peer p. Host-fillable, device-readable (host-pinned buffer).
@@ -212,53 +201,74 @@ __device__ __forceinline__ void BufferStore128(BufRsrc r, V128 v, uint32_t voff)
                                      /*soffset=*/0, RS_BUF_AUX);
 }
 
-// Emit SDMA_PKT_COPY_LINEAR into dw[0..6] + NOP.
-__device__ __forceinline__ void WriteCopyPacket(uint32_t* dw, 
-           const void* srcBuf, const void* dstBuf, size_t packetSize) {
+__device__ __forceinline__ void WriteFusedPacket(int lane, 
+     const void* srcBuf, const void* dstBuf, size_t packetSize, HSAuint64* signal,
+     uint32_t* outBasePtr) {
+  
+  uint32_t dw[4];
+  // if (lane == 0) {
+  //   decltype(SDMA_PKT_COPY_LINEAR::HEADER_UNION) hdr;
+  //   hdr.DW_0_DATA = 0;
+  //   hdr.op = SDMA_OP_COPY;
+  //   hdr.sub_op = SDMA_SUBOP_COPY_LINEAR;
+  //   dw[0] = 0;  // leading single-dword NOP (must be 0)
+  //   dw[1] = hdr.DW_0_DATA;
+  //   dw[2] = static_cast<uint32_t>(packetSize - 1);  // COUNT_UNION.count (reserved bits 0)
+  //   dw[3] = 0;                                      // PARAMETER_UNION (unused)
+  // } else if (lane == 2) {
+  //   decltype(SDMA_PKT_ATOMIC::HEADER_UNION) hdr;
+  //   hdr.DW_0_DATA = 0;
+  //   hdr.op = SDMA_OP_ATOMIC;
+  //   hdr.operation = SDMA_ATOMIC_ADD32;
+  //   dw[0] = hdr.DW_0_DATA;
+  //   dw[1] = (uint32_t)((uintptr_t)signal);
+  //   dw[2] = (uint32_t)((uintptr_t)signal >> 32);
+  //   dw[3] = 1;
+  if (lane % 2 == 0) {
   // Header depends only on constants; a scalar-replaceable local keeps the
   // bitfield layout authoritative and constant-folds (no address taken).
-  decltype(SDMA_PKT_COPY_LINEAR::HEADER_UNION) hdr;
-  hdr.DW_0_DATA = 0;
-  hdr.op = SDMA_OP_COPY;
-  hdr.sub_op = SDMA_SUBOP_COPY_LINEAR;
-  dw[0] = hdr.DW_0_DATA;
-  dw[1] = static_cast<uint32_t>(packetSize - 1);  // COUNT_UNION.count (reserved bits 0)
-  dw[2] = 0;                                       // PARAMETER_UNION (unused)
-  dw[3] = (uint32_t)(uintptr_t)srcBuf;
-  dw[4] = (uint32_t)((uintptr_t)srcBuf >> 32);
-  dw[5] = (uint32_t)(uintptr_t)dstBuf;
-  dw[6] = (uint32_t)((uintptr_t)dstBuf >> 32);
-  dw[7] = 0;  // trailing single-dword NOP (must be 0)
-} 
+    int flag = lane >> 1;
+    decltype(SDMA_PKT_COPY_LINEAR::HEADER_UNION) cp;
+    cp.DW_0_DATA = 0;
+    cp.op = SDMA_OP_COPY;
+    cp.sub_op = SDMA_SUBOP_COPY_LINEAR;
 
-// Emit SDMA_PKT_ATOMIC (ADD32) into dw[0..7]. A 32-bit atomic add touches only
-// the low dword of the 8-byte-aligned target (little-endian), which is what the
-// 64-bit waiter load reads as long as the high dword stays zero (resets clear the
-// full 64-bit slot and the counter never exceeds npes).
-__device__ __forceinline__ void WriteAtomicInc32Packet(uint32_t* dw, HSAuint64* signal) {
-  decltype(SDMA_PKT_ATOMIC::HEADER_UNION) hdr;
-  hdr.DW_0_DATA = 0;
-  hdr.op = SDMA_OP_ATOMIC;
-  hdr.operation = SDMA_ATOMIC_ADD32;
-  dw[0] = hdr.DW_0_DATA;
-  dw[1] = (uint32_t)((uintptr_t)signal);
-  dw[2] = (uint32_t)((uintptr_t)signal >> 32);
-  dw[3] = 1;
-  dw[4] = 0;  // SRC_DATA_HI (unused for 32-bit ADD)
-  dw[5] = 0;  // CMP_DATA_LO (unused for ADD)
-  dw[6] = 0;  // CMP_DATA_HI (unused for ADD)
-  dw[7] = 0;  // LOOP/interval (unused)
-}
+    decltype(SDMA_PKT_ATOMIC::HEADER_UNION) inc;
+    inc.DW_0_DATA = 0;
+    inc.op = SDMA_OP_ATOMIC;
+    inc.operation = SDMA_ATOMIC_ADD32;
+    dw[0] = flag == 0 ? 0 : inc.DW_0_DATA;
+    dw[1] = flag == 0 ? cp.DW_0_DATA : (uint32_t)((uintptr_t)signal);
+    dw[2] = flag == 0 ? static_cast<uint32_t>(packetSize) - 1 : 
+                        (uint32_t)((uintptr_t)signal >> 32);
+    dw[3] = flag;
+  } else {
+    // lane 1 - real addresses, lane 3 - all zeros
+    uint32_t mask = lane == 1 ? ~0u : 0;
+    dw[0] = (uint32_t)(uintptr_t)srcBuf & mask;
+    dw[1] = (uint32_t)((uintptr_t)srcBuf >> 32) & mask;
+    dw[2] = (uint32_t)(uintptr_t)dstBuf & mask;
+    dw[3] = (uint32_t)((uintptr_t)dstBuf >> 32) & mask;
+  }
+  const V128 v = {dw[0], dw[1], dw[2], dw[3]};
+  StreamStore<EAgentScope, 16>(outBasePtr + lane * 4, v);
+} 
 
 // Broadcast `v` from `srcLane` of this wave. ds_bpermute is lane-addressed;
 // srcLane must be < warpSize (64 on gfx950, 32 on gfx1250).
-__device__ __forceinline__ uint32_t shfl_u32(uint32_t v, int srcLane) {
-  return __builtin_amdgcn_ds_bpermute(srcLane << 2, v);
-}
-__device__ __forceinline__ uint64_t shfl_u64(uint64_t v, int srcLane) {
-  const uint32_t lo = shfl_u32(static_cast<uint32_t>(v), srcLane);
-  const uint32_t hi = shfl_u32(static_cast<uint32_t>(v >> 32), srcLane);
-  return (static_cast<uint64_t>(hi) << 32) | lo;
+template <typename T>
+__device__ __forceinline__ T broadcast_warp(T v, int srcLane) {
+  static_assert(sizeof(T) % sizeof(uint32_t) == 0, 
+                        "T must be a multiple of uint32_t");
+  union {
+    T v;
+    uint32_t dw[sizeof(T) / sizeof(uint32_t)];
+  } S = {.v = v};
+#pragma unroll
+  for (int i = 0; i < sizeof(T) / sizeof(uint32_t); i++) {
+    S.dw[i] = __builtin_amdgcn_ds_bpermute(srcLane << 2, S.dw[i]);
+  }
+  return S.v;
 }
 
 // SDMA queue handle augmented with collective-specific ring writers. It adds no
@@ -266,32 +276,12 @@ __device__ __forceinline__ uint64_t shfl_u64(uint64_t v, int srcLane) {
 // via a reinterpret_cast -- mirroring anvil::SdmaQueueSingleProducerDeviceHandle.
 struct SdmaCollectiveHandle : anvil::SdmaQueueDeviceHandle {
 
-  // Build a fused copy+atomic packet ENTIRELY in registers and stream it to an
-  // ABSOLUTE ring index as four b128 stores. 
-  // Layout matches SDMA_PKT_COPY_WITH_ATOMIC, assembled from the two shared dword
-  // writers: copy = dwords 0..6 (WriteCopyPacket), atomic = dwords 7..14
-  // (WriteAtomicInc32Packet), trailing single-dword NOP = 15.
-  // Caller must have reserved a contiguous, non-wrapping 64B slot at wptrIndex.
-  __device__ __forceinline__ void placeCopyAtomicPacketAt(const void* srcBuf, const void* dstBuf,
-                                                          size_t copyBytes, HSAuint64* signal,
-                                                          uint64_t wptrIndex) {
-    uint32_t dw[16];
-    WriteCopyPacket(dw, srcBuf, dstBuf, copyBytes);  // copy: dw[0..6]
-    WriteAtomicInc32Packet(dw + 8, signal);    // atomic: dw[7..14]
-    const uint64_t base = WrapIntoRing(wptrIndex) / sizeof(uint32_t);
-#pragma unroll
-    for (int i = 0; i < 16; i += 4) {
-      const V128 v = {dw[i], dw[i + 1], dw[i + 2], dw[i + 3]};
-      StreamStore<EAgentScope, 16>(queueBuf + base + i, v);
-    }
-  }
-
   // Fill [wptrIndex, wptrIndex+numBytes) with zero dwords (single-dword SDMA NOPs)
   // so the engine harmlessly skips the wrap-around padding region.
-  __device__ __forceinline__ void fillNops(uint64_t wptrIndex, uint64_t numBytes) {
+  __device__ __forceinline__ void fillNops(uint64_t wptrIndex, uint32_t numBytes) {
     uint64_t base_index_in_dwords = WrapIntoRing(wptrIndex) / sizeof(uint32_t);
-    const uint64_t numDwords = numBytes / sizeof(uint32_t);
-    for (uint64_t i = 0; i < numDwords; i++) {
+    const uint32_t numDwords = static_cast<uint32_t>(numBytes / sizeof(uint32_t));
+    for (uint32_t i = 0; i < numDwords; i++) {
       StreamStore<EAgentScope, 4>(queueBuf + base_index_in_dwords + i, 0);
     }
   }
@@ -304,16 +294,16 @@ struct SdmaCollectiveHandle : anvil::SdmaQueueDeviceHandle {
   // `this` is the shared device handle, so updating cachedHwReadIndex publishes
   // the rptr hint for the next caller.
   __device__ __forceinline__ uint64_t ReserveQueueSpaceCASFree(
-      const size_t size_in_bytes, uint64_t& offset) {
+      const size_t size_in_bytes, uint32_t& offset) {
     constexpr uint64_t q_size = anvil::SDMA_QUEUE_SIZE;
     uint64_t base =
         __hip_atomic_fetch_add(cachedWptr, size_in_bytes, __ATOMIC_RELAXED,
                                __HIP_MEMORY_SCOPE_AGENT);
     offset = 0;
     if (const uint64_t pos = WrapIntoRing(base); pos + size_in_bytes > q_size) {
-      offset = q_size - pos;
-      __hip_atomic_fetch_add(cachedWptr, offset, __ATOMIC_RELAXED,
-                             __HIP_MEMORY_SCOPE_AGENT);
+      offset = static_cast<uint32_t>(q_size - pos);
+      __hip_atomic_fetch_add(cachedWptr, static_cast<uint64_t>(offset), 
+                 __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
     const uint64_t end = base + size_in_bytes + offset;
     if (end - cachedHwReadIndex > q_size) {
@@ -354,39 +344,66 @@ static_assert(sizeof(SdmaCollectiveHandle) == sizeof(anvil::SdmaQueueDeviceHandl
 
 // One warp broadcasts a single slice to every peer's output[myPe] slice (same
 // byte offset `dstOff` on each peer), trailing an ADD32(1) into peer
-// signalPtrs[signalSlot]. Multi-producer-safe: other slice-groups' last blocks
+// signalPtrs[signalSlot]. Four consecutive lanes write one fused 64B packet
+// via WriteFusedPacket. Multi-producer-safe: other slice-groups' last blocks
 // may hit the same per-peer queue concurrently, so this uses the CAS-based
 // ReserveQueueSpace + ordered submitPacket (NOT the single-producer CAS-free
-// fast path). Lane p serves peer p; the whole warp must be active.
-template <class T> 
+// fast path). sub==0 of each peer group reserves/rings; the whole warp must
+// execute the barriers.
+template <class T>
 inline __device__ void SdmaBroadcastSliceWarp(const void* src, size_t dstOff, size_t sliceBytes,
                                               int myPe, int npes, int signalSlot, int qId) {
   auto* heapObj = shmem::GetGlobalGpuStatesPtr()->heapObj;
   const int numSdmaQ = static_cast<int>(heapObj->sdmaNumQueue);
-  const int peer = threadIdx.x % warpSize;
-  if (peer < npes && peer != myPe) {
-    auto& h = *static_cast<SdmaCollectiveHandle*>(
-        *(heapObj->deviceHandles_d + peer * numSdmaQ + qId));
-    constexpr size_t pkt = sizeof(SDMA_PKT_COPY_WITH_ATOMIC);
-    uint64_t offset = 0;
-    uint64_t base = h.ReserveQueueSpace(pkt, offset);  // CAS: multi-producer safe
-    if (offset) h.fillNops(base, offset);
-    auto* dst = reinterpret_cast<uint8_t*>(heapObj->peerPtrs[peer] + dstOff);
-    h.placeCopyAtomicPacketAt(
-        src, dst, sliceBytes,
-        reinterpret_cast<HSAuint64*>(heapObj->peerSignalPtrs[peer] + signalSlot), base + offset);
-    h.submitPacket(base, base + offset + pkt);
+  constexpr int W = warpSize;
+  const int lane = static_cast<int>(threadIdx.x) % W;
+  const int nWork = npes << 2;
+
+  for (int i = lane; i < nWork; i += W) {
+    const int peer = i >> 2, sub = i & 3, leader = lane & ~3;
+    const bool active = peer != myPe;
+
+    uint64_t base = 0, pktStart = 0;
+    SdmaCollectiveHandle* shared = nullptr;
+    uint32_t* queueBuf = nullptr;
+    if (active && sub == 0) {
+      shared = static_cast<SdmaCollectiveHandle*>(
+          *(heapObj->deviceHandles_d + peer * numSdmaQ + qId));
+      uint64_t offset = 0;
+      base = shared->ReserveQueueSpace(kSDMACopyAtomicPktSize, offset);  // CAS: multi-producer safe
+      if (offset) shared->fillNops(base, static_cast<uint32_t>(offset));
+      pktStart = base + offset;
+      queueBuf = shared->queueBuf;
+    }
+    pktStart = broadcast_warp(pktStart, leader);
+    queueBuf = broadcast_warp(queueBuf, leader);
+
+    if (active) {
+      auto* dst = reinterpret_cast<uint8_t*>(heapObj->peerPtrs[peer] + dstOff);
+      auto* signal = heapObj->peerSignalPtrs[peer] + signalSlot;
+      const uint64_t Xbase =
+          anvil::SdmaQueueDeviceHandle::WrapIntoRing(pktStart) / sizeof(uint32_t);
+      WriteFusedPacket(sub, src, dst, sliceBytes, signal, queueBuf + Xbase);
+    }
+
+    anvil::PublishStores();
+    __builtin_amdgcn_wave_barrier();
+
+    if (active && sub == 0) {
+      shared->submitPacket(base, pktStart + kSDMACopyAtomicPktSize);
+    }
   }
   __syncwarp();
 }
 
 // ---------------------------------------------------------------------------
 // Fused SDMA "push" scatter shared by the push collectives (reduce-scatter and
-// all-gather). Packet-strided: i = tid + k*blockDim.x maps to peer*S + slice,
-// one fused 64B copy+atomic per lane. S divides warpSize (1/2/4/8 | 32 or 64)
-// and blockDim.x is a multiple of warpSize, so a peer's S workers (and slice-0
-// submit) stay in the same warp — slice 0 reserves, shuffles base, every
-// active lane writes its ring slot, then slice 0 rings. No LDS / syncthreads.
+// all-gather). Packet-strided: i = tid + k*blockDim.x maps to peer, slice, and
+// a 16B quarter (sub = i&3). Four consecutive lanes write one fused 64B
+// copy+atomic via WriteFusedPacket (one b128 store each). G = S*4 threads per
+// peer (at most 32) divides warpSize, so a peer's workers and slice-0/sub-0
+// submit stay in the same warp — leader reserves, shuffles base, every active
+// lane writes its 16B, then the leader rings. No LDS / syncthreads.
 //
 // Each shard is split into S = 1<<logS slices. Lane (peer,slice) issues an SDMA
 // copy of slice `slice` from srcOf(peer) into peer's heap at byte offset
@@ -417,49 +434,49 @@ inline __device__ void SdmaBroadcastSliceWarp(const void* src, size_t dstOff, si
 // ---------------------------------------------------------------------------
 template <uint64_t ElemBytes = 1, class ActiveFn, class SrcFn, class DstOffFn>
 __device__ __forceinline__ void StartSdmaScatter(
-    int myPe, int npes, int logS, size_t chunkElems,
+    int npes, int logS, size_t chunkElems,
     ActiveFn activeOf, SrcFn srcOf, DstOffFn dstOffOf, int signalSlotBase = 0) {
 
   static_assert(ElemBytes > 0 && VecBytes % ElemBytes == 0,
                 "ElemBytes must divide VecBytes");
   constexpr size_t vecSize = VecBytes / ElemBytes;
-  const int S = 1 << logS, tid = static_cast<int>(threadIdx.x),
-            B = static_cast<int>(blockDim.x);
-  const size_t sliceLen = ((chunkElems >> logS) / vecSize) * vecSize;
   constexpr int W = warpSize;
-  // We submit S packets per peer (one fused packet is 64B wide)
-  // For coalesced stores we need 4 threads per packet.
-  // Hence, for S = 8, we need 32 threads to submit all packets for a peer.
-  // NOTE here we assume; WarpSize % S == 0 !
+  
+  const int S = 1 << logS, tid = static_cast<int>(threadIdx.x),
+            B = static_cast<int>(blockDim.x), G = S << 2;
+  // We submit S packets per peer (one fused packet is 64B wide).
+  // Four consecutive threads write one packet (one b128 each).
+  // Hence, for S = 8, we need 32 threads per peer.
+  // NOTE: warpSize % (S*4) == 0, so a peer never straddles a warp.
 
   auto* heapObj = shmem::GetGlobalGpuStatesPtr()->heapObj;
   const int numSdmaQ = static_cast<int>(heapObj->sdmaNumQueue);
+  const size_t sliceLen = ((chunkElems >> logS) / vecSize) * vecSize,
+          sliceBytes = sliceLen * ElemBytes,
+          lastBytes = (chunkElems - (sliceLen << logS) + sliceLen) * ElemBytes;
 
-  const size_t sliceBytes = sliceLen * ElemBytes;
-  const size_t lastBytes = (chunkElems - (sliceLen << logS) + sliceLen) * ElemBytes;
-  constexpr size_t packetSize = sizeof(SDMA_PKT_COPY_WITH_ATOMIC);
-
-  const int nWork = npes << logS, lane = tid % W;
+  const int nWork = npes * G, lane = tid % W;
   for (int i = tid; i < nWork; i += B) {
-    const int peer = i >> logS, slice = i & (S - 1), leader = lane & ~(S - 1);
+    const int peer = i >> (logS + 2), slice = (i >> 2) & (S - 1), sub = i & 3,
+              leader = lane & ~(G - 1);
     const bool active = activeOf(peer);
 
     uint64_t base = 0, pktStart = 0;
     SdmaCollectiveHandle* shared = nullptr;
-    if (active && slice == 0) {
+    uint32_t *queueBuf = nullptr;
+    if (active && slice == 0 && sub == 0) {
       shared = static_cast<SdmaCollectiveHandle*>(
           *(heapObj->deviceHandles_d + peer * numSdmaQ));
-      uint64_t offset = 0;
-      base = shared->ReserveQueueSpaceCASFree(packetSize * static_cast<size_t>(S), offset);
+      uint32_t offset = 0;
+      base = shared->ReserveQueueSpaceCASFree(kSDMACopyAtomicPktSize << logS, offset);
       if (offset) shared->fillNops(base, offset);
       pktStart = base + offset;
+      queueBuf = shared->queueBuf;
     }
-    pktStart = shfl_u64(pktStart, leader);
-    base = shfl_u64(base, leader);
+    pktStart = broadcast_warp(pktStart, leader);
+    queueBuf = broadcast_warp(queueBuf, leader);
 
     if (active) {
-      auto& h = *static_cast<SdmaCollectiveHandle*>(
-          *(heapObj->deviceHandles_d + peer * numSdmaQ));
       const size_t off = dstOffOf(peer);
       auto* s = srcOf(peer) + slice * sliceBytes;
       auto* d =
@@ -467,26 +484,19 @@ __device__ __forceinline__ void StartSdmaScatter(
       const size_t sz = (slice == S - 1) ? lastBytes : sliceBytes;
 
       auto* signal = heapObj->peerSignalPtrs[peer] + signalSlotBase + slice;
-      uint32_t dw[16];
-      WriteCopyPacket(dw, s, d, sz);  // copy: dw[0..6]
-      WriteAtomicInc32Packet(dw + 8, signal);    // atomic: dw[7..14]
       const uint64_t Xbase = anvil::SdmaQueueDeviceHandle::WrapIntoRing(
-                        pktStart + slice * packetSize) / sizeof(uint32_t);
-  #pragma unroll
-      for (int j = 0; j < 16; j += 4) {
-        const V128 v = {dw[j], dw[j + 1], dw[j + 2], dw[j + 3]};
-        StreamStore<EAgentScope, 16>(h.queueBuf + Xbase + j, v);
-      }
+                     pktStart + slice * kSDMACopyAtomicPktSize) / sizeof(uint32_t);
+      auto *outBasePtr = queueBuf + Xbase;
+      WriteFusedPacket(sub, s, d, sz, signal, outBasePtr);
     }
 
     anvil::PublishStores();
     __builtin_amdgcn_wave_barrier();
 
-    if (active && slice == 0) {
-      shared->submitPacket(base, pktStart + packetSize * static_cast<size_t>(S));
+    if (active && slice == 0 && sub == 0) {
+      shared->submitPacket(base, pktStart + (kSDMACopyAtomicPktSize << logS));
     }
   }
-  (void)myPe;
 }
 
 #endif  // __HIPCC__ || __HIP__

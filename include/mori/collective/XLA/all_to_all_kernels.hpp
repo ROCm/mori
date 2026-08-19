@@ -67,7 +67,7 @@ __global__ void AllToAllPushKernel(int myPe, int npes,
   const size_t heapBase = GetGlobalGpuStatesPtr()->heapBaseAddr;
   const size_t off = reinterpret_cast<uintptr_t>(pairs[myPe].dest) - heapBase;
   StartSdmaScatter(
-      myPe, npes, /*logS=*/0, chunkBytes,
+      npes, /*logS=*/0, chunkBytes,
       [](int) { return true; },
       [=](int peer) -> const uint8_t* {
         return reinterpret_cast<const uint8_t*>(pairs[peer].source);

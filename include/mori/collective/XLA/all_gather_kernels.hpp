@@ -63,7 +63,7 @@ __global__ void AllGatherPushKernel(int myPe, int npes, const void* __restrict__
   const size_t dstOff = reinterpret_cast<uintptr_t>(output) - heapBase +
                         myPe * chunkBytes;
   StartSdmaScatter(
-      myPe, npes, /*logS=*/0, chunkBytes,
+      npes, /*logS=*/0, chunkBytes,
       [](int) { return true; },
       [=](int) -> const uint8_t* { return reinterpret_cast<const uint8_t*>(input); },
       [=](int) -> size_t { return dstOff; });

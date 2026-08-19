@@ -303,7 +303,7 @@ __device__ __forceinline__ void ReduceScatterPushBody(
     const size_t dstBaseOff = reinterpret_cast<uintptr_t>(staging) - heapBase;
     const size_t chunkBytes = chunkElems * sizeof(T);
     StartSdmaScatter<sizeof(T)>(
-        myPe, npes, logS, chunkElems,
+        npes, logS, chunkElems,
         [=](int peer) { return peer != myPe; },
         [=](int peer) -> const uint8_t* {
           return reinterpret_cast<const uint8_t*>(input + peer * chunkElems);
