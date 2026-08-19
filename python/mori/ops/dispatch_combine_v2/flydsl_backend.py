@@ -118,6 +118,7 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
         self.token_dest_map = torch.full(
             (max_tok_per_rank * topk,), -1, dtype=torch.int32, device=device
         )
+        self.routing_dest_map = torch.full_like(self.token_dest_map, -1)
         self.dest_pe_counter = torch.zeros(
             cfg.world_size, dtype=torch.int32, device=device
         )

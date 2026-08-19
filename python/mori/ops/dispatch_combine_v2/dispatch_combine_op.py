@@ -695,13 +695,10 @@ class EpDispatchCombineOp:
             kern, dest_map = table[disp_spec], routing.disp_dest_tok_id_map
         else:
             kern = self._kernels.dispatch[disp_spec]
-            # return_routing hands the handle its own dest_map (filled -1 so unset
-            # (tok,k) slots read as null); a plain dispatch reuses the scratch one.
-            dest_map = (
-                torch.full_like(self.token_dest_map, -1)
-                if return_routing
-                else self.token_dest_map
-            )
+            if return_routing:
+                dest_map = self.routing_dest_map
+            else:
+                dest_map = self.token_dest_map
 
         kern(
             input=input,
