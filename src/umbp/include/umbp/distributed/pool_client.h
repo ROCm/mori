@@ -388,10 +388,16 @@ class PoolClient {
   std::deque<ReCacheJob> recache_queue_;
   std::mutex recache_mutex_;
 
-  // Serializes users of the caller-owned ranged scratch arena.  Only the remote
-  // half of a ranged operation takes it — keys served by this node's own medium
-  // never touch the arena and stay fully concurrent.
-  std::mutex ranged_scratch_mutex_;
+  // Serializes users of each caller-owned ranged scratch arena.  Only the remote
+  // half of a ranged operation takes one — keys served by this node's own medium
+  // never touch an arena and stay fully concurrent.
+  //
+  // Separate GET and PUT arenas each get their own mutex, so a remote ranged GET
+  // and a remote ranged PUT run concurrently instead of serializing on one lock
+  // — the load/offload overlap sglang's direct linker wants.  (Two same-kind ops
+  // still serialize on their arena's mutex.)
+  std::mutex ranged_get_scratch_mutex_;
+  std::mutex ranged_put_scratch_mutex_;
   std::condition_variable recache_cv_;
   std::thread recache_worker_;
   bool recache_stop_ = false;

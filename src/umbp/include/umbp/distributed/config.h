@@ -199,11 +199,20 @@ struct PoolClientConfig {
 
   size_t staging_buffer_size = 64ULL * 1024 * 1024;
 
-  // Caller-owned, RDMA-registered host arena for ranged I/O. DistributedClient
-  // owns the backing mapping and frees it only after PoolClient::Shutdown has
-  // deregistered the region. Direct PoolClient tests may provide their own.
-  void* ranged_scratch_buffer = nullptr;
-  size_t ranged_scratch_size = 0;
+  // Caller-owned, RDMA-registered host arenas for ranged I/O. DistributedClient
+  // owns the backing mappings and frees them only after PoolClient::Shutdown has
+  // deregistered the regions. Direct PoolClient tests may provide their own.
+  //
+  // Two separate arenas — one for remote ranged GET, one for remote ranged PUT
+  // — each under its own mutex in PoolClient, so a remote get and a remote put
+  // run concurrently instead of serializing on one lock (the load/offload
+  // overlap sglang's direct linker wants). Each must hold at least one whole
+  // object. Both zero keeps ranged remote I/O disabled with no host memory
+  // registered; SupportsRangedIO() requires both to be set.
+  void* ranged_get_scratch_buffer = nullptr;
+  size_t ranged_get_scratch_size = 0;
+  void* ranged_put_scratch_buffer = nullptr;
+  size_t ranged_put_scratch_size = 0;
 
   // SSD read-staging tuning (peer side).  More slots reduce NO_SLOT under large
   // concurrent prefetch batches, but shrink per-slot size (= staging_buffer_size
@@ -276,7 +285,8 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.master_config = dc.master_config;
   pc.io_engine = dc.io_engine;
   pc.staging_buffer_size = dc.staging_buffer_size;
-  pc.ranged_scratch_size = dc.ranged_scratch_size;
+  // The ranged scratch buffers/sizes are set by DistributedClient after it
+  // allocates and registers the two arenas (see DistributedClient ctor).
   pc.ssd_staging_buffer_size = dc.ssd_staging_buffer_size;
   pc.ssd_staging_buffer_slots = dc.ssd_staging_buffer_slots;
   pc.ssd_staging_use_hugepages = dc.ssd_staging_use_hugepages;
