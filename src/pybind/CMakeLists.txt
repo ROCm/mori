@@ -90,6 +90,9 @@ if(BUILD_XLA_FFI_OPS)
   endif()
 
   message(STATUS "XLA FFI include dir: ${XLA_FFI_INCLUDE_DIR}")
+  if(NOT EXISTS "${XLA_FFI_INCLUDE_DIR}/xla/ffi/api/ffi.h")
+    message(FATAL_ERROR "XLA_FFI_INCLUDE_DIR='${XLA_FFI_INCLUDE_DIR}' does not contain xla/ffi/api/ffi.h")
+  endif()
   target_include_directories(mori_pybinds PRIVATE ${XLA_FFI_INCLUDE_DIR})
 endif()
 
