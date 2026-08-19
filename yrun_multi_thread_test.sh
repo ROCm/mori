@@ -60,19 +60,15 @@ export RS_MODE=push
 export RS_LOG_PUSH_SLICES=2  # logS: S = 1<<2 = 4 slices
 export RS_MIN_SIGNAL_SLOTS_PER_DEV=2
 
-TORCH_LIBS=/usr/local/lib/python3.12/dist-packages/torch/lib
-# TORCH=$TORCH_LIBS/libtorch.so
-
 # this is go get rid of 'request to allocate mask for invalid number: Invalid argument'
 export LD_PRELOAD=/lib/x86_64-linux-gnu/libnuma.so.1 #:/lib/x86_64-linux-gnu/libibverbs.so.1
-# export LD_LIBRARY_PATH=$TORCH_LIBS:$LD_LIBRARY_PATH
 
 #mpirun --allow-run-as-root -np 2 ./build/examples/allgather_test $@
 NUM_PROCS=1
 NUM_GPUS_PER_PROCESS=4
 
-TEST_NAME=reduce_scatter_test
-#TEST_NAME=all_reduce_test
+#TEST_NAME=reduce_scatter_test
+TEST_NAME=all_reduce_test
 pkill -9 -c -f $TEST_NAME
 #rm -f allgather_test_uid.bin zz*.log
 

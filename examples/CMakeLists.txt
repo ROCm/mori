@@ -118,6 +118,9 @@ target_compile_options(reduce_scatter_test PRIVATE -Rpass-analysis=kernel-resour
 add_executable(all_gather_test collective/XLA/all_gather_test.cpp)
 target_link_libraries(all_gather_test mori_shmem hip::host hip::device)
 
+add_executable(collective_permute_test collective/XLA/collective_permute_test.cpp)
+target_link_libraries(collective_permute_test mori_shmem hip::host hip::device)
+
 add_executable(all_to_all_test collective/XLA/all_to_all_test.cpp)
 target_link_libraries(all_to_all_test mori_shmem hip::host hip::device)
 

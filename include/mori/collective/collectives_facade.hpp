@@ -69,6 +69,7 @@
 #include "mori/collective/XLA/all_gather_kernels.hpp"
 #include "mori/collective/XLA/all_reduce_kernels.hpp"
 #include "mori/collective/XLA/all_to_all_kernels.hpp"
+#include "mori/collective/XLA/collective_permute_kernels.hpp"
 #include "mori/collective/XLA/reduce_scatter_kernels.hpp"
 #endif  // MORI_KERNELS_IMPL
 
@@ -204,7 +205,7 @@ class CollectivesFacade {
   hipError_t RunRecv(void* recvBuf, size_t numBytes, int peer, hipStream_t stream);
 
   // Collective-permute: send my buffer to each target PE, recv from srcPe
-  // (srcPe < 0 means no source). Dummy no-op.
+  // (srcPe < 0 means no source). v1: dstPes.size() == 1, SDMA push.
   hipError_t RunCollectivePermute(const void* sendBuf, void* recvBuf, size_t numBytes,
                                   int srcPe, const std::vector<int>& dstPes,
                                   hipStream_t stream);
@@ -397,22 +398,33 @@ hipError_t CollectivesFacade::RunBarrier(hipStream_t stream) {
 hipError_t CollectivesFacade::RunSend(const void* /*sendBuf*/, size_t /*numBytes*/,
                                       int /*peer*/, hipStream_t /*stream*/) {
   // TODO: dummy placeholder; real P2P send push kernel goes here.
-  return hipSuccess;
+  return hipErrorNotSupported;
 }
 
 hipError_t CollectivesFacade::RunRecv(void* /*recvBuf*/, size_t /*numBytes*/,
                                       int /*peer*/, hipStream_t /*stream*/) {
   // TODO: dummy placeholder; real P2P recv kernel goes here.
-  return hipSuccess;
+  return hipErrorNotSupported;
 }
 
-hipError_t CollectivesFacade::RunCollectivePermute(const void* /*sendBuf*/,
-                                                   void* /*recvBuf*/,
-                                                   size_t /*numBytes*/, int /*srcPe*/,
-                                                   const std::vector<int>& /*dstPes*/,
-                                                   hipStream_t /*stream*/) {
-  // TODO: dummy placeholder; real collective-permute kernel goes here.
-  return hipSuccess;
+hipError_t CollectivesFacade::RunCollectivePermute(const void* sendBuf, void* recvBuf,
+                                                   size_t numBytes, int srcPe,
+                                                   const std::vector<int>& dstPes,
+                                                   hipStream_t stream) {
+  if (dstPes.size() != 1) {
+    FACADE_PRINTF("CollectivePermute: only dstPes.size()==1 is implemented");
+    return hipErrorNotSupported;
+  }
+  const int dstPe = dstPes[0];
+  if (dstPe < 0 || dstPe >= nPes_ || srcPe < -1 || srcPe >= nPes_) {
+    FACADE_PRINTF("CollectivePermute: dstPe=%d srcPe=%d out of range (nPes=%d)", dstPe, srcPe,
+                  nPes_);
+    return hipErrorInvalidValue;
+  }
+  constexpr int kThreads = 256;
+  CollectivePermutePushKernel<<<1, kThreads, 0, stream>>>(nPes_, dstPe, srcPe, sendBuf, recvBuf,
+                                                          numBytes);
+  return hipGetLastError();
 }
 
 hipError_t CollectivesFacade::RunQuiet(hipStream_t /*stream*/) {
