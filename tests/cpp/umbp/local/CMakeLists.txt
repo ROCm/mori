@@ -60,6 +60,11 @@ add_executable(test_ssd_tier test_ssd_tier.cpp)
 target_link_libraries(test_ssd_tier PRIVATE umbp_core)
 add_test(NAME test_ssd_tier COMMAND test_ssd_tier)
 
+add_executable(test_umbp_ssd_tier_ranges test_ssd_tier_ranges.cpp)
+target_link_libraries(test_umbp_ssd_tier_ranges PRIVATE umbp_core GTest::gtest_main)
+target_compile_features(test_umbp_ssd_tier_ranges PRIVATE cxx_std_17)
+add_test(NAME umbp_ssd_tier_ranges COMMAND test_umbp_ssd_tier_ranges)
+
 add_executable(test_segment_crc test_segment_crc.cpp)
 target_link_libraries(test_segment_crc PRIVATE umbp_core)
 add_test(NAME test_segment_crc COMMAND test_segment_crc)

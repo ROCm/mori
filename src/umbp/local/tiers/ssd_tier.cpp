@@ -29,13 +29,16 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <numeric>
 #include <stdexcept>
 #include <thread>
 #include <vector>
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/aligned_buffer.h"
+#include "umbp/common/device_copy.h"
 #include "umbp/common/parallel_for.h"
+#include "umbp/common/range_utils.h"
 #include "umbp/common/ssd_perf.h"
 #include "umbp/local/tiers/segment/segment_format.h"
 
@@ -671,6 +674,289 @@ std::vector<bool> SSDTier::BatchReadIntoPtr(const std::vector<std::string>& keys
   return ReadBatchIntoPtr(keys, dst_ptrs, sizes);
 }
 
+namespace {
+
+// One caller range to lift out of a run's bounce buffer once the read lands.
+// `device_id` is -1 for ordinary host memory; anything else means the caller
+// handed us GPU memory (the tree connector registers its device KV buffers over
+// IPC, so the resolved destination really is a device pointer) and the lift has
+// to be a hipMemcpy rather than a memcpy.
+struct BounceCopy {
+  void* dst = nullptr;
+  size_t bounce_offset = 0;
+  size_t size = 0;
+  int device_id = -1;
+};
+
+// One device read.  A run is a maximal set of ranges that are contiguous *in
+// the object*, which is the shape a layer-group load produces: consecutive
+// layers of one component sit next to each other in the stored object.
+// Collapsing them into a single pread is the whole reason ranged SSD beats
+// whole-object SSD -- it trades N device round trips for one read plus a host
+// memcpy, and on this tier a device round trip costs orders of magnitude more
+// than the memcpy does.
+struct RunRead {
+  size_t key_index = 0;
+  int fd = -1;
+  uint64_t io_offset = 0;
+  size_t io_size = 0;
+  void* io_dst = nullptr;
+  AlignedBuffer bounce;            // unused when reading straight into the caller
+  std::vector<BounceCopy> copies;  // empty when reading straight into the caller
+};
+
+}  // namespace
+
+std::vector<bool> SSDTier::ReadBatchRangesIntoPtr(
+    const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dst_ptrs,
+    const std::vector<std::vector<size_t>>& sizes,
+    const std::vector<std::vector<size_t>>& src_offsets) {
+  const size_t n = keys.size();
+  std::vector<bool> results(n, false);
+  if (n == 0 || !RangeBatchShapeValid(n, dst_ptrs, sizes, src_offsets)) return results;
+
+  const auto t_begin = ssdperf::Now();
+  double lock_ms = 0.0, plan_ms = 0.0, io_ms = 0.0, copy_ms = 0.0;
+
+  // What Phase 1 needs out of the index, so run planning can happen without mu_.
+  struct KeyLocation {
+    size_t key_index;
+    int fd;
+    uint64_t value_offset;
+    size_t object_size;
+  };
+  std::vector<KeyLocation> located;
+  located.reserve(n);
+
+  // Phase 1 (mu_ held): resolve every key to a segment fd + value offset.
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto t_locked = ssdperf::Now();
+    lock_ms = ssdperf::MsBetween(t_begin, t_locked);
+
+    // Follower: one refresh covers the whole batch, same as ReadBatchIntoPtr.
+    if (IsReadOnlyShared()) {
+      for (size_t i = 0; i < n; ++i) {
+        if (!sizes[i].empty() && !index_.FindKey(keys[i])) {
+          RefreshFromDiskLocked(false);
+          break;
+        }
+      }
+    }
+
+    for (size_t i = 0; i < n; ++i) {
+      if (sizes[i].empty()) continue;  // asked for nothing; stays false
+      auto* meta = index_.FindKey(keys[i]);
+      if (!meta) continue;
+      auto* seg = GetSegmentLocked(meta->segment_id);
+      if (!seg || seg->fd < 0) continue;
+      index_.TouchLRU(keys[i]);
+      located.push_back({i, seg->fd, meta->value_offset, meta->size});
+    }
+    plan_ms = ssdperf::MsSince(t_locked);
+  }
+
+  if (located.empty()) return results;
+
+  // Phase 2 (no lock): validate ranges and plan the runs.
+  const auto t_plan = ssdperf::Now();
+  std::vector<RunRead> runs;
+  std::vector<size_t> expected(n, 0);
+  std::vector<size_t> order;
+  for (const auto& loc : located) {
+    const size_t i = loc.key_index;
+    const size_t count = sizes[i].size();
+
+    bool valid = true;
+    for (size_t j = 0; j < count; ++j) {
+      if (sizes[i][j] == 0 ||
+          IsObjectRangeOverflow(src_offsets[i][j], sizes[i][j], loc.object_size)) {
+        valid = false;
+        break;
+      }
+    }
+    if (!valid) continue;  // a caller bug, reported as this key's failure only
+
+    order.resize(count);
+    std::iota(order.begin(), order.end(), size_t{0});
+    std::sort(order.begin(), order.end(),
+              [&](size_t a, size_t b) { return src_offsets[i][a] < src_offsets[i][b]; });
+
+    size_t start = 0;
+    while (start < count) {
+      // Extend while the next range begins exactly where this one ends.
+      // Overlapping ranges simply do not merge; they become separate reads.
+      size_t end = start + 1;
+      size_t span_end = src_offsets[i][order[start]] + sizes[i][order[start]];
+      while (end < count && src_offsets[i][order[end]] == span_end) {
+        span_end += sizes[i][order[end]];
+        ++end;
+      }
+
+      const uint64_t file_begin = loc.value_offset + src_offsets[i][order[start]];
+      const uint64_t file_end = loc.value_offset + span_end;
+      const size_t span = static_cast<size_t>(file_end - file_begin);
+      void* first_dst = reinterpret_cast<void*>(dst_ptrs[i][order[start]]);
+
+      // A device destination cannot receive a read() at all, so it always
+      // bounces through host memory.  Classification costs one
+      // hipPointerGetAttributes per range, the same toll the DRAM tier pays.
+      bool any_device = false;
+      for (size_t j = start; j < end; ++j) {
+        if (DetectPointerLocation(reinterpret_cast<const void*>(dst_ptrs[i][order[j]]))
+                .IsDevice()) {
+          any_device = true;
+          break;
+        }
+      }
+
+      RunRead run;
+      run.key_index = i;
+      run.fd = loc.fd;
+
+      // Straight into the caller's buffer when nothing forbids it: one host
+      // range, and (under O_DIRECT) an aligned file offset, buffer and length.
+      // Value offsets are aligned by construction, so only the range's own
+      // offset can break the file side.
+      const bool aligned_ok = !direct_io_ || ((file_begin % segment::kRecordAlign) == 0 &&
+                                              IsDirectIoCompatible(first_dst, span));
+      if (end - start == 1 && aligned_ok && !any_device) {
+        run.io_offset = file_begin;
+        run.io_size = span;
+        run.io_dst = first_dst;
+      } else {
+        // Bounce.  Under O_DIRECT widen to the enclosing aligned window; the
+        // value is padded to kRecordAlign on disk, so the widened read cannot
+        // escape this record.
+        uint64_t io_begin = file_begin;
+        size_t io_len = span;
+        if (direct_io_) {
+          io_begin = file_begin & ~(segment::kRecordAlign - 1);
+          io_len = static_cast<size_t>(segment::AlignUp(file_end - io_begin));
+        }
+        run.bounce.Resize(io_len);
+        run.io_offset = io_begin;
+        run.io_size = io_len;
+        run.io_dst = run.bounce.data();
+        run.copies.reserve(end - start);
+        for (size_t j = start; j < end; ++j) {
+          const size_t idx = order[j];
+          void* dst = reinterpret_cast<void*>(dst_ptrs[i][idx]);
+          const auto where = DetectPointerLocation(dst);
+          run.copies.push_back(
+              {dst, static_cast<size_t>(loc.value_offset + src_offsets[i][idx] - io_begin),
+               sizes[i][idx], where.IsDevice() ? where.device_id : -1});
+        }
+      }
+
+      runs.push_back(std::move(run));
+      ++expected[i];
+      start = end;
+    }
+  }
+  plan_ms += ssdperf::MsSince(t_plan);
+
+  if (runs.empty()) return results;
+
+  // Phase 3: issue every run as one batch, falling back per run if the driver
+  // rejects the batch as a whole.
+  const bool needs_io_lock = !io_driver_->Capabilities().thread_safe;
+  const bool use_batch = io_driver_->Capabilities().batch_read && runs.size() > 1;
+  const auto t_io = ssdperf::Now();
+  std::vector<char> run_ok(runs.size(), 0);
+  uint64_t io_bytes = 0;
+
+  auto read_one = [&](size_t j) {
+    const auto& run = runs[j];
+    IoStatus status;
+    if (needs_io_lock) {
+      std::lock_guard<std::mutex> io_lock(io_mu_);
+      status = io_driver_->ReadAt(run.fd, run.io_dst, run.io_size, run.io_offset);
+    } else {
+      status = io_driver_->ReadAt(run.fd, run.io_dst, run.io_size, run.io_offset);
+    }
+    run_ok[j] = status.ok() ? 1 : 0;
+    if (!status.ok()) RememberStatus(std::move(status));
+  };
+
+  if (use_batch) {
+    std::vector<IoReadOp> ops;
+    ops.reserve(runs.size());
+    for (const auto& run : runs) ops.push_back({run.fd, run.io_dst, run.io_size, run.io_offset});
+
+    IoStatus status;
+    if (needs_io_lock) {
+      std::lock_guard<std::mutex> io_lock(io_mu_);
+      status = io_driver_->ReadBatch(ops);
+    } else {
+      status = io_driver_->ReadBatch(ops);
+    }
+    if (status.ok()) {
+      std::fill(run_ok.begin(), run_ok.end(), 1);
+    } else {
+      RememberStatus(std::move(status));
+      for (size_t j = 0; j < runs.size(); ++j) read_one(j);
+    }
+  } else {
+    for (size_t j = 0; j < runs.size(); ++j) read_one(j);
+  }
+  io_ms = ssdperf::MsSince(t_io);
+  for (size_t j = 0; j < runs.size(); ++j) {
+    if (run_ok[j]) io_bytes += runs[j].io_size;
+  }
+
+  // Phase 4 (no lock): lift the bounced runs out to their caller buffers.
+  // Disjoint destinations, so this fans out across tier_io_threads.
+  const auto t_copy = ssdperf::Now();
+  ParallelFor(runs.size(), TierThreads(), [&](size_t j) {
+    if (!run_ok[j]) return;
+    auto& run = runs[j];
+    for (const auto& copy : run.copies) {
+      const void* src = run.bounce.data() + copy.bounce_offset;
+      if (copy.device_id < 0) {
+        std::memcpy(copy.dst, src, copy.size);
+        continue;
+      }
+      // One synchronous hipMemcpy per range.  The DRAM tier merges and pipelines
+      // these; here the device copy sits behind a device read that costs orders
+      // of magnitude more, so the simple form is not the bottleneck yet.
+      if (!DeviceCopy(copy.dst, src, copy.size, hipMemcpyHostToDevice, copy.device_id)) {
+        run_ok[j] = 0;  // distinct index per worker; no race
+        return;
+      }
+    }
+  });
+  copy_ms = ssdperf::MsSince(t_copy);
+
+  std::vector<size_t> done(n, 0);
+  for (size_t j = 0; j < runs.size(); ++j) {
+    if (run_ok[j]) ++done[runs[j].key_index];
+  }
+  uint64_t served_bytes = 0;
+  for (size_t i = 0; i < n; ++i) {
+    if (expected[i] == 0 || done[i] != expected[i]) continue;
+    results[i] = true;
+    for (size_t size : sizes[i]) served_bytes += size;
+  }
+
+  if (ssdperf::Enabled()) {
+    const double total_ms = lock_ms + plan_ms + io_ms + copy_ms;
+    MORI_UMBP_INFO(
+        "[SsdPerf/tier] RANGED_GET dir={} keys={} located={} runs={} served_bytes={} "
+        "read_bytes={} total_ms={:.3f} GB_s={:.2f} | mu_wait={:.3f}ms plan={:.3f}ms ({:.0f}%) "
+        "dev_read={:.3f}ms ({:.0f}%) bounce_copy={:.3f}ms ({:.0f}%) | dev_GB_s={:.2f} "
+        "amplification={:.2f}x batched={}",
+        dir_, keys.size(), located.size(), runs.size(), served_bytes, io_bytes, total_ms,
+        ssdperf::GbPerSec(served_bytes, total_ms), lock_ms, plan_ms,
+        ssdperf::Pct(plan_ms, total_ms), io_ms, ssdperf::Pct(io_ms, total_ms), copy_ms,
+        ssdperf::Pct(copy_ms, total_ms), ssdperf::GbPerSec(io_bytes, io_ms),
+        served_bytes ? static_cast<double>(io_bytes) / static_cast<double>(served_bytes) : 0.0,
+        use_batch);
+  }
+
+  return results;
+}
+
 bool SSDTier::Exists(const std::string& key) const {
   std::lock_guard<std::mutex> lock(mu_);
   if (index_.HasKey(key)) return true;
@@ -746,6 +1032,7 @@ TierCapabilities SSDTier::Capabilities() const {
   TierCapabilities caps;
   caps.batch_write = true;
   caps.batch_read = true;
+  caps.ranged_read = true;
   return caps;
 }
 

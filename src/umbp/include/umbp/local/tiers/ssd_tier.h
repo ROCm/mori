@@ -66,6 +66,20 @@ class SSDTier : public TierBackend {
   std::vector<bool> BatchReadIntoPtr(const std::vector<std::string>& keys,
                                      const std::vector<uintptr_t>& dst_ptrs,
                                      const std::vector<size_t>& sizes) override;
+  // Scattered sub-object reads: each key supplies several disjoint
+  // object-relative ranges, each with its own destination buffer.  The v3
+  // layout makes this cheap -- a value is one contiguous, alignment-anchored
+  // extent, so a range is just `value_offset + object_offset` handed to pread.
+  //
+  // CHECKSUMS ARE NOT VERIFIED HERE, whatever ssd.verify_crc says.  A record's
+  // CRC covers the whole value, so a partial read has nothing to check itself
+  // against; the alternative (per-block checksums) is a record-format change.
+  // Whole-object reads keep verifying, so this narrows the guarantee only for
+  // callers that opted into ranged I/O.
+  std::vector<bool> ReadBatchRangesIntoPtr(
+      const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dst_ptrs,
+      const std::vector<std::vector<size_t>>& sizes,
+      const std::vector<std::vector<size_t>>& src_offsets) override;
   bool Exists(const std::string& key) const override;
   bool Evict(const std::string& key) override;
   std::pair<size_t, size_t> Capacity() const override;
