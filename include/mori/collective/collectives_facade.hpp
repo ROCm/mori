@@ -284,14 +284,13 @@ hipError_t CollectivesFacade::reduceScatterImpl(const void* input_v, void* outpu
   int pushBlocks = std::max(pushSlices, (blocks / pushSlices) * pushSlices);
 
   if (mode_ == RsMode::kPull) {
-    // input is its own symmetric allocation, so peerPtrs[pe] is peer pe's input
-    // base. NPES is a compile-time template arg; dispatch on the real npes.
-    mori::application::SymmMemObjPtr srcObj =
-        mori::shmem::ShmemQueryMemObjPtr(const_cast<T*>(input));
+    // input is a symmetric-heap allocation; the kernel resolves peer pe's copy of
+    // it from device state (heapObj->peerPtrs[pe] + input's heap offset). NPES is a
+    // compile-time template arg; dispatch on the real npes.
     auto launch = [&](auto NPES_c) {
       ReduceScatterPullKernel<NumPullVecs, decltype(NPES_c)::value, ReduceOp>
-          <<<blocks, kThreads, 0, stream>>>(myPe_, srcObj, reinterpret_cast<ComputeT*>(output),
-                                            chunkElemsC);
+          <<<blocks, kThreads, 0, stream>>>(myPe_, reinterpret_cast<const ComputeT*>(input),
+                                            reinterpret_cast<ComputeT*>(output), chunkElemsC);
     };
     switch (nPes_) {
       case 2: launch(std::integral_constant<int, 2>{}); break;

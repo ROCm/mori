@@ -500,10 +500,12 @@ __device__ __forceinline__ void ReduceAllPeersGroup(SrcBaseFn srcBase, T* __rest
 //
 //   output[j] = REDUCE_p( input_p[ myPe*chunkElems + j ] )
 //
-// input_p's base is srcObj->peerPtrs[p] (the symmetric peer pointer); this PE's
-// shard within each peer starts at peerPtrs[p] + myPe*chunkElems. There is no
-// staging buffer and no cross-block flag handoff, so every block is independent
-// (no co-residency cap) and the kernel is a single fused grid-strided reduce.
+// input_p's base is resolved from GPU device state: peer p's copy of the local
+// `input` lives at heapObj->peerPtrs[p] + (input - heapBaseAddr) (its byte offset
+// within the symmetric heap); this PE's shard within each peer starts at that base
+// + myPe*chunkElems. There is no staging buffer and no cross-block flag handoff, so
+// every block is independent (no co-residency cap) and the kernel is a single fused
+// grid-strided reduce.
 //
 // The fast path uses ReduceAllPeersGroup: each group reduces M = NumVecs/NPES
 // output positions and issues all M*NPES remote loads up front, for maximum
@@ -517,7 +519,7 @@ __device__ __forceinline__ void ReduceAllPeersGroup(SrcBaseFn srcBase, T* __rest
 // ---------------------------------------------------------------------------
 template <int NumVecs, int NPES, class ReduceOp, class T = typename ReduceOp::Type>
 __global__ void ReduceScatterPullKernel(int myPe,
-                                        mori::application::SymmMemObjPtr srcObj,
+                                        const T* __restrict__ input,
                                         T* __restrict__ output, size_t chunkElems) {
   constexpr int vecSize = VecBytes / sizeof(T);
   constexpr int M = NumVecs / NPES;  // output positions per group (M >= 1 for NPES <= NumVecs)
@@ -525,11 +527,18 @@ __global__ void ReduceScatterPullKernel(int myPe,
   const size_t gstride = static_cast<size_t>(blockDim.x) * gridDim.x;
   const size_t totalVecs = chunkElems / vecSize;
   using AccType = typename AccumulatorType<T>::type;
-  
-  // Peer pe's contribution to my shard: base of peer pe's input + myPe*chunkElems.
+
+  // Resolve peer pe's input base from GPU device state (same scheme as the push
+  // body / shmem P2P kernels): peer pe's copy of `input` is at that peer's heap
+  // base plus input's byte offset within the local symmetric heap. Peer pe's
+  // contribution to my shard then starts at + myPe*chunkElems. peerPtrs[myPe] ==
+  // heapBaseAddr, so the self term resolves back to the local `input`.
+  auto* gs = GetGlobalGpuStatesPtr();
+  application::SymmMemObj* heapObj = gs->heapObj;
+  const size_t inOff = reinterpret_cast<uintptr_t>(input) - gs->heapBaseAddr;
   const size_t myOfs = static_cast<size_t>(myPe) * chunkElems;
-  auto srcBase = [srcObj, myOfs](int pe) -> const T* {
-    return reinterpret_cast<const T*>(srcObj->peerPtrs[pe]) + myOfs;
+  auto srcBase = [heapObj, inOff, myOfs](int pe) -> const T* {
+    return reinterpret_cast<const T*>(heapObj->peerPtrs[pe] + inOff) + myOfs;
   };
 
   // Fast path: M positions per group, all M*NPES loads issued up front.
