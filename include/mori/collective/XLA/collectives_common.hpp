@@ -382,12 +382,11 @@ inline __device__ void SdmaBroadcastSliceWarp(const void* src, size_t dstOff, si
 
 // ---------------------------------------------------------------------------
 // Fused SDMA "push" scatter shared by the push collectives (reduce-scatter and
-// all-gather). Warp 0 of the calling block posts; other warps return (no block
-// barrier). Packet-strided: i = peer*S + slice, one fused 64B copy+atomic per
-// lane. S divides warpSize (1/2/4/8 | 32 or 64), so a peer's group never
-// straddles a stride iteration — slice 0 reserves, shuffles base, every active
-// lane writes its ring slot, then slice 0 rings. npes*S only sets the iter
-// count (two iters at 16*8 on wave64).
+// all-gather). Packet-strided: i = tid + k*blockDim.x maps to peer*S + slice,
+// one fused 64B copy+atomic per lane. S divides warpSize (1/2/4/8 | 32 or 64)
+// and blockDim.x is a multiple of warpSize, so a peer's S workers (and slice-0
+// submit) stay in the same warp — slice 0 reserves, shuffles base, every
+// active lane writes its ring slot, then slice 0 rings. No LDS / syncthreads.
 //
 // Each shard is split into S = 1<<logS slices. Lane (peer,slice) issues an SDMA
 // copy of slice `slice` from srcOf(peer) into peer's heap at byte offset
@@ -416,39 +415,34 @@ inline __device__ void SdmaBroadcastSliceWarp(const void* src, size_t dstOff, si
 // so the address-based SDMA put can translate local->peer (offset from
 // heapBaseAddr).
 // ---------------------------------------------------------------------------
-template <class ActiveFn, class SrcFn, class DstOffFn>
+template <uint64_t ElemBytes = 1, class ActiveFn, class SrcFn, class DstOffFn>
 __device__ __forceinline__ void StartSdmaScatter(
-    int myPe, int npes, int logS, size_t chunkElems, size_t elemBytes,
+    int myPe, int npes, int logS, size_t chunkElems,
     ActiveFn activeOf, SrcFn srcOf, DstOffFn dstOffOf, int signalSlotBase = 0) {
 
-  const size_t vecSize = VecBytes / elemBytes;
-  const int S = 1 << logS;
+  static_assert(ElemBytes > 0 && VecBytes % ElemBytes == 0,
+                "ElemBytes must divide VecBytes");
+  constexpr size_t vecSize = VecBytes / ElemBytes;
+  const int S = 1 << logS, tid = static_cast<int>(threadIdx.x),
+            B = static_cast<int>(blockDim.x);
   const size_t sliceLen = ((chunkElems >> logS) / vecSize) * vecSize;
-  const int tid = static_cast<int>(threadIdx.x);
   constexpr int W = warpSize;
-  if (tid >= W) return;
-#if BREAK_ON_RETRIES
-  if (W % S != 0) __builtin_trap();
-#endif
+  // We submit S packets per peer (one fused packet is 64B wide)
+  // For coalesced stores we need 4 threads per packet.
+  // Hence, for S = 8, we need 32 threads to submit all packets for a peer.
+  // NOTE here we assume; WarpSize % S == 0 !
 
   auto* heapObj = shmem::GetGlobalGpuStatesPtr()->heapObj;
   const int numSdmaQ = static_cast<int>(heapObj->sdmaNumQueue);
 
-  const size_t sliceBytes = sliceLen * elemBytes;
-  const size_t lastBytes = (chunkElems - (sliceLen << logS) + sliceLen) * elemBytes;
-
+  const size_t sliceBytes = sliceLen * ElemBytes;
+  const size_t lastBytes = (chunkElems - (sliceLen << logS) + sliceLen) * ElemBytes;
   constexpr size_t packetSize = sizeof(SDMA_PKT_COPY_WITH_ATOMIC);
-  const int nWork = npes * S;
-  const int nIters = (nWork + W - 1) / W;
-  const int lane = tid;
 
-  for (int iter = 0; iter < nIters; ++iter) {
-    const int i = lane + iter * W;
-    const int peer = i >> logS;
-    const int slice = i & (S - 1);
-    const bool valid = i < nWork;
-    const bool active = valid && activeOf(peer);
-    const int leader = lane & ~(S - 1);
+  const int nWork = npes << logS, lane = tid % W;
+  for (int i = tid; i < nWork; i += B) {
+    const int peer = i >> logS, slice = i & (S - 1), leader = lane & ~(S - 1);
+    const bool active = activeOf(peer);
 
     uint64_t base = 0, pktStart = 0;
     SdmaCollectiveHandle* shared = nullptr;
