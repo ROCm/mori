@@ -170,7 +170,14 @@ std::vector<bool> StandaloneClient::BatchPut(const std::vector<std::string>& key
     for (size_t j = 0; j < wkeys.size(); ++j) {
       if (!wres[j]) continue;
       size_t i = wmap[j];
-      index_.Insert(keys[i], {StorageTier::CPU_DRAM, 0, sizes[i]});
+      // A batch larger than the DRAM tier demotes its own earlier keys while it
+      // runs, and the manager records LOCAL_SSD for them in this same index.
+      // Stamping CPU_DRAM unconditionally would erase that, leaving every later
+      // read to miss on DRAM and take the slow fallback -- so only claim DRAM
+      // for keys the write path did not already place.
+      if (!index_.Lookup(keys[i]).has_value()) {
+        index_.Insert(keys[i], {StorageTier::CPU_DRAM, 0, sizes[i]});
+      }
       results[i] = true;
     }
   }
@@ -226,7 +233,10 @@ std::vector<bool> StandaloneClient::BatchPutRanges(
     for (size_t j = 0; j < write_map.size(); ++j) {
       if (j >= write_results.size() || !write_results[j]) continue;
       const size_t i = write_map[j];
-      index_.Insert(keys[i], {StorageTier::CPU_DRAM, 0, object_sizes[i]});
+      // Same reason as BatchPut: a batch that outgrows DRAM demotes its own
+      // earlier keys mid-flight, and that placement must not be overwritten.
+      if (!index_.Lookup(keys[i]).has_value())
+        index_.Insert(keys[i], {StorageTier::CPU_DRAM, 0, object_sizes[i]});
       results[i] = true;
     }
   }
