@@ -49,7 +49,20 @@ export UMBP_SSD_DURABILITY=strict    # ~free once direct I/O is on
 export UMBP_SSD_READ_LEASE_MS=30000
 export UMBP_DRAM_USE_HUGEPAGES=1
 export UMBP_DISTRIBUTED_SSD_STAGING_USE_HUGEPAGES=1
+
+# Only if the engine issues ranged (sub-object) I/O -- the SGLang tree
+# connector does.  Zero is the default and turns the feature off, and on a
+# pure-SSD deployment every node is SSD, so leaving it unset costs ranged I/O
+# cluster-wide.  Size it above the largest object a remote ranged batch moves.
+export UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES=268435456
 ```
+
+Ranged I/O on an SSD medium used to be refused outright regardless of this
+variable; that exclusion is gone. Note what it does and does not buy: a ranged
+**put** runs at full speed, while a ranged **get** still reads the whole object
+off the drive and saves only the final copy into the caller's buffers, because
+a resolve stages the object before the requested ranges are known. See
+[design-ssd-ranged-io.md](design-ssd-ranged-io.md).
 
 Deliberately **not** in that list: `UMBP_SSD_TIMING=1`. It is a diagnostic, not a
 production setting — it prints several `[SsdPerf/*]` lines per batch, which on a

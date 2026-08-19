@@ -206,8 +206,22 @@ target_link_libraries(
           gtest_main)
 add_test(NAME umbp_pool_client_ranges COMMAND test_umbp_pool_client_ranges)
 
+# test_umbp_ssd_ranged_io — ranged multi-buffer I/O on an SSD-medium node
+# (doc/design-ssd-ranged-io.md, D0): the capability flag now turning on the
+# arena alone, plus local and remote ranged put/get against an SSD-only peer.
+add_executable(test_umbp_ssd_ranged_io test_ssd_ranged_io.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_ssd_ranged_io PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_ssd_ranged_io
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+add_test(NAME umbp_ssd_ranged_io COMMAND test_umbp_ssd_ranged_io)
+
 set_tests_properties(umbp_cross_node_smoke umbp_pool_client_batch_put
                      umbp_medium_selection umbp_pool_client_ranges
+                     umbp_ssd_ranged_io
                      PROPERTIES LABELS "integration")
 
 # --------------------------------------------------------------------------
