@@ -230,6 +230,9 @@ def make_dispatch_tdm(
     # peers are split across the warps that exist. mori measured the split to be
     # a loss at small batches (the sub-runs get shorter than a TDM row), where
     # the metadata is short enough for one warp per peer to hide anyway.
+    # HIP's adaptive tokens-per-warp collapse is left for a follow-up: a runtime
+    # peer_split in this FlyDSL port moved the META trip count into a dynamic
+    # range and regressed mid-size batches.
     peer_split = max(1, warp_num_per_block // npes) if npes else 1
     meta_runs = npes * peer_split
 
@@ -640,14 +643,22 @@ def make_dispatch_tdm(
             local_recv_num = fx.Int64(window.lsa_ptr(my_lsa_rank, off_recv_num))
             for dest_pe in range(lane, npes, WAVE):
                 if global_warp_id == 0:
-                    P.spin_until_eq_i32(fx.Int64(addr_disp_bar), block_num)
-                    buffer_store(arith.constant(0), rsrc_disp_bar, 0)
-                    signal_value = (
-                        buffer_load(rsrc_dest_ctr, dest_pe, vec_width=1, dtype=T.i32()) + 1
-                    )
+                    # These two waits are independent: whether the peer has
+                    # drained last launch's mailbox has nothing to do with
+                    # whether this rank's slowest block has finished. Issuing
+                    # the uncached slot wait while the grid barrier is still
+                    # spinning hides its fabric RTT (HIP A/B +8.7% @512).
                     peer_recv_num = fx.Int64(window.lsa_ptr(dest_pe, off_recv_num))
                     recv_num_remote_addr = peer_recv_num + fx.Int64(rank) * fx.Int64(4)
                     P.spin_until_eq_i32(recv_num_remote_addr, 0)
+                    P.spin_until_eq_i32(fx.Int64(addr_disp_bar), block_num)
+                    buffer_store(arith.constant(0), rsrc_disp_bar, 0)
+                    # Counter load stays AFTER the grid barrier: this is the
+                    # sum every block contributed to.
+                    signal_value = (
+                        buffer_load(rsrc_dest_ctr, dest_pe, vec_width=1, dtype=T.i32())
+                        + 1
+                    )
                     P.store_i32_system(
                         recv_num_remote_addr, arith.constant(0), signal_value
                     )

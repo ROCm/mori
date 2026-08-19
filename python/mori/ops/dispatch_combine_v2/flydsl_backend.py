@@ -211,7 +211,8 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
             # per-warp LDS, so it can name a warp width this one cannot build
             # (32 warps of a 7168-wide bf16 tile want 448 KB of a 320 KB budget).
             # Clamp the width, keep the tuned block count, and keep the caller's
-            # spec as the key so the runtime pick still resolves.
+            # spec as the key so the runtime pick still resolves. When the config
+            # already pulled a TDM schedule (warps <= max_warps), this is a no-op.
             max_warps = tdm_max_warps(
                 hidden_dim=hidden_dim,
                 hidden_elem_size=elem_size,

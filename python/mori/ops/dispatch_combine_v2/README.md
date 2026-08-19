@@ -26,8 +26,9 @@ The flydsl backend's dispatch leg has two payload transports, chosen with
   roughly 3x the bandwidth once the payload dominates: at hidden 7168 EP4,
   32768 tokens, 540 GB/s -> 1690 (3.1x); on perfectly balanced routing, 630 ->
   1640 (2.6x). Below about a thousand tokens both sit on the same cross-rank
-  rendezvous floor and the fixed cost puts TDM ~10% behind, so `auto` resolves
-  to vector; `MORI_EP_DISPATCH_TDM=1` flips that default for A/B runs.
+  rendezvous floor; with the TDM-specific launch schedule (128x8 through 2048
+  tokens, then 64x16/128x16) the remaining gap to HIP is ~10% there, so `auto`
+  resolves to vector; `MORI_EP_DISPATCH_TDM=1` flips that default for A/B runs.
 
 Supported token dtypes: **bf16**, **f32**, **fp8** (gather-only; OCP e4m3 on
 gfx950, e4m3**fnuz** max 240 on gfx942) and **fp4** (e2m1, gather-only,

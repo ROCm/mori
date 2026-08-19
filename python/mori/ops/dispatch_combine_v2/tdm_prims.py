@@ -131,6 +131,13 @@ def tdm_run_shape(n_elems):
     floor at 4 bytes). ``dim0 * dim1 == n_elems`` exactly, so the descriptor
     footprint is the run and cannot spill past it.
 
+    When no 128B-legal tile exists, fall back to the narrowest legal-by-
+    construction shape ``(n_elems/2, 2)`` for even ``n_elems >= 4`` -- the same
+    branch as C++ ``TdmWholeOrSplit128``. The 128B floor is a bandwidth result,
+    not a legality one: a metadata field at 512 tokens is 64B..512B, so half
+    bandwidth costs nothing measurable while leaving TDM costs the whole
+    pipeline (HIP A/B +10% @512).
+
     Returns None when no such split exists. The caller must then move the run
     some other way rather than falling back to ``dim1 == 1``: a 1xN tile is not
     a shape the engine accepts here (see the module docstring).
@@ -138,6 +145,8 @@ def tdm_run_shape(n_elems):
     for d1 in (8, 4, 2):
         if n_elems % d1 == 0 and n_elems // d1 >= _TDM_ROW_ELEMS_4B:
             return n_elems // d1, d1
+    if n_elems >= 4 and (n_elems & 1) == 0:
+        return n_elems // 2, 2
     return None
 
 

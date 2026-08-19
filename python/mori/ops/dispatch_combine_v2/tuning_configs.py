@@ -208,6 +208,36 @@ _GFX1250_SCHED_BF16_EP8 = (
     (1024, 128, 32, 64, 8),  # <=1024: disp warp 32, comb 64/8
     (None, 128, 32, 64, 16),  # >1024 (peak)
 )
+# FlyDSL TDM transport (dispatch_transport='tdm'). Dispatch columns are from a
+# FlyDSL-TDM geometry sweep on gfx1250 EP4 hidden 7168 (same machine as the HIP
+# table), not a straight copy of hip_tuning_configs: the FlyDSL port still pays
+# more fixed cost per block, so mid-size batches want more blocks than HIP.
+# Combine columns stay on the flydsl vector table (combine is still vector).
+#   ct      64x8  128x8  64x16 128x16     (dispatch us, graph, topk6)
+#   64      50.0   49.8   57.6   56.6
+#   512     53.3   53.2   63.5   62.5
+#   1024    73.2   65.5   72.5   72.1
+#   2048   108.8   91.8  113.3   99.6
+#   4096   187.3  157.6  155.6  161.2
+_GFX1250_SCHED_BF16_T6_TDM = (
+    (512, 128, 8, 64, 4),  # 128x8 wins 64..512
+    (2048, 128, 8, 128, 8),  # 128x8 still best through 2048
+    (4096, 64, 16, 256, 16),  # 64x16 edges out at 4096
+    (None, 128, 16, 256, 16),
+)
+_GFX1250_SCHED_BF16_TDM = (
+    (512, 128, 8, 64, 4),
+    (2048, 128, 8, 128, 8),
+    (4096, 64, 16, 128, 8),
+    (None, 128, 16, 192, 8),
+)
+# EP8 TDM: no dedicated sweep yet; reuse EP4 TDM dispatch columns with the EP8
+# flydsl combine schedule (combine stays vector).
+_GFX1250_SCHED_BF16_EP8_TDM = (
+    (512, 128, 8, 64, 4),
+    (2048, 128, 8, 64, 8),
+    (None, 128, 16, 64, 16),
+)
 # bf16-tuned (EP4 + EP8). fp8/fp4 fall back to the bf16 schedule until separately tuned.
 _GFX1250_TABLE = {
     (4, 7168, 8): {"bf16": _GFX1250_SCHED_BF16},
@@ -215,6 +245,13 @@ _GFX1250_TABLE = {
     (8, 7168, 8): {"bf16": _GFX1250_SCHED_BF16_EP8},  # cross-node / single-node EP8
     # V4-Pro topk=6 EP8: topk-independent, reuse the topk=8 schedule.
     (8, 7168, 6): {"bf16": _GFX1250_SCHED_BF16_EP8},
+}
+# Same shape keys as _GFX1250_TABLE, selected when dispatch_transport='tdm'.
+_GFX1250_TDM_TABLE = {
+    (4, 7168, 8): {"bf16": _GFX1250_SCHED_BF16_TDM},
+    (4, 7168, 6): {"bf16": _GFX1250_SCHED_BF16_T6_TDM},
+    (8, 7168, 8): {"bf16": _GFX1250_SCHED_BF16_EP8_TDM},
+    (8, 7168, 6): {"bf16": _GFX1250_SCHED_BF16_EP8_TDM},
 }
 
 _DEVICES = {
@@ -263,7 +300,7 @@ def _cu_scaled_default():
     )
 
 
-def lookup(world_size, hidden_dim, topk, dtype="fp8"):
+def lookup(world_size, hidden_dim, topk, dtype="fp8", dispatch_transport="vector"):
     """Return {dispatch_block_num, combine_block_num, warp_num_per_block,
     combine_warp_num_per_block, schedule} for the current GPU, shape, and dtype.
 
@@ -271,6 +308,10 @@ def lookup(world_size, hidden_dim, topk, dtype="fp8"):
     per-dtype schedule, because dtype sets the communication volume (fp4 = 0.5 B,
     fp8 = 1 B, bf16 = 2 B per element) and thus the best block/warp. It falls back
     to the "fp8" schedule, then to the device default, when a dtype isn't tuned.
+
+    `dispatch_transport` ("vector" | "tdm") selects the dispatch half of the
+    schedule. TDM is a different kernel with different optima (and a tighter LDS
+    budget), so it must not inherit the vector table's 128-256 x 32 grids.
 
     `schedule` (or None) is a per-token-count launch plan: a tuple of
     (max_tok_inclusive | None, disp_block, disp_warp, comb_block, comb_warp)
@@ -284,7 +325,16 @@ def lookup(world_size, hidden_dim, topk, dtype="fp8"):
     dev_default, dev_table = _DEVICES[key]
     base = dict(dev_default) if dev_default is not None else _cu_scaled_default()
     base.setdefault("schedule", None)
-    entry = dev_table.get((world_size, hidden_dim, topk))
+    shape = (world_size, hidden_dim, topk)
+    entry = dev_table.get(shape)
+    if dispatch_transport == "tdm" and key == "gfx1250":
+        tdm_entry = _GFX1250_TDM_TABLE.get(shape)
+        if tdm_entry:
+            entry = tdm_entry
+            # Single-shot fallback also names a geometry TDM can actually build
+            # (16 warps of a 7168-bf16 tile fit the 320 KB LDS budget; 32 do not).
+            base["dispatch_block_num"] = 64
+            base["warp_num_per_block"] = 16
     if entry:
         base["schedule"] = entry.get(dtype) or entry.get("fp8") or base["schedule"]
     return base

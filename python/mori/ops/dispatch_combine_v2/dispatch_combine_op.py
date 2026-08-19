@@ -251,6 +251,7 @@ class EpDispatchCombineConfig:
                     self.hidden_dim,
                     self.num_experts_per_token,
                     dtype=self.dtype_str,
+                    dispatch_transport=self.dispatch_transport,
                 )
             self.dispatch_block_num = t["dispatch_block_num"]
             self.combine_block_num = t["combine_block_num"]
@@ -313,6 +314,15 @@ class EpDispatchCombineConfig:
             kwargs["hidden_dim"],
             kwargs["num_experts_per_token"],
             dtype=dtype,
+            dispatch_transport=(
+                "tdm"
+                if kwargs.get("dispatch_transport") == "tdm"
+                or (
+                    kwargs.get("dispatch_transport", "auto") == "auto"
+                    and os.environ.get("MORI_EP_DISPATCH_TDM") == "1"
+                )
+                else "vector"
+            ),
         )
         for k, v in t.items():
             kwargs.setdefault(k, v)
