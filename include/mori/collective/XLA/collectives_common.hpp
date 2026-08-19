@@ -227,17 +227,17 @@ __device__ __forceinline__ void WriteFusedPacket(int lane,
   if (lane % 2 == 0) {
   // Header depends only on constants; a scalar-replaceable local keeps the
   // bitfield layout authoritative and constant-folds (no address taken).
-    int flag = lane >> 1;
     decltype(SDMA_PKT_COPY_LINEAR::HEADER_UNION) cp;
     cp.DW_0_DATA = 0;
     cp.op = SDMA_OP_COPY;
     cp.sub_op = SDMA_SUBOP_COPY_LINEAR;
-
     decltype(SDMA_PKT_ATOMIC::HEADER_UNION) inc;
     inc.DW_0_DATA = 0;
     inc.op = SDMA_OP_ATOMIC;
     inc.operation = SDMA_ATOMIC_ADD32;
-    dw[0] = flag == 0 ? 0 : inc.DW_0_DATA;
+
+    uint32_t flag = lane >> 1;
+    dw[0] = inc.DW_0_DATA & -flag;
     dw[1] = flag == 0 ? cp.DW_0_DATA : (uint32_t)((uintptr_t)signal);
     dw[2] = flag == 0 ? static_cast<uint32_t>(packetSize) - 1 : 
                         (uint32_t)((uintptr_t)signal >> 32);
@@ -291,10 +291,13 @@ struct SdmaCollectiveHandle : anvil::SdmaQueueDeviceHandle {
   // lane per distinct queue). Claim-then-wait like cco ReserveSlot: fetch_add
   // first, then poll rptr if occupancy exceeds the ring. Wrap pad is a rare
   // second fetch_add of `offset` (safe only because we are the sole producer).
-  // `this` is the shared device handle, so updating cachedHwReadIndex publishes
-  // the rptr hint for the next caller.
-  __device__ __forceinline__ uint64_t ReserveQueueSpaceCASFree(
-      const size_t size_in_bytes, uint32_t& offset) {
+  //
+  // cachedHwReadIndex is by-value, so a refreshed read index must be published
+  // back to `shared` (the handle this was copied from) or every caller re-reads
+  // rptr — an uncached SYSTEM load. The hint only moves forward to a value rptr
+  // actually had, so a later writer is harmless.
+  __device__ __forceinline__ uint64_t ReserveSingleProducer(
+      const size_t size_in_bytes, uint32_t& offset, SdmaCollectiveHandle* shared) {
     constexpr uint64_t q_size = anvil::SDMA_QUEUE_SIZE;
     uint64_t base =
         __hip_atomic_fetch_add(cachedWptr, size_in_bytes, __ATOMIC_RELAXED,
@@ -315,6 +318,8 @@ struct SdmaCollectiveHandle : anvil::SdmaQueueDeviceHandle {
         if (retries++ == anvil::MAX_RETRIES) __builtin_trap();
 #endif
       } while (end - cachedHwReadIndex > q_size);
+      __hip_atomic_store(&shared->cachedHwReadIndex, cachedHwReadIndex, __ATOMIC_RELAXED,
+                         __HIP_MEMORY_SCOPE_AGENT);
     }
     return base;
   }
@@ -348,9 +353,10 @@ static_assert(sizeof(SdmaCollectiveHandle) == sizeof(anvil::SdmaQueueDeviceHandl
 // via WriteFusedPacket. Multi-producer-safe: other slice-groups' last blocks
 // may hit the same per-peer queue concurrently, so this uses the CAS-based
 // ReserveQueueSpace + ordered submitPacket (NOT the single-producer CAS-free
-// fast path). sub==0 of each peer group reserves/rings; the whole warp must
-// execute the barriers.
-template <class T>
+// fast path). The leader copies the handle (VGPR pointer fields for fillNops /
+// submitPacket) and writes cachedHwReadIndex back if CanWriteUpto refreshed it.
+// sub==0 of each peer group reserves/rings; the whole warp must execute the
+// barriers.
 inline __device__ void SdmaBroadcastSliceWarp(const void* src, size_t dstOff, size_t sliceBytes,
                                               int myPe, int npes, int signalSlot, int qId) {
   auto* heapObj = shmem::GetGlobalGpuStatesPtr()->heapObj;
@@ -364,16 +370,22 @@ inline __device__ void SdmaBroadcastSliceWarp(const void* src, size_t dstOff, si
     const bool active = peer != myPe;
 
     uint64_t base = 0, pktStart = 0;
-    SdmaCollectiveHandle* shared = nullptr;
+    SdmaCollectiveHandle handle;
     uint32_t* queueBuf = nullptr;
     if (active && sub == 0) {
-      shared = static_cast<SdmaCollectiveHandle*>(
+      auto* shared = static_cast<SdmaCollectiveHandle*>(
           *(heapObj->deviceHandles_d + peer * numSdmaQ + qId));
+      handle = *shared;
       uint64_t offset = 0;
-      base = shared->ReserveQueueSpace(kSDMACopyAtomicPktSize, offset);  // CAS: multi-producer safe
-      if (offset) shared->fillNops(base, static_cast<uint32_t>(offset));
+      const uint64_t hint = handle.cachedHwReadIndex;
+      base = handle.ReserveQueueSpace(kSDMACopyAtomicPktSize, offset);  // CAS: multi-producer safe
+      if (handle.cachedHwReadIndex != hint) {
+        __hip_atomic_store(&shared->cachedHwReadIndex, handle.cachedHwReadIndex,
+                           __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      }
+      if (offset) handle.fillNops(base, static_cast<uint32_t>(offset));
       pktStart = base + offset;
-      queueBuf = shared->queueBuf;
+      queueBuf = handle.queueBuf;
     }
     pktStart = broadcast_warp(pktStart, leader);
     queueBuf = broadcast_warp(queueBuf, leader);
@@ -390,7 +402,7 @@ inline __device__ void SdmaBroadcastSliceWarp(const void* src, size_t dstOff, si
     __builtin_amdgcn_wave_barrier();
 
     if (active && sub == 0) {
-      shared->submitPacket(base, pktStart + kSDMACopyAtomicPktSize);
+      handle.submitPacket(base, pktStart + kSDMACopyAtomicPktSize);
     }
   }
   __syncwarp();
@@ -461,17 +473,19 @@ __device__ __forceinline__ void StartSdmaScatter(
               leader = lane & ~(G - 1);
     const bool active = activeOf(peer);
 
-    uint64_t base = 0, pktStart = 0;
-    SdmaCollectiveHandle* shared = nullptr;
+    uint64_t pktBase = 0, pktStart = 0;
+    SdmaCollectiveHandle handle;
     uint32_t *queueBuf = nullptr;
     if (active && slice == 0 && sub == 0) {
-      shared = static_cast<SdmaCollectiveHandle*>(
+      auto* shared = static_cast<SdmaCollectiveHandle*>(
           *(heapObj->deviceHandles_d + peer * numSdmaQ));
+      handle = *shared;
       uint32_t offset = 0;
-      base = shared->ReserveQueueSpaceCASFree(kSDMACopyAtomicPktSize << logS, offset);
-      if (offset) shared->fillNops(base, offset);
-      pktStart = base + offset;
-      queueBuf = shared->queueBuf;
+      pktBase = handle.ReserveSingleProducer(
+                             kSDMACopyAtomicPktSize << logS, offset, shared);
+      if (offset) handle.fillNops(pktBase, offset);
+      pktStart = pktBase + offset;
+      queueBuf = handle.queueBuf;
     }
     pktStart = broadcast_warp(pktStart, leader);
     queueBuf = broadcast_warp(queueBuf, leader);
@@ -484,9 +498,9 @@ __device__ __forceinline__ void StartSdmaScatter(
       const size_t sz = (slice == S - 1) ? lastBytes : sliceBytes;
 
       auto* signal = heapObj->peerSignalPtrs[peer] + signalSlotBase + slice;
-      const uint64_t Xbase = anvil::SdmaQueueDeviceHandle::WrapIntoRing(
+      const uint64_t base = anvil::SdmaQueueDeviceHandle::WrapIntoRing(
                      pktStart + slice * kSDMACopyAtomicPktSize) / sizeof(uint32_t);
-      auto *outBasePtr = queueBuf + Xbase;
+      auto *outBasePtr = queueBuf + base;
       WriteFusedPacket(sub, s, d, sz, signal, outBasePtr);
     }
 
@@ -494,7 +508,7 @@ __device__ __forceinline__ void StartSdmaScatter(
     __builtin_amdgcn_wave_barrier();
 
     if (active && slice == 0 && sub == 0) {
-      shared->submitPacket(base, pktStart + (kSDMACopyAtomicPktSize << logS));
+      handle.submitPacket(pktBase, pktStart + (kSDMACopyAtomicPktSize << logS));
     }
   }
 }

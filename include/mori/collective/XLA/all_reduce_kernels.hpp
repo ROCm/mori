@@ -140,7 +140,6 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
       heapObj->signalPtrs[g] = 0;   // reset slice g's reduce-scatter counter
       groupCounters[g] = 0;         // reset group g's local counter
     }
-    const int numSdmaQ = static_cast<int>(heapObj->sdmaNumQueue);
     // Destination slot is myPe on every peer, so the byte offset is constant; the
     // source is my reduced slice (same for all peers). Self already holds it.
     const size_t heapBase = GetGlobalGpuStatesPtr()->heapBaseAddr;
@@ -150,9 +149,10 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
     // DEDICATED per-slice broadcast counter signalPtrs[kBcastSlot+g]. Groups spread
     // across queues (qId = g % numSdmaQ) to reduce contention; the CAS reserve keeps
     // it correct even when two groups share a queue.
+    //const int numSdmaQ = static_cast<int>(heapObj->sdmaNumQueue);
     if (threadIdx.x < warpSize) {
-      SdmaBroadcastSliceWarp<T>(myShard + sOfs, dstOff, sCnt * sizeof(T), myPe, npes,
-                                kBcastSlot + static_cast<int>(g), /*qId=*/g % numSdmaQ);
+      SdmaBroadcastSliceWarp(myShard + sOfs, dstOff, sCnt * sizeof(T), myPe, npes,
+                                kBcastSlot + static_cast<int>(g), /*qId=*/0);
     }
     if (threadIdx.x == 0) {
       // Wait for every peer's copy of slice g to land in my output[myPe] slice.
