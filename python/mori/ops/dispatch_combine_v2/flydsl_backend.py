@@ -42,7 +42,6 @@ from .intranode_kernels import (
 from .intranode_kernels_tdm import (
     make_dispatch_tdm,
     tdm_max_warps,
-    tdm_stage_capacity,
 )
 from .dispatch_combine_op import (  # noqa: F401
     _DT,
@@ -54,6 +53,28 @@ from .dispatch_combine_op import (  # noqa: F401
     KernelSet,
 )
 from .symm_arena import SymmArena  # noqa: F401
+
+_TDM_STAGE_POOLS = {}
+
+
+def _tdm_stage_pool(device, npes, stg_cap, topk):
+    """Process-wide destTokId staging SoA, reused across op instances.
+
+    HIP keeps these as ``__device__`` BSS; FlyDSL cannot emit that, so one
+    ``torch.empty`` trio per (device, npes, cap, topk) is the equivalent.
+    """
+    key = (torch.cuda.current_device(), int(npes), int(stg_cap), int(topk))
+    hit = _TDM_STAGE_POOLS.get(key)
+    if hit is not None:
+        return hit
+    slots = npes * stg_cap
+    pool = (
+        torch.empty(slots * topk, dtype=torch.int32, device=device),
+        torch.empty(slots * topk, dtype=torch.int32, device=device),
+        torch.empty(slots, dtype=torch.int32, device=device),
+    )
+    _TDM_STAGE_POOLS[key] = pool
+    return pool
 
 
 class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
@@ -193,11 +214,9 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
         }
         self._dispatch_replay_variants_raw = {}  # lazily compiled per (block, warp)
 
-        # TDM transport: the same kwargs minus the knobs it does not implement,
-        # plus its own staging pool. FINALIZE gathers each route's metadata into
-        # a (block, peer)-contiguous run there so META can ship it in bulk; the
-        # pool is sized for the widest precompiled geometry, since a narrower
-        # grid only ever addresses a prefix of it.
+        # TDM transport: destTokId-ordered staging SoA (HIP _cusplit_stg*),
+        # sized to recv_cap so a block's reserved run is a contiguous TDM source.
+        # The pool is process-wide: geometry only changes which prefix is live.
         self._dispatch_tdm_variants = {}
         self._tdm_stage = None
         if cfg.dispatch_transport == "tdm":
@@ -219,20 +238,8 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                 npes=cfg.world_size,
             )
             tdm_geom = {(b, w): (b, min(w, max_warps)) for (b, w) in dispatch_specs}
-            slots = max(
-                tdm_stage_capacity(
-                    npes=cfg.world_size,
-                    experts_per_token=topk,
-                    max_tok_per_rank=max_tok_per_rank,
-                    block_num=b,
-                    warp_num_per_block=w,
-                )[1]
-                for (b, w) in tdm_geom.values()
-            )
-            self._tdm_stage = (
-                torch.empty(slots * topk, dtype=torch.int32, device=device),  # indices
-                torch.empty(slots * topk, dtype=torch.int32, device=device),  # weights
-                torch.empty(slots, dtype=torch.int32, device=device),  # srcmap
+            self._tdm_stage = _tdm_stage_pool(
+                device, cfg.world_size, recv_cap, topk
             )
             built = {}
             for spec, geom in tdm_geom.items():
