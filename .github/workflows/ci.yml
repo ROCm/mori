@@ -126,7 +126,7 @@ jobs:
           PORT=29130
           COMMON="--op-type write --mem-type gpu --all \
             --sweep-start-size 1048576 --sweep-max-size 33554432 --sweep-step 1048576 \
-            --num-qp-per-transfer 4 --batch-contiguous --target-dev-offset 0 \
+            --num-qp-per-transfer 4 --batch-contiguous \
             --num-initiator-dev 1 --num-target-dev 1 \
             --warmup-iters 10 --log-level info"
           for BATCH in 1 64; do
@@ -135,9 +135,11 @@ jobs:
             echo "=== C++ bench_engine GPU write sweep, batch=$BATCH, iters=$ITERS, port=$PORT ===" | tee -a "$RESULTS"
             ARGS="$COMMON --transfer-batch-size $BATCH --iters $ITERS"
             R1="cd $GITHUB_WORKSPACE && MORI_DISABLE_AUTO_XGMI=1 $LDP $BIN \
-              --rank 1 --master-ip $NODE1_HOST --self-ip $NODE2_HOST --port $PORT $ARGS"
+              --rank 1 --master-ip $NODE1_HOST --self-ip $NODE2_HOST --port $PORT \
+              --target-dev-offset 0 $ARGS"
             R0="cd $GITHUB_WORKSPACE && MORI_DISABLE_AUTO_XGMI=1 $LDP $BIN \
-              --rank 0 --master-ip $NODE1_HOST --self-ip $NODE1_HOST --port $PORT $ARGS"
+              --rank 0 --master-ip $NODE1_HOST --self-ip $NODE1_HOST --port $PORT \
+              --target-dev-offset 0 $ARGS"
             ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
               "$CT exec $CONTAINER bash -c \"$R1\"" >> "$RESULTS" 2>&1 &
             $CT exec $CONTAINER bash -c "$R0" | tee -a "$RESULTS"
