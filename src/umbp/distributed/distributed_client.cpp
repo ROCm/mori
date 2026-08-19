@@ -91,6 +91,11 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
     ranged_get_scratch_handle_ = allocator.Alloc(dc.ranged_scratch_size, scratch_opts);
     ranged_put_scratch_handle_ = allocator.Alloc(dc.ranged_scratch_size, scratch_opts);
     if (!ranged_get_scratch_handle_.valid() || !ranged_put_scratch_handle_.valid()) {
+      // HostBufferHandle is not RAII and the destructor/Close() won't run when a
+      // constructor throws, so free whatever did allocate before bailing out
+      // (Free() is a no-op on an invalid handle).
+      allocator.Free(ranged_get_scratch_handle_);
+      allocator.Free(ranged_put_scratch_handle_);
       throw std::runtime_error("DistributedClient: memory allocation failed for ranged scratch");
     }
     ranged_get_scratch_ = ranged_get_scratch_handle_.ptr;
