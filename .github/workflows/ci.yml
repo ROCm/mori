@@ -128,10 +128,12 @@ jobs:
             --sweep-start-size 1048576 --sweep-max-size 33554432 --sweep-step 1048576 \
             --num-qp-per-transfer 4 --batch-contiguous --target-dev-offset 0 \
             --num-initiator-dev 1 --num-target-dev 1 \
-            --iters 128 --warmup-iters 10 --log-level info"
+            --warmup-iters 10 --log-level info"
           for BATCH in 1 64; do
-            echo "=== C++ bench_engine GPU write sweep, batch=$BATCH, port=$PORT ===" | tee -a "$RESULTS"
-            ARGS="$COMMON --transfer-batch-size $BATCH"
+            ITERS=128
+            if [ "$BATCH" -eq 1 ]; then ITERS=512; fi
+            echo "=== C++ bench_engine GPU write sweep, batch=$BATCH, iters=$ITERS, port=$PORT ===" | tee -a "$RESULTS"
+            ARGS="$COMMON --transfer-batch-size $BATCH --iters $ITERS"
             R1="cd $GITHUB_WORKSPACE && MORI_DISABLE_AUTO_XGMI=1 $LDP $BIN \
               --rank 1 --master-ip $NODE1_HOST --self-ip $NODE2_HOST --port $PORT $ARGS"
             R0="cd $GITHUB_WORKSPACE && MORI_DISABLE_AUTO_XGMI=1 $LDP $BIN \
