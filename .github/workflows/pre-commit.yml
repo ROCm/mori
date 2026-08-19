@@ -1,8 +1,10 @@
 name: pre-commit
 
 on:
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
+  # Disabled on the bench_engine perf CI branch; re-enable when merging back to upstream main.
+  # pull_request:
+  #   branches: [main]
 
 jobs:
   pre-commit:
