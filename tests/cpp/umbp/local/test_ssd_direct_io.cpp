@@ -27,6 +27,8 @@
 // it is meaningless.  These tests pin the correctness properties that make the
 // unbuffered path usable, not its speed.
 
+#include <unistd.h>
+
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -190,6 +192,41 @@ void test_round_trip(bool direct_io) {
   std::cout << "OK\n";
 }
 
+// LocateRecord must hand back an fd and offset that, pread'd directly, yield the
+// stored value — the contract GdsEngine relies on to hipFileRead a segment range
+// straight into GPU memory.
+void test_locate_record() {
+  std::cout << "test_locate_record... ";
+  const std::string dir = MakeDir("locate");
+  auto cfg = BaseConfig(dir, /*direct_io=*/false, /*verify_crc=*/true);
+  SSDTier tier(dir, cfg.capacity_bytes, cfg);
+
+  const std::string key = "k/locate";
+  const auto value = AlignedValue('L', 3);
+  CHECK(tier.Write(key, value.data(), value.size()));
+
+  auto loc = tier.LocateRecord(key);
+  CHECK(loc.has_value());
+  CHECK(loc->fd >= 0);
+  CHECK(loc->value_size == value.size());
+  CHECK(loc->readable_size == PaddedValueBytes(value.size()));
+  CHECK(loc->value_offset % kRecordAlign == 0);
+  CHECK(loc->direct_io == tier.direct_io_active());
+
+  // The offset/size must point at the real bytes: pread the fd ourselves and
+  // compare — exactly what a GDS read does, but on the CPU.
+  std::vector<char> got(loc->value_size, 0);
+  const ssize_t n = ::pread(loc->fd, got.data(), got.size(), static_cast<off_t>(loc->value_offset));
+  CHECK(n == static_cast<ssize_t>(got.size()));
+  CHECK(std::memcmp(got.data(), value.data(), value.size()) == 0);
+
+  // An unknown key has no location.
+  CHECK(!tier.LocateRecord("k/missing").has_value());
+
+  fs::remove_all(dir);
+  std::cout << "OK\n";
+}
+
 // verify_crc=0 must round-trip, and — the part that is easy to get wrong — a
 // store written with checksums off must stay readable by a tier with checksums
 // on.  Without the kFlagNoCrc marker every such key would read back as corrupt.
@@ -297,6 +334,7 @@ int main() {
   test_aligned_buffer();
   test_round_trip(/*direct_io=*/false);
   test_round_trip(/*direct_io=*/true);
+  test_locate_record();
   test_crc_disabled_round_trip();
   test_tier_threads_are_result_invariant();
   test_capacity_charges_padded_bytes();

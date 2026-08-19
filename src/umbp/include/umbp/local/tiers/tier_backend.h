@@ -38,6 +38,18 @@ struct TierCapabilities {
   bool batch_read = false;
 };
 
+// Physical location of a value inside a segment file, for a zero-copy reader
+// (GdsEngine) that DMAs the bytes itself with hipFileRead instead of asking the
+// tier to copy them.  Only the segment-file SSD tiers can answer; every other
+// tier reports "no stable file location".
+struct RecordLocation {
+  int fd = -1;                 // O_DIRECT segment descriptor
+  uint64_t value_offset = 0;   // 4 KiB-aligned start of the value in the file
+  uint64_t readable_size = 0;  // 4 KiB-aligned padded length safe to read
+  uint64_t value_size = 0;     // logical value length (<= readable_size)
+  bool direct_io = false;      // fd is O_DIRECT — a hipFile fastpath precondition
+};
+
 // Abstract base class for storage tier backends (DRAM, SSD, NVM, ...).
 // All tiers share a common interface for write/read/evict; tier-specific
 // extensions (e.g., DRAMTier::ReadPtr) live in the concrete subclass.
@@ -126,6 +138,15 @@ class TierBackend {
   // Return an opaque location identifier for a previously written key.
   // Callers prepend the store index before publishing to the Master.
   virtual std::optional<std::string> GetLocationId(const std::string& key) const;
+
+  // Physical location of |key|'s value for a zero-copy reader that DMAs it
+  // itself (GdsEngine).  Default: no stable file location — only the
+  // segment-file SSD tiers override it.  Read-only: acquires no lock the caller
+  // must hold and does not touch LRU, so a Resolve can call it without
+  // perturbing recency.
+  virtual std::optional<RecordLocation> LocateRecord(const std::string& /*key*/) const {
+    return std::nullopt;
+  }
 
   // Which StorageTier does this backend represent?
   StorageTier tier_id() const { return tier_id_; }

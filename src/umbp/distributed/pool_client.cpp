@@ -55,6 +55,9 @@
 #include "umbp/distributed/transfer/hbm_copy_engine.h"
 #include "umbp/distributed/transfer/local_copy_engine.h"
 #include "umbp/distributed/transfer/mori_io_engine.h"
+#ifdef UMBP_ENABLE_GDS
+#include "umbp/distributed/transfer/gds_engine.h"
+#endif
 #include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {
@@ -325,6 +328,12 @@ bool PoolClient::Init() {
   // call: everything that moves bytes still goes through transfer_engine_.
   hbm_engine_ = hbm.get();
   composite->AddEngine(std::move(hbm));
+#ifdef UMBP_ENABLE_GDS
+  // The file->GPU engine for SsdBackend's FileRefs.  It claims only (file,
+  // device) pairs, which no memory engine touches, so registration order is
+  // documentation.  Present only when the build found hipfile.
+  composite->AddEngine(std::make_unique<GdsEngine>());
+#endif
   if (!config_.io_engine.host.empty()) {
     mori::io::IOEngineConfig io_cfg;
     io_cfg.host = config_.io_engine.host;
@@ -804,8 +813,17 @@ PoolClient::GetAttemptOutcome PoolClient::ExecuteLocalGet(const std::string& key
       return GetAttemptOutcome::kRetry;
     }
     std::vector<TransferItem> items;
-    if (!BuildLocalPageTransfers(backend, resolved.pages, resolved.page_size, dst, size,
-                                 /*to_backend=*/false, &items)) {
+    if (resolved.file_ref.IsFile()) {
+      // Zero-copy GDS path: the backend published a file range, not a staged
+      // host page.  Read it straight into the caller's (device) buffer; the
+      // planner routes the (file, GPU) pair to GdsEngine.
+      TransferItem item;
+      item.src = resolved.file_ref;
+      item.dst = ClassifiedUserBytes(dst, size);
+      item.size = size;
+      items.push_back(std::move(item));
+    } else if (!BuildLocalPageTransfers(backend, resolved.pages, resolved.page_size, dst, size,
+                                        /*to_backend=*/false, &items)) {
       // This medium holds the key but cannot be read in-process (no published
       // endpoint for its buffers).  Route elsewhere rather than reporting a
       // miss, which would make the client exclude a node that does hold it.

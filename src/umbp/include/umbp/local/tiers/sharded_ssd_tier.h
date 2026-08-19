@@ -79,6 +79,7 @@ class ShardedSsdTier : public TierBackend {
   std::string GetLRUKey() const override;
   std::vector<std::string> GetLRUCandidates(size_t max_candidates) const override;
   std::optional<std::string> GetLocationId(const std::string& key) const override;
+  std::optional<RecordLocation> LocateRecord(const std::string& key) const override;
   bool Flush() override;
   void SetColdRead(bool enable) override;
 

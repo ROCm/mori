@@ -33,6 +33,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -44,6 +45,12 @@
 #include "umbp/distributed/peer/backend/ssd_backend.h"
 #include "umbp/distributed/transfer/composite_transfer_engine.h"
 #include "umbp/distributed/transfer/local_copy_engine.h"
+#ifdef UMBP_ENABLE_GDS
+#include <hip/hip_runtime.h>
+
+#include "umbp/distributed/transfer/gds_engine.h"
+#include "umbp/distributed/transfer/hbm_copy_engine.h"
+#endif
 
 namespace mori::umbp {
 namespace {
@@ -437,6 +444,95 @@ TEST_F(SsdBackendTest, ShutdownDeregistersTheArena) {
   backend->Shutdown();  // idempotent
   EXPECT_EQ(registrar_.deregistrations, 1);
 }
+
+#ifdef UMBP_ENABLE_GDS
+// End to end: with a GdsEngine in the transfer stack and an O_DIRECT-capable
+// filesystem, Resolve publishes a FileRef (not a staging page) and the engine
+// reads the segment range straight into GPU memory. Point TMPDIR at ext4/xfs
+// (e.g. /mnt/gds); skips without a GPU or where the filesystem rejects O_DIRECT.
+TEST(SsdBackendGds, ResolvePublishesFileRefAndReadsIntoDeviceMemory) {
+  // GDS is opt-in at runtime (default off).  Enable it for this test only and
+  // restore on every exit path (including GTEST_SKIP), so sibling staging tests
+  // in this binary keep their default-off behaviour.
+  struct GdsEnvGuard {
+    GdsEnvGuard() { ::setenv("UMBP_ENABLE_GDS", "1", /*overwrite=*/1); }
+    ~GdsEnvGuard() { ::unsetenv("UMBP_ENABLE_GDS"); }
+  } gds_env_guard;
+
+  int ndev = 0;
+  if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) GTEST_SKIP() << "no HIP device";
+
+  const auto dir = fs::temp_directory_path() / ("umbp_ssd_gds_" + std::to_string(::getpid()));
+  fs::remove_all(dir);
+
+  // A transfer stack that can move a file into GPU memory: the memory engines
+  // for the Put, the GdsEngine for the zero-copy Get.
+  CompositeTransferEngine composite;
+  composite.AddEngine(std::make_unique<LocalCopyEngine>());
+  composite.AddEngine(std::make_unique<HbmCopyEngine>());
+  composite.AddEngine(std::make_unique<GdsEngine>());
+
+  SsdBackend::Config cfg;
+  cfg.page_size = kPageSize;
+  cfg.staging_pages = 8;
+  cfg.ssd.enabled = true;
+  cfg.ssd.ssd.enabled = true;
+  cfg.ssd.ssd.storage_dir = dir.string();
+  cfg.ssd.ssd.capacity_bytes = 64ULL * 1024 * 1024;
+  cfg.ssd.ssd.io.backend = UMBPIoBackend::Posix;
+  SsdBackend backend(std::move(cfg));
+  ASSERT_TRUE(backend.Init(&composite));
+
+  // Put: allocate a staging page, move the payload in, commit (spills to SSD).
+  std::vector<char> payload(8192);
+  std::iota(payload.begin(), payload.end(), 3);
+  auto alloc = backend.BatchAllocate({AllocateRequest{"k/gds", payload.size()}});
+  ASSERT_EQ(1u, alloc.size());
+  ASSERT_EQ(AllocateOutcome::kSuccessAllocated, alloc[0].outcome);
+  {
+    TransferRef pool = backend.BufferRef(alloc[0].pages[0].buffer_index);
+    TransferItem in;
+    in.src = TransferRef::HostBytes(payload.data(), payload.size());
+    in.dst = pool;
+    in.dst_offset = static_cast<uint64_t>(alloc[0].pages[0].page_index) * kPageSize;
+    in.size = payload.size();
+    ASSERT_TRUE(composite.Transfer({in}, nullptr));
+  }
+  auto commit = backend.BatchCommit({CommitRequest{alloc[0].slot_id, "k/gds"}});
+  ASSERT_EQ(1u, commit.size());
+  ASSERT_TRUE(commit[0].success);
+
+  auto resolved = backend.BatchResolve({"k/gds"}, /*include_descs=*/false);
+  ASSERT_EQ(1u, resolved.size());
+  ASSERT_TRUE(resolved[0].found);
+  if (!resolved[0].file_ref.IsFile()) {
+    backend.Shutdown();
+    fs::remove_all(dir);
+    GTEST_SKIP() << "GDS branch inactive (filesystem rejects O_DIRECT?)";
+  }
+  EXPECT_EQ(resolved[0].size, payload.size());
+
+  // Read the file range straight into device memory through GdsEngine.
+  void* dbuf = nullptr;
+  ASSERT_EQ(hipSuccess, hipMalloc(&dbuf, payload.size()));
+  ASSERT_EQ(hipSuccess, hipMemset(dbuf, 0, payload.size()));
+  TransferItem out;
+  out.src = resolved[0].file_ref;
+  out.dst = TransferRef::HostBytes(dbuf, payload.size(), mori::io::MemoryLocationType::GPU, 0);
+  out.size = resolved[0].size;
+  std::vector<size_t> failed;
+  ASSERT_TRUE(composite.Transfer({out}, &failed));
+  EXPECT_TRUE(failed.empty());
+
+  std::vector<char> got(payload.size(), 0);
+  ASSERT_EQ(hipSuccess, hipMemcpy(got.data(), dbuf, payload.size(), hipMemcpyDeviceToHost));
+  EXPECT_EQ(payload, got);
+
+  (void)hipFree(dbuf);
+  backend.Shutdown();
+  fs::remove_all(dir);
+}
+#endif  // UMBP_ENABLE_GDS
 
 }  // namespace
 }  // namespace mori::umbp

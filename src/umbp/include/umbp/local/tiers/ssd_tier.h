@@ -76,6 +76,7 @@ class SSDTier : public TierBackend {
   std::vector<std::string> GetLRUCandidates(size_t max_candidates) const override;
   const IoStatus& LastIoStatus() const { return last_io_status_; }
   std::optional<std::string> GetLocationId(const std::string& key) const override;
+  std::optional<RecordLocation> LocateRecord(const std::string& key) const override;
   // Enables O_DIRECT for segments opened from here on.  Takes effect for
   // segments opened after the call; existing fds keep their current mode, so
   // the intended use is at construction (ssd.direct_io) rather than mid-run.

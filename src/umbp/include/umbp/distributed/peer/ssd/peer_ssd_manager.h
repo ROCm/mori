@@ -28,6 +28,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -36,10 +37,13 @@
 
 #include "umbp/distributed/config.h"  // PeerSsdConfig
 #include "umbp/distributed/types.h"
+// RecordLocation is returned by value from LocateRecord, so the tier interface
+// is included here rather than forward-declared. peer/ssd is the SSD adapter
+// that already builds on the local tier (Phase 5 lint exempts this directory),
+// so this crosses no new boundary.
+#include "umbp/local/tiers/tier_backend.h"
 
 namespace mori::umbp {
-
-class TierBackend;  // umbp/local/tiers/tier_backend.h — kept out of this header.
 
 enum class SsdReadStatus { kOk, kNotFound, kSizeTooLarge, kError };
 struct SsdReadOutcome {
@@ -81,6 +85,11 @@ class PeerSsdManager {
   // to know how big the key is while it still only holds the key's name.
   // `owned_` has carried this all along; only the accessor was missing.
   uint64_t SizeOf(const std::string& key) const;
+
+  // Physical location of |key|'s value for a zero-copy GDS read, or nullopt when
+  // the key is unknown or being evicted (mirroring PrepareRead's kNotFound).
+  // Forwards to the SSD tier; does no device IO.
+  std::optional<RecordLocation> LocateRecord(const std::string& key) const;
 
   // Write the key's bytes (assembled from possibly non-contiguous DRAM source
   // segments) to the SSD backend.  On success records the SSD location and
