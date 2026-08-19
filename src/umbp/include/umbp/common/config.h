@@ -310,8 +310,13 @@ struct UMBPDistributedConfig {
   // Registered host arena used by ranged multi-buffer I/O. Remote objects are
   // fetched into disjoint slices here before being installed into the local
   // medium; ranged puts routed to another node assemble their scattered ranges
-  // into the same arena. Purely a remote-path resource — ranged I/O served by
+  // into a matching arena. Purely a remote-path resource — ranged I/O served by
   // this node's own medium never touches it.
+  //
+  // This sizes EACH of the two arenas UMBP allocates: a separate GET arena and
+  // PUT arena, each under its own mutex, so a remote ranged get and a remote
+  // ranged put run concurrently instead of serializing on one lock. Each must
+  // hold at least one whole object.
   //
   // Zero keeps ranged remote I/O disabled without allocating or registering
   // additional host memory; callers that need it must opt in explicitly. An

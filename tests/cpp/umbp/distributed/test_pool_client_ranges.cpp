@@ -122,10 +122,14 @@ class PoolClientRangesTest : public ::testing::Test {
     ASSERT_NE(master_->GetBoundPort(), 0);
     master_address_ = "localhost:" + std::to_string(master_->GetBoundPort());
 
-    caller_scratch_.resize(kScratchSize);
-    target_scratch_.resize(kScratchSize);
-    caller_ = MakeClient("ranges-caller", kCallerCapacity, caller_scratch_);
-    target_ = MakeClient("ranges-target", kTargetCapacity, target_scratch_);
+    caller_get_scratch_.resize(kScratchSize);
+    caller_put_scratch_.resize(kScratchSize);
+    target_get_scratch_.resize(kScratchSize);
+    target_put_scratch_.resize(kScratchSize);
+    caller_ =
+        MakeClient("ranges-caller", kCallerCapacity, caller_get_scratch_, caller_put_scratch_);
+    target_ =
+        MakeClient("ranges-target", kTargetCapacity, target_get_scratch_, target_put_scratch_);
   }
 
   void TearDown() override {
@@ -139,7 +143,8 @@ class PoolClientRangesTest : public ::testing::Test {
   }
 
   std::unique_ptr<PoolClient> MakeClient(const std::string& node_id, size_t dram_capacity,
-                                         std::vector<char>& scratch) {
+                                         std::vector<char>& get_scratch,
+                                         std::vector<char>& put_scratch) {
     PoolClientConfig cfg;
     cfg.master_config.node_id = node_id;
     cfg.master_config.node_address = "127.0.0.1";
@@ -154,12 +159,16 @@ class PoolClientRangesTest : public ::testing::Test {
     // The DRAM backend self-allocates its own pool (refactor Phase 2b), so the
     // test hands it a size rather than a buffer.
     cfg.dram.buffer_sizes = {dram_capacity};
-    cfg.ranged_scratch_buffer = scratch.data();
-    cfg.ranged_scratch_size = scratch.size();
+    // Separate GET and PUT arenas so remote ranged get/put run concurrently.
+    cfg.ranged_get_scratch_buffer = get_scratch.data();
+    cfg.ranged_get_scratch_size = get_scratch.size();
+    cfg.ranged_put_scratch_buffer = put_scratch.data();
+    cfg.ranged_put_scratch_size = put_scratch.size();
     cfg.cache_remote_fetches = false;
     auto client = std::make_unique<PoolClient>(std::move(cfg));
     EXPECT_TRUE(client->Init());
-    EXPECT_TRUE(client->RegisterMemory(scratch.data(), scratch.size()));
+    EXPECT_TRUE(client->RegisterMemory(get_scratch.data(), get_scratch.size()));
+    EXPECT_TRUE(client->RegisterMemory(put_scratch.data(), put_scratch.size()));
     return client;
   }
 
@@ -235,8 +244,10 @@ class PoolClientRangesTest : public ::testing::Test {
   std::string master_address_;
   std::unique_ptr<PoolClient> caller_;
   std::unique_ptr<PoolClient> target_;
-  std::vector<char> caller_scratch_;
-  std::vector<char> target_scratch_;
+  std::vector<char> caller_get_scratch_;
+  std::vector<char> caller_put_scratch_;
+  std::vector<char> target_get_scratch_;
+  std::vector<char> target_put_scratch_;
 };
 
 TEST_F(PoolClientRangesTest, RemoteRoundTripSubBatchesAndInstallsLocally) {
@@ -445,6 +456,140 @@ TEST_F(PoolClientRangesTest, GpuRangesUseGatherKernel) {
                           hipMemcpyDeviceToHost),
                 hipSuccess);
       EXPECT_EQ(std::memcmp(actual.data(), full.data() + get_offsets[i], get_sizes[i]), 0);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Separate GET / PUT scratch arenas: a remote ranged get and put use different
+// buffers under different mutexes, so they overlap and must never clobber each
+// other.  The fixture already gives every client a separate get arena and put
+// arena (each one object); these exercise the two together.
+// ---------------------------------------------------------------------------
+
+// A remote ranged put (PUT arena) then a remote ranged get (GET arena) of the
+// same keys round-trips the exact bytes.
+TEST_F(PoolClientRangesTest, SplitRemotePutThenGetRoundTrips) {
+  constexpr size_t kKeys = 3;
+  std::vector<std::string> keys = {"split-0", "split-1", "split-2"};
+  std::vector<std::vector<char>> objects(kKeys, std::vector<char>(kObjectSize));
+  for (size_t k = 0; k < kKeys; ++k) {
+    for (size_t i = 0; i < kObjectSize; ++i) {
+      objects[k][i] = static_cast<char>((i * 7 + k * 101) & 0xff);
+    }
+  }
+
+  std::vector<size_t> object_sizes(kKeys, kObjectSize);
+  std::vector<std::vector<const void*>> put_ptrs(kKeys);
+  std::vector<std::vector<size_t>> put_sizes(kKeys);
+  std::vector<std::vector<size_t>> put_offsets(kKeys);
+  for (size_t k = 0; k < kKeys; ++k) {
+    put_ptrs[k] = {objects[k].data(), objects[k].data() + 2048};
+    put_sizes[k] = {2048, kObjectSize - 2048};
+    put_offsets[k] = {0, 2048};
+  }
+  auto put = caller_->BatchPutRanges(keys, object_sizes, put_ptrs, put_sizes, put_offsets);
+  ASSERT_EQ(put, std::vector<bool>(kKeys, true));
+  caller_->Master().FlushHeartbeat();
+  target_->Master().FlushHeartbeat();
+  for (const auto& key : keys) ASSERT_TRUE(WaitForExists(caller_.get(), key));
+
+  std::vector<std::vector<char>> out(kKeys, std::vector<char>(kObjectSize, 0));
+  std::vector<std::vector<void*>> get_ptrs(kKeys);
+  std::vector<std::vector<size_t>> get_sizes(kKeys, {kObjectSize});
+  std::vector<std::vector<size_t>> get_offsets(kKeys, {0});
+  for (size_t k = 0; k < kKeys; ++k) get_ptrs[k] = {out[k].data()};
+
+  auto got = caller_->BatchGetRanges(keys, get_ptrs, get_sizes, get_offsets);
+  ASSERT_EQ(got, std::vector<bool>(kKeys, true));
+  for (size_t k = 0; k < kKeys; ++k) {
+    EXPECT_EQ(std::memcmp(out[k].data(), objects[k].data(), kObjectSize), 0) << "key=" << keys[k];
+  }
+}
+
+// Concurrent remote gets (GET arena) and remote puts (PUT arena) on disjoint key
+// sets: every payload must survive byte-for-byte, proving the two arenas never
+// overwrite each other under real contention.
+TEST_F(PoolClientRangesTest, SplitConcurrentGetPutDoNotClobber) {
+  constexpr size_t kSeed = 8;  // keys pre-seeded on target for the get threads
+  constexpr size_t kPutPerThread = 8;
+  constexpr size_t kGetThreads = 3;
+  constexpr size_t kPutThreads = 3;
+
+  // Seed keys the get threads will fetch remotely; each has a distinct fill.
+  std::vector<std::string> seed_keys(kSeed);
+  std::vector<std::vector<char>> seed_objs(kSeed, std::vector<char>(kObjectSize));
+  for (size_t s = 0; s < kSeed; ++s) {
+    for (size_t i = 0; i < kObjectSize; ++i)
+      seed_objs[s][i] = static_cast<char>((i + s * 17) & 0xff);
+    seed_keys[s] = "seed-" + std::to_string(s);
+    PutLocalReplica(target_.get(), seed_keys[s], seed_objs[s]);
+  }
+  target_->Master().FlushHeartbeat();
+  caller_->Master().FlushHeartbeat();
+  for (const auto& k : seed_keys) ASSERT_TRUE(WaitForExists(caller_.get(), k));
+
+  std::atomic<bool> ok{true};
+  std::vector<std::thread> threads;
+
+  // GET threads: read whole seeded objects, verify bytes (GET arena).
+  for (size_t t = 0; t < kGetThreads; ++t) {
+    threads.emplace_back([&, t] {
+      for (size_t it = 0; it < 12; ++it) {
+        const size_t s = (t + it) % kSeed;
+        std::vector<char> out(kObjectSize, 0);
+        std::vector<std::vector<void*>> ptrs = {{out.data()}};
+        std::vector<std::vector<size_t>> sizes = {{kObjectSize}};
+        std::vector<std::vector<size_t>> offsets = {{0}};
+        auto r = caller_->BatchGetRanges({seed_keys[s]}, ptrs, sizes, offsets);
+        if (r.size() != 1 || !r[0] || std::memcmp(out.data(), seed_objs[s].data(), kObjectSize)) {
+          ok.store(false);
+        }
+      }
+    });
+  }
+
+  // PUT threads: write unique objects (PUT arena) concurrently with the gets.
+  // Read-back verification happens after join to avoid racing master's
+  // ADD-event propagation.
+  auto put_key = [](size_t t, size_t p) {
+    return "cput-" + std::to_string(t) + "-" + std::to_string(p);
+  };
+  auto put_fill = [](size_t t, size_t p) { return static_cast<int>((t * 31 + p * 3 + 1) & 0xff); };
+  for (size_t t = 0; t < kPutThreads; ++t) {
+    threads.emplace_back([&, t] {
+      for (size_t p = 0; p < kPutPerThread; ++p) {
+        std::vector<char> obj(kObjectSize);
+        std::memset(obj.data(), put_fill(t, p), kObjectSize);
+        std::vector<std::vector<const void*>> src = {{obj.data(), obj.data() + 4096}};
+        std::vector<std::vector<size_t>> sizes = {{4096, kObjectSize - 4096}};
+        std::vector<std::vector<size_t>> offs = {{0, 4096}};
+        auto pr = caller_->BatchPutRanges({put_key(t, p)}, {kObjectSize}, src, sizes, offs);
+        if (pr.size() != 1 || !pr[0]) ok.store(false);
+      }
+    });
+  }
+
+  for (auto& th : threads) th.join();
+  EXPECT_TRUE(ok.load());
+
+  // After the concurrent phase, every put's bytes must be intact — a clobber
+  // between the two arenas would corrupt these.
+  caller_->Master().FlushHeartbeat();
+  target_->Master().FlushHeartbeat();
+  for (size_t t = 0; t < kPutThreads; ++t) {
+    for (size_t p = 0; p < kPutPerThread; ++p) {
+      const std::string key = put_key(t, p);
+      ASSERT_TRUE(WaitForExists(caller_.get(), key));
+      std::vector<char> back(kObjectSize, 0xAB);
+      std::vector<std::vector<void*>> gp = {{back.data()}};
+      std::vector<std::vector<size_t>> gs = {{kObjectSize}};
+      std::vector<std::vector<size_t>> go = {{0}};
+      auto gr = caller_->BatchGetRanges({key}, gp, gs, go);
+      ASSERT_EQ(gr.size(), 1u);
+      ASSERT_TRUE(gr[0]) << "key=" << key;
+      std::vector<char> expect(kObjectSize, static_cast<char>(put_fill(t, p)));
+      EXPECT_EQ(std::memcmp(back.data(), expect.data(), kObjectSize), 0) << "key=" << key;
     }
   }
 }
