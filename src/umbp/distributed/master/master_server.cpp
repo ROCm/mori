@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -90,7 +91,24 @@ KvEvent FromProtoEvent(const ::umbp::KvEvent& pe) {
   ev.key = pe.key();
   ev.tier = static_cast<TierType>(pe.tier());
   ev.size = pe.size();
+  ev.logical_tier = pe.logical_tier();
   return ev;
+}
+
+std::map<std::string, LogicalTierCapacity> LogicalCapsFromProto(
+    const ::google::protobuf::RepeatedPtrField<::umbp::LogicalTierCapacity>& source) {
+  std::map<std::string, LogicalTierCapacity> out;
+  for (const auto& value : source) {
+    if (value.name().empty()) continue;
+    LogicalTierCapacity cap;
+    cap.representative_tier = static_cast<TierType>(value.representative_tier());
+    cap.capacity.total_bytes = value.total_capacity_bytes();
+    cap.capacity.available_bytes = value.available_capacity_bytes();
+    cap.capacity.max_allocatable_bytes = value.max_allocatable_bytes();
+    cap.put_eligible = value.put_eligible();
+    out[value.name()] = cap;
+  }
+  return out;
 }
 
 int EvictKeyDeadlineMs() {
@@ -234,6 +252,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
         TierCapacity c;
         c.total_bytes = tc.total_capacity_bytes();
         c.available_bytes = tc.available_capacity_bytes();
+        c.max_allocatable_bytes = tc.max_allocatable_bytes();
         caps[static_cast<TierType>(tc.tier())] = c;
       }
 
@@ -243,6 +262,10 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       registration.node_id = request->node_id();
       registration.node_address = request->node_address();
       registration.tier_capacities = caps;
+      if (config_.advertise_logical_tiers) {
+        registration.logical_tier_capacities =
+            LogicalCapsFromProto(request->logical_tier_capacities());
+      }
       registration.peer_address = request->peer_address();
       registration.engine_desc_bytes.assign(engine_desc_str.begin(), engine_desc_str.end());
       registration.tags.assign(request->tags().begin(), request->tags().end());
@@ -265,6 +288,8 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
           static_cast<uint64_t>(config_.heartbeat_ttl.count() * 1000) / HeartbeatIntervalDivisor();
       response->set_heartbeat_interval_ms(interval_ms);
       response->set_ack_seq(0);
+      response->set_supports_max_allocatable_bytes(config_.advertise_max_allocatable_bytes);
+      response->set_supports_logical_tiers(config_.advertise_logical_tiers);
       return grpc::Status::OK;
     });
   }
@@ -289,8 +314,13 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
         TierCapacity c;
         c.total_bytes = tc.total_capacity_bytes();
         c.available_bytes = tc.available_capacity_bytes();
+        c.max_allocatable_bytes = tc.max_allocatable_bytes();
         caps[static_cast<TierType>(tc.tier())] = c;
       }
+      auto logical_caps =
+          config_.advertise_logical_tiers
+              ? LogicalCapsFromProto(request->logical_tier_capacities())
+              : std::map<std::string, LogicalTierCapacity>{};
 
       std::vector<EventBundle> bundles;
       bundles.reserve(static_cast<size_t>(request->bundles_size()));
@@ -298,7 +328,11 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
         EventBundle bundle;
         bundle.seq = pb.seq();
         bundle.events.reserve(static_cast<size_t>(pb.events_size()));
-        for (const auto& pe : pb.events()) bundle.events.push_back(FromProtoEvent(pe));
+        for (const auto& pe : pb.events()) {
+          auto event = FromProtoEvent(pe);
+          if (!config_.advertise_logical_tiers) event.logical_tier.clear();
+          bundle.events.push_back(std::move(event));
+        }
         bundles.push_back(std::move(bundle));
       }
 
@@ -320,7 +354,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
           for (const auto& ev : bundle.events) events.push_back(ev);
         }
         auto result = store_.ApplyHeartbeat(request->node_id(), request->delta_seq_baseline(), now,
-                                            caps, events, /*is_full_sync=*/true);
+                                            caps, events, /*is_full_sync=*/true, logical_caps);
         if (result.status == HeartbeatResult::UNKNOWN) {
           client_status = ClientStatus::UNKNOWN;
         } else {
@@ -333,7 +367,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
         // without advancing last_applied_seq; the gap is ignored (no full-sync
         // request) because there is nothing to recover.
         auto result = store_.ApplyHeartbeat(request->node_id(), /*seq=*/0, now, caps,
-                                            /*events=*/{}, /*is_full_sync=*/false);
+                                            /*events=*/{}, /*is_full_sync=*/false, logical_caps);
         if (result.status == HeartbeatResult::UNKNOWN) {
           client_status = ClientStatus::UNKNOWN;
         } else {
@@ -346,7 +380,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
         // across the batch).
         for (const auto& bundle : bundles) {
           auto result = store_.ApplyHeartbeat(request->node_id(), bundle.seq, now, caps,
-                                              bundle.events, /*is_full_sync=*/false);
+                                              bundle.events, /*is_full_sync=*/false, logical_caps);
           if (result.status == HeartbeatResult::UNKNOWN) {
             client_status = ClientStatus::UNKNOWN;
             break;
@@ -428,6 +462,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       response->set_node_id(result->node_id);
       response->set_tier(static_cast<::umbp::TierType>(result->tier));
       response->set_peer_address(result->peer_address);
+      response->set_logical_tier(result->logical_tier);
 
       if (metrics_) {
         metrics_->addCounter(MORI_UMBP_METRIC_CLIENT_ROUTE_PUT,
@@ -455,6 +490,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       response->set_tier(static_cast<::umbp::TierType>(result->location.tier));
       response->set_size(result->location.size);
       response->set_peer_address(result->peer_address);
+      response->set_logical_tier(result->location.logical_tier);
 
       if (metrics_) {
         metrics_->addCounter(MORI_UMBP_METRIC_CLIENT_ROUTE_GET,
@@ -491,6 +527,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
         entry->set_node_id(opt->node_id);
         entry->set_tier(static_cast<::umbp::TierType>(opt->tier));
         entry->set_peer_address(opt->peer_address);
+        entry->set_logical_tier(opt->logical_tier);
         if (metrics_) {
           metrics_->addCounter(MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_PUT,
                                MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_PUT_HELP,
@@ -516,6 +553,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       response->mutable_node_ref()->Reserve(static_cast<int>(results.size()));
       response->mutable_tier()->Reserve(static_cast<int>(results.size()));
       response->mutable_size()->Reserve(static_cast<int>(results.size()));
+      response->mutable_logical_tier()->Reserve(static_cast<int>(results.size()));
       // Maps "node_id\0peer_address" -> 1-based index into response->nodes().
       std::unordered_map<std::string, uint32_t> node_index;
       for (auto& opt : results) {
@@ -523,6 +561,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
           response->add_node_ref(0);
           response->add_tier(::umbp::TIER_UNKNOWN);
           response->add_size(0);
+          response->add_logical_tier("");
           continue;
         }
         std::string node_key = opt->location.node_id;
@@ -538,6 +577,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
         response->add_node_ref(it->second);
         response->add_tier(static_cast<::umbp::TierType>(opt->location.tier));
         response->add_size(opt->location.size);
+        response->add_logical_tier(opt->location.logical_tier);
         if (metrics_) {
           metrics_->addCounter(MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_GET,
                                MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_GET_HELP,

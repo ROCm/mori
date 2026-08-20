@@ -59,6 +59,12 @@ class MasterServer {
   // has called BuildAndStart().
   uint16_t GetBoundPort() const { return bound_port_.load(); }
 
+  // Latest registered/heartbeat view of one peer. Used by tests to observe
+  // whether capacity heartbeats aggregated across same-tier backends.
+  std::optional<ClientRecord> GetClient(const std::string& node_id) const {
+    return store_ ? store_->GetClient(node_id) : std::nullopt;
+  }
+
  private:
   MasterServerConfig config_;
   // Single owner of all master metadata state (block locations, client

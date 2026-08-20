@@ -480,6 +480,30 @@ std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::stri
   return out;
 }
 
+bool PageBackend::AcquireMigrationRead(const std::string& key,
+                                       ResolvedEntry* resolved) {
+  if (resolved == nullptr) return false;
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto owned = owned_.find(key);
+  if (owned == owned_.end() || pins_.find(key) != pins_.end()) return false;
+  resolved->found = true;
+  resolved->pages = owned->second.pages;
+  resolved->size = owned->second.size;
+  resolved->page_size = page_size_;
+  pins_[key] = PinState{next_pin_token_++, std::chrono::steady_clock::now()};
+  return true;
+}
+
+void PageBackend::ReleaseMigrationRead(const std::string& key) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  pins_.erase(key);
+}
+
+bool PageBackend::Contains(const std::string& key) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return owned_.find(key) != owned_.end();
+}
+
 // ---------------------------------------------------------------------------
 //  Eviction (skips leased / copy-pinned keys; emits REMOVE)
 // ---------------------------------------------------------------------------
@@ -702,6 +726,7 @@ TierCapacity PageBackend::Capacity() const {
   if (allocator_) {
     cap.total_bytes = allocator_->TotalBytes();
     cap.available_bytes = allocator_->AvailableBytes();
+    cap.max_allocatable_bytes = cap.available_bytes;
   }
   return cap;
 }

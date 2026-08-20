@@ -46,7 +46,12 @@
 
 namespace mori::umbp {
 
+namespace benchmark {
+class WorkloadTraceRecorder;
+}
+
 class PeerServiceServer;
+class PeerPool;
 class HbmCopyEngine;
 
 // Short name for log output. Generic FAILED maps to "FAILED" — the
@@ -169,12 +174,15 @@ class PoolClient {
 
   MasterClient& Master();
 
-  // The storage medium live on this node (exactly one — see PoolClient::Init).
-  // Callers reach it by tier (Backends().Get(Medium())) and use it through
+  // Every named storage backend live on this node.  Callers use them through
   // MediumBackend — no concrete backend type is named outside PoolClient::Init.
   BackendRegistry& Backends();
+  TierTransitionMetrics TransitionMetrics() const;
+  std::map<std::string, uint64_t> TierReadHits() const;
+  std::string LogicalTierForBackend(uint32_t backend_id) const;
 
-  // Which medium this node serves.  Valid after Init.
+  // Legacy default medium: the first configured backend's tier.  Valid after
+  // Init and retained for callers that have not adopted named instances.
   TierType Medium() const { return medium_; }
 
   bool IsInitialized() const;
@@ -228,15 +236,17 @@ class PoolClient {
 
   // Every storage medium live on this node.  Owned here because PoolClient is
   // the natural lifetime anchor for the per-process IO engine + backend pools.
-  // PeerServiceServer and MasterClient both borrow the registry and dispatch
-  // through it (backend-agnostic refactor Phase 3).
+  // MasterClient borrows it for heartbeat aggregation; default_pool_ borrows it
+  // for logical placement and peer/local dispatch.
   BackendRegistry registry_;
 
-  // The one tier registry_ holds, cached from the backend at Init.  Read by the
-  // few paths that must name a LOCAL destination with no route to dispatch on
-  // (the re-cache installer); everything with a route uses route.tier.  Kept in
-  // sync with config_.medium by construction — Init sets it from the backend it
-  // actually built, not from config.
+  // The implicit default logical pool. It borrows registry_, owns placement
+  // state and policy, and is the dispatch surface for local and peer RPC paths.
+  std::unique_ptr<PeerPool> default_pool_;
+  std::unique_ptr<benchmark::WorkloadTraceRecorder> workload_recorder_;
+
+  // Legacy default tier, cached from the first configured backend. Read by
+  // re-cache paths that do not yet carry a PoolPolicy decision.
   TierType medium_ = TierType::DRAM;
 
   std::unique_ptr<PeerServiceServer> peer_service_;
@@ -305,7 +315,7 @@ class PoolClient {
   enum class GetAttemptOutcome { kSuccess, kRetry, kFatal };
 
   PutAttemptOutcome ExecuteLocalPut(const std::string& key, const void* src, size_t size,
-                                    TierType tier);
+                                    TierType tier, const std::string& logical_tier = {});
   GetAttemptOutcome ExecuteLocalGet(const std::string& key, void* dst, size_t size);
 
   // One TransferItem per page between a caller buffer and `backend`'s own

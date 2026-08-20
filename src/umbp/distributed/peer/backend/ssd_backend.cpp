@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include "umbp/distributed/peer/backend/ssd_backend.h"
 
+#include <algorithm>
 #include <msgpack.hpp>
 #include <stdexcept>
 #include <utility>
@@ -134,6 +135,8 @@ void SsdBackend::Shutdown() {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     pending_.clear();
+    for (auto& [key, lease] : migration_reads_) ReleaseStagingPageLocked(lease.page_index);
+    migration_reads_.clear();
     read_leases_.clear();
     free_pages_.clear();
   }
@@ -172,6 +175,7 @@ TierCapacity SsdBackend::Capacity() const {
   TierCapacity cap;
   cap.total_bytes = static_cast<uint64_t>(total);
   cap.available_bytes = total > used ? static_cast<uint64_t>(total - used) : 0;
+  cap.max_allocatable_bytes = std::min<uint64_t>(cap.available_bytes, cfg_.page_size);
   return cap;
 }
 
@@ -198,6 +202,7 @@ std::vector<KvEvent> SsdBackend::SnapshotOwnedKeysForFullSync() {
 }
 
 void SsdBackend::ClearLocal() {
+  std::vector<std::string> migration_keys;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     // Invalidate outstanding slots so a late Commit fails rather than
@@ -206,8 +211,14 @@ void SsdBackend::ClearLocal() {
     pending_.clear();
     for (auto& [key, lease] : read_leases_) ReleaseStagingPageLocked(lease.page_index);
     read_leases_.clear();
+    for (auto& [key, lease] : migration_reads_) {
+      ReleaseStagingPageLocked(lease.page_index);
+      migration_keys.push_back(key);
+    }
+    migration_reads_.clear();
     unshipped_events_ = 0;
   }
+  for (const auto& key : migration_keys) ssd_->UnpinForMigration(key);
   clear_full_sync_pending_.store(true, std::memory_order_release);
   ssd_->ClearLocal();
 }
@@ -465,6 +476,61 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
   return results;
 }
 
+bool SsdBackend::AcquireMigrationRead(const std::string& key,
+                                      ResolvedEntry* resolved) {
+  if (resolved == nullptr) return false;
+  if (!ssd_->PinForMigration(key)) return false;
+  const uint64_t size = ssd_->SizeOf(key);
+  if (size == 0 || size > cfg_.page_size) {
+    ssd_->UnpinForMigration(key);
+    return false;
+  }
+
+  uint32_t page = kNoPage;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (migration_reads_.count(key) != 0) {
+      ssd_->UnpinForMigration(key);
+      return false;
+    }
+    page = AcquireStagingPageLocked();
+    if (page == kNoPage) {
+      ssd_->UnpinForMigration(key);
+      return false;
+    }
+    migration_reads_[key] =
+        ReadLease{page, size, std::chrono::steady_clock::time_point::max()};
+  }
+  const SsdReadOutcome outcome =
+      ssd_->PrepareRead(key, StagingPagePtr(page), cfg_.page_size);
+  if (outcome.status != SsdReadStatus::kOk) {
+    ReleaseMigrationRead(key);
+    return false;
+  }
+  resolved->found = true;
+  resolved->pages = {PageLocation{kStagingBufferIndex, page}};
+  resolved->size = outcome.size;
+  resolved->page_size = cfg_.page_size;
+  return true;
+}
+
+void SsdBackend::ReleaseMigrationRead(const std::string& key) {
+  bool released = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = migration_reads_.find(key);
+    if (it == migration_reads_.end()) return;
+    ReleaseStagingPageLocked(it->second.page_index);
+    migration_reads_.erase(it);
+    released = true;
+  }
+  if (released) ssd_->UnpinForMigration(key);
+}
+
+bool SsdBackend::Contains(const std::string& key) const {
+  return ssd_ != nullptr && ssd_->Exists(key);
+}
+
 std::vector<EvictResult> SsdBackend::Evict(const std::vector<std::string>& keys) {
   std::vector<EvictResult> results;
   results.reserve(keys.size());
@@ -478,7 +544,7 @@ std::vector<EvictResult> SsdBackend::Evict(const std::vector<std::string>& keys)
     // master's retry behavior explicit rather than incidental.
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      if (read_leases_.count(key) != 0) {
+      if (read_leases_.count(key) != 0 || migration_reads_.count(key) != 0) {
         results.push_back(r);  // bytes_freed = 0 -> master retries next round
         continue;
       }

@@ -268,7 +268,8 @@ class RedisStoreTest : public ::testing::TestWithParam<StoreMode> {
     r.node_id = id;
     r.node_address = id + ".addr";
     r.peer_address = id + ".peer:1234";
-    r.tier_capacities[TierType::DRAM] = TierCapacity{1u << 30, 1u << 30};
+    r.tier_capacities[TierType::DRAM] =
+        TierCapacity{1u << 30, 1u << 30, 1u << 29};
     r.tags = {"sgl_role=prefill", "zone=a"};
     return r;
   }
@@ -325,6 +326,7 @@ TEST_P(RedisStoreTest, RegisterMakesClientAlive) {
   EXPECT_EQ(rec->status, ClientStatus::ALIVE);
   ASSERT_EQ(rec->tier_capacities.count(TierType::DRAM), 1u);
   EXPECT_EQ(rec->tier_capacities[TierType::DRAM].total_bytes, 1u << 30);
+  EXPECT_EQ(rec->tier_capacities[TierType::DRAM].max_allocatable_bytes, 1u << 29);
   EXPECT_EQ(store_->GetClientTags("n1").size(), 2u);
 }
 

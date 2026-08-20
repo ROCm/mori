@@ -205,6 +205,9 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
     *error = "UMBP_DISTRIBUTED_DRAM_PAGE_SIZE must be explicitly set to > 0";
     return false;
   }
+  if (auto policy = EnvString("UMBP_BACKEND_POLICY"); policy.has_value()) {
+    dist.backend_policy_path = *policy;
+  }
 
   config->distributed = dist;
   return true;

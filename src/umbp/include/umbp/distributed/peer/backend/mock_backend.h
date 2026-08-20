@@ -48,7 +48,11 @@ namespace mori::umbp {
 // that a test can drive through BackendRegistry — not a no-op stub.
 class MockBackend : public MediumBackend {
  public:
-  explicit MockBackend(TierType tier) : tier_(tier) {}
+  // The registry requires every backend on a peer to agree on a page size, so
+  // a mock sharing a registry with a real page-based backend must be told which
+  // one to report.
+  explicit MockBackend(TierType tier, uint64_t page_size = 1)
+      : tier_(tier), page_size_(page_size) {}
 
   TierType Tier() const override { return tier_; }
   const char* Name() const override { return "MockBackend"; }
@@ -171,6 +175,11 @@ class MockBackend : public MediumBackend {
     return out;
   }
 
+  bool Contains(const std::string& key) const override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return owned_.find(key) != owned_.end();
+  }
+
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys) override {
     std::vector<EvictResult> out;
     out.reserve(keys.size());
@@ -189,7 +198,7 @@ class MockBackend : public MediumBackend {
     return out;
   }
 
-  uint64_t PageSize() const override { return 1; }
+  uint64_t PageSize() const override { return page_size_; }
 
   // Publish `count` fake buffers, numbered from 0 — like every real backend,
   // and the reason a bare buffer_index is not an address: two mocks that both
@@ -258,6 +267,7 @@ class MockBackend : public MediumBackend {
   }
 
   TierType tier_;
+  uint64_t page_size_ = 1;
   bool initialized_ = false;
   mutable std::mutex mutex_;
   uint64_t next_slot_id_ = 1;

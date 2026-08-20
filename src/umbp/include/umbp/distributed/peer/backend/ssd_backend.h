@@ -167,6 +167,9 @@ class SsdBackend : public MediumBackend {
   std::vector<bool> BatchAbort(const std::vector<uint64_t>& slot_ids) override;
   std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
                                           bool include_descs) override;
+  bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved) override;
+  void ReleaseMigrationRead(const std::string& key) override;
+  bool Contains(const std::string& key) const override;
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys) override;
 
   void SetAutoFlushHook(size_t threshold, std::function<void()> cb) override;
@@ -234,6 +237,7 @@ class SsdBackend : public MediumBackend {
 
   std::unordered_map<uint64_t, PendingSlot> pending_;
   std::unordered_map<std::string, ReadLease> read_leases_;
+  std::unordered_map<std::string, ReadLease> migration_reads_;
 
   size_t unshipped_events_ = 0;
   size_t auto_flush_threshold_ = SIZE_MAX;

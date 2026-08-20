@@ -101,7 +101,9 @@ class RedisMasterMetadataStore : public IMasterMetadataStore {
   HeartbeatResult ApplyHeartbeat(const std::string& node_id, uint64_t seq,
                                  std::chrono::system_clock::time_point now,
                                  const std::map<TierType, TierCapacity>& caps,
-                                 const std::vector<KvEvent>& events, bool is_full_sync) override;
+                                 const std::vector<KvEvent>& events, bool is_full_sync,
+                                 const std::map<std::string, LogicalTierCapacity>& logical_caps =
+                                     {}) override;
   std::vector<std::string> ExpireStaleClients(
       std::chrono::system_clock::time_point cutoff) override;
 

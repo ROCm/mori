@@ -24,16 +24,16 @@
 //
 // 1. MasterClientMetricsTest — unit tests for MasterClient::AddCounter,
 //    SetGauge, and Observe buffering.  Uses a fake recording server that
-//    returns a 100ms heartbeat interval, allowing the flush to be verified
-//    within a short wall-clock window.
+//    captures ReportMetrics calls. main() sets the metrics reporting interval
+//    to 10ms so buffering semantics can be verified without one-second waits.
 //
 // 2. PoolClientLocalByteTrackingTest — integration test verifying that a
 //    single-node PoolClient reports correct Put/Get byte counts (traffic=local)
 //    through the full pipeline: PoolClient → MasterClient buffer →
 //    ReportMetrics RPC → MasterServer → Prometheus HTTP endpoint.
 //
-// main() sets UMBP_HEARTBEAT_TTL_SEC=1 before any test runs so that the real
-// MasterServer in suite 2 returns ≈500ms heartbeat/metrics flush intervals.
+// main() shortens the independently configured heartbeat and metrics intervals
+// before either suite constructs a client.
 
 #include <arpa/inet.h>
 #include <grpcpp/grpcpp.h>
@@ -90,17 +90,14 @@ static uint16_t AllocPort() {
 
 // ============================================================
 //  Fake gRPC server that captures ReportMetrics calls.
-//  RegisterClient returns a configurable heartbeat interval so
-//  the metrics flush cadence is under test control.
+//  RegisterClient returns a short heartbeat interval; the independent
+//  metrics cadence is controlled by UMBP_METRICS_REPORT_INTERVAL_MS in main().
 // ============================================================
 class RecordingMasterService final : public ::umbp::UMBPMaster::Service {
  public:
-  explicit RecordingMasterService(int heartbeat_interval_ms)
-      : heartbeat_interval_ms_(heartbeat_interval_ms) {}
-
   grpc::Status RegisterClient(grpc::ServerContext*, const ::umbp::RegisterClientRequest*,
                               ::umbp::RegisterClientResponse* resp) override {
-    resp->set_heartbeat_interval_ms(heartbeat_interval_ms_);
+    resp->set_heartbeat_interval_ms(100);
     return grpc::Status::OK;
   }
 
@@ -139,7 +136,6 @@ class RecordingMasterService final : public ::umbp::UMBPMaster::Service {
   }
 
  private:
-  int heartbeat_interval_ms_;
   std::mutex mu_;
   std::condition_variable cv_;
   std::vector<::umbp::ReportMetricsRequest> requests_;
@@ -180,10 +176,8 @@ static double SumCounterDelta(const std::vector<::umbp::MetricSample>& samples,
 // ============================================================
 class MasterClientMetricsTest : public ::testing::Test {
  protected:
-  static constexpr int kFlushIntervalMs = 100;
-
   void SetUp() override {
-    service_ = std::make_unique<RecordingMasterService>(kFlushIntervalMs);
+    service_ = std::make_unique<RecordingMasterService>();
 
     grpc::ServerBuilder builder;
     int selected_port = 0;
@@ -600,9 +594,12 @@ TEST_F(PoolClientLocalByteTrackingTest, TierCapacityGaugesPublished) {
 
 int main(int argc, char** argv) {
   // Must be set before any GetEnvSeconds("UMBP_HEARTBEAT_TTL_SEC") static
-  // is initialized.  TTL=1s → recommended interval ≈ 500ms, which the
-  // metrics flush thread reuses.
+  // is initialized. TTL=1s keeps the real-server heartbeat tests short.
   ::setenv("UMBP_HEARTBEAT_TTL_SEC", "1", 1);
+  // MetricsReportIntervalMs() caches this on the first MasterClient
+  // construction. A short interval keeps the mock-server buffering tests
+  // deterministic without sleeping for the production default of one second.
+  ::setenv("UMBP_METRICS_REPORT_INTERVAL_MS", "10", 1);
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }

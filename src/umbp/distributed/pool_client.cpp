@@ -21,6 +21,8 @@
 // SOFTWARE.
 #include "umbp/distributed/pool_client.h"
 
+#include "umbp/distributed/benchmark/workload_trace_recorder.h"
+
 #include <grpcpp/grpcpp.h>
 
 #include <algorithm>
@@ -51,6 +53,7 @@
 #include "umbp/distributed/peer/backend/ssd_backend.h"
 #include "umbp/distributed/peer/batch_resolve_codec.h"
 #include "umbp/distributed/peer/peer_service.h"
+#include "umbp/distributed/pool/peer_pool.h"
 #include "umbp/distributed/transfer/composite_transfer_engine.h"
 #include "umbp/distributed/transfer/hbm_copy_engine.h"
 #include "umbp/distributed/transfer/local_copy_engine.h"
@@ -290,6 +293,100 @@ void ApplyRejectedTags(std::vector<Entry>& entries, const std::vector<size_t>& t
   }
 }
 
+std::vector<BackendInstanceConfig> EffectiveBackendConfigs(const PoolClientConfig& config) {
+  if (!config.backends.empty()) return config.backends;
+
+  BackendInstanceConfig legacy;
+  legacy.name = DefaultBackendInstanceName(config.medium);
+  legacy.tier = config.medium;
+  legacy.dram = config.dram;
+  legacy.hbm = config.hbm;
+  legacy.ssd = config.ssd;
+  legacy.ssd_staging_buffer_slots = config.ssd_staging_buffer_slots;
+  return {std::move(legacy)};
+}
+
+// staging_use_hugepages / staging_hugepage_size are node-wide rather than
+// per-instance: they describe how this process backs any SSD staging arena, so
+// every SSD backend it registers gets the same treatment.
+std::unique_ptr<MediumBackend> MakeConfiguredBackend(const BackendInstanceConfig& config,
+                                                     uint64_t page_size,
+                                                     bool staging_use_hugepages,
+                                                     uint64_t staging_hugepage_size) {
+  switch (config.tier) {
+    case TierType::DRAM: {
+      PageBackend::OwnershipConfig ownership;
+      ownership.buffer_sizes = config.dram.buffer_sizes;
+      ownership.use_hugepages = config.dram.use_hugepages;
+      ownership.hugepage_size = config.dram.hugepage_size;
+      ownership.numa_node = config.dram.numa_node;
+      ownership.prefault = config.dram.prefault;
+      return MakePageBackend(TierType::DRAM, page_size, std::move(ownership),
+                             /*pending_ttl=*/std::chrono::milliseconds{30000},
+                             /*read_lease_ttl=*/DramReadLeaseTtl());
+    }
+    case TierType::HBM:
+      return MakeHbmBackend(page_size, config.hbm.device, config.hbm.buffer_sizes,
+                            /*pending_ttl=*/std::chrono::milliseconds{30000},
+                            /*read_lease_ttl=*/DramReadLeaseTtl());
+    case TierType::SSD: {
+      SsdBackend::Config ssd_cfg;
+      ssd_cfg.page_size = page_size;
+      ssd_cfg.staging_pages = config.ssd_staging_buffer_slots > 0
+                                  ? static_cast<uint32_t>(config.ssd_staging_buffer_slots)
+                                  : 16;
+      ssd_cfg.staging_use_hugepages = staging_use_hugepages;
+      ssd_cfg.staging_hugepage_size = staging_hugepage_size;
+      ssd_cfg.ssd = config.ssd;
+      ssd_cfg.ssd.enabled = true;
+      ssd_cfg.read_lease_ttl = DramReadLeaseTtl();
+      return MakeSsdBackend(std::move(ssd_cfg));
+    }
+    case TierType::UNKNOWN:
+      return nullptr;
+  }
+  return nullptr;
+}
+
+std::unique_ptr<PoolPolicy> MakeConfiguredPoolPolicy(
+    const PoolClientConfig& config, const std::vector<BackendInstanceConfig>& backends,
+    const BackendRegistry& registry,
+    std::shared_ptr<const LogicalTierGraph>* tier_graph) {
+  switch (config.placement_policy) {
+    case PoolPlacementPolicy::SINGLE_BACKEND:
+      return MakeSingleBackendPolicy();
+    case PoolPlacementPolicy::WEIGHTED: {
+      std::vector<BackendPlacementWeight> weights;
+      weights.reserve(backends.size());
+      for (const auto& backend : backends) {
+        if (backend.placement_weight == 0) {
+          MORI_UMBP_ERROR("[PoolClient] weighted backend '{}' has zero placement weight",
+                          backend.name);
+          return nullptr;
+        }
+        weights.push_back(BackendPlacementWeight{backend.name, backend.placement_weight});
+      }
+      return MakeWeightedPlacementPolicy(std::move(weights));
+    }
+    case PoolPlacementPolicy::TIERED:
+      if (config.logical_tiers.empty()) {
+        MORI_UMBP_ERROR("[PoolClient] tiered placement has no logical tiers");
+        return nullptr;
+      }
+      if (tier_graph == nullptr) return nullptr;
+      {
+        auto compiled = LogicalTierGraph::Compile(config.logical_tiers, registry);
+        if (!compiled.ok()) {
+          MORI_UMBP_ERROR("[PoolClient] invalid logical tier graph: {}", compiled.error);
+          return nullptr;
+        }
+        *tier_graph = std::move(compiled.graph);
+        return MakeTieredPlacementPolicy(*tier_graph);
+      }
+  }
+  return nullptr;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -302,6 +399,31 @@ PoolClient::~PoolClient() { Shutdown(); }
 bool PoolClient::Init() {
   bool expected = false;
   if (!initialized_.compare_exchange_strong(expected, true)) return true;
+
+  if (config_.workload_trace_path.empty()) {
+    if (const char* path = std::getenv("UMBP_WORKLOAD_TRACE_PATH")) {
+      config_.workload_trace_path = path;
+    }
+  }
+  if (const char* value = std::getenv("UMBP_WORKLOAD_TRACE_CLIENT_ID")) {
+    config_.workload_trace_client_id =
+        static_cast<uint32_t>(std::strtoull(value, nullptr, 10));
+  }
+  if (const char* value = std::getenv("UMBP_WORKLOAD_TRACE_SEED")) {
+    config_.workload_trace_seed = std::strtoull(value, nullptr, 10);
+  }
+
+  if (!config_.policy_config_path.empty()) {
+    auto loaded = LoadBackendPolicyFile(config_.policy_config_path);
+    std::string error;
+    if (!loaded.ok() || !ApplyBackendPolicy(*loaded.config, &config_, &error)) {
+      MORI_UMBP_ERROR("[PoolClient] failed to load backend policy '{}': {}",
+                      config_.policy_config_path,
+                      loaded.ok() ? error : loaded.error);
+      initialized_.store(false);
+      return false;
+    }
+  }
 
   master_client_ = std::make_unique<MasterClient>(config_.master_config);
 
@@ -334,7 +456,7 @@ bool PoolClient::Init() {
     if (!rdma->Init()) {
       MORI_UMBP_ERROR("[PoolClient] MoriIoEngine init failed on {}:{}", config_.io_engine.host,
                       config_.io_engine.port);
-      initialized_ = false;
+      Shutdown();
       return false;
     }
     peer_directory_ = rdma.get();
@@ -342,95 +464,79 @@ bool PoolClient::Init() {
   }
   transfer_engine_ = std::move(composite);
 
-  // Peer-side backend: ONE medium, chosen by config_.medium.
-  //
-  // This is the ONLY place in the tree that decides which medium is live;
-  // everything downstream dispatches through registry_ (Phase 3) and never
-  // names a tier.  It does not name a concrete backend TYPE either — each
-  // factory hands back a MediumBackend, which is what closes Phase 5 Rule A.
-  //
-  // WHY ONE.  The registry holds a map keyed by tier and would happily take
-  // all three, but UMBP's routing plane does not tier: master treats every
-  // advertised tier as an equally valid put target (Phase 4 deleted the
-  // hardcoded tier orders), so a node registering DRAM *and* SSD does not get
-  // "DRAM in front of SSD" — it gets two independent pools that master picks
-  // between by free capacity, i.e. mirroring, not promotion.  Local tiering is
-  // a policy nobody has asked for; heterogeneity comes from different NODES
-  // picking different media, which the routing plane already handles.  See
-  // UMBPMedium in common/config.h.
+  // Peer-side backend instances.  The legacy single-medium selector is
+  // synthesized into one entry here; topology-aware callers may
+  // supply several named instances, including several of the same TierType.
+  // This composition root remains the only place concrete backend factories
+  // are named. The configured PoolPolicy below owns placement among them.
   const uint64_t page_size =
       config_.dram_page_size > 0 ? config_.dram_page_size : 2ULL * 1024 * 1024;
 
-  std::unique_ptr<MediumBackend> backend;
-  switch (config_.medium) {
-    case TierType::DRAM: {
-      // Self-allocated at Init from sizing knobs only — PoolClient holds no
-      // buffer pointer (design doc §1 item 4 / Phase 2b).
-      PageBackend::OwnershipConfig dram_ownership;
-      dram_ownership.buffer_sizes = config_.dram.buffer_sizes;
-      dram_ownership.use_hugepages = config_.dram.use_hugepages;
-      dram_ownership.hugepage_size = config_.dram.hugepage_size;
-      dram_ownership.numa_node = config_.dram.numa_node;
-      dram_ownership.prefault = config_.dram.prefault;
-      backend = MakePageBackend(TierType::DRAM, page_size, std::move(dram_ownership),
-                                /*pending_ttl=*/std::chrono::milliseconds{30000},
-                                /*read_lease_ttl=*/DramReadLeaseTtl());
-      break;
-    }
-    case TierType::HBM: {
-      backend = MakeHbmBackend(page_size, config_.hbm.device, config_.hbm.buffer_sizes,
-                               /*pending_ttl=*/std::chrono::milliseconds{30000},
-                               /*read_lease_ttl=*/DramReadLeaseTtl());
-      break;
-    }
-    case TierType::SSD: {
-      // The one medium that is genuinely NOT like the others: its bytes are not
-      // addressable, so it publishes a registered host staging arena and spills
-      // behind it (see ssd_backend.h).  Everything outside that class — routing,
-      // peer service, heartbeat, the batch executors — sees ordinary pages.
-      SsdBackend::Config ssd_cfg;
-      ssd_cfg.page_size = page_size;
-      ssd_cfg.staging_pages = config_.ssd_staging_buffer_slots > 0
-                                  ? static_cast<uint32_t>(config_.ssd_staging_buffer_slots)
-                                  : 16;
-      ssd_cfg.staging_use_hugepages = config_.ssd_staging_use_hugepages;
-      ssd_cfg.staging_hugepage_size = config_.ssd_staging_hugepage_size;
-      ssd_cfg.ssd = config_.ssd;
-      ssd_cfg.ssd.enabled = true;  // selecting SSD IS the opt-in
-      ssd_cfg.read_lease_ttl = DramReadLeaseTtl();
-      backend = MakeSsdBackend(std::move(ssd_cfg));
-      break;
-    }
-    case TierType::UNKNOWN:
-      break;  // falls into the null check below
-  }
-  if (backend == nullptr) {
-    MORI_UMBP_ERROR("[PoolClient] unknown medium {}", static_cast<int>(config_.medium));
-    initialized_ = false;
+  auto backend_configs = EffectiveBackendConfigs(config_);
+  if (backend_configs.empty()) {
+    MORI_UMBP_ERROR("[PoolClient] no backend instances configured");
+    Shutdown();
     return false;
+  }
+  medium_ = backend_configs.front().tier;  // legacy default for paths without a routed tier
+  for (const auto& backend_config : backend_configs) {
+    if (backend_config.name.empty() || registry_.Get(backend_config.name) != nullptr) {
+      MORI_UMBP_ERROR("[PoolClient] backend instance name '{}' is empty or duplicated",
+                      backend_config.name);
+      Shutdown();
+      return false;
+    }
+    auto backend = MakeConfiguredBackend(backend_config, page_size,
+                                         config_.ssd_staging_use_hugepages,
+                                         config_.ssd_staging_hugepage_size);
+    if (backend == nullptr) {
+      MORI_UMBP_ERROR("[PoolClient] backend '{}' has unknown medium {}",
+                      backend_config.name, static_cast<int>(backend_config.tier));
+      Shutdown();
+      return false;
+    }
+
+    // Narrowed to MemoryRegistrar: a backend publishes endpoints, it does not
+    // move bytes, and that is a compile-time fact (design doc §5 Rule C).
+    if (!backend->Init(static_cast<MemoryRegistrar*>(transfer_engine_.get()))) {
+      MORI_UMBP_ERROR("[PoolClient] backend '{}' ({}) Init failed", backend_config.name,
+                      TierTypeName(backend_config.tier));
+      backend->Shutdown();
+      Shutdown();
+      return false;
+    }
+    if (!registry_.Register(backend_config.name, std::move(backend))) {
+      Shutdown();
+      return false;
+    }
   }
 
-  // Narrowed to MemoryRegistrar: a backend publishes endpoints, it does not
-  // move bytes, and that is now a compile-time fact (design doc §5 Rule C).
-  medium_ = backend->Tier();
-  if (!backend->Init(static_cast<MemoryRegistrar*>(transfer_engine_.get()))) {
-    MORI_UMBP_ERROR("[PoolClient] {} backend Init failed", TierTypeName(medium_));
-    initialized_ = false;
+  std::shared_ptr<const LogicalTierGraph> tier_graph;
+  auto placement_policy =
+      MakeConfiguredPoolPolicy(config_, backend_configs, registry_, &tier_graph);
+  if (placement_policy == nullptr) {
+    MORI_UMBP_ERROR("[PoolClient] invalid placement policy configuration");
+    Shutdown();
     return false;
   }
-  if (!registry_.Register(std::move(backend))) {
-    initialized_ = false;
-    return false;
-  }
+  default_pool_ = std::make_unique<PeerPool>(
+      &registry_, std::move(placement_policy), transfer_engine_.get());
+  const bool weighted_placement =
+      config_.placement_policy == PoolPlacementPolicy::WEIGHTED ||
+      config_.placement_policy == PoolPlacementPolicy::TIERED;
+  master_client_->SetAggregateBackendCapacities(weighted_placement);
 
-  // Declare every host region the gather kernel may dereference: the live
-  // medium's own buffers, and the ranged scratch arena.  Both are copied
-  // fragment-wise against GPU callers, which is the shape the kernel exists
-  // for.  Registration is best-effort and asynchronous for large pools, so
-  // until it lands the engine just takes hipMemcpy — no ordering requirement
-  // here beyond the buffers existing.
+  // Declare every host region the gather kernel may dereference: the buffers of
+  // every backend registered here, and the ranged scratch arenas.  Both are
+  // copied fragment-wise against GPU callers, which is the shape the kernel
+  // exists for.  A key may sit on any registered backend, so declaring only the
+  // default one would leave the kernel dereferencing an unregistered region.
+  // Registration is best-effort and asynchronous for large pools, so until it
+  // lands the engine just takes hipMemcpy — no ordering requirement here beyond
+  // the buffers existing.
   if (hbm_engine_ != nullptr) {
-    if (auto* live = registry_.Get(medium_); live != nullptr) {
+    for (auto* live : registry_.All()) {
+      if (live == nullptr) continue;
       for (uint32_t i = 0; i < live->BufferCount(); ++i) {
         const TransferRef ref = live->BufferRef(i);
         // Only host buffers: a device-resident medium is already addressable
@@ -451,6 +557,7 @@ bool PoolClient::Init() {
   }
 
   master_client_->SetBackendRegistry(&registry_);
+  master_client_->SetPeerPool(default_pool_.get());
 
   // Medium-specific counters (SSD read outcomes, single-flight coalescing,
   // eviction, staging pressure) ride the existing metrics tick.  Backend-
@@ -462,41 +569,49 @@ bool PoolClient::Init() {
   std::vector<uint8_t> engine_desc_bytes;
   if (peer_directory_ != nullptr) engine_desc_bytes = peer_directory_->PackedLocalEngineDesc();
 
-  if (config_.peer_service_port > 0) {
-    peer_service_ =
-        std::make_unique<PeerServiceServer>(&registry_, engine_desc_bytes, master_client_.get());
+  if (config_.peer_service_port > 0 || config_.auto_peer_service_port) {
+    peer_service_ = std::make_unique<PeerServiceServer>(*default_pool_, engine_desc_bytes,
+                                                        master_client_.get());
     if (!peer_service_->Start(config_.peer_service_port)) {
       MORI_UMBP_ERROR("[PoolClient] PeerService failed to start on port {}",
                       config_.peer_service_port);
       peer_service_.reset();
-      initialized_ = false;
+      Shutdown();
       return false;
     }
+    config_.peer_service_port = peer_service_->BoundPort();
   }
 
   std::string peer_address;
-  if (config_.peer_service_port > 0) {
+  if (peer_service_ != nullptr) {
     std::string host = config_.master_config.node_address;
     peer_address = host + ":" + std::to_string(config_.peer_service_port);
   }
 
-  // Master register.  In the new design master holds no DRAM-side
-  // metadata; only membership + capacity-snapshot.  Capacity is aggregated
-  // over every registered backend instead of a PoolClientConfig literal
-  // (design doc §1 item 4 / Phase 2b).  A backend reporting zero capacity is
-  // omitted rather than advertised as a full tier: since Phase 4 the router
-  // treats every advertised tier as a valid put target, so advertising an
-  // empty one would invite placements it can never accept.
+  // Register conservatively with one instance per tier. Once the Master
+  // confirms max_allocatable_bytes support, weighted heartbeats advertise the
+  // full aggregate without making rolling upgrades over-admit large values.
   std::map<TierType, TierCapacity> tier_caps;
   for (auto* backend : registry_.All()) {
+    if (registry_.Get(backend->Tier()) != backend) continue;
     auto cap = backend->Capacity();
-    if (cap.total_bytes > 0) tier_caps[backend->Tier()] = cap;
+    if (cap.total_bytes == 0) continue;
+    tier_caps[backend->Tier()] = cap;
   }
-  auto status = master_client_->RegisterSelf(tier_caps, peer_address, engine_desc_bytes);
+  const auto logical_caps =
+      default_pool_ == nullptr ? std::map<std::string, LogicalTierCapacity>{}
+                               : default_pool_->LogicalTierCapacities();
+  auto status = master_client_->RegisterSelf(tier_caps, peer_address, engine_desc_bytes,
+                                             logical_caps);
   if (!status.ok()) {
     MORI_UMBP_ERROR("[PoolClient] RegisterSelf failed: {}", status.error_message());
-    initialized_ = false;
+    Shutdown();
     return false;
+  }
+  if (weighted_placement && !master_client_->SupportsMaxAllocatableCapacity()) {
+    MORI_UMBP_WARN(
+        "[PoolClient] Master lacks max_allocatable_bytes support; weighted placement remains "
+        "enabled but capacity advertisement is limited to the first instance per tier");
   }
 
   if (config_.master_config.auto_heartbeat) master_client_->StartHeartbeat();
@@ -509,6 +624,24 @@ bool PoolClient::Init() {
       recache_stop_ = false;
     }
     recache_worker_ = std::thread([this] { ReCacheWorkerLoop(); });
+  }
+
+  if (!config_.workload_trace_path.empty()) {
+    try {
+      benchmark::WorkloadTraceRecorderOptions options;
+      options.path = config_.workload_trace_path;
+      options.client_id = config_.workload_trace_client_id;
+      options.seed = config_.workload_trace_seed;
+      options.node_id = config_.master_config.node_id;
+      options.backend_policy = config_.policy_config_path;
+      workload_recorder_ =
+          std::make_unique<benchmark::WorkloadTraceRecorder>(std::move(options));
+    } catch (const std::exception& exception) {
+      MORI_UMBP_ERROR("[PoolClient] failed to open workload trace '{}': {}",
+                      config_.workload_trace_path, exception.what());
+      Shutdown();
+      return false;
+    }
   }
 
   MORI_UMBP_INFO("[PoolClient] Initialized node_id='{}'", config_.master_config.node_id);
@@ -529,6 +662,15 @@ void PoolClient::Shutdown() {
   }
   recache_cv_.notify_all();
   if (recache_worker_.joinable()) recache_worker_.join();
+  if (workload_recorder_ != nullptr) {
+    try {
+      workload_recorder_->Close();
+    } catch (const std::exception& exception) {
+      MORI_UMBP_ERROR("[PoolClient] workload trace is incomplete: {}",
+                      exception.what());
+    }
+    workload_recorder_.reset();
+  }
 
   if (master_client_) {
     master_client_->StopHeartbeat();
@@ -555,7 +697,11 @@ void PoolClient::Shutdown() {
   // Every backend deregisters its memory through transfer_engine_ inside its
   // own destructor — this MUST run before transfer_engine_ is torn down below.
   // MasterClient borrows the registry, so unbind it first.
-  if (master_client_) master_client_->SetBackendRegistry(nullptr);
+  if (master_client_) {
+    master_client_->SetPeerPool(nullptr);
+    master_client_->SetBackendRegistry(nullptr);
+  }
+  default_pool_.reset();
   registry_ = BackendRegistry{};
 
   if (transfer_engine_) {
@@ -575,9 +721,9 @@ bool PoolClient::Clear() {
   // clear and no master to notify.  Treat as success so callers in
   // shutdown / teardown paths do not surface a spurious error.
   if (!initialized_.load()) return true;
-  // Clear every medium, not just DRAM: a key mirrored across backends must
-  // disappear from all of them before the full-sync empty snapshot goes out.
-  for (auto* backend : registry_.All()) backend->ClearLocal();
+  // Clear physical state and the default Pool's logical placement index before
+  // the full-sync empty snapshot goes out.
+  if (default_pool_ != nullptr) default_pool_->ClearLocal();
 
   bool ok = true;
   if (master_client_) {
@@ -590,6 +736,20 @@ bool PoolClient::Clear() {
 bool PoolClient::IsInitialized() const { return initialized_; }
 MasterClient& PoolClient::Master() { return *master_client_; }
 BackendRegistry& PoolClient::Backends() { return registry_; }
+std::map<std::string, uint64_t> PoolClient::TierReadHits() const {
+  return default_pool_ == nullptr ? std::map<std::string, uint64_t>{}
+                                  : default_pool_->TierReadHits();
+}
+
+std::string PoolClient::LogicalTierForBackend(uint32_t backend_id) const {
+  return default_pool_ == nullptr ? std::string{}
+                                  : default_pool_->LogicalTierForBackend(backend_id);
+}
+
+TierTransitionMetrics PoolClient::TransitionMetrics() const {
+  return default_pool_ == nullptr ? TierTransitionMetrics{}
+                                  : default_pool_->TransitionMetrics();
+}
 
 // ---------------------------------------------------------------------------
 //  Memory registration
@@ -740,23 +900,31 @@ bool PoolClient::BuildLocalPageTransfers(MediumBackend* backend,
 }
 
 PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key, const void* src,
-                                                          size_t size, TierType tier) {
-  if (registry_.Empty()) {
-    MORI_UMBP_ERROR("[PoolClient] Local Put requested but no storage backend is registered");
+                                                          size_t size, TierType tier,
+                                                          const std::string& logical_tier) {
+  if (default_pool_ == nullptr || registry_.Empty()) {
+    MORI_UMBP_ERROR("[PoolClient] Local Put requested but no default pool is initialized");
     return PutAttemptOutcome::kFatal;
   }
-  // Dispatch on the routed tier (Phase 3) rather than assuming DRAM.  A tier
-  // with no live backend here is not fatal: kRetry routes the key elsewhere,
-  // the same way the pre-refactor allocator rejected an unconfigured tier.
-  auto* backend = registry_.Get(tier);
+  PoolPlacementRequest request;
+  request.key = key;
+  request.size = size;
+  request.tier = tier;
+  request.logical_tier = logical_tier;
+  auto pool_alloc = default_pool_->BatchAllocate({request}).front();
+  auto* backend = registry_.Get(pool_alloc.backend_id);
   // A medium that publishes no buffer endpoints cannot be reached in-process at
   // all; route the key elsewhere rather than allocating a slot we cannot fill.
   if (backend == nullptr || backend->BufferCount() == 0) {
+    if (pool_alloc.allocation.outcome == AllocateOutcome::kSuccessAllocated) {
+      default_pool_->BatchAbort(
+          {PoolSlotRef{pool_alloc.backend_id, pool_alloc.allocation.slot_id}});
+    }
     MORI_UMBP_WARN("[PoolClient] Local Put: tier={} has no in-process-addressable backend",
                    static_cast<int>(tier));
     return PutAttemptOutcome::kRetry;
   }
-  auto alloc_res = backend->BatchAllocate({AllocateRequest{key, size}}).front();
+  auto& alloc_res = pool_alloc.allocation;
   switch (alloc_res.outcome) {
     case AllocateOutcome::kSuccessAlreadyExists:
       return PutAttemptOutcome::kSuccessAlreadyExists;
@@ -771,11 +939,14 @@ PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key
   if (!BuildLocalPageTransfers(backend, alloc_res.pages, alloc_res.page_size,
                                const_cast<void*>(src), size, /*to_backend=*/true, &items) ||
       !transfer_engine_->Transfer(items, /*failed_tags=*/nullptr)) {
-    backend->BatchAbort({alloc_res.slot_id});
+    default_pool_->BatchAbort({PoolSlotRef{pool_alloc.backend_id, alloc_res.slot_id}});
     return PutAttemptOutcome::kFatal;
   }
-  if (!backend->BatchCommit({CommitRequest{alloc_res.slot_id, key}}).front().success) {
-    backend->BatchAbort({alloc_res.slot_id});
+  PoolCommitRequest commit;
+  commit.slot = PoolSlotRef{pool_alloc.backend_id, alloc_res.slot_id};
+  commit.key = key;
+  if (!default_pool_->BatchCommit({commit}).front().commit.success) {
+    default_pool_->BatchAbort({commit.slot});
     return PutAttemptOutcome::kFatal;
   }
   master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL,
@@ -789,17 +960,15 @@ PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key
 
 PoolClient::GetAttemptOutcome PoolClient::ExecuteLocalGet(const std::string& key, void* dst,
                                                           size_t size) {
-  if (registry_.Empty()) {
-    MORI_UMBP_ERROR("[PoolClient] Local Get requested but no storage backend is registered");
+  if (default_pool_ == nullptr || registry_.Empty()) {
+    MORI_UMBP_ERROR("[PoolClient] Local Get requested but no default pool is initialized");
     return GetAttemptOutcome::kFatal;
   }
-  // Get carries no tier — the key may be in any medium here, and mirrored
-  // across several.  Walk this node's media and take the first hit, matching
-  // what the peer service does for a remote reader.
-  bool served = false;
-  for (auto* backend : registry_.All()) {
-    auto resolved = backend->BatchResolve({key}, /*include_descs=*/false).front();
-    if (!resolved.found) continue;
+  auto pool_resolved = default_pool_->BatchResolve({key}, /*include_descs=*/false).front();
+  auto* backend = registry_.Get(pool_resolved.backend_id);
+  bool served = pool_resolved.resolved.found && backend != nullptr;
+  if (served) {
+    auto& resolved = pool_resolved.resolved;
     // Same guard the remote path applies after BatchResolveKeys: a stored size
     // that disagrees with the requested one is a different object, and copying
     // `size` bytes out of a slot sized for something else would read past it.
@@ -820,7 +989,6 @@ PoolClient::GetAttemptOutcome PoolClient::ExecuteLocalGet(const std::string& key
       return GetAttemptOutcome::kFatal;
     }
     served = true;
-    break;
   }
   // No medium here held the key.  This is reachable: PartitionBatchGetTargets
   // sends a key master has no route for down the local path as a fallback.
@@ -1151,6 +1319,15 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
   for (size_t i = 0; i < outcomes.size(); ++i) {
     results[i] = (outcomes[i] != PutEntryOutcome::kFailed);
   }
+  if (workload_recorder_ != nullptr) {
+    std::vector<benchmark::WorkloadTraceOutcome> recorded(outcomes.size());
+    for (size_t i = 0; i < outcomes.size(); ++i) {
+      recorded[i] = outcomes[i] != PutEntryOutcome::kFailed
+                        ? benchmark::WorkloadTraceOutcome::kSuccess
+                        : benchmark::WorkloadTraceOutcome::kFailure;
+    }
+    workload_recorder_->RecordBatchPut(keys, sizes, recorded);
+  }
   return results;
 }
 
@@ -1202,7 +1379,8 @@ void PoolClient::ExecuteBatchPutPlan(const BatchPutPlan& plan,
     const auto t0 = std::chrono::steady_clock::now();
     ParallelFor(local.size(), nthr, [&](size_t k) {
       const auto& item = local[k];
-      switch (ExecuteLocalPut(*item.key, item.src, item.size, item.route.tier)) {
+      switch (ExecuteLocalPut(*item.key, item.src, item.size, item.route.tier,
+                              item.route.logical_tier)) {
         case PutAttemptOutcome::kSuccess:
           (*results)[item.index] = PutEntryOutcome::kSucceeded;
           break;
@@ -1369,6 +1547,7 @@ bool PoolClient::AllocateRemotePutEntries(const std::vector<BatchPutItem>& items
     entry->set_size(item.size);
     entry->set_tier(static_cast<::umbp::TierType>(item.route.tier));
     entry->set_key(*item.key);
+    entry->set_logical_tier(item.route.logical_tier);
   }
 
   ::umbp::BatchAllocateSlotsResponse alloc_resp;
@@ -1637,6 +1816,18 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
     ObserveBatchBandwidth(*master_client_, split.remote, seconds,
                           MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH,
                           MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH_HELP, "remote");
+  }
+  if (workload_recorder_ != nullptr) {
+    std::vector<benchmark::WorkloadTraceOutcome> recorded(results.size());
+    for (size_t i = 0; i < results.size(); ++i) {
+      // No route means the master had no location for the key: a cache miss,
+      // which is workload information. Anything else that failed is a fault.
+      recorded[i] = results[i] ? benchmark::WorkloadTraceOutcome::kSuccess
+                    : (i < routes.size() && !routes[i].has_value())
+                        ? benchmark::WorkloadTraceOutcome::kMiss
+                        : benchmark::WorkloadTraceOutcome::kFailure;
+    }
+    workload_recorder_->RecordBatchGet(keys, sizes, recorded);
   }
   return results;
 }

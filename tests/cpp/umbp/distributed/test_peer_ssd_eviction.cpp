@@ -223,6 +223,13 @@ TEST(PeerSsdEviction, WatermarkTriggersEvictionDownToLow) {
   EXPECT_EQ(CountKind(events, KvEvent::Kind::REMOVE), 2);
 }
 
+TEST(PeerSsdEviction, SuccessfulWriteDoesNotEvictItself) {
+  auto h = MakeHarness(/*capacity=*/100, /*high=*/0.9, /*low=*/0.7);
+  std::string value(90, 'x');
+  ASSERT_TRUE(h.mgr->Write("only", OneSeg(value), value.size()));
+  EXPECT_TRUE(h.mgr->Exists("only"));
+}
+
 TEST(PeerSsdEviction, EnospcTriggersEvictThenRetry) {
   // Fill to 800/1000 (below the 0.9 high watermark, so no watermark eviction
   // fires during the fill), then write a 300-byte value that overflows the
