@@ -36,6 +36,11 @@ struct TierCapabilities {
   bool zero_copy_read = false;
   bool batch_write = false;
   bool batch_read = false;
+  // Whether ReadBatchRangesIntoPtr is really implemented.  The base class
+  // provides an all-false default, which is indistinguishable from "every key
+  // missed"; callers route on this flag instead so an unsupported tier falls
+  // through to another one rather than reporting a phantom miss.
+  bool ranged_read = false;
 };
 
 // Abstract base class for storage tier backends (DRAM, SSD, NVM, ...).
@@ -85,6 +90,10 @@ class TierBackend {
   virtual std::vector<bool> ReadBatchIntoPtr(const std::vector<std::string>& keys,
                                              const std::vector<uintptr_t>& dst_ptrs,
                                              const std::vector<size_t>& sizes);
+  virtual std::vector<bool> ReadBatchRangesIntoPtr(
+      const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dst_ptrs,
+      const std::vector<std::vector<size_t>>& sizes,
+      const std::vector<std::vector<size_t>>& src_offsets);
 
   // Return the LRU key, or empty string if empty.
   // Default returns "". Override in tiers with LRU tracking.
@@ -99,6 +108,11 @@ class TierBackend {
   virtual std::vector<bool> BatchWrite(const std::vector<std::string>& keys,
                                        const std::vector<const void*>& data_ptrs,
                                        const std::vector<size_t>& sizes);
+  virtual std::vector<bool> BatchWriteRanges(const std::vector<std::string>& keys,
+                                             const std::vector<size_t>& object_sizes,
+                                             const std::vector<std::vector<const void*>>& src_ptrs,
+                                             const std::vector<std::vector<size_t>>& sizes,
+                                             const std::vector<std::vector<size_t>>& dst_offsets);
 
   // Batch read into user pointers. Default loops over ReadIntoPtr().
   virtual std::vector<bool> BatchReadIntoPtr(const std::vector<std::string>& keys,

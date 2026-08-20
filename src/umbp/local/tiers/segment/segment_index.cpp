@@ -42,41 +42,50 @@ void Index::RemoveLRU(const std::string& key) {
 }
 
 bool Index::PrepareWrite(const std::string& key, size_t size, size_t key_len, uint32_t crc32,
-                         Meta* seg, WriteReservation* out) {
+                         Meta* seg, WriteReservation* out, bool crc_valid) {
   if (!seg || !out) return false;
 
+  // Admission is decided on the padded on-disk footprint, which is what
+  // capacity_bytes is meant to bound; charging only `size` would let a store of
+  // small values overrun the drive by the padding ratio.
+  const size_t on_disk = static_cast<size_t>(RecordBytes(key_len, size));
   auto existing = key_meta_.find(key);
-  size_t existing_size = (existing == key_meta_.end()) ? 0 : existing->second.size;
+  size_t existing_size = (existing == key_meta_.end()) ? 0 : existing->second.disk_bytes;
   size_t effective_used = (used_ >= existing_size) ? (used_ - existing_size) : 0;
-  if (effective_used + size > capacity_) return false;
+  if (effective_used + on_disk > capacity_) return false;
 
   const uint64_t generation = generation_counter_++;
   out->key = key;
   out->had_previous = (existing != key_meta_.end());
   if (out->had_previous) out->previous_meta = existing->second;
 
-  const size_t record_size = sizeof(RecordHeader) + key_len + size;
+  // v3 layout: the append cursor is always on a kRecordAlign boundary, so
+  // starting the record at write_offset already gives an aligned record_offset;
+  // the padded prefix then puts the value on an aligned boundary too.  Both are
+  // preconditions for reading or writing this record with O_DIRECT.
   out->record_offset = seg->write_offset;
   out->previous_write_offset = seg->write_offset;
-  seg->write_offset += static_cast<uint64_t>(record_size);
+  seg->write_offset += RecordBytes(key_len, size);
 
   out->meta.segment_id = seg->id;
-  out->meta.value_offset = out->record_offset + sizeof(RecordHeader) + key_len;
+  out->meta.value_offset = out->record_offset + PrefixBytes(key_len);
   out->meta.size = static_cast<uint32_t>(size);
   out->meta.crc32 = crc32;
   out->meta.generation = generation;
+  out->meta.crc_valid = crc_valid;
+  out->meta.disk_bytes = static_cast<uint32_t>(on_disk);
 
   if (existing != key_meta_.end()) {
     auto old_seg = segments_.find(existing->second.segment_id);
-    if (old_seg != segments_.end() && old_seg->second.live_bytes >= existing->second.size) {
-      old_seg->second.live_bytes -= existing->second.size;
+    if (old_seg != segments_.end() && old_seg->second.live_bytes >= existing->second.disk_bytes) {
+      old_seg->second.live_bytes -= existing->second.disk_bytes;
     }
-    used_ -= existing->second.size;
+    used_ -= existing->second.disk_bytes;
   }
 
-  seg->live_bytes += size;
+  seg->live_bytes += on_disk;
   key_meta_[key] = out->meta;
-  used_ += size;
+  used_ += on_disk;
   TouchLRU(key);
   return true;
 }
@@ -86,12 +95,12 @@ void Index::RollbackWrite(const WriteReservation& reservation) {
   if (it != key_meta_.end() && it->second.generation == reservation.meta.generation) {
     auto seg = segments_.find(reservation.meta.segment_id);
     if (seg != segments_.end()) {
-      if (seg->second.live_bytes >= reservation.meta.size) {
-        seg->second.live_bytes -= reservation.meta.size;
+      if (seg->second.live_bytes >= reservation.meta.disk_bytes) {
+        seg->second.live_bytes -= reservation.meta.disk_bytes;
       }
       seg->second.write_offset = reservation.previous_write_offset;
     }
-    if (used_ >= reservation.meta.size) used_ -= reservation.meta.size;
+    if (used_ >= reservation.meta.disk_bytes) used_ -= reservation.meta.disk_bytes;
     key_meta_.erase(it);
     RemoveLRU(reservation.key);
   }
@@ -99,8 +108,9 @@ void Index::RollbackWrite(const WriteReservation& reservation) {
   if (reservation.had_previous) {
     key_meta_[reservation.key] = reservation.previous_meta;
     auto old_seg = segments_.find(reservation.previous_meta.segment_id);
-    if (old_seg != segments_.end()) old_seg->second.live_bytes += reservation.previous_meta.size;
-    used_ += reservation.previous_meta.size;
+    if (old_seg != segments_.end())
+      old_seg->second.live_bytes += reservation.previous_meta.disk_bytes;
+    used_ += reservation.previous_meta.disk_bytes;
     TouchLRU(reservation.key);
   }
 }
@@ -110,16 +120,16 @@ void Index::RecordRecoveredEntry(const std::string& key, const KeyMeta& meta) {
   if (existing != key_meta_.end()) {
     if (existing->second.generation >= meta.generation) return;
     auto old_seg = segments_.find(existing->second.segment_id);
-    if (old_seg != segments_.end() && old_seg->second.live_bytes >= existing->second.size) {
-      old_seg->second.live_bytes -= existing->second.size;
+    if (old_seg != segments_.end() && old_seg->second.live_bytes >= existing->second.disk_bytes) {
+      old_seg->second.live_bytes -= existing->second.disk_bytes;
     }
-    if (used_ >= existing->second.size) used_ -= existing->second.size;
+    if (used_ >= existing->second.disk_bytes) used_ -= existing->second.disk_bytes;
   }
 
   auto seg = segments_.find(meta.segment_id);
-  if (seg != segments_.end()) seg->second.live_bytes += meta.size;
+  if (seg != segments_.end()) seg->second.live_bytes += meta.disk_bytes;
   key_meta_[key] = meta;
-  used_ += meta.size;
+  used_ += meta.disk_bytes;
   TouchLRU(key);
   ObserveGeneration(meta.generation);
 }
@@ -129,10 +139,10 @@ bool Index::EraseKey(const std::string& key) {
   if (it == key_meta_.end()) return false;
 
   auto seg = segments_.find(it->second.segment_id);
-  if (seg != segments_.end() && seg->second.live_bytes >= it->second.size) {
-    seg->second.live_bytes -= it->second.size;
+  if (seg != segments_.end() && seg->second.live_bytes >= it->second.disk_bytes) {
+    seg->second.live_bytes -= it->second.disk_bytes;
   }
-  if (used_ >= it->second.size) used_ -= it->second.size;
+  if (used_ >= it->second.disk_bytes) used_ -= it->second.disk_bytes;
   key_meta_.erase(it);
   RemoveLRU(key);
   return true;

@@ -249,9 +249,73 @@ target_link_libraries(
           gtest_main)
 add_test(NAME umbp_medium_selection COMMAND test_umbp_medium_selection)
 
+# test_umbp_local_first — PoolClientConfig::local_first: a fully-local batch
+# never contacts the master.  Asserted by STOPPING the master and reading
+# anyway, with a local_first=false twin that must fail on the same data.
+add_executable(test_umbp_local_first test_local_first.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_local_first PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_local_first
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+add_test(NAME umbp_local_first COMMAND test_umbp_local_first)
+
+# test_umbp_no_master — the distributed client with master_address empty: same
+# data plane, no routing/registration/heartbeat, a local miss is final.  No
+# master is started in that file, so reaching for one hangs or crashes rather
+# than passing quietly.
+add_executable(test_umbp_no_master test_no_master.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_no_master PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_no_master
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+add_test(NAME umbp_no_master COMMAND test_umbp_no_master)
+
+# test_umbp_pool_client_ranges — ranged multi-buffer I/O through PoolClient:
+# local range reads/writes against the node's own medium, the remote path via
+# the scratch arena, range validation, and GPU caller buffers.
+add_executable(test_umbp_pool_client_ranges test_pool_client_ranges.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_pool_client_ranges PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_pool_client_ranges
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+add_test(NAME umbp_pool_client_ranges COMMAND test_umbp_pool_client_ranges)
+
+# test_umbp_ssd_ranged_io — ranged multi-buffer I/O on an SSD-medium node
+# (doc/design-ssd-ranged-io.md, D0): the capability flag now turning on the
+# arena alone, plus local and remote ranged put/get against an SSD-only peer.
+add_executable(test_umbp_ssd_ranged_io test_ssd_ranged_io.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_ssd_ranged_io PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_ssd_ranged_io
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+add_test(NAME umbp_ssd_ranged_io COMMAND test_umbp_ssd_ranged_io)
+
+# test_umbp_range_map — the object-range -> page-range arithmetic on its own.
+# Header-only and node-free, so it is a plain unit test rather than an
+# integration one: the shapes that matter (short last page, range ending on the
+# object's last byte, one byte past the end) are awkward to reach through a
+# live two-node fixture, and a mistake there corrupts a KV block silently
+# rather than failing.
+add_executable(test_umbp_range_map test_range_map.cpp)
+target_link_libraries(test_umbp_range_map PRIVATE umbp_common gtest_main)
+add_test(NAME umbp_range_map COMMAND test_umbp_range_map)
+
 set_tests_properties(umbp_cross_node_smoke umbp_pool_client_batch_put
                      umbp_medium_selection umbp_tier_benchmark
                      umbp_client_metrics_pool_bytes umbp_tags_real_master
+                     umbp_pool_client_ranges umbp_ssd_ranged_io
                      PROPERTIES
                        LABELS "integration"
                        ENVIRONMENT
@@ -285,6 +349,20 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 target_link_libraries(
   bench_umbp_pool_client_batch_get
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+
+# Layer-wise ranged-restore bench: drives BatchGetRanges the way the sglang
+# tree connector does (N ranks walking layer groups over the same keys) and
+# reports TTFL, wire bytes and repeat-remote alongside latency.  Standalone
+# executable, not a CTest target.
+add_executable(bench_umbp_pool_client_ranges bench_pool_client_ranges.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(bench_umbp_pool_client_ranges PRIVATE
+                      -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  bench_umbp_pool_client_ranges
   PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
           gtest_main)
 
@@ -366,6 +444,17 @@ target_link_libraries(test_transfer_engine PRIVATE umbp_common GTest::gtest_main
 target_compile_features(test_transfer_engine PRIVATE cxx_std_17)
 add_test(NAME test_transfer_engine COMMAND test_transfer_engine)
 
+# test_component_metrics — the observability seam: MetricPublisher's delta /
+# gauge / baseline rules, InstrumentedBackend deriving the generic backend
+# series from the MediumBackend interface alone (asserted against MockBackend,
+# which carries no metrics code — that is the genericity guarantee), and the
+# composite transfer engine's per-engine byte/plan accounting.
+add_executable(test_component_metrics test_component_metrics.cpp)
+target_link_libraries(test_component_metrics PRIVATE umbp_common
+                                                     GTest::gtest_main)
+target_compile_features(test_component_metrics PRIVATE cxx_std_17)
+add_test(NAME test_component_metrics COMMAND test_component_metrics)
+
 # test_hbm_backend — the HBM medium and the engine that had to exist for it:
 # HbmCopyEngine's selection/planner (no GPU needed) plus real H2D/D2H/D2D bytes
 # and a Put/Get round trip against an hipMalloc'd pool (skipped without a GPU).
@@ -404,13 +493,20 @@ target_link_libraries(test_router_dedup PRIVATE umbp_common GTest::gtest_main)
 target_compile_features(test_router_dedup PRIVATE cxx_std_17)
 add_test(NAME test_router_dedup COMMAND test_router_dedup)
 
-# test_peer_ssd_manager — SSD tier ownership (dormant: unwired from the
-# distributed data plane, see design-backend-agnostic-refactor.md Phase 0)
+# test_peer_ssd_manager — SSD tier ownership (reachable again: SsdBackend is the
+# MediumBackend adapter that drives it)
 add_executable(test_peer_ssd_manager test_peer_ssd_manager.cpp)
 target_link_libraries(test_peer_ssd_manager PRIVATE umbp_common
                                                     GTest::gtest_main)
 target_compile_features(test_peer_ssd_manager PRIVATE cxx_std_17)
 add_test(NAME test_peer_ssd_manager COMMAND test_peer_ssd_manager)
+
+# test_peer_ssd_single_flight — same-key read coalescing (leader/follower)
+add_executable(test_peer_ssd_single_flight test_peer_ssd_single_flight.cpp)
+target_link_libraries(test_peer_ssd_single_flight PRIVATE umbp_common
+                                                          GTest::gtest_main)
+target_compile_features(test_peer_ssd_single_flight PRIVATE cxx_std_17)
+add_test(NAME test_peer_ssd_single_flight COMMAND test_peer_ssd_single_flight)
 
 # test_peer_ssd_eviction — LRU + watermark eviction + in-flight guard
 add_executable(test_peer_ssd_eviction test_peer_ssd_eviction.cpp)

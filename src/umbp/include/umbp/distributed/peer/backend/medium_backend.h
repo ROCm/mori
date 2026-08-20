@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/distributed/metrics/component_metrics.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
 #include "umbp/distributed/types.h"
 
@@ -168,7 +169,7 @@ struct EvictResult {
   uint64_t bytes_freed = 0;
 };
 
-class MediumBackend {
+class MediumBackend : public MetricSource {
  public:
   virtual ~MediumBackend() = default;
 
@@ -239,6 +240,23 @@ class MediumBackend {
   // it should only signal the heartbeat thread.  Pass a very large threshold to
   // disable.
   virtual void SetAutoFlushHook(size_t threshold, std::function<void()> cb) = 0;
+
+  // ---- observability ----
+  //
+  // A backend does NOT report its own operation counts, byte volumes or
+  // latencies.  InstrumentedBackend sits on this interface and derives all of
+  // those from the calls below, which is why a new medium is fully observable
+  // the moment PoolClient composes it in — see instrumented_backend.h.
+  //
+  // MetricSource::SampleMetrics(), inherited here, is for the one thing a
+  // decorator cannot see: state INSIDE the medium (the drive's own read
+  // outcomes, single-flight coalescing, a staging arena's occupancy).  Publish
+  // those under the generic MORI_UMBP_METRIC_BACKEND_MEDIUM_* names with the
+  // specifics in an event=/state= label, never under a name that spells the
+  // medium — a metric called mori_umbp_ssd_something forces a second dashboard,
+  // which is exactly what the single-dashboard layout removed.
+  //
+  // tier= and backend= are added by the publisher; do not set them here.
 
   // ---- slot lifecycle (peer-side; driven by PeerServiceServer handlers) ----
   //

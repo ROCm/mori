@@ -44,8 +44,9 @@ enum class UMBPDeploymentMode : int {
 
 /// Abstract interface for UMBP storage clients.
 ///
-/// Two implementations exist behind this interface:
+/// Three implementations exist behind this interface:
 ///   - StandaloneClient: purely local DRAM+SSD storage, no networking.
+///   - StandaloneProcessClient: gRPC forwarding to a standalone server.
 ///   - DistributedClient: master-led global routing + RDMA data plane.
 ///
 /// Use CreateUMBPClient() to obtain the appropriate implementation based on
@@ -85,6 +86,21 @@ class IUMBPClient {
                                      const std::vector<uintptr_t>& dsts,
                                      const std::vector<size_t>& sizes) = 0;
 
+  /// Read byte ranges of stored objects into scattered user buffers. Shape
+  /// errors fail the whole batch; data errors are reported per key.
+  virtual std::vector<bool> BatchGetRanges(const std::vector<std::string>& keys,
+                                           const std::vector<std::vector<uintptr_t>>& dsts,
+                                           const std::vector<std::vector<size_t>>& sizes,
+                                           const std::vector<std::vector<size_t>>& src_offsets) = 0;
+
+  /// Atomically publish objects assembled from scattered buffers. The ranges
+  /// for each key must exactly tile [0, object_sizes[i]).
+  virtual std::vector<bool> BatchPutRanges(const std::vector<std::string>& keys,
+                                           const std::vector<size_t>& object_sizes,
+                                           const std::vector<std::vector<uintptr_t>>& srcs,
+                                           const std::vector<std::vector<size_t>>& sizes,
+                                           const std::vector<std::vector<size_t>>& dst_offsets) = 0;
+
   virtual std::vector<bool> BatchExists(const std::vector<std::string>& keys) const = 0;
 
   /// Returns the number of keys that exist consecutively from index 0.
@@ -119,6 +135,14 @@ class IUMBPClient {
     return IsDistributed() ? UMBPDeploymentMode::Distributed : UMBPDeploymentMode::Local;
   }
 
+  /// Returns the backend behind a forwarding client. For direct clients this
+  /// equals GetDeploymentMode(); StandaloneProcessClient overrides it with the
+  /// mode reported by the server's Ping response.
+  virtual UMBPDeploymentMode GetBackendMode() const { return GetDeploymentMode(); }
+
+  /// Whether this concrete backend implements ranged multi-buffer I/O.
+  virtual bool SupportsRangedIO() const { return false; }
+
   // ---- Optional zero-copy hooks ----
   //
   // Register a host buffer for zero-copy RDMA transfers.  Standalone
@@ -132,10 +156,13 @@ class IUMBPClient {
   /// not any storage medium — a GPU-resident src/dst (e.g. sglang HiCache
   /// device-resident KV pages) must be registered as such so the transfer
   /// layer picks HbmCopyEngine instead of assuming host memory.
+  /// `mode` picks whether the region is pinned and exported to the IO engine
+  /// or merely recorded for engine selection; see MemoryRegistration. A backend
+  /// with nothing to pin may ignore it.
   virtual bool RegisterMemory(
       uintptr_t /*ptr*/, size_t /*size*/,
-      mori::io::MemoryLocationType /*loc*/ = mori::io::MemoryLocationType::CPU,
-      int /*device*/ = -1) {
+      mori::io::MemoryLocationType /*loc*/ = mori::io::MemoryLocationType::CPU, int /*device*/ = -1,
+      MemoryRegistration /*mode*/ = MemoryRegistration::kPinned) {
     return true;
   }
   virtual void DeregisterMemory(uintptr_t /*ptr*/) {}

@@ -166,6 +166,11 @@
 #define MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP \
   "Total bytes delivered to this client (inbound reads) split by local/remote traffic"
 
+#define MORI_UMBP_METRIC_RANGED_REMOTE_INSTALL_FAILURES_TOTAL \
+  "mori_umbp_ranged_remote_install_failures_total"
+#define MORI_UMBP_METRIC_RANGED_REMOTE_INSTALL_FAILURES_TOTAL_HELP \
+  "Remote ranged objects that could not be synchronously installed in the local medium"
+
 // --- Heartbeat / event-shipping counters (master-as-advisor) ----------------
 
 #define MORI_UMBP_METRIC_HEARTBEAT_EVENTS_APPLIED_TOTAL "mori_umbp_heartbeat_events_applied_total"
@@ -188,6 +193,27 @@
   "BatchGet e2e call bandwidth in GiB/s (successful bytes only, split by client and local/remote " \
   "traffic)"
 
+// Ranged siblings.  Kept as their own series rather than folded into the two
+// above: a ranged call moves a SUBSET of each object, so mixing them would make
+// the whole-object families' bytes-per-call meaningless.  Bytes counted are the
+// range bytes actually delivered to (or committed from) the caller's buffers,
+// which is what the caller sees and what the sglang tree connector reports on
+// its side -- note that a REMOTE ranged get still moves the whole object over
+// the wire into the scratch arena, so its wire traffic exceeds what this
+// histogram credits (mori_umbp_client_*bound_get_bytes_total covers that).
+
+#define MORI_UMBP_METRIC_CLIENT_BATCH_PUT_RANGES_BANDWIDTH \
+  "mori_umbp_client_batch_put_ranges_bandwidth_gibps"
+#define MORI_UMBP_METRIC_CLIENT_BATCH_PUT_RANGES_BANDWIDTH_HELP                                  \
+  "BatchPutRanges e2e call bandwidth in GiB/s (committed range bytes only, split by client and " \
+  "local/remote traffic)"
+
+#define MORI_UMBP_METRIC_CLIENT_BATCH_GET_RANGES_BANDWIDTH \
+  "mori_umbp_client_batch_get_ranges_bandwidth_gibps"
+#define MORI_UMBP_METRIC_CLIENT_BATCH_GET_RANGES_BANDWIDTH_HELP                                  \
+  "BatchGetRanges e2e call bandwidth in GiB/s (delivered range bytes only, split by client and " \
+  "local/remote traffic)"
+
 // --- MasterClient -> MasterServer RPC latency (client-perceived) -----------
 // Histogram of round-trip latency for every RPC method on the
 // MasterClient channel, reported by clients via ReportMetrics.  Labels
@@ -208,10 +234,14 @@
   "Number of histogram observations dropped client-side because the pending buffer hit its cap " \
   "(see kMasterClientMaxPendingHistograms in master_client.h)"
 
-// --- SSD tier metrics -------------------------------------------------------
-// Removed in the backend-agnostic refactor Phase 0: SSD is unwired from the
-// distributed data plane (copy-on-commit pipeline, peer reads, read-staging
-// slots, the reader-side transient-retry counter, and the
-// mori_umbp_client_capacity_{used,total}_bytes{tier="SSD"} advertisement all
-// went with it — see design-backend-agnostic-refactor.md). Local (standalone)
-// mode is unaffected: it has no master/heartbeat and never shipped these.
+// --- Storage-backend and transfer-layer metrics -----------------------------
+//
+// NOT here.  Everything a medium or a transport reports now lives in
+// umbp/distributed/metrics/component_metrics.h under names that carry the
+// medium in a LABEL rather than in the identifier, because the previous
+// arrangement — mori_umbp_ssd_* beside an implicit DRAM set — is what forced a
+// separate dashboard per medium and left an SSD panel wired to counters that
+// no longer had a publisher after the backend-agnostic refactor.
+//
+// This header keeps what the MASTER itself measures.  A peer-side component's
+// metrics arrive through ReportMetrics and are named by the component.

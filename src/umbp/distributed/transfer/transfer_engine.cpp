@@ -22,14 +22,46 @@
 #include "umbp/distributed/transfer/transfer_engine.h"
 
 #include <algorithm>
+#include <chrono>
 
 namespace mori::umbp {
 
+namespace {
+
+// Adds its lifetime to a sink; a null sink makes it inert, so an untimed
+// Transfer does not even read the clock.
+class StepTimer {
+ public:
+  explicit StepTimer(double* sink)
+      : sink_(sink),
+        start_(sink ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+  ~StepTimer() { Stop(); }
+  StepTimer(const StepTimer&) = delete;
+  StepTimer& operator=(const StepTimer&) = delete;
+  void Stop() {
+    if (sink_ == nullptr) return;
+    *sink_ += std::chrono::duration_cast<std::chrono::duration<double>>(
+                  std::chrono::steady_clock::now() - start_)
+                  .count();
+    sink_ = nullptr;
+  }
+
+ private:
+  double* sink_;
+  std::chrono::steady_clock::time_point start_;
+};
+
+}  // namespace
+
 bool TransferEngine::Transfer(const std::vector<TransferItem>& items,
-                              std::vector<size_t>* failed_tags) {
+                              std::vector<size_t>* failed_tags, const StepTiming* timing) {
   if (items.empty()) return true;
 
-  TransferPlanSet planned = Plan(items);
+  TransferPlanSet planned;
+  {
+    StepTimer plan_timer(timing ? timing->plan : nullptr);
+    planned = Plan(items);
+  }
   bool ok = planned.rejected_tags.empty();
   if (failed_tags != nullptr) {
     failed_tags->insert(failed_tags->end(), planned.rejected_tags.begin(),
@@ -44,7 +76,11 @@ bool TransferEngine::Transfer(const std::vector<TransferItem>& items,
     planned_tags.insert(planned_tags.end(), plan.tags.begin(), plan.tags.end());
   }
 
-  auto handle = Submit(std::move(planned.plans));
+  std::unique_ptr<TransferHandle> handle;
+  {
+    StepTimer submit_timer(timing ? timing->submit : nullptr);
+    handle = Submit(std::move(planned.plans));
+  }
   if (handle == nullptr) {
     if (failed_tags != nullptr) {
       failed_tags->insert(failed_tags->end(), planned_tags.begin(), planned_tags.end());
@@ -53,7 +89,10 @@ bool TransferEngine::Transfer(const std::vector<TransferItem>& items,
   }
 
   std::vector<TransferFailure> failures;
-  handle->Wait(&failures);
+  {
+    StepTimer wait_timer(timing ? timing->wait : nullptr);
+    handle->Wait(&failures);
+  }
   if (failures.empty()) return ok;
   if (failed_tags != nullptr) {
     for (const auto& f : failures) {

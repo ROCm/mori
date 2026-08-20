@@ -166,6 +166,16 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("capacity_bytes", &UMBPSsdConfig::capacity_bytes)
       .def_readwrite("layout_mode", &UMBPSsdConfig::layout_mode)
       .def_readwrite("segment_size_bytes", &UMBPSsdConfig::segment_size_bytes)
+      // Multi-drive: storage_dir accepts a comma-separated list (one per drive);
+      // shard_io_threads=0 means one worker per drive.
+      .def_readwrite("shard_io_threads", &UMBPSsdConfig::shard_io_threads)
+      .def_readwrite("tier_io_threads", &UMBPSsdConfig::tier_io_threads)
+      .def_readwrite("direct_io", &UMBPSsdConfig::direct_io)
+      .def_readwrite("verify_crc", &UMBPSsdConfig::verify_crc)
+      // sglang's UMBPStore builds UMBPConfig directly rather than via
+      // FromEnvironment(), so UMBP_SSD_SINGLE_FLIGHT never reaches it — this is
+      // the only way to turn coalescing off on that path.
+      .def_readwrite("single_flight_reads", &UMBPSsdConfig::single_flight_reads)
       .def_readwrite("high_watermark", &UMBPSsdConfig::high_watermark)
       .def_readwrite("low_watermark", &UMBPSsdConfig::low_watermark)
       .def_readwrite("io", &UMBPSsdConfig::io)
@@ -238,10 +248,15 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("master_config", &UMBPDistributedConfig::master_config)
       .def_readwrite("io_engine", &UMBPDistributedConfig::io_engine)
       .def_readwrite("staging_buffer_size", &UMBPDistributedConfig::staging_buffer_size)
+      .def_readwrite("ranged_scratch_size", &UMBPDistributedConfig::ranged_scratch_size)
       .def_readwrite("ssd_staging_buffer_size", &UMBPDistributedConfig::ssd_staging_buffer_size)
       .def_readwrite("ssd_staging_buffer_slots", &UMBPDistributedConfig::ssd_staging_buffer_slots)
+      .def_readwrite("ssd_staging_use_hugepages", &UMBPDistributedConfig::ssd_staging_use_hugepages)
+      .def_readwrite("ssd_staging_hugepage_size", &UMBPDistributedConfig::ssd_staging_hugepage_size)
       .def_readwrite("peer_service_port", &UMBPDistributedConfig::peer_service_port)
       .def_readwrite("cache_remote_fetches", &UMBPDistributedConfig::cache_remote_fetches)
+      .def_readwrite("ranged_locality_prefetch", &UMBPDistributedConfig::ranged_locality_prefetch)
+      .def_readwrite("local_first", &UMBPDistributedConfig::local_first)
       .def_readwrite("cache_remote_admission", &UMBPDistributedConfig::cache_remote_admission)
       .def_readwrite("admission_max_block_bytes", &UMBPDistributedConfig::admission_max_block_bytes)
       .def_readwrite("dram_page_size", &UMBPDistributedConfig::dram_page_size)
@@ -292,6 +307,12 @@ void RegisterMoriUmbp(py::module_& m) {
            py::call_guard<py::gil_scoped_release>())
       .def("batch_get_into_ptr", &IUMBPClient::BatchGet, py::arg("keys"), py::arg("ptrs"),
            py::arg("sizes"), py::call_guard<py::gil_scoped_release>())
+      .def("batch_get_ranges_into_ptr", &IUMBPClient::BatchGetRanges, py::arg("keys"),
+           py::arg("ptrs"), py::arg("sizes"), py::arg("src_offsets"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("batch_put_ranges_from_ptr", &IUMBPClient::BatchPutRanges, py::arg("keys"),
+           py::arg("object_sizes"), py::arg("ptrs"), py::arg("sizes"), py::arg("dst_offsets"),
+           py::call_guard<py::gil_scoped_release>())
       .def("batch_exists", &IUMBPClient::BatchExists, py::arg("keys"),
            py::call_guard<py::gil_scoped_release>())
       .def("batch_exists_consecutive", &IUMBPClient::BatchExistsConsecutive, py::arg("keys"),
@@ -300,9 +321,20 @@ void RegisterMoriUmbp(py::module_& m) {
       .def("flush", &IUMBPClient::Flush, py::call_guard<py::gil_scoped_release>())
       .def("is_distributed", &IUMBPClient::IsDistributed)           // pure getter, no I/O
       .def("get_deployment_mode", &IUMBPClient::GetDeploymentMode)  // pure getter, no I/O
-      .def("register_memory", &IUMBPClient::RegisterMemory, py::arg("ptr"), py::arg("size"),
-           py::arg("loc") = mori::io::MemoryLocationType::CPU, py::arg("device") = -1,
-           py::call_guard<py::gil_scoped_release>())
+      .def("get_backend_mode", &IUMBPClient::GetBackendMode)        // pure getter, no I/O
+      .def("supports_ranged_io", &IUMBPClient::SupportsRangedIO)    // pure getter, no I/O
+      // Bound to the pinned form on purpose.  MemoryRegistration selects
+      // whether a region is pinned for RDMA or merely recorded for local
+      // copies, and that is decided by the deployment -- the standalone server
+      // picks it from its inner backend mode.  A caller reaching this binding
+      // is registering its own buffers and always wants them pinned, so the
+      // knob is kept off the Python surface rather than offered and ignored.
+      .def(
+          "register_memory",
+          [](IUMBPClient& self, uintptr_t ptr, size_t size, mori::io::MemoryLocationType loc,
+             int device) { return self.RegisterMemory(ptr, size, loc, device); },
+          py::arg("ptr"), py::arg("size"), py::arg("loc") = mori::io::MemoryLocationType::CPU,
+          py::arg("device") = -1, py::call_guard<py::gil_scoped_release>())
       .def("deregister_memory", &IUMBPClient::DeregisterMemory, py::arg("ptr"),
            py::call_guard<py::gil_scoped_release>())
       .def("report_external_kv_blocks", &IUMBPClient::ReportExternalKvBlocks, py::arg("hashes"),

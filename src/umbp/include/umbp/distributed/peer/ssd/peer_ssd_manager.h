@@ -47,19 +47,15 @@ struct SsdReadOutcome {
   size_t size = 0;
 };
 
-// Peer-side owner of the local SSD tier in the master-as-advisor design.
-// Single responsibility: manage one SSD TierBackend + the key->SSD-location
-// map + capacity + the owned-location event outbox + the read-prepare and
-// local-eviction paths.  It deliberately reuses ONLY the low-level TierBackend
-// (SSDTier); it must NOT pull in LocalStorageManager / LocalBlockIndex (which
-// carry their own DRAM tier + demote/promote) — peer DRAM is owned by
-// PageBackend and two DRAM concepts would scramble ownership.
+// Peer-side owner of the local SSD tier: one SSD TierBackend + the
+// key->SSD-location map, capacity, the owned-location event outbox, and the
+// read-prepare and local-eviction paths.  Reached from the distributed data
+// plane through SsdBackend : MediumBackend, which forwards to it.
 //
-// Dormant: unwired from the distributed data plane (see
-// design-backend-agnostic-refactor.md Phase 0). No longer implements
-// OwnedLocationSource — that wiring is exactly the coupling Phase 0 removes —
-// but keeps the same-shaped DrainPendingEvents / SnapshotOwnedKeys methods so
-// a future SsdBackend : MediumBackend adapter can forward to them directly.
+// It deliberately reuses ONLY the low-level TierBackend (SSDTier); it must NOT
+// pull in LocalStorageManager / LocalBlockIndex, which carry their own DRAM
+// tier + demote/promote — peer DRAM is owned by PageBackend, and two DRAM
+// concepts would scramble ownership.
 class PeerSsdManager {
  public:
   explicit PeerSsdManager(const PeerSsdConfig& cfg);
@@ -67,7 +63,8 @@ class PeerSsdManager {
   // Test-only: inject a ready-made backend and explicit watermarks so unit
   // tests can drive eviction with a controllable (e.g. blocking) fake backend.
   // Production code must use the config constructor.
-  PeerSsdManager(std::unique_ptr<TierBackend> backend, double high_watermark, double low_watermark);
+  PeerSsdManager(std::unique_ptr<TierBackend> backend, double high_watermark, double low_watermark,
+                 bool single_flight = true);
 
   ~PeerSsdManager();
 
@@ -96,6 +93,21 @@ class PeerSsdManager {
   // (best-effort clean).
   bool Write(const std::string& key, const std::vector<std::pair<const void*, size_t>>& segments,
              size_t total_size);
+
+  // Batched form of Write for contiguous sources — the SsdBackend::BatchCommit
+  // path.  One dedup pass, ONE backend BatchWrite (which a multi-drive
+  // ShardedSsdTier fans across every drive in parallel), then one recording
+  // pass.  This is what makes an SSD-target batch put scale with drive count
+  // instead of serializing key-by-key; a per-key Write loop would idle every
+  // drive but one.
+  //
+  // Result length and order match @p keys.  An already-owned key reports true
+  // without any device IO (LRU refreshed).  On a partial failure the failed keys
+  // are retried once after a single eviction round, so a batch that trips the
+  // high watermark mid-way still lands.
+  std::vector<bool> WriteBatch(const std::vector<std::string>& keys,
+                               const std::vector<const void*>& srcs,
+                               const std::vector<size_t>& sizes);
 
   // Local eviction of a single key.  Read priority: a key with an
   // in-flight PrepareRead (inflight_reads_ > 0) is NOT evicted (returns false).
@@ -141,6 +153,21 @@ class PeerSsdManager {
   // in-flight (inflight_reads_) across that window so eviction skips it.
   SsdReadOutcome PrepareRead(const std::string& key, void* staging_ptr, size_t staging_cap);
 
+  // Batched form of PrepareRead: resolve + mark every key in flight under one
+  // lock, issue ONE backend BatchReadIntoPtr (fanned across drives by
+  // ShardedSsdTier), then release the marks in one pass.  Per-key semantics are
+  // identical to PrepareRead — including kNotFound for an evicting key and
+  // kSizeTooLarge rejected before any device IO.
+  //
+  // This is the throughput path: the per-key form costs one device read per
+  // key and leaves every drive but one idle, so a multi-drive tier can only be
+  // saturated through here.
+  //
+  // @p dsts and @p caps are parallel to @p keys; the result is too.
+  std::vector<SsdReadOutcome> PrepareReadBatch(const std::vector<std::string>& keys,
+                                               const std::vector<void*>& dsts,
+                                               const std::vector<size_t>& caps);
+
   // Same shape as OwnedLocationSource (see the class comment above) — all
   // events carry TierType::SSD.
   std::vector<KvEvent> DrainPendingEvents();
@@ -167,6 +194,12 @@ class PeerSsdManager {
     return metrics_.read_size_too_large.load(std::memory_order_relaxed);
   }
   uint64_t ReadError() const { return metrics_.read_error.load(std::memory_order_relaxed); }
+  // Single-flight coalescing: leads issue device IO, dups are the concurrent
+  // same-key requests, merged is the subset of dups actually served from a
+  // leader's buffer.  dup - merged is the residue that still hit the drive.
+  uint64_t ReadLead() const { return metrics_.read_lead.load(std::memory_order_relaxed); }
+  uint64_t ReadDup() const { return metrics_.read_dup.load(std::memory_order_relaxed); }
+  uint64_t ReadMerged() const { return metrics_.read_merged.load(std::memory_order_relaxed); }
   // Byte counters for SSD IO bandwidth (rate() in Grafana = bytes/s).
   uint64_t CopyBytes() const { return metrics_.copy_bytes.load(std::memory_order_relaxed); }
   uint64_t ReadBytes() const { return metrics_.read_bytes.load(std::memory_order_relaxed); }
@@ -215,14 +248,67 @@ class PeerSsdManager {
   std::list<std::string> lru_;  // front = most-recently-used, back = LRU
   std::vector<KvEvent> pending_events_;
 
+  // One follower attached to a leader's read.  Delivery is a memcpy into
+  // {dst, cap} out of the leader's staging slot.
+  //
+  // Held by shared_ptr on both sides: the leader swaps the follower list out of
+  // the episode when it seals, so a follower cannot read its own outcome out of
+  // that list afterwards — it keeps its own handle instead.
+  //
+  // Buffer lifetime: both leader and followers are blocked inside
+  // PrepareRead/PrepareReadBatch for the whole copy, so neither side's staging
+  // slot can be recycled underneath the memcpy.
+  struct FollowerTarget {
+    void* dst = nullptr;
+    size_t cap = 0;
+    // Written by the leader before it sets episode->done, read by the follower
+    // after it wakes.
+    bool ok = false;
+  };
+
+  // One leader's read, from claim to fan-out.  Followers capture a shared_ptr
+  // at attach time and wait on *this* object, never on mutable per-key state:
+  // otherwise a leader that finishes and is immediately replaced by a new
+  // leader on the same key would reset the flag a not-yet-woken follower is
+  // waiting on, and that follower would silently start tracking a read whose
+  // fan-out list it is not in.  Holding the shared_ptr also lets the episode
+  // outlive its slot, so the last follower to wake still finds valid state.
+  //
+  // Note there is deliberately no episode-level `ok`: the leader's read outcome
+  // reaches each follower through that follower's own FollowerTarget::ok.
+  // `done` is the only thing followers wait on.
+  struct ReadEpisode {
+    bool sealed = false;  // snapshot taken; late arrivals must not attach
+    bool done = false;    // leader finished (read + fan-out)
+    std::vector<std::shared_ptr<FollowerTarget>> followers;
+    std::condition_variable cv;  // waited on under mutex_
+  };
+
+  struct InflightRead {
+    int refs = 0;  // leader + followers + independents holding this key
+    // Non-null exactly while a leader is mid-read; the leader clears it on
+    // completion so the next arrival starts a fresh episode.
+    std::shared_ptr<ReadEpisode> episode;
+  };
+
   // Read priority + eviction coordination (all guarded by mutex_):
-  //   inflight_reads_: key -> active PrepareRead count (entry exists only while
-  //     > 0).  Eviction skips keys with a live read.
+  //   inflight_reads_: key -> InflightRead (entry exists only while refs > 0).
+  //     Eviction skips keys with a live read.
   //   evicting_: keys currently inside Evict's backend-evict window; new reads
   //     of these miss (kNotFound) and SelectVictims skips them.
-  std::unordered_map<std::string, int> inflight_reads_;
+  std::unordered_map<std::string, std::unique_ptr<InflightRead>> inflight_reads_;
   std::unordered_set<std::string> evicting_;
   std::condition_variable reads_drained_cv_;  // notified when inflight_reads_ empties
+
+  // Coalesce concurrent same-key reads (UMBPSsdConfig::single_flight_reads).
+  // Off => every requester reads the device, and read_dup still reports the
+  // headroom that turning it on would recover.
+  bool single_flight_ = true;
+
+  // Cap on how long a follower waits for its leader.  A wedged or crashed
+  // leader must surface as a read error rather than hanging the RPC; the caller
+  // treats it as a miss and refetches from source.
+  static constexpr int kFollowerWaitSeconds = 30;
 
   // Prometheus-only observability counters: relaxed atomics bumped at discrete
   // events, read once per metrics tick.  NOT correctness state
@@ -232,6 +318,18 @@ class PeerSsdManager {
     std::atomic<uint64_t> read_not_found{0};
     std::atomic<uint64_t> read_size_too_large{0};
     std::atomic<uint64_t> read_error{0};
+    // Single-flight accounting.  A requester that finds no in-flight read of
+    // the key is a "lead" (it is the one that issues device IO); one that finds
+    // an in-flight read is a "dup" — a concurrent request for the identical key
+    // that could attach to it instead.  MLA + TP is the case that produces them
+    // (all attention-TP ranks GET a byte-identical key); MHA keys carry a
+    // per-rank suffix and should never dup.
+    std::atomic<uint64_t> read_lead{0};
+    std::atomic<uint64_t> read_dup{0};
+    // Of the read_dup requests, those actually served by memcpy from a leader
+    // (single_flight_ on and the merge window not missed).  read_dup minus this
+    // is the residue that still hit the drive.
+    std::atomic<uint64_t> read_merged{0};
     std::atomic<uint64_t> copy_bytes{0};  // bytes written to SSD (write IO)
     std::atomic<uint64_t> read_bytes{0};  // bytes read from SSD (read IO)
     std::atomic<uint64_t> evict_rounds{0};

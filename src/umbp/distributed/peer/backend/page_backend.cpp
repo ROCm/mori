@@ -454,7 +454,7 @@ ResolvedEntry PageBackend::Resolve(const std::string& key) {
   // Extend the read lease so concurrent Evict reports bytes_freed=0 for
   // this key.  steady_clock is monotonic and read_lease_ttl_ is fixed,
   // so this assignment is always >= any previous deadline for the key.
-  read_lease_until_[key] = std::chrono::steady_clock::now() + read_lease_ttl_;
+  it->second.read_lease_until = std::chrono::steady_clock::now() + read_lease_ttl_;
   return r;
 }
 
@@ -463,9 +463,11 @@ std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::stri
   std::vector<ResolvedEntry> out(keys.size());
   if (keys.empty()) return out;
   std::lock_guard<std::mutex> lock(mutex_);
+  // One now() for the batch: it runs in well under a millisecond against a
+  // TTL measured in seconds, so the last key loses nothing worth a syscall.
+  const auto lease_deadline = std::chrono::steady_clock::now() + read_lease_ttl_;
   for (size_t i = 0; i < keys.size(); ++i) {
-    const auto& key = keys[i];
-    auto it = owned_.find(key);
+    auto it = owned_.find(keys[i]);
     if (it == owned_.end()) continue;
     auto& entry = out[i];
     entry.found = true;
@@ -473,9 +475,7 @@ std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::stri
     entry.size = it->second.size;
     entry.page_size = page_size_;
     if (include_descs) entry.descs = BuildBufferDescsLocked(it->second.pages);
-    // Per-key now(): matches single-key Resolve() so the last key in
-    // a large batch isn't shortchanged by earlier keys' work.
-    read_lease_until_[key] = std::chrono::steady_clock::now() + read_lease_ttl_;
+    it->second.read_lease_until = lease_deadline;
   }
   return out;
 }
@@ -520,7 +520,7 @@ std::vector<EvictResult> PageBackend::Evict(const std::vector<std::string>& keys
       out.push_back(std::move(r));
       continue;
     }
-    if (HasActiveReadLeaseLocked(key)) {
+    if (HasActiveReadLeaseLocked(it->second, std::chrono::steady_clock::now())) {
       // Master will retry next round once the lease expires.  Emit no event.
       out.push_back(std::move(r));
       continue;
@@ -624,12 +624,11 @@ void PageBackend::ClearLocal() {
   // REMOVE events — the upcoming full-sync empty snapshot collapses
   // master's index.
   for (auto& [key, slot] : owned_) {
-    auto lease_it = read_lease_until_.find(key);
-    if (lease_it != read_lease_until_.end() && lease_it->second > now) {
+    if (slot.read_lease_until > now) {
       DeferredFree df;
       df.key = key;
       df.pages = std::move(slot.pages);
-      df.release_at = lease_it->second;
+      df.release_at = slot.read_lease_until;
       deferred_frees_.push_back(std::move(df));
       continue;
     }
@@ -637,8 +636,8 @@ void PageBackend::ClearLocal() {
   }
   owned_.clear();
 
-  // Active read-lease deadlines that mattered are already in deferred_frees_.
-  read_lease_until_.clear();
+  // Deadlines that mattered are already in deferred_frees_; the rest went
+  // with owned_.
   pins_.clear();
 
   // Drop any queued ADD/REMOVE that the heartbeat hasn't shipped yet: the
@@ -775,14 +774,9 @@ std::vector<BufferMemoryDescBytes> PageBackend::BuildBufferDescsLocked(
 //  Read-lease helper
 // ---------------------------------------------------------------------------
 
-bool PageBackend::HasActiveReadLeaseLocked(const std::string& key) {
-  auto it = read_lease_until_.find(key);
-  if (it == read_lease_until_.end()) return false;
-  if (it->second <= std::chrono::steady_clock::now()) {
-    read_lease_until_.erase(it);
-    return false;
-  }
-  return true;
+bool PageBackend::HasActiveReadLeaseLocked(const OwnedSlot& slot,
+                                           std::chrono::steady_clock::time_point now) {
+  return slot.read_lease_until > now;
 }
 
 // ---------------------------------------------------------------------------
@@ -824,16 +818,6 @@ void PageBackend::ReaperSweep() {
       MORI_UMBP_DEBUG("[PageBackend] reaped pending slot {} ({} bytes)", it->first,
                       it->second.size);
       it = pending_.erase(it);
-    } else {
-      ++it;
-    }
-  }
-
-  // Drop expired read leases so they stop blocking eviction and the map
-  // size stays bounded.
-  for (auto it = read_lease_until_.begin(); it != read_lease_until_.end();) {
-    if (it->second <= now) {
-      it = read_lease_until_.erase(it);
     } else {
       ++it;
     }

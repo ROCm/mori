@@ -159,11 +159,12 @@ void test_build_reserve_split() {
   assert(built.crc32 == ComputeRecordCrc32(key, value.data(), value.size()));
   assert(pr.crc32 == built.crc32);
   assert(built.generation == 0);  // not yet reserved
-  assert(pr.record.size() == sizeof(RecordHeader) + key.size() + value.size());
+  // v3 pads the record so the value starts on a kRecordAlign boundary.
+  assert(pr.record.size() == RecordBytes(key.size(), value.size()));
+  assert(pr.record.size() % kRecordAlign == 0);
   // Key and value bytes are already in place before the lock is taken.
   assert(std::memcmp(pr.record.data() + sizeof(RecordHeader), key.data(), key.size()) == 0);
-  assert(std::memcmp(pr.record.data() + sizeof(RecordHeader) + key.size(), value.data(),
-                     value.size()) == 0);
+  assert(std::memcmp(pr.record.data() + PrefixBytes(key.size()), value.data(), value.size()) == 0);
 
   // Reserve stamps a real generation into the already-built buffer.
   Index index(1 << 20);
@@ -180,8 +181,12 @@ void test_build_reserve_split() {
   assert(reserved.crc32 == built.crc32);
   assert(reserved.key_len == built.key_len);
   assert(reserved.value_size == built.value_size);
-  assert(std::memcmp(pr.record.data() + sizeof(RecordHeader) + key.size(), value.data(),
-                     value.size()) == 0);
+  assert(std::memcmp(pr.record.data() + PrefixBytes(key.size()), value.data(), value.size()) == 0);
+  // The reservation must put the value on an aligned offset -- the precondition
+  // that makes the record readable and writable with O_DIRECT.
+  assert(pr.reservation.record_offset % kRecordAlign == 0);
+  assert(pr.reservation.meta.value_offset % kRecordAlign == 0);
+  assert(seg.write_offset % kRecordAlign == 0);
 
   // Generations strictly advance, so recovery can order two writes of one key.
   PreparedRecord pr2;

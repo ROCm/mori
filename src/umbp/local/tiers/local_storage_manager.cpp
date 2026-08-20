@@ -27,10 +27,13 @@
 #include <cstring>
 #include <stdexcept>
 #include <thread>
+#include <unordered_set>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/range_utils.h"
 #include "umbp/local/tiers/dram_tier.h"
 #include "umbp/local/tiers/dummy_ssd_tier.h"
+#include "umbp/local/tiers/ssd_backend_factory.h"
 #include "umbp/local/tiers/ssd_tier.h"
 #ifdef USE_SPDK
 #include "umbp/local/tiers/spdk_ssd_tier.h"
@@ -519,8 +522,7 @@ LocalStorageManager::LocalStorageManager(const UMBPConfig& config,
       if (role_ == UMBPRole::SharedSSDFollower) {
         segmented_access_mode = SSDAccessMode::ReadOnlyShared;
       }
-      ssd_backend = std::make_unique<SSDTier>(config_.ssd.storage_dir, config_.ssd.capacity_bytes,
-                                              config_.ssd, segmented_access_mode);
+      ssd_backend = MakeFileSsdBackend(config_.ssd, segmented_access_mode);
     }
     tiers_.push_back({StorageTier::LOCAL_SSD, std::move(ssd_backend)});
   }
@@ -710,6 +712,97 @@ std::vector<bool> LocalStorageManager::WriteBatchFromPtr(const std::vector<std::
   return results;
 }
 
+bool LocalStorageManager::WriteRangesFromPtr(const std::string& key, size_t object_size,
+                                             const std::vector<uintptr_t>& srcs,
+                                             const std::vector<size_t>& sizes,
+                                             const std::vector<size_t>& dst_offsets,
+                                             StorageTier tier) {
+  // Ranged I/O is intentionally DRAM-only in v1.
+  if (tier != StorageTier::CPU_DRAM || !RangesTileObject(object_size, sizes, dst_offsets) ||
+      srcs.size() != sizes.size()) {
+    return false;
+  }
+  TierBackend* target = GetTier(tier);
+  if (!target) return false;
+
+  std::vector<const void*> ptrs;
+  ptrs.reserve(srcs.size());
+  for (uintptr_t src : srcs) ptrs.push_back(reinterpret_cast<const void*>(src));
+
+  auto attempt = [&]() {
+    auto result = target->BatchWriteRanges({key}, {object_size}, {ptrs}, {sizes}, {dst_offsets});
+    return result.size() == 1 && result[0];
+  };
+  if (attempt()) return true;
+
+  while (DemoteLRUForSpace(target)) {
+    if (attempt()) return true;
+  }
+
+  TierBackend* faster_than_target = NextFasterTier(target->tier_id());
+  while (true) {
+    std::string victim = SelectVictim(target);
+    if (victim.empty()) return false;
+    std::vector<std::string> group = GetGroup(victim);
+    for (const auto& k : group) {
+      if (!target->Exists(k)) continue;
+      const bool only_on_target = !faster_than_target || !faster_than_target->Exists(k);
+      target->Evict(k);
+      if (only_on_target) {
+        if (on_tier_change_) {
+          on_tier_change_(k, target->tier_id(), std::nullopt, std::nullopt);
+        }
+        if (index_) index_->Remove(k);
+        RemoveDepthAndGroup(k);
+      }
+    }
+    if (attempt()) return true;
+  }
+}
+
+std::vector<bool> LocalStorageManager::WriteBatchRangesFromPtr(
+    const std::vector<std::string>& keys, const std::vector<size_t>& object_sizes,
+    const std::vector<std::vector<uintptr_t>>& srcs, const std::vector<std::vector<size_t>>& sizes,
+    const std::vector<std::vector<size_t>>& dst_offsets, StorageTier tier) {
+  const size_t n = keys.size();
+  std::vector<bool> results(n, false);
+  if (object_sizes.size() != n || !RangeBatchShapeValid(n, srcs, sizes, dst_offsets) || n == 0 ||
+      tier != StorageTier::CPU_DRAM) {
+    return results;
+  }
+
+  TierBackend* target = GetTier(tier);
+  if (!target) return results;
+
+  std::unordered_set<std::string> seen;
+  std::unordered_set<std::string> duplicates;
+  for (const auto& key : keys) {
+    if (!seen.insert(key).second) duplicates.insert(key);
+  }
+
+  std::vector<std::vector<const void*>> ptrs(n);
+  std::vector<bool> valid(n, false);
+  for (size_t i = 0; i < n; ++i) {
+    valid[i] = duplicates.count(keys[i]) == 0 &&
+               RangesTileObject(object_sizes[i], sizes[i], dst_offsets[i]);
+    ptrs[i].reserve(srcs[i].size());
+    for (uintptr_t src : srcs[i]) ptrs[i].push_back(reinterpret_cast<const void*>(src));
+  }
+  results = target->BatchWriteRanges(keys, object_sizes, ptrs, sizes, dst_offsets);
+  if (results.size() != n) results.assign(n, false);
+  for (size_t i = 0; i < n; ++i) {
+    if (duplicates.count(keys[i]) != 0) results[i] = false;
+  }
+
+  for (size_t i = 0; i < n; ++i) {
+    if (!results[i] && valid[i]) {
+      results[i] =
+          WriteRangesFromPtr(keys[i], object_sizes[i], srcs[i], sizes[i], dst_offsets[i], tier);
+    }
+  }
+  return results;
+}
+
 bool LocalStorageManager::ReadIntoPtr(const std::string& key, uintptr_t dst, size_t size) {
   bool ok = ReadIntoPtrNoPromote(key, dst, size);
   if (ok && config_.eviction.auto_promote_on_read) {
@@ -827,6 +920,118 @@ std::vector<bool> LocalStorageManager::ReadBatchIntoPtr(const std::vector<std::s
   for (size_t idx : no_hint_indices) {
     if (results[idx]) continue;  // already resolved
     results[idx] = ReadIntoPtr(keys[idx], dst_ptrs[idx], sizes[idx]);
+  }
+
+  return results;
+}
+
+std::vector<bool> LocalStorageManager::ReadBatchRangesIntoPtr(
+    const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dst_ptrs,
+    const std::vector<std::vector<size_t>>& sizes,
+    const std::vector<std::vector<size_t>>& src_offsets) {
+  const size_t n = keys.size();
+  std::vector<bool> results(n, false);
+  if (!RangeBatchShapeValid(n, dst_ptrs, sizes, src_offsets) || n == 0) return results;
+
+  // Route by the tier that actually holds each key, exactly as ReadBatchIntoPtr
+  // does.  Sending everything to DRAM was what "ranged I/O is DRAM-only" meant
+  // in practice: a key the DRAM tier had demoted read back as a miss rather
+  // than as a slower hit, and the caller could not tell the two apart.
+  constexpr int kNumTiers = 2;
+
+  // Issue at most one call per tier per pass.  Batching is not a micro-
+  // optimisation here: it is what lets the SSD tier coalesce runs, submit one
+  // io_uring batch, and fan out across drives.  A per-key fallback silently
+  // costs ~5x on a 512-key batch, so the retry below is batched too.
+  auto read_from_tier = [&](int tier_index, const std::vector<size_t>& indices,
+                            std::vector<size_t>* failed) {
+    if (indices.empty()) return;
+    TierBackend* tier = GetTier(static_cast<StorageTier>(tier_index));
+    if (!tier || !tier->Capabilities().ranged_read) {
+      // No ranged support on this tier: not a miss, just the wrong door.
+      failed->insert(failed->end(), indices.begin(), indices.end());
+      return;
+    }
+
+    std::vector<std::string> batch_keys;
+    std::vector<std::vector<uintptr_t>> batch_ptrs;
+    std::vector<std::vector<size_t>> batch_sizes;
+    std::vector<std::vector<size_t>> batch_offsets;
+    batch_keys.reserve(indices.size());
+    batch_ptrs.reserve(indices.size());
+    batch_sizes.reserve(indices.size());
+    batch_offsets.reserve(indices.size());
+    for (size_t idx : indices) {
+      batch_keys.push_back(keys[idx]);
+      batch_ptrs.push_back(dst_ptrs[idx]);
+      batch_sizes.push_back(sizes[idx]);
+      batch_offsets.push_back(src_offsets[idx]);
+    }
+
+    auto batch = tier->ReadBatchRangesIntoPtr(batch_keys, batch_ptrs, batch_sizes, batch_offsets);
+    for (size_t j = 0; j < indices.size(); ++j) {
+      const size_t idx = indices[j];
+      if (j < batch.size() && batch[j]) {
+        results[idx] = true;
+      } else {
+        failed->push_back(idx);
+      }
+    }
+  };
+
+  std::vector<size_t> tier_indices[kNumTiers];
+  std::vector<int> attempted(n, -1);
+  std::vector<size_t> unresolved;
+
+  for (size_t i = 0; i < n; ++i) {
+    if (sizes[i].empty()) continue;  // asked for nothing; stays false
+
+    int chosen = -1;
+    if (index_) {
+      auto loc = index_->Lookup(keys[i]);
+      if (loc) {
+        const int t = static_cast<int>(loc->tier);
+        if (t >= 0 && t < kNumTiers && GetTier(loc->tier)) chosen = t;
+      }
+    }
+    if (chosen < 0) {
+      for (const auto& entry : tiers_) {
+        if (!entry.backend->Exists(keys[i])) continue;
+        chosen = static_cast<int>(entry.backend->tier_id());
+        break;
+      }
+    }
+    if (chosen < 0) continue;  // nowhere on this node
+    attempted[i] = chosen;
+    tier_indices[chosen].push_back(i);
+  }
+
+  for (int t = 0; t < kNumTiers; ++t) read_from_tier(t, tier_indices[t], &unresolved);
+
+  // A hint can name a tier that no longer holds the key -- a demote landing
+  // between Lookup and the read, or an index that only tracks the tier a key
+  // was first written to.  Re-bucket those against whoever actually holds them
+  // and reissue, still one call per tier.
+  std::vector<size_t> retry_indices[kNumTiers];
+  for (size_t idx : unresolved) {
+    if (results[idx]) continue;
+    for (const auto& entry : tiers_) {
+      const int t = static_cast<int>(entry.backend->tier_id());
+      if (t == attempted[idx] || t < 0 || t >= kNumTiers) continue;
+      if (!entry.backend->Capabilities().ranged_read || !entry.backend->Exists(keys[idx])) continue;
+      retry_indices[t].push_back(idx);
+      break;
+    }
+  }
+  std::vector<size_t> still_missing;
+  for (int t = 0; t < kNumTiers; ++t) read_from_tier(t, retry_indices[t], &still_missing);
+
+  // Same promotion policy as the whole-object path: a hit served from a slower
+  // tier pulls the object up, so the next group of ranges is a DRAM hit.
+  if (config_.eviction.auto_promote_on_read) {
+    for (size_t idx : tier_indices[static_cast<int>(StorageTier::LOCAL_SSD)]) {
+      if (results[idx]) MaybeAutoPromote(keys[idx]);
+    }
   }
 
   return results;

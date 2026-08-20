@@ -57,6 +57,15 @@ class StandaloneProcessClient : public IUMBPClient {
   std::vector<bool> BatchGet(const std::vector<std::string>& keys,
                              const std::vector<uintptr_t>& dsts,
                              const std::vector<size_t>& sizes) override;
+  std::vector<bool> BatchGetRanges(const std::vector<std::string>& keys,
+                                   const std::vector<std::vector<uintptr_t>>& dsts,
+                                   const std::vector<std::vector<size_t>>& sizes,
+                                   const std::vector<std::vector<size_t>>& src_offsets) override;
+  std::vector<bool> BatchPutRanges(const std::vector<std::string>& keys,
+                                   const std::vector<size_t>& object_sizes,
+                                   const std::vector<std::vector<uintptr_t>>& srcs,
+                                   const std::vector<std::vector<size_t>>& sizes,
+                                   const std::vector<std::vector<size_t>>& dst_offsets) override;
   std::vector<bool> BatchExists(const std::vector<std::string>& keys) const override;
   size_t BatchExistsConsecutive(const std::vector<std::string>& keys) const override;
 
@@ -67,10 +76,15 @@ class StandaloneProcessClient : public IUMBPClient {
   UMBPDeploymentMode GetDeploymentMode() const override {
     return UMBPDeploymentMode::StandaloneProcess;
   }
+  UMBPDeploymentMode GetBackendMode() const override { return backend_mode_; }
+  bool SupportsRangedIO() const override { return supports_ranged_io_; }
 
+  // `mode` is accepted and ignored: this client owns nothing to pin. It forwards
+  // the region to the server, which decides how to declare it to the backend.
   bool RegisterMemory(uintptr_t ptr, size_t size,
                       mori::io::MemoryLocationType loc = mori::io::MemoryLocationType::CPU,
-                      int device = -1) override;
+                      int device = -1,
+                      MemoryRegistration mode = MemoryRegistration::kPinned) override;
   void DeregisterMemory(uintptr_t ptr) override;
 
   bool ReportExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) override;
@@ -85,10 +99,14 @@ class StandaloneProcessClient : public IUMBPClient {
   // Resolves `ptr` against the registered host regions. On success writes the
   // region-relative `offset` and the matched region's worker VA `region_base`.
   bool OffsetFor(uintptr_t ptr, size_t size, uint64_t* offset, uint64_t* region_base) const;
-  bool WaitReady(int timeout_ms) const;
+  // Not const: a successful Ping is where the server's backend mode and ranged
+  // capability become known, and they are cached on the client.
+  bool WaitReady(int timeout_ms);
   void MaybeAutoStart();
   std::string ClientId();
   void DeregisterMemoryLocked();
+  bool RegisterDeviceMemory(uintptr_t ptr, size_t size, int device_id);
+  bool RegisterHostShmMemory(uintptr_t ptr, size_t size);
 
   UMBPConfig config_;
   UMBPStandaloneProcessConfig standalone_config_;
@@ -100,15 +118,17 @@ class StandaloneProcessClient : public IUMBPClient {
   mutable std::shared_mutex op_mutex_;
   std::atomic<bool> closing_{false};
   bool closed_ = false;
+  UMBPDeploymentMode backend_mode_ = UMBPDeploymentMode::StandaloneProcess;
+  bool supports_ranged_io_ = false;
 
-  // One registered host shared-memory region. A hybrid HiCache worker (e.g.
-  // DeepSeek-V4) registers several non-contiguous host pools per rank, so the
-  // client tracks N regions and resolves each data op to the one that owns its
-  // pointer. `base` is the worker VA base (== allocation->base), `size` its
-  // mapped size.
+  enum class RegionKind { kHostShm, kGpuIpc };
+
+  // A hybrid worker can register several non-contiguous host or GPU regions.
+  // `base` is the worker VA used as region_base in data requests.
   struct RegisteredRegion {
     uintptr_t base = 0;
     size_t size = 0;
+    RegionKind kind = RegionKind::kHostShm;
   };
 
   mutable std::mutex registration_mu_;

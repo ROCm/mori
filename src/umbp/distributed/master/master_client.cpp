@@ -54,6 +54,36 @@ int RpcShutdownTimeoutMs() {
   return v;
 }
 
+int HeartbeatRpcTimeoutMs() {
+  static const int timeout = [] {
+    const char* raw = std::getenv("UMBP_HEARTBEAT_RPC_TIMEOUT_MS");
+    if (!raw || raw[0] == '\0') return 3000;
+    const int parsed = std::atoi(raw);
+    return parsed > 0 ? parsed : 3000;
+  }();
+  return timeout;
+}
+
+size_t HeartbeatEventsPerBundle() {
+  static const size_t value = [] {
+    const char* raw = std::getenv("UMBP_HEARTBEAT_EVENTS_PER_BUNDLE");
+    if (!raw || raw[0] == '\0') return size_t{1024};
+    const unsigned long long parsed = std::strtoull(raw, nullptr, 10);
+    return parsed > 0 ? static_cast<size_t>(parsed) : size_t{1024};
+  }();
+  return value;
+}
+
+size_t HeartbeatMaxBundlesPerRpc() {
+  static const size_t value = [] {
+    const char* raw = std::getenv("UMBP_HEARTBEAT_MAX_BUNDLES_PER_RPC");
+    if (!raw || raw[0] == '\0') return size_t{16};
+    const unsigned long long parsed = std::strtoull(raw, nullptr, 10);
+    return parsed > 0 ? static_cast<size_t>(parsed) : size_t{16};
+  }();
+  return value;
+}
+
 uint64_t MetricsReportIntervalMs() {
   static const uint64_t v =
       static_cast<uint64_t>(GetEnvMilliseconds("UMBP_METRICS_REPORT_INTERVAL_MS",
@@ -649,7 +679,16 @@ bool MasterClient::SendDeltaHeartbeatLocked(const std::map<TierType, TierCapacit
                         : DrainAllBackends(Backends());
   if (!new_events.empty()) {
     std::lock_guard state_lock(hb_state_mutex_);
-    outbox_.push_back(EventBundle{next_bundle_seq_++, std::move(new_events)});
+    const size_t per_bundle = HeartbeatEventsPerBundle();
+    for (size_t begin = 0; begin < new_events.size(); begin += per_bundle) {
+      const size_t end = std::min(new_events.size(), begin + per_bundle);
+      EventBundle bundle;
+      bundle.seq = next_bundle_seq_++;
+      bundle.events.reserve(end - begin);
+      std::move(new_events.begin() + begin, new_events.begin() + end,
+                std::back_inserter(bundle.events));
+      outbox_.push_back(std::move(bundle));
+    }
   }
 
   ::umbp::HeartbeatRequest req;
@@ -663,10 +702,12 @@ bool MasterClient::SendDeltaHeartbeatLocked(const std::map<TierType, TierCapacit
   FillTierKvCounts(req.mutable_tier_kv_counts(), kv_counts);
   {
     std::lock_guard state_lock(hb_state_mutex_);
+    size_t added = 0;
     for (const auto& bundle : outbox_) {
-      if (bundle.seq > hb_last_acked_seq_) {
-        FillBundle(req.add_bundles(), bundle, supports_logical_tiers_);
-      }
+      if (bundle.seq <= hb_last_acked_seq_) continue;
+      if (added >= HeartbeatMaxBundlesPerRpc()) break;
+      FillBundle(req.add_bundles(), bundle, supports_logical_tiers_);
+      ++added;
     }
   }
 
@@ -744,7 +785,7 @@ grpc::Status MasterClient::SendHeartbeatRpcLocked(::umbp::HeartbeatRequest& req,
                                                   ::umbp::HeartbeatResponse* resp) {
   grpc::ClientContext ctx;
   ctx.set_deadline(std::chrono::system_clock::now() +
-                   std::chrono::milliseconds(RpcShutdownTimeoutMs()));
+                   std::chrono::milliseconds(HeartbeatRpcTimeoutMs()));
   grpc::Status status;
   {
     ScopedRpcTimer _rpc_timer(this, "Heartbeat");
@@ -752,10 +793,23 @@ grpc::Status MasterClient::SendHeartbeatRpcLocked(::umbp::HeartbeatRequest& req,
     _rpc_timer.SetStatus(status);
   }
   if (!status.ok()) return status;
-  std::lock_guard state_lock(hb_state_mutex_);
-  hb_last_acked_seq_ = resp->acked_seq();
-  while (!outbox_.empty() && outbox_.front().seq <= hb_last_acked_seq_) {
-    outbox_.pop_front();
+  bool more_pending = false;
+  bool made_progress = false;
+  {
+    std::lock_guard state_lock(hb_state_mutex_);
+    const uint64_t previous_ack = hb_last_acked_seq_;
+    hb_last_acked_seq_ = std::max(hb_last_acked_seq_, resp->acked_seq());
+    made_progress = hb_last_acked_seq_ > previous_ack;
+    while (!outbox_.empty() && outbox_.front().seq <= hb_last_acked_seq_) {
+      outbox_.pop_front();
+    }
+    more_pending = !outbox_.empty();
+  }
+  // Drain a bounded backlog immediately in consecutive RPCs instead of paying
+  // one heartbeat interval per chunk. Each RPC remains independently bounded.
+  if (more_pending && made_progress && heartbeat_running_) {
+    flush_requested_ = true;
+    hb_cv_.notify_one();
   }
   return status;
 }
@@ -911,8 +965,8 @@ void MasterClient::MetricsLoop() {
   // Final flush: ship the last sub-interval of provider deltas before the
   // thread exits.  PoolClient::Shutdown calls StopMetricsReporting() BEFORE
   // UnregisterSelf, so the master is still reachable here; without this final
-  // flush the last (<metrics_interval_ms_) of SSD counter deltas would be
-  // dropped at shutdown.
+  // flush the last (<metrics_interval_ms_) of every component's counter deltas
+  // would be dropped at shutdown.
   FlushMetricsOnce();
 }
 

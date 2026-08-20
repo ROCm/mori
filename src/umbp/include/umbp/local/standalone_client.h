@@ -56,6 +56,15 @@ class StandaloneClient : public IUMBPClient {
   std::vector<bool> BatchGet(const std::vector<std::string>& keys,
                              const std::vector<uintptr_t>& dsts,
                              const std::vector<size_t>& sizes) override;
+  std::vector<bool> BatchGetRanges(const std::vector<std::string>& keys,
+                                   const std::vector<std::vector<uintptr_t>>& dsts,
+                                   const std::vector<std::vector<size_t>>& sizes,
+                                   const std::vector<std::vector<size_t>>& src_offsets) override;
+  std::vector<bool> BatchPutRanges(const std::vector<std::string>& keys,
+                                   const std::vector<size_t>& object_sizes,
+                                   const std::vector<std::vector<uintptr_t>>& srcs,
+                                   const std::vector<std::vector<size_t>>& sizes,
+                                   const std::vector<std::vector<size_t>>& dst_offsets) override;
   std::vector<bool> BatchExists(const std::vector<std::string>& keys) const override;
   size_t BatchExistsConsecutive(const std::vector<std::string>& keys) const override;
 
@@ -64,6 +73,9 @@ class StandaloneClient : public IUMBPClient {
   void Close() override;
   bool IsDistributed() const override;
   UMBPDeploymentMode GetDeploymentMode() const override { return UMBPDeploymentMode::Local; }
+  // Both media behind LocalStorageManager implement ranged I/O now; only the
+  // read-only follower role is still whole-object.
+  bool SupportsRangedIO() const override { return role_ != UMBPRole::SharedSSDFollower; }
 
   bool ReportExternalKvBlocks(const std::vector<std::string>& /*hashes*/,
                               TierType /*tier*/) override {

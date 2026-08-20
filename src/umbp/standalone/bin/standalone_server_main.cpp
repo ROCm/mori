@@ -117,14 +117,16 @@ bool AnyEnv(const std::vector<const char*>& names) {
 
 bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
                                           bool* distributed_requested, std::string* error) {
-  static const std::vector<const char*> kRequiredDistributedEnv = {
+  // Any one of these selects the distributed backend; see below for which are
+  // then actually required (master address is not).
+  static const std::vector<const char*> kDistributedSelectorEnv = {
       "UMBP_MASTER_ADDRESS",
       "UMBP_NODE_ADDRESS",
       "UMBP_NODE_ID",
       "UMBP_IO_ENGINE_HOST",
   };
 
-  *distributed_requested = AnyEnv(kRequiredDistributedEnv);
+  *distributed_requested = AnyEnv(kDistributedSelectorEnv);
   if (!*distributed_requested) {
     config->distributed.reset();
     return true;
@@ -134,8 +136,11 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
   auto node_address = EnvString("UMBP_NODE_ADDRESS");
   auto node_id = EnvString("UMBP_NODE_ID");
   auto io_engine_host = EnvString("UMBP_IO_ENGINE_HOST");
+  // UMBP_MASTER_ADDRESS is optional: without it the distributed backend runs
+  // single-node -- same data plane, no routing, no registration, no heartbeat.
+  // The node still needs its own identity and IO engine host, which is why
+  // those three stay required.
   std::vector<const char*> missing;
-  if (!master_address.has_value()) missing.push_back("UMBP_MASTER_ADDRESS");
   if (!node_address.has_value()) missing.push_back("UMBP_NODE_ADDRESS");
   if (!node_id.has_value()) missing.push_back("UMBP_NODE_ID");
   if (!io_engine_host.has_value()) missing.push_back("UMBP_IO_ENGINE_HOST");
@@ -148,7 +153,7 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
   }
 
   mori::umbp::UMBPDistributedConfig dist;
-  dist.master_config.master_address = *master_address;
+  dist.master_config.master_address = master_address.value_or("");
   dist.master_config.node_address = *node_address;
   dist.master_config.node_id = *node_id;
   dist.io_engine.host = *io_engine_host;
@@ -156,6 +161,8 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
   if (!ParseUint16Env("UMBP_IO_ENGINE_PORT", &dist.io_engine.port, error)) return false;
   if (!ParseUint16Env("UMBP_PEER_SERVICE_PORT", &dist.peer_service_port, error)) return false;
   if (!ParseSizeEnv("UMBP_DISTRIBUTED_STAGING_BUFFER_SIZE", &dist.staging_buffer_size, error))
+    return false;
+  if (!ParseSizeEnv("UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES", &dist.ranged_scratch_size, error))
     return false;
   if (!ParseSizeEnv("UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SIZE", &dist.ssd_staging_buffer_size,
                     error)) {
@@ -169,11 +176,47 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
     *error = "UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS must be > 0";
     return false;
   }
+  if (!ParseBoolEnv("UMBP_DISTRIBUTED_SSD_STAGING_USE_HUGEPAGES", &dist.ssd_staging_use_hugepages,
+                    error)) {
+    return false;
+  }
+  if (!ParseSizeEnv("UMBP_DISTRIBUTED_SSD_STAGING_HUGEPAGE_SIZE", &dist.ssd_staging_hugepage_size,
+                    error)) {
+    return false;
+  }
+  // The one medium this node serves.  Selecting SSD here is the whole opt-in
+  // for a storage node — there is no separate "pure-SSD mode" flag.  Unknown
+  // values are rejected rather than silently defaulting to DRAM, since serving
+  // the wrong medium is not something a node should discover at runtime.
+  if (const char* medium_env = std::getenv("UMBP_DISTRIBUTED_MEDIUM")) {
+    const std::string m(medium_env);
+    if (m == "DRAM" || m == "dram") {
+      dist.medium = mori::umbp::UMBPMedium::DRAM;
+    } else if (m == "HBM" || m == "hbm") {
+      dist.medium = mori::umbp::UMBPMedium::HBM;
+    } else if (m == "SSD" || m == "ssd") {
+      dist.medium = mori::umbp::UMBPMedium::SSD;
+    } else {
+      *error = "UMBP_DISTRIBUTED_MEDIUM must be one of: DRAM, HBM, SSD";
+      return false;
+    }
+  }
   if (!ParseBoolEnv("UMBP_DISTRIBUTED_CACHE_REMOTE_FETCHES", &dist.cache_remote_fetches, error))
     return false;
+  if (!ParseBoolEnv("UMBP_DISTRIBUTED_RANGED_LOCALITY_PREFETCH", &dist.ranged_locality_prefetch,
+                    error)) {
+    return false;
+  }
+  if (!ParseBoolEnv("UMBP_DISTRIBUTED_LOCAL_FIRST", &dist.local_first, error)) {
+    return false;
+  }
   size_t dram_page_size = static_cast<size_t>(dist.dram_page_size);
   if (!ParseSizeEnv("UMBP_DISTRIBUTED_DRAM_PAGE_SIZE", &dram_page_size, error)) return false;
   dist.dram_page_size = static_cast<uint64_t>(dram_page_size);
+  if (dist.dram_page_size == 0) {
+    *error = "UMBP_DISTRIBUTED_DRAM_PAGE_SIZE must be explicitly set to > 0";
+    return false;
+  }
   if (auto policy = EnvString("UMBP_BACKEND_POLICY"); policy.has_value()) {
     dist.backend_policy_path = *policy;
   }

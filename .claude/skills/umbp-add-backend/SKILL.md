@@ -147,6 +147,43 @@ all.
 That is the whole change. Routing, the peer service, the heartbeat and the batch
 executors were all written against `BackendRegistry` and need no edit.
 
+### Metrics: do not write any
+
+`PoolClient::Init` wraps whatever the medium switch produced in
+`InstrumentedBackend` before registering it, and that decorator derives the
+whole generic series — operations by outcome, bytes committed / resolved /
+freed, batch depth, time spent inside the medium — from the `MediumBackend`
+calls themselves. Your backend is charted the moment it is composed in, under
+`tier=<your tier>`, in the panels of
+`examples/monitoring/grafana/dashboards/umbp_backends.json` that already exist.
+There is no metric to register, no dashboard to edit, and **no counter to add to
+your backend**.
+
+Override `SampleMetrics()` (from `MetricSource`) only for state the interface
+cannot show from outside — what the device itself did, how full an internal
+arena is. When you do, obey the one rule that keeps the single dashboard
+working: **publish under the generic name and put your specifics in a label.**
+
+```cpp
+std::vector<MetricSample> MyBackend::SampleMetrics() const {
+  return {MetricSample{MORI_UMBP_METRIC_BACKEND_MEDIUM_EVENTS_TOTAL,
+                       MORI_UMBP_METRIC_BACKEND_MEDIUM_EVENTS_TOTAL_HELP,
+                       {{"event", "device_read_error"}},   // YOU name the event
+                       device_read_errors_.load(std::memory_order_relaxed)},
+          MetricSample{MORI_UMBP_METRIC_BACKEND_MEDIUM_STATE,
+                       MORI_UMBP_METRIC_BACKEND_MEDIUM_STATE_HELP,
+                       {{"state", "queue_depth"}},
+                       depth, MetricKind::kGauge}};
+}
+```
+
+A metric named after your medium (`mori_umbp_myssd_reads_total`) compiles and
+scrapes fine, and is still wrong: it needs its own panel, which is how UMBP
+ended up with a dashboard per medium and an SSD dashboard wired to counters
+that lost their publisher. `tier=` and `backend=` are stamped by the publisher —
+do not set them. Counter values must be monotonic; gauges may move either way.
+See `umbp/distributed/metrics/component_metrics.h`.
+
 ---
 
 ## Shape 2: a medium whose bytes are not addressable

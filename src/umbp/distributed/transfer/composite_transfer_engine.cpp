@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include "umbp/distributed/transfer/composite_transfer_engine.h"
 
+#include <chrono>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -30,10 +31,34 @@
 namespace mori::umbp {
 
 // Wraps the per-engine handles a single Submit fanned out into.
+//
+// Also the transfer layer's measurement point.  Each sub-handle is tagged with
+// the engine that produced it and the shape of what it carries, so Wait can
+// charge bytes, failures and in-flight time to that engine — the composite is
+// the only object that knows the mapping, and Wait is the only moment the
+// outcome is known.
 class CompositeTransferEngine::FanOutHandle final : public TransferHandle {
  public:
-  void Add(std::unique_ptr<TransferHandle> handle) {
-    if (handle != nullptr) handles_.push_back(std::move(handle));
+  // One sub-handle plus what it costs.  `bytes` and `plans` are known at submit
+  // time; how many plans failed is known only after Wait.
+  struct Charge {
+    size_t engine_index = 0;
+    TransferDirection dir = TransferDirection::kLocal;
+    uint64_t bytes = 0;
+    uint64_t plans = 0;
+  };
+
+  explicit FanOutHandle(CompositeTransferEngine* owner) : owner_(owner) {}
+
+  void Add(std::unique_ptr<TransferHandle> handle, std::vector<Charge> charges) {
+    if (handle == nullptr) {
+      // Nothing posted: the caller fails these tags, and so do the metrics.
+      for (auto& c : charges) {
+        owner_->RecordSettled(c.engine_index, c.dir, /*bytes=*/0, /*nanos=*/0, c.plans);
+      }
+      return;
+    }
+    handles_.push_back({std::move(handle), std::move(charges)});
   }
   void AddFailure(TransferFailure f) { failures_.push_back(std::move(f)); }
   bool Empty() const { return handles_.empty() && failures_.empty(); }
@@ -47,11 +72,46 @@ class CompositeTransferEngine::FanOutHandle final : public TransferHandle {
     failures_.clear();
     // Wait every sub-handle, never breaking early: an unwaited handle would
     // leave live statuses behind.
-    for (auto& h : handles_) h->Wait(failures);
+    for (auto& entry : handles_) {
+      std::vector<TransferFailure> mine;
+      const auto start = std::chrono::steady_clock::now();
+      entry.handle->Wait(&mine);
+      const uint64_t nanos =
+          static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - start)
+                                    .count());
+
+      // One TransferFailure per failed plan (see TransferHandle::Wait), so the
+      // count maps onto the plans this engine was charged.  A handle carries at
+      // most one charge per direction, and a submit is usually uniform in
+      // direction, so the fill order below is exact in practice; when one
+      // engine posted both a push and a pull in the same submit, the failure
+      // total is right and its split across the two directions can be off.
+      // Wait does not say which plan failed, and adding a plan id to
+      // TransferFailure to sharpen a metric would be paying in the interface
+      // for something no caller needs.
+      uint64_t failed = static_cast<uint64_t>(mine.size());
+      for (auto& c : entry.charges) {
+        const uint64_t attributed = failed >= c.plans ? c.plans : failed;
+        failed -= attributed;
+        // Time is charged once per (engine, direction) group, not per plan: it
+        // is wall time in flight, and the plans inside a group overlap.
+        owner_->RecordSettled(c.engine_index, c.dir, c.bytes, nanos, attributed);
+      }
+      if (failures != nullptr) {
+        for (auto& f : mine) failures->push_back(std::move(f));
+      }
+    }
   }
 
  private:
-  std::vector<std::unique_ptr<TransferHandle>> handles_;
+  struct Entry {
+    std::unique_ptr<TransferHandle> handle;
+    std::vector<Charge> charges;
+  };
+
+  CompositeTransferEngine* owner_ = nullptr;
+  std::vector<Entry> handles_;
   std::vector<TransferFailure> failures_;
   bool drained_ = false;
 };
@@ -59,6 +119,18 @@ class CompositeTransferEngine::FanOutHandle final : public TransferHandle {
 void CompositeTransferEngine::AddEngine(std::unique_ptr<TransferEngine> engine) {
   if (engine == nullptr) return;
   engines_.push_back(std::move(engine));
+  // Grown in lockstep so an engine's index is its counters' index.  This is the
+  // whole registration cost of instrumenting a new transport.
+  counters_.push_back(std::make_unique<EngineCounters>());
+}
+
+void CompositeTransferEngine::RecordSettled(size_t engine_index, TransferDirection dir,
+                                            uint64_t bytes, uint64_t nanos, uint64_t failed_plans) {
+  if (engine_index >= counters_.size()) return;
+  DirectionCounters& c = counters_[engine_index]->by_direction[DirectionIndex(dir)];
+  if (bytes > 0) c.bytes.fetch_add(bytes, std::memory_order_relaxed);
+  if (nanos > 0) c.nanos.fetch_add(nanos, std::memory_order_relaxed);
+  if (failed_plans > 0) c.failed_plans.fetch_add(failed_plans, std::memory_order_relaxed);
 }
 
 TransferRef CompositeTransferEngine::RegisterMemory(void* base, size_t size,
@@ -147,6 +219,7 @@ TransferPlanSet CompositeTransferEngine::Plan(const std::vector<TransferItem>& i
     TransferEngine* engine = SelectEngine(item.src, item.dst);
     if (engine == nullptr) {
       out.rejected_tags.push_back(item.tag);
+      rejected_items_.fetch_add(1, std::memory_order_relaxed);
       continue;
     }
     by_engine[engine].push_back(item);
@@ -158,11 +231,18 @@ TransferPlanSet CompositeTransferEngine::Plan(const std::vector<TransferItem>& i
   return out;
 }
 
+size_t CompositeTransferEngine::IndexOf(const TransferEngine* engine) const {
+  for (size_t i = 0; i < engines_.size(); ++i) {
+    if (engines_[i].get() == engine) return i;
+  }
+  return engines_.size();  // not ours; RecordSettled drops it
+}
+
 std::unique_ptr<TransferHandle> CompositeTransferEngine::Submit(std::vector<TransferPlan> plans) {
   if (plans.empty()) return nullptr;
 
   std::unordered_map<TransferEngine*, std::vector<TransferPlan>> by_engine;
-  auto handle = std::make_unique<FanOutHandle>();
+  auto handle = std::make_unique<FanOutHandle>(this);
   for (auto& plan : plans) {
     TransferEngine* engine = plan.engine;
     if (engine == nullptr) {
@@ -180,17 +260,42 @@ std::unique_ptr<TransferHandle> CompositeTransferEngine::Submit(std::vector<Tran
   }
 
   for (auto& [engine, engine_plans] : by_engine) {
+    const size_t engine_index = IndexOf(engine);
+
     // Snapshot the tags BEFORE the move so a Submit that posts nothing can
-    // still fail exactly the keys it dropped.
+    // still fail exactly the keys it dropped.  The metric charges are built in
+    // the same pass, for the same reason.
     std::vector<size_t> tags;
-    for (const auto& plan : engine_plans)
+    FanOutHandle::Charge charges[kDirectionCount];
+    for (size_t d = 0; d < kDirectionCount; ++d) {
+      charges[d].engine_index = engine_index;
+      charges[d].dir = static_cast<TransferDirection>(d);
+    }
+    for (const auto& plan : engine_plans) {
       tags.insert(tags.end(), plan.tags.begin(), plan.tags.end());
+      FanOutHandle::Charge& c = charges[DirectionIndex(plan.dir)];
+      ++c.plans;
+      for (size_t size : plan.sizes) c.bytes += size;
+    }
+
+    std::vector<FanOutHandle::Charge> live;
+    for (auto& c : charges) {
+      if (c.plans == 0) continue;
+      // Posted count goes in now; how many of them failed is decided in Wait.
+      if (engine_index < counters_.size()) {
+        counters_[engine_index]->by_direction[DirectionIndex(c.dir)].plans.fetch_add(
+            c.plans, std::memory_order_relaxed);
+      }
+      live.push_back(c);
+    }
+
     auto sub = engine->Submit(std::move(engine_plans));
     if (sub != nullptr) {
-      handle->Add(std::move(sub));
+      handle->Add(std::move(sub), std::move(live));
       continue;
     }
     // Submit posted nothing: the caller will never get a completion for these.
+    handle->Add(nullptr, std::move(live));
     TransferFailure f;
     f.message = std::string(engine->Name()) + " submitted nothing";
     f.tags = std::move(tags);
@@ -199,6 +304,90 @@ std::unique_ptr<TransferHandle> CompositeTransferEngine::Submit(std::vector<Tran
 
   if (handle->Empty()) return nullptr;
   return handle;
+}
+
+namespace {
+
+const char* DirectionName(TransferDirection dir) {
+  switch (dir) {
+    case TransferDirection::kPush:
+      return "push";
+    case TransferDirection::kPull:
+      return "pull";
+    case TransferDirection::kLocal:
+      return "local";
+    default:
+      return "unknown";
+  }
+}
+
+constexpr double kNanosPerSecond = 1e9;
+
+}  // namespace
+
+std::vector<MetricSample> CompositeTransferEngine::SampleMetrics() const {
+  std::vector<MetricSample> out;
+
+  for (size_t i = 0; i < engines_.size() && i < counters_.size(); ++i) {
+    const char* engine_name = engines_[i]->Name();
+
+    for (size_t d = 0; d < kDirectionCount; ++d) {
+      const DirectionCounters& c = counters_[i]->by_direction[d];
+      const uint64_t plans = c.plans.load(std::memory_order_relaxed);
+      if (plans == 0) continue;
+      const char* dir = DirectionName(static_cast<TransferDirection>(d));
+      const uint64_t failed = c.failed_plans.load(std::memory_order_relaxed);
+
+      out.push_back(MetricSample{MORI_UMBP_METRIC_TRANSFER_OPS_TOTAL,
+                                 MORI_UMBP_METRIC_TRANSFER_OPS_TOTAL_HELP,
+                                 {{"engine", engine_name}, {"direction", dir}, {"status", "ok"}},
+                                 // Plans posted but not yet settled count as ok until Wait says
+                                 // otherwise; the correction lands on the next tick.
+                                 plans >= failed ? plans - failed : 0});
+      if (failed > 0) {
+        out.push_back(
+            MetricSample{MORI_UMBP_METRIC_TRANSFER_OPS_TOTAL,
+                         MORI_UMBP_METRIC_TRANSFER_OPS_TOTAL_HELP,
+                         {{"engine", engine_name}, {"direction", dir}, {"status", "failed"}},
+                         failed});
+      }
+
+      const uint64_t bytes = c.bytes.load(std::memory_order_relaxed);
+      if (bytes > 0) {
+        out.push_back(MetricSample{MORI_UMBP_METRIC_TRANSFER_BYTES_TOTAL,
+                                   MORI_UMBP_METRIC_TRANSFER_BYTES_TOTAL_HELP,
+                                   {{"engine", engine_name}, {"direction", dir}},
+                                   bytes});
+      }
+      const uint64_t nanos = c.nanos.load(std::memory_order_relaxed);
+      if (nanos > 0) {
+        out.push_back(MetricSample{MORI_UMBP_METRIC_TRANSFER_SECONDS_TOTAL,
+                                   MORI_UMBP_METRIC_TRANSFER_SECONDS_TOTAL_HELP,
+                                   {{"engine", engine_name}, {"direction", dir}},
+                                   nanos,
+                                   MetricKind::kCounter,
+                                   1.0 / kNanosPerSecond});
+      }
+    }
+
+    // Whatever the engine publishes about its own internals, stamped with the
+    // engine that produced it so it shares the dashboard's engine= dimension.
+    for (MetricSample& s : engines_[i]->SampleMetrics()) {
+      s.labels.insert(s.labels.begin(), {"engine", engine_name});
+      out.push_back(std::move(s));
+    }
+  }
+
+  // Items no engine would take.  Not an engine failure — a routing one — so it
+  // gets its own engine value rather than being blamed on whoever ran last.
+  const uint64_t rejected = rejected_items_.load(std::memory_order_relaxed);
+  if (rejected > 0) {
+    out.push_back(MetricSample{MORI_UMBP_METRIC_TRANSFER_OPS_TOTAL,
+                               MORI_UMBP_METRIC_TRANSFER_OPS_TOTAL_HELP,
+                               {{"engine", "none"}, {"direction", "none"}, {"status", "rejected"}},
+                               rejected});
+  }
+  return out;
 }
 
 }  // namespace mori::umbp

@@ -37,15 +37,19 @@
 #include <chrono>
 #include <climits>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/device_copy.h"
 #include "umbp/standalone/external_kv_identity_client.h"
 #include "umbp/standalone/ipc.h"
 #include "umbp/umbp_client.h"
@@ -141,6 +145,27 @@ std::chrono::milliseconds FdHandshakeTimeout() {
   return std::chrono::milliseconds(value);
 }
 
+// Keeps the read-handler bodies independent of the deployment-specific lock
+// policy. Exactly one of the two deferred locks owns the mutex.
+class ConditionalReadLock {
+ public:
+  ConditionalReadLock(std::shared_mutex& mutex, bool shared)
+      : shared_(mutex, std::defer_lock), exclusive_(mutex, std::defer_lock) {
+    if (shared) {
+      shared_.lock();
+    } else {
+      exclusive_.lock();
+    }
+  }
+
+  ConditionalReadLock(const ConditionalReadLock&) = delete;
+  ConditionalReadLock& operator=(const ConditionalReadLock&) = delete;
+
+ private:
+  std::shared_lock<std::shared_mutex> shared_;
+  std::unique_lock<std::shared_mutex> exclusive_;
+};
+
 }  // namespace
 
 class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
@@ -148,6 +173,9 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   Impl(const UMBPConfig& config, std::string address)
       : backend_config_(NormalizeBackendConfig(config)),
         client_(CreateUMBPClient(backend_config_)),
+        shared_reads_((client_->GetDeploymentMode() == UMBPDeploymentMode::Local ||
+                       client_->GetDeploymentMode() == UMBPDeploymentMode::Distributed) &&
+                      !backend_config_.ssd.enabled),
         address_(std::move(address)),
         fd_socket_path_(DeriveFdSocketPath(address_)) {}
 
@@ -190,6 +218,15 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
 
     chmod(grpc_path.c_str(), 0600);
     MORI_UMBP_INFO("[StandaloneServer] listening grpc={} fd_socket={}", address_, fd_socket_path_);
+    if (shared_reads_) {
+      MORI_UMBP_INFO("[StandaloneServer] data plane: concurrent reads ({} backend, SSD disabled)",
+                     client_->GetDeploymentMode() == UMBPDeploymentMode::Distributed ? "distributed"
+                                                                                     : "local");
+    } else if (client_->GetDeploymentMode() != UMBPDeploymentMode::Local) {
+      MORI_UMBP_INFO("[StandaloneServer] data plane: serialized reads (non-local backend)");
+    } else {
+      MORI_UMBP_INFO("[StandaloneServer] data plane: serialized reads (SSD enabled)");
+    }
     return true;
   }
 
@@ -207,12 +244,12 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     }
     UnregisterAllExternalIdentities();
     {
-      std::lock_guard<std::mutex> lock(client_mu_);
+      std::unique_lock<std::shared_mutex> lock(client_mu_);
       client_->Flush();
     }
     UnmapAll();
     {
-      std::lock_guard<std::mutex> lock(client_mu_);
+      std::unique_lock<std::shared_mutex> lock(client_mu_);
       client_->Close();
     }
     unlink(UnixPathFromGrpcAddress(address_).c_str());
@@ -223,18 +260,21 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
                     ::umbp::PingResponse* response) override {
     response->set_ready(!shutdown_.load());
     response->set_deployment_mode(BackendModeToProto(client_->GetDeploymentMode()));
+    // The inner client is the authority now that local SSD serves ranges; the
+    // extra ssd.enabled veto here would keep refusing a backend that can.
+    response->set_supports_ranged_io(client_->SupportsRangedIO());
     return grpc::Status::OK;
   }
 
   grpc::Status Put(grpc::ServerContext*, const ::umbp::PutRequest* request,
                    ::umbp::BoolResponse* response) override {
+    std::unique_lock<std::shared_mutex> lock(client_mu_);
     uintptr_t ptr = 0;
     if (!ResolveRange(request->client_id(), request->region_base(), request->shm_offset(),
                       request->size(), &ptr)) {
       SetBool(response, false, "unregistered or out-of-range shm buffer");
       return grpc::Status::OK;
     }
-    std::lock_guard<std::mutex> lock(client_mu_);
     if (shutdown_.load()) {
       SetBool(response, false, "server is shutting down");
       return grpc::Status::OK;
@@ -245,13 +285,13 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
 
   grpc::Status Get(grpc::ServerContext*, const ::umbp::GetRequest* request,
                    ::umbp::BoolResponse* response) override {
+    ConditionalReadLock lock(client_mu_, shared_reads_);
     uintptr_t ptr = 0;
     if (!ResolveRange(request->client_id(), request->region_base(), request->shm_offset(),
                       request->size(), &ptr)) {
       SetBool(response, false, "unregistered or out-of-range shm buffer");
       return grpc::Status::OK;
     }
-    std::lock_guard<std::mutex> lock(client_mu_);
     if (shutdown_.load()) {
       SetBool(response, false, "server is shutting down");
       return grpc::Status::OK;
@@ -262,14 +302,14 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
 
   grpc::Status BatchPut(grpc::ServerContext*, const ::umbp::BatchDataRequest* request,
                         ::umbp::BatchBoolResponse* response) override {
+    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+    std::vector<size_t> sizes = Sizes(*request);
+    std::unique_lock<std::shared_mutex> lock(client_mu_);
     std::vector<uintptr_t> ptrs;
     if (!ResolveBatch(*request, &ptrs)) {
       FillFalse(request->keys_size(), response);
       return grpc::Status::OK;
     }
-    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
-    std::vector<size_t> sizes = Sizes(*request);
-    std::lock_guard<std::mutex> lock(client_mu_);
     if (shutdown_.load()) {
       FillFalse(request->keys_size(), response);
       return grpc::Status::OK;
@@ -278,12 +318,59 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     return grpc::Status::OK;
   }
 
+  grpc::Status BatchPutRanges(grpc::ServerContext*, const ::umbp::BatchRangeDataRequest* request,
+                              ::umbp::BatchBoolResponse* response) override {
+    size_t total_ranges = 0;
+    if (!ValidateRangeRequest(*request, /*put=*/true, &total_ranges)) {
+      FillFalse(request->keys_size(), response);
+      return grpc::Status::OK;
+    }
+
+    std::vector<RangeQuery> queries;
+    queries.reserve(total_ranges);
+    for (size_t i = 0; i < total_ranges; ++i) {
+      queries.push_back({request->region_bases(static_cast<int>(i)),
+                         request->shm_offsets(static_cast<int>(i)),
+                         request->sizes(static_cast<int>(i))});
+    }
+
+    std::unique_lock<std::shared_mutex> lock(client_mu_);
+    std::vector<uintptr_t> flat_ptrs;
+    if (!ResolveRanges(request->client_id(), queries, &flat_ptrs, /*allow_zero=*/true) ||
+        shutdown_.load()) {
+      FillFalse(request->keys_size(), response);
+      return grpc::Status::OK;
+    }
+
+    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+    std::vector<size_t> object_sizes;
+    object_sizes.reserve(keys.size());
+    for (uint64_t size : request->object_sizes()) object_sizes.push_back(static_cast<size_t>(size));
+    std::vector<std::vector<uintptr_t>> ptrs(keys.size());
+    std::vector<std::vector<size_t>> sizes(keys.size());
+    std::vector<std::vector<size_t>> offsets(keys.size());
+    size_t cursor = 0;
+    for (size_t i = 0; i < keys.size(); ++i) {
+      const size_t count = request->range_counts(static_cast<int>(i));
+      ptrs[i].reserve(count);
+      sizes[i].reserve(count);
+      offsets[i].reserve(count);
+      for (size_t j = 0; j < count; ++j, ++cursor) {
+        ptrs[i].push_back(flat_ptrs[cursor]);
+        sizes[i].push_back(static_cast<size_t>(request->sizes(static_cast<int>(cursor))));
+        offsets[i].push_back(
+            static_cast<size_t>(request->object_offsets(static_cast<int>(cursor))));
+      }
+    }
+    FillResults(client_->BatchPutRanges(keys, object_sizes, ptrs, sizes, offsets), response);
+    return grpc::Status::OK;
+  }
+
   grpc::Status BatchPutWithDepth(grpc::ServerContext*,
                                  const ::umbp::BatchDataWithDepthRequest* request,
                                  ::umbp::BatchBoolResponse* response) override {
     // region_bases is optional for legacy single-region callers; when present it
-    // must be parallel to keys (BatchPutWithDepth resolves inline, not through
-    // ResolveBatch).
+    // must be parallel to keys.
     const bool has_region_bases = request->region_bases_size() > 0;
     if (request->keys_size() != request->shm_offsets_size() ||
         request->keys_size() != request->sizes_size() ||
@@ -291,24 +378,24 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       FillFalse(request->keys_size(), response);
       return grpc::Status::OK;
     }
-    std::vector<uintptr_t> ptrs;
-    ptrs.reserve(request->keys_size());
-    for (int i = 0; i < request->keys_size(); ++i) {
-      uintptr_t ptr = 0;
-      uint64_t region_base = has_region_bases ? request->region_bases(i) : 0;
-      if (!ResolveRange(request->client_id(), region_base, request->shm_offsets(i),
-                        request->sizes(i), &ptr)) {
-        FillFalse(request->keys_size(), response);
-        return grpc::Status::OK;
-      }
-      ptrs.push_back(ptr);
-    }
     std::vector<std::string> keys(request->keys().begin(), request->keys().end());
     std::vector<size_t> sizes;
     sizes.reserve(request->sizes_size());
     for (uint64_t size : request->sizes()) sizes.push_back(static_cast<size_t>(size));
     std::vector<int> depths(request->depths().begin(), request->depths().end());
-    std::lock_guard<std::mutex> lock(client_mu_);
+    std::vector<RangeQuery> queries;
+    queries.reserve(request->keys_size());
+    for (int i = 0; i < request->keys_size(); ++i) {
+      queries.push_back({has_region_bases ? request->region_bases(i) : 0, request->shm_offsets(i),
+                         request->sizes(i)});
+    }
+
+    std::unique_lock<std::shared_mutex> lock(client_mu_);
+    std::vector<uintptr_t> ptrs;
+    if (!ResolveRanges(request->client_id(), queries, &ptrs, /*allow_zero=*/false)) {
+      FillFalse(request->keys_size(), response);
+      return grpc::Status::OK;
+    }
     if (shutdown_.load()) {
       FillFalse(request->keys_size(), response);
       return grpc::Status::OK;
@@ -319,14 +406,14 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
 
   grpc::Status BatchGet(grpc::ServerContext*, const ::umbp::BatchDataRequest* request,
                         ::umbp::BatchBoolResponse* response) override {
+    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+    std::vector<size_t> sizes = Sizes(*request);
+    ConditionalReadLock lock(client_mu_, shared_reads_);
     std::vector<uintptr_t> ptrs;
     if (!ResolveBatch(*request, &ptrs)) {
       FillFalse(request->keys_size(), response);
       return grpc::Status::OK;
     }
-    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
-    std::vector<size_t> sizes = Sizes(*request);
-    std::lock_guard<std::mutex> lock(client_mu_);
     if (shutdown_.load()) {
       FillFalse(request->keys_size(), response);
       return grpc::Status::OK;
@@ -335,9 +422,54 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     return grpc::Status::OK;
   }
 
+  grpc::Status BatchGetRanges(grpc::ServerContext*, const ::umbp::BatchRangeDataRequest* request,
+                              ::umbp::BatchBoolResponse* response) override {
+    size_t total_ranges = 0;
+    if (!ValidateRangeRequest(*request, /*put=*/false, &total_ranges)) {
+      FillFalse(request->keys_size(), response);
+      return grpc::Status::OK;
+    }
+
+    std::vector<RangeQuery> queries;
+    queries.reserve(total_ranges);
+    for (size_t i = 0; i < total_ranges; ++i) {
+      queries.push_back({request->region_bases(static_cast<int>(i)),
+                         request->shm_offsets(static_cast<int>(i)),
+                         request->sizes(static_cast<int>(i))});
+    }
+
+    ConditionalReadLock lock(client_mu_, shared_reads_);
+    std::vector<uintptr_t> flat_ptrs;
+    if (!ResolveRanges(request->client_id(), queries, &flat_ptrs, /*allow_zero=*/true) ||
+        shutdown_.load()) {
+      FillFalse(request->keys_size(), response);
+      return grpc::Status::OK;
+    }
+
+    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+    std::vector<std::vector<uintptr_t>> ptrs(keys.size());
+    std::vector<std::vector<size_t>> sizes(keys.size());
+    std::vector<std::vector<size_t>> offsets(keys.size());
+    size_t cursor = 0;
+    for (size_t i = 0; i < keys.size(); ++i) {
+      const size_t count = request->range_counts(static_cast<int>(i));
+      ptrs[i].reserve(count);
+      sizes[i].reserve(count);
+      offsets[i].reserve(count);
+      for (size_t j = 0; j < count; ++j, ++cursor) {
+        ptrs[i].push_back(flat_ptrs[cursor]);
+        sizes[i].push_back(static_cast<size_t>(request->sizes(static_cast<int>(cursor))));
+        offsets[i].push_back(
+            static_cast<size_t>(request->object_offsets(static_cast<int>(cursor))));
+      }
+    }
+    FillResults(client_->BatchGetRanges(keys, ptrs, sizes, offsets), response);
+    return grpc::Status::OK;
+  }
+
   grpc::Status Exists(grpc::ServerContext*, const ::umbp::KeyRequest* request,
                       ::umbp::BoolResponse* response) override {
-    std::lock_guard<std::mutex> lock(client_mu_);
+    ConditionalReadLock lock(client_mu_, shared_reads_);
     if (shutdown_.load()) {
       SetBool(response, false, "server is shutting down");
       return grpc::Status::OK;
@@ -349,7 +481,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   grpc::Status BatchExists(grpc::ServerContext*, const ::umbp::BatchKeysRequest* request,
                            ::umbp::BatchBoolResponse* response) override {
     std::vector<std::string> keys(request->keys().begin(), request->keys().end());
-    std::lock_guard<std::mutex> lock(client_mu_);
+    ConditionalReadLock lock(client_mu_, shared_reads_);
     if (shutdown_.load()) {
       FillFalse(request->keys_size(), response);
       return grpc::Status::OK;
@@ -361,7 +493,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   grpc::Status BatchExistsConsecutive(grpc::ServerContext*, const ::umbp::BatchKeysRequest* request,
                                       ::umbp::CountResponse* response) override {
     std::vector<std::string> keys(request->keys().begin(), request->keys().end());
-    std::lock_guard<std::mutex> lock(client_mu_);
+    ConditionalReadLock lock(client_mu_, shared_reads_);
     if (shutdown_.load()) {
       response->set_count(0);
       return grpc::Status::OK;
@@ -372,7 +504,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
 
   grpc::Status Clear(grpc::ServerContext*, const ::umbp::Empty*,
                      ::umbp::BoolResponse* response) override {
-    std::lock_guard<std::mutex> lock(client_mu_);
+    std::unique_lock<std::shared_mutex> lock(client_mu_);
     if (shutdown_.load()) {
       SetBool(response, false, "server is shutting down");
       return grpc::Status::OK;
@@ -383,7 +515,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
 
   grpc::Status Flush(grpc::ServerContext*, const ::umbp::Empty*,
                      ::umbp::BoolResponse* response) override {
-    std::lock_guard<std::mutex> lock(client_mu_);
+    std::unique_lock<std::shared_mutex> lock(client_mu_);
     if (shutdown_.load()) {
       SetBool(response, false, "server is shutting down");
       return grpc::Status::OK;
@@ -398,10 +530,21 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       SetBool(response, false, "server is shutting down");
       return grpc::Status::OK;
     }
+    if (request->kind() == ::umbp::MEMORY_KIND_GPU_IPC) {
+      std::lock_guard<std::mutex> lifecycle_lock(external_identity_lifecycle_mu_);
+      RegisterGpuIpc(*request, response);
+      if (response->ok() && !EnsureExternalIdentity(*request)) {
+        MORI_UMBP_WARN(
+            "[StandaloneServer] external-KV identity registration failed for client_id={} "
+            "worker_node_id={}; continuing with core GPU registration",
+            request->client_id(), request->worker_node_id());
+      }
+      return grpc::Status::OK;
+    }
     std::lock_guard<std::mutex> lifecycle_lock(external_identity_lifecycle_mu_);
     bool ok = false;
     {
-      std::lock_guard<std::mutex> lock(memory_mu_);
+      std::shared_lock<std::shared_mutex> lock(memory_mu_);
       auto it = memory_.find(request->client_id());
       if (it != memory_.end()) {
         ok = std::any_of(it->second.begin(), it->second.end(), [&](const RegisteredMemory& mem) {
@@ -492,7 +635,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     if (auto identity = GetExternalIdentity(request->client_id())) {
       matches = identity->MatchExternalKv(hashes, request->count_as_hit());
     } else {
-      std::lock_guard<std::mutex> lock(client_mu_);
+      ConditionalReadLock lock(client_mu_, shared_reads_);
       if (!shutdown_.load()) matches = client_->MatchExternalKv(hashes, request->count_as_hit());
     }
     FillExternalKvMatches(matches, response);
@@ -508,7 +651,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     if (auto identity = GetExternalIdentity(request->client_id())) {
       entries = identity->GetExternalKvHitCounts(hashes);
     } else {
-      std::lock_guard<std::mutex> lock(client_mu_);
+      ConditionalReadLock lock(client_mu_, shared_reads_);
       if (!shutdown_.load()) entries = client_->GetExternalKvHitCounts(hashes);
     }
     FillExternalKvHitCounts(entries, response);
@@ -516,10 +659,38 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   }
 
  private:
+  enum class MemoryKind { kHostShm, kGpuIpc };
+
   struct RegisteredMemory {
     void* base = nullptr;
     uint64_t worker_base = 0;
     uint64_t size = 0;
+    MemoryKind kind = MemoryKind::kHostShm;
+    int device_id = -1;
+    uint64_t alloc_base = 0;
+    std::string client_id;
+  };
+
+  struct RangeQuery {
+    uint64_t region_base = 0;
+    uint64_t offset = 0;
+    uint64_t size = 0;
+  };
+
+  struct IpcKey {
+    std::string client_id;
+    int device_id = -1;
+    uint64_t alloc_base = 0;
+
+    bool operator<(const IpcKey& other) const {
+      return std::tie(client_id, device_id, alloc_base) <
+             std::tie(other.client_id, other.device_id, other.alloc_base);
+    }
+  };
+
+  struct IpcMapping {
+    void* base = nullptr;
+    size_t refcount = 0;
   };
 
   bool BackendIsDistributed() const {
@@ -717,22 +888,12 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     }
 
     std::string client_id(msg.client_id);
-    RegisteredMemory entry{mapped, static_cast<uint64_t>(msg.worker_base), msg.size};
-    std::optional<RegisteredMemory> old_mem;
-    {
-      std::lock_guard<std::mutex> lock(memory_mu_);
-      auto& regions = memory_[client_id];
-      auto existing = std::find_if(
-          regions.begin(), regions.end(),
-          [&](const RegisteredMemory& mem) { return mem.worker_base == entry.worker_base; });
-      if (existing != regions.end()) {
-        // Same region re-registered: replace the mapping, release the old one.
-        old_mem = *existing;
-        *existing = entry;
-      } else {
-        regions.push_back(entry);
-      }
-    }
+    RegisteredMemory entry;
+    entry.base = mapped;
+    entry.worker_base = static_cast<uint64_t>(msg.worker_base);
+    entry.size = msg.size;
+    entry.client_id = client_id;
+    std::optional<RegisteredMemory> old_mem = InsertOrReplaceRegion(client_id, entry);
     // Release outside the lock, and via ReleaseRegisteredMemory so the backend
     // deregisters the region before its mapping is munmap'd (required by the
     // distributed backend; see design-standalone-process-mode.md §5.3/§6.3).
@@ -742,22 +903,184 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     return true;
   }
 
+  bool HasIdenticalGpuRegion(const ::umbp::RegisterMemoryRequest& request) {
+    std::shared_lock<std::shared_mutex> lock(memory_mu_);
+    auto it = memory_.find(request.client_id());
+    if (it == memory_.end()) return false;
+    return std::any_of(it->second.begin(), it->second.end(), [&](const RegisteredMemory& mem) {
+      return mem.kind == MemoryKind::kGpuIpc && mem.worker_base == request.worker_base() &&
+             mem.size == request.size() && mem.device_id == request.device_id() &&
+             mem.alloc_base == request.alloc_base();
+    });
+  }
+
+  std::optional<RegisteredMemory> InsertOrReplaceRegion(const std::string& client_id,
+                                                        const RegisteredMemory& entry) {
+    std::unique_lock<std::shared_mutex> lock(memory_mu_);
+    auto& regions = memory_[client_id];
+    auto existing = std::find_if(regions.begin(), regions.end(), [&](const RegisteredMemory& mem) {
+      return mem.worker_base == entry.worker_base;
+    });
+    if (existing == regions.end()) {
+      regions.push_back(entry);
+      return std::nullopt;
+    }
+    RegisteredMemory old = *existing;
+    *existing = entry;
+    return old;
+  }
+
+  void RegisterGpuIpc(const ::umbp::RegisterMemoryRequest& request,
+                      ::umbp::BoolResponse* response) {
+    const UMBPDeploymentMode mode = client_->GetDeploymentMode();
+    if (mode != UMBPDeploymentMode::Local && mode != UMBPDeploymentMode::Distributed) {
+      SetBool(response, false, "GPU IPC registration requires a Local or Distributed backend");
+      return;
+    }
+    if (backend_config_.ssd.enabled) {
+      SetBool(response, false,
+              "GPU IPC registration requires SSD to be disabled "
+              "(start the server with UMBP_SSD_ENABLED=0)");
+      return;
+    }
+    if (request.client_id().empty() || request.worker_base() == 0 || request.size() == 0 ||
+        request.alloc_base() == 0 || request.ipc_handle().size() != sizeof(hipIpcMemHandle_t)) {
+      SetBool(response, false, "invalid GPU IPC registration payload");
+      return;
+    }
+    if (HasIdenticalGpuRegion(request)) {
+      SetBool(response, true);
+      return;
+    }
+
+    const IpcKey key{request.client_id(), request.device_id(), request.alloc_base()};
+    ScopedHipDevice device_guard(request.device_id());
+    if (!device_guard.IsValid()) {
+      SetBool(response, false, "hipSetDevice failed for the requested device_id");
+      return;
+    }
+
+    void* mapped_base = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(ipc_mu_);
+      auto existing = ipc_maps_.find(key);
+      if (existing != ipc_maps_.end()) {
+        ++existing->second.refcount;
+        mapped_base = existing->second.base;
+      } else {
+        hipIpcMemHandle_t handle{};
+        std::memcpy(&handle, request.ipc_handle().data(), sizeof(handle));
+        const hipError_t status =
+            hipIpcOpenMemHandle(&mapped_base, handle, hipIpcMemLazyEnablePeerAccess);
+        if (status != hipSuccess) {
+          const std::string error = hipGetErrorString(status);
+          (void)hipGetLastError();
+          SetBool(response, false, "hipIpcOpenMemHandle failed: " + error);
+          return;
+        }
+        ipc_maps_.emplace(key, IpcMapping{mapped_base, 1});
+      }
+    }
+
+    const uintptr_t mapped_address = reinterpret_cast<uintptr_t>(mapped_base);
+    if (request.ipc_offset() > std::numeric_limits<uintptr_t>::max() - mapped_address) {
+      ReleaseIpcMapping(key);
+      SetBool(response, false, "GPU IPC offset overflows the mapped address");
+      return;
+    }
+
+    RegisteredMemory entry;
+    entry.base = reinterpret_cast<void*>(mapped_address + request.ipc_offset());
+    entry.worker_base = request.worker_base();
+    entry.size = request.size();
+    entry.kind = MemoryKind::kGpuIpc;
+    entry.device_id = request.device_id();
+    entry.alloc_base = request.alloc_base();
+    entry.client_id = request.client_id();
+    // Both modes declare the imported mapping to the inner backend; only Local
+    // pins it. Ranged distributed I/O stages remote objects through a registered
+    // host arena, so an RDMA MR over this mapping buys nothing, and the dmabuf
+    // fallback is unsafe for IPC-imported ROCm mappings.
+    //
+    // Declaring it is not optional in either mode. Leaving it out is correct --
+    // an unregistered device pointer is classified rather than assumed host, so
+    // HbmCopyEngine still claims the pair -- but a range that misses the region
+    // table is described by its own address instead of its region base, so it
+    // becomes its own transfer plan instead of sharing one. Measured on
+    // DSv4-Pro/TP8 at 256K, that is plan = 23.2% of a ranged call against 1.4%
+    // once declared.
+    if (!RegisterBackendMemory(entry.base, static_cast<size_t>(entry.size),
+                               mori::io::MemoryLocationType::GPU, entry.device_id,
+                               mode == UMBPDeploymentMode::Local
+                                   ? MemoryRegistration::kPinned
+                                   : MemoryRegistration::kLocalCopyOnly)) {
+      ReleaseIpcMapping(key);
+      SetBool(response, false, "inner backend RegisterMemory failed");
+      return;
+    }
+
+    std::optional<RegisteredMemory> old_mem = InsertOrReplaceRegion(request.client_id(), entry);
+    if (old_mem.has_value()) ReleaseRegisteredMemory(*old_mem);
+    MORI_UMBP_INFO(
+        "[StandaloneServer] registered GPU IPC client_id={} worker_base=0x{:x} size={}MB "
+        "device={}",
+        request.client_id(), request.worker_base(), request.size() / (1024 * 1024),
+        request.device_id());
+    SetBool(response, true);
+  }
+
+  void ReleaseIpcMapping(const IpcKey& key) {
+    void* mapped_base = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(ipc_mu_);
+      auto it = ipc_maps_.find(key);
+      if (it == ipc_maps_.end()) return;
+      if (--it->second.refcount != 0) return;
+      mapped_base = it->second.base;
+      ipc_maps_.erase(it);
+    }
+
+    ScopedHipDevice device_guard(key.device_id);
+    if (!device_guard.IsValid()) {
+      MORI_UMBP_WARN("[StandaloneServer] failed to select GPU {} while closing IPC mapping",
+                     key.device_id);
+    }
+    const hipError_t status = hipIpcCloseMemHandle(mapped_base);
+    if (status != hipSuccess) {
+      MORI_UMBP_WARN("[StandaloneServer] hipIpcCloseMemHandle failed for client_id={}: {}",
+                     key.client_id, hipGetErrorString(status));
+      (void)hipGetLastError();
+    }
+  }
+
+  size_t IpcMappingCount() {
+    std::lock_guard<std::mutex> lock(ipc_mu_);
+    return ipc_maps_.size();
+  }
+
   void UnmapClient(const std::string& client_id) {
     std::vector<RegisteredMemory> mems;
     {
-      std::lock_guard<std::mutex> lock(memory_mu_);
+      std::unique_lock<std::shared_mutex> lock(memory_mu_);
       auto it = memory_.find(client_id);
       if (it == memory_.end()) return;
       mems.swap(it->second);
       memory_.erase(it);
     }
+    const size_t mappings_before = IpcMappingCount();
     for (const auto& mem : mems) ReleaseRegisteredMemory(mem);
+    const size_t mappings_after = IpcMappingCount();
+    MORI_UMBP_INFO(
+        "[StandaloneServer] unmapped client_id={} regions={} ipc_allocations_released={} "
+        "ipc_allocations_remaining={}",
+        client_id, mems.size(),
+        mappings_before >= mappings_after ? mappings_before - mappings_after : 0, mappings_after);
   }
 
   void UnmapAll() {
     std::vector<RegisteredMemory> entries;
     {
-      std::lock_guard<std::mutex> lock(memory_mu_);
+      std::unique_lock<std::shared_mutex> lock(memory_mu_);
       for (auto& kv : memory_) {
         for (const auto& mem : kv.second) entries.push_back(mem);
       }
@@ -766,19 +1089,31 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     for (const auto& mem : entries) ReleaseRegisteredMemory(mem);
   }
 
-  bool RegisterBackendMemory(void* base, size_t size) {
-    std::lock_guard<std::mutex> lock(client_mu_);
+  // `loc`/`device` describe the mapping this server made, not the worker's
+  // original allocation.  They must be passed through: a GPU-IPC region is
+  // device memory in this process too, and registering it as host memory would
+  // send it down the inner client's host paths — a memcpy from device memory in
+  // the local case, and a host staging bounce in the distributed one.
+  bool RegisterBackendMemory(void* base, size_t size,
+                             mori::io::MemoryLocationType loc = mori::io::MemoryLocationType::CPU,
+                             int device = -1,
+                             MemoryRegistration mode = MemoryRegistration::kPinned) {
+    std::unique_lock<std::shared_mutex> lock(client_mu_);
     if (shutdown_.load()) return false;
-    return client_->RegisterMemory(reinterpret_cast<uintptr_t>(base), size);
+    return client_->RegisterMemory(reinterpret_cast<uintptr_t>(base), size, loc, device, mode);
   }
 
   void ReleaseRegisteredMemory(const RegisteredMemory& mem) {
     if (!mem.base) return;
     {
-      std::lock_guard<std::mutex> lock(client_mu_);
+      std::unique_lock<std::shared_mutex> lock(client_mu_);
       client_->DeregisterMemory(reinterpret_cast<uintptr_t>(mem.base));
     }
-    munmap(mem.base, static_cast<size_t>(mem.size));
+    if (mem.kind == MemoryKind::kGpuIpc) {
+      ReleaseIpcMapping(IpcKey{mem.client_id, mem.device_id, mem.alloc_base});
+    } else {
+      munmap(mem.base, static_cast<size_t>(mem.size));
+    }
   }
 
   // Resolves (client_id, region_base, offset) to a server-local pointer.
@@ -787,10 +1122,18 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   bool ResolveRange(const std::string& client_id, uint64_t region_base, uint64_t offset,
                     uint64_t size, uintptr_t* out_ptr) {
     if (!out_ptr || size == 0) return false;
-    std::lock_guard<std::mutex> lock(memory_mu_);
+    std::shared_lock<std::shared_mutex> lock(memory_mu_);
     auto it = memory_.find(client_id);
     if (it == memory_.end()) return false;
-    for (const auto& mem : it->second) {
+    return ResolveRangeInRegions(it->second, region_base, offset, size, out_ptr,
+                                 /*allow_zero=*/false);
+  }
+
+  static bool ResolveRangeInRegions(const std::vector<RegisteredMemory>& regions,
+                                    uint64_t region_base, uint64_t offset, uint64_t size,
+                                    uintptr_t* out_ptr, bool allow_zero) {
+    if (!out_ptr || (!allow_zero && size == 0)) return false;
+    for (const auto& mem : regions) {
       if (region_base != 0 && mem.worker_base != region_base) continue;
       if (offset > mem.size || size > mem.size - offset) {
         if (region_base != 0) return false;
@@ -802,6 +1145,29 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     return false;
   }
 
+  bool ResolveRanges(const std::string& client_id, const std::vector<RangeQuery>& queries,
+                     std::vector<uintptr_t>* ptrs, bool allow_zero) {
+    if (!ptrs) return false;
+    ptrs->clear();
+    ptrs->reserve(queries.size());
+    if (queries.empty()) return true;
+
+    std::shared_lock<std::shared_mutex> lock(memory_mu_);
+    auto it = memory_.find(client_id);
+    if (it == memory_.end()) return false;
+
+    for (const auto& query : queries) {
+      uintptr_t ptr = 0;
+      if (!ResolveRangeInRegions(it->second, query.region_base, query.offset, query.size, &ptr,
+                                 allow_zero)) {
+        ptrs->clear();
+        return false;
+      }
+      ptrs->push_back(ptr);
+    }
+    return true;
+  }
+
   bool ResolveBatch(const ::umbp::BatchDataRequest& request, std::vector<uintptr_t>* ptrs) {
     // region_bases is optional for legacy single-region callers; when present it
     // must be parallel to keys.
@@ -811,17 +1177,47 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
         (has_region_bases && request.keys_size() != request.region_bases_size())) {
       return false;
     }
-    ptrs->clear();
-    ptrs->reserve(request.keys_size());
+    std::vector<RangeQuery> queries;
+    queries.reserve(request.keys_size());
     for (int i = 0; i < request.keys_size(); ++i) {
-      uintptr_t ptr = 0;
       uint64_t region_base = has_region_bases ? request.region_bases(i) : 0;
-      if (!ResolveRange(request.client_id(), region_base, request.shm_offsets(i), request.sizes(i),
-                        &ptr)) {
-        return false;
-      }
-      ptrs->push_back(ptr);
+      queries.push_back({region_base, request.shm_offsets(i), request.sizes(i)});
     }
+    return ResolveRanges(request.client_id(), queries, ptrs, /*allow_zero=*/false);
+  }
+
+  static bool ValidateRangeRequest(const ::umbp::BatchRangeDataRequest& request, bool put,
+                                   size_t* total_ranges) {
+    if (!total_ranges || request.range_counts_size() != request.keys_size()) return false;
+    if ((put && request.object_sizes_size() != request.keys_size()) ||
+        (!put && request.object_sizes_size() != 0)) {
+      return false;
+    }
+
+    size_t total = 0;
+    for (uint32_t count : request.range_counts()) {
+      if (count > std::numeric_limits<size_t>::max() - total) return false;
+      total += count;
+    }
+    if (total != static_cast<size_t>(request.shm_offsets_size()) ||
+        total != static_cast<size_t>(request.region_bases_size()) ||
+        total != static_cast<size_t>(request.sizes_size()) ||
+        total != static_cast<size_t>(request.object_offsets_size())) {
+      return false;
+    }
+
+    if constexpr (sizeof(size_t) < sizeof(uint64_t)) {
+      for (uint64_t value : request.sizes()) {
+        if (value > std::numeric_limits<size_t>::max()) return false;
+      }
+      for (uint64_t value : request.object_offsets()) {
+        if (value > std::numeric_limits<size_t>::max()) return false;
+      }
+      for (uint64_t value : request.object_sizes()) {
+        if (value > std::numeric_limits<size_t>::max()) return false;
+      }
+    }
+    *total_ranges = total;
     return true;
   }
 
@@ -868,17 +1264,23 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
 
   UMBPConfig backend_config_;
   std::unique_ptr<IUMBPClient> client_;
+  const bool shared_reads_;
   std::string address_;
   std::string fd_socket_path_;
   std::unique_ptr<grpc::Server> server_;
   std::atomic<bool> shutdown_{false};
 
-  std::mutex client_mu_;
-  std::mutex memory_mu_;
+  // Data operations acquire client_mu_ before memory_mu_ and keep the client
+  // lock through the backend call, making it the lifetime barrier for resolved
+  // host/GPU mappings. Lifecycle paths never hold the two locks at once.
+  std::shared_mutex client_mu_;
+  mutable std::shared_mutex memory_mu_;
+  std::mutex ipc_mu_;
   // A worker registers N non-contiguous host regions (e.g. DeepSeek-V4's KV
   // side pools), so each client_id maps to a list of regions, resolved by
   // worker_base at data-op time.
   std::map<std::string, std::vector<RegisteredMemory>> memory_;
+  std::map<IpcKey, IpcMapping> ipc_maps_;
   std::mutex external_identity_lifecycle_mu_;
   std::mutex external_identity_mu_;
   std::map<std::string, std::shared_ptr<ExternalKvIdentityClient>> external_identities_;

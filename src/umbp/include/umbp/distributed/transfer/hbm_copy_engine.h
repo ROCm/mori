@@ -22,9 +22,12 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <mutex>
 #include <vector>
 
+#include "umbp/common/host_registration.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
 
 namespace mori::umbp {
@@ -82,6 +85,23 @@ class HbmCopyEngine final : public TransferEngine {
   }
   void Deregister(const TransferRef&) override {}
 
+  // Declare a host region as kernel-addressable, enabling the gather fast path
+  // for plans whose host side lies inside it.
+  //
+  // A gather kernel cannot dereference plain mmap memory — it faults the GPU —
+  // so the region must be hipHostRegister'd first, which is what
+  // HostTierRegistration does (asynchronously for large pools).  Registration
+  // is best-effort and this is purely an optimisation hint: until it completes,
+  // and forever if it fails, Submit simply takes the hipMemcpy path it took
+  // before.
+  //
+  // PoolClient calls this once per buffer each medium publishes, after Init.
+  // It belongs on the engine rather than at the call sites because the engine
+  // is the only layer that sees the segment shape a copy actually decomposes
+  // into, which is what decides whether a kernel beats the copy engine.
+  void AddHostGatherRegion(void* base, size_t bytes);
+  void ClearHostGatherRegions();
+
   // Both endpoints addressable in this process, at least one of them GPU.
   bool CanHandle(const TransferRef& src, const TransferRef& dst) const override;
 
@@ -104,6 +124,49 @@ class HbmCopyEngine final : public TransferEngine {
   // worker threads concurrently — cost with no matching win at KV-block sizes,
   // where a multi-MiB copy dwarfs the per-call launch overhead.
   std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan> plans) override;
+
+ private:
+  // Why a plan did not take the gather kernel.  The hot path never computes
+  // this: it is filled in only when debug mode is on (UMBP_HBM_COPY_DEBUG), so
+  // that the log can say which path carried a batch AND why the other one
+  // declined — the two questions are always asked together when a bandwidth
+  // number looks wrong.
+  enum class GatherSkip : uint8_t {
+    kTaken = 0,
+    kUnrecorded,                  // debug mode off, or a plan the pass never classified
+    kDisabled,                    // UMBP_DRAM_GATHER_KERNEL=0, or latched off by a failure
+    kKindNotHostDevice,           // D2D: no host side to register, so no kernel form
+    kNoDevice,                    // neither endpoint named a device
+    kHostNotGatherable,           // host side outside every HostTierRegistration, or
+                                  // registered but unreachable from this device
+    kNoFragments,                 // plan contributed no segments
+    kTooFewFragments,             // < 2 in the bucket; one segment is hipMemcpy's best case
+    kFragmentAtOrAboveThreshold,  // mean segment >= kGatherFragmentThreshold
+    kSetDeviceFailed,
+    kNoStream,
+    kLaunchFailed,
+    kSyncFailed,
+  };
+  static const char* GatherSkipName(GatherSkip reason);
+
+  // Run the gather kernel over the batch's eligible segments, bucketed by
+  // device.  Returns a per-plan flag: 1 means fully copied by the kernel, 0
+  // means "not taken" and never "failed" — Submit then runs its hipMemcpy loop
+  // for it, which reaches the same result whether or not fragments landed.
+  // May leave the current HIP device changed.
+  //
+  // `skip_reasons`, when non-null, is resized to plans.size() and filled with
+  // the per-plan verdict.  Submit passes it only in debug mode.
+  std::vector<char> GatherEligiblePlans(const std::vector<TransferPlan>& plans,
+                                        std::vector<GatherSkip>* skip_reasons);
+
+  // The address `device_id` must use to reach `ptr`, or null when no registered
+  // region covers it or that device cannot gather from the one that does.
+  // Kernels take this, never the host pointer -- see HostTierRegistration.
+  void* HostRegionDeviceAddress(const void* ptr, size_t size, int device_id) const;
+
+  mutable std::mutex host_regions_mutex_;
+  std::vector<std::unique_ptr<HostTierRegistration>> host_regions_;
 };
 
 }  // namespace mori::umbp

@@ -342,6 +342,10 @@ class PageBackend : public MediumBackend {
   struct OwnedSlot {
     std::vector<PageLocation> pages;
     uint64_t size = 0;
+    // Eviction fence, renewed by every Resolve.  Lives here rather than in a
+    // map keyed by the same string, which cost a second hash of a ~128-byte
+    // key per resolve.  Default-constructed means no lease.
+    std::chrono::steady_clock::time_point read_lease_until{};
   };
 
   AllocateResult AllocateLocked(const std::string& key, uint64_t size);
@@ -356,9 +360,9 @@ class PageBackend : public MediumBackend {
   // Build the full ADD list for every owned key.  Caller MUST hold `mutex_`.
   std::vector<KvEvent> SnapshotOwnedKeysLocked() const;
 
-  // Caller MUST hold `mutex_`.  True iff `key`'s read-lease deadline is
-  // still in the future.  Drops the entry if it has expired.
-  bool HasActiveReadLeaseLocked(const std::string& key);
+  // True iff `slot`'s read-lease deadline is still in the future.
+  static bool HasActiveReadLeaseLocked(const OwnedSlot& slot,
+                                       std::chrono::steady_clock::time_point now);
 
   // Caller MUST hold `mutex_`.  True iff `key` currently has an active copy
   // pin (protects its pages from eviction).
@@ -412,7 +416,6 @@ class PageBackend : public MediumBackend {
 
   std::unordered_map<uint64_t, PendingSlot> pending_;
   std::unordered_map<std::string, OwnedSlot> owned_;
-  std::unordered_map<std::string, std::chrono::steady_clock::time_point> read_lease_until_;
   std::vector<KvEvent> pending_events_;
 
   // Auto-flush state (see QueueEventLocked):

@@ -16,6 +16,38 @@ add_executable(test_umbp_local_client test_umbp_client.cpp)
 target_link_libraries(test_umbp_local_client PRIVATE umbp_core)
 add_test(NAME umbp_local_client COMMAND test_umbp_local_client)
 
+add_executable(test_umbp_dram_tier_concurrency test_dram_tier_concurrency.cpp)
+target_link_libraries(test_umbp_dram_tier_concurrency PRIVATE umbp_core
+                                                              GTest::gtest_main)
+target_compile_features(test_umbp_dram_tier_concurrency PRIVATE cxx_std_17)
+add_test(NAME umbp_dram_tier_concurrency
+         COMMAND test_umbp_dram_tier_concurrency)
+
+add_executable(test_umbp_dram_tier_ranges test_dram_tier_ranges.cpp)
+target_link_libraries(test_umbp_dram_tier_ranges PRIVATE umbp_core
+                                                         GTest::gtest_main)
+target_include_directories(test_umbp_dram_tier_ranges
+                           PRIVATE ${PROJECT_SOURCE_DIR}/src/umbp/local/tiers)
+target_compile_features(test_umbp_dram_tier_ranges PRIVATE cxx_std_17)
+add_test(NAME umbp_dram_tier_ranges COMMAND test_umbp_dram_tier_ranges)
+
+# Run the same byte-level expectations against both copy paths, since the
+# kernel and the copy engine must be indistinguishable in their results.
+add_executable(test_umbp_dram_tier_gather test_dram_tier_gather.cpp)
+# Own main(), to exit with SKIP_RETURN_CODE where the kernel path is unreachable.
+target_link_libraries(test_umbp_dram_tier_gather PRIVATE umbp_core GTest::gtest)
+# The gather and registration headers are source-private to the tier, like the
+# run planner; the test reaches them the same way rather than installing them.
+target_include_directories(test_umbp_dram_tier_gather
+                           PRIVATE ${PROJECT_SOURCE_DIR}/src/umbp/local/tiers)
+target_compile_features(test_umbp_dram_tier_gather PRIVATE cxx_std_17)
+add_test(NAME umbp_dram_tier_gather COMMAND test_umbp_dram_tier_gather)
+set_tests_properties(umbp_dram_tier_gather PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME umbp_dram_tier_gather_kernel_off
+         COMMAND test_umbp_dram_tier_gather)
+set_tests_properties(umbp_dram_tier_gather_kernel_off
+                     PROPERTIES ENVIRONMENT "UMBP_DRAM_GATHER_KERNEL=0")
+
 add_executable(test_umbp_local_follower_mode test_follower_mode.cpp)
 target_link_libraries(test_umbp_local_follower_mode PRIVATE umbp_core)
 add_test(NAME umbp_local_follower_mode COMMAND test_umbp_local_follower_mode)
@@ -28,9 +60,22 @@ add_executable(test_ssd_tier test_ssd_tier.cpp)
 target_link_libraries(test_ssd_tier PRIVATE umbp_core)
 add_test(NAME test_ssd_tier COMMAND test_ssd_tier)
 
+add_executable(test_umbp_ssd_tier_ranges test_ssd_tier_ranges.cpp)
+target_link_libraries(test_umbp_ssd_tier_ranges PRIVATE umbp_core GTest::gtest_main)
+target_compile_features(test_umbp_ssd_tier_ranges PRIVATE cxx_std_17)
+add_test(NAME umbp_ssd_tier_ranges COMMAND test_umbp_ssd_tier_ranges)
+
 add_executable(test_segment_crc test_segment_crc.cpp)
 target_link_libraries(test_segment_crc PRIVATE umbp_core)
 add_test(NAME test_segment_crc COMMAND test_segment_crc)
+
+add_executable(test_sharded_ssd_tier test_sharded_ssd_tier.cpp)
+target_link_libraries(test_sharded_ssd_tier PRIVATE umbp_core)
+add_test(NAME test_sharded_ssd_tier COMMAND test_sharded_ssd_tier)
+
+add_executable(test_ssd_direct_io test_ssd_direct_io.cpp)
+target_link_libraries(test_ssd_direct_io PRIVATE umbp_core)
+add_test(NAME test_ssd_direct_io COMMAND test_ssd_direct_io)
 
 add_executable(test_dummy_ssd_tier test_dummy_ssd_tier.cpp)
 target_link_libraries(test_dummy_ssd_tier PRIVATE umbp_core)
