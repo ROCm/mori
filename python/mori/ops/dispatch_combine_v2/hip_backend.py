@@ -105,6 +105,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         max_tok = cfg.max_num_inp_token_per_rank
         i32 = dict(dtype=torch.int32, device=dev)
         self.token_dest_map = torch.zeros(max_tok * topk, **i32)
+        self._null_flat = cfg.world_size * cfg.effective_max_recv
+        self.routing_dest_map = torch.full_like(self.token_dest_map, self._null_flat)
         self.dest_pe_counter = torch.zeros(cfg.world_size, **i32)
         self.total_recv = torch.zeros(1, **i32)
         self.dispatch_barrier = torch.zeros(1, dtype=torch.uint32, device=dev)
