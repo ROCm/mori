@@ -534,7 +534,7 @@ __global__ void ReduceScatterPullKernel(int myPe,
   // contribution to my shard then starts at + myPe*chunkElems. peerPtrs[myPe] ==
   // heapBaseAddr, so the self term resolves back to the local `input`.
   auto* gs = GetGlobalGpuStatesPtr();
-  application::SymmMemObj* heapObj = gs->heapObj;
+  auto* heapObj = gs->heapObj;
   const size_t inOff = reinterpret_cast<uintptr_t>(input) - gs->heapBaseAddr;
   const size_t myOfs = static_cast<size_t>(myPe) * chunkElems;
   auto srcBase = [heapObj, inOff, myOfs](int pe) -> const T* {

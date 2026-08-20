@@ -48,8 +48,7 @@ static_assert(sizeof(SDMA_PKT_COPY_LINEAR) + sizeof(SDMA_PKT_ATOMIC)
 static constexpr int kRSPushMaxPeers = 16;
 static constexpr int kRSPushMaxSlices = 8;
 
-// Per-peer all-to-all endpoints: chunk sent from `source` to peer p / received
-// into `dest` from peer p. Host-fillable, device-readable (host-pinned buffer).
+// Per-peer all-to-all endpoints: chunk sent from `source` to peer p / received// into `dest` from peer p. Host-fillable, device-readable (host-pinned buffer).
 struct AddressPair {
   const void* source;
   void* dest;
@@ -62,11 +61,12 @@ struct AddressPair {
 #define BREAK_ON_RETRIES 1
 
 // Streaming (cache-bypassing) 16-byte load/store.
-#if (defined(__gfx942__) || defined(__gfx950__)) &&     \
-    __has_builtin(__builtin_amdgcn_global_load_b128) && \
+#if (defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1250__))
+#if __has_builtin(__builtin_amdgcn_global_load_b128) && \
     __has_builtin(__builtin_amdgcn_global_store_b128)
 #elif defined(__HIP_DEVICE_COMPILE__)
 #error "Global b128 load/store not supported on this architecture"
+#endif
 #endif
 
 constexpr uint32_t VecBytes = 16;

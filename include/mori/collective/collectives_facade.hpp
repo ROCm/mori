@@ -64,13 +64,21 @@
 // definitions -- the one that defines MORI_KERNELS_IMPL (the XLA device TU
 // mori_kernels.cu.cc, or each standalone MORI example binary). Host TUs see only
 // the declarations below and link against that TU's symbols.
+//
+// Device compilation is restricted to gfx942 / gfx950 / gfx1250. Other offload
+// arches skip the kernel headers (and get Run* stubs below) so fatbin builds
+// do not pull SDMA/b128 device code.
 #if defined(MORI_KERNELS_IMPL)
+#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx942__) || defined(__gfx950__) || \
+    defined(__gfx1250__)
+#define MORI_FACADE_COLLECTIVES_ARCH 1
 #include <hip/hip_bfloat16.h>
 #include "mori/collective/XLA/all_gather_kernels.hpp"
 #include "mori/collective/XLA/all_reduce_kernels.hpp"
 #include "mori/collective/XLA/all_to_all_kernels.hpp"
 #include "mori/collective/XLA/collective_permute_kernels.hpp"
 #include "mori/collective/XLA/reduce_scatter_kernels.hpp"
+#endif
 #endif  // MORI_KERNELS_IMPL
 
 #define FACADE_PRINTF(fmt, ...) std::fprintf(stderr, fmt"\n", ##__VA_ARGS__)
@@ -240,8 +248,12 @@ class CollectivesFacade {
 // __global__ kernel headers, so they are compiled only by the single TU that
 // defines MORI_KERNELS_IMPL (a HIP compiler). Host TUs see only the declarations
 // above and link against that TU's non-template symbols.
+//
+// Host compile and gfx942/gfx950/gfx1250 device compile get the real launches.
+// Other device compiles of this TU never include the kernel headers and stub
+// every Run* to hipErrorNotSupported.
 // ---------------------------------------------------------------------------
-#if defined(MORI_KERNELS_IMPL)
+#if defined(MORI_KERNELS_IMPL) && defined(MORI_FACADE_COLLECTIVES_ARCH)
 
 namespace detail {
 // Device-wide barrier: one thread issues the cross-PE shmem barrier.
@@ -436,7 +448,38 @@ hipError_t CollectivesFacade::RunFence() {
   return hipSuccess;
 }
 
+#elif defined(MORI_KERNELS_IMPL)
+hipError_t CollectivesFacade::RunReduceScatter(const void*, void*, size_t, DataType, ReduceOpKind,
+                                               hipStream_t) {
+  return hipErrorNotSupported;
+}
+hipError_t CollectivesFacade::RunAllReduce(const void*, void*, size_t, DataType, ReduceOpKind,
+                                           hipStream_t) {
+  return hipErrorNotSupported;
+}
+hipError_t CollectivesFacade::RunAllGather(const void*, void*, size_t, hipStream_t) {
+  return hipErrorNotSupported;
+}
+hipError_t CollectivesFacade::RunAllToAll(const AddressVector&, size_t, hipStream_t) {
+  return hipErrorNotSupported;
+}
+hipError_t CollectivesFacade::RunBarrier(hipStream_t) { return hipErrorNotSupported; }
+hipError_t CollectivesFacade::RunSend(const void*, size_t, int, hipStream_t) {
+  return hipErrorNotSupported;
+}
+hipError_t CollectivesFacade::RunRecv(void*, size_t, int, hipStream_t) {
+  return hipErrorNotSupported;
+}
+hipError_t CollectivesFacade::RunCollectivePermute(const void*, void*, size_t, int,
+                                                   const std::vector<int>&, hipStream_t) {
+  return hipErrorNotSupported;
+}
+hipError_t CollectivesFacade::RunQuiet(hipStream_t) { return hipErrorNotSupported; }
+hipError_t CollectivesFacade::RunFence() { return hipErrorNotSupported; }
+
 #endif  // MORI_KERNELS_IMPL
 
 }  // namespace collective
 }  // namespace mori
+
+#undef MORI_FACADE_COLLECTIVES_ARCH
