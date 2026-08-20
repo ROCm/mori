@@ -1059,10 +1059,13 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
                 qpn, ibuf->addr, ibuf->lkey, signalRaddr, signalRkey, &signalValue, &signalValue,
                 sizeof(signalValue), core::atomicType::AMO_ADD);
           } else if constexpr (PrvdType == core::ProviderType::PSD) {
-            dbr_val = core::PostAtomic<PrvdType>(
+            // gfx942+ionic: GPU-issued RDMA atomic-add does NOT transmit at all (confirmed on driver
+            // 26.03.27.002: tx counter stays 0 when PostAtomic is used). Use a plain remote WRITE of
+            // the accumulated value instead. Single-writer-per-slot signal slots make write ==
+            // add-from-zero semantically.
+            dbr_val = core::PostWriteInline<PrvdType>(
                 *wq, my_sq_counter + 1, my_sq_counter + 1, my_sq_counter + 1, is_leader, qpn,
-                ibuf->addr, ibuf->lkey, signalRaddr, signalRkey, &signalValue, &signalValue,
-                sizeof(signalValue), core::atomicType::AMO_ADD);
+                &signalValue, signalRaddr, signalRkey, sizeof(signalValue));
           }
         }
       } else {
@@ -1302,9 +1305,11 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelImpl(
         core::PostAtomic<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter, is_leader,
                                    qpn, laddr, lkey, raddr, rkey, val, val, bytes, amoType);
   } else if constexpr (PrvdType == core::ProviderType::PSD) {
-    dbr_val =
-        core::PostAtomic<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, is_leader, qpn,
-                                   laddr, lkey, raddr, rkey, val, val, bytes, amoType);
+    // gfx942+ionic: GPU-issued RDMA atomics don't land at the remote target (post OK, never applied).
+    // MoRI-EP uses this non-fetch atomic only for single-writer signal counters, so a remote WRITE of
+    // the value is equivalent and uses the working write path. (AMO_ADD-from-zero == write of value.)
+    dbr_val = core::PostWriteInline<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter,
+                                              is_leader, qpn, val, raddr, rkey, bytes);
   }
 
   __threadfence_system();
@@ -2157,10 +2162,13 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelAddrImpl(
                 qpn, ibuf->addr, ibuf->lkey, signalRaddr, signalRkey, &signalValue, &signalValue,
                 sizeof(signalValue), core::atomicType::AMO_ADD);
           } else if constexpr (PrvdType == core::ProviderType::PSD) {
-            dbr_val = core::PostAtomic<PrvdType>(
+            // gfx942+ionic: GPU-issued RDMA atomic-add does NOT transmit at all (confirmed on driver
+            // 26.03.27.002: tx counter stays 0 when PostAtomic is used). Use a plain remote WRITE of
+            // the accumulated value instead. Single-writer-per-slot signal slots make write ==
+            // add-from-zero semantically.
+            dbr_val = core::PostWriteInline<PrvdType>(
                 *wq, my_sq_counter + 1, my_sq_counter + 1, my_sq_counter + 1, is_leader, qpn,
-                ibuf->addr, ibuf->lkey, signalRaddr, signalRkey, &signalValue, &signalValue,
-                sizeof(signalValue), core::atomicType::AMO_ADD);
+                &signalValue, signalRaddr, signalRkey, sizeof(signalValue));
           }
         }
       } else {
@@ -2377,9 +2385,11 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelAddrImpl(const void* d
         core::PostAtomic<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter, is_leader,
                                    qpn, laddr, lkey, raddr, rkey, val, val, bytes, amoType);
   } else if constexpr (PrvdType == core::ProviderType::PSD) {
-    dbr_val =
-        core::PostAtomic<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, is_leader, qpn,
-                                   laddr, lkey, raddr, rkey, val, val, bytes, amoType);
+    // gfx942+ionic: GPU-issued RDMA atomics don't land at the remote target (post OK, never applied).
+    // MoRI-EP uses this non-fetch atomic only for single-writer signal counters, so a remote WRITE of
+    // the value is equivalent and uses the working write path. (AMO_ADD-from-zero == write of value.)
+    dbr_val = core::PostWriteInline<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter,
+                                              is_leader, qpn, val, raddr, rkey, bytes);
   }
 
   __threadfence_system();

@@ -276,6 +276,22 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
   MORI_APP_TRACE("cq ptr:0x{:x}, cq size:{}, cq mask:0x{:x}",
                  reinterpret_cast<uintptr_t>(dvcq.q.ptr), dvcq.q.size, dvcq.q.mask);
 
+  // Enable GPU-Direct Async (GDA) mode on the QP: the provider writes WQEs into the SQ/RQ ring
+  // without ringing the doorbell, so the GPU kernel can ring the mapped doorbell register itself
+  // (this is exactly what the device-side IonicPostSend/RingDoorbell path does). Without this the
+  // QP stays in normal mode and the GPU-issued doorbell has no effect -> internode EP dispatch hangs.
+  // Required on gfx942+ionic; optional symbol (older drivers may lack it).
+  if (IonicDvApi::Instance().qp_set_gda != nullptr && !std::getenv("MORI_DISABLE_IONIC_GDA")) {
+    int gdaRc = IonicDvApi::Instance().qp_set_gda(qp, /*enable_send=*/true, /*enable_recv=*/true);
+    if (gdaRc != 0) {
+      MORI_APP_WARN("ionic_dv_qp_set_gda failed rc={} (GPU-direct doorbell may not work)", gdaRc);
+    } else {
+      MORI_APP_TRACE("ionic_dv_qp_set_gda enabled (GDA mode) for GPU doorbell");
+    }
+  } else {
+    MORI_APP_WARN("ionic_dv_qp_set_gda unavailable in libionic; GPU-direct doorbell may not work");
+  }
+
   ionic_dv_qp dvqp;
   IonicDvApi::Instance().get_qp(&dvqp, qp);
 
@@ -316,7 +332,29 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
   int atomicIbufAccessFlag =
       MaybeAddRelaxedOrderingFlag(IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
                                   IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
-  atomicIbufMr = ibv_reg_mr(pd_uxdma, atomicIbufAddr, atomicIbufSize, atomicIbufAccessFlag);
+  // gfx942+ionic: plain ibv_reg_mr on GPU memory needs amdgpu_peermem (absent on this stack).
+  // Register the GPU atomic ibuf via dmabuf first (matches the symmetric-heap dmabuf path that works
+  // for MoRI-IO here); fall back to plain ibv_reg_mr for host memory / when dmabuf is unavailable.
+  atomicIbufMr = nullptr;
+  if (config.onGpu) {
+    int atomicIbufDmabufFd = -1;
+    hipError_t dmabufErr = hipMemGetHandleForAddressRange(
+        &atomicIbufDmabufFd, reinterpret_cast<hipDeviceptr_t>(atomicIbufAddr), atomicIbufSize,
+        hipMemRangeHandleTypeDmaBufFd, 0);
+    if (dmabufErr == hipSuccess && atomicIbufDmabufFd >= 0) {
+      atomicIbufMr = ibv_reg_dmabuf_mr(pd_uxdma, 0, atomicIbufSize,
+                                       reinterpret_cast<uint64_t>(atomicIbufAddr),
+                                       atomicIbufDmabufFd, atomicIbufAccessFlag);
+      close(atomicIbufDmabufFd);
+      if (atomicIbufMr) {
+        MORI_APP_TRACE("IONIC Atomic ibuf registered via dmabuf, addr=0x{:x}",
+                       reinterpret_cast<uintptr_t>(atomicIbufAddr));
+      }
+    }
+  }
+  if (!atomicIbufMr) {
+    atomicIbufMr = ibv_reg_mr(pd_uxdma, atomicIbufAddr, atomicIbufSize, atomicIbufAccessFlag);
+  }
   assert(atomicIbufMr);
 
   MORI_APP_TRACE(
@@ -389,7 +427,10 @@ void IonicQpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& local_handle,
   attr.ah_attr.grh.sgid_index = local_handle.eth.gidIdx;
   attr.ah_attr.port_num = config.portId;
   attr.ah_attr.is_global = 1;
-  attr.ah_attr.grh.hop_limit = 1;
+  // hop_limit=1 only survives a single switch hop -> works for same-leaf/loopback but DROPS packets
+  // that cross a routed leaf-spine fabric (multi-hop) -> cross-physical-node RDMA never lands and the
+  // receiver hangs. Use 255 like the bnxt provider (mlx5 uses 64) so cross-node traffic is routed.
+  attr.ah_attr.grh.hop_limit = 255;
   attr.ah_attr.sl = ReadRdmaServiceLevelEnv().value_or(0);
   std::optional<uint8_t> tc = ReadRdmaTrafficClassEnv();
   if (tc.has_value()) {

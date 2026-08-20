@@ -1017,11 +1017,19 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs<T>& 
     if ((laneId < nNodes) &&
         (laneId != myNode)) {  // avoid setting myNode, it will be set in intra node branch
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
+#ifdef MORI_DEVICE_NIC_IONIC
+      // gfx942+ionic: RDMA atomic-add is emulated as an overwriting WRITE (real atomics don't
+      // transmit). numQpPerPe add-1s can't accumulate, so write the absolute expected value once.
+      shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(
+          args.crossDeviceBarrierMemObj, args.config.rank * sizeof(uint64_t),
+          barrierFlag * config.numQpPerPe, core::AMO_ADD, proxyPe, 0);
+#else
       for (int i = 0; i < config.numQpPerPe; i++) {
         shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(args.crossDeviceBarrierMemObj,
                                                        args.config.rank * sizeof(uint64_t), 1,
                                                        core::AMO_ADD, proxyPe, i);
       }
+#endif
     }
     if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
 
@@ -1152,11 +1160,18 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs<T>
     if ((laneId < nNodes) &&
         (laneId != myNode)) {  // avoid setting myNode, it will be set in intra node branch
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
+#ifdef MORI_DEVICE_NIC_IONIC
+      // gfx942+ionic: RDMA atomic-add is emulated as an overwriting WRITE; write absolute value once.
+      shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(
+          args.crossDeviceBarrierMemObj, args.config.rank * sizeof(uint64_t),
+          barrierFlag * config.numQpPerPe, core::AMO_ADD, proxyPe, 0);
+#else
       for (int i = 0; i < config.numQpPerPe; i++) {
         shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(args.crossDeviceBarrierMemObj,
                                                        args.config.rank * sizeof(uint64_t), 1,
                                                        core::AMO_ADD, proxyPe, i);
       }
+#endif
       __threadfence_system();
     }
     if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
