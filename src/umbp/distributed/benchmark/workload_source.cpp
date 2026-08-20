@@ -10,8 +10,7 @@
 
 namespace mori::umbp::benchmark {
 
-TraceWorkloadSource::TraceWorkloadSource(const std::string& path, TraceLimits limits)
-    : reader_(path, limits) {}
+TraceWorkloadSource::TraceWorkloadSource(const std::string& path) : reader_(path) {}
 
 bool TraceWorkloadSource::Next(::umbp::benchmark::WorkloadEvent* event) {
   return reader_.ReadNext(event);

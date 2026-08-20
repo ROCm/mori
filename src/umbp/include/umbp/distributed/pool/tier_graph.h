@@ -36,7 +36,6 @@ class LogicalTierGraph {
     PoolOffloadTrigger trigger = PoolOffloadTrigger::kOnEvict;
     double high_watermark = 0.9;
     double low_watermark = 0.7;
-    TierCandidatePolicy candidate_policy = TierCandidatePolicy::kLru;
     bool promote_on_read = false;
     PoolTransitionMode promotion_mode = PoolTransitionMode::kCopy;
   };
@@ -50,13 +49,19 @@ class LogicalTierGraph {
   TierIndex EntryTierIndex() const { return entry_tier_; }
   const Node& NodeAt(TierIndex tier) const { return nodes_.at(tier); }
 
-  std::optional<TierIndex> TierIndexForBackendName(std::string_view name) const;
   std::optional<TierIndex> TierIndexForBackendId(uint32_t backend_id) const;
   std::string NameForBackend(uint32_t backend_id) const;
   std::map<std::string, LogicalTierCapacity> CapacitySnapshot() const;
 
-  double Utilization(TierIndex tier) const;
+  double MemberUtilization(uint32_t backend_id) const;
+  // Watermarks describe pressure, and pressure does not average: a tier that
+  // mixes a 512 GiB DRAM member with a 1 TiB SSD member would report only ~33%
+  // aggregate use with DRAM completely full, so nothing would ever offload and
+  // the DRAM-weighted share of the traffic would silently spill to SSD. The
+  // fullest member therefore speaks for the tier.
+  double PeakMemberUtilization(TierIndex tier) const;
   bool AtOrAbove(TierIndex tier, double watermark) const;
+  bool MemberAtOrAbove(uint32_t backend_id, double watermark) const;
 
   std::vector<uint32_t> WeightedMemberOrder(TierIndex tier, std::string_view key) const;
   std::vector<uint32_t> PutOrder(std::string_view key) const;
@@ -69,7 +74,6 @@ class LogicalTierGraph {
  private:
   LogicalTierGraph(const BackendRegistry& backends, std::vector<Node> nodes,
                    std::vector<std::vector<TierIndex>> upstream,
-                   std::unordered_map<std::string, TierIndex> tier_by_backend_name,
                    std::unordered_map<uint32_t, TierIndex> tier_by_backend_id,
                    TierIndex entry_tier);
 
@@ -81,7 +85,6 @@ class LogicalTierGraph {
   const BackendRegistry* backends_;
   std::vector<Node> nodes_;
   std::vector<std::vector<TierIndex>> upstream_;
-  std::unordered_map<std::string, TierIndex> tier_by_backend_name_;
   std::unordered_map<uint32_t, TierIndex> tier_by_backend_id_;
   TierIndex entry_tier_ = kEntryTierIndex;
 };

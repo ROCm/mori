@@ -146,12 +146,14 @@ add_test(NAME umbp_backend_policy_config
 # the real PoolClient adapter is covered by the integration smoke below.
 add_executable(test_umbp_workload_trace test_umbp_workload_trace.cpp)
 add_dependencies(test_umbp_workload_trace umbp_workload_proto)
-target_link_libraries(test_umbp_workload_trace PRIVATE umbp_common gtest_main)
+target_link_libraries(test_umbp_workload_trace PRIVATE umbp_workload_bench
+                                                       gtest_main)
 add_test(NAME umbp_workload_trace COMMAND test_umbp_workload_trace)
 
 add_executable(test_umbp_workload_runner test_umbp_workload_runner.cpp)
 add_dependencies(test_umbp_workload_runner umbp_workload_proto)
-target_link_libraries(test_umbp_workload_runner PRIVATE umbp_common gtest_main)
+target_link_libraries(test_umbp_workload_runner PRIVATE umbp_workload_bench
+                                                        gtest_main)
 add_test(NAME umbp_workload_runner COMMAND test_umbp_workload_runner)
 
 # env_time helpers are header-only; tests only exercise the parser path. NOTE:
@@ -223,8 +225,8 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 target_link_libraries(
   test_umbp_tier_benchmark
-  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
-          gtest_main)
+  PRIVATE umbp_core umbp_workload_bench ${_TEST_PROTOBUF_LIB}
+          ${_TEST_GRPCPP_LIB} gtest_main)
 add_test(NAME umbp_tier_benchmark COMMAND test_umbp_tier_benchmark)
 
 # test_umbp_medium_selection — one medium per node: the UMBPMedium -> TierType
@@ -342,10 +344,11 @@ add_test(NAME test_backend_registry COMMAND test_backend_registry)
 
 # test_peer_pool — implicit default Pool, SingleBackendPolicy compatibility,
 # logical key placement, named same-tier backend dispatch, and recovery fallback.
+# Registered under the umbp_ prefix so CI's ctest filter picks it up.
 add_executable(test_peer_pool test_peer_pool.cpp)
 target_link_libraries(test_peer_pool PRIVATE umbp_common GTest::gtest_main)
 target_compile_features(test_peer_pool PRIVATE cxx_std_17)
-add_test(NAME test_peer_pool COMMAND test_peer_pool)
+add_test(NAME umbp_peer_pool COMMAND test_peer_pool)
 
 # test_transfer_engine — the Phase 6 transfer layer without gRPC or RDMA:
 # LocalCopyEngine's planner/executor and CompositeTransferEngine's fan-out

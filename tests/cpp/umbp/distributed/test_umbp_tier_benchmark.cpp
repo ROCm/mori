@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "umbp/distributed/benchmark/payload.h"
+#include "umbp/distributed/benchmark/pool_workload_client.h"
 #include "umbp/distributed/benchmark/workload_runner.h"
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/master/master_server.h"
@@ -133,125 +134,25 @@ std::vector<Event> MakeReplay() {
   return events;
 }
 
-// WorkloadRunner preserves order within a client but runs different client IDs
-// concurrently. This adapter maps each ID to its PoolClient and keeps the data
-// path batched. A heartbeat flush after PUT plus bounded GET retries bridges the
-// intentionally asynchronous peer-event -> master-index publication boundary.
-class PoolWorkloadClient final : public bench::WorkloadClient {
- public:
-  explicit PoolWorkloadClient(std::vector<std::unique_ptr<PoolClient>>* clients)
-      : clients_(clients) {}
 
-  bench::ClientResult Put(uint32_t client_id, const std::string& key, const uint8_t* data,
-                          size_t size) override {
-    PoolClient* client = Select(client_id);
-    if (client == nullptr) return bench::ClientResult::kFailed;
-    const bool success = client->Put(key, data, size);
-    if (success) client->Master().FlushHeartbeat();
-    return success ? bench::ClientResult::kSuccess : bench::ClientResult::kFailed;
-  }
-
-  bench::ClientResult Get(uint32_t client_id, const std::string& key, uint8_t* data,
-                          size_t size) override {
-    PoolClient* client = Select(client_id);
-    if (client == nullptr) return bench::ClientResult::kFailed;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    do {
-      if (client->Get(key, data, size)) return bench::ClientResult::kSuccess;
-      std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    } while (std::chrono::steady_clock::now() < deadline);
-    return client->Exists(key) ? bench::ClientResult::kFailed
-                               : bench::ClientResult::kNotFound;
-  }
-
-  std::vector<bench::ClientResult> BatchPut(
-      uint32_t client_id, const std::vector<std::string>& keys,
-      const std::vector<std::vector<uint8_t>>& values) override {
-    PoolClient* client = Select(client_id);
-    if (client == nullptr || keys.size() != values.size()) {
-      return std::vector<bench::ClientResult>(keys.size(), bench::ClientResult::kFailed);
-    }
-
-    ++batch_put_calls_[client_id];
-    std::vector<const void*> sources;
-    std::vector<size_t> sizes;
-    sources.reserve(values.size());
-    sizes.reserve(values.size());
-    for (const auto& value : values) {
-      sources.push_back(value.data());
-      sizes.push_back(value.size());
-    }
-
-    const auto results = client->BatchPut(keys, sources, sizes);
-    std::vector<bench::ClientResult> converted(keys.size(), bench::ClientResult::kFailed);
-    for (size_t i = 0; i < std::min(keys.size(), results.size()); ++i) {
-      if (results[i]) converted[i] = bench::ClientResult::kSuccess;
-    }
-    client->Master().FlushHeartbeat();
-    return converted;
-  }
-
-  std::vector<bench::ClientResult> BatchGet(
-      uint32_t client_id, const std::vector<std::string>& keys,
-      const std::vector<size_t>& sizes,
-      std::vector<std::vector<uint8_t>>* values) override {
-    PoolClient* client = Select(client_id);
-    if (client == nullptr || keys.size() != sizes.size() || values == nullptr) {
-      return std::vector<bench::ClientResult>(keys.size(), bench::ClientResult::kFailed);
-    }
-
-    ++batch_get_calls_[client_id];
-    values->resize(keys.size());
-    std::vector<void*> destinations(keys.size());
-    for (size_t i = 0; i < keys.size(); ++i) {
-      (*values)[i].assign(sizes[i], 0);
-      destinations[i] = (*values)[i].data();
-    }
-
-    std::vector<bool> results;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    do {
-      results = client->BatchGet(keys, destinations, sizes);
-      if (results.size() == keys.size() &&
-          std::all_of(results.begin(), results.end(), [](bool result) { return result; })) {
-        return std::vector<bench::ClientResult>(keys.size(), bench::ClientResult::kSuccess);
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    } while (std::chrono::steady_clock::now() < deadline);
-
-    std::vector<bench::ClientResult> converted(keys.size(), bench::ClientResult::kFailed);
-    const auto exists = client->BatchExists(keys);
-    for (size_t i = 0; i < keys.size(); ++i) {
-      if (i >= exists.size() || !exists[i]) converted[i] = bench::ClientResult::kNotFound;
-    }
-    return converted;
-  }
-
-  uint64_t BatchPutCalls(uint32_t client_id) const { return batch_put_calls_[client_id].load(); }
-  uint64_t BatchGetCalls(uint32_t client_id) const { return batch_get_calls_[client_id].load(); }
-
- private:
-  PoolClient* Select(uint32_t client_id) const {
-    if (clients_ == nullptr || client_id >= clients_->size()) return nullptr;
-    return (*clients_)[client_id].get();
-  }
-
-  std::vector<std::unique_ptr<PoolClient>>* clients_;
-  std::atomic<uint64_t> batch_put_calls_[2]{{0}, {0}};
-  std::atomic<uint64_t> batch_get_calls_[2]{{0}, {0}};
-};
-
-class TierBenchmarkSmokeTest : public ::testing::Test {
+// Every case here needs the same thing before it can say anything about
+// placement: one in-process master on an ephemeral port, and PoolClients that
+// really register with it. Only the routing affinity, the capacity contract, and
+// the backend shapes differ, so those are the parameters.
+class InProcessClusterTest : public ::testing::Test {
  protected:
-  void SetUp() override {
+  using Affinity = ConfigurableRoutePutStrategy::NodeAffinity;
+
+  void StartMaster(Affinity affinity = Affinity::kNone,
+                   bool advertise_max_allocatable_bytes = false) {
     MasterServerConfig config;
     config.listen_address = "127.0.0.1:0";
     config.metrics_port = 0;
     config.registry_config.default_dram_page_size = kPageSize;
     config.registry_config.heartbeat_ttl = std::chrono::seconds(1);
+    config.registry_config.advertise_max_allocatable_bytes = advertise_max_allocatable_bytes;
     config.put_strategy = std::make_unique<ConfigurableRoutePutStrategy>(
-        ConfigurableRoutePutStrategy::SelectAlgo::kMostAvailable,
-        ConfigurableRoutePutStrategy::NodeAffinity::kNone, 17);
+        ConfigurableRoutePutStrategy::SelectAlgo::kMostAvailable, affinity, 17);
     master_ = std::make_unique<MasterServer>(std::move(config));
     master_thread_ = std::thread([this] { master_->Run(); });
 
@@ -260,14 +161,47 @@ class TierBenchmarkSmokeTest : public ::testing::Test {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     ASSERT_NE(master_->GetBoundPort(), 0) << "in-process master failed to start";
-
-    StartClient(0);
-    StartClient(1);
-    ASSERT_EQ(clients_.size(), 2u);
-
-    for (const auto& client : clients_) client->Master().FlushHeartbeat();
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
+
+  // Weighted placement across named DRAM backends, which is the configuration
+  // under test in every case; callers supply the backends.
+  void StartClient(const std::string& node_id,
+                   const std::vector<BackendInstanceConfig>& backends) {
+    PoolClientConfig config;
+    config.master_config.master_address =
+        "127.0.0.1:" + std::to_string(master_->GetBoundPort());
+    config.master_config.node_id = node_id;
+    config.master_config.node_address = "127.0.0.1";
+    config.master_config.auto_heartbeat = true;
+    config.io_engine.host = "127.0.0.1";
+    config.io_engine.port = 0;
+    config.auto_peer_service_port = true;
+    config.dram_page_size = kPageSize;
+    config.cache_remote_fetches = false;
+    config.placement_policy = PoolPlacementPolicy::WEIGHTED;
+    config.backends = backends;
+
+    auto client = std::make_unique<PoolClient>(std::move(config));
+    ASSERT_TRUE(client->Init()) << "failed to initialize PoolClient " << node_id;
+    clients_.push_back(std::move(client));
+  }
+
+  static BackendInstanceConfig DramBackend(const std::string& name, uint64_t capacity,
+                                           uint32_t weight) {
+    BackendInstanceConfig backend;
+    backend.name = name;
+    backend.tier = TierType::DRAM;
+    backend.dram.buffer_sizes = {capacity};
+    backend.placement_weight = weight;
+    return backend;
+  }
+
+  void Settle(std::chrono::milliseconds wait) {
+    for (const auto& client : clients_) client->Master().FlushHeartbeat();
+    std::this_thread::sleep_for(wait);
+  }
+
+  PoolClient* client() const { return clients_.empty() ? nullptr : clients_.front().get(); }
 
   void TearDown() override {
     for (auto& client : clients_) {
@@ -282,43 +216,34 @@ class TierBenchmarkSmokeTest : public ::testing::Test {
     master_.reset();
   }
 
-  void StartClient(uint32_t client_id) {
-    PoolClientConfig config;
-    config.master_config.master_address =
-        "127.0.0.1:" + std::to_string(master_->GetBoundPort());
-    config.master_config.node_id = "tier-smoke-node-" + std::to_string(client_id);
-    config.master_config.node_address = "127.0.0.1";
-    config.master_config.auto_heartbeat = true;
-    config.io_engine.host = "127.0.0.1";
-    config.io_engine.port = 0;
-    config.auto_peer_service_port = true;
-    config.dram_page_size = kPageSize;
-    config.cache_remote_fetches = false;
-    config.placement_policy = PoolPlacementPolicy::WEIGHTED;
-
-    for (uint32_t backend_id = 0; backend_id < 2; ++backend_id) {
-      BackendInstanceConfig backend;
-      backend.name = "dram-" + std::to_string(backend_id);
-      backend.tier = TierType::DRAM;
-      backend.dram.buffer_sizes = {kBackendCapacity};
-      backend.placement_weight = backend_id + 1;
-      config.backends.push_back(std::move(backend));
-    }
-
-    auto client = std::make_unique<PoolClient>(std::move(config));
-    ASSERT_TRUE(client->Init()) << "failed to initialize PoolClient " << client_id;
-    clients_.push_back(std::move(client));
-  }
-
   std::unique_ptr<MasterServer> master_;
   std::thread master_thread_;
   std::vector<std::unique_ptr<PoolClient>> clients_;
 };
 
+class TierBenchmarkSmokeTest : public InProcessClusterTest {
+ protected:
+  void SetUp() override {
+    ASSERT_NO_FATAL_FAILURE(StartMaster());
+    for (uint32_t client_id = 0; client_id < 2; ++client_id) {
+      ASSERT_NO_FATAL_FAILURE(
+          StartClient("tier-smoke-node-" + std::to_string(client_id),
+                      {DramBackend("dram-0", kBackendCapacity, 1),
+                       DramBackend("dram-1", kBackendCapacity, 2)}));
+    }
+    ASSERT_EQ(clients_.size(), 2u);
+    Settle(std::chrono::milliseconds(100));
+  }
+};
+
 TEST_F(TierBenchmarkSmokeTest, ReplaysValidatedBatchesAcrossWeightedDramBackends) {
   constexpr uint64_t kPayloadSeed = 0x5eed;
   VectorSource source(MakeReplay(), kPayloadSeed);
-  PoolWorkloadClient adapter(&clients_);
+  // Client B may read a key client A only just wrote, so the reader waits out
+  // the peer-event to master-index publication window instead of missing.
+  bench::PoolWorkloadClient adapter(&clients_,
+                                    {std::chrono::seconds(5), std::chrono::seconds(5),
+                                     std::chrono::milliseconds(25)});
   bench::WorkloadRunnerOptions options;
   options.max_throughput = true;
   options.validate_get_payloads = true;
@@ -396,76 +321,25 @@ TEST_F(TierBenchmarkSmokeTest, ClientBReadsClientAKeysWithPayloadValidation) {
   }
 }
 
-class TinyWeightedPoolTest : public ::testing::Test {
+// The weight of 100 to 1 makes dram-0 the primary for practically every key, so
+// a fallback onto dram-1 is a decision the pool made and not a coin flip.
+class TinyWeightedPoolTest : public InProcessClusterTest {
  protected:
   static constexpr size_t kTinyPages = 4;
   static constexpr size_t kTinyCapacity = kPageSize * kTinyPages;
 
   void SetUp() override {
-    MasterServerConfig config;
-    config.listen_address = "127.0.0.1:0";
-    config.metrics_port = 0;
-    config.registry_config.default_dram_page_size = kPageSize;
-    config.registry_config.heartbeat_ttl = std::chrono::seconds(1);
-    config.put_strategy = std::make_unique<ConfigurableRoutePutStrategy>(
-        ConfigurableRoutePutStrategy::SelectAlgo::kMostAvailable,
-        ConfigurableRoutePutStrategy::NodeAffinity::kLocal, 17);
-    master_ = std::make_unique<MasterServer>(std::move(config));
-    master_thread_ = std::thread([this] { master_->Run(); });
-
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (master_->GetBoundPort() == 0 && std::chrono::steady_clock::now() < deadline) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    ASSERT_NE(master_->GetBoundPort(), 0);
-
-    PoolClientConfig client_config;
-    client_config.master_config.master_address =
-        "127.0.0.1:" + std::to_string(master_->GetBoundPort());
-    client_config.master_config.node_id = "tier-tiny-node-0";
-    client_config.master_config.node_address = "127.0.0.1";
-    client_config.master_config.auto_heartbeat = true;
-    client_config.io_engine.host = "127.0.0.1";
-    client_config.io_engine.port = 0;
-    client_config.auto_peer_service_port = true;
-    client_config.dram_page_size = kPageSize;
-    client_config.cache_remote_fetches = false;
-    client_config.placement_policy = PoolPlacementPolicy::WEIGHTED;
-
-    for (uint32_t backend_id = 0; backend_id < 2; ++backend_id) {
-      BackendInstanceConfig backend;
-      backend.name = "dram-" + std::to_string(backend_id);
-      backend.tier = TierType::DRAM;
-      backend.dram.buffer_sizes = {kTinyCapacity};
-      backend.placement_weight = backend_id == 0 ? 100u : 1u;
-      client_config.backends.push_back(std::move(backend));
-    }
-
-    client_ = std::make_unique<PoolClient>(std::move(client_config));
-    ASSERT_TRUE(client_->Init());
-    client_->Master().FlushHeartbeat();
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    ASSERT_NO_FATAL_FAILURE(StartMaster(Affinity::kLocal));
+    ASSERT_NO_FATAL_FAILURE(StartClient("tier-tiny-node-0",
+                                        {DramBackend("dram-0", kTinyCapacity, 100),
+                                         DramBackend("dram-1", kTinyCapacity, 1)}));
+    Settle(std::chrono::milliseconds(100));
   }
-
-  void TearDown() override {
-    if (client_) {
-      client_->Clear();
-      client_->Shutdown();
-    }
-    client_.reset();
-    if (master_) master_->Shutdown();
-    if (master_thread_.joinable()) master_thread_.join();
-    master_.reset();
-  }
-
-  std::unique_ptr<MasterServer> master_;
-  std::thread master_thread_;
-  std::unique_ptr<PoolClient> client_;
 };
 
 TEST_F(TinyWeightedPoolTest, FallsBackThenFailsWithoutLeakingSlots) {
-  MediumBackend* primary = client_->Backends().Get("dram-0");
-  MediumBackend* fallback = client_->Backends().Get("dram-1");
+  MediumBackend* primary = client()->Backends().Get("dram-0");
+  MediumBackend* fallback = client()->Backends().Get("dram-1");
   ASSERT_NE(primary, nullptr);
   ASSERT_NE(fallback, nullptr);
 
@@ -475,7 +349,7 @@ TEST_F(TinyWeightedPoolTest, FallsBackThenFailsWithoutLeakingSlots) {
   constexpr size_t kAttempts = kTinyPages * 2 + 4;
   for (size_t i = 0; i < kAttempts; ++i) {
     const std::string key = "tiny-" + std::to_string(i);
-    if (client_->Put(key, value.data(), value.size())) {
+    if (client()->Put(key, value.data(), value.size())) {
       ++succeeded;
     } else {
       ++failed;
@@ -503,14 +377,17 @@ TEST_F(TinyWeightedPoolTest, FallsBackThenFailsWithoutLeakingSlots) {
   EXPECT_EQ(fallback_cap.available_bytes + fallback->OwnedKeyCount() * kPageSize,
             fallback_cap.total_bytes);
 
-  ASSERT_TRUE(client_->Clear());
+  ASSERT_TRUE(client()->Clear());
   EXPECT_EQ(primary->OwnedKeyCount(), 0u);
   EXPECT_EQ(fallback->OwnedKeyCount(), 0u);
   EXPECT_EQ(primary->Capacity().available_bytes, kTinyCapacity);
   EXPECT_EQ(fallback->Capacity().available_bytes, kTinyCapacity);
 }
 
-class UnequalDramWeightedPoolTest : public ::testing::Test {
+// Two DRAM backends of very different sizes: the aggregate is three times the
+// largest single allocation the pool can serve, which is exactly where a master
+// that only understands totals overcommits the node.
+class UnequalDramWeightedPoolTest : public InProcessClusterTest {
  protected:
   static constexpr size_t kPrimaryPages = 4;
   static constexpr size_t kSecondaryPages = 12;
@@ -520,67 +397,12 @@ class UnequalDramWeightedPoolTest : public ::testing::Test {
   static constexpr const char* kNodeId = "tier-cap-node-0";
 
   void StartCluster(bool advertise_max_allocatable_bytes) {
-    MasterServerConfig config;
-    config.listen_address = "127.0.0.1:0";
-    config.metrics_port = 0;
-    config.registry_config.default_dram_page_size = kPageSize;
-    config.registry_config.heartbeat_ttl = std::chrono::seconds(1);
-    config.registry_config.advertise_max_allocatable_bytes = advertise_max_allocatable_bytes;
-    config.put_strategy = std::make_unique<ConfigurableRoutePutStrategy>(
-        ConfigurableRoutePutStrategy::SelectAlgo::kMostAvailable,
-        ConfigurableRoutePutStrategy::NodeAffinity::kLocal, 17);
-    master_ = std::make_unique<MasterServer>(std::move(config));
-    master_thread_ = std::thread([this] { master_->Run(); });
-
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (master_->GetBoundPort() == 0 && std::chrono::steady_clock::now() < deadline) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    ASSERT_NE(master_->GetBoundPort(), 0);
-
-    PoolClientConfig client_config;
-    client_config.master_config.master_address =
-        "127.0.0.1:" + std::to_string(master_->GetBoundPort());
-    client_config.master_config.node_id = kNodeId;
-    client_config.master_config.node_address = "127.0.0.1";
-    client_config.master_config.auto_heartbeat = true;
-    client_config.io_engine.host = "127.0.0.1";
-    client_config.io_engine.port = 0;
-    client_config.auto_peer_service_port = true;
-    client_config.dram_page_size = kPageSize;
-    client_config.cache_remote_fetches = false;
-    client_config.placement_policy = PoolPlacementPolicy::WEIGHTED;
-
-    BackendInstanceConfig primary;
-    primary.name = "dram-0";
-    primary.tier = TierType::DRAM;
-    primary.dram.buffer_sizes = {kPrimaryCapacity};
-    primary.placement_weight = 1;
-    client_config.backends.push_back(std::move(primary));
-
-    BackendInstanceConfig secondary;
-    secondary.name = "dram-1";
-    secondary.tier = TierType::DRAM;
-    secondary.dram.buffer_sizes = {kSecondaryCapacity};
-    secondary.placement_weight = 1;
-    client_config.backends.push_back(std::move(secondary));
-
-    client_ = std::make_unique<PoolClient>(std::move(client_config));
-    ASSERT_TRUE(client_->Init());
-    client_->Master().FlushHeartbeat();
-    std::this_thread::sleep_for(std::chrono::milliseconds(150));
-    client_->Master().FlushHeartbeat();
-  }
-
-  void TearDown() override {
-    if (client_) {
-      client_->Clear();
-      client_->Shutdown();
-    }
-    client_.reset();
-    if (master_) master_->Shutdown();
-    if (master_thread_.joinable()) master_thread_.join();
-    master_.reset();
+    ASSERT_NO_FATAL_FAILURE(StartMaster(Affinity::kLocal, advertise_max_allocatable_bytes));
+    ASSERT_NO_FATAL_FAILURE(StartClient(kNodeId,
+                                        {DramBackend("dram-0", kPrimaryCapacity, 1),
+                                         DramBackend("dram-1", kSecondaryCapacity, 1)}));
+    Settle(std::chrono::milliseconds(150));
+    client()->Master().FlushHeartbeat();
   }
 
   size_t FillLocalPool(const std::string& key_prefix) {
@@ -588,14 +410,10 @@ class UnequalDramWeightedPoolTest : public ::testing::Test {
     size_t succeeded = 0;
     const size_t attempts = kPrimaryPages + kSecondaryPages;
     for (size_t i = 0; i < attempts; ++i) {
-      if (client_->Put(key_prefix + std::to_string(i), value.data(), value.size())) ++succeeded;
+      if (client()->Put(key_prefix + std::to_string(i), value.data(), value.size())) ++succeeded;
     }
     return succeeded;
   }
-
-  std::unique_ptr<MasterServer> master_;
-  std::thread master_thread_;
-  std::unique_ptr<PoolClient> client_;
 };
 
 class NewMasterWeightedPoolTest : public UnequalDramWeightedPoolTest {
@@ -609,12 +427,12 @@ class LegacyMasterWeightedPoolTest : public UnequalDramWeightedPoolTest {
 };
 
 TEST_F(NewMasterWeightedPoolTest, NegotiatesMaxAllocatableAndSumsSameTierCapacity) {
-  EXPECT_TRUE(client_->Master().SupportsMaxAllocatableCapacity())
+  EXPECT_TRUE(client()->Master().SupportsMaxAllocatableCapacity())
       << "current Master must advertise supports_max_allocatable_bytes so weighted "
          "peers can aggregate same-tier capacity";
 
-  MediumBackend* primary = client_->Backends().Get("dram-0");
-  MediumBackend* secondary = client_->Backends().Get("dram-1");
+  MediumBackend* primary = client()->Backends().Get("dram-0");
+  MediumBackend* secondary = client()->Backends().Get("dram-1");
   ASSERT_NE(primary, nullptr);
   ASSERT_NE(secondary, nullptr);
   EXPECT_EQ(primary->Capacity().total_bytes + secondary->Capacity().total_bytes, kPooledCapacity);
@@ -623,18 +441,18 @@ TEST_F(NewMasterWeightedPoolTest, NegotiatesMaxAllocatableAndSumsSameTierCapacit
   EXPECT_GT(primary->OwnedKeyCount(), 0u);
   EXPECT_GT(secondary->OwnedKeyCount(), 0u);
 
-  client_->Master().FlushHeartbeat();
+  client()->Master().FlushHeartbeat();
   EXPECT_TRUE(WaitForAdvertisedDram(master_.get(), kNodeId, kPooledCapacity, /*available=*/0))
       << "new Master must store the aggregated same-tier pool, not the first instance";
   EXPECT_NE(AdvertisedDramTotal(master_.get(), kNodeId), kPrimaryCapacity);
 }
 
 TEST_F(LegacyMasterWeightedPoolTest, KeepsFirstInstanceCapacityAndStillPlacesOnBothBackends) {
-  EXPECT_FALSE(client_->Master().SupportsMaxAllocatableCapacity())
+  EXPECT_FALSE(client()->Master().SupportsMaxAllocatableCapacity())
       << "omitting supports_max_allocatable_bytes must disable aggregate heartbeats";
 
-  MediumBackend* primary = client_->Backends().Get("dram-0");
-  MediumBackend* secondary = client_->Backends().Get("dram-1");
+  MediumBackend* primary = client()->Backends().Get("dram-0");
+  MediumBackend* secondary = client()->Backends().Get("dram-1");
   ASSERT_NE(primary, nullptr);
   ASSERT_NE(secondary, nullptr);
 
@@ -644,7 +462,7 @@ TEST_F(LegacyMasterWeightedPoolTest, KeepsFirstInstanceCapacityAndStillPlacesOnB
   EXPECT_EQ(primary->OwnedKeyCount() + secondary->OwnedKeyCount(), kPrimaryPages + kSecondaryPages)
       << "weighted placement remains enabled under a legacy Master; only advertisement shrinks";
 
-  client_->Master().FlushHeartbeat();
+  client()->Master().FlushHeartbeat();
   EXPECT_TRUE(WaitForAdvertisedDram(master_.get(), kNodeId, kPrimaryCapacity, /*available=*/0))
       << "heartbeats stay at the first same-tier instance so the old Master cannot "
          "over-admit a value larger than any single backend";

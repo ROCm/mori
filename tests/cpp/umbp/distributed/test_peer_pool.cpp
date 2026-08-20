@@ -4,8 +4,12 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <future>
 #include <memory>
+#include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -27,6 +31,65 @@ PoolPlacementRequest PutRequest(std::string key, std::string backend_name = {}) 
   return request;
 }
 
+constexpr auto kNoExpiry = std::chrono::milliseconds(30000);
+
+// A page backend the tier tests can move real bytes through.
+void RegisterPageBackend(BackendRegistry* registry, TransferEngine* engine,
+                         const std::string& name, TierType tier, uint64_t page_size,
+                         uint64_t pages,
+                         std::chrono::milliseconds read_lease_ttl = kNoExpiry) {
+  PageBackend::OwnershipConfig ownership;
+  ownership.buffer_sizes = {pages * page_size};
+  auto backend = MakePageBackend(tier, page_size, ownership, kNoExpiry, read_lease_ttl);
+  ASSERT_TRUE(backend->Init(engine));
+  ASSERT_TRUE(registry->Register(name, std::move(backend)));
+}
+
+// The topology most tier tests need: a 'hot' tier that offloads to a 'cold'
+// one. Watermarks are only consulted for the watermark trigger, so the same
+// pair of values suits both triggers.
+std::vector<LogicalTierConfig> HotColdTiers(PoolOffloadTrigger trigger) {
+  LogicalTierConfig hot;
+  hot.name = "hot";
+  hot.entry = true;
+  hot.members = {{"hot", 100}};
+  hot.offload_to = {"cold"};
+  hot.trigger = trigger;
+  hot.high_watermark = 0.4;
+  hot.low_watermark = 0.2;
+  LogicalTierConfig cold;
+  cold.name = "cold";
+  cold.members = {{"cold", 100}};
+  return {hot, cold};
+}
+
+// Puts a key through the pool and returns where it landed.
+PoolAllocateResult CommitKey(PeerPool* pool, const std::string& key,
+                             const std::string& backend_name = {},
+                             const std::string& logical_tier = {}) {
+  auto request = PutRequest(key, backend_name);
+  request.logical_tier = logical_tier;
+  auto allocation = pool->BatchAllocate({request}).front();
+  EXPECT_EQ(allocation.allocation.outcome, AllocateOutcome::kSuccessAllocated) << key;
+  EXPECT_TRUE(pool->BatchCommit({PoolCommitRequest{
+                                     {allocation.backend_id, allocation.allocation.slot_id},
+                                     key}})
+                  .front()
+                  .commit.success)
+      << key;
+  return allocation;
+}
+
+// Transitions run on a worker thread, so arrival is observed rather than
+// awaited.
+bool WaitForKey(BackendRegistry* registry, const std::string& backend,
+                const std::string& key) {
+  for (int attempt = 0; attempt < 100 && !registry->Get(backend)->Contains(key); ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  return registry->Get(backend)->Contains(key);
+}
+
 class NoSpaceBackend final : public MockBackend {
  public:
   explicit NoSpaceBackend(TierType tier) : MockBackend(tier) {}
@@ -37,6 +100,49 @@ class NoSpaceBackend final : public MockBackend {
     for (auto& result : results) result.outcome = AllocateOutcome::kFailedNoSpace;
     return results;
   }
+};
+
+// Stands in for a slow migration target: parks inside the allocation a
+// transition performs, so a test can observe the pool while bytes are moving.
+class BlockingAllocateBackend final : public MockBackend {
+ public:
+  BlockingAllocateBackend(TierType tier, uint64_t page_size)
+      : MockBackend(tier, page_size) {}
+
+  std::vector<AllocateResult> BatchAllocate(
+      const std::vector<AllocateRequest>& entries) override {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      entered_ = true;
+    }
+    cv_.notify_all();
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      cv_.wait_for(lock, std::chrono::seconds(5), [this] { return released_; });
+    }
+    std::vector<AllocateResult> results(entries.size());
+    for (auto& result : results) result.outcome = AllocateOutcome::kFailedNoSpace;
+    return results;
+  }
+
+  bool WaitUntilEntered() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return cv_.wait_for(lock, std::chrono::seconds(5), [this] { return entered_; });
+  }
+
+  void Release() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      released_ = true;
+    }
+    cv_.notify_all();
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  bool entered_ = false;
+  bool released_ = false;
 };
 
 TEST(PeerPool, DefaultPolicyPreservesTierOnlySelection) {
@@ -83,7 +189,7 @@ TEST(PeerPool, NamedBackendCommitBuildsLogicalPlacement) {
   EXPECT_EQ(duplicate.backend_id, second_id);
   EXPECT_EQ(registry.Get("dram_a")->OwnedKeyCount(), 0u);
 
-  auto evicted = pool.Evict({"k"});
+  auto evicted = pool.Evict({"k"}, PoolEvictMode::kReclaim);
   ASSERT_EQ(evicted.size(), 1u);
   EXPECT_EQ(evicted[0].bytes_freed, 64u);
   EXPECT_EQ(pool.PlacementCount(), 0u);
@@ -243,19 +349,19 @@ TEST(WeightedPlacementPolicy, DistributesDeterministicallyWithinRequestedTier) {
   size_t on_b = 0;
   for (size_t i = 0; i < 10000; ++i) {
     auto request = PutRequest("weighted-" + std::to_string(i * 2654435761ULL));
-    auto selected = policy->SelectPutBackend(registry, request);
-    ASSERT_TRUE(selected.has_value());
-    if (*selected == dram_a) ++on_a;
-    if (*selected == dram_b) ++on_b;
+    auto order = policy->PutOrder(registry, request);
+    ASSERT_FALSE(order.empty());
+    if (order.front() == dram_a) ++on_a;
+    if (order.front() == dram_b) ++on_b;
   }
 
   EXPECT_EQ(on_a + on_b, 10000u);
   EXPECT_NEAR(static_cast<double>(on_a) / 10000.0, 0.3, 0.03);
 
   auto repeated = PutRequest("stable-key");
-  auto first = policy->SelectPutBackend(registry, repeated);
+  auto first = policy->PutOrder(registry, repeated);
   for (int i = 0; i < 10; ++i) {
-    EXPECT_EQ(policy->SelectPutBackend(registry, repeated), first);
+    EXPECT_EQ(policy->PutOrder(registry, repeated), first);
   }
 }
 
@@ -267,10 +373,9 @@ TEST(WeightedPlacementPolicy, ExplicitBackendNameOverridesWeightedSelection) {
       registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
   auto policy = MakeWeightedPlacementPolicy({{"dram_a", 1}, {"dram_b", 100}});
 
-  auto selected =
-      policy->SelectPutBackend(registry, PutRequest("forced", "dram_a"));
-  ASSERT_TRUE(selected.has_value());
-  EXPECT_EQ(*selected, registry.BackendId(registry.Get("dram_a")));
+  auto order = policy->PutOrder(registry, PutRequest("forced", "dram_a"));
+  ASSERT_FALSE(order.empty());
+  EXPECT_EQ(order.front(), registry.BackendId(registry.Get("dram_a")));
 }
 
 TEST(PeerPool, WeightedPolicyPlacesNewKeysOnMultipleBackends) {
@@ -332,19 +437,27 @@ TEST(PeerPool, WeightedPolicyFallsBackWhenPrimaryHasNoSpace) {
   EXPECT_EQ(result.backend_id, registry.BackendId(registry.Get("dram_b")));
 }
 
+TEST(TieredPlacementPolicy, RejectsTierGraphWithoutTransferEngine) {
+  BackendRegistry registry;
+  ASSERT_TRUE(
+      registry.Register("only", std::make_unique<MockBackend>(TierType::DRAM)));
+  auto compiled = LogicalTierGraph::Compile({LogicalTierConfig{{{"only", 1}}}}, registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  EXPECT_THROW(PeerPool(&registry, MakeTieredPlacementPolicy(compiled.graph)),
+               std::invalid_argument);
+}
+
 TEST(TieredPlacementPolicy, IgnoresPhysicalRouteAndSpillsToConfiguredTarget) {
+  LocalCopyEngine engine;
   BackendRegistry registry;
   ASSERT_TRUE(
       registry.Register("hot", std::make_unique<NoSpaceBackend>(TierType::HBM)));
   ASSERT_TRUE(
       registry.Register("cold", std::make_unique<MockBackend>(TierType::SSD)));
-  std::vector<LogicalTierConfig> tiers = {
-      LogicalTierConfig{{{"hot", 100}}, {"cold"}, PoolOffloadTrigger::kOnEvict},
-      LogicalTierConfig{{{"cold", 100}}, {}, PoolOffloadTrigger::kOnEvict},
-  };
-  auto compiled = LogicalTierGraph::Compile(tiers, registry);
+  auto compiled =
+      LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
   ASSERT_TRUE(compiled.ok()) << compiled.error;
-  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph));
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
 
   auto request = PutRequest("spill");
   request.tier = TierType::DRAM;
@@ -354,32 +467,17 @@ TEST(TieredPlacementPolicy, IgnoresPhysicalRouteAndSpillsToConfiguredTarget) {
 }
 
 TEST(TieredPlacementPolicy, HonorsExplicitLogicalTierAndTagsEvents) {
+  LocalCopyEngine engine;
   BackendRegistry registry;
-  ASSERT_TRUE(
-      registry.Register("hot_backend", std::make_unique<MockBackend>(TierType::DRAM)));
-  ASSERT_TRUE(
-      registry.Register("cold_backend", std::make_unique<MockBackend>(TierType::DRAM)));
-  LogicalTierConfig hot;
-  hot.name = "hot";
-  hot.entry = true;
-  hot.members = {{"hot_backend", 1}};
-  hot.offload_to = {"cold"};
-  LogicalTierConfig cold;
-  cold.name = "cold";
-  cold.members = {{"cold_backend", 1}};
-  auto compiled = LogicalTierGraph::Compile({hot, cold}, registry);
+  ASSERT_TRUE(registry.Register("hot", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("cold", std::make_unique<MockBackend>(TierType::DRAM)));
+  auto compiled =
+      LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
   ASSERT_TRUE(compiled.ok()) << compiled.error;
-  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph));
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
 
-  auto request = PutRequest("named");
-  request.logical_tier = "cold";
-  auto allocation = pool.BatchAllocate({request}).front();
-  ASSERT_EQ(allocation.backend_id,
-            registry.BackendId(registry.Get("cold_backend")));
-  PoolCommitRequest commit{{allocation.backend_id,
-                            allocation.allocation.slot_id},
-                           "named"};
-  ASSERT_TRUE(pool.BatchCommit({commit}).front().commit.success);
+  auto allocation = CommitKey(&pool, "named", {}, "cold");
+  ASSERT_EQ(allocation.backend_id, registry.BackendId(registry.Get("cold")));
 
   auto events = pool.DrainPendingEvents();
   ASSERT_EQ(events.size(), 1u);
@@ -393,24 +491,10 @@ TEST(PeerPool, OnEvictMigratesBytesToConfiguredBackend) {
   constexpr uint64_t kPageSize = 64;
   LocalCopyEngine engine;
   BackendRegistry registry;
-  PageBackend::OwnershipConfig ownership;
-  ownership.buffer_sizes = {2 * kPageSize};
-  auto hot = MakePageBackend(TierType::DRAM, kPageSize, ownership,
-                             std::chrono::milliseconds(30000),
-                             std::chrono::milliseconds(30000));
-  auto cold = MakePageBackend(TierType::SSD, kPageSize, ownership,
-                              std::chrono::milliseconds(30000),
-                              std::chrono::milliseconds(30000));
-  ASSERT_TRUE(hot->Init(&engine));
-  ASSERT_TRUE(cold->Init(&engine));
-  ASSERT_TRUE(registry.Register("hot", std::move(hot)));
-  ASSERT_TRUE(registry.Register("cold", std::move(cold)));
-
-  std::vector<LogicalTierConfig> tiers = {
-      LogicalTierConfig{{{"hot", 100}}, {"cold"}, PoolOffloadTrigger::kOnEvict},
-      LogicalTierConfig{{{"cold", 100}}, {}, PoolOffloadTrigger::kOnEvict},
-  };
-  auto compiled = LogicalTierGraph::Compile(tiers, registry);
+  RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kPageSize, 2);
+  RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kPageSize, 2);
+  auto compiled =
+      LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
   ASSERT_TRUE(compiled.ok()) << compiled.error;
   PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
 
@@ -428,7 +512,7 @@ TEST(PeerPool, OnEvictMigratesBytesToConfiguredBackend) {
                   .front()
                   .commit.success);
 
-  auto evicted = pool.Evict({"move"});
+  auto evicted = pool.Evict({"move"}, PoolEvictMode::kReclaim);
   ASSERT_EQ(evicted.size(), 1u);
   EXPECT_EQ(evicted.front().bytes_freed, payload.size());
   EXPECT_FALSE(registry.Get("hot")->Contains("move"));
@@ -449,140 +533,152 @@ TEST(PeerPool, OnEvictMigratesBytesToConfiguredBackend) {
 
 TEST(PeerPool, EvictionRetryDrainsLeasedSourceWithoutDeletingTarget) {
   constexpr uint64_t kPageSize = 64;
+  constexpr auto kShortLease = std::chrono::milliseconds(1);
   LocalCopyEngine engine;
   BackendRegistry registry;
-  PageBackend::OwnershipConfig ownership;
-  ownership.buffer_sizes = {2 * kPageSize};
-  auto hot = MakePageBackend(TierType::DRAM, kPageSize, ownership,
-                             std::chrono::milliseconds(30000),
-                             std::chrono::milliseconds(1));
-  auto cold = MakePageBackend(TierType::SSD, kPageSize, ownership,
-                              std::chrono::milliseconds(30000),
-                              std::chrono::milliseconds(1));
-  ASSERT_TRUE(hot->Init(&engine));
-  ASSERT_TRUE(cold->Init(&engine));
-  ASSERT_TRUE(registry.Register("hot", std::move(hot)));
-  ASSERT_TRUE(registry.Register("cold", std::move(cold)));
-  std::vector<LogicalTierConfig> tiers = {
-      LogicalTierConfig{{{"hot", 100}}, {"cold"}, PoolOffloadTrigger::kOnEvict},
-      LogicalTierConfig{{{"cold", 100}}, {}, PoolOffloadTrigger::kOnEvict},
-  };
-  auto compiled = LogicalTierGraph::Compile(tiers, registry);
+  RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kPageSize, 2, kShortLease);
+  RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kPageSize, 2, kShortLease);
+  auto compiled =
+      LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
   ASSERT_TRUE(compiled.ok()) << compiled.error;
   PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
 
-  auto allocation = pool.BatchAllocate({PutRequest("leased")}).front();
-  ASSERT_TRUE(pool.BatchCommit({PoolCommitRequest{
-                                   {allocation.backend_id, allocation.allocation.slot_id},
-                                   "leased"}})
-                  .front()
-                  .commit.success);
+  CommitKey(&pool, "leased");
   ASSERT_TRUE(registry.Get("hot")->BatchResolve({"leased"}, false).front().found);
 
-  auto first = pool.Evict({"leased"});
+  auto first = pool.Evict({"leased"}, PoolEvictMode::kReclaim);
   ASSERT_EQ(first.front().bytes_freed, 0u);
   EXPECT_TRUE(registry.Get("hot")->Contains("leased"));
   EXPECT_TRUE(registry.Get("cold")->Contains("leased"));
 
   std::this_thread::sleep_for(std::chrono::milliseconds(5));
-  auto retry = pool.Evict({"leased"});
+  auto retry = pool.Evict({"leased"}, PoolEvictMode::kReclaim);
   EXPECT_EQ(retry.front().bytes_freed, 64u);
   EXPECT_FALSE(registry.Get("hot")->Contains("leased"));
   EXPECT_TRUE(registry.Get("cold")->Contains("leased"));
 }
 
-TEST(PeerPool, WatermarkMigratesCommittedKey) {
+TEST(PeerPool, DiscardDeletesInsteadOfDemoting) {
   constexpr uint64_t kPageSize = 64;
   LocalCopyEngine engine;
   BackendRegistry registry;
-  PageBackend::OwnershipConfig ownership;
-  ownership.buffer_sizes = {2 * kPageSize};
-  auto hot = MakePageBackend(TierType::DRAM, kPageSize, ownership,
-                             std::chrono::milliseconds(30000),
-                             std::chrono::milliseconds(30000));
-  auto cold = MakePageBackend(TierType::SSD, kPageSize, ownership,
-                              std::chrono::milliseconds(30000),
-                              std::chrono::milliseconds(30000));
-  ASSERT_TRUE(hot->Init(&engine));
-  ASSERT_TRUE(cold->Init(&engine));
-  ASSERT_TRUE(registry.Register("hot", std::move(hot)));
-  ASSERT_TRUE(registry.Register("cold", std::move(cold)));
-
-  LogicalTierConfig hot_tier;
-  hot_tier.members = {{"hot", 100}};
-  hot_tier.offload_to = {"cold"};
-  hot_tier.trigger = PoolOffloadTrigger::kWatermark;
-  hot_tier.high_watermark = 0.4;
-  hot_tier.low_watermark = 0.2;
-  std::vector<LogicalTierConfig> tiers = {
-      hot_tier,
-      LogicalTierConfig{{{"cold", 100}}, {}, PoolOffloadTrigger::kOnEvict},
-  };
-  auto compiled = LogicalTierGraph::Compile(tiers, registry);
+  RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kPageSize, 2);
+  RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kPageSize, 2);
+  // The same on_evict topology that demotes under kReclaim.
+  auto compiled =
+      LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
   ASSERT_TRUE(compiled.ok()) << compiled.error;
   PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
 
-  auto allocation = pool.BatchAllocate({PutRequest("watermark")}).front();
-  ASSERT_EQ(allocation.allocation.outcome, AllocateOutcome::kSuccessAllocated);
-  ASSERT_TRUE(pool.BatchCommit({PoolCommitRequest{
-                                   {allocation.backend_id, allocation.allocation.slot_id},
-                                   "watermark"}})
-                  .front()
-                  .commit.success);
-  for (int attempt = 0; attempt < 100 && !registry.Get("cold")->Contains("watermark");
-       ++attempt) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(2));
-  }
+  CommitKey(&pool, "gone");
+
+  auto discarded = pool.Evict({"gone"}, PoolEvictMode::kDiscard);
+  ASSERT_EQ(discarded.size(), 1u);
+  EXPECT_EQ(discarded.front().bytes_freed, 64u);
+  EXPECT_FALSE(registry.Get("hot")->Contains("gone"));
+  EXPECT_FALSE(registry.Get("cold")->Contains("gone"));
+  EXPECT_EQ(pool.PlacementCount(), 0u);
+}
+
+TEST(PeerPool, WatermarkMigratesCommittedKey) {
+  // Unlike the other tier tests, this one asserts on utilization, so the owned
+  // buffer must be a whole number of host allocation granules: a smaller
+  // request is rounded up by the memory source, and PageBackend adopts the
+  // size it actually got, which would put utilization far below the watermark.
+  constexpr uint64_t kPageSize = 4096;
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kPageSize, 2);
+  RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kPageSize, 2);
+  // Fails loudly if the granularity assumption above ever stops holding.
+  ASSERT_EQ(registry.Get("hot")->Capacity().total_bytes, 2 * kPageSize);
+
+  auto compiled =
+      LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kWatermark), registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+
+  CommitKey(&pool, "watermark");
+  EXPECT_TRUE(WaitForKey(&registry, "cold", "watermark"));
   EXPECT_FALSE(registry.Get("hot")->Contains("watermark"));
-  EXPECT_TRUE(registry.Get("cold")->Contains("watermark"));
+}
+
+TEST(PeerPool, WatermarkFollowsTheFullestMemberOfAMixedTier) {
+  constexpr uint64_t kPageSize = 4096;
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "small", TierType::DRAM, kPageSize, 2);
+  RegisterPageBackend(&registry, &engine, "large", TierType::DRAM, kPageSize, 64);
+  RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kPageSize, 64);
+
+  LogicalTierConfig parallel;
+  parallel.members = {{"small", 1}, {"large", 1}};
+  parallel.offload_to = {"cold"};
+  parallel.trigger = PoolOffloadTrigger::kWatermark;
+  parallel.high_watermark = 0.4;
+  parallel.low_watermark = 0.2;
+  auto compiled = LogicalTierGraph::Compile(
+      {parallel, LogicalTierConfig{{{"cold", 1}}, {}, PoolOffloadTrigger::kOnEvict}},
+      registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+
+  // One page on each member. Aggregated over the tier that is ~3% used, so an
+  // averaged watermark would never fire, yet "small" is half full.
+  CommitKey(&pool, "on_large", "large");
+  CommitKey(&pool, "on_small", "small");
+
+  EXPECT_TRUE(WaitForKey(&registry, "cold", "on_small"));
+  EXPECT_FALSE(registry.Get("small")->Contains("on_small"));
+  // The roomy member is not under pressure, so its key must stay put.
+  EXPECT_TRUE(registry.Get("large")->Contains("on_large"));
+  EXPECT_FALSE(registry.Get("cold")->Contains("on_large"));
+}
+
+TEST(PeerPool, MigrationDoesNotBlockConcurrentPoolOperations) {
+  constexpr uint64_t kPageSize = 4096;
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kPageSize, 2);
+  auto cold = std::make_unique<BlockingAllocateBackend>(TierType::SSD, kPageSize);
+  auto* blocking = cold.get();
+  ASSERT_TRUE(registry.Register("cold", std::move(cold)));
+
+  auto compiled =
+      LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kWatermark), registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+
+  CommitKey(&pool, "blocked");
+  ASSERT_TRUE(blocking->WaitUntilEntered());
+
+  // The transition is parked mid-copy. An unrelated resolve must not wait for
+  // it, which is only true while the copy runs without the pool lock.
+  auto concurrent = std::async(std::launch::async, [&] {
+    return pool.BatchResolve({"unrelated"}, false).size();
+  });
+  EXPECT_EQ(concurrent.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+  blocking->Release();
+  EXPECT_EQ(concurrent.get(), 1u);
 }
 
 TEST(PeerPool, ReadPromotesColdKeyWithoutDeletingSource) {
   constexpr uint64_t kPageSize = 64;
   LocalCopyEngine engine;
   BackendRegistry registry;
-  PageBackend::OwnershipConfig ownership;
-  ownership.buffer_sizes = {2 * kPageSize};
-  auto hot = MakePageBackend(TierType::DRAM, kPageSize, ownership,
-                             std::chrono::milliseconds(30000),
-                             std::chrono::milliseconds(30000));
-  auto cold = MakePageBackend(TierType::SSD, kPageSize, ownership,
-                              std::chrono::milliseconds(30000),
-                              std::chrono::milliseconds(30000));
-  ASSERT_TRUE(hot->Init(&engine));
-  ASSERT_TRUE(cold->Init(&engine));
-  ASSERT_TRUE(registry.Register("hot", std::move(hot)));
-  ASSERT_TRUE(registry.Register("cold", std::move(cold)));
+  RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kPageSize, 2);
+  RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kPageSize, 2);
 
-  LogicalTierConfig hot_tier;
-  hot_tier.name = "hot";
-  hot_tier.entry = true;
-  hot_tier.members = {{"hot", 1}};
-  hot_tier.offload_to = {"cold"};
-  LogicalTierConfig cold_tier;
-  cold_tier.name = "cold";
-  cold_tier.members = {{"cold", 1}};
-  cold_tier.promote_on_read = true;
-  auto compiled = LogicalTierGraph::Compile({hot_tier, cold_tier}, registry);
+  auto tiers = HotColdTiers(PoolOffloadTrigger::kOnEvict);
+  tiers.back().promote_on_read = true;
+  auto compiled = LogicalTierGraph::Compile(tiers, registry);
   ASSERT_TRUE(compiled.ok()) << compiled.error;
   PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
 
-  auto request = PutRequest("promote");
-  request.logical_tier = "cold";
-  auto allocation = pool.BatchAllocate({request}).front();
-  ASSERT_EQ(allocation.allocation.outcome, AllocateOutcome::kSuccessAllocated);
-  PoolCommitRequest commit{
-      {allocation.backend_id, allocation.allocation.slot_id}, "promote"};
-  ASSERT_TRUE(pool.BatchCommit({commit})
-                  .front()
-                  .commit.success);
+  CommitKey(&pool, "promote", {}, "cold");
   ASSERT_TRUE(pool.BatchResolve({"promote"}, false).front().resolved.found);
 
-  for (int attempt = 0; attempt < 100 && !registry.Get("hot")->Contains("promote");
-       ++attempt) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(2));
-  }
-  EXPECT_TRUE(registry.Get("hot")->Contains("promote"));
+  EXPECT_TRUE(WaitForKey(&registry, "hot", "promote"));
   EXPECT_TRUE(registry.Get("cold")->Contains("promote"));
 }
 

@@ -35,28 +35,33 @@ class PoolPolicy {
  public:
   virtual ~PoolPolicy() = default;
 
-  virtual std::optional<uint32_t> SelectPutBackend(
-      const BackendRegistry& backends, const PoolPlacementRequest& request) const = 0;
-
-  // Ordered candidates for one placement attempt. The default preserves the
-  // single-choice contract; policies may add deterministic no-space fallbacks.
+  // Ordered candidates for one placement attempt, best first. A single-choice
+  // policy returns one id; others append deterministic no-space fallbacks.
   virtual std::vector<uint32_t> PutOrder(
-      const BackendRegistry& backends, const PoolPlacementRequest& request) const {
-    auto selected = SelectPutBackend(backends, request);
-    return selected.has_value() ? std::vector<uint32_t>{*selected}
-                                : std::vector<uint32_t>{};
-  }
+      const BackendRegistry& backends, const PoolPlacementRequest& request) const = 0;
 
   virtual std::vector<uint32_t> ReadOrder(const BackendRegistry& backends) const = 0;
   virtual std::shared_ptr<const LogicalTierGraph> TierGraph() const { return {}; }
 };
+
+// Every backend the peer holds, in registry order. Shared by the policies that
+// have no read preference of their own.
+inline std::vector<uint32_t> AllBackendIds(const BackendRegistry& backends) {
+  std::vector<uint32_t> order;
+  order.reserve(backends.Size());
+  for (auto* backend : backends.All()) {
+    const uint32_t id = backends.BackendId(backend);
+    if (id < BackendRegistry::kMaxBackends) order.push_back(id);
+  }
+  return order;
+}
 
 // Compatibility policy for the implicit default pool. An explicit backend name
 // selects that instance; otherwise the first instance of the routed TierType is
 // used, exactly matching the pre-Pool behavior.
 class SingleBackendPolicy final : public PoolPolicy {
  public:
-  std::optional<uint32_t> SelectPutBackend(
+  std::vector<uint32_t> PutOrder(
       const BackendRegistry& backends, const PoolPlacementRequest& request) const override {
     MediumBackend* backend = nullptr;
     if (!request.backend_name.empty()) {
@@ -65,19 +70,14 @@ class SingleBackendPolicy final : public PoolPolicy {
     } else {
       backend = backends.Get(request.tier);
     }
-    if (backend == nullptr) return std::nullopt;
+    if (backend == nullptr) return {};
     const uint32_t id = backends.BackendId(backend);
-    return id < BackendRegistry::kMaxBackends ? std::optional<uint32_t>{id} : std::nullopt;
+    return id < BackendRegistry::kMaxBackends ? std::vector<uint32_t>{id}
+                                             : std::vector<uint32_t>{};
   }
 
   std::vector<uint32_t> ReadOrder(const BackendRegistry& backends) const override {
-    std::vector<uint32_t> order;
-    order.reserve(backends.Size());
-    for (auto* backend : backends.All()) {
-      const uint32_t id = backends.BackendId(backend);
-      if (id < BackendRegistry::kMaxBackends) order.push_back(id);
-    }
-    return order;
+    return AllBackendIds(backends);
   }
 };
 
@@ -97,12 +97,6 @@ class WeightedPlacementPolicy final : public PoolPolicy {
  public:
   explicit WeightedPlacementPolicy(std::vector<BackendPlacementWeight> weights)
       : weights_(std::move(weights)) {}
-
-  std::optional<uint32_t> SelectPutBackend(
-      const BackendRegistry& backends, const PoolPlacementRequest& request) const override {
-    auto order = PutOrder(backends, request);
-    return order.empty() ? std::nullopt : std::optional<uint32_t>{order.front()};
-  }
 
   std::vector<uint32_t> PutOrder(
       const BackendRegistry& backends, const PoolPlacementRequest& request) const override {
@@ -125,13 +119,7 @@ class WeightedPlacementPolicy final : public PoolPolicy {
   }
 
   std::vector<uint32_t> ReadOrder(const BackendRegistry& backends) const override {
-    std::vector<uint32_t> order;
-    order.reserve(backends.Size());
-    for (auto* backend : backends.All()) {
-      const uint32_t id = backends.BackendId(backend);
-      if (id < BackendRegistry::kMaxBackends) order.push_back(id);
-    }
-    return order;
+    return AllBackendIds(backends);
   }
 
  private:
@@ -147,12 +135,6 @@ class TieredPlacementPolicy final : public PoolPolicy {
  public:
   explicit TieredPlacementPolicy(std::shared_ptr<const LogicalTierGraph> graph)
       : graph_(std::move(graph)) {}
-
-  std::optional<uint32_t> SelectPutBackend(
-      const BackendRegistry& backends, const PoolPlacementRequest& request) const override {
-    auto order = PutOrder(backends, request);
-    return order.empty() ? std::nullopt : std::optional<uint32_t>{order.front()};
-  }
 
   std::vector<uint32_t> PutOrder(
       const BackendRegistry& backends, const PoolPlacementRequest& request) const override {

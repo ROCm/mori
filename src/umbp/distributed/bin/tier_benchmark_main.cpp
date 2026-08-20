@@ -15,6 +15,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -23,10 +24,12 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include "umbp/distributed/benchmark/pool_workload_client.h"
 #include "umbp/distributed/benchmark/workload_runner.h"
 #include "umbp/distributed/benchmark/workload_source.h"
 #include "umbp/distributed/benchmark/workload_trace.h"
 #include "umbp/distributed/master/master_server.h"
+#include "umbp/distributed/pool/policy_config.h"
 #include "umbp/distributed/pool_client.h"
 #include "umbp/distributed/routing/route_get_strategy.h"
 #include "umbp/distributed/routing/route_put_strategy.h"
@@ -45,12 +48,16 @@ using mori::umbp::RandomRouteGetStrategy;
 using mori::umbp::TierType;
 constexpr uint64_t kDefaultCapacity = 256ULL << 20;
 constexpr uint64_t kDefaultPageSize = 2ULL << 20;
-constexpr auto kPublicationTimeout = std::chrono::seconds(5);
 constexpr auto kServerStartTimeout = std::chrono::seconds(10);
 struct Options {
   std::string command;
   std::string trace_path;
   std::string policy_path;
+  // Parsed once by LoadPolicy; the clients lower it per node rather than
+  // reading and reparsing the file.
+  std::optional<mori::umbp::BackendPolicyConfig> policy;
+  // The policy puts values on a medium that stores one value per page.
+  bool page_limited_medium = false;
   bench::SyntheticWorkloadConfig workload;
   bench::WorkloadRunnerOptions runner;
   std::string profile = "mixed";
@@ -58,16 +65,14 @@ struct Options {
   std::string put_strategy = "most_available";
   std::string affinity = "none";
   std::string get_strategy = "local";
-  std::string placement = "single";
-  std::string tier = "dram";
-  std::string ssd_dir_prefix = "/tmp/umbp-tier-benchmark";
-  uint32_t backends_per_peer = 1;
-  std::vector<uint32_t> placement_weights;
   uint64_t backend_capacity = kDefaultCapacity;
   uint64_t page_size = kDefaultPageSize;
   uint64_t settle_ms = 500;
   bool clients_explicit = false;
   bool scheduling_explicit = false;
+  // Set for a trace recorded from production: the workload is whatever the
+  // trace contains, so the synthetic generator's knobs describe nothing.
+  bool trace_defines_workload = false;
 };
 [[noreturn]] void UsageError(const std::string& message) {
   throw std::invalid_argument(message + " (use --help for usage)");
@@ -84,11 +89,12 @@ Workload:
   --size-distribution fixed|uniform|log-uniform
   --read-ratio R  --clients N  --batch N  --qps Q
 Cluster:
-  --config PATH
-  --tier dram|hbm|ssd  --backends-per-peer N  --backend-capacity SIZE
-  --page-size SIZE  --placement single|weighted  --placement-weights LIST
-  --ssd-dir-prefix PATH  --put-strategy most_available|random
-  --affinity none|same|local  --get-strategy local|random
+  --config PATH   topology: named backends, logical tiers, weights, watermarks.
+                  Without it every peer gets one DRAM backend sized by
+                  --backend-capacity.
+  --backend-capacity SIZE  --page-size SIZE
+  --put-strategy most_available|random  --affinity none|same|local
+  --get-strategy local|random
 Execution:
   --max-throughput | --open-loop  --time-scale R
   --payload-validation BOOL  --no-payload-validation  --settle-ms N
@@ -139,21 +145,6 @@ uint64_t ParseSize(std::string_view text, const char* option) {
     UsageError(std::string(option) + " is too large");
   }
   return value * scale;
-}
-std::vector<uint32_t> ParseWeights(std::string_view text) {
-  std::vector<uint32_t> weights;
-  while (!text.empty()) {
-    const size_t comma = text.find(',');
-    const auto item = text.substr(0, comma);
-    const uint32_t weight = ParseUnsigned<uint32_t>(item, "--placement-weights");
-    if (weight == 0) UsageError("--placement-weights entries must be positive");
-    weights.push_back(weight);
-    if (comma == std::string_view::npos) break;
-    text.remove_prefix(comma + 1);
-    if (text.empty()) UsageError("--placement-weights must not end with a comma");
-  }
-  if (weights.empty()) UsageError("--placement-weights must not be empty");
-  return weights;
 }
 Options ParseOptions(int argc, char** argv) {
   if (argc < 2) UsageError("missing subcommand");
@@ -227,20 +218,10 @@ Options ParseOptions(int argc, char** argv) {
       options.workload.batch_size = ParseUnsigned<uint32_t>(value(), "--batch");
     } else if (name == "--qps") {
       options.workload.qps = ParseDouble(value(), "--qps");
-    } else if (name == "--tier") {
-      options.tier = value();
-    } else if (name == "--backends-per-peer") {
-      options.backends_per_peer = ParseUnsigned<uint32_t>(value(), "--backends-per-peer");
     } else if (name == "--backend-capacity") {
       options.backend_capacity = ParseSize(value(), "--backend-capacity");
     } else if (name == "--page-size") {
       options.page_size = ParseSize(value(), "--page-size");
-    } else if (name == "--placement") {
-      options.placement = value();
-    } else if (name == "--placement-weights") {
-      options.placement_weights = ParseWeights(value());
-    } else if (name == "--ssd-dir-prefix") {
-      options.ssd_dir_prefix = value();
     } else if (name == "--put-strategy") {
       options.put_strategy = value();
     } else if (name == "--affinity") {
@@ -270,12 +251,6 @@ bench::SyntheticProfile ParseProfile(const std::string& name) {
   if (name == "mixed") return bench::SyntheticProfile::kMixed;
   if (name == "capacity-pressure") return bench::SyntheticProfile::kCapacityPressure;
   UsageError("invalid --profile: " + name);
-}
-TierType ParseTier(const std::string& name) {
-  if (name == "dram") return TierType::DRAM;
-  if (name == "hbm") return TierType::HBM;
-  if (name == "ssd") return TierType::SSD;
-  UsageError("invalid --tier: " + name);
 }
 void ValidateOptions(Options* options) {
   options->workload.profile = ParseProfile(options->profile);
@@ -314,46 +289,38 @@ void ValidateOptions(Options* options) {
     UsageError("--get-strategy must be local or random");
   }
   if (options->page_size == 0) UsageError("--page-size must be positive");
-  if (!options->policy_path.empty()) {
-    auto loaded = mori::umbp::LoadBackendPolicyFile(options->policy_path);
-    if (!loaded.ok()) UsageError("invalid --config: " + loaded.error);
-    PoolClientConfig lowered;
-    lowered.dram_page_size = options->page_size;
-    std::string error;
-    if (!mori::umbp::ApplyBackendPolicy(*loaded.config, &lowered, &error)) {
-      UsageError("invalid --config: " + error);
-    }
-    if (lowered.backends.size() > mori::umbp::kMaxBackendsPerPeer) {
-      UsageError("--config expands beyond the per-peer backend limit");
-    }
-    const bool has_ssd = std::any_of(
-        lowered.backends.begin(), lowered.backends.end(),
-        [](const BackendInstanceConfig& backend) { return backend.tier == TierType::SSD; });
-    if (has_ssd && options->command != "replay" &&
-        options->workload.max_value_size > options->page_size) {
-      UsageError("SSD values must not exceed --page-size");
-    }
-  } else {
-    if (options->placement != "single" && options->placement != "weighted") {
-      UsageError("--placement must be single or weighted");
-    }
-    ParseTier(options->tier);
-    if (options->backends_per_peer == 0 ||
-        options->backends_per_peer > mori::umbp::kMaxBackendsPerPeer) {
-      UsageError("--backends-per-peer is out of range");
-    }
-    if (!options->placement_weights.empty() &&
-        options->placement_weights.size() != options->backends_per_peer) {
-      UsageError("--placement-weights must have one entry per backend");
-    }
-    if (options->backend_capacity < options->page_size || options->page_size == 0) {
-      UsageError("--backend-capacity must be at least the positive --page-size");
-    }
-    if (options->tier == "ssd" && options->command != "replay" &&
-        options->workload.max_value_size > options->page_size) {
-      UsageError("SSD values must not exceed --page-size");
-    }
+  if (options->policy_path.empty() && options->backend_capacity < options->page_size) {
+    UsageError("--backend-capacity must be at least --page-size");
   }
+  // An SSD backend stores one value per page, so a value larger than the page
+  // can never land. For a replay the authoritative sizes are in the events, and
+  // the trace scan checks them there.
+  if (options->page_limited_medium && options->command != "replay" &&
+      options->workload.max_value_size > options->page_size) {
+    UsageError("SSD values must not exceed --page-size");
+  }
+}
+// Reads --config once. The clients lower it again per node for their own
+// instance names; this pass exists to reject a bad topology before anything
+// starts, and to tell the rest of the run what media it will be writing to.
+void LoadPolicy(Options* options) {
+  if (options->policy_path.empty()) return;
+  auto loaded = mori::umbp::LoadBackendPolicyFile(options->policy_path);
+  if (!loaded.ok()) UsageError("invalid --config: " + loaded.error);
+  options->policy = std::move(*loaded.config);
+
+  PoolClientConfig lowered;
+  lowered.dram_page_size = options->page_size;
+  std::string error;
+  if (!mori::umbp::ApplyBackendPolicy(*options->policy, &lowered, &error)) {
+    UsageError("invalid --config: " + error);
+  }
+  if (lowered.backends.size() > mori::umbp::kMaxBackendsPerPeer) {
+    UsageError("--config expands beyond the per-peer backend limit");
+  }
+  options->page_limited_medium = std::any_of(
+      lowered.backends.begin(), lowered.backends.end(),
+      [](const BackendInstanceConfig& backend) { return backend.tier == TierType::SSD; });
 }
 void AddTraceMetadata(const Options& options,
                       ::umbp::benchmark::WorkloadTraceHeader* header) {
@@ -411,8 +378,6 @@ class MasterHarness {
     }
     config.put_strategy = std::make_unique<ConfigurableRoutePutStrategy>(
         algorithm, affinity, options.workload.seed);
-    config.route_put_algo = options.put_strategy;
-    config.route_put_affinity = options.affinity;
     if (options.get_strategy == "random") {
       config.get_strategy = std::make_unique<RandomRouteGetStrategy>();
     } else {
@@ -454,37 +419,20 @@ class MasterHarness {
   std::exception_ptr error_;
   std::atomic<bool> failed_{false};
 };
-BackendInstanceConfig MakeBackend(const Options& options, uint32_t node,
-                                  uint32_t index) {
+// Topology for a run without --config: the smallest thing that can serve the
+// workload. Anything richer — several backends, other media, logical tiers,
+// weights, watermarks — is what the policy file is for.
+BackendInstanceConfig DefaultBackend(uint64_t capacity) {
   BackendInstanceConfig backend;
-  backend.name = options.tier + "-" + std::to_string(index);
-  backend.tier = ParseTier(options.tier);
-  backend.placement_weight =
-      options.placement_weights.empty() ? 1 : options.placement_weights[index];
-  if (backend.tier == TierType::DRAM) {
-    backend.dram.buffer_sizes = {options.backend_capacity};
-  } else if (backend.tier == TierType::HBM) {
-    backend.hbm.buffer_sizes = {options.backend_capacity};
-  } else {
-    backend.ssd.enabled = true;
-    backend.ssd.ssd.enabled = true;
-    backend.ssd.ssd.capacity_bytes = options.backend_capacity;
-    backend.ssd.ssd.storage_dir = options.ssd_dir_prefix + "-node-" +
-                                  std::to_string(node) + "-backend-" +
-                                  std::to_string(index);
-    backend.ssd.ssd.ssd_backend = "file";
-  }
+  backend.name = "dram-0";
+  backend.tier = TierType::DRAM;
+  backend.dram.buffer_sizes = {capacity};
   return backend;
 }
 std::vector<std::unique_ptr<PoolClient>> StartClients(
     const Options& options, const std::string& master_address) {
   std::vector<std::unique_ptr<PoolClient>> clients;
-  std::optional<mori::umbp::BackendPolicyConfig> policy;
-  if (!options.policy_path.empty()) {
-    auto loaded = mori::umbp::LoadBackendPolicyFile(options.policy_path);
-    if (!loaded.ok()) throw std::runtime_error("invalid backend policy: " + loaded.error);
-    policy = std::move(*loaded.config);
-  }
+  const auto& policy = options.policy;
   for (uint32_t node = 0; node < options.workload.client_count; ++node) {
     PoolClientConfig config;
     config.master_config.master_address = master_address;
@@ -505,12 +453,8 @@ std::vector<std::unique_ptr<PoolClient>> StartClients(
         throw std::runtime_error("failed to apply backend policy: " + error);
       }
     } else {
-      config.placement_policy = options.placement == "weighted"
-                                    ? PoolPlacementPolicy::WEIGHTED
-                                    : PoolPlacementPolicy::SINGLE_BACKEND;
-      for (uint32_t i = 0; i < options.backends_per_peer; ++i) {
-        config.backends.push_back(MakeBackend(options, node, i));
-      }
+      config.placement_policy = PoolPlacementPolicy::SINGLE_BACKEND;
+      config.backends.push_back(DefaultBackend(options.backend_capacity));
     }
     auto client = std::make_unique<PoolClient>(std::move(config));
     if (!client->Init()) {
@@ -520,116 +464,6 @@ std::vector<std::unique_ptr<PoolClient>> StartClients(
   }
   return clients;
 }
-class PoolWorkloadClient final : public bench::WorkloadClient {
- public:
-  explicit PoolWorkloadClient(std::vector<std::unique_ptr<PoolClient>>* clients)
-      : clients_(clients) {}
-
-  bench::ClientResult Put(uint32_t id, const std::string& key, const uint8_t* data,
-                          size_t size) override {
-    PoolClient* client = Select(id);
-    if (client == nullptr || !client->Put(key, data, size)) {
-      return bench::ClientResult::kFailed;
-    }
-    Published(key);
-    client->Master().FlushHeartbeat();
-    return bench::ClientResult::kSuccess;
-  }
-
-  bench::ClientResult Get(uint32_t id, const std::string& key, uint8_t* data,
-                          size_t size) override {
-    PoolClient* client = Select(id);
-    if (client == nullptr) return bench::ClientResult::kFailed;
-    if (client->Get(key, data, size)) {
-      Clear(key);
-      return bench::ClientResult::kSuccess;
-    }
-    const auto deadline = Deadline(key);
-    while (deadline > std::chrono::steady_clock::now()) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(5));
-      if (client->Get(key, data, size)) {
-        Clear(key);
-        return bench::ClientResult::kSuccess;
-      }
-    }
-    Clear(key);
-    return client->Exists(key) ? bench::ClientResult::kFailed
-                               : bench::ClientResult::kNotFound;
-  }
-
-  std::vector<bench::ClientResult> BatchPut(
-      uint32_t id, const std::vector<std::string>& keys,
-      const std::vector<std::vector<uint8_t>>& values) override {
-    PoolClient* client = Select(id);
-    if (client == nullptr || keys.size() != values.size()) {
-      return std::vector<bench::ClientResult>(keys.size(), bench::ClientResult::kFailed);
-    }
-    std::vector<const void*> pointers;
-    std::vector<size_t> sizes;
-    for (const auto& value : values) {
-      pointers.push_back(value.data());
-      sizes.push_back(value.size());
-    }
-    const auto results = client->BatchPut(keys, pointers, sizes);
-    std::vector<bench::ClientResult> converted(keys.size(), bench::ClientResult::kFailed);
-    for (size_t i = 0; i < std::min(keys.size(), results.size()); ++i) {
-      if (results[i]) {
-        converted[i] = bench::ClientResult::kSuccess;
-        Published(keys[i]);
-      }
-    }
-    client->Master().FlushHeartbeat();
-    return converted;
-  }
-
-  std::vector<bench::ClientResult> BatchGet(
-      uint32_t id, const std::vector<std::string>& keys,
-      const std::vector<size_t>& sizes,
-      std::vector<std::vector<uint8_t>>* values) override {
-    PoolClient* client = Select(id);
-    if (client == nullptr || keys.size() != sizes.size() || values == nullptr) {
-      return std::vector<bench::ClientResult>(keys.size(), bench::ClientResult::kFailed);
-    }
-    values->resize(keys.size());
-    std::vector<void*> pointers;
-    for (size_t i = 0; i < keys.size(); ++i) {
-      (*values)[i].resize(sizes[i]);
-      pointers.push_back((*values)[i].data());
-    }
-    const auto results = client->BatchGet(keys, pointers, sizes);
-    std::vector<bench::ClientResult> converted(keys.size());
-    for (size_t i = 0; i < keys.size(); ++i) {
-      if (i < results.size() && results[i]) {
-        Clear(keys[i]);
-        converted[i] = bench::ClientResult::kSuccess;
-      } else {
-        converted[i] = Get(id, keys[i], (*values)[i].data(), sizes[i]);
-      }
-    }
-    return converted;
-  }
-
- private:
-  PoolClient* Select(uint32_t id) const {
-    return clients_ != nullptr && id < clients_->size() ? (*clients_)[id].get() : nullptr;
-  }
-  void Published(const std::string& key) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    pending_[key] = std::chrono::steady_clock::now() + kPublicationTimeout;
-  }
-  std::chrono::steady_clock::time_point Deadline(const std::string& key) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto found = pending_.find(key);
-    return found == pending_.end() ? std::chrono::steady_clock::now() : found->second;
-  }
-  void Clear(const std::string& key) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    pending_.erase(key);
-  }
-  std::vector<std::unique_ptr<PoolClient>>* clients_;
-  std::mutex mutex_;
-  std::unordered_map<std::string, std::chrono::steady_clock::time_point> pending_;
-};
 void Settle(const std::vector<std::unique_ptr<PoolClient>>& clients, uint64_t ms) {
   for (const auto& client : clients) client->Master().FlushHeartbeat();
   if (ms != 0) std::this_thread::sleep_for(std::chrono::milliseconds(ms));
@@ -642,16 +476,6 @@ std::string Csv(std::string_view value) {
   }
   return result + '"';
 }
-std::string Weights(const Options& options) {
-  std::string result;
-  for (uint32_t i = 0; i < options.backends_per_peer; ++i) {
-    if (!result.empty()) result += ':';
-    result += std::to_string(options.placement_weights.empty()
-                                 ? 1
-                                 : options.placement_weights[i]);
-  }
-  return result;
-}
 void PrintSummary(const Options& options, const bench::WorkloadMetrics& metrics,
                   uint64_t seed,
                   uint64_t wall_ns) {
@@ -660,23 +484,38 @@ void PrintSummary(const Options& options, const bench::WorkloadMetrics& metrics,
   const double gib_per_second =
       seconds == 0 ? 0 : metrics.total.succeeded_bytes / static_cast<double>(1ULL << 30) /
                                 seconds;
+  // When a recorded trace supplies the workload, the generator's knobs kept
+  // their defaults and describe nothing; reporting them invents a shape the run
+  // never had. The topology is always reported from the pool itself below.
+  const auto generated = [&](std::string_view value) {
+    return options.trace_defines_workload ? Csv("") : Csv(value);
+  };
+  const auto generated_number = [&](auto value) {
+    if (options.trace_defines_workload) return std::string{};
+    std::ostringstream text;
+    text << value;
+    return text.str();
+  };
   std::cout
       << "config\n"
       << "command,trace,policy,seed,profile,operations,keys,min_value_bytes,max_value_bytes,"
-         "size_distribution,read_ratio,clients,batch,qps,tier,"
-         "backends_per_peer,backend_capacity,page_size,placement,weights,"
+         "size_distribution,read_ratio,clients,batch,qps,backend_capacity,page_size,"
          "put_strategy,affinity,get_strategy,scheduling,time_scale,payload_validation,"
          "settle_ms\n"
       << Csv(options.command) << ',' << Csv(options.trace_path) << ','
       << Csv(options.policy_path) << ',' << seed << ','
-      << Csv(options.profile) << ',' << options.workload.operation_count << ','
-      << options.workload.key_count << ',' << options.workload.min_value_size << ','
-      << options.workload.max_value_size << ',' << Csv(options.size_distribution) << ','
-      << options.workload.read_ratio << ',' << options.workload.client_count << ','
-      << options.workload.batch_size << ',' << options.workload.qps << ','
-      << Csv(options.tier) << ',' << options.backends_per_peer << ','
-      << options.backend_capacity << ',' << options.page_size << ','
-      << Csv(options.placement) << ',' << Csv(Weights(options)) << ','
+      << generated(options.profile) << ',' << options.workload.operation_count << ','
+      << generated_number(options.workload.key_count) << ','
+      << generated_number(options.workload.min_value_size) << ','
+      << generated_number(options.workload.max_value_size) << ','
+      << generated(options.size_distribution) << ','
+      << generated_number(options.workload.read_ratio) << ','
+      << options.workload.client_count << ','
+      << generated_number(options.workload.batch_size) << ','
+      << generated_number(options.workload.qps) << ','
+      << (options.policy_path.empty() ? std::to_string(options.backend_capacity)
+                                      : std::string{})
+      << ',' << options.page_size << ','
       << Csv(options.put_strategy) << ',' << Csv(options.affinity) << ','
       << Csv(options.get_strategy) << ','
       << Csv(options.runner.max_throughput ? "max-throughput" : "open-loop") << ','
@@ -684,21 +523,27 @@ void PrintSummary(const Options& options, const bench::WorkloadMetrics& metrics,
       << (options.runner.validate_get_payloads ? "true" : "false") << ','
       << options.settle_ms << '\n'
       << "summary\n"
-      << "seed,attempted,succeeded,failed,succeeded_bytes,puts,gets,get_misses,"
-         "validation_failures,wall_time_ns,ops_per_s,GiB_per_s,latency_p50_ns,"
+      << "seed,attempted,succeeded,failed,succeeded_bytes,puts,puts_failed,gets,gets_failed,"
+         "get_misses,validation_failures,recorded_misses,recorded_failures,"
+         "wall_time_ns,ops_per_s,GiB_per_s,latency_p50_ns,"
          "latency_p95_ns,latency_p99_ns,latency_max_ns,schedule_lag_p99_ns\n"
       << seed << ',' << metrics.total.attempted << ',' << metrics.total.succeeded << ','
       << metrics.total.failed << ',' << metrics.total.succeeded_bytes << ','
-      << metrics.puts.succeeded << ',' << metrics.gets.succeeded << ','
-      << metrics.get_misses << ',' << metrics.get_validation_failures << ',' << wall_ns
+      << metrics.puts.succeeded << ',' << metrics.puts.failed << ','
+      << metrics.gets.succeeded << ',' << metrics.gets.failed << ','
+      << metrics.get_misses << ',' << metrics.get_validation_failures << ','
+      << metrics.recorded_misses << ',' << metrics.recorded_failures << ',' << wall_ns
       << ',' << std::setprecision(10) << ops_per_second << ',' << gib_per_second << ','
       << metrics.latency.p50_ns << ',' << metrics.latency.p95_ns << ','
       << metrics.latency.p99_ns << ',' << metrics.latency.max_ns << ','
       << metrics.schedule_lag.p99_ns << '\n';
 }
 void PrintBackendPlacement(const std::vector<std::unique_ptr<PoolClient>>& clients) {
+  // logical_tier is the topology as the pool actually built it, which is the
+  // only description that stays true when a policy file expands one named
+  // backend into several instances.
   std::cout << "backend_placement\n"
-            << "node,backend,tier,owned_keys,total_bytes,available_bytes,"
+            << "node,backend,logical_tier,tier,owned_keys,total_bytes,available_bytes,"
                "max_allocatable_bytes\n";
   for (const auto& client : clients) {
     auto& registry = client->Backends();
@@ -707,6 +552,7 @@ void PrintBackendPlacement(const std::vector<std::unique_ptr<PoolClient>>& clien
       const auto capacity = backend->Capacity();
       std::cout << Csv(client->NodeId()) << ','
                 << Csv(entry == nullptr ? backend->Name() : entry->name) << ','
+                << Csv(client->LogicalTierForBackend(registry.BackendId(backend))) << ','
                 << Csv(mori::umbp::TierTypeName(backend->Tier())) << ','
                 << backend->OwnedKeyCount() << ',' << capacity.total_bytes << ','
                 << capacity.available_bytes << ',' << capacity.max_allocatable_bytes << '\n';
@@ -720,6 +566,14 @@ void PrintBackendPlacement(const std::vector<std::unique_ptr<PoolClient>>& clien
               << metrics.succeeded << ',' << metrics.failed << ','
               << metrics.offloaded_bytes << ',' << metrics.promoted_bytes << '\n';
   }
+  // Which tier answered the reads: a hierarchy whose hot tier serves few of them
+  // is misconfigured even when the throughput number looks acceptable.
+  std::cout << "tier_reads\n" << "node,logical_tier,reads_served\n";
+  for (const auto& client : clients) {
+    for (const auto& [tier, reads] : client->TierReadHits()) {
+      std::cout << Csv(client->NodeId()) << ',' << Csv(tier) << ',' << reads << '\n';
+    }
+  }
 }
 void InspectReplayTrace(Options* options) {
   bench::TraceReader reader(options->trace_path);
@@ -730,6 +584,14 @@ void InspectReplayTrace(Options* options) {
     return found == metadata.end() ? nullptr : &found->second;
   };
   if (const auto* value = metadata_value("profile")) options->profile = *value;
+  // A recorded trace carries keys and sizes but not payloads, so the expected
+  // bytes cannot be rederived and GET validation would fail on every hit.
+  if (const auto* value = metadata_value("payload_mode"); value != nullptr && *value == "external") {
+    options->runner.validate_get_payloads = false;
+  }
+  if (const auto* value = metadata_value("source"); value != nullptr && *value == "production") {
+    options->trace_defines_workload = true;
+  }
   if (const auto* value = metadata_value("keys")) {
     options->workload.key_count = ParseUnsigned<uint64_t>(*value, "trace metadata keys");
   }
@@ -768,7 +630,7 @@ void InspectReplayTrace(Options* options) {
     has_events = true;
     ++event_count;
     max_client = std::max(max_client, event.client_id());
-    if (options->tier == "ssd" && event.value_size() > options->page_size) {
+    if (options->page_limited_medium && event.value_size() > options->page_size) {
       UsageError("trace contains an SSD value larger than --page-size");
     }
   }
@@ -797,7 +659,7 @@ int RunBenchmark(Options options) {
                 std::make_unique<bench::SyntheticWorkloadSource>(options.workload));
   MasterHarness master(options);
   auto clients = StartClients(options, master.Address());
-  PoolWorkloadClient adapter(&clients);
+  bench::PoolWorkloadClient adapter(&clients);
   Settle(clients, options.settle_ms);
   bench::WorkloadRunner runner(&adapter, options.runner);
   const auto start = std::chrono::steady_clock::now();
@@ -814,6 +676,7 @@ int RunBenchmark(Options options) {
 int main(int argc, char** argv) {
   try {
     Options options = ParseOptions(argc, argv);
+    LoadPolicy(&options);
     ValidateOptions(&options);
     return options.command == "generate" ? GenerateTrace(options)
                                          : RunBenchmark(std::move(options));

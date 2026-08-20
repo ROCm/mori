@@ -6,10 +6,22 @@
 #include <algorithm>
 #include <map>
 #include <set>
+#include <stdexcept>
 #include <tuple>
 #include <utility>
 
 namespace mori::umbp {
+namespace {
+
+// One watermark scan queues at most this many keys; the worker tops the queue
+// up after each completed offload, so a tier still drains all the way down to
+// its low watermark without ever queueing its whole key set at once.
+constexpr size_t kWatermarkCandidateBatch = 64;
+// Floor between scans. Without it every commit batch arriving above the high
+// watermark would re-walk the placements.
+constexpr auto kWatermarkScanInterval = std::chrono::milliseconds(5);
+
+}  // namespace
 
 PeerPool::PeerPool(BackendRegistry* backends, std::unique_ptr<PoolPolicy> policy,
                    TransferEngine* transfer_engine)
@@ -19,6 +31,17 @@ PeerPool::PeerPool(BackendRegistry* backends, std::unique_ptr<PoolPolicy> policy
       tier_graph_(policy_ == nullptr ? nullptr : policy_->TierGraph()),
       transition_executor_(backends, transfer_engine) {
   if (tier_graph_ != nullptr) {
+    // A tier graph without an engine would accept offload and promotion rules
+    // and then silently fail every one of them, leaving the topology looking
+    // configured while nothing ever moves.
+    if (transfer_engine == nullptr) {
+      throw std::invalid_argument(
+          "PeerPool: a tiered policy requires a TransferEngine to move bytes between "
+          "backends");
+    }
+    tier_scan_backoff_.assign(tier_graph_->TierCount(),
+                              std::chrono::steady_clock::time_point{});
+    queued_by_tier_.assign(tier_graph_->TierCount(), 0);
     transition_worker_ = std::thread(&PeerPool::TransitionWorkerLoop, this);
   }
 }
@@ -28,6 +51,7 @@ PeerPool::~PeerPool() { StopTransitionWorker(); }
 void PeerPool::EnqueueTransition(TransitionJob job) {
   std::lock_guard<std::mutex> lock(transition_mutex_);
   if (stop_transition_worker_ || !queued_transition_keys_.insert(job.key).second) return;
+  if (job.source_tier < queued_by_tier_.size()) ++queued_by_tier_[job.source_tier];
   transition_queue_.push_back(std::move(job));
   transition_cv_.notify_one();
 }
@@ -38,39 +62,133 @@ void PeerPool::StopTransitionWorker() {
     stop_transition_worker_ = true;
     transition_queue_.clear();
     queued_transition_keys_.clear();
+    std::fill(queued_by_tier_.begin(), queued_by_tier_.end(), 0);
   }
   transition_cv_.notify_all();
   if (transition_worker_.joinable()) transition_worker_.join();
 }
 
-TierTransitionResult PeerPool::RunTransitionLocked(const TransitionJob& job) {
-  TierTransitionResult result;
-  if (tier_graph_ == nullptr) return result;
+void PeerPool::TouchLocked(const std::string& key) {
+  auto access = last_access_.find(key);
+  if (access != last_access_.end()) access_order_.erase(access->second);
+  const uint64_t stamp = ++access_clock_;
+  last_access_[key] = stamp;
+  access_order_[stamp] = key;
+}
+
+void PeerPool::ForgetAccessLocked(const std::string& key) {
+  auto access = last_access_.find(key);
+  if (access == last_access_.end()) return;
+  access_order_.erase(access->second);
+  last_access_.erase(access);
+}
+
+uint32_t PeerPool::FindOwnerLocked(const std::string& key) const {
+  if (policy_ == nullptr || backends_ == nullptr) return BackendRegistry::kMaxBackends;
+  for (uint32_t backend_id : policy_->ReadOrder(*backends_)) {
+    auto* backend = backends_->Get(backend_id);
+    if (backend != nullptr && backend->Contains(key)) return backend_id;
+  }
+  return BackendRegistry::kMaxBackends;
+}
+
+size_t PeerPool::EnqueueWatermarkCandidatesLocked(LogicalTierGraph::TierIndex tier_index,
+                                                  size_t max_count) {
+  if (tier_graph_ == nullptr || max_count == 0) return 0;
+  const auto& tier = tier_graph_->NodeAt(tier_index);
+  if (tier.trigger != PoolOffloadTrigger::kWatermark || tier.offload_to.empty()) return 0;
+
+  std::vector<TransitionJob> candidates;
+  const auto consider = [&](const std::string& key, uint32_t backend_id) {
+    if (tier_graph_->TierIndexForBackendId(backend_id) != tier_index) return;
+    // Draining a member that is not itself under pressure frees nothing that
+    // was scarce, and in a mixed-medium tier it would move keys off the roomy
+    // member while the full one stays full.
+    if (!tier_graph_->MemberAtOrAbove(backend_id, tier.low_watermark)) return;
+    if (migrating_keys_.count(key) != 0) return;
+    candidates.push_back({TierTransitionKind::kOffload, key, backend_id, tier_index});
+  };
+
+  // Coldest first: access_order_ is keyed by access stamp, so the keys least
+  // likely to be read again leave the tier before the rest.
+  for (const auto& [stamp, key] : access_order_) {
+    (void)stamp;
+    auto placement = placements_.find(key);
+    if (placement == placements_.end()) continue;
+    consider(key, placement->second);
+    if (candidates.size() >= max_count) break;
+  }
+  for (auto& candidate : candidates) EnqueueTransition(std::move(candidate));
+  return candidates.size();
+}
+
+void PeerPool::MaybeEnqueueWatermarkOffloadLocked() {
+  if (tier_graph_ == nullptr) return;
+  const auto now = std::chrono::steady_clock::now();
+  for (size_t tier_index = 0; tier_index < tier_graph_->TierCount(); ++tier_index) {
+    const auto& tier = tier_graph_->NodeAt(tier_index);
+    if (tier.trigger != PoolOffloadTrigger::kWatermark || tier.offload_to.empty() ||
+        now < tier_scan_backoff_[tier_index] ||
+        !tier_graph_->AtOrAbove(tier_index, tier.high_watermark)) {
+      continue;
+    }
+    {
+      // Work is already queued for this tier; the worker tops it up as it
+      // drains, so there is nothing to decide here.
+      std::lock_guard<std::mutex> lock(transition_mutex_);
+      if (queued_by_tier_[tier_index] > 0) continue;
+    }
+    if (EnqueueWatermarkCandidatesLocked(tier_index, kWatermarkCandidateBatch) == 0) {
+      tier_scan_backoff_[tier_index] = now + kWatermarkScanInterval;
+    }
+  }
+}
+
+bool PeerPool::WatermarkDrivenLocked(const TransitionJob& job) const {
+  return job.kind == TierTransitionKind::kOffload && tier_graph_ != nullptr &&
+         tier_graph_->NodeAt(job.source_tier).trigger == PoolOffloadTrigger::kWatermark;
+}
+
+PeerPool::TransitionPlan PeerPool::PlanTransitionLocked(const TransitionJob& job) {
+  TransitionPlan plan;
+  if (tier_graph_ == nullptr) return plan;
   auto placement = placements_.find(job.key);
   if (placement == placements_.end() || placement->second != job.source_backend_id) {
-    return result;
+    return plan;
   }
-  const bool promotion = job.kind == TransitionJobKind::kPromotion;
+  if (!migrating_keys_.insert(job.key).second) return plan;
+
+  const bool promotion = job.kind == TierTransitionKind::kPromotion;
   const auto& source_tier = tier_graph_->NodeAt(job.source_tier);
-  const bool remove_source =
-      !promotion || source_tier.promotion_mode == PoolTransitionMode::kMove;
-  const auto targets =
-      promotion ? tier_graph_->PromoteTargetOrder(job.source_tier, job.key)
-                : tier_graph_->TransitionTargetOrder(job.source_tier, job.key);
+  plan.remove_source = !promotion || source_tier.promotion_mode == PoolTransitionMode::kMove;
+  plan.targets = promotion ? tier_graph_->PromoteTargetOrder(job.source_tier, job.key)
+                           : tier_graph_->TransitionTargetOrder(job.source_tier, job.key);
+  plan.valid = true;
   ++transition_metrics_.attempted;
-  result = transition_executor_.Execute(job.key, job.source_backend_id, targets,
-                                        remove_source);
+  return plan;
+}
+
+void PeerPool::FinishTransitionLocked(const TransitionJob& job,
+                                      const TierTransitionResult& result) {
+  migrating_keys_.erase(job.key);
+  if (migrating_keys_.empty()) transition_idle_cv_.notify_all();
   if (!result.success) {
     ++transition_metrics_.failed;
-    return result;
+    return;
   }
   ++transition_metrics_.succeeded;
-  if (promotion) {
+  if (job.kind == TierTransitionKind::kPromotion) {
     transition_metrics_.promoted_bytes += result.bytes_moved;
   } else {
     transition_metrics_.offloaded_bytes += result.bytes_moved;
   }
-  placements_[job.key] = result.target_backend_id;
+  // The copy ran with the pool lock released, so another operation may have
+  // re-placed the key meanwhile. Only the placement this transition started
+  // from may be advanced to the target.
+  auto placement = placements_.find(job.key);
+  if (placement != placements_.end() && placement->second == job.source_backend_id) {
+    placement->second = result.target_backend_id;
+  }
   if (result.source_draining) {
     draining_sources_[job.key].insert(job.source_backend_id);
   } else {
@@ -80,6 +198,19 @@ TierTransitionResult PeerPool::RunTransitionLocked(const TransitionJob& job) {
       if (draining->second.empty()) draining_sources_.erase(draining);
     }
   }
+}
+
+TierTransitionResult PeerPool::RunTransition(std::unique_lock<std::mutex>& lock,
+                                             const TransitionJob& job) {
+  TierTransitionResult result;
+  const auto plan = PlanTransitionLocked(job);
+  if (!plan.valid) return result;
+
+  lock.unlock();
+  result = transition_executor_.Execute(job.key, job.source_backend_id, plan.targets,
+                                        plan.remove_source);
+  lock.lock();
+  FinishTransitionLocked(job, result);
   return result;
 }
 
@@ -96,15 +227,24 @@ void PeerPool::TransitionWorkerLoop() {
     }
     bool retry = false;
     {
-      std::lock_guard<std::mutex> lock(operation_mutex_);
+      std::unique_lock<std::mutex> lock(operation_mutex_);
       if (tier_graph_ != nullptr) {
         const auto& tier = tier_graph_->NodeAt(job.source_tier);
-        if (job.kind != TransitionJobKind::kWatermark ||
+        const bool watermark_driven = WatermarkDrivenLocked(job);
+        if (!watermark_driven ||
             tier_graph_->AtOrAbove(job.source_tier, tier.low_watermark)) {
-          const auto result = RunTransitionLocked(job);
-          retry = job.kind == TransitionJobKind::kWatermark && !result.success &&
-                  job.attempts < 3 &&
-                  tier_graph_->AtOrAbove(job.source_tier, tier.low_watermark);
+          const auto result = RunTransition(lock, job);
+          const bool still_pressured =
+              watermark_driven && tier_graph_->AtOrAbove(job.source_tier, tier.low_watermark);
+          retry = still_pressured && !result.success && job.attempts < 3;
+          // Keep the drain going without waiting for the next commit batch to
+          // notice the tier is still above its low watermark. The scan skips
+          // whatever is still queued, so this tops the batch back up rather
+          // than duplicating it.
+          if (still_pressured && result.success) {
+            tier_scan_backoff_[job.source_tier] = std::chrono::steady_clock::time_point{};
+            EnqueueWatermarkCandidatesLocked(job.source_tier, kWatermarkCandidateBatch);
+          }
         }
       }
     }
@@ -115,11 +255,15 @@ void PeerPool::TransitionWorkerLoop() {
     {
       std::lock_guard<std::mutex> lock(transition_mutex_);
       queued_transition_keys_.erase(job.key);
+      const size_t source_tier = job.source_tier;
       if (retry && !stop_transition_worker_) {
         ++job.attempts;
         queued_transition_keys_.insert(job.key);
         transition_queue_.push_back(std::move(job));
         transition_cv_.notify_one();
+      } else if (source_tier < queued_by_tier_.size() &&
+                 queued_by_tier_[source_tier] > 0) {
+        --queued_by_tier_[source_tier];
       }
     }
   }
@@ -164,21 +308,15 @@ std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
       }
     }
 
-    // The index is process-local and may be empty after restart while a
-    // persistent backend still owns the key. Rebuild it authoritatively before
-    // making a new placement decision.
-    bool already_exists = false;
-    for (uint32_t backend_id : policy_->ReadOrder(*backends_)) {
-      auto* backend = backends_->Get(backend_id);
-      if (backend != nullptr && backend->Contains(requests[i].key)) {
-        placements_[requests[i].key] = backend_id;
-        out[i].backend_id = backend_id;
-        out[i].allocation.outcome = AllocateOutcome::kSuccessAlreadyExists;
-        already_exists = true;
-        break;
-      }
+    // Rebuild the index before making a new placement decision: a persistent
+    // backend may still own the key even though this process has no record.
+    const uint32_t owner = FindOwnerLocked(requests[i].key);
+    if (owner != BackendRegistry::kMaxBackends) {
+      placements_[requests[i].key] = owner;
+      out[i].backend_id = owner;
+      out[i].allocation.outcome = AllocateOutcome::kSuccessAlreadyExists;
+      continue;
     }
-    if (already_exists) continue;
 
     put_orders[i] = policy_->PutOrder(*backends_, requests[i]);
     if (!put_orders[i].empty()) {
@@ -198,21 +336,24 @@ std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
       by_backend[put_orders[index][next_candidate[index]]].push_back(index);
     }
     std::vector<size_t> retry;
+    // Moves a request onto its next policy candidate, or drops the reservation
+    // once the candidates run out.
+    auto advance = [&](size_t index) {
+      ++next_candidate[index];
+      if (next_candidate[index] >= put_orders[index].size()) {
+        pending_keys_.erase(requests[index].key);
+        return;
+      }
+      pending_keys_[requests[index].key] =
+          PendingPlacement{put_orders[index][next_candidate[index]], 0,
+                           std::chrono::steady_clock::time_point::max()};
+      retry.push_back(index);
+    };
 
     for (const auto& [backend_id, indices] : by_backend) {
       auto* backend = backends_->Get(backend_id);
       if (backend == nullptr) {
-        for (size_t index : indices) {
-          ++next_candidate[index];
-          if (next_candidate[index] < put_orders[index].size()) {
-            const uint32_t next_backend = put_orders[index][next_candidate[index]];
-            pending_keys_[requests[index].key] = PendingPlacement{
-                next_backend, 0, std::chrono::steady_clock::time_point::max()};
-            retry.push_back(index);
-          } else {
-            pending_keys_.erase(requests[index].key);
-          }
-        }
+        for (size_t index : indices) advance(index);
         continue;
       }
 
@@ -252,15 +393,7 @@ std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
             pending_keys_.erase(requests[index].key);
             break;
           case AllocateOutcome::kFailedNoSpace:
-            ++next_candidate[index];
-            if (next_candidate[index] < put_orders[index].size()) {
-              const uint32_t next_backend = put_orders[index][next_candidate[index]];
-              pending_keys_[requests[index].key] = PendingPlacement{
-                  next_backend, 0, std::chrono::steady_clock::time_point::max()};
-              retry.push_back(index);
-            } else {
-              pending_keys_.erase(requests[index].key);
-            }
+            advance(index);
             break;
         }
       }
@@ -335,42 +468,12 @@ std::vector<PoolCommitResult> PeerPool::BatchCommit(
       out[index].commit = results[i];
       if (results[i].success) {
         placements_[requests[index].key] = backend_id;
-        last_access_[requests[index].key] = ++access_clock_;
+        TouchLocked(requests[index].key);
       }
       release_pending(requests[index].slot);
     }
   }
-  if (tier_graph_ == nullptr) return out;
-  for (size_t tier_index = 0; tier_index < tier_graph_->TierCount(); ++tier_index) {
-    const auto& tier = tier_graph_->NodeAt(tier_index);
-    if (tier.trigger != PoolOffloadTrigger::kWatermark || tier.offload_to.empty() ||
-        !tier_graph_->AtOrAbove(tier_index, tier.high_watermark)) {
-      continue;
-    }
-    std::vector<std::pair<std::string, uint32_t>> candidates;
-    for (const auto& [key, backend_id] : placements_) {
-      if (tier_graph_->TierIndexForBackendId(backend_id) == tier_index) {
-        candidates.emplace_back(key, backend_id);
-      }
-    }
-    std::sort(candidates.begin(), candidates.end(), [&](const auto& left, const auto& right) {
-      if (tier.candidate_policy == TierCandidatePolicy::kKeyOrder) {
-        return left.first < right.first;
-      }
-      const auto left_access = last_access_.find(left.first);
-      const auto right_access = last_access_.find(right.first);
-      const uint64_t left_value =
-          left_access == last_access_.end() ? 0 : left_access->second;
-      const uint64_t right_value =
-          right_access == last_access_.end() ? 0 : right_access->second;
-      return left_value == right_value ? left.first < right.first
-                                       : left_value < right_value;
-    });
-    for (const auto& [key, backend_id] : candidates) {
-      EnqueueTransition(
-          {TransitionJobKind::kWatermark, key, backend_id, tier_index});
-    }
-  }
+  MaybeEnqueueWatermarkOffloadLocked();
   return out;
 }
 
@@ -468,8 +571,9 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
   for (size_t i = 0; i < keys.size(); ++i) {
     if (out[i].resolved.found) {
       placements_[keys[i]] = out[i].backend_id;
-      last_access_[keys[i]] = ++access_clock_;
+      TouchLocked(keys[i]);
       if (tier_graph_ != nullptr) {
+        ++tier_read_hits_[tier_graph_->NameForBackend(out[i].backend_id)];
         const auto source_tier = tier_graph_->TierIndexForBackendId(out[i].backend_id);
         if (source_tier.has_value() && *source_tier != tier_graph_->EntryTierIndex() &&
             tier_graph_->NodeAt(*source_tier).promote_on_read &&
@@ -477,7 +581,7 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
                                     tier_graph_->NodeAt(tier_graph_->EntryTierIndex())
                                         .high_watermark)) {
           EnqueueTransition(
-              {TransitionJobKind::kPromotion, keys[i], out[i].backend_id, *source_tier});
+              {TierTransitionKind::kPromotion, keys[i], out[i].backend_id, *source_tier});
         }
       }
     } else {
@@ -490,14 +594,20 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
           break;
         }
       }
-      if (!exists) placements_.erase(keys[i]);
+      // A key the backends no longer hold must leave the access index too, or
+      // it accumulates there for the life of the process and skews LRU order.
+      if (!exists) {
+        placements_.erase(keys[i]);
+        ForgetAccessLocked(keys[i]);
+      }
     }
   }
   return out;
 }
 
-std::vector<EvictResult> PeerPool::Evict(const std::vector<std::string>& keys) {
-  std::lock_guard<std::mutex> operation_lock(operation_mutex_);
+std::vector<EvictResult> PeerPool::Evict(const std::vector<std::string>& keys,
+                                         PoolEvictMode mode) {
+  std::unique_lock<std::mutex> operation_lock(operation_mutex_);
   std::vector<EvictResult> out;
   out.reserve(keys.size());
   for (const auto& key : keys) out.push_back(EvictResult{key, 0});
@@ -505,6 +615,17 @@ std::vector<EvictResult> PeerPool::Evict(const std::vector<std::string>& keys) {
 
   std::vector<bool> handled(keys.size(), false);
   for (size_t i = 0; i < keys.size(); ++i) {
+    // A copy already owns this key. Freeing nothing makes the caller retry,
+    // which is the same contract as a read lease delaying a source delete, and
+    // it keeps a discard from racing a target commit that would resurrect it.
+    if (migrating_keys_.count(keys[i]) != 0) {
+      handled[i] = true;
+      continue;
+    }
+    // A discard has to leave no copy behind, so it skips demotion and the
+    // drain shortcut and goes straight to the delete pass below.
+    if (mode == PoolEvictMode::kDiscard) continue;
+
     auto draining = draining_sources_.find(keys[i]);
     if (draining != draining_sources_.end()) {
       std::vector<uint32_t> drained;
@@ -524,19 +645,9 @@ std::vector<EvictResult> PeerPool::Evict(const std::vector<std::string>& keys) {
       continue;
     }
 
-    uint32_t source_id = BackendRegistry::kMaxBackends;
     auto placement = placements_.find(keys[i]);
-    if (placement != placements_.end()) {
-      source_id = placement->second;
-    } else if (policy_ != nullptr) {
-      for (uint32_t backend_id : policy_->ReadOrder(*backends_)) {
-        auto* backend = backends_->Get(backend_id);
-        if (backend != nullptr && backend->Contains(keys[i])) {
-          source_id = backend_id;
-          break;
-        }
-      }
-    }
+    const uint32_t source_id = placement != placements_.end() ? placement->second
+                                                              : FindOwnerLocked(keys[i]);
     if (tier_graph_ == nullptr) continue;
     const auto tier_index = tier_graph_->TierIndexForBackendId(source_id);
     if (!tier_index.has_value()) continue;
@@ -544,8 +655,8 @@ std::vector<EvictResult> PeerPool::Evict(const std::vector<std::string>& keys) {
     if (tier.trigger != PoolOffloadTrigger::kOnEvict || tier.offload_to.empty()) {
       continue;
     }
-    auto migrated = RunTransitionLocked(
-        {TransitionJobKind::kWatermark, keys[i], source_id, *tier_index});
+    auto migrated = RunTransition(
+        operation_lock, {TierTransitionKind::kOffload, keys[i], source_id, *tier_index});
     handled[i] = migrated.success;
     out[i].bytes_freed = migrated.bytes_freed;
   }
@@ -567,25 +678,30 @@ std::vector<EvictResult> PeerPool::Evict(const std::vector<std::string>& keys) {
 
   for (size_t i = 0; i < keys.size(); ++i) {
     if (handled[i]) continue;
-    bool found = false;
-    if (policy_ != nullptr) {
-      for (uint32_t backend_id : policy_->ReadOrder(*backends_)) {
-        auto* backend = backends_->Get(backend_id);
-        if (backend != nullptr && backend->Contains(keys[i])) {
-          placements_[keys[i]] = backend_id;
-          found = true;
-          break;
-        }
-      }
+    const uint32_t owner = FindOwnerLocked(keys[i]);
+    if (owner != BackendRegistry::kMaxBackends) {
+      placements_[keys[i]] = owner;
+    } else {
+      placements_.erase(keys[i]);
+      ForgetAccessLocked(keys[i]);
+      draining_sources_.erase(keys[i]);
     }
-    if (!found) placements_.erase(keys[i]);
-    if (!found) last_access_.erase(keys[i]);
   }
   return out;
 }
 
 void PeerPool::ClearLocal() {
-  std::lock_guard<std::mutex> operation_lock(operation_mutex_);
+  std::unique_lock<std::mutex> operation_lock(operation_mutex_);
+  {
+    std::lock_guard<std::mutex> lock(transition_mutex_);
+    transition_queue_.clear();
+    queued_transition_keys_.clear();
+  }
+  // Wiping state underneath an in-flight copy would let its target commit
+  // resurrect a key the user asked to discard, so drain the copies first. The
+  // queue is already empty, so no new key can enter the set.
+  transition_idle_cv_.wait(operation_lock, [&] { return migrating_keys_.empty(); });
+
   if (backends_ != nullptr) {
     for (auto* backend : backends_->All()) backend->ClearLocal();
   }
@@ -594,11 +710,7 @@ void PeerPool::ClearLocal() {
   pending_keys_.clear();
   pending_slots_.clear();
   last_access_.clear();
-  {
-    std::lock_guard<std::mutex> lock(transition_mutex_);
-    transition_queue_.clear();
-    queued_transition_keys_.clear();
-  }
+  access_order_.clear();
 }
 
 std::vector<KvEvent> PeerPool::DrainPendingEvents() {
@@ -695,6 +807,11 @@ size_t PeerPool::PlacementCount() const {
 TierTransitionMetrics PeerPool::TransitionMetrics() const {
   std::lock_guard<std::mutex> lock(operation_mutex_);
   return transition_metrics_;
+}
+
+std::map<std::string, uint64_t> PeerPool::TierReadHits() const {
+  std::lock_guard<std::mutex> lock(operation_mutex_);
+  return tier_read_hits_;
 }
 
 }  // namespace mori::umbp

@@ -636,6 +636,16 @@ bool PoolClient::Clear() {
 bool PoolClient::IsInitialized() const { return initialized_; }
 MasterClient& PoolClient::Master() { return *master_client_; }
 BackendRegistry& PoolClient::Backends() { return registry_; }
+std::map<std::string, uint64_t> PoolClient::TierReadHits() const {
+  return default_pool_ == nullptr ? std::map<std::string, uint64_t>{}
+                                  : default_pool_->TierReadHits();
+}
+
+std::string PoolClient::LogicalTierForBackend(uint32_t backend_id) const {
+  return default_pool_ == nullptr ? std::string{}
+                                  : default_pool_->LogicalTierForBackend(backend_id);
+}
+
 TierTransitionMetrics PoolClient::TransitionMetrics() const {
   return default_pool_ == nullptr ? TierTransitionMetrics{}
                                   : default_pool_->TransitionMetrics();
@@ -993,7 +1003,13 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
     results[i] = (outcomes[i] != PutEntryOutcome::kFailed);
   }
   if (workload_recorder_ != nullptr) {
-    workload_recorder_->RecordBatchPut(keys, sizes, results);
+    std::vector<benchmark::WorkloadTraceOutcome> recorded(outcomes.size());
+    for (size_t i = 0; i < outcomes.size(); ++i) {
+      recorded[i] = outcomes[i] != PutEntryOutcome::kFailed
+                        ? benchmark::WorkloadTraceOutcome::kSuccess
+                        : benchmark::WorkloadTraceOutcome::kFailure;
+    }
+    workload_recorder_->RecordBatchPut(keys, sizes, recorded);
   }
   return results;
 }
@@ -1485,7 +1501,16 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
                           MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH_HELP, "remote");
   }
   if (workload_recorder_ != nullptr) {
-    workload_recorder_->RecordBatchGet(keys, sizes, results);
+    std::vector<benchmark::WorkloadTraceOutcome> recorded(results.size());
+    for (size_t i = 0; i < results.size(); ++i) {
+      // No route means the master had no location for the key: a cache miss,
+      // which is workload information. Anything else that failed is a fault.
+      recorded[i] = results[i] ? benchmark::WorkloadTraceOutcome::kSuccess
+                    : (i < routes.size() && !routes[i].has_value())
+                        ? benchmark::WorkloadTraceOutcome::kMiss
+                        : benchmark::WorkloadTraceOutcome::kFailure;
+    }
+    workload_recorder_->RecordBatchGet(keys, sizes, recorded);
   }
   return results;
 }

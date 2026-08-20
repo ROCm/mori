@@ -5,10 +5,8 @@
 #include "umbp/distributed/pool/tier_graph.h"
 
 #include <algorithm>
-#include <cmath>
 #include <functional>
 #include <limits>
-#include <unordered_set>
 #include <utility>
 
 namespace mori::umbp {
@@ -75,114 +73,52 @@ std::vector<uint32_t> WeightedBackendOrder(
 LogicalTierGraph::LogicalTierGraph(
     const BackendRegistry& backends, std::vector<Node> nodes,
     std::vector<std::vector<TierIndex>> upstream,
-    std::unordered_map<std::string, TierIndex> tier_by_backend_name,
     std::unordered_map<uint32_t, TierIndex> tier_by_backend_id, TierIndex entry_tier)
     : backends_(&backends),
       nodes_(std::move(nodes)),
       upstream_(std::move(upstream)),
-      tier_by_backend_name_(std::move(tier_by_backend_name)),
       tier_by_backend_id_(std::move(tier_by_backend_id)),
       entry_tier_(entry_tier) {}
 
 LogicalTierGraph::CompileResult LogicalTierGraph::Compile(
     const std::vector<LogicalTierConfig>& tiers, const BackendRegistry& backends) {
-  if (tiers.empty()) return CompileError("logical tier graph must not be empty");
+  LogicalTierIndex index;
+  if (std::string error = IndexLogicalTiers(tiers, &index); !error.empty()) {
+    return CompileError(std::move(error));
+  }
 
+  // Everything the tier list can say about itself has been checked; what is
+  // left is binding member names to the backends this peer actually registered.
   std::vector<Node> nodes;
   nodes.reserve(tiers.size());
-  std::unordered_map<std::string, TierIndex> tier_names;
-  std::unordered_map<std::string, TierIndex> tier_by_backend_name;
   std::unordered_map<uint32_t, TierIndex> tier_by_backend_id;
-  TierIndex entry_tier = kEntryTierIndex;
-  size_t entry_count = 0;
+  std::vector<std::vector<TierIndex>> upstream(tiers.size());
 
   for (TierIndex i = 0; i < tiers.size(); ++i) {
-    const auto& tier = tiers[i];
     Node node;
-    node.name = tier.name.empty() ? "tier_" + std::to_string(i) : tier.name;
-    if (node.name.find('|') != std::string::npos) {
-      return CompileError("logical tier name '" + node.name + "' must not contain '|'");
-    }
-    if (!tier_names.emplace(node.name, i).second) {
-      return CompileError("duplicate logical tier name '" + node.name + "'");
-    }
-    if (tier.entry) {
-      entry_tier = i;
-      ++entry_count;
-    }
-    if (tier.members.empty()) {
-      return CompileError("logical tier '" + node.name + "' must not be empty");
-    }
-    if (!std::isfinite(tier.low_watermark) || !std::isfinite(tier.high_watermark) ||
-        !(tier.low_watermark > 0.0 && tier.low_watermark < tier.high_watermark &&
-          tier.high_watermark <= 1.0)) {
-      return CompileError("logical tier '" + node.name +
-                          "' watermarks must satisfy 0 < low < high <= 1");
-    }
-
-    node.members = tier.members;
-    node.trigger = tier.trigger;
-    node.high_watermark = tier.high_watermark;
-    node.low_watermark = tier.low_watermark;
-    node.candidate_policy = tier.candidate_policy;
-    node.promote_on_read = tier.promote_on_read;
-    node.promotion_mode = tier.promotion_mode;
+    node.name = index.names[i];
+    node.members = tiers[i].members;
+    node.offload_to = index.offload_to[i];
+    node.trigger = tiers[i].trigger;
+    node.high_watermark = tiers[i].high_watermark;
+    node.low_watermark = tiers[i].low_watermark;
+    node.promote_on_read = tiers[i].promote_on_read;
+    node.promotion_mode = tiers[i].promotion_mode;
     for (const auto& member : node.members) {
-      if (member.backend_name.empty()) {
-        return CompileError("logical tier '" + node.name + "' has an empty backend name");
-      }
-      if (member.weight == 0) {
-        return CompileError("backend '" + member.backend_name + "' has zero placement weight");
-      }
       const auto* entry = backends.GetEntry(member.backend_name);
       if (entry == nullptr) {
         return CompileError("logical tier '" + node.name + "' references unknown backend '" +
                             member.backend_name + "'");
       }
-      if (!tier_by_backend_name.emplace(member.backend_name, i).second) {
-        return CompileError("backend '" + member.backend_name +
-                            "' belongs to more than one logical tier");
-      }
       tier_by_backend_id.emplace(entry->backend_id, i);
     }
+    for (TierIndex target : node.offload_to) upstream[target].push_back(i);
     nodes.push_back(std::move(node));
   }
-  if (entry_count > 1) return CompileError("logical tier graph has multiple entry tiers");
 
-  std::vector<std::vector<TierIndex>> upstream(tiers.size());
-  for (TierIndex i = 0; i < tiers.size(); ++i) {
-    std::unordered_set<TierIndex> seen;
-    for (const auto& target_name : tiers[i].offload_to) {
-      const auto owner = tier_by_backend_name.find(target_name);
-      const auto named_tier = tier_names.find(target_name);
-      if (owner == tier_by_backend_name.end() && named_tier == tier_names.end()) {
-        return CompileError("logical tier '" + nodes[i].name +
-                            "' has unknown offload target '" + target_name + "'");
-      }
-      const TierIndex target =
-          owner != tier_by_backend_name.end() ? owner->second : named_tier->second;
-      if (target <= i) {
-        return CompileError("logical tier '" + nodes[i].name + "' offload target '" +
-                            target_name + "' must belong to a strictly later tier");
-      }
-      if (seen.insert(target).second) {
-        nodes[i].offload_to.push_back(target);
-        upstream[target].push_back(i);
-      }
-    }
-  }
-
-  auto* graph = new LogicalTierGraph(
-      backends, std::move(nodes), std::move(upstream), std::move(tier_by_backend_name),
-      std::move(tier_by_backend_id), entry_tier);
+  auto* graph = new LogicalTierGraph(backends, std::move(nodes), std::move(upstream),
+                                     std::move(tier_by_backend_id), index.entry_tier);
   return {std::shared_ptr<const LogicalTierGraph>(graph), {}};
-}
-
-std::optional<LogicalTierGraph::TierIndex> LogicalTierGraph::TierIndexForBackendName(
-    std::string_view name) const {
-  const auto it = tier_by_backend_name_.find(std::string(name));
-  return it == tier_by_backend_name_.end() ? std::nullopt
-                                           : std::optional<TierIndex>{it->second};
 }
 
 std::optional<LogicalTierGraph::TierIndex> LogicalTierGraph::TierIndexForBackendId(
@@ -236,22 +172,38 @@ std::map<std::string, LogicalTierCapacity> LogicalTierGraph::CapacitySnapshot() 
   return snapshot;
 }
 
-double LogicalTierGraph::Utilization(TierIndex tier) const {
-  long double total = 0;
-  long double used = 0;
+namespace {
+
+double UtilizationOf(const TierCapacity& capacity) {
+  if (capacity.total_bytes == 0) return 0.0;
+  const uint64_t used =
+      capacity.total_bytes - std::min(capacity.total_bytes, capacity.available_bytes);
+  return static_cast<double>(used) / static_cast<double>(capacity.total_bytes);
+}
+
+}  // namespace
+
+double LogicalTierGraph::MemberUtilization(uint32_t backend_id) const {
+  const auto* backend = backends_->Get(backend_id);
+  return backend == nullptr ? 0.0 : UtilizationOf(backend->Capacity());
+}
+
+double LogicalTierGraph::PeakMemberUtilization(TierIndex tier) const {
+  double peak = 0.0;
   for (const auto& member : NodeAt(tier).members) {
     const auto* backend = backends_->Get(member.backend_name);
     if (backend == nullptr) continue;
-    const TierCapacity capacity = backend->Capacity();
-    total += capacity.total_bytes;
-    used += capacity.total_bytes -
-            std::min(capacity.total_bytes, capacity.available_bytes);
+    peak = std::max(peak, UtilizationOf(backend->Capacity()));
   }
-  return total == 0 ? 0.0 : static_cast<double>(used / total);
+  return peak;
 }
 
 bool LogicalTierGraph::AtOrAbove(TierIndex tier, double watermark) const {
-  return Utilization(tier) >= watermark;
+  return PeakMemberUtilization(tier) >= watermark;
+}
+
+bool LogicalTierGraph::MemberAtOrAbove(uint32_t backend_id, double watermark) const {
+  return MemberUtilization(backend_id) >= watermark;
 }
 
 std::vector<uint32_t> LogicalTierGraph::WeightedMemberOrder(TierIndex tier,

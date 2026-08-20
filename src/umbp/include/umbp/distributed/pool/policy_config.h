@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "umbp/distributed/types.h"
@@ -21,11 +22,6 @@ enum class PoolOffloadTrigger {
 enum class PoolTransitionMode {
   kMove,
   kCopy,
-};
-
-enum class TierCandidatePolicy {
-  kLru,
-  kKeyOrder,
 };
 
 struct PolicyBackendSpec {
@@ -50,7 +46,6 @@ struct LogicalTierConfig {
   double low_watermark = 0.7;
   std::string name;
   bool entry = false;
-  TierCandidatePolicy candidate_policy = TierCandidatePolicy::kLru;
   bool promote_on_read = false;
   PoolTransitionMode promotion_mode = PoolTransitionMode::kCopy;
 };
@@ -61,6 +56,26 @@ struct BackendPolicyConfig {
   uint32_t schema_version = 1;
   std::string entry_tier;
 };
+
+// Everything a caller can learn about a tier list by looking at the list
+// alone: resolved names, which tier owns each backend name, the entry tier,
+// and offload edges resolved to tier indices with duplicates dropped.
+struct LogicalTierIndex {
+  std::vector<std::string> names;
+  std::unordered_map<std::string, size_t> by_name;
+  std::unordered_map<std::string, size_t> by_backend;
+  std::vector<std::vector<size_t>> offload_to;
+  size_t entry_tier = 0;
+  bool entry_flagged = false;
+};
+
+// The single statement of what makes a tier list well formed, shared by the
+// JSON front end, ApplyBackendPolicy, and LogicalTierGraph::Compile so a rule
+// is written once and every entry point holds configs to the same bar. Returns
+// an empty string and fills the index when the list is well formed, otherwise
+// the reason it is not and an index no caller may read.
+std::string IndexLogicalTiers(const std::vector<LogicalTierConfig>& tiers,
+                              LogicalTierIndex* index);
 
 struct BackendPolicyLoadResult {
   std::optional<BackendPolicyConfig> config;

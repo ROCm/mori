@@ -25,11 +25,23 @@ namespace {
 
 void ValidateBatch(const std::vector<std::string>& keys,
                    const std::vector<size_t>& sizes,
-                   const std::vector<bool>& successes) {
-  if (keys.size() != sizes.size() || keys.size() != successes.size()) {
+                   const std::vector<WorkloadTraceOutcome>& outcomes) {
+  if (keys.size() != sizes.size() || keys.size() != outcomes.size()) {
     throw std::invalid_argument(
-        "workload trace batch keys, sizes, and successes must have equal lengths");
+        "workload trace batch keys, sizes, and outcomes must have equal lengths");
   }
+}
+
+::umbp::benchmark::WorkloadEvent::Outcome ToProtoOutcome(WorkloadTraceOutcome outcome) {
+  switch (outcome) {
+    case WorkloadTraceOutcome::kSuccess:
+      return ::umbp::benchmark::WorkloadEvent::OUTCOME_SUCCESS;
+    case WorkloadTraceOutcome::kMiss:
+      return ::umbp::benchmark::WorkloadEvent::OUTCOME_MISS;
+    case WorkloadTraceOutcome::kFailure:
+      return ::umbp::benchmark::WorkloadEvent::OUTCOME_FAILURE;
+  }
+  return ::umbp::benchmark::WorkloadEvent::OUTCOME_UNSPECIFIED;
 }
 
 }  // namespace
@@ -52,84 +64,43 @@ uint64_t WorkloadTraceRecorder::RelativeTimestampNs() const {
           .count());
 }
 
-void WorkloadTraceRecorder::RecordBatchPut(
-    const std::vector<std::string>& keys, const std::vector<size_t>& sizes,
-    const std::vector<bool>& successes) {
-  ValidateBatch(keys, sizes, successes);
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (failed_) return;
-  const uint64_t batch_id = ++next_batch_id_;
-  const uint64_t timestamp_ns = RelativeTimestampNs();
-
-  for (size_t i = 0; i < keys.size(); ++i) {
-    if (!successes[i]) continue;
-
-    const uint64_t operation_id = ++next_operation_id_;
-    ::umbp::benchmark::WorkloadEvent event;
-    event.set_relative_timestamp_ns(timestamp_ns);
-    event.set_client_id(client_id_);
-    event.set_operation_id(operation_id);
-    event.set_operation(::umbp::benchmark::WorkloadEvent::PUT);
-    const std::string recorded_key =
-        keys[i] + "#umbp-v" + std::to_string(operation_id);
-    event.set_key(recorded_key);
-    event.set_value_size(static_cast<uint64_t>(sizes[i]));
-    event.set_batch_id(batch_id);
-    try {
-      writer_.Write(event);
-    } catch (const std::exception& exception) {
-      failed_ = true;
-      error_ = exception.what();
-      return;
-    } catch (...) {
-      failed_ = true;
-      error_ = "unknown workload trace write error";
-      return;
-    }
-    ++event_count_;
-    if (successes[i]) {
-      last_put_ids_[keys[i]] = operation_id;
-      recorded_keys_[keys[i]] = recorded_key;
-    }
+bool WorkloadTraceRecorder::WriteLocked(const ::umbp::benchmark::WorkloadEvent& event) {
+  try {
+    writer_.Write(event);
+  } catch (const std::exception& exception) {
+    failed_ = true;
+    error_ = exception.what();
+    return false;
+  } catch (...) {
+    failed_ = true;
+    error_ = "unknown workload trace write error";
+    return false;
   }
+  ++event_count_;
+  return true;
 }
 
-void WorkloadTraceRecorder::RecordBatchGet(
-    const std::vector<std::string>& keys, const std::vector<size_t>& sizes,
-    const std::vector<bool>& successes) {
-  ValidateBatch(keys, sizes, successes);
+void WorkloadTraceRecorder::RecordBatch(::umbp::benchmark::WorkloadEvent::Operation operation,
+                                       const std::vector<std::string>& keys,
+                                       const std::vector<size_t>& sizes,
+                                       const std::vector<WorkloadTraceOutcome>& outcomes) {
+  ValidateBatch(keys, sizes, outcomes);
   std::lock_guard<std::mutex> lock(mutex_);
   if (failed_) return;
   const uint64_t batch_id = ++next_batch_id_;
   const uint64_t timestamp_ns = RelativeTimestampNs();
 
   for (size_t i = 0; i < keys.size(); ++i) {
-    if (!successes[i]) continue;
-
-    const auto put = last_put_ids_.find(keys[i]);
-    if (put == last_put_ids_.end()) continue;
-    const uint64_t operation_id = put->second;
     ::umbp::benchmark::WorkloadEvent event;
     event.set_relative_timestamp_ns(timestamp_ns);
     event.set_client_id(client_id_);
-    event.set_operation_id(operation_id);
-    event.set_operation(::umbp::benchmark::WorkloadEvent::GET);
-    const auto recorded = recorded_keys_.find(keys[i]);
-    event.set_key(recorded == recorded_keys_.end() ? keys[i] : recorded->second);
+    event.set_operation_id(++next_operation_id_);
+    event.set_operation(operation);
+    event.set_key(keys[i]);
     event.set_value_size(static_cast<uint64_t>(sizes[i]));
     event.set_batch_id(batch_id);
-    try {
-      writer_.Write(event);
-    } catch (const std::exception& exception) {
-      failed_ = true;
-      error_ = exception.what();
-      return;
-    } catch (...) {
-      failed_ = true;
-      error_ = "unknown workload trace write error";
-      return;
-    }
-    ++event_count_;
+    event.set_outcome(ToProtoOutcome(outcomes[i]));
+    if (!WriteLocked(event)) return;
   }
 }
 

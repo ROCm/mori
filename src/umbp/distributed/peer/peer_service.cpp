@@ -264,12 +264,16 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
 
   grpc::Status EvictKey(grpc::ServerContext* /*ctx*/, const ::umbp::EvictKeyRequest* request,
                         ::umbp::EvictKeyResponse* response) override {
-    // Eviction carries no tier either.  A key mirrored across media must be
-    // dropped from ALL of them, so every backend is asked and the freed bytes
-    // are summed per key — master sizes its next eviction round off this total.
+    // Eviction carries no tier either.  Master drives this to reclaim capacity
+    // it measured per (node, tier), so the pool is free to demote where a tier
+    // configures on_evict offload; otherwise a key mirrored across media is
+    // dropped from ALL of them.  Either way the freed bytes are summed per key
+    // — master sizes its next eviction round off this total.
     std::vector<std::string> keys(request->keys().begin(), request->keys().end());
     if (keys.empty()) return grpc::Status::OK;
-    auto evicted = pool_ == nullptr ? std::vector<EvictResult>{} : pool_->Evict(keys);
+    auto evicted = pool_ == nullptr
+                       ? std::vector<EvictResult>{}
+                       : pool_->Evict(keys, PoolEvictMode::kReclaim);
     for (size_t i = 0; i < keys.size(); ++i) {
       auto* entry = response->add_evicted();
       entry->set_key(keys[i]);

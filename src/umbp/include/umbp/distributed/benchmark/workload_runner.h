@@ -41,7 +41,6 @@ struct OperationMetrics {
   uint64_t attempted = 0;
   uint64_t succeeded = 0;
   uint64_t failed = 0;
-  uint64_t attempted_bytes = 0;
   uint64_t succeeded_bytes = 0;
 };
 
@@ -59,6 +58,11 @@ struct WorkloadMetrics {
   OperationMetrics gets;
   uint64_t get_misses = 0;
   uint64_t get_validation_failures = 0;
+  // What the trace says the recorded system answered, so a replay can be read
+  // against the run it came from instead of being assumed to start from a
+  // perfect hit rate.
+  uint64_t recorded_misses = 0;
+  uint64_t recorded_failures = 0;
   DistributionMetrics latency;
   DistributionMetrics schedule_lag;
 };

@@ -101,20 +101,49 @@ TEST(BackendPolicyConfig, RejectsInvalidSchemaAndBackwardEdges) {
   )json");
   EXPECT_FALSE(backward.ok());
   EXPECT_NE(backward.error.find("strictly later tier"), std::string::npos);
-}
 
-TEST(BackendPolicyConfig, ApplyIsAtomicOnExpansionFailure) {
-  auto loaded = LoadBackendPolicyJson(R"json(
+  // Tier invariants live in the shared validator rather than in the JSON
+  // parser, so these two pin the wiring that runs it on the loading path.
+  auto watermarks = LoadBackendPolicyJson(R"json(
+    {"backends":{"d":{"type":"dram","capacity":"1GiB"}},
+     "tiers":[{"backends":{"d":1},"high_watermark":0.2,"low_watermark":0.9}]}
+  )json");
+  EXPECT_FALSE(watermarks.ok());
+  EXPECT_NE(watermarks.error.find("watermarks must satisfy"), std::string::npos);
+
+  auto shared_backend = LoadBackendPolicyJson(R"json(
+    {"backends":{"d":{"type":"dram","capacity":"1GiB"}},
+     "tiers":[{"backends":{"d":1}},{"backends":{"d":1}}]}
+  )json");
+  EXPECT_FALSE(shared_backend.ok());
+  EXPECT_NE(shared_backend.error.find("more than one tier"), std::string::npos);
+
+  // Loading and applying share one validator, so a topology that cannot be
+  // expanded is rejected by whichever entry point sees it first.
+  auto tiny_hbm = LoadBackendPolicyJson(R"json(
     {"backends":{"h":{"type":"hbm","capacity":"1B","devices":[0,1]}},
      "tiers":[{"backends":{"h":1}}]}
+  )json");
+  EXPECT_FALSE(tiny_hbm.ok());
+  EXPECT_NE(tiny_hbm.error.find("per-device capacity"), std::string::npos);
+}
+
+TEST(BackendPolicyConfig, ApplyIsAtomicWhenLoweringFails) {
+  auto loaded = LoadBackendPolicyJson(R"json(
+    {"backends":{"d":{"type":"dram","capacity":"1MiB"}},
+     "tiers":[{"backends":{"d":1}}]}
   )json");
   ASSERT_TRUE(loaded.ok()) << loaded.error;
 
   PoolClientConfig output;
+  // Only Apply can reject this: whether a capacity is usable depends on the
+  // page size of the client the policy is being applied to.
+  output.dram_page_size = 2ULL << 20;
   output.backends.push_back(BackendInstanceConfig{});
   output.backends.front().name = "unchanged";
   std::string error;
   EXPECT_FALSE(ApplyBackendPolicy(*loaded.config, &output, &error));
+  EXPECT_NE(error.find("smaller than page size"), std::string::npos);
   ASSERT_EQ(output.backends.size(), 1u);
   EXPECT_EQ(output.backends.front().name, "unchanged");
 }

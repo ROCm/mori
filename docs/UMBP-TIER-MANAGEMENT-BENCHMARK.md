@@ -17,17 +17,16 @@ The benchmark is a manual target and is not run by plain `ctest`.
 
 ## Run, generate, and replay
 
-Run a weighted DRAM workload:
+Run a workload against the default topology, one DRAM backend per peer:
 
 ```bash
 ./build/src/umbp/umbp_tier_bench run \
   --profile mixed --clients 4 --operations 10000 --keys 2000 \
   --read-ratio 0.7 --min-value-bytes 4096 --max-value-bytes 4096 \
-  --qps 20000 --placement weighted --backends-per-peer 2 \
-  --placement-weights 1,3
+  --qps 20000 --backend-capacity 2GiB
 ```
 
-Generate a reusable trace and replay it under another policy:
+Generate a reusable trace and replay it under a policy:
 
 ```bash
 ./build/src/umbp/umbp_tier_bench generate \
@@ -35,16 +34,16 @@ Generate a reusable trace and replay it under another policy:
   --operations 100000 --keys 10000 --clients 8 --qps 50000
 
 ./build/src/umbp/umbp_tier_bench replay \
-  --trace workload.umbptrace --placement weighted \
-  --backends-per-peer 2 --placement-weights 1,3
+  --trace workload.umbptrace --config policy.json
 ```
 
 Use `umbp_tier_bench <subcommand> --help` for the complete option list.
 
 ## JSON backend and tier policy
 
-`--config` replaces the legacy `--tier`, `--backends-per-peer`,
-`--placement`, and `--placement-weights` cluster topology:
+Anything beyond one DRAM backend per peer — several backends, other media,
+weights, logical tiers, watermarks — is described by `--config`, which is the
+same policy format the product reads:
 
 ```bash
 ./build/src/umbp/umbp_tier_bench run --config policy.json \
@@ -74,8 +73,7 @@ Use `umbp_tier_bench <subcommand> --help` for the complete option list.
       "offload_to": ["cold"],
       "offload_trigger": "watermark",
       "high_watermark": 0.9,
-      "low_watermark": 0.7,
-      "candidate_policy": "lru"
+      "low_watermark": 0.7
     },
     {
       "name": "cold",

@@ -223,7 +223,7 @@ TEST(WorkloadTraceTest, CapacityPressureUsesUniqueWritesAndBatchTimestamps) {
   EXPECT_EQ(keys.size(), config.operation_count);
 }
 
-TEST(WorkloadTraceRecorderTest, VersionsOverwritesAndLinksGets) {
+TEST(WorkloadTraceRecorderTest, KeepsKeysVerbatimAndRecordsEveryOutcome) {
   const std::string path = TempPath(".trace");
   {
     WorkloadTraceRecorderOptions options;
@@ -231,10 +231,12 @@ TEST(WorkloadTraceRecorderTest, VersionsOverwritesAndLinksGets) {
     options.client_id = 7;
     options.seed = 42;
     WorkloadTraceRecorder recorder(std::move(options));
-    recorder.RecordBatchPut({"key"}, {64}, {true});
-    recorder.RecordBatchPut({"key"}, {64}, {true});
-    recorder.RecordBatchGet({"key", "missing"}, {64, 64}, {true, true});
-    EXPECT_EQ(recorder.event_count(), 3u);
+    recorder.RecordBatchPut({"key"}, {64}, {WorkloadTraceOutcome::kSuccess});
+    recorder.RecordBatchPut({"key"}, {64}, {WorkloadTraceOutcome::kSuccess});
+    recorder.RecordBatchPut({"full"}, {64}, {WorkloadTraceOutcome::kFailure});
+    recorder.RecordBatchGet({"key", "missing"}, {64, 64},
+                            {WorkloadTraceOutcome::kSuccess, WorkloadTraceOutcome::kMiss});
+    EXPECT_EQ(recorder.event_count(), 5u);
     recorder.Close();
   }
 
@@ -242,12 +244,21 @@ TEST(WorkloadTraceRecorderTest, VersionsOverwritesAndLinksGets) {
   std::vector<::umbp::benchmark::WorkloadEvent> events;
   ::umbp::benchmark::WorkloadEvent event;
   while (reader.ReadNext(&event)) events.push_back(event);
-  ASSERT_EQ(events.size(), 3u);
-  EXPECT_NE(events[0].key(), events[1].key());
-  EXPECT_EQ(events[2].key(), events[1].key());
-  EXPECT_EQ(events[2].operation_id(), events[1].operation_id());
+  ASSERT_EQ(events.size(), 5u);
+  // The overwrite is two writes of one key, which is what makes it an
+  // overwrite; a versioned key would replay as two unrelated objects.
+  EXPECT_EQ(events[0].key(), "key");
+  EXPECT_EQ(events[1].key(), "key");
+  EXPECT_EQ(events[2].key(), "full");
+  EXPECT_EQ(events[2].outcome(), ::umbp::benchmark::WorkloadEvent::OUTCOME_FAILURE);
+  EXPECT_EQ(events[3].key(), "key");
+  EXPECT_EQ(events[3].outcome(), ::umbp::benchmark::WorkloadEvent::OUTCOME_SUCCESS);
+  // A GET for a key this client never wrote is still traffic the tiers saw.
+  EXPECT_EQ(events[4].key(), "missing");
+  EXPECT_EQ(events[4].outcome(), ::umbp::benchmark::WorkloadEvent::OUTCOME_MISS);
+  EXPECT_EQ(events[3].batch_id(), events[4].batch_id());
   EXPECT_LE(events[0].relative_timestamp_ns(), events[1].relative_timestamp_ns());
-  EXPECT_LE(events[1].relative_timestamp_ns(), events[2].relative_timestamp_ns());
+  EXPECT_LE(events[1].relative_timestamp_ns(), events[3].relative_timestamp_ns());
   std::filesystem::remove(path);
 }
 

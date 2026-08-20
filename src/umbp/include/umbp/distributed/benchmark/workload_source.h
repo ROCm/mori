@@ -22,7 +22,7 @@ class WorkloadSource {
 
 class TraceWorkloadSource final : public WorkloadSource {
  public:
-  explicit TraceWorkloadSource(const std::string& path, TraceLimits limits = {});
+  explicit TraceWorkloadSource(const std::string& path);
 
   uint64_t seed() const override { return reader_.header().seed(); }
   bool Next(::umbp::benchmark::WorkloadEvent* event) override;

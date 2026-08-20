@@ -48,10 +48,14 @@ enum class TierType : int {
 //
 // A backend id is the other half of a buffer address (see BufferMemoryDescBytes)
 // and the registry hands them out densely from 0, so this is also the width of
-// the reader's per-backend buffer shelves.  One per TierType is all the registry
-// can hold today; the slack is headroom for a registry that allows two backends
-// on one tier.
-inline constexpr uint32_t kMaxBackendsPerPeer = 8;
+// the reader's per-backend buffer shelves.
+//
+// Sized for the topology a logical tier policy expands into rather than for one
+// backend per TierType: an 8-GPU node whose HBM is declared once expands to
+// eight instances, and a policy that also names hot and warm DRAM plus a pair of
+// SSDs lands at twelve.  The shelves are vectors, so unused ids cost a pointer
+// triple each.
+inline constexpr uint32_t kMaxBackendsPerPeer = 16;
 
 struct TierCapacity {
   uint64_t total_bytes = 0;

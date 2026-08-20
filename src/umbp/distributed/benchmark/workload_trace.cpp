@@ -13,6 +13,14 @@ namespace {
 constexpr std::array<char, 8> kMagic = {'U', 'M', 'B', 'P', 'T', 'R', 'C', 'E'};
 constexpr uint32_t kEnvelopeVersion = 1;
 
+// Ceilings that stop a truncated or hostile trace from being read into
+// unbounded memory. Fixed on purpose: a per-instance limit was threaded through
+// every reader and writer and no caller ever set anything but the defaults.
+constexpr size_t kMaxHeaderBytes = 1 << 20;
+constexpr size_t kMaxEventBytes = 2 << 20;
+constexpr size_t kMaxKeyBytes = 1 << 20;
+constexpr uint64_t kMaxValueBytes = uint64_t{1} << 40;
+
 void WriteU32(std::ostream* stream, uint32_t value) {
   std::array<char, 4> bytes{};
   for (size_t i = 0; i < bytes.size(); ++i) {
@@ -40,16 +48,16 @@ void ValidateHeader(const ::umbp::benchmark::WorkloadTraceHeader& header) {
   }
 }
 
-void ValidateEvent(const ::umbp::benchmark::WorkloadEvent& event, const TraceLimits& limits) {
+void ValidateEvent(const ::umbp::benchmark::WorkloadEvent& event) {
   if (event.operation() != ::umbp::benchmark::WorkloadEvent::PUT &&
       event.operation() != ::umbp::benchmark::WorkloadEvent::GET) {
     throw TraceError("workload event has an invalid operation");
   }
   if (event.key().empty()) throw TraceError("workload event has an empty key");
-  if (event.key().size() > limits.max_key_bytes) {
+  if (event.key().size() > kMaxKeyBytes) {
     throw TraceError("workload event key exceeds configured limit");
   }
-  if (event.value_size() > limits.max_value_bytes) {
+  if (event.value_size() > kMaxValueBytes) {
     throw TraceError("workload event value exceeds configured limit");
   }
 }
@@ -57,15 +65,14 @@ void ValidateEvent(const ::umbp::benchmark::WorkloadEvent& event, const TraceLim
 }  // namespace
 
 TraceWriter::TraceWriter(const std::string& path,
-                         const ::umbp::benchmark::WorkloadTraceHeader& header,
-                         TraceLimits limits)
-    : stream_(path, std::ios::binary | std::ios::trunc), limits_(limits) {
+                         const ::umbp::benchmark::WorkloadTraceHeader& header)
+    : stream_(path, std::ios::binary | std::ios::trunc) {
   if (!stream_) throw TraceError("failed to open workload trace for writing: " + path);
   ValidateHeader(header);
   stream_.write(kMagic.data(), kMagic.size());
   WriteU32(&stream_, kEnvelopeVersion);
   if (!stream_) throw TraceError("failed to write workload trace envelope");
-  WriteRecord(header, limits_.max_header_bytes);
+  WriteRecord(header, kMaxHeaderBytes);
 }
 
 TraceWriter::~TraceWriter() {
@@ -91,8 +98,8 @@ void TraceWriter::WriteRecord(const google::protobuf::MessageLite& record, size_
 
 void TraceWriter::Write(const ::umbp::benchmark::WorkloadEvent& event) {
   if (closed_) throw TraceError("cannot write to a closed workload trace");
-  ValidateEvent(event, limits_);
-  WriteRecord(event, limits_.max_event_bytes);
+  ValidateEvent(event);
+  WriteRecord(event, kMaxEventBytes);
 }
 
 void TraceWriter::Close() {
@@ -104,8 +111,7 @@ void TraceWriter::Close() {
   closed_ = true;
 }
 
-TraceReader::TraceReader(const std::string& path, TraceLimits limits)
-    : stream_(path, std::ios::binary), limits_(limits) {
+TraceReader::TraceReader(const std::string& path) : stream_(path, std::ios::binary) {
   if (!stream_) throw TraceError("failed to open workload trace for reading: " + path);
 
   std::array<char, kMagic.size()> magic{};
@@ -123,7 +129,7 @@ TraceReader::TraceReader(const std::string& path, TraceLimits limits)
     throw TraceError("unsupported workload trace envelope version: " +
                      std::to_string(envelope_version));
   }
-  ReadRecord(&header_, limits_.max_header_bytes, false);
+  ReadRecord(&header_, kMaxHeaderBytes, false);
   ValidateHeader(header_);
 }
 
@@ -153,8 +159,8 @@ bool TraceReader::ReadRecord(google::protobuf::MessageLite* record, size_t max_b
 bool TraceReader::ReadNext(::umbp::benchmark::WorkloadEvent* event) {
   if (event == nullptr) throw std::invalid_argument("event must not be null");
   event->Clear();
-  if (!ReadRecord(event, limits_.max_event_bytes, true)) return false;
-  ValidateEvent(*event, limits_);
+  if (!ReadRecord(event, kMaxEventBytes, true)) return false;
+  ValidateEvent(*event);
   return true;
 }
 

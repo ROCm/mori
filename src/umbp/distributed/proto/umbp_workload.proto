@@ -23,6 +23,20 @@ message WorkloadEvent {
     GET = 2;
   }
 
+  // What the recorded system answered. This is provenance, not an instruction:
+  // a replay reissues the operation regardless and reports its own result, so
+  // the two can be compared. Traces written before this field existed leave it
+  // unspecified, which readers must treat as "not recorded" rather than as a
+  // failure.
+  enum Outcome {
+    OUTCOME_UNSPECIFIED = 0;
+    OUTCOME_SUCCESS = 1;
+    // A GET that found nothing. Kept in the trace because dropping misses
+    // rewrites the workload into one with a perfect hit rate.
+    OUTCOME_MISS = 2;
+    OUTCOME_FAILURE = 3;
+  }
+
   uint64 relative_timestamp_ns = 1;
   uint32 client_id = 2;
   uint64 operation_id = 3;
@@ -30,4 +44,5 @@ message WorkloadEvent {
   string key = 5;
   uint64 value_size = 6;
   uint64 batch_id = 7;
+  Outcome outcome = 8;
 }

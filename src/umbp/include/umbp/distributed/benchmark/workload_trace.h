@@ -16,13 +16,6 @@ namespace mori::umbp::benchmark {
 
 inline constexpr uint32_t kWorkloadTraceSchemaVersion = 1;
 
-struct TraceLimits {
-  size_t max_header_bytes = 1 << 20;
-  size_t max_event_bytes = 2 << 20;
-  size_t max_key_bytes = 1 << 20;
-  uint64_t max_value_bytes = uint64_t{1} << 40;
-};
-
 // Errors caused by I/O, a malformed trace, or an unsupported version.
 class TraceError : public std::runtime_error {
  public:
@@ -31,8 +24,7 @@ class TraceError : public std::runtime_error {
 
 class TraceWriter {
  public:
-  TraceWriter(const std::string& path, const ::umbp::benchmark::WorkloadTraceHeader& header,
-              TraceLimits limits = {});
+  TraceWriter(const std::string& path, const ::umbp::benchmark::WorkloadTraceHeader& header);
   ~TraceWriter();
 
   TraceWriter(const TraceWriter&) = delete;
@@ -45,13 +37,12 @@ class TraceWriter {
   void WriteRecord(const google::protobuf::MessageLite& record, size_t max_bytes);
 
   std::ofstream stream_;
-  TraceLimits limits_;
   bool closed_ = false;
 };
 
 class TraceReader {
  public:
-  explicit TraceReader(const std::string& path, TraceLimits limits = {});
+  explicit TraceReader(const std::string& path);
 
   const ::umbp::benchmark::WorkloadTraceHeader& header() const { return header_; }
 
@@ -62,7 +53,6 @@ class TraceReader {
   bool ReadRecord(google::protobuf::MessageLite* record, size_t max_bytes, bool allow_eof);
 
   std::ifstream stream_;
-  TraceLimits limits_;
   ::umbp::benchmark::WorkloadTraceHeader header_;
 };
 

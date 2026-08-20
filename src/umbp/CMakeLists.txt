@@ -363,11 +363,12 @@ add_library(
   ${UMBP_STANDALONE_PROTO_SRCS}
   ${UMBP_STANDALONE_GRPC_SRCS}
   ${UMBP_WORKLOAD_PROTO_SRCS}
-  distributed/benchmark/payload.cpp
+  # Trace capture is a client feature: PoolClient records live traffic when
+  # UMBP_WORKLOAD_TRACE_PATH is set, so the writer ships with the library. The
+  # rest of the workload harness drives benchmarks and lives in
+  # umbp_workload_bench instead.
   distributed/benchmark/workload_trace.cpp
   distributed/benchmark/workload_trace_recorder.cpp
-  distributed/benchmark/workload_source.cpp
-  distributed/benchmark/workload_runner.cpp
   distributed/master/in_memory_master_metadata_store.cpp
   distributed/master/master_metadata_store_factory.cpp
   distributed/master/master_server.cpp
@@ -510,6 +511,19 @@ set_target_properties(umbp_client PROPERTIES BUILD_RPATH "$ORIGIN"
                                              INSTALL_RPATH "$ORIGIN"
                                              BUILD_WITH_INSTALL_RPATH TRUE)
 
+# ---------- Workload harness for benchmarks ----------------------------------
+# Generates synthetic workloads, replays traces, and drives them against a
+# client. Nothing in the data path needs it, so it stays out of umbp_common and
+# is linked only by the benchmark tool and the tests that exercise it.
+add_library(
+  umbp_workload_bench STATIC
+  distributed/benchmark/payload.cpp
+  distributed/benchmark/workload_source.cpp
+  distributed/benchmark/workload_runner.cpp)
+add_dependencies(umbp_workload_bench umbp_workload_proto)
+target_link_libraries(umbp_workload_bench PUBLIC umbp_common)
+target_compile_features(umbp_workload_bench PUBLIC cxx_std_17)
+
 # ---------- Distributed tier-management benchmark ---------------------------
 # Manual synthetic/trace-replay tool. It starts an in-process master and real
 # PoolClients, so it exercises routing, peer placement, transfer, heartbeat,
@@ -519,7 +533,8 @@ add_dependencies(umbp_tier_bench umbp_workload_proto)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_link_options(umbp_tier_bench PRIVATE -Wl,--no-as-needed)
 endif()
-target_link_libraries(umbp_tier_bench PRIVATE umbp_common ${_PROTOBUF_LIBS}
+target_link_libraries(umbp_tier_bench PRIVATE umbp_workload_bench
+                                               ${_PROTOBUF_LIBS}
                                                ${_GRPCPP_LIB})
 set_target_properties(umbp_tier_bench PROPERTIES BUILD_RPATH "$ORIGIN"
                                                   INSTALL_RPATH "$ORIGIN"

@@ -25,11 +25,8 @@ OperationMetrics& MetricsFor(Event::Operation operation, WorkloadMetrics* metric
 }
 
 void AddAttempt(const Event& event, WorkloadMetrics* metrics) {
-  OperationMetrics& operation = MetricsFor(event.operation(), metrics);
-  ++operation.attempted;
-  operation.attempted_bytes += event.value_size();
+  ++MetricsFor(event.operation(), metrics).attempted;
   ++metrics->total.attempted;
-  metrics->total.attempted_bytes += event.value_size();
 }
 
 void AddResult(const Event& event, bool success, WorkloadMetrics* metrics) {
@@ -49,7 +46,6 @@ void MergeOperation(const OperationMetrics& source, OperationMetrics* destinatio
   destination->attempted += source.attempted;
   destination->succeeded += source.succeeded;
   destination->failed += source.failed;
-  destination->attempted_bytes += source.attempted_bytes;
   destination->succeeded_bytes += source.succeeded_bytes;
 }
 
@@ -132,10 +128,13 @@ WorkloadRunner::WorkloadRunner(WorkloadClient* client, WorkloadRunnerOptions opt
 WorkloadMetrics WorkloadRunner::Run(WorkloadSource* source) {
   if (source == nullptr) throw std::invalid_argument("source must not be null");
 
+  WorkloadMetrics metrics;
   std::map<uint32_t, std::vector<Event>> client_events;
   std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> put_identity;
   Event event;
   while (source->Next(&event)) {
+    if (event.outcome() == Event::OUTCOME_MISS) ++metrics.recorded_misses;
+    if (event.outcome() == Event::OUTCOME_FAILURE) ++metrics.recorded_failures;
     if (event.operation() != Event::PUT && event.operation() != Event::GET) {
       throw std::invalid_argument("workload source produced an invalid operation");
     }
@@ -145,7 +144,11 @@ WorkloadMetrics WorkloadRunner::Run(WorkloadSource* source) {
     if (event.value_size() > std::numeric_limits<size_t>::max()) {
       throw std::length_error("workload value does not fit in size_t");
     }
-    if (event.operation() == Event::PUT) {
+    // Payload validation derives the expected bytes from (key, operation_id),
+    // which only works if a key is written once. A recorded production trace
+    // legitimately overwrites keys, so the invariant applies to generated
+    // traces being validated, not to replay in general.
+    if (event.operation() == Event::PUT && options_.validate_get_payloads) {
       const auto [found, inserted] =
           put_identity.emplace(event.key(),
                                std::make_pair(event.operation_id(), event.value_size()));
@@ -169,7 +172,6 @@ WorkloadMetrics WorkloadRunner::Run(WorkloadSource* source) {
 
   const auto start = Clock::now();
   const uint64_t payload_seed = source->seed();
-  WorkloadMetrics metrics;
   std::mutex metrics_mutex;
   std::exception_ptr worker_error;
   std::vector<std::thread> workers;

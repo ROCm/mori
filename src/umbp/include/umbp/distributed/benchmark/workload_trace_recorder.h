@@ -7,7 +7,6 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include "umbp/distributed/benchmark/workload_trace.h"
@@ -22,6 +21,14 @@ struct WorkloadTraceRecorderOptions {
   std::string backend_policy;
 };
 
+// How the recorded system answered an operation. A miss is distinct from a
+// failure because only one of them says something about the cache.
+enum class WorkloadTraceOutcome {
+  kSuccess,
+  kMiss,
+  kFailure,
+};
+
 class WorkloadTraceRecorder {
  public:
   using Options = WorkloadTraceRecorderOptions;
@@ -32,26 +39,39 @@ class WorkloadTraceRecorder {
   WorkloadTraceRecorder(const WorkloadTraceRecorder&) = delete;
   WorkloadTraceRecorder& operator=(const WorkloadTraceRecorder&) = delete;
 
+  // Records every attempted operation, keys verbatim. A trace that keeps only
+  // the operations that succeeded, or that rewrites keys to make each write
+  // unique, is no longer the workload that ran: the reuse and overwrite
+  // patterns that decide what a tier policy does are exactly what those
+  // transformations remove.
   void RecordBatchPut(const std::vector<std::string>& keys,
                       const std::vector<size_t>& sizes,
-                      const std::vector<bool>& successes);
+                      const std::vector<WorkloadTraceOutcome>& outcomes) {
+    RecordBatch(::umbp::benchmark::WorkloadEvent::PUT, keys, sizes, outcomes);
+  }
   void RecordBatchGet(const std::vector<std::string>& keys,
                       const std::vector<size_t>& sizes,
-                      const std::vector<bool>& successes);
+                      const std::vector<WorkloadTraceOutcome>& outcomes) {
+    RecordBatch(::umbp::benchmark::WorkloadEvent::GET, keys, sizes, outcomes);
+  }
   void Close();
   uint64_t event_count() const;
 
  private:
   using Clock = std::chrono::steady_clock;
 
+  void RecordBatch(::umbp::benchmark::WorkloadEvent::Operation operation,
+                   const std::vector<std::string>& keys, const std::vector<size_t>& sizes,
+                   const std::vector<WorkloadTraceOutcome>& outcomes);
+
   uint64_t RelativeTimestampNs() const;
+
+  bool WriteLocked(const ::umbp::benchmark::WorkloadEvent& event);
 
   const uint32_t client_id_;
   mutable std::mutex mutex_;
   TraceWriter writer_;
   const Clock::time_point start_;
-  std::unordered_map<std::string, uint64_t> last_put_ids_;
-  std::unordered_map<std::string, std::string> recorded_keys_;
   uint64_t next_operation_id_ = 0;
   uint64_t next_batch_id_ = 0;
   uint64_t event_count_ = 0;
