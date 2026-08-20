@@ -118,39 +118,62 @@ jobs:
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
           chmod +x "$SCRIPT"
 
-          # Shared workload for C++ bench_engine and Python benchmark.py.
           # batch=1: 512 iters (chunking ON by default; no --batch-contiguous).
-          # batch=64: 128 iters.
-          COMMON="--op-type write --mem-type gpu --all \
+          # batch=64: tuned write sweep (batch-contiguous, disable-chunking, 8 workers).
+          COMMON_BATCH1="--op-type write --mem-type gpu --all \
             --sweep-start-size 1048576 --sweep-max-size 33554432 --sweep-step 1048576 \
             --num-qp-per-transfer 8 --enable-sess --poll_cq_mode polling \
             --num-initiator-dev 1 --num-target-dev 1 --target-dev-offset 0 \
             --log-level info"
 
+          BATCH64_CPP="--op write --mem-type gpu --gpu 0 --target-dev-offset 0 \
+            --all --sweep-start-size 1048576 --sweep-max-size 33554432 --sweep-step 1048576 \
+            --transfer-batch-size 64 --enable-batch-transfer --batch-contiguous \
+            --enable-sess --disable-chunking \
+            --num-qp-per-transfer 8 --num-worker-threads 8 \
+            --num-initiator-dev 1 --num-target-dev 1 \
+            --poll_cq_mode polling --iters 128 --warmup-iters 10 \
+            --log-level info"
+
+          BATCH64_PY="--op-type write --mem-type gpu --target-dev-offset 0 \
+            --all --sweep-start-size 1048576 --sweep-max-size 33554432 --sweep-step 1048576 \
+            --transfer-batch-size 64 --enable-batch-transfer --batch-contiguous \
+            --enable-sess --disable-chunking \
+            --num-qp-per-transfer 8 --num-worker-threads 8 \
+            --num-initiator-dev 1 --num-target-dev 1 \
+            --poll_cq_mode polling --iters 128 --warmup-iters 10 \
+            --log-level info"
+
           CPP_PORT=29130
           PY_PORT=29230
           for BATCH in 1 64; do
-            ITERS=128
-            if [ "$BATCH" -eq 1 ]; then ITERS=512; fi
-            ARGS="$COMMON --transfer-batch-size $BATCH --iters $ITERS"
+            if [ "$BATCH" -eq 1 ]; then
+              ITERS=512
+              CPP_ARGS="$COMMON_BATCH1 --transfer-batch-size 1 --iters $ITERS"
+              CPP_RENDEZ="--target-dev-offset 0 --warmup-iters 10"
+              PY_ARGS="$CPP_ARGS --enable-batch-transfer"
+            else
+              CPP_ARGS="$BATCH64_CPP"
+              CPP_RENDEZ=""
+              PY_ARGS="$BATCH64_PY"
+            fi
 
-            echo "=== C++ bench_engine GPU write sweep, batch=$BATCH, iters=$ITERS, port=$CPP_PORT ===" \
+            echo "=== C++ bench_engine GPU write sweep, batch=$BATCH, port=$CPP_PORT ===" \
               | tee -a "$CPP_RESULTS"
             R1="cd $GITHUB_WORKSPACE && MORI_DISABLE_AUTO_XGMI=1 $LDP $BIN \
               --rank 1 --master-ip $NODE1_HOST --self-ip $NODE2_HOST --port $CPP_PORT \
-              --target-dev-offset 0 --warmup-iters 10 $ARGS"
+              $CPP_RENDEZ $CPP_ARGS"
             R0="cd $GITHUB_WORKSPACE && MORI_DISABLE_AUTO_XGMI=1 $LDP $BIN \
               --rank 0 --master-ip $NODE1_HOST --self-ip $NODE1_HOST --port $CPP_PORT \
-              --target-dev-offset 0 --warmup-iters 10 $ARGS"
+              $CPP_RENDEZ $CPP_ARGS"
             ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
               "$CT exec $CONTAINER bash -c \"$R1\"" >> "$CPP_RESULTS" 2>&1 &
             $CT exec $CONTAINER bash -c "$R0" | tee -a "$CPP_RESULTS"
             wait
             CPP_PORT=$((CPP_PORT + 1))
 
-            echo "=== Python benchmark.py GPU write sweep, batch=$BATCH, iters=$ITERS, port=$PY_PORT ===" \
+            echo "=== Python benchmark.py GPU write sweep, batch=$BATCH, port=$PY_PORT ===" \
               | tee -a "$PY_RESULTS"
-            PY_ARGS="$ARGS --enable-batch-transfer"
             NODE2_CMD=(
               $CT exec -e MORI_DISABLE_AUTO_XGMI=1 $CONTAINER bash $SCRIPT
               --rank 1 --master-addr $NODE1_HOST --master-port $PY_PORT
