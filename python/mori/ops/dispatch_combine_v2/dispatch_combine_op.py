@@ -795,6 +795,7 @@ class EpDispatchCombineOp:
         half, so one rank resetting alone would leave the two disagreeing."""
         self.arena.zero()
         self.token_dest_map.fill_(-1)
+        self.routing_dest_map.fill_(self._null_flat)
         self.dest_pe_counter.zero_()
         self.dispatch_barrier.zero_()
         self.combine_barrier.zero_()
