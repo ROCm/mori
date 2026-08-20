@@ -34,6 +34,7 @@
 #include <string>
 #include <vector>
 
+#include "mori/application/transport/rdma/providers/bnxt/bnxt.hpp"
 #include "mori/application/transport/rdma/providers/ionic/ionic.hpp"
 #include "mori/application/transport/rdma/providers/mlx5/mlx5.hpp"
 #include "mori/application/transport/sdma/anvil.hpp"
@@ -444,6 +445,7 @@ void Context::BuildAndConnectInitialEndpoints() {
                              peerToLocalEpHandles[epIndex], qp);
         auto* ionic = dynamic_cast<IonicDeviceContext*>(ctx);
         auto* mlx5 = dynamic_cast<Mlx5DeviceContext*>(ctx);
+        auto* bnxt = dynamic_cast<BnxtDeviceContext*>(ctx);
         if (ionic) {
           auto ri = ionic->GetProxyRecvInfo(rdmaEps[epIndex].handle.qpn);
           rdmaEps[epIndex].ibvHandle.recvBuf = ri.buf;
@@ -451,6 +453,11 @@ void Context::BuildAndConnectInitialEndpoints() {
           rdmaEps[epIndex].ibvHandle.recvCount = ri.count;
         } else if (mlx5) {
           auto ri = mlx5->GetProxyRecvInfo(rdmaEps[epIndex].handle.qpn);
+          rdmaEps[epIndex].ibvHandle.recvBuf = ri.buf;
+          rdmaEps[epIndex].ibvHandle.recvLkey = ri.lkey;
+          rdmaEps[epIndex].ibvHandle.recvCount = ri.count;
+        } else if (bnxt) {
+          auto ri = bnxt->GetProxyRecvInfo(rdmaEps[epIndex].handle.qpn);
           rdmaEps[epIndex].ibvHandle.recvBuf = ri.buf;
           rdmaEps[epIndex].ibvHandle.recvLkey = ri.lkey;
           rdmaEps[epIndex].ibvHandle.recvCount = ri.count;
