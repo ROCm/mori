@@ -128,7 +128,7 @@ jobs:
           BATCH64_CPP="--op write --mem-type gpu --gpu 0 --target-dev-offset 0 \
             --all --sweep-start-size 268435456 --sweep-max-size 536870912 --sweep-step 67108864 \
             --transfer-batch-size 64 --enable-batch-transfer --batch-contiguous \
-            --enable-sess --disable-chunking \
+            --enable-sess \
             --num-qp-per-transfer 8 --num-worker-threads 8 \
             --num-initiator-dev 1 --num-target-dev 1 \
             --poll_cq_mode polling --iters 128 --warmup-iters 10 \
@@ -137,7 +137,7 @@ jobs:
           BATCH64_PY="--op-type write --mem-type gpu --target-dev-offset 0 \
             --all --sweep-start-size 268435456 --sweep-max-size 536870912 --sweep-step 67108864 \
             --transfer-batch-size 64 --enable-batch-transfer --batch-contiguous \
-            --enable-sess --disable-chunking \
+            --enable-sess \
             --num-qp-per-transfer 8 --num-worker-threads 8 \
             --num-initiator-dev 1 --num-target-dev 1 \
             --poll_cq_mode polling --iters 128 --warmup-iters 10 \
