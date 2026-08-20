@@ -118,39 +118,32 @@ jobs:
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
           chmod +x "$SCRIPT"
 
-          # Sweep: 128 MiB .. 512 MiB by 32 MiB (134217728, step 33554432).
-          COMMON_BATCH1="--op-type write --mem-type gpu --all \
-            --sweep-start-size 134217728 --sweep-max-size 536870912 --sweep-step 33554432 \
-            --num-qp-per-transfer 8 --num-worker-threads 8 --enable-sess --poll_cq_mode polling \
+          # Sweep: 1 MiB .. 32 MiB by 1 MiB; 4 QP, chunking off, 4 workers, batch-contiguous.
+          SWEEP="--all --sweep-start-size 1048576 --sweep-max-size 33554432 --sweep-step 1048576 \
+            --disable-chunking --batch-contiguous \
+            --num-qp-per-transfer 4 --num-worker-threads 4 --enable-sess --poll_cq_mode polling \
             --num-initiator-dev 1 --num-target-dev 1 --target-dev-offset 0 \
             --log-level info"
 
-          BATCH64_CPP="--op write --mem-type gpu --gpu 0 --target-dev-offset 0 \
-            --all --sweep-start-size 134217728 --sweep-max-size 536870912 --sweep-step 33554432 \
-            --transfer-batch-size 64 --enable-batch-transfer --batch-contiguous \
-            --enable-sess \
-            --num-qp-per-transfer 8 --num-worker-threads 8 \
-            --num-initiator-dev 1 --num-target-dev 1 \
-            --poll_cq_mode polling --iters 128 --warmup-iters 10 \
-            --log-level info"
+          BATCH1_CPP="--op write --mem-type gpu --gpu 0 $SWEEP \
+            --transfer-batch-size 1 --iters 512 --warmup-iters 10"
 
-          BATCH64_PY="--op-type write --mem-type gpu --target-dev-offset 0 \
-            --all --sweep-start-size 134217728 --sweep-max-size 536870912 --sweep-step 33554432 \
-            --transfer-batch-size 64 --enable-batch-transfer --batch-contiguous \
-            --enable-sess \
-            --num-qp-per-transfer 8 --num-worker-threads 8 \
-            --num-initiator-dev 1 --num-target-dev 1 \
-            --poll_cq_mode polling --iters 128 --warmup-iters 10 \
-            --log-level info"
+          BATCH1_PY="--op-type write --mem-type gpu $SWEEP \
+            --transfer-batch-size 1 --enable-batch-transfer --iters 512 --warmup-iters 10"
+
+          BATCH64_CPP="--op write --mem-type gpu --gpu 0 $SWEEP \
+            --transfer-batch-size 64 --enable-batch-transfer --iters 128 --warmup-iters 10"
+
+          BATCH64_PY="--op-type write --mem-type gpu $SWEEP \
+            --transfer-batch-size 64 --enable-batch-transfer --iters 128 --warmup-iters 10"
 
           CPP_PORT=29130
           PY_PORT=29230
           for BATCH in 1 64; do
             if [ "$BATCH" -eq 1 ]; then
-              ITERS=512
-              CPP_ARGS="$COMMON_BATCH1 --transfer-batch-size 1 --iters $ITERS"
-              CPP_RENDEZ="--target-dev-offset 0 --warmup-iters 10"
-              PY_ARGS="$CPP_ARGS --enable-batch-transfer"
+              CPP_ARGS="$BATCH1_CPP"
+              CPP_RENDEZ=""
+              PY_ARGS="$BATCH1_PY"
             else
               CPP_ARGS="$BATCH64_CPP"
               CPP_RENDEZ=""
