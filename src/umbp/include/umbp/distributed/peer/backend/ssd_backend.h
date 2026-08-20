@@ -113,6 +113,14 @@ class SsdBackend : public MediumBackend {
     // that cannot get one degrades to a miss (see the class comment).
     uint32_t staging_pages = 64;
 
+    // Back the staging arena with hugetlbfs pages.  Every byte this backend
+    // moves crosses the arena twice (device <-> arena, arena <-> wire), so its
+    // TLB behaviour is on the critical path in a way an ordinary buffer's is
+    // not.  Falls back to 4 KiB pages with a warning when hugepages cannot be
+    // reserved — a failure here must not stop the node coming up.
+    bool staging_use_hugepages = false;
+    uint64_t staging_hugepage_size = 2ULL * 1024 * 1024;
+
     PeerSsdConfig ssd;
 
     std::chrono::milliseconds pending_ttl{30000};
@@ -165,6 +173,10 @@ class SsdBackend : public MediumBackend {
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys) override;
 
   void SetAutoFlushHook(size_t threshold, std::function<void()> cb) override;
+
+  // PeerSsdManager's read/eviction counters plus this class's own staging-arena
+  // counters, as monotonic values.  PoolClient ships the deltas.
+  std::vector<MediumCounter> Counters() const override;
 
   uint64_t PageSize() const override { return cfg_.page_size; }
   std::vector<BufferMemoryDescBytes> AllBufferDescs() const override;
@@ -233,6 +245,13 @@ class SsdBackend : public MediumBackend {
 
   std::atomic<uint64_t> next_slot_id_{1};
   std::atomic<bool> clear_full_sync_pending_{false};
+
+  // Staging-arena observability.  Relaxed atomics, never correctness state.
+  // slot_full_rejects_ is the one to watch: it counts Resolves that reported a
+  // miss for a key this node actually HOLDS, purely because the arena was full
+  // (see the class comment on why exhaustion has to surface that way).
+  std::atomic<uint64_t> slot_full_rejects_{0};
+  std::atomic<uint64_t> staging_expired_reclaims_{0};
   bool initialized_ = false;
   MemoryRegistrar* registrar_ = nullptr;
 

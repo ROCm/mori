@@ -28,6 +28,7 @@
 #include "umbp/local/block_index/local_block_index.h"
 #include "umbp/local/standalone_client.h"
 #include "umbp/local/tiers/local_storage_manager.h"
+#include "umbp/local/tiers/segment/segment_format.h"
 
 using namespace mori::umbp;
 
@@ -378,7 +379,10 @@ void test_ssd_prefix_aware_index_sync() {
   cfg.dram.capacity_bytes = 4 * 1024 * 1024;  // large DRAM — no DRAM pressure
   cfg.ssd.enabled = true;
   cfg.ssd.storage_dir = "/tmp/umbp_test_prefix_ssd";
-  cfg.ssd.capacity_bytes = 1024;  // tiny SSD: 1 KB
+  // Room for exactly two records, so the third write forces an eviction.  In
+  // padded on-disk bytes, not raw value bytes -- see the v3 layout in
+  // segment_format.h.
+  cfg.ssd.capacity_bytes = 2 * mori::umbp::segment::RecordBytes(sizeof("hash1_0_k") - 1, 512);
   cfg.eviction.policy = "prefix_aware_lru";
   cfg.eviction.candidate_window = 16;
 

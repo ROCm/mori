@@ -91,6 +91,7 @@ endif()
 
 # Core static library
 set(UMBP_CORE_SRCS
+    common/device_copy.cpp
     local/block_index/local_block_index.cpp
     storage/io/storage_io_driver.cpp
     storage/io/posix_storage_io_driver.cpp
@@ -102,8 +103,12 @@ set(UMBP_CORE_SRCS
     local/tiers/segment/segment_writer.cpp
     local/tiers/tier_backend.cpp
     local/tiers/dram_tier.cpp
+    local/tiers/host_registration.cpp
+    local/tiers/device_gather.hip
     local/host_mem_allocator.cpp
     local/tiers/ssd_tier.cpp
+    local/tiers/sharded_ssd_tier.cpp
+    local/tiers/ssd_backend_factory.cpp
     local/tiers/dummy_ssd_tier.cpp
     local/tiers/local_storage_manager.cpp
     local/standalone_client.cpp
@@ -123,6 +128,10 @@ endif()
 add_library(umbp_core STATIC ${UMBP_CORE_SRCS})
 target_include_directories(umbp_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(umbp_core PRIVATE pthread)
+# The DRAM tier registers its region for GPU access and gathers scattered
+# copies in a kernel, so the core library now needs the HIP runtime. PUBLIC
+# because dram_tier.h exposes no HIP types but device_gather.hip is linked in.
+target_link_libraries(umbp_core PUBLIC hip::host)
 if(UNIX)
   target_link_libraries(umbp_core PRIVATE rt)
 endif()

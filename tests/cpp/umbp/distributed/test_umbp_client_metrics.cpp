@@ -366,28 +366,6 @@ constexpr size_t kLocalBufSize = 8 << 20;
 class PoolClientLocalByteTrackingTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    // Kernel-assigned ephemeral ports are expected to be plentiful in CI;
-    // bounded retries protect against pathological duplicate picks.
-    constexpr int kMaxPortAllocAttempts = 32;  // far above expected collision rate in CI
-    auto alloc_unique_port = [&](std::initializer_list<uint16_t> used) {
-      for (int attempt = 0; attempt < kMaxPortAllocAttempts; ++attempt) {
-        const uint16_t candidate = AllocPort();
-        bool duplicate = false;
-        for (const uint16_t port : used) {
-          if (candidate == port) {
-            duplicate = true;
-            break;
-          }
-        }
-        if (!duplicate) return candidate;
-      }
-      throw std::runtime_error("Failed to allocate unique test port");
-    };
-
-    master_port_ = AllocPort();
-    metrics_port_ = alloc_unique_port({master_port_});
-    io_port_ = alloc_unique_port({master_port_, metrics_port_});
-
     src_ = std::malloc(kLocalPageSize);
     dst_ = std::malloc(kLocalPageSize);
     ASSERT_NE(src_, nullptr);
@@ -395,21 +373,61 @@ class PoolClientLocalByteTrackingTest : public ::testing::Test {
     std::memset(src_, 0xAB, kLocalPageSize);
     std::memset(dst_, 0, kLocalPageSize);
 
-    MasterServerConfig master_cfg;
-    // Short TTL so the recommended heartbeat/metrics interval is ≈100ms.
-    master_cfg.registry_config.heartbeat_ttl = std::chrono::seconds(1);
-    master_cfg.listen_address = "0.0.0.0:" + std::to_string(master_port_);
-    master_cfg.metrics_port = metrics_port_;
-    master_ = std::make_unique<MasterServer>(std::move(master_cfg));
-    server_thread_ = std::thread([this] { master_->Run(); });
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    // The master's gRPC port and the IO engine's port are requested as 0 and
+    // read back, so neither is reserved and released. metrics_port_ cannot be:
+    // MasterServerConfig takes it as a number, treats 0 as "no metrics server",
+    // and exposes no accessor for what it bound. Losing AllocPort's
+    // reserve-close-rebind race throws inside MetricsServer's constructor on
+    // the Run() thread, which is std::terminate rather than a test failure, so
+    // retry the whole server on a fresh port instead.
+    constexpr int kMaxAttempts = 8;
+    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+      metrics_port_ = AllocPort();
+
+      MasterServerConfig master_cfg;
+      // Short TTL so the recommended heartbeat/metrics interval is ≈100ms.
+      master_cfg.registry_config.heartbeat_ttl = std::chrono::seconds(1);
+      master_cfg.listen_address = "0.0.0.0:0";
+      master_cfg.metrics_port = metrics_port_;
+      master_ = std::make_unique<MasterServer>(std::move(master_cfg));
+      run_failed_.store(false);
+      server_thread_ = std::thread([this] {
+        try {
+          master_->Run();
+        } catch (const std::exception&) {
+          run_failed_.store(true);
+        }
+      });
+
+      // Wait for the assigned port rather than sleeping a fixed interval and
+      // hoping: it has to be read back anyway, and it is only non-zero once the
+      // server is actually listening.
+      bool ready = false;
+      for (int i = 0; i < 500; ++i) {
+        if (master_->GetBoundPort() != 0) {
+          ready = true;
+          break;
+        }
+        if (run_failed_.load()) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+      if (ready && !run_failed_.load()) break;
+
+      master_->Shutdown();
+      if (server_thread_.joinable()) server_thread_.join();
+      master_.reset();
+    }
+    ASSERT_NE(master_, nullptr);
+    ASSERT_FALSE(run_failed_.load()) << "MasterServer::Run() kept failing to bind a metrics port";
+    ASSERT_NE(master_->GetBoundPort(), 0);
+    master_port_ = static_cast<uint16_t>(master_->GetBoundPort());
 
     PoolClientConfig cfg;
     cfg.master_config.node_id = "node-local";
     cfg.master_config.node_address = "127.0.0.1";
     cfg.master_config.master_address = "localhost:" + std::to_string(master_port_);
     cfg.io_engine.host = "0.0.0.0";
-    cfg.io_engine.port = io_port_;
+    cfg.io_engine.port = 0;
     cfg.dram_page_size = kLocalPageSize;
     cfg.dram.buffer_sizes = {kLocalBufSize};
     client_ = std::make_unique<PoolClient>(std::move(cfg));
@@ -426,11 +444,11 @@ class PoolClientLocalByteTrackingTest : public ::testing::Test {
 
   uint16_t master_port_ = 0;
   uint16_t metrics_port_ = 0;
-  uint16_t io_port_ = 0;
   void* src_ = nullptr;
   void* dst_ = nullptr;
   std::unique_ptr<MasterServer> master_;
   std::thread server_thread_;
+  std::atomic<bool> run_failed_{false};
   std::unique_ptr<PoolClient> client_;
 };
 

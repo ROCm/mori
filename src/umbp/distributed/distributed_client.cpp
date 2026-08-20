@@ -22,6 +22,7 @@
 #include "umbp/distributed/distributed_client.h"
 
 #include <map>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 
@@ -74,13 +75,69 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   // directly from dc — no ownership struct crosses this boundary the way dram's
   // hugepages/NUMA/prefault knobs do, because hipMalloc has none of those
   // dimensions.
+  // The ranged scratch arena. Plain anonymous host pages: it is registered with
+  // the transfer engine below, and unlike a medium pool it has no hugepage/NUMA
+  // policy to honour — it is touched once per remote ranged operation, not held
+  // as a cache.
+  //
+  // Zero-sized is the default and means "this deployment does not do ranged
+  // I/O": no arena, no registration, and SupportsRangedIO() reports false, so
+  // a client that never issues ranged operations stops paying for the arena.
+  HostMemAllocator allocator;
+  HostBufferOptions scratch_opts;
+  // Two separate arenas — GET and PUT — each of ranged_scratch_size, so the two
+  // directions never share a buffer or a lock and can run concurrently.
+  if (dc.ranged_scratch_size > 0) {
+    ranged_get_scratch_handle_ = allocator.Alloc(dc.ranged_scratch_size, scratch_opts);
+    ranged_put_scratch_handle_ = allocator.Alloc(dc.ranged_scratch_size, scratch_opts);
+    if (!ranged_get_scratch_handle_.valid() || !ranged_put_scratch_handle_.valid()) {
+      // HostBufferHandle is not RAII and the destructor/Close() won't run when a
+      // constructor throws, so free whatever did allocate before bailing out
+      // (Free() is a no-op on an invalid handle).
+      allocator.Free(ranged_get_scratch_handle_);
+      allocator.Free(ranged_put_scratch_handle_);
+      throw std::runtime_error("DistributedClient: memory allocation failed for ranged scratch");
+    }
+    ranged_get_scratch_ = ranged_get_scratch_handle_.ptr;
+    ranged_get_scratch_size_ = ranged_get_scratch_handle_.mapped_size;
+    ranged_put_scratch_ = ranged_put_scratch_handle_.ptr;
+    ranged_put_scratch_size_ = ranged_put_scratch_handle_.mapped_size;
+  }
+
   auto pc_config = ToPoolClientConfig(dc, std::move(dram_ownership), std::move(ssd_ownership));
+  pc_config.ranged_get_scratch_buffer = ranged_get_scratch_;
+  pc_config.ranged_get_scratch_size = ranged_get_scratch_size_;
+  pc_config.ranged_put_scratch_buffer = ranged_put_scratch_;
+  pc_config.ranged_put_scratch_size = ranged_put_scratch_size_;
   pc_config.copy_pipeline = config_.copy_pipeline;
+
+  auto release_scratch = [this] {
+    HostMemAllocator cleanup;
+    cleanup.Free(ranged_get_scratch_handle_);
+    cleanup.Free(ranged_put_scratch_handle_);
+    ranged_get_scratch_ = nullptr;
+    ranged_get_scratch_size_ = 0;
+    ranged_put_scratch_ = nullptr;
+    ranged_put_scratch_size_ = 0;
+  };
 
   pool_client_ = std::make_unique<PoolClient>(std::move(pc_config));
   if (!pool_client_->Init()) {
     pool_client_.reset();
+    release_scratch();
     throw std::runtime_error("DistributedClient: PoolClient::Init() failed");
+  }
+  // Registered explicitly rather than through a backend: each arena is a remote
+  // endpoint for RDMA reads and writes, so it needs a memory region even though
+  // no medium owns it. Skipped entirely when the deployment did not opt in.
+  if ((ranged_get_scratch_ &&
+       !pool_client_->RegisterMemory(ranged_get_scratch_, ranged_get_scratch_size_)) ||
+      (ranged_put_scratch_ &&
+       !pool_client_->RegisterMemory(ranged_put_scratch_, ranged_put_scratch_size_))) {
+    pool_client_->Shutdown();
+    pool_client_.reset();
+    release_scratch();
+    throw std::runtime_error("DistributedClient: ranged scratch registration failed");
   }
 
   std::string tags_str;
@@ -210,6 +267,36 @@ std::vector<bool> DistributedClient::BatchGet(const std::vector<std::string>& ke
   return pool_client_->BatchGet(keys, dst_ptrs, sizes);
 }
 
+std::vector<bool> DistributedClient::BatchGetRanges(
+    const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dsts,
+    const std::vector<std::vector<size_t>>& sizes,
+    const std::vector<std::vector<size_t>>& src_offsets) {
+  if (closing_) return std::vector<bool>(keys.size(), false);
+  std::shared_lock lk(op_mutex_);
+  if (closed_ || !pool_client_) return std::vector<bool>(keys.size(), false);
+  std::vector<std::vector<void*>> dst_ptrs(dsts.size());
+  for (size_t i = 0; i < dsts.size(); ++i) {
+    dst_ptrs[i].reserve(dsts[i].size());
+    for (uintptr_t ptr : dsts[i]) dst_ptrs[i].push_back(reinterpret_cast<void*>(ptr));
+  }
+  return pool_client_->BatchGetRanges(keys, dst_ptrs, sizes, src_offsets);
+}
+
+std::vector<bool> DistributedClient::BatchPutRanges(
+    const std::vector<std::string>& keys, const std::vector<size_t>& object_sizes,
+    const std::vector<std::vector<uintptr_t>>& srcs, const std::vector<std::vector<size_t>>& sizes,
+    const std::vector<std::vector<size_t>>& dst_offsets) {
+  if (closing_) return std::vector<bool>(keys.size(), false);
+  std::shared_lock lk(op_mutex_);
+  if (closed_ || !pool_client_) return std::vector<bool>(keys.size(), false);
+  std::vector<std::vector<const void*>> src_ptrs(srcs.size());
+  for (size_t i = 0; i < srcs.size(); ++i) {
+    src_ptrs[i].reserve(srcs[i].size());
+    for (uintptr_t ptr : srcs[i]) src_ptrs[i].push_back(reinterpret_cast<const void*>(ptr));
+  }
+  return pool_client_->BatchPutRanges(keys, object_sizes, src_ptrs, sizes, dst_offsets);
+}
+
 std::vector<bool> DistributedClient::BatchExists(const std::vector<std::string>& keys) const {
   if (closing_) return std::vector<bool>(keys.size(), false);
   std::shared_lock lk(op_mutex_);
@@ -300,10 +387,27 @@ void DistributedClient::Close() {
     pool_client_.reset();
   }
 
+  // Only after Shutdown has deregistered the regions — the arenas are
+  // caller-owned and PoolClient holds a memory region over each until then.
+  if (ranged_get_scratch_ || ranged_put_scratch_) {
+    HostMemAllocator allocator;
+    allocator.Free(ranged_get_scratch_handle_);
+    allocator.Free(ranged_put_scratch_handle_);
+    ranged_get_scratch_ = nullptr;
+    ranged_get_scratch_size_ = 0;
+    ranged_put_scratch_ = nullptr;
+    ranged_put_scratch_size_ = 0;
+  }
+
   MORI_UMBP_INFO("[DistributedClient] closed");
 }
 
 bool DistributedClient::IsDistributed() const { return true; }
+
+bool DistributedClient::SupportsRangedIO() const {
+  if (ranged_get_scratch_size_ == 0 || ranged_put_scratch_size_ == 0) return false;
+  return config_.distributed.has_value() && config_.distributed->medium != UMBPMedium::SSD;
+}
 
 bool DistributedClient::ReportExternalKvBlocks(const std::vector<std::string>& hashes,
                                                TierType tier) {

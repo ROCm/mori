@@ -230,6 +230,21 @@ struct PoolClientConfig {
 
   size_t staging_buffer_size = 64ULL * 1024 * 1024;
 
+  // Caller-owned, RDMA-registered host arenas for ranged I/O. DistributedClient
+  // owns the backing mappings and frees them only after PoolClient::Shutdown has
+  // deregistered the regions. Direct PoolClient tests may provide their own.
+  //
+  // Two separate arenas — one for remote ranged GET, one for remote ranged PUT
+  // — each under its own mutex in PoolClient, so a remote get and a remote put
+  // run concurrently instead of serializing on one lock (the load/offload
+  // overlap sglang's direct linker wants). Each must hold at least one whole
+  // object. Both zero keeps ranged remote I/O disabled with no host memory
+  // registered; SupportsRangedIO() requires both to be set.
+  void* ranged_get_scratch_buffer = nullptr;
+  size_t ranged_get_scratch_size = 0;
+  void* ranged_put_scratch_buffer = nullptr;
+  size_t ranged_put_scratch_size = 0;
+
   // SSD read-staging tuning (peer side).  More slots reduce NO_SLOT under large
   // concurrent prefetch batches, but shrink per-slot size (= staging_buffer_size
   // / slots), which must stay >= the largest single SSD block.  The slot lease
@@ -241,6 +256,15 @@ struct PoolClientConfig {
   // read fits one whole key value in a slot, so this / ssd_staging_buffer_slots
   // must be >= the largest single-key page KV (61-layer MLA page ~= 4.5 MB).
   size_t ssd_staging_buffer_size = 268435456;  // 256 MiB
+
+  // Back the SSD staging arena with hugetlbfs pages.  Every byte the SSD
+  // backend moves crosses that arena twice (device <-> arena, arena <-> wire),
+  // so its TLB behaviour sits on the critical path in a way an ordinary
+  // buffer's does not.  Falls back to 4 KiB pages when no hugetlb pages are
+  // free — a node must still come up.  Node-wide: it applies to every SSD
+  // backend this client registers, not to one of them.
+  bool ssd_staging_use_hugepages = false;
+  size_t ssd_staging_hugepage_size = 2ULL * 1024 * 1024;  // 2 MiB
 
   // Legacy one-medium selector. Used only when `backends` is empty; in that
   // mode PoolClient::Init reads exactly one ownership block below.
@@ -318,8 +342,12 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.master_config = dc.master_config;
   pc.io_engine = dc.io_engine;
   pc.staging_buffer_size = dc.staging_buffer_size;
+  // The ranged scratch buffers/sizes are set by DistributedClient after it
+  // allocates and registers the two arenas (see DistributedClient ctor).
   pc.ssd_staging_buffer_size = dc.ssd_staging_buffer_size;
   pc.ssd_staging_buffer_slots = dc.ssd_staging_buffer_slots;
+  pc.ssd_staging_use_hugepages = dc.ssd_staging_use_hugepages;
+  pc.ssd_staging_hugepage_size = dc.ssd_staging_hugepage_size;
   pc.peer_service_port = dc.peer_service_port;
   pc.cache_remote_fetches = dc.cache_remote_fetches;
   pc.cache_remote_admission = dc.cache_remote_admission;

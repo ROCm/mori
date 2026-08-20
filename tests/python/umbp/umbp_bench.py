@@ -247,7 +247,237 @@ if dst_loc == "gpu" and backend_name != "umbp":
     print("ERROR: --dst-loc gpu is only supported for backend=umbp", file=sys.stderr)
     sys.exit(2)
 
+
+# --- SSD read-staging arena sizing ------------------------------------------
+# A remote SSD read is not served in place: the owner stages the value into a
+# registered host arena of `slots` pages and the reader RDMAs it out. A key that
+# finds no free slot does NOT retry and does NOT block -- it is reported as a
+# plain cache MISS (ssd_backend.cpp bumps slot_full_rejects_ and gives up;
+# UMBP_SSD_GET_MAX_ATTEMPTS is described in doc/pure-ssd-mode.md but is not
+# implemented on this branch, so there is no retry lever).
+#
+# That makes a fixed default arena actively dangerous for a sweep: with 512
+# slots a batch of 2048 keys returns exactly 512 hits and 1536 misses, every
+# pass, and the run still prints a perfectly healthy-looking MiB/s -- computed
+# only over the keys that got a slot. The drives are never the bottleneck, so
+# drive-count scaling comes out flat and the whole comparison is silently
+# meaningless. Size the arena from the sweep instead of from a constant.
+def _staging_plan(nr_objects_: int, value_size_: int, batch_sizes_):
+    """Slots/bytes the SSD tier needs so the largest batch can be fully staged.
+
+    Returns (slots, total_bytes, max_batch). Slot size is total_bytes // slots
+    and must be >= the largest single value, so bytes are derived from slots.
+    """
+    max_batch = max(batch_sizes_) if batch_sizes_ else nr_objects_
+    max_batch = max(1, min(max_batch, nr_objects_))
+    # Occupancy is NOT just the batch width. A staged page is freed when the
+    # reader's best-effort release lands, and otherwise only when the read lease
+    # expires -- so in steady state the arena also holds roughly
+    # (completed reads/sec x lease). Measured on n06-21 with a 2304-slot arena:
+    #
+    #   1 drive,  batch 128:  3042 req/s -> 1521 + 128  = 1649 slots -> 0 misses
+    #   2 drives, batch 128:  4699 req/s -> 2350 + 128  = 2478 slots -> 23% misses
+    #   1 drive,  batch 2048: 2939 req/s -> 1470 + 2048 = 3518 slots -> 44% misses
+    #
+    # The throughput term is what makes this bite harder as drives are added:
+    # faster media completes more reads per second, so it needs a BIGGER arena,
+    # which is the opposite of the intuition that fewer drives are the tight case.
+    # Two levers: keep the lease short (see _SSD_LEASE_MS -- it only has to cover
+    # one sub-ms RDMA round trip, so the 500ms default is ~1000x more than needed)
+    # and budget two batches of burst plus a fixed throughput margin.
+    # The hold time is NOT just the lease: measured on 4x KIOXIA CD8 at ~15k
+    # reads/s, clearing misses needed 4096 slots for a 512-wide batch, implying
+    # ~200ms of hold per page against a 50ms lease -- the RDMA round trip and the
+    # asynchronous release dominate. Calibrated empirically at the fastest media
+    # available (30 GB/s), since under-sizing is silent and over-sizing only
+    # costs host memory:
+    #
+    #   4 drives, batch 512, 2048 slots -> 20% misses (13.4 GB/s reported)
+    #   4 drives, batch 512, 4096 slots ->  0% misses (30.0 GB/s)
+    #   4 drives, batch 512, 8192 slots ->  0% misses (29.0 GB/s -- no gain,
+    #                                       so 4096 is genuinely sufficient and
+    #                                       the number is not cache-inflated)
+    slots = max(4096, 4 * max_batch + 2048)
+    # Pad the per-slot page to the 4 KiB the on-disk records are aligned to.
+    slot_bytes = ((value_size_ + 4095) // 4096) * 4096
+    return slots, slots * slot_bytes, max_batch
+
+
+_auto_slots, _auto_staging_bytes, _auto_max_batch = _staging_plan(
+    nr_objects, value_size, getattr(args, "batch_sizes", None)
+)
+
+# The peer holds a staged page under this lease until the reader's release lands
+# (pool_client.cpp DramReadLeaseTtl, UMBP_DRAM_READ_LEASE_MS, 500ms default). The
+# lease only has to outlive one RDMA round trip, which is sub-millisecond, but it
+# is what bounds how fast slots recycle -- at 500ms a fast multi-drive tier keeps
+# thousands of pages pinned purely waiting for it. Default it down for the bench
+# so arena sizing stays a function of the sweep instead of the media speed. Must
+# be in the environment before the client is built: the C++ side caches it in a
+# function-local static on first read.
+_SSD_LEASE_MS = "50"
+if tier == "ssd":
+    os.environ.setdefault("UMBP_DRAM_READ_LEASE_MS", _SSD_LEASE_MS)
+
+
+# --- pool capacity sizing ----------------------------------------------------
+# The master runs an eviction manager over every (node, tier): once a tier's
+# used/total crosses EvictionConfig::high_watermark it evicts that tier's oldest
+# keys down to low_watermark (eviction_manager.cpp; defaults 0.9 / 0.7 in
+# distributed/config.h, checked every 5s). Those two watermarks are deliberately
+# NOT env-overridable -- "watermarks and batch size have dedicated tuning paths
+# and are intentionally excluded" -- so a bench cannot turn the reaper off. The
+# only lever is to keep the dataset under the high watermark.
+#
+# Getting this wrong is silent and looks exactly like a correctness bug. Measured
+# on n06-21 with a 32 GiB dataset in a 34 GiB pool: the write side reports a clean
+# `WRITE_DONE ok=16384 fail=0`, then every later pass misses 25.6% of its keys with
+# no eviction line anywhere in the client log. 32768/34816 = 94% >= 0.9 trips the
+# watermark, and 0.7 * 34816 MiB / 2 MiB = 12185 keys survive -- exactly the 12185
+# hits observed, reproducibly. The same dataset in a 48 GiB pool (67%) never
+# evicts, which is why an oversized pool "fixes" it and why the bug only shows up
+# once someone tightens the pool.
+#
+# Note this is a race, not a hard cap: the sweep is only wrong if the 5s eviction
+# check lands before the reads. A short single-pass run over a 100%-full pool can
+# pass, which makes small-scale probing actively misleading -- size for the
+# watermark, do not trust a lucky short run.
+_EVICT_HIGH_WM = 0.9  # EvictionConfig::high_watermark
+_EVICT_LOW_WM = 0.7  # EvictionConfig::low_watermark (what it evicts DOWN to)
+# Target occupancy for an auto-sized pool. Below the high watermark with room to
+# spare, since over-sizing only costs host memory while under-sizing silently
+# destroys the measurement.
+_POOL_TARGET_OCCUPANCY = 0.75
+
+
+def _pool_plan(nr_objects_: int, value_size_: int, per_entry_bytes: int = 0) -> int:
+    """Tier capacity that keeps the whole dataset below the eviction watermark.
+
+    `per_entry_bytes` overrides the on-medium cost of one value (the SSD tier
+    charges capacity in 4 KiB-padded record bytes, not raw value bytes).
+    """
+    entry = per_entry_bytes or value_size_
+    return int(nr_objects_ * entry / _POOL_TARGET_OCCUPANCY)
+
+
+# The reader only needs capacity of its own when it re-caches what it fetched;
+# with UMBP_CACHE_REMOTE_FETCHES=0 its pool never holds anything, and sizing it
+# like the writer's just wastes memory -- which is not free, because a DRAM pool
+# is hugepage-backed and NUMA-bound, so an oversized reader pool starves its own
+# read buffer of hugepages on the reader's node and demotes it to 4 KiB pages.
+_caches_remotely = os.environ.get("UMBP_CACHE_REMOTE_FETCHES", "1") not in (
+    "0",
+    "false",
+    "False",
+    "",
+)
+_holds_dataset = role != "reader" or _caches_remotely
+_auto_pool_bytes = _pool_plan(nr_objects, value_size)
+
+
+def _pool_capacity(env_var: str, auto_bytes: int, floor_bytes: int, label: str) -> int:
+    """Resolve a tier capacity, warning when an explicit value invites eviction."""
+    want = auto_bytes if _holds_dataset else floor_bytes
+    configured = int(os.environ.get(env_var, want))
+    dataset = nr_objects * value_size
+    if _holds_dataset and configured and dataset / configured >= _EVICT_HIGH_WM:
+        survivors = int(configured * _EVICT_LOW_WM / value_size)
+        print(
+            f"WARNING: {label} capacity ({configured / 2**30:.2f}GiB) leaves the "
+            f"{dataset / 2**30:.2f}GiB dataset at "
+            f"{100 * dataset / configured:.1f}% >= the {_EVICT_HIGH_WM:.0%} eviction "
+            f"high watermark. The master will evict down to {_EVICT_LOW_WM:.0%}, so "
+            f"about {survivors} of {nr_objects} keys survive and the rest come back "
+            f"as MISSES after a clean WRITE_DONE. Unset {env_var} to auto-size "
+            f"(would use {auto_bytes / 2**30:.2f}GiB).",
+            flush=True,
+        )
+    return configured
+
+
+# Resolve every tier capacity ONCE, here, rather than per-client: role=both builds
+# two backends and would otherwise print each warning twice.
+_DRAM_FLOOR = 8 * 1024 * 1024 * 1024
+_dram_capacity_bytes = (
+    _pool_capacity("UMBP_DRAM_CAPACITY_BYTES", _auto_pool_bytes, _DRAM_FLOOR, "DRAM")
+    if tier == "dram"
+    # Floor for hbm/ssd runs: PoolClient::Init always registers DRAM, and
+    # most-available put routing would otherwise send every put to DRAM and
+    # report it as the tier under test.
+    else int(os.environ.get("UMBP_DRAM_CAPACITY_BYTES", 256 * 1024 * 1024))
+)
+_ssd_entry_bytes = ((value_size + 4095) // 4096) * 4096
+
+
+# --- hugepage preflight ------------------------------------------------------
+# The DRAM pool, the SSD staging arena and the bench's own read buffer are all
+# hugepage-backed AND bound to this process's --numa-node. Hugepages are a
+# per-NUMA-node reservation, so the only number that matters is that node's
+# free_hugepages -- the /proc/meminfo total can look plentiful while the pinned
+# node is empty.
+#
+# Running short does not fail the allocation: mmap(MAP_HUGETLB) succeeds against
+# the reservation, then MADV_POPULATE_WRITE returns EFAULT, the allocator falls
+# back to touching pages by hand, and the process dies on the first page it
+# cannot get -- a bare "Bus error (core dumped)" with no indication that page
+# size or NUMA had anything to do with it. Check up front and say so instead.
+def _hugepage_preflight():
+    if os.environ.get("UMBP_DRAM_USE_HUGEPAGES", "1") in ("0", ""):
+        return
+    node = int(os.environ.get("UMBP_DRAM_NUMA_NODE", numa_node))
+    if node < 0:
+        return  # unpinned: the kernel may draw from any node, so no check is sound
+    hp_size = int(os.environ.get("UMBP_DRAM_HUGEPAGE_SIZE", 2 * 1024 * 1024))
+    try:
+        with open(
+            f"/sys/devices/system/node/node{node}/hugepages/"
+            f"hugepages-{hp_size // 1024}kB/free_hugepages"
+        ) as f:
+            free_bytes = int(f.read().strip()) * hp_size
+    except OSError:
+        return  # no hugetlb sysfs for this size; allocation will fall back loudly
+
+    need = {"DRAM pool": _dram_capacity_bytes}
+    if tier == "ssd":
+        need["SSD staging arena"] = int(
+            os.environ.get("UMBP_SSD_STAGING_BYTES", _auto_staging_bytes)
+        )
+    if dst_loc == "host":
+        # batch_perf reads the whole dataset into one buffer; correctness reuses
+        # a single value-sized one. The writer allocates only a scratch value.
+        if command == "batch_perf" and role != "writer":
+            need["read buffer"] = nr_objects * value_size
+        else:
+            need["value scratch"] = value_size
+    total = sum(need.values())
+    if total <= free_bytes:
+        return
+
+    detail = ", ".join(f"{k} {v / 2**30:.2f}GiB" for k, v in need.items())
+    pages = -(-total // hp_size)
+    print(
+        f"ERROR: this run needs about {total / 2**30:.2f}GiB of {hp_size // 1024}kB "
+        f"hugepages on NUMA node {node} ({detail}), but that node has only "
+        f"{free_bytes / 2**30:.2f}GiB free. Hugepages are reserved PER NUMA NODE, so "
+        f"a healthy-looking /proc/meminfo total does not help a pinned process. "
+        f"Continuing would not fail cleanly -- it would die with a bare "
+        f"'Bus error (core dumped)' while faulting the pages in.\n"
+        f"  Fix (as root):  echo {pages} > /sys/devices/system/node/node{node}"
+        f"/hugepages/hugepages-{hp_size // 1024}kB/nr_hugepages\n"
+        f"  If the node cannot satisfy that, its free memory is probably page "
+        f"cache: 'sync; echo 3 > /proc/sys/vm/drop_caches' first.\n"
+        f"  Or run without hugepages:  UMBP_DRAM_USE_HUGEPAGES=0  (4 KiB pages; "
+        f"lowers DRAM-tier numbers and makes large RDMA registrations more likely "
+        f"to fail, so do not mix such runs into a comparison).",
+        file=sys.stderr,
+        flush=True,
+    )
+    sys.exit(1)
+
+
 if backend_name == "umbp":
+    _hugepage_preflight()
+
     from mori.io import MemoryLocationType
     from mori.umbp import (
         UMBPClient,
@@ -378,12 +608,11 @@ class UMBPBackend(Backend):
         # every put to DRAM and report it as HBM. Shrink DRAM to a floor well
         # below the target pool so most-available can only pick the target.
         # The bench's whole working set must also fit in that headroom.
-        default_dram = 8 * 1024 * 1024 * 1024
-        if tier != "dram":
-            default_dram = 256 * 1024 * 1024
-        cfg.dram.capacity_bytes = int(
-            os.environ.get("UMBP_DRAM_CAPACITY_BYTES", default_dram)
-        )
+        # For a --tier dram run this pool holds the dataset, so it is sized from
+        # the eviction watermark (see _pool_plan) rather than from a constant --
+        # an 8 GiB default silently evicted most of any dataset bigger than
+        # ~7 GiB. For the other tiers it stays a floor.
+        cfg.dram.capacity_bytes = _dram_capacity_bytes
         cfg.dram.use_hugepages = os.environ.get("UMBP_DRAM_USE_HUGEPAGES", "1") not in (
             "0",
             "",
@@ -411,8 +640,14 @@ class UMBPBackend(Backend):
         if tier == "hbm":
             dist.medium = UMBPMedium.HBM
             dist.hbm.device = int(os.environ.get("UMBP_HBM_DEVICE", hbm_device))
-            dist.hbm.capacity_bytes = int(
-                os.environ.get("UMBP_HBM_CAPACITY_BYTES", 4 * 1024 * 1024 * 1024)
+            # Same eviction watermark applies to HBM: the master's eviction
+            # manager walks every (node, tier), not just DRAM. The old flat 4 GiB
+            # default evicted all but ~1400 keys of a 32 GiB dataset.
+            dist.hbm.capacity_bytes = _pool_capacity(
+                "UMBP_HBM_CAPACITY_BYTES",
+                _auto_pool_bytes,
+                4 * 1024 * 1024 * 1024,
+                "HBM",
             )
         if tier == "ssd":
             # medium is the distributed-side selector; cfg.ssd carries the actual
@@ -421,28 +656,126 @@ class UMBPBackend(Backend):
             dist.medium = UMBPMedium.SSD
             # SSD is not directly addressable: a remote read stages the value
             # into a registered host arena of ssd_staging_buffer_slots pages.
-            # The default 16 slots caps read concurrency at 16 keys, and a
-            # slot stays pinned for UMBP_SSD_READ_LEASE_MS (3s) when the
-            # reader's best-effort ReleaseSsdLease is lost -- so a sweep over
-            # more than ~16 keys degrades the rest to MISSES, not slow hits
-            # (ssd_backend.cpp: "Sizing the arena for read concurrency is the
-            # mitigation"). Size the arena for the sweep instead.
+            # Too few slots does not slow the sweep down, it turns the keys that
+            # miss out on a slot into cache MISSES -- see _staging_plan above for
+            # why that is silent and why the default is computed, not constant.
+            # The env vars stay as escape hatches, but an explicit value that is
+            # too small for the sweep is now called out instead of obeyed quietly.
             dist.ssd_staging_buffer_slots = int(
-                os.environ.get("UMBP_SSD_STAGING_SLOTS", 512)
+                os.environ.get("UMBP_SSD_STAGING_SLOTS", _auto_slots)
             )
             # Slot size = size / slots, and must be >= the largest single value.
             dist.ssd_staging_buffer_size = int(
-                os.environ.get("UMBP_SSD_STAGING_BYTES", 2 * 1024 * 1024 * 1024)
+                os.environ.get("UMBP_SSD_STAGING_BYTES", _auto_staging_bytes)
             )
+            _slot_bytes = (
+                dist.ssd_staging_buffer_size // dist.ssd_staging_buffer_slots
+                if dist.ssd_staging_buffer_slots
+                else 0
+            )
+            print(
+                f"[staging] slots={dist.ssd_staging_buffer_slots} "
+                f"arena={dist.ssd_staging_buffer_size / 2**30:.2f}GiB "
+                f"slot={_slot_bytes / 2**20:.2f}MiB "
+                f"(auto: slots={_auto_slots} arena={_auto_staging_bytes / 2**30:.2f}GiB "
+                f"for max_batch={_auto_max_batch}) "
+                f"read_lease_ms={os.environ.get('UMBP_DRAM_READ_LEASE_MS')}",
+                flush=True,
+            )
+            if dist.ssd_staging_buffer_slots < _auto_max_batch:
+                print(
+                    f"WARNING: staging slots ({dist.ssd_staging_buffer_slots}) < largest "
+                    f"batch ({_auto_max_batch}). Keys past the slot count return as "
+                    f"MISSES, not slow hits, and the reported MiB/s is computed only "
+                    f"over the keys that got a slot -- the sweep will look fast and "
+                    f"scale flat. Unset UMBP_SSD_STAGING_SLOTS to auto-size.",
+                    flush=True,
+                )
+            if _slot_bytes < value_size:
+                print(
+                    f"WARNING: staging slot ({_slot_bytes}B) < value_size "
+                    f"({value_size}B); values cannot be staged and every read will "
+                    f"miss. Unset UMBP_SSD_STAGING_BYTES to auto-size.",
+                    flush=True,
+                )
+            # The other half of the trap: an arena at least as big as the whole
+            # dataset means a repeated pass finds every key still staged from the
+            # previous one (SsdBackend::Resolve serves a live lease straight from
+            # the arena and renews it), so passes 2..N are timed against host DRAM
+            # and never touch a drive. That reads as a several-fold speedup and
+            # flattens drive-count scaling just as effectively as the miss bug.
+            _dataset_bytes = nr_objects * value_size
+            if dist.ssd_staging_buffer_size >= _dataset_bytes:
+                print(
+                    f"WARNING: staging arena "
+                    f"({dist.ssd_staging_buffer_size / 2**30:.2f}GiB) >= dataset "
+                    f"({_dataset_bytes / 2**30:.2f}GiB), so repeated passes are served "
+                    f"from the staging arena in host DRAM rather than from the drives. "
+                    f"For a real SSD number raise --nr-objects (>= ~4x the largest "
+                    f"batch) or lower --batch-sizes, and cross-check with iostat.",
+                    flush=True,
+                )
             cfg.ssd.enabled = True
             cfg.ssd.storage_dir = os.environ.get(
                 "UMBP_SSD_STORAGE_DIR", f"/tmp/umbp_ssd_{node_id}"
             )
-            cfg.ssd.capacity_bytes = int(
-                os.environ.get("UMBP_SSD_CAPACITY_BYTES", 32 * 1024 * 1024 * 1024)
+            # SSD is watermarked twice over -- the master's eviction manager and
+            # PeerSsdManager's own high/low watermarks (both 0.9/0.7) -- and it
+            # charges capacity in 4 KiB-padded record bytes, so size from the
+            # padded entry. This is the total across every drive in
+            # UMBP_SSD_STORAGE_DIR, not a per-drive budget.
+            cfg.ssd.capacity_bytes = _pool_capacity(
+                "UMBP_SSD_CAPACITY_BYTES",
+                _pool_plan(nr_objects, value_size, _ssd_entry_bytes),
+                32 * 1024 * 1024 * 1024,
+                "SSD",
             )
             cfg.ssd.ssd_backend = os.environ.get("UMBP_SSD_BACKEND", "file")
-            os.makedirs(cfg.ssd.storage_dir, exist_ok=True)
+            # This bench builds UMBPConfig directly and never calls
+            # UMBPConfig::FromEnvironment(), so the UMBP_SSD_* env vars that
+            # configure the tier do NOT reach it on their own -- they have to be
+            # applied here through the pybind fields. Leaving direct_io unset is
+            # the trap this block exists to avoid: buffered reads can be served
+            # entirely from page cache, moving zero bytes to the device, which
+            # makes any drive-count or DRAM-vs-SSD comparison meaningless.
+            cfg.ssd.direct_io = os.environ.get("UMBP_SSD_DIRECT_IO", "1") not in (
+                "0",
+                "",
+            )
+            cfg.ssd.verify_crc = os.environ.get("UMBP_SSD_VERIFY_CRC", "1") not in (
+                "0",
+                "",
+            )
+            cfg.ssd.tier_io_threads = int(os.environ.get("UMBP_SSD_TIER_IO_THREADS", 4))
+            cfg.ssd.shard_io_threads = int(
+                os.environ.get("UMBP_SSD_SHARD_IO_THREADS", 0)
+            )
+            cfg.ssd.single_flight_reads = os.environ.get(
+                "UMBP_SSD_SINGLE_FLIGHT", "1"
+            ) not in ("0", "")
+            # Hugepage-back the staging arena by default. _staging_plan sizes it
+            # from the sweep, so it is routinely 8 GiB+, and the arena is pinned
+            # twice: hipHostRegister for GPU access and then ibv_reg_mr for RDMA.
+            # At 4 KiB pages that second registration is ~2M pages and fails with
+            # `ibv_reg_mr and dmabuf registration both failed ... errno:12
+            # (Cannot allocate memory)`, which is FATAL -- the writer dies and the
+            # reader only sees `ReadMessageHeader(type) failed ... EOF`, giving no
+            # hint that page size was the problem. 2 MiB pages cut the count 512x
+            # and the same arena registers fine.
+            #
+            # Safe as a default: HostMemAllocator falls back to anonymous pages
+            # with a warning when MAP_HUGETLB cannot be satisfied, so a host with
+            # no hugepage pool still runs (see LogHugepageFallbackOnce).
+            dist.ssd_staging_use_hugepages = os.environ.get(
+                "UMBP_SSD_STAGING_HUGEPAGES", "1"
+            ) not in ("0", "")
+            # storage_dir is comma-separated for a multi-drive tier (one entry
+            # per physical drive), so each entry needs its own mkdir -- a single
+            # makedirs would create one literal directory named "a,b".
+            for _d in cfg.ssd.storage_dir.split(","):
+                _d = _d.strip()
+                if _d:
+                    os.makedirs(_d, exist_ok=True)
         else:
             # Keep the SSD tier dark for dram/hbm runs: cfg.ssd.enabled defaults
             # to True, and leaving it on would let the local (non-distributed)

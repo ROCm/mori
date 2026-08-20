@@ -249,9 +249,23 @@ target_link_libraries(
           gtest_main)
 add_test(NAME umbp_medium_selection COMMAND test_umbp_medium_selection)
 
+# test_umbp_pool_client_ranges — ranged multi-buffer I/O through PoolClient:
+# local range reads/writes against the node's own medium, the remote path via
+# the scratch arena, range validation, and GPU caller buffers.
+add_executable(test_umbp_pool_client_ranges test_pool_client_ranges.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_pool_client_ranges PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_pool_client_ranges
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+add_test(NAME umbp_pool_client_ranges COMMAND test_umbp_pool_client_ranges)
+
 set_tests_properties(umbp_cross_node_smoke umbp_pool_client_batch_put
-                     umbp_medium_selection umbp_tier_benchmark
-                     umbp_client_metrics_pool_bytes umbp_tags_real_master
+                     umbp_medium_selection umbp_pool_client_ranges
+                     umbp_tier_benchmark umbp_client_metrics_pool_bytes
+                     umbp_tags_real_master
                      PROPERTIES
                        LABELS "integration"
                        ENVIRONMENT
@@ -404,13 +418,20 @@ target_link_libraries(test_router_dedup PRIVATE umbp_common GTest::gtest_main)
 target_compile_features(test_router_dedup PRIVATE cxx_std_17)
 add_test(NAME test_router_dedup COMMAND test_router_dedup)
 
-# test_peer_ssd_manager — SSD tier ownership (dormant: unwired from the
-# distributed data plane, see design-backend-agnostic-refactor.md Phase 0)
+# test_peer_ssd_manager — SSD tier ownership (reachable again: SsdBackend is the
+# MediumBackend adapter that drives it)
 add_executable(test_peer_ssd_manager test_peer_ssd_manager.cpp)
 target_link_libraries(test_peer_ssd_manager PRIVATE umbp_common
                                                     GTest::gtest_main)
 target_compile_features(test_peer_ssd_manager PRIVATE cxx_std_17)
 add_test(NAME test_peer_ssd_manager COMMAND test_peer_ssd_manager)
+
+# test_peer_ssd_single_flight — same-key read coalescing (leader/follower)
+add_executable(test_peer_ssd_single_flight test_peer_ssd_single_flight.cpp)
+target_link_libraries(test_peer_ssd_single_flight PRIVATE umbp_common
+                                                          GTest::gtest_main)
+target_compile_features(test_peer_ssd_single_flight PRIVATE cxx_std_17)
+add_test(NAME test_peer_ssd_single_flight COMMAND test_peer_ssd_single_flight)
 
 # test_peer_ssd_eviction — LRU + watermark eviction + in-flight guard
 add_executable(test_peer_ssd_eviction test_peer_ssd_eviction.cpp)

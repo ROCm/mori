@@ -88,6 +88,11 @@ that has loaded `libmori_pybinds.so`).
 | `UMBP_WORKLOAD_TRACE_PATH` | empty | path | Records successful production PUT/GET calls in the benchmark trace format. Empty disables recording. |
 | `UMBP_WORKLOAD_TRACE_CLIENT_ID` | `0` | id | Logical client stream written into production trace events. |
 | `UMBP_WORKLOAD_TRACE_SEED` | `0` | seed | Payload seed stored in the trace header for deterministic replay. |
+| `UMBP_PEER_MIN_POLLERS` | `8` | count | Minimum gRPC sync poller threads on the peer service. The default pool is small, and every peer RPC that stages SSD bytes holds one of those threads for the whole device read — on a loopback read the pool, not the drive, is the binding constraint. Same head-of-line-blocking fix as `UMBP_MASTER_MIN_POLLERS`. |
+| `UMBP_PEER_MAX_POLLERS` | `64` | count | Maximum gRPC sync poller threads on the peer service. Clamped up to `UMBP_PEER_MIN_POLLERS` if set lower. |
+| `UMBP_DISTRIBUTED_SSD_STAGING_USE_HUGEPAGES` | `0` | bool | Back the SSD staging arena with hugetlbfs pages. Every byte the SSD backend moves crosses that arena twice (device <-> arena, arena <-> wire), so its TLB behaviour is on the critical path in a way an ordinary buffer's is not. Falls back to 4 KiB pages when no hugetlb pages are free — a node must still come up. Standalone server binary only; the SGLang path uses the pybind `ssd_staging_use_hugepages` field. |
+| `UMBP_DISTRIBUTED_SSD_STAGING_HUGEPAGE_SIZE` | 2 MiB | bytes | Hugepage size requested for the SSD staging arena. |
+| `UMBP_DISTRIBUTED_MEDIUM` | `DRAM` | enum | The one medium this node serves when no backend policy is given: `DRAM`, `HBM` or `SSD`. Selecting `SSD` is the whole opt-in for a storage node — there is no separate pure-SSD flag. An unknown value is rejected at startup rather than silently defaulting. Ignored once `UMBP_BACKEND_POLICY` names a policy, which describes the backends directly. Standalone server binary only; the SGLang path uses the pybind `medium` field. |
 
 ## SPDK proxy
 
@@ -123,8 +128,15 @@ Python wrapper construct one) — they are read once.
 | `UMBP_DRAM_CAPACITY` | 4 GiB | `dram.capacity_bytes`. |
 | `UMBP_DRAM_HIGH_WM` / `UMBP_DRAM_LOW_WM` | `0.9` / `0.7` | DRAM tier eviction watermarks. |
 | `UMBP_SSD_ENABLED` | `1` | `0` to disable the SSD tier entirely. |
-| `UMBP_SSD_DIR` | `/tmp/umbp_ssd` | POSIX backend root. |
-| `UMBP_SSD_CAPACITY` | 32 GiB | `ssd.capacity_bytes`. |
+| `UMBP_SSD_DIR` | `/tmp/umbp_ssd` | POSIX backend root(s).  **Comma-separated for multi-drive**, one directory per physical drive (e.g. `/mnt/nvme0,/mnt/nvme1`).  More than one turns the tier into a `ShardedSsdTier`: keys are placed on the drive with the most free space and batch IO runs on every drive at once, so the tier delivers their aggregate bandwidth. |
+| `UMBP_SSD_CAPACITY` | 32 GiB | `ssd.capacity_bytes`.  With multiple `UMBP_SSD_DIR` entries this is the TOTAL budget, split evenly across the drives.  Charged in **padded** on-disk bytes (see `UMBP_SSD_DIRECT_IO`), not raw value bytes. |
+| `UMBP_SSD_DIRECT_IO` | `1` | `ssd.direct_io` — `1` opens segments `O_DIRECT`, bypassing the page cache.  **On by default**; set `0` only to deliberately measure or exploit the page cache.  Buffered can serve an entire working set from page cache and move **zero** bytes to the device, which makes drive-count and DRAM-vs-SSD comparisons meaningless — that is why the default is direct.  Requires record format v3 (already unconditional), so a directory reads back either way. |
+| `UMBP_SSD_VERIFY_CRC` | `1` | Compute checksums on write, verify on read.  Off isolates how much of the SSD path is integrity work rather than storage — the DRAM tier does no checksumming, so an unqualified comparison conflates the two.  Records written with it off carry `kFlagNoCrc` and stay readable either way. |
+| `UMBP_SSD_TIER_IO_THREADS` | `4` | Worker threads for the CPU-bound phases *inside one drive's* batch (checksum verify on read, checksum + record assembly on write).  Matches the DRAM tier's default so a DRAM-vs-SSD comparison is not silently 4 threads against 1. |
+| `UMBP_SSD_SHARD_IO_THREADS` | `0` | Worker threads for the multi-drive fan-out.  `0` = one per drive, which is what saturates N drives.  Ignored with a single `UMBP_SSD_DIR`. |
+| `UMBP_SSD_SINGLE_FLIGHT` | `1` | Coalesce concurrent reads of the same key: the first requester touches the drive, the rest are served by memcpy from its buffer.  Exists for MLA + TP, where every attention-TP rank GETs a byte-identical key and one page is otherwise read `tp_size` times.  MHA keys carry a per-rank suffix and never collide, so this is a no-op there.  Reaches only configs built by `UMBPConfig::FromEnvironment()` — sglang's `UMBPStore` needs the pybind `single_flight_reads` field instead. |
+| `UMBP_SSD_DURABILITY` | `strict` | `strict` fdatasync()s every batch write; `relaxed` leaves it to the kernel.  Relaxed is safe for a pure cache — the bytes are re-fetchable and the peer discards leftover segments at startup — so the flush buys nothing there while costing a large share of write time.  Unknown values leave the configured mode untouched. |
+| `UMBP_SSD_TIMING` | unset | Diagnostic.  Prints a stage-by-stage `[SsdPerf/tier]`, `[SsdPerf/shard]` and `[SsdPerf/peer]` breakdown per batch (index lookup / device IO / CRC / fan-out, with implied GB/s), which is what answers "device or CPU?" without a profiler.  Several lines per batch — turn it off again after investigating. |
 | `UMBP_SSD_BACKEND` | `file` | `file` or `spdk`. Implicitly upgraded to `spdk` if `UMBP_SPDK_NVME_PCI` is set. |
 | `UMBP_EVICTION_POLICY` | `lru` | Forwarded to `eviction.policy`. |
 | `UMBP_ROLE` | (empty) | `leader` / `follower` / `standalone`. If unset, falls back to `LOCAL_RANK` / `OMPI_COMM_WORLD_LOCAL_RANK` / `SLURM_LOCALID` / `MPI_LOCALRANKID`: rank 0 → leader, others → follower. |

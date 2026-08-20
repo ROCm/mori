@@ -27,10 +27,13 @@
 #include <cstring>
 #include <stdexcept>
 #include <thread>
+#include <unordered_set>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/range_utils.h"
 #include "umbp/local/tiers/dram_tier.h"
 #include "umbp/local/tiers/dummy_ssd_tier.h"
+#include "umbp/local/tiers/ssd_backend_factory.h"
 #include "umbp/local/tiers/ssd_tier.h"
 #ifdef USE_SPDK
 #include "umbp/local/tiers/spdk_ssd_tier.h"
@@ -519,8 +522,7 @@ LocalStorageManager::LocalStorageManager(const UMBPConfig& config,
       if (role_ == UMBPRole::SharedSSDFollower) {
         segmented_access_mode = SSDAccessMode::ReadOnlyShared;
       }
-      ssd_backend = std::make_unique<SSDTier>(config_.ssd.storage_dir, config_.ssd.capacity_bytes,
-                                              config_.ssd, segmented_access_mode);
+      ssd_backend = MakeFileSsdBackend(config_.ssd, segmented_access_mode);
     }
     tiers_.push_back({StorageTier::LOCAL_SSD, std::move(ssd_backend)});
   }
@@ -710,6 +712,97 @@ std::vector<bool> LocalStorageManager::WriteBatchFromPtr(const std::vector<std::
   return results;
 }
 
+bool LocalStorageManager::WriteRangesFromPtr(const std::string& key, size_t object_size,
+                                             const std::vector<uintptr_t>& srcs,
+                                             const std::vector<size_t>& sizes,
+                                             const std::vector<size_t>& dst_offsets,
+                                             StorageTier tier) {
+  // Ranged I/O is intentionally DRAM-only in v1.
+  if (tier != StorageTier::CPU_DRAM || !RangesTileObject(object_size, sizes, dst_offsets) ||
+      srcs.size() != sizes.size()) {
+    return false;
+  }
+  TierBackend* target = GetTier(tier);
+  if (!target) return false;
+
+  std::vector<const void*> ptrs;
+  ptrs.reserve(srcs.size());
+  for (uintptr_t src : srcs) ptrs.push_back(reinterpret_cast<const void*>(src));
+
+  auto attempt = [&]() {
+    auto result = target->BatchWriteRanges({key}, {object_size}, {ptrs}, {sizes}, {dst_offsets});
+    return result.size() == 1 && result[0];
+  };
+  if (attempt()) return true;
+
+  while (DemoteLRUForSpace(target)) {
+    if (attempt()) return true;
+  }
+
+  TierBackend* faster_than_target = NextFasterTier(target->tier_id());
+  while (true) {
+    std::string victim = SelectVictim(target);
+    if (victim.empty()) return false;
+    std::vector<std::string> group = GetGroup(victim);
+    for (const auto& k : group) {
+      if (!target->Exists(k)) continue;
+      const bool only_on_target = !faster_than_target || !faster_than_target->Exists(k);
+      target->Evict(k);
+      if (only_on_target) {
+        if (on_tier_change_) {
+          on_tier_change_(k, target->tier_id(), std::nullopt, std::nullopt);
+        }
+        if (index_) index_->Remove(k);
+        RemoveDepthAndGroup(k);
+      }
+    }
+    if (attempt()) return true;
+  }
+}
+
+std::vector<bool> LocalStorageManager::WriteBatchRangesFromPtr(
+    const std::vector<std::string>& keys, const std::vector<size_t>& object_sizes,
+    const std::vector<std::vector<uintptr_t>>& srcs, const std::vector<std::vector<size_t>>& sizes,
+    const std::vector<std::vector<size_t>>& dst_offsets, StorageTier tier) {
+  const size_t n = keys.size();
+  std::vector<bool> results(n, false);
+  if (object_sizes.size() != n || !RangeBatchShapeValid(n, srcs, sizes, dst_offsets) || n == 0 ||
+      tier != StorageTier::CPU_DRAM) {
+    return results;
+  }
+
+  TierBackend* target = GetTier(tier);
+  if (!target) return results;
+
+  std::unordered_set<std::string> seen;
+  std::unordered_set<std::string> duplicates;
+  for (const auto& key : keys) {
+    if (!seen.insert(key).second) duplicates.insert(key);
+  }
+
+  std::vector<std::vector<const void*>> ptrs(n);
+  std::vector<bool> valid(n, false);
+  for (size_t i = 0; i < n; ++i) {
+    valid[i] = duplicates.count(keys[i]) == 0 &&
+               RangesTileObject(object_sizes[i], sizes[i], dst_offsets[i]);
+    ptrs[i].reserve(srcs[i].size());
+    for (uintptr_t src : srcs[i]) ptrs[i].push_back(reinterpret_cast<const void*>(src));
+  }
+  results = target->BatchWriteRanges(keys, object_sizes, ptrs, sizes, dst_offsets);
+  if (results.size() != n) results.assign(n, false);
+  for (size_t i = 0; i < n; ++i) {
+    if (duplicates.count(keys[i]) != 0) results[i] = false;
+  }
+
+  for (size_t i = 0; i < n; ++i) {
+    if (!results[i] && valid[i]) {
+      results[i] =
+          WriteRangesFromPtr(keys[i], object_sizes[i], srcs[i], sizes[i], dst_offsets[i], tier);
+    }
+  }
+  return results;
+}
+
 bool LocalStorageManager::ReadIntoPtr(const std::string& key, uintptr_t dst, size_t size) {
   bool ok = ReadIntoPtrNoPromote(key, dst, size);
   if (ok && config_.eviction.auto_promote_on_read) {
@@ -829,6 +922,21 @@ std::vector<bool> LocalStorageManager::ReadBatchIntoPtr(const std::vector<std::s
     results[idx] = ReadIntoPtr(keys[idx], dst_ptrs[idx], sizes[idx]);
   }
 
+  return results;
+}
+
+std::vector<bool> LocalStorageManager::ReadBatchRangesIntoPtr(
+    const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dst_ptrs,
+    const std::vector<std::vector<size_t>>& sizes,
+    const std::vector<std::vector<size_t>>& src_offsets) {
+  const size_t n = keys.size();
+  std::vector<bool> results(n, false);
+  if (!RangeBatchShapeValid(n, dst_ptrs, sizes, src_offsets) || n == 0) return results;
+
+  TierBackend* dram = GetTier(StorageTier::CPU_DRAM);
+  if (!dram) return results;
+  results = dram->ReadBatchRangesIntoPtr(keys, dst_ptrs, sizes, src_offsets);
+  if (results.size() != n) results.assign(n, false);
   return results;
 }
 
