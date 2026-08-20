@@ -11,41 +11,13 @@
 namespace mori::umbp {
 namespace {
 
-constexpr const char* kPolicy = R"json(
-{
-  "schema_version": 1,
-  "entry_tier": "hot",
-  "backends": {
-    "hbm":   { "type": "hbm", "capacity": "80GiB", "devices": [0, 1] },
-    "dram":  { "type": "dram", "capacity": "512GiB", "numa_node": 0 },
-    "ssd_a": { "type": "ssd", "capacity": "1TiB", "path": "/mnt/kvcache/hot" },
-    "ssd_b": { "type": "ssd", "capacity": "3TiB", "path": "/mnt/kvcache/cold" }
-  },
-  "tiers": [
-    {
-      "name": "hot",
-      "backends": { "hbm": 100 },
-      "offload_to": ["warm"],
-      "offload_trigger": "on_evict"
-    },
-    {
-      "name": "warm",
-      "backends": { "dram": 70, "ssd_a": 30 },
-      "offload_to": ["cold"],
-      "offload_trigger": "watermark"
-    },
-    {
-      "name": "cold",
-      "backends": { "ssd_b": 100 },
-      "promote_on_read": true
-    }
-  ]
-}
-)json";
-
-TEST(BackendPolicyConfig, ParsesAndLowersDocumentedTopology) {
-  auto loaded = LoadBackendPolicyJson(kPolicy);
-  ASSERT_TRUE(loaded.ok()) << loaded.error;
+// The three-tier example we ship, read from disk rather than copied here, so
+// that editing one without the other fails this test.
+TEST(BackendPolicyConfig, ParsesAndLowersShippedExample) {
+  auto loaded = LoadBackendPolicyFile(UMBP_EXAMPLE_POLICY_PATH);
+  ASSERT_TRUE(loaded.ok()) << UMBP_EXAMPLE_POLICY_PATH << ": " << loaded.error;
+  EXPECT_EQ(loaded.config->schema_version, 1u);
+  EXPECT_EQ(loaded.config->entry_tier, "hot");
   ASSERT_EQ(loaded.config->backends.size(), 4u);
   ASSERT_EQ(loaded.config->logical_tiers.size(), 3u);
 
@@ -70,6 +42,8 @@ TEST(BackendPolicyConfig, ParsesAndLowersDocumentedTopology) {
   ASSERT_NE(find_backend("ssd_a"), nullptr);
   EXPECT_EQ(find_backend("ssd_a")->ssd.ssd.storage_dir, "/mnt/kvcache/hot-node-0");
 
+  // One backend with two devices lowers to one member per device, splitting the
+  // declared capacity evenly, so the tier weights stay equal.
   ASSERT_EQ(output.logical_tiers[0].members.size(), 2u);
   EXPECT_EQ(output.logical_tiers[0].members[0].weight,
             output.logical_tiers[0].members[1].weight);
@@ -78,8 +52,18 @@ TEST(BackendPolicyConfig, ParsesAndLowersDocumentedTopology) {
   EXPECT_EQ(output.logical_tiers[0].trigger, PoolOffloadTrigger::kOnEvict);
   EXPECT_EQ(output.logical_tiers[0].name, "hot");
   EXPECT_TRUE(output.logical_tiers[0].entry);
+
+  ASSERT_EQ(output.logical_tiers[1].members.size(), 2u);
+  EXPECT_EQ(output.logical_tiers[1].members[0].backend_name, "dram");
+  EXPECT_EQ(output.logical_tiers[1].members[0].weight, 70u);
+  EXPECT_EQ(output.logical_tiers[1].members[1].backend_name, "ssd_a");
+  EXPECT_EQ(output.logical_tiers[1].members[1].weight, 30u);
   EXPECT_EQ(output.logical_tiers[1].trigger, PoolOffloadTrigger::kWatermark);
+  EXPECT_DOUBLE_EQ(output.logical_tiers[1].high_watermark, 0.9);
+  EXPECT_DOUBLE_EQ(output.logical_tiers[1].low_watermark, 0.7);
+
   EXPECT_TRUE(output.logical_tiers[2].promote_on_read);
+  EXPECT_EQ(output.logical_tiers[2].promotion_mode, PoolTransitionMode::kCopy);
   EXPECT_TRUE(output.logical_tiers[2].offload_to.empty());
 }
 

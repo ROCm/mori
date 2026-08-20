@@ -138,6 +138,13 @@ add_test(NAME umbp_types COMMAND test_umbp_types)
 add_executable(test_umbp_backend_policy_config test_backend_policy_config.cpp)
 target_link_libraries(test_umbp_backend_policy_config PRIVATE umbp_common
                                                               gtest_main)
+# The test loads the example policy shipped in configs/ instead of keeping its
+# own copy, so the file and the parser cannot drift apart unnoticed.
+target_compile_definitions(
+  test_umbp_backend_policy_config
+  PRIVATE
+    UMBP_EXAMPLE_POLICY_PATH="${CMAKE_SOURCE_DIR}/examples/umbp/multi_backend_policy.json"
+)
 add_test(NAME umbp_backend_policy_config
          COMMAND test_umbp_backend_policy_config)
 

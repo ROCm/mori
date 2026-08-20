@@ -46,42 +46,24 @@ weights, logical tiers, watermarks — is described by `--config`, which is the
 same policy format the product reads:
 
 ```bash
-./build/src/umbp/umbp_tier_bench run --config policy.json \
+./build/src/umbp/umbp_tier_bench run \
+  --config examples/umbp/multi_backend_policy.json \
   --profile capacity-pressure --operations 1000 --page-size 2MiB
 ```
 
+That file is the complete example: HBM in front of DRAM and two SSDs, three
+tiers, weighted members. The `umbp_backend_policy_config` test loads it, so the
+example and the parser cannot drift apart. A single tier from it, which is where
+the placement and migration knobs live:
+
 ```json
 {
-  "schema_version": 1,
-  "entry_tier": "hot",
-  "backends": {
-    "hbm":   { "type": "hbm", "capacity": "80GiB", "devices": [0, 1] },
-    "dram":  { "type": "dram", "capacity": "512GiB", "numa_node": 0 },
-    "ssd_a": { "type": "ssd", "capacity": "1TiB", "path": "/mnt/kvcache/hot" },
-    "ssd_b": { "type": "ssd", "capacity": "3TiB", "path": "/mnt/kvcache/cold" }
-  },
-  "tiers": [
-    {
-      "name": "hot",
-      "backends": { "hbm": 100 },
-      "offload_to": ["warm"],
-      "offload_trigger": "on_evict"
-    },
-    {
-      "name": "warm",
-      "backends": { "dram": 70, "ssd_a": 30 },
-      "offload_to": ["cold"],
-      "offload_trigger": "watermark",
-      "high_watermark": 0.9,
-      "low_watermark": 0.7
-    },
-    {
-      "name": "cold",
-      "backends": { "ssd_b": 100 },
-      "promote_on_read": true,
-      "promotion_mode": "copy"
-    }
-  ]
+  "name": "warm",
+  "backends": { "dram": 70, "ssd_a": 30 },
+  "offload_to": ["cold"],
+  "offload_trigger": "watermark",
+  "high_watermark": 0.9,
+  "low_watermark": 0.7
 }
 ```
 
