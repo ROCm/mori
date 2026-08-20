@@ -24,8 +24,8 @@
 // reduce_scatter_kernels.hpp
 //
 // Device/template kernels for the reduce-scatter example. Both modes share the
-// same streaming load/store, reduction op functors, and the generic vectorized
-// reduce core (ReduceVecGroup):
+// same streaming load/store, reduction op functors (see reduce_ops.hpp), and the
+// generic vectorized reduce core (ReduceVecGroup):
 //
 //   * ReduceScatterPushKernel  — fused SDMA "push" scatter + receiver-side
 //                                completion signal + grid-strided reduce.
@@ -39,8 +39,9 @@
 #include <array>
 #include <cstdint>
 
-#include "mori/collective/XLA/collectives_common.hpp"  
-#include "mori/core/transport/p2p/device_primitives.hpp"  // Bf16BitsToF32
+#include "mori/collective/XLA/collectives_common.hpp"
+#include "mori/collective/XLA/reduce_ops.hpp"
+#include "mori/core/transport/p2p/device_primitives.hpp"
 #include "mori/shmem/shmem.hpp"
 #include "mori/shmem/internal.hpp"
 
@@ -57,79 +58,6 @@ using namespace mori::collective;
 #ifndef RS_USE_BUFFER_REDUCE
 #define RS_USE_BUFFER_REDUCE 0
 #endif
-
-// ---------------------------------------------------------------------------
-// Reduction Op functors. The accumulator stays in the element type T (so bf16
-// reduces in bf16-width registers -- half the VGPRs of a float accumulator and
-// no spilling for the 8x8 register tile). Numerical accuracy of the add is
-// handled inside the Op functor: SumOp<hip_bfloat16> promotes each add to float
-// and rounds the result back to bf16 (per-add rounding, not a float running sum).
-// ---------------------------------------------------------------------------
-template < class T >
-struct AccumulatorType {
-  using type = T;
-};
-
-// Generic up/down cast (identity for float; specialize for fp16/bf16 if needed).
-template <typename T>
-__device__ __forceinline__ typename AccumulatorType<T>::type UpcastF(T v) {
-  return static_cast<typename AccumulatorType<T>::type>(v);
-}
-
-template <typename T>
-__device__ __forceinline__ T DowncastF(typename AccumulatorType<T>::type v) {
-  return static_cast<T>(v);
-}
-
-template < typename T >
-struct SumOp {
-  using Type = T;
-  __device__ T operator()(T a, T b) { return a + b; }
-};
-template < class T>
-struct MaxOp {
-  using Type = T;
-  __device__ T operator()(T a, T b) { return std::max(a, b); }
-};
-template < class T >
-struct MinOp {
-  using Type = T;
-  __device__ T operator()(T a, T b) { return std::min(a, b); }
-};
-template < class T >
-struct ProdOp {
-  using Type = T;
-  __device__ T operator()(T a, T b) { return a * b; }
-};
-
-struct alignas(4) BF16Pack {
-  hip_bfloat16 x, y;
-};
-static_assert(sizeof(BF16Pack) == 4 && alignof(BF16Pack) == 4);
-
-template <>
-struct SumOp<BF16Pack> {
-  using Type = BF16Pack;
-  __device__ BF16Pack operator()(BF16Pack a, BF16Pack b) {
-    const uint32_t ua = __builtin_bit_cast(uint32_t, a);
-    const uint32_t ub = __builtin_bit_cast(uint32_t, b);
-    const float x = Bf16BitsToF32(static_cast<uint16_t>(ua)) +
-                    Bf16BitsToF32(static_cast<uint16_t>(ub));
-    const float y = Bf16BitsToF32(static_cast<uint16_t>(ua >> 16)) +
-                    Bf16BitsToF32(static_cast<uint16_t>(ub >> 16));
-    const auto r = static_cast<__hip_bfloat162_raw>(__float22bfloat162_rn(float2{x, y}));
-    const auto packed = static_cast<uint32_t>(r.x) | (static_cast<uint32_t>(r.y) << 16);
-    return __builtin_bit_cast(BF16Pack, packed);
-  }
-};
-
-// Maps a storage element type to the type used to INSTANTIATE the reduce kernels.
-// float reduces as float; bf16 reduces as a packed pair (BF16Pack) so vecSize stays
-// at fp32 parity and the 8x8 accumulator tile does not spill. Data buffers stay
-// physically ElemT; host code reinterpret_casts them to ComputeT and passes counts
-// in packs (kPack = sizeof(ComputeT)/sizeof(ElemT)).
-template <class T> struct ReduceComputeType { using type = T; };
-template <> struct ReduceComputeType<hip_bfloat16> { using type = BF16Pack; };
 
 // Reduce one group of NV vectors (each NV-member at vector index g + i*gstride)
 // across all npes staging slots into the output. Callers guarantee every member
@@ -294,6 +222,7 @@ template <int NumVecs, class ReduceOp, class T = typename ReduceOp::Type>
 __device__ __forceinline__ void ReduceScatterPushBody(
     int myPe, int npes, int logS, const T* __restrict__ input,
     T* __restrict__ staging, T* __restrict__ shardOut, size_t chunkElems) {
+
   if (blockIdx.x == 0) {
     // reduce-scatter: per-peer source slice (stride=chunkElems), dst=staging,
     // no self-copy (self is folded in by the Phase-3 reduce reading local input).
@@ -424,7 +353,16 @@ __global__ void __launch_bounds__(256, 1)
 ReduceScatterPushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
                                     T* __restrict__ staging, T* __restrict__ output,
                                     uint32_t* __restrict__ groupCounters, size_t chunkElems) {
-  // Phase 1-3 (scatter + completion wait + acquire + grid-strided reduce) into
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    auto val = 1 + atomicAdd(&barrier_remote, 1);
+    while (val % npes != 0) {
+      __builtin_amdgcn_s_sleep(1);
+      val = __hip_atomic_load(&barrier_remote, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+  }
+  __syncthreads();
+  
+                                      // Phase 1-3 (scatter + completion wait + acquire + grid-strided reduce) into
   // this PE's shard-sized output buffer.
   ReduceScatterPushBody<NumVecs, ReduceOp, T>(myPe, npes, logS, input, staging, output,
                                               chunkElems);

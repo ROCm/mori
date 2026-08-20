@@ -68,38 +68,77 @@
 #include <vector>
 
 #include <hip/hip_bfloat16.h>
+#include <hip/hip_fp16.h>
+
+#define MORI_KERNELS_IMPL
 
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/application/utils/check.hpp"
 #include "mori/core/transport/p2p/device_primitives.hpp"  // load<N>/store<N>
 #include "mori/shmem/shmem.hpp"
 #include "mori/shmem/internal.hpp"
+#include "mori/collective/collectives_facade.hpp"
 
 using namespace mori::core;
 using namespace mori::shmem;
 using namespace mori::application;
+using mori::collective::ReduceOpKind;
+using mori::collective::DataType;
+using mori::collective::CollectivesFacade;
 
-using ElemT = float;  // element type used by the test instantiation
-//using ElemT = hip_bfloat16;  // element type used by the test instantiation
+using ElemT = __half;  // element type used by the test instantiation
+// using ElemT = hip_bfloat16;
+// using ElemT = float;
+// using ElemT = int32_t;
+// using ElemT = int64_t;
 #define XPUT(fmt, ...) fprintf(stderr, fmt "\n", ##__VA_ARGS__)
 
-// Central facade that owns staging/counters and launches the collective kernels
-// (push/pull), hiding all host-side sizing/mode logic.
-// This standalone example is the single TU that compiles the facade Run*
-// definitions, so it opts in to the device-only impl section.
-#define MORI_KERNELS_IMPL
-#include "mori/collective/collectives_facade.hpp"
 
-static_assert(std::is_same<ElemT, float>::value || std::is_same<ElemT, hip_bfloat16>::value,
-              "reduce_scatter_test supports only float and hip_bfloat16");
+static_assert(std::is_same<ElemT, float>::value || std::is_same<ElemT, hip_bfloat16>::value ||
+                  std::is_same<ElemT, __half>::value || std::is_same<ElemT, int32_t>::value ||
+                  std::is_same<ElemT, int64_t>::value,
+              "reduce_scatter_test supports float, hip_bfloat16, __half, int32_t, int64_t");
+
+constexpr DataType kDataType = []() {
+  if constexpr (std::is_same<ElemT, float>::value) return DataType::F32;
+  if constexpr (std::is_same<ElemT, hip_bfloat16>::value) return DataType::BF16;
+  if constexpr (std::is_same<ElemT, __half>::value) return DataType::F16;
+  if constexpr (std::is_same<ElemT, int32_t>::value) return DataType::S32;
+  if constexpr (std::is_same<ElemT, int64_t>::value) return DataType::S64;
+  return DataType::F32;
+}();
+
+const char *DataTypeName(DataType dt) {
+#define ITEM(x) case DataType::x: return #x;
+  switch (dt) {
+    DATA_TYPE_LIST(ITEM)
+    default:
+      return "?";
+  }
+#undef ITEM
+}
+
+static const char* ReduceOpName(ReduceOpKind op) {
+  switch (op) {
+    case ReduceOpKind::SUM:
+      return "SUM";
+    case ReduceOpKind::PRODUCT:
+      return "PRODUCT";
+    case ReduceOpKind::MIN:
+      return "MIN";
+    case ReduceOpKind::MAX:
+      return "MAX";
+  }
+  return "?";
+}
 
 // ---------------------------------------------------------------------------
 // Fill / verify kernels
 // ---------------------------------------------------------------------------
-// input[k] = (myPe + 1) + (k % 8). All small integers (exact in float). With
-// this pattern the reduce-scatter SUM result on shard owned by PE q is:
-//   output_q[j] = sum_p[(p+1) + ((q*chunkElems + j) % 8)]
-//              = npes*(npes+1)/2 + npes * ((q*chunkElems + j) % 8)
+// input[k] = (myPe + 1) + (k % 8). All small integers (exact in float/bf16
+// storage). Expected output is a sequential fold over peers (seed PE 0, then
+// 1..npes-1) of that term, with a round-trip through ElemT after each op so
+// packed per-op bf16 rounding matches the kernel.
 __global__ void FillPatternKernel(ElemT* buf, size_t numElements, int myPe) {
   for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < numElements;
        i += (size_t)gridDim.x * blockDim.x) {
@@ -108,13 +147,30 @@ __global__ void FillPatternKernel(ElemT* buf, size_t numElements, int myPe) {
 }
 
 __global__ void VerifyKernel(const ElemT* output, size_t chunkElems, int myPe, int npes,
-                             uint32_t* errorCount) {
-  const float base = static_cast<float>(npes) * (npes + 1) / 2.0f;
+                             ReduceOpKind op, uint32_t* errorCount) {
   for (size_t j = blockIdx.x * blockDim.x + threadIdx.x; j < chunkElems;
        j += (size_t)gridDim.x * blockDim.x) {
     size_t globalIdx = static_cast<size_t>(myPe) * chunkElems + j;
-    float expected = base + static_cast<float>(npes) * static_cast<float>(globalIdx % 8);
-    if (fabsf(static_cast<float>(output[j]) - expected) > 1e-3f) {
+    float acc = static_cast<float>(1 + static_cast<int>(globalIdx % 8));
+    for (int p = 1; p < npes; p++) {
+      float term = static_cast<float>((p + 1) + static_cast<int>(globalIdx % 8));
+      switch (op) {
+        case ReduceOpKind::SUM:
+          acc += term;
+          break;
+        case ReduceOpKind::PRODUCT:
+          acc *= term;
+          break;
+        case ReduceOpKind::MIN:
+          acc = fminf(acc, term);
+          break;
+        case ReduceOpKind::MAX:
+          acc = fmaxf(acc, term);
+          break;
+      }
+      acc = static_cast<float>(static_cast<ElemT>(acc));
+    }
+    if (fabsf(static_cast<float>(output[j]) - acc) > 1e-3f) {
       atomicAdd(errorCount, 1u);
     }
   }
@@ -157,8 +213,8 @@ static void RunReduceScatterThreadedTest(size_t numElems, const UniqueId& uid, T
   ShmemBarrierAll();
 
   if (info.deviceId == 0) {
-    XPUT("reduce_scatter_test: %d PEs, %zu bytes/shard (%zu elems), %zu bytes input/PE", npes,
-         chunkBytes, chunkElems, inBytes);
+    XPUT("reduce_scatter_test: %d PEs, %zu bytes/shard (%zu elems), %zu bytes input/PE, dtype=%s",
+         npes, chunkBytes, chunkElems, inBytes, DataTypeName(kDataType));
   }
 
   hipStream_t stream;
@@ -205,71 +261,81 @@ static void RunReduceScatterThreadedTest(size_t numElems, const UniqueId& uid, T
   }
   ShmemBarrierAll();
 
-  // --- Benchmark ---
+  constexpr ReduceOpKind kOps[] = {
+      ReduceOpKind::SUM, ReduceOpKind::PRODUCT,
+      ReduceOpKind::MIN, ReduceOpKind::MAX};
+
   constexpr int nWarmup = 2;
   constexpr int nRuns = 5;
   hipEvent_t tStart, tStop;
   HIP_RUNTIME_CHECK(hipEventCreate(&tStart));
   HIP_RUNTIME_CHECK(hipEventCreate(&tStop));
 
-  float totalMs = 0, minMs = 1e9f, maxMs = 0;
-  for (int iter = 0; iter < nWarmup + nRuns; iter++) {
-    ShmemBarrierAll();
-    HIP_RUNTIME_CHECK(hipEventRecord(tStart, stream));
-    // Reduce-scatter over the full input into this PE's shard; the facade picks
-    // push vs pull (RS_MODE) and all block/slice sizing internally. `count` is
-    // the per-rank shard element count (full input = chunkElems * npes).
-    facade->RunReduceScatter(input, output, chunkElems, mori::collective::DataType::F32,
-                             mori::collective::ReduceOpKind::SUM, stream);
-    HIP_RUNTIME_CHECK(hipEventRecord(tStop, stream));
-    HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
-
-    float iterMs = 0;
-    HIP_RUNTIME_CHECK(hipEventElapsedTime(&iterMs, tStart, tStop));
-    if (iter >= nWarmup) {
-      totalMs += iterMs;
-      minMs = std::min(minMs, iterMs);
-      maxMs = std::max(maxMs, iterMs);
-    }
-  }
-
-  // After every PE's last kernel has been stream-synced above, each PE has
-  // observed all incoming completion signals -> every outgoing DMA (incoming to
-  // some peer) has landed. This host barrier makes that global before teardown,
-  // so no in-flight peer DMA can target our staging after we free it.
-  ShmemBarrierAll();
-
-  float avgMs = totalMs / nRuns;
-  // Bytes scattered over the network per PE ~ input bytes (N elements).
-  double avgBw = (inBytes / 1e9) / (avgMs / 1e3);
-  double maxBw = (inBytes / 1e9) / (minMs / 1e3);
-
-  // --- Verify (last iteration result) ---
   uint32_t* dErrors;
   HIP_RUNTIME_CHECK(hipMalloc(&dErrors, sizeof(uint32_t)));
-  HIP_RUNTIME_CHECK(hipMemsetAsync(dErrors, 0, sizeof(uint32_t), stream));
   int vBlocks =
       static_cast<int>(std::min<size_t>(1024, (chunkElems + kThreads - 1) / kThreads));
-  VerifyKernel<<<vBlocks, kThreads, 0, stream>>>(output, chunkElems, myPe, npes, dErrors);
-  uint32_t hErrors = 0;
-  HIP_RUNTIME_CHECK(hipMemcpyAsync(&hErrors, dErrors, sizeof(uint32_t), hipMemcpyDeviceToHost, stream));
-  HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
-  HIP_RUNTIME_CHECK(hipFree(dErrors));
 
-  if (hErrors != 0 || myPe == 0) {
-    XPUT("Rank %d: %s | %d warmup + %d runs | avg %.3f ms (%.3f GB/s) "
-       "min %.3f ms (%.3f GB/s) max %.3f ms\n--------------------",
-       myPe, hErrors == 0 ? "PASS" : "FAIL", nWarmup, nRuns, avgMs, avgBw, minMs, maxBw,
-       maxMs);
+  int nFailed = 0;
+  for (auto op : kOps) {
+    float totalMs = 0, minMs = 1e9f, maxMs = 0;
+    hipError_t launchErr = hipSuccess;
+    for (int iter = 0; iter < nWarmup + nRuns; iter++) {
+      ShmemBarrierAll();
+      HIP_RUNTIME_CHECK(hipEventRecord(tStart, stream));
+      launchErr = facade->RunReduceScatter(input, output, chunkElems, kDataType, op, stream);
+      HIP_RUNTIME_CHECK(hipEventRecord(tStop, stream));
+      HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
+      if (launchErr != hipSuccess) break;
+
+      float iterMs = 0;
+      HIP_RUNTIME_CHECK(hipEventElapsedTime(&iterMs, tStart, tStop));
+      if (iter >= nWarmup) {
+        totalMs += iterMs;
+        minMs = std::min(minMs, iterMs);
+        maxMs = std::max(maxMs, iterMs);
+      }
+    }
+
+    ShmemBarrierAll();
+
+    uint32_t hErrors = 0;
+    if (launchErr != hipSuccess) {
+      hErrors = 1;
+      if (myPe == 0) {
+        XPUT("Rank %d: FAIL op=%s launch=%s", myPe, ReduceOpName(op), hipGetErrorString(launchErr));
+      }
+    } else {
+      float avgMs = totalMs / nRuns;
+      double avgBw = (inBytes / 1e9) / (avgMs / 1e3);
+      double maxBw = (inBytes / 1e9) / (minMs / 1e3);
+
+      HIP_RUNTIME_CHECK(hipMemsetAsync(dErrors, 0, sizeof(uint32_t), stream));
+      VerifyKernel<<<vBlocks, kThreads, 0, stream>>>(output, chunkElems, myPe, npes, op, dErrors);
+      HIP_RUNTIME_CHECK(hipMemcpyAsync(&hErrors, dErrors, sizeof(uint32_t), hipMemcpyDeviceToHost,
+                                       stream));
+      HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
+
+      if (hErrors != 0 || myPe == 0) {
+        XPUT("Rank %d: %s op=%s | %d warmup + %d runs | avg %.3f ms (%.3f GB/s) "
+             "min %.3f ms (%.3f GB/s) max %.3f ms",
+             myPe, hErrors == 0 ? "PASS" : "FAIL", ReduceOpName(op), nWarmup, nRuns, avgMs, avgBw,
+             minMs, maxBw, maxMs);
+      }
+    }
+    if (hErrors != 0) nFailed++;
   }
 
+  ShmemBarrierAll();
+
+  HIP_RUNTIME_CHECK(hipFree(dErrors));
   HIP_RUNTIME_CHECK(hipEventDestroy(tStart));
   HIP_RUNTIME_CHECK(hipEventDestroy(tStop));
   HIP_RUNTIME_CHECK(hipStreamDestroy(stream));
   facade.reset();
   ShmemFree(baseBuf);
   ShmemFinalize();
-  info.ret_code = 0;
+  info.ret_code = nFailed == 0 ? 0 : -1;
 }
 
 // ---------------------------------------------------------------------------

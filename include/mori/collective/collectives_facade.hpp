@@ -73,6 +73,7 @@
     defined(__gfx1250__)
 #define MORI_FACADE_COLLECTIVES_ARCH 1
 #include <hip/hip_bfloat16.h>
+#include <hip/hip_fp16.h>
 #include "mori/collective/XLA/all_gather_kernels.hpp"
 #include "mori/collective/XLA/all_reduce_kernels.hpp"
 #include "mori/collective/XLA/all_to_all_kernels.hpp"
@@ -85,11 +86,27 @@
 namespace mori {
 namespace collective {
 
+#define DATA_TYPE_LIST(V) \
+  V(F8E5M2) \
+  V(F8E4M3FN) \
+  V(F16) \
+  V(BF16) \
+  V(S8) \
+  V(U8) \
+  V(S32) \
+  V(U32) \
+  V(S64) \
+  V(U64) \
+  V(F32) \
+  V(F64)
+
 // Numeric element type of the reduce collectives, expressed as a plain enum so
 // the facade public API stays non-templated. The type/op -> kernel dispatch
 // happens inside the (device) Run* definitions.
 enum class DataType {
-  F8E5M2, F8E4M3FN, F16, BF16, S8, U8, S32, U32, S64, U64, F32, F64
+  #define DECLARE_ENUM(enum_name) enum_name,
+    DATA_TYPE_LIST(DECLARE_ENUM)
+  #undef DECLARE_ENUM
 };
 
 // Reduction operation for the reduce collectives.
@@ -180,15 +197,15 @@ class CollectivesFacade {
   // output is this PE's reduced shard. `count` is the per-rank shard element
   // count (chunk = count); the full input is npes*count. RS_MODE=push|pull
   // selects the algorithm; RS_LOG_PUSH_SLICES tunes the push slice count. `dt`
-  // and `op` select the element type and reduction; the definition dispatches to
-  // the matching kernel (currently only F32/kSum is implemented).
+  // and `op` select the element type and reduction; F32/BF16/F16/S32/S64
+  // support all four ops (SUM/PRODUCT/MIN/MAX).
   hipError_t RunReduceScatter(const void* input, void* output, size_t count,
                               DataType dt, ReduceOpKind op, hipStream_t stream);
 
   // All-reduce: input is the full N = npes*chunk vector (symmetric heap), output
   // is the full reduced N vector (symmetric heap). numElems is the TOTAL element
   // count (chunk = numElems / npes). Push-only (npes in [1,8]). `dt`/`op` select
-  // the element type and reduction (currently only F32/kSum is implemented).
+  // the element type and reduction; F32/BF16/F16/S32/S64 support all four ops.
   hipError_t RunAllReduce(const void* input, void* output, size_t numElems,
                           DataType dt, ReduceOpKind op, hipStream_t stream);
 
@@ -258,6 +275,23 @@ class CollectivesFacade {
 namespace detail {
 // Device-wide barrier: one thread issues the cross-PE shmem barrier.
 __global__ void BarrierKernel() { mori::shmem::ShmemBarrierAllThread(); }
+
+template <class T, class F>
+hipError_t DispatchReduceOp(ReduceOpKind op, F&& f) {
+  using C = typename ReduceComputeType<T>::type;
+  switch (op) {
+    case ReduceOpKind::SUM:
+      return f(static_cast<SumOp<C>*>(nullptr));
+    case ReduceOpKind::PRODUCT:
+      return f(static_cast<ProdOp<C>*>(nullptr));
+    case ReduceOpKind::MIN:
+      return f(static_cast<MinOp<C>*>(nullptr));
+    case ReduceOpKind::MAX:
+      return f(static_cast<MaxOp<C>*>(nullptr));
+    default:
+      return hipErrorNotSupported;
+  }
+}
 }  // namespace detail
 
 template <class T, class Op>
@@ -318,13 +352,31 @@ hipError_t CollectivesFacade::reduceScatterImpl(const void* input_v, void* outpu
   return hipGetLastError();
 }
 
-// Enum entry point: dispatch (dt, op) to the implemented reduceScatterImpl. Only
-// F32/kSum is wired up today; add cases here as more kernels land.
+// Enum entry point: dispatch (dt, op) to reduceScatterImpl for F32/BF16/F16/S32/S64
+// and all four reduction ops.
 hipError_t CollectivesFacade::RunReduceScatter(const void* input, void* output, size_t count,
                                                DataType dt, ReduceOpKind op, hipStream_t stream) {
-  if (dt == DataType::F32 && op == ReduceOpKind::SUM)
-    return reduceScatterImpl<float, ::SumOp<float>>(input, output, count, stream);
-  return hipErrorNotSupported;
+  auto go = [&](auto* typeTag) {
+    using T = std::remove_pointer_t<decltype(typeTag)>;
+    return detail::DispatchReduceOp<T>(op, [&](auto* opTag) {
+      using Op = std::remove_pointer_t<decltype(opTag)>;
+      return this->reduceScatterImpl<T, Op>(input, output, count, stream);
+    });
+  };
+  switch (dt) {
+    case DataType::F32:
+      return go(static_cast<float*>(nullptr));
+    case DataType::BF16:
+      return go(static_cast<hip_bfloat16*>(nullptr));
+    case DataType::F16:
+      return go(static_cast<__half*>(nullptr));
+    case DataType::S32:
+      return go(static_cast<int32_t*>(nullptr));
+    case DataType::S64:
+      return go(static_cast<int64_t*>(nullptr));
+    default:
+      return hipErrorNotSupported;
+  }
 }
 
 template <class T, class Op>
@@ -369,13 +421,31 @@ hipError_t CollectivesFacade::allReduceImpl(const void* input_v, void* output_v,
   return hipGetLastError();
 }
 
-// Enum entry point: dispatch (dt, op) to the implemented allReduceImpl. Only
-// F32/kSum is wired up today; add cases here as more kernels land.
+// Enum entry point: dispatch (dt, op) to allReduceImpl for F32/BF16/F16/S32/S64
+// and all four reduction ops.
 hipError_t CollectivesFacade::RunAllReduce(const void* input, void* output, size_t numElems,
                                            DataType dt, ReduceOpKind op, hipStream_t stream) {
-  if (dt == DataType::F32 && op == ReduceOpKind::SUM)
-    return allReduceImpl<float, ::SumOp<float>>(input, output, numElems, stream);
-  return hipErrorNotSupported;
+  auto go = [&](auto* typeTag) {
+    using T = std::remove_pointer_t<decltype(typeTag)>;
+    return detail::DispatchReduceOp<T>(op, [&](auto* opTag) {
+      using Op = std::remove_pointer_t<decltype(opTag)>;
+      return this->allReduceImpl<T, Op>(input, output, numElems, stream);
+    });
+  };
+  switch (dt) {
+    case DataType::F32:
+      return go(static_cast<float*>(nullptr));
+    case DataType::BF16:
+      return go(static_cast<hip_bfloat16*>(nullptr));
+    case DataType::F16:
+      return go(static_cast<__half*>(nullptr));
+    case DataType::S32:
+      return go(static_cast<int32_t*>(nullptr));
+    case DataType::S64:
+      return go(static_cast<int64_t*>(nullptr));
+    default:
+      return hipErrorNotSupported;
+  }
 }
 
 hipError_t CollectivesFacade::RunAllGather(const void* input, void* output, size_t chunkBytes,

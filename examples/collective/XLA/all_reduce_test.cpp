@@ -58,6 +58,7 @@
 #include <vector>
 
 #include <hip/hip_bfloat16.h>
+#include <hip/hip_fp16.h>
 
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/application/utils/check.hpp"
@@ -65,12 +66,6 @@
 #include "mori/shmem/shmem.hpp"
 #include "mori/shmem/internal.hpp"
 
-using namespace mori::core;
-using namespace mori::shmem;
-using namespace mori::application;
-
-using ElemT = float;  // element type used by the test instantiation
-//using ElemT = hip_bfloat16;  // element type used by the test instantiation
 #define XPUT(fmt, ...) fprintf(stderr, fmt "\n", ##__VA_ARGS__)
 
 // Central facade that owns staging/counters and launches the collective kernels,
@@ -80,8 +75,42 @@ using ElemT = float;  // element type used by the test instantiation
 #define MORI_KERNELS_IMPL
 #include "mori/collective/collectives_facade.hpp"
 
-static_assert(std::is_same<ElemT, float>::value || std::is_same<ElemT, hip_bfloat16>::value,
-              "all_reduce_test supports only float and hip_bfloat16");
+using namespace mori::core;
+using namespace mori::shmem;
+using namespace mori::application;
+using mori::collective::ReduceOpKind;
+using mori::collective::DataType;
+using mori::collective::CollectivesFacade;
+
+using ElemT = float;  // element type used by the test instantiation
+// using ElemT = __half;
+// using ElemT = hip_bfloat16;
+// using ElemT = int32_t;
+// using ElemT = int64_t;
+
+static_assert(std::is_same<ElemT, float>::value || std::is_same<ElemT, hip_bfloat16>::value ||
+                  std::is_same<ElemT, __half>::value || std::is_same<ElemT, int32_t>::value ||
+                  std::is_same<ElemT, int64_t>::value,
+              "all_reduce_test supports float, hip_bfloat16, __half, int32_t, int64_t");
+
+constexpr DataType kDataType = []() {
+  if constexpr (std::is_same<ElemT, float>::value) return DataType::F32;
+  if constexpr (std::is_same<ElemT, hip_bfloat16>::value) return DataType::BF16;
+  if constexpr (std::is_same<ElemT, __half>::value) return DataType::F16;
+  if constexpr (std::is_same<ElemT, int32_t>::value) return DataType::S32;
+  if constexpr (std::is_same<ElemT, int64_t>::value) return DataType::S64;
+  return DataType::F32;
+}();
+
+const char* DataTypeName(DataType dt) {
+#define ITEM(x) case DataType::x: return #x;
+  switch (dt) {
+    DATA_TYPE_LIST(ITEM)
+    default:
+      return "?";
+  }
+#undef ITEM
+}
 
 // ---------------------------------------------------------------------------
 // Fill / verify kernels
@@ -153,8 +182,8 @@ static void RunAllReduceThreadedTest(size_t numElems, const UniqueId& uid, Threa
   ShmemBarrierAll();
 
   if (info.deviceId == 0) {
-    XPUT("all_reduce_test: %d PEs, %zu bytes/shard (%zu elems), %zu bytes input/PE", npes,
-         chunkBytes, chunkElems, inBytes);
+    XPUT("all_reduce_test: %d PEs, %zu bytes/shard (%zu elems), %zu bytes input/PE, dtype=%s",
+         npes, chunkBytes, chunkElems, inBytes, DataTypeName(kDataType));
   }
 
   hipStream_t stream;
@@ -212,8 +241,7 @@ static void RunAllReduceThreadedTest(size_t numElems, const UniqueId& uid, Threa
     HIP_RUNTIME_CHECK(hipEventRecord(tStart, stream));
     // Fused all-reduce (reduce-scatter push + pipelined per-slice broadcast); the
     // facade handles block/slice sizing internally.
-    facade->RunAllReduce(input, output, N, mori::collective::DataType::F32,
-                         mori::collective::ReduceOpKind::SUM, stream);
+    facade->RunAllReduce(input, output, N, kDataType, ReduceOpKind::SUM, stream);
     HIP_RUNTIME_CHECK(hipEventRecord(tStop, stream));
     HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
 
