@@ -118,16 +118,15 @@ jobs:
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
           chmod +x "$SCRIPT"
 
-          # batch=1: 512 iters (chunking ON by default; no --batch-contiguous).
-          # batch=64: tuned write sweep (batch-contiguous, disable-chunking, 8 workers).
+          # Sweep: 256 MiB .. 512 MiB by 64 MiB (268435456, step 67108864).
           COMMON_BATCH1="--op-type write --mem-type gpu --all \
-            --sweep-start-size 1048576 --sweep-max-size 33554432 --sweep-step 1048576 \
+            --sweep-start-size 268435456 --sweep-max-size 536870912 --sweep-step 67108864 \
             --num-qp-per-transfer 8 --enable-sess --poll_cq_mode polling \
             --num-initiator-dev 1 --num-target-dev 1 --target-dev-offset 0 \
             --log-level info"
 
           BATCH64_CPP="--op write --mem-type gpu --gpu 0 --target-dev-offset 0 \
-            --all --sweep-start-size 1048576 --sweep-max-size 33554432 --sweep-step 1048576 \
+            --all --sweep-start-size 268435456 --sweep-max-size 536870912 --sweep-step 67108864 \
             --transfer-batch-size 64 --enable-batch-transfer --batch-contiguous \
             --enable-sess --disable-chunking \
             --num-qp-per-transfer 8 --num-worker-threads 8 \
@@ -136,7 +135,7 @@ jobs:
             --log-level info"
 
           BATCH64_PY="--op-type write --mem-type gpu --target-dev-offset 0 \
-            --all --sweep-start-size 1048576 --sweep-max-size 33554432 --sweep-step 1048576 \
+            --all --sweep-start-size 268435456 --sweep-max-size 536870912 --sweep-step 67108864 \
             --transfer-batch-size 64 --enable-batch-transfer --batch-contiguous \
             --enable-sess --disable-chunking \
             --num-qp-per-transfer 8 --num-worker-threads 8 \
