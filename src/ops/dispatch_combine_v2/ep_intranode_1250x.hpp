@@ -264,6 +264,29 @@ constexpr int CeilingPowerOfTwo(int value) {
   return result;
 }
 
+template <int WaveSize, typename ElementType>
+__device__ __forceinline__ void CopyMetadataRemainder(ElementType* destination,
+                                                      const ElementType* source,
+                                                      int headElementCount, int bodyElementCount,
+                                                      int totalElementCount, int laneIndex) {
+  for (int elementIndex = laneIndex; elementIndex < headElementCount; elementIndex += WaveSize) {
+    destination[elementIndex] = source[elementIndex];
+  }
+  for (int elementIndex = headElementCount + bodyElementCount + laneIndex;
+       elementIndex < totalElementCount; elementIndex += WaveSize) {
+    destination[elementIndex] = source[elementIndex];
+  }
+}
+
+template <int WaveSize, typename ElementType>
+__device__ __forceinline__ void CopyMetadataField(ElementType* destination,
+                                                  const ElementType* source, int elementCount,
+                                                  int laneIndex) {
+  for (int elementIndex = laneIndex; elementIndex < elementCount; elementIndex += WaveSize) {
+    destination[elementIndex] = source[elementIndex];
+  }
+}
+
 /* ------------------------------------------------------------------------- */
 /*                                  Dispatch                                  */
 /* ------------------------------------------------------------------------- */
@@ -361,7 +384,8 @@ __device__ void EpDispatch1250xBody(EpArgs arguments) {
         (destinationRank >= 0 && laneIndex == (__ffsll((long long)matchingLaneMask) - 1)) ? 1 : 0;
     if (laneProcessesToken) {
       if (isRepresentativeLane) {
-        atomicAdd(&destinationTokenCounts[destinationRank], 1);
+        __hip_atomic_fetch_add(&destinationTokenCounts[destinationRank], 1, __ATOMIC_RELAXED,
+                               __HIP_MEMORY_SCOPE_WORKGROUP);
       } else {
         arguments.dispDestTokIdMap[(size_t)token * ExpertsPerToken + expertIndexWithinToken] =
             EpNullFlat<Config>();
@@ -381,7 +405,8 @@ __device__ void EpDispatch1250xBody(EpArgs arguments) {
           __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
       _cusplit_blkBase[(size_t)blockIdx.x * WorldSize + destinationRank] =
           destinationSlotBases[destinationRank];
-      atomicAdd(&arguments.destPeTokenCounter[destinationRank], destinationTokenCount);
+      __hip_atomic_fetch_add(&arguments.destPeTokenCounter[destinationRank], destinationTokenCount,
+                             __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
   }
   __syncthreads();
@@ -420,7 +445,9 @@ __device__ void EpDispatch1250xBody(EpArgs arguments) {
                                    : 0;
     index_t destinationTokenIndex = -1;
     if (isRepresentativeLane) {
-      index_t blockLocalTokenOffset = atomicAdd(&destinationRunningOffsets[destinationRank], 1);
+      index_t blockLocalTokenOffset =
+          __hip_atomic_fetch_add(&destinationRunningOffsets[destinationRank], 1, __ATOMIC_RELAXED,
+                                 __HIP_MEMORY_SCOPE_WORKGROUP);
       destinationTokenIndex = destinationSlotBases[destinationRank] + blockLocalTokenOffset;
       arguments.dispDestTokIdMap[(size_t)token * ExpertsPerToken + expertIndexWithinToken] =
           EpFlatIndex<Config>(destinationRank, destinationTokenIndex);
@@ -482,18 +509,15 @@ __device__ void EpDispatch1250xBody(EpArgs arguments) {
 
   // ---- METADATA FIRST (its cross-device writes drain under the payload phase) ----
   bool metadataStorePending = false;
-  const int MetadataExpertsPerToken = ExpertsPerToken;
-  const index_t ReceiveCapacity = (index_t)EpMaxRecv(Config);
-  const index_t MetadataStagingCapacity = (index_t)(CUSPLIT_POOL_SLOTS / WorldSize);
+  constexpr index_t ReceiveCapacity = (index_t)EpMaxRecv(Config);
   // One warp owns a complete (peer, sub-range) run and moves all metadata through one tile.
-  const int MetadataTileBytes = (int)(HiddenDimension * sizeof(ElementType));
-  const int MetadataBytesPerToken = MetadataExpertsPerToken * 4 + MetadataExpertsPerToken * 4 + 4;
+  constexpr int TileBytes = (int)(HiddenDimension * sizeof(ElementType));
+  constexpr int BytesPerToken = ExpertsPerToken * 4 + ExpertsPerToken * 4 + 4;
   // 384B slack covers rounding each of the 3 field regions up to a 128B boundary.
-  const int MetadataTokensPerTile =
-      (MetadataBytesPerToken > 0) ? ((MetadataTileBytes - 384) / MetadataBytesPerToken) : 0;
-  if (MetadataTokensPerTile > 0) {
-    uint8_t* metadataTile = reinterpret_cast<uint8_t*>(tensorDataMovementSharedMemory) +
-                            (size_t)warpIndex * MetadataTileBytes;
+  constexpr int TokensPerTile = (BytesPerToken > 0) ? ((TileBytes - 384) / BytesPerToken) : 0;
+  if constexpr (TokensPerTile > 0) {
+    uint8_t* metadataTile =
+        reinterpret_cast<uint8_t*>(tensorDataMovementSharedMemory) + (size_t)warpIndex * TileBytes;
     // Use one warp per peer when runs are short, otherwise multiple warps per peer.
     //
     // What a coarser cut buys is ROW WIDTH with the load still perfectly balanced. At 512 tokens
@@ -512,10 +536,10 @@ __device__ void EpDispatch1250xBody(EpArgs arguments) {
     // geometry instead of hard-coding the two shapes that happen to have been benchmarked. At 512
     // tokens over 512 warps this is 1 token/warp and takes split 1; at 4096 it is 8 and takes
     // split 2, which is byte-for-byte the old behaviour.
-    const int PartitionsPerPeer =
-        (WorldSize > 0 && WarpsPerWorkGroup >= WorldSize) ? (WarpsPerWorkGroup / WorldSize) : 1;
+    constexpr int PartitionsPerPeer =
+        (WarpsPerWorkGroup >= WorldSize) ? (WarpsPerWorkGroup / WorldSize) : 1;
     const int partitionsPerPeer =
-        (warpCount > 0 && arguments.numTokens <= (index_t)warpCount * 2) ? 1 : PartitionsPerPeer;
+        (arguments.numTokens <= (index_t)warpCount * 2) ? 1 : PartitionsPerPeer;
     const int metadataRunCount = WorldSize * partitionsPerPeer;
     for (int metadataRunIndex = warpIndex; metadataRunIndex < metadataRunCount;
          metadataRunIndex += WarpsPerWorkGroup) {
@@ -535,43 +559,42 @@ __device__ void EpDispatch1250xBody(EpArgs arguments) {
       index_t partitionTokenCount =
           tokensPerPartition + ((partitionIndex < partitionsWithExtraToken) ? 1 : 0);
       for (index_t chunkTokenOffset = 0; chunkTokenOffset < partitionTokenCount;
-           chunkTokenOffset += MetadataTokensPerTile) {
-        int chunkTokenCount =
-            (int)((chunkTokenOffset + MetadataTokensPerTile <= partitionTokenCount)
-                      ? MetadataTokensPerTile
-                      : (partitionTokenCount - chunkTokenOffset));
+           chunkTokenOffset += TokensPerTile) {
+        int chunkTokenCount = (int)((chunkTokenOffset + TokensPerTile <= partitionTokenCount)
+                                        ? TokensPerTile
+                                        : (partitionTokenCount - chunkTokenOffset));
         index_t destinationSlotBegin =
             destinationSlotBase + partitionTokenOffset + chunkTokenOffset;
         if (destinationSlotBegin + chunkTokenCount > ReceiveCapacity) {
           continue;
         }
-        if (destinationSlotBegin + chunkTokenCount > MetadataStagingCapacity) {
+        if (destinationSlotBegin + chunkTokenCount > StagingCapacity) {
           continue;
         }
-        const int indexElementCount = chunkTokenCount * MetadataExpertsPerToken,
-                  weightElementCount = chunkTokenCount * MetadataExpertsPerToken;
+        const int indexElementCount = chunkTokenCount * ExpertsPerToken,
+                  weightElementCount = chunkTokenCount * ExpertsPerToken;
         index_t* stagedExpertIndexSource =
-            _cusplit_stgIdx + (size_t)destinationRank * MetadataStagingCapacity * CUSPLIT_MAX_TOPK +
-            (size_t)destinationSlotBegin * MetadataExpertsPerToken;
-        float* stagedWeightSource =
-            _cusplit_stgWt + (size_t)destinationRank * MetadataStagingCapacity * CUSPLIT_MAX_TOPK +
-            (size_t)destinationSlotBegin * MetadataExpertsPerToken;
+            _cusplit_stgIdx + (size_t)destinationRank * StagingCapacity * CUSPLIT_MAX_TOPK +
+            (size_t)destinationSlotBegin * ExpertsPerToken;
+        float* stagedWeightSource = _cusplit_stgWt +
+                                    (size_t)destinationRank * StagingCapacity * CUSPLIT_MAX_TOPK +
+                                    (size_t)destinationSlotBegin * ExpertsPerToken;
         index_t* stagedSourceTokenSource = _cusplit_stgSrc +
-                                           (size_t)destinationRank * MetadataStagingCapacity +
+                                           (size_t)destinationRank * StagingCapacity +
                                            (size_t)destinationSlotBegin;
         index_t* remoteExpertIndexDestination =
             EpPeer<index_t>(window, destinationRank, arguments.offOutIdx) +
-            (size_t)destinationSlotBegin * MetadataExpertsPerToken;
+            (size_t)destinationSlotBegin * ExpertsPerToken;
         float* remoteWeightDestination =
             (Config.useWeights && arguments.weightsBuf)
                 ? (EpPeer<float>(window, destinationRank, arguments.offOutWts) +
-                   (size_t)destinationSlotBegin * MetadataExpertsPerToken)
+                   (size_t)destinationSlotBegin * ExpertsPerToken)
                 : nullptr;
         index_t* remoteSourceTokenDestination =
             EpPeer<index_t>(window, destinationRank, arguments.offRecvToSrc) +
             (size_t)destinationSlotBegin;
-        const TdmSplit128 expertIndexTransferSplit = TdmWholeOrSplit128(
-            (size_t)destinationSlotBegin * MetadataExpertsPerToken, indexElementCount);
+        const TdmSplit128 expertIndexTransferSplit =
+            TdmWholeOrSplit128((size_t)destinationSlotBegin * ExpertsPerToken, indexElementCount);
         const TdmSplit128 weightTransferSplit =
             (remoteWeightDestination != nullptr) ? expertIndexTransferSplit : TdmSplit128{0, 0, 0};
         const TdmSplit128 sourceTokenTransferSplit =
@@ -614,31 +637,19 @@ __device__ void EpDispatch1250xBody(EpArgs arguments) {
               sourceTokenTransferShape);
         }
         // Unaligned heads/tails and fields too small for two rows copy directly.
-#define COPY_METADATA_REMAINDER(destinationPointer, sourcePointer, headCount, bodyCount,        \
-                                totalCount)                                                     \
-  do {                                                                                          \
-    for (int elementIndex = laneIndex; elementIndex < (headCount); elementIndex += WaveSize) {  \
-      (destinationPointer)[elementIndex] = (sourcePointer)[elementIndex];                       \
-    }                                                                                           \
-    for (int elementIndex = (headCount) + (bodyCount) + laneIndex; elementIndex < (totalCount); \
-         elementIndex += WaveSize) {                                                            \
-      (destinationPointer)[elementIndex] = (sourcePointer)[elementIndex];                       \
-    }                                                                                           \
-  } while (0)
-        COPY_METADATA_REMAINDER(reinterpret_cast<int*>(remoteExpertIndexDestination),
-                                reinterpret_cast<int*>(stagedExpertIndexSource),
-                                expertIndexTransferSplit.head, expertIndexTransferSplit.body,
-                                indexElementCount);
+        CopyMetadataRemainder<WaveSize>(
+            reinterpret_cast<int*>(remoteExpertIndexDestination),
+            reinterpret_cast<int*>(stagedExpertIndexSource), expertIndexTransferSplit.head,
+            expertIndexTransferSplit.body, indexElementCount, laneIndex);
         if (remoteWeightDestination) {
-          COPY_METADATA_REMAINDER(reinterpret_cast<int*>(remoteWeightDestination),
-                                  reinterpret_cast<int*>(stagedWeightSource),
-                                  weightTransferSplit.head, weightTransferSplit.body,
-                                  weightElementCount);
+          CopyMetadataRemainder<WaveSize>(reinterpret_cast<int*>(remoteWeightDestination),
+                                          reinterpret_cast<int*>(stagedWeightSource),
+                                          weightTransferSplit.head, weightTransferSplit.body,
+                                          weightElementCount, laneIndex);
         }
-        COPY_METADATA_REMAINDER(remoteSourceTokenDestination, stagedSourceTokenSource,
-                                sourceTokenTransferSplit.head, sourceTokenTransferSplit.body,
-                                chunkTokenCount);
-#undef COPY_METADATA_REMAINDER
+        CopyMetadataRemainder<WaveSize>(remoteSourceTokenDestination, stagedSourceTokenSource,
+                                        sourceTokenTransferSplit.head,
+                                        sourceTokenTransferSplit.body, chunkTokenCount, laneIndex);
         if (expertIndexTransferSplit.body || weightTransferSplit.body ||
             sourceTokenTransferSplit.body) {
           __builtin_amdgcn_s_wait_tensorcnt(0);
@@ -682,40 +693,31 @@ __device__ void EpDispatch1250xBody(EpArgs arguments) {
       if (destinationSlotBase + destinationTokenCount > ReceiveCapacity) {
         continue;
       }
-      if (destinationSlotBase + destinationTokenCount > MetadataStagingCapacity) {
+      if (destinationSlotBase + destinationTokenCount > StagingCapacity) {
         continue;
       }
       if (metadataFieldIndex == 0) {
         index_t* source = _cusplit_stgIdx +
-                          (size_t)destinationRank * MetadataStagingCapacity * CUSPLIT_MAX_TOPK +
-                          (size_t)destinationSlotBase * MetadataExpertsPerToken;
+                          (size_t)destinationRank * StagingCapacity * CUSPLIT_MAX_TOPK +
+                          (size_t)destinationSlotBase * ExpertsPerToken;
         index_t* destination = EpPeer<index_t>(window, destinationRank, arguments.offOutIdx) +
-                               (size_t)destinationSlotBase * MetadataExpertsPerToken;
-        for (int elementIndex = laneIndex;
-             elementIndex < (int)destinationTokenCount * MetadataExpertsPerToken;
-             elementIndex += WaveSize) {
-          destination[elementIndex] = source[elementIndex];
-        }
+                               (size_t)destinationSlotBase * ExpertsPerToken;
+        CopyMetadataField<WaveSize>(destination, source,
+                                    (int)destinationTokenCount * ExpertsPerToken, laneIndex);
       } else if (metadataFieldIndex == 1) {
         float* source = _cusplit_stgWt +
-                        (size_t)destinationRank * MetadataStagingCapacity * CUSPLIT_MAX_TOPK +
-                        (size_t)destinationSlotBase * MetadataExpertsPerToken;
+                        (size_t)destinationRank * StagingCapacity * CUSPLIT_MAX_TOPK +
+                        (size_t)destinationSlotBase * ExpertsPerToken;
         float* destination = EpPeer<float>(window, destinationRank, arguments.offOutWts) +
-                             (size_t)destinationSlotBase * MetadataExpertsPerToken;
-        for (int elementIndex = laneIndex;
-             elementIndex < (int)destinationTokenCount * MetadataExpertsPerToken;
-             elementIndex += WaveSize) {
-          destination[elementIndex] = source[elementIndex];
-        }
+                             (size_t)destinationSlotBase * ExpertsPerToken;
+        CopyMetadataField<WaveSize>(destination, source,
+                                    (int)destinationTokenCount * ExpertsPerToken, laneIndex);
       } else {
-        index_t* source = _cusplit_stgSrc + (size_t)destinationRank * MetadataStagingCapacity +
+        index_t* source = _cusplit_stgSrc + (size_t)destinationRank * StagingCapacity +
                           (size_t)destinationSlotBase;
         index_t* destination = EpPeer<index_t>(window, destinationRank, arguments.offRecvToSrc) +
                                (size_t)destinationSlotBase;
-        for (int elementIndex = laneIndex; elementIndex < (int)destinationTokenCount;
-             elementIndex += WaveSize) {
-          destination[elementIndex] = source[elementIndex];
-        }
+        CopyMetadataField<WaveSize>(destination, source, (int)destinationTokenCount, laneIndex);
       }
     }
   }
@@ -780,7 +782,7 @@ __device__ void EpDispatch1250xBody(EpArgs arguments) {
 
   // ---- Completion: all blocks arrive, then per-peer release-signal ----
   if (threadIndex == 0) {
-    atomicAdd(arguments.gridBarrier, 1u);
+    __hip_atomic_fetch_add(arguments.gridBarrier, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
   }
   index_t* receivedTokenSignals = EpLocal<index_t>(window, arguments.offRecvNum);
   if (globalWarpIndex == 0) {
@@ -821,7 +823,8 @@ __device__ void EpDispatch1250xBody(EpArgs arguments) {
       index_t* sourceSignal = receivedTokenSignals + sourceRank;
       index_t receivedTokenCount = EpWaitGt(sourceSignal, 0) - 1;
       __hip_atomic_store(sourceSignal, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-      atomicAdd(arguments.totalRecvTokenNum, receivedTokenCount);
+      __hip_atomic_fetch_add(arguments.totalRecvTokenNum, receivedTokenCount, __ATOMIC_RELAXED,
+                             __HIP_MEMORY_SCOPE_AGENT);
       arguments.destPeTokenCounter[sourceRank] = 0;
     }
     if (laneIndex == 0) {
@@ -845,7 +848,9 @@ __device__ __forceinline__ void EpCrossDeviceBarrier1250x(EpArgs args, unsigned 
   const unsigned long long win = args.window;
 
   __syncthreads();
-  if (thdId == 0) atomicAdd(args.gridBarrier, 1u);
+  if (thdId == 0) {
+    __hip_atomic_fetch_add(args.gridBarrier, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  }
 
   if (globalThdId < npes) {
     EpWaitEq(args.gridBarrier, static_cast<unsigned int>(gridDim.x));
@@ -854,7 +859,9 @@ __device__ __forceinline__ void EpCrossDeviceBarrier1250x(EpArgs args, unsigned 
     __hip_atomic_store(EpPeer<unsigned long long>(win, globalThdId, args.offXdb) + args.rank, flag,
                        __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
   }
-  if (globalThdId == 0) atomicAdd(args.xdbFlag, 1ull);
+  if (globalThdId == 0) {
+    __hip_atomic_fetch_add(args.xdbFlag, 1ull, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  }
 
   unsigned long long* localBarrier = EpLocal<unsigned long long>(win, args.offXdb);
   unsigned int* fanLines = reinterpret_cast<unsigned int*>(args.combineBarrierFan);

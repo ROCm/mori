@@ -86,11 +86,11 @@ __device__ __forceinline__ T EpWaitGt(T* addr, T val) {
 // index handed out by the destination's tokOff counter, which runs to EpMaxRecv.
 // A smaller stride aliases peer p slot s onto peer p+1 slot s-stride.
 template <EpCfg kCfg>
-__device__ __forceinline__ int EpFlatStride() {
+__device__ __forceinline__ constexpr int EpFlatStride() {
   return EpMaxRecv(kCfg);
 }
 template <EpCfg kCfg>
-__device__ __forceinline__ int EpFlatIndex(int pe, int localTokId) {
+__device__ __forceinline__ constexpr int EpFlatIndex(int pe, int localTokId) {
   return pe * EpFlatStride<kCfg>() + localTokId;
 }
 // The reverse map ("tis": recv slot -> global source token id) is a PUBLIC output
@@ -99,22 +99,22 @@ __device__ __forceinline__ int EpFlatIndex(int pe, int localTokId) {
 // maxTokPerRank. FlyDSL publishes rank*maxTokPerRank + srcTok, so this must match
 // or one handle decodes differently per backend.
 template <EpCfg kCfg>
-__device__ __forceinline__ int EpSrcTokIndex(int pe, int srcTokId) {
+__device__ __forceinline__ constexpr int EpSrcTokIndex(int pe, int srcTokId) {
   return pe * kCfg.maxTokPerRank + srcTokId;
 }
 template <EpCfg kCfg>
-__device__ __forceinline__ int EpPeFromFlat(int flat) {
+__device__ __forceinline__ constexpr int EpPeFromFlat(int flat) {
   return flat / EpFlatStride<kCfg>();
 }
 template <EpCfg kCfg>
-__device__ __forceinline__ int EpLocalTokFromFlat(int flat) {
+__device__ __forceinline__ constexpr int EpLocalTokFromFlat(int flat) {
   return flat % EpFlatStride<kCfg>();
 }
 // "No destination": decodes to pe == worldSize, which combine reads as a null
 // source. Must use the SAME stride as the encoder -- with a mismatched stride it
 // decodes to a real peer and combine silently folds in someone else's token.
 template <EpCfg kCfg>
-__device__ __forceinline__ int EpNullFlat() {
+__device__ __forceinline__ constexpr int EpNullFlat() {
   return kCfg.worldSize * EpFlatStride<kCfg>();
 }
 
