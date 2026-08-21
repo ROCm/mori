@@ -740,18 +740,6 @@ __device__ __forceinline__ void EpCrossDeviceBarrier1250x(EpArgs args, bool need
     }
     __syncthreads();
   }
-  // ACQUIRE, and only the staging path needs one. The gather's sources include this
-  // rank itself, and when this kernel staged out_tok a DIFFERENT block -- so a
-  // different CU -- wrote the rows we are about to read, leaving our vector L1 holding
-  // the previous call's line for that address. Dropping this fails the staged half of
-  // the identity check at every token count, while the in-place half keeps passing:
-  // there, nothing in this kernel wrote out_tok and the launch acquire still stands.
-  //
-  // Device scope is enough, and that is the whole story: the window's remote mappings
-  // are uncached (cco_init.cpp CcoWindowAllocType) so peer rows are never stale, and
-  // what is left is an intra-device, cross-CU hazard. SCOPE_SYS also passes but pays
-  // for a system-wide writeback nobody needs. Per block by necessity -- there is no
-  // grid-wide ordering point after this barrier.
   // No acquire before the gather. Peer rows are read through the window's remote
   // mapping, which is uncached (cco_init.cpp CcoWindowAllocType), so they are never
   // stale; our own rows are covered by the staging release above plus the launch
