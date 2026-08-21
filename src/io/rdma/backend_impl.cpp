@@ -1463,6 +1463,91 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
   }
 }
 
+// Prepared-transfer handle for the RDMA backend: owns the built (sorted/merged/chunked)
+// work-request list so PostPrepared can re-arm and re-post it.
+struct RdmaPreparedTransfer : public PreparedTransfer {
+  explicit RdmaPreparedTransfer(const RdmaBackendSession* owner_) : owner(owner_) {}
+
+  // The WR addresses were built from this session's memory descriptors, so posting
+  // the handle through a different session would pair those addresses with foreign
+  // QPs and memory regions.
+  const RdmaBackendSession* const owner;
+  PreparedRdmaBatch batch;
+  // Every post re-arms the WR list in place (lkey/rkey, wr_id, send_flags, next).
+  // Serializing posts of the SAME handle keeps two callers from interleaving that
+  // re-arm; distinct handles remain fully parallel.
+  std::mutex postMu;
+};
+
+std::shared_ptr<PreparedTransfer> RdmaBackendSession::PrepareBatch(const SizeVec& localOffsets,
+                                                                   const SizeVec& remoteOffsets,
+                                                                   const SizeVec& sizes,
+                                                                   bool isRead) {
+  MORI_IO_FUNCTION_TIMER;
+  if (eps.empty() || localMrPerEp.empty() || remoteMrPerEp.empty()) {
+    MORI_IO_WARN("PrepareBatch: session has no endpoints or memory regions");
+    return nullptr;
+  }
+
+  // Prepared batches are posted inline on the calling thread, matching the inline
+  // branch of BatchReadWrite. Sessions configured with an executor still prepare
+  // and post correctly, but the posting work is not spread over worker threads.
+  const bool chunk = config.enableTransferChunking;
+  RdmaTransferControl control{};
+  control.chunkBytes = chunk ? config.chunkBytes : 0;
+  control.maxChunks = config.maxChunksPerTransfer;
+  control.creditByWrCount = chunk;
+
+  auto handle = std::make_shared<RdmaPreparedTransfer>(this);
+  RdmaOpRet ret = BuildPreparedRdmaBatch(eps, localMrPerEp.front(), remoteMrPerEp.front(),
+                                         localOffsets, remoteOffsets, sizes, isRead, control,
+                                         config.postBatchSize, handle->batch);
+  if (ret.Failed()) {
+    MORI_IO_WARN("PrepareBatch failed to build work requests: {}", ret.message);
+    return nullptr;
+  }
+  return handle;
+}
+
+void RdmaBackendSession::PostPrepared(const std::shared_ptr<PreparedTransfer>& prepared,
+                                      TransferStatus* status, TransferUniqueId id) {
+  MORI_IO_FUNCTION_TIMER;
+  status->SetCode(StatusCode::IN_PROGRESS);
+
+  auto* handle = dynamic_cast<RdmaPreparedTransfer*>(prepared.get());
+  if (handle == nullptr || !handle->batch.valid) {
+    status->Update(StatusCode::ERR_INVALID_ARGS, "invalid prepared transfer handle");
+    return;
+  }
+  if (handle->owner != this) {
+    status->Update(StatusCode::ERR_INVALID_ARGS,
+                   "prepared transfer belongs to a different RDMA session");
+    return;
+  }
+
+  // When crediting by WR count, PostPreparedRdmaBatch overwrites this with the final
+  // WR count (control.ownsTotalBatchSize); otherwise the credit is one per descriptor.
+  const int totalCredit = static_cast<int>(handle->batch.batchSize);
+  auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, totalCredit);
+  internal::PublishCurrentIoCallDiagnostics(callbackMeta);
+
+  RdmaOpRet ret;
+  {
+    std::lock_guard<std::mutex> postLock(handle->postMu);
+    ret = PostPreparedRdmaBatch(eps, localMrPerEp, remoteMrPerEp, handle->batch, callbackMeta, id);
+  }
+  assert(!ret.Init());
+  if (ret.Failed() || ret.Succeeded()) {
+    status->Update(ret.code, ret.message);
+  }
+  if (!ret.Failed() && config.enableNotification) {
+    RdmaOpRet notifRet = RdmaNotifyTransfer(eps, status, id);
+    if (notifRet.Failed()) {
+      status->Update(notifRet.code, notifRet.message);
+    }
+  }
+}
+
 bool RdmaBackendSession::Alive() const { return true; }
 
 /* ----------------------------------------------------------------------------------------------
