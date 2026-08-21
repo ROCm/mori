@@ -30,6 +30,11 @@ from setuptools.command.build import build as _build
 from setuptools.command.build_ext import build_ext
 
 try:
+    from torch.utils.cpp_extension import CppExtension as _TorchCppExtension
+except ImportError:  # torch is optional at build time
+    _TorchCppExtension = None
+
+try:
     from Cython.Build import cythonize as _cythonize
 
     _HAVE_CYTHON = True
@@ -462,8 +467,33 @@ class CMakeBuild(build_ext):
         if mpi_enabled:
             _REQUIRED_SYSTEM_DEPS.extend(_MPI_SYSTEM_DEPS)
         _check_system_deps()
+        torch_exts = [
+            e for e in self.extensions if getattr(e, "_mori_torch_ext", False)
+        ]
         for ext in self.extensions:
-            self.build_extension(ext)
+            if ext not in torch_exts:
+                self.build_extension(ext)
+        if torch_exts:
+            self._build_with_torch(torch_exts)
+
+    def _build_with_torch(self, exts: list) -> None:
+        """Build torch-linked extensions with torch's own build_ext, in a separate
+        command instance so nothing else in this build sees torch's compiler patches.
+
+        torch derives _GLIBCXX_USE_CXX11_ABI, its bundled pybind11 and the module's ABI
+        tag from the installed torch; hand-rolling those is what we are avoiding."""
+        from torch.utils.cpp_extension import BuildExtension
+
+        cmd = BuildExtension(self.distribution)
+        cmd.initialize_options()
+        cmd.inplace = self.inplace
+        cmd.build_lib = self.build_lib
+        cmd.build_temp = self.build_temp
+        cmd.force = self.force
+        cmd.finalize_options()
+        # after finalize_options, which would otherwise reset this to all ext_modules
+        cmd.extensions = exts
+        cmd.run()
 
     def build_extension(self, ext: Extension) -> None:
         if ext.sources and any(s.endswith((".pyx", ".cpp")) for s in ext.sources):
@@ -861,14 +891,46 @@ def _cco_extension() -> list:
     )
 
 
-extensions = [
-    Extension(
-        "mori",
-        sources=[],
-        # extra_compile_args=['-ggdb', '-O0'],
-        # extra_link_args=['-g'],
-    ),
-] + _cco_extension()
+def _torch_symm_extension():
+    """SymmetricMemory backend. Built by torch's cpp_extension, not CMake: it is the
+    only target that links libtorch, and torch's build_ext is what keeps the ABI flag,
+    pybind11 copy and module suffix consistent with the installed torch."""
+    if _TorchCppExtension is None:
+        return []
+    rocm = os.environ.get("ROCM_PATH", "/opt/rocm")
+    # Absolute: torch's ninja compiler writes its build file into build_temp and runs
+    # ninja from there, so a relative -I would resolve against the wrong directory.
+    ext = _TorchCppExtension(
+        name="mori.mori_torch_symm",
+        sources=["src/allocator/symm_backend.cpp"],
+        include_dirs=[str(_root_dir.resolve() / "include"), f"{rocm}/include"],
+        library_dirs=[f"{rocm}/lib"],
+        libraries=["amdhip64", "c10_hip", "torch_hip"],
+        extra_compile_args=["-std=c++17"]
+        # barrier/put_signal/wait_signal are unimplemented, so the signal pad is not
+        # reserved by default; it would cost a whole 2 MiB page on a page-aligned window.
+        + (
+            ["-DMORI_SYMM_SIGNAL_PAD=1"]
+            if _env_flag("MORI_SYMM_SIGNAL_PAD", "OFF")
+            else []
+        ),
+    )
+    ext._mori_torch_ext = True
+    return [ext]
+
+
+extensions = (
+    [
+        Extension(
+            "mori",
+            sources=[],
+            # extra_compile_args=['-ggdb', '-O0'],
+            # extra_link_args=['-g'],
+        ),
+    ]
+    + _cco_extension()
+    + _torch_symm_extension()
+)
 
 mori_package_data = [
     "libmori_cco.so",
