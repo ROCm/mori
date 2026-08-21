@@ -589,8 +589,7 @@ check_intra_node_bw() {
     [[ ${#all_devs[@]} -gt 0 ]] || { log_fail "no local RDMA devices found (check ibv_devices)"; return 1; }
     log_ok "local RDMA devices (${#all_devs[@]}): ${all_devs[*]}"
 
-    # Group by name prefix, like the remote side: the sysfs vendor id is empty for
-    # auxiliary-bus RDMA devices, which dropped 8x ionic in favour of 1x mlx5.
+    # Group by name prefix, like the remote side below.
     # Exported via LOCAL_DEVS for inter-node tests.
     dominant_group LOCAL_DEVS "${all_devs[@]}"
     if (( ${#all_devs[@]} != ${#LOCAL_DEVS[@]} )); then
@@ -1264,10 +1263,22 @@ LOCAL_DEVS=()
 # bnxt_re management NIC can't steal the checks away from 8x mlx5 GPU NICs.
 _VENDOR_IDS=(ionic:0x1dd8 bnxt:0x14e4 mlx:0x15b3)
 
+# <dev sysfs dir> -> its PCI vendor id. "device" can be an auxiliary device
+# (.../0000:c1:00.0/ionic.rdma.0) with no "vendor" node, so walk up to the PCI one.
+ib_pci_vendor() {
+    local p; p=$(readlink -f "$1/device" 2>/dev/null) || return
+    local i
+    for (( i = 0; i < 6; i++ )); do
+        [[ "$p" == /sys/devices/* ]] || return
+        [[ -r "$p/vendor" ]] && { cat "$p/vendor"; return; }
+        p=$(dirname "$p")
+    done
+}
+
 ib_count_vendor() {   # <pci_vendor_id> -> number of matching IB devices
     local vid="$1" d n=0
     for d in /sys/class/infiniband/*; do
-        [[ "$(cat "$d/device/vendor" 2>/dev/null)" == "$vid" ]] && (( n++ ))
+        [[ "$(ib_pci_vendor "$d")" == "$vid" ]] && (( n++ ))
     done
     echo "$n"
 }
