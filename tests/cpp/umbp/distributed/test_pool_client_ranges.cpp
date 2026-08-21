@@ -124,10 +124,12 @@ class PoolClientRangesTest : public ::testing::Test {
 
     caller_dram_.resize(kCallerCapacity);
     target_dram_.resize(kTargetCapacity);
-    caller_scratch_.resize(kScratchSize);
-    target_scratch_.resize(kScratchSize);
-    caller_ = MakeClient("ranges-caller", caller_dram_, caller_scratch_);
-    target_ = MakeClient("ranges-target", target_dram_, target_scratch_);
+    caller_get_scratch_.resize(kScratchSize);
+    caller_put_scratch_.resize(kScratchSize);
+    target_get_scratch_.resize(kScratchSize);
+    target_put_scratch_.resize(kScratchSize);
+    caller_ = MakeClient("ranges-caller", caller_dram_, caller_get_scratch_, caller_put_scratch_);
+    target_ = MakeClient("ranges-target", target_dram_, target_get_scratch_, target_put_scratch_);
   }
 
   void TearDown() override {
@@ -141,7 +143,8 @@ class PoolClientRangesTest : public ::testing::Test {
   }
 
   std::unique_ptr<PoolClient> MakeClient(const std::string& node_id, std::vector<char>& dram,
-                                         std::vector<char>& scratch) {
+                                         std::vector<char>& get_scratch,
+                                         std::vector<char>& put_scratch) {
     PoolClientConfig cfg;
     cfg.master_config.node_id = node_id;
     cfg.master_config.node_address = "127.0.0.1";
@@ -155,12 +158,16 @@ class PoolClientRangesTest : public ::testing::Test {
     cfg.staging_buffer_size = 1024;
     cfg.dram_buffers = {{dram.data(), dram.size()}};
     cfg.tier_capacities = {{TierType::DRAM, {dram.size(), dram.size()}}};
-    cfg.ranged_scratch_buffer = scratch.data();
-    cfg.ranged_scratch_size = scratch.size();
+    // Separate GET and PUT arenas so remote ranged get/put run concurrently.
+    cfg.ranged_get_scratch_buffer = get_scratch.data();
+    cfg.ranged_get_scratch_size = get_scratch.size();
+    cfg.ranged_put_scratch_buffer = put_scratch.data();
+    cfg.ranged_put_scratch_size = put_scratch.size();
     cfg.cache_remote_fetches = false;
     auto client = std::make_unique<PoolClient>(std::move(cfg));
     EXPECT_TRUE(client->Init());
-    EXPECT_TRUE(client->RegisterMemory(scratch.data(), scratch.size()));
+    EXPECT_TRUE(client->RegisterMemory(get_scratch.data(), get_scratch.size()));
+    EXPECT_TRUE(client->RegisterMemory(put_scratch.data(), put_scratch.size()));
     return client;
   }
 
@@ -233,8 +240,10 @@ class PoolClientRangesTest : public ::testing::Test {
   std::unique_ptr<PoolClient> target_;
   std::vector<char> caller_dram_;
   std::vector<char> target_dram_;
-  std::vector<char> caller_scratch_;
-  std::vector<char> target_scratch_;
+  std::vector<char> caller_get_scratch_;
+  std::vector<char> caller_put_scratch_;
+  std::vector<char> target_get_scratch_;
+  std::vector<char> target_put_scratch_;
 };
 
 TEST_F(PoolClientRangesTest, RemoteRoundTripSubBatchesAndInstallsLocally) {

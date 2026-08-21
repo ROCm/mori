@@ -63,16 +63,26 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   // 2 MiB, so this only matters with non-default page size combinations.
   dram_pool_size_ = dram_pool_handle_.mapped_size;
 
+  // Two arenas, each of the configured size: GET and PUT never share a buffer
+  // or a lock, so a remote ranged get overlaps a remote ranged put.
   if (dc.ranged_scratch_size > 0) {
-    ranged_scratch_handle_ = allocator.Alloc(dc.ranged_scratch_size, opts);
-    if (!ranged_scratch_handle_.valid()) {
+    ranged_get_scratch_handle_ = allocator.Alloc(dc.ranged_scratch_size, opts);
+    ranged_put_scratch_handle_ = allocator.Alloc(dc.ranged_scratch_size, opts);
+    if (!ranged_get_scratch_handle_.valid() || !ranged_put_scratch_handle_.valid()) {
+      // HostBufferHandle is not RAII and Close() does not run when a
+      // constructor throws, so release whatever did allocate before bailing
+      // out (Free() is a no-op on an invalid handle).
+      allocator.Free(ranged_get_scratch_handle_);
+      allocator.Free(ranged_put_scratch_handle_);
       allocator.Free(dram_pool_handle_);
       dram_pool_ = nullptr;
       dram_pool_size_ = 0;
       throw std::runtime_error("DistributedClient: memory allocation failed for ranged scratch");
     }
-    ranged_scratch_ = ranged_scratch_handle_.ptr;
-    ranged_scratch_size_ = ranged_scratch_handle_.mapped_size;
+    ranged_get_scratch_ = ranged_get_scratch_handle_.ptr;
+    ranged_get_scratch_size_ = ranged_get_scratch_handle_.mapped_size;
+    ranged_put_scratch_ = ranged_put_scratch_handle_.ptr;
+    ranged_put_scratch_size_ = ranged_put_scratch_handle_.mapped_size;
   }
 
   // Lower SSD config to the peer.  When ssd.enabled, the peer builds a
@@ -91,31 +101,44 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   auto pc_config = ToPoolClientConfig(dc,
                                       /*dram_buffers=*/{{dram_pool_, dram_pool_size_}},
                                       std::move(tier_capacities), std::move(ssd_cfg));
-  pc_config.ranged_scratch_buffer = ranged_scratch_;
-  pc_config.ranged_scratch_size = ranged_scratch_size_;
+  pc_config.ranged_get_scratch_buffer = ranged_get_scratch_;
+  pc_config.ranged_get_scratch_size = ranged_get_scratch_size_;
+  pc_config.ranged_put_scratch_buffer = ranged_put_scratch_;
+  pc_config.ranged_put_scratch_size = ranged_put_scratch_size_;
   pc_config.copy_pipeline = config_.copy_pipeline;
 
   pool_client_ = std::make_unique<PoolClient>(std::move(pc_config));
   if (!pool_client_->Init()) {
     pool_client_.reset();
     HostMemAllocator cleanup_allocator;
-    if (ranged_scratch_) {
-      cleanup_allocator.Free(ranged_scratch_handle_);
-      ranged_scratch_ = nullptr;
-      ranged_scratch_size_ = 0;
+    if (ranged_get_scratch_) {
+      cleanup_allocator.Free(ranged_get_scratch_handle_);
+      ranged_get_scratch_ = nullptr;
+      ranged_get_scratch_size_ = 0;
+    }
+    if (ranged_put_scratch_) {
+      cleanup_allocator.Free(ranged_put_scratch_handle_);
+      ranged_put_scratch_ = nullptr;
+      ranged_put_scratch_size_ = 0;
     }
     cleanup_allocator.Free(dram_pool_handle_);
     dram_pool_ = nullptr;
     dram_pool_size_ = 0;
     throw std::runtime_error("DistributedClient: PoolClient::Init() failed");
   }
-  if (ranged_scratch_ && !pool_client_->RegisterMemory(ranged_scratch_, ranged_scratch_size_)) {
+  if ((ranged_get_scratch_ &&
+       !pool_client_->RegisterMemory(ranged_get_scratch_, ranged_get_scratch_size_)) ||
+      (ranged_put_scratch_ &&
+       !pool_client_->RegisterMemory(ranged_put_scratch_, ranged_put_scratch_size_))) {
     pool_client_->Shutdown();
     pool_client_.reset();
     HostMemAllocator cleanup_allocator;
-    cleanup_allocator.Free(ranged_scratch_handle_);
-    ranged_scratch_ = nullptr;
-    ranged_scratch_size_ = 0;
+    cleanup_allocator.Free(ranged_get_scratch_handle_);
+    cleanup_allocator.Free(ranged_put_scratch_handle_);
+    ranged_get_scratch_ = nullptr;
+    ranged_get_scratch_size_ = 0;
+    ranged_put_scratch_ = nullptr;
+    ranged_put_scratch_size_ = 0;
     cleanup_allocator.Free(dram_pool_handle_);
     dram_pool_ = nullptr;
     dram_pool_size_ = 0;
@@ -137,7 +160,7 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
       dc.master_config.node_id, dc.master_config.node_address, dc.master_config.master_address,
       dram_pool_size_ / (1024 * 1024), config_.dram.use_hugepages,
       config_.dram.hugepage_size / (1024 * 1024), config_.dram.numa_node, dc.dram_page_size / 1024,
-      dc.staging_buffer_size / (1024 * 1024), ranged_scratch_size_ / (1024 * 1024),
+      dc.staging_buffer_size / (1024 * 1024), ranged_get_scratch_size_ / (1024 * 1024),
       dc.peer_service_port, dc.cache_remote_fetches, dc.io_engine.host, dc.io_engine.port,
       tags_str);
 }
@@ -337,11 +360,14 @@ void DistributedClient::Close() {
     pool_client_.reset();
   }
 
-  if (ranged_scratch_) {
+  if (ranged_get_scratch_ || ranged_put_scratch_) {
     HostMemAllocator allocator;
-    allocator.Free(ranged_scratch_handle_);
-    ranged_scratch_ = nullptr;
-    ranged_scratch_size_ = 0;
+    allocator.Free(ranged_get_scratch_handle_);
+    allocator.Free(ranged_put_scratch_handle_);
+    ranged_get_scratch_ = nullptr;
+    ranged_get_scratch_size_ = 0;
+    ranged_put_scratch_ = nullptr;
+    ranged_put_scratch_size_ = 0;
   }
 
   if (dram_pool_) {

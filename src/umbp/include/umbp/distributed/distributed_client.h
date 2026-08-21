@@ -75,7 +75,10 @@ class DistributedClient : public IUMBPClient {
   void Close() override;
   bool IsDistributed() const override;
   UMBPDeploymentMode GetDeploymentMode() const override { return UMBPDeploymentMode::Distributed; }
-  bool SupportsRangedIO() const override { return ranged_scratch_size_ > 0; }
+  // Both arenas or neither: the GET and PUT halves of ranged I/O each need one.
+  bool SupportsRangedIO() const override {
+    return ranged_get_scratch_size_ > 0 && ranged_put_scratch_size_ > 0;
+  }
 
   bool RegisterMemory(uintptr_t ptr, size_t size) override;
   void DeregisterMemory(uintptr_t ptr) override;
@@ -93,9 +96,14 @@ class DistributedClient : public IUMBPClient {
   void* dram_pool_ = nullptr;
   size_t dram_pool_size_ = 0;
   HostBufferHandle dram_pool_handle_;
-  void* ranged_scratch_ = nullptr;
-  size_t ranged_scratch_size_ = 0;
-  HostBufferHandle ranged_scratch_handle_;
+  // One arena per direction, each ranged_scratch_size bytes.  See
+  // PoolClient's ranged_get_scratch_mutex_ / ranged_put_scratch_mutex_.
+  void* ranged_get_scratch_ = nullptr;
+  size_t ranged_get_scratch_size_ = 0;
+  HostBufferHandle ranged_get_scratch_handle_;
+  void* ranged_put_scratch_ = nullptr;
+  size_t ranged_put_scratch_size_ = 0;
+  HostBufferHandle ranged_put_scratch_handle_;
   std::unique_ptr<PoolClient> pool_client_;
   std::atomic<bool> closing_{false};
   mutable std::shared_mutex op_mutex_;

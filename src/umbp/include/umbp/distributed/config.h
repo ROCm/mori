@@ -156,8 +156,15 @@ struct PoolClientConfig {
   // Caller-owned, RDMA-registered host arena for ranged I/O. DistributedClient
   // owns the backing mapping and frees it only after PoolClient::Shutdown has
   // deregistered the region. Direct PoolClient tests may provide their own.
-  void* ranged_scratch_buffer = nullptr;
-  size_t ranged_scratch_size = 0;
+  // Separate GET and PUT arenas, each of the user-facing ranged_scratch_size.
+  // One shared arena means one shared mutex, and a remote ranged get then
+  // serializes against a remote ranged put for the whole of its network round
+  // trip -- which is exactly the load/offload overlap a layer-wise KV
+  // connector is trying to get.
+  void* ranged_get_scratch_buffer = nullptr;
+  size_t ranged_get_scratch_size = 0;
+  void* ranged_put_scratch_buffer = nullptr;
+  size_t ranged_put_scratch_size = 0;
 
   // SSD read-staging tuning (peer side).  More slots reduce NO_SLOT under large
   // concurrent prefetch batches, but shrink per-slot size (= staging_buffer_size
@@ -213,7 +220,6 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.master_config = dc.master_config;
   pc.io_engine = dc.io_engine;
   pc.staging_buffer_size = dc.staging_buffer_size;
-  pc.ranged_scratch_size = dc.ranged_scratch_size;
   pc.ssd_staging_buffer_size = dc.ssd_staging_buffer_size;
   pc.ssd_staging_buffer_slots = dc.ssd_staging_buffer_slots;
   pc.peer_service_port = dc.peer_service_port;

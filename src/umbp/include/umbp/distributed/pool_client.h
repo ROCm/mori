@@ -200,10 +200,15 @@ class PoolClient {
   std::unique_ptr<char[]> staging_buffer_;
   std::mutex staging_mutex_;
 
-  // Caller-owned, registered host arena used only by ranged operations. One
-  // mutex deliberately serializes arena users in phase 1; local-only ranged
-  // reads do not take it and remain concurrent.
-  std::mutex ranged_scratch_mutex_;
+  // Caller-owned, registered host arenas used only by ranged operations.
+  // Local-only ranged reads take neither and remain concurrent.
+  //
+  // GET and PUT get one arena and one mutex each, so a remote ranged get and a
+  // remote ranged put run concurrently instead of serializing on one lock --
+  // the load/offload overlap a layer-wise KV connector wants. Two same-kind
+  // operations still serialize on their arena's mutex.
+  std::mutex ranged_get_scratch_mutex_;
+  std::mutex ranged_put_scratch_mutex_;
 
   std::unique_ptr<char[]> ssd_staging_buffer_;
   mori::io::MemoryDesc ssd_staging_mem_{};
