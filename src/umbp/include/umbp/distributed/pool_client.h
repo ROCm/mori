@@ -368,12 +368,31 @@ class PoolClient {
     size_t size;
     RoutePutResult route;
   };
+  // One contiguous extent of a stored object, named in object coordinates.
+  // The remote ranged read moves exactly these and nothing else.
+  struct ByteSpan {
+    size_t object_offset = 0;
+    size_t size = 0;
+  };
+
   struct BatchGetItem {
     size_t index;
     const std::string* key;
     void* dst;
+    // The OBJECT's size, which the peer must agree with; not necessarily how
+    // much lands in dst.
     size_t size;
+    // Bytes actually landing in dst.  0 means the whole object, which is what
+    // every non-ranged caller wants.
+    size_t dst_bytes = 0;
+    // Extents to fetch, packed into dst back to back in this order.  Null or
+    // empty means the whole object -- the degenerate one-span case, kept
+    // implicit so no existing caller has to say so.
+    const std::vector<ByteSpan>* spans = nullptr;
     RouteGetResult route;
+
+    size_t DstBytes() const { return dst_bytes != 0 ? dst_bytes : size; }
+    bool Ranged() const { return spans != nullptr && !spans->empty(); }
   };
 
   // Routing plan for one BatchGet: which keys go to which tier/target.  Pure
@@ -509,6 +528,23 @@ class PoolClient {
                                 std::vector<uint64_t>& abort_slots,
                                 std::vector<PutEntryOutcome>* results,
                                 ::umbp::UMBPPeer::Stub* stub);
+
+  // Remote-only sibling of PartitionBatchGetTargets for ranged reads.  Every
+  // key contributes one item carrying its arena slice, its span list and the
+  // span total; unroutable and self-routed keys were filtered by the caller, so
+  // there is no local half to collect.  `spans` and `keys` must outlive the
+  // returned plan.
+  BatchGetPlan PartitionBatchGetRangeTargets(
+      const std::vector<std::string>& keys, const std::vector<void*>& arena_slices,
+      const std::vector<size_t>& object_sizes, const std::vector<size_t>& packed_bytes,
+      const std::vector<const std::vector<ByteSpan>*>& spans,
+      const std::vector<std::optional<RouteGetResult>>& routes);
+
+  // The submit-all / wait-all half of ExecuteBatchGetPlan, with no local half.
+  // A ranged plan has none by construction, and its destinations are slices of
+  // the registered arena, so the staging branch cannot apply either.
+  void ExecuteRemoteBatchGetPlan(const BatchGetPlan& plan, std::vector<bool>* results,
+                                 bool recache_remote);
 
   bool PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items, PeerConnection& peer,
                                ::umbp::UMBPPeer::Stub* stub, std::vector<RemoteGetEntry>* entries,
