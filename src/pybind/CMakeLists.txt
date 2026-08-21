@@ -69,8 +69,31 @@ endif()
 
 if(BUILD_XLA_FFI_OPS)
   target_sources(mori_pybinds PRIVATE pybind_xla_ffi_ops.cpp)
-  target_include_directories(mori_pybinds
-                             PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/xla_ffi)
+
+  if(NOT XLA_FFI_INCLUDE_DIR AND DEFINED ENV{XLA_FFI_INCLUDE_DIR})
+    set(XLA_FFI_INCLUDE_DIR "$ENV{XLA_FFI_INCLUDE_DIR}")
+  endif()
+
+  if(NOT XLA_FFI_INCLUDE_DIR)
+    execute_process(
+      COMMAND ${PYTHON_EXECUTABLE} -c
+              "from jax import ffi; print(ffi.include_dir())"
+      OUTPUT_VARIABLE XLA_FFI_INCLUDE_DIR
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      RESULT_VARIABLE _jax_ffi_result)
+    if(NOT _jax_ffi_result EQUAL 0 OR NOT XLA_FFI_INCLUDE_DIR)
+      message(
+        FATAL_ERROR
+          "BUILD_XLA_FFI_OPS=ON: could not resolve XLA FFI headers. Install jax "
+          "(providing jax.ffi.include_dir()) or set -DXLA_FFI_INCLUDE_DIR=<path>.")
+    endif()
+  endif()
+
+  message(STATUS "XLA FFI include dir: ${XLA_FFI_INCLUDE_DIR}")
+  if(NOT EXISTS "${XLA_FFI_INCLUDE_DIR}/xla/ffi/api/ffi.h")
+    message(FATAL_ERROR "XLA_FFI_INCLUDE_DIR='${XLA_FFI_INCLUDE_DIR}' does not contain xla/ffi/api/ffi.h")
+  endif()
+  target_include_directories(mori_pybinds PRIVATE ${XLA_FFI_INCLUDE_DIR})
 endif()
 
 # For python packages to find dependent libraries
