@@ -624,14 +624,25 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     }
   }
   if (globalWarpId == 0) {
+    // STORE, not accumulate: only this one warp of this one block contributes, so a
+    // warp reduction can write the final count outright. Accumulating instead made
+    // the total depend on the counter already being zero, which is what forced the
+    // host to memset it before every dispatch (one whole kernel launch in the graph
+    // for four bytes). A store is also correct for back-to-back dispatches with no
+    // combine in between, which the accumulate form silently doubled.
+    index_t myRecv = 0;
     for (int srcPe = laneId; srcPe < npes; srcPe += WS) {
       index_t* signal = recvTokenNums + srcPe;
       index_t recvTokenNum = EpWaitGt(signal, 0) - 1;
       __hip_atomic_store(signal, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-      atomicAdd(args.totalRecvTokenNum, recvTokenNum);
+      myRecv += recvTokenNum;
       args.destPeTokenCounter[srcPe] = 0;
     }
-    if (laneId == 0) EpLocal<index_t>(win, args.offTokOff)[0] = 0;
+    for (int off = WS / 2; off > 0; off >>= 1) myRecv += __shfl_down(myRecv, off, WS);
+    if (laneId == 0) {
+      *args.totalRecvTokenNum = myRecv;
+      EpLocal<index_t>(win, args.offTokOff)[0] = 0;
+    }
   }
 }
 
