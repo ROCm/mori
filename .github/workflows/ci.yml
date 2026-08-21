@@ -45,7 +45,7 @@ jobs:
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -127,18 +127,20 @@ jobs:
           COMMON="--op-type write --mem-type gpu --all \
             --sweep-start-size 1048576 --sweep-max-size 33554432 --sweep-step 1048576 \
             --num-qp-per-transfer 4 --batch-contiguous \
-            --num-initiator-dev 8 --num-target-dev 8 \
+            --num-initiator-dev 1 --num-target-dev 1 \
             --warmup-iters 128 --log-level info"
           {
             echo "=== MORI-IO bench_engine CI commands ==="
             echo "COMMON=${COMMON}"
+            echo "GPU sweep: 0 1 2 3 4 5 6 7 (one GPU pair per run)"
             echo "NODE1_HOST=${NODE1_HOST} NODE2_HOST=${NODE2_HOST}"
             echo ""
           } | tee "$RESULTS"
+          for GPU in 0 1 2 3 4 5 6 7; do
           for BATCH in 1 64; do
             ITERS=128
             if [ "$BATCH" -eq 1 ]; then ITERS=512; fi
-            ARGS="$COMMON --transfer-batch-size $BATCH --iters $ITERS"
+            ARGS="$COMMON --gpu $GPU --transfer-batch-size $BATCH --iters $ITERS"
             R1="cd $GITHUB_WORKSPACE && MORI_DISABLE_AUTO_XGMI=1 $LDP $BIN \
               --rank 1 --master-ip $NODE1_HOST --self-ip $NODE2_HOST --port $PORT \
               --target-dev-offset 0 $ARGS"
@@ -146,7 +148,7 @@ jobs:
               --rank 0 --master-ip $NODE1_HOST --self-ip $NODE1_HOST --port $PORT \
               --target-dev-offset 0 $ARGS"
             {
-              echo "=== C++ bench_engine GPU write sweep, batch=$BATCH, iters=$ITERS, port=$PORT ==="
+              echo "=== C++ bench_engine GPU write sweep, gpu=$GPU, batch=$BATCH, iters=$ITERS, port=$PORT ==="
               echo "rank 0 (initiator, node1):"
               echo "$R0"
               echo "rank 1 (target, node2):"
@@ -158,6 +160,7 @@ jobs:
             $CT exec $CONTAINER bash -c "$R0" | tee -a "$RESULTS"
             wait
             PORT=$((PORT + 1))
+          done
           done
 
       - name: Upload bench_engine results
