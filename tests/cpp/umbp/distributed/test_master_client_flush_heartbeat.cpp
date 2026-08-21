@@ -46,6 +46,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "umbp.grpc.pb.h"
 #include "umbp/distributed/master/master_client.h"
@@ -77,12 +78,21 @@ class RecordingMasterService final : public ::umbp::UMBPMaster::Service {
     return grpc::Status::OK;
   }
 
-  grpc::Status Heartbeat(grpc::ServerContext* ctx, const ::umbp::HeartbeatRequest*,
+  grpc::Status Heartbeat(grpc::ServerContext* ctx, const ::umbp::HeartbeatRequest* req,
                          ::umbp::HeartbeatResponse* resp) override {
     {
       std::lock_guard<std::mutex> lock(mu_);
       ++count_;
       last_time_ = std::chrono::steady_clock::now();
+      size_t event_count = 0;
+      uint64_t highest_seq = 0;
+      for (const auto& bundle : req->bundles()) {
+        event_count += static_cast<size_t>(bundle.events_size());
+        highest_seq = std::max(highest_seq, bundle.seq());
+      }
+      heartbeat_event_counts_.push_back(event_count);
+      resp->set_acked_seq(highest_seq);
+      resp->set_status(::umbp::CLIENT_STATUS_ALIVE);
       entered_cv_.notify_all();
     }
     if (block_heartbeats_) {
@@ -95,7 +105,6 @@ class RecordingMasterService final : public ::umbp::UMBPMaster::Service {
                              [&] { return released_ || ctx->IsCancelled(); });
       }
     }
-    resp->set_acked_seq(0);
     return grpc::Status::OK;
   }
 
@@ -133,6 +142,11 @@ class RecordingMasterService final : public ::umbp::UMBPMaster::Service {
     return last_time_;
   }
 
+  std::vector<size_t> HeartbeatEventCounts() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return heartbeat_event_counts_;
+  }
+
  private:
   const int interval_ms_;
   const bool block_heartbeats_;
@@ -141,8 +155,30 @@ class RecordingMasterService final : public ::umbp::UMBPMaster::Service {
   std::condition_variable entered_cv_;
   std::condition_variable release_cv_;
   int count_ = 0;
+  std::vector<size_t> heartbeat_event_counts_;
   std::chrono::steady_clock::time_point last_time_;
   bool released_ = false;
+};
+
+class VectorEventSource final : public OwnedLocationSource {
+ public:
+  explicit VectorEventSource(size_t count) {
+    pending_.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+      pending_.push_back(
+          KvEvent{KvEvent::Kind::ADD, "heartbeat-key-" + std::to_string(i), TierType::DRAM, 4096});
+    }
+  }
+
+  std::vector<KvEvent> DrainPendingEvents() override { return std::move(pending_); }
+  std::vector<KvEvent> SnapshotOwnedKeys() const override { return {}; }
+  std::vector<KvEvent> SnapshotOwnedKeysForFullSync() override {
+    pending_.clear();
+    return {};
+  }
+
+ private:
+  std::vector<KvEvent> pending_;
 };
 
 // --------------------------------------------------------------------------
@@ -280,6 +316,26 @@ TEST_F(FlushHeartbeatTest, FlushWhileRPCInFlightFiresNextTickImmediately) {
   EXPECT_LT(gap_ms, kDeadlineMs)
       << "Second heartbeat arrived " << gap_ms << " ms after release (budget " << kDeadlineMs
       << " ms); flush_requested_ may not have been preserved across the in-flight RPC";
+}
+
+TEST_F(FlushHeartbeatTest, LargeEventBacklogIsSplitAcrossBoundedImmediateHeartbeats) {
+  constexpr size_t kEvents = 20'000;
+  constexpr size_t kDefaultMaxEventsPerRpc = 16 * 1024;
+  ASSERT_NO_FATAL_FAILURE(BuildServer(/*interval_ms=*/10'000));
+  auto client = MakeRegisteredClient();
+  VectorEventSource source(kEvents);
+  client->AddOwnedLocationSource(&source);
+  client->StartHeartbeat();
+
+  client->FlushHeartbeat();
+  ASSERT_TRUE(service_->WaitForCount(2, std::chrono::milliseconds(2000)));
+  client->StopHeartbeat();
+
+  const auto counts = service_->HeartbeatEventCounts();
+  ASSERT_GE(counts.size(), 2u);
+  EXPECT_LE(counts[0], kDefaultMaxEventsPerRpc);
+  EXPECT_LE(counts[1], kDefaultMaxEventsPerRpc);
+  EXPECT_EQ(counts[0] + counts[1], kEvents);
 }
 
 }  // namespace

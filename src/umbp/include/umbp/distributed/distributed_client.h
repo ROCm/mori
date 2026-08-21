@@ -58,6 +58,15 @@ class DistributedClient : public IUMBPClient {
   std::vector<bool> BatchGet(const std::vector<std::string>& keys,
                              const std::vector<uintptr_t>& dsts,
                              const std::vector<size_t>& sizes) override;
+  std::vector<bool> BatchGetRanges(const std::vector<std::string>& keys,
+                                   const std::vector<std::vector<uintptr_t>>& dsts,
+                                   const std::vector<std::vector<size_t>>& sizes,
+                                   const std::vector<std::vector<size_t>>& src_offsets) override;
+  std::vector<bool> BatchPutRanges(const std::vector<std::string>& keys,
+                                   const std::vector<size_t>& object_sizes,
+                                   const std::vector<std::vector<uintptr_t>>& srcs,
+                                   const std::vector<std::vector<size_t>>& sizes,
+                                   const std::vector<std::vector<size_t>>& dst_offsets) override;
   std::vector<bool> BatchExists(const std::vector<std::string>& keys) const override;
   size_t BatchExistsConsecutive(const std::vector<std::string>& keys) const override;
 
@@ -66,6 +75,7 @@ class DistributedClient : public IUMBPClient {
   void Close() override;
   bool IsDistributed() const override;
   UMBPDeploymentMode GetDeploymentMode() const override { return UMBPDeploymentMode::Distributed; }
+  bool SupportsRangedIO() const override { return ranged_scratch_size_ > 0; }
 
   bool RegisterMemory(uintptr_t ptr, size_t size) override;
   void DeregisterMemory(uintptr_t ptr) override;
@@ -83,6 +93,9 @@ class DistributedClient : public IUMBPClient {
   void* dram_pool_ = nullptr;
   size_t dram_pool_size_ = 0;
   HostBufferHandle dram_pool_handle_;
+  void* ranged_scratch_ = nullptr;
+  size_t ranged_scratch_size_ = 0;
+  HostBufferHandle ranged_scratch_handle_;
   std::unique_ptr<PoolClient> pool_client_;
   std::atomic<bool> closing_{false};
   mutable std::shared_mutex op_mutex_;
