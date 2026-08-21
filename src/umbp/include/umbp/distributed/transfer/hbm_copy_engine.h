@@ -22,6 +22,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -125,12 +126,38 @@ class HbmCopyEngine final : public TransferEngine {
   std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan> plans) override;
 
  private:
+  // Why a plan did not take the gather kernel.  The hot path never computes
+  // this: it is filled in only when debug mode is on (UMBP_HBM_COPY_DEBUG), so
+  // that the log can say which path carried a batch AND why the other one
+  // declined — the two questions are always asked together when a bandwidth
+  // number looks wrong.
+  enum class GatherSkip : uint8_t {
+    kTaken = 0,
+    kUnrecorded,                  // debug mode off, or a plan the pass never classified
+    kDisabled,                    // UMBP_DRAM_GATHER_KERNEL=0, or latched off by a failure
+    kKindNotHostDevice,           // D2D: no host side to register, so no kernel form
+    kNoDevice,                    // neither endpoint named a device
+    kHostNotRegistered,           // host side outside every HostTierRegistration
+    kNoFragments,                 // plan contributed no segments
+    kTooFewFragments,             // < 2 in the bucket; one segment is hipMemcpy's best case
+    kFragmentAtOrAboveThreshold,  // mean segment >= kGatherFragmentThreshold
+    kSetDeviceFailed,
+    kNoStream,
+    kLaunchFailed,
+    kSyncFailed,
+  };
+  static const char* GatherSkipName(GatherSkip reason);
+
   // Run the gather kernel over the batch's eligible segments, bucketed by
   // device.  Returns a per-plan flag: 1 means fully copied by the kernel, 0
   // means "not taken" and never "failed" — Submit then runs its hipMemcpy loop
   // for it, which reaches the same result whether or not fragments landed.
   // May leave the current HIP device changed.
-  std::vector<char> GatherEligiblePlans(const std::vector<TransferPlan>& plans);
+  //
+  // `skip_reasons`, when non-null, is resized to plans.size() and filled with
+  // the per-plan verdict.  Submit passes it only in debug mode.
+  std::vector<char> GatherEligiblePlans(const std::vector<TransferPlan>& plans,
+                                        std::vector<GatherSkip>* skip_reasons);
 
   // True when [ptr, ptr + size) is inside a completed registration, and so safe
   // to hand to a kernel.  False is always the safe answer.

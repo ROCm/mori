@@ -369,8 +369,13 @@ class PoolClient {
   // afterwards, keyed off the engine's failed tags.
   //
   // Ranges must already have been validated as tiling their object.
+  //
+  // `committed_bytes`, when non-null, accumulates the bytes this call actually
+  // wrote.  Deliberately not derivable from `results`: a key already present in
+  // the medium reports success without moving anything, and crediting it would
+  // inflate the bandwidth histogram.
   void ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteRequest>& requests,
-                                  std::vector<bool>* results);
+                                  std::vector<bool>* results, double* committed_bytes = nullptr);
   // After a successful remote DRAM fetch, if cache_remote_fetches is enabled and
   // the admission gate admits the block, enqueue it for asynchronous install into
   // this node's local DRAM tier (see ReCacheWorkerLoop). The install (DRAM

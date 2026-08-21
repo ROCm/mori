@@ -193,6 +193,27 @@
   "BatchGet e2e call bandwidth in GiB/s (successful bytes only, split by client and local/remote " \
   "traffic)"
 
+// Ranged siblings.  Kept as their own series rather than folded into the two
+// above: a ranged call moves a SUBSET of each object, so mixing them would make
+// the whole-object families' bytes-per-call meaningless.  Bytes counted are the
+// range bytes actually delivered to (or committed from) the caller's buffers,
+// which is what the caller sees and what the sglang tree connector reports on
+// its side -- note that a REMOTE ranged get still moves the whole object over
+// the wire into the scratch arena, so its wire traffic exceeds what this
+// histogram credits (mori_umbp_client_*bound_get_bytes_total covers that).
+
+#define MORI_UMBP_METRIC_CLIENT_BATCH_PUT_RANGES_BANDWIDTH \
+  "mori_umbp_client_batch_put_ranges_bandwidth_gibps"
+#define MORI_UMBP_METRIC_CLIENT_BATCH_PUT_RANGES_BANDWIDTH_HELP                                  \
+  "BatchPutRanges e2e call bandwidth in GiB/s (committed range bytes only, split by client and " \
+  "local/remote traffic)"
+
+#define MORI_UMBP_METRIC_CLIENT_BATCH_GET_RANGES_BANDWIDTH \
+  "mori_umbp_client_batch_get_ranges_bandwidth_gibps"
+#define MORI_UMBP_METRIC_CLIENT_BATCH_GET_RANGES_BANDWIDTH_HELP                                  \
+  "BatchGetRanges e2e call bandwidth in GiB/s (delivered range bytes only, split by client and " \
+  "local/remote traffic)"
+
 // --- MasterClient -> MasterServer RPC latency (client-perceived) -----------
 // Histogram of round-trip latency for every RPC method on the
 // MasterClient channel, reported by clients via ReportMetrics.  Labels

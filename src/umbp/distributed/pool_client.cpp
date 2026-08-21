@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -32,6 +33,7 @@
 #include <functional>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <msgpack.hpp>
 #include <new>
 #include <numeric>
@@ -116,6 +118,290 @@ void ObserveBatchBandwidth(MasterClient& master_client, double bytes, double sec
   master_client.Observe(metric_name, metric_help, std::move(labels), BatchBandwidthBucketsGiBps(),
                         gibps);
 }
+
+// ---------------------------------------------------------------------------
+//  Ranged-call sub-timers  (UMBP_RANGED_CALL_DEBUG=1)
+//
+//  ScopedBatchBandwidth already times the WHOLE ranged call, and HbmCopyEngine's
+//  debug mode times the copies inside it.  Neither answers the question those
+//  two together raise: where does the rest of the call go?  Subtracting one
+//  aggregate from the other only bounds it, because a batch fans keys across
+//  executor threads, so summed copy time is not the call's copy wall-clock.
+//
+//  These timers close that gap by splitting a ranged call into the phases that
+//  can actually stall it:
+//
+//    resolve  per-key BatchResolve, scanning every backend in the registry
+//    route    BatchRouteGet / BatchRoutePut RPC to the master
+//    xfer     transfer_engine_->Transfer (the part HbmCopyEngine reports)
+//    lock     waiting on the get/put scratch mutex, which serializes arena users
+//    remote   the arena loop: fetch/assemble + install
+//
+//  Note the paths are NOT symmetric, and the timers are what proves it: a get
+//  resolves locally first and only routes on a miss, while a put issues
+//  BatchRoutePut on EVERY call including fully-local ones.
+//
+//  Off by default; knobs mirror UMBP_HBM_COPY_DEBUG:
+//    UMBP_RANGED_CALL_DEBUG=1             enable
+//    UMBP_RANGED_CALL_DEBUG_SAMPLE=N      per-call line every Nth call (1)
+//    UMBP_RANGED_CALL_DEBUG_SUMMARY_SEC=N cumulative rollup cadence (10; 0=off)
+// ---------------------------------------------------------------------------
+
+bool RangedDebugEnvFlag(const char* name, bool fallback) {
+  const char* value = std::getenv(name);
+  if (value == nullptr) return fallback;
+  const std::string text(value);
+  return text != "0" && text != "off" && text != "false";
+}
+
+size_t RangedDebugEnvSize(const char* name, size_t fallback) {
+  const char* value = std::getenv(name);
+  if (value == nullptr) return fallback;
+  char* end = nullptr;
+  const unsigned long long parsed = std::strtoull(value, &end, 10);
+  if (end == value) return fallback;
+  return static_cast<size_t>(parsed);
+}
+
+bool RangedDebugEnabled() {
+  static const bool enabled = RangedDebugEnvFlag("UMBP_RANGED_CALL_DEBUG", false);
+  return enabled;
+}
+
+size_t RangedDebugSampleEvery() {
+  static const size_t n =
+      std::max<size_t>(RangedDebugEnvSize("UMBP_RANGED_CALL_DEBUG_SAMPLE", 1), 1);
+  return n;
+}
+
+size_t RangedDebugSummarySeconds() {
+  static const size_t n = RangedDebugEnvSize("UMBP_RANGED_CALL_DEBUG_SUMMARY_SEC", 10);
+  return n;
+}
+
+bool RangedDebugSampleThisCall() {
+  static std::atomic<uint64_t> counter{0};
+  return (counter.fetch_add(1, std::memory_order_relaxed) % RangedDebugSampleEvery()) == 0;
+}
+
+inline double RangedSeconds(std::chrono::steady_clock::time_point start,
+                            std::chrono::steady_clock::time_point end) {
+  return std::chrono::duration_cast<std::chrono::duration<double>>(end - start).count();
+}
+
+struct RangedPhases {
+  double resolve = 0.0;
+  double route = 0.0;
+  double xfer = 0.0;
+  double lock = 0.0;
+  double remote = 0.0;
+  size_t keys = 0;
+  size_t local_keys = 0;
+  size_t remote_keys = 0;
+  double bytes = 0.0;
+  // Component identity.  A ranged call is always single-pool -- the tree
+  // connector groups by PoolName and chunks inside a per-pool loop, so one
+  // sample key names the component for the whole batch.  Verified empirically
+  // too: 60/60 gather buckets carried a single object size.
+  //
+  // `object_size` is the grouping key rather than the string: the six DSv4-Pro
+  // components have six distinct object sizes, so it is an exact label that
+  // costs no parsing on the hot path.  `key0` is carried alongside so the
+  // size->component mapping is provable from the log rather than inferred.
+  const std::string* key0 = nullptr;
+  size_t object_size = 0;
+};
+
+// Adds its lifetime to a sink.  A null sink makes it inert, which is how the
+// hot path pays nothing when debug is off.
+class PhaseTimer {
+ public:
+  explicit PhaseTimer(double* sink)
+      : sink_(sink),
+        start_(sink ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+  ~PhaseTimer() { Stop(); }
+  PhaseTimer(const PhaseTimer&) = delete;
+  PhaseTimer& operator=(const PhaseTimer&) = delete;
+  void Stop() {
+    if (sink_ == nullptr) return;
+    *sink_ += RangedSeconds(start_, std::chrono::steady_clock::now());
+    sink_ = nullptr;
+  }
+
+ private:
+  double* sink_;
+  std::chrono::steady_clock::time_point start_;
+};
+
+class RangedStats {
+ public:
+  void Record(const char* op, const RangedPhases& p, double total) {
+    const bool is_get = (op[0] == 'g');
+    std::lock_guard<std::mutex> lock(mutex_);
+    Totals& t = is_get ? get_ : put_;
+    t.calls += 1;
+    t.total += total;
+    t.resolve += p.resolve;
+    t.route += p.route;
+    t.xfer += p.xfer;
+    t.lock += p.lock;
+    t.remote += p.remote;
+    t.bytes += p.bytes;
+
+    // Per-component totals, keyed by object size (one call = one pool).  The
+    // sample key is stored once per (op, size) so the log proves the
+    // size->component mapping instead of leaving it inferred.
+    if (p.object_size != 0) {
+      Component& c = components_[{is_get, p.object_size}];
+      c.calls += 1;
+      c.keys += p.keys;
+      c.bytes += p.bytes;
+      c.total += total;
+      c.xfer += p.xfer;
+      if (c.sample_key.empty() && p.key0 != nullptr) c.sample_key = *p.key0;
+    }
+
+    const size_t cadence = RangedDebugSummarySeconds();
+    if (cadence == 0) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (RangedSeconds(last_report_, now) < static_cast<double>(cadence)) return;
+    last_report_ = now;
+    Emit("GET", get_);
+    Emit("PUT", put_);
+    EmitComponentsLocked();
+  }
+
+ private:
+  struct Totals {
+    uint64_t calls = 0;
+    double total = 0, resolve = 0, route = 0, xfer = 0, lock = 0, remote = 0, bytes = 0;
+  };
+  struct Component {
+    uint64_t calls = 0;
+    uint64_t keys = 0;
+    double bytes = 0, total = 0, xfer = 0;
+    std::string sample_key;
+  };
+  static void Emit(const char* name, const Totals& t) {
+    if (t.calls == 0) return;
+    const double other = t.total - (t.resolve + t.route + t.xfer + t.lock + t.remote);
+    auto share = [&](double v) { return t.total > 0 ? 100.0 * v / t.total : 0.0; };
+    MORI_UMBP_INFO(
+        "[RangedCall][dbg] SUMMARY {} calls={} total={:.3f}s mean_call={:.1f}us bytes={:.2f}GiB "
+        "| resolve={:.1f}% route={:.1f}% xfer={:.1f}% lock={:.1f}% remote={:.1f}% other={:.1f}% "
+        "| xfer_only={:.2f}GiB/s end2end={:.2f}GiB/s",
+        name, t.calls, t.total, 1e6 * t.total / t.calls, t.bytes / (1024.0 * 1024 * 1024),
+        share(t.resolve), share(t.route), share(t.xfer), share(t.lock), share(t.remote),
+        share(other), t.xfer > 0 ? (t.bytes / t.xfer) / (1024.0 * 1024 * 1024) : 0.0,
+        t.total > 0 ? (t.bytes / t.total) / (1024.0 * 1024 * 1024) : 0.0);
+  }
+  void EmitComponentsLocked() const {
+    for (const auto& [id, c] : components_) {
+      if (c.calls == 0) continue;
+      MORI_UMBP_INFO(
+          "[RangedCall][dbg] COMPONENT {} obj={} key0='{}' calls={} keys={} bytes={:.3f}GiB "
+          "total={:.3f}s mean_call={:.1f}us keys_per_call={:.1f} xfer_only={:.2f}GiB/s "
+          "end2end={:.2f}GiB/s",
+          id.first ? "GET" : "PUT", id.second, c.sample_key, c.calls, c.keys,
+          c.bytes / (1024.0 * 1024 * 1024), c.total, 1e6 * c.total / c.calls,
+          static_cast<double>(c.keys) / c.calls,
+          c.xfer > 0 ? (c.bytes / c.xfer) / (1024.0 * 1024 * 1024) : 0.0,
+          c.total > 0 ? (c.bytes / c.total) / (1024.0 * 1024 * 1024) : 0.0);
+    }
+  }
+
+  std::mutex mutex_;
+  Totals get_;
+  Totals put_;
+  // key = (is_get, object_size); ordered so the rollup prints deterministically.
+  std::map<std::pair<bool, size_t>, Component> components_;
+  std::chrono::steady_clock::time_point last_report_ = std::chrono::steady_clock::now();
+};
+
+RangedStats& RangedStatsInstance() {
+  static RangedStats* stats = new RangedStats();
+  return *stats;
+}
+
+// Emits at scope exit so every early return in a ranged call is covered, the
+// same reason ScopedBatchBandwidth is a destructor.
+class ScopedRangedReport {
+ public:
+  ScopedRangedReport(const char* op, RangedPhases& phases, bool enabled, const double& local_bytes,
+                     const double& remote_bytes)
+      : op_(op),
+        phases_(phases),
+        enabled_(enabled),
+        local_bytes_(local_bytes),
+        remote_bytes_(remote_bytes),
+        start_(std::chrono::steady_clock::now()) {}
+  ~ScopedRangedReport() {
+    if (!enabled_) return;
+    // Read at exit: the remote phase keeps adding after any mid-call snapshot.
+    phases_.bytes = local_bytes_ + remote_bytes_;
+    const double total = RangedSeconds(start_, std::chrono::steady_clock::now());
+    RangedStatsInstance().Record(op_, phases_, total);
+    if (!RangedDebugSampleThisCall()) return;
+    const double other =
+        total - (phases_.resolve + phases_.route + phases_.xfer + phases_.lock + phases_.remote);
+    MORI_UMBP_INFO(
+        "[RangedCall][dbg] op={} obj={} key0='{}' keys={} local={} remote={} bytes={} "
+        "total={:.1f}us resolve={:.1f}us route={:.1f}us xfer={:.1f}us lock={:.1f}us "
+        "remote_phase={:.1f}us other={:.1f}us",
+        op_, phases_.object_size, phases_.key0 != nullptr ? *phases_.key0 : std::string("?"),
+        phases_.keys, phases_.local_keys, phases_.remote_keys, phases_.bytes, total * 1e6,
+        phases_.resolve * 1e6, phases_.route * 1e6, phases_.xfer * 1e6, phases_.lock * 1e6,
+        phases_.remote * 1e6, other * 1e6);
+  }
+
+ private:
+  const char* op_;
+  RangedPhases& phases_;
+  bool enabled_;
+  const double& local_bytes_;
+  const double& remote_bytes_;
+  std::chrono::steady_clock::time_point start_;
+};
+
+// Ranged calls have several early returns that can still have moved bytes (a
+// batch fully served from the local medium returns before the remote phase is
+// even considered).  Emitting from a destructor keeps every exit covered,
+// including ones added later, instead of relying on each `return` remembering
+// to observe first.  The accumulators are held by reference and read at scope
+// exit, so callers just add to them as keys succeed.
+class ScopedBatchBandwidth {
+ public:
+  ScopedBatchBandwidth(MasterClient& master_client, const char* metric_name,
+                       const char* metric_help, const double& local_bytes,
+                       const double& remote_bytes)
+      : master_client_(master_client),
+        metric_name_(metric_name),
+        metric_help_(metric_help),
+        local_bytes_(local_bytes),
+        remote_bytes_(remote_bytes),
+        start_(std::chrono::steady_clock::now()) {}
+
+  ScopedBatchBandwidth(const ScopedBatchBandwidth&) = delete;
+  ScopedBatchBandwidth& operator=(const ScopedBatchBandwidth&) = delete;
+
+  ~ScopedBatchBandwidth() {
+    const double seconds = std::chrono::duration_cast<std::chrono::duration<double>>(
+                               std::chrono::steady_clock::now() - start_)
+                               .count();
+    ObserveBatchBandwidth(master_client_, local_bytes_, seconds, metric_name_, metric_help_,
+                          "local");
+    ObserveBatchBandwidth(master_client_, remote_bytes_, seconds, metric_name_, metric_help_,
+                          "remote");
+  }
+
+ private:
+  MasterClient& master_client_;
+  const char* metric_name_;
+  const char* metric_help_;
+  const double& local_bytes_;
+  const double& remote_bytes_;
+  std::chrono::steady_clock::time_point start_;
+};
 
 // ---------------------------------------------------------------------------
 //  Page / size math
@@ -958,7 +1244,7 @@ bool PoolClient::CopyRangesToContiguous(const std::vector<ObjectRange>& ranges, 
 }
 
 void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteRequest>& requests,
-                                            std::vector<bool>* results) {
+                                            std::vector<bool>* results, double* committed_bytes) {
   if (requests.empty()) return;
   if (registry_.Empty()) {
     MORI_UMBP_ERROR("[PoolClient] Local ranged Put requested but no storage backend is registered");
@@ -1019,6 +1305,7 @@ void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteReq
       continue;
     }
     (*results)[request.result_index] = true;
+    if (committed_bytes != nullptr) *committed_bytes += static_cast<double>(request.object_size);
     master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL,
                                MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL_HELP,
                                {{"traffic", "local"}}, static_cast<double>(request.object_size));
@@ -1691,9 +1978,25 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
     return results;
   }
 
+  // Observed at scope exit for whichever phases ran; see ScopedBatchBandwidth.
+  double local_bytes = 0.0;
+  double remote_bytes = 0.0;
+  ScopedBatchBandwidth bandwidth(
+      *master_client_, MORI_UMBP_METRIC_CLIENT_BATCH_GET_RANGES_BANDWIDTH,
+      MORI_UMBP_METRIC_CLIENT_BATCH_GET_RANGES_BANDWIDTH_HELP, local_bytes, remote_bytes);
+
+  // Sub-timers.  `dbg` is null when disabled, which makes every PhaseTimer inert.
+  const bool ranged_debug = RangedDebugEnabled();
+  RangedPhases phases;
+  phases.keys = n;
+  if (ranged_debug && n > 0) phases.key0 = &keys[0];
+  RangedPhases* dbg = ranged_debug ? &phases : nullptr;
+  ScopedRangedReport ranged_report("get", phases, ranged_debug, local_bytes, remote_bytes);
+
   auto record_local_get = [&](size_t index) {
     const double bytes =
         static_cast<double>(std::accumulate(sizes[index].begin(), sizes[index].end(), size_t{0}));
+    local_bytes += bytes;
     master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL,
                                MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL_HELP,
                                {{"traffic", "local"}}, bytes);
@@ -1712,6 +2015,7 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   std::vector<size_t> local_keys;
   std::vector<size_t> missed;
   missed.reserve(n);
+  auto resolve_timer = std::make_unique<PhaseTimer>(dbg ? &dbg->resolve : nullptr);
   for (size_t i = 0; i < n; ++i) {
     if (sizes[i].empty()) continue;  // asked for nothing; stays false
 
@@ -1727,6 +2031,11 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
     if (holder == nullptr) {
       missed.push_back(i);
       continue;
+    }
+    // The get API takes no object_sizes; the resolved entry is where the true
+    // stored size becomes known.  First hit labels the call.
+    if (dbg != nullptr && dbg->object_size == 0) {
+      dbg->object_size = static_cast<size_t>(resolved.size);
     }
     if (!RangesAreDisjointAndInBounds(static_cast<size_t>(resolved.size), sizes[i],
                                       src_offsets[i])) {
@@ -1747,16 +2056,22 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
     }
     local_keys.push_back(i);
   }
+  resolve_timer.reset();  // ends the resolve phase
   if (!local_items.empty()) {
     std::vector<size_t> failed_tags;
-    transfer_engine_->Transfer(local_items, &failed_tags);
+    {
+      PhaseTimer xfer_timer(dbg ? &dbg->xfer : nullptr);
+      transfer_engine_->Transfer(local_items, &failed_tags);
+    }
     const std::unordered_set<size_t> failed(failed_tags.begin(), failed_tags.end());
     for (size_t i : local_keys) {
       if (failed.count(i) != 0) continue;
       results[i] = true;
       record_local_get(i);
+      if (dbg != nullptr) dbg->local_keys += 1;
     }
   }
+  if (dbg != nullptr) dbg->remote_keys = missed.size();
   if (missed.empty()) return results;
 
   // ---- Phase 2: the rest, through the GET scratch arena ----
@@ -1770,14 +2085,22 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
     return results;
   }
   // Only the arena users serialize; the local hits above were fully concurrent.
-  std::unique_lock<std::mutex> scratch_lock(ranged_get_scratch_mutex_);
+  std::unique_lock<std::mutex> scratch_lock(ranged_get_scratch_mutex_, std::defer_lock);
+  {
+    PhaseTimer lock_timer(dbg ? &dbg->lock : nullptr);
+    scratch_lock.lock();
+  }
 
   std::vector<std::string> route_keys;
   route_keys.reserve(missed.size());
   for (size_t index : missed) route_keys.push_back(keys[index]);
   std::vector<std::optional<RouteGetResult>> routes;
   std::unordered_set<std::string> excludes{config_.master_config.node_id};
-  auto route_status = master_client_->BatchRouteGet(route_keys, excludes, &routes);
+  grpc::Status route_status;
+  {
+    PhaseTimer route_timer(dbg ? &dbg->route : nullptr);
+    route_status = master_client_->BatchRouteGet(route_keys, excludes, &routes);
+  }
   if (!route_status.ok()) {
     MORI_UMBP_ERROR("[PoolClient] BatchGetRanges: BatchRouteGet failed: {}",
                     route_status.error_message());
@@ -1807,6 +2130,7 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   }
 
   // Pack as many objects into the arena as fit, fetch that group, then repeat.
+  PhaseTimer remote_timer(dbg ? &dbg->remote : nullptr);
   size_t pos = 0;
   while (pos < eligible.size()) {
     std::vector<size_t> scratch_offsets;
@@ -1865,6 +2189,13 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
       results[original] = CopyContiguousToRanges(
           sub_dsts[j], sub_sizes[j],
           MakeReadRanges(dsts[original], sizes[original], src_offsets[original]));
+      if (results[original]) {
+        // Range bytes handed to the caller, not sub_sizes[j]: the arena fetch
+        // moved the whole object, but only these bytes were asked for.  The
+        // wire cost is on the outbound/inbound get byte counters instead.
+        remote_bytes += static_cast<double>(
+            std::accumulate(sizes[original].begin(), sizes[original].end(), size_t{0}));
+      }
 
       const auto installed = ExecuteLocalPut(sub_keys[j], sub_dsts[j], sub_sizes[j], medium_);
       if (installed != PutAttemptOutcome::kSuccess &&
@@ -1891,6 +2222,25 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
     return results;
   }
 
+  // Observed at scope exit for whichever phases ran; see ScopedBatchBandwidth.
+  double local_bytes = 0.0;
+  double remote_bytes = 0.0;
+  ScopedBatchBandwidth bandwidth(
+      *master_client_, MORI_UMBP_METRIC_CLIENT_BATCH_PUT_RANGES_BANDWIDTH,
+      MORI_UMBP_METRIC_CLIENT_BATCH_PUT_RANGES_BANDWIDTH_HELP, local_bytes, remote_bytes);
+
+  const bool ranged_debug = RangedDebugEnabled();
+  RangedPhases phases;
+  phases.keys = n;
+  if (ranged_debug && n > 0) {
+    // One call is always one pool (the tree connector groups by PoolName), so
+    // key/size from the first entry label the whole batch.
+    phases.key0 = &keys[0];
+    phases.object_size = object_sizes[0];
+  }
+  RangedPhases* dbg = ranged_debug ? &phases : nullptr;
+  ScopedRangedReport ranged_report("put", phases, ranged_debug, local_bytes, remote_bytes);
+
   // A put must account for every byte of the object it commits, so the ranges
   // have to tile it — being merely disjoint and in bounds would leave gaps of
   // whatever the slot happened to hold.
@@ -1900,6 +2250,7 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
   valid.reserve(n);
   route_keys.reserve(n);
   route_sizes.reserve(n);
+  auto resolve_timer = std::make_unique<PhaseTimer>(dbg ? &dbg->resolve : nullptr);
   for (size_t i = 0; i < n; ++i) {
     if (!RangesTileObject(object_sizes[i], sizes[i], dst_offsets[i])) {
       MORI_UMBP_ERROR("[PoolClient] BatchPutRanges: ranges do not tile key='{}' size={}", keys[i],
@@ -1910,11 +2261,18 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
     route_keys.push_back(keys[i]);
     route_sizes.push_back(object_sizes[i]);
   }
+  resolve_timer.reset();
   if (valid.empty()) return results;
 
   std::vector<std::optional<RoutePutResult>> routes;
   std::unordered_set<std::string> excludes;
-  auto route_status = master_client_->BatchRoutePut(route_keys, route_sizes, excludes, &routes);
+  // Unconditional, unlike the get path, which routes only what it missed
+  // locally.  Every put pays this RPC even when every key lands on this node.
+  grpc::Status route_status;
+  {
+    PhaseTimer route_timer(dbg ? &dbg->route : nullptr);
+    route_status = master_client_->BatchRoutePut(route_keys, route_sizes, excludes, &routes);
+  }
   if (!route_status.ok()) {
     MORI_UMBP_ERROR("[PoolClient] BatchPutRanges: BatchRoutePut failed: {}",
                     route_status.error_message());
@@ -1946,7 +2304,14 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
                             route.tier});
   }
   // One transfer for every locally-routed key in the batch, not one per key.
-  ExecuteLocalPutRangesBatch(local_writes, &results);
+  if (dbg != nullptr) {
+    dbg->local_keys = local_writes.size();
+    dbg->remote_keys = remote.size();
+  }
+  {
+    PhaseTimer xfer_timer(dbg ? &dbg->xfer : nullptr);
+    ExecuteLocalPutRangesBatch(local_writes, &results, &local_bytes);
+  }
   if (remote.empty()) return results;
 
   // A key routed to another node has to be one contiguous object on the wire,
@@ -1960,8 +2325,13 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
     MORI_UMBP_ERROR("[PoolClient] BatchPutRanges: ranged scratch is absent or not registered");
     return results;
   }
-  std::unique_lock<std::mutex> scratch_lock(ranged_put_scratch_mutex_);
+  std::unique_lock<std::mutex> scratch_lock(ranged_put_scratch_mutex_, std::defer_lock);
+  {
+    PhaseTimer lock_timer(dbg ? &dbg->lock : nullptr);
+    scratch_lock.lock();
+  }
 
+  PhaseTimer remote_timer(dbg ? &dbg->remote : nullptr);
   size_t pos = 0;
   while (pos < remote.size()) {
     std::vector<size_t> scratch_offsets;
@@ -2022,6 +2392,11 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
       ExecuteBatchPutPlan(plan, &outcomes);
       for (size_t j = 0; j < outcomes.size(); ++j) {
         results[sub_originals[j]] = outcomes[j] != PutEntryOutcome::kFailed;
+        // kAlreadyExists is success to the caller but moved nothing, matching
+        // IsCountedForBandwidth's rule for the whole-object BatchPut family.
+        if (outcomes[j] == PutEntryOutcome::kSucceeded) {
+          remote_bytes += static_cast<double>(sub_sizes[j]);
+        }
       }
     }
     pos = end;

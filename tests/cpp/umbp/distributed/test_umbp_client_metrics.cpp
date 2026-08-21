@@ -536,6 +536,58 @@ TEST_F(PoolClientLocalByteTrackingTest, LocalPutGetBytesCounted) {
       << "Unexpected remote batch-get bandwidth series in single-node setup";
 }
 
+// The ranged siblings get their OWN histograms, and the reason they are worth a
+// test is that they are the only bandwidth series with early returns between
+// the first byte and the observation: a batch served entirely from the local
+// medium returns before the remote phase exists.  If ScopedBatchBandwidth ever
+// stops covering that path, the tree-connector panels silently render empty
+// while ranged I/O runs at full rate.
+TEST_F(PoolClientLocalByteTrackingTest, LocalRangedPutGetBandwidthCounted) {
+  const std::string key = "ranged-metric-key";
+  constexpr size_t kHalf = kLocalPageSize / 2;
+
+  // A put must TILE its object; a get may take any subset.
+  const std::vector<std::vector<const void*>> put_srcs = {
+      {src_, static_cast<const char*>(src_) + kHalf}};
+  const std::vector<std::vector<size_t>> put_sizes = {{kHalf, kHalf}};
+  const std::vector<std::vector<size_t>> put_offsets = {{0, kHalf}};
+  ASSERT_TRUE(
+      client_->BatchPutRanges({key}, {kLocalPageSize}, put_srcs, put_sizes, put_offsets).front());
+
+  const std::vector<std::vector<void*>> get_dsts = {{dst_}};
+  const std::vector<std::vector<size_t>> get_sizes = {{kHalf}};
+  const std::vector<std::vector<size_t>> get_offsets = {{kHalf}};
+  ASSERT_TRUE(client_->BatchGetRanges({key}, get_dsts, get_sizes, get_offsets).front());
+  EXPECT_EQ(std::memcmp(dst_, static_cast<const char*>(src_) + kHalf, kHalf), 0)
+      << "Ranged get did not return the bytes the ranged put committed";
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+
+  const std::string body = FetchPrometheusMetrics(metrics_port_);
+  ASSERT_FALSE(body.empty()) << "Could not fetch Prometheus metrics from port " << metrics_port_;
+
+  auto hist = [&](const std::string& name, const std::string& suffix, const std::string& traffic) {
+    return ParseMetricValue(body, name + suffix, "traffic=\"" + traffic + "\"");
+  };
+
+  for (const char* name : {"mori_umbp_client_batch_put_ranges_bandwidth_gibps",
+                           "mori_umbp_client_batch_get_ranges_bandwidth_gibps"}) {
+    EXPECT_GT(hist(name, "_sum", "local"), 0.0)
+        << "Expected local " << name << " sum > 0; Prometheus shows "
+        << hist(name, "_sum", "local");
+    EXPECT_GT(hist(name, "_count", "local"), 0.0)
+        << "Expected local " << name << " count > 0; Prometheus shows "
+        << hist(name, "_count", "local");
+    EXPECT_EQ(hist(name, "_sum", "remote"), -1.0)
+        << "Unexpected remote " << name << " series in single-node setup";
+  }
+
+  // Distinct series from the whole-object families: a ranged call moves a
+  // subset, so folding them together would make bytes-per-call meaningless.
+  EXPECT_EQ(hist("mori_umbp_client_batch_get_bandwidth_gibps", "_count", "local"), -1.0)
+      << "Ranged get leaked into the whole-object BatchGet bandwidth histogram";
+}
+
 // End-to-end proof that the refactored data plane is still wired to Prometheus:
 // a Put and a Get on the live path must show up as the GENERIC backend and
 // transfer series, carrying the medium and the engine as labels.
