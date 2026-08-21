@@ -54,6 +54,7 @@
 #include "umbp/distributed/peer/backend/ssd_backend.h"
 #include "umbp/distributed/peer/batch_resolve_codec.h"
 #include "umbp/distributed/peer/peer_service.h"
+#include "umbp/distributed/range_map.h"
 #include "umbp/distributed/transfer/composite_transfer_engine.h"
 #include "umbp/distributed/transfer/hbm_copy_engine.h"
 #include "umbp/distributed/transfer/local_copy_engine.h"
@@ -426,11 +427,6 @@ inline int LocalCopyThreads(const char* env_name) {
   return t;
 }
 
-inline uint64_t LogicalPageBytes(size_t i, size_t num_pages, uint64_t page_size,
-                                 size_t total_size) {
-  return (i + 1 == num_pages) ? (total_size - i * page_size) : page_size;
-}
-
 // Classify a caller's buffer so engine selection can see what it really is.
 //
 // An unregistered pointer used to be described unconditionally as host bytes,
@@ -444,13 +440,6 @@ TransferRef ClassifiedUserBytes(void* ptr, uint64_t size) {
   const PointerLocation location = DetectPointerLocation(ptr);
   if (!location.IsDevice()) return TransferRef::HostBytes(ptr, size);
   return TransferRef::HostBytes(ptr, size, mori::io::MemoryLocationType::GPU, location.device_id);
-}
-
-bool SizeMatchesAllocation(uint64_t size, size_t num_pages, uint64_t page_size) {
-  if (page_size == 0 || num_pages == 0 || size == 0) return false;
-  if (size > num_pages * page_size) return false;
-  if (size <= (num_pages - 1) * page_size) return false;
-  return true;
 }
 
 // Read-side range validity: inside the object and non-overlapping.  Weaker than
@@ -988,15 +977,6 @@ std::pair<TransferRef, uint64_t> PoolClient::UserBufferRef(void* ptr, size_t siz
 //  concrete backend type to obtain those pointers.
 // ---------------------------------------------------------------------------
 
-namespace {
-
-// Offset of a page within its buffer, as a plain byte offset.
-inline uint64_t PageOffset(const PageLocation& page, uint64_t page_size) {
-  return static_cast<uint64_t>(page.page_index) * page_size;
-}
-
-}  // namespace
-
 // Build one TransferItem per page between a caller buffer and a backend's own
 // buffers.  `to_backend` is Put (user -> pages); false is Get (pages -> user).
 // Returns false when the backend publishes no endpoint for a referenced buffer,
@@ -1145,58 +1125,43 @@ bool PoolClient::BuildLocalRangeTransfers(MediumBackend* backend,
                                           const std::vector<ObjectRange>& ranges, bool to_backend,
                                           size_t tag, std::vector<TransferItem>* items) {
   if (pages.empty() || page_size == 0) return false;
-  if (!SizeMatchesAllocation(stored_size, pages.size(), page_size)) return false;
 
   for (const auto& range : ranges) {
-    if (range.size == 0 || range.user == nullptr) return false;
-    if (IsObjectRangeOverflow(range.object_offset, range.size, static_cast<size_t>(stored_size))) {
-      return false;
-    }
+    if (range.user == nullptr) return false;
     // Classified once per range, not per page: an unregistered device pointer
     // must reach HbmCopyEngine, and the whole range lives in one buffer.
     const TransferRef user_ref = ClassifiedUserBytes(range.user, range.size);
 
-    size_t object_offset = range.object_offset;
-    size_t copied = 0;
-    while (copied < range.size) {
-      const size_t page_index = static_cast<size_t>(object_offset / page_size);
-      const size_t within_page = static_cast<size_t>(object_offset % page_size);
-      if (page_index >= pages.size()) return false;
-
-      TransferRef buf = backend->BufferRef(pages[page_index].buffer_index);
-      if (!buf.HasHostPtr()) {
-        MORI_UMBP_WARN("[PoolClient] ranged transfer: tier={} publishes no endpoint for buffer {}",
-                       static_cast<int>(backend->Tier()), pages[page_index].buffer_index);
-        return false;
-      }
-      // The last page of an object is short; a range must not run off its end
-      // into whatever the slot's final partial page does not own.
-      const uint64_t page_bytes =
-          LogicalPageBytes(page_index, pages.size(), page_size, static_cast<size_t>(stored_size));
-      if (within_page >= page_bytes) return false;
-      const size_t fragment =
-          std::min<size_t>(range.size - copied, static_cast<size_t>(page_bytes - within_page));
-      const uint64_t tier_offset = PageOffset(pages[page_index], page_size) + within_page;
-
-      TransferItem item;
-      item.size = fragment;
-      item.tag = tag;
-      if (to_backend) {
-        item.src = user_ref;
-        item.src_offset = copied;
-        item.dst = std::move(buf);
-        item.dst_offset = tier_offset;
-      } else {
-        item.src = std::move(buf);
-        item.src_offset = tier_offset;
-        item.dst = user_ref;
-        item.dst_offset = copied;
-      }
-      items->push_back(std::move(item));
-
-      object_offset += fragment;
-      copied += fragment;
-    }
+    // The walk owns every bound: object overflow, page-list overrun, and the
+    // short last page a range must not run off the end of.
+    const bool walked = ForEachRangePageFragment(
+        pages, page_size, stored_size, range.object_offset, range.size,
+        [&](size_t page_index, uint64_t tier_offset, size_t fragment, size_t copied) {
+          TransferRef buf = backend->BufferRef(pages[page_index].buffer_index);
+          if (!buf.HasHostPtr()) {
+            MORI_UMBP_WARN(
+                "[PoolClient] ranged transfer: tier={} publishes no endpoint for buffer {}",
+                static_cast<int>(backend->Tier()), pages[page_index].buffer_index);
+            return false;
+          }
+          TransferItem item;
+          item.size = fragment;
+          item.tag = tag;
+          if (to_backend) {
+            item.src = user_ref;
+            item.src_offset = copied;
+            item.dst = std::move(buf);
+            item.dst_offset = tier_offset;
+          } else {
+            item.src = std::move(buf);
+            item.src_offset = tier_offset;
+            item.dst = user_ref;
+            item.dst_offset = copied;
+          }
+          items->push_back(std::move(item));
+          return true;
+        });
+    if (!walked) return false;
   }
   return true;
 }
