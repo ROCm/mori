@@ -384,6 +384,7 @@ class PoolClient {
   // (kSuccessAlreadyExists) and best-effort: the queue is bounded and drops on
   // full; failure does not affect the returned Get result.
   void MaybeReCacheAfterRemote(const std::string& key, const void* src, size_t size);
+
   // Background worker that drains recache_queue_ and performs the DRAM install
   // via ExecuteLocalPut. Started in Init (when cache_remote_fetches), stopped in
   // Shutdown before peer_alloc_ is torn down.
@@ -397,6 +398,7 @@ class PoolClient {
     std::unique_ptr<char[]> bytes;
     size_t size = 0;
   };
+
   std::deque<ReCacheJob> recache_queue_;
   std::mutex recache_mutex_;
 
@@ -421,12 +423,27 @@ class PoolClient {
     size_t size;
     RoutePutResult route;
   };
+  // One byte range of a stored object, named by the caller.
+  struct ByteSpan {
+    size_t object_offset = 0;
+    size_t size = 0;
+  };
+
   struct BatchGetItem {
     size_t index;
     const std::string* key;
     void* dst;
-    size_t size;
+    size_t size;  // the OBJECT's stored size — what the peer must report
+    // Ranged reads move only `spans` and land them packed at `dst`, so the
+    // bytes written are the span total rather than the object size.  Both
+    // fields default to the whole-object behaviour, which is what plain
+    // BatchGet wants and why it needs no changes.
+    size_t dst_bytes = 0;                          // 0 => size
+    const std::vector<ByteSpan>* spans = nullptr;  // null/empty => whole object
     RouteGetResult route;
+
+    size_t DstBytes() const { return dst_bytes != 0 ? dst_bytes : size; }
+    bool Ranged() const { return spans != nullptr && !spans->empty(); }
   };
 
   // Routing plan for one BatchGet: which keys go to which target.  Pure
@@ -473,12 +490,30 @@ class PoolClient {
   // all peers.  Staging (non-zero-copy) runs per peer serially (submit ->
   // wait).  Reads the plan; writes per-key outcomes into *results.
   // `recache_remote=false` suppresses the asynchronous re-cache of remotely
-  // fetched blocks.  BatchGetRanges passes false because it installs the object
-  // synchronously itself; leaving it on would queue a second, redundant install
-  // of bytes that are already in the local medium.
+  // fetched blocks.
   void ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector<std::string>& keys,
                            const std::vector<void*>& dsts, const std::vector<size_t>& sizes,
                            std::vector<bool>* results, bool recache_remote = true);
+
+  // The remote half of ExecuteBatchGetPlan: submit every peer, then wait every
+  // peer.  Split out for the ranged path, whose plan has no local half by
+  // construction (BatchGetRanges filters unroutable and self-routed keys out
+  // before building it), so threading the keys/dsts/sizes the local half needs
+  // would only pass three vectors nothing reads.
+  void ExecuteRemoteBatchGetPlan(const BatchGetPlan& plan, std::vector<bool>* results,
+                                 bool recache_remote);
+
+  // Remote-only sibling of PartitionBatchGetTargets for ranged reads.  Each key
+  // contributes one item carrying its arena slice, its span list, and the span
+  // total.  Spans are passed by pointer rather than by value: the caller
+  // already owns them for the whole call, and copying one small vector per key
+  // per sub-batch is a heap allocation per key that buys nothing.  Both the
+  // pointees and `keys` must outlive the returned plan.
+  BatchGetPlan PartitionBatchGetRangeTargets(
+      const std::vector<std::string>& keys, const std::vector<void*>& arena_slices,
+      const std::vector<size_t>& object_sizes, const std::vector<size_t>& packed_bytes,
+      const std::vector<const std::vector<ByteSpan>*>& spans,
+      const std::vector<std::optional<RouteGetResult>>& routes);
 
   struct RemotePutEntry {
     size_t result_index;

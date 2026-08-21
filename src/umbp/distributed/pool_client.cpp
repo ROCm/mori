@@ -2040,6 +2040,14 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   if (missed.empty()) return results;
 
   // ---- Phase 2: the rest, through the GET scratch arena ----
+  //
+  // Only the requested spans cross the wire, packed back-to-back into the
+  // arena.  A layer-wise reader asks for one layer group out of many, so
+  // fetching the whole object would move an order of magnitude more bytes than
+  // it uses, and would do it on the first group -- the one the caller cannot
+  // overlap with anything.  Packing spans instead also multiplies how many keys
+  // fit in one arena round by the same factor.
+  //
   // GET has its own arena and mutex, so it overlaps a concurrent remote PUT
   // (which uses the separate PUT arena/mutex).
   char* const scratch_base = static_cast<char*>(config_.ranged_get_scratch_buffer);
@@ -2049,13 +2057,9 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
     MORI_UMBP_ERROR("[PoolClient] BatchGetRanges: ranged scratch is absent or not registered");
     return results;
   }
-  // Only the arena users serialize; the local hits above were fully concurrent.
-  std::unique_lock<std::mutex> scratch_lock(ranged_get_scratch_mutex_, std::defer_lock);
-  {
-    PhaseTimer lock_timer(dbg ? &dbg->lock : nullptr);
-    scratch_lock.lock();
-  }
 
+  // Routing is a master RPC that never touches the arena, so it runs before the
+  // lock is taken rather than holding every other arena user behind it.
   std::vector<std::string> route_keys;
   route_keys.reserve(missed.size());
   for (size_t index : missed) route_keys.push_back(keys[index]);
@@ -2074,104 +2078,179 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   routes.resize(route_keys.size());
 
   // No tier filter here.  Upstream restricts remote ranged reads to DRAM/HBM
-  // because its remote path is a hand-written DRAM RDMA read; ours fetches the
-  // whole object through ExecuteBatchGetPlan, which reaches any medium the
-  // owning peer publishes — including SSD.
-  std::vector<size_t> eligible;
-  eligible.reserve(missed.size());
+  // because its remote path is a hand-written DRAM RDMA read; ours goes through
+  // ExecuteRemoteBatchGetPlan, which reaches any medium the owning peer
+  // publishes — including SSD, whose staging page is ordinary registered host
+  // memory and so is readable at range granularity like any other.
+  //
+  // Each eligible key becomes one fetch unit: its spans, the bytes they total,
+  // and where in the arena they will land.  Splitting by span prefix rather
+  // than by key means an object larger than the arena is no longer unservable —
+  // only a single span larger than the arena is.
+  struct RangeFetchUnit {
+    size_t original = 0;  // caller key index
+    size_t object_size = 0;
+    std::optional<RouteGetResult> route;
+    std::vector<ByteSpan> spans;
+    std::vector<ObjectRange> packed;  // caller pointer + arena-relative offset
+    size_t bytes = 0;                 // == sum of spans
+  };
+  std::vector<RangeFetchUnit> units;
+  units.reserve(missed.size());
+
   for (size_t r = 0; r < missed.size(); ++r) {
     const size_t original = missed[r];
     if (!routes[r].has_value()) continue;  // genuinely nowhere in the cluster
     const auto& route = *routes[r];
+    const size_t object_size = static_cast<size_t>(route.size);
     if (route.node_id == config_.master_config.node_id || route.size == 0 ||
         route.size > std::numeric_limits<size_t>::max() ||
-        !RangesAreDisjointAndInBounds(static_cast<size_t>(route.size), sizes[original],
-                                      src_offsets[original])) {
+        !RangesAreDisjointAndInBounds(object_size, sizes[original], src_offsets[original])) {
       MORI_UMBP_ERROR("[PoolClient] BatchGetRanges: invalid route/ranges for key='{}' size={}",
                       keys[original], route.size);
       continue;
     }
-    eligible.push_back(r);
+
+    // Built aside and only spliced in once the WHOLE key has been laid out.  A
+    // key can need several units, and a later range that cannot be served must
+    // discard the earlier ones too -- committing them would fetch part of the
+    // key and still report it whole, which the caller cannot detect.
+    std::vector<RangeFetchUnit> key_units;
+    RangeFetchUnit unit;
+    unit.original = original;
+    unit.object_size = object_size;
+    unit.route = routes[r];
+    bool servable = true;
+    for (size_t j = 0; j < sizes[original].size(); ++j) {
+      const size_t span_bytes = sizes[original][j];
+      if (span_bytes > scratch_size) {
+        MORI_UMBP_ERROR(
+            "[PoolClient] BatchGetRanges: range exceeds ranged scratch key='{}' range={} "
+            "scratch={}",
+            keys[original], span_bytes, scratch_size);
+        servable = false;
+        break;
+      }
+      if (unit.bytes + span_bytes > scratch_size) {
+        key_units.push_back(std::move(unit));
+        unit = RangeFetchUnit{};
+        unit.original = original;
+        unit.object_size = object_size;
+        unit.route = routes[r];
+      }
+      // The copy-out list stays one entry per caller range -- each has its own
+      // buffer -- but the FETCH list does not have to.  Consecutive layers are
+      // consecutive bytes of the object, and the arena packs them in the same
+      // order, so a whole layer group is one contiguous read.
+      //
+      // The engine's planner would coalesce these too, but only after sorting
+      // and bucketing every one of them: a 61-range whole-object read would
+      // build 61 TransferItems per key just to merge them back into one.  That
+      // CPU is invisible next to a multi-MiB object and very visible next to a
+      // small one, so the merge happens here instead.
+      unit.packed.push_back(
+          ObjectRange{.user = dsts[original][j], .size = span_bytes, .object_offset = unit.bytes});
+      if (!unit.spans.empty() &&
+          unit.spans.back().object_offset + unit.spans.back().size == src_offsets[original][j]) {
+        unit.spans.back().size += span_bytes;
+      } else {
+        unit.spans.push_back(
+            ByteSpan{.object_offset = src_offsets[original][j], .size = span_bytes});
+      }
+      unit.bytes += span_bytes;
+    }
+    if (!servable) continue;  // key stays false; none of its units are queued
+    if (!unit.spans.empty()) key_units.push_back(std::move(unit));
+    units.insert(units.end(), std::make_move_iterator(key_units.begin()),
+                 std::make_move_iterator(key_units.end()));
+  }
+  if (units.empty()) return results;
+
+  // A key served by several units only succeeds if every one of them does.
+  std::unordered_map<size_t, bool> unit_ok;
+  for (const auto& unit : units) unit_ok.emplace(unit.original, true);
+
+  // Only the arena users serialize; the local hits above were fully concurrent,
+  // and so was the routing RPC above.
+  std::unique_lock<std::mutex> scratch_lock(ranged_get_scratch_mutex_, std::defer_lock);
+  {
+    PhaseTimer lock_timer(dbg ? &dbg->lock : nullptr);
+    scratch_lock.lock();
   }
 
-  // Pack as many objects into the arena as fit, fetch that group, then repeat.
+  // Pack as many units into the arena as fit, fetch that group, then repeat.
+  // Units are 64 B apart so two concurrently-filled slices never share a cache
+  // line; spans WITHIN a unit are exactly packed, which is what lets a group of
+  // adjacent layer ranges coalesce into a single wire segment.
   PhaseTimer remote_timer(dbg ? &dbg->remote : nullptr);
   size_t pos = 0;
-  while (pos < eligible.size()) {
+  while (pos < units.size()) {
     std::vector<size_t> scratch_offsets;
     size_t cursor = 0;
     size_t end = pos;
-    for (; end < eligible.size(); ++end) {
-      const size_t object_size = static_cast<size_t>(routes[eligible[end]]->size);
+    for (; end < units.size(); ++end) {
       size_t aligned = 0;
       if (!AlignUpChecked(cursor, kRangedScratchAlignment, &aligned) ||
-          object_size > scratch_size || aligned > scratch_size - object_size) {
+          aligned > scratch_size - units[end].bytes) {
         break;
       }
       scratch_offsets.push_back(aligned);
-      cursor = aligned + object_size;
+      cursor = aligned + units[end].bytes;
     }
-    if (end == pos) {
-      // Not even one fits: this object is larger than the whole arena.
-      const size_t original = missed[eligible[pos]];
-      MORI_UMBP_ERROR(
-          "[PoolClient] BatchGetRanges: object exceeds ranged scratch key='{}' size={} scratch={}",
-          keys[original], routes[eligible[pos]]->size, scratch_size);
-      ++pos;
-      continue;
-    }
-
+    // Unit sizing already caps every unit at scratch_size, so the first one
+    // always fits and this loop always advances.
     const size_t count = end - pos;
+
     std::vector<std::string> sub_keys;
     std::vector<void*> sub_dsts;
-    std::vector<size_t> sub_sizes;
+    std::vector<size_t> sub_object_sizes;
+    std::vector<size_t> sub_bytes;
+    std::vector<const std::vector<ByteSpan>*> sub_spans;
     std::vector<std::optional<RouteGetResult>> sub_routes;
     sub_keys.reserve(count);
     sub_dsts.reserve(count);
-    sub_sizes.reserve(count);
+    sub_object_sizes.reserve(count);
+    sub_bytes.reserve(count);
+    sub_spans.reserve(count);
     sub_routes.reserve(count);
     for (size_t j = 0; j < count; ++j) {
-      const size_t route_index = eligible[pos + j];
-      sub_keys.push_back(keys[missed[route_index]]);
+      const auto& unit = units[pos + j];
+      sub_keys.push_back(keys[unit.original]);
       sub_dsts.push_back(scratch_base + scratch_offsets[j]);
-      sub_sizes.push_back(static_cast<size_t>(routes[route_index]->size));
-      sub_routes.push_back(routes[route_index]);
+      sub_object_sizes.push_back(unit.object_size);
+      sub_bytes.push_back(unit.bytes);
+      sub_spans.push_back(&unit.spans);
+      sub_routes.push_back(unit.route);
     }
 
     std::vector<bool> fetched(count, false);
-    BatchGetPlan plan = PartitionBatchGetTargets(sub_keys, sub_dsts, sub_sizes, sub_routes);
-    // recache_remote=false: this loop installs synchronously below, and the
-    // async re-cache would queue a second install of the same bytes.
-    ExecuteBatchGetPlan(plan, sub_keys, sub_dsts, sub_sizes, &fetched, /*recache_remote=*/false);
+    BatchGetPlan plan = PartitionBatchGetRangeTargets(sub_keys, sub_dsts, sub_object_sizes,
+                                                      sub_bytes, sub_spans, sub_routes);
+    // recache_remote=false: a ranged entry never holds the whole object, so
+    // there is nothing the generic re-cache could legally install.  Restoring
+    // locality is a separate concern, added in the next change.
+    ExecuteRemoteBatchGetPlan(plan, &fetched, /*recache_remote=*/false);
 
     for (size_t j = 0; j < count; ++j) {
-      const size_t original = missed[eligible[pos + j]];
-      if (!fetched[j]) continue;
-
-      // Serve the caller from the arena copy we already have.  Installing into
-      // the local medium is a caching side effect: it makes the *next* ranged
-      // read of this key a local hit, and its failure must not fail this read.
-      results[original] = CopyContiguousToRanges(
-          sub_dsts[j], sub_sizes[j],
-          MakeReadRanges(dsts[original], sizes[original], src_offsets[original]));
-      if (results[original]) {
-        // Range bytes handed to the caller, not sub_sizes[j]: the arena fetch
-        // moved the whole object, but only these bytes were asked for.  The
-        // wire cost is on the outbound/inbound get byte counters instead.
-        remote_bytes += static_cast<double>(
-            std::accumulate(sizes[original].begin(), sizes[original].end(), size_t{0}));
+      const auto& unit = units[pos + j];
+      if (!fetched[j]) {
+        unit_ok[unit.original] = false;
+        continue;
       }
-
-      const auto installed = ExecuteLocalPut(sub_keys[j], sub_dsts[j], sub_sizes[j], medium_);
-      if (installed != PutAttemptOutcome::kSuccess &&
-          installed != PutAttemptOutcome::kSuccessAlreadyExists) {
-        master_client_->AddCounter(MORI_UMBP_METRIC_RANGED_REMOTE_INSTALL_FAILURES_TOTAL,
-                                   MORI_UMBP_METRIC_RANGED_REMOTE_INSTALL_FAILURES_TOTAL_HELP, {},
-                                   1.0);
+      if (!CopyContiguousToRanges(sub_dsts[j], unit.bytes, unit.packed)) {
+        unit_ok[unit.original] = false;
+        continue;
+      }
+      // unit.bytes is both what the caller asked for and what crossed the wire:
+      // the fetch is range-granular now, so the two no longer differ.
+      remote_bytes += static_cast<double>(unit.bytes);
+      {
       }
     }
     pos = end;
   }
+
+  for (const auto& [original, ok] : unit_ok) results[original] = ok;
   return results;
 }
 
@@ -2403,6 +2482,31 @@ PoolClient::BatchGetPlan PoolClient::PartitionBatchGetTargets(
   return plan;
 }
 
+PoolClient::BatchGetPlan PoolClient::PartitionBatchGetRangeTargets(
+    const std::vector<std::string>& keys, const std::vector<void*>& arena_slices,
+    const std::vector<size_t>& object_sizes, const std::vector<size_t>& packed_bytes,
+    const std::vector<const std::vector<ByteSpan>*>& spans,
+    const std::vector<std::optional<RouteGetResult>>& routes) {
+  BatchGetPlan plan;
+  for (size_t i = 0; i < keys.size(); ++i) {
+    // Unroutable and self-routed keys were filtered by the caller, which is
+    // what makes this plan remote-only.  Anything that slips through is a
+    // caller bug, not a local read to fall back to.
+    if (i >= routes.size() || !routes[i].has_value() || packed_bytes[i] == 0 ||
+        spans[i] == nullptr || spans[i]->empty()) {
+      continue;
+    }
+    plan.remote_groups[routes[i]->node_id].push_back(BatchGetItem{.index = i,
+                                                                  .key = &keys[i],
+                                                                  .dst = arena_slices[i],
+                                                                  .size = object_sizes[i],
+                                                                  .dst_bytes = packed_bytes[i],
+                                                                  .spans = spans[i],
+                                                                  .route = *routes[i]});
+  }
+  return plan;
+}
+
 void PoolClient::ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector<std::string>& keys,
                                      const std::vector<void*>& dsts,
                                      const std::vector<size_t>& sizes, std::vector<bool>* results,
@@ -2455,6 +2559,16 @@ void PoolClient::ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector
     if (auto f = SubmitRemoteBatchGet(items, results)) inflights.push_back(std::move(f));
   }
   run_local();
+  for (auto& f : inflights) WaitRemoteBatchGet(*f, results, recache_remote);
+}
+
+void PoolClient::ExecuteRemoteBatchGetPlan(const BatchGetPlan& plan, std::vector<bool>* results,
+                                           bool recache_remote) {
+  std::vector<std::unique_ptr<RemoteGetInFlight>> inflights;
+  inflights.reserve(plan.remote_groups.size());
+  for (const auto& [node_id, items] : plan.remote_groups) {
+    if (auto f = SubmitRemoteBatchGet(items, results)) inflights.push_back(std::move(f));
+  }
   for (auto& f : inflights) WaitRemoteBatchGet(*f, results, recache_remote);
 }
 
@@ -2652,32 +2766,89 @@ bool PoolClient::BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries,
 
   for (size_t idx = 0; idx < entries.size(); ++idx) {
     auto& entry = entries[idx];
-    const auto [dst, dst_base] = UserBufferRef(entry.item->dst, entry.item->size);
+    // DstBytes(), not size: a ranged entry's destination is an arena slice
+    // holding only the spans.  Passing the object size would make
+    // FindRegisteredMemory's containment check reject a slice that sits near
+    // the end of the arena, silently downgrading a zero-copy read to a staged
+    // one instead of failing.
+    const auto [dst, dst_base] = UserBufferRef(entry.item->dst, entry.item->DstBytes());
     const std::vector<TransferRef>& remote = buffers_for(entry.plan.backend_id);
 
-    std::vector<TransferItem> entry_items;
-    entry_items.reserve(entry.plan.pages.size());
-    for (size_t p = 0; p < entry.plan.pages.size(); ++p) {
-      const auto& page = entry.plan.pages[p];
+    // Shared by both shapes: a page the peer never published means this key
+    // cannot be read at all, so the entry fails whole rather than partially.
+    auto peer_buffer = [&](const PageLocation& page) -> const TransferRef* {
       if (page.buffer_index >= remote.size() || !remote[page.buffer_index].HasMemoryDesc()) {
         MORI_UMBP_ERROR(
             "[PoolClient] BuildRemoteGetTransfers: peer published no buffer, "
             "key='{}' backend={} buffer_index={} peer_buffers={} page_index={}",
             (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"},
             entry.plan.backend_id, page.buffer_index, remote.size(), page.page_index);
-        entry.failed = true;
-        entry_items.clear();
-        break;
+        return nullptr;
       }
-      TransferItem item;
-      item.tag = idx;
-      item.src = remote[page.buffer_index];
-      item.src_offset = static_cast<uint64_t>(page.page_index) * entry.plan.page_size;
-      item.dst = dst;
-      item.dst_offset = dst_base + static_cast<uint64_t>(p) * entry.plan.page_size;
-      item.size =
-          LogicalPageBytes(p, entry.plan.pages.size(), entry.plan.page_size, entry.item->size);
-      entry_items.push_back(std::move(item));
+      return &remote[page.buffer_index];
+    };
+
+    std::vector<TransferItem> entry_items;
+
+    if (entry.item->Ranged()) {
+      // Move only the requested spans, laid down back-to-back at the
+      // destination in the caller's span order.  The spans are NOT assumed
+      // ascending — a packed multi-component KV pool emits them interleaved —
+      // so each is walked independently and any merging is left to the engine's
+      // planner, which coalesces adjacent segments per MR pair anyway.
+      //
+      // One item per (span x page it touches), so the page count alone is not
+      // the bound.
+      entry_items.reserve(entry.item->spans->size() + entry.plan.pages.size());
+      size_t packed_cursor = 0;
+      for (const auto& span : *entry.item->spans) {
+        const bool walked = ForEachRangePageFragment(
+            entry.plan.pages, entry.plan.page_size, entry.item->size, span.object_offset, span.size,
+            [&](size_t page_index, uint64_t tier_offset, size_t fragment, size_t copied) {
+              const TransferRef* buf = peer_buffer(entry.plan.pages[page_index]);
+              if (buf == nullptr) return false;
+              TransferItem item;
+              item.tag = idx;
+              item.src = *buf;
+              item.src_offset = tier_offset;
+              item.dst = dst;
+              item.dst_offset = dst_base + packed_cursor + copied;
+              item.size = fragment;
+              entry_items.push_back(std::move(item));
+              return true;
+            });
+        if (!walked) {
+          MORI_UMBP_ERROR(
+              "[PoolClient] BuildRemoteGetTransfers: span [{},{}) outside object, key='{}' size={}",
+              span.object_offset, span.object_offset + span.size,
+              (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"},
+              entry.item->size);
+          entry.failed = true;
+          entry_items.clear();
+          break;
+        }
+        packed_cursor += span.size;
+      }
+    } else {
+      entry_items.reserve(entry.plan.pages.size());
+      for (size_t p = 0; p < entry.plan.pages.size(); ++p) {
+        const TransferRef* buf = peer_buffer(entry.plan.pages[p]);
+        if (buf == nullptr) {
+          entry.failed = true;
+          entry_items.clear();
+          break;
+        }
+        TransferItem item;
+        item.tag = idx;
+        item.src = *buf;
+        item.src_offset =
+            static_cast<uint64_t>(entry.plan.pages[p].page_index) * entry.plan.page_size;
+        item.dst = dst;
+        item.dst_offset = dst_base + static_cast<uint64_t>(p) * entry.plan.page_size;
+        item.size =
+            LogicalPageBytes(p, entry.plan.pages.size(), entry.plan.page_size, entry.item->size);
+        entry_items.push_back(std::move(item));
+      }
     }
 
     if (!entry_items.empty()) {
@@ -2695,18 +2866,28 @@ void PoolClient::FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries,
       (*results)[entry.result_index] = false;
       continue;
     }
+    // Bytes that actually crossed the wire, which for a ranged entry is the
+    // span total and not the object size.  Reporting the object size here would
+    // overstate remote GET bandwidth by the whole read-amplification factor the
+    // ranged path exists to remove.
+    const double moved = static_cast<double>(entry.item->DstBytes());
     master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL,
                                MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL_HELP,
-                               {{"traffic", "remote"}}, static_cast<double>(entry.item->size));
+                               {{"traffic", "remote"}}, moved);
     master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL,
                                MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP,
-                               {{"traffic", "remote"}}, static_cast<double>(entry.item->size));
+                               {{"traffic", "remote"}}, moved);
     (*results)[entry.result_index] = true;
 
     // Re-cache the remotely-fetched block into local DRAM (best-effort): the
     // user dst is already populated (staging copy-out and zero-copy both land
     // before Finalize runs), so subsequent reads of this key route local.
-    if (recache_remote && entry.item) {
+    //
+    // Never for a ranged entry: the destination holds only the requested spans,
+    // and a medium slot is whole-object, so installing it would publish a key
+    // whose remaining bytes are undefined.  Restoring locality for a ranged
+    // read is a separate concern.
+    if (recache_remote && entry.item && !entry.item->Ranged()) {
       MaybeReCacheAfterRemote(*entry.item->key, entry.item->dst, entry.item->size);
     }
   }
