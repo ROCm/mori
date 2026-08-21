@@ -56,6 +56,7 @@
 #include "umbp/distributed/peer/peer_service.h"
 #include "umbp/distributed/peer/peer_ssd_manager.h"
 #include "umbp/distributed/peer/ssd_copy_pipeline.h"
+#include "umbp/distributed/range_map.h"
 #include "umbp/distributed/ssd_read_lease.h"
 #include "umbp_peer.grpc.pb.h"
 
@@ -227,18 +228,6 @@ inline void LocalParallelFor(size_t n, int num_threads, Fn&& fn) {
   pool.reserve(num_threads);
   for (int t = 0; t < num_threads; ++t) pool.emplace_back(worker);
   for (auto& th : pool) th.join();
-}
-
-inline uint64_t LogicalPageBytes(size_t i, size_t num_pages, uint64_t page_size,
-                                 size_t total_size) {
-  return (i + 1 == num_pages) ? (total_size - i * page_size) : page_size;
-}
-
-bool SizeMatchesAllocation(uint64_t size, size_t num_pages, uint64_t page_size) {
-  if (page_size == 0 || num_pages == 0 || size == 0) return false;
-  if (size > num_pages * page_size) return false;
-  if (size <= (num_pages - 1) * page_size) return false;
-  return true;
 }
 
 uint64_t AlignUp(uint64_t value, uint64_t alignment) {
@@ -1073,27 +1062,22 @@ bool PoolClient::LocalGetRangesBatch(const std::vector<LocalRangeReadRequest>& r
     }
     runs.reserve(runs.size() + request.sizes->size() + request.pages->size());
     for (size_t r = 0; r < request.sizes->size(); ++r) {
-      size_t object_offset = (*request.src_offsets)[r];
-      size_t copied = 0;
-      while (copied < (*request.sizes)[r]) {
-        const size_t page_index = object_offset / page_size;
-        const size_t within_page = object_offset % page_size;
-        if (page_index >= request.pages->size()) return false;
-        const auto& page = (*request.pages)[page_index];
-        if (page.buffer_index >= config_.dram_buffers.size()) return false;
-        const auto& dram = config_.dram_buffers[page.buffer_index];
-        const uint64_t tier_page_offset = static_cast<uint64_t>(page.page_index) * page_size;
-        if (!dram.buffer || page_size > dram.size || tier_page_offset > dram.size - page_size) {
-          return false;
-        }
-        const size_t fragment = std::min<size_t>((*request.sizes)[r] - copied,
-                                                 static_cast<size_t>(page_size - within_page));
-        const void* src = static_cast<const char*>(dram.buffer) + tier_page_offset + within_page;
-        void* dst = static_cast<char*>((*request.dsts)[r]) + copied;
-        AppendRangeCopyRun(&runs, src, dst, fragment);
-        object_offset += fragment;
-        copied += fragment;
-      }
+      // The walk owns every object-side bound: overflow, page-list overrun, and
+      // the short last page a range must not run off the end of.  Only the
+      // buffer-side bound stays here, because only this caller knows it.
+      const bool walked = ForEachRangePageFragment(
+          *request.pages, page_size, request.stored_size, (*request.src_offsets)[r],
+          (*request.sizes)[r],
+          [&](size_t page_index, uint64_t tier_offset, size_t fragment, size_t copied) {
+            const auto& page = (*request.pages)[page_index];
+            if (page.buffer_index >= config_.dram_buffers.size()) return false;
+            const auto& dram = config_.dram_buffers[page.buffer_index];
+            if (!dram.buffer || tier_offset + fragment > dram.size) return false;
+            AppendRangeCopyRun(&runs, static_cast<const char*>(dram.buffer) + tier_offset,
+                               static_cast<char*>((*request.dsts)[r]) + copied, fragment);
+            return true;
+          });
+      if (!walked) return false;
     }
   }
   if (runs.empty()) {
@@ -1156,34 +1140,17 @@ std::vector<PoolClient::PutAttemptOutcome> PoolClient::ExecuteLocalPutRangesBatc
     const size_t run_begin = runs.size();
     bool valid = true;
     for (size_t r = 0; r < request.sizes->size() && valid; ++r) {
-      size_t object_offset = (*request.dst_offsets)[r];
-      size_t copied = 0;
-      while (copied < (*request.sizes)[r]) {
-        const size_t page_index = object_offset / page_size;
-        const size_t within_page = object_offset % page_size;
-        if (page_index >= slot.pages.size()) {
-          valid = false;
-          break;
-        }
-        const auto& page = slot.pages[page_index];
-        if (page.buffer_index >= config_.dram_buffers.size()) {
-          valid = false;
-          break;
-        }
-        const auto& dram = config_.dram_buffers[page.buffer_index];
-        const uint64_t tier_page_offset = static_cast<uint64_t>(page.page_index) * page_size;
-        if (!dram.buffer || page_size > dram.size || tier_page_offset > dram.size - page_size) {
-          valid = false;
-          break;
-        }
-        const size_t fragment = std::min<size_t>((*request.sizes)[r] - copied,
-                                                 static_cast<size_t>(page_size - within_page));
-        const void* src = static_cast<const char*>((*request.srcs)[r]) + copied;
-        void* dst = static_cast<char*>(dram.buffer) + tier_page_offset + within_page;
-        AppendRangeCopyRun(&runs, src, dst, fragment);
-        object_offset += fragment;
-        copied += fragment;
-      }
+      valid = ForEachRangePageFragment(
+          slot.pages, page_size, slot.size, (*request.dst_offsets)[r], (*request.sizes)[r],
+          [&](size_t page_index, uint64_t tier_offset, size_t fragment, size_t copied) {
+            const auto& page = slot.pages[page_index];
+            if (page.buffer_index >= config_.dram_buffers.size()) return false;
+            const auto& dram = config_.dram_buffers[page.buffer_index];
+            if (!dram.buffer || tier_offset + fragment > dram.size) return false;
+            AppendRangeCopyRun(&runs, static_cast<const char*>((*request.srcs)[r]) + copied,
+                               static_cast<char*>(dram.buffer) + tier_offset, fragment);
+            return true;
+          });
     }
     if (!valid) {
       runs.resize(run_begin);

@@ -203,6 +203,16 @@ set_tests_properties(umbp_peer_service umbp_cross_node_smoke
                      umbp_pool_client_batch_put umbp_pool_client_ranges
                      PROPERTIES LABELS "integration")
 
+# test_umbp_range_map — the object-range -> page-range arithmetic on its own.
+# Header-only and node-free, so it is a plain unit test rather than an
+# integration one: the shapes that matter (short last page, range ending on the
+# object's last byte, one byte past the end) are awkward to reach through a
+# live two-node fixture, and a mistake there corrupts a KV block silently
+# rather than failing.
+add_executable(test_umbp_range_map test_range_map.cpp)
+target_link_libraries(test_umbp_range_map PRIVATE umbp_common gtest_main)
+add_test(NAME umbp_range_map COMMAND test_umbp_range_map)
+
 # --------------------------------------------------------------------------
 # Benchmarks (manual; built but NOT registered with add_test).
 # --------------------------------------------------------------------------
