@@ -107,6 +107,14 @@ class EpDispatchCombineConfig:
     # else the default. Only consulted when constructing the BASE class; naming a
     # subclass directly wins.
     kernel_backend: str = None
+    # How the flydsl backend moves dispatch payload: "vector" (per-lane vec4
+    # copies) or "tdm" (the gfx1250 tensor data mover, a port of the C++
+    # intranode_1250x path -- block-local route histogram, one remote atomic per
+    # (block, peer), bulk metadata runs, DMA payload). "auto" picks vector, so
+    # nothing changes for existing callers; MORI_EP_DISPATCH_TDM=1 flips the auto
+    # default for A/B runs. The two produce interchangeable state, so combine /
+    # replay / the routing handle do not care which ran.
+    dispatch_transport: str = "auto"
 
     def __post_init__(self):
         # all-or-none: setting only one silently defaults the other to data_type.
@@ -128,6 +136,33 @@ class EpDispatchCombineConfig:
             )
         if self.quant_type != "none":
             self.combine_mode = "scatter"
+        if self.dispatch_transport not in ("auto", "vector", "tdm"):
+            raise ValueError(
+                "dispatch_transport must be auto|vector|tdm, "
+                f"got {self.dispatch_transport!r}"
+            )
+        if self.dispatch_transport == "auto":
+            self.dispatch_transport = (
+                "tdm" if os.environ.get("MORI_EP_DISPATCH_TDM") == "1" else "vector"
+            )
+        if self.dispatch_transport == "tdm":
+            # Each of these has its own staging region / slot arithmetic that the
+            # TDM kernel does not carry; failing loudly beats silently dropping
+            # scales or landing tokens in the wrong group.
+            unsupported = [
+                name
+                for name, on in (
+                    ("scale_dim", self.scale_dim > 0),
+                    ("fp4 tokens", self.is_fp4),
+                )
+                if on
+            ]
+            if unsupported:
+                raise ValueError(
+                    "dispatch_transport='tdm' does not implement "
+                    + ", ".join(unsupported)
+                    + "; use dispatch_transport='vector'"
+                )
         # The dispatch grid barrier resets inside a `range(lane, npes, 64)` loop,
         # correct only while each lane runs it once (npes <= wavefront).
         if self.world_size > 64:
@@ -216,6 +251,7 @@ class EpDispatchCombineConfig:
                     self.hidden_dim,
                     self.num_experts_per_token,
                     dtype=self.dtype_str,
+                    dispatch_transport=self.dispatch_transport,
                 )
             self.dispatch_block_num = t["dispatch_block_num"]
             self.combine_block_num = t["combine_block_num"]
@@ -278,6 +314,15 @@ class EpDispatchCombineConfig:
             kwargs["hidden_dim"],
             kwargs["num_experts_per_token"],
             dtype=dtype,
+            dispatch_transport=(
+                "tdm"
+                if kwargs.get("dispatch_transport") == "tdm"
+                or (
+                    kwargs.get("dispatch_transport", "auto") == "auto"
+                    and os.environ.get("MORI_EP_DISPATCH_TDM") == "1"
+                )
+                else "vector"
+            ),
         )
         for k, v in t.items():
             kwargs.setdefault(k, v)
