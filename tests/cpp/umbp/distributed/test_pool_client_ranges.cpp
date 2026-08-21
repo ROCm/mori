@@ -1082,5 +1082,90 @@ TEST_F(PoolClientRangesTest, PartialFailureAttributionAcrossKeys) {
   EXPECT_EQ(bad_out, std::vector<char>(600, 0x5a)) << "failed key's buffer was written";
 }
 
+// Everything above reads one or two keys from one thread.  The paths this
+// change added only diverge under load: which keys are local when a call
+// starts, whether a slot can be had, whether the background pull lands before
+// the next group asks -- all of it decided by a race.  So drive every shape at
+// once over an overlapping key set and check the bytes afterwards.
+//
+// The caller's medium deliberately cannot hold all the keys, so slot
+// allocation fails part of the time and the arena fallback is exercised too.
+TEST_F(PoolClientRangesTest, ConcurrentMixedShapesAllReturnCorrectBytes) {
+  constexpr size_t kKeys = 12;  // > kCallerCapacity / kObjectSize, so slots run out
+  constexpr size_t kThreads = 4;
+  constexpr size_t kRounds = 3;
+  constexpr size_t kGroups = 8;
+  constexpr size_t kSlice = kObjectSize / kGroups;
+
+  std::vector<std::string> keys;
+  std::vector<std::vector<char>> objects;
+  for (size_t k = 0; k < kKeys; ++k) {
+    keys.push_back("stress-" + std::to_string(k));
+    std::vector<char> object(kObjectSize);
+    for (size_t i = 0; i < kObjectSize; ++i) {
+      object[i] = static_cast<char>((i * 97 + k * 211 + 5) & 0xff);
+    }
+    SeedRemoteObject(keys.back(), object);
+    objects.push_back(std::move(object));
+  }
+
+  std::atomic<size_t> mismatches{0};
+  std::atomic<size_t> failures{0};
+  std::vector<std::thread> threads;
+  for (size_t t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&, t] {
+      // Half the threads read layer-wise (a slice per call, never the whole
+      // object); half read the whole object in one call (the slot path).  Both
+      // touch the same keys.
+      const bool layer_wise = (t % 2) == 0;
+      std::vector<std::vector<char>> restored(kKeys, std::vector<char>(kObjectSize, 0));
+      for (size_t round = 0; round < kRounds; ++round) {
+        for (auto& buffer : restored) std::fill(buffer.begin(), buffer.end(), 0);
+
+        if (layer_wise) {
+          for (size_t g = 0; g < kGroups; ++g) {
+            const size_t offset = g * kSlice;
+            std::vector<std::vector<void*>> ptrs(kKeys);
+            std::vector<std::vector<size_t>> sizes(kKeys, {kSlice});
+            std::vector<std::vector<size_t>> offsets(kKeys, {offset});
+            for (size_t k = 0; k < kKeys; ++k) ptrs[k] = {restored[k].data() + offset};
+            const auto got = caller_->BatchGetRanges(keys, ptrs, sizes, offsets);
+            for (bool ok : got) {
+              if (!ok) failures.fetch_add(1, std::memory_order_relaxed);
+            }
+          }
+        } else {
+          std::vector<std::vector<void*>> ptrs(kKeys);
+          std::vector<std::vector<size_t>> sizes(kKeys), offsets(kKeys);
+          for (size_t k = 0; k < kKeys; ++k) {
+            for (size_t g = 0; g < kGroups; ++g) {
+              ptrs[k].push_back(restored[k].data() + g * kSlice);
+              sizes[k].push_back(kSlice);
+              offsets[k].push_back(g * kSlice);
+            }
+          }
+          const auto got = caller_->BatchGetRanges(keys, ptrs, sizes, offsets);
+          for (bool ok : got) {
+            if (!ok) failures.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+
+        for (size_t k = 0; k < kKeys; ++k) {
+          if (std::memcmp(restored[k].data(), objects[k].data(), kObjectSize) != 0) {
+            mismatches.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+      }
+    });
+  }
+  for (auto& thread : threads) thread.join();
+
+  // A read may legitimately fail here -- the medium is intentionally too small,
+  // so a slot or an arena round can be refused -- but it must never return the
+  // wrong bytes.
+  EXPECT_EQ(mismatches.load(), 0u) << "a caller buffer came back wrong";
+  EXPECT_EQ(failures.load(), 0u) << "reads should still all succeed; the fallbacks cover this";
+}
+
 }  // namespace
 }  // namespace mori::umbp
