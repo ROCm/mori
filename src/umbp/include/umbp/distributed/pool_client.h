@@ -385,6 +385,34 @@ class PoolClient {
   // full; failure does not affect the returned Get result.
   void MaybeReCacheAfterRemote(const std::string& key, const void* src, size_t size);
 
+  // After a remote RANGED read served `fetched_bytes` of `object_size`, queue a
+  // background pull of the WHOLE object into this node's medium, so the next
+  // read of the key is a local hit instead of another trip to the peer.
+  //
+  // Why this exists at all: a ranged read holds only the caller's spans, so
+  // MaybeReCacheAfterRemote — which installs the buffer it is handed — has
+  // nothing legal to install.  Locality has to be rebuilt from the peer.
+  //
+  // Skipped when this call already covered the object (`fetched_bytes ==
+  // object_size`): the whole-object reader would otherwise pull every object
+  // twice, once for itself and once for a cache it just filled.
+  //
+  // Best-effort in every direction: gated by ranged_locality_prefetch and the
+  // re-cache admission policy, deduplicated against both the queue and this
+  // node's medium, bounded, and silent on failure.  It never runs on, and never
+  // blocks, the read that scheduled it.
+  void MaybePrefetchWholeObject(const std::string& key, size_t object_size,
+                                const RouteGetResult& route);
+  // The other half of the same decision: the arena slice already holds the
+  // whole object (the caller's ranges tiled it in order), so locality costs one
+  // local copy instead of a second trip to the peer.  Synchronous because the
+  // slice is live only until the next sub-batch reuses it.  Mutually exclusive
+  // with MaybePrefetchWholeObject — exactly one runs per fetched key.
+  void MaybeInstallCompleteArenaObject(const std::string& key, const void* arena_slice,
+                                       size_t object_size);
+  // Shared gate for both: the feature switch, an installable local medium, and
+  // the re-cache admission policy.
+  bool LocalityCachingAdmits(size_t object_size) const;
   // Background worker that drains recache_queue_ and performs the DRAM install
   // via ExecuteLocalPut. Started in Init (when cache_remote_fetches), stopped in
   // Shutdown before peer_alloc_ is torn down.
@@ -393,14 +421,42 @@ class PoolClient {
   // Async re-cache install queue. MaybeReCacheAfterRemote copies the block bytes
   // into a job here (the source buffer is not owned past the Get return), and the
   // worker thread installs it. Bounded to keep memory + publish churn in check.
+  // Two shapes share one queue and one worker so they also share its lifecycle,
+  // its bound and its drain-on-shutdown:
+  //   bytes != nullptr  -> install this buffer (MaybeReCacheAfterRemote)
+  //   bytes == nullptr  -> pull the object from `route` first
+  //                        (MaybePrefetchWholeObject)
   struct ReCacheJob {
     std::string key;
     std::unique_ptr<char[]> bytes;
     size_t size = 0;
+    std::optional<RouteGetResult> route;
   };
+  // Pull whole objects from their peers straight into freshly allocated local
+  // slots and commit them.  Peer pages and medium pages are both registered
+  // host memory, so this is RDMA with no bounce buffer and no memcpy — unlike
+  // the ReCacheJob path, which has to carry a heap copy of the bytes.
+  //
+  // BATCHED deliberately, and it has to be.  Per key the fixed cost is a peer
+  // resolve RPC plus an RDMA submit/wait; done one at a time on this single
+  // worker thread that cost is paid once per key, and for small objects it
+  // dominates the bytes so thoroughly that the worker cannot keep up with the
+  // reader — the prefetch then loses more races than it wins and the whole
+  // feature turns negative.  Batching amortises the resolve over every key
+  // routed to the same peer and gives the engine one large scatter-gather to
+  // post.
+  //
+  // Best-effort per key: already-local keys are dropped before allocating (the
+  // alternative wastes a whole object of wire), and any key whose allocation or
+  // transfer fails is aborted without affecting the others.
+  void FetchWholeObjectsIntoMedium(std::vector<ReCacheJob>& jobs);
 
   std::deque<ReCacheJob> recache_queue_;
   std::mutex recache_mutex_;
+  // Keys with a whole-object pull already queued or running.  A layer-wise
+  // reader names the same key once per layer group, so without this every group
+  // that misses locally would queue another pull of bytes already in flight.
+  std::unordered_set<std::string> prefetch_inflight_;
 
   // Serializes users of each caller-owned ranged scratch arena.  Only the remote
   // half of a ranged operation takes one — keys served by this node's own medium
@@ -440,6 +496,14 @@ class PoolClient {
     // BatchGet wants and why it needs no changes.
     size_t dst_bytes = 0;                          // 0 => size
     const std::vector<ByteSpan>* spans = nullptr;  // null/empty => whole object
+    // Pre-resolved destination, used instead of `dst` when set.  UserBufferRef
+    // only knows regions registered through PoolClient::RegisterMemory, so a
+    // destination inside a medium backend's own pool — which is RDMA-reachable
+    // but was never handed to RegisterMemory — has to be named by the ref the
+    // backend publishes.  Locality prefetch writes straight into a medium slot
+    // and is the only user.
+    const TransferRef* dst_ref = nullptr;
+    uint64_t dst_ref_offset = 0;
     RouteGetResult route;
 
     size_t DstBytes() const { return dst_bytes != 0 ? dst_bytes : size; }
