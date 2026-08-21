@@ -309,6 +309,10 @@ constexpr int EpTokenBytes(const EpCfg& c) { return c.hiddenDim * EpElemSize(c.d
 // engine; combine reserves the whole budget and sizes its tiles at runtime.
 // EpCombine1250xLdsBudget must match MORI_COMB_LDS_BUDGET in ep_intranode_1250x.hpp.
 constexpr int EpCombine1250xLdsBudget = 327680;
+// xdbFlag slots for the per-block combine entry barrier: one uint64 per block, so a
+// block is the only writer of its own epoch. 256 == the CU count, which caps the
+// combine block_num; the host allocates this many and every call keeps them in step.
+constexpr int EpXdbFlagSlots = 256;
 constexpr int EpDispatch1250xLdsBytes(const EpCfg& c) {
   return c.warpPerBlock * c.hiddenDim * EpElemSize(c.dtype);
 }
