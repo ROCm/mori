@@ -22,7 +22,9 @@
 #include "umbp/distributed/distributed_client.h"
 
 #include <map>
+#include <mutex>
 #include <stdexcept>
+#include <string>
 
 #include "mori/io/engine.hpp"
 #include "mori/utils/mori_log.hpp"
@@ -38,56 +40,104 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
 
   const auto& dc = config.distributed.value();
 
+  // All three ownership blocks are lowered unconditionally; dc.medium selects
+  // the one PoolClient::Init actually builds a backend from (exactly one medium
+  // per node — see UMBPMedium in common/config.h).  Lowering all three keeps
+  // this function free of medium branching and lets one deployment template
+  // carry dram/hbm/ssd sizing while choosing between them with a single field.
+  //
+  // Ownership (ptr, hugepages, NUMA, prefault) moved into PoolClient's DRAM
+  // PageBackend — it self-allocates at Init() instead of DistributedClient
+  // calling HostMemAllocator and handing over a buffer pointer
+  // (backend-agnostic refactor Phase 2b, design doc §1 item 4).  Only the
+  // sizing/policy knobs cross this boundary now.
+  DramOwnershipConfig dram_ownership;
+  dram_ownership.buffer_sizes = {config.dram.capacity_bytes};
+  dram_ownership.use_hugepages = config.dram.use_hugepages;
+  dram_ownership.hugepage_size = config.dram.hugepage_size;
+  dram_ownership.numa_node = config.dram.numa_node;
+  dram_ownership.prefault = config.dram.prefault;
+
+  // SSD came back to the distributed data plane as a MediumBackend: Phase 0
+  // unwired the old PeerSsdManager special case, and PoolClient::Init builds an
+  // SsdBackend from PoolClientConfig::ssd the same way it builds DRAM and HBM.
+  //
+  // PeerSsdConfig::enabled is set by ToPoolClientConfig from dc.medium, NOT
+  // from config.ssd.enabled — that flag defaults to true and describes the
+  // LOCAL-mode tier, so keying the distributed medium off it would make every
+  // existing distributed deployment start advertising SSD capacity it had never
+  // opted into.
+  PeerSsdConfig ssd_ownership;
+  ssd_ownership.ssd = config.ssd;
+
+  // HBM is different again: dc.hbm carries everything PoolClient's HBM
+  // PageBackend needs (device/capacity), and ToPoolClientConfig lowers it
+  // directly from dc — no ownership struct crosses this boundary the way dram's
+  // hugepages/NUMA/prefault knobs do, because hipMalloc has none of those
+  // dimensions.
+  // The ranged scratch arena. Plain anonymous host pages: it is registered with
+  // the transfer engine below, and unlike a medium pool it has no hugepage/NUMA
+  // policy to honour — it is touched once per remote ranged operation, not held
+  // as a cache.
+  //
+  // Zero-sized is the default and means "this deployment does not do ranged
+  // I/O": no arena, no registration, and SupportsRangedIO() reports false, so
+  // a client that never issues ranged operations stops paying for the arena.
   HostMemAllocator allocator;
-  HostBufferOptions opts;
-  opts.backing = config.dram.use_hugepages ? HostBufferBacking::kAnonymousHugetlb
-                                           : HostBufferBacking::kAnonymous;
-  opts.hugepage_size = config.dram.hugepage_size;
-  opts.numa_node = config.dram.numa_node;
-  opts.prefault = config.dram.prefault;
-
-  dram_pool_handle_ = allocator.Alloc(config.dram.capacity_bytes, opts);
-  if (!dram_pool_handle_.valid()) {
-    throw std::runtime_error("DistributedClient: memory allocation failed for DRAM pool");
+  HostBufferOptions scratch_opts;
+  // Two separate arenas — GET and PUT — each of ranged_scratch_size, so the two
+  // directions never share a buffer or a lock and can run concurrently.
+  if (dc.ranged_scratch_size > 0) {
+    ranged_get_scratch_handle_ = allocator.Alloc(dc.ranged_scratch_size, scratch_opts);
+    ranged_put_scratch_handle_ = allocator.Alloc(dc.ranged_scratch_size, scratch_opts);
+    if (!ranged_get_scratch_handle_.valid() || !ranged_put_scratch_handle_.valid()) {
+      // HostBufferHandle is not RAII and the destructor/Close() won't run when a
+      // constructor throws, so free whatever did allocate before bailing out
+      // (Free() is a no-op on an invalid handle).
+      allocator.Free(ranged_get_scratch_handle_);
+      allocator.Free(ranged_put_scratch_handle_);
+      throw std::runtime_error("DistributedClient: memory allocation failed for ranged scratch");
+    }
+    ranged_get_scratch_ = ranged_get_scratch_handle_.ptr;
+    ranged_get_scratch_size_ = ranged_get_scratch_handle_.mapped_size;
+    ranged_put_scratch_ = ranged_put_scratch_handle_.ptr;
+    ranged_put_scratch_size_ = ranged_put_scratch_handle_.mapped_size;
   }
-  dram_pool_ = dram_pool_handle_.ptr;
-  // Use mapped_size (>= capacity_bytes, rounded up to page/hugepage boundary)
-  // so that RDMA registration, PeerDramAllocator capacity, and master-reported
-  // tier_capacities all agree on a single value.  This means the effective
-  // pool size may exceed config.dram.capacity_bytes by up to one hugepage.
-  // NOTE: if hugepage_size is not a multiple of dram_page_size, the tail
-  // bytes that don't form a complete dram_page are reported in
-  // tier_capacities but never allocated by PeerDramAllocator; heartbeat's
-  // TierCapacitiesSnapshot() will correct master's view.  Both default to
-  // 2 MiB, so this only matters with non-default page size combinations.
-  dram_pool_size_ = dram_pool_handle_.mapped_size;
 
-  // Lower SSD config to the peer.  When ssd.enabled, the peer builds a
-  // PeerSsdManager (SSDTier backend) from the SSD config (UMBPSsdConfig) and
-  // reports SSD capacity via TierType::SSD; when disabled, behavior is exactly
-  // DRAM-only (no PeerSsdManager, no SSD capacity, no SSD event source).
-  std::map<TierType, TierCapacity> tier_capacities = {
-      {TierType::DRAM, {dram_pool_size_, dram_pool_size_}}};
-  PeerSsdConfig ssd_cfg;
-  if (config_.ssd.enabled) {
-    ssd_cfg.enabled = true;
-    ssd_cfg.ssd = config_.ssd;
-    const uint64_t ssd_cap = config_.ssd.capacity_bytes;
-    tier_capacities[TierType::SSD] = {ssd_cap, ssd_cap};
-  }
-  auto pc_config = ToPoolClientConfig(dc,
-                                      /*dram_buffers=*/{{dram_pool_, dram_pool_size_}},
-                                      std::move(tier_capacities), std::move(ssd_cfg));
+  auto pc_config = ToPoolClientConfig(dc, std::move(dram_ownership), std::move(ssd_ownership));
+  pc_config.ranged_get_scratch_buffer = ranged_get_scratch_;
+  pc_config.ranged_get_scratch_size = ranged_get_scratch_size_;
+  pc_config.ranged_put_scratch_buffer = ranged_put_scratch_;
+  pc_config.ranged_put_scratch_size = ranged_put_scratch_size_;
   pc_config.copy_pipeline = config_.copy_pipeline;
+
+  auto release_scratch = [this] {
+    HostMemAllocator cleanup;
+    cleanup.Free(ranged_get_scratch_handle_);
+    cleanup.Free(ranged_put_scratch_handle_);
+    ranged_get_scratch_ = nullptr;
+    ranged_get_scratch_size_ = 0;
+    ranged_put_scratch_ = nullptr;
+    ranged_put_scratch_size_ = 0;
+  };
 
   pool_client_ = std::make_unique<PoolClient>(std::move(pc_config));
   if (!pool_client_->Init()) {
     pool_client_.reset();
-    HostMemAllocator cleanup_allocator;
-    cleanup_allocator.Free(dram_pool_handle_);
-    dram_pool_ = nullptr;
-    dram_pool_size_ = 0;
+    release_scratch();
     throw std::runtime_error("DistributedClient: PoolClient::Init() failed");
+  }
+  // Registered explicitly rather than through a backend: each arena is a remote
+  // endpoint for RDMA reads and writes, so it needs a memory region even though
+  // no medium owns it. Skipped entirely when the deployment did not opt in.
+  if ((ranged_get_scratch_ &&
+       !pool_client_->RegisterMemory(ranged_get_scratch_, ranged_get_scratch_size_)) ||
+      (ranged_put_scratch_ &&
+       !pool_client_->RegisterMemory(ranged_put_scratch_, ranged_put_scratch_size_))) {
+    pool_client_->Shutdown();
+    pool_client_.reset();
+    release_scratch();
+    throw std::runtime_error("DistributedClient: ranged scratch registration failed");
   }
 
   std::string tags_str;
@@ -96,17 +146,49 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
     tags_str += t;
   }
 
+  // Only the live medium's sizing is logged: the other two blocks were lowered
+  // but never allocated from, and printing them invites reading a config that
+  // is not in effect (the exact confusion the single selector removes).
+  const auto mb = [](uint64_t bytes) { return std::to_string(bytes / (1024 * 1024)); };
+  std::string medium_desc;
+  switch (dc.medium) {
+    case UMBPMedium::DRAM:
+      medium_desc = "DRAM pool=" + mb(config_.dram.capacity_bytes) +
+                    "MB hugepages=" + (config_.dram.use_hugepages ? "true" : "false") +
+                    " hugepage_size=" + mb(config_.dram.hugepage_size) +
+                    "MB numa_node=" + std::to_string(config_.dram.numa_node);
+      break;
+    case UMBPMedium::HBM:
+      medium_desc =
+          "HBM pool=" + mb(dc.hbm.capacity_bytes) + "MB device=" + std::to_string(dc.hbm.device);
+      break;
+    case UMBPMedium::SSD:
+      // Slot COUNT only, not ssd_staging_buffer_size.  The arena SsdBackend
+      // actually allocates is staging_pages * page_size (see its own
+      // "[SsdBackend] Init ... arena_bytes=" line, which is authoritative);
+      // ssd_staging_buffer_size does not size it, so printing that number here
+      // stated a capacity the node did not have — 6144MB against a real 4096MB
+      // arena in a 2 MiB-page run.
+      //
+      // The slot count is the number worth showing, because it is the SSD
+      // medium's read-concurrency limit: a BatchGet wider than this cannot get
+      // a staging page for every key, and SsdBackend reports that shortfall as
+      // found=false (a MISS), not as backpressure.
+      medium_desc = "SSD pool=" + mb(config_.ssd.capacity_bytes) +
+                    "MB backend=" + config_.ssd.ssd_backend + " dir=" + config_.ssd.storage_dir +
+                    " staging_slots=" + std::to_string(dc.ssd_staging_buffer_slots);
+      break;
+  }
+
   MORI_UMBP_INFO(
       "[DistributedClient] initialized — "
-      "node_id={} node_address={} master={} "
-      "dram_pool={}MB hugepages={} hugepage_size={}MB numa_node={} "
-      "dram_page_size={}KB staging_buffer={}MB peer_port={} cache_remote={} "
+      "node_id={} node_address={} master={} medium=[{}] "
+      "page_size={}KB staging_buffer={}MB peer_port={} cache_remote={} "
       "io_engine={}:{} tags=[{}]",
       dc.master_config.node_id, dc.master_config.node_address, dc.master_config.master_address,
-      dram_pool_size_ / (1024 * 1024), config_.dram.use_hugepages,
-      config_.dram.hugepage_size / (1024 * 1024), config_.dram.numa_node, dc.dram_page_size / 1024,
-      dc.staging_buffer_size / (1024 * 1024), dc.peer_service_port, dc.cache_remote_fetches,
-      dc.io_engine.host, dc.io_engine.port, tags_str);
+      medium_desc, dc.dram_page_size / 1024, dc.staging_buffer_size / (1024 * 1024),
+      dc.peer_service_port, dc.cache_remote_fetches, dc.io_engine.host, dc.io_engine.port,
+      tags_str);
 }
 
 DistributedClient::~DistributedClient() { Close(); }
@@ -185,6 +267,36 @@ std::vector<bool> DistributedClient::BatchGet(const std::vector<std::string>& ke
   return pool_client_->BatchGet(keys, dst_ptrs, sizes);
 }
 
+std::vector<bool> DistributedClient::BatchGetRanges(
+    const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dsts,
+    const std::vector<std::vector<size_t>>& sizes,
+    const std::vector<std::vector<size_t>>& src_offsets) {
+  if (closing_) return std::vector<bool>(keys.size(), false);
+  std::shared_lock lk(op_mutex_);
+  if (closed_ || !pool_client_) return std::vector<bool>(keys.size(), false);
+  std::vector<std::vector<void*>> dst_ptrs(dsts.size());
+  for (size_t i = 0; i < dsts.size(); ++i) {
+    dst_ptrs[i].reserve(dsts[i].size());
+    for (uintptr_t ptr : dsts[i]) dst_ptrs[i].push_back(reinterpret_cast<void*>(ptr));
+  }
+  return pool_client_->BatchGetRanges(keys, dst_ptrs, sizes, src_offsets);
+}
+
+std::vector<bool> DistributedClient::BatchPutRanges(
+    const std::vector<std::string>& keys, const std::vector<size_t>& object_sizes,
+    const std::vector<std::vector<uintptr_t>>& srcs, const std::vector<std::vector<size_t>>& sizes,
+    const std::vector<std::vector<size_t>>& dst_offsets) {
+  if (closing_) return std::vector<bool>(keys.size(), false);
+  std::shared_lock lk(op_mutex_);
+  if (closed_ || !pool_client_) return std::vector<bool>(keys.size(), false);
+  std::vector<std::vector<const void*>> src_ptrs(srcs.size());
+  for (size_t i = 0; i < srcs.size(); ++i) {
+    src_ptrs[i].reserve(srcs[i].size());
+    for (uintptr_t ptr : srcs[i]) src_ptrs[i].push_back(reinterpret_cast<const void*>(ptr));
+  }
+  return pool_client_->BatchPutRanges(keys, object_sizes, src_ptrs, sizes, dst_offsets);
+}
+
 std::vector<bool> DistributedClient::BatchExists(const std::vector<std::string>& keys) const {
   if (closing_) return std::vector<bool>(keys.size(), false);
   std::shared_lock lk(op_mutex_);
@@ -216,11 +328,12 @@ size_t DistributedClient::BatchExistsConsecutive(const std::vector<std::string>&
 // RegisterMemory / DeregisterMemory
 // ---------------------------------------------------------------------------
 
-bool DistributedClient::RegisterMemory(uintptr_t ptr, size_t size) {
+bool DistributedClient::RegisterMemory(uintptr_t ptr, size_t size, mori::io::MemoryLocationType loc,
+                                       int device) {
   if (closing_) return false;
   std::shared_lock lk(op_mutex_);
   if (closed_) return false;
-  return pool_client_->RegisterMemory(reinterpret_cast<void*>(ptr), size);
+  return pool_client_->RegisterMemory(reinterpret_cast<void*>(ptr), size, loc, device);
 }
 
 void DistributedClient::DeregisterMemory(uintptr_t ptr) {
@@ -274,17 +387,48 @@ void DistributedClient::Close() {
     pool_client_.reset();
   }
 
-  if (dram_pool_) {
+  // Only after Shutdown has deregistered the regions — the arenas are
+  // caller-owned and PoolClient holds a memory region over each until then.
+  if (ranged_get_scratch_ || ranged_put_scratch_) {
     HostMemAllocator allocator;
-    allocator.Free(dram_pool_handle_);
-    dram_pool_ = nullptr;
-    dram_pool_size_ = 0;
+    allocator.Free(ranged_get_scratch_handle_);
+    allocator.Free(ranged_put_scratch_handle_);
+    ranged_get_scratch_ = nullptr;
+    ranged_get_scratch_size_ = 0;
+    ranged_put_scratch_ = nullptr;
+    ranged_put_scratch_size_ = 0;
   }
 
   MORI_UMBP_INFO("[DistributedClient] closed");
 }
 
 bool DistributedClient::IsDistributed() const { return true; }
+
+bool DistributedClient::SupportsRangedIO() const {
+  // The scratch arenas are the whole opt-in.  They are purely a remote-path
+  // resource -- remote gets are staged in them, remote puts assembled in them --
+  // and they default to zero, so a deployment that never issues ranged I/O
+  // allocates and registers nothing.
+  //
+  // Deliberately NOT gated on the medium.  SSD used to be excluded here on the
+  // reasoning that its bytes are not addressable by the transfer layer, but
+  // that is exactly what SsdBackend already solves for every other operation:
+  // it publishes a registered host staging arena and spills behind it, so a
+  // resolved SSD key reaches BuildLocalRangeTransfers as ordinary pages and the
+  // object-range -> page-range arithmetic never learns which medium it is
+  // walking (ssd_backend.h).  All four ranged paths therefore work on an SSD
+  // node: get and put, each local and remote.
+  //
+  // What the medium changes is the saving, not the correctness.  A resolve
+  // stages the whole object before anyone says which bytes they want, so a
+  // ranged get off SSD still reads the full object from the device and saves
+  // only the final copy into the caller's buffers.  Ranged put is unaffected:
+  // it tiles its object, so the single whole-object write was always going to
+  // happen.  Making the device read follow the requested extent needs an extent
+  // on the resolve path and is a separate change (doc/design-ssd-ranged-io.md,
+  // D1) -- this flag was never what stood in its way.
+  return ranged_get_scratch_size_ != 0 && ranged_put_scratch_size_ != 0;
+}
 
 bool DistributedClient::ReportExternalKvBlocks(const std::vector<std::string>& hashes,
                                                TierType tier) {

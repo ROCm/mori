@@ -89,10 +89,11 @@ class RoutePutStrategy {
 ///   - node affinity: none / same-node / local-node.
 ///
 /// Both knobs are wired from env vars at master startup
-/// (UMBP_ROUTE_PUT_SELECT_ALGO / UMBP_ROUTE_PUT_NODE_AFFINITY).  Tier order is
-/// always HBM -> DRAM; SSD is never a direct-put target.  Projected capacity is
-/// deducted on the batch-local candidates copy within SelectBatch; nothing is
-/// written back to the registry.
+/// (UMBP_ROUTE_PUT_SELECT_ALGO / UMBP_ROUTE_PUT_NODE_AFFINITY).  There is no
+/// tier order: every medium is treated as equivalent, so any tier a node
+/// advertises capacity for is a valid put target (backend-agnostic refactor
+/// Phase 4).  Projected capacity is deducted on the batch-local candidates copy
+/// within SelectBatch; nothing is written back to the registry.
 class ConfigurableRoutePutStrategy : public RoutePutStrategy {
  public:
   enum class SelectAlgo { kMostAvailable, kRandom };
@@ -113,24 +114,24 @@ class ConfigurableRoutePutStrategy : public RoutePutStrategy {
 
  private:
   /// Try only @p node_id on exactly @p tier; nullopt if it cannot fit
-  /// @p block_size.  No cross-node, no cross-tier fallback.
+  /// @p block_size.  No cross-node, no cross-tier fallback.  Used by same-node
+  /// affinity to pin a whole batch to one (node, tier) — stickiness, not a tier
+  /// preference.
   std::optional<RoutePutResult> TrySelectOnNodeTier(
       const std::vector<ClientRecord>& candidates, const std::string& node_id, TierType tier,
       uint64_t block_size, const std::unordered_set<std::string>& exclude_nodes) const;
 
-  /// Try only @p node_id, HBM then DRAM; nullopt if it cannot fit @p block_size.
-  /// Performs no cross-node fallback — that is the caller's explicit job.
+  /// Try only @p node_id, on whichever of its tiers has the most room; nullopt
+  /// if none can fit @p block_size.  Performs no cross-node fallback — that is
+  /// the caller's explicit job.
   std::optional<RoutePutResult> TrySelectOnNode(
       const std::vector<ClientRecord>& candidates, const std::string& node_id, uint64_t block_size,
       const std::unordered_set<std::string>& exclude_nodes) const;
 
-  /// Base algorithm, tier priority paramount (HBM before DRAM): walk tiers in
-  /// order and route on the first tier that has room.  Within a tier, most-
-  /// available picks the largest free space; random draws weighted by it.  When
-  /// @p preferred_node is set and has room on the current tier, it wins over the
-  /// algorithm — but only within that tier, so tier priority is never broken
-  /// (a remote HBM node still beats the preferred node's DRAM).  This is the
-  /// explicit global-fallback entry point.
+  /// Base algorithm over every (node, tier) pair with room: most-available picks
+  /// the largest free space, random draws weighted by it.  When @p preferred_node
+  /// is set and has room on any of its tiers it wins over the algorithm outright.
+  /// This is the explicit global-fallback entry point.
   std::optional<RoutePutResult> SelectByAlgo(
       const std::vector<ClientRecord>& candidates, uint64_t block_size,
       const std::unordered_set<std::string>& exclude_nodes,

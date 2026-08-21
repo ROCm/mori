@@ -24,8 +24,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -35,6 +37,11 @@
 #include "umbp/local/tiers/tier_backend.h"
 
 namespace mori::umbp {
+
+// Implementation detail of this tier, declared in a source-private header so it
+// stays out of the installed API. `~DRAMTier` is defined out of line, which is
+// what lets the unique_ptr below hold an incomplete type.
+class HostTierRegistration;
 
 // DRAM Tier: mmap pre-allocated large memory block with offset allocator
 class DRAMTier : public TierBackend {
@@ -67,6 +74,10 @@ class DRAMTier : public TierBackend {
   std::vector<bool> ReadBatchIntoPtr(const std::vector<std::string>& keys,
                                      const std::vector<uintptr_t>& dst_ptrs,
                                      const std::vector<size_t>& sizes) override;
+  std::vector<bool> ReadBatchRangesIntoPtr(
+      const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dst_ptrs,
+      const std::vector<std::vector<size_t>>& sizes,
+      const std::vector<std::vector<size_t>>& src_offsets) override;
   // Multi-threaded batch write: serial slot allocation (mutates free_list_)
   // followed by parallel non-temporal CopyBlock of each payload into its slot.
   // Mirrors ReadBatchIntoPtr to break the single-core memcpy ceiling on the
@@ -75,6 +86,11 @@ class DRAMTier : public TierBackend {
   std::vector<bool> BatchWrite(const std::vector<std::string>& keys,
                                const std::vector<const void*>& data_ptrs,
                                const std::vector<size_t>& sizes) override;
+  std::vector<bool> BatchWriteRanges(const std::vector<std::string>& keys,
+                                     const std::vector<size_t>& object_sizes,
+                                     const std::vector<std::vector<const void*>>& src_ptrs,
+                                     const std::vector<std::vector<size_t>>& sizes,
+                                     const std::vector<std::vector<size_t>>& dst_offsets) override;
   bool Exists(const std::string& key) const override;
   bool Evict(const std::string& key) override;
   std::pair<size_t, size_t> Capacity() const override;
@@ -108,6 +124,10 @@ class DRAMTier : public TierBackend {
   std::string shm_name_;
   HostBufferHandle host_buf_handle_;  // owned handle for non-shm path
 
+  // Makes the region above addressable from GPU kernels. Destroyed first so it
+  // unregisters while the mapping is still alive.
+  std::unique_ptr<HostTierRegistration> host_registration_;
+
   // Simple offset allocator: key -> (offset, size)
   struct SlotInfo {
     size_t offset;
@@ -126,7 +146,8 @@ class DRAMTier : public TierBackend {
   };
   std::list<FreeBlock> free_list_;
 
-  mutable std::mutex mu_;
+  mutable std::shared_mutex mu_;  // slots_, free_list_, used_
+  mutable std::mutex lru_mu_;     // lru_list_, lru_map_
 
   // Threads used by ReadBatchIntoPtr for parallel CopyBlock. Default 8, override
   // via env UMBP_DRAM_READ_THREADS, capped to hardware concurrency. >1 breaks
@@ -140,8 +161,8 @@ class DRAMTier : public TierBackend {
 
   size_t Allocate(size_t size);                 // Allocate from free_list_
   void Deallocate(size_t offset, size_t size);  // Return to free_list_
-  void EvictLRU();                              // Evict least recently used
-  void TouchLRU(const std::string& key);        // Update LRU position
+  void EvictLRU();                              // mu_ held; locks lru_mu_
+  void TouchLRU(const std::string& key);        // Caller holds lru_mu_
 };
 
 }  // namespace mori::umbp

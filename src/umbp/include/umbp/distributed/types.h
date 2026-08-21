@@ -39,6 +39,20 @@ enum class TierType : int {
   SSD = 3,
 };
 
+// Upper bound on live storage backends per peer.
+//
+// Lives here, not on BackendRegistry, because both layers that key on a
+// backend id need it and neither may depend on the other: medium_backend.h
+// already includes transfer_engine.h, so the transfer layer cannot include the
+// backend layer back.  types.h is the shared vocabulary both sides already use.
+//
+// A backend id is the other half of a buffer address (see BufferMemoryDescBytes)
+// and the registry hands them out densely from 0, so this is also the width of
+// the reader's per-backend buffer shelves.  One per TierType is all the registry
+// can hold today; the slack is headroom for a registry that allows two backends
+// on one tier.
+inline constexpr uint32_t kMaxBackendsPerPeer = 8;
+
 struct TierCapacity {
   uint64_t total_bytes = 0;
   uint64_t available_bytes = 0;
@@ -146,14 +160,20 @@ struct PageLocation {
   }
 };
 
-// One peer-side buffer's RDMA MemoryDesc bytes plus the buffer_index it
-// belongs to.  Returned by PeerDramAllocator and the peer service in
-// AllocateSlot / ResolveKey / GetPeerInfo responses so the Client can
-// hydrate its peer-side buffer_index -> MemoryDesc cache in a single
-// batch.
+// One peer-side buffer's RDMA MemoryDesc bytes plus the address it lives at.
+// Returned by the backends and the peer service in AllocateSlot / ResolveKey /
+// GetPeerInfo responses so the Client can hydrate its peer-side
+// (backend_id, buffer_index) -> MemoryDesc cache in a single batch.
+//
+// BACKENDS LEAVE backend_id AT 0 AND MUST NOT SET IT.  Every backend numbers
+// its buffers from 0 and knows nothing of its peers; the peer service stamps
+// the owning backend on the way out (see BufferMemoryDesc in umbp.proto for why
+// buffer_index alone is not an address).  Keeping the stamp at the wire
+// boundary is what lets a new backend be correct by construction.
 struct BufferMemoryDescBytes {
   uint32_t buffer_index = 0;
   std::vector<uint8_t> desc_bytes;
+  uint32_t backend_id = 0;
 };
 
 // One mutation in a peer's owned-key set, shipped via Heartbeat.  Mirrors

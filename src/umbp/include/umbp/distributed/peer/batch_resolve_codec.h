@@ -43,6 +43,10 @@ struct ResolvedKeyEntry {
   TierType tier = TierType::UNKNOWN;
   uint64_t size = 0;
   std::vector<PageLocation> pages;
+  // Which backend `pages` index into.  A batch may span media, so this is per
+  // key; `pages` carries backend-local buffer indices and is meaningless
+  // without it.
+  uint32_t backend_id = 0;
 };
 
 // One key decoded out of the SoA response (page_size and descs are batch-level
@@ -52,6 +56,7 @@ struct DecodedResolveKey {
   TierType tier = TierType::UNKNOWN;
   uint64_t size = 0;
   std::vector<PageLocation> pages;
+  uint32_t backend_id = 0;
 };
 
 // Whole-batch decode result.
@@ -102,6 +107,7 @@ inline void EncodeBatchResolveResponse(const std::vector<ResolvedKeyEntry>& keys
   for (const auto& d : descs) {
     auto* desc = resp->add_descs();
     desc->set_buffer_index(d.buffer_index);
+    desc->set_backend_id(d.backend_id);
     desc->set_desc(std::string(d.desc_bytes.begin(), d.desc_bytes.end()));
   }
 
@@ -111,6 +117,7 @@ inline void EncodeBatchResolveResponse(const std::vector<ResolvedKeyEntry>& keys
   resp->mutable_tier()->Reserve(static_cast<int>(keys.size()));
   resp->mutable_size()->Reserve(static_cast<int>(keys.size()));
   resp->mutable_page_count()->Reserve(static_cast<int>(keys.size()));
+  resp->mutable_backend_id()->Reserve(static_cast<int>(keys.size()));
   resp->mutable_buffer_index()->Reserve(static_cast<int>(total_pages));
   resp->mutable_page_index()->Reserve(static_cast<int>(total_pages));
 
@@ -118,6 +125,7 @@ inline void EncodeBatchResolveResponse(const std::vector<ResolvedKeyEntry>& keys
     resp->add_found(k.found);
     resp->add_tier(BatchResolveTierToProto(k.tier));
     resp->add_size(k.size);
+    resp->add_backend_id(k.backend_id);
     resp->add_page_count(static_cast<uint32_t>(k.pages.size()));
     for (const auto& p : k.pages) {
       resp->add_buffer_index(p.buffer_index);
@@ -146,6 +154,7 @@ inline DecodedBatchResolve DecodeBatchResolveResponse(
   for (const auto& d : resp.descs()) {
     BufferMemoryDescBytes b;
     b.buffer_index = d.buffer_index();
+    b.backend_id = d.backend_id();
     b.desc_bytes.assign(d.desc().begin(), d.desc().end());
     out.descs.push_back(std::move(b));
   }
@@ -155,7 +164,7 @@ inline DecodedBatchResolve DecodeBatchResolveResponse(
   // hold at least the summed page_count.  Anything else is a malformed peer
   // response; refuse to decode it.
   if (resp.tier_size() != n || resp.size_size() != n || resp.page_count_size() != n ||
-      resp.buffer_index_size() != resp.page_index_size()) {
+      resp.backend_id_size() != n || resp.buffer_index_size() != resp.page_index_size()) {
     return out;
   }
 
@@ -172,6 +181,7 @@ inline DecodedBatchResolve DecodeBatchResolveResponse(
     k.found = resp.found(i);
     k.tier = BatchResolveTierFromProto(resp.tier(i));
     k.size = resp.size(i);
+    k.backend_id = resp.backend_id(i);
     const uint32_t pc = resp.page_count(i);
     k.pages.reserve(pc);
     for (uint32_t p = 0; p < pc; ++p) {

@@ -66,6 +66,20 @@ class SSDTier : public TierBackend {
   std::vector<bool> BatchReadIntoPtr(const std::vector<std::string>& keys,
                                      const std::vector<uintptr_t>& dst_ptrs,
                                      const std::vector<size_t>& sizes) override;
+  // Scattered sub-object reads: each key supplies several disjoint
+  // object-relative ranges, each with its own destination buffer.  The v3
+  // layout makes this cheap -- a value is one contiguous, alignment-anchored
+  // extent, so a range is just `value_offset + object_offset` handed to pread.
+  //
+  // CHECKSUMS ARE NOT VERIFIED HERE, whatever ssd.verify_crc says.  A record's
+  // CRC covers the whole value, so a partial read has nothing to check itself
+  // against; the alternative (per-block checksums) is a record-format change.
+  // Whole-object reads keep verifying, so this narrows the guarantee only for
+  // callers that opted into ranged I/O.
+  std::vector<bool> ReadBatchRangesIntoPtr(
+      const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dst_ptrs,
+      const std::vector<std::vector<size_t>>& sizes,
+      const std::vector<std::vector<size_t>>& src_offsets) override;
   bool Exists(const std::string& key) const override;
   bool Evict(const std::string& key) override;
   std::pair<size_t, size_t> Capacity() const override;
@@ -76,28 +90,53 @@ class SSDTier : public TierBackend {
   std::vector<std::string> GetLRUCandidates(size_t max_candidates) const override;
   const IoStatus& LastIoStatus() const { return last_io_status_; }
   std::optional<std::string> GetLocationId(const std::string& key) const override;
+  // Enables O_DIRECT for segments opened from here on.  Takes effect for
+  // segments opened after the call; existing fds keep their current mode, so
+  // the intended use is at construction (ssd.direct_io) rather than mid-run.
+  void SetColdRead(bool enable) override;
+
+  // True when segment I/O is actually bypassing the page cache.  False if
+  // direct I/O was never requested, or was requested and the probe failed.
+  bool direct_io_active() const { return direct_io_; }
 
  private:
   bool IsReadOnlyShared() const { return access_mode_ == SSDAccessMode::ReadOnlyShared; }
   bool ShouldSyncOnWrite() const {
     return ssd_config_.durability.mode == UMBPDurabilityMode::Strict;
   }
+  int SegmentOpenFlags() const;
+  // Empirical check that this directory's filesystem supports O_DIRECT at
+  // kRecordAlign: opens a probe file, writes and reads back one aligned block.
+  // Cheaper to trust than a reported capability, and it catches tmpfs/overlayfs
+  // (which reject the open) as well as devices needing coarser alignment.
+  bool ProbeDirectIo() const;
 
   bool EnsureActiveSegment(size_t need_bytes);
   bool RefreshFromDiskLocked(bool force_full_rescan);
+  // Startup repair: truncate each segment to the last record the scanner could
+  // parse.  Removes records from an older kRecordVersion and torn tails, both of
+  // which would otherwise make every subsequently appended record unreadable
+  // after a restart.  Owner-only; no-op for a fully-parsed segment.
+  void DropUnparsedTailsLocked();
   bool OpenOrCreateSegmentLocked(uint64_t segment_id);
 
   bool RefreshFollowerLocked() const;
   segment::Meta* GetSegmentLocked(uint64_t segment_id);
   const segment::Meta* GetSegmentLocked(uint64_t segment_id) const;
   bool ReadRecordLocked(const std::string& key, void* dst, size_t size, uint32_t expected_crc,
-                        uint64_t value_offset, int read_fd) const;
+                        uint64_t value_offset, int read_fd, bool crc_valid) const;
   void RememberStatus(IoStatus status) const;
+  // Issue one value read, transparently bouncing through an aligned buffer when
+  // direct I/O is on and `dst`/`size` do not meet the alignment rules.
+  IoStatus ReadValueInto(int fd, void* dst, size_t size, uint64_t value_offset) const;
+  bool ShouldVerifyCrc(bool crc_valid) const { return ssd_config_.verify_crc && crc_valid; }
+  int TierThreads() const;
 
   std::string dir_;
   size_t capacity_;
   UMBPSsdConfig ssd_config_;
   SSDAccessMode access_mode_;
+  bool direct_io_ = false;
 
   mutable std::mutex mu_;
   mutable std::mutex io_mu_;

@@ -23,6 +23,7 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdlib>
@@ -35,8 +36,6 @@
 #include "umbp/common/env_time.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/master/rpc_latency_timer.h"
-#include "umbp/distributed/peer/peer_dram_allocator.h"
-#include "umbp/distributed/peer/peer_ssd_manager.h"
 
 namespace mori::umbp {
 
@@ -51,6 +50,36 @@ int RpcShutdownTimeoutMs() {
                                           std::chrono::milliseconds(3000), /*min_allowed=*/1)
                            .count());
   return v;
+}
+
+int HeartbeatRpcTimeoutMs() {
+  static const int timeout = [] {
+    const char* raw = std::getenv("UMBP_HEARTBEAT_RPC_TIMEOUT_MS");
+    if (!raw || raw[0] == '\0') return 3000;
+    const int parsed = std::atoi(raw);
+    return parsed > 0 ? parsed : 3000;
+  }();
+  return timeout;
+}
+
+size_t HeartbeatEventsPerBundle() {
+  static const size_t value = [] {
+    const char* raw = std::getenv("UMBP_HEARTBEAT_EVENTS_PER_BUNDLE");
+    if (!raw || raw[0] == '\0') return size_t{1024};
+    const unsigned long long parsed = std::strtoull(raw, nullptr, 10);
+    return parsed > 0 ? static_cast<size_t>(parsed) : size_t{1024};
+  }();
+  return value;
+}
+
+size_t HeartbeatMaxBundlesPerRpc() {
+  static const size_t value = [] {
+    const char* raw = std::getenv("UMBP_HEARTBEAT_MAX_BUNDLES_PER_RPC");
+    if (!raw || raw[0] == '\0') return size_t{16};
+    const unsigned long long parsed = std::strtoull(raw, nullptr, 10);
+    return parsed > 0 ? static_cast<size_t>(parsed) : size_t{16};
+  }();
+  return value;
 }
 
 uint64_t MetricsReportIntervalMs() {
@@ -399,22 +428,25 @@ size_t AutoFlushEventThreshold() {
 }
 }  // namespace
 
-void MasterClient::SetPeerDramAllocator(PeerDramAllocator* dram_alloc) {
-  peer_alloc_ = dram_alloc;
-  AddOwnedLocationSource(dram_alloc);
-  if (dram_alloc != nullptr) {
-    dram_alloc->SetAutoFlushHook(AutoFlushEventThreshold(), [this] { FlushHeartbeat(); });
+void MasterClient::SetBackendRegistry(BackendRegistry* registry) {
+  registry_ = registry;
+  // Every medium's outbox feeds the same single-bundle heartbeat, so each one
+  // gets the same auto-flush hook — a backend added to the registry starts
+  // flushing without any change here.
+  const size_t threshold = AutoFlushEventThreshold();
+  for (auto* backend : Backends()) {
+    backend->SetAutoFlushHook(threshold, [this] { FlushHeartbeat(); });
   }
 }
 
-void MasterClient::SetPeerSsdManager(PeerSsdManager* ssd_manager) {
-  ssd_manager_ = ssd_manager;
-  AddOwnedLocationSource(ssd_manager);
+std::vector<MediumBackend*> MasterClient::Backends() const {
+  return registry_ == nullptr ? std::vector<MediumBackend*>{} : registry_->All();
 }
 
-void MasterClient::AddOwnedLocationSource(OwnedLocationSource* source) {
-  if (source == nullptr) return;
-  owned_sources_.push_back(source);
+std::map<TierType, uint64_t> MasterClient::OwnedKeyCountsByTier() const {
+  std::map<TierType, uint64_t> counts;
+  for (auto* backend : Backends()) counts[backend->Tier()] += backend->OwnedKeyCount();
+  return counts;
 }
 
 bool MasterClient::ClearFullSync() {
@@ -422,8 +454,7 @@ bool MasterClient::ClearFullSync() {
   if (!registered_) return false;
 
   auto caps = SnapshotAndCacheTierCapacities();
-  std::map<TierType, uint64_t> kv_counts;
-  if (peer_alloc_ != nullptr) kv_counts = peer_alloc_->OwnedKeyCountByTier();
+  auto kv_counts = OwnedKeyCountsByTier();
 
   ::umbp::HeartbeatRequest req;
   req.set_node_id(config_.node_id);
@@ -449,9 +480,11 @@ bool MasterClient::ClearFullSync() {
     return false;
   }
 
-  if (peer_alloc_ != nullptr) {
-    peer_alloc_->ClearFullSyncAcked();
-    MORI_UMBP_INFO("[Client] Clear full-sync acked by master; allocator writes re-enabled");
+  auto backends = Backends();
+  for (auto* backend : backends) backend->ClearFullSyncAcked();
+  if (!backends.empty()) {
+    MORI_UMBP_INFO("[Client] Clear full-sync acked by master; writes re-enabled on {} backend(s)",
+                   backends.size());
   }
   return true;
 }
@@ -509,17 +542,9 @@ void MasterClient::HeartbeatLoop() {
 std::map<TierType, TierCapacity> MasterClient::SnapshotAndCacheTierCapacities() {
   std::map<TierType, TierCapacity> caps;
   bool have_live = false;
-  if (peer_alloc_ != nullptr) {
-    caps = peer_alloc_->TierCapacitiesSnapshot();  // DRAM/HBM, bitmap-derived
+  for (auto* backend : Backends()) {
+    caps[backend->Tier()] = backend->Capacity();  // bitmap-derived, per medium
     have_live = true;
-  }
-  if (ssd_manager_ != nullptr) {
-    auto [used, total] = ssd_manager_->Capacity();
-    if (total > 0) {
-      const uint64_t avail = used < total ? total - used : 0;
-      caps[TierType::SSD] = TierCapacity{total, avail};
-      have_live = true;
-    }
   }
   std::lock_guard lock(caps_mutex_);
   if (!have_live) return current_capacities_;
@@ -536,8 +561,7 @@ bool MasterClient::SendHeartbeatOnce() {
   if (!registered_) return false;
 
   auto caps = SnapshotAndCacheTierCapacities();
-  std::map<TierType, uint64_t> kv_counts;
-  if (peer_alloc_ != nullptr) kv_counts = peer_alloc_->OwnedKeyCountByTier();
+  auto kv_counts = OwnedKeyCountsByTier();
 
   bool do_full_sync;
   {
@@ -568,7 +592,7 @@ bool MasterClient::SendFullSyncHeartbeatLocked(const std::map<TierType, TierCapa
     snapshot.seq = next_bundle_seq_ - 1;
     req.set_delta_seq_baseline(snapshot.seq);
   }
-  snapshot.events = SnapshotAllSourcesForFullSync(owned_sources_);
+  snapshot.events = SnapshotAllBackendsForFullSync(Backends());
   FillBundle(req.add_bundles(), snapshot);
 
   ::umbp::HeartbeatResponse resp;
@@ -585,10 +609,19 @@ bool MasterClient::SendDeltaHeartbeatLocked(const std::map<TierType, TierCapacit
   // Drain every owned-location source (DRAM allocator + SSD manager) and
   // concat into ONE bundle under ONE monotonic seq — never one seq per source,
   // which would break ack / seq-gap full-sync recovery.
-  auto new_events = DrainAllSources(owned_sources_);
+  auto new_events = DrainAllBackends(Backends());
   if (!new_events.empty()) {
     std::lock_guard state_lock(hb_state_mutex_);
-    outbox_.push_back(EventBundle{next_bundle_seq_++, std::move(new_events)});
+    const size_t per_bundle = HeartbeatEventsPerBundle();
+    for (size_t begin = 0; begin < new_events.size(); begin += per_bundle) {
+      const size_t end = std::min(new_events.size(), begin + per_bundle);
+      EventBundle bundle;
+      bundle.seq = next_bundle_seq_++;
+      bundle.events.reserve(end - begin);
+      std::move(new_events.begin() + begin, new_events.begin() + end,
+                std::back_inserter(bundle.events));
+      outbox_.push_back(std::move(bundle));
+    }
   }
 
   ::umbp::HeartbeatRequest req;
@@ -598,8 +631,12 @@ bool MasterClient::SendDeltaHeartbeatLocked(const std::map<TierType, TierCapacit
   FillTierKvCounts(req.mutable_tier_kv_counts(), kv_counts);
   {
     std::lock_guard state_lock(hb_state_mutex_);
+    size_t added = 0;
     for (const auto& bundle : outbox_) {
-      if (bundle.seq > hb_last_acked_seq_) FillBundle(req.add_bundles(), bundle);
+      if (bundle.seq <= hb_last_acked_seq_) continue;
+      if (added >= HeartbeatMaxBundlesPerRpc()) break;
+      FillBundle(req.add_bundles(), bundle);
+      ++added;
     }
   }
 
@@ -654,7 +691,7 @@ grpc::Status MasterClient::SendHeartbeatRpcLocked(::umbp::HeartbeatRequest& req,
                                                   ::umbp::HeartbeatResponse* resp) {
   grpc::ClientContext ctx;
   ctx.set_deadline(std::chrono::system_clock::now() +
-                   std::chrono::milliseconds(RpcShutdownTimeoutMs()));
+                   std::chrono::milliseconds(HeartbeatRpcTimeoutMs()));
   grpc::Status status;
   {
     ScopedRpcTimer _rpc_timer(this, "Heartbeat");
@@ -662,10 +699,23 @@ grpc::Status MasterClient::SendHeartbeatRpcLocked(::umbp::HeartbeatRequest& req,
     _rpc_timer.SetStatus(status);
   }
   if (!status.ok()) return status;
-  std::lock_guard state_lock(hb_state_mutex_);
-  hb_last_acked_seq_ = resp->acked_seq();
-  while (!outbox_.empty() && outbox_.front().seq <= hb_last_acked_seq_) {
-    outbox_.pop_front();
+  bool more_pending = false;
+  bool made_progress = false;
+  {
+    std::lock_guard state_lock(hb_state_mutex_);
+    const uint64_t previous_ack = hb_last_acked_seq_;
+    hb_last_acked_seq_ = std::max(hb_last_acked_seq_, resp->acked_seq());
+    made_progress = hb_last_acked_seq_ > previous_ack;
+    while (!outbox_.empty() && outbox_.front().seq <= hb_last_acked_seq_) {
+      outbox_.pop_front();
+    }
+    more_pending = !outbox_.empty();
+  }
+  // Drain a bounded backlog immediately in consecutive RPCs instead of paying
+  // one heartbeat interval per chunk. Each RPC remains independently bounded.
+  if (more_pending && made_progress && heartbeat_running_) {
+    flush_requested_ = true;
+    hb_cv_.notify_one();
   }
   return status;
 }
@@ -821,8 +871,8 @@ void MasterClient::MetricsLoop() {
   // Final flush: ship the last sub-interval of provider deltas before the
   // thread exits.  PoolClient::Shutdown calls StopMetricsReporting() BEFORE
   // UnregisterSelf, so the master is still reachable here; without this final
-  // flush the last (<metrics_interval_ms_) of SSD counter deltas would be
-  // dropped at shutdown.
+  // flush the last (<metrics_interval_ms_) of every component's counter deltas
+  // would be dropped at shutdown.
   FlushMetricsOnce();
 }
 

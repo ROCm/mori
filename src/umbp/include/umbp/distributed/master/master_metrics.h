@@ -166,6 +166,11 @@
 #define MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP \
   "Total bytes delivered to this client (inbound reads) split by local/remote traffic"
 
+#define MORI_UMBP_METRIC_RANGED_REMOTE_INSTALL_FAILURES_TOTAL \
+  "mori_umbp_ranged_remote_install_failures_total"
+#define MORI_UMBP_METRIC_RANGED_REMOTE_INSTALL_FAILURES_TOTAL_HELP \
+  "Remote ranged objects that could not be synchronously installed in the local medium"
+
 // --- Heartbeat / event-shipping counters (master-as-advisor) ----------------
 
 #define MORI_UMBP_METRIC_HEARTBEAT_EVENTS_APPLIED_TOTAL "mori_umbp_heartbeat_events_applied_total"
@@ -188,6 +193,27 @@
   "BatchGet e2e call bandwidth in GiB/s (successful bytes only, split by client and local/remote " \
   "traffic)"
 
+// Ranged siblings.  Kept as their own series rather than folded into the two
+// above: a ranged call moves a SUBSET of each object, so mixing them would make
+// the whole-object families' bytes-per-call meaningless.  Bytes counted are the
+// range bytes actually delivered to (or committed from) the caller's buffers,
+// which is what the caller sees and what the sglang tree connector reports on
+// its side -- note that a REMOTE ranged get still moves the whole object over
+// the wire into the scratch arena, so its wire traffic exceeds what this
+// histogram credits (mori_umbp_client_*bound_get_bytes_total covers that).
+
+#define MORI_UMBP_METRIC_CLIENT_BATCH_PUT_RANGES_BANDWIDTH \
+  "mori_umbp_client_batch_put_ranges_bandwidth_gibps"
+#define MORI_UMBP_METRIC_CLIENT_BATCH_PUT_RANGES_BANDWIDTH_HELP                                  \
+  "BatchPutRanges e2e call bandwidth in GiB/s (committed range bytes only, split by client and " \
+  "local/remote traffic)"
+
+#define MORI_UMBP_METRIC_CLIENT_BATCH_GET_RANGES_BANDWIDTH \
+  "mori_umbp_client_batch_get_ranges_bandwidth_gibps"
+#define MORI_UMBP_METRIC_CLIENT_BATCH_GET_RANGES_BANDWIDTH_HELP                                  \
+  "BatchGetRanges e2e call bandwidth in GiB/s (delivered range bytes only, split by client and " \
+  "local/remote traffic)"
+
 // --- MasterClient -> MasterServer RPC latency (client-perceived) -----------
 // Histogram of round-trip latency for every RPC method on the
 // MasterClient channel, reported by clients via ReportMetrics.  Labels
@@ -208,99 +234,14 @@
   "Number of histogram observations dropped client-side because the pending buffer hit its cap " \
   "(see kMasterClientMaxPendingHistograms in master_client.h)"
 
-// --- SSD tier: copy / read / eviction / staging (peer-reported) ------------
-// All shipped via ReportMetrics from the owner peer (node=<node_id>).  Labels
-// are low-cardinality fixed enums only — status / reason — never key / path /
-// error string / lease id.  Counters are accumulated peer-side as cheap relaxed
-// atomics at the event point and converted to ReportMetrics deltas once per
-// metrics flush tick (no per-key AddCounter on the commit / read hot paths).
-// SSD capacity is NOT re-exported here: it rides heartbeat tier_capacities as
-// mori_umbp_client_capacity_{used,total}_bytes{tier="SSD"} (master emits the
-// tier label upper-cased, e.g. tier="SSD" — match that casing in queries).
-
-// copy-on-commit pipeline (ssd_copy_pipeline.cpp)
-#define MORI_UMBP_METRIC_SSD_COPY_ENQUEUED_TOTAL "mori_umbp_ssd_copy_enqueued_total"
-#define MORI_UMBP_METRIC_SSD_COPY_ENQUEUED_TOTAL_HELP \
-  "SSD copy-on-commit tasks accepted into the async copy queue"
-
-#define MORI_UMBP_METRIC_SSD_COPY_SUCCEEDED_TOTAL "mori_umbp_ssd_copy_succeeded_total"
-#define MORI_UMBP_METRIC_SSD_COPY_SUCCEEDED_TOTAL_HELP                                           \
-  "SSD copy-on-commit tasks that completed successfully: either the bytes were written to the "  \
-  "backend (emits ADD SSD) OR the content-addressed key was already resident (dedup fast path, " \
-  "no write, no event).  Not a count of physical writes — see "                                  \
-  "mori_umbp_ssd_copy_bytes_total for physical SSD write bytes."
-
-#define MORI_UMBP_METRIC_SSD_COPY_FAILED_TOTAL "mori_umbp_ssd_copy_failed_total"
-#define MORI_UMBP_METRIC_SSD_COPY_FAILED_TOTAL_HELP \
-  "SSD copy-on-commit tasks whose backend Write failed (no SSD copy, no event)"
-
-// label: reason=queue_full|stopped
-#define MORI_UMBP_METRIC_SSD_COPY_DROPPED_TOTAL "mori_umbp_ssd_copy_dropped_total"
-#define MORI_UMBP_METRIC_SSD_COPY_DROPPED_TOTAL_HELP                             \
-  "SSD copy tasks dropped at enqueue (reason=queue_full when the bounded queue " \
-  "was full, reason=stopped when the pipeline was stopped/quiescing)"
-
-// label: status=ok|not_found|no_slot|size_too_large|error
-#define MORI_UMBP_METRIC_SSD_READ_TOTAL "mori_umbp_ssd_read_total"
-#define MORI_UMBP_METRIC_SSD_READ_TOTAL_HELP                                    \
-  "SSD reads served by this peer's SSD tier, by outcome (covers local owner "   \
-  "reads and remote PrepareSsdRead).  not_found = stale-route miss; no_slot = " \
-  "staging slots exhausted (transient, not a miss)"
-
-// SSD IO byte counters.  Bandwidth is derived in Grafana/Prometheus via
-// rate(<counter>[<window>]) (bytes/s) — same convention as the client
-// inbound/outbound byte counters.  copy_bytes = bytes landed on SSD by a
-// successful copy-on-commit Write; read_bytes = bytes served by a successful
-// SSD read (local owner read or remote PrepareSsdRead).
-#define MORI_UMBP_METRIC_SSD_COPY_BYTES_TOTAL "mori_umbp_ssd_copy_bytes_total"
-#define MORI_UMBP_METRIC_SSD_COPY_BYTES_TOTAL_HELP                                 \
-  "Bytes written to the SSD tier by successful copy-on-commit.  rate() = offered " \
-  "SSD write throughput (bytes / wall-clock; a load signal, not device per-IO "    \
-  "bandwidth — it averages in idle gaps)"
-
-#define MORI_UMBP_METRIC_SSD_READ_BYTES_TOTAL "mori_umbp_ssd_read_bytes_total"
-#define MORI_UMBP_METRIC_SSD_READ_BYTES_TOTAL_HELP                                \
-  "Bytes read from the SSD tier by successful reads.  rate() = offered SSD read " \
-  "throughput (bytes / wall-clock; a load signal, not device per-IO bandwidth)"
-
-// eviction (peer_ssd_manager.cpp, local watermark + LRU)
-#define MORI_UMBP_METRIC_SSD_EVICTION_ROUNDS_TOTAL "mori_umbp_ssd_eviction_rounds_total"
-#define MORI_UMBP_METRIC_SSD_EVICTION_ROUNDS_TOTAL_HELP \
-  "Local SSD eviction rounds that actually ran (used above high watermark)"
-
-#define MORI_UMBP_METRIC_SSD_EVICTION_VICTIMS_TOTAL "mori_umbp_ssd_eviction_victims_total"
-#define MORI_UMBP_METRIC_SSD_EVICTION_VICTIMS_TOTAL_HELP \
-  "SSD keys evicted locally (REMOVE SSD emitted)"
-
-#define MORI_UMBP_METRIC_SSD_EVICTION_BYTES_FREED_TOTAL "mori_umbp_ssd_eviction_bytes_freed_total"
-#define MORI_UMBP_METRIC_SSD_EVICTION_BYTES_FREED_TOTAL_HELP "Bytes freed by local SSD eviction"
-
-#define MORI_UMBP_METRIC_SSD_EVICTION_BACKEND_FAILED_TOTAL \
-  "mori_umbp_ssd_eviction_backend_failed_total"
-#define MORI_UMBP_METRIC_SSD_EVICTION_BACKEND_FAILED_TOTAL_HELP \
-  "Local SSD evictions where the backend Evict failed (key kept for retry)"
-
-// staging (peer_service.cpp SSD read slots)
-#define MORI_UMBP_METRIC_SSD_STAGING_SLOTS_IN_USE "mori_umbp_ssd_staging_slots_in_use"
-#define MORI_UMBP_METRIC_SSD_STAGING_SLOTS_IN_USE_HELP \
-  "SSD read staging slots currently in use (Preparing or Leased), sampled once per flush"
-
-#define MORI_UMBP_METRIC_SSD_STAGING_EXPIRED_RECLAIMS_TOTAL \
-  "mori_umbp_ssd_staging_expired_reclaims_total"
-#define MORI_UMBP_METRIC_SSD_STAGING_EXPIRED_RECLAIMS_TOTAL_HELP \
-  "SSD read staging slots reclaimed after lease TTL expiry"
-
-#define MORI_UMBP_METRIC_SSD_STAGING_SLOT_FULL_REJECTS_TOTAL \
-  "mori_umbp_ssd_staging_slot_full_rejects_total"
-#define MORI_UMBP_METRIC_SSD_STAGING_SLOT_FULL_REJECTS_TOTAL_HELP \
-  "PrepareSsdRead calls rejected with NO_SLOT because all staging slots were busy"
-
-// Optional reader-side diagnostic: per-batch count of remote SSD reads that
-// stayed transient-not-served (NO_SLOT / reader-local lease expiry) after the
-// configured attempts.  Reported by the reader node; no reason label (kept
-// cheap — one AddCounter per batch).  lease expiry is reader-local and never
-// visible in the peer-side ssd_read_total, so this is its only observability.
-#define MORI_UMBP_METRIC_SSD_READ_CLIENT_TRANSIENT_TOTAL "mori_umbp_ssd_read_client_transient_total"
-#define MORI_UMBP_METRIC_SSD_READ_CLIENT_TRANSIENT_TOTAL_HELP                   \
-  "Remote SSD reads reported not-served this round due to transient NO_SLOT / " \
-  "reader-local lease expiry (not a definitive miss)"
+// --- Storage-backend and transfer-layer metrics -----------------------------
+//
+// NOT here.  Everything a medium or a transport reports now lives in
+// umbp/distributed/metrics/component_metrics.h under names that carry the
+// medium in a LABEL rather than in the identifier, because the previous
+// arrangement — mori_umbp_ssd_* beside an implicit DRAM set — is what forced a
+// separate dashboard per medium and left an SSD panel wired to counters that
+// no longer had a publisher after the backend-agnostic refactor.
+//
+// This header keeps what the MASTER itself measures.  A peer-side component's
+// metrics arrive through ReportMetrics and are named by the component.

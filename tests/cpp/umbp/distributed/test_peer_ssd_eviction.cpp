@@ -38,7 +38,7 @@
 #include <utility>
 #include <vector>
 
-#include "umbp/distributed/peer/peer_ssd_manager.h"
+#include "umbp/distributed/peer/ssd/peer_ssd_manager.h"
 #include "umbp/local/tiers/tier_backend.h"
 
 namespace mori::umbp {

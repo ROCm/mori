@@ -41,6 +41,23 @@ class RouteGetStrategy;
 class RoutePutStrategy;
 class MasterEvictStrategy;
 
+// The user-facing medium selector, lowered to the tier id the routing plane
+// and the wire already speak.  Two enums rather than one because the
+// dependency is one-directional (distributed/config.h -> common/config.h) and
+// UMBPMedium must be nameable by callers that never include the distributed
+// headers.
+inline TierType ToTierType(UMBPMedium medium) {
+  switch (medium) {
+    case UMBPMedium::HBM:
+      return TierType::HBM;
+    case UMBPMedium::SSD:
+      return TierType::SSD;
+    case UMBPMedium::DRAM:
+      break;
+  }
+  return TierType::DRAM;
+}
+
 struct ClientRegistryConfig {
   std::chrono::seconds heartbeat_ttl{10};
   std::chrono::seconds reaper_interval{5};
@@ -131,9 +148,34 @@ struct MasterServerConfig {
   MasterServerConfig& operator=(MasterServerConfig&&) noexcept;
 };
 
-struct ExportableDram {
-  void* buffer = nullptr;
-  size_t size = 0;
+// Ownership config for this node's DRAM/HBM backend pool(s) — sizes only.
+// PageBackend::Init(TransferEngine*) self-allocates one HostMemAllocator
+// buffer per entry in `buffer_sizes` and registers it with the transfer
+// engine; PoolClientConfig never sees a buffer pointer (backend-agnostic
+// refactor Phase 2b — see design-backend-agnostic-refactor.md §1 item 4).
+// `buffer_sizes` usually holds exactly one entry (one pool); more than one
+// exercises PageBitmapAllocator's cross-buffer scatter/gather strategy.
+struct DramOwnershipConfig {
+  std::vector<uint64_t> buffer_sizes;
+  bool use_hugepages = false;
+  uint64_t hugepage_size = 2ULL * 1024 * 1024;
+  int numa_node = -1;
+  bool prefault = true;
+};
+
+// HBM-tier ownership knobs.  Deliberately NOT a superset of the DRAM ones:
+// hipMalloc has no hugepage, NUMA or prefault dimension, and the device ordinal
+// it does have is meaningless for host memory.  That asymmetry is the reason
+// each medium brings its own PageMemorySource rather than sharing one options
+// struct with per-medium fields nobody else reads.
+//
+// No `enabled` flag: PoolClientConfig::medium selects the one live medium, and
+// these knobs are read only when it names HBM.
+struct HbmOwnershipConfig {
+  // GPU ordinal the pool is allocated on.  Fixed at Init, not inherited from
+  // whichever thread allocates first (see HbmPageMemorySource).
+  int device = 0;
+  std::vector<uint64_t> buffer_sizes;
 };
 
 // SSD-tier construction parameters lowered from the user-facing UMBPConfig.
@@ -142,6 +184,10 @@ struct ExportableDram {
 // peer only needs that subset — not the whole global config.  ssd_backend
 // (posix / spdk / spdk_proxy) lives inside UMBPSsdConfig, so PeerSsdManager
 // picks the backend from cfg.ssd directly.
+//
+// `enabled` stays because PeerSsdManager's own contract is written against it
+// (it refuses to open a tier that is off); PoolClient sets it from
+// PoolClientConfig::medium rather than from user config.
 struct PeerSsdConfig {
   bool enabled = false;
   UMBPSsdConfig ssd;
@@ -152,6 +198,21 @@ struct PoolClientConfig {
   UMBPIoEngineConfig io_engine;
 
   size_t staging_buffer_size = 64ULL * 1024 * 1024;
+
+  // Caller-owned, RDMA-registered host arenas for ranged I/O. DistributedClient
+  // owns the backing mappings and frees them only after PoolClient::Shutdown has
+  // deregistered the regions. Direct PoolClient tests may provide their own.
+  //
+  // Two separate arenas — one for remote ranged GET, one for remote ranged PUT
+  // — each under its own mutex in PoolClient, so a remote get and a remote put
+  // run concurrently instead of serializing on one lock (the load/offload
+  // overlap sglang's direct linker wants). Each must hold at least one whole
+  // object. Both zero keeps ranged remote I/O disabled with no host memory
+  // registered; SupportsRangedIO() requires both to be set.
+  void* ranged_get_scratch_buffer = nullptr;
+  size_t ranged_get_scratch_size = 0;
+  void* ranged_put_scratch_buffer = nullptr;
+  size_t ranged_put_scratch_size = 0;
 
   // SSD read-staging tuning (peer side).  More slots reduce NO_SLOT under large
   // concurrent prefetch batches, but shrink per-slot size (= staging_buffer_size
@@ -165,10 +226,24 @@ struct PoolClientConfig {
   // must be >= the largest single-key page KV (61-layer MLA page ~= 4.5 MB).
   size_t ssd_staging_buffer_size = 268435456;  // 256 MiB
 
-  std::vector<ExportableDram> dram_buffers;
-  PeerSsdConfig ssd;
+  // Back the SSD staging arena with hugetlbfs pages.  Every byte the SSD
+  // backend moves crosses that arena twice (device <-> arena, arena <-> wire),
+  // so its TLB behaviour sits on the critical path in a way an ordinary
+  // buffer's does not.  Falls back to 4 KiB pages when no hugetlb pages are
+  // free — a node must still come up.
+  bool ssd_staging_use_hugepages = false;
+  size_t ssd_staging_hugepage_size = 2ULL * 1024 * 1024;  // 2 MiB
 
-  std::map<TierType, TierCapacity> tier_capacities;
+  // The one medium this node registers a backend for (design note in
+  // common/config.h's UMBPMedium: UMBP routes across nodes, it does not tier
+  // within one, so a second local backend would mirror rather than demote).
+  // PoolClient::Init reads exactly one of the three ownership blocks below,
+  // chosen by this field; the other two are ignored, not validated.
+  TierType medium = TierType::DRAM;
+
+  DramOwnershipConfig dram;
+  HbmOwnershipConfig hbm;
+  PeerSsdConfig ssd;
 
   uint16_t peer_service_port = 0;
 
@@ -197,18 +272,25 @@ struct PoolClientConfig {
 // Kept as a free function (not a member of UMBPDistributedConfig) so that
 // common/config.h does not need to include distributed/config.h — the
 // dependency is one-directional: distributed/config.h -> common/config.h.
-// DRAM buffers and tier capacities are caller-supplied because they live in
-// DistributedClient (pool mmap'd memory), not in the user-facing config.
+// `dram` is caller-supplied (sizes only, no pointer — see DramOwnershipConfig)
+// because DistributedClient is the one place that knows the top-level
+// UMBPConfig::dram ownership knobs (hugepages/numa/prefault), which sit
+// beside — not inside — UMBPDistributedConfig.  PoolClient's DRAM PageBackend
+// self-allocates from this at Init(); tier capacities are no longer
+// caller-supplied at all — they are derived from BackendRegistry::Capacity()
+// after Init (backend-agnostic refactor Phase 2).
 inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
-                                           std::vector<ExportableDram> dram_buffers,
-                                           std::map<TierType, TierCapacity> tier_capacities,
-                                           PeerSsdConfig ssd = {}) {
+                                           DramOwnershipConfig dram, PeerSsdConfig ssd = {}) {
   PoolClientConfig pc;
   pc.master_config = dc.master_config;
   pc.io_engine = dc.io_engine;
   pc.staging_buffer_size = dc.staging_buffer_size;
+  // The ranged scratch buffers/sizes are set by DistributedClient after it
+  // allocates and registers the two arenas (see DistributedClient ctor).
   pc.ssd_staging_buffer_size = dc.ssd_staging_buffer_size;
   pc.ssd_staging_buffer_slots = dc.ssd_staging_buffer_slots;
+  pc.ssd_staging_use_hugepages = dc.ssd_staging_use_hugepages;
+  pc.ssd_staging_hugepage_size = dc.ssd_staging_hugepage_size;
   pc.peer_service_port = dc.peer_service_port;
   pc.cache_remote_fetches = dc.cache_remote_fetches;
   pc.cache_remote_admission = dc.cache_remote_admission;
@@ -217,9 +299,17 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   // proto -> ClientRegistry, where it is interpreted as "use the
   // registry-wide default_dram_page_size".
   pc.dram_page_size = dc.dram_page_size;
-  pc.dram_buffers = std::move(dram_buffers);
-  pc.tier_capacities = std::move(tier_capacities);
+  pc.dram = std::move(dram);
   pc.ssd = std::move(ssd);
+  // Unlike dram/ssd, UMBPHbmConfig carries no ownership knobs that live
+  // outside UMBPDistributedConfig (no hugepages/NUMA/prefault dimension for
+  // hipMalloc'd memory), so it can be lowered directly here instead of via a
+  // caller-supplied parameter.
+  pc.hbm.device = dc.hbm.device;
+  if (dc.hbm.capacity_bytes > 0) pc.hbm.buffer_sizes = {dc.hbm.capacity_bytes};
+  pc.medium = ToTierType(dc.medium);
+  // The medium is what opts the SSD tier in; PeerSsdManager keys off this.
+  pc.ssd.enabled = (pc.medium == TierType::SSD);
   return pc;
 }
 

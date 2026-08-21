@@ -25,12 +25,21 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
+#include <numeric>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/aligned_buffer.h"
+#include "umbp/common/device_copy.h"
+#include "umbp/common/parallel_for.h"
+#include "umbp/common/range_utils.h"
+#include "umbp/common/ssd_perf.h"
 #include "umbp/local/tiers/segment/segment_format.h"
 
 namespace fs = std::filesystem;
@@ -57,12 +66,123 @@ SSDTier::SSDTier(const std::string& dir, size_t capacity, const UMBPSsdConfig& s
         "SSDTier: io_uring backend requested but unavailable (kernel missing io_uring "
         "support or restricted by seccomp/capabilities); falling back to POSIX backend");
   }
-  writer_ = std::make_unique<segment::Writer>(*io_driver_);
+  writer_ = std::make_unique<segment::Writer>(*io_driver_, ssd_config_.verify_crc);
   fs::create_directories(dir_);
+
+  if (ssd_config_.direct_io) {
+    direct_io_ = ProbeDirectIo();
+    if (!direct_io_) {
+      MORI_UMBP_WARN(
+          "[SSDTier] {}: direct I/O requested but this filesystem rejects O_DIRECT at {}B "
+          "alignment (tmpfs/overlayfs cannot do it); falling back to buffered I/O. Reads will "
+          "be served from the page cache, so reported tier bandwidth will NOT be the device's",
+          dir_, segment::kRecordAlign);
+    }
+  }
+  MORI_UMBP_INFO("[SSDTier] {}: direct_io={} verify_crc={} tier_io_threads={} io_backend={}", dir_,
+                 direct_io_, ssd_config_.verify_crc, TierThreads(),
+                 ssd_config_.io.backend == UMBPIoBackend::IoUring ? "io_uring" : "posix");
+  if (direct_io_ && ssd_config_.io.backend != UMBPIoBackend::IoUring) {
+    MORI_UMBP_WARN(
+        "[SSDTier] {}: direct I/O on the POSIX backend issues one blocking pread per key "
+        "(queue depth 1). Every read is now a synchronous device round trip, which will look "
+        "far slower than it needs to — prefer ssd.io.backend=io_uring for direct I/O",
+        dir_);
+  }
+
   std::lock_guard<std::mutex> lock(mu_);
   RefreshFromDiskLocked(true);
+  DropUnparsedTailsLocked();
   if (!IsReadOnlyShared() && index_.Segments().empty()) {
     OpenOrCreateSegmentLocked(0);
+  }
+}
+
+int SSDTier::TierThreads() const {
+  int t = ssd_config_.tier_io_threads;
+  if (t < 1) t = 1;
+  const unsigned hc = std::thread::hardware_concurrency();
+  if (hc > 0 && t > static_cast<int>(hc)) t = static_cast<int>(hc);
+  return t;
+}
+
+int SSDTier::SegmentOpenFlags() const { return direct_io_ ? O_DIRECT : 0; }
+
+bool SSDTier::ProbeDirectIo() const {
+  const std::string path = dir_ + "/.umbp_odirect_probe";
+  // O_DIRECT is rejected at open() time on filesystems that cannot do it, but a
+  // successful open does not prove the alignment is accepted, so round-trip one
+  // real block before believing it.
+  int fd = open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_DIRECT, 0644);
+  if (fd < 0) return false;
+
+  bool ok = false;
+  try {
+    AlignedBuffer block(static_cast<size_t>(segment::kRecordAlign));
+    std::memset(block.data(), 0xA5, block.padded_size());
+    const ssize_t w = pwrite(fd, block.data(), block.padded_size(), 0);
+    if (w == static_cast<ssize_t>(block.padded_size())) {
+      AlignedBuffer back(static_cast<size_t>(segment::kRecordAlign));
+      const ssize_t r = pread(fd, back.data(), back.padded_size(), 0);
+      ok = r == static_cast<ssize_t>(back.padded_size()) &&
+           std::memcmp(block.data(), back.data(), block.padded_size()) == 0;
+    }
+  } catch (const std::bad_alloc&) {
+    ok = false;
+  }
+
+  close(fd);
+  unlink(path.c_str());
+  return ok;
+}
+
+void SSDTier::SetColdRead(bool enable) {
+  if (enable == direct_io_) return;
+  if (enable && !ProbeDirectIo()) {
+    MORI_UMBP_WARN("[SSDTier] {}: SetColdRead(true) ignored — filesystem rejects O_DIRECT", dir_);
+    return;
+  }
+  direct_io_ = enable;
+  MORI_UMBP_INFO("[SSDTier] {}: direct I/O {} for segments opened from here on", dir_,
+                 enable ? "enabled" : "disabled");
+}
+
+void SSDTier::DropUnparsedTailsLocked() {
+  // A follower must never rewrite the shared log; the owner does this once at
+  // startup, before any write can land.
+  if (IsReadOnlyShared()) return;
+
+  for (auto& kv : index_.MutableSegments()) {
+    auto& seg = kv.second;
+    if (seg.fd < 0) continue;
+
+    struct stat st;
+    if (fstat(seg.fd, &st) != 0) continue;
+    const uint64_t file_size = static_cast<uint64_t>(st.st_size);
+    if (seg.scanned_offset >= file_size) continue;  // fully parsed, nothing to do
+
+    // Bytes past the last parsed record boundary are permanently unreachable:
+    // the scanner stops at the first header it cannot read and every later
+    // restart stops at the same place.  Two ways to get here --
+    //   * records written by an older kRecordVersion (e.g. the CRC-32/ISO-HDLC
+    //     v1 format that preceded CRC-32C), and
+    //   * a torn tail record from a crash mid-write.
+    // Either way, appending after them silently loses the new records on the
+    // next restart, so truncate instead.  Safe by construction: the SSD tier is
+    // a cache whose contents are re-fetchable.
+    const uint64_t dropped = file_size - seg.scanned_offset;
+    MORI_UMBP_WARN(
+        "[SSDTier] {}: dropping {}B of unreadable tail (stale record version or torn write); "
+        "segment truncated to the last valid record at offset {}",
+        seg.path, dropped, seg.scanned_offset);
+    if (ftruncate(seg.fd, static_cast<off_t>(seg.scanned_offset)) != 0) {
+      MORI_UMBP_ERROR("[SSDTier] {}: ftruncate to {} failed; segment left as-is", seg.path,
+                      seg.scanned_offset);
+      continue;
+    }
+    // Reset the append cursor too, otherwise the next write leaves a hole that
+    // the scanner would stop at all over again.
+    seg.write_offset = seg.scanned_offset;
   }
 }
 
@@ -91,7 +211,7 @@ bool SSDTier::OpenOrCreateSegmentLocked(uint64_t segment_id) {
   seg.id = segment_id;
   seg.path = dir_ + "/" + segment::BuildFileName(segment_id);
 
-  int flags = IsReadOnlyShared() ? O_RDONLY : (O_RDWR | O_CREAT);
+  int flags = (IsReadOnlyShared() ? O_RDONLY : (O_RDWR | O_CREAT)) | SegmentOpenFlags();
   seg.fd = open(seg.path.c_str(), flags, 0644);
   if (seg.fd < 0) return false;
 
@@ -141,7 +261,7 @@ bool SSDTier::RefreshFromDiskLocked(bool force_full_rescan) {
 
   std::string error_message;
   bool ok = scanner_.RefreshFromDisk(dir_, *io_driver_, index_, IsReadOnlyShared(),
-                                     force_full_rescan, &error_message);
+                                     force_full_rescan, &error_message, SegmentOpenFlags());
   if (!ok && !error_message.empty()) {
     RememberStatus(IoStatus::IoError(error_message));
   }
@@ -155,16 +275,20 @@ bool SSDTier::RefreshFollowerLocked() const {
 bool SSDTier::Write(const std::string& key, const void* data, size_t size) {
   if (IsReadOnlyShared()) return false;
 
-  const size_t record_size = sizeof(segment::RecordHeader) + key.size() + size;
+  const size_t record_size = static_cast<size_t>(segment::RecordBytes(key.size(), size));
   segment::PreparedRecord pr;
+
+  // Phase 1a (no lock): checksum + assemble, same rationale as WriteBatch.
+  writer_->Build(key, data, size, &pr);
+
   int write_fd = -1;
   {
-    // Phase 1: reserve index space and build record buffer under mu_
+    // Phase 1b: reserve index space under mu_
     std::lock_guard<std::mutex> lock(mu_);
     if (!EnsureActiveSegment(record_size)) return false;
     auto* seg = GetSegmentLocked(index_.active_segment_id());
     if (!seg) return false;
-    if (!writer_->Prepare(key, data, size, seg, index_, &pr)) return false;
+    if (!writer_->Reserve(key, size, seg, index_, &pr)) return false;
     write_fd = seg->fd;
   }
 
@@ -193,9 +317,11 @@ bool SSDTier::WriteBatch(const std::vector<std::string>& keys,
   if (keys.empty()) return true;
   if (IsReadOnlyShared()) return false;
 
+  // Padded size: what the batch will actually occupy on disk, and therefore what
+  // the segment-roll check has to be made against.
   size_t total_bytes = 0;
   for (size_t i = 0; i < keys.size(); ++i) {
-    total_bytes += sizeof(segment::RecordHeader) + keys[i].size() + sizes[i];
+    total_bytes += static_cast<size_t>(segment::RecordBytes(keys[i].size(), sizes[i]));
   }
   if (total_bytes > ssd_config_.segment_size_bytes) {
     bool all_ok = true;
@@ -205,11 +331,29 @@ bool SSDTier::WriteBatch(const std::vector<std::string>& keys,
     return all_ok;
   }
 
+  // Stage timers for the [SsdPerf/tier] PUT breakdown (no-ops unless
+  // UMBP_SSD_TIMING is set).  `prepare` covers the CRC + record memcpy done
+  // under mu_, which is the stage that blocks concurrent reads on this drive.
+  const auto t_begin = ssdperf::Now();
+  double build_ms = 0.0, lock_ms = 0.0, reserve_ms = 0.0, io_ms = 0.0, sync_ms = 0.0;
+
+  // Phase 1a (NO lock): checksum + assemble every record.  This is the expensive
+  // half of the old Prepare() and it touches no shared state, so keeping it out
+  // of mu_ stops a write batch from blocking concurrent reads on this drive for
+  // the whole of its CRC + copy time.
+  std::vector<segment::PreparedRecord> built(keys.size());
+  ParallelFor(keys.size(), TierThreads(),
+              [&](size_t i) { writer_->Build(keys[i], data_ptrs[i], sizes[i], &built[i]); });
+  build_ms = ssdperf::MsSince(t_begin);
+
   std::vector<segment::PreparedRecord> prepared;
   int write_fd = -1;
   {
-    // Phase 1: reserve index space and build record buffers under mu_
+    // Phase 1b: reserve index/segment space under mu_ (cheap: no CRC, no copy).
+    const auto t_lock = ssdperf::Now();
     std::lock_guard<std::mutex> lock(mu_);
+    const auto t_locked = ssdperf::Now();
+    lock_ms = ssdperf::MsBetween(t_lock, t_locked);
     if (!EnsureActiveSegment(total_bytes)) return false;
     auto* seg = GetSegmentLocked(index_.active_segment_id());
     if (!seg) return false;
@@ -217,22 +361,38 @@ bool SSDTier::WriteBatch(const std::vector<std::string>& keys,
 
     prepared.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-      segment::PreparedRecord pr;
-      if (!writer_->Prepare(keys[i], data_ptrs[i], sizes[i], seg, index_, &pr)) continue;
-      prepared.push_back(std::move(pr));
+      if (!writer_->Reserve(keys[i], sizes[i], seg, index_, &built[i])) continue;
+      prepared.push_back(std::move(built[i]));
     }
+    reserve_ms = ssdperf::MsSince(t_locked);
   }
 
   if (prepared.empty()) return true;
 
   // Phase 2: perform I/O outside mu_
   const bool needs_io_lock = !io_driver_->Capabilities().thread_safe;
+  const auto t_io = ssdperf::Now();
   IoStatus status;
   if (needs_io_lock) {
     std::lock_guard<std::mutex> io_lock(io_mu_);
-    status = writer_->WriteRecords(write_fd, prepared, ShouldSyncOnWrite());
+    status = writer_->WriteRecords(write_fd, prepared, ShouldSyncOnWrite(), &sync_ms);
   } else {
-    status = writer_->WriteRecords(write_fd, prepared, ShouldSyncOnWrite());
+    status = writer_->WriteRecords(write_fd, prepared, ShouldSyncOnWrite(), &sync_ms);
+  }
+  io_ms = ssdperf::MsSince(t_io) - sync_ms;
+
+  if (ssdperf::Enabled()) {
+    const double total_ms = ssdperf::MsSince(t_begin);
+    MORI_UMBP_INFO(
+        "[SsdPerf/tier] PUT dir={} keys={} bytes={} total_ms={:.3f} GB_s={:.2f} | "
+        "build_crc_memcpy={:.3f}ms ({:.0f}%, lock-free) mu_wait={:.3f}ms reserve={:.3f}ms "
+        "({:.0f}%, under mu_) dev_write={:.3f}ms ({:.0f}%) fsync={:.3f}ms ({:.0f}%) | "
+        "crc_GB_s={:.2f} dev_GB_s={:.2f} sync_on_write={}",
+        dir_, prepared.size(), total_bytes, total_ms, ssdperf::GbPerSec(total_bytes, total_ms),
+        build_ms, ssdperf::Pct(build_ms, total_ms), lock_ms, reserve_ms,
+        ssdperf::Pct(reserve_ms, total_ms), io_ms, ssdperf::Pct(io_ms, total_ms), sync_ms,
+        ssdperf::Pct(sync_ms, total_ms), ssdperf::GbPerSec(total_bytes, build_ms),
+        ssdperf::GbPerSec(total_bytes, io_ms), ShouldSyncOnWrite());
   }
 
   if (!status.ok()) {
@@ -244,22 +404,38 @@ bool SSDTier::WriteBatch(const std::vector<std::string>& keys,
   return true;
 }
 
+IoStatus SSDTier::ReadValueInto(int fd, void* dst, size_t size, uint64_t value_offset) const {
+  // Value offsets are alignment multiples by construction in the v3 layout, so
+  // only the caller's buffer and length can disqualify a direct read.  When they
+  // do, read the padded value (always present on disk) into an aligned bounce
+  // buffer and hand back just the value bytes.
+  if (direct_io_ && !IsDirectIoCompatible(dst, size)) {
+    AlignedBuffer bounce(size);
+    IoStatus status = io_driver_->ReadAt(fd, bounce.data(), bounce.padded_size(), value_offset);
+    if (!status.ok()) return status;
+    std::memcpy(dst, bounce.data(), size);
+    return IoStatus::Ok();
+  }
+  return io_driver_->ReadAt(fd, dst, size, value_offset);
+}
+
 bool SSDTier::ReadRecordLocked(const std::string& key, void* dst, size_t size,
-                               uint32_t expected_crc, uint64_t value_offset, int read_fd) const {
+                               uint32_t expected_crc, uint64_t value_offset, int read_fd,
+                               bool crc_valid) const {
   const bool needs_external_lock = !io_driver_->Capabilities().thread_safe;
   IoStatus status;
   if (needs_external_lock) {
     std::lock_guard<std::mutex> io_lock(io_mu_);
-    status = io_driver_->ReadAt(read_fd, dst, size, value_offset);
+    status = ReadValueInto(read_fd, dst, size, value_offset);
   } else {
-    status = io_driver_->ReadAt(read_fd, dst, size, value_offset);
+    status = ReadValueInto(read_fd, dst, size, value_offset);
   }
   if (!status.ok()) {
     RememberStatus(std::move(status));
     return false;
   }
 
-  if (segment::ComputeRecordCrc32(key, dst, size) != expected_crc) {
+  if (ShouldVerifyCrc(crc_valid) && segment::ComputeRecordCrc32(key, dst, size) != expected_crc) {
     RememberStatus(IoStatus::Corruption("segment CRC mismatch"));
     return false;
   }
@@ -270,6 +446,7 @@ bool SSDTier::ReadIntoPtr(const std::string& key, uintptr_t dst_ptr, size_t size
   int read_fd = -1;
   uint64_t value_offset = 0;
   uint32_t expected_crc = 0;
+  bool crc_valid = true;
   {
     std::lock_guard<std::mutex> lock(mu_);
     auto* meta = index_.FindKey(key);
@@ -284,10 +461,11 @@ bool SSDTier::ReadIntoPtr(const std::string& key, uintptr_t dst_ptr, size_t size
     read_fd = seg->fd;
     value_offset = meta->value_offset;
     expected_crc = meta->crc32;
+    crc_valid = meta->crc_valid;
     index_.TouchLRU(key);
   }
   return ReadRecordLocked(key, reinterpret_cast<void*>(dst_ptr), size, expected_crc, value_offset,
-                          read_fd);
+                          read_fd, crc_valid);
 }
 
 std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys,
@@ -303,15 +481,27 @@ std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys
     uint64_t offset;
     uint32_t expected_crc;
     size_t size;
-    void* dst;
+    void* dst;       // final destination (caller's buffer)
+    void* io_dst;    // where the I/O lands: dst, or `bounce` when misaligned
+    size_t io_size;  // bytes to transfer: size, or the padded value length
+    bool crc_valid;
+    AlignedBuffer bounce;  // only allocated when a bounce is actually needed
   };
 
   std::vector<ReadLookup> lookups;
   lookups.reserve(keys.size());
 
+  // Stage timers for the [SsdPerf/tier] GET breakdown (no-ops unless
+  // UMBP_SSD_TIMING is set).  The three stages are disjoint and cover the whole
+  // call, so their percentages answer "device or CPU?" directly.
+  const auto t_begin = ssdperf::Now();
+  double lock_ms = 0.0, lookup_ms = 0.0, io_ms = 0.0, crc_ms = 0.0;
+
   // Phase 1 (mu_ held): batch index lookup + metadata extraction.
   {
     std::lock_guard<std::mutex> lock(mu_);
+    const auto t_locked = ssdperf::Now();
+    lock_ms = ssdperf::MsBetween(t_begin, t_locked);
 
     // Follower: do a single refresh if any key is missing.
     if (IsReadOnlyShared()) {
@@ -334,9 +524,31 @@ std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys
       auto* seg = GetSegmentLocked(meta->segment_id);
       if (!seg || seg->fd < 0) continue;
       index_.TouchLRU(keys[i]);
-      lookups.push_back({i, seg->fd, meta->value_offset, meta->crc32, sizes[i],
-                         reinterpret_cast<void*>(dst_ptrs[i])});
+
+      ReadLookup lk;
+      lk.orig_idx = i;
+      lk.fd = seg->fd;
+      lk.offset = meta->value_offset;
+      lk.expected_crc = meta->crc32;
+      lk.size = sizes[i];
+      lk.dst = reinterpret_cast<void*>(dst_ptrs[i]);
+      lk.crc_valid = meta->crc_valid;
+      lk.io_dst = lk.dst;
+      lk.io_size = lk.size;
+      // Direct I/O demands an aligned buffer and length.  KV page buffers are
+      // normally both (page sizes here are exact 4 KiB multiples out of
+      // hugepage-backed allocations), so this bounce is the exception, not the
+      // rule — but it has to exist, because the failure mode without it is an
+      // EINVAL that the per-key fallback below would simply repeat, surfacing as
+      // a silent 100% miss rather than an error.
+      if (direct_io_ && !IsDirectIoCompatible(lk.dst, lk.size)) {
+        lk.bounce.Resize(lk.size);
+        lk.io_dst = lk.bounce.data();
+        lk.io_size = lk.bounce.padded_size();
+      }
+      lookups.push_back(std::move(lk));
     }
+    lookup_ms = ssdperf::MsSince(t_locked);
   }
 
   if (lookups.empty()) return results;
@@ -344,6 +556,7 @@ std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys
   // Phase 2 (io_mu_ if needed): batch I/O.
   const bool needs_io_lock = !io_driver_->Capabilities().thread_safe;
   const bool use_batch = io_driver_->Capabilities().batch_read && lookups.size() > 1;
+  const auto t_io = ssdperf::Now();
 
   std::vector<bool> io_ok(lookups.size(), false);
 
@@ -351,7 +564,7 @@ std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys
     std::vector<IoReadOp> ops;
     ops.reserve(lookups.size());
     for (const auto& lk : lookups) {
-      ops.push_back({lk.fd, lk.dst, lk.size, lk.offset});
+      ops.push_back({lk.fd, lk.io_dst, lk.io_size, lk.offset});
     }
 
     IoStatus status;
@@ -373,9 +586,9 @@ std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys
         IoStatus s;
         if (needs_io_lock) {
           std::lock_guard<std::mutex> io_lock(io_mu_);
-          s = io_driver_->ReadAt(lk.fd, lk.dst, lk.size, lk.offset);
+          s = io_driver_->ReadAt(lk.fd, lk.io_dst, lk.io_size, lk.offset);
         } else {
-          s = io_driver_->ReadAt(lk.fd, lk.dst, lk.size, lk.offset);
+          s = io_driver_->ReadAt(lk.fd, lk.io_dst, lk.io_size, lk.offset);
         }
         io_ok[j] = s.ok();
         if (!s.ok()) RememberStatus(std::move(s));
@@ -388,24 +601,61 @@ std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys
       IoStatus s;
       if (needs_io_lock) {
         std::lock_guard<std::mutex> io_lock(io_mu_);
-        s = io_driver_->ReadAt(lk.fd, lk.dst, lk.size, lk.offset);
+        s = io_driver_->ReadAt(lk.fd, lk.io_dst, lk.io_size, lk.offset);
       } else {
-        s = io_driver_->ReadAt(lk.fd, lk.dst, lk.size, lk.offset);
+        s = io_driver_->ReadAt(lk.fd, lk.io_dst, lk.io_size, lk.offset);
       }
       io_ok[j] = s.ok();
       if (!s.ok()) RememberStatus(std::move(s));
     }
   }
 
-  // Phase 3 (no lock): per-key CRC verification.
+  io_ms = ssdperf::MsSince(t_io);
+
+  // Phase 3 (no lock): copy out of any bounce buffers, then verify checksums.
+  // Both are pure CPU over disjoint indices, so they fan out across
+  // tier_io_threads — this is the phase that was single-threaded while the DRAM
+  // tier's equivalent memcpy ran on read_threads_ workers.
+  const auto t_crc = ssdperf::Now();
+  uint64_t verified_bytes = 0;
+  for (size_t j = 0; j < lookups.size(); ++j) {
+    if (io_ok[j]) verified_bytes += lookups[j].size;
+  }
+
+  std::vector<char> key_ok(lookups.size(), 0);
+  ParallelFor(lookups.size(), TierThreads(), [&](size_t j) {
+    if (!io_ok[j]) return;
+    auto& lk = lookups[j];
+    if (lk.io_dst != lk.dst) std::memcpy(lk.dst, lk.bounce.data(), lk.size);
+    // CRC covers exactly the value, never the record's alignment padding.
+    if (ShouldVerifyCrc(lk.crc_valid) &&
+        segment::ComputeRecordCrc32(keys[lk.orig_idx], lk.dst, lk.size) != lk.expected_crc) {
+      return;  // key_ok stays 0
+    }
+    key_ok[j] = 1;
+  });
+
   for (size_t j = 0; j < lookups.size(); ++j) {
     if (!io_ok[j]) continue;
-    const auto& lk = lookups[j];
-    if (segment::ComputeRecordCrc32(keys[lk.orig_idx], lk.dst, lk.size) != lk.expected_crc) {
+    if (!key_ok[j]) {
       RememberStatus(IoStatus::Corruption("segment CRC mismatch"));
       continue;
     }
-    results[lk.orig_idx] = true;
+    results[lookups[j].orig_idx] = true;
+  }
+  crc_ms = ssdperf::MsSince(t_crc);
+
+  if (ssdperf::Enabled()) {
+    const double total_ms = lock_ms + lookup_ms + io_ms + crc_ms;
+    MORI_UMBP_INFO(
+        "[SsdPerf/tier] GET dir={} keys={} served={} bytes={} total_ms={:.3f} GB_s={:.2f} | "
+        "mu_wait={:.3f}ms index={:.3f}ms ({:.0f}%) dev_read={:.3f}ms ({:.0f}%) crc={:.3f}ms "
+        "({:.0f}%) | dev_GB_s={:.2f} crc_GB_s={:.2f} batched={}",
+        dir_, keys.size(), lookups.size(), verified_bytes, total_ms,
+        ssdperf::GbPerSec(verified_bytes, total_ms), lock_ms, lookup_ms,
+        ssdperf::Pct(lookup_ms, total_ms), io_ms, ssdperf::Pct(io_ms, total_ms), crc_ms,
+        ssdperf::Pct(crc_ms, total_ms), ssdperf::GbPerSec(verified_bytes, io_ms),
+        ssdperf::GbPerSec(verified_bytes, crc_ms), use_batch);
   }
 
   return results;
@@ -422,6 +672,289 @@ std::vector<bool> SSDTier::BatchReadIntoPtr(const std::vector<std::string>& keys
                                             const std::vector<uintptr_t>& dst_ptrs,
                                             const std::vector<size_t>& sizes) {
   return ReadBatchIntoPtr(keys, dst_ptrs, sizes);
+}
+
+namespace {
+
+// One caller range to lift out of a run's bounce buffer once the read lands.
+// `device_id` is -1 for ordinary host memory; anything else means the caller
+// handed us GPU memory (the tree connector registers its device KV buffers over
+// IPC, so the resolved destination really is a device pointer) and the lift has
+// to be a hipMemcpy rather than a memcpy.
+struct BounceCopy {
+  void* dst = nullptr;
+  size_t bounce_offset = 0;
+  size_t size = 0;
+  int device_id = -1;
+};
+
+// One device read.  A run is a maximal set of ranges that are contiguous *in
+// the object*, which is the shape a layer-group load produces: consecutive
+// layers of one component sit next to each other in the stored object.
+// Collapsing them into a single pread is the whole reason ranged SSD beats
+// whole-object SSD -- it trades N device round trips for one read plus a host
+// memcpy, and on this tier a device round trip costs orders of magnitude more
+// than the memcpy does.
+struct RunRead {
+  size_t key_index = 0;
+  int fd = -1;
+  uint64_t io_offset = 0;
+  size_t io_size = 0;
+  void* io_dst = nullptr;
+  AlignedBuffer bounce;            // unused when reading straight into the caller
+  std::vector<BounceCopy> copies;  // empty when reading straight into the caller
+};
+
+}  // namespace
+
+std::vector<bool> SSDTier::ReadBatchRangesIntoPtr(
+    const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dst_ptrs,
+    const std::vector<std::vector<size_t>>& sizes,
+    const std::vector<std::vector<size_t>>& src_offsets) {
+  const size_t n = keys.size();
+  std::vector<bool> results(n, false);
+  if (n == 0 || !RangeBatchShapeValid(n, dst_ptrs, sizes, src_offsets)) return results;
+
+  const auto t_begin = ssdperf::Now();
+  double lock_ms = 0.0, plan_ms = 0.0, io_ms = 0.0, copy_ms = 0.0;
+
+  // What Phase 1 needs out of the index, so run planning can happen without mu_.
+  struct KeyLocation {
+    size_t key_index;
+    int fd;
+    uint64_t value_offset;
+    size_t object_size;
+  };
+  std::vector<KeyLocation> located;
+  located.reserve(n);
+
+  // Phase 1 (mu_ held): resolve every key to a segment fd + value offset.
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto t_locked = ssdperf::Now();
+    lock_ms = ssdperf::MsBetween(t_begin, t_locked);
+
+    // Follower: one refresh covers the whole batch, same as ReadBatchIntoPtr.
+    if (IsReadOnlyShared()) {
+      for (size_t i = 0; i < n; ++i) {
+        if (!sizes[i].empty() && !index_.FindKey(keys[i])) {
+          RefreshFromDiskLocked(false);
+          break;
+        }
+      }
+    }
+
+    for (size_t i = 0; i < n; ++i) {
+      if (sizes[i].empty()) continue;  // asked for nothing; stays false
+      auto* meta = index_.FindKey(keys[i]);
+      if (!meta) continue;
+      auto* seg = GetSegmentLocked(meta->segment_id);
+      if (!seg || seg->fd < 0) continue;
+      index_.TouchLRU(keys[i]);
+      located.push_back({i, seg->fd, meta->value_offset, meta->size});
+    }
+    plan_ms = ssdperf::MsSince(t_locked);
+  }
+
+  if (located.empty()) return results;
+
+  // Phase 2 (no lock): validate ranges and plan the runs.
+  const auto t_plan = ssdperf::Now();
+  std::vector<RunRead> runs;
+  std::vector<size_t> expected(n, 0);
+  std::vector<size_t> order;
+  for (const auto& loc : located) {
+    const size_t i = loc.key_index;
+    const size_t count = sizes[i].size();
+
+    bool valid = true;
+    for (size_t j = 0; j < count; ++j) {
+      if (sizes[i][j] == 0 ||
+          IsObjectRangeOverflow(src_offsets[i][j], sizes[i][j], loc.object_size)) {
+        valid = false;
+        break;
+      }
+    }
+    if (!valid) continue;  // a caller bug, reported as this key's failure only
+
+    order.resize(count);
+    std::iota(order.begin(), order.end(), size_t{0});
+    std::sort(order.begin(), order.end(),
+              [&](size_t a, size_t b) { return src_offsets[i][a] < src_offsets[i][b]; });
+
+    size_t start = 0;
+    while (start < count) {
+      // Extend while the next range begins exactly where this one ends.
+      // Overlapping ranges simply do not merge; they become separate reads.
+      size_t end = start + 1;
+      size_t span_end = src_offsets[i][order[start]] + sizes[i][order[start]];
+      while (end < count && src_offsets[i][order[end]] == span_end) {
+        span_end += sizes[i][order[end]];
+        ++end;
+      }
+
+      const uint64_t file_begin = loc.value_offset + src_offsets[i][order[start]];
+      const uint64_t file_end = loc.value_offset + span_end;
+      const size_t span = static_cast<size_t>(file_end - file_begin);
+      void* first_dst = reinterpret_cast<void*>(dst_ptrs[i][order[start]]);
+
+      // A device destination cannot receive a read() at all, so it always
+      // bounces through host memory.  Classification costs one
+      // hipPointerGetAttributes per range, the same toll the DRAM tier pays.
+      bool any_device = false;
+      for (size_t j = start; j < end; ++j) {
+        if (DetectPointerLocation(reinterpret_cast<const void*>(dst_ptrs[i][order[j]]))
+                .IsDevice()) {
+          any_device = true;
+          break;
+        }
+      }
+
+      RunRead run;
+      run.key_index = i;
+      run.fd = loc.fd;
+
+      // Straight into the caller's buffer when nothing forbids it: one host
+      // range, and (under O_DIRECT) an aligned file offset, buffer and length.
+      // Value offsets are aligned by construction, so only the range's own
+      // offset can break the file side.
+      const bool aligned_ok = !direct_io_ || ((file_begin % segment::kRecordAlign) == 0 &&
+                                              IsDirectIoCompatible(first_dst, span));
+      if (end - start == 1 && aligned_ok && !any_device) {
+        run.io_offset = file_begin;
+        run.io_size = span;
+        run.io_dst = first_dst;
+      } else {
+        // Bounce.  Under O_DIRECT widen to the enclosing aligned window; the
+        // value is padded to kRecordAlign on disk, so the widened read cannot
+        // escape this record.
+        uint64_t io_begin = file_begin;
+        size_t io_len = span;
+        if (direct_io_) {
+          io_begin = file_begin & ~(segment::kRecordAlign - 1);
+          io_len = static_cast<size_t>(segment::AlignUp(file_end - io_begin));
+        }
+        run.bounce.Resize(io_len);
+        run.io_offset = io_begin;
+        run.io_size = io_len;
+        run.io_dst = run.bounce.data();
+        run.copies.reserve(end - start);
+        for (size_t j = start; j < end; ++j) {
+          const size_t idx = order[j];
+          void* dst = reinterpret_cast<void*>(dst_ptrs[i][idx]);
+          const auto where = DetectPointerLocation(dst);
+          run.copies.push_back(
+              {dst, static_cast<size_t>(loc.value_offset + src_offsets[i][idx] - io_begin),
+               sizes[i][idx], where.IsDevice() ? where.device_id : -1});
+        }
+      }
+
+      runs.push_back(std::move(run));
+      ++expected[i];
+      start = end;
+    }
+  }
+  plan_ms += ssdperf::MsSince(t_plan);
+
+  if (runs.empty()) return results;
+
+  // Phase 3: issue every run as one batch, falling back per run if the driver
+  // rejects the batch as a whole.
+  const bool needs_io_lock = !io_driver_->Capabilities().thread_safe;
+  const bool use_batch = io_driver_->Capabilities().batch_read && runs.size() > 1;
+  const auto t_io = ssdperf::Now();
+  std::vector<char> run_ok(runs.size(), 0);
+  uint64_t io_bytes = 0;
+
+  auto read_one = [&](size_t j) {
+    const auto& run = runs[j];
+    IoStatus status;
+    if (needs_io_lock) {
+      std::lock_guard<std::mutex> io_lock(io_mu_);
+      status = io_driver_->ReadAt(run.fd, run.io_dst, run.io_size, run.io_offset);
+    } else {
+      status = io_driver_->ReadAt(run.fd, run.io_dst, run.io_size, run.io_offset);
+    }
+    run_ok[j] = status.ok() ? 1 : 0;
+    if (!status.ok()) RememberStatus(std::move(status));
+  };
+
+  if (use_batch) {
+    std::vector<IoReadOp> ops;
+    ops.reserve(runs.size());
+    for (const auto& run : runs) ops.push_back({run.fd, run.io_dst, run.io_size, run.io_offset});
+
+    IoStatus status;
+    if (needs_io_lock) {
+      std::lock_guard<std::mutex> io_lock(io_mu_);
+      status = io_driver_->ReadBatch(ops);
+    } else {
+      status = io_driver_->ReadBatch(ops);
+    }
+    if (status.ok()) {
+      std::fill(run_ok.begin(), run_ok.end(), 1);
+    } else {
+      RememberStatus(std::move(status));
+      for (size_t j = 0; j < runs.size(); ++j) read_one(j);
+    }
+  } else {
+    for (size_t j = 0; j < runs.size(); ++j) read_one(j);
+  }
+  io_ms = ssdperf::MsSince(t_io);
+  for (size_t j = 0; j < runs.size(); ++j) {
+    if (run_ok[j]) io_bytes += runs[j].io_size;
+  }
+
+  // Phase 4 (no lock): lift the bounced runs out to their caller buffers.
+  // Disjoint destinations, so this fans out across tier_io_threads.
+  const auto t_copy = ssdperf::Now();
+  ParallelFor(runs.size(), TierThreads(), [&](size_t j) {
+    if (!run_ok[j]) return;
+    auto& run = runs[j];
+    for (const auto& copy : run.copies) {
+      const void* src = run.bounce.data() + copy.bounce_offset;
+      if (copy.device_id < 0) {
+        std::memcpy(copy.dst, src, copy.size);
+        continue;
+      }
+      // One synchronous hipMemcpy per range.  The DRAM tier merges and pipelines
+      // these; here the device copy sits behind a device read that costs orders
+      // of magnitude more, so the simple form is not the bottleneck yet.
+      if (!DeviceCopy(copy.dst, src, copy.size, hipMemcpyHostToDevice, copy.device_id)) {
+        run_ok[j] = 0;  // distinct index per worker; no race
+        return;
+      }
+    }
+  });
+  copy_ms = ssdperf::MsSince(t_copy);
+
+  std::vector<size_t> done(n, 0);
+  for (size_t j = 0; j < runs.size(); ++j) {
+    if (run_ok[j]) ++done[runs[j].key_index];
+  }
+  uint64_t served_bytes = 0;
+  for (size_t i = 0; i < n; ++i) {
+    if (expected[i] == 0 || done[i] != expected[i]) continue;
+    results[i] = true;
+    for (size_t size : sizes[i]) served_bytes += size;
+  }
+
+  if (ssdperf::Enabled()) {
+    const double total_ms = lock_ms + plan_ms + io_ms + copy_ms;
+    MORI_UMBP_INFO(
+        "[SsdPerf/tier] RANGED_GET dir={} keys={} located={} runs={} served_bytes={} "
+        "read_bytes={} total_ms={:.3f} GB_s={:.2f} | mu_wait={:.3f}ms plan={:.3f}ms ({:.0f}%) "
+        "dev_read={:.3f}ms ({:.0f}%) bounce_copy={:.3f}ms ({:.0f}%) | dev_GB_s={:.2f} "
+        "amplification={:.2f}x batched={}",
+        dir_, keys.size(), located.size(), runs.size(), served_bytes, io_bytes, total_ms,
+        ssdperf::GbPerSec(served_bytes, total_ms), lock_ms, plan_ms,
+        ssdperf::Pct(plan_ms, total_ms), io_ms, ssdperf::Pct(io_ms, total_ms), copy_ms,
+        ssdperf::Pct(copy_ms, total_ms), ssdperf::GbPerSec(io_bytes, io_ms),
+        served_bytes ? static_cast<double>(io_bytes) / static_cast<double>(served_bytes) : 0.0,
+        use_batch);
+  }
+
+  return results;
 }
 
 bool SSDTier::Exists(const std::string& key) const {
@@ -466,6 +999,7 @@ std::vector<char> SSDTier::Read(const std::string& key) {
   uint64_t value_offset = 0;
   uint32_t read_size = 0;
   uint32_t expected_crc = 0;
+  bool crc_valid = true;
   {
     std::lock_guard<std::mutex> lock(mu_);
     auto* meta = index_.FindKey(key);
@@ -480,11 +1014,16 @@ std::vector<char> SSDTier::Read(const std::string& key) {
     value_offset = meta->value_offset;
     read_size = meta->size;
     expected_crc = meta->crc32;
+    crc_valid = meta->crc_valid;
     index_.TouchLRU(key);
   }
 
+  // The returned vector is only max_align_t-aligned, so under direct I/O
+  // ReadValueInto bounces it; that is the whole cost of keeping this API's
+  // std::vector<char> return type.
   std::vector<char> out(read_size);
-  if (!ReadRecordLocked(key, out.data(), out.size(), expected_crc, value_offset, read_fd))
+  if (!ReadRecordLocked(key, out.data(), out.size(), expected_crc, value_offset, read_fd,
+                        crc_valid))
     return {};
   return out;
 }
@@ -493,6 +1032,7 @@ TierCapabilities SSDTier::Capabilities() const {
   TierCapabilities caps;
   caps.batch_write = true;
   caps.batch_read = true;
+  caps.ranged_read = true;
   return caps;
 }
 

@@ -29,12 +29,26 @@ message PageLocation {
   uint32 page_index   = 2;
 }
 
-// One DRAM/HBM buffer's RDMA MemoryDesc plus the buffer_index it belongs
-// to.  Peer responses ship a deduplicated, ascending list so the writer
-// can hydrate its peer-side buffer_index → MemoryDesc cache in one batch.
+// One buffer's RDMA MemoryDesc plus the address it lives at.  Peer responses
+// ship a deduplicated, ascending list so the writer can hydrate its peer-side
+// buffer cache in one batch.
+//
+// THE ADDRESS IS THE PAIR, not buffer_index alone.  Every backend numbers its
+// own buffers from 0 (PageBackend from its allocator, SsdBackend's staging
+// arena is hardcoded to 0), so a bare buffer_index is ambiguous the moment a
+// second medium is live on a peer — and in practice every backend publishes
+// exactly one buffer, so index 0 collides on EVERY mixed-media node.  Before
+// backend_id existed, one medium's descriptors silently overwrote another's in
+// the reader's cache and reads were served from the wrong memory: a hit, with
+// garbage bytes.
+//
+// backend_id is assigned by the peer's BackendRegistry and is peer-local and
+// opaque to the client, which only ever echoes it back.  buffer_index stays
+// backend-local and unchanged — no backend knows this field exists.
 message BufferMemoryDesc {
   uint32 buffer_index = 1;
   bytes  desc         = 2;  // msgpack-packed mori::io::MemoryDesc
+  uint32 backend_id   = 3;
 }
 
 // ============================================================
