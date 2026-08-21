@@ -128,7 +128,7 @@ jobs:
             --sweep-start-size 1048576 --sweep-max-size 33554432 --sweep-step 1048576 \
             --num-qp-per-transfer 4 --batch-contiguous \
             --num-initiator-dev 1 --num-target-dev 1 \
-            --warmup-iters 10 --log-level info"
+            --warmup-iters 128 --log-level info"
           for BATCH in 1 64; do
             ITERS=128
             if [ "$BATCH" -eq 1 ]; then ITERS=512; fi
