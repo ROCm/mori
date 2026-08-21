@@ -1,10 +1,11 @@
 name: CCO CI test
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
+  # Disabled on the bench_engine perf CI branch.
+  # push:
+  #   branches: [main]
+  # pull_request:
+  #   branches: [main]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
