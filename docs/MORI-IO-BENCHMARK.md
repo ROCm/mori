@@ -2,6 +2,7 @@
 
 ## Table of Contents
 
+- [Before an internode run](#before-an-internode-run)
 - [Benchmark Commands](#benchmark-commands)
   - [Fabric (cross-node scale-up UALink super-node)](#fabric-cross-node-scale-up-ualink-super-node)
 - [C++ Benchmark (nixlbench-matching)](#c-benchmark-nixlbench-matching)
@@ -23,6 +24,30 @@
   - [The merged-WR size limit](#the-merged-wr-size-limit)
   - [Parameters that usually do not help (or can hurt)](#parameters-that-usually-do-not-help-or-can-hurt)
   - [Host (CPU) vs GPU memory](#host-cpu-vs-gpu-memory)
+
+## Before an internode run
+
+Validate the fabric before collecting numbers across nodes:
+
+```bash
+mori check <peer_ip>          # or: tools/env_check.sh <peer_ip>
+```
+
+It exits non-zero if any check failed. Three results change how you should read
+the benchmark output:
+
+- **Firmware not known-good** — the wrong NIC firmware is the most common cause
+  of cross-node RDMA misbehaviour, and it surfaces as bad MORI numbers rather
+  than as an obvious firmware problem.
+- **Rail-only fabric** (`0/N cross-rail pairs reachable`) — every NIC reaches
+  only its own rail on the peer. MORI-IO works there with
+  `MORI_IO_RAIL_AFFINITY=1`, which keeps each transfer on its own rail.
+- **Rails below threshold** — the per-rail GPU-memory pass is the serial,
+  quotable figure. If a rail is short of line rate there, no benchmark tuning
+  below will recover it.
+
+The reachability matrices are measured concurrently and are labelled as such:
+use them to answer "is this pair connected", not as bandwidth results.
 
 ## Benchmark Commands
 

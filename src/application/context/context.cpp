@@ -243,6 +243,44 @@ void Context::InitializeTopologyAndTransports() {
                   devicePortId, device->Name());
   }
 
+  // Firmware provenance for the NIC/GPU pair this rank actually uses. NIC
+  // firmware is a common cause of cross-node RDMA misbehaviour and the GPU MEC
+  // firmware pins down the compute-engine microcode in play; both are among the
+  // first things asked for in a bug report. `mori check` reports the same
+  // values, but that is a separate tool users may never run.
+  {
+    int gpuId = -1;
+    char pciBusId[32] = {};
+    std::string mecFw;
+    if ((hipGetDevice(&gpuId) == hipSuccess) &&
+        (hipDeviceGetPCIBusId(pciBusId, sizeof(pciBusId), gpuId) == hipSuccess)) {
+      mecFw = ReadGpuMecFirmware(pciBusId);
+    }
+    std::string nicFw = (device != nullptr) ? ReadNicFirmware(device->Name()) : std::string{};
+    MORI_APP_INFO("rank {} firmware: nic {} fw_ver {} | gpu {} [{}] mec_fw {}", LocalRank(),
+                  (device != nullptr) ? device->Name() : "none", nicFw.empty() ? "unknown" : nicFw,
+                  gpuId, (pciBusId[0] != '\0') ? pciBusId : "unknown",
+                  mecFw.empty() ? "unknown" : mecFw);
+
+    // Judge the version, do not just print it. `mori check` applies this table
+    // in Step 1, but it is a separate tool users may never run -- and the wrong
+    // NIC firmware is a leading cause of cross-node RDMA misbehaviour, which
+    // then surfaces as a MORI bug rather than as a firmware problem. WARN rather
+    // than INFO so it survives MORI_GLOBAL_LOG_LEVEL=warn; note the default
+    // level is ERROR, so neither line shows until the level is lowered.
+    // Advisory only: MORI still runs, and nothing here knows whether this rank
+    // will actually issue the cross-node IBGDA traffic the minimum is about.
+    if (device != nullptr) {
+      const auto fwCheck = CheckNicFirmware(ReadNicVendorId(device->Name()), nicFw);
+      if (fwCheck.verdict == FwVerdict::Bad) {
+        MORI_APP_WARN("rank {} nic {}: {}", LocalRank(), device->Name(), fwCheck.detail);
+      } else if (fwCheck.verdict == FwVerdict::Unknown) {
+        MORI_APP_WARN("rank {} nic {}: {}, cannot verify against the known-good table", LocalRank(),
+                      device->Name(), fwCheck.detail);
+      }
+    }
+  }
+
   int numQpPerPe = 4;
   const char* envNumQp = std::getenv("MORI_NUM_QP_PER_PE");
   if (envNumQp != nullptr) {

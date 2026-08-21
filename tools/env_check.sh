@@ -1,11 +1,14 @@
 #!/bin/bash
 
-# NIC version recommendations for cross-node MORI (EP over RDMA / IBGDA).
+# NIC version requirements for cross-node MORI (EP over RDMA / IBGDA).
 # The wrong NIC firmware/driver version is a common blocker, so `mori check`
-# validates the detected version against these known-good/known-bad ranges:
+# validates the detected version against these known-good/known-bad ranges and
+# FAILS anything that is not known-good -- including firmware on a branch that
+# has never been validated. Only an undetectable version downgrades to a warning.
 #   - AINIC     : >= 1.117.5-a-45 is solid. The 1.117.1 major does NOT support IBGDA.
 #   - Broadcom  : solid on 237.1.137.x (official release) and 235.2.86.x
-#                 (customer-specific build); 231.x is too old for IBGDA.
+#                 (customer-specific build). Known bad: 231.x is too old for
+#                 IBGDA, and 232.x does not work on Thor2.
 #   - Mellanox  : good backward compatibility, no known minimum version.
 # For all NICs, the userspace library must match the corresponding kernel driver.
 
@@ -13,9 +16,25 @@ set -uo pipefail
 
 # ============================ config ============================
 
-PEER_IP="${1:-}"
+# Set by parse_args() below (it runs after the logging helpers are defined, so
+# that a bad flag can die() with a formatted message).
+PEER_IP=""
+INSTALL_PERFTEST=false   # --install-perftest: build perftest instead of just warning
+USE_GPU_MEM=true         # --no-gpu-mem: force the mesh onto host memory
+# Where --install-perftest installs to, and the first place resolve_perftest()
+# looks after $PATH. Override to point at an existing build.
+MORI_PERFTEST_PREFIX="${MORI_PERFTEST_PREFIX:-$HOME/.local/mori-perftest}"
+# Upstream perftest carries ROCm support (--enable-rocm / --use_rocm) and is
+# actively maintained; ROCm/rdma-perftest has the same flags but has not moved
+# since 2025-05.
+PERFTEST_REPO="https://github.com/linux-rdma/perftest.git"
 BW_THRESHOLD=300    # Gbps
 LAT_THRESHOLD=10    # microseconds
+# A single QP tops out around half of line rate on the ionic GPUDirect path
+# (measured ~162 Gbps vs ~340 Gbps at 4 QPs on GPU memory); the fabric is fine,
+# one QP just cannot fill the pipe. Fan the bandwidth test across a few QPs so
+# the per-rail numbers reflect what MORI actually achieves.
+BW_QP=4             # -q for ib_write_bw (>1 to saturate the ionic NIC)
 MSG_SIZE=65536      # 64K
 LAT_MSG_SIZE=2      # bytes (small message for latency)
 IB_PORT=18515       # base port for ib_write_bw / ib_write_lat
@@ -28,7 +47,17 @@ MESH_PARALLEL=8     # max concurrent pair probes for mesh tests
 MESH_CLI_TIMEOUT=3  # per-pair client timeout (s); unreachable pair -> fail
 MESH_SRV_TIMEOUT=6  # per-pair server timeout (s); must exceed client timeout
 MESH_SRV_WAIT_REMOTE=0.5  # wait (s) for ssh-launched remote server to bind (master is warm)
+MESH_SRV_WAIT_LOCAL=0.5   # same, for a server started locally (no ssh round trip)
 MESH_RETRIES=2      # extra attempts for a pair when the server wasn't ready (anti false-negative)
+# GPU-memory runs pay a HIP init per process (~1s idle, considerably more with
+# tens of pairs contending), on top of the RDMA setup a host-memory run does.
+# The host-memory timeouts are too tight for that, so scale them in GPU mode --
+# otherwise every pair times out and gets reported as an unreachable NIC.
+MESH_GPU_TIME_SCALE=4
+_MESH_CLI_TIMEOUT0=$MESH_CLI_TIMEOUT
+_MESH_SRV_TIMEOUT0=$MESH_SRV_TIMEOUT
+_MESH_SRV_WAIT_LOCAL0=$MESH_SRV_WAIT_LOCAL
+_MESH_SRV_WAIT_REMOTE0=$MESH_SRV_WAIT_REMOTE
 MORI_RDMA_SL=0      # overwritten by check_qos()
 MORI_RDMA_TC=0      # overwritten by check_qos()
 
@@ -41,40 +70,132 @@ YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+# Aggregate verdict. log_fail is the single choke point for "a check found
+# something wrong", so counting here gives the script an exit status without
+# auditing thirty call sites. Until now it exited 0 no matter how many [FAIL]
+# lines it printed, which made it unusable as a gate: CI could run it and always
+# go green. die() still exits 1 immediately for fatal prerequisites.
+# A plain variable is enough -- every log_fail runs in the main shell. The
+# parallel niccli and mesh work writes to temp files and reports after `wait`,
+# so no increment happens in a subshell where it would be lost.
+FAIL_COUNT=0
+
 step()      { STEP=$((STEP + 1)); echo ""; echo -e "${CYAN}=== Step $STEP: $* ===${NC}"; }
 log_ok()    { echo -e "${GREEN}[OK]${NC}   $*"; }
-log_fail()  { echo -e "${RED}[FAIL]${NC} $*"; }
+log_fail()  { FAIL_COUNT=$((FAIL_COUNT + 1)); echo -e "${RED}[FAIL]${NC} $*"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_skip()  { echo -e "${YELLOW}[SKIP]${NC} $*"; }
 
 die() { log_fail "$@"; exit 1; }
 
+# ============================ arguments =========================
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [options] [peer_ip]
+
+  peer_ip                 run the inter-node bandwidth/latency checks against
+                          this host as well (steps 5 and 6). Local-only if omitted.
+
+Options:
+  --install-perftest      build perftest from $PERFTEST_REPO into
+                          \$MORI_PERFTEST_PREFIX (default $MORI_PERFTEST_PREFIX)
+                          if it is not already available. Off by default: a
+                          check should not silently compile software.
+  --no-gpu-mem            run the bandwidth/latency mesh on host memory instead
+                          of GPU memory. The mesh uses GPU memory by default,
+                          since that is the path MORI actually transfers over.
+  -h, --help              show this help
+
+Environment:
+  MORI_PERFTEST_PREFIX    where to find/install perftest (searched before \$PATH)
+  ROCM_PATH               ROCm install used to build perftest (default /opt/rocm)
+  SSH_USER                user for peer access (default \$SUDO_USER, else \$(whoami))
+
+Exit status:
+  0   every check passed, or was skipped for a missing tool
+  1   at least one check FAILed, or a fatal prerequisite was missing
+
+  A skipped check is not a failure: a missing perftest or nicctl leaves the
+  status at 0, since the check could not run rather than having found a fault.
+EOF
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --install-perftest) INSTALL_PERFTEST=true ;;
+            --no-gpu-mem)       USE_GPU_MEM=false ;;
+            -h|--help)          usage; exit 0 ;;
+            -*)                 usage >&2; die "unknown option: $1" ;;
+            *)
+                [[ -z "$PEER_IP" ]] || { usage >&2; die "unexpected extra argument: $1"; }
+                PEER_IP="$1"
+                ;;
+        esac
+        shift
+    done
+}
+parse_args "$@"
+
 require_cmd() {
     command -v "$1" > /dev/null 2>&1 || die "$1 not found. Please install it first."
 }
 
-# report_driver_version <kernel_module>
-#   Compares on-disk (modinfo) vs loaded (/sys/module or lsmod) version of a
-#   kernel module and logs ok/warn/fail accordingly. Shared by any vendor
-#   check that needs a "driver version sane?" line (bnxt_re/bnxt_en, mlx5_core).
-report_driver_version() {
-    local m="$1" disk_ver load_ver
-    disk_ver=$(modinfo -F version "$m" 2>/dev/null || true)
-    if [[ -r "/sys/module/$m/version" ]]; then
-        load_ver=$(cat "/sys/module/$m/version")
-    elif lsmod | awk '{print $1}' | grep -qx "$m"; then
-        load_ver="(loaded, no version node)"
+# module_state <kernel_module>
+#   Echoes one of: built-in | loaded | absent.
+#   `lsmod` alone is not enough to answer "is this driver active?": a driver
+#   compiled into the kernel never appears there (nor in /proc/modules), yet it
+#   is very much loaded. Treating that as absent produces a false FAIL on a
+#   perfectly healthy host.
+module_state() {
+    local m="$1"
+    # For a built-in, `modinfo -F <field>` prints "name: <mod>" followed by
+    # "(builtin)" regardless of the field asked for -- so the filename field is
+    # the reliable discriminator, and `-F version` cannot be trusted (see below).
+    if [[ "$(modinfo -F filename "$m" 2>/dev/null)" == *"(builtin)"* ]]; then
+        echo "built-in"
+    elif [[ -d "/sys/module/$m" ]]; then
+        echo "loaded"
     else
-        load_ver="(not loaded)"
+        echo "absent"
     fi
-    if [[ "${load_ver:0:1}" != "(" ]]; then
-        log_ok "$m driver : $load_ver"
+}
+
+# report_driver_version <kernel_module>
+#   Reports a kernel driver's version and logs ok/warn/fail. Shared by any
+#   vendor check that needs a "driver version sane?" line (bnxt_re/bnxt_en,
+#   mlx5_core, mlx5_ib).
+#
+#   Three states are kept distinct, because collapsing the last two into
+#   "not loaded" is a false FAIL:
+#     - absent                -> fail
+#     - active, version known -> ok (+ warn if on-disk and loaded disagree)
+#     - active, no version    -> ok; plenty of in-tree drivers (bnxt_re among
+#                                them) simply export no version anywhere.
+report_driver_version() {
+    local m="$1" state disk_ver="" load_ver=""
+    state=$(module_state "$m")
+
+    if [[ "$state" == "absent" ]]; then
+        log_fail "$m : not loaded"; return 1
+    fi
+
+    [[ -r "/sys/module/$m/version" ]] && load_ver=$(cat "/sys/module/$m/version")
+    # Only meaningful for a real .ko; for a built-in this returns the bogus
+    # "name: <mod>" string described above, so don't even ask.
+    [[ "$state" != "built-in" ]] && disk_ver=$(modinfo -F version "$m" 2>/dev/null || true)
+
+    if [[ -n "$load_ver" ]]; then
+        log_ok "$m driver : $load_ver ($state)"
         [[ -n "$disk_ver" && "$disk_ver" != "$load_ver" ]] \
             && log_warn "$m on-disk ($disk_ver) differs from loaded ($load_ver) — reboot needed?"
+    elif [[ -n "$disk_ver" ]]; then
+        log_ok "$m driver (on-disk) : $disk_ver ($state)"
     else
-        [[ -n "$disk_ver" ]] && log_ok "$m driver (on-disk) : $disk_ver" \
-                             || log_fail "$m : not installed"
+        log_ok "$m driver : $state (exports no version)"
     fi
+    return 0
 }
 
 # report_uniform <label> <value...>
@@ -145,6 +266,101 @@ query_rdma_devices() {
     fi
 }
 
+# Self-contained snippet printing "<dev> <state> <phys_state> <link_layer>" for
+# every local IB device. `state` reads as "4: ACTIVE" and phys_state as
+# "5: LinkUp", hence the cut on the second space-separated field. Like the other
+# snippets here it is embedded in a single-quoted ssh command line, so it must
+# stay free of single quotes.
+_LINK_STATE_SNIPPET='for d in /sys/class/infiniband/*; do
+[ -d "$d" ] || continue; n=${d##*/}; p="$d/ports/1";
+s=$(cut -d" " -f2 "$p/state" 2>/dev/null); y=$(cut -d" " -f2 "$p/phys_state" 2>/dev/null);
+l=$(cat "$p/link_layer" 2>/dev/null);
+echo "$n ${s:-unknown} ${y:-unknown} ${l:-unknown}"; done'
+
+# query_link_states <assoc_name> [host]
+#   fills the named assoc array: dev -> "<state> <phys_state> <link_layer>".
+#   One round trip for all devices, not one per device.
+#   The nameref is __qls_st, not _st: bash rejects `local -n x="x"` as a circular
+#   reference, and a caller naturally wants to name its own array _st. That
+#   failure is silent -- the array stays empty and every device looks unknown --
+#   so keep this name distinct from anything a caller would pick.
+query_link_states() {
+    local -n __qls_st="$1"; local host="${2:-}" out n s y l
+    if [[ -z "$host" || "$host" == "localhost" || "$host" == "127.0.0.1" ]]; then
+        out=$(bash -c "$_LINK_STATE_SNIPPET" 2>/dev/null)
+    else
+        out=$("${SSH_PREFIX[@]}" ssh $SSH_OPTS "$SSH_USER@$host" \
+              "echo __LNK__; bash -c '$_LINK_STATE_SNIPPET'" 2>/dev/null \
+              | sed -n '/^__LNK__$/,$p' | tail -n +2)
+    fi
+    while read -r n s y l; do
+        [[ -n "$n" ]] && __qls_st["$n"]="$s $y $l"
+    done <<< "$out"
+}
+
+# filter_fabric_devs <out_array_name> <host> <dev...>
+#   Keeps only the devices that can actually carry mesh traffic. ibv_devices
+#   already excludes non-RDMA interfaces, but says nothing about whether a port
+#   is up: a DOWN port still entered the mesh and contributed a whole row and
+#   column of ✗, inflating the "N/M reachable" warning on a host where every
+#   live rail worked. Step 1 computes the same liveness and then discards it.
+#
+#   Every exclusion is reported. Shrinking the mesh silently would turn a dead
+#   fabric NIC into a clean-looking matrix covering fewer pairs than the reader
+#   assumes -- the opposite failure, and the harder one to notice.
+#
+#   Not covered: a NIC that is ACTIVE but not on the fabric (a management port
+#   of the same vendor). No sysfs field distinguishes it; that needs the subnet
+#   reasoning in intra_reachable(), deliberately left out here.
+filter_fabric_devs() {
+    local -n _out="$1"; local host="$2"; shift 2
+    local -A _st=(); query_link_states _st "$host"
+    local where="local"; [[ -n "$host" ]] && where="$host"
+    local d state phys link
+    local -a alive=()
+
+    for d in "$@"; do
+        # No sysfs row for it: keep it. An actual mesh probe is a better
+        # authority than a file we could not read.
+        [[ -n "${_st[$d]:-}" ]] || { alive+=("$d"); continue; }
+        read -r state phys link <<< "${_st[$d]}"
+        if [[ "$state" != "ACTIVE" ]]; then
+            log_warn "$d ($where) excluded from mesh: port state=$state"; continue
+        fi
+        if [[ "$phys" != "LinkUp" && "$phys" != "unknown" ]]; then
+            log_warn "$d ($where) excluded from mesh: phys_state=$phys"; continue
+        fi
+        alive+=("$d")
+    done
+
+    # ib_write_bw cannot pair an InfiniBand port with a RoCE one, so keep the
+    # majority link layer and drop the rest rather than filling the matrix with
+    # pairs that were never going to work.
+    local -A _ll=(); local -a _ll_order=(); local best="" bc=0
+    for d in "${alive[@]}"; do
+        read -r state phys link <<< "${_st[$d]:-unknown unknown unknown}"
+        [[ -n "${_ll[$link]:-}" ]] || _ll_order+=("$link")
+        _ll["$link"]=$(( ${_ll[$link]:-0} + 1 ))
+    done
+    # First-seen order with a strict >, so a tie goes to whichever link layer
+    # appeared first in the caller's device list. Iterating "${!_ll[@]}" would
+    # decide ties in bash hash order: on a 1-1 split the winner flips between
+    # runs, and the run that picks InfiniBand drops every RoCE fabric NIC.
+    for link in "${_ll_order[@]}"; do
+        (( ${_ll[$link]} > bc )) && { bc=${_ll[$link]}; best="$link"; }
+    done
+
+    _out=()
+    for d in "${alive[@]}"; do
+        read -r state phys link <<< "${_st[$d]:-unknown unknown unknown}"
+        if [[ -n "$best" && "$link" != "unknown" && "$link" != "$best" ]]; then
+            log_warn "$d ($where) excluded from mesh: link_layer=$link, mesh is $best"
+            continue
+        fi
+        _out+=("$d")
+    done
+}
+
 # Self-contained snippet ($1=ib device) that prints the best GID index for that
 # device, mirroring MORI's ScoreGidCandidate (rdma.cpp): RoCEv2 (+1000) over
 # RoCEv1 (+500); IPv4-mapped (+200) over global IPv6 (+100) over link-local (+0);
@@ -196,6 +412,641 @@ build_gid_map() {
     rm -rf "$tmpd"
 }
 
+# ================== perftest: resolve / gpu pairing =============
+
+# NOTE for every snippet below: it is embedded into an ssh command line wrapped
+# in single quotes, so it must not itself contain a single quote (that includes
+# apostrophes in comments -- hence none here).
+
+# Echo an absolute path to <tool>, or nothing. Absolute matters: the mesh server
+# leg runs over non-interactive ssh, whose PATH is a bare
+# /usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin -- a bare tool name can never
+# resolve there even when the local shell finds it fine.
+#
+# $MORI_PERFTEST_PREFIX wins over $PATH. Distros ship a perftest built without
+# ROCm, and it sits on PATH: searching PATH first means --install-perftest builds
+# a ROCm-capable binary that is then never used, and the GPU pass is skipped
+# advising the reader to run --install-perftest, which they just did. The prefix
+# is only populated deliberately, so treat it as the stronger signal.
+_PERFTEST_RESOLVE_SNIPPET='t="$1"; p="$2";
+if [ -x "$p/bin/$t" ]; then echo "$p/bin/$t";
+else c=$(command -v "$t" 2>/dev/null); if [ -n "$c" ]; then readlink -f "$c"; fi; fi'
+
+# Pair every RDMA device with its PCIe-closest GPU, printing "<ib_dev> <hip_id>"
+# per line. Mirrors the ordering MORI itself uses in MatchGpuAndNic
+# (src/application/topology/system.cpp): NUMA locality first, then PCIe
+# proximity. Proximity is approximated by how many leading components two
+# devices share in their /sys/devices PCI path, which is a direct stand-in for
+# PCIe hop count and needs no libpci.
+#
+# HIP device i is the i-th KFD topology node (ascending numeric order) whose
+# gpu_id is non-zero -- gpu_id is its own file, not a line in properties, and
+# the zero ones are CPU nodes. Verified against rocm-smi --showbus.
+_GPU_PAIR_SNIPPET='kfd=/sys/class/kfd/kfd/topology/nodes;
+[ -d "$kfd" ] || exit 0;
+gbdf=(); gnuma=(); n=0;
+for d in $(ls "$kfd" 2>/dev/null | sort -n); do
+  gid=$(cat "$kfd/$d/gpu_id" 2>/dev/null);
+  [ -z "$gid" ] || [ "$gid" = "0" ] && continue;
+  loc=""; dom="";
+  while read -r k v _; do
+    [ "$k" = "location_id" ] && loc="$v";
+    [ "$k" = "domain" ] && dom="$v";
+  done < "$kfd/$d/properties";
+  [ -z "$loc" ] && continue;
+  [ -z "$dom" ] && dom=0;
+  bdf=$(printf "%04x:%02x:%02x.%d" "$dom" $(( (loc>>8)&255 )) $(( (loc>>3)&31 )) $(( loc&7 )));
+  [ -d "/sys/bus/pci/devices/$bdf" ] || continue;
+  gbdf[$n]="$bdf";
+  gnuma[$n]=$(cat "/sys/bus/pci/devices/$bdf/numa_node" 2>/dev/null);
+  n=$((n+1));
+done;
+[ "$n" -eq 0 ] && exit 0;
+for nd in /sys/class/infiniband/*; do
+  [ -e "$nd" ] || continue;
+  dev=$(basename "$nd");
+  nb=$(basename "$(readlink -f "$nd/device" 2>/dev/null)" 2>/dev/null);
+  [ -d "/sys/bus/pci/devices/$nb" ] || continue;
+  np=$(readlink -f "/sys/bus/pci/devices/$nb" 2>/dev/null);
+  nn=$(cat "/sys/bus/pci/devices/$nb/numa_node" 2>/dev/null);
+  IFS=/ read -ra pa <<< "$np";
+  best=-1; bs=-1; g=0;
+  while [ "$g" -lt "$n" ]; do
+    gp=$(readlink -f "/sys/bus/pci/devices/${gbdf[$g]}" 2>/dev/null);
+    IFS=/ read -ra pb <<< "$gp";
+    s=0; k=0;
+    while [ "$k" -lt "${#pa[@]}" ] && [ "$k" -lt "${#pb[@]}" ]; do
+      [ "${pa[$k]}" = "${pb[$k]}" ] || break;
+      s=$((s+1)); k=$((k+1));
+    done;
+    if [ -n "$nn" ] && [ "$nn" != "-1" ] && [ "${gnuma[$g]}" = "$nn" ]; then s=$((s+100)); fi;
+    if [ "$s" -gt "$bs" ]; then bs="$s"; best="$g"; fi;
+    g=$((g+1));
+  done;
+  [ "$best" -ge 0 ] && echo "$dev $best";
+done'
+
+# resolve_perftest <tool> [host]  -> absolute path, or empty if not found.
+#   Search order: $MORI_PERFTEST_PREFIX/bin, then $PATH -- the prefix is only
+#   ever populated deliberately, so it outranks a distro perftest on $PATH
+#   that was built without ROCm support. Resolved per host,
+#   since a peer may have it installed somewhere else.
+resolve_perftest() {
+    local tool="$1" host="${2:-}"
+    if [[ -z "$host" || "$host" == "localhost" || "$host" == "127.0.0.1" ]]; then
+        bash -c "$_PERFTEST_RESOLVE_SNIPPET" _ "$tool" "$MORI_PERFTEST_PREFIX" 2>/dev/null
+    else
+        "${SSH_PREFIX[@]}" ssh $SSH_OPTS "$SSH_USER@$host" \
+            "echo __BIN__; bash -c '$_PERFTEST_RESOLVE_SNIPPET' _ $tool '$MORI_PERFTEST_PREFIX'" 2>/dev/null \
+            | sed -n '/^__BIN__$/,$p' | sed -n '2p'
+    fi
+}
+
+# perftest_has_rocm <abs_bin> [host]
+#   True if the binary was built with ROCm support. Probe the help text, not the
+#   exit status: a non-ROCm build given --use_rocm prints "Unsupported memory
+#   type" but its exit code is easily masked in a pipeline.
+perftest_has_rocm() {
+    local bin="$1" host="${2:-}" help=""
+    [[ -n "$bin" ]] || return 1
+    # Capture first, match second. perftest exits non-zero from --help, and this
+    # script runs under `set -o pipefail`, so piping --help straight into grep
+    # reports "no ROCm support" even when the binary clearly has it.
+    if [[ -z "$host" || "$host" == "localhost" || "$host" == "127.0.0.1" ]]; then
+        help=$("$bin" --help 2>&1 || true)
+    else
+        help=$("${SSH_PREFIX[@]}" ssh $SSH_OPTS "$SSH_USER@$host" \
+               "$bin --help 2>&1 || true" 2>/dev/null)
+    fi
+    grep -q -- '--use_rocm' <<<"$help"
+}
+
+# perftest_has_rocm_dmabuf <abs_bin> [host]
+#   True if the binary was also built with --enable-rocm-dmabuf. perftest only
+#   advertises --use_rocm_dmabuf in --help when that build option was on.
+perftest_has_rocm_dmabuf() {
+    local bin="$1" host="${2:-}" help=""
+    [[ -n "$bin" ]] || return 1
+    if [[ -z "$host" || "$host" == "localhost" || "$host" == "127.0.0.1" ]]; then
+        help=$("$bin" --help 2>&1 || true)
+    else
+        help=$("${SSH_PREFIX[@]}" ssh $SSH_OPTS "$SSH_USER@$host" \
+               "$bin --help 2>&1 || true" 2>/dev/null)
+    fi
+    grep -q -- '--use_rocm_dmabuf' <<<"$help"
+}
+
+# probe_gpu_mem_mode <dev> <hip_id>
+#   Works out how perftest can actually reach GPU memory, by trying it rather
+#   than inferring it, and sets MESH_GPU_MODE / MESH_GPU_DMABUF. Returns 1 if
+#   neither path works.
+#
+#   --use_rocm alone does hipMalloc + ordinary ibv_reg_mr, which needs a
+#   peer-memory client in the kernel; --use_rocm_dmabuf registers via
+#   ibv_reg_dmabuf_mr instead and needs none. Which one is available cannot be
+#   detected reliably: /sys/kernel/mm/memory_peers is a Mellanox-OFED artefact
+#   that the in-tree AMD peer-memory client never creates (amdgpu registers
+#   through ib_uverbs with no sysfs trace), and /proc/kallsyms is routinely
+#   restricted inside containers. One tiny loopback transfer settles it.
+#
+#   Sets globals rather than echoing: a $(...) capture would run this in a
+#   subshell and throw the result away.
+probe_gpu_mem_mode() {
+    local dev="$1" gpu="$2" gid port=$(( IB_PORT + 900 )) variant
+    local prefer="${3:-peer_mem}"   # which registration path to try first
+    MESH_GPU_MODE=""; MESH_GPU_DMABUF=""
+    gid=$(gid_index "$dev" "")
+    # This loopback proves a mode on THIS host only. peer_mem needs a kernel
+    # peer-memory client that a heterogeneous peer may lack, so a local pass
+    # does not generalize; dma-buf registers via ibv_reg_dmabuf_mr with no such
+    # client and is symmetric. When a peer is in play we therefore try dma-buf
+    # first (prefer="dma-buf"): picking a locally-proven peer_mem the remote
+    # cannot use would flag every otherwise-valid GPU pair as a failure.
+    local order="peer_mem dma-buf"
+    [[ "$prefer" == "dma-buf" ]] && order="dma-buf peer_mem"
+    for variant in $order; do
+        local extra=""
+        if [[ "$variant" == "dma-buf" ]]; then
+            [[ -n "$MESH_GPU_DMABUF_OK" ]] || continue
+            extra=" --use_rocm_dmabuf"
+        fi
+        local args="-d $dev -p $port -x $gid -s 4096 -n 5 --use_rocm=$gpu$extra"
+        local sp rc=0
+        timeout "$MESH_SRV_TIMEOUT" $MESH_CLI_BIN $args &>/dev/null &
+        sp=$!
+        sleep "$MESH_SRV_WAIT_LOCAL"
+        timeout "$MESH_CLI_TIMEOUT" $MESH_CLI_BIN $args localhost &>/dev/null || rc=$?
+        kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
+        port=$(( port + 1 ))
+        if (( rc == 0 )); then
+            MESH_GPU_MODE="$variant"
+            [[ "$variant" == "dma-buf" ]] && MESH_GPU_DMABUF=1
+            return 0
+        fi
+    done
+    return 1
+}
+
+# build_gpu_map <assoc_name> [host]
+#   Fills the named assoc array: ib_dev -> HIP device id. One round trip per
+#   host (not per device pair), so calling it per mesh step is cheap.
+build_gpu_map() {
+    local -n _g="$1"; local host="${2:-}" out dev gid
+    if [[ -z "$host" || "$host" == "localhost" || "$host" == "127.0.0.1" ]]; then
+        out=$(bash -c "$_GPU_PAIR_SNIPPET" 2>/dev/null)
+    else
+        # Same login-banner sentinel guard as query_rdma_devices.
+        out=$("${SSH_PREFIX[@]}" ssh $SSH_OPTS "$SSH_USER@$host" \
+              "echo __GPU__; bash -c '$_GPU_PAIR_SNIPPET'" 2>/dev/null \
+              | sed -n '/^__GPU__$/,$p' | tail -n +2)
+    fi
+    [[ -n "$out" ]] || return 1
+    while read -r dev gid; do
+        [[ -n "$dev" && -n "$gid" ]] && _g["$dev"]="$gid"
+    done <<< "$out"
+    (( ${#_g[@]} > 0 ))
+}
+
+# install_perftest -- only ever called via --install-perftest. A check should not
+# compile software as a side effect of being run.
+install_perftest() {
+    local prefix="$MORI_PERFTEST_PREFIX" rocm="${ROCM_PATH:-/opt/rocm}"
+    local missing=() c
+    for c in git autoconf automake libtoolize make gcc; do
+        command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+    done
+    [[ -d "$rocm" ]] || missing+=("rocm at $rocm (set ROCM_PATH)")
+    if (( ${#missing[@]} )); then
+        log_fail "cannot build perftest, missing: ${missing[*]}"
+        return 1
+    fi
+
+    local src; src=$(mktemp -d)
+    log_ok "building perftest from $PERFTEST_REPO into $prefix (this takes a few minutes)"
+    if ! git clone --depth 1 "$PERFTEST_REPO" "$src/perftest" >/dev/null 2>&1; then
+        log_fail "git clone $PERFTEST_REPO failed"; rm -rf "$src"; return 1
+    fi
+    # Try with dma-buf first: without it the check has no fallback when the
+    # kernel has no peer-memory client. Older kernels/ROCm lack the headers it
+    # needs, so drop back rather than failing the whole install.
+    (
+        cd "$src/perftest" || exit 1
+        ./autogen.sh || exit 1
+        if ! ./configure --enable-rocm --enable-rocm-dmabuf \
+                         --with-rocm="$rocm" --prefix="$prefix"; then
+            echo "=== configure with --enable-rocm-dmabuf failed, retrying without ==="
+            make distclean >/dev/null 2>&1 || true
+            ./configure --enable-rocm --with-rocm="$rocm" --prefix="$prefix" || exit 1
+        fi
+        make -j"$(nproc)" &&
+        make install
+    ) >"$src/build.log" 2>&1
+    local rc=$?
+    if (( rc != 0 )); then
+        log_fail "perftest build failed; build tree kept at $src for inspection"
+        log_fail "last lines of $src/build.log:"
+        tail -15 "$src/build.log" >&2
+        return 1
+    fi
+    rm -rf "$src"
+    log_ok "perftest installed into $prefix/bin"
+}
+
+perftest_hint() {
+    log_warn "  install with: $(basename "$0") --install-perftest"
+    log_warn "  or manually : git clone $PERFTEST_REPO && cd perftest && ./autogen.sh &&"
+    log_warn "                ./configure --enable-rocm --enable-rocm-dmabuf --with-rocm=${ROCM_PATH:-/opt/rocm} &&"
+    log_warn "                make -j && make install     (drop --enable-rocm-dmabuf if configure rejects it)"
+}
+
+# State shared with mesh_execute. Set by mesh_prepare, read in the pair loop.
+MESH_CLI_BIN=""          # absolute path to the client-side binary (this host)
+MESH_SRV_BIN=""          # absolute path to the server-side binary (may be remote)
+MESH_USE_GPU=""          # per-run toggle: non-empty => append --use_rocm
+MESH_GPU_READY=""        # non-empty => GPU memory is *available* (capability + maps)
+MESH_GPU_DMABUF_OK=""    # non-empty => binary was built with --enable-rocm-dmabuf
+MESH_GPU_DMABUF=""       # non-empty => reach GPU memory via dma-buf, not peer_mem
+MESH_GPU_MODE=""         # "peer_mem" | "dma-buf", as proven by probe_gpu_mem_mode
+declare -A MESH_RGPU=()  # row/client  ib_dev -> HIP id
+declare -A MESH_CGPU=()  # col/server  ib_dev -> HIP id
+
+# mesh_gpu_on / mesh_gpu_off
+#   Toggle GPU memory for the next mesh_execute. Only the GPU run needs the
+#   longer budget: each process pays a HIP init (~1s idle, more under contention)
+#   on top of the RDMA setup, which the host-memory timeouts are too tight for.
+mesh_gpu_on() {
+    MESH_USE_GPU=1
+    MESH_CLI_TIMEOUT=$(( _MESH_CLI_TIMEOUT0 * MESH_GPU_TIME_SCALE ))
+    MESH_SRV_TIMEOUT=$(( _MESH_SRV_TIMEOUT0 * MESH_GPU_TIME_SCALE ))
+    MESH_SRV_WAIT_LOCAL=$(awk "BEGIN{print $_MESH_SRV_WAIT_LOCAL0 * $MESH_GPU_TIME_SCALE}")
+    MESH_SRV_WAIT_REMOTE=$(awk "BEGIN{print $_MESH_SRV_WAIT_REMOTE0 * $MESH_GPU_TIME_SCALE}")
+}
+mesh_gpu_off() {
+    MESH_USE_GPU=""
+    MESH_CLI_TIMEOUT=$_MESH_CLI_TIMEOUT0
+    MESH_SRV_TIMEOUT=$_MESH_SRV_TIMEOUT0
+    MESH_SRV_WAIT_LOCAL=$_MESH_SRV_WAIT_LOCAL0
+    MESH_SRV_WAIT_REMOTE=$_MESH_SRV_WAIT_REMOTE0
+}
+
+# mesh_prepare <tool> [peer_host] [want_gpu]
+#   Resolves the binary on both sides and, when want_gpu is true, works out
+#   whether GPU memory is usable (setting MESH_GPU_READY). Returns 1 if the step
+#   cannot run at all (binary missing on either side), having already logged why.
+#   Every degrade path warns exactly once here rather than once per pair.
+#
+#   Runs always start on host memory; callers opt into GPU memory per run via
+#   mesh_gpu_on. Intra-node (step 4) passes want_gpu=false: it is a fabric
+#   reachability probe, and MORI moves data intra-node over XGMI, not RDMA.
+mesh_prepare() {
+    local tool="$1" peer="${2:-}" want_gpu="${3:-true}"
+    MESH_CLI_BIN=""; MESH_SRV_BIN=""; MESH_GPU_READY=""
+    MESH_GPU_DMABUF_OK=""; MESH_GPU_DMABUF=""; MESH_GPU_MODE=""
+    MESH_RGPU=(); MESH_CGPU=()
+    mesh_gpu_off
+
+    MESH_CLI_BIN=$(resolve_perftest "$tool")
+    if [[ -z "$MESH_CLI_BIN" ]]; then
+        log_warn "$tool not found (searched $MORI_PERFTEST_PREFIX/bin and \$PATH), skipping"
+        perftest_hint; return 1
+    fi
+    if [[ -n "$peer" ]]; then
+        # Resolve on the peer too. Previously only the local side was checked, so a
+        # peer without perftest showed up as every pair being unreachable.
+        MESH_SRV_BIN=$(resolve_perftest "$tool" "$peer")
+        if [[ -z "$MESH_SRV_BIN" ]]; then
+            log_warn "$tool not found on $peer (searched $MORI_PERFTEST_PREFIX/bin and \$PATH), skipping"
+            perftest_hint; return 1
+        fi
+    else
+        MESH_SRV_BIN="$MESH_CLI_BIN"
+    fi
+
+    [[ "$want_gpu" == "true" && "$USE_GPU_MEM" == "true" ]] || return 0
+
+    # _GPU_PAIR_SNIPPET numbers GPUs by KFD topology node (every physical GPU),
+    # but perftest reads --use_rocm=<id> in the process-visible HIP ordinal
+    # space. If HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES restricts or reorders
+    # the set, those two numbering schemes diverge and the ids select the wrong
+    # GPU or run out of range -- false failures. Clear the filter for the probe
+    # so the two agree; a diagnostic wants every rail anyway, not a subset.
+    if [[ -n "${HIP_VISIBLE_DEVICES:-}${ROCR_VISIBLE_DEVICES:-}${CUDA_VISIBLE_DEVICES:-}" ]]; then
+        log_warn "clearing HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES for the GPU-memory pass (KFD ordinals must match HIP's)"
+        unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
+    fi
+
+    # Both ends must agree on memory type, so a one-sided capability is useless.
+    local rocm_ok=true
+    perftest_has_rocm "$MESH_CLI_BIN" || rocm_ok=false
+    if [[ "$rocm_ok" == "true" && -n "$peer" ]]; then
+        perftest_has_rocm "$MESH_SRV_BIN" "$peer" || rocm_ok=false
+    fi
+    if [[ "$rocm_ok" != "true" ]]; then
+        log_warn "perftest lacks ROCm support -- skipping the GPU-memory pass"
+        perftest_hint; return 0
+    fi
+
+    if ! build_gpu_map MESH_RGPU; then
+        log_warn "no GPUs found via KFD topology -- skipping the GPU-memory pass"
+        return 0
+    fi
+    if [[ -n "$peer" ]] && ! build_gpu_map MESH_CGPU "$peer"; then
+        log_warn "no GPUs found on $peer -- skipping the GPU-memory pass"
+        MESH_RGPU=(); return 0
+    fi
+
+    # How to reach GPU memory: peer_mem if it works, dma-buf otherwise.
+    perftest_has_rocm_dmabuf "$MESH_CLI_BIN" && MESH_GPU_DMABUF_OK=1
+    if [[ -n "$peer" && -n "$MESH_GPU_DMABUF_OK" ]] && \
+       ! perftest_has_rocm_dmabuf "$MESH_SRV_BIN" "$peer"; then
+        MESH_GPU_DMABUF_OK=""   # both ends must agree on the registration path
+    fi
+    # Probe with a NIC the mesh actually tests. MESH_RGPU covers every device
+    # under /sys/class/infiniband, which on a mixed host includes management
+    # NICs carrying no RDMA traffic; iterating ${!assoc[@]} picks one in bash
+    # hash order, so the loopback could fail on an untested NIC and skip the
+    # whole GPU pass on a host where every rail works.
+    local pdev="" pgpu="" _d
+    for _d in "${LOCAL_DEVS[@]}"; do
+        if [[ -n "${MESH_RGPU[$_d]:-}" ]]; then pdev="$_d"; pgpu="${MESH_RGPU[$_d]}"; break; fi
+    done
+    if [[ -z "$pdev" ]]; then
+        log_warn "none of the tested NICs has a paired GPU -- skipping the GPU-memory pass"
+        MESH_RGPU=(); MESH_CGPU=(); return 0
+    fi
+    # Against a peer, prefer the symmetric dma-buf path when both ends support
+    # it: a local peer_mem pass says nothing about whether the remote can use
+    # it (see probe_gpu_mem_mode). Solo runs keep the peer_mem-first default.
+    local gpu_mode_pref="peer_mem"
+    [[ -n "$peer" && -n "$MESH_GPU_DMABUF_OK" ]] && gpu_mode_pref="dma-buf"
+    mesh_gpu_on                 # probe under the GPU timeout budget (HIP init)
+    if ! probe_gpu_mem_mode "$pdev" "$pgpu" "$gpu_mode_pref"; then
+        mesh_gpu_off
+        # A ROCm-capable perftest and a paired GPU are both present, so this is
+        # not a missing prerequisite we can skip past: the GPUDirect path this
+        # check exists to validate is genuinely unusable. Fail rather than warn,
+        # or `mori check` goes green on a host where GPU transfers cannot run.
+        if [[ -n "$MESH_GPU_DMABUF_OK" ]]; then
+            log_fail "GPU memory unreachable via peer_mem or dma-buf -- GPUDirect RDMA unusable"
+        else
+            log_fail "GPU memory unreachable via peer_mem, and this perftest has no dma-buf support"
+            log_warn "  rebuild with --enable-rocm-dmabuf (or rerun with --install-perftest)"
+        fi
+        MESH_RGPU=(); MESH_CGPU=(); return 0
+    fi
+    mesh_gpu_off
+    if [[ "$MESH_GPU_MODE" == "dma-buf" ]]; then
+        log_warn "peer_mem unavailable -- using dma-buf (ibv_reg_dmabuf_mr) for GPU memory"
+    fi
+    MESH_GPU_READY=1
+    return 0
+}
+
+# Fabric topology, derived from the inter-node host-memory mesh. Set by
+# assess_fabric_topology() and reported once at the end of the run, because it
+# is a property of the cluster rather than of any single step.
+FABRIC_TOPOLOGY=""      # "" (unknown) | rail-only | partial | full
+FABRIC_TOPO_DETAIL=""
+
+# assess_fabric_topology <cell_assoc> <nrows> <ncols>
+#   Classify the fabric from which cells carried traffic. On a rail-only cluster
+#   NIC i reaches only NIC i on the peer, so the mesh is diagonal: that is the
+#   expected shape there, not a fault, and mesh_report already declines to fail
+#   on it. What it cannot do is tell the reader what the shape *means* for MORI.
+assess_fabric_topology() {
+    local -n _c="$1"; local nr="$2" nc="$3"
+    local i j n=$nr diag_ok=0 off_ok=0 off_total=0
+    (( nc < n )) && n=$nc
+    (( n > 0 )) || return 0
+    for (( i=0; i<nr; i++ )); do
+        for (( j=0; j<nc; j++ )); do
+            if (( i == j )); then
+                [[ "${_c[$i,$j]:-x}" =~ ^[0-9.]+$ ]] && diag_ok=$(( diag_ok + 1 ))
+            else
+                off_total=$(( off_total + 1 ))
+                [[ "${_c[$i,$j]:-x}" =~ ^[0-9.]+$ ]] && off_ok=$(( off_ok + 1 ))
+            fi
+        done
+    done
+    (( off_total > 0 )) || return 0
+    if (( off_ok == 0 && diag_ok == 0 )); then
+        # Nothing carried traffic at all. Distinct from rail-only, which needs
+        # the rails to actually be up -- calling this "partially connected" would
+        # tell the reader some pairs work when none do.
+        FABRIC_TOPOLOGY="none"
+        FABRIC_TOPO_DETAIL="0/$n rails up, 0/$off_total cross-rail pairs reachable"
+    elif (( off_ok == 0 && diag_ok > 0 )); then
+        FABRIC_TOPOLOGY="rail-only"
+        FABRIC_TOPO_DETAIL="$diag_ok/$n rails up, 0/$off_total cross-rail pairs reachable"
+    elif (( off_ok == off_total )); then
+        FABRIC_TOPOLOGY="full"
+        FABRIC_TOPO_DETAIL="all $off_total cross-rail pairs reachable"
+    else
+        FABRIC_TOPOLOGY="partial"
+        FABRIC_TOPO_DETAIL="$diag_ok/$n rails up, $off_ok/$off_total cross-rail pairs reachable"
+    fi
+}
+
+# report_fabric_topology
+#   One line at the end of the run. MORI-EP v1 does not support a rail-only
+#   fabric today, and that is invisible in the per-step output: every step
+#   passes, because a rail-only fabric is not broken -- it just is not what
+#   MORI-EP v1 needs. A WARN, not a FAIL: the check reports what the fabric is,
+#   and whether that suits a given consumer is a fact about the consumer.
+report_fabric_topology() {
+    [[ -n "$FABRIC_TOPOLOGY" ]] || return 0
+    case "$FABRIC_TOPOLOGY" in
+        full)
+            # Say so rather than staying silent: a reader cannot tell "classified
+            # as fully routed" from "the classifier never ran", and this is the
+            # line that tells them MORI-EP has the paths it needs.
+            log_ok "fabric is fully routed ($FABRIC_TOPO_DETAIL) — MORI-EP v1 cross-rail paths present"
+            ;;
+        none)
+            # A completely dead fabric is a failure, not a topology note: no MORI
+            # cross-node workload can run. Fail so the script's exit status
+            # reflects it even when firmware/QoS pass (mesh_report only warns on
+            # unreachable pairs, so nothing else fails the run here).
+            log_fail "no inter-node RDMA path on any NIC pair ($FABRIC_TOPO_DETAIL)"
+            log_warn "  neither MORI-EP nor MORI-IO can run cross-node here. Step 5 shows the"
+            log_warn "  whole matrix failing, which is a fabric or QoS problem, not a topology."
+            ;;
+        rail-only)
+            log_warn "fabric looks rail-only ($FABRIC_TOPO_DETAIL)"
+            log_warn "  MORI-EP v1 does not support rail-only clusters currently: dispatch/combine"
+            log_warn "  sends cross-rail (NIC i -> NIC j), which has no path here. Rail-only"
+            log_warn "  support for the internode-v1 and v1_ll kernels is in progress."
+            log_warn "  MORI-IO with MORI_IO_RAIL_AFFINITY=1 stays on-rail and is expected to work."
+            ;;
+        partial)
+            log_warn "fabric is partially connected ($FABRIC_TOPO_DETAIL)"
+            log_warn "  neither a clean rail-only nor a fully routed fabric -- cross-rail traffic"
+            log_warn "  works for some NIC pairs and not others. Check the x cells in Step 5;"
+            log_warn "  MORI-EP v1 needs cross-rail paths and will fail on the missing ones."
+            ;;
+    esac
+}
+
+# gpu_mesh_check <tool> <peer> <row_arr> <col_arr> <rgid_assoc> <cgid_assoc>
+#                <host_cell_assoc> <label> <unit> <fmt>
+#   Full NxM GPU-memory mesh, mirroring the host-memory mesh that just ran.
+#   host_cell_assoc is that host matrix, keyed "<row>,<col>": a GPU failure only
+#   implicates GPUDirect if the same pair passed on host memory.
+#
+#   This used to probe the rail-aligned diagonal only, on the argument that the
+#   host mesh had already established reachability and GPU memory only needed to
+#   confirm the rails MORI transfers over. That assumed cross-NIC GPUDirect
+#   follows from the diagonal, which nothing verifies -- peer-memory registration
+#   and the ToR path are not the same question. The full mesh costs NxM HIP inits
+#   instead of N; that is the price of measuring it rather than assuming it.
+#   mesh_execute already keys the GPU per cell (MESH_RGPU[row] / MESH_CGPU[col]),
+#   so off-diagonal pairs use each side's own NIC-local GPU with no extra work.
+gpu_mesh_check() {
+    local tool="$1" peer="$2"
+    local -n _rr="$3" _cc="$4" _rg="$5" _cg="$6" _hc="$7"
+    local hc_name="$7"
+    local label="$8" unit="$9" fmt="${10}"
+
+    [[ -n "$MESH_GPU_READY" ]] || return 0
+    local nr=${#_rr[@]} nc=${#_cc[@]}
+    (( nr > 0 && nc > 0 )) || return 0
+    local n=$nr; (( nc < n )) && n=$nc
+
+    # Probe only what host memory already proved. A pair with no fabric path
+    # cannot say anything about GPUDirect, and re-probing it costs a full GPU
+    # timeout (MESH_CLI_TIMEOUT x MESH_GPU_TIME_SCALE) to rediscover Step 5's
+    # answer. On a rail-only cluster that is 56 of 64 pairs, ~84s of pure
+    # timeout. Gating also means every failure below genuinely implicates
+    # GPUDirect, so the verdict needs no "unless the fabric was already broken"
+    # caveat.
+    local i j gated=0 gated_off=0
+    for (( i=0; i<nr; i++ )); do
+        for (( j=0; j<nc; j++ )); do
+            if [[ "${_hc[$i,$j]:-x}" =~ ^[0-9.]+$ ]]; then
+                gated=$(( gated + 1 )); (( i != j )) && gated_off=$(( gated_off + 1 ))
+            fi
+        done
+    done
+    if (( gated == 0 )); then
+        log_warn "$label: no pair reachable on host memory, skipping the GPU-memory pass"
+        return 0
+    fi
+
+    # ---- Phase A: cross-rail coverage, concurrent ----------------------------
+    # Skipped when host memory only proved the diagonal (a rail-only fabric):
+    # Phase B covers those same pairs, and serially, so running both would just
+    # measure the diagonal twice.
+    if (( gated_off > 0 )); then
+        log_ok "$label: GPU-memory mesh over the $gated pair(s) reachable on host memory, via ${MESH_GPU_MODE:-unknown}, timeouts x$MESH_GPU_TIME_SCALE for HIP init"
+        mesh_gpu_on
+        local -A GCELL=()
+        mesh_execute GCELL "$tool" "$peer" false "$( [[ "$tool" == ib_write_bw ]] && echo 1000 )" \
+                     _rg _cg _rr _cc false "$hc_name"
+        mesh_gpu_off
+        mesh_report GCELL _rr _cc "$label GPU memory" "$unit" "$fmt" no
+
+        # Reachability only -- no threshold. Concurrent probes do not produce
+        # numbers worth judging: measured on cv350, the same healthy fabric
+        # flagged 10/64 then 6/64 pairs below BW_THRESHOLD across two runs, a
+        # different set each time, while reachability stayed 64/64. Contention
+        # moves the numbers, not the connectivity. Phase B does the judging.
+        local bad=0
+        for (( i=0; i<nr; i++ )); do
+            for (( j=0; j<nc; j++ )); do
+                [[ "${_hc[$i,$j]:-x}" =~ ^[0-9.]+$ ]] || continue
+                [[ "${GCELL[$i,$j]:-x}" =~ ^[0-9.]+$ ]] || bad=$(( bad + 1 ))
+            done
+        done
+        if (( bad == 0 )); then
+            log_ok "$label GPU memory: all $gated pair(s) reachable on GPU memory"
+        else
+            log_fail "$label GPU memory: $bad/$gated pair(s) reachable on host memory but not on GPU -- GPUDirect RDMA problem"
+            # The mode was proven by a loopback on THIS host only, so a peer
+            # missing the same registration path looks identical from here.
+            [[ -n "$peer" && "$MESH_GPU_MODE" == "peer_mem" ]] && \
+                log_warn "  $MESH_GPU_MODE was proven on this host only; a peer without it fails the same way"
+        fi
+    fi
+
+    # ---- Phase B: the numbers, serially --------------------------------------
+    # The rail-aligned pairs are what MORI actually transfers over, and these are
+    # the figures a user would quote, so they run one at a time: 8 rails at once
+    # oversubscribes the host badly enough that some land at a third of line rate
+    # (69a3027b). n probes at a few seconds each is a cheap price for numbers
+    # that mean something -- and unlike Phase A, these are worth judging.
+    #
+    # A rail is the reachable pair for local NIC i, not blindly local[i] <->
+    # remote[i]: if the two nodes enumerate their devices in different orders the
+    # physical rail is a permuted pair, and the diagonal would either skip a good
+    # rail (rail-only fabric) or measure a cross-rail pair as if it were on-rail
+    # (fully routed). So take the diagonal when it is reachable, else fall back to
+    # the single reachable pair in that row -- which on a rail-only fabric is the
+    # actual rail. When a row has several reachable pairs (fully routed) the
+    # diagonal is reachable too, so the ambiguous case never reaches the fallback.
+    local -a R=() C=(); local diag_gated=0
+    for (( i=0; i<${#_rr[@]}; i++ )); do
+        local jsel=-1
+        if [[ "${_hc[$i,$i]:-x}" =~ ^[0-9.]+$ ]]; then
+            jsel=$i
+        else
+            local jreach=-1 nreach=0 jj
+            for (( jj=0; jj<${#_cc[@]}; jj++ )); do
+                [[ "${_hc[$i,$jj]:-x}" =~ ^[0-9.]+$ ]] || continue
+                jreach=$jj; nreach=$(( nreach + 1 ))
+            done
+            (( nreach == 1 )) && jsel=$jreach
+        fi
+        (( jsel >= 0 )) || continue
+        R+=("${_rr[$i]}"); C+=("${_cc[$jsel]}"); diag_gated=$(( diag_gated + 1 ))
+    done
+    if (( diag_gated == 0 )); then
+        log_warn "$label GPU memory: no rail-aligned pair reachable on host memory, skipping the serial pass"
+        return 0
+    fi
+
+    log_ok "$label: GPU-memory serial pass over $diag_gated rail-aligned pair(s) for per-rail numbers"
+    local MESH_PARALLEL=1
+    mesh_gpu_on
+    local -A RCELL=()
+    mesh_execute RCELL "$tool" "$peer" false "$( [[ "$tool" == ib_write_bw ]] && echo 1000 )" \
+                 _rg _cg R C true
+    mesh_gpu_off
+
+    local thr dir
+    if [[ "$tool" == "ib_write_bw" ]]; then thr="$BW_THRESHOLD"; dir=min
+    else                                    thr="$LAT_THRESHOLD"; dir=max; fi
+
+    local ok=0 slow=0 dead=0 v gpu
+    for (( i=0; i<diag_gated; i++ )); do
+        v="${RCELL[$i,$i]:-x}"; gpu="${MESH_RGPU[${R[$i]}]:-?}"
+        if [[ "$v" =~ ^[0-9.]+$ ]]; then
+            if awk -v v="$v" -v t="$thr" -v d="$dir" \
+                   'BEGIN{exit !((d=="min" && v<t) || (d=="max" && v>t))}'; then
+                slow=$(( slow + 1 ))
+                printf "  %-12s <-> %-12s (gpu %s) : %s %s  <-- %s threshold %s %s\n" \
+                       "${R[$i]}" "${C[$i]}" "$gpu" "$v" "$unit" \
+                       "$( [[ $dir == min ]] && echo below || echo above )" "$thr" "$unit"
+            else
+                ok=$(( ok + 1 ))
+                printf "  %-12s <-> %-12s (gpu %s) : %s %s\n" "${R[$i]}" "${C[$i]}" "$gpu" "$v" "$unit"
+            fi
+        else
+            dead=$(( dead + 1 ))
+            printf "  %-12s <-> %-12s (gpu %s) : FAILED (host memory passed)\n" \
+                   "${R[$i]}" "${C[$i]}" "$gpu"
+        fi
+    done
+    if (( slow == 0 && dead == 0 )); then
+        log_ok "$label GPU memory: all $ok rail(s) passed (threshold $dir $thr $unit)"
+        return 0
+    fi
+    (( slow )) && log_fail \
+        "$label GPU memory: $slow/$diag_gated rail(s) completed but missed the $thr $unit threshold"
+    (( dead )) && log_fail \
+        "$label GPU memory: $dead/$diag_gated rail(s) passed on host memory but failed on GPU -- GPUDirect RDMA problem"
+    return 0
+}
+
 # nic_ipv4 <dev>   -> first IPv4 of the device's netdev (empty if none)
 nic_ipv4() {
     local dev="$1" nd
@@ -238,10 +1089,17 @@ intra_reachable() {
 mesh_execute() {
     local -n _cell="$1" _rgid="$6" _cgid="$7" _row="$8" _col="$9"
     local tool="$2" shost="$3" self_skip="$4" iters="$5"
+    local diag_only="${10:-false}"   # true => probe only row[i] <-> col[i]
+    # Optional: name of an assoc array keyed "<i>,<j>". When given, probe only
+    # the cells that hold a number there. Used to run the GPU pass over exactly
+    # the pairs host memory already proved, so a pair with no fabric path is not
+    # re-probed at the GPU timeout budget to learn what Step 5 already reported.
+    local gate_name="${11:-}"
     local nr=${#_row[@]} nc=${#_col[@]}
     local extra key col
     if [[ "$tool" == "ib_write_bw" ]]; then
         extra="-s $MSG_SIZE --report_gbits"; key="$MSG_SIZE"; col='$(NF-1)'
+        [[ "$BW_QP" -gt 1 ]] && extra="$extra -q $BW_QP"
     else
         extra="-s $LAT_MSG_SIZE"; key="$LAT_MSG_SIZE"; col='$6'
     fi
@@ -251,36 +1109,51 @@ mesh_execute() {
     local i j port running=0
     for (( i=0; i<nr; i++ )); do
         for (( j=0; j<nc; j++ )); do
-            if [[ "$self_skip" == "true" && "${_row[$i]}" == "${_col[$j]}" ]]; then
+            if [[ "$self_skip" == "true" && "${_row[$i]}" == "${_col[$j]}" ]] \
+               || [[ "$diag_only" == "true" && $i -ne $j ]]; then
                 printf -- '-' > "$tmpd/$i.$j"; continue
+            fi
+            if [[ -n "$gate_name" ]]; then
+                local _gk="${gate_name}[$i,$j]"
+                [[ "${!_gk:-x}" =~ ^[0-9.]+$ ]] || { printf -- '-' > "$tmpd/$i.$j"; continue; }
             fi
             port=$(( IB_PORT + i * nc + j ))   # unique per pair
             (
                 local is_local=false base_wait="$MESH_SRV_WAIT_REMOTE"
-                [[ "$shost" == "localhost" || "$shost" == "127.0.0.1" ]] && { is_local=true; base_wait=0.5; }
+                [[ "$shost" == "localhost" || "$shost" == "127.0.0.1" ]] && { is_local=true; base_wait="$MESH_SRV_WAIT_LOCAL"; }
                 local result="x" try sp out rc m tport sw
                 # Retry only transient "server not ready yet" races (client couldn't
                 # open the out-of-band socket because the server hadn't bound the port).
                 # A genuine unreachable pair connects on TCP but the RDMA QP never comes
                 # up -> the client hits its timeout (rc=124); those are NOT retried, so
                 # dead NICs don't waste attempts.
+                # GPU memory: each side binds the GPU paired with its own NIC, so
+                # the two ids normally differ. Empty when running on host memory.
+                local sgpu="" cgpu="" dmabuf=""
+                if [[ -n "$MESH_USE_GPU" ]]; then
+                    # --use_rocm_dmabuf modifies --use_rocm, it does not replace
+                    # it: the device id still comes from --use_rocm.
+                    [[ -n "$MESH_GPU_DMABUF" ]] && dmabuf=" --use_rocm_dmabuf"
+                    [[ -n "${MESH_CGPU[${_col[$j]}]:-}" ]] && sgpu=" --use_rocm=${MESH_CGPU[${_col[$j]}]}$dmabuf"
+                    [[ -n "${MESH_RGPU[${_row[$i]}]:-}" ]] && cgpu=" --use_rocm=${MESH_RGPU[${_row[$i]}]}$dmabuf"
+                fi
                 for (( try=0; try<=MESH_RETRIES; try++ )); do
                     tport=$(( port + try * nr * nc ))   # fresh port each try (old server may linger)
-                    local sa="-p $tport -x ${_cgid[${_col[$j]}]} --sl $MORI_RDMA_SL $extra"
-                    local ca="-p $tport -x ${_rgid[${_row[$i]}]} --sl $MORI_RDMA_SL $extra"
+                    local sa="-p $tport -x ${_cgid[${_col[$j]}]} --sl $MORI_RDMA_SL $extra$sgpu"
+                    local ca="-p $tport -x ${_rgid[${_row[$i]}]} --sl $MORI_RDMA_SL $extra$cgpu"
                     # Server is wrapped in `timeout` so an unreachable pair can never make
                     # `wait` block forever (no client ever connects -> server self-exits).
                     if $is_local; then
-                        timeout "$MESH_SRV_TIMEOUT" $tool -d "${_col[$j]}" $sa &>/dev/null &
+                        timeout "$MESH_SRV_TIMEOUT" $MESH_SRV_BIN -d "${_col[$j]}" $sa &>/dev/null &
                     else
                         "${SSH_PREFIX[@]}" ssh $SSH_OPTS "$SSH_USER@$shost" \
-                            "timeout $MESH_SRV_TIMEOUT $tool -d ${_col[$j]} $sa" &>/dev/null &
+                            "timeout $MESH_SRV_TIMEOUT $MESH_SRV_BIN -d ${_col[$j]} $sa" &>/dev/null &
                     fi
                     sp=$!
                     sw=$(awk "BEGIN{print $base_wait + $try*0.8}")   # wait longer on later tries
                     sleep "$sw"
                     rc=0
-                    out=$(timeout "$MESH_CLI_TIMEOUT" $tool -d "${_row[$i]}" $ca "$shost" 2>&1) || rc=$?
+                    out=$(timeout "$MESH_CLI_TIMEOUT" $MESH_CLI_BIN -d "${_row[$i]}" $ca "$shost" 2>&1) || rc=$?
                     kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
                     if (( rc == 0 )); then
                         m=$(echo "$out" | grep "^[[:space:]]*$key" | awk "{print $col}" | head -1)
@@ -339,7 +1212,15 @@ mesh_report() {
     done
 
     echo ""
-    echo "  $title $unit matrix"
+    # Qualify the numbers when they were measured concurrently. Up to
+    # MESH_PARALLEL pairs run at once, which moves the throughput a lot: the same
+    # healthy fabric measured 84-386 Gbps in one run and 243-386 in the next,
+    # against 345-387 serially. Reachability survives contention -- that is what
+    # the mesh is for, and nothing here judges the figures -- but a bare "Gbps
+    # matrix" invites the reader to quote them. Serial callers get no qualifier.
+    local qual=""
+    (( MESH_PARALLEL > 1 )) && qual="   (concurrent x$MESH_PARALLEL — reachability probe, not a benchmark)"
+    echo "  $title $unit matrix$qual"
     echo "$hdr"
     for (( i=0; i<nr; i++ )); do
         local row; row=$(printf "  %-10s" "$(echo "${_row[$i]}" | sed 's/bnxt_//')")
@@ -369,36 +1250,51 @@ version_ge() {
 }
 
 # check_ainic_version_recommendation <fw_version>
-#   warns if the AINIC firmware is on the IBGDA-incapable 1.117.1 branch, or
-#   below the recommended minimum for cross-node MORI (EP over RDMA / IBGDA).
+#   fails if the AINIC firmware is on the IBGDA-incapable 1.117.1 branch, or
+#   below the required minimum for cross-node MORI (EP over RDMA / IBGDA).
+#   Anything that is not a known-good version fails: the wrong firmware is a
+#   hard blocker for cross-node MORI, not an advisory. An *undetectable*
+#   version stays a warning -- that is a tooling gap, not a firmware verdict.
 check_ainic_version_recommendation() {
     local ver="$1"
-    [[ -n "$ver" ]] || { log_warn "cannot verify AINIC firmware version against recommendation (empty)"; return; }
+    [[ -n "$ver" ]] || { log_warn "cannot verify AINIC firmware version against requirement (empty)"; return; }
+    # Same reasoning as the Broadcom path: unparseable means undetectable.
+    [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || {
+        log_warn "cannot parse AINIC firmware version '$ver' against requirement"; return; }
     if [[ "$ver" =~ ^1\.117\.1([.-]|$) ]]; then
-        log_warn "AINIC firmware $ver is on the 1.117.1 branch, which does NOT support IBGDA — upgrade to >= $AINIC_MIN_VER"
+        log_fail "AINIC firmware $ver is on the 1.117.1 branch, which does NOT support IBGDA — upgrade to >= $AINIC_MIN_VER"
     elif version_ge "$ver" "$AINIC_MIN_VER"; then
-        log_ok "AINIC firmware $ver meets the recommended minimum (>= $AINIC_MIN_VER) for cross-node IBGDA"
+        log_ok "AINIC firmware $ver meets the required minimum (>= $AINIC_MIN_VER) for cross-node IBGDA"
     else
-        log_warn "AINIC firmware $ver is below the recommended minimum (>= $AINIC_MIN_VER) for cross-node IBGDA"
+        log_fail "AINIC firmware $ver is below the required minimum (>= $AINIC_MIN_VER) for cross-node IBGDA"
     fi
 }
 
 # check_bnxt_version_recommendation <fw_version>
 #   classifies Broadcom firmware by major branch against known-good/known-bad
 #   ranges for cross-node MORI (EP over RDMA / IBGDA).
+#   Anything that is not a known-good version fails, including an unverified
+#   branch: "we have never validated this firmware" is not a pass. An
+#   *undetectable* version stays a warning -- that is a tooling gap (no niccli),
+#   not a verdict on the firmware itself.
 check_bnxt_version_recommendation() {
     local ver="$1" major="${1%%.*}" min=""
-    [[ -n "$ver" ]] || { log_warn "cannot verify Broadcom firmware version against recommendation (empty)"; return; }
+    [[ -n "$ver" ]] || { log_warn "cannot verify Broadcom firmware version against requirement (empty)"; return; }
+    # An unparseable string (niccli reports "N/A" for RoCE firmware on some
+    # cards) is an undetectable version, not a bad one -- warn, do not fail.
+    [[ "$ver" =~ ^[0-9]+(\.[0-9]+)+$ ]] || {
+        log_warn "cannot parse Broadcom firmware version '$ver' against requirement"; return; }
     case "$major" in
-        231) log_warn "Broadcom firmware $ver is on the 231.x branch, which is too old for IBGDA — upgrade to >= $BNXT_MIN_VER_235 or >= $BNXT_MIN_VER_237"; return ;;
+        231) log_fail "Broadcom firmware $ver is on the 231.x branch, which is too old for IBGDA — upgrade to >= $BNXT_MIN_VER_235 or >= $BNXT_MIN_VER_237"; return ;;
+        232) log_fail "Broadcom firmware $ver is on the 232.x branch, which is known not to work on Thor2 — upgrade to >= $BNXT_MIN_VER_235 or >= $BNXT_MIN_VER_237"; return ;;
         235) min="$BNXT_MIN_VER_235" ;;
         237) min="$BNXT_MIN_VER_237" ;;
-        *)   log_warn "Broadcom firmware $ver is on an unverified branch ($major.x) — known-solid: $BNXT_MIN_VER_235, $BNXT_MIN_VER_237; known-bad: 231.x"; return ;;
+        *)   log_fail "Broadcom firmware $ver is on an unverified branch ($major.x) — required: >= $BNXT_MIN_VER_235 on 235.x or >= $BNXT_MIN_VER_237 on 237.x; known-bad: 231.x, 232.x"; return ;;
     esac
     if version_ge "$ver" "$min"; then
         log_ok "Broadcom firmware $ver is solid (>= $min on the $major.x branch)"
     else
-        log_warn "Broadcom firmware $ver is below the solid minimum on the $major.x branch (>= $min)"
+        log_fail "Broadcom firmware $ver is below the required minimum on the $major.x branch (>= $min)"
     fi
 }
 
@@ -595,7 +1491,10 @@ check_dcqcn() {
 check_intra_node_bw() {
     step "intra-node bandwidth check (full mesh)"
 
-    command -v ib_write_bw > /dev/null 2>&1 || { log_warn "ib_write_bw not found, skipping"; return 0; }
+    # want_gpu=false: this mesh is a fabric reachability probe between local NICs
+    # (hairpinning through the ToR). MORI moves data intra-node over XGMI, not
+    # RDMA, so a HIP init per pair here would buy nothing.
+    mesh_prepare ib_write_bw "" false || return 0
 
     local all_devs=()
     mapfile -t all_devs < <(query_rdma_devices)
@@ -610,6 +1509,10 @@ check_intra_node_bw() {
     else
         dominant_group LOCAL_DEVS "${all_devs[@]}"
     fi
+    # Drop ports that cannot carry traffic before the mesh sees them. LOCAL_DEVS
+    # is global and reused by steps 5 and 6, so filtering once here covers all
+    # three mesh steps.
+    filter_fabric_devs LOCAL_DEVS "" "${LOCAL_DEVS[@]}"
     if (( ${#all_devs[@]} != ${#LOCAL_DEVS[@]} )); then
         log_warn "mixed NIC vendors detected; using ${#LOCAL_DEVS[@]} devices for tests: ${LOCAL_DEVS[*]}"
     fi
@@ -619,8 +1522,16 @@ check_intra_node_bw() {
     # RDMA writes per pair scales with the test size (number of devices squared).
     local iters=$(( n * n ))
     # Intra-node pairs are all local (no ssh), so they aren't bound by sshd
-    # MaxSessions -> use more parallelism than the inter-node mesh.
-    local MESH_PARALLEL=$(( MESH_PARALLEL * 4 ))
+    # MaxSessions -- but they are bound by the host. This used to run at
+    # MESH_PARALLEL * 4 on the theory that reachability survives contention the
+    # way 69a3027b argued for the rail pass. It does not: 32 concurrent
+    # ib_write_bw server+client pairs on one host push server bind past
+    # MESH_SRV_WAIT_LOCAL, the client times out, and the cell is recorded
+    # unreachable. Measured on cv350 gfx950 -- 7/56 "reachable" at x4, every one
+    # of the 49 failures a false negative (the same pairs run serially at
+    # ~312 Gbps, and all 56 IP paths ping clean). MESH_RETRIES=2 did not absorb
+    # it. Contention degrades the rail pass into bad numbers; here it degrades
+    # into wrong answers, which is worse.
     log_ok "full mesh over $n devices ($((n*(n-1))) ordered pairs, ${iters} writes/pair, parallel=$MESH_PARALLEL)"
 
     local -A GID=(); build_gid_map GID "" "${LOCAL_DEVS[@]}"
@@ -632,18 +1543,23 @@ check_intra_node_bw() {
 check_inter_node_bw() {
     step "inter-node bandwidth check (full mesh)"
 
-    command -v ib_write_bw > /dev/null 2>&1 || { log_warn "ib_write_bw not found, skipping"; return 0; }
     if [[ -z "$PEER_IP" ]]; then
         log_skip "no peer IP provided (usage: $0 <peer_ip>)"; return 0
     fi
     ping -c 2 -W 2 "$PEER_IP" > /dev/null 2>&1 || die "cannot ping $PEER_IP, skip inter-node bandwidth test"
     log_ok "ping $PEER_IP reachable"
     ssh_warm "$PEER_IP"
+    # After ssh_warm: resolving the binary and the GPU map on the peer both need ssh.
+    mesh_prepare ib_write_bw "$PEER_IP" || return 0
 
     local all_remote=()
     mapfile -t all_remote < <(query_rdma_devices "$PEER_IP")
     [[ ${#all_remote[@]} -gt 0 ]] || { log_fail "no RDMA devices on $PEER_IP (check ibv_devices / ssh)"; return 1; }
     local REMOTE_DEVS=(); dominant_group REMOTE_DEVS "${all_remote[@]}"
+    # A down port on the peer costs a whole column of ✗, exactly as a local one
+    # costs a row. Filter both ends.
+    filter_fabric_devs REMOTE_DEVS "$PEER_IP" "${REMOTE_DEVS[@]}"
+    [[ ${#REMOTE_DEVS[@]} -gt 0 ]] || { log_fail "no usable RDMA devices on $PEER_IP after filtering"; return 1; }
     [[ ${#LOCAL_DEVS[@]} -gt 0 ]] || { log_fail "no local RDMA devices available"; return 1; }
     log_ok "local ${#LOCAL_DEVS[@]} x remote ${#REMOTE_DEVS[@]} mesh (parallel=$MESH_PARALLEL): ${REMOTE_DEVS[*]}"
 
@@ -654,6 +1570,13 @@ check_inter_node_bw() {
     # just makes each working pair ~5x slower. no self-skip (distinct hosts).
     mesh_execute CELL ib_write_bw "$PEER_IP" false 1000 LGID RGID LOCAL_DEVS REMOTE_DEVS
     mesh_report CELL LOCAL_DEVS REMOTE_DEVS "inter-node BW" "Gbps" int
+    assess_fabric_topology CELL "${#LOCAL_DEVS[@]}" "${#REMOTE_DEVS[@]}"
+
+    # The mesh above ran on host memory. MORI transfers VRAM-to-VRAM, so repeat
+    # it on GPU memory: a pair that passed on host memory and fails here is a
+    # GPUDirect fault, not a fabric one.
+    gpu_mesh_check ib_write_bw "$PEER_IP" LOCAL_DEVS REMOTE_DEVS LGID RGID CELL \
+                   "inter-node BW" "Gbps" int
 }
 
 # =================== bnxt_re (Broadcom) checks =================
@@ -684,26 +1607,51 @@ check_bnxt_versions() {
     log_ok "bnxt_re devices (${#BNXT_DEVS[@]}): ${BNXT_DEVS[*]}"
 
     # --- kernel modules ---
-    # Only the loaded (in-memory) driver version matters here.
-    local m load_ver
+    local m
     for m in bnxt_re bnxt_en; do
-        if [[ -r "/sys/module/$m/version" ]]; then
-            load_ver=$(cat "/sys/module/$m/version")
-            log_ok "$m driver : $load_ver"
-        else
-            log_fail "$m : not loaded"
-        fi
+        report_driver_version "$m"
     done
 
     # --- RoCE userspace library ---
-    local roce_lib_dir="/usr/local/lib"
-    local found_ver
-    found_ver=$(find "$roce_lib_dir" -maxdepth 2 -name 'libbnxt_re-*.so' 2>/dev/null \
-        | sed -n 's|.*libbnxt_re-\([0-9][0-9.]*\)\.so$|\1|p' | sort -V | tail -1)
-    if [[ -n "$found_ver" ]]; then
-        log_ok "libbnxt_re userspace : $found_ver"
+    # Two provider shapes exist and both are valid:
+    #   - Broadcom out-of-tree: libbnxt_re-<fw-style ver>.so, usually in
+    #     /usr/local/lib; its version is expected to track the kernel driver.
+    #   - rdma-core in-tree   : libbnxt_re-rdmav<abi>.so in a libibverbs
+    #     provider dir; versioned by rdma-core ABI, not by firmware.
+    # Searching only /usr/local/lib for only the first shape reported a
+    # perfectly functional in-tree provider as missing.
+    local lib_dirs=() d
+    for d in /usr/local/lib /usr/lib64/libibverbs \
+             /usr/lib/x86_64-linux-gnu/libibverbs /usr/lib/libibverbs; do
+        [[ -d "$d" ]] && lib_dirs+=("$d")
+    done
+    # Containers commonly stage the host provider somewhere non-standard and
+    # point at it with LD_LIBRARY_PATH; honour that rather than hardcoding paths.
+    local _ldp=()
+    IFS=: read -ra _ldp <<< "${LD_LIBRARY_PATH:-}"
+    for d in "${_ldp[@]}"; do
+        [[ -n "$d" && -d "$d" ]] && lib_dirs+=("$d")
+        [[ -n "$d" && -d "$d/libibverbs" ]] && lib_dirs+=("$d/libibverbs")
+    done
+
+    if [[ ${#lib_dirs[@]} -eq 0 ]]; then
+        log_warn "no library directory to search for a libbnxt_re provider"
     else
-        log_warn "libbnxt_re-<ver>.so not found under $roce_lib_dir"
+        local oot_ver intree
+        oot_ver=$(find "${lib_dirs[@]}" -maxdepth 2 -name 'libbnxt_re-[0-9]*.so' 2>/dev/null \
+            | sed -n 's|.*libbnxt_re-\([0-9][0-9.]*\)\.so$|\1|p' | sort -V | tail -1)
+        intree=$(find "${lib_dirs[@]}" -maxdepth 2 -name 'libbnxt_re-rdmav*.so' 2>/dev/null \
+            | sort -u | head -1)
+        if [[ -n "$oot_ver" ]]; then
+            log_ok "libbnxt_re userspace : $oot_ver (Broadcom out-of-tree)"
+        elif [[ -n "$intree" ]]; then
+            local core_ver
+            core_ver=$(rpm -q --qf '%{VERSION}-%{RELEASE}' rdma-core 2>/dev/null \
+                    || dpkg-query -W -f='${Version}' rdma-core 2>/dev/null || true)
+            log_ok "libbnxt_re userspace : $(basename "$intree") (rdma-core in-tree${core_ver:+ $core_ver})"
+        else
+            log_warn "no libbnxt_re provider found (searched: ${lib_dirs[*]})"
+        fi
     fi
 
     # --- firmware version via niccli -i <idx> show per NIC ---
@@ -720,9 +1668,35 @@ check_bnxt_versions() {
     local niccli_list
     niccli_list=$(sudo niccli --list 2>/dev/null || true)
 
-    # get list of NIC indices from niccli --list (first column, skip header)
-    local nic_indices=()
-    mapfile -t nic_indices < <(awk 'NR>1 && /^[[:space:]]*[0-9]/{gsub(/[^0-9]/,"",$1); print $1}' <<< "$niccli_list")
+    # Build a PCI->niccli_index map from the "niccli --list" output fetched above:
+    #   "  1) BCM57608  <mac>  235.2.40.0  0000:06:00.0  NIC  PCI"
+    declare -A _pci2idx=()
+    while IFS= read -r line; do
+        local _idx _pci
+        _idx=$(echo "$line" | awk '/^[[:space:]]*[0-9]+\)/{gsub(/[^0-9]/,"",$1); print $1}')
+        _pci=$(echo "$line" | grep -oiE '[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9]' | tr '[:upper:]' '[:lower:]')
+        [[ -n "$_idx" && -n "$_pci" ]] && _pci2idx["$_pci"]="$_idx"
+    done < <(echo "$niccli_list")
+
+    # Poll only the NICs that actually back a bnxt_re device. niccli lists every
+    # Broadcom NIC in the box, including ones with no RoCE: those report
+    # "RoCE Firmware Version: 0.0.0.0", which is a well-shaped version string, so
+    # it slips past the N/A guard from 7a7c8f7e and gets classified as an
+    # unverified 0.x branch -- a FAIL, plus a bogus "RoCE firmware inconsistent"
+    # warning. Measured on cv350: 12 NICs listed, 8 with bnxt_re; the 4 without
+    # (two dual-port cards) all read 0.0.0.0. Restricting the set also drops 12
+    # slow per-NIC firmware round trips to 8.
+    local nic_indices=() _d _pci
+    for _d in "${BNXT_DEVS[@]}"; do
+        _pci=$(basename "$(readlink -f "$ib_root/$_d/device")" 2>/dev/null || true)
+        [[ -n "${_pci2idx[$_pci]+x}" ]] && nic_indices+=("${_pci2idx[$_pci]}")
+    done
+    if [[ ${#nic_indices[@]} -eq 0 ]]; then
+        # No PCI matched (unexpected niccli --list format): fall back to every
+        # listed index rather than checking nothing at all.
+        mapfile -t nic_indices < <(awk 'NR>1 && /^[[:space:]]*[0-9]/{gsub(/[^0-9]/,"",$1); print $1}' <<< "$niccli_list")
+        (( ${#nic_indices[@]} )) && log_warn "could not map any bnxt_re device to a niccli index; checking all ${#nic_indices[@]} listed NICs"
+    fi
     if [[ ${#nic_indices[@]} -eq 0 ]]; then
         log_warn "niccli --list returned no devices; defaulting to index 1"
         nic_indices=(1)
@@ -783,16 +1757,8 @@ check_bnxt_versions() {
     fi
 
     # --- port state, net device, and niccli index mapping via sysfs ---
-    # Build a PCI->niccli_index map from the "niccli --list" output fetched above:
-    #   "  1) BCM57608  <mac>  235.2.40.0  0000:06:00.0  NIC  PCI"
-    declare -A _pci2idx=()
-    while IFS= read -r line; do
-        local idx pci
-        idx=$(echo "$line" | awk '/^[[:space:]]*[0-9]+\)/{gsub(/[^0-9]/,"",$1); print $1}')
-        pci=$(echo "$line" | grep -oiE '[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9]' | tr '[:upper:]' '[:lower:]')
-        [[ -n "$idx" && -n "$pci" ]] && _pci2idx["$pci"]="$idx"
-    done < <(echo "$niccli_list")
-
+    # _pci2idx was built above, before the firmware query used it to pick which
+    # NICs to poll.
     local first_idx_set=false
     local dev state link eth_dev pci_addr
     local active_count=0 inactive_devs=()
@@ -1027,10 +1993,14 @@ check_mlx5_versions() {
     log_ok "mlx5 devices (${#MLX5_DEVS[@]}): ${MLX5_DEVS[*]}"
 
     report_driver_version mlx5_core
-    if lsmod | awk '{print $1}' | grep -qx mlx5_ib; then
-        log_ok "mlx5_ib driver : loaded (same package as mlx5_core)"
-    else
+    # mlx5_ib ships in the same package as mlx5_core, so its version adds
+    # nothing over the line above -- only presence matters. Ask module_state
+    # rather than lsmod: mlx5_ib is built into the kernel on some distros.
+    local mlx5_ib_state; mlx5_ib_state=$(module_state mlx5_ib)
+    if [[ "$mlx5_ib_state" == "absent" ]]; then
         log_fail "mlx5_ib : not loaded"
+    else
+        log_ok "mlx5_ib driver : $mlx5_ib_state (same package as mlx5_core)"
     fi
 
     local rdma_core_ver
@@ -1040,8 +2010,10 @@ check_mlx5_versions() {
 
     # Only Ethernet/RoCE ports must be ACTIVE; native IB ports may legitimately
     # be Down on a RoCE-only host.
-    local dev state link fw_ver eth_dev devid inactive_devs=()
-    local -A fw_by_model=()  # PCI device id -> space-separated fw versions
+    local dev state link fw_ver eth_dev devid rate inactive_devs=()
+    local -A fw_by_model=()    # PCI device id -> space-separated fw versions
+    local -A devs_by_model=()  # PCI device id -> space-separated device names
+    local -A rate_by_model=()  # PCI device id -> link rate of the last dev seen
     for dev in "${MLX5_DEVS[@]}"; do
         state=$(awk -F': *' '{print $2}' "$ib_root/$dev/ports/1/state" 2>/dev/null)
         link=$(cat "$ib_root/$dev/ports/1/link_layer" 2>/dev/null)
@@ -1049,7 +2021,10 @@ check_mlx5_versions() {
         eth_dev=$(basename "$(readlink -f "$ib_root/$dev/device/net/"* 2>/dev/null)" 2>/dev/null)
         devid=$(cat "$ib_root/$dev/device/device" 2>/dev/null)
 
+        rate=$(awk '{print $1" "$2}' "$ib_root/$dev/ports/1/rate" 2>/dev/null)
         [[ -n "$fw_ver" ]] && fw_by_model["${devid:-?}"]+="$fw_ver "
+        devs_by_model["${devid:-?}"]+="$dev "
+        [[ -n "$rate" ]] && rate_by_model["${devid:-?}"]="$rate"
         if [[ "$link" == "Ethernet" ]]; then
             MLX5_ROCE_DEVS+=("$dev")
             [[ -n "$eth_dev" ]] && MLX5_ROCE_ETH+=("$eth_dev")
@@ -1072,6 +2047,22 @@ check_mlx5_versions() {
         read -ra fws <<< "${fw_by_model[$model]}"
         report_uniform "mlx5 firmware (${devname:-PCI id $model})" "${fws[@]}"
     done
+
+    # More than one card model on the host. Legitimate -- the usual layout is a
+    # fast fabric NIC plus a slower management NIC -- but every step from here on
+    # meshes all mlx5 devices together, so the slow ones show up as unreachable
+    # cells and as rails that miss the bandwidth threshold. Name them once, up
+    # front, so those later failures read as expected rather than as faults.
+    if (( ${#devs_by_model[@]} > 1 )); then
+        log_warn "host has ${#devs_by_model[@]} mlx5 card models -- they are meshed together below:"
+        local m dname
+        for m in "${!devs_by_model[@]}"; do
+            dname=$(lspci -d "15b3:$m" -mm 2>/dev/null | head -1 | awk -F'"' '{print $6}')
+            log_warn "  ${dname:-PCI id $m} @ ${rate_by_model[$m]:-unknown rate} : ${devs_by_model[$m]% }"
+        done
+        log_warn "  a lower-rate model is usually the management NIC, not fabric: expect it to"
+        log_warn "  fail the ${BW_THRESHOLD} Gbps rail threshold and to show x cells in steps 4-6"
+    fi
 
     # If native IB ports outnumber RoCE ports, the RoCE port(s) are likely an
     # incidental management NIC, not MORI's fabric. Clear MLX5_ROCE_DEVS so
@@ -1244,17 +2235,19 @@ check_mlx5_dcqcn() {
 check_inter_node_lat() {
     step "inter-node latency check (full mesh)"
 
-    command -v ib_write_lat > /dev/null 2>&1 || { log_warn "ib_write_lat not found, skipping"; return 0; }
     if [[ -z "$PEER_IP" ]]; then
         log_skip "no peer IP provided (usage: $0 <peer_ip>)"; return 0
     fi
     ping -c 1 -W 2 "$PEER_IP" > /dev/null 2>&1 || die "cannot ping $PEER_IP, skip inter-node latency test"
     ssh_warm "$PEER_IP"
+    mesh_prepare ib_write_lat "$PEER_IP" || return 0
 
     local all_remote=()
     mapfile -t all_remote < <(query_rdma_devices "$PEER_IP")
     [[ ${#all_remote[@]} -gt 0 ]] || { log_fail "no RDMA devices on $PEER_IP"; return 1; }
     local REMOTE_DEVS=(); dominant_group REMOTE_DEVS "${all_remote[@]}"
+    filter_fabric_devs REMOTE_DEVS "$PEER_IP" "${REMOTE_DEVS[@]}"
+    [[ ${#REMOTE_DEVS[@]} -gt 0 ]] || { log_fail "no usable RDMA devices on $PEER_IP after filtering"; return 1; }
     [[ ${#LOCAL_DEVS[@]} -gt 0 ]]  || { log_fail "no local RDMA devices available"; return 1; }
     log_ok "local ${#LOCAL_DEVS[@]} x remote ${#REMOTE_DEVS[@]} latency mesh (parallel=$MESH_PARALLEL)"
 
@@ -1265,6 +2258,16 @@ check_inter_node_lat() {
     # here: Step 5 (inter-node BW) already reported inter-node reachability.
     mesh_execute CELL ib_write_lat "$PEER_IP" false "" LGID RGID LOCAL_DEVS REMOTE_DEVS
     mesh_report CELL LOCAL_DEVS REMOTE_DEVS "inter-node latency" "us" f1 no
+
+    # No GPU-memory pass here. Step 5 already answers whether GPUDirect works on
+    # every NIC pair, and it answers it on bandwidth, where the signal is large
+    # and the threshold is meaningful. Repeating it on latency measured the same
+    # registration path again and added only LAT_THRESHOLD, which does not hold
+    # up: measured serially on cv350 every rail sits at 10.9-11.7 us against a
+    # 10 us bar, so the pass failed a fabric running at line rate. 69a3027b read
+    # 6.77-7.10 us on different hardware and concluded the threshold was usable;
+    # it is not portable, and a bar that fires on healthy clusters trains readers
+    # to ignore the check.
 }
 
 # ============================= main =============================
@@ -1274,6 +2277,19 @@ check_inter_node_lat() {
 # [[ $EUID -eq 0 ]] || die "please run as root"
 
 LOCAL_DEVS=()
+
+# Runs before the numbered checks and deliberately does not call step(): the
+# check is documented as a fixed 6-step sequence, and an optional flag should
+# not renumber it.
+if [[ "$INSTALL_PERFTEST" == "true" ]]; then
+    echo ""; echo -e "${CYAN}=== install perftest (--install-perftest) ===${NC}"
+    _pt=$(resolve_perftest ib_write_bw)
+    if [[ -n "$_pt" ]] && perftest_has_rocm "$_pt"; then
+        log_ok "perftest with ROCm support already present at $_pt, nothing to do"
+    else
+        install_perftest || true
+    fi
+fi
 
 # Detect NICs by PCI vendor id (stable), not IB device name (ionic cards may
 # show up as ionic_*, roceensp*, etc.). On mixed-vendor hosts, run the checks
@@ -1347,5 +2363,12 @@ check_intra_node_bw
 check_inter_node_bw
 check_inter_node_lat
 
+# Cluster-level findings the per-step output cannot express, reported once here.
+report_fabric_topology
+
 echo ""
-echo "=== All checks completed ==="
+if (( FAIL_COUNT > 0 )); then
+    echo -e "=== All checks completed — ${RED}${FAIL_COUNT} failure(s)${NC} ==="
+    exit 1
+fi
+echo -e "=== All checks completed — ${GREEN}no failures${NC} ==="

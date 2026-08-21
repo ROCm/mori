@@ -143,6 +143,15 @@ Non-obvious package roles:
 - `sudo` — ionic/bnxt paths of `mori check`/`mori setup` invoke `nicctl`,
   `dcb`, `ethtool`, sysfs writes via `sudo`.
 - `perftest` — `ib_write_bw`/`ib_write_lat` for bandwidth/latency checks.
+  The distro package covers the host-memory mesh, but the GPU-memory pass in
+  steps 5/6 needs a build with ROCm support (`--use_rocm`), which distro
+  builds generally lack — build it yourself or use
+  `mori check --install-perftest` (Step 7). `mori check` resolves the binary
+  from `$MORI_PERFTEST_PREFIX/bin` (default `~/.local/mori-perftest`) **first**,
+  and only then `$PATH` — the prefix is only ever populated deliberately, so it
+  outranks a distro perftest sitting on `$PATH` without ROCm support. It is
+  needed on the **peer** as well for steps 5/6; on a cluster with shared
+  `/home`, the default prefix covers both nodes at once.
 - `iproute2` — provides `dcb`, needed by `mori setup` on bnxt.
 - `libgrpc++-dev` + protobuf packages — build defaults to `BUILD_UMBP=ON`,
   whose CMake step needs gRPC headers. (`cmake`/`ninja`/`pybind11` come from
@@ -234,8 +243,10 @@ nicctl --version
 
 > **Recommended version**: for cross-node MORI (EP over RDMA / IBGDA), Broadcom firmware
 > is solid on `237.1.137.x` (official Broadcom release) and `235.2.86.x` (customer-specific
-> build). `231.x` is too old for IBGDA — if the host is on that branch, flag it to the user
-> and recommend upgrading. The userspace library (`libbnxt_re`, 3b.2) must match the kernel
+> build). Known bad: `231.x` is too old for IBGDA, and `232.x` does not work on Thor2 — if
+> the host is on either branch, flag it to the user and recommend upgrading. Any other
+> branch is unverified and treated the same way.
+> The userspace library (`libbnxt_re`, 3b.2) must match the kernel
 > driver version detected in 3b.1.
 
 The bnxt path of `mori check` / `mori setup` needs two NIC-specific pieces installed
@@ -266,7 +277,10 @@ https://packages.broadcom.com/artifactory/ethernet-nic-debian-public jammy main"
 apt-get update
 # pin to match the host bnxt_re version from 3b.1; list options: apt-cache madison bnxt-rocelib
 apt-get install -y ibverbs-utils bnxt-rocelib=235.2.86.0
-# mori check looks for libbnxt_re-<ver>.so under /usr/local/lib — make it visible there
+# Make the out-of-tree provider visible on a standard path. `mori check` also
+# accepts the rdma-core in-tree provider (libbnxt_re-rdmav<abi>.so under a
+# libibverbs dir) and honours $LD_LIBRARY_PATH, so this copy is only needed to
+# have the *Broadcom* build take precedence and get its version reported.
 cp /usr/local/lib/x86_64-linux-gnu/libbnxt_re* /usr/local/lib/.
 ldconfig
 '
@@ -515,14 +529,63 @@ sudo docker exec $CONTAINER_NAME bash -c "mori check"
 `mori check` validates the RDMA stack in 6 steps (vendor-specific variants,
 same intent):
 
-1. **firmware & driver** — versions consistent
+1. **firmware & driver** — versions consistent. Firmware that is not
+   known-good **fails**, including an unverified branch; only an undetectable
+   version downgrades to a warning.
 2. **QoS / SL / TC** — PFC + lossless TC; selects SL/TC for MORI
 3. **DCQCN** — congestion control enabled on all RoCE devices
-4. **intra-node bandwidth** — `ib_write_bw` full mesh (needs `perftest`)
+4. **intra-node bandwidth** — `ib_write_bw` full mesh, host memory
+   (needs `perftest`)
 5. **inter-node bandwidth** — `ib_write_bw` to a peer: `mori check <peer_ip>`
 6. **inter-node latency** — `ib_write_lat` to a peer: same peer IP
 
 Steps 5/6 are skipped without a peer IP — run from both nodes to test cross-node connectivity.
+
+**GPU memory.** Only **Step 5 (inter-node bandwidth)** runs a GPU-memory pass;
+Step 6 (latency) is host-memory only. Step 5 first runs the host-memory mesh
+(reachability across all NIC pairs), then a GPU-memory pass over the pairs host
+memory already proved reachable via `--use_rocm` (each NIC paired to its
+PCIe-closest GPU), and finally a **serial pass over the rail-aligned pairs**
+(`local[i]` ↔ `remote[i]`) for the per-rail numbers that carry the bandwidth
+threshold. That rail-aligned diagonal is the path MORI actually transfers over,
+so a rail failing there while the host mesh passed points at GPUDirect rather
+than the fabric. Step 4 stays on host memory deliberately: it is a fabric
+reachability probe, and MORI moves data intra-node over XGMI, not RDMA.
+
+GPU runs pay a HIP init per process, so their timeouts scale automatically;
+the host-memory mesh keeps its original budget. If perftest lacks ROCm support
+or no GPUs are visible, the GPU pass is skipped with a single warning and the
+host mesh still runs. `--no-gpu-mem` forces host memory everywhere.
+
+**peer_mem vs dma-buf.** `--use_rocm` registers GPU memory with an ordinary
+`ibv_reg_mr`, which needs a peer-memory client in the kernel; `--use_rocm_dmabuf`
+registers via `ibv_reg_dmabuf_mr` and needs none. `mori check` picks between
+them by *trying* one tiny loopback transfer, then reports which it used
+(`... via peer_mem` / `... via dma-buf`), warning when it had to fall back.
+Static detection is not used on purpose: `/sys/kernel/mm/memory_peers` is a
+Mellanox-OFED artefact that the in-tree AMD client never creates (amdgpu
+registers through `ib_uverbs` leaving no sysfs trace), and `/proc/kallsyms` is
+routinely restricted in containers — both would misreport a working peer_mem
+as absent. The dma-buf fallback needs perftest built with
+`--enable-rocm-dmabuf`, which `--install-perftest` attempts and silently drops
+on kernels/ROCm too old for it.
+
+```bash
+# build a ROCm-capable perftest into $MORI_PERFTEST_PREFIX (default
+# ~/.local/mori-perftest); opt-in, never triggered implicitly
+sudo docker exec $CONTAINER_NAME bash -c "mori check --install-perftest"
+```
+
+That builds upstream `linux-rdma/perftest` with
+`--enable-rocm --enable-rocm-dmabuf --with-rocm=$ROCM_PATH`, retrying without
+`--enable-rocm-dmabuf` if configure rejects it. Prefer it over `ROCm/rdma-perftest`,
+which exposes the same flags but has not moved since 2025-05.
+
+The build needs `libtoolize` (not the `libtool` wrapper — `configure` generates
+that), plus `git autoconf automake make gcc` and ibverbs headers. Note the
+resolved binary comes from `$MORI_PERFTEST_PREFIX/bin` in preference to `$PATH`:
+distros ship a perftest built without ROCm, and letting it win would mean
+`--install-perftest` silently has no effect.
 
 **mlx5 note:** native IB ports don't use PFC/DSCP/DCQCN (IB has its own
 credit-based flow control managed by the fabric SM) — steps 2/3 only run

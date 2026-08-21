@@ -2,6 +2,20 @@
 
 MORI-EP provides high-performance MoE (Mixture of Experts) dispatch and combine kernels for Expert Parallelism. It supports both intra-node (XGMI) and inter-node (RDMA) communication, delivering state-of-the-art bandwidth for token routing in models like DeepSeek V3.
 
+> **Fabric requirement (inter-node).** Dispatch/combine sends cross-rail — NIC
+> `i` on one node to NIC `j` on another — so it needs a fully routed fabric.
+> **MORI-EP v1 does not support rail-only clusters currently**, where each NIC
+> reaches only its own rail on the peer. Rail-only support for the
+> `internode-v1` and `v1_ll` kernels is in progress. Check before you run:
+>
+> ```bash
+> mori check <peer_ip>          # or: tools/env_check.sh <peer_ip>
+> ```
+>
+> It classifies the fabric from a full NIC-to-NIC mesh and warns at the end if
+> it is rail-only, along with reporting NIC firmware against the known-good
+> table. MORI-IO is unaffected: it stays on-rail with `MORI_IO_RAIL_AFFINITY=1`.
+
 ## Table of Contents
 
 - [Quick Reference](#quick-reference)
