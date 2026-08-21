@@ -695,13 +695,10 @@ class EpDispatchCombineOp:
             kern, dest_map = table[disp_spec], routing.disp_dest_tok_id_map
         else:
             kern = self._kernels.dispatch[disp_spec]
-            # return_routing hands the handle its own dest_map (filled -1 so unset
-            # (tok,k) slots read as null); a plain dispatch reuses the scratch one.
-            dest_map = (
-                torch.full_like(self.token_dest_map, -1)
-                if return_routing
-                else self.token_dest_map
-            )
+            if return_routing:
+                dest_map = self.routing_dest_map
+            else:
+                dest_map = self.token_dest_map
 
         kern(
             input=input,
@@ -798,6 +795,7 @@ class EpDispatchCombineOp:
         half, so one rank resetting alone would leave the two disagreeing."""
         self.arena.zero()
         self.token_dest_map.fill_(-1)
+        self.routing_dest_map.fill_(self._null_flat)
         self.dest_pe_counter.zero_()
         self.dispatch_barrier.zero_()
         self.combine_barrier.zero_()
