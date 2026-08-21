@@ -127,7 +127,7 @@ jobs:
           COMMON="--op-type write --mem-type gpu --all \
             --sweep-start-size 1048576 --sweep-max-size 33554432 --sweep-step 1048576 \
             --num-qp-per-transfer 4 --batch-contiguous \
-            --num-initiator-dev 1 --num-target-dev 1 \
+            --num-initiator-dev 8 --num-target-dev 8 \
             --warmup-iters 128 --log-level info"
           {
             echo "=== MORI-IO bench_engine CI commands ==="
