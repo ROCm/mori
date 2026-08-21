@@ -226,9 +226,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # The combine kernel stages into out_tok itself (and skips the copy
             # when the caller already wrote there), so the op must not do it.
             stages_in_kernel=True,
-            # These are plain local buffers, not symmetric regions: the kernels
-            # do not reset them, the op must.
-            self_resets_counters=False,
+            # dest_pe_counter and the grid barrier have always been kernel-cleared;
+            # total_recv joined them once dispatch started storing the count instead
+            # of accumulating into it, which is what the host memset existed for.
+            self_resets_counters=True,
             capabilities=frozenset({"gather"}),
         )
 
