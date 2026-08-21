@@ -67,6 +67,8 @@ _DISPATCH_DTYPES = {
     torch.float4_e2m1fn_x2: 1,  # nominal: cfg.token_nbytes is what sizes buffers
 }
 _COMBINE_DTYPES = {torch.bfloat16: 2, torch.float32: 4}
+# Must match EpXdbFlagSlots in include/mori/ops/dispatch_combine_v2/ep_cfg.hpp.
+_XDB_FLAG_SLOTS = 256
 
 
 class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
@@ -112,8 +114,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self.dispatch_barrier = torch.zeros(1, dtype=torch.uint32, device=dev)
         self.combine_barrier = torch.zeros(1, dtype=torch.uint32, device=dev)
         # Monotone epoch. Starts at 1 so the zeroed barrier slots cannot alias
-        # the first launch's flag value.
-        self.cross_device_flag = torch.ones(1, dtype=torch.int64, device=dev)
+        # the first launch's flag value. The gfx1250 combine barrier gives every
+        # block a private slot (EpXdbFlagSlots in ep_cfg.hpp), so it is the only
+        # writer of its own epoch; the portable path only ever uses slot 0.
+        self.cross_device_flag = torch.ones(
+            _XDB_FLAG_SLOTS if self._is1250 else 1, dtype=torch.int64, device=dev
+        )
         self.combine_out = torch.zeros(
             max_tok * cfg.hidden_dim, dtype=cfg.combine_dtype, device=dev
         )
@@ -126,6 +132,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self.combine_barrier_fan = None
         if self._is1250:
             max_comb_blocks = max(b for b, _ in self._combine_specs)
+            if max_comb_blocks > _XDB_FLAG_SLOTS:
+                raise ValueError(
+                    f"combine block_num {max_comb_blocks} exceeds the {_XDB_FLAG_SLOTS} "
+                    "per-block xdb epoch slots the entry barrier owns"
+                )
             self.combine_barrier_fan = torch.zeros(max_comb_blocks * 16, **i32)
 
     # -- backend hooks -----------------------------------------------------
