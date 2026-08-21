@@ -384,6 +384,35 @@ class PoolClient {
   // (kSuccessAlreadyExists) and best-effort: the queue is bounded and drops on
   // full; failure does not affect the returned Get result.
   void MaybeReCacheAfterRemote(const std::string& key, const void* src, size_t size);
+
+  // After a remote RANGED read served `fetched_bytes` of `object_size`, queue a
+  // background pull of the WHOLE object into this node's medium, so the next
+  // read of the key is a local hit instead of another trip to the peer.
+  //
+  // Why this exists at all: a ranged read holds only the caller's spans, so
+  // MaybeReCacheAfterRemote — which installs the buffer it is handed — has
+  // nothing legal to install.  Locality has to be rebuilt from the peer.
+  //
+  // Skipped when this call already covered the object (`fetched_bytes ==
+  // object_size`): the whole-object reader would otherwise pull every object
+  // twice, once for itself and once for a cache it just filled.
+  //
+  // Best-effort in every direction: gated by ranged_locality_prefetch and the
+  // re-cache admission policy, deduplicated against both the queue and this
+  // node's medium, bounded, and silent on failure.  It never runs on, and never
+  // blocks, the read that scheduled it.
+  void MaybePrefetchWholeObject(const std::string& key, size_t object_size,
+                                const RouteGetResult& route);
+  // The other half of the same decision: the arena slice already holds the
+  // whole object (the caller's ranges tiled it in order), so locality costs one
+  // local copy instead of a second trip to the peer.  Synchronous because the
+  // slice is live only until the next sub-batch reuses it.  Mutually exclusive
+  // with MaybePrefetchWholeObject — exactly one runs per fetched key.
+  void MaybeInstallCompleteArenaObject(const std::string& key, const void* arena_slice,
+                                       size_t object_size);
+  // Shared gate for both: the feature switch, an installable local medium, and
+  // the re-cache admission policy.
+  bool LocalityCachingAdmits(size_t object_size) const;
   // Background worker that drains recache_queue_ and performs the DRAM install
   // via ExecuteLocalPut. Started in Init (when cache_remote_fetches), stopped in
   // Shutdown before peer_alloc_ is torn down.
@@ -392,13 +421,42 @@ class PoolClient {
   // Async re-cache install queue. MaybeReCacheAfterRemote copies the block bytes
   // into a job here (the source buffer is not owned past the Get return), and the
   // worker thread installs it. Bounded to keep memory + publish churn in check.
+  // Two shapes share one queue and one worker so they also share its lifecycle,
+  // its bound and its drain-on-shutdown:
+  //   bytes != nullptr  -> install this buffer (MaybeReCacheAfterRemote)
+  //   bytes == nullptr  -> pull the object from `route` first
+  //                        (MaybePrefetchWholeObject)
   struct ReCacheJob {
     std::string key;
     std::unique_ptr<char[]> bytes;
     size_t size = 0;
+    std::optional<RouteGetResult> route;
   };
+  // Pull whole objects from their peers straight into freshly allocated local
+  // slots and commit them.  Peer pages and medium pages are both registered
+  // host memory, so this is RDMA with no bounce buffer and no memcpy — unlike
+  // the ReCacheJob path, which has to carry a heap copy of the bytes.
+  //
+  // BATCHED deliberately, and it has to be.  Per key the fixed cost is a peer
+  // resolve RPC plus an RDMA submit/wait; done one at a time on this single
+  // worker thread that cost is paid once per key, and for small objects it
+  // dominates the bytes so thoroughly that the worker cannot keep up with the
+  // reader — the prefetch then loses more races than it wins and the whole
+  // feature turns negative.  Batching amortises the resolve over every key
+  // routed to the same peer and gives the engine one large scatter-gather to
+  // post.
+  //
+  // Best-effort per key: already-local keys are dropped before allocating (the
+  // alternative wastes a whole object of wire), and any key whose allocation or
+  // transfer fails is aborted without affecting the others.
+  void FetchWholeObjectsIntoMedium(std::vector<ReCacheJob>& jobs);
+
   std::deque<ReCacheJob> recache_queue_;
   std::mutex recache_mutex_;
+  // Keys with a whole-object pull already queued or running.  A layer-wise
+  // reader names the same key once per layer group, so without this every group
+  // that misses locally would queue another pull of bytes already in flight.
+  std::unordered_set<std::string> prefetch_inflight_;
 
   // Serializes users of each caller-owned ranged scratch arena.  Only the remote
   // half of a ranged operation takes one — keys served by this node's own medium
@@ -421,12 +479,35 @@ class PoolClient {
     size_t size;
     RoutePutResult route;
   };
+  // One byte range of a stored object, named by the caller.
+  struct ByteSpan {
+    size_t object_offset = 0;
+    size_t size = 0;
+  };
+
   struct BatchGetItem {
     size_t index;
     const std::string* key;
     void* dst;
-    size_t size;
+    size_t size;  // the OBJECT's stored size — what the peer must report
+    // Ranged reads move only `spans` and land them packed at `dst`, so the
+    // bytes written are the span total rather than the object size.  Both
+    // fields default to the whole-object behaviour, which is what plain
+    // BatchGet wants and why it needs no changes.
+    size_t dst_bytes = 0;                          // 0 => size
+    const std::vector<ByteSpan>* spans = nullptr;  // null/empty => whole object
+    // Pre-resolved destination, used instead of `dst` when set.  UserBufferRef
+    // only knows regions registered through PoolClient::RegisterMemory, so a
+    // destination inside a medium backend's own pool — which is RDMA-reachable
+    // but was never handed to RegisterMemory — has to be named by the ref the
+    // backend publishes.  Locality prefetch writes straight into a medium slot
+    // and is the only user.
+    const TransferRef* dst_ref = nullptr;
+    uint64_t dst_ref_offset = 0;
     RouteGetResult route;
+
+    size_t DstBytes() const { return dst_bytes != 0 ? dst_bytes : size; }
+    bool Ranged() const { return spans != nullptr && !spans->empty(); }
   };
 
   // Routing plan for one BatchGet: which keys go to which target.  Pure
@@ -473,12 +554,63 @@ class PoolClient {
   // all peers.  Staging (non-zero-copy) runs per peer serially (submit ->
   // wait).  Reads the plan; writes per-key outcomes into *results.
   // `recache_remote=false` suppresses the asynchronous re-cache of remotely
-  // fetched blocks.  BatchGetRanges passes false because it installs the object
-  // synchronously itself; leaving it on would queue a second, redundant install
-  // of bytes that are already in the local medium.
+  // fetched blocks.
   void ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector<std::string>& keys,
                            const std::vector<void*>& dsts, const std::vector<size_t>& sizes,
                            std::vector<bool>* results, bool recache_remote = true);
+
+  // The remote half of ExecuteBatchGetPlan: submit every peer, then wait every
+  // peer.  Split out for the ranged path, whose plan has no local half by
+  // construction (BatchGetRanges filters unroutable and self-routed keys out
+  // before building it), so threading the keys/dsts/sizes the local half needs
+  // would only pass three vectors nothing reads.
+  void ExecuteRemoteBatchGetPlan(const BatchGetPlan& plan, std::vector<bool>* results,
+                                 bool recache_remote);
+
+  // One key's share of one arena round: the spans to fetch, where they land in
+  // the slice, and the caller buffers they are copied out to.  A key needs more
+  // than one when its spans do not all fit at once.
+  struct RangeFetchUnit {
+    size_t original = 0;  // caller key index
+    size_t object_size = 0;
+    std::optional<RouteGetResult> route;
+    std::vector<ByteSpan> spans;
+    std::vector<ObjectRange> packed;  // caller pointer + slice-relative offset
+    size_t bytes = 0;                 // == sum of spans
+    // The slice is byte-for-byte the whole object, which happens when the
+    // caller's ranges tile it in ascending order and it all fits in one unit.
+    // The whole-object reader (one call for every layer) hits this; the
+    // layer-wise reader never does.
+    bool holds_whole_object = false;
+  };
+
+  // Serve whole-object ranged reads out of a fresh medium slot instead of the
+  // arena.  Their span layout already equals the object, so the peer can write
+  // straight into the slot: one copy instead of two, the arena stays free for
+  // the readers that actually need it, and the arena mutex is never taken.
+  // Committing the slot afterwards is the local install, for nothing.
+  //
+  // Returns the units it could not take -- no slot to be had, or a slot that is
+  // not one contiguous run -- for the arena path to serve the ordinary way.
+  // That fallback is decided here, on a cheap local allocation, and never after
+  // a failed transfer: a transfer does not fail because of where it was
+  // pointed, and retrying it elsewhere would only double the latency of a
+  // failure the caller treats as fatal.
+  std::vector<RangeFetchUnit> ServeWholeObjectUnitsFromMedium(
+      const std::vector<std::string>& keys, std::vector<RangeFetchUnit> units,
+      std::unordered_map<size_t, bool>* unit_ok);
+
+  // Remote-only sibling of PartitionBatchGetTargets for ranged reads.  Each key
+  // contributes one item carrying its arena slice, its span list, and the span
+  // total.  Spans are passed by pointer rather than by value: the caller
+  // already owns them for the whole call, and copying one small vector per key
+  // per sub-batch is a heap allocation per key that buys nothing.  Both the
+  // pointees and `keys` must outlive the returned plan.
+  BatchGetPlan PartitionBatchGetRangeTargets(
+      const std::vector<std::string>& keys, const std::vector<void*>& arena_slices,
+      const std::vector<size_t>& object_sizes, const std::vector<size_t>& packed_bytes,
+      const std::vector<const std::vector<ByteSpan>*>& spans,
+      const std::vector<std::optional<RouteGetResult>>& routes);
 
   struct RemotePutEntry {
     size_t result_index;

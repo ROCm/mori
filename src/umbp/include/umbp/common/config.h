@@ -344,6 +344,22 @@ struct UMBPDistributedConfig {
 
   bool cache_remote_fetches = true;  // cache remotely-fetched blocks locally
 
+  // After a remote RANGED read, pull the whole object into this node's medium
+  // in the background so the next read of the key is a local hit.
+  //
+  // Separate from cache_remote_fetches on purpose.  That flag gates a re-cache
+  // that copies out of the caller's destination buffer, which a GPU-destination
+  // deployment cannot use and therefore has to turn off; this one never touches
+  // the caller's buffer — it reads the peer straight into a freshly allocated
+  // local slot — so the same deployment can keep locality.
+  //
+  // The traffic is duplicate: the layer-wise reader will pull the same object a
+  // slice at a time regardless, so this costs up to one extra copy of the
+  // object on the wire, in exchange for the object being local for the NEXT
+  // request. Best-effort throughout — bounded queue, drop on full, admission
+  // gated by cache_remote_admission / admission_max_block_bytes.
+  bool ranged_locality_prefetch = true;
+
   // Admission gate for re-caching. Only consulted when cache_remote_fetches is true.
   CacheRemoteAdmission cache_remote_admission = CacheRemoteAdmission::SIZE;
 
