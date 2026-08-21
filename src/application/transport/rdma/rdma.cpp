@@ -704,7 +704,7 @@ RdmaDevice* RdmaContext::RdmaDeviceFactory(ibv_device* inDevice) {
         return new Mlx5Device(inDevice);
         break;
       case (static_cast<uint32_t>(RdmaDeviceVendorId::Broadcom)):
-        if (!BnxtDvApi::Available()) {
+        if (!BnxtDvApi::Available() && !env::IsEnvVarEnabled("MORI_EP_OVER_RDMA")) {
           MORI_APP_ERROR("BNXT device detected but libbnxt_re.so not available at runtime");
           return nullptr;
         }
