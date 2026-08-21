@@ -30,6 +30,7 @@
 #include "mori/application/transport/rdma/providers/mlx5/mlx5_prm.hpp"
 #include "mori/application/utils/check.hpp"
 #include "mori/application/utils/math.hpp"
+#include "mori/utils/env_utils.hpp"
 #include "mori/utils/mori_log.hpp"
 
 namespace mori {
@@ -527,14 +528,17 @@ void Mlx5QpContainer::ModifyRtr2Rts(const RdmaEndpointHandle& local_handle) {
 /*                                        Mlx5DeviceContext                                       */
 /* ---------------------------------------------------------------------------------------------- */
 Mlx5DeviceContext::Mlx5DeviceContext(RdmaDevice* rdma_device, ibv_pd* in_pd)
-    : RdmaDeviceContext(rdma_device, in_pd) {
-  mlx5dv_obj dv_obj{};
-  mlx5dv_pd dvpd{};
-  dv_obj.pd.in = pd;
-  dv_obj.pd.out = &dvpd;
-  int status = Mlx5DvApi::Instance().init_obj(&dv_obj, MLX5DV_OBJ_PD);
-  assert(!status);
-  pdn = dvpd.pdn;
+    : RdmaDeviceContext(rdma_device, in_pd),
+      proxyEnabled(env::IsEnvVarEnabled("MORI_EP_OVER_RDMA")) {
+  if (!proxyEnabled) {
+    mlx5dv_obj dv_obj{};
+    mlx5dv_pd dvpd{};
+    dv_obj.pd.in = pd;
+    dv_obj.pd.out = &dvpd;
+    int status = Mlx5DvApi::Instance().init_obj(&dv_obj, MLX5DV_OBJ_PD);
+    assert(!status);
+    pdn = dvpd.pdn;
+  }
 }
 
 Mlx5DeviceContext::~Mlx5DeviceContext() {}

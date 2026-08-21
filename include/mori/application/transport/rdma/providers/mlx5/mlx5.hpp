@@ -145,6 +145,7 @@ class Mlx5DeviceContext : public RdmaDeviceContext {
 
  private:
   uint32_t pdn;
+  bool proxyEnabled{false};
 
   std::unordered_map<uint32_t, std::unique_ptr<Mlx5CqContainer>> cqPool;
   std::unordered_map<uint32_t, std::unique_ptr<Mlx5QpContainer>> qpPool;
