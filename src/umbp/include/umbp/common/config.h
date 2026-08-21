@@ -234,6 +234,16 @@ struct UMBPDistributedConfig {
 
   uint16_t peer_service_port = 0;  // gRPC peer service port
 
+  // After a remote RANGED read, pull the whole object into this node's medium
+  // in the background so the next reader finds it local.
+  //
+  // Deliberately NOT cache_remote_fetches: that one gates a re-cache which
+  // copies out of the CALLER's destination buffer, which a GPU-destination
+  // deployment cannot do and therefore has to switch off. This path never
+  // reads the caller's buffer -- it pulls peer pages straight into a freshly
+  // allocated local slot -- so the same deployment can still have locality.
+  bool ranged_locality_prefetch = true;
+
   bool cache_remote_fetches = true;  // cache remotely-fetched blocks locally
 
   // Admission gate for re-caching. Only consulted when cache_remote_fetches is true.

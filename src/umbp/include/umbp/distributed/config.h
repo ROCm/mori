@@ -187,6 +187,8 @@ struct PoolClientConfig {
 
   // Re-cache remotely-fetched blocks into local DRAM + publish to master so this
   // node becomes an additional serving replica (LMCache-style P2P pull).
+  // See UMBPDistributedConfig::ranged_locality_prefetch.
+  bool ranged_locality_prefetch = true;
   bool cache_remote_fetches = true;
   CacheRemoteAdmission cache_remote_admission = CacheRemoteAdmission::SIZE;
   size_t admission_max_block_bytes = 16ULL * 1024 * 1024;
@@ -223,6 +225,7 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.ssd_staging_buffer_size = dc.ssd_staging_buffer_size;
   pc.ssd_staging_buffer_slots = dc.ssd_staging_buffer_slots;
   pc.peer_service_port = dc.peer_service_port;
+  pc.ranged_locality_prefetch = dc.ranged_locality_prefetch;
   pc.cache_remote_fetches = dc.cache_remote_fetches;
   pc.cache_remote_admission = dc.cache_remote_admission;
   pc.admission_max_block_bytes = dc.admission_max_block_bytes;

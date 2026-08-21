@@ -347,12 +347,57 @@ class PoolClient {
   // Async re-cache install queue. MaybeReCacheAfterRemote copies the block bytes
   // into a job here (the source buffer is not owned past the Get return), and the
   // worker thread installs it. Bounded to keep memory + publish churn in check.
+  // Two shapes share one queue and one worker so they also share its
+  // lifecycle, its bound and its drain-on-shutdown:
+  //   bytes != nullptr  -> install this buffer (MaybeReCacheAfterRemote)
+  //   bytes == nullptr  -> pull the object from `route` first
+  //                        (MaybePrefetchWholeObject)
   struct ReCacheJob {
     std::string key;
     std::unique_ptr<char[]> bytes;
     size_t size = 0;
+    std::optional<RouteGetResult> route;
   };
+
+  // After a remote RANGED read, queue a background pull of the whole object
+  // into this node's medium so the next reader finds it local. The read itself
+  // holds only the caller's spans, and a slot is whole-object, so there is
+  // nothing on hand to install.
+  void MaybePrefetchWholeObject(const std::string& key, size_t object_size,
+                                const RouteGetResult& route);
+  // The other half of the same decision: the arena slice already holds the
+  // whole object (the caller's ranges tiled it in order), so locality costs one
+  // local copy instead of a second trip to the peer. Synchronous because the
+  // slice is live only until the next sub-batch reuses it. Mutually exclusive
+  // with MaybePrefetchWholeObject -- exactly one runs per fetched key.
+  void MaybeInstallCompleteArenaObject(const std::string& key, const void* arena_slice,
+                                       size_t object_size);
+  // Shared gate for both: the feature switch, an allocator to install into, and
+  // the re-cache admission policy.
+  bool LocalityCachingAdmits(size_t object_size) const;
+
+  // Pull whole objects from their peers straight into freshly allocated local
+  // slots and commit them. Peer pages and this node's DRAM pool are both
+  // registered with the IO engine, so this is plain RDMA: no arena, no bounce
+  // buffer, no memcpy, and the reader's destination is never touched.
+  //
+  // BATCHED deliberately, and it has to be. Per key the fixed cost is a peer
+  // resolve RPC plus an RDMA submit/wait, and one worker thread pays it. Done
+  // one key at a time that cost dominates the bytes for small objects so
+  // thoroughly that the worker cannot keep up with the reader, the prefetch
+  // loses more races than it wins, and the feature turns negative. Draining
+  // the queue in one pass per peer amortises the resolve over every key.
+  //
+  // Best-effort per key: already-local keys are dropped before allocating (the
+  // alternative wastes a whole object of wire), and any key whose allocation or
+  // transfer fails is aborted without affecting the others.
+  void FetchWholeObjectsIntoMedium(std::vector<ReCacheJob>& jobs);
+
   std::deque<ReCacheJob> recache_queue_;
+  // Keys with a whole-object pull already queued or running. A layer-wise
+  // reader names the same key once per layer group, so without this every group
+  // that misses locally would queue another pull of bytes already in flight.
+  std::unordered_set<std::string> prefetch_inflight_;
   std::mutex recache_mutex_;
   std::condition_variable recache_cv_;
   std::thread recache_worker_;
@@ -389,6 +434,14 @@ class PoolClient {
     // empty means the whole object -- the degenerate one-span case, kept
     // implicit so no existing caller has to say so.
     const std::vector<ByteSpan>* spans = nullptr;
+    // Pre-resolved destination, used instead of `dst` when set.
+    // FindRegisteredMemory only knows regions passed to RegisterMemory, so a
+    // destination inside this node's own DRAM pool -- RDMA-reachable via
+    // export_dram_mems_ but never handed to RegisterMemory -- has to be named
+    // by that descriptor directly. The locality prefetch writes straight into
+    // a medium slot and is the only user.
+    const mori::io::MemoryDesc* dst_desc = nullptr;
+    uint64_t dst_desc_offset = 0;
     RouteGetResult route;
 
     size_t DstBytes() const { return dst_bytes != 0 ? dst_bytes : size; }

@@ -566,7 +566,9 @@ bool PoolClient::Init() {
 
   // Start the async re-cache worker only when the feature is on and this node has
   // an exportable local DRAM tier to install into.
-  if (config_.cache_remote_fetches && peer_alloc_) {
+  // Two independent producers share the worker: cache_remote_fetches
+  // (whole-object BatchGet) and ranged_locality_prefetch (remote ranged reads).
+  if ((config_.cache_remote_fetches || config_.ranged_locality_prefetch) && peer_alloc_) {
     {
       std::lock_guard<std::mutex> lk(recache_mutex_);
       recache_stop_ = false;
@@ -588,6 +590,7 @@ void PoolClient::Shutdown() {
   {
     std::lock_guard<std::mutex> lk(recache_mutex_);
     recache_stop_ = true;
+    prefetch_inflight_.clear();
     recache_queue_.clear();
   }
   recache_cv_.notify_all();
@@ -1338,7 +1341,162 @@ void PoolClient::MaybeReCacheAfterRemote(const std::string& key, const void* src
   recache_cv_.notify_one();
 }
 
+// How many whole-object prefetches one worker pass may take at once.  Large
+// enough that the per-batch resolve RPC is amortised over a realistic page
+// batch, small enough that one batch's slot allocations and wire time stay
+// bounded when objects are multi-MiB.
+constexpr size_t kPrefetchBatchMax = 256;
+
+bool PoolClient::LocalityCachingAdmits(size_t object_size) const {
+  if (!config_.ranged_locality_prefetch || !peer_alloc_) return false;
+  // Same admission policy as the non-ranged re-cache, minus its enable flag:
+  // ranged_locality_prefetch is this path's switch and was checked above, so
+  // the predicate is asked only about the policy and the block size.
+  return ShouldAdmitReCache(/*cache_remote_fetches=*/true, config_.cache_remote_admission,
+                            config_.admission_max_block_bytes, object_size);
+}
+
+void PoolClient::MaybeInstallCompleteArenaObject(const std::string& key, const void* arena_slice,
+                                                 size_t object_size) {
+  if (!LocalityCachingAdmits(object_size)) return;
+  // Synchronous on purpose, and cheap relative to the alternative: the slice is
+  // live only until the next sub-batch reuses it, and a local copy of the
+  // object beats a second RDMA of the same bytes.
+  const auto installed =
+      ExecuteLocalPut(key, arena_slice, object_size, TierType::DRAM, /*enqueue_ssd_copy=*/false);
+  if (installed != PutAttemptOutcome::kSuccess &&
+      installed != PutAttemptOutcome::kSuccessAlreadyExists) {
+    master_client_->AddCounter(MORI_UMBP_METRIC_RANGED_REMOTE_INSTALL_FAILURES_TOTAL,
+                               MORI_UMBP_METRIC_RANGED_REMOTE_INSTALL_FAILURES_TOTAL_HELP, {}, 1.0);
+  }
+}
+
+void PoolClient::MaybePrefetchWholeObject(const std::string& key, size_t object_size,
+                                          const RouteGetResult& route) {
+  if (!LocalityCachingAdmits(object_size)) return;
+
+  ReCacheJob job;
+  job.key = key;
+  job.size = object_size;
+  job.route = route;  // bytes stays null: the worker pulls them itself
+
+  {
+    std::lock_guard<std::mutex> lk(recache_mutex_);
+    if (recache_stop_) return;
+    if (recache_queue_.size() >= recache_queue_max_) {
+      MORI_UMBP_DEBUG("[PoolClient] MaybePrefetchWholeObject: queue full, dropping key='{}'", key);
+      return;
+    }
+    if (!prefetch_inflight_.insert(key).second) return;  // already queued or running
+    recache_queue_.push_back(std::move(job));
+  }
+  recache_cv_.notify_one();
+}
+
+void PoolClient::FetchWholeObjectsIntoMedium(std::vector<ReCacheJob>& jobs) {
+  if (!peer_alloc_ || jobs.empty()) return;
+
+  // Drop anything that landed while it waited in the queue -- a concurrent
+  // request, or the offload path writing it back.  One batched resolve, before
+  // any allocation: the alternative wastes a whole object of wire per key.
+  std::vector<std::string> keys;
+  keys.reserve(jobs.size());
+  for (const auto& job : jobs) keys.push_back(job.key);
+  const auto resolved = peer_alloc_->BatchResolve(keys, /*include_descs=*/false);
+
+  std::vector<size_t> wanted;
+  std::vector<PeerDramAllocator::AllocateRequest> requests;
+  wanted.reserve(jobs.size());
+  requests.reserve(jobs.size());
+  for (size_t i = 0; i < jobs.size(); ++i) {
+    if (i < resolved.size() && resolved[i].found) continue;
+    if (!jobs[i].route.has_value()) continue;
+    wanted.push_back(i);
+    requests.push_back(
+        PeerDramAllocator::AllocateRequest{jobs[i].key, jobs[i].size, TierType::DRAM});
+  }
+  if (requests.empty()) return;
+
+  auto allocs = peer_alloc_->BatchAllocate(requests);
+
+  // The remote get path names its destination as one contiguous span, so the
+  // slot has to be one.  The page allocator already prefers a same-buffer
+  // continuous run, and distributed mode stores one key per page, so the common
+  // cases are covered; a scattered slot is left uncached rather than served by
+  // a path that would misplace it.
+  //
+  // slot_descs is reserved up front and never grows: the plan holds pointers
+  // into it.
+  BatchGetPlan plan;
+  std::vector<mori::io::MemoryDesc> slot_descs;
+  std::vector<size_t> planned;  // index into wanted/allocs
+  slot_descs.reserve(wanted.size());
+  planned.reserve(wanted.size());
+
+  for (size_t w = 0; w < wanted.size(); ++w) {
+    auto& alloc = allocs[w];
+    if (alloc.outcome != PeerDramAllocator::Outcome::kSuccessAllocated || !alloc.slot.has_value()) {
+      continue;
+    }
+    const auto& slot = *alloc.slot;
+    const auto& job = jobs[wanted[w]];
+
+    bool contiguous = !slot.pages.empty();
+    for (size_t q = 1; q < slot.pages.size() && contiguous; ++q) {
+      contiguous = slot.pages[q].buffer_index == slot.pages.front().buffer_index &&
+                   slot.pages[q].page_index == slot.pages.front().page_index + q;
+    }
+    const uint32_t buffer_index = slot.pages.empty() ? 0 : slot.pages.front().buffer_index;
+    if (!contiguous || buffer_index >= export_dram_mems_.size() ||
+        !IsValidMemoryDesc(export_dram_mems_[buffer_index])) {
+      MORI_UMBP_DEBUG("[PoolClient] prefetch: slot for key='{}' is not one addressable run",
+                      job.key);
+      // Aborted here and never revisited: the commit/abort pass below walks
+      // `planned`, which this key does not enter.
+      peer_alloc_->Abort(slot.slot_id);
+      continue;
+    }
+
+    slot_descs.push_back(export_dram_mems_[buffer_index]);
+    plan.remote_dram_groups[job.route->node_id].push_back(
+        BatchGetItem{.index = planned.size(),
+                     .key = &job.key,
+                     .dst = nullptr,
+                     .size = job.size,
+                     .dst_desc = &slot_descs.back(),
+                     .dst_desc_offset = PageOffset(slot.pages.front(), peer_alloc_->PageSize()),
+                     .route = *job.route});
+    planned.push_back(w);
+  }
+  if (planned.empty()) return;
+
+  std::vector<bool> fetched(planned.size(), false);
+  ExecuteRemoteBatchGetPlan(plan, &fetched, /*recache_remote=*/false);
+
+  std::vector<PeerDramAllocator::CommitRequest> commits;
+  std::vector<uint64_t> aborts;
+  commits.reserve(planned.size());
+  for (size_t i = 0; i < planned.size(); ++i) {
+    const auto& slot = *allocs[planned[i]].slot;
+    if (!fetched[i]) {
+      aborts.push_back(slot.slot_id);
+      continue;
+    }
+    commits.push_back(PeerDramAllocator::CommitRequest{slot.slot_id, jobs[wanted[planned[i]]].key});
+  }
+  if (!commits.empty()) {
+    const auto committed = peer_alloc_->BatchCommit(commits);
+    for (size_t c = 0; c < committed.size(); ++c) {
+      if (!committed[c].success) aborts.push_back(commits[c].slot_id);
+    }
+  }
+  if (!aborts.empty()) peer_alloc_->BatchAbort(aborts);
+}
+
 void PoolClient::ReCacheWorkerLoop() {
+  // Reused across iterations so a steady stream of prefetches does not
+  // reallocate this vector on every batch.
+  std::vector<ReCacheJob> prefetch_batch;
   for (;;) {
     ReCacheJob job;
     {
@@ -1347,6 +1505,35 @@ void PoolClient::ReCacheWorkerLoop() {
       if (recache_stop_ && recache_queue_.empty()) return;
       job = std::move(recache_queue_.front());
       recache_queue_.pop_front();
+      // A prefetch is worth batching: its cost per key is a peer resolve RPC
+      // plus an RDMA round trip, and this is the only thread paying it.  Take
+      // every prefetch already waiting, up to a cap that keeps one batch's
+      // allocations and wire time bounded.
+      if (job.bytes == nullptr) {
+        prefetch_batch.clear();
+        prefetch_batch.push_back(std::move(job));
+        for (auto it = recache_queue_.begin();
+             it != recache_queue_.end() && prefetch_batch.size() < kPrefetchBatchMax;) {
+          if (it->bytes != nullptr) {
+            ++it;  // an install job; leave it in order
+            continue;
+          }
+          prefetch_batch.push_back(std::move(*it));
+          it = recache_queue_.erase(it);
+        }
+      }
+    }
+    if (!prefetch_batch.empty()) {
+      // Whole-object locality prefetch.  The dedup slots are released
+      // afterwards, so a later miss can retry whatever did not land.
+      FetchWholeObjectsIntoMedium(prefetch_batch);
+      {
+        std::lock_guard<std::mutex> lk(recache_mutex_);
+        for (const auto& done : prefetch_batch) prefetch_inflight_.erase(done.key);
+      }
+      MORI_UMBP_DEBUG("[PoolClient] ReCacheWorker: prefetched {} objects", prefetch_batch.size());
+      prefetch_batch.clear();
+      continue;
     }
     // Install into local DRAM. ExecuteLocalPut allocates a slot in dram_buffers,
     // copies the bytes, and Commit queues a KvEvent::ADD that reaches the master
@@ -2177,6 +2364,12 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
     std::vector<size_t> lens;    // their sizes
     std::vector<size_t> packed;  // where each lands inside the slice
     size_t bytes = 0;            // == sum of spans
+    // The slice is byte-for-byte the whole object, which happens when the
+    // caller's ranges tile it in ascending order and it all fits in one unit.
+    // The whole-object reader (one call for every layer) hits this; the
+    // layer-wise reader never does.  When it holds, locality costs one local
+    // install instead of a second trip to the peer.
+    bool holds_whole_object = false;
   };
   std::vector<RangeFetchUnit> units;
   units.reserve(missed.size());
@@ -2204,7 +2397,12 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
     unit.original = original;
     unit.object_size = object_size;
     unit.route = routes[r];
+    // Ascending and gapless from byte 0 is what makes the slice equal the
+    // object; a split breaks it because no single slice then holds everything.
+    bool ascending_from_zero = true;
+    bool split = false;
     bool servable = true;
+    size_t cursor = 0;
     for (size_t j = 0; j < sizes[original].size(); ++j) {
       const size_t span_bytes = sizes[original][j];
       if (span_bytes > scratch_size) {
@@ -2215,7 +2413,10 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
         servable = false;
         break;
       }
+      if (src_offsets[original][j] != cursor) ascending_from_zero = false;
+      cursor += span_bytes;
       if (unit.bytes + span_bytes > scratch_size) {
+        split = true;
         key_units.push_back(std::move(unit));
         unit = RangeFetchUnit{};
         unit.original = original;
@@ -2245,7 +2446,10 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
       unit.bytes += span_bytes;
     }
     if (!servable) continue;  // key stays false; none of its units are queued
-    if (!unit.spans.empty()) key_units.push_back(std::move(unit));
+    if (!unit.spans.empty()) {
+      unit.holds_whole_object = !split && ascending_from_zero && unit.bytes == object_size;
+      key_units.push_back(std::move(unit));
+    }
     units.insert(units.end(), std::make_move_iterator(key_units.begin()),
                  std::make_move_iterator(key_units.end()));
   }
@@ -2314,6 +2518,19 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
       if (!fetched[j] ||
           !CopyContiguousToRanges(sub_slices[j], unit.bytes, unit.dsts, unit.lens, unit.packed)) {
         unit_ok[unit.original] = false;
+        continue;
+      }
+      // Make the NEXT read of this key local.  Two ways, and exactly one of
+      // them applies:
+      //   * the slice already IS the whole object -> install it from there,
+      //     which costs one local copy and nothing on the wire;
+      //   * it is not -> ask the background worker to pull the object.
+      // Installing from the slice has to happen now, before the next sub-batch
+      // reuses it.
+      if (unit.holds_whole_object) {
+        MaybeInstallCompleteArenaObject(sub_keys[j], sub_slices[j], unit.object_size);
+      } else {
+        MaybePrefetchWholeObject(sub_keys[j], unit.object_size, *unit.route);
       }
     }
     pos = end;
@@ -2904,11 +3121,20 @@ bool PoolClient::BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries, P
   for (size_t idx = 0; idx < entries.size(); ++idx) {
     auto& entry = entries[idx];
 
-    // DstBytes(), not size: a ranged entry's slice is only as long as its spans
-    // total, and asking about the whole object makes the containment check
-    // reject a slice near the end of the arena -- silently downgrading a
+    // A pre-resolved destination short-circuits the lookup: the locality
+    // prefetch writes into this node's own DRAM pool, which is registered with
+    // the IO engine but was never passed to RegisterMemory, so
+    // FindRegisteredMemory would miss it and fall through to staging.
+    //
+    // Otherwise DstBytes(), not size: a ranged entry's slice is only as long as
+    // its spans total, and asking about the whole object makes the containment
+    // check reject a slice near the end of the arena -- silently downgrading a
     // zero-copy read to a staged one.
-    auto zero_copy = FindRegisteredMemory(entry.item->dst, entry.item->DstBytes());
+    auto zero_copy =
+        entry.item->dst_desc != nullptr
+            ? std::make_optional(std::make_pair(*entry.item->dst_desc,
+                                                static_cast<size_t>(entry.item->dst_desc_offset)))
+            : FindRegisteredMemory(entry.item->dst, entry.item->DstBytes());
     if (zero_copy.has_value()) {
       entry.zero_copy = zero_copy;
       entry.use_staging = false;
