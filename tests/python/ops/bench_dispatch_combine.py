@@ -1656,7 +1656,7 @@ if __name__ == "__main__":
             "'normal' is the legacy default (torch.randn). "
             "'uniform' samples on [-1, 1]. "
             "'lognormal' samples exp(N(0,1))-1 (heavy right tail). "
-            "'two_bucket' is 99% N(0,1) + 1% N(0, 16) for long-tail activations."
+            "'two_bucket' is 99%% N(0,1) + 1%% N(0, 16) for long-tail activations."
         ),
     )
     parser.add_argument(
