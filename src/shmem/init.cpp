@@ -46,6 +46,7 @@ namespace mori {
 namespace shmem {
 
 static std::vector<std::unique_ptr<core::ProxyThread>> proxyThreads;
+static void* proxyRingsHost[core::PROXY_MAX_NICS] = {};
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                      ShmemStatesSingleton                                     */
@@ -608,6 +609,8 @@ void GpuStateInit(ShmemStates* states) {
 
     // Allocate one ProxyRing per NIC. Each ring has its own gpu_head so
     // GPU warps targeting different NICs don't contend on the same atomic.
+    // proxyRingsHost[] keeps the host pointer for the CPU proxy thread and cleanup.
+    // gpuStates.proxyRings[] stores the GPU device pointer for the GPU kernels.
     int allocated = 0;
     for (int n = 0; n < numNics; n++) {
       void* ringPtr = nullptr;
@@ -618,7 +621,10 @@ void GpuStateInit(ShmemStates* states) {
                                             hipHostRegisterMapped | hipHostRegisterPortable);
         if (regErr == hipSuccess) {
           memset(ring, 0, sizeof(core::ProxyRing));
-          states->gpuStates.proxyRings[n] = ring;
+          proxyRingsHost[n] = ring;
+          void* ringDev = nullptr;
+          hipHostGetDevicePointer(&ringDev, ring, 0);
+          states->gpuStates.proxyRings[n] = ringDev ? static_cast<core::ProxyRing*>(ringDev) : ring;
           allocated++;
         } else {
           free(ringPtr);
@@ -783,7 +789,7 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
       }
       if (nicQpCount > 0) {
         auto thread = std::make_unique<core::ProxyThread>();
-        thread->Init(static_cast<core::ProxyRing*>(states->gpuStates.proxyRings[n]), std::move(nicQps), gpuId);
+        thread->Init(static_cast<core::ProxyRing*>(proxyRingsHost[n]), std::move(nicQps), gpuId);
         thread->Start();
         proxyThreads.push_back(std::move(thread));
       }
@@ -810,9 +816,10 @@ static void FinalizeGpuStates(ShmemStates* states) {
   }
   proxyThreads.clear();
   for (int n = 0; n < core::PROXY_MAX_NICS; n++) {
-    if (states->gpuStates.proxyRings[n]) {
-      hipHostUnregister(states->gpuStates.proxyRings[n]);
-      free(states->gpuStates.proxyRings[n]);
+    if (proxyRingsHost[n]) {
+      hipHostUnregister(proxyRingsHost[n]);
+      free(proxyRingsHost[n]);
+      proxyRingsHost[n] = nullptr;
       states->gpuStates.proxyRings[n] = nullptr;
     }
   }
