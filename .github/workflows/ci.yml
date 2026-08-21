@@ -129,10 +129,15 @@ jobs:
             --num-qp-per-transfer 4 --batch-contiguous \
             --num-initiator-dev 1 --num-target-dev 1 \
             --warmup-iters 128 --log-level info"
+          {
+            echo "=== MORI-IO bench_engine CI commands ==="
+            echo "COMMON=${COMMON}"
+            echo "NODE1_HOST=${NODE1_HOST} NODE2_HOST=${NODE2_HOST}"
+            echo ""
+          } | tee "$RESULTS"
           for BATCH in 1 64; do
             ITERS=128
             if [ "$BATCH" -eq 1 ]; then ITERS=512; fi
-            echo "=== C++ bench_engine GPU write sweep, batch=$BATCH, iters=$ITERS, port=$PORT ===" | tee -a "$RESULTS"
             ARGS="$COMMON --transfer-batch-size $BATCH --iters $ITERS"
             R1="cd $GITHUB_WORKSPACE && MORI_DISABLE_AUTO_XGMI=1 $LDP $BIN \
               --rank 1 --master-ip $NODE1_HOST --self-ip $NODE2_HOST --port $PORT \
@@ -140,6 +145,14 @@ jobs:
             R0="cd $GITHUB_WORKSPACE && MORI_DISABLE_AUTO_XGMI=1 $LDP $BIN \
               --rank 0 --master-ip $NODE1_HOST --self-ip $NODE1_HOST --port $PORT \
               --target-dev-offset 0 $ARGS"
+            {
+              echo "=== C++ bench_engine GPU write sweep, batch=$BATCH, iters=$ITERS, port=$PORT ==="
+              echo "rank 0 (initiator, node1):"
+              echo "$R0"
+              echo "rank 1 (target, node2):"
+              echo "$R1"
+              echo ""
+            } | tee -a "$RESULTS"
             ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
               "$CT exec $CONTAINER bash -c \"$R1\"" >> "$RESULTS" 2>&1 &
             $CT exec $CONTAINER bash -c "$R0" | tee -a "$RESULTS"
