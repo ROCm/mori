@@ -108,78 +108,36 @@ jobs:
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
             "$CT exec $CONTAINER bash -c \"$INSTALL_CMD\""
 
-      - name: MORI-IO C++ and Python write sweeps (batch 1 and 64)
+      - name: MORI-IO C++ bench_engine write sweep (batch 1)
         run: |
+          set -euo pipefail
           mkdir -p $GITHUB_WORKSPACE/_perf
           CPP_RESULTS=$GITHUB_WORKSPACE/_perf/bench_engine_results.txt
-          PY_RESULTS=$GITHUB_WORKSPACE/_perf/python_benchmark_results.txt
           BIN=$GITHUB_WORKSPACE/build/tests/cpp/bench_engine
           LDP="LD_LIBRARY_PATH=$GITHUB_WORKSPACE/build/src/io:$GITHUB_WORKSPACE/build/src/application"
-          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
-          chmod +x "$SCRIPT"
-
-          # Sweep: 1 MiB .. 32 MiB by 1 MiB; 4 QP, chunking off, 4 workers, batch-contiguous.
-          SWEEP="--all --sweep-start-size 1048576 --sweep-max-size 33554432 --sweep-step 1048576 \
-            --disable-chunking --batch-contiguous \
-            --num-qp-per-transfer 4 --num-worker-threads 4 --enable-sess --poll_cq_mode polling \
+          PORT=29130
+          ARGS="--op-type write --mem-type gpu --all \
+            --sweep-start-size 1048576 --sweep-max-size 33554432 --sweep-step 1048576 \
+            --disable-chunking --num-qp-per-transfer 8 --enable-sess --poll_cq_mode polling \
             --num-initiator-dev 1 --num-target-dev 1 --target-dev-offset 0 \
-            --log-level info"
+            --transfer-batch-size 1 --iters 512 --log-level info"
 
-          BATCH1_CPP="--op write --mem-type gpu --gpu 0 $SWEEP \
-            --transfer-batch-size 1 --iters 512 --warmup-iters 10"
-
-          BATCH1_PY="--op-type write --mem-type gpu $SWEEP \
-            --transfer-batch-size 1 --enable-batch-transfer --iters 512 --warmup-iters 10"
-
-          BATCH64_CPP="--op write --mem-type gpu --gpu 0 $SWEEP \
-            --transfer-batch-size 64 --enable-batch-transfer --iters 128 --warmup-iters 10"
-
-          BATCH64_PY="--op-type write --mem-type gpu $SWEEP \
-            --transfer-batch-size 64 --enable-batch-transfer --iters 128 --warmup-iters 10"
-
-          CPP_PORT=29130
-          PY_PORT=29230
-          for BATCH in 1 64; do
-            if [ "$BATCH" -eq 1 ]; then
-              CPP_ARGS="$BATCH1_CPP"
-              CPP_RENDEZ=""
-              PY_ARGS="$BATCH1_PY"
-            else
-              CPP_ARGS="$BATCH64_CPP"
-              CPP_RENDEZ=""
-              PY_ARGS="$BATCH64_PY"
-            fi
-
-            echo "=== C++ bench_engine GPU write sweep, batch=$BATCH, port=$CPP_PORT ===" \
-              | tee -a "$CPP_RESULTS"
-            R1="cd $GITHUB_WORKSPACE && MORI_DISABLE_AUTO_XGMI=1 $LDP $BIN \
-              --rank 1 --master-ip $NODE1_HOST --self-ip $NODE2_HOST --port $CPP_PORT \
-              $CPP_RENDEZ $CPP_ARGS"
-            R0="cd $GITHUB_WORKSPACE && MORI_DISABLE_AUTO_XGMI=1 $LDP $BIN \
-              --rank 0 --master-ip $NODE1_HOST --self-ip $NODE1_HOST --port $CPP_PORT \
-              $CPP_RENDEZ $CPP_ARGS"
-            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
-              "$CT exec $CONTAINER bash -c \"$R1\"" >> "$CPP_RESULTS" 2>&1 &
-            $CT exec $CONTAINER bash -c "$R0" | tee -a "$CPP_RESULTS"
-            wait
-            CPP_PORT=$((CPP_PORT + 1))
-
-            echo "=== Python benchmark.py GPU write sweep, batch=$BATCH, port=$PY_PORT ===" \
-              | tee -a "$PY_RESULTS"
-            NODE2_CMD=(
-              $CT exec -e MORI_DISABLE_AUTO_XGMI=1 $CONTAINER bash $SCRIPT
-              --rank 1 --master-addr $NODE1_HOST --master-port $PY_PORT
-              --ifname $NODE2_IFNAME
-              -- $PY_ARGS
-            )
-            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" >> "$PY_RESULTS" 2>&1 &
-            $CT exec -e MORI_DISABLE_AUTO_XGMI=1 $CONTAINER bash $SCRIPT \
-              --rank 0 --master-addr $NODE1_HOST --master-port $PY_PORT \
-              --ifname $NODE1_IFNAME \
-              -- $PY_ARGS | tee -a "$PY_RESULTS"
-            wait
-            PY_PORT=$((PY_PORT + 1))
-          done
+          echo "=== C++ bench_engine GPU write sweep, batch=1, iters=512, port=$PORT ===" \
+            | tee "$CPP_RESULTS"
+          R1="cd $GITHUB_WORKSPACE && MORI_DISABLE_AUTO_XGMI=1 $LDP $BIN \
+            --rank 1 --master-ip $NODE1_HOST --self-ip $NODE2_HOST --port $PORT \
+            --target-dev-offset 0 --warmup-iters 128 $ARGS"
+          R0="cd $GITHUB_WORKSPACE && MORI_DISABLE_AUTO_XGMI=1 $LDP $BIN \
+            --rank 0 --master-ip $NODE1_HOST --self-ip $NODE1_HOST --port $PORT \
+            --target-dev-offset 0 --warmup-iters 128 $ARGS"
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
+            "$CT exec $CONTAINER bash -c \"$R1\"" >> "$CPP_RESULTS" 2>&1 &
+          pid=$!
+          if ! $CT exec $CONTAINER bash -c "$R0" | tee -a "$CPP_RESULTS"; then
+            wait "$pid" || true
+            exit 1
+          fi
+          wait "$pid"
 
       - name: Upload perf results
         if: always()
@@ -188,7 +146,6 @@ jobs:
           name: mori-io-perf-${{ github.run_id }}
           path: |
             ${{ github.workspace }}/_perf/bench_engine_results.txt
-            ${{ github.workspace }}/_perf/python_benchmark_results.txt
           if-no-files-found: warn
 
       - name: Cleanup node1
