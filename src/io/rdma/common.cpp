@@ -914,8 +914,6 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
   // signal on each EP (mirrors epMergedSinceSignal); attached to the signaled
   // record's io_transfer range and reset on signal. The empty vector does not
   // allocate when transfer markers are disabled.
-  std::vector<size_t> epBytesSinceSignal;
-  if (roctxTransferEnabled) epBytesSinceSignal.assign(epNum, 0);
 
   // Rotate the starting EP by transfer id so single-segment (single WR)
   // transfers spread evenly across all QPs instead of always landing on eps[0].
@@ -955,13 +953,6 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
     epWrsSinceSignal[epId] += batchWrNum;
     epMergedSinceSignal[epId] += mergedReqSize;
     epBytesSinceSignal[epId] += batchBytes;
-    if (roctxTransferEnabled) {
-      size_t batchBytes = 0;
-      for (int j = st; j < end; ++j) {
-        batchBytes += mergedWrs[j].totalRemoteLength;
-      }
-      epBytesSinceSignal[epId] += batchBytes;
-    }
 
     bool isLastBatchForEp = ((i + epNum) >= numPostBatch);
     bool sqNearFull = eps[epId].sqDepth && (epWrsSinceSignal[epId] >= eps[epId].maxSqDepth);
@@ -1119,7 +1110,6 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
       epWrsSinceSignal[epId] = 0;
       epMergedSinceSignal[epId] = 0;
       epBytesSinceSignal[epId] = 0;
-      if (roctxTransferEnabled) epBytesSinceSignal[epId] = 0;
     }
     MORI_IO_TRACE("ibv_post_send ep index {} batch index range [{}, {})", epId, st, end);
   }
