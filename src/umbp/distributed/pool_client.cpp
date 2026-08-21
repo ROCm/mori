@@ -2355,22 +2355,6 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   // bytes they total, and where in the arena they land.  Splitting by span
   // prefix rather than by key means an object larger than the arena is no
   // longer unservable -- only a single span larger than the arena is.
-  struct RangeFetchUnit {
-    size_t original = 0;
-    size_t object_size = 0;
-    std::optional<RouteGetResult> route;
-    std::vector<ByteSpan> spans;
-    std::vector<void*> dsts;     // caller buffers, one per named range
-    std::vector<size_t> lens;    // their sizes
-    std::vector<size_t> packed;  // where each lands inside the slice
-    size_t bytes = 0;            // == sum of spans
-    // The slice is byte-for-byte the whole object, which happens when the
-    // caller's ranges tile it in ascending order and it all fits in one unit.
-    // The whole-object reader (one call for every layer) hits this; the
-    // layer-wise reader never does.  When it holds, locality costs one local
-    // install instead of a second trip to the peer.
-    bool holds_whole_object = false;
-  };
   std::vector<RangeFetchUnit> units;
   units.reserve(missed.size());
 
@@ -2459,6 +2443,14 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   std::unordered_map<size_t, bool> unit_ok;
   for (const auto& unit : units) unit_ok.emplace(unit.original, true);
 
+  // Whole-object units skip the arena entirely when a slot can be had; what
+  // comes back is everything that still needs one.
+  units = ServeWholeObjectUnitsFromMedium(keys, std::move(units), &unit_ok);
+  if (units.empty()) {
+    for (const auto& [original, ok] : unit_ok) results[original] = ok;
+    return results;
+  }
+
   std::unique_lock<std::mutex> scratch_lock(ranged_get_scratch_mutex_);
 
   // Pack as many units into the arena as fit, fetch that group, then repeat.
@@ -2523,7 +2515,8 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
       // Make the NEXT read of this key local.  Two ways, and exactly one of
       // them applies:
       //   * the slice already IS the whole object -> install it from there,
-      //     which costs one local copy and nothing on the wire;
+      //     which costs one local copy and nothing on the wire.  Only units the
+      //     medium could not give a slot to reach this;
       //   * it is not -> ask the background worker to pull the object.
       // Installing from the slice has to happen now, before the next sub-batch
       // reuses it.
@@ -2987,6 +2980,142 @@ void PoolClient::WaitRemoteBatchGet(RemoteDramGetInFlight& f, std::vector<bool>*
   }
 
   FinalizeRemoteGetEntries(f.entries, results, recache_remote);
+}
+
+std::vector<PoolClient::RangeFetchUnit> PoolClient::ServeWholeObjectUnitsFromMedium(
+    const std::vector<std::string>& keys, std::vector<RangeFetchUnit> units,
+    std::unordered_map<size_t, bool>* unit_ok) {
+  std::vector<RangeFetchUnit> leftover;
+  leftover.reserve(units.size());
+
+  // Only a unit that is the whole object can go straight into a slot, and only
+  // when this node wants the object cached at all -- with locality caching off
+  // there is no slot to commit and the arena is the only destination.
+  std::vector<size_t> candidates;
+  for (size_t i = 0; i < units.size(); ++i) {
+    if (peer_alloc_ && units[i].holds_whole_object && LocalityCachingAdmits(units[i].object_size)) {
+      candidates.push_back(i);
+    } else {
+      leftover.push_back(std::move(units[i]));
+    }
+  }
+  if (candidates.empty()) return leftover;
+
+  // Already here? Then the local phase raced us to it; hand the unit back
+  // rather than allocate a second slot for a key the medium already holds.
+  std::vector<std::string> candidate_keys;
+  candidate_keys.reserve(candidates.size());
+  for (size_t i : candidates) candidate_keys.push_back(keys[units[i].original]);
+  const auto resolved = peer_alloc_->BatchResolve(candidate_keys, /*include_descs=*/false);
+
+  std::vector<size_t> wanted;
+  std::vector<PeerDramAllocator::AllocateRequest> requests;
+  wanted.reserve(candidates.size());
+  requests.reserve(candidates.size());
+  for (size_t c = 0; c < candidates.size(); ++c) {
+    if (c < resolved.size() && resolved[c].found) {
+      leftover.push_back(std::move(units[candidates[c]]));
+      continue;
+    }
+    wanted.push_back(candidates[c]);
+    requests.push_back(PeerDramAllocator::AllocateRequest{
+        candidate_keys[c], units[candidates[c]].object_size, TierType::DRAM});
+  }
+  if (requests.empty()) return leftover;
+
+  auto allocs = peer_alloc_->BatchAllocate(requests);
+
+  // slot_descs and slot_bases are reserved up front and never grow: the plan
+  // holds pointers into the first.
+  BatchGetPlan plan;
+  std::vector<mori::io::MemoryDesc> slot_descs;
+  std::vector<char*> slot_bases;
+  std::vector<size_t> planned;  // index into wanted/allocs
+  slot_descs.reserve(wanted.size());
+  slot_bases.reserve(wanted.size());
+  planned.reserve(wanted.size());
+
+  for (size_t w = 0; w < wanted.size(); ++w) {
+    auto& alloc = allocs[w];
+    RangeFetchUnit& unit = units[wanted[w]];
+    if (alloc.outcome != PeerDramAllocator::Outcome::kSuccessAllocated || !alloc.slot.has_value()) {
+      leftover.push_back(std::move(unit));  // medium is full; the arena still works
+      continue;
+    }
+    const auto& slot = *alloc.slot;
+
+    // The remote get path names its destination as one contiguous span, so the
+    // slot has to be one.  The page allocator already prefers a same-buffer
+    // continuous run, and distributed mode stores one key per page, so the
+    // common cases are covered.
+    bool contiguous = !slot.pages.empty();
+    for (size_t q = 1; q < slot.pages.size() && contiguous; ++q) {
+      contiguous = slot.pages[q].buffer_index == slot.pages.front().buffer_index &&
+                   slot.pages[q].page_index == slot.pages.front().page_index + q;
+    }
+    const uint32_t buffer_index = slot.pages.empty() ? 0 : slot.pages.front().buffer_index;
+    if (!contiguous || buffer_index >= export_dram_mems_.size() ||
+        !IsValidMemoryDesc(export_dram_mems_[buffer_index]) ||
+        buffer_index >= config_.dram_buffers.size() ||
+        config_.dram_buffers[buffer_index].buffer == nullptr) {
+      peer_alloc_->Abort(slot.slot_id);
+      leftover.push_back(std::move(unit));
+      continue;
+    }
+
+    const uint64_t slot_offset = PageOffset(slot.pages.front(), peer_alloc_->PageSize());
+    slot_bases.push_back(static_cast<char*>(config_.dram_buffers[buffer_index].buffer) +
+                         slot_offset);
+    slot_descs.push_back(export_dram_mems_[buffer_index]);
+    plan.remote_dram_groups[unit.route->node_id].push_back(
+        BatchGetItem{.index = planned.size(),
+                     .key = &keys[unit.original],
+                     .dst = nullptr,
+                     .size = unit.object_size,
+                     .dst_bytes = unit.bytes,
+                     .spans = &unit.spans,
+                     .dst_desc = &slot_descs.back(),
+                     .dst_desc_offset = slot_offset,
+                     .route = *unit.route});
+    planned.push_back(w);
+  }
+  if (planned.empty()) return leftover;
+
+  std::vector<bool> fetched(planned.size(), false);
+  ExecuteRemoteBatchGetPlan(plan, &fetched, /*recache_remote=*/false);
+
+  std::vector<PeerDramAllocator::CommitRequest> commits;
+  std::vector<uint64_t> aborts;
+  commits.reserve(planned.size());
+  for (size_t i = 0; i < planned.size(); ++i) {
+    const auto& slot = *allocs[planned[i]].slot;
+    RangeFetchUnit& unit = units[wanted[planned[i]]];
+    if (!fetched[i]) {
+      // The bytes never arrived, so there is nothing worth keeping.  Not a
+      // fallback to the arena: see the note on the declaration.
+      aborts.push_back(slot.slot_id);
+      (*unit_ok)[unit.original] = false;
+      continue;
+    }
+    // Copy out BEFORE committing.  A pending slot cannot be reclaimed; a
+    // committed one is an ordinary evictable object, and reading it after that
+    // races the allocator.
+    if (!CopyContiguousToRanges(slot_bases[i], unit.object_size, unit.dsts, unit.lens,
+                                unit.packed)) {
+      (*unit_ok)[unit.original] = false;
+    }
+    // Commit either way: the slot holds the object whether or not the caller's
+    // copy-out worked, and caching it still helps the next reader.
+    commits.push_back(PeerDramAllocator::CommitRequest{slot.slot_id, keys[unit.original]});
+  }
+  if (!commits.empty()) {
+    const auto committed = peer_alloc_->BatchCommit(commits);
+    for (size_t c = 0; c < committed.size(); ++c) {
+      if (!committed[c].success) aborts.push_back(commits[c].slot_id);
+    }
+  }
+  if (!aborts.empty()) peer_alloc_->BatchAbort(aborts);
+  return leftover;
 }
 
 PoolClient::BatchGetPlan PoolClient::PartitionBatchGetRangeTargets(
