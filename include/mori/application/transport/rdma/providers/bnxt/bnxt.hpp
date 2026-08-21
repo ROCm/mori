@@ -28,6 +28,7 @@ extern "C" {
 
 #include <mutex>
 #include <set>
+#include <unordered_map>
 
 #include "mori/application/transport/rdma/providers/dv_loader.hpp"
 #include "mori/application/transport/rdma/rdma.hpp"
@@ -143,11 +144,20 @@ class BnxtDeviceContext : public RdmaDeviceContext {
   bool TryRegisterUar(void* uar_addr);
   bool TryUnregisterUar(void* uar_addr);
 
+  struct ProxyRecvInfo { void* buf{nullptr}; uint32_t lkey{0}; uint32_t count{0}; };
+  ProxyRecvInfo GetProxyRecvInfo(uint32_t qpn) {
+    auto it = proxyRecvInfo.find(qpn);
+    return (it != proxyRecvInfo.end()) ? it->second : ProxyRecvInfo{};
+  }
+
  private:
   uint32_t pdn;
+  bool proxyEnabled{false};
 
   std::unordered_map<uint32_t, BnxtCqContainer*> cqPool;
   std::unordered_map<uint32_t, BnxtQpContainer*> qpPool;
+  std::unordered_map<uint32_t, ibv_qp*> proxyQpPool;
+  std::unordered_map<uint32_t, ProxyRecvInfo> proxyRecvInfo;
 
   // Track registered UAR addresses to avoid double registration/unregistration
   std::set<void*> registeredUars;
