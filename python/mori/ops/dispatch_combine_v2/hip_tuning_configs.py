@@ -158,7 +158,12 @@ _COMBINE_TABLE: dict = {
         #   4096  155.5   132.6  133.5
         # The tail is a tie, so it keeps the smaller grid. topk 8 is left alone: topk
         # sets the tokens consumed per round, so its edges need their own sweep.
-        (4, 7168, 6, None): ((128, 64, 8), (256, 128, 8), (512, 256, 8), (None, 128, 8)),
+        (4, 7168, 6, None): (
+            (128, 64, 8),
+            (256, 128, 8),
+            (512, 256, 8),
+            (None, 128, 8),
+        ),
     },
 }
 
