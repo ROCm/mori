@@ -947,6 +947,64 @@ TEST_F(PoolClientRangesTest, CompleteArenaObjectIsInstalledWithoutRefetching) {
   EXPECT_EQ(std::memcmp(again.data(), object.data(), kObjectSize), 0);
 }
 
+// A whole-object read does not need the arena at all: the slot it is going to
+// be cached in has the same layout, so the peer writes straight into it.  The
+// arena is the witness -- poison it, and if a single byte changed the read went
+// the long way round.
+TEST_F(PoolClientRangesTest, WholeObjectReadBypassesTheArena) {
+  const std::string key = "slot-direct";
+  std::vector<char> object(kObjectSize);
+  for (size_t i = 0; i < kObjectSize; ++i) object[i] = static_cast<char>((i * 71 + 13) & 0xff);
+  SeedRemoteObject(key, object);
+  ASSERT_FALSE(LocallyResident(caller_.get(), key));
+
+  constexpr char kPoison = static_cast<char>(0xC3);
+  std::fill(caller_get_scratch_.begin(), caller_get_scratch_.end(), kPoison);
+
+  constexpr size_t kQuarter = kObjectSize / 4;
+  std::vector<char> out(kObjectSize, 0);
+  std::vector<std::vector<void*>> ptrs(1);
+  std::vector<std::vector<size_t>> sizes(1), offsets(1);
+  for (size_t q = 0; q < 4; ++q) {
+    ptrs[0].push_back(out.data() + q * kQuarter);
+    sizes[0].push_back(kQuarter);
+    offsets[0].push_back(q * kQuarter);
+  }
+  ASSERT_TRUE(caller_->BatchGetRanges({key}, ptrs, sizes, offsets).front());
+
+  EXPECT_EQ(std::memcmp(out.data(), object.data(), kObjectSize), 0);
+  EXPECT_TRUE(LocallyResident(caller_.get(), key)) << "committing the slot IS the install";
+  EXPECT_EQ(caller_get_scratch_, std::vector<char>(kScratchSize, kPoison))
+      << "the arena was used for a read that did not need it";
+}
+
+// ...and when the medium cannot give it a slot, the same read still has to
+// work.  The fallback is the arena, decided on the failed allocation rather
+// than after a failed transfer.
+TEST_F(PoolClientRangesTest, WholeObjectReadFallsBackToArenaWithoutASlot) {
+  // One page of DRAM, objects are two: BatchAllocate can never satisfy one.
+  std::vector<char> tiny_get(kScratchSize), tiny_put(kScratchSize);
+  auto cramped = MakeClient("ranges-cramped", kPageSize, tiny_get, tiny_put);
+
+  const std::string key = "slot-unavailable";
+  std::vector<char> object(kObjectSize);
+  for (size_t i = 0; i < kObjectSize; ++i) object[i] = static_cast<char>((i * 73 + 19) & 0xff);
+  PutLocalReplica(target_.get(), key, object);
+  target_->Master().FlushHeartbeat();
+  cramped->Master().FlushHeartbeat();
+  ASSERT_TRUE(WaitForExists(cramped.get(), key));
+
+  std::vector<char> out(kObjectSize, 0);
+  std::vector<std::vector<void*>> ptrs = {{out.data()}};
+  std::vector<std::vector<size_t>> sizes = {{kObjectSize}};
+  std::vector<std::vector<size_t>> offsets = {{0}};
+  ASSERT_TRUE(cramped->BatchGetRanges({key}, ptrs, sizes, offsets).front())
+      << "no slot must not mean no read";
+  EXPECT_EQ(std::memcmp(out.data(), object.data(), kObjectSize), 0);
+  EXPECT_FALSE(LocallyResident(cramped.get(), key)) << "nowhere to cache it, and that is fine";
+  cramped->Shutdown();
+}
+
 // Ranges that cover every byte but arrive out of order do NOT make the arena
 // equal the object -- it is packed in caller order -- so this must fall back to
 // the background pull rather than install a scrambled slice.

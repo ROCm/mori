@@ -567,6 +567,39 @@ class PoolClient {
   void ExecuteRemoteBatchGetPlan(const BatchGetPlan& plan, std::vector<bool>* results,
                                  bool recache_remote);
 
+  // One key's share of one arena round: the spans to fetch, where they land in
+  // the slice, and the caller buffers they are copied out to.  A key needs more
+  // than one when its spans do not all fit at once.
+  struct RangeFetchUnit {
+    size_t original = 0;  // caller key index
+    size_t object_size = 0;
+    std::optional<RouteGetResult> route;
+    std::vector<ByteSpan> spans;
+    std::vector<ObjectRange> packed;  // caller pointer + slice-relative offset
+    size_t bytes = 0;                 // == sum of spans
+    // The slice is byte-for-byte the whole object, which happens when the
+    // caller's ranges tile it in ascending order and it all fits in one unit.
+    // The whole-object reader (one call for every layer) hits this; the
+    // layer-wise reader never does.
+    bool holds_whole_object = false;
+  };
+
+  // Serve whole-object ranged reads out of a fresh medium slot instead of the
+  // arena.  Their span layout already equals the object, so the peer can write
+  // straight into the slot: one copy instead of two, the arena stays free for
+  // the readers that actually need it, and the arena mutex is never taken.
+  // Committing the slot afterwards is the local install, for nothing.
+  //
+  // Returns the units it could not take -- no slot to be had, or a slot that is
+  // not one contiguous run -- for the arena path to serve the ordinary way.
+  // That fallback is decided here, on a cheap local allocation, and never after
+  // a failed transfer: a transfer does not fail because of where it was
+  // pointed, and retrying it elsewhere would only double the latency of a
+  // failure the caller treats as fatal.
+  std::vector<RangeFetchUnit> ServeWholeObjectUnitsFromMedium(
+      const std::vector<std::string>& keys, std::vector<RangeFetchUnit> units,
+      std::unordered_map<size_t, bool>* unit_ok);
+
   // Remote-only sibling of PartitionBatchGetTargets for ranged reads.  Each key
   // contributes one item carrying its arena slice, its span list, and the span
   // total.  Spans are passed by pointer rather than by value: the caller
