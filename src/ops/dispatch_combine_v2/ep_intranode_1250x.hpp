@@ -613,6 +613,13 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
       // which buys an amount that cannot be measured (597.0 against 595.7 at 512, inside a 22 GB/s
       // per-rank spread) at the price of a format every rank must agree on.
       index_t* signal = EpPeer<index_t>(win, destPe, args.offRecvNum) + myPe;
+      // Deleting this wait outright was measured, not assumed, and it is a LOSS: the slot segment
+      // drops from 3.93 to 0.11us and dispatch gets SLOWER by 1.05us (ct=512 topk6, 6 of 6
+      // interleaved passes agreeing, 40.25 -> 41.3us median). Part of it resurfaces as the grid
+      // barrier below, 0.43 -> 0.77-2.44us, since block 0 then waits out the slowest block itself
+      // -- the same wall the prefetch attempt hit, see the note under this wait. That result also
+      // prices the depth-2 mailbox mentioned above at zero, because removing this wait is exactly
+      // what it would buy.
       EpWaitEq(signal, 0);
       EpWaitEq(args.gridBarrier, static_cast<unsigned int>(gridDim.x));
       __hip_atomic_store(args.gridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
