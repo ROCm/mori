@@ -620,7 +620,24 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
       index_t numTokenSignal = __hip_atomic_load(args.destPeTokenCounter + destPe, __ATOMIC_RELAXED,
                                                  __HIP_MEMORY_SCOPE_AGENT) +
                                1;
-      __threadfence_system();
+      // Release, not seq_cst: all this fence owes the peer is that the payload stores precede
+      // the signal store below. __threadfence_system() would be seq_cst, and on gfx1250 that
+      // compiles to two extra cache ops -- `global_wb scope:SCOPE_SYS` then
+      // `global_inv scope:SCOPE_SYS` -- neither of which buys anything here. Payload and signal
+      // both live in the CCO symmetric window, allocated hipMemAllocationTypeUncached by
+      // CcoWindowAllocType(), so writes go straight through and leave no dirty L2 line to flush;
+      // the invalidate is the acquire half, and the spin on recvTokenNums that follows reads
+      // SCOPE_SYS out of that same uncached window, so dropping the whole L2 only costs
+      // everything downstream. Worth ~0.45us of the fence itself and ~0.7us of dispatch, with
+      // 14 of 14 interleaved A/B passes agreeing.
+      //
+      // Do NOT go further and remove the fence altogether: what remains is `s_wait_storecnt 0x0`,
+      // and that is the only thing ordering the payload stores ahead of the signal. Without it
+      // both are in flight with no defined order, the signal can land first, and the peer reads
+      // stale payload. Peer speed is no substitute -- a slow peer merely reads late enough that
+      // the payload happened to arrive, which turns a deterministic bug into a probabilistic one
+      // that correctness-off perf runs never surface.
+      __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
       __hip_atomic_store(signal, numTokenSignal, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
     }
   }
