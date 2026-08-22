@@ -412,13 +412,24 @@ inline __device__ void ShmemQuietThreadKernelImpl(int pe, int qpId) {
   }
 }
 
+// A peer can be RDMA-typed yet have no QP in this Context: under
+// MORI_ENABLE_RAIL_ONLY only same-rail peers are connected, and the rest keep the
+// empty-stub slots that also stand in for non-RDMA peers. A stub's qpn is 0,
+// which ibverbs never hands out (QP0 is reserved), so it is an exact
+// "connected" test. Always true when rail-only is off.
+__device__ __forceinline__ bool ShmemPeerHasQp(int pe) {
+  GpuStates* s = GetGlobalGpuStatesPtr();
+  return s->rdmaEndpoints[pe * s->numQpPerPe].qpn != 0;
+}
+
 template <>
 inline __device__ void ShmemQuietThreadKernel<application::TransportType::RDMA>() {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   int rank = globalGpuStates->rank;
   int worldSize = globalGpuStates->worldSize;
   for (int peId = 0; peId < worldSize; peId++) {
-    if (peId != rank && globalGpuStates->transportTypes[peId] == application::TransportType::RDMA) {
+    if (peId != rank && globalGpuStates->transportTypes[peId] == application::TransportType::RDMA &&
+        ShmemPeerHasQp(peId)) {
       for (int qpId = 0; qpId < globalGpuStates->numQpPerPe; qpId++) {
         // Real completion wait (DrainToLive=true), like the per-PE / per-QP overloads.
         if constexpr (DISPATCH_BNXT == 1) {
@@ -443,6 +454,7 @@ inline __device__ void ShmemQuietThreadKernel<application::TransportType::RDMA>(
   int rank = globalGpuStates->rank;
   if (pe == rank) return;
   if (globalGpuStates->transportTypes[pe] != application::TransportType::RDMA) return;
+  if (!ShmemPeerHasQp(pe)) return;
   for (int qpId = 0; qpId < globalGpuStates->numQpPerPe; qpId++) {
     if constexpr (DISPATCH_BNXT == 1) {
       ShmemQuietThreadKernelImpl<core::ProviderType::BNXT, true>(pe, qpId);
@@ -461,6 +473,7 @@ inline __device__ void ShmemQuietThreadKernel<application::TransportType::RDMA>(
   int rank = globalGpuStates->rank;
   if (pe == rank) return;
   if (globalGpuStates->transportTypes[pe] != application::TransportType::RDMA) return;
+  if (!ShmemPeerHasQp(pe)) return;
   // Real completion wait (DrainToLive=true): the caller's own WQEs must be done on
   // return (e.g. a GET reads its local dest right after). Snapshot drain is only
   // for the recycle gate, which calls ShmemQuietThreadKernelImpl directly.

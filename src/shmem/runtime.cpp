@@ -189,6 +189,11 @@ bool ShmemSdmaEnabled() {
   return states->rdmaStates->commContext->IsSdmaEnabled();
 }
 
+bool ShmemRailOnly() {
+  ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  return states->rdmaStates->commContext->IsRailOnly();
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                      Barrier APIs                                             */
 /* ---------------------------------------------------------------------------------------------- */

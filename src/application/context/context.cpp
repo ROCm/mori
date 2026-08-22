@@ -28,8 +28,10 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -52,6 +54,11 @@ Context::Context(BootstrapNetwork& bootNet) : bootNet(bootNet) {
   sdmaEnabled = env::IsEnvVarEnabled("MORI_ENABLE_SDMA");
   p2pDisabled = env::IsEnvVarEnabled("MORI_DISABLE_P2P");
   CollectHostNames();
+  if (env::IsEnvVarEnabled("MORI_ENABLE_RAIL_ONLY") || env::IsEnvVarEnabled("MORI_ENABLE_RAIL")) {
+    railOnly = RailOnlyEligible();
+    if (!railOnly)
+      MORI_APP_ERROR("MORI_ENABLE_RAIL_ONLY requested but not eligible; using full mesh");
+  }
   // Lightweight: topology, NIC selection, transport type decision, SDMA queues.
   // No QP creation, no AllToAll. Modules that need the initial RDMA endpoint
   // set must explicitly call BuildInitialEndpoints() afterwards.
@@ -62,7 +69,6 @@ void Context::BuildInitialEndpoints() {
   if (initialEndpointsBuilt) return;
 
   // (A) Apply default policy: cap + env vars → one TransportType per peer.
-  //     Populates transportTypes[] which SHMEM consumes via GetTransportType[s].
   transportTypes.clear();
   transportTypes.reserve(WorldSize());
   bool anyNeedsSdma = false;
@@ -75,8 +81,32 @@ void Context::BuildInitialEndpoints() {
   // (B) Materialize SDMA queues if any peer resolved to SDMA.
   if (anyNeedsSdma) EnsureSdmaTransport();
 
-  // (C) Build & connect the initial QP set (worldSize × numQpPerPe).
-  BuildAndConnectInitialEndpoints();
+  // (C) Build & connect the initial QP set via the same peerMask path CCO uses.
+  //     Under MORI_ENABLE_RAIL_ONLY, cross-rail cross-node peers are masked out.
+  std::vector<bool> peerMask(WorldSize(), false);
+  int myRail = peerInfos[LocalRank()].rankInNode;
+  for (int i = 0; i < WorldSize(); i++) {
+    if (transportTypes[i] != TransportType::RDMA) continue;
+    if (railOnly && !peerInfos[i].sameHost && peerInfos[i].rankInNode != myRail) continue;
+    peerMask[i] = true;
+  }
+
+  rdmaEps = CreateAdditionalEndpoints(numQpPerPe, peerMask);
+  ConnectAdditionalEndpoints(rdmaEps, numQpPerPe, peerMask);
+
+  // Log what we connected.
+  int connected = 0;
+  std::string peerList;
+  for (int i = 0; i < WorldSize(); i++) {
+    if (peerMask[i] && i != LocalRank() && peerCaps[i].canRDMA) {
+      connected++;
+      peerList += " " + std::to_string(i);
+    }
+  }
+  MORI_APP_INFO("{}: rank {} rail {} connected {} RDMA peers ({} QPs):{}",
+                railOnly ? "rail-only" : "full-mesh", LocalRank(), myRail, connected,
+                connected * numQpPerPe, peerList);
+
   initialEndpointsBuilt = true;
 }
 
@@ -153,6 +183,7 @@ void Context::CollectHostNames() {
 
   std::string myNodeId(localBuffer + kPidSize);
   peerInfos.resize(WorldSize());
+  std::map<std::string, int> seenPerNode;
   for (int i = 0; i < WorldSize(); i++) {
     const char* rec = global.data() + i * kRecordSize;
     pid_t peerPid;
@@ -160,11 +191,33 @@ void Context::CollectHostNames() {
     std::string peerNodeId(rec + kPidSize);
     peerInfos[i].sameHost = (peerNodeId == myNodeId);
     peerInfos[i].sameProcess = peerInfos[i].sameHost && (peerPid == myPid);
+    peerInfos[i].rankInNode = seenPerNode[peerNodeId]++;
     if (LocalRank() == 0) {
-      MORI_APP_TRACE("rank {} nodeId={} pid={} sameHost={} sameProcess={}", i, peerNodeId, peerPid,
-                     peerInfos[i].sameHost, peerInfos[i].sameProcess);
+      MORI_APP_TRACE("rank {} nodeId={} pid={} rankInNode={} sameHost={} sameProcess={}", i,
+                     peerNodeId, peerPid, peerInfos[i].rankInNode, peerInfos[i].sameHost,
+                     peerInfos[i].sameProcess);
     }
   }
+}
+
+bool Context::RailOnlyEligible() const {
+  const int world = WorldSize();
+  int nodeSize = 0;
+  for (int i = 0; i < world; i++) nodeSize = std::max(nodeSize, peerInfos[i].rankInNode + 1);
+  if (nodeSize <= 0 || world % nodeSize != 0) {
+    MORI_APP_ERROR("MORI_ENABLE_RAIL_ONLY: non-uniform node sizes (world={} maxNodeSize={})", world,
+                   nodeSize);
+    return false;
+  }
+  for (int i = 0; i < world; i++) {
+    if (peerInfos[i].rankInNode != i % nodeSize) {
+      MORI_APP_ERROR("MORI_ENABLE_RAIL_ONLY: ranks not node-major contiguous (rank {} rankInNode={} "
+                     "expected {})",
+                     i, peerInfos[i].rankInNode, i % nodeSize);
+      return false;
+    }
+  }
+  return true;
 }
 
 // MORI_ENABLE_SDMA / MORI_DISABLE_P2P are now read exactly once in the
@@ -374,52 +427,9 @@ void Context::EnsureSdmaTransport(int requestedChannels) {
 }
 
 /* ------------------------------------------------------------------------ */
-/*               Phase B: build + connect initial RDMA endpoint set         */
+/*               Create / Connect additional endpoint sets                  */
 /* ------------------------------------------------------------------------ */
 
-void Context::BuildAndConnectInitialEndpoints() {
-  // Build the worldSize × numQpPerPe rdmaEps vector. Non-RDMA peer slots are
-  // populated with empty stubs to keep the indexing uniform.
-  rdmaEps.reserve(static_cast<size_t>(WorldSize()) * numQpPerPe);
-  for (int i = 0; i < WorldSize(); i++) {
-    if (transportTypes[i] == TransportType::RDMA) {
-      for (int qp = 0; qp < numQpPerPe; qp++) {
-        RdmaEndpoint ep = rdmaDeviceContext->CreateRdmaEndpoint(savedEpConfig);
-        rdmaEps.push_back(ep);
-      }
-    } else {
-      for (int qp = 0; qp < numQpPerPe; qp++) {
-        rdmaEps.push_back({});
-      }
-    }
-  }
-
-  // Exchange endpoint handles via AllToAll (worldSize × numQpPerPe handles).
-  int totalEps = WorldSize() * numQpPerPe;
-  std::vector<RdmaEndpointHandle> localToPeerEpHandles(totalEps);
-  std::vector<RdmaEndpointHandle> peerToLocalEpHandles(totalEps);
-  for (int i = 0; i < rdmaEps.size(); i++) {
-    localToPeerEpHandles[i] = rdmaEps[i].handle;
-  }
-  bootNet.AllToAll(localToPeerEpHandles.data(), peerToLocalEpHandles.data(),
-                   sizeof(RdmaEndpointHandle) * numQpPerPe);
-
-  // Connect each RDMA peer's QPs (INIT -> RTR -> RTS).
-  for (int peer = 0; peer < WorldSize(); peer++) {
-    if (transportTypes[peer] != TransportType::RDMA) {
-      continue;
-    }
-    for (int qp = 0; qp < numQpPerPe; qp++) {
-      int epIndex = peer * numQpPerPe + qp;
-      rdmaDeviceContext->ConnectEndpoint(localToPeerEpHandles[epIndex],
-                                         peerToLocalEpHandles[epIndex], qp);
-    }
-  }
-}
-
-// Whether peer `i` should be a target for QP create/connect. Filters self
-// and capability-less peers regardless of what the mask says, so callers
-// don't need to repeat those checks.
 static bool ShouldCreateQpForPeer(int i, int selfRank,
                                   const std::vector<PeerCapabilities>& peerCaps,
                                   const std::vector<bool>& peerMask) {

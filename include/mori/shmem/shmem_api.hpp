@@ -112,6 +112,10 @@ int ShmemNumQpPerPe();
 // with the transport selection that was made at shmem init.
 bool ShmemSdmaEnabled();
 
+// Whether MORI_ENABLE_RAIL_ONLY took effect: only same-rail peers have QPs. Callers
+// whose cross-node traffic is not same-rail must not run in this mode.
+bool ShmemRailOnly();
+
 // TODO: finish team pe api
 // int ShmemTeamMyPe(ShmemTeamType);
 // int ShmemTeamNPes(ShmemTeamType);
