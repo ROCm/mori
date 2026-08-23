@@ -211,9 +211,10 @@ bool Context::RailOnlyEligible() const {
   }
   for (int i = 0; i < world; i++) {
     if (peerInfos[i].rankInNode != i % nodeSize) {
-      MORI_APP_ERROR("MORI_ENABLE_RAIL_ONLY: ranks not node-major contiguous (rank {} rankInNode={} "
-                     "expected {})",
-                     i, peerInfos[i].rankInNode, i % nodeSize);
+      MORI_APP_ERROR(
+          "MORI_ENABLE_RAIL_ONLY: ranks not node-major contiguous "
+          "(rank {} rankInNode={} expected {})",
+          i, peerInfos[i].rankInNode, i % nodeSize);
       return false;
     }
   }
