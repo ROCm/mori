@@ -81,31 +81,48 @@ void Context::BuildInitialEndpoints() {
   // (B) Materialize SDMA queues if any peer resolved to SDMA.
   if (anyNeedsSdma) EnsureSdmaTransport();
 
-  // (C) Build & connect the initial QP set via the same peerMask path CCO uses.
-  //     Under MORI_ENABLE_RAIL_ONLY, cross-rail cross-node peers are masked out.
-  std::vector<bool> peerMask(WorldSize(), false);
+  // (C) Build & connect the initial QP set (worldSize × numQpPerPe).
+  //     Under MORI_ENABLE_RAIL_ONLY, cross-rail cross-node peers get stubs.
   int myRail = peerInfos[LocalRank()].rankInNode;
-  for (int i = 0; i < WorldSize(); i++) {
-    if (transportTypes[i] != TransportType::RDMA) continue;
-    if (railOnly && !peerInfos[i].sameHost && peerInfos[i].rankInNode != myRail) continue;
-    peerMask[i] = true;
-  }
+  auto shouldConnect = [&](int i) {
+    if (transportTypes[i] != TransportType::RDMA) return false;
+    if (railOnly && !peerInfos[i].sameHost && peerInfos[i].rankInNode != myRail) return false;
+    return true;
+  };
 
-  rdmaEps = CreateAdditionalEndpoints(numQpPerPe, peerMask);
-  ConnectAdditionalEndpoints(rdmaEps, numQpPerPe, peerMask);
-
-  // Log what we connected.
   int connected = 0;
   std::string peerList;
+  rdmaEps.reserve(static_cast<size_t>(WorldSize()) * numQpPerPe);
   for (int i = 0; i < WorldSize(); i++) {
-    if (peerMask[i] && i != LocalRank() && peerCaps[i].canRDMA) {
-      connected++;
-      peerList += " " + std::to_string(i);
+    if (shouldConnect(i)) {
+      if (i != LocalRank()) {
+        connected++;
+        peerList += " " + std::to_string(i);
+      }
+      for (int qp = 0; qp < numQpPerPe; qp++)
+        rdmaEps.push_back(rdmaDeviceContext->CreateRdmaEndpoint(savedEpConfig));
+    } else {
+      for (int qp = 0; qp < numQpPerPe; qp++) rdmaEps.push_back({});
     }
   }
   MORI_APP_INFO("{}: rank {} rail {} connected {} RDMA peers ({} QPs):{}",
                 railOnly ? "rail-only" : "full-mesh", LocalRank(), myRail, connected,
                 connected * numQpPerPe, peerList);
+
+  // Exchange endpoint handles via AllToAll then connect.
+  int totalEps = WorldSize() * numQpPerPe;
+  std::vector<RdmaEndpointHandle> localHandles(totalEps), peerHandles(totalEps);
+  for (int i = 0; i < totalEps; i++) localHandles[i] = rdmaEps[i].handle;
+  bootNet.AllToAll(localHandles.data(), peerHandles.data(),
+                   sizeof(RdmaEndpointHandle) * numQpPerPe);
+
+  for (int peer = 0; peer < WorldSize(); peer++) {
+    if (!shouldConnect(peer)) continue;
+    for (int qp = 0; qp < numQpPerPe; qp++) {
+      int idx = peer * numQpPerPe + qp;
+      rdmaDeviceContext->ConnectEndpoint(localHandles[idx], peerHandles[idx], qp);
+    }
+  }
 
   initialEndpointsBuilt = true;
 }
