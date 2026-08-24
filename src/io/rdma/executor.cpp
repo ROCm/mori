@@ -131,11 +131,13 @@ void MultithreadExecutor::Worker::MainLoop() {
   MORI_IO_INFO("worker {} enter main loop, running on core {}", workerId, sched_getcpu());
 
   Task task{};
+  SizeVec tLoclOffsets, tRemoteOffsets, tSizes;
+  std::vector<application::RdmaMemoryRegion> localMrPerEp(1), remoteMrPerEp(1);
+
   while (true) {
     {
       std::unique_lock<std::mutex> lock(mu);
       cond.wait(lock, [this]() { return count > 0 || !running.load(); });
-
       if (!running.load()) {
         MORI_IO_INFO("worker {} shutdown", workerId);
         break;
@@ -145,31 +147,30 @@ void MultithreadExecutor::Worker::MainLoop() {
       --count;
     }
 
-    SizeVec tLoclOffsets(task.req->localOffsets.begin() + task.begin,
-                         task.req->localOffsets.begin() + task.end);
-    SizeVec tRemoteOffsets(task.req->remoteOffsets.begin() + task.begin,
-                           task.req->remoteOffsets.begin() + task.end);
-    SizeVec tSizes(task.req->sizes.begin() + task.begin, task.req->sizes.begin() + task.end);
+    auto *preq = task.req;
+    tLoclOffsets.assign(preq->localOffsets.begin() + task.begin,
+                         preq->localOffsets.begin() + task.end);
+    tRemoteOffsets.assign(preq->remoteOffsets.begin() + task.begin,
+                           preq->remoteOffsets.begin() + task.end);
+    tSizes.assign(preq->sizes.begin() + task.begin, preq->sizes.begin() + task.end);
 
     const bool chunk = task.req->chunkBytes > 0;
     RdmaTransferControl control{};
-    control.chunkBytes = task.req->chunkBytes;
-    control.maxChunks = task.req->maxChunks;
+    control.chunkBytes = preq->chunkBytes;
+    control.maxChunks = preq->maxChunks;
     control.creditByWrCount = chunk;
     control.ownsTotalBatchSize = false;
     control.disableMerge = chunk;
 
-    thread_local std::vector<application::RdmaMemoryRegion> localMrPerEp(1);
-    thread_local std::vector<application::RdmaMemoryRegion> remoteMrPerEp(1);
-    localMrPerEp[0] = task.req->local;
-    remoteMrPerEp[0] = task.req->remote;
+    localMrPerEp[0] = preq->local;
+    remoteMrPerEp[0] = preq->remote;
 
     RdmaOpRet ret = mori::io::RdmaBatchReadWrite(
         {task.req->eps[task.epId]}, localMrPerEp, remoteMrPerEp, tLoclOffsets, tRemoteOffsets,
-        tSizes, task.req->callbackMeta, task.req->id, task.req->isRead, task.req->postBatchSize,
+        tSizes, preq->callbackMeta, preq->id, preq->isRead, preq->postBatchSize,
         control);
     task.latch->Complete(ret);
-    MORI_IO_TRACE("Worker {} execute task {} begin {} end {} ret code {}", workerId, task.req->id,
+    MORI_IO_TRACE("Worker {} execute task {} begin {} end {} ret code {}", workerId, preq->id,
                   task.begin, task.end, static_cast<uint32_t>(ret.code));
   }
 }
