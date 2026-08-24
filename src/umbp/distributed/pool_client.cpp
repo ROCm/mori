@@ -399,6 +399,24 @@ class ScopedRangedReport {
   std::chrono::steady_clock::time_point start_;
 };
 
+// Runs a callable at scope exit.  Same reason the two Scoped* classes below are
+// destructor-based: a ranged call has several early returns that have still
+// moved bytes, and end-of-call work must not depend on each `return` having
+// remembered to do it.
+template <class Fn>
+class ScopeExit {
+ public:
+  explicit ScopeExit(Fn fn) : fn_(std::move(fn)) {}
+  ~ScopeExit() { fn_(); }
+  ScopeExit(const ScopeExit&) = delete;
+  ScopeExit& operator=(const ScopeExit&) = delete;
+
+ private:
+  Fn fn_;
+};
+template <class Fn>
+ScopeExit(Fn) -> ScopeExit<Fn>;
+
 // Ranged calls have several early returns that can still have moved bytes (a
 // batch fully served from the local medium returns before the remote phase is
 // even considered).  Emitting from a destructor keeps every exit covered,
@@ -2300,17 +2318,31 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   RangedPhases* dbg = ranged_debug ? &phases : nullptr;
   ScopedRangedReport ranged_report("get", phases, ranged_debug, local_bytes, remote_bytes);
 
+  // Accumulated over the batch and reported once at the end rather than per
+  // key.  AddCounter takes a lock and builds a metric key out of the name and
+  // labels, and the help text is a hundred-odd bytes that has to be
+  // materialized on every call -- affordable once, not a thousand times.  The
+  // counter totals are identical either way; only the number of updates
+  // changes.
+  double local_get_bytes = 0.0;
   auto record_local_get = [&](size_t index) {
-    const double bytes =
+    local_get_bytes +=
         static_cast<double>(std::accumulate(sizes[index].begin(), sizes[index].end(), size_t{0}));
-    local_bytes += bytes;
+  };
+  auto flush_local_get_bytes = [&] {
+    if (local_get_bytes == 0.0) return;
+    local_bytes += local_get_bytes;
     master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL,
                                MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL_HELP,
-                               {{"traffic", "local"}}, bytes);
+                               {{"traffic", "local"}}, local_get_bytes);
     master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL,
                                MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP,
-                               {{"traffic", "local"}}, bytes);
+                               {{"traffic", "local"}}, local_get_bytes);
+    local_get_bytes = 0.0;
   };
+  // Declared after ScopedBatchBandwidth and ScopedRangedReport, so it runs
+  // BEFORE either of them reads local_bytes.
+  ScopeExit flush_guard{flush_local_get_bytes};
 
   // ---- Phase 1: everything this node already holds, in one submit ----
   //
@@ -2322,21 +2354,53 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   std::vector<size_t> local_keys;
   std::vector<size_t> missed;
   missed.reserve(n);
+
+  // One BatchResolve per BACKEND for the whole batch, not one per key.
+  //
+  // Calling it per key made a "batch" API do the opposite: a temporary
+  // vector<string> (copying the key) and a temporary result vector per key, and
+  // one acquisition per key of the backend mutex that Allocate, Commit and
+  // Evict also take -- and in standalone-process mode every rank on the node
+  // shares this client, so that mutex is where they serialize.
+  //
+  // Backends are still tried in registry order and the first hit still wins;
+  // only keys nothing has claimed yet are carried to the next backend, so a
+  // second medium is asked about exactly what the first one missed.
+  std::vector<MediumBackend*> holders(n, nullptr);
+  std::vector<ResolvedEntry> resolutions(n);
+  {
+    PhaseTimer resolve_timer(dbg ? &dbg->resolve : nullptr);
+    std::vector<size_t> pending;
+    pending.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+      if (!sizes[i].empty()) pending.push_back(i);  // asked for nothing: never resolved
+    }
+    std::vector<std::string> batch;
+    std::vector<size_t> still_missing;
+    for (auto* backend : registry_.All()) {
+      if (pending.empty()) break;
+      batch.clear();
+      batch.reserve(pending.size());
+      for (size_t i : pending) batch.push_back(keys[i]);
+      auto found = backend->BatchResolve(batch, /*include_descs=*/false);
+      still_missing.clear();
+      for (size_t j = 0; j < pending.size(); ++j) {
+        if (j < found.size() && found[j].found) {
+          holders[pending[j]] = backend;
+          resolutions[pending[j]] = std::move(found[j]);
+        } else {
+          still_missing.push_back(pending[j]);
+        }
+      }
+      pending.swap(still_missing);
+    }
+  }
+
   for (size_t i = 0; i < n; ++i) {
     if (sizes[i].empty()) continue;  // asked for nothing; stays false
 
-    MediumBackend* holder = nullptr;
-    ResolvedEntry resolved;
-    {
-      PhaseTimer resolve_timer(dbg ? &dbg->resolve : nullptr);
-      for (auto* backend : registry_.All()) {
-        auto candidate = backend->BatchResolve({keys[i]}, /*include_descs=*/false).front();
-        if (!candidate.found) continue;
-        holder = backend;
-        resolved = std::move(candidate);
-        break;
-      }
-    }
+    MediumBackend* const holder = holders[i];
+    const ResolvedEntry& resolved = resolutions[i];
     if (holder == nullptr) {
       missed.push_back(i);
       continue;
