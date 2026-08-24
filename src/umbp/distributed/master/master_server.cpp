@@ -106,6 +106,7 @@ std::map<std::string, LogicalTierCapacity> LogicalCapsFromProto(
     cap.capacity.available_bytes = value.available_capacity_bytes();
     cap.capacity.max_allocatable_bytes = value.max_allocatable_bytes();
     cap.put_eligible = value.put_eligible();
+    cap.peak_member_utilization = value.peak_member_utilization();
     out[value.name()] = cap;
   }
   return out;
@@ -283,6 +284,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
 
       UpdateClientCountMetric();
       UpdateClientCapacityMetrics(request->node_id(), caps);
+      UpdateClientLogicalTierMetrics(request->node_id(), registration.logical_tier_capacities);
 
       auto interval_ms =
           static_cast<uint64_t>(config_.heartbeat_ttl.count() * 1000) / HeartbeatIntervalDivisor();
@@ -399,6 +401,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       response->set_request_full_sync(request_full_sync);
 
       UpdateClientCapacityMetrics(request->node_id(), caps);
+      UpdateClientLogicalTierMetrics(request->node_id(), logical_caps);
 
       if (metrics_ != nullptr && request->tier_kv_counts_size() > 0) {
         mori::metrics::MetricsServer::Labels base = {{"node", request->node_id()}};
@@ -848,6 +851,42 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
                                                      : 0.0;
       metrics_->setGauge(MORI_UMBP_METRIC_CLIENT_CAPACITY_UTILIZATION,
                          MORI_UMBP_METRIC_CLIENT_CAPACITY_UTILIZATION_HELP, labels, utilization);
+    }
+  }
+
+  void UpdateClientLogicalTierMetrics(
+      const std::string& node_id,
+      const std::map<std::string, LogicalTierCapacity>& logical_caps) {
+    if (!metrics_) return;
+    for (const auto& [name, logical] : logical_caps) {
+      const auto& cap = logical.capacity;
+      mori::metrics::MetricsServer::Labels labels = {
+          {"node", node_id},
+          {"logical_tier", name},
+          {"tier", TierTypeName(logical.representative_tier)}};
+      metrics_->setGauge(MORI_UMBP_METRIC_CLIENT_LOGICAL_CAPACITY_TOTAL,
+                         MORI_UMBP_METRIC_CLIENT_LOGICAL_CAPACITY_TOTAL_HELP, labels,
+                         static_cast<double>(cap.total_bytes));
+      metrics_->setGauge(MORI_UMBP_METRIC_CLIENT_LOGICAL_CAPACITY_AVAIL,
+                         MORI_UMBP_METRIC_CLIENT_LOGICAL_CAPACITY_AVAIL_HELP, labels,
+                         static_cast<double>(cap.available_bytes));
+      const uint64_t used_bytes =
+          cap.total_bytes >= cap.available_bytes ? cap.total_bytes - cap.available_bytes : 0;
+      metrics_->setGauge(MORI_UMBP_METRIC_CLIENT_LOGICAL_CAPACITY_USED,
+                         MORI_UMBP_METRIC_CLIENT_LOGICAL_CAPACITY_USED_HELP, labels,
+                         static_cast<double>(used_bytes));
+      const double utilization = cap.total_bytes > 0 ? static_cast<double>(used_bytes) /
+                                                           static_cast<double>(cap.total_bytes)
+                                                     : 0.0;
+      metrics_->setGauge(MORI_UMBP_METRIC_CLIENT_LOGICAL_CAPACITY_UTILIZATION,
+                         MORI_UMBP_METRIC_CLIENT_LOGICAL_CAPACITY_UTILIZATION_HELP, labels,
+                         utilization);
+      metrics_->setGauge(MORI_UMBP_METRIC_CLIENT_LOGICAL_PUT_ELIGIBLE,
+                         MORI_UMBP_METRIC_CLIENT_LOGICAL_PUT_ELIGIBLE_HELP, labels,
+                         logical.put_eligible ? 1.0 : 0.0);
+      metrics_->setGauge(MORI_UMBP_METRIC_CLIENT_LOGICAL_PEAK_UTILIZATION,
+                         MORI_UMBP_METRIC_CLIENT_LOGICAL_PEAK_UTILIZATION_HELP, labels,
+                         logical.peak_member_utilization);
     }
   }
 

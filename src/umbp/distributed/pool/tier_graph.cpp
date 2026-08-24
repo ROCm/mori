@@ -157,6 +157,7 @@ std::map<std::string, LogicalTierCapacity> LogicalTierGraph::CapacitySnapshot() 
       logical.capacity.max_allocatable_bytes =
           std::max(logical.capacity.max_allocatable_bytes, allocatable);
     }
+    logical.peak_member_utilization = PeakMemberUtilization(tier);
     snapshot.emplace(NodeAt(tier).name, logical);
   }
   TierCapacity entry_pool;

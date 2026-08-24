@@ -29,6 +29,12 @@ message LogicalTierCapacity {
   uint64   available_capacity_bytes = 4;
   uint64   max_allocatable_bytes    = 5;
   bool     put_eligible              = 6;
+  // The tier's own pressure as the offload decision measures it: the highest
+  // utilization among its backends, not the aggregate above. The two differ
+  // whenever a tier mixes backend sizes, and for the entry tier the aggregate
+  // covers every tier it can spill into, so this is the only field a reader can
+  // compare against the tier's watermarks.
+  double   peak_member_utilization  = 7;
 }
 
 // One page slot inside one of a node's DRAM/HBM buffers.  Carried by the
