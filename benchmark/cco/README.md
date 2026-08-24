@@ -99,6 +99,51 @@ The IBGDA run pins all ranks to one HCA because this MI355X setup cannot route
 local GDA traffic across AINIC rails. This is a correctness configuration, not
 a multi-rail peak-bandwidth measurement.
 
+## Triton GEMM + LSA A2A
+
+`triton/gemm_a2a/bench_gemm_a2a.py` implements the split baseline from
+`/workspace/gcnasm/opus_gemm_dist/opus_gemm_a2a_lsa`:
+
+1. a BF16 `tl.dot` GEMM writes compact local staging slabs
+   `[dst_rank, M, shard_n]`;
+2. a second Triton kernel copies every slab into
+   `peer_recv[dst_rank][source_rank]` through `cco.lsa_ptr`.
+
+The Opus-compatible 4-GPU workload is:
+
+```bash
+torchrun --standalone --nproc_per_node=4 \
+  benchmark/cco/triton/gemm_a2a/bench_gemm_a2a.py \
+  --mode split-lsa \
+  -m 2048 -n 18432 -k 8192 --shard-n 2560 \
+  --warmup 3 --iters 20
+```
+
+The tuned default GEMM tile is `256×128×64` with 8 warps and two pipeline
+stages. M/N/K and shard boundaries are compile-time specialized, so divisible
+benchmark shapes use an unmasked K loop and a tile-level staging/tail branch.
+Scatter tiles use the same peer-round-robin N-tile order as Opus.
+
+Use `--mode local` to isolate Triton GEMM. Correctness checks use the same
+rank-dependent BF16 input formulas, compact receive layout and tolerance as the
+Opus executable. Timings are collected on every rank and reported using the
+maximum-rank E2E time.
+
+To run Opus Direct fused, Opus Split-LSA, Opus local, Triton local and Triton
+Split-LSA repeatedly and compare their medians:
+
+```bash
+python benchmark/cco/triton/gemm_a2a/compare_opus.py \
+  --opus-exe /workspace/gcnasm/opus_gemm_dist/opus_gemm_a2a_lsa/build/quad_lsa_direct.exe \
+  --json-out /tmp/gemm_a2a_compare.json \
+  --markdown-out /tmp/gemm_a2a_compare.md
+```
+
+The Triton path intentionally uses two kernels. Its E2E delta against Opus
+Direct therefore contains both the Triton-vs-handwritten-GEMM difference and
+the lack of fused peer stores. Opus Split-LSA is included to isolate the
+communication/fusion component.
+
 ## SDMA specifics
 
 `MORI_SDMA_NUM_CHANNELS` sets the queues per GPU pair — default 2, max 8. It is

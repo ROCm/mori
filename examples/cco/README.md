@@ -111,6 +111,9 @@ workaround and limits aggregate bandwidth.
 For latency/bandwidth sweeps and automated comparison with the C++ binaries,
 use `benchmark/cco/triton/bench_p2p.py` and
 `benchmark/cco/compare_triton_cpp.py`; see `benchmark/cco/README.md`.
+The same benchmark directory also contains `triton/gemm_a2a/` for the
+4-GPU BF16 GEMM + column-shard LSA A2A comparison against the external Opus
+fused implementation.
 
 ---
 

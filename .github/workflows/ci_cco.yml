@@ -171,7 +171,8 @@ jobs:
                 tests/python/cco/test_triton_bindings.py \
                 tests/python/cco/test_triton_lsa.py \
                 tests/python/cco/test_triton_sdma.py \
-                tests/python/cco/test_triton_benchmark.py"
+                tests/python/cco/test_triton_benchmark.py \
+                tests/python/cco/test_triton_gemm_a2a.py"
 
       - name: Run CCO Triton GDA tests (single AINIC rail)
         run: |
