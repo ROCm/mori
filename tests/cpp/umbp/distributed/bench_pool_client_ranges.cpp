@@ -58,7 +58,7 @@
 // A bench that forces every call remote would overstate how often the arena is
 // reached, so this one lets the real behavior happen and reports the local-hit
 // rate it observes (how that number is obtained, and what it cannot tell you,
-// is on AllLocallyResident below).
+// is on LocallyResidentCount below).
 //
 // WHERE "REMOTE" COMES FROM ON A SINGLE HOST
 //
@@ -178,7 +178,12 @@ class RangedClient {
   // Whether every key can be served without leaving this node.  For the
   // distributed client that is a medium resolve; for the local one, where
   // there is no other node, it is simply existence.
-  virtual bool AllResident(const std::vector<std::string>& keys) = 0;
+  // How many of `keys` this deployment can serve from ITS OWN local
+  // storage right now, without reaching another node.  A count rather than
+  // a bool because callers want both a per-call all-or-nothing check and a
+  // per-key credit -- deriving the former from a count keeps there from
+  // being two divergent notions of "resident" in this file.
+  virtual size_t ResidentCount(const std::vector<std::string>& keys) = 0;
 };
 
 inline uint16_t NextPeerServicePort() {
@@ -611,25 +616,29 @@ class Cluster {
 // resolves here is a key that will not go remote.  This runs that identical
 // resolve just before the call.
 //
-// Three limits, so the number is not over-read:
+// Two limits, so the number is not over-read:
 //   * It is a prediction from the same criterion, taken a moment earlier -- not
 //     an observation from inside mori.
 //   * It races: under concurrency the object can be evicted between this
 //     resolve and the call, which would then go remote after being counted
 //     local.  Expect the reported rate to be slightly optimistic at high rank
 //     counts, which is also where eviction actually starts happening.
-//   * It is per CALL, not per key: a chunk counts as local only when every key
-//     in it resolves, so a partially-local chunk is counted remote.
+//
+// Returns a per-key COUNT rather than a bool: local_hit_pct wants an
+// all-or-nothing call classification (a chunk counts as local only when every
+// key in it resolves), while local_write_mib wants partial credit (an object
+// that landed counts even if others in its pool have not yet) -- two different
+// questions the callers derive from the same count rather than two functions
+// that could silently drift apart.
 //
 // Resolved for the whole chunk in one call: this sits inside the timed region,
 // so it has to stay cheap.
-bool AllLocallyResident(PoolClient* client, const std::vector<std::string>& keys) {
+size_t LocallyResidentCount(PoolClient* client, const std::vector<std::string>& keys) {
   auto* backend = client->Backends().Get(client->Medium());
-  if (backend == nullptr) return false;
+  if (backend == nullptr) return 0;
   auto resolved = backend->BatchResolve(keys, /*include_descs=*/false);
-  return resolved.size() == keys.size() &&
-         std::all_of(resolved.begin(), resolved.end(),
-                     [](const auto& entry) { return entry.found; });
+  return static_cast<size_t>(std::count_if(resolved.begin(), resolved.end(),
+                                           [](const auto& entry) { return entry.found; }));
 }
 
 // Distributed mode: a PoolClient with a master behind it.
@@ -658,8 +667,8 @@ class DistributedRangedClient final : public RangedClient {
   std::vector<bool> Exists(const std::vector<std::string>& keys) override {
     return client_->BatchExists(keys);
   }
-  bool AllResident(const std::vector<std::string>& keys) override {
-    return AllLocallyResident(client_, keys);
+  size_t ResidentCount(const std::vector<std::string>& keys) override {
+    return LocallyResidentCount(client_, keys);
   }
 
  private:
@@ -711,10 +720,9 @@ class LocalRangedClient final : public RangedClient {
     return client_->BatchExists(keys);
   }
   // There is no other node, so anything that exists is here.
-  bool AllResident(const std::vector<std::string>& keys) override {
+  size_t ResidentCount(const std::vector<std::string>& keys) override {
     auto present = client_->BatchExists(keys);
-    return present.size() == keys.size() &&
-           std::all_of(present.begin(), present.end(), [](bool b) { return b; });
+    return static_cast<size_t>(std::count(present.begin(), present.end(), true));
   }
 
  private:
@@ -816,7 +824,7 @@ struct RankStats {
   size_t get_bytes = 0;        // bytes the caller asked for
   size_t put_bytes = 0;
   // Wire accounting.  These are PREDICTIONS from the same criterion
-  // AllLocallyResident applies -- see its comment for what that does and does
+  // LocallyResidentCount applies -- see its comment for what that does and does
   // not mean.  They are what the bench can know from outside mori.
   //
   // remote_keys is the useful one: it counts (key, call) pairs that had to reach
@@ -913,7 +921,7 @@ void RunLoadRank(RangedClient* client, const BenchOpts& o,
             }
 
             // Whether this call can be served without the arena at all.
-            const bool all_local = client->AllResident(chunk_keys);
+            const bool all_local = client->ResidentCount(chunk_keys) == chunk_keys.size();
 
             auto res = client->GetRanges(chunk_keys, dsts, sizes, offsets);
             ok = res.size() == count &&
@@ -1002,9 +1010,8 @@ void RunLoadRank(RangedClient* client, const BenchOpts& o,
       // Counted after the load so an asynchronous install has had the whole
       // request to land; it is still a lower bound if one lands later.
       for (size_t pi = 0; pi < o.pools.size(); ++pi) {
-        if (client->AllResident(pool_keys[pi])) {
-          stats->local_write_bytes += pool_keys[pi].size() * o.pools[pi].object_bytes();
-        }
+        stats->local_write_bytes +=
+            client->ResidentCount(pool_keys[pi]) * o.pools[pi].object_bytes();
       }
     }
   }
