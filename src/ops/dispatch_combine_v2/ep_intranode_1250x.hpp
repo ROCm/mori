@@ -299,7 +299,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   T* _tdmTile = reinterpret_cast<T*>(_tdmBatchSmem + (size_t)warpId * kSlabBytes);
   const gfx1250_TDM_GROUP1 _tdmG1 = TdmShape<T>(static_cast<int>(hiddenDim));
 
-  constexpr int kMaxNpes = CUSPLIT_MAX_GPUS;
+  constexpr int kMaxNpes = kCfg.worldSize;
   __shared__ index_t s_N[kMaxNpes];
   __shared__ index_t s_base[kMaxNpes];
   __shared__ index_t s_run[kMaxNpes];
