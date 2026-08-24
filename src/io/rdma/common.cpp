@@ -511,7 +511,7 @@ void PlanSgeStreamChunks(std::vector<ChunkedSgeSegment>& plan, const std::vector
     uint64_t sgeRemaining = sge.length;
     uint64_t sgeOffset = 0;
     while (sgeRemaining > 0) {
-      const uint64_t len64 = std::min({targetRemaining, sgeRemaining, maxMessageSize});
+      const uint64_t len64 = std::min(std::min(targetRemaining, sgeRemaining), maxMessageSize);
       if (len64 == 0) return;
       plan.push_back(ChunkedSgeSegment{
           .remoteOffset = remoteStreamOffset + sgeOffset,

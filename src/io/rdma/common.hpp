@@ -256,10 +256,10 @@ struct RdmaOpRet {
   StatusCode code{StatusCode::INIT};
   std::string message;
 
-  bool Init() { return code == StatusCode::INIT; }
-  bool InProgress() { return code == StatusCode::IN_PROGRESS; }
-  bool Succeeded() { return code == StatusCode::SUCCESS; }
-  bool Failed() { return code > StatusCode::ERR_BEGIN; }
+  bool Init() const { return code == StatusCode::INIT; }
+  bool InProgress() const { return code == StatusCode::IN_PROGRESS; }
+  bool Succeeded() const { return code == StatusCode::SUCCESS; }
+  bool Failed() const { return code > StatusCode::ERR_BEGIN; }
 };
 
 void NotifySqStateChanged(const EpPair& ep);

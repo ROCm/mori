@@ -25,9 +25,9 @@
 #include <sched.h>
 
 #include <cstring>
-#include <future>
 #include <vector>
 
+#include "mori/core/utils/utils.hpp"
 #include "mori/io/logging.hpp"
 #include "mori/utils/env_utils.hpp"
 
@@ -56,7 +56,27 @@ std::vector<int> GetAllowedCpus() {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                   MultithreadExecutor::Worker                                  */
 /* ---------------------------------------------------------------------------------------------- */
-MultithreadExecutor::Worker::Worker(int wid) : workerId(wid) {}
+namespace {
+constexpr size_t kInitialRingCapacity = 1024;  // power of two
+}  // namespace
+
+MultithreadExecutor::Worker::Worker(int wid) : workerId(wid) {
+  ring.resize(kInitialRingCapacity);
+  mask = kInitialRingCapacity - 1;
+}
+
+void MultithreadExecutor::Worker::GrowRing() {
+  const size_t oldCap = ring.size();
+  const size_t newCap = oldCap * 2;
+  std::vector<Task> next(newCap);
+  for (size_t i = 0; i < count; ++i) {
+    next[i] = std::move(ring[(head + i) & mask]);
+  }
+  ring.swap(next);
+  head = 0;
+  tail = count;
+  mask = newCap - 1;
+}
 
 MultithreadExecutor::Worker::~Worker() { Shutdown(); }
 
@@ -110,18 +130,19 @@ void MultithreadExecutor::Worker::MainLoop() {
 
   MORI_IO_INFO("worker {} enter main loop, running on core {}", workerId, sched_getcpu());
 
-  Task task{nullptr, 0, 0, 0};
+  Task task{};
   while (true) {
     {
       std::unique_lock<std::mutex> lock(mu);
-      cond.wait(lock, [this]() { return !q.empty() || !running.load(); });
+      cond.wait(lock, [this]() { return count > 0 || !running.load(); });
 
       if (!running.load()) {
         MORI_IO_INFO("worker {} shutdown", workerId);
         break;
       }
-      task = std::move(q.front());
-      q.pop();
+      task = std::move(ring[head & mask]);
+      ++head;
+      --count;
     }
 
     SizeVec tLoclOffsets(task.req->localOffsets.begin() + task.begin,
@@ -147,7 +168,7 @@ void MultithreadExecutor::Worker::MainLoop() {
         {task.req->eps[task.epId]}, localMrPerEp, remoteMrPerEp, tLoclOffsets, tRemoteOffsets,
         tSizes, task.req->callbackMeta, task.req->id, task.req->isRead, task.req->postBatchSize,
         control);
-    task.ret.set_value(ret);
+    task.latch->Complete(ret);
     MORI_IO_TRACE("Worker {} execute task {} begin {} end {} ret code {}", workerId, task.req->id,
                   task.begin, task.end, static_cast<uint32_t>(ret.code));
   }
@@ -158,11 +179,16 @@ void MultithreadExecutor::Worker::Submit(Task&& task) {
   {
     std::lock_guard<std::mutex> lock(mu);
     if (!running.load()) {
-      task.ret.set_value({StatusCode::ERR_BAD_STATE, "worker not started yet"});
+      task.latch->Complete({StatusCode::ERR_BAD_STATE, "worker not started yet"});
       return;
     }
-    q.push(std::move(task));
-    cond.notify_all();
+    if (MORI_UNLIKELY(count == ring.size())) {
+      GrowRing();
+    }
+    ring[tail & mask] = std::move(task);
+    ++tail;
+    ++count;
+    cond.notify_one();
   }
   MORI_IO_TRACE("Submit to worker {} task {} begin {} end {}", workerId, task.req->id, task.begin,
                 task.end);
@@ -180,65 +206,41 @@ MultithreadExecutor::MultithreadExecutor(int n) : numWorker(n) {
 
 MultithreadExecutor::~MultithreadExecutor() { Shutdown(); }
 
-std::vector<std::pair<int, int>> MultithreadExecutor::SplitWork(const ExecutorReq& req) {
-  int numEps = req.eps.size();
-  int totalBatchSize = req.sizes.size();
-
-  assert(numEps > 0);
-
-  int numActiveWorkers = std::min(numEps, numWorker);
-  int perWorkerBatchSize = (totalBatchSize + numActiveWorkers - 1) / numActiveWorkers;
-
-  std::vector<std::pair<int, int>> splits;
-  for (int i = 0; i < numActiveWorkers; i++) {
-    int begin = i * perWorkerBatchSize;
-    int end = std::min(begin + perWorkerBatchSize, totalBatchSize);
-    splits.push_back({begin, end});
-    if (end >= totalBatchSize) break;
-  }
-
-  return splits;
-}
-
 RdmaOpRet MultithreadExecutor::RdmaBatchReadWrite(const ExecutorReq& req) {
   MORI_IO_FUNCTION_TIMER;
 
-  auto splits = SplitWork(req);
-  int numSplits = splits.size();
   int numEps = static_cast<int>(req.eps.size());
+  int totalBatchSize = static_cast<int>(req.sizes.size());
+  assert(numEps > 0);
+
+  // Split the batch across at most one worker per EP. Ranges are derived inline
+  // (previously SplitWork returned a heap std::vector<std::pair> per call).
+  int numActiveWorkers = std::min(numEps, numWorker);
+  int perWorkerBatchSize = (totalBatchSize + numActiveWorkers - 1) / numActiveWorkers;
+  // Number of non-empty splits. An empty batch still yields one {0,0} split so
+  // the caller gets a well-formed (empty) completion, matching prior behavior.
+  int numSplits =
+      (totalBatchSize == 0) ? 1 : (totalBatchSize + perWorkerBatchSize - 1) / perWorkerBatchSize;
+
   // Rotate the starting EP by transfer id so single-segment transfers spread
   // evenly across all QPs instead of always landing on eps[0].
   int epOffset = static_cast<int>(req.id % static_cast<uint64_t>(numEps));
-  std::vector<std::future<RdmaOpRet>> futs;
 
+  // One stack-local latch shared by all splits: no per-split heap allocation and
+  // a single blocking wait for the whole batch (see BatchLatch in executor.hpp).
+  BatchLatch latch(numSplits);
   for (int i = 0; i < numSplits; i++) {
+    int begin = i * perWorkerBatchSize;
+    int end = std::min(begin + perWorkerBatchSize, totalBatchSize);
     int epId = (i + epOffset) % numEps;
-    Task task{&req, epId, splits[i].first, splits[i].second};
-    futs.push_back(std::move(task.ret.get_future()));
+    Task task{&req, epId, begin, end, &latch};
     // Keep each QP owned by a stable worker to preserve QP affinity.
     pool[epId % numWorker]->Submit(std::move(task));
   }
 
-  bool hasFail = false;
-  int numSucc = 0;
-  RdmaOpRet failedRet;
-  for (auto& fut : futs) {
-    RdmaOpRet ret = fut.get();
-    if (ret.Failed()) {
-      hasFail = true;
-      failedRet = ret;
-    } else if (ret.Succeeded()) {
-      numSucc++;
-    }
-  }
-  if (hasFail) return failedRet;
-
-  if (numSucc == numSplits) {
-    return {StatusCode::SUCCESS, ""};
-  }
-
+  RdmaOpRet ret = latch.Wait(numSplits);
   MORI_IO_TRACE("MultithreadExecutor submit request for RdmaBatchReadWrite done");
-  return {StatusCode::IN_PROGRESS, ""};
+  return ret;
 }
 
 void MultithreadExecutor::Start() {
