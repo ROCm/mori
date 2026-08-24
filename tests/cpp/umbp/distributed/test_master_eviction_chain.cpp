@@ -346,6 +346,56 @@ TEST(MasterEvictionChain, MasterRoundReclaimsTheParkedSourceOfAMovePromotion) {
       << "the evict drained the promoted target instead of the parked source";
 }
 
+// Master-side eviction reads one capacity per TierType, and a client with a
+// weighted multi-backend policy sums its backends into that one figure
+// (MasterClient::SnapshotAndCacheTierCapacities). So a hot tier sharing DRAM with
+// a larger cold tier is reported against their combined size, and a hot tier that
+// is completely full reads as a medium that is nearly empty.
+//
+// The pool side already rejects this reasoning for its own watermarks:
+// PeakMemberUtilization exists because "pressure does not average", and lets the
+// fullest member speak for the tier. RunOnce averages anyway, being one level up
+// and seeing only the sum.
+//
+// Both halves below hold the hot tier at 4 of 4 pages. The only difference is
+// whether a sibling logical tier shares its medium, which is not a property of
+// the hot tier at all -- and it decides whether the master acts.
+TEST(MasterEvictionChain, SiblingTierInTheSameMediumHidesTheOverload) {
+  const std::vector<std::string> keys = {"k0", "k1", "k2", "k3"};
+
+  const auto run_round = [&keys](uint64_t reported_total_pages) {
+    LocalCopyEngine engine;
+    BackendRegistry registry;
+    RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, /*pages=*/4);
+    RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, /*pages=*/8);
+    auto compiled = LogicalTierGraph::Compile(HotColdOnEvict(), registry);
+    PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+    for (const auto& key : keys) CommitKey(&pool, key);
+
+    InMemoryMasterMetadataStore store;
+    PublishNode(&store, keys, reported_total_pages * kPageSize, /*used_bytes=*/4 * kPageSize);
+    PoolDispatcher dispatcher(&pool);
+    EvictionManager manager(store, OneSecondRounds(), &dispatcher);
+    manager.Start();
+    WaitFor([&] { return !dispatcher.Dispatched().empty(); }, std::chrono::seconds(4));
+    manager.Stop();
+    return dispatcher.Dispatched().size();
+  };
+
+  // Hot alone in its medium: 4 of 4 pages, over the watermark, master acts.
+  EXPECT_GT(run_round(/*reported_total_pages=*/4), 0u)
+      << "a full tier alone in its medium was not evicted from";
+
+  // Same full hot tier, now summed with a 32-page DRAM sibling: 4 of 36 pages
+  // reads as 11% and the master sees nothing to do. This is the bug, and the
+  // assertion is deliberately on the current behaviour -- when the decision moves
+  // to per-tier utilisation this expectation is what should fail.
+  EXPECT_EQ(run_round(/*reported_total_pages=*/36), 0u)
+      << "master evicted despite the aggregate being under the watermark -- if "
+         "this now fails, the decision has moved off the per-medium sum and this "
+         "test should be inverted";
+}
+
 // The timing half of the finding above, which the single-key test cannot reach:
 // with one candidate the master has no ordering decision to make. Victims are
 // named least-recently-accessed first, and a key is promoted precisely because
