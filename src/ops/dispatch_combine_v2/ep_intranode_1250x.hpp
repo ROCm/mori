@@ -37,9 +37,12 @@
 
 #pragma once
 
-#include <hip/amd_detail/amd_gfx1250_TDM.h>
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
+
+// AFTER hip_runtime.h, and in its own block so clang-format cannot sort it up:
+// it pulls in driver_types.h, which uses hipMemoryType without declaring it.
+#include <hip/amd_detail/amd_gfx1250_TDM.h>
 
 #include <type_traits>
 
