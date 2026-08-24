@@ -369,8 +369,13 @@ jobs:
 
       - name: Install mori (XLA FFI)
         run: |
+          # Resolve the XLA FFI headers from the system jax *outside* pip's
+          # isolated build env (build isolation hides system site-packages, so
+          # CMake can't `import jax` during configure). Pass it via env var.
           $CT exec ${CONTAINER}_jax bash -c \
-            "cd $GITHUB_WORKSPACE && BUILD_UMBP=OFF BUILD_XLA_FFI_OPS=ON pip install --break-system-packages ."
+            "cd $GITHUB_WORKSPACE && \
+             export XLA_FFI_INCLUDE_DIR=\$(python3 -c 'from jax import ffi; print(ffi.include_dir())') && \
+             BUILD_UMBP=OFF BUILD_XLA_FFI_OPS=ON pip install --break-system-packages ."
 
       - name: MORI-EP JAX test
         run: |
