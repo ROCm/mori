@@ -319,7 +319,12 @@ constexpr int EpTokenBytes(const EpCfg& c) { return c.hiddenDim * EpElemSize(c.d
 // gfx1250 launch LDS. Dispatch stages one token tile per warp through the TDM
 // engine; combine reserves the whole budget and sizes its tiles at runtime.
 // EpCombine1250xLdsBudget must match MORI_COMB_LDS_BUDGET in ep_intranode_1250x.hpp.
-constexpr int EpCombine1250xLdsBudget = 327680;
+//
+// Ep1250xLdsBytes is the physical ceiling; combine's budget happens to be all of
+// it. Anything else that needs the ceiling should say so directly rather than
+// reach for combine's number -- otherwise retuning combine silently resizes it.
+constexpr int Ep1250xLdsBytes = 327680;
+constexpr int EpCombine1250xLdsBudget = Ep1250xLdsBytes;
 // xdbFlag slots for the per-block combine entry barrier: one uint64 per block, so a
 // block is the only writer of its own epoch. 256 == the CU count, which caps the
 // combine block_num; the host allocates this many and every call keeps them in step.
@@ -331,17 +336,24 @@ constexpr int EpXdbFlagSlots = 256;
 //
 // Sizing it off the payload dtype alone is fine until a scale row joins the
 // metadata: an fp8 payload halves the slab exactly when per-token metadata grows
-// from 52 to 276 bytes, and the batch collapses ~11x. Measured at 512 tokens:
-// dispatch 36.7us (bf16) -> 93.1us (fp8+scale), all of it in metadata batching.
-// So when scales are on, ask for the bf16 width -- unless the extra LDS would
-// exceed what this geometry can launch with, in which case keep the payload size
-// and take the smaller batch rather than failing at launch.
+// from 52 to 276 bytes, and the batch collapses ~11x.
+//
+// The floor is EMPIRICAL, and from one shape: hidden 7168, topk 6, EP4, 512
+// tokens/rank on gfx1250, where it moved dispatch from 93.1us back to 36.7us.
+// The mechanism (a narrower slab shrinks the metadata batch) is general; the
+// conclusion that the bf16 width is the right target is not necessarily so for a
+// very different hidden size, and this is the first thing to re-measure if one
+// shows up.
+//
+// Capped by the physical LDS rather than by combine's budget: the two are the
+// same number today, but for a shared physical reason, not because dispatch
+// follows combine.
 constexpr int EpDispatch1250xSlabBytes(const EpCfg& c) {
   const int payload = c.hiddenDim * EpElemSize(c.dtype);
   if (c.scaleBytes <= 0) return payload;
-  const int wide = c.hiddenDim * 2;
+  const int wide = c.hiddenDim * EpElemSize(EpDType::Bf16);
   const long long total = (long long)wide * c.warpPerBlock;
-  return (wide > payload && total <= EpCombine1250xLdsBudget) ? wide : payload;
+  return (wide > payload && total <= Ep1250xLdsBytes) ? wide : payload;
 }
 constexpr int EpDispatch1250xLdsBytes(const EpCfg& c) {
   return c.warpPerBlock * EpDispatch1250xSlabBytes(c);

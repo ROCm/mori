@@ -184,6 +184,17 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             bad.append(f"quant_type={cfg.quant_type!r}")
         if cfg.enable_std_moe:
             bad.append("enable_std_moe")
+        # The kernel walks the source scale rows with the PADDED dword stride, so
+        # a caller row that is not itself a whole number of dwords would be read
+        # at the wrong pitch. _scale_i32 rounds up, which hides that from the Cfg
+        # validator -- check the caller's own width here instead.
+        raw_scale_bytes = cfg.scale_dim * cfg.scale_type_size
+        if raw_scale_bytes % 4:
+            bad.append(
+                f"per-token scale row of {raw_scale_bytes} B "
+                f"(scale_dim={cfg.scale_dim} x {cfg.scale_type_size}); "
+                "the row must be a whole number of dwords"
+            )
         # The C++ validator rejects a shrunk cap: the recv capacity is also the
         # flat-index stride, so an overflow re-encodes to the next peer instead
         # of merely overrunning the region.

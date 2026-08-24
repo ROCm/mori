@@ -270,6 +270,30 @@ constexpr size_t kEpScaleSlots = 1;
 constexpr size_t kEpScaleRows = 1;
 constexpr int kMetaFields = 3;  // idx, weights, srcmap
 #endif
+// FOOTPRINT, and it is quadratic in world_size: kEpScaleSlots is
+// worldSize * EpMaxRecv, and EpMaxRecv is itself worldSize * maxTokPerRank. That
+// is deliberate -- the per-peer stride has to be the peer's full recv capacity so
+// the destination slot id indexes it directly, which is also what lets the
+// existing `ab + cc > recvCapM` guard cover this array (_stgCap does NOT bound
+// it; the two cross over as world_size grows).
+//
+// It costs, at scaleBytes=224 (hidden 7168):
+//     EP4  maxTok 16384  ->   56 MiB
+//     EP8  maxTok  8192  ->  112 MiB
+//     EP8  maxTok 16384  ->  224 MiB
+// and this is a __device__ global, so it is one copy PER COMPILED VARIANT: a
+// three-entry (block, warp) schedule at EP8/16384 reserves ~672 MiB.
+//
+// The idx/wt pools next to it are world_size-independent (a fixed CUSPLIT_POOL
+// split per peer). Making this one match would need the staging to be indexed by
+// a block-local slot instead of the destination slot id, which is a bigger change
+// than it looks and wants hardware validation -- the guard would start dropping
+// tokens rather than merely skipping transfers. Until then, fail at compile time
+// rather than at the first launch on a big EP.
+static_assert(kEpScaleBytes == 0 || (size_t)kEpScaleSlots * kEpScaleBytes <= (size_t)1 << 30,
+              "EP scale staging exceeds 1 GiB per compiled variant -- it grows as "
+              "world_size^2 * maxTokPerRank * scaleBytes; re-index it block-locally "
+              "before going wider");
 __device__ unsigned char _cusplit_stgScale[kEpScaleSlots * (kEpScaleBytes > 0 ? kEpScaleBytes : 1)];
 
 /* ------------------------------------------------------------------------- */

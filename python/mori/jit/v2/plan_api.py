@@ -64,6 +64,13 @@ __all__ = [
 # (the caller halves hiddenDim). Combine cannot use it; C++ rejects that.
 DTYPES = {"bf16": 0, "fp32": 1, "byte8": 2}
 
+# Arena regions a caller is allowed not to carry. Everything else missing is a
+# bug in the caller, not a configuration: see the bind loop in make_plan.
+_OPTIONAL_REGIONS = frozenset({"out_scales"})
+
+# ... and the Request field that makes each of them mandatory again.
+_REGION_REQUIRED_WHEN = {"out_scales": "scaleBytes"}
+
 # The C ABI + the plan registry both live here; op-libraries register INTO it.
 _ABI_NAME = "libmori_jit.so"
 
@@ -416,13 +423,28 @@ def make_plan(kernel: str) -> type:
                     try:
                         self._defaults[wire] = int(arena.offset(name))
                     except KeyError:
-                        # A region the arena does not carry binds to 0. Optional
-                        # regions exist (out_scales is only laid out when the scale
-                        # transport is on) and every caller would otherwise have to
-                        # know about a feature it does not use. The kernel's own
-                        # `if constexpr` is what keeps a 0 offset from being read --
-                        # a backend that enables a feature must check its arena has
-                        # the region, because 0 here aliases the first one.
+                        # ONLY a region on the optional list may be missing. A
+                        # blanket catch here would turn a typo in region_names, or
+                        # a backend that forgot a required region, from an
+                        # immediate KeyError into a silent bind to offset 0 -- and
+                        # 0 aliases the first region, so the kernel would scribble
+                        # over it. Callers that build their own arena and pass a
+                        # region_names mapping (aiter's MegaMoE does) are exactly
+                        # the ones most able to get this wrong.
+                        if region not in _OPTIONAL_REGIONS:
+                            raise
+                        # Optional, but not optional for THIS plan: if the Request
+                        # field that turns the feature on is set, the kernel will
+                        # dereference the offset and a 0 would alias region 0.
+                        # Mechanism, not a comment telling callers to be careful.
+                        enabler = _REGION_REQUIRED_WHEN.get(region)
+                        if enabler and int(req.get(enabler) or 0):
+                            raise KeyError(
+                                f"{kernel}: arena has no region {name!r}, but "
+                                f"{enabler}={req[enabler]} turns it on"
+                            ) from None
+                        # Optional and genuinely off: the kernel's `if constexpr`
+                        # is what keeps the 0 from being dereferenced.
                         self._defaults[wire] = 0
 
         def bind(self, **args) -> None:
