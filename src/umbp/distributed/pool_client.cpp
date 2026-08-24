@@ -2271,13 +2271,13 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
 
 namespace {
 
-std::vector<PoolClient::ObjectRange> MakeReadRanges(const std::vector<void*>& dsts,
-                                                    const std::vector<size_t>& sizes,
-                                                    const std::vector<size_t>& offsets) {
-  std::vector<PoolClient::ObjectRange> out;
-  out.reserve(dsts.size());
-  for (size_t r = 0; r < dsts.size(); ++r) out.push_back({dsts[r], sizes[r], offsets[r]});
-  return out;
+// Fills `out` rather than returning a fresh vector: the caller loops over keys
+// and one allocation per key adds up on a call carrying thousands of ranges.
+void FillReadRanges(const std::vector<void*>& dsts, const std::vector<size_t>& sizes,
+                    const std::vector<size_t>& offsets, std::vector<PoolClient::ObjectRange>* out) {
+  out->clear();
+  out->reserve(dsts.size());
+  for (size_t r = 0; r < dsts.size(); ++r) out->push_back({dsts[r], sizes[r], offsets[r]});
 }
 
 std::vector<PoolClient::ObjectRange> MakeWriteRanges(const std::vector<const void*>& srcs,
@@ -2354,6 +2354,16 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   std::vector<size_t> local_keys;
   std::vector<size_t> missed;
   missed.reserve(n);
+  // A TransferItem carries two TransferRefs, each with a MemoryDesc, so growing
+  // this vector by doubling relocates a lot of bytes.  One range is at least one
+  // item -- more only when it straddles a page -- so the range count is a tight
+  // lower bound and covers the common case exactly.
+  {
+    size_t range_total = 0;
+    for (const auto& per_key : sizes) range_total += per_key.size();
+    local_items.reserve(range_total);
+  }
+  std::vector<ObjectRange> key_ranges;
 
   // One BatchResolve per BACKEND for the whole batch, not one per key.
   //
@@ -2420,10 +2430,12 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
     bool built = false;
     {
       PhaseTimer build_timer(dbg ? &dbg->build : nullptr);
-      built = BuildLocalRangeTransfers(holder, resolved.pages, resolved.page_size, resolved.size,
-                                       MakeReadRanges(dsts[i], sizes[i], src_offsets[i]),
-                                       /*to_backend=*/false, /*tag=*/i, &local_items,
-                                       dbg ? &dbg->classify : nullptr);
+      // Refilled per key rather than returned fresh: one allocation for the
+      // call instead of one per key.
+      FillReadRanges(dsts[i], sizes[i], src_offsets[i], &key_ranges);
+      built = BuildLocalRangeTransfers(
+          holder, resolved.pages, resolved.page_size, resolved.size, key_ranges,
+          /*to_backend=*/false, /*tag=*/i, &local_items, dbg ? &dbg->classify : nullptr);
     }
     if (!built) {
       // The medium holds the key but cannot be read in-process.  Same call as
