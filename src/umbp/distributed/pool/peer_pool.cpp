@@ -181,7 +181,7 @@ PeerPool::TransitionPlan PeerPool::PlanTransitionLocked(const TransitionJob& job
 
   const bool promotion = job.kind == TierTransitionKind::kPromotion;
   const auto& source_tier = tier_graph_->NodeAt(job.source_tier);
-  plan.remove_source = !promotion || source_tier.promotion_mode == PoolTransitionMode::kMove;
+  plan.remove_source = !promotion || source_tier.promote_mode == PoolTransitionMode::kMove;
   plan.targets = promotion ? tier_graph_->PromoteTargetOrder(job.source_tier, job.key)
                            : tier_graph_->TransitionTargetOrder(job.source_tier, job.key);
   plan.valid = true;

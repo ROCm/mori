@@ -63,7 +63,7 @@ TEST(BackendPolicyConfig, ParsesAndLowersShippedExample) {
   EXPECT_DOUBLE_EQ(output.logical_tiers[1].low_watermark, 0.7);
 
   EXPECT_EQ(output.logical_tiers[2].promote_trigger, PoolPromoteTrigger::kOnRead);
-  EXPECT_EQ(output.logical_tiers[2].promotion_mode, PoolTransitionMode::kCopy);
+  EXPECT_EQ(output.logical_tiers[2].promote_mode, PoolTransitionMode::kCopy);
   EXPECT_TRUE(output.logical_tiers[2].offload_to.empty());
 }
 
@@ -112,7 +112,7 @@ TEST(BackendPolicyConfig, RejectsInvalidSchemaAndBackwardEdges) {
   EXPECT_NE(tiny_hbm.error.find("per-device capacity"), std::string::npos);
 }
 
-// The shipped example only exercises promotion_mode "copy", so nothing pins the
+// The shipped example only exercises promote_mode "copy", so nothing pins the
 // other branch of the enum: a policy asking for move would have parsed to copy
 // and silently kept the source tier's copy alive.
 TEST(BackendPolicyConfig, LowersMovePromotionMode) {
@@ -122,7 +122,7 @@ TEST(BackendPolicyConfig, LowersMovePromotionMode) {
        "c":{"type":"dram","capacity":"1GiB"}},
      "tiers":[
        {"backends":{"h":1},"offload_to":["cold"],"offload_trigger":"on_evict","name":"hot"},
-       {"backends":{"c":1},"name":"cold","promote_trigger":"on_read","promotion_mode":"move"}]}
+       {"backends":{"c":1},"name":"cold","promote_trigger":"on_read","promote_mode":"move"}]}
   )json");
   ASSERT_TRUE(loaded.ok()) << loaded.error;
 
@@ -132,14 +132,14 @@ TEST(BackendPolicyConfig, LowersMovePromotionMode) {
   ASSERT_TRUE(ApplyBackendPolicy(*loaded.config, &output, &error)) << error;
   ASSERT_EQ(output.logical_tiers.size(), 2u);
   EXPECT_EQ(output.logical_tiers[1].promote_trigger, PoolPromoteTrigger::kOnRead);
-  EXPECT_EQ(output.logical_tiers[1].promotion_mode, PoolTransitionMode::kMove);
+  EXPECT_EQ(output.logical_tiers[1].promote_mode, PoolTransitionMode::kMove);
   // The entry tier keeps the default, so one tier asking for move does not
   // change how the rest of the graph promotes.
-  EXPECT_EQ(output.logical_tiers[0].promotion_mode, PoolTransitionMode::kCopy);
+  EXPECT_EQ(output.logical_tiers[0].promote_mode, PoolTransitionMode::kCopy);
 
   auto bad = LoadBackendPolicyJson(R"json(
     {"backends":{"d":{"type":"dram","capacity":"1GiB"}},
-     "tiers":[{"backends":{"d":1},"promotion_mode":"relocate"}]}
+     "tiers":[{"backends":{"d":1},"promote_mode":"relocate"}]}
   )json");
   EXPECT_FALSE(bad.ok());
 }
@@ -210,6 +210,13 @@ TEST(BackendPolicyConfig, LowersPromoteTriggerAndRejectsIncoherentThresholds) {
               "tiers":[{"backends":{"h":1},"offload_to":["cold"],
                         "offload_trigger":"on_evict","name":"hot"},
                        {"backends":{"c":1},"name":"cold","promote_on_read":true}]})json",
+      // Nor the pre-rename spelling of promote_mode, for the same reason.
+      R"json({"backends":{"h":{"type":"dram","capacity":"1GiB"},
+              "c":{"type":"dram","capacity":"1GiB"}},
+              "tiers":[{"backends":{"h":1},"offload_to":["cold"],
+                        "offload_trigger":"on_evict","name":"hot"},
+                       {"backends":{"c":1},"name":"cold","promote_trigger":"on_read",
+                        "promotion_mode":"move"}]})json",
   };
   for (const char* json : kRejected) {
     EXPECT_FALSE(LoadBackendPolicyJson(json).ok()) << json;

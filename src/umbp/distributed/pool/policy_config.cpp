@@ -229,7 +229,7 @@ LogicalTierConfig ParseLogicalTier(const Value& value, size_t index) {
   RejectUnknownFields(object,
                       {"name", "backends", "placement_policy", "offload_to",
                        "offload_trigger", "high_watermark", "low_watermark",
-                       "promote_trigger", "promote_hits", "promotion_mode"},
+                       "promote_trigger", "promote_hits", "promote_mode"},
                       context);
 
   LogicalTierConfig tier;
@@ -301,8 +301,8 @@ LogicalTierConfig ParseLogicalTier(const Value& value, size_t index) {
   } else if (tier.promote_trigger == PoolPromoteTrigger::kOnHits) {
     Invalid(context + ": promote_hits is required when promote_trigger is 'on_hits'");
   }
-  if (const Value* mode = OptionalField(object, "promotion_mode")) {
-    tier.promotion_mode = AsEnum<PoolTransitionMode>(*mode, context + ".promotion_mode",
+  if (const Value* mode = OptionalField(object, "promote_mode")) {
+    tier.promote_mode = AsEnum<PoolTransitionMode>(*mode, context + ".promote_mode",
                                                      {{"copy", PoolTransitionMode::kCopy},
                                                       {"move", PoolTransitionMode::kMove}});
   }
@@ -652,7 +652,7 @@ bool ApplyBackendPolicy(const BackendPolicyConfig& policy, PoolClientConfig* con
       lowered.entry = tier_index == index.entry_tier;
       lowered.promote_trigger = source.promote_trigger;
       lowered.promote_hits = source.promote_hits;
-      lowered.promotion_mode = source.promotion_mode;
+      lowered.promote_mode = source.promote_mode;
       for (const auto& member : source.members) {
         const auto& names = expansions.at(member.backend_name);
         const uint64_t factor = expansion_lcm / names.size();

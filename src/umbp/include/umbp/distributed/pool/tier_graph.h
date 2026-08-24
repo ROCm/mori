@@ -38,7 +38,7 @@ class LogicalTierGraph {
     double low_watermark = 0.7;
     PoolPromoteTrigger promote_trigger = PoolPromoteTrigger::kNever;
     uint32_t promote_hits = 0;
-    PoolTransitionMode promotion_mode = PoolTransitionMode::kCopy;
+    PoolTransitionMode promote_mode = PoolTransitionMode::kCopy;
   };
 
   struct CompileResult;

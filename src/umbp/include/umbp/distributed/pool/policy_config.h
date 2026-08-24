@@ -64,7 +64,7 @@ struct LogicalTierConfig {
   // Reads on this tier before a key is promoted. Only kOnHits reads it, and a
   // threshold of 1 is kOnRead spelled differently, so the parser requires >= 2.
   uint32_t promote_hits = 0;
-  PoolTransitionMode promotion_mode = PoolTransitionMode::kCopy;
+  PoolTransitionMode promote_mode = PoolTransitionMode::kCopy;
 };
 
 struct BackendPolicyConfig {
