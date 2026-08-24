@@ -180,14 +180,25 @@ target_link_libraries(test_umbp_route_put_strategy PRIVATE umbp_common
                                                            gtest_main)
 add_test(NAME umbp_route_put_strategy COMMAND test_umbp_route_put_strategy)
 
-# Master eviction policy plug-in: default LRU behavior + the EvictionManager DI
-# seam.  The seam test calls EvictionManager::RunOnce() directly (a public
-# single-pass trigger), so no special compile flags are needed.
+# Master eviction policy plug-in: the default LRU victim selection in isolation,
+# given candidates and a per-(node, tier) byte budget.
 add_executable(test_umbp_master_evict_strategy test_master_evict_strategy.cpp)
 target_link_libraries(test_umbp_master_evict_strategy PRIVATE umbp_common
                                                               gtest_main)
 add_test(NAME umbp_master_evict_strategy
          COMMAND test_umbp_master_evict_strategy)
+
+# The master-to-peer eviction chain, which the two tests above and test_peer_pool
+# only cover from their own ends: watermark detection, victim selection, and the
+# dispatch, wired into a real PeerPool so on_evict offload is driven the way a
+# deployed master drives it.  RunOnce() is private, so rounds are driven by
+# Start() at the one-second floor rather than called directly.
+add_executable(test_umbp_master_eviction_chain test_master_eviction_chain.cpp)
+target_link_libraries(test_umbp_master_eviction_chain PRIVATE umbp_common
+                                                             GTest::gtest_main)
+target_compile_features(test_umbp_master_eviction_chain PRIVATE cxx_std_17)
+add_test(NAME umbp_master_eviction_chain
+         COMMAND test_umbp_master_eviction_chain)
 
 # PageBitmapAllocator (peer-side per-tier page allocator primitive).
 add_executable(test_umbp_page_bitmap_allocator test_page_bitmap_allocator.cpp)
