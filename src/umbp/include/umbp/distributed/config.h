@@ -253,6 +253,11 @@ struct PoolClientConfig {
   CacheRemoteAdmission cache_remote_admission = CacheRemoteAdmission::SIZE;
   size_t admission_max_block_bytes = 16ULL * 1024 * 1024;
 
+  // Background whole-object pull after a remote ranged read; see
+  // UMBPDistributedConfig::ranged_locality_prefetch for why it is not folded
+  // into cache_remote_fetches.
+  bool ranged_locality_prefetch = true;
+
   // Page size used by Master's PageBitmapAllocator for this node's DRAM/HBM
   // tier.  Reported via RegisterClient.  Same value applies to both DRAM
   // and HBM.  Forwarded unmodified to MasterClient::RegisterSelf by
@@ -295,6 +300,7 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.cache_remote_fetches = dc.cache_remote_fetches;
   pc.cache_remote_admission = dc.cache_remote_admission;
   pc.admission_max_block_bytes = dc.admission_max_block_bytes;
+  pc.ranged_locality_prefetch = dc.ranged_locality_prefetch;
   // 0 propagates through PoolClient -> MasterClient::RegisterSelf ->
   // proto -> ClientRegistry, where it is interpreted as "use the
   // registry-wide default_dram_page_size".
