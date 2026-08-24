@@ -1892,7 +1892,13 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
       } else {
         // Cross-process: standard IPC open.
         void* mapped = nullptr;
-        HIP_RUNTIME_CHECK(hipIpcOpenMemHandle(&mapped, handles[pe], hipIpcMemLazyEnablePeerAccess));
+        hipError_t ipcErr =
+            hipIpcOpenMemHandle(&mapped, handles[pe], hipIpcMemLazyEnablePeerAccess);
+        // Lazy peer setup can leave hipErrorPeerAccessAlreadyEnabled as the
+        // sticky last error even when the IPC mapping succeeded.  Torch checks
+        // that state on its next runtime call, so consume it here.
+        (void)hipGetLastError();
+        HIP_RUNTIME_CHECK(ipcErr);
         peerPtrs_host[lsa] = reinterpret_cast<uint64_t*>(mapped);
       }
     }

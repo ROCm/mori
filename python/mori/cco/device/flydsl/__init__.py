@@ -42,6 +42,7 @@ Example (inside ``@flyc.kernel``)::
 """
 
 from mori.cco.device.bitcode import find_cco_bitcode, get_bitcode_path
+from mori.cco.device.ops import SdmaOptFlags
 from .handles import DevComm, Window, Gda, CoopScope, SignalOp, ThreadMode, Sdma
 from . import _bindings
 
@@ -52,6 +53,7 @@ __all__ = [
     "CoopScope",
     "SignalOp",
     "ThreadMode",
+    "SdmaOptFlags",
     "find_cco_bitcode",
     "get_bitcode_path",
     "_bindings",

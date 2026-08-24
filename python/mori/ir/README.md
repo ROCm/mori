@@ -8,7 +8,9 @@ use it.
 The `mori.ir` Python package provides:
 
 - **`mori.ir`** — framework-agnostic bitcode locator and device function ABI metadata
-- **`mori.ir.triton`** — Triton integration layer (as a reference backend)
+- **`mori.ir.triton`** — shmem Triton integration layer
+- **`mori.ir.triton.cco`** — CCO LSA/SDMA/GDA Triton integration backed by
+  `libmori_cco_device.bc`
 
 `mori.ir` is designed to be framework-agnostic. Triton is the first supported
 backend; the same bitcode and ABI metadata can be used to integrate with
@@ -46,6 +48,47 @@ def my_kernel(buf_ptr, N, BLOCK: tl.constexpr):
 
 my_kernel[(grid,)](buf, N, BLOCK=1024, extern_libs=get_extern_libs())
 ```
+
+## Quick Start (CCO + Triton)
+
+CCO host state is explicit: create a `Communicator`, register a window, create
+a DevComm, then pass `dc.ptr` and `win.handle` as `uint64` kernel arguments.
+Unlike shmem, CCO has no `globalGpuStates` symbol and needs no
+`install_hook()`.
+
+```python
+import triton
+import triton.language as tl
+from mori.ir.triton import cco
+
+@triton.jit
+def lsa_copy(dev_comm, win, peer: tl.constexpr, N: tl.constexpr):
+    me = cco.devcomm_lsa_rank(dev_comm)
+    src_addr = cco.lsa_ptr(win, me, 0)
+    dst_addr = cco.lsa_ptr(win, peer, 0)
+    src = src_addr.to(tl.pointer_type(tl.uint32), bitcast=True)
+    dst = dst_addr.to(tl.pointer_type(tl.uint32), bitcast=True)
+    offs = tl.arange(0, N)
+    tl.store(dst + offs, tl.load(src + offs))
+
+lsa_copy[(1,)](
+    dc.ptr,
+    win.handle,
+    peer=1,
+    N=256,
+    extern_libs=cco.get_extern_libs(),
+)
+```
+
+The flat CCO functions mirror the monomorphized C symbols. Examples:
+
+- `devcomm_rank`, `devcomm_lsa_rank`, `lsa_ptr`
+- `sdma_put_{thread,warp,block}` and `sdma_quiet_*`
+- `gda_put_{it,iw,ib,at}_{none,inc,add}`
+- `gda_get_{it,iw,ib,at}`, signal/wait/read/reset, and flush variants
+
+SDMA requires a MORI build with `BUILD_CCO_SDMA=ON` and runtime
+`MORI_ENABLE_SDMA=1`. GDA peers are world ranks; LSA/SDMA peers are LSA ranks.
 
 ## Quick Start (Bitcode only, no Triton)
 
@@ -157,6 +200,7 @@ bash tools/build_shmem_bitcode.sh [output_dir] [gpu_arch]
 | `examples/shmem/ir/test_triton_shmem.py` | Basic put/get via `mori.ir.triton` |
 | `examples/shmem/ir/test_triton_allreduce.py` | Allreduce: P2P read + put+signal kernels |
 | `examples/shmem/ir/test_mlir_shmem.py` | MLIR / LLVM IR paths (no Triton) |
+| `examples/cco/ir/test_triton_cco.py` | CCO DevComm + LSA/SDMA/GDA via Triton |
 
 ## Testing
 
@@ -183,6 +227,23 @@ MORI_DISABLE_P2P=ON torchrun --nproc_per_node=8 examples/shmem/ir/test_triton_al
 ```bash
 cd examples/shmem/ir
 bash run.sh 2 gfx942
+```
+
+### CCO Triton (2 GPUs)
+
+```bash
+# LSA
+torchrun --standalone --nproc_per_node=2 \
+  examples/cco/ir/test_triton_cco.py --transport lsa
+
+# SDMA
+MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=2 \
+  examples/cco/ir/test_triton_cco.py --transport sdma
+
+# GDA-FULL on one AINIC rail
+MORI_DEVICE_NIC=ionic MORI_DISABLE_TOPO=1 MORI_RDMA_DEVICES=rocep9s0 \
+  torchrun --standalone --nproc_per_node=2 \
+  examples/cco/ir/test_triton_cco.py --transport gda
 ```
 
 ## Known Limitations

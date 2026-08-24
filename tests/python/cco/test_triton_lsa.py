@@ -19,40 +19,10 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-# Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
-# MIT License
-"""
-mori.ir.triton — Triton integration for MORI device APIs.
 
-The package-level functions expose shmem. The :mod:`mori.ir.triton.cco`
-submodule exposes CCO LSA, SDMA, and GDA functions.
+from tests.python.cco.helper import run_triton_example
 
-Quick start::
 
-    from mori.ir import triton as mori_shmem_device
-    from mori.ir.triton import get_extern_libs, install_hook
-
-    install_hook()
-
-    @triton.jit
-    def my_kernel(buf_ptr, N, BLOCK: tl.constexpr):
-        pe = mori_shmem_device.my_pe()
-        mori_shmem_device.putmem_nbi_block(buf_ptr, buf_ptr, N * 2, pe, 0)
-        mori_shmem_device.quiet_thread()
-
-    my_kernel[(grid,)](buf, N, BLOCK=1024, extern_libs=get_extern_libs())
-"""
-
-from .ops import *  # noqa: F401,F403 — export all device functions at package level
-from .ops import __all__ as _ops_all
-from .runtime import get_extern_libs, install_hook
-from . import cco
-
-get_cco_extern_libs = cco.get_extern_libs
-
-__all__ = _ops_all + [
-    "get_extern_libs",
-    "install_hook",
-    "cco",
-    "get_cco_extern_libs",
-]
+def test_triton_cco_lsa():
+    output = run_triton_example("lsa", timeout=120)
+    assert "All CCO Triton lsa tests PASSED" in output

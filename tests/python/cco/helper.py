@@ -31,6 +31,10 @@ examples.
 """
 
 import ctypes
+import os
+from pathlib import Path
+import subprocess
+import sys
 
 from mori.jit.hip_driver import _get_hip_lib, _check
 
@@ -63,3 +67,52 @@ def read(dev_ptr: int, count: int, ctype=ctypes.c_uint64):
     arr = (ctype * count)()
     _copy(arr, ctypes.c_void_p(dev_ptr), ctypes.sizeof(arr), _D2H)
     return arr
+
+
+def run_triton_example(transport: str, timeout: int = 240) -> str:
+    """Run the two-rank CCO Triton example and return its combined output."""
+
+    repo_root = Path(__file__).resolve().parents[3]
+    script = repo_root / "examples" / "cco" / "ir" / "test_triton_cco.py"
+    env = os.environ.copy()
+    env.setdefault("MORI_SOCKET_IFNAME", "lo")
+    env.setdefault("BUILD_CCO_SDMA", "ON")
+
+    if transport in ("sdma", "all"):
+        env["MORI_ENABLE_SDMA"] = "1"
+
+    if transport in ("gda", "all"):
+        devices = env.get("MORI_CCO_TRITON_GDA_DEVICE") or env.get(
+            "MORI_RDMA_DEVICES", ""
+        )
+        if not devices:
+            raise RuntimeError(
+                "GDA test needs MORI_CCO_TRITON_GDA_DEVICE or MORI_RDMA_DEVICES"
+            )
+        env["MORI_RDMA_DEVICES"] = devices.split(",", 1)[0]
+        env["MORI_DISABLE_TOPO"] = "1"
+
+    command = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc_per_node=2",
+        str(script),
+        "--transport",
+        transport,
+    ]
+    result = subprocess.run(
+        command,
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    output = result.stdout + result.stderr
+    if result.returncode != 0:
+        raise AssertionError(
+            f"CCO Triton {transport} example failed ({result.returncode}):\n{output}"
+        )
+    return output

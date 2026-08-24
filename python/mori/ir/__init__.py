@@ -24,9 +24,10 @@
 """
 mori.ir — Mori device IR layer.
 
-Provides framework-agnostic access to the shmem device bitcode and
-function ABI metadata, plus framework-specific integration sub-packages
-(``mori.ir.triton``, and in the future ``mori.ir.flydsl``, etc.).
+Provides framework-agnostic access to the shmem device bitcode and function
+ABI metadata, plus framework-specific integration sub-packages. CCO Triton
+bindings are available from ``mori.ir.triton.cco`` and reuse
+``mori.cco.device`` bitcode/ABI infrastructure.
 
 Quick start (no framework dependency)::
 

@@ -6,6 +6,7 @@ the cco host runtime) and C++.
 ```
 examples/cco/
 ├── python/   # FlyDSL device kernels + cco host runtime (mpi4py bootstrap)
+├── ir/       # Triton device kernels + cco host runtime (torchrun bootstrap)
 └── cpp/      # standalone C++ host+device examples (MPI bootstrap)
 ```
 
@@ -17,6 +18,7 @@ examples/cco/
 | `python/04_flydsl_lsa_put` | py | FlyDSL LSA: direct peer-pointer store in the kernel |
 | `python/05_flydsl_lsa_allreduce` | py | FlyDSL LSA custom all-reduce (peer pointers + device signal barrier) |
 | `python/06_flydsl_gda_modes` | py | FlyDSL GDA template matrix: (thread_mode, coop) × signal |
+| `ir/test_triton_cco.py` | py | Triton DevComm queries and LSA/SDMA/GDA device APIs |
 | `cpp/01_lsa_put.cpp` | c++ | intra-node LSA put (includes only `cco.hpp`) |
 | `cpp/02_gda_put.cpp` | c++ | GPU-initiated RDMA put + signal/wait (includes only `cco_scale_out.hpp`) |
 
@@ -82,7 +84,33 @@ node; LSA examples (02, 04, 05) ignore it. Each example prints `SUCCESS` on pass
 
 ---
 
-## 3. Run the C++ examples
+## 3. Run the Triton example
+
+The Triton integration links `libmori_cco_device.bc` with code object version 5
+and passes `DevCommHandle.ptr` / `RegisteredWindow.handle` into the kernel.
+
+```bash
+# LSA
+torchrun --standalone --nproc_per_node=2 \
+  examples/cco/ir/test_triton_cco.py --transport lsa
+
+# SDMA: MORI must also be built with BUILD_CCO_SDMA=ON
+MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=2 \
+  examples/cco/ir/test_triton_cco.py --transport sdma
+
+# GDA-FULL on a single Ionic rail
+MORI_DEVICE_NIC=ionic MORI_DISABLE_TOPO=1 MORI_RDMA_DEVICES=rocep9s0 \
+  torchrun --standalone --nproc_per_node=2 \
+  examples/cco/ir/test_triton_cco.py --transport gda
+```
+
+Replace `rocep9s0` with one active HCA on the host. Pinning one HCA avoids the
+known local cross-rail hang on multi-AINIC systems; it is a correctness
+workaround and limits aggregate bandwidth.
+
+---
+
+## 4. Run the C++ examples
 
 Two ways:
 
