@@ -35,8 +35,8 @@
 // GB/s decimal, payload x1.
 //
 // Build: hipcc -std=c++17 -O3 ualoe_bw.cpp -o ualoe_bw
-//   node A> ./ualoe_bw listen  <port> [gpu]        # omit gpu => all GPUs
-//   node B> ./ualoe_bw connect <peer_ip> <port> [gpu]
+//   node A> ./ualoe_bw listen  [-port=N] [-gpu=X]            # omit -gpu => all GPUs
+//   node B> ./ualoe_bw connect <peer_ip> [-port=N] [-gpu=X]  # -port default 55552
 #include <arpa/inet.h>
 #include <hip/hip_runtime.h>
 #include <netinet/in.h>
