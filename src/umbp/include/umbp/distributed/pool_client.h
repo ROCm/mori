@@ -416,9 +416,20 @@ class PoolClient {
   // with MaybePrefetchWholeObject — exactly one runs per fetched key.
   void MaybeInstallCompleteArenaObject(const std::string& key, const void* arena_slice,
                                        size_t object_size);
-  // Shared gate for both: the feature switch, an installable local medium, and
-  // the re-cache admission policy.
-  bool LocalityCachingAdmits(size_t object_size) const;
+  // The two locality paths are gated separately, because they do not cost the
+  // same thing.
+  //
+  // Landing the object in this node's medium when it is ALREADY IN HAND -- the
+  // arena slice is the whole object, or the peer can write straight into a slot
+  // -- costs nothing on the wire. The pre-ranged code did it on every remote
+  // ranged read, unconditionally, so gating it would be a silent regression
+  // against a switch whose documented job is something else. The only question
+  // worth asking is whether there is a medium to install into.
+  bool CanInstallLocally() const;
+  // Fetching the object a SECOND time in the background costs up to one extra
+  // copy of it on the wire. That is what ranged_locality_prefetch switches off,
+  // and what the re-cache admission policy sizes.
+  bool LocalityPrefetchAdmits(size_t object_size) const;
   // Background worker that drains recache_queue_ and performs the DRAM install
   // via ExecuteLocalPut. Started in Init (when cache_remote_fetches), stopped in
   // Shutdown before peer_alloc_ is torn down.

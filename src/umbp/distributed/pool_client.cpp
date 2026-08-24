@@ -1342,10 +1342,14 @@ void PoolClient::MaybeReCacheAfterRemote(const std::string& key, const void* src
 // bounded when objects are multi-MiB.
 constexpr size_t kPrefetchBatchMax = 256;
 
-bool PoolClient::LocalityCachingAdmits(size_t object_size) const {
-  if (!config_.ranged_locality_prefetch) return false;
+bool PoolClient::CanInstallLocally() const {
   auto* local = registry_.Get(medium_);
-  if (local == nullptr || local->BufferCount() == 0) return false;  // nothing to install into
+  return local != nullptr && local->BufferCount() != 0;
+}
+
+bool PoolClient::LocalityPrefetchAdmits(size_t object_size) const {
+  if (!config_.ranged_locality_prefetch) return false;
+  if (!CanInstallLocally()) return false;
   // Same admission policy as the non-ranged re-cache, minus its enable flag:
   // ranged_locality_prefetch is this path's switch and was checked above, so
   // the predicate is asked only about the policy and the block size.
@@ -1355,7 +1359,7 @@ bool PoolClient::LocalityCachingAdmits(size_t object_size) const {
 
 void PoolClient::MaybeInstallCompleteArenaObject(const std::string& key, const void* arena_slice,
                                                  size_t object_size) {
-  if (!LocalityCachingAdmits(object_size)) return;
+  if (!CanInstallLocally()) return;
   // Synchronous on purpose, and cheap relative to the alternative: the slice is
   // live only until the next sub-batch reuses it, and a local copy of the
   // object beats a second RDMA of the same bytes.  This is also exactly what
@@ -1371,7 +1375,7 @@ void PoolClient::MaybeInstallCompleteArenaObject(const std::string& key, const v
 
 void PoolClient::MaybePrefetchWholeObject(const std::string& key, size_t object_size,
                                           const RouteGetResult& route) {
-  if (!LocalityCachingAdmits(object_size)) return;
+  if (!LocalityPrefetchAdmits(object_size)) return;
 
   ReCacheJob job;
   job.key = key;
@@ -2716,13 +2720,14 @@ std::vector<PoolClient::RangeFetchUnit> PoolClient::ServeWholeObjectUnitsFromMed
   std::vector<RangeFetchUnit> leftover;
   leftover.reserve(units.size());
 
-  // Only a unit that is the whole object can go straight into a slot, and only
-  // when this node wants the object cached at all -- with locality caching off
-  // there is no slot to commit and the arena is the only destination.
+  // Only a unit that is the whole object can go straight into a slot.  No
+  // switch and no size cap: the bytes are crossing the wire either way, so
+  // landing them in a slot instead of the arena costs nothing extra and is what
+  // the pre-ranged code did on every remote ranged read.
+  const bool can_install = CanInstallLocally();
   std::vector<size_t> candidates;
   for (size_t i = 0; i < units.size(); ++i) {
-    if (backend != nullptr && backend->BufferCount() != 0 && units[i].holds_whole_object &&
-        LocalityCachingAdmits(units[i].object_size)) {
+    if (can_install && units[i].holds_whole_object) {
       candidates.push_back(i);
     } else {
       leftover.push_back(std::move(units[i]));

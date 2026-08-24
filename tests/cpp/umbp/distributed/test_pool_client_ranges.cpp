@@ -883,6 +883,44 @@ TEST_F(PoolClientRangesTest, LocalityPrefetchOffLeavesNothingLocal) {
 // Eight layer groups over one cold key must schedule ONE whole-object pull, not
 // one per group: the dedup set is what keeps the duplicate traffic bounded at
 // 1x the object instead of 8x.
+// The switch buys off the SECOND fetch, not locality itself.  A whole-object
+// read already has every byte in hand, so landing it in a slot costs nothing on
+// the wire and must still happen -- gating it would silently undo what the
+// pre-ranged code did on every remote ranged read.
+TEST_F(PoolClientRangesTest, WholeObjectReadStillInstallsWithPrefetchOff) {
+  std::vector<char> quiet_get(kScratchSize), quiet_put(kScratchSize);
+  auto quiet = MakeClient("ranges-quiet-whole", kCallerCapacity, quiet_get, quiet_put,
+                          /*locality_prefetch=*/false);
+
+  const std::string key = "prefetch-off-whole";
+  std::vector<char> object(kObjectSize);
+  for (size_t i = 0; i < kObjectSize; ++i) object[i] = static_cast<char>((i * 83 + 7) & 0xff);
+  PutLocalReplica(target_.get(), key, object);
+  target_->Master().FlushHeartbeat();
+  quiet->Master().FlushHeartbeat();
+  ASSERT_TRUE(WaitForExists(quiet.get(), key));
+  ASSERT_FALSE(LocallyResident(quiet.get(), key));
+
+  // Four ascending gapless quarters: the ranges tile the object, so the fetch
+  // brings all of it and the slot path applies.
+  constexpr size_t kQuarter = kObjectSize / 4;
+  std::vector<char> out(kObjectSize, 0);
+  std::vector<std::vector<void*>> ptrs(1);
+  std::vector<std::vector<size_t>> sizes(1), offsets(1);
+  for (size_t q = 0; q < 4; ++q) {
+    ptrs[0].push_back(out.data() + q * kQuarter);
+    sizes[0].push_back(kQuarter);
+    offsets[0].push_back(q * kQuarter);
+  }
+  ASSERT_TRUE(quiet->BatchGetRanges({key}, ptrs, sizes, offsets).front());
+  EXPECT_EQ(std::memcmp(out.data(), object.data(), kObjectSize), 0);
+
+  // Synchronous: the slot is committed before the call returns, so no waiting.
+  EXPECT_TRUE(LocallyResident(quiet.get(), key))
+      << "a switch named for the background pull must not disable the free install";
+  quiet->Shutdown();
+}
+
 TEST_F(PoolClientRangesTest, LocalityPrefetchDedupsAcrossLayerGroups) {
   const std::string key = "prefetch-dedup";
   std::vector<char> object(kObjectSize);
