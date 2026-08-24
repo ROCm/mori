@@ -25,7 +25,6 @@
 #include <sched.h>
 
 #include <cstring>
-#include <future>
 #include <vector>
 
 #include "mori/io/logging.hpp"
@@ -110,7 +109,7 @@ void MultithreadExecutor::Worker::MainLoop() {
 
   MORI_IO_INFO("worker {} enter main loop, running on core {}", workerId, sched_getcpu());
 
-  Task task{nullptr, 0, 0, 0};
+  Task task{};
   while (true) {
     {
       std::unique_lock<std::mutex> lock(mu);
@@ -147,7 +146,7 @@ void MultithreadExecutor::Worker::MainLoop() {
         {task.req->eps[task.epId]}, localMrPerEp, remoteMrPerEp, tLoclOffsets, tRemoteOffsets,
         tSizes, task.req->callbackMeta, task.req->id, task.req->isRead, task.req->postBatchSize,
         control);
-    task.ret.set_value(ret);
+    task.latch->Complete(ret);
     MORI_IO_TRACE("Worker {} execute task {} begin {} end {} ret code {}", workerId, task.req->id,
                   task.begin, task.end, static_cast<uint32_t>(ret.code));
   }
@@ -158,7 +157,7 @@ void MultithreadExecutor::Worker::Submit(Task&& task) {
   {
     std::lock_guard<std::mutex> lock(mu);
     if (!running.load()) {
-      task.ret.set_value({StatusCode::ERR_BAD_STATE, "worker not started yet"});
+      task.latch->Complete({StatusCode::ERR_BAD_STATE, "worker not started yet"});
       return;
     }
     q.push(std::move(task));
@@ -209,36 +208,20 @@ RdmaOpRet MultithreadExecutor::RdmaBatchReadWrite(const ExecutorReq& req) {
   // Rotate the starting EP by transfer id so single-segment transfers spread
   // evenly across all QPs instead of always landing on eps[0].
   int epOffset = static_cast<int>(req.id % static_cast<uint64_t>(numEps));
-  std::vector<std::future<RdmaOpRet>> futs;
 
+  // One stack-local latch shared by all splits: no per-split heap allocation and
+  // a single blocking wait for the whole batch (see BatchLatch in executor.hpp).
+  BatchLatch latch(numSplits);
   for (int i = 0; i < numSplits; i++) {
     int epId = (i + epOffset) % numEps;
-    Task task{&req, epId, splits[i].first, splits[i].second};
-    futs.push_back(std::move(task.ret.get_future()));
+    Task task{&req, epId, splits[i].first, splits[i].second, &latch};
     // Keep each QP owned by a stable worker to preserve QP affinity.
     pool[epId % numWorker]->Submit(std::move(task));
   }
 
-  bool hasFail = false;
-  int numSucc = 0;
-  RdmaOpRet failedRet;
-  for (auto& fut : futs) {
-    RdmaOpRet ret = fut.get();
-    if (ret.Failed()) {
-      hasFail = true;
-      failedRet = ret;
-    } else if (ret.Succeeded()) {
-      numSucc++;
-    }
-  }
-  if (hasFail) return failedRet;
-
-  if (numSucc == numSplits) {
-    return {StatusCode::SUCCESS, ""};
-  }
-
+  RdmaOpRet ret = latch.Wait(numSplits);
   MORI_IO_TRACE("MultithreadExecutor submit request for RdmaBatchReadWrite done");
-  return {StatusCode::IN_PROGRESS, ""};
+  return ret;
 }
 
 void MultithreadExecutor::Start() {
