@@ -346,6 +346,12 @@ class PoolClient {
   // not a medium and so has no PageLocations to map.
   bool CopyContiguousToRanges(const void* src, size_t object_size,
                               const std::vector<ObjectRange>& ranges);
+  // Same, but for a source the backend already described.  A medium slot is
+  // NOT necessarily host memory -- an HBM pool's BufferRef carries a device
+  // pointer -- so it has to keep the ref's loc/device rather than be re-wrapped
+  // as host bytes, or the engine picks the wrong copy direction.
+  bool CopyContiguousToRanges(const TransferRef& src, uint64_t src_base,
+                              size_t object_size, const std::vector<ObjectRange>& ranges);
   bool CopyRangesToContiguous(const std::vector<ObjectRange>& ranges, void* dst,
                               size_t object_size);
 
@@ -596,9 +602,14 @@ class PoolClient {
   // a failed transfer: a transfer does not fail because of where it was
   // pointed, and retrying it elsewhere would only double the latency of a
   // failure the caller treats as fatal.
+  // `remote_bytes` accumulates what this path pulled over the wire.  It has to
+  // be reported here rather than by the arena loop, because a batch whose units
+  // are all slot-served never reaches that loop -- and that is exactly the
+  // shape this path exists to make fast, so leaving it out would blank the
+  // bandwidth metric precisely where it matters.
   std::vector<RangeFetchUnit> ServeWholeObjectUnitsFromMedium(
       const std::vector<std::string>& keys, std::vector<RangeFetchUnit> units,
-      std::unordered_map<size_t, bool>* unit_ok);
+      std::unordered_map<size_t, bool>* unit_ok, double* remote_bytes);
 
   // Remote-only sibling of PartitionBatchGetTargets for ranged reads.  Each key
   // contributes one item carrying its arena slice, its span list, and the span

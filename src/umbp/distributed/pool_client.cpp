@@ -1174,7 +1174,13 @@ bool PoolClient::CopyContiguousToRanges(const void* src, size_t object_size,
                                         const std::vector<ObjectRange>& ranges) {
   // The arena is plain host memory this client owns, so it is described
   // directly rather than resolved through a backend's published endpoints.
-  const TransferRef object_ref = TransferRef::HostBytes(const_cast<void*>(src), object_size);
+  return CopyContiguousToRanges(TransferRef::HostBytes(const_cast<void*>(src), object_size),
+                                /*src_base=*/0, object_size, ranges);
+}
+
+bool PoolClient::CopyContiguousToRanges(const TransferRef& src, uint64_t src_base,
+                                        size_t object_size,
+                                        const std::vector<ObjectRange>& ranges) {
   std::vector<TransferItem> items;
   items.reserve(ranges.size());
   for (const auto& range : ranges) {
@@ -1183,8 +1189,8 @@ bool PoolClient::CopyContiguousToRanges(const void* src, size_t object_size,
     TransferItem item;
     item.size = range.size;
     item.tag = 0;
-    item.src = object_ref;
-    item.src_offset = range.object_offset;
+    item.src = src;
+    item.src_offset = src_base + range.object_offset;
     item.dst = ClassifiedUserBytes(range.user, range.size);
     item.dst_offset = 0;
     items.push_back(std::move(item));
@@ -2373,7 +2379,7 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
 
   // Whole-object units skip the arena entirely when a slot can be had; what
   // comes back is everything that still needs one.
-  units = ServeWholeObjectUnitsFromMedium(keys, std::move(units), &unit_ok);
+  units = ServeWholeObjectUnitsFromMedium(keys, std::move(units), &unit_ok, &remote_bytes);
   if (units.empty()) {
     for (const auto& [original, ok] : unit_ok) results[original] = ok;
     return results;
@@ -2705,7 +2711,7 @@ PoolClient::BatchGetPlan PoolClient::PartitionBatchGetTargets(
 
 std::vector<PoolClient::RangeFetchUnit> PoolClient::ServeWholeObjectUnitsFromMedium(
     const std::vector<std::string>& keys, std::vector<RangeFetchUnit> units,
-    std::unordered_map<size_t, bool>* unit_ok) {
+    std::unordered_map<size_t, bool>* unit_ok, double* remote_bytes) {
   auto* backend = registry_.Get(medium_);
   std::vector<RangeFetchUnit> leftover;
   leftover.reserve(units.size());
@@ -2747,14 +2753,14 @@ std::vector<PoolClient::RangeFetchUnit> PoolClient::ServeWholeObjectUnitsFromMed
 
   auto allocs = backend->BatchAllocate(requests);
 
-  // slot_refs and slot_bases are reserved up front and never grow: the plan
+  // slot_refs and slot_offsets are reserved up front and never grow: the plan
   // holds pointers into the first.
   BatchGetPlan plan;
   std::vector<TransferRef> slot_refs;
-  std::vector<char*> slot_bases;
+  std::vector<uint64_t> slot_offsets;
   std::vector<size_t> planned;  // index into wanted/allocs
   slot_refs.reserve(wanted.size());
-  slot_bases.reserve(wanted.size());
+  slot_offsets.reserve(wanted.size());
   planned.reserve(wanted.size());
 
   for (size_t w = 0; w < wanted.size(); ++w) {
@@ -2783,7 +2789,7 @@ std::vector<PoolClient::RangeFetchUnit> PoolClient::ServeWholeObjectUnitsFromMed
     }
 
     const uint64_t slot_offset = PageOffset(alloc.pages.front(), alloc.page_size);
-    slot_bases.push_back(static_cast<char*>(slot_buffer.host_ptr) + slot_offset);
+    slot_offsets.push_back(slot_offset);
     slot_refs.push_back(std::move(slot_buffer));
     // Named by the backend's own ref rather than a raw pointer: the medium pool
     // is RDMA-reachable but was never handed to RegisterMemory, so
@@ -2820,7 +2826,10 @@ std::vector<PoolClient::RangeFetchUnit> PoolClient::ServeWholeObjectUnitsFromMed
     // Copy out BEFORE committing.  A pending slot cannot be reclaimed; a
     // committed one is an ordinary evictable object, and reading it after that
     // races the allocator.
-    if (!CopyContiguousToRanges(slot_bases[i], unit.object_size, unit.packed)) {
+    // The backend's own ref, not a bare pointer: an HBM pool hands back a
+    // device pointer, and re-wrapping it as host bytes makes the engine copy
+    // in the wrong direction (or memcpy device memory).
+    if (!CopyContiguousToRanges(slot_refs[i], slot_offsets[i], unit.object_size, unit.packed)) {
       (*unit_ok)[unit.original] = false;
     }
     // Commit either way: the slot holds the object whether or not the caller's
