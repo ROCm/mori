@@ -185,35 +185,54 @@ void Context::CollectHostNames() {
   // cross-node ranks as co-located, over-counting rankInNode (trips assert below).
   std::string nodeId = ResolveNodeId(myHostname);
 
-  // Allgather a fixed-layout {pid, nodeId} record; fixed size avoids parsing.
+  // Allgather a fixed-layout {pid, railFlag, nodeId} record.
   constexpr int kPidSize = sizeof(pid_t);
-  constexpr int kStrMax = 256;  // node id: boot_id, hostname, or override
-  constexpr int kRecordSize = kPidSize + kStrMax;
+  constexpr int kFlagSize = sizeof(uint8_t);
+  constexpr int kStrMax = 256;
+  constexpr int kRecordSize = kPidSize + kFlagSize + kStrMax;
 
   pid_t myPid = getpid();
+  uint8_t myRailFlag =
+      env::IsEnvVarEnabled("MORI_ENABLE_RAIL_ONLY") || env::IsEnvVarEnabled("MORI_ENABLE_RAIL");
   char localBuffer[kRecordSize] = {};
   memcpy(localBuffer, &myPid, kPidSize);
-  snprintf(localBuffer + kPidSize, kStrMax, "%s", nodeId.c_str());
+  memcpy(localBuffer + kPidSize, &myRailFlag, kFlagSize);
+  snprintf(localBuffer + kPidSize + kFlagSize, kStrMax, "%s", nodeId.c_str());
 
   std::vector<char> global(kRecordSize * WorldSize());
   bootNet.Allgather(localBuffer, global.data(), kRecordSize);
 
-  std::string myNodeId(localBuffer + kPidSize);
+  std::string myNodeId(localBuffer + kPidSize + kFlagSize);
   peerInfos.resize(WorldSize());
   std::map<std::string, int> seenPerNode;
+  bool anyRailMismatch = false;
   for (int i = 0; i < WorldSize(); i++) {
     const char* rec = global.data() + i * kRecordSize;
     pid_t peerPid;
     memcpy(&peerPid, rec, kPidSize);
-    std::string peerNodeId(rec + kPidSize);
+    uint8_t peerRailFlag;
+    memcpy(&peerRailFlag, rec + kPidSize, kFlagSize);
+    std::string peerNodeId(rec + kPidSize + kFlagSize);
     peerInfos[i].sameHost = (peerNodeId == myNodeId);
     peerInfos[i].sameProcess = peerInfos[i].sameHost && (peerPid == myPid);
     peerInfos[i].rankInNode = seenPerNode[peerNodeId]++;
+    if (peerRailFlag != myRailFlag) {
+      MORI_APP_ERROR("MORI_ENABLE_RAIL_ONLY mismatch: rank {} has {}={}, this rank ({}) has {}", i,
+                     peerRailFlag ? "on" : "off", peerRailFlag, LocalRank(),
+                     myRailFlag ? "on" : "off");
+      anyRailMismatch = true;
+    }
     if (LocalRank() == 0) {
       MORI_APP_TRACE("rank {} nodeId={} pid={} rankInNode={} sameHost={} sameProcess={}", i,
                      peerNodeId, peerPid, peerInfos[i].rankInNode, peerInfos[i].sameHost,
                      peerInfos[i].sameProcess);
     }
+  }
+  if (anyRailMismatch) {
+    MORI_APP_ERROR(
+        "MORI_ENABLE_RAIL_ONLY must be set identically on all ranks; "
+        "mismatched ranks will hang at ConnectEndpoint. Aborting.");
+    abort();
   }
 }
 
@@ -222,7 +241,7 @@ bool Context::RailOnlyEligible() const {
   int nodeSize = 0;
   for (int i = 0; i < world; i++) nodeSize = std::max(nodeSize, peerInfos[i].rankInNode + 1);
   if (nodeSize <= 0 || world % nodeSize != 0) {
-    MORI_APP_ERROR("MORI_ENABLE_RAIL_ONLY: non-uniform node sizes (world={} maxNodeSize={})", world,
+    MORI_APP_ERROR("MORI_ENABLE_RAIL_ONLY: world size {} is not a multiple of node size {}", world,
                    nodeSize);
     return false;
   }

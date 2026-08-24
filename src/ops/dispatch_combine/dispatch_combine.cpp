@@ -154,6 +154,7 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
   // cross-node traffic through their same-rail proxy PE, so they are fine;
   // InterNode v0 and AsyncLL post straight to `destExpert / numExpertPerRank`,
   // which lands on an unconnected QP and hangs. Fail at construction instead.
+  // CCO path (!useCcoComm) is excluded: CCO has its own CCO_GDA_CONNECTION_RAIL.
   if (!useCcoComm && config.worldSize > config.gpuPerNode && ShmemRailOnly() &&
       (config.kernelType == KernelType::InterNode || config.kernelType == KernelType::AsyncLL)) {
     throw std::runtime_error(

@@ -660,6 +660,7 @@ template <>
 inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::RDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
+  assert(ShmemPeerHasQp(pe) && "RDMA put to a peer with no QP (rail-only stub?)");
   bool need_turn{true};
   uint64_t turns = __ballot(need_turn);
   while (turns) {
@@ -1114,6 +1115,7 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportTy
     const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
     const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
     core::atomicType signalOp, int pe, int qpId) {
+  assert(ShmemPeerHasQp(pe) && "RDMA put+signal to a peer with no QP (rail-only stub?)");
   bool need_turn{true};
   uint64_t turns = __ballot(need_turn);
   while (turns) {
@@ -1343,6 +1345,7 @@ template <>
 inline __device__ void ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::RDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes,
     core::atomicType amoType, int pe, int qpId) {
+  assert(ShmemPeerHasQp(pe) && "RDMA atomic to a peer with no QP (rail-only stub?)");
   bool need_turn{true};
   uint64_t turns = __ballot(need_turn);
   while (turns) {
