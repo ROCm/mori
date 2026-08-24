@@ -37,18 +37,15 @@
 
 #pragma once
 
+#include <hip/amd_detail/amd_gfx1250_TDM.h>
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
-// The TDM header pulls hip/driver_types.h, which uses hipMemoryType: the HIP
-// runtime types must come first.
-#include <hip/amd_detail/amd_gfx1250_TDM.h>
 
 #include <type_traits>
 
 #include "mori/cco/cco.hpp"
 #include "mori/core/transport/p2p/device_primitives.hpp"
 #include "mori/ops/dispatch_combine_v2/ep_cfg.hpp"
-// EpPeer/EpLocal/EpWaitEq/EpWaitGt/EpFlat*/EpNullFlat/EpMultiWarpIter live here.
 #include "src/ops/dispatch_combine_v2/ep_intranode_kernel.hpp"
 
 namespace mori {
@@ -57,20 +54,14 @@ namespace v2 {
 
 using index_t = int32_t;
 
-// Shipping gfx1250 combine config (were env gates in v1; production has one).
-#define MORI_COMB_TDM 2  // token push goes through the TDM engine, 2 chunks
-// Tokens in flight per group; raising past 2 needs fewer warps to fit LDS budget.
+#define MORI_COMB_TDM 2
 #define MORI_COMB_QUAD 2
-#define MORI_COMB_LDS_BUDGET 327680  // dynamic LDS a combine block may reserve
-#define MORI_COMB_BARSLEEP 15        // s_sleep units between cross-device flag polls
-#define MORI_COMB_BARSPREAD 16       // stride (uint32 lines) of the per-block fan-out slots
+#define MORI_COMB_LDS_BUDGET 327680
+#define MORI_COMB_BARSLEEP 15
+#define MORI_COMB_BARSPREAD 16
 
-// v1 pulled MAX_GPUS_PER_NODE from the includer; here it is a fixed intranode cap.
 #define CUSPLIT_MAX_GPUS 8
 
-/* -------------------------------- TDM helpers ------------------------------- */
-// __float22bfloat162_rn is not actually packed; this is the one-instruction form.
-// TYPE-GUARD every caller: returns 0 for any T that is not hip_bfloat16.
 template <typename T>
 __device__ __forceinline__ uint32_t MoriPackTo2(float a, float b) {
   if constexpr (std::is_same_v<T, hip_bfloat16>) {
@@ -81,7 +72,6 @@ __device__ __forceinline__ uint32_t MoriPackTo2(float a, float b) {
     return 0;
   }
 }
-// bf16 fma-mix: src0 is the bf16 operand, src1 the per-row f32 multiplier.
 template <bool HI>
 __device__ __forceinline__ float MoriFmaMixBf16M(uint32_t src, float mul, float acc) {
   float r;
@@ -98,8 +88,6 @@ __device__ __forceinline__ float MoriFmaMixBf16M(uint32_t src, float mul, float 
 }
 typedef int _mori_v4i __attribute__((ext_vector_type(4)));
 
-// __syncthreads' vmcnt(0) drains the fold's own stores into the critical path; this
-// barrier waits only on ds ops.
 #define _Q_BARRIER()                               \
   do {                                             \
     asm volatile("s_wait_dscnt 0x0" ::: "memory"); \
@@ -107,7 +95,6 @@ typedef int _mori_v4i __attribute__((ext_vector_type(4)));
     asm volatile("" ::: "memory");                 \
   } while (0)
 
-// GROUP1 (shape) descriptor for a 1D hiddenDim token payload. dataSize = log2(bytes).
 template <typename T>
 __device__ __forceinline__ gfx1250_TDM_GROUP1 TdmShape(int hiddenDim) {
   static_assert(sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4,
@@ -122,7 +109,6 @@ __device__ __forceinline__ gfx1250_TDM_GROUP1 TdmShape(int hiddenDim) {
   g1.tileDim1(1);
   return g1;
 }
-// Async TDM load global->LDS (no wait). TH/SCOPE default when 0.
 template <typename T, int TH = 0, int SCOPE = 0>
 __device__ __forceinline__ void TdmIssueLoad(T* ldsTile, const T* src,
                                              const gfx1250_TDM_GROUP1& g1) {
@@ -150,7 +136,6 @@ __device__ __forceinline__ gfx1250_TDM_GROUP1 TdmShapeGather(int rowElems, int n
   g1.tileDim1(nRows);
   return g1;
 }
-// Async TDM store LDS->global (no wait).
 template <typename T, int TH = 0, int SCOPE = 0>
 __device__ __forceinline__ void TdmIssueStore(T* dst, T* ldsTile, const gfx1250_TDM_GROUP1& g1) {
   typedef int _tdm_v4i __attribute__((ext_vector_type(4)));
@@ -164,7 +149,6 @@ __device__ __forceinline__ void TdmIssueStore(T* dst, T* ldsTile, const gfx1250_
   _tdm_v8i z8{0, 0, 0, 0, 0, 0, 0, 0};
   __builtin_amdgcn_tensor_store_from_lds(g0.m_bitfield, g1.m_bitfield, z4, z4, z8, 0);
 }
-// 2D meta tile (dataSize=2 -> 4B elems). Both dims must be >= 2.
 __device__ __forceinline__ gfx1250_TDM_GROUP1 TdmShape2D(int dim0, int dim1) {
   gfx1250_TDM_GROUP1 g1;
   g1.dataSize(2);
@@ -176,79 +160,49 @@ __device__ __forceinline__ gfx1250_TDM_GROUP1 TdmShape2D(int dim0, int dim1) {
   g1.tileDim1(dim1);
   return g1;
 }
-// 128B-aligned split for a contiguous run of 4B elements at an arbitrary phase.
 struct TdmSplit128 {
-  int head;  // leading elements copied scalar (until 128B-aligned)
-  int body;  // elements covered by the TDM tile (whole 128B rows)
-  int rows;  // body / 32
+  int head;
+  int body;
+  int rows;
 };
 __device__ __forceinline__ TdmSplit128 TdmAlignSplit128(size_t phase, int nElems) {
-  constexpr int P = 32;  // 32 x 4B = 128B
+  constexpr int P = 32;
   int head = (int)((P - (phase & (size_t)(P - 1))) & (size_t)(P - 1));
   if (head > nElems) head = nElems;
   int rows = (nElems - head) / P;
   if (rows < 2) return TdmSplit128{nElems, 0, 0};
   return TdmSplit128{head, rows * P, rows};
 }
-// Legal whole-run tile geometry by closed form (tensorDim1 = 8/4/2, 32-elem row floor).
 __device__ __forceinline__ int TdmCheapDim1(int nElems) {
   if ((nElems & 7) == 0 && (nElems >> 3) >= 32) return 8;
   if ((nElems & 3) == 0 && (nElems >> 2) >= 32) return 4;
   if ((nElems & 1) == 0 && (nElems >> 1) >= 32) return 2;
   return 0;
 }
-// Cover the WHOLE run with ONE tile so it carries no scalar head/tail.
-//
-// THE 128B ROW FLOOR IS A BANDWIDTH RESULT, NOT A LEGALITY ONE, and treating it as legality is what
-// used to push small metadata fields off TDM entirely. The evidence behind the floor is per-byte:
-// 224B rows at ~500 GB/s against 256B rows at ~1500. A metadata field at 512 tokens is 64B..512B,
-// so half bandwidth on it is worth nothing measurable -- while being off the TDM path costs the
-// whole pipeline, because with only the scale field clearing the floor a warp has exactly ONE op to
-// issue before its s_wait_tensorcnt(0) and both the load latency and the cross-card store
-// completion are fully exposed (measured: 8 TDM ops per block at 512 against 24 at 4096,
-// metasend 13.91us against 10.53us for 8x the bytes).
-//
-// So when no 128B-legal tile exists, fall back to the narrowest legal-by-construction shape rather
-// than giving up: (nElems/2, 2) for even nElems. d0*d1 == nElems exactly, so the descriptor
-// footprint is still precisely the run and cannot write outside it. Isolated A/B on the v1 body
-// this was ported from: +10.0% at 512 and neutral at 4096, which only ever clears the floor anyway.
-// The figure for all four changes together on THIS body is in the commit that added them.
-//
-// It deliberately does NOT test d1 == 1. That is a separate unknown: TdmShape2D's contract says
-// gfx1250 has no 1xN wedge, while the payload has always sent 1 x hiddenDim -- two records that
-// contradict each other, and mixing that question in here would make this change unfalsifiable.
 __device__ __forceinline__ TdmSplit128 TdmWholeOrSplit128(size_t phase, int nElems) {
   const TdmSplit128 sp = TdmAlignSplit128(phase, nElems);
   if (sp.head == 0 && sp.body == nElems) return sp;
-  if (TdmCheapDim1(nElems)) return TdmSplit128{0, nElems, 0};  // rows==0 && body>0 => whole run
-  // Must agree with TdmSplitShape's matching branch to the element.
+  if (TdmCheapDim1(nElems)) return TdmSplit128{0, nElems, 0};
   if (nElems >= 4 && (nElems & 1) == 0) return TdmSplit128{0, nElems, 0};
   return sp;
 }
-// Shape for a split's TDM body. rows==0 marks a whole-run tile.
 __device__ __forceinline__ gfx1250_TDM_GROUP1 TdmSplitShape(const TdmSplit128& sp, int nElems) {
   if (sp.rows == 0) {
     const int d1 = TdmCheapDim1(nElems);
     if (d1 > 0) return TdmShape2D(nElems / d1, d1);
-    // Same condition as TdmWholeOrSplit128's narrow branch, so rows==0 always has a shape here.
     if (nElems >= 4 && (nElems & 1) == 0) return TdmShape2D(nElems / 2, 2);
-    return TdmShape2D(32, 2);  // unreachable: rows==0 only if one branch above accepted
+    return TdmShape2D(32, 2);
   }
   return TdmShape2D(32, sp.rows);
 }
 
-/* --------------------------- dispatch staging pools ------------------------- */
-// GATHER-FUSED staging: FINALIZE gathers each token's metadata into per-peer,
-// destTokId-ordered SoA arrays; the meta phase TDM-copies them to the peers.
 #define CUSPLIT_POOL_SLOTS (CUSPLIT_MAX_GPUS * 32768)
 #define CUSPLIT_MAX_BLOCKS 512
 #define CUSPLIT_MAX_TOPK 16
 
 __device__ index_t _cusplit_stgIdx[CUSPLIT_POOL_SLOTS * CUSPLIT_MAX_TOPK];
 __device__ float _cusplit_stgWt[CUSPLIT_POOL_SLOTS * CUSPLIT_MAX_TOPK];
-// Staging for dispTokIdToSrcTokId (4B cross-GPU scattered store otherwise).
 __device__ index_t _cusplit_stgSrc[CUSPLIT_POOL_SLOTS];
-// Per-(srcBlock, peer) contiguous remote slot range: base + count.
 __device__ index_t _cusplit_blkBase[CUSPLIT_MAX_BLOCKS * CUSPLIT_MAX_GPUS];
 __device__ index_t _cusplit_blkCount[CUSPLIT_MAX_BLOCKS * CUSPLIT_MAX_GPUS];
 // Per-token scale rows, staged like the other meta fields so they ship to a peer as
@@ -302,11 +256,6 @@ static_assert(kEpScaleStride == 0 || (size_t)kEpScaleSlots * kEpScaleStride <= (
 constexpr size_t kEpScaleStgBytes = kEpScaleSlots * (kEpScaleStride > 0 ? kEpScaleStride : 1);
 __device__ __align__(EpScaleAlign) unsigned char _cusplit_stgScale[kEpScaleStgBytes];
 
-/* ------------------------------------------------------------------------- */
-/*                                  Dispatch                                  */
-/* ------------------------------------------------------------------------- */
-// Narrow-grid, batched-metadata, TDM dispatch. Block-local exact count, one remote
-// fetch_add(N) per destPe, local slot distribution, metadata + payload via TDM.
 template <EpCfg kCfg, typename T>
 __device__ void EpDispatch1250xBody(EpArgs args) {
   // The macro sizes the staging, the Cfg drives the copies. They come from the same
@@ -328,25 +277,10 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   const size_t hiddenDim = (size_t)kCfg.hiddenDim;
   constexpr int topk = kCfg.numExpertPerToken;
   const unsigned long long win = args.window;
-  // One partition shared by count / reserve / finalize / meta / payload.
   const int aWarp = globalWarpId;
   const int aWarps = (int)gridDim.x * warpNum;
 
-  // Tokens per warp iteration: WS/topk lets COUNT read tokenIndices with all lanes.
   const int _tpi = (topk > 0 && topk <= WS && (WS % topk) == 0) ? (WS / topk) : 1;
-  // One round of the token loops covers aWarps * _tpi tokens, so a batch short of that
-  // leaves the tail of the grid idle: at 512 tokens on 64x8 with topk 8 every token
-  // lands on aWarp < 128 and 48 of the 64 blocks send no payload, which is why 64 and
-  // 512 tokens cost the same. Cap the quota at what the batch can fill. It only ever
-  // shrinks, so COUNT reads tokenIndices with whole lanes wherever it did before, and
-  // above the threshold _etpi == _tpi and this is the original partition.
-  //
-  // The lower bound is load-bearing: ceil(n / aWarps) is 0 for n <= 0, and a step of
-  // aWarps * 0 never advances -- an unkillable D-state hang still holding the GPU.
-  //
-  // All three token loops must use _etpi. COUNT sizes the per-block reservation that
-  // FINALIZE hands slots out of, so any disagreement over which tokens a warp owns
-  // puts payload in another block's slots.
   const int _qTok = (aWarps > 0) ? (int)(((long long)args.numTokens + aWarps - 1) / aWarps) : _tpi;
   const int _etpi = (_tpi > 1 && _qTok >= 1 && _qTok < _tpi) ? _qTok : _tpi;
   const int _sLane = (_etpi > 1) ? (laneId / topk) : 0;
@@ -363,58 +297,89 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   const gfx1250_TDM_GROUP1 _tdmG1 = TdmShape<T>(static_cast<int>(hiddenDim));
 
   constexpr int kMaxNpes = CUSPLIT_MAX_GPUS;
-  __shared__ index_t s_N[kMaxNpes];     // block-local committed count per destPe
-  __shared__ index_t s_base[kMaxNpes];  // this block's REMOTE contiguous slot base
-  __shared__ index_t s_run[kMaxNpes];   // block-local running distribution index
+  __shared__ index_t s_N[kMaxNpes];
+  __shared__ index_t s_base[kMaxNpes];
+  __shared__ index_t s_run[kMaxNpes];
+  int _preGszP2 = 1;
+  {
+    int _r = (topk < 1) ? 1 : topk;
+    while (_preGszP2 < _r) _preGszP2 <<= 1;
+  }
+  const int _preGsz = (_preGszP2 <= WS) ? _preGszP2 : WS;
+  const int _preE = laneId & (_preGsz - 1);
+  const int _preTok = aWarp * _etpi;
+  const bool _metapreOk = ((long long)aWarps * (long long)_etpi >= (long long)args.numTokens) &&
+                          (_etpi == 1) && (_preGsz >= topk) && (_preTok < (int)args.numTokens) &&
+                          args.tokenIndices && args.inpTokenBuf;
+  index_t _pIdx = 0;
+  float _pWt = 0.0f;
+  if (_metapreOk && _preE < topk) {
+    _pIdx = args.tokenIndices[(size_t)_preTok * topk + _preE];
+    if constexpr (kCfg.useWeights) {
+      if (args.weightsBuf) _pWt = args.weightsBuf[(size_t)_preTok * topk + _preE];
+    }
+  }
   for (int p = thdId; p < npes; p += blockDim.x) {
     s_N[p] = 0;
     s_run[p] = 0;
   }
   __syncthreads();
 
-  // ---- Phase 1: block-local count (LDS atomic histogram) ----
+  const bool _dedupOk = ((long long)aWarps * (long long)_etpi >= (long long)args.numTokens);
+  int _cDestPe = -1;
+  int _cKeep = 0;
+  const bool _bdOk = (_etpi == 1);
+
   if (args.tokenIndices && args.inpTokenBuf) {
     for (int tokBase = aWarp * _etpi; tokBase < args.numTokens; tokBase += aWarps * _etpi) {
       int tok = tokBase + _sLane;
       bool act = _laneAct && (tok < args.numTokens);
-      index_t myExpert = act ? args.tokenIndices[(size_t)tok * topk + _eLane] : (index_t)-1;
+      index_t myExpert =
+          act ? (_metapreOk ? _pIdx : args.tokenIndices[(size_t)tok * topk + _eLane]) : (index_t)-1;
       int myDestPe = -1;
       if (myExpert >= 0) {
         int d = (int)(myExpert / kCfg.numExpertPerRank);
         if (d >= 0 && d < npes) myDestPe = d;
       }
-      // Composite match key (token, destPe) so lanes of different tokens don't merge.
-      unsigned mv = (myDestPe >= 0) ? (((unsigned)_sLane << 8) | (unsigned)myDestPe) : 0xFFFFFFFFu;
-      unsigned long long grp = __match_any_sync(0xFFFFFFFFFFFFFFFFull, mv);
-      int keep = (myDestPe >= 0 && laneId == (__ffsll((long long)grp) - 1)) ? 1 : 0;
-      if (act) {
-        if (keep) {
-          atomicAdd(&s_N[myDestPe], 1);
-        } else {
-          args.dispDestTokIdMap[(size_t)tok * topk + _eLane] = EpNullFlat<kCfg>();
+      int keep = 0;
+      if (_bdOk) {
+        unsigned long long _mine = 0ull;
+        for (int p = 0; p < npes; ++p) {
+          unsigned long long m = __ballot(myDestPe == p);
+          if (myDestPe == p) _mine = m;
+          if (laneId == 0 && m != 0ull) atomicAdd(&s_N[p], 1);
         }
+        keep = (myDestPe >= 0 && laneId == (__ffsll((long long)_mine) - 1)) ? 1 : 0;
+      } else {
+        unsigned mv =
+            (myDestPe >= 0) ? (((unsigned)_sLane << 8) | (unsigned)myDestPe) : 0xFFFFFFFFu;
+        unsigned long long grp = __match_any_sync(0xFFFFFFFFFFFFFFFFull, mv);
+        keep = (myDestPe >= 0 && laneId == (__ffsll((long long)grp) - 1)) ? 1 : 0;
+        if (act && keep) atomicAdd(&s_N[myDestPe], 1);
+      }
+      if (_dedupOk) {
+        _cDestPe = myDestPe;
+        _cKeep = (act && keep) ? 1 : 0;
       }
     }
   }
   __syncthreads();
-  // ---- Phase 2: per-block RESERVE. One remote atomic per active peer against the
-  // peer's dispTokOffset (== portable offTokOff); the old value is this block's base.
+  const int _bmPerTok = topk * 4 + topk * 4 + 4;
+  const int _bmTileB = (int)(hiddenDim * sizeof(T));
+  const bool _blkMapNeeded = !((_bmPerTok > 0) && (((_bmTileB - 384) / _bmPerTok) > 0));
   for (int p = thdId; p < npes; p += blockDim.x) {
     index_t n = s_N[p];
-    _cusplit_blkCount[(size_t)blockIdx.x * npes + p] = n;
+    if (_blkMapNeeded) _cusplit_blkCount[(size_t)blockIdx.x * npes + p] = n;
     if (n > 0) {
       s_base[p] = __hip_atomic_fetch_add(EpPeer<index_t>(win, p, args.offTokOff), n,
                                          __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-      _cusplit_blkBase[(size_t)blockIdx.x * npes + p] = s_base[p];
+      if (_blkMapNeeded) _cusplit_blkBase[(size_t)blockIdx.x * npes + p] = s_base[p];
       atomicAdd(&args.destPeTokenCounter[p], n);
     }
   }
   __syncthreads();
-  // ---- FINALIZE: destTokId = s_base + block-local running index; gather meta into
-  // peer-local staging. Disjoint [s_base, s_base+s_N) per block, no cross-block race.
   constexpr index_t _stgCap = (index_t)(CUSPLIT_POOL_SLOTS / npes);
   if (args.tokenIndices && args.inpTokenBuf) {
-    // gsz = lanes per destination, power of two (no scale field: driven by topk).
     int _gszReq = topk;
     if (_gszReq < 1) _gszReq = 1;
     int _gszP2 = 1;
@@ -426,27 +391,35 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     for (int tokBase = aWarp * _etpi; tokBase < args.numTokens; tokBase += aWarps * _etpi) {
       int tok = tokBase + _sLane;
       bool act = _laneAct && (tok < args.numTokens);
-      index_t myExpert = act ? args.tokenIndices[(size_t)tok * topk + _eLane] : (index_t)-1;
       int myDestPe = -1;
-      if (myExpert >= 0) {
-        int d = (int)(myExpert / kCfg.numExpertPerRank);
-        if (d >= 0 && d < npes) myDestPe = d;
+      int keep = 0;
+      if (_dedupOk) {
+        myDestPe = _cDestPe;
+        keep = _cKeep;
+      } else {
+        index_t myExpert = act ? args.tokenIndices[(size_t)tok * topk + _eLane] : (index_t)-1;
+        myDestPe = -1;
+        if (myExpert >= 0) {
+          int d = (int)(myExpert / kCfg.numExpertPerRank);
+          if (d >= 0 && d < npes) myDestPe = d;
+        }
+        unsigned mv =
+            (myDestPe >= 0) ? (((unsigned)_sLane << 8) | (unsigned)myDestPe) : 0xFFFFFFFFu;
+        unsigned long long grp = __match_any_sync(0xFFFFFFFFFFFFFFFFull, mv);
+        keep = (act && myDestPe >= 0 && laneId == (__ffsll((long long)grp) - 1)) ? 1 : 0;
       }
-      unsigned mv = (myDestPe >= 0) ? (((unsigned)_sLane << 8) | (unsigned)myDestPe) : 0xFFFFFFFFu;
-      unsigned long long grp = __match_any_sync(0xFFFFFFFFFFFFFFFFull, mv);
-      int keep = (act && myDestPe >= 0 && laneId == (__ffsll((long long)grp) - 1)) ? 1 : 0;
       index_t myDestTokId = -1;
       if (keep) {
         index_t j = atomicAdd(&s_run[myDestPe], 1);
         myDestTokId = s_base[myDestPe] + j;
         args.dispDestTokIdMap[(size_t)tok * topk + _eLane] =
             EpFlatIndex<kCfg>(myDestPe, myDestTokId);
-        // srcmap to local staging (4B cross-GPU scattered store otherwise).
         if (myDestTokId < _stgCap)
           _cusplit_stgSrc[(size_t)myDestPe * _stgCap + myDestTokId] =
               EpSrcTokIndex<kCfg>(myPe, tok);
+      } else if (act) {
+        args.dispDestTokIdMap[(size_t)tok * topk + _eLane] = EpNullFlat<kCfg>();
       }
-      // Hand out kept destinations ngrp at a time; keepMask is warp-uniform.
       unsigned long long keepMask = __ballot(keep);
       while (keepMask) {
         int srcLane = -1;
@@ -467,18 +440,28 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
         index_t* sIdx =
             _cusplit_stgIdx + (size_t)d * _stgCap * CUSPLIT_MAX_TOPK + (size_t)dt * topk;
         float* sWt = _cusplit_stgWt + (size_t)d * _stgCap * CUSPLIT_MAX_TOPK + (size_t)dt * topk;
-        for (int e = myE; e < topk; e += gsz) sIdx[e] = args.tokenIndices[(size_t)gTok * topk + e];
-        if constexpr (kCfg.useWeights) {
-          if (args.weightsBuf) {
-            for (int e = myE; e < topk; e += gsz) sWt[e] = args.weightsBuf[(size_t)gTok * topk + e];
+        if (_metapreOk) {
+          if (myE < topk) {
+            sIdx[myE] = _pIdx;
+            if constexpr (kCfg.useWeights) {
+              if (args.weightsBuf) sWt[myE] = _pWt;
+            }
+          }
+        } else {
+          for (int e = myE; e < topk; e += gsz)
+            sIdx[e] = args.tokenIndices[(size_t)gTok * topk + e];
+          if constexpr (kCfg.useWeights) {
+            if (args.weightsBuf) {
+              for (int e = myE; e < topk; e += gsz)
+                sWt[e] = args.weightsBuf[(size_t)gTok * topk + e];
+            }
           }
         }
         if constexpr (kEpScaleBytes > 0) {
           if (args.scalesBuf) {
-            // Dwords: EpCfgIsValid makes the row dword-sized, so the gsz lanes that
-            // own this destination stride it without a byte tail.
-            // The only place the two widths meet, and the copy is per-row
-            // anyway -- which is what makes the pad free rather than its own pass.
+            // The only place the two widths meet, and the copy is per-row anyway,
+            // which is what makes the pad free rather than a pass of its own.
+            // EpCfgIsValid keeps the row dword-sized, so these lanes have no tail.
             constexpr int kSrcDw = kEpScaleBytes / 4;
             constexpr int kDstDw = kEpScaleStride / 4;
             const unsigned int* srcS =
@@ -497,7 +480,6 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   }
   __syncthreads();
 
-  // ---- META FIRST (its cross-GPU writes drain under the payload phase) ----
   bool _mPend = false;
   if (args.tokenIndices && args.inpTokenBuf) {
     const int tkM = topk;
@@ -512,24 +494,6 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     const int tokCapM = (perTokM > 0) ? ((mtileBytesM - 128 * kMetaFields) / perTokM) : 0;
     if (tokCapM > 0) {
       uint8_t* _m4 = reinterpret_cast<uint8_t*>(_tdmBatchSmem) + (size_t)warpId * mtileBytesM;
-      // ONE WARP PER PEER when the runs are short, warpNum/npes warps per peer otherwise.
-      //
-      // What a coarser cut buys is ROW WIDTH with the load still perfectly balanced. At 512 tokens
-      // the default split of 2 gives a warp 3.6 tokens x 196B = 706B with rows of 32/48/64B --
-      // under the 128B floor, so those runs land on the narrow fallback above. Merging the halves
-      // makes it 7.2 tokens x 1412B with rows of 96/112/128B. Isolated A/B on the v1 body: +5.4% at
-      // 512.
-      //
-      // ADAPTIVE, because unconditional split==1 was MEASURED to lose at 4096: 1296.2 against
-      // 1304.2, -0.6%, with all four ranks below all four baseline ranks. The gain is row width and
-      // 4096 does not need it -- a run there is ~58 tokens, so even cut in half the idx field is
-      // 232 ints and TdmCheapDim1's `nElems/d1 >= 32` is satisfied with room to spare. That shape
-      // would pay the cost of warps npes..warpNum-1 sitting idle and buy nothing.
-      //
-      // The test is TOKENS PER WARP rather than a token-count constant so it follows the launch
-      // geometry instead of hard-coding the two shapes that happen to have been benchmarked. At 512
-      // tokens over 512 warps this is 1 token/warp and takes split 1; at 4096 it is 8 and takes
-      // split 2, which is byte-for-byte the old behaviour.
       const int _peerSplit = (npes > 0 && warpNum >= npes) ? (warpNum / npes) : 1;
       const int split = (aWarps > 0 && args.numTokens <= (index_t)aWarps * 2) ? 1 : _peerSplit;
       const int nRuns = npes * split;
@@ -545,8 +509,8 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
         for (index_t cs = 0; cs < myCnt; cs += tokCapM) {
           int cc = (int)((cs + tokCapM <= myCnt) ? tokCapM : (myCnt - cs));
           index_t ab = baseAll + myBeg + cs;
-          if (ab + cc > recvCapM) continue;  // OOB guard (peer slot capacity)
-          if (ab + cc > _stgCapM) continue;  // OOB guard (our staging region)
+          if (ab + cc > recvCapM) continue;
+          if (ab + cc > _stgCapM) continue;
           const int nIdxB = cc * tkM, nWtB = cc * tkM;
           index_t* sI =
               _cusplit_stgIdx + (size_t)peer * _stgCapM * CUSPLIT_MAX_TOPK + (size_t)ab * tkM;
@@ -591,7 +555,6 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
           if (spW.body) TdmIssueLoad<int>(tW, reinterpret_cast<int*>(sW + spW.head), gW);
           if (spR.body) TdmIssueLoad<int>(tR, reinterpret_cast<int*>(sR + spR.head), gR);
           if (spS.body) TdmIssueLoad<int>(tS, reinterpret_cast<int*>(sS + spS.head), gS);
-          // Unaligned head/tail (and fields too small for 2 rows) go global->global.
 #define _MHT_REM(dstp, glbp, hd, bd, ntot)                                         \
   do {                                                                             \
     for (int i = laneId; i < (hd); i += WS) (dstp)[i] = (glbp)[i];                 \
@@ -613,16 +576,15 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
             if (spW.body) TdmIssueStore<int>(reinterpret_cast<int*>(dW + spW.head), tW, gW);
             if (spR.body) TdmIssueStore<int>(reinterpret_cast<int*>(dR + spR.head), tR, gR);
             if (spS.body) TdmIssueStore<int>(reinterpret_cast<int*>(dS + spS.head), tS, gS);
-            _mPend = true;  // drain deferred to the __syncthreads() below
+            _mPend = true;
           }
         }
       }
     } else {
-      // Degenerate LDS budget: no tile to bounce through, copy each field scalar.
       const int nItems = npes * kMetaFields;
       for (int item = warpId; item < nItems; item += warpNum) {
         int peer = item / kMetaFields;
-        int field = item - peer * kMetaFields;  // 0=idx, 1=wt, 2=srcmap
+        int field = item - peer * kMetaFields;
         if (field == 1 && !(kCfg.useWeights && args.weightsBuf)) continue;
         index_t cnt = _cusplit_blkCount[(size_t)blockIdx.x * npes + peer];
         if (cnt <= 0) continue;
@@ -654,19 +616,10 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
       }
     }
   }
-  // NO BARRIER BETWEEN META AND PAYLOAD. There used to be a __syncthreads() here whose only stated
-  // job was the tile reuse the wait below covers, and that dependency is WITHIN a warp rather than
-  // across them: _m4 and the payload's _tdmTile are both _tdmBatchSmem +
-  // warpId*kSlabBytes, i.e. the SAME per-warp address, so the warp that must not
-  // clobber the tile is the warp that issued the stores -- which is exactly what `if (_mPend)`
-  // guarantees. Cross-warp visibility of FINALIZE's writes (dispDestTokIdMap, staging, s_base)
-  // comes from the barrier after FINALIZE, not from this one.
-  //
-  // With it gone a warp enters payload as soon as its own stores are issued, instead of waiting for
-  // the slowest meta warp in its block. Isolated A/B on the v1 body: +4.8% at 512, +0.8% at 4096.
-  if (_mPend) __builtin_amdgcn_s_wait_tensorcnt(0);
+  if (_mPend) {
+    __builtin_amdgcn_s_wait_tensorcnt(0);
+  }
 
-  // ---- Phase 3b: payload copy, driven by dispDestTokIdMap (own-block). ----
   if (args.tokenIndices && args.inpTokenBuf) {
     for (int tokBase = aWarp * _etpi; tokBase < args.numTokens; tokBase += aWarps * _etpi) {
       for (int _sub = 0; _sub < _etpi; ++_sub) {
@@ -681,8 +634,10 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
                         reinterpret_cast<const T*>(args.inpTokenBuf) + (size_t)tok * hiddenDim,
                         _tdmG1);
         bool loadWaited = false;
-        for (int l = 0; l < topk; ++l) {
-          if (!__shfl(validMe, l)) continue;
+        unsigned long long _vm = __ballot(validMe);
+        while (_vm) {
+          int l = __ffsll((long long)_vm) - 1;
+          _vm &= _vm - 1;
           index_t flat = __shfl(flatMe, l);
           index_t destPe = EpPeFromFlat<kCfg>(flat);
           index_t destTokId = EpLocalTokFromFlat<kCfg>(flat);
@@ -699,63 +654,38 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   }
   __syncthreads();
 
-  // ---- Completion: all blocks arrive, then per-peer release-signal ----
   if (thdId == 0) atomicAdd(args.gridBarrier, 1u);
   index_t* recvTokenNums = EpLocal<index_t>(win, args.offRecvNum);
   if (globalWarpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += WS) {
-      // THESE TWO WAITS ARE INDEPENDENT, WHICH IS WHY THE SLOT ONE GOES FIRST.
-      // Whether the peer has drained last launch's mailbox has nothing to do with whether this
-      // rank's slowest block has finished, so running them in that order used to cost cbar + cslot
-      // where it can cost max(cbar, cslot). Instrumented on the v1 body at 512: cbar 6.60 -> 1.50
-      // and cslot 3.38 -> 4.55, i.e. the sum 9.98 became 6.05; isolated A/B there was +8.7% at 512
-      // and +1.6% at 4096.
-      //
-      // The slot read is against uncached peer memory, so it pays a full fabric round trip even
-      // when the slot has long been zero -- issuing it while the grid barrier is still spinning is
-      // what hides it. Its address depends only on destPe, so nothing here needs the barrier to
-      // have been satisfied.
-      //
-      // THE WIRE FORMAT IS BYTE-FOR-BYTE UNCHANGED: both of these are pure spin-waits that write
-      // nothing, and the signal store below still happens after BOTH. This is only the order of two
-      // reads, which is what makes it safe to enable unconditionally -- unlike a depth-2 mailbox,
-      // which buys an amount that cannot be measured (597.0 against 595.7 at 512, inside a 22 GB/s
-      // per-rank spread) at the price of a format every rank must agree on.
       index_t* signal = EpPeer<index_t>(win, destPe, args.offRecvNum) + myPe;
       EpWaitEq(signal, 0);
       EpWaitEq(args.gridBarrier, static_cast<unsigned int>(gridDim.x));
       __hip_atomic_store(args.gridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      // Must stay AFTER the grid barrier: this is the sum every block contributed to.
       index_t numTokenSignal = __hip_atomic_load(args.destPeTokenCounter + destPe, __ATOMIC_RELAXED,
                                                  __HIP_MEMORY_SCOPE_AGENT) +
                                1;
-      __threadfence_system();
+      __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
       __hip_atomic_store(signal, numTokenSignal, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
     }
   }
   if (globalWarpId == 0) {
+    index_t myRecv = 0;
     for (int srcPe = laneId; srcPe < npes; srcPe += WS) {
       index_t* signal = recvTokenNums + srcPe;
       index_t recvTokenNum = EpWaitGt(signal, 0) - 1;
       __hip_atomic_store(signal, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-      atomicAdd(args.totalRecvTokenNum, recvTokenNum);
+      myRecv += recvTokenNum;
       args.destPeTokenCounter[srcPe] = 0;
     }
-    if (laneId == 0) EpLocal<index_t>(win, args.offTokOff)[0] = 0;
+    for (int off = WS / 2; off > 0; off >>= 1) myRecv += __shfl_down(myRecv, off, WS);
+    if (laneId == 0) {
+      *args.totalRecvTokenNum = myRecv;
+      EpLocal<index_t>(win, args.offTokOff)[0] = 0;
+    }
   }
 }
 
-/* ------------------------------------------------------------------------- */
-/*                            Cross-device barrier                            */
-/* ------------------------------------------------------------------------- */
-// Same contract as the portable EpCrossDeviceBarrier.
-//
-// ARRIVAL: per-block epoch xdbFlag[blockIdx.x] — no contended atomic, no reset race.
-// DISTRIBUTION: block-0 fan-out into device-local lines (SCOPE_DEV, L2-served);
-// every-block polling of the SCOPE_SYS arena slots was +9 us at 64 blocks / +69 at 256.
-//
-// needGridRendezvous: true when this kernel staged out_tok (all blocks must finish
-// before any epoch is published); false on the in-place path.
 template <EpCfg kCfg>
 __device__ __forceinline__ void EpCrossDeviceBarrier1250x(EpArgs args, bool needGridRendezvous) {
   constexpr int npes = kCfg.worldSize;
@@ -763,7 +693,7 @@ __device__ __forceinline__ void EpCrossDeviceBarrier1250x(EpArgs args, bool need
   const int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
   const unsigned long long win = args.window;
 
-  if (needGridRendezvous) __syncthreads();  // drain staging writes before signalling
+  if (needGridRendezvous) __syncthreads();
   const unsigned long long phase = args.xdbFlag[blockIdx.x];
 
   if (needGridRendezvous) {
@@ -775,14 +705,11 @@ __device__ __forceinline__ void EpCrossDeviceBarrier1250x(EpArgs args, bool need
   }
 
   if (globalThdId < npes) {
-    // One SYS release here flushes all blocks' staging (they synced above). Per-thread
-    // at call site costs 26 us at 256 blocks. In-place needs none.
     if (needGridRendezvous) __threadfence_system();
     __hip_atomic_store(EpPeer<unsigned long long>(win, globalThdId, args.offXdb) + args.rank, phase,
                        __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
   }
-  if (thdId == 0) args.xdbFlag[blockIdx.x] = phase + 1;  // single writer, plain store
-  // Keep tail slots in step for a later call that may launch a larger grid.
+  if (thdId == 0) args.xdbFlag[blockIdx.x] = phase + 1;
   if (blockIdx.x == 0) {
     for (int b = (int)gridDim.x + thdId; b < EpXdbFlagSlots; b += (int)blockDim.x)
       args.xdbFlag[b] = phase + 1;
@@ -791,19 +718,17 @@ __device__ __forceinline__ void EpCrossDeviceBarrier1250x(EpArgs args, bool need
   unsigned int* fanLines = reinterpret_cast<unsigned int*>(args.combineBarrierFan);
   const unsigned int fanEpoch = static_cast<unsigned int>(phase);
   if (blockIdx.x == 0) {
-    // Arena slots: >= (peers can lap us) and 64-bit (never wraps).
     if (thdId < npes) {
       unsigned long long* slot = EpLocal<unsigned long long>(win, args.offXdb) + thdId;
       while (__hip_atomic_load(slot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) < phase)
         __builtin_amdgcn_s_sleep(MORI_COMB_BARSLEEP);
     }
     __syncthreads();
-    __threadfence();  // release for fan-out: relaxed stores need ordering for readers
+    __threadfence();
     for (int b = thdId; b < (int)gridDim.x; b += (int)blockDim.x)
       __hip_atomic_store(fanLines + (size_t)b * MORI_COMB_BARSPREAD, fanEpoch, __ATOMIC_RELAXED,
                          __HIP_MEMORY_SCOPE_AGENT);
   } else {
-    // Fan lines: == not >= — fanEpoch is 32-bit, no lapping, and >= would break on wrap.
     if (thdId == 0) {
       while (__hip_atomic_load(fanLines + (size_t)blockIdx.x * MORI_COMB_BARSPREAD,
                                __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != fanEpoch)
@@ -811,16 +736,9 @@ __device__ __forceinline__ void EpCrossDeviceBarrier1250x(EpArgs args, bool need
     }
     __syncthreads();
   }
-  // No acquire: peer rows are uncached (CcoWindowAllocType), own rows covered by
-  // staging release + launch acquire.
   __syncthreads();
 }
 
-/* ------------------------------------------------------------------------- */
-/*                                   Combine                                  */
-/* ------------------------------------------------------------------------- */
-// The unquantized combine: UseP2PRead PULL gather + QUAD (by-source) decomposition.
-// T is the type on the wire throughout (no scale plumbing).
 template <EpCfg kCfg, typename T>
 __device__ void EpCombine1250xBody(EpArgs args) {
   using TokT = T;
@@ -841,9 +759,6 @@ __device__ void EpCombine1250xBody(EpArgs args) {
   const index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
   const size_t hiddenDim = (size_t)kCfg.hiddenDim;
 
-  // Stage post-expert tokens into the arena (offOutTok) so peers can gather them,
-  // unless the caller already produced them there. Weights need no staging: dispatch
-  // already pushed them to each peer's offOutWts, which is what combine gathers.
   T* const stage = EpLocal<T>(win, args.offOutTok);
   bool staged = false;
   if (reinterpret_cast<const T*>(args.inpTokenBuf) != stage) {
@@ -853,7 +768,6 @@ __device__ void EpCombine1250xBody(EpArgs args) {
     }
     staged = true;
   }
-  // Per-block release (writeback is per-CU, one wave per grid is not enough).
   if (staged) {
     __syncthreads();
     if (warpId == 0) __threadfence_system();
@@ -863,7 +777,6 @@ __device__ void EpCombine1250xBody(EpArgs args) {
   if (args.numTokens == 0) return;
 
   extern __shared__ char sharedMem[];
-  // Layout: [srcPtrs][srcWeightsPtr]; the QUAD/PULL tiles follow at a 128B boundary.
   TokT** srcPtrs = reinterpret_cast<TokT**>(sharedMem) + warpId * topk;
   float** srcWeightsPtr = nullptr;
   if constexpr (kCfg.useWeights) {
@@ -897,8 +810,6 @@ __device__ void EpCombine1250xBody(EpArgs args) {
   }
   const int _cRedEnd = (int)(args.numTokens * mwIter.warpsPerItem);
 
-  // -------------------------------------------------------------------------
-  // QUAD: decompose the PULL gather by SOURCE instead of by hidden-dim chunk.
   bool _qDone = false;
   if constexpr (_cPullType && UseP2PRead) {
     constexpr int _qBufs = ((MORI_COMB_QUAD) < 2) ? 2 : (MORI_COMB_QUAD);
@@ -932,7 +843,6 @@ __device__ void EpCombine1250xBody(EpArgs args) {
       const TokT* const _qGroupBase = _qTiles + (size_t)(_qId * _qSize) * _qBufs * _qTile;
       const gfx1250_TDM_GROUP1 _qPgFull = TdmShape<TokT>(_qTile);
       const gfx1250_TDM_GROUP1 _qPgDummy = TdmShape<TokT>(_cPullRowElems);
-      // A dedup-removed source still issues one (unfolded) safe load off own staging.
       TokT* const _qSafe = EpPeer<TokT>(win, myPe, args.offOutTok);
       auto _qSetup = [&](int _tok, int& _cntOut) -> TokT* {
         if (_tok >= _qN) {
@@ -965,10 +875,6 @@ __device__ void EpCombine1250xBody(EpArgs args) {
           const int _slot = __popcll(_mask & ((1ULL << laneId) - 1));
           srcPtrs[_slot] = _myPtr;
         }
-        // The weight fold: topk peer reads of 32B, ordinary loads, on one warp while
-        // the group waits -- 385 vs 165us at EP4/4096/64x8. Training-backward only;
-        // inference leaves outWeightsBuf null. Placement is v1's (issuing it after the
-        // TDM load, and hoisting it per token, both measured no better).
         if constexpr (kCfg.useWeights) {
           if (args.outWeightsBuf != nullptr && _qLane == 0) {
             core::WarpAccum<float, 4>(args.outWeightsBuf + (size_t)_tok * topk, srcWeightsPtr,
@@ -1084,7 +990,7 @@ __device__ void EpCombine1250xBody(EpArgs args) {
           const TokT* const _tBase = _qGroupBase + (size_t)_buf * _qTile + _o;
           const size_t _tStride = (size_t)_qBufs * _qTile;
           auto _qStore = [&](int _e, _QOutVecT _v) {
-            *reinterpret_cast<_QOutVecT*>(_outLds + _e) = _v;  // output-width, not tile-width
+            *reinterpret_cast<_QOutVecT*>(_outLds + _e) = _v;
           };
           if (_cntRed == 4) {
             const TokT* _p0 = _tBase;
@@ -1168,8 +1074,6 @@ __device__ void EpCombine1250xBody(EpArgs args) {
     }
   }
 
-  // -------------------------------------------------------------------------
-  // PULL: the general per-chunk gather (QUAD declined this launch's geometry).
   if (!_qDone)
     for (int i = globalWarpId; i < _cRedEnd; i += globalWarpNum) {
       int tokenId, inTokenPartId;
@@ -1218,7 +1122,6 @@ __device__ void EpCombine1250xBody(EpArgs args) {
             int _n = (int)(hiddenDimSize - _off);
             if (_n > _cPullTileElems) _n = _cPullTileElems;
             if ((size_t)_n * sizeof(TokT) < 128) {
-              // Tail below one legal TDM row: direct scalar gather.
               for (int _e = laneId; _e < _n; _e += WS) {
                 float _acc = 0.0f;
                 for (int _j = 0; _j < _nSrc; ++_j) {
@@ -1346,7 +1249,6 @@ __device__ void EpCombine1250xBody(EpArgs args) {
         }
       }
       if (!_pullDone) {
-        // Tile path declined (shape/alignment/LDS budget): 16B vec load-first gather.
         core::WarpAccumLF<T, 16>(outPtr, srcPtrs, nullptr, validAccumCount, hiddenDimSize);
       }
 

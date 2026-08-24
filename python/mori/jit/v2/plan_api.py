@@ -414,6 +414,12 @@ def make_plan(kernel: str) -> type:
                 raise RuntimeError(f"mori jit [{kernel}]: {_error()}")
             self._handle = ctypes.c_void_p(handle)
             self._arena = arena  # held: the kernel dereferences the window
+            # launch()'s reusable arg struct; see the comment there. Dropped on
+            # bind(), so pinned arguments are never served from a stale cache.
+            self._buf = None
+            self._buf_shape = None
+            self._dyn_args = ()
+            self._dyn_defs = ()
             # Known at construction, so the caller need not repeat them per launch.
             self._defaults = {}
             if "window" in arg_names:
@@ -465,23 +471,56 @@ def make_plan(kernel: str) -> type:
                         f"{kernel}: unknown launch argument '{k}'; schema is {arg_names}"
                     )
                 self._defaults[wire] = v
+            self._buf = None  # pinned values changed; rebuild the cached struct
 
         def launch(self, stream=0, **args) -> None:
             """Arguments by name, snake_case or the C++ spelling, per the schema."""
             if self._handle is None:
                 raise RuntimeError("launch on a closed plan")
-            merged = dict(self._defaults)
-            for k, v in args.items():
-                wire = arg_snake_to_wire.get(k, k)
-                if wire not in arg_names:
-                    raise TypeError(
-                        f"{kernel}: unknown launch argument '{k}'; schema is {arg_names}"
-                    )
-                merged[wire] = v
-            buf = args_t()
-            for name in arg_names:
-                if name in merged:
-                    setattr(buf, name, _as_ptr(merged[name]))
+
+            # A serving loop calls this with the same argument NAMES every time,
+            # so the struct-filling work repeats identically while only a few
+            # values differ. Cache the struct instead of rebuilding it: on f01-2
+            # this path cost 10-20us per launch against a ~36us kernel, which is
+            # what made the eager host path -- not the GPU -- the bottleneck at
+            # small token counts (HANDOFF §16.13).
+            #
+            # What may be cached: a _defaults entry that is an int, since bind()
+            # is the only way to change one and it drops the cache. Everything
+            # else is re-read every launch -- args because they are the varying
+            # ones (num_tokens is an int that changes per call), and a tensor in
+            # _defaults because its storage may have been reallocated.
+            #
+            # Keyed on the argument names: a call passing a different set must not
+            # inherit fields left over from the previous shape.
+            shape = tuple(args)
+            if self._buf is None or shape != self._buf_shape:
+                merged = dict(self._defaults)
+                for k, v in args.items():
+                    wire = arg_snake_to_wire.get(k, k)
+                    if wire not in arg_names:
+                        raise TypeError(
+                            f"{kernel}: unknown launch argument '{k}'; schema is {arg_names}"
+                        )
+                    merged[wire] = v
+                buf = args_t()
+                for name in arg_names:
+                    if name in merged:
+                        setattr(buf, name, _as_ptr(merged[name]))
+                self._buf = buf
+                self._buf_shape = shape
+                self._dyn_args = tuple((k, arg_snake_to_wire.get(k, k)) for k in args)
+                self._dyn_defs = tuple(
+                    w
+                    for w, v in self._defaults.items()
+                    if w in arg_names and not isinstance(v, int)
+                )
+            else:
+                buf = self._buf
+                for k, wire in self._dyn_args:
+                    setattr(buf, wire, _as_ptr(args[k]))
+                for wire in self._dyn_defs:
+                    setattr(buf, wire, _as_ptr(self._defaults[wire]))
             rc = _load().mori_jit_plan_launch(
                 self._handle,
                 ctypes.byref(buf),
