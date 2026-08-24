@@ -44,14 +44,9 @@ from .symm_arena import SymmArena
 
 # C++ offset-argument stem -> arena region name. The C++ side names the offsets
 # after its own EpArgs fields (offTokOff -> "tokOff"); the region names match the
-# FlyDSL op's.
-#
-# Same NAMES, and for every region but one the same SIZE -- `out_scales` is the
-# exception: this backend lays the rows down at scale_stride_bytes() (the caller's
-# row padded to 128 B) while FlyDSL uses the row as given. An arena sized for
-# FlyDSL and handed to this backend is overrun by its last tokens, and nothing
-# would catch it: a plan binds offsets, never sizes. A caller building its own
-# arena must size `out_scales` from scale_stride_bytes() on the op it will run.
+# FlyDSL op's, and so do the sizes EXCEPT out_scales -- this backend pads the row,
+# FlyDSL does not. A plan binds offsets, never sizes, so an arena sized for the
+# wrong one is overrun silently: size it from scale_stride_bytes().
 _REGIONS = {
     "tokOff": "tok_off",
     "recvNum": "recv_num",
@@ -82,17 +77,8 @@ _SCALE_ALIGN = 128
 def scale_stride_bytes(scale_bytes: int) -> int:
     """What a DESTINATION scale row is laid down at: EpScaleStride in ep_cfg.hpp.
 
-    The caller states the row it has; mori pads it to 128 B so that a transfer of
-    a run of consecutive destination slots starts aligned, which is the whole
-    reason the padding exists (TdmWholeOrSplit128 only gives a body to the
-    aligned part of a run). The extra bytes are written as zero.
-
-    A consumer that addresses the region itself -- a receiving kernel handed the
-    base pointer -- must stride by this. One that goes through recv_scales() does
-    not: that view hides the padding.
-
-    Mirrored here rather than read out of the C++ because the sizing happens
-    before any kernel exists; the two must be changed together.
+    Anything addressing the region itself strides by this; recv_scales() hides it.
+    Mirrored from the C++ because sizing happens before any kernel exists.
     """
     if scale_bytes <= 0:
         return 0
@@ -175,21 +161,13 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     @staticmethod
     def _scale_i32(cfg) -> int:
-        """Dwords in the SOURCE scale row -- what the caller hands us.
-
-        Rounded up to a dword the way the FlyDSL backend does; _unsupported
-        rejects a row that needed the rounding, so this only ever restates a
-        width that was already whole.
-        """
+        """Dwords in the SOURCE scale row. _unsupported rejects a row that is not
+        already dword-sized, so the rounding here never actually rounds."""
         return (cfg.scale_dim * cfg.scale_type_size + 3) // 4
 
     def scale_stride_bytes(self) -> int:
-        """This backend pads the row to 128 B; the base returns it unchanged.
-
-        The module-level function of the same name is the form to use when there
-        is no op yet -- sizing an arena before constructing the thing that will
-        read it, which is exactly what an external caller does.
-        """
+        """Padded to 128 B here; the base returns the row unchanged. Use the
+        module-level function when there is no op yet (sizing an arena)."""
         return scale_stride_bytes(self._scale_row_bytes())
 
     @classmethod
@@ -216,11 +194,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # Sized by the DESTINATION stride, which is the caller's row padded to
             # 128 B: the kernel lays the rows down at that pitch, so an arena sized
             # for the unpadded row would be overrun by the last tokens.
-            #
-            # Padding the rows only aligns them if the region itself starts aligned,
-            # and that is a different file's constant. Checked rather than assumed:
-            # lowering it would show up as a ~1.7x dispatch regression, which is not
-            # a symptom anyone traces back to an arena constant.
+            # Padded rows only land aligned if the region does; that is another
+            # file's constant, and lowering it reads as a perf regression.
             assert SymmArena._ALIGN % _SCALE_ALIGN == 0, (
                 f"SymmArena._ALIGN={SymmArena._ALIGN} does not keep scale regions "
                 f"{_SCALE_ALIGN} B-aligned; the padding in EpScaleStride buys nothing"
@@ -366,11 +341,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         answer FlyDSL gives, and the same (recv_cap, dwords) int32 view, so a caller
         cannot tell the backends apart.
 
-        The rows sit `scale_stride_bytes` apart, not `n_i32 * 4`: this returns a
-        STRIDED view of the meaningful dwords, so the padding stays mori's business
-        for anyone who just wants the values. A consumer that addresses the region
-        itself -- a kernel taking the base pointer -- has to know the real pitch and
-        should ask for it (scale_stride_bytes) rather than infer it from this shape.
+        Strided, not packed: the rows sit scale_stride_bytes() apart. Anything
+        reading the region by pointer needs that pitch, not this shape.
         """
         n_i32 = self._scale_i32(self.cfg)
         if not n_i32:

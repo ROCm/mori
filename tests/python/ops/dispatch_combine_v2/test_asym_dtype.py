@@ -31,11 +31,9 @@ converts dtype: dispatch moves fp8 tokens, the (mock) expert dequants fp8->bf16
     rank's input is regenerated from its per-rank seed, no collective needed).
   * ASYM-COMBINE(bf16): identity-expert telescoping -- out == U * dequant(inp) * wt
     (U = distinct dest PEs per token), weights == U * wt.
-  * ASYM-SCALES: with SCALE_DIM>0, the per-token scale row rides along and lands
-    in the same slot as its token, byte-exact. This is the combination a
-    quantizing wire actually uses -- fp8/fp4 payload plus its e8m0 row -- and it
-    is the only place the two are tested together: test_op.py can only ask for a
-    symmetric dtype, so its scale coverage is bf16-only.
+  * ASYM-SCALES: with SCALE_DIM>0, the scale row rides along and lands in the
+    same slot as its token, byte-exact. Only tested here: test_op.py takes one
+    dtype for both legs, so its scale coverage can only ever be bf16.
 
     torchrun --nnodes=1 --nproc_per_node=4 --tee 3 ... test_asym_dtype.py
     SCALE_DIM=16 DISP=fp4 torchrun ... test_asym_dtype.py
@@ -68,9 +66,8 @@ HIDDEN = int(os.environ.get("HIDDEN", 512))  # 16 B aligned for both fp8 and bf1
 K = int(os.environ.get("TOPK", 6))
 EPR = int(os.environ.get("EPR", 8))
 SWEEP = [int(x) for x in os.environ.get("SWEEP", "8,64,512").split(",")]
-# Bytes in the per-token scale row, 0 = no scale channel. A real MX wire sends
-# HIDDEN//32 (one e8m0 per 32 features); mori pads that up to its own slot stride,
-# so a value that is NOT already 128 B-aligned is the interesting one to pass.
+# Bytes per scale row, 0 = off. A real MX wire sends HIDDEN//32; mori pads that
+# to its own stride, so a value that is not 128 B-aligned is the one worth passing.
 SCALE_DIM = int(os.environ.get("SCALE_DIM", 0))
 
 
@@ -141,10 +138,8 @@ def main():
     # Compared as raw bytes, so fp4 -- which has no torch arithmetic -- works too.
     all_inp = torch.cat([as_bytes(gen_inp(r, M)) for r in range(npes)], dim=0)
 
-    # Per-token scale rows, one dword pattern per token: rank*100003 + tok. The
-    # recv side decodes the origin from the routing reverse map, so a row that
-    # landed in the wrong slot -- or was read at the wrong pitch, which is what a
-    # padding bug looks like -- shows up as a mismatch rather than as noise.
+    # rank*100003 + tok per dword, so the recv side can decode the origin from the
+    # reverse map: a row in the wrong slot or read at the wrong pitch mismatches.
     sc_n_i32 = (SCALE_DIM + 3) // 4
     scales = None
     if SCALE_DIM:

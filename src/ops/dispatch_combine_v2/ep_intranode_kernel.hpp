@@ -226,11 +226,8 @@ __device__ void EpDispatchBody(EpArgs args) {
       // The scale row follows its token to the same slot. No staging detour like the
       // gfx1250 body needs: this body already copies straight to the peer per token,
       // and on these parts a peer vector store is not the slow path TDM exists for.
-      //
-      // The destination is laid out at EpScaleStride even here, where the alignment
-      // it buys is worthless: one layout for every arch, so a consumer reads the
-      // same rows whatever produced them. The pad is written, not skipped -- see the
-      // gfx1250 staging.
+      // Laid out at EpScaleStride even here, where the alignment buys nothing:
+      // one layout per consumer, whatever arch produced it.
       if constexpr (kCfg.scaleBytes > 0) {
         constexpr int kSrcDw = kCfg.scaleBytes / 4;
         constexpr int kDstDw = EpScaleStride(kCfg) / 4;
@@ -238,7 +235,8 @@ __device__ void EpDispatchBody(EpArgs args) {
           unsigned int* dstS =
               EpPeer<unsigned int>(win, destPe, args.offOutScales) + (size_t)destTokId * kDstDw;
           core::WarpCopy(
-              dstS, reinterpret_cast<const unsigned int*>(args.scalesBuf) + (size_t)srcTokId * kSrcDw,
+              dstS,
+              reinterpret_cast<const unsigned int*>(args.scalesBuf) + (size_t)srcTokId * kSrcDw,
               kSrcDw);
           for (int e = kSrcDw + laneId; e < kDstDw; e += kCfg.waveSize) dstS[e] = 0u;
         }

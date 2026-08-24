@@ -316,36 +316,18 @@ constexpr int EpCombineSharedBytes(const EpCfg& c) {
 
 constexpr int EpTokenBytes(const EpCfg& c) { return c.hiddenDim * EpElemSize(c.dtype); }
 
-// The scale row's SLOT stride, which is not the row the caller handed us.
+// The scale row's SLOT stride: the caller's row padded to 128 B. A transfer is a
+// run of consecutive slots, and TdmWholeOrSplit128 only gives a body to the part
+// of a run that starts aligned -- at the natural 224 B only every 4th one does.
+// gfx1250, 512 tok/rank, hidden 7168, EP4: dispatch 157.7us at 224 B, 94.8 at 256.
 //
-// A scale transfer is a run of consecutive destination slots, so the slot stride
-// is what decides whether a run STARTS on a 128 B boundary -- and TdmWholeOrSplit128
-// only yields a `body` for the part of a run that does; the rest degrades to the
-// scalar global->global fallback. At the natural hidden/32 = 224 B only every 4th
-// run starts aligned. Measured at 512 tokens/rank, hidden 7168, EP4 on gfx1250:
-// dispatch 157.7us at 224 B, 94.8us at 256 B.
+// Padded on every arch so the destination layout does not fork per arch. The pad
+// is unconditional, so small rows amplify: 224->256 is 1.14x, 32->128 is 4x,
+// 4->128 is 32x, and the gfx1250 staging pool is worldSize^2 * maxTok * THIS per
+// compiled variant. Bounded by the static_assert there, not by this being cheap.
 //
-// Derived rather than a second Cfg field, so a caller states only the row it has
-// and mori states the row it lays down. It is padded on every arch, not just the
-// TDM one: the portable body does not need the alignment, but a destination
-// layout that changed with the arch would fork every consumer of it.
-//
-// The pad is UNCONDITIONAL, so what it costs depends entirely on how close the
-// row already is to a multiple of 128:
-//     224 B (hidden 7168, one e8m0 per 32)  -> 256    1.14x
-//      32 B                                 -> 128    4x
-//       4 B (one fp32 scale per token)      -> 128    32x
-// Three places pay it, and the one that hurts is the gfx1250 staging pool: it is
-// worldSize^2 * maxTokPerRank * THIS, once per compiled variant, so a 4 B row at
-// EP8/8192 goes from 2 MiB to 64 MiB per variant. The portable body instead
-// writes 3x more zeroes than data to a peer. Neither is a reason to fork the
-// layout -- the static_assert below bounds the extreme -- but "~14%" is only true
-// near the top of that table.
-//
-// ANY reader of the destination -- the receiving kernel, the arena sizing, a test
-// -- must use this, not Cfg.scaleBytes. The alignment it buys also assumes the
-// arena hands the region out on at least this boundary; SymmArena._ALIGN is 256
-// and says so next to its own constant.
+// Everything reading the destination uses this, not Cfg.scaleBytes; it assumes
+// the arena aligns the region too (SymmArena._ALIGN, checked in hip_backend).
 constexpr int EpScaleAlign = 128;
 constexpr int EpScaleStride(const EpCfg& c) {
   return c.scaleBytes <= 0 ? 0 : (c.scaleBytes + EpScaleAlign - 1) / EpScaleAlign * EpScaleAlign;

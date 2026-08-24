@@ -43,12 +43,9 @@ HIDDEN = int(os.environ.get("HIDDEN", 2048))
 TOPK = int(os.environ.get("TOPK", 4))
 EPR = int(os.environ.get("EPR", 4))
 SWEEP = [int(x) for x in os.environ.get("SWEEP", "8,64,512").split(",")]
-# The scale channel is the one place the two backends lay the SAME region out
-# differently: HIP pads each row to 128 B, FlyDSL uses the row as given. The
-# contract is that recv_scales() hides that -- same values, same shape, whatever
-# the pitch underneath -- and until this test carried scales nothing pinned it.
-# 224 is deliberate: it is not a multiple of 128, so the two pitches really differ
-# (an already-aligned row would make the backends agree by accident).
+# The one region the backends lay out differently (HIP pads the row, FlyDSL does
+# not); recv_scales() is supposed to hide that. 224 is not 128-aligned on purpose,
+# so the pitches really differ -- an aligned row would agree by accident.
 SCALE_DIM = int(os.environ.get("SCALE_DIM", 224))
 
 
@@ -90,13 +87,8 @@ def run_once(op, comm, ct, inp, wts, idx, scales):
         # Cloned before combine, and only the live rows: this is the view whose
         # PITCH differs between the backends, so it has to be read the way a
         # caller reads it (through the returned tensor) rather than off the arena.
-        #
-        # The reverse map comes with it, because the backends do NOT agree on
-        # which recv slot a token lands in -- they hand slots out block-local, and
-        # nothing promises the same order. Every other check here is already
-        # order-free (it compares combine's output, indexed by source token); a
-        # raw row-by-row compare of a dispatch buffer is not, and would fail on
-        # the ordering rather than on the values.
+        # With the reverse map: the backends do not agree on WHICH slot a token
+        # lands in, so a row-by-row compare would fail on order, not on values.
         recv_s = out_s[:total].clone() if (out_s is not None and total) else None
         tis = (
             routing.disp_tok_id_to_src_tok_id_local[:total].clone()
@@ -140,9 +132,8 @@ def main():
         .to(dev)
     )
 
-    # One recognisable dword per token, so a row that landed in the wrong slot --
-    # or was read at the wrong pitch -- shows up as a value mismatch and not as
-    # noise. int32 viewed as bytes: the transport is opaque either way.
+    # One recognisable dword per token: a row read at the wrong pitch, or landed in
+    # the wrong slot, then shows up as a mismatch rather than as noise.
     scales = None
     if SCALE_DIM:
         n_i32 = (SCALE_DIM + 3) // 4
@@ -184,11 +175,8 @@ def main():
             a_out.to(torch.float32), b_out.to(torch.float32), atol=2e-2, rtol=2e-2
         )
         ok_w = torch.allclose(a_w, b_w, atol=2e-3, rtol=2e-3)
-        # Byte-exact, not allclose: scales are opaque payload, so anything but
-        # equality is a layout bug -- and the pitches differ underneath, which is
-        # the point of checking at all. Compared in SOURCE-token order, because the
-        # slot a token lands in is a backend's own business; sorting by the reverse
-        # map is what makes the two comparable without pretending they agree on it.
+        # Byte-exact (opaque payload), in SOURCE-token order via the reverse map --
+        # the pitches differ underneath, which is the point of checking at all.
         ok_s = True
         if a_s is not None and b_s is not None:
             ok_s = a_s.shape == b_s.shape
@@ -206,8 +194,7 @@ def main():
                 f"recv={a_recv}/{b_recv} "
                 f"out_max_diff={(a_out.to(torch.float32) - b_out.to(torch.float32)).abs().max():.4f} "
                 f"wts_max_diff={(a_w - b_w).abs().max():.5f} "
-                # Which check failed, so a scale-only failure is not read as a
-                # payload one: they have completely different causes.
+                # Which check failed: a scale-only failure has a different cause.
                 f"[recv={'ok' if ok_recv else 'BAD'} out={'ok' if ok_out else 'BAD'} "
                 f"wts={'ok' if ok_w else 'BAD'} scales={'ok' if ok_s else 'BAD'}]",
                 flush=True,

@@ -258,10 +258,7 @@ __device__ index_t _cusplit_blkCount[CUSPLIT_MAX_BLOCKS * CUSPLIT_MAX_GPUS];
 // is on; off, it degenerates to one byte. `if constexpr` discards the staging code
 // but still looks the name up, hence a declaration in both cases.
 #if defined(MORI_EP_SCALE_BYTES) && MORI_EP_SCALE_BYTES > 0
-// The SOURCE row (what the caller handed us) and the SLOT stride we lay it down
-// at. They differ by the 128 B padding EpScaleStride adds: staging reads
-// kEpScaleBytes and writes kEpScaleStride, and every transfer below moves the
-// stride, because that is the layout the destination has.
+// Source row vs the stride we lay it down at; they differ by EpScaleStride's pad.
 constexpr int kEpScaleBytes = MORI_EP_SCALE_BYTES;
 constexpr int kEpScaleStride = MORI_EP_SCALE_STRIDE;
 constexpr size_t kEpScaleSlots = (size_t)MORI_EP_SCALE_SLOTS;
@@ -300,14 +297,10 @@ static_assert(kEpScaleStride == 0 || (size_t)kEpScaleSlots * kEpScaleStride <= (
               "EP scale staging exceeds 1 GiB per compiled variant -- it grows as "
               "world_size^2 * maxTokPerRank * EpScaleStride; re-index it block-locally "
               "before going wider");
-// __align__ because the padding above only buys anything if the BASE is aligned
-// too: TdmWholeOrSplit128 derives its split from an offset, and that one split
-// drives both the load out of this array and the store to the peer. The per-row
-// phase is self-consistent already (rows are kEpScaleStride apart, itself a
-// multiple of 128), so the base was the one unstated assumption. Free, and it
-// turns the assumption into something the compiler guarantees.
-__device__ __align__(EpScaleAlign) unsigned char
-    _cusplit_stgScale[kEpScaleSlots * (kEpScaleStride > 0 ? kEpScaleStride : 1)];
+// Rows are already a multiple of 128 apart; __align__ makes the BASE match, which
+// TdmWholeOrSplit128 needs for the same split it uses on the peer side.
+constexpr size_t kEpScaleStgBytes = kEpScaleSlots * (kEpScaleStride > 0 ? kEpScaleStride : 1);
+__device__ __align__(EpScaleAlign) unsigned char _cusplit_stgScale[kEpScaleStgBytes];
 
 /* ------------------------------------------------------------------------- */
 /*                                  Dispatch                                  */
@@ -321,8 +314,6 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   static_assert(kCfg.scaleBytes == kEpScaleBytes,
                 "MORI_EP_SCALE_BYTES disagrees with Cfg.scaleBytes -- RenderEpSource must "
                 "emit the macro from the same Cfg it renders");
-  // The pair matters more than either: staging is sized by the macro and indexed
-  // by it, while the descriptors below take their pitch from the same number.
   static_assert(EpScaleStride(kCfg) == kEpScaleStride,
                 "MORI_EP_SCALE_STRIDE disagrees with EpScaleStride(Cfg) -- the staging "
                 "would be sized at one pitch and written at another");
@@ -486,11 +477,8 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
           if (args.scalesBuf) {
             // Dwords: EpCfgIsValid makes the row dword-sized, so the gsz lanes that
             // own this destination stride it without a byte tail.
-            //
-            // This is the ONLY place the two widths meet: the caller's rows are
-            // packed at kEpScaleBytes, the staging slot is kEpScaleStride wide, and
-            // the copy is per-row anyway -- which is what makes the padding free
-            // here rather than a pass of its own.
+            // The only place the two widths meet, and the copy is per-row
+            // anyway -- which is what makes the pad free rather than its own pass.
             constexpr int kSrcDw = kEpScaleBytes / 4;
             constexpr int kDstDw = kEpScaleStride / 4;
             const unsigned int* srcS =
@@ -499,9 +487,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
               unsigned int* dstS = reinterpret_cast<unsigned int*>(
                   _cusplit_stgScale + ((size_t)d * kEpScaleRows + (size_t)dt) * kEpScaleStride);
               for (int e = myE; e < kSrcDw; e += gsz) dstS[e] = srcS[e];
-              // Zero the pad rather than ship whatever the last launch left. Nobody
-              // reads it, but it crosses to a peer's memory, and "nobody reads it"
-              // is not something a buffer diff or a future consumer knows.
+              // Zeroed, not left over: it crosses into a peer's memory.
               for (int e = kSrcDw + myE; e < kDstDw; e += gsz) dstS[e] = 0u;
             }
           }
@@ -519,9 +505,8 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     const index_t _stgCapM = (index_t)(CUSPLIT_POOL_SLOTS / npes);
     // One warp owns a whole (peer, sub-range) run, moving idx+wt+srcmap through one tile.
     const int mtileBytesM = kSlabBytes;  // the whole slab, see above
-    // idx + weights + srcmap, plus the scale row when it rides along -- at the
-    // stride it is actually staged and moved at, padding included, or the tile
-    // would be sized for less than the batch it then holds.
+    // idx + weights + srcmap + the scale row, at the stride it is really moved at:
+    // sizing this from the unpadded row would under-size the tile it then holds.
     const int perTokM = tkM * 4 + tkM * 4 + 4 + EpScaleStride(kCfg);
     // 128B of slack per field region for the rounding below.
     const int tokCapM = (perTokM > 0) ? ((mtileBytesM - 128 * kMetaFields) / perTokM) : 0;
@@ -577,9 +562,8 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
           const TdmSplit128 spW = (dW != nullptr) ? spI : TdmSplit128{0, 0, 0};
           const TdmSplit128 spR = TdmWholeOrSplit128((size_t)ab, cc);
           // Scale rides as a fourth field: same run, same tile, one more descriptor.
-          // The STRIDE, not the caller's row: staging and destination are both laid
-          // out at it, and it is what puts `ab * kSdw` on a 128 B boundary so
-          // TdmWholeOrSplit128 gives this run a body instead of a scalar tail.
+          // The stride, not the caller's row: it is what puts `ab * kSdw` on a
+          // 128 B boundary, so this run gets a body instead of a scalar tail.
           constexpr int kSdw = (kEpScaleStride > 0) ? kEpScaleStride / 4 : 0;
           const int nScB = cc * kSdw;
           unsigned int* sS = reinterpret_cast<unsigned int*>(_cusplit_stgScale) +

@@ -154,8 +154,8 @@ std::string RenderEpSource(const EpCfg& cfg, const std::string& entry, const cha
     // ROWS is the per-peer stride and SLOTS the total. They must be emitted as a
     // pair: the staging is indexed peer*ROWS + destTokId, and sizing it from one
     // while indexing with the other is an out-of-bounds write on peer > 0.
-    // BYTES is the caller's row; STRIDE is what we lay it down at (EpScaleStride).
-    // Both are needed: the staging step reads one and writes the other.
+    // BYTES is the caller's row, STRIDE what we lay it down at: staging reads one
+    // and writes the other.
     scaleDefs = "#define MORI_EP_SCALE_BYTES " + std::to_string(cfg.scaleBytes) +
                 "\n#define MORI_EP_SCALE_STRIDE " + std::to_string(EpScaleStride(cfg)) +
                 "\n#define MORI_EP_SCALE_ROWS " + std::to_string(EpMaxRecv(cfg)) +
