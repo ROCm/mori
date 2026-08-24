@@ -154,6 +154,22 @@ class PoolClient {
     size_t object_offset = 0;
   };
 
+  // Where a ranged call's internal helpers report the time they spent, so the
+  // phases can be attributed without the helpers knowing about the reporting
+  // machinery.  Split this finely because the costs scale differently: `resolve`
+  // is per key, `classify` is per RANGE, and one call carries thousands of
+  // ranges per key batch.  Every member is nullable; null is inert.
+  struct RangedPhaseSinks {
+    double* resolve = nullptr;   // medium index lookup / slot allocation
+    double* classify = nullptr;  // classifying the caller's range pointers
+    double* build = nullptr;     // TransferItem assembly (classify excluded)
+    double* commit = nullptr;    // slot commit / abort
+    size_t* items = nullptr;     // TransferItems handed to the engine
+    // Forwarded straight to TransferEngine::Transfer so the engine's own three
+    // steps land in the same report as the phases around them.
+    const TransferEngine::StepTiming* steps = nullptr;
+  };
+
   std::vector<bool> BatchGetRanges(const std::vector<std::string>& keys,
                                    const std::vector<std::vector<void*>>& dsts,
                                    const std::vector<std::vector<size_t>>& sizes,
@@ -336,10 +352,14 @@ class PoolClient {
   //
   // Appends to `items`; returns false if the medium publishes no endpoint for a
   // referenced buffer, or a range falls outside the stored object.
+  //
+  // `classify_sink`, when non-null, accumulates the seconds spent classifying
+  // the caller's range pointers.  That cost scales with ranges rather than
+  // keys, so it is reported as its own phase; null makes it inert.
   bool BuildLocalRangeTransfers(MediumBackend* backend, const std::vector<PageLocation>& pages,
                                 uint64_t page_size, uint64_t stored_size,
                                 const std::vector<ObjectRange>& ranges, bool to_backend, size_t tag,
-                                std::vector<TransferItem>* items);
+                                std::vector<TransferItem>* items, double* classify_sink = nullptr);
 
   // Copy between one contiguous host object and a set of caller ranges, through
   // the transfer engine so a device-resident caller buffer is handled by
@@ -381,8 +401,14 @@ class PoolClient {
   // wrote.  Deliberately not derivable from `results`: a key already present in
   // the medium reports success without moving anything, and crediting it would
   // inflate the bandwidth histogram.
+  //
+  // `sinks`, when non-null, attributes the call's time to phases; see
+  // RangedPhaseSinks.  Its members are independently nullable too, and a null
+  // one costs nothing -- that is what keeps this off the hot path when the
+  // ranged debug switch is off.
   void ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteRequest>& requests,
-                                  std::vector<bool>* results, double* committed_bytes = nullptr);
+                                  std::vector<bool>* results, double* committed_bytes = nullptr,
+                                  const RangedPhaseSinks* sinks = nullptr);
   // After a successful remote DRAM fetch, if cache_remote_fetches is enabled and
   // the admission gate admits the block, enqueue it for asynchronous install into
   // this node's local DRAM tier (see ReCacheWorkerLoop). The install (DRAM

@@ -350,9 +350,20 @@ class TransferEngine : public MemoryRegistrar, public MetricSource {
   // several peers deadlock-free without the caller knowing staging exists.
   virtual std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan> plans) = 0;
 
+  // Where Transfer() reports the seconds it spent in each of its three steps.
+  // Planning grows with the number of items while the move grows with bytes, so
+  // a caller that batches thousands of small ranges needs to tell them apart to
+  // know which one it is paying for.  Null members are inert.
+  struct StepTiming {
+    double* plan = nullptr;
+    double* submit = nullptr;
+    double* wait = nullptr;
+  };
+
   // Plan + Submit + Wait, for callers with nothing to overlap.  Returns false
   // and fills `failed_tags` if anything was rejected or failed.
-  bool Transfer(const std::vector<TransferItem>& items, std::vector<size_t>* failed_tags);
+  bool Transfer(const std::vector<TransferItem>& items, std::vector<size_t>* failed_tags,
+                const StepTiming* timing = nullptr);
 };
 
 }  // namespace mori::umbp

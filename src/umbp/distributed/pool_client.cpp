@@ -192,11 +192,27 @@ inline double RangedSeconds(std::chrono::steady_clock::time_point start,
 
 struct RangedPhases {
   double resolve = 0.0;
+  // Split out of `resolve`, which used to cover the whole per-key loop and so
+  // could not say whether the time went to the medium's index or to describing
+  // the caller's buffers.  `classify` is the latter: one pointer lookup per
+  // RANGE, and a ranged call carries thousands of them.
+  double classify = 0.0;
+  double build = 0.0;
+  double validate = 0.0;  // put only: checking the ranges tile their object
+  double commit = 0.0;    // put only: slot commit
   double route = 0.0;
   double xfer = 0.0;
+  // xfer split three ways.  Planning scales with items, the move with bytes, so
+  // a batch of many small ranges needs them apart to say which it is paying.
+  double xfer_plan = 0.0;
+  double xfer_submit = 0.0;
+  double xfer_wait = 0.0;
   double lock = 0.0;
   double remote = 0.0;
   size_t keys = 0;
+  // TransferItems handed to the engine.  Grows with ranges, not keys, and is
+  // what makes the item-per-range cost visible next to the phase times.
+  size_t items = 0;
   size_t local_keys = 0;
   size_t remote_keys = 0;
   double bytes = 0.0;
@@ -243,11 +259,19 @@ class RangedStats {
     t.calls += 1;
     t.total += total;
     t.resolve += p.resolve;
+    t.classify += p.classify;
+    t.build += p.build;
+    t.validate += p.validate;
+    t.commit += p.commit;
     t.route += p.route;
     t.xfer += p.xfer;
+    t.xfer_plan += p.xfer_plan;
+    t.xfer_submit += p.xfer_submit;
+    t.xfer_wait += p.xfer_wait;
     t.lock += p.lock;
     t.remote += p.remote;
     t.bytes += p.bytes;
+    t.items += p.items;
 
     // Per-component totals, keyed by object size (one call = one pool).  The
     // sample key is stored once per (op, size) so the log proves the
@@ -275,7 +299,9 @@ class RangedStats {
  private:
   struct Totals {
     uint64_t calls = 0;
-    double total = 0, resolve = 0, route = 0, xfer = 0, lock = 0, remote = 0, bytes = 0;
+    uint64_t items = 0;
+    double total = 0, resolve = 0, classify = 0, build = 0, validate = 0, commit = 0, route = 0,
+           xfer = 0, xfer_plan = 0, xfer_submit = 0, xfer_wait = 0, lock = 0, remote = 0, bytes = 0;
   };
   struct Component {
     uint64_t calls = 0;
@@ -285,15 +311,20 @@ class RangedStats {
   };
   static void Emit(const char* name, const Totals& t) {
     if (t.calls == 0) return;
-    const double other = t.total - (t.resolve + t.route + t.xfer + t.lock + t.remote);
+    const double other = t.total - (t.resolve + t.classify + t.build + t.validate + t.commit +
+                                    t.route + t.xfer + t.lock + t.remote);
     auto share = [&](double v) { return t.total > 0 ? 100.0 * v / t.total : 0.0; };
     MORI_UMBP_INFO(
         "[RangedCall][dbg] SUMMARY {} calls={} total={:.3f}s mean_call={:.1f}us bytes={:.2f}GiB "
-        "| resolve={:.1f}% route={:.1f}% xfer={:.1f}% lock={:.1f}% remote={:.1f}% other={:.1f}% "
+        "items_per_call={:.0f} | resolve={:.1f}% classify={:.1f}% build={:.1f}% validate={:.1f}% "
+        "commit={:.1f}% route={:.1f}% xfer={:.1f}%(plan={:.1f}% submit={:.1f}% wait={:.1f}%) "
+        "lock={:.1f}% remote={:.1f}% other={:.1f}% "
         "| xfer_only={:.2f}GiB/s end2end={:.2f}GiB/s",
         name, t.calls, t.total, 1e6 * t.total / t.calls, t.bytes / (1024.0 * 1024 * 1024),
-        share(t.resolve), share(t.route), share(t.xfer), share(t.lock), share(t.remote),
-        share(other), t.xfer > 0 ? (t.bytes / t.xfer) / (1024.0 * 1024 * 1024) : 0.0,
+        static_cast<double>(t.items) / t.calls, share(t.resolve), share(t.classify), share(t.build),
+        share(t.validate), share(t.commit), share(t.route), share(t.xfer), share(t.xfer_plan),
+        share(t.xfer_submit), share(t.xfer_wait), share(t.lock), share(t.remote), share(other),
+        t.xfer > 0 ? (t.bytes / t.xfer) / (1024.0 * 1024 * 1024) : 0.0,
         t.total > 0 ? (t.bytes / t.total) / (1024.0 * 1024 * 1024) : 0.0);
   }
   void EmitComponentsLocked() const {
@@ -344,15 +375,19 @@ class ScopedRangedReport {
     RangedStatsInstance().Record(op_, phases_, total);
     if (!RangedDebugSampleThisCall()) return;
     const double other =
-        total - (phases_.resolve + phases_.route + phases_.xfer + phases_.lock + phases_.remote);
+        total - (phases_.resolve + phases_.classify + phases_.build + phases_.validate +
+                 phases_.commit + phases_.route + phases_.xfer + phases_.lock + phases_.remote);
     MORI_UMBP_INFO(
-        "[RangedCall][dbg] op={} obj={} key0='{}' keys={} local={} remote={} bytes={} "
-        "total={:.1f}us resolve={:.1f}us route={:.1f}us xfer={:.1f}us lock={:.1f}us "
-        "remote_phase={:.1f}us other={:.1f}us",
+        "[RangedCall][dbg] op={} obj={} key0='{}' keys={} items={} local={} remote={} bytes={} "
+        "total={:.1f}us resolve={:.1f}us classify={:.1f}us build={:.1f}us validate={:.1f}us "
+        "commit={:.1f}us route={:.1f}us xfer={:.1f}us(plan={:.1f} submit={:.1f} wait={:.1f}) "
+        "lock={:.1f}us remote_phase={:.1f}us other={:.1f}us",
         op_, phases_.object_size, phases_.key0 != nullptr ? *phases_.key0 : std::string("?"),
-        phases_.keys, phases_.local_keys, phases_.remote_keys, phases_.bytes, total * 1e6,
-        phases_.resolve * 1e6, phases_.route * 1e6, phases_.xfer * 1e6, phases_.lock * 1e6,
-        phases_.remote * 1e6, other * 1e6);
+        phases_.keys, phases_.items, phases_.local_keys, phases_.remote_keys, phases_.bytes,
+        total * 1e6, phases_.resolve * 1e6, phases_.classify * 1e6, phases_.build * 1e6,
+        phases_.validate * 1e6, phases_.commit * 1e6, phases_.route * 1e6, phases_.xfer * 1e6,
+        phases_.xfer_plan * 1e6, phases_.xfer_submit * 1e6, phases_.xfer_wait * 1e6,
+        phases_.lock * 1e6, phases_.remote * 1e6, other * 1e6);
   }
 
  private:
@@ -1127,14 +1162,30 @@ bool PoolClient::BuildLocalRangeTransfers(MediumBackend* backend,
                                           const std::vector<PageLocation>& pages,
                                           uint64_t page_size, uint64_t stored_size,
                                           const std::vector<ObjectRange>& ranges, bool to_backend,
-                                          size_t tag, std::vector<TransferItem>* items) {
+                                          size_t tag, std::vector<TransferItem>* items,
+                                          double* classify_sink) {
   if (pages.empty() || page_size == 0) return false;
 
-  for (const auto& range : ranges) {
-    if (range.user == nullptr) return false;
-    // Classified once per range, not per page: an unregistered device pointer
-    // must reach HbmCopyEngine, and the whole range lives in one buffer.
-    const TransferRef user_ref = ClassifiedUserBytes(range.user, range.size);
+  // Classified once per range, not per page: an unregistered device pointer
+  // must reach HbmCopyEngine, and the whole range lives in one buffer.
+  //
+  // Hoisted out of the walk below so the cost is one measurable phase instead
+  // of being smeared through item assembly.  Same calls in the same order, and
+  // callers already truncate `items` when this returns false, so bailing before
+  // anything is emitted is equivalent to bailing partway through.
+  std::vector<TransferRef> user_refs;
+  {
+    PhaseTimer classify_timer(classify_sink);
+    user_refs.reserve(ranges.size());
+    for (const auto& range : ranges) {
+      if (range.user == nullptr) return false;
+      user_refs.push_back(ClassifiedUserBytes(range.user, range.size));
+    }
+  }
+
+  for (size_t r = 0; r < ranges.size(); ++r) {
+    const auto& range = ranges[r];
+    const TransferRef& user_ref = user_refs[r];
 
     // The walk owns every bound: object overflow, page-list overrun, and the
     // short last page a range must not run off the end of.
@@ -1219,7 +1270,10 @@ bool PoolClient::CopyRangesToContiguous(const std::vector<ObjectRange>& ranges, 
 }
 
 void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteRequest>& requests,
-                                            std::vector<bool>* results, double* committed_bytes) {
+                                            std::vector<bool>* results, double* committed_bytes,
+                                            const RangedPhaseSinks* sinks_or_null) {
+  static const RangedPhaseSinks kNoSinks;
+  const RangedPhaseSinks& sinks = sinks_or_null != nullptr ? *sinks_or_null : kNoSinks;
   if (requests.empty()) return;
   if (registry_.Empty()) {
     MORI_UMBP_ERROR("[PoolClient] Local ranged Put requested but no storage backend is registered");
@@ -1243,8 +1297,12 @@ void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteReq
                      static_cast<int>(request.tier));
       continue;
     }
-    auto alloc_res =
-        backend->BatchAllocate({AllocateRequest{*request.key, request.object_size}}).front();
+    AllocateResult alloc_res;
+    {
+      PhaseTimer alloc_timer(sinks.resolve);
+      alloc_res =
+          backend->BatchAllocate({AllocateRequest{*request.key, request.object_size}}).front();
+    }
     if (alloc_res.outcome == AllocateOutcome::kSuccessAlreadyExists) {
       (*results)[request.result_index] = true;
       continue;
@@ -1254,19 +1312,28 @@ void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteReq
     // tag = index into `requests`, so the engine's failed tags map straight
     // back to the slot that has to be aborted.
     const size_t before = items.size();
-    if (!BuildLocalRangeTransfers(backend, alloc_res.pages, alloc_res.page_size,
-                                  request.object_size, request.ranges, /*to_backend=*/true,
-                                  /*tag=*/r, &items)) {
+    bool built = false;
+    {
+      PhaseTimer build_timer(sinks.build);
+      built = BuildLocalRangeTransfers(backend, alloc_res.pages, alloc_res.page_size,
+                                       request.object_size, request.ranges, /*to_backend=*/true,
+                                       /*tag=*/r, &items, sinks.classify);
+    }
+    if (!built) {
       items.resize(before);
       backend->BatchAbort({alloc_res.slot_id});
       continue;
     }
     pending.push_back({r, backend, alloc_res.slot_id});
   }
+  // Classification is timed inside the build window; subtract it so the phases
+  // stay disjoint.
+  if (sinks.build != nullptr && sinks.classify != nullptr) *sinks.build -= *sinks.classify;
+  if (sinks.items != nullptr) *sinks.items += items.size();
   if (pending.empty()) return;
 
   std::vector<size_t> failed_tags;
-  transfer_engine_->Transfer(items, &failed_tags);
+  transfer_engine_->Transfer(items, &failed_tags, sinks.steps);
   const std::unordered_set<size_t> failed(failed_tags.begin(), failed_tags.end());
 
   for (const auto& write : pending) {
@@ -1275,7 +1342,13 @@ void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteReq
       write.backend->BatchAbort({write.slot_id});
       continue;
     }
-    if (!write.backend->BatchCommit({CommitRequest{write.slot_id, *request.key}}).front().success) {
+    bool committed = false;
+    {
+      PhaseTimer commit_timer(sinks.commit);
+      committed =
+          write.backend->BatchCommit({CommitRequest{write.slot_id, *request.key}}).front().success;
+    }
+    if (!committed) {
       write.backend->BatchAbort({write.slot_id});
       continue;
     }
@@ -2195,18 +2268,20 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   std::vector<size_t> local_keys;
   std::vector<size_t> missed;
   missed.reserve(n);
-  auto resolve_timer = std::make_unique<PhaseTimer>(dbg ? &dbg->resolve : nullptr);
   for (size_t i = 0; i < n; ++i) {
     if (sizes[i].empty()) continue;  // asked for nothing; stays false
 
     MediumBackend* holder = nullptr;
     ResolvedEntry resolved;
-    for (auto* backend : registry_.All()) {
-      auto candidate = backend->BatchResolve({keys[i]}, /*include_descs=*/false).front();
-      if (!candidate.found) continue;
-      holder = backend;
-      resolved = std::move(candidate);
-      break;
+    {
+      PhaseTimer resolve_timer(dbg ? &dbg->resolve : nullptr);
+      for (auto* backend : registry_.All()) {
+        auto candidate = backend->BatchResolve({keys[i]}, /*include_descs=*/false).front();
+        if (!candidate.found) continue;
+        holder = backend;
+        resolved = std::move(candidate);
+        break;
+      }
     }
     if (holder == nullptr) {
       missed.push_back(i);
@@ -2224,9 +2299,15 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
       continue;  // a caller bug, not a miss — do not go looking for a replica
     }
     const size_t before = local_items.size();
-    if (!BuildLocalRangeTransfers(holder, resolved.pages, resolved.page_size, resolved.size,
-                                  MakeReadRanges(dsts[i], sizes[i], src_offsets[i]),
-                                  /*to_backend=*/false, /*tag=*/i, &local_items)) {
+    bool built = false;
+    {
+      PhaseTimer build_timer(dbg ? &dbg->build : nullptr);
+      built = BuildLocalRangeTransfers(holder, resolved.pages, resolved.page_size, resolved.size,
+                                       MakeReadRanges(dsts[i], sizes[i], src_offsets[i]),
+                                       /*to_backend=*/false, /*tag=*/i, &local_items,
+                                       dbg ? &dbg->classify : nullptr);
+    }
+    if (!built) {
       // The medium holds the key but cannot be read in-process.  Same call as
       // ExecuteLocalGet's kRetry: look for it on another node rather than
       // reporting a miss the caller cannot distinguish from absence.
@@ -2236,12 +2317,19 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
     }
     local_keys.push_back(i);
   }
-  resolve_timer.reset();  // ends the resolve phase
+  if (dbg != nullptr) {
+    // Classification is timed inside the build window, so subtract it out to
+    // keep the phases disjoint and `other` meaningful.
+    dbg->build -= dbg->classify;
+    dbg->items += local_items.size();
+  }
   if (!local_items.empty()) {
     std::vector<size_t> failed_tags;
     {
       PhaseTimer xfer_timer(dbg ? &dbg->xfer : nullptr);
-      transfer_engine_->Transfer(local_items, &failed_tags);
+      TransferEngine::StepTiming steps;
+      if (dbg != nullptr) steps = {&dbg->xfer_plan, &dbg->xfer_submit, &dbg->xfer_wait};
+      transfer_engine_->Transfer(local_items, &failed_tags, dbg != nullptr ? &steps : nullptr);
     }
     const std::unordered_set<size_t> failed(failed_tags.begin(), failed_tags.end());
     for (size_t i : local_keys) {
@@ -2532,7 +2620,7 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
   valid.reserve(n);
   route_keys.reserve(n);
   route_sizes.reserve(n);
-  auto resolve_timer = std::make_unique<PhaseTimer>(dbg ? &dbg->resolve : nullptr);
+  auto validate_timer = std::make_unique<PhaseTimer>(dbg ? &dbg->validate : nullptr);
   for (size_t i = 0; i < n; ++i) {
     if (!RangesTileObject(object_sizes[i], sizes[i], dst_offsets[i])) {
       MORI_UMBP_ERROR("[PoolClient] BatchPutRanges: ranges do not tile key='{}' size={}", keys[i],
@@ -2543,7 +2631,7 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
     route_keys.push_back(keys[i]);
     route_sizes.push_back(object_sizes[i]);
   }
-  resolve_timer.reset();
+  validate_timer.reset();
   if (valid.empty()) return results;
 
   std::vector<std::optional<RoutePutResult>> routes;
@@ -2592,7 +2680,20 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
   }
   {
     PhaseTimer xfer_timer(dbg ? &dbg->xfer : nullptr);
-    ExecuteLocalPutRangesBatch(local_writes, &results, &local_bytes);
+    TransferEngine::StepTiming steps;
+    RangedPhaseSinks sinks;
+    if (dbg != nullptr) {
+      steps = {&dbg->xfer_plan, &dbg->xfer_submit, &dbg->xfer_wait};
+      sinks = {&dbg->resolve, &dbg->classify, &dbg->build, &dbg->commit, &dbg->items, &steps};
+    }
+    ExecuteLocalPutRangesBatch(local_writes, &results, &local_bytes,
+                               dbg != nullptr ? &sinks : nullptr);
+  }
+  if (dbg != nullptr) {
+    // The sub-phases above are all timed inside the xfer window, so xfer alone
+    // is left holding the engine's copy.  Subtract rather than re-time: nesting
+    // is what makes each sub-phase attributable to the call it belongs to.
+    dbg->xfer -= dbg->resolve + dbg->classify + dbg->build + dbg->commit;
   }
   if (remote.empty()) return results;
 

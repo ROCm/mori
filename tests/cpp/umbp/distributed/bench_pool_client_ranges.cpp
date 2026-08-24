@@ -91,11 +91,11 @@
 //
 // Usage:
 //   bench_pool_client_ranges [--ranks N] [--layers N] [--layer-group N]
-//                            [--layer-bytes N] [--pages N] [--requests N]
-//                            [--compute-us-per-layer N] [--offload-ranks N]
-//                            [--ranges-per-call N] [--scratch-mib N]
-//                            [--page-bytes N] [--no-prefetch]
-//                            [--interleave-groups] [--verify]
+//                            [--layer-bytes N] [--pools SPEC] [--pages N]
+//                            [--requests N] [--compute-us-per-layer N]
+//                            [--offload-ranks N] [--ranges-per-call N]
+//                            [--scratch-mib N] [--page-bytes N] [--no-prefetch]
+//                            [--interleave-groups] [--local-only] [--verify]
 //
 // CSV (stdout): one row per rank count in --ranks
 //   ranks,layers,group,pages,object_kib,restore_ms_p50,restore_ms_p95,
@@ -213,6 +213,12 @@ struct BenchOpts {
   // adjacency changes.  This is the adversarial case for any implementation
   // that leans on contiguous layer groups.
   bool interleave_groups = false;
+  // Seed onto the reading node instead of the peer, so every call is served by
+  // the local medium and Phase 2 never runs.  This is the single-machine shape:
+  // a standalone process whose inner backend is distributed but whose keys all
+  // live here.  It isolates the per-key and per-range CPU cost of the
+  // distributed path from anything to do with the wire.
+  bool local_only = false;
   // Check every restored page byte-for-byte after each request.  Off by
   // default because the comparison lands inside the measured window; on, this
   // is the only thing here that proves the numbers above came from correct
@@ -267,7 +273,8 @@ void Usage() {
             << "        [--pools SPEC] [--pages N] [--requests N]\n"
             << "        [--compute-us-per-layer N]\n"
             << "        [--offload-ranks N] [--ranges-per-call N] [--scratch-mib N]\n"
-            << "        [--page-bytes N] [--no-prefetch] [--interleave-groups] [--verify]\n"
+            << "        [--page-bytes N] [--no-prefetch] [--interleave-groups]\n"
+            << "        [--local-only] [--verify]\n"
             << "\n"
             << "  --pools replaces --layers/--layer-bytes with a real model's several\n"
             << "  pools, whose per-layer sizes differ by more than 10x and decide the\n"
@@ -387,6 +394,8 @@ bool ParseArgs(int argc, char** argv, BenchOpts* o) {
       o->locality_prefetch = false;
     } else if (a == "--interleave-groups") {
       o->interleave_groups = true;
+    } else if (a == "--local-only") {
+      o->local_only = true;
     } else if (a == "--verify") {
       o->verify = true;
     } else if (a == "-h" || a == "--help") {
@@ -598,7 +607,9 @@ inline char SeedByte(size_t key_index, size_t offset) {
   return static_cast<char>((offset * 31 + key_index * 131 + 7) & 0xff);
 }
 
-void SeedPeer(PoolClient* peer, const std::vector<std::string>& keys, size_t object_bytes,
+// `target` is the peer by default, which is what makes the reads remote; under
+// --local-only it is the reading node itself, so the same keys resolve locally.
+void SeedInto(PoolClient* target, const std::vector<std::string>& keys, size_t object_bytes,
               std::vector<char>* storage) {
   storage->assign(keys.size() * object_bytes, 0);
   std::vector<const void*> srcs(keys.size());
@@ -608,8 +619,8 @@ void SeedPeer(PoolClient* peer, const std::vector<std::string>& keys, size_t obj
     for (size_t b = 0; b < object_bytes; ++b) slot[b] = SeedByte(i, b);
     srcs[i] = slot;
   }
-  peer->RegisterMemory(storage->data(), storage->size());
-  auto r = peer->BatchPut(keys, srcs, sizes);
+  target->RegisterMemory(storage->data(), storage->size());
+  auto r = target->BatchPut(keys, srcs, sizes);
   for (size_t i = 0; i < keys.size(); ++i) {
     if (!r[i]) {
       std::cerr << "seed put failed for " << keys[i] << "\n";
@@ -831,7 +842,7 @@ void RunLoadRank(Cluster& cluster, const BenchOpts& o,
           const size_t object_bytes = o.pools[pi].object_bytes();
           for (size_t p = 0; p < o.pages; ++p) {
             const char* page = kv[pi].data() + p * object_bytes;
-            // Seeded per pool, so the index must match SeedPeer's ordering.
+            // Seeded per pool, so the index must match SeedInto's ordering.
             const size_t seed_index = req * o.pages + p;
             for (size_t b = 0; b < object_bytes; ++b) {
               if (page[b] != SeedByte(seed_index, b)) {
@@ -918,14 +929,16 @@ void RunOne(const BenchOpts& o, size_t ranks) {
   const size_t offload_ranks = (o.offload_ranks == SIZE_MAX) ? ranks : o.offload_ranks;
   const size_t object_bytes = o.object_bytes();
 
-  // The node must be able to hold one restore working set per rank (that is
-  // what makes groups 2..N local hits), plus slack for offloads routed here.
-  const size_t node_capacity =
-      std::max<size_t>(size_t{256} << 20, ranks * o.pages * object_bytes * 3);
-  // The peer holds every seeded page for every rank and request (+1 warm-up).
-  const size_t peer_capacity =
+  // Whichever client is seeded holds every page for every rank and request
+  // (+1 warm-up); the other only needs a restore working set per rank, which is
+  // what makes groups 2..N local hits, plus slack for offloads routed there.
+  const size_t seeded_capacity =
       std::max<size_t>(size_t{512} << 20,
                        ranks * (o.requests + 1) * o.pages * object_bytes * 2 + (size_t{512} << 20));
+  const size_t reader_capacity =
+      std::max<size_t>(size_t{256} << 20, ranks * o.pages * object_bytes * 3);
+  const size_t node_capacity = o.local_only ? seeded_capacity : reader_capacity;
+  const size_t peer_capacity = o.local_only ? reader_capacity : seeded_capacity;
   // The arena must hold at least one whole object: the remote path stages
   // through it, and an object that does not fit is unservable.  With several
   // pools the largest one sets the floor.
@@ -935,8 +948,10 @@ void RunOne(const BenchOpts& o, size_t ranks) {
                   o.locality_prefetch);
 
   // Seed: each (rank, request) gets its own pages, so the first group of every
-  // request is a real remote miss.  One extra leading request per rank is a
-  // warm-up that pays the peer handshake and is not recorded.
+  // request is a real remote miss -- or, under --local-only, a local hit that
+  // no earlier group warmed.  One extra leading request per rank is a warm-up
+  // that pays the peer handshake and is not recorded.
+  PoolClient* const seed_target = o.local_only ? cluster.node() : cluster.peer();
   constexpr size_t kWarmupRequests = 1;
   const size_t total_requests = o.requests + kWarmupRequests;
   // [rank][request][pool] -> that pool's page keys.  A pool's object holds only
@@ -961,7 +976,7 @@ void RunOne(const BenchOpts& o, size_t ranks) {
       }
     }
     for (size_t pi = 0; pi < o.pools.size(); ++pi) {
-      SeedPeer(cluster.peer(), flat[pi], o.pools[pi].object_bytes(), &seed_storage[r][pi]);
+      SeedInto(seed_target, flat[pi], o.pools[pi].object_bytes(), &seed_storage[r][pi]);
       all_keys.insert(all_keys.end(), flat[pi].begin(), flat[pi].end());
     }
   }
