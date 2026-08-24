@@ -1116,30 +1116,48 @@ bool PoolClient::CopyRangesToContiguous(const std::vector<ObjectRange>& ranges, 
 void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteRequest>& requests,
                                             std::vector<bool>* results) {
   if (requests.empty()) return;
-  if (registry_.Empty()) {
-    MORI_UMBP_ERROR("[PoolClient] Local ranged Put requested but no storage backend is registered");
+  if (default_pool_ == nullptr || registry_.Empty()) {
+    MORI_UMBP_ERROR("[PoolClient] Local ranged Put requested but no default pool is initialized");
     return;
   }
 
+  // Same seam as ExecuteLocalPut. The pool chooses the backend and owns the
+  // placement index, so a ranged write is visible to the placement policy,
+  // watermark offload and tier transitions instead of bypassing all three.
+  std::vector<PoolPlacementRequest> placements;
+  placements.reserve(requests.size());
+  for (const auto& request : requests) {
+    PoolPlacementRequest placement;
+    placement.key = *request.key;
+    placement.size = request.object_size;
+    placement.tier = request.tier;
+    placement.logical_tier = request.logical_tier;
+    placements.push_back(std::move(placement));
+  }
+  auto allocations = default_pool_->BatchAllocate(placements);
+
   struct PendingWrite {
     size_t request_index = 0;
-    MediumBackend* backend = nullptr;
-    uint64_t slot_id = 0;
+    PoolSlotRef slot;
   };
   std::vector<PendingWrite> pending;
+  std::vector<PoolSlotRef> aborts;
   std::vector<TransferItem> items;
   pending.reserve(requests.size());
 
-  for (size_t r = 0; r < requests.size(); ++r) {
+  for (size_t r = 0; r < requests.size() && r < allocations.size(); ++r) {
     const auto& request = requests[r];
-    auto* backend = registry_.Get(request.tier);
+    auto& alloc_res = allocations[r].allocation;
+    const PoolSlotRef slot{allocations[r].backend_id, alloc_res.slot_id};
+    auto* backend = registry_.Get(allocations[r].backend_id);
+    // A medium that publishes no buffer endpoints cannot be filled in-process
+    // at all, so give the slot back rather than holding one we cannot write.
     if (backend == nullptr || backend->BufferCount() == 0) {
+      if (alloc_res.outcome == AllocateOutcome::kSuccessAllocated) aborts.push_back(slot);
       MORI_UMBP_WARN("[PoolClient] Local ranged Put: tier={} has no in-process-addressable backend",
                      static_cast<int>(request.tier));
       continue;
     }
-    auto alloc_res =
-        backend->BatchAllocate({AllocateRequest{*request.key, request.object_size}}).front();
     if (alloc_res.outcome == AllocateOutcome::kSuccessAlreadyExists) {
       (*results)[request.result_index] = true;
       continue;
@@ -1153,25 +1171,37 @@ void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteReq
                                   request.object_size, request.ranges, /*to_backend=*/true,
                                   /*tag=*/r, &items)) {
       items.resize(before);
-      backend->BatchAbort({alloc_res.slot_id});
+      aborts.push_back(slot);
       continue;
     }
-    pending.push_back({r, backend, alloc_res.slot_id});
+    pending.push_back({r, slot});
   }
-  if (pending.empty()) return;
+  if (pending.empty()) {
+    if (!aborts.empty()) default_pool_->BatchAbort(aborts);
+    return;
+  }
 
   std::vector<size_t> failed_tags;
   transfer_engine_->Transfer(items, &failed_tags);
   const std::unordered_set<size_t> failed(failed_tags.begin(), failed_tags.end());
 
+  std::vector<PoolCommitRequest> commits;
+  std::vector<size_t> committed_requests;
+  commits.reserve(pending.size());
+  committed_requests.reserve(pending.size());
   for (const auto& write : pending) {
-    const auto& request = requests[write.request_index];
     if (failed.count(write.request_index) != 0) {
-      write.backend->BatchAbort({write.slot_id});
+      aborts.push_back(write.slot);
       continue;
     }
-    if (!write.backend->BatchCommit({CommitRequest{write.slot_id, *request.key}}).front().success) {
-      write.backend->BatchAbort({write.slot_id});
+    commits.push_back(PoolCommitRequest{write.slot, *requests[write.request_index].key});
+    committed_requests.push_back(write.request_index);
+  }
+  const auto commit_results = default_pool_->BatchCommit(commits);
+  for (size_t c = 0; c < committed_requests.size(); ++c) {
+    const auto& request = requests[committed_requests[c]];
+    if (c >= commit_results.size() || !commit_results[c].commit.success) {
+      aborts.push_back(commits[c].slot);
       continue;
     }
     (*results)[request.result_index] = true;
@@ -1182,6 +1212,7 @@ void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteReq
                                MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL_HELP,
                                {{"traffic", "local"}}, static_cast<double>(request.object_size));
   }
+  if (!aborts.empty()) default_pool_->BatchAbort(aborts);
 }
 
 void PoolClient::MaybeReCacheAfterRemote(const std::string& key, const void* src, size_t size) {
@@ -1891,17 +1922,31 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   std::vector<size_t> local_keys;
   std::vector<size_t> missed;
   missed.reserve(n);
+
+  // Resolve through the pool, in one batch, for the same reason the ranged
+  // write allocates through it: the pool repairs its placement index, records
+  // the read against the logical tier that served it, and applies
+  // promote-on-read. Scanning the registry directly would serve the bytes and
+  // leave every one of those inert.
+  std::vector<size_t> resolve_indices;
+  std::vector<std::string> resolve_keys;
+  resolve_indices.reserve(n);
+  resolve_keys.reserve(n);
   for (size_t i = 0; i < n; ++i) {
     if (sizes[i].empty()) continue;  // asked for nothing; stays false
-
+    resolve_indices.push_back(i);
+    resolve_keys.push_back(keys[i]);
+  }
+  auto pool_resolved = default_pool_ == nullptr
+                           ? std::vector<PoolResolvedEntry>(resolve_keys.size())
+                           : default_pool_->BatchResolve(resolve_keys, /*include_descs=*/true);
+  for (size_t r = 0; r < resolve_indices.size(); ++r) {
+    const size_t i = resolve_indices[r];
     MediumBackend* holder = nullptr;
     ResolvedEntry resolved;
-    for (auto* backend : registry_.All()) {
-      auto candidate = backend->BatchResolve({keys[i]}, /*include_descs=*/false).front();
-      if (!candidate.found) continue;
-      holder = backend;
-      resolved = std::move(candidate);
-      break;
+    if (r < pool_resolved.size() && pool_resolved[r].resolved.found) {
+      holder = registry_.Get(pool_resolved[r].backend_id);
+      resolved = std::move(pool_resolved[r].resolved);
     }
     if (holder == nullptr) {
       missed.push_back(i);
@@ -2122,7 +2167,7 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
     // land where they belong.
     local_writes.push_back({original, &keys[original], object_sizes[original],
                             MakeWriteRanges(srcs[original], sizes[original], dst_offsets[original]),
-                            route.tier});
+                            route.tier, route.logical_tier});
   }
   // One transfer for every locally-routed key in the batch, not one per key.
   ExecuteLocalPutRangesBatch(local_writes, &results);

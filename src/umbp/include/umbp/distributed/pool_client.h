@@ -360,6 +360,7 @@ class PoolClient {
     size_t object_size = 0;
     std::vector<ObjectRange> ranges;
     TierType tier = TierType::UNKNOWN;
+    std::string logical_tier;
   };
 
   // Allocate a slot per request, write the ranges straight into its pages, and

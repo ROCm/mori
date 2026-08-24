@@ -223,6 +223,52 @@ class PoolClientRangesTest : public ::testing::Test {
     ASSERT_EQ(committed.bytes_committed, object.size());
   }
 
+  // Two DRAM instances under a tiered policy whose entry tier is the SECOND
+  // one registered, so selecting by TierType and asking the policy disagree.
+  std::unique_ptr<PoolClient> MakeTieredClient(const std::string& node_id) {
+    PoolClientConfig cfg;
+    cfg.master_config.node_id = node_id;
+    cfg.master_config.node_address = "127.0.0.1";
+    cfg.master_config.master_address = master_address_;
+    cfg.io_engine.host = "0.0.0.0";
+    cfg.io_engine.port = 0;
+    cfg.peer_service_port = FreePort();
+    cfg.dram_page_size = kPageSize;
+    cfg.staging_buffer_size = 1024;
+    tiered_get_scratch_.resize(kScratchSize);
+    tiered_put_scratch_.resize(kScratchSize);
+    cfg.ranged_get_scratch_buffer = tiered_get_scratch_.data();
+    cfg.ranged_get_scratch_size = tiered_get_scratch_.size();
+    cfg.ranged_put_scratch_buffer = tiered_put_scratch_.data();
+    cfg.ranged_put_scratch_size = tiered_put_scratch_.size();
+    cfg.cache_remote_fetches = false;
+
+    BackendInstanceConfig cold;
+    cold.name = "cold";
+    cold.tier = TierType::DRAM;
+    cold.dram.buffer_sizes = {kTargetCapacity};
+    BackendInstanceConfig hot = cold;
+    hot.name = "hot";
+    cfg.backends = {cold, hot};
+
+    cfg.placement_policy = PoolPlacementPolicy::TIERED;
+    LogicalTierConfig hot_tier;
+    hot_tier.name = "hot";
+    hot_tier.members = {{"hot", 1}};
+    hot_tier.entry = true;
+    hot_tier.offload_to = {"cold"};
+    LogicalTierConfig cold_tier;
+    cold_tier.name = "cold";
+    cold_tier.members = {{"cold", 1}};
+    cfg.logical_tiers = {hot_tier, cold_tier};
+
+    auto client = std::make_unique<PoolClient>(std::move(cfg));
+    EXPECT_TRUE(client->Init());
+    EXPECT_TRUE(client->RegisterMemory(tiered_get_scratch_.data(), tiered_get_scratch_.size()));
+    EXPECT_TRUE(client->RegisterMemory(tiered_put_scratch_.data(), tiered_put_scratch_.size()));
+    return client;
+  }
+
   bool WaitForRoute(PoolClient* client, const std::string& key,
                     const std::unordered_set<std::string>& excludes,
                     const std::string& expected_node) {
@@ -248,7 +294,62 @@ class PoolClientRangesTest : public ::testing::Test {
   std::vector<char> caller_put_scratch_;
   std::vector<char> target_get_scratch_;
   std::vector<char> target_put_scratch_;
+  std::vector<char> tiered_get_scratch_;
+  std::vector<char> tiered_put_scratch_;
 };
+
+// ---------------------------------------------------------------------------
+// Ranged I/O must go through the pool, not straight at the backend registry.
+// A tiered policy shows both directions at once: the entry tier is
+// deliberately not the first-registered DRAM instance, so a write that picked
+// a backend by TierType lands on the wrong one, and a read that scanned the
+// registry serves the bytes but leaves the pool's placement index and read
+// accounting empty -- which is what makes watermark offload and
+// promote-on-read inert.
+// ---------------------------------------------------------------------------
+TEST_F(PoolClientRangesTest, LocalRangedIoIsPlacedAndAccountedByThePool) {
+  caller_->Shutdown();
+  target_->Shutdown();
+  auto tiered = MakeTieredClient("ranges-tiered");
+  ASSERT_NE(tiered, nullptr);
+
+  auto* cold = tiered->Backends().Get("cold");
+  auto* hot = tiered->Backends().Get("hot");
+  ASSERT_NE(cold, nullptr);
+  ASSERT_NE(hot, nullptr);
+  // Selecting by TierType would hand back "cold": it is the first DRAM entry.
+  ASSERT_EQ(tiered->Backends().Get(TierType::DRAM), cold);
+
+  const std::string key = "tiered-range-object";
+  std::vector<char> head(1024, 0x41);
+  std::vector<char> tail(kObjectSize - head.size(), 0x42);
+  const std::vector<const void*> srcs = {head.data(), tail.data()};
+  const std::vector<size_t> sizes = {head.size(), tail.size()};
+  const std::vector<size_t> offsets = {0, head.size()};
+  ASSERT_EQ(tiered->BatchPutRanges({key}, {kObjectSize}, {srcs}, {sizes}, {offsets}),
+            std::vector<bool>({true}));
+
+  // Placed where the policy's entry tier says, not where the routed TierType
+  // would have put it.
+  EXPECT_TRUE(hot->Contains(key));
+  EXPECT_FALSE(cold->Contains(key));
+
+  std::vector<char> readback(kObjectSize, 0);
+  const std::vector<void*> dsts = {readback.data()};
+  ASSERT_EQ(tiered->BatchGetRanges({key}, {dsts}, {{kObjectSize}}, {{0}}),
+            std::vector<bool>({true}));
+  EXPECT_EQ(std::memcmp(readback.data(), head.data(), head.size()), 0);
+  EXPECT_EQ(std::memcmp(readback.data() + head.size(), tail.data(), tail.size()), 0);
+
+  // Served through the pool, so the read is attributed to the logical tier
+  // that held the key. A registry scan would leave this map empty.
+  const auto hits = tiered->TierReadHits();
+  const auto hot_hits = hits.find("hot");
+  ASSERT_NE(hot_hits, hits.end());
+  EXPECT_GE(hot_hits->second, 1u);
+
+  tiered->Shutdown();
+}
 
 TEST_F(PoolClientRangesTest, RemoteRoundTripSubBatchesAndInstallsLocally) {
   constexpr size_t kKeys = 2;
