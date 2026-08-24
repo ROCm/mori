@@ -1583,6 +1583,13 @@ void PoolClient::FetchWholeObjectsIntoMedium(std::vector<ReCacheJob>& jobs) {
 }
 
 void PoolClient::ReCacheWorkerLoop() {
+  // Nobody is blocked on this thread.  Its whole purpose is to make LATER calls
+  // faster, so it must not borrow cores from the calls happening NOW -- doing
+  // so cost 63% of TTFL on a remote layer-wise restore at 8 ranks.  Set once
+  // here rather than around each copy: everything this loop does is background
+  // by construction.
+  MarkThreadBackgroundCopies();
+
   // Reused across iterations so a steady stream of prefetches does not
   // reallocate this vector on every batch.
   std::vector<ReCacheJob> prefetch_batch;
