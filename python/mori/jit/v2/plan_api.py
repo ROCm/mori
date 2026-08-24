@@ -66,6 +66,9 @@ DTYPES = {"bf16": 0, "fp32": 1, "byte8": 2}
 
 # Arena regions a caller is allowed not to carry. Everything else missing is a
 # bug in the caller, not a configuration: see the bind loop in make_plan.
+# Keyed by the snake_case region name: the region key comes from the C++ launch
+# argument (offOutScales -> "outScales") while an arena names it "out_scales",
+# so both are folded through _camel_to_snake before being looked up here.
 _OPTIONAL_REGIONS = frozenset({"out_scales"})
 
 # ... and the Request field that makes each of them mandatory again.
@@ -431,13 +434,14 @@ def make_plan(kernel: str) -> type:
                         # over it. Callers that build their own arena and pass a
                         # region_names mapping (aiter's MegaMoE does) are exactly
                         # the ones most able to get this wrong.
-                        if region not in _OPTIONAL_REGIONS:
+                        canon = _camel_to_snake(region)
+                        if canon not in _OPTIONAL_REGIONS:
                             raise
                         # Optional, but not optional for THIS plan: if the Request
                         # field that turns the feature on is set, the kernel will
                         # dereference the offset and a 0 would alias region 0.
                         # Mechanism, not a comment telling callers to be careful.
-                        enabler = _REGION_REQUIRED_WHEN.get(region)
+                        enabler = _REGION_REQUIRED_WHEN.get(canon)
                         if enabler and int(req.get(enabler) or 0):
                             raise KeyError(
                                 f"{kernel}: arena has no region {name!r}, but "
