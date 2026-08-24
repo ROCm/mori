@@ -40,6 +40,11 @@ struct PolicyBackendSpec {
   std::vector<int> devices;
   int numa_node = -1;
   std::string path;
+  // SSD only. The backend's staging arena is staging_slots * page_size, and a
+  // read that cannot claim a slot is reported as a miss rather than as
+  // backpressure, so this is a hard read-concurrency ceiling and not a tuning
+  // hint. 0 leaves BackendInstanceConfig's default.
+  int staging_slots = 0;
 };
 
 struct LogicalTierBackendConfig {
