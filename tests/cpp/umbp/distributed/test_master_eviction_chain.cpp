@@ -8,7 +8,7 @@
 // keys. Nothing joined them, so a break anywhere between "this tier is over its
 // watermark" and "the key moved to the tier below" was invisible.
 //
-// That gap is not hypothetical. offload_trigger=on_evict and promotion_mode=move
+// That gap is not hypothetical. offload_trigger=on_evict and promote_mode=move
 // both do their work inside PeerPool::Evict, whose only production caller is the
 // EvictKey handler the master drives. Measuring them under umbp_tier_bench --
 // which starts no EvictionManager -- reports zero offloads and no reclamation,
@@ -273,7 +273,7 @@ TEST(MasterEvictionChain, TierBelowWatermarkIsLeftAlone) {
   }
 }
 
-// promotion_mode=move deletes the cold copy once a key is promoted, but the
+// promote_mode=move deletes the cold copy once a key is promoted, but the
 // delete races the read lease the triggering read still holds, so it defers: the
 // source parks in draining_sources_ and the promotion reports success. Nothing
 // requeues it, and the one place that drains it is PeerPool::Evict -- so whether
@@ -302,7 +302,7 @@ TEST(MasterEvictionChain, MasterRoundReclaimsTheParkedSourceOfAMovePromotion) {
 
   auto tiers = HotColdOnEvict();
   tiers.back().promote_trigger = PoolPromoteTrigger::kOnRead;
-  tiers.back().promotion_mode = PoolTransitionMode::kMove;
+  tiers.back().promote_mode = PoolTransitionMode::kMove;
   auto compiled = LogicalTierGraph::Compile(tiers, registry);
   ASSERT_TRUE(compiled.ok()) << compiled.error;
   PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
@@ -370,7 +370,7 @@ TEST(MasterEvictionChain, ParkedMoveSourceIsNamedLastAmongColderKeys) {
 
   auto tiers = HotColdOnEvict();
   tiers.back().promote_trigger = PoolPromoteTrigger::kOnRead;
-  tiers.back().promotion_mode = PoolTransitionMode::kMove;
+  tiers.back().promote_mode = PoolTransitionMode::kMove;
   auto compiled = LogicalTierGraph::Compile(tiers, registry);
   ASSERT_TRUE(compiled.ok()) << compiled.error;
   PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);

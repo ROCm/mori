@@ -725,7 +725,7 @@ TEST(PeerPool, ReadPromotesOnlyAfterConfiguredHitCount) {
   EXPECT_TRUE(registry.Get("cold")->Contains("bystander"));
 }
 
-// The move half of promotion_mode, which nothing else covers. Copy leaves the
+// The move half of promote_mode, which nothing else covers. Copy leaves the
 // cold copy behind, so a lost promotion costs nothing; move deletes it, and the
 // promoted copy becomes the only one. That makes two things load-bearing that
 // copy mode never has to get right: the source has to go away (or the tier keeps
@@ -746,7 +746,7 @@ TEST(PeerPool, ReadPromotesWithMoveDrainsSourceAndKeepsBytes) {
 
   auto tiers = HotColdTiers(PoolOffloadTrigger::kOnEvict);
   tiers.back().promote_trigger = PoolPromoteTrigger::kOnRead;
-  tiers.back().promotion_mode = PoolTransitionMode::kMove;
+  tiers.back().promote_mode = PoolTransitionMode::kMove;
   auto compiled = LogicalTierGraph::Compile(tiers, registry);
   ASSERT_TRUE(compiled.ok()) << compiled.error;
   PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);

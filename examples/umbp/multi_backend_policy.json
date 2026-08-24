@@ -49,7 +49,7 @@
         "ssd_b": 100
       },
       "promote_trigger": "on_read",
-      "promotion_mode": "copy"
+      "promote_mode": "copy"
     }
   ]
 }

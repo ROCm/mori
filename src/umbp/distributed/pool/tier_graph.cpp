@@ -104,7 +104,7 @@ LogicalTierGraph::CompileResult LogicalTierGraph::Compile(
     node.low_watermark = tiers[i].low_watermark;
     node.promote_trigger = tiers[i].promote_trigger;
     node.promote_hits = tiers[i].promote_hits;
-    node.promotion_mode = tiers[i].promotion_mode;
+    node.promote_mode = tiers[i].promote_mode;
     for (const auto& member : node.members) {
       const auto* entry = backends.GetEntry(member.backend_name);
       if (entry == nullptr) {

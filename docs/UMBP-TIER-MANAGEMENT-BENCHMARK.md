@@ -80,8 +80,10 @@ retries transient failures with bounded backoff.
 `on_hits` once `promote_hits` reads have been served for that key from this
 tier. `promote_hits` is required by `on_hits`, rejected by the others, and must
 be at least 2 — a threshold of 1 is `on_read`. The entry tier may not declare a
-trigger, having no upstream tier to promote into. `promotion_mode` decides
-whether the promoted key is copied or moved.
+trigger, having no upstream tier to promote into. `promote_mode` decides whether
+the promoted key is copied or moved; under `move` the source tier is reclaimed
+when the master next names that key as an eviction victim, not at promotion time,
+because the delete defers behind the read lease the triggering read holds.
 
 Backend and logical-tier names must be unique, and every backend must belong to
 exactly one logical tier. Offload targets may name a backend or logical tier
