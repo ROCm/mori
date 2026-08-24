@@ -670,7 +670,7 @@ TEST(PeerPool, ReadPromotesColdKeyWithoutDeletingSource) {
   RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kPageSize, 2);
 
   auto tiers = HotColdTiers(PoolOffloadTrigger::kOnEvict);
-  tiers.back().promote_on_read = true;
+  tiers.back().promote_trigger = PoolPromoteTrigger::kOnRead;
   auto compiled = LogicalTierGraph::Compile(tiers, registry);
   ASSERT_TRUE(compiled.ok()) << compiled.error;
   PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
@@ -680,6 +680,121 @@ TEST(PeerPool, ReadPromotesColdKeyWithoutDeletingSource) {
 
   EXPECT_TRUE(WaitForKey(&registry, "hot", "promote"));
   EXPECT_TRUE(registry.Get("cold")->Contains("promote"));
+}
+
+// The on_hits trigger, which is what made promote_trigger a key-value policy
+// rather than a boolean. The threshold has to be counted per key, so one key
+// crossing it must not carry another one along, and the count must not survive
+// the promotion it caused.
+TEST(PeerPool, ReadPromotesOnlyAfterConfiguredHitCount) {
+  constexpr uint64_t kPageSize = 64;
+  constexpr uint32_t kHits = 3;
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kPageSize, 4);
+  RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kPageSize, 4);
+
+  auto tiers = HotColdTiers(PoolOffloadTrigger::kOnEvict);
+  tiers.back().promote_trigger = PoolPromoteTrigger::kOnHits;
+  tiers.back().promote_hits = kHits;
+  auto compiled = LogicalTierGraph::Compile(tiers, registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+
+  CommitKey(&pool, "warm", {}, "cold");
+  CommitKey(&pool, "bystander", {}, "cold");
+
+  // Below the threshold the reads still have to be served, from the cold tier,
+  // while the count builds up.
+  for (uint32_t read = 1; read < kHits; ++read) {
+    ASSERT_TRUE(pool.BatchResolve({"warm"}, false).front().resolved.found) << read;
+  }
+  // Settled first, because promotion is asynchronous: checking straight after
+  // the read would also pass while a wrongly queued promotion was still in
+  // flight, which is the bug this is meant to catch.
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_FALSE(registry.Get("hot")->Contains("warm"))
+      << "promoted after " << kHits - 1 << " reads, below the threshold of " << kHits;
+
+  ASSERT_TRUE(pool.BatchResolve({"warm"}, false).front().resolved.found);
+  EXPECT_TRUE(WaitForKey(&registry, "hot", "warm"));
+
+  // The other cold key was read zero times and must not have been dragged along
+  // by a count kept per tier instead of per key.
+  EXPECT_FALSE(registry.Get("hot")->Contains("bystander"));
+  EXPECT_TRUE(registry.Get("cold")->Contains("bystander"));
+}
+
+// The move half of promotion_mode, which nothing else covers. Copy leaves the
+// cold copy behind, so a lost promotion costs nothing; move deletes it, and the
+// promoted copy becomes the only one. That makes two things load-bearing that
+// copy mode never has to get right: the source has to go away (or the tier keeps
+// paying for a key it no longer serves), and the bytes have to survive the hop
+// (or the delete has destroyed the only copy).
+//
+// The read that triggers the promotion is still holding a lease on the source
+// page while the promotion runs, so the delete cannot land inside the transition
+// itself; the source is parked as draining and the next evict of that key
+// finishes it. Hence the short lease and the explicit evict below.
+TEST(PeerPool, ReadPromotesWithMoveDrainsSourceAndKeepsBytes) {
+  constexpr uint64_t kPageSize = 64;
+  constexpr auto kShortLease = std::chrono::milliseconds(1);
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kPageSize, 2, kShortLease);
+  RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kPageSize, 2, kShortLease);
+
+  auto tiers = HotColdTiers(PoolOffloadTrigger::kOnEvict);
+  tiers.back().promote_trigger = PoolPromoteTrigger::kOnRead;
+  tiers.back().promotion_mode = PoolTransitionMode::kMove;
+  auto compiled = LogicalTierGraph::Compile(tiers, registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+
+  // Placed straight onto cold and written through its own page, so the payload
+  // the promotion has to carry is known rather than incidental.
+  auto request = PutRequest("moved");
+  request.logical_tier = "cold";
+  auto allocation = pool.BatchAllocate({request}).front();
+  ASSERT_EQ(allocation.allocation.outcome, AllocateOutcome::kSuccessAllocated);
+  ASSERT_EQ(allocation.backend_id, registry.BackendId(registry.Get("cold")));
+  auto source_ref = registry.Get("cold")->BufferRef(allocation.allocation.pages[0].buffer_index);
+  ASSERT_TRUE(source_ref.HasHostPtr());
+  const std::string payload(kPageSize, 'm');
+  std::memcpy(static_cast<char*>(source_ref.host_ptr) +
+                  allocation.allocation.pages[0].page_index * kPageSize,
+              payload.data(), payload.size());
+  ASSERT_TRUE(pool.BatchCommit({PoolCommitRequest{
+                                   {allocation.backend_id, allocation.allocation.slot_id},
+                                   "moved"}})
+                  .front()
+                  .commit.success);
+
+  ASSERT_TRUE(pool.BatchResolve({"moved"}, false).front().resolved.found);
+  EXPECT_TRUE(WaitForKey(&registry, "hot", "moved"));
+  EXPECT_EQ(pool.PlacementBackend("moved"),
+            std::optional<uint32_t>{registry.BackendId(registry.Get("hot"))});
+
+  // Past the lease, so the parked source can actually be freed. The evict has to
+  // take the draining source and leave the promoted copy alone, which is the one
+  // way move can lose data outright.
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  pool.Evict({"moved"}, PoolEvictMode::kReclaim);
+  EXPECT_FALSE(registry.Get("cold")->Contains("moved"));
+  EXPECT_EQ(registry.Get("cold")->OwnedKeyCount(), 0u);
+  EXPECT_TRUE(registry.Get("hot")->Contains("moved"));
+  EXPECT_EQ(registry.Get("hot")->OwnedKeyCount(), 1u);
+  EXPECT_EQ(pool.PlacementBackend("moved"),
+            std::optional<uint32_t>{registry.BackendId(registry.Get("hot"))});
+
+  auto resolved = pool.BatchResolve({"moved"}, false).front();
+  ASSERT_TRUE(resolved.resolved.found);
+  auto target_ref = registry.Get("hot")->BufferRef(resolved.resolved.pages[0].buffer_index);
+  ASSERT_TRUE(target_ref.HasHostPtr());
+  EXPECT_EQ(std::string(static_cast<char*>(target_ref.host_ptr) +
+                            resolved.resolved.pages[0].page_index * kPageSize,
+                        payload.size()),
+            payload);
 }
 
 }  // namespace

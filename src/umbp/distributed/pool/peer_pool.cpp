@@ -77,10 +77,31 @@ void PeerPool::TouchLocked(const std::string& key) {
 }
 
 void PeerPool::ForgetAccessLocked(const std::string& key) {
+  promote_hit_counts_.erase(key);
   auto access = last_access_.find(key);
   if (access == last_access_.end()) return;
   access_order_.erase(access->second);
   last_access_.erase(access);
+}
+
+bool PeerPool::PromoteOnReadLocked(const std::string& key,
+                                   LogicalTierGraph::TierIndex source_tier) {
+  const auto& tier = tier_graph_->NodeAt(source_tier);
+  switch (tier.promote_trigger) {
+    case PoolPromoteTrigger::kNever:
+      return false;
+    case PoolPromoteTrigger::kOnRead:
+      return true;
+    case PoolPromoteTrigger::kOnHits: {
+      const uint32_t hits = ++promote_hit_counts_[key];
+      if (hits < tier.promote_hits) return false;
+      // The count has done its job; leaving it behind would promote again on
+      // the next read if this promotion does not move the key.
+      promote_hit_counts_.erase(key);
+      return true;
+    }
+  }
+  return false;
 }
 
 uint32_t PeerPool::FindOwnerLocked(const std::string& key) const {
@@ -576,10 +597,10 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
         ++tier_read_hits_[tier_graph_->NameForBackend(out[i].backend_id)];
         const auto source_tier = tier_graph_->TierIndexForBackendId(out[i].backend_id);
         if (source_tier.has_value() && *source_tier != tier_graph_->EntryTierIndex() &&
-            tier_graph_->NodeAt(*source_tier).promote_on_read &&
             !tier_graph_->AtOrAbove(tier_graph_->EntryTierIndex(),
                                     tier_graph_->NodeAt(tier_graph_->EntryTierIndex())
-                                        .high_watermark)) {
+                                        .high_watermark) &&
+            PromoteOnReadLocked(keys[i], *source_tier)) {
           EnqueueTransition(
               {TierTransitionKind::kPromotion, keys[i], out[i].backend_id, *source_tier});
         }
@@ -711,6 +732,7 @@ void PeerPool::ClearLocal() {
   pending_slots_.clear();
   last_access_.clear();
   access_order_.clear();
+  promote_hit_counts_.clear();
 }
 
 std::vector<KvEvent> PeerPool::DrainPendingEvents() {

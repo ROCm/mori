@@ -73,8 +73,15 @@ destination tier applies its own weights.
 `on_evict` copies the key to the first available target before deleting its
 source copy. `watermark` queues asynchronous LRU offload after aggregate tier
 use reaches `high_watermark`. Migration continues toward `low_watermark` and
-retries transient failures with bounded backoff. `promote_on_read` copies or
-moves a cold hit into the fastest reachable upstream tier.
+retries transient failures with bounded backoff.
+
+`promote_trigger` says when a tier sends a key back up, mirroring
+`offload_trigger`: `never` (the default), `on_read` on the first hit, or
+`on_hits` once `promote_hits` reads have been served for that key from this
+tier. `promote_hits` is required by `on_hits`, rejected by the others, and must
+be at least 2 — a threshold of 1 is `on_read`. The entry tier may not declare a
+trigger, having no upstream tier to promote into. `promotion_mode` decides
+whether the promoted key is copied or moved.
 
 Backend and logical-tier names must be unique, and every backend must belong to
 exactly one logical tier. Offload targets may name a backend or logical tier

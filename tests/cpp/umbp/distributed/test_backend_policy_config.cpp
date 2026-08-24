@@ -62,7 +62,7 @@ TEST(BackendPolicyConfig, ParsesAndLowersShippedExample) {
   EXPECT_DOUBLE_EQ(output.logical_tiers[1].high_watermark, 0.9);
   EXPECT_DOUBLE_EQ(output.logical_tiers[1].low_watermark, 0.7);
 
-  EXPECT_TRUE(output.logical_tiers[2].promote_on_read);
+  EXPECT_EQ(output.logical_tiers[2].promote_trigger, PoolPromoteTrigger::kOnRead);
   EXPECT_EQ(output.logical_tiers[2].promotion_mode, PoolTransitionMode::kCopy);
   EXPECT_TRUE(output.logical_tiers[2].offload_to.empty());
 }
@@ -110,6 +110,110 @@ TEST(BackendPolicyConfig, RejectsInvalidSchemaAndBackwardEdges) {
   )json");
   EXPECT_FALSE(tiny_hbm.ok());
   EXPECT_NE(tiny_hbm.error.find("per-device capacity"), std::string::npos);
+}
+
+// The shipped example only exercises promotion_mode "copy", so nothing pins the
+// other branch of the enum: a policy asking for move would have parsed to copy
+// and silently kept the source tier's copy alive.
+TEST(BackendPolicyConfig, LowersMovePromotionMode) {
+  auto loaded = LoadBackendPolicyJson(R"json(
+    {"backends":{
+       "h":{"type":"dram","capacity":"1GiB"},
+       "c":{"type":"dram","capacity":"1GiB"}},
+     "tiers":[
+       {"backends":{"h":1},"offload_to":["cold"],"offload_trigger":"on_evict","name":"hot"},
+       {"backends":{"c":1},"name":"cold","promote_trigger":"on_read","promotion_mode":"move"}]}
+  )json");
+  ASSERT_TRUE(loaded.ok()) << loaded.error;
+
+  PoolClientConfig output;
+  output.dram_page_size = 64ULL << 10;
+  std::string error;
+  ASSERT_TRUE(ApplyBackendPolicy(*loaded.config, &output, &error)) << error;
+  ASSERT_EQ(output.logical_tiers.size(), 2u);
+  EXPECT_EQ(output.logical_tiers[1].promote_trigger, PoolPromoteTrigger::kOnRead);
+  EXPECT_EQ(output.logical_tiers[1].promotion_mode, PoolTransitionMode::kMove);
+  // The entry tier keeps the default, so one tier asking for move does not
+  // change how the rest of the graph promotes.
+  EXPECT_EQ(output.logical_tiers[0].promotion_mode, PoolTransitionMode::kCopy);
+
+  auto bad = LoadBackendPolicyJson(R"json(
+    {"backends":{"d":{"type":"dram","capacity":"1GiB"}},
+     "tiers":[{"backends":{"d":1},"promotion_mode":"relocate"}]}
+  )json");
+  EXPECT_FALSE(bad.ok());
+}
+
+// promote_trigger is the extension point the promote policy is built on, so the
+// rules that keep one policy from having two spellings are worth pinning: a
+// threshold only where something reads it, never below 2, and never on the
+// entry tier, which has no upstream tier to promote into.
+TEST(BackendPolicyConfig, LowersPromoteTriggerAndRejectsIncoherentThresholds) {
+  auto loaded = LoadBackendPolicyJson(R"json(
+    {"backends":{
+       "h":{"type":"dram","capacity":"1GiB"},
+       "c":{"type":"dram","capacity":"1GiB"}},
+     "tiers":[
+       {"backends":{"h":1},"offload_to":["cold"],"offload_trigger":"watermark","name":"hot"},
+       {"backends":{"c":1},"name":"cold","promote_trigger":"on_hits","promote_hits":4}]}
+  )json");
+  ASSERT_TRUE(loaded.ok()) << loaded.error;
+
+  PoolClientConfig output;
+  output.dram_page_size = 64ULL << 10;
+  std::string error;
+  ASSERT_TRUE(ApplyBackendPolicy(*loaded.config, &output, &error)) << error;
+  ASSERT_EQ(output.logical_tiers.size(), 2u);
+  EXPECT_EQ(output.logical_tiers[1].promote_trigger, PoolPromoteTrigger::kOnHits);
+  EXPECT_EQ(output.logical_tiers[1].promote_hits, 4u);
+  // Absent means never, so a tier says nothing about promotion by saying
+  // nothing rather than by carrying a threshold nothing reads.
+  EXPECT_EQ(output.logical_tiers[0].promote_trigger, PoolPromoteTrigger::kNever);
+  EXPECT_EQ(output.logical_tiers[0].promote_hits, 0u);
+
+  const char* kRejected[] = {
+      // on_hits without a threshold: there is no default worth guessing.
+      R"json({"backends":{"h":{"type":"dram","capacity":"1GiB"},
+              "c":{"type":"dram","capacity":"1GiB"}},
+              "tiers":[{"backends":{"h":1},"offload_to":["cold"],
+                        "offload_trigger":"on_evict","name":"hot"},
+                       {"backends":{"c":1},"name":"cold","promote_trigger":"on_hits"}]})json",
+      // A threshold where nothing reads it is a misconfiguration, not a hint.
+      R"json({"backends":{"h":{"type":"dram","capacity":"1GiB"},
+              "c":{"type":"dram","capacity":"1GiB"}},
+              "tiers":[{"backends":{"h":1},"offload_to":["cold"],
+                        "offload_trigger":"on_evict","name":"hot"},
+                       {"backends":{"c":1},"name":"cold","promote_trigger":"on_read",
+                        "promote_hits":3}]})json",
+      // 1 hit is on_read spelled a second way.
+      R"json({"backends":{"h":{"type":"dram","capacity":"1GiB"},
+              "c":{"type":"dram","capacity":"1GiB"}},
+              "tiers":[{"backends":{"h":1},"offload_to":["cold"],
+                        "offload_trigger":"on_evict","name":"hot"},
+                       {"backends":{"c":1},"name":"cold","promote_trigger":"on_hits",
+                        "promote_hits":1}]})json",
+      // The entry tier has nowhere to promote to; today this is silently dead
+      // config because the read path skips it.
+      R"json({"backends":{"h":{"type":"dram","capacity":"1GiB"},
+              "c":{"type":"dram","capacity":"1GiB"}},
+              "entry_tier":"hot",
+              "tiers":[{"backends":{"h":1},"offload_to":["cold"],
+                        "offload_trigger":"on_evict","name":"hot",
+                        "promote_trigger":"on_read"},
+                       {"backends":{"c":1},"name":"cold"}]})json",
+      // Unknown enumerator, so a typo cannot read as "never".
+      R"json({"backends":{"d":{"type":"dram","capacity":"1GiB"}},
+              "tiers":[{"backends":{"d":1},"promote_trigger":"on_every_read"}]})json",
+      // The old boolean must not keep working, or policies keep using it.
+      R"json({"backends":{"h":{"type":"dram","capacity":"1GiB"},
+              "c":{"type":"dram","capacity":"1GiB"}},
+              "tiers":[{"backends":{"h":1},"offload_to":["cold"],
+                        "offload_trigger":"on_evict","name":"hot"},
+                       {"backends":{"c":1},"name":"cold","promote_on_read":true}]})json",
+  };
+  for (const char* json : kRejected) {
+    EXPECT_FALSE(LoadBackendPolicyJson(json).ok()) << json;
+  }
 }
 
 TEST(BackendPolicyConfig, ApplyIsAtomicWhenLoweringFails) {

@@ -106,13 +106,6 @@ double AsNumber(const Value& value, const std::string& context) {
   return value.number_value();
 }
 
-bool AsBool(const Value& value, const std::string& context) {
-  if (value.kind_case() != Value::kBoolValue) {
-    Invalid(context + ": expected boolean, got " + ValueTypeName(value));
-  }
-  return value.bool_value();
-}
-
 template <typename Enum>
 Enum AsEnum(const Value& value, const std::string& context,
             std::initializer_list<std::pair<std::string_view, Enum>> allowed) {
@@ -231,7 +224,7 @@ LogicalTierConfig ParseLogicalTier(const Value& value, size_t index) {
   RejectUnknownFields(object,
                       {"name", "backends", "placement_policy", "offload_to",
                        "offload_trigger", "high_watermark", "low_watermark",
-                       "promote_on_read", "promotion_mode"},
+                       "promote_trigger", "promote_hits", "promotion_mode"},
                       context);
 
   LogicalTierConfig tier;
@@ -284,8 +277,24 @@ LogicalTierConfig ParseLogicalTier(const Value& value, size_t index) {
   if (const Value* low = OptionalField(object, "low_watermark")) {
     tier.low_watermark = AsNumber(*low, context + ".low_watermark");
   }
-  if (const Value* promote = OptionalField(object, "promote_on_read")) {
-    tier.promote_on_read = AsBool(*promote, context + ".promote_on_read");
+  if (const Value* promote = OptionalField(object, "promote_trigger")) {
+    tier.promote_trigger = AsEnum<PoolPromoteTrigger>(
+        *promote, context + ".promote_trigger",
+        {{"never", PoolPromoteTrigger::kNever},
+         {"on_read", PoolPromoteTrigger::kOnRead},
+         {"on_hits", PoolPromoteTrigger::kOnHits}});
+  }
+  // A hit threshold has no meaningful default, so accepting it where nothing
+  // reads it would hide the misconfiguration instead of reporting it. The
+  // watermark fields above are lenient because they do have defaults.
+  if (const Value* hits = OptionalField(object, "promote_hits")) {
+    if (tier.promote_trigger != PoolPromoteTrigger::kOnHits) {
+      Invalid(context + ".promote_hits: only valid when promote_trigger is 'on_hits'");
+    }
+    tier.promote_hits =
+        static_cast<uint32_t>(AsInt(*hits, 2, context + ".promote_hits"));
+  } else if (tier.promote_trigger == PoolPromoteTrigger::kOnHits) {
+    Invalid(context + ": promote_hits is required when promote_trigger is 'on_hits'");
   }
   if (const Value* mode = OptionalField(object, "promotion_mode")) {
     tier.promotion_mode = AsEnum<PoolTransitionMode>(*mode, context + ".promotion_mode",
@@ -293,6 +302,19 @@ LogicalTierConfig ParseLogicalTier(const Value& value, size_t index) {
                                                       {"move", PoolTransitionMode::kMove}});
   }
   return tier;
+}
+
+// Promotion moves a key upstream and the entry tier has no upstream, so a
+// trigger declared there can never fire: the read path tests the same condition
+// and skips it. Checked wherever the entry tier is finally known, because
+// naming it in `entry_tier` can move it after the per-tier pass.
+std::string RejectEntryTierPromotion(const std::vector<LogicalTierConfig>& tiers,
+                                     size_t entry_tier, const std::string& name) {
+  if (entry_tier >= tiers.size() ||
+      tiers[entry_tier].promote_trigger == PoolPromoteTrigger::kNever) {
+    return {};
+  }
+  return "logical tier '" + name + "': the entry tier has no upstream tier to promote into";
 }
 
 // The single definition of a well formed policy. The JSON front end and
@@ -364,6 +386,11 @@ LogicalTierIndex ValidateBackendPolicy(const BackendPolicyConfig& policy) {
               "' but a different logical tier is flagged as the entry tier");
     }
     index.entry_tier = named->second;
+    if (const std::string error = RejectEntryTierPromotion(
+            policy.logical_tiers, index.entry_tier, index.names[index.entry_tier]);
+        !error.empty()) {
+      Invalid(error);
+    }
   }
   return index;
 }
@@ -445,6 +472,23 @@ std::string IndexLogicalTiers(const std::vector<LogicalTierConfig>& tiers,
         tier.trigger != PoolOffloadTrigger::kWatermark) {
       return context + ": unsupported offload trigger";
     }
+    switch (tier.promote_trigger) {
+      case PoolPromoteTrigger::kNever:
+      case PoolPromoteTrigger::kOnRead:
+        if (tier.promote_hits != 0) {
+          return context + ": promote_hits is only meaningful for the 'on_hits' trigger";
+        }
+        break;
+      case PoolPromoteTrigger::kOnHits:
+        // 1 would be the on_read trigger under another name, and one policy
+        // meaning two things is how the two drift apart.
+        if (tier.promote_hits < 2) {
+          return context + ": promote_hits must be at least 2";
+        }
+        break;
+      default:
+        return context + ": unsupported promote trigger";
+    }
     if (tier.members.empty()) return context + ": must have at least one backend";
     for (const auto& member : tier.members) {
       if (member.backend_name.empty()) return context + ": backend names must not be empty";
@@ -477,7 +521,8 @@ std::string IndexLogicalTiers(const std::vector<LogicalTierConfig>& tiers,
       if (seen.insert(resolved).second) index->offload_to[i].push_back(resolved);
     }
   }
-  return {};
+  return RejectEntryTierPromotion(tiers, index->entry_tier,
+                                  index->names[index->entry_tier]);
 }
 
 BackendPolicyLoadResult LoadBackendPolicyJson(std::string_view json) {
@@ -596,7 +641,8 @@ bool ApplyBackendPolicy(const BackendPolicyConfig& policy, PoolClientConfig* con
       lowered.low_watermark = source.low_watermark;
       lowered.name = index.names[tier_index];
       lowered.entry = tier_index == index.entry_tier;
-      lowered.promote_on_read = source.promote_on_read;
+      lowered.promote_trigger = source.promote_trigger;
+      lowered.promote_hits = source.promote_hits;
       lowered.promotion_mode = source.promotion_mode;
       for (const auto& member : source.members) {
         const auto& names = expansions.at(member.backend_name);

@@ -122,6 +122,10 @@ class PeerPool {
   void StopTransitionWorker();
   void TouchLocked(const std::string& key);
   void ForgetAccessLocked(const std::string& key);
+  // Whether this read should promote the key out of `source_tier`, per that
+  // tier's trigger. Counts the read for an kOnHits tier, so it must only be
+  // called once per served read and only when a promotion could actually run.
+  bool PromoteOnReadLocked(const std::string& key, LogicalTierGraph::TierIndex source_tier);
   // Backend that currently holds the key, or kMaxBackends. The placement index
   // is process-local and can be stale or empty (after a restart, or once
   // another path evicted the key), so the backends are the authority.
@@ -167,6 +171,11 @@ class PeerPool {
   std::unordered_map<std::string, PendingPlacement> pending_keys_;
   std::map<std::pair<uint32_t, uint64_t>, std::string> pending_slots_;
   std::unordered_map<std::string, uint64_t> last_access_;
+  // Reads served for a key from a tier whose trigger is kOnHits. Separate from
+  // last_access_, which is an LRU stamp and carries no count. Cleared when the
+  // promotion is queued and whenever the key leaves the access index, so it
+  // cannot outlive the key it counts for.
+  std::unordered_map<std::string, uint32_t> promote_hit_counts_;
   // Reverse index of last_access_, so the least recently used key is the first
   // element rather than the result of sorting every placement.
   std::map<uint64_t, std::string> access_order_;
