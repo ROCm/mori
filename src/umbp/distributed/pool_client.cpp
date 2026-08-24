@@ -1368,8 +1368,7 @@ void PoolClient::MaybeInstallCompleteArenaObject(const std::string& key, const v
   const auto installed = ExecuteLocalPut(key, arena_slice, object_size, medium_);
   if (installed != PutAttemptOutcome::kSuccess &&
       installed != PutAttemptOutcome::kSuccessAlreadyExists) {
-    master_client_->AddCounter(MORI_UMBP_METRIC_RANGED_REMOTE_INSTALL_FAILURES_TOTAL,
-                               MORI_UMBP_METRIC_RANGED_REMOTE_INSTALL_FAILURES_TOTAL_HELP, {}, 1.0);
+    NoteRangedInstallFailure();
   }
 }
 
@@ -1482,24 +1481,32 @@ void PoolClient::FetchWholeObjectsIntoMedium(std::vector<ReCacheJob>& jobs) {
 
   std::vector<CommitRequest> commits;
   std::vector<uint64_t> aborts;
-  std::vector<size_t> commit_index;
   commits.reserve(planned.size());
+  // Everything this pass wanted but could not plan -- no slot, or a slot that
+  // is not one addressable run -- already failed to become local.
+  size_t not_installed = wanted.size() - planned.size();
   for (size_t i = 0; i < planned.size(); ++i) {
     auto& alloc = allocs[planned[i]];
     if (!fetched[i]) {
       aborts.push_back(alloc.slot_id);
+      ++not_installed;
       continue;
     }
     commits.push_back(CommitRequest{alloc.slot_id, jobs[wanted[planned[i]]].key});
-    commit_index.push_back(i);
   }
   if (!commits.empty()) {
     const auto results = backend->BatchCommit(commits);
     for (size_t c = 0; c < results.size(); ++c) {
-      if (!results[c].success) aborts.push_back(commits[c].slot_id);
+      if (!results[c].success) {
+        aborts.push_back(commits[c].slot_id);
+        ++not_installed;
+      }
     }
   }
   if (!aborts.empty()) backend->BatchAbort(aborts);
+  // Reported in one go rather than per key: this is a background pass, and the
+  // counter is there to say how much locality is being lost, not to trace it.
+  NoteRangedInstallFailure(not_installed);
 }
 
 void PoolClient::ReCacheWorkerLoop() {
@@ -2789,6 +2796,7 @@ std::vector<PoolClient::RangeFetchUnit> PoolClient::ServeWholeObjectUnitsFromMed
         contiguous ? backend->BufferRef(alloc.pages.front().buffer_index) : TransferRef{};
     if (!contiguous || !slot_buffer.Valid() || !slot_buffer.HasHostPtr()) {
       backend->BatchAbort({alloc.slot_id});
+      NoteRangedInstallFailure();  // the arena will still serve it, but not cache it
       leftover.push_back(std::move(unit));
       continue;
     }
@@ -2843,9 +2851,14 @@ std::vector<PoolClient::RangeFetchUnit> PoolClient::ServeWholeObjectUnitsFromMed
   }
   if (!commits.empty()) {
     const auto committed = backend->BatchCommit(commits);
+    size_t refused = 0;
     for (size_t c = 0; c < committed.size(); ++c) {
-      if (!committed[c].success) aborts.push_back(commits[c].slot_id);
+      if (!committed[c].success) {
+        aborts.push_back(commits[c].slot_id);
+        ++refused;
+      }
     }
+    NoteRangedInstallFailure(refused);
   }
   if (!aborts.empty()) backend->BatchAbort(aborts);
   return leftover;
@@ -2914,10 +2927,16 @@ void PoolClient::ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector
     }
   };
 
+  ExecuteRemoteBatchGetPlan(plan, results, recache_remote, run_local);
+}
+
+void PoolClient::ExecuteRemoteBatchGetPlan(const BatchGetPlan& plan, std::vector<bool>* results,
+                                           bool recache_remote,
+                                           const std::function<void()>& in_flight_window) {
   // Submit every peer (posted, not waited) to overlap wire time across peers,
-  // run local reads in that window, then wait all.  On early/exceptional exit
-  // the engine handle's destructor drains in-flight statuses (lifetime safety);
-  // the wait loop does failure mapping + backfill.
+  // run whatever the caller wants overlapped in that window, then wait all.  On
+  // early/exceptional exit the engine handle's destructor drains in-flight
+  // statuses (lifetime safety); the wait loop does failure mapping + backfill.
   //
   // As in Put, there is no all-zero-copy / all-staging fork any more: staging
   // lives in the engine's bounce pool and a plan that needs it settles inside
@@ -2927,18 +2946,15 @@ void PoolClient::ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector
   for (const auto& [node_id, items] : plan.remote_groups) {
     if (auto f = SubmitRemoteBatchGet(items, results)) inflights.push_back(std::move(f));
   }
-  run_local();
+  if (in_flight_window) in_flight_window();
   for (auto& f : inflights) WaitRemoteBatchGet(*f, results, recache_remote);
 }
 
-void PoolClient::ExecuteRemoteBatchGetPlan(const BatchGetPlan& plan, std::vector<bool>* results,
-                                           bool recache_remote) {
-  std::vector<std::unique_ptr<RemoteGetInFlight>> inflights;
-  inflights.reserve(plan.remote_groups.size());
-  for (const auto& [node_id, items] : plan.remote_groups) {
-    if (auto f = SubmitRemoteBatchGet(items, results)) inflights.push_back(std::move(f));
-  }
-  for (auto& f : inflights) WaitRemoteBatchGet(*f, results, recache_remote);
+void PoolClient::NoteRangedInstallFailure(size_t count) {
+  if (count == 0) return;
+  master_client_->AddCounter(MORI_UMBP_METRIC_RANGED_REMOTE_INSTALL_FAILURES_TOTAL,
+                             MORI_UMBP_METRIC_RANGED_REMOTE_INSTALL_FAILURES_TOTAL_HELP, {},
+                             static_cast<double>(count));
 }
 
 std::unique_ptr<PoolClient::RemoteGetInFlight> PoolClient::SubmitRemoteBatchGet(

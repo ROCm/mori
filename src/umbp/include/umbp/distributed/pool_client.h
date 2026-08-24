@@ -25,6 +25,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -581,8 +582,18 @@ class PoolClient {
   // construction (BatchGetRanges filters unroutable and self-routed keys out
   // before building it), so threading the keys/dsts/sizes the local half needs
   // would only pass three vectors nothing reads.
+  // `in_flight_window`, when set, runs after every peer has been posted and
+  // before any of them is waited on -- which is where local reads belong, so
+  // they overlap the wire instead of following it.  A ranged plan has no local
+  // half by construction and passes nothing.
   void ExecuteRemoteBatchGetPlan(const BatchGetPlan& plan, std::vector<bool>* results,
-                                 bool recache_remote);
+                                 bool recache_remote,
+                                 const std::function<void()>& in_flight_window = {});
+  // One place to say "this key was fetched but did not become local".  Every
+  // way that can happen -- no slot, a slot that cannot be addressed as one run,
+  // a refused commit, a background pull that never landed -- reports here, so
+  // the counter measures the feature rather than one branch of it.
+  void NoteRangedInstallFailure(size_t count = 1);
 
   // One key's share of one arena round: the spans to fetch, where they land in
   // the slice, and the caller buffers they are copied out to.  A key needs more
