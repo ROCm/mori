@@ -63,9 +63,9 @@ from mori.ir.triton import cco
 
 @triton.jit
 def lsa_copy(dev_comm, win, peer: tl.constexpr, N: tl.constexpr):
-    me = cco.devcomm_lsa_rank(dev_comm)
-    src_addr = cco.lsa_ptr(win, me, 0)
-    dst_addr = cco.lsa_ptr(win, peer, 0)
+    me = cco.DevComm.lsa_rank(dev_comm)
+    src_addr = cco.Window.lsa_ptr(win, me, 0)
+    dst_addr = cco.Window.lsa_ptr(win, peer, 0)
     src = src_addr.to(tl.pointer_type(tl.uint32), bitcast=True)
     dst = dst_addr.to(tl.pointer_type(tl.uint32), bitcast=True)
     offs = tl.arange(0, N)
@@ -79,6 +79,11 @@ lsa_copy[(1,)](
     extern_libs=cco.get_extern_libs(),
 )
 ```
+
+`DevComm`, `Window`, `Gda`, and `Sdma` are compile-time namespace facades with
+method names matching the FlyDSL handles. Triton still passes raw scalar handles
+explicitly, for example `cco.Gda.put(dev_comm, peer, ...)`; the original flat
+functions remain available for ABI-level or generated code.
 
 The flat CCO functions mirror the monomorphized C symbols. Examples:
 

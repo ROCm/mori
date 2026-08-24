@@ -39,6 +39,27 @@ def test_all_cco_device_symbols_are_exported_to_triton():
     assert all(meta["ret"] != "void" for meta in CCO_DEVICE_FUNCTIONS.values())
 
 
+def test_triton_facades_match_flydsl_handle_names():
+    assert {"rank", "world_size", "lsa_rank", "lsa_size"} <= set(
+        vars(cco.DevComm)
+    )
+    assert {"lsa_ptr"} <= set(vars(cco.Window))
+    assert {
+        "put",
+        "put_value",
+        "get",
+        "signal",
+        "read_signal",
+        "reset_signal",
+        "wait_signal",
+        "flush",
+        "flush_peer",
+    } <= set(vars(cco.Gda))
+    assert {"put", "get", "commit", "quiet", "quiet_queue"} <= set(
+        vars(cco.Sdma)
+    )
+
+
 def test_cov5_bitcode_contains_every_enabled_wrapper_symbol():
     bitcode = find_cco_bitcode(cov=5)
     cfg = detect_build_config()

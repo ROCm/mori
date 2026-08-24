@@ -110,10 +110,10 @@ def read_u64(ptr):
 
 @triton.jit
 def query_kernel(dev_comm, out):
-    tl.store(out + 0, cco.devcomm_rank(dev_comm))
-    tl.store(out + 1, cco.devcomm_world_size(dev_comm))
-    tl.store(out + 2, cco.devcomm_lsa_rank(dev_comm))
-    tl.store(out + 3, cco.devcomm_lsa_size(dev_comm))
+    tl.store(out + 0, cco.DevComm.rank(dev_comm))
+    tl.store(out + 1, cco.DevComm.world_size(dev_comm))
+    tl.store(out + 2, cco.DevComm.lsa_rank(dev_comm))
+    tl.store(out + 3, cco.DevComm.lsa_size(dev_comm))
 
 
 @triton.jit
@@ -128,9 +128,9 @@ def lsa_put_kernel(
 ):
     offs = tl.arange(0, block)
     mask = offs < n_elements
-    my_lsa_rank = cco.devcomm_lsa_rank(dev_comm)
-    src_addr = cco.lsa_ptr(window, my_lsa_rank, src_off)
-    dst_addr = cco.lsa_ptr(window, dst_lsa_rank, dst_off)
+    my_lsa_rank = cco.DevComm.lsa_rank(dev_comm)
+    src_addr = cco.Window.lsa_ptr(window, my_lsa_rank, src_off)
+    dst_addr = cco.Window.lsa_ptr(window, dst_lsa_rank, dst_off)
     src = src_addr.to(tl.pointer_type(tl.uint32), bitcast=True)
     dst = dst_addr.to(tl.pointer_type(tl.uint32), bitcast=True)
     tl.store(dst + offs, tl.load(src + offs, mask=mask), mask=mask)
@@ -149,49 +149,38 @@ def sdma_put_variant_kernel(
 ):
     # mode: 0=quiet, 1=quiet_queue, 2=no-signal + signaled drain,
     #       3=aggregate + commit + quiet_queue.
-    flags = 1 if mode == 3 else 0
-    if scope == 0:
-        if mode == 2:
-            cco.sdma_put_thread_ns(
-                dev_comm, peer, window, dst_off, window, src_off, nbytes, 0, 0
-            )
-        cco.sdma_put_thread(
-            dev_comm, peer, window, dst_off, window, src_off, nbytes, 0, flags
+    if mode == 2:
+        cco.Sdma.put(
+            dev_comm,
+            peer,
+            window,
+            dst_off,
+            window,
+            src_off,
+            nbytes,
+            0,
+            coop=scope,
+            signal=False,
         )
-        if mode == 3:
-            cco.sdma_commit_thread(dev_comm, peer, 0)
-        if mode == 0 or mode == 2:
-            cco.sdma_quiet_thread(dev_comm, peer)
-        else:
-            cco.sdma_quiet_queue(dev_comm, peer, 0)
-    elif scope == 1:
-        if mode == 2:
-            cco.sdma_put_warp_ns(
-                dev_comm, peer, window, dst_off, window, src_off, nbytes, 0, 0
-            )
-        cco.sdma_put_warp(
-            dev_comm, peer, window, dst_off, window, src_off, nbytes, 0, flags
-        )
-        if mode == 3:
-            cco.sdma_commit_warp(dev_comm, peer, 0)
-        if mode == 0 or mode == 2:
-            cco.sdma_quiet_warp(dev_comm, peer)
-        else:
-            cco.sdma_quiet_queue(dev_comm, peer, 0)
+    cco.Sdma.put(
+        dev_comm,
+        peer,
+        window,
+        dst_off,
+        window,
+        src_off,
+        nbytes,
+        0,
+        coop=scope,
+        signal=True,
+        aggregate=mode == 3,
+    )
+    if mode == 3:
+        cco.Sdma.commit(dev_comm, peer, 0, coop=scope)
+    if mode == 0 or mode == 2:
+        cco.Sdma.quiet(dev_comm, peer, coop=scope)
     else:
-        if mode == 2:
-            cco.sdma_put_block_ns(
-                dev_comm, peer, window, dst_off, window, src_off, nbytes, 0, 0
-            )
-        cco.sdma_put_block(
-            dev_comm, peer, window, dst_off, window, src_off, nbytes, 0, flags
-        )
-        if mode == 3:
-            cco.sdma_commit_block(dev_comm, peer, 0)
-        if mode == 0 or mode == 2:
-            cco.sdma_quiet_block(dev_comm, peer)
-        else:
-            cco.sdma_quiet_queue(dev_comm, peer, 0)
+        cco.Sdma.quiet_queue(dev_comm, peer, 0)
 
 
 @triton.jit
@@ -203,10 +192,18 @@ def sdma_get_kernel(
     src_off: tl.constexpr,
     nbytes: tl.constexpr,
 ):
-    cco.sdma_get_block(
-        dev_comm, peer, window, dst_off, window, src_off, nbytes, 0, 0
+    cco.Sdma.get(
+        dev_comm,
+        peer,
+        window,
+        dst_off,
+        window,
+        src_off,
+        nbytes,
+        0,
+        coop=cco.CoopScope.BLOCK,
     )
-    cco.sdma_quiet_block(dev_comm, peer)
+    cco.Sdma.quiet(dev_comm, peer, coop=cco.CoopScope.BLOCK)
 
 
 @triton.jit
@@ -222,149 +219,91 @@ def gda_put_variant_kernel(
     signal_id: tl.constexpr,
     do_wait: tl.constexpr,
 ):
+    signal_val = 1 if signal_op == cco.SignalOp.ADD else 0
     if tc == 0:
-        if signal_op == 0:
-            cco.gda_put_it_none(
-                dev_comm, 0, peer, window, dst_off, window, src_off, nbytes, 0, 0
-            )
-        elif signal_op == 1:
-            cco.gda_put_it_inc(
-                dev_comm,
-                0,
-                peer,
-                window,
-                dst_off,
-                window,
-                src_off,
-                nbytes,
-                signal_id,
-                0,
-            )
-        else:
-            cco.gda_put_it_add(
-                dev_comm,
-                0,
-                peer,
-                window,
-                dst_off,
-                window,
-                src_off,
-                nbytes,
-                signal_id,
-                1,
-            )
+        cco.Gda.put(
+            dev_comm,
+            peer,
+            window,
+            dst_off,
+            window,
+            src_off,
+            nbytes,
+            signal_op=signal_op,
+            signal_id=signal_id,
+            signal_val=signal_val,
+            coop=cco.CoopScope.THREAD,
+            thread_mode=cco.ThreadMode.INDEPENDENT,
+        )
     elif tc == 1:
-        if signal_op == 0:
-            cco.gda_put_iw_none(
-                dev_comm, 0, peer, window, dst_off, window, src_off, nbytes, 0, 0
-            )
-        elif signal_op == 1:
-            cco.gda_put_iw_inc(
-                dev_comm,
-                0,
-                peer,
-                window,
-                dst_off,
-                window,
-                src_off,
-                nbytes,
-                signal_id,
-                0,
-            )
-        else:
-            cco.gda_put_iw_add(
-                dev_comm,
-                0,
-                peer,
-                window,
-                dst_off,
-                window,
-                src_off,
-                nbytes,
-                signal_id,
-                1,
-            )
+        cco.Gda.put(
+            dev_comm,
+            peer,
+            window,
+            dst_off,
+            window,
+            src_off,
+            nbytes,
+            signal_op=signal_op,
+            signal_id=signal_id,
+            signal_val=signal_val,
+            coop=cco.CoopScope.WARP,
+            thread_mode=cco.ThreadMode.INDEPENDENT,
+        )
     elif tc == 2:
-        if signal_op == 0:
-            cco.gda_put_ib_none(
-                dev_comm, 0, peer, window, dst_off, window, src_off, nbytes, 0, 0
-            )
-        elif signal_op == 1:
-            cco.gda_put_ib_inc(
-                dev_comm,
-                0,
-                peer,
-                window,
-                dst_off,
-                window,
-                src_off,
-                nbytes,
-                signal_id,
-                0,
-            )
-        else:
-            cco.gda_put_ib_add(
-                dev_comm,
-                0,
-                peer,
-                window,
-                dst_off,
-                window,
-                src_off,
-                nbytes,
-                signal_id,
-                1,
-            )
+        cco.Gda.put(
+            dev_comm,
+            peer,
+            window,
+            dst_off,
+            window,
+            src_off,
+            nbytes,
+            signal_op=signal_op,
+            signal_id=signal_id,
+            signal_val=signal_val,
+            coop=cco.CoopScope.BLOCK,
+            thread_mode=cco.ThreadMode.INDEPENDENT,
+        )
     else:
-        if signal_op == 0:
-            cco.gda_put_at_none(
-                dev_comm, 0, peer, window, dst_off, window, src_off, nbytes, 0, 0
-            )
-        elif signal_op == 1:
-            cco.gda_put_at_inc(
-                dev_comm,
-                0,
-                peer,
-                window,
-                dst_off,
-                window,
-                src_off,
-                nbytes,
-                signal_id,
-                0,
-            )
-        else:
-            cco.gda_put_at_add(
-                dev_comm,
-                0,
-                peer,
-                window,
-                dst_off,
-                window,
-                src_off,
-                nbytes,
-                signal_id,
-                1,
-            )
-
+        cco.Gda.put(
+            dev_comm,
+            peer,
+            window,
+            dst_off,
+            window,
+            src_off,
+            nbytes,
+            signal_op=signal_op,
+            signal_id=signal_id,
+            signal_val=signal_val,
+            coop=cco.CoopScope.THREAD,
+            thread_mode=cco.ThreadMode.AGGREGATE,
+        )
     if tc == 1:
         if signal_op == 0:
-            cco.gda_flush_warp(dev_comm, 0)
+            cco.Gda.flush(dev_comm, coop=cco.CoopScope.WARP)
         else:
-            cco.gda_flush_peer_warp(dev_comm, 0, peer)
+            cco.Gda.flush_peer(dev_comm, peer, coop=cco.CoopScope.WARP)
     else:
         if signal_op == 0:
-            cco.gda_flush_block(dev_comm, 0)
+            cco.Gda.flush(dev_comm, coop=cco.CoopScope.BLOCK)
         else:
-            cco.gda_flush_peer_block(dev_comm, 0, peer)
+            cco.Gda.flush_peer(dev_comm, peer, coop=cco.CoopScope.BLOCK)
 
     if signal_op != 0 and do_wait:
-        if tc == 0 or tc == 3:
-            cco.gda_wait_signal_thread(dev_comm, 0, signal_id, 1, 64)
-        elif tc == 1:
-            cco.gda_wait_signal_warp(dev_comm, 0, signal_id, 1, 64)
+        if tc == 1:
+            cco.Gda.wait_signal(
+                dev_comm, signal_id, 1, coop=cco.CoopScope.WARP
+            )
+        elif tc == 2:
+            cco.Gda.wait_signal(
+                dev_comm, signal_id, 1, coop=cco.CoopScope.BLOCK
+            )
         else:
-            cco.gda_wait_signal_block(dev_comm, 0, signal_id, 1, 64)
+            cco.Gda.wait_signal(
+                dev_comm, signal_id, 1, coop=cco.CoopScope.THREAD
+            )
 
 
 @triton.jit
@@ -378,25 +317,57 @@ def gda_get_variant_kernel(
     tc: tl.constexpr,
 ):
     if tc == 0:
-        cco.gda_get_it(
-            dev_comm, 0, peer, window, src_off, window, dst_off, nbytes
+        cco.Gda.get(
+            dev_comm,
+            peer,
+            window,
+            src_off,
+            window,
+            dst_off,
+            nbytes,
+            coop=cco.CoopScope.THREAD,
+            thread_mode=cco.ThreadMode.INDEPENDENT,
         )
-        cco.gda_flush_warp(dev_comm, 0)
+        cco.Gda.flush(dev_comm, coop=cco.CoopScope.THREAD)
     elif tc == 1:
-        cco.gda_get_iw(
-            dev_comm, 0, peer, window, src_off, window, dst_off, nbytes
+        cco.Gda.get(
+            dev_comm,
+            peer,
+            window,
+            src_off,
+            window,
+            dst_off,
+            nbytes,
+            coop=cco.CoopScope.WARP,
+            thread_mode=cco.ThreadMode.INDEPENDENT,
         )
-        cco.gda_flush_peer_warp(dev_comm, 0, peer)
+        cco.Gda.flush_peer(dev_comm, peer, coop=cco.CoopScope.WARP)
     elif tc == 2:
-        cco.gda_get_ib(
-            dev_comm, 0, peer, window, src_off, window, dst_off, nbytes
+        cco.Gda.get(
+            dev_comm,
+            peer,
+            window,
+            src_off,
+            window,
+            dst_off,
+            nbytes,
+            coop=cco.CoopScope.BLOCK,
+            thread_mode=cco.ThreadMode.INDEPENDENT,
         )
-        cco.gda_flush_block(dev_comm, 0)
+        cco.Gda.flush(dev_comm, coop=cco.CoopScope.BLOCK)
     else:
-        cco.gda_get_at(
-            dev_comm, 0, peer, window, src_off, window, dst_off, nbytes
+        cco.Gda.get(
+            dev_comm,
+            peer,
+            window,
+            src_off,
+            window,
+            dst_off,
+            nbytes,
+            coop=cco.CoopScope.THREAD,
+            thread_mode=cco.ThreadMode.AGGREGATE,
         )
-        cco.gda_flush_peer_block(dev_comm, 0, peer)
+        cco.Gda.flush_peer(dev_comm, peer, coop=cco.CoopScope.THREAD)
 
 
 @triton.jit
@@ -410,65 +381,67 @@ def gda_put_value_variant_kernel(
     signal_op: tl.constexpr,
     signal_id: tl.constexpr,
 ):
+    signal_val = 1 if signal_op == cco.SignalOp.ADD else 0
     if tc == 0:
-        if signal_op == 0:
-            cco.gda_put_value_it_none(
-                dev_comm, 0, peer, window, dst_off, value, 0, 0
-            )
-        elif signal_op == 1:
-            cco.gda_put_value_it_inc(
-                dev_comm, 0, peer, window, dst_off, value, signal_id, 0
-            )
-        else:
-            cco.gda_put_value_it_add(
-                dev_comm, 0, peer, window, dst_off, value, signal_id, 1
-            )
+        cco.Gda.put_value(
+            dev_comm,
+            peer,
+            window,
+            dst_off,
+            value,
+            signal_op=signal_op,
+            signal_id=signal_id,
+            signal_val=signal_val,
+            coop=cco.CoopScope.THREAD,
+            thread_mode=cco.ThreadMode.INDEPENDENT,
+        )
+        cco.Gda.flush_peer(dev_comm, peer, coop=cco.CoopScope.THREAD)
     elif tc == 1:
-        if signal_op == 0:
-            cco.gda_put_value_iw_none(
-                dev_comm, 0, peer, window, dst_off, value, 0, 0
-            )
-        elif signal_op == 1:
-            cco.gda_put_value_iw_inc(
-                dev_comm, 0, peer, window, dst_off, value, signal_id, 0
-            )
-        else:
-            cco.gda_put_value_iw_add(
-                dev_comm, 0, peer, window, dst_off, value, signal_id, 1
-            )
+        cco.Gda.put_value(
+            dev_comm,
+            peer,
+            window,
+            dst_off,
+            value,
+            signal_op=signal_op,
+            signal_id=signal_id,
+            signal_val=signal_val,
+            coop=cco.CoopScope.WARP,
+            thread_mode=cco.ThreadMode.INDEPENDENT,
+        )
+        cco.Gda.flush_peer(dev_comm, peer, coop=cco.CoopScope.WARP)
     elif tc == 2:
-        if signal_op == 0:
-            cco.gda_put_value_ib_none(
-                dev_comm, 0, peer, window, dst_off, value, 0, 0
-            )
-        elif signal_op == 1:
-            cco.gda_put_value_ib_inc(
-                dev_comm, 0, peer, window, dst_off, value, signal_id, 0
-            )
-        else:
-            cco.gda_put_value_ib_add(
-                dev_comm, 0, peer, window, dst_off, value, signal_id, 1
-            )
+        cco.Gda.put_value(
+            dev_comm,
+            peer,
+            window,
+            dst_off,
+            value,
+            signal_op=signal_op,
+            signal_id=signal_id,
+            signal_val=signal_val,
+            coop=cco.CoopScope.BLOCK,
+            thread_mode=cco.ThreadMode.INDEPENDENT,
+        )
+        cco.Gda.flush_peer(dev_comm, peer, coop=cco.CoopScope.BLOCK)
     else:
-        if signal_op == 0:
-            cco.gda_put_value_at_none(
-                dev_comm, 0, peer, window, dst_off, value, 0, 0
-            )
-        elif signal_op == 1:
-            cco.gda_put_value_at_inc(
-                dev_comm, 0, peer, window, dst_off, value, signal_id, 0
-            )
-        else:
-            cco.gda_put_value_at_add(
-                dev_comm, 0, peer, window, dst_off, value, signal_id, 1
-            )
-
-    if tc == 1:
-        cco.gda_flush_peer_warp(dev_comm, 0, peer)
-    else:
-        cco.gda_flush_peer_block(dev_comm, 0, peer)
+        cco.Gda.put_value(
+            dev_comm,
+            peer,
+            window,
+            dst_off,
+            value,
+            signal_op=signal_op,
+            signal_id=signal_id,
+            signal_val=signal_val,
+            coop=cco.CoopScope.THREAD,
+            thread_mode=cco.ThreadMode.AGGREGATE,
+        )
+        cco.Gda.flush_peer(dev_comm, peer, coop=cco.CoopScope.THREAD)
     if signal_op != 0:
-        cco.gda_wait_signal_block(dev_comm, 0, signal_id, 1, 64)
+        cco.Gda.wait_signal(
+            dev_comm, signal_id, 1, coop=cco.CoopScope.BLOCK
+        )
 
 
 @triton.jit
@@ -481,38 +454,19 @@ def gda_signal_variant_kernel(
     signal_value: tl.constexpr,
     out,
 ):
-    if scope == 0:
-        if signal_op == 1:
-            cco.gda_signal_thread_inc(dev_comm, 0, peer, signal_id, 0)
-        else:
-            cco.gda_signal_thread_add(
-                dev_comm, 0, peer, signal_id, signal_value
-            )
-        cco.gda_flush_peer_warp(dev_comm, 0, peer)
-        cco.gda_wait_signal_thread(
-            dev_comm, 0, signal_id, signal_value, 64
-        )
-    elif scope == 1:
-        if signal_op == 1:
-            cco.gda_signal_warp_inc(dev_comm, 0, peer, signal_id, 0)
-        else:
-            cco.gda_signal_warp_add(
-                dev_comm, 0, peer, signal_id, signal_value
-            )
-        cco.gda_flush_peer_warp(dev_comm, 0, peer)
-        cco.gda_wait_signal_warp(dev_comm, 0, signal_id, signal_value, 64)
-    else:
-        if signal_op == 1:
-            cco.gda_signal_block_inc(dev_comm, 0, peer, signal_id, 0)
-        else:
-            cco.gda_signal_block_add(
-                dev_comm, 0, peer, signal_id, signal_value
-            )
-        cco.gda_flush_peer_block(dev_comm, 0, peer)
-        cco.gda_wait_signal_block(
-            dev_comm, 0, signal_id, signal_value, 64
-        )
-    tl.store(out, cco.gda_read_signal(dev_comm, 0, signal_id, 64))
+    cco.Gda.signal(
+        dev_comm,
+        peer,
+        signal_op=signal_op,
+        signal_id=signal_id,
+        signal_val=signal_value,
+        coop=scope,
+    )
+    cco.Gda.flush_peer(dev_comm, peer, coop=scope)
+    cco.Gda.wait_signal(
+        dev_comm, signal_id, signal_value, coop=scope
+    )
+    tl.store(out, cco.Gda.read_signal(dev_comm, signal_id))
 
 
 @triton.jit
@@ -520,7 +474,7 @@ def gda_reset_signal_kernel(
     dev_comm,
     signal_id: tl.constexpr,
 ):
-    cco.gda_reset_signal(dev_comm, 0, signal_id)
+    cco.Gda.reset_signal(dev_comm, signal_id)
 
 
 @triton.jit
@@ -529,7 +483,7 @@ def gda_read_signal_kernel(
     signal_id: tl.constexpr,
     out,
 ):
-    tl.store(out, cco.gda_read_signal(dev_comm, 0, signal_id, 64))
+    tl.store(out, cco.Gda.read_signal(dev_comm, signal_id))
 
 
 def setup_distributed():

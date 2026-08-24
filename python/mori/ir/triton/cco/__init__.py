@@ -27,14 +27,22 @@ Example::
 
     @triton.jit
     def kernel(dev_comm, window):
-        rank = cco.devcomm_lsa_rank(dev_comm)
-        peer_ptr = cco.lsa_ptr(window, rank, 0)
+        rank = cco.DevComm.lsa_rank(dev_comm)
+        peer_ptr = cco.Window.lsa_ptr(window, rank, 0)
 
     kernel[(1,)](dc.ptr, win.handle, extern_libs=cco.get_extern_libs())
 """
 
 from .ops import *  # noqa: F401,F403
 from .ops import __all__ as _ops_all
+from .handles import DevComm, Window, Gda, Sdma
 from .runtime import get_extern_libs, get_cco_extern_libs
 
-__all__ = _ops_all + ["get_extern_libs", "get_cco_extern_libs"]
+__all__ = _ops_all + [
+    "DevComm",
+    "Window",
+    "Gda",
+    "Sdma",
+    "get_extern_libs",
+    "get_cco_extern_libs",
+]
