@@ -146,6 +146,36 @@ inline uint16_t NextPeerServicePort() {
   return next.fetch_add(1);
 }
 
+// One KV pool: the layers it holds and how many bytes each occupies in a page.
+//
+// A model does not have one uniform pool.  DeepSeek-V4 splits its layers across
+// six, and their per-layer sizes span more than an order of magnitude
+// (37,440 B for the c4 pool, 8,448 for its indexer, 1,728 for c128).  That
+// spread is the point: achieved bandwidth on this path is dominated by fragment
+// size, measured at 5.4 GB/s at 1,728 B against 37.5 GB/s at 37,440 B, so a
+// single --layer-bytes picks one point on a 7x curve and any change that helps
+// small fragments specifically is mis-measured by it.
+//
+// `layers` are logical layer numbers, because pools interleave: DeepSeek-V4's
+// c4 and c128 alternate down the stack, so which pools a layer group touches
+// depends on their actual positions and not just their counts.
+struct Pool {
+  std::string name;
+  std::vector<size_t> layers;
+  size_t layer_bytes = 0;
+
+  size_t object_bytes() const { return layers.size() * layer_bytes; }
+  // Position of a logical layer inside the object, or npos.  The object packs
+  // the pool's own layers back to back, so this is an index into `layers`, not
+  // the logical number -- the twin of DevicePoolEntry.layer_mapping.
+  size_t IndexOf(size_t logical_layer) const {
+    for (size_t i = 0; i < layers.size(); ++i) {
+      if (layers[i] == logical_layer) return i;
+    }
+    return SIZE_MAX;
+  }
+};
+
 struct BenchOpts {
   // Concurrency: one load thread + one offload thread per rank, all sharing one
   // PoolClient (topology 3's node-level server).
@@ -162,6 +192,11 @@ struct BenchOpts {
   size_t pages = 64;                  // pages (objects) restored per request
   size_t requests = 3;                // requests per rank
   size_t compute_us_per_layer = 150;  // simulated forward compute
+
+  // Empty unless --pools was given, in which case it replaces the single
+  // implied pool above.  Resolve() fills it either way so the rest of the
+  // bench only ever reads this.
+  std::vector<Pool> pools;
 
   // Client-side budgets that shape the call pattern.
   size_t ranges_per_call = 8192;  // UMBP_RANGES_PER_CALL
@@ -184,18 +219,68 @@ struct BenchOpts {
   // reads and not from a fast wrong answer.
   bool verify = false;
 
-  size_t object_bytes() const { return layers * layer_bytes; }
+  // Turn --layers/--layer-bytes into a one-pool list when --pools was not
+  // given, so a command line that worked before this option existed still
+  // describes exactly the same workload.
+  void Resolve() {
+    if (pools.empty()) {
+      Pool single;
+      single.name = "kv";
+      single.layer_bytes = layer_bytes;
+      single.layers.resize(layers);
+      for (size_t l = 0; l < layers; ++l) single.layers[l] = l;
+      pools.push_back(std::move(single));
+    }
+    layers = 0;
+    for (const Pool& pool : pools) {
+      for (size_t l : pool.layers) layers = std::max(layers, l + 1);
+    }
+    if (layers == 0) layers = 1;
+  }
+
+  // Bytes of one page across every pool -- the whole KV footprint of a token
+  // page, which is what a restore has to move.
+  size_t object_bytes() const {
+    size_t total = 0;
+    for (const Pool& pool : pools) total += pool.object_bytes();
+    return total;
+  }
   size_t group_count() const { return (layers + layer_group - 1) / layer_group; }
-  size_t group_bytes() const { return layer_group * layer_bytes; }
-  size_t medium_page_bytes() const { return page_bytes != 0 ? page_bytes : object_bytes(); }
+  // Bytes one layer group moves, summed over the pools that group touches.
+  // With heterogeneous pools this varies by group, so it is the mean.
+  size_t group_bytes() const {
+    const size_t groups = group_count();
+    return groups > 0 ? object_bytes() / groups : object_bytes();
+  }
+  // Largest single object, which is what the scratch arena must be able to hold.
+  size_t max_object_bytes() const {
+    size_t most = 0;
+    for (const Pool& pool : pools) most = std::max(most, pool.object_bytes());
+    return most;
+  }
+  size_t medium_page_bytes() const { return page_bytes != 0 ? page_bytes : max_object_bytes(); }
 };
 
 void Usage() {
   std::cerr << "Usage: bench_pool_client_ranges [--ranks 1,2,4,8]\n"
             << "        [--layers N] [--layer-group N] [--layer-bytes N]\n"
-            << "        [--pages N] [--requests N] [--compute-us-per-layer N]\n"
+            << "        [--pools SPEC] [--pages N] [--requests N]\n"
+            << "        [--compute-us-per-layer N]\n"
             << "        [--offload-ranks N] [--ranges-per-call N] [--scratch-mib N]\n"
-            << "        [--page-bytes N] [--no-prefetch] [--interleave-groups] [--verify]\n";
+            << "        [--page-bytes N] [--no-prefetch] [--interleave-groups] [--verify]\n"
+            << "\n"
+            << "  --pools replaces --layers/--layer-bytes with a real model's several\n"
+            << "  pools, whose per-layer sizes differ by more than 10x and decide the\n"
+            << "  achieved bandwidth.  Semicolon separated, each entry:\n"
+            << "      name:layer_count:layer_bytes[:first/stride | :l1,l2,l3,...]\n"
+            << "  The last field places the pool's layers in the stack (default 0,1,2..),\n"
+            << "  which is what decides the layer groups a pool appears in.  Use the\n"
+            << "  explicit list when the layers are not an arithmetic progression.\n"
+            << "  DeepSeek-V4-Pro, from its config's compress_ratios:\n"
+            << "      --pools "
+               "'c4:30:37440:2/2;c4_indexer:30:8448:2/"
+               "2;c128:31:1728:0,1,3,5,7,9,11,13,15,17,19,21,23,25,27,29,31,33,35,37,39,41,43,45,"
+               "47,49,51,53,55,57,59'\n";
 }
 
 std::vector<size_t> ParseList(const std::string& s) {
@@ -206,6 +291,62 @@ std::vector<size_t> ParseList(const std::string& s) {
     if (!tok.empty()) out.push_back(std::strtoull(tok.c_str(), nullptr, 10));
   }
   return out;
+}
+
+// "name:count:bytes[:first/stride]" entries separated by ';'.
+std::vector<Pool> ParsePools(const std::string& spec) {
+  std::vector<Pool> pools;
+  std::stringstream entries(spec);
+  std::string entry;
+  while (std::getline(entries, entry, ';')) {
+    if (entry.empty()) continue;
+    std::vector<std::string> field;
+    std::stringstream fields(entry);
+    std::string tok;
+    while (std::getline(fields, tok, ':')) field.push_back(tok);
+    if (field.size() < 3 || field.size() > 4) {
+      std::cerr << "--pools: expected name:count:bytes[:first/stride], got '" << entry << "'\n";
+      std::exit(2);
+    }
+    Pool pool;
+    pool.name = field[0];
+    const size_t count = std::strtoull(field[1].c_str(), nullptr, 10);
+    pool.layer_bytes = std::strtoull(field[2].c_str(), nullptr, 10);
+    if (count == 0 || pool.layer_bytes == 0) {
+      std::cerr << "--pools: count and bytes must be non-zero in '" << entry << "'\n";
+      std::exit(2);
+    }
+    if (field.size() == 3) {
+      pool.layers.reserve(count);
+      for (size_t i = 0; i < count; ++i) pool.layers.push_back(i);
+    } else if (field[3].find('/') != std::string::npos) {
+      const size_t slash = field[3].find('/');
+      const size_t first = std::strtoull(field[3].substr(0, slash).c_str(), nullptr, 10);
+      const size_t stride = std::strtoull(field[3].substr(slash + 1).c_str(), nullptr, 10);
+      if (stride == 0) {
+        std::cerr << "--pools: stride must be non-zero in '" << entry << "'\n";
+        std::exit(2);
+      }
+      pool.layers.reserve(count);
+      for (size_t i = 0; i < count; ++i) pool.layers.push_back(first + i * stride);
+    } else {
+      // Explicit list.  Needed because real pools are not always an arithmetic
+      // progression: DeepSeek-V4's c128 holds layers 0,1,3,5,...,59 -- the
+      // first two adjacent, the rest every other one.
+      pool.layers = ParseList(field[3]);
+      if (pool.layers.size() != count) {
+        std::cerr << "--pools: '" << pool.name << "' declares " << count << " layers but lists "
+                  << pool.layers.size() << "\n";
+        std::exit(2);
+      }
+    }
+    pools.push_back(std::move(pool));
+  }
+  if (pools.empty()) {
+    std::cerr << "--pools: no pools parsed from '" << spec << "'\n";
+    std::exit(2);
+  }
+  return pools;
 }
 
 bool ParseArgs(int argc, char** argv, BenchOpts* o) {
@@ -226,6 +367,8 @@ bool ParseArgs(int argc, char** argv, BenchOpts* o) {
       o->layer_group = std::strtoull(next("--layer-group"), nullptr, 10);
     } else if (a == "--layer-bytes") {
       o->layer_bytes = std::strtoull(next("--layer-bytes"), nullptr, 10);
+    } else if (a == "--pools") {
+      o->pools = ParsePools(next("--pools"));
     } else if (a == "--pages") {
       o->pages = std::strtoull(next("--pages"), nullptr, 10);
     } else if (a == "--requests") {
@@ -258,10 +401,13 @@ bool ParseArgs(int argc, char** argv, BenchOpts* o) {
   if (o->rank_sweep.empty()) o->rank_sweep = {1, 2, 4, 8};
   if (o->layer_group == 0) o->layer_group = 1;
   if (o->layers == 0) o->layers = 1;
+  o->Resolve();
   return true;
 }
 
-// Layers covered by group `g`, mirroring _layer_groups().
+// Layers covered by group `g`, mirroring _layer_groups().  These are logical
+// layer numbers spanning the whole stack; which pools they reach is a separate
+// question answered by PoolGroupLayers.
 //
 // With --interleave-groups the same layers are dealt round-robin instead, so
 // every group still covers its share of the object but its ranges are strided
@@ -274,6 +420,19 @@ std::vector<size_t> GroupLayers(const BenchOpts& o, size_t g) {
   }
   const size_t start = g * o.layer_group;
   for (size_t l = start; l < std::min(start + o.layer_group, o.layers); ++l) out.push_back(l);
+  return out;
+}
+
+// Where this pool's own layers sit inside a group: object-relative indices, not
+// logical numbers.  Empty when the group misses the pool entirely, which is how
+// interleaved pools end up issuing calls on different groups -- the twin of
+// _plans_covering() skipping a plan.
+std::vector<size_t> PoolGroupLayers(const Pool& pool, const std::vector<size_t>& group) {
+  std::vector<size_t> out;
+  for (size_t logical : group) {
+    const size_t index = pool.IndexOf(logical);
+    if (index != SIZE_MAX) out.push_back(index);
+  }
   return out;
 }
 
@@ -514,6 +673,21 @@ struct RankStats {
                                  // this request had already fetched remotely
   size_t local_write_bytes = 0;  // objects that ended up installed on this node
   size_t verify_mismatches = 0;  // pages that came back wrong (--verify only)
+  // Per pool, indexed as BenchOpts::pools.  Kept apart from the totals because
+  // the totals cannot show the thing heterogeneous pools exist to expose: a
+  // pool with a tenth the range size moves its bytes at a fraction of the rate,
+  // and only a per-pool split says which pool a change actually helped.
+  std::vector<size_t> pool_bytes;
+  std::vector<size_t> pool_ranges;
+  std::vector<size_t> pool_calls;
+  std::vector<size_t> pool_remote_keys;
+
+  void Init(size_t pools) {
+    pool_bytes.assign(pools, 0);
+    pool_ranges.assign(pools, 0);
+    pool_calls.assign(pools, 0);
+    pool_remote_keys.assign(pools, 0);
+  }
   // Measured window for this rank, so aggregate throughput excludes warm-up.
   std::chrono::steady_clock::time_point window_start{};
   std::chrono::steady_clock::time_point window_end{};
@@ -525,13 +699,17 @@ struct RankStats {
 // restore on a fresh client also pays the peer handshake, which a long-lived
 // connector has already paid.
 void RunLoadRank(Cluster& cluster, const BenchOpts& o,
-                 const std::vector<std::vector<std::string>>& request_keys, size_t warmup_requests,
-                 std::atomic<size_t>* warmed_ranks, RankStats* stats) {
+                 const std::vector<std::vector<std::vector<std::string>>>& request_keys,
+                 size_t warmup_requests, std::atomic<size_t>* warmed_ranks, RankStats* stats) {
   PoolClient* client = cluster.node();
 
-  // Destination for one request's pages, registered once for zero copy.
-  std::vector<char> kv(o.pages * o.object_bytes(), 0);
-  client->RegisterMemory(kv.data(), kv.size());
+  // Destination for one request's pages, one buffer per pool because a pool's
+  // pages are only contiguous among themselves.  Registered once for zero copy.
+  std::vector<std::vector<char>> kv(o.pools.size());
+  for (size_t p = 0; p < o.pools.size(); ++p) {
+    kv[p].assign(o.pages * o.pools[p].object_bytes(), 0);
+    client->RegisterMemory(kv[p].data(), kv[p].size());
+  }
 
   for (size_t req = 0; req < request_keys.size(); ++req) {
     const bool measured = req >= warmup_requests;
@@ -539,7 +717,7 @@ void RunLoadRank(Cluster& cluster, const BenchOpts& o,
       stats->window_start = std::chrono::steady_clock::now();
       warmed_ranks->fetch_add(1, std::memory_order_relaxed);
     }
-    const std::vector<std::string>& keys = request_keys[req];
+    const std::vector<std::vector<std::string>>& pool_keys = request_keys[req];
     LayerGate gate;
     const size_t groups = o.group_count();
     // Keys this request has already pulled from the peer once.  A second remote
@@ -551,50 +729,62 @@ void RunLoadRank(Cluster& cluster, const BenchOpts& o,
 
     std::thread loader([&] {
       for (size_t g = 0; g < groups; ++g) {
-        const std::vector<size_t> layers = GroupLayers(o, g);
-        if (layers.empty()) {
-          gate.Complete(g + 1);
-          continue;
-        }
-        // Every page carries one range per layer in this group.
-        const size_t step = EntriesPerCall(o, layers.size());
+        const std::vector<size_t> group = GroupLayers(o, g);
         bool ok = true;
-        for (size_t start = 0; start < keys.size() && ok; start += step) {
-          const size_t end = std::min(start + step, keys.size());
-          const size_t count = end - start;
+        // Each pool this group reaches issues its own calls, at its own range
+        // size -- the loop _run_layer_wise_batch runs over _plans_covering.
+        for (size_t pi = 0; pi < o.pools.size() && ok; ++pi) {
+          const Pool& pool = o.pools[pi];
+          const std::vector<size_t> layers = PoolGroupLayers(pool, group);
+          if (layers.empty()) continue;
+          const std::vector<std::string>& keys = pool_keys[pi];
+          // Every page carries one range per layer of this pool in this group.
+          const size_t step = EntriesPerCall(o, layers.size());
+          for (size_t start = 0; start < keys.size() && ok; start += step) {
+            const size_t end = std::min(start + step, keys.size());
+            const size_t count = end - start;
 
-          std::vector<std::string> chunk_keys(keys.begin() + start, keys.begin() + end);
-          std::vector<std::vector<void*>> dsts(count);
-          std::vector<std::vector<size_t>> sizes(count);
-          std::vector<std::vector<size_t>> offsets(count);
-          for (size_t i = 0; i < count; ++i) {
-            char* page = kv.data() + (start + i) * o.object_bytes();
-            for (size_t l : layers) {
-              dsts[i].push_back(page + l * o.layer_bytes);
-              sizes[i].push_back(o.layer_bytes);
-              offsets[i].push_back(l * o.layer_bytes);
+            std::vector<std::string> chunk_keys(keys.begin() + start, keys.begin() + end);
+            std::vector<std::vector<void*>> dsts(count);
+            std::vector<std::vector<size_t>> sizes(count);
+            std::vector<std::vector<size_t>> offsets(count);
+            for (size_t i = 0; i < count; ++i) {
+              char* page = kv[pi].data() + (start + i) * pool.object_bytes();
+              for (size_t l : layers) {
+                dsts[i].push_back(page + l * pool.layer_bytes);
+                sizes[i].push_back(pool.layer_bytes);
+                offsets[i].push_back(l * pool.layer_bytes);
+              }
             }
-          }
 
-          // Whether this call can be served without the arena at all.
-          const bool all_local = AllLocallyResident(client, chunk_keys);
+            // Whether this call can be served without the arena at all.
+            const bool all_local = AllLocallyResident(client, chunk_keys);
 
-          auto res = client->BatchGetRanges(chunk_keys, dsts, sizes, offsets);
-          ok = res.size() == count && std::all_of(res.begin(), res.end(), [](bool b) { return b; });
+            auto res = client->BatchGetRanges(chunk_keys, dsts, sizes, offsets);
+            ok = res.size() == count &&
+                 std::all_of(res.begin(), res.end(), [](bool b) { return b; });
 
-          if (measured) {
-            stats->get_calls += 1;
-            if (all_local) stats->get_calls_local += 1;
-            if (ok) stats->get_bytes += count * layers.size() * o.layer_bytes;
-          }
-          if (!all_local) {
-            for (const auto& k : chunk_keys) {
-              const bool again = !pulled_remote.insert(k).second;
-              if (measured && again) stats->repeat_remote += 1;
-            }
             if (measured) {
-              stats->remote_calls += 1;
-              stats->remote_keys += count;
+              stats->get_calls += 1;
+              if (all_local) stats->get_calls_local += 1;
+              if (ok) {
+                const size_t moved = count * layers.size() * pool.layer_bytes;
+                stats->get_bytes += moved;
+                stats->pool_bytes[pi] += moved;
+                stats->pool_ranges[pi] += count * layers.size();
+                stats->pool_calls[pi] += 1;
+              }
+            }
+            if (!all_local) {
+              for (const auto& k : chunk_keys) {
+                const bool again = !pulled_remote.insert(k).second;
+                if (measured && again) stats->repeat_remote += 1;
+              }
+              if (measured) {
+                stats->remote_calls += 1;
+                stats->remote_keys += count;
+                stats->pool_remote_keys[pi] += count;
+              }
             }
           }
         }
@@ -637,13 +827,17 @@ void RunLoadRank(Cluster& cluster, const BenchOpts& o,
       // inside the throughput window, so --verify runs are for correctness and
       // the timing runs are separate.
       if (o.verify) {
-        for (size_t p = 0; p < o.pages; ++p) {
-          const char* page = kv.data() + p * o.object_bytes();
-          const size_t seed_index = req * o.pages + p;
-          for (size_t b = 0; b < o.object_bytes(); ++b) {
-            if (page[b] != SeedByte(seed_index, b)) {
-              stats->verify_mismatches += 1;
-              break;
+        for (size_t pi = 0; pi < o.pools.size(); ++pi) {
+          const size_t object_bytes = o.pools[pi].object_bytes();
+          for (size_t p = 0; p < o.pages; ++p) {
+            const char* page = kv[pi].data() + p * object_bytes;
+            // Seeded per pool, so the index must match SeedPeer's ordering.
+            const size_t seed_index = req * o.pages + p;
+            for (size_t b = 0; b < object_bytes; ++b) {
+              if (page[b] != SeedByte(seed_index, b)) {
+                stats->verify_mismatches += 1;
+                break;
+              }
             }
           }
         }
@@ -653,8 +847,10 @@ void RunLoadRank(Cluster& cluster, const BenchOpts& o,
       // Counted after the load so an asynchronous install has had the whole
       // request to land; it is still a lower bound if one lands later.
       if (auto* backend = client->Backends().Get(client->Medium())) {
-        for (const auto& entry : backend->BatchResolve(keys, /*include_descs=*/false)) {
-          if (entry.found) stats->local_write_bytes += o.object_bytes();
+        for (size_t pi = 0; pi < o.pools.size(); ++pi) {
+          for (const auto& entry : backend->BatchResolve(pool_keys[pi], /*include_descs=*/false)) {
+            if (entry.found) stats->local_write_bytes += o.pools[pi].object_bytes();
+          }
         }
       }
     }
@@ -667,45 +863,52 @@ void RunOffloadRank(Cluster& cluster, const BenchOpts& o, size_t rank,
                     const std::atomic<bool>& stop, const std::atomic<size_t>& warmed_ranks,
                     size_t load_ranks, RankStats* stats) {
   PoolClient* client = cluster.node();
-  std::vector<char> kv(o.pages * o.object_bytes(), 0);
-  for (size_t i = 0; i < kv.size(); ++i) kv[i] = static_cast<char>((i + rank) & 0xff);
-  client->RegisterMemory(kv.data(), kv.size());
-
-  // A put names every layer of the page at once: its ranges must tile the
-  // object exactly, so offload never walks groups.
-  std::vector<size_t> all_layers(o.layers);
-  for (size_t l = 0; l < o.layers; ++l) all_layers[l] = l;
-  const size_t step = EntriesPerCall(o, o.layers);
+  // One buffer per pool, mirroring the load side.
+  std::vector<std::vector<char>> kv(o.pools.size());
+  for (size_t pi = 0; pi < o.pools.size(); ++pi) {
+    kv[pi].assign(o.pages * o.pools[pi].object_bytes(), 0);
+    for (size_t i = 0; i < kv[pi].size(); ++i)
+      kv[pi][i] = static_cast<char>((i + rank + pi) & 0xff);
+    client->RegisterMemory(kv[pi].data(), kv[pi].size());
+  }
 
   for (size_t round = 0; !stop.load(std::memory_order_relaxed); ++round) {
-    for (size_t start = 0; start < o.pages && !stop.load(std::memory_order_relaxed);
-         start += step) {
-      const size_t end = std::min(start + step, o.pages);
-      const size_t count = end - start;
+    for (size_t pi = 0; pi < o.pools.size() && !stop.load(std::memory_order_relaxed); ++pi) {
+      const Pool& pool = o.pools[pi];
+      const size_t object_bytes = pool.object_bytes();
+      // A put names every layer of the page at once: its ranges must tile the
+      // object exactly, so offload never walks groups.
+      const size_t step = EntriesPerCall(o, pool.layers.size());
 
-      std::vector<std::string> chunk_keys(count);
-      std::vector<size_t> object_sizes(count, o.object_bytes());
-      std::vector<std::vector<const void*>> srcs(count);
-      std::vector<std::vector<size_t>> sizes(count);
-      std::vector<std::vector<size_t>> offsets(count);
-      for (size_t i = 0; i < count; ++i) {
-        // Fresh key every time: a repeat would be short-circuited by RoutePut's
-        // dedup and never reach the data path.
-        chunk_keys[i] = "off-r" + std::to_string(rank) + "-" + std::to_string(round) + "-" +
-                        std::to_string(start + i);
-        char* page = kv.data() + (start + i) * o.object_bytes();
-        for (size_t l : all_layers) {
-          srcs[i].push_back(page + l * o.layer_bytes);
-          sizes[i].push_back(o.layer_bytes);
-          offsets[i].push_back(l * o.layer_bytes);
+      for (size_t start = 0; start < o.pages && !stop.load(std::memory_order_relaxed);
+           start += step) {
+        const size_t end = std::min(start + step, o.pages);
+        const size_t count = end - start;
+
+        std::vector<std::string> chunk_keys(count);
+        std::vector<size_t> object_sizes(count, object_bytes);
+        std::vector<std::vector<const void*>> srcs(count);
+        std::vector<std::vector<size_t>> sizes(count);
+        std::vector<std::vector<size_t>> offsets(count);
+        for (size_t i = 0; i < count; ++i) {
+          // Fresh key every time: a repeat would be short-circuited by
+          // RoutePut's dedup and never reach the data path.
+          chunk_keys[i] = "off-" + pool.name + "-r" + std::to_string(rank) + "-" +
+                          std::to_string(round) + "-" + std::to_string(start + i);
+          char* page = kv[pi].data() + (start + i) * object_bytes;
+          for (size_t l = 0; l < pool.layers.size(); ++l) {
+            srcs[i].push_back(page + l * pool.layer_bytes);
+            sizes[i].push_back(pool.layer_bytes);
+            offsets[i].push_back(l * pool.layer_bytes);
+          }
         }
-      }
-      auto res = client->BatchPutRanges(chunk_keys, object_sizes, srcs, sizes, offsets);
-      // Offload keeps running through warm-up so the arena is loaded from the
-      // start, but only bytes inside the measured window are counted.
-      const bool in_window = warmed_ranks.load(std::memory_order_relaxed) >= load_ranks;
-      for (size_t i = 0; i < res.size(); ++i) {
-        if (res[i] && in_window) stats->put_bytes += o.object_bytes();
+        auto res = client->BatchPutRanges(chunk_keys, object_sizes, srcs, sizes, offsets);
+        // Offload keeps running through warm-up so the arena is loaded from the
+        // start, but only bytes inside the measured window are counted.
+        const bool in_window = warmed_ranks.load(std::memory_order_relaxed) >= load_ranks;
+        for (size_t i = 0; i < res.size(); ++i) {
+          if (res[i] && in_window) stats->put_bytes += object_bytes;
+        }
       }
     }
   }
@@ -724,8 +927,9 @@ void RunOne(const BenchOpts& o, size_t ranks) {
       std::max<size_t>(size_t{512} << 20,
                        ranks * (o.requests + 1) * o.pages * object_bytes * 2 + (size_t{512} << 20));
   // The arena must hold at least one whole object: the remote path stages
-  // through it, and an object that does not fit is unservable.
-  const size_t scratch_bytes = std::max<size_t>(object_bytes, o.scratch_mib << 20);
+  // through it, and an object that does not fit is unservable.  With several
+  // pools the largest one sets the floor.
+  const size_t scratch_bytes = std::max<size_t>(o.max_object_bytes(), o.scratch_mib << 20);
 
   Cluster cluster(node_capacity, peer_capacity, scratch_bytes, o.medium_page_bytes(),
                   o.locality_prefetch);
@@ -735,21 +939,31 @@ void RunOne(const BenchOpts& o, size_t ranks) {
   // warm-up that pays the peer handshake and is not recorded.
   constexpr size_t kWarmupRequests = 1;
   const size_t total_requests = o.requests + kWarmupRequests;
-  std::vector<std::vector<std::vector<std::string>>> keys(ranks);
-  std::vector<std::vector<char>> seed_storage(ranks);
+  // [rank][request][pool] -> that pool's page keys.  A pool's object holds only
+  // its own layers, so pools cannot share keys.
+  std::vector<std::vector<std::vector<std::vector<std::string>>>> keys(ranks);
+  std::vector<std::vector<std::vector<char>>> seed_storage(ranks);
   std::vector<std::string> all_keys;
   for (size_t r = 0; r < ranks; ++r) {
     keys[r].resize(total_requests);
-    std::vector<std::string> flat;
+    seed_storage[r].resize(o.pools.size());
+    // Seeded per pool so SeedByte's index is (request, page) within the pool,
+    // which is what the verify pass recomputes.
+    std::vector<std::vector<std::string>> flat(o.pools.size());
     for (size_t q = 0; q < total_requests; ++q) {
-      for (size_t p = 0; p < o.pages; ++p) {
-        keys[r][q].push_back("kv-r" + std::to_string(r) + "-q" + std::to_string(q) + "-p" +
-                             std::to_string(p));
-        flat.push_back(keys[r][q].back());
+      keys[r][q].resize(o.pools.size());
+      for (size_t pi = 0; pi < o.pools.size(); ++pi) {
+        for (size_t p = 0; p < o.pages; ++p) {
+          keys[r][q][pi].push_back(o.pools[pi].name + "-r" + std::to_string(r) + "-q" +
+                                   std::to_string(q) + "-p" + std::to_string(p));
+          flat[pi].push_back(keys[r][q][pi].back());
+        }
       }
     }
-    SeedPeer(cluster.peer(), flat, object_bytes, &seed_storage[r]);
-    all_keys.insert(all_keys.end(), flat.begin(), flat.end());
+    for (size_t pi = 0; pi < o.pools.size(); ++pi) {
+      SeedPeer(cluster.peer(), flat[pi], o.pools[pi].object_bytes(), &seed_storage[r][pi]);
+      all_keys.insert(all_keys.end(), flat[pi].begin(), flat[pi].end());
+    }
   }
   cluster.peer()->Master().FlushHeartbeat();
   cluster.node()->Master().FlushHeartbeat();
@@ -757,6 +971,8 @@ void RunOne(const BenchOpts& o, size_t ranks) {
 
   std::vector<RankStats> load_stats(ranks);
   std::vector<RankStats> offload_stats(std::max<size_t>(offload_ranks, 1));
+  for (auto& s : load_stats) s.Init(o.pools.size());
+  for (auto& s : offload_stats) s.Init(o.pools.size());
   std::atomic<bool> stop{false};
 
   // Offload streams run for the whole measurement window, the way a steady
@@ -795,6 +1011,8 @@ void RunOne(const BenchOpts& o, size_t ranks) {
   std::vector<double> restore, ttfl, stall;
   size_t get_bytes = 0, put_bytes = 0, calls = 0, calls_local = 0;
   size_t remote_calls = 0, remote_keys = 0, repeat_remote = 0, local_write = 0, mismatches = 0;
+  std::vector<size_t> pool_bytes(o.pools.size(), 0), pool_ranges(o.pools.size(), 0);
+  std::vector<size_t> pool_calls(o.pools.size(), 0), pool_remote_keys(o.pools.size(), 0);
   for (auto& s : load_stats) {
     restore.insert(restore.end(), s.restore_ms.begin(), s.restore_ms.end());
     ttfl.insert(ttfl.end(), s.ttfl_us.begin(), s.ttfl_us.end());
@@ -807,6 +1025,12 @@ void RunOne(const BenchOpts& o, size_t ranks) {
     repeat_remote += s.repeat_remote;
     local_write += s.local_write_bytes;
     mismatches += s.verify_mismatches;
+    for (size_t pi = 0; pi < o.pools.size(); ++pi) {
+      pool_bytes[pi] += s.pool_bytes[pi];
+      pool_ranges[pi] += s.pool_ranges[pi];
+      pool_calls[pi] += s.pool_calls[pi];
+      pool_remote_keys[pi] += s.pool_remote_keys[pi];
+    }
   }
   for (auto& s : offload_stats) put_bytes += s.put_bytes;
 
@@ -824,6 +1048,23 @@ void RunOne(const BenchOpts& o, size_t ranks) {
       wall_s > 0 ? (put_bytes / kGiB) / wall_s : 0.0, calls > 0 ? 100.0 * calls_local / calls : 0.0,
       remote_calls, remote_keys, repeat_remote, wire_whole_mib, wire_range_mib, local_write / kMiB);
   std::fflush(stdout);
+
+  // Per-pool split.  On stderr so the CSV schema above stays stable, and only
+  // when there is more than one pool to split.  range_kib is the number that
+  // predicts the rate: this path is fragment-size bound, so two pools moving
+  // equal bytes at different range sizes will not move them at equal speed.
+  if (o.pools.size() > 1) {
+    std::fprintf(stderr, "  %-16s %9s %10s %8s %10s %9s %10s\n", "pool", "range_kib", "ranges",
+                 "calls", "bytes_mib", "share_pct", "remote_keys");
+    for (size_t pi = 0; pi < o.pools.size(); ++pi) {
+      std::fprintf(stderr, "  %-16s %9.2f %10zu %8zu %10.1f %9.1f %10zu\n",
+                   o.pools[pi].name.c_str(), o.pools[pi].layer_bytes / 1024.0, pool_ranges[pi],
+                   pool_calls[pi], pool_bytes[pi] / kMiB,
+                   get_bytes > 0 ? 100.0 * pool_bytes[pi] / get_bytes : 0.0, pool_remote_keys[pi]);
+    }
+    std::fflush(stderr);
+  }
+
   if (o.verify) {
     std::fprintf(stderr, "verify: %zu mismatched pages at %zu ranks\n", mismatches, ranks);
     if (mismatches != 0) std::exit(1);
@@ -836,14 +1077,19 @@ int main(int argc, char** argv) {
   BenchOpts opts;
   if (!ParseArgs(argc, argv, &opts)) return 2;
 
-  std::fprintf(
-      stderr,
-      "layer-wise restore: %zu layers in groups of %zu (%zu groups/request), "
-      "%zu pages/request, object=%zu KiB, group slice=%zu KiB, "
-      "medium page=%zu KiB, arena=%zu MiB, locality_prefetch=%s, layout=%s\n",
-      opts.layers, opts.layer_group, opts.group_count(), opts.pages, opts.object_bytes() / 1024,
-      opts.group_bytes() / 1024, opts.medium_page_bytes() / 1024, opts.scratch_mib,
-      opts.locality_prefetch ? "on" : "off", opts.interleave_groups ? "interleaved" : "contiguous");
+  std::fprintf(stderr,
+               "layer-wise restore: %zu layers in groups of %zu (%zu groups/request), "
+               "%zu pages/request, page=%zu KiB across %zu pool(s), mean group slice=%zu KiB, "
+               "medium page=%zu KiB, arena=%zu MiB, locality_prefetch=%s, layout=%s\n",
+               opts.layers, opts.layer_group, opts.group_count(), opts.pages,
+               opts.object_bytes() / 1024, opts.pools.size(), opts.group_bytes() / 1024,
+               opts.medium_page_bytes() / 1024, opts.scratch_mib,
+               opts.locality_prefetch ? "on" : "off",
+               opts.interleave_groups ? "interleaved" : "contiguous");
+  for (const Pool& pool : opts.pools) {
+    std::fprintf(stderr, "  pool %-16s %3zu layers x %8zu B = %8zu KiB/page\n", pool.name.c_str(),
+                 pool.layers.size(), pool.layer_bytes, pool.object_bytes() / 1024);
+  }
 
   std::printf(
       "ranks,layers,group,pages,object_kib,restore_ms_p50,restore_ms_p95,ttfl_us_p50,"
