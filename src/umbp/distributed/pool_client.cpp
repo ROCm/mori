@@ -1345,6 +1345,61 @@ void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteReq
     return;
   }
 
+  // Work grouped by the backend that will hold it, so the backend's batch APIs
+  // are called once per batch instead of once per key.
+  //
+  // Calling them per key hurts a put far more than it hurt a get, because the
+  // batches are far smaller: an offload call carries single-digit keys (its
+  // ranges must tile whole objects, so a page's worth of layers uses up the
+  // per-call range budget) against a load call's hundreds.  A cost paid per
+  // call is amortized over a few keys, and there are correspondingly more
+  // calls -- measured end to end, this loop's allocation was 68% of all time
+  // spent in BatchPutRanges.
+  struct BackendWork {
+    MediumBackend* backend = nullptr;
+    std::vector<size_t> requests;    // indices into `requests`
+    std::vector<uint64_t> to_abort;  // slots to release
+    std::vector<CommitRequest> commits;
+    std::vector<size_t> commit_owner;  // request index behind each commit
+  };
+  std::vector<BackendWork> work;
+  auto work_for = [&work](MediumBackend* backend) -> BackendWork& {
+    for (auto& entry : work) {
+      if (entry.backend == backend) return entry;
+    }
+    work.push_back(BackendWork{backend, {}, {}, {}, {}});
+    return work.back();
+  };
+
+  for (size_t r = 0; r < requests.size(); ++r) {
+    auto* backend = registry_.Get(requests[r].tier);
+    if (backend == nullptr || backend->BufferCount() == 0) {
+      MORI_UMBP_WARN("[PoolClient] Local ranged Put: tier={} has no in-process-addressable backend",
+                     static_cast<int>(requests[r].tier));
+      continue;
+    }
+    work_for(backend).requests.push_back(r);
+  }
+
+  std::vector<AllocateResult> allocations(requests.size());
+  std::vector<MediumBackend*> backend_of(requests.size(), nullptr);
+  {
+    PhaseTimer alloc_timer(sinks.resolve);
+    std::vector<AllocateRequest> asks;
+    for (auto& entry : work) {
+      asks.clear();
+      asks.reserve(entry.requests.size());
+      for (size_t r : entry.requests) {
+        asks.push_back(AllocateRequest{*requests[r].key, requests[r].object_size});
+      }
+      auto results_for_backend = entry.backend->BatchAllocate(asks);
+      for (size_t j = 0; j < entry.requests.size() && j < results_for_backend.size(); ++j) {
+        allocations[entry.requests[j]] = std::move(results_for_backend[j]);
+        backend_of[entry.requests[j]] = entry.backend;
+      }
+    }
+  }
+
   struct PendingWrite {
     size_t request_index = 0;
     MediumBackend* backend = nullptr;
@@ -1353,21 +1408,17 @@ void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteReq
   std::vector<PendingWrite> pending;
   std::vector<TransferItem> items;
   pending.reserve(requests.size());
+  {
+    size_t range_total = 0;
+    for (const auto& request : requests) range_total += request.ranges.size();
+    items.reserve(range_total);
+  }
 
   for (size_t r = 0; r < requests.size(); ++r) {
+    MediumBackend* const backend = backend_of[r];
+    if (backend == nullptr) continue;
     const auto& request = requests[r];
-    auto* backend = registry_.Get(request.tier);
-    if (backend == nullptr || backend->BufferCount() == 0) {
-      MORI_UMBP_WARN("[PoolClient] Local ranged Put: tier={} has no in-process-addressable backend",
-                     static_cast<int>(request.tier));
-      continue;
-    }
-    AllocateResult alloc_res;
-    {
-      PhaseTimer alloc_timer(sinks.resolve);
-      alloc_res =
-          backend->BatchAllocate({AllocateRequest{*request.key, request.object_size}}).front();
-    }
+    const AllocateResult& alloc_res = allocations[r];
     if (alloc_res.outcome == AllocateOutcome::kSuccessAlreadyExists) {
       (*results)[request.result_index] = true;
       continue;
@@ -1386,7 +1437,7 @@ void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteReq
     }
     if (!built) {
       items.resize(before);
-      backend->BatchAbort({alloc_res.slot_id});
+      work_for(backend).to_abort.push_back(alloc_res.slot_id);
       continue;
     }
     pending.push_back({r, backend, alloc_res.slot_id});
@@ -1395,36 +1446,65 @@ void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteReq
   // stay disjoint.
   if (sinks.build != nullptr && sinks.classify != nullptr) *sinks.build -= *sinks.classify;
   if (sinks.items != nullptr) *sinks.items += items.size();
-  if (pending.empty()) return;
+  auto flush_aborts = [&work] {
+    for (auto& entry : work) {
+      if (entry.to_abort.empty()) continue;
+      entry.backend->BatchAbort(entry.to_abort);
+      entry.to_abort.clear();
+    }
+  };
+
+  if (pending.empty()) {
+    flush_aborts();
+    return;
+  }
 
   std::vector<size_t> failed_tags;
   transfer_engine_->Transfer(items, &failed_tags, sinks.steps);
   const std::unordered_set<size_t> failed(failed_tags.begin(), failed_tags.end());
 
+  // Commit is still strictly after the transfer, and a slot that fails either
+  // step is still aborted -- only the number of calls changes.
   for (const auto& write : pending) {
-    const auto& request = requests[write.request_index];
+    BackendWork& entry = work_for(write.backend);
     if (failed.count(write.request_index) != 0) {
-      write.backend->BatchAbort({write.slot_id});
+      entry.to_abort.push_back(write.slot_id);
       continue;
     }
-    bool committed = false;
-    {
-      PhaseTimer commit_timer(sinks.commit);
-      committed =
-          write.backend->BatchCommit({CommitRequest{write.slot_id, *request.key}}).front().success;
+    entry.commits.push_back(CommitRequest{write.slot_id, *requests[write.request_index].key});
+    entry.commit_owner.push_back(write.request_index);
+  }
+
+  double put_bytes = 0.0;
+  {
+    PhaseTimer commit_timer(sinks.commit);
+    for (auto& entry : work) {
+      if (entry.commits.empty()) continue;
+      auto outcomes = entry.backend->BatchCommit(entry.commits);
+      for (size_t j = 0; j < entry.commit_owner.size(); ++j) {
+        const auto& request = requests[entry.commit_owner[j]];
+        if (j >= outcomes.size() || !outcomes[j].success) {
+          entry.to_abort.push_back(entry.commits[j].slot_id);
+          continue;
+        }
+        (*results)[request.result_index] = true;
+        put_bytes += static_cast<double>(request.object_size);
+      }
     }
-    if (!committed) {
-      write.backend->BatchAbort({write.slot_id});
-      continue;
-    }
-    (*results)[request.result_index] = true;
-    if (committed_bytes != nullptr) *committed_bytes += static_cast<double>(request.object_size);
+  }
+  flush_aborts();
+
+  if (committed_bytes != nullptr) *committed_bytes += put_bytes;
+  if (put_bytes > 0.0) {
+    // One update for the batch rather than two per key; the totals are the
+    // same.  AddCounter locks and materializes its help text every call, which
+    // is not something to do once per object.
     master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL,
                                MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL_HELP,
-                               {{"traffic", "local"}}, static_cast<double>(request.object_size));
+                               {{"traffic", "local"}}, put_bytes);
     master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL,
                                MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL_HELP,
-                               {{"traffic", "local"}}, static_cast<double>(request.object_size));
+                               {{"traffic", "local"}}, put_bytes);
   }
 }
 
