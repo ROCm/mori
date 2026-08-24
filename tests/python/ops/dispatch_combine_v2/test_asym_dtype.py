@@ -29,10 +29,14 @@ converts dtype: dispatch moves fp8 tokens, the (mock) expert dequants fp8->bf16
   * ASYM-DISPATCH(fp8): local-expert-count routing sum + recv tokens are the
     byte-exact source fp8 tokens (checked via the routing reverse map; every
     rank's input is regenerated from its per-rank seed, no collective needed).
-  * ASYM-COMBINE(bf16): identity-expert telescoping — out == U * dequant(inp) * wt
+  * ASYM-COMBINE(bf16): identity-expert telescoping -- out == U * dequant(inp) * wt
     (U = distinct dest PEs per token), weights == U * wt.
+  * ASYM-SCALES: with SCALE_DIM>0, the scale row rides along and lands in the
+    same slot as its token, byte-exact. Only tested here: test_op.py takes one
+    dtype for both legs, so its scale coverage can only ever be bf16.
 
     torchrun --nnodes=1 --nproc_per_node=4 --tee 3 ... test_asym_dtype.py
+    SCALE_DIM=16 DISP=fp4 torchrun ... test_asym_dtype.py
 """
 import os
 import sys
@@ -62,6 +66,9 @@ HIDDEN = int(os.environ.get("HIDDEN", 512))  # 16 B aligned for both fp8 and bf1
 K = int(os.environ.get("TOPK", 6))
 EPR = int(os.environ.get("EPR", 8))
 SWEEP = [int(x) for x in os.environ.get("SWEEP", "8,64,512").split(",")]
+# Bytes per scale row, 0 = off. A real MX wire sends HIDDEN//32; mori pads that
+# to its own stride, so a value that is not 128 B-aligned is the one worth passing.
+SCALE_DIM = int(os.environ.get("SCALE_DIM", 0))
 
 
 class Dist:
@@ -131,6 +138,20 @@ def main():
     # Compared as raw bytes, so fp4 -- which has no torch arithmetic -- works too.
     all_inp = torch.cat([as_bytes(gen_inp(r, M)) for r in range(npes)], dim=0)
 
+    # rank*100003 + tok per dword, so the recv side can decode the origin from the
+    # reverse map: a row in the wrong slot or read at the wrong pitch mismatches.
+    sc_n_i32 = (SCALE_DIM + 3) // 4
+    scales = None
+    if SCALE_DIM:
+        scales = (
+            (torch.arange(M, device=dev) + rank * 100003)
+            .view(M, 1)
+            .expand(M, sc_n_i32)
+            .contiguous()
+            .to(torch.int32)
+            .view(torch.uint8)
+        )
+
     uid = Communicator.get_unique_id() if rank == 0 else None
     uid = d.bcast_uid(uid)
     win_bytes = npes * M * HIDDEN * 2 * 2 + (1 << 24)  # sized for bf16 (the larger)
@@ -147,13 +168,19 @@ def main():
             dispatch_data_type=DISP,  # fp8 or fp4 dispatch
             combine_data_type=torch.bfloat16,  # bf16 combine
             combine_mode="gather",
+            scale_dim=SCALE_DIM,
+            scale_type_size=1 if SCALE_DIM else 0,
         )
         op = EpDispatchCombineOp(cfg, comm)
         comm.barrier()
 
         for ct in SWEEP:
-            recv_x, _w, _s, _i, total_recv_t, routing = op.dispatch(
-                inp[:ct], wts[:ct], None, idx[:ct], return_routing=True
+            recv_x, _w, out_s, _i, total_recv_t, routing = op.dispatch(
+                inp[:ct],
+                wts[:ct],
+                scales[:ct] if SCALE_DIM else None,
+                idx[:ct],
+                return_routing=True,
             )
             total_recv = int(total_recv_t.cpu().item())
             sync()
@@ -172,6 +199,14 @@ def main():
             exp_recv = all_inp[tis]  # source token per recv slot
             ok_disp = bool(torch.equal(recv_b, exp_recv))
             errs_disp = d.allreduce_sum(0 if (ok_lec and ok_disp) else 1)
+
+            # ---- scale rows landed with their tokens ----
+            errs_sc = 0
+            if SCALE_DIM:
+                exp_sc = ((tis // M) * 100003 + (tis % M)).view(total_recv, 1)
+                got_sc = out_s[:total_recv].cpu()
+                ok_sc = bool(torch.equal(got_sc, exp_sc.expand(total_recv, sc_n_i32)))
+                errs_sc = d.allreduce_sum(0 if ok_sc else 1)
 
             # ---- mock fmoe: dispatch dtype -> bf16 (identity) ----
             if _IS_FP4:
@@ -220,6 +255,14 @@ def main():
                     f"dtype={'ok' if ok_dt else 'BAD'})",
                     flush=True,
                 )
+                if SCALE_DIM:
+                    print(
+                        f"# ASYM-SCALES({_TAG}) ct={ct}: "
+                        f"{'PASS' if errs_sc == 0 else 'FAIL'} "
+                        f"(scale_dim={SCALE_DIM} B -> {sc_n_i32} dwords/token, "
+                        f"reverse-map ok, recv={total_recv})",
+                        flush=True,
+                    )
     d.shutdown()
 
 

@@ -575,6 +575,20 @@ class EpDispatchCombineOp:
     def capabilities(self) -> frozenset[str]:
         return self._kernels.capabilities
 
+    def scale_stride_bytes(self) -> int:
+        """Bytes between consecutive out_scales rows, 0 when off.
+
+        A backend may lay them down wider than the row it was handed (the HIP one
+        pads to 128 B). On the base so a consumer never branches on the backend;
+        the default is the row unchanged, which is right for one that does not pad.
+        """
+        return self._scale_row_bytes()
+
+    def _scale_row_bytes(self) -> int:
+        """The caller's row in bytes, dword-rounded. 0 when the transport is off."""
+        n = self.cfg.scale_dim * self.cfg.scale_type_size
+        return ((n + 3) // 4) * 4 if n else 0
+
     # -- shared: variant selection -----------------------------------------
 
     def _pick(self, num_tokens):
@@ -666,6 +680,10 @@ class EpDispatchCombineOp:
         exclusive. Returns (out, out_weights, out_scales, out_indices,
         total_recv[, routing]); out == arena disp_out, safe to read without
         .clone() because combine stages into a separate out_tok buffer.
+
+        out_scales is [max_recv, scale_dim_i32] on both backends but is not always
+        CONTIGUOUS -- a backend may lay the rows down wider and return a strided
+        view. Read by pointer, stride by scale_stride_bytes(), not by this shape.
 
         total_recv is a DEVICE tensor. Reading it on the host is a full sync that
         costs more than the kernel and makes the op uncapturable, so neither

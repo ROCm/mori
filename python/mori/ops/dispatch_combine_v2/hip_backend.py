@@ -44,7 +44,9 @@ from .symm_arena import SymmArena
 
 # C++ offset-argument stem -> arena region name. The C++ side names the offsets
 # after its own EpArgs fields (offTokOff -> "tokOff"); the region names match the
-# FlyDSL op's, so one arena can serve either backend.
+# FlyDSL op's, and so do the sizes EXCEPT out_scales -- this backend pads the row,
+# FlyDSL does not. A plan binds offsets, never sizes, so an arena sized for the
+# wrong one is overrun silently: size it from scale_stride_bytes().
 _REGIONS = {
     "tokOff": "tok_off",
     "recvNum": "recv_num",
@@ -54,6 +56,7 @@ _REGIONS = {
     "dispOut": "disp_out",
     "outTok": "out_tok",
     "xdb": "cross_device_barrier",
+    "outScales": "out_scales",  # only laid out when scales are on; binds to 0 otherwise
 }
 
 # Only what EpDType enumerates -- fp16 is absent because plan_api.DTYPES has no code
@@ -67,6 +70,21 @@ _DISPATCH_DTYPES = {
     torch.float4_e2m1fn_x2: 1,  # nominal: cfg.token_nbytes is what sizes buffers
 }
 _COMBINE_DTYPES = {torch.bfloat16: 2, torch.float32: 4}
+# Must match EpScaleAlign in include/mori/ops/dispatch_combine_v2/ep_cfg.hpp.
+_SCALE_ALIGN = 128
+
+
+def scale_stride_bytes(scale_bytes: int) -> int:
+    """What a DESTINATION scale row is laid down at: EpScaleStride in ep_cfg.hpp.
+
+    Anything addressing the region itself strides by this; recv_scales() hides it.
+    Mirrored from the C++ because sizing happens before any kernel exists.
+    """
+    if scale_bytes <= 0:
+        return 0
+    return (scale_bytes + _SCALE_ALIGN - 1) // _SCALE_ALIGN * _SCALE_ALIGN
+
+
 # Must match EpXdbFlagSlots in include/mori/ops/dispatch_combine_v2/ep_cfg.hpp.
 _XDB_FLAG_SLOTS = 256
 
@@ -141,6 +159,22 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     # -- backend hooks -----------------------------------------------------
 
+    @staticmethod
+    def _scale_i32(cfg) -> int:
+        """Dwords in the SOURCE scale row. _unsupported rejects a row that is not
+        already dword-sized, so the rounding here never actually rounds."""
+        return (cfg.scale_dim * cfg.scale_type_size + 3) // 4
+
+    def scale_stride_bytes(self) -> int:
+        """Padded to 128 B here; the base returns the row unchanged. Use the
+        module-level function when there is no op yet (sizing an arena)."""
+        return scale_stride_bytes(self._scale_row_bytes())
+
+    @classmethod
+    def _scale_stride_i32(cls, cfg) -> int:
+        """Dwords per DESTINATION scale row, 0 when the transport is off."""
+        return scale_stride_bytes(cls._scale_i32(cfg) * 4) // 4
+
     def _regions(self, cfg):
         # token_nbytes / combine_token_nbytes rather than elem*hidden: they are the
         # only forms that are right for fp4, where 2 values share a byte.
@@ -156,6 +190,17 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             ("out_tok", cap * cfg.combine_token_nbytes),
             ("cross_device_barrier", cfg.world_size * 8),
         ]
+        if self._scale_i32(cfg):
+            # Sized by the DESTINATION stride, which is the caller's row padded to
+            # 128 B: the kernel lays the rows down at that pitch, so an arena sized
+            # for the unpadded row would be overrun by the last tokens.
+            # Padded rows only land aligned if the region does; that is another
+            # file's constant, and lowering it reads as a perf regression.
+            assert SymmArena._ALIGN % _SCALE_ALIGN == 0, (
+                f"SymmArena._ALIGN={SymmArena._ALIGN} does not keep scale regions "
+                f"{_SCALE_ALIGN} B-aligned; the padding in EpScaleStride buys nothing"
+            )
+            regions.append(("out_scales", cap * self._scale_stride_i32(cfg) * 4))
         return regions
 
     def _unsupported(self, cfg) -> tuple[str, ...]:
@@ -173,8 +218,17 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             bad.append(f"quant_type={cfg.quant_type!r}")
         if cfg.enable_std_moe:
             bad.append("enable_std_moe")
-        if cfg.scale_dim and cfg.scale_type_size:
-            bad.append("per-token scales forwarding")
+        # The kernel walks the source scale rows with the PADDED dword stride, so
+        # a caller row that is not itself a whole number of dwords would be read
+        # at the wrong pitch. _scale_i32 rounds up, which hides that from the Cfg
+        # validator -- check the caller's own width here instead.
+        raw_scale_bytes = cfg.scale_dim * cfg.scale_type_size
+        if raw_scale_bytes % 4:
+            bad.append(
+                f"per-token scale row of {raw_scale_bytes} B "
+                f"(scale_dim={cfg.scale_dim} x {cfg.scale_type_size}); "
+                "the row must be a whole number of dwords"
+            )
         # The C++ validator rejects a shrunk cap: the recv capacity is also the
         # flat-index stride, so an overflow re-encodes to the next peer instead
         # of merely overrunning the region.
@@ -211,6 +265,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         disp_cfg = dict(
             hidden_dim=cfg.hidden_dim // 2 if cfg.is_fp4 else cfg.hidden_dim,
             dtype=cfg.dispatch_dtype,
+            # Dword-padded: the kernel copies the row as dwords, and EpCfgIsValid
+            # rejects a Cfg whose row is not a whole number of them.
+            scale_bytes=self._scale_i32(cfg) * 4,
         )
         comb_cfg = dict(hidden_dim=cfg.hidden_dim, dtype=cfg.combine_dtype)
         # One plan per (block, warp) the schedule can select. Compilation happens
@@ -240,7 +297,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # These are plain local buffers, not symmetric regions: the kernels
             # do not reset them, the op must.
             self_resets_counters=False,
-            capabilities=frozenset({"gather"}),
+            capabilities=frozenset({"gather", "scales"}),
         )
 
     def _close_backend(self):
@@ -280,10 +337,23 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         )
 
     def recv_scales(self):
-        """Always None: this backend forwards no scales. Not an error -- it is
-        the same answer FlyDSL gives for a config built without them, and a
-        config that actually asks for scales is rejected by the gate."""
-        return None
+        """The forwarded scale rows, or None when the transport is off -- the same
+        answer FlyDSL gives, and the same (recv_cap, dwords) int32 view, so a caller
+        cannot tell the backends apart.
+
+        Strided, not packed: the rows sit scale_stride_bytes() apart. Anything
+        reading the region by pointer needs that pitch, not this shape.
+        """
+        n_i32 = self._scale_i32(self.cfg)
+        if not n_i32:
+            return None
+        stride_i32 = self._scale_stride_i32(self.cfg)
+        rows = from_gpu_ptr(
+            self.arena.local_ptr("out_scales"),
+            (self._recv_cap, stride_i32),
+            torch.int32,
+        )
+        return rows[:, :n_i32]
 
     def local_expert_count(self):
         raise NotImplementedError(
@@ -307,6 +377,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 token_indices=indices,
                 inp_token_buf=input,
                 weights_buf=weights,
+                scales_buf=scales,
                 disp_dest_tok_id_map=dest_map,
                 dest_pe_token_counter=self.dest_pe_counter,
                 total_recv_token_num=self.total_recv,

@@ -39,6 +39,9 @@
 
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
+
+// AFTER hip_runtime.h, and in its own block so clang-format cannot sort it up:
+// it pulls in driver_types.h, which uses hipMemoryType without declaring it.
 #include <hip/amd_detail/amd_gfx1250_TDM.h>
 
 #include <type_traits>
@@ -205,10 +208,67 @@ __device__ float _cusplit_stgWt[CUSPLIT_POOL_SLOTS * CUSPLIT_MAX_TOPK];
 __device__ index_t _cusplit_stgSrc[CUSPLIT_POOL_SLOTS];
 __device__ index_t _cusplit_blkBase[CUSPLIT_MAX_BLOCKS * CUSPLIT_MAX_GPUS];
 __device__ index_t _cusplit_blkCount[CUSPLIT_MAX_BLOCKS * CUSPLIT_MAX_GPUS];
-constexpr int kMetaFields = 3;
+// Per-token scale rows, staged like the other meta fields so they ship to a peer as
+// one contiguous run rather than a 224 B transfer per (token, destination) -- the
+// size TDM is worst at. The array is at file scope, which the TU reaches before kCfg
+// exists, so its extent comes from a macro RenderEpSource emits only when the feature
+// is on; off, it degenerates to one byte. `if constexpr` discards the staging code
+// but still looks the name up, hence a declaration in both cases.
+#if defined(MORI_EP_SCALE_BYTES) && MORI_EP_SCALE_BYTES > 0
+// Source row vs the stride we lay it down at; they differ by EpScaleStride's pad.
+constexpr int kEpScaleBytes = MORI_EP_SCALE_BYTES;
+constexpr int kEpScaleStride = MORI_EP_SCALE_STRIDE;
+constexpr size_t kEpScaleSlots = (size_t)MORI_EP_SCALE_SLOTS;
+// Per-peer stride. NOT _stgCap: that one sizes the idx/wt pool, which is a
+// different (larger) constant, and indexing this array with it walks off the end.
+constexpr size_t kEpScaleRows = (size_t)MORI_EP_SCALE_ROWS;
+constexpr int kMetaFields = 4;  // idx, weights, srcmap, scale
+#else
+constexpr int kEpScaleBytes = 0;
+constexpr int kEpScaleStride = 0;
+constexpr size_t kEpScaleSlots = 1;
+constexpr size_t kEpScaleRows = 1;
+constexpr int kMetaFields = 3;  // idx, weights, srcmap
+#endif
+// FOOTPRINT, and it is quadratic in world_size: kEpScaleSlots is
+// worldSize * EpMaxRecv, and EpMaxRecv is itself worldSize * maxTokPerRank. That
+// is deliberate -- the per-peer stride has to be the peer's full recv capacity so
+// the destination slot id indexes it directly, which is also what lets the
+// existing `ab + cc > recvCapM` guard cover this array (_stgCap does NOT bound
+// it; the two cross over as world_size grows).
+//
+// It costs, at the 256 B STRIDE a 224 B row (hidden 7168) pads up to:
+//     EP4  maxTok 16384  ->   64 MiB
+//     EP8  maxTok  8192  ->  128 MiB
+//     EP8  maxTok 16384  ->  256 MiB
+// and this is a __device__ global, so it is one copy PER COMPILED VARIANT: a
+// three-entry (block, warp) schedule at EP8/16384 reserves ~672 MiB.
+//
+// The idx/wt pools next to it are world_size-independent (a fixed CUSPLIT_POOL
+// split per peer). Making this one match would need the staging to be indexed by
+// a block-local slot instead of the destination slot id, which is a bigger change
+// than it looks and wants hardware validation -- the guard would start dropping
+// tokens rather than merely skipping transfers. Until then, fail at compile time
+// rather than at the first launch on a big EP.
+static_assert(kEpScaleStride == 0 || (size_t)kEpScaleSlots * kEpScaleStride <= (size_t)1 << 30,
+              "EP scale staging exceeds 1 GiB per compiled variant -- it grows as "
+              "world_size^2 * maxTokPerRank * EpScaleStride; re-index it block-locally "
+              "before going wider");
+// Rows are already a multiple of 128 apart; __align__ makes the BASE match, which
+// TdmWholeOrSplit128 needs for the same split it uses on the peer side.
+constexpr size_t kEpScaleStgBytes = kEpScaleSlots * (kEpScaleStride > 0 ? kEpScaleStride : 1);
+__device__ __align__(EpScaleAlign) unsigned char _cusplit_stgScale[kEpScaleStgBytes];
 
 template <EpCfg kCfg, typename T>
 __device__ void EpDispatch1250xBody(EpArgs args) {
+  // The macro sizes the staging, the Cfg drives the copies. They come from the same
+  // render, so a disagreement means the generator changed under the header.
+  static_assert(kCfg.scaleBytes == kEpScaleBytes,
+                "MORI_EP_SCALE_BYTES disagrees with Cfg.scaleBytes -- RenderEpSource must "
+                "emit the macro from the same Cfg it renders");
+  static_assert(EpScaleStride(kCfg) == kEpScaleStride,
+                "MORI_EP_SCALE_STRIDE disagrees with EpScaleStride(Cfg) -- the staging "
+                "would be sized at one pitch and written at another");
   constexpr int WS = kCfg.waveSize;
   const int thdId = threadIdx.x;
   const int laneId = threadIdx.x & (WS - 1);
@@ -231,7 +291,12 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   const bool _laneAct = (_etpi > 1) ? (_sLane < _etpi) : (laneId < topk);
 
   extern __shared__ char _tdmBatchSmem[];
-  T* _tdmTile = reinterpret_cast<T*>(_tdmBatchSmem) + (size_t)warpId * hiddenDim;
+  // One slab per warp, shared by the payload tile and (later) the metadata tile.
+  // Sized in BYTES rather than payload elements: with a scale row in the metadata
+  // an fp8 payload would otherwise shrink the slab exactly when the metadata got
+  // bigger. EpDispatch1250xSlabBytes owns that decision; both tiles must agree.
+  constexpr int kSlabBytes = EpDispatch1250xSlabBytes(kCfg);
+  T* _tdmTile = reinterpret_cast<T*>(_tdmBatchSmem + (size_t)warpId * kSlabBytes);
   const gfx1250_TDM_GROUP1 _tdmG1 = TdmShape<T>(static_cast<int>(hiddenDim));
 
   constexpr int kMaxNpes = CUSPLIT_MAX_GPUS;
@@ -247,8 +312,8 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   const int _preE = laneId & (_preGsz - 1);
   const int _preTok = aWarp * _etpi;
   const bool _metapreOk = ((long long)aWarps * (long long)_etpi >= (long long)args.numTokens) &&
-                          (_etpi == 1) && (_preGsz >= topk) &&
-                          (_preTok < (int)args.numTokens) && args.tokenIndices && args.inpTokenBuf;
+                          (_etpi == 1) && (_preGsz >= topk) && (_preTok < (int)args.numTokens) &&
+                          args.tokenIndices && args.inpTokenBuf;
   index_t _pIdx = 0;
   float _pWt = 0.0f;
   if (_metapreOk && _preE < topk) {
@@ -272,8 +337,8 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     for (int tokBase = aWarp * _etpi; tokBase < args.numTokens; tokBase += aWarps * _etpi) {
       int tok = tokBase + _sLane;
       bool act = _laneAct && (tok < args.numTokens);
-      index_t myExpert = act ? (_metapreOk ? _pIdx : args.tokenIndices[(size_t)tok * topk + _eLane])
-                             : (index_t)-1;
+      index_t myExpert =
+          act ? (_metapreOk ? _pIdx : args.tokenIndices[(size_t)tok * topk + _eLane]) : (index_t)-1;
       int myDestPe = -1;
       if (myExpert >= 0) {
         int d = (int)(myExpert / kCfg.numExpertPerRank);
@@ -289,7 +354,8 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
         }
         keep = (myDestPe >= 0 && laneId == (__ffsll((long long)_mine) - 1)) ? 1 : 0;
       } else {
-        unsigned mv = (myDestPe >= 0) ? (((unsigned)_sLane << 8) | (unsigned)myDestPe) : 0xFFFFFFFFu;
+        unsigned mv =
+            (myDestPe >= 0) ? (((unsigned)_sLane << 8) | (unsigned)myDestPe) : 0xFFFFFFFFu;
         unsigned long long grp = __match_any_sync(0xFFFFFFFFFFFFFFFFull, mv);
         keep = (myDestPe >= 0 && laneId == (__ffsll((long long)grp) - 1)) ? 1 : 0;
         if (act && keep) atomicAdd(&s_N[myDestPe], 1);
@@ -340,7 +406,8 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
           int d = (int)(myExpert / kCfg.numExpertPerRank);
           if (d >= 0 && d < npes) myDestPe = d;
         }
-        unsigned mv = (myDestPe >= 0) ? (((unsigned)_sLane << 8) | (unsigned)myDestPe) : 0xFFFFFFFFu;
+        unsigned mv =
+            (myDestPe >= 0) ? (((unsigned)_sLane << 8) | (unsigned)myDestPe) : 0xFFFFFFFFu;
         unsigned long long grp = __match_any_sync(0xFFFFFFFFFFFFFFFFull, mv);
         keep = (act && myDestPe >= 0 && laneId == (__ffsll((long long)grp) - 1)) ? 1 : 0;
       }
@@ -384,10 +451,30 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
             }
           }
         } else {
-          for (int e = myE; e < topk; e += gsz) sIdx[e] = args.tokenIndices[(size_t)gTok * topk + e];
+          for (int e = myE; e < topk; e += gsz)
+            sIdx[e] = args.tokenIndices[(size_t)gTok * topk + e];
           if constexpr (kCfg.useWeights) {
             if (args.weightsBuf) {
-              for (int e = myE; e < topk; e += gsz) sWt[e] = args.weightsBuf[(size_t)gTok * topk + e];
+              for (int e = myE; e < topk; e += gsz)
+                sWt[e] = args.weightsBuf[(size_t)gTok * topk + e];
+            }
+          }
+        }
+        if constexpr (kEpScaleBytes > 0) {
+          if (args.scalesBuf) {
+            // The only place the two widths meet, and the copy is per-row anyway,
+            // which is what makes the pad free rather than a pass of its own.
+            // EpCfgIsValid keeps the row dword-sized, so these lanes have no tail.
+            constexpr int kSrcDw = kEpScaleBytes / 4;
+            constexpr int kDstDw = kEpScaleStride / 4;
+            const unsigned int* srcS =
+                reinterpret_cast<const unsigned int*>(args.scalesBuf) + (size_t)gTok * kSrcDw;
+            if ((size_t)dt < kEpScaleRows) {
+              unsigned int* dstS = reinterpret_cast<unsigned int*>(
+                  _cusplit_stgScale + ((size_t)d * kEpScaleRows + (size_t)dt) * kEpScaleStride);
+              for (int e = myE; e < kSrcDw; e += gsz) dstS[e] = srcS[e];
+              // Zeroed, not left over: it crosses into a peer's memory.
+              for (int e = kSrcDw + myE; e < kDstDw; e += gsz) dstS[e] = 0u;
             }
           }
         }
@@ -401,9 +488,13 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     const int tkM = topk;
     const index_t recvCapM = (index_t)EpMaxRecv(kCfg);
     const index_t _stgCapM = (index_t)(CUSPLIT_POOL_SLOTS / npes);
-    const int mtileBytesM = (int)(hiddenDim * sizeof(T));
-    const int perTokM = tkM * 4 + tkM * 4 + 4;
-    const int tokCapM = (perTokM > 0) ? ((mtileBytesM - 384) / perTokM) : 0;
+    // One warp owns a whole (peer, sub-range) run, moving idx+wt+srcmap through one tile.
+    const int mtileBytesM = kSlabBytes;  // the whole slab, see above
+    // idx + weights + srcmap + the scale row, at the stride it is really moved at:
+    // sizing this from the unpadded row would under-size the tile it then holds.
+    const int perTokM = tkM * 4 + tkM * 4 + 4 + EpScaleStride(kCfg);
+    // 128B of slack per field region for the rounding below.
+    const int tokCapM = (perTokM > 0) ? ((mtileBytesM - 128 * kMetaFields) / perTokM) : 0;
     if (tokCapM > 0) {
       uint8_t* _m4 = reinterpret_cast<uint8_t*>(_tdmBatchSmem) + (size_t)warpId * mtileBytesM;
       const int _peerSplit = (npes > 0 && warpNum >= npes) ? (warpNum / npes) : 1;
@@ -437,10 +528,24 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
           const TdmSplit128 spI = TdmWholeOrSplit128((size_t)ab * tkM, nIdxB);
           const TdmSplit128 spW = (dW != nullptr) ? spI : TdmSplit128{0, 0, 0};
           const TdmSplit128 spR = TdmWholeOrSplit128((size_t)ab, cc);
+          // Scale rides as a fourth field: same run, same tile, one more descriptor.
+          // The stride, not the caller's row: it is what puts `ab * kSdw` on a
+          // 128 B boundary, so this run gets a body instead of a scalar tail.
+          constexpr int kSdw = (kEpScaleStride > 0) ? kEpScaleStride / 4 : 0;
+          const int nScB = cc * kSdw;
+          unsigned int* sS = reinterpret_cast<unsigned int*>(_cusplit_stgScale) +
+                             (size_t)peer * kEpScaleRows * kSdw + (size_t)ab * kSdw;
+          unsigned int* dS =
+              (kEpScaleBytes > 0 && args.scalesBuf)
+                  ? (EpPeer<unsigned int>(win, peer, args.offOutScales) + (size_t)ab * kSdw)
+                  : nullptr;
+          const TdmSplit128 spS =
+              (dS != nullptr) ? TdmWholeOrSplit128((size_t)ab * kSdw, nScB) : TdmSplit128{0, 0, 0};
           int* tI = reinterpret_cast<int*>(_m4);
           int* tW = tI + ((spI.body + 31) & ~31);
           int* tR = tW + ((spW.body + 31) & ~31);
-          gfx1250_TDM_GROUP1 gI{}, gW{}, gR{};
+          int* tS = tR + ((spR.body + 31) & ~31);
+          gfx1250_TDM_GROUP1 gI{}, gW{}, gR{}, gS{};
           if (_mPend) {
             __builtin_amdgcn_s_wait_tensorcnt(0);
             _mPend = false;
@@ -448,9 +553,11 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
           if (spI.body) gI = TdmSplitShape(spI, spI.body);
           if (spW.body) gW = TdmSplitShape(spW, spW.body);
           if (spR.body) gR = TdmSplitShape(spR, spR.body);
+          if (spS.body) gS = TdmSplitShape(spS, spS.body);
           if (spI.body) TdmIssueLoad<int>(tI, reinterpret_cast<int*>(sI + spI.head), gI);
           if (spW.body) TdmIssueLoad<int>(tW, reinterpret_cast<int*>(sW + spW.head), gW);
           if (spR.body) TdmIssueLoad<int>(tR, reinterpret_cast<int*>(sR + spR.head), gR);
+          if (spS.body) TdmIssueLoad<int>(tS, reinterpret_cast<int*>(sS + spS.head), gS);
 #define _MHT_REM(dstp, glbp, hd, bd, ntot)                                         \
   do {                                                                             \
     for (int i = laneId; i < (hd); i += WS) (dstp)[i] = (glbp)[i];                 \
@@ -462,12 +569,16 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
             _MHT_REM(reinterpret_cast<int*>(dW), reinterpret_cast<int*>(sW), spW.head, spW.body,
                      nWtB);
           _MHT_REM(dR, sR, spR.head, spR.body, cc);
+          if (dS)
+            _MHT_REM(reinterpret_cast<int*>(dS), reinterpret_cast<int*>(sS), spS.head, spS.body,
+                     nScB);
 #undef _MHT_REM
-          if (spI.body || spW.body || spR.body) {
+          if (spI.body || spW.body || spR.body || spS.body) {
             __builtin_amdgcn_s_wait_tensorcnt(0);
             if (spI.body) TdmIssueStore<int>(reinterpret_cast<int*>(dI + spI.head), tI, gI);
             if (spW.body) TdmIssueStore<int>(reinterpret_cast<int*>(dW + spW.head), tW, gW);
             if (spR.body) TdmIssueStore<int>(reinterpret_cast<int*>(dR + spR.head), tR, gR);
+            if (spS.body) TdmIssueStore<int>(reinterpret_cast<int*>(dS + spS.head), tS, gS);
             _mPend = true;
           }
         }
@@ -493,10 +604,17 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
               _cusplit_stgWt + (size_t)peer * _stgCapM * CUSPLIT_MAX_TOPK + (size_t)ab * tkM;
           float* dst = EpPeer<float>(win, peer, args.offOutWts) + (size_t)ab * tkM;
           for (int i = laneId; i < (int)cnt * tkM; i += WS) dst[i] = src[i];
-        } else {
+        } else if (field == 2) {
           index_t* src = _cusplit_stgSrc + (size_t)peer * _stgCapM + (size_t)ab;
           index_t* dst = EpPeer<index_t>(win, peer, args.offRecvToSrc) + (size_t)ab;
           for (int i = laneId; i < (int)cnt; i += WS) dst[i] = src[i];
+        } else if constexpr (kEpScaleStride > 0) {
+          constexpr int kSdw = kEpScaleStride / 4;
+          unsigned int* src = reinterpret_cast<unsigned int*>(
+              _cusplit_stgScale + ((size_t)peer * kEpScaleRows + (size_t)ab) * kEpScaleStride);
+          unsigned int* dst =
+              EpPeer<unsigned int>(win, peer, args.offOutScales) + (size_t)ab * kSdw;
+          for (int i = laneId; i < (int)cnt * kSdw; i += WS) dst[i] = src[i];
         }
       }
     }
@@ -1146,6 +1264,6 @@ __device__ void EpCombine1250xBody(EpArgs args) {
     }
 }
 
-}
-}
-}
+}  // namespace v2
+}  // namespace ops
+}  // namespace mori

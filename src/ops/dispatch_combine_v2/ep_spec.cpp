@@ -58,6 +58,9 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
   c.maxRecv = req.maxRecv;
   c.dtype = req.dtype;
   c.useWeights = req.useWeights;
+  // Combine never carries scales: it moves post-expert tokens, which are already
+  // in the combine dtype. Only dispatch gets the row.
+  c.scaleBytes = (kind == EpKernelKind::Dispatch) ? req.scaleBytes : 0;
 
   c.waveSize = mori::jit::v2::WaveSizeForArch(arch);
 
@@ -142,9 +145,24 @@ std::string RenderEpSource(const EpCfg& cfg, const std::string& entry, const cha
   const char* header = is1250 ? "src/ops/dispatch_combine_v2/ep_intranode_1250x.hpp"
                               : "src/ops/dispatch_combine_v2/ep_intranode_kernel.hpp";
   const char* body = is1250 ? gfx1250Body : portableBody;
-  return std::string(
-             "// mori jit v2 — generated, do not edit.\n"
-             "#include \"") +
+  // Scale staging is a macro rather than a Cfg read because the array is at file
+  // scope in the header, which the TU includes BEFORE kCfg exists. Emitted only
+  // when the feature is on, so a scaleBytes=0 TU is byte-identical to one built
+  // before this existed -- same text, same sha256, same cache entry.
+  std::string scaleDefs;
+  if (cfg.scaleBytes > 0) {
+    // ROWS is the per-peer stride and SLOTS the total. They must be emitted as a
+    // pair: the staging is indexed peer*ROWS + destTokId, and sizing it from one
+    // while indexing with the other is an out-of-bounds write on peer > 0.
+    // BYTES is the caller's row, STRIDE what we lay it down at: staging reads one
+    // and writes the other.
+    scaleDefs = "#define MORI_EP_SCALE_BYTES " + std::to_string(cfg.scaleBytes) +
+                "\n#define MORI_EP_SCALE_STRIDE " + std::to_string(EpScaleStride(cfg)) +
+                "\n#define MORI_EP_SCALE_ROWS " + std::to_string(EpMaxRecv(cfg)) +
+                "\n#define MORI_EP_SCALE_SLOTS " +
+                std::to_string((long long)cfg.worldSize * EpMaxRecv(cfg)) + "\n";
+  }
+  return std::string("// mori jit v2 — generated, do not edit.\n") + scaleDefs + "#include \"" +
          header +
          "\"\n"
          "using namespace mori::ops::v2;\n"
