@@ -178,6 +178,11 @@ class CopyPool {
     size_t count = 0;
     std::atomic<size_t> next{0};
     std::atomic<size_t> done{0};
+    // Completion is waited on, not spun on.  A spin is only free when the box
+    // has a spare core, and the process this runs in does not: it is also
+    // running the model's forward pass, the HIP runtime and every other rank.
+    std::mutex mutex;
+    std::condition_variable cv;
   };
 
   static CopyPool& Instance() {
@@ -187,38 +192,82 @@ class CopyPool {
     return *pool;
   }
 
-  // Publishes `batch` to the helpers, works on it from the calling thread, and
-  // returns once every item has been run.  Helpers are best-effort: if they are
-  // all busy the caller simply does the whole batch itself.
+  // Publishes `batch`, works on it from the calling thread, and returns once
+  // every item has run.  Helpers are best-effort: if they are all busy the
+  // caller simply does the whole batch itself.
   void Run(const std::shared_ptr<Batch>& batch, int helpers) {
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      StartThreadsLocked(helpers);
+      GrowLocked(helpers);
       queue_.push_back(batch);
     }
-    cv_.notify_all();
+    // One wake per helper this batch wants.  notify_all would wake every idle
+    // thread in the process to serve one batch.
+    for (int i = 0; i < helpers; ++i) cv_.notify_one();
+
     Drain(*batch);
-    // Drain() returning only means this thread found nothing left to claim; a
-    // helper may still be inside the last item.  The batch is shared_ptr-owned
-    // precisely so that is safe to wait for.
-    while (batch->done.load(std::memory_order_acquire) < batch->count) {
-      std::this_thread::yield();
+
+    // Draining only means THIS thread found nothing left to claim; a helper may
+    // still be inside the last item.  The batch is shared_ptr-owned so waiting
+    // for it is safe.
+    {
+      std::unique_lock<std::mutex> lock(batch->mutex);
+      batch->cv.wait(
+          lock, [&batch] { return batch->done.load(std::memory_order_acquire) >= batch->count; });
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto it = std::find(queue_.begin(), queue_.end(), batch);
+      if (it != queue_.end()) queue_.erase(it);
     }
   }
 
  private:
+  // Upper bound on helper threads for the whole process.  They are shared by
+  // every caller, so this is not per call.
+  static int PoolCap() {
+    static const int cap = [] {
+      const unsigned hc = std::thread::hardware_concurrency();
+      const int n = hc == 0 ? 4 : static_cast<int>(hc);
+      return std::max(1, std::min(n, 32));
+    }();
+    return cap;
+  }
+
   static void Drain(Batch& batch) {
     for (size_t i = batch.next.fetch_add(1, std::memory_order_relaxed); i < batch.count;
          i = batch.next.fetch_add(1, std::memory_order_relaxed)) {
       (*batch.fn)(i);
-      batch.done.fetch_add(1, std::memory_order_release);
+      if (batch.done.fetch_add(1, std::memory_order_acq_rel) + 1 == batch.count) {
+        // Notify under the batch mutex the waiter checks its predicate under,
+        // so a waiter that has not yet slept cannot miss this.
+        std::lock_guard<std::mutex> lock(batch.mutex);
+        batch.cv.notify_all();
+      }
     }
   }
 
-  void StartThreadsLocked(int wanted) {
-    while (static_cast<int>(threads_.size()) < wanted) {
+  // Adds threads only for the helpers this batch cannot get from the idle ones.
+  //
+  // The previous version sized the pool to `helpers` outright, which with the
+  // default of one helper per call meant ONE thread for the whole process: the
+  // second concurrent caller onwards got no help at all and still paid the
+  // queue, the wake and the wait.
+  void GrowLocked(int helpers) {
+    const int deficit = helpers - idle_;
+    for (int i = 0; i < deficit && static_cast<int>(threads_.size()) < PoolCap(); ++i) {
       threads_.emplace_back([this] { WorkerLoop(); });
     }
+  }
+
+  // The oldest batch that still has items to claim.  Exhausted batches are left
+  // for their publisher to remove, so they must be skipped rather than blocking
+  // the queue.
+  std::shared_ptr<Batch> PickLocked() {
+    for (auto& batch : queue_) {
+      if (batch->next.load(std::memory_order_relaxed) < batch->count) return batch;
+    }
+    return nullptr;
   }
 
   void WorkerLoop() {
@@ -229,13 +278,12 @@ class CopyPool {
       std::shared_ptr<Batch> batch;
       {
         std::unique_lock<std::mutex> lock(mutex_);
-        cv_.wait(lock, [this] { return !queue_.empty(); });
-        batch = queue_.front();
-        // Popped on claim rather than on completion: the caller is draining it
-        // too, and a batch that is already exhausted must not keep waking
-        // helpers.
-        queue_.pop_front();
+        ++idle_;
+        cv_.wait(lock, [this, &batch] { return (batch = PickLocked()) != nullptr; });
+        --idle_;
       }
+      // Left queued while draining: several helpers working the same batch is
+      // the point, and they share its cursor.
       Drain(*batch);
     }
   }
@@ -244,6 +292,7 @@ class CopyPool {
   std::condition_variable cv_;
   std::deque<std::shared_ptr<Batch>> queue_;
   std::vector<std::thread> threads_;
+  int idle_ = 0;
 };
 
 // How many threads to spread one Submit's copies over, counting the caller.
@@ -258,29 +307,29 @@ class CopyPool {
 // executors above it supplied the parallelism.  Ranged I/O broke that
 // assumption: a layer-wise reader hands one thread thousands of small copies.
 //
-// The default is 2 rather than local mode's 4.  On DeepSeek-V4-Pro's real pool
-// geometry 2 is the best value measured everywhere, not a compromise between
-// workloads (medians of 3, restore ms / TTFL us):
+// 4, matching local mode's UMBP_DRAM_READ_THREADS.  On DeepSeek-V4-Pro's real
+// pool geometry it is best or tied-best on every shape measured (medians of 3,
+// restore ms / TTFL us):
 //
-//                     threads=1        threads=2        threads=4
-//   local  1 rank   10.78 / 1340     10.28 / 1093     10.30 / 1118
-//   local  8 ranks  13.03 / 1810     11.24 / 1492     11.56 / 1669
-//   remote 1 rank   15.29 / 2404     13.61 / 2486     13.64 / 2342
-//   remote 8 ranks  81.92 / 10812    83.78 / 10787    84.16 / 11790
+//                     threads=1        threads=2        threads=4        threads=8
+//   local  1 rank    9.88 / 690       9.71 / 518       9.61 / 425       9.57 / 381
+//   local  8 ranks  10.06 / 853      10.03 / 723       9.83 / 611       9.94 / 682
+//   remote 1 rank   13.23 / 2294     12.06 / 2229     11.50 / 2304     11.51 / 2284
+//   remote 8 ranks  84.44 / 12399    90.55 / 12860    82.58 / 11384    79.78 / 11600
 //
-// Going past 2 costs twice: it starves a concurrent remote half (the NIC's DMA
-// into the scratch arena loses to the copies, and the first layer group -- the
-// one nothing overlaps -- waits), and on the real geometry it does not even pay
-// for the local case, because fragments this small do not keep four threads
-// usefully busy.  An earlier uniform-73,728 B shape did show 4 winning locally;
-// that was the synthetic shape, not the model's.
+// An earlier revision defaulted to 2, because 4 appeared to cost a concurrent
+// remote half its first layer group.  That was not bandwidth: it was this
+// file's own pool handing out one helper for the whole process and making
+// everyone else spin waiting for it.  With that fixed the effect is gone, and
+// the value that looked reckless is simply the right one.  8 buys a little more
+// at one rank and gives it back at eight, so 4 is where this stops.
 //
 // Below the byte floor the threads cost more than they save, so a small batch
 // stays on the calling thread and pays nothing.
 int CopyThreads(size_t total_bytes, size_t copy_count) {
   if (ThreadBackgroundFlag()) return 1;
   static const int kMax = [] {
-    int n = 2;
+    int n = 4;
     if (const char* raw = std::getenv("UMBP_DRAM_COPY_THREADS")) {
       const int v = std::atoi(raw);
       if (v >= 1) n = v;
