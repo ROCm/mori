@@ -115,6 +115,23 @@
 #define MORI_UMBP_METRIC_CLIENT_CAPACITY_UTILIZATION_HELP \
   "Capacity utilization ratio (used / total) in [0,1]"
 
+// --- Logical tier transitions ----------------------------------------------
+// Whether an offload or a promotion ever ran is otherwise only visible to a
+// process that links the tier benchmark, so a served workload cannot tell a
+// working tier graph from one whose every migration fails.
+
+#define MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS "mori_umbp_client_tier_transitions_total"
+#define MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS_HELP \
+  "Logical tier transitions on this client's pool, by outcome"
+
+#define MORI_UMBP_METRIC_CLIENT_TIER_OFFLOADED_BYTES "mori_umbp_client_tier_offloaded_bytes_total"
+#define MORI_UMBP_METRIC_CLIENT_TIER_OFFLOADED_BYTES_HELP \
+  "Bytes moved to a later tier by offload"
+
+#define MORI_UMBP_METRIC_CLIENT_TIER_PROMOTED_BYTES "mori_umbp_client_tier_promoted_bytes_total"
+#define MORI_UMBP_METRIC_CLIENT_TIER_PROMOTED_BYTES_HELP \
+  "Bytes moved to an earlier tier by promote-on-read"
+
 // --- Per-client RPC call counters ------------------------------------------
 // Full name: prefix + sanitized_node_id
 
