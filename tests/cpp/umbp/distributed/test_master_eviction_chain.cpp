@@ -15,6 +15,7 @@
 // which reads exactly like the features being unimplemented.
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <functional>
 #include <map>
@@ -129,36 +130,45 @@ class PoolDispatcher final : public EvictKeyDispatcher {
   uint64_t freed_bytes_ = 0;
 };
 
-// Reports the node as holding `used` of `total` DRAM bytes, so RunOnce sees a
-// bucket over its high watermark. The keys are registered with staggered access
-// times because the default strategy evicts least-recently-accessed first, and a
-// test that cannot tell the order apart cannot tell LRU from arbitrary.
-void PublishNode(InMemoryMasterMetadataStore* store, const std::vector<std::string>& keys,
-                 uint64_t total_bytes, uint64_t used_bytes) {
-  const auto now = Clock::now();
-
+void RegisterNode(InMemoryMasterMetadataStore* store, Clock::time_point now) {
   ClientRegistration registration;
   registration.node_id = kNodeId;
   registration.node_address = "127.0.0.1:1";
   registration.peer_address = "127.0.0.1:2";
-  registration.tier_capacities[TierType::DRAM] = TierCapacity{total_bytes, total_bytes, kPageSize};
   ASSERT_TRUE(store->RegisterClient(registration, now, std::chrono::seconds(60)));
+}
 
+// One heartbeat: `caps` is what makes a bucket look over or under its watermark,
+// and `now` becomes the access time of any key this heartbeat introduces --
+// the store stamps it on first insertion only, so staggering heartbeats is how a
+// test gets a victim order it can predict.
+void ReportHeartbeat(InMemoryMasterMetadataStore* store, uint64_t seq, Clock::time_point now,
+                     const std::map<TierType, TierCapacity>& caps, TierType key_tier,
+                     const std::string& logical_tier, const std::vector<std::string>& keys,
+                     bool full_sync) {
   std::vector<KvEvent> events;
   events.reserve(keys.size());
   for (const auto& key : keys) {
     KvEvent event;
     event.kind = KvEvent::Kind::ADD;
     event.key = key;
-    event.tier = TierType::DRAM;
+    event.tier = key_tier;
     event.size = kPageSize;
-    event.logical_tier = "hot";
+    event.logical_tier = logical_tier;
     events.push_back(std::move(event));
   }
+  store->ApplyHeartbeat(kNodeId, seq, now, caps, events, full_sync);
+}
 
+// Reports the node as holding `used` of `total` DRAM bytes, so RunOnce sees a
+// bucket over its high watermark.
+void PublishNode(InMemoryMasterMetadataStore* store, const std::vector<std::string>& keys,
+                 uint64_t total_bytes, uint64_t used_bytes) {
+  const auto now = Clock::now();
+  RegisterNode(store, now);
   std::map<TierType, TierCapacity> caps;
   caps[TierType::DRAM] = TierCapacity{total_bytes, total_bytes - used_bytes, kPageSize};
-  store->ApplyHeartbeat(kNodeId, /*seq=*/1, now, caps, events, /*is_full_sync=*/true);
+  ReportHeartbeat(store, /*seq=*/1, now, caps, TierType::DRAM, "hot", keys, /*full_sync=*/true);
 }
 
 EvictionConfig OneSecondRounds() {
@@ -334,6 +344,101 @@ TEST(MasterEvictionChain, MasterRoundReclaimsTheParkedSourceOfAMovePromotion) {
   // The promoted copy is the only one left, so the key is still servable.
   EXPECT_TRUE(registry.Get("hot")->Contains("moved"))
       << "the evict drained the promoted target instead of the parked source";
+}
+
+// The timing half of the finding above, which the single-key test cannot reach:
+// with one candidate the master has no ordering decision to make. Victims are
+// named least-recently-accessed first, and a key is promoted precisely because
+// it was just read, so its parked source should be the last thing its tier gives
+// up. That is what makes `move` reclaim late rather than not at all -- a
+// distinction worth a test, because the two look identical over any window
+// shorter than the tier's turnover.
+TEST(MasterEvictionChain, ParkedMoveSourceIsNamedLastAmongColderKeys) {
+  constexpr auto kShortLease = std::chrono::milliseconds(50);
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  PageBackend::OwnershipConfig hot_ownership;
+  hot_ownership.buffer_sizes = {4 * kPageSize};
+  auto hot = MakePageBackend(TierType::DRAM, kPageSize, hot_ownership, kNoExpiry, kShortLease);
+  ASSERT_TRUE(hot->Init(&engine));
+  ASSERT_TRUE(registry.Register("hot", std::move(hot)));
+  PageBackend::OwnershipConfig cold_ownership;
+  cold_ownership.buffer_sizes = {10 * kPageSize};
+  auto cold = MakePageBackend(TierType::SSD, kPageSize, cold_ownership, kNoExpiry, kShortLease);
+  ASSERT_TRUE(cold->Init(&engine));
+  ASSERT_TRUE(registry.Register("cold", std::move(cold)));
+
+  auto tiers = HotColdOnEvict();
+  tiers.back().promote_trigger = PoolPromoteTrigger::kOnRead;
+  tiers.back().promotion_mode = PoolTransitionMode::kMove;
+  auto compiled = LogicalTierGraph::Compile(tiers, registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+
+  const std::vector<std::string> colder = {"cold0", "cold1", "cold2"};
+  const auto place_in_cold = [&](const std::string& key) {
+    PoolPlacementRequest request;
+    request.key = key;
+    request.size = kPageSize;
+    request.tier = TierType::DRAM;
+    request.logical_tier = "cold";
+    auto allocation = pool.BatchAllocate({request}).front();
+    ASSERT_EQ(allocation.allocation.outcome, AllocateOutcome::kSuccessAllocated) << key;
+    ASSERT_TRUE(pool.BatchCommit({PoolCommitRequest{
+                                     {allocation.backend_id, allocation.allocation.slot_id}, key}})
+                    .front()
+                    .commit.success)
+        << key;
+  };
+  for (const auto& key : colder) place_in_cold(key);
+  place_in_cold("moved");
+
+  // Read "moved" so it promotes; move defers the source delete behind the read
+  // lease, leaving the source parked in cold alongside the three colder keys.
+  ASSERT_TRUE(pool.BatchResolve({"moved"}, false).front().resolved.found);
+  ASSERT_TRUE(
+      WaitFor([&] { return registry.Get("hot")->Contains("moved"); }, std::chrono::seconds(2)));
+  ASSERT_TRUE(registry.Get("cold")->Contains("moved"));
+
+  InMemoryMasterMetadataStore store;
+  const auto now = Clock::now();
+  RegisterNode(&store, now);
+  // 10 of 10 SSD pages used, draining to 0.7, so the budget covers three keys of
+  // the four present. DRAM is left comfortably under its watermark so the hot
+  // tier contributes no bucket of its own.
+  std::map<TierType, TierCapacity> caps;
+  caps[TierType::SSD] = TierCapacity{10 * kPageSize, 0, kPageSize};
+  caps[TierType::DRAM] = TierCapacity{10 * kPageSize, 9 * kPageSize, kPageSize};
+  // The three colder keys enter ten seconds earlier, so their access stamps are
+  // unambiguously older than the promoted key's.
+  ReportHeartbeat(&store, /*seq=*/1, now - std::chrono::seconds(10), caps, TierType::SSD, "cold",
+                  colder, /*full_sync=*/true);
+  ReportHeartbeat(&store, /*seq=*/2, now, caps, TierType::SSD, "cold", {"moved"},
+                  /*full_sync=*/false);
+
+  PoolDispatcher dispatcher(&pool);
+  EvictionManager manager(store, OneSecondRounds(), &dispatcher);
+  manager.Start();
+  const bool dispatched =
+      WaitFor([&] { return dispatcher.Dispatched().size() >= colder.size(); },
+              std::chrono::seconds(8));
+  manager.Stop();
+
+  ASSERT_TRUE(dispatched) << "master never named the colder keys";
+  const auto named = dispatcher.Dispatched();
+
+  // The parked source is the newest entry in its tier, so a budget that covers
+  // three of four keys must spend it on the other three.
+  EXPECT_EQ(std::count(named.begin(), named.end(), "moved"), 0)
+      << "the just-promoted key was named ahead of colder entries";
+  for (const auto& key : colder) {
+    EXPECT_EQ(std::count(named.begin(), named.end(), key), 1) << key << " was not named";
+  }
+  // And it really is still occupying the tier: this is the lag, stated as an
+  // observation rather than inferred from the ordering.
+  EXPECT_TRUE(registry.Get("cold")->Contains("moved"))
+      << "parked source was reclaimed after all, so the ordering concern is moot";
+  EXPECT_TRUE(registry.Get("hot")->Contains("moved"));
 }
 
 }  // namespace
