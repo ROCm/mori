@@ -574,6 +574,16 @@ std::chrono::milliseconds DramReadLeaseTtl() {
   return v;
 }
 
+// The SSD equivalent, which is a different number for a different reason: it has
+// to cover an SSD read plus the RDMA, not just the RDMA. It is also the window a
+// staging page stays claimed, so it sets this backend's read concurrency against
+// a fixed arena -- shortening it frees pages and costs read coalescing.
+std::chrono::milliseconds SsdReadLeaseTtl() {
+  static const auto v = GetEnvMilliseconds("UMBP_SSD_READ_LEASE_MS",
+                                           std::chrono::milliseconds(3000), /*min_allowed=*/1);
+  return v;
+}
+
 // ---------------------------------------------------------------------------
 //  Config / proto translation
 // ---------------------------------------------------------------------------
@@ -686,7 +696,7 @@ std::unique_ptr<MediumBackend> MakeConfiguredBackend(const BackendInstanceConfig
       ssd_cfg.staging_hugepage_size = staging_hugepage_size;
       ssd_cfg.ssd = config.ssd;
       ssd_cfg.ssd.enabled = true;
-      ssd_cfg.read_lease_ttl = DramReadLeaseTtl();
+      ssd_cfg.read_lease_ttl = SsdReadLeaseTtl();
       return MakeSsdBackend(std::move(ssd_cfg));
     }
     case TierType::UNKNOWN:
