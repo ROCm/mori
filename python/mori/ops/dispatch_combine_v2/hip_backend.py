@@ -44,7 +44,14 @@ from .symm_arena import SymmArena
 
 # C++ offset-argument stem -> arena region name. The C++ side names the offsets
 # after its own EpArgs fields (offTokOff -> "tokOff"); the region names match the
-# FlyDSL op's, so one arena can serve either backend.
+# FlyDSL op's.
+#
+# Same NAMES, and for every region but one the same SIZE -- `out_scales` is the
+# exception: this backend lays the rows down at scale_stride_bytes() (the caller's
+# row padded to 128 B) while FlyDSL uses the row as given. An arena sized for
+# FlyDSL and handed to this backend is overrun by its last tokens, and nothing
+# would catch it: a plan binds offsets, never sizes. A caller building its own
+# arena must size `out_scales` from scale_stride_bytes() on the op it will run.
 _REGIONS = {
     "tokOff": "tok_off",
     "recvNum": "recv_num",
@@ -176,12 +183,19 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         """
         return (cfg.scale_dim * cfg.scale_type_size + 3) // 4
 
-    scale_stride_bytes = staticmethod(scale_stride_bytes)
+    def scale_stride_bytes(self) -> int:
+        """This backend pads the row to 128 B; the base returns it unchanged.
+
+        The module-level function of the same name is the form to use when there
+        is no op yet -- sizing an arena before constructing the thing that will
+        read it, which is exactly what an external caller does.
+        """
+        return scale_stride_bytes(self._scale_row_bytes())
 
     @classmethod
     def _scale_stride_i32(cls, cfg) -> int:
         """Dwords per DESTINATION scale row, 0 when the transport is off."""
-        return cls.scale_stride_bytes(cls._scale_i32(cfg) * 4) // 4
+        return scale_stride_bytes(cls._scale_i32(cfg) * 4) // 4
 
     def _regions(self, cfg):
         # token_nbytes / combine_token_nbytes rather than elem*hidden: they are the
@@ -202,6 +216,15 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # Sized by the DESTINATION stride, which is the caller's row padded to
             # 128 B: the kernel lays the rows down at that pitch, so an arena sized
             # for the unpadded row would be overrun by the last tokens.
+            #
+            # Padding the rows only aligns them if the region itself starts aligned,
+            # and that is a different file's constant. Checked rather than assumed:
+            # lowering it would show up as a ~1.7x dispatch regression, which is not
+            # a symptom anyone traces back to an arena constant.
+            assert SymmArena._ALIGN % _SCALE_ALIGN == 0, (
+                f"SymmArena._ALIGN={SymmArena._ALIGN} does not keep scale regions "
+                f"{_SCALE_ALIGN} B-aligned; the padding in EpScaleStride buys nothing"
+            )
             regions.append(("out_scales", cap * self._scale_stride_i32(cfg) * 4))
         return regions
 

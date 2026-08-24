@@ -300,7 +300,13 @@ static_assert(kEpScaleStride == 0 || (size_t)kEpScaleSlots * kEpScaleStride <= (
               "EP scale staging exceeds 1 GiB per compiled variant -- it grows as "
               "world_size^2 * maxTokPerRank * EpScaleStride; re-index it block-locally "
               "before going wider");
-__device__ unsigned char
+// __align__ because the padding above only buys anything if the BASE is aligned
+// too: TdmWholeOrSplit128 derives its split from an offset, and that one split
+// drives both the load out of this array and the store to the peer. The per-row
+// phase is self-consistent already (rows are kEpScaleStride apart, itself a
+// multiple of 128), so the base was the one unstated assumption. Free, and it
+// turns the assumption into something the compiler guarantees.
+__device__ __align__(EpScaleAlign) unsigned char
     _cusplit_stgScale[kEpScaleSlots * (kEpScaleStride > 0 ? kEpScaleStride : 1)];
 
 /* ------------------------------------------------------------------------- */

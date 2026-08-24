@@ -40,6 +40,11 @@ class SymmArena:
     """One cco symmetric window carved into named, aligned sub-regions. A kernel
     reaches peer pe's copy of region R via cco.Window(handle).lsa_ptr(pe, off_R)."""
 
+    # Every region starts here. It is not free to lower: EpScaleAlign in
+    # ep_cfg.hpp is 128, and the scale transport's whole reason for padding its
+    # rows is that a run of them starts on a 128 B boundary -- which only holds
+    # if the region does too. Dropping this below 128 would give that back
+    # silently, as a ~1.7x dispatch regression rather than as a failure.
     _ALIGN = 256
 
     def __init__(self, comm, regions):

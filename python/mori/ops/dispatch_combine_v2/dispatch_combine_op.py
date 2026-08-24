@@ -575,6 +575,26 @@ class EpDispatchCombineOp:
     def capabilities(self) -> frozenset[str]:
         return self._kernels.capabilities
 
+    def scale_stride_bytes(self) -> int:
+        """Bytes between consecutive rows of the out_scales region, 0 when off.
+
+        The row a caller hands in is not necessarily the row a backend lays down
+        -- the HIP one pads to 128 B so a transfer of consecutive destination
+        slots starts aligned. Whoever sizes the region, or reads it through a raw
+        pointer, needs the real pitch and must not infer it from scale_dim.
+
+        On the base so a consumer does not branch on the backend: each one
+        answers for the layout it actually produces, and the default here is
+        "exactly the row you gave me", which is what a backend that does not pad
+        inherits.
+        """
+        return self._scale_row_bytes()
+
+    def _scale_row_bytes(self) -> int:
+        """The caller's row in bytes, dword-rounded. 0 when the transport is off."""
+        n = self.cfg.scale_dim * self.cfg.scale_type_size
+        return ((n + 3) // 4) * 4 if n else 0
+
     # -- shared: variant selection -----------------------------------------
 
     def _pick(self, num_tokens):
@@ -666,6 +686,14 @@ class EpDispatchCombineOp:
         exclusive. Returns (out, out_weights, out_scales, out_indices,
         total_recv[, routing]); out == arena disp_out, safe to read without
         .clone() because combine stages into a separate out_tok buffer.
+
+        out_scales is [max_recv, scale_dim_i32] on both backends, but it is not
+        always CONTIGUOUS: a backend may lay the rows down at a wider pitch and
+        hand back a strided view of the meaningful dwords (see
+        scale_stride_bytes). Values compare equal either way; anything that wants
+        packed memory has to .contiguous(), and anything reading the region
+        through a raw pointer must stride by scale_stride_bytes(), not by the
+        shape of this tensor.
 
         total_recv is a DEVICE tensor. Reading it on the host is a full sync that
         costs more than the kernel and makes the op uncapturable, so neither

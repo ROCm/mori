@@ -328,11 +328,24 @@ constexpr int EpTokenBytes(const EpCfg& c) { return c.hiddenDim * EpElemSize(c.d
 // Derived rather than a second Cfg field, so a caller states only the row it has
 // and mori states the row it lays down. It is padded on every arch, not just the
 // TDM one: the portable body does not need the alignment, but a destination
-// layout that changed with the arch would fork every consumer of it, and the
-// padding is ~14% of a side channel that is itself ~3% of an fp8 payload.
+// layout that changed with the arch would fork every consumer of it.
+//
+// The pad is UNCONDITIONAL, so what it costs depends entirely on how close the
+// row already is to a multiple of 128:
+//     224 B (hidden 7168, one e8m0 per 32)  -> 256    1.14x
+//      32 B                                 -> 128    4x
+//       4 B (one fp32 scale per token)      -> 128    32x
+// Three places pay it, and the one that hurts is the gfx1250 staging pool: it is
+// worldSize^2 * maxTokPerRank * THIS, once per compiled variant, so a 4 B row at
+// EP8/8192 goes from 2 MiB to 64 MiB per variant. The portable body instead
+// writes 3x more zeroes than data to a peer. Neither is a reason to fork the
+// layout -- the static_assert below bounds the extreme -- but "~14%" is only true
+// near the top of that table.
 //
 // ANY reader of the destination -- the receiving kernel, the arena sizing, a test
-// -- must use this, not Cfg.scaleBytes.
+// -- must use this, not Cfg.scaleBytes. The alignment it buys also assumes the
+// arena hands the region out on at least this boundary; SymmArena._ALIGN is 256
+// and says so next to its own constant.
 constexpr int EpScaleAlign = 128;
 constexpr int EpScaleStride(const EpCfg& c) {
   return c.scaleBytes <= 0 ? 0 : (c.scaleBytes + EpScaleAlign - 1) / EpScaleAlign * EpScaleAlign;
