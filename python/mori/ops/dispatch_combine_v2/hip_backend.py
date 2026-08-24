@@ -68,6 +68,30 @@ _DISPATCH_DTYPES = {
     torch.float4_e2m1fn_x2: 1,  # nominal: cfg.token_nbytes is what sizes buffers
 }
 _COMBINE_DTYPES = {torch.bfloat16: 2, torch.float32: 4}
+# Must match EpScaleAlign in include/mori/ops/dispatch_combine_v2/ep_cfg.hpp.
+_SCALE_ALIGN = 128
+
+
+def scale_stride_bytes(scale_bytes: int) -> int:
+    """What a DESTINATION scale row is laid down at: EpScaleStride in ep_cfg.hpp.
+
+    The caller states the row it has; mori pads it to 128 B so that a transfer of
+    a run of consecutive destination slots starts aligned, which is the whole
+    reason the padding exists (TdmWholeOrSplit128 only gives a body to the
+    aligned part of a run). The extra bytes are written as zero.
+
+    A consumer that addresses the region itself -- a receiving kernel handed the
+    base pointer -- must stride by this. One that goes through recv_scales() does
+    not: that view hides the padding.
+
+    Mirrored here rather than read out of the C++ because the sizing happens
+    before any kernel exists; the two must be changed together.
+    """
+    if scale_bytes <= 0:
+        return 0
+    return (scale_bytes + _SCALE_ALIGN - 1) // _SCALE_ALIGN * _SCALE_ALIGN
+
+
 # Must match EpXdbFlagSlots in include/mori/ops/dispatch_combine_v2/ep_cfg.hpp.
 _XDB_FLAG_SLOTS = 256
 
@@ -144,9 +168,20 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     @staticmethod
     def _scale_i32(cfg) -> int:
-        """Dwords per scale row, 0 when the transport is off. Same rounding the
-        FlyDSL backend uses, so both lay the region out identically."""
+        """Dwords in the SOURCE scale row -- what the caller hands us.
+
+        Rounded up to a dword the way the FlyDSL backend does; _unsupported
+        rejects a row that needed the rounding, so this only ever restates a
+        width that was already whole.
+        """
         return (cfg.scale_dim * cfg.scale_type_size + 3) // 4
+
+    scale_stride_bytes = staticmethod(scale_stride_bytes)
+
+    @classmethod
+    def _scale_stride_i32(cls, cfg) -> int:
+        """Dwords per DESTINATION scale row, 0 when the transport is off."""
+        return cls.scale_stride_bytes(cls._scale_i32(cfg) * 4) // 4
 
     def _regions(self, cfg):
         # token_nbytes / combine_token_nbytes rather than elem*hidden: they are the
@@ -164,9 +199,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             ("cross_device_barrier", cfg.world_size * 8),
         ]
         if self._scale_i32(cfg):
-            # Same name and dword-padded sizing as the FlyDSL backend, so one arena
-            # serves either and a caller can swap backends without relaying it out.
-            regions.append(("out_scales", cap * self._scale_i32(cfg) * 4))
+            # Sized by the DESTINATION stride, which is the caller's row padded to
+            # 128 B: the kernel lays the rows down at that pitch, so an arena sized
+            # for the unpadded row would be overrun by the last tokens.
+            regions.append(("out_scales", cap * self._scale_stride_i32(cfg) * 4))
         return regions
 
     def _unsupported(self, cfg) -> tuple[str, ...]:
@@ -305,13 +341,24 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     def recv_scales(self):
         """The forwarded scale rows, or None when the transport is off -- the same
         answer FlyDSL gives, and the same (recv_cap, dwords) int32 view, so a caller
-        cannot tell the backends apart."""
+        cannot tell the backends apart.
+
+        The rows sit `scale_stride_bytes` apart, not `n_i32 * 4`: this returns a
+        STRIDED view of the meaningful dwords, so the padding stays mori's business
+        for anyone who just wants the values. A consumer that addresses the region
+        itself -- a kernel taking the base pointer -- has to know the real pitch and
+        should ask for it (scale_stride_bytes) rather than infer it from this shape.
+        """
         n_i32 = self._scale_i32(self.cfg)
         if not n_i32:
             return None
-        return from_gpu_ptr(
-            self.arena.local_ptr("out_scales"), (self._recv_cap, n_i32), torch.int32
+        stride_i32 = self._scale_stride_i32(self.cfg)
+        rows = from_gpu_ptr(
+            self.arena.local_ptr("out_scales"),
+            (self._recv_cap, stride_i32),
+            torch.int32,
         )
+        return rows[:, :n_i32]
 
     def local_expert_count(self):
         raise NotImplementedError(

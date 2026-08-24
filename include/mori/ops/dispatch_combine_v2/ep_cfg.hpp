@@ -316,6 +316,28 @@ constexpr int EpCombineSharedBytes(const EpCfg& c) {
 
 constexpr int EpTokenBytes(const EpCfg& c) { return c.hiddenDim * EpElemSize(c.dtype); }
 
+// The scale row's SLOT stride, which is not the row the caller handed us.
+//
+// A scale transfer is a run of consecutive destination slots, so the slot stride
+// is what decides whether a run STARTS on a 128 B boundary -- and TdmWholeOrSplit128
+// only yields a `body` for the part of a run that does; the rest degrades to the
+// scalar global->global fallback. At the natural hidden/32 = 224 B only every 4th
+// run starts aligned. Measured at 512 tokens/rank, hidden 7168, EP4 on gfx1250:
+// dispatch 157.7us at 224 B, 94.8us at 256 B.
+//
+// Derived rather than a second Cfg field, so a caller states only the row it has
+// and mori states the row it lays down. It is padded on every arch, not just the
+// TDM one: the portable body does not need the alignment, but a destination
+// layout that changed with the arch would fork every consumer of it, and the
+// padding is ~14% of a side channel that is itself ~3% of an fp8 payload.
+//
+// ANY reader of the destination -- the receiving kernel, the arena sizing, a test
+// -- must use this, not Cfg.scaleBytes.
+constexpr int EpScaleAlign = 128;
+constexpr int EpScaleStride(const EpCfg& c) {
+  return c.scaleBytes <= 0 ? 0 : (c.scaleBytes + EpScaleAlign - 1) / EpScaleAlign * EpScaleAlign;
+}
+
 // gfx1250 launch LDS. Dispatch stages one token tile per warp through the TDM
 // engine; combine reserves the whole budget and sizes its tiles at runtime.
 // EpCombine1250xLdsBudget must match MORI_COMB_LDS_BUDGET in ep_intranode_1250x.hpp.
