@@ -108,6 +108,7 @@ cco_sdma_quiet_queue = _binding("sdma_quiet_queue")
 # ── axis-free symbols ──
 # cco_lsa_ptr(window, peerLsaRank, offset) -> peer's load/store-accessible VA.
 cco_lsa_ptr = _binding("lsa_ptr")
+cco_system_fence = _binding("system_fence")
 
 cco_devcomm_rank = _binding("devcomm_rank")
 cco_devcomm_world_size = _binding("devcomm_world_size")

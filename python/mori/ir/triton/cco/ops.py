@@ -89,9 +89,33 @@ def _make_extern(name: str, meta: dict):
     return _fn
 
 
+def _make_extern_noargs(name: str, meta: dict):
+    symbol = meta["symbol"]
+    ret_type = _TYPE_MAP[meta["ret"]]
+    is_pure = meta.get("pure", False)
+
+    @core.extern
+    def _fn(_semantic=None, _sym=symbol, _rt=ret_type, _pure=is_pure):
+        return core.extern_elementwise(
+            _LIB_NAME,
+            "",
+            [],
+            {(): (_sym, _rt)},
+            is_pure=_pure,
+            _semantic=_semantic,
+        )
+
+    _set_name(_fn, name, meta)
+    return _fn
+
+
 def _build_all():
     return {
-        name: _make_extern(name, meta)
+        name: (
+            _make_extern_noargs(name, meta)
+            if not meta["args"]
+            else _make_extern(name, meta)
+        )
         for name, meta in CCO_DEVICE_FUNCTIONS.items()
     }
 

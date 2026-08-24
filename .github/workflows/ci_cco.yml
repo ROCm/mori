@@ -170,7 +170,8 @@ jobs:
               timeout 300 pytest -v \
                 tests/python/cco/test_triton_bindings.py \
                 tests/python/cco/test_triton_lsa.py \
-                tests/python/cco/test_triton_sdma.py"
+                tests/python/cco/test_triton_sdma.py \
+                tests/python/cco/test_triton_benchmark.py"
 
       - name: Run CCO Triton GDA tests (single AINIC rail)
         run: |

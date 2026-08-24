@@ -102,6 +102,13 @@ CCO_DEV uint64_t cco_lsa_ptr(uint64_t window, int peer, uint64_t offset) {
   return reinterpret_cast<uint64_t>(w->winBase) + static_cast<uint64_t>(peer) * stride + offset;
 }
 
+// System-scope publication fence used by direct LSA benchmark/store paths.
+// Latency kernels fence from block lane 0; bandwidth kernels fence every lane.
+CCO_DEV int cco_system_fence(int leaderOnly) {
+  if (!leaderOnly || threadIdx.x == 0) __threadfence_system();
+  return 0;
+}
+
 // Expose SDMA C API. Symbol tags kept in sync with _bindings.py:
 //   put/get carry a coop tag (thread/warp/block); a "_ns" suffix selects the
 //   no-signal (fire-and-forget) variant.

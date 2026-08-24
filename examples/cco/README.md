@@ -108,6 +108,10 @@ Replace `rocep9s0` with one active HCA on the host. Pinning one HCA avoids the
 known local cross-rail hang on multi-AINIC systems; it is a correctness
 workaround and limits aggregate bandwidth.
 
+For latency/bandwidth sweeps and automated comparison with the C++ binaries,
+use `benchmark/cco/triton/bench_p2p.py` and
+`benchmark/cco/compare_triton_cpp.py`; see `benchmark/cco/README.md`.
+
 ---
 
 ## 4. Run the C++ examples

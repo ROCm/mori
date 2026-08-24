@@ -120,6 +120,13 @@ _add(
     pure=True,
     family="lsa",
 )
+_add(
+    "system_fence",
+    "cco_system_fence",
+    [_I32],
+    _I32,
+    family="sync",
+)
 for _field in ("rank", "world_size", "lsa_rank", "lsa_size"):
     _add(
         f"devcomm_{_field}",
