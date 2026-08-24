@@ -48,7 +48,7 @@
       "backends": {
         "ssd_b": 100
       },
-      "promote_on_read": true,
+      "promote_trigger": "on_read",
       "promotion_mode": "copy"
     }
   ]

@@ -19,6 +19,15 @@ enum class PoolOffloadTrigger {
   kWatermark,
 };
 
+// Mirrors PoolOffloadTrigger so a tier states when to promote the same way it
+// states when to offload, and a new rule is a new enumerator rather than
+// another boolean beside the last one.
+enum class PoolPromoteTrigger {
+  kNever,
+  kOnRead,
+  kOnHits,
+};
+
 enum class PoolTransitionMode {
   kMove,
   kCopy,
@@ -46,7 +55,10 @@ struct LogicalTierConfig {
   double low_watermark = 0.7;
   std::string name;
   bool entry = false;
-  bool promote_on_read = false;
+  PoolPromoteTrigger promote_trigger = PoolPromoteTrigger::kNever;
+  // Reads on this tier before a key is promoted. Only kOnHits reads it, and a
+  // threshold of 1 is kOnRead spelled differently, so the parser requires >= 2.
+  uint32_t promote_hits = 0;
   PoolTransitionMode promotion_mode = PoolTransitionMode::kCopy;
 };
 

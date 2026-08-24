@@ -36,7 +36,8 @@ class LogicalTierGraph {
     PoolOffloadTrigger trigger = PoolOffloadTrigger::kOnEvict;
     double high_watermark = 0.9;
     double low_watermark = 0.7;
-    bool promote_on_read = false;
+    PoolPromoteTrigger promote_trigger = PoolPromoteTrigger::kNever;
+    uint32_t promote_hits = 0;
     PoolTransitionMode promotion_mode = PoolTransitionMode::kCopy;
   };
 
