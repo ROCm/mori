@@ -265,6 +265,20 @@ target_link_libraries(
   PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
           gtest_main)
 
+# Layer-wise ranged-restore bench: drives BatchGetRanges the way the sglang
+# tree connector does (N ranks walking layer groups over the same keys) and
+# reports TTFL, wire bytes and repeat-remote alongside latency.  Standalone
+# executable, not a CTest target.
+add_executable(bench_umbp_pool_client_ranges bench_pool_client_ranges.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(bench_umbp_pool_client_ranges PRIVATE
+                      -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  bench_umbp_pool_client_ranges
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+
 # RoutePut strategy bench: compares batch put / put-then-get performance and
 # placement distribution across UMBP_ROUTE_PUT_SELECT_ALGO x
 # UMBP_ROUTE_PUT_NODE_AFFINITY under roomy/tight capacity regimes.  Standalone
