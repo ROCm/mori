@@ -208,10 +208,15 @@ PolicyBackendSpec ParseBackend(const std::string& name, const Value& value) {
       backend.numa_node = AsInt(*numa, -1, context + ".numa_node");
     }
   } else if (type == "ssd") {
-    RejectUnknownFields(object, {"type", "capacity", "path"}, context);
+    RejectUnknownFields(object, {"type", "capacity", "path", "staging_slots"}, context);
     backend.tier = TierType::SSD;
     backend.path = AsString(RequiredField(object, "path", context), context + ".path");
     if (backend.path.empty()) Invalid(context + ".path: must not be empty");
+    // Minimum 1, not 0: 0 is how a config assembled in code says "leave the
+    // default", which is not a thing a written-out field can mean.
+    if (const Value* slots = OptionalField(object, "staging_slots")) {
+      backend.staging_slots = AsInt(*slots, 1, context + ".staging_slots");
+    }
   } else {
     Invalid(context + ".type: expected 'dram', 'hbm', or 'ssd'");
   }
@@ -350,6 +355,7 @@ LogicalTierIndex ValidateBackendPolicy(const BackendPolicyConfig& policy) {
       if (backend.numa_node < -1) Invalid(context + ": numa_node must be >= -1");
     } else if (backend.tier == TierType::SSD) {
       if (backend.path.empty()) Invalid(context + ": path must not be empty");
+      if (backend.staging_slots < 0) Invalid(context + ": staging_slots must be >= 0");
     } else {
       Invalid(context + ": unsupported tier");
     }
@@ -603,6 +609,9 @@ bool ApplyBackendPolicy(const BackendPolicyConfig& policy, PoolClientConfig* con
           instance.ssd.ssd.capacity_bytes = static_cast<size_t>(backend.capacity_bytes);
           instance.ssd.ssd.storage_dir = backend.path + storage_path_suffix;
           instance.ssd.ssd.ssd_backend = "file";
+          if (backend.staging_slots > 0) {
+            instance.ssd_staging_buffer_slots = backend.staging_slots;
+          }
         }
         concrete_names.push_back(instance.name);
         concrete_backends.push_back(std::move(instance));

@@ -216,6 +216,53 @@ TEST(BackendPolicyConfig, LowersPromoteTriggerAndRejectsIncoherentThresholds) {
   }
 }
 
+// An SSD backend's staging arena is staging_slots * page_size, and a read that
+// cannot claim a slot is reported as a miss rather than as backpressure, so the
+// slot count is a hard read-concurrency ceiling. Left at the default of 16 a
+// 64 KiB-page backend has a 1 MiB arena, which under a mixed workload fails the
+// majority of its reads and, because the offload target then refuses pages,
+// most of its writes too. Omitting the field must keep the previous default so
+// existing policies are unaffected.
+TEST(BackendPolicyConfig, LowersSsdStagingSlotsAndDefaultsWhenAbsent) {
+  auto loaded = LoadBackendPolicyJson(R"json(
+    {"backends":{
+       "with_slots":{"type":"ssd","capacity":"1GiB","path":"/tmp/a","staging_slots":512},
+       "without":{"type":"ssd","capacity":"1GiB","path":"/tmp/b"}},
+     "tiers":[{"backends":{"with_slots":1}},{"backends":{"without":1}}]}
+  )json");
+  ASSERT_TRUE(loaded.ok()) << loaded.error;
+
+  PoolClientConfig output;
+  output.dram_page_size = 64ULL << 10;
+  std::string error;
+  ASSERT_TRUE(ApplyBackendPolicy(*loaded.config, &output, &error)) << error;
+
+  const auto slots_of = [&](const std::string& name) {
+    for (const auto& backend : output.backends) {
+      if (backend.name == name) return backend.ssd_staging_buffer_slots;
+    }
+    ADD_FAILURE() << "backend '" << name << "' missing";
+    return -1;
+  };
+  EXPECT_EQ(slots_of("with_slots"), 512);
+  EXPECT_EQ(slots_of("without"), BackendInstanceConfig{}.ssd_staging_buffer_slots);
+
+  // A DRAM backend has no staging arena, so the field must not be silently
+  // accepted there and then ignored.
+  auto on_dram = LoadBackendPolicyJson(R"json(
+    {"backends":{"d":{"type":"dram","capacity":"1GiB","staging_slots":512}},
+     "tiers":[{"backends":{"d":1}}]}
+  )json");
+  EXPECT_FALSE(on_dram.ok());
+  EXPECT_NE(on_dram.error.find("unknown field"), std::string::npos);
+
+  auto negative = LoadBackendPolicyJson(R"json(
+    {"backends":{"s":{"type":"ssd","capacity":"1GiB","path":"/tmp/c","staging_slots":-1}},
+     "tiers":[{"backends":{"s":1}}]}
+  )json");
+  EXPECT_FALSE(negative.ok());
+}
+
 TEST(BackendPolicyConfig, ApplyIsAtomicWhenLoweringFails) {
   auto loaded = LoadBackendPolicyJson(R"json(
     {"backends":{"d":{"type":"dram","capacity":"1MiB"}},
