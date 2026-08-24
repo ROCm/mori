@@ -578,6 +578,27 @@ only `4: Warm Reboot` supported — a host reboot is the only recovery path.
 
 ---
 
+## Known environment issues
+
+Some machines are configured in ways that make MORI slow without anything being wrong
+with MORI. The **`known-issues`** skill collects them, with detection commands and fixes.
+
+Worth a look on any newly deployed box, and mandatory reading before debugging a
+performance problem that only shows up on one machine. The most common one:
+
+- **HIP VMM peer traffic silently falls off XGMI** on kernels built without
+  `CONFIG_DMABUF_MOVE_NOTIFY` / `CONFIG_PCI_P2PDMA` (stock Ubuntu 22.04 GA 5.15).
+  Hits `mori-cco` (EPv2) but not `mori-shmem` (EPv1); costs ~9x a2a bandwidth and
+  reports no error. One-line check:
+
+  ```bash
+  grep -E 'CONFIG_(PCI_P2PDMA|DMABUF_MOVE_NOTIFY)=' /boot/config-$(uname -r)
+  ```
+
+  Both must print `=y`. See `.claude/skills/known-issues/SKILL.md`.
+
+---
+
 ## Done — Report Back
 
 - Base image and OS
@@ -586,6 +607,8 @@ only `4: Warm Reboot` supported — a host reboot is the only recovery path.
 - GPU arch and NIC type as reported by MORI
 - Kernels: JIT on first use (`~/.mori/jit/`)
 - `mori check` result — include full output, highlight any `[WARN]` or `[FAIL]`
+- Kernel `CONFIG_PCI_P2PDMA` / `CONFIG_DMABUF_MOVE_NOTIFY` — flag it if either is
+  missing (see Known environment issues above)
 - Attach command (working directory set to the MORI source tree):
 
 ```bash
