@@ -4235,26 +4235,49 @@ void PoolClient::PublishComponentMetrics() {
     metric_publisher_.Publish("transfer", {}, *transfer_engine_, sink);
   }
 
-  // Logical tier transitions.  PeerPool accumulates these and nothing else
-  // reads them, so without this a served workload cannot distinguish a tier
-  // graph that is migrating from one whose every migration fails.
+  // Logical tier transitions.  PeerPool accumulates these and nothing outside
+  // the tier benchmark reads them, so without this a served workload cannot
+  // distinguish a tier graph that is migrating from one whose every migration
+  // fails.  Read hits carry the logical tier as a label because the per-backend
+  // labels above collapse every instance of a medium into one series, which
+  // hides which tier actually served a read.
   if (default_pool_ != nullptr) {
-    const TierTransitionMetrics tiers = default_pool_->TransitionMetrics();
-    const std::vector<MetricSample> samples = {
-        {MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS, MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS_HELP,
-         {{"outcome", "attempted"}}, tiers.attempted, MetricKind::kCounter},
-        {MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS, MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS_HELP,
-         {{"outcome", "succeeded"}}, tiers.succeeded, MetricKind::kCounter},
-        {MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS, MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS_HELP,
-         {{"outcome", "failed"}}, tiers.failed, MetricKind::kCounter},
-        {MORI_UMBP_METRIC_CLIENT_TIER_OFFLOADED_BYTES,
-         MORI_UMBP_METRIC_CLIENT_TIER_OFFLOADED_BYTES_HELP,
-         {}, tiers.offloaded_bytes, MetricKind::kCounter},
-        {MORI_UMBP_METRIC_CLIENT_TIER_PROMOTED_BYTES,
-         MORI_UMBP_METRIC_CLIENT_TIER_PROMOTED_BYTES_HELP,
-         {}, tiers.promoted_bytes, MetricKind::kCounter},
+    // Same absolute-to-delta rebasing as the backend counters above; these are
+    // cumulative and AddCounter takes an increment.
+    const auto publish = [&](const char* name, const char* help,
+                             MasterClient::Labels labels, uint64_t value) {
+      std::string id = "pool";
+      id += '\0';
+      id += name;
+      for (const auto& [k, v] : labels) {
+        id += '\0';
+        id += k;
+        id += '=';
+        id += v;
+      }
+      uint64_t& last = backend_counter_last_[id];
+      if (value > last) {
+        master_client_->AddCounter(name, help, labels, static_cast<double>(value - last));
+      }
+      last = value;
     };
-    metric_publisher_.Publish("pool:tier_transitions", {}, samples, sink);
+
+    const TierTransitionMetrics tiers = default_pool_->TransitionMetrics();
+    publish(MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS, MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS_HELP,
+            {{"outcome", "attempted"}}, tiers.attempted);
+    publish(MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS, MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS_HELP,
+            {{"outcome", "succeeded"}}, tiers.succeeded);
+    publish(MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS, MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS_HELP,
+            {{"outcome", "failed"}}, tiers.failed);
+    publish(MORI_UMBP_METRIC_CLIENT_TIER_OFFLOADED_BYTES,
+            MORI_UMBP_METRIC_CLIENT_TIER_OFFLOADED_BYTES_HELP, {}, tiers.offloaded_bytes);
+    publish(MORI_UMBP_METRIC_CLIENT_TIER_PROMOTED_BYTES,
+            MORI_UMBP_METRIC_CLIENT_TIER_PROMOTED_BYTES_HELP, {}, tiers.promoted_bytes);
+
+    for (const auto& [tier, hits] : default_pool_->TierReadHits()) {
+      publish(MORI_UMBP_METRIC_CLIENT_TIER_READ_HITS, MORI_UMBP_METRIC_CLIENT_TIER_READ_HITS_HELP,
+              {{"tier", tier}}, hits);
+    }
   }
 }
 

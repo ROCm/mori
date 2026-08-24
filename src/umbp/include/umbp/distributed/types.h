@@ -69,6 +69,11 @@ struct LogicalTierCapacity {
   TierType representative_tier = TierType::UNKNOWN;
   TierCapacity capacity;
   bool put_eligible = false;
+  // What the watermark comparison actually reads: the highest utilization among
+  // this tier's own backends. `capacity` aggregates instead, and for the entry
+  // tier it aggregates every tier reachable by offload, so neither of its
+  // ratios can be checked against this tier's watermarks.
+  double peak_member_utilization = 0.0;
 };
 
 struct TierTransitionMetrics {

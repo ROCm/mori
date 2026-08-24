@@ -60,6 +60,7 @@
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/master/master_client.h"
 #include "umbp/distributed/master/master_server.h"
+#include "umbp/distributed/pool/policy_config.h"
 #include "umbp/distributed/pool_client.h"
 
 namespace mori::umbp {
@@ -429,9 +430,15 @@ class PoolClientLocalByteTrackingTest : public ::testing::Test {
     cfg.io_engine.host = "0.0.0.0";
     cfg.io_engine.port = 0;
     cfg.dram_page_size = kLocalPageSize;
-    cfg.dram.buffer_sizes = {kLocalBufSize};
+    ConfigureClient(&cfg);
     client_ = std::make_unique<PoolClient>(std::move(cfg));
     ASSERT_TRUE(client_->Init());
+  }
+
+  // Lets a fixture put a richer topology behind the same master bring-up. The
+  // base case is the one flat DRAM backend the byte-tracking tests expect.
+  virtual void ConfigureClient(PoolClientConfig* config) {
+    config->dram.buffer_sizes = {kLocalBufSize};
   }
 
   void TearDown() override {
@@ -729,6 +736,97 @@ TEST_F(PoolClientLocalByteTrackingTest, TierCapacityGaugesPublished) {
   // Invariants the gauge formulas guarantee.  Tolerances absorb %g rounding.
   EXPECT_NEAR(used1 + avail1, total1, 16.0) << "used + available must equal total";
   EXPECT_NEAR(util1, used1 / total1, 1e-3) << "utilization must equal used / total";
+}
+
+// Two DRAM backends in different logical tiers, which is the case the
+// per-medium gauges cannot describe: both are tier="DRAM", so they land on one
+// series and the hierarchy is unreadable.
+class PoolClientLogicalTierMetricsTest : public PoolClientLocalByteTrackingTest {
+ protected:
+  static constexpr uint64_t kHotBytes = 1ULL << 20;
+  static constexpr uint64_t kColdBytes = 4ULL << 20;
+
+  void ConfigureClient(PoolClientConfig* config) override {
+    static constexpr char kPolicy[] = R"json({
+      "schema_version": 1,
+      "entry_tier": "hot",
+      "backends": {
+        "dram_hot": {"type": "dram", "capacity": "1MiB"},
+        "dram_cold": {"type": "dram", "capacity": "4MiB"}
+      },
+      "tiers": [
+        {
+          "name": "hot",
+          "backends": {"dram_hot": 100},
+          "offload_to": ["cold"],
+          "offload_trigger": "watermark",
+          "high_watermark": 0.9,
+          "low_watermark": 0.7
+        },
+        {"name": "cold", "backends": {"dram_cold": 100}, "promote_trigger": "on_read"}
+      ]
+    })json";
+    auto loaded = LoadBackendPolicyJson(kPolicy);
+    ASSERT_TRUE(loaded.ok()) << loaded.error;
+    std::string error;
+    ASSERT_TRUE(ApplyBackendPolicy(*loaded.config, config, &error)) << error;
+  }
+};
+
+// Each logical tier has to reach Prometheus as its own series, carrying the
+// name the policy gave it. Without this a two-DRAM-tier policy publishes one
+// tier="DRAM" series holding the sum, which cannot answer where a key sits, or
+// whether a drain reached its low watermark, or which tiers take new PUTs.
+TEST_F(PoolClientLogicalTierMetricsTest, PublishesCapacityPerLogicalTier) {
+  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+  const std::string body = FetchPrometheusMetrics(metrics_port_);
+  ASSERT_FALSE(body.empty()) << "Could not fetch Prometheus metrics from port " << metrics_port_;
+
+  const std::string hot = "logical_tier=\"hot\"";
+  const std::string cold = "logical_tier=\"cold\"";
+  const double hot_total =
+      ParseMetricValue(body, "mori_umbp_client_logical_tier_capacity_total_bytes", hot);
+  const double cold_total =
+      ParseMetricValue(body, "mori_umbp_client_logical_tier_capacity_total_bytes", cold);
+  ASSERT_GE(hot_total, 0.0) << "hot tier missing from /metrics";
+  ASSERT_GE(cold_total, 0.0) << "cold tier missing from /metrics";
+
+  // Cold is its own backends' sum. The entry tier is not: its capacity covers
+  // everything a PUT addressed to it can spill into, because that is what the
+  // router needs. Pinning both shapes keeps the difference from being read as
+  // one tier's occupancy.
+  EXPECT_NEAR(cold_total, static_cast<double>(kColdBytes), 16.0);
+  EXPECT_NEAR(hot_total, static_cast<double>(kHotBytes + kColdBytes), 16.0)
+      << "entry tier capacity should aggregate every offload-reachable tier";
+
+  for (const std::string& tier : {hot, cold}) {
+    const double avail =
+        ParseMetricValue(body, "mori_umbp_client_logical_tier_capacity_available_bytes", tier);
+    const double used =
+        ParseMetricValue(body, "mori_umbp_client_logical_tier_capacity_used_bytes", tier);
+    const double total =
+        ParseMetricValue(body, "mori_umbp_client_logical_tier_capacity_total_bytes", tier);
+    const double util =
+        ParseMetricValue(body, "mori_umbp_client_logical_tier_capacity_utilization_ratio", tier);
+    const double eligible =
+        ParseMetricValue(body, "mori_umbp_client_logical_tier_put_eligible", tier);
+    const double peak = ParseMetricValue(
+        body, "mori_umbp_client_logical_tier_peak_member_utilization_ratio", tier);
+    ASSERT_GE(avail, 0.0) << tier << " available missing";
+    ASSERT_GE(used, 0.0) << tier << " used missing";
+    ASSERT_GE(util, 0.0) << tier << " utilization missing";
+    ASSERT_GE(eligible, 0.0) << tier << " put_eligible missing";
+    // The watermark comparison reads this one, so its absence is what made a
+    // drain unobservable even with the aggregate gauges present.
+    ASSERT_GE(peak, 0.0) << tier << " peak_member_utilization missing";
+    EXPECT_LE(peak, 1.0);
+    EXPECT_NEAR(used + avail, total, 16.0);
+    EXPECT_NEAR(util, used / total, 1e-3);
+  }
+
+  // Only the entry tier takes new PUTs; cold is reachable by offload alone.
+  EXPECT_EQ(ParseMetricValue(body, "mori_umbp_client_logical_tier_put_eligible", hot), 1.0);
+  EXPECT_EQ(ParseMetricValue(body, "mori_umbp_client_logical_tier_put_eligible", cold), 0.0);
 }
 
 }  // namespace
