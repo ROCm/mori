@@ -412,7 +412,18 @@ def make_plan(kernel: str) -> type:
             if arena is not None:
                 names = region_names or {}
                 for wire, region in arg_regions.items():
-                    self._defaults[wire] = int(arena.offset(names.get(region, region)))
+                    name = names.get(region, region)
+                    try:
+                        self._defaults[wire] = int(arena.offset(name))
+                    except KeyError:
+                        # A region the arena does not carry binds to 0. Optional
+                        # regions exist (out_scales is only laid out when the scale
+                        # transport is on) and every caller would otherwise have to
+                        # know about a feature it does not use. The kernel's own
+                        # `if constexpr` is what keeps a 0 offset from being read --
+                        # a backend that enables a feature must check its arena has
+                        # the region, because 0 here aliases the first one.
+                        self._defaults[wire] = 0
 
         def bind(self, **args) -> None:
             """Pin launch arguments that never change between calls.

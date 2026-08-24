@@ -54,6 +54,7 @@ _REGIONS = {
     "dispOut": "disp_out",
     "outTok": "out_tok",
     "xdb": "cross_device_barrier",
+    "outScales": "out_scales",  # only laid out when scales are on; binds to 0 otherwise
 }
 
 # Only what EpDType enumerates -- fp16 is absent because plan_api.DTYPES has no code
@@ -141,6 +142,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     # -- backend hooks -----------------------------------------------------
 
+    @staticmethod
+    def _scale_i32(cfg) -> int:
+        """Dwords per scale row, 0 when the transport is off. Same rounding the
+        FlyDSL backend uses, so both lay the region out identically."""
+        return (cfg.scale_dim * cfg.scale_type_size + 3) // 4
+
     def _regions(self, cfg):
         # token_nbytes / combine_token_nbytes rather than elem*hidden: they are the
         # only forms that are right for fp4, where 2 values share a byte.
@@ -156,6 +163,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             ("out_tok", cap * cfg.combine_token_nbytes),
             ("cross_device_barrier", cfg.world_size * 8),
         ]
+        if self._scale_i32(cfg):
+            # Same name and dword-padded sizing as the FlyDSL backend, so one arena
+            # serves either and a caller can swap backends without relaying it out.
+            regions.append(("out_scales", cap * self._scale_i32(cfg) * 4))
         return regions
 
     def _unsupported(self, cfg) -> tuple[str, ...]:
@@ -173,8 +184,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             bad.append(f"quant_type={cfg.quant_type!r}")
         if cfg.enable_std_moe:
             bad.append("enable_std_moe")
-        if cfg.scale_dim and cfg.scale_type_size:
-            bad.append("per-token scales forwarding")
         # The C++ validator rejects a shrunk cap: the recv capacity is also the
         # flat-index stride, so an overflow re-encodes to the next peer instead
         # of merely overrunning the region.
@@ -211,6 +220,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         disp_cfg = dict(
             hidden_dim=cfg.hidden_dim // 2 if cfg.is_fp4 else cfg.hidden_dim,
             dtype=cfg.dispatch_dtype,
+            # Dword-padded: the kernel copies the row as dwords, and EpCfgIsValid
+            # rejects a Cfg whose row is not a whole number of them.
+            scale_bytes=self._scale_i32(cfg) * 4,
         )
         comb_cfg = dict(hidden_dim=cfg.hidden_dim, dtype=cfg.combine_dtype)
         # One plan per (block, warp) the schedule can select. Compilation happens
@@ -240,7 +252,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # These are plain local buffers, not symmetric regions: the kernels
             # do not reset them, the op must.
             self_resets_counters=False,
-            capabilities=frozenset({"gather"}),
+            capabilities=frozenset({"gather", "scales"}),
         )
 
     def _close_backend(self):
@@ -280,10 +292,15 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         )
 
     def recv_scales(self):
-        """Always None: this backend forwards no scales. Not an error -- it is
-        the same answer FlyDSL gives for a config built without them, and a
-        config that actually asks for scales is rejected by the gate."""
-        return None
+        """The forwarded scale rows, or None when the transport is off -- the same
+        answer FlyDSL gives, and the same (recv_cap, dwords) int32 view, so a caller
+        cannot tell the backends apart."""
+        n_i32 = self._scale_i32(self.cfg)
+        if not n_i32:
+            return None
+        return from_gpu_ptr(
+            self.arena.local_ptr("out_scales"), (self._recv_cap, n_i32), torch.int32
+        )
 
     def local_expert_count(self):
         raise NotImplementedError(
@@ -307,6 +324,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 token_indices=indices,
                 inp_token_buf=input,
                 weights_buf=weights,
+                scales_buf=scales,
                 disp_dest_tok_id_map=dest_map,
                 dest_pe_token_counter=self.dest_pe_counter,
                 total_recv_token_num=self.total_recv,

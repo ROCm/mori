@@ -251,8 +251,26 @@ __device__ index_t _cusplit_stgSrc[CUSPLIT_POOL_SLOTS];
 // Per-(srcBlock, peer) contiguous remote slot range: base + count.
 __device__ index_t _cusplit_blkBase[CUSPLIT_MAX_BLOCKS * CUSPLIT_MAX_GPUS];
 __device__ index_t _cusplit_blkCount[CUSPLIT_MAX_BLOCKS * CUSPLIT_MAX_GPUS];
-// The staged meta fields (unquantized): idx, weights, srcmap.
-constexpr int kMetaFields = 3;
+// Per-token scale rows, staged like the other meta fields so they ship to a peer as
+// one contiguous run rather than a 224 B transfer per (token, destination) -- the
+// size TDM is worst at. The array is at file scope, which the TU reaches before kCfg
+// exists, so its extent comes from a macro RenderEpSource emits only when the feature
+// is on; off, it degenerates to one byte. `if constexpr` discards the staging code
+// but still looks the name up, hence a declaration in both cases.
+#if defined(MORI_EP_SCALE_BYTES) && MORI_EP_SCALE_BYTES > 0
+constexpr int kEpScaleBytes = MORI_EP_SCALE_BYTES;
+constexpr size_t kEpScaleSlots = (size_t)MORI_EP_SCALE_SLOTS;
+// Per-peer stride. NOT _stgCap: that one sizes the idx/wt pool, which is a
+// different (larger) constant, and indexing this array with it walks off the end.
+constexpr size_t kEpScaleRows = (size_t)MORI_EP_SCALE_ROWS;
+constexpr int kMetaFields = 4;  // idx, weights, srcmap, scale
+#else
+constexpr int kEpScaleBytes = 0;
+constexpr size_t kEpScaleSlots = 1;
+constexpr size_t kEpScaleRows = 1;
+constexpr int kMetaFields = 3;  // idx, weights, srcmap
+#endif
+__device__ unsigned char _cusplit_stgScale[kEpScaleSlots * (kEpScaleBytes > 0 ? kEpScaleBytes : 1)];
 
 /* ------------------------------------------------------------------------- */
 /*                                  Dispatch                                  */
@@ -261,6 +279,11 @@ constexpr int kMetaFields = 3;
 // fetch_add(N) per destPe, local slot distribution, metadata + payload via TDM.
 template <EpCfg kCfg, typename T>
 __device__ void EpDispatch1250xBody(EpArgs args) {
+  // The macro sizes the staging, the Cfg drives the copies. They come from the same
+  // render, so a disagreement means the generator changed under the header.
+  static_assert(kCfg.scaleBytes == kEpScaleBytes,
+                "MORI_EP_SCALE_BYTES disagrees with Cfg.scaleBytes -- RenderEpSource must "
+                "emit the macro from the same Cfg it renders");
   constexpr int WS = kCfg.waveSize;
   const int thdId = threadIdx.x;
   const int laneId = threadIdx.x & (WS - 1);
@@ -298,7 +321,12 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   const bool _laneAct = (_etpi > 1) ? (_sLane < _etpi) : (laneId < topk);
 
   extern __shared__ char _tdmBatchSmem[];
-  T* _tdmTile = reinterpret_cast<T*>(_tdmBatchSmem) + (size_t)warpId * hiddenDim;
+  // One slab per warp, shared by the payload tile and (later) the metadata tile.
+  // Sized in BYTES rather than payload elements: with a scale row in the metadata
+  // an fp8 payload would otherwise shrink the slab exactly when the metadata got
+  // bigger. EpDispatch1250xSlabBytes owns that decision; both tiles must agree.
+  constexpr int kSlabBytes = EpDispatch1250xSlabBytes(kCfg);
+  T* _tdmTile = reinterpret_cast<T*>(_tdmBatchSmem + (size_t)warpId * kSlabBytes);
   const gfx1250_TDM_GROUP1 _tdmG1 = TdmShape<T>(static_cast<int>(hiddenDim));
 
   constexpr int kMaxNpes = CUSPLIT_MAX_GPUS;
@@ -412,6 +440,20 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
             for (int e = myE; e < topk; e += gsz) sWt[e] = args.weightsBuf[(size_t)gTok * topk + e];
           }
         }
+        if constexpr (kEpScaleBytes > 0) {
+          if (args.scalesBuf) {
+            // Dwords: EpCfgIsValid makes the row dword-sized, so the gsz lanes that
+            // own this destination stride it without a byte tail.
+            constexpr int kSdw = kEpScaleBytes / 4;
+            const unsigned int* srcS =
+                reinterpret_cast<const unsigned int*>(args.scalesBuf) + (size_t)gTok * kSdw;
+            if ((size_t)dt < kEpScaleRows) {
+              unsigned int* dstS = reinterpret_cast<unsigned int*>(
+                  _cusplit_stgScale + ((size_t)d * kEpScaleRows + (size_t)dt) * kEpScaleBytes);
+              for (int e = myE; e < kSdw; e += gsz) dstS[e] = srcS[e];
+            }
+          }
+        }
       }
     }
   }
@@ -424,10 +466,11 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     const index_t recvCapM = (index_t)EpMaxRecv(kCfg);
     const index_t _stgCapM = (index_t)(CUSPLIT_POOL_SLOTS / npes);
     // One warp owns a whole (peer, sub-range) run, moving idx+wt+srcmap through one tile.
-    const int mtileBytesM = (int)(hiddenDim * sizeof(T));
-    const int perTokM = tkM * 4 + tkM * 4 + 4;  // idx + weights + srcmap (no scale)
-    // 384B slack covers rounding each of the 3 field regions up to a 128B boundary.
-    const int tokCapM = (perTokM > 0) ? ((mtileBytesM - 384) / perTokM) : 0;
+    const int mtileBytesM = kSlabBytes;  // the whole slab, see above
+    // idx + weights + srcmap, plus the scale row when it rides along.
+    const int perTokM = tkM * 4 + tkM * 4 + 4 + kCfg.scaleBytes;
+    // 128B of slack per field region for the rounding below.
+    const int tokCapM = (perTokM > 0) ? ((mtileBytesM - 128 * kMetaFields) / perTokM) : 0;
     if (tokCapM > 0) {
       uint8_t* _m4 = reinterpret_cast<uint8_t*>(_tdmBatchSmem) + (size_t)warpId * mtileBytesM;
       // ONE WARP PER PEER when the runs are short, warpNum/npes warps per peer otherwise.
@@ -479,10 +522,22 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
           const TdmSplit128 spI = TdmWholeOrSplit128((size_t)ab * tkM, nIdxB);
           const TdmSplit128 spW = (dW != nullptr) ? spI : TdmSplit128{0, 0, 0};
           const TdmSplit128 spR = TdmWholeOrSplit128((size_t)ab, cc);
+          // Scale rides as a fourth field: same run, same tile, one more descriptor.
+          constexpr int kSdw = (kEpScaleBytes > 0) ? kEpScaleBytes / 4 : 0;
+          const int nScB = cc * kSdw;
+          unsigned int* sS = reinterpret_cast<unsigned int*>(_cusplit_stgScale) +
+                             (size_t)peer * kEpScaleRows * kSdw + (size_t)ab * kSdw;
+          unsigned int* dS =
+              (kEpScaleBytes > 0 && args.scalesBuf)
+                  ? (EpPeer<unsigned int>(win, peer, args.offOutScales) + (size_t)ab * kSdw)
+                  : nullptr;
+          const TdmSplit128 spS =
+              (dS != nullptr) ? TdmWholeOrSplit128((size_t)ab * kSdw, nScB) : TdmSplit128{0, 0, 0};
           int* tI = reinterpret_cast<int*>(_m4);
           int* tW = tI + ((spI.body + 31) & ~31);
           int* tR = tW + ((spW.body + 31) & ~31);
-          gfx1250_TDM_GROUP1 gI{}, gW{}, gR{};
+          int* tS = tR + ((spR.body + 31) & ~31);
+          gfx1250_TDM_GROUP1 gI{}, gW{}, gR{}, gS{};
           if (_mPend) {
             __builtin_amdgcn_s_wait_tensorcnt(0);
             _mPend = false;
@@ -490,9 +545,11 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
           if (spI.body) gI = TdmSplitShape(spI, spI.body);
           if (spW.body) gW = TdmSplitShape(spW, spW.body);
           if (spR.body) gR = TdmSplitShape(spR, spR.body);
+          if (spS.body) gS = TdmSplitShape(spS, spS.body);
           if (spI.body) TdmIssueLoad<int>(tI, reinterpret_cast<int*>(sI + spI.head), gI);
           if (spW.body) TdmIssueLoad<int>(tW, reinterpret_cast<int*>(sW + spW.head), gW);
           if (spR.body) TdmIssueLoad<int>(tR, reinterpret_cast<int*>(sR + spR.head), gR);
+          if (spS.body) TdmIssueLoad<int>(tS, reinterpret_cast<int*>(sS + spS.head), gS);
           // Unaligned head/tail (and fields too small for 2 rows) go global->global.
 #define _MHT_REM(dstp, glbp, hd, bd, ntot)                                         \
   do {                                                                             \
@@ -505,12 +562,16 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
             _MHT_REM(reinterpret_cast<int*>(dW), reinterpret_cast<int*>(sW), spW.head, spW.body,
                      nWtB);
           _MHT_REM(dR, sR, spR.head, spR.body, cc);
+          if (dS)
+            _MHT_REM(reinterpret_cast<int*>(dS), reinterpret_cast<int*>(sS), spS.head, spS.body,
+                     nScB);
 #undef _MHT_REM
-          if (spI.body || spW.body || spR.body) {
+          if (spI.body || spW.body || spR.body || spS.body) {
             __builtin_amdgcn_s_wait_tensorcnt(0);
             if (spI.body) TdmIssueStore<int>(reinterpret_cast<int*>(dI + spI.head), tI, gI);
             if (spW.body) TdmIssueStore<int>(reinterpret_cast<int*>(dW + spW.head), tW, gW);
             if (spR.body) TdmIssueStore<int>(reinterpret_cast<int*>(dR + spR.head), tR, gR);
+            if (spS.body) TdmIssueStore<int>(reinterpret_cast<int*>(dS + spS.head), tS, gS);
             _mPend = true;  // drain deferred to the __syncthreads() below
           }
         }
@@ -537,18 +598,25 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
               _cusplit_stgWt + (size_t)peer * _stgCapM * CUSPLIT_MAX_TOPK + (size_t)ab * tkM;
           float* dst = EpPeer<float>(win, peer, args.offOutWts) + (size_t)ab * tkM;
           for (int i = laneId; i < (int)cnt * tkM; i += WS) dst[i] = src[i];
-        } else {
+        } else if (field == 2) {
           index_t* src = _cusplit_stgSrc + (size_t)peer * _stgCapM + (size_t)ab;
           index_t* dst = EpPeer<index_t>(win, peer, args.offRecvToSrc) + (size_t)ab;
           for (int i = laneId; i < (int)cnt; i += WS) dst[i] = src[i];
+        } else if constexpr (kEpScaleBytes > 0) {
+          constexpr int kSdw = kEpScaleBytes / 4;
+          unsigned int* src = reinterpret_cast<unsigned int*>(
+              _cusplit_stgScale + ((size_t)peer * kEpScaleRows + (size_t)ab) * kEpScaleBytes);
+          unsigned int* dst =
+              EpPeer<unsigned int>(win, peer, args.offOutScales) + (size_t)ab * kSdw;
+          for (int i = laneId; i < (int)cnt * kSdw; i += WS) dst[i] = src[i];
         }
       }
     }
   }
   // NO BARRIER BETWEEN META AND PAYLOAD. There used to be a __syncthreads() here whose only stated
   // job was the tile reuse the wait below covers, and that dependency is WITHIN a warp rather than
-  // across them: _m4 is _tdmBatchSmem + warpId*mtileBytesM and the payload's _tdmTile is
-  // _tdmBatchSmem + warpId*hiddenDim, i.e. the SAME per-warp address, so the warp that must not
+  // across them: _m4 and the payload's _tdmTile are both _tdmBatchSmem +
+  // warpId*kSlabBytes, i.e. the SAME per-warp address, so the warp that must not
   // clobber the tile is the warp that issued the stores -- which is exactly what `if (_mPend)`
   // guarantees. Cross-warp visibility of FINALIZE's writes (dispDestTokIdMap, staging, s_base)
   // comes from the barrier after FINALIZE, not from this one.

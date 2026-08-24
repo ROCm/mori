@@ -203,6 +203,20 @@ jobs:
             case \"\$out\" in *FAIL*) exit 1;; esac; \
             case \"\$out\" in *PASS*) ;; *) echo 'no PASS line: nothing ran'; exit 1;; esac"
 
+      - name: Run ops-v2 HIP backend with per-token scales (EP8, 8 ranks)
+        run: |
+          # SCALE_DIM>0 turns on the forwarded per-token scale row and makes
+          # test_op.py verify it through the routing reverse map (OP-SCALES). It is
+          # a separate step rather than an env added to the one above so the
+          # no-scale path keeps its own coverage.
+          $CT exec -e MORI_V2_KERNEL_BACKEND=hip -e SCALE_DIM=32 $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
+            out=\$(timeout 900 torchrun --standalone --nproc_per_node=8 test_op.py 2>&1) || \
+              { echo \"\$out\"; exit 1; }; \
+            echo \"\$out\"; \
+            case \"\$out\" in *FAIL*) exit 1;; esac; \
+            case \"\$out\" in *OP-SCALES*) ;; *) echo 'no OP-SCALES line: scales never ran'; exit 1;; esac"
+
       - name: Run ops-v2 backend parity (FlyDSL vs HIP, EP8)
         run: |
           $CT exec $CONTAINER bash -c "\

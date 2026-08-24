@@ -223,6 +223,18 @@ __device__ void EpDispatchBody(EpArgs args) {
 
       core::WarpCopy(EpPeer<T>(win, destPe, args.offDispOut) + destTokId * kHidden,
                      reinterpret_cast<const T*>(args.inpTokenBuf) + srcTokId * kHidden, kHidden);
+      // The scale row follows its token to the same slot. No staging detour like the
+      // gfx1250 body needs: this body already copies straight to the peer per token,
+      // and on these parts a peer vector store is not the slow path TDM exists for.
+      if constexpr (kCfg.scaleBytes > 0) {
+        constexpr int kSdw = kCfg.scaleBytes / 4;
+        if (args.scalesBuf) {
+          core::WarpCopy(
+              EpPeer<unsigned int>(win, destPe, args.offOutScales) + (size_t)destTokId * kSdw,
+              reinterpret_cast<const unsigned int*>(args.scalesBuf) + (size_t)srcTokId * kSdw,
+              kSdw);
+        }
+      }
     }
   }
 
