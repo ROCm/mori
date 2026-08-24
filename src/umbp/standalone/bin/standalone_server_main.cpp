@@ -198,6 +198,10 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
   }
   if (!ParseBoolEnv("UMBP_DISTRIBUTED_CACHE_REMOTE_FETCHES", &dist.cache_remote_fetches, error))
     return false;
+  if (!ParseBoolEnv("UMBP_DISTRIBUTED_RANGED_LOCALITY_PREFETCH", &dist.ranged_locality_prefetch,
+                    error)) {
+    return false;
+  }
   size_t dram_page_size = static_cast<size_t>(dist.dram_page_size);
   if (!ParseSizeEnv("UMBP_DISTRIBUTED_DRAM_PAGE_SIZE", &dram_page_size, error)) return false;
   dist.dram_page_size = static_cast<uint64_t>(dram_page_size);

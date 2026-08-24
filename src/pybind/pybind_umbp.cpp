@@ -255,6 +255,8 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("ssd_staging_hugepage_size", &UMBPDistributedConfig::ssd_staging_hugepage_size)
       .def_readwrite("peer_service_port", &UMBPDistributedConfig::peer_service_port)
       .def_readwrite("cache_remote_fetches", &UMBPDistributedConfig::cache_remote_fetches)
+      .def_readwrite("ranged_locality_prefetch",
+                     &UMBPDistributedConfig::ranged_locality_prefetch)
       .def_readwrite("cache_remote_admission", &UMBPDistributedConfig::cache_remote_admission)
       .def_readwrite("admission_max_block_bytes", &UMBPDistributedConfig::admission_max_block_bytes)
       .def_readwrite("dram_page_size", &UMBPDistributedConfig::dram_page_size)

@@ -239,6 +239,11 @@ L3 is ~1.3x faster than cold recompute at 4K and ~9x by 128K.
   `UMBP_DRAM_USE_HUGEPAGES` does nothing on a node whose medium is SSD — that
   node registers no DRAM pool.
 - `cache_remote_fetches: false` keeps remote-fetch cost honest by not re-caching
+  whole-object remote reads. It does **not** cover remote *ranged* reads: those
+  land the object in the local medium whenever it is already in hand (the fetch
+  brought all of it), which costs nothing on the wire. The extra background
+  pull, which does cost a second copy on the wire, is
+  `ranged_locality_prefetch: false`
   locally. Turn it on for a production hit-rate setup.
 - **SPDK.** `UMBP_SPDK_REACTOR_MASK` defaults to `0x1` — a single core polling
   all drives. Give it at least one core per drive (`0x3`, `0xf`, …) before

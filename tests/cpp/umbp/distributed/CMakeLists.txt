@@ -219,6 +219,16 @@ target_link_libraries(
           gtest_main)
 add_test(NAME umbp_ssd_ranged_io COMMAND test_umbp_ssd_ranged_io)
 
+# test_umbp_range_map — the object-range -> page-range arithmetic on its own.
+# Header-only and node-free, so it is a plain unit test rather than an
+# integration one: the shapes that matter (short last page, range ending on the
+# object's last byte, one byte past the end) are awkward to reach through a
+# live two-node fixture, and a mistake there corrupts a KV block silently
+# rather than failing.
+add_executable(test_umbp_range_map test_range_map.cpp)
+target_link_libraries(test_umbp_range_map PRIVATE umbp_common gtest_main)
+add_test(NAME umbp_range_map COMMAND test_umbp_range_map)
+
 set_tests_properties(umbp_cross_node_smoke umbp_pool_client_batch_put
                      umbp_medium_selection umbp_pool_client_ranges
                      umbp_ssd_ranged_io
@@ -252,6 +262,20 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 target_link_libraries(
   bench_umbp_pool_client_batch_get
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+
+# Layer-wise ranged-restore bench: drives BatchGetRanges the way the sglang
+# tree connector does (N ranks walking layer groups over the same keys) and
+# reports TTFL, wire bytes and repeat-remote alongside latency.  Standalone
+# executable, not a CTest target.
+add_executable(bench_umbp_pool_client_ranges bench_pool_client_ranges.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(bench_umbp_pool_client_ranges PRIVATE
+                      -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  bench_umbp_pool_client_ranges
   PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
           gtest_main)
 
