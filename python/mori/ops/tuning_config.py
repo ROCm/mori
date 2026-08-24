@@ -88,7 +88,12 @@ _KERNEL_TYPE_NAMES = frozenset(
     {"IntraNode", "InterNode", "InterNodeV1", "InterNodeV1LL", "AsyncLL", "IntraNodeLL"}
 )
 
-_QUANT_TYPE_CONFIG_STRS = {"none", "fp8_direct_cast", "fp8_blockwise"}
+_QUANT_TYPE_CONFIG_STRS = {
+    "none",
+    "fp8_direct_cast",
+    "fp8_blockwise",
+    "fp4_blockwise",
+}
 
 
 def kernel_type_to_config_str(kernel_type) -> str:
@@ -118,6 +123,8 @@ def quant_type_to_config_str(quant_type) -> str:
             return "fp8_direct_cast"
         if name == "Fp8BlockwiseQuant":
             return "fp8_blockwise"
+        if name == "Fp4BlockwiseQuant":
+            return "fp4_blockwise"
     raise ValueError(f"Unknown quant_type: {quant_type!r}")
 
 
