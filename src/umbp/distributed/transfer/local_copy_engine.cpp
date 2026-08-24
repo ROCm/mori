@@ -116,10 +116,44 @@ class SettledHandle final : public TransferHandle {
 
 }  // namespace
 
+namespace {
+
+// Smallest block the non-temporal path is used for.
+//
+// This was 256 KiB, a figure that came from whole-object copies where one key
+// is one ~MiB page.  A RANGED copy moves one LAYER of one page, and layers are
+// small: DeepSeek-V4-Pro's three pools are 37,440 B, 8,448 B and 1,728 B.  So
+// every ranged copy fell under the old threshold and took the ordinary memcpy,
+// paying read-for-ownership on a destination it completely overwrites.
+//
+// The threshold has to be set against a real model's fragment sizes, not a
+// synthetic one: a uniform 73,728 B shape is larger than anything the model
+// actually has, so a threshold that looks right there never fires in practice.
+//
+// 2 KiB, measured on DeepSeek-V4-Pro's geometry (8 ranks, 32 pages, served
+// entirely from the local medium, medians of 3): restore 12.04 -> 11.43 ms and
+// TTFL 1,529 -> 1,353 us.  Below 2 KiB the remaining movement is inside this
+// machine's run-to-run spread.  Tunable because the right answer is a property
+// of the machine's cache, not of the code.
+size_t NtMinBytes() {
+  static const size_t kDefault = size_t{2} << 10;
+  static const size_t n = [] {
+    const char* raw = std::getenv("UMBP_DRAM_NT_COPY_MIN_BYTES");
+    if (raw == nullptr) return kDefault;
+    char* end = nullptr;
+    const unsigned long long v = std::strtoull(raw, &end, 10);
+    if (end == raw || v == 0) return kDefault;
+    return static_cast<size_t>(v);
+  }();
+  return n;
+}
+
+}  // namespace
+
 void HostCopyBlock(void* dst, const void* src, size_t size) {
   static const bool kNt = NtSupported() && !(std::getenv("UMBP_DRAM_NT_COPY") &&
                                              std::getenv("UMBP_DRAM_NT_COPY")[0] == '0');
-  static const size_t kNtMinBytes = 256ull << 10;
+  static const size_t kNtMinBytes = NtMinBytes();
   if (kNt && size >= kNtMinBytes) {
     NtCopyAvx2(static_cast<char*>(dst), static_cast<const char*>(src), size);
   } else {
