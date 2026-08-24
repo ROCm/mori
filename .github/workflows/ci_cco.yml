@@ -217,6 +217,31 @@ jobs:
             case \"\$out\" in *FAIL*) exit 1;; esac; \
             case \"\$out\" in *OP-SCALES*) ;; *) echo 'no OP-SCALES line: scales never ran'; exit 1;; esac"
 
+      - name: Run ops-v2 scales on a quantizing wire (fp8 and fp4 dispatch, EP8)
+        run: |
+          # The step above can only test scales on a BF16 wire: test_op.py gives
+          # dispatch and combine one dtype, and the HIP backend refuses an fp8
+          # combine (it sums). fp8/fp4 dispatch with a bf16 combine is what a real
+          # quantizing wire is, and it is the only configuration where the scale
+          # row is not decoration -- so it gets its own step.
+          #
+          # SCALE_DIM=224 on purpose: hidden/32 for hidden 7168, and NOT a multiple
+          # of 128, so it exercises the padding mori adds to the destination stride
+          # (EpScaleStride). A row that is already aligned would not.
+          #
+          # This runner has no gfx1250, so what actually runs here is the portable
+          # body -- the one that cannot be exercised by hand on the TDM boxes.
+          for disp in fp8 fp4; do
+            $CT exec -e MORI_V2_KERNEL_BACKEND=hip -e SCALE_DIM=224 -e HIDDEN=7168 \
+              -e DISP=$disp $CONTAINER bash -c "\
+              cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
+              out=\$(timeout 900 torchrun --standalone --nproc_per_node=8 test_asym_dtype.py 2>&1) || \
+                { echo \"\$out\"; exit 1; }; \
+              echo \"\$out\"; \
+              case \"\$out\" in *FAIL*) exit 1;; esac; \
+              case \"\$out\" in *ASYM-SCALES*) ;; *) echo 'no ASYM-SCALES line: scales never ran'; exit 1;; esac" || exit 1
+          done
+
       - name: Run ops-v2 backend parity (FlyDSL vs HIP, EP8)
         run: |
           $CT exec $CONTAINER bash -c "\
