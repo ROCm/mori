@@ -39,6 +39,10 @@ from .intranode_kernels import (
     make_convert_combine_input,
     make_local_expert_count,
 )
+from .intranode_kernels_tdm import (
+    make_dispatch_tdm,
+    tdm_max_warps,
+)
 from .dispatch_combine_op import (  # noqa: F401
     _DT,
     _FP8_DTYPES,
@@ -49,6 +53,28 @@ from .dispatch_combine_op import (  # noqa: F401
     KernelSet,
 )
 from .symm_arena import SymmArena  # noqa: F401
+
+_TDM_STAGE_POOLS = {}
+
+
+def _tdm_stage_pool(device, npes, stg_cap, topk):
+    """Process-wide destTokId staging SoA, reused across op instances.
+
+    HIP keeps these as ``__device__`` BSS; FlyDSL cannot emit that, so one
+    ``torch.empty`` trio per (device, npes, cap, topk) is the equivalent.
+    """
+    key = (torch.cuda.current_device(), int(npes), int(stg_cap), int(topk))
+    hit = _TDM_STAGE_POOLS.get(key)
+    if hit is not None:
+        return hit
+    slots = npes * stg_cap
+    pool = (
+        torch.empty(slots * topk, dtype=torch.int32, device=device),
+        torch.empty(slots * topk, dtype=torch.int32, device=device),
+        torch.empty(slots, dtype=torch.int32, device=device),
+    )
+    _TDM_STAGE_POOLS[key] = pool
+    return pool
 
 
 class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
@@ -189,6 +215,44 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
             for (b, w) in dispatch_specs
         }
         self._dispatch_replay_variants_raw = {}  # lazily compiled per (block, warp)
+
+        # TDM transport: destTokId-ordered staging SoA (HIP _cusplit_stg*),
+        # sized to recv_cap so a block's reserved run is a contiguous TDM source.
+        # The pool is process-wide: geometry only changes which prefix is live.
+        self._dispatch_tdm_variants = {}
+        self._tdm_stage = None
+        if cfg.dispatch_transport == "tdm":
+            tdm_kwargs = {
+                k: v
+                for k, v in self._dispatch_kwargs.items()
+                if k
+                not in ("off_out_scales", "scale_dim", "scale_type_size", "fp4")
+            }
+            # The schedule is tuned against the vector transport, which holds no
+            # per-warp LDS, so it can name a warp width this one cannot build
+            # (32 warps of a 7168-wide bf16 tile want 448 KB of a 320 KB budget).
+            # Clamp the width, keep the tuned block count, and keep the caller's
+            # spec as the key so the runtime pick still resolves. When the config
+            # already pulled a TDM schedule (warps <= max_warps), this is a no-op.
+            max_warps = tdm_max_warps(
+                hidden_dim=hidden_dim,
+                hidden_elem_size=elem_size,
+                npes=cfg.world_size,
+            )
+            tdm_geom = {(b, w): (b, min(w, max_warps)) for (b, w) in dispatch_specs}
+            self._tdm_stage = _tdm_stage_pool(
+                device, cfg.world_size, recv_cap, topk
+            )
+            built = {}
+            for spec, geom in tdm_geom.items():
+                if geom not in built:
+                    built[geom] = make_dispatch_tdm(
+                        block_num=geom[0],
+                        warp_num_per_block=geom[1],
+                        **tdm_kwargs,
+                    )
+                self._dispatch_tdm_variants[spec] = built[geom]
+
         if cfg.is_scatter:
             self._combine_variants = {
                 (b, w): make_combine_scatter(
@@ -433,6 +497,13 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
 
         def run(*, input, indices, weights, scales, dest_map, num_tokens):
             if replay:
+                if self._dispatch_tdm_variants:
+                    raise NotImplementedError(
+                        "replay is not ported to dispatch_transport='tdm': its "
+                        "slots come from a per-(block, peer) reservation, so a "
+                        "cached map is only replayable under the same grid AND "
+                        "the same block->token assignment"
+                    )
                 kern = self._dispatch_replay_variants_raw.get(spec)
                 if kern is None:
                     kern = self._dispatch_replay_variants_raw[spec] = make_dispatch(
@@ -441,6 +512,27 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                         warp_num_per_block=spec[1],
                         **self._dispatch_kwargs,
                     )
+            elif self._dispatch_tdm_variants:
+                # Same state as the vector kernel, but the metadata leaves via a
+                # staging pool instead of a scales pointer.
+                stg_idx, stg_wt, stg_src = self._tdm_stage
+                self._dispatch_tdm_variants[spec](
+                    self.arena.handle,
+                    input.data_ptr(),
+                    indices.data_ptr(),
+                    weights.data_ptr() if weights is not None else 0,
+                    dest_map.data_ptr(),
+                    self.dest_pe_counter.data_ptr(),
+                    self.dispatch_barrier.data_ptr(),
+                    self.total_recv.data_ptr(),
+                    stg_idx.data_ptr(),
+                    stg_wt.data_ptr(),
+                    stg_src.data_ptr(),
+                    self.cfg.rank,
+                    num_tokens,
+                    fx.Stream(torch.cuda.current_stream()),
+                )
+                return
             else:
                 kern = self._dispatch_variants[spec]
             kern(
