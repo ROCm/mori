@@ -30,6 +30,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -310,14 +311,26 @@ class PoolClient {
   // layer's decision, not the client's.
   std::pair<TransferRef, uint64_t> UserBufferRef(void* ptr, size_t size) const;
 
-  // Zero-copy registered memory regions.
+  // Zero-copy registered memory regions, kept sorted by `base`.
+  //
+  // Sorted because a ranged call looks one up PER RANGE, and a layer-wise
+  // reader carries thousands of ranges against a caller that registered one
+  // buffer per layer -- a linear scan makes that quadratic.  Shared, because
+  // those lookups are reads and every rank on the node shares this client.
   struct RegisteredRegion {
     void* base;
     size_t size;
     TransferRef ref;
   };
-  mutable std::mutex registered_mem_mutex_;
+  mutable std::shared_mutex registered_mem_mutex_;
   std::vector<RegisteredRegion> registered_regions_;
+
+  // The region covering [ptr, ptr+size), or null.  Caller holds
+  // registered_mem_mutex_; the returned pointer is valid only under that lock.
+  // Exposed separately from FindRegisteredMemory so a batch can take the lock
+  // once and then resolve every range under it.
+  const RegisteredRegion* FindRegisteredRegionLocked(const void* ptr, size_t size) const;
+
   // The registered ref covering [ptr, ptr+size) plus the offset of ptr within
   // it, or nullopt when the region was never registered.
   std::optional<std::pair<TransferRef, size_t>> FindRegisteredMemory(const void* ptr,
@@ -371,8 +384,8 @@ class PoolClient {
   // NOT necessarily host memory -- an HBM pool's BufferRef carries a device
   // pointer -- so it has to keep the ref's loc/device rather than be re-wrapped
   // as host bytes, or the engine picks the wrong copy direction.
-  bool CopyContiguousToRanges(const TransferRef& src, uint64_t src_base,
-                              size_t object_size, const std::vector<ObjectRange>& ranges);
+  bool CopyContiguousToRanges(const TransferRef& src, uint64_t src_base, size_t object_size,
+                              const std::vector<ObjectRange>& ranges);
   bool CopyRangesToContiguous(const std::vector<ObjectRange>& ranges, void* dst,
                               size_t object_size);
 

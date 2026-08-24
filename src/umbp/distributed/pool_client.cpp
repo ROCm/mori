@@ -885,7 +885,7 @@ void PoolClient::Shutdown() {
   registry_ = BackendRegistry{};
 
   if (transfer_engine_) {
-    std::lock_guard<std::mutex> lock(registered_mem_mutex_);
+    std::unique_lock<std::shared_mutex> lock(registered_mem_mutex_);
     for (auto& reg : registered_regions_) transfer_engine_->Deregister(reg.ref);
     registered_regions_.clear();
   }
@@ -931,9 +931,12 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size, mori::io::MemoryLocation
     MORI_UMBP_ERROR("[PoolClient] RegisterMemory: invalid args ptr={}, size={}", ptr, size);
     return false;
   }
-  std::lock_guard<std::mutex> lock(registered_mem_mutex_);
-  for (auto& reg : registered_regions_) {
-    if (reg.base != ptr) continue;
+  std::unique_lock<std::shared_mutex> lock(registered_mem_mutex_);
+  const auto at = std::lower_bound(
+      registered_regions_.begin(), registered_regions_.end(), ptr,
+      [](const RegisteredRegion& r, const void* p) { return std::less<const void*>{}(r.base, p); });
+  if (at != registered_regions_.end() && at->base == ptr) {
+    const RegisteredRegion& reg = *at;
     // Re-registering the same base with a larger size is not idempotent: the
     // existing registration covers fewer bytes, so FindRegisteredMemory would
     // start rejecting the tail and silently fall back to unregistered bytes.
@@ -962,7 +965,8 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size, mori::io::MemoryLocation
       transfer_engine_->Deregister(ref);
       return false;
     }
-    registered_regions_.push_back({ptr, size, std::move(ref)});
+    // Inserted in place rather than appended: lookups binary-search this.
+    registered_regions_.insert(at, RegisteredRegion{ptr, size, std::move(ref)});
   } catch (const std::exception& error) {
     MORI_UMBP_ERROR("[PoolClient] RegisterMemory failed for ptr={}, size={}: {}", ptr, size,
                     error.what());
@@ -977,26 +981,38 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size, mori::io::MemoryLocation
 
 void PoolClient::DeregisterMemory(void* ptr) {
   if (ptr == nullptr) return;
-  std::lock_guard<std::mutex> lock(registered_mem_mutex_);
-  auto it = std::find_if(registered_regions_.begin(), registered_regions_.end(),
-                         [ptr](const RegisteredRegion& r) { return r.base == ptr; });
-  if (it != registered_regions_.end()) {
+  std::unique_lock<std::shared_mutex> lock(registered_mem_mutex_);
+  auto it = std::lower_bound(
+      registered_regions_.begin(), registered_regions_.end(), ptr,
+      [](const RegisteredRegion& r, const void* p) { return std::less<const void*>{}(r.base, p); });
+  if (it != registered_regions_.end() && it->base == ptr) {
     if (transfer_engine_) transfer_engine_->Deregister(it->ref);
     registered_regions_.erase(it);
   }
 }
 
+const PoolClient::RegisteredRegion* PoolClient::FindRegisteredRegionLocked(const void* ptr,
+                                                                           size_t size) const {
+  // Regions never overlap, so the only candidate is the last one whose base is
+  // <= ptr.  upper_bound then step back finds it in O(log n).
+  auto at = std::upper_bound(
+      registered_regions_.begin(), registered_regions_.end(), ptr,
+      [](const void* p, const RegisteredRegion& r) { return std::less<const void*>{}(p, r.base); });
+  if (at == registered_regions_.begin()) return nullptr;
+  --at;
+  const auto addr = reinterpret_cast<uintptr_t>(ptr);
+  const auto base = reinterpret_cast<uintptr_t>(at->base);
+  if (size > at->size || (addr - base) > at->size - size) return nullptr;
+  return &*at;
+}
+
 std::optional<std::pair<TransferRef, size_t>> PoolClient::FindRegisteredMemory(const void* ptr,
                                                                                size_t size) const {
-  auto addr = reinterpret_cast<uintptr_t>(ptr);
-  std::lock_guard<std::mutex> lock(registered_mem_mutex_);
-  for (auto& reg : registered_regions_) {
-    auto base = reinterpret_cast<uintptr_t>(reg.base);
-    if (addr >= base && size <= reg.size && (addr - base) <= reg.size - size) {
-      return std::pair{reg.ref, static_cast<size_t>(addr - base)};
-    }
-  }
-  return std::nullopt;
+  std::shared_lock<std::shared_mutex> lock(registered_mem_mutex_);
+  const RegisteredRegion* reg = FindRegisteredRegionLocked(ptr, size);
+  if (reg == nullptr) return std::nullopt;
+  const auto offset = reinterpret_cast<uintptr_t>(ptr) - reinterpret_cast<uintptr_t>(reg->base);
+  return std::pair{reg->ref, static_cast<size_t>(offset)};
 }
 
 std::pair<TransferRef, uint64_t> PoolClient::UserBufferRef(void* ptr, size_t size) const {
@@ -1166,26 +1182,52 @@ bool PoolClient::BuildLocalRangeTransfers(MediumBackend* backend,
                                           double* classify_sink) {
   if (pages.empty() || page_size == 0) return false;
 
-  // Classified once per range, not per page: an unregistered device pointer
-  // must reach HbmCopyEngine, and the whole range lives in one buffer.
+  // Describe each range's caller buffer once, ahead of the page walk, because a
+  // range can produce several page fragments and the description belongs to the
+  // range.  Callers already truncate `items` when this returns false, so bailing
+  // before anything is emitted is equivalent to bailing partway through.
   //
-  // Hoisted out of the walk below so the cost is one measurable phase instead
-  // of being smeared through item assembly.  Same calls in the same order, and
-  // callers already truncate `items` when this returns false, so bailing before
-  // anything is emitted is equivalent to bailing partway through.
+  // Prefer the registration table.  A registered ref already carries loc and
+  // device, so it answers what ClassifiedUserBytes asks hipPointerGetAttributes
+  // for -- and it answers it for the whole region, not per range.  That matters
+  // twice over here:
+  //
+  //   * The HIP call is per RANGE, and a layer-wise reader carries thousands.
+  //   * A registered ref names the REGION base, so every range landing in one
+  //     caller buffer shares a (src, dst) pair and LocalCopyEngine::Plan folds
+  //     them into a single plan.  Describing them by their own addresses made
+  //     each range its own plan, with its own vectors, and defeated the
+  //     coalescing that Plan exists to do.
+  //
+  // In standalone-process mode the server registers every client region it
+  // imports, so this is the path a real deployment takes; ClassifiedUserBytes
+  // stays as the answer for genuinely unregistered memory, where the pointer
+  // really does have to be interrogated.
   std::vector<TransferRef> user_refs;
+  std::vector<uint64_t> user_offsets;
   {
     PhaseTimer classify_timer(classify_sink);
     user_refs.reserve(ranges.size());
+    user_offsets.reserve(ranges.size());
+    // One shared lock for the whole batch, not one per range.
+    std::shared_lock<std::shared_mutex> lock(registered_mem_mutex_);
     for (const auto& range : ranges) {
       if (range.user == nullptr) return false;
-      user_refs.push_back(ClassifiedUserBytes(range.user, range.size));
+      if (const RegisteredRegion* reg = FindRegisteredRegionLocked(range.user, range.size)) {
+        user_refs.push_back(reg->ref);
+        user_offsets.push_back(reinterpret_cast<uintptr_t>(range.user) -
+                               reinterpret_cast<uintptr_t>(reg->base));
+      } else {
+        user_refs.push_back(ClassifiedUserBytes(range.user, range.size));
+        user_offsets.push_back(0);
+      }
     }
   }
 
   for (size_t r = 0; r < ranges.size(); ++r) {
     const auto& range = ranges[r];
     const TransferRef& user_ref = user_refs[r];
+    const uint64_t user_base = user_offsets[r];
 
     // The walk owns every bound: object overflow, page-list overrun, and the
     // short last page a range must not run off the end of.
@@ -1202,16 +1244,21 @@ bool PoolClient::BuildLocalRangeTransfers(MediumBackend* backend,
           TransferItem item;
           item.size = fragment;
           item.tag = tag;
+          // `copied` is relative to the range; the ref may describe the whole
+          // registered region the range sits inside, so bias by where the range
+          // starts in it.  user_base is 0 for an unregistered pointer, whose ref
+          // describes exactly the range.
+          const uint64_t user_offset = user_base + copied;
           if (to_backend) {
             item.src = user_ref;
-            item.src_offset = copied;
+            item.src_offset = user_offset;
             item.dst = std::move(buf);
             item.dst_offset = tier_offset;
           } else {
             item.src = std::move(buf);
             item.src_offset = tier_offset;
             item.dst = user_ref;
-            item.dst_offset = copied;
+            item.dst_offset = user_offset;
           }
           items->push_back(std::move(item));
           return true;
