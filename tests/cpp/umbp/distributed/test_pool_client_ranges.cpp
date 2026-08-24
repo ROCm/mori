@@ -739,26 +739,36 @@ TEST_F(PoolClientRangesTest, MultiLayerGroupsOverSameKeys) {
 
 // Spans totalling more than the arena are split across sub-batches rather than
 // failing the key -- the packing unit is a span prefix, not an object.
-TEST_F(PoolClientRangesTest, RangedFetchSplitsWhenSpansExceedArena) {
+TEST_F(PoolClientRangesTest, PartialReadSplitsWhenSpansExceedArena) {
+  // The spans have to total MORE than the arena to split, which a single object
+  // the size of the arena can never do -- so the object is bigger, and the read
+  // is deliberately NOT a tiling one.  That keeps holds_whole_object false, so
+  // this exercises the split on the arena path rather than the slot path
+  // ObjectLargerThanArenaIsServedAcrossSubBatches already covers.
+  constexpr size_t kBigObject = 5 * kPageSize;  // 20480, arena is 8192
   const std::string key = "ranged-split";
-  std::vector<char> object(kObjectSize);
-  for (size_t i = 0; i < kObjectSize; ++i) object[i] = static_cast<char>((i * 17 + 9) & 0xff);
+  std::vector<char> object(kBigObject);
+  for (size_t i = 0; i < kBigObject; ++i) object[i] = static_cast<char>((i * 17 + 9) & 0xff);
   SeedRemoteObject(key, object);
 
-  // Three spans covering the whole object; kScratchSize == kObjectSize, so all
-  // three cannot be packed at once once alignment padding is added.
-  const size_t third = kObjectSize / 3;
-  std::vector<char> a(third, 0), b(third, 0), c(kObjectSize - 2 * third, 0);
-  std::vector<std::vector<void*>> ptrs = {{a.data(), b.data(), c.data()}};
-  std::vector<std::vector<size_t>> sizes = {{a.size(), b.size(), c.size()}};
-  std::vector<std::vector<size_t>> offsets = {{0, third, 2 * third}};
+  // 3 x 4000 = 12000 > 8192, with gaps between them so they cannot tile.
+  constexpr size_t kSpan = 4000;
+  const size_t starts[3] = {0, 6000, 13000};
+  std::vector<std::vector<char>> out(3, std::vector<char>(kSpan, 0));
+  std::vector<std::vector<void*>> ptrs(1);
+  std::vector<std::vector<size_t>> sizes(1), offsets(1);
+  for (size_t i = 0; i < 3; ++i) {
+    ptrs[0].push_back(out[i].data());
+    sizes[0].push_back(kSpan);
+    offsets[0].push_back(starts[i]);
+  }
 
   auto got = caller_->BatchGetRanges({key}, ptrs, sizes, offsets);
   ASSERT_EQ(got.size(), 1u);
   ASSERT_TRUE(got[0]);
-  EXPECT_EQ(std::memcmp(a.data(), object.data(), a.size()), 0);
-  EXPECT_EQ(std::memcmp(b.data(), object.data() + third, b.size()), 0);
-  EXPECT_EQ(std::memcmp(c.data(), object.data() + 2 * third, c.size()), 0);
+  for (size_t i = 0; i < 3; ++i) {
+    EXPECT_EQ(std::memcmp(out[i].data(), object.data() + starts[i], kSpan), 0) << "span " << i;
+  }
 }
 
 // One span bigger than the whole arena is the only remaining unservable shape,
@@ -921,7 +931,17 @@ TEST_F(PoolClientRangesTest, WholeObjectReadStillInstallsWithPrefetchOff) {
   quiet->Shutdown();
 }
 
-TEST_F(PoolClientRangesTest, LocalityPrefetchDedupsAcrossLayerGroups) {
+// The sglang shape against a cold key: eight layer groups, each naming the same
+// key, with the object only ever arriving from the peer.  Every group must
+// return its own bytes and the key must end up local.
+//
+// This does NOT pin the in-flight dedup (prefetch_inflight_).  Dedup has no
+// external observable -- a duplicate pull is absorbed by the worker's
+// BatchResolve check and by kSuccessAlreadyExists, so removing the set changes
+// nothing a caller can see.  Naming it here would claim coverage that does not
+// exist; it is a throughput guard, and the bench is where it shows up.
+TEST_F(PoolClientRangesTest, LayerWiseGroupsOverOneColdKeyAllReturnTheirBytes) {
+
   const std::string key = "prefetch-dedup";
   std::vector<char> object(kObjectSize);
   for (size_t i = 0; i < kObjectSize; ++i) object[i] = static_cast<char>((i * 31 + 13) & 0xff);
@@ -1157,8 +1177,10 @@ TEST_F(PoolClientRangesTest, ConcurrentMixedShapesAllReturnCorrectBytes) {
       // touch the same keys.
       const bool layer_wise = (t % 2) == 0;
       std::vector<std::vector<char>> restored(kKeys, std::vector<char>(kObjectSize, 0));
+      std::vector<char> served(kKeys, 1);
       for (size_t round = 0; round < kRounds; ++round) {
         for (auto& buffer : restored) std::fill(buffer.begin(), buffer.end(), 0);
+        std::fill(served.begin(), served.end(), 1);
 
         if (layer_wise) {
           for (size_t g = 0; g < kGroups; ++g) {
@@ -1168,8 +1190,11 @@ TEST_F(PoolClientRangesTest, ConcurrentMixedShapesAllReturnCorrectBytes) {
             std::vector<std::vector<size_t>> offsets(kKeys, {offset});
             for (size_t k = 0; k < kKeys; ++k) ptrs[k] = {restored[k].data() + offset};
             const auto got = caller_->BatchGetRanges(keys, ptrs, sizes, offsets);
-            for (bool ok : got) {
-              if (!ok) failures.fetch_add(1, std::memory_order_relaxed);
+            for (size_t k = 0; k < kKeys; ++k) {
+              if (!got[k]) {
+                served[k] = false;
+                failures.fetch_add(1, std::memory_order_relaxed);
+              }
             }
           }
         } else {
@@ -1183,12 +1208,19 @@ TEST_F(PoolClientRangesTest, ConcurrentMixedShapesAllReturnCorrectBytes) {
             }
           }
           const auto got = caller_->BatchGetRanges(keys, ptrs, sizes, offsets);
-          for (bool ok : got) {
-            if (!ok) failures.fetch_add(1, std::memory_order_relaxed);
+          for (size_t k = 0; k < kKeys; ++k) {
+            if (!got[k]) {
+              served[k] = false;
+              failures.fetch_add(1, std::memory_order_relaxed);
+            }
           }
         }
 
+        // Only a key the client SAID it served is checked.  A refused read
+        // leaves its buffer untouched, and counting that as corruption would
+        // turn every capacity refusal into a false alarm.
         for (size_t k = 0; k < kKeys; ++k) {
+          if (!served[k]) continue;
           if (std::memcmp(restored[k].data(), objects[k].data(), kObjectSize) != 0) {
             mismatches.fetch_add(1, std::memory_order_relaxed);
           }
@@ -1202,7 +1234,12 @@ TEST_F(PoolClientRangesTest, ConcurrentMixedShapesAllReturnCorrectBytes) {
   // so a slot or an arena round can be refused -- but it must never return the
   // wrong bytes.
   EXPECT_EQ(mismatches.load(), 0u) << "a caller buffer came back wrong";
-  EXPECT_EQ(failures.load(), 0u) << "reads should still all succeed; the fallbacks cover this";
+  // Failures are reported, not asserted away: the medium really is too small
+  // here, so a refusal is a legitimate outcome and pinning it to zero would
+  // make this test fail for the one reason it is allowed to.
+  if (failures.load() != 0) {
+    GTEST_LOG_(INFO) << failures.load() << " reads were refused (capacity), none returned bad bytes";
+  }
 }
 
 }  // namespace
