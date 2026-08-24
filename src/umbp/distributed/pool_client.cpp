@@ -2775,6 +2775,28 @@ void PoolClient::PublishBackendCounters() {
       last = c.value;
     }
   }
+
+  // Logical tier transitions.  PeerPool accumulates these and nothing else
+  // reads them, so without this a served workload cannot distinguish a tier
+  // graph that is migrating from one whose every migration fails.
+  if (default_pool_ != nullptr) {
+    const TierTransitionMetrics tiers = default_pool_->TransitionMetrics();
+    const std::vector<MetricSample> samples = {
+        {MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS, MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS_HELP,
+         {{"outcome", "attempted"}}, tiers.attempted, MetricKind::kCounter},
+        {MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS, MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS_HELP,
+         {{"outcome", "succeeded"}}, tiers.succeeded, MetricKind::kCounter},
+        {MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS, MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS_HELP,
+         {{"outcome", "failed"}}, tiers.failed, MetricKind::kCounter},
+        {MORI_UMBP_METRIC_CLIENT_TIER_OFFLOADED_BYTES,
+         MORI_UMBP_METRIC_CLIENT_TIER_OFFLOADED_BYTES_HELP,
+         {}, tiers.offloaded_bytes, MetricKind::kCounter},
+        {MORI_UMBP_METRIC_CLIENT_TIER_PROMOTED_BYTES,
+         MORI_UMBP_METRIC_CLIENT_TIER_PROMOTED_BYTES_HELP,
+         {}, tiers.promoted_bytes, MetricKind::kCounter},
+    };
+    metric_publisher_.Publish("pool:tier_transitions", {}, samples, sink);
+  }
 }
 
 }  // namespace mori::umbp
