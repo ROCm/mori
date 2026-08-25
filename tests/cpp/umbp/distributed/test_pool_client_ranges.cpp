@@ -339,6 +339,55 @@ TEST_F(PoolClientRangesTest, RemoteRoundTripSubBatchesAndInstallsLocally) {
   }
 }
 
+TEST_F(PoolClientRangesTest, LocalCopyOnlyRegistrationServesRangesAndSharesOnePlan) {
+  // kLocalCopyOnly records a region without handing it to the IO engine. It
+  // exists because the two halves of "register" are separable: a region that is
+  // only ever a local copy endpoint has no use for an RDMA MR, but it still has
+  // to be in the table -- a range that misses it is described by its own
+  // address instead of its region base, so instead of every range sharing one
+  // (src, dst) pair and collapsing into a single transfer plan, each range
+  // becomes its own plan. That is a latency bug with no wrong answer attached,
+  // which is exactly why it needs a test rather than a reviewer.
+  const std::string key = "local-copy-only-ranges";
+  std::vector<char> object(kObjectSize);
+  for (size_t i = 0; i < object.size(); ++i) object[i] = static_cast<char>((i * 31 + 7) & 0xff);
+  PutLocalReplica(caller_.get(), key, object);
+
+  // One buffer, several disjoint ranges landing in it -- the layer-wise restore
+  // shape, and the case the pair has to collapse for.
+  std::vector<char> dst(kObjectSize, 0);
+  ASSERT_TRUE(caller_->RegisterMemory(dst.data(), dst.size(), mori::io::MemoryLocationType::CPU, -1,
+                                      MemoryRegistration::kLocalCopyOnly));
+
+  // Disjoint and inside the 2-page object; the middle one straddles the page
+  // boundary so the walk emits more than one fragment for a single range.
+  const std::vector<size_t> sizes = {2048, 2048, 1024};
+  const std::vector<size_t> offsets = {0, 3072, 6144};
+  std::vector<void*> dsts;
+  size_t cursor = 0;
+  for (size_t bytes : sizes) {
+    dsts.push_back(dst.data() + cursor);
+    cursor += bytes;
+  }
+  ASSERT_EQ(caller_->BatchGetRanges({key}, {dsts}, {sizes}, {offsets}), std::vector<bool>({true}));
+
+  cursor = 0;
+  for (size_t i = 0; i < sizes.size(); ++i) {
+    EXPECT_EQ(std::memcmp(dst.data() + cursor, object.data() + offsets[i], sizes[i]), 0)
+        << "range " << i << " restored the wrong bytes";
+    cursor += sizes[i];
+  }
+
+  // Idempotent for a size already covered, and still refuses to silently shrink
+  // a region -- same contract as the pinned path.
+  EXPECT_TRUE(caller_->RegisterMemory(dst.data(), dst.size() / 2, mori::io::MemoryLocationType::CPU,
+                                      -1, MemoryRegistration::kLocalCopyOnly));
+  EXPECT_FALSE(caller_->RegisterMemory(dst.data(), dst.size() * 2,
+                                       mori::io::MemoryLocationType::CPU, -1,
+                                       MemoryRegistration::kLocalCopyOnly));
+  caller_->DeregisterMemory(dst.data());
+}
+
 TEST_F(PoolClientRangesTest, InvalidRangesFailWithoutPublishing) {
   std::vector<char> src(kObjectSize, 0x5a);
   std::vector<std::string> keys = {"range-gap", "range-overlap"};

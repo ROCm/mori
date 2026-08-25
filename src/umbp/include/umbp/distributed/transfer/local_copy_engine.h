@@ -36,6 +36,24 @@ namespace mori::umbp {
 // wants the same cache-bypass behavior.  Honors UMBP_DRAM_NT_COPY=0.
 void HostCopyBlock(void* dst, const void* src, size_t size);
 
+// Declare that copies issued on THIS thread are not on anyone's critical path,
+// so LocalCopyEngine::Submit should run them on the calling thread instead of
+// fanning them out.
+//
+// Fanning out is a latency trade: it spends other cores to finish one caller's
+// copy sooner.  That is the right trade for a thread someone is blocked on and
+// the wrong one for a background worker, which has no waiter and whose helpers
+// land on whoever does.  Measured: with the asynchronous locality install
+// fanning out too, a remote layer-wise restore at 8 ranks saw TTFL go from
+// 7,470 to 12,154 us while its own throughput barely moved -- and the whole
+// regression vanished under --no-prefetch, which is what identified the
+// installer as the thief.
+//
+// Thread-local and sticky, so a worker sets it once at start-up rather than
+// around each call.
+void MarkThreadBackgroundCopies();
+bool ThreadDoesBackgroundCopies();
+
 // The both-endpoints-are-local implementation of TransferEngine.
 //
 // This is what makes the local fast path stop being a special case (design doc

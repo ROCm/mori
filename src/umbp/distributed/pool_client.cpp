@@ -192,11 +192,27 @@ inline double RangedSeconds(std::chrono::steady_clock::time_point start,
 
 struct RangedPhases {
   double resolve = 0.0;
+  // Split out of `resolve`, which used to cover the whole per-key loop and so
+  // could not say whether the time went to the medium's index or to describing
+  // the caller's buffers.  `classify` is the latter: one pointer lookup per
+  // RANGE, and a ranged call carries thousands of them.
+  double classify = 0.0;
+  double build = 0.0;
+  double validate = 0.0;  // put only: checking the ranges tile their object
+  double commit = 0.0;    // put only: slot commit
   double route = 0.0;
   double xfer = 0.0;
+  // xfer split three ways.  Planning scales with items, the move with bytes, so
+  // a batch of many small ranges needs them apart to say which it is paying.
+  double xfer_plan = 0.0;
+  double xfer_submit = 0.0;
+  double xfer_wait = 0.0;
   double lock = 0.0;
   double remote = 0.0;
   size_t keys = 0;
+  // TransferItems handed to the engine.  Grows with ranges, not keys, and is
+  // what makes the item-per-range cost visible next to the phase times.
+  size_t items = 0;
   size_t local_keys = 0;
   size_t remote_keys = 0;
   double bytes = 0.0;
@@ -243,11 +259,19 @@ class RangedStats {
     t.calls += 1;
     t.total += total;
     t.resolve += p.resolve;
+    t.classify += p.classify;
+    t.build += p.build;
+    t.validate += p.validate;
+    t.commit += p.commit;
     t.route += p.route;
     t.xfer += p.xfer;
+    t.xfer_plan += p.xfer_plan;
+    t.xfer_submit += p.xfer_submit;
+    t.xfer_wait += p.xfer_wait;
     t.lock += p.lock;
     t.remote += p.remote;
     t.bytes += p.bytes;
+    t.items += p.items;
 
     // Per-component totals, keyed by object size (one call = one pool).  The
     // sample key is stored once per (op, size) so the log proves the
@@ -272,10 +296,24 @@ class RangedStats {
     EmitComponentsLocked();
   }
 
+  // The cadence emit only fires when a call lands more than one window after
+  // the previous one, so a measured phase shorter than the cadence reports no
+  // line at all -- indistinguishable from the instrumentation being off -- and
+  // the final partial window of a long run is lost the same way.
+  void FlushFinal() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (get_.calls == 0 && put_.calls == 0) return;
+    Emit("GET", get_);
+    Emit("PUT", put_);
+    EmitComponentsLocked();
+  }
+
  private:
   struct Totals {
     uint64_t calls = 0;
-    double total = 0, resolve = 0, route = 0, xfer = 0, lock = 0, remote = 0, bytes = 0;
+    uint64_t items = 0;
+    double total = 0, resolve = 0, classify = 0, build = 0, validate = 0, commit = 0, route = 0,
+           xfer = 0, xfer_plan = 0, xfer_submit = 0, xfer_wait = 0, lock = 0, remote = 0, bytes = 0;
   };
   struct Component {
     uint64_t calls = 0;
@@ -285,15 +323,20 @@ class RangedStats {
   };
   static void Emit(const char* name, const Totals& t) {
     if (t.calls == 0) return;
-    const double other = t.total - (t.resolve + t.route + t.xfer + t.lock + t.remote);
+    const double other = t.total - (t.resolve + t.classify + t.build + t.validate + t.commit +
+                                    t.route + t.xfer + t.lock + t.remote);
     auto share = [&](double v) { return t.total > 0 ? 100.0 * v / t.total : 0.0; };
     MORI_UMBP_INFO(
         "[RangedCall][dbg] SUMMARY {} calls={} total={:.3f}s mean_call={:.1f}us bytes={:.2f}GiB "
-        "| resolve={:.1f}% route={:.1f}% xfer={:.1f}% lock={:.1f}% remote={:.1f}% other={:.1f}% "
+        "items_per_call={:.0f} | resolve={:.1f}% classify={:.1f}% build={:.1f}% validate={:.1f}% "
+        "commit={:.1f}% route={:.1f}% xfer={:.1f}%(plan={:.1f}% submit={:.1f}% wait={:.1f}%) "
+        "lock={:.1f}% remote={:.1f}% other={:.1f}% "
         "| xfer_only={:.2f}GiB/s end2end={:.2f}GiB/s",
         name, t.calls, t.total, 1e6 * t.total / t.calls, t.bytes / (1024.0 * 1024 * 1024),
-        share(t.resolve), share(t.route), share(t.xfer), share(t.lock), share(t.remote),
-        share(other), t.xfer > 0 ? (t.bytes / t.xfer) / (1024.0 * 1024 * 1024) : 0.0,
+        static_cast<double>(t.items) / t.calls, share(t.resolve), share(t.classify), share(t.build),
+        share(t.validate), share(t.commit), share(t.route), share(t.xfer), share(t.xfer_plan),
+        share(t.xfer_submit), share(t.xfer_wait), share(t.lock), share(t.remote), share(other),
+        t.xfer > 0 ? (t.bytes / t.xfer) / (1024.0 * 1024 * 1024) : 0.0,
         t.total > 0 ? (t.bytes / t.total) / (1024.0 * 1024 * 1024) : 0.0);
   }
   void EmitComponentsLocked() const {
@@ -320,7 +363,14 @@ class RangedStats {
 };
 
 RangedStats& RangedStatsInstance() {
-  static RangedStats* stats = new RangedStats();
+  // Deliberately leaked: a destructor here would run at static-destruction
+  // time, after singletons it logs through may be gone. atexit gives back the
+  // final flush the leak would otherwise cost, and runs before those teardowns.
+  static RangedStats* stats = [] {
+    auto* created = new RangedStats();
+    std::atexit([] { RangedStatsInstance().FlushFinal(); });
+    return created;
+  }();
   return *stats;
 }
 
@@ -344,15 +394,19 @@ class ScopedRangedReport {
     RangedStatsInstance().Record(op_, phases_, total);
     if (!RangedDebugSampleThisCall()) return;
     const double other =
-        total - (phases_.resolve + phases_.route + phases_.xfer + phases_.lock + phases_.remote);
+        total - (phases_.resolve + phases_.classify + phases_.build + phases_.validate +
+                 phases_.commit + phases_.route + phases_.xfer + phases_.lock + phases_.remote);
     MORI_UMBP_INFO(
-        "[RangedCall][dbg] op={} obj={} key0='{}' keys={} local={} remote={} bytes={} "
-        "total={:.1f}us resolve={:.1f}us route={:.1f}us xfer={:.1f}us lock={:.1f}us "
-        "remote_phase={:.1f}us other={:.1f}us",
+        "[RangedCall][dbg] op={} obj={} key0='{}' keys={} items={} local={} remote={} bytes={} "
+        "total={:.1f}us resolve={:.1f}us classify={:.1f}us build={:.1f}us validate={:.1f}us "
+        "commit={:.1f}us route={:.1f}us xfer={:.1f}us(plan={:.1f} submit={:.1f} wait={:.1f}) "
+        "lock={:.1f}us remote_phase={:.1f}us other={:.1f}us",
         op_, phases_.object_size, phases_.key0 != nullptr ? *phases_.key0 : std::string("?"),
-        phases_.keys, phases_.local_keys, phases_.remote_keys, phases_.bytes, total * 1e6,
-        phases_.resolve * 1e6, phases_.route * 1e6, phases_.xfer * 1e6, phases_.lock * 1e6,
-        phases_.remote * 1e6, other * 1e6);
+        phases_.keys, phases_.items, phases_.local_keys, phases_.remote_keys, phases_.bytes,
+        total * 1e6, phases_.resolve * 1e6, phases_.classify * 1e6, phases_.build * 1e6,
+        phases_.validate * 1e6, phases_.commit * 1e6, phases_.route * 1e6, phases_.xfer * 1e6,
+        phases_.xfer_plan * 1e6, phases_.xfer_submit * 1e6, phases_.xfer_wait * 1e6,
+        phases_.lock * 1e6, phases_.remote * 1e6, other * 1e6);
   }
 
  private:
@@ -363,6 +417,24 @@ class ScopedRangedReport {
   const double& remote_bytes_;
   std::chrono::steady_clock::time_point start_;
 };
+
+// Runs a callable at scope exit.  Same reason the two Scoped* classes below are
+// destructor-based: a ranged call has several early returns that have still
+// moved bytes, and end-of-call work must not depend on each `return` having
+// remembered to do it.
+template <class Fn>
+class ScopeExit {
+ public:
+  explicit ScopeExit(Fn fn) : fn_(std::move(fn)) {}
+  ~ScopeExit() { fn_(); }
+  ScopeExit(const ScopeExit&) = delete;
+  ScopeExit& operator=(const ScopeExit&) = delete;
+
+ private:
+  Fn fn_;
+};
+template <class Fn>
+ScopeExit(Fn) -> ScopeExit<Fn>;
 
 // Ranged calls have several early returns that can still have moved bytes (a
 // batch fully served from the local medium returns before the remote phase is
@@ -850,7 +922,7 @@ void PoolClient::Shutdown() {
   registry_ = BackendRegistry{};
 
   if (transfer_engine_) {
-    std::lock_guard<std::mutex> lock(registered_mem_mutex_);
+    std::unique_lock<std::shared_mutex> lock(registered_mem_mutex_);
     for (auto& reg : registered_regions_) transfer_engine_->Deregister(reg.ref);
     registered_regions_.clear();
   }
@@ -887,8 +959,8 @@ BackendRegistry& PoolClient::Backends() { return registry_; }
 // ---------------------------------------------------------------------------
 
 bool PoolClient::RegisterMemory(void* ptr, size_t size, mori::io::MemoryLocationType loc,
-                                int device) {
-  if (!transfer_engine_) {
+                                int device, MemoryRegistration mode) {
+  if (!transfer_engine_ && mode == MemoryRegistration::kPinned) {
     MORI_UMBP_ERROR("[PoolClient] RegisterMemory: transfer engine not available");
     return false;
   }
@@ -896,9 +968,12 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size, mori::io::MemoryLocation
     MORI_UMBP_ERROR("[PoolClient] RegisterMemory: invalid args ptr={}, size={}", ptr, size);
     return false;
   }
-  std::lock_guard<std::mutex> lock(registered_mem_mutex_);
-  for (auto& reg : registered_regions_) {
-    if (reg.base != ptr) continue;
+  std::unique_lock<std::shared_mutex> lock(registered_mem_mutex_);
+  const auto at = std::lower_bound(
+      registered_regions_.begin(), registered_regions_.end(), ptr,
+      [](const RegisteredRegion& r, const void* p) { return std::less<const void*>{}(r.base, p); });
+  if (at != registered_regions_.end() && at->base == ptr) {
+    const RegisteredRegion& reg = *at;
     // Re-registering the same base with a larger size is not idempotent: the
     // existing registration covers fewer bytes, so FindRegisteredMemory would
     // start rejecting the tail and silently fall back to unregistered bytes.
@@ -907,6 +982,15 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size, mori::io::MemoryLocation
         "[PoolClient] RegisterMemory: ptr={} already registered with smaller size {}<{}", ptr,
         reg.size, size);
     return false;
+  }
+
+  if (mode == MemoryRegistration::kLocalCopyOnly) {
+    // Nothing to pin and nothing that can throw: the ref carries exactly what
+    // local engine selection reads off it, and every engine's Deregister
+    // no-ops on a ref without a descriptor.
+    TransferRef ref = TransferRef::HostBytes(ptr, size, loc, device);
+    registered_regions_.insert(at, RegisteredRegion{ptr, size, std::move(ref)});
+    return true;
   }
 
   // The engine may throw (mori-io pinning can fail on a region the NIC cannot
@@ -927,7 +1011,8 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size, mori::io::MemoryLocation
       transfer_engine_->Deregister(ref);
       return false;
     }
-    registered_regions_.push_back({ptr, size, std::move(ref)});
+    // Inserted in place rather than appended: lookups binary-search this.
+    registered_regions_.insert(at, RegisteredRegion{ptr, size, std::move(ref)});
   } catch (const std::exception& error) {
     MORI_UMBP_ERROR("[PoolClient] RegisterMemory failed for ptr={}, size={}: {}", ptr, size,
                     error.what());
@@ -942,26 +1027,38 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size, mori::io::MemoryLocation
 
 void PoolClient::DeregisterMemory(void* ptr) {
   if (ptr == nullptr) return;
-  std::lock_guard<std::mutex> lock(registered_mem_mutex_);
-  auto it = std::find_if(registered_regions_.begin(), registered_regions_.end(),
-                         [ptr](const RegisteredRegion& r) { return r.base == ptr; });
-  if (it != registered_regions_.end()) {
+  std::unique_lock<std::shared_mutex> lock(registered_mem_mutex_);
+  auto it = std::lower_bound(
+      registered_regions_.begin(), registered_regions_.end(), ptr,
+      [](const RegisteredRegion& r, const void* p) { return std::less<const void*>{}(r.base, p); });
+  if (it != registered_regions_.end() && it->base == ptr) {
     if (transfer_engine_) transfer_engine_->Deregister(it->ref);
     registered_regions_.erase(it);
   }
 }
 
+const PoolClient::RegisteredRegion* PoolClient::FindRegisteredRegionLocked(const void* ptr,
+                                                                           size_t size) const {
+  // Regions never overlap, so the only candidate is the last one whose base is
+  // <= ptr.  upper_bound then step back finds it in O(log n).
+  auto at = std::upper_bound(
+      registered_regions_.begin(), registered_regions_.end(), ptr,
+      [](const void* p, const RegisteredRegion& r) { return std::less<const void*>{}(p, r.base); });
+  if (at == registered_regions_.begin()) return nullptr;
+  --at;
+  const auto addr = reinterpret_cast<uintptr_t>(ptr);
+  const auto base = reinterpret_cast<uintptr_t>(at->base);
+  if (size > at->size || (addr - base) > at->size - size) return nullptr;
+  return &*at;
+}
+
 std::optional<std::pair<TransferRef, size_t>> PoolClient::FindRegisteredMemory(const void* ptr,
                                                                                size_t size) const {
-  auto addr = reinterpret_cast<uintptr_t>(ptr);
-  std::lock_guard<std::mutex> lock(registered_mem_mutex_);
-  for (auto& reg : registered_regions_) {
-    auto base = reinterpret_cast<uintptr_t>(reg.base);
-    if (addr >= base && size <= reg.size && (addr - base) <= reg.size - size) {
-      return std::pair{reg.ref, static_cast<size_t>(addr - base)};
-    }
-  }
-  return std::nullopt;
+  std::shared_lock<std::shared_mutex> lock(registered_mem_mutex_);
+  const RegisteredRegion* reg = FindRegisteredRegionLocked(ptr, size);
+  if (reg == nullptr) return std::nullopt;
+  const auto offset = reinterpret_cast<uintptr_t>(ptr) - reinterpret_cast<uintptr_t>(reg->base);
+  return std::pair{reg->ref, static_cast<size_t>(offset)};
 }
 
 std::pair<TransferRef, uint64_t> PoolClient::UserBufferRef(void* ptr, size_t size) const {
@@ -1127,14 +1224,56 @@ bool PoolClient::BuildLocalRangeTransfers(MediumBackend* backend,
                                           const std::vector<PageLocation>& pages,
                                           uint64_t page_size, uint64_t stored_size,
                                           const std::vector<ObjectRange>& ranges, bool to_backend,
-                                          size_t tag, std::vector<TransferItem>* items) {
+                                          size_t tag, std::vector<TransferItem>* items,
+                                          double* classify_sink) {
   if (pages.empty() || page_size == 0) return false;
 
-  for (const auto& range : ranges) {
-    if (range.user == nullptr) return false;
-    // Classified once per range, not per page: an unregistered device pointer
-    // must reach HbmCopyEngine, and the whole range lives in one buffer.
-    const TransferRef user_ref = ClassifiedUserBytes(range.user, range.size);
+  // Describe each range's caller buffer once, ahead of the page walk, because a
+  // range can produce several page fragments and the description belongs to the
+  // range.  Callers already truncate `items` when this returns false, so bailing
+  // before anything is emitted is equivalent to bailing partway through.
+  //
+  // Prefer the registration table.  A registered ref already carries loc and
+  // device, so it answers what ClassifiedUserBytes asks hipPointerGetAttributes
+  // for -- and it answers it for the whole region, not per range.  That matters
+  // twice over here:
+  //
+  //   * The HIP call is per RANGE, and a layer-wise reader carries thousands.
+  //   * A registered ref names the REGION base, so every range landing in one
+  //     caller buffer shares a (src, dst) pair and LocalCopyEngine::Plan folds
+  //     them into a single plan.  Describing them by their own addresses made
+  //     each range its own plan, with its own vectors, and defeated the
+  //     coalescing that Plan exists to do.
+  //
+  // In standalone-process mode the server registers every client region it
+  // imports, so this is the path a real deployment takes; ClassifiedUserBytes
+  // stays as the answer for genuinely unregistered memory, where the pointer
+  // really does have to be interrogated.
+  std::vector<TransferRef> user_refs;
+  std::vector<uint64_t> user_offsets;
+  {
+    PhaseTimer classify_timer(classify_sink);
+    user_refs.reserve(ranges.size());
+    user_offsets.reserve(ranges.size());
+    // One shared lock for the whole batch, not one per range.
+    std::shared_lock<std::shared_mutex> lock(registered_mem_mutex_);
+    for (const auto& range : ranges) {
+      if (range.user == nullptr) return false;
+      if (const RegisteredRegion* reg = FindRegisteredRegionLocked(range.user, range.size)) {
+        user_refs.push_back(reg->ref);
+        user_offsets.push_back(reinterpret_cast<uintptr_t>(range.user) -
+                               reinterpret_cast<uintptr_t>(reg->base));
+      } else {
+        user_refs.push_back(ClassifiedUserBytes(range.user, range.size));
+        user_offsets.push_back(0);
+      }
+    }
+  }
+
+  for (size_t r = 0; r < ranges.size(); ++r) {
+    const auto& range = ranges[r];
+    const TransferRef& user_ref = user_refs[r];
+    const uint64_t user_base = user_offsets[r];
 
     // The walk owns every bound: object overflow, page-list overrun, and the
     // short last page a range must not run off the end of.
@@ -1151,16 +1290,21 @@ bool PoolClient::BuildLocalRangeTransfers(MediumBackend* backend,
           TransferItem item;
           item.size = fragment;
           item.tag = tag;
+          // `copied` is relative to the range; the ref may describe the whole
+          // registered region the range sits inside, so bias by where the range
+          // starts in it.  user_base is 0 for an unregistered pointer, whose ref
+          // describes exactly the range.
+          const uint64_t user_offset = user_base + copied;
           if (to_backend) {
             item.src = user_ref;
-            item.src_offset = copied;
+            item.src_offset = user_offset;
             item.dst = std::move(buf);
             item.dst_offset = tier_offset;
           } else {
             item.src = std::move(buf);
             item.src_offset = tier_offset;
             item.dst = user_ref;
-            item.dst_offset = copied;
+            item.dst_offset = user_offset;
           }
           items->push_back(std::move(item));
           return true;
@@ -1219,11 +1363,69 @@ bool PoolClient::CopyRangesToContiguous(const std::vector<ObjectRange>& ranges, 
 }
 
 void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteRequest>& requests,
-                                            std::vector<bool>* results, double* committed_bytes) {
+                                            std::vector<bool>* results, double* committed_bytes,
+                                            const RangedPhaseSinks* sinks_or_null) {
+  static const RangedPhaseSinks kNoSinks;
+  const RangedPhaseSinks& sinks = sinks_or_null != nullptr ? *sinks_or_null : kNoSinks;
   if (requests.empty()) return;
   if (registry_.Empty()) {
     MORI_UMBP_ERROR("[PoolClient] Local ranged Put requested but no storage backend is registered");
     return;
+  }
+
+  // Work grouped by the backend that will hold it, so the backend's batch APIs
+  // are called once per batch instead of once per key.
+  //
+  // Calling them per key hurts a put far more than it hurt a get, because the
+  // batches are far smaller: an offload call carries single-digit keys (its
+  // ranges must tile whole objects, so a page's worth of layers uses up the
+  // per-call range budget) against a load call's hundreds.  A cost paid per
+  // call is amortized over a few keys, and there are correspondingly more
+  // calls -- measured end to end, this loop's allocation was 68% of all time
+  // spent in BatchPutRanges.
+  struct BackendWork {
+    MediumBackend* backend = nullptr;
+    std::vector<size_t> requests;    // indices into `requests`
+    std::vector<uint64_t> to_abort;  // slots to release
+    std::vector<CommitRequest> commits;
+    std::vector<size_t> commit_owner;  // request index behind each commit
+  };
+  std::vector<BackendWork> work;
+  auto work_for = [&work](MediumBackend* backend) -> BackendWork& {
+    for (auto& entry : work) {
+      if (entry.backend == backend) return entry;
+    }
+    work.push_back(BackendWork{backend, {}, {}, {}, {}});
+    return work.back();
+  };
+
+  for (size_t r = 0; r < requests.size(); ++r) {
+    auto* backend = registry_.Get(requests[r].tier);
+    if (backend == nullptr || backend->BufferCount() == 0) {
+      MORI_UMBP_WARN("[PoolClient] Local ranged Put: tier={} has no in-process-addressable backend",
+                     static_cast<int>(requests[r].tier));
+      continue;
+    }
+    work_for(backend).requests.push_back(r);
+  }
+
+  std::vector<AllocateResult> allocations(requests.size());
+  std::vector<MediumBackend*> backend_of(requests.size(), nullptr);
+  {
+    PhaseTimer alloc_timer(sinks.resolve);
+    std::vector<AllocateRequest> asks;
+    for (auto& entry : work) {
+      asks.clear();
+      asks.reserve(entry.requests.size());
+      for (size_t r : entry.requests) {
+        asks.push_back(AllocateRequest{*requests[r].key, requests[r].object_size});
+      }
+      auto results_for_backend = entry.backend->BatchAllocate(asks);
+      for (size_t j = 0; j < entry.requests.size() && j < results_for_backend.size(); ++j) {
+        allocations[entry.requests[j]] = std::move(results_for_backend[j]);
+        backend_of[entry.requests[j]] = entry.backend;
+      }
+    }
   }
 
   struct PendingWrite {
@@ -1234,17 +1436,17 @@ void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteReq
   std::vector<PendingWrite> pending;
   std::vector<TransferItem> items;
   pending.reserve(requests.size());
+  {
+    size_t range_total = 0;
+    for (const auto& request : requests) range_total += request.ranges.size();
+    items.reserve(range_total);
+  }
 
   for (size_t r = 0; r < requests.size(); ++r) {
+    MediumBackend* const backend = backend_of[r];
+    if (backend == nullptr) continue;
     const auto& request = requests[r];
-    auto* backend = registry_.Get(request.tier);
-    if (backend == nullptr || backend->BufferCount() == 0) {
-      MORI_UMBP_WARN("[PoolClient] Local ranged Put: tier={} has no in-process-addressable backend",
-                     static_cast<int>(request.tier));
-      continue;
-    }
-    auto alloc_res =
-        backend->BatchAllocate({AllocateRequest{*request.key, request.object_size}}).front();
+    const AllocateResult& alloc_res = allocations[r];
     if (alloc_res.outcome == AllocateOutcome::kSuccessAlreadyExists) {
       (*results)[request.result_index] = true;
       continue;
@@ -1254,39 +1456,83 @@ void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteReq
     // tag = index into `requests`, so the engine's failed tags map straight
     // back to the slot that has to be aborted.
     const size_t before = items.size();
-    if (!BuildLocalRangeTransfers(backend, alloc_res.pages, alloc_res.page_size,
-                                  request.object_size, request.ranges, /*to_backend=*/true,
-                                  /*tag=*/r, &items)) {
+    bool built = false;
+    {
+      PhaseTimer build_timer(sinks.build);
+      built = BuildLocalRangeTransfers(backend, alloc_res.pages, alloc_res.page_size,
+                                       request.object_size, request.ranges, /*to_backend=*/true,
+                                       /*tag=*/r, &items, sinks.classify);
+    }
+    if (!built) {
       items.resize(before);
-      backend->BatchAbort({alloc_res.slot_id});
+      work_for(backend).to_abort.push_back(alloc_res.slot_id);
       continue;
     }
     pending.push_back({r, backend, alloc_res.slot_id});
   }
-  if (pending.empty()) return;
+  // Classification is timed inside the build window; subtract it so the phases
+  // stay disjoint.
+  if (sinks.build != nullptr && sinks.classify != nullptr) *sinks.build -= *sinks.classify;
+  if (sinks.items != nullptr) *sinks.items += items.size();
+  auto flush_aborts = [&work] {
+    for (auto& entry : work) {
+      if (entry.to_abort.empty()) continue;
+      entry.backend->BatchAbort(entry.to_abort);
+      entry.to_abort.clear();
+    }
+  };
+
+  if (pending.empty()) {
+    flush_aborts();
+    return;
+  }
 
   std::vector<size_t> failed_tags;
-  transfer_engine_->Transfer(items, &failed_tags);
+  transfer_engine_->Transfer(items, &failed_tags, sinks.steps);
   const std::unordered_set<size_t> failed(failed_tags.begin(), failed_tags.end());
 
+  // Commit is still strictly after the transfer, and a slot that fails either
+  // step is still aborted -- only the number of calls changes.
   for (const auto& write : pending) {
-    const auto& request = requests[write.request_index];
+    BackendWork& entry = work_for(write.backend);
     if (failed.count(write.request_index) != 0) {
-      write.backend->BatchAbort({write.slot_id});
+      entry.to_abort.push_back(write.slot_id);
       continue;
     }
-    if (!write.backend->BatchCommit({CommitRequest{write.slot_id, *request.key}}).front().success) {
-      write.backend->BatchAbort({write.slot_id});
-      continue;
+    entry.commits.push_back(CommitRequest{write.slot_id, *requests[write.request_index].key});
+    entry.commit_owner.push_back(write.request_index);
+  }
+
+  double put_bytes = 0.0;
+  {
+    PhaseTimer commit_timer(sinks.commit);
+    for (auto& entry : work) {
+      if (entry.commits.empty()) continue;
+      auto outcomes = entry.backend->BatchCommit(entry.commits);
+      for (size_t j = 0; j < entry.commit_owner.size(); ++j) {
+        const auto& request = requests[entry.commit_owner[j]];
+        if (j >= outcomes.size() || !outcomes[j].success) {
+          entry.to_abort.push_back(entry.commits[j].slot_id);
+          continue;
+        }
+        (*results)[request.result_index] = true;
+        put_bytes += static_cast<double>(request.object_size);
+      }
     }
-    (*results)[request.result_index] = true;
-    if (committed_bytes != nullptr) *committed_bytes += static_cast<double>(request.object_size);
+  }
+  flush_aborts();
+
+  if (committed_bytes != nullptr) *committed_bytes += put_bytes;
+  if (put_bytes > 0.0) {
+    // One update for the batch rather than two per key; the totals are the
+    // same.  AddCounter locks and materializes its help text every call, which
+    // is not something to do once per object.
     master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL,
                                MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL_HELP,
-                               {{"traffic", "local"}}, static_cast<double>(request.object_size));
+                               {{"traffic", "local"}}, put_bytes);
     master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL,
                                MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL_HELP,
-                               {{"traffic", "local"}}, static_cast<double>(request.object_size));
+                               {{"traffic", "local"}}, put_bytes);
   }
 }
 
@@ -1510,6 +1756,13 @@ void PoolClient::FetchWholeObjectsIntoMedium(std::vector<ReCacheJob>& jobs) {
 }
 
 void PoolClient::ReCacheWorkerLoop() {
+  // Nobody is blocked on this thread.  Its whole purpose is to make LATER calls
+  // faster, so it must not borrow cores from the calls happening NOW -- doing
+  // so cost 63% of TTFL on a remote layer-wise restore at 8 ranks.  Set once
+  // here rather than around each copy: everything this loop does is background
+  // by construction.
+  MarkThreadBackgroundCopies();
+
   // Reused across iterations so a steady stream of prefetches does not
   // reallocate this vector on every batch.
   std::vector<ReCacheJob> prefetch_batch;
@@ -2126,13 +2379,13 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
 
 namespace {
 
-std::vector<PoolClient::ObjectRange> MakeReadRanges(const std::vector<void*>& dsts,
-                                                    const std::vector<size_t>& sizes,
-                                                    const std::vector<size_t>& offsets) {
-  std::vector<PoolClient::ObjectRange> out;
-  out.reserve(dsts.size());
-  for (size_t r = 0; r < dsts.size(); ++r) out.push_back({dsts[r], sizes[r], offsets[r]});
-  return out;
+// Fills `out` rather than returning a fresh vector: the caller loops over keys
+// and one allocation per key adds up on a call carrying thousands of ranges.
+void FillReadRanges(const std::vector<void*>& dsts, const std::vector<size_t>& sizes,
+                    const std::vector<size_t>& offsets, std::vector<PoolClient::ObjectRange>* out) {
+  out->clear();
+  out->reserve(dsts.size());
+  for (size_t r = 0; r < dsts.size(); ++r) out->push_back({dsts[r], sizes[r], offsets[r]});
 }
 
 std::vector<PoolClient::ObjectRange> MakeWriteRanges(const std::vector<const void*>& srcs,
@@ -2173,17 +2426,31 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   RangedPhases* dbg = ranged_debug ? &phases : nullptr;
   ScopedRangedReport ranged_report("get", phases, ranged_debug, local_bytes, remote_bytes);
 
+  // Accumulated over the batch and reported once at the end rather than per
+  // key.  AddCounter takes a lock and builds a metric key out of the name and
+  // labels, and the help text is a hundred-odd bytes that has to be
+  // materialized on every call -- affordable once, not a thousand times.  The
+  // counter totals are identical either way; only the number of updates
+  // changes.
+  double local_get_bytes = 0.0;
   auto record_local_get = [&](size_t index) {
-    const double bytes =
+    local_get_bytes +=
         static_cast<double>(std::accumulate(sizes[index].begin(), sizes[index].end(), size_t{0}));
-    local_bytes += bytes;
+  };
+  auto flush_local_get_bytes = [&] {
+    if (local_get_bytes == 0.0) return;
+    local_bytes += local_get_bytes;
     master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL,
                                MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL_HELP,
-                               {{"traffic", "local"}}, bytes);
+                               {{"traffic", "local"}}, local_get_bytes);
     master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL,
                                MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP,
-                               {{"traffic", "local"}}, bytes);
+                               {{"traffic", "local"}}, local_get_bytes);
+    local_get_bytes = 0.0;
   };
+  // Declared after ScopedBatchBandwidth and ScopedRangedReport, so it runs
+  // BEFORE either of them reads local_bytes.
+  ScopeExit flush_guard{flush_local_get_bytes};
 
   // ---- Phase 1: everything this node already holds, in one submit ----
   //
@@ -2195,19 +2462,63 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   std::vector<size_t> local_keys;
   std::vector<size_t> missed;
   missed.reserve(n);
-  auto resolve_timer = std::make_unique<PhaseTimer>(dbg ? &dbg->resolve : nullptr);
+  // A TransferItem carries two TransferRefs, each with a MemoryDesc, so growing
+  // this vector by doubling relocates a lot of bytes.  One range is at least one
+  // item -- more only when it straddles a page -- so the range count is a tight
+  // lower bound and covers the common case exactly.
+  {
+    size_t range_total = 0;
+    for (const auto& per_key : sizes) range_total += per_key.size();
+    local_items.reserve(range_total);
+  }
+  std::vector<ObjectRange> key_ranges;
+
+  // One BatchResolve per BACKEND for the whole batch, not one per key.
+  //
+  // Calling it per key made a "batch" API do the opposite: a temporary
+  // vector<string> (copying the key) and a temporary result vector per key, and
+  // one acquisition per key of the backend mutex that Allocate, Commit and
+  // Evict also take -- and in standalone-process mode every rank on the node
+  // shares this client, so that mutex is where they serialize.
+  //
+  // Backends are still tried in registry order and the first hit still wins;
+  // only keys nothing has claimed yet are carried to the next backend, so a
+  // second medium is asked about exactly what the first one missed.
+  std::vector<MediumBackend*> holders(n, nullptr);
+  std::vector<ResolvedEntry> resolutions(n);
+  {
+    PhaseTimer resolve_timer(dbg ? &dbg->resolve : nullptr);
+    std::vector<size_t> pending;
+    pending.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+      if (!sizes[i].empty()) pending.push_back(i);  // asked for nothing: never resolved
+    }
+    std::vector<std::string> batch;
+    std::vector<size_t> still_missing;
+    for (auto* backend : registry_.All()) {
+      if (pending.empty()) break;
+      batch.clear();
+      batch.reserve(pending.size());
+      for (size_t i : pending) batch.push_back(keys[i]);
+      auto found = backend->BatchResolve(batch, /*include_descs=*/false);
+      still_missing.clear();
+      for (size_t j = 0; j < pending.size(); ++j) {
+        if (j < found.size() && found[j].found) {
+          holders[pending[j]] = backend;
+          resolutions[pending[j]] = std::move(found[j]);
+        } else {
+          still_missing.push_back(pending[j]);
+        }
+      }
+      pending.swap(still_missing);
+    }
+  }
+
   for (size_t i = 0; i < n; ++i) {
     if (sizes[i].empty()) continue;  // asked for nothing; stays false
 
-    MediumBackend* holder = nullptr;
-    ResolvedEntry resolved;
-    for (auto* backend : registry_.All()) {
-      auto candidate = backend->BatchResolve({keys[i]}, /*include_descs=*/false).front();
-      if (!candidate.found) continue;
-      holder = backend;
-      resolved = std::move(candidate);
-      break;
-    }
+    MediumBackend* const holder = holders[i];
+    const ResolvedEntry& resolved = resolutions[i];
     if (holder == nullptr) {
       missed.push_back(i);
       continue;
@@ -2224,9 +2535,17 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
       continue;  // a caller bug, not a miss — do not go looking for a replica
     }
     const size_t before = local_items.size();
-    if (!BuildLocalRangeTransfers(holder, resolved.pages, resolved.page_size, resolved.size,
-                                  MakeReadRanges(dsts[i], sizes[i], src_offsets[i]),
-                                  /*to_backend=*/false, /*tag=*/i, &local_items)) {
+    bool built = false;
+    {
+      PhaseTimer build_timer(dbg ? &dbg->build : nullptr);
+      // Refilled per key rather than returned fresh: one allocation for the
+      // call instead of one per key.
+      FillReadRanges(dsts[i], sizes[i], src_offsets[i], &key_ranges);
+      built = BuildLocalRangeTransfers(
+          holder, resolved.pages, resolved.page_size, resolved.size, key_ranges,
+          /*to_backend=*/false, /*tag=*/i, &local_items, dbg ? &dbg->classify : nullptr);
+    }
+    if (!built) {
       // The medium holds the key but cannot be read in-process.  Same call as
       // ExecuteLocalGet's kRetry: look for it on another node rather than
       // reporting a miss the caller cannot distinguish from absence.
@@ -2236,12 +2555,19 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
     }
     local_keys.push_back(i);
   }
-  resolve_timer.reset();  // ends the resolve phase
+  if (dbg != nullptr) {
+    // Classification is timed inside the build window, so subtract it out to
+    // keep the phases disjoint and `other` meaningful.
+    dbg->build -= dbg->classify;
+    dbg->items += local_items.size();
+  }
   if (!local_items.empty()) {
     std::vector<size_t> failed_tags;
     {
       PhaseTimer xfer_timer(dbg ? &dbg->xfer : nullptr);
-      transfer_engine_->Transfer(local_items, &failed_tags);
+      TransferEngine::StepTiming steps;
+      if (dbg != nullptr) steps = {&dbg->xfer_plan, &dbg->xfer_submit, &dbg->xfer_wait};
+      transfer_engine_->Transfer(local_items, &failed_tags, dbg != nullptr ? &steps : nullptr);
     }
     const std::unordered_set<size_t> failed(failed_tags.begin(), failed_tags.end());
     for (size_t i : local_keys) {
@@ -2532,7 +2858,7 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
   valid.reserve(n);
   route_keys.reserve(n);
   route_sizes.reserve(n);
-  auto resolve_timer = std::make_unique<PhaseTimer>(dbg ? &dbg->resolve : nullptr);
+  auto validate_timer = std::make_unique<PhaseTimer>(dbg ? &dbg->validate : nullptr);
   for (size_t i = 0; i < n; ++i) {
     if (!RangesTileObject(object_sizes[i], sizes[i], dst_offsets[i])) {
       MORI_UMBP_ERROR("[PoolClient] BatchPutRanges: ranges do not tile key='{}' size={}", keys[i],
@@ -2543,7 +2869,7 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
     route_keys.push_back(keys[i]);
     route_sizes.push_back(object_sizes[i]);
   }
-  resolve_timer.reset();
+  validate_timer.reset();
   if (valid.empty()) return results;
 
   std::vector<std::optional<RoutePutResult>> routes;
@@ -2592,7 +2918,20 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
   }
   {
     PhaseTimer xfer_timer(dbg ? &dbg->xfer : nullptr);
-    ExecuteLocalPutRangesBatch(local_writes, &results, &local_bytes);
+    TransferEngine::StepTiming steps;
+    RangedPhaseSinks sinks;
+    if (dbg != nullptr) {
+      steps = {&dbg->xfer_plan, &dbg->xfer_submit, &dbg->xfer_wait};
+      sinks = {&dbg->resolve, &dbg->classify, &dbg->build, &dbg->commit, &dbg->items, &steps};
+    }
+    ExecuteLocalPutRangesBatch(local_writes, &results, &local_bytes,
+                               dbg != nullptr ? &sinks : nullptr);
+  }
+  if (dbg != nullptr) {
+    // The sub-phases above are all timed inside the xfer window, so xfer alone
+    // is left holding the engine's copy.  Subtract rather than re-time: nesting
+    // is what makes each sub-phase attributable to the call it belongs to.
+    dbg->xfer -= dbg->resolve + dbg->classify + dbg->build + dbg->commit;
   }
   if (remote.empty()) return results;
 

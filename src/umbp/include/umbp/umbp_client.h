@@ -156,10 +156,13 @@ class IUMBPClient {
   /// not any storage medium — a GPU-resident src/dst (e.g. sglang HiCache
   /// device-resident KV pages) must be registered as such so the transfer
   /// layer picks HbmCopyEngine instead of assuming host memory.
+  /// `mode` picks whether the region is pinned and exported to the IO engine
+  /// or merely recorded for engine selection; see MemoryRegistration. A backend
+  /// with nothing to pin may ignore it.
   virtual bool RegisterMemory(
       uintptr_t /*ptr*/, size_t /*size*/,
-      mori::io::MemoryLocationType /*loc*/ = mori::io::MemoryLocationType::CPU,
-      int /*device*/ = -1) {
+      mori::io::MemoryLocationType /*loc*/ = mori::io::MemoryLocationType::CPU, int /*device*/ = -1,
+      MemoryRegistration /*mode*/ = MemoryRegistration::kPinned) {
     return true;
   }
   virtual void DeregisterMemory(uintptr_t /*ptr*/) {}
