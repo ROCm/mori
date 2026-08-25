@@ -305,6 +305,9 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
   int chunkStartTokenIdx = blockChunkNum * blockId * warpSize;
   int chunkEndTokenIdx =
       std::min(chunkStartTokenIdx + blockChunkNum * warpSize, args.curRankNumToken);
+  // Hoisted: this warp is the one on the critical path to the doorbell, so keep the per-expert
+  // work down to a single divide against a loop-invariant divisor.
+  const int expertPerNode = config.numExpertPerRank * config.gpuPerNode;
   for (int i = warpId; i < nNodes; i += warpNum) {
     if (i == myNode) continue;
     int proxyPe = i * config.gpuPerNode + (config.rank % config.gpuPerNode);
@@ -312,12 +315,25 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
     for (int tokenId = chunkStartTokenIdx + laneId; tokenId < chunkEndTokenIdx;
          tokenId += warpSize) {
       bool shouldSend = false;
-      for (int e = 0; e < config.numExpertPerToken; e++) {
-        int destNode = args.tokenIndices[tokenId * numExpertPerToken + e] /
-                       config.numExpertPerRank / config.gpuPerNode;
+      // Issue every topk index load before consuming any of them. numExpertPerToken is a runtime
+      // value, so the natural loop hands the compiler one load per iteration feeding an
+      // immediately dependent divide and a conditional store, and there is no other warp resident
+      // here to hide that latency behind.
+      index_t laneExpert[MAX_EXPERTS_PER_TOKEN];
+#pragma unroll
+      for (int e = 0; e < MAX_EXPERTS_PER_TOKEN; e++) {
+        if (e < numExpertPerToken)
+          laneExpert[e] = args.tokenIndices[tokenId * numExpertPerToken + e];
+      }
+#pragma unroll
+      for (int e = 0; e < MAX_EXPERTS_PER_TOKEN; e++) {
+        if (e >= numExpertPerToken) break;
+        // One divide instead of two: for non-negative operands x/a/b == x/(a*b), and a negative
+        // sentinel expert truncates to 0 under both forms, so behaviour is unchanged.
+        int destNode = laneExpert[e] / expertPerNode;
         if (destNode == i) {
           shouldSend |= true;
-          args.dispDestTokIdMap[tokenId * numExpertPerToken + e] = NullFlatTokenIndex(config);
+          args.dispDestTokIdMap[tokenId * numExpertPerToken + e] = nullTokenId;
         }
       }
 
