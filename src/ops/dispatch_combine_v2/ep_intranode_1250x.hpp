@@ -63,7 +63,11 @@ using index_t = int32_t;
 #define MORI_COMB_BARSLEEP 15
 #define MORI_COMB_BARSPREAD 16
 
-#define CUSPLIT_MAX_GPUS 8
+// MORI_EP_WORLD_SIZE is emitted by RenderEpSource before #include-ing this
+// header, so the global arrays below are sized to the exact config.
+#ifndef MORI_EP_WORLD_SIZE
+#define MORI_EP_WORLD_SIZE 8
+#endif
 
 template <typename T>
 __device__ __forceinline__ uint32_t MoriPackTo2(float a, float b) {
@@ -199,15 +203,15 @@ __device__ __forceinline__ gfx1250_TDM_GROUP1 TdmSplitShape(const TdmSplit128& s
   return TdmShape2D(32, sp.rows);
 }
 
-#define CUSPLIT_POOL_SLOTS (CUSPLIT_MAX_GPUS * 32768)
+#define CUSPLIT_POOL_SLOTS (MORI_EP_WORLD_SIZE * 32768)
 #define CUSPLIT_MAX_BLOCKS 512
 #define CUSPLIT_MAX_TOPK 16
 
 __device__ index_t _cusplit_stgIdx[CUSPLIT_POOL_SLOTS * CUSPLIT_MAX_TOPK];
 __device__ float _cusplit_stgWt[CUSPLIT_POOL_SLOTS * CUSPLIT_MAX_TOPK];
 __device__ index_t _cusplit_stgSrc[CUSPLIT_POOL_SLOTS];
-__device__ index_t _cusplit_blkBase[CUSPLIT_MAX_BLOCKS * CUSPLIT_MAX_GPUS];
-__device__ index_t _cusplit_blkCount[CUSPLIT_MAX_BLOCKS * CUSPLIT_MAX_GPUS];
+__device__ index_t _cusplit_blkBase[CUSPLIT_MAX_BLOCKS * MORI_EP_WORLD_SIZE];
+__device__ index_t _cusplit_blkCount[CUSPLIT_MAX_BLOCKS * MORI_EP_WORLD_SIZE];
 // Per-token scale rows, staged like the other meta fields so they ship to a peer as
 // one contiguous run rather than a 224 B transfer per (token, destination) -- the
 // size TDM is worst at. The array is at file scope, which the TU reaches before kCfg
