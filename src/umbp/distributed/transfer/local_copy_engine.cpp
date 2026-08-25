@@ -21,13 +21,21 @@
 // SOFTWARE.
 #include "umbp/distributed/transfer/local_copy_engine.h"
 
+#include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <limits>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
@@ -114,12 +122,245 @@ class SettledHandle final : public TransferHandle {
   bool reported_ = false;
 };
 
+// Tuning knobs for the copy itself.  Kept internal: they describe how this
+// engine schedules work, not anything a caller can act on.
+
+// Smallest block the non-temporal path is used for.
+//
+// This was 256 KiB, a figure that came from whole-object copies where one key
+// is one ~MiB page.  A RANGED copy moves one LAYER of one page, and layers are
+// small: DeepSeek-V4-Pro's three pools are 37,440 B, 8,448 B and 1,728 B.  So
+// every ranged copy fell under the old threshold and took the ordinary memcpy,
+// paying read-for-ownership on a destination it completely overwrites.
+//
+// The threshold has to be set against a real model's fragment sizes, not a
+// synthetic one: a uniform 73,728 B shape is larger than anything the model
+// actually has, so a threshold that looks right there never fires in practice.
+//
+// 2 KiB, measured on DeepSeek-V4-Pro's geometry (8 ranks, 32 pages, served
+// entirely from the local medium, medians of 3): restore 12.04 -> 11.43 ms and
+// TTFL 1,529 -> 1,353 us.  Below 2 KiB the remaining movement is inside this
+// machine's run-to-run spread.  Tunable because the right answer is a property
+// of the machine's cache, not of the code.
+size_t NtMinBytes() {
+  static const size_t kDefault = size_t{2} << 10;
+  static const size_t n = [] {
+    const char* raw = std::getenv("UMBP_DRAM_NT_COPY_MIN_BYTES");
+    if (raw == nullptr) return kDefault;
+    char* end = nullptr;
+    const unsigned long long v = std::strtoull(raw, &end, 10);
+    if (end == raw || v == 0) return kDefault;
+    return static_cast<size_t>(v);
+  }();
+  return n;
+}
+
+// Backing store for MarkThreadBackgroundCopies(); see the header for why a
+// thread would declare itself background.
+bool& ThreadBackgroundFlag() {
+  static thread_local bool background = false;
+  return background;
+}
+
+// A persistent set of helper threads that Submit can lend its copies to.
+//
+// Persistent, not spawned per call, because spawning was measured to cost more
+// than the parallelism gained on any workload with a remote half.  Creating and
+// joining threads maps and unmaps their stacks, which serializes on the
+// process's address space -- so the damage is not proportional to how many
+// helpers are used, and indeed capping the whole process to FOUR concurrent
+// spawned helpers still cost 25% of TTFL on a remote layer-wise restore.  The
+// pool makes fan-out cost a condition-variable wake instead.
+class CopyPool {
+ public:
+  struct Batch {
+    const std::function<void(size_t)>* fn = nullptr;
+    size_t count = 0;
+    std::atomic<size_t> next{0};
+    std::atomic<size_t> done{0};
+    // Completion is waited on, not spun on.  A spin is only free when the box
+    // has a spare core, and the process this runs in does not: it is also
+    // running the model's forward pass, the HIP runtime and every other rank.
+    std::mutex mutex;
+    std::condition_variable cv;
+  };
+
+  static CopyPool& Instance() {
+    // Never destroyed: the helpers outlive any translation unit's static
+    // destructor order, and tearing them down during exit buys nothing.
+    static CopyPool* pool = new CopyPool();
+    return *pool;
+  }
+
+  // Publishes `batch`, works on it from the calling thread, and returns once
+  // every item has run.  Helpers are best-effort: if they are all busy the
+  // caller simply does the whole batch itself.
+  void Run(const std::shared_ptr<Batch>& batch, int helpers) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      GrowLocked(helpers);
+      queue_.push_back(batch);
+    }
+    // One wake per helper this batch wants.  notify_all would wake every idle
+    // thread in the process to serve one batch.
+    for (int i = 0; i < helpers; ++i) cv_.notify_one();
+
+    Drain(*batch);
+
+    // Draining only means THIS thread found nothing left to claim; a helper may
+    // still be inside the last item.  The batch is shared_ptr-owned so waiting
+    // for it is safe.
+    {
+      std::unique_lock<std::mutex> lock(batch->mutex);
+      batch->cv.wait(
+          lock, [&batch] { return batch->done.load(std::memory_order_acquire) >= batch->count; });
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto it = std::find(queue_.begin(), queue_.end(), batch);
+      if (it != queue_.end()) queue_.erase(it);
+    }
+  }
+
+ private:
+  // Upper bound on helper threads for the whole process.  They are shared by
+  // every caller, so this is not per call.
+  static int PoolCap() {
+    static const int cap = [] {
+      const unsigned hc = std::thread::hardware_concurrency();
+      const int n = hc == 0 ? 4 : static_cast<int>(hc);
+      return std::max(1, std::min(n, 32));
+    }();
+    return cap;
+  }
+
+  static void Drain(Batch& batch) {
+    for (size_t i = batch.next.fetch_add(1, std::memory_order_relaxed); i < batch.count;
+         i = batch.next.fetch_add(1, std::memory_order_relaxed)) {
+      (*batch.fn)(i);
+      if (batch.done.fetch_add(1, std::memory_order_acq_rel) + 1 == batch.count) {
+        // Notify under the batch mutex the waiter checks its predicate under,
+        // so a waiter that has not yet slept cannot miss this.
+        std::lock_guard<std::mutex> lock(batch.mutex);
+        batch.cv.notify_all();
+      }
+    }
+  }
+
+  // Adds threads only for the helpers this batch cannot get from the idle ones.
+  //
+  // The previous version sized the pool to `helpers` outright, which with the
+  // default of one helper per call meant ONE thread for the whole process: the
+  // second concurrent caller onwards got no help at all and still paid the
+  // queue, the wake and the wait.
+  void GrowLocked(int helpers) {
+    const int deficit = helpers - idle_;
+    for (int i = 0; i < deficit && static_cast<int>(threads_.size()) < PoolCap(); ++i) {
+      threads_.emplace_back([this] { WorkerLoop(); });
+    }
+  }
+
+  // The oldest batch that still has items to claim.  Exhausted batches are left
+  // for their publisher to remove, so they must be skipped rather than blocking
+  // the queue.
+  std::shared_ptr<Batch> PickLocked() {
+    for (auto& batch : queue_) {
+      if (batch->next.load(std::memory_order_relaxed) < batch->count) return batch;
+    }
+    return nullptr;
+  }
+
+  void WorkerLoop() {
+    // A helper exists to serve other threads' copies, so its own copies -- of
+    // which it has none -- must never recurse into fanning out.
+    MarkThreadBackgroundCopies();
+    for (;;) {
+      std::shared_ptr<Batch> batch;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        ++idle_;
+        cv_.wait(lock, [this, &batch] { return (batch = PickLocked()) != nullptr; });
+        --idle_;
+      }
+      // Left queued while draining: several helpers working the same batch is
+      // the point, and they share its cursor.
+      Drain(*batch);
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::deque<std::shared_ptr<Batch>> queue_;
+  std::vector<std::thread> threads_;
+  int idle_ = 0;
+};
+
+// How many threads to spread one Submit's copies over, counting the caller.
+//
+// A single memcpy stream tops out well below what the memory system can do --
+// measured at ~6 GB/s here, and the same ~6 GB/s whether 1 rank or 8 are
+// copying concurrently, so the ceiling is the stream and not the DRAM.  Local
+// mode already knew this: DRAMTier fans its batch reads out over
+// UMBP_DRAM_READ_THREADS (default 4), and its comment says ">1 breaks the
+// single-core memcpy ceiling".  The distributed path never did, because
+// LocalCopyEngine was written when one key was one whole page and the batch
+// executors above it supplied the parallelism.  Ranged I/O broke that
+// assumption: a layer-wise reader hands one thread thousands of small copies.
+//
+// 4, matching local mode's UMBP_DRAM_READ_THREADS.  On DeepSeek-V4-Pro's real
+// pool geometry it is best or tied-best on every shape measured (medians of 3,
+// restore ms / TTFL us):
+//
+//                     threads=1        threads=2        threads=4        threads=8
+//   local  1 rank    9.88 / 690       9.71 / 518       9.61 / 425       9.57 / 381
+//   local  8 ranks  10.06 / 853      10.03 / 723       9.83 / 611       9.94 / 682
+//   remote 1 rank   13.23 / 2294     12.06 / 2229     11.50 / 2304     11.51 / 2284
+//   remote 8 ranks  84.44 / 12399    90.55 / 12860    82.58 / 11384    79.78 / 11600
+//
+// An earlier revision defaulted to 2, because 4 appeared to cost a concurrent
+// remote half its first layer group.  That was not bandwidth: it was this
+// file's own pool handing out one helper for the whole process and making
+// everyone else spin waiting for it.  With that fixed the effect is gone, and
+// the value that looked reckless is simply the right one.  8 buys a little more
+// at one rank and gives it back at eight, so 4 is where this stops.
+//
+// Below the byte floor the threads cost more than they save, so a small batch
+// stays on the calling thread and pays nothing.
+int CopyThreads(size_t total_bytes, size_t copy_count) {
+  if (ThreadBackgroundFlag()) return 1;
+  static const int kMax = [] {
+    int n = 4;
+    if (const char* raw = std::getenv("UMBP_DRAM_COPY_THREADS")) {
+      const int v = std::atoi(raw);
+      if (v >= 1) n = v;
+    }
+    const unsigned hc = std::thread::hardware_concurrency();
+    if (hc > 0 && n > static_cast<int>(hc)) n = static_cast<int>(hc);
+    return n < 1 ? 1 : n;
+  }();
+  static const size_t kMinBytes = [] {
+    if (const char* raw = std::getenv("UMBP_DRAM_COPY_THREADS_MIN_BYTES")) {
+      char* end = nullptr;
+      const unsigned long long v = std::strtoull(raw, &end, 10);
+      if (end != raw) return static_cast<size_t>(v);
+    }
+    return size_t{1} << 20;
+  }();
+  if (kMax <= 1 || copy_count < 2 || total_bytes < kMinBytes) return 1;
+  return std::min(kMax, static_cast<int>(copy_count));
+}
+
 }  // namespace
+
+// Set on a worker thread at start-up; read by CopyThreads above.
+void MarkThreadBackgroundCopies() { ThreadBackgroundFlag() = true; }
+
+bool ThreadDoesBackgroundCopies() { return ThreadBackgroundFlag(); }
 
 void HostCopyBlock(void* dst, const void* src, size_t size) {
   static const bool kNt = NtSupported() && !(std::getenv("UMBP_DRAM_NT_COPY") &&
                                              std::getenv("UMBP_DRAM_NT_COPY")[0] == '0');
-  static const size_t kNtMinBytes = 256ull << 10;
+  static const size_t kNtMinBytes = NtMinBytes();
   if (kNt && size >= kNtMinBytes) {
     NtCopyAvx2(static_cast<char*>(dst), static_cast<const char*>(src), size);
   } else {
@@ -191,13 +432,46 @@ TransferPlanSet LocalCopyEngine::Plan(const std::vector<TransferItem>& items) co
 
 std::unique_ptr<TransferHandle> LocalCopyEngine::Submit(std::vector<TransferPlan> plans) {
   if (plans.empty()) return nullptr;
+
+  // Flatten first.  A ranged call arrives as many plans of one copy each, a
+  // whole-object one as a single plan of many; spreading work over threads has
+  // to see past that shape difference or it parallelizes only one of them.
+  struct Copy {
+    char* dst;
+    const char* src;
+    size_t size;
+  };
+  std::vector<Copy> copies;
+  size_t total_copies = 0;
+  for (const auto& plan : plans) total_copies += plan.sizes.size();
+  copies.reserve(total_copies);
+  size_t total_bytes = 0;
   for (const auto& plan : plans) {
     char* dst = static_cast<char*>(plan.dst.host_ptr);
     const char* src = static_cast<const char*>(plan.src.host_ptr);
     for (size_t i = 0; i < plan.sizes.size(); ++i) {
-      HostCopyBlock(dst + plan.dst_offsets[i], src + plan.src_offsets[i], plan.sizes[i]);
+      copies.push_back({dst + plan.dst_offsets[i], src + plan.src_offsets[i], plan.sizes[i]});
+      total_bytes += plan.sizes[i];
     }
   }
+
+  const int threads = CopyThreads(total_bytes, copies.size());
+  if (threads <= 1) {
+    for (const Copy& c : copies) HostCopyBlock(c.dst, c.src, c.size);
+  } else {
+    // Items are claimed off one shared cursor rather than split up front: the
+    // copies in a batch are not the same size (a range that straddles a page
+    // boundary is emitted as fragments), so equal counts would not be equal
+    // work.
+    const std::function<void(size_t)> fn = [&copies](size_t i) {
+      HostCopyBlock(copies[i].dst, copies[i].src, copies[i].size);
+    };
+    auto batch = std::make_shared<CopyPool::Batch>();
+    batch->fn = &fn;
+    batch->count = copies.size();
+    CopyPool::Instance().Run(batch, threads - 1);
+  }
+
   // No failure mode: bounds were validated at plan time and a memcpy cannot
   // fail afterwards.
   return std::make_unique<SettledHandle>(std::vector<TransferFailure>{});

@@ -95,7 +95,8 @@ class DistributedClient : public IUMBPClient {
 
   bool RegisterMemory(uintptr_t ptr, size_t size,
                       mori::io::MemoryLocationType loc = mori::io::MemoryLocationType::CPU,
-                      int device = -1) override;
+                      int device = -1,
+                      MemoryRegistration mode = MemoryRegistration::kPinned) override;
   void DeregisterMemory(uintptr_t ptr) override;
 
   bool ReportExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) override;

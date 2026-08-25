@@ -1,6 +1,10 @@
 [build-system]
 requires = [
-    "setuptools>=61",
+    # setuptools 84 requires build_ext.run() to initialize the compiler, while
+    # CMakeBuild currently invokes build_extension() directly. Without the upper
+    # bound, build isolation pulls the newest setuptools and the wheel build dies
+    # in `AssertionError: run() must precede build_extension()`.
+    "setuptools>=61,<84",
     "setuptools_scm[toml]>=6.2",
     "wheel",
     "ninja",

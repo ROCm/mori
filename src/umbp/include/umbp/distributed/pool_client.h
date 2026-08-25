@@ -30,6 +30,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -100,15 +101,20 @@ class PoolClient {
 
   const std::string& NodeId() const { return config_.master_config.node_id; }
 
-  // Pin a caller-owned region for zero-copy RDMA.  Calls into the IO
-  // engine's RegisterMemory; the descriptor is cached and looked up by
-  // (ptr, size) on the Put/Get hot paths. `loc`/`device` describe the
-  // caller's allocation (CPU, or a GPU ordinal for a device-resident
-  // buffer) so the transfer layer can route to HbmCopyEngine instead of
-  // assuming host memory.
+  // Record a caller-owned region.  The descriptor is cached and looked up by
+  // (ptr, size) on the Put/Get hot paths; `loc`/`device` describe the caller's
+  // allocation (CPU, or a GPU ordinal) so the transfer layer routes to
+  // HbmCopyEngine instead of assuming host memory.
+  //
+  // kPinned also hands the region to the IO engine for zero-copy RDMA.
+  // kLocalCopyOnly skips that, for a region that is only ever a local copy
+  // endpoint -- it still has to be recorded, because a range that misses this
+  // table is described by its own address rather than its region base and so
+  // becomes its own transfer plan.
   bool RegisterMemory(void* ptr, size_t size,
                       mori::io::MemoryLocationType loc = mori::io::MemoryLocationType::CPU,
-                      int device = -1);
+                      int device = -1, MemoryRegistration mode = MemoryRegistration::kPinned);
+
   void DeregisterMemory(void* ptr);
 
   // Hot paths.  Both retry up to `max_route_retries` times when the
@@ -152,6 +158,22 @@ class PoolClient {
     void* user = nullptr;
     size_t size = 0;
     size_t object_offset = 0;
+  };
+
+  // Where a ranged call's internal helpers report the time they spent, so the
+  // phases can be attributed without the helpers knowing about the reporting
+  // machinery.  Split this finely because the costs scale differently: `resolve`
+  // is per key, `classify` is per RANGE, and one call carries thousands of
+  // ranges per key batch.  Every member is nullable; null is inert.
+  struct RangedPhaseSinks {
+    double* resolve = nullptr;   // medium index lookup / slot allocation
+    double* classify = nullptr;  // classifying the caller's range pointers
+    double* build = nullptr;     // TransferItem assembly (classify excluded)
+    double* commit = nullptr;    // slot commit / abort
+    size_t* items = nullptr;     // TransferItems handed to the engine
+    // Forwarded straight to TransferEngine::Transfer so the engine's own three
+    // steps land in the same report as the phases around them.
+    const TransferEngine::StepTiming* steps = nullptr;
   };
 
   std::vector<bool> BatchGetRanges(const std::vector<std::string>& keys,
@@ -294,14 +316,26 @@ class PoolClient {
   // layer's decision, not the client's.
   std::pair<TransferRef, uint64_t> UserBufferRef(void* ptr, size_t size) const;
 
-  // Zero-copy registered memory regions.
+  // Zero-copy registered memory regions, kept sorted by `base`.
+  //
+  // Sorted because a ranged call looks one up PER RANGE, and a layer-wise
+  // reader carries thousands of ranges against a caller that registered one
+  // buffer per layer -- a linear scan makes that quadratic.  Shared, because
+  // those lookups are reads and every rank on the node shares this client.
   struct RegisteredRegion {
     void* base;
     size_t size;
     TransferRef ref;
   };
-  mutable std::mutex registered_mem_mutex_;
+  mutable std::shared_mutex registered_mem_mutex_;
   std::vector<RegisteredRegion> registered_regions_;
+
+  // The region covering [ptr, ptr+size), or null.  Caller holds
+  // registered_mem_mutex_; the returned pointer is valid only under that lock.
+  // Exposed separately from FindRegisteredMemory so a batch can take the lock
+  // once and then resolve every range under it.
+  const RegisteredRegion* FindRegisteredRegionLocked(const void* ptr, size_t size) const;
+
   // The registered ref covering [ptr, ptr+size) plus the offset of ptr within
   // it, or nullopt when the region was never registered.
   std::optional<std::pair<TransferRef, size_t>> FindRegisteredMemory(const void* ptr,
@@ -336,10 +370,14 @@ class PoolClient {
   //
   // Appends to `items`; returns false if the medium publishes no endpoint for a
   // referenced buffer, or a range falls outside the stored object.
+  //
+  // `classify_sink`, when non-null, accumulates the seconds spent classifying
+  // the caller's range pointers.  That cost scales with ranges rather than
+  // keys, so it is reported as its own phase; null makes it inert.
   bool BuildLocalRangeTransfers(MediumBackend* backend, const std::vector<PageLocation>& pages,
                                 uint64_t page_size, uint64_t stored_size,
                                 const std::vector<ObjectRange>& ranges, bool to_backend, size_t tag,
-                                std::vector<TransferItem>* items);
+                                std::vector<TransferItem>* items, double* classify_sink = nullptr);
 
   // Copy between one contiguous host object and a set of caller ranges, through
   // the transfer engine so a device-resident caller buffer is handled by
@@ -351,8 +389,8 @@ class PoolClient {
   // NOT necessarily host memory -- an HBM pool's BufferRef carries a device
   // pointer -- so it has to keep the ref's loc/device rather than be re-wrapped
   // as host bytes, or the engine picks the wrong copy direction.
-  bool CopyContiguousToRanges(const TransferRef& src, uint64_t src_base,
-                              size_t object_size, const std::vector<ObjectRange>& ranges);
+  bool CopyContiguousToRanges(const TransferRef& src, uint64_t src_base, size_t object_size,
+                              const std::vector<ObjectRange>& ranges);
   bool CopyRangesToContiguous(const std::vector<ObjectRange>& ranges, void* dst,
                               size_t object_size);
 
@@ -381,8 +419,14 @@ class PoolClient {
   // wrote.  Deliberately not derivable from `results`: a key already present in
   // the medium reports success without moving anything, and crediting it would
   // inflate the bandwidth histogram.
+  //
+  // `sinks`, when non-null, attributes the call's time to phases; see
+  // RangedPhaseSinks.  Its members are independently nullable too, and a null
+  // one costs nothing -- that is what keeps this off the hot path when the
+  // ranged debug switch is off.
   void ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteRequest>& requests,
-                                  std::vector<bool>* results, double* committed_bytes = nullptr);
+                                  std::vector<bool>* results, double* committed_bytes = nullptr,
+                                  const RangedPhaseSinks* sinks = nullptr);
   // After a successful remote DRAM fetch, if cache_remote_fetches is enabled and
   // the admission gate admits the block, enqueue it for asynchronous install into
   // this node's local DRAM tier (see ReCacheWorkerLoop). The install (DRAM

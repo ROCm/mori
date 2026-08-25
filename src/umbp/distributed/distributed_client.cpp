@@ -329,11 +329,11 @@ size_t DistributedClient::BatchExistsConsecutive(const std::vector<std::string>&
 // ---------------------------------------------------------------------------
 
 bool DistributedClient::RegisterMemory(uintptr_t ptr, size_t size, mori::io::MemoryLocationType loc,
-                                       int device) {
+                                       int device, MemoryRegistration mode) {
   if (closing_) return false;
   std::shared_lock lk(op_mutex_);
   if (closed_) return false;
-  return pool_client_->RegisterMemory(reinterpret_cast<void*>(ptr), size, loc, device);
+  return pool_client_->RegisterMemory(reinterpret_cast<void*>(ptr), size, loc, device, mode);
 }
 
 void DistributedClient::DeregisterMemory(uintptr_t ptr) {

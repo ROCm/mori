@@ -255,8 +255,7 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("ssd_staging_hugepage_size", &UMBPDistributedConfig::ssd_staging_hugepage_size)
       .def_readwrite("peer_service_port", &UMBPDistributedConfig::peer_service_port)
       .def_readwrite("cache_remote_fetches", &UMBPDistributedConfig::cache_remote_fetches)
-      .def_readwrite("ranged_locality_prefetch",
-                     &UMBPDistributedConfig::ranged_locality_prefetch)
+      .def_readwrite("ranged_locality_prefetch", &UMBPDistributedConfig::ranged_locality_prefetch)
       .def_readwrite("cache_remote_admission", &UMBPDistributedConfig::cache_remote_admission)
       .def_readwrite("admission_max_block_bytes", &UMBPDistributedConfig::admission_max_block_bytes)
       .def_readwrite("dram_page_size", &UMBPDistributedConfig::dram_page_size)
@@ -318,9 +317,18 @@ void RegisterMoriUmbp(py::module_& m) {
       .def("get_deployment_mode", &IUMBPClient::GetDeploymentMode)  // pure getter, no I/O
       .def("get_backend_mode", &IUMBPClient::GetBackendMode)        // pure getter, no I/O
       .def("supports_ranged_io", &IUMBPClient::SupportsRangedIO)    // pure getter, no I/O
-      .def("register_memory", &IUMBPClient::RegisterMemory, py::arg("ptr"), py::arg("size"),
-           py::arg("loc") = mori::io::MemoryLocationType::CPU, py::arg("device") = -1,
-           py::call_guard<py::gil_scoped_release>())
+      // Bound to the pinned form on purpose.  MemoryRegistration selects
+      // whether a region is pinned for RDMA or merely recorded for local
+      // copies, and that is decided by the deployment -- the standalone server
+      // picks it from its inner backend mode.  A caller reaching this binding
+      // is registering its own buffers and always wants them pinned, so the
+      // knob is kept off the Python surface rather than offered and ignored.
+      .def(
+          "register_memory",
+          [](IUMBPClient& self, uintptr_t ptr, size_t size, mori::io::MemoryLocationType loc,
+             int device) { return self.RegisterMemory(ptr, size, loc, device); },
+          py::arg("ptr"), py::arg("size"), py::arg("loc") = mori::io::MemoryLocationType::CPU,
+          py::arg("device") = -1, py::call_guard<py::gil_scoped_release>())
       .def("deregister_memory", &IUMBPClient::DeregisterMemory, py::arg("ptr"),
            py::call_guard<py::gil_scoped_release>())
       .def("report_external_kv_blocks", &IUMBPClient::ReportExternalKvBlocks, py::arg("hashes"),

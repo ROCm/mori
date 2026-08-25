@@ -982,16 +982,23 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     entry.device_id = request.device_id();
     entry.alloc_base = request.alloc_base();
     entry.client_id = request.client_id();
-    // Only the Local backend registers the imported mapping. Ranged distributed
-    // I/O stages remote objects through a registered host arena instead: the
-    // imported worker mapping is a local HIP copy endpoint only, so an RDMA MR
-    // for it buys nothing and the dmabuf fallback is unsafe for IPC-imported
-    // ROCm mappings. Skipping it is safe here because an unregistered device
-    // pointer is classified, not assumed host (ClassifiedUserBytes), so
-    // HbmCopyEngine still claims the pair.
-    if (mode == UMBPDeploymentMode::Local &&
-        !RegisterBackendMemory(entry.base, static_cast<size_t>(entry.size),
-                               mori::io::MemoryLocationType::GPU, entry.device_id)) {
+    // Both modes declare the imported mapping to the inner backend; only Local
+    // pins it. Ranged distributed I/O stages remote objects through a registered
+    // host arena, so an RDMA MR over this mapping buys nothing, and the dmabuf
+    // fallback is unsafe for IPC-imported ROCm mappings.
+    //
+    // Declaring it is not optional in either mode. Leaving it out is correct --
+    // an unregistered device pointer is classified rather than assumed host, so
+    // HbmCopyEngine still claims the pair -- but a range that misses the region
+    // table is described by its own address instead of its region base, so it
+    // becomes its own transfer plan instead of sharing one. Measured on
+    // DSv4-Pro/TP8 at 256K, that is plan = 23.2% of a ranged call against 1.4%
+    // once declared.
+    if (!RegisterBackendMemory(entry.base, static_cast<size_t>(entry.size),
+                               mori::io::MemoryLocationType::GPU, entry.device_id,
+                               mode == UMBPDeploymentMode::Local
+                                   ? MemoryRegistration::kPinned
+                                   : MemoryRegistration::kLocalCopyOnly)) {
       ReleaseIpcMapping(key);
       SetBool(response, false, "inner backend RegisterMemory failed");
       return;
@@ -1074,10 +1081,11 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   // the local case, and a host staging bounce in the distributed one.
   bool RegisterBackendMemory(void* base, size_t size,
                              mori::io::MemoryLocationType loc = mori::io::MemoryLocationType::CPU,
-                             int device = -1) {
+                             int device = -1,
+                             MemoryRegistration mode = MemoryRegistration::kPinned) {
     std::unique_lock<std::shared_mutex> lock(client_mu_);
     if (shutdown_.load()) return false;
-    return client_->RegisterMemory(reinterpret_cast<uintptr_t>(base), size, loc, device);
+    return client_->RegisterMemory(reinterpret_cast<uintptr_t>(base), size, loc, device, mode);
   }
 
   void ReleaseRegisteredMemory(const RegisteredMemory& mem) {

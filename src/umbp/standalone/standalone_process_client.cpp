@@ -560,7 +560,8 @@ void StandaloneProcessClient::Close() {
 }
 
 bool StandaloneProcessClient::RegisterMemory(uintptr_t ptr, size_t size,
-                                             mori::io::MemoryLocationType loc, int device) {
+                                             mori::io::MemoryLocationType loc, int device,
+                                             MemoryRegistration /*mode*/) {
   if (closing_) return false;
   std::unique_lock lk(op_mutex_);
   if (closed_) return false;

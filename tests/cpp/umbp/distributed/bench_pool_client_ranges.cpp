@@ -58,7 +58,7 @@
 // A bench that forces every call remote would overstate how often the arena is
 // reached, so this one lets the real behavior happen and reports the local-hit
 // rate it observes (how that number is obtained, and what it cannot tell you,
-// is on AllLocallyResident below).
+// is on LocallyResidentCount below).
 //
 // WHERE "REMOTE" COMES FROM ON A SINGLE HOST
 //
@@ -91,11 +91,18 @@
 //
 // Usage:
 //   bench_pool_client_ranges [--ranks N] [--layers N] [--layer-group N]
-//                            [--layer-bytes N] [--pages N] [--requests N]
-//                            [--compute-us-per-layer N] [--offload-ranks N]
-//                            [--ranges-per-call N] [--scratch-mib N]
-//                            [--page-bytes N] [--no-prefetch]
-//                            [--interleave-groups] [--verify]
+//                            [--layer-bytes N] [--pools SPEC] [--pages N]
+//                            [--requests N] [--compute-us-per-layer N]
+//                            [--offload-ranks N] [--ranges-per-call N]
+//                            [--scratch-mib N] [--page-bytes N] [--no-prefetch]
+//                            [--interleave-groups] [--local-only] [--local-mode]
+//                            [--verify]
+//
+// --local-only and --local-mode are different questions.  --local-only keeps
+// the distributed client and puts every key on the reading node, so the local
+// half of the distributed path is what runs.  --local-mode swaps the client for
+// StandaloneClient, which has no master, peer or arena at all -- the floor the
+// distributed numbers are measured against.
 //
 // CSV (stdout): one row per rank count in --ranks
 //   ranks,layers,group,pages,object_kib,restore_ms_p50,restore_ms_p95,
@@ -132,6 +139,7 @@
 #include "umbp/distributed/master/master_server.h"
 #include "umbp/distributed/peer/backend/medium_backend.h"
 #include "umbp/distributed/pool_client.h"
+#include "umbp/local/standalone_client.h"
 
 using mori::umbp::MasterServer;
 using mori::umbp::MasterServerConfig;
@@ -139,6 +147,44 @@ using mori::umbp::PoolClient;
 using mori::umbp::PoolClientConfig;
 
 namespace {
+
+// The bench drives one of two deployments through the same loop.
+//
+// Comparing them is the point: "distributed mode on one machine" and "local
+// mode" run the same layer-wise restore against the same shapes, so any
+// difference is the deployment and not the workload.  That only holds if the
+// measurement loop is literally the same code, which is why this indirection
+// exists rather than a second copy of the loop.
+//
+// Pointers are void* here because that is PoolClient's signature; the local
+// client takes uintptr_t and the adapter converts.
+class RangedClient {
+ public:
+  virtual ~RangedClient() = default;
+  virtual bool Register(void* ptr, size_t size) = 0;
+  virtual std::vector<bool> Put(const std::vector<std::string>& keys,
+                                const std::vector<const void*>& srcs,
+                                const std::vector<size_t>& sizes) = 0;
+  virtual std::vector<bool> GetRanges(const std::vector<std::string>& keys,
+                                      const std::vector<std::vector<void*>>& dsts,
+                                      const std::vector<std::vector<size_t>>& sizes,
+                                      const std::vector<std::vector<size_t>>& offsets) = 0;
+  virtual std::vector<bool> PutRanges(const std::vector<std::string>& keys,
+                                      const std::vector<size_t>& object_sizes,
+                                      const std::vector<std::vector<const void*>>& srcs,
+                                      const std::vector<std::vector<size_t>>& sizes,
+                                      const std::vector<std::vector<size_t>>& offsets) = 0;
+  virtual std::vector<bool> Exists(const std::vector<std::string>& keys) = 0;
+  // Whether every key can be served without leaving this node.  For the
+  // distributed client that is a medium resolve; for the local one, where
+  // there is no other node, it is simply existence.
+  // How many of `keys` this deployment can serve from ITS OWN local
+  // storage right now, without reaching another node.  A count rather than
+  // a bool because callers want both a per-call all-or-nothing check and a
+  // per-key credit -- deriving the former from a count keeps there from
+  // being two divergent notions of "resident" in this file.
+  virtual size_t ResidentCount(const std::vector<std::string>& keys) = 0;
+};
 
 inline uint16_t NextPeerServicePort() {
   static std::atomic<uint16_t> next{
@@ -213,6 +259,16 @@ struct BenchOpts {
   // adjacency changes.  This is the adversarial case for any implementation
   // that leans on contiguous layer groups.
   bool interleave_groups = false;
+  // Seed onto the reading node instead of the peer, so every call is served by
+  // the local medium and Phase 2 never runs.  This is the single-machine shape:
+  // a standalone process whose inner backend is distributed but whose keys all
+  // live here.  It isolates the per-key and per-range CPU cost of the
+  // distributed path from anything to do with the wire.
+  bool local_only = false;
+  // Run the whole bench against local mode (StandaloneClient: no master, no
+  // peer, no arena) instead of distributed mode.  Same loop, same shapes, so
+  // the difference between the two runs is the deployment.
+  bool local_mode = false;
   // Check every restored page byte-for-byte after each request.  Off by
   // default because the comparison lands inside the measured window; on, this
   // is the only thing here that proves the numbers above came from correct
@@ -267,7 +323,8 @@ void Usage() {
             << "        [--pools SPEC] [--pages N] [--requests N]\n"
             << "        [--compute-us-per-layer N]\n"
             << "        [--offload-ranks N] [--ranges-per-call N] [--scratch-mib N]\n"
-            << "        [--page-bytes N] [--no-prefetch] [--interleave-groups] [--verify]\n"
+            << "        [--page-bytes N] [--no-prefetch] [--interleave-groups]\n"
+            << "        [--local-only] [--local-mode] [--verify]\n"
             << "\n"
             << "  --pools replaces --layers/--layer-bytes with a real model's several\n"
             << "  pools, whose per-layer sizes differ by more than 10x and decide the\n"
@@ -387,6 +444,10 @@ bool ParseArgs(int argc, char** argv, BenchOpts* o) {
       o->locality_prefetch = false;
     } else if (a == "--interleave-groups") {
       o->interleave_groups = true;
+    } else if (a == "--local-only") {
+      o->local_only = true;
+    } else if (a == "--local-mode") {
+      o->local_mode = true;
     } else if (a == "--verify") {
       o->verify = true;
     } else if (a == "-h" || a == "--help") {
@@ -555,33 +616,135 @@ class Cluster {
 // resolves here is a key that will not go remote.  This runs that identical
 // resolve just before the call.
 //
-// Three limits, so the number is not over-read:
+// Two limits, so the number is not over-read:
 //   * It is a prediction from the same criterion, taken a moment earlier -- not
 //     an observation from inside mori.
 //   * It races: under concurrency the object can be evicted between this
 //     resolve and the call, which would then go remote after being counted
 //     local.  Expect the reported rate to be slightly optimistic at high rank
 //     counts, which is also where eviction actually starts happening.
-//   * It is per CALL, not per key: a chunk counts as local only when every key
-//     in it resolves, so a partially-local chunk is counted remote.
+//
+// Returns a per-key COUNT rather than a bool: local_hit_pct wants an
+// all-or-nothing call classification (a chunk counts as local only when every
+// key in it resolves), while local_write_mib wants partial credit (an object
+// that landed counts even if others in its pool have not yet) -- two different
+// questions the callers derive from the same count rather than two functions
+// that could silently drift apart.
 //
 // Resolved for the whole chunk in one call: this sits inside the timed region,
 // so it has to stay cheap.
-bool AllLocallyResident(PoolClient* client, const std::vector<std::string>& keys) {
+size_t LocallyResidentCount(PoolClient* client, const std::vector<std::string>& keys) {
   auto* backend = client->Backends().Get(client->Medium());
-  if (backend == nullptr) return false;
+  if (backend == nullptr) return 0;
   auto resolved = backend->BatchResolve(keys, /*include_descs=*/false);
-  return resolved.size() == keys.size() &&
-         std::all_of(resolved.begin(), resolved.end(),
-                     [](const auto& entry) { return entry.found; });
+  return static_cast<size_t>(std::count_if(resolved.begin(), resolved.end(),
+                                           [](const auto& entry) { return entry.found; }));
 }
 
-void WaitAllVisible(PoolClient* client, const std::vector<std::string>& keys,
+// Distributed mode: a PoolClient with a master behind it.
+class DistributedRangedClient final : public RangedClient {
+ public:
+  explicit DistributedRangedClient(PoolClient* client) : client_(client) {}
+
+  bool Register(void* ptr, size_t size) override { return client_->RegisterMemory(ptr, size); }
+  std::vector<bool> Put(const std::vector<std::string>& keys, const std::vector<const void*>& srcs,
+                        const std::vector<size_t>& sizes) override {
+    return client_->BatchPut(keys, srcs, sizes);
+  }
+  std::vector<bool> GetRanges(const std::vector<std::string>& keys,
+                              const std::vector<std::vector<void*>>& dsts,
+                              const std::vector<std::vector<size_t>>& sizes,
+                              const std::vector<std::vector<size_t>>& offsets) override {
+    return client_->BatchGetRanges(keys, dsts, sizes, offsets);
+  }
+  std::vector<bool> PutRanges(const std::vector<std::string>& keys,
+                              const std::vector<size_t>& object_sizes,
+                              const std::vector<std::vector<const void*>>& srcs,
+                              const std::vector<std::vector<size_t>>& sizes,
+                              const std::vector<std::vector<size_t>>& offsets) override {
+    return client_->BatchPutRanges(keys, object_sizes, srcs, sizes, offsets);
+  }
+  std::vector<bool> Exists(const std::vector<std::string>& keys) override {
+    return client_->BatchExists(keys);
+  }
+  size_t ResidentCount(const std::vector<std::string>& keys) override {
+    return LocallyResidentCount(client_, keys);
+  }
+
+ private:
+  PoolClient* client_;
+};
+
+// Local mode: StandaloneClient, no master, no peer, no network.  The floor the
+// distributed numbers are measured against.
+class LocalRangedClient final : public RangedClient {
+ public:
+  explicit LocalRangedClient(size_t dram_capacity) {
+    mori::umbp::UMBPConfig cfg;
+    cfg.dram.capacity_bytes = dram_capacity;
+    // UMBPConfig enables an SSD tier by default, which brings a demotion
+    // pipeline with its own threads.  The distributed side of this comparison
+    // has DRAM only, so leaving it on would measure two different storage
+    // stacks rather than two deployments of the same one.
+    cfg.ssd.enabled = false;
+    client_ = std::make_unique<mori::umbp::StandaloneClient>(cfg);
+    if (!client_->SupportsRangedIO()) {
+      std::cerr << "local client reports no ranged I/O support\n";
+      std::exit(2);
+    }
+  }
+
+  // Nothing to pin: local mode copies out of its own tier with no engine in
+  // the way, so a caller pointer is already usable.
+  bool Register(void*, size_t) override { return true; }
+  std::vector<bool> Put(const std::vector<std::string>& keys, const std::vector<const void*>& srcs,
+                        const std::vector<size_t>& sizes) override {
+    std::vector<uintptr_t> raw(srcs.size());
+    for (size_t i = 0; i < srcs.size(); ++i) raw[i] = reinterpret_cast<uintptr_t>(srcs[i]);
+    return client_->BatchPut(keys, raw, sizes);
+  }
+  std::vector<bool> GetRanges(const std::vector<std::string>& keys,
+                              const std::vector<std::vector<void*>>& dsts,
+                              const std::vector<std::vector<size_t>>& sizes,
+                              const std::vector<std::vector<size_t>>& offsets) override {
+    return client_->BatchGetRanges(keys, ToRaw(dsts), sizes, offsets);
+  }
+  std::vector<bool> PutRanges(const std::vector<std::string>& keys,
+                              const std::vector<size_t>& object_sizes,
+                              const std::vector<std::vector<const void*>>& srcs,
+                              const std::vector<std::vector<size_t>>& sizes,
+                              const std::vector<std::vector<size_t>>& offsets) override {
+    return client_->BatchPutRanges(keys, object_sizes, ToRaw(srcs), sizes, offsets);
+  }
+  std::vector<bool> Exists(const std::vector<std::string>& keys) override {
+    return client_->BatchExists(keys);
+  }
+  // There is no other node, so anything that exists is here.
+  size_t ResidentCount(const std::vector<std::string>& keys) override {
+    auto present = client_->BatchExists(keys);
+    return static_cast<size_t>(std::count(present.begin(), present.end(), true));
+  }
+
+ private:
+  template <class P>
+  static std::vector<std::vector<uintptr_t>> ToRaw(const std::vector<std::vector<P>>& in) {
+    std::vector<std::vector<uintptr_t>> out(in.size());
+    for (size_t i = 0; i < in.size(); ++i) {
+      out[i].reserve(in[i].size());
+      for (P p : in[i]) out[i].push_back(reinterpret_cast<uintptr_t>(p));
+    }
+    return out;
+  }
+
+  std::unique_ptr<mori::umbp::StandaloneClient> client_;
+};
+
+void WaitAllVisible(RangedClient* client, const std::vector<std::string>& keys,
                     std::chrono::milliseconds timeout = std::chrono::seconds{30}) {
   if (keys.empty()) return;
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   for (;;) {
-    auto present = client->BatchExists(keys);
+    auto present = client->Exists(keys);
     if (std::all_of(present.begin(), present.end(), [](bool b) { return b; })) return;
     if (std::chrono::steady_clock::now() >= deadline) {
       std::cerr << "WaitAllVisible: keys not visible before timeout\n";
@@ -598,7 +761,9 @@ inline char SeedByte(size_t key_index, size_t offset) {
   return static_cast<char>((offset * 31 + key_index * 131 + 7) & 0xff);
 }
 
-void SeedPeer(PoolClient* peer, const std::vector<std::string>& keys, size_t object_bytes,
+// `target` is the peer by default, which is what makes the reads remote; under
+// --local-only it is the reading node itself, so the same keys resolve locally.
+void SeedInto(RangedClient* target, const std::vector<std::string>& keys, size_t object_bytes,
               std::vector<char>* storage) {
   storage->assign(keys.size() * object_bytes, 0);
   std::vector<const void*> srcs(keys.size());
@@ -608,8 +773,8 @@ void SeedPeer(PoolClient* peer, const std::vector<std::string>& keys, size_t obj
     for (size_t b = 0; b < object_bytes; ++b) slot[b] = SeedByte(i, b);
     srcs[i] = slot;
   }
-  peer->RegisterMemory(storage->data(), storage->size());
-  auto r = peer->BatchPut(keys, srcs, sizes);
+  target->Register(storage->data(), storage->size());
+  auto r = target->Put(keys, srcs, sizes);
   for (size_t i = 0; i < keys.size(); ++i) {
     if (!r[i]) {
       std::cerr << "seed put failed for " << keys[i] << "\n";
@@ -659,7 +824,7 @@ struct RankStats {
   size_t get_bytes = 0;        // bytes the caller asked for
   size_t put_bytes = 0;
   // Wire accounting.  These are PREDICTIONS from the same criterion
-  // AllLocallyResident applies -- see its comment for what that does and does
+  // LocallyResidentCount applies -- see its comment for what that does and does
   // not mean.  They are what the bench can know from outside mori.
   //
   // remote_keys is the useful one: it counts (key, call) pairs that had to reach
@@ -698,17 +863,15 @@ struct RankStats {
 // `warmup_requests` leading requests run but are not recorded: the first
 // restore on a fresh client also pays the peer handshake, which a long-lived
 // connector has already paid.
-void RunLoadRank(Cluster& cluster, const BenchOpts& o,
+void RunLoadRank(RangedClient* client, const BenchOpts& o,
                  const std::vector<std::vector<std::vector<std::string>>>& request_keys,
                  size_t warmup_requests, std::atomic<size_t>* warmed_ranks, RankStats* stats) {
-  PoolClient* client = cluster.node();
-
   // Destination for one request's pages, one buffer per pool because a pool's
   // pages are only contiguous among themselves.  Registered once for zero copy.
   std::vector<std::vector<char>> kv(o.pools.size());
   for (size_t p = 0; p < o.pools.size(); ++p) {
     kv[p].assign(o.pages * o.pools[p].object_bytes(), 0);
-    client->RegisterMemory(kv[p].data(), kv[p].size());
+    client->Register(kv[p].data(), kv[p].size());
   }
 
   for (size_t req = 0; req < request_keys.size(); ++req) {
@@ -758,9 +921,9 @@ void RunLoadRank(Cluster& cluster, const BenchOpts& o,
             }
 
             // Whether this call can be served without the arena at all.
-            const bool all_local = AllLocallyResident(client, chunk_keys);
+            const bool all_local = client->ResidentCount(chunk_keys) == chunk_keys.size();
 
-            auto res = client->BatchGetRanges(chunk_keys, dsts, sizes, offsets);
+            auto res = client->GetRanges(chunk_keys, dsts, sizes, offsets);
             ok = res.size() == count &&
                  std::all_of(res.begin(), res.end(), [](bool b) { return b; });
 
@@ -831,7 +994,7 @@ void RunLoadRank(Cluster& cluster, const BenchOpts& o,
           const size_t object_bytes = o.pools[pi].object_bytes();
           for (size_t p = 0; p < o.pages; ++p) {
             const char* page = kv[pi].data() + p * object_bytes;
-            // Seeded per pool, so the index must match SeedPeer's ordering.
+            // Seeded per pool, so the index must match SeedInto's ordering.
             const size_t seed_index = req * o.pages + p;
             for (size_t b = 0; b < object_bytes; ++b) {
               if (page[b] != SeedByte(seed_index, b)) {
@@ -846,12 +1009,9 @@ void RunLoadRank(Cluster& cluster, const BenchOpts& o,
       // How much of this request's working set the remote path installed here.
       // Counted after the load so an asynchronous install has had the whole
       // request to land; it is still a lower bound if one lands later.
-      if (auto* backend = client->Backends().Get(client->Medium())) {
-        for (size_t pi = 0; pi < o.pools.size(); ++pi) {
-          for (const auto& entry : backend->BatchResolve(pool_keys[pi], /*include_descs=*/false)) {
-            if (entry.found) stats->local_write_bytes += o.pools[pi].object_bytes();
-          }
-        }
+      for (size_t pi = 0; pi < o.pools.size(); ++pi) {
+        stats->local_write_bytes +=
+            client->ResidentCount(pool_keys[pi]) * o.pools[pi].object_bytes();
       }
     }
   }
@@ -859,17 +1019,16 @@ void RunLoadRank(Cluster& cluster, const BenchOpts& o,
 
 // One rank's offload stream: whole-object writes that overlap the loads above.
 // This is the traffic that used to contend with loading on a single arena.
-void RunOffloadRank(Cluster& cluster, const BenchOpts& o, size_t rank,
+void RunOffloadRank(RangedClient* client, const BenchOpts& o, size_t rank,
                     const std::atomic<bool>& stop, const std::atomic<size_t>& warmed_ranks,
                     size_t load_ranks, RankStats* stats) {
-  PoolClient* client = cluster.node();
   // One buffer per pool, mirroring the load side.
   std::vector<std::vector<char>> kv(o.pools.size());
   for (size_t pi = 0; pi < o.pools.size(); ++pi) {
     kv[pi].assign(o.pages * o.pools[pi].object_bytes(), 0);
     for (size_t i = 0; i < kv[pi].size(); ++i)
       kv[pi][i] = static_cast<char>((i + rank + pi) & 0xff);
-    client->RegisterMemory(kv[pi].data(), kv[pi].size());
+    client->Register(kv[pi].data(), kv[pi].size());
   }
 
   for (size_t round = 0; !stop.load(std::memory_order_relaxed); ++round) {
@@ -902,7 +1061,7 @@ void RunOffloadRank(Cluster& cluster, const BenchOpts& o, size_t rank,
             offsets[i].push_back(l * pool.layer_bytes);
           }
         }
-        auto res = client->BatchPutRanges(chunk_keys, object_sizes, srcs, sizes, offsets);
+        auto res = client->PutRanges(chunk_keys, object_sizes, srcs, sizes, offsets);
         // Offload keeps running through warm-up so the arena is loaded from the
         // start, but only bytes inside the measured window are counted.
         const bool in_window = warmed_ranks.load(std::memory_order_relaxed) >= load_ranks;
@@ -918,25 +1077,43 @@ void RunOne(const BenchOpts& o, size_t ranks) {
   const size_t offload_ranks = (o.offload_ranks == SIZE_MAX) ? ranks : o.offload_ranks;
   const size_t object_bytes = o.object_bytes();
 
-  // The node must be able to hold one restore working set per rank (that is
-  // what makes groups 2..N local hits), plus slack for offloads routed here.
-  const size_t node_capacity =
-      std::max<size_t>(size_t{256} << 20, ranks * o.pages * object_bytes * 3);
-  // The peer holds every seeded page for every rank and request (+1 warm-up).
-  const size_t peer_capacity =
+  // Whichever client is seeded holds every page for every rank and request
+  // (+1 warm-up); the other only needs a restore working set per rank, which is
+  // what makes groups 2..N local hits, plus slack for offloads routed there.
+  const size_t seeded_capacity =
       std::max<size_t>(size_t{512} << 20,
                        ranks * (o.requests + 1) * o.pages * object_bytes * 2 + (size_t{512} << 20));
+  const size_t reader_capacity =
+      std::max<size_t>(size_t{256} << 20, ranks * o.pages * object_bytes * 3);
+  const size_t node_capacity = o.local_only ? seeded_capacity : reader_capacity;
+  const size_t peer_capacity = o.local_only ? reader_capacity : seeded_capacity;
   // The arena must hold at least one whole object: the remote path stages
   // through it, and an object that does not fit is unservable.  With several
   // pools the largest one sets the floor.
   const size_t scratch_bytes = std::max<size_t>(o.max_object_bytes(), o.scratch_mib << 20);
 
-  Cluster cluster(node_capacity, peer_capacity, scratch_bytes, o.medium_page_bytes(),
-                  o.locality_prefetch);
+  // Local mode needs no master, no peer and no arena, so the cluster is built
+  // only for the distributed side.  Both then go through RangedClient.
+  std::unique_ptr<Cluster> cluster;
+  std::unique_ptr<RangedClient> node_client;
+  std::unique_ptr<RangedClient> peer_client;
+  if (o.local_mode) {
+    node_client = std::make_unique<LocalRangedClient>(seeded_capacity);
+  } else {
+    cluster = std::make_unique<Cluster>(node_capacity, peer_capacity, scratch_bytes,
+                                        o.medium_page_bytes(), o.locality_prefetch);
+    node_client = std::make_unique<DistributedRangedClient>(cluster->node());
+    peer_client = std::make_unique<DistributedRangedClient>(cluster->peer());
+  }
 
   // Seed: each (rank, request) gets its own pages, so the first group of every
-  // request is a real remote miss.  One extra leading request per rank is a
-  // warm-up that pays the peer handshake and is not recorded.
+  // request is a real remote miss -- or, under --local-only, a local hit that
+  // no earlier group warmed.  One extra leading request per rank is a warm-up
+  // that pays the peer handshake and is not recorded.
+  // Local mode has nowhere else to put anything; distributed mode seeds the
+  // peer unless --local-only asks for everything on the reading node.
+  RangedClient* const seed_target =
+      (o.local_mode || o.local_only) ? node_client.get() : peer_client.get();
   constexpr size_t kWarmupRequests = 1;
   const size_t total_requests = o.requests + kWarmupRequests;
   // [rank][request][pool] -> that pool's page keys.  A pool's object holds only
@@ -961,13 +1138,17 @@ void RunOne(const BenchOpts& o, size_t ranks) {
       }
     }
     for (size_t pi = 0; pi < o.pools.size(); ++pi) {
-      SeedPeer(cluster.peer(), flat[pi], o.pools[pi].object_bytes(), &seed_storage[r][pi]);
+      SeedInto(seed_target, flat[pi], o.pools[pi].object_bytes(), &seed_storage[r][pi]);
       all_keys.insert(all_keys.end(), flat[pi].begin(), flat[pi].end());
     }
   }
-  cluster.peer()->Master().FlushHeartbeat();
-  cluster.node()->Master().FlushHeartbeat();
-  WaitAllVisible(cluster.node(), all_keys);
+  if (cluster) {
+    // Distributed mode only: the seeded keys become visible to the reader once
+    // both nodes' outboxes have reached master.
+    cluster->peer()->Master().FlushHeartbeat();
+    cluster->node()->Master().FlushHeartbeat();
+  }
+  WaitAllVisible(node_client.get(), all_keys);
 
   std::vector<RankStats> load_stats(ranks);
   std::vector<RankStats> offload_stats(std::max<size_t>(offload_ranks, 1));
@@ -980,14 +1161,15 @@ void RunOne(const BenchOpts& o, size_t ranks) {
   std::atomic<size_t> warmed_ranks{0};
   std::vector<std::thread> offloaders;
   for (size_t r = 0; r < offload_ranks; ++r) {
-    offloaders.emplace_back(
-        [&, r] { RunOffloadRank(cluster, o, r, stop, warmed_ranks, ranks, &offload_stats[r]); });
+    offloaders.emplace_back([&, r] {
+      RunOffloadRank(node_client.get(), o, r, stop, warmed_ranks, ranks, &offload_stats[r]);
+    });
   }
 
   std::vector<std::thread> loaders;
   for (size_t r = 0; r < ranks; ++r) {
     loaders.emplace_back([&, r] {
-      RunLoadRank(cluster, o, keys[r], kWarmupRequests, &warmed_ranks, &load_stats[r]);
+      RunLoadRank(node_client.get(), o, keys[r], kWarmupRequests, &warmed_ranks, &load_stats[r]);
     });
   }
   for (auto& t : loaders) t.join();
