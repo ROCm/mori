@@ -502,7 +502,95 @@ wall 只降 6%，是因为 GPU 侧（136us）本来就贴着 host（150us），�
 `ENABLE_PROFILER` 重新编译 mori，当前安装的 pybind 没有该支持：
 `hasattr(mori.cpp, "get_debug_time_buf") == False`）。
 
-### 5.10 双峰抖动（未解决）
+### 5.10 `MORI_TRACE_SPAN` 内核 span 分解 —— 找到了 55us 的真正去向
+
+§5.9 的消融只能切出"等待 5us / put 13us / 剩余 32us 不明"。用 mori 内置的
+`MORI_TRACE_SPAN` profiler 拿到了逐 span 的答案。
+
+**启用方式**（当前 main 上开箱是坏的，见下）：
+
+```bash
+ENABLE_PROFILER=ON pip install --no-build-isolation .   # C++ 侧，装出 get_debug_time_buf
+ENABLE_PROFILER=1  <正常 bench 命令>                     # 运行时，JIT 带 -DENABLE_PROFILER
+```
+
+`--cmd bench` 会在 CWD 落 `trace_rank_*.json`（perfetto 格式，B/E 事件，tid = warp）。
+
+> **踩坑 1：`ENABLE_PROFILER=ON` 在当前 main 上编不过。**
+> `intranode_ll.hpp` 用了 `Slot::DispatchSendTokens` / `DispatchNotifyPeer` /
+> `DispatchWaitPeerToken` 三个**从未声明**的 slot。生成器按**源文件名**给 slot 分组，
+> 这三个落进 `IntranodeLlSlot`，而该文件里的 `Slot` 实际别名到 `intranode.hpp` 的
+> `IntranodeSlot`，于是对不上。绕过办法见
+> `ep16_tuning/fix_enable_profiler_build.patch`（把三处注掉，不影响 internode_v1 的 span）。
+>
+> **踩坑 2：直接看 span 的中位数会被误导。** 绝大多数 warp 没活干，中位数只有 0.45us，
+> 会得出"kernel 什么都没做"的错误结论。要看**每轮的时间包络**和**最慢 warp**。
+
+单轮包络分解（4 tokens / hidden 6144，`disp=32/8/16`）：
+
+| span | 包络 | warp ramp | 最慢 warp | 中位 warp |
+|---|---|---|---|---|
+| `dispatch_inter_node_ll_send` | 19.14 us | 0.90 | **16.22** | 1.24 |
+| `dispatch_inter_node_ll_recv` | 37.42 us | **17.25** | 29.08 | 0.45 |
+| `combine_inter_node_ll` | 79.64 us | 7.12 | 52.90 | **14.26** |
+| `combine_intra_node_ll` | 17.36 us | 6.78 | 12.12 | 8.82 |
+| `ep_combine_sync_barrier` | 10.52 us | 0.00 | 10.52 | 10.52 |
+| `combine_sync` | 6.57 us | 0.96 | 5.88 | 1.00 |
+| `ep_combine_all` | 4.03 us | 0.34 | 3.80 | 3.40 |
+| `ep_dispatch_copy_to_staging` | 3.60 us | 0.95 | 2.72 | 1.48 |
+
+send 19.1 + recv 37.4 ≈ 56us，与 kineto 的 55us 吻合。**结论：**
+
+1. **一个 warp 发一次 RDMA put 用掉 16.2us**，其余 127 个 warp 1.24us 就走完 send。
+   recv 那 17.25us 的 "ramp"（warp 进入 span 的时间跨度）正好等于被 put 拖住的那个 warp
+   落后的时间 —— 两个数字互相印证。
+2. combine 的**中位 warp 做了 14.26us 的真实工作**：`warpsPerToken` 硬编码为 4，每个 warp
+   要对 8 个专家 × 1536 个元素做跨 GPU 的 XGMI gather。这和 dispatch 的 0.45us 完全不是
+   一个性质 —— combine 是真在算，dispatch 是在等一个 warp。
+
+#### 为什么一次 put 要 16us —— 以及为什么不能简单削减
+
+`ShmemPutMemNbiSignalThreadKernel`（`include/mori/shmem/shmem_ibgda_kernels.hpp`）单次调用里有：
+SQ 槽位原子 → 等空闲槽的自旋 → `PostWrite`(数据 WQE) → `PostAtomic`(signal WQE) →
+**4 个 `__threadfence_system()`** → 等 doorbell 顺序的自旋 → MMIO `RingDoorbell` → 若干记账原子。
+
+试过把这 4 个 system fence 降级为 agent fence 来量化其代价，结果**全面劣化**
+（dispatch LL 55→131us，combine 56→170us，连没改的 CopyToStaging 都变慢）——
+NIC 看不到数据，协议进入 stall/重试。**这些 fence 是承重的，不能动。** 已回退。
+
+### 5.11 未验证的改动：自适应 `warpsPerToken`
+
+针对上面第 2 条，`ep16_tuning/adaptive_warps_per_token.patch`：
+
+- `warpsPerToken` 不再固定为 4，改为按**真实 token 数**（`chunkFlag` 求和）分配：
+  `warpsPerToken = clamp(rdmaWarpNum / realTokens, 4, hiddenDim/(warpSize*4))`。
+  4 tokens / 128 rdma warps 下从 4 提到 24，每 warp 的 gather 量从 8×1536 降到 8×256。
+  注意注释里那个"动态公式"用的是 `nodeCount`，而发送端会把它补齐到 warpSize 边界
+  （4 个真实 token 会读成 64），所以那个公式在小 token 下反而算出 2，比固定的 4 更差。
+- 同时跳过 padding slot（大 `warpsPerToken` 会成比例放大原有的单地址原子风暴）。
+
+**正确性已验证**（`--cmd test`，4 token，8 rank 全 0 error），**性能未验证** —— 测量环境在
+此时损坏（见 §5.12）。恢复后应优先测这一条。
+
+### 5.12 环境事故：086 的 GPU 被自旋 kernel 占死（**待处理**）
+
+§5.9 的"kernel 开头直接 return"消融会让 combine 侧永久等待。进程被 kill 后，
+**自旋中的 GPU kernel 无法被抢占**，于是留下 16 个 `Rl` 状态、每个占 18GB 显存的
+python3 进程，把 086 的 8 张 GPU 全部钉在 100%。
+
+- `SIGKILL` 无效（卡在驱动里）
+- 容器内 `pkill` 看不到（PID namespace）
+- 现象：`EpDispatchCopyToStaging`（我没改过的 kernel）从 4.74us 劣化到 21-23us，
+  **但 fastest 仍是 4.74us** —— 即部分 rank 变慢，是典型的"某节点被拖累"特征。
+  这个 kernel 是很好的**天然 canary**：它与任何被测改动无关，读数偏离就说明环境有问题。
+
+**恢复需要 `rocm-smi --gpureset`（或重启 086）。** 在此之前所有性能数字都不可信。
+
+> 教训：不要用"让 kernel 提前返回"的方式做消融。对端会永久等待，而自旋 kernel
+> 杀不掉，代价是整台机器需要 GPU reset。要做消融，改成"非阻塞探测 + 假装拿到数据"
+> （§5.9 前两项就是这么做的，没有留下后遗症）。
+
+### 5.13 双峰抖动（未解决）
 
 约 **1/3** 的 run 会整体慢 1.7 倍，干净双峰、没有中间值：
 
@@ -519,7 +607,7 @@ wall 只降 6%，是因为 GPU 侧（136us）本来就贴着 host（150us），�
 
 **实践影响：任何对比都要跑 ≥3 次取好模式，单次结果不可信。**
 
-### 5.11 改动清单
+### 5.14 改动清单
 
 修改：
 
