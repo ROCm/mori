@@ -531,10 +531,11 @@ constexpr size_t kGatherRunBytesThreshold = 128ull << 10;
 // single kernel launch should carry them. Returns false to leave the batch on
 // the copy-engine path -- which is also what happens for any run whose tier
 // side is not registered, since a kernel would fault on it.
-bool PlanGatherFragments(const std::vector<CopyJob*>& ordered, hipMemcpyKind kind,
+bool PlanGatherFragments(const std::vector<CopyJob*>& ordered, hipMemcpyKind kind, int device_id,
                          const HostTierRegistration* registration,
                          std::vector<DeviceGatherFragment>* fragments) {
   if (registration == nullptr || !DeviceGatherEnabled()) return false;
+  if (!registration->GatherableOn(device_id)) return false;
 
   fragments->clear();
   fragments->reserve(ordered.size());
@@ -542,8 +543,18 @@ bool PlanGatherFragments(const std::vector<CopyJob*>& ordered, hipMemcpyKind kin
   for (size_t begin = 0; begin < ordered.size();) {
     const DeviceCopyRun run = FindDeviceCopyRun(ordered, begin, /*allow_pitched=*/false);
     const CopyJob* first = ordered[begin];
-    if (!registration->Covers(TierSide(first, kind), run.bytes)) return false;
-    fragments->push_back({first->src, first->dst, run.bytes});
+    // Only the tier side is host memory and gets translated; the other side is
+    // already a device allocation. Translating the wrong one silently writes to
+    // the wrong place, so both directions are spelled out. Null also covers the
+    // unregistered case, which is why there is no separate Covers() test.
+    void* const tier_alias =
+        registration->DeviceAddress(TierSide(first, kind), run.bytes, device_id);
+    if (tier_alias == nullptr) return false;
+    if (kind == hipMemcpyDeviceToHost) {
+      fragments->push_back({first->src, tier_alias, run.bytes});
+    } else {
+      fragments->push_back({tier_alias, first->dst, run.bytes});
+    }
     total_bytes += run.bytes;
     begin = run.end;
   }
@@ -612,7 +623,7 @@ void CopyDeviceJobs(const std::vector<CopyJob*>& jobs, int device_id, hipMemcpyK
   bool enqueued_all = true;
   std::vector<DeviceGatherFragment> fragments;
   const bool gathered = GatherPathHealthy() &&
-                        PlanGatherFragments(ordered, kind, registration, &fragments) &&
+                        PlanGatherFragments(ordered, kind, device_id, registration, &fragments) &&
                         LaunchDeviceGather(fragments.data(), fragments.size(), device_id, stream);
   if (gathered) {
     if (ProfileEnabled()) {

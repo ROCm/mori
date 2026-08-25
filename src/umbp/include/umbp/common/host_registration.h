@@ -24,6 +24,7 @@
 #include <atomic>
 #include <cstddef>
 #include <thread>
+#include <vector>
 
 namespace mori::umbp {
 
@@ -43,6 +44,13 @@ namespace mori::umbp {
 // caller simply behaves as it did before until that finishes. It must be a
 // single registration covering the whole region -- see Register() -- so this is
 // all-or-nothing rather than a progressive watermark.
+//
+// The device need not see the region at the host's address -- hipHostRegister's
+// own documentation says the two "will have a different value" on many systems
+// and that device code must use the device pointer. Equal addresses are a CUDA
+// UVA property ROCm never promised. So the alias is recorded per device and
+// DeviceAddress() translates by offset, which is sound because the whole region
+// is one registration of one contiguous range.
 class HostTierRegistration {
  public:
   // Registers [base, base + bytes). `bytes` must be the mapped (page-aligned)
@@ -55,9 +63,20 @@ class HostTierRegistration {
   HostTierRegistration(const HostTierRegistration&) = delete;
   HostTierRegistration& operator=(const HostTierRegistration&) = delete;
 
-  // True when [ptr, ptr + size) is registered, and therefore safe to hand to a
-  // kernel. False is always the safe answer.
+  // True when [ptr, ptr + size) is registered, and therefore safe to copy from
+  // or to without the pageable staging path. False is always the safe answer.
+  // Weaker than "safe to hand to a kernel" -- that needs DeviceAddress().
   bool Covers(const void* ptr, size_t size) const;
+
+  // Whether a kernel on `device_id` can reach this region at all, i.e. whether
+  // DeviceAddress() will return non-null for a covered pointer.
+  bool GatherableOn(int device_id) const;
+
+  // The address `device_id` must use to reach [host_ptr, host_ptr + size), or
+  // null when that range is outside the region or the device has no alias, in
+  // which case the caller must stay on the copy-engine path. Subsumes Covers(),
+  // so a caller that needs the address should not test both.
+  void* DeviceAddress(const void* host_ptr, size_t size, int device_id) const;
 
   // Zero until registration succeeds, then the full region. For logging and
   // tests.
@@ -65,10 +84,19 @@ class HostTierRegistration {
 
  private:
   void Register();
+  // Fills alias_bases_, one entry per device. False only when the devices
+  // cannot be enumerated; a device without an alias gets a null entry.
+  bool RecordDeviceAliases();
+  // Bounds check against an already-loaded registered_bytes_, so an entry point
+  // that needs the value anyway reads the atomic once.
+  bool CoversRegistered(const void* ptr, size_t size, size_t registered) const;
 
   char* base_{nullptr};
   size_t bytes_{0};
   std::atomic<size_t> registered_bytes_{0};
+  // Indexed by device ordinal. Written before registered_bytes_ is published
+  // and read-only after, so that release/acquire pair is what publishes it.
+  std::vector<char*> alias_bases_;
   std::thread worker_;
 };
 

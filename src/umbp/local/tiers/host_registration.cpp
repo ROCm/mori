@@ -99,53 +99,87 @@ void HostTierRegistration::Register() {
     return;
   }
 
-  // The gather path hands host addresses straight to the kernel, which is only
-  // valid under unified addressing. Verify rather than assume -- and verify it
-  // on every device, not just whichever one this thread happens to have
-  // current: the standalone server serves all ranks from one process, so a
-  // batch can launch the kernel on any of them.
-  int devices = 0;
-  if (hipGetDeviceCount(&devices) != hipSuccess || devices <= 0) {
-    // Not being able to enumerate the devices is not the same as having
-    // verified them: an empty loop below would silently publish the region as
-    // kernel-addressable on every device.
+  // Deliberately does not undo the registration on failure: pinning already
+  // succeeded and takes every hipMemcpy on this tier off the pageable staging
+  // path, so a device without an alias loses only the gather kernel.
+  if (!RecordDeviceAliases()) {
+    // Leaving alias_bases_ empty disables gather everywhere, which is the safe
+    // answer -- an unchecked device must not be published as gatherable.
     MORI_UMBP_WARN(
-        "[DRAMTier] cannot enumerate devices to verify the host mapping; the GPU gather path "
-        "stays off");
+        "[DRAMTier] cannot enumerate devices to map the host region; the GPU gather path stays "
+        "off (the region stays registered, so copies keep the pinned path)");
     (void)hipGetLastError();
-    (void)hipHostUnregister(base_);
-    return;
   }
-  int previous = 0;
-  const bool have_previous = hipGetDevice(&previous) == hipSuccess;
-  if (!have_previous) (void)hipGetLastError();
-  for (int device = 0; device < devices; ++device) {
-    void* device_alias = nullptr;
-    const bool selected = hipSetDevice(device) == hipSuccess;
-    const bool matches = selected &&
-                         hipHostGetDevicePointer(&device_alias, base_, 0) == hipSuccess &&
-                         device_alias == base_;
-    if (matches) continue;
-
-    MORI_UMBP_WARN(
-        "[DRAMTier] device {} maps the registered host region at a different address than the "
-        "host does; the GPU gather path needs unified addressing and stays off",
-        device);
-    (void)hipGetLastError();
-    if (have_previous) (void)hipSetDevice(previous);
-    (void)hipHostUnregister(base_);
-    return;
-  }
-  if (have_previous) (void)hipSetDevice(previous);
 
   registered_bytes_.store(bytes_, std::memory_order_release);
   const double seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-  MORI_UMBP_INFO("[DRAMTier] host memory registered for GPU access: {} MiB in {:.1f} s",
-                 bytes_ >> 20, seconds);
+  size_t gatherable = 0;
+  for (const char* alias : alias_bases_) {
+    if (alias != nullptr) ++gatherable;
+  }
+  MORI_UMBP_INFO(
+      "[DRAMTier] host memory registered for GPU access: {} MiB in {:.1f} s ({}/{} devices "
+      "gatherable)",
+      bytes_ >> 20, seconds, gatherable, alias_bases_.size());
+}
+
+bool HostTierRegistration::RecordDeviceAliases() {
+  int devices = 0;
+  if (hipGetDeviceCount(&devices) != hipSuccess || devices <= 0) return false;
+
+  int previous = 0;
+  const bool have_previous = hipGetDevice(&previous) == hipSuccess;
+  if (!have_previous) (void)hipGetLastError();
+
+  alias_bases_.assign(static_cast<size_t>(devices), nullptr);
+  for (int device = 0; device < devices; ++device) {
+    if (hipSetDevice(device) != hipSuccess) {
+      (void)hipGetLastError();
+      continue;
+    }
+    void* alias = nullptr;
+    if (hipHostGetDevicePointer(&alias, base_, 0) != hipSuccess || alias == nullptr) {
+      (void)hipGetLastError();
+      MORI_UMBP_WARN(
+          "[DRAMTier] device {} has no mapping for the registered host region; the "
+          "GPU gather path stays off for it",
+          device);
+      continue;
+    }
+
+    // Only the base is queried: hipHostGetDevicePointer is documented in terms
+    // of the pointer an allocation starts at, so an interior offset is outside
+    // the contract and a rejection there would disable gather needlessly.
+    alias_bases_[static_cast<size_t>(device)] = static_cast<char*>(alias);
+  }
+
+  if (have_previous) (void)hipSetDevice(previous);
+  return true;
+}
+
+bool HostTierRegistration::GatherableOn(int device_id) const {
+  if (registered_bytes_.load(std::memory_order_acquire) == 0) return false;
+  if (device_id < 0 || static_cast<size_t>(device_id) >= alias_bases_.size()) return false;
+  return alias_bases_[static_cast<size_t>(device_id)] != nullptr;
+}
+
+void* HostTierRegistration::DeviceAddress(const void* host_ptr, size_t size, int device_id) const {
+  const size_t registered = registered_bytes_.load(std::memory_order_acquire);
+  if (registered == 0) return nullptr;
+  if (device_id < 0 || static_cast<size_t>(device_id) >= alias_bases_.size()) return nullptr;
+  char* const alias = alias_bases_[static_cast<size_t>(device_id)];
+  if (alias == nullptr || !CoversRegistered(host_ptr, size, registered)) return nullptr;
+  const uintptr_t address = reinterpret_cast<uintptr_t>(host_ptr);
+  const uintptr_t base = reinterpret_cast<uintptr_t>(base_);
+  return alias + (address - base);
 }
 
 bool HostTierRegistration::Covers(const void* ptr, size_t size) const {
+  return CoversRegistered(ptr, size, registered_bytes_.load(std::memory_order_acquire));
+}
+
+bool HostTierRegistration::CoversRegistered(const void* ptr, size_t size, size_t registered) const {
   if (ptr == nullptr || bytes_ == 0) return false;
   // Compared as integers, not pointers: `ptr` may be outside this region, and
   // relational operators and subtraction on pointers into different objects are
@@ -154,7 +188,6 @@ bool HostTierRegistration::Covers(const void* ptr, size_t size) const {
   const uintptr_t base = reinterpret_cast<uintptr_t>(base_);
   if (address < base) return false;
   const uintptr_t offset = address - base;
-  const size_t registered = registered_bytes_.load(std::memory_order_acquire);
   return size <= registered && offset <= registered - size;
 }
 

@@ -60,7 +60,7 @@ constexpr size_t kScratchSize = kObjectSize;  // Forces one object per sub-batch
 bool GatherPathAvailable() {
   static const bool available = [] {
     std::vector<char> probe(64 * 1024);
-    return HostTierRegistration(probe.data(), probe.size()).RegisteredBytes() != 0;
+    return HostTierRegistration(probe.data(), probe.size()).GatherableOn(0);
   }();
   return available;
 }
@@ -941,7 +941,6 @@ TEST_F(PoolClientRangesTest, WholeObjectReadStillInstallsWithPrefetchOff) {
 // nothing a caller can see.  Naming it here would claim coverage that does not
 // exist; it is a throughput guard, and the bench is where it shows up.
 TEST_F(PoolClientRangesTest, LayerWiseGroupsOverOneColdKeyAllReturnTheirBytes) {
-
   const std::string key = "prefetch-dedup";
   std::vector<char> object(kObjectSize);
   for (size_t i = 0; i < kObjectSize; ++i) object[i] = static_cast<char>((i * 31 + 13) & 0xff);
@@ -1238,7 +1237,8 @@ TEST_F(PoolClientRangesTest, ConcurrentMixedShapesAllReturnCorrectBytes) {
   // here, so a refusal is a legitimate outcome and pinning it to zero would
   // make this test fail for the one reason it is allowed to.
   if (failures.load() != 0) {
-    GTEST_LOG_(INFO) << failures.load() << " reads were refused (capacity), none returned bad bytes";
+    GTEST_LOG_(INFO) << failures.load()
+                     << " reads were refused (capacity), none returned bad bytes";
   }
 }
 
