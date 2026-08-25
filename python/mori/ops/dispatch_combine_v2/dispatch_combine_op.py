@@ -128,8 +128,11 @@ class EpDispatchCombineConfig:
             )
         if self.quant_type != "none":
             self.combine_mode = "scatter"
-        # The dispatch grid barrier resets inside a `range(lane, npes, 64)` loop,
-        # correct only while each lane runs it once (npes <= wavefront).
+        # The combine cross-device barrier uses `tid < npes` to poll per-peer xdb
+        # slots, so npes must fit within a single block (blockDim = warp * WAVE).
+        # The minimum warp count across all schedule variants bounds this; the
+        # hard cap is the maximum wavefront (64) since even a 1-warp block on
+        # wave64 covers that many peers.
         if self.world_size > 64:
             raise ValueError(
                 f"intranode op supports world_size <= 64, got {self.world_size}"

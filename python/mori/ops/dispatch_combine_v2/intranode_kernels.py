@@ -348,10 +348,11 @@ def make_dispatch(
                 P.atomic_add_global(fx.Int64(addr_disp_bar), arith.constant(1))
 
             local_recv_num = fx.Int64(window.lsa_ptr(my_lsa_rank, off_recv_num))
+            if global_warp_id == 0:
+                P.spin_until_eq_i32(fx.Int64(addr_disp_bar), block_num)
+                buffer_store(arith.constant(0), rsrc_disp_bar, 0)
             for dest_pe in range(lane, npes, WAVE):
                 if global_warp_id == 0:
-                    P.spin_until_eq_i32(fx.Int64(addr_disp_bar), block_num)
-                    buffer_store(arith.constant(0), rsrc_disp_bar, 0)
                     signal_value = (
                         buffer_load(rsrc_dest_ctr, dest_pe, vec_width=1, dtype=T.i32())
                         + 1
