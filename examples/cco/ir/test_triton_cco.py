@@ -75,6 +75,11 @@ GDA_VALUE_OFF = GDA_GET_OFF + NBYTES
 WINDOW_BYTES = GDA_VALUE_OFF + 8
 
 _H2D, _D2H = 1, 2
+_TRUE_VALUES = {"1", "on", "true", "yes"}
+
+
+def _env_enabled(name):
+    return os.environ.get(name, "").strip().lower() in _TRUE_VALUES
 
 
 def _copy(dst, src, nbytes, kind):
@@ -641,6 +646,10 @@ def test_gda(comm, dc, win, rank, world_size, extern_libs):
                 num_warps=1,
             )
 
+    if _env_enabled("MORI_CCO_TRITON_GDA_COMPILE_ONLY"):
+        print(f"[rank {rank}] GDA compile-only PASS", flush=True)
+        return
+
     zero(win.local_ptr + GDA_RECV_OFF, 2 * NBYTES)
     comm.barrier()
     gda_put_variant_kernel[(1,)](
@@ -775,7 +784,8 @@ def main():
             reqs.gda_connection_type = (
                 GDA_CONNECTION_FULL if gda_enabled else GDA_CONNECTION_NONE
             )
-            reqs.gda_signal_count = 32 if gda_enabled else 0
+            reqs.gda_context_count = 1 if gda_enabled else 0
+            reqs.gda_signal_count = world_size if gda_enabled else 0
             reqs.gda_counter_count = 0
             reqs.sdma_queue_count = 2 if sdma_enabled else 0
             dc = comm.create_dev_comm(reqs)
