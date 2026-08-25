@@ -143,18 +143,6 @@ class EpDispatchCombineConfig:
             )
         if self.quant_type != "none":
             self.combine_mode = "scatter"
-        # The combine cross-device barrier uses `tid < npes` to poll per-peer
-        # xdb slots, so npes must fit within a single block (blockDim =
-        # combine_warp * WAVE).  The exact bound depends on the resolved
-        # schedule (checked at the end of _resolve_geometry); this early guard
-        # catches obviously invalid values before the tuning lookup runs.
-        # 16 = max combine_warp_num_per_block across all tuning configs
-        # (MI355X and gfx1250 both peak at 16 warps).
-        if self.world_size > 16 * WAVE:
-            raise ValueError(
-                f"intranode op supports world_size <= {16 * WAVE} "
-                f"(16 warps × {WAVE}-wide wave), got {self.world_size}"
-            )
         # Token copy moves whole 16 B (vec4) chunks; a non-16 B-aligned per-token
         # size would over-read/write a few dwords past the token.
         if self.token_nbytes % 16 != 0:
