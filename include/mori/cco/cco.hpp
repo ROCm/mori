@@ -115,11 +115,9 @@ __device__ inline int warpSize() { return __builtin_amdgcn_wavefrontsize(); }
 
 #define CCO_GLOBAL_SPACE __attribute__((address_space(1)))
 // Implicit cast to global memory space.
-template<typename T, 
-    typename T2 = typename std::remove_volatile<T>::type >
-__device__ __host__ inline static  T2* global(T* ptr) 
-{ 
-  return (T2*)(T2 CCO_GLOBAL_SPACE *)reinterpret_cast<uintptr_t>(ptr);
+template <typename T, typename T2 = typename std::remove_volatile<T>::type>
+__device__ __host__ inline static T2* global(T* ptr) {
+  return (T2*)(T2 CCO_GLOBAL_SPACE*)reinterpret_cast<uintptr_t>(ptr);
 }
 
 /* ── Wavefront primitives ─────────────────────────────────────────────────────
@@ -1254,7 +1252,8 @@ struct ccoSdmaQueueDeviceHandle {
     if ((base + slotBytes) - cachedHwReadIndex > CCO_SDMA_QUEUE_SIZE) {
       [[maybe_unused]] int retries = 0;
       do {
-        cachedHwReadIndex = __hip_atomic_load(impl::global(rptr), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        cachedHwReadIndex =
+            __hip_atomic_load(impl::global(rptr), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
         if constexpr (CCO_SDMA_BREAK_ON_RETRIES) {
           if (retries++ == CCO_SDMA_MAX_RETRIES) {
             __builtin_trap();
@@ -1262,8 +1261,8 @@ struct ccoSdmaQueueDeviceHandle {
           }
         }
       } while ((base + slotBytes) - cachedHwReadIndex > CCO_SDMA_QUEUE_SIZE);
-      __hip_atomic_store(impl::global(&shared->cachedHwReadIndex), cachedHwReadIndex, __ATOMIC_RELAXED,
-                         __HIP_MEMORY_SCOPE_AGENT);
+      __hip_atomic_store(impl::global(&shared->cachedHwReadIndex), cachedHwReadIndex,
+                         __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
     return base;
   }
@@ -1273,7 +1272,8 @@ struct ccoSdmaQueueDeviceHandle {
     // s_waitcnt(0) publishes the packet dwords before the doorbell; the three
     // stores below rely on landing in order, unlike upstream anvil_device.hpp.
     [[maybe_unused]] int retries = 0;
-    while (__hip_atomic_load(impl::global(committedWptr), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != base) {
+    while (__hip_atomic_load(impl::global(committedWptr), __ATOMIC_RELAXED,
+                             __HIP_MEMORY_SCOPE_AGENT) != base) {
       __builtin_amdgcn_s_sleep(1);
       if constexpr (CCO_SDMA_BREAK_ON_RETRIES) {
         if (retries++ == CCO_SDMA_MAX_RETRIES) {
@@ -1285,9 +1285,11 @@ struct ccoSdmaQueueDeviceHandle {
     ccoSdmaPublishStores();
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
     __hip_atomic_store(impl::global(wptr), pendingWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    __hip_atomic_store(impl::global(doorbell), pendingWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    __hip_atomic_store(impl::global(doorbell), pendingWptr, __ATOMIC_RELAXED,
+                       __HIP_MEMORY_SCOPE_SYSTEM);
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
-    __hip_atomic_store(impl::global(committedWptr), pendingWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    __hip_atomic_store(impl::global(committedWptr), pendingWptr, __ATOMIC_RELAXED,
+                       __HIP_MEMORY_SCOPE_AGENT);
   }
 
   // Queue resources
@@ -1367,8 +1369,8 @@ struct alignas(16) ccoSdmaUnit {
   constexpr static size_t kVecSize = CCO_SDMA_UNIT / sizeof(Uint4);
   Uint4 vec[kVecSize];
 };
-static_assert(CCO_SDMA_UNIT % sizeof(Uint4) == 0, 
-          "CCO_SDMA_UNIT must be divisible by sizeof(Uint4)");
+static_assert(CCO_SDMA_UNIT % sizeof(Uint4) == 0,
+              "CCO_SDMA_UNIT must be divisible by sizeof(Uint4)");
 static_assert(sizeof(ccoSdmaUnit) == CCO_SDMA_UNIT);
 static_assert(CCO_SDMA_QUEUE_SIZE % CCO_SDMA_UNIT == 0, "ring must be whole units");
 static_assert(sizeof(CCO_SDMA_PKT_COPY_LINEAR) <= CCO_SDMA_UNIT, "COPY must fit one unit");
@@ -1376,15 +1378,14 @@ static_assert(sizeof(CCO_SDMA_PKT_ATOMIC) == CCO_SDMA_UNIT, "ATOMIC must be exac
 
 // Where a unit at monotonic byte offset `at` lands. Units are 32B-aligned in a
 // 32B-multiple ring, so this never needs to split a packet.
-inline __device__ ccoSdmaUnit* ccoSdmaUnitAt(uint32_t *queueBuf, uint64_t at) {
+inline __device__ ccoSdmaUnit* ccoSdmaUnitAt(uint32_t* queueBuf, uint64_t at) {
   constexpr uint64_t kRingDwords = CCO_SDMA_QUEUE_SIZE / sizeof(uint32_t);
   static_assert((kRingDwords & (kRingDwords - 1)) == 0, "ring must be a power of two to mask");
-  return reinterpret_cast<ccoSdmaUnit*>(queueBuf +
-                                        ((at / sizeof(uint32_t)) & (kRingDwords - 1)));
+  return reinterpret_cast<ccoSdmaUnit*>(queueBuf + ((at / sizeof(uint32_t)) & (kRingDwords - 1)));
 }
 
-inline __device__ void ccoSdmaWriteCopy(uint32_t *queueBuf, uint64_t at, void* srcPtr,
-                                        void* dstPtr, size_t size) {
+inline __device__ void ccoSdmaWriteCopy(uint32_t* queueBuf, uint64_t at, void* srcPtr, void* dstPtr,
+                                        size_t size) {
   auto pkt = ccoCreateCopyPacket(srcPtr, dstPtr, size);
   const uint32_t* p = reinterpret_cast<const uint32_t*>(&pkt);
   auto dst = impl::global(ccoSdmaUnitAt(queueBuf, at));
@@ -1392,8 +1393,7 @@ inline __device__ void ccoSdmaWriteCopy(uint32_t *queueBuf, uint64_t at, void* s
   dst->vec[1] = Uint4{p[4], p[5], p[6], 0};
 }
 
-inline __device__ void ccoSdmaWriteAtomic(uint32_t *queueBuf, uint64_t at,
-                                          HSAuint64* target) {
+inline __device__ void ccoSdmaWriteAtomic(uint32_t* queueBuf, uint64_t at, HSAuint64* target) {
   auto pkt = ccoCreateAtomicIncPacket(target);
   const uint32_t* p = reinterpret_cast<const uint32_t*>(&pkt);
   auto dst = impl::global(ccoSdmaUnitAt(queueBuf, at));
@@ -1402,8 +1402,8 @@ inline __device__ void ccoSdmaWriteAtomic(uint32_t *queueBuf, uint64_t at,
 }
 
 template <bool localSignal, bool remoteSignal>
-inline __device__ void ccoSdmaWriteSignals(uint32_t *queueBuf, uint64_t at,
-                                           HSAuint64* localTarget, HSAuint64* remoteTarget) {
+inline __device__ void ccoSdmaWriteSignals(uint32_t* queueBuf, uint64_t at, HSAuint64* localTarget,
+                                           HSAuint64* remoteTarget) {
   if constexpr (localSignal) {
     ccoSdmaWriteAtomic(queueBuf, at, localTarget);
     at += CCO_SDMA_UNIT;
@@ -1414,9 +1414,9 @@ inline __device__ void ccoSdmaWriteSignals(uint32_t *queueBuf, uint64_t at,
 // One lane's contribution to a group run: its COPY, plus its signals when they
 // are per-copy. `slot` is the lane's stride-aligned start.
 template <bool localSignal, bool remoteSignal, bool signalPerCopy>
-inline __device__ void ccoSdmaFillLane(uint32_t *queueBuf, uint64_t slot,
-                                       HSAuint64* localTarget, HSAuint64* remoteTarget,
-                                       void* srcPtr, void* dstPtr, size_t size) {
+inline __device__ void ccoSdmaFillLane(uint32_t* queueBuf, uint64_t slot, HSAuint64* localTarget,
+                                       HSAuint64* remoteTarget, void* srcPtr, void* dstPtr,
+                                       size_t size) {
   ccoSdmaWriteCopy(queueBuf, slot, srcPtr, dstPtr, size);
   if constexpr (signalPerCopy) {
     ccoSdmaWriteSignals<localSignal, remoteSignal>(queueBuf, slot + CCO_SDMA_UNIT, localTarget,
@@ -1426,10 +1426,10 @@ inline __device__ void ccoSdmaFillLane(uint32_t *queueBuf, uint64_t slot,
 
 // Ring the doorbell for everything placed-but-not-rung on this queue.
 inline __device__ void ccoSdmaRingQueueDbr(ccoSdmaQueueDeviceHandle& handle) {
-  uint64_t base =
-      __hip_atomic_load(impl::global(handle.committedWptr), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-  uint64_t pending =
-      __hip_atomic_load(impl::global(handle.cachedWptr), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  uint64_t base = __hip_atomic_load(impl::global(handle.committedWptr), __ATOMIC_RELAXED,
+                                    __HIP_MEMORY_SCOPE_AGENT);
+  uint64_t pending = __hip_atomic_load(impl::global(handle.cachedWptr), __ATOMIC_RELAXED,
+                                       __HIP_MEMORY_SCOPE_AGENT);
   if (pending != base) handle.submitPacket(base, pending);
 }
 
@@ -1470,12 +1470,13 @@ inline __device__ void ccoSdmaPutGrouped(ccoSdmaQueueDeviceHandle* shared, void*
       base = impl::waveBcastLane(base, leaderLane);
 
       ccoSdmaFillLane<localSignal, remoteSignal, signalPerCopy>(
-          handle.queueBuf, base + myIdx * kStride, localTarget, remoteTarget, srcBuf, dstBuf, copy_size);
+          handle.queueBuf, base + myIdx * kStride, localTarget, remoteTarget, srcBuf, dstBuf,
+          copy_size);
       // One signal for the group, after every copy in it.
       if constexpr (!signalPerCopy) {
         if (myIdx == cnt - 1)
-          ccoSdmaWriteSignals<localSignal, remoteSignal>(handle.queueBuf, base + cnt * CCO_SDMA_UNIT,
-                                                         localTarget, remoteTarget);
+          ccoSdmaWriteSignals<localSignal, remoteSignal>(
+              handle.queueBuf, base + cnt * CCO_SDMA_UNIT, localTarget, remoteTarget);
       }
       // s_waitcnt is per-lane, so the leader's cannot publish anyone else's slot.
       ccoSdmaPublishStores();
@@ -1520,8 +1521,8 @@ inline __device__ void ccoSdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_
     const uint64_t bytes = ccoSdmaGroupBytes<localSignal, remoteSignal, kPerCopy>(1);
     const uint64_t base = handle.ReserveSlot(bytes, shared);
     ccoSdmaWriteCopy(handle.queueBuf, base, srcBuf, dstBuf, copy_size);
-    ccoSdmaWriteSignals<localSignal, remoteSignal>(handle.queueBuf, base + CCO_SDMA_UNIT, localTarget,
-                                                   remoteTarget);
+    ccoSdmaWriteSignals<localSignal, remoteSignal>(handle.queueBuf, base + CCO_SDMA_UNIT,
+                                                   localTarget, remoteTarget);
     if constexpr (kRing) {
       handle.submitPacket(base, base + bytes);
     } else {
@@ -1554,12 +1555,13 @@ inline __device__ void ccoSdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_
     uint64_t base = (myIdx == 0) ? handle.ReserveSlot(runBytes, shared) : 0;
     base = impl::waveBcastFirstLane(base);  // leader is the lowest active lane
 
-    ccoSdmaFillLane<localSignal, remoteSignal, kPerCopy>(
-        handle.queueBuf, base + myIdx * kStride, localTarget, remoteTarget, srcBuf, dstBuf, copy_size);
+    ccoSdmaFillLane<localSignal, remoteSignal, kPerCopy>(handle.queueBuf, base + myIdx * kStride,
+                                                         localTarget, remoteTarget, srcBuf, dstBuf,
+                                                         copy_size);
     if constexpr (!kPerCopy) {
       if (myIdx == nActive - 1)
-        ccoSdmaWriteSignals<localSignal, remoteSignal>(handle.queueBuf, base + nActive * CCO_SDMA_UNIT,
-                                                       localTarget, remoteTarget);
+        ccoSdmaWriteSignals<localSignal, remoteSignal>(
+            handle.queueBuf, base + nActive * CCO_SDMA_UNIT, localTarget, remoteTarget);
     }
     ccoSdmaPublishStores();  // per-lane: the leader cannot publish for us
     __builtin_amdgcn_wave_barrier();
@@ -1641,16 +1643,18 @@ inline __device__ void ccoSdmaCommitBlock(ccoSdmaQueueDeviceHandle** deviceHandl
 // published on this queue (rptr >= committedWptr). Independent of signals, so it
 // works whatever a put's signal targets (local / peer / none).
 inline __device__ void ccoSdmaDrainQueue(ccoSdmaQueueDeviceHandle& handle) {
-  uint64_t target =
-      __hip_atomic_load(impl::global(handle.committedWptr), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  uint64_t target = __hip_atomic_load(impl::global(handle.committedWptr), __ATOMIC_RELAXED,
+                                      __HIP_MEMORY_SCOPE_AGENT);
   // Aggregate puts that were never commit()ed sit past committedWptr, so this
   // would return without them having been rung.
   if constexpr (CCO_SDMA_BREAK_ON_RETRIES) {
-    if (__hip_atomic_load(impl::global(handle.cachedWptr), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) > target) {
+    if (__hip_atomic_load(impl::global(handle.cachedWptr), __ATOMIC_RELAXED,
+                          __HIP_MEMORY_SCOPE_AGENT) > target) {
       __builtin_trap();  // un-committed Aggregate puts: call commit() first
     }
   }
-  while (__hip_atomic_load(impl::global(handle.rptr), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) < target) {
+  while (__hip_atomic_load(impl::global(handle.rptr), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) <
+         target) {
     __builtin_amdgcn_s_sleep(1);
   }
 }
