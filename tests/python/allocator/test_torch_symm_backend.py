@@ -19,6 +19,8 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+import gc
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -80,8 +82,50 @@ def _run(rank, world_size, port):
         dist.barrier()
 
 
+def _run_release(rank, world_size, port):
+    """Releasing a rendezvous'd window must both survive and give the memory back.
+
+    Teardown used to segfault, so it was disabled and every window leaked; this pins
+    down both halves of that.
+    """
+    with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
+        device = torch.device("cuda", rank)
+        torch.cuda.set_device(device)
+        group_name = dist.group.WORLD.group_name
+        symm_mem.set_backend("MORI")
+        symm_mem.enable_symm_mem_for_group(group_name)
+
+        mib = 1 << 20
+
+        def cycle():
+            t = symm_mem.empty(16 * mib // 4, dtype=torch.float32, device=device)
+            hdl = symm_mem.rendezvous(t, group_name)
+            assert hdl.world_size == world_size
+            dist.barrier()
+            del hdl, t
+            gc.collect()
+            torch.cuda.synchronize()
+            dist.barrier()
+
+        cycle()  # first cycle also pays any one-off context growth
+        settled = torch.cuda.mem_get_info(device)[0]
+        for _ in range(4):
+            cycle()
+        assert (
+            torch.cuda.mem_get_info(device)[0] == settled
+        ), "free memory shrank across alloc/free cycles: the window is leaking"
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs at least 2 GPUs")
 def test_symm_backend():
     world_size = 2
     port = get_free_port()
     mp.spawn(_run, args=(world_size, port), nprocs=world_size, join=True)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs at least 4 GPUs")
+def test_symm_release():
+    # 4 ranks on purpose: the teardown crash did not show at 2 on every torch.
+    world_size = 4
+    port = get_free_port()
+    mp.spawn(_run_release, args=(world_size, port), nprocs=world_size, join=True)

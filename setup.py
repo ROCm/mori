@@ -77,6 +77,20 @@ def _env_flag(name: str, default: str = "OFF") -> bool:
     }
 
 
+def _torch_symm_mode() -> str:
+    """ON | OFF | AUTO for the torch SymmetricMemory backend.
+
+    AUTO (the default) builds it when torch is importable and treats a failure as a
+    skip, because the extension is optional and its ABI tracks a torch that mori does
+    not depend on. ON turns those skips into build errors."""
+    raw = os.environ.get("BUILD_TORCH_SYMM", "AUTO").strip().upper()
+    if raw in {"1", "ON", "TRUE", "YES"}:
+        return "ON"
+    if raw in {"0", "OFF", "FALSE", "NO"}:
+        return "OFF"
+    return "AUTO"
+
+
 def _detect_pkg_manager() -> str:
     """Detect the system package manager."""
     if shutil.which("apt-get"):
@@ -363,6 +377,15 @@ def _copy_jit_sources(root_dir: Path) -> None:
         if src_file.is_file():
             shutil.copy2(src_file, shmem_dst / name)
 
+    # torch SymmetricMemory backend — compiled on first import when the prebuilt
+    # extension is missing or was built against a different torch. Headers come from
+    # the include/ copy above.
+    symm_src = root_dir / "src" / "allocator" / "symm_backend.cpp"
+    if symm_src.is_file():
+        symm_dst = jit_dir / "src" / "allocator"
+        symm_dst.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(symm_src, symm_dst / "symm_backend.cpp")
+
     # cco device-API wrapper — JIT-compiled to libmori_cco_device.bc on first use
     # (mori.cco.device.bitcode). Headers come from the include/ copy above.
     cco_dev_src = root_dir / "src" / "cco" / "device" / "cco_device_wrapper.cpp"
@@ -474,7 +497,20 @@ class CMakeBuild(build_ext):
             if ext not in torch_exts:
                 self.build_extension(ext)
         if torch_exts:
-            self._build_with_torch(torch_exts)
+            try:
+                self._build_with_torch(torch_exts)
+            except Exception as exc:
+                # AUTO means "build it if this environment can": a torch whose
+                # SymmetricMemory interface has moved must not take the rest of mori
+                # down with it. mori.allocator rebuilds from the shipped sources on
+                # first import, so the backend is still reachable after this.
+                if _torch_symm_mode() != "AUTO":
+                    raise
+                print(
+                    f"[mori] torch SymmetricMemory backend not prebuilt ({exc}). "
+                    "It will be compiled on first `import mori.allocator`; set "
+                    "BUILD_TORCH_SYMM=ON to make this a build error instead."
+                )
 
     def _build_with_torch(self, exts: list) -> None:
         """Build torch-linked extensions with torch's own build_ext, in a separate
@@ -895,7 +931,14 @@ def _torch_symm_extension():
     """SymmetricMemory backend. Built by torch's cpp_extension, not CMake: it is the
     only target that links libtorch, and torch's build_ext is what keeps the ABI flag,
     pybind11 copy and module suffix consistent with the installed torch."""
+    mode = _torch_symm_mode()
+    if mode == "OFF":
+        return []
     if _TorchCppExtension is None:
+        if mode == "ON":
+            raise RuntimeError(
+                "BUILD_TORCH_SYMM=ON but torch is not importable at build time"
+            )
         return []
     rocm = os.environ.get("ROCM_PATH", "/opt/rocm")
     # Absolute: torch's ninja compiler writes its build file into build_temp and runs

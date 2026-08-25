@@ -53,14 +53,24 @@ check ``signal_pad_supported()`` at run time. torch's own ``symm_mem`` collectiv
 synchronise through the pad, so they need that build; ``dist.barrier()`` is the stand-in
 without it.
 
-Known gap: releasing a rendezvous'd window segfaults at world_size >= 4 (2 ranks are
-fine), somewhere in the unmap/release path. Teardown is therefore disabled by default and
-the mappings are leaked -- symmetric buffers are few and long-lived, so that is much less
-harmful than crashing. Set ``MORI_SYMM_TEARDOWN=1`` to re-enable it while debugging.
+``rendezvous()`` takes the tensor's *storage* base, so ``get_offset()`` is 0 by
+construction: every ``alloc()`` is its own VMM allocation. Handing it a view
+(``rendezvous(t[512:])``) therefore describes the whole storage, and ``get_remote_tensor``
+answers for the storage base -- pass ``storage_offset`` to ``get_buffer`` to address a
+slice. That is torch's model, not something this backend narrows.
+
+The extension is optional and its ABI tracks the installed torch, so it is a plugin:
+``pip install`` prebuilds it when it can (``BUILD_TORCH_SYMM=AUTO``, the default; ``ON``
+makes a failure fatal, ``OFF`` skips it), and a build that did not happen or no longer
+loads is compiled here on first import from the sources shipped in ``_jit-sources``. So
+switching torch does not require reinstalling mori. ``MORI_SYMM_FORCE_JIT=1`` ignores the
+prebuilt module, which is also how ``MORI_SYMM_SIGNAL_PAD=ON`` can be turned on without
+rebuilding mori itself.
 """
 
 import atexit
 import logging
+import os
 from typing import Literal
 
 __all__ = [
@@ -77,22 +87,79 @@ SYMM_BACKEND_NAME = "MORI"
 _atexit_registered = False
 
 
+_ext_cache = None
+
+
+def _jit_ext():
+    """Compile the backend against the torch that is actually loaded.
+
+    torch caches the result under TORCH_EXTENSIONS_DIR keyed by the build flags, so this
+    costs a compile once per (torch, flag) combination, not once per process."""
+    from torch.utils.cpp_extension import load
+
+    from ..jit.config import get_mori_source_root
+
+    root = get_mori_source_root()
+    if root is None:
+        raise ImportError(
+            "mori_torch_symm is not built and its sources were not found. Reinstall "
+            "mori from a source tree or a wheel that ships _jit-sources."
+        )
+    source = root / "src" / "allocator" / "symm_backend.cpp"
+    if not source.is_file():
+        raise ImportError(f"mori_torch_symm sources missing at {source}")
+
+    rocm = os.environ.get("ROCM_PATH", "/opt/rocm")
+    flags = ["-std=c++17", "-O3", "-D__HIP_PLATFORM_AMD__=1", "-DUSE_ROCM=1"]
+    if os.environ.get("MORI_SYMM_SIGNAL_PAD", "OFF").strip().upper() in {
+        "1",
+        "ON",
+        "TRUE",
+        "YES",
+    }:
+        flags.append("-DMORI_SYMM_SIGNAL_PAD=1")
+    logger.info("compiling mori_torch_symm from %s", source)
+    return load(
+        name="mori_torch_symm",
+        sources=[str(source)],
+        extra_include_paths=[str(root / "include"), f"{rocm}/include"],
+        extra_cflags=flags,
+        extra_ldflags=[f"-L{rocm}/lib", "-lamdhip64"],
+    )
+
+
 def _ext():
     # torch must be imported first: the extension links libtorch, and nothing on its
     # RUNPATH resolves those, so they have to already be in the process.
+    global _ext_cache
+    if _ext_cache is not None:
+        return _ext_cache
     try:
-        import torch
+        import torch  # noqa: F401
     except ImportError as exc:
         raise ImportError("mori.allocator requires torch") from exc
+
+    prebuilt_error = None
+    if os.environ.get("MORI_SYMM_FORCE_JIT", "0").strip() not in {"1", "ON", "on"}:
+        try:
+            from .. import mori_torch_symm
+
+            _ext_cache = mori_torch_symm
+            return _ext_cache
+        # ImportError also covers the interesting case: the .so is there but was linked
+        # against a different torch, so a symbol it needs is gone.
+        except (ImportError, OSError) as exc:  # pragma: no cover - build dependent
+            prebuilt_error = exc
+            logger.debug("prebuilt mori_torch_symm unusable, rebuilding: %s", exc)
+
     try:
-        from .. import mori_torch_symm
-    except ImportError as exc:  # pragma: no cover - depends on build flags
+        _ext_cache = _jit_ext()
+    except Exception as exc:
         raise ImportError(
-            "mori_torch_symm extension not found. It is built by torch's cpp_extension, "
-            "so torch must be installed when mori is built; reinstall mori with torch "
-            f"present. ({exc})"
+            f"mori_torch_symm could not be loaded ({prebuilt_error}) and rebuilding it "
+            f"from source failed ({exc})."
         ) from exc
-    return mori_torch_symm
+    return _ext_cache
 
 
 def register_symm_backend() -> str:

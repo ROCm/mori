@@ -91,15 +91,6 @@ size_t RoundUp(size_t v, size_t m) { return ((v + m - 1) / m) * m; }
 // segfaults. is_finalizing() catches torch's own shutdown; this catches the rest by
 // probing the runtime first. Leaking there is deliberate -- the process is exiting.
 bool RuntimeUsable() {
-  // KNOWN GAP: releasing a rendezvous'd window segfaults at world_size >= 4 (fine at 2),
-  // somewhere in the unmap/release path. Until that is understood, teardown is off by
-  // default -- symmetric buffers are few and long-lived, so leaking them is far less
-  // harmful than crashing. MORI_SYMM_TEARDOWN=1 re-enables it for debugging.
-  static const bool teardown = [] {
-    const char* e = getenv("MORI_SYMM_TEARDOWN");
-    return e && *e == '1';
-  }();
-  if (!teardown) return false;
   if (c10d::symmetric_memory::is_finalizing()) return false;
   int dev = -1;
   return hipGetDevice(&dev) == hipSuccess;
@@ -316,7 +307,9 @@ class MoriSymmetricMemory : public SymmetricMemory {
     if (rank_to_global_rank_dev_) (void)hipFree(rank_to_global_rank_dev_);
     for (int r = 0; r < world_size_; ++r) {
       (void)hipMemUnmap(flat_base_ + static_cast<size_t>(r) * stride_, stride_);
-      (void)hipMemRelease(handles_[r]);
+      // handles_[rank_] is the Block's own handle, borrowed for the self slot. The
+      // allocator's free() releases it, and releasing it twice segfaults.
+      if (r != rank_) (void)hipMemRelease(handles_[r]);
     }
     (void)hipMemAddressFree(flat_base_, span_);
   }
@@ -333,6 +326,9 @@ class MoriSymmetricMemory : public SymmetricMemory {
   }
   size_t get_buffer_size() override { return buffer_size_; }
   size_t get_offset() override { return 0; }
+  // Every alloc() is its own VMM allocation, so torch's storage starts at the window
+  // base and the pad, when reserved, sits directly after the buffer.
+  size_t get_signal_pad_size() override { return kSignalPadBytes; }
 
   bool has_multicast_support() override { return false; }
   void* get_multicast_ptr() override { return nullptr; }
@@ -421,8 +417,10 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
       block = it->second;
       blocks_.erase(it);
     }
-    // Local only: the flat span is owned by the SymmetricMemory object.
     if (!RuntimeUsable()) return;
+    // Drop the window first: its self slot maps this same handle, so the mapping has to
+    // go before the release below. Relying on ~Block to do it later would reverse that.
+    block->symm.reset();
     (void)hipMemUnmap(block->ptr, block->alloc_size);
     (void)hipMemAddressFree(block->ptr, block->alloc_size);
     (void)hipMemRelease(block->handle);
@@ -487,7 +485,8 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
     std::vector<hipMemGenericAllocationHandle_t> handles(world_size);
 
     // A second alias of our own allocation, so the stride is uniform across all ranks.
-    MORI_HIP_CHECK(hipMemRetainAllocationHandle(&handles[rank], block->ptr));
+    // The handle is borrowed from the Block rather than retained: one owner, one release.
+    handles[rank] = block->handle;
     map_slot(rank, handles[rank]);
 
     if (use_fabric) {
