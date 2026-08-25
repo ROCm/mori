@@ -959,8 +959,8 @@ BackendRegistry& PoolClient::Backends() { return registry_; }
 // ---------------------------------------------------------------------------
 
 bool PoolClient::RegisterMemory(void* ptr, size_t size, mori::io::MemoryLocationType loc,
-                                int device) {
-  if (!transfer_engine_) {
+                                int device, MemoryRegistration mode) {
+  if (!transfer_engine_ && mode == MemoryRegistration::kPinned) {
     MORI_UMBP_ERROR("[PoolClient] RegisterMemory: transfer engine not available");
     return false;
   }
@@ -982,6 +982,15 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size, mori::io::MemoryLocation
         "[PoolClient] RegisterMemory: ptr={} already registered with smaller size {}<{}", ptr,
         reg.size, size);
     return false;
+  }
+
+  if (mode == MemoryRegistration::kLocalCopyOnly) {
+    // Nothing to pin and nothing that can throw: the ref carries exactly what
+    // local engine selection reads off it, and every engine's Deregister
+    // no-ops on a ref without a descriptor.
+    TransferRef ref = TransferRef::HostBytes(ptr, size, loc, device);
+    registered_regions_.insert(at, RegisteredRegion{ptr, size, std::move(ref)});
+    return true;
   }
 
   // The engine may throw (mori-io pinning can fail on a region the NIC cannot

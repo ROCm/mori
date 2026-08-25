@@ -79,9 +79,12 @@ class StandaloneProcessClient : public IUMBPClient {
   UMBPDeploymentMode GetBackendMode() const override { return backend_mode_; }
   bool SupportsRangedIO() const override { return supports_ranged_io_; }
 
+  // `mode` is accepted and ignored: this client owns nothing to pin. It forwards
+  // the region to the server, which decides how to declare it to the backend.
   bool RegisterMemory(uintptr_t ptr, size_t size,
                       mori::io::MemoryLocationType loc = mori::io::MemoryLocationType::CPU,
-                      int device = -1) override;
+                      int device = -1,
+                      MemoryRegistration mode = MemoryRegistration::kPinned) override;
   void DeregisterMemory(uintptr_t ptr) override;
 
   bool ReportExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) override;

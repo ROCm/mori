@@ -142,6 +142,19 @@ enum class EvictionOrder : int {
   kLeastRecentlyAccessed = 1,  // oldest last_accessed_at first
 };
 
+// What a RegisterMemory call is asking for.
+//
+// Registering is not only about pinning: it is also what lets a range be
+// described by its region's base instead of its own address, which is what
+// collapses a batch of ranges into one transfer plan rather than one per range.
+// A region that will only ever be copied locally still wants that, but has no
+// use for an RDMA MR — and for an IPC-imported ROCm mapping the dmabuf fallback
+// is unsafe — so the two halves are separable.
+enum class MemoryRegistration : int {
+  kPinned = 0,         // record it and export it to the IO engine
+  kLocalCopyOnly = 1,  // record it only; no MR, no dmabuf export
+};
+
 // Structured form of one (buffer_index, page_index) slot.  Used by the
 // peer DRAM/HBM allocator to describe which page slot a write should
 // land in, and by ResolveKey responses to tell readers where to RDMA
