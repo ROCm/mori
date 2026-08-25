@@ -40,6 +40,13 @@ _own.add_argument("--quant-type", type=str, default="none")
 _own.add_argument("--out", type=str, default=None)
 _own.add_argument("--label", type=str, default="")
 _own.add_argument(
+    "--kineto",
+    action="store_true",
+    help="Per-kernel GPU time from the CUDA profiler. Unlike --profile-kernels "
+    "this does not insert events between launches, so it does not break "
+    "launch batching and is not inflated by host pacing.",
+)
+_own.add_argument(
     "--cpu-profile",
     action="store_true",
     help="cProfile the host-side enqueue loop.",
@@ -230,6 +237,65 @@ def _profile_kernels(case, op, test_data, matrix, global_rank):
             print(f"{'TOTAL (sum of slowest)':<52} {'':>7} {total:9.2f}", flush=True)
 
 
+def _kineto_breakdown(case, op, test_data, matrix, global_rank):
+    """Per-kernel GPU time straight from the CUDA profiler.
+
+    The phase totals are host-paced at small token counts, so they cannot tell
+    us whether a kernel change helped. Kernel durations come off the device and
+    are immune to that, which makes this the metric to optimise against.
+    """
+    _, ari, ari_in, arw, ars = test_data
+    r = case.rank
+
+    for entry in matrix:
+        dc, cc = tuple(entry["disp"]), tuple(entry["comb"])
+        _timed_trial(case, op, test_data, 5, dc, cc, False)   # warm
+
+        def _round():
+            d = case.run_dispatch(op, ari_in[r], arw[r], ars[r], ari[r],
+                                  block_num=dc[0], warp_per_block=dc[1], rdma_block_num=dc[2])
+            case.run_combine(op, case._convert_for_combine(d[0]), None, ari[r],
+                             block_num=cc[0], warp_per_block=cc[1], rdma_block_num=cc[2])
+
+        torch.cuda.synchronize()
+        dist.barrier()
+        sched = torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1)
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CUDA], schedule=sched
+        ) as prof:
+            for _ in range(2):
+                for _ in range(OWN.rounds):
+                    _round()
+                torch.cuda.synchronize()
+                prof.step()
+
+        rows = []
+        for evt in prof.key_averages():
+            if not (evt.key.startswith("EpDispatch") or evt.key.startswith("EpCombine")):
+                continue
+            n = max(1, evt.count)
+            rows.append((evt.key, evt.self_device_time_total / n, n))
+
+        # slowest-rank view per kernel
+        out_rows = []
+        for name, us, n in sorted(rows):
+            local = torch.tensor([us], dtype=torch.float64)
+            g = [torch.zeros(1, dtype=torch.float64) for _ in range(case.world_size)]
+            dist.all_gather(g, local)
+            v = [x.item() for x in g]
+            out_rows.append((name, max(v), sum(v) / len(v), min(v), n))
+
+        if global_rank == 0:
+            print(f"\n=== kineto GPU time [{entry['name']}] disp={dc} comb={cc} "
+                  f"tokens={OWN.max_tokens} hidden={OWN.hidden_dim} ===", flush=True)
+            print(f"{'kernel':<48}{'slowest':>10}{'mean':>10}{'fastest':>10}{'n':>6}", flush=True)
+            tot_s = tot_m = 0.0
+            for name, mx, mean, mn, n in out_rows:
+                tot_s += mx; tot_m += mean
+                print(f"{name:<48}{mx:10.2f}{mean:10.2f}{mn:10.2f}{n:6d}", flush=True)
+            print(f"{'TOTAL':<48}{tot_s:10.2f}{tot_m:10.2f}", flush=True)
+
+
 def main(local_rank, num_node, gpu_per_node):
     node_rank = int(os.environ["RANK"])
     global_rank = node_rank * gpu_per_node + local_rank
@@ -250,6 +316,11 @@ def main(local_rank, num_node, gpu_per_node):
     test_data = case.gen_test_data(
         max_num_token=OWN.max_tokens, use_max_token_num=True, only_my_rank=True
     )
+
+    if OWN.kineto:
+        _kineto_breakdown(case, op, test_data, matrix, global_rank)
+        case.cleanup()
+        return
 
     if OWN.cpu_profile:
         import cProfile, pstats, io as _io

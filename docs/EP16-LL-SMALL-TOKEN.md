@@ -353,7 +353,120 @@ op **确实**是分阶段读 JSON 的（`get_launch_config(is_dispatch=...)`）�
    `EpCombineSync` 尾部，6 次 launch 省 1 次。
 3. 修 §5.5 的 4 个配置加载问题。
 
-### 5.7 改动清单
+### 5.7 逐 kernel 详细分析（GPU 侧）
+
+前面几节的结论都基于 wall time，而 wall time 在这个区间被 host 节流，看不清 GPU 侧。
+`bench_matrix.py --kineto` 直接从 CUDA profiler 读 kernel 时长，不插 event、不破坏 launch
+批处理，**这是唯一能评价 kernel 改动的指标**。
+
+4 tokens / hidden 6144 / EP16，20 轮，跨 rank 取平均：
+
+| kernel | grid | mean (us) | 占比 | 性质 |
+|---|---|---|---|---|
+| `EpDispatchCopyToStaging` | mp | 4.74 | 3.5% | 与 payload 无关，基本是 launch 底噪 |
+| **`EpDispatchInterNodeV1KernelLowLatency`** | bn | **55.5** | **41%** | ~50us 固定 + 0.5us/token |
+| `EpCombineSync` | mp | 6.8 | 5% | 随 payload 线性（1K→16K：4.7→13.8） |
+| `EpCombineSyncBarrier` | 1 | 7.7 | 5.7% | node 内 8-GPU barrier |
+| **`EpCombineInterNodeV1KernelLowLatency`** | bn | **56.3** | **41%** | ~46us 固定 + 0.48us/token |
+| `EpCombineAll` | mp | 4.96 | 3.6% | 与 payload 无关，launch 底噪 |
+| **合计** | | **136.1** | | |
+
+#### 固定成本的确认
+
+两个 LL kernel 占 **82%** 的 GPU 时间，其中绝大部分是与工作量无关的固定成本。三组扫描：
+
+| 变量 | 范围 | dispatch LL | combine LL |
+|---|---|---|---|
+| hidden_dim（4 tokens） | 1024 / 6144 / 16384 | 55.1 / 53.4 / 53.4 —— **完全不变** | 54.8 / 66.5 / 79.8 |
+| max-tokens（hidden 6144） | 4 / 8 / 16 | 52.2 ~ 57.2 —— **不变** | 56.4 ~ 66.5 |
+| max-tokens 拉大 | 4 / 64 / 128 / 256 | 51.7 / 82.8 / 124.0 / 180.1 | 58.2 / 76.7 / 107.8 / 169.4 |
+
+对第三行线性拟合：**dispatch LL ≈ 50us + 0.5us/token**，**combine LL ≈ 46us + 0.48us/token**。
+4 token 时 98% 的开销是那个固定截距。dispatch 连 payload 都完全不敏感（16 倍数据量零变化），
+说明它的 XGMI 拷贝全部被等待掩盖了。
+
+#### 这个固定成本合理吗？—— 不合理
+
+用 `ib_write_lat` 在同一对网卡（mlx5_0，`10.224.2.156` ↔ `10.224.2.85`）上测裸 RDMA：
+
+| 消息大小 | t_typical |
+|---|---|
+| 8 B | 8.1 us |
+| 4 KB | 9.9 us |
+| 24 KB（≈4 token × 6144 fp8） | **10.7 us** |
+
+线路只要 ~11us，mori 每个 phase 花 46–50us，**每个 phase 有约 40us 高于线路的软件开销，
+两个 phase 合计约 80us，占 GPU 总时间的 59%。**
+
+而且这不是硬件下限：同一 fabric 上 mori 自己的 async_ll，其接收侧 kernel
+（`EpDispatchLowLatencyAsyncRecvTransfer`）最快能到 **18.6us**，
+`EpCombineLowLatencyAsyncRecvTransfer` 到 **16.6us**。也就是说接收路径本身可以做到接近线路，
+v1_ll 的 50us 是协议/实现开销。
+
+（注意 async_ll 整体并不可用：端到端 1387us，比 v1_ll 慢 8.5 倍，它的 SendTransfer 是常驻
+ kernel，只有 RecvTransfer 的下限有参考价值。）
+
+#### 协议横向对比（端到端 wall/round，4 tokens）
+
+| kernel-type | dispatch | combine | wall/round |
+|---|---|---|---|
+| **`v1_ll`** | 72.8 / 73.1 | 93.3 / 92.2 | **161.2 / 166.6** |
+| `v1` | 121.7 / 123.0 | 123.1 / 166.3 | 222.3 / 272.6 |
+| `async_ll` | 500.6 / 502.7 | 884.6 / 883.8 | 1386.7 / 1386.9 |
+
+**`v1_ll` 是当前正确选择**，比 v1 快 27–39%，async_ll 在这个配置下完全不适用。
+
+#### 可优化点（按收益排序）
+
+1. **两个 LL kernel 的 ~96us 固定成本**（GPU 时间的 71%）。最大的一块，且已证明不是 fabric
+   限制。方向是 GPU 发起 RDMA 的 WQE 构建/doorbell 开销、轮询检测延迟、以及
+   send→signal→poll 这条协议链路。**需要协议层改动，参数调优已经榨干了。**
+2. **合并 kernel**：6 个 kernel，每个 launch 底噪约 5us，合计 20–25us（GPU 侧 15–18%）。
+   `EpCombineSyncBarrier`（grid=1、单 warp）可用 last-block-arrives 并进 `EpCombineSync` 尾部；
+   `EpDispatchCopyToStaging` 可并进 dispatch LL 头部。
+3. **host 侧**：cpu-enqueue ~150us 仍然 ≥ GPU 的 136us，**端到端依旧是 host 定的节奏**。
+   即使把上面两条全做完，不解决 host 侧也看不到端到端收益。HIP graph 仍是最大杠杆。
+
+#### 已用 kineto 复测确认无效的改动
+
+| 尝试 | 结果 |
+|---|---|
+| §5.2 那 4 个 kernel 改动 | stock 136.0 / 136.2 vs 打补丁 135.5 / 135.5 —— 无差异 |
+| `--num-qp` 1 / 2 / 3 / 4 | wall 161–169us，全在噪声内（2 微弱最优，维持不变） |
+| `MORI_RDMA_DEVICES`（显式 8 张 fabric 卡 / `^mlx5_1,mlx5_6`） | 与默认完全一致 |
+
+`MORI_RDMA_DEVICES` 无效的原因是**默认选卡本来就是对的**。`MORI_APP_LOG_LEVEL=info` 可见
+`TopoSystem::MatchGpuAndNic()` 按 PCIe 拓扑给出：
+
+```
+rank 0 → mlx5_0   rank 2 → mlx5_3   rank 4 → mlx5_5   rank 6 → mlx5_8
+rank 1 → mlx5_2   rank 3 → mlx5_4   rank 5 → mlx5_7   rank 7 → mlx5_9
+```
+
+8 个 rank 各自拿到对应 fabric 网卡，以太网的 `mlx5_1` / `mlx5_6` 已自动跳过，没有改进空间。
+
+> 另外澄清：`MORI_NUM_QP_PER_PE`（transport 层 QP 数，默认 4）和 `--num-qp`
+> （`config.numQpPerPe`，kernel 选 qpId 用）是两个不同的东西。DeepEP 那条命令里
+> env=1 而脚本内部 config 写死 4，其实是不匹配的。
+
+### 5.8 双峰抖动（未解决）
+
+约 **1/3** 的 run 会整体慢 1.7 倍，干净双峰、没有中间值：
+
+| | wall/round | combine |
+|---|---|---|
+| 好模式（~2/3） | ~165 us | ~88 us |
+| 坏模式（~1/3） | ~275 us | ~170 us |
+
+两个 bench 都会出现。已排除：`--num-qp`、RDMA 设备选择、其他任务抢 GPU（两台均空闲，
+无第三方进程）。关键线索是坏模式下 **cpu-enqueue 仍是 ~150us 但 wall 到 275us**，
+即 GPU 侧真的变慢了（好模式是 wall≈enqueue，host-bound）。怀疑 GPU 没升频
+（`rocm-smi` 空闲 131MHz 并警告 `AMD GPU device(s) is/are in a low-power state`），
+但本机 `rocm-smi --setperflevel high` 返回 `Not supported on the given system`，无法直接验证。
+
+**实践影响：任何对比都要跑 ≥3 次取好模式，单次结果不可信。**
+
+### 5.9 改动清单
 
 修改：
 
