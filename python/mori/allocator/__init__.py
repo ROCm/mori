@@ -19,7 +19,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""Register mori as a torch SymmetricMemory backend.
+"""Register mori as a torch SymmetricMemory backend. Requires **torch >= 2.9**.
 
 Self-contained: plain HIP VMM, no shmem or cco allocator involved, so no mori bootstrap
 is needed -- torch's process group is the only rendezvous::
@@ -84,6 +84,10 @@ logger = logging.getLogger(__name__)
 
 SYMM_BACKEND_NAME = "MORI"
 
+# torch 2.9 is where symm_mem.set_backend() and the SymmetricMemory interface this
+# implements arrived; on 2.8 there is no pluggable backend to register with at all.
+TORCH_MIN_VERSION = (2, 9)
+
 _atexit_registered = False
 
 
@@ -95,9 +99,22 @@ def _jit_ext():
 
     torch caches the result under TORCH_EXTENSIONS_DIR keyed by the build flags, so this
     costs a compile once per (torch, flag) combination, not once per process."""
+    import torch
     from torch.utils.cpp_extension import load
 
     from ..jit.config import get_mori_source_root
+
+    # Checked before ninja, not after: on torch < 2.9 the SymmetricMemory interface this
+    # implements does not exist, so the compile is a guaranteed minute-long failure whose
+    # error says nothing about the version.
+    have = tuple(int(p) for p in torch.__version__.split("+")[0].split(".")[:2])
+    if have < TORCH_MIN_VERSION:
+        raise ImportError(
+            f"mori's torch SymmetricMemory backend needs torch >= "
+            f"{'.'.join(map(str, TORCH_MIN_VERSION))}, found {torch.__version__}. "
+            "torch.distributed._symmetric_memory.set_backend() does not exist before "
+            "then, so there is nothing to register the backend with."
+        )
 
     root = get_mori_source_root()
     if root is None:

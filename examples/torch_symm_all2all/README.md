@@ -13,6 +13,9 @@ torchrun --nnodes=1 --nproc_per_node=8 all2all_hip.py --chunk-kib 256
 torchrun --nnodes=1 --nproc_per_node=8 all2all_triton.py --chunk-kib 256
 ```
 
+Needs **torch >= 2.9**: `symm_mem.set_backend()`, and the SymmetricMemory interface the
+backend implements, do not exist before that.
+
 There is no build step. The HIP kernel is a string in `all2all_hip.py`, JIT-built by
 torch's `cpp_extension` on first run (concurrent ranks share one build — torch holds a file
 lock), and the Triton kernel needs no C++ at all.

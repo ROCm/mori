@@ -42,6 +42,7 @@
 #include <pybind11/pybind11.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <torch/version.h>
 #include <unistd.h>
 
 #include <cstdlib>
@@ -56,6 +57,19 @@
 #include <vector>
 
 #include "mori/utils/hip_compat.hpp"
+
+// The SymmetricMemory interface is not stable across torch minors -- methods move
+// between pure virtual, virtual-with-default and non-virtual -- so the few places that
+// differ are gated rather than written for one release.
+#if !defined(TORCH_VERSION_MAJOR) || !defined(TORCH_VERSION_MINOR)
+#error "mori's torch SymmetricMemory backend needs <torch/version.h> to define TORCH_VERSION_*"
+#endif
+#if TORCH_VERSION_MAJOR < 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR < 9)
+#error "mori's torch SymmetricMemory backend requires torch >= 2.9"
+#endif
+#define MORI_TORCH_AT_LEAST(major, minor) \
+  (TORCH_VERSION_MAJOR > (major) ||       \
+   (TORCH_VERSION_MAJOR == (major) && TORCH_VERSION_MINOR >= (minor)))
 
 namespace mori {
 namespace allocator {
@@ -301,6 +315,9 @@ class MoriSymmetricMemory : public SymmetricMemory {
 
   ~MoriSymmetricMemory() override {
     if (!RuntimeUsable()) return;  // leak rather than crash on the way out
+    // Usually reached from free(), which has already synchronised; not when a Python
+    // reference outlived the tensor. Sync on the window's own device either way.
+    DeviceGuard guard(device_.index());
     (void)hipDeviceSynchronize();
     if (buffers_dev_) (void)hipFree(buffers_dev_);
     if (signal_pads_dev_) (void)hipFree(signal_pads_dev_);
@@ -328,7 +345,15 @@ class MoriSymmetricMemory : public SymmetricMemory {
   size_t get_offset() override { return 0; }
   // Every alloc() is its own VMM allocation, so torch's storage starts at the window
   // base and the pad, when reserved, sits directly after the buffer.
+  //
+  // torch 2.9 declares this pure virtual, so it must be defined; 2.10 turned it into a
+  // concrete base method, where 'override' is itself a compile error. Hence the guard
+  // rather than defining it unconditionally.
+#if MORI_TORCH_AT_LEAST(2, 10)
+  // provided by the base class
+#else
   size_t get_signal_pad_size() override { return kSignalPadBytes; }
+#endif
 
   bool has_multicast_support() override { return false; }
   void* get_multicast_ptr() override { return nullptr; }
@@ -418,6 +443,11 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
       blocks_.erase(it);
     }
     if (!RuntimeUsable()) return;
+    // Unmapping a range a kernel is still writing is a page fault, not a stale read, and
+    // torch's contract lets a symmetric tensor die with work outstanding. Sync here
+    // rather than in the window's destructor, which a never-rendezvous'd block has none of.
+    DeviceGuard guard(block->device_idx);
+    (void)hipDeviceSynchronize();
     // Drop the window first: its self slot maps this same handle, so the mapping has to
     // go before the release below. Relying on ~Block to do it later would reverse that.
     block->symm.reset();
@@ -541,6 +571,8 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
     }
     if (!RuntimeUsable()) return;
     for (auto& [ptr, block] : taken) {
+      DeviceGuard guard(block->device_idx);
+      (void)hipDeviceSynchronize();
       block->symm.reset();  // unmaps the flat span
       (void)hipMemUnmap(block->ptr, block->alloc_size);
       (void)hipMemAddressFree(block->ptr, block->alloc_size);

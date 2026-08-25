@@ -109,11 +109,17 @@ def _run_release(rank, world_size, port):
 
         cycle()  # first cycle also pays any one-off context growth
         settled = torch.cuda.mem_get_info(device)[0]
-        for _ in range(4):
+        rounds = 4
+        for _ in range(rounds):
             cycle()
-        assert (
-            torch.cuda.mem_get_info(device)[0] == settled
-        ), "free memory shrank across alloc/free cycles: the window is leaking"
+        # mem_get_info is device-wide, so anything else sharing the GPU moves it too.
+        # Leaking would cost rounds * 16 MiB; half of one window is a wide enough margin
+        # to stay clear of that noise while still failing loudly on a real leak.
+        lost = settled - torch.cuda.mem_get_info(device)[0]
+        assert lost < 8 * mib, (
+            f"free memory dropped {lost / mib:.1f} MiB across {rounds} alloc/free "
+            f"cycles of 16 MiB each: the window is leaking"
+        )
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs at least 2 GPUs")
