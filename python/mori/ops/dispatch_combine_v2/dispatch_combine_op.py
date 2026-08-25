@@ -50,21 +50,9 @@ from typing import Callable
 import torch
 
 from mori.tensor_utils import from_gpu_ptr
+from mori.jit.config import detect_wave_size
 
-
-def _detect_wave_size():
-    v = os.environ.get("MORI_WAVE_SIZE")
-    if v:
-        return int(v)
-    try:
-        from mori.jit.config import detect_gpu_arch
-
-        return 32 if detect_gpu_arch().startswith("gfx12") else 64
-    except Exception:
-        return 64
-
-
-WAVE = _detect_wave_size()
+WAVE = detect_wave_size()
 
 # Where each backend lives. Imported lazily, on selection only.
 _BACKEND_MODULES = {"flydsl": "flydsl_backend", "hip": "hip_backend"}
