@@ -424,12 +424,13 @@ void HbmCopyEngine::ClearHostGatherRegions() {
   host_regions_.clear();
 }
 
-bool HbmCopyEngine::HostRegionCovers(const void* ptr, size_t size) const {
+void* HbmCopyEngine::HostRegionDeviceAddress(const void* ptr, size_t size, int device_id) const {
   std::lock_guard<std::mutex> lock(host_regions_mutex_);
   for (const auto& region : host_regions_) {
-    if (region && region->Covers(ptr, size)) return true;
+    if (region == nullptr) continue;
+    if (void* alias = region->DeviceAddress(ptr, size, device_id)) return alias;
   }
-  return false;
+  return nullptr;
 }
 
 // Run the gather kernel over every eligible segment in the batch, and report
@@ -459,8 +460,8 @@ const char* HbmCopyEngine::GatherSkipName(GatherSkip reason) {
       return "kind-not-h2d-or-d2h";
     case GatherSkip::kNoDevice:
       return "no-device";
-    case GatherSkip::kHostNotRegistered:
-      return "host-not-registered";
+    case GatherSkip::kHostNotGatherable:
+      return "host-not-gatherable";
     case GatherSkip::kNoFragments:
       return "no-fragments";
     case GatherSkip::kTooFewFragments:
@@ -534,16 +535,22 @@ std::vector<char> HbmCopyEngine::GatherEligiblePlans(const std::vector<TransferP
       void* fragment_dst = dst + plan.dst_offsets[i];
       const void* host_side = host_is_src ? fragment_src : fragment_dst;
       // A kernel cannot dereference plain mmap memory — it faults the GPU — so
-      // an uncovered host side disqualifies the whole plan.
-      if (!HostRegionCovers(host_side, plan.sizes[i])) {
+      // an uncovered host side disqualifies the whole plan. Nor can it use the
+      // host address: only the host side is replaced by its per-device alias.
+      void* const host_alias = HostRegionDeviceAddress(host_side, plan.sizes[i], device_id);
+      if (host_alias == nullptr) {
         eligible = false;
         break;
       }
-      fragments.push_back({fragment_src, fragment_dst, plan.sizes[i]});
+      if (host_is_src) {
+        fragments.push_back({host_alias, fragment_dst, plan.sizes[i]});
+      } else {
+        fragments.push_back({fragment_src, host_alias, plan.sizes[i]});
+      }
       plan_bytes += plan.sizes[i];
     }
     if (!eligible) {
-      note(p, GatherSkip::kHostNotRegistered);
+      note(p, GatherSkip::kHostNotGatherable);
       continue;
     }
     if (fragments.empty()) {

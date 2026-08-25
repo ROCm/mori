@@ -46,13 +46,15 @@ bool GatherKernelExpected() {
   return value == nullptr || (std::string(value) != "0");
 }
 
-// The tier registers itself the same way. Without it the kernel path cannot
-// engage whatever the batch looks like, so the launch counter would be
-// measuring the machine rather than the planner.
+// The tier registers itself the same way. Without a reachable region the kernel
+// path cannot engage whatever the batch looks like, so the launch counter would
+// be measuring the machine rather than the planner. GatherableOn() rather than
+// RegisteredBytes(): registration can succeed on a machine whose devices still
+// cannot reach the region.
 bool GatherPathAvailable() {
   static const bool available = [] {
     std::vector<char> probe(64 * 1024);
-    return HostTierRegistration(probe.data(), probe.size()).RegisteredBytes() != 0;
+    return HostTierRegistration(probe.data(), probe.size()).GatherableOn(0);
   }();
   return available;
 }
@@ -328,6 +330,40 @@ TEST(HostTierRegistrationTest, CoversOnlyRegisteredBytesAndRejectsOverflow) {
   EXPECT_FALSE(registration.Covers(nullptr, 1));
   // A size that would wrap when added to the offset must not read as covered.
   EXPECT_FALSE(registration.Covers(region.data(), static_cast<size_t>(-1)));
+}
+
+// A device address off by anything writes the right bytes to the wrong place and
+// reports success, so pin the arithmetic rather than only checking non-null.
+TEST(HostTierRegistrationTest, DeviceAddressTranslatesByOffsetWithinTheRegion) {
+  std::vector<char> region(64 * 1024);
+  HostTierRegistration registration(region.data(), region.size());
+
+  if (!registration.GatherableOn(0)) {
+    // No device, or no usable mapping: null keeps callers on the copy engine.
+    EXPECT_EQ(registration.DeviceAddress(region.data(), 1, 0), nullptr);
+    return;
+  }
+
+  char* const alias = static_cast<char*>(registration.DeviceAddress(region.data(), 1, 0));
+  ASSERT_NE(alias, nullptr);
+  for (const size_t offset : {size_t{0}, size_t{1}, region.size() / 2, region.size() - 1}) {
+    EXPECT_EQ(registration.DeviceAddress(region.data() + offset, 1, 0), alias + offset)
+        << "offset " << offset;
+  }
+  EXPECT_EQ(registration.DeviceAddress(region.data(), region.size(), 0), alias);
+
+  // DeviceAddress is the only coverage test its callers make, so every case
+  // Covers() rejects must come back null here too -- otherwise a caller gets a
+  // plausible wild address.
+  EXPECT_EQ(registration.DeviceAddress(region.data(), region.size() + 1, 0), nullptr);
+  EXPECT_EQ(registration.DeviceAddress(region.data() + region.size() - 1, 2, 0), nullptr);
+  EXPECT_EQ(registration.DeviceAddress(region.data() + region.size(), 1, 0), nullptr);
+  EXPECT_EQ(registration.DeviceAddress(region.data(), static_cast<size_t>(-1), 0), nullptr);
+  EXPECT_EQ(registration.DeviceAddress(nullptr, 1, 0), nullptr);
+  EXPECT_EQ(registration.DeviceAddress(region.data(), 1, -1), nullptr);
+  EXPECT_EQ(registration.DeviceAddress(region.data(), 1, 1 << 20), nullptr);
+  EXPECT_FALSE(registration.GatherableOn(-1));
+  EXPECT_FALSE(registration.GatherableOn(1 << 20));
 }
 
 }  // namespace

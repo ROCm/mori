@@ -137,7 +137,8 @@ class HbmCopyEngine final : public TransferEngine {
     kDisabled,                    // UMBP_DRAM_GATHER_KERNEL=0, or latched off by a failure
     kKindNotHostDevice,           // D2D: no host side to register, so no kernel form
     kNoDevice,                    // neither endpoint named a device
-    kHostNotRegistered,           // host side outside every HostTierRegistration
+    kHostNotGatherable,           // host side outside every HostTierRegistration, or
+                                  // registered but unreachable from this device
     kNoFragments,                 // plan contributed no segments
     kTooFewFragments,             // < 2 in the bucket; one segment is hipMemcpy's best case
     kFragmentAtOrAboveThreshold,  // mean segment >= kGatherFragmentThreshold
@@ -159,9 +160,10 @@ class HbmCopyEngine final : public TransferEngine {
   std::vector<char> GatherEligiblePlans(const std::vector<TransferPlan>& plans,
                                         std::vector<GatherSkip>* skip_reasons);
 
-  // True when [ptr, ptr + size) is inside a completed registration, and so safe
-  // to hand to a kernel.  False is always the safe answer.
-  bool HostRegionCovers(const void* ptr, size_t size) const;
+  // The address `device_id` must use to reach `ptr`, or null when no registered
+  // region covers it or that device cannot gather from the one that does.
+  // Kernels take this, never the host pointer -- see HostTierRegistration.
+  void* HostRegionDeviceAddress(const void* ptr, size_t size, int device_id) const;
 
   mutable std::mutex host_regions_mutex_;
   std::vector<std::unique_ptr<HostTierRegistration>> host_regions_;
