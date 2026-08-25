@@ -282,6 +282,19 @@ class MediumBackend : public MetricSource {
   virtual std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
                                                   bool include_descs) = 0;
 
+  // Same lookup, but the result is shared rather than copied out.
+  //
+  // A layer-wise reader asks for the SAME key set once per layer group -- eight
+  // times over for DeepSeek-V4 -- changing only which bytes of each object it
+  // wants.  Handing back a shared, immutable result lets a medium that can
+  // prove the answer is unchanged return the previous one instead of rebuilding
+  // a page list per key.  The default just wraps BatchResolve, so a medium that
+  // cannot make that proof is unaffected.
+  virtual std::shared_ptr<const std::vector<ResolvedEntry>> BatchResolveShared(
+      const std::vector<std::string>& keys, bool include_descs) {
+    return std::make_shared<const std::vector<ResolvedEntry>>(BatchResolve(keys, include_descs));
+  }
+
   // Master-driven eviction.  Idempotent; see EvictResult::bytes_freed.  One
   // result per key, in request order — the peer service relies on that to sum
   // freed bytes for a key mirrored across media.

@@ -2485,7 +2485,13 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   // only keys nothing has claimed yet are carried to the next backend, so a
   // second medium is asked about exactly what the first one missed.
   std::vector<MediumBackend*> holders(n, nullptr);
-  std::vector<ResolvedEntry> resolutions(n);
+  // Pointers into the backend's own result rather than copies of it.  A
+  // layer-wise reader repeats one key set per layer group, so a medium can hand
+  // back the same shared answer each time; moving entries out would defeat that
+  // by rebuilding a page list per key on every group.  The results are held for
+  // the rest of the call so those pointers stay valid.
+  std::vector<const ResolvedEntry*> resolutions(n, nullptr);
+  std::vector<std::shared_ptr<const std::vector<ResolvedEntry>>> resolved_batches;
   {
     PhaseTimer resolve_timer(dbg ? &dbg->resolve : nullptr);
     std::vector<size_t> pending;
@@ -2500,16 +2506,17 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
       batch.clear();
       batch.reserve(pending.size());
       for (size_t i : pending) batch.push_back(keys[i]);
-      auto found = backend->BatchResolve(batch, /*include_descs=*/false);
+      auto found = backend->BatchResolveShared(batch, /*include_descs=*/false);
       still_missing.clear();
       for (size_t j = 0; j < pending.size(); ++j) {
-        if (j < found.size() && found[j].found) {
+        if (found != nullptr && j < found->size() && (*found)[j].found) {
           holders[pending[j]] = backend;
-          resolutions[pending[j]] = std::move(found[j]);
+          resolutions[pending[j]] = &(*found)[j];
         } else {
           still_missing.push_back(pending[j]);
         }
       }
+      resolved_batches.push_back(std::move(found));
       pending.swap(still_missing);
     }
   }
@@ -2518,11 +2525,12 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
     if (sizes[i].empty()) continue;  // asked for nothing; stays false
 
     MediumBackend* const holder = holders[i];
-    const ResolvedEntry& resolved = resolutions[i];
     if (holder == nullptr) {
       missed.push_back(i);
       continue;
     }
+    // Non-null exactly when a holder was recorded; the two are set together.
+    const ResolvedEntry& resolved = *resolutions[i];
     // The get API takes no object_sizes; the resolved entry is where the true
     // stored size becomes known.  First hit labels the call.
     if (dbg != nullptr && dbg->object_size == 0) {

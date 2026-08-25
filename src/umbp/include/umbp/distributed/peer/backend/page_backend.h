@@ -254,6 +254,8 @@ class PageBackend : public MediumBackend {
   std::vector<bool> BatchAbort(const std::vector<uint64_t>& slot_ids) override;
   std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
                                           bool include_descs) override;
+  std::shared_ptr<const std::vector<ResolvedEntry>> BatchResolveShared(
+      const std::vector<std::string>& keys, bool include_descs) override;
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys) override;
 
   uint64_t PageSize() const override { return page_size_; }
@@ -413,6 +415,40 @@ class PageBackend : public MediumBackend {
 
   std::unordered_map<uint64_t, PendingSlot> pending_;
   std::unordered_map<std::string, OwnedSlot> owned_;
+
+  // Bumped whenever an OWNED key's pages stop being that key's.  A cached
+  // resolve is only reusable while this has not moved: unchanged means no key
+  // was erased, which is what keeps the OwnedSlot pointers below valid
+  // (unordered_map keeps element pointers stable across rehash -- only
+  // iterators are invalidated) and what keeps the page lists accurate.
+  //
+  // Distinct from allocator_generation_, which only moves on ClearLocal.
+  uint64_t eviction_generation_ = 0;
+
+  // One layer group's worth of resolve, kept for the next group.
+  //
+  // A layer-wise reader sends the same key set once per group, so seven of
+  // every eight resolves rebuild an answer that is already correct. `keys` is
+  // compared in full on a hit -- the fingerprint only picks the candidate, so a
+  // collision costs a re-resolve and never a wrong page list. `slots` lets the
+  // hit renew each lease through a pointer instead of hashing the key again.
+  struct ResolveCacheEntry {
+    std::vector<std::string> keys;
+    std::vector<OwnedSlot*> slots;
+    std::shared_ptr<const std::vector<ResolvedEntry>> result;
+    uint64_t generation = 0;
+    bool include_descs = false;
+    uint64_t last_used = 0;
+  };
+  // Eight ranks times six pools are in flight at once on DSv4, so a single
+  // entry would thrash; this is sized to hold all of them with room over.
+  static constexpr size_t kResolveCacheCapacity = 64;
+  std::unordered_map<uint64_t, ResolveCacheEntry> resolve_cache_;
+  uint64_t resolve_cache_clock_ = 0;
+
+  // Caller MUST hold `mutex_`.
+  std::shared_ptr<const std::vector<ResolvedEntry>> ResolveBatchLocked(
+      const std::vector<std::string>& keys, bool include_descs);
   std::vector<KvEvent> pending_events_;
 
   // Auto-flush state (see QueueEventLocked):
