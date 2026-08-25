@@ -337,13 +337,9 @@ def _gda_signal(
     tl.static_assert(signal_op != 0, "GDA signal requires INC or ADD")
     if coop == 0:
         if signal_op == 1:
-            raw.gda_signal_thread_inc(
-                dev_comm, ctx, peer, signal_id, signal_val
-            )
+            raw.gda_signal_thread_inc(dev_comm, ctx, peer, signal_id, signal_val)
         else:
-            raw.gda_signal_thread_add(
-                dev_comm, ctx, peer, signal_id, signal_val
-            )
+            raw.gda_signal_thread_add(dev_comm, ctx, peer, signal_id, signal_val)
     elif coop == 1:
         if signal_op == 1:
             raw.gda_signal_warp_inc(dev_comm, ctx, peer, signal_id, signal_val)

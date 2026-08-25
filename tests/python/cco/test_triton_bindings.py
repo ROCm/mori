@@ -40,9 +40,7 @@ def test_all_cco_device_symbols_are_exported_to_triton():
 
 
 def test_triton_facades_match_flydsl_handle_names():
-    assert {"rank", "world_size", "lsa_rank", "lsa_size"} <= set(
-        vars(cco.DevComm)
-    )
+    assert {"rank", "world_size", "lsa_rank", "lsa_size"} <= set(vars(cco.DevComm))
     assert {"lsa_ptr"} <= set(vars(cco.Window))
     assert {
         "put",
@@ -55,9 +53,7 @@ def test_triton_facades_match_flydsl_handle_names():
         "flush",
         "flush_peer",
     } <= set(vars(cco.Gda))
-    assert {"put", "get", "commit", "quiet", "quiet_queue"} <= set(
-        vars(cco.Sdma)
-    )
+    assert {"put", "get", "commit", "quiet", "quiet_queue"} <= set(vars(cco.Sdma))
 
 
 def test_cov5_bitcode_contains_every_enabled_wrapper_symbol():
@@ -108,9 +104,7 @@ def test_flydsl_and_triton_share_the_same_scalar_abi():
         _bindings.cco_gda_reset_signal,
     ]
     by_symbol = {extern._symbol: extern for extern in externs}
-    assert set(by_symbol) == {
-        meta["symbol"] for meta in CCO_DEVICE_FUNCTIONS.values()
-    }
+    assert set(by_symbol) == {meta["symbol"] for meta in CCO_DEVICE_FUNCTIONS.values()}
     for meta in CCO_DEVICE_FUNCTIONS.values():
         extern = by_symbol[meta["symbol"]]
         assert extern._args == meta["args"]

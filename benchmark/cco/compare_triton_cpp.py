@@ -103,7 +103,9 @@ def resolve_cpp_binary(name: str, cpp_dir: str | None) -> Path:
     try:
         import mori
 
-        candidates.append(Path(mori.__file__).resolve().parent / "benchmarks" / "cco" / name)
+        candidates.append(
+            Path(mori.__file__).resolve().parent / "benchmarks" / "cco" / name
+        )
     except ImportError:
         pass
     for candidate in candidates:
@@ -183,7 +185,9 @@ def run_cpp_case(args, transport: str, op: str, metric: str) -> list[dict]:
         "-T",
         str(threads),
     ]
-    output = run_command(command, transport_env(os.environ.copy(), transport), args.timeout)
+    output = run_command(
+        command, transport_env(os.environ.copy(), transport), args.timeout
+    )
     rows = parse_cpp_table(output)
     if not rows:
         raise RuntimeError(f"no C++ results parsed from:\n{output}")
@@ -222,7 +226,9 @@ def run_triton_case(args, transport: str, op: str, metric: str) -> list[dict]:
         "--threads",
         str(threads),
     ]
-    output = run_command(command, transport_env(os.environ.copy(), transport), args.timeout)
+    output = run_command(
+        command, transport_env(os.environ.copy(), transport), args.timeout
+    )
     rows = parse_triton_json(output)
     if not rows:
         raise RuntimeError(f"no Triton results parsed from:\n{output}")
@@ -321,7 +327,9 @@ def main() -> int:
     if args.json_out:
         output = Path(args.json_out)
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(json.dumps({"results": rows, "comparisons": comparisons}, indent=2))
+        output.write_text(
+            json.dumps({"results": rows, "comparisons": comparisons}, indent=2)
+        )
     if args.markdown_out:
         output = Path(args.markdown_out)
         output.parent.mkdir(parents=True, exist_ok=True)

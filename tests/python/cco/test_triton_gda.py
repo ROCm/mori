@@ -32,8 +32,6 @@ def test_triton_cco_gda_matrix_single_rail():
         os.environ.get("MORI_CCO_TRITON_GDA_DEVICE")
         or os.environ.get("MORI_RDMA_DEVICES")
     ):
-        pytest.skip(
-            "GDA test needs MORI_CCO_TRITON_GDA_DEVICE or MORI_RDMA_DEVICES"
-        )
+        pytest.skip("GDA test needs MORI_CCO_TRITON_GDA_DEVICE or MORI_RDMA_DEVICES")
     output = run_triton_example("gda", timeout=240)
     assert "All CCO Triton gda tests PASSED" in output

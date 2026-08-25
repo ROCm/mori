@@ -79,9 +79,7 @@ _H2D, _D2H = 1, 2
 
 def _copy(dst, src, nbytes, kind):
     _check(
-        _get_hip_lib().hipMemcpy(
-            dst, src, ctypes.c_size_t(nbytes), ctypes.c_int(kind)
-        ),
+        _get_hip_lib().hipMemcpy(dst, src, ctypes.c_size_t(nbytes), ctypes.c_int(kind)),
         "hipMemcpy",
     )
 
@@ -293,17 +291,11 @@ def gda_put_variant_kernel(
 
     if signal_op != 0 and do_wait:
         if tc == 1:
-            cco.Gda.wait_signal(
-                dev_comm, signal_id, 1, coop=cco.CoopScope.WARP
-            )
+            cco.Gda.wait_signal(dev_comm, signal_id, 1, coop=cco.CoopScope.WARP)
         elif tc == 2:
-            cco.Gda.wait_signal(
-                dev_comm, signal_id, 1, coop=cco.CoopScope.BLOCK
-            )
+            cco.Gda.wait_signal(dev_comm, signal_id, 1, coop=cco.CoopScope.BLOCK)
         else:
-            cco.Gda.wait_signal(
-                dev_comm, signal_id, 1, coop=cco.CoopScope.THREAD
-            )
+            cco.Gda.wait_signal(dev_comm, signal_id, 1, coop=cco.CoopScope.THREAD)
 
 
 @triton.jit
@@ -439,9 +431,7 @@ def gda_put_value_variant_kernel(
         )
         cco.Gda.flush_peer(dev_comm, peer, coop=cco.CoopScope.THREAD)
     if signal_op != 0:
-        cco.Gda.wait_signal(
-            dev_comm, signal_id, 1, coop=cco.CoopScope.BLOCK
-        )
+        cco.Gda.wait_signal(dev_comm, signal_id, 1, coop=cco.CoopScope.BLOCK)
 
 
 @triton.jit
@@ -463,9 +453,7 @@ def gda_signal_variant_kernel(
         coop=scope,
     )
     cco.Gda.flush_peer(dev_comm, peer, coop=scope)
-    cco.Gda.wait_signal(
-        dev_comm, signal_id, signal_value, coop=scope
-    )
+    cco.Gda.wait_signal(dev_comm, signal_id, signal_value, coop=scope)
     tl.store(out, cco.Gda.read_signal(dev_comm, signal_id))
 
 
@@ -505,9 +493,9 @@ def check_payload(win, offset, source_rank, label):
     got = read_u32(win.local_ptr + offset, NUM_ELEMS)
     expected = expected_payload(source_rank)
     for index in (0, 1, NUM_ELEMS // 2, NUM_ELEMS - 1):
-        assert got[index] == expected[index], (
-            f"{label}: got[{index}]={got[index]}, expected={expected[index]}"
-        )
+        assert (
+            got[index] == expected[index]
+        ), f"{label}: got[{index}]={got[index]}, expected={expected[index]}"
 
 
 def test_query(dc, rank, world_size, extern_libs):

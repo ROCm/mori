@@ -75,7 +75,9 @@ def _make_extern(name: str, meta: dict):
         _rt=ret_type,
         _pure=is_pure,
     ):
-        cast_args = [tl.cast(arg, typ, _semantic=_semantic) for arg, typ in zip(args, _at)]
+        cast_args = [
+            tl.cast(arg, typ, _semantic=_semantic) for arg, typ in zip(args, _at)
+        ]
         return core.extern_elementwise(
             _LIB_NAME,
             "",

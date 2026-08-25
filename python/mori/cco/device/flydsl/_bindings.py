@@ -60,6 +60,7 @@ def _binding(name):
         pure=meta.get("pure", False),
     )
 
+
 # ── monomorphized op tables (keyed by tag) ──
 PUT = {
     f"{tc}__{s}": _binding(f"gda_put_{tc}_{s}")
@@ -77,14 +78,9 @@ SIGNAL = {
     for c in COOP_TAGS
     for s in ("inc", "add")
 }
-WAIT_SIGNAL = {
-    c: _binding(f"gda_wait_signal_{c}") for c in COOP_TAGS
-}
+WAIT_SIGNAL = {c: _binding(f"gda_wait_signal_{c}") for c in COOP_TAGS}
 FLUSH = {c: _binding(f"gda_flush_{c}") for c in ("warp", "block")}
-FLUSH_PEER = {
-    c: _binding(f"gda_flush_peer_{c}")
-    for c in ("warp", "block")
-}
+FLUSH_PEER = {c: _binding(f"gda_flush_peer_{c}") for c in ("warp", "block")}
 
 # ── SDMA ──
 
@@ -95,14 +91,8 @@ SDMA_XFER = {
     for s in ("thread", "warp", "block", "thread_ns", "warp_ns", "block_ns")
 }
 
-SDMA_QUIET = {
-    s: _binding(f"sdma_quiet_{s}")
-    for s in ("thread", "warp", "block")
-}
-SDMA_COMMIT = {
-    s: _binding(f"sdma_commit_{s}")
-    for s in ("thread", "warp", "block")
-}
+SDMA_QUIET = {s: _binding(f"sdma_quiet_{s}") for s in ("thread", "warp", "block")}
+SDMA_COMMIT = {s: _binding(f"sdma_commit_{s}") for s in ("thread", "warp", "block")}
 cco_sdma_quiet_queue = _binding("sdma_quiet_queue")
 
 # ── axis-free symbols ──

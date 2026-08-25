@@ -145,7 +145,9 @@ def _derived_geometry(args) -> tuple[int, int]:
         grid = 32
     threads = args.threads if args.threads is not None else 256
     if grid <= 0 or threads <= 0 or threads % 64 != 0:
-        raise ValueError("grid must be positive and threads must be a positive multiple of 64")
+        raise ValueError(
+            "grid must be positive and threads must be a positive multiple of 64"
+        )
     return grid, threads
 
 
@@ -333,7 +335,9 @@ def run(args) -> list[dict]:
                         "rail_mode": "single" if gda_enabled else None,
                     }
                     results.append(result)
-                    print("RESULT_JSON " + json.dumps(result, sort_keys=True), flush=True)
+                    print(
+                        "RESULT_JSON " + json.dumps(result, sort_keys=True), flush=True
+                    )
                 comm.barrier()
     finally:
         if dist.is_initialized():
