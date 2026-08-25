@@ -11,6 +11,7 @@ dist/*
 .pytest_cache
 __pycache__
 python/mori/_version.py
+python/mori/_rocm_build_info.py
 python/mori/_jit-sources/
 python/mori/*.so
 python/mori/cco/*.so

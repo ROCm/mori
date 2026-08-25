@@ -23,6 +23,11 @@
 #
 # MIT License
 
+from .._rocm_bootstrap import ensure_rocm_runtime as _ensure_rocm_runtime
+
+_ensure_rocm_runtime()
+del _ensure_rocm_runtime
+
 from .cco import (
     # Low-level Cython classes (prefer high-level wrappers below)
     UniqueId as _CyUniqueId,

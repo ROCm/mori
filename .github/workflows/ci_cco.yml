@@ -168,6 +168,8 @@ jobs:
             $CONTAINER bash -c "\
               cd $GITHUB_WORKSPACE && \
               timeout 300 pytest -v \
+                tests/python/cco/test_rocm_bootstrap.py \
+                tests/python/cco/test_rocm_import_order.py \
                 tests/python/cco/test_triton_bindings.py \
                 tests/python/cco/test_triton_lsa.py \
                 tests/python/cco/test_triton_sdma.py"
