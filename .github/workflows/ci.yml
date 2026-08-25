@@ -45,6 +45,9 @@ jobs:
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
+      # Force GPU RDMA registration via dma-buf (ibv_reg_dmabuf_mr) instead of
+      # ibv_reg_mr-first fallback — matches production AINIC GPU IO path.
+      MORI_ENABLE_DMABUF_REG: "1"
     timeout-minutes: 90
     steps:
       - name: Checkout
@@ -63,6 +66,7 @@ jobs:
             -e MORI_RDMA_SL=$MORI_RDMA_SL \
             -e MORI_RDMA_TC=$MORI_RDMA_TC \
             -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
+            -e MORI_ENABLE_DMABUF_REG=$MORI_ENABLE_DMABUF_REG \
             -e GLOO_SOCKET_IFNAME=$NODE1_IFNAME \
             -e NCCL_SOCKET_IFNAME=$NODE1_IFNAME \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
@@ -89,6 +93,7 @@ jobs:
               -e MORI_RDMA_SL=$MORI_RDMA_SL \
               -e MORI_RDMA_TC=$MORI_RDMA_TC \
               -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
+              -e MORI_ENABLE_DMABUF_REG=$MORI_ENABLE_DMABUF_REG \
               -e GLOO_SOCKET_IFNAME=$NODE2_IFNAME \
               -e NCCL_SOCKET_IFNAME=$NODE2_IFNAME \
               -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
@@ -132,6 +137,7 @@ jobs:
           {
             echo "=== MORI-IO bench_engine CI commands ==="
             echo "COMMON=${COMMON}"
+            echo "MORI_ENABLE_DMABUF_REG=${MORI_ENABLE_DMABUF_REG}"
             echo "GPU sweep: 0 1 2 3 4 5 6 7 (one GPU pair per run)"
             echo "NODE1_HOST=${NODE1_HOST} NODE2_HOST=${NODE2_HOST}"
             echo ""
@@ -141,10 +147,10 @@ jobs:
             ITERS=128
             if [ "$BATCH" -eq 1 ]; then ITERS=512; fi
             ARGS="$COMMON --gpu $GPU --transfer-batch-size $BATCH --iters $ITERS"
-            R1="cd $GITHUB_WORKSPACE && MORI_DISABLE_AUTO_XGMI=1 $LDP $BIN \
+            R1="cd $GITHUB_WORKSPACE && MORI_DISABLE_AUTO_XGMI=1 MORI_ENABLE_DMABUF_REG=1 $LDP $BIN \
               --rank 1 --master-ip $NODE1_HOST --self-ip $NODE2_HOST --port $PORT \
               --target-dev-offset 0 $ARGS"
-            R0="cd $GITHUB_WORKSPACE && MORI_DISABLE_AUTO_XGMI=1 $LDP $BIN \
+            R0="cd $GITHUB_WORKSPACE && MORI_DISABLE_AUTO_XGMI=1 MORI_ENABLE_DMABUF_REG=1 $LDP $BIN \
               --rank 0 --master-ip $NODE1_HOST --self-ip $NODE1_HOST --port $PORT \
               --target-dev-offset 0 $ARGS"
             {
