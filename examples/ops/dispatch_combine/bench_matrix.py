@@ -40,6 +40,14 @@ _own.add_argument("--quant-type", type=str, default="none")
 _own.add_argument("--out", type=str, default=None)
 _own.add_argument("--label", type=str, default="")
 _own.add_argument(
+    "--cuda-graph",
+    action="store_true",
+    help="Capture one dispatch+combine round into a HIP graph and replay it. "
+    "At small token counts the host submission path costs more than the GPU "
+    "work, so collapsing it into a single graph launch is the largest "
+    "end-to-end lever available.",
+)
+_own.add_argument(
     "--kineto",
     action="store_true",
     help="Per-kernel GPU time from the CUDA profiler. Unlike --profile-kernels "
@@ -252,6 +260,9 @@ def _kineto_breakdown(case, op, test_data, matrix, global_rank):
         _timed_trial(case, op, test_data, 5, dc, cc, False)   # warm
 
         def _round():
+            if OWN.barrier_per_round:
+                torch.cuda.synchronize()
+                dist.barrier()
             d = case.run_dispatch(op, ari_in[r], arw[r], ars[r], ari[r],
                                   block_num=dc[0], warp_per_block=dc[1], rdma_block_num=dc[2])
             case.run_combine(op, case._convert_for_combine(d[0]), None, ari[r],
@@ -296,6 +307,94 @@ def _kineto_breakdown(case, op, test_data, matrix, global_rank):
             print(f"{'TOTAL':<48}{tot_s:10.2f}{tot_m:10.2f}", flush=True)
 
 
+def _cuda_graph_bench(case, op, test_data, matrix, global_rank):
+    """Capture dispatch+combine into a HIP graph and time the replay."""
+    _, ari, ari_in, arw, ars = test_data
+    r = case.rank
+
+    for entry in matrix:
+        dc, cc = tuple(entry["disp"]), tuple(entry["comb"])
+
+        last = {}
+
+        def _round():
+            d = case.run_dispatch(op, ari_in[r], arw[r], ars[r], ari[r],
+                                  block_num=dc[0], warp_per_block=dc[1], rdma_block_num=dc[2])
+            out = case.run_combine(op, case._convert_for_combine(d[0]), None, ari[r],
+                                   block_num=cc[0], warp_per_block=cc[1], rdma_block_num=cc[2])
+            last["out"] = out[0] if isinstance(out, tuple) else out
+
+        # Warm up on a side stream first: capture refuses to record allocations
+        # and lazy init that have not happened yet.
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(5):
+                _round()
+        torch.cuda.current_stream().wait_stream(side)
+        torch.cuda.synchronize()
+        dist.barrier()
+
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph):
+                _round()
+        except Exception as e:
+            if global_rank == 0:
+                print(f"[{entry['name']}] graph capture FAILED: {type(e).__name__}: {e}",
+                      flush=True)
+            return
+
+        torch.cuda.synchronize()
+        dist.barrier()
+
+        # Correctness: eager result vs graph replay, same inputs.
+        _round()
+        torch.cuda.synchronize()
+        ref = last["out"].clone()
+        graph.replay()
+        torch.cuda.synchronize()
+        got = last["out"].clone()
+        ok = torch.equal(ref, got)
+        maxdiff = (ref.float() - got.float()).abs().max().item()
+        chk = torch.tensor([0.0 if ok else 1.0, maxdiff], dtype=torch.float64)
+        allchk = [torch.zeros(2, dtype=torch.float64) for _ in range(case.world_size)]
+        dist.all_gather(allchk, chk)
+        nbad = sum(1 for x in allchk if x[0].item() > 0)
+        worst = max(x[1].item() for x in allchk)
+        if global_rank == 0:
+            print(f"    graph-vs-eager: {case.world_size - nbad}/{case.world_size} ranks bit-exact,"
+                  f" max abs diff={worst:g}", flush=True)
+
+        # replay timing, same protocol as _timed_trial
+        results = []
+        for _ in range(OWN.trials):
+            ev0 = [torch.cuda.Event(enable_timing=True) for _ in range(OWN.rounds)]
+            ev1 = [torch.cuda.Event(enable_timing=True) for _ in range(OWN.rounds)]
+            torch.cuda.synchronize()
+            dist.barrier()
+            t0 = time.perf_counter()
+            for i in range(OWN.rounds):
+                ev0[i].record()
+                graph.replay()
+                ev1[i].record()
+            enq = (time.perf_counter() - t0) * 1e6 / OWN.rounds
+            torch.cuda.synchronize()
+            wall = (time.perf_counter() - t0) * 1e6 / OWN.rounds
+            per = statistics.mean([ev0[i].elapsed_time(ev1[i]) * 1000.0 for i in range(OWN.rounds)])
+            _, slow = _gather_mean(case, per)
+            results.append((slow, enq, wall))
+
+        if global_rank == 0:
+            rr = sorted(x[0] for x in results)
+            print(f"[{entry['name']}] HIP GRAPH disp={dc} comb={cc} tokens={OWN.max_tokens} "
+                  f"hidden={OWN.hidden_dim}", flush=True)
+            print(f"    round median={statistics.median(rr):8.2f} us   {[round(x,2) for x in rr]}",
+                  flush=True)
+            print(f"    cpu-enqueue/round={statistics.median([x[1] for x in results]):7.2f} us   "
+                  f"wall/round={statistics.median([x[2] for x in results]):7.2f} us", flush=True)
+
+
 def main(local_rank, num_node, gpu_per_node):
     node_rank = int(os.environ["RANK"])
     global_rank = node_rank * gpu_per_node + local_rank
@@ -316,6 +415,11 @@ def main(local_rank, num_node, gpu_per_node):
     test_data = case.gen_test_data(
         max_num_token=OWN.max_tokens, use_max_token_num=True, only_my_rank=True
     )
+
+    if OWN.cuda_graph:
+        _cuda_graph_bench(case, op, test_data, matrix, global_rank)
+        case.cleanup()
+        return
 
     if OWN.kineto:
         _kineto_breakdown(case, op, test_data, matrix, global_rank)

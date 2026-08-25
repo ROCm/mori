@@ -449,7 +449,60 @@ rank 1 → mlx5_2   rank 3 → mlx5_4   rank 5 → mlx5_7   rank 7 → mlx5_9
 > （`config.numQpPerPe`，kernel 选 qpId 用）是两个不同的东西。DeepEP 那条命令里
 > env=1 而脚本内部 config 写死 4，其实是不匹配的。
 
-### 5.8 双峰抖动（未解决）
+### 5.8 HIP graph：把 host 从关键路径上拿掉（有效）
+
+§5.7 第 3 条指出即使 GPU 侧优化完，端到端仍被 host 的 ~150us/轮卡住。用
+`torch.cuda.CUDAGraph` 把一轮 dispatch+combine 捕获成图再 replay，`bench_matrix.py --cuda-graph`：
+
+| 指标 | eager（3 次） | HIP graph（3 次） | 变化 |
+|---|---|---|---|
+| cpu-enqueue/轮 | 152.7 / 164.5 / 149.2 | **29.0 / 28.4 / 28.6** | **−82%** |
+| wall/轮 | 166.7 / 168.7 / 159.8 | 156.9 / 157.0 / 174.6 | −6% |
+
+**正确性：graph replay 与 eager 结果 16/16 rank 逐位相同（max abs diff = 0）。**
+
+wall 只降 6%，是因为 GPU 侧（136us）本来就贴着 host（150us），拿掉 host 后 GPU 立刻成为新的
+下限。但这一步的意义不在这 6%：
+
+> **捕获后 cpu-enqueue 29us ≪ wall 157us，瓶颈第一次完全落在 GPU 上。
+> 也就是说，从现在起 kernel 层面的任何优化才会真正反映到端到端。**
+
+在此之前所有 kernel 改动看不到收益，正是因为省下的 GPU 时间被 host 吸收掉了。
+
+注意 view 缓存（§5.3）是 graph 捕获能成功的前提之一：捕获期间每轮重建 tensor 视图会引入
+无法录制的 host 逻辑。
+
+### 5.9 LL kernel 那 ~50us 到底花在哪（消融实验）
+
+对 `EpDispatchInterNodeV1KernelLowLatency` 逐层砍掉功能，用 kineto 量（**这些改动会破坏
+正确性，只用于测量，已全部回退**）：
+
+| 变体 | dispatch LL mean | fastest | 该层成本 |
+|---|---|---|---|
+| 基线 | 55.5 us | 44.7 | — |
+| 去掉 recv 轮询等待 | 50.5 us | 41.5 | **等待 ≈ 5 us** |
+| 再去掉 RDMA put | 37.1 us | 34.9 | **put 发起 ≈ 13 us** |
+| 剩余 | **37.1 us** | 34.9 | **??? ≈ 32 us** |
+
+（对照：`EpDispatchCopyToStaging` 这种简单 kernel 是 4.7us，可视为空 kernel 底噪。）
+
+**这个结果推翻了"LL kernel 在等对端"的直觉：**
+
+1. **等待只占 5us。** 把轮询循环整个换成一次非阻塞探测，kernel 时间几乎不变。这也解释了
+   为什么 §5.2 的 `s_sleep` 退避完全无效——轮询根本不是瓶颈。
+2. **RDMA put 发起占 13us。** 对比裸 RDMA 全程 10.7us，GPU 侧发 WQE + doorbell 的代价确实
+   偏高，但不是主要矛盾。
+3. **剩下 ~32us 既不是等待也不是发送，也不是数据搬运**（dispatch 对 payload 完全不敏感）。
+   这是最大的一块，且目前**没有定位到**。嫌疑：kernel ramp（这个 kernel 体积远大于
+   CopyToStaging，i-cache 压力）、grid barrier 的竞争原子、recv 侧的记账原子
+   （`destPeTokenCounter`）。
+
+想进一步切分需要"kernel 开头直接 return"的消融，但那会让 combine 侧永久等待而死锁，
+这条路走不通。**下一步应该用 mori 内置的 `MORI_TRACE_SPAN` span profiler**（需要带
+`ENABLE_PROFILER` 重新编译 mori，当前安装的 pybind 没有该支持：
+`hasattr(mori.cpp, "get_debug_time_buf") == False`）。
+
+### 5.10 双峰抖动（未解决）
 
 约 **1/3** 的 run 会整体慢 1.7 倍，干净双峰、没有中间值：
 
@@ -466,7 +519,7 @@ rank 1 → mlx5_2   rank 3 → mlx5_4   rank 5 → mlx5_7   rank 7 → mlx5_9
 
 **实践影响：任何对比都要跑 ≥3 次取好模式，单次结果不可信。**
 
-### 5.9 改动清单
+### 5.11 改动清单
 
 修改：
 
