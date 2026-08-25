@@ -74,7 +74,9 @@ inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs<T>& args, in
 
   T* remoteTokenPtr = args.interNodeV1TokBufs.dispatchOut->template GetAs<T*>(destPe);
   const T* localTokenPtr = args.inpTokenBuf;
-  core::WarpCopy(remoteTokenPtr + destTokOffset, localTokenPtr + srcTokOffset, hiddenDim);
+  // Unroll 4 batches the latency-bound peer write into 4 KB steps instead of 1 KB. Payloads
+  // under 4 KB fall through to the Unroll=1 body, i.e. unchanged.
+  core::WarpCopy<T, 4>(remoteTokenPtr + destTokOffset, localTokenPtr + srcTokOffset, hiddenDim);
 
   index_t* remoteIndexPtr = args.shmemOutIndicesMemObj->template GetAs<index_t*>(destPe);
   const index_t* localIndexPtr = args.tokenIndices;
@@ -100,17 +102,19 @@ inline __device__ void DispatchIntraNode(EpDispatchCombineArgs<T>& args) {
       INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SPAN(profiler, Slot::DispatchIntra);
 
+  // Flat (token, expert) stride over every XGMI warp in the grid. Blocking by token instead
+  // starves most blocks whenever curRankNumToken < xgmiBlockNum: at 4 tokens / 16 XGMI blocks
+  // only 4 blocks got work and carried all 32 copies.
   int blockOffset = args.rdmaBlockNum;
   int xgmiBlockNum = blockNum - args.rdmaBlockNum;
-  int tokenPerBlock = (args.curRankNumToken + xgmiBlockNum - 1) / xgmiBlockNum;
-  int startTokenIdx = (blockId - blockOffset) * tokenPerBlock;
-  int endTokenIdx = std::min(startTokenIdx + tokenPerBlock, args.curRankNumToken);
+  int xgmiWarpId = (blockId - blockOffset) * warpNum + warpId;
+  int xgmiWarpNum = xgmiBlockNum * warpNum;
 
   int localPeTokenCounter = 0;
 
-  for (int i = warpId; i < (endTokenIdx - startTokenIdx) * config.numExpertPerToken; i += warpNum) {
-    index_t tokenId = i / config.numExpertPerToken + startTokenIdx;
-    index_t expertOffset = startTokenIdx * config.numExpertPerToken + i;
+  for (int i = xgmiWarpId; i < args.curRankNumToken * config.numExpertPerToken; i += xgmiWarpNum) {
+    index_t tokenId = i / config.numExpertPerToken;
+    index_t expertOffset = i;
     index_t destExpert = args.tokenIndices[expertOffset];
     if (destExpert < 0) {
       if (!args.replayMode && laneId == 0)
