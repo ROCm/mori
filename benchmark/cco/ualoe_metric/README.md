@@ -1,6 +1,18 @@
-# xGMI copy bandwidth: TDM vs CU
+# Link metrics between two GPUs
 
-How much of a GPU it costs to saturate one xGMI link, and at what transfer size that cost is worth
+Two questions about the link, answered by the two tools here:
+
+| tool | question |
+|---|---|
+| `ualoe_bw.cpp` | how much of a GPU it costs to *saturate* the link, and at what transfer size that is worth paying |
+| `ualoe_latency.cpp` | what *one* crossing costs, with nothing else in flight |
+
+Most of this document is about the first; the second is at the end under
+[One-operation latency](#one-operation-latency).
+
+## Copy bandwidth: TDM vs CU
+
+How much of a GPU it costs to saturate one link, and at what transfer size that cost is worth
 paying.
 
 The question is not "which transport is faster" -- at a full grid and a large payload they land
@@ -301,3 +313,50 @@ The `config` column in `results/` carries the batch, which is why near-duplicate
 `_pilot` is the earlier partial run at the same settings, and `_unified` is the re-measurement after the
 build moved to `tools/build_ualoe.sh`. They agree to 0.07% at 16 GB, but that is a result, not a licence
 to subtract rows across suffixes.
+
+## One-operation latency
+
+`ualoe_latency.cpp` answers the other half: not how fast a saturated link runs, but what a single
+crossing costs. One thread, one outstanding operation, each op followed by the wait that matches it,
+so an iteration is issue -> ack rather than an issue rate.
+
+```bash
+./ualoe_latency 0 -1        # local baseline: GPU 0 writing its own memory
+./ualoe_latency 0  1        # GPU 0 -> GPU 1
+# args: srcGpu  dstGpu (-1 = local)  iters  reps  stride
+```
+
+Run it twice and subtract. The local baseline is the identical loop against the issuing GPU's own
+memory, so **remote minus local** is the link and cancels the cost of the instruction itself.
+
+Eight modes, because no single one is valid on every architecture:
+
+| mode | what it measures |
+|---|---|
+| `global_store_b128` / `_b32`, `flat_store`, `buffer_store` | a bare store followed by the store wait |
+| `atomic_add(ret)` | a genuine round trip: the value cannot come back before the peer has answered |
+| `atomic_add(noret)` | the same without the return value |
+| `store+sysfence` | store plus a system-scope release |
+| `store+readback` | two crossings, as a check on the others |
+
+**The bare-store modes are only valid on gfx12.** There `s_wait_storecnt 0` is a real store counter
+and retires on acknowledgement. On gfx9 the equivalent is `s_waitcnt vmcnt(0)`, which retires when
+the store leaves the CU -- so those four rows read the same locally and remotely and their delta is
+meaningless. Use `store+sysfence` or `atomic_add` there; they agree with each other within about 1%,
+and `store+readback` lands at roughly twice their delta, which is the check that they are measuring a
+crossing at all.
+
+### Two clocks
+
+Every interval is timed with both counters at once:
+
+- `__builtin_readcyclecounter()` counts shader clocks, which move with DVFS, so cycles are only a
+  time once the clock for that run is known;
+- `wall_clock64()` is the constant-rate reference clock and needs no calibration.
+
+Their ratio has to come out as the shader clock. If it does not, one of the two is not measuring what
+it is assumed to, which is the point of reporting both.
+
+The constant clock's rate is measured against the host once per run rather than read from
+`hipDeviceAttributeWallClockRate`: that attribute reports 100000 kHz on gfx950 but **0 on gfx1250,
+returning `hipSuccess` either way**, so dividing by it silently yields infinity.
