@@ -189,6 +189,15 @@ jobs:
             cd $GITHUB_WORKSPACE && MORI_DISABLE_P2P=1 MORI_ENABLE_SDMA=0 timeout 300 pytest tests/python/ops/test_dispatch_combine_async_ll.py -v
           "
 
+      - name: MORI-EP (AUTO tuning config quant types, CPU)
+        run: |
+          # Pure mapping test: no GPU, no RDMA. Named explicitly because the
+          # only directory-level collection in this workflow is tests/python/io,
+          # so a file elsewhere under tests/python runs nowhere by default.
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE && timeout 60 pytest tests/python/test_tuning_config_quant_types.py -v
+          "
+
       - name: MORI-EP bench
         run: |
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "

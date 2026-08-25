@@ -88,12 +88,18 @@ _KERNEL_TYPE_NAMES = frozenset(
     {"IntraNode", "InterNode", "InterNodeV1", "InterNodeV1LL", "AsyncLL", "IntraNodeLL"}
 )
 
-_QUANT_TYPE_CONFIG_STRS = {
-    "none",
-    "fp8_direct_cast",
-    "fp8_blockwise",
-    "fp4_blockwise",
+# Single source for the quant-type mapping. Keyed by EpDispatchCombineQuantType
+# member name; the accepted config strings are derived rather than restated,
+# because holding the two in separate literals is what let them drift apart
+# (fp4_blockwise reached dispatch_combine.py but never the enum branch here).
+_QUANT_ENUM_TO_CONFIG_STR = {
+    "None_": "none",
+    "Fp8DirectCast": "fp8_direct_cast",
+    "Fp8BlockwiseQuant": "fp8_blockwise",
+    "Fp4BlockwiseQuant": "fp4_blockwise",
 }
+
+_QUANT_TYPE_CONFIG_STRS = frozenset(_QUANT_ENUM_TO_CONFIG_STR.values())
 
 
 def kernel_type_to_config_str(kernel_type) -> str:
@@ -117,14 +123,8 @@ def quant_type_to_config_str(quant_type) -> str:
             return "none"
     else:
         name = getattr(quant_type, "name", str(quant_type))
-        if name == "None_":
-            return "none"
-        if name == "Fp8DirectCast":
-            return "fp8_direct_cast"
-        if name == "Fp8BlockwiseQuant":
-            return "fp8_blockwise"
-        if name == "Fp4BlockwiseQuant":
-            return "fp4_blockwise"
+        if name in _QUANT_ENUM_TO_CONFIG_STR:
+            return _QUANT_ENUM_TO_CONFIG_STR[name]
     raise ValueError(f"Unknown quant_type: {quant_type!r}")
 
 
