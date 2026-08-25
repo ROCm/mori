@@ -133,6 +133,10 @@ def dtype_to_config_str(dtype: torch.dtype) -> str:
 _SUPPORTED_VERSION = "1.0"
 _TUNING_CONFIGS_DIR = Path(__file__).parent / "tuning_configs"
 
+# A re-tune must beat the recorded bandwidth by this much before it is allowed
+# to overwrite an existing rule. Keeps saved configs stable under noise.
+_SAVE_REL_MARGIN = 0.02
+
 _gpu_model_cache: str | None = None
 _gpu_model_detected: bool = False
 
@@ -609,7 +613,10 @@ class TuningConfigManager:
         if matched_idx is not None:
             old_bw = rules[matched_idx].get("bandwidth_gbps", 0)
             new_bw = entry.get("bandwidth_gbps", 0)
-            if new_bw > old_bw:
+            # Require a margin, not just any improvement: without it a re-tune
+            # that lands 0.01 GB/s higher purely on measurement noise rewrites
+            # the checked-in rule, so the file churns on every run.
+            if new_bw > old_bw * (1.0 + _SAVE_REL_MARGIN):
                 rules[matched_idx] = entry
                 logger.info(
                     "Updated %s rule for %s (%.2f -> %.2f GB/s)",

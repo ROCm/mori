@@ -46,9 +46,36 @@ _CLI_TO_KERNEL_TYPE_NAME = {
 
 _FP4_DTYPE = getattr(torch, "float4_e2m1fn_x2", None)
 
-# Bandwidth improvement must exceed this margin (GB/s) to update the best
-# config during tuning. Prevents config churn from run-to-run noise.
-_BW_NOISE_MARGIN = 1.0
+# Bandwidth improvement must exceed this *relative* margin to update the best
+# config during tuning. An absolute GB/s margin cannot work across the whole
+# operating range: 1.0 GB/s is ~40% of the total spread at 4 tokens (where the
+# whole sweep lives in 2-3 GB/s) and <2% at large token counts, so the same
+# constant is simultaneously far too strict and far too loose.
+_BW_REL_MARGIN = 0.02
+
+# Rounds benchmarked per config during tuning. Scored by median across rounds
+# (not mean) so a single stalled round cannot decide the winner.
+_TUNING_ROUNDS = 9
+
+
+def _beats(new_bw, new_cfg, best_bw, best_cfg):
+    """Should *new_cfg* replace *best_cfg* as the tuning winner?
+
+    A candidate wins outright only when it clears the relative noise margin.
+    Inside the margin the two are statistically indistinguishable, so we break
+    the tie deterministically on block_num (fewer CUs for the same bandwidth
+    leaves more of the GPU for overlapping work) instead of letting whichever
+    sample happened to land higher decide. Determinism matters as much as the
+    choice itself: it is what stops the saved JSON from churning between
+    equivalent configs on every re-tune.
+    """
+    if best_cfg is None:
+        return True
+    if new_bw > best_bw * (1.0 + _BW_REL_MARGIN):
+        return True
+    if new_bw >= best_bw * (1.0 - _BW_REL_MARGIN) and new_cfg[0] < best_cfg[0]:
+        return True
+    return False
 
 
 def _perf_report():
@@ -1493,7 +1520,7 @@ class EpDispatchCombineTestCase:
                         max_num_token,
                         op,
                         test_data,
-                        repeat=5,
+                        repeat=_TUNING_ROUNDS,
                         block_num=bn,
                         rdma_block_num=rdma_bn,
                         warp_per_block=warp,
@@ -1503,26 +1530,28 @@ class EpDispatchCombineTestCase:
                     # kept: (rounds, world_size, 6)
                     # cols: d_rdma, d_xgmi, d_lat, c_rdma, c_xgmi, c_lat
 
-                    # Selection: per-rank avg across kept rounds, min rank
-                    rank_means = kept.mean(dim=0)  # (world_size, 6)
+                    # Selection: per-rank median across kept rounds, min rank.
+                    # Median (not mean) so one stalled round cannot decide a config.
+                    rank_meds = kept.median(dim=0).values  # (world_size, 6)
                     if is_ll_kernel:
-                        disp_bw = (rank_means[:, 1] * ll_scale).min().item()
-                        comb_bw = (rank_means[:, 4] * ll_scale).min().item()
+                        disp_bw = (rank_meds[:, 1] * ll_scale).min().item()
+                        comb_bw = (rank_meds[:, 4] * ll_scale).min().item()
                     else:
-                        disp_bw = rank_means[:, 0].min().item()
-                        comb_bw = rank_means[:, 3].min().item()
+                        disp_bw = rank_meds[:, 0].min().item()
+                        comb_bw = rank_meds[:, 3].min().item()
 
                     # Stats via shared code (same as bench PrettyTable)
                     disp_stats = self._build_phase_stats(kept, 0, 1, 2, ll_scale)
                     comb_stats = self._build_phase_stats(kept, 3, 4, 5, ll_scale)
 
-                    if disp_bw > best_disp_bw + _BW_NOISE_MARGIN:
+                    cand = (bn, warp, rdma_bn)
+                    if _beats(disp_bw, cand, best_disp_bw, best_disp_config):
                         best_disp_bw = disp_bw
-                        best_disp_config = (bn, warp, rdma_bn)
+                        best_disp_config = cand
                         best_disp_stats = disp_stats
-                    if comb_bw > best_comb_bw + _BW_NOISE_MARGIN:
+                    if _beats(comb_bw, cand, best_comb_bw, best_comb_config):
                         best_comb_bw = comb_bw
-                        best_comb_config = (bn, warp, rdma_bn)
+                        best_comb_config = cand
                         best_comb_stats = comb_stats
 
                     if self.rank == 0:
