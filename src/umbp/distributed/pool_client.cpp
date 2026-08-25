@@ -296,6 +296,18 @@ class RangedStats {
     EmitComponentsLocked();
   }
 
+  // The cadence emit only fires when a call lands more than one window after
+  // the previous one, so a measured phase shorter than the cadence reports no
+  // line at all -- indistinguishable from the instrumentation being off -- and
+  // the final partial window of a long run is lost the same way.
+  void FlushFinal() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (get_.calls == 0 && put_.calls == 0) return;
+    Emit("GET", get_);
+    Emit("PUT", put_);
+    EmitComponentsLocked();
+  }
+
  private:
   struct Totals {
     uint64_t calls = 0;
@@ -351,7 +363,14 @@ class RangedStats {
 };
 
 RangedStats& RangedStatsInstance() {
-  static RangedStats* stats = new RangedStats();
+  // Deliberately leaked: a destructor here would run at static-destruction
+  // time, after singletons it logs through may be gone. atexit gives back the
+  // final flush the leak would otherwise cost, and runs before those teardowns.
+  static RangedStats* stats = [] {
+    auto* created = new RangedStats();
+    std::atexit([] { RangedStatsInstance().FlushFinal(); });
+    return created;
+  }();
   return *stats;
 }
 
