@@ -301,11 +301,63 @@ This copies the current GPU states to the `globalGpuStates` symbol in the dynami
 | `MORI_RDMA_SL` | RDMA service level | Auto |
 | `MORI_RDMA_TC` | RDMA traffic class | Auto |
 | `MORI_DISABLE_P2P` | Disable P2P (XGMI) transport, force RDMA | Not set |
+| `MORI_ENABLE_RAIL_ONLY` | Only create RDMA QPs to same-rail peers (same index within their node). For rail-isolated fabrics where cross-rail QPs cannot be established. See [Rail-only connections](#rail-only-connections). | Not set |
 | `MORI_DISABLE_TOPO` | Disable topology detection | Not set |
 | `MORI_IGNORE_CPU_AFFINITY` | By default the thread calling `ShmemInit` is pinned to the CPUs local to its GPU (sysfs `local_cpulist`, intersected with the existing cpuset). Set to `1` to disable and leave CPU placement to an outer `numactl`/`torchrun`. Works in SPMT (single-process multi-GPU) too: each per-GPU init thread pins to its own GPU's NUMA node. | Not set (binding on) |
 | `MORI_GLOBAL_LOG_LEVEL` | Global log verbosity: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | `INFO` |
 | `MORI_PRECOMPILE` | Precompile all JIT kernels on import | Not set |
 | `MORI_DISABLE_JIT` | Disable JIT compilation of device bitcode | Not set |
+
+---
+
+## Rail-only connections
+
+By default `Context` builds a full mesh: every cross-node peer gets
+`MORI_NUM_QP_PER_PE` queue pairs. On a **rail-isolated** fabric only NICs on
+the same rail can reach each other, so the cross-rail QPs never reach RTR and
+init hangs — even though no kernel would ever have used them.
+
+`MORI_ENABLE_RAIL_ONLY=1` restricts QP creation to same-rail peers. Two ranks are
+on the same rail when they have the same index within their own node, which is
+the same relation the EP internode kernels already encode in their proxy:
+
+```cpp
+// src/ops/dispatch_combine/internode_v1.cpp
+int proxyPe = i * config.gpuPerNode + (config.rank % config.gpuPerNode);
+```
+
+On a 2-node × 8-GPU job this takes each rank from 8 cross-node peers (32 QPs at
+4 QP/PE) down to 1 (4 QPs). Skipped peers keep the same empty endpoint stubs
+already used for non-RDMA peers, so `rdmaEps` indexing is unchanged; the
+predicate is symmetric, so both ends stub each other and the handle AllToAll
+stays aligned.
+
+**This is opt-in, and only safe for kernels whose cross-node traffic is
+same-rail.**
+
+| Path | Cross-node RDMA target | Rail-only safe |
+|------|------------------------|----------------|
+| EP `InterNodeV1` / `InterNodeV1LL` | `proxyPe` | yes |
+| EP `InterNode` (v0) | arbitrary `destPe` | no |
+| EP `AsyncLL` | arbitrary `destPe` | no |
+| CCO with `CCO_GDA_CONNECTION_RAIL` | same rail | yes |
+| CCO with `FULL` / `CROSSNODE` | arbitrary peer | no |
+
+Requirements checked at init — if any fails, mori logs an error and falls back
+to the full mesh rather than mis-pairing ranks:
+
+- node sizes are uniform,
+- ranks are node-major contiguous (`rankInNode == rank % gpuPerNode`), which is
+  what the EP proxy formula above assumes.
+
+Same-host peers are never dropped: their RDMA loopback (used only under
+`MORI_DISABLE_P2P`) does not traverse the fabric.
+
+To confirm it took effect, look for this line from each rank:
+
+```
+rail-only: rank 3 rail 3 created QPs to 1 peers (4 QPs): 11
+```
 
 ---
 

@@ -150,6 +150,19 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
         "for communication, which provides little overlap benefit and can severely degrade "
         "performance. Use a non-AsyncLL kernel path or set MORI_ENABLE_SDMA=1.");
   }
+  // MORI_ENABLE_RAIL_ONLY wires up same-rail QPs only. InterNodeV1/V1LL funnel all
+  // cross-node traffic through their same-rail proxy PE, so they are fine;
+  // InterNode v0 and AsyncLL post straight to `destExpert / numExpertPerRank`,
+  // which lands on an unconnected QP and hangs. Fail at construction instead.
+  // CCO path (!useCcoComm) is excluded: CCO has its own CCO_GDA_CONNECTION_RAIL.
+  if (!useCcoComm && config.worldSize > config.gpuPerNode && ShmemRailOnly() &&
+      (config.kernelType == KernelType::InterNode || config.kernelType == KernelType::AsyncLL)) {
+    throw std::runtime_error(
+        "MORI_ENABLE_RAIL_ONLY is set, but kernelType=" +
+        std::to_string(static_cast<int>(config.kernelType)) +
+        " (InterNode v0 / AsyncLL) sends cross-node RDMA to arbitrary PEs, which have no QP in "
+        "rail-only mode. Use InterNodeV1 or InterNodeV1LL, or unset MORI_ENABLE_RAIL_ONLY.");
+  }
   if (config.maxTotalRecvTokens > 0) {
     int worstCase = config.worldSize * config.maxNumInpTokenPerRank;
     if (config.maxTotalRecvTokens > worstCase) {
