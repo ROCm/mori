@@ -90,6 +90,20 @@ def detect_gpu_arch(rocm_path: str = "/opt/rocm") -> str:
     )
 
 
+def detect_wave_size() -> int:
+    """Return the wavefront width for the current GPU (32 or 64).
+
+    Override with MORI_WAVE_SIZE.  Falls back to 64 when detection fails.
+    """
+    v = os.environ.get("MORI_WAVE_SIZE")
+    if v:
+        return int(v)
+    try:
+        return 32 if detect_gpu_arch().startswith("gfx12") else 64
+    except Exception:
+        return 64
+
+
 def _find_tool(rocm_path: str, name: str) -> str:
     """Locate a ROCm LLVM tool, raising FileNotFoundError if missing."""
     candidates = [

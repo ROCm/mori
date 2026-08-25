@@ -50,6 +50,9 @@ from typing import Callable
 import torch
 
 from mori.tensor_utils import from_gpu_ptr
+from mori.jit.config import detect_wave_size
+
+WAVE = detect_wave_size()
 
 # Where each backend lives. Imported lazily, on selection only.
 _BACKEND_MODULES = {"flydsl": "flydsl_backend", "hip": "hip_backend"}
@@ -128,12 +131,6 @@ class EpDispatchCombineConfig:
             )
         if self.quant_type != "none":
             self.combine_mode = "scatter"
-        # The dispatch grid barrier resets inside a `range(lane, npes, 64)` loop,
-        # correct only while each lane runs it once (npes <= wavefront).
-        if self.world_size > 64:
-            raise ValueError(
-                f"intranode op supports world_size <= 64, got {self.world_size}"
-            )
         # Token copy moves whole 16 B (vec4) chunks; a non-16 B-aligned per-token
         # size would over-read/write a few dwords past the token.
         if self.token_nbytes % 16 != 0:
@@ -232,6 +229,22 @@ class EpDispatchCombineConfig:
                 self.warp_num_per_block = 16
             if self.combine_warp_num_per_block is None:
                 self.combine_warp_num_per_block = 4
+
+        # Precise world_size check against the resolved geometry.  The combine
+        # xdb barrier polls with `tid < npes`, so every schedule bucket must
+        # have blockDim (= comb_warp * WAVE) >= world_size.
+        if self.schedule:
+            min_comb_warp = min(bucket[4] for bucket in self.schedule)
+        else:
+            min_comb_warp = self.combine_warp_num_per_block
+        max_peers = min_comb_warp * WAVE
+        if self.world_size > max_peers:
+            raise ValueError(
+                f"world_size ({self.world_size}) exceeds the smallest combine "
+                f"blockDim in the schedule ({min_comb_warp} warps × {WAVE}-wide "
+                f"wave = {max_peers} threads); the `tid < npes` barrier requires "
+                f"world_size <= blockDim"
+            )
 
     @property
     def is_scatter(self):

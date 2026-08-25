@@ -72,25 +72,9 @@ import mori.cco.device.flydsl as cco
 
 from . import flydsl_prims as P
 
-# Wavefront size: gfx9 (MI300/MI350) = 64, gfx12 (MI400/gfx1250) = 32. Detected
-# once per process; override with MORI_WAVE_SIZE. get_warp_size(gfx1250) wrongly
-# reports 64, so key off the arch string.
-import os as _os
+from mori.jit.config import detect_wave_size
 
-
-def _detect_wave_size():
-    v = _os.environ.get("MORI_WAVE_SIZE")
-    if v:
-        return int(v)
-    try:
-        from mori.jit.config import detect_gpu_arch
-
-        return 32 if detect_gpu_arch().startswith("gfx12") else 64
-    except Exception:
-        return 64
-
-
-WAVE = _detect_wave_size()
+WAVE = detect_wave_size()
 LANE_MASK = WAVE - 1
 LOG2_WAVE = WAVE.bit_length() - 1
 _BALLOT_INT = T.i64 if WAVE == 64 else T.i32
@@ -348,10 +332,11 @@ def make_dispatch(
                 P.atomic_add_global(fx.Int64(addr_disp_bar), arith.constant(1))
 
             local_recv_num = fx.Int64(window.lsa_ptr(my_lsa_rank, off_recv_num))
+            if global_warp_id == 0:
+                P.spin_until_eq_i32(fx.Int64(addr_disp_bar), block_num)
+                buffer_store(arith.constant(0), rsrc_disp_bar, 0)
             for dest_pe in range(lane, npes, WAVE):
                 if global_warp_id == 0:
-                    P.spin_until_eq_i32(fx.Int64(addr_disp_bar), block_num)
-                    buffer_store(arith.constant(0), rsrc_disp_bar, 0)
                     signal_value = (
                         buffer_load(rsrc_dest_ctr, dest_pe, vec_width=1, dtype=T.i32())
                         + 1
