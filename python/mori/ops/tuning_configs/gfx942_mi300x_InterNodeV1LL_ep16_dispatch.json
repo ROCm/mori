@@ -1,0 +1,49 @@
+{
+  "version": "1.0",
+  "gpu_arch": "gfx942",
+  "gpu_model": "mi300x",
+  "kernel_type": "InterNodeV1LL",
+  "ep_size": 16,
+  "phase": "dispatch",
+  "rules": [
+    {
+      "dtype": "fp8_e4m3_fnuz",
+      "num_tokens": 4,
+      "hidden_dim": 6144,
+      "block_num": 32,
+      "rdma_block_num": 16,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 3.16,
+      "avg_rdma_bandwidth_gbps": 0.98,
+      "avg_xgmi_bandwidth_gbps": 3.27,
+      "avg_ll_bandwidth_gbps": 3.74,
+      "avg_latency_us": 50.01
+    },
+    {
+      "dtype": "fp8_e4m3_fnuz",
+      "num_tokens": 8,
+      "hidden_dim": 6144,
+      "block_num": 32,
+      "rdma_block_num": 16,
+      "warp_per_block": 6,
+      "bandwidth_gbps": 6.7,
+      "avg_rdma_bandwidth_gbps": 1.98,
+      "avg_xgmi_bandwidth_gbps": 6.43,
+      "avg_ll_bandwidth_gbps": 8.06,
+      "avg_latency_us": 49.76
+    },
+    {
+      "dtype": "fp8_e4m3_fnuz",
+      "num_tokens": 16,
+      "hidden_dim": 6144,
+      "block_num": 32,
+      "rdma_block_num": 16,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 14.09,
+      "avg_rdma_bandwidth_gbps": 3.86,
+      "avg_xgmi_bandwidth_gbps": 12.6,
+      "avg_ll_bandwidth_gbps": 15.97,
+      "avg_latency_us": 51.05
+    }
+  ]
+}
