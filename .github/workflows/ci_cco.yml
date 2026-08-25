@@ -170,8 +170,16 @@ jobs:
               timeout 300 pytest -v \
                 tests/python/cco/test_triton_bindings.py \
                 tests/python/cco/test_triton_lsa.py \
-                tests/python/cco/test_triton_sdma.py \
-                tests/python/cco/test_triton_benchmark.py"
+                tests/python/cco/test_triton_sdma.py"
+
+      - name: Run CCO Triton benchmark tests
+        run: |
+          $CT exec \
+            -e MORI_ENABLE_SDMA=1 \
+            -e BUILD_CCO_SDMA=ON \
+            $CONTAINER bash -c "\
+              cd $GITHUB_WORKSPACE && \
+              timeout 300 pytest -v tests/python/cco/test_triton_benchmark.py"
 
       - name: Run CCO Triton GDA tests (single AINIC rail)
         run: |
