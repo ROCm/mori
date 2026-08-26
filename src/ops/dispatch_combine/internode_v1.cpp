@@ -762,6 +762,49 @@ inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
   }
 }
 
+// Announce to the peer GPUs on this node that our combineInp is populated, then
+// wait for theirs.
+//
+// This is EpCombineSyncBarrier, which used to be its own grid=1 single-warp
+// launch sitting between EpCombineSync and the combine body purely to get a
+// grid-wide ordering point. Running it in the last block of EpCombineSync to
+// arrive gives the same ordering -- every other block has passed its fence
+// before the counter reaches blockNum, and the kernel cannot retire until this
+// block does -- for one launch less.
+template <typename T>
+inline __device__ void CombineSyncBarrierInLastBlock(EpDispatchCombineArgs<T>& args) {
+  DEF_COMMON_VARS;
+
+  __syncthreads();
+  if (thdId == 0) __threadfence_system();
+  __syncthreads();
+
+  __shared__ int sIsLastBlock;
+  if (thdId == 0) {
+    int prev = atomicAdd(args.combineGridBarrier, 1);
+    sIsLastBlock = ((prev + 1) == blockNum);
+  }
+  __syncthreads();
+  if (!sIsLastBlock || (warpId != 0)) return;
+
+  if (laneId == 0)
+    __hip_atomic_store(args.combineGridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+
+  uint64_t barrierFlag = 0;
+  if (laneId == 0) barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
+  barrierFlag = __shfl(barrierFlag, 0);
+
+  uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
+  if (laneId < config.gpuPerNode) {
+    int destPe = myNode * config.gpuPerNode + laneId;
+    core::AtomicStoreRelaxedSystem(
+        args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>(destPe) + args.config.rank,
+        barrierFlag);
+    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + destPe) != barrierFlag) {
+    }
+  }
+}
+
 namespace combine_impl {
 
 // Gathering a token from its experts reads from up to numExpertPerToken peer
@@ -1515,6 +1558,19 @@ __device__ void EpCombineSync_body(EpDispatchCombineArgs<T> args) {
 template <typename T>
 __global__ void EpCombineSync(EpDispatchCombineArgs<T> args) {
   EpCombineSync_body<T>(args);
+}
+
+// EpCombineSync + EpCombineSyncBarrier in one launch, for the low-latency path.
+// The non-LL path still launches the two separately.
+template <typename T>
+__device__ void EpCombineSyncLL_body(EpDispatchCombineArgs<T> args) {
+  v1::CombineSync(args);
+  v1::CombineSyncBarrierInLastBlock(args);
+}
+
+template <typename T>
+__global__ void EpCombineSyncLL(EpDispatchCombineArgs<T> args) {
+  EpCombineSyncLL_body<T>(args);
 }
 
 template <typename T>

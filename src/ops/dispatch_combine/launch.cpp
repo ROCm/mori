@@ -612,9 +612,8 @@ void LaunchCombine(EpDispatchCombineHandle& handle, void* input, void* weights, 
       reg.Launch(std::string("EpCombineAll_") + sfx, mp, block_x, smem, stream, &args, args_size);
       break;
     case KernelType::InterNodeV1LL:
-      reg.Launch(std::string("EpCombineSync_") + sfx, mp, block_x, 0, stream, &args, args_size);
-      reg.Launch(std::string("EpCombineSyncBarrier_") + sfx, 1, WARP_SIZE, 0, stream, &args,
-                 args_size);
+      // EpCombineSyncLL folds in the grid=1 EpCombineSyncBarrier launch.
+      reg.Launch(std::string("EpCombineSyncLL_") + sfx, mp, block_x, 0, stream, &args, args_size);
       reg.Launch(std::string("EpCombineInterNodeV1KernelLowLatency_") + sfx, bn, block_x, smem,
                  stream, &args, args_size);
       reg.Launch(std::string("EpCombineAll_") + sfx, mp, block_x, smem, stream, &args, args_size);
