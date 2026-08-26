@@ -137,7 +137,8 @@ std::string EncodeLogicalCaps(
     out += std::to_string(logical.capacity.total_bytes) + ':';
     out += std::to_string(logical.capacity.available_bytes) + ':';
     out += std::to_string(logical.capacity.max_allocatable_bytes) + ':';
-    out += logical.put_eligible ? "1;" : "0;";
+    out += logical.put_eligible ? "1:" : "0:";
+    out += std::to_string(logical.peak_member_utilization) + ';';
   }
   return out;
 }
@@ -160,14 +161,20 @@ std::map<std::string, LogicalTierCapacity> DecodeLogicalCaps(
       }
       const std::string name = blob.substr(name_begin, name_size);
       pos = name_begin + name_size + 1;
-      std::array<std::string, 5> fields;
-      for (size_t i = 0; i < fields.size(); ++i) {
-        const char delimiter = i + 1 == fields.size() ? ';' : ':';
-        const size_t end = blob.find(delimiter, pos);
-        if (end == std::string::npos) throw std::invalid_argument("logical caps");
-        fields[i] = blob.substr(pos, end - pos);
-        pos = end + 1;
+      const size_t record_end = blob.find(';', pos);
+      if (record_end == std::string::npos) {
+        throw std::invalid_argument("logical caps");
       }
+      std::vector<std::string> fields;
+      while (pos < record_end) {
+        const size_t field_end = std::min(blob.find(':', pos), record_end);
+        fields.push_back(blob.substr(pos, field_end - pos));
+        pos = field_end + 1;
+      }
+      if (fields.size() != 5 && fields.size() != 6) {
+        throw std::invalid_argument("logical caps");
+      }
+      pos = record_end + 1;
       LogicalTierCapacity logical;
       logical.representative_tier =
           static_cast<TierType>(std::stoi(fields[0]));
@@ -175,6 +182,9 @@ std::map<std::string, LogicalTierCapacity> DecodeLogicalCaps(
       logical.capacity.available_bytes = std::stoull(fields[2]);
       logical.capacity.max_allocatable_bytes = std::stoull(fields[3]);
       logical.put_eligible = fields[4] == "1";
+      if (fields.size() == 6) {
+        logical.peak_member_utilization = std::stod(fields[5]);
+      }
       caps[name] = logical;
     } catch (const std::exception&) {
       break;
