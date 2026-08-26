@@ -140,9 +140,12 @@ def dtype_to_config_str(dtype: torch.dtype) -> str:
 _SUPPORTED_VERSION = "1.0"
 _TUNING_CONFIGS_DIR = Path(__file__).parent / "tuning_configs"
 
-# A re-tune must beat the recorded bandwidth by this much before it is allowed
-# to overwrite an existing rule. Keeps saved configs stable under noise.
-_SAVE_REL_MARGIN = 0.02
+# Relative improvement a re-tune must show before it overwrites an existing
+# rule. Default 0: any improvement wins, matching the tuner's own default so a
+# tuning run that finds something faster actually persists it. Set
+# MORI_EP_TUNING_MARGIN to require a real margin instead, which keeps the
+# checked-in JSON from churning when a re-tune only lands higher on noise.
+_SAVE_REL_MARGIN = float(os.environ.get("MORI_EP_TUNING_MARGIN", "0.0"))
 
 _gpu_model_cache: str | None = None
 _gpu_model_detected: bool = False
