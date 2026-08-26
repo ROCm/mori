@@ -95,12 +95,10 @@ namespace mori::umbp {
 //   a control-plane change, and it is why the staging arena should be sized for
 //   the read concurrency, not for one page.
 //
-// LIMIT: ONE KEY, ONE PAGE.  A key larger than page_size is refused at
-// BatchAllocate.  In distributed mode master's page_size IS the KV block size
-// so 1 key == 1 page (the same assumption LocalCopyEngine documents), and a
-// contiguous staging page is what PeerSsdManager::PrepareRead requires — it
-// takes a single (ptr, capacity), not a scatter list.  Lifting this means a
-// scatter-gather PrepareRead, not a change to this class's shape.
+// A key may span several staging pages.  Runs are contiguous inside the one
+// registered arena because PeerSsdManager::PrepareRead takes one (ptr,
+// capacity), while AllocateResult / ResolvedEntry publish every page so the
+// ordinary transfer path can address the object at page granularity.
 class SsdBackend : public MediumBackend {
  public:
   struct Config {
@@ -108,9 +106,9 @@ class SsdBackend : public MediumBackend {
     // batch spanning media stays self-describing only if every medium agrees.
     uint64_t page_size = 2ULL * 1024 * 1024;
 
-    // Staging pages held in host DRAM.  This is the backend's concurrency
-    // limit: in-flight writes + leased reads cannot exceed it, and a Resolve
-    // that cannot get one degrades to a miss (see the class comment).
+    // Staging pages held in host DRAM.  This is the backend's aggregate
+    // in-flight capacity: an object of N pages consumes N entries until its
+    // write commits or its read lease expires.
     uint32_t staging_pages = 64;
 
     // Back the staging arena with hugetlbfs pages.  Every byte this backend
@@ -188,24 +186,30 @@ class SsdBackend : public MediumBackend {
   void RunReaperOnceForTest() { ReaperSweep(); }
 
  private:
-  // A staging page borrowed for a write (pending slot) or a read (lease).
+  struct StagingSpan {
+    uint32_t first_page = 0;
+    uint32_t page_count = 0;
+  };
+
+  // A contiguous staging span borrowed for a write (pending slot) or read.
   struct PendingSlot {
     uint64_t slot_id = 0;
     std::string key;
-    uint32_t page_index = 0;
+    StagingSpan span;
     uint64_t size = 0;
     std::chrono::steady_clock::time_point deadline;
   };
 
   struct ReadLease {
-    uint32_t page_index = 0;
+    StagingSpan span;
     uint64_t size = 0;
     std::chrono::steady_clock::time_point expires_at;
   };
 
-  // Caller MUST hold mutex_.  Returns UINT32_MAX when the arena is exhausted.
-  uint32_t AcquireStagingPageLocked();
-  void ReleaseStagingPageLocked(uint32_t page_index);
+  // Caller MUST hold mutex_.  A zero-length result means no contiguous run of
+  // the requested size is currently available.
+  StagingSpan AcquireStagingSpanLocked(uint32_t page_count);
+  void ReleaseStagingSpanLocked(StagingSpan span);
 
   // Local address of a staging page.  Valid after Init.
   void* StagingPagePtr(uint32_t page_index) const;
@@ -233,7 +237,7 @@ class SsdBackend : public MediumBackend {
   uint64_t staging_size_ = 0;
   TransferRef buffer_ref_;
   std::vector<uint8_t> buffer_desc_;
-  std::vector<uint32_t> free_pages_;  // stack of free page indices
+  std::vector<bool> staging_page_used_;
 
   std::unordered_map<uint64_t, PendingSlot> pending_;
   std::unordered_map<std::string, ReadLease> read_leases_;

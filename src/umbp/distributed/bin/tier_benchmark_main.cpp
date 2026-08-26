@@ -56,8 +56,8 @@ struct Options {
   // Parsed once by LoadPolicy; the clients lower it per node rather than
   // reading and reparsing the file.
   std::optional<mori::umbp::BackendPolicyConfig> policy;
-  // The policy puts values on a medium that stores one value per page.
-  bool page_limited_medium = false;
+  // Largest object that can fit one SSD backend's contiguous staging arena.
+  uint64_t max_ssd_staging_object_bytes = std::numeric_limits<uint64_t>::max();
   bench::SyntheticWorkloadConfig workload;
   bench::WorkloadRunnerOptions runner;
   std::string profile = "mixed";
@@ -253,6 +253,7 @@ bench::SyntheticProfile ParseProfile(const std::string& name) {
   UsageError("invalid --profile: " + name);
 }
 void ValidateOptions(Options* options) {
+  if (options->page_size == 0) UsageError("--page-size must be positive");
   options->workload.profile = ParseProfile(options->profile);
   if (options->size_distribution == "fixed") {
     options->workload.value_size_distribution = bench::ValueSizeDistribution::kFixed;
@@ -288,16 +289,14 @@ void ValidateOptions(Options* options) {
   if (options->get_strategy != "local" && options->get_strategy != "random") {
     UsageError("--get-strategy must be local or random");
   }
-  if (options->page_size == 0) UsageError("--page-size must be positive");
   if (options->policy_path.empty() && options->backend_capacity < options->page_size) {
     UsageError("--backend-capacity must be at least --page-size");
   }
-  // An SSD backend stores one value per page, so a value larger than the page
-  // can never land. For a replay the authoritative sizes are in the events, and
-  // the trace scan checks them there.
-  if (options->page_limited_medium && options->command != "replay" &&
-      options->workload.max_value_size > options->page_size) {
-    UsageError("SSD values must not exceed --page-size");
+  // For a replay the authoritative sizes are in the events, and the trace scan
+  // checks them there.
+  if (options->command != "replay" &&
+      options->workload.max_value_size > options->max_ssd_staging_object_bytes) {
+    UsageError("SSD values must not exceed the contiguous staging arena");
   }
 }
 // Reads --config once. The clients lower it again per node for their own
@@ -305,6 +304,7 @@ void ValidateOptions(Options* options) {
 // starts, and to tell the rest of the run what media it will be writing to.
 void LoadPolicy(Options* options) {
   if (options->policy_path.empty()) return;
+  if (options->page_size == 0) UsageError("--page-size must be positive");
   auto loaded = mori::umbp::LoadBackendPolicyFile(options->policy_path);
   if (!loaded.ok()) UsageError("invalid --config: " + loaded.error);
   options->policy = std::move(*loaded.config);
@@ -318,9 +318,19 @@ void LoadPolicy(Options* options) {
   if (lowered.backends.size() > mori::umbp::kMaxBackendsPerPeer) {
     UsageError("--config expands beyond the per-peer backend limit");
   }
-  options->page_limited_medium = std::any_of(
-      lowered.backends.begin(), lowered.backends.end(),
-      [](const BackendInstanceConfig& backend) { return backend.tier == TierType::SSD; });
+  for (const auto& backend : lowered.backends) {
+    if (backend.tier != TierType::SSD) continue;
+    const uint64_t pages = backend.ssd_staging_buffer_slots > 0
+                               ? static_cast<uint64_t>(backend.ssd_staging_buffer_slots)
+                               : 16;
+    if (pages > std::numeric_limits<uint64_t>::max() / options->page_size) {
+      UsageError("SSD staging arena size overflows uint64");
+    }
+    const uint64_t ssd_capacity = backend.ssd.ssd.capacity_bytes;
+    options->max_ssd_staging_object_bytes =
+        std::min({options->max_ssd_staging_object_bytes, pages * options->page_size,
+                  ssd_capacity});
+  }
 }
 void AddTraceMetadata(const Options& options,
                       ::umbp::benchmark::WorkloadTraceHeader* header) {
@@ -630,8 +640,8 @@ void InspectReplayTrace(Options* options) {
     has_events = true;
     ++event_count;
     max_client = std::max(max_client, event.client_id());
-    if (options->page_limited_medium && event.value_size() > options->page_size) {
-      UsageError("trace contains an SSD value larger than --page-size");
+    if (event.value_size() > options->max_ssd_staging_object_bytes) {
+      UsageError("trace contains an SSD value larger than the contiguous staging arena");
     }
   }
   options->workload.operation_count = event_count;
