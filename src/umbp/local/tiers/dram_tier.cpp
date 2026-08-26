@@ -1097,12 +1097,29 @@ std::vector<bool> DRAMTier::ReadBatchRangesIntoPtr(
     if (job.copied) ++copied[job.idx];
   }
 
-  std::lock_guard<std::mutex> lru_lock(lru_mu_);
-  for (size_t i = 0; i < n; ++i) {
-    if (expected[i] != 0 && copied[i] == expected[i]) {
-      results[i] = true;
-      TouchLRU(keys[i]);
+  // TouchLRU is the expensive half of the per-key work this path does: it
+  // hashes the key twice more (lru_map_ lookup and insert) and copies it into
+  // the LRU list, all under a second mutex.  A repeat of a key set already at
+  // the front does not reorder anything among those keys -- the first pass put
+  // them there, and re-fronting them in the same order is a no-op -- so the
+  // repeats skip it.
+  //
+  // This is an eviction-policy nuance, not a correctness one: if another
+  // caller fronts different keys between two groups of the same restore, those
+  // keys end up marginally more recent than they would have been. No read can
+  // return wrong bytes as a result.
+  if (cached_slots == nullptr) {
+    std::lock_guard<std::mutex> lru_lock(lru_mu_);
+    for (size_t i = 0; i < n; ++i) {
+      if (expected[i] != 0 && copied[i] == expected[i]) {
+        results[i] = true;
+        TouchLRU(keys[i]);
+      }
     }
+    return results;
+  }
+  for (size_t i = 0; i < n; ++i) {
+    if (expected[i] != 0 && copied[i] == expected[i]) results[i] = true;
   }
   return results;
 }
