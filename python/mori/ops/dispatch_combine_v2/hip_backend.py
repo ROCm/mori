@@ -218,29 +218,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             bad.append(f"quant_type={cfg.quant_type!r}")
         if cfg.enable_std_moe:
             bad.append("enable_std_moe")
-        flydsl_only = {
-            "dispatch_fp8_blockwise": cfg.dispatch_fp8_blockwise,
-            "sdma_token_copy": cfg.sdma_token_copy,
-            "prefetch_route_payload": cfg.prefetch_route_payload,
-            "defer_dest_ctr_atomic": cfg.defer_dest_ctr_atomic,
-            "use_tok_off_total_recv": cfg.use_tok_off_total_recv,
-            "uncached_token_store": cfg.uncached_token_store,
-            "uncached_metadata_store": cfg.uncached_metadata_store,
-            "replay_fast_path": cfg.replay_fast_path,
-            "token_centric_dispatch": cfg.token_centric_dispatch,
-            "token_centric_rotate_peer_order": cfg.token_centric_rotate_peer_order,
-            "rotate_dispatch_slot_order": cfg.rotate_dispatch_slot_order,
-            "rotate_combine_peer_order": cfg.rotate_combine_peer_order,
-        }
-        bad.extend(name for name, enabled in flydsl_only.items() if enabled)
+        if cfg.dispatch_fp8_blockwise:
+            bad.append("dispatch_fp8_blockwise")
         if cfg.uncached_token_store_max_tokens:
             bad.append("uncached_token_store_max_tokens")
         if cfg.uncached_metadata_store_max_tokens:
             bad.append("uncached_metadata_store_max_tokens")
-        if cfg.token_centric_min_tokens or cfg.token_centric_max_tokens:
-            bad.append("token_centric token thresholds")
-        if cfg.token_centric_schedule:
-            bad.append("token_centric_schedule")
         # The kernel walks the source scale rows with the PADDED dword stride, so
         # a caller row that is not itself a whole number of dwords would be read
         # at the wrong pitch. _scale_i32 rounds up, which hides that from the Cfg

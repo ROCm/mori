@@ -110,11 +110,6 @@ _MI355X_SCHED_BF16_NO_CACHE_HINT = (
     (4096, 160, 8, 32, 16),
     (None, 128, 16, 48, 16),
 )
-_MI355X_TOKEN_CENTRIC_BF16 = (
-    (512, 64, 8),
-    (1024, 96, 8),
-    (4096, 160, 8),
-)
 # Preserve the pre-existing plan for topk=6 and untuned shapes. On the measured
 # topk=6 / 384-expert shape, 64x8 regresses 112-token dispatch by 3.5%.
 _MI355X_SCHED_BF16_BASE = (
@@ -186,9 +181,7 @@ _MI355X_DEFAULT = dict(
 _MI355X_TABLE = {
     (8, 7168, 8): {
         "bf16": (
-            _MI355X_SCHED_BF16
-            if HAS_BUFFER_OPS
-            else _MI355X_SCHED_BF16_NO_CACHE_HINT
+            _MI355X_SCHED_BF16 if HAS_BUFFER_OPS else _MI355X_SCHED_BF16_NO_CACHE_HINT
         ),
         "fp8": _MI355X_SCHED_FP8,
         "bf16_disp_fp8bw": _MI355X_SCHED_BF16_DISP_FP8BW,
@@ -199,30 +192,12 @@ _MI355X_TABLE = {
         # 256. Cached stores recover the large-message write-combining path.
         "_options": {
             "bf16": {
-                "use_tok_off_total_recv": True,
-                "replay_fast_path": True,
                 "uncached_token_store_max_tokens": 512 if HAS_BUFFER_OPS else 0,
-                "uncached_metadata_store_max_tokens": (
-                    256 if HAS_BUFFER_OPS else 0
-                ),
-                # Workgroup-per-token load-once/store-many wins from 512
-                # through the largest measured bucket. Keep small tokens and
-                # >4096 on the work-centric kernel.
-                "token_centric_min_tokens": 512 if HAS_BUFFER_OPS else 0,
-                "token_centric_max_tokens": 4096 if HAS_BUFFER_OPS else 0,
-                "token_centric_schedule": (
-                    _MI355X_TOKEN_CENTRIC_BF16
-                    if HAS_BUFFER_OPS
-                    else None
-                ),
-                "token_centric_rotate_peer_order": HAS_BUFFER_OPS,
+                "uncached_metadata_store_max_tokens": (256 if HAS_BUFFER_OPS else 0),
             },
             "bf16_disp_fp8bw": {
-                "use_tok_off_total_recv": True,
-                "replay_fast_path": True,
                 "uncached_token_store_max_tokens": 4096,
                 "uncached_metadata_store_max_tokens": 256,
-                "token_centric_rotate_peer_order": True,
             },
         },
     },
@@ -359,9 +334,7 @@ def lookup_analytical(world_size, hidden_dim, topk, dtype="bf16"):
     elem_bytes = {"bf16": 2.0, "fp8": 1.0, "fp4": 0.5}.get(dtype, 1.0)
     expected = expected_unique_peers(world_size, topk)
     ref_expected = expected_unique_peers(8, 8)
-    volume_scale = (
-        hidden_dim * elem_bytes * expected
-    ) / (7168.0 * 2.0 * ref_expected)
+    volume_scale = (hidden_dim * elem_bytes * expected) / (7168.0 * 2.0 * ref_expected)
     volume_scale = max(volume_scale, 1.0 / 16.0)
 
     def threshold(ref):

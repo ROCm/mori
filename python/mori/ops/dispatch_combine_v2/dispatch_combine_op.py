@@ -91,11 +91,8 @@ class EpDispatchCombineConfig:
     # "gather" (UseP2PRead) or "scatter" (mori _nop2p, fp8 compression home).
     combine_mode: str = "gather"
     quant_type: str = "none"  # none | fp8_direct_cast | fp8_blockwise
-    # Experimental BF16-input -> FP8-wire blockwise quantization in dispatch.
+    # Fused BF16-input -> FP8-wire blockwise quantization in dispatch.
     dispatch_fp8_blockwise: bool = False
-    # Experimental token-centric payload offload through the CCO SDMA engine.
-    sdma_token_copy: bool = False
-    sdma_queue_count: int = 8
     # Geometry: None => the tuned schedule for this device/shape/dtype; pin any of
     # these to opt out. Combine keeps its own warp count -- its K-deep per-lane MLP
     # saturates sooner than dispatch's copy.
@@ -108,25 +105,11 @@ class EpDispatchCombineConfig:
     # distinct (block, warp) variants and picks one at runtime from
     # cur_rank_num_token. None => auto (from tuning_configs) or single-shot fallback.
     schedule: tuple = None
-    geometry_mode: str = "hybrid"  # table | analytical | hybrid
     enable_std_moe: bool = False
     max_total_recv_tokens: int = 0  # mori maxTotalRecvTokens; 0 = worst-case ws*M
-    # FlyDSL dispatch policy / A-B experiment switches.
-    prefetch_route_payload: bool = False
-    defer_dest_ctr_atomic: bool = False
-    use_tok_off_total_recv: bool = False
-    uncached_token_store: bool = False
-    uncached_metadata_store: bool = False
+    # Size-gated FlyDSL cache policy populated by the tuning table.
     uncached_token_store_max_tokens: int = 0
     uncached_metadata_store_max_tokens: int = 0
-    replay_fast_path: bool = False
-    token_centric_dispatch: bool = False
-    token_centric_rotate_peer_order: bool = False
-    token_centric_min_tokens: int = 0
-    token_centric_max_tokens: int = 0
-    token_centric_schedule: tuple = None
-    rotate_dispatch_slot_order: bool = False
-    rotate_combine_peer_order: bool = False
     # Which kernel backend serves this op: "flydsl" (default, full feature set)
     # or "hip" (HIP/JIT, bf16/fp32 gather only). None = MORI_V2_KERNEL_BACKEND,
     # else the default. Only consulted when constructing the BASE class; naming a
@@ -164,22 +147,8 @@ class EpDispatchCombineConfig:
                     "dispatch_fp8_blockwise requires symmetric BF16 input/output, "
                     "combine_mode='gather', quant_type='none', and StdMoE disabled"
                 )
-            self.token_centric_dispatch = True
-        if self.sdma_token_copy:
-            if (
-                self.dispatch_dtype not in (torch.bfloat16, torch.float32)
-                or self.dispatch_fp8_blockwise
-            ):
-                raise ValueError(
-                    "sdma_token_copy supports plain BF16/F32 dispatch payloads only"
-                )
-            if not 1 <= self.sdma_queue_count <= 8:
-                raise ValueError("sdma_queue_count must be in [1, 8]")
-            self.token_centric_dispatch = True
         if self.quant_type != "none":
             self.combine_mode = "scatter"
-        if self.rotate_combine_peer_order and self.combine_mode != "gather":
-            raise ValueError("rotate_combine_peer_order requires combine_mode='gather'")
         # Token copy moves whole 16 B (vec4) chunks; a non-16 B-aligned per-token
         # size would over-read/write a few dwords past the token.
         if self.token_nbytes % 16 != 0:
@@ -261,20 +230,11 @@ class EpDispatchCombineConfig:
                     lookup_analytical,
                 )
 
-                mode = os.environ.get("MORI_EPV2_GEOMETRY", self.geometry_mode)
-                if mode not in ("table", "analytical", "hybrid"):
-                    raise ValueError(
-                        "MORI_EPV2_GEOMETRY must be table|analytical|hybrid, "
-                        f"got {mode!r}"
-                    )
-                use_analytical = mode == "analytical" or (
-                    mode == "hybrid"
-                    and not has_tuned_entry(
-                        self.world_size,
-                        self.hidden_dim,
-                        self.num_experts_per_token,
-                        dtype=self.dtype_str,
-                    )
+                use_analytical = not has_tuned_entry(
+                    self.world_size,
+                    self.hidden_dim,
+                    self.num_experts_per_token,
+                    dtype=self.dtype_str,
                 )
                 resolver = lookup_analytical if use_analytical else lookup
                 t = resolver(
@@ -302,18 +262,11 @@ class EpDispatchCombineConfig:
                     t.update(
                         {k: v for k, v in table_cfg.items() if k not in geometry_keys}
                     )
-                self.geometry_mode = mode
             self.dispatch_block_num = t["dispatch_block_num"]
             self.combine_block_num = t["combine_block_num"]
             self.warp_num_per_block = t["warp_num_per_block"]
             self.combine_warp_num_per_block = t["combine_warp_num_per_block"]
             self.schedule = t["schedule"]
-            self.use_tok_off_total_recv = self.use_tok_off_total_recv or bool(
-                t.get("use_tok_off_total_recv", False)
-            )
-            self.replay_fast_path = self.replay_fast_path or bool(
-                t.get("replay_fast_path", False)
-            )
             self.uncached_token_store_max_tokens = max(
                 self.uncached_token_store_max_tokens,
                 int(t.get("uncached_token_store_max_tokens", 0)),
@@ -321,20 +274,6 @@ class EpDispatchCombineConfig:
             self.uncached_metadata_store_max_tokens = max(
                 self.uncached_metadata_store_max_tokens,
                 int(t.get("uncached_metadata_store_max_tokens", 0)),
-            )
-            self.token_centric_min_tokens = max(
-                self.token_centric_min_tokens,
-                int(t.get("token_centric_min_tokens", 0)),
-            )
-            self.token_centric_max_tokens = max(
-                self.token_centric_max_tokens,
-                int(t.get("token_centric_max_tokens", 0)),
-            )
-            if self.token_centric_schedule is None:
-                self.token_centric_schedule = t.get("token_centric_schedule")
-            self.token_centric_rotate_peer_order = (
-                self.token_centric_rotate_peer_order
-                or bool(t.get("token_centric_rotate_peer_order", False))
             )
         else:
             # explicit geometry: fill any unset field with the single-shot default
@@ -741,22 +680,6 @@ class EpDispatchCombineOp:
 
     # -- shared: variant selection -----------------------------------------
 
-    def _use_token_centric(self, num_tokens):
-        if self.cfg.token_centric_dispatch:
-            return True
-        lo = self.cfg.token_centric_min_tokens
-        hi = self.cfg.token_centric_max_tokens
-        return lo > 0 and num_tokens >= lo and (hi <= 0 or num_tokens <= hi)
-
-    def _token_centric_spec(self, num_tokens, fallback):
-        schedule = self.cfg.token_centric_schedule
-        if not schedule:
-            return fallback
-        for max_tok, block, warp in schedule:
-            if max_tok is None or num_tokens <= max_tok:
-                return block, warp
-        return schedule[-1][1], schedule[-1][2]
-
     def _pick(self, num_tokens):
         """((disp_block, disp_warp), (comb_block, comb_warp)) for a runtime token
         count via the per-token schedule; falls back to the single-shot specs
@@ -778,8 +701,6 @@ class EpDispatchCombineOp:
                 disp_spec, comb_spec = (last[1], last[2]), (last[3], last[4])
         else:
             disp_spec, comb_spec = self._dispatch_specs[0], self._combine_specs[0]
-        if self._use_token_centric(num_tokens):
-            disp_spec = self._token_centric_spec(num_tokens, disp_spec)
         if disp_spec not in self._kernels.dispatch:
             disp_spec = self._dispatch_specs[-1]
         if comb_spec not in self._kernels.combine:

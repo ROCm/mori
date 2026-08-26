@@ -112,30 +112,9 @@ def make_dispatch(
     enable_signal=True,
     replay=False,
     fp4=False,
-    prefetch_route_payload=False,
-    defer_dest_ctr_atomic=False,
-    rotate_dispatch_slot_order=False,
-    use_tok_off_total_recv=False,
     uncached_token_store=False,
     uncached_metadata_store=False,
-    replay_fast_path=False,
-    token_centric_rotate_peer_order=False,
-    dispatch_fp8_blockwise=False,
-    off_disp_quant_scales=0,
-    dispatch_quant_scale_dim=0,
-    sdma_token_copy=False,
-    off_tok_staging=0,
-    sdma_queue_count=8,
 ):
-    del (
-        token_centric_rotate_peer_order,
-        dispatch_fp8_blockwise,
-        off_disp_quant_scales,
-        dispatch_quant_scale_dim,
-        sdma_token_copy,
-        off_tok_staging,
-        sdma_queue_count,
-    )
     # fp4 (e2m1) packs 2 values per byte, so a token is hidden_dim/2 bytes; dispatch
     # is a pure byte mover (no fp4 decode), matching mori v1's plain-fp4 path.
     nbytes = hidden_dim // 2 if fp4 else hidden_dim * hidden_elem_size
@@ -150,7 +129,7 @@ def make_dispatch(
     enable_scales = scale_bytes > 0
     token_store_cache_modifier = 3 if uncached_token_store else 0
     metadata_store_cache_modifier = 3 if uncached_metadata_store else 0
-    direct_tok_off_total = use_tok_off_total_recv and not replay
+    direct_tok_off_total = not replay
 
     @flyc.kernel(known_block_size=[warp_num_per_block * WAVE, 1, 1])
     def ep_dispatch(
@@ -178,8 +157,6 @@ def make_dispatch(
         my_lsa_rank: Int32,
         # Actual number of source tokens in this invocation (<= max_tok_per_rank).
         inp_cur_tok: Int32,
-        # Device-resident ccoDevComm pointer; 0 on the normal LSA path.
-        dev_comm: Int64,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -199,119 +176,56 @@ def make_dispatch(
         # ── Phase 1: P2P-scatter each (src_tok, k_slot) to its dest PE ──
         for logical_work_idx in range(global_warp_id, work_limit, global_warp_num):
             src_tok = logical_work_idx // experts_per_token
-            logical_k_slot = logical_work_idx % experts_per_token
-            if const_expr(rotate_dispatch_slot_order):
-                # A per-token bijection: all original top-k slots are still
-                # processed exactly once, but concurrent ranks/tokens begin at
-                # different slots instead of issuing slot 0 in lockstep.
-                slot_phase = (src_tok + rank) % experts_per_token
-                k_slot = (logical_k_slot + slot_phase) % experts_per_token
-                work_idx = src_tok * experts_per_token + k_slot
-            else:
-                k_slot = logical_k_slot
-                work_idx = logical_work_idx
-            prefetched_weight = arith.constant(0.0, type=T.f32())
-            prefetched_idx = arith.constant(0)
-            if const_expr(replay and replay_fast_path):
-                # The cached map already contains both destination PE and slot;
-                # sentinel entries encode duplicate/overflow work. Replaying
-                # therefore needs neither route decoding nor a dedup ballot.
-                cached_v = buffer_load(
-                    rsrc_tok_map, work_idx, vec_width=1, dtype=T.i32()
-                )
-                cached = readlane(T.i32(), cached_v, 0)
+            k_slot = logical_work_idx % experts_per_token
+            work_idx = logical_work_idx
+
+            # Dedup: one token routed to several experts on the SAME dest PE
+            # must be sent only once. Lower lanes inspect earlier top-k slots.
+            dest_expert = buffer_load(
+                rsrc_inp_idx, work_idx, vec_width=1, dtype=T.i32()
+            )
+            safe_lane = arith.select(lane < k_slot, lane, 0)
+            lane_expert = buffer_load(
+                rsrc_inp_idx,
+                src_tok * experts_per_token + safe_lane,
+                vec_width=1,
+                dtype=T.i32(),
+            )
+            dest_pe = dest_expert // experts_per_rank
+            lane_dest_pe = lane_expert // experts_per_rank
+            peer_base = fx.Int64(window.lsa_ptr(dest_pe, 0))
+            dup_per_lane = arith.select(
+                lane_dest_pe == dest_pe,
+                arith.select(lane < k_slot, lane, WAVE),
+                WAVE,
+            )
+            dup_ballot = ballot(_BALLOT_INT(), dup_per_lane < WAVE)
+            no_dup = dup_ballot == 0
+            is_dup = dup_ballot != 0
+
+            if const_expr(replay):
+                cached = buffer_load(rsrc_tok_map, work_idx, vec_width=1, dtype=T.i32())
                 is_dup_or_overflow = cached >= sentinel_val
                 do_publish = cached < sentinel_val
-                decoded_pe = cached // max_recv
-                dest_pe = arith.select(do_publish, decoded_pe, arith.constant(0))
-                dest_tok_id = arith.select(
-                    do_publish, cached - decoded_pe * max_recv, arith.constant(0)
-                )
-                peer_base = fx.Int64(window.lsa_ptr(dest_pe, 0))
-                if const_expr(prefetch_route_payload):
-                    if lane < experts_per_token:
-                        if do_publish:
-                            prefetch_off = src_tok * experts_per_token + lane
-                            prefetched_weight = buffer_load(
-                                rsrc_inp_wts,
-                                prefetch_off,
-                                vec_width=1,
-                                dtype=T.f32(),
-                            )
-                            prefetched_idx = buffer_load(
-                                rsrc_inp_idx,
-                                prefetch_off,
-                                vec_width=1,
-                                dtype=T.i32(),
-                            )
+                dest_tok_id = cached - dest_pe * max_recv
             else:
-                # Dedup: one token routed to several experts on the SAME dest PE
-                # must be sent only once. Lower lanes inspect earlier top-k slots.
-                dest_expert = buffer_load(
-                    rsrc_inp_idx, work_idx, vec_width=1, dtype=T.i32()
+                dest_tok_lane0 = arith.constant(0)
+                if lane == 0:
+                    if no_dup:
+                        peer_tok_off = peer_base + fx.Int64(off_tok_off)
+                        dest_tok_lane0 = P.atomic_add_global(peer_tok_off, fx.Int32(1))
+                dest_tok_id = readlane(T.i32(), dest_tok_lane0, 0)
+                overflow = dest_tok_id >= max_recv
+                is_dup_or_overflow = arith.select(is_dup, is_dup, overflow)
+                in_cap = dest_tok_id < max_recv
+                do_publish = arith.select(no_dup, in_cap, no_dup)
+                tok_map_entry = arith.select(
+                    is_dup_or_overflow,
+                    sentinel_val,
+                    dest_pe * max_recv + dest_tok_id,
                 )
-                safe_lane = arith.select(lane < k_slot, lane, 0)
-                lane_expert = buffer_load(
-                    rsrc_inp_idx,
-                    src_tok * experts_per_token + safe_lane,
-                    vec_width=1,
-                    dtype=T.i32(),
-                )
-                dest_pe = dest_expert // experts_per_rank
-                lane_dest_pe = lane_expert // experts_per_rank
-                peer_base = fx.Int64(window.lsa_ptr(dest_pe, 0))
-                dup_per_lane = arith.select(
-                    lane_dest_pe == dest_pe,
-                    arith.select(lane < k_slot, lane, WAVE),
-                    WAVE,
-                )
-                dup_ballot = ballot(_BALLOT_INT(), dup_per_lane < WAVE)
-                no_dup = dup_ballot == 0
-                is_dup = dup_ballot != 0
-                if const_expr(prefetch_route_payload):
-                    if lane < experts_per_token:
-                        if no_dup:
-                            prefetch_off = src_tok * experts_per_token + lane
-                            prefetched_weight = buffer_load(
-                                rsrc_inp_wts,
-                                prefetch_off,
-                                vec_width=1,
-                                dtype=T.f32(),
-                            )
-                            prefetched_idx = buffer_load(
-                                rsrc_inp_idx,
-                                prefetch_off,
-                                vec_width=1,
-                                dtype=T.i32(),
-                            )
-
-                if const_expr(replay):
-                    cached = buffer_load(
-                        rsrc_tok_map, work_idx, vec_width=1, dtype=T.i32()
-                    )
-                    is_dup_or_overflow = cached >= sentinel_val
-                    do_publish = cached < sentinel_val
-                    dest_tok_id = cached - dest_pe * max_recv
-                else:
-                    dest_tok_lane0 = arith.constant(0)
-                    if lane == 0:
-                        if no_dup:
-                            peer_tok_off = peer_base + fx.Int64(off_tok_off)
-                            dest_tok_lane0 = P.atomic_add_global(
-                                peer_tok_off, fx.Int32(1)
-                            )
-                    dest_tok_id = readlane(T.i32(), dest_tok_lane0, 0)
-                    overflow = dest_tok_id >= max_recv
-                    is_dup_or_overflow = arith.select(is_dup, is_dup, overflow)
-                    in_cap = dest_tok_id < max_recv
-                    do_publish = arith.select(no_dup, in_cap, no_dup)
-                    tok_map_entry = arith.select(
-                        is_dup_or_overflow,
-                        sentinel_val,
-                        dest_pe * max_recv + dest_tok_id,
-                    )
-                    if lane == 0:
-                        buffer_store(tok_map_entry, rsrc_tok_map, work_idx)
+                if lane == 0:
+                    buffer_store(tok_map_entry, rsrc_tok_map, work_idx)
 
             if lane == 0:
                 if do_publish:
@@ -325,9 +239,7 @@ def make_dispatch(
                         dest_tok_id,
                         cache_modifier=metadata_store_cache_modifier,
                     )
-                    if const_expr(
-                        not defer_dest_ctr_atomic and not direct_tok_off_total
-                    ):
+                    if const_expr(replay):
                         dest_ctr_addr = fx.Int64(addr_dest_pe_ctr) + fx.Int64(
                             dest_pe
                         ) * fx.Int64(4)
@@ -337,25 +249,18 @@ def make_dispatch(
             if lane < experts_per_token:
                 if do_publish:
                     weight_src_off = src_tok * experts_per_token + lane
-                    if const_expr(prefetch_route_payload):
-                        # Values carried through the dynamic dedup branch are
-                        # FlyDSL expression wrappers; recover raw MLIR values
-                        # expected by bitcast/buffer_store.
-                        weight_val = arith.unwrap(prefetched_weight)
-                        idx_val = arith.unwrap(prefetched_idx)
-                    else:
-                        weight_val = buffer_load(
-                            rsrc_inp_wts,
-                            weight_src_off,
-                            vec_width=1,
-                            dtype=T.f32(),
-                        )
-                        idx_val = buffer_load(
-                            rsrc_inp_idx,
-                            weight_src_off,
-                            vec_width=1,
-                            dtype=T.i32(),
-                        )
+                    weight_val = buffer_load(
+                        rsrc_inp_wts,
+                        weight_src_off,
+                        vec_width=1,
+                        dtype=T.f32(),
+                    )
+                    idx_val = buffer_load(
+                        rsrc_inp_idx,
+                        weight_src_off,
+                        vec_width=1,
+                        dtype=T.i32(),
+                    )
                     dest_slot = dest_tok_id * experts_per_token + lane
                     peer_wts = peer_base + fx.Int64(off_out_wts)
                     buffer_store(
@@ -393,16 +298,6 @@ def make_dispatch(
                             dest_tok_id * scale_num_i32 + k_off,
                             cache_modifier=metadata_store_cache_modifier,
                         )
-
-            if const_expr(defer_dest_ctr_atomic and not direct_tok_off_total):
-                # Keep the atomic ahead of the long token copy so its completion
-                # can overlap useful VMEM work before the Phase-2 barrier.
-                if lane == 0:
-                    if do_publish:
-                        dest_ctr_addr = fx.Int64(addr_dest_pe_ctr) + fx.Int64(
-                            dest_pe
-                        ) * fx.Int64(4)
-                        P.atomic_add_global(dest_ctr_addr, fx.Int32(1))
 
             # Token-embedding scatter: each lane owns 4 i32 (16B). _DISP_NSTREAMS
             # vec4 streams (chunk + k*_LANE_STRIDE_I32, stride _MAIN_STRIDE_I32) for
@@ -556,7 +451,6 @@ def make_dispatch(
         addr_inp_scales: Int64,
         my_lsa_rank: Int32,
         inp_cur_tok: Int32,
-        dev_comm: Int64,
         stream=fx.Stream(None),
     ):
         ep_dispatch(
@@ -571,7 +465,6 @@ def make_dispatch(
             addr_inp_scales,
             my_lsa_rank,
             inp_cur_tok,
-            dev_comm,
         ).launch(
             grid=(block_num, 1, 1),
             block=[warp_num_per_block * WAVE, 1, 1],
@@ -605,27 +498,19 @@ def make_dispatch_token_centric(
     enable_signal=True,
     replay=False,
     fp4=False,
-    prefetch_route_payload=False,
-    defer_dest_ctr_atomic=False,
-    rotate_dispatch_slot_order=False,
-    use_tok_off_total_recv=False,
     uncached_token_store=False,
     uncached_metadata_store=False,
-    replay_fast_path=False,
-    token_centric_rotate_peer_order=False,
     dispatch_fp8_blockwise=False,
     off_disp_quant_scales=0,
     dispatch_quant_scale_dim=0,
-    sdma_token_copy=False,
-    off_tok_staging=0,
-    sdma_queue_count=8,
 ):
-    """Workgroup-per-token dispatch A/B kernel.
+    """Workgroup-per-token dispatch used by fused BF16-to-FP8 transport.
 
     Wave 0 builds a PE-indexed route once; every workgroup thread then loads
     each 16-byte token chunk once and stores that value to all unique peers.
     """
-    del prefetch_route_payload, rotate_dispatch_slot_order, replay_fast_path
+    if not dispatch_fp8_blockwise:
+        raise ValueError("token-centric dispatch is reserved for fused FP8 transport")
     input_nbytes = hidden_dim // 2 if fp4 else hidden_dim * hidden_elem_size
     nbytes = hidden_dim if dispatch_fp8_blockwise else input_nbytes
     n_i32 = nbytes // 4
@@ -636,7 +521,7 @@ def make_dispatch_token_centric(
     block_threads = warp_num_per_block * WAVE
     token_store_cache_modifier = 3 if uncached_token_store else 0
     metadata_store_cache_modifier = 3 if uncached_metadata_store else 0
-    direct_tok_off_total = use_tok_off_total_recv and not replay
+    direct_tok_off_total = not replay
     if dispatch_fp8_blockwise:
         if WAVE != 64:
             raise NotImplementedError("dispatch_fp8_blockwise requires wave64")
@@ -644,13 +529,6 @@ def make_dispatch_token_centric(
             raise ValueError(
                 "dispatch_fp8_blockwise requires BF16 input and hidden/128 scales"
             )
-    if sdma_token_copy:
-        if fp4 or dispatch_fp8_blockwise or hidden_elem_size not in (2, 4):
-            raise ValueError(
-                "sdma_token_copy supports plain BF16/F32 token payloads only"
-            )
-        if sdma_queue_count <= 0:
-            raise ValueError("sdma_queue_count must be positive")
 
     @flyc.kernel(known_block_size=[block_threads, 1, 1])
     def ep_dispatch_token_centric(
@@ -665,7 +543,6 @@ def make_dispatch_token_centric(
         addr_inp_scales: Int64,
         my_lsa_rank: Int32,
         inp_cur_tok: Int32,
-        dev_comm: Int64,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -747,9 +624,7 @@ def make_dispatch_token_centric(
                 if lane < npes:
                     fx.ptr_store(arith.unwrap(publish_i32), route_i32 + lane)
                     fx.ptr_store(arith.unwrap(dest_tok_lane), route_i32 + npes + lane)
-                    if const_expr(
-                        not direct_tok_off_total and not defer_dest_ctr_atomic
-                    ):
+                    if const_expr(replay):
                         if do_publish:
                             dest_ctr_addr = fx.Int64(addr_dest_pe_ctr) + fx.Int64(
                                 lane
@@ -815,31 +690,19 @@ def make_dispatch_token_centric(
                                 cache_modifier=metadata_store_cache_modifier,
                             )
 
-                if const_expr(not direct_tok_off_total and defer_dest_ctr_atomic):
-                    if lane < npes:
-                        if do_publish:
-                            dest_ctr_addr = fx.Int64(addr_dest_pe_ctr) + fx.Int64(
-                                lane
-                            ) * fx.Int64(4)
-                            P.atomic_add_global(dest_ctr_addr, fx.Int32(1))
-
             # Route atomics feed the LDS stores above; once wave 0 reaches this
             # barrier every wave can safely consume the compact route.
             fx.barrier()
 
             route_valids = []
             route_slots = []
-            route_peers = []
             route_token_rsrcs = []
             route_scale_rsrcs = []
             route_quant_scale_rsrcs = []
             for route_step in range_constexpr(npes):
                 # Phase-shift peer order by wave so workgroup waves do not all
                 # inject into the same peer at the same instant.
-                if const_expr(token_centric_rotate_peer_order):
-                    peer = (route_step + warp) % npes
-                else:
-                    peer = route_step
+                peer = (route_step + warp) % npes
                 valid_v = fx.ptr_load(route_i32 + peer, result_type=T.i32())
                 slot_v = fx.ptr_load(route_i32 + npes + peer, result_type=T.i32())
                 peer_valid = readlane(T.i32(), valid_v, 0)
@@ -852,7 +715,6 @@ def make_dispatch_token_centric(
                 )
                 route_valids.append(peer_valid)
                 route_slots.append(peer_slot)
-                route_peers.append(peer)
                 route_token_rsrcs.append(
                     create_buffer_resource_from_addr(peer_tok_addr)
                 )
@@ -937,76 +799,6 @@ def make_dispatch_token_centric(
                                     scale_block * 32 + (lane >> arith.constant(1)),
                                     cache_modifier=token_store_cache_modifier,
                                 )
-            elif const_expr(sdma_token_copy):
-                # SDMA can only source registered window memory, while the input
-                # tensor is an external Torch allocation. Stage each token once
-                # into this rank's arena, then let one issuer per workgroup post
-                # the whole contiguous token to every unique destination PE.
-                staging_addr = fx.Int64(
-                    window.lsa_ptr(my_lsa_rank, off_tok_staging)
-                ) + fx.Int64(src_tok) * fx.Int64(nbytes)
-                rsrc_staging = create_buffer_resource_from_addr(staging_addr)
-                for chunk in range(tid * 4, n_i32, block_threads * 4):
-                    token_vec = buffer_load(rsrc_src, chunk, vec_width=4, dtype=T.i32())
-                    buffer_store(token_vec, rsrc_staging, chunk)
-                P.waitcnt_all()
-                # The SDMA engine is a system-scope observer. waitcnt only
-                # retires each lane's VMEM stores; release every lane's staged
-                # chunks before lane 0 rings the copy-engine doorbell.
-                P.fence_system_release()
-                fx.barrier()
-
-                # Anvil queues connect GPU pairs; there is no SDMA peer queue
-                # for self. Preserve local routes with the normal CU copy.
-                for route_step in range_constexpr(npes):
-                    if route_valids[route_step] != 0:
-                        if route_peers[route_step] == my_lsa_rank:
-                            for chunk in range(tid * 4, n_i32, block_threads * 4):
-                                token_vec = buffer_load(
-                                    rsrc_staging,
-                                    chunk,
-                                    vec_width=4,
-                                    dtype=T.i32(),
-                                )
-                                buffer_store(
-                                    token_vec,
-                                    route_token_rsrcs[route_step],
-                                    chunk,
-                                    cache_modifier=token_store_cache_modifier,
-                                )
-
-                if warp == 0:
-                    if lane == 0:
-                        sdma = cco.DevComm(dev_comm).sdma()
-                        # A block is the issuing unit. Stripe blocks, not peers,
-                        # over queues: (peer,qid) identifies a queue, so peer%N
-                        # would put every block targeting one peer on queue peer.
-                        qid = fx.Int32(bid % sdma_queue_count)
-                        src_off = fx.Int64(off_tok_staging) + fx.Int64(
-                            src_tok
-                        ) * fx.Int64(nbytes)
-                        for route_step in range_constexpr(npes):
-                            if route_valids[route_step] != 0:
-                                if route_peers[route_step] != my_lsa_rank:
-                                    dst_off = fx.Int64(off_out_tok) + fx.Int64(
-                                        route_slots[route_step]
-                                    ) * fx.Int64(nbytes)
-                                    sdma.put(
-                                        route_peers[route_step],
-                                        arena,
-                                        dst_off,
-                                        arena,
-                                        src_off,
-                                        nbytes,
-                                        qid,
-                                        coop=cco.CoopScope.THREAD,
-                                    )
-                        # Drain exactly the queues used above before this block
-                        # reuses its staging slot or publishes dispatch-ready.
-                        for route_step in range_constexpr(npes):
-                            if route_valids[route_step] != 0:
-                                if route_peers[route_step] != my_lsa_rank:
-                                    sdma.quiet_queue(route_peers[route_step], qid)
             else:
                 for chunk in range(tid * 4, n_i32, block_threads * 4):
                     token_vec = buffer_load(rsrc_src, chunk, vec_width=4, dtype=T.i32())
@@ -1142,7 +934,6 @@ def make_dispatch_token_centric(
         addr_inp_scales: Int64,
         my_lsa_rank: Int32,
         inp_cur_tok: Int32,
-        dev_comm: Int64,
         stream=fx.Stream(None),
     ):
         ep_dispatch_token_centric(
@@ -1157,7 +948,6 @@ def make_dispatch_token_centric(
             addr_inp_scales,
             my_lsa_rank,
             inp_cur_tok,
-            dev_comm,
         ).launch(
             grid=(block_num, 1, 1),
             block=[block_threads, 1, 1],
@@ -1344,7 +1134,6 @@ def make_combine(
     reset_total_recv=True,
     _s3_cache=2,
     _unroll=4,
-    rotate_combine_peer_order=False,
 ):
     assert block_num <= xdb_flag_slots, (
         f"combine block_num {block_num} exceeds xdb_flag_slots {xdb_flag_slots}: "
@@ -1482,14 +1271,6 @@ def make_combine(
             tok_map_lane = arith.select(
                 lane < experts_per_token, lane, arith.constant(0)
             )
-            if const_expr(rotate_combine_peer_order):
-                # Match OPUS's communication-WG phase shift: each gather warp
-                # sees the same K entries through a different cyclic order.
-                peer_phase = (global_warp_id + rank) % experts_per_token
-                rotated_lane = (lane + peer_phase) % experts_per_token
-                tok_map_lane = arith.select(
-                    lane < experts_per_token, rotated_lane, arith.constant(0)
-                )
             encoded_my = buffer_load(
                 rsrc_tok_map, tok_map_base + tok_map_lane, vec_width=1, dtype=T.i32()
             )

@@ -75,8 +75,6 @@ MODES = os.environ.get("MODES", "eager,graph").split(",")
 # copy -- what a real pipeline does. "staged": a separate buffer, copy included.
 COMBINE_IN = os.environ.get("COMBINE_IN", "inplace")
 CHECK = int(os.environ.get("CHECK", 1))
-SDMA_TOKEN_COPY = int(os.environ.get("SDMA_TOKEN_COPY", 0))
-SDMA_QUEUES = int(os.environ.get("SDMA_QUEUES", 8))
 # What dispatch transports; combine is always bf16, so anything else is asymmetric.
 _DISP_DT = {
     "bf16": torch.bfloat16,
@@ -135,8 +133,6 @@ def main():
     comm = cco.Communicator.init(world, rank, obj[0], vmm)
 
     def build(backend):
-        if SDMA_TOKEN_COPY and backend != "flydsl":
-            raise ValueError("SDMA_TOKEN_COPY is supported by the flydsl backend only")
         cfg = EpDispatchCombineConfig(
             rank=rank,
             world_size=world,
@@ -148,8 +144,6 @@ def main():
             dispatch_data_type=None if _DISP_DT is torch.bfloat16 else _DISP_DT,
             combine_data_type=None if _DISP_DT is torch.bfloat16 else torch.bfloat16,
             kernel_backend=backend,
-            sdma_token_copy=bool(SDMA_TOKEN_COPY),
-            sdma_queue_count=SDMA_QUEUES,
             dispatch_block_num=_G["DBN"],
             warp_num_per_block=_G["DWPB"],
             combine_block_num=_G["CBN"],
@@ -163,8 +157,7 @@ def main():
         print(
             f"# EP{world} hidden={HIDDEN} topk={TOPK} epr={EPR} "
             f"disp={_DISP_DT} comb=bf16 backends={BACKENDS} modes={MODES} "
-            f"iters={ITERS} combine_in={COMBINE_IN} check={CHECK} "
-            f"sdma={SDMA_TOKEN_COPY} sdma_queues={SDMA_QUEUES}",
+            f"iters={ITERS} combine_in={COMBINE_IN} check={CHECK}",
             flush=True,
         )
 

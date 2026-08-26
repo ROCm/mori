@@ -102,19 +102,7 @@ SCALE_DIM = int(
 COMBINE = os.environ.get("COMBINE", "gather")  # gather | scatter
 QUANT = os.environ.get("QUANT", "none")  # none | fp8_direct_cast | fp8_blockwise
 DISPATCH_FP8_BLOCKWISE = int(os.environ.get("DISPATCH_FP8_BLOCKWISE", 0))
-SDMA_TOKEN_COPY = int(os.environ.get("SDMA_TOKEN_COPY", 0))
-SDMA_QUEUES = int(os.environ.get("SDMA_QUEUES", 8))
 ZERO_COPY_EXPERT_OUTPUT = int(os.environ.get("ZERO_COPY_EXPERT_OUTPUT", 0))
-PREFETCH_ROUTE_PAYLOAD = int(os.environ.get("PREFETCH_ROUTE_PAYLOAD", 0))
-DEFER_DEST_CTR_ATOMIC = int(os.environ.get("DEFER_DEST_CTR_ATOMIC", 0))
-USE_TOK_OFF_TOTAL_RECV = int(os.environ.get("USE_TOK_OFF_TOTAL_RECV", 0))
-UNCACHED_TOKEN_STORE = int(os.environ.get("UNCACHED_TOKEN_STORE", 0))
-UNCACHED_METADATA_STORE = int(os.environ.get("UNCACHED_METADATA_STORE", 0))
-REPLAY_FAST_PATH = int(os.environ.get("REPLAY_FAST_PATH", 0))
-TOKEN_CENTRIC_DISPATCH = int(os.environ.get("TOKEN_CENTRIC_DISPATCH", 0))
-TOKEN_CENTRIC_ROTATE_PEERS = int(os.environ.get("TOKEN_CENTRIC_ROTATE_PEERS", 0))
-ROTATE_DISPATCH_SLOT_ORDER = int(os.environ.get("ROTATE_DISPATCH_SLOT_ORDER", 0))
-ROTATE_COMBINE_PEER_ORDER = int(os.environ.get("ROTATE_COMBINE_PEER_ORDER", 0))
 ROUTING_PATTERN = os.environ.get("ROUTING_PATTERN", "random").lower()
 # Scale the input up so per-token/-block amax exceeds the fp8 max -> exercises the
 # fp8_blockwise per-block scaling branch (randn ~N(0,1) never triggers it).
@@ -206,19 +194,7 @@ def main():
             combine_mode=COMBINE,
             quant_type=QUANT,
             dispatch_fp8_blockwise=bool(DISPATCH_FP8_BLOCKWISE),
-            sdma_token_copy=bool(SDMA_TOKEN_COPY),
-            sdma_queue_count=SDMA_QUEUES,
             max_total_recv_tokens=int(os.environ.get("MAXRECV", 0)),
-            prefetch_route_payload=bool(PREFETCH_ROUTE_PAYLOAD),
-            defer_dest_ctr_atomic=bool(DEFER_DEST_CTR_ATOMIC),
-            use_tok_off_total_recv=bool(USE_TOK_OFF_TOTAL_RECV),
-            uncached_token_store=bool(UNCACHED_TOKEN_STORE),
-            uncached_metadata_store=bool(UNCACHED_METADATA_STORE),
-            replay_fast_path=bool(REPLAY_FAST_PATH),
-            token_centric_dispatch=bool(TOKEN_CENTRIC_DISPATCH),
-            token_centric_rotate_peer_order=bool(TOKEN_CENTRIC_ROTATE_PEERS),
-            rotate_dispatch_slot_order=bool(ROTATE_DISPATCH_SLOT_ORDER),
-            rotate_combine_peer_order=bool(ROTATE_COMBINE_PEER_ORDER),
         )
         if int(os.environ.get("TUNED", 0)):
             from mori.ops.dispatch_combine_v2.tuning_configs import lookup

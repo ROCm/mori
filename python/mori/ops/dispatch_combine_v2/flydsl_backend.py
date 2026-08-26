@@ -25,12 +25,9 @@ One SymmArena window holds the symmetric staging; per-rank metadata are plain
 device tensors surfaced to the caller via from_gpu_ptr.
 """
 
-import os
-
 import torch
 
 import flydsl.expr as fx
-from mori.cco import CCODevCommRequirements, GDA_CONNECTION_NONE
 from mori.tensor_utils import from_gpu_ptr
 
 from .intranode_kernels import (
@@ -79,25 +76,6 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
         recv_cap = cfg.effective_max_recv  # recv-slot cap (== ws*M unless capped)
         self._recv_cap = recv_cap
 
-        if cfg.sdma_token_copy:
-            enabled = os.environ.get("MORI_ENABLE_SDMA", "").strip().lower() in (
-                "1",
-                "true",
-                "on",
-                "yes",
-            )
-            if not enabled:
-                raise RuntimeError(
-                    "sdma_token_copy requires MORI_ENABLE_SDMA=1 before "
-                    "Communicator.init()"
-                )
-            from mori.cco.device._build_flags import BUILD_CCO_SDMA
-
-            if not BUILD_CCO_SDMA:
-                raise RuntimeError(
-                    "sdma_token_copy requires a BUILD_CCO_SDMA=ON installation"
-                )
-
         self._scale_bytes = cfg.scale_dim * cfg.scale_type_size
         self._scale_num_i32 = (self._scale_bytes + 3) // 4
         self._enable_scales = self._scale_bytes > 0
@@ -125,8 +103,6 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                     recv_cap * cfg.dispatch_quant_scale_dim * 4,
                 )
             )
-        if cfg.sdma_token_copy:
-            regions.append(("tok_staging", max_tok_per_rank * token_nbytes))
         # scatter combine needs its own staging regions
         if cfg.is_scatter:
             wire_elem_size = cfg.wire_elem_size
@@ -146,23 +122,6 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                 )
         self.arena = SymmArena(comm, regions)
         self.arena.zero()
-
-        self._dev_comm = None
-        self._dev_comm_ptr = 0
-        if cfg.sdma_token_copy:
-            reqs = CCODevCommRequirements()
-            reqs.gda_connection_type = GDA_CONNECTION_NONE
-            reqs.gda_context_count = 0
-            reqs.gda_signal_count = 0
-            reqs.gda_counter_count = 0
-            reqs.lsa_barrier_count = 0
-            reqs.sdma_queue_count = cfg.sdma_queue_count
-            try:
-                self._dev_comm = comm.create_dev_comm(reqs)
-            except Exception:
-                self.arena.close()
-                raise
-            self._dev_comm_ptr = self._dev_comm.ptr
 
         self.token_dest_map = torch.full(
             (max_tok_per_rank * topk,), -1, dtype=torch.int32, device=device
@@ -207,11 +166,6 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
         # the op picks the best (block, warp) at runtime from cur_rank_num_token;
         # otherwise it is single-shot. Scatter combine is not schedule-tuned.
         dispatch_specs, combine_specs = self._specs_from(cfg)
-        if cfg.token_centric_schedule:
-            dispatch_specs = sorted(
-                set(dispatch_specs)
-                | {(block, warp) for _, block, warp in cfg.token_centric_schedule}
-            )
         self._dispatch_specs = dispatch_specs
         self._combine_specs = combine_specs
 
@@ -234,27 +188,27 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
             scale_dim=cfg.scale_dim,
             scale_type_size=cfg.scale_type_size,
             fp4=is_fp4,
-            prefetch_route_payload=cfg.prefetch_route_payload,
-            defer_dest_ctr_atomic=cfg.defer_dest_ctr_atomic,
-            rotate_dispatch_slot_order=cfg.rotate_dispatch_slot_order,
-            use_tok_off_total_recv=cfg.use_tok_off_total_recv,
-            uncached_token_store=cfg.uncached_token_store,
-            uncached_metadata_store=cfg.uncached_metadata_store,
-            replay_fast_path=cfg.replay_fast_path,
-            token_centric_rotate_peer_order=cfg.token_centric_rotate_peer_order,
+        )
+        self._token_dispatch_kwargs = dict(
+            self._dispatch_kwargs,
             dispatch_fp8_blockwise=cfg.dispatch_fp8_blockwise,
             off_disp_quant_scales=(
                 arena.offset("disp_quant_scales") if cfg.dispatch_fp8_blockwise else 0
             ),
             dispatch_quant_scale_dim=cfg.dispatch_quant_scale_dim,
-            sdma_token_copy=cfg.sdma_token_copy,
-            off_tok_staging=(arena.offset("tok_staging") if cfg.sdma_token_copy else 0),
-            sdma_queue_count=cfg.sdma_queue_count,
+        )
+        dispatch_factory = (
+            make_dispatch_token_centric if cfg.dispatch_fp8_blockwise else make_dispatch
+        )
+        dispatch_kwargs = (
+            self._token_dispatch_kwargs
+            if cfg.dispatch_fp8_blockwise
+            else self._dispatch_kwargs
         )
         # (block, warp) -> compiled dispatch / combine kernel.
         self._dispatch_variants = {
-            (b, w): make_dispatch(
-                block_num=b, warp_num_per_block=w, **self._dispatch_kwargs
+            (b, w): dispatch_factory(
+                block_num=b, warp_num_per_block=w, **dispatch_kwargs
             )
             for (b, w) in dispatch_specs
         }
@@ -305,7 +259,6 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                     off_out_wts=arena.offset("out_wts"),
                     reset_total_recv=True,
                     fp4=(cfg.combine_dtype == torch.float4_e2m1fn_x2),
-                    rotate_combine_peer_order=cfg.rotate_combine_peer_order,
                 )
                 for (b, w) in combine_specs
             }
@@ -514,11 +467,11 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
     # -- kernel adapters: FlyDSL's positional convention -> the base's named one --
 
     def _dispatch_cache_policy(self, num_tokens):
-        token_uncached = self.cfg.uncached_token_store or (
+        token_uncached = (
             self.cfg.uncached_token_store_max_tokens > 0
             and num_tokens <= self.cfg.uncached_token_store_max_tokens
         )
-        metadata_uncached = self.cfg.uncached_metadata_store or (
+        metadata_uncached = (
             self.cfg.uncached_metadata_store_max_tokens > 0
             and num_tokens <= self.cfg.uncached_metadata_store_max_tokens
         )
@@ -527,13 +480,8 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
     def _get_dispatch_variant(self, spec, num_tokens, *, replay=False):
         """Select/compile the FlyDSL policy specialization for this bucket."""
         token_uncached, metadata_uncached = self._dispatch_cache_policy(num_tokens)
-        token_centric = self._use_token_centric(num_tokens)
-        if (
-            not replay
-            and not token_centric
-            and token_uncached == self.cfg.uncached_token_store
-            and metadata_uncached == self.cfg.uncached_metadata_store
-        ):
+        token_centric = self.cfg.dispatch_fp8_blockwise
+        if not replay and not token_uncached and not metadata_uncached:
             return self._dispatch_variants[spec]
 
         variants = (
@@ -544,7 +492,9 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
         key = (spec, token_uncached, metadata_uncached, token_centric)
         kern = variants.get(key)
         if kern is None:
-            kwargs = dict(self._dispatch_kwargs)
+            kwargs = dict(
+                self._token_dispatch_kwargs if token_centric else self._dispatch_kwargs
+            )
             kwargs.update(
                 uncached_token_store=token_uncached,
                 uncached_metadata_store=metadata_uncached,
@@ -583,7 +533,6 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                 ),
                 self.cfg.rank,
                 num_tokens,
-                self._dev_comm_ptr,
                 fx.Stream(torch.cuda.current_stream()),
             )
 
@@ -608,12 +557,6 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
             )
 
         return run
-
-    def _close_backend(self):
-        if self._dev_comm is not None:
-            self._dev_comm.close()
-            self._dev_comm = None
-            self._dev_comm_ptr = 0
 
     def local_expert_count(self):
         """[num_experts_per_rank] i32: recv tokens per local expert. Call after
