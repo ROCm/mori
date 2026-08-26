@@ -119,6 +119,7 @@ template <typename T, typename T2 = typename std::remove_volatile<T>::type>
 __device__ __host__ inline static T2* global(T* ptr) {
   return (T2*)(T2 CCO_GLOBAL_SPACE*)reinterpret_cast<uintptr_t>(ptr);
 }
+#undef CCO_GLOBAL_SPACE
 
 /* ── Wavefront primitives ─────────────────────────────────────────────────────
  * Every arch mori targets is wave64 except gfx1250. The ballot builtin is not
