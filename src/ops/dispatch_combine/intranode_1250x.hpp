@@ -887,7 +887,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_1250x_body(EpDispatchCo
   int npes = config.worldSize;
 
   IF_ENABLE_PROFILER(
-      INTRANODE_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
+      INTRANODE_1250X_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SEQ(seq, profiler);
   MORI_TRACE_NEXT(seq, Slot::CombineStageInput);
 
