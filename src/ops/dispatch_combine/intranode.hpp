@@ -107,6 +107,12 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   const int topk = config.numExpertPerToken;
   const int Npair = args.curRankNumToken * topk;
 
+  // Sentinel bit set in dispDestTokIdMap during Phase 1 to mark kept (non-deduped) pairs.
+  // Phase 3 tests this bit to skip dropped pairs without re-reading tokenIndices.
+  // Safe because FlatTokenIndex values are bounded by worldSize * MaxNumTokensToSend(),
+  // which is well below 2^30 for any practical configuration.
+  constexpr index_t kCachedRoutingSentinel = 0x40000000;
+
   constexpr int kMaxNpes = MAX_GPUS_PER_NODE;
   __shared__ index_t s_N[kMaxNpes];     // block's committed count per destPe
   __shared__ index_t s_base[kMaxNpes];  // reserved contiguous base slot on destPe
@@ -142,7 +148,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       }
       if (laneId == 0) {
         atomicAdd(&s_N[destPe], 1);
-        args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, 0) | 0x40000000;
+        args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, 0) | kCachedRoutingSentinel;
       }
     }
   }
@@ -164,9 +170,9 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       index_t cached = 0;
       if (laneId == 0) cached = args.dispDestTokIdMap[i];
       cached = __shfl(cached, 0);
-      if (!(cached & 0x40000000)) continue;
+      if (!(cached & kCachedRoutingSentinel)) continue;
 
-      index_t destPe = PeFromFlatTokenIndex(config, cached & ~0x40000000);
+      index_t destPe = PeFromFlatTokenIndex(config, cached & ~kCachedRoutingSentinel);
       index_t srcTokId = i / topk;
 
       index_t destTokId = 0;
@@ -180,17 +186,15 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       destTokId = __shfl(destTokId, 0);
 
       if (args.weightsBuf) {
-        core::WarpCopy(
-            args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(destPe) +
-                (size_t)destTokId * config.numExpertPerToken,
-            args.weightsBuf + (size_t)srcTokId * config.numExpertPerToken,
-            (size_t)config.numExpertPerToken);
+        core::WarpCopy(args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(destPe) +
+                           (size_t)destTokId * config.numExpertPerToken,
+                       args.weightsBuf + (size_t)srcTokId * config.numExpertPerToken,
+                       (size_t)config.numExpertPerToken);
       }
-      core::WarpCopy(
-          args.shmemOutIndicesMemObj->template GetAs<index_t*>(destPe) +
-              (size_t)destTokId * config.numExpertPerToken,
-          args.tokenIndices + (size_t)srcTokId * config.numExpertPerToken,
-          (size_t)config.numExpertPerToken);
+      core::WarpCopy(args.shmemOutIndicesMemObj->template GetAs<index_t*>(destPe) +
+                         (size_t)destTokId * config.numExpertPerToken,
+                     args.tokenIndices + (size_t)srcTokId * config.numExpertPerToken,
+                     (size_t)config.numExpertPerToken);
       if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
         size_t destScaleOffset = (size_t)destTokId * config.scaleDim * config.scaleTypeSize;
         size_t srcScaleOffset = (size_t)srcTokId * config.scaleDim * config.scaleTypeSize;
