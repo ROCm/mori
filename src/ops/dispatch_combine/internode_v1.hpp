@@ -47,6 +47,9 @@ template <typename T>
 __global__ void EpCombineSync(EpDispatchCombineArgs<T> args);
 
 template <typename T>
+__global__ void EpCombineSyncLL(EpDispatchCombineArgs<T> args);
+
+template <typename T>
 __global__ void EpCombineSyncBarrier(EpDispatchCombineArgs<T> args);
 
 template <typename T>

@@ -1595,16 +1595,16 @@ class EpDispatchCombineOp:
         elif kt == EpDispatchCombineKernelType.InterNodeV1LL.value:
             mp = self._handle_info["multi_processor_count"]
             bsz = self._warp_size * actual_wpb
+            # EpCombineSyncLL = EpCombineSync + the (grid=1) EpCombineSyncBarrier.
             self._launch_multi(
                 [
-                    f"EpCombineSync_{sfx}",
-                    f"EpCombineSyncBarrier_{sfx}",
+                    f"EpCombineSyncLL_{sfx}",
                     f"EpCombineInterNodeV1KernelLowLatency_{sfx}",
                     f"EpCombineAll_{sfx}",
                 ],
-                [mp, 1, actual_bn, mp],
-                [bsz, self._warp_size, bsz, bsz],
-                [0, 0, shared_mem, shared_mem],
+                [mp, actual_bn, mp],
+                [bsz, bsz, bsz],
+                [0, shared_mem, shared_mem],
                 stream,
                 args_ptr,
             )
@@ -2025,15 +2025,7 @@ class EpDispatchCombineOp:
 
         if kt == EpDispatchCombineKernelType.InterNodeV1LL.value:
             mp = self._handle_info["multi_processor_count"]
-            self._launch(f"EpCombineSync_{sfx}", (mp,), block, 0, stream, args_ptr)
-            self._launch(
-                f"EpCombineSyncBarrier_{sfx}",
-                (1,),
-                (self._warp_size,),
-                0,
-                stream,
-                args_ptr,
-            )
+            self._launch(f"EpCombineSyncLL_{sfx}", (mp,), block, 0, stream, args_ptr)
             self._launch(
                 f"EpCombineInterNodeV1KernelLowLatency_{sfx}_stdmoe",
                 grid,
