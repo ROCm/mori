@@ -46,12 +46,18 @@ _CLI_TO_KERNEL_TYPE_NAME = {
 
 _FP4_DTYPE = getattr(torch, "float4_e2m1fn_x2", None)
 
-# Bandwidth improvement must exceed this *relative* margin to update the best
-# config during tuning. An absolute GB/s margin cannot work across the whole
-# operating range: 1.0 GB/s is ~40% of the total spread at 4 tokens (where the
-# whole sweep lives in 2-3 GB/s) and <2% at large token counts, so the same
-# constant is simultaneously far too strict and far too loose.
-_BW_REL_MARGIN = 0.02
+# Relative bandwidth improvement required to update the best config during
+# tuning. Default 0: take any improvement, which is what you want when tuning
+# to find the fastest config. Raise it (e.g. MORI_EP_TUNING_MARGIN=0.02) to
+# trade a little peak performance for stability -- run-to-run spread here is
+# 10-20%, so with no margin the winner is partly whichever config drew the
+# luckiest sample. The median-over-rounds scoring below is the primary defence
+# against that; the margin is a second, optional one.
+#
+# An *absolute* GB/s margin (which this used to be) cannot work at all: 1.0
+# GB/s is ~40% of the total spread at 4 tokens, where the whole sweep lives in
+# 2-3 GB/s, and under 2% at large token counts.
+_BW_REL_MARGIN = float(os.environ.get("MORI_EP_TUNING_MARGIN", "0.0"))
 
 # Rounds benchmarked per config during tuning. Scored by median across rounds
 # (not mean) so a single stalled round cannot decide the winner.
