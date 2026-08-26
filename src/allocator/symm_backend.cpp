@@ -270,9 +270,16 @@ struct Block {
   int device_idx = 0;
   hipMemGenericAllocationHandle_t handle{};
   hipMemAllocationHandleType handle_type = hipMemHandleTypePosixFileDescriptor;
+  int export_fd = -1;  // closed in free(), after hipMemRelease -- see the fd-lifetime note below
   std::optional<std::string> default_group_name;
   c10::intrusive_ptr<SymmetricMemory> symm;
 };
+
+// ROCm 7.14 ties a shareable fd's lifetime to the allocation it names: the fd must not
+// be closed until after hipMemRelease of that handle. Close it earlier and the physical
+// memory is never returned -- measured at a full allocation leaked per export. Closing it
+// before the mapping is granted is worse still: hipMemSetAccess then fails outright.
+// ROCm 7.2 cared about neither, which is why both only surfaced once CI ran this.
 
 constexpr const char* kNoSignalPad =
     "Signal-pad support is compiled out (MORI_SYMM_SIGNAL_PAD=0), so no pad is reserved "
@@ -281,13 +288,14 @@ constexpr const char* kNoSignalPad =
 class MoriSymmetricMemory : public SymmetricMemory {
  public:
   MoriSymmetricMemory(char* flat_base, size_t span, size_t stride, size_t buffer_size,
-                      std::vector<hipMemGenericAllocationHandle_t> handles, int rank,
-                      int world_size, int device_idx)
+                      std::vector<hipMemGenericAllocationHandle_t> handles,
+                      std::vector<int> peer_fds, int rank, int world_size, int device_idx)
       : flat_base_(flat_base),
         span_(span),
         stride_(stride),
         buffer_size_(buffer_size),
         handles_(std::move(handles)),
+        peer_fds_(std::move(peer_fds)),
         rank_(rank),
         world_size_(world_size),
         device_(c10::DeviceType::CUDA, device_idx) {
@@ -326,7 +334,10 @@ class MoriSymmetricMemory : public SymmetricMemory {
       (void)hipMemUnmap(flat_base_ + static_cast<size_t>(r) * stride_, stride_);
       // handles_[rank_] is the Block's own handle, borrowed for the self slot. The
       // allocator's free() releases it, and releasing it twice segfaults.
-      if (r != rank_) (void)hipMemRelease(handles_[r]);
+      if (r != rank_) {
+        (void)hipMemRelease(handles_[r]);
+        if (r < static_cast<int>(peer_fds_.size()) && peer_fds_[r] >= 0) ::close(peer_fds_[r]);
+      }
     }
     (void)hipMemAddressFree(flat_base_, span_);
   }
@@ -387,6 +398,7 @@ class MoriSymmetricMemory : public SymmetricMemory {
   size_t stride_;
   size_t buffer_size_;
   std::vector<hipMemGenericAllocationHandle_t> handles_;
+  std::vector<int> peer_fds_;  // outlive their handles; see the note above
   int rank_;
   int world_size_;
   c10::Device device_;
@@ -454,6 +466,7 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
     (void)hipMemUnmap(block->ptr, block->alloc_size);
     (void)hipMemAddressFree(block->ptr, block->alloc_size);
     (void)hipMemRelease(block->handle);
+    if (block->export_fd >= 0) ::close(block->export_fd);
   }
 
   size_t get_alloc_size(void* ptr) override {
@@ -513,6 +526,7 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
     };
 
     std::vector<hipMemGenericAllocationHandle_t> handles(world_size);
+    std::vector<int> peer_fds(world_size, -1);
 
     // A second alias of our own allocation, so the stride is uniform across all ranks.
     // The handle is borrowed from the Block rather than retained: one owner, one release.
@@ -535,7 +549,7 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
       for (int peer = 0; peer < world_size; ++peer) {
         if (peer != rank) chan.SendFd(FdChannel::Path(reqs[peer].pid, peer), fd, rank);
       }
-      ::close(fd);
+      block->export_fd = fd;  // closed by free(), after the release
 
       for (int i = 0; i < world_size - 1; ++i) {
         auto [owner, peer_fd] = chan.RecvFd();
@@ -544,14 +558,18 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
         MORI_HIP_CHECK(hipMemImportFromShareableHandle(
             &handles[owner], reinterpret_cast<void*>(static_cast<intptr_t>(peer_fd)),
             hipMemHandleTypePosixFileDescriptor));
-        ::close(peer_fd);
+        // Close only after the handle is mapped and granted. ROCm 7.14 still needs the fd
+        // until then: closing first leaves a handle that imports and maps fine but whose
+        // hipMemSetAccess fails with "invalid argument". ROCm 7.2 did not care, which is
+        // why this stayed invisible until CI began running the backend.
         map_slot(owner, handles[owner]);
+        peer_fds[owner] = peer_fd;
       }
     }
 
-    auto symm = c10::make_intrusive<MoriSymmetricMemory>(static_cast<char*>(flat), span, stride,
-                                                         block->buffer_size, std::move(handles),
-                                                         rank, world_size, block->device_idx);
+    auto symm = c10::make_intrusive<MoriSymmetricMemory>(
+        static_cast<char*>(flat), span, stride, block->buffer_size, std::move(handles),
+        std::move(peer_fds), rank, world_size, block->device_idx);
     block->symm = symm;
     return symm;
   }
@@ -577,6 +595,7 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
       (void)hipMemUnmap(block->ptr, block->alloc_size);
       (void)hipMemAddressFree(block->ptr, block->alloc_size);
       (void)hipMemRelease(block->handle);
+      if (block->export_fd >= 0) ::close(block->export_fd);
     }
   }
 
