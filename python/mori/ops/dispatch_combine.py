@@ -511,6 +511,15 @@ class EpDispatchCombineOp:
         self._dispatch_out_ptrs = mori_cpp.get_dispatch_output_ptrs(self._handle, True)
         self._combine_out_ptrs = mori_cpp.get_combine_output_ptrs(self._handle, True)
 
+        # Output tensor views over the two pointer sets above. Read the opt-out
+        # once here: probing the environment per call would reintroduce exactly
+        # the kind of host-side cost this cache removes.
+        self._view_cache = (
+            None
+            if os.environ.get("MORI_EP_DISABLE_VIEW_CACHE", "0") == "1"
+            else {}
+        )
+
         self.local_expert_count = torch.zeros(
             config.num_experts_per_rank, dtype=torch.int32, device="cuda"
         )
@@ -951,6 +960,36 @@ class EpDispatchCombineOp:
             # so the reservation stays at the pointer arrays.
         return base
 
+
+    def _cached_view(self, key, ptr, shape, dtype):
+        """Memoized ``from_gpu_ptr`` over a handle-owned shmem buffer.
+
+        dispatch()/combine() hand back views over buffers whose addresses are
+        snapshotted once in __init__ (self._dispatch_out_ptrs /
+        self._combine_out_ptrs) and whose shapes are fixed by the config, yet a
+        fresh view was built on every call. Each rebuild walks
+        __cuda_array_interface__ and queries the current device; six of them per
+        dispatch+combine round measured ~60us of host time, and at small token
+        counts the host submission path is what paces the GPU.
+
+        The cache key includes the pointer, so if a buffer were ever
+        reallocated the lookup misses and a correct view is built rather than a
+        stale one being returned. Entries are bounded by the number of distinct
+        (shape, dtype) a given op is called with -- one, for a fixed model.
+
+        The returned tensor aliases exactly the memory a fresh view would, and
+        the kernels overwrite it in place either way, so callers see no change
+        beyond object identity.
+        """
+        if self._view_cache is None:
+            return from_gpu_ptr(ptr, shape, dtype)
+        ck = (key, ptr, tuple(shape), dtype)
+        t = self._view_cache.get(ck)
+        if t is None:
+            t = from_gpu_ptr(ptr, shape, dtype)
+            self._view_cache[ck] = t
+        return t
+
     def _launch(self, func_name, grid, block, shared_mem, stream, args_ptr):
         func = self._get_func(func_name)
         func.launch_struct(grid, block, shared_mem, stream, args_ptr)
@@ -1278,22 +1317,22 @@ class EpDispatchCombineOp:
 
         out_ptr, outW_ptr, outS_ptr, outI_ptr, total_ptr = self._dispatch_out_ptrs
         max_recv = self._cpp_config.max_num_tokens_to_recv()
-        out = from_gpu_ptr(out_ptr, (max_recv, hidden_dim), input.dtype)
-        out_weights = from_gpu_ptr(
-            outW_ptr, (max_recv, self.config.num_experts_per_token), torch.float32
+        out = self._cached_view("disp_out", out_ptr, (max_recv, hidden_dim), input.dtype)
+        out_weights = self._cached_view(
+            "disp_w", outW_ptr, (max_recv, self.config.num_experts_per_token), torch.float32
         )
         out_scales = None
         if has_scales and outS_ptr:
-            out_scales = from_gpu_ptr(
-                outS_ptr, (max_recv, self.config.scale_dim), scales.dtype
+            out_scales = self._cached_view(
+                "disp_s", outS_ptr, (max_recv, self.config.scale_dim), scales.dtype
             )
-        out_indices = from_gpu_ptr(
-            outI_ptr, (max_recv, self.config.num_experts_per_token), TOPK_IDX_DTYPE
+        out_indices = self._cached_view(
+            "disp_i", outI_ptr, (max_recv, self.config.num_experts_per_token), TOPK_IDX_DTYPE
         )
         total_recv = (
             routing.total_recv_token_num
             if use_routing_handle
-            else from_gpu_ptr(total_ptr, (1,), TOPK_IDX_DTYPE)
+            else self._cached_view("disp_total", total_ptr, (1,), TOPK_IDX_DTYPE)
         )
 
         if return_routing:
@@ -1692,14 +1731,16 @@ class EpDispatchCombineOp:
             raise ValueError(f"Unsupported combine kernel_type: {kt}")
 
         out_ptr, outW_ptr = self._combine_out_ptrs
-        out = from_gpu_ptr(
+        out = self._cached_view(
+            "comb_out",
             out_ptr,
             (self.config.max_num_inp_token_per_rank, hidden_dim),
             input.dtype,
         )
         out_weights = None
         if weight_ptr and outW_ptr:
-            out_weights = from_gpu_ptr(
+            out_weights = self._cached_view(
+                "comb_w",
                 outW_ptr,
                 (
                     self.config.max_num_inp_token_per_rank,
