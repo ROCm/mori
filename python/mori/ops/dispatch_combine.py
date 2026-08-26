@@ -515,9 +515,7 @@ class EpDispatchCombineOp:
         # once here: probing the environment per call would reintroduce exactly
         # the kind of host-side cost this cache removes.
         self._view_cache = (
-            None
-            if os.environ.get("MORI_EP_DISABLE_VIEW_CACHE", "0") == "1"
-            else {}
+            None if os.environ.get("MORI_EP_DISABLE_VIEW_CACHE", "0") == "1" else {}
         )
 
         self.local_expert_count = torch.zeros(
@@ -960,7 +958,6 @@ class EpDispatchCombineOp:
             # so the reservation stays at the pointer arrays.
         return base
 
-
     def _cached_view(self, key, ptr, shape, dtype):
         """Memoized ``from_gpu_ptr`` over a handle-owned shmem buffer.
 
@@ -1317,9 +1314,14 @@ class EpDispatchCombineOp:
 
         out_ptr, outW_ptr, outS_ptr, outI_ptr, total_ptr = self._dispatch_out_ptrs
         max_recv = self._cpp_config.max_num_tokens_to_recv()
-        out = self._cached_view("disp_out", out_ptr, (max_recv, hidden_dim), input.dtype)
+        out = self._cached_view(
+            "disp_out", out_ptr, (max_recv, hidden_dim), input.dtype
+        )
         out_weights = self._cached_view(
-            "disp_w", outW_ptr, (max_recv, self.config.num_experts_per_token), torch.float32
+            "disp_w",
+            outW_ptr,
+            (max_recv, self.config.num_experts_per_token),
+            torch.float32,
         )
         out_scales = None
         if has_scales and outS_ptr:
@@ -1327,7 +1329,10 @@ class EpDispatchCombineOp:
                 "disp_s", outS_ptr, (max_recv, self.config.scale_dim), scales.dtype
             )
         out_indices = self._cached_view(
-            "disp_i", outI_ptr, (max_recv, self.config.num_experts_per_token), TOPK_IDX_DTYPE
+            "disp_i",
+            outI_ptr,
+            (max_recv, self.config.num_experts_per_token),
+            TOPK_IDX_DTYPE,
         )
         total_recv = (
             routing.total_recv_token_num
