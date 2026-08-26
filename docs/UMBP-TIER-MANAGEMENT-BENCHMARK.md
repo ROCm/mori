@@ -102,10 +102,10 @@ sections. Production clients can record successful PUT/GET traffic with
 `UMBP_WORKLOAD_TRACE_PATH`; replay it with payload validation disabled because
 production payload bytes are not embedded in the trace.
 
-**Page size vs value size.** Each value occupies a whole page. The defaults
-(`page_size=2MiB`, `backend_capacity=256MiB`) only hold 128 keys per backend.
-A 4KiB value still consumes 2MiB. For small-value policy sweeps use
-`--page-size 64KiB --backend-capacity 2GiB` (or size capacity as
+**Page size vs value size.** Each value occupies one or more whole pages. The
+defaults (`page_size=2MiB`, `backend_capacity=256MiB`) only hold 128 one-page
+keys per backend. A 4KiB value still consumes 2MiB. For small-value policy
+sweeps use `--page-size 64KiB --backend-capacity 2GiB` (or size capacity as
 `page_size * key_count`).
 
 **GET affinity.** Synthetic PUT/GET pairs for one key stay on one client
@@ -128,8 +128,10 @@ export MORI_IO_QP_MAX_CQE=4096
 Also set `LD_LIBRARY_PATH` to the build tree (`build/src/application:build/src/io:build/src/metrics`)
 when running binaries from `build/`.
 
-**SSD.** Values must not exceed `--page-size`. `max_allocatable_bytes` for an
-SSD backend is `min(available_bytes, page_size)`.
+**SSD.** A value may span several contiguous staging pages. It must fit the
+arena (`page_size * staging_pages`); committed SSD capacity is charged by the
+value's actual bytes. `max_allocatable_bytes` is
+`min(available_bytes, staging_arena_bytes)`.
 
 The workload controls are profile, seed, operation and key counts, minimum and
 maximum value size, value-size distribution, read ratio, client count, batch
