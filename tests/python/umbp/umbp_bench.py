@@ -307,17 +307,17 @@ _auto_slots, _auto_staging_bytes, _auto_max_batch = _staging_plan(
     nr_objects, value_size, getattr(args, "batch_sizes", None)
 )
 
-# The peer holds a staged page under this lease until the reader's release lands
-# (pool_client.cpp DramReadLeaseTtl, UMBP_DRAM_READ_LEASE_MS, 500ms default). The
-# lease only has to outlive one RDMA round trip, which is sub-millisecond, but it
-# is what bounds how fast slots recycle -- at 500ms a fast multi-drive tier keeps
+# The SSD backend holds a staged page for this lease
+# (pool_client.cpp SsdReadLeaseTtl, UMBP_SSD_READ_LEASE_MS, 3000ms default).
+# It must outlive one SSD read plus RDMA, but it also bounds how fast slots
+# recycle -- at the production default a fast multi-drive tier can keep
 # thousands of pages pinned purely waiting for it. Default it down for the bench
 # so arena sizing stays a function of the sweep instead of the media speed. Must
 # be in the environment before the client is built: the C++ side caches it in a
 # function-local static on first read.
 _SSD_LEASE_MS = "50"
 if tier == "ssd":
-    os.environ.setdefault("UMBP_DRAM_READ_LEASE_MS", _SSD_LEASE_MS)
+    os.environ.setdefault("UMBP_SSD_READ_LEASE_MS", _SSD_LEASE_MS)
 
 
 # --- pool capacity sizing ----------------------------------------------------

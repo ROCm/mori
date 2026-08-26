@@ -124,7 +124,7 @@ class SsdBackend : public MediumBackend {
     PeerSsdConfig ssd;
 
     std::chrono::milliseconds pending_ttl{30000};
-    std::chrono::milliseconds read_lease_ttl{500};
+    std::chrono::milliseconds read_lease_ttl{3000};
     std::chrono::milliseconds reaper_interval{200};
   };
 
