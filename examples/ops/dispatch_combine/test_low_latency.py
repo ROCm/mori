@@ -43,6 +43,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+import argparse
 import json
 import os
 import sys
@@ -655,9 +656,16 @@ def test_main(
 
 
 # noinspection PyUnboundLocalVariable
-def test_loop(local_rank: int, num_local_ranks: int):
+def test_loop(
+    local_rank: int,
+    num_local_ranks: int,
+    num_tokens: int = 128,
+    hidden: int = 7168,
+    num_topk: int = 8,
+    num_experts: int = 288,
+    do_pressure_test: bool = False,
+):
     rank, num_ranks, group, num_nodes = init_dist(local_rank, num_local_ranks)
-    num_tokens, hidden, num_topk, num_experts = 128, 7168, 8, 288
 
     test_main(
         num_tokens,
@@ -671,7 +679,6 @@ def test_loop(local_rank: int, num_local_ranks: int):
         seed=1,
     )
 
-    do_pressure_test = False
     for seed in range(int(1e9) if do_pressure_test else 0):
         if local_rank == 0:
             print(f"Testing with seed {seed} ...", flush=True)
@@ -706,7 +713,39 @@ def test_loop(local_rank: int, num_local_ranks: int):
     dist.destroy_process_group()
 
 
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="DeepEP-style low-latency dispatch/combine test for MORI-EP."
+    )
+    # Defaults reproduce the shape this test has always run, so existing
+    # invocations are unaffected.
+    p.add_argument("--num-tokens", type=int, default=128, help="tokens per rank")
+    p.add_argument("--hidden", type=int, default=7168, help="hidden dimension")
+    p.add_argument("--num-topk", type=int, default=8, help="experts per token")
+    p.add_argument("--num-experts", type=int, default=288, help="experts in total")
+    p.add_argument(
+        "--num-processes", type=int, default=8, help="ranks per node (GPUs to use)"
+    )
+    p.add_argument(
+        "--pressure-test",
+        action="store_true",
+        help="loop over seeds forever, re-checking the output hash each time",
+    )
+    return p.parse_args()
+
+
 if __name__ == "__main__":
     # TODO: you may modify NUMA binding for less CPU overhead
-    num_processes = 8
-    torch.multiprocessing.spawn(test_loop, args=(num_processes,), nprocs=num_processes)
+    args = parse_args()
+    torch.multiprocessing.spawn(
+        test_loop,
+        args=(
+            args.num_processes,
+            args.num_tokens,
+            args.hidden,
+            args.num_topk,
+            args.num_experts,
+            args.pressure_test,
+        ),
+        nprocs=args.num_processes,
+    )
