@@ -330,6 +330,23 @@ TEST_P(RedisStoreTest, RegisterMakesClientAlive) {
   EXPECT_EQ(store_->GetClientTags("n1").size(), 2u);
 }
 
+TEST_P(RedisStoreTest, PreservesLogicalTierPeakUtilization) {
+  auto registration = MakeReg("n1");
+  LogicalTierCapacity hot;
+  hot.representative_tier = TierType::DRAM;
+  hot.capacity = TierCapacity{1024, 256, 128};
+  hot.put_eligible = true;
+  hot.peak_member_utilization = 0.875;
+  registration.logical_tier_capacities["hot"] = hot;
+
+  ASSERT_TRUE(store_->RegisterClient(registration, now_, 30s));
+  auto record = store_->GetClient("n1");
+  ASSERT_TRUE(record.has_value());
+  ASSERT_EQ(record->logical_tier_capacities.count("hot"), 1u);
+  EXPECT_DOUBLE_EQ(record->logical_tier_capacities.at("hot").peak_member_utilization,
+                   0.875);
+}
+
 TEST_P(RedisStoreTest, RegisterRejectsAliveDuplicateButAllowsStale) {
   EXPECT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
   // Alive and not stale -> rejected.
