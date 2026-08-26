@@ -756,25 +756,38 @@ inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
   MORI_TRACE_SPAN(profiler, Slot::CombineSync);
 
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
-  int tokenPerBlock = core::CeilDiv(totalRecvTokenNum, blockNum);
-  int startTokenIdx = blockId * tokenPerBlock;
-  int endTokenIdx = std::min(startTokenIdx + tokenPerBlock, totalRecvTokenNum);
+  if (totalRecvTokenNum <= 0) return;
+
+  // Blocking by token starves the grid whenever totalRecvTokenNum < blockNum, which is the
+  // normal case at low token counts: this kernel is always launched with one block per CU
+  // (304 on MI300X) while EP16 at 4 tokens/rank receives ~28. tokenPerBlock then rounds to 1,
+  // only warp 0 of the first 28 blocks has work, and 28 warps out of 2432 carry every copy.
+  // Split by (token, hidden slice) over the whole grid instead -- the same fix DispatchIntraNode
+  // needed.
+  MultiWarpIter mwIter(globalWarpNum, totalRecvTokenNum, hiddenDim);
 #ifndef ENABLE_STANDARD_MOE_ADAPT
-  for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
+  for (int i = globalWarpId; i < (totalRecvTokenNum * mwIter.warpsPerItem); i += globalWarpNum) {
+    int tokenId, inTokenPartId;
+    size_t hiddenDimOffset, hiddenDimSize;
+    mwIter.Decode(i, tokenId, inTokenPartId, hiddenDimOffset, hiddenDimSize);
+    if (hiddenDimSize == 0) continue;
+
+    const size_t base = tokenId * hiddenDim + hiddenDimOffset;
     if (args.config.quantType == QuantType::Fp8DirectCast) {
       using Fp8T = core::CombineInternalFp8;
       Fp8T* dst = args.interNodeV1TokBufs.combineInp->template GetAs<Fp8T*>();
-      const T* src = args.inpTokenBuf;
-      const size_t base = tokenId * hiddenDim;
-      core::WarpCastBf16ToCombineInternalFp8<T>(dst + base, src + base, hiddenDim, laneId);
+      core::WarpCastBf16ToCombineInternalFp8<T>(dst + base, args.inpTokenBuf + base, hiddenDimSize,
+                                                laneId);
     } else {
-      core::WarpCopy(args.interNodeV1TokBufs.combineInp->template GetAs<T*>() + tokenId * hiddenDim,
-                     args.inpTokenBuf + tokenId * hiddenDim, hiddenDim);
+      core::WarpCopy(args.interNodeV1TokBufs.combineInp->template GetAs<T*>() + base,
+                     args.inpTokenBuf + base, hiddenDimSize);
     }
   }
 #endif
   if (args.weightsBuf) {
-    for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
+    // numExpertPerToken floats per token -- too small to slice, so one warp per token, but
+    // strided over the whole grid rather than over one block's warps.
+    for (int tokenId = globalWarpId; tokenId < totalRecvTokenNum; tokenId += globalWarpNum) {
       core::WarpCopy(
           args.shmemInpWeightsMemObj->template GetAs<float*>() + tokenId * config.numExpertPerToken,
           args.weightsBuf + tokenId * config.numExpertPerToken, config.numExpertPerToken);
