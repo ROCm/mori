@@ -245,11 +245,9 @@ struct PoolClientConfig {
   void* ranged_put_scratch_buffer = nullptr;
   size_t ranged_put_scratch_size = 0;
 
-  // SSD read-staging tuning (peer side).  More slots reduce NO_SLOT under large
-  // concurrent prefetch batches, but shrink per-slot size (= staging_buffer_size
-  // / slots), which must stay >= the largest single SSD block.  The slot lease
-  // TTL (the primary slot-reclaim mechanism; ReleaseSsdLease is best-effort) is
-  // resolved from UMBP_SSD_READ_LEASE_MS at PeerService construction, not here.
+  // SSD read-staging tuning. More slots increase concurrent reads and writes;
+  // each policy-created SsdBackend owns `slots * page_size` staging bytes. Its
+  // read lease is resolved from UMBP_SSD_READ_LEASE_MS during PoolClient::Init.
   int ssd_staging_buffer_slots = 16;
 
   // Backs ssd_staging_buffer_, allocated only when ssd.enabled. A remote SSD
