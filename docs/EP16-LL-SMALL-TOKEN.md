@@ -21,6 +21,15 @@
 `EP16 = 2 节点 × 8 GPU`。两台共享同一个 NFS `/shared_inference`，所以代码和日志是共用的，
 容器则是每台一个。
 
+> §6 那一轮换到了 `useocpm2m-097-040`（`10.158.213.159`，node_rank 0）+
+> `useocpm2m-097-137`（`10.158.215.248`），容器名 `yutong-mori-perf`，工作目录
+> `dev/mori-perf`。§4 的数字来自上面这组机器，§6 的来自 040/137，**两组之间不要直接比**
+> —— §6 里所有对比都是在同一组机器上 A/B 交替测出来的。
+
+**开测前先确认没有别人在用这两台。** 这个 workload 是 host 定速的，别的进程哪怕只占
+CPU 也会污染数据；如果对方还占着 GPU，数字会直接飘到 5 倍以上。`uptime` 看 load，
+`rocm-smi --showuse --showmemuse` 看显存有没有被别人占。
+
 ### 容器（两台完全一致）
 
 ```bash
@@ -365,3 +374,171 @@ op **确实**是分阶段读 JSON 的（`get_launch_config(is_dispatch=...)`）�
 
 - `examples/ops/dispatch_combine/bench_matrix.py` —— 测量框架
 - `docs/EP16-LL-SMALL-TOKEN.md` —— 本文档
+
+---
+
+## 6. 2026-08-25/26 —— kernel 侧优化
+
+§5 的结论是"host-bound，kernel 改动全在噪声内"。这一轮回到 kernel，先把 GPU 侧
+真正的开销测出来，再改。结论是 kernel 侧确实有 20% 以上的水分，但要**先有能看见它的
+测量手段**。
+
+### 6.1 测量手段：`--kineto` 和拆 kernel
+
+两个前提工具：
+
+1. **`bench_matrix.py --kineto`** —— 从 CUDA profiler 直接取每个 kernel 的 GPU 时间。
+   端到端指标在小 token 下是 host 定速的，改了 kernel 也看不出来；kernel 时长来自设备，
+   不受 host 节奏影响，是优化 kernel 时唯一该盯的数。
+2. **把一个 kernel 拆成几个 launch 来做归因。** 主 kernel 内部是"干活 + 等对端"混在
+   一起的，phase 总时长分不清"算得慢"和"在等人"。拆开后 profile 直接给出比例。
+   这些拆分版本都保留下来了，由环境变量控制，默认走合并路径：
+
+   | 环境变量 | 作用 |
+   |---|---|
+   | `MORI_SPLIT_XBAR=1` | combine 主 kernel 拆成 accum+send / 跨节点 rendezvous |
+   | `MORI_SPLIT_DISP=1` | dispatch 拆成 stage+send / recv / sync |
+   | `MORI_INLINE_STAGE=0` | staging copy 退回独立 launch（§6.5 就是靠它定位的） |
+   | `MORI_FUSE_COMBINE_ALL=1` | 把 `EpCombineAll` 并进 combine 主 kernel（实测更慢，见 §6.4） |
+   | `MORI_SYNC_BN=<n>` | 覆盖 `EpCombineSyncLL` 的 grid |
+
+归因结果（4 token，hidden 6144，`disp=32/8/16 comb=64/4/32`）：
+
+| 阶段 | slowest us | fastest us |
+|---|---|---|
+| dispatch stage+send | 25.3 | 19.5 |
+| dispatch recv | 17.6 | 10.6 |
+| dispatch sync | 19.9 | 8.5 |
+| combine accum+send | 36.1 | 33.5 |
+| combine 跨节点 rendezvous | 41.4 | 11.7 |
+
+`fastest` 稳定说明那是**真实开销**，`slowest - fastest` 才是等待。combine 的
+accum+send fastest 33.5us 几乎不随数据量变（hidden 1024 vs 6144 只差 8us），
+说明它是**固定开销**，不是搬数据慢 —— 这条线索指向了 §6.2。
+
+### 6.2 三个 kernel 侧的真实问题
+
+**(1) `__threadfence_system()` 和 barrier arrival 是 per-warp 的。**
+gfx942 上 `__threadfence_system()` 是一次完整的 L2 writeback。combine 主 kernel 尾部
+每个 warp 都执行一次，于是 kernel 耗时跟着 **warp 数**走而不是数据量走：
+`warp_per_block` 从 4 调到 8，同样的 4 个 token 多花 13us。改成
+`__syncthreads()` + 单线程 fence + 每 block 一次 arrival 后消失。
+
+**(2) combine 遍历的是 padding 槽位。** `nodeRecvTokenNum` 记的是 chunk 数 ×
+`warpSize`，即把 token 数向上取整到 64 的倍数。原来对这个 padding 区间的每个槽位都要在
+chunk 完成计数器上做一次 `atomicAdd` —— 4 token 时是 **256 次串行原子操作打同一个地址
+来搬 4 个 token**，其中只有 16 次对应真实数据。改成直接跳过 padding 槽位，完成条件相应
+从 `warpsPerToken * warpSize` 改为 `thisChunkTokenNum * warpsPerToken`。
+
+**(3) combine 的 gather 没用 load-first 向量路径。** intra-node combine 早就用
+`WarpAccumLF<T,16>`（16B 向量 + 一次发出 `AccumNum*Unroll` 个 peer 读，用来盖住 xGMI
+的**延迟**），v1 internode 路径却还在用 `WarpAccum<TokT,4>`：4B/lane，且同时只有
+`AccumNum` 个读在飞。换过去后 combine accum 从 33.5 → 20.4us。
+
+> 换 `WarpAccumLF` 有个坑：它的向量主循环一次吃
+> `WARP_ACCUM_UNROLL * warpSize * (16/sizeof(T))` = 1024 个元素（bf16），不足一整步的
+> 尾巴会掉到**每 lane 一次标量 peer 读**的慢路径上。第一次改完反而从 33.5 涨到 35.3，
+> 就是因为每个 warp 只分到 512 个元素、整段都走了标量尾巴。必须把每 warp 的切片对齐到
+> 一整个向量步长（`CombineVecStep()`），`MultiWarpIter` 也为此加了 `dimGranularity`。
+
+### 6.3 减少 launch 次数：6 → 4
+
+- `EpDispatchCopyToStaging`（grid=mp）折进主 kernel 的 rdma block。每个 rdma block 只
+  发自己那段 token，所以 copy 按 block 切分之后不需要 grid 范围的 barrier，只要在发出
+  RDMA 前补一次 system fence（原来由 kernel 边界提供）。
+- `EpCombineSyncBarrier`（grid=1、单 warp，纯粹为了拿一个 grid 范围的顺序点）折进
+  `EpCombineSync` 最后到达的那个 block，合成 `EpCombineSyncLL`。
+
+### 6.4 试过但回退的
+
+| 改动 | 结果 |
+|---|---|
+| 把 `EpCombineAll` 并进 combine 主 kernel（grid barrier 代替 kernel 边界） | **更慢 ~17us**。硬件退掉一个 kernel 边界比一整个 grid 的 block 自旋在计数器上便宜。留了 `MORI_FUSE_COMBINE_ALL` 开关 |
+| 把 `EpCombineSyncLL` 的 grid 从 mp 缩到 `actual_bn` | per-kernel 时间降了（39.9 → 20.6us），端到端没区别。留了 `MORI_SYNC_BN` 开关，默认仍是 mp |
+| dispatch 侧的 per-block barrier | **正确性回归**，见 §6.5 |
+
+### 6.5 一个只在多 chunk 下出现的正确性回归
+
+把 (1) 的 per-block barrier 同样应用到 dispatch 的两处（`DispatchInterNodeLLSend` 尾部
+和 `DispatchSync`）之后，4/8/16/64 token 全过，但 **128 token/rank 偶发丢 1-2 个
+token**（`--cmd test` 要跑到 200~300 轮才暴露）。分界线是
+`maxChunkNum = ceil(maxNumInpTokenPerRank / warpSize)`：单 chunk 全过，多 chunk 才错。
+
+`DispatchInterNodeLLSend` 尾部那个 last-arriver 要读 `blockFlagCounter` 来算发给对端的
+`nodeRecvTokenNum`，而对端用它决定 combine 要遍历多少个 chunk。per-warp 版本里，同一个
+wave 先 `atomicAdd(blockFlagCounter)` 再 `atomicAdd(barrier)`，两者有 wave 内的顺序；
+改成 per-block 之后，读的线程和写的线程不在同一个 wave，中间只有一个 `__syncthreads()`
+和一个 relaxed 的 barrier atomic，没有 acquire/release 配对。读到偏小的
+`blockFlagCounter`，对端就会漏掉一个 chunk。
+
+**已回退这两处**，dispatch 保持 per-warp arrival。combine 尾部的 per-block barrier 不
+受影响（那里 last-arriver 不读别的 block 写的计数），保留。
+
+定位过程值得记下来，因为走了两次弯路：
+
+1. 一开始用 65 token 找边界，基线在 65 token 下**本身就挂**（这是个既有问题，不是回归），
+   白测了两轮。有效的多 chunk 测试点是 **128**，基线在那里是通过的。
+2. 中间有一次 `--cmd test` 慢了 5.6 倍，看着像性能回归，实际是上一次跑残留的进程没清掉在
+   抢机器。`cleanup.sh` 当时有个自杀 bug：`bash -c "pkill -f torchrun; ..."` 自己的 argv
+   就包含 `torchrun`，第一条 pkill 把自己杀了，后面几条根本没执行。模式改成
+   `[t]orchrun` 这种字符类写法就好了。
+
+### 6.6 host 侧顺手做掉的
+
+kernel 优化之后 GPU 时间已经低于 host 提交时间，两边都得动。`--cpu-profile` 显示
+host 侧没有单点热点了，但有两处纯浪费：
+
+- `torch.cuda.current_stream()` 每次重新解析 device 并构造 `Stream` 对象，**4.93us/次**；
+  它包装的原始 binding 只要 0.16us。
+- `os.environ.get()` 在每次调用的路径上（`_cached_view` 里 6 次/轮），提到模块级常量。
+- `_launch_multi` / `_resolve_launch_params` 里每次都执行 `from ... import ...`。
+
+### 6.7 结果
+
+正确性：4 / 8 / 16 / 128 token 各 500 轮，16 个 rank 全部 `error times: 0`。
+
+GPU kernel 时间（`--kineto`，4 token，slowest across ranks）：
+
+| kernel | 改前 | 改后 |
+|---|---|---|
+| dispatch（2 个 kernel → 1 个） | 75.9 | 56.8 |
+| combine sync（2 个 → 1 个） | 16.8 | 23.2 |
+| combine 主 kernel | 63.5 | 44.4 |
+| `EpCombineAll` | 10.7 | 5.2 |
+| **合计** | **166.8** | **129.6** |
+
+端到端（`bench_matrix.py --trials 5~7`，A/B 交替，取 trial 中位数、最慢 rank）：
+
+| max-tokens | 指标 | 改前 | 改后 |
+|---|---|---|---|
+| 4 | dispatch / combine / wall | 68.8 / 94.2 / 165.3 | 61.3 / 74.2 / 142.0 |
+| 8 | dispatch / combine / wall | 66.9 / 104.1 / 172.5 | 64.3 / 77.7 / 145.5 |
+| 16 | dispatch / combine / wall | 77.7 / 120.9 / 206.7 | 69.9 / 77.0 / 151.0 |
+
+host enqueue/轮：152.8 → 124.5 us（4 次重复，离散度 < 3%）。
+
+**这些数字的可信度要打个折**，如 §3.6 所说：端到端的 A/B 是在最终版本**之前**的
+revision 上测的（当时 dispatch 还带着 §6.5 后来回退掉的 per-block barrier），而回退之后
+机器上来了别的用户的负载，`wall` 一度跑到 800us 以上，没能在干净环境下完整重测。
+kernel 时间和 host enqueue 这两项是可信的，端到端的量级（−14% ~ −27%）方向可信、
+具体数值待复测。
+
+### 6.8 后续方向
+
+1. GPU 侧现在 fastest 加起来约 91us，slowest 约 157us —— **差的 66us 全是等待**，
+   而等待的根源是 16 个 rank 的启动不齐，也就是 host。§5.6 说的 HIP graph 仍然是
+   最大的那个杠杆，而且只有 host 降下来之后，kernel 这 20% 才吃得到。
+2. `EpCombineSync` 每个 block 只分到 1 个 token 且只有 warp 0 干活（`tokenPerBlock =
+   ceil(totalRecvTokenNum / blockNum)` 在小 token 下恒为 1），可以用 `MultiWarpIter`
+   把 hiddenDim 切给所有 warp。
+3. 基线在 **65 token/rank** 下会挂（§6.5），和本次改动无关，但值得单独查。
+
+### 6.9 改动清单
+
+- `src/ops/dispatch_combine/internode_v1.cpp` —— 上述全部 kernel 改动
+- `src/ops/dispatch_combine/common.hpp` —— `MultiWarpIter` 的 `dimGranularity`
+- `src/ops/dispatch_combine/launch.cpp`、`src/ops/kernels/ep_internode_v1ll.hip` —— launch 列表与 kernel 符号
+- `python/mori/ops/dispatch_combine.py` —— launch 列表、诊断开关、host 侧开销
+- 辅助脚本在 `/shared_inference/yutongwu/store/ep16_tuning/perf/`：
+  `run2.sh`（两节点跑一次 bench）、`verify.sh`（正确性）、`ab.sh`（交替 A/B）、
+  `deploy.sh`（推 kernel 源码进 JIT 树）、`cleanup.sh`、`env.sh`
