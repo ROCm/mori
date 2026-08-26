@@ -6,6 +6,7 @@ WRAP_ALL_TYPES(EpDispatchCopyToStaging)
 
 WRAP_ALL_TYPES_BOOL(EpDispatchInterNodeV1KernelLowLatency, , false)
 WRAP_ALL_TYPES_BOOL(EpDispatchInterNodeV1KernelLowLatency, _stdmoe, true)
+WRAP_ALL_TYPES(EpDispatchInterNodeV1LLInlineStage)
 
 WRAP_ALL_TYPES(EpCombineSync)
 WRAP_ALL_TYPES(EpCombineSyncLL)

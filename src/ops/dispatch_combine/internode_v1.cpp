@@ -287,7 +287,55 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
   }
 }
 
+// Pack [startTokenIdx, endTokenIdx) into the RDMA staging buffer using every warp
+// of the calling block.
+//
+// This is the per-block form of EpDispatchCopyToStaging, which is otherwise its
+// own grid=multiProcessorCount launch covering every token. An rdma block only
+// ever sends its own token range, so once the copy is block-local no grid-wide
+// barrier is needed and the separate launch disappears -- but the copy is then
+// limited to rdmaBlockNum*warpNum warps instead of mp*warpNum, which is only a
+// good trade while the payload is small. The launcher picks per call.
 template <typename T>
+inline __device__ void DispatchLLStageBlockTokens(EpDispatchCombineArgs<T>& args, int startTokenIdx,
+                                                  int endTokenIdx) {
+  DEF_COMMON_VARS;
+  int numTok = endTokenIdx - startTokenIdx;
+  if (numTok <= 0) return;
+
+  uint8_t* stagingPtr = args.interNodeV1TokBufs.dispatchStaging->template GetAs<uint8_t*>();
+  MultiWarpIter mwIter(warpNum, numTok, hiddenDim);
+
+  for (int i = warpId; i < (numTok * mwIter.warpsPerItem); i += warpNum) {
+    int localId, inTokenPartId;
+    size_t hiddenDimOffset, hiddenDimSize;
+    mwIter.Decode(i, localId, inTokenPartId, hiddenDimOffset, hiddenDimSize);
+    int tokenId = startTokenIdx + localId;
+
+    size_t stagingTokOffset = tokenId * xferBytes;
+    core::WarpCopy<uint8_t, 4>(stagingPtr + stagingTokOffset + hiddenDimOffset * sizeof(T),
+                               reinterpret_cast<uint8_t*>(args.inpTokenBuf) +
+                                   tokenId * hiddenBytes + hiddenDimOffset * sizeof(T),
+                               hiddenDimSize * sizeof(T));
+    if (inTokenPartId != 0) continue;
+    core::WarpCopy<uint8_t, 4>(stagingPtr + stagingTokOffset + hiddenBytes,
+                               reinterpret_cast<uint8_t*>(args.tokenIndices) + tokenId * indexBytes,
+                               indexBytes);
+    core::WarpCopy<uint8_t, 4>(stagingPtr + stagingTokOffset + hiddenBytes + indexBytes,
+                               reinterpret_cast<uint8_t*>(args.weightsBuf) + tokenId * weightBytes,
+                               weightBytes);
+    if (args.scalesBuf && (scaleBytes > 0))
+      core::WarpCopy<uint8_t, 4>(
+          stagingPtr + stagingTokOffset + hiddenBytes + indexBytes + weightBytes,
+          reinterpret_cast<uint8_t*>(args.scalesBuf) + tokenId * scaleBytes, scaleBytes);
+    if (laneId == 0)
+      reinterpret_cast<index_t*>(stagingPtr + stagingTokOffset + hiddenBytes + indexBytes +
+                                 weightBytes + scaleBytes)[0] =
+          static_cast<index_t>(FlatTokenIndex(config, config.rank, tokenId));
+  }
+}
+
+template <typename T, bool InlineStage = false>
 inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
@@ -301,6 +349,26 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
   int chunkStartTokenIdx = blockChunkNum * blockId * warpSize;
   int chunkEndTokenIdx =
       std::min(chunkStartTokenIdx + blockChunkNum * warpSize, args.curRankNumToken);
+
+  if constexpr (InlineStage) {
+    // The NIC reads the staging buffer directly, so the payload has to be visible
+    // system-wide before any put is issued -- the fence the kernel boundary used
+    // to provide is gone. One fence per block, after __syncthreads() has retired
+    // every warp's stores.
+    //
+    // Gated on there being a token range at all: __threadfence_system() is a
+    // full-chip L2 writeback, and rdmaBlockNum blocks issuing one concurrently
+    // regardless of whether they staged anything measured as a ~5x regression
+    // on the whole kernel (only 1-2 of e.g. 16 blocks ever own real tokens at
+    // small counts; the rest own an empty range and have nothing to publish).
+    if (chunkEndTokenIdx > chunkStartTokenIdx) {
+      DispatchLLStageBlockTokens(args, chunkStartTokenIdx, chunkEndTokenIdx);
+      __syncthreads();
+      if (thdId == 0) __threadfence_system();
+      __syncthreads();
+    }
+  }
+
   for (int i = warpId; i < nNodes; i += warpNum) {
     if (i == myNode) continue;
     int proxyPe = i * config.gpuPerNode + (config.rank % config.gpuPerNode);
@@ -721,6 +789,27 @@ __device__ void EpDispatchInterNodeV1KernelLowLatency_body(EpDispatchCombineArgs
 template <typename T, bool EnableStdMoE>
 __global__ void EpDispatchInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args) {
   EpDispatchInterNodeV1KernelLowLatency_body<T, EnableStdMoE>(args);
+}
+
+// Same as above but packing the staging buffer itself, so EpDispatchCopyToStaging
+// does not have to be launched. One launch less, at the cost of doing the copy
+// with rdmaBlockNum*warpNum warps instead of mp*warpNum -- worth it only while
+// the payload is small, which is why the launcher chooses per call.
+template <typename T>
+__device__ void EpDispatchInterNodeV1LLInlineStage_body(EpDispatchCombineArgs<T> args) {
+  DEF_COMMON_VARS;
+  if (blockId < args.rdmaBlockNum) {
+    v1::DispatchInterNodeLLSend<T, true>(args);
+    v1::DispatchInterNodeLLRecv(args);
+  } else {
+    v1::DispatchIntraNode(args);
+  }
+  v1::DispatchSync(args);
+}
+
+template <typename T>
+__global__ void EpDispatchInterNodeV1LLInlineStage(EpDispatchCombineArgs<T> args) {
+  EpDispatchInterNodeV1LLInlineStage_body<T>(args);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
