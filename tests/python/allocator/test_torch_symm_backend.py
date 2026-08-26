@@ -96,30 +96,46 @@ def _run_release(rank, world_size, port):
         symm_mem.enable_symm_mem_for_group(group_name)
 
         mib = 1 << 20
+        rounds = 4
 
-        def cycle():
+        def cycle(rendezvous):
             t = symm_mem.empty(16 * mib // 4, dtype=torch.float32, device=device)
-            hdl = symm_mem.rendezvous(t, group_name)
-            assert hdl.world_size == world_size
+            if rendezvous:
+                hdl = symm_mem.rendezvous(t, group_name)
+                assert hdl.world_size == world_size
+            else:
+                hdl = None
             dist.barrier()
             del hdl, t
             gc.collect()
             torch.cuda.synchronize()
             dist.barrier()
 
-        cycle()  # first cycle also pays any one-off context growth
-        settled = torch.cuda.mem_get_info(device)[0]
-        rounds = 4
-        for _ in range(rounds):
-            cycle()
+        def measure(rendezvous):
+            cycle(rendezvous)  # first cycle also pays any one-off context growth
+            settled = torch.cuda.mem_get_info(device)[0]
+            for _ in range(rounds):
+                cycle(rendezvous)
+            return settled - torch.cuda.mem_get_info(device)[0]
+
+        # The control isolates who is at fault. Plain alloc/free exercises only
+        # hipMemCreate/hipMemRelease; adding rendezvous brings in the shareable-fd
+        # export and import, whose fd lifetime rules changed in ROCm 7.14. If both
+        # leak, the pairing itself is broken rather than anything about sharing.
+        plain = measure(rendezvous=False)
+        shared = measure(rendezvous=True)
+
         # mem_get_info is device-wide, so anything else sharing the GPU moves it too.
         # Leaking would cost rounds * 16 MiB; half of one window is a wide enough margin
         # to stay clear of that noise while still failing loudly on a real leak.
-        lost = settled - torch.cuda.mem_get_info(device)[0]
-        assert lost < 8 * mib, (
-            f"free memory dropped {lost / mib:.1f} MiB across {rounds} alloc/free "
-            f"cycles of 16 MiB each: the window is leaking"
+        report = (
+            f"[rank {rank}] hip={torch.version.hip} world={world_size} "
+            f"lost over {rounds} x 16 MiB cycles: alloc/free only={plain / mib:.1f} MiB, "
+            f"with rendezvous={shared / mib:.1f} MiB"
         )
+        print(report, flush=True)
+        assert plain < 8 * mib, f"plain alloc/free leaks, before any sharing. {report}"
+        assert shared < 8 * mib, f"the rendezvous'd window leaks. {report}"
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs at least 2 GPUs")
