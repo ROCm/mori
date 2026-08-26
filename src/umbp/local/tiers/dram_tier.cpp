@@ -112,6 +112,27 @@ inline void CopyBlock(void* dst, const void* src, size_t size) {
   }
 }
 
+// Only picks a cache candidate; a hit is confirmed by comparing every key, so
+// this needs to be fast and well-spread, not cryptographic.
+uint64_t FingerprintKeys(const std::vector<std::string>& keys) {
+  uint64_t h = 1469598103934665603ULL;  // FNV-1a offset basis
+  auto mix = [&h](const void* data, size_t len) {
+    const auto* p = static_cast<const unsigned char*>(data);
+    for (size_t i = 0; i < len; ++i) {
+      h ^= p[i];
+      h *= 1099511628211ULL;
+    }
+  };
+  const uint64_t count = keys.size();
+  mix(&count, sizeof(count));
+  for (const auto& key : keys) {
+    const uint64_t len = key.size();
+    mix(&len, sizeof(len));
+    mix(key.data(), key.size());
+  }
+  return h;
+}
+
 struct CopyJob {
   void* dst;
   const void* src;
@@ -831,6 +852,7 @@ void DRAMTier::EvictLRU() {
     Deallocate(slot_it->second.offset, slot_it->second.size);
     used_ -= slot_it->second.size;
     slots_.erase(slot_it);
+    ++slot_generation_;
   }
   lru_map_.erase(victim);
   lru_list_.pop_back();
@@ -845,6 +867,7 @@ bool DRAMTier::Write(const std::string& key, const void* data, size_t size) {
     Deallocate(existing->second.offset, existing->second.size);
     used_ -= existing->second.size;
     slots_.erase(existing);
+    ++slot_generation_;
     {
       std::lock_guard<std::mutex> lru_lock(lru_mu_);
       auto lru_it = lru_map_.find(key);
@@ -973,28 +996,81 @@ std::vector<bool> DRAMTier::ReadBatchRangesIntoPtr(
   std::vector<CopyJob> jobs;
   jobs.reserve(total_ranges);
   std::vector<size_t> expected(n, 0);
+
+  // A layer group repeats the previous group's key set, so try to answer the
+  // lookups from the last time this exact set came through.
+  const uint64_t fingerprint = FingerprintKeys(keys);
+  const SlotInfo* cached_slots = nullptr;
+  auto cache_it = range_lookup_cache_.find(fingerprint);
+  if (cache_it != range_lookup_cache_.end()) {
+    if (cache_it->second.generation == slot_generation_ && cache_it->second.keys == keys) {
+      cache_it->second.last_used = ++range_lookup_clock_;
+      cached_slots = cache_it->second.slots.data();
+    } else {
+      range_lookup_cache_.erase(cache_it);
+    }
+  }
+
+  std::vector<SlotInfo> found_slots;
+  bool all_found = true;
+  if (cached_slots == nullptr) found_slots.assign(n, SlotInfo{0, 0});
+
   for (size_t i = 0; i < n; ++i) {
-    if (sizes[i].empty()) continue;
-    auto it = slots_.find(keys[i]);
-    if (it == slots_.end()) continue;
+    if (sizes[i].empty()) {
+      all_found = false;
+      continue;
+    }
+    SlotInfo slot;
+    if (cached_slots != nullptr) {
+      slot = cached_slots[i];
+    } else {
+      auto it = slots_.find(keys[i]);
+      if (it == slots_.end()) {
+        all_found = false;
+        continue;
+      }
+      slot = it->second;
+      found_slots[i] = slot;
+    }
 
     bool valid = true;
     for (size_t j = 0; j < sizes[i].size(); ++j) {
-      if (sizes[i][j] == 0 ||
-          IsObjectRangeOverflow(src_offsets[i][j], sizes[i][j], it->second.size)) {
+      if (sizes[i][j] == 0 || IsObjectRangeOverflow(src_offsets[i][j], sizes[i][j], slot.size)) {
         valid = false;
         break;
       }
     }
-    if (!valid) continue;
+    if (!valid) {
+      all_found = false;
+      continue;
+    }
 
     expected[i] = sizes[i].size();
     for (size_t j = 0; j < sizes[i].size(); ++j) {
       void* dst = reinterpret_cast<void*>(dst_ptrs[i][j]);
-      const void* src = static_cast<const char*>(base_ptr_) + it->second.offset + src_offsets[i][j];
+      const void* src = static_cast<const char*>(base_ptr_) + slot.offset + src_offsets[i][j];
       jobs.push_back({dst, src, dst, sizes[i][j], i, false});
       job_bytes += sizes[i][j];
     }
+  }
+
+  // Only a batch that hit on every key is reusable.  The generation tracks
+  // slots being taken away or moved, not new keys arriving, so a remembered
+  // miss could outlive the key showing up; a full hit has no such hole.
+  if (cached_slots == nullptr && all_found) {
+    if (range_lookup_cache_.size() >= kRangeLookupCacheCapacity) {
+      auto oldest = range_lookup_cache_.begin();
+      for (auto it = range_lookup_cache_.begin(); it != range_lookup_cache_.end(); ++it) {
+        if (it->second.last_used < oldest->second.last_used) oldest = it;
+      }
+      range_lookup_cache_.erase(oldest);
+    }
+    RangeLookupCache entry;
+    entry.keys = keys;
+    entry.slots = std::move(found_slots);
+    entry.generation = slot_generation_;
+    entry.last_used = ++range_lookup_clock_;
+    range_lookup_cache_.emplace(fingerprint, std::move(entry));
   }
 
   const uint64_t lookup_us = phase.Lap();
@@ -1056,6 +1132,7 @@ std::vector<bool> DRAMTier::BatchWrite(const std::vector<std::string>& keys,
         Deallocate(existing->second.offset, existing->second.size);
         used_ -= existing->second.size;
         slots_.erase(existing);
+        ++slot_generation_;
         auto lru_it = lru_map_.find(keys[i]);
         if (lru_it != lru_map_.end()) {
           lru_list_.erase(lru_it->second);
@@ -1184,6 +1261,10 @@ std::vector<bool> DRAMTier::BatchWriteRanges(const std::vector<std::string>& key
     if (existing != slots_.end()) {
       Deallocate(existing->second.offset, existing->second.size);
       used_ -= existing->second.size;
+      // Overwritten in place rather than erased, so nothing else moves the
+      // generation here -- and this key's offset is about to change under any
+      // remembered lookup that names it.
+      ++slot_generation_;
     }
     slots_[key] = {reservation.offset, reservation.object_size};
     used_ += reservation.object_size;
@@ -1245,6 +1326,7 @@ bool DRAMTier::Evict(const std::string& key) {
   Deallocate(it->second.offset, it->second.size);
   used_ -= it->second.size;
   slots_.erase(it);
+  ++slot_generation_;
 
   {
     std::lock_guard<std::mutex> lru_lock(lru_mu_);
@@ -1266,6 +1348,8 @@ void DRAMTier::Clear() {
   std::unique_lock<std::shared_mutex> lock(mu_);
   std::lock_guard<std::mutex> lru_lock(lru_mu_);
   slots_.clear();
+  ++slot_generation_;
+  range_lookup_cache_.clear();
   lru_list_.clear();
   lru_map_.clear();
   free_list_.clear();
