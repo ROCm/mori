@@ -1070,9 +1070,23 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs<T>
       int tokenId = i / warpsPerToken;
       int k = tokenId / warpSize;
       int startTokenIdx = k * warpSize;
-      uint64_t thisChunkTokenNum = chunkFlag[node * maxChunkNum + k];
-      thisChunkTokenNum -= (thisChunkTokenNum > 0) ? 1 : 0;
-      if ((tokenId - startTokenIdx) < thisChunkTokenNum) {
+      uint64_t cf = chunkFlag[node * maxChunkNum + k];
+      int thisChunkTokenNum = (cf > 0) ? static_cast<int>(cf - 1) : 0;
+
+      // nodeRecvTokenNum counts whole warpSize-wide chunks, so this range is
+      // padded up to a multiple of warpSize. Skip the padding slots outright
+      // instead of running them just for their arrival on the chunk counter: at
+      // 4 tokens/rank that arrival was 256 serialised atomics on one address to
+      // move 4 tokens, only 16 of which carried data. The completion target
+      // below drops to the real slot count to match.
+      //
+      // A slot whose chunk has already completed reads thisChunkTokenNum == 0
+      // and lands here too, which is correct -- a chunk cannot complete until
+      // all of its real slots have arrived, so no real slot can reach this point
+      // after the clear.
+      if ((tokenId - startTokenIdx) >= thisChunkTokenNum) continue;
+
+      {
         int inTokenPartId = i % warpsPerToken;
         size_t hiddenDimOffset = inTokenPartId * hiddenDimPerWarp;
         size_t hiddenDimSize = (hiddenDimOffset < hiddenDim)
@@ -1111,7 +1125,7 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs<T>
       if (laneId == 0)
         finished = atomicAdd(&args.interNodeChunkFlagCombine[node * maxChunkNum + k], 1);
       finished = __shfl(finished, 0);
-      if ((finished + 1) >= (warpsPerToken * warpSize)) {
+      if ((finished + 1) >= (thisChunkTokenNum * warpsPerToken)) {
         if (laneId == 0) {
           core::AtomicStoreSeqCstSystem(
               args.interNodeChunkFlagMemObj->template GetAs<uint64_t*>() + node * maxChunkNum + k,
