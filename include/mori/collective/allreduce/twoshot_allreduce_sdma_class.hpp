@@ -31,6 +31,7 @@
 #include <tuple>
 
 #include "mori/application/application.hpp"
+#include "mori/collective/allreduce/twoshot_sdma_common.hpp"
 #include "mori/collective/ccl_kernel_args.hpp"
 #include "mori/collective/collective_pub.hpp"
 #include "mori/collective/core/wall_time.hpp"
@@ -38,18 +39,6 @@
 
 namespace mori {
 namespace collective {
-
-struct alignas(128) CrossPeBarrier {
-  alignas(128) uint32_t flag;
-};
-
-inline int getDeviceMaxBlocks() {
-  int dev = 0;
-  (void)hipGetDevice(&dev);
-  hipDeviceProp_t prop;
-  (void)hipGetDeviceProperties(&prop, dev);
-  return (prop.multiProcessorCount > 0) ? prop.multiProcessorCount : 80;
-}
 
 template <typename T>
 class AllreduceSdma {
@@ -64,25 +53,17 @@ class AllreduceSdma {
   application::SymmMemObjPtr flagsObj_;
   std::unique_ptr<uint64_t[], ShmemDeleter> flags_;
 
-  // Device-scope barrier for block-0-to-all broadcast inside
-  // SdmaReduceScatterKernel (generation counter, ~128 bytes).
+  // Device-side generation and per-block rendezvous state.
   CrossPeBarrier* barrierPtr_;
   std::unique_ptr<void, ShmemDeleter> barrierMem_;
 
-  // Input transit buffer (symmetric memory for P2P reads)
+  // Fixed-stride symmetric scratch for SDMA scatter + local reduce. Rank slots
+  // keep stable offsets across graph replays with different message sizes.
   void* input_transit_buffer_;
   size_t input_transit_buffer_size_;
+  size_t slot_stride_elements_;
   application::SymmMemObjPtr input_transit_buffer_obj_;
   std::unique_ptr<void, ShmemDeleter> input_transit_buffer_ptr_;
-
-  // Output transit buffer — serves as:
-  //   1. SDMA scatter destination (gather buffer, npes * chunkSize)
-  //   2. Local reduce output (myPe's slot)
-  //   3. AllGather source / final result
-  void* output_transit_buffer_;
-  size_t output_transit_buffer_size_;
-  application::SymmMemObjPtr output_transit_buffer_obj_;
-  std::unique_ptr<void, ShmemDeleter> output_transit_buffer_ptr_;
 
   // Async state variables
   std::atomic<bool> async_in_progress_;
@@ -90,21 +71,18 @@ class AllreduceSdma {
   T* async_output_;
   size_t async_total_count_;
   hipStream_t async_stream_;
+  // Marks completion of work enqueued by start_async for cross-stream waits.
+  hipEvent_t async_start_event_;
   double async_start_time_;
 
-  // Copy mode flag: if true, copy output_transit_buffer to user output buffer
-  // if false, user should directly use output_transit_buffer
+  // Kept for source compatibility. Results are always materialized in the
+  // caller output; two-shot operations copy from compact symmetric scratch.
   bool copy_output_to_user_;
 
   AllreduceSdma(const AllreduceSdma&) = delete;
   AllreduceSdma& operator=(const AllreduceSdma&) = delete;
 
-  bool ensure_buffer_size(void*& buffer, std::unique_ptr<void, ShmemDeleter>& buffer_ptr,
-                          size_t& current_size, application::SymmMemObjPtr& buffer_obj,
-                          size_t required_size, const char* buffer_name);
-
   void copy_input_to_transit(T* input, size_t total_count, hipStream_t stream);
-  void copy_output_to_user(T* output, size_t total_count, hipStream_t stream);
   void fill_jit_args_(const T* input, size_t total_count);
 
  public:
@@ -113,7 +91,7 @@ class AllreduceSdma {
    * @param myPe Current PE ID
    * @param npes Total number of PEs
    * @param transit_buffer_size Output transit buffer size in bytes (default 512MB)
-   * @param copy_output_to_user If true, copy result to user output buffer
+   * @param copy_output_to_user Kept for compatibility; caller output is always populated.
    * @param use_graph_mode Kept for API compat — ignored (SDMA always reads
    *        input directly, no IPC registration needed).
    */
@@ -167,11 +145,6 @@ class AllreduceSdma {
   bool allreduce_inplace(T* data, size_t total_count, hipStream_t stream = nullptr);
 
   application::SymmMemObjPtr getFlagsObj() const { return flagsObj_; }
-  void* getOutputTransitBuffer() const { return output_transit_buffer_; }
-  size_t getOutputTransitBufferSize() const { return output_transit_buffer_size_; }
-  application::SymmMemObjPtr getOutputTransitBufferObj() const {
-    return output_transit_buffer_obj_;
-  }
 
   void resetFlags();
 
@@ -184,15 +157,15 @@ class AllreduceSdma {
   std::tuple<int, int> get_reduce_scatter_grid(size_t total_count) const;
   int64_t prepare_allgather(size_t total_count, hipStream_t stream);
   double finish_sync(T* output, size_t total_count, hipStream_t stream,
-                     bool force_copy_output_to_user = false);
+                     bool force_copy_output_to_user = false, bool direct_output = false);
 
   int64_t prepare_async_reduce_scatter(const T* input, T* output, size_t total_count,
                                        hipStream_t stream);
   int64_t prepare_async_allgather_put(size_t total_count, hipStream_t stream);
-  void after_async_start();
+  void after_async_start(bool capturing = false);
 
   int64_t prepare_async_wait(hipStream_t stream);
-  double finish_async_wait(hipStream_t stream);
+  double finish_async_wait(hipStream_t stream, bool capturing = false, bool direct_output = false);
 
   int max_blocks() const { return max_blocks_; }
   int npes() const { return npes_; }

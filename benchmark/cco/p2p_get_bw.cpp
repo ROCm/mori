@@ -23,8 +23,9 @@
 // CCO p2p get bandwidth — PE 0 pulls from PE 1's send window into its recv
 // window.
 //
-//   -T lsa   : intra-node flat-VA load loop (read peer slot → local).
-//   -T ibgda : cross-node one-sided RDMA read via ccoGda<PrvdType>.
+//   -t lsa   : intra-node flat-VA load loop (read peer slot → local).
+//   -t sdma  : intra-node copy engine via ccoSdma.
+//   -t ibgda : cross-node one-sided RDMA read via ccoGda<PrvdType>.
 
 #include <cstdio>
 #include <cstdlib>
@@ -98,20 +99,41 @@ __global__ void ibgda_get_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
   gda.flush(ccoCoopBlock{});
 }
 
-// SDMA thread scope: one thread per SDMA queue pulls its slice each iteration;
-// quiet drains completion at the end. Each slice is issued as `depth` sub-copies:
-// with agg the doorbell is suppressed and one commit() rings the batch.
-template <uint32_t Flags>
+// SDMA: the buffer is split over issue units -- a unit is a thread, a wavefront or
+// a whole block, per Coop -- spread across the grid, one queue per unit round
+// robin. Each unit's slice is issued as `depth` sub-copies: with agg the doorbell
+// is suppressed and one commit() rings the batch, otherwise each sub-copy rings.
+template <typename Coop, uint32_t Flags>
 __global__ void sdma_get_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, size_t len_doubles,
                             ccoDevComm devComm, int peerLsa, int iter, int depth) {
   ccoSdma sdma{devComm};
-  const int nq = devComm.sdma.sdmaNumQueue;
-  const int q = threadIdx.x;
-  if (q >= nq) return;
+  // Uniform inside a coop group, so the group derives one slice and calls get together.
+  int unitsPerBlock, unitInBlock;
+  if constexpr (std::is_same_v<Coop, ccoCoopThread>) {
+    unitsPerBlock = blockDim.x;
+    unitInBlock = threadIdx.x;
+  } else if constexpr (std::is_same_v<Coop, ccoCoopWarp>) {
+    unitsPerBlock = blockDim.x / warpSize;
+    unitInBlock = threadIdx.x / warpSize;
+  } else {
+    unitsPerBlock = 1;
+    unitInBlock = 0;
+  }
+  const int nUnits = gridDim.x * unitsPerBlock;
+  const int u = blockIdx.x * unitsPerBlock + unitInBlock;
+  const int q = u % devComm.sdma.sdmaNumQueue;
+
   const size_t total = len_doubles * sizeof(double);
-  const size_t per = total / static_cast<size_t>(nq);
-  const size_t off = static_cast<size_t>(q) * per;
-  const size_t bytes = (q == nq - 1) ? (total - off) : per;
+  const size_t per = (total / static_cast<size_t>(nUnits)) & ~size_t{7};
+  size_t base = 0, bytes = total;
+  if (per != 0) {
+    base = static_cast<size_t>(u) * per;
+    bytes = (u == nUnits - 1) ? (total - base) : per;
+  } else if (u != 0) {
+    return;  // more units than 8B chunks: unit 0 moves it all
+  }
+  if (bytes == 0) return;
+
   constexpr bool agg = (Flags & ccoSdmaOptFlagsAggregate) != 0;
   const size_t sub = bytes / static_cast<size_t>(depth);
   for (int i = 0; i < iter; i++) {
@@ -119,62 +141,42 @@ __global__ void sdma_get_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, 
       const size_t so = static_cast<size_t>(j) * sub;
       const size_t sb = (j == depth - 1) ? (bytes - so) : sub;
       if (sb == 0) continue;  // bytes < depth: skip empty sub-copies (no 0-byte packet)
-      sdma.get<ccoCoopThread, false, false, Flags>(peerLsa, reinterpret_cast<ccoWindow_t>(recvWin),
-                                                   off + so, reinterpret_cast<ccoWindow_t>(sendWin),
-                                                   off + so, sb, q);
+      sdma.get<Coop, false, false, Flags>(peerLsa, reinterpret_cast<ccoWindow_t>(recvWin),
+                                          base + so, reinterpret_cast<ccoWindow_t>(sendWin),
+                                          base + so, sb, q);
     }
-    if constexpr (agg) sdma.commit(peerLsa, q);
+    if constexpr (agg) sdma.commit<Coop>(peerLsa, q);
   }
-  sdma.quietQueue(peerLsa, q);
-}
-
-// SDMA warp/block scope: leader-only, so one lane issues the whole transfer on one
-// queue — the group does not split it. `depth` sub-copies per iteration; with agg
-// one commit() rings them, else each get rings. Contrast with the thread kernel,
-// which puts one issuer on every queue and so uses a smaller op each.
-template <typename Coop, uint32_t Flags>
-__global__ void sdma_get_bw_coop(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
-                                 size_t len_doubles, ccoDevComm devComm, int peerLsa, int iter,
-                                 int depth) {
-  ccoSdma sdma{devComm};
-  const size_t total = len_doubles * sizeof(double);
-  constexpr bool agg = (Flags & ccoSdmaOptFlagsAggregate) != 0;
-  const size_t sub = total / static_cast<size_t>(depth);
-  for (int i = 0; i < iter; i++) {
-    for (int j = 0; j < depth; j++) {
-      const size_t so = static_cast<size_t>(j) * sub;
-      const size_t sb = (j == depth - 1) ? (total - so) : sub;
-      if (sb == 0) continue;  // total < depth: skip empty sub-copies (no 0-byte packet)
-      sdma.get<Coop, false, false, Flags>(peerLsa, reinterpret_cast<ccoWindow_t>(recvWin), so,
-                                          reinterpret_cast<ccoWindow_t>(sendWin), so, sb, 0);
-    }
-    if constexpr (agg) sdma.commit<Coop>(peerLsa);
-  }
-  sdma.quiet<Coop>(peerLsa);
+  sdma.quietQueue<Coop>(peerLsa, q);
 }
 
 static void launch_sdma(PutScope scope, ccoWindow_t sendWin, ccoWindow_t recvWin,
                         size_t len_doubles, ccoDevComm devComm, int peerLsa, int count,
-                        int warp_size, int depth, bool agg) {
+                        int warp_size, int depth, bool agg, int nblocks, int threads) {
   const int nq = devComm.sdma.sdmaNumQueue;
-  const int thr = scope == PutScope::kWarp ? warp_size : (scope == PutScope::kBlock ? 256 : nq);
-  const dim3 grid(1), block(thr);
-#define LAUNCH(FLAGS)                                                                            \
-  do {                                                                                           \
-    if (scope == PutScope::kWarp)                                                                \
-      hipLaunchKernelGGL((sdma_get_bw_coop<ccoCoopWarp, FLAGS>), grid, block, 0, 0, sendWin,     \
-                         recvWin, len_doubles, devComm, peerLsa, count, depth);                  \
-    else if (scope == PutScope::kBlock)                                                          \
-      hipLaunchKernelGGL((sdma_get_bw_coop<ccoCoopBlock, FLAGS>), grid, block, 0, 0, sendWin,    \
-                         recvWin, len_doubles, devComm, peerLsa, count, depth);                  \
-    else                                                                                         \
-      hipLaunchKernelGGL((sdma_get_bw<FLAGS>), grid, block, 0, 0, sendWin, recvWin, len_doubles, \
-                         devComm, peerLsa, count, depth);                                        \
+  // Without -c / -T: one block, and one issue unit per queue for thread scope.
+  const dim3 grid(nblocks > 0 ? nblocks : 1);
+  const dim3 block(threads > 0 ? threads
+                               : (scope == PutScope::kWarp    ? warp_size
+                                  : scope == PutScope::kBlock ? 256
+                                                              : nq));
+#define LAUNCH(COOP, FLAGS)                                                                        \
+  hipLaunchKernelGGL((sdma_get_bw<COOP, FLAGS>), grid, block, 0, 0, sendWin, recvWin, len_doubles, \
+                     devComm, peerLsa, count, depth)
+#define LAUNCH_SCOPE(FLAGS)             \
+  do {                                  \
+    if (scope == PutScope::kWarp)       \
+      LAUNCH(ccoCoopWarp, FLAGS);       \
+    else if (scope == PutScope::kBlock) \
+      LAUNCH(ccoCoopBlock, FLAGS);      \
+    else                                \
+      LAUNCH(ccoCoopThread, FLAGS);     \
   } while (0)
   if (agg)
-    LAUNCH(ccoSdmaOptFlagsAggregate);
+    LAUNCH_SCOPE(ccoSdmaOptFlagsAggregate);
   else
-    LAUNCH(ccoSdmaOptFlagsDefault);
+    LAUNCH_SCOPE(ccoSdmaOptFlagsDefault);
+#undef LAUNCH_SCOPE
 #undef LAUNCH
 }
 
@@ -259,7 +261,8 @@ int main(int argc, char** argv) {
         if (args.transport == Transport::kSdma) {
           launch_sdma(args.put_scope, ctx.send_win, ctx.recv_win, len_doubles, ctx.devComm,
                       ctx.peer_lsa_rank, count, ctx.device_warp_size, args.agg_depth,
-                      args.aggregate);
+                      args.aggregate, args.nblocks_explicit ? args.nblocks : 1,
+                      args.threads_explicit ? args.threads_per_block : 0);
         } else if (args.transport == Transport::kLsa) {
           launch_lsa(args.put_scope, grid, block, ctx.send_win, ctx.recv_win, res.counter_d,
                      len_doubles, ctx.peer_lsa_rank, count, ctx.device_warp_size);
@@ -280,23 +283,17 @@ int main(int argc, char** argv) {
 
   ccoBarrierAll(ctx.comm);
   if (my_pe == 0) {
-    // SDMA parallelism is the queue count; see put_bw. thread scope → 1×nq
-    // threads (one message per queue); warp scope → a single warp fanning the
-    // whole transfer across the queues.
+    // Mirror the geometry launch_sdma derives when -c / -T are absent.
     int print_grid = args.nblocks;
     int print_block = args.threads_per_block;
     const char* print_scope = ScopeToChar(args.put_scope);
     if (args.transport == Transport::kSdma) {
-      print_grid = 1;
-      if (args.put_scope == PutScope::kWarp) {
-        print_block = ctx.device_warp_size;
-        print_scope = "warp";
-      } else if (args.put_scope == PutScope::kBlock) {
-        print_block = 256;
-        print_scope = "block";
-      } else {
-        print_block = static_cast<int>(ctx.devComm.sdma.sdmaNumQueue);
-        print_scope = "thread";
+      if (!args.nblocks_explicit) print_grid = 1;
+      if (!args.threads_explicit) {
+        print_block = args.put_scope == PutScope::kWarp ? ctx.device_warp_size
+                      : args.put_scope == PutScope::kBlock
+                          ? 256
+                          : static_cast<int>(ctx.devComm.sdma.sdmaNumQueue);
       }
     }
     PrintPerfTable("p2p_get_bw unidirection", TransportToChar(args.transport), print_scope,

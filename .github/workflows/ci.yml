@@ -22,13 +22,16 @@ on:
         type: boolean
         default: false
         description: Enable DP/EP modes when launching the hicache test
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
   IMAGE: rocm/mori:ci
-  BASE_IMAGE: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0
+  BASE_IMAGE: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
   CONTAINER: mori_ci_${{ github.run_id }}
   CT: docker
 
@@ -369,8 +372,13 @@ jobs:
 
       - name: Install mori (XLA FFI)
         run: |
+          # Resolve the XLA FFI headers from the system jax *outside* pip's
+          # isolated build env (build isolation hides system site-packages, so
+          # CMake can't `import jax` during configure). Pass it via env var.
           $CT exec ${CONTAINER}_jax bash -c \
-            "cd $GITHUB_WORKSPACE && BUILD_UMBP=OFF BUILD_XLA_FFI_OPS=ON pip install --break-system-packages ."
+            "cd $GITHUB_WORKSPACE && \
+             export XLA_FFI_INCLUDE_DIR=\$(python3 -c 'from jax import ffi; print(ffi.include_dir())') && \
+             BUILD_UMBP=OFF BUILD_XLA_FFI_OPS=ON pip install --break-system-packages ."
 
       - name: MORI-EP JAX test
         run: |
@@ -496,8 +504,20 @@ jobs:
           submodules: true
 
       - name: Recover podman if needed
-        if: ${{ matrix.ct == 'podman' }}
-        run: podman system migrate || true
+        run: |
+          build() {
+            $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev .
+          }
+          build && exit 0
+          if [ "$CT" = podman ]; then
+            # 'system migrate' stops every container owned by this user, not just
+            # this job's, so keep it on the failure path only.
+            echo "::warning::podman build failed; retrying after 'system migrate'"
+            podman ps --format 'will be stopped: {{.Names}}' || true
+            podman system migrate || true
+          fi
+          build
+
 
       - name: Build CI image
         run: $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev .
@@ -770,6 +790,36 @@ jobs:
               sleep 1
               PORT=$((PORT + 1))
             done
+          done
+
+      - name: MORI-EP internode rail-only (MORI_ENABLE_RAIL_ONLY)
+        run: |
+          # Same v1/v1_ll path with cross-rail QPs never created. Guards the claim
+          # that the EP internode data path only ever needs same-rail connections.
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
+          RAIL_ENV="-e MORI_INTERNODE_TIMEOUT=600 -e MORI_ENABLE_RAIL_ONLY=1 -e MORI_APP_LOG_LEVEL=INFO"
+          PORT=29170
+          for KERNEL in v1 v1_ll; do
+            echo "=== rail-only kernel=$KERNEL port=$PORT ==="
+            NODE2_CMD=(
+              $CT exec $RAIL_ENV $CONTAINER bash $SCRIPT
+              --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+              --ifname $NODE2_IFNAME
+              --cmd bench --kernel-type $KERNEL --max-tokens 1024
+            )
+            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+            $CT exec $RAIL_ENV $CONTAINER bash $SCRIPT \
+              --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+              --ifname $NODE1_IFNAME \
+              --cmd bench --kernel-type $KERNEL --max-tokens 1024 > /tmp/rail_$KERNEL.log 2>&1
+            rc=$?
+            wait
+            cat /tmp/rail_$KERNEL.log
+            [ $rc -eq 0 ] || exit $rc
+            # Every local rank must have connected to exactly one cross-node peer.
+            n=$(grep -c "rail-only: rank .* connected 1 RDMA peers" /tmp/rail_$KERNEL.log)
+            [ "$n" -eq 8 ] || { echo "expected 8 rail-only ranks, got $n"; exit 1; }
+            PORT=$((PORT + 1))
           done
 
       - name: MORI-EP internode async kernel test

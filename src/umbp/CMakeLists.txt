@@ -155,8 +155,8 @@ if(HAVE_SPDK)
   # SPDK Proxy daemon (owns SPDK, serves ranks via SHM IPC)
   add_executable(spdk_proxy storage/spdk/proxy/spdk_proxy_daemon.cpp)
   target_link_libraries(spdk_proxy PRIVATE umbp_core)
-  set_target_properties(spdk_proxy PROPERTIES BUILD_RPATH "$ORIGIN"
-                                             INSTALL_RPATH "$ORIGIN"
+  set_target_properties(spdk_proxy PROPERTIES BUILD_RPATH "$ORIGIN;${ROCM_PATH}/lib"
+                                             INSTALL_RPATH "$ORIGIN;${ROCM_PATH}/lib"
                                              BUILD_WITH_INSTALL_RPATH TRUE)
 endif()
 
@@ -444,8 +444,8 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 target_link_libraries(umbp_master PRIVATE umbp_common ${_PROTOBUF_LIBS}
                                           ${_GRPCPP_LIB})
-set_target_properties(umbp_master PROPERTIES BUILD_RPATH "$ORIGIN"
-                                             INSTALL_RPATH "$ORIGIN"
+set_target_properties(umbp_master PROPERTIES BUILD_RPATH "$ORIGIN;${ROCM_PATH}/lib"
+                                             INSTALL_RPATH "$ORIGIN;${ROCM_PATH}/lib"
                                              BUILD_WITH_INSTALL_RPATH TRUE)
 
 # ---------- Client executable -------------------------------------------------
@@ -456,8 +456,8 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 target_link_libraries(umbp_client PRIVATE umbp_common ${_PROTOBUF_LIBS}
                                           ${_GRPCPP_LIB})
-set_target_properties(umbp_client PROPERTIES BUILD_RPATH "$ORIGIN"
-                                             INSTALL_RPATH "$ORIGIN"
+set_target_properties(umbp_client PROPERTIES BUILD_RPATH "$ORIGIN;${ROCM_PATH}/lib"
+                                             INSTALL_RPATH "$ORIGIN;${ROCM_PATH}/lib"
                                              BUILD_WITH_INSTALL_RPATH TRUE)
 
 # ---------- Standalone-process executable ------------------------------------
@@ -468,8 +468,8 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 target_link_libraries(umbp_standalone_server PRIVATE umbp_common ${_PROTOBUF_LIBS}
                                                      ${_GRPCPP_LIB})
-set_target_properties(umbp_standalone_server PROPERTIES BUILD_RPATH "$ORIGIN"
-                                                        INSTALL_RPATH "$ORIGIN"
+set_target_properties(umbp_standalone_server PROPERTIES BUILD_RPATH "$ORIGIN;${ROCM_PATH}/lib"
+                                                        INSTALL_RPATH "$ORIGIN;${ROCM_PATH}/lib"
                                                         BUILD_WITH_INSTALL_RPATH TRUE)
 
 # UMBP unit tests live under tests/cpp/umbp (built when BUILD_TESTS=ON); they

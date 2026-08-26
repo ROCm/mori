@@ -32,7 +32,8 @@ import torch
 os.environ.setdefault("MORI_ENABLE_SDMA", "1")
 from tests.python.ops.dispatch_combine_test_utils import (
     _all_data_types,
-    _is_fp4x2_dtype,
+    cross_dtype_hidden_dims,
+    cross_dtype_skip_reason,
     EpDispatchCombineTestCase,
     assert_worker_results,
     run_ep_dispatch_combine_test,
@@ -78,7 +79,11 @@ class AsyncLLDispatchCombineTestCase(EpDispatchCombineTestCase):
         # AsyncLL combine weight reconstruction is not exercised in the
         # reference example yet, so validate token reconstruction only.
         combine_output, _ = op.combine_send(
-            dispatch_output,
+            self._get_combine_input(
+                op,
+                dispatch_output,
+                num_token=dispatch_recv_num_token[0].item(),
+            ),
             None,
             all_rank_indices[self.config.rank],
         )
@@ -86,7 +91,13 @@ class AsyncLLDispatchCombineTestCase(EpDispatchCombineTestCase):
 
         self.sync()
         if check_results:
-            self.check_combine_result(op, test_data, combine_output, None)
+            self.check_combine_result(
+                op,
+                test_data,
+                combine_output,
+                None,
+                combine_data_type=self.combine_data_type,
+            )
 
 
 class _AsyncLLCombineOnlyTestCase(AsyncLLDispatchCombineTestCase):
@@ -109,12 +120,16 @@ def _make_asyncll_config(
     scale_type_size=1,
     max_total_recv_tokens=0,
     quant_type="none",
+    combine_data_type=None,
 ):
+    _, _, config_hidden_dim = cross_dtype_hidden_dims(
+        hidden_dim, data_type, combine_data_type or data_type
+    )
     return mori.ops.EpDispatchCombineConfig(
         data_type=data_type,
         rank=rank,
         world_size=world_size,
-        hidden_dim=hidden_dim // 2 if _is_fp4x2_dtype(data_type) else hidden_dim,
+        hidden_dim=config_hidden_dim,
         scale_dim=scale_dim,
         scale_type_size=scale_type_size,
         max_num_inp_token_per_rank=max_num_inp_token_per_rank,
@@ -249,6 +264,88 @@ def test_dispatch_combine(
                     num_experts_per_token,
                     scale_dim,
                     scale_type_size,
+                    quant_type,
+                ],
+            )
+        )
+
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
+def _test_dispatch_combine_cross_dtype(
+    rank,
+    world_size,
+    data_type,
+    combine_data_type,
+    hidden_dim,
+    max_num_inp_token_per_rank,
+    num_experts_per_rank,
+    num_experts_per_token,
+    quant_type,
+):
+    dispatch_hidden_dim, combine_hidden_dim, _ = cross_dtype_hidden_dims(
+        hidden_dim, data_type, combine_data_type
+    )
+    config = _make_asyncll_config(
+        rank=rank,
+        world_size=world_size,
+        data_type=data_type,
+        hidden_dim=hidden_dim,
+        max_num_inp_token_per_rank=max_num_inp_token_per_rank,
+        num_experts_per_rank=num_experts_per_rank,
+        num_experts_per_token=num_experts_per_token,
+        quant_type=quant_type,
+        combine_data_type=combine_data_type,
+    )
+    run_ep_dispatch_combine_test(
+        config,
+        AsyncLLDispatchCombineTestCase,
+        use_max_token_num=True,
+        combine_data_type=combine_data_type,
+        combine_hidden_dim=combine_hidden_dim,
+        dispatch_hidden_dim=dispatch_hidden_dim,
+    )
+
+
+# Cross-dtype coverage for AsyncLL: narrow (FP4 / FP8) dispatch paired with a
+# BF16 combine, with and without the FP8 direct-cast combine codec. The matrix
+# above ties the combine element type to config.data_type and so only ever
+# reaches the same-dtype diagonal.
+@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("data_type", _all_data_types())
+@pytest.mark.parametrize("combine_data_type", (torch.bfloat16,), ids=("combine_bf16",))
+@pytest.mark.parametrize("hidden_dim", (7168, 4096))
+@pytest.mark.parametrize("max_num_inp_token_per_rank", (128,))
+@pytest.mark.parametrize("num_experts_per_rank", (32,))
+@pytest.mark.parametrize("num_experts_per_token", (8,))
+@pytest.mark.parametrize("quant_type", ("none", "fp8_direct_cast"))
+def test_dispatch_combine_cross_dtype(
+    torch_dist_process_manager,
+    world_size,
+    data_type,
+    combine_data_type,
+    hidden_dim,
+    max_num_inp_token_per_rank,
+    num_experts_per_rank,
+    num_experts_per_token,
+    quant_type,
+):
+    skip = cross_dtype_skip_reason(quant_type, data_type, combine_data_type)
+    if skip:
+        pytest.skip(skip)
+
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (
+                _test_dispatch_combine_cross_dtype,
+                [
+                    world_size,
+                    data_type,
+                    combine_data_type,
+                    hidden_dim,
+                    max_num_inp_token_per_rank,
+                    num_experts_per_rank,
+                    num_experts_per_token,
                     quant_type,
                 ],
             )

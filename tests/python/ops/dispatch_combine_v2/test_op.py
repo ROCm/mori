@@ -112,9 +112,7 @@ UNCACHED_TOKEN_STORE = int(os.environ.get("UNCACHED_TOKEN_STORE", 0))
 UNCACHED_METADATA_STORE = int(os.environ.get("UNCACHED_METADATA_STORE", 0))
 REPLAY_FAST_PATH = int(os.environ.get("REPLAY_FAST_PATH", 0))
 TOKEN_CENTRIC_DISPATCH = int(os.environ.get("TOKEN_CENTRIC_DISPATCH", 0))
-TOKEN_CENTRIC_ROTATE_PEERS = int(
-    os.environ.get("TOKEN_CENTRIC_ROTATE_PEERS", 0)
-)
+TOKEN_CENTRIC_ROTATE_PEERS = int(os.environ.get("TOKEN_CENTRIC_ROTATE_PEERS", 0))
 ROTATE_DISPATCH_SLOT_ORDER = int(os.environ.get("ROTATE_DISPATCH_SLOT_ORDER", 0))
 ROTATE_COMBINE_PEER_ORDER = int(os.environ.get("ROTATE_COMBINE_PEER_ORDER", 0))
 ROUTING_PATTERN = os.environ.get("ROUTING_PATTERN", "random").lower()
@@ -161,7 +159,6 @@ def main():
     set_device(d.local_rank)
     dev = torch.device("cuda", d.local_rank)
     M = max(SWEEP)
-    num_experts = npes * EPR
 
     g = torch.Generator(device="cpu").manual_seed(1234 + rank)
     if _IS_FP4:  # fp4: packed uint8 (2 e2m1/byte), reinterpret as float4_e2m1fn_x2
@@ -247,11 +244,14 @@ def main():
             idx_c = idx[:ct].cpu().numpy()
             # local_expert_count: global sum over ranks == world*ct*K (every
             # (token,k) assignment is recorded on exactly the rank owning it).
-            lec_sum = int(op.local_expert_count().sum().cpu().item())
+            # Capability-gated: a backend that does not implement this says so
+            # through op.capabilities rather than by failing at the call.
+            has_lec = "local_expert_count" in getattr(op, "capabilities", frozenset())
+            lec_sum = int(op.local_expert_count().sum().cpu().item()) if has_lec else 0
             sync()
             comm.barrier()
             lec_total = d.allreduce_sum(lec_sum)
-            if rank == 0:
+            if rank == 0 and has_lec:
                 ok_lec = lec_total == npes * ct * K
                 print(
                     f"# OP-LEC ct={ct}: {'PASS' if ok_lec else 'FAIL'} "
@@ -289,13 +289,9 @@ def main():
                     )
             combine_input = recv_x
             if DISPATCH_FP8_BLOCKWISE:
-                quant_scale = op.recv_quant_scales().abs().repeat_interleave(
-                    128, dim=1
-                )
+                quant_scale = op.recv_quant_scales().abs().repeat_interleave(128, dim=1)
                 combine_input = op.combine_in_view()
-                combine_input.copy_(
-                    (recv_x.float() * quant_scale).to(torch.bfloat16)
-                )
+                combine_input.copy_((recv_x.float() * quant_scale).to(torch.bfloat16))
             elif ZERO_COPY_EXPERT_OUTPUT:
                 combine_input = op.expert_output_buffer()
                 combine_input.copy_(recv_x)
@@ -322,7 +318,7 @@ def main():
                 op.convert_combine_input(routing)
                 sync()
                 comm.barrier()
-                out, out_w = op.combine(recv_x, routing=routing)
+                out, out_w = op.combine(recv_x, wts[:ct], routing=routing)
                 sync()
                 comm.barrier()
                 # telescopes to (sum_k wts)*input
@@ -335,7 +331,9 @@ def main():
                 tag = "OP-STDMOE"
             else:
                 # identity expert: recv_x already holds the dispatched tokens.
-                out, out_w = op.combine(combine_input, routing=routing)
+                # Weights passed because this test checks the weight fold; an
+                # inference caller passes None and the kernel skips it.
+                out, out_w = op.combine(combine_input, wts[:ct], routing=routing)
                 sync()
                 comm.barrier()
                 U = np.array(
@@ -354,11 +352,7 @@ def main():
                         torch.from_numpy(U).view(ct, 1).float() * inp[:ct].float().cpu()
                     ).to(DTYPE)
                     # fp8 paths (quant or plain fp8 token) lose precision; relax.
-                    lossy = (
-                        QUANT != "none"
-                        or _IS_FP8
-                        or bool(DISPATCH_FP8_BLOCKWISE)
-                    )
+                    lossy = QUANT != "none" or _IS_FP8 or bool(DISPATCH_FP8_BLOCKWISE)
                     atol = 3e-1 if lossy else 2e-2
                     rtol = 1e-1 if lossy else 2e-2
                     ok = torch.allclose(

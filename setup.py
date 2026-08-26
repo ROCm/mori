@@ -36,7 +36,7 @@ try:
 except ImportError:
     _HAVE_CYTHON = False
 
-_supported_arch_list = ["gfx942", "gfx950"]
+_supported_arch_list = ["gfx942", "gfx950", "gfx1250"]
 
 _REQUIRED_SYSTEM_DEPS: list = []
 
@@ -334,6 +334,13 @@ def _copy_jit_sources(root_dir: Path) -> None:
     _copytree(
         root_dir / "src" / "ops" / "dispatch_combine",
         jit_dir / "src" / "ops" / "dispatch_combine",
+    )
+    # JIT v2 device bodies. The rendered TU includes one of these by path, so
+    # without them the v2 hip backend does not compile at all -- and only off a
+    # repo checkout would anyone notice.
+    _copytree(
+        root_dir / "src" / "ops" / "dispatch_combine_v2",
+        jit_dir / "src" / "ops" / "dispatch_combine_v2",
     )
 
     io_kernels_src = root_dir / "src" / "io" / "kernels"
@@ -653,6 +660,18 @@ class CMakeBuild(build_ext):
                 build_dir / "src/metrics/libmori_metrics.so",
                 root_dir / "python/mori/libmori_metrics.so",
             ),
+            # JIT v2. plan_api looks for these next to the mori package first, so
+            # this is where they have to land; without them a wheel raises
+            # "libmori_ops_v2.so not found" on the hip backend, which a dev tree
+            # hides because plan_api also probes build/src/**.
+            (
+                build_dir / "src/jit/v2/libmori_jit.so",
+                root_dir / "python/mori/libmori_jit.so",
+            ),
+            (
+                build_dir / "src/ops/dispatch_combine_v2/libmori_ops_v2.so",
+                root_dir / "python/mori/libmori_ops_v2.so",
+            ),
         ]
         collective_so = build_dir / "src/collective/libmori_collective.so"
         if collective_so.exists():
@@ -860,6 +879,8 @@ mori_package_data = [
     "libmori_application.so",
     "libmori_metrics.so",
     "libmori_collective.so",  # optional: only present when BUILD_COLLECTIVE=ON
+    "libmori_jit.so",  # JIT v2 C ABI + plan registry
+    "libmori_ops_v2.so",  # v2 EP kernels' host side; registers into libmori_jit
     "umbp_master",
     "umbp_standalone_server",
     "_jit-sources/include/**/*.hpp",

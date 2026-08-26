@@ -9,6 +9,27 @@ FetchContent_Declare(
   GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(googletest)
 
+add_library(test_sdma_allreduce_public_header_compile OBJECT
+            collective/test_sdma_allreduce_public_header.hip)
+set_source_files_properties(
+  collective/test_sdma_allreduce_public_header.hip PROPERTIES LANGUAGE HIP)
+target_include_directories(test_sdma_allreduce_public_header_compile
+                           PRIVATE ${CMAKE_SOURCE_DIR}/include
+                                   ${CMAKE_SOURCE_DIR})
+if(DEFINED GPU_TARGETS)
+  set_target_properties(
+    test_sdma_allreduce_public_header_compile
+    PROPERTIES HIP_ARCHITECTURES "${GPU_TARGETS}")
+endif()
+
+# Core logging is header-only (spdlog); test its thread-safety independently of
+# BUILD_IO. Run under ThreadSanitizer to actually prove the maps are safe.
+add_executable(test_logging utils/test_logging.cpp)
+target_include_directories(test_logging PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_include_directories(test_logging PUBLIC ${CMAKE_SOURCE_DIR})
+target_link_libraries(test_logging PRIVATE mori_logging gtest_main)
+add_test(NAME logging_concurrency COMMAND test_logging)
+
 add_executable(test_transport_tcp application/test_transport_tcp.cpp)
 
 target_include_directories(test_transport_tcp
@@ -46,6 +67,12 @@ if(BUILD_IO)
   target_include_directories(test_engine PUBLIC ${CMAKE_SOURCE_DIR}/include)
   target_include_directories(test_engine PUBLIC ${CMAKE_SOURCE_DIR})
   target_link_libraries(test_engine mori_application mori_io)
+
+  add_executable(bench_engine io/bench_engine.cpp)
+
+  target_include_directories(bench_engine PUBLIC ${CMAKE_SOURCE_DIR}/include)
+  target_include_directories(bench_engine PUBLIC ${CMAKE_SOURCE_DIR})
+  target_link_libraries(bench_engine mori_application mori_io)
 
   add_executable(test_transfer_wait io/test_transfer_wait.cpp)
 
@@ -95,3 +122,6 @@ endif()
 if(BUILD_METRICS)
   add_subdirectory(metrics)
 endif()
+
+# JIT v2 — always built: mori_jit is host-only and needs no hipcc.
+add_subdirectory(jit)

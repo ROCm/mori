@@ -52,6 +52,8 @@ void PrintUsage(const char* program) {
                "  -w warmup      warmup iterations\n"
                "  -c grid_x      HIP grid x (blocks)\n"
                "  -T threads     threads per block\n"
+               "                 for sdma bw, -c/-T set the number of issue units\n"
+               "                 (grid x units-per-block); omit both for one block\n"
                "  -s scope       thread | warp | block | thread_agg (default block)\n"
                "                 thread_agg = thread scope + ThreadAggregate (bw only)\n"
                "  -C comp        SDMA latency completion: quiet | signal (default quiet)\n"
@@ -120,9 +122,11 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
         break;
       case 'c':
         out_args->nblocks = std::atoi(optarg);
+        out_args->nblocks_explicit = true;
         break;
       case 'T':
         out_args->threads_per_block = std::atoi(optarg);
+        out_args->threads_explicit = true;
         break;
       case 't':
         if (std::strcmp(optarg, "lsa") == 0) {

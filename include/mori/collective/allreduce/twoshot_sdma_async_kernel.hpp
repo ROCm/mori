@@ -115,8 +115,8 @@ __device__ void AllGatherAsyncPutKernel_body(int myPe, int npes,
   // Generation counter — matches AllGatherSdmaKernel's protocol
   __shared__ uint64_t ag_token;
   if (threadIdx.x == 0) {
-    ag_token = static_cast<uint64_t>(barrier->flag) + 1ULL;
-    barrier->flag = static_cast<uint32_t>(ag_token);
+    ag_token = barrier->flag + 1ULL;
+    barrier->flag = ag_token;
   }
   __syncthreads();
   uint64_t flag_val = ag_token;
@@ -174,7 +174,7 @@ __device__ void AllGatherAsyncWaitKernel_body(int myPe, int npes,
   uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
 
   // Read the generation token set by AllGatherAsyncPutKernel
-  uint64_t flag_val = static_cast<uint64_t>(barrier->flag);
+  uint64_t flag_val = barrier->flag;
 
   for (int sender = 0; sender < npes; ++sender) {
     if (sender == myPe) continue;
@@ -192,10 +192,9 @@ __device__ void AllGatherAsyncWaitKernel_body(int myPe, int npes,
   }
 
   // Ensure SDMA-written data is visible to subsequent CU reads.
-  // SDMA AllGather writes bypass L2/L1, so flush caches to force re-fetch.
   __threadfence_system();
   if (threadIdx.x == 0) {
-    // asm volatile("buffer_wbinvl1_vol" ::: "memory");
+    SdmaDirectOutputCacheInvalidate();
   }
   __syncthreads();
 }
@@ -255,12 +254,10 @@ __device__ void ReduceScatterLocalReduceKernel_body(T* gathered, const T* input,
 
   // Flush L2 dirty lines to HBM so AllGather SDMA reads see fresh data.
   // CU reduce writes land in L2 (write-back); SDMA reads bypass L2.
-#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
   __syncthreads();
   if (threadIdx.x == 0) {
-    asm volatile("buffer_wbl2" ::: "memory");
+    SdmaTransitCacheWriteback();
   }
-#endif
 }
 
 template <typename T>
@@ -321,12 +318,10 @@ __device__ void ReduceScatterP2pKernel_body(int myPe, int npes,
   }
 
   // Flush L2 dirty lines to HBM so AllGather SDMA reads see fresh data.
-#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
   __syncthreads();
   if (threadIdx.x == 0) {
-    asm volatile("buffer_wbl2" ::: "memory");
+    SdmaTransitCacheWriteback();
   }
-#endif
 }
 
 template <typename T>
@@ -418,9 +413,9 @@ __device__ void ReduceScatterAllGatherFusedKernel_body(int myPe, int npes,
   if (elementCountPerRank == 0) return;
 
   // --- generation counter for device-scope broadcast -------------------------
-  __shared__ uint32_t s_next;
+  __shared__ uint64_t s_next;
   if (threadIdx.x == 0) {
-    s_next = barrier->flag + 1;
+    s_next = barrier->flag + 1ULL;
   }
   __syncthreads();
 
@@ -431,7 +426,7 @@ __device__ void ReduceScatterAllGatherFusedKernel_body(int myPe, int npes,
   // =========================================================================
   if (blockIdx.x == 0) {
     uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
-    uint64_t flag_val = static_cast<uint64_t>(s_next);
+    uint64_t flag_val = s_next;
 
     const int warpId = static_cast<int>(threadIdx.x) / warpSize;
     const int laneId = static_cast<int>(threadIdx.x) % warpSize;
@@ -522,12 +517,10 @@ __device__ void ReduceScatterAllGatherFusedKernel_body(int myPe, int npes,
   }
 
   // Flush dirty L2 lines to HBM so SDMA-based AllGather reads fresh data.
-#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
   __syncthreads();
   if (threadIdx.x == 0) {
-    asm volatile("buffer_wbl2" ::: "memory");
+    SdmaTransitCacheWriteback();
   }
-#endif
 }
 
 template <typename T>

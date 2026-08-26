@@ -1,11 +1,19 @@
-# cco-LSA intranode MoE dispatch / combine (ops v2, FlyDSL)
+# cco-LSA intranode MoE dispatch / combine (ops v2)
 
 Intranode (single-node, EP8) MoE dispatch + combine built on **mori-cco LSA**
-(intra-node P2P over the flat symmetric VA) and **FlyDSL** device kernels. A
-mori-parity reimplementation that swaps the mori-shmem provider for cco-LSA:
-peer addresses are computed in-kernel via `cco.Window(arena).lsa_ptr(pe, off)`,
-no host P2P tables. Reference = ROCm/FlyDSL PR #522
-(`dispatch_combine_intranode_{kernel,op}.py`).
+(intra-node P2P over the flat symmetric VA). One op class, `EpDispatchCombineOp`,
+behind two interchangeable kernel backends:
+
+- **flydsl** (default): FlyDSL device kernels, the full feature set (gather +
+  scatter combine, fp8/fp4, quant, StdMoE, per-token scales, routing replay).
+- **hip**: C++/HIP kernels JIT-compiled by the v2 JIT framework. Gather combine
+  only, in bf16/fp32; the dispatch leg also carries fp8 and fp4 (transport only —
+  it moves an already-quantized payload). A dedicated gfx125x TDM body is selected
+  by arch. Works on a machine with no FlyDSL. See `docs/MORI_JIT_V2_DESIGN.md`.
+
+Select with `cfg.kernel_backend` or `MORI_V2_KERNEL_BACKEND`. Peer addresses are
+computed in-kernel over the flat LSA VA, no host P2P tables. Reference =
+ROCm/FlyDSL PR #522 (`dispatch_combine_intranode_{kernel,op}.py`).
 
 Supported token dtypes: **bf16**, **f32**, **fp8** (gather-only; OCP e4m3 on
 gfx950, e4m3**fnuz** max 240 on gfx942) and **fp4** (e2m1, gather-only,
@@ -18,32 +26,36 @@ keeps a bf16 external payload); per-token scales forwarding;
 `max_total_recv_tokens` cap; mori-parity host op-layer + per-device,
 dtype-aware tuning table. Not done: `skip_stage1` (FlyDSL-only).
 
-> **Test-only, not a mori API (yet).** These modules import each other by
-> top-level name (`from intranode_kernels import ...`, `import flydsl_prims as P`)
-> and have no `__init__.py`; they only resolve after the tests do
-> `sys.path.insert(0, <this dir>)`. There is no `mori.ops.dispatch_combine_v2`
-> package export, so `import mori.ops.dispatch_combine_v2.dispatch_combine_op`
-> will fail. Use it via the test/bench harnesses below. Wiring it in as a real
-> package (relative imports + `__init__.py` + `ops/__init__.py` export) is a
-> follow-up.
+This is a real package: `from mori.ops.dispatch_combine_v2 import
+EpDispatchCombineConfig, EpDispatchCombineOp`. Importing it pulls in **no** kernel
+backend — the base and config live in `dispatch_combine_op.py`; each backend is imported
+lazily, only when selected, so the package imports without FlyDSL installed.
 
 ## Layout
 
 | file | role |
 |---|---|
-| `flydsl_prims.py` | device primitives: system atomics / ordered stores / fences / volatile-spin waits |
-| `intranode_kernels.py` | all FlyDSL intranode kernel factories: `make_dispatch` (+scales/replay), `make_combine` (gather) / `make_combine_scatter` (`_nop2p`, bf16/f32/fp8/fp4), `make_convert_dispatch_output` / `make_convert_combine_input` (StdMoE), `make_local_expert_count` |
-| `dispatch_combine_op.py` | `SymmArena` + `EpDispatchCombineOp` / `EpDispatchCombineConfig` (+`.tuned()`) / `EpDispatchRoutingHandle` — mori-parity host op-layer (scales, scatter/quant combine, StdMoE, recv cap, LEC, reset, replay) |
-| `tuning_configs.py` | per-(world,hidden,topk) block/warp lookup |
+| `dispatch_combine_op.py` | backend-agnostic base + entry: `EpDispatchCombineConfig` (+`.tuned()`), `EpDispatchCombineOp` (backend selector + shared dispatch/combine/reset/lifecycle), `EpDispatchRoutingHandle`, `KernelSet` |
+| `flydsl_backend.py` | **flydsl** backend subclass (`EpDispatchCombineOpFlyDSL`): arena layout + FlyDSL kernel binding for the full feature set |
+| `hip_backend.py` | **hip** backend subclass (`EpDispatchCombineOpHip`): arena layout + C++/JIT plan binding, gather only; rejects unsupported configs at construction |
+| `ep_plans.py` | EP-specific shim: loads `libmori_ops_v2.so` and exposes `EpDispatchPlan`/`EpCombinePlan`. The generic ctypes binding it calls lives in `mori.jit.v2.plan_api` (the plan_api C ABI), not here |
+| `symm_arena.py` | `SymmArena`: one cco-LSA window carved into named regions |
+| `flydsl_prims.py` | FlyDSL device primitives: system atomics / ordered stores / fences / volatile-spin waits |
+| `intranode_kernels.py` | FlyDSL kernel factories: `make_dispatch` (+scales/replay), `make_combine` (gather) / `make_combine_scatter` (`_nop2p`, bf16/f32/fp8/fp4), `make_convert_dispatch_output` / `make_convert_combine_input` (StdMoE), `make_local_expert_count` |
+| `tuning_configs.py` | **flydsl** kernel geometry: per-(world,hidden,topk) block/warp lookup |
+| `hip_tuning_configs.py` | **hip** kernel geometry, separate table (never borrows flydsl's); same `lookup` contract. Independent dispatch/combine tables, keyed by device, shape, topk and (dispatch only) dtype; an unswept shape gets a single-shot default |
 
 Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 
 | file | role |
 |---|---|
 | `test_dispatch_combine_v2_intranode.py` | pytest wrapper: runs `test_op.py` under torchrun for the representative modes and asserts every line PASS |
-| `test_op.py` | EP8 op-layer test (gather/scatter, quant, StdMoE, recv-cap, scales, LEC, reset, replay) |
-| `bench_dispatch_combine.py` | eager + CUDA-graph perf bench + e2e correctness. Envs: `DTYPE=bf16\|f32\|fp8\|fp4`, `COMBINE=gather\|scatter`, `QUANT=none\|fp8_direct_cast\|fp8_blockwise`, `DISPATCH_FP8_BLOCKWISE`, `SDMA_TOKEN_COPY`, `SDMA_QUEUES`, `SDMA_DEBUG`, `ZERO_COPY_EXPERT_OUTPUT`, `E2E_PIPELINE`, `GEOMETRY=table\|analytical\|hybrid`, `STDMOE=1`, `SCALE_DIM`, `SWEEP`, `DISP_BLOCK`/`COMB_BLOCK`, `WARP_NUM`/`COMB_WARP`, `MODE`, `TUNED`, `USE_TOK_OFF_TOTAL_RECV`, `UNCACHED_TOKEN_STORE`, `UNCACHED_METADATA_STORE`, `REPLAY_FAST_PATH`, `REPLAY_BENCH`, `TOKEN_CENTRIC_DISPATCH`, `TOKEN_CENTRIC_ROTATE_PEERS`, `PREFETCH_ROUTE_PAYLOAD`, `DEFER_DEST_CTR_ATOMIC`, `ROTATE_DISPATCH_SLOT_ORDER`, `ROTATE_COMBINE_PEER_ORDER`, `ROUTING_PATTERN` |
-| `run_bench.sh` | bench launcher (runs `bench_dispatch_combine.py` in the container) |
+| `test_op.py` | EP8 op-layer test (gather/scatter, quant, StdMoE, recv-cap, scales, LEC, reset, replay). `MORI_V2_KERNEL_BACKEND=hip` runs it against the HIP kernels; FlyDSL experiment toggles cover SDMA, cache policy, token-centric dispatch, and peer-order variants |
+| `test_ep_backend_parity.py` | runs both backends in one process on the same input and compares element for element |
+| `test_jit_binding.py` | JIT plan binding: schemas, request/args round-trip, cache behaviour. No GPU peers needed |
+| `test_graph_capture.py` | captures dispatch → identity expert → combine as one HIP graph and replays it |
+| `test_asym_dtype.py` | asymmetric dtype legs (fp8/fp4 dispatch + bf16 combine) |
+| `bench_ep.py` | the perf bench, for every backend. Alternating dispatch/combine pairs, eager + CUDA graph, each point gated on an identity-expert check and non-zero exit on failure. Envs: `BACKENDS=flydsl,hip`, `MODES=eager,graph`, `SWEEP`, `ITERS`, `DISP=bf16\|fp8\|fp4`, `COMBINE_IN=inplace\|staged`, `CHECK=0`, `SDMA_TOKEN_COPY`/`SDMA_QUEUES` (FlyDSL only), `DBN`/`DWPB`/`CBN`/`CWPB` to pin geometry, `HIDDEN`/`TOPK`/`EPR` |
 
 (Each script inlines a tiny torchrun/gloo `Dist` bootstrap — gloo only carries the cco unique-id and pass/fail counts.)
 
@@ -57,11 +69,17 @@ cd tests/python/ops/dispatch_combine_v2
 
 pytest test_dispatch_combine_v2_intranode.py -v                       # EP8 correctness (all modes)
 torchrun --standalone --nproc_per_node=8 test_op.py                   # op-layer correctness (env-driven)
-torchrun --standalone --nproc_per_node=8 bench_dispatch_combine.py    # perf + e2e correctness
+BACKENDS=flydsl,hip torchrun --standalone --nproc_per_node=8 bench_ep.py   # perf, both backends
 ```
 
-Config via env: `HIDDEN`, `TOPK`, `EPR`, `SWEEP`, `DTYPE`, `COMBINE`, `QUANT`,
-`DISP_BLOCK`/`COMB_BLOCK`, `WARP_NUM`/`COMB_WARP`, `MODE=eager|graph|both`, `TUNED`.
+Config via env (`test_op.py` / pytest): `HIDDEN`, `TOPK`, `EPR`, `SWEEP`,
+`DTYPE`, `COMBINE`, `QUANT`, `STDMOE`, `SCALE_DIM`, `TUNED`, `REPLAY`,
+`RESET`, `MAXRECV`, and `MORI_V2_KERNEL_BACKEND`.
+
+Config via env (`bench_ep.py`): `HIDDEN`, `TOPK`, `EPR`, `SWEEP`, `DISP`,
+`COMBINE_IN`, `BACKENDS`, `MODES`, `ITERS`, `WARMUP`, `CHECK`, and
+`SDMA_TOKEN_COPY`/`SDMA_QUEUES`, `DBN`/`DWPB`/`CBN`/`CWPB`.
+
 CCO's `cco_lsa_ptr` restores the global address-space provenance erased by the
 scalar DSL ABI, so `{winBase, stride4G}` metadata loads use LLVM `addrspace(1)`.
 Dispatch unconditionally reuses one peer base per work item. A 2026-08-10

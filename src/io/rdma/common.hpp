@@ -240,6 +240,11 @@ struct EndpointRuntime {
 
   EndpointId id{0};
   EpPair ep;
+  // Cached pointer to this endpoint's NotifManager::QpNotifContext, published once
+  // at registration. Lets the hot CQ poller resolve the notif context without
+  // locking NotifManager::mu on every poll. Type-erased (void*) to avoid a header
+  // dependency on the NotifManager-private struct; nullptr until registered.
+  std::atomic<void*> notifCtx{nullptr};
 };
 
 using EpPairVec = std::vector<EpPair>;

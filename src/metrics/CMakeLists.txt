@@ -6,6 +6,6 @@ target_link_libraries(mori_metrics PRIVATE pthread)
 
 set_target_properties(
   mori_metrics
-  PROPERTIES BUILD_RPATH "$ORIGIN"
-             INSTALL_RPATH "$ORIGIN"
+  PROPERTIES BUILD_RPATH "$ORIGIN;${ROCM_PATH}/lib"
+             INSTALL_RPATH "$ORIGIN;${ROCM_PATH}/lib"
              BUILD_WITH_INSTALL_RPATH TRUE)

@@ -72,25 +72,9 @@ import mori.cco.device.flydsl as cco
 
 from . import flydsl_prims as P
 
-# Wavefront size: gfx9 (MI300/MI350) = 64, gfx12 (MI400/gfx1250) = 32. Detected
-# once per process; override with MORI_WAVE_SIZE. get_warp_size(gfx1250) wrongly
-# reports 64, so key off the arch string.
-import os as _os
+from mori.jit.config import detect_wave_size
 
-
-def _detect_wave_size():
-    v = _os.environ.get("MORI_WAVE_SIZE")
-    if v:
-        return int(v)
-    try:
-        from mori.jit.config import detect_gpu_arch
-
-        return 32 if detect_gpu_arch().startswith("gfx12") else 64
-    except Exception:
-        return 64
-
-
-WAVE = _detect_wave_size()
+WAVE = detect_wave_size()
 LANE_MASK = WAVE - 1
 LOG2_WAVE = WAVE.bit_length() - 1
 _BALLOT_INT = T.i64 if WAVE == 64 else T.i32
@@ -342,8 +326,7 @@ def make_dispatch(
                         cache_modifier=metadata_store_cache_modifier,
                     )
                     if const_expr(
-                        not defer_dest_ctr_atomic
-                        and not direct_tok_off_total
+                        not defer_dest_ctr_atomic and not direct_tok_off_total
                     ):
                         dest_ctr_addr = fx.Int64(addr_dest_pe_ctr) + fx.Int64(
                             dest_pe
@@ -411,10 +394,7 @@ def make_dispatch(
                             cache_modifier=metadata_store_cache_modifier,
                         )
 
-            if const_expr(
-                defer_dest_ctr_atomic
-                and not direct_tok_off_total
-            ):
+            if const_expr(defer_dest_ctr_atomic and not direct_tok_off_total):
                 # Keep the atomic ahead of the long token copy so its completion
                 # can overlap useful VMEM work before the Phase-2 barrier.
                 if lane == 0:
@@ -507,10 +487,11 @@ def make_dispatch(
                 P.atomic_add_global(fx.Int64(addr_disp_bar), arith.constant(1))
 
             local_recv_num = fx.Int64(window.lsa_ptr(my_lsa_rank, off_recv_num))
+            if global_warp_id == 0:
+                P.spin_until_eq_i32(fx.Int64(addr_disp_bar), block_num)
+                buffer_store(arith.constant(0), rsrc_disp_bar, 0)
             for dest_pe in range(lane, npes, WAVE):
                 if global_warp_id == 0:
-                    P.spin_until_eq_i32(fx.Int64(addr_disp_bar), block_num)
-                    buffer_store(arith.constant(0), rsrc_disp_bar, 0)
                     if const_expr(direct_tok_off_total):
                         # tok_off already counts every successfully allocated
                         # destination slot. In normal dispatch the per-source
@@ -658,13 +639,8 @@ def make_dispatch_token_centric(
     direct_tok_off_total = use_tok_off_total_recv and not replay
     if dispatch_fp8_blockwise:
         if WAVE != 64:
-            raise NotImplementedError(
-                "dispatch_fp8_blockwise requires wave64"
-            )
-        if (
-            hidden_elem_size != 2
-            or dispatch_quant_scale_dim != hidden_dim // 128
-        ):
+            raise NotImplementedError("dispatch_fp8_blockwise requires wave64")
+        if hidden_elem_size != 2 or dispatch_quant_scale_dim != hidden_dim // 128:
             raise ValueError(
                 "dispatch_fp8_blockwise requires BF16 input and hidden/128 scales"
             )
@@ -758,46 +734,34 @@ def make_dispatch_token_centric(
                         )
                     if lane < npes:
                         if first_slot_lane < experts_per_token:
-                            peer_tok_off = fx.Int64(
-                                window.lsa_ptr(lane, off_tok_off)
-                            )
+                            peer_tok_off = fx.Int64(window.lsa_ptr(lane, off_tok_off))
                             dest_tok_lane = P.atomic_add_global(
                                 peer_tok_off, fx.Int32(1)
                             )
 
                 has_dest = first_slot_lane < experts_per_token
-                do_publish = arith.select(
-                    has_dest, dest_tok_lane < max_recv, has_dest
-                )
+                do_publish = arith.select(has_dest, dest_tok_lane < max_recv, has_dest)
                 publish_i32 = arith.select(
                     do_publish, arith.constant(1), arith.constant(0)
                 )
                 if lane < npes:
-                    fx.ptr_store(
-                        arith.unwrap(publish_i32), route_i32 + lane
-                    )
-                    fx.ptr_store(
-                        arith.unwrap(dest_tok_lane), route_i32 + npes + lane
-                    )
+                    fx.ptr_store(arith.unwrap(publish_i32), route_i32 + lane)
+                    fx.ptr_store(arith.unwrap(dest_tok_lane), route_i32 + npes + lane)
                     if const_expr(
                         not direct_tok_off_total and not defer_dest_ctr_atomic
                     ):
                         if do_publish:
-                            dest_ctr_addr = fx.Int64(
-                                addr_dest_pe_ctr
-                            ) + fx.Int64(lane) * fx.Int64(4)
+                            dest_ctr_addr = fx.Int64(addr_dest_pe_ctr) + fx.Int64(
+                                lane
+                            ) * fx.Int64(4)
                             P.atomic_add_global(dest_ctr_addr, fx.Int32(1))
 
                 if const_expr(not replay):
                     if lane == 0:
                         for k_slot in range_constexpr(experts_per_token):
                             peer_k = readlane(T.i32(), dest_peer_lane, k_slot)
-                            first_k = readlane(
-                                T.i32(), first_slot_lane, peer_k
-                            )
-                            publish_k = readlane(
-                                T.i32(), publish_i32, peer_k
-                            )
+                            first_k = readlane(T.i32(), first_slot_lane, peer_k)
+                            publish_k = readlane(T.i32(), publish_i32, peer_k)
                             slot_k = readlane(T.i32(), dest_tok_lane, peer_k)
                             is_first = first_k == k_slot
                             publish_first = arith.select(
@@ -851,14 +815,12 @@ def make_dispatch_token_centric(
                                 cache_modifier=metadata_store_cache_modifier,
                             )
 
-                if const_expr(
-                    not direct_tok_off_total and defer_dest_ctr_atomic
-                ):
+                if const_expr(not direct_tok_off_total and defer_dest_ctr_atomic):
                     if lane < npes:
                         if do_publish:
-                            dest_ctr_addr = fx.Int64(
-                                addr_dest_pe_ctr
-                            ) + fx.Int64(lane) * fx.Int64(4)
+                            dest_ctr_addr = fx.Int64(addr_dest_pe_ctr) + fx.Int64(
+                                lane
+                            ) * fx.Int64(4)
                             P.atomic_add_global(dest_ctr_addr, fx.Int32(1))
 
             # Route atomics feed the LDS stores above; once wave 0 reaches this
@@ -879,9 +841,7 @@ def make_dispatch_token_centric(
                 else:
                     peer = route_step
                 valid_v = fx.ptr_load(route_i32 + peer, result_type=T.i32())
-                slot_v = fx.ptr_load(
-                    route_i32 + npes + peer, result_type=T.i32()
-                )
+                slot_v = fx.ptr_load(route_i32 + npes + peer, result_type=T.i32())
                 peer_valid = readlane(T.i32(), valid_v, 0)
                 peer_slot = readlane(T.i32(), slot_v, 0)
                 peer_base = fx.Int64(window.lsa_ptr(peer, 0))
@@ -932,9 +892,7 @@ def make_dispatch_token_centric(
                     )
                     e0 = vector.extract(v2, static_position=[0])
                     e1 = vector.extract(v2, static_position=[1])
-                    amax = _warp_amax(
-                        lane, arith.maximumf(_fabs(e0), _fabs(e1))
-                    )
+                    amax = _warp_amax(lane, arith.maximumf(_fabs(e0), _fabs(e1)))
                     scaled = amax > fp8max
                     scale = arith.select(
                         scaled,
@@ -957,14 +915,11 @@ def make_dispatch_token_centric(
                     )
                     nbr_packed = ds_bpermute(
                         T.i32(),
-                        arith.unwrap(
-                            (lane ^ arith.constant(1)) * arith.constant(4)
-                        ),
+                        arith.unwrap((lane ^ arith.constant(1)) * arith.constant(4)),
                         arith.unwrap(my_packed),
                     )
                     packed_pair = (my_packed & arith.constant(0xFFFF)) | (
-                        (nbr_packed & arith.constant(0xFFFF))
-                        << arith.constant(16)
+                        (nbr_packed & arith.constant(0xFFFF)) << arith.constant(16)
                     )
                     for route_step in range_constexpr(npes):
                         if route_valids[route_step] != 0:
@@ -979,8 +934,7 @@ def make_dispatch_token_centric(
                                 buffer_store(
                                     packed_pair,
                                     route_token_rsrcs[route_step],
-                                    scale_block * 32
-                                    + (lane >> arith.constant(1)),
+                                    scale_block * 32 + (lane >> arith.constant(1)),
                                     cache_modifier=token_store_cache_modifier,
                                 )
             elif const_expr(sdma_token_copy):
@@ -993,9 +947,7 @@ def make_dispatch_token_centric(
                 ) + fx.Int64(src_tok) * fx.Int64(nbytes)
                 rsrc_staging = create_buffer_resource_from_addr(staging_addr)
                 for chunk in range(tid * 4, n_i32, block_threads * 4):
-                    token_vec = buffer_load(
-                        rsrc_src, chunk, vec_width=4, dtype=T.i32()
-                    )
+                    token_vec = buffer_load(rsrc_src, chunk, vec_width=4, dtype=T.i32())
                     buffer_store(token_vec, rsrc_staging, chunk)
                 P.waitcnt_all()
                 # The SDMA engine is a system-scope observer. waitcnt only
@@ -1009,9 +961,7 @@ def make_dispatch_token_centric(
                 for route_step in range_constexpr(npes):
                     if route_valids[route_step] != 0:
                         if route_peers[route_step] == my_lsa_rank:
-                            for chunk in range(
-                                tid * 4, n_i32, block_threads * 4
-                            ):
+                            for chunk in range(tid * 4, n_i32, block_threads * 4):
                                 token_vec = buffer_load(
                                     rsrc_staging,
                                     chunk,
@@ -1056,14 +1006,10 @@ def make_dispatch_token_centric(
                         for route_step in range_constexpr(npes):
                             if route_valids[route_step] != 0:
                                 if route_peers[route_step] != my_lsa_rank:
-                                    sdma.quiet_queue(
-                                        route_peers[route_step], qid
-                                    )
+                                    sdma.quiet_queue(route_peers[route_step], qid)
             else:
                 for chunk in range(tid * 4, n_i32, block_threads * 4):
-                    token_vec = buffer_load(
-                        rsrc_src, chunk, vec_width=4, dtype=T.i32()
-                    )
+                    token_vec = buffer_load(rsrc_src, chunk, vec_width=4, dtype=T.i32())
                     for route_step in range_constexpr(npes):
                         if route_valids[route_step] != 0:
                             buffer_store(
@@ -1087,8 +1033,7 @@ def make_dispatch_token_centric(
                             buffer_store(
                                 scale_val,
                                 route_scale_rsrcs[route_step],
-                                route_slots[route_step] * scale_num_i32
-                                + scale_off,
+                                route_slots[route_step] * scale_num_i32 + scale_off,
                                 cache_modifier=metadata_store_cache_modifier,
                             )
 
@@ -1130,12 +1075,10 @@ def make_dispatch_token_centric(
                                 )
                                 + 1
                             )
-                        peer_recv_num = fx.Int64(
-                            window.lsa_ptr(dest_pe, off_recv_num)
-                        )
-                        recv_num_remote_addr = (
-                            peer_recv_num + fx.Int64(rank) * fx.Int64(4)
-                        )
+                        peer_recv_num = fx.Int64(window.lsa_ptr(dest_pe, off_recv_num))
+                        recv_num_remote_addr = peer_recv_num + fx.Int64(
+                            rank
+                        ) * fx.Int64(4)
                         P.spin_until_eq_i32(recv_num_remote_addr, 0)
                         P.store_i32_system(
                             recv_num_remote_addr,
@@ -1146,12 +1089,10 @@ def make_dispatch_token_centric(
             for src_pe in range(lane, npes, WAVE):
                 if bid == 0:
                     if warp == 0:
-                        recv_num_src_addr = (
-                            local_recv_num + fx.Int64(src_pe) * fx.Int64(4)
-                        )
-                        signal_value = P.spin_until_gt_i32(
-                            recv_num_src_addr, 0
-                        )
+                        recv_num_src_addr = local_recv_num + fx.Int64(
+                            src_pe
+                        ) * fx.Int64(4)
+                        signal_value = P.spin_until_gt_i32(recv_num_src_addr, 0)
                         peer_recv_count = signal_value - 1
                         P.store_i32_system(
                             recv_num_src_addr,
@@ -1162,9 +1103,7 @@ def make_dispatch_token_centric(
                             P.atomic_add_global(
                                 fx.Int64(addr_total_recv), peer_recv_count
                             )
-                            buffer_store(
-                                arith.constant(0), rsrc_dest_ctr, src_pe
-                            )
+                            buffer_store(arith.constant(0), rsrc_dest_ctr, src_pe)
 
             if bid == 0:
                 if warp == 0:
@@ -1173,9 +1112,7 @@ def make_dispatch_token_centric(
                             window.lsa_ptr(my_lsa_rank, off_tok_off)
                         )
                         if const_expr(direct_tok_off_total):
-                            allocated = fx.Int32(
-                                P.load_i32_acquire(local_tok_off)
-                            )
+                            allocated = fx.Int32(P.load_i32_acquire(local_tok_off))
                             capped = arith.select(
                                 allocated < arith.constant(max_recv),
                                 allocated,
@@ -1539,7 +1476,12 @@ def make_combine(
             expert_valids = []
             expert_pes = []
             expert_toks = []
-            tok_map_lane = lane
+            # Idle lanes (>= experts_per_token) are never read back by
+            # readlane, but their tok_map_base+lane can overrun the
+            # allocation on the last tokens of a batch. Fold onto slot 0.
+            tok_map_lane = arith.select(
+                lane < experts_per_token, lane, arith.constant(0)
+            )
             if const_expr(rotate_combine_peer_order):
                 # Match OPUS's communication-WG phase shift: each gather warp
                 # sees the same K entries through a different cyclic order.

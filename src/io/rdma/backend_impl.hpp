@@ -68,6 +68,8 @@ EpPairVec InterleaveEndpointsByLocalDevice(const EpPairVec& eps,
 /* ---------------------------------------------------------------------------------------------- */
 class RdmaManager {
  public:
+  using SnapshotVector = std::vector<std::shared_ptr<EndpointRuntime>>;
+
   RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* ctx);
   ~RdmaManager();
 
@@ -98,7 +100,12 @@ class RdmaManager {
                              int rdevId, application::RdmaEndpointHandle remote, TopoKeyPair key,
                              int weight);
   std::shared_ptr<EndpointRuntime> GetEndpointRuntime(EndpointId id);
-  std::vector<std::shared_ptr<EndpointRuntime>> SnapshotEndpointRuntimes();
+  void SnapshotEndpointRuntimes(SnapshotVector& result);
+  // Monotonic generation counter bumped whenever the endpoint set changes.
+  // Lets hot pollers skip the locked snapshot rebuild when nothing changed.
+  uint64_t EndpointsEpoch() const noexcept {
+    return endpointsEpoch_.load(std::memory_order_acquire);
+  }
 
   application::RdmaDeviceContext* GetRdmaDeviceContext(int devId);
   size_t NumAvailDevices() const { return availDevices.size(); }
@@ -119,6 +126,7 @@ class RdmaManager {
   std::unordered_map<EngineKey, RemoteEngineMeta> remotes;
   std::atomic<EndpointId> nextEndpointId_{1};
   std::unordered_map<EndpointId, std::shared_ptr<EndpointRuntime>> endpointsById_;
+  std::atomic<uint64_t> endpointsEpoch_{0};
 
   std::unique_ptr<application::TopoSystem> topo{nullptr};
   std::atomic<uint32_t> roundRobinCounter{0};

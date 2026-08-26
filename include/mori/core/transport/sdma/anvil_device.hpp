@@ -52,6 +52,17 @@ constexpr long long MAX_RETRIES = 1LL << 34;
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
 
+// gfx12 dropped the s_waitcnt intrinsic. This gate only makes the header build
+// for gfx1250 -- the packets below are still the gfx9 layout, with no npd/scope
+// fields, so this path is not ported to gfx12.5 (see cco.hpp for one that is).
+__device__ __forceinline__ void PublishStores() {
+#if defined(__gfx1250__)
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+#else
+  __builtin_amdgcn_s_waitcnt(0);
+#endif
+}
+
 // SDMA_PKT_COPY_LINEAR DW2 (PARAMETER_UNION) stays 0: peak D2D/XGMI copy BW.
 __device__ __forceinline__ SDMA_PKT_COPY_LINEAR CreateCopyPacket(void* srcBuf, void* dstBuf,
                                                                  long long int packetSize) {
@@ -196,24 +207,24 @@ struct SdmaQueueDeviceHandle {
       // Ringing the doorbell out of order would publish a partial packet.
       if (++retries > MAX_RETRIES) __builtin_trap();
     }
-    __builtin_amdgcn_s_waitcnt(0);
+    PublishStores();
     __builtin_amdgcn_wave_barrier();
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
 
     __hip_atomic_store(wptr, pendingWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 
-    __builtin_amdgcn_s_waitcnt(0);
+    PublishStores();
     __builtin_amdgcn_wave_barrier();
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
 
     __hip_atomic_store(doorbell, pendingWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
 
-    __builtin_amdgcn_s_waitcnt(0);
+    PublishStores();
     __builtin_amdgcn_wave_barrier();
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
     __hip_atomic_store(committedWptr, pendingWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 
-    __builtin_amdgcn_s_waitcnt(0);
+    PublishStores();
     __builtin_amdgcn_wave_barrier();
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
   }

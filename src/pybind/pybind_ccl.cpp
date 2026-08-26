@@ -75,13 +75,13 @@ void BindAllreduceHandle(py::module_& m, const char* python_name) {
       .def(
           "finish_sync",
           [](Handle& self, uintptr_t output, size_t count, int64_t stream,
-             bool force_copy_output_to_user) -> double {
+             bool force_copy_output_to_user, bool direct_output) -> double {
             return self.finish_sync(reinterpret_cast<T*>(output), count,
                                     reinterpret_cast<hipStream_t>(stream),
-                                    force_copy_output_to_user);
+                                    force_copy_output_to_user, direct_output);
           },
           py::arg("output_ptr"), py::arg("count"), py::arg("stream"),
-          py::arg("force_copy_output_to_user") = false)
+          py::arg("force_copy_output_to_user") = false, py::arg("direct_output") = false)
       // JIT async path
       .def(
           "prepare_async_reduce_scatter",
@@ -98,7 +98,7 @@ void BindAllreduceHandle(py::module_& m, const char* python_name) {
             return self.prepare_async_allgather_put(count, reinterpret_cast<hipStream_t>(stream));
           },
           py::arg("count"), py::arg("stream"))
-      .def("after_async_start", &Handle::after_async_start)
+      .def("after_async_start", &Handle::after_async_start, py::arg("capturing") = false)
       .def(
           "prepare_async_wait",
           [](Handle& self, int64_t stream) -> int64_t {
@@ -107,22 +107,14 @@ void BindAllreduceHandle(py::module_& m, const char* python_name) {
           py::arg("stream"))
       .def(
           "finish_async_wait",
-          [](Handle& self, int64_t stream) -> double {
-            return self.finish_async_wait(reinterpret_cast<hipStream_t>(stream));
+          [](Handle& self, int64_t stream, bool capturing, bool direct_output) -> double {
+            return self.finish_async_wait(reinterpret_cast<hipStream_t>(stream), capturing,
+                                          direct_output);
           },
-          py::arg("stream"))
+          py::arg("stream"), py::arg("capturing") = false, py::arg("direct_output") = false)
       .def("is_async_in_progress", &Handle::is_async_in_progress)
       .def("cancel_async", &Handle::cancel_async)
       .def("reset_flags", &Handle::resetFlags)
-      .def(
-          "get_output_transit_buffer",
-          [](Handle& self) -> py::tuple {
-            void* ptr = self.getOutputTransitBuffer();
-            size_t size = self.getOutputTransitBufferSize();
-            if (ptr == nullptr) throw std::runtime_error("Output transit buffer is null");
-            return py::make_tuple(reinterpret_cast<uintptr_t>(ptr), size);
-          },
-          "Return (ptr, size_bytes) of the output transit buffer")
       .def("max_blocks", &Handle::max_blocks)
       .def("npes", &Handle::npes);
 }
