@@ -112,6 +112,102 @@ TEST(DRAMTierRangesTest, ShuffledPutAndOverlappingGetAreByteCorrect) {
   EXPECT_EQ(prefix_b, std::vector<char>(4, 'A'));
 }
 
+// A layer group repeats the previous group's key set, so the tier remembers the
+// lookups.  These cover the ways that answer can go stale -- each asserts the
+// BYTES that come back, not that some counter moved.
+
+// The dangerous one: a key is rewritten and lands at a different offset.  A
+// remembered lookup would copy from where it used to be.
+TEST(DRAMTierRangesTest, RepeatedReadSeesAKeyRewrittenToANewOffset) {
+  DRAMTier tier(4096);
+  std::vector<char> a(8, 'A');
+  std::vector<char> b(8, 'B');
+  ASSERT_TRUE(tier.Write("k", a.data(), a.size()));
+
+  std::vector<char> out(8, 0);
+  const std::vector<std::string> batch = {"k"};
+  auto first =
+      tier.ReadBatchRangesIntoPtr(batch, {{reinterpret_cast<uintptr_t>(out.data())}}, {{8}}, {{0}});
+  ASSERT_EQ(first, std::vector<bool>({true}));
+  ASSERT_EQ(out, std::vector<char>(8, 'A'));
+
+  // Rewrite: frees the old slot and takes a new one for the same key.
+  ASSERT_TRUE(tier.Write("k", b.data(), b.size()));
+
+  std::vector<char> again(8, 0);
+  auto second = tier.ReadBatchRangesIntoPtr(batch, {{reinterpret_cast<uintptr_t>(again.data())}},
+                                            {{8}}, {{0}});
+  ASSERT_EQ(second, std::vector<bool>({true}));
+  EXPECT_EQ(again, std::vector<char>(8, 'B')) << "served from a stale remembered slot";
+}
+
+// Evicting a key must not leave the batch reading whatever now owns its space.
+TEST(DRAMTierRangesTest, RepeatedReadAfterEvictReportsAMissNotStaleBytes) {
+  DRAMTier tier(4096);
+  std::vector<char> a(8, 'A');
+  ASSERT_TRUE(tier.Write("k", a.data(), a.size()));
+
+  std::vector<char> out(8, 0);
+  const std::vector<std::string> batch = {"k"};
+  ASSERT_EQ(
+      tier.ReadBatchRangesIntoPtr(batch, {{reinterpret_cast<uintptr_t>(out.data())}}, {{8}}, {{0}}),
+      std::vector<bool>({true}));
+
+  ASSERT_TRUE(tier.Evict("k"));
+
+  std::vector<char> again(8, 0);
+  auto second = tier.ReadBatchRangesIntoPtr(batch, {{reinterpret_cast<uintptr_t>(again.data())}},
+                                            {{8}}, {{0}});
+  EXPECT_EQ(second, std::vector<bool>({false})) << "evicted key served from a remembered lookup";
+}
+
+// A key absent on the first pass must be picked up once it is written: a
+// remembered "not found" would outlive it.
+TEST(DRAMTierRangesTest, RepeatedReadPicksUpAKeyWrittenAfterTheFirstPass) {
+  DRAMTier tier(4096);
+  std::vector<char> a(8, 'A');
+  std::vector<char> b(8, 'B');
+  ASSERT_TRUE(tier.Write("a", a.data(), a.size()));
+
+  std::vector<char> out_a(8, 0), out_b(8, 0);
+  const std::vector<std::string> batch = {"a", "b"};
+  auto ptrs = std::vector<std::vector<uintptr_t>>{{reinterpret_cast<uintptr_t>(out_a.data())},
+                                                  {reinterpret_cast<uintptr_t>(out_b.data())}};
+  auto first = tier.ReadBatchRangesIntoPtr(batch, ptrs, {{8}, {8}}, {{0}, {0}});
+  ASSERT_EQ(first, std::vector<bool>({true, false}));
+
+  ASSERT_TRUE(tier.Write("b", b.data(), b.size()));
+
+  std::vector<char> again_a(8, 0), again_b(8, 0);
+  auto ptrs2 = std::vector<std::vector<uintptr_t>>{{reinterpret_cast<uintptr_t>(again_a.data())},
+                                                   {reinterpret_cast<uintptr_t>(again_b.data())}};
+  auto second = tier.ReadBatchRangesIntoPtr(batch, ptrs2, {{8}, {8}}, {{0}, {0}});
+  EXPECT_EQ(second, std::vector<bool>({true, true}))
+      << "a key written after the batch was first read was missed";
+  EXPECT_EQ(again_b, std::vector<char>(8, 'B'));
+}
+
+// Same keys, different byte ranges -- which is exactly what consecutive layer
+// groups do. The remembered lookup must not pin the ranges too.
+TEST(DRAMTierRangesTest, RepeatedReadOfOneKeySetHonoursDifferentRanges) {
+  DRAMTier tier(4096);
+  std::vector<char> value{'0', '1', '2', '3', '4', '5', '6', '7'};
+  ASSERT_TRUE(tier.Write("k", value.data(), value.size()));
+  const std::vector<std::string> batch = {"k"};
+
+  std::vector<char> head(4, 0);
+  ASSERT_EQ(tier.ReadBatchRangesIntoPtr(batch, {{reinterpret_cast<uintptr_t>(head.data())}}, {{4}},
+                                        {{0}}),
+            std::vector<bool>({true}));
+  EXPECT_EQ(head, (std::vector<char>{'0', '1', '2', '3'}));
+
+  std::vector<char> tail(4, 0);
+  ASSERT_EQ(tier.ReadBatchRangesIntoPtr(batch, {{reinterpret_cast<uintptr_t>(tail.data())}}, {{4}},
+                                        {{4}}),
+            std::vector<bool>({true}));
+  EXPECT_EQ(tail, (std::vector<char>{'4', '5', '6', '7'}));
+}
+
 TEST(DRAMTierRangesTest, ShapeErrorsFailWholeBatch) {
   DRAMTier tier(4096);
   std::vector<char> value(8, 'x');

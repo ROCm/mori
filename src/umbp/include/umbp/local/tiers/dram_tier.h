@@ -135,6 +135,28 @@ class DRAMTier : public TierBackend {
   };
   std::unordered_map<std::string, SlotInfo> slots_;
 
+  // Bumped whenever a key's slot stops being that key's.  A remembered batch
+  // lookup is reusable only while this has not moved.
+  uint64_t slot_generation_ = 0;
+
+  // One layer group's worth of lookups, kept for the next group.
+  //
+  // A layer-wise reader sends the same key set once per layer group -- eight
+  // times for DeepSeek-V4 -- changing only which bytes of each object it wants.
+  // Each repeat re-hashed every ~128-byte key twice (slots_ and lru_map_) and
+  // copied it once more into the LRU list.  `keys` is compared in full on a
+  // hit; the fingerprint only picks the candidate, so a collision costs a
+  // re-lookup and never the wrong slot.
+  struct RangeLookupCache {
+    std::vector<std::string> keys;
+    std::vector<SlotInfo> slots;
+    uint64_t generation = 0;
+    uint64_t last_used = 0;
+  };
+  static constexpr size_t kRangeLookupCacheCapacity = 64;
+  std::unordered_map<uint64_t, RangeLookupCache> range_lookup_cache_;
+  uint64_t range_lookup_clock_ = 0;
+
   // LRU linked list
   std::list<std::string> lru_list_;
   std::unordered_map<std::string, std::list<std::string>::iterator> lru_map_;
