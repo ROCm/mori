@@ -290,8 +290,14 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
   assert(qpUar->page_id != 0);
 
   if (config.onGpu) {
-    uint32_t flag = hipHostRegisterPortable | hipHostRegisterMapped;
-    HIP_RUNTIME_CHECK(hipHostRegister(qpUar->reg_addr, QueryHcaCap(context).dbrRegSize, flag));
+    // One registration per UAR address, not per QP: devx_alloc_uar(MLX5DV_UAR_ALLOC_TYPE_NC)
+    // returns the ibv_context's singleton NC UAR, so every QP sees the same reg_addr and the
+    // second hipHostRegister would fail with hipErrorHostMemoryAlreadyRegistered. The teardown
+    // path below already assumed the sharing; the register side did not.
+    if (device_context->TryRegisterUar(qpUar->reg_addr)) {
+      uint32_t flag = hipHostRegisterPortable | hipHostRegisterMapped;
+      HIP_RUNTIME_CHECK(hipHostRegister(qpUar->reg_addr, QueryHcaCap(context).dbrRegSize, flag));
+    }
     HIP_RUNTIME_CHECK(hipHostGetDevicePointer(&qpUarPtr, qpUar->reg_addr, 0));
   } else {
     qpUarPtr = qpUar->reg_addr;
@@ -378,13 +384,11 @@ void Mlx5QpContainer::DestroyQueuePair() {
     }
   }
   if (qpUar) {
-    if (config.onGpu) {
-      hipPointerAttribute_t attr;
-      HIP_RUNTIME_CHECK(hipPointerGetAttributes(&attr, qpUar->reg_addr));
-      // Multiple qp may share the same uar address, only unregister once
-      if ((attr.type == hipMemoryTypeHost) && (attr.hostPointer != nullptr)) {
-        HIP_RUNTIME_CHECK(hipHostUnregister(qpUar->reg_addr));
-      }
+    // Multiple qp share the same uar address, only unregister once. Driven by the same bookkeeping
+    // as the register side rather than by probing the pointer: once the first QP unregisters, the
+    // probe errors out and HIP_RUNTIME_CHECK would exit(-1) during teardown.
+    if (config.onGpu && device_context->TryUnregisterUar(qpUar->reg_addr)) {
+      HIP_RUNTIME_CHECK(hipHostUnregister(qpUar->reg_addr));
     }
     Mlx5DvApi::Instance().devx_free_uar(qpUar);
   }
@@ -537,7 +541,28 @@ Mlx5DeviceContext::Mlx5DeviceContext(RdmaDevice* rdma_device, ibv_pd* in_pd)
   pdn = dvpd.pdn;
 }
 
-Mlx5DeviceContext::~Mlx5DeviceContext() {}
+Mlx5DeviceContext::~Mlx5DeviceContext() {
+  // Drop the queue pairs while this object is still whole: ~Mlx5QpContainer reaches back into
+  // TryUnregisterUar. Relying on implicit member destruction would be order-dependent even with
+  // the declaration order above.
+  qpPool.clear();
+  cqPool.clear();
+}
+
+bool Mlx5DeviceContext::TryRegisterUar(void* uar_addr) {
+  std::lock_guard<std::mutex> lock(uarMutex);
+  if (registeredUars.find(uar_addr) != registeredUars.end()) return false;
+  registeredUars.insert(uar_addr);
+  return true;
+}
+
+bool Mlx5DeviceContext::TryUnregisterUar(void* uar_addr) {
+  std::lock_guard<std::mutex> lock(uarMutex);
+  auto it = registeredUars.find(uar_addr);
+  if (it == registeredUars.end()) return false;
+  registeredUars.erase(it);
+  return true;
+}
 
 RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& config) {
   assert(!config.withCompChannel && !config.enableSrq && "not implemented");

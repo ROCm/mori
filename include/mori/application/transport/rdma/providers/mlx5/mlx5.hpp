@@ -21,6 +21,9 @@
 // SOFTWARE.
 #pragma once
 
+#include <mutex>
+#include <set>
+
 #include "mori/application/transport/rdma/providers/dv_loader.hpp"
 #include "mori/application/transport/rdma/providers/mlx5/mlx5_dv.h"
 #include "mori/application/transport/rdma/providers/mlx5/mlx5_ifc.hpp"
@@ -137,8 +140,21 @@ class Mlx5DeviceContext : public RdmaDeviceContext {
   virtual void ConnectEndpoint(const RdmaEndpointHandle& local, const RdmaEndpointHandle& remote,
                                uint32_t qpId = 0) override;
 
+  // rdma-core hands out ONE non-cached UAR per ibv_context: _mlx5dv_devx_alloc_uar() short
+  // circuits MLX5DV_UAR_ALLOC_TYPE_NC to mlx5_get_singleton_nc_uar(), so every QP on this device
+  // gets the identical reg_addr. Register it with HIP exactly once (bnxt already does this).
+  bool TryRegisterUar(void* uar_addr);
+  bool TryUnregisterUar(void* uar_addr);
+
  private:
   uint32_t pdn;
+
+  // Declared BEFORE the pools: members are destroyed in reverse declaration order, and
+  // ~Mlx5QpContainer calls TryUnregisterUar. If these came after qpPool they would already be
+  // gone by the time the QPs are destroyed, and the unregister would lock a destroyed mutex and
+  // mutate a destroyed set -- silent heap corruption at teardown.
+  std::set<void*> registeredUars;
+  std::mutex uarMutex;
 
   std::unordered_map<uint32_t, std::unique_ptr<Mlx5CqContainer>> cqPool;
   std::unordered_map<uint32_t, std::unique_ptr<Mlx5QpContainer>> qpPool;
