@@ -182,6 +182,14 @@ def _normalize_quant_type(quant_type):
     )
 
 
+# Above this many tokens per rank the v1_ll dispatch keeps EpDispatchCopyToStaging
+# as its own grid=mp launch; at or below it the copy is folded into the main
+# kernel's rdma blocks, trading grid width for one launch less. The default is
+# one chunk (warpSize tokens), where the whole copy is a single block's work
+# anyway. Set MORI_INLINE_STAGE_MAX_TOKENS=0 to always use the separate launch.
+_INLINE_STAGE_MAX_TOKENS = int(os.environ.get("MORI_INLINE_STAGE_MAX_TOKENS", "64"))
+
+
 def _current_stream():
     return torch.cuda.current_stream().cuda_stream
 
@@ -1250,17 +1258,33 @@ class EpDispatchCombineOp:
             )
         elif kt == EpDispatchCombineKernelType.InterNodeV1LL.value:
             mp = self._handle_info["multi_processor_count"]
-            self._launch_multi(
-                [
-                    f"EpDispatchCopyToStaging_{sfx}",
-                    f"EpDispatchInterNodeV1KernelLowLatency_{sfx}",
-                ],
-                [mp, actual_bn],
-                [self._warp_size * actual_wpb, self._warp_size * actual_wpb],
-                [0, shared_mem],
-                stream,
-                args_ptr,
-            )
+            bsz = self._warp_size * actual_wpb
+            if num_tokens <= _INLINE_STAGE_MAX_TOKENS:
+                # Small payload: pack staging inside the main kernel and save a
+                # launch. The copy then runs on rdmaBlockNum*warpNum warps rather
+                # than mp*warpNum, which only pays off while there is little to
+                # copy -- above the threshold the wider grid wins, so keep the
+                # separate launch there.
+                self._launch(
+                    f"EpDispatchInterNodeV1LLInlineStage_{sfx}",
+                    (actual_bn,),
+                    (bsz,),
+                    shared_mem,
+                    stream,
+                    args_ptr,
+                )
+            else:
+                self._launch_multi(
+                    [
+                        f"EpDispatchCopyToStaging_{sfx}",
+                        f"EpDispatchInterNodeV1KernelLowLatency_{sfx}",
+                    ],
+                    [mp, actual_bn],
+                    [bsz, bsz],
+                    [0, shared_mem],
+                    stream,
+                    args_ptr,
+                )
         elif kt == EpDispatchCombineKernelType.IntraNode.value:
             self._launch(
                 self._intranode_dispatch_kernel(sfx),
