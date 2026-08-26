@@ -805,6 +805,37 @@ __global__ void EpDispatchInterNodeV1LLInlineStage(EpDispatchCombineArgs<T> args
 }
 
 /* ---------------------------------------------------------------------------------------------- */
+/*                          Attribution-only variants (MORI_SPLIT_*)                              */
+/* ---------------------------------------------------------------------------------------------- */
+// The main kernels interleave "doing work" with "waiting for a peer", and a
+// phase total cannot separate the two. These variants run one phase per launch
+// so a kernel-level profile attributes the time. Splitting serialises phases
+// that otherwise overlap, so they are strictly for measurement -- the launcher
+// only uses them when the matching MORI_SPLIT_* env var is set.
+template <typename T>
+__device__ void EpDispatchLLSendPhase_body(EpDispatchCombineArgs<T> args) {
+  DEF_COMMON_VARS;
+  if (blockId < args.rdmaBlockNum) {
+    v1::DispatchInterNodeLLSend<T, true>(args);
+  } else {
+    v1::DispatchIntraNode(args);
+  }
+}
+
+template <typename T>
+__device__ void EpDispatchLLRecvPhase_body(EpDispatchCombineArgs<T> args) {
+  DEF_COMMON_VARS;
+  if (blockId < args.rdmaBlockNum) {
+    v1::DispatchInterNodeLLRecv(args);
+  }
+}
+
+template <typename T>
+__device__ void EpDispatchLLSyncPhase_body(EpDispatchCombineArgs<T> args) {
+  v1::DispatchSync(args);
+}
+
+/* ---------------------------------------------------------------------------------------------- */
 /*                                   EpCombineInterNodeV1Kernel                                   */
 /* ---------------------------------------------------------------------------------------------- */
 namespace v1 {
@@ -1200,7 +1231,40 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs<T>& 
   }
 }
 
-template <typename TokT, typename T>
+// Cross-node rendezvous that closes the combine phase: tell each remote node's
+// proxy PE we are done sending, then wait for its counterpart. Split out so it
+// can also run as its own launch, which is what makes the "accumulate + send"
+// cost separable from the "wait for the peer node" cost in a kernel profile.
+template <typename T>
+__forceinline__ __device__ void CombineXNodeBarrierWarp(EpDispatchCombineArgs<T>& args,
+                                                        uint64_t barrierFlag) {
+  DEF_COMMON_VARS;
+
+  if (laneId < nNodes) {
+    core::AtomicStoreSeqCstSystem(
+        args.nodeRecvTokenNumMemObj->template GetAs<uint64_t*>() + laneId, uint64_t{0});
+  }
+  // myNode is signalled by the intra-node branch, so skip it here.
+  if ((laneId < nNodes) && (laneId != myNode)) {
+    int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
+    for (int i = 0; i < config.numQpPerPe; i++) {
+      shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(
+          args.crossDeviceBarrierMemObj, args.config.rank * sizeof(uint64_t), 1, core::AMO_ADD,
+          proxyPe, i);
+    }
+    __threadfence_system();
+  }
+
+  uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
+  if ((laneId < nNodes) && (laneId != myNode)) {
+    int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
+    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
+           (barrierFlag * config.numQpPerPe)) {
+    }
+  }
+}
+
+template <typename TokT, typename T, bool DoTailBarrier = true>
 __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs<T>& args,
                                                         size_t tokHiddenBytes,
                                                         size_t tokCombXferBytes) {
@@ -1346,32 +1410,12 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs<T>
 
   if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
 
-  uint64_t barrierFlag = 0;
-  if (laneId == 0) barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
-  barrierFlag = __shfl(barrierFlag, 0);
-
-  if (laneId < nNodes) {
-    core::AtomicStoreSeqCstSystem(
-        args.nodeRecvTokenNumMemObj->template GetAs<uint64_t*>() + laneId, uint64_t{0});
-  }
-  if ((laneId < nNodes) &&
-      (laneId != myNode)) {  // avoid setting myNode, it will be set in intra node branch
-    int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
-    for (int i = 0; i < config.numQpPerPe; i++) {
-      shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(args.crossDeviceBarrierMemObj,
-                                                     args.config.rank * sizeof(uint64_t), 1,
-                                                     core::AMO_ADD, proxyPe, i);
-    }
-    __threadfence_system();
-  }
-
-  // Wait other nodes
-  uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
-  if ((laneId < nNodes) && (laneId != myNode)) {
-    int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
-    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
-           (barrierFlag * config.numQpPerPe)) {
-    }
+  // When DoTailBarrier is false the rendezvous runs as its own launch instead.
+  if constexpr (DoTailBarrier) {
+    uint64_t barrierFlag = 0;
+    if (laneId == 0) barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
+    barrierFlag = __shfl(barrierFlag, 0);
+    CombineXNodeBarrierWarp(args, barrierFlag);
   }
 }
 
@@ -1432,7 +1476,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
   combine_impl::CombineInterNodeTyped<T>(args, hiddenBytes, combXferBytes);
 }
 
-template <typename T>
+template <typename T, bool DoTailBarrier = true>
 inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
@@ -1443,10 +1487,11 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
     const size_t tokHiddenBytes = hiddenDim * sizeof(TokT);
     const size_t tokCombXferBytes =
         (args.weightsBuf == nullptr) ? tokHiddenBytes : tokHiddenBytes + weightBytes;
-    combine_impl::CombineInterNodeLLTyped<TokT>(args, tokHiddenBytes, tokCombXferBytes);
+    combine_impl::CombineInterNodeLLTyped<TokT, T, DoTailBarrier>(args, tokHiddenBytes,
+                                                                  tokCombXferBytes);
     return;
   }
-  combine_impl::CombineInterNodeLLTyped<T>(args, hiddenBytes, combXferBytes);
+  combine_impl::CombineInterNodeLLTyped<T, T, DoTailBarrier>(args, hiddenBytes, combXferBytes);
 }
 }  // namespace v1
 
@@ -1628,6 +1673,28 @@ __device__ void EpCombineInterNodeV1KernelLowLatency_body(EpDispatchCombineArgs<
 template <typename T, bool EnableStdMoE>
 __global__ void EpCombineInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args) {
   EpCombineInterNodeV1KernelLowLatency_body<T, EnableStdMoE>(args);
+}
+
+// Attribution-only; see the note above EpDispatchLLSendPhase_body. This pair
+// separates combine's accumulate+send from its wait on the peer node.
+template <typename T>
+__device__ void EpCombineInterNodeV1LLNoBar_body(EpDispatchCombineArgs<T> args) {
+  DEF_COMMON_VARS;
+  if (blockId < args.rdmaBlockNum) {
+    v1::CombineInterNodeLL<T, false>(args);
+  } else {
+    v1::CombineIntraNodeLL(args);
+  }
+}
+
+template <typename T>
+__device__ void EpCombineXNodeBarrier_body(EpDispatchCombineArgs<T> args) {
+  DEF_COMMON_VARS;
+  if (globalWarpId != 0) return;
+  uint64_t barrierFlag = 0;
+  if (laneId == 0) barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
+  barrierFlag = __shfl(barrierFlag, 0);
+  v1::combine_impl::CombineXNodeBarrierWarp(args, barrierFlag);
 }
 
 template <typename T>

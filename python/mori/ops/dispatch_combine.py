@@ -189,6 +189,12 @@ def _normalize_quant_type(quant_type):
 # anyway. Set MORI_INLINE_STAGE_MAX_TOKENS=0 to always use the separate launch.
 _INLINE_STAGE_MAX_TOKENS = int(os.environ.get("MORI_INLINE_STAGE_MAX_TOKENS", "64"))
 
+# Attribution-only: run one phase per launch so a kernel-level profile can say
+# whether the time went into doing work or into waiting for a peer. Splitting
+# serialises phases that otherwise overlap, so these are for measurement only.
+_SPLIT_DISP = os.environ.get("MORI_SPLIT_DISP") == "1"
+_SPLIT_XBAR = os.environ.get("MORI_SPLIT_XBAR") == "1"
+
 
 def _current_stream():
     return torch.cuda.current_stream().cuda_stream
@@ -1259,7 +1265,20 @@ class EpDispatchCombineOp:
         elif kt == EpDispatchCombineKernelType.InterNodeV1LL.value:
             mp = self._handle_info["multi_processor_count"]
             bsz = self._warp_size * actual_wpb
-            if num_tokens <= _INLINE_STAGE_MAX_TOKENS:
+            if _SPLIT_DISP:
+                self._launch_multi(
+                    [
+                        f"EpDispatchLLSendPhase_{sfx}",
+                        f"EpDispatchLLRecvPhase_{sfx}",
+                        f"EpDispatchLLSyncPhase_{sfx}",
+                    ],
+                    [actual_bn, actual_bn, actual_bn],
+                    [bsz, bsz, bsz],
+                    [shared_mem, shared_mem, shared_mem],
+                    stream,
+                    args_ptr,
+                )
+            elif num_tokens <= _INLINE_STAGE_MAX_TOKENS:
                 # Small payload: pack staging inside the main kernel and save a
                 # launch. The copy then runs on rdmaBlockNum*warpNum warps rather
                 # than mp*warpNum, which only pays off while there is little to
@@ -1613,18 +1632,26 @@ class EpDispatchCombineOp:
             mp = self._handle_info["multi_processor_count"]
             bsz = self._warp_size * actual_wpb
             # EpCombineSyncLL = EpCombineSync + the (grid=1) EpCombineSyncBarrier.
-            self._launch_multi(
-                [
+            if _SPLIT_XBAR:
+                names = [
+                    f"EpCombineSyncLL_{sfx}",
+                    f"EpCombineInterNodeV1LLNoBar_{sfx}",
+                    f"EpCombineXNodeBarrier_{sfx}",
+                    f"EpCombineAll_{sfx}",
+                ]
+                grids = [mp, actual_bn, 1, mp]
+                blocks = [bsz, bsz, self._warp_size, bsz]
+                shms = [0, shared_mem, 0, shared_mem]
+            else:
+                names = [
                     f"EpCombineSyncLL_{sfx}",
                     f"EpCombineInterNodeV1KernelLowLatency_{sfx}",
                     f"EpCombineAll_{sfx}",
-                ],
-                [mp, actual_bn, mp],
-                [bsz, bsz, bsz],
-                [0, shared_mem, shared_mem],
-                stream,
-                args_ptr,
-            )
+                ]
+                grids = [mp, actual_bn, mp]
+                blocks = [bsz, bsz, bsz]
+                shms = [0, shared_mem, shared_mem]
+            self._launch_multi(names, grids, blocks, shms, stream, args_ptr)
         elif kt in (
             EpDispatchCombineKernelType.IntraNode.value,
             EpDispatchCombineKernelType.IntraNodeLL.value,
