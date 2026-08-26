@@ -165,6 +165,12 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   __syncthreads();
 
   // ---- Phase 3: distribute LOCAL slots + copy metadata and payload ----
+  // INVARIANT: this loop MUST have the same bounds, stride, and guard as Phase 1's loop
+  // (globalWarpId .. Npair, step globalWarpNum, gated by tokenIndices && inpTokenBuf &&
+  // !replayMode). The cached-routing scheme relies on each warp reading back the same
+  // dispDestTokIdMap[i] entry it wrote in Phase 1 — same warp, same block, guaranteed
+  // visible after __syncthreads. Changing one loop without the other silently corrupts
+  // routing because a different block's stale or unwritten entry would be read instead.
   if (args.tokenIndices && args.inpTokenBuf && !args.replayMode) {
     for (int i = globalWarpId; i < Npair; i += globalWarpNum) {
       index_t cached = 0;
@@ -209,7 +215,21 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     }
   }
   __syncthreads();
-  // ---- Completion: overlap slot drain with grid barrier ----
+  // ---- Completion: all blocks arrive, then per-peer release-signal ----------------------------
+  // THESE TWO WAITS ARE INDEPENDENT, WHICH IS WHY THE SLOT ONE GOES FIRST.
+  // Whether the peer has drained last launch's mailbox has nothing to do with whether this
+  // rank's slowest block has finished, so running them in that order used to cost cbar + cslot
+  // where it can cost max(cbar, cslot). Instrumented at 512: cbar 6.60 -> 1.50 and cslot 3.38
+  // -> 4.55, i.e. the sum 9.98 became 6.05; isolated A/B was +8.7% at 512 and +1.6% at 4096
+  // on the gfx1250 body (intranode_1250x.hpp lines 811-826).
+  //
+  // The slot read is against uncached peer memory, so it pays a full fabric round trip even
+  // when the slot has long been zero -- issuing it while the grid barrier is still spinning is
+  // what hides it. Its address depends only on destPe, so nothing here needs the barrier
+  // satisfied.
+  //
+  // THE WIRE FORMAT IS BYTE-FOR-BYTE UNCHANGED: both are pure spin-waits that write nothing,
+  // and the signal store below still happens after BOTH. This is only the order of two reads.
   if (thdId == 0) atomicAdd(args.dispatchGridBarrier, 1);
   index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
   if (globalWarpId == 0) {
