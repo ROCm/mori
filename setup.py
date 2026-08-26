@@ -30,6 +30,11 @@ from setuptools.command.build import build as _build
 from setuptools.command.build_ext import build_ext
 
 try:
+    from torch.utils.cpp_extension import CppExtension as _TorchCppExtension
+except ImportError:  # torch is optional at build time
+    _TorchCppExtension = None
+
+try:
     from Cython.Build import cythonize as _cythonize
 
     _HAVE_CYTHON = True
@@ -70,6 +75,20 @@ def _env_flag(name: str, default: str = "OFF") -> bool:
         "TRUE",
         "YES",
     }
+
+
+def _torch_symm_mode() -> str:
+    """ON | OFF | AUTO for the torch SymmetricMemory backend.
+
+    AUTO (the default) builds it when torch is importable and treats a failure as a
+    skip, because the extension is optional and its ABI tracks a torch that mori does
+    not depend on. ON turns those skips into build errors."""
+    raw = os.environ.get("BUILD_TORCH_SYMM", "AUTO").strip().upper()
+    if raw in {"1", "ON", "TRUE", "YES"}:
+        return "ON"
+    if raw in {"0", "OFF", "FALSE", "NO"}:
+        return "OFF"
+    return "AUTO"
 
 
 def _detect_pkg_manager() -> str:
@@ -358,6 +377,15 @@ def _copy_jit_sources(root_dir: Path) -> None:
         if src_file.is_file():
             shutil.copy2(src_file, shmem_dst / name)
 
+    # torch SymmetricMemory backend — compiled on first import when the prebuilt
+    # extension is missing or was built against a different torch. Headers come from
+    # the include/ copy above.
+    symm_src = root_dir / "src" / "allocator" / "symm_backend.cpp"
+    if symm_src.is_file():
+        symm_dst = jit_dir / "src" / "allocator"
+        symm_dst.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(symm_src, symm_dst / "symm_backend.cpp")
+
     # cco device-API wrapper — JIT-compiled to libmori_cco_device.bc on first use
     # (mori.cco.device.bitcode). Headers come from the include/ copy above.
     cco_dev_src = root_dir / "src" / "cco" / "device" / "cco_device_wrapper.cpp"
@@ -462,8 +490,46 @@ class CMakeBuild(build_ext):
         if mpi_enabled:
             _REQUIRED_SYSTEM_DEPS.extend(_MPI_SYSTEM_DEPS)
         _check_system_deps()
+        torch_exts = [
+            e for e in self.extensions if getattr(e, "_mori_torch_ext", False)
+        ]
         for ext in self.extensions:
-            self.build_extension(ext)
+            if ext not in torch_exts:
+                self.build_extension(ext)
+        if torch_exts:
+            try:
+                self._build_with_torch(torch_exts)
+            except Exception as exc:
+                # AUTO means "build it if this environment can": a torch whose
+                # SymmetricMemory interface has moved must not take the rest of mori
+                # down with it. mori.allocator rebuilds from the shipped sources on
+                # first import, so the backend is still reachable after this.
+                if _torch_symm_mode() != "AUTO":
+                    raise
+                print(
+                    f"[mori] torch SymmetricMemory backend not prebuilt ({exc}). "
+                    "It will be compiled on first `import mori.allocator`; set "
+                    "BUILD_TORCH_SYMM=ON to make this a build error instead."
+                )
+
+    def _build_with_torch(self, exts: list) -> None:
+        """Build torch-linked extensions with torch's own build_ext, in a separate
+        command instance so nothing else in this build sees torch's compiler patches.
+
+        torch derives _GLIBCXX_USE_CXX11_ABI, its bundled pybind11 and the module's ABI
+        tag from the installed torch; hand-rolling those is what we are avoiding."""
+        from torch.utils.cpp_extension import BuildExtension
+
+        cmd = BuildExtension(self.distribution)
+        cmd.initialize_options()
+        cmd.inplace = self.inplace
+        cmd.build_lib = self.build_lib
+        cmd.build_temp = self.build_temp
+        cmd.force = self.force
+        cmd.finalize_options()
+        # after finalize_options, which would otherwise reset this to all ext_modules
+        cmd.extensions = exts
+        cmd.run()
 
     def build_extension(self, ext: Extension) -> None:
         if ext.sources and any(s.endswith((".pyx", ".cpp")) for s in ext.sources):
@@ -861,14 +927,53 @@ def _cco_extension() -> list:
     )
 
 
-extensions = [
-    Extension(
-        "mori",
-        sources=[],
-        # extra_compile_args=['-ggdb', '-O0'],
-        # extra_link_args=['-g'],
-    ),
-] + _cco_extension()
+def _torch_symm_extension():
+    """SymmetricMemory backend. Built by torch's cpp_extension, not CMake: it is the
+    only target that links libtorch, and torch's build_ext is what keeps the ABI flag,
+    pybind11 copy and module suffix consistent with the installed torch."""
+    mode = _torch_symm_mode()
+    if mode == "OFF":
+        return []
+    if _TorchCppExtension is None:
+        if mode == "ON":
+            raise RuntimeError(
+                "BUILD_TORCH_SYMM=ON but torch is not importable at build time"
+            )
+        return []
+    rocm = os.environ.get("ROCM_PATH", "/opt/rocm")
+    # Absolute: torch's ninja compiler writes its build file into build_temp and runs
+    # ninja from there, so a relative -I would resolve against the wrong directory.
+    ext = _TorchCppExtension(
+        name="mori.mori_torch_symm",
+        sources=["src/allocator/symm_backend.cpp"],
+        include_dirs=[str(_root_dir.resolve() / "include"), f"{rocm}/include"],
+        library_dirs=[f"{rocm}/lib"],
+        libraries=["amdhip64", "c10_hip", "torch_hip"],
+        extra_compile_args=["-std=c++17"]
+        # barrier/put_signal/wait_signal are unimplemented, so the signal pad is not
+        # reserved by default; it would cost a whole 2 MiB page on a page-aligned window.
+        + (
+            ["-DMORI_SYMM_SIGNAL_PAD=1"]
+            if _env_flag("MORI_SYMM_SIGNAL_PAD", "OFF")
+            else []
+        ),
+    )
+    ext._mori_torch_ext = True
+    return [ext]
+
+
+extensions = (
+    [
+        Extension(
+            "mori",
+            sources=[],
+            # extra_compile_args=['-ggdb', '-O0'],
+            # extra_link_args=['-g'],
+        ),
+    ]
+    + _cco_extension()
+    + _torch_symm_extension()
+)
 
 mori_package_data = [
     "libmori_cco.so",

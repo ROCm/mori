@@ -150,6 +150,15 @@ jobs:
             # mpirun --allow-run-as-root -np 2 python 03_flydsl_put/main.py
             # mpirun --allow-run-as-root -np 2 python 06_flydsl_gda_modes/main.py
 
+      # Lives here rather than in ci.yml because this is the job that shares a runner
+      # label with 08_torch_symm_import above, and because MORI_SYMM_FORCE_JIT is what
+      # compiles src/allocator/symm_backend.cpp at all: every `pip install .` runs under
+      # PEP 517 build isolation, where torch is not importable, so setup.py never
+      # prebuilds the extension. Without this step nothing in CI compiles that file.
+      - name: MORI torch SymmetricMemory backend
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE -e MORI_SYMM_FORCE_JIT=1 $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE && timeout 600 pytest tests/python/allocator -v"
 
       - name: Run CCO SDMA Python API tests (spawn, up to 8 GPUs)
         run: |
