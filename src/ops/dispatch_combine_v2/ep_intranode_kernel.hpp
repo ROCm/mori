@@ -248,13 +248,13 @@ __device__ void EpDispatchBody(EpArgs args) {
   if (thdId == 0) atomicAdd(args.gridBarrier, 1u);
 
   // Phase 2: one warp announces this rank's per-destination counts, then reads
-  // back everyone else's. worldSize <= waveSize (EpCfgIsValid) so each lane
-  // handles at most one peer and the in-loop barrier reset is safe.
+  // back everyone else's. The grid barrier is hoisted before the peer loop so
+  // that wide EP (worldSize > waveSize) multi-iterates safely.
   if (globalWarpId == 0) {
-    for (int destPe = laneId; destPe < kNpes; destPe += kCfg.waveSize) {
-      EpWaitEq(args.gridBarrier, static_cast<unsigned int>(gridDim.x));
-      __hip_atomic_store(args.gridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    EpWaitEq(args.gridBarrier, static_cast<unsigned int>(gridDim.x));
+    __hip_atomic_store(args.gridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 
+    for (int destPe = laneId; destPe < kNpes; destPe += kCfg.waveSize) {
       // +1 so a zero-token destination still sees a distinct "signal arrived".
       const int numTokenSignal = __hip_atomic_load(args.destPeTokenCounter + destPe,
                                                    __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) +
@@ -299,13 +299,30 @@ __device__ __forceinline__ void EpCrossDeviceBarrier(EpArgs args, unsigned long 
   __threadfence_system();
   if (thdId == 0) atomicAdd(args.gridBarrier, 1u);
 
-  if (globalThdId < kNpes) {
-    EpWaitEq(args.gridBarrier, static_cast<unsigned int>(gridDim.x));
-    __hip_atomic_store(args.gridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  if constexpr (!EpIsWideEp(kCfg)) {
+    // Narrow path: all participating threads are in one warp, no multi-warp race.
+    if (globalThdId < kNpes) {
+      EpWaitEq(args.gridBarrier, static_cast<unsigned int>(gridDim.x));
+      __hip_atomic_store(args.gridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 
-    __threadfence_system();
-    __hip_atomic_store(EpPeer<unsigned long long>(win, globalThdId, args.offXdb) + args.rank, flag,
-                       __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      __threadfence_system();
+      __hip_atomic_store(EpPeer<unsigned long long>(win, globalThdId, args.offXdb) + args.rank,
+                         flag, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+  } else {
+    // Wide path: peers span multiple warps — single-thread wait+reset avoids the
+    // race where warp 0 resets the barrier before warp 1 reads gridDim.x.
+    if (thdId == 0) {
+      EpWaitEq(args.gridBarrier, static_cast<unsigned int>(gridDim.x));
+      __hip_atomic_store(args.gridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+    __syncthreads();
+
+    if (globalThdId < kNpes) {
+      __threadfence_system();
+      __hip_atomic_store(EpPeer<unsigned long long>(win, globalThdId, args.offXdb) + args.rank,
+                         flag, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
   }
 
   if (globalThdId == 0) atomicAdd(args.xdbFlag, 1ull);
@@ -315,10 +332,6 @@ __device__ __forceinline__ void EpCrossDeviceBarrier(EpArgs args, unsigned long 
     while (__hip_atomic_load(localBarrier + thdId, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) !=
            flag) {
     }
-    // ACQUIRE. The poll is a relaxed load and orders nothing, so without this the
-    // block's vector L1 still holds pre-barrier data and the fold reads
-    // pre-staging zeros for slots another block just filled -- dropping whole
-    // contributions silently. worldSize <= waveSize, so this is one invalidate.
     __threadfence_system();
   }
   __syncthreads();

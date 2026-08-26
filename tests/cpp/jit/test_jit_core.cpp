@@ -176,8 +176,24 @@ TEST(Geometry, ValidityRejectsWhatTheKernelCannotRun) {
   c.numExpertPerToken = 64;  // the dedup ballot needs topk < waveSize
   EXPECT_FALSE(EpCfgIsValid(c));
 
+  // Wide EP: worldSize > waveSize is valid when it fits within one block.
   c = ok;
-  c.worldSize = 128;  // the grid-barrier peer loop needs worldSize <= waveSize
+  c.worldSize = 64;
+  c.waveSize = 32;
+  c.warpPerBlock = 2;  // blockDim = 64 >= worldSize
+  EXPECT_TRUE(EpCfgIsValid(c));
+
+  c = ok;
+  c.worldSize = 48;
+  c.waveSize = 32;
+  c.warpPerBlock = 2;
+  EXPECT_TRUE(EpCfgIsValid(c));
+
+  // Still reject worldSize > blockDim.
+  c = ok;
+  c.worldSize = 128;
+  c.waveSize = 32;
+  c.warpPerBlock = 2;  // blockDim = 64 < 128
   EXPECT_FALSE(EpCfgIsValid(c));
 
   c = ok;
