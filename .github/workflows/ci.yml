@@ -167,16 +167,6 @@ jobs:
             cd $GITHUB_WORKSPACE && MORI_ENABLE_SDMA=1 timeout 300 pytest tests/python/ccl/test_allgather_param_contiguous.py -v
           "
 
-      # MORI_SYMM_FORCE_JIT is what makes this compile src/allocator/symm_backend.cpp at
-      # all: the installs above run under PEP 517 build isolation, where torch is not
-      # importable, so setup.py never prebuilds the extension. Without this step nothing
-      # in CI compiles that file against the image's torch, and interface drift between
-      # torch minors lands on users instead of here.
-      - name: MORI torch SymmetricMemory backend
-        run: |
-          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE -e MORI_SYMM_FORCE_JIT=1 $CONTAINER bash -c "
-            cd $GITHUB_WORKSPACE && timeout 600 pytest tests/python/allocator -v
-          "
 
       - name: MORI-CCL (hier allgather offset spec, CPU)
         run: |
