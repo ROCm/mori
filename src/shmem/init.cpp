@@ -599,6 +599,7 @@ void GpuStateInit(ShmemStates* states) {
 
   // Check if IBGDA proxy mode is requested
   if (states->rdmaStates->commContext->IsProxyEnabled()) {
+    fprintf(stderr, "[MORI] Rank %d: CPU proxy RDMA mode enabled (MORI_EP_OVER_RDMA=1)\n", states->bootStates->rank);
     // Determine number of NICs for per-NIC ring allocation
     int numNics = 1;
     if (states->rdmaStates && states->rdmaStates->commContext) {
