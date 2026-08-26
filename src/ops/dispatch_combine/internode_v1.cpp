@@ -1133,41 +1133,56 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs<T>
 
   // Ensure all prior writes (in particular zeroing interNodeChunkFlagMemObj) are visible
   // to other nodes before participating in the cross-device barrier, so a remote node
-  // never observes a non-zero flag that is subsequently overwritten with zero
-  __threadfence_system();
-  int finishedWarp = 0;
-  uint64_t barrierFlag = 0;
-  if (laneId == 0) {
-    finishedWarp = atomicAdd(&args.interNodeBlocksBarrier[0], 1);
-    barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
+  // never observes a non-zero flag that is subsequently overwritten with zero.
+  //
+  // Both the fence and the arrival are per block, not per warp. On gfx942
+  // __threadfence_system() is a full L2 writeback, so running it once per wave
+  // made this kernel's cost track the warp count rather than the data: at 4
+  // tokens, going from 4 to 8 warps/block added ~13us for the same work.
+  //
+  // Safe to make the arrival per block here because the last arriver only reads
+  // state it wrote itself or that the barrier already orders -- unlike the
+  // dispatch-side arrivals, where the last arriver reads a counter other blocks
+  // wrote and __syncthreads() gives no cross-block ordering.
+  __syncthreads();
+  if (thdId == 0) __threadfence_system();
+  __syncthreads();
+
+  __shared__ int sIsLastRdmaBlock;
+  if (thdId == 0) {
+    int prev = atomicAdd(&args.interNodeBlocksBarrier[0], 1);
+    sIsLastRdmaBlock = ((prev + 1) == args.rdmaBlockNum);
   }
-  finishedWarp = __shfl(finishedWarp, 0);
+  __syncthreads();
+  if (!sIsLastRdmaBlock || (warpId != 0)) return;
+
+  if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
+
+  uint64_t barrierFlag = 0;
+  if (laneId == 0) barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
   barrierFlag = __shfl(barrierFlag, 0);
 
-  if ((finishedWarp + 1) == (args.rdmaBlockNum * warpNum)) {
-    if (laneId < nNodes) {
-      core::AtomicStoreSeqCstSystem(
-          args.nodeRecvTokenNumMemObj->template GetAs<uint64_t*>() + laneId, uint64_t{0});
+  if (laneId < nNodes) {
+    core::AtomicStoreSeqCstSystem(
+        args.nodeRecvTokenNumMemObj->template GetAs<uint64_t*>() + laneId, uint64_t{0});
+  }
+  if ((laneId < nNodes) &&
+      (laneId != myNode)) {  // avoid setting myNode, it will be set in intra node branch
+    int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
+    for (int i = 0; i < config.numQpPerPe; i++) {
+      shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(args.crossDeviceBarrierMemObj,
+                                                     args.config.rank * sizeof(uint64_t), 1,
+                                                     core::AMO_ADD, proxyPe, i);
     }
-    if ((laneId < nNodes) &&
-        (laneId != myNode)) {  // avoid setting myNode, it will be set in intra node branch
-      int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
-      for (int i = 0; i < config.numQpPerPe; i++) {
-        shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(args.crossDeviceBarrierMemObj,
-                                                       args.config.rank * sizeof(uint64_t), 1,
-                                                       core::AMO_ADD, proxyPe, i);
-      }
-      __threadfence_system();
-    }
-    if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
+    __threadfence_system();
+  }
 
-    // Wait other nodes
-    uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
-    if ((laneId < nNodes) && (laneId != myNode)) {
-      int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
-      while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
-             (barrierFlag * config.numQpPerPe)) {
-      }
+  // Wait other nodes
+  uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
+  if ((laneId < nNodes) && (laneId != myNode)) {
+    int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
+    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
+           (barrierFlag * config.numQpPerPe)) {
     }
   }
 }
