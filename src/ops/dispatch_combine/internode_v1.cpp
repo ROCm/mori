@@ -764,6 +764,43 @@ inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
 
 namespace combine_impl {
 
+// Gathering a token from its experts reads from up to numExpertPerToken peer
+// GPUs over xGMI, and peer-read *latency* -- not bandwidth -- is what caps it.
+// WarpAccumLF issues AccumNum*Unroll of those reads before accumulating any of
+// them so they overlap; WarpAccum keeps only AccumNum in flight and moves 4B per
+// lane. The intra-node combine path (intranode.hpp) has used the 16B load-first
+// form for a while; the v1 internode path had not.
+//
+// Two constraints come with it:
+//   - Both ends must be 16B-aligned. A combine staging slot interleaves the
+//     hidden payload with the per-token weights, so its stride is only aligned
+//     for some topk/dtype combinations; CombineVecAligned() decides per launch
+//     and the caller falls back to the 4B path when it cannot.
+//   - The vector loop advances CombineVecStep() elements per iteration and drops
+//     to a per-lane scalar tail below that. A slice shorter than one step is
+//     *slower* than not vectorizing at all, so slices must be a whole multiple
+//     of it.
+constexpr size_t kCombineVecBytes = 16;
+
+inline __device__ bool CombineVecAligned(size_t tokHiddenBytes, size_t tokCombXferBytes) {
+  return ((tokHiddenBytes % kCombineVecBytes) == 0) && ((tokCombXferBytes % kCombineVecBytes) == 0);
+}
+
+template <typename TokT>
+inline __device__ size_t CombineVecStep(int warpSizeRt) {
+  return static_cast<size_t>(WARP_ACCUM_UNROLL) * warpSizeRt * (kCombineVecBytes / sizeof(TokT));
+}
+
+template <typename TokT>
+inline __device__ void CombineGather(TokT* dest, TokT** srcPtrs, int accumNum, size_t nelems,
+                                     bool vecAligned) {
+  if (vecAligned) {
+    core::WarpAccumLF<TokT, kCombineVecBytes>(dest, srcPtrs, nullptr, accumNum, nelems);
+  } else {
+    core::WarpAccum<TokT, 4>(dest, srcPtrs, nullptr, accumNum, nelems);
+  }
+}
+
 template <typename TokT, typename T>
 __forceinline__ __device__ void CombineIntraNodeTyped(EpDispatchCombineArgs<T>& args,
                                                       size_t tokHiddenBytes,
@@ -827,7 +864,11 @@ __forceinline__ __device__ void CombineIntraNodeLLTyped(EpDispatchCombineArgs<T>
   uint8_t* stagingPtr = args.interNodeV1TokBufs.staging->template GetAs<uint8_t*>() +
                         SendBufSlotOffset(config, nNodes + myNode, 0) * tokCombXferBytes;
 
-  MultiWarpIter mwIter(xgmiWarpNum, args.curRankNumToken, hiddenDim);
+  // Slices are snapped to a whole vector step so the gather below stays on
+  // WarpAccumLF's vector path instead of its scalar tail.
+  MultiWarpIter mwIter(xgmiWarpNum, args.curRankNumToken, hiddenDim,
+                       CombineVecStep<TokT>(warpSize));
+  const bool vecAligned = CombineVecAligned(tokHiddenBytes, tokCombXferBytes);
 
   for (int i = globalWarpId - blockOffset * warpNum;
        i < (args.curRankNumToken * mwIter.warpsPerItem); i += xgmiWarpNum) {
@@ -849,9 +890,9 @@ __forceinline__ __device__ void CombineIntraNodeLLTyped(EpDispatchCombineArgs<T>
                                 destLocalTokId * config.numExpertPerToken;
       }
     }
-    core::WarpAccum<TokT, 4>(
+    CombineGather<TokT>(
         reinterpret_cast<TokT*>(stagingPtr + tokenId * tokCombXferBytes) + hiddenDimOffset, srcPtrs,
-        nullptr, config.numExpertPerToken, hiddenDimSize);
+        config.numExpertPerToken, hiddenDimSize, vecAligned);
     if (args.weightsBuf && (inTokenPartId == mwIter.warpsPerItem - 1)) {
       core::WarpAccum<float, 4>(
           reinterpret_cast<float*>(stagingPtr + tokenId * tokCombXferBytes + tokHiddenBytes),
@@ -1060,11 +1101,21 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs<T>
     if (nodeCount > 0) nodeCount -= 1;
     if (nodeCount == 0) continue;
 
-    // int warpsPerToken = (rdmaWarpNum + nodeCount - 1) / nodeCount;
-    // NOTE: Using a fixed value of 4 for warpsPerToken instead of the dynamic formula above is
-    // an intentional tuning choice.
-    int warpsPerToken = 4;
-    size_t hiddenDimPerWarp = (hiddenDim + warpsPerToken - 1) / warpsPerToken;
+    // One whole vector step per warp. warpsPerToken was a fixed 4, which for
+    // hidden 6144 bf16 gives a 1536-element slice -- one full 1024-element vector
+    // step plus a 512-element scalar tail, and that tail costs more than the
+    // vector part saves. Sizing the split by the step instead keeps every warp on
+    // the vector path.
+    //
+    // This has to be a static function of the config: chunkFlag is cleared by
+    // whichever warp completes a chunk, so anything derived from the live counts
+    // can differ between two warps, and they must agree on the completion target.
+    const size_t vecStep = CombineVecStep<TokT>(warpSize);
+    int warpsPerToken = static_cast<int>(hiddenDim / vecStep);
+    if (warpsPerToken < 1) warpsPerToken = 1;
+    size_t hiddenDimPerWarp = core::CeilDiv(hiddenDim, static_cast<size_t>(warpsPerToken));
+    hiddenDimPerWarp = core::CeilDiv(hiddenDimPerWarp, vecStep) * vecStep;
+    const bool vecAligned = CombineVecAligned(tokHiddenBytes, tokCombXferBytes);
 
     for (int i = globalWarpId; i < (nodeCount * warpsPerToken); i += rdmaWarpNum) {
       int tokenId = i / warpsPerToken;
@@ -1109,10 +1160,9 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs<T>
                                     destLocalTokId * config.numExpertPerToken;
           }
         }
-        core::WarpAccum<TokT, 4>(
-            reinterpret_cast<TokT*>(stagingPtr + globalTokenId * tokCombXferBytes) +
-                hiddenDimOffset,
-            srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
+        CombineGather<TokT>(reinterpret_cast<TokT*>(stagingPtr + globalTokenId * tokCombXferBytes) +
+                                hiddenDimOffset,
+                            srcPtrs, config.numExpertPerToken, hiddenDimSize, vecAligned);
         if (args.weightsBuf && (inTokenPartId == 0)) {
           core::WarpAccum<float, 4>(
               reinterpret_cast<float*>(stagingPtr + globalTokenId * tokCombXferBytes +

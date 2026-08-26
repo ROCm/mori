@@ -68,10 +68,20 @@ struct MultiWarpIter {
   size_t dimPerWarp;
   size_t dimSize;
 
-  inline __device__ MultiWarpIter(int globalWarpNum, int numItems, size_t dimSize_)
+  // dimGranularity rounds dimPerWarp up to a multiple of itself, so callers doing
+  // vectorized loads get every warp's slice starting on a vector boundary and
+  // sized in whole vector steps.
+  inline __device__ MultiWarpIter(int globalWarpNum, int numItems, size_t dimSize_,
+                                  size_t dimGranularity = 1)
       : dimSize(dimSize_) {
     warpsPerItem = (globalWarpNum + numItems - 1) / numItems;
     dimPerWarp = (dimSize + warpsPerItem - 1) / warpsPerItem;
+    if (dimGranularity > 1) {
+      dimPerWarp = ((dimPerWarp + dimGranularity - 1) / dimGranularity) * dimGranularity;
+      // A coarser slice means fewer warps are actually needed; keep warpsPerItem
+      // consistent with dimPerWarp or the tail warps decode to empty ranges.
+      warpsPerItem = static_cast<int>((dimSize + dimPerWarp - 1) / dimPerWarp);
+    }
   }
 
   inline __device__ void Decode(int i, int& itemId, int& inItemPartId, size_t& dimOffset,
