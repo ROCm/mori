@@ -46,41 +46,53 @@ _CLI_TO_KERNEL_TYPE_NAME = {
 
 _FP4_DTYPE = getattr(torch, "float4_e2m1fn_x2", None)
 
-# Relative bandwidth improvement a candidate needs to replace the current
-# best during tuning. Default 0 (any improvement wins); raise via
-# MORI_EP_TUNING_MARGIN for a clearer-win requirement. Must be relative, not
-# absolute GB/s: a fixed 1.0 GB/s is ~40% of the sweep's spread at 4 tokens
-# but under 2% at large ones.
-_BW_REL_MARGIN = float(os.environ.get("MORI_EP_TUNING_MARGIN", "0.0"))
+# Relative improvement a candidate needs to replace the current best during
+# tuning. Default 0 (any improvement wins); raise via MORI_EP_TUNING_MARGIN
+# for a clearer-win requirement. Must be relative, not an absolute unit: a
+# fixed threshold cannot work across the whole operating range (e.g. a 1.0
+# GB/s bandwidth margin used to be ~40% of the sweep's spread at 4 tokens
+# but under 2% at large ones).
+_TUNING_MARGIN = float(os.environ.get("MORI_EP_TUNING_MARGIN", "0.0"))
 
-# Rounds per candidate and the statistic used to score it. Override with
-# MORI_EP_TUNING_ROUNDS / MORI_EP_TUNING_STAT. Default statistic is mean,
-# matching --cmd bench and main: mean is pulled up by one bad round, so it
-# penalizes a config with a good typical case but a bad worst-case tail;
-# median can't see that tail at all. MORI_EP_TUNING_STAT=median restores the
-# tail-blind behavior for anyone who wants single-round outlier resistance
-# instead.
+# Rounds benchmarked per candidate during tuning. Override with
+# MORI_EP_TUNING_ROUNDS.
 _TUNING_ROUNDS = int(os.environ.get("MORI_EP_TUNING_ROUNDS", "9"))
-_TUNING_STAT = os.environ.get("MORI_EP_TUNING_STAT", "mean")
-if _TUNING_STAT not in ("mean", "median"):
-    raise ValueError(
-        f"MORI_EP_TUNING_STAT must be 'mean' or 'median', got {_TUNING_STAT!r}"
-    )
 
 
-def _beats(new_bw, new_cfg, best_bw, best_cfg):
+def _beats(new_lat, new_cfg, best_lat, best_cfg):
     """Should *new_cfg* replace *best_cfg* as the tuning winner?
+
+    Selection metric is the grand-mean latency (lower is better) -- the same
+    quantity _build_phase_stats/_compute_stats compute and this file prints
+    as "Average", not a separate slowest-rank bandwidth figure. Picking a
+    config on one metric while reporting another let a config win the sweep
+    on paper yet look worse in the printed table it was supposedly chosen
+    from; using the printed number for both closes that gap by construction.
 
     Wins outright past the margin; within it, ties break on smaller
     block_num so re-tuning the same hardware is deterministic.
     """
     if best_cfg is None:
         return True
-    if new_bw > best_bw * (1.0 + _BW_REL_MARGIN):
+    if new_lat < best_lat * (1.0 - _TUNING_MARGIN):
         return True
-    if new_bw >= best_bw * (1.0 - _BW_REL_MARGIN) and new_cfg[0] < best_cfg[0]:
+    if new_lat <= best_lat * (1.0 + _TUNING_MARGIN) and new_cfg[0] < best_cfg[0]:
         return True
     return False
+
+
+def _headline_bw(stats, kernel_type):
+    """The winner's own avg bandwidth, for the JSON's top-level bandwidth_gbps.
+
+    Selection no longer runs on bandwidth (see _beats), but the saved config
+    still wants one representative bandwidth number; per-metric averages
+    (rdma/xgmi/ll) are saved alongside it regardless of kernel type.
+    """
+    is_ll_kernel = kernel_type in (
+        mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
+        mori.ops.EpDispatchCombineKernelType.AsyncLL,
+    )
+    return stats["ll"][2] if is_ll_kernel else stats["rdma"][2]
 
 
 def _perf_report():
@@ -1466,12 +1478,6 @@ class EpDispatchCombineTestCase:
                 set(v for v in [bn // 4, bn // 2, bn * 2 // 3] if 1 <= v < bn)
             )
 
-        is_ll_kernel = self.config.kernel_type in (
-            mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
-            mori.ops.EpDispatchCombineKernelType.AsyncLL,
-        )
-        bw_label = "LL BW" if is_ll_kernel else "RDMA BW"
-
         total_configs = sum(
             len(warp_list) * len(rdma_candidates_for(bn)) for bn in block_list
         )
@@ -1481,12 +1487,12 @@ class EpDispatchCombineTestCase:
                 f"skip_verify={skip_verify}\n"
                 f"block_num candidates ({len(block_list)}): {block_list}\n"
                 f"warp_per_block candidates: {warp_list}\n"
-                f"BW metric: {bw_label}\n"
+                f"Selection metric: grand-mean latency (same as printed Average)\n"
                 f"Total configurations: {total_configs}"
             )
 
-        best_disp_bw = 0
-        best_comb_bw = 0
+        best_disp_lat = float("inf")
+        best_comb_lat = float("inf")
         best_disp_config = None
         best_comb_config = None
         _zero_stats = {
@@ -1535,46 +1541,38 @@ class EpDispatchCombineTestCase:
                     # kept: (rounds, world_size, 6)
                     # cols: d_rdma, d_xgmi, d_lat, c_rdma, c_xgmi, c_lat
 
-                    # Selection: per-rank stat across kept rounds, min rank. See
-                    # _TUNING_STAT above for why mean is the default.
-                    if _TUNING_STAT == "median":
-                        rank_stat = kept.median(dim=0).values  # (world_size, 6)
-                    else:
-                        rank_stat = kept.mean(dim=0)  # (world_size, 6)
-                    if is_ll_kernel:
-                        disp_bw = (rank_stat[:, 1] * ll_scale).min().item()
-                        comb_bw = (rank_stat[:, 4] * ll_scale).min().item()
-                    else:
-                        disp_bw = rank_stat[:, 0].min().item()
-                        comb_bw = rank_stat[:, 3].min().item()
-
-                    # Stats via shared code (same as bench PrettyTable)
+                    # Stats via shared code (same as bench PrettyTable). Selection
+                    # uses disp_stats["lat"][2]/comb_stats["lat"][2] below -- the
+                    # exact grand-mean latency this same dict prints as "Average"
+                    # (see _beats' docstring for why that identity matters).
                     disp_stats = self._build_phase_stats(kept, 0, 1, 2, ll_scale)
                     comb_stats = self._build_phase_stats(kept, 3, 4, 5, ll_scale)
+                    disp_lat = disp_stats["lat"][2]
+                    comb_lat = comb_stats["lat"][2]
 
                     cand = (bn, warp, rdma_bn)
-                    if _beats(disp_bw, cand, best_disp_bw, best_disp_config):
-                        best_disp_bw = disp_bw
+                    if _beats(disp_lat, cand, best_disp_lat, best_disp_config):
+                        best_disp_lat = disp_lat
                         best_disp_config = cand
                         best_disp_stats = disp_stats
-                    if _beats(comb_bw, cand, best_comb_bw, best_comb_config):
-                        best_comb_bw = comb_bw
+                    if _beats(comb_lat, cand, best_comb_lat, best_comb_config):
+                        best_comb_lat = comb_lat
                         best_comb_config = cand
                         best_comb_stats = comb_stats
 
                     if self.rank == 0:
                         da, ca = disp_stats["xgmi"][2], comb_stats["xgmi"][2]
                         print(
-                            f"  disp sel={disp_bw:.1f} xgmi={da:.1f}  "
-                            f"comb sel={comb_bw:.1f} xgmi={ca:.1f}  "
-                            f"(best disp={best_disp_bw:.1f} comb={best_comb_bw:.1f})"
+                            f"  disp sel={disp_lat:.1f}us xgmi={da:.1f}  "
+                            f"comb sel={comb_lat:.1f}us xgmi={ca:.1f}  "
+                            f"(best disp={best_disp_lat:.1f}us comb={best_comb_lat:.1f}us)"
                         )
 
         if self.rank == 0:
             disp_dtype_str = str(self.config.data_type).split(".")[-1]
             comb_dtype_str = str(self.combine_data_type).split(".")[-1]
             print(f"\n{'=' * 70}")
-            print("Tuning Result (best config chosen by slowest-rank XGMI BW)")
+            print("Tuning Result (best config chosen by grand-mean latency)")
             print(f"{'=' * 70}")
             for label, dtype_s, cfg, st in [
                 ("Dispatch", disp_dtype_str, best_disp_config, best_disp_stats),
@@ -1595,10 +1593,10 @@ class EpDispatchCombineTestCase:
                     combine_hidden_dim=self.combine_hidden_dim,
                     combine_data_type=self.combine_data_type,
                     best_disp_config=best_disp_config,
-                    best_disp_bw=best_disp_bw,
+                    best_disp_bw=_headline_bw(best_disp_stats, self.config.kernel_type),
                     best_disp_all_bw=best_disp_stats,
                     best_comb_config=best_comb_config,
-                    best_comb_bw=best_comb_bw,
+                    best_comb_bw=_headline_bw(best_comb_stats, self.config.kernel_type),
                     best_comb_all_bw=best_comb_stats,
                 )
 
