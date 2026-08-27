@@ -788,9 +788,9 @@ jobs:
           # IO internode steps leave many short-lived torchrun/mp.spawn workers; if any
           # linger they keep HIP UAR host mappings and the EP bench hits hipHostRegister
           # "already mapped" on mlx5. Best-effort cleanup on both nodes.
-          $CT exec $CONTAINER bash -c 'pkill -9 -f "tests.python.io.benchmark" 2>/dev/null || true; pkill -9 -f "test_dispatch_combine_internode" 2>/dev/null || true; sleep 2'
+          $CT exec $CONTAINER bash -c 'pkill -9 -f "[t]ests\.python\.io\.benchmark" 2>/dev/null || true; pkill -9 -f "[t]est_dispatch_combine_internode" 2>/dev/null || true; sleep 2'
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
-            "$CT exec $CONTAINER bash -c 'pkill -9 -f tests.python.io.benchmark 2>/dev/null || true; pkill -9 -f test_dispatch_combine_internode 2>/dev/null || true; sleep 2'"
+            "$CT exec $CONTAINER bash -c 'pkill -9 -f \"[t]ests\\.python\\.io\\.benchmark\" 2>/dev/null || true; pkill -9 -f \"[t]est_dispatch_combine_internode\" 2>/dev/null || true; sleep 2'"
 
       - name: MORI-EP internode normal kernel bench
         run: |
