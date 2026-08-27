@@ -12,14 +12,14 @@
       "hidden_dim": 6144,
       "zero_copy": false,
       "quant_type": "none",
-      "block_num": 64,
+      "block_num": 128,
       "rdma_block_num": 32,
       "warp_per_block": 4,
-      "bandwidth_gbps": 5.43,
-      "avg_rdma_bandwidth_gbps": 1.43,
-      "avg_xgmi_bandwidth_gbps": 4.75,
-      "avg_ll_bandwidth_gbps": 5.43,
-      "avg_latency_us": 69.04
+      "bandwidth_gbps": 4.29,
+      "avg_rdma_bandwidth_gbps": 1.38,
+      "avg_xgmi_bandwidth_gbps": 4.59,
+      "avg_ll_bandwidth_gbps": 5.25,
+      "avg_latency_us": 71.32
     },
     {
       "dtype": "bf16",
@@ -27,14 +27,14 @@
       "hidden_dim": 6144,
       "zero_copy": false,
       "quant_type": "none",
-      "block_num": 64,
+      "block_num": 128,
       "rdma_block_num": 32,
       "warp_per_block": 4,
-      "bandwidth_gbps": 11.59,
-      "avg_rdma_bandwidth_gbps": 2.85,
-      "avg_xgmi_bandwidth_gbps": 9.23,
-      "avg_ll_bandwidth_gbps": 11.59,
-      "avg_latency_us": 69.11
+      "bandwidth_gbps": 9.45,
+      "avg_rdma_bandwidth_gbps": 2.72,
+      "avg_xgmi_bandwidth_gbps": 8.82,
+      "avg_ll_bandwidth_gbps": 11.07,
+      "avg_latency_us": 72.45
     },
     {
       "dtype": "bf16",
@@ -45,11 +45,11 @@
       "block_num": 32,
       "rdma_block_num": 21,
       "warp_per_block": 4,
-      "bandwidth_gbps": 23.58,
-      "avg_rdma_bandwidth_gbps": 5.7,
-      "avg_xgmi_bandwidth_gbps": 18.61,
-      "avg_ll_bandwidth_gbps": 23.58,
-      "avg_latency_us": 69.16
+      "bandwidth_gbps": 20.65,
+      "avg_rdma_bandwidth_gbps": 5.62,
+      "avg_xgmi_bandwidth_gbps": 18.34,
+      "avg_ll_bandwidth_gbps": 23.25,
+      "avg_latency_us": 70.05
     },
     {
       "dtype": "bf16",
@@ -60,11 +60,11 @@
       "block_num": 64,
       "rdma_block_num": 32,
       "warp_per_block": 4,
-      "bandwidth_gbps": 43.81,
-      "avg_rdma_bandwidth_gbps": 10.52,
-      "avg_xgmi_bandwidth_gbps": 34.57,
-      "avg_ll_bandwidth_gbps": 43.81,
-      "avg_latency_us": 74.8
+      "bandwidth_gbps": 39.81,
+      "avg_rdma_bandwidth_gbps": 10.47,
+      "avg_xgmi_bandwidth_gbps": 34.42,
+      "avg_ll_bandwidth_gbps": 43.62,
+      "avg_latency_us": 75.26
     }
   ]
 }
