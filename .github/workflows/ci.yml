@@ -52,6 +52,15 @@ jobs:
           #   runner: [self-hosted, 325_bnxt_108]
     timeout-minutes: 15
     steps:
+      - name: Fix workspace permissions
+        run: |
+          # Docker pytest/pip runs as root; stale root-owned files break actions/checkout cleanup.
+          WS="${GITHUB_WORKSPACE}"
+          if [ -d "$WS" ]; then
+            $CT run --rm -v "$WS:$WS" "$BASE_IMAGE" \
+              chown -R $(id -u):$(id -g) "$WS" 2>/dev/null || true
+          fi
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -122,6 +131,14 @@ jobs:
       NCCL_SOCKET_IFNAME: ${{ matrix.socket_ifname }}
     timeout-minutes: 45
     steps:
+      - name: Fix workspace permissions
+        run: |
+          WS="${GITHUB_WORKSPACE}"
+          if [ -d "$WS" ]; then
+            $CT run --rm -v "$WS:$WS" "$BASE_IMAGE" \
+              chown -R $(id -u):$(id -g) "$WS" 2>/dev/null || true
+          fi
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -364,6 +381,14 @@ jobs:
           #   gpu_arch: gfx942
     timeout-minutes: 90
     steps:
+      - name: Fix workspace permissions
+        run: |
+          WS="${GITHUB_WORKSPACE}"
+          if [ -d "$WS" ]; then
+            $CT run --rm -v "$WS:$WS" "$BASE_IMAGE" \
+              chown -R $(id -u):$(id -g) "$WS" 2>/dev/null || true
+          fi
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -429,6 +454,14 @@ jobs:
             runner: [self-hosted, MI355X-AINIC-TW]
     timeout-minutes: 30
     steps:
+      - name: Fix workspace permissions
+        run: |
+          WS="${GITHUB_WORKSPACE}"
+          if [ -d "$WS" ]; then
+            $CT run --rm -v "$WS:$WS" "$BASE_IMAGE" \
+              chown -R $(id -u):$(id -g) "$WS" 2>/dev/null || true
+          fi
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -537,6 +570,14 @@ jobs:
       MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     steps:
+      - name: Fix workspace permissions
+        run: |
+          WS="${GITHUB_WORKSPACE}"
+          if [ -d "$WS" ]; then
+            $CT run --rm -v "$WS:$WS" "$BASE_IMAGE" \
+              chown -R $(id -u):$(id -g) "$WS" 2>/dev/null || true
+          fi
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -959,6 +1000,14 @@ jobs:
     runs-on: [self-hosted, MI355X-AINIC-TW]
     timeout-minutes: 180
     steps:
+      - name: Fix workspace permissions
+        run: |
+          WS="${GITHUB_WORKSPACE}"
+          if [ -d "$WS" ]; then
+            $CT run --rm -v "$WS:$WS" "$BASE_IMAGE" \
+              chown -R $(id -u):$(id -g) "$WS" 2>/dev/null || true
+          fi
+
       - name: Checkout MoRI
         uses: actions/checkout@v4
         with:
