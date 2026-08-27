@@ -46,38 +46,20 @@ _CLI_TO_KERNEL_TYPE_NAME = {
 
 _FP4_DTYPE = getattr(torch, "float4_e2m1fn_x2", None)
 
-# Relative bandwidth improvement required to update the best config during
-# tuning. Default 0: take any improvement. Raise it (e.g.
-# MORI_EP_TUNING_MARGIN=0.02) to require a clearer win before a config
-# replaces the incumbent.
-#
-# An *absolute* GB/s margin (which this used to be) cannot work at all: 1.0
-# GB/s is ~40% of the total spread at 4 tokens, where the whole sweep lives in
-# 2-3 GB/s, and under 2% at large token counts.
+# Relative bandwidth improvement a candidate needs to replace the current
+# best during tuning. Default 0 (any improvement wins); raise via
+# MORI_EP_TUNING_MARGIN for a clearer-win requirement. Must be relative, not
+# absolute GB/s: a fixed 1.0 GB/s is ~40% of the sweep's spread at 4 tokens
+# but under 2% at large ones.
 _BW_REL_MARGIN = float(os.environ.get("MORI_EP_TUNING_MARGIN", "0.0"))
 
-# Rounds benchmarked per config during tuning, and the statistic used to score
-# each one. Override with MORI_EP_TUNING_ROUNDS / MORI_EP_TUNING_STAT to
-# experiment without editing this file.
-#
-# Default statistic is the mean, matching --cmd bench's own reporting and
-# matching what main always did: the mean is pulled up hard by a single bad
-# round, so a config with a fine typical case but a heavy worst-case tail
-# cannot win on a lucky sample the way it can under a median.
-#
-# This is not a hypothetical tradeoff. A customer's MI308 production run of
-# the median-scored, no-margin tuner picked larger/more-parallel geometries
-# (up to block=80 warp=16 rdma=53) whose median edged out the baseline while
-# their Worst regressed 30-45% at bs=16/32, with Best essentially unchanged --
-# the exact signature median-blind-to-tail selection produces, and not one
-# environment noise alone would produce (noise would not spare Best while
-# inflating Worst for one selection method only). A full-sweep sanity check
-# on an idle 2x8 MI300X pair (no contention, different SKU) did not reproduce
-# the same magnitude, so treat the mechanism as demonstrated and the exact
-# severity as hardware/load dependent, not as bounded by that check.
-#
-# MORI_EP_TUNING_STAT=median restores the previous behaviour for anyone who
-# still wants resistance to a single stalled round instead of tail-awareness.
+# Rounds per candidate and the statistic used to score it. Override with
+# MORI_EP_TUNING_ROUNDS / MORI_EP_TUNING_STAT. Default statistic is mean,
+# matching --cmd bench and main: mean is pulled up by one bad round, so it
+# penalizes a config with a good typical case but a bad worst-case tail;
+# median can't see that tail at all. MORI_EP_TUNING_STAT=median restores the
+# tail-blind behavior for anyone who wants single-round outlier resistance
+# instead.
 _TUNING_ROUNDS = int(os.environ.get("MORI_EP_TUNING_ROUNDS", "9"))
 _TUNING_STAT = os.environ.get("MORI_EP_TUNING_STAT", "mean")
 if _TUNING_STAT not in ("mean", "median"):
@@ -89,13 +71,8 @@ if _TUNING_STAT not in ("mean", "median"):
 def _beats(new_bw, new_cfg, best_bw, best_cfg):
     """Should *new_cfg* replace *best_cfg* as the tuning winner?
 
-    A candidate wins outright only when it clears the relative noise margin.
-    Inside the margin the two are statistically indistinguishable, so we break
-    the tie deterministically on block_num (fewer CUs for the same bandwidth
-    leaves more of the GPU for overlapping work) instead of letting whichever
-    sample happened to land higher decide. Determinism matters as much as the
-    choice itself: it is what stops the saved JSON from churning between
-    equivalent configs on every re-tune.
+    Wins outright past the margin; within it, ties break on smaller
+    block_num so re-tuning the same hardware is deterministic.
     """
     if best_cfg is None:
         return True
