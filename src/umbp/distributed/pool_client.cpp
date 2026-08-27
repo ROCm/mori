@@ -142,6 +142,41 @@ inline int LocalCopyThreads(const char* env_name) {
   return t;
 }
 
+inline std::chrono::milliseconds ResolveBusyRetryTimeout() {
+  uint64_t ms = 30000;
+  if (const char* value = std::getenv("UMBP_RESOLVE_BUSY_TIMEOUT_MS")) {
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (end != value && *end == '\0' && parsed > 0) ms = parsed;
+  }
+  return std::chrono::milliseconds(std::min<uint64_t>(ms, 300000));
+}
+
+std::vector<PoolResolvedEntry> ResolveLocalBatchWithBusyRetry(
+    PeerPool* pool, const std::vector<std::string>& keys, bool include_descs) {
+  if (pool == nullptr) return std::vector<PoolResolvedEntry>(keys.size());
+  const auto deadline = std::chrono::steady_clock::now() + ResolveBusyRetryTimeout();
+  std::chrono::milliseconds backoff{1};
+  size_t attempts = 0;
+  while (true) {
+    auto resolved = pool->BatchResolve(keys, include_descs);
+    const bool busy = std::any_of(resolved.begin(), resolved.end(), [](const auto& entry) {
+      return EffectiveResolveOutcome(entry.resolved) == ResolveOutcome::kBusy;
+    });
+    if (!busy) return resolved;
+    ++attempts;
+    const auto remaining = deadline - std::chrono::steady_clock::now();
+    if (remaining <= std::chrono::steady_clock::duration::zero()) {
+      MORI_UMBP_WARN("[PoolClient] local BatchResolve BUSY timeout after {} attempts", attempts);
+      return resolved;
+    }
+    const auto sleep_for =
+        std::min(backoff, std::chrono::duration_cast<std::chrono::milliseconds>(remaining));
+    if (sleep_for.count() > 0) std::this_thread::sleep_for(sleep_for);
+    backoff = std::min(backoff * 2, std::chrono::milliseconds{50});
+  }
+}
+
 inline uint64_t LogicalPageBytes(size_t i, size_t num_pages, uint64_t page_size,
                                  size_t total_size) {
   return (i + 1 == num_pages) ? (total_size - i * page_size) : page_size;
@@ -974,7 +1009,8 @@ PoolClient::GetAttemptOutcome PoolClient::ExecuteLocalGet(const std::string& key
     MORI_UMBP_ERROR("[PoolClient] Local Get requested but no default pool is initialized");
     return GetAttemptOutcome::kFatal;
   }
-  auto pool_resolved = default_pool_->BatchResolve({key}, /*include_descs=*/false).front();
+  auto pool_resolved =
+      ResolveLocalBatchWithBusyRetry(default_pool_.get(), {key}, /*include_descs=*/false).front();
   auto* backend = registry_.Get(pool_resolved.backend_id);
   bool served = pool_resolved.resolved.found && backend != nullptr;
   if (served) {
@@ -1947,9 +1983,8 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
     resolve_indices.push_back(i);
     resolve_keys.push_back(keys[i]);
   }
-  auto pool_resolved = default_pool_ == nullptr
-                           ? std::vector<PoolResolvedEntry>(resolve_keys.size())
-                           : default_pool_->BatchResolve(resolve_keys, /*include_descs=*/true);
+  auto pool_resolved =
+      ResolveLocalBatchWithBusyRetry(default_pool_.get(), resolve_keys, /*include_descs=*/true);
   for (size_t r = 0; r < resolve_indices.size(); ++r) {
     const size_t i = resolve_indices[r];
     MediumBackend* holder = nullptr;
@@ -2454,29 +2489,57 @@ bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
   for (const auto& item : items) resolve_req.add_keys(*item.key);
   resolve_req.set_omit_descs(have_descs);
 
-  ::umbp::BatchResolveKeysResponse resolve_resp;
-  grpc::ClientContext resolve_ctx;
-  auto resolve_status = stub->BatchResolveKeys(&resolve_ctx, resolve_req, &resolve_resp);
-  if (!resolve_status.ok() ||
-      BatchResolveKeyCount(resolve_resp) != static_cast<int>(items.size())) {
-    MORI_UMBP_WARN("[PoolClient] BatchResolveKeys failed on {}: {}", items.front().route.node_id,
-                   resolve_status.error_message());
-    for (const auto& item : items) {
-      (*results)[item.index] = false;
+  DecodedBatchResolve decoded;
+  const auto retry_timeout = ResolveBusyRetryTimeout();
+  const auto retry_deadline = std::chrono::steady_clock::now() + retry_timeout;
+  std::chrono::milliseconds backoff{1};
+  size_t busy_attempts = 0;
+  while (true) {
+    ::umbp::BatchResolveKeysResponse resolve_resp;
+    grpc::ClientContext resolve_ctx;
+    const auto remaining = retry_deadline - std::chrono::steady_clock::now();
+    if (remaining <= std::chrono::steady_clock::duration::zero()) {
+      MORI_UMBP_WARN("[PoolClient] BatchResolveKeys BUSY timeout on {} after {} attempts",
+                     items.front().route.node_id, busy_attempts);
+      for (const auto& item : items) (*results)[item.index] = false;
+      return false;
     }
-    return false;
-  }
+    resolve_ctx.set_deadline(std::chrono::system_clock::now() + remaining);
+    auto resolve_status = stub->BatchResolveKeys(&resolve_ctx, resolve_req, &resolve_resp);
+    if (!resolve_status.ok() ||
+        BatchResolveKeyCount(resolve_resp) != static_cast<int>(items.size())) {
+      MORI_UMBP_WARN("[PoolClient] BatchResolveKeys failed on {}: {}", items.front().route.node_id,
+                     resolve_status.error_message());
+      for (const auto& item : items) (*results)[item.index] = false;
+      return false;
+    }
 
-  DecodedBatchResolve decoded = DecodeBatchResolveResponse(resolve_resp);
-  if (decoded.keys.size() != items.size()) {
-    // Malformed (mismatched parallel arrays); fail the whole batch rather than
-    // partially-read it.
-    MORI_UMBP_WARN("[PoolClient] BatchResolveKeys malformed response on {}: {} keys for {} items",
-                   items.front().route.node_id, decoded.keys.size(), items.size());
-    for (const auto& item : items) {
-      (*results)[item.index] = false;
+    decoded = DecodeBatchResolveResponse(resolve_resp);
+    if (decoded.keys.size() != items.size()) {
+      // Malformed (mismatched parallel arrays); fail the whole batch rather
+      // than partially reading it.
+      MORI_UMBP_WARN(
+          "[PoolClient] BatchResolveKeys malformed response on {}: {} keys for {} items",
+          items.front().route.node_id, decoded.keys.size(), items.size());
+      for (const auto& item : items) (*results)[item.index] = false;
+      return false;
     }
-    return false;
+
+    const bool busy = std::any_of(decoded.keys.begin(), decoded.keys.end(), [](const auto& key) {
+      return key.outcome == ResolveOutcome::kBusy;
+    });
+    if (!busy) break;
+
+    // Discard the ENTIRE response.  Keeping its successful SSD entries while
+    // retrying only BUSY keys would pin their leases and can make forward
+    // progress impossible; it can also leave stale page locations if a retry
+    // outlives the lease.
+    ++busy_attempts;
+    const auto sleep_for = std::min(
+        backoff, std::chrono::duration_cast<std::chrono::milliseconds>(
+                     retry_deadline - std::chrono::steady_clock::now()));
+    if (sleep_for.count() > 0) std::this_thread::sleep_for(sleep_for);
+    backoff = std::min(backoff * 2, std::chrono::milliseconds{50});
   }
   // Hydrate the batch-level descriptors once (skipped when the peer honored
   // omit_descs and sent none).
@@ -2487,6 +2550,10 @@ bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
     const auto& item = items[i];
     const auto& key = decoded.keys[i];
     if (!key.found) {
+      if (key.outcome == ResolveOutcome::kFailed) {
+        MORI_UMBP_ERROR("[PoolClient] BatchGet: peer reported permanent resolve failure key='{}'",
+                        *item.key);
+      }
       (*results)[item.index] = false;
       continue;
     }

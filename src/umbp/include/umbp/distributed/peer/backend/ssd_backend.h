@@ -87,13 +87,11 @@ namespace mori::umbp {
 //
 //   This is the one place SSD's asymmetry with DRAM shows through the
 //   interface: a Resolve does real IO and can fail, and it consumes a scarce
-//   resource (a staging page) that a DRAM resolve does not.  Exhaustion is
-//   reported as found=false, which medium_backend.h warns is imperfect
-//   ("the client excludes a missing node and retries elsewhere, which is wrong
-//   for a node that does hold the key") — the rejected "not ready, retry here"
-//   state is what this case wanted.  It is the honest limit of staging without
-//   a control-plane change, and it is why the staging arena should be sized for
-//   the read concurrency, not for one page.
+//   resource (staging pages) that a DRAM resolve does not.  A transient
+//   shortfall is reported as kBusy, after rolling back every reservation made
+//   by that backend batch.  PoolClient retries the whole response so no page
+//   location survives across attempts.  A batch whose own working set exceeds
+//   the arena is kFailed instead: unchanged retries can never make it fit.
 //
 // A key may span several staging pages.  Runs are contiguous inside the one
 // registered arena because PeerSsdManager::PrepareRead takes one (ptr,
@@ -251,9 +249,8 @@ class SsdBackend : public MediumBackend {
   std::atomic<bool> clear_full_sync_pending_{false};
 
   // Staging-arena observability.  Relaxed atomics, never correctness state.
-  // slot_full_rejects_ is the one to watch: it counts Resolves that reported a
-  // miss for a key this node actually HOLDS, purely because the arena was full
-  // (see the class comment on why exhaustion has to surface that way).
+  // slot_full_rejects_ is the one to watch: it counts resolve batches that
+  // returned BUSY because the arena was temporarily full.
   std::atomic<uint64_t> slot_full_rejects_{0};
   std::atomic<uint64_t> staging_expired_reclaims_{0};
   bool initialized_ = false;

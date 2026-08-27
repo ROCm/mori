@@ -410,8 +410,11 @@ TEST_F(PeerServiceDispatchTest, BatchResolveReportsTheServingTier) {
   grpc::ClientContext ctx;
   ASSERT_TRUE(stub_->BatchResolveKeys(&ctx, req, &resp).ok());
   ASSERT_EQ(resp.found_size(), 2);
+  ASSERT_EQ(resp.resolve_status_size(), 2);
   EXPECT_FALSE(resp.found(0));
   EXPECT_TRUE(resp.found(1));
+  EXPECT_EQ(resp.resolve_status(0), ::umbp::RESOLVE_STATUS_MISSING);
+  EXPECT_EQ(resp.resolve_status(1), ::umbp::RESOLVE_STATUS_FOUND);
   ASSERT_EQ(resp.tier_size(), 2);
   EXPECT_EQ(resp.tier(1), Proto(kSecondByTier));
   EXPECT_EQ(resp.size(1), 55u);

@@ -163,6 +163,7 @@ class MockBackend : public MediumBackend {
     for (size_t i = 0; i < keys.size(); ++i) {
       auto it = owned_.find(keys[i]);
       if (it == owned_.end()) continue;
+      out[i].outcome = ResolveOutcome::kFound;
       out[i].found = true;
       out[i].size = it->second.size();
       if (published_buffers_ == 0) continue;

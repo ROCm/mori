@@ -85,10 +85,10 @@ namespace mori::umbp {
 //   * a staging / bounce pool — belongs to the transfer engine, the only layer
 //     that can observe completion.  A pool here would have to fall back to a
 //     TTL, which is the deleted PrepareSsdRead lease under another name.
-//   * a "not ready, retry here" resolve state — only needed to express
-//     staging-pool exhaustion, which is no longer a backend resource.  Note it
-//     must NOT be spelled as found=false: the client excludes a missing node
-//     and retries elsewhere, which is wrong for a node that does hold the key.
+//   * byte-moving or staging methods — staging ownership stays an
+//     implementation detail.  ResolveOutcome::kBusy is intentionally part of
+//     the RESULT, however: a staged backend must distinguish transient pressure
+//     from kMissing or the client excludes a node that does hold the key.
 //   * local mode's TierBackend (blocking read/write of bytes) — a different
 //     medium contract at a different layer, fenced off by lint in Phase 5
 //   * single-key Allocate/Commit/Abort/Resolve — the single-key RPCs are
@@ -151,7 +151,22 @@ struct CommitResult {
   uint64_t bytes_committed = 0;
 };
 
+// A resolve needs one more state than a cache lookup.  kBusy means this backend
+// owns the key but cannot publish its bytes until a transient resource (SSD
+// staging) becomes available; callers must retry THIS peer rather than exclude
+// it as they do for kMissing.  kFailed is a permanent shape/backend error and
+// must not be retried indefinitely.
+enum class ResolveOutcome {
+  kMissing,
+  kFound,
+  kBusy,
+  kFailed,
+};
+
 struct ResolvedEntry {
+  ResolveOutcome outcome = ResolveOutcome::kMissing;
+  // Kept for source and wire compatibility.  New code should set outcome too;
+  // readers accept found=true as kFound for older backend implementations.
   bool found = false;
   std::vector<PageLocation> pages;
   uint64_t size = 0;
@@ -160,6 +175,10 @@ struct ResolvedEntry {
   // from GetPeerInfo), or when found=false.
   std::vector<BufferMemoryDescBytes> descs;
 };
+
+inline ResolveOutcome EffectiveResolveOutcome(const ResolvedEntry& entry) {
+  return entry.found ? ResolveOutcome::kFound : entry.outcome;
+}
 
 struct EvictResult {
   std::string key;

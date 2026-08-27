@@ -564,10 +564,25 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
     auto results = backend->BatchResolve(backend_keys, include_descs);
     for (size_t i = 0; i < indices.size() && i < results.size(); ++i) {
       const size_t index = indices[i];
-      if (!results[i].found || out[index].resolved.found) continue;
-      out[index].backend_id = backend_id;
-      out[index].tier = backend->Tier();
-      out[index].resolved = std::move(results[i]);
+      const ResolveOutcome outcome = EffectiveResolveOutcome(results[i]);
+      if (outcome == ResolveOutcome::kFound) {
+        if (out[index].resolved.found) continue;
+        out[index].backend_id = backend_id;
+        out[index].tier = backend->Tier();
+        out[index].resolved = std::move(results[i]);
+        out[index].resolved.outcome = ResolveOutcome::kFound;
+        continue;
+      }
+      if (out[index].resolved.found) continue;
+      // Preserve a retryable owner over misses from fallback media.  A
+      // permanent backend failure is useful only when no backend reported
+      // BUSY; BUSY has priority because a later attempt can still succeed.
+      const ResolveOutcome current = EffectiveResolveOutcome(out[index].resolved);
+      if (outcome == ResolveOutcome::kBusy || current == ResolveOutcome::kMissing) {
+        out[index].backend_id = backend_id;
+        out[index].tier = backend->Tier();
+        out[index].resolved.outcome = outcome;
+      }
     }
   };
 
@@ -588,6 +603,14 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
     }
     resolve(backend_id, unresolved);
   }
+
+  // A caller retries the whole batch on BUSY and discards this response.  Do
+  // not count hits, repair placements, or enqueue promotions for a response
+  // whose page locations will never be consumed.
+  const bool batch_busy = std::any_of(out.begin(), out.end(), [](const auto& entry) {
+    return EffectiveResolveOutcome(entry.resolved) == ResolveOutcome::kBusy;
+  });
+  if (batch_busy) return out;
 
   for (size_t i = 0; i < keys.size(); ++i) {
     if (out[i].resolved.found) {

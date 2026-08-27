@@ -324,9 +324,9 @@
 
 #define MORI_UMBP_METRIC_SSD_STAGING_SLOT_FULL_REJECTS_TOTAL \
   "mori_umbp_ssd_staging_slot_full_rejects_total"
-#define MORI_UMBP_METRIC_SSD_STAGING_SLOT_FULL_REJECTS_TOTAL_HELP                        \
-  "Resolves degraded to a miss because the staging arena was exhausted. Non-zero means " \
-  "the arena is undersized for the read concurrency, not that the keys are absent"
+#define MORI_UMBP_METRIC_SSD_STAGING_SLOT_FULL_REJECTS_TOTAL_HELP                    \
+  "Resolve batches returned BUSY because the staging arena was exhausted. Non-zero " \
+  "means clients experienced retryable staging pressure, not missing keys"
 
 #define MORI_UMBP_METRIC_SSD_STAGING_EXPIRED_RECLAIMS_TOTAL \
   "mori_umbp_ssd_staging_expired_reclaims_total"

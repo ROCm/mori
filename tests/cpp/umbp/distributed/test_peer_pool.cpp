@@ -102,6 +102,26 @@ class NoSpaceBackend final : public MockBackend {
   }
 };
 
+class BusyResolveBackend final : public MockBackend {
+ public:
+  explicit BusyResolveBackend(TierType tier) : MockBackend(tier) {}
+
+  std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
+                                          bool include_descs) override {
+    if (!busy_) return MockBackend::BatchResolve(keys, include_descs);
+    std::vector<ResolvedEntry> results(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+      if (Contains(keys[i])) results[i].outcome = ResolveOutcome::kBusy;
+    }
+    return results;
+  }
+
+  void SetBusy(bool busy) { busy_ = busy; }
+
+ private:
+  bool busy_ = true;
+};
+
 // Stands in for a slow migration target: parks inside the allocation a
 // transition performs, so a test can observe the pool while bytes are moving.
 class BlockingAllocateBackend final : public MockBackend {
@@ -156,6 +176,25 @@ TEST(PeerPool, DefaultPolicyPreservesTierOnlySelection) {
   auto allocated = pool.BatchAllocate({PutRequest("k")}).front();
   ASSERT_EQ(allocated.allocation.outcome, AllocateOutcome::kSuccessAllocated);
   EXPECT_EQ(allocated.backend_id, registry.BackendId(registry.Get("dram_a")));
+}
+
+TEST(PeerPool, PreservesBusyOwnerInsteadOfTurningItIntoAMiss) {
+  BackendRegistry registry;
+  auto backend = std::make_unique<BusyResolveBackend>(TierType::DRAM);
+  auto* busy = backend.get();
+  ASSERT_TRUE(registry.Register(std::move(backend)));
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+  CommitKey(&pool, "busy-key");
+
+  auto first = pool.BatchResolve({"busy-key"}, false);
+  ASSERT_EQ(first.size(), 1u);
+  EXPECT_FALSE(first[0].resolved.found);
+  EXPECT_EQ(first[0].resolved.outcome, ResolveOutcome::kBusy);
+
+  busy->SetBusy(false);
+  auto second = pool.BatchResolve({"busy-key"}, false);
+  ASSERT_TRUE(second[0].resolved.found);
+  EXPECT_EQ(EffectiveResolveOutcome(second[0].resolved), ResolveOutcome::kFound);
 }
 
 TEST(PeerPool, NamedBackendCommitBuildsLogicalPlacement) {
