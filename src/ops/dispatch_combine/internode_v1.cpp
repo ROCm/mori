@@ -314,29 +314,11 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
 
     for (int tokenId = chunkStartTokenIdx + laneId; tokenId < chunkEndTokenIdx;
          tokenId += warpSize) {
-      bool shouldSend = false;
-      // Issue every topk index load before consuming any of them. numExpertPerToken is a runtime
-      // value, so the natural loop hands the compiler one load per iteration feeding an
-      // immediately dependent divide and a conditional store, and there is no other warp resident
-      // here to hide that latency behind.
-      index_t laneExpert[MAX_EXPERTS_PER_TOKEN];
-#pragma unroll
-      for (int e = 0; e < MAX_EXPERTS_PER_TOKEN; e++) {
-        if (e < numExpertPerToken)
-          laneExpert[e] = args.tokenIndices[tokenId * numExpertPerToken + e];
-      }
-#pragma unroll
-      for (int e = 0; e < MAX_EXPERTS_PER_TOKEN; e++) {
-        if (e >= numExpertPerToken) break;
-        // One divide instead of two: for non-negative operands x/a/b == x/(a*b), and a negative
-        // sentinel expert truncates to 0 under both forms, so behaviour is unchanged.
-        int destNode = laneExpert[e] / expertPerNode;
-        if (destNode == i) {
-          shouldSend |= true;
-          args.dispDestTokIdMap[tokenId * numExpertPerToken + e] = nullTokenId;
-        }
-      }
-
+      // Get the chunk on the wire before doing anything else. Nothing the put needs depends on
+      // the topk scan below -- the source is the staging buffer, the length is the chunk's token
+      // count, and the destination slot comes from a local counter. The scan only fills in
+      // dispDestTokIdMap / interNodeDispSendMap, which combine reads much later. Issuing first
+      // takes the scan off the path between the kernel starting and the NIC being rung.
       index_t flagSlotId = 0;
       if (laneId == 0) {
         flagSlotId = atomicAdd(args.blockFlagCounter + i, 1);
@@ -363,6 +345,29 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
             args.interNodeV1TokBufs.dispatchStaging, stagingTokOffset, tokenNum * xferBytes,
             args.interNodeChunkFlagMemObj, (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t),
             tokenNum + 1, core::atomicType::AMO_SET, proxyPe, qpId);
+      }
+
+      bool shouldSend = false;
+      // Issue every topk index load before consuming any of them. numExpertPerToken is a runtime
+      // value, so the natural loop hands the compiler one load per iteration feeding an
+      // immediately dependent divide and a conditional store, and there is no other warp resident
+      // here to hide that latency behind.
+      index_t laneExpert[MAX_EXPERTS_PER_TOKEN];
+#pragma unroll
+      for (int e = 0; e < MAX_EXPERTS_PER_TOKEN; e++) {
+        if (e < numExpertPerToken)
+          laneExpert[e] = args.tokenIndices[tokenId * numExpertPerToken + e];
+      }
+#pragma unroll
+      for (int e = 0; e < MAX_EXPERTS_PER_TOKEN; e++) {
+        if (e >= numExpertPerToken) break;
+        // One divide instead of two: for non-negative operands x/a/b == x/(a*b), and a negative
+        // sentinel expert truncates to 0 under both forms, so behaviour is unchanged.
+        int destNode = laneExpert[e] / expertPerNode;
+        if (destNode == i) {
+          shouldSend |= true;
+          args.dispDestTokIdMap[tokenId * numExpertPerToken + e] = nullTokenId;
+        }
       }
       if (shouldSend) args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
     }
