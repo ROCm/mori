@@ -1576,7 +1576,7 @@ class EpDispatchCombineTestCase:
                         print(
                             f"\n{'=' * 60}\n"
                             f"[{config_idx}/{total_configs}] "
-                            f"block_num={bn}, warp={warp}, rdma_block_num={rdma_bn}\n"
+                            f"block={bn} warp={warp} rdma={rdma_bn}\n"
                             f"{'=' * 60}"
                         )
                     bench_result = self.run_bench_once(
