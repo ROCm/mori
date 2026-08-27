@@ -58,21 +58,20 @@ _FP4_DTYPE = getattr(torch, "float4_e2m1fn_x2", None)
 # import time, so fall back on an empty string too.
 _TUNING_MARGIN = float(os.environ.get("MORI_EP_TUNING_MARGIN") or "0.0")
 
-# Rounds benchmarked per candidate during tuning. Default matches main's
-# longstanding hardcoded value; override with MORI_EP_TUNING_ROUNDS. (This used
-# to default to 9 -- that was carried over from an abandoned median-scoring
-# experiment that wanted more samples to resist a single stalled round. Now
-# that selection is back to mean (see _beats), that extra defense isn't doing
-# anything for us, so there's no reason to pay the ~1.8x longer sweep.)
-_TUNING_ROUNDS = int(os.environ.get("MORI_EP_TUNING_ROUNDS") or "5")
-if _TUNING_ROUNDS < 2:
-    # tuning_dispatch_combine drops round 0 as in-loop warmup (`kept =
-    # all_data[1:]`, matching what bench does); at 1 round that leaves an
-    # empty tensor and _compute_stats' .min()/.max()/.mean() blow up with a
-    # shape error that says nothing about rounds being the cause.
+# Rounds benchmarked per config, shared by both --cmd bench and --cmd tuning
+# (each candidate during a sweep) so the two measure on equal footing --
+# bench's own number for a config should be comparable to what tuning saw
+# for that same config during its sweep. Override with MORI_EP_ROUNDS;
+# default 10 matches bench's longstanding hardcoded value.
+_EP_ROUNDS = int(os.environ.get("MORI_EP_ROUNDS") or "10")
+if _EP_ROUNDS < 2:
+    # Both call sites drop round 0 as in-loop warmup (`kept = all_data[1:]`);
+    # at 1 round that leaves an empty tensor and _compute_stats'
+    # .min()/.max()/.mean() blow up with a shape error that says nothing
+    # about rounds being the cause.
     raise ValueError(
-        f"MORI_EP_TUNING_ROUNDS must be >= 2 (round 0 is dropped as warmup), "
-        f"got {_TUNING_ROUNDS}"
+        f"MORI_EP_ROUNDS must be >= 2 (round 0 is dropped as warmup), "
+        f"got {_EP_ROUNDS}"
     )
 
 # Debug aid only, no effect on selection: print every candidate's full
@@ -1286,7 +1285,7 @@ class EpDispatchCombineTestCase:
             only_my_rank=skip_verify,
         )
 
-        repeat = 10
+        repeat = _EP_ROUNDS
 
         if not skip_verify:
             error_round = set()
@@ -1594,7 +1593,7 @@ class EpDispatchCombineTestCase:
                         max_num_token,
                         op,
                         test_data,
-                        repeat=_TUNING_ROUNDS,
+                        repeat=_EP_ROUNDS,
                         block_num=bn,
                         rdma_block_num=rdma_bn,
                         warp_per_block=warp,
