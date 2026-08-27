@@ -169,6 +169,14 @@ jobs:
             cd $GITHUB_WORKSPACE && \
             timeout 300 pytest tests/python/cco/test_sdma_api.py -v"
 
+      - name: Validate CCO ROCm runtime import order
+        run: |
+          $CT exec $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE && \
+            timeout 120 pytest -v \
+              tests/python/cco/test_rocm_bootstrap.py \
+              tests/python/cco/test_rocm_import_order.py"
+
       - name: Run JIT v2 C++ tests + host/device split guard
         run: |
           # Registered by tests/cpp/jit/CMakeLists.txt but selected by no job before
