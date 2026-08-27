@@ -616,7 +616,6 @@ def make_combine(
         warp = tid >> LOG2_WAVE
         global_warp_id = bid * warp_num_per_block + warp
         global_warp_num = block_num * warp_num_per_block
-        grid_thread_id = bid * (warp_num_per_block * WAVE) + tid
 
         window = cco.Window(arena)
         rsrc_tok_map = create_buffer_resource_from_addr(addr_tok_map)
@@ -635,11 +634,14 @@ def make_combine(
         # reset. Polling is local (peer pushes into our slots), so the extra
         # per-block spins add no remote traffic.
         phase = fx.Int64(buffer_load(rsrc_xdb_flag, bid, vec_width=1, dtype=T.i64()))
-        if grid_thread_id < npes:
-            xdb_remote = fx.Int64(
-                window.lsa_ptr(grid_thread_id, off_xdb_mem)
-            ) + fx.Int64(rank) * fx.Int64(8)
-            P.store_i64_system(xdb_remote, arith.constant(0), phase)
+        # Wave0 strided push: npes > WAVE would split across sibling waves
+        # with no forward-progress guarantee, deadlocking the barrier.
+        if global_warp_id == 0:
+            for p in range(lane, npes, WAVE):
+                xdb_remote = fx.Int64(window.lsa_ptr(p, off_xdb_mem)) + fx.Int64(
+                    rank
+                ) * fx.Int64(8)
+                P.store_i64_system(xdb_remote, arith.constant(0), phase)
         # advance this block's private counter for the next call (single writer)
         if tid == 0:
             buffer_store(phase + arith.constant(1, type=T.i64()), rsrc_xdb_flag, bid)
@@ -666,11 +668,13 @@ def make_combine(
         # slot, so a faster peer can lap us and overwrite its (monotonic) push with
         # a higher call count before our late blocks read it. `>=` still releases
         # (a peer being ahead is the safe direction); `==` would deadlock.
-        if tid < npes:
-            xdb_peer_slot = fx.Int64(
-                window.lsa_ptr(my_lsa_rank, off_xdb_mem)
-            ) + fx.Int64(tid) * fx.Int64(8)
-            P.spin_until_ge_i64(xdb_peer_slot, phase)
+        # Wave0 strided poll: same cross-wave deadlock avoidance as the push.
+        if warp == 0:
+            for p in range(lane, npes, WAVE):
+                xdb_peer_slot = fx.Int64(
+                    window.lsa_ptr(my_lsa_rank, off_xdb_mem)
+                ) + fx.Int64(p) * fx.Int64(8)
+                P.spin_until_ge_i64(xdb_peer_slot, phase)
         fx.barrier()
         # No acquire fence needed here: the gather reads peer out_tok via
         # non-temporal loads (cache-bypassing, always fresh from HBM), and the

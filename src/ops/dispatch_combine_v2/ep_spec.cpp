@@ -97,7 +97,8 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
         " hidden=" + std::to_string(c.hiddenDim) + " topk=" + std::to_string(c.numExpertPerToken) +
         " wave=" + std::to_string(c.waveSize) + " warps=" + std::to_string(c.warpPerBlock) +
         " blocks=" + std::to_string(c.blockNum) +
-        "); token bytes must be 16 B aligned, topk and worldSize must fit in a wavefront");
+        "); token bytes must be 16 B aligned, topk must fit in a wavefront, "
+        "worldSize must fit in one block (worldSize <= warpPerBlock * waveSize)");
   }
   return c;
 }

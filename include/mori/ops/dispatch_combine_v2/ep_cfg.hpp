@@ -301,6 +301,11 @@ inline void EpApplyFields(T& dst, const std::string& prefix, const Has& has, con
 // ---------------------------------------------------------------------------
 constexpr int EpBlockThreads(const EpCfg& c) { return c.warpPerBlock * c.waveSize; }
 
+// True when worldSize exceeds a single wavefront. The per-peer loops in
+// dispatch Phase 2 and the XDB barrier then iterate more than once per lane
+// and need the multi-iteration-safe code path. Compile-time via the Cfg NTTP.
+constexpr bool EpIsWideEp(const EpCfg& c) { return c.worldSize > c.waveSize; }
+
 // Recv-slot capacity. The flat token index encodes (pe, localTokId) with this
 // stride, so host and device must agree exactly.
 constexpr int EpMaxRecv(const EpCfg& c) {
@@ -387,9 +392,10 @@ constexpr bool EpCfgIsValid(const EpCfg& c) {
          // re-encodes to the next peer and combine folds in a stranger's token.
          // Token dropping is not implemented, so reject the cap at construction.
          EpMaxRecv(c) >= c.worldSize * c.maxTokPerRank &&
-         // The dedup ballot and the grid-barrier peer loop both assume one lane
-         // per peer / per top-k slot within a single wavefront.
-         c.numExpertPerToken < c.waveSize && c.worldSize <= c.waveSize &&
+         // The dedup ballot assumes one lane per top-k slot within a wavefront.
+         // worldSize may exceed waveSize (wide EP) but must fit within one
+         // block so the combine XDB barrier's thdId < npes poll covers all peers.
+         c.numExpertPerToken < c.waveSize && c.worldSize <= EpBlockThreads(c) &&
          // WarpCopy moves whole 16 B chunks.
          (EpTokenBytes(c) % 16) == 0 &&
          // Scale rows are copied as dwords, so the row must be dword-sized.
