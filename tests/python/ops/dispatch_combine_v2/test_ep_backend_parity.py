@@ -43,6 +43,10 @@ HIDDEN = int(os.environ.get("HIDDEN", 2048))
 TOPK = int(os.environ.get("TOPK", 4))
 EPR = int(os.environ.get("EPR", 4))
 SWEEP = [int(x) for x in os.environ.get("SWEEP", "8,64,512").split(",")]
+# The one region the backends lay out differently (HIP pads the row, FlyDSL does
+# not); recv_scales() is supposed to hide that. 224 is not 128-aligned on purpose,
+# so the pitches really differ -- an aligned row would agree by accident.
+SCALE_DIM = int(os.environ.get("SCALE_DIM", 224))
 
 
 def make_op(name, comm, rank, world, M):
@@ -55,18 +59,24 @@ def make_op(name, comm, rank, world, M):
         num_experts_per_token=TOPK,
         data_type=torch.bfloat16,
         kernel_backend=name,
+        scale_dim=SCALE_DIM,
+        scale_type_size=1 if SCALE_DIM else 0,
     )
     op = EpDispatchCombineOp(cfg, comm)
     assert op.backend_name == name, f"{op.backend_name} != {name}"
     return op
 
 
-def run_once(op, comm, ct, inp, wts, idx):
+def run_once(op, comm, ct, inp, wts, idx, scales):
     """One dispatch+combine at `ct` tokens. The op is reused across token counts
     on purpose -- that is what exercises the variant table's _pick."""
     if True:
-        *_, total_recv_t, routing = op.dispatch(
-            inp[:ct], wts[:ct], None, idx[:ct], return_routing=True
+        _, _, out_s, _, total_recv_t, routing = op.dispatch(
+            inp[:ct],
+            wts[:ct],
+            scales[:ct] if scales is not None else None,
+            idx[:ct],
+            return_routing=True,
         )
         torch.cuda.synchronize()
         comm.barrier()
@@ -74,11 +84,22 @@ def run_once(op, comm, ct, inp, wts, idx):
         # measures each backend's reset policy instead -- flydsl's combine kernel
         # zeroes the op's live counter, the C++ one zeroes only the handle's copy.
         total = int(total_recv_t.cpu().item())
+        # Cloned before combine, and only the live rows: this is the view whose
+        # PITCH differs between the backends, so it has to be read the way a
+        # caller reads it (through the returned tensor) rather than off the arena.
+        # With the reverse map: the backends do not agree on WHICH slot a token
+        # lands in, so a row-by-row compare would fail on order, not on values.
+        recv_s = out_s[:total].clone() if (out_s is not None and total) else None
+        tis = (
+            routing.disp_tok_id_to_src_tok_id_local[:total].clone()
+            if recv_s is not None
+            else None
+        )
         # Identity expert: hand the received tokens straight back.
         out, out_wts = op.combine(op.combine_in_view(), wts[:ct], routing=routing)
         torch.cuda.synchronize()
         comm.barrier()
-        return out.clone(), out_wts.clone(), total
+        return out.clone(), out_wts.clone(), total, recv_s, tis
 
 
 def main():
@@ -111,6 +132,20 @@ def main():
         .to(dev)
     )
 
+    # One recognisable dword per token: a row read at the wrong pitch, or landed in
+    # the wrong slot, then shows up as a mismatch rather than as noise.
+    scales = None
+    if SCALE_DIM:
+        n_i32 = (SCALE_DIM + 3) // 4
+        scales = (
+            (torch.arange(M, device=dev) + rank * 100003)
+            .view(M, 1)
+            .expand(M, n_i32)
+            .contiguous()
+            .to(torch.int32)
+            .view(torch.uint8)
+        )
+
     # Six ops are built and closed in sequence (2 backends x len(SWEEP)),
     # so the reservation has to survive the repeated alloc/free, not just
     # hold one arena.
@@ -126,8 +161,12 @@ def main():
 
     failures = 0
     for ct in SWEEP:
-        a_out, a_w, a_recv = run_once(ops["flydsl"], comm, ct, inp, wts, idx)
-        b_out, b_w, b_recv = run_once(ops["hip"], comm, ct, inp, wts, idx)
+        a_out, a_w, a_recv, a_s, a_tis = run_once(
+            ops["flydsl"], comm, ct, inp, wts, idx, scales
+        )
+        b_out, b_w, b_recv, b_s, b_tis = run_once(
+            ops["hip"], comm, ct, inp, wts, idx, scales
+        )
 
         # Routing is deterministic given the same indices, so the recv counts must
         # match exactly; the payload is the same bf16 sum in the same order.
@@ -136,18 +175,40 @@ def main():
             a_out.to(torch.float32), b_out.to(torch.float32), atol=2e-2, rtol=2e-2
         )
         ok_w = torch.allclose(a_w, b_w, atol=2e-3, rtol=2e-3)
-        ok = ok_recv and ok_out and ok_w
+        # Byte-exact (opaque payload), in SOURCE-token order via the reverse map --
+        # the pitches differ underneath, which is the point of checking at all.
+        ok_s = True
+        if a_s is not None and b_s is not None:
+            ok_s = a_s.shape == b_s.shape
+            if ok_s:
+                a_ord = torch.argsort(a_tis.cpu(), stable=True)
+                b_ord = torch.argsort(b_tis.cpu(), stable=True)
+                ok_s = torch.equal(a_tis.cpu()[a_ord], b_tis.cpu()[b_ord]) and (
+                    torch.equal(a_s.cpu()[a_ord], b_s.cpu()[b_ord])
+                )
+        ok = ok_recv and ok_out and ok_w and ok_s
         failures += 0 if ok else 1
         if not ok:
             print(
                 f"[rank {rank}] ct={ct}: PARITY FAIL "
                 f"recv={a_recv}/{b_recv} "
                 f"out_max_diff={(a_out.to(torch.float32) - b_out.to(torch.float32)).abs().max():.4f} "
-                f"wts_max_diff={(a_w - b_w).abs().max():.5f}",
+                f"wts_max_diff={(a_w - b_w).abs().max():.5f} "
+                # Which check failed: a scale-only failure has a different cause.
+                f"[recv={'ok' if ok_recv else 'BAD'} out={'ok' if ok_out else 'BAD'} "
+                f"wts={'ok' if ok_w else 'BAD'} scales={'ok' if ok_s else 'BAD'}]",
                 flush=True,
             )
         elif rank == 0:
-            print(f"# PARITY ct={ct}: PASS (recv={a_recv}, flydsl == hip)", flush=True)
+            sc = (
+                f", scales {a_s.shape[1]} dwords byte-exact across pitches"
+                if a_s is not None
+                else ""
+            )
+            print(
+                f"# PARITY ct={ct}: PASS (recv={a_recv}, flydsl == hip{sc})",
+                flush=True,
+            )
 
     counts = torch.tensor([failures], dtype=torch.int32)
     dist.all_reduce(counts)

@@ -75,7 +75,7 @@ TEST(FieldCount, NestedCountsAsOne) { EXPECT_EQ(FieldCount<Nested>(), 3u); }
 
 // The Cfg's own count: if this ever disagrees with VisitFields(EpCfg), a field is
 // silently missing from the rendered text -- a wrong kernel, not a stale one.
-TEST(FieldCount, MatchesEpCfg) { EXPECT_EQ(FieldCount<EpCfg>(), 11u); }
+TEST(FieldCount, MatchesEpCfg) { EXPECT_EQ(FieldCount<EpCfg>(), 12u); }
 #endif
 
 // --------------------------------------------------------------------------

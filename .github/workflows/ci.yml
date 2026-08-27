@@ -22,6 +22,9 @@ on:
         type: boolean
         default: false
         description: Enable DP/EP modes when launching the hicache test
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -167,6 +170,7 @@ jobs:
             cd $GITHUB_WORKSPACE && MORI_ENABLE_SDMA=1 timeout 300 pytest tests/python/ccl/test_allgather_param_contiguous.py -v
           "
 
+
       - name: MORI-CCL (hier allgather offset spec, CPU)
         run: |
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
@@ -187,6 +191,15 @@ jobs:
         run: |
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
             cd $GITHUB_WORKSPACE && MORI_DISABLE_P2P=1 MORI_ENABLE_SDMA=0 timeout 300 pytest tests/python/ops/test_dispatch_combine_async_ll.py -v
+          "
+
+      - name: MORI-EP (AUTO tuning config quant types, CPU)
+        run: |
+          # Pure mapping test: no GPU, no RDMA. Named explicitly because the
+          # only directory-level collection in this workflow is tests/python/io,
+          # so a file elsewhere under tests/python runs nowhere by default.
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE && timeout 60 pytest tests/python/test_tuning_config_quant_types.py -v
           "
 
       - name: MORI-EP bench
@@ -369,8 +382,13 @@ jobs:
 
       - name: Install mori (XLA FFI)
         run: |
+          # Resolve the XLA FFI headers from the system jax *outside* pip's
+          # isolated build env (build isolation hides system site-packages, so
+          # CMake can't `import jax` during configure). Pass it via env var.
           $CT exec ${CONTAINER}_jax bash -c \
-            "cd $GITHUB_WORKSPACE && BUILD_UMBP=OFF BUILD_XLA_FFI_OPS=ON pip install --break-system-packages ."
+            "cd $GITHUB_WORKSPACE && \
+             export XLA_FFI_INCLUDE_DIR=\$(python3 -c 'from jax import ffi; print(ffi.include_dir())') && \
+             BUILD_UMBP=OFF BUILD_XLA_FFI_OPS=ON pip install --break-system-packages ."
 
       - name: MORI-EP JAX test
         run: |
@@ -782,6 +800,36 @@ jobs:
               sleep 1
               PORT=$((PORT + 1))
             done
+          done
+
+      - name: MORI-EP internode rail-only (MORI_ENABLE_RAIL_ONLY)
+        run: |
+          # Same v1/v1_ll path with cross-rail QPs never created. Guards the claim
+          # that the EP internode data path only ever needs same-rail connections.
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
+          RAIL_ENV="-e MORI_INTERNODE_TIMEOUT=600 -e MORI_ENABLE_RAIL_ONLY=1 -e MORI_APP_LOG_LEVEL=INFO"
+          PORT=29170
+          for KERNEL in v1 v1_ll; do
+            echo "=== rail-only kernel=$KERNEL port=$PORT ==="
+            NODE2_CMD=(
+              $CT exec $RAIL_ENV $CONTAINER bash $SCRIPT
+              --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+              --ifname $NODE2_IFNAME
+              --cmd bench --kernel-type $KERNEL --max-tokens 1024
+            )
+            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+            $CT exec $RAIL_ENV $CONTAINER bash $SCRIPT \
+              --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+              --ifname $NODE1_IFNAME \
+              --cmd bench --kernel-type $KERNEL --max-tokens 1024 > /tmp/rail_$KERNEL.log 2>&1
+            rc=$?
+            wait
+            cat /tmp/rail_$KERNEL.log
+            [ $rc -eq 0 ] || exit $rc
+            # Every local rank must have connected to exactly one cross-node peer.
+            n=$(grep -c "rail-only: rank .* connected 1 RDMA peers" /tmp/rail_$KERNEL.log)
+            [ "$n" -eq 8 ] || { echo "expected 8 rail-only ranks, got $n"; exit 1; }
+            PORT=$((PORT + 1))
           done
 
       - name: MORI-EP internode async kernel test

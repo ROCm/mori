@@ -50,6 +50,9 @@ from typing import Callable
 import torch
 
 from mori.tensor_utils import from_gpu_ptr
+from mori.jit.config import detect_wave_size
+
+WAVE = detect_wave_size()
 
 # Where each backend lives. Imported lazily, on selection only.
 _BACKEND_MODULES = {"flydsl": "flydsl_backend", "hip": "hip_backend"}
@@ -128,12 +131,6 @@ class EpDispatchCombineConfig:
             )
         if self.quant_type != "none":
             self.combine_mode = "scatter"
-        # The dispatch grid barrier resets inside a `range(lane, npes, 64)` loop,
-        # correct only while each lane runs it once (npes <= wavefront).
-        if self.world_size > 64:
-            raise ValueError(
-                f"intranode op supports world_size <= 64, got {self.world_size}"
-            )
         # Token copy moves whole 16 B (vec4) chunks; a non-16 B-aligned per-token
         # size would over-read/write a few dwords past the token.
         if self.token_nbytes % 16 != 0:
@@ -232,6 +229,22 @@ class EpDispatchCombineConfig:
                 self.warp_num_per_block = 16
             if self.combine_warp_num_per_block is None:
                 self.combine_warp_num_per_block = 4
+
+        # Precise world_size check against the resolved geometry.  The combine
+        # xdb barrier polls with `tid < npes`, so every schedule bucket must
+        # have blockDim (= comb_warp * WAVE) >= world_size.
+        if self.schedule:
+            min_comb_warp = min(bucket[4] for bucket in self.schedule)
+        else:
+            min_comb_warp = self.combine_warp_num_per_block
+        max_peers = min_comb_warp * WAVE
+        if self.world_size > max_peers:
+            raise ValueError(
+                f"world_size ({self.world_size}) exceeds the smallest combine "
+                f"blockDim in the schedule ({min_comb_warp} warps × {WAVE}-wide "
+                f"wave = {max_peers} threads); the `tid < npes` barrier requires "
+                f"world_size <= blockDim"
+            )
 
     @property
     def is_scatter(self):
@@ -575,6 +588,20 @@ class EpDispatchCombineOp:
     def capabilities(self) -> frozenset[str]:
         return self._kernels.capabilities
 
+    def scale_stride_bytes(self) -> int:
+        """Bytes between consecutive out_scales rows, 0 when off.
+
+        A backend may lay them down wider than the row it was handed (the HIP one
+        pads to 128 B). On the base so a consumer never branches on the backend;
+        the default is the row unchanged, which is right for one that does not pad.
+        """
+        return self._scale_row_bytes()
+
+    def _scale_row_bytes(self) -> int:
+        """The caller's row in bytes, dword-rounded. 0 when the transport is off."""
+        n = self.cfg.scale_dim * self.cfg.scale_type_size
+        return ((n + 3) // 4) * 4 if n else 0
+
     # -- shared: variant selection -----------------------------------------
 
     def _pick(self, num_tokens):
@@ -666,6 +693,10 @@ class EpDispatchCombineOp:
         exclusive. Returns (out, out_weights, out_scales, out_indices,
         total_recv[, routing]); out == arena disp_out, safe to read without
         .clone() because combine stages into a separate out_tok buffer.
+
+        out_scales is [max_recv, scale_dim_i32] on both backends but is not always
+        CONTIGUOUS -- a backend may lay the rows down wider and return a strided
+        view. Read by pointer, stride by scale_stride_bytes(), not by this shape.
 
         total_recv is a DEVICE tensor. Reading it on the host is a full sync that
         costs more than the kernel and makes the op uncapturable, so neither

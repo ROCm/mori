@@ -793,8 +793,17 @@ bool SocketBootstrapNetwork::PhoneHomeProtocol() {
         return false;
       }
 
+      if (info.rank < 0 || info.rank >= worldSize) {
+        MORI_APP_ERROR("Root: peer reported invalid rank {} (worldSize={})", info.rank, worldSize);
+        CloseSocket(client_sock);
+        CloseSocket(root_listen_socket);
+        for (int j = 1; j < i; j++) {
+          CloseSocket(client_sockets[j]);
+        }
+        return false;
+      }
+
       peer_infos[info.rank] = info;
-      // Keep socket open and store it by rank
       client_sockets[info.rank] = client_sock;
     }
 
@@ -962,6 +971,13 @@ bool SocketBootstrapNetwork::ReceiveMessage(int peer, int tag, void* data, size_
     int recv_peer = header[0];
     int recv_tag = header[1];
     int recv_size = header[2];
+
+    constexpr int kMaxMessageSize = 128 * 1024 * 1024;
+    if (recv_size < 0 || recv_size > kMaxMessageSize) {
+      MORI_APP_ERROR("ReceiveMessage: invalid size {} from peer {}", recv_size, recv_peer);
+      CloseSocket(client_sock);
+      return false;
+    }
 
     if (recv_peer == peer && recv_tag == tag && recv_size == static_cast<int>(size)) {
       // Expected message

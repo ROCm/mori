@@ -64,6 +64,16 @@ __all__ = [
 # (the caller halves hiddenDim). Combine cannot use it; C++ rejects that.
 DTYPES = {"bf16": 0, "fp32": 1, "byte8": 2}
 
+# Arena regions a caller is allowed not to carry. Everything else missing is a
+# bug in the caller, not a configuration: see the bind loop in make_plan.
+# Keyed by the snake_case region name: the region key comes from the C++ launch
+# argument (offOutScales -> "outScales") while an arena names it "out_scales",
+# so both are folded through _camel_to_snake before being looked up here.
+_OPTIONAL_REGIONS = frozenset({"out_scales"})
+
+# ... and the Request field that makes each of them mandatory again.
+_REGION_REQUIRED_WHEN = {"out_scales": "scaleBytes"}
+
 # The C ABI + the plan registry both live here; op-libraries register INTO it.
 _ABI_NAME = "libmori_jit.so"
 
@@ -404,6 +414,12 @@ def make_plan(kernel: str) -> type:
                 raise RuntimeError(f"mori jit [{kernel}]: {_error()}")
             self._handle = ctypes.c_void_p(handle)
             self._arena = arena  # held: the kernel dereferences the window
+            # launch()'s reusable arg struct; see the comment there. Dropped on
+            # bind(), so pinned arguments are never served from a stale cache.
+            self._buf = None
+            self._buf_shape = None
+            self._dyn_args = ()
+            self._dyn_defs = ()
             # Known at construction, so the caller need not repeat them per launch.
             self._defaults = {}
             if "window" in arg_names:
@@ -412,7 +428,34 @@ def make_plan(kernel: str) -> type:
             if arena is not None:
                 names = region_names or {}
                 for wire, region in arg_regions.items():
-                    self._defaults[wire] = int(arena.offset(names.get(region, region)))
+                    name = names.get(region, region)
+                    try:
+                        self._defaults[wire] = int(arena.offset(name))
+                    except KeyError:
+                        # ONLY a region on the optional list may be missing. A
+                        # blanket catch here would turn a typo in region_names, or
+                        # a backend that forgot a required region, from an
+                        # immediate KeyError into a silent bind to offset 0 -- and
+                        # 0 aliases the first region, so the kernel would scribble
+                        # over it. Callers that build their own arena and pass a
+                        # region_names mapping (aiter's MegaMoE does) are exactly
+                        # the ones most able to get this wrong.
+                        canon = _camel_to_snake(region)
+                        if canon not in _OPTIONAL_REGIONS:
+                            raise
+                        # Optional, but not optional for THIS plan: if the Request
+                        # field that turns the feature on is set, the kernel will
+                        # dereference the offset and a 0 would alias region 0.
+                        # Mechanism, not a comment telling callers to be careful.
+                        enabler = _REGION_REQUIRED_WHEN.get(canon)
+                        if enabler and int(req.get(enabler) or 0):
+                            raise KeyError(
+                                f"{kernel}: arena has no region {name!r}, but "
+                                f"{enabler}={req[enabler]} turns it on"
+                            ) from None
+                        # Optional and genuinely off: the kernel's `if constexpr`
+                        # is what keeps the 0 from being dereferenced.
+                        self._defaults[wire] = 0
 
         def bind(self, **args) -> None:
             """Pin launch arguments that never change between calls.
@@ -428,23 +471,56 @@ def make_plan(kernel: str) -> type:
                         f"{kernel}: unknown launch argument '{k}'; schema is {arg_names}"
                     )
                 self._defaults[wire] = v
+            self._buf = None  # pinned values changed; rebuild the cached struct
 
         def launch(self, stream=0, **args) -> None:
             """Arguments by name, snake_case or the C++ spelling, per the schema."""
             if self._handle is None:
                 raise RuntimeError("launch on a closed plan")
-            merged = dict(self._defaults)
-            for k, v in args.items():
-                wire = arg_snake_to_wire.get(k, k)
-                if wire not in arg_names:
-                    raise TypeError(
-                        f"{kernel}: unknown launch argument '{k}'; schema is {arg_names}"
-                    )
-                merged[wire] = v
-            buf = args_t()
-            for name in arg_names:
-                if name in merged:
-                    setattr(buf, name, _as_ptr(merged[name]))
+
+            # A serving loop calls this with the same argument NAMES every time,
+            # so the struct-filling work repeats identically while only a few
+            # values differ. Cache the struct instead of rebuilding it: on f01-2
+            # this path cost 10-20us per launch against a ~36us kernel, which is
+            # what made the eager host path -- not the GPU -- the bottleneck at
+            # small token counts (HANDOFF §16.13).
+            #
+            # What may be cached: a _defaults entry that is an int, since bind()
+            # is the only way to change one and it drops the cache. Everything
+            # else is re-read every launch -- args because they are the varying
+            # ones (num_tokens is an int that changes per call), and a tensor in
+            # _defaults because its storage may have been reallocated.
+            #
+            # Keyed on the argument names: a call passing a different set must not
+            # inherit fields left over from the previous shape.
+            shape = tuple(args)
+            if self._buf is None or shape != self._buf_shape:
+                merged = dict(self._defaults)
+                for k, v in args.items():
+                    wire = arg_snake_to_wire.get(k, k)
+                    if wire not in arg_names:
+                        raise TypeError(
+                            f"{kernel}: unknown launch argument '{k}'; schema is {arg_names}"
+                        )
+                    merged[wire] = v
+                buf = args_t()
+                for name in arg_names:
+                    if name in merged:
+                        setattr(buf, name, _as_ptr(merged[name]))
+                self._buf = buf
+                self._buf_shape = shape
+                self._dyn_args = tuple((k, arg_snake_to_wire.get(k, k)) for k in args)
+                self._dyn_defs = tuple(
+                    w
+                    for w, v in self._defaults.items()
+                    if w in arg_names and not isinstance(v, int)
+                )
+            else:
+                buf = self._buf
+                for k, wire in self._dyn_args:
+                    setattr(buf, wire, _as_ptr(args[k]))
+                for wire in self._dyn_defs:
+                    setattr(buf, wire, _as_ptr(self._defaults[wire]))
             rc = _load().mori_jit_plan_launch(
                 self._handle,
                 ctypes.byref(buf),

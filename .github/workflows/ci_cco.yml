@@ -150,6 +150,15 @@ jobs:
             # mpirun --allow-run-as-root -np 2 python 03_flydsl_put/main.py
             # mpirun --allow-run-as-root -np 2 python 06_flydsl_gda_modes/main.py
 
+      # Lives here rather than in ci.yml because this is the job that shares a runner
+      # label with 08_torch_symm_import above, and because MORI_SYMM_FORCE_JIT is what
+      # compiles src/allocator/symm_backend.cpp at all: every `pip install .` runs under
+      # PEP 517 build isolation, where torch is not importable, so setup.py never
+      # prebuilds the extension. Without this step nothing in CI compiles that file.
+      - name: MORI torch SymmetricMemory backend
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE -e MORI_SYMM_FORCE_JIT=1 $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE && timeout 600 pytest tests/python/allocator -v"
 
       - name: Run CCO SDMA Python API tests (spawn, up to 8 GPUs)
         run: |
@@ -160,6 +169,14 @@ jobs:
             cd $GITHUB_WORKSPACE && \
             timeout 300 pytest tests/python/cco/test_sdma_api.py -v"
 
+      - name: Validate CCO ROCm runtime import order
+        run: |
+          $CT exec $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE && \
+            timeout 120 pytest -v \
+              tests/python/cco/test_rocm_bootstrap.py \
+              tests/python/cco/test_rocm_import_order.py"
+
       - name: Run CCO Triton bindings, LSA, and SDMA tests
         run: |
           $CT exec \
@@ -168,8 +185,6 @@ jobs:
             $CONTAINER bash -c "\
               cd $GITHUB_WORKSPACE && \
               timeout 300 pytest -v \
-                tests/python/cco/test_rocm_bootstrap.py \
-                tests/python/cco/test_rocm_import_order.py \
                 tests/python/cco/test_triton_bindings.py \
                 tests/python/cco/test_triton_lsa.py \
                 tests/python/cco/test_triton_sdma.py"
@@ -199,7 +214,6 @@ jobs:
             $CONTAINER bash -c "\
               cd $GITHUB_WORKSPACE && \
               timeout 300 pytest -v tests/python/cco/test_triton_gda.py"
-
       - name: Run JIT v2 C++ tests + host/device split guard
         run: |
           # Registered by tests/cpp/jit/CMakeLists.txt but selected by no job before
@@ -242,6 +256,45 @@ jobs:
             echo \"\$out\"; \
             case \"\$out\" in *FAIL*) exit 1;; esac; \
             case \"\$out\" in *PASS*) ;; *) echo 'no PASS line: nothing ran'; exit 1;; esac"
+
+      - name: Run ops-v2 HIP backend with per-token scales (EP8, 8 ranks)
+        run: |
+          # SCALE_DIM>0 turns on the forwarded per-token scale row and makes
+          # test_op.py verify it through the routing reverse map (OP-SCALES). It is
+          # a separate step rather than an env added to the one above so the
+          # no-scale path keeps its own coverage.
+          $CT exec -e MORI_V2_KERNEL_BACKEND=hip -e SCALE_DIM=32 $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
+            out=\$(timeout 900 torchrun --standalone --nproc_per_node=8 test_op.py 2>&1) || \
+              { echo \"\$out\"; exit 1; }; \
+            echo \"\$out\"; \
+            case \"\$out\" in *FAIL*) exit 1;; esac; \
+            case \"\$out\" in *OP-SCALES*) ;; *) echo 'no OP-SCALES line: scales never ran'; exit 1;; esac"
+
+      - name: Run ops-v2 scales on a quantizing wire (fp8 and fp4 dispatch, EP8)
+        run: |
+          # The step above can only test scales on a BF16 wire: test_op.py gives
+          # dispatch and combine one dtype, and the HIP backend refuses an fp8
+          # combine (it sums). fp8/fp4 dispatch with a bf16 combine is what a real
+          # quantizing wire is, and it is the only configuration where the scale
+          # row is not decoration -- so it gets its own step.
+          #
+          # SCALE_DIM=224 on purpose: hidden/32 for hidden 7168, and NOT a multiple
+          # of 128, so it exercises the padding mori adds to the destination stride
+          # (EpScaleStride). A row that is already aligned would not.
+          #
+          # This runner has no gfx1250, so what actually runs here is the portable
+          # body -- the one that cannot be exercised by hand on the TDM boxes.
+          for disp in fp8 fp4; do
+            $CT exec -e MORI_V2_KERNEL_BACKEND=hip -e SCALE_DIM=224 -e HIDDEN=7168 \
+              -e DISP=$disp $CONTAINER bash -c "\
+              cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
+              out=\$(timeout 900 torchrun --standalone --nproc_per_node=8 test_asym_dtype.py 2>&1) || \
+                { echo \"\$out\"; exit 1; }; \
+              echo \"\$out\"; \
+              case \"\$out\" in *FAIL*) exit 1;; esac; \
+              case \"\$out\" in *ASYM-SCALES*) ;; *) echo 'no ASYM-SCALES line: scales never ran'; exit 1;; esac" || exit 1
+          done
 
       - name: Run ops-v2 backend parity (FlyDSL vs HIP, EP8)
         run: |

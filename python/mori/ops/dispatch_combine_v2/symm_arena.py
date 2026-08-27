@@ -40,6 +40,8 @@ class SymmArena:
     """One cco symmetric window carved into named, aligned sub-regions. A kernel
     reaches peer pe's copy of region R via cco.Window(handle).lsa_ptr(pe, off_R)."""
 
+    # Not free to lower: the scale transport pads its rows to EpScaleAlign (128)
+    # and that only aligns them if the region is aligned too. hip_backend asserts.
     _ALIGN = 256
 
     def __init__(self, comm, regions):

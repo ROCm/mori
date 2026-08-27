@@ -118,6 +118,9 @@ struct EpArgs {
   unsigned long long offDispOut = 0;    // T[maxRecv*hidden]     dispatch landing zone
   unsigned long long offOutTok = 0;     // T[maxRecv*hidden]     combine staging
   unsigned long long offXdb = 0;        // uint64[worldSize]     barrier slots
+  // uint8[maxRecv*scaleBytes]. Only read when Cfg.scaleBytes > 0; the arena does
+  // not carry the region otherwise, so this stays 0 and nothing dereferences it.
+  unsigned long long offOutScales = 0;
 
   // Which LSA rank this is. Runtime for the same reason: as a Cfg field it made
   // all eight ranks compile their own copy of an identical kernel.
@@ -126,6 +129,7 @@ struct EpArgs {
   const int* tokenIndices = nullptr;  // [numTokens * topk] expert ids, <0 drops
   const void* inpTokenBuf = nullptr;  // dispatch: source tokens; combine: post-expert tokens
   const float* weightsBuf = nullptr;  // [numTokens * topk]
+  const void* scalesBuf = nullptr;    // [numTokens * scaleBytes] per-token scale rows
   void* outTokenBuf = nullptr;        // combine output, local
   float* outWeightsBuf = nullptr;     // combine weight output, local
 
@@ -142,7 +146,7 @@ struct EpArgs {
 
 // The wire schema, generated from the field list rather than kept parallel to it.
 // The binding builds its ctypes struct from `name:tag` in this order and checks
-// sizeof -- which cannot see two same-type fields swapped, and 8 of the 22 are
+// sizeof -- which cannot see two same-type fields swapped, and 9 of the 24 are
 // bare pointers. So the static_asserts below take the offsets in SCHEMA order:
 // any disagreement with the declaration order stops the sequence increasing.
 #define MORI_EP_ARGS_FIELDS(X) \
@@ -155,10 +159,12 @@ struct EpArgs {
   X(offDispOut, "u64")         \
   X(offOutTok, "u64")          \
   X(offXdb, "u64")             \
+  X(offOutScales, "u64")       \
   X(rank, "i32")               \
   X(tokenIndices, "p")         \
   X(inpTokenBuf, "p")          \
   X(weightsBuf, "p")           \
+  X(scalesBuf, "p")            \
   X(outTokenBuf, "p")          \
   X(outWeightsBuf, "p")        \
   X(dispDestTokIdMap, "p")     \
@@ -190,7 +196,7 @@ constexpr bool EpArgsOffsetsAscend() {
 
 }  // namespace detail
 
-static_assert(detail::kEpArgsFieldCount == 22,
+static_assert(detail::kEpArgsFieldCount == 24,
               "added an EpArgs field -- add it to MORI_EP_ARGS_FIELDS in the same position "
               "and bump this count");
 static_assert(detail::EpArgsOffsetsAscend(),
@@ -218,6 +224,10 @@ struct EpCfg {
 
   // ---- algorithm ----
   bool useWeights = true;
+  // Per-token scale row carried alongside the payload, in bytes. 0 = off, and off
+  // is free: Render omits default-valued fields, so the Cfg text -- which IS the
+  // JIT cache key -- is byte-identical to a build without this feature.
+  int scaleBytes = 0;
 };
 
 template <typename Self, typename Visit>
@@ -234,10 +244,11 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
   MORI_FIELD(warpPerBlock);
   MORI_FIELD(waveSize);
   MORI_FIELD(useWeights);
+  MORI_FIELD(scaleBytes);
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 11, "added an EpCfg field -- update VisitFields(EpCfg) too");
+MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 12, "added an EpCfg field -- update VisitFields(EpCfg) too");
 
 inline std::string Render(const EpCfg& c) {
   const EpCfg d{};
@@ -305,16 +316,64 @@ constexpr int EpCombineSharedBytes(const EpCfg& c) {
 
 constexpr int EpTokenBytes(const EpCfg& c) { return c.hiddenDim * EpElemSize(c.dtype); }
 
+// The scale row's SLOT stride: the caller's row padded to 128 B. A transfer is a
+// run of consecutive slots, and TdmWholeOrSplit128 only gives a body to the part
+// of a run that starts aligned -- at the natural 224 B only every 4th one does.
+// gfx1250, 512 tok/rank, hidden 7168, EP4: dispatch 157.7us at 224 B, 94.8 at 256.
+//
+// Padded on every arch so the destination layout does not fork per arch. The pad
+// is unconditional, so small rows amplify: 224->256 is 1.14x, 32->128 is 4x,
+// 4->128 is 32x, and the gfx1250 staging pool is worldSize^2 * maxTok * THIS per
+// compiled variant. Bounded by the static_assert there, not by this being cheap.
+//
+// Everything reading the destination uses this, not Cfg.scaleBytes; it assumes
+// the arena aligns the region too (SymmArena._ALIGN, checked in hip_backend).
+constexpr int EpScaleAlign = 128;
+constexpr int EpScaleStride(const EpCfg& c) {
+  return c.scaleBytes <= 0 ? 0 : (c.scaleBytes + EpScaleAlign - 1) / EpScaleAlign * EpScaleAlign;
+}
+
 // gfx1250 launch LDS. Dispatch stages one token tile per warp through the TDM
 // engine; combine reserves the whole budget and sizes its tiles at runtime.
 // EpCombine1250xLdsBudget must match MORI_COMB_LDS_BUDGET in ep_intranode_1250x.hpp.
-constexpr int EpCombine1250xLdsBudget = 327680;
+//
+// Ep1250xLdsBytes is the physical ceiling; combine's budget happens to be all of
+// it. Anything else that needs the ceiling should say so directly rather than
+// reach for combine's number -- otherwise retuning combine silently resizes it.
+constexpr int Ep1250xLdsBytes = 327680;
+constexpr int EpCombine1250xLdsBudget = Ep1250xLdsBytes;
 // xdbFlag slots for the per-block combine entry barrier: one uint64 per block, so a
 // block is the only writer of its own epoch. 256 == the CU count, which caps the
 // combine block_num; the host allocates this many and every call keeps them in step.
 constexpr int EpXdbFlagSlots = 256;
+
+// Per-warp LDS slab. The metadata tile and the payload tile share it (same
+// address, different phases), so its size bounds BOTH -- and the metadata batch
+// size is (slab - headroom) / bytes-per-token.
+//
+// Sizing it off the payload dtype alone is fine until a scale row joins the
+// metadata: an fp8 payload halves the slab exactly when per-token metadata grows
+// from 52 to 276 bytes, and the batch collapses ~11x.
+//
+// The floor is EMPIRICAL, and from one shape: hidden 7168, topk 6, EP4, 512
+// tokens/rank on gfx1250, where it moved dispatch from 93.1us back to 36.7us.
+// The mechanism (a narrower slab shrinks the metadata batch) is general; the
+// conclusion that the bf16 width is the right target is not necessarily so for a
+// very different hidden size, and this is the first thing to re-measure if one
+// shows up.
+//
+// Capped by the physical LDS rather than by combine's budget: the two are the
+// same number today, but for a shared physical reason, not because dispatch
+// follows combine.
+constexpr int EpDispatch1250xSlabBytes(const EpCfg& c) {
+  const int payload = c.hiddenDim * EpElemSize(c.dtype);
+  if (c.scaleBytes <= 0) return payload;
+  const int wide = c.hiddenDim * EpElemSize(EpDType::Bf16);
+  const long long total = (long long)wide * c.warpPerBlock;
+  return (wide > payload && total <= Ep1250xLdsBytes) ? wide : payload;
+}
 constexpr int EpDispatch1250xLdsBytes(const EpCfg& c) {
-  return c.warpPerBlock * c.hiddenDim * EpElemSize(c.dtype);
+  return c.warpPerBlock * EpDispatch1250xSlabBytes(c);
 }
 
 // A Cfg that cannot launch is a host-side error, not a kernel that misbehaves.
@@ -332,7 +391,9 @@ constexpr bool EpCfgIsValid(const EpCfg& c) {
          // per peer / per top-k slot within a single wavefront.
          c.numExpertPerToken < c.waveSize && c.worldSize <= c.waveSize &&
          // WarpCopy moves whole 16 B chunks.
-         (EpTokenBytes(c) % 16) == 0;
+         (EpTokenBytes(c) % 16) == 0 &&
+         // Scale rows are copied as dwords, so the row must be dword-sized.
+         c.scaleBytes >= 0 && (c.scaleBytes % 4) == 0;
 }
 
 }  // namespace v2
