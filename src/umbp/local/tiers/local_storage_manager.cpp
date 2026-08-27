@@ -953,6 +953,23 @@ std::vector<bool> LocalStorageManager::ReadBatchRangesIntoPtr(
       return;
     }
 
+    // Every key routing to the same single tier is the common case -- a
+    // layer-wise restore's whole batch usually lives in one tier -- and the
+    // loop that built `indices` pushes in ascending i, so indices.size() == n
+    // here means indices IS [0, 1, ..., n-1]. Pass the caller's vectors
+    // through instead of rebuilding an identical copy of all four per call.
+    if (indices.size() == n) {
+      auto batch = tier->ReadBatchRangesIntoPtr(keys, dst_ptrs, sizes, src_offsets);
+      for (size_t idx = 0; idx < n; ++idx) {
+        if (idx < batch.size() && batch[idx]) {
+          results[idx] = true;
+        } else {
+          failed->push_back(idx);
+        }
+      }
+      return;
+    }
+
     std::vector<std::string> batch_keys;
     std::vector<std::vector<uintptr_t>> batch_ptrs;
     std::vector<std::vector<size_t>> batch_sizes;

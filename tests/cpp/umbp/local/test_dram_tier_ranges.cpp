@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "device_copy_run.h"
+#include "umbp/local/standalone_client.h"
 #include "umbp/local/tiers/dram_tier.h"
 #include "umbp/local/tiers/local_storage_manager.h"
 
@@ -291,6 +292,91 @@ TEST(DRAMTierRangesTest, AllocationFailureNeverReplacesExistingValue) {
   std::vector<char> readback(12, 0);
   ASSERT_TRUE(tier.ReadIntoPtr("key", reinterpret_cast<uintptr_t>(readback.data()), 12));
   EXPECT_EQ(readback, original);
+}
+
+// The fast path in ReadBatchRangesIntoPtr's tier dispatch skips rebuilding the
+// four per-tier vectors when every key in the batch lands on the same tier --
+// the common case for a layer-wise restore. It must produce byte-identical
+// results to the slow path it bypasses, including for the partial-hit case
+// that still has to fall through to the general per-index dispatch.
+TEST(LocalStorageManagerRangesTest, AllKeysOnOneTierMatchesThePerIndexPath) {
+  UMBPConfig config;
+  config.dram.capacity_bytes = 4096;
+  config.ssd.enabled = false;
+  LocalStorageManager manager(config);
+
+  std::vector<char> a(8, 'A'), b(8, 'B'), c(8, 'C');
+  ASSERT_TRUE(manager.Write("a", a.data(), a.size()));
+  ASSERT_TRUE(manager.Write("b", b.data(), b.size()));
+  ASSERT_TRUE(manager.Write("c", c.data(), c.size()));
+
+  std::vector<char> out_a(8, 0), out_b(8, 0), out_c(8, 0);
+  auto get = manager.ReadBatchRangesIntoPtr({"a", "b", "c"},
+                                            {{reinterpret_cast<uintptr_t>(out_a.data())},
+                                             {reinterpret_cast<uintptr_t>(out_b.data())},
+                                             {reinterpret_cast<uintptr_t>(out_c.data())}},
+                                            {{8}, {8}, {8}}, {{0}, {0}, {0}});
+  ASSERT_EQ(get, std::vector<bool>({true, true, true}));
+  EXPECT_EQ(out_a, a);
+  EXPECT_EQ(out_b, b);
+  EXPECT_EQ(out_c, c);
+
+  // A miss in the middle of the batch must fall back to the per-index path
+  // and still resolve the hits around it correctly.
+  std::vector<char> out_a2(8, 0), out_missing(8, 0), out_c2(8, 0);
+  auto mixed = manager.ReadBatchRangesIntoPtr({"a", "missing", "c"},
+                                              {{reinterpret_cast<uintptr_t>(out_a2.data())},
+                                               {reinterpret_cast<uintptr_t>(out_missing.data())},
+                                               {reinterpret_cast<uintptr_t>(out_c2.data())}},
+                                              {{8}, {8}, {8}}, {{0}, {0}, {0}});
+  ASSERT_EQ(mixed, std::vector<bool>({true, false, true}));
+  EXPECT_EQ(out_a2, a);
+  EXPECT_EQ(out_c2, c);
+}
+
+// StandaloneClient::BatchGetRanges takes an "every key present" fast path that
+// forwards the caller's vectors directly instead of copying them into a
+// filtered subset. It must agree byte-for-byte with the general path a
+// partial hit still takes.
+TEST(StandaloneClientRangesTest, AllPresentFastPathMatchesThePartialHitPath) {
+  UMBPConfig config;
+  config.dram.capacity_bytes = 4096;
+  config.ssd.enabled = false;
+  StandaloneClient client(config);
+
+  std::vector<char> a(8, 'A'), b(8, 'B');
+  ASSERT_TRUE(client.Put("a", a.data(), a.size()));
+  ASSERT_TRUE(client.Put("b", b.data(), b.size()));
+
+  std::vector<char> out_a(8, 0), out_b(8, 0);
+  auto all_present = client.BatchGetRanges(
+      {"a", "b"},
+      {{reinterpret_cast<uintptr_t>(out_a.data())}, {reinterpret_cast<uintptr_t>(out_b.data())}},
+      {{8}, {8}}, {{0}, {0}});
+  ASSERT_EQ(all_present, std::vector<bool>({true, true}));
+  EXPECT_EQ(out_a, a);
+  EXPECT_EQ(out_b, b);
+
+  // Same keys, but with one absent -- must not take the fast path, and must
+  // still resolve "a" correctly.
+  std::vector<char> out_a2(8, 0), out_missing(8, 0);
+  auto partial = client.BatchGetRanges({"a", "missing"},
+                                       {{reinterpret_cast<uintptr_t>(out_a2.data())},
+                                        {reinterpret_cast<uintptr_t>(out_missing.data())}},
+                                       {{8}, {8}}, {{0}, {0}});
+  ASSERT_EQ(partial, std::vector<bool>({true, false}));
+  EXPECT_EQ(out_a2, a);
+
+  // Repeating the all-present set at a DIFFERENT range must still see the
+  // right bytes -- the shape consecutive layer groups actually produce.
+  std::vector<char> tail_a(4, 0), tail_b(4, 0);
+  auto retry = client.BatchGetRanges(
+      {"a", "b"},
+      {{reinterpret_cast<uintptr_t>(tail_a.data())}, {reinterpret_cast<uintptr_t>(tail_b.data())}},
+      {{4}, {4}}, {{4}, {4}});
+  ASSERT_EQ(retry, std::vector<bool>({true, true}));
+  EXPECT_EQ(tail_a, std::vector<char>(a.begin() + 4, a.end()));
+  EXPECT_EQ(tail_b, std::vector<char>(b.begin() + 4, b.end()));
 }
 
 TEST(LocalStorageManagerRangesTest, FullTierEvictsAndRetriesWholeEntry) {

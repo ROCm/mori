@@ -346,6 +346,29 @@ std::vector<bool> StandaloneClient::BatchGetRanges(
     return results;
   }
 
+  // A layer-wise restore hits on every key almost always -- that is the whole
+  // point of prefetching -- so the filter below usually keeps the entire
+  // batch. Checking that first skips copying all four parallel vectors (a
+  // ~128-byte key string apiece, x1023 keys x8 layer groups in the DSv4-Pro
+  // shape) for the case that dominates: pass the caller's own vectors through
+  // by reference instead of building an identical set.
+  bool all_present = true;
+  for (size_t i = 0; i < n; ++i) {
+    if (sizes[i].empty() || !index_.MayExist(keys[i])) {
+      all_present = false;
+      break;
+    }
+  }
+  if (all_present) {
+    auto read_results = storage_.ReadBatchRangesIntoPtr(keys, dsts, sizes, src_offsets);
+    for (size_t i = 0; i < n; ++i) {
+      const bool ok = i < read_results.size() && read_results[i];
+      results[i] = ok;
+      if (!ok && !storage_.Exists(keys[i])) index_.Remove(keys[i]);
+    }
+    return results;
+  }
+
   std::vector<size_t> read_map;
   std::vector<std::string> read_keys;
   std::vector<std::vector<uintptr_t>> read_dsts;
