@@ -9,6 +9,8 @@
 #include <cstring>
 #include <unistd.h>
 
+#include "mori/utils/mori_log.hpp"
+
 namespace mori {
 namespace core {
 
@@ -65,42 +67,45 @@ void ProxyThread::DrainCq(ProxyQpHandle& qph) {
   int n;
   while ((n = ibv_poll_cq(qph.cq, 64, wc)) > 0) {
     for (int i = 0; i < n; i++) {
+      if (wc[i].status != IBV_WC_SUCCESS) {
+        if (wc[i].opcode & IBV_WC_RECV) {
+          MORI_CORE_ERROR("proxy: RECV CQE error status={} ({}) ibvQP={}",
+                         wc[i].status, ibv_wc_status_str(wc[i].status),
+                         qph.qp ? qph.qp->qp_num : 0);
+        } else {
+          uint32_t slot = static_cast<uint32_t>(wc[i].wr_id) & PROXY_RING_MASK;
+          MORI_CORE_ERROR("proxy: CQE error slot={} status={} ({}) wr_id={} ibvQP={}",
+                         slot, wc[i].status, ibv_wc_status_str(wc[i].status), wc[i].wr_id,
+                         qph.qp ? qph.qp->qp_num : 0);
+          ring_->cmds[slot].status = PROXY_ERROR;
+          ops_completed_++;
+        }
+        continue;
+      }
       if (wc[i].opcode == IBV_WC_RECV || wc[i].opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
-        if (wc[i].status == IBV_WC_SUCCESS && wc[i].byte_len >= 16) {
-          uint32_t recv_idx = static_cast<uint32_t>(wc[i].wr_id);
-          if (recv_idx < qph.recv_count && qph.recv_buf) {
-            struct { uint64_t addr; uint64_t val; } payload;
-            memcpy(&payload, reinterpret_cast<char*>(qph.recv_buf) + recv_idx * 64, 16);
-            volatile uint64_t* target = reinterpret_cast<volatile uint64_t*>(payload.addr);
-            __atomic_fetch_add(target, payload.val, __ATOMIC_SEQ_CST);
-            asm volatile("clflush (%0)" :: "r"(target) : "memory");
-            asm volatile("sfence" ::: "memory");
-            ibv_sge rsge{};
-            rsge.addr = reinterpret_cast<uintptr_t>(qph.recv_buf) + recv_idx * 64;
-            rsge.length = 64;
-            rsge.lkey = qph.recv_lkey;
-            ibv_recv_wr rwr{}, *rbad = nullptr;
-            rwr.wr_id = recv_idx;
-            rwr.sg_list = &rsge;
-            rwr.num_sge = 1;
-            ibv_post_recv(qph.qp, &rwr, &rbad);
-          }
-        } else if (wc[i].status != IBV_WC_SUCCESS) {
-          fprintf(stderr, "proxy: RECV CQE error status=%d (%s) ibvQP=%u\n",
-                  wc[i].status, ibv_wc_status_str(wc[i].status),
-                  qph.qp ? qph.qp->qp_num : 0);
+        uint32_t recv_idx = static_cast<uint32_t>(wc[i].wr_id);
+        if (recv_idx < qph.recv_count && qph.recv_buf && wc[i].byte_len >= 16) {
+          struct { uint64_t addr; uint64_t val; } payload;
+          memcpy(&payload, reinterpret_cast<char*>(qph.recv_buf) + recv_idx * 64, 16);
+          if (payload.addr == 0) continue;
+          volatile uint64_t* target = reinterpret_cast<volatile uint64_t*>(payload.addr);
+          __atomic_fetch_add(target, payload.val, __ATOMIC_SEQ_CST);
+          asm volatile("clflush (%0)" :: "r"(target) : "memory");
+          asm volatile("sfence" ::: "memory");
+          ibv_sge rsge{};
+          rsge.addr = reinterpret_cast<uintptr_t>(qph.recv_buf) + recv_idx * 64;
+          rsge.length = 64;
+          rsge.lkey = qph.recv_lkey;
+          ibv_recv_wr rwr{}, *rbad = nullptr;
+          rwr.wr_id = recv_idx;
+          rwr.sg_list = &rsge;
+          rwr.num_sge = 1;
+          ibv_post_recv(qph.qp, &rwr, &rbad);
         }
         continue;
       }
       uint32_t slot = static_cast<uint32_t>(wc[i].wr_id) & PROXY_RING_MASK;
-      if (wc[i].status == IBV_WC_SUCCESS) {
-        ring_->cmds[slot].status = PROXY_COMPLETED;
-      } else {
-        fprintf(stderr, "proxy: CQE error slot=%u status=%d (%s) wr_id=%lu ibvQP=%u\n",
-                slot, wc[i].status, ibv_wc_status_str(wc[i].status), wc[i].wr_id,
-                qph.qp ? qph.qp->qp_num : 0);
-        ring_->cmds[slot].status = PROXY_ERROR;
-      }
+      ring_->cmds[slot].status = PROXY_COMPLETED;
       ops_completed_++;
     }
   }
