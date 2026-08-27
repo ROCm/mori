@@ -78,7 +78,7 @@ def _worker_imports():
     from mori.cco import CCODevCommRequirements, GDA_CONNECTION_NONE
     import mori.cco.device.flydsl as cco
 
-    from helper import sync, fill, zero, read
+    from .helper import sync, fill, zero, read
 
     return dict(
         ctypes=ctypes,
@@ -602,12 +602,9 @@ def _run(worker, world_size, coop_name):
     with open(uid_path, "wb") as f:
         f.write(bytes(uid))
 
-    # This dir holds helper.py; spawned children need it on sys.path to import it.
-    this_dir = os.path.dirname(os.path.abspath(__file__))
-
     torch.multiprocessing.spawn(
         _spawn_entry,
-        args=(worker, world_size, uid_path, coop_name, results_path, this_dir),
+        args=(worker, world_size, uid_path, coop_name, results_path),
         nprocs=world_size,
         join=True,
     )
@@ -621,10 +618,7 @@ def _run(worker, world_size, coop_name):
     assert not errs, "\n\n".join(errs)
 
 
-def _spawn_entry(rank, worker, world_size, uid_path, coop_name, results_path, this_dir):
-    import sys
-
-    sys.path.insert(0, this_dir)  # so the child can import helper
+def _spawn_entry(rank, worker, world_size, uid_path, coop_name, results_path):
     worker(rank, world_size, uid_path, coop_name, results_path)
 
 

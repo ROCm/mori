@@ -104,6 +104,11 @@ CCO_DEV uint64_t cco_lsa_ptr(uint64_t window, int peer, uint64_t offset) {
 
 // System-scope publication fence used by direct LSA benchmark/store paths.
 // Latency kernels fence from block lane 0; bandwidth kernels fence every lane.
+// This primitive is NOT a barrier: callers must synchronize participating
+// threads before entering it. leaderOnly orders only thread 0's operations
+// under the HIP memory model; it must not be used as a general replacement for
+// a release fence issued by every producer lane. It exists for the matched C++
+// and Triton benchmark protocol, which brackets it with block barriers.
 CCO_DEV int cco_system_fence(int leaderOnly) {
   if (!leaderOnly || threadIdx.x == 0) __threadfence_system();
   return 0;

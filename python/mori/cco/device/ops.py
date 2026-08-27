@@ -51,7 +51,12 @@ class SignalOp:
 
 
 class ThreadMode:
-    """How participating lanes contribute to a GDA data-path operation."""
+    """How participating lanes contribute to a GDA data-path operation.
+
+    ``INDEPENDENT`` makes each participating thread issue its own transfer.
+    ``AGGREGATE`` coalesces the warp's lanes into one transfer and is valid only
+    with ``CoopScope.THREAD``; every lane in the warp must enter the operation.
+    """
 
     INDEPENDENT = 0
     AGGREGATE = 1
@@ -120,6 +125,9 @@ _add(
     pure=True,
     family="lsa",
 )
+# Benchmark-only publication primitive. It is not a cooperative barrier:
+# leaderOnly=1 fences thread 0 only, so producers must synchronize first and
+# must not use it as a substitute for a per-lane release fence.
 _add(
     "system_fence",
     "cco_system_fence",

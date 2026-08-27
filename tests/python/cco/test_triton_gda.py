@@ -24,7 +24,7 @@ import os
 
 import pytest
 
-from tests.python.cco.helper import run_triton_example
+from .helper import run_triton_example
 
 
 def test_triton_cco_gda_matrix_single_rail():

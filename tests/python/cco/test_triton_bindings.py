@@ -21,14 +21,37 @@
 # SOFTWARE.
 
 from pathlib import Path
+import re
 import subprocess
 
 import pytest
+import triton
+import triton.language as tl
+from triton.compiler.errors import CompilationError
 
 from mori.cco.device.bitcode import _sdma_enabled, find_cco_bitcode
-from mori.cco.device.ops import CCO_DEVICE_FUNCTIONS
+from mori.cco.device.ops import (
+    CCO_DEVICE_FUNCTIONS,
+    CCO_DEVICE_FUNCTIONS_BY_SYMBOL,
+)
 from mori.ir.triton import cco
 from mori.jit.config import detect_build_config
+
+
+@triton.jit
+def invalid_constexpr_axis_kernel(
+    dev_comm,
+    window,
+    axis: tl.constexpr,
+):
+    if axis == 0:
+        cco.Gda.get(dev_comm, 0, window, 0, window, 0, 8, coop=99)
+    elif axis == 1:
+        cco.Gda.get(dev_comm, 0, window, 0, window, 0, 8, thread_mode=99)
+    elif axis == 2:
+        cco.Gda.signal(dev_comm, 0, signal_op=99)
+    else:
+        cco.Sdma.quiet(dev_comm, 0, coop=-1)
 
 
 def test_all_cco_device_symbols_are_exported_to_triton():
@@ -56,6 +79,33 @@ def test_triton_facades_match_flydsl_handle_names():
     assert {"put", "get", "commit", "quiet", "quiet_queue"} <= set(vars(cco.Sdma))
 
 
+@pytest.mark.parametrize(
+    "axis,error",
+    [
+        (0, "GDA coop must be"),
+        (1, "GDA thread_mode must be"),
+        (2, "GDA signal requires"),
+        (3, "SDMA coop must be"),
+    ],
+)
+def test_triton_facades_reject_invalid_constexpr_axes(axis, error):
+    with pytest.raises(CompilationError) as exc_info:
+        invalid_constexpr_axis_kernel.warmup(
+            0,
+            0,
+            axis=axis,
+            grid=(1,),
+            extern_libs=cco.get_extern_libs(),
+            num_warps=1,
+        )
+    messages = []
+    exc = exc_info.value
+    while exc is not None:
+        messages.append(str(exc))
+        exc = exc.__cause__
+    assert error in "\n".join(messages)
+
+
 def test_cov5_bitcode_contains_every_enabled_wrapper_symbol():
     bitcode = find_cco_bitcode(cov=5)
     cfg = detect_build_config()
@@ -76,6 +126,41 @@ def test_cov5_bitcode_contains_every_enabled_wrapper_symbol():
         if _sdma_enabled() or not meta["family"].startswith("sdma_")
     }
     assert expected <= defined
+
+
+def test_cov5_bitcode_return_types_match_the_declared_abi():
+    bitcode = find_cco_bitcode(cov=5)
+    cfg = detect_build_config()
+    llvm_dis = Path(cfg.opt).with_name("llvm-dis")
+    if not llvm_dis.is_file():
+        pytest.skip(f"llvm-dis not found next to {cfg.opt}")
+
+    result = subprocess.run(
+        [str(llvm_dis), "-o", "-", bitcode],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    pattern = re.compile(
+        r"^\s*define\b.*?\b(?P<ret>void|i\d+)\s+" r"@(?P<symbol>[A-Za-z0-9_.$-]+)\("
+    )
+    definitions = {
+        match.group("symbol"): match.group("ret")
+        for line in result.stdout.splitlines()
+        if (match := pattern.match(line))
+    }
+    expected = {
+        symbol: "i32" if meta["ret"] == "int32" else "i64"
+        for symbol, (_, meta) in CCO_DEVICE_FUNCTIONS_BY_SYMBOL.items()
+        if _sdma_enabled() or not meta["family"].startswith("sdma_")
+    }
+
+    assert expected.keys() <= definitions.keys()
+    assert {
+        symbol: definitions[symbol]
+        for symbol in expected
+        if definitions[symbol] != expected[symbol]
+    } == {}
 
 
 def test_flydsl_and_triton_share_the_same_scalar_abi():

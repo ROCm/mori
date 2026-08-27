@@ -23,7 +23,7 @@
 import pytest
 
 from mori.cco.device.bitcode import _sdma_enabled
-from tests.python.cco.helper import run_triton_example
+from .helper import run_triton_example
 
 
 def test_triton_cco_sdma_matrix():

@@ -559,69 +559,6 @@ If any step shows `[FAIL]`:
   DCQCN fix may need a firmware reset/reboot to take effect — see 3c.
 - Still failing: `sudo docker exec $CONTAINER_NAME bash -c "mori diagnose"`.
 
-### AINIC/Ionic: single-node IBGDA hangs across multiple rails
-
-On some multi-AINIC hosts, the individual HCA rails are active but are not
-locally routable to one another. Automatic topology selection, or an ordered
-multi-device value such as:
-
-```bash
-MORI_RDMA_DEVICES=rocep121s0,rocep9s0,...
-```
-
-can then assign different ranks to different rails. Initialization still looks
-healthy (Ionic loads, QPs connect, and MRs register), but the first device-side
-RDMA put/quiet, put+signal, or CCO barrier hangs. P2P/LSA tests continue to pass.
-
-First compare with a known-good **single-rail** run. Select one active Ionic HCA
-from `ibv_devices`; `rocep9s0` is only an example and must not be hardcoded for
-other hosts. All ranks must receive the same single device name:
-
-```bash
-cd "$MORI_REPO_DIR"
-test -x .venv/bin/python || {
-  echo "Missing $MORI_REPO_DIR/.venv; create or activate the project environment first"
-  exit 1
-}
-
-AINIC_DEV="${AINIC_DEV:-rocep9s0}"  # replace with one active Ionic HCA on this host
-export MORI_SOCKET_IFNAME=lo
-export MORI_DEVICE_NIC=ionic
-export MORI_DISABLE_TOPO=1
-export MORI_RDMA_DEVICES="$AINIC_DEV"
-
-# Basic Triton SHMEM over RDMA, 2 GPUs.
-MORI_DISABLE_P2P=1 timeout 90s \
-  .venv/bin/python -m torch.distributed.run \
-  --standalone --nproc_per_node=2 \
-  examples/shmem/ir/test_triton_shmem.py
-
-# Triton allreduce put+signal over RDMA, 8 GPUs.
-MORI_DISABLE_P2P=1 timeout 180s \
-  .venv/bin/python -m torch.distributed.run \
-  --standalone --nproc_per_node=8 \
-  examples/shmem/ir/test_triton_allreduce.py
-```
-
-For a P2P regression, use the same command with `MORI_DISABLE_P2P=0`.
-Always use the repository `.venv` for these local tests; do not silently fall
-back to system Python or `/opt/venv`, since Torch/Triton and the editable MORI
-build may differ.
-
-Interpretation:
-
-- Single-rail passes but automatic/multi-rail hangs: the Triton/SHMEM RDMA path
-  is working; diagnose rail routing, GID, QoS/PFC, and fabric configuration.
-- Single-rail also hangs: continue with `mori check`, `ib_write_bw`, provider
-  library, firmware, and CQ/QP diagnostics.
-- Mixed hosts may also print missing `libbnxt_re.so` errors while enumerating
-  incidental Broadcom HCAs. Pinning the Ionic HCA removes that noise; it is not
-  the cause when the same single-Ionic run still fails.
-
-This is a correctness workaround, not a multi-rail performance solution:
-sharing one HCA across all ranks limits aggregate bandwidth. Fix the fabric or
-rail-selection policy before re-enabling multiple devices.
-
 ### mlx5 hardware faults (CQ errors / firmware health)
 
 `dmesg` repeating `cq_err_event_notifier: CQ error ..., syndrome 0x2`
@@ -641,15 +578,37 @@ only `4: Warm Reboot` supported — a host reboot is the only recovery path.
 
 ---
 
+## Known environment issues
+
+Some machines are configured in ways that make MORI slow without anything being wrong
+with MORI. The **`known-issues`** skill collects them, with detection commands and fixes.
+
+Worth a look on any newly deployed box, and mandatory reading before debugging a
+performance problem that only shows up on one machine. The most common one:
+
+- **HIP VMM peer traffic silently falls off XGMI** on kernels built without
+  `CONFIG_DMABUF_MOVE_NOTIFY` / `CONFIG_PCI_P2PDMA` (stock Ubuntu 22.04 GA 5.15).
+  Hits `mori-cco` (EPv2) but not `mori-shmem` (EPv1); costs ~9x a2a bandwidth and
+  reports no error. One-line check:
+
+  ```bash
+  grep -E 'CONFIG_(PCI_P2PDMA|DMABUF_MOVE_NOTIFY)=' /boot/config-$(uname -r)
+  ```
+
+  Both must print `=y`. See `.claude/skills/known-issues/SKILL.md`.
+
+---
+
 ## Done — Report Back
 
 - Base image and OS
 - NIC library installed (`libionic` / `libbnxt_re` / mlx5 inbox `libmlx5` + optional `mlnx-tools`/MFT / none)
 - Install mode: source (`pip install .`)
 - GPU arch and NIC type as reported by MORI
-- AINIC test device and whether single-rail versus automatic/multi-rail RDMA passed
 - Kernels: JIT on first use (`~/.mori/jit/`)
 - `mori check` result — include full output, highlight any `[WARN]` or `[FAIL]`
+- Kernel `CONFIG_PCI_P2PDMA` / `CONFIG_DMABUF_MOVE_NOTIFY` — flag it if either is
+  missing (see Known environment issues above)
 - Attach command (working directory set to the MORI source tree):
 
 ```bash

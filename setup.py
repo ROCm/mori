@@ -419,7 +419,7 @@ def _detect_rocm_build_version() -> tuple[str | None, str | None]:
                 subprocess.check_output(
                     [str(hipconfig), "--version"],
                     text=True,
-                    stderr=subprocess.STDOUT,
+                    stderr=subprocess.DEVNULL,
                 )
             )
         except (OSError, subprocess.CalledProcessError):
