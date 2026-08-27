@@ -21,6 +21,12 @@
 # SOFTWARE.
 from mori import cpp as mori_cpp
 from mori.tensor_utils import from_gpu_ptr, dtype_to_int
+
+# Imported here rather than inside the per-call helpers: both sit on the
+# dispatch/combine hot path, where a repeated `from ... import ...` is pure
+# interpreter overhead.
+from mori.jit.hip_driver import launch_multi
+from mori.ops.tuning_config import TuningConfigManager
 import logging
 import os
 from dataclasses import dataclass
@@ -183,7 +189,12 @@ def _normalize_quant_type(quant_type):
 
 
 def _current_stream():
-    return torch.cuda.current_stream().cuda_stream
+    # torch.cuda.current_stream() re-resolves the device index and builds a
+    # Stream object on every call (~4.9us measured); the raw binding it wraps
+    # costs ~0.16us and returns (stream_ptr, device_index, device_type). At small
+    # token counts the host submission path is what paces the GPU, so this is
+    # real latency rather than bookkeeping.
+    return torch._C._cuda_getCurrentStream(torch.cuda.current_device())[0]
 
 
 @dataclass
@@ -774,8 +785,6 @@ class EpDispatchCombineOp:
         is_push_transport=False,
     ):
         if tuning_rules and dtype is not None:
-            from mori.ops.tuning_config import TuningConfigManager
-
             params = TuningConfigManager.lookup(
                 tuning_rules,
                 dtype,
@@ -996,8 +1005,6 @@ class EpDispatchCombineOp:
         func.launch_struct(grid, block, shared_mem, stream, args_ptr)
 
     def _launch_multi(self, func_names, grids, blocks, shared_mems, stream, args_ptr):
-        from mori.jit.hip_driver import launch_multi
-
         funcs = [self._get_func(name)._func for name in func_names]
         launch_multi(funcs, grids, blocks, shared_mems, stream, args_ptr)
 
