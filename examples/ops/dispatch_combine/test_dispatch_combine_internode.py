@@ -47,21 +47,43 @@ _CLI_TO_KERNEL_TYPE_NAME = {
 _FP4_DTYPE = getattr(torch, "float4_e2m1fn_x2", None)
 
 # Relative bandwidth improvement required to update the best config during
-# tuning. Default 0: take any improvement, which is what you want when tuning
-# to find the fastest config. Raise it (e.g. MORI_EP_TUNING_MARGIN=0.02) to
-# trade a little peak performance for stability -- run-to-run spread here is
-# 10-20%, so with no margin the winner is partly whichever config drew the
-# luckiest sample. The median-over-rounds scoring below is the primary defence
-# against that; the margin is a second, optional one.
+# tuning. Default 0: take any improvement. Raise it (e.g.
+# MORI_EP_TUNING_MARGIN=0.02) to require a clearer win before a config
+# replaces the incumbent.
 #
 # An *absolute* GB/s margin (which this used to be) cannot work at all: 1.0
 # GB/s is ~40% of the total spread at 4 tokens, where the whole sweep lives in
 # 2-3 GB/s, and under 2% at large token counts.
 _BW_REL_MARGIN = float(os.environ.get("MORI_EP_TUNING_MARGIN", "0.0"))
 
-# Rounds benchmarked per config during tuning. Scored by median across rounds
-# (not mean) so a single stalled round cannot decide the winner.
-_TUNING_ROUNDS = 9
+# Rounds benchmarked per config during tuning, and the statistic used to score
+# each one. Override with MORI_EP_TUNING_ROUNDS / MORI_EP_TUNING_STAT to
+# experiment without editing this file.
+#
+# Default statistic is the mean, matching --cmd bench's own reporting and
+# matching what main always did: the mean is pulled up hard by a single bad
+# round, so a config with a fine typical case but a heavy worst-case tail
+# cannot win on a lucky sample the way it can under a median.
+#
+# This is not a hypothetical tradeoff. A customer's MI308 production run of
+# the median-scored, no-margin tuner picked larger/more-parallel geometries
+# (up to block=80 warp=16 rdma=53) whose median edged out the baseline while
+# their Worst regressed 30-45% at bs=16/32, with Best essentially unchanged --
+# the exact signature median-blind-to-tail selection produces, and not one
+# environment noise alone would produce (noise would not spare Best while
+# inflating Worst for one selection method only). A full-sweep sanity check
+# on an idle 2x8 MI300X pair (no contention, different SKU) did not reproduce
+# the same magnitude, so treat the mechanism as demonstrated and the exact
+# severity as hardware/load dependent, not as bounded by that check.
+#
+# MORI_EP_TUNING_STAT=median restores the previous behaviour for anyone who
+# still wants resistance to a single stalled round instead of tail-awareness.
+_TUNING_ROUNDS = int(os.environ.get("MORI_EP_TUNING_ROUNDS", "9"))
+_TUNING_STAT = os.environ.get("MORI_EP_TUNING_STAT", "mean")
+if _TUNING_STAT not in ("mean", "median"):
+    raise ValueError(
+        f"MORI_EP_TUNING_STAT must be 'mean' or 'median', got {_TUNING_STAT!r}"
+    )
 
 
 def _beats(new_bw, new_cfg, best_bw, best_cfg):
@@ -1536,15 +1558,18 @@ class EpDispatchCombineTestCase:
                     # kept: (rounds, world_size, 6)
                     # cols: d_rdma, d_xgmi, d_lat, c_rdma, c_xgmi, c_lat
 
-                    # Selection: per-rank median across kept rounds, min rank.
-                    # Median (not mean) so one stalled round cannot decide a config.
-                    rank_meds = kept.median(dim=0).values  # (world_size, 6)
-                    if is_ll_kernel:
-                        disp_bw = (rank_meds[:, 1] * ll_scale).min().item()
-                        comb_bw = (rank_meds[:, 4] * ll_scale).min().item()
+                    # Selection: per-rank stat across kept rounds, min rank. See
+                    # _TUNING_STAT above for why mean is the default.
+                    if _TUNING_STAT == "median":
+                        rank_stat = kept.median(dim=0).values  # (world_size, 6)
                     else:
-                        disp_bw = rank_meds[:, 0].min().item()
-                        comb_bw = rank_meds[:, 3].min().item()
+                        rank_stat = kept.mean(dim=0)  # (world_size, 6)
+                    if is_ll_kernel:
+                        disp_bw = (rank_stat[:, 1] * ll_scale).min().item()
+                        comb_bw = (rank_stat[:, 4] * ll_scale).min().item()
+                    else:
+                        disp_bw = rank_stat[:, 0].min().item()
+                        comb_bw = rank_stat[:, 3].min().item()
 
                     # Stats via shared code (same as bench PrettyTable)
                     disp_stats = self._build_phase_stats(kept, 0, 1, 2, ll_scale)
