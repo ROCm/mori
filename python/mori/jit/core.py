@@ -121,6 +121,7 @@ def _hipcc_device_bc(
         *_nic_defines(),
         *_ccqe_defines(),
         *_profiler_defines(),
+        *_tunable_defines(),
         *(extra_defines or []),
     ]
     for d in include_dirs:
