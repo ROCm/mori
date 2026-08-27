@@ -1289,10 +1289,14 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs<T>
     if (nodeCount > 0) nodeCount -= 1;
     if (nodeCount == 0) continue;
 
-    // int warpsPerToken = (rdmaWarpNum + nodeCount - 1) / nodeCount;
-    // NOTE: Using a fixed value of 4 for warpsPerToken instead of the dynamic formula above is
-    // an intentional tuning choice.
-    int warpsPerToken = 4;
+    // Split each relayed token across more warps. nodeCount here is the chunk-rounded count
+    // (the sender signals numChunks*warpSize+1), so it is 64 whenever a rank sends a single
+    // chunk -- which is every shape in the low-latency regime. That is why the dynamic formula
+    // above, which divides by nodeCount, can never produce anything but 2 and was replaced by a
+    // constant: it was measuring the padding, not the tokens. With rdmaWarpNum = 128 and ~8 real
+    // tokens, a split of 4 leaves 96 of 128 warps idle while the other 32 each drag 8 sources x
+    // 12KB across the XGMI aperture.
+    int warpsPerToken = 8;
     size_t hiddenDimPerWarp = (hiddenDim + warpsPerToken - 1) / warpsPerToken;
 
     for (int i = globalWarpId; i < (nodeCount * warpsPerToken); i += rdmaWarpNum) {
