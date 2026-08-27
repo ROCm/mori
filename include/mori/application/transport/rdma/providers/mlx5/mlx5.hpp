@@ -137,20 +137,11 @@ class Mlx5DeviceContext : public RdmaDeviceContext {
   virtual void ConnectEndpoint(const RdmaEndpointHandle& local, const RdmaEndpointHandle& remote,
                                uint32_t qpId = 0) override;
 
-  struct ProxyRecvInfo { void* buf{nullptr}; uint32_t lkey{0}; uint32_t count{0}; };
-  ProxyRecvInfo GetProxyRecvInfo(uint32_t qpn) {
-    auto it = proxyRecvInfo.find(qpn);
-    return (it != proxyRecvInfo.end()) ? it->second : ProxyRecvInfo{};
-  }
-
  private:
   uint32_t pdn;
-  bool proxyEnabled{false};
 
   std::unordered_map<uint32_t, std::unique_ptr<Mlx5CqContainer>> cqPool;
   std::unordered_map<uint32_t, std::unique_ptr<Mlx5QpContainer>> qpPool;
-  std::unordered_map<uint32_t, ibv_qp*> proxyQpPool;
-  std::unordered_map<uint32_t, ProxyRecvInfo> proxyRecvInfo;
 };
 
 class Mlx5Device : public RdmaDevice {

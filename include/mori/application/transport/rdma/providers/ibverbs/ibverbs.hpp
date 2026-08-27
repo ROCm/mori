@@ -39,11 +39,15 @@ class IBVerbsDeviceContext : public RdmaDeviceContext {
                                uint32_t qpId = 0) override;
   bool DestroyRdmaEndpointNoThrow(const RdmaEndpoint&) noexcept override;
 
+  struct ProxyRecvInfo { void* buf; uint32_t lkey; uint32_t count; };
+  ProxyRecvInfo GetProxyRecvInfo(uint32_t qpn) const;
+
  private:
   mutable std::mutex poolMu;
   std::unordered_map<void*, ibv_cq*> cqPool;
   std::unordered_map<uint32_t, ibv_qp*> qpPool;
   std::vector<ibv_comp_channel*> compChPool;
+  std::unordered_map<uint32_t, ProxyRecvInfo> proxyRecvInfo;
 };
 
 class IBVerbsDevice : public RdmaDevice {

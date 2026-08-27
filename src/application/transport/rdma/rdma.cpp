@@ -697,21 +697,21 @@ RdmaDevice* RdmaContext::RdmaDeviceFactory(ibv_device* inDevice) {
   } else if (backendType == RdmaBackendType::DirectVerbs) {
     switch (device_attr_ex.orig_attr.vendor_id) {
       case (static_cast<uint32_t>(RdmaDeviceVendorId::Mellanox)):
-        if (!Mlx5DvApi::Available() && !env::IsEnvVarEnabled("MORI_EP_OVER_RDMA")) {
+        if (!Mlx5DvApi::Available()) {
           MORI_APP_ERROR("MLX5 device detected but libmlx5.so not available at runtime");
           return nullptr;
         }
         return new Mlx5Device(inDevice);
         break;
       case (static_cast<uint32_t>(RdmaDeviceVendorId::Broadcom)):
-        if (!BnxtDvApi::Available() && !env::IsEnvVarEnabled("MORI_EP_OVER_RDMA")) {
+        if (!BnxtDvApi::Available()) {
           MORI_APP_ERROR("BNXT device detected but libbnxt_re.so not available at runtime");
           return nullptr;
         }
         return new BnxtDevice(inDevice);
         break;
       case (static_cast<uint32_t>(RdmaDeviceVendorId::Pensando)):
-        if (!IonicDvApi::Available() && !env::IsEnvVarEnabled("MORI_EP_OVER_RDMA")) {
+        if (!IonicDvApi::Available()) {
           MORI_APP_ERROR("IONIC device detected but libionic.so not available at runtime");
           return nullptr;
         }

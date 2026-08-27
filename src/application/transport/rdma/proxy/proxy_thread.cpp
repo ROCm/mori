@@ -21,6 +21,23 @@ void ProxyThread::Init(ProxyRing* ring, std::vector<ProxyQpHandle> qps, int gpuI
   ops_posted_ = 0;
   ops_completed_ = 0;
   gpu_id_ = gpuId;
+
+  // Post initial recv WRs for SEND_WITH_IMM barrier atomic emulation.
+  for (auto& qph : qps_) {
+    if (qph.qp && qph.recv_buf && qph.recv_count > 0) {
+      for (uint32_t r = 0; r < qph.recv_count; r++) {
+        ibv_sge rsge{};
+        rsge.addr = reinterpret_cast<uintptr_t>(qph.recv_buf) + r * 64;
+        rsge.length = 64;
+        rsge.lkey = qph.recv_lkey;
+        ibv_recv_wr rwr{}, *rbad = nullptr;
+        rwr.wr_id = r;
+        rwr.sg_list = &rsge;
+        rwr.num_sge = 1;
+        ibv_post_recv(qph.qp, &rwr, &rbad);
+      }
+    }
+  }
 }
 
 void ProxyThread::Start() {
