@@ -792,18 +792,40 @@ __device__ void EpCombine1250xBody(EpArgs args) {
 
   EpMultiWarpIter mwIter(globalWarpNum, args.numTokens, hiddenDim);
 
-  constexpr int _cPullChunks = MORI_COMB_TDM;
   constexpr bool _cPullType = (sizeof(TokT) == 2 || sizeof(TokT) == 4);
   const int _cPullRowElems = 128 / (int)sizeof(TokT);
-  const int _cPullSrcMax = (npes <= 4 && npes < topk) ? npes : topk;
+  // Slots per warp. Dispatch already deduped (see ep_intranode_kernel.hpp), so a
+  // token reaches at most npes distinct ranks and never more than topk of them.
+  // Past npes >= topk this saturates at topk and stops tracking world size,
+  // which is what lets one budget cover EP4 through EP64 with one expression.
+  const int _cPullSrcMax = (npes < topk) ? npes : topk;
+  const size_t _cPullPtrBytes =
+      ((((size_t)(1 + (kCfg.useWeights ? 1 : 0)) * warpNum * topk * sizeof(void*)) + 127) &
+       ~(size_t)127);
+  // Solve for the tile rather than assume one. With a fixed chunk count the need
+  // is warpNum * srcMax * (hidden / TDM) * sizeof, which crosses the budget once
+  // srcMax passes 4 -- and crossing it costs 7x, because the fallback reads peer
+  // memory one element at a time with the fabric latency exposed. Chunking finer
+  // always fits: the floor is one row per slot, 8 KB at warp 8 with 8 slots. So
+  // after this the fallback is reachable only by dtype, never by world size.
+  // MORI_COMB_TDM stays the floor, so any shape that already fit is untouched.
+  const size_t _cPullSlotBytes =
+      ((size_t)MORI_COMB_LDS_BUDGET > _cPullPtrBytes)
+          ? ((size_t)MORI_COMB_LDS_BUDGET - _cPullPtrBytes) /
+                ((size_t)warpNum * (size_t)_cPullSrcMax)
+          : 0;
+  const int _cPullTileCap = (int)(_cPullSlotBytes / sizeof(TokT)) & ~(_cPullRowElems - 1);
+  const int _cPullFitChunks = (_cPullTileCap >= _cPullRowElems)
+                                  ? (((int)hiddenDim + _cPullTileCap - 1) / _cPullTileCap)
+                                  : MORI_COMB_TDM;
+  const int _cPullChunks =
+      (MORI_COMB_TDM > _cPullFitChunks) ? MORI_COMB_TDM : _cPullFitChunks;
   const int _cPullTileElems =
       (((int)((hiddenDim + _cPullChunks - 1) / _cPullChunks) + _cPullRowElems - 1) /
        _cPullRowElems) *
       _cPullRowElems;
   const size_t _cPullLdsNeed =
-      ((((size_t)(1 + (kCfg.useWeights ? 1 : 0)) * warpNum * topk * sizeof(void*)) + 127) &
-       ~(size_t)127) +
-      (size_t)warpNum * _cPullSrcMax * _cPullTileElems * sizeof(TokT);
+      _cPullPtrBytes + (size_t)warpNum * _cPullSrcMax * _cPullTileElems * sizeof(TokT);
   const bool _cPullOk = _cPullType && ((int)hiddenDim >= _cPullRowElems) &&
                         (_cPullTileElems >= _cPullRowElems) &&
                         (_cPullLdsNeed <= (size_t)MORI_COMB_LDS_BUDGET);
