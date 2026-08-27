@@ -145,7 +145,11 @@ _TUNING_CONFIGS_DIR = Path(__file__).parent / "tuning_configs"
 # tuning run that finds something faster actually persists it. Set
 # MORI_EP_TUNING_MARGIN to require a real margin instead, which keeps the
 # checked-in JSON from churning when a re-tune only lands higher on noise.
-_SAVE_REL_MARGIN = float(os.environ.get("MORI_EP_TUNING_MARGIN", "0.0"))
+#
+# `os.environ.get(k, default)` only substitutes default when the var is
+# *unset* -- MORI_EP_TUNING_MARGIN="" would reach float("") and crash, so
+# fall back on an empty string too.
+_SAVE_REL_MARGIN = float(os.environ.get("MORI_EP_TUNING_MARGIN") or "0.0")
 
 _gpu_model_cache: str | None = None
 _gpu_model_detected: bool = False

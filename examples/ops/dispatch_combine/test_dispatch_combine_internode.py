@@ -52,7 +52,11 @@ _FP4_DTYPE = getattr(torch, "float4_e2m1fn_x2", None)
 # fixed threshold cannot work across the whole operating range (e.g. a 1.0
 # GB/s bandwidth margin used to be ~40% of the sweep's spread at 4 tokens
 # but under 2% at large ones).
-_TUNING_MARGIN = float(os.environ.get("MORI_EP_TUNING_MARGIN", "0.0"))
+#
+# `os.environ.get(k, default)` only substitutes default when the var is
+# *unset* -- MORI_EP_TUNING_MARGIN="" would reach float("") and crash at
+# import time, so fall back on an empty string too.
+_TUNING_MARGIN = float(os.environ.get("MORI_EP_TUNING_MARGIN") or "0.0")
 
 # Rounds benchmarked per candidate during tuning. Default matches main's
 # longstanding hardcoded value; override with MORI_EP_TUNING_ROUNDS. (This used
@@ -60,7 +64,16 @@ _TUNING_MARGIN = float(os.environ.get("MORI_EP_TUNING_MARGIN", "0.0"))
 # experiment that wanted more samples to resist a single stalled round. Now
 # that selection is back to mean (see _beats), that extra defense isn't doing
 # anything for us, so there's no reason to pay the ~1.8x longer sweep.)
-_TUNING_ROUNDS = int(os.environ.get("MORI_EP_TUNING_ROUNDS", "5"))
+_TUNING_ROUNDS = int(os.environ.get("MORI_EP_TUNING_ROUNDS") or "5")
+if _TUNING_ROUNDS < 2:
+    # tuning_dispatch_combine drops round 0 as in-loop warmup (`kept =
+    # all_data[1:]`, matching what bench does); at 1 round that leaves an
+    # empty tensor and _compute_stats' .min()/.max()/.mean() blow up with a
+    # shape error that says nothing about rounds being the cause.
+    raise ValueError(
+        f"MORI_EP_TUNING_ROUNDS must be >= 2 (round 0 is dropped as warmup), "
+        f"got {_TUNING_ROUNDS}"
+    )
 
 
 def _beats(new_lat, new_cfg, best_lat, best_cfg):
@@ -73,30 +86,47 @@ def _beats(new_lat, new_cfg, best_lat, best_cfg):
     on paper yet look worse in the printed table it was supposedly chosen
     from; using the printed number for both closes that gap by construction.
 
-    Wins outright past the margin; within it, ties break on smaller
-    block_num so re-tuning the same hardware is deterministic.
+    Wins outright past the margin; within it, ties break on the
+    lexicographically smaller (block_num, warp_per_block, rdma_block_num)
+    tuple so re-tuning the same hardware is deterministic regardless of sweep
+    order. (Comparing only new_cfg[0] here used to be equivalent to a no-op:
+    the sweep visits block_num in ascending order, so a later candidate's
+    block_num is never smaller than the incumbent's -- the full-tuple
+    comparison actually does the tie-break instead of relying on visitation
+    order, so this keeps working if the sweep is ever parallelized.)
     """
     if best_cfg is None:
         return True
     if new_lat < best_lat * (1.0 - _TUNING_MARGIN):
         return True
-    if new_lat <= best_lat * (1.0 + _TUNING_MARGIN) and new_cfg[0] < best_cfg[0]:
+    if new_lat <= best_lat * (1.0 + _TUNING_MARGIN) and new_cfg < best_cfg:
         return True
     return False
 
 
 def _headline_bw(stats, kernel_type):
-    """The winner's own avg bandwidth, for the JSON's top-level bandwidth_gbps.
+    """The winner's own bandwidth, for the JSON's top-level bandwidth_gbps.
 
     Selection no longer runs on bandwidth (see _beats), but the saved config
     still wants one representative bandwidth number; per-metric averages
     (rdma/xgmi/ll) are saved alongside it regardless of kernel type.
+
+    Deliberately the slowest-rank mean (stats["*_worst_rank"]), not the
+    grand-mean stats["rdma"/"ll"][2] this file prints as "Average":
+    tuning_config.save_tuning_result gates overwriting an existing rule on
+    `new_bw > old_bw`, and every rule already on disk (including ones this PR
+    doesn't touch, e.g. other GPU models/kernel types) was written under the
+    old, main-derived definition of bandwidth_gbps -- slowest-rank mean
+    bandwidth. Saving the grand mean instead would systematically read higher
+    than a same-performance old entry (grand mean >= slowest-rank mean by
+    construction) and silently overwrite still-good rules on the first re-tune
+    with this code, even with zero real improvement.
     """
     is_ll_kernel = kernel_type in (
         mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
         mori.ops.EpDispatchCombineKernelType.AsyncLL,
     )
-    return stats["ll"][2] if is_ll_kernel else stats["rdma"][2]
+    return stats["ll_worst_rank"] if is_ll_kernel else stats["rdma_worst_rank"]
 
 
 def _perf_report():
@@ -1350,16 +1380,22 @@ class EpDispatchCombineTestCase:
     def _build_phase_stats(self, kept, col_rdma, col_xgmi, col_lat, ll_scale):
         """Compute (worst, best, avg) stats for one phase from gathered data.
 
-        Returns dict with keys rdma, xgmi, ll, lat — each a (worst, best, avg) tuple.
-        Uses the same ``_compute_stats`` as PrettyTable, so values are identical.
+        Returns dict with keys rdma, xgmi, ll, lat — each a (worst, best, avg)
+        tuple identical to what PrettyTable prints — plus rdma_worst_rank and
+        ll_worst_rank (see _headline_bw for why those need to exist alongside
+        the grand-mean numbers above).
         """
         _s = self._compute_stats
         xgmi_s = _s(kept[:, :, col_xgmi])
+        rdma_worst_rank = kept[:, :, col_rdma].mean(dim=0).min().item()
+        xgmi_worst_rank = kept[:, :, col_xgmi].mean(dim=0).min().item()
         return {
             "rdma": _s(kept[:, :, col_rdma]),
             "xgmi": xgmi_s,
             "ll": tuple(v * ll_scale for v in xgmi_s),
             "lat": _s(kept[:, :, col_lat]),
+            "rdma_worst_rank": rdma_worst_rank,
+            "ll_worst_rank": xgmi_worst_rank * ll_scale,
         }
 
     @staticmethod
@@ -1504,6 +1540,8 @@ class EpDispatchCombineTestCase:
             "xgmi": (0, 0, 0),
             "ll": (0, 0, 0),
             "lat": (0, 0, 0),
+            "rdma_worst_rank": 0,
+            "ll_worst_rank": 0,
         }
         best_disp_stats = dict(_zero_stats)
         best_comb_stats = dict(_zero_stats)
