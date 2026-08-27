@@ -809,17 +809,15 @@ __device__ void EpCombine1250xBody(EpArgs args) {
   // always fits: the floor is one row per slot, 8 KB at warp 8 with 8 slots. So
   // after this the fallback is reachable only by dtype, never by world size.
   // MORI_COMB_TDM stays the floor, so any shape that already fit is untouched.
-  const size_t _cPullSlotBytes =
-      ((size_t)MORI_COMB_LDS_BUDGET > _cPullPtrBytes)
-          ? ((size_t)MORI_COMB_LDS_BUDGET - _cPullPtrBytes) /
-                ((size_t)warpNum * (size_t)_cPullSrcMax)
-          : 0;
+  const size_t _cPullSlotBytes = ((size_t)MORI_COMB_LDS_BUDGET > _cPullPtrBytes)
+                                     ? ((size_t)MORI_COMB_LDS_BUDGET - _cPullPtrBytes) /
+                                           ((size_t)warpNum * (size_t)_cPullSrcMax)
+                                     : 0;
   const int _cPullTileCap = (int)(_cPullSlotBytes / sizeof(TokT)) & ~(_cPullRowElems - 1);
   const int _cPullFitChunks = (_cPullTileCap >= _cPullRowElems)
                                   ? (((int)hiddenDim + _cPullTileCap - 1) / _cPullTileCap)
                                   : MORI_COMB_TDM;
-  const int _cPullChunks =
-      (MORI_COMB_TDM > _cPullFitChunks) ? MORI_COMB_TDM : _cPullFitChunks;
+  const int _cPullChunks = (MORI_COMB_TDM > _cPullFitChunks) ? MORI_COMB_TDM : _cPullFitChunks;
   const int _cPullTileElems =
       (((int)((hiddenDim + _cPullChunks - 1) / _cPullChunks) + _cPullRowElems - 1) /
        _cPullRowElems) *
