@@ -509,6 +509,118 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
   }
 }
 
+// One relayed (token, expert) item: wait for its chunk to land, work out where it belongs, and
+// claim the destination slot. Split out of DispatchInterNodeLLRecv so the copy that follows can
+// either run on the same warp or, when the block owns few enough items, be shared by the whole
+// block. Returns false when there is nothing to forward.
+template <typename T>
+inline __device__ bool DispatchInterNodeLLResolveItem(EpDispatchCombineArgs<T>& args, int item,
+                                                      uint8_t* stagingPtr, uint64_t* chunkFlag,
+                                                      uint64_t* nodeRecvTokenNum, int maxChunkNum,
+                                                      int& globalTokenId, int& destPe,
+                                                      int& destTokId, int& localPeTokenCounter) {
+  DEF_COMMON_VARS;
+  int expertId = item % config.numExpertPerToken;
+  int tokenId = item / config.numExpertPerToken % config.MaxNumTokensToSendPerRank();
+  int nodeId = item / config.numExpertPerToken / config.MaxNumTokensToSendPerRank();
+
+  int node = (myNode + 1 + nodeId) % nNodes;
+  int k = tokenId / warpSize;
+  int startTokenIdx = k * warpSize;
+
+  uint64_t thisChunkTokenNum = 0;
+  index_t nodeFlag = 0;
+  if (laneId == 0) {
+    while (1) {
+      thisChunkTokenNum = core::AtomicLoadRelaxedSystem(&chunkFlag[node * maxChunkNum + k]);
+      if (thisChunkTokenNum > 0) break;
+
+      nodeFlag = core::AtomicLoadRelaxedSystem(&nodeRecvTokenNum[node]);
+      if ((nodeFlag > 0) && (startTokenIdx >= (nodeFlag - 1))) {
+        thisChunkTokenNum = 1;
+        break;
+      }
+    }
+  }
+  thisChunkTokenNum = __shfl(thisChunkTokenNum, 0) - 1;
+  int endTokenIdx = startTokenIdx + thisChunkTokenNum;
+  globalTokenId = SendBufSlotOffset(config, node, tokenId);
+  if (tokenId >= endTokenIdx) return false;
+
+  index_t* indices =
+      reinterpret_cast<index_t*>(stagingPtr + globalTokenId * xferBytes + hiddenBytes);
+  int lanePe = -1;
+  if (laneId < config.numExpertPerToken) {
+    lanePe = indices[laneId] / config.numExpertPerRank;
+    assert((lanePe < config.worldSize) && (lanePe >= 0));
+  }
+  index_t srcTokId =
+      reinterpret_cast<index_t*>(stagingPtr + globalTokenId * xferBytes + hiddenBytes + indexBytes +
+                                 weightBytes + scaleBytes)[0];
+
+  destPe = __shfl(lanePe, expertId);
+  int destNode = destPe / config.gpuPerNode;
+  // HSA-RCA Signature 1 guard (mirror of the :396 site): out-of-range destPe
+  // (assert at :493 stripped under NDEBUG) is dropped instead of writing OOB.
+  bool peOutOfRange = (destPe < 0) || (destPe >= config.worldSize);
+  bool shouldSkip =
+      peOutOfRange || (destNode != myNode) || __any((laneId < expertId) && (destPe == lanePe));
+  if (shouldSkip) {
+    if (laneId == 0)
+      args.interNodeDispDestTokIdMap[globalTokenId * config.numExpertPerToken + expertId] =
+          NullFlatTokenIndex(config);
+    return false;
+  }
+
+  destTokId = 0;
+  if (laneId == 0) {
+    destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
+    assert(destTokId < config.MaxNumTokensToRecv() &&
+           "Total recv token overflow: increase maxTotalRecvTokens");
+    args.interNodeDispDestTokIdMap[globalTokenId * config.numExpertPerToken + expertId] =
+        FlatTokenIndex(config, destPe, destTokId);
+    args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] = srcTokId;
+  }
+  if ((destPe % config.gpuPerNode) == laneId) localPeTokenCounter++;
+  destTokId = __shfl(destTokId, 0);
+  return true;
+}
+
+// Move one item's payload. [off, off+len) is the slice of the hidden vector this warp owns;
+// the index/weight/scale tail rides along with the first slice only.
+template <typename T>
+inline __device__ void DispatchInterNodeLLCopyItem(EpDispatchCombineArgs<T>& args,
+                                                   uint8_t* stagingPtr, int globalTokenId,
+                                                   int destPe, int destTokId, size_t off,
+                                                   size_t len, bool copyMeta) {
+  DEF_COMMON_VARS;
+  if (len > 0) {
+    core::WarpCopy<uint8_t, 4>(args.interNodeV1TokBufs.dispatchOut->template GetAs<uint8_t*>(destPe) +
+                                   destTokId * hiddenBytes + off,
+                               stagingPtr + globalTokenId * xferBytes + off, len);
+  }
+  if (!copyMeta) return;
+  core::WarpCopy<uint8_t, 4>(
+      args.shmemOutIndicesMemObj->template GetAs<uint8_t*>(destPe) + destTokId * indexBytes,
+      stagingPtr + globalTokenId * xferBytes + hiddenBytes, indexBytes);
+  core::WarpCopy<uint8_t, 4>(
+      args.shmemDispatchOutWeightsMemObj->template GetAs<uint8_t*>(destPe) +
+          destTokId * weightBytes,
+      stagingPtr + globalTokenId * xferBytes + hiddenBytes + indexBytes, weightBytes);
+  if (scaleBytes > 0) {
+    core::WarpCopy<uint8_t, 4>(
+        args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destTokId * scaleBytes,
+        stagingPtr + globalTokenId * xferBytes + hiddenBytes + indexBytes + weightBytes,
+        scaleBytes);
+  }
+}
+
+// Most relay items fit in a handful of blocks, so give each block a contiguous run of them,
+// resolve one per warp, then let every warp of the block carry a slice of every item's payload.
+// The sync that makes that safe is __syncthreads(), not a grid barrier -- an earlier attempt at
+// the same idea used a whole-grid barrier and cost more than the copy it parallelised.
+constexpr int kMaxBlockRelayItems = 8;
+
 template <typename T>
 inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
@@ -523,6 +635,63 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs<T>& args) {
   uint8_t* stagingPtr = args.interNodeV1TokBufs.dispatchInp->template GetAs<uint8_t*>();
 
   int localPeTokenCounter = 0;
+
+  int itemsTotal = config.MaxNumTokensToSendPerRank() * config.numExpertPerToken * (nNodes - 1);
+  int itemsPerBlock = core::CeilDiv(itemsTotal, args.rdmaBlockNum);
+  // Only when a block owns a single item: then there is nothing to serialise inside the block
+  // and the warps it shares the payload with were provably idle. As soon as a block owns two,
+  // it would have to resolve both -- and so wait for the later chunk to arrive -- before copying
+  // either, which is exactly the pipelining an earlier attempt at this lost 8% to.
+  // Grid-uniform, so __syncthreads() below is reached by every thread of every relay block.
+  bool blockSplit = (warpNum > 1) && (itemsPerBlock == 1);
+
+  if (blockSplit) {
+    extern __shared__ char sharedMem[];
+    int* itemGlobalTokenId = reinterpret_cast<int*>(sharedMem);
+    int* itemDestPe = itemGlobalTokenId + kMaxBlockRelayItems;
+    int* itemDestTokId = itemDestPe + kMaxBlockRelayItems;
+
+    int itemBegin = blockId * itemsPerBlock;
+    int itemCount = std::min(itemsPerBlock, std::max(itemsTotal - itemBegin, 0));
+
+    for (int j = warpId; j < itemCount; j += warpNum) {
+      int g = 0, pe = 0, tok = 0;
+      bool ok = DispatchInterNodeLLResolveItem(args, itemBegin + j, stagingPtr, chunkFlag,
+                                               nodeRecvTokenNum, maxChunkNum, g, pe, tok,
+                                               localPeTokenCounter);
+      if (laneId == 0) {
+        itemGlobalTokenId[j] = g;
+        itemDestPe[j] = ok ? pe : -1;
+        itemDestTokId[j] = tok;
+      }
+    }
+    __syncthreads();
+
+    // Keep each slice a whole number of WarpCopy<,4> granules: splitting off a ragged tail drops
+    // straight off that fast path and is slower than not splitting at all.
+    constexpr size_t kGranule = 4096;
+    size_t sliceBytes = core::CeilDiv(hiddenBytes, static_cast<size_t>(warpNum));
+    sliceBytes = (sliceBytes + kGranule - 1) & ~(kGranule - 1);
+    if (sliceBytes == 0) sliceBytes = hiddenBytes;
+    int slicePerItem = static_cast<int>(core::CeilDiv(hiddenBytes, sliceBytes));
+
+    for (int s = warpId; s < itemCount * slicePerItem; s += warpNum) {
+      int j = s / slicePerItem;
+      int slice = s % slicePerItem;
+      int pe = itemDestPe[j];
+      if (pe < 0) continue;
+      size_t off = static_cast<size_t>(slice) * sliceBytes;
+      size_t len = (off < hiddenBytes) ? std::min(sliceBytes, hiddenBytes - off) : size_t{0};
+      DispatchInterNodeLLCopyItem(args, stagingPtr, itemGlobalTokenId[j], pe, itemDestTokId[j], off,
+                                  len, slice == 0);
+    }
+
+    if (laneId < config.gpuPerNode) {
+      int destPe = myNode * config.gpuPerNode + laneId;
+      atomicAdd(args.destPeTokenCounter + destPe, localPeTokenCounter);
+    }
+    return;
+  }
 
   // expert -> token -> node
   for (int i = globalWarpId;
