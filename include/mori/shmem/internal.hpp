@@ -130,7 +130,7 @@ struct GpuStates {
   application::SymmMemObj* heapObj{nullptr};  // Pointer to the heap's SymmMemObj on device
   uint64_t* internalSyncPtr{nullptr};         // Pointer to the internal synchronization object
 
-  // Proxy fields — used when MORI_EP_OVER_RDMA=1
+  // Proxy fields — used when MORI_ENABLE_HOST_PROXY=1
   uint64_t _proxyPad{0};  // alignment padding
   core::ProxyRing* proxyRings[core::PROXY_MAX_NICS]{};
   uint32_t proxyQuietHead[core::PROXY_MAX_NICS]{};
