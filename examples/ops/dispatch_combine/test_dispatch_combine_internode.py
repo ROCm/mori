@@ -46,6 +46,11 @@ _CLI_TO_KERNEL_TYPE_NAME = {
 
 _FP4_DTYPE = getattr(torch, "float4_e2m1fn_x2", None)
 
+# Zero-copy combine input: the caller owns combineInp and writes its expert outputs straight
+# into it, so CombineSync has nothing to stage. Emulates what a real MoE does when its GEMM
+# writes into mori's registered buffer.
+_ZERO_COPY_COMBINE = os.environ.get("MORI_ZERO_COPY_COMBINE", "0") == "1"
+
 # Relative improvement a candidate needs to replace the current best during
 # tuning. Default 0 (any improvement wins); raise via MORI_EP_TUNING_MARGIN
 # for a clearer-win requirement. Must be relative, not an absolute unit: a
@@ -476,6 +481,7 @@ class EpDispatchCombineTestCase:
             max_token_type_size=2,
             kernel_type=kernel_type_map[kernel_type],
             gpu_per_node=self.gpu_per_node,
+            use_external_inp_buf=not _ZERO_COPY_COMBINE,
             rdma_block_num=64,
             num_qp_per_pe=num_qp,
             quant_type=quant_type,
@@ -1131,6 +1137,16 @@ class EpDispatchCombineTestCase:
                 torch.cuda.synchronize()
                 total_recv_num_token = dispatch_recv_num_token[0].item()
             combine_input = self._convert_for_combine(dispatch_output)
+            if _ZERO_COPY_COMBINE:
+                # Seed mori's registered buffer once. The bench feeds the same tokens every
+                # iteration, so a real caller's per-iteration GEMM write is already accounted
+                # for outside the combine window -- what the timed loop must not contain is
+                # mori staging a copy the caller already made.
+                reg = op.get_registered_combine_input_buffer(
+                    combine_input.dtype, combine_input.shape[1]
+                )
+                reg[: combine_input.shape[0]].copy_(combine_input)
+                combine_input = reg[: combine_input.shape[0]]
             combine_output, combine_output_weight = self.run_combine(
                 op,
                 combine_input,

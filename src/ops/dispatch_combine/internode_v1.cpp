@@ -960,26 +960,37 @@ inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
   // only warp 0 of the first 28 blocks has work, and 28 warps out of 2432 carry every copy.
   // Split by (token, hidden slice) over the whole grid instead -- the same fix DispatchIntraNode
   // needed.
-  MultiWarpIter mwIter(globalWarpNum, totalRecvTokenNum, hiddenDim);
-#ifndef ENABLE_STANDARD_MOE_ADAPT
-  for (int i = globalWarpId; i < (totalRecvTokenNum * mwIter.warpsPerItem); i += globalWarpNum) {
-    int tokenId, inTokenPartId;
-    size_t hiddenDimOffset, hiddenDimSize;
-    mwIter.Decode(i, tokenId, inTokenPartId, hiddenDimOffset, hiddenDimSize);
-    if (hiddenDimSize == 0) continue;
+  // Zero-copy combine input: when the caller owns combineInp -- it asked for the buffer with
+  // get_registered_combine_input_buffer() and wrote its expert outputs straight into it -- there
+  // is nothing to stage, and staging would overwrite what the caller put there. IntraNode
+  // already honours useExternalInpBuffer this way; InterNodeV1/V1LL did not, which made that
+  // accessor unusable on the internode path. Borrowed from XG-zheng's zxg/low_latency_ep.
+  bool stageExternalInput = config.useExternalInpBuffer;
+#ifdef ENABLE_STANDARD_MOE_ADAPT
+  // The fused Standard-MoE kernel already converts expert-major GEMM output into combineInp.
+  stageExternalInput = stageExternalInput && !args.enableStandardMoeOutput;
+#endif
 
-    const size_t base = tokenId * hiddenDim + hiddenDimOffset;
-    if (args.config.quantType == QuantType::Fp8DirectCast) {
-      using Fp8T = core::CombineInternalFp8;
-      Fp8T* dst = args.interNodeV1TokBufs.combineInp->template GetAs<Fp8T*>();
-      core::WarpCastBf16ToCombineInternalFp8<T>(dst + base, args.inpTokenBuf + base, hiddenDimSize,
-                                                laneId);
-    } else {
-      core::WarpCopy(args.interNodeV1TokBufs.combineInp->template GetAs<T*>() + base,
-                     args.inpTokenBuf + base, hiddenDimSize);
+  MultiWarpIter mwIter(globalWarpNum, totalRecvTokenNum, hiddenDim);
+  if (stageExternalInput) {
+    for (int i = globalWarpId; i < (totalRecvTokenNum * mwIter.warpsPerItem); i += globalWarpNum) {
+      int tokenId, inTokenPartId;
+      size_t hiddenDimOffset, hiddenDimSize;
+      mwIter.Decode(i, tokenId, inTokenPartId, hiddenDimOffset, hiddenDimSize);
+      if (hiddenDimSize == 0) continue;
+
+      const size_t base = tokenId * hiddenDim + hiddenDimOffset;
+      if (args.config.quantType == QuantType::Fp8DirectCast) {
+        using Fp8T = core::CombineInternalFp8;
+        Fp8T* dst = args.interNodeV1TokBufs.combineInp->template GetAs<Fp8T*>();
+        core::WarpCastBf16ToCombineInternalFp8<T>(dst + base, args.inpTokenBuf + base,
+                                                  hiddenDimSize, laneId);
+      } else {
+        core::WarpCopy(args.interNodeV1TokBufs.combineInp->template GetAs<T*>() + base,
+                       args.inpTokenBuf + base, hiddenDimSize);
+      }
     }
   }
-#endif
   if (args.weightsBuf) {
     // numExpertPerToken floats per token -- too small to slice, so one warp per token, but
     // strided over the whole grid rather than over one block's warps.
