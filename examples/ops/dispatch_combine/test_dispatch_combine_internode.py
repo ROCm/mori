@@ -1331,14 +1331,14 @@ class EpDispatchCombineTestCase:
                     ),
                 ),
             ]
-            for phase, cols in _labels:
-                for i in range(all_data.shape[0]):
-                    rd = all_data[i]
-                    if cols is _labels[0][1]:
-                        print(f"Round {i}")
+            for i in range(all_data.shape[0]):
+                rd = all_data[i]
+                print(f"Round {i}")
+                for phase, cols in _labels:
                     for name, col, unit in cols:
+                        vals = [round(v, 2) for v in rd[:, col].tolist()]
                         print(
-                            f"  {phase} {name} {rd[:, col].int().tolist()}"
+                            f"  {phase} {name} {vals}"
                             f" avg {rd[:, col].mean():.2f} {unit}"
                         )
 
