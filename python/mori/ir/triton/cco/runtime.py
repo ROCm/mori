@@ -19,40 +19,27 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-# Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
-# MIT License
-"""
-mori.ir.triton — Triton integration for MORI device APIs.
+"""Runtime helpers for linking CCO device bitcode into Triton kernels."""
 
-The package-level functions expose shmem. The :mod:`mori.ir.triton.cco`
-submodule exposes CCO LSA, SDMA, and GDA functions.
+from mori.cco.device.bitcode import find_cco_bitcode
 
-Quick start::
+# Triton's AMD backend links an extern library only when this key prefixes an
+# unresolved symbol.  CCO wrapper symbols are named ``cco_*``.
+_LIB_KEY = "cco"
+_TRITON_COV = 5
 
-    from mori.ir import triton as mori_shmem_device
-    from mori.ir.triton import get_extern_libs, install_hook
 
-    install_hook()
+def get_extern_libs() -> dict[str, str]:
+    """Return the CCO bitcode mapping for a Triton kernel launch.
 
-    @triton.jit
-    def my_kernel(buf_ptr, N, BLOCK: tl.constexpr):
-        pe = mori_shmem_device.my_pe()
-        mori_shmem_device.putmem_nbi_block(buf_ptr, buf_ptr, N * 2, pe, 0)
-        mori_shmem_device.quiet_thread()
+    CCO carries all device state through explicit ``dev_comm`` and window
+    handles, so unlike shmem this integration does not install a post-compile
+    module initialization hook.
+    """
 
-    my_kernel[(grid,)](buf, N, BLOCK=1024, extern_libs=get_extern_libs())
-"""
+    return {_LIB_KEY: find_cco_bitcode(cov=_TRITON_COV)}
 
-from .ops import *  # noqa: F401,F403 — export all device functions at package level
-from .ops import __all__ as _ops_all
-from .runtime import get_extern_libs, install_hook
-from . import cco
 
-get_cco_extern_libs = cco.get_extern_libs
+get_cco_extern_libs = get_extern_libs
 
-__all__ = _ops_all + [
-    "get_extern_libs",
-    "install_hook",
-    "cco",
-    "get_cco_extern_libs",
-]
+__all__ = ["get_extern_libs", "get_cco_extern_libs"]

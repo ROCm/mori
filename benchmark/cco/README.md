@@ -44,6 +44,61 @@ mpirun -np 2 ./build/benchmark/cco_p2p_put_latency -t sdma -C quiet -b 8 -e 64K 
 mpirun -np 2 ./build/benchmark/cco_p2p_put_bw -t lsa -b 1M -e 1G -f 4 -n 20 -w 5
 ```
 
+## Triton benchmark
+
+The Triton implementation mirrors the C++ two-window, rank-0-only and
+completion boundaries. It reports one `RESULT_JSON` record per size plus a
+human-readable table.
+
+```bash
+# LSA put latency: 8B..64KB
+torchrun --standalone --nproc_per_node=2 \
+  benchmark/cco/triton/bench_p2p.py \
+  --transport lsa --op put --metric latency
+
+# SDMA get bandwidth: 64KB..8MB
+MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=2 \
+  benchmark/cco/triton/bench_p2p.py \
+  --transport sdma --op get --metric bandwidth
+
+# IBGDA on one AINIC rail
+MORI_DEVICE_NIC=ionic MORI_DISABLE_TOPO=1 MORI_RDMA_DEVICES=rocep9s0 \
+  torchrun --standalone --nproc_per_node=2 \
+  benchmark/cco/triton/bench_p2p.py \
+  --transport ibgda --op put --metric bandwidth
+```
+
+Common options are `--min-size`, `--max-size`, `--step-factor`, `--iters`,
+`--warmup`, `--grid`, `--threads`, and `--json-out`. The current fair-comparison
+preset uses block scope: latency and SDMA bandwidth use one program, while
+LSA/IBGDA bandwidth use 32 programs × 256 threads.
+
+Triton JIT compilation and warmup occur before the timed event. Each timed
+launch loops `iters` times inside the kernel, so Python launch overhead is not
+reported as device latency.
+
+## Automated Triton vs C++ comparison
+
+Build the four C++ binaries, then run:
+
+```bash
+BUILD_BENCHMARK=ON BUILD_CCO_SDMA=ON BUILD_UMBP=OFF pip install -e .
+
+MORI_CCO_TRITON_GDA_DEVICE=rocep9s0 \
+  python benchmark/cco/compare_triton_cpp.py \
+  --cpp-dir build/benchmark \
+  --json-out /tmp/cco_compare.json \
+  --markdown-out /tmp/cco_compare.md
+```
+
+The runner executes LSA, SDMA and IBGDA put/get latency and bandwidth with
+identical sizes, block scope, geometry, iterations and warmup. `ratio` is
+`Triton/C++`: greater than one is better for bandwidth and worse for latency.
+
+The IBGDA run pins all ranks to one HCA because this MI355X setup cannot route
+local GDA traffic across AINIC rails. This is a correctness configuration, not
+a multi-rail peak-bandwidth measurement.
+
 ## SDMA specifics
 
 `MORI_SDMA_NUM_CHANNELS` sets the queues per GPU pair — default 2, max 8. It is
@@ -97,3 +152,9 @@ threads do not shorten the path.
 - Repeat and take a median. Run-to-run spread is well under 1% for large
   messages but reaches double digits in the steep part of the curve.
 - Check the machine is otherwise idle (`rocm-smi --showpids`).
+- C++ LSA bandwidth uses a HIP system fence and cross-block sense barrier.
+  Triton mirrors both through a CCO fence wrapper and a small fully-resident
+  atomic barrier, but generated instruction scheduling is not identical.
+- The comparison intentionally fixes scope to `block`; a Triton scalar extern
+  call is executed by every hardware lane and is not equivalent to CCO's
+  one-thread benchmark mode.

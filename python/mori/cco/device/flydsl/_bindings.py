@@ -41,84 +41,69 @@ Symbol tags (must match the wrapper):
     ``none`` / ``inc`` / ``add`` (``signal`` has no ``none``).
 """
 
+from mori.cco.device.ops import (
+    CCO_DEVICE_FUNCTIONS,
+    COOP_TAGS,
+    GDA_DATA_TAGS,
+    GDA_SIGNAL_TAGS,
+)
+
 from ._internal import _ffi
 
-_U64, _I32 = "uint64", "int32"
 
-# (devComm, ctx, peer, dstWin, dstOff, srcWin, srcOff, bytes, signalId, signalVal)
-_PUT_ARGS = [_U64, _I32, _I32, _U64, _U64, _U64, _U64, _U64, _I32, _U64]
-# (devComm, ctx, peer, dstWin, dstOff, value, signalId, signalVal)
-_PUTV_ARGS = [_U64, _I32, _I32, _U64, _U64, _U64, _I32, _U64]
-# (devComm, ctx, peer, remoteWin, remoteOff, localWin, localOff, bytes)
-_GET_ARGS = [_U64, _I32, _I32, _U64, _U64, _U64, _U64, _U64]
-# (devComm, ctx, peer, signalId, signalVal)
-_SIGNAL_ARGS = [_U64, _I32, _I32, _I32, _U64]
-# (devComm, ctx, signalId, least, bits)
-_WAIT_ARGS = [_U64, _I32, _I32, _U64, _I32]
+def _binding(name):
+    meta = CCO_DEVICE_FUNCTIONS[name]
+    return _ffi(
+        meta["symbol"],
+        meta["args"],
+        meta["ret"],
+        pure=meta.get("pure", False),
+    )
 
-_TC = ("it", "iw", "ib", "at")  # data-path (ThreadMode, Coop) tags
-_SIG = ("none", "inc", "add")  # remote-action tags
-_COOP = ("thread", "warp", "block")  # coop-only tags
 
 # ── monomorphized op tables (keyed by tag) ──
 PUT = {
-    f"{tc}__{s}": _ffi(f"cco_gda_put__{tc}__{s}", _PUT_ARGS, "void")
-    for tc in _TC
-    for s in _SIG
+    f"{tc}__{s}": _binding(f"gda_put_{tc}_{s}")
+    for tc in GDA_DATA_TAGS
+    for s in GDA_SIGNAL_TAGS
 }
 PUT_VALUE = {
-    f"{tc}__{s}": _ffi(f"cco_gda_put_value__{tc}__{s}", _PUTV_ARGS, "void")
-    for tc in _TC
-    for s in _SIG
+    f"{tc}__{s}": _binding(f"gda_put_value_{tc}_{s}")
+    for tc in GDA_DATA_TAGS
+    for s in GDA_SIGNAL_TAGS
 }
-GET = {tc: _ffi(f"cco_gda_get__{tc}", _GET_ARGS, "void") for tc in _TC}
+GET = {tc: _binding(f"gda_get_{tc}") for tc in GDA_DATA_TAGS}
 SIGNAL = {
-    f"{c}__{s}": _ffi(f"cco_gda_signal__{c}__{s}", _SIGNAL_ARGS, "void")
-    for c in _COOP
+    f"{c}__{s}": _binding(f"gda_signal_{c}_{s}")
+    for c in COOP_TAGS
     for s in ("inc", "add")
 }
-WAIT_SIGNAL = {c: _ffi(f"cco_gda_wait_signal__{c}", _WAIT_ARGS, "void") for c in _COOP}
-FLUSH = {
-    c: _ffi(f"cco_gda_flush__{c}", [_U64, _I32], "void") for c in ("warp", "block")
-}
-FLUSH_PEER = {
-    c: _ffi(f"cco_gda_flush_peer__{c}", [_U64, _I32, _I32], "void")
-    for c in ("warp", "block")
-}
+WAIT_SIGNAL = {c: _binding(f"gda_wait_signal_{c}") for c in COOP_TAGS}
+FLUSH = {c: _binding(f"gda_flush_{c}") for c in ("warp", "block")}
+FLUSH_PEER = {c: _binding(f"gda_flush_peer_{c}") for c in ("warp", "block")}
 
 # ── SDMA ──
 
-# (devComm, peer, dstWin, dstOff, srcWin, srcOff, nbytes, queueId, optFlags)
-_SDMA_XFER_ARGS = [_U64, _I32, _U64, _U64, _U64, _U64, _U64, _I32, _I32]
-
 SDMA_XFER = {
-    f"{op}__{s}": _ffi(f"cco_sdma_{op}__{s}", _SDMA_XFER_ARGS, "void")
+    f"{op}__{s}": _binding(f"sdma_{op}_{s}")
     for op in ("put", "get")
     # coop tag, plus "_ns" (no-signal / fire-and-forget) variants.
     for s in ("thread", "warp", "block", "thread_ns", "warp_ns", "block_ns")
 }
 
-# quiet: (devComm, peer)
-SDMA_QUIET = {
-    s: _ffi(f"cco_sdma_quiet__{s}", [_U64, _I32], "void")
-    for s in ("thread", "warp", "block")
-}
-# commit: (devComm, peer, queueId)
-SDMA_COMMIT = {
-    s: _ffi(f"cco_sdma_commit__{s}", [_U64, _I32, _I32], "void")
-    for s in ("thread", "warp", "block")
-}
-# quiet_queue: (devComm, peer, queueId)
-cco_sdma_quiet_queue = _ffi("cco_sdma_quiet_queue", [_U64, _I32, _I32], "void")
+SDMA_QUIET = {s: _binding(f"sdma_quiet_{s}") for s in ("thread", "warp", "block")}
+SDMA_COMMIT = {s: _binding(f"sdma_commit_{s}") for s in ("thread", "warp", "block")}
+cco_sdma_quiet_queue = _binding("sdma_quiet_queue")
 
 # ── axis-free symbols ──
 # cco_lsa_ptr(window, peerLsaRank, offset) -> peer's load/store-accessible VA.
-cco_lsa_ptr = _ffi("cco_lsa_ptr", [_U64, _I32, _U64], _U64, pure=True)
+cco_lsa_ptr = _binding("lsa_ptr")
+cco_system_fence = _binding("system_fence")
 
-cco_devcomm_rank = _ffi("cco_devcomm_rank", [_U64], _I32, pure=True)
-cco_devcomm_world_size = _ffi("cco_devcomm_world_size", [_U64], _I32, pure=True)
-cco_devcomm_lsa_rank = _ffi("cco_devcomm_lsa_rank", [_U64], _I32, pure=True)
-cco_devcomm_lsa_size = _ffi("cco_devcomm_lsa_size", [_U64], _I32, pure=True)
+cco_devcomm_rank = _binding("devcomm_rank")
+cco_devcomm_world_size = _binding("devcomm_world_size")
+cco_devcomm_lsa_rank = _binding("devcomm_lsa_rank")
+cco_devcomm_lsa_size = _binding("devcomm_lsa_size")
 
-cco_gda_read_signal = _ffi("cco_gda_read_signal", [_U64, _I32, _I32, _I32], _U64)
-cco_gda_reset_signal = _ffi("cco_gda_reset_signal", [_U64, _I32, _I32], "void")
+cco_gda_read_signal = _binding("gda_read_signal")
+cco_gda_reset_signal = _binding("gda_reset_signal")

@@ -177,6 +177,43 @@ jobs:
               tests/python/cco/test_rocm_bootstrap.py \
               tests/python/cco/test_rocm_import_order.py"
 
+      - name: Run CCO Triton bindings, LSA, and SDMA tests
+        run: |
+          $CT exec \
+            -e MORI_ENABLE_SDMA=1 \
+            -e BUILD_CCO_SDMA=ON \
+            $CONTAINER bash -c "\
+              cd $GITHUB_WORKSPACE && \
+              timeout 300 pytest -v \
+                tests/python/cco/test_triton_bindings.py \
+                tests/python/cco/test_triton_lsa.py \
+                tests/python/cco/test_triton_sdma.py"
+
+      - name: Run CCO Triton benchmark tests
+        run: |
+          $CT exec \
+            -e MORI_ENABLE_SDMA=1 \
+            -e BUILD_CCO_SDMA=ON \
+            $CONTAINER bash -c "\
+              cd $GITHUB_WORKSPACE && \
+              timeout 300 pytest -v tests/python/cco/test_triton_benchmark.py"
+
+      - name: Compile CCO Triton GDA variants (AINIC runtime gated)
+        run: |
+          # Runtime GDA-FULL tests and examples are already gated on this runner:
+          # its intranode AINIC path faults even when both ranks use one HCA.
+          # Still create the resources and compile/link every Triton GDA variant.
+          FIRST_RDMA_DEVICE="${MORI_RDMA_DEVICES%%,*}"
+          $CT exec \
+            -e MORI_CCO_TRITON_GDA_DEVICE=$FIRST_RDMA_DEVICE \
+            -e MORI_CCO_TRITON_GDA_COMPILE_ONLY=1 \
+            -e MORI_RDMA_DEVICES=$FIRST_RDMA_DEVICE \
+            -e MORI_DISABLE_TOPO=1 \
+            -e MORI_DEVICE_NIC=ionic \
+            -e BUILD_CCO_SDMA=ON \
+            $CONTAINER bash -c "\
+              cd $GITHUB_WORKSPACE && \
+              timeout 300 pytest -v tests/python/cco/test_triton_gda.py"
       - name: Run JIT v2 C++ tests + host/device split guard
         run: |
           # Registered by tests/cpp/jit/CMakeLists.txt but selected by no job before

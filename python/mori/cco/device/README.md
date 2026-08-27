@@ -1,20 +1,19 @@
-# CCO device API → FlyDSL integration
+# CCO device API → FlyDSL and Triton integration
 
-Lets FlyDSL `@flyc.kernel` code call the cco GDA/LSA device API via a device-IR
-binding layer (extern-C wrappers compiled to bitcode, linked into the kernel),
-adapted to FlyDSL's scalar-only FFI. Fully independent of the shmem `mori.ir`
-machinery; the C++ device implementation (`ccoGda<P>`) is reused **unchanged**.
+Lets FlyDSL and Triton kernels call the CCO GDA/LSA/SDMA device API through
+extern-C wrappers compiled to bitcode and linked into the kernel. The C++
+device implementation (`ccoGda<P>` / `ccoSdma`) is reused unchanged.
 
-## The 5 layers (top → bottom)
+## The layers (top → bottom)
 
 ```
-FlyDSL @flyc.kernel
-  └─ cco.DevComm(h).gda(0).put(...)         OO handles (method-carrying fx.struct)
-       └─ _bindings.PUT["iw__inc"](...)      per-combo FFI symbol tables
-            └─ link_extern(ffi(...), bc)      lazy bind + attach bitcode
-                 └─ llvm.call @cco_gda_put__iw__inc   FlyDSL-emitted IR (one monomorphic symbol)
-                      └─ libmori_cco_device.bc extern "C" wrapper (one template instantiation)
-                           └─ ccoGda<P>::put<Aggregate?,Coop>() the real C++ device impl (unchanged)
+CCO_DEVICE_FUNCTIONS (one scalar ABI table)
+  ├─ FlyDSL: cco.DevComm(h).gda(0).put(...)
+  │    └─ link_extern(ffi(...), cov6 bitcode)
+  └─ Triton: mori.ir.triton.cco.gda_put_iw_inc(...)
+       └─ core.extern_elementwise(..., cov5 bitcode)
+            └─ llvm.call @cco_gda_put__iw__inc
+                 └─ ccoGda<P>::put<...>() / ccoSdma::put<...>()
 ```
 
 ## What to look at where
@@ -22,7 +21,9 @@ FlyDSL @flyc.kernel
 | Question | File |
 |---|---|
 | What device ops exist / the C++ wrapper | `src/cco/device/cco_device_wrapper.cpp` |
-| The ABI (exact symbol + scalar arg list) | `python/mori/cco/device/flydsl/_bindings.py` (1:1 with the wrapper) |
+| The shared ABI metadata | `python/mori/cco/device/ops.py` (`CCO_DEVICE_FUNCTIONS`) |
+| FlyDSL FFI objects | `python/mori/cco/device/flydsl/_bindings.py` |
+| Triton extern wrappers | `python/mori/ir/triton/cco/ops.py` |
 | OO API (`DevComm/Window/Gda`) + enums (`CoopScope/SignalOp/ThreadMode`) | `python/mori/cco/device/flydsl/handles.py` |
 | `_ffi` factory + `cco_struct` (handle keeps methods across `if`/`for`) | `flydsl/_internal.py` |
 | How the `.bc` is located at runtime | `python/mori/cco/device/bitcode.py` (`find_cco_bitcode`) |
@@ -48,6 +49,9 @@ FlyDSL @flyc.kernel
   data path carries it as part of its `(ThreadMode,Coop)` tag (`it/iw/ib/at`).
   `AGGREGATE` is only valid with `CoopScope.THREAD` (cco coalesces the warp's
   lanes itself — enforced in both the wrapper and `handles.py`).
+- **Concrete status returns.** Side-effect wrappers return `int32` status 0.
+  FlyDSL ignores it; Triton needs a concrete element return type for
+  `extern_elementwise`, especially when an argument is a block value.
 - **Provider fixed at build time** via `CCO_GDA_BUILD_PROVIDER` (NIC macro) — one
   `ccoGda<P>` specialization per NIC, same as the C++ kernels / shmem bitcode.
 - **OO handles** (`DevComm/Window/Gda`) are method-carrying `fx.struct`s
@@ -88,18 +92,39 @@ run guide (Python + C++), including the two-node (`crossnode`) setup. To skip
 JIT, override with `MORI_CCO_BC=/path/to/libmori_cco_device.bc` or prebuild via
 `tools/build_cco_bitcode.sh`.
 
+Triton uses code object version 5 and passes CCO state explicitly:
+
+```python
+from mori.ir.triton import cco
+
+kernel[(1,)](
+    dc.ptr,
+    win.handle,
+    extern_libs=cco.get_extern_libs(),
+)
+```
+
+No shmem `install_hook()` is used. Run the complete example with:
+
+```bash
+torchrun --standalone --nproc_per_node=2 \
+  examples/cco/ir/test_triton_cco.py --transport lsa
+```
+
 ## Adding a new device op (the path)
 
 1. Add the `extern "C"` wrapper in `cco_device_wrapper.cpp`. For a templated op,
    define it with the `CCO_TC_LIST` / `CCO_COOP_LIST` X-macros so every valid
    combination is monomorphized into a tagged symbol (no runtime dispatch). JIT
    re-compiles automatically — the cache key includes the wrapper source hash.
-2. Add the matching symbol table / `_ffi(...)` prototype in `_bindings.py`
-   (keyed by the same tags).
-3. Expose it as a method on `DevComm` / `Window` / `Gda` in `handles.py`, picking
+2. Add the scalar signature once to `CCO_DEVICE_FUNCTIONS` in `ops.py`.
+   Triton exports it automatically; `_bindings.py` builds FlyDSL FFI objects
+   from the same entry.
+3. Expose it as a FlyDSL method on `DevComm` / `Window` / `Gda` in `handles.py`, picking
    the symbol from the compile-time `coop`/`thread_mode`/`signal_op` constants.
 
-The `_bindings.py` ↔ wrapper ABI is mechanical — it's the natural codegen target.
+`tests/python/cco/test_triton_bindings.py` verifies metadata, FlyDSL FFI, and
+the symbols defined in the cov5 bitcode remain synchronized.
 
 ## Examples
 
@@ -109,6 +134,7 @@ The `_bindings.py` ↔ wrapper ABI is mechanical — it's the natural codegen ta
 | `04_flydsl_lsa_put` | LSA direct peer-pointer store in the kernel |
 | `05_flydsl_lsa_allreduce` | LSA custom all-reduce: peer pointers + device signal barrier |
 | `06_flydsl_gda_modes` | GDA template matrix: (thread_mode,coop) {indep×thread/warp/block, aggr×thread} × signal {inc,add} |
+| `examples/cco/ir/test_triton_cco.py` | Triton DevComm queries plus LSA, SDMA, and GDA |
 
 ## FlyDSL kernel-author gotchas
 

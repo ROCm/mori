@@ -19,40 +19,30 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-# Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
-# MIT License
-"""
-mori.ir.triton — Triton integration for MORI device APIs.
+"""Triton bindings for the CCO LSA, SDMA, and GDA device APIs.
 
-The package-level functions expose shmem. The :mod:`mori.ir.triton.cco`
-submodule exposes CCO LSA, SDMA, and GDA functions.
+Example::
 
-Quick start::
-
-    from mori.ir import triton as mori_shmem_device
-    from mori.ir.triton import get_extern_libs, install_hook
-
-    install_hook()
+    from mori.ir.triton import cco
 
     @triton.jit
-    def my_kernel(buf_ptr, N, BLOCK: tl.constexpr):
-        pe = mori_shmem_device.my_pe()
-        mori_shmem_device.putmem_nbi_block(buf_ptr, buf_ptr, N * 2, pe, 0)
-        mori_shmem_device.quiet_thread()
+    def kernel(dev_comm, window):
+        rank = cco.DevComm.lsa_rank(dev_comm)
+        peer_ptr = cco.Window.lsa_ptr(window, rank, 0)
 
-    my_kernel[(grid,)](buf, N, BLOCK=1024, extern_libs=get_extern_libs())
+    kernel[(1,)](dc.ptr, win.handle, extern_libs=cco.get_extern_libs())
 """
 
-from .ops import *  # noqa: F401,F403 — export all device functions at package level
+from .ops import *  # noqa: F401,F403
 from .ops import __all__ as _ops_all
-from .runtime import get_extern_libs, install_hook
-from . import cco
-
-get_cco_extern_libs = cco.get_extern_libs
+from .handles import DevComm, Window, Gda, Sdma
+from .runtime import get_extern_libs, get_cco_extern_libs
 
 __all__ = _ops_all + [
+    "DevComm",
+    "Window",
+    "Gda",
+    "Sdma",
     "get_extern_libs",
-    "install_hook",
-    "cco",
     "get_cco_extern_libs",
 ]

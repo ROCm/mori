@@ -49,51 +49,17 @@ except ImportError as e:  # optional dependency
         "cco FlyDSL bindings require FlyDSL. Install it with: pip install flydsl"
     ) from e
 
+from mori.cco.device.ops import (
+    COOP_TAG as _COOP_TAG,
+    DATA_PATH_TAG as _TC_TAG,
+    SIGNAL_TAG as _SIG_TAG,
+    CoopScope,
+    SignalOp,
+    ThreadMode,
+)
+
 from . import _bindings as raw
 from ._internal import cco_struct
-
-
-class CoopScope:
-    """Cooperative-group scope for a GDA op."""
-
-    THREAD = 0
-    WARP = 1
-    BLOCK = 2
-
-
-class SignalOp:
-    """Remote signal action bundled with a put/get/signal."""
-
-    NONE = 0
-    INC = 1
-    ADD = 2
-
-
-class ThreadMode:
-    """How a thread's lanes contribute to one GDA data-path op.
-
-    ``INDEPENDENT`` — each participating thread issues its own transfer.
-    ``AGGREGATE``   — the warp's lanes are coalesced into one transfer by cco
-                      (requires ``CoopScope.THREAD``; all lanes must enter).
-    """
-
-    INDEPENDENT = 0
-    AGGREGATE = 1
-
-
-# Tag tables — must match the wrapper / _bindings symbol names.
-_SIG_TAG = {SignalOp.NONE: "none", SignalOp.INC: "inc", SignalOp.ADD: "add"}
-_COOP_TAG = {
-    CoopScope.THREAD: "thread",
-    CoopScope.WARP: "warp",
-    CoopScope.BLOCK: "block",
-}
-_TC_TAG = {
-    (ThreadMode.INDEPENDENT, CoopScope.THREAD): "it",
-    (ThreadMode.INDEPENDENT, CoopScope.WARP): "iw",
-    (ThreadMode.INDEPENDENT, CoopScope.BLOCK): "ib",
-    (ThreadMode.AGGREGATE, CoopScope.THREAD): "at",
-}
 
 
 def _const(value, name):

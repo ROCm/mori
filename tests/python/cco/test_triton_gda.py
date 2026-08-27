@@ -19,40 +19,25 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-# Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
-# MIT License
-"""
-mori.ir.triton — Triton integration for MORI device APIs.
 
-The package-level functions expose shmem. The :mod:`mori.ir.triton.cco`
-submodule exposes CCO LSA, SDMA, and GDA functions.
+import os
 
-Quick start::
+import pytest
 
-    from mori.ir import triton as mori_shmem_device
-    from mori.ir.triton import get_extern_libs, install_hook
+from .helper import run_triton_example
 
-    install_hook()
 
-    @triton.jit
-    def my_kernel(buf_ptr, N, BLOCK: tl.constexpr):
-        pe = mori_shmem_device.my_pe()
-        mori_shmem_device.putmem_nbi_block(buf_ptr, buf_ptr, N * 2, pe, 0)
-        mori_shmem_device.quiet_thread()
-
-    my_kernel[(grid,)](buf, N, BLOCK=1024, extern_libs=get_extern_libs())
-"""
-
-from .ops import *  # noqa: F401,F403 — export all device functions at package level
-from .ops import __all__ as _ops_all
-from .runtime import get_extern_libs, install_hook
-from . import cco
-
-get_cco_extern_libs = cco.get_extern_libs
-
-__all__ = _ops_all + [
-    "get_extern_libs",
-    "install_hook",
-    "cco",
-    "get_cco_extern_libs",
-]
+def test_triton_cco_gda_matrix_single_rail():
+    if not (
+        os.environ.get("MORI_CCO_TRITON_GDA_DEVICE")
+        or os.environ.get("MORI_RDMA_DEVICES")
+    ):
+        pytest.skip("GDA test needs MORI_CCO_TRITON_GDA_DEVICE or MORI_RDMA_DEVICES")
+    output = run_triton_example("gda", timeout=240)
+    if os.environ.get("MORI_CCO_TRITON_GDA_COMPILE_ONLY", "").lower() in (
+        "1",
+        "true",
+        "on",
+    ):
+        assert "GDA compile-only PASS" in output
+    assert "All CCO Triton gda tests PASSED" in output
