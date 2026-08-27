@@ -188,6 +188,18 @@ message BatchResolveKeysRequest {
   // would have corrected the reader, and the miss became a wrong-memory read.
   bool omit_descs = 2;
 }
+
+enum ResolveStatus {
+  RESOLVE_STATUS_UNSPECIFIED = 0;
+  RESOLVE_STATUS_FOUND = 1;
+  RESOLVE_STATUS_MISSING = 2;
+  // The peer owns the key but cannot publish it until transient staging
+  // pressure clears.  Retry the same peer; do not treat this as a cache miss.
+  RESOLVE_STATUS_BUSY = 3;
+  // Permanent backend/shape failure.  Retrying unchanged input cannot help.
+  RESOLVE_STATUS_FAILED = 4;
+}
+
 // Struct-of-arrays layout.  The previous shape repeated a full ResolveKeyResponse
 // per key, each carrying its own copy of the peer's buffer descriptors and
 // page_size — the descriptors and page_size are batch-invariant, so that
@@ -214,6 +226,10 @@ message BatchResolveKeysResponse {
   // entirely in one medium, so this costs one uint32 per key rather than one
   // per page on the hottest array in the protocol.
   repeated uint32   backend_id = 9;
+  // Optional for wire compatibility.  New peers emit one status per key; new
+  // clients derive FOUND/MISSING from `found` when talking to an old peer that
+  // omits this field.
+  repeated ResolveStatus resolve_status = 10;
   // Flattened page locations across all keys: key i owns the next page_count[i]
   // (buffer_index, page_index) pairs, walking keys in order.
   repeated uint32 buffer_index = 7;

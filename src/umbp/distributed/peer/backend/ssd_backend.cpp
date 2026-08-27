@@ -436,6 +436,7 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
   // mutex_.  Factored out because the lease-hit and read-completed paths publish
   // byte-identical results and drifting between them would be a silent bug.
   auto publish = [&](ResolvedEntry& out, const ReadLease& lease) {
+    out.outcome = ResolveOutcome::kFound;
     out.found = true;
     out.pages.reserve(lease.span.page_count);
     for (uint32_t page = lease.span.first_page;
@@ -449,11 +450,14 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
     }
   };
 
-  // Phase 1 (ONE lock): serve every key that is already staged, then size and
-  // claim a staging page for the rest.  An existing lease means the bytes are
-  // there: extend it and reuse the page rather than re-reading the SSD for a
-  // concurrent second reader.
+  // Phase 1 (ONE lock): serve every key that is already staged, size every
+  // unique remaining key, then reserve ALL required spans atomically.  A
+  // partial resolve is unusable to layer-wise callers and, worse, pins the
+  // successful subset while retries compete for the remainder.  On transient
+  // pressure this call therefore publishes kBusy and keeps none of its new
+  // reservations.
   std::vector<size_t> todo;            // keys needing a device read
+  std::vector<uint32_t> page_counts;   // parallel to todo
   std::vector<StagingSpan> spans;      // parallel to todo
   std::vector<void*> dsts;             // parallel to todo
   std::vector<size_t> caps;            // parallel to todo
@@ -479,25 +483,51 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
 
       const uint64_t size = ssd_->SizeOf(keys[i]);
       const uint32_t page_count = SizeToPages(size, cfg_.page_size);
-      if (page_count == 0 || page_count > staging_page_used_.size()) continue;
-
-      const StagingSpan span = AcquireStagingSpanLocked(page_count);
-      if (span.page_count == 0) {
-        // Staging exhausted.  Reported as a miss, which is the wrong shape for
-        // "this node has it, come back" — see the header's note on the rejected
-        // retry state.  Sizing the arena for read concurrency is the mitigation.
-        slot_full_rejects_.fetch_add(1, std::memory_order_relaxed);
-        MORI_UMBP_WARN("[SsdBackend] Resolve: staging arena exhausted, key '{}' degraded to miss",
-                       keys[i]);
+      if (size == 0) continue;
+      if (page_count == 0 || page_count > staging_page_used_.size()) {
+        results[i].outcome = ResolveOutcome::kFailed;
+        MORI_UMBP_ERROR("[SsdBackend] Resolve: key '{}' size {} cannot fit staging arena", keys[i],
+                        size);
         continue;
       }
       todo.push_back(i);
-      spans.push_back(span);
-      dsts.push_back(StagingPagePtr(span.first_page));
-      caps.push_back(static_cast<size_t>(span.page_count) * cfg_.page_size);
+      page_counts.push_back(page_count);
       read_keys.push_back(keys[i]);
       scheduled.emplace(keys[i], todo.size() - 1);
       result_groups.push_back({i});
+    }
+
+    uint64_t requested_pages = 0;
+    for (uint32_t page_count : page_counts) requested_pages += page_count;
+    if (requested_pages > staging_page_used_.size()) {
+      for (const auto& group : result_groups) {
+        for (size_t index : group) results[index].outcome = ResolveOutcome::kFailed;
+      }
+      MORI_UMBP_ERROR(
+          "[SsdBackend] Resolve: batch requires {} staging pages but arena has {}; not retryable",
+          requested_pages, staging_page_used_.size());
+      return results;
+    }
+
+    spans.reserve(todo.size());
+    for (size_t j = 0; j < todo.size(); ++j) {
+      const StagingSpan span = AcquireStagingSpanLocked(page_counts[j]);
+      if (span.page_count == 0) {
+        for (const StagingSpan reserved : spans) ReleaseStagingSpanLocked(reserved);
+        for (const auto& group : result_groups) {
+          for (size_t index : group) results[index].outcome = ResolveOutcome::kBusy;
+        }
+        slot_full_rejects_.fetch_add(1, std::memory_order_relaxed);
+        MORI_UMBP_WARN(
+            "[SsdBackend] Resolve: staging arena busy; rolled back {} reservations for {} keys",
+            spans.size(), todo.size());
+        return results;
+      }
+      spans.push_back(span);
+    }
+    for (const StagingSpan span : spans) {
+      dsts.push_back(StagingPagePtr(span.first_page));
+      caps.push_back(static_cast<size_t>(span.page_count) * cfg_.page_size);
     }
   }
   if (todo.empty()) return results;
@@ -517,6 +547,12 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
       const size_t primary = todo[j];
       if (outcomes[j].status != SsdReadStatus::kOk) {
         ReleaseStagingSpanLocked(spans[j]);
+        const ResolveOutcome outcome = outcomes[j].status == SsdReadStatus::kNotFound
+                                           ? ResolveOutcome::kMissing
+                                           : ResolveOutcome::kFailed;
+        for (size_t result_index : result_groups[j]) {
+          results[result_index].outcome = outcome;
+        }
         continue;
       }
       // A concurrent Resolve of the same key may have staged it while this read
@@ -568,6 +604,7 @@ bool SsdBackend::AcquireMigrationRead(const std::string& key,
     ReleaseMigrationRead(key);
     return false;
   }
+  resolved->outcome = ResolveOutcome::kFound;
   resolved->found = true;
   resolved->pages.reserve(span.page_count);
   for (uint32_t page = span.first_page; page < span.first_page + span.page_count; ++page) {

@@ -399,8 +399,14 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     for (size_t i = 0; i < resolved.size() && i < entries.size(); ++i) {
       auto& result = resolved[i];
       auto& r = result.resolved;
+      entries[i].outcome = EffectiveResolveOutcome(r);
+      if (result.backend_id < BackendRegistry::kMaxBackends) {
+        entries[i].tier = result.tier;
+        entries[i].backend_id = result.backend_id;
+      }
       if (!r.found || result.backend_id >= BackendRegistry::kMaxBackends) continue;
       entries[i].found = true;
+      entries[i].outcome = ResolveOutcome::kFound;
       entries[i].tier = result.tier;
       entries[i].backend_id = result.backend_id;
       entries[i].size = r.size;

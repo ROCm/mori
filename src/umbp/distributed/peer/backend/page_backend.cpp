@@ -447,6 +447,7 @@ ResolvedEntry PageBackend::Resolve(const std::string& key) {
   ResolvedEntry r;
   auto it = owned_.find(key);
   if (it == owned_.end()) return r;
+  r.outcome = ResolveOutcome::kFound;
   r.found = true;
   r.pages = it->second.pages;
   r.size = it->second.size;
@@ -470,6 +471,7 @@ std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::stri
     auto it = owned_.find(keys[i]);
     if (it == owned_.end()) continue;
     auto& entry = out[i];
+    entry.outcome = ResolveOutcome::kFound;
     entry.found = true;
     entry.pages = it->second.pages;
     entry.size = it->second.size;
@@ -486,6 +488,7 @@ bool PageBackend::AcquireMigrationRead(const std::string& key,
   std::lock_guard<std::mutex> lock(mutex_);
   auto owned = owned_.find(key);
   if (owned == owned_.end() || pins_.find(key) != pins_.end()) return false;
+  resolved->outcome = ResolveOutcome::kFound;
   resolved->found = true;
   resolved->pages = owned->second.pages;
   resolved->size = owned->second.size;

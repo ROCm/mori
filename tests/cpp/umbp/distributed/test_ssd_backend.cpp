@@ -427,11 +427,7 @@ TEST_F(SsdBackendTest, DuplicateKeysInOneBatchShareOneMultiPageSpan) {
   EXPECT_EQ(resolved[0].size, resolved[1].size);
 }
 
-// Exhaustion degrades a Get to a miss.  Asserted because it is a KNOWN wrong
-// shape (the client will retry another peer for a key this node does hold) —
-// documented in ssd_backend.h, and pinned here so a future control-plane fix
-// has a test to change deliberately rather than discovering the behavior.
-TEST_F(SsdBackendTest, ResolveDegradesToAMissWhenStagingIsExhausted) {
+TEST_F(SsdBackendTest, ResolveReportsBusyWhenStagingIsExhausted) {
   SsdBackend* backend = Start(/*staging_pages=*/1);
   ASSERT_TRUE(Put(backend, "key-a", Payload(1024, 1)));
   ASSERT_TRUE(Put(backend, "key-b", Payload(1024, 2)));
@@ -440,7 +436,37 @@ TEST_F(SsdBackendTest, ResolveDegradesToAMissWhenStagingIsExhausted) {
   ASSERT_TRUE(a[0].found);  // takes the only page and holds it under a lease
 
   auto b = backend->BatchResolve({"key-b"}, false);
-  EXPECT_FALSE(b[0].found) << "expected the documented degrade-to-miss";
+  EXPECT_FALSE(b[0].found);
+  EXPECT_EQ(b[0].outcome, ResolveOutcome::kBusy);
+}
+
+TEST_F(SsdBackendTest, BusyBatchRollsBackEveryNewReservation) {
+  SsdBackend* backend = Start(/*staging_pages=*/4);
+  ASSERT_TRUE(Put(backend, "blocker", Payload(1024, 1)));
+  ASSERT_TRUE(Put(backend, "large-a", Payload(2 * kPageSize, 2)));
+  ASSERT_TRUE(Put(backend, "large-b", Payload(2 * kPageSize, 3)));
+  ASSERT_TRUE(backend->BatchResolve({"blocker"}, false)[0].found);  // one page remains leased
+
+  auto resolved = backend->BatchResolve({"large-a", "large-b"}, false);
+  ASSERT_EQ(resolved.size(), 2u);
+  EXPECT_EQ(resolved[0].outcome, ResolveOutcome::kBusy);
+  EXPECT_EQ(resolved[1].outcome, ResolveOutcome::kBusy);
+
+  // The first two-page reservation was returned when the second could not fit:
+  // all three pages not held by blocker are available to one writer.
+  auto allocated = backend->BatchAllocate({AllocateRequest{"three-pages", 3 * kPageSize}});
+  EXPECT_EQ(allocated[0].outcome, AllocateOutcome::kSuccessAllocated);
+}
+
+TEST_F(SsdBackendTest, BatchLargerThanArenaFailsWithoutRetryLoop) {
+  SsdBackend* backend = Start(/*staging_pages=*/3);
+  ASSERT_TRUE(Put(backend, "large-a", Payload(2 * kPageSize, 2)));
+  ASSERT_TRUE(Put(backend, "large-b", Payload(2 * kPageSize, 3)));
+
+  auto resolved = backend->BatchResolve({"large-a", "large-b"}, false);
+  ASSERT_EQ(resolved.size(), 2u);
+  EXPECT_EQ(resolved[0].outcome, ResolveOutcome::kFailed);
+  EXPECT_EQ(resolved[1].outcome, ResolveOutcome::kFailed);
 }
 
 // ---------------------------------------------------------------------------
