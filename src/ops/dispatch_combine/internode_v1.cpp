@@ -352,11 +352,17 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
         size_t stagingTokOffset = tokenId * xferBytes;
         int qpId = (tokenId / warpSize) % config.numQpPerPe;
 
+        // AMO_SET, not AMO_ADD: the flag slot has exactly one writer. flagSlotId comes from a
+        // per-node counter on this rank, and proxyPe = node * gpuPerNode + (rank % gpuPerNode)
+        // pairs each rank with exactly one remote rank, so (myNode, flagSlotId) names a slot no
+        // other sender touches. AMO_ADD makes the NIC issue an IB atomic -- a read-modify-write
+        // on the responder with its own ACK -- where AMO_SET is an 8-byte inline write that
+        // rides the same QP and is ordered behind the payload for free.
         shmem::ShmemPutMemNbiSignalThread(
             args.interNodeV1TokBufs.dispatchInp, remoteIdx * xferBytes,
             args.interNodeV1TokBufs.dispatchStaging, stagingTokOffset, tokenNum * xferBytes,
             args.interNodeChunkFlagMemObj, (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t),
-            tokenNum + 1, core::atomicType::AMO_ADD, proxyPe, qpId);
+            tokenNum + 1, core::atomicType::AMO_SET, proxyPe, qpId);
       }
       if (shouldSend) args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
     }
