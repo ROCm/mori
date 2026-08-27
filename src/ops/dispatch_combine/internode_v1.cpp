@@ -373,19 +373,26 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
     }
   }
 
-  // Only the warps that could have posted anything need to gather here: the loop above is
-  // `for (i = warpId; i < nNodes; i += warpNum)`, so with warpNum >= nNodes exactly the first
-  // nNodes warps of each block enter it. Counting all of them made every idle warp round-trip
-  // through a contended atomic before the token-count signal could go out -- at 2 nodes and
-  // 8 warps/block that is 6 useless arrivals in 8, and it is why the sweep keeps choosing
-  // warp_per_block=2 for dispatch.
+  // Only the warps that could have posted anything need to gather here.
+  //
+  // By warp: the loop above is `for (i = warpId; i < nNodes; i += warpNum)`, so with
+  // warpNum >= nNodes exactly the first nNodes warps of each block enter it.
+  //
+  // By block: block b covers tokens [blockChunkNum*b*warpSize, ...), so every block past
+  // ceil(curRankNumToken / (blockChunkNum*warpSize)) has an empty range and posts nothing.
+  // Below one chunk per block -- which is every shape up to warpSize tokens per rank, i.e.
+  // the whole low-latency regime -- that is a single block. Counting all rdmaBlockNum of them
+  // put ~80 arrivals on one contended address directly in front of the token-count signal.
   int sendWarpPerBlock = std::min(warpNum, nNodes);
-  if (warpId >= sendWarpPerBlock) return;
+  int chunkTokens = blockChunkNum * warpSize;
+  int activeBlockNum =
+      std::min(args.rdmaBlockNum, core::CeilDiv(args.curRankNumToken, chunkTokens));
+  if ((warpId >= sendWarpPerBlock) || (blockId >= activeBlockNum)) return;
 
   int finishedWarp = 0;
   if (laneId == 0) finishedWarp = atomicAdd(&args.interNodeBlocksBarrier[1], 1);
   finishedWarp = __shfl(finishedWarp, 0);
-  if ((finishedWarp + 1) == (args.rdmaBlockNum * sendWarpPerBlock)) {
+  if ((finishedWarp + 1) == (activeBlockNum * sendWarpPerBlock)) {
     if (laneId < nNodes) {
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
       index_t numTokenSignal =
