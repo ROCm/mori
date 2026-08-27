@@ -195,7 +195,7 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
       break;
     }
   }
-  if (context.IsProxyEnabled() && rdmaDeviceContext && anyRdmaPeer) {
+  if (context.IsProxyEnabled() && rdmaDeviceContext && anyRdmaPeer && rdmaRegister) {
     if (heap_begin) {
       application::RdmaMemoryRegion mr =
           rdmaDeviceContext->RegisterRdmaMemoryRegionAuto(localPtr, size);
@@ -223,7 +223,9 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
       }
     } else {
       cpuMemObj->lkey = heapLkey_;
-      memcpy(cpuMemObj->peerRkeys, heapRkeys_.data(), worldSize * sizeof(uint32_t));
+      if (!heapRkeys_.empty()) {
+        memcpy(cpuMemObj->peerRkeys, heapRkeys_.data(), worldSize * sizeof(uint32_t));
+      }
     }
   } else {
     // Native path — main's original code
