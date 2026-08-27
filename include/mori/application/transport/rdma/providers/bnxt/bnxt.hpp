@@ -28,7 +28,6 @@ extern "C" {
 
 #include <mutex>
 #include <set>
-#include <unordered_map>
 
 #include "mori/application/transport/rdma/providers/dv_loader.hpp"
 #include "mori/application/transport/rdma/rdma.hpp"
