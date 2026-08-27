@@ -10,40 +10,40 @@
       "dtype": "fp8_e4m3_fnuz",
       "num_tokens": 4,
       "hidden_dim": 6144,
-      "block_num": 32,
-      "rdma_block_num": 21,
+      "block_num": 64,
+      "rdma_block_num": 42,
       "warp_per_block": 4,
-      "bandwidth_gbps": 3.2,
-      "avg_rdma_bandwidth_gbps": 1.04,
-      "avg_xgmi_bandwidth_gbps": 3.46,
-      "avg_ll_bandwidth_gbps": 3.95,
-      "avg_latency_us": 47.43
+      "bandwidth_gbps": 3.88,
+      "avg_rdma_bandwidth_gbps": 1.02,
+      "avg_xgmi_bandwidth_gbps": 3.4,
+      "avg_ll_bandwidth_gbps": 3.88,
+      "avg_latency_us": 48.2
     },
     {
       "dtype": "fp8_e4m3_fnuz",
       "num_tokens": 8,
       "hidden_dim": 6144,
       "block_num": 64,
-      "rdma_block_num": 32,
+      "rdma_block_num": 42,
       "warp_per_block": 4,
-      "bandwidth_gbps": 6.81,
-      "avg_rdma_bandwidth_gbps": 2.02,
-      "avg_xgmi_bandwidth_gbps": 6.55,
-      "avg_ll_bandwidth_gbps": 8.22,
-      "avg_latency_us": 48.83
+      "bandwidth_gbps": 8.36,
+      "avg_rdma_bandwidth_gbps": 2.05,
+      "avg_xgmi_bandwidth_gbps": 6.66,
+      "avg_ll_bandwidth_gbps": 8.36,
+      "avg_latency_us": 48.1
     },
     {
       "dtype": "fp8_e4m3_fnuz",
       "num_tokens": 16,
       "hidden_dim": 6144,
       "block_num": 64,
-      "rdma_block_num": 32,
+      "rdma_block_num": 42,
       "warp_per_block": 4,
-      "bandwidth_gbps": 14.42,
-      "avg_rdma_bandwidth_gbps": 3.96,
-      "avg_xgmi_bandwidth_gbps": 12.94,
-      "avg_ll_bandwidth_gbps": 16.39,
-      "avg_latency_us": 49.72
+      "bandwidth_gbps": 16.48,
+      "avg_rdma_bandwidth_gbps": 3.99,
+      "avg_xgmi_bandwidth_gbps": 13.01,
+      "avg_ll_bandwidth_gbps": 16.48,
+      "avg_latency_us": 49.5
     }
   ]
 }
