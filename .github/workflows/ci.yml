@@ -623,20 +623,20 @@ jobs:
             $CT exec $CONTAINER bash $SCRIPT
             --rank 1 --master-addr $NODE1_HOST --master-port $PORT
             --ifname $NODE2_IFNAME
-            -- --op-type write --transfer-batch-size 128 --all
-            --sweep-start-size 1024 --sweep-max-size 16777216 --iters 4
-            --enable-sess --enable-batch-transfer
-            --num-qp-per-transfer 2
+            -- --op-type write --buffer-size 65536 --transfer-batch-size 256 --all
+            --sweep-start-size 1024 --sweep-max-size 16777216 --iters 128
+            --batch-contiguous --enable-sess --enable-batch-transfer
+            --num-qp-per-transfer 8 --num-worker-threads 8
             --num-initiator-dev 8 --num-target-dev 8
           )
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
           $CT exec $CONTAINER bash $SCRIPT \
             --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
             --ifname $NODE1_IFNAME \
-            -- --op-type write --transfer-batch-size 128 --all \
-            --sweep-start-size 1024 --sweep-max-size 16777216 --iters 4 \
-            --enable-sess --enable-batch-transfer \
-            --num-qp-per-transfer 2 \
+            -- --op-type write --buffer-size 65536 --transfer-batch-size 256 --all \
+            --sweep-start-size 1024 --sweep-max-size 16777216 --iters 128 \
+            --batch-contiguous --enable-sess --enable-batch-transfer \
+            --num-qp-per-transfer 8 --num-worker-threads 8 \
             --num-initiator-dev 8 --num-target-dev 8
           wait
 
@@ -782,6 +782,15 @@ jobs:
             --num-initiator-dev 8 --num-target-dev 8 \
             --target-dev-offset 5
           wait
+
+      - name: Reset GPU processes before EP internode bench
+        run: |
+          # IO internode steps leave many short-lived torchrun/mp.spawn workers; if any
+          # linger they keep HIP UAR host mappings and the EP bench hits hipHostRegister
+          # "already mapped" on mlx5. Best-effort cleanup on both nodes.
+          $CT exec $CONTAINER bash -c 'pkill -9 -f "tests.python.io.benchmark" 2>/dev/null || true; pkill -9 -f "test_dispatch_combine_internode" 2>/dev/null || true; sleep 2'
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
+            "$CT exec $CONTAINER bash -c 'pkill -9 -f tests.python.io.benchmark 2>/dev/null || true; pkill -9 -f test_dispatch_combine_internode 2>/dev/null || true; sleep 2'"
 
       - name: MORI-EP internode normal kernel bench
         run: |
