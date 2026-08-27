@@ -1502,6 +1502,17 @@ class EpDispatchCombineTestCase:
         tuning_scope = os.environ.get("MORI_TUNING_SCOPE", "full")
 
         block_set = set()
+        # Small-block candidates below the doubling sequence's usual 32 floor.
+        # Measured on MI300X EP16 v1_ll (tok=4/8/16/32): 8 loses everywhere;
+        # 16 ties the eventual winner at 4 tokens (48.83 vs 48.46us, within
+        # noise) but is clearly worse from 8 tokens up (e.g. 56.29 vs
+        # 49.01us dispatch at 8 tokens). Left in the sweep rather than
+        # hardcoded per-arch, so a re-tune (including on a different
+        # sm_count like MI308's 80) empirically finds out whether either
+        # actually wins there instead of assuming this MI300X result holds.
+        for extra in (8, 16):
+            if extra < sm_count:
+                block_set.add(extra)
         pow2 = 32
         while pow2 <= sm_count:
             block_set.add(pow2)
