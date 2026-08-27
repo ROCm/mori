@@ -54,9 +54,13 @@ _FP4_DTYPE = getattr(torch, "float4_e2m1fn_x2", None)
 # but under 2% at large ones).
 _TUNING_MARGIN = float(os.environ.get("MORI_EP_TUNING_MARGIN", "0.0"))
 
-# Rounds benchmarked per candidate during tuning. Override with
-# MORI_EP_TUNING_ROUNDS.
-_TUNING_ROUNDS = int(os.environ.get("MORI_EP_TUNING_ROUNDS", "9"))
+# Rounds benchmarked per candidate during tuning. Default matches main's
+# longstanding hardcoded value; override with MORI_EP_TUNING_ROUNDS. (This used
+# to default to 9 -- that was carried over from an abandoned median-scoring
+# experiment that wanted more samples to resist a single stalled round. Now
+# that selection is back to mean (see _beats), that extra defense isn't doing
+# anything for us, so there's no reason to pay the ~1.8x longer sweep.)
+_TUNING_ROUNDS = int(os.environ.get("MORI_EP_TUNING_ROUNDS", "5"))
 
 
 def _beats(new_lat, new_cfg, best_lat, best_cfg):
