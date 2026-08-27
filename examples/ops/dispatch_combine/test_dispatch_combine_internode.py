@@ -75,6 +75,13 @@ if _TUNING_ROUNDS < 2:
         f"got {_TUNING_ROUNDS}"
     )
 
+# Debug aid only, no effect on selection: print every candidate's full
+# PrettyTable (same _print_phase_table bench uses) instead of just the
+# one-line "disp sel=... comb sel=..." summary, so a candidate's raw
+# Best/Worst/Average can be compared directly against a --cmd bench run of
+# that same block/warp/rdma without re-deriving it from the summary line.
+_TUNING_VERBOSE = os.environ.get("MORI_EP_TUNING_VERBOSE", "0") == "1"
+
 
 def _beats(new_lat, new_cfg, best_lat, best_cfg):
     """Should *new_cfg* replace *best_cfg* as the tuning winner?
@@ -1557,6 +1564,9 @@ class EpDispatchCombineTestCase:
                 self.run_test_once(op, test_data, error_round, wr_i)
             assert len(error_round) == 0, f"Warmup failed: {error_round}"
 
+        disp_dtype_str = str(self.config.data_type).split(".")[-1]
+        comb_dtype_str = str(self.combine_data_type).split(".")[-1]
+
         config_idx = 0
         for bn in block_list:
             for warp in warp_list:
@@ -1609,10 +1619,19 @@ class EpDispatchCombineTestCase:
                             f"comb sel={comb_lat:.1f}us xgmi={ca:.1f}  "
                             f"(best disp={best_disp_lat:.1f}us comb={best_comb_lat:.1f}us)"
                         )
+                        if _TUNING_VERBOSE:
+                            self._print_phase_table(
+                                f"Dispatch ({disp_dtype_str}) "
+                                f"block={bn} warp={warp} rdma={rdma_bn}",
+                                disp_stats,
+                            )
+                            self._print_phase_table(
+                                f"Combine ({comb_dtype_str}) "
+                                f"block={bn} warp={warp} rdma={rdma_bn}",
+                                comb_stats,
+                            )
 
         if self.rank == 0:
-            disp_dtype_str = str(self.config.data_type).split(".")[-1]
-            comb_dtype_str = str(self.combine_data_type).split(".")[-1]
             print(f"\n{'=' * 70}")
             print("Tuning Result (best config chosen by grand-mean latency)")
             print(f"{'=' * 70}")
