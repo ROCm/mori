@@ -63,10 +63,14 @@ using index_t = int32_t;
 #define MORI_COMB_BARSLEEP 15
 #define MORI_COMB_BARSPREAD 16
 
-// MORI_EP_WORLD_SIZE is emitted by RenderEpSource before #include-ing this
-// header, so the global arrays below are sized to the exact config.
+// MORI_EP_WORLD_SIZE and MORI_EP_MAX_RECV are emitted by RenderEpSource before
+// #include-ing this header, so the global arrays below are sized to the exact
+// config. The fallbacks are for bare C++ callers only.
 #ifndef MORI_EP_WORLD_SIZE
 #define MORI_EP_WORLD_SIZE 8
+#endif
+#ifndef MORI_EP_MAX_RECV
+#define MORI_EP_MAX_RECV (MORI_EP_WORLD_SIZE * 32768)
 #endif
 
 template <typename T>
@@ -203,7 +207,7 @@ __device__ __forceinline__ gfx1250_TDM_GROUP1 TdmSplitShape(const TdmSplit128& s
   return TdmShape2D(32, sp.rows);
 }
 
-#define CUSPLIT_POOL_SLOTS (MORI_EP_WORLD_SIZE * 32768)
+#define CUSPLIT_POOL_SLOTS (MORI_EP_WORLD_SIZE * MORI_EP_MAX_RECV)
 #define CUSPLIT_MAX_BLOCKS 512
 #define CUSPLIT_MAX_TOPK 16
 

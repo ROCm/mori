@@ -163,7 +163,8 @@ std::string RenderEpSource(const EpCfg& cfg, const std::string& entry, const cha
                 "\n#define MORI_EP_SCALE_SLOTS " +
                 std::to_string((long long)cfg.worldSize * EpMaxRecv(cfg)) + "\n";
   }
-  std::string worldDef = "#define MORI_EP_WORLD_SIZE " + std::to_string(cfg.worldSize) + "\n";
+  std::string worldDef = "#define MORI_EP_WORLD_SIZE " + std::to_string(cfg.worldSize) + "\n" +
+                         "#define MORI_EP_MAX_RECV " + std::to_string(EpMaxRecv(cfg)) + "\n";
   return std::string("// mori jit v2 — generated, do not edit.\n") + worldDef + scaleDefs +
          "#include \"" + header +
          "\"\n"
