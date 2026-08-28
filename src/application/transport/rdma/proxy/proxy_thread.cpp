@@ -69,12 +69,12 @@ void ProxyThread::DrainCq(ProxyQpHandle& qph) {
     for (int i = 0; i < n; i++) {
       if (wc[i].status != IBV_WC_SUCCESS) {
         if (wc[i].opcode & IBV_WC_RECV) {
-          MORI_CORE_ERROR("proxy: RECV CQE error status={} ({}) ibvQP={}",
+          MORI_APP_ERROR("proxy: RECV CQE error status={} ({}) ibvQP={}",
                          wc[i].status, ibv_wc_status_str(wc[i].status),
                          qph.qp ? qph.qp->qp_num : 0);
         } else {
           uint32_t slot = static_cast<uint32_t>(wc[i].wr_id) & PROXY_RING_MASK;
-          MORI_CORE_ERROR("proxy: CQE error slot={} status={} ({}) wr_id={} ibvQP={}",
+          MORI_APP_ERROR("proxy: CQE error slot={} status={} ({}) wr_id={} ibvQP={}",
                          slot, wc[i].status, ibv_wc_status_str(wc[i].status), wc[i].wr_id,
                          qph.qp ? qph.qp->qp_num : 0);
           ring_->cmds[slot].status = PROXY_ERROR;
@@ -88,7 +88,7 @@ void ProxyThread::DrainCq(ProxyQpHandle& qph) {
           struct { uint64_t addr; uint64_t val; } payload;
           memcpy(&payload, reinterpret_cast<char*>(qph.recv_buf) + recv_idx * 64, 16);
           if (payload.addr == 0) {
-            MORI_CORE_ERROR("proxy: RECV atomic payload has null target addr, recv_idx={}", recv_idx);
+            MORI_APP_ERROR("proxy: RECV atomic payload has null target addr, recv_idx={}", recv_idx);
             continue;
           }
           volatile uint64_t* target = reinterpret_cast<volatile uint64_t*>(payload.addr);
