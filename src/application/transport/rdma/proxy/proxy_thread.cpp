@@ -138,6 +138,13 @@ bool ProxyThread::BuildWr(volatile ProxyCmd* cmd, ProxyQpHandle& qph,
       wr.wr.rdma.rkey = (qph.rkey_override != 0) ? qph.rkey_override : cmd->rkey;
       break;
     case PROXY_RDMA_WRITE_INLINE:
+      if (cmd->inline_tag != PROXY_INLINE_SCALAR_WRITE ||
+          cmd->inline_len == 0 || cmd->inline_len > PROXY_MAX_INLINE_DATA) {
+        MORI_APP_ERROR("proxy: WRITE_INLINE invalid tag={} len={}", cmd->inline_tag, cmd->inline_len);
+        return false;
+      }
+      sge.addr = reinterpret_cast<uintptr_t>(const_cast<uint8_t*>(cmd->inline_data));
+      sge.length = cmd->inline_len;
       wr.opcode = IBV_WR_RDMA_WRITE;
       wr.send_flags |= IBV_SEND_INLINE;
       wr.wr.rdma.remote_addr = cmd->dst_addr;

@@ -149,7 +149,7 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernel<application::TransportType
     rkey = dest->peerRkeys[pe];
   }
   core::ProxyPostWriteInline(ring, epIndex,
-                             reinterpret_cast<uint64_t>(val), 0, raddr, rkey, bytes);
+                             val, 0, raddr, rkey, bytes);
 }
 
 template <>

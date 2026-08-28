@@ -59,7 +59,7 @@ inline __device__ uint32_t ProxyPostWrite(
 
 inline __device__ uint32_t ProxyPostWriteInline(
     volatile ProxyRing* ring, uint32_t qp_idx,
-    uint64_t src_addr, uint32_t lkey,
+    const void* src, uint32_t lkey,
     uint64_t dst_addr, uint32_t rkey,
     uint32_t length) {
   uint32_t seq = ProxyReserveSlot(ring);
@@ -68,12 +68,22 @@ inline __device__ uint32_t ProxyPostWriteInline(
 
   ring->cmds[slot].op = PROXY_RDMA_WRITE_INLINE;
   ring->cmds[slot].qp_idx = qp_idx;
-  ring->cmds[slot].src_addr = src_addr;
   ring->cmds[slot].dst_addr = dst_addr;
   ring->cmds[slot].length = length;
   ring->cmds[slot].lkey = lkey;
   ring->cmds[slot].rkey = rkey;
   ring->cmds[slot].flags = 1;
+
+  if (src != nullptr && length > 0 && length <= PROXY_MAX_INLINE_DATA) {
+    const uint64_t* s64 = reinterpret_cast<const uint64_t*>(src);
+    volatile uint64_t* d64 = reinterpret_cast<volatile uint64_t*>(ring->cmds[slot].inline_data);
+    for (uint32_t i = 0; i < (length + 7) / 8; i++) d64[i] = s64[i];
+    ring->cmds[slot].inline_tag = PROXY_INLINE_SCALAR_WRITE;
+    ring->cmds[slot].inline_len = length;
+  } else {
+    ring->cmds[slot].inline_tag = PROXY_INLINE_NONE;
+    ring->cmds[slot].inline_len = 0;
+  }
 
   __threadfence_system();
   ring->cmds[slot].status = PROXY_PENDING;

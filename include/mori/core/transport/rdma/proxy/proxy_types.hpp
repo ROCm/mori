@@ -16,12 +16,19 @@ enum ProxyCmdOp : uint32_t {
   PROXY_SIGNAL_WRITE = 5,      // signal paired with data → RDMA_WRITE (same PCIe path)
 };
 
+enum ProxyInlineTag : uint32_t {
+  PROXY_INLINE_NONE = 0,
+  PROXY_INLINE_SCALAR_WRITE = 1,
+};
+
 enum ProxyCmdStatus : uint32_t {
   PROXY_FREE = 0,
   PROXY_PENDING = 1,
   PROXY_COMPLETED = 3,
   PROXY_ERROR = 4,
 };
+
+static constexpr uint32_t PROXY_MAX_INLINE_DATA = 48;
 
 struct alignas(128) ProxyCmd {
   uint32_t op;
@@ -37,8 +44,12 @@ struct alignas(128) ProxyCmd {
   volatile uint32_t status;
   uint32_t pad0;
   volatile uint64_t result;
-  uint8_t pad1[128 - 72];
+  uint8_t inline_data[PROXY_MAX_INLINE_DATA];
+  uint32_t inline_tag;
+  uint32_t inline_len;
 };
+
+static_assert(sizeof(ProxyCmd) == 128, "ProxyCmd must be 128 bytes");
 
 static constexpr uint32_t PROXY_RING_SIZE = 65536;
 static constexpr uint32_t PROXY_RING_MASK = PROXY_RING_SIZE - 1;
