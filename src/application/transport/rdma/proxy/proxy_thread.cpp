@@ -3,6 +3,7 @@
 #include "mori/core/transport/rdma/proxy/proxy_thread.hpp"
 
 #include <arpa/inet.h>
+#include <atomic>
 #include <hip/hip_runtime_api.h>
 #include <cerrno>
 #include <cstdio>
@@ -93,8 +94,7 @@ void ProxyThread::DrainCq(ProxyQpHandle& qph) {
           }
           volatile uint64_t* target = reinterpret_cast<volatile uint64_t*>(payload.addr);
           __atomic_fetch_add(target, payload.val, __ATOMIC_SEQ_CST);
-          asm volatile("clflush (%0)" :: "r"(target) : "memory");
-          asm volatile("sfence" ::: "memory");
+          std::atomic_thread_fence(std::memory_order_seq_cst);
           ibv_sge rsge{};
           rsge.addr = reinterpret_cast<uintptr_t>(qph.recv_buf) + recv_idx * 64;
           rsge.length = 64;
