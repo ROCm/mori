@@ -53,8 +53,7 @@ Context::Context(BootstrapNetwork& bootNet) : bootNet(bootNet) {
   // uncached SDMA buffers, leading to cache/IPC inconsistency hangs.
   sdmaEnabled = env::IsEnvVarEnabled("MORI_ENABLE_SDMA");
   p2pDisabled = env::IsEnvVarEnabled("MORI_DISABLE_P2P");
-  proxyEnabled = env::IsEnvVarEnabled("MORI_ENABLE_HOST_PROXY") ||
-                 env::IsEnvVarEnabled("MORI_EP_OVER_RDMA");
+  proxyEnabled = env::IsEnvVarEnabled("MORI_ENABLE_HOST_PROXY");
   CollectHostNames();
   // Lightweight: topology, NIC selection, transport type decision, SDMA queues.
   // No QP creation, no AllToAll. Modules that need the initial RDMA endpoint
