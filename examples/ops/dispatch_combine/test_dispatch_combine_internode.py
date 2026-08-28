@@ -110,29 +110,39 @@ def _beats(new_lat, new_cfg, best_lat, best_cfg):
     return False
 
 
-def _headline_bw(stats, kernel_type):
-    """The winner's own bandwidth, for the JSON's top-level bandwidth_gbps.
-
-    Selection no longer runs on bandwidth (see _beats), but the saved config
-    still wants one representative bandwidth number; per-metric averages
-    (rdma/xgmi/ll) are saved alongside it regardless of kernel type.
-
-    Deliberately the slowest-rank mean (stats["*_worst_rank"]), not the
-    grand-mean stats["rdma"/"ll"][2] this file prints as "Average":
-    tuning_config.save_tuning_result gates overwriting an existing rule on
-    `new_bw > old_bw`, and every rule already on disk (including ones this PR
-    doesn't touch, e.g. other GPU models/kernel types) was written under the
-    old, main-derived definition of bandwidth_gbps -- slowest-rank mean
-    bandwidth. Saving the grand mean instead would systematically read higher
-    than a same-performance old entry (grand mean >= slowest-rank mean by
-    construction) and silently overwrite still-good rules on the first re-tune
-    with this code, even with zero real improvement.
-    """
-    is_ll_kernel = kernel_type in (
+def _is_ll_kernel(kernel_type):
+    return kernel_type in (
         mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
         mori.ops.EpDispatchCombineKernelType.AsyncLL,
     )
-    return stats["ll_worst_rank"] if is_ll_kernel else stats["rdma_worst_rank"]
+
+
+def _headline_bw(stats, kernel_type):
+    """The winner's bandwidth for the JSON's top-level bandwidth_gbps.
+
+    Which of the recorded bandwidths is the meaningful one depends on the
+    kernel: LL kernels move their payload over xGMI (reported as LL bandwidth),
+    v1 over RDMA. bandwidth_gbps is that pick, so a reader does not have to
+    know the rule; avg_rdma/xgmi/ll_bandwidth_gbps are all saved alongside it
+    regardless.
+
+    The grand mean -- the same number this file prints as the table's
+    "Average" row, so a saved rule can be checked against a --cmd bench run of
+    that block/warp/rdma without re-deriving anything. It used to be the
+    slowest-rank mean instead, purely so it stayed comparable with rules
+    written by older code: save_tuning_result gated overwriting on
+    `new_bw > old_bw`, and reading higher than a same-performance old entry
+    would have overwritten still-good rules. That gate is gone (nothing
+    numeric decides overwrites now), and with it the reason to report a
+    quantity nothing else prints.
+
+    Rules already on disk keep their slowest-rank value until re-tuned, so
+    bandwidth_gbps is only comparable within one tuning run's output -- which
+    is all it was ever good for, given two runs come from different hosts and
+    load. The slowest-rank figure is still printed per candidate for reference
+    (see the sweep's summary), just not saved.
+    """
+    return stats["ll"][2] if _is_ll_kernel(kernel_type) else stats["rdma"][2]
 
 
 def _perf_report():
@@ -262,6 +272,8 @@ def _save_internode_tuning_result(
 ):
     from pathlib import Path
     from mori.ops.tuning_config import (
+        BANDWIDTH_METRIC_GRAND_MEAN,
+        BANDWIDTH_METRIC_KEY,
         TuningConfigManager,
         dtype_to_config_str,
         build_config_filename,
@@ -300,6 +312,7 @@ def _save_internode_tuning_result(
         "avg_xgmi_bandwidth_gbps": round(_stats_avg(best_disp_all_bw, "xgmi"), 2),
         "avg_ll_bandwidth_gbps": round(_stats_avg(best_disp_all_bw, "ll"), 2),
         "avg_latency_us": round(_stats_avg(best_disp_all_bw, "lat"), 2),
+        BANDWIDTH_METRIC_KEY: BANDWIDTH_METRIC_GRAND_MEAN,
     }
 
     combine_entry = {
@@ -316,6 +329,7 @@ def _save_internode_tuning_result(
         "avg_xgmi_bandwidth_gbps": round(_stats_avg(best_comb_all_bw, "xgmi"), 2),
         "avg_ll_bandwidth_gbps": round(_stats_avg(best_comb_all_bw, "ll"), 2),
         "avg_latency_us": round(_stats_avg(best_comb_all_bw, "lat"), 2),
+        BANDWIDTH_METRIC_KEY: BANDWIDTH_METRIC_GRAND_MEAN,
     }
 
     if config_path == "auto":
@@ -1388,8 +1402,10 @@ class EpDispatchCombineTestCase:
 
         Returns dict with keys rdma, xgmi, ll, lat — each a (worst, best, avg)
         tuple identical to what PrettyTable prints — plus rdma_worst_rank and
-        ll_worst_rank (see _headline_bw for why those need to exist alongside
-        the grand-mean numbers above).
+        ll_worst_rank, the per-rank means' minimum. Those two are printed
+        alongside the tuning summary as a straggler check and are not saved or
+        used for selection; "worst" inside the tuples above is the minimum over
+        individual samples, which is a different (noisier) quantity.
         """
         _s = self._compute_stats
         xgmi_s = _s(kept[:, :, col_xgmi])
@@ -1661,6 +1677,21 @@ class EpDispatchCombineTestCase:
                 self._print_phase_table(
                     f"{label} ({dtype_s}) block={cfg[0]} warp={cfg[1]} rdma={cfg[2]}",
                     st,
+                )
+                # Slowest-rank bandwidth, for reference only -- neither the
+                # sweep nor the saved rule uses it. Worth seeing next to the
+                # table's Average because a large gap between the two means the
+                # ranks disagree, i.e. that Average is smoothing over a
+                # straggler rather than describing every rank.
+                worst_key = (
+                    "ll_worst_rank"
+                    if _is_ll_kernel(self.config.kernel_type)
+                    else "rdma_worst_rank"
+                )
+                print(
+                    f"  {label.strip()} slowest-rank bandwidth: "
+                    f"{st[worst_key]:.2f} GB/s "
+                    f"(table Average: {_headline_bw(st, self.config.kernel_type):.2f} GB/s)"
                 )
             print(f"{'=' * 70}")
 
