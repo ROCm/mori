@@ -1493,12 +1493,21 @@ class EpDispatchCombineTestCase:
     def tuning_dispatch_combine(
         self, max_num_token, save_tuning_config=None, skip_verify=False
     ):
+        tuning_scope = os.environ.get("MORI_TUNING_SCOPE", "full")
+        if save_tuning_config and tuning_scope == "quick":
+            raise ValueError(
+                "MORI_TUNING_SCOPE=quick cannot be combined with "
+                "--save-tuning-config: quick only sweeps 3 warp_per_block "
+                "candidates against full's 5, plus a narrower rdma_block_num "
+                "set, so a quick-scope winner is not a result worth "
+                "committing as a saved config. Re-run with MORI_TUNING_SCOPE "
+                "unset (or =full) to save."
+            )
+
         op = mori.ops.EpDispatchCombineOp(self.config)
         sm_count = torch.cuda.get_device_properties(
             self.rank % self.gpu_per_node
         ).multi_processor_count
-
-        tuning_scope = os.environ.get("MORI_TUNING_SCOPE", "full")
 
         block_set = set()
         # Small-block candidates below the doubling sequence's usual 32 floor.
