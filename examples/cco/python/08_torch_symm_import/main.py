@@ -125,7 +125,9 @@ def main():
     uid = comm_mpi.bcast(uid, root=0)
 
     errors = 0
-    with Communicator.init(nranks, rank, uid, per_rank_vmm=PER_RANK_VMM) as comm:
+    with Communicator.init(
+        nranks, rank, uid, per_rank_vmm=PER_RANK_VMM, lsa_only=True
+    ) as comm:
         if rank == 0:
             print(f"CommCreate: {nranks} ranks, PER_RANK_VMM={PER_RANK_VMM >> 30} GiB")
 
@@ -147,7 +149,8 @@ def main():
         per_rank_size = dc.per_rank_size
         host_buf = (ctypes.c_int * 8)()
         for pe in range(nranks):
-            peer_ptr = win.local_ptr + (pe - my_lsa) * per_rank_size
+            peer_ptr = win.peer_ptr(pe)
+            assert peer_ptr == win.local_ptr + (pe - my_lsa) * per_rank_size
             _check(
                 hip.hipMemcpy(
                     host_buf,

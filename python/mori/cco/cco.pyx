@@ -5,19 +5,23 @@
 
 from libc.stdint cimport intptr_t
 from libc.stddef cimport size_t
-from libc.string cimport memcpy
+from libc.string cimport memcpy, memset
 
 from .cco cimport (
-    ccoComm, ccoUniqueId, ccoDevCommRequirements, ccoDevComm, ccoWindow_t,
-    ccoGdaConnectionType,
-    CCO_API_MAGIC, CCO_API_VERSION,
+    ccoComm, ccoCommInfo, ccoUniqueId, ccoDevCommRequirements, ccoDevComm,
+    ccoWindow_t, ccoWindowRegisterOptions, ccoGdaConnectionType,
+    CCO_API_MAGIC, CCO_API_VERSION, CCO_COMM_INFO_VERSION,
+    CCO_WINDOW_REGISTER_OPTIONS_VERSION,
+    CCO_WINDOW_REGISTER_DEFAULT, CCO_WINDOW_REGISTER_LSA_ONLY,
     CCO_GDA_CONNECTION_NONE, CCO_GDA_CONNECTION_FULL,
     CCO_GDA_CONNECTION_CROSSNODE, CCO_GDA_CONNECTION_RAIL,
-    ccoGetUniqueId, ccoCommCreate, ccoCommDestroy,
+    ccoGetUniqueId, ccoCommCreate, ccoCommCreateLsaOnly,
+    ccoCommDestroy, ccoCommGetInfo,
     ccoMemAlloc, ccoMemImport, ccoMemFree,
     ccoWindowDeregister, ccoDevCommCreate, ccoDevCommDestroy,
     ccoDevCommCopyToDevice, ccoDevCommFreeDeviceCopy,
-    ccoBarrierAll, ccoWindowRegister,
+    ccoBarrierAll, ccoWindowRegister, ccoWindowRegisterExternal,
+    ccoGetPeerPtr,
 )
 
 
@@ -259,20 +263,28 @@ def get_unique_id():
     return UniqueId.create()
 
 
-def comm_create(UniqueId uid, int n_ranks, int rank, size_t per_rank_vmm_size):
+def comm_create(UniqueId uid, int n_ranks, int rank, size_t per_rank_vmm_size,
+                bint lsa_only=False):
     """
     Create a communicator.  All ranks call with the same uid (broadcast from
     rank 0) and their own rank index.
 
     per_rank_vmm_size: bytes of flat VA reserved per rank for symmetric memory.
+    lsa_only: skip NIC provider and RDMA initialization while retaining LSA.
     """
     cdef Comm comm = Comm.__new__(Comm)
     cdef ccoComm* out_comm = NULL
     cdef int ret
     with nogil:
-        ret = ccoCommCreate(uid._uid, n_ranks, rank, per_rank_vmm_size, &out_comm)
+        if lsa_only:
+            ret = ccoCommCreateLsaOnly(
+                uid._uid, n_ranks, rank, per_rank_vmm_size, &out_comm)
+        else:
+            ret = ccoCommCreate(
+                uid._uid, n_ranks, rank, per_rank_vmm_size, &out_comm)
     if ret != 0:
-        raise RuntimeError(f"ccoCommCreate failed: {ret}")
+        api = "ccoCommCreateLsaOnly" if lsa_only else "ccoCommCreate"
+        raise RuntimeError(f"{api} failed: {ret}")
     comm._ptr = out_comm
     return comm
 
@@ -287,6 +299,29 @@ def comm_destroy(Comm comm):
     comm._ptr = NULL
     if ret != 0:
         raise RuntimeError(f"ccoCommDestroy failed: {ret}")
+
+
+def comm_get_info(Comm comm):
+    """Return the versioned host communicator topology snapshot."""
+    cdef ccoCommInfo info
+    cdef int ret
+    memset(&info, 0, sizeof(ccoCommInfo))
+    info.size = sizeof(ccoCommInfo)
+    info.magic = CCO_API_MAGIC
+    info.version = CCO_COMM_INFO_VERSION
+    with nogil:
+        ret = ccoCommGetInfo(comm._ptr, &info)
+    if ret != 0:
+        raise RuntimeError(f"ccoCommGetInfo failed: {ret}")
+    return {
+        "version": info.version,
+        "rank": info.rank,
+        "world_size": info.worldSize,
+        "lsa_rank": info.lsaRank,
+        "lsa_size": info.lsaSize,
+        "lsa_start": info.lsaStart,
+        "per_rank_size": info.perRankSize,
+    }
 
 
 def mem_alloc(Comm comm, size_t size):
@@ -308,7 +343,8 @@ def mem_import(Comm comm, intptr_t external_ptr, size_t size):
     Import an external HIP VMM allocation (e.g. a torch.symm_mem tensor buffer)
     into this rank's flat-VA slot without allocating new physical memory. Returns
     the local (flat-VA) pointer as intptr_t; it aliases the external buffer and can
-    be passed to window_register_ptr() and freed with mem_free().
+    be passed to window_register_ptr() and freed with mem_free(). The external
+    owner must keep the backing allocation alive and performs its final release.
     """
     cdef void* ptr = NULL
     cdef int ret
@@ -361,27 +397,59 @@ def window_register_ptr(Comm comm, intptr_t ptr, size_t size):
     return <intptr_t>win
 
 
-def window_register_external(Comm comm, intptr_t external_ptr, size_t size):
+def window_register_external(
+    Comm comm, intptr_t external_ptr, size_t size, bint lsa_only=False
+):
     """
     Overload C: import an EXTERNAL HIP VMM allocation (e.g. a torch.symm_mem
     tensor buffer) into the flat LSA space and register it as a window in one call.
     Collective — all ranks call in the same order with the same size.
+    Set lsa_only=True to retain LSA mappings/window creation while skipping RDMA
+    memory-region registration.
 
     Returns (win: intptr_t, local_ptr: intptr_t), where local_ptr is the flat-VA
     alias of the external buffer.
     """
     cdef ccoWindow_t win = NULL
     cdef void* local_ptr = NULL
+    cdef ccoWindowRegisterOptions options
     cdef int ret
+    memset(&options, 0, sizeof(ccoWindowRegisterOptions))
+    options.size = sizeof(ccoWindowRegisterOptions)
+    options.magic = CCO_API_MAGIC
+    options.version = CCO_WINDOW_REGISTER_OPTIONS_VERSION
+    options.flags = (
+        CCO_WINDOW_REGISTER_LSA_ONLY
+        if lsa_only
+        else CCO_WINDOW_REGISTER_DEFAULT
+    )
     with nogil:
-        ret = ccoWindowRegister(comm._ptr, <void*>external_ptr, size, &win, &local_ptr)
+        ret = ccoWindowRegisterExternal(
+            comm._ptr,
+            <void*>external_ptr,
+            size,
+            &options,
+            &win,
+            &local_ptr,
+        )
     if ret != 0:
         raise RuntimeError(f"ccoWindowRegister (external) failed: {ret}")
     return (<intptr_t>win, <intptr_t>local_ptr)
 
 
+def get_peer_ptr(Comm comm, intptr_t local_ptr, int pe):
+    """
+    Return this process's LSA flat-VA mapping for world rank pe, or 0 when pe is
+    outside the communicator's LSA team.
+    """
+    cdef void* peer_ptr
+    with nogil:
+        peer_ptr = ccoGetPeerPtr(comm._ptr, <void*>local_ptr, pe)
+    return <intptr_t>peer_ptr
+
+
 def window_deregister(Comm comm, intptr_t win):
-    """Deregister and release a window.  Collective."""
+    """Deregister and release a window.  This operation is local."""
     cdef int ret
     with nogil:
         ret = ccoWindowDeregister(comm._ptr, <ccoWindow_t>win)

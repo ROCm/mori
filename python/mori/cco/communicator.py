@@ -206,18 +206,27 @@ class ImportedWindow(CCOResource):
     ``ext_ptr`` must be the base of a HIP VMM allocation exportable to the comm's
     handle type. ``local_ptr`` is the cco flat-VA alias of that buffer; peers can
     address it through the LSA window just like a ``ccoMemAlloc`` buffer. Cleanup
-    deregisters the window and frees the imported alias (unmap + drop the retained
-    handle refcount); the external owner keeps its own mapping.
+    deregisters the window and unmaps the imported alias; the external owner must
+    keep its allocation alive through this object's lifetime and performs the
+    final physical-handle release.
     """
 
-    def __init__(self, comm: Communicator, ext_ptr: int, size: int) -> None:
+    def __init__(
+        self,
+        comm: Communicator,
+        ext_ptr: int,
+        size: int,
+        *,
+        lsa_only: bool = False,
+    ) -> None:
         super().__init__(comm)
         self._ext_ptr = ext_ptr
         self._size = size
+        self._lsa_only = lsa_only
         # One call (ccoWindowRegister overload C): import the external buffer into
         # the flat LSA space and register the window; returns (handle, flat-VA ptr).
         self._handle, self._local_ptr = _cco.window_register_external(
-            comm._raw, ext_ptr, size
+            comm._raw, ext_ptr, size, lsa_only=lsa_only
         )
 
     def _deallocate(self) -> None:
@@ -246,13 +255,23 @@ class ImportedWindow(CCOResource):
     def size(self) -> int:
         return self._size
 
+    def peer_ptr(self, pe: int) -> int:
+        """Return this process's LSA mapping for world rank ``pe``.
+
+        Returns 0 when ``pe`` is outside this communicator's LSA team. The
+        returned address uses this process's local slot placement; another rank
+        may place the same logical window at a different local offset.
+        """
+        self._check_valid()
+        return _cco.get_peer_ptr(self._comm._raw, self._local_ptr, pe)
+
     def __repr__(self) -> str:
         if not self.is_valid:
             return "<ImportedWindow: closed>"
         return (
             f"<ImportedWindow: handle={self._handle:#x}, "
             f"local_ptr={self._local_ptr:#x}, ext_ptr={self._ext_ptr:#x}, "
-            f"size={self._size}>"
+            f"size={self._size}, lsa_only={self._lsa_only}>"
         )
 
 
@@ -334,6 +353,10 @@ class Communicator:
         self._resources: list[CCOResource] = []
         self._rank: int | None = None
         self._nranks: int | None = None
+        self._lsa_rank: int | None = None
+        self._lsa_size: int | None = None
+        self._lsa_start: int | None = None
+        self._per_rank_size: int | None = None
 
     @staticmethod
     def get_unique_id() -> UniqueId:
@@ -347,13 +370,23 @@ class Communicator:
         rank: int,
         unique_id: UniqueId,
         per_rank_vmm: int = DEFAULT_PER_RANK_VMM,
+        lsa_only: bool = False,
     ) -> Communicator:
-        """Collective: create a CCO communicator."""
+        """Collective: create a CCO communicator.
+
+        ``lsa_only=True`` skips NIC provider and RDMA initialization while
+        retaining host/P2P topology discovery and LSA flat-VA support.
+        """
         comm = cls()
         uid = unique_id.ptr if isinstance(unique_id, UniqueId) else unique_id
-        comm._raw = _cco.comm_create(uid, nranks, rank, per_rank_vmm)
-        comm._rank = rank
-        comm._nranks = nranks
+        comm._raw = _cco.comm_create(uid, nranks, rank, per_rank_vmm, lsa_only=lsa_only)
+        info = _cco.comm_get_info(comm._raw)
+        comm._rank = info["rank"]
+        comm._nranks = info["world_size"]
+        comm._lsa_rank = info["lsa_rank"]
+        comm._lsa_size = info["lsa_size"]
+        comm._lsa_start = info["lsa_start"]
+        comm._per_rank_size = info["per_rank_size"]
         return comm
 
     def destroy(self) -> None:
@@ -387,6 +420,35 @@ class Communicator:
         return self._nranks  # type: ignore[return-value]
 
     @property
+    def world_size(self) -> int:
+        """World communicator size (alias of :attr:`nranks`)."""
+        return self.nranks
+
+    @property
+    def lsa_rank(self) -> int:
+        """This rank's index within its contiguous LSA team."""
+        self._check_valid("get lsa_rank")
+        return self._lsa_rank  # type: ignore[return-value]
+
+    @property
+    def lsa_size(self) -> int:
+        """Number of ranks in this communicator's LSA team."""
+        self._check_valid("get lsa_size")
+        return self._lsa_size  # type: ignore[return-value]
+
+    @property
+    def lsa_start(self) -> int:
+        """World rank of LSA rank zero."""
+        self._check_valid("get lsa_start")
+        return self._lsa_start  # type: ignore[return-value]
+
+    @property
+    def per_rank_size(self) -> int:
+        """Byte stride between LSA rank slices in this process's flat mapping."""
+        self._check_valid("get per_rank_size")
+        return self._per_rank_size  # type: ignore[return-value]
+
+    @property
     def ptr(self) -> int:
         self._check_valid("get ptr")
         return self._raw.ptr  # type: ignore[union-attr]
@@ -407,14 +469,17 @@ class Communicator:
         self._resources.append(r)
         return r
 
-    def register_external_window(self, ext_ptr: int, size: int) -> ImportedWindow:
+    def register_external_window(
+        self, ext_ptr: int, size: int, *, lsa_only: bool = False
+    ) -> ImportedWindow:
         """Register an EXTERNAL HIP VMM allocation (e.g. a torch.symm_mem tensor
         buffer) into the flat LSA space without copying: imports its physical
         handle into a flat-VA slot, then registers it as a P2P/LSA window.
+        Set ``lsa_only=True`` to skip RDMA MR registration.
         Collective — all ranks call in the same order with the same size.
         """
         self._check_valid("register_external_window")
-        r = ImportedWindow(self, ext_ptr, size)
+        r = ImportedWindow(self, ext_ptr, size, lsa_only=lsa_only)
         self._resources.append(r)
         return r
 
@@ -437,7 +502,8 @@ class Communicator:
             return "<Communicator: destroyed>"
         return (
             f"<Communicator: rank={self._rank}/{self._nranks}, "
-            f"ptr={self._raw.ptr:#x}>"
+            f"lsa_rank={self._lsa_rank}/{self._lsa_size}, "
+            f"lsa_start={self._lsa_start}, ptr={self._raw.ptr:#x}>"
         )  # type: ignore[union-attr]
 
     def __enter__(self) -> Communicator:

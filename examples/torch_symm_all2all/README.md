@@ -1,8 +1,12 @@
 # All-to-all over the mori torch SymmetricMemory backend
 
-One-shot all-to-all against a symmetric window, written twice — `all2all_hip.py` and
-`all2all_triton.py`. Each is self-contained and runs on its own; neither uses mori's shmem
-or cco. The only thing either needs from the backend is the peer pointers torch publishes:
+One-shot all-to-all against a symmetric window, with the same allocation exposed through
+both supported addressing models:
+
+- `all2all_hip.py` and `all2all_triton.py` use torch's pointer array.
+- `all2all_flydsl_lsa.py` uses the CCO window handle and LSA address arithmetic.
+
+The pointer-array kernels address a destination as:
 
 ```
 recv slot of rank p, chunk from rank r  ==  peers[p] + r*chunk_bytes
@@ -11,6 +15,7 @@ recv slot of rank p, chunk from rank r  ==  peers[p] + r*chunk_bytes
 ```bash
 torchrun --nnodes=1 --nproc_per_node=8 all2all_hip.py --chunk-kib 256
 torchrun --nnodes=1 --nproc_per_node=8 all2all_triton.py --chunk-kib 256
+torchrun --nnodes=1 --nproc_per_node=8 all2all_flydsl_lsa.py --chunk-kib 256
 ```
 
 Needs **torch >= 2.9**: `symm_mem.set_backend()`, and the SymmetricMemory interface the
@@ -38,12 +43,21 @@ all2all_push_ptrs(send, hdl.buffer_ptrs_dev, chunk_bytes, rank_id, world_size)
 ```
 
 `hdl.buffer_ptrs_dev` is the N-entry device array, which is what torch's model provides and
-what its own backends force — they map each peer at an unrelated address. This backend does
-map every rank into one evenly-strided span, but `base + rank*stride` is deliberately not
-exposed: [ROCm/mori#557](https://github.com/ROCm/mori/issues/557) is where the flat window
-arrives, as cco's `ccoWindowDevice` rather than as a third scheme invented here. An earlier
-version of this example implemented both forms to compare them; they measured within a
-couple of percent of each other, so nothing is given up by shipping only the array.
+what its own backends consume. MORI derives that array from the same CCO window available
+to an LSA kernel:
+
+```python
+from mori.allocator import get_cco_window
+import mori.cco.device.flydsl as cco
+
+lsa = get_cco_window(recv, group_name)
+# In a FlyDSL kernel:
+dst = cco.Window(lsa.window_handle).lsa_ptr(peer_lsa_rank, offset)
+```
+
+`get_cco_window()` returns an owning object: keep it alive until kernels using the raw
+`window_handle` have completed. Stage 2 supports peers in the local LSA team; GDA/SDMA and
+cross-node transport selection remain later work.
 
 ## The Triton version
 
@@ -95,9 +109,10 @@ flight to cover interconnect latency: 15.8 GB/s on gfx1250 and 745 GB/s on gfx95
 same 4 MiB payload. Splitting each chunk across `blocks_per_peer` blocks is worth ~2.5x on
 gfx950 and ~95x on gfx1250.
 
-Uncached/fine-grained windows, as mori's cco windows are, were measured and rejected: half
-the bandwidth on gfx1250 (712 vs 1499 GB/s at 4 ranks) and no change on gfx950. The backend
-uses coarse-grained pinned memory.
+Uncached/fine-grained backing was measured and rejected: half the bandwidth on gfx1250
+(712 vs 1499 GB/s at 4 ranks) and no change on gfx950. The torch-owned allocation remains
+coarse-grained pinned memory; importing it into CCO adds an alias and does not change its
+physical allocation type.
 
 ### HIP vs Triton
 

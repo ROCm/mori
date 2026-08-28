@@ -21,26 +21,25 @@
 # SOFTWARE.
 """Register mori as a torch SymmetricMemory backend. Requires **torch >= 2.9**.
 
-Self-contained: plain HIP VMM, no shmem or cco allocator involved, so no mori bootstrap
-is needed -- torch's process group is the only rendezvous::
+Torch-owned HIP VMM allocations are imported into group-scoped CCO LSA windows. The
+normal torch API remains the pointer-array model; ``get_cco_window`` exposes the same
+mapping as a lifetime-safe CCO window view::
 
     import torch.distributed._symmetric_memory as symm_mem
-    from mori.allocator import register_symm_backend
+    from mori.allocator import get_cco_window, register_symm_backend
 
     symm_mem.set_backend("MORI")   # importing mori.allocator registers it
 
     t   = symm_mem.empty(1024, dtype=torch.bfloat16, device=device)
     hdl = symm_mem.rendezvous(t, group_name)
     peer = hdl.get_buffer(1, (1024,), torch.bfloat16)
+    lsa = get_cco_window(t, group_name)
 
 Peers are exposed the way torch's model expects, as the ``buffer_ptrs`` /
 ``buffer_ptrs_dev`` array -- one base address per rank, same as every other backend.
 
-Internally the ranks are mapped into one flat span, so those pointers happen to be evenly
-strided (``buffer_ptrs[r] == buffer_ptrs[0] + r*stride``). That is deliberately not public
-yet: exposing it belongs with mori's cco window, whose ``ccoWindowDevice`` already defines
-the layout (``winBase``, 4 GiB-quantised ``stride4G``, LSA-rank indexing). See ROCm/mori#557
-for the staged plan.
+The pointers are derived from the same CCO window used by the LSA handle, so CCO is the
+single source of truth for peer addressing. Peers outside the local LSA team are null.
 
 The handle type is probed per device: fabric where supported, POSIX fd otherwise. gfx9
 (MI300/MI355) has no fabric support -- ``hipMemCreate`` itself reports "operation not
@@ -71,10 +70,12 @@ rebuilding mori itself.
 import atexit
 import logging
 import os
+from pathlib import Path
 from typing import Literal
 
 __all__ = [
     "SYMM_BACKEND_NAME",
+    "get_cco_window",
     "handle_type",
     "register_symm_backend",
     "signal_pad_supported",
@@ -127,6 +128,19 @@ def _jit_ext():
         raise ImportError(f"mori_torch_symm sources missing at {source}")
 
     rocm = os.environ.get("ROCM_PATH", "/opt/rocm")
+    package_dir = Path(__file__).resolve().parent.parent
+    source_build_dir = root / "build" / "src" / "cco"
+    cco_lib_dir = (
+        source_build_dir
+        if (source_build_dir / "libmori_cco.so").is_file()
+        else package_dir
+    )
+    cco_lib = cco_lib_dir / "libmori_cco.so"
+    if not cco_lib.is_file():
+        raise ImportError(
+            f"mori's CCO-backed SymmetricMemory backend requires {cco_lib}; "
+            "reinstall MORI with BUILD_CCO=ON"
+        )
     flags = ["-std=c++17", "-O3", "-D__HIP_PLATFORM_AMD__=1", "-DUSE_ROCM=1"]
     if os.environ.get("MORI_SYMM_SIGNAL_PAD", "OFF").strip().upper() in {
         "1",
@@ -141,7 +155,13 @@ def _jit_ext():
         sources=[str(source)],
         extra_include_paths=[str(root / "include"), f"{rocm}/include"],
         extra_cflags=flags,
-        extra_ldflags=[f"-L{rocm}/lib", "-lamdhip64"],
+        extra_ldflags=[
+            f"-L{cco_lib_dir}",
+            "-lmori_cco",
+            f"-Wl,-rpath,{cco_lib_dir}",
+            f"-L{rocm}/lib",
+            "-lamdhip64",
+        ],
     )
 
 
@@ -156,11 +176,20 @@ def _ext():
     except ImportError as exc:
         raise ImportError("mori.allocator requires torch") from exc
 
+    # Resolve the same HIP runtime torch is using before the loader pulls in CCO.
+    from .._rocm_bootstrap import ensure_rocm_runtime
+
+    ensure_rocm_runtime()
+
     prebuilt_error = None
     if os.environ.get("MORI_SYMM_FORCE_JIT", "0").strip() not in {"1", "ON", "on"}:
         try:
             from .. import mori_torch_symm
 
+            if getattr(mori_torch_symm, "lsa_stage2_api_version", 0) != 1:
+                raise ImportError(
+                    "prebuilt mori_torch_symm predates the CCO LSA Stage 2 ABI"
+                )
             _ext_cache = mori_torch_symm
             return _ext_cache
         # ImportError also covers the interesting case: the .so is there but was linked
@@ -196,6 +225,20 @@ def register_symm_backend() -> str:
         atexit.register(ext.shutdown)
         _atexit_registered = True
     return SYMM_BACKEND_NAME
+
+
+def get_cco_window(tensor, group):
+    """Return an owning CCO LSA view for a MORI symmetric tensor.
+
+    This performs (or reuses) torch's collective rendezvous. The returned pybind
+    object pins the underlying ``MoriSymmetricMemory``; keep it alive while a kernel
+    uses ``window_handle``.
+    """
+    import torch.distributed._symmetric_memory as symm_mem
+
+    symm_mem.rendezvous(tensor, group)
+    storage_ptr = tensor.untyped_storage().data_ptr()
+    return _ext().get_cco_window(storage_ptr)
 
 
 def handle_type(device_index: int = 0) -> Literal["fabric", "posix_fd"]:

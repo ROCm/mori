@@ -248,7 +248,7 @@ int ccoGetUniqueId(ccoUniqueId* uniqueId) {
 // — the ccoUniqueId overload below builds the built-in socket bootstrap and
 // delegates here.
 static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
-                             ccoComm** outComm);
+                             bool enableRdma, ccoComm** outComm);
 
 // Self-contained overload: build cco's built-in socket bootstrap from the id and
 // delegate to the internal helper, which takes ownership (the socket bootstrap is
@@ -259,7 +259,16 @@ int ccoCommCreate(const ccoUniqueId& uniqueId, int nRanks, int rank, size_t perR
   application::UniqueId appUid;
   std::memcpy(&appUid, &uniqueId, sizeof(appUid));
   auto* boot = new application::SocketBootstrapNetwork(appUid, rank, nRanks);
-  return ccoCommCreateImpl(boot, perRankVmmSize, outComm);
+  return ccoCommCreateImpl(boot, perRankVmmSize, /*enableRdma=*/true, outComm);
+}
+
+int ccoCommCreateLsaOnly(const ccoUniqueId& uniqueId, int nRanks, int rank, size_t perRankVmmSize,
+                         ccoComm** outComm) {
+  if (!outComm || nRanks <= 0 || rank < 0 || rank >= nRanks) return -1;
+  application::UniqueId appUid;
+  std::memcpy(&appUid, &uniqueId, sizeof(appUid));
+  auto* boot = new application::SocketBootstrapNetwork(appUid, rank, nRanks);
+  return ccoCommCreateImpl(boot, perRankVmmSize, /*enableRdma=*/false, outComm);
 }
 
 // The LSA team is always the contiguous rank range [myNodeStart, myNodeStart+
@@ -421,7 +430,7 @@ static hipError_t CcoZeroWindowMem(void* ptr, size_t bytes) {
 }
 
 static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
-                             ccoComm** outComm) {
+                             bool enableRdma, ccoComm** outComm) {
   auto* comm = new ccoComm();
   *outComm = comm;
 
@@ -431,17 +440,26 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
   comm->rank = comm->bootNet->GetLocalRank();
   comm->worldSize = comm->bootNet->GetWorldSize();
 
-  // Derive a shared group ID (rank 0's pid) for unique LocalBootstrap socket paths
-  int64_t myPid = static_cast<int64_t>(getpid());
-  std::vector<int64_t> allPids(comm->worldSize);
-  comm->bootNet->Allgather(&myPid, allPids.data(), sizeof(int64_t));
-  comm->groupId = allPids[0];
+  // Derive a shared random communicator ID for LocalBootstrap socket paths.
+  // A pid alone collides for overlapping process groups whose first member is
+  // the same process and whose window sequences both begin at one.
+  int64_t localGroupId = 0;
+  if (comm->rank == 0) {
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+    localGroupId = static_cast<int64_t>(gen());
+    if (localGroupId == 0) localGroupId = 1;
+  }
+  std::vector<int64_t> allGroupIds(comm->worldSize);
+  comm->bootNet->Allgather(&localGroupId, allGroupIds.data(), sizeof(int64_t));
+  comm->groupId = allGroupIds[0];
 
   MORI_SHMEM_TRACE("ccoCommCreate: rank={} worldSize={} groupId={}", comm->rank, comm->worldSize,
                    comm->groupId);
 
-  // Step 2: context (RDMA endpoints + transport-type negotiation).
-  comm->ctx = new application::Context(*comm->bootNet);
+  // Step 2: context. The lightweight path retains host/P2P topology discovery
+  // but does not load NIC providers or materialize RDMA state.
+  comm->ctx = new application::Context(*comm->bootNet, enableRdma);
   comm->defaultNumQpPerPe = comm->ctx->GetNumQpPerPe();
 
   // Cache the bound device once (used by topology detection below and later by
@@ -585,31 +603,37 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
   // (64-byte tokens exchangeable via Allgather) instead of dma-buf FDs
   // (which require Unix socket + SCM_RIGHTS).
   {
-    hipMemAllocationProp probeProp = {};
-    probeProp.type = hipMemAllocationTypePinned;
-    probeProp.requestedHandleType = hipMemHandleTypeFabricCompat;
-    probeProp.location.type = hipMemLocationTypeDevice;
-    probeProp.location.id = comm->hipDev;
+    const char* forceFdEnv = getenv("MORI_CCO_FORCE_FD");
+    const bool forceFd = forceFdEnv && atoi(forceFdEnv) != 0;
+    if (!forceFd) {
+      hipMemAllocationProp probeProp = {};
+      probeProp.type = hipMemAllocationTypePinned;
+      probeProp.requestedHandleType = hipMemHandleTypeFabricCompat;
+      probeProp.location.type = hipMemLocationTypeDevice;
+      probeProp.location.id = comm->hipDev;
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-    probeProp.allocFlags.gpuDirectRDMACapable = 1;
+      probeProp.allocFlags.gpuDirectRDMACapable = 1;
 #endif
 
-    size_t probeGranularity = 0;
-    hipError_t probeErr = hipMemGetAllocationGranularity(&probeGranularity, &probeProp,
-                                                         hipMemAllocationGranularityRecommended);
-    if (probeErr == hipSuccess && probeGranularity > 0) {
-      hipMemGenericAllocationHandle_t probeHandle = 0;
-      probeErr = hipMemCreate(&probeHandle, probeGranularity, &probeProp, 0);
-      if (probeErr == hipSuccess) {
-        hipMemFabricHandle_compat_t probeFabric;
-        probeErr = hipMemExportToShareableHandle(&probeFabric, probeHandle,
-                                                 hipMemHandleTypeFabricCompat, 0);
-        (void)hipMemRelease(probeHandle);
+      size_t probeGranularity = 0;
+      hipError_t probeErr = hipMemGetAllocationGranularity(&probeGranularity, &probeProp,
+                                                           hipMemAllocationGranularityRecommended);
+      if (probeErr == hipSuccess && probeGranularity > 0) {
+        hipMemGenericAllocationHandle_t probeHandle = 0;
+        probeErr = hipMemCreate(&probeHandle, probeGranularity, &probeProp, 0);
         if (probeErr == hipSuccess) {
-          comm->handleType = static_cast<int>(hipMemHandleTypeFabricCompat);
-          MORI_SHMEM_INFO("ccoCommCreate: fabric handle probe succeeded");
+          hipMemFabricHandle_compat_t probeFabric;
+          probeErr = hipMemExportToShareableHandle(&probeFabric, probeHandle,
+                                                   hipMemHandleTypeFabricCompat, 0);
+          (void)hipMemRelease(probeHandle);
+          if (probeErr == hipSuccess) {
+            comm->handleType = static_cast<int>(hipMemHandleTypeFabricCompat);
+            MORI_SHMEM_INFO("ccoCommCreate: fabric handle probe succeeded");
+          }
         }
       }
+    } else {
+      MORI_SHMEM_INFO("ccoCommCreate: MORI_CCO_FORCE_FD=1, skipping fabric handle probe");
     }
     if (comm->handleType != static_cast<int>(hipMemHandleTypeFabricCompat)) {
       MORI_SHMEM_INFO("ccoCommCreate: fabric handle probe failed, using FD path");
@@ -686,6 +710,43 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
 }
 
 /* ========================================================================== */
+/*                             ccoCommGetInfo                              */
+/* ========================================================================== */
+
+int ccoCommGetInfo(const ccoComm* comm, ccoCommInfo* info) {
+  if (comm == nullptr || info == nullptr) {
+    MORI_SHMEM_ERROR("ccoCommGetInfo: comm or info is NULL");
+    return -1;
+  }
+  constexpr size_t kCommInfoV1Size = offsetof(ccoCommInfo, perRankSize) + sizeof(size_t);
+  if (info->size < kCommInfoV1Size) {
+    MORI_SHMEM_ERROR("ccoCommGetInfo: info->size={} is smaller than version {} size {}", info->size,
+                     CCO_COMM_INFO_VERSION, kCommInfoV1Size);
+    return -1;
+  }
+  if (info->magic != CCO_API_MAGIC) {
+    MORI_SHMEM_ERROR(
+        "ccoCommGetInfo: info->magic mismatch (got {:#x}, expect {:#x}) — "
+        "initialize with CCO_COMM_INFO_INITIALIZER",
+        info->magic, CCO_API_MAGIC);
+    return -1;
+  }
+  if (info->version == 0 || info->version > CCO_COMM_INFO_VERSION) {
+    MORI_SHMEM_ERROR("ccoCommGetInfo: unsupported info version {} (runtime supports {})",
+                     info->version, CCO_COMM_INFO_VERSION);
+    return -1;
+  }
+
+  info->rank = comm->rank;
+  info->worldSize = comm->worldSize;
+  info->lsaRank = comm->lsaRank;
+  info->lsaSize = comm->lsaSize;
+  info->lsaStart = comm->myNodeStart;
+  info->perRankSize = comm->perRankSize;
+  return 0;
+}
+
+/* ========================================================================== */
 /*                             ccoCommDestroy                              */
 /* ========================================================================== */
 
@@ -719,7 +780,7 @@ int ccoCommDestroy(ccoComm* comm) {
   for (auto& [ptr, meta] : comm->allocTable) {
     vmmProcessLock vmmLock;
     (void)hipMemUnmap(ptr, meta.size);
-    (void)hipMemRelease(meta.physHandle);
+    if (meta.ownsPhysHandle) (void)hipMemRelease(meta.physHandle);
     if (!meta.isFabric && meta.shareFd >= 0) close(meta.shareFd);
   }
   comm->allocTable.clear();
@@ -887,18 +948,28 @@ int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) {
 // Map an EXTERNAL HIP VMM allocation into this rank's flat-VA slot without
 // allocating new physical memory. Mirrors ccoMemAlloc, except the physical
 // handle comes from hipMemRetainAllocationHandle(externalPtr) instead of
-// hipMemCreate. The retained handle is refcounted: ccoMemFree's hipMemRelease
-// balances this retain; the external owner (e.g. torch.symm_mem) keeps its own
-// mapping and refcount alive independently.
-int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) {
+// hipMemCreate. HIP returns the allocation's existing handle rather than a
+// separately owned reference: the external owner must keep it alive through
+// WindowDeregister/MemFree and performs the one final hipMemRelease.
+static int CcoMemImportImpl(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) {
+  if (comm == nullptr) {
+    MORI_SHMEM_ERROR("ccoMemImport: comm is NULL");
+    return -1;
+  }
   if (outPtr == nullptr) {
     MORI_SHMEM_ERROR("ccoMemImport: outPtr is NULL");
     return -1;
   }
+  *outPtr = nullptr;
   if (externalPtr == nullptr || size == 0) {
     MORI_SHMEM_ERROR("ccoMemImport: externalPtr is NULL or size is 0");
     return -1;
   }
+
+  const bool useFabric = (comm->handleType == static_cast<int>(hipMemHandleTypeFabricCompat));
+  const hipMemAllocationHandleType expectedHandleType =
+      static_cast<hipMemAllocationHandleType>(comm->handleType);
+  const char* expectedHandleName = useFabric ? "fabric" : "POSIX file descriptor";
 
   // Recover the physical handle from the external mapping. Fails (e.g. for a
   // plain hipMalloc pointer, which is not VMM-backed).
@@ -916,6 +987,48 @@ int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) {
     return -1;
   }
 
+  // ROCm 6.4 and newer expose the allocation properties query alongside the
+  // VMM APIs used above. Keep it guarded so older supported HIP headers still
+  // compile; the export call below remains the portable final handle-type test.
+  size_t externalGranularity = 0;
+#if defined(HIP_VERSION) && HIP_VERSION >= 60400000
+  hipMemAllocationProp externalProp = {};
+  hipError_t propErr = hipMemGetAllocationPropertiesFromHandle(&externalProp, physHandle);
+  if (propErr == hipSuccess) {
+    if (externalProp.location.type != hipMemLocationTypeDevice ||
+        externalProp.location.id != comm->hipDev) {
+      MORI_SHMEM_ERROR(
+          "ccoMemImport: external allocation belongs to location(type={}, id={}), "
+          "but communicator is bound to device {}",
+          static_cast<int>(externalProp.location.type), externalProp.location.id, comm->hipDev);
+      return -1;
+    }
+    const uint32_t actualHandleTypes = static_cast<uint32_t>(externalProp.requestedHandleType);
+    const uint32_t requiredHandleType = static_cast<uint32_t>(expectedHandleType);
+    if ((actualHandleTypes & requiredHandleType) == 0) {
+      MORI_SHMEM_ERROR(
+          "ccoMemImport: external allocation handle type {:#x} does not include the "
+          "communicator's required {} type ({:#x})",
+          actualHandleTypes, expectedHandleName, requiredHandleType);
+      return -1;
+    }
+    propErr = hipMemGetAllocationGranularity(&externalGranularity, &externalProp,
+                                             hipMemAllocationGranularityMinimum);
+    if (propErr != hipSuccess) {
+      MORI_SHMEM_WARN(
+          "ccoMemImport: could not query external allocation granularity: {} ({}) — "
+          "using communicator granularity {}",
+          static_cast<int>(propErr), hipGetErrorString(propErr), comm->vmmGranularity);
+      externalGranularity = 0;
+    }
+  } else {
+    MORI_SHMEM_WARN(
+        "ccoMemImport: could not query external allocation properties: {} ({}) — "
+        "handle compatibility will be validated by export",
+        static_cast<int>(propErr), hipGetErrorString(propErr));
+  }
+#endif
+
   // Validate: externalPtr is the allocation base and the range covers `size`.
   // Our flat-VA map starts at offset 0 of the handle, so offset imports are
   // unsupported (would need a per-handle base+offset scheme).
@@ -925,7 +1038,6 @@ int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) {
   if (err != hipSuccess) {
     MORI_SHMEM_ERROR("ccoMemImport: hipMemGetAddressRange failed: {} ({})", static_cast<int>(err),
                      hipGetErrorString(err));
-    (void)hipMemRelease(physHandle);
     return -1;
   }
   if (rangeBase != externalPtr) {
@@ -933,30 +1045,61 @@ int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) {
         "ccoMemImport: externalPtr {} is not the allocation base {} "
         "(offset imports unsupported)",
         externalPtr, rangeBase);
-    (void)hipMemRelease(physHandle);
     return -1;
   }
 
-  size_t alignedSize = AlignUp(size, comm->vmmGranularity);
-  if (alignedSize > rangeSize) {
-    MORI_SHMEM_ERROR("ccoMemImport: aligned size {} exceeds external allocation {}", alignedSize,
+  if (size > rangeSize) {
+    MORI_SHMEM_ERROR("ccoMemImport: requested size {} exceeds external allocation range {}", size,
                      rangeSize);
-    (void)hipMemRelease(physHandle);
     return -1;
   }
 
-  uintptr_t slotAddr = comm->vaManager->Allocate(alignedSize, comm->vmmGranularity);
+  size_t mapGranularity = comm->vmmGranularity;
+  if (mapGranularity == 0) {
+    MORI_SHMEM_ERROR("ccoMemImport: communicator mapping granularity is zero");
+    return -1;
+  }
+  if (externalGranularity != 0) {
+    const size_t larger = std::max(mapGranularity, externalGranularity);
+    const size_t smaller = std::min(mapGranularity, externalGranularity);
+    if (larger % smaller != 0) {
+      MORI_SHMEM_ERROR(
+          "ccoMemImport: incompatible mapping granularities (communicator={}, external={})",
+          mapGranularity, externalGranularity);
+      return -1;
+    }
+    mapGranularity = larger;
+    if ((reinterpret_cast<uintptr_t>(externalPtr) % externalGranularity) != 0 ||
+        (rangeSize % externalGranularity) != 0) {
+      MORI_SHMEM_ERROR(
+          "ccoMemImport: external allocation base/range is not aligned to its {}-byte "
+          "mapping granularity (base={}, range={})",
+          externalGranularity, externalPtr, rangeSize);
+      return -1;
+    }
+  }
+  if (size > static_cast<size_t>(-1) - (mapGranularity - 1)) {
+    MORI_SHMEM_ERROR("ccoMemImport: size {} overflows alignment to {}", size, mapGranularity);
+    return -1;
+  }
+  size_t alignedSize = AlignUp(size, mapGranularity);
+  if (alignedSize > rangeSize) {
+    MORI_SHMEM_ERROR(
+        "ccoMemImport: size {} rounds to {} at mapping granularity {}, exceeding external "
+        "allocation range {}",
+        size, alignedSize, mapGranularity, rangeSize);
+    return -1;
+  }
+
+  uintptr_t slotAddr = comm->vaManager->Allocate(alignedSize, mapGranularity);
   if (slotAddr == 0) {
     MORI_SHMEM_ERROR("ccoMemImport: slot exhausted (need {} bytes, perRankSize={})", alignedSize,
                      comm->perRankSize);
-    (void)hipMemRelease(physHandle);
     return -1;
   }
   size_t slotOffset = static_cast<size_t>(slotAddr - LocalSlotBase(comm));
   void* localVa = reinterpret_cast<void*>(slotAddr);
   auto rollbackSlot = [&]() { (void)comm->vaManager->Free(slotAddr); };
-
-  const bool useFabric = (comm->handleType == static_cast<int>(hipMemHandleTypeFabricCompat));
 
   {
     vmmProcessLock vmmLock;
@@ -965,7 +1108,6 @@ int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) {
   if (err != hipSuccess) {
     MORI_SHMEM_ERROR("ccoMemImport: hipMemMap failed: {} ({})", static_cast<int>(err),
                      hipGetErrorString(err));
-    (void)hipMemRelease(physHandle);
     rollbackSlot();
     return -1;
   }
@@ -988,7 +1130,6 @@ int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) {
     {
       vmmProcessLock vmmLock;
       (void)hipMemUnmap(localVa, alignedSize);
-      (void)hipMemRelease(physHandle);
     }
     rollbackSlot();
     return -1;
@@ -1000,6 +1141,7 @@ int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) {
   ccoComm::AllocMeta meta;
   meta.physHandle = physHandle;
   meta.isFabric = useFabric;
+  meta.ownsPhysHandle = false;
   meta.slotOffset = slotOffset;
   meta.size = alignedSize;
   if (useFabric) {
@@ -1012,13 +1154,14 @@ int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) {
   }
   if (err != hipSuccess) {
     MORI_SHMEM_ERROR(
-        "ccoMemImport: hipMemExportToShareableHandle failed: {} ({}) — external "
-        "allocation may not support the comm's handle type",
-        static_cast<int>(err), hipGetErrorString(err));
+        "ccoMemImport: hipMemExportToShareableHandle failed: {} ({}) — communicator "
+        "requires the {} handle type ({:#x}); create the external VMM allocation with "
+        "that requestedHandleType",
+        static_cast<int>(err), hipGetErrorString(err), expectedHandleName,
+        static_cast<uint32_t>(expectedHandleType));
     {
       vmmProcessLock vmmLock;
       (void)hipMemUnmap(localVa, alignedSize);
-      (void)hipMemRelease(physHandle);
     }
     rollbackSlot();
     return -1;
@@ -1034,6 +1177,10 @@ int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) {
   return 0;
 }
 
+int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) {
+  return CcoMemImportImpl(comm, externalPtr, size, outPtr);
+}
+
 /* ========================================================================== */
 /*                              ccoMemFree                                 */
 /* ========================================================================== */
@@ -1041,9 +1188,9 @@ int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) {
 int ccoMemFree(ccoComm* comm, void* ptr) {
   if (ptr == nullptr) return 0;
 
-  // Snapshot meta + return the slot to vaManager, then drop the cco mutex
-  // before the (potentially slow) hipMem* calls so concurrent MemAlloc
-  // isn't blocked. vaManager->Free takes its own mutex internally.
+  // Remove metadata under the mutex, then perform the slow HIP teardown.
+  // The VA slot is returned only after unmap/release completes, so another
+  // thread cannot reuse and remap it while this free is still in flight.
   ccoComm::AllocMeta meta;
   {
     std::lock_guard<std::mutex> lock(comm->allocMutex);
@@ -1052,11 +1199,14 @@ int ccoMemFree(ccoComm* comm, void* ptr) {
       MORI_SHMEM_WARN("ccoMemFree: ptr {} not found", ptr);
       return -1;
     }
+    if (it->second.windowRefs != 0) {
+      MORI_SHMEM_WARN("ccoMemFree: ptr {} still has {} registered window(s)", ptr,
+                      it->second.windowRefs);
+      return -1;
+    }
     meta = it->second;
     comm->allocTable.erase(it);
   }
-  // ptr == LocalSlotBase(comm) + meta.slotOffset == the address vaManager handed out.
-  (void)comm->vaManager->Free(reinterpret_cast<uintptr_t>(ptr));
 
   size_t alignedSize = meta.size;
 
@@ -1069,44 +1219,135 @@ int ccoMemFree(ccoComm* comm, void* ptr) {
       MORI_SHMEM_WARN("ccoMemFree: local hipMemUnmap failed: {} ({})", static_cast<int>(err),
                       hipGetErrorString(err));
     }
-    err = hipMemRelease(meta.physHandle);
-    if (err != hipSuccess) {
-      MORI_SHMEM_WARN("ccoMemFree: hipMemRelease failed: {} ({})", static_cast<int>(err),
-                      hipGetErrorString(err));
+    if (meta.ownsPhysHandle) {
+      err = hipMemRelease(meta.physHandle);
+      if (err != hipSuccess) {
+        MORI_SHMEM_WARN("ccoMemFree: hipMemRelease failed: {} ({})", static_cast<int>(err),
+                        hipGetErrorString(err));
+      }
     }
   }
 
   if (!meta.isFabric && meta.shareFd >= 0) close(meta.shareFd);
+  // ptr == LocalSlotBase(comm) + meta.slotOffset == the address vaManager handed out.
+  (void)comm->vaManager->Free(reinterpret_cast<uintptr_t>(ptr));
 
   return 0;
 }
 
 /* ========================================================================== */
-/*                         ccoWindowRegister (ptr)                         */
+/*                       ccoWindowRegister implementation                  */
 /* ========================================================================== */
 
-int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin) {
-  auto it = comm->allocTable.find(ptr);
-  if (it == comm->allocTable.end()) {
-    MORI_SHMEM_ERROR("ccoWindowRegister: ptr {} not in allocTable", ptr);
+class CcoAllocWindowPin {
+ public:
+  CcoAllocWindowPin(ccoComm* comm, void* ptr) : comm_(comm), ptr_(ptr) {}
+  ~CcoAllocWindowPin() {
+    if (!rollback_) return;
+    std::lock_guard<std::mutex> lock(comm_->allocMutex);
+    auto it = comm_->allocTable.find(ptr_);
+    if (it != comm_->allocTable.end() && it->second.windowRefs > 0) {
+      --it->second.windowRefs;
+    }
+  }
+  void Commit() { rollback_ = false; }
+
+ private:
+  ccoComm* comm_;
+  void* ptr_;
+  bool rollback_ = true;
+};
+
+static int CcoWindowRegisterImpl(ccoComm* comm, void* ptr, size_t size, uint32_t flags,
+                                 ccoWindow_t* outWin) {
+  if (comm == nullptr || outWin == nullptr) {
+    MORI_SHMEM_ERROR("ccoWindowRegister: comm or outWin is NULL");
+    return -1;
+  }
+  *outWin = nullptr;
+  if (ptr == nullptr || size == 0) {
+    MORI_SHMEM_ERROR("ccoWindowRegister: ptr is NULL or size is zero");
     return -1;
   }
 
-  auto& meta = it->second;
+  // Snapshot allocation metadata and consume a communicator-scoped collective
+  // identity. Local alloc/free churn intentionally does not affect this
+  // sequence; only collective registrations consume it.
+  ccoComm::AllocMeta meta;
+  uint64_t windowSequence = 0;
+  {
+    std::lock_guard<std::mutex> lock(comm->allocMutex);
+    auto it = comm->allocTable.find(ptr);
+    if (it == comm->allocTable.end()) {
+      MORI_SHMEM_ERROR("ccoWindowRegister: ptr {} not in allocTable", ptr);
+      return -1;
+    }
+    meta = it->second;
+    ++it->second.windowRefs;
+    windowSequence = comm->nextWindowRegistrationSequence++;
+  }
+  CcoAllocWindowPin registrationPin(comm, ptr);
+
   size_t slotOffset = meta.slotOffset;
   void* localPtr = ptr;
   int worldSize = comm->worldSize;
   int rank = comm->rank;
   const bool useFabric = meta.isFabric;
+  const bool lsaOnly = (flags & CCO_WINDOW_REGISTER_LSA_ONLY) != 0;
 
   size_t alignedSize = meta.size;
 
-  MORI_SHMEM_TRACE("ccoWindowRegister: rank={} ptr={} size={} slotOffset={} fabric={}", rank, ptr,
-                   size, slotOffset, useFabric);
+  // Validate the collective call before entering handle-specific rendezvous.
+  // Deliberately absent: slotOffset. It is a per-process placement detail, not
+  // the identity of this logical window.
+  struct WindowRegistrationDescriptor {
+    uint64_t sequence;
+    uint64_t size;
+    uint64_t mappedSize;
+    uint32_t flags;
+    uint32_t handleType;
+  };
+  WindowRegistrationDescriptor localDesc = {
+      windowSequence,
+      static_cast<uint64_t>(size),
+      static_cast<uint64_t>(alignedSize),
+      flags,
+      static_cast<uint32_t>(useFabric ? hipMemHandleTypeFabricCompat
+                                      : hipMemHandleTypePosixFileDescriptor),
+  };
+  std::vector<WindowRegistrationDescriptor> allDescs(worldSize);
+  comm->bootNet->Allgather(&localDesc, allDescs.data(), sizeof(localDesc));
+  for (int pe = 0; pe < worldSize; pe++) {
+    const auto& peerDesc = allDescs[pe];
+    if (peerDesc.sequence != localDesc.sequence || peerDesc.size != localDesc.size ||
+        peerDesc.mappedSize != localDesc.mappedSize || peerDesc.flags != localDesc.flags ||
+        peerDesc.handleType != localDesc.handleType) {
+      MORI_SHMEM_ERROR(
+          "ccoWindowRegister: collective descriptor mismatch at PE {}: "
+          "local(seq={}, size={}, mapped={}, flags={:#x}, handle={:#x}) "
+          "peer(seq={}, size={}, mapped={}, flags={:#x}, handle={:#x}); "
+          "registration must be collective and same-order",
+          pe, localDesc.sequence, localDesc.size, localDesc.mappedSize, localDesc.flags,
+          localDesc.handleType, peerDesc.sequence, peerDesc.size, peerDesc.mappedSize,
+          peerDesc.flags, peerDesc.handleType);
+      return -1;
+    }
+  }
+  if (size > meta.size) {
+    MORI_SHMEM_ERROR("ccoWindowRegister: requested size {} exceeds mapped allocation size {}", size,
+                     meta.size);
+    return -1;
+  }
+
+  MORI_SHMEM_TRACE(
+      "ccoWindowRegister: rank={} sequence={} ptr={} size={} slotOffset={} fabric={} "
+      "lsaOnly={}",
+      rank, windowSequence, ptr, size, slotOffset, useFabric, lsaOnly);
 
   // P2P imported handles — collected during the exchange loop below,
   // ownership later transferred to ccoWindowHost so Deregister can release.
   std::vector<hipMemGenericAllocationHandle_t> p2pImportedHandles;
+  std::vector<int> p2pImportedFds;
 
   // P2P: exchange handles with same-node peers and map their slots into
   // the LSA flat VA.
@@ -1138,10 +1379,15 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
         (void)hipMemRelease(mp.handle);
       }
       mappedPeers.clear();
+      for (int fd : p2pImportedFds) {
+        if (fd >= 0) close(fd);
+      }
+      p2pImportedFds.clear();
     };
 
-    // Import + map a single peer's handle into our flat VA. Returns 0 on
-    // success, -1 on failure (rolls back all prior mappings).
+    // Import + map a single peer's handle into OUR process's flat VA at OUR
+    // local slotOffset. The exporting peer may have chosen a different local
+    // offset for the same collective window.
     auto mapPeer = [&](int pe, hipMemGenericAllocationHandle_t importedHandle) -> int {
       int peerLsaRank = CcoPeToLsaRank(comm, pe);
       void* peerVa = static_cast<char*>(comm->flatBase) +
@@ -1258,9 +1504,9 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
       }
       int p2pWorldSize = static_cast<int>(sortedGroup.size());
 
-      std::string socketPath = "/tmp/mori_cco_" + std::to_string(comm->groupId) + "_" +
-                               std::to_string(slotOffset) + "_g" + std::to_string(sortedGroup[0]) +
-                               "_";
+      std::string socketPath = "/tmp/mori_cco_" + std::to_string(comm->groupId) + "_w" +
+                               std::to_string(windowSequence) + "_g" +
+                               std::to_string(sortedGroup[0]) + "_";
 
       application::LocalBootstrapNetwork localBoot(myPeerRank, p2pWorldSize, socketPath);
       localBoot.Initialize();
@@ -1326,6 +1572,11 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
           localBoot.Finalize();
           return -1;
         }
+        // ROCm may tie the imported allocation handle's lifetime to the
+        // received dma-buf FD. Transfer this FD out of the scratch table and
+        // close it only after hipMemRelease in WindowDeregister.
+        p2pImportedFds.push_back(peerFd);
+        allFds[pr][0] = -1;
       }
 
       closePeerFds();
@@ -1339,9 +1590,10 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
   // RDMA MR registration + rkey Allgather.
   uint32_t lkey = 0;
   uint32_t localRkey = 0;
+  bool rdmaRegistered = false;
 
   application::RdmaDeviceContext* rdmaDevCtx = comm->ctx->GetRdmaDeviceContext();
-  if (rdmaDevCtx) {
+  if (!lsaOnly && rdmaDevCtx) {
     application::RdmaMemoryRegion mr;
     if (useFabric) {
       mr = rdmaDevCtx->RegisterRdmaMemoryRegionAuto(localPtr, size);
@@ -1352,6 +1604,7 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
     }
     lkey = mr.lkey;
     localRkey = mr.rkey;
+    rdmaRegistered = true;
   }
 
   // Allgather rkeys into a std::vector so an exception in Allgather doesn't
@@ -1385,22 +1638,32 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
   tableEntry.base = reinterpret_cast<uintptr_t>(localPtr);
   tableEntry.size = static_cast<uintptr_t>(size);
   tableEntry.devPtr = devPtr;
-  comm->windowTableEntries.push_back(tableEntry);
 
   auto* wh = new ccoWindowHost();
   wh->localPtr = localPtr;
   wh->size = size;
+  wh->slotOffset = slotOffset;
+  wh->mappedSize = alignedSize;
   wh->devPtr = devPtr;
   wh->peerRkeys_gpu = peerRkeys_gpu;
+  wh->rdmaRegistered = rdmaRegistered;
   wh->peerImportedHandles = std::move(p2pImportedHandles);
-  comm->windows.push_back(wh);
+  wh->peerShareFds = std::move(p2pImportedFds);
+  {
+    std::lock_guard<std::mutex> lock(comm->allocMutex);
+    comm->windowTableEntries.push_back(tableEntry);
+    comm->windows.push_back(wh);
+  }
+  registrationPin.Commit();
 
   *outWin = devPtr;
 
   char* winBase = static_cast<char*>(comm->flatBase) + slotOffset;
   MORI_SHMEM_INFO(
-      "ccoWindowRegister: rank={} win={} winBase={} size={} slotOffset={} lkey={} fabric={}", rank,
-      (void*)devPtr, (void*)winBase, size, slotOffset, lkey, useFabric);
+      "ccoWindowRegister: rank={} sequence={} win={} winBase={} size={} localSlotOffset={} "
+      "lkey={} fabric={} lsaOnly={}",
+      rank, windowSequence, (void*)devPtr, (void*)winBase, size, slotOffset, lkey, useFabric,
+      lsaOnly);
   for (int lsa = 0; lsa < comm->lsaSize; lsa++) {
     int pe = comm->myNodeStart + lsa;
     void* peerVa = winBase + static_cast<size_t>(lsa) * comm->perRankSize;
@@ -1414,6 +1677,10 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
   // peerRkeys_host is std::vector — destructs cleanly at scope exit.
 
   return 0;
+}
+
+int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin) {
+  return CcoWindowRegisterImpl(comm, ptr, size, CCO_WINDOW_REGISTER_DEFAULT, outWin);
 }
 
 /* ========================================================================== */
@@ -1441,11 +1708,63 @@ int ccoWindowRegister(ccoComm* comm, size_t size, ccoWindow_t* outWin, void** lo
 // the same as Overload A: WindowDeregister → MemFree(localPtr).
 int ccoWindowRegister(ccoComm* comm, void* externalPtr, size_t size, ccoWindow_t* outWin,
                       void** localPtr) {
-  void* ptr = nullptr;
-  int ret = ccoMemImport(comm, externalPtr, size, &ptr);
+  return ccoWindowRegisterExternal(comm, externalPtr, size, nullptr, outWin, localPtr);
+}
+
+static int CcoResolveWindowRegisterOptions(const ccoWindowRegisterOptions* options,
+                                           uint32_t* flags) {
+  *flags = CCO_WINDOW_REGISTER_DEFAULT;
+  if (options == nullptr) return 0;
+  constexpr size_t kWindowOptionsV1Size =
+      offsetof(ccoWindowRegisterOptions, flags) + sizeof(uint32_t);
+  if (options->size < kWindowOptionsV1Size) {
+    MORI_SHMEM_ERROR(
+        "ccoWindowRegisterExternal: options->size={} is smaller than version {} size {}",
+        options->size, CCO_WINDOW_REGISTER_OPTIONS_VERSION, kWindowOptionsV1Size);
+    return -1;
+  }
+  if (options->magic != CCO_API_MAGIC) {
+    MORI_SHMEM_ERROR(
+        "ccoWindowRegisterExternal: options->magic mismatch (got {:#x}, expect {:#x}) — "
+        "initialize with CCO_WINDOW_REGISTER_OPTIONS_INITIALIZER",
+        options->magic, CCO_API_MAGIC);
+    return -1;
+  }
+  if (options->version == 0 || options->version > CCO_WINDOW_REGISTER_OPTIONS_VERSION) {
+    MORI_SHMEM_ERROR(
+        "ccoWindowRegisterExternal: unsupported options version {} (runtime supports {})",
+        options->version, CCO_WINDOW_REGISTER_OPTIONS_VERSION);
+    return -1;
+  }
+  constexpr uint32_t kKnownFlags = CCO_WINDOW_REGISTER_LSA_ONLY;
+  if ((options->flags & ~kKnownFlags) != 0) {
+    MORI_SHMEM_ERROR("ccoWindowRegisterExternal: unknown options flags {:#x}",
+                     options->flags & ~kKnownFlags);
+    return -1;
+  }
+  *flags = options->flags;
+  return 0;
+}
+
+static int CcoWindowRegisterExternalImpl(ccoComm* comm, void* externalPtr, size_t size,
+                                         const ccoWindowRegisterOptions* options,
+                                         ccoWindow_t* outWin, void** localPtr) {
+  if (outWin == nullptr || localPtr == nullptr) {
+    MORI_SHMEM_ERROR("ccoWindowRegisterExternal: outWin or localPtr is NULL");
+    return -1;
+  }
+  *outWin = nullptr;
+  *localPtr = nullptr;
+
+  uint32_t flags = 0;
+  int ret = CcoResolveWindowRegisterOptions(options, &flags);
   if (ret != 0) return ret;
 
-  ret = ccoWindowRegister(comm, ptr, size, outWin);
+  void* ptr = nullptr;
+  ret = CcoMemImportImpl(comm, externalPtr, size, &ptr);
+  if (ret != 0) return ret;
+
+  ret = CcoWindowRegisterImpl(comm, ptr, size, flags, outWin);
   if (ret != 0) {
     ccoMemFree(comm, ptr);
     return ret;
@@ -1455,17 +1774,25 @@ int ccoWindowRegister(ccoComm* comm, void* externalPtr, size_t size, ccoWindow_t
   return 0;
 }
 
+int ccoWindowRegisterExternal(ccoComm* comm, void* externalPtr, size_t size,
+                              const ccoWindowRegisterOptions* options, ccoWindow_t* outWin,
+                              void** localPtr) {
+  return CcoWindowRegisterExternalImpl(comm, externalPtr, size, options, outWin, localPtr);
+}
+
 /* ========================================================================== */
 /*                          ccoGetPeerPtr (host)                           */
 /* ========================================================================== */
 
-// Host mirror of the device ccoGetLsaPeerPtr. A symmetric slot lives at the same
-// slotOffset within every LSA rank's perRankSize slice of the flat VA, so:
+// Host mirror of the device ccoGetLsaPeerPtr. Within THIS process's flat
+// mapping, every peer allocation for one logical window is placed at this
+// process's slotOffset. Another process may place the same window at a different
+// local offset:
 //   localPtr = flatBase + lsaRank      * perRankSize + slotOffset
 //   peerVa   = flatBase + peerLsaRank  * perRankSize + slotOffset
 //            = localPtr + (peerLsaRank - lsaRank) * perRankSize
 // No allocTable lookup or slotOffset needed. Returns nullptr if pe is outside
-// this rank's LSA (intra-node) team.
+// this rank's LSA team.
 void* ccoGetPeerPtr(ccoComm* comm, void* localPtr, int pe) {
   if (comm == nullptr || localPtr == nullptr) return nullptr;
   int peerLsaRank = CcoPeToLsaRank(comm, pe);
@@ -1480,34 +1807,39 @@ void* ccoGetPeerPtr(ccoComm* comm, void* localPtr, int pe) {
 
 int ccoWindowDeregister(ccoComm* comm, ccoWindow_t win) {
   ccoWindowHost* wh = nullptr;
-  size_t idx = 0;
-  for (size_t i = 0; i < comm->windows.size(); i++) {
-    if (comm->windows[i]->devPtr == win) {
-      wh = comm->windows[i];
-      idx = i;
-      break;
+  {
+    std::lock_guard<std::mutex> lock(comm->allocMutex);
+    auto windowIt = std::find_if(comm->windows.begin(), comm->windows.end(),
+                                 [win](const ccoWindowHost* candidate) {
+                                   return candidate != nullptr && candidate->devPtr == win;
+                                 });
+    if (windowIt == comm->windows.end()) {
+      MORI_SHMEM_WARN("ccoWindowDeregister: win {} not found", (void*)win);
+      return -1;
     }
-  }
-  if (!wh) {
-    MORI_SHMEM_WARN("ccoWindowDeregister: win {} not found", (void*)win);
-    return -1;
+    wh = *windowIt;
+    comm->windows.erase(windowIt);
+    auto& entries = comm->windowTableEntries;
+    entries.erase(
+        std::remove_if(entries.begin(), entries.end(),
+                       [win](const ccoComm::WindowTableEntry& e) { return e.devPtr == win; }),
+        entries.end());
   }
 
   MORI_SHMEM_TRACE("ccoWindowDeregister: rank={} ptr={}", comm->rank, wh->localPtr);
 
   // Unmap the P2P peer slots that WindowRegister mapped (ENOMAP is fine).
-  auto allocIt = comm->allocTable.find(wh->localPtr);
-  if (allocIt != comm->allocTable.end()) {
-    size_t slotOff = allocIt->second.slotOffset;
-    size_t allocSize = allocIt->second.size;
+  // Window-local placement metadata is retained on ccoWindowHost, so cleanup
+  // does not infer collective identity from allocTable or from another rank.
+  {
     vmmProcessLock vmmLock;
     for (int lsa = 0; lsa < comm->lsaSize; lsa++) {
       if (lsa == comm->lsaRank) continue;
       int pe = comm->myNodeStart + lsa;  // global pe (matches register's p2pPeers)
       if (!CcoCanLsaMapPeer(comm, pe)) continue;
       void* peerVa = static_cast<char*>(comm->flatBase) +
-                     static_cast<size_t>(lsa) * comm->perRankSize + slotOff;
-      (void)hipMemUnmap(peerVa, allocSize);
+                     static_cast<size_t>(lsa) * comm->perRankSize + wh->slotOffset;
+      (void)hipMemUnmap(peerVa, wh->mappedSize);
     }
   }
 
@@ -1520,20 +1852,24 @@ int ccoWindowDeregister(ccoComm* comm, ccoWindow_t win) {
     }
   }
   wh->peerImportedHandles.clear();
-
-  auto& entries = comm->windowTableEntries;
-  entries.erase(
-      std::remove_if(entries.begin(), entries.end(),
-                     [win](const ccoComm::WindowTableEntry& e) { return e.devPtr == win; }),
-      entries.end());
+  for (int fd : wh->peerShareFds) {
+    if (fd >= 0) close(fd);
+  }
+  wh->peerShareFds.clear();
 
   application::RdmaDeviceContext* rdmaDevCtx = comm->ctx->GetRdmaDeviceContext();
-  if (rdmaDevCtx) rdmaDevCtx->DeregisterRdmaMemoryRegion(wh->localPtr);
+  if (rdmaDevCtx && wh->rdmaRegistered) rdmaDevCtx->DeregisterRdmaMemoryRegion(wh->localPtr);
 
   if (wh->peerRkeys_gpu) HIP_RUNTIME_CHECK(hipFree(wh->peerRkeys_gpu));
   if (wh->devPtr) HIP_RUNTIME_CHECK(hipFree(wh->devPtr));
 
-  comm->windows.erase(comm->windows.begin() + idx);
+  {
+    std::lock_guard<std::mutex> lock(comm->allocMutex);
+    auto allocIt = comm->allocTable.find(wh->localPtr);
+    if (allocIt != comm->allocTable.end() && allocIt->second.windowRefs > 0) {
+      --allocIt->second.windowRefs;
+    }
+  }
   delete wh;
   return 0;
 }
@@ -1802,7 +2138,11 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
       railGdaBarrierCount, railGdaBarrierSignal0, hybridRailBarrierCount, hybridRailBarrierSignal0);
 
   // Build window-table linked list on GPU.
-  const auto& tableEntries = comm->windowTableEntries;
+  std::vector<ccoComm::WindowTableEntry> tableEntries;
+  {
+    std::lock_guard<std::mutex> lock(comm->allocMutex);
+    tableEntries = comm->windowTableEntries;
+  }
   size_t numWindows = tableEntries.size();
   size_t numNodes = (numWindows + CCO_WINDOW_TABLE_SIZE - 1) / CCO_WINDOW_TABLE_SIZE;
   if (numNodes == 0) numNodes = 1;
@@ -2012,10 +2352,13 @@ int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm) {
   // Look up the wh->localPtr before Deregister erases the entry.
   if (hostShadow.resourceWindow && comm) {
     void* resourceWindowLocalPtr = nullptr;
-    for (auto* wh : comm->windows) {
-      if (wh && wh->devPtr == hostShadow.resourceWindow) {
-        resourceWindowLocalPtr = wh->localPtr;
-        break;
+    {
+      std::lock_guard<std::mutex> lock(comm->allocMutex);
+      for (auto* wh : comm->windows) {
+        if (wh && wh->devPtr == hostShadow.resourceWindow) {
+          resourceWindowLocalPtr = wh->localPtr;
+          break;
+        }
       }
     }
     (void)ccoWindowDeregister(comm, hostShadow.resourceWindow);

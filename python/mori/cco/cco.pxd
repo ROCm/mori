@@ -10,6 +10,29 @@ cdef extern from "mori/cco/cco.hpp" namespace "mori::cco":
 
     unsigned int CCO_API_MAGIC
     unsigned int CCO_API_VERSION
+    unsigned int CCO_COMM_INFO_VERSION
+    unsigned int CCO_WINDOW_REGISTER_OPTIONS_VERSION
+
+    cdef struct ccoCommInfo:
+        size_t size
+        uint32_t magic
+        uint32_t version
+        int rank
+        int worldSize
+        int lsaRank
+        int lsaSize
+        int lsaStart
+        size_t perRankSize
+
+    ctypedef enum ccoWindowRegisterFlags:
+        CCO_WINDOW_REGISTER_DEFAULT
+        CCO_WINDOW_REGISTER_LSA_ONLY
+
+    cdef struct ccoWindowRegisterOptions:
+        size_t size
+        uint32_t magic
+        uint32_t version
+        uint32_t flags
 
     ctypedef enum ccoGdaConnectionType:
         CCO_GDA_CONNECTION_NONE
@@ -118,7 +141,10 @@ cdef extern from "mori/cco/cco.hpp" namespace "mori::cco":
     int ccoGetUniqueId(ccoUniqueId* uniqueId) nogil
     int ccoCommCreate(const ccoUniqueId& uniqueId, int nRanks, int rank,
                       size_t perRankVmmSize, ccoComm** outComm) nogil
+    int ccoCommCreateLsaOnly(const ccoUniqueId& uniqueId, int nRanks, int rank,
+                             size_t perRankVmmSize, ccoComm** outComm) nogil
     int ccoCommDestroy(ccoComm* comm) nogil
+    int ccoCommGetInfo(const ccoComm* comm, ccoCommInfo* info) nogil
     int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) nogil
     int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) nogil
     int ccoMemFree(ccoComm* comm, void* ptr) nogil
@@ -128,7 +154,12 @@ cdef extern from "mori/cco/cco.hpp" namespace "mori::cco":
                           ccoWindow_t* outWin) nogil
     int ccoWindowRegister(ccoComm* comm, void* externalPtr, size_t size,
                           ccoWindow_t* outWin, void** outLocalPtr) nogil
+    int ccoWindowRegisterExternal(
+        ccoComm* comm, void* externalPtr, size_t size,
+        const ccoWindowRegisterOptions* options,
+        ccoWindow_t* outWin, void** outLocalPtr) nogil
     int ccoWindowDeregister(ccoComm* comm, ccoWindow_t win) nogil
+    void* ccoGetPeerPtr(ccoComm* comm, void* localPtr, int pe) nogil
     int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs,
                          ccoDevComm* outDevComm) nogil
     int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm) nogil

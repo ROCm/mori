@@ -73,7 +73,10 @@ struct PeerCapabilities {
 
 class Context {
  public:
-  Context(BootstrapNetwork& bootNet);
+  explicit Context(BootstrapNetwork& bootNet);
+  // `enableRdma=false` keeps host/P2P topology discovery but skips NIC/provider
+  // loading. CCO's LSA-only communicator uses this lightweight mode.
+  Context(BootstrapNetwork& bootNet, bool enableRdma);
   ~Context();
 
   int LocalRank() const { return bootNet.GetLocalRank(); }
@@ -162,7 +165,7 @@ class Context {
 
  private:
   void CollectHostNames();
-  void InitializeTopologyAndTransports();
+  void InitializeTopologyAndTransports(bool enableRdma);
 
   // Apply Context's built-in policy to derive a single TransportType from a
   // PeerCapabilities entry. Preference: P2P > SDMA > RDMA. Self always P2P.

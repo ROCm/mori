@@ -44,7 +44,9 @@
 namespace mori {
 namespace application {
 
-Context::Context(BootstrapNetwork& bootNet) : bootNet(bootNet) {
+Context::Context(BootstrapNetwork& bootNet) : Context(bootNet, true) {}
+
+Context::Context(BootstrapNetwork& bootNet, bool enableRdma) : bootNet(bootNet) {
   // Snapshot env vars once at construction. Every subsequent decision (transport
   // selection, hipMalloc vs hipExtMallocWithFlags(uncached), etc.) must read
   // from this cached state, not getenv. Otherwise late env mutations -- e.g.
@@ -62,7 +64,7 @@ Context::Context(BootstrapNetwork& bootNet) : bootNet(bootNet) {
   // Lightweight: topology, NIC selection, transport type decision, SDMA queues.
   // No QP creation, no AllToAll. Modules that need the initial RDMA endpoint
   // set must explicitly call BuildInitialEndpoints() afterwards.
-  InitializeTopologyAndTransports();
+  InitializeTopologyAndTransports(enableRdma);
 }
 
 void Context::BuildInitialEndpoints() {
@@ -269,12 +271,29 @@ int Context::SameHostPeersBefore(int rank) const {
   return n;
 }
 
-void Context::InitializeTopologyAndTransports() {
+void Context::InitializeTopologyAndTransports(bool enableRdma) {
   // Find my rank in node
   for (int i = 0; i <= LocalRank(); i++) {
     if (peerInfos[i].sameHost) rankInNode++;
   }
   assert(rankInNode < 8);
+
+  if (!enableRdma) {
+    // LSA-only consumers still need the host/process map, but touching
+    // RdmaContext here would enumerate NIC providers and may dlopen vendor
+    // libraries that are intentionally absent from a P2P-only installation.
+    peerCaps.resize(WorldSize());
+    for (int i = 0; i < WorldSize(); i++) {
+      PeerCapabilities& cap = peerCaps[i];
+      cap.sameHost = peerInfos[i].sameHost;
+      cap.sameProcess = peerInfos[i].sameProcess;
+      cap.canP2P = cap.sameHost;
+      cap.canSDMA = cap.sameHost;
+      cap.canRDMA = false;
+    }
+    MORI_APP_INFO("rank {} initialized host/LSA topology without RDMA", LocalRank());
+    return;
+  }
 
   // Init rdma context
   rdmaContext.reset(new RdmaContext(RdmaBackendType::DirectVerbs));

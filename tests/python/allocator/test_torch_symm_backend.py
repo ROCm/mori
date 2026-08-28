@@ -27,6 +27,7 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 import torch.multiprocessing as mp
 from mori.allocator import (  # importing registers "MORI"
+    get_cco_window,
     handle_type,
     signal_pad_supported,
 )
@@ -53,12 +54,18 @@ def _run(rank, world_size, port):
         hdl = symm_mem.rendezvous(t, group_name)
         assert hdl.world_size == world_size and hdl.rank == rank
 
-        # Peers come back the torch way, as one base address per rank.
+        # The public torch view remains a pointer array, but every entry now comes from
+        # the same CCO window exposed to MORI-specific LSA kernels.
         ptrs = hdl.buffer_ptrs
         assert len(ptrs) == world_size and all(p for p in ptrs)
-        # An implementation detail rather than an API promise, but worth pinning: the
-        # ranks share one flat span, so the pointers are evenly strided. ROCm/mori#557
-        # is where that becomes a first-class cco window.
+        lsa = get_cco_window(t, group_name)
+        assert lsa.window_handle
+        assert lsa.local_ptr == ptrs[rank]
+        assert lsa.rank == rank and lsa.world_size == world_size
+        assert lsa.lsa_rank == rank and lsa.lsa_size == world_size
+        assert lsa.lsa_start == 0 and lsa.per_rank_size % (4 << 30) == 0
+        assert [lsa.peer_ptr(r) for r in range(world_size)] == ptrs
+
         stride = ptrs[1] - ptrs[0]
         for r, p in enumerate(ptrs):
             assert p == ptrs[0] + r * stride, f"rank {r} not at base + r*stride"
@@ -79,6 +86,58 @@ def _run(rank, world_size, port):
             with pytest.raises(RuntimeError, match="MORI_SYMM_SIGNAL_PAD"):
                 torch.ops.symm_mem.one_shot_all_reduce(t, "sum", group_name)
 
+        dist.barrier()
+        # The owning LSA/torch handles keep the original VMM allocation alive even
+        # after tensor storage invokes allocator.free().
+        del t
+        gc.collect()
+        torch.cuda.synchronize()
+        dist.barrier()
+        assert lsa.local_ptr == hdl.buffer_ptrs[rank]
+        assert hdl.get_buffer(rank, (1,), torch.float32).item() != 0
+
+
+def _run_divergent_release(rank, world_size, port):
+    """A later CCO window must work after ranks release an older one differently."""
+    with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
+        device = torch.device("cuda", rank)
+        torch.cuda.set_device(device)
+        group_name = dist.group.WORLD.group_name
+        symm_mem.set_backend("MORI")
+        symm_mem.enable_symm_mem_for_group(group_name)
+
+        old = symm_mem.empty(4096, dtype=torch.float32, device=device)
+        old.fill_(float(rank + 1))
+        old_hdl = symm_mem.rendezvous(old, group_name)
+        old_lsa = get_cco_window(old, group_name)
+        torch.cuda.synchronize()
+        dist.barrier()
+
+        # rank 0 returns its first-fit slot; rank 1 keeps the old window live. The
+        # next collective therefore uses different local slot offsets on the ranks.
+        if rank == 0:
+            del old_lsa, old_hdl, old
+            gc.collect()
+            torch.cuda.synchronize()
+        dist.barrier()
+
+        new = symm_mem.empty(4096, dtype=torch.float32, device=device)
+        new.fill_(float(rank + 11))
+        torch.cuda.synchronize()
+        new_hdl = symm_mem.rendezvous(new, group_name)
+        new_lsa = get_cco_window(new, group_name)
+        assert new_lsa.local_ptr == new_hdl.buffer_ptrs[rank]
+        assert [new_lsa.peer_ptr(r) for r in range(world_size)] == new_hdl.buffer_ptrs
+        for pe in range(world_size):
+            peer = new_hdl.get_buffer(pe, (1,), torch.float32)
+            assert peer.item() == float(pe + 11)
+
+        dist.barrier()
+        if rank != 0:
+            del old_lsa, old_hdl, old
+        del new_lsa, new_hdl, new
+        gc.collect()
+        torch.cuda.synchronize()
         dist.barrier()
 
 
@@ -138,11 +197,59 @@ def _run_release(rank, world_size, port):
         assert shared < 8 * mib, f"the rendezvous'd window leaks. {report}"
 
 
+def _run_subgroups(rank, world_size, port):
+    """Disjoint process groups get independent CCO communicators and rank maps."""
+    with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
+        device = torch.device("cuda", rank)
+        torch.cuda.set_device(device)
+        group01 = dist.new_group([0, 1])
+        group23 = dist.new_group([2, 3])
+        group = group01 if rank < 2 else group23
+        group_rank = rank % 2
+        group_name = group.group_name
+
+        symm_mem.set_backend("MORI")
+        symm_mem.enable_symm_mem_for_group(group_name)
+        tensor = symm_mem.empty(1024, dtype=torch.float32, device=device)
+        tensor.fill_(float(rank + 1))
+        torch.cuda.synchronize()
+
+        hdl = symm_mem.rendezvous(tensor, group_name)
+        lsa = get_cco_window(tensor, group)
+        assert hdl.rank == group_rank and hdl.world_size == 2
+        assert lsa.rank == group_rank and lsa.world_size == 2
+        assert lsa.lsa_rank == group_rank and lsa.lsa_size == 2
+        assert [lsa.peer_ptr(r) for r in range(2)] == hdl.buffer_ptrs
+
+        first_global_rank = 0 if rank < 2 else 2
+        for peer in range(2):
+            remote = hdl.get_buffer(peer, (1,), torch.float32)
+            assert remote.item() == float(first_global_rank + peer + 1)
+
+        dist.barrier(group=group)
+        del lsa, hdl, tensor
+        gc.collect()
+        torch.cuda.synchronize()
+        dist.barrier(group=group)
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs at least 2 GPUs")
 def test_symm_backend():
     world_size = 2
     port = get_free_port()
     mp.spawn(_run, args=(world_size, port), nprocs=world_size, join=True)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs at least 2 GPUs")
+def test_symm_divergent_release():
+    world_size = 2
+    port = get_free_port()
+    mp.spawn(
+        _run_divergent_release,
+        args=(world_size, port),
+        nprocs=world_size,
+        join=True,
+    )
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs at least 4 GPUs")
@@ -151,3 +258,10 @@ def test_symm_release():
     world_size = 4
     port = get_free_port()
     mp.spawn(_run_release, args=(world_size, port), nprocs=world_size, join=True)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs at least 4 GPUs")
+def test_symm_subgroups():
+    world_size = 4
+    port = get_free_port()
+    mp.spawn(_run_subgroups, args=(world_size, port), nprocs=world_size, join=True)
