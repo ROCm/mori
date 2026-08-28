@@ -1,8 +1,8 @@
 # All-to-all over the mori torch SymmetricMemory backend
 
-One-shot all-to-all against a symmetric window, written twice — `all2all_hip.py` and
-`all2all_triton.py`. Each is self-contained and runs on its own; neither uses mori's shmem
-or cco. The only thing either needs from the backend is the peer pointers torch publishes:
+One-shot all-to-all against a symmetric window, written three ways — `all2all_hip.py`,
+`all2all_triton.py` and `all2all_lsa.py`. Each is self-contained and runs on its own. The
+first two need nothing from mori but the peer pointers torch publishes:
 
 ```
 recv slot of rank p, chunk from rank r  ==  peers[p] + r*chunk_bytes
@@ -11,6 +11,7 @@ recv slot of rank p, chunk from rank r  ==  peers[p] + r*chunk_bytes
 ```bash
 torchrun --nnodes=1 --nproc_per_node=8 all2all_hip.py --chunk-kib 256
 torchrun --nnodes=1 --nproc_per_node=8 all2all_triton.py --chunk-kib 256
+torchrun --nnodes=1 --nproc_per_node=8 all2all_lsa.py --chunk-kib 256
 ```
 
 Needs **torch >= 2.9**: `symm_mem.set_backend()`, and the SymmetricMemory interface the
@@ -60,6 +61,40 @@ is the same dwordx4-per-lane store the HIP kernel does. One Triton detail worth 
 the kernel is declared `@triton.jit(do_not_specialize=["chunk_elems", "rank_id",
 "blocks_per_peer"])`, because Triton turns an `int` argument that happens to equal `1` into
 a `constexpr` — without it, **rank 1 alone** fails to compile.
+
+## The LSA version
+
+`all2all_lsa.py` is the same push again, with the peer address *computed* instead of
+loaded. It is the one file here that does use cco: `register_external_window()` aliases the
+tensor's VMM handle into cco's flat LSA space, and the kernel asks the window for the
+address.
+
+```python
+win  = comm.register_external_window(recv.data_ptr(), recv.nbytes)   # no copy
+addr = cco.Window.lsa_ptr(window, peer, rank_id * chunk_bytes)       # in the kernel
+```
+
+`symm_mem.rendezvous()` is never called: the backend's own peer exchange would duplicate
+what `ccoWindowRegister` already does. torch keeps the allocation and its lifetime, cco
+takes the addressing. cco has its own rendezvous, so the example passes a `ccoUniqueId`
+through torch's process group; and `import torch` must come before `import mori.cco`, or
+the two LLVM copies collide at import time.
+
+It measures the same as the pointer array — 8×gfx950, 4 MiB per peer, three repeats each:
+
+| | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| `all2all_lsa.py` | 1924.7 | 1964.3 | 1862.9 GB/s |
+| `all2all_triton.py` | 1944.5 | 1922.3 | 1914.4 GB/s |
+
+which is the point: the reason to write against the window is not throughput. An address
+array can only describe peers that are directly load/store-able, while `ccoWindowDevice`
+also carries the RDMA MR for peers that are not, so this is the addressing mode a
+scale-out version has to be built on. See [ROCm/mori#557](https://github.com/ROCm/mori/issues/557).
+
+Use the same `blocks_per_peer` heuristic as its siblings. An earlier draft capped it at 16
+and lost ~6% at 8 ranks, which reads exactly like an addressing-mode difference and is not
+one.
 
 ## Measured
 
