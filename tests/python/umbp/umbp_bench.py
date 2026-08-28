@@ -343,6 +343,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     _add_backend_sub(cmd_sub.add_parser("correctness"))
     _add_backend_sub(cmd_sub.add_parser("batch_perf"), batch_perf=True)
+    _add_backend_sub(cmd_sub.add_parser("exists_perf"), batch_perf=True)
     _add_backend_sub(cmd_sub.add_parser("ranged_perf"), ranged_perf=True)
     return parser
 
@@ -664,6 +665,10 @@ def _hugepage_preflight():
         # a single value-sized one. The writer allocates only a scratch value.
         if command == "batch_perf" and role != "writer":
             need["read buffer"] = nr_objects * value_size
+        elif command == "exists_perf":
+            # Presence queries move no value bytes; a value-sized scratch for
+            # the writer is all this command ever touches.
+            need["value scratch"] = value_size
         else:
             need["value scratch"] = value_size
     total = sum(need.values())
@@ -782,6 +787,19 @@ class Backend(ABC):
     @abstractmethod
     def batch_get_into_ptr(self, keys: list, ptrs: list, sizes: list) -> list:
         """Batch read into ptrs. Returns bytes_read per key (0 = miss)."""
+
+    def batch_exists(self, keys: list) -> list:
+        """Presence of each key. Not abstract: only the UMBP backends implement
+        it, and a backend that cannot answer should say so rather than silently
+        report every key missing."""
+        raise NotImplementedError(f"{type(self).__name__} has no batch_exists")
+
+    def batch_exists_consecutive(self, keys: list) -> int:
+        """How many keys exist consecutively from index 0 (early-stop).  This is
+        the shape a prefix-cache probe actually uses."""
+        raise NotImplementedError(
+            f"{type(self).__name__} has no batch_exists_consecutive"
+        )
 
     @abstractmethod
     def wait_visible(self, keys: list, timeout: float = 30.0) -> int:
@@ -912,6 +930,17 @@ class UMBPBackend(Backend):
         dist.cache_remote_fetches = os.environ.get(
             "UMBP_CACHE_REMOTE_FETCHES", "1"
         ) not in ("0", "false", "False", "")
+        # Local-first (PoolClientConfig::local_first): resolve on this node's
+        # own media before asking the master, and skip the master entirely when
+        # the whole batch is local.  Exposed here because it is the knob a
+        # single-node get sweep exists to measure -- with it off every batch
+        # pays a BatchRouteGet round trip it cannot use.
+        dist.local_first = os.environ.get("UMBP_LOCAL_FIRST", "1") not in (
+            "0",
+            "false",
+            "False",
+            "",
+        )
         dist.io_engine.host = node_address
         # The ranged scratch arena is the whole opt-in for ranged I/O, on every
         # medium including SSD, and it defaults to zero.  ranged_perf sizes it
@@ -1103,6 +1132,12 @@ class UMBPBackend(Backend):
 
     def wait_visible(self, keys: list, timeout: float = 30.0) -> int:
         return _wait_visible_via_exists(self._client, keys, timeout)
+
+    def batch_exists(self, keys: list) -> list:
+        return self._client.batch_exists(keys)
+
+    def batch_exists_consecutive(self, keys: list) -> int:
+        return self._client.batch_exists_consecutive(keys)
 
     def supports_ranged_io(self) -> bool:
         return self._client.supports_ranged_io()
@@ -1345,6 +1380,12 @@ class UMBPLocalBackend(Backend):
     def wait_visible(self, keys: list, timeout: float = 30.0) -> int:
         return _wait_visible_via_exists(self._client, keys, timeout)
 
+    def batch_exists(self, keys: list) -> list:
+        return self._client.batch_exists(keys)
+
+    def batch_exists_consecutive(self, keys: list) -> int:
+        return self._client.batch_exists_consecutive(keys)
+
     def supports_ranged_io(self) -> bool:
         return self._client.supports_ranged_io()
 
@@ -1408,6 +1449,12 @@ class UMBPServerBackend(Backend):
 
     def wait_visible(self, keys: list, timeout: float = 30.0) -> int:
         return _wait_visible_via_exists(self._client, keys, timeout)
+
+    def batch_exists(self, keys: list) -> list:
+        return self._client.batch_exists(keys)
+
+    def batch_exists_consecutive(self, keys: list) -> int:
+        return self._client.batch_exists_consecutive(keys)
 
     def supports_ranged_io(self) -> bool:
         return self._client.supports_ranged_io()
@@ -1997,6 +2044,87 @@ elif command == "batch_perf":
             flush=True,
         )
 
+elif command == "exists_perf":
+    # Presence-probe sweep: the shape a prefix cache uses before it reads.
+    #
+    # Separate from batch_perf on purpose.  A get has a local half that is
+    # already parallel and already batched, so a routing change is only part of
+    # its cost.  An Exists moves no bytes at all -- under route-first it is
+    # ONE master RPC and nothing else -- so it isolates what consulting the
+    # master actually costs, with no copy to hide behind.
+    #
+    # Two key populations, because local-first is asymmetric:
+    #   present -- this node holds them, so a local resolve is conclusive and
+    #              the master is never asked.
+    #   absent  -- a local miss proves nothing, so every key still goes to the
+    #              master.  This is the worst case: the local resolve is pure
+    #              added work.
+    passes = args.passes
+    batch_sizes = args.batch_sizes if args.batch_sizes else [1, 32, 128, nr_objects]
+
+    present_keys = [make_key(i) for i in range(nr_objects)]
+    # Same key shape, never written.  make_key's namespace is the object index,
+    # so pushing past nr_objects cannot collide with the dataset.
+    absent_keys = [make_key(i) for i in range(nr_objects, 2 * nr_objects)]
+
+    def _sweep(label: str, probe_keys: list, fn, unit: str):
+        for batch_size in batch_sizes:
+            batches = [
+                probe_keys[i : i + batch_size]
+                for i in range(0, len(probe_keys), batch_size)
+            ]
+            for kb in batches:  # warmup
+                fn(kb)
+
+            found = 0
+            start = time.perf_counter()
+            for _ in range(passes):
+                for kb in batches:
+                    found += fn(kb)
+            elapsed = time.perf_counter() - start
+            total_reqs = len(probe_keys) * passes
+            total_batches = len(batches) * passes
+            print(
+                f"RESULT op={unit} population={label} batch_size={batch_size} "
+                f"found={found} requests={total_reqs} batches={total_batches} "
+                f"duration={elapsed:.3f}s key_per_s={total_reqs / elapsed:.2f} "
+                f"batch_per_s={total_batches / elapsed:.2f} "
+                f"avg_latency_ms={(elapsed / total_batches) * 1000:.4f}",
+                flush=True,
+            )
+
+    # WHICH client probes decides what is being measured, and it is the whole
+    # point of this command:
+    #   holder  -- the node that wrote the keys.  Under local_first its own
+    #              backends answer for `present` and the master is never asked.
+    #              This is the single-node deployment.
+    #   probe   -- the separate reader node, which holds nothing.  Every key,
+    #              present or not, has to go to the master.  Unlike batch_perf
+    #              nothing re-caches onto it here, because a presence query
+    #              moves no bytes.
+    clients = [("probe", reader)]
+    if role == "both":
+        clients.insert(0, ("holder", writer))
+
+    try:
+        for who, client in clients:
+            for pop, pkeys in (("present", present_keys), ("absent", absent_keys)):
+                _sweep(
+                    f"{who}/{pop}",
+                    pkeys,
+                    lambda kb, c=client: sum(c.batch_exists(kb)),
+                    "exists",
+                )
+                _sweep(
+                    f"{who}/{pop}",
+                    pkeys,
+                    lambda kb, c=client: c.batch_exists_consecutive(kb),
+                    "exists_consecutive",
+                )
+    except NotImplementedError as exc:
+        print(f"EXISTS_UNSUPPORTED {exc}", flush=True)
+        sys.exit(2)
+
 elif command == "ranged_perf":
     # Ranged (sub-object) vs whole-object over the SAME keys in the SAME
     # process.  The headline is the RATIO at each fetched fraction: it cancels
@@ -2006,6 +2134,25 @@ elif command == "ranged_perf":
     # moves object_size per key regardless, so its useful figure is deliberately
     # the smaller one -- that gap IS the thing being measured.
     import statistics
+
+    # WHICH client issues the reads decides what is measured.  The bench's
+    # `reader` is a SEPARATE UMBP node holding nothing, so its ranged reads are
+    # remote until ranged_locality_prefetch happens to have pulled an object
+    # over -- background, best-effort, and therefore not a controlled input.
+    # Probing on the holder makes every read local by construction, which is
+    # the single-node deployment local_first exists for.
+    if os.environ.get("UMBP_PROBE_ON_HOLDER", "0") not in ("0", "false", "False", ""):
+        if role != "both":
+            print(
+                "ERROR: UMBP_PROBE_ON_HOLDER needs role=both (there is no local "
+                "holder in this process otherwise)",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        reader = writer
+        print("probe_on=holder", flush=True)
+    else:
+        print("probe_on=reader", flush=True)
 
     if not reader.supports_ranged_io():
         print(

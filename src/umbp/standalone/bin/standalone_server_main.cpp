@@ -117,14 +117,16 @@ bool AnyEnv(const std::vector<const char*>& names) {
 
 bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
                                           bool* distributed_requested, std::string* error) {
-  static const std::vector<const char*> kRequiredDistributedEnv = {
+  // Any one of these selects the distributed backend; see below for which are
+  // then actually required (master address is not).
+  static const std::vector<const char*> kDistributedSelectorEnv = {
       "UMBP_MASTER_ADDRESS",
       "UMBP_NODE_ADDRESS",
       "UMBP_NODE_ID",
       "UMBP_IO_ENGINE_HOST",
   };
 
-  *distributed_requested = AnyEnv(kRequiredDistributedEnv);
+  *distributed_requested = AnyEnv(kDistributedSelectorEnv);
   if (!*distributed_requested) {
     config->distributed.reset();
     return true;
@@ -134,8 +136,11 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
   auto node_address = EnvString("UMBP_NODE_ADDRESS");
   auto node_id = EnvString("UMBP_NODE_ID");
   auto io_engine_host = EnvString("UMBP_IO_ENGINE_HOST");
+  // UMBP_MASTER_ADDRESS is optional: without it the distributed backend runs
+  // single-node -- same data plane, no routing, no registration, no heartbeat.
+  // The node still needs its own identity and IO engine host, which is why
+  // those three stay required.
   std::vector<const char*> missing;
-  if (!master_address.has_value()) missing.push_back("UMBP_MASTER_ADDRESS");
   if (!node_address.has_value()) missing.push_back("UMBP_NODE_ADDRESS");
   if (!node_id.has_value()) missing.push_back("UMBP_NODE_ID");
   if (!io_engine_host.has_value()) missing.push_back("UMBP_IO_ENGINE_HOST");
@@ -148,7 +153,7 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
   }
 
   mori::umbp::UMBPDistributedConfig dist;
-  dist.master_config.master_address = *master_address;
+  dist.master_config.master_address = master_address.value_or("");
   dist.master_config.node_address = *node_address;
   dist.master_config.node_id = *node_id;
   dist.io_engine.host = *io_engine_host;
@@ -200,6 +205,9 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
     return false;
   if (!ParseBoolEnv("UMBP_DISTRIBUTED_RANGED_LOCALITY_PREFETCH", &dist.ranged_locality_prefetch,
                     error)) {
+    return false;
+  }
+  if (!ParseBoolEnv("UMBP_DISTRIBUTED_LOCAL_FIRST", &dist.local_first, error)) {
     return false;
   }
   size_t dram_page_size = static_cast<size_t>(dist.dram_page_size);

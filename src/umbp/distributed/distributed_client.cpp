@@ -372,7 +372,9 @@ bool DistributedClient::Flush() {
   if (closing_) return true;
   std::shared_lock lk(op_mutex_);
   if (closed_ || !pool_client_) return true;
-  pool_client_->Master().FlushHeartbeat();
+  // Nothing to flush to on a node with no master; the local media are already
+  // authoritative for everything they hold.
+  if (pool_client_->HasMaster()) pool_client_->Master().FlushHeartbeat();
   return true;
 }
 

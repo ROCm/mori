@@ -357,7 +357,13 @@ TEST_F(SsdRangedIoTest, RemoteRangedRoundTripThroughAnSsdPeer) {
 
   auto put = caller->BatchPutRanges({key}, {kObjectSize}, {srcs}, {put_sizes}, {put_offsets});
   ASSERT_EQ(put, std::vector<bool>({true})) << "ranged put did not reach the SSD peer";
-  ASSERT_TRUE(WaitForExists(target, key)) << "the object never landed on the SSD node";
+  // Polled on the CALLER, not the holder: what the ranged get below needs is
+  // not "the target has the bytes" but "the master can route the caller to
+  // them", and only the caller's lookup waits for that.  Under local_first the
+  // holder answers Exists out of its own backend, which is true as soon as the
+  // put commits -- a publication interval before the master knows -- so polling
+  // `target` here would stop waiting for the very thing this test needs.
+  ASSERT_TRUE(WaitForExists(caller, key)) << "the object never landed on the SSD node";
 
   std::vector<char> front(200, 0);
   std::vector<char> tail(100, 0);

@@ -22,6 +22,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -201,6 +202,11 @@ class PoolClient {
   // Which medium this node serves.  Valid after Init.
   TierType Medium() const { return medium_; }
 
+  // Whether this node is part of a master-coordinated cluster.  False is the
+  // single-node deployment: the data plane is unchanged, but nothing is routed,
+  // registered, or heartbeated, and a local miss is the final answer.
+  bool HasMaster() const { return master_client_ != nullptr; }
+
   bool IsInitialized() const;
 
   // External KV block events.
@@ -348,7 +354,30 @@ class PoolClient {
 
   PutAttemptOutcome ExecuteLocalPut(const std::string& key, const void* src, size_t size,
                                     TierType tier);
-  GetAttemptOutcome ExecuteLocalGet(const std::string& key, void* dst, size_t size);
+
+  // Resolve `keys` against this node's own media.  On return holders[i] is the
+  // backend that owns keys[i] (nullptr when nothing here does) and, when it is
+  // non-null, resolutions[i] is that backend's entry.  Both are sized to
+  // keys.size(); `candidates` selects which indices are asked about, so a
+  // caller can skip entries it has already rejected.
+  //
+  // `resolutions` may be null for a caller that only needs to know WHETHER a
+  // key is here -- an Exists does, and materializing an entry per key costs it
+  // a pages vector and a descs vector it never reads (measured 6-15%).
+  //
+  // One BatchResolve per BACKEND rather than one per key: the backend mutex is
+  // shared with Allocate / Commit / Evict, and in standalone-process mode every
+  // rank on the node shares this client, so a per-key walk is where they
+  // serialize.  Backends are tried in registry order and the first hit wins, so
+  // a second medium is asked only about what the first one missed.
+  //
+  // A hit here is conclusive: the backend owns the bytes.  A miss is conclusive
+  // only about THIS node; the key may still live on a peer, which is why every
+  // caller sends its misses to the master.
+  void ResolveLocalBatch(const std::vector<std::string>& keys,
+                         const std::vector<size_t>& candidates,
+                         std::vector<MediumBackend*>* holders,
+                         std::vector<ResolvedEntry>* resolutions);
 
   // One TransferItem per page between a caller buffer and `backend`'s own
   // buffers.  `to_backend` is Put (user -> pages), false is Get (pages -> user).
@@ -360,6 +389,21 @@ class PoolClient {
                                std::vector<TransferItem>* items);
 
   // ---- ranged I/O internals ----
+
+  // The route-first arm of BatchGetRanges: one BatchRouteGet over every key,
+  // before anything is served.  `route_sink` is the optional phase timer.
+  // False means the routing RPC failed.
+  bool RouteAllRangesUpFront(const std::vector<std::string>& keys, double* route_sink,
+                             std::vector<std::optional<RouteGetResult>>* preroutes);
+
+  // Routes for the keys BatchGetRanges' local phase missed, parallel to
+  // `missed`.  Issues the RPC under local_first; under the route-first arm it
+  // projects phase 0's `preroutes` instead, so that arm costs one routing RPC
+  // rather than two.  False means the routing RPC failed.
+  bool RouteMissedRanges(const std::vector<std::string>& route_keys,
+                         const std::vector<size_t>& missed,
+                         const std::vector<std::optional<RouteGetResult>>& preroutes,
+                         double* route_sink, std::vector<std::optional<RouteGetResult>>* routes);
 
   // The ranged counterpart of BuildLocalPageTransfers, and the only place the
   // object-range -> page-range mapping lives.  Emits one TransferItem per
@@ -577,6 +621,13 @@ class PoolClient {
   // path (remote_groups, keyed by peer node_id); self-target reads are
   // deferred (collected as indices) so ExecuteBatchGetPlan can place them
   // inside the remote-DRAM in-flight window when overlapping.
+  // What a key that no PEER can serve should fall back to.  Route-first has not
+  // looked locally yet, so an unroutable or self-routed key still deserves a
+  // local read.  Local-first has already asked every medium on this node, so the
+  // same key must be dropped -- sending it back would re-resolve a key just
+  // proven absent, which is the per-key cost ServeLocalBatchGet exists to avoid.
+  enum class LocalFallback { kAllow, kSkip };
+
   struct BatchGetPlan {
     std::unordered_map<std::string, std::vector<BatchGetItem>> remote_groups;
     std::vector<size_t> local_indices;
@@ -609,7 +660,48 @@ class PoolClient {
   BatchGetPlan PartitionBatchGetTargets(const std::vector<std::string>& keys,
                                         const std::vector<void*>& dsts,
                                         const std::vector<size_t>& sizes,
-                                        const std::vector<std::optional<RouteGetResult>>& routes);
+                                        const std::vector<std::optional<RouteGetResult>>& routes,
+                                        LocalFallback fallback);
+
+  // Route `indices` of `keys` and scatter the answers into *routes at their
+  // ORIGINAL key index, leaving every other slot nullopt -- which is how
+  // ComputeBatchBandwidthBytes already reads a missing route, and what lets one
+  // partition pass serve both arms.  `exclude_self` is set by the caller that
+  // has already tried this node's own media.  False means the RPC failed.
+  bool RouteGetsInto(const std::vector<std::string>& keys, const std::vector<size_t>& indices,
+                     bool exclude_self, std::vector<std::optional<RouteGetResult>>* routes);
+
+  // ---- local-first get (PoolClientConfig::local_first) ----
+
+  // Serve `indices` from this node's own media in one resolve and one transfer.
+  // Hits go into *results; unservable keys are appended to *missed, which may be
+  // null when the caller has no fallback left.  Shared by both BatchGet arms.
+  void ServeLocalGets(const std::vector<std::string>& keys, const std::vector<void*>& dsts,
+                      const std::vector<size_t>& sizes, const std::vector<size_t>& indices,
+                      std::vector<bool>* results, std::vector<size_t>* missed);
+
+  // Whole-batch wrapper for the local-first arm: drops what cannot be served at
+  // all, serves the rest, and returns the keys the master still has to route.
+  std::vector<size_t> ServeLocalBatchGet(const std::vector<std::string>& keys,
+                                         const std::vector<void*>& dsts,
+                                         const std::vector<size_t>& sizes,
+                                         std::vector<bool>* results);
+
+  // Counter sink that tolerates a node running without a master: metrics
+  // accumulate on the MasterClient and ride its flush tick, so with no master
+  // there is simply nowhere to put them.
+  void CountMetric(std::string name, std::string help, MasterClient::Labels labels, double delta);
+
+  // Placement when there is no master to ask: this node is the only candidate,
+  // so every key is routed to it on the medium it serves.  The put paths then
+  // proceed exactly as they would for a master-issued self-route.
+  void RouteAllPutsLocally(size_t count, std::vector<std::optional<RoutePutResult>>* routes) const;
+
+  // Local/remote bandwidth histograms for one BatchGet.  A method rather than
+  // an inline tail because local-first gives the call several exit points.
+  void ObserveBatchGetBandwidth(const std::vector<bool>& results, const std::vector<size_t>& sizes,
+                                const std::vector<std::optional<RouteGetResult>>& routes,
+                                std::chrono::steady_clock::time_point call_start);
   // Execute a BatchGetPlan: local reads and the remote-DRAM submit/wait
   // arrangement.  Zero-copy remote DRAM submits all peers, runs local reads
   // INSIDE that submit..wait gap (so they overlap the DRAM wire), then waits

@@ -109,15 +109,17 @@ BatchBandwidthSplit ComputeBatchBandwidthBytes(const std::vector<Result>& result
   return acc;
 }
 
-void ObserveBatchBandwidth(MasterClient& master_client, double bytes, double seconds,
+// `master_client` is null on a node running without a master; the histogram
+// simply has nowhere to go, and the caller should not have to know that.
+void ObserveBatchBandwidth(MasterClient* master_client, double bytes, double seconds,
                            const char* metric_name, const char* metric_help,
                            std::string_view traffic) {
-  if (bytes <= 0.0 || seconds <= 0.0) return;
+  if (master_client == nullptr || bytes <= 0.0 || seconds <= 0.0) return;
   const double gibps = (bytes / seconds) / kGiB;
   if (gibps <= 0.0) return;
   MasterClient::Labels labels = {{"traffic", std::string(traffic)}};
-  master_client.Observe(metric_name, metric_help, std::move(labels), BatchBandwidthBucketsGiBps(),
-                        gibps);
+  master_client->Observe(metric_name, metric_help, std::move(labels), BatchBandwidthBucketsGiBps(),
+                         gibps);
 }
 
 // ---------------------------------------------------------------------------
@@ -444,7 +446,7 @@ ScopeExit(Fn) -> ScopeExit<Fn>;
 // exit, so callers just add to them as keys succeed.
 class ScopedBatchBandwidth {
  public:
-  ScopedBatchBandwidth(MasterClient& master_client, const char* metric_name,
+  ScopedBatchBandwidth(MasterClient* master_client, const char* metric_name,
                        const char* metric_help, const double& local_bytes,
                        const double& remote_bytes)
       : master_client_(master_client),
@@ -468,7 +470,7 @@ class ScopedBatchBandwidth {
   }
 
  private:
-  MasterClient& master_client_;
+  MasterClient* master_client_;
   const char* metric_name_;
   const char* metric_help_;
   const double& local_bytes_;
@@ -651,7 +653,15 @@ bool PoolClient::Init() {
   bool expected = false;
   if (!initialized_.compare_exchange_strong(expected, true)) return true;
 
-  master_client_ = std::make_unique<MasterClient>(config_.master_config);
+  // No address, no master.  Everything below -- backends, transfer engine, peer
+  // service -- is built either way; only routing, registration and the
+  // heartbeat are skipped.  That is what lets one binary be a single node or a
+  // cluster member depending on config alone.
+  if (!config_.master_config.master_address.empty()) {
+    master_client_ = std::make_unique<MasterClient>(config_.master_config);
+  } else {
+    MORI_UMBP_INFO("[PoolClient] no master configured; running single-node");
+  }
 
   // The one byte-moving path (design doc §4).  Order is preference order:
   // a pair both of whose endpoints are host-addressable never reaches the wire.
@@ -807,7 +817,7 @@ bool PoolClient::Init() {
     }
   }
 
-  master_client_->SetBackendRegistry(&registry_);
+  if (master_client_) master_client_->SetBackendRegistry(&registry_);
 
   // Every instrumented component on this node rides the existing metrics tick:
   // the storage backend (generic slot-lifecycle series from the decorator, plus
@@ -815,7 +825,7 @@ bool PoolClient::Init() {
   // (per-engine bytes, plans and in-flight time).  Backend-agnostic by
   // construction — PoolClient forwards what each component samples and never
   // learns which medium or transport produced it.
-  master_client_->AddMetricsProvider([this] { PublishComponentMetrics(); });
+  if (master_client_) master_client_->AddMetricsProvider([this] { PublishComponentMetrics(); });
 
   // Pack engine_desc for master registration.
   std::vector<uint8_t> engine_desc_bytes;
@@ -851,14 +861,15 @@ bool PoolClient::Init() {
     auto cap = backend->Capacity();
     if (cap.total_bytes > 0) tier_caps[backend->Tier()] = cap;
   }
-  auto status = master_client_->RegisterSelf(tier_caps, peer_address, engine_desc_bytes);
-  if (!status.ok()) {
-    MORI_UMBP_ERROR("[PoolClient] RegisterSelf failed: {}", status.error_message());
-    initialized_ = false;
-    return false;
+  if (master_client_) {
+    auto status = master_client_->RegisterSelf(tier_caps, peer_address, engine_desc_bytes);
+    if (!status.ok()) {
+      MORI_UMBP_ERROR("[PoolClient] RegisterSelf failed: {}", status.error_message());
+      initialized_ = false;
+      return false;
+    }
+    if (config_.master_config.auto_heartbeat) master_client_->StartHeartbeat();
   }
-
-  if (config_.master_config.auto_heartbeat) master_client_->StartHeartbeat();
 
   // Start the async re-cache worker only when something can feed it and this
   // node has an exportable local medium to install into.  Two independent
@@ -952,6 +963,20 @@ bool PoolClient::Clear() {
 
 bool PoolClient::IsInitialized() const { return initialized_; }
 MasterClient& PoolClient::Master() { return *master_client_; }
+
+void PoolClient::RouteAllPutsLocally(size_t count,
+                                     std::vector<std::optional<RoutePutResult>>* routes) const {
+  RoutePutResult local;
+  local.node_id = config_.master_config.node_id;
+  local.tier = medium_;
+  routes->assign(count, local);
+}
+
+void PoolClient::CountMetric(std::string name, std::string help, MasterClient::Labels labels,
+                             double delta) {
+  if (master_client_ == nullptr) return;
+  master_client_->AddCounter(std::move(name), std::move(help), std::move(labels), delta);
+}
 BackendRegistry& PoolClient::Backends() { return registry_; }
 
 // ---------------------------------------------------------------------------
@@ -1157,63 +1182,48 @@ PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key
     backend->BatchAbort({alloc_res.slot_id});
     return PutAttemptOutcome::kFatal;
   }
-  master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL,
-                             MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL_HELP,
-                             {{"traffic", "local"}}, static_cast<double>(size));
-  master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL,
-                             MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL_HELP,
-                             {{"traffic", "local"}}, static_cast<double>(size));
+  CountMetric(MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL,
+              MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL_HELP, {{"traffic", "local"}},
+              static_cast<double>(size));
+  CountMetric(MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL,
+              MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL_HELP, {{"traffic", "local"}},
+              static_cast<double>(size));
   return PutAttemptOutcome::kSuccess;
 }
 
-PoolClient::GetAttemptOutcome PoolClient::ExecuteLocalGet(const std::string& key, void* dst,
-                                                          size_t size) {
-  if (registry_.Empty()) {
-    MORI_UMBP_ERROR("[PoolClient] Local Get requested but no storage backend is registered");
-    return GetAttemptOutcome::kFatal;
-  }
-  // Get carries no tier — the key may be in any medium here, and mirrored
-  // across several.  Walk this node's media and take the first hit, matching
-  // what the peer service does for a remote reader.
-  bool served = false;
+void PoolClient::ResolveLocalBatch(const std::vector<std::string>& keys,
+                                   const std::vector<size_t>& candidates,
+                                   std::vector<MediumBackend*>* holders,
+                                   std::vector<ResolvedEntry>* resolutions) {
+  holders->assign(keys.size(), nullptr);
+  if (resolutions != nullptr) resolutions->assign(keys.size(), ResolvedEntry{});
+  if (candidates.empty() || registry_.Empty()) return;
+
+  // Carry only the still-unclaimed indices from one backend to the next, so a
+  // second medium is asked about exactly what the first one missed.  Same shape
+  // as BatchGetRanges' phase-1 resolve, and for the same reason: one
+  // BatchResolve per backend, not per key.
+  std::vector<size_t> pending = candidates;
+  std::vector<std::string> batch;
+  std::vector<size_t> still_missing;
   for (auto* backend : registry_.All()) {
-    auto resolved = backend->BatchResolve({key}, /*include_descs=*/false).front();
-    if (!resolved.found) continue;
-    // Same guard the remote path applies after BatchResolveKeys: a stored size
-    // that disagrees with the requested one is a different object, and copying
-    // `size` bytes out of a slot sized for something else would read past it.
-    if (resolved.size != size) {
-      MORI_UMBP_WARN("[PoolClient] local Get: size mismatch for key='{}' (wanted {}, got {})", key,
-                     size, resolved.size);
-      return GetAttemptOutcome::kRetry;
+    if (pending.empty()) break;
+    batch.clear();
+    batch.reserve(pending.size());
+    for (size_t i : pending) batch.push_back(keys[i]);
+
+    auto found = backend->BatchResolve(batch, /*include_descs=*/false);
+    still_missing.clear();
+    for (size_t j = 0; j < pending.size(); ++j) {
+      if (j < found.size() && found[j].found) {
+        (*holders)[pending[j]] = backend;
+        if (resolutions != nullptr) (*resolutions)[pending[j]] = std::move(found[j]);
+      } else {
+        still_missing.push_back(pending[j]);
+      }
     }
-    std::vector<TransferItem> items;
-    if (!BuildLocalPageTransfers(backend, resolved.pages, resolved.page_size, dst, size,
-                                 /*to_backend=*/false, &items)) {
-      // This medium holds the key but cannot be read in-process (no published
-      // endpoint for its buffers).  Route elsewhere rather than reporting a
-      // miss, which would make the client exclude a node that does hold it.
-      return GetAttemptOutcome::kRetry;
-    }
-    if (!transfer_engine_->Transfer(items, /*failed_tags=*/nullptr)) {
-      return GetAttemptOutcome::kFatal;
-    }
-    served = true;
-    break;
+    pending.swap(still_missing);
   }
-  // No medium here held the key.  This is reachable: PartitionBatchGetTargets
-  // sends a key master has no route for down the local path as a fallback.
-  // Falling through to kSuccess would report a HIT with an untouched dst — the
-  // caller cannot tell the difference, and would hand stale bytes to its own
-  // caller.  (Pre-Phase-6 the loop did exactly that.)
-  if (!served) return GetAttemptOutcome::kRetry;
-  master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL,
-                             MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL_HELP,
-                             {{"traffic", "local"}}, static_cast<double>(size));
-  master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL,
-                             MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP,
-                             {{"traffic", "local"}}, static_cast<double>(size));
-  return GetAttemptOutcome::kSuccess;
 }
 
 // ---------------------------------------------------------------------------
@@ -1527,12 +1537,12 @@ void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteReq
     // One update for the batch rather than two per key; the totals are the
     // same.  AddCounter locks and materializes its help text every call, which
     // is not something to do once per object.
-    master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL,
-                               MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL_HELP,
-                               {{"traffic", "local"}}, put_bytes);
-    master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL,
-                               MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL_HELP,
-                               {{"traffic", "local"}}, put_bytes);
+    CountMetric(MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL,
+                MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL_HELP, {{"traffic", "local"}},
+                put_bytes);
+    CountMetric(MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL,
+                MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL_HELP, {{"traffic", "local"}},
+                put_bytes);
   }
 }
 
@@ -1856,12 +1866,16 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
   for (size_t i = 0; i < sizes.size(); ++i) block_sizes[i] = static_cast<uint64_t>(sizes[i]);
   std::vector<std::optional<RoutePutResult>> routes;
   std::unordered_set<std::string> excludes;
-  auto status = master_client_->BatchRoutePut(keys, block_sizes, excludes, &routes);
-  if (!status.ok()) {
-    MORI_UMBP_ERROR("[PoolClient] BatchPut: BatchRoutePut failed: {}", status.error_message());
-    return std::vector<bool>(keys.size(), false);
+  if (!HasMaster()) {
+    RouteAllPutsLocally(keys.size(), &routes);
+  } else {
+    auto status = master_client_->BatchRoutePut(keys, block_sizes, excludes, &routes);
+    if (!status.ok()) {
+      MORI_UMBP_ERROR("[PoolClient] BatchPut: BatchRoutePut failed: {}", status.error_message());
+      return std::vector<bool>(keys.size(), false);
+    }
+    if (routes.size() < keys.size()) routes.resize(keys.size());
   }
-  if (routes.size() < keys.size()) routes.resize(keys.size());
 
   BatchPutPlan plan = PartitionBatchPutTargets(keys, srcs, sizes, routes, &outcomes);
   ExecuteBatchPutPlan(plan, &outcomes);
@@ -1871,10 +1885,10 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
       std::chrono::duration_cast<std::chrono::duration<double>>(call_end - call_start).count();
   if (seconds > 0.0) {
     auto split = ComputeBatchBandwidthBytes(outcomes, sizes, routes, config_.master_config.node_id);
-    ObserveBatchBandwidth(*master_client_, split.local, seconds,
+    ObserveBatchBandwidth(master_client_.get(), split.local, seconds,
                           MORI_UMBP_METRIC_CLIENT_BATCH_PUT_BANDWIDTH,
                           MORI_UMBP_METRIC_CLIENT_BATCH_PUT_BANDWIDTH_HELP, "local");
-    ObserveBatchBandwidth(*master_client_, split.remote, seconds,
+    ObserveBatchBandwidth(master_client_.get(), split.remote, seconds,
                           MORI_UMBP_METRIC_CLIENT_BATCH_PUT_BANDWIDTH,
                           MORI_UMBP_METRIC_CLIENT_BATCH_PUT_BANDWIDTH_HELP, "remote");
   }
@@ -2287,10 +2301,9 @@ void PoolClient::FinalizeRemotePutEntries(std::vector<RemotePutEntry>& entries,
         auto idx = commit_indices[i];
         auto& entry = entries[idx];
         if (commit_resp.success(static_cast<int>(i))) {
-          master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL,
-                                     MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL_HELP,
-                                     {{"traffic", "remote"}},
-                                     static_cast<double>(entry.item->size));
+          CountMetric(MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL,
+                      MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL_HELP,
+                      {{"traffic", "remote"}}, static_cast<double>(entry.item->size));
           (*results)[entry.result_index] = PutEntryOutcome::kSucceeded;
         } else {
           // Peer allocator already logged the reason (SLOT_GONE / PRE_CLEAR).
@@ -2330,6 +2343,172 @@ bool PoolClient::Get(const std::string& key, void* dst, size_t size) {
   return !results.empty() && results[0];
 }
 
+// Serve `indices` from this node's own media in one resolve and one transfer.
+// Hits are written into *results; anything this node could not serve is
+// appended to *missed when the caller wants it back (null when there is no
+// fallback left to try).
+//
+// Batched on both axes deliberately.  One BatchResolve per BACKEND, not per
+// key: that mutex is shared with Allocate / Commit / Evict, and in
+// standalone-process mode every rank on the node shares this client.  Then ONE
+// Transfer for every key, tagged by key index so the engine attributes a
+// failure to its key instead of failing the batch.  The per-key alternative
+// measured 1.4-1.6x SLOWER than route-first at batch >= 32 despite issuing no
+// RPC at all; batching it made local-first win at every batch size.
+void PoolClient::ServeLocalGets(const std::vector<std::string>& keys,
+                                const std::vector<void*>& dsts, const std::vector<size_t>& sizes,
+                                const std::vector<size_t>& indices, std::vector<bool>* results,
+                                std::vector<size_t>* missed) {
+  const auto miss = [&](size_t i) {
+    if (missed != nullptr) missed->push_back(i);
+  };
+  if (indices.empty()) return;
+
+  std::vector<MediumBackend*> holders;
+  std::vector<ResolvedEntry> resolutions;
+  ResolveLocalBatch(keys, indices, &holders, &resolutions);
+
+  const auto t0 = std::chrono::steady_clock::now();
+  std::vector<TransferItem> items;
+  std::vector<size_t> local_keys;
+  local_keys.reserve(indices.size());
+  for (size_t i : indices) {
+    MediumBackend* const holder = holders[i];
+    if (holder == nullptr) {
+      miss(i);
+      continue;
+    }
+    const ResolvedEntry& resolved = resolutions[i];
+    // A stored size that disagrees with the requested one is a different
+    // object; copying sizes[i] out of a slot sized for something else would
+    // read past it.  Look for it elsewhere rather than report a hit.
+    if (resolved.size != sizes[i]) {
+      MORI_UMBP_WARN("[PoolClient] local Get: size mismatch for key='{}' (wanted {}, got {})",
+                     keys[i], sizes[i], resolved.size);
+      miss(i);
+      continue;
+    }
+    const size_t before = items.size();
+    if (!BuildLocalPageTransfers(holder, resolved.pages, resolved.page_size, dsts[i], sizes[i],
+                                 /*to_backend=*/false, &items)) {
+      // This medium holds the key but publishes no in-process endpoint for its
+      // buffers.  Drop what was appended for it -- a half-built key must not
+      // ride along in the batch -- and route it instead.
+      items.resize(before);
+      miss(i);
+      continue;
+    }
+    for (size_t k = before; k < items.size(); ++k) items[k].tag = i;
+    local_keys.push_back(i);
+  }
+  if (items.empty()) return;
+
+  std::vector<size_t> failed_tags;
+  transfer_engine_->Transfer(items, &failed_tags);
+  const std::unordered_set<size_t> failed(failed_tags.begin(), failed_tags.end());
+
+  double local_get_bytes = 0.0;
+  for (size_t i : local_keys) {
+    if (failed.count(i) != 0) {
+      // Any failed fragment fails the whole key: the destination now holds a
+      // partial object, and reporting a hit would hand the caller bytes it
+      // cannot tell are incomplete.
+      miss(i);
+      continue;
+    }
+    (*results)[i] = true;
+    local_get_bytes += static_cast<double>(sizes[i]);
+  }
+  if (local_get_bytes > 0.0) {
+    CountMetric(MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL,
+                MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL_HELP, {{"traffic", "local"}},
+                local_get_bytes);
+    CountMetric(MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL,
+                MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP, {{"traffic", "local"}},
+                local_get_bytes);
+  }
+  if (std::getenv("UMBP_LOCAL_COPY_TIMING")) {
+    const double sec = std::chrono::duration_cast<std::chrono::duration<double>>(
+                           std::chrono::steady_clock::now() - t0)
+                           .count();
+    MORI_UMBP_INFO("[LocalCopy] GET keys={} items={} bytes={} elapsed_ms={:.3f} GiB_s={:.2f}",
+                   local_keys.size(), items.size(), local_get_bytes, sec * 1000.0,
+                   local_get_bytes / (sec > 0 ? sec : 1e-12) / (1024.0 * 1024 * 1024));
+  }
+}
+
+// Whole-batch entry point for the local-first arm: filter what cannot be served
+// at all, serve the rest, and hand back the keys the master still has to route.
+std::vector<size_t> PoolClient::ServeLocalBatchGet(const std::vector<std::string>& keys,
+                                                   const std::vector<void*>& dsts,
+                                                   const std::vector<size_t>& sizes,
+                                                   std::vector<bool>* results) {
+  std::vector<size_t> candidates;
+  candidates.reserve(keys.size());
+  for (size_t i = 0; i < keys.size(); ++i) {
+    // Silently skipped here; PartitionBatchGetTargets sees every key and owns
+    // the warning, so routing it through both would log each one twice.
+    if (sizes[i] == 0) continue;
+    candidates.push_back(i);
+  }
+  std::vector<size_t> missed;
+  missed.reserve(candidates.size());
+  ServeLocalGets(keys, dsts, sizes, candidates, results, &missed);
+  return missed;
+}
+
+// Route the keys the local phase missed and group them by peer.  `routes` is
+// indexed by ORIGINAL key index and left nullopt for anything served locally,
+// which is how ComputeBatchBandwidthBytes already reads a missing route.
+//
+// Self is excluded: ServeLocalBatchGet already asked every medium here, so a
+// route back to this node could only repeat that miss.  The returned plan has
+// no local half for the same reason.  False means the routing RPC failed.
+bool PoolClient::RouteGetsInto(const std::vector<std::string>& keys,
+                               const std::vector<size_t>& indices, bool exclude_self,
+                               std::vector<std::optional<RouteGetResult>>* routes) {
+  if (indices.empty()) return true;
+  // No master means no peers: this node already looked, so the miss is final
+  // and every slot stays nullopt.  Not a failure -- there was nothing to ask.
+  if (!HasMaster()) return true;
+
+  std::vector<std::string> route_keys;
+  route_keys.reserve(indices.size());
+  for (size_t i : indices) route_keys.push_back(keys[i]);
+
+  std::unordered_set<std::string> excludes;
+  if (exclude_self) excludes.insert(config_.master_config.node_id);
+
+  std::vector<std::optional<RouteGetResult>> answers;
+  auto status = master_client_->BatchRouteGet(route_keys, excludes, &answers);
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[PoolClient] BatchGet: BatchRouteGet failed: {}", status.error_message());
+    return false;
+  }
+  // A short reply is not an error; the unanswered keys stay nullopt, which the
+  // partition reads as "nowhere".
+  answers.resize(indices.size());
+  for (size_t r = 0; r < indices.size(); ++r) (*routes)[indices[r]] = answers[r];
+  return true;
+}
+
+void PoolClient::ObserveBatchGetBandwidth(const std::vector<bool>& results,
+                                          const std::vector<size_t>& sizes,
+                                          const std::vector<std::optional<RouteGetResult>>& routes,
+                                          std::chrono::steady_clock::time_point call_start) {
+  const double seconds = std::chrono::duration_cast<std::chrono::duration<double>>(
+                             std::chrono::steady_clock::now() - call_start)
+                             .count();
+  if (seconds <= 0.0) return;
+  auto split = ComputeBatchBandwidthBytes(results, sizes, routes, config_.master_config.node_id);
+  ObserveBatchBandwidth(master_client_.get(), split.local, seconds,
+                        MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH,
+                        MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH_HELP, "local");
+  ObserveBatchBandwidth(master_client_.get(), split.remote, seconds,
+                        MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH,
+                        MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH_HELP, "remote");
+}
+
 std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
                                        const std::vector<void*>& dsts,
                                        const std::vector<size_t>& sizes) {
@@ -2344,32 +2523,36 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
     return results;
   }
 
-  std::vector<std::optional<RouteGetResult>> routes;
-  std::unordered_set<std::string> excludes;
-  auto status = master_client_->BatchRouteGet(keys, excludes, &routes);
-  if (!status.ok()) {
-    MORI_UMBP_ERROR("[PoolClient] BatchGet: BatchRouteGet failed: {}", status.error_message());
-    return results;
-  }
-  if (routes.size() < keys.size()) {
-    routes.resize(keys.size());
+  // Both arms are route-then-partition; they differ only in WHICH keys reach
+  // the master and whether an unroutable key may still fall back to a local
+  // read.  Left nullopt for anything served locally, which is how
+  // ComputeBatchBandwidthBytes already reads a missing route.
+  std::vector<std::optional<RouteGetResult>> routes(keys.size());
+  const bool local_first = config_.local_first && !registry_.Empty();
+
+  std::vector<size_t> to_route;
+  if (local_first) {
+    to_route = ServeLocalBatchGet(keys, dsts, sizes, &results);
+    // The whole point of the flag: a batch this node could satisfy by itself
+    // never touches the master.
+    if (to_route.empty()) {
+      ObserveBatchGetBandwidth(results, sizes, routes, call_start);
+      return results;
+    }
+  } else {
+    to_route.resize(keys.size());
+    std::iota(to_route.begin(), to_route.end(), 0);
   }
 
-  BatchGetPlan plan = PartitionBatchGetTargets(keys, dsts, sizes, routes);
-  ExecuteBatchGetPlan(plan, keys, dsts, sizes, &results);
-
-  const auto call_end = std::chrono::steady_clock::now();
-  const double seconds =
-      std::chrono::duration_cast<std::chrono::duration<double>>(call_end - call_start).count();
-  if (seconds > 0.0) {
-    auto split = ComputeBatchBandwidthBytes(results, sizes, routes, config_.master_config.node_id);
-    ObserveBatchBandwidth(*master_client_, split.local, seconds,
-                          MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH,
-                          MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH_HELP, "local");
-    ObserveBatchBandwidth(*master_client_, split.remote, seconds,
-                          MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH,
-                          MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH_HELP, "remote");
+  // A routing failure is not fatal to what is already in hand: under local-first
+  // the phase-1 hits stand, since they never depended on this RPC.
+  if (RouteGetsInto(keys, to_route, /*exclude_self=*/local_first, &routes)) {
+    const BatchGetPlan plan = PartitionBatchGetTargets(
+        keys, dsts, sizes, routes, local_first ? LocalFallback::kSkip : LocalFallback::kAllow);
+    ExecuteBatchGetPlan(plan, keys, dsts, sizes, &results);
   }
+
+  ObserveBatchGetBandwidth(results, sizes, routes, call_start);
   return results;
 }
 
@@ -2401,6 +2584,72 @@ std::vector<PoolClient::ObjectRange> MakeWriteRanges(const std::vector<const voi
 
 }  // namespace
 
+// The route-first arm of BatchGetRanges: one BatchRouteGet over EVERY key,
+// issued before anything is served.
+//
+// Turning local_first off cannot mean "do not look locally" here -- the local
+// medium is the only thing that can serve a local key on this path.  What it
+// means is "ask the master the way the whole-object path used to", so the
+// difference between the arms is purely WHEN and over HOW MANY keys the routing
+// RPC is issued: all of them up front, versus just the misses (or none at all
+// when the batch is entirely local).
+//
+// Uses the same exclude set as the missed-key routing below, so both arms send
+// an identical request shape and a self-route cannot reach the remote planner
+// from either one.  False means the RPC failed.
+bool PoolClient::RouteAllRangesUpFront(const std::vector<std::string>& keys, double* route_sink,
+                                       std::vector<std::optional<RouteGetResult>>* preroutes) {
+  if (!HasMaster()) {
+    // Nothing to pre-route; phase 2 will find every miss unroutable, which on a
+    // single node is the correct answer rather than a degraded one.
+    preroutes->assign(keys.size(), std::nullopt);
+    return true;
+  }
+  std::unordered_set<std::string> excludes{config_.master_config.node_id};
+  PhaseTimer route_timer(route_sink);
+  auto status = master_client_->BatchRouteGet(keys, excludes, preroutes);
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[PoolClient] BatchGetRanges: BatchRouteGet failed: {}",
+                    status.error_message());
+    return false;
+  }
+  preroutes->resize(keys.size());
+  return true;
+}
+
+// Routes for the keys the local phase missed, parallel to `missed`.
+//
+// Under local_first this is the only routing RPC the call makes.  Under the
+// route-first arm phase 0 already routed every key, so this projects those
+// answers onto the misses instead of paying a second round trip -- that arm
+// must cost ONE routing RPC, not two, or a comparison against it measures the
+// harness rather than the flag.  False means the RPC failed.
+bool PoolClient::RouteMissedRanges(const std::vector<std::string>& route_keys,
+                                   const std::vector<size_t>& missed,
+                                   const std::vector<std::optional<RouteGetResult>>& preroutes,
+                                   double* route_sink,
+                                   std::vector<std::optional<RouteGetResult>>* routes) {
+  if (!HasMaster()) {
+    routes->assign(route_keys.size(), std::nullopt);
+    return true;
+  }
+  if (!config_.local_first) {
+    routes->reserve(missed.size());
+    for (size_t index : missed) routes->push_back(preroutes[index]);
+  } else {
+    std::unordered_set<std::string> excludes{config_.master_config.node_id};
+    PhaseTimer route_timer(route_sink);
+    auto status = master_client_->BatchRouteGet(route_keys, excludes, routes);
+    if (!status.ok()) {
+      MORI_UMBP_ERROR("[PoolClient] BatchGetRanges: BatchRouteGet failed: {}",
+                      status.error_message());
+      return false;
+    }
+  }
+  routes->resize(route_keys.size());
+  return true;
+}
+
 std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& keys,
                                              const std::vector<std::vector<void*>>& dsts,
                                              const std::vector<std::vector<size_t>>& sizes,
@@ -2415,7 +2664,7 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   double local_bytes = 0.0;
   double remote_bytes = 0.0;
   ScopedBatchBandwidth bandwidth(
-      *master_client_, MORI_UMBP_METRIC_CLIENT_BATCH_GET_RANGES_BANDWIDTH,
+      master_client_.get(), MORI_UMBP_METRIC_CLIENT_BATCH_GET_RANGES_BANDWIDTH,
       MORI_UMBP_METRIC_CLIENT_BATCH_GET_RANGES_BANDWIDTH_HELP, local_bytes, remote_bytes);
 
   // Sub-timers.  `dbg` is null when disabled, which makes every PhaseTimer inert.
@@ -2440,17 +2689,24 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   auto flush_local_get_bytes = [&] {
     if (local_get_bytes == 0.0) return;
     local_bytes += local_get_bytes;
-    master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL,
-                               MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL_HELP,
-                               {{"traffic", "local"}}, local_get_bytes);
-    master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL,
-                               MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP,
-                               {{"traffic", "local"}}, local_get_bytes);
+    CountMetric(MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL,
+                MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL_HELP, {{"traffic", "local"}},
+                local_get_bytes);
+    CountMetric(MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL,
+                MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP, {{"traffic", "local"}},
+                local_get_bytes);
     local_get_bytes = 0.0;
   };
   // Declared after ScopedBatchBandwidth and ScopedRangedReport, so it runs
   // BEFORE either of them reads local_bytes.
   ScopeExit flush_guard{flush_local_get_bytes};
+
+  // ---- Phase 0: the route-first arm (local_first = false) ----
+  std::vector<std::optional<RouteGetResult>> preroutes;
+  if (!config_.local_first &&
+      !RouteAllRangesUpFront(keys, dbg ? &dbg->route : nullptr, &preroutes)) {
+    return results;
+  }
 
   // ---- Phase 1: everything this node already holds, in one submit ----
   //
@@ -2473,45 +2729,18 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   }
   std::vector<ObjectRange> key_ranges;
 
-  // One BatchResolve per BACKEND for the whole batch, not one per key.
-  //
-  // Calling it per key made a "batch" API do the opposite: a temporary
-  // vector<string> (copying the key) and a temporary result vector per key, and
-  // one acquisition per key of the backend mutex that Allocate, Commit and
-  // Evict also take -- and in standalone-process mode every rank on the node
-  // shares this client, so that mutex is where they serialize.
-  //
-  // Backends are still tried in registry order and the first hit still wins;
-  // only keys nothing has claimed yet are carried to the next backend, so a
-  // second medium is asked about exactly what the first one missed.
-  std::vector<MediumBackend*> holders(n, nullptr);
-  std::vector<ResolvedEntry> resolutions(n);
+  // A key that asked for no ranges is never resolved -- there is nothing to
+  // serve it from, and it stays false either way.
+  std::vector<size_t> candidates;
+  candidates.reserve(n);
+  for (size_t i = 0; i < n; ++i) {
+    if (!sizes[i].empty()) candidates.push_back(i);
+  }
+  std::vector<MediumBackend*> holders;
+  std::vector<ResolvedEntry> resolutions;
   {
     PhaseTimer resolve_timer(dbg ? &dbg->resolve : nullptr);
-    std::vector<size_t> pending;
-    pending.reserve(n);
-    for (size_t i = 0; i < n; ++i) {
-      if (!sizes[i].empty()) pending.push_back(i);  // asked for nothing: never resolved
-    }
-    std::vector<std::string> batch;
-    std::vector<size_t> still_missing;
-    for (auto* backend : registry_.All()) {
-      if (pending.empty()) break;
-      batch.clear();
-      batch.reserve(pending.size());
-      for (size_t i : pending) batch.push_back(keys[i]);
-      auto found = backend->BatchResolve(batch, /*include_descs=*/false);
-      still_missing.clear();
-      for (size_t j = 0; j < pending.size(); ++j) {
-        if (j < found.size() && found[j].found) {
-          holders[pending[j]] = backend;
-          resolutions[pending[j]] = std::move(found[j]);
-        } else {
-          still_missing.push_back(pending[j]);
-        }
-      }
-      pending.swap(still_missing);
-    }
+    ResolveLocalBatch(keys, candidates, &holders, &resolutions);
   }
 
   for (size_t i = 0; i < n; ++i) {
@@ -2547,7 +2776,7 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
     }
     if (!built) {
       // The medium holds the key but cannot be read in-process.  Same call as
-      // ExecuteLocalGet's kRetry: look for it on another node rather than
+      // Same disposition the local get path takes on a size mismatch: look
       // reporting a miss the caller cannot distinguish from absence.
       local_items.resize(before);
       missed.push_back(i);
@@ -2605,18 +2834,9 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   route_keys.reserve(missed.size());
   for (size_t index : missed) route_keys.push_back(keys[index]);
   std::vector<std::optional<RouteGetResult>> routes;
-  std::unordered_set<std::string> excludes{config_.master_config.node_id};
-  grpc::Status route_status;
-  {
-    PhaseTimer route_timer(dbg ? &dbg->route : nullptr);
-    route_status = master_client_->BatchRouteGet(route_keys, excludes, &routes);
-  }
-  if (!route_status.ok()) {
-    MORI_UMBP_ERROR("[PoolClient] BatchGetRanges: BatchRouteGet failed: {}",
-                    route_status.error_message());
+  if (!RouteMissedRanges(route_keys, missed, preroutes, dbg ? &dbg->route : nullptr, &routes)) {
     return results;
   }
-  routes.resize(route_keys.size());
 
   // No tier filter here.  Upstream restricts remote ranged reads to DRAM/HBM
   // because its remote path is a hand-written DRAM RDMA read; ours goes through
@@ -2834,7 +3054,7 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
   double local_bytes = 0.0;
   double remote_bytes = 0.0;
   ScopedBatchBandwidth bandwidth(
-      *master_client_, MORI_UMBP_METRIC_CLIENT_BATCH_PUT_RANGES_BANDWIDTH,
+      master_client_.get(), MORI_UMBP_METRIC_CLIENT_BATCH_PUT_RANGES_BANDWIDTH,
       MORI_UMBP_METRIC_CLIENT_BATCH_PUT_RANGES_BANDWIDTH_HELP, local_bytes, remote_bytes);
 
   const bool ranged_debug = RangedDebugEnabled();
@@ -2879,7 +3099,11 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
   grpc::Status route_status;
   {
     PhaseTimer route_timer(dbg ? &dbg->route : nullptr);
-    route_status = master_client_->BatchRoutePut(route_keys, route_sizes, excludes, &routes);
+    if (!HasMaster()) {
+      RouteAllPutsLocally(route_keys.size(), &routes);
+    } else {
+      route_status = master_client_->BatchRoutePut(route_keys, route_sizes, excludes, &routes);
+    }
   }
   if (!route_status.ok()) {
     MORI_UMBP_ERROR("[PoolClient] BatchPutRanges: BatchRoutePut failed: {}",
@@ -3027,7 +3251,9 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
 
 PoolClient::BatchGetPlan PoolClient::PartitionBatchGetTargets(
     const std::vector<std::string>& keys, const std::vector<void*>& dsts,
-    const std::vector<size_t>& sizes, const std::vector<std::optional<RouteGetResult>>& routes) {
+    const std::vector<size_t>& sizes, const std::vector<std::optional<RouteGetResult>>& routes,
+    LocalFallback fallback) {
+  const bool allow_local = fallback == LocalFallback::kAllow && !registry_.Empty();
   BatchGetPlan plan;
   for (size_t i = 0; i < keys.size(); ++i) {
     // Zero-size gets are rejected before local fallback or remote read: an
@@ -3037,24 +3263,19 @@ PoolClient::BatchGetPlan PoolClient::PartitionBatchGetTargets(
       MORI_UMBP_WARN("[PoolClient] BatchGet: skipping zero-size get for key='{}'", keys[i]);
       continue;
     }
-    if (i >= routes.size() || !routes[i].has_value()) {
-      if (!registry_.Empty()) plan.local_indices.push_back(i);
+    // No route, or one pointing back at this node.  Under kAllow that is a
+    // local read the caller has not attempted yet -- deferred as an index so
+    // ExecuteBatchGetPlan can run it inside the remote in-flight window.  Under
+    // kSkip the local media were already asked, and the key is either served
+    // (routes[i] stayed nullopt) or genuinely absent; either way it is done.
+    if (i >= routes.size() || !routes[i].has_value() ||
+        routes[i]->node_id == config_.master_config.node_id) {
+      if (allow_local) plan.local_indices.push_back(i);
       continue;
     }
-    const auto& route = routes[i].value();
-    if (route.node_id == config_.master_config.node_id) {
-      // Self-target: deferred (collected as an index) so ExecuteBatchGetPlan
-      // can place it inside the remote-DRAM in-flight window in the overlap
-      // path.
-      plan.local_indices.push_back(i);
-      continue;
-    }
-    BatchGetItem item{.index = i,
-                      .key = &keys[i],
-                      .dst = const_cast<void*>(dsts[i]),
-                      .size = sizes[i],
-                      .route = route};
-    plan.remote_groups[route.node_id].push_back(std::move(item));
+    const auto& route = *routes[i];
+    plan.remote_groups[route.node_id].push_back(BatchGetItem{
+        .index = i, .key = &keys[i], .dst = dsts[i], .size = sizes[i], .route = route});
   }
   return plan;
 }
@@ -3232,38 +3453,11 @@ void PoolClient::ExecuteBatchGetPlan(const BatchGetPlan& plan, const std::vector
                                      const std::vector<void*>& dsts,
                                      const std::vector<size_t>& sizes, std::vector<bool>* results,
                                      bool recache_remote) {
-  // Parallel local reads: different threads handle different keys. Resolve
-  // is mutex-serialized in the allocator; the per-key memcpy in
-  // ExecuteLocalGet->LocalGetPages runs lock-free in parallel. results is
-  // std::vector<bool> (bit-packed) so threads write a temp buffer; merge serially.
+  // The local half, run inside the remote submit..wait window so it overlaps
+  // the wire.  One batched resolve and one Transfer -- the same core the
+  // local-first arm uses; nothing left to route, so misses simply stay false.
   auto run_local = [&]() {
-    const auto& idx = plan.local_indices;
-    if (idx.empty()) return;
-    const int nthr = LocalCopyThreads("UMBP_DRAM_READ_THREADS");
-    const auto t0 = std::chrono::steady_clock::now();
-    std::vector<char> ok(idx.size(), 0);
-    ParallelFor(idx.size(), nthr, [&](size_t k) {
-      const size_t i = idx[k];
-      if (ExecuteLocalGet(keys[i], const_cast<void*>(dsts[i]), sizes[i]) ==
-          GetAttemptOutcome::kSuccess) {
-        ok[k] = 1;
-      }
-    });
-    size_t tot = 0;
-    for (size_t k = 0; k < idx.size(); ++k) {
-      if (ok[k]) {
-        (*results)[idx[k]] = true;
-        tot += sizes[idx[k]];
-      }
-    }
-    if (std::getenv("UMBP_LOCAL_COPY_TIMING")) {
-      double sec = std::chrono::duration_cast<std::chrono::duration<double>>(
-                       std::chrono::steady_clock::now() - t0)
-                       .count();
-      MORI_UMBP_INFO("[LocalCopy] GET keys={} bytes={} threads={} elapsed_ms={:.3f} GiB_s={:.2f}",
-                     idx.size(), tot, nthr, sec * 1000.0,
-                     tot / (sec > 0 ? sec : 1e-12) / (1024.0 * 1024 * 1024));
-    }
+    ServeLocalGets(keys, dsts, sizes, plan.local_indices, results, /*missed=*/nullptr);
   };
 
   ExecuteRemoteBatchGetPlan(plan, results, recache_remote, run_local);
@@ -3291,9 +3485,9 @@ void PoolClient::ExecuteRemoteBatchGetPlan(const BatchGetPlan& plan, std::vector
 
 void PoolClient::NoteRangedInstallFailure(size_t count) {
   if (count == 0) return;
-  master_client_->AddCounter(MORI_UMBP_METRIC_RANGED_REMOTE_INSTALL_FAILURES_TOTAL,
-                             MORI_UMBP_METRIC_RANGED_REMOTE_INSTALL_FAILURES_TOTAL_HELP, {},
-                             static_cast<double>(count));
+  CountMetric(MORI_UMBP_METRIC_RANGED_REMOTE_INSTALL_FAILURES_TOTAL,
+              MORI_UMBP_METRIC_RANGED_REMOTE_INSTALL_FAILURES_TOTAL_HELP, {},
+              static_cast<double>(count));
 }
 
 std::unique_ptr<PoolClient::RemoteGetInFlight> PoolClient::SubmitRemoteBatchGet(
@@ -3602,12 +3796,12 @@ void PoolClient::FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries,
     // overstate remote GET bandwidth by the whole read-amplification factor the
     // ranged path exists to remove.
     const double moved = static_cast<double>(entry.item->DstBytes());
-    master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL,
-                               MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL_HELP,
-                               {{"traffic", "remote"}}, moved);
-    master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL,
-                               MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP,
-                               {{"traffic", "remote"}}, moved);
+    CountMetric(MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL,
+                MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL_HELP, {{"traffic", "remote"}},
+                moved);
+    CountMetric(MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL,
+                MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP, {{"traffic", "remote"}},
+                moved);
     (*results)[entry.result_index] = true;
 
     // Re-cache the remotely-fetched block into local DRAM (best-effort): the
@@ -3636,9 +3830,45 @@ bool PoolClient::Exists(const std::string& key) {
 std::vector<bool> PoolClient::BatchExists(const std::vector<std::string>& keys) {
   if (!initialized_ || keys.empty()) return std::vector<bool>(keys.size(), false);
 
-  std::vector<bool> out;
-  auto status = master_client_->BatchLookup(keys, &out);
-  if (!status.ok() || out.size() != keys.size()) return std::vector<bool>(keys.size(), false);
+  // Local-first: this node's own backends answer conclusively for the keys they
+  // hold, so a batch that is entirely local needs no master round trip at all.
+  // The misses are NOT conclusive -- a peer may hold them -- so they still go to
+  // the master, and only they do.
+  std::vector<bool> out(keys.size(), false);
+  std::vector<std::string> unknown;
+  std::vector<size_t> unknown_indices;
+  if (config_.local_first) {
+    std::vector<size_t> all(keys.size());
+    std::iota(all.begin(), all.end(), 0);
+    std::vector<MediumBackend*> holders;
+    ResolveLocalBatch(keys, all, &holders, /*resolutions=*/nullptr);
+    for (size_t i = 0; i < keys.size(); ++i) out[i] = holders[i] != nullptr;
+    for (size_t i = 0; i < keys.size(); ++i) {
+      if (!out[i]) {
+        unknown.push_back(keys[i]);
+        unknown_indices.push_back(i);
+      }
+    }
+    if (unknown.empty()) return out;
+  } else {
+    unknown = keys;
+    unknown_indices.resize(keys.size());
+    std::iota(unknown_indices.begin(), unknown_indices.end(), 0);
+  }
+
+  // With no master this node is the whole cluster, so what it does not hold
+  // does not exist.  `out` already carries that answer.
+  if (!HasMaster()) return out;
+
+  std::vector<bool> remote;
+  auto status = master_client_->BatchLookup(unknown, &remote);
+  // A lookup failure must not downgrade a local hit to a miss: the local half of
+  // the answer did not depend on the RPC.  Only the keys we could not answer
+  // ourselves fall back to false.
+  if (!status.ok() || remote.size() != unknown.size()) return out;
+  for (size_t j = 0; j < unknown_indices.size(); ++j) {
+    if (remote[j]) out[unknown_indices[j]] = true;
+  }
   return out;
 }
 
@@ -3649,17 +3879,26 @@ std::vector<bool> PoolClient::BatchExists(const std::vector<std::string>& keys) 
 bool PoolClient::ReportExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) {
   if (!initialized_) return false;
   if (hashes.empty()) return true;
+  // External KV placement lives only in the master's index; with no master
+  // there is no such index and nothing to report to.
+  if (!HasMaster()) return true;
   return master_client_->ReportExternalKvBlocks(config_.master_config.node_id, hashes, tier).ok();
 }
 
 bool PoolClient::RevokeExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) {
   if (!initialized_) return false;
   if (hashes.empty()) return true;
+  // External KV placement lives only in the master's index; with no master
+  // there is no such index and nothing to report to.
+  if (!HasMaster()) return true;
   return master_client_->RevokeExternalKvBlocks(config_.master_config.node_id, hashes, tier).ok();
 }
 
 bool PoolClient::RevokeAllExternalKvBlocksAtTier(TierType tier) {
   if (!initialized_) return false;
+  // External KV placement lives only in the master's index; with no master
+  // there is no such index and nothing to report to.
+  if (!HasMaster()) return true;
   return master_client_->RevokeAllExternalKvBlocksAtTier(config_.master_config.node_id, tier).ok();
 }
 
@@ -3667,6 +3906,9 @@ bool PoolClient::MatchExternalKv(const std::vector<std::string>& hashes,
                                  std::vector<MasterClient::ExternalKvNodeMatch>* out_matches,
                                  bool count_as_hit) {
   if (!initialized_) return false;
+  // External KV placement lives only in the master's index; with no master
+  // there is no such index and nothing to report to.
+  if (!HasMaster()) return true;
   return master_client_->MatchExternalKv(hashes, out_matches, count_as_hit).ok();
 }
 
@@ -3674,6 +3916,9 @@ bool PoolClient::GetExternalKvHitCounts(
     const std::vector<std::string>& hashes,
     std::vector<MasterClient::ExternalKvHitCountEntry>* out_entries) {
   if (!initialized_) return false;
+  // External KV placement lives only in the master's index; with no master
+  // there is no such index and nothing to report to.
+  if (!HasMaster()) return true;
   return master_client_->GetExternalKvHitCounts(hashes, out_entries).ok();
 }
 
@@ -3777,7 +4022,7 @@ void PoolClient::PublishComponentMetrics() {
 
   MetricPublisher::Sink sink{
       [this](const char* name, const char* help, const MetricLabels& labels, double delta) {
-        master_client_->AddCounter(name, help, labels, delta);
+        CountMetric(name, help, labels, delta);
       },
       [this](const char* name, const char* help, const MetricLabels& labels, double value) {
         master_client_->SetGauge(name, help, labels, value);

@@ -360,6 +360,36 @@ struct UMBPDistributedConfig {
   // gated by cache_remote_admission / admission_max_block_bytes.
   bool ranged_locality_prefetch = true;
 
+  // Ask this node's own media before asking the master.
+  //
+  // A read is a two-part question: "who holds this key" (master) and "give me
+  // the bytes" (whoever holds it).  When this node holds the key itself, the
+  // first part is answered by its own backends, and the routing RPC only
+  // confirms what a local resolve already knew.  A single-node deployment —
+  // one peer, master on localhost — never gets a different answer, so every
+  // routing round trip on that path is pure latency.
+  //
+  // With this on, BatchGet and BatchExists resolve locally first and contact
+  // the master ONLY for the keys this node missed; a fully-local batch issues
+  // no RPC at all.  A local hit is conclusive (the backends own the bytes), so
+  // this cannot invent a hit; a local MISS is not conclusive — another node may
+  // hold the key — which is why the misses still go to the master.
+  //
+  // The cost is on multi-node deployments: local and remote reads stop
+  // overlapping (the local half is served before the routing RPC is issued
+  // rather than inside its in-flight window), and a batch whose keys are mostly
+  // remote pays a local resolve that mostly misses.  Set false to restore
+  // route-first ordering.
+  //
+  // One visible consequence: on a node that holds the key, Exists() now answers
+  // as soon as the put commits, rather than a heartbeat publication interval
+  // later once the master's index has it.  That is a more current answer about
+  // the key, but it means Exists() on the HOLDER is no longer a barrier for
+  // "the rest of the cluster can route to this".  Poll the node that will
+  // actually read it -- which has to go to the master -- when that is what is
+  // being waited for.
+  bool local_first = true;
+
   // Admission gate for re-caching. Only consulted when cache_remote_fetches is true.
   CacheRemoteAdmission cache_remote_admission = CacheRemoteAdmission::SIZE;
 
@@ -480,11 +510,12 @@ struct UMBPConfig {
     }
     if (distributed.has_value()) {
       const auto& d = distributed.value();
-      if (d.master_config.master_address.empty()) {
-        if (error_message)
-          *error_message = "distributed.master_config.master_address must not be empty";
-        return false;
-      }
+      // master_address MAY be empty.  That is the single-node deployment: the
+      // client keeps its whole data plane -- backends, transfer engine, peer
+      // service -- and simply never consults a master.  Every read already
+      // resolves locally first (see local_first), and on one node a local miss
+      // is the final answer, so there is nothing a master could add.  Setting
+      // the address later is what turns the same process into a cluster member.
       if (d.master_config.node_id.empty()) {
         if (error_message) *error_message = "distributed.master_config.node_id must not be empty";
         return false;
