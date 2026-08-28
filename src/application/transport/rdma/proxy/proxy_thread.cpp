@@ -108,6 +108,9 @@ void ProxyThread::DrainCq(ProxyQpHandle& qph) {
         continue;
       }
       uint32_t slot = static_cast<uint32_t>(wc[i].wr_id) & PROXY_RING_MASK;
+      if (ring_->cmds[slot].op == PROXY_ATOMIC_FETCH_ADD && qph.use_native_atomics) {
+        ring_->cmds[slot].result = *reinterpret_cast<volatile uint64_t*>(ring_->cmds[slot].src_addr);
+      }
       ring_->cmds[slot].status = PROXY_COMPLETED;
       ops_completed_++;
     }
