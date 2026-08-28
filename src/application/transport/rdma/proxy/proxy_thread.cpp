@@ -17,13 +17,16 @@ namespace core {
 
 ProxyThread::~ProxyThread() { Shutdown(); }
 
-void ProxyThread::Init(ProxyRing* ring, std::vector<ProxyQpHandle> qps, int gpuId) {
+void ProxyThread::Init(ProxyRing* ring, std::vector<ProxyQpHandle> qps, int gpuId,
+                       uintptr_t heapBase, uintptr_t heapEnd) {
   ring_ = ring;
   qps_ = std::move(qps);
   next_slot_ = 0;
   ops_posted_ = 0;
   ops_completed_ = 0;
   gpu_id_ = gpuId;
+  heap_base_ = heapBase;
+  heap_end_ = heapEnd;
 
   // Post initial recv WRs for SEND_WITH_IMM barrier atomic emulation.
   for (auto& qph : qps_) {
@@ -88,8 +91,11 @@ void ProxyThread::DrainCq(ProxyQpHandle& qph) {
         if (recv_idx < qph.recv_count && qph.recv_buf && wc[i].byte_len >= 16) {
           struct { uint64_t addr; uint64_t val; } payload;
           memcpy(&payload, reinterpret_cast<char*>(qph.recv_buf) + recv_idx * 64, 16);
-          if (payload.addr == 0) {
-            MORI_APP_ERROR("proxy: RECV atomic payload has null target addr, recv_idx={}", recv_idx);
+          if (payload.addr == 0 ||
+              (heap_end_ > heap_base_ &&
+               (payload.addr < heap_base_ || payload.addr + 8 > heap_end_))) {
+            MORI_APP_ERROR("proxy: RECV atomic target addr=0x{:x} outside heap [0x{:x}, 0x{:x}), recv_idx={}",
+                           payload.addr, heap_base_, heap_end_, recv_idx);
             continue;
           }
           volatile uint64_t* target = reinterpret_cast<volatile uint64_t*>(payload.addr);
