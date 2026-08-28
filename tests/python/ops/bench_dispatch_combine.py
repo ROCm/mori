@@ -37,7 +37,42 @@ import os
 
 os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "6G")
 
-_BW_NOISE_MARGIN = 1.0
+# Relative bandwidth improvement a candidate needs to take the lead during the
+# sweep. Default 0: any improvement wins.
+#
+# This was an absolute 1.0 GB/s, which cannot work across the operating range.
+# Where a whole sweep sits in the low single-digit GB/s -- small token counts --
+# nothing after the first candidate can ever clear +1.0, so the sweep silently
+# returns whatever it happened to measure first; where bandwidth is in the
+# hundreds it is under 1%, so it stops filtering noise at all. The inter-node
+# tuner had the same bug and the same fix (MORI_EP_TUNING_MARGIN, shared here
+# so one setting covers both).
+#
+# `os.environ.get(k, default)` only substitutes default when the var is
+# *unset* -- MORI_EP_TUNING_MARGIN="" would reach float("") and crash, so fall
+# back on an empty string too.
+_BW_REL_MARGIN = float(os.environ.get("MORI_EP_TUNING_MARGIN") or "0.0")
+
+
+def _bw_beats(new_bw, new_cfg, best_bw, best_cfg):
+    """Should *new_cfg* take the lead? Higher bandwidth is better here.
+
+    Note the direction: this path selects on bandwidth, while the inter-node
+    tuner selects on latency, so the comparisons are inverted relative to its
+    _beats().
+
+    Wins outright past the margin; within it, ties break on the
+    lexicographically smaller (block_num, warp_per_block) so re-tuning the same
+    hardware is deterministic instead of depending on which candidate the sweep
+    reached first.
+    """
+    if best_cfg is None:
+        return True
+    if new_bw > best_bw * (1.0 + _BW_REL_MARGIN):
+        return True
+    if new_bw >= best_bw * (1.0 - _BW_REL_MARGIN) and new_cfg < best_cfg:
+        return True
+    return False
 
 
 def _emit_intra_perf(
@@ -1268,13 +1303,14 @@ def _bench_dispatch_combine(
                         call_local_expert_count=call_local_expert_count,
                     )
 
-                    if disp_bw > best_disp_bw + _BW_NOISE_MARGIN:
+                    cand = (block_num, warp_per_block)
+                    if _bw_beats(disp_bw, cand, best_disp_bw, best_disp_config):
                         best_disp_bw = disp_bw
-                        best_disp_config = (block_num, warp_per_block)
+                        best_disp_config = cand
                         best_disp_lat = disp_lat
-                    if comb_bw > best_comb_bw + _BW_NOISE_MARGIN:
+                    if _bw_beats(comb_bw, cand, best_comb_bw, best_comb_config):
                         best_comb_bw = comb_bw
-                        best_comb_config = (block_num, warp_per_block)
+                        best_comb_config = cand
                         best_comb_lat = comb_lat
 
             # --- Extra dispatch sweep: over-subscribe, fix combine at best ---
@@ -1306,9 +1342,10 @@ def _bench_dispatch_combine(
                             call_local_expert_count=call_local_expert_count,
                         )
 
-                        if disp_bw > best_disp_bw + _BW_NOISE_MARGIN:
+                        cand = (block_num, warp_per_block)
+                        if _bw_beats(disp_bw, cand, best_disp_bw, best_disp_config):
                             best_disp_bw = disp_bw
-                            best_disp_config = (block_num, warp_per_block)
+                            best_disp_config = cand
                             best_disp_lat = disp_lat
 
             if rank == 0:
