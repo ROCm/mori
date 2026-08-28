@@ -468,7 +468,7 @@ void Test3_LargeMultiChunk(int myPe) {
   constexpr int largeThreadNum = 256;
   constexpr size_t testElements = largeBlockNum * largeThreadNum;
 
-  ConcurrentGetThreadKernel_PureAddr<<<largeBlockNum, largeThreadNum>>>(
+  ConcurrentGetBlockKernel_PureAddr<<<largeBlockNum, largeThreadNum>>>(
       myPe, reinterpret_cast<uint32_t*>(localBuff), reinterpret_cast<uint32_t*>(remoteBuff),
       testElements);
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
