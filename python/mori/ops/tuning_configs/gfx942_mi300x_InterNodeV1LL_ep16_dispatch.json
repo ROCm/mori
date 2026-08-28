@@ -21,6 +21,38 @@
     },
     {
       "dtype": "bf16",
+      "num_tokens": 8,
+      "hidden_dim": 6144,
+      "block_num": 96,
+      "rdma_block_num": 64,
+      "warp_per_block": 2
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 16,
+      "hidden_dim": 6144,
+      "block_num": 96,
+      "rdma_block_num": 64,
+      "warp_per_block": 2
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 32,
+      "hidden_dim": 6144,
+      "block_num": 128,
+      "rdma_block_num": 64,
+      "warp_per_block": 4
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 64,
+      "hidden_dim": 6144,
+      "block_num": 96,
+      "rdma_block_num": 64,
+      "warp_per_block": 8
+    },
+    {
+      "dtype": "bf16",
       "num_tokens": 4,
       "hidden_dim": 7168,
       "block_num": 8,
