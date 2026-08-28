@@ -64,6 +64,13 @@ inline __device__ int NullSendBufSlotOffset(const EpDispatchCombineConfig& confi
 // When there are more warps than items, multiple warps collaborate on a single item
 // by splitting dimSize; when there are fewer warps, each warp handles multiple items.
 struct MultiWarpIter {
+  // Floor on how thin a slice is worth handing to a warp. Without it the split is driven purely
+  // by how many warps happen to be in the grid: EpCombineAll runs 608 warps over 4 tokens and
+  // was giving each warp 40 elements of a 6144-wide vector. Measured directly on the LL combine
+  // relay, whose split is the same shape: 8 warps per token (768 elements) beat both 4 (1536)
+  // and 16 (384), so somewhere around this size is where a warp stops paying for itself.
+  static constexpr size_t kMinDimPerWarp = 512;
+
   int warpsPerItem;
   size_t dimPerWarp;
   size_t dimSize;
@@ -71,6 +78,9 @@ struct MultiWarpIter {
   inline __device__ MultiWarpIter(int globalWarpNum, int numItems, size_t dimSize_)
       : dimSize(dimSize_) {
     warpsPerItem = (globalWarpNum + numItems - 1) / numItems;
+    int maxSplit = static_cast<int>(dimSize / kMinDimPerWarp);
+    if (maxSplit < 1) maxSplit = 1;
+    if (warpsPerItem > maxSplit) warpsPerItem = maxSplit;
     dimPerWarp = (dimSize + warpsPerItem - 1) / warpsPerItem;
   }
 

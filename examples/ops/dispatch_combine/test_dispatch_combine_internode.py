@@ -46,6 +46,11 @@ _CLI_TO_KERNEL_TYPE_NAME = {
 
 _FP4_DTYPE = getattr(torch, "float4_e2m1fn_x2", None)
 
+# Zero-copy combine input: the caller owns combineInp and writes its expert outputs straight
+# into it, so CombineSync has nothing to stage. Emulates what a real MoE does when its GEMM
+# writes into mori's registered buffer.
+_ZERO_COPY_COMBINE = os.environ.get("MORI_ZERO_COPY_COMBINE", "0") == "1"
+
 # Relative improvement a candidate needs to replace the current best during
 # tuning. Default 0 (any improvement wins); raise via MORI_EP_TUNING_MARGIN
 # for a clearer-win requirement. Must be relative, not an absolute unit: a
@@ -476,6 +481,7 @@ class EpDispatchCombineTestCase:
             max_token_type_size=2,
             kernel_type=kernel_type_map[kernel_type],
             gpu_per_node=self.gpu_per_node,
+            use_external_inp_buf=not _ZERO_COPY_COMBINE,
             rdma_block_num=64,
             num_qp_per_pe=num_qp,
             quant_type=quant_type,
@@ -1131,6 +1137,16 @@ class EpDispatchCombineTestCase:
                 torch.cuda.synchronize()
                 total_recv_num_token = dispatch_recv_num_token[0].item()
             combine_input = self._convert_for_combine(dispatch_output)
+            if _ZERO_COPY_COMBINE:
+                # Seed mori's registered buffer once. The bench feeds the same tokens every
+                # iteration, so a real caller's per-iteration GEMM write is already accounted
+                # for outside the combine window -- what the timed loop must not contain is
+                # mori staging a copy the caller already made.
+                reg = op.get_registered_combine_input_buffer(
+                    combine_input.dtype, combine_input.shape[1]
+                )
+                reg[: combine_input.shape[0]].copy_(combine_input)
+                combine_input = reg[: combine_input.shape[0]]
             combine_output, combine_output_weight = self.run_combine(
                 op,
                 combine_input,
@@ -1500,24 +1516,30 @@ class EpDispatchCombineTestCase:
 
         tuning_scope = os.environ.get("MORI_TUNING_SCOPE", "full")
 
-        block_set = set()
-        # Small-block candidates below the doubling sequence's usual 32 floor.
-        # Measured on MI300X EP16 v1_ll (tok=4/8/16/32): 8 loses everywhere;
-        # 16 ties the eventual winner at 4 tokens (48.83 vs 48.46us, within
-        # noise) but is clearly worse from 8 tokens up (e.g. 56.29 vs
-        # 49.01us dispatch at 8 tokens). Left in the sweep rather than
-        # hardcoded per-arch, so a re-tune (including on a different
-        # sm_count like MI308's 80) empirically finds out whether either
-        # actually wins there instead of assuming this MI300X result holds.
-        for extra in (8, 16):
-            if extra < sm_count:
-                block_set.add(extra)
-        pow2 = 32
-        while pow2 <= sm_count:
-            block_set.add(pow2)
-            pow2 <<= 1
-        block_set.add(sm_count)
-        block_list = sorted(block_set)
+        # MORI_TUNING_BLOCKS overrides the ladder outright, so a sweep can be pointed at an
+        # arbitrary candidate list (including below 8) without editing this file.
+        blocks_env = os.environ.get("MORI_TUNING_BLOCKS", "")
+        if blocks_env:
+            block_list = sorted({int(v) for v in blocks_env.replace(",", " ").split()})
+        else:
+            block_set = set()
+            # Small-block candidates below the doubling sequence's usual 32 floor.
+            # Measured on MI300X EP16 v1_ll (tok=4/8/16/32): 8 loses everywhere;
+            # 16 ties the eventual winner at 4 tokens (48.83 vs 48.46us, within
+            # noise) but is clearly worse from 8 tokens up (e.g. 56.29 vs
+            # 49.01us dispatch at 8 tokens). Left in the sweep rather than
+            # hardcoded per-arch, so a re-tune (including on a different
+            # sm_count like MI308's 80) empirically finds out whether either
+            # actually wins there instead of assuming this MI300X result holds.
+            for extra in (8, 16):
+                if extra < sm_count:
+                    block_set.add(extra)
+            pow2 = 32
+            while pow2 <= sm_count:
+                block_set.add(pow2)
+                pow2 <<= 1
+            block_set.add(sm_count)
+            block_list = sorted(block_set)
 
         if tuning_scope == "quick":
             warp_list = [4, 8, 16]
@@ -1525,6 +1547,9 @@ class EpDispatchCombineTestCase:
         else:
             warp_list = [4, 6, 8, 12, 16]
             _rdma_mode = "full"
+        warps_env = os.environ.get("MORI_TUNING_WARPS", "")
+        if warps_env:
+            warp_list = sorted({int(v) for v in warps_env.replace(",", " ").split()})
 
         def rdma_candidates_for(bn):
             if _rdma_mode == "quick":
