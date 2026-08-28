@@ -140,17 +140,6 @@ def dtype_to_config_str(dtype: torch.dtype) -> str:
 _SUPPORTED_VERSION = "1.0"
 _TUNING_CONFIGS_DIR = Path(__file__).parent / "tuning_configs"
 
-# Relative improvement a re-tune must show before it overwrites an existing
-# rule. Default 0: any improvement wins, matching the tuner's own default so a
-# tuning run that finds something faster actually persists it. Set
-# MORI_EP_TUNING_MARGIN to require a real margin instead, which keeps the
-# checked-in JSON from churning when a re-tune only lands higher on noise.
-#
-# `os.environ.get(k, default)` only substitutes default when the var is
-# *unset* -- MORI_EP_TUNING_MARGIN="" would reach float("") and crash, so
-# fall back on an empty string too.
-_SAVE_REL_MARGIN = float(os.environ.get("MORI_EP_TUNING_MARGIN") or "0.0")
-
 _gpu_model_cache: str | None = None
 _gpu_model_detected: bool = False
 
@@ -297,6 +286,120 @@ class LaunchParams:
     block_num: int
     rdma_block_num: int
     warp_per_block: int
+
+
+# ---------------------------------------------------------------------------
+# Save reporting
+#
+# BANDWIDTH_METRIC_KEY records how a rule's bandwidth_gbps was computed, so a
+# re-tune can tell whether the old value is comparable with the new one. Rules
+# written before this existed carry no key at all, which reads as "unknown" and
+# is correctly treated as not comparable with anything.
+#
+# A tuning run overwrites the matching rule unconditionally -- see
+# save_tuning_result. Two tuning runs are rarely comparable (different host,
+# ROCm version, machine load, time), so no numeric rule can reliably decide
+# "is this new result good enough to keep", and a wrong decision in the
+# *keep the old rule* direction is invisible: you get a stale config and no
+# indication your run was discarded. Overwriting instead makes the change
+# reviewable in the JSON's git diff, which is where it can actually be judged.
+#
+# These print rather than logger.info deliberately. This library's logger sits
+# at WARNING by default, so an info-level line here would never reach the
+# person running the tuning -- exactly the silent-discard failure the gate
+# used to have.
+# ---------------------------------------------------------------------------
+
+
+BANDWIDTH_METRIC_KEY = "bandwidth_metric"
+
+#: Value for BANDWIDTH_METRIC_KEY when bandwidth_gbps is the mean over all
+#: ranks and rounds -- the "Average" row of the table tuning prints.
+BANDWIDTH_METRIC_GRAND_MEAN = "grand_mean"
+
+
+def _rule_geometry(rule: dict) -> str:
+    """block/warp/rdma of a rule, in the order tuning prints them."""
+    return (
+        f"block={rule.get('block_num')} "
+        f"warp={rule.get('warp_per_block')} "
+        f"rdma={rule.get('rdma_block_num')}"
+    )
+
+
+def _format_delta(
+    old: float | None, new: float | None, unit: str, comparable: bool = True
+) -> str:
+    """`old -> new (+x.x%)`, or a bare value when there is nothing to compare.
+
+    ``comparable=False`` still shows both numbers but drops the percentage:
+    a percentage between two differently-defined quantities reads as a
+    performance change when it is only a change of definition.
+    """
+    if new is None:
+        return "n/a"
+    if not old:
+        return f"{new:.2f}{unit}"
+    if not comparable:
+        return (
+            f"{old:.2f} -> {new:.2f}{unit} "
+            f"(old value used a different metric, not comparable)"
+        )
+    pct = (new - old) / old * 100.0
+    return f"{old:.2f} -> {new:.2f}{unit} ({pct:+.1f}%)"
+
+
+def _rule_latency(rule: dict) -> float | None:
+    """A rule's latency, whichever of the two spellings it uses.
+
+    The inter-node tuner writes avg_latency_us, the intra-node one
+    latency_us. Reading only the first left every intra-node save reporting
+    "latency: n/a" -- dropping the field that matters most on the one line
+    that exists to make the change reviewable.
+    """
+    for key in ("avg_latency_us", "latency_us"):
+        value = rule.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _report_rule_change(phase: str, merge_key, old_rule: dict, new_rule: dict) -> None:
+    old_geo, new_geo = _rule_geometry(old_rule), _rule_geometry(new_rule)
+    geo = (
+        f"{old_geo}  ->  {new_geo}" if old_geo != new_geo else f"{new_geo} (unchanged)"
+    )
+    # Inter-node bandwidth_gbps changed meaning (slowest-rank mean -> grand
+    # mean); a rule written before that carries no marker. Percentages across
+    # the two are meaningless and read as a big win -- grand mean >=
+    # slowest-rank mean by construction -- which is exactly backwards for a
+    # report meant to help judge whether to keep the new result.
+    #
+    # Both sides missing the marker means neither side changed definition, so
+    # they *are* comparable: that is the intra-node path, whose bandwidth_gbps
+    # was never redefined. Only a mismatch indicates a redefinition.
+    old_metric = old_rule.get(BANDWIDTH_METRIC_KEY)
+    new_metric = new_rule.get(BANDWIDTH_METRIC_KEY)
+    bw_comparable = old_metric == new_metric
+    print(
+        f"[mori-tuning] REPLACED {phase} rule {merge_key}\n"
+        f"               config:  {geo}\n"
+        f"               latency: "
+        f"{_format_delta(_rule_latency(old_rule), _rule_latency(new_rule), 'us')}\n"
+        f"               bw:      "
+        f"{_format_delta(old_rule.get('bandwidth_gbps'), new_rule.get('bandwidth_gbps'), ' GB/s', bw_comparable)}",
+        flush=True,
+    )
+
+
+def _report_rule_added(phase: str, merge_key, rule: dict) -> None:
+    print(
+        f"[mori-tuning] ADDED {phase} rule {merge_key}\n"
+        f"               config:  {_rule_geometry(rule)}\n"
+        f"               latency: {_format_delta(None, _rule_latency(rule), 'us')}\n"
+        f"               bw:      {_format_delta(None, rule.get('bandwidth_gbps'), ' GB/s')}",
+        flush=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -561,6 +664,12 @@ class TuningConfigManager:
 
         ``topk`` participates in the merge key, so tuning the same shape at a
         different top-k adds a rule instead of overwriting the existing one.
+
+        A matching rule is replaced unconditionally, and what changed is
+        printed (see the "Save reporting" section above for why there is no
+        keep-best comparison guarding this). ``bandwidth_gbps`` is recorded for
+        readers, not consulted here -- nothing in the runtime lookup path reads
+        it either, only block_num/rdma_block_num/warp_per_block are.
         """
         path = Path(path)
 
@@ -625,31 +734,11 @@ class TuningConfigManager:
                 break
 
         if matched_idx is not None:
-            old_bw = rules[matched_idx].get("bandwidth_gbps", 0)
-            new_bw = entry.get("bandwidth_gbps", 0)
-            # Require a margin, not just any improvement: without it a re-tune
-            # that lands 0.01 GB/s higher purely on measurement noise rewrites
-            # the checked-in rule, so the file churns on every run.
-            if new_bw > old_bw * (1.0 + _SAVE_REL_MARGIN):
-                rules[matched_idx] = entry
-                logger.info(
-                    "Updated %s rule for %s (%.2f -> %.2f GB/s)",
-                    phase,
-                    merge_key,
-                    old_bw,
-                    new_bw,
-                )
-            else:
-                logger.info(
-                    "Kept existing %s rule for %s (existing %.2f >= new %.2f GB/s)",
-                    phase,
-                    merge_key,
-                    old_bw,
-                    new_bw,
-                )
+            _report_rule_change(phase, merge_key, rules[matched_idx], entry)
+            rules[matched_idx] = entry
         else:
+            _report_rule_added(phase, merge_key, entry)
             rules.append(entry)
-            logger.info("Added %s rule: %s", phase, merge_key)
 
         rules.sort(key=sort_key)
         data["rules"] = rules

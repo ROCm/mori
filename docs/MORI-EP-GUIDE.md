@@ -603,10 +603,12 @@ Each file contains rules sorted by (dtype, hidden_dim, num_tokens):
 }
 ```
 
-- `bandwidth_gbps` — The primary metric used for keep-best comparison (RDMA BW for v1, LL BW for v1_ll/async_ll).
+- `bandwidth_gbps` — The bandwidth that matters for this kernel (RDMA BW for v1, LL BW for v1_ll/async_ll), recorded for readers. Nothing reads it at runtime: only `block_num` / `rdma_block_num` / `warp_per_block` are.
 - `rdma_bandwidth_gbps` / `xgmi_bandwidth_gbps` / `ll_bandwidth_gbps` — All three BW types recorded for analysis (inter-node only).
 
-New tuning results merge into existing files using a keep-best strategy: a rule is only updated if the new bandwidth exceeds the existing one.
+New tuning results replace the matching rule unconditionally, printing the old and new config and their latency/bandwidth delta. Two tuning runs come from different hosts, ROCm versions and machine load, so no numeric rule can reliably decide whether a new result is worth keeping — the JSON's git diff is where that call gets made. Re-run tuning if a printed delta looks wrong.
+
+> Inter-node `bandwidth_gbps` is the grand mean across ranks and rounds, matching the "Average" row of the table `--cmd bench` prints, so a saved rule can be checked against a bench run directly. Rules carry `bandwidth_metric` recording this; rules written before it existed hold the slowest-rank mean and have no such field, and a re-tune that replaces one prints both bandwidths without a percentage rather than comparing across the two definitions.
 
 ### Intra-node Tuning
 
