@@ -142,12 +142,30 @@ echo "============================================================"
 echo ""
 
 # ---- Verify SSH connectivity ----
+#
+# DOCKER_EXEC is probed rather than fixed: `docker exec` needs access to the
+# docker daemon socket, which comes from membership in the `docker` group, not
+# from being root. Where the operator is in that group, plain `docker exec`
+# works and `sudo` fails outright on hosts that grant no sudo rights at all.
+# Try unprivileged first, fall back to sudo, and report both failures together
+# rather than blaming SSH for a permissions problem.
+DOCKER_EXEC=""
 echo "Verifying SSH to $PEER_HOST ..."
 if [[ -n "$DOCKER" ]]; then
-    if ! ssh "${SSH_OPTS[@]}" "$PEER_HOST" "sudo docker exec $DOCKER bash -c 'echo ok'" &>/dev/null; then
-        echo "Error: Cannot SSH to $PEER_HOST or docker exec into $DOCKER failed"
+    for candidate in "docker exec" "sudo -n docker exec"; do
+        if ssh "${SSH_OPTS[@]}" "$PEER_HOST" "$candidate $DOCKER bash -c 'echo ok'" &>/dev/null; then
+            DOCKER_EXEC="$candidate"
+            break
+        fi
+    done
+    if [[ -z "$DOCKER_EXEC" ]]; then
+        echo "Error: cannot reach container '$DOCKER' on $PEER_HOST."
+        echo "       Tried 'docker exec' and 'sudo -n docker exec'. Check that"
+        echo "       passwordless SSH works, the container is running, and the"
+        echo "       remote user is in the docker group (or has sudo rights)."
         exit 1
     fi
+    echo "  docker exec prefix:  $DOCKER_EXEC"
 else
     if ! ssh "${SSH_OPTS[@]}" "$PEER_HOST" "echo ok" &>/dev/null; then
         echo "Error: Cannot SSH to $PEER_HOST (passwordless SSH required)"
@@ -202,7 +220,7 @@ launch_peer() {
     local CMD="$1"
     if [[ -n "$DOCKER" ]]; then
         ssh "${SSH_OPTS[@]}" "$PEER_HOST" \
-            "sudo docker exec -w $REMOTE_REPO_ROOT $DOCKER bash -c \"$CMD\"" &
+            "$DOCKER_EXEC -w $REMOTE_REPO_ROOT $DOCKER bash -c \"$CMD\"" &
     else
         ssh "${SSH_OPTS[@]}" "$PEER_HOST" "bash -lc '$CMD'" &
     fi
@@ -216,7 +234,7 @@ cleanup_peer() {
     local KILL_CMD='pkill -9 -f torchrun; pkill -9 -f test_dispatch_combine_internode; pkill -9 -f "multiprocessing.spawn"'
     if [[ -n "$DOCKER" ]]; then
         ssh "${SSH_OPTS[@]}" "$PEER_HOST" \
-            "sudo docker exec $DOCKER bash -c '$KILL_CMD'" 2>/dev/null || true
+            "$DOCKER_EXEC $DOCKER bash -c '$KILL_CMD'" 2>/dev/null || true
     else
         ssh "${SSH_OPTS[@]}" "$PEER_HOST" "$KILL_CMD" 2>/dev/null || true
     fi
@@ -228,7 +246,7 @@ KILL_ALL='pkill -9 -f torchrun; pkill -9 -f test_dispatch_combine_internode; pki
 eval "$KILL_ALL" 2>/dev/null || true
 if [[ -n "$DOCKER" ]]; then
     ssh "${SSH_OPTS[@]}" "$PEER_HOST" \
-        "sudo docker exec $DOCKER bash -c '$KILL_ALL'" 2>/dev/null || true
+        "$DOCKER_EXEC $DOCKER bash -c '$KILL_ALL'" 2>/dev/null || true
 else
     ssh "${SSH_OPTS[@]}" "$PEER_HOST" "$KILL_ALL" 2>/dev/null || true
 fi
