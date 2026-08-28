@@ -258,6 +258,12 @@ struct PoolClientConfig {
   // into cache_remote_fetches.
   bool ranged_locality_prefetch = true;
 
+  // Resolve on this node's own media before asking the master to route, and
+  // skip the master entirely when the whole batch is local.  See
+  // UMBPDistributedConfig::local_first for the reasoning and the multi-node
+  // trade-off.
+  bool local_first = true;
+
   // Page size used by Master's PageBitmapAllocator for this node's DRAM/HBM
   // tier.  Reported via RegisterClient.  Same value applies to both DRAM
   // and HBM.  Forwarded unmodified to MasterClient::RegisterSelf by
@@ -301,6 +307,7 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.cache_remote_admission = dc.cache_remote_admission;
   pc.admission_max_block_bytes = dc.admission_max_block_bytes;
   pc.ranged_locality_prefetch = dc.ranged_locality_prefetch;
+  pc.local_first = dc.local_first;
   // 0 propagates through PoolClient -> MasterClient::RegisterSelf ->
   // proto -> ClientRegistry, where it is interpreted as "use the
   // registry-wide default_dram_page_size".

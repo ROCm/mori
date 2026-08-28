@@ -193,6 +193,33 @@ target_link_libraries(
           gtest_main)
 add_test(NAME umbp_medium_selection COMMAND test_umbp_medium_selection)
 
+# test_umbp_local_first — PoolClientConfig::local_first: a fully-local batch
+# never contacts the master.  Asserted by STOPPING the master and reading
+# anyway, with a local_first=false twin that must fail on the same data.
+add_executable(test_umbp_local_first test_local_first.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_local_first PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_local_first
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+add_test(NAME umbp_local_first COMMAND test_umbp_local_first)
+
+# test_umbp_no_master — the distributed client with master_address empty: same
+# data plane, no routing/registration/heartbeat, a local miss is final.  No
+# master is started in that file, so reaching for one hangs or crashes rather
+# than passing quietly.
+add_executable(test_umbp_no_master test_no_master.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_no_master PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_no_master
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+add_test(NAME umbp_no_master COMMAND test_umbp_no_master)
+
 # test_umbp_pool_client_ranges — ranged multi-buffer I/O through PoolClient:
 # local range reads/writes against the node's own medium, the remote path via
 # the scratch arena, range validation, and GPU caller buffers.
