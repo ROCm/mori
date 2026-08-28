@@ -87,7 +87,10 @@ void ProxyThread::DrainCq(ProxyQpHandle& qph) {
         if (recv_idx < qph.recv_count && qph.recv_buf && wc[i].byte_len >= 16) {
           struct { uint64_t addr; uint64_t val; } payload;
           memcpy(&payload, reinterpret_cast<char*>(qph.recv_buf) + recv_idx * 64, 16);
-          if (payload.addr == 0) continue;
+          if (payload.addr == 0) {
+            MORI_CORE_ERROR("proxy: RECV atomic payload has null target addr, recv_idx={}", recv_idx);
+            continue;
+          }
           volatile uint64_t* target = reinterpret_cast<volatile uint64_t*>(payload.addr);
           __atomic_fetch_add(target, payload.val, __ATOMIC_SEQ_CST);
           asm volatile("clflush (%0)" :: "r"(target) : "memory");
