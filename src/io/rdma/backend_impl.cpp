@@ -591,6 +591,7 @@ EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
   EndpointId id = nextEndpointId_.fetch_add(1);
   auto rt = std::make_shared<EndpointRuntime>(id, ep);
   endpointsById_[id] = rt;
+  endpointsEpoch_.fetch_add(1, std::memory_order_release);
   return id;
 }
 
@@ -617,14 +618,13 @@ bool RdmaManager::HasIonicDevice() const {
   return false;
 }
 
-std::vector<std::shared_ptr<EndpointRuntime>> RdmaManager::SnapshotEndpointRuntimes() {
+void RdmaManager::SnapshotEndpointRuntimes(SnapshotVector& result) {
   std::shared_lock<std::shared_mutex> lock(mu);
-  std::vector<std::shared_ptr<EndpointRuntime>> result;
-  result.reserve(endpointsById_.size());
-  for (auto& [_, rt] : endpointsById_) {
-    result.push_back(rt);
+  result.resize(endpointsById_.size());
+  size_t i = 0;
+  for (const auto& [_, rt] : endpointsById_) {
+    result[i++] = rt;
   }
-  return result;
 }
 
 application::RdmaDeviceContext* RdmaManager::GetOrCreateDeviceContext(int devId) {
@@ -676,7 +676,10 @@ void NotifManager::RegisterEndpoint(const std::shared_ptr<EndpointRuntime>& rt) 
   application::RdmaMemoryRegion mr =
       devCtx->RegisterRdmaMemoryRegionAuto(buf, config.notifPerQp * sizeof(NotifMessage));
 
-  notifCtxById_.insert({rt->id, {mr, buf}});
+  auto notifIt = notifCtxById_.insert({rt->id, {mr, buf}}).first;
+  // Publish the (rehash-stable, node-based map) context pointer so the poll loop
+  // can read it locklessly. release pairs with the acquire load in ProcessOneCqe.
+  rt->notifCtx.store(&notifIt->second, std::memory_order_release);
 
   struct ibv_qp* qp = rt->ep.local.ibvHandle.qp;
   assert(qp);
@@ -703,13 +706,13 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
   ibv_cq* cq = ep.local.ibvHandle.cq;
   FlushDrainStats flushDrain;
 
-  // Resolve notif context once before the CQ drain loop.
-  QpNotifContext* notifCtxPtr = nullptr;
-  if (config.enableNotification) {
-    std::lock_guard<std::mutex> lock(mu);
-    auto nit = notifCtxById_.find(rt->id);
-    if (nit != notifCtxById_.end()) notifCtxPtr = &nit->second;
-  }
+  // Resolve notif context locklessly: it is published once at registration and
+  // the containing map is node-based, so the cached pointer stays valid. acquire
+  // pairs with the release store in RegisterEndpoint.
+  QpNotifContext* notifCtxPtr =
+      config.enableNotification
+          ? static_cast<QpNotifContext*>(rt->notifCtx.load(std::memory_order_acquire))
+          : nullptr;
 
   const int batchSize = 32;
   struct ibv_wc wc[batchSize];
@@ -956,8 +959,18 @@ void NotifManager::MainLoop() {
       }
     }
   } else {
+    // The endpoint set is effectively append-only and changes rarely, but this
+    // is a tight busy-poll loop. Rebuilding the snapshot every iteration would
+    // take a shared_lock and heap-allocate on every spin (a large fraction of
+    // this thread's CPU). Instead cache it and only rebuild when the epoch moves.
+    RdmaManager::SnapshotVector snapshot;
+    uint64_t snapshotEpoch = rdma->EndpointsEpoch() - 1;
     while (running.load()) {
-      auto snapshot = rdma->SnapshotEndpointRuntimes();
+      uint64_t curEpoch = rdma->EndpointsEpoch();
+      if (curEpoch != snapshotEpoch) {
+        rdma->SnapshotEndpointRuntimes(snapshot);
+        snapshotEpoch = curEpoch;
+      }
       if (snapshot.empty()) {
         EmitFlushSummaryIfNeeded(FlushRoundStats{});
         std::this_thread::yield();

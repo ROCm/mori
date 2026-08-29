@@ -3,6 +3,12 @@
 ## Table of Contents
 
 - [Benchmark Commands](#benchmark-commands)
+  - [Fabric (cross-node scale-up UALink super-node)](#fabric-cross-node-scale-up-ualink-super-node)
+- [C++ Benchmark (nixlbench-matching)](#c-benchmark-nixlbench-matching)
+  - [Build](#build)
+  - [Run (two nodes)](#run-two-nodes)
+  - [Sweep modes](#sweep-modes)
+  - [Differences from the Python flags](#differences-from-the-python-flags)
 - [Benchmark Arguments](#benchmark-arguments)
 - [Results: Thor2 RDMA Read](#results-thor2-rdma-read)
 - [Results: Thor2 RDMA Write](#results-thor2-rdma-write)
@@ -11,6 +17,12 @@
 - [Results: CX7 RDMA (Batch Size = 1)](#results-cx7-rdma-batch-size--1)
   - [Write](#write)
   - [Read](#read)
+- [Benchmark Tuning Guide](#benchmark-tuning-guide)
+  - [Recommended starting config](#recommended-starting-config)
+  - [Parameters that help](#parameters-that-help)
+  - [The merged-WR size limit](#the-merged-wr-size-limit)
+  - [Parameters that usually do not help (or can hurt)](#parameters-that-usually-do-not-help-or-can-hurt)
+  - [Host (CPU) vs GPU memory](#host-cpu-vs-gpu-memory)
 
 ## Benchmark Commands
 
@@ -47,6 +59,164 @@ torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
 > Requires ROCm ≥ 7.15 (HIP fabric VMM APIs). Only GPU memory is supported
 > (`--mem-type gpu`). If the two nodes are not in the same vPOD, session creation
 > fails fast with a clear error.
+
+## C++ Benchmark (nixlbench-matching)
+
+The commands above use the **Python** benchmark (`tests/python/io/benchmark.py`).
+There is also a native **C++** benchmark, `tests/cpp/io/bench_engine.cpp`, whose
+measurement loop is written to **match [nixlbench](https://github.com/ai-dynamo/nixl)**
+(NVIDIA NIXL's `xferbench`) exactly, so MORI-IO and NIXL RDMA numbers are
+apples-to-apples on the same fabric. Use it when you want a head-to-head
+comparison against NIXL, or a benchmark with no Python-interpreter overhead in the
+measurement loop (which the Python bench pays per iteration, so it shows up most
+at small message sizes).
+
+What "nixl-matching" means here:
+
+- **One whole-loop timer** around the entire iteration loop (not a per-iteration
+  sum), identical to nixlbench's `total_timer`.
+- **Latency is reported per single transfer**: `total_us / (iters × batch)`,
+  matching nixl's `avg_latency = total_duration / (per_thread_iter × batch_size)`.
+- **Bandwidth** `= msg × batch × iters / 1e9 / (total_us / 1e6)` (GB = 10⁹), same
+  units as nixl.
+- **Completion is always an inline spin-poll** in the benchmark thread (mirroring
+  nixl's `getXferStatus` scan); there is no cv-blocking wait that would add wakeup
+  latency and make numbers non-comparable.
+- **Strict stop-and-wait** (one request outstanding at a time, == nixl
+  `--pipeline_depth 1`): post one request, spin until it completes, then post the
+  next.
+- **Warmup** iterations are excluded from timing (`--warmup-iters`, nixl
+  `--warmup_iter`).
+
+### Build
+
+`bench_engine` builds with the C++ tests (both options default `ON`):
+
+```bash
+cd /path/to/mori
+cmake -B build -DBUILD_IO=ON -DBUILD_TESTS=ON
+cmake --build build --target bench_engine -j
+# binary: build/tests/cpp/bench_engine
+```
+
+`bench_engine --help` prints the full flag list, grouped by rendezvous,
+workload, sweep, memory, and backend tuning.
+
+The MORI shared libraries must be discoverable at runtime — from the build tree
+above, or from `python/mori` after an editable install:
+
+```bash
+export LD_LIBRARY_PATH=$PWD/build/src/io:$PWD/build/src/application:$LD_LIBRARY_PATH
+# or, after an editable install:
+export LD_LIBRARY_PATH=/path/to/mori/python/mori:$LD_LIBRARY_PATH
+```
+
+### Run (two nodes)
+
+Unlike the Python benchmark (which uses `torchrun` for the out-of-band
+rendezvous), the C++ benchmark brings the two processes together over MORI's own
+socket bootstrap — the same layer that starts multi-node CCO and SHMEM jobs, so
+connect and accept are retried over the `MORI_BOOTSTRAP_TIMEOUT` budget (seconds,
+default `300`). **Rank 0 is the initiator** and drives every transfer; **rank 1
+is the target** and only keeps its memory registered. Start the target first as a
+habit — rank 0 is the rendezvous root, so either order works and the two retry at
+each other, but the second process has to arrive within the budget.
+`--master-ip` is rank 0's IP and is passed identically on both ranks; `--self-ip`
+is the address each rank advertises to its peer.
+
+```bash
+# On the TARGET node (rank 1) — start this FIRST:
+MORI_DISABLE_AUTO_XGMI=1 build/tests/cpp/bench_engine \
+    --rank 1 --master-ip 10.190.162.0 --self-ip 10.190.162.1 --port 18515 \
+    --op write --all --sweep-start 1048576 --sweep-max 33554432 --sweep-step 1048576 \
+    --iters 500 --warmup-iters 50 --num-qp-per-transfer 4 --enable-sess
+
+# On the INITIATOR node (rank 0) — start this SECOND (prints the results table):
+MORI_DISABLE_AUTO_XGMI=1 build/tests/cpp/bench_engine \
+    --rank 0 --master-ip 10.190.162.0 --self-ip 10.190.162.0 --port 18515 \
+    --op write --all --sweep-start 1048576 --sweep-max 33554432 --sweep-step 1048576 \
+    --iters 500 --warmup-iters 50 --num-qp-per-transfer 4 --enable-sess
+```
+
+Both ranks must be given the **same** benchmark args (op, sweep, batch, etc.).
+Only rank 0 (initiator) prints the results table:
+
+```
+MsgSize(B)  Batch  Iters  AvgBW(GB/s)  AvgLat(us)  TotalDur(us)
+```
+
+`--port` is not the only TCP port in play, which matters behind a firewall:
+
+| Endpoint | Bound by | Address |
+|----------|----------|---------|
+| Bootstrap rendezvous | rank 0 only | `--master-ip` : `--port` (`18515` above) |
+| Engine control plane | both ranks | `--self-ip` : `--port + 1 + rank` (`18516` / `18517` above) |
+| Bootstrap ring / allgather | both ranks | chosen interface, kernel-assigned ephemeral port |
+
+The engine control plane is a plain TCP channel: the initiator dials the target's
+advertised `EngineDesc` address to run the QP handshake and to look up the remote
+memory region. No RDMA payload crosses it.
+
+### Sweep modes
+
+- `--all` — sweep message size. Geometric ×2 by default, or linear when
+  `--sweep-step > 0`, from `--sweep-start` to `--sweep-max`; batch stays at
+  `--transfer-batch-size`.
+- `--all-batch` — fix message size at `--buffer-size` and sweep batch
+  `1,2,4,…,32768`.
+- neither — a single `(--buffer-size, --transfer-batch-size)` point.
+
+### Differences from the Python flags
+
+Most flags share names with the Python benchmark (`--op-type`/`--op`,
+`--num-qp-per-transfer`, `--num-worker-threads`, `--transfer-batch-size`,
+`--enable-sess`, `--batch-contiguous`, `--disable-chunking`, `--chunk-bytes`,
+`--poll_cq_mode`, `--mem-type`, `--iters`, `--sweep-step`, `--all`,
+`--all-batch`), but note:
+
+| Python | C++ (nixl-style) | Notes |
+|--------|------------------|-------|
+| `torchrun ... --node_rank` | `--rank 0` / `--rank 1` | C++ rendezvous runs over MORI's socket bootstrap; rank 0 is the root, and the second process must arrive within `MORI_BOOTSTRAP_TIMEOUT`. |
+| `--host` | `--master-ip` + `--self-ip` | `--host` is accepted as a spelling of `--master-ip`. `--master-ip` = rank 0's IP, same on both ranks; `--self-ip` = the control-plane IP each rank advertises to the peer, which Python does not need because torchrun supplies it. |
+| `--src-gpu` / `--dst-gpu` | `--gpu` / `--target-dev-offset` | Python's names are accepted: `--src-gpu` is `--gpu`, and `--dst-gpu N` sets `--target-dev-offset` to `N - gpu` (passing both a conflicting `--dst-gpu` and `--target-dev-offset` is rejected). Under `--xgmi-single-process` they are the two local GPUs directly. |
+| `--num-initiator-dev` / `--num-target-dev` | same | One process per GPU on each side, forked before any HIP call; initiator local *i* pairs with target local *i*, driving GPU `--gpu + i`. The two counts must be equal, as Python asserts. Each pair prints its own `[gpu N]`-prefixed row and rank 0 adds an `[AGGREGATE]` line summing bandwidth across pairs — Python prints per-rank tables with no aggregate. |
+| `--enable-batch-transfer` (default OFF) | `--enable-batch-transfer` / `--disable-batch-transfer` (C++ default **ON**) | Same meaning as Python: **ON** = one N-descriptor batch request (the nixl-equivalent; nixl always batches); **OFF** = `--transfer-batch-size` N *individual* single-transfer submissions per iteration (Python `run_single_once`). The C++ tool defaults **ON** so the out-of-the-box run and `--all-batch` sweep are nixl-comparable; pass `--disable-batch-transfer` for the Python single-submission path. |
+| `--iters` (default `128`) | `--iters` (default `500`), plus `--warmup-iters` | Only the warmup flag is new: it runs untimed iterations before the timed region, matching nixl's `--warmup_iter`. |
+| `--sweep-start-size` / `--sweep-max-size` | `--sweep-start` / `--sweep-max` (long names also accepted) | Names only; `--sweep-step` (`0` = geometric ×2, `>0` = linear) behaves the same in both. |
+| `--backend rdma\|xgmi\|fabric` | same | `--num-streams` / `--num-events` size the XGMI **and** FABRIC HIP pools, as in Python. `fabric` (UALink scale-up, GPU memory only) needs a host whose GPUs expose `/sys/bus/pci/devices/*/ualink`; on RoCE-only hardware the engine reports `No available backend found` at the first transfer. |
+| `--xgmi-multiprocess` (default OFF) | `--xgmi-single-process` (default OFF, i.e. multiprocess) | The defaults are **opposite**. The C++ tool's two-rank path is already Python's `--xgmi-multiprocess`: two processes with distinct engine keys, so the backend takes its `hipIpc*` route. `--xgmi-single-process` adds Python's *default* instead — one process owning both GPUs, no rendezvous and no IPC. `--xgmi-multiprocess` is accepted to document intent but is a no-op. |
+| *(always on)* | `--skip-validate` | Both tools verify transferred data as part of the run. Python compares the target's buffer byte-for-byte over gloo; the C++ tool seeds a rank- and offset-dependent pattern and exchanges one checksum per transferred slot after the sweep (so the check is O(batch) on the wire but still covers every byte), printing `validation: OK` or naming the first mismatching slot and exiting non-zero. `--skip-validate` opts out; passing it to only one rank is safe — that rank contributes nothing and the run reports `validation: skipped` rather than hanging. |
+
+> `--self-ip` must be an address the peer can reach over TCP, since it becomes the
+> `EngineDesc` host the peer dials for the QP handshake and remote-MR lookup.
+> `0.0.0.0` does not work: the peer ends up dialing its own loopback and fails with
+> `connect(...): Connection refused`. It does **not** choose the RDMA device that
+> carries the data — that stays rail/NUMA-aware (override with
+> `MORI_RDMA_DEVICES`) — so the control IP need not be the RoCE interface's. The
+> bootstrap picks its local interface independently of both, so set
+> `MORI_SOCKET_IFNAME` when that choice has no route to the peer.
+>
+> `MORI_DISABLE_AUTO_XGMI` gates only the RDMA→XGMI *fallback* for hosts with no
+> active RDMA device, and that fallback is off unless the variable is literally
+> `0`. The `=1` above is therefore belt-and-braces, worth keeping only where
+> something in the environment sets it to `0`.
+>
+> For `--backend xgmi`, run both ranks on the **same** host with different `--gpu`
+> (XGMI is intra-node) and the same `--master-ip`/`--self-ip`; their engine control
+> ports still differ because those are derived from the rank. The backend is
+> created explicitly, so no env var is needed. That two-rank form measures the
+> *cross-process* XGMI path (distinct engine keys ⇒ `hipIpc*`). To measure what the
+> Python benchmark measures by default, pass `--xgmi-single-process` with
+> `--src-gpu`/`--dst-gpu`: one process owns both GPUs, there is no rendezvous and no
+> IPC, so `--rank`/`--master-ip` are not needed and small-message numbers become
+> directly comparable to Python's.
+>
+> For multi-GPU runs (`--num-initiator-dev N --num-target-dev N`) the bootstrap
+> world is `2N` ranks, laid out initiators first. Engine control ports are derived
+> from the **global** rank, so `--port P` reserves `P` for the bootstrap and
+> `P+1 … P+2N` for the engines — leave that range free. Each side forks `N-1`
+> children before touching HIP, so a failure in one pair still reaps the others
+> rather than leaving them holding ports.
 
 ## Benchmark Arguments
 
@@ -277,6 +447,7 @@ torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
 |   67108864  |     1     |     67.11      |     44.81     |     44.78     |   1497.51    |   1498.58    |
 +-------------+-----------+----------------+---------------+---------------+--------------+--------------+
 ```
+
 ## Benchmark Tuning Guide
 
 This section is a practical starting point for maximizing **single-NIC internode
@@ -310,7 +481,9 @@ defaults. Tune from here.
 
 ### The merged-WR size limit
 
-A single RDMA WR cannot exceed the backend's `max_msg_sz` (commonly **2 GiB**).
+A single RDMA WR cannot exceed the NIC port's reported `max_msg_sz` (`ibv_port_attr`,
+**2 GiB** on the usual mlx5 and `bnxt_re` parts), taken as the minimum across the
+endpoints a transfer uses.
 With `--batch-contiguous --disable-chunking` and a **single** worker, an entire
 batch can merge into one WR of `message_size × transfer_batch_size`. If that
 exceeds `max_msg_sz` the run aborts with:

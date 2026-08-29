@@ -22,10 +22,10 @@
 # Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
 # MIT License
 """
-mori.ir.triton — Triton integration for mori shmem device API.
+mori.ir.triton — Triton integration for MORI device APIs.
 
-Provides ready-to-use ``@core.extern`` device functions and runtime helpers
-so that Triton kernels can call mori shmem operations with minimal boilerplate.
+The package-level functions expose shmem. The :mod:`mori.ir.triton.cco`
+submodule exposes CCO LSA, SDMA, and GDA functions.
 
 Quick start::
 
@@ -46,5 +46,13 @@ Quick start::
 from .ops import *  # noqa: F401,F403 — export all device functions at package level
 from .ops import __all__ as _ops_all
 from .runtime import get_extern_libs, install_hook
+from . import cco
 
-__all__ = _ops_all + ["get_extern_libs", "install_hook"]
+get_cco_extern_libs = cco.get_extern_libs
+
+__all__ = _ops_all + [
+    "get_extern_libs",
+    "install_hook",
+    "cco",
+    "get_cco_extern_libs",
+]

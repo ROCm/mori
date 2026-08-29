@@ -116,7 +116,7 @@ void CopyGpuStatesToDevice(ShmemStates* states) {
 void FinalizeRuntime(ShmemStates* states) {
   ModuleStates& ms = states->moduleStates;
   if (ms.module != nullptr) {
-    hipModuleUnload(ms.module);
+    (void)hipModuleUnload(ms.module);
     ms.module = nullptr;
     ms.gpuStatesPtr = nullptr;
     ms.barrierFunc = nullptr;
@@ -187,6 +187,11 @@ int ShmemNumQpPerPe() {
 bool ShmemSdmaEnabled() {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
   return states->rdmaStates->commContext->IsSdmaEnabled();
+}
+
+bool ShmemRailOnly() {
+  ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  return states->rdmaStates->commContext->IsRailOnly();
 }
 
 /* ---------------------------------------------------------------------------------------------- */

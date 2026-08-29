@@ -20,9 +20,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 #
-# The FlyDSL-based dispatch/combine (v2) op. Importing this package pulls in
-# FlyDSL (an optional mori dependency: `pip install amd_mori[flydsl]`), so it is
-# lazily loaded from mori.ops rather than eagerly imported there.
+# The dispatch/combine (v2) op. The base class and config live in
+# dispatch_combine_op and import no kernel backend, so this package imports
+# without FlyDSL: the flydsl backend (needs `pip install amd_mori[flydsl]`) and
+# the hip backend are each imported lazily, only when selected. mori.ops still
+# lazy-loads this submodule.
 from .dispatch_combine_op import (
     EpDispatchCombineConfig,
     EpDispatchCombineOp,

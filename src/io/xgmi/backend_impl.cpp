@@ -498,7 +498,7 @@ XgmiBackend::~XgmiBackend() {
 
   for (auto& mod : scatterGatherModules_) {
     if (mod != nullptr) {
-      hipModuleUnload(mod);
+      (void)hipModuleUnload(mod);
     }
   }
   scatterGatherModules_.clear();
@@ -535,7 +535,7 @@ hipFunction_t XgmiBackend::GetScatterGatherFunc(int deviceId) {
   if (err != hipSuccess) {
     MORI_IO_WARN("XGMI: Failed to get scatterGatherCopyKernel on device {}: {}", deviceId,
                  hipGetErrorString(err));
-    hipModuleUnload(scatterGatherModules_[deviceId]);
+    (void)hipModuleUnload(scatterGatherModules_[deviceId]);
     scatterGatherModules_[deviceId] = nullptr;
     return nullptr;
   }

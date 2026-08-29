@@ -25,6 +25,7 @@
 
 #include <cstddef>
 
+#include "mori/collective/allreduce/twoshot_sdma_common.hpp"
 #include "mori/collective/intra_node/kernels/vec_type.cuh"
 #include "mori/core/transport/rdma/device_primitives.hpp"
 #include "mori/core/transport/sdma/device_primitives.hpp"
@@ -35,26 +36,43 @@ namespace collective {
 
 constexpr int kRSMaxBlocks = 80;
 
+__device__ __forceinline__ void SdmaTransitCacheWriteback() {
+#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
+  asm volatile("buffer_wbl2\n\ts_waitcnt 0" ::: "memory");
+#elif defined(__gfx950__)
+  asm volatile("buffer_inv\n\ts_waitcnt 0" ::: "memory");
+#endif
+}
+
+__device__ __forceinline__ void SdmaDirectOutputCacheInvalidate() {
+#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || defined(__gfx950__)
+  asm volatile("buffer_inv\n\ts_waitcnt 0" ::: "memory");
+#endif
+}
+
+template <typename P>
+__device__ __forceinline__ void SdmaVisibleStore(P* destination, const P& value) {
+  using Uint4 = uint32_t __attribute__((ext_vector_type(4)));
+  static_assert(sizeof(P) == sizeof(Uint4));
+  const Uint4 bits = *reinterpret_cast<const Uint4*>(&value);
+  __builtin_nontemporal_store(bits, reinterpret_cast<Uint4*>(destination));
+}
+
+__device__ __forceinline__ void PublishControlFlag(const application::SymmMemObjPtr flagsMemObj,
+                                                   size_t flagIndex, uint64_t value, int remotePe) {
+  auto* remoteFlags = reinterpret_cast<uint64_t*>(flagsMemObj->peerPtrs[remotePe]);
+  __scoped_atomic_store_n(remoteFlags + flagIndex, value, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+}
+
+__device__ __forceinline__ uint64_t LoadControlFlag(const uint64_t* flag) {
+  return __scoped_atomic_load_n(flag, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+}
+
 // Legacy per-block barrier for ReduceScatterKernel / standalone Allreduce_sdma.
 struct alignas(128) RSBarrierSignal {
   uint32_t sync[kRSMaxBlocks][8];
   alignas(128) uint32_t flag[kRSMaxBlocks];
 };
-
-// Lightweight barrier for SdmaReduceScatterKernel.
-// Block 0 does the SDMA scatter + wait, then device-scope broadcasts to
-// all other blocks.  Device-side generation counter → graph-safe.
-struct alignas(128) CrossPeBarrier {
-  alignas(128) uint32_t flag;
-};
-
-inline int getDeviceMaxBlocks() {
-  int dev = 0;
-  (void)hipGetDevice(&dev);
-  hipDeviceProp_t prop;
-  (void)hipGetDeviceProperties(&prop, dev);
-  return (prop.multiProcessorCount > 0) ? prop.multiProcessorCount : 80;
-}
 
 // ============================================================================
 // ReduceScatterKernel (LEGACY) — IPC reads with per-block start_sync barrier
@@ -161,7 +179,8 @@ __device__ void SdmaReduceScatterKernel_body(int myPe, int npes, const T* __rest
                                              const application::SymmMemObjPtr dstMemObj,
                                              const application::SymmMemObjPtr flagsMemObj,
                                              CrossPeBarrier* __restrict__ barrier,
-                                             size_t elementCount) {
+                                             size_t elementCount, size_t slotStrideElements,
+                                             T* output = nullptr) {
   if (elementCount == 0 || npes <= 0) return;
 
   using P = typename packed_t<T>::P;
@@ -173,32 +192,52 @@ __device__ void SdmaReduceScatterKernel_body(int myPe, int npes, const T* __rest
   const size_t bytesPerElement = sizeof(T);
   const size_t chunkBytes = elementCountPerRank * bytesPerElement;
   const size_t packedPerRank = elementCountPerRank / pack_size;
+  const size_t slotStrideBytes = slotStrideElements * bytesPerElement;
+  const size_t slotStridePacked = slotStrideElements / pack_size;
   if (elementCountPerRank == 0) return;
 
   // --- generation counter for device-scope broadcast -------------------------
-  __shared__ uint32_t s_next;
+  __shared__ uint64_t s_next;
+  __shared__ uint64_t s_reuse;
+  __shared__ uint32_t s_needs_reuse;
   if (threadIdx.x == 0) {
-    s_next = barrier->flag + 1;
+    s_next = barrier->flag + 1ULL;
+    s_reuse = barrier->reuseGeneration + 1ULL;
+    s_needs_reuse = barrier->needsReuseHandshake && chunkBytes > barrier->reuseSafeChunkBytes;
   }
   __syncthreads();
 
   if (blockIdx.x == 0) {
-    // === Phase 1: SDMA scatter ===============================================
-    // Each warp handles one destination PE.
     uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
-    uint64_t flag_val = static_cast<uint64_t>(s_next);
+    uint64_t flag_val = s_next;
+    uint64_t reuse_val = s_reuse;
 
     const int warpId = static_cast<int>(threadIdx.x) / warpSize;
     const int laneId = static_cast<int>(threadIdx.x) % warpSize;
 
-    if (warpId < npes && laneId == 0) {
+    // Protect scratch reuse without a separate stream-barrier launch. Reaching
+    // this point proves that the prior operation's local copy-out has finished.
+    if (s_needs_reuse && warpId < npes && laneId == 0 && warpId != myPe) {
+      PublishControlFlag(flagsMemObj, npes + myPe, reuse_val, warpId);
+    }
+    if (s_needs_reuse) {
+      if (warpId < npes && laneId == 0 && warpId != myPe) {
+        while (LoadControlFlag(flags + npes + warpId) < reuse_val);
+      }
+      __syncthreads();
+      if (threadIdx.x == 0) barrier->reuseGeneration = s_reuse;
+    }
+
+    // === Phase 1: SDMA scatter ===============================================
+    // Each warp handles one destination PE.
+    if (warpId < npes && laneId == 0 && warpId != myPe) {
       int destPe = warpId;
 
       uint8_t* srcPtr = reinterpret_cast<uint8_t*>(const_cast<T*>(input)) +
                         static_cast<size_t>(destPe) * chunkBytes;
 
       uint8_t* remoteDst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe]) +
-                           static_cast<size_t>(myPe) * chunkBytes;
+                           static_cast<size_t>(myPe) * slotStrideBytes;
 
       anvil::SdmaQueueDeviceHandle** dh =
           dstMemObj->deviceHandles_d + destPe * dstMemObj->sdmaNumQueue;
@@ -208,30 +247,26 @@ __device__ void SdmaReduceScatterKernel_body(int myPe, int npes, const T* __rest
     }
 
     // Notify remote PEs that our data has landed
-    if (warpId < npes && laneId == 0) {
+    if (warpId < npes && laneId == 0 && warpId != myPe) {
       int destPe = warpId;
       shmem::ShmemQuietThread(destPe, dstMemObj);
-      shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
-          flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flag_val, 8,
-          core::atomicType::AMO_SET, destPe, 0);
+      PublishControlFlag(flagsMemObj, myPe, flag_val, destPe);
     }
     __syncthreads();
 
     // === Phase 2: Wait for all peers' scatter ================================
-    for (int sender = 0; sender < npes; ++sender) {
-      if (sender == myPe) continue;
-      if (threadIdx.x == 0) {
-        int spin = 0;
-        bool warned = false;
-        while (core::AtomicLoadRelaxed(flags + sender) < flag_val) {
-          if (++spin > 100000000 && !warned) {
-            printf("PE %d: SdmaScatter timeout waiting for peer %d\n", myPe, sender);
-            warned = true;
-          }
+    if (warpId < npes && laneId == 0 && warpId != myPe) {
+      const int sender = warpId;
+      int spin = 0;
+      bool warned = false;
+      while (LoadControlFlag(flags + sender) < flag_val) {
+        if (++spin > 100000000 && !warned) {
+          printf("PE %d: SdmaScatter timeout waiting for peer %d\n", myPe, sender);
+          warned = true;
         }
       }
-      __syncthreads();
     }
+    __syncthreads();
 
     // === Broadcast to all local blocks: scatter done =========================
     if (threadIdx.x == 0) {
@@ -246,59 +281,107 @@ __device__ void SdmaReduceScatterKernel_body(int myPe, int npes, const T* __rest
     __syncthreads();
   }
 
-  // === Phase 2.5: CU copy of slot[myPe] — L2 coherence fix =================
-  // SDMA scatter writes bypass L2 and land in HBM directly.  However, the
-  // previous reduce wrote slot[myPe] via CU stores, which left a dirty L2
-  // line holding the *old reduce result*.  When the CU reduce below reads
-  // slot[myPe], it hits L2 and sees stale data instead of the fresh scatter
-  // data in HBM.  Overwriting slot[myPe] with the current input via CU
-  // stores forces L2 to match.  Other slots are only *read* (never written
-  // by the reduce), so their L2 entries remain correct.
-  //
-  // Uses the same tid/stride as the reduce, so each thread fixes exactly the
-  // elements it will read — no inter-block barrier required.
+  // The local contribution is read directly from input. This avoids a
+  // redundant self-SDMA transfer and never gives a receive slot a CU-written
+  // role, which also removes the old local-slot L2 alias hazard.
   P* __restrict__ buf = reinterpret_cast<P*>(dstMemObj->localPtr);
-  P* __restrict__ myDst = buf + static_cast<size_t>(myPe) * packedPerRank;
+  P* __restrict__ reduced = buf + static_cast<size_t>(npes) * slotStridePacked;
+  P* __restrict__ directOutput =
+      output == nullptr || chunkBytes < (64U << 10)
+          ? nullptr
+          : reinterpret_cast<P*>(output) + static_cast<size_t>(myPe) * packedPerRank;
+  const P* __restrict__ inputSlot =
+      reinterpret_cast<const P*>(input) + static_cast<size_t>(myPe) * packedPerRank;
 
   const size_t tid =
       static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
   const size_t stride = static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x);
 
-  {
-    const P* __restrict__ inputSlot =
-        reinterpret_cast<const P*>(input) + static_cast<size_t>(myPe) * packedPerRank;
-    for (size_t k = tid; k < packedPerRank; k += stride) {
-      myDst[k] = inputSlot[k];
-    }
-  }
-
   // === Phase 3: Local reduce (all blocks) ==================================
   for (size_t k = tid; k < packedPerRank; k += stride) {
-    A acc = upcast_v<typename P::type, pack_size>(buf[k]);
+    A acc = upcast_v<typename P::type, pack_size>(myPe == 0 ? inputSlot[k] : buf[k]);
     for (int pe = 1; pe < npes; ++pe) {
-      packed_assign_add(acc, upcast_v<typename P::type, pack_size>(
-                                 buf[static_cast<size_t>(pe) * packedPerRank + k]));
+      const P value =
+          pe == myPe ? inputSlot[k] : buf[static_cast<size_t>(pe) * slotStridePacked + k];
+      packed_assign_add(acc, upcast_v<typename P::type, pack_size>(value));
     }
-    myDst[k] = downcast_v<typename P::type, pack_size>(acc);
+    const P value = downcast_v<typename P::type, pack_size>(acc);
+    SdmaVisibleStore(reduced + k, value);
+    if (directOutput != nullptr) SdmaVisibleStore(directOutput + k, value);
   }
 
-  // Flush dirty L2 lines to HBM so the SDMA-based AllGather reads fresh data.
-  // CU stores land in L2 (write-back); SDMA reads bypass L2 and hit HBM.
-  // buffer_wbl2 (CDNA3 / MI300, gfx94x) writes back ALL dirty L2 lines.
-#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
+  if (output == nullptr) return;
+
   __syncthreads();
   if (threadIdx.x == 0) {
-    asm volatile("buffer_wbl2" ::: "memory");
+    __scoped_atomic_store_n(&barrier->blockDone[blockIdx.x], s_next, __ATOMIC_RELEASE,
+                            __MEMORY_SCOPE_DEVICE);
   }
-#endif
+  if (blockIdx.x != 0) return;
+  __syncthreads();
+
+  if (threadIdx.x < gridDim.x) {
+    while (__scoped_atomic_load_n(&barrier->blockDone[threadIdx.x], __ATOMIC_ACQUIRE,
+                                  __MEMORY_SCOPE_DEVICE) < s_next);
+  }
+  __syncthreads();
+
+  uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
+  const int warpId = static_cast<int>(threadIdx.x) / warpSize;
+  const int laneId = static_cast<int>(threadIdx.x) % warpSize;
+  uint64_t ready_val = static_cast<uint64_t>(s_next) + 1ULL;
+
+  if (warpId < npes && laneId == 0 && warpId != myPe) {
+    int remotePe = warpId;
+    PublishControlFlag(flagsMemObj, myPe, ready_val, remotePe);
+  }
+  __syncthreads();
+  if (warpId < npes && laneId == 0 && warpId != myPe) {
+    while (LoadControlFlag(flags + warpId) < ready_val);
+  }
+  __syncthreads();
+
+  if (warpId < npes && laneId == 0 && (warpId != myPe || directOutput == nullptr)) {
+    int sourcePe = warpId;
+    uint8_t* source = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[sourcePe]) +
+                      static_cast<size_t>(npes) * slotStrideBytes;
+    uint8_t* destination =
+        reinterpret_cast<uint8_t*>(output) + static_cast<size_t>(sourcePe) * chunkBytes;
+    anvil::SdmaQueueDeviceHandle** handles =
+        dstMemObj->deviceHandles_d + sourcePe * dstMemObj->sdmaNumQueue;
+    HSAuint64* signals = dstMemObj->signalPtrs + sourcePe * dstMemObj->sdmaNumQueue;
+    HSAuint64* expectedSignals = dstMemObj->expectSignalsPtr + sourcePe * dstMemObj->sdmaNumQueue;
+    core::SdmaPutThread(source, destination, chunkBytes, handles, signals, expectedSignals,
+                        dstMemObj->sdmaNumQueue, 0);
+    shmem::ShmemQuietThread(sourcePe, dstMemObj);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) SdmaDirectOutputCacheInvalidate();
+
+  uint64_t done_val = ready_val + 1ULL;
+  if (warpId < npes && laneId == 0 && warpId != myPe) {
+    int remotePe = warpId;
+    PublishControlFlag(flagsMemObj, myPe, done_val, remotePe);
+  }
+  __syncthreads();
+  if (warpId < npes && laneId == 0 && warpId != myPe) {
+    while (LoadControlFlag(flags + warpId) < done_val);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    barrier->flag = done_val;
+    barrier->needsReuseHandshake = 0;
+  }
 }
 
 template <typename T>
 __global__ void SdmaReduceScatterKernel(int myPe, int npes, const T* __restrict__ input,
                                         const application::SymmMemObjPtr dstMemObj,
                                         const application::SymmMemObjPtr flagsMemObj,
-                                        CrossPeBarrier* __restrict__ barrier, size_t elementCount) {
-  SdmaReduceScatterKernel_body<T>(myPe, npes, input, dstMemObj, flagsMemObj, barrier, elementCount);
+                                        CrossPeBarrier* __restrict__ barrier, size_t elementCount,
+                                        size_t slotStrideElements) {
+  SdmaReduceScatterKernel_body<T>(myPe, npes, input, dstMemObj, flagsMemObj, barrier, elementCount,
+                                  slotStrideElements);
 }
 
 // ============================================================================
@@ -309,10 +392,12 @@ __global__ void SdmaReduceScatterKernel(int myPe, int npes, const T* __restrict_
 // ============================================================================
 template <typename T>
 __device__ void AllGatherSdmaKernel_body(int myPe, int npes,
+                                         const application::SymmMemObjPtr srcMemObj,
                                          const application::SymmMemObjPtr dstMemObj,
                                          const application::SymmMemObjPtr flagsMemObj,
-                                         CrossPeBarrier* __restrict__ barrier,
-                                         size_t elementCount) {
+                                         CrossPeBarrier* __restrict__ barrier, size_t elementCount,
+                                         size_t slotStrideElements, size_t outputBaseOffsetBytes,
+                                         size_t sourceOffsetElements = SIZE_MAX) {
   if (elementCount == 0 || npes <= 0) {
     return;
   }
@@ -332,26 +417,49 @@ __device__ void AllGatherSdmaKernel_body(int myPe, int npes,
   __shared__ uint64_t ag_token;
   if (threadIdx.x == 0) {
     ag_token = static_cast<uint64_t>(barrier->flag) + 1ULL;
-    barrier->flag = static_cast<uint32_t>(ag_token);
   }
   __syncthreads();
-  uint64_t flag_val = ag_token;
+  uint64_t ready_val = ag_token;
+  uint64_t done_val = ag_token + 1ULL;
 
   const size_t threadLinearId =
       static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
   int warpId = threadLinearId / warpSize;
   const int laneId = threadIdx.x % warpSize;
 
+  // A nonzero output base lies wholly in slot-0 padding and cannot overwrite
+  // receive data. Compact output at base zero still needs the cross-rank ready
+  // rendezvous before any peer writes into another rank's receive slots.
+  if (outputBaseOffsetBytes == 0) {
+    if (warpId < npes && laneId == 0 && warpId != myPe) {
+      PublishControlFlag(flagsMemObj, myPe, ready_val, warpId);
+    }
+    __syncthreads();
+    if (warpId < npes && laneId == 0 && warpId != myPe) {
+      while (LoadControlFlag(flags + warpId) < ready_val);
+    }
+    __syncthreads();
+  }
+
   // --- SDMA put: send my reduced shard to every rank -------------------------
-  uint8_t* agSrcPtr = reinterpret_cast<uint8_t*>(dstMemObj->localPtr) +
-                      static_cast<size_t>(myPe) * elementCountPerRank * bytesPerElement;
+  if (sourceOffsetElements == SIZE_MAX) {
+    sourceOffsetElements = static_cast<size_t>(myPe) * slotStrideElements;
+  }
+  uint8_t* agSrcPtr =
+      reinterpret_cast<uint8_t*>(srcMemObj->localPtr) + sourceOffsetElements * bytesPerElement;
   size_t agSendBytes = elementCountPerRank * bytesPerElement;
 
-  if (warpId < npes && laneId == 0) {
+  if (warpId < npes && laneId == 0 && (outputBaseOffsetBytes == 0 || warpId != myPe)) {
     int remotePe = warpId;
     application::SymmMemObjPtr dest = dstMemObj;
 
-    uint8_t* agDstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) +
+    const size_t remoteOutputBase =
+        outputBaseOffsetBytes == 0
+            ? 0
+            : static_cast<size_t>(static_cast<ptrdiff_t>(outputBaseOffsetBytes) +
+                                  static_cast<ptrdiff_t>(myPe - remotePe) *
+                                      static_cast<ptrdiff_t>(agSendBytes));
+    uint8_t* agDstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + remoteOutputBase +
                         static_cast<size_t>(myPe) * elementCountPerRank * bytesPerElement;
 
     anvil::SdmaQueueDeviceHandle** devicehandles =
@@ -363,42 +471,54 @@ __device__ void AllGatherSdmaKernel_body(int myPe, int npes,
   }
 
   // --- Notify remote PEs that our data is in place ---------------------------
-  if (warpId < npes && laneId == 0) {
+  if (warpId < npes && laneId == 0 && (outputBaseOffsetBytes == 0 || warpId != myPe)) {
     int remotePe = warpId;
     shmem::ShmemQuietThread(remotePe, dstMemObj);
-    shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
-        flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flag_val, 8,
-        core::atomicType::AMO_SET, remotePe, 0);
+    if (remotePe != myPe) {
+      PublishControlFlag(flagsMemObj, myPe, done_val, remotePe);
+    }
   }
   __syncthreads();
 
   // --- Wait for all peers to finish AllGather --------------------------------
-  for (int sender = 0; sender < npes; ++sender) {
-    if (sender == myPe) {
-      continue;
-    }
-    if (threadLinearId == 0) {
-      int spinCount = 0;
-      bool warned = false;
-      while (core::AtomicLoadRelaxed(flags + sender) < flag_val) {
-        ++spinCount;
-        if (spinCount > 10000000 && !warned) {
-          printf("PE %d: AllGather timeout waiting for peer %d\n", myPe, sender);
-          warned = true;
-        }
+  if (warpId < npes && laneId == 0 && warpId != myPe) {
+    const int sender = warpId;
+    int spinCount = 0;
+    bool warned = false;
+    while (LoadControlFlag(flags + sender) < done_val) {
+      ++spinCount;
+      if (spinCount > 10000000 && !warned) {
+        printf("PE %d: AllGather timeout waiting for peer %d\n", myPe, sender);
+        warned = true;
       }
     }
-    __syncthreads();
+  }
+  __syncthreads();
+
+  if (threadLinearId == 0) {
+    barrier->flag = done_val;
+    barrier->needsReuseHandshake = 1;
+    // The next scatter writes the prefix of every fixed receive slot. Use the
+    // most restrictive rank's padding so every rank makes the same handshake
+    // decision; a rank-local threshold would deadlock when only some ranks
+    // enter the collective reuse rendezvous.
+    const size_t slotStrideBytes = slotStrideElements * bytesPerElement;
+    barrier->reuseSafeChunkBytes =
+        outputBaseOffsetBytes == 0 ? 0
+                                   : slotStrideBytes - static_cast<size_t>(npes - 1) * agSendBytes;
   }
 
   // Flags are monotonic generation tokens (AMO_SET), so no reset is needed.
 }
 
 template <typename T>
-__global__ void AllGatherSdmaKernel(int myPe, int npes, const application::SymmMemObjPtr dstMemObj,
+__global__ void AllGatherSdmaKernel(int myPe, int npes, const application::SymmMemObjPtr srcMemObj,
+                                    const application::SymmMemObjPtr dstMemObj,
                                     const application::SymmMemObjPtr flagsMemObj,
-                                    CrossPeBarrier* __restrict__ barrier, size_t elementCount) {
-  AllGatherSdmaKernel_body<T>(myPe, npes, dstMemObj, flagsMemObj, barrier, elementCount);
+                                    CrossPeBarrier* __restrict__ barrier, size_t elementCount,
+                                    size_t slotStrideElements, size_t outputBaseOffsetBytes) {
+  AllGatherSdmaKernel_body<T>(myPe, npes, srcMemObj, dstMemObj, flagsMemObj, barrier, elementCount,
+                              slotStrideElements, outputBaseOffsetBytes);
 }
 
 }  // namespace collective

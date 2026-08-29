@@ -64,7 +64,7 @@ function(add_mori_benchmark_cco name)
   # $ORIGIN-relative rpath (kept alongside the build-tree rpath) so the binaries
   # resolve libmori_*.so after `BUILD_BENCHMARK=ON pip install .` copies them to
   # site-packages/mori/benchmarks/cco/ (the libs live at site-packages/mori/).
-  set_target_properties(${name} PROPERTIES BUILD_RPATH "$ORIGIN/../..")
+  set_target_properties(${name} PROPERTIES BUILD_RPATH "$ORIGIN/../..;${ROCM_PATH}/lib")
   if(DEFINED GPU_TARGETS)
     set_target_properties(${name} PROPERTIES HIP_ARCHITECTURES "${GPU_TARGETS}")
   endif()
@@ -126,4 +126,48 @@ if(WITH_MPI AND BUILD_CCO)
 elseif(WITH_MPI AND NOT BUILD_CCO)
   message(WARNING
     "BUILD_BENCHMARK=ON with BUILD_CCO=OFF: CCO p2p benchmark targets skipped")
+endif()
+
+# --- link characterisation probes (cco/ualoe_metric) ---
+# Self-contained HIP TUs: they open their own socket and talk to the HIP runtime
+# directly, so they link no mori library.
+#
+# ualoe_latency is one thread issuing one operation at a time, so it builds
+# everywhere; ualoe_bw calls the gfx125x tensor-DMA builtins
+# (__builtin_amdgcn_tensor_load_to_lds and friends), which do not exist on other
+# targets, hence the arch filter on that one.
+#
+# The sweeps under cco/ualoe_metric/tools/ compile ualoe_bw themselves, because
+# tile, pipe depth and issuer count are compile time and a sweep changes them per
+# configuration. cco/ualoe_metric/tools/build_ualoe.sh owns the flag set both
+# paths use; keep the compile options below in step with it, or the numbers this
+# target produces stop matching the recorded tables in
+# cco/ualoe_metric/results/.
+if(DEFINED GPU_TARGETS)
+  add_executable(ualoe_latency cco/ualoe_metric/ualoe_latency.cpp)
+  set_source_files_properties(cco/ualoe_metric/ualoe_latency.cpp PROPERTIES LANGUAGE HIP)
+  target_link_libraries(ualoe_latency PRIVATE hip::host hip::device)
+  # -O3 for the same reason as ualoe_bw: the timed loops are a handful of
+  # instructions and -O2 does not schedule them the same way.
+  target_compile_options(ualoe_latency PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-O3>)
+  set_target_properties(ualoe_latency PROPERTIES HIP_ARCHITECTURES "${GPU_TARGETS}")
+
+  set(_ualoe_archs "")
+  foreach(_arch IN LISTS GPU_TARGETS)
+    if(_arch MATCHES "^gfx125")
+      list(APPEND _ualoe_archs ${_arch})
+    endif()
+  endforeach()
+  if(_ualoe_archs)
+    add_executable(ualoe_bw cco/ualoe_metric/ualoe_bw.cpp)
+    set_source_files_properties(cco/ualoe_metric/ualoe_bw.cpp PROPERTIES LANGUAGE HIP)
+    target_link_libraries(ualoe_bw PRIVATE hip::host hip::device)
+    # -O3, not the library's -O2: the recorded tables were measured at -O3 and
+    # the TDM issue loop is tight enough that the two do not agree.
+    target_compile_options(ualoe_bw PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-O3>)
+    set_target_properties(ualoe_bw PROPERTIES HIP_ARCHITECTURES "${_ualoe_archs}")
+  else()
+    message(STATUS
+      "ualoe_metric: no gfx125x in GPU_TARGETS (${GPU_TARGETS}), ualoe_bw skipped")
+  endif()
 endif()

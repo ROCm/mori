@@ -96,8 +96,9 @@ double Allreduce_sdma(T* input, T* output, size_t total_count, hipStream_t strea
   double start = CollectiveWallTime();
   ReduceScatterKernel<T><<<blocks, threads, 0, stream>>>(myPe, npes, inPutBuffObj, transitObj,
                                                          barrierObj, total_count);
-  AllGatherSdmaKernel<T>
-      <<<1, 512, 0, stream>>>(myPe, npes, transitObj, flagsObj, agBarrier, total_count);
+  const size_t slotStrideElements = static_cast<size_t>(partSize) * pack_size;
+  AllGatherSdmaKernel<T><<<1, 512, 0, stream>>>(myPe, npes, transitObj, transitObj, flagsObj,
+                                                agBarrier, total_count, slotStrideElements, 0);
 
   // Synchronize GPU to ensure kernel completion
   hipError_t sync_err;

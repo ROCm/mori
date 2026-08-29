@@ -47,6 +47,9 @@
 //     ib = independent+block    at = aggregate+thread
 //   signal/wait/flush — coop-only tag: thread / warp / block.
 //   put/put_value/signal also carry a remote-action tag: none / inc / add.
+//   Side-effect-only wrappers return int status 0 rather than void. Triton's
+//   extern_elementwise requires a concrete return element type; FlyDSL ignores
+//   the status.
 
 #include "mori/cco/cco_scale_out.hpp"
 
@@ -99,6 +102,18 @@ CCO_DEV uint64_t cco_lsa_ptr(uint64_t window, int peer, uint64_t offset) {
   return reinterpret_cast<uint64_t>(w->winBase) + static_cast<uint64_t>(peer) * stride + offset;
 }
 
+// System-scope publication fence used by direct LSA benchmark/store paths.
+// Latency kernels fence from block lane 0; bandwidth kernels fence every lane.
+// This primitive is NOT a barrier: callers must synchronize participating
+// threads before entering it. leaderOnly orders only thread 0's operations
+// under the HIP memory model; it must not be used as a general replacement for
+// a release fence issued by every producer lane. It exists for the matched C++
+// and Triton benchmark protocol, which brackets it with block barriers.
+CCO_DEV int cco_system_fence(int leaderOnly) {
+  if (!leaderOnly || threadIdx.x == 0) __threadfence_system();
+  return 0;
+}
+
 // Expose SDMA C API. Symbol tags kept in sync with _bindings.py:
 //   put/get carry a coop tag (thread/warp/block); a "_ns" suffix selects the
 //   no-signal (fire-and-forget) variant.
@@ -108,17 +123,18 @@ CCO_DEV uint64_t cco_lsa_ptr(uint64_t window, int peer, uint64_t offset) {
 // Entire block compile-gated on BUILD_CCO_SDMA — when off, no cco_sdma_* symbols
 // are emitted (matches the host lib, which builds no SDMA queues).
 #if BUILD_CCO_SDMA
-#define CCO_DEF_SDMA_XFER(OP, TAG, COOP, SIG)                                                     \
-  CCO_DEV void cco_sdma_##OP##__##TAG(uint64_t dc, int peer, uint64_t dW, uint64_t dO,            \
-                                      uint64_t sW, uint64_t sO, uint64_t n, int qid, int flags) { \
-    Sdma sdma{*AsDevComm(dc)};                                                                    \
-    if (static_cast<uint32_t>(flags) & ccoSdmaOptFlagsAggregate) {                                \
-      sdma.OP<COOP, SIG, false, ccoSdmaOptFlagsAggregate>(peer, AsWindow(dW), dO, AsWindow(sW),   \
-                                                          sO, n, qid);                            \
-    } else {                                                                                      \
-      sdma.OP<COOP, SIG, false, ccoSdmaOptFlagsDefault>(peer, AsWindow(dW), dO, AsWindow(sW), sO, \
-                                                        n, qid);                                  \
-    }                                                                                             \
+#define CCO_DEF_SDMA_XFER(OP, TAG, COOP, SIG)                                                      \
+  CCO_DEV int cco_sdma_##OP##__##TAG(uint64_t dc, int peer, uint64_t dW, uint64_t dO, uint64_t sW, \
+                                     uint64_t sO, uint64_t n, int qid, int flags) {                \
+    Sdma sdma{*AsDevComm(dc)};                                                                     \
+    if (static_cast<uint32_t>(flags) & ccoSdmaOptFlagsAggregate) {                                 \
+      sdma.OP<COOP, SIG, false, ccoSdmaOptFlagsAggregate>(peer, AsWindow(dW), dO, AsWindow(sW),    \
+                                                          sO, n, qid);                             \
+    } else {                                                                                       \
+      sdma.OP<COOP, SIG, false, ccoSdmaOptFlagsDefault>(peer, AsWindow(dW), dO, AsWindow(sW), sO,  \
+                                                        n, qid);                                   \
+    }                                                                                              \
+    return 0;                                                                                      \
   }
 
 CCO_DEF_SDMA_XFER(put, thread, ccoCoopThread, true)
@@ -137,10 +153,11 @@ CCO_DEF_SDMA_XFER(get, block_ns, ccoCoopBlock, false)
 #undef CCO_DEF_SDMA_XFER
 
 // ── SDMA quiet: cco_sdma_quiet__<coop> (wait for outstanding ops to peer) ──
-#define CCO_DEF_SDMA_QUIET(TAG, COOP)                         \
-  CCO_DEV void cco_sdma_quiet__##TAG(uint64_t dc, int peer) { \
-    Sdma sdma{*AsDevComm(dc)};                                \
-    sdma.quiet<COOP>(peer);                                   \
+#define CCO_DEF_SDMA_QUIET(TAG, COOP)                        \
+  CCO_DEV int cco_sdma_quiet__##TAG(uint64_t dc, int peer) { \
+    Sdma sdma{*AsDevComm(dc)};                               \
+    sdma.quiet<COOP>(peer);                                  \
+    return 0;                                                \
   }
 CCO_DEF_SDMA_QUIET(thread, ccoCoopThread)
 CCO_DEF_SDMA_QUIET(warp, ccoCoopWarp)
@@ -148,16 +165,18 @@ CCO_DEF_SDMA_QUIET(block, ccoCoopBlock)
 #undef CCO_DEF_SDMA_QUIET
 
 // quiet a single (peer, queueId) queue only.
-CCO_DEV void cco_sdma_quiet_queue(uint64_t dc, int peer, int qid) {
+CCO_DEV int cco_sdma_quiet_queue(uint64_t dc, int peer, int qid) {
   Sdma sdma{*AsDevComm(dc)};
   sdma.quietQueue(peer, qid);
+  return 0;
 }
 
 // ── SDMA commit: ring the doorbell for packets posted with the Aggregate flag ──
-#define CCO_DEF_SDMA_COMMIT(TAG, COOP)                                  \
-  CCO_DEV void cco_sdma_commit__##TAG(uint64_t dc, int peer, int qid) { \
-    Sdma sdma{*AsDevComm(dc)};                                          \
-    sdma.commit<COOP>(peer, qid);                                       \
+#define CCO_DEF_SDMA_COMMIT(TAG, COOP)                                 \
+  CCO_DEV int cco_sdma_commit__##TAG(uint64_t dc, int peer, int qid) { \
+    Sdma sdma{*AsDevComm(dc)};                                         \
+    sdma.commit<COOP>(peer, qid);                                      \
+    return 0;                                                          \
   }
 CCO_DEF_SDMA_COMMIT(thread, ccoCoopThread)
 CCO_DEF_SDMA_COMMIT(warp, ccoCoopWarp)
@@ -172,13 +191,14 @@ CCO_DEV int cco_devcomm_lsa_rank(uint64_t dc) { return AsDevComm(dc)->lsaRank; }
 CCO_DEV int cco_devcomm_lsa_size(uint64_t dc) { return AsDevComm(dc)->lsaSize; }
 
 // ── GDA put: cco_gda_put__<tc>__<sig> ──
-#define CCO_DEF_PUT(TAG, TM, COOP, SIG)                                                       \
-  CCO_DEV void cco_gda_put__##TAG##__##SIG(uint64_t dc, int ctx, int peer, uint64_t dW,       \
-                                           uint64_t dO, uint64_t sW, uint64_t sO, uint64_t n, \
-                                           int sid, uint64_t sv) {                            \
-    Gda gda{*AsDevComm(dc), ctx};                                                             \
-    gda.put<CCO_TEAM_WORLD, TM>(peer, AsWindow(dW), dO, AsWindow(sW), sO, n, CCO_RA_##SIG,    \
-                                COOP{});                                                      \
+#define CCO_DEF_PUT(TAG, TM, COOP, SIG)                                                      \
+  CCO_DEV int cco_gda_put__##TAG##__##SIG(uint64_t dc, int ctx, int peer, uint64_t dW,       \
+                                          uint64_t dO, uint64_t sW, uint64_t sO, uint64_t n, \
+                                          int sid, uint64_t sv) {                            \
+    Gda gda{*AsDevComm(dc), ctx};                                                            \
+    gda.put<CCO_TEAM_WORLD, TM>(peer, AsWindow(dW), dO, AsWindow(sW), sO, n, CCO_RA_##SIG,   \
+                                COOP{});                                                     \
+    return 0;                                                                                \
   }
 #define CCO_DEF_PUT_SIGS(TAG, TM, COOP) \
   CCO_DEF_PUT(TAG, TM, COOP, none)      \
@@ -189,12 +209,13 @@ CCO_TC_LIST(CCO_DEF_PUT_SIGS)
 #undef CCO_DEF_PUT
 
 // ── GDA put_value: cco_gda_put_value__<tc>__<sig> ──
-#define CCO_DEF_PUTV(TAG, TM, COOP, SIG)                                                      \
-  CCO_DEV void cco_gda_put_value__##TAG##__##SIG(uint64_t dc, int ctx, int peer, uint64_t dW, \
-                                                 uint64_t dO, uint64_t value, int sid,        \
-                                                 uint64_t sv) {                               \
-    Gda gda{*AsDevComm(dc), ctx};                                                             \
-    gda.putValue<CCO_TEAM_WORLD, TM>(peer, AsWindow(dW), dO, value, CCO_RA_##SIG, COOP{});    \
+#define CCO_DEF_PUTV(TAG, TM, COOP, SIG)                                                     \
+  CCO_DEV int cco_gda_put_value__##TAG##__##SIG(uint64_t dc, int ctx, int peer, uint64_t dW, \
+                                                uint64_t dO, uint64_t value, int sid,        \
+                                                uint64_t sv) {                               \
+    Gda gda{*AsDevComm(dc), ctx};                                                            \
+    gda.putValue<CCO_TEAM_WORLD, TM>(peer, AsWindow(dW), dO, value, CCO_RA_##SIG, COOP{});   \
+    return 0;                                                                                \
   }
 #define CCO_DEF_PUTV_SIGS(TAG, TM, COOP) \
   CCO_DEF_PUTV(TAG, TM, COOP, none)      \
@@ -205,21 +226,23 @@ CCO_TC_LIST(CCO_DEF_PUTV_SIGS)
 #undef CCO_DEF_PUTV
 
 // ── GDA get (no remote action): cco_gda_get__<tc> ──
-#define CCO_DEF_GET(TAG, TM, COOP)                                                          \
-  CCO_DEV void cco_gda_get__##TAG(uint64_t dc, int ctx, int peer, uint64_t rW, uint64_t rO, \
-                                  uint64_t lW, uint64_t lO, uint64_t n) {                   \
-    Gda gda{*AsDevComm(dc), ctx};                                                           \
-    gda.get<CCO_TEAM_WORLD, TM>(peer, AsWindow(rW), rO, AsWindow(lW), lO, n, COOP{});       \
+#define CCO_DEF_GET(TAG, TM, COOP)                                                         \
+  CCO_DEV int cco_gda_get__##TAG(uint64_t dc, int ctx, int peer, uint64_t rW, uint64_t rO, \
+                                 uint64_t lW, uint64_t lO, uint64_t n) {                   \
+    Gda gda{*AsDevComm(dc), ctx};                                                          \
+    gda.get<CCO_TEAM_WORLD, TM>(peer, AsWindow(rW), rO, AsWindow(lW), lO, n, COOP{});      \
+    return 0;                                                                              \
   }
 CCO_TC_LIST(CCO_DEF_GET)
 #undef CCO_DEF_GET
 
 // ── GDA signal (inc/add only): cco_gda_signal__<coop>__<sig> ──
-#define CCO_DEF_SIGNAL(TAG, COOP, SIG)                                                 \
-  CCO_DEV void cco_gda_signal__##TAG##__##SIG(uint64_t dc, int ctx, int peer, int sid, \
-                                              uint64_t sv) {                           \
-    Gda gda{*AsDevComm(dc), ctx};                                                      \
-    gda.signal<CCO_TEAM_WORLD>(peer, CCO_RA_##SIG, COOP{});                            \
+#define CCO_DEF_SIGNAL(TAG, COOP, SIG)                                                \
+  CCO_DEV int cco_gda_signal__##TAG##__##SIG(uint64_t dc, int ctx, int peer, int sid, \
+                                             uint64_t sv) {                           \
+    Gda gda{*AsDevComm(dc), ctx};                                                     \
+    gda.signal<CCO_TEAM_WORLD>(peer, CCO_RA_##SIG, COOP{});                           \
+    return 0;                                                                         \
   }
 #define CCO_DEF_SIGNAL_SIGS(TAG, COOP) \
   CCO_DEF_SIGNAL(TAG, COOP, inc)       \
@@ -234,30 +257,34 @@ CCO_DEV uint64_t cco_gda_read_signal(uint64_t dc, int ctx, int sigId, int bits) 
   return gda.readSignal(AsSig(sigId), bits);
 }
 
-CCO_DEV void cco_gda_reset_signal(uint64_t dc, int ctx, int sigId) {
+CCO_DEV int cco_gda_reset_signal(uint64_t dc, int ctx, int sigId) {
   Gda gda{*AsDevComm(dc), ctx};
   gda.resetSignal(AsSig(sigId));
+  return 0;
 }
 
 // ── GDA wait_signal: cco_gda_wait_signal__<coop> ──
-#define CCO_DEF_WAIT(TAG, COOP)                                                          \
-  CCO_DEV void cco_gda_wait_signal__##TAG(uint64_t dc, int ctx, int sid, uint64_t least, \
-                                          int bits) {                                    \
-    Gda gda{*AsDevComm(dc), ctx};                                                        \
-    gda.waitSignal(AsSig(sid), least, COOP{}, bits);                                     \
+#define CCO_DEF_WAIT(TAG, COOP)                                                         \
+  CCO_DEV int cco_gda_wait_signal__##TAG(uint64_t dc, int ctx, int sid, uint64_t least, \
+                                         int bits) {                                    \
+    Gda gda{*AsDevComm(dc), ctx};                                                       \
+    gda.waitSignal(AsSig(sid), least, COOP{}, bits);                                    \
+    return 0;                                                                           \
   }
 CCO_COOP_LIST(CCO_DEF_WAIT)
 #undef CCO_DEF_WAIT
 
 // ── GDA completion (>= warp): cco_gda_flush__<coop> / cco_gda_flush_peer__<coop> ──
-#define CCO_DEF_FLUSH(TAG, COOP)                                           \
-  CCO_DEV void cco_gda_flush__##TAG(uint64_t dc, int ctx) {                \
-    Gda gda{*AsDevComm(dc), ctx};                                          \
-    gda.flush(COOP{});                                                     \
-  }                                                                        \
-  CCO_DEV void cco_gda_flush_peer__##TAG(uint64_t dc, int ctx, int peer) { \
-    Gda gda{*AsDevComm(dc), ctx};                                          \
-    gda.flush(peer, COOP{});                                               \
+#define CCO_DEF_FLUSH(TAG, COOP)                                          \
+  CCO_DEV int cco_gda_flush__##TAG(uint64_t dc, int ctx) {                \
+    Gda gda{*AsDevComm(dc), ctx};                                         \
+    gda.flush(COOP{});                                                    \
+    return 0;                                                             \
+  }                                                                       \
+  CCO_DEV int cco_gda_flush_peer__##TAG(uint64_t dc, int ctx, int peer) { \
+    Gda gda{*AsDevComm(dc), ctx};                                         \
+    gda.flush(peer, COOP{});                                              \
+    return 0;                                                             \
   }
 CCO_DEF_FLUSH(warp, ccoCoopWarp)
 CCO_DEF_FLUSH(block, ccoCoopBlock)

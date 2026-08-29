@@ -52,8 +52,8 @@ done
 ## Step 1: Start the Docker container
 
 Use the container name from the user's args if provided; ask if not.
-Default image: `rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.10.0`
-(use unless the user specifies another).
+Default image: `rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0`
+(use unless the user specifies another) — same base the CI workflows build on.
 
 ```bash
 if sudo docker inspect $CONTAINER_NAME &>/dev/null; then
@@ -418,6 +418,42 @@ mst status -v
 
 ## Step 4: Install MORI
 
+### 4.0 — ROCm 7.14 dev toolchain (rocm7.14 base images only)
+
+**Skip on pre-7.14 images** — they already ship a full `/opt/rocm` and must not
+get a second ROCm stacked on top.
+
+The rocm7.14 pytorch image has **no `/opt/rocm` at all**: ROCm comes from the pip
+`rocm-sdk-core` wheel, which ships runtime `.so` files and headers but no CMake
+package configs. Without this step the build dies at configure time with
+`does not contain the HIP runtime CMake package ... hip-lang-config.cmake`.
+
+```bash
+sudo docker exec $CONTAINER_NAME bash -c '
+set -e
+[ -d /opt/rocm/bin ] && { echo "/opt/rocm already present — skipping"; exit 0; }
+apt-get install -y --no-install-recommends wget gnupg ca-certificates
+mkdir -p --mode=0755 /etc/apt/keyrings
+wget -qO - https://repo.amd.com/rocm/packages-multi-arch/gpg/rocm.gpg \
+  | gpg --dearmor > /etc/apt/keyrings/amdrocm.gpg
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://repo.amd.com/rocm/packages-multi-arch/ubuntu2404 stable main" \
+  > /etc/apt/sources.list.d/amdrocm.list
+apt-get update
+apt-get install -y --no-install-recommends amdrocm-core-dev7.14-gfx942 amdrocm-core-dev7.14-gfx950
+hipconfig --version
+'
+```
+
+No environment setup is needed for the rest of the session. CMake resolves ROCm
+as `-DROCM_PATH` → `$ROCM_PATH` → `$HIP_PATH` → `/opt/rocm` (where both the
+7.2.4 and 7.14 stacks live) and pins the compiler to an absolute
+`<rocm>/llvm/bin/amdclang++`; mori's libraries carry
+`RUNPATH "$ORIGIN:<rocm>/lib"`, and the JIT builds absolute `<rocm>/bin/...`
+paths off the same default. Set `ROCM_PATH` only for ROCm somewhere else (e.g. a
+versioned `/opt/rocm-7.2.4`).
+
+### 4.1 — Build and install
+
 `pybind11` is a required build dep missing from `pyproject.toml`:
 
 ```bash
@@ -440,7 +476,7 @@ sudo docker exec -w $MORI_REPO_DIR $CONTAINER_NAME bash -c "BUILD_UMBP=OFF pip i
 ## Step 5: Verify
 
 ```bash
-sudo docker exec $CONTAINER_NAME python3 -c "import mori; print('mori version:', mori.__version__)"
+sudo docker exec $CONTAINER_NAME bash -c "python3 -c \"import mori; print('mori version:', mori.__version__)\""
 ```
 
 On shared-library errors (`libpci.so`, `libibverbs.so`, …):
@@ -542,6 +578,27 @@ only `4: Warm Reboot` supported — a host reboot is the only recovery path.
 
 ---
 
+## Known environment issues
+
+Some machines are configured in ways that make MORI slow without anything being wrong
+with MORI. The **`known-issues`** skill collects them, with detection commands and fixes.
+
+Worth a look on any newly deployed box, and mandatory reading before debugging a
+performance problem that only shows up on one machine. The most common one:
+
+- **HIP VMM peer traffic silently falls off XGMI** on kernels built without
+  `CONFIG_DMABUF_MOVE_NOTIFY` / `CONFIG_PCI_P2PDMA` (stock Ubuntu 22.04 GA 5.15).
+  Hits `mori-cco` (EPv2) but not `mori-shmem` (EPv1); costs ~9x a2a bandwidth and
+  reports no error. One-line check:
+
+  ```bash
+  grep -E 'CONFIG_(PCI_P2PDMA|DMABUF_MOVE_NOTIFY)=' /boot/config-$(uname -r)
+  ```
+
+  Both must print `=y`. See `.claude/skills/known-issues/SKILL.md`.
+
+---
+
 ## Done — Report Back
 
 - Base image and OS
@@ -550,6 +607,8 @@ only `4: Warm Reboot` supported — a host reboot is the only recovery path.
 - GPU arch and NIC type as reported by MORI
 - Kernels: JIT on first use (`~/.mori/jit/`)
 - `mori check` result — include full output, highlight any `[WARN]` or `[FAIL]`
+- Kernel `CONFIG_PCI_P2PDMA` / `CONFIG_DMABUF_MOVE_NOTIFY` — flag it if either is
+  missing (see Known environment issues above)
 - Attach command (working directory set to the MORI source tree):
 
 ```bash

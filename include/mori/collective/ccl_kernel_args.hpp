@@ -159,10 +159,14 @@ struct CclAllreduceArgs {
   int myPe;
   int npes;
   const T* input;
+  T* output;
   application::SymmMemObjPtr dstMemObj;
+  application::SymmMemObjPtr outputMemObj;
   application::SymmMemObjPtr flagsMemObj;
   CrossPeBarrier* barrier;
   size_t elementCount;
+  size_t slotStrideElements;
+  size_t outputBaseOffsetBytes;
 };
 
 // Inter-node RDMA ring AllGather. Ring buffer memObj holds ringSize contiguous chunks of

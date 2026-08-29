@@ -131,10 +131,45 @@ message(STATUS "WARP_ACCUM_UNROLL is set to: ${WARP_ACCUM_UNROLL}")
 add_definitions(-DWARP_ACCUM_UNROLL=${WARP_ACCUM_UNROLL})
 add_definitions(-DHIP_ENABLE_WARP_SYNC_BUILTINS)
 if(USE_ROCM)
-  list(APPEND CMAKE_PREFIX_PATH "/opt/rocm")
+  # Resolve ROCm before project(... HIP). Not via `hipconfig`: the rocm7.14
+  # pytorch image ships a shim at /opt/venv/bin/hipconfig that shadows the real
+  # one and always reports the pip rocm-sdk-core wheel dir, which has no CMake
+  # configs — CMake then dies with "Failed to find HIP root directory".
+  if(NOT DEFINED MORI_ROCM_PATH)
+    if(DEFINED ROCM_PATH)
+      set(MORI_ROCM_PATH "${ROCM_PATH}")
+    elseif(DEFINED ENV{ROCM_PATH})
+      set(MORI_ROCM_PATH "$ENV{ROCM_PATH}")
+    elseif(DEFINED ENV{HIP_PATH})
+      set(MORI_ROCM_PATH "$ENV{HIP_PATH}")
+    else()
+      set(MORI_ROCM_PATH "/opt/rocm")
+    endif()
+  endif()
+  if(NOT EXISTS "${MORI_ROCM_PATH}/lib/cmake/hip-lang/hip-lang-config.cmake")
+    message(FATAL_ERROR
+      "No ROCm dev toolchain at '${MORI_ROCM_PATH}' "
+      "(missing lib/cmake/hip-lang/hip-lang-config.cmake).\n"
+      "Install the apt ROCm dev stack (see docker/Dockerfile.dev), or point at "
+      "an existing install with -DROCM_PATH=<path>.")
+  endif()
+  message(STATUS "Mori ROCm path: ${MORI_ROCM_PATH}")
+  set(ROCM_PATH "${MORI_ROCM_PATH}" CACHE PATH "ROCm root" FORCE)
+  # CMakeDetermineHIPCompiler consults this (and only falls back to hipconfig).
+  set(CMAKE_HIP_COMPILER_ROCM_ROOT "${MORI_ROCM_PATH}" CACHE PATH "" FORCE)
+  # Pin the compiler too: the venv also shims amdclang++ into the wheel.
+  if(NOT DEFINED CMAKE_HIP_COMPILER AND EXISTS "${MORI_ROCM_PATH}/llvm/bin/amdclang++")
+    set(CMAKE_HIP_COMPILER "${MORI_ROCM_PATH}/llvm/bin/amdclang++" CACHE FILEPATH "" FORCE)
+  endif()
+  list(APPEND CMAKE_PREFIX_PATH "${MORI_ROCM_PATH}")
+  # RPATH the ROCm libdir so the installed libraries resolve libamdhip64 /
+  # libhsa-runtime64 without the caller exporting LD_LIBRARY_PATH. Targets that
+  # set their own RPATH repeat this (see src/*/CMakeLists.txt).
+  list(APPEND CMAKE_INSTALL_RPATH "${MORI_ROCM_PATH}/lib")
+  list(APPEND CMAKE_BUILD_RPATH "${MORI_ROCM_PATH}/lib")
   project(mori LANGUAGES HIP CXX C)
   find_package(hip REQUIRED)
-  link_directories(/opt/rocm/lib)
+  link_directories(${MORI_ROCM_PATH}/lib)
 
   if(DEFINED GPU_TARGETS)
     list(GET GPU_TARGETS 0 GPU_ARCH)
@@ -185,10 +220,23 @@ add_subdirectory(3rdparty/spdlog)
 # MORI's .so files.
 set_target_properties(spdlog PROPERTIES CXX_VISIBILITY_PRESET hidden
                                         VISIBILITY_INLINES_HIDDEN ON)
+# Silence the deprecated `operator"" _a` warning from the bundled fmt while
+# compiling spdlog's own sources (see mori_logging below for consumers).
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag("-Wno-deprecated-literal-operator"
+                        HAVE_WNO_DEPRECATED_LITERAL_OPERATOR)
+if(HAVE_WNO_DEPRECATED_LITERAL_OPERATOR)
+  target_compile_options(spdlog PRIVATE -Wno-deprecated-literal-operator)
+endif()
 
 add_library(mori_logging INTERFACE)
 target_include_directories(mori_logging INTERFACE include)
 target_link_libraries(mori_logging INTERFACE spdlog::spdlog)
+
+if(HAVE_WNO_DEPRECATED_LITERAL_OPERATOR)
+  target_compile_options(mori_logging
+                         INTERFACE -Wno-deprecated-literal-operator)
+endif()
 
 if(ENABLE_PROFILER)
   find_package(
@@ -270,6 +318,11 @@ endif()
 if(BUILD_CCO)
   add_subdirectory(src/cco)
 endif()
+
+# JIT v2 host runtime. Host-only (HIP runtime API, no device code), so it needs
+# no hipcc at build time — see docs/MORI_JIT_V2_DESIGN.md.
+add_subdirectory(src/jit/v2)
+add_subdirectory(src/ops/dispatch_combine_v2)
 
 if(BUILD_OPS)
   add_subdirectory(src/ops)

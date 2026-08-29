@@ -24,10 +24,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # py3.10 stays on 7.2.4: ROCm 7.14 ships no py3.10/ubuntu22.04 image.
+          # Dockerfile.dev skips its apt ROCm 7.14 install when the base already
+          # has a dev stack, so both lanes build from the same file.
           - python: "3.10"
             base_image: rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.8.0
           - python: "3.12"
-            base_image: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0
+            base_image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -153,10 +156,11 @@ jobs:
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
+
           - platform: MI355X_AINIC
             python: "3.12"
             runner: [self-hosted, MI355X-AINIC-TW]
-            base_image: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0
+            base_image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
@@ -381,7 +385,7 @@ jobs:
           - platform: MI355X_AINIC
             python: "3.12"
             runner: [self-hosted, MI355X-AINIC]
-            base_image: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0
+            base_image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
             node1_host: 10.2.80.22
             node2_host: 10.2.80.20
             node2_port: 22
@@ -559,6 +563,28 @@ jobs:
             --num-qp-per-transfer 2 --num-worker-threads 2 \
             --num-initiator-dev 8 --num-target-dev 8
           wait
+
+      - name: Build MORI-IO C++ bench_engine (both nodes)
+        run: |
+          BUILD_CMD="cd $GITHUB_WORKSPACE && cmake -B build -DBUILD_IO=ON -DBUILD_TESTS=ON -DBUILD_EXAMPLES=OFF -DBUILD_PYBINDS=OFF&& cmake --build build --target bench_engine -j && ls -la build/tests/cpp/bench_engine"
+          $CT exec $CONTAINER bash -c "$BUILD_CMD"
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "$CT exec $CONTAINER bash -c \"$BUILD_CMD\""
+
+      - name: MORI-IO C++ bench_engine write sweep (batch 1 and 64)
+        run: |
+          BIN=$GITHUB_WORKSPACE/build/tests/cpp/bench_engine
+          LDP="LD_LIBRARY_PATH=$GITHUB_WORKSPACE/build/src/io:$GITHUB_WORKSPACE/build/src/application"
+          PORT=29130
+          for BATCH in 1 64; do
+            echo "=== C++ bench_engine GPU write sweep, batch=$BATCH, port=$PORT ==="
+            ARGS="--op write --mem-type gpu --all --sweep-start 1048576 --sweep-max 33554432 --sweep-step 1048576 --transfer-batch-size $BATCH --enable-sess --enable-batch-transfer --num-initiator-dev 1 --num-target-dev 1 --num-qp-per-transfer 8 --iters 200 --warmup-iters 5"
+            R1="cd $GITHUB_WORKSPACE && $LDP $BIN --rank 1 --master-ip $NODE1_HOST --self-ip $NODE2_HOST --port $PORT $ARGS"
+            R0="cd $GITHUB_WORKSPACE && $LDP $BIN --rank 0 --master-ip $NODE1_HOST --self-ip $NODE1_HOST --port $PORT $ARGS"
+            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "$CT exec $CONTAINER bash -c \"$R1\"" &
+            $CT exec $CONTAINER bash -c "$R0"
+            wait
+            PORT=$((PORT + 1))
+          done
 
       - name: MORI-EP internode normal kernel bench
         run: |
@@ -749,7 +775,7 @@ jobs:
           - python: "3.10"
             base_image: rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.8.0
           - python: "3.12"
-            base_image: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0
+            base_image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
     env:
       IMAGE: rocm/mori:ci-py${{ matrix.python }}
     steps:

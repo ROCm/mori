@@ -1,11 +1,14 @@
-# Override with --build-arg BASE_IMAGE=... to switch ROCm/Python version.
-# Tested base images:
-#   rocm/pytorch:rocm6.4.3_ubuntu22.04_py3.10_pytorch_release_2.5.1
-#   rocm/pytorch:rocm7.1.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
-#   rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.8.0
-#   rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0
-ARG BASE_IMAGE=rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.8.0
+# Tested base image (the ROCm 7.14 install below assumes a 7.14/ubuntu24.04
+# base; an older one would end up with two ROCm installs stacked):
+#   rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+ARG BASE_IMAGE=rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
 FROM ${BASE_IMAGE}
+
+# Space-separated gfx targets to pull ROCm device packages for. The CCO CI
+# image uses "gfx950 gfx1250".
+ARG GPU_ARCHS="gfx942 gfx950"
+# 1 installs flydsl, which only the cco Python examples need.
+ARG WITH_FLYDSL=0
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -15,3 +18,52 @@ RUN apt-get update && \
     libgrpc-dev libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc \
     cmake && \
     rm -rf /var/lib/apt/lists/*
+
+# ── ROCm 7.14 dev toolchain (only when the base image lacks one) ──
+#
+# The rocm7.14 pytorch image has no /opt/rocm: ROCm comes from the pip
+# `rocm-sdk-core` wheel, which ships runtime .so files and headers but no CMake
+# package configs, so `project(... HIP)` cannot find hip-lang-config.cmake.
+# The apt ROCm 7.14 below installs under /opt/rocm/core-7.14 and registers
+# /opt/rocm/{bin,lib,include,...} via update-alternatives, the layout mori
+# expects.
+#
+# Older base images (the 7.2.4 ones the py3.10 nightly lane still uses) already
+# ship a full ROCm dev stack, and its apt repo is ubuntu2404-only anyway — so
+# probe for the same file mori's CMakeLists checks and skip if it is there.
+RUN set -ex; \
+    if [ -e /opt/rocm/lib/cmake/hip-lang/hip-lang-config.cmake ]; then \
+      echo "ROCm dev stack already present at /opt/rocm — skipping apt ROCm 7.14"; \
+    else \
+      apt-get update; \
+      apt-get install -y --no-install-recommends wget gnupg ca-certificates; \
+      mkdir -p --mode=0755 /etc/apt/keyrings; \
+      wget -qO - https://repo.amd.com/rocm/packages-multi-arch/gpg/rocm.gpg \
+        | gpg --dearmor > /etc/apt/keyrings/amdrocm.gpg; \
+      echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://repo.amd.com/rocm/packages-multi-arch/ubuntu2404 stable main" \
+        > /etc/apt/sources.list.d/amdrocm.list; \
+      apt-get update; \
+      for arch in ${GPU_ARCHS}; do pkgs="${pkgs} amdrocm-core-dev7.14-${arch}"; done; \
+      apt-get install -y --no-install-recommends ${pkgs}; \
+      rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# Works around an amdgpu kernel bug that makes the symmetric heap's hipMemCreate
+# fail with hipErrorOutOfMemory while VRAM is nearly empty. VMM allocations carry
+# no VA yet, so the thunk passes va_addr=0, but kfd_ioctl_alloc_memory_of_gpu
+# still runs its SVM-overlap check over [va_addr, va_addr+size) — with va_addr=0
+# that degenerates into "is anything SVM-registered below <size>?". A pageable
+# host tensor that ROCr registers as SVM for an H2D copy lands on the brk heap at
+# a low VA, hits that window, and the kernel returns EADDRINUSE. Pinning glibc's
+# mmap threshold (i.e. disabling the dynamic one) keeps such buffers in the mmap
+# region, well above any plausible allocation size.
+#
+# Upstream fix is 93aa919 ("drm/amdkfd: fix vram allocation failure for a special
+# case"), in 6.18 and stable 6.17.8 / 6.12.58 / 6.6.117 / 6.1.159. Drop this once
+# the runners' amdgpu-dkms carries it — note the DKMS module overrides the
+# distro kernel's amdgpu, so bumping the Ubuntu kernel alone does nothing.
+ENV MALLOC_MMAP_THRESHOLD_=131072
+
+# Pinned <0.3: 0.3.x dropped `flydsl.expr.buffer_ops`, still imported directly
+# by the cco examples (04/05/07/08). Unpin once they move to the 0.3.x API.
+RUN if [ "${WITH_FLYDSL}" = "1" ]; then pip install --no-cache-dir "flydsl<0.3"; fi

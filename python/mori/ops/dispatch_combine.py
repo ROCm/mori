@@ -632,6 +632,22 @@ class EpDispatchCombineOp:
                 f"invalid MORI_EP_LAUNCH_CONFIG_MODE, must be ['MANUAL', 'AUTO'], got '{self.launch_config_mode}'"
             )
 
+        # Buffers are zeroed as they are allocated, and peers do not wait for that: once
+        # a peer reaches dispatch, its kernel writes straight into our buffers. A rank a
+        # few milliseconds behind then zeroes a buffer a peer already wrote to:
+        #
+        #   rank 0  [barrier] alloc+zero, dispatch kernel --+
+        #                                                   |  writes rank 1's
+        #                                                   v  recvTokenNum, payload
+        #   rank 1  [barrier] alloc+zero . . . . . . . . . -X  zeroed here, write lost
+        #
+        # A lost recvTokenNum hangs rank 1, and everyone waiting on it. The barrier at
+        # the top of __init__ runs before the allocation, so it only makes ranks start
+        # together; the sync finishes our zeroing, the barrier makes peers wait for it.
+        if dist.is_initialized():
+            torch.cuda.synchronize()
+            dist.barrier()
+
     # ------------------------------------------------------------------
     # Kernel launch helpers
     # ------------------------------------------------------------------
@@ -1043,6 +1059,24 @@ class EpDispatchCombineOp:
             )
         return n
 
+    @staticmethod
+    def _check_combine_indices(indices, cur_n: int) -> None:
+        """Reject recv-slot-layout indices in combine.
+
+        The InterNodeV1 combine indexes tokenIndices by this rank's own token id,
+        the same key as interNodeDispSendMap, so anything but this rank's own
+        [num_token, topk] routing reduces cross-node tokens against an unrelated
+        token's routing and silently corrupts the result (ROCm/mori#475).
+        """
+        n = int(indices.size(0))
+        if n != cur_n:
+            raise ValueError(
+                f"combine() indices has {n} rows but this rank dispatched {cur_n} "
+                f"tokens. Pass this rank's own [num_tokens, topk] routing -- the "
+                f"tensor given to dispatch() -- not dispatch()'s returned "
+                f"out_idx (ROCm/mori#475)."
+            )
+
     def _build_args_routing(
         self,
         routing,
@@ -1359,20 +1393,18 @@ class EpDispatchCombineOp:
         *,
         routing: "EpDispatchRoutingHandle | None" = None,
     ):
+        """Reduce post-expert tokens back onto this rank's tokens.
+
+        ``indices`` is this rank's own [num_token, topk] routing, the same
+        tensor handed to ``dispatch()`` -- not the received-token indices that
+        ``dispatch()`` returned.
+        """
         if routing is not None and not self._supports_routing_handle():
             raise NotImplementedError(
                 f"routing handle path not supported for kernel_type="
                 f"{self.config.kernel_type}; only IntraNode and InterNodeV1 "
                 "currently consume routing handles in combine."
             )
-
-        if routing is not None:
-            routing_n = self._routing_source_token_count(routing)
-            if int(indices.size(0)) != routing_n:
-                raise ValueError(
-                    f"combine indices has {int(indices.size(0))} tokens but "
-                    f"routing.cur_rank_num_token={routing_n}"
-                )
 
         hidden_dim = input.size(1)
         weight_ptr = (
@@ -1389,6 +1421,7 @@ class EpDispatchCombineOp:
             if routing is not None
             else self._get_cur_rank_num_token(self._handle)
         )
+        self._check_combine_indices(indices, cur_n)
         # The width default follows the TRANSPORT. Same three conditions the _nop2p suffix is
         # chosen by at the launch below, and deliberately not "actual_use_ext" alone -- blockwise
         # and direct_cast own their input too, reach the gather by other routes, and have no
@@ -1895,11 +1928,13 @@ class EpDispatchCombineOp:
                 "Rebuild with ENABLE_STANDARD_MOE_ADAPT=ON."
             )
         hidden_dim = input.size(2)
+        cur_n = self._get_cur_rank_num_token(self._handle)
+        self._check_combine_indices(indices, cur_n)
         actual_bn, actual_rbn, actual_wpb = self._resolve_launch_params(
             block_num,
             rdma_block_num,
             warp_per_block,
-            num_tokens=self._get_cur_rank_num_token(self._handle),
+            num_tokens=cur_n,
             hidden_dim=hidden_dim,
             dtype=input.dtype,
             tuning_rules=self._combine_rules,
@@ -1915,7 +1950,7 @@ class EpDispatchCombineOp:
             self._handle,
             inp_ptr=input.data_ptr(),
             dtype=dtype_to_int(input.dtype),
-            num_tokens=self._get_cur_rank_num_token(self._handle),
+            num_tokens=cur_n,
             weight_ptr=(
                 weights.data_ptr()
                 if weights is not None and weights.size(0) != 0

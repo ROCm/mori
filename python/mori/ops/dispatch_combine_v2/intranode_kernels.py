@@ -72,25 +72,9 @@ import mori.cco.device.flydsl as cco
 
 from . import flydsl_prims as P
 
-# Wavefront size: gfx9 (MI300/MI350) = 64, gfx12 (MI400/gfx1250) = 32. Detected
-# once per process; override with MORI_WAVE_SIZE. get_warp_size(gfx1250) wrongly
-# reports 64, so key off the arch string.
-import os as _os
+from mori.jit.config import detect_wave_size
 
-
-def _detect_wave_size():
-    v = _os.environ.get("MORI_WAVE_SIZE")
-    if v:
-        return int(v)
-    try:
-        from mori.jit.config import detect_gpu_arch
-
-        return 32 if detect_gpu_arch().startswith("gfx12") else 64
-    except Exception:
-        return 64
-
-
-WAVE = _detect_wave_size()
+WAVE = detect_wave_size()
 LANE_MASK = WAVE - 1
 LOG2_WAVE = WAVE.bit_length() - 1
 _BALLOT_INT = T.i64 if WAVE == 64 else T.i32
@@ -348,10 +332,11 @@ def make_dispatch(
                 P.atomic_add_global(fx.Int64(addr_disp_bar), arith.constant(1))
 
             local_recv_num = fx.Int64(window.lsa_ptr(my_lsa_rank, off_recv_num))
+            if global_warp_id == 0:
+                P.spin_until_eq_i32(fx.Int64(addr_disp_bar), block_num)
+                buffer_store(arith.constant(0), rsrc_disp_bar, 0)
             for dest_pe in range(lane, npes, WAVE):
                 if global_warp_id == 0:
-                    P.spin_until_eq_i32(fx.Int64(addr_disp_bar), block_num)
-                    buffer_store(arith.constant(0), rsrc_disp_bar, 0)
                     signal_value = (
                         buffer_load(rsrc_dest_ctr, dest_pe, vec_width=1, dtype=T.i32())
                         + 1
@@ -631,7 +616,6 @@ def make_combine(
         warp = tid >> LOG2_WAVE
         global_warp_id = bid * warp_num_per_block + warp
         global_warp_num = block_num * warp_num_per_block
-        grid_thread_id = bid * (warp_num_per_block * WAVE) + tid
 
         window = cco.Window(arena)
         rsrc_tok_map = create_buffer_resource_from_addr(addr_tok_map)
@@ -650,11 +634,14 @@ def make_combine(
         # reset. Polling is local (peer pushes into our slots), so the extra
         # per-block spins add no remote traffic.
         phase = fx.Int64(buffer_load(rsrc_xdb_flag, bid, vec_width=1, dtype=T.i64()))
-        if grid_thread_id < npes:
-            xdb_remote = fx.Int64(
-                window.lsa_ptr(grid_thread_id, off_xdb_mem)
-            ) + fx.Int64(rank) * fx.Int64(8)
-            P.store_i64_system(xdb_remote, arith.constant(0), phase)
+        # Wave0 strided push: npes > WAVE would split across sibling waves
+        # with no forward-progress guarantee, deadlocking the barrier.
+        if global_warp_id == 0:
+            for p in range(lane, npes, WAVE):
+                xdb_remote = fx.Int64(window.lsa_ptr(p, off_xdb_mem)) + fx.Int64(
+                    rank
+                ) * fx.Int64(8)
+                P.store_i64_system(xdb_remote, arith.constant(0), phase)
         # advance this block's private counter for the next call (single writer)
         if tid == 0:
             buffer_store(phase + arith.constant(1, type=T.i64()), rsrc_xdb_flag, bid)
@@ -681,11 +668,13 @@ def make_combine(
         # slot, so a faster peer can lap us and overwrite its (monotonic) push with
         # a higher call count before our late blocks read it. `>=` still releases
         # (a peer being ahead is the safe direction); `==` would deadlock.
-        if tid < npes:
-            xdb_peer_slot = fx.Int64(
-                window.lsa_ptr(my_lsa_rank, off_xdb_mem)
-            ) + fx.Int64(tid) * fx.Int64(8)
-            P.spin_until_ge_i64(xdb_peer_slot, phase)
+        # Wave0 strided poll: same cross-wave deadlock avoidance as the push.
+        if warp == 0:
+            for p in range(lane, npes, WAVE):
+                xdb_peer_slot = fx.Int64(
+                    window.lsa_ptr(my_lsa_rank, off_xdb_mem)
+                ) + fx.Int64(p) * fx.Int64(8)
+                P.spin_until_ge_i64(xdb_peer_slot, phase)
         fx.barrier()
         # No acquire fence needed here: the gather reads peer out_tok via
         # non-temporal loads (cache-bypassing, always fresh from HBM), and the
@@ -726,8 +715,14 @@ def make_combine(
             expert_valids = []
             expert_pes = []
             expert_toks = []
+            # Idle lanes (>= experts_per_token) are never read back by
+            # readlane, but their tok_map_base+lane can overrun the
+            # allocation on the last tokens of a batch. Fold onto slot 0.
+            tok_map_lane = arith.select(
+                lane < experts_per_token, lane, arith.constant(0)
+            )
             encoded_my = buffer_load(
-                rsrc_tok_map, tok_map_base + lane, vec_width=1, dtype=T.i32()
+                rsrc_tok_map, tok_map_base + tok_map_lane, vec_width=1, dtype=T.i32()
             )
             for k_slot in range_constexpr(experts_per_token):
                 encoded_k = readlane(T.i32(), encoded_my, k_slot)

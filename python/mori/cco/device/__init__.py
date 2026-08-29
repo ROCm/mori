@@ -33,5 +33,20 @@ All bindings link against the cco device bitcode located by
 """
 
 from mori.cco.device.bitcode import find_cco_bitcode, get_bitcode_path
+from mori.cco.device.ops import (
+    CCO_DEVICE_FUNCTIONS,
+    CoopScope,
+    SignalOp,
+    ThreadMode,
+    SdmaOptFlags,
+)
 
-__all__ = ["find_cco_bitcode", "get_bitcode_path"]
+__all__ = [
+    "find_cco_bitcode",
+    "get_bitcode_path",
+    "CCO_DEVICE_FUNCTIONS",
+    "CoopScope",
+    "SignalOp",
+    "ThreadMode",
+    "SdmaOptFlags",
+]

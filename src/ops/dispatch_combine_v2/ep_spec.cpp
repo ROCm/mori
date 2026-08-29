@@ -1,0 +1,270 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+//
+// Host-only. Never includes the device kernel header -- that is what keeps this
+// target compilable without hipcc.
+
+#include "mori/ops/dispatch_combine_v2/ep_spec.hpp"
+
+#include <cstdlib>
+#include <stdexcept>
+#include <string>
+
+#include "mori/jit/v2/toolchain.hpp"
+
+namespace mori {
+namespace ops {
+namespace v2 {
+
+namespace {
+
+int EnvInt(const char* name, int current) {
+  const char* v = std::getenv(name);
+  if (!v || !*v) return current;
+  char* end = nullptr;
+  long parsed = std::strtol(v, &end, 10);
+  if (end == v || parsed <= 0) return current;
+  return static_cast<int>(parsed);
+}
+
+}  // namespace
+
+EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind) {
+  EpCfg c;
+  c.worldSize = req.worldSize;
+  c.hiddenDim = req.hiddenDim;
+  c.maxTokPerRank = req.maxTokPerRank;
+  c.numExpertPerRank = req.numExpertPerRank;
+  c.numExpertPerToken = req.numExpertPerToken;
+  c.maxRecv = req.maxRecv;
+  c.dtype = req.dtype;
+  c.useWeights = req.useWeights;
+  // Combine never carries scales: it moves post-expert tokens, which are already
+  // in the combine dtype. Only dispatch gets the row.
+  c.scaleBytes = (kind == EpKernelKind::Dispatch) ? req.scaleBytes : 0;
+
+  c.waveSize = mori::jit::v2::WaveSizeForArch(arch);
+
+  // Defaults for the bare C++ caller only -- the Python path uses the tuning
+  // table (hip_tuning_configs) and never sees these. Split by kernel because
+  // dispatch is copy-bound and wants warps while combine's reduction saturates
+  // sooner; 64x8 measured best for combine at every token count and topk on
+  // mi355x, so it replaces v1's 80x4.
+  const bool isDispatch = kind == EpKernelKind::Dispatch;
+  c.blockNum = 64;
+  c.warpPerBlock = isDispatch ? 16 : 8;
+
+  if (req.blockNum > 0) c.blockNum = req.blockNum;
+  if (req.warpPerBlock > 0) c.warpPerBlock = req.warpPerBlock;
+
+  // Overrides. The ONLY place the environment is read.
+  const char* blkVar = isDispatch ? "MORI_V2_EP_DISP_BLOCKS" : "MORI_V2_EP_COMB_BLOCKS";
+  const char* wrpVar = isDispatch ? "MORI_V2_EP_DISP_WARPS" : "MORI_V2_EP_COMB_WARPS";
+  c.blockNum = EnvInt(blkVar, c.blockNum);
+  c.warpPerBlock = EnvInt(wrpVar, c.warpPerBlock);
+
+  // Byte8 is transport-only. Dispatch copies its payload untouched, but combine
+  // sums across sources, so a byte type there would compile and silently reduce
+  // garbage. Reject it here rather than let a Cfg like that reach hipcc.
+  if (!isDispatch && c.dtype == EpDType::Byte8) {
+    throw std::runtime_error(
+        "mori v2 ep: combine reduces its input, so it needs an arithmetic dtype; "
+        "fp8/fp4 are dispatch-transport only (pair them with a bf16/fp32 combine)");
+  }
+
+  if (!EpCfgIsValid(c)) {
+    throw std::runtime_error(
+        "mori v2 ep: inconsistent config (world=" + std::to_string(c.worldSize) +
+        " hidden=" + std::to_string(c.hiddenDim) + " topk=" + std::to_string(c.numExpertPerToken) +
+        " wave=" + std::to_string(c.waveSize) + " warps=" + std::to_string(c.warpPerBlock) +
+        " blocks=" + std::to_string(c.blockNum) +
+        "); token bytes must be 16 B aligned, topk must fit in a wavefront, "
+        "worldSize must fit in one block (worldSize <= warpPerBlock * waveSize)");
+  }
+  return c;
+}
+
+std::string EpRequestSchema() {
+  mori::jit::v2::SchemaBuilder sb;
+  const EpRequest def{};
+  VisitFields(def, def,
+              [&](const char* n, const auto& val, const auto&) { EpEmitSchema(sb, n, val); });
+  return sb.Str();
+}
+
+// ---------------------------------------------------------------------------
+// Source rendering. The Cfg text IS the specialisation and IS the cache key --
+// there is no other channel by which a config can reach hipcc.
+// ---------------------------------------------------------------------------
+namespace {
+
+// gfx125x -> the TDM body + its LDS geometry.
+bool EpArchIs1250() { return mori::jit::v2::GetToolchain().arch.rfind("gfx125", 0) == 0; }
+
+// The exported symbol, and the name a profile shows: which kernel, which body,
+// the transported dtype, the shape, the launch geometry. The tuning schedule
+// varies geometry per token count, so one op contributes several rows.
+std::string EpEntryName(const EpCfg& cfg, const char* kind) {
+  std::string s = "mori_ep_";
+  s += kind;
+  if (EpArchIs1250()) s += "_tdm";
+  s += '_';
+  s += EpDTypeTag(cfg.dtype);
+  s += "_ws" + std::to_string(cfg.worldSize);
+  s += "_h" + std::to_string(cfg.hiddenDim);
+  s += "_k" + std::to_string(cfg.numExpertPerToken);
+  s += '_' + std::to_string(cfg.blockNum) + 'x' + std::to_string(cfg.warpPerBlock);
+  return s;
+}
+
+// Arch routing: gfx125x renders the TDM body, every other arch the portable one.
+// The render-time arch is the same GetToolchain().arch the compile uses
+// (--offload-arch), so host and device cannot disagree, and the choice is in the
+// rendered text and therefore in the cache key.
+std::string RenderEpSource(const EpCfg& cfg, const std::string& entry, const char* portableBody,
+                           const char* gfx1250Body) {
+  const bool is1250 = EpArchIs1250();
+  const char* header = is1250 ? "src/ops/dispatch_combine_v2/ep_intranode_1250x.hpp"
+                              : "src/ops/dispatch_combine_v2/ep_intranode_kernel.hpp";
+  const char* body = is1250 ? gfx1250Body : portableBody;
+  // Scale staging is a macro rather than a Cfg read because the array is at file
+  // scope in the header, which the TU includes BEFORE kCfg exists. Emitted only
+  // when the feature is on, so a scaleBytes=0 TU is byte-identical to one built
+  // before this existed -- same text, same sha256, same cache entry.
+  std::string scaleDefs;
+  if (cfg.scaleBytes > 0) {
+    // ROWS is the per-peer stride and SLOTS the total. They must be emitted as a
+    // pair: the staging is indexed peer*ROWS + destTokId, and sizing it from one
+    // while indexing with the other is an out-of-bounds write on peer > 0.
+    // BYTES is the caller's row, STRIDE what we lay it down at: staging reads one
+    // and writes the other.
+    scaleDefs = "#define MORI_EP_SCALE_BYTES " + std::to_string(cfg.scaleBytes) +
+                "\n#define MORI_EP_SCALE_STRIDE " + std::to_string(EpScaleStride(cfg)) +
+                "\n#define MORI_EP_SCALE_ROWS " + std::to_string(EpMaxRecv(cfg)) +
+                "\n#define MORI_EP_SCALE_SLOTS " +
+                std::to_string((long long)cfg.worldSize * EpMaxRecv(cfg)) + "\n";
+  }
+  std::string worldDef = "#define MORI_EP_WORLD_SIZE " + std::to_string(cfg.worldSize) + "\n" +
+                         "#define MORI_EP_MAX_RECV " + std::to_string(EpMaxRecv(cfg)) + "\n";
+  return std::string("// mori jit v2 — generated, do not edit.\n") + worldDef + scaleDefs +
+         "#include \"" + header +
+         "\"\n"
+         "using namespace mori::ops::v2;\n"
+         "constexpr EpCfg kCfg = " +
+         Render(cfg) +
+         ";\n"
+         "using TokT = " +
+         EpDTypeName(cfg.dtype) +
+         ";\n"
+         "extern \"C\" __global__ void __launch_bounds__(EpBlockThreads(kCfg))\n" +
+         entry + "(EpArgs args) { " + body + "<kCfg, TokT>(args); }\n";
+}
+
+const std::vector<std::string>& EpSourceDeps() {
+  static const std::vector<std::string> deps{"include/mori", "src/ops/dispatch_combine_v2",
+                                             "src/cco"};
+  return deps;
+}
+
+}  // namespace
+
+std::string EpDispatchSpec::EntryName(const Cfg& cfg) { return EpEntryName(cfg, "dispatch"); }
+std::string EpCombineSpec::EntryName(const Cfg& cfg) { return EpEntryName(cfg, "combine"); }
+
+std::string EpDispatchSpec::RenderSource(const Cfg& cfg) {
+  return RenderEpSource(cfg, EntryName(cfg), "EpDispatchBody", "EpDispatch1250xBody");
+}
+
+std::string EpCombineSpec::RenderSource(const Cfg& cfg) {
+  return RenderEpSource(cfg, EntryName(cfg), "EpCombineBody", "EpCombine1250xBody");
+}
+
+const std::vector<std::string>& EpDispatchSpec::SourceDeps() { return EpSourceDeps(); }
+const std::vector<std::string>& EpCombineSpec::SourceDeps() { return EpSourceDeps(); }
+
+mori::jit::v2::LaunchGeometry EpDispatchSpec::Geometry(const Cfg& cfg) {
+  mori::jit::v2::LaunchGeometry g;
+  g.gridX = static_cast<unsigned>(cfg.blockNum);
+  g.blockX = static_cast<unsigned>(EpBlockThreads(cfg));
+  // Portable dispatch keeps everything in registers; the gfx1250 TDM dispatch
+  // stages one hidden-dim token tile per warp in dynamic LDS.
+  g.sharedBytes = EpArchIs1250() ? static_cast<unsigned>(EpDispatch1250xLdsBytes(cfg)) : 0;
+  return g;
+}
+
+mori::jit::v2::LaunchGeometry EpCombineSpec::Geometry(const Cfg& cfg) {
+  mori::jit::v2::LaunchGeometry g;
+  g.gridX = static_cast<unsigned>(cfg.blockNum);
+  g.blockX = static_cast<unsigned>(EpBlockThreads(cfg));
+  // Portable combine only needs the per-warp pointer arrays; the gfx1250 PULL/QUAD
+  // paths size their tiles against the whole LDS budget at runtime.
+  g.sharedBytes = EpArchIs1250() ? static_cast<unsigned>(EpCombine1250xLdsBudget)
+                                 : static_cast<unsigned>(EpCombineSharedBytes(cfg));
+  return g;
+}
+
+}  // namespace v2
+}  // namespace ops
+}  // namespace mori
+
+// ===========================================================================
+// Plan registration. Two kernels, one Cfg, one Request, one Args schema -- the
+// only thing that differs is which Spec and which geometry.
+// ===========================================================================
+
+#include "mori/jit/v2/plan_api.hpp"
+
+namespace {
+
+mori::ops::v2::EpCfg EpCfgFromFields(const mori::jit::v2::FieldBag& f,
+                                     mori::ops::v2::EpKernelKind kind) {
+  using namespace mori::ops::v2;
+  EpRequest req;
+  EpApplyFields(
+      req, /*prefix=*/"", [&](const std::string& n) { return f.Has(n.c_str()); },
+      [&](const std::string& n) { return f.Get(n.c_str(), 0); });
+  return MakeEpCfg(mori::jit::v2::GetToolchain().arch, req, kind);
+}
+
+mori::ops::v2::EpCfg EpDispatchFromFields(const mori::jit::v2::FieldBag& f) {
+  return EpCfgFromFields(f, mori::ops::v2::EpKernelKind::Dispatch);
+}
+mori::ops::v2::EpCfg EpCombineFromFields(const mori::jit::v2::FieldBag& f) {
+  return EpCfgFromFields(f, mori::ops::v2::EpKernelKind::Combine);
+}
+
+// No C++-side AOT: a precompiled entry only helps if it renders the Cfg a live op
+// renders, and the geometry comes from the Python tuning schedule. Warming the
+// cache means constructing the op once at build time, which needs no table here.
+int EpNoPrecompile(const std::string&) { return 0; }
+
+}  // namespace
+
+// MORI_EP_ARGS_SCHEMA is generated from MORI_EP_ARGS_FIELDS next to the struct
+// (ep_cfg.hpp), which also static_asserts that the list is in declaration order.
+MORI_JIT_DEFINE_PLAN(ep_dispatch, mori::ops::v2::EpDispatchSpec, EpDispatchFromFields,
+                     mori::ops::v2::EpRequestSchema, mori::ops::v2::Describe, EpNoPrecompile,
+                     mori::ops::v2::EpArgs, MORI_EP_ARGS_SCHEMA)
+
+MORI_JIT_DEFINE_PLAN(ep_combine, mori::ops::v2::EpCombineSpec, EpCombineFromFields,
+                     mori::ops::v2::EpRequestSchema, mori::ops::v2::Describe, EpNoPrecompile,
+                     mori::ops::v2::EpArgs, MORI_EP_ARGS_SCHEMA)

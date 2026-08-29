@@ -146,7 +146,8 @@ endif()
 # Add an $ORIGIN-relative rpath (kept alongside the build-tree rpath) so the
 # binaries still find libmori_*.so after `pip install .` copies them to
 # site-packages/mori/examples/cco/ (the libs live at site-packages/mori/).
-set_target_properties(cco_lsa_put cco_gda_put PROPERTIES BUILD_RPATH "$ORIGIN/../..")
+set_target_properties(cco_lsa_put cco_gda_put
+                      PROPERTIES BUILD_RPATH "$ORIGIN/../..;${ROCM_PATH}/lib")
 
 # --- Application examples ---
 add_executable(context application/context.cpp)

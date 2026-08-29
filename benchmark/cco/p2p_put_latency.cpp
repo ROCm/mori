@@ -22,8 +22,9 @@
 
 // CCO p2p put latency — unidirectional, PE 0 → PE 1, one op per iteration.
 //
-//   -T lsa   : single flat-VA store of the whole buffer + system fence.
-//   -T ibgda : single RDMA write + flush per iteration.
+//   -t lsa   : single flat-VA store of the whole buffer + system fence.
+//   -t sdma  : single copy-engine put + completion wait (-C quiet | signal).
+//   -t ibgda : single RDMA write + flush per iteration.
 
 #include <cstdio>
 #include <cstdlib>
