@@ -1,14 +1,36 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
 // MIT License
 #include "mori/core/transport/rdma/proxy/proxy_thread.hpp"
 
 #include <arpa/inet.h>
-#include <atomic>
 #include <hip/hip_runtime_api.h>
+#include <unistd.h>
+
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
-#include <unistd.h>
 
 #include "mori/utils/mori_log.hpp"
 
@@ -73,13 +95,12 @@ void ProxyThread::DrainCq(ProxyQpHandle& qph) {
     for (int i = 0; i < n; i++) {
       if (wc[i].status != IBV_WC_SUCCESS) {
         if (wc[i].opcode & IBV_WC_RECV) {
-          MORI_APP_ERROR("proxy: RECV CQE error status={} ({}) ibvQP={}",
-                         wc[i].status, ibv_wc_status_str(wc[i].status),
-                         qph.qp ? qph.qp->qp_num : 0);
+          MORI_APP_ERROR("proxy: RECV CQE error status={} ({}) ibvQP={}", wc[i].status,
+                         ibv_wc_status_str(wc[i].status), qph.qp ? qph.qp->qp_num : 0);
         } else {
           uint32_t slot = static_cast<uint32_t>(wc[i].wr_id) & PROXY_RING_MASK;
-          MORI_APP_ERROR("proxy: CQE error slot={} status={} ({}) wr_id={} ibvQP={}",
-                         slot, wc[i].status, ibv_wc_status_str(wc[i].status), wc[i].wr_id,
+          MORI_APP_ERROR("proxy: CQE error slot={} status={} ({}) wr_id={} ibvQP={}", slot,
+                         wc[i].status, ibv_wc_status_str(wc[i].status), wc[i].wr_id,
                          qph.qp ? qph.qp->qp_num : 0);
           ring_->cmds[slot].status = PROXY_ERROR;
           ops_completed_++;
@@ -90,9 +111,13 @@ void ProxyThread::DrainCq(ProxyQpHandle& qph) {
         uint32_t recv_idx = static_cast<uint32_t>(wc[i].wr_id);
         uint32_t imm = ntohl(wc[i].imm_data);
 
-        if (imm == PROXY_IMM_ATOMIC_REPLY && recv_idx < qph.recv_count && qph.recv_buf && wc[i].byte_len >= 16) {
+        if (imm == PROXY_IMM_ATOMIC_REPLY && recv_idx < qph.recv_count && qph.recv_buf &&
+            wc[i].byte_len >= 16) {
           // Atomic fetch reply: [old_value, slot_id]
-          struct { uint64_t old_val; uint64_t slot_id; } reply;
+          struct {
+            uint64_t old_val;
+            uint64_t slot_id;
+          } reply;
           memcpy(&reply, reinterpret_cast<char*>(qph.recv_buf) + recv_idx * 64, 16);
           uint32_t slot = static_cast<uint32_t>(reply.slot_id) & PROXY_RING_MASK;
           ring_->cmds[slot].result = reply.old_val;
@@ -101,13 +126,16 @@ void ProxyThread::DrainCq(ProxyQpHandle& qph) {
         } else if ((imm == PROXY_IMM_ATOMIC_NONFETCH || imm == PROXY_IMM_ATOMIC_FETCH) &&
                    recv_idx < qph.recv_count && qph.recv_buf && wc[i].byte_len >= 16) {
           // Atomic request: do the atomic
-          struct { uint64_t addr; uint64_t val; } payload;
+          struct {
+            uint64_t addr;
+            uint64_t val;
+          } payload;
           memcpy(&payload, reinterpret_cast<char*>(qph.recv_buf) + recv_idx * 64, 16);
-          if (payload.addr == 0 ||
-              (heap_end_ > heap_base_ &&
-               (payload.addr < heap_base_ || payload.addr + 8 > heap_end_))) {
-            MORI_APP_ERROR("proxy: RECV atomic target addr=0x{:x} outside heap [0x{:x}, 0x{:x}), recv_idx={}",
-                           payload.addr, heap_base_, heap_end_, recv_idx);
+          if (payload.addr == 0 || (heap_end_ > heap_base_ &&
+                                    (payload.addr < heap_base_ || payload.addr + 8 > heap_end_))) {
+            MORI_APP_ERROR(
+                "proxy: RECV atomic target addr=0x{:x} outside heap [0x{:x}, 0x{:x}), recv_idx={}",
+                payload.addr, heap_base_, heap_end_, recv_idx);
           } else {
             volatile uint64_t* target = reinterpret_cast<volatile uint64_t*>(payload.addr);
             uint64_t old_val = __atomic_fetch_add(target, payload.val, __ATOMIC_SEQ_CST);
@@ -115,7 +143,12 @@ void ProxyThread::DrainCq(ProxyQpHandle& qph) {
 
             // If fetch-required (PROXY_IMM_ATOMIC_FETCH), send reply with old value
             if (imm == PROXY_IMM_ATOMIC_FETCH && wc[i].byte_len >= 32) {
-              struct { uint64_t addr; uint64_t val; uint64_t reply_qp; uint64_t reply_slot; } req;
+              struct {
+                uint64_t addr;
+                uint64_t val;
+                uint64_t reply_qp;
+                uint64_t reply_slot;
+              } req;
               memcpy(&req, reinterpret_cast<char*>(qph.recv_buf) + recv_idx * 64, 32);
               // Send reply back on the same QP
               InlineBuf reply_buf;
@@ -151,12 +184,12 @@ void ProxyThread::DrainCq(ProxyQpHandle& qph) {
       }
       uint32_t slot = static_cast<uint32_t>(wc[i].wr_id) & PROXY_RING_MASK;
       if (ring_->cmds[slot].op == PROXY_ATOMIC_FETCH_ADD && qph.use_native_atomics) {
-        ring_->cmds[slot].result = *reinterpret_cast<volatile uint64_t*>(ring_->cmds[slot].src_addr);
+        ring_->cmds[slot].result =
+            *reinterpret_cast<volatile uint64_t*>(ring_->cmds[slot].src_addr);
       }
       // For fetch-required emulated atomics, don't complete here — the reply RECV will do it
       if (ring_->cmds[slot].op == PROXY_ATOMIC_FETCH_ADD &&
-          ring_->cmds[slot].flags == PROXY_FLAGS_FETCH_REQUIRED &&
-          !qph.use_native_atomics) {
+          ring_->cmds[slot].flags == PROXY_FLAGS_FETCH_REQUIRED && !qph.use_native_atomics) {
         continue;
       }
       ring_->cmds[slot].status = PROXY_COMPLETED;
@@ -166,9 +199,8 @@ void ProxyThread::DrainCq(ProxyQpHandle& qph) {
 }
 
 // Build a single ibv_send_wr from a ProxyCmd. Returns false on invalid op.
-bool ProxyThread::BuildWr(volatile ProxyCmd* cmd, ProxyQpHandle& qph,
-                          ibv_send_wr& wr, ibv_sge& sge, uint32_t slot_id,
-                          InlineBuf& ibuf) {
+bool ProxyThread::BuildWr(volatile ProxyCmd* cmd, ProxyQpHandle& qph, ibv_send_wr& wr, ibv_sge& sge,
+                          uint32_t slot_id, InlineBuf& ibuf) {
   sge.addr = cmd->src_addr;
   sge.length = cmd->length;
   sge.lkey = (qph.lkey_override != 0) ? qph.lkey_override : cmd->lkey;
@@ -186,9 +218,10 @@ bool ProxyThread::BuildWr(volatile ProxyCmd* cmd, ProxyQpHandle& qph,
       wr.wr.rdma.rkey = (qph.rkey_override != 0) ? qph.rkey_override : cmd->rkey;
       break;
     case PROXY_RDMA_WRITE_INLINE:
-      if (cmd->inline_tag != PROXY_INLINE_SCALAR_WRITE ||
-          cmd->inline_len == 0 || cmd->inline_len > PROXY_MAX_INLINE_DATA) {
-        MORI_APP_ERROR("proxy: WRITE_INLINE invalid tag={} len={}", cmd->inline_tag, cmd->inline_len);
+      if (cmd->inline_tag != PROXY_INLINE_SCALAR_WRITE || cmd->inline_len == 0 ||
+          cmd->inline_len > PROXY_MAX_INLINE_DATA) {
+        MORI_APP_ERROR("proxy: WRITE_INLINE invalid tag={} len={}", cmd->inline_tag,
+                       cmd->inline_len);
         return false;
       }
       sge.addr = reinterpret_cast<uintptr_t>(const_cast<uint8_t*>(cmd->inline_data));
@@ -273,7 +306,8 @@ void ProxyThread::MainLoop() {
         continue;
       }
 
-      if (!BuildWr(cmd, qps_[qi], wrs[batch_count], sges[batch_count], next_slot_, ibufs[batch_count])) {
+      if (!BuildWr(cmd, qps_[qi], wrs[batch_count], sges[batch_count], next_slot_,
+                   ibufs[batch_count])) {
         cmd->status = PROXY_ERROR;
         next_slot_++;
         continue;
@@ -298,7 +332,10 @@ void ProxyThread::MainLoop() {
         wrs[k].next = nullptr;
         int found = -1;
         for (int c = 0; c < num_chains; c++) {
-          if (seen_qps[c] == qi) { found = c; break; }
+          if (seen_qps[c] == qi) {
+            found = c;
+            break;
+          }
         }
         if (found >= 0) {
           wrs[chain_tail[found]].next = &wrs[k];

@@ -30,7 +30,6 @@
 #include "mori/application/transport/rdma/providers/mlx5/mlx5_prm.hpp"
 #include "mori/application/utils/check.hpp"
 #include "mori/application/utils/math.hpp"
-
 #include "mori/utils/mori_log.hpp"
 
 namespace mori {

@@ -23,7 +23,6 @@
 #include "mori/application/transport/rdma/providers/ionic/ionic.hpp"
 
 #include <hip/hip_runtime_api.h>
-
 #include <infiniband/verbs.h>
 
 #include <cctype>

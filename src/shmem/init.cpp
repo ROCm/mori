@@ -604,7 +604,8 @@ void GpuStateInit(ShmemStates* states) {
     // Determine number of NICs for per-NIC ring allocation
     int numNics = 1;
     if (states->rdmaStates && states->rdmaStates->commContext) {
-      numNics = static_cast<int>(states->rdmaStates->commContext->GetAllRdmaDeviceContexts().size());
+      numNics =
+          static_cast<int>(states->rdmaStates->commContext->GetAllRdmaDeviceContexts().size());
       if (numNics < 1) numNics = 1;
       if (numNics > core::PROXY_MAX_NICS) numNics = core::PROXY_MAX_NICS;
     }
@@ -636,8 +637,8 @@ void GpuStateInit(ShmemStates* states) {
     states->gpuStates.numProxyRings = allocated;
     states->gpuStates.numNics = numNics;
     states->gpuStates.localGpuIdx = states->gpuStates.rank % numNics;
-    MORI_SHMEM_INFO("Proxy: {} rings allocated for {} NICs, localGpuIdx={}",
-                    allocated, numNics, states->gpuStates.localGpuIdx);
+    MORI_SHMEM_INFO("Proxy: {} rings allocated for {} NICs, localGpuIdx={}", allocated, numNics,
+                    states->gpuStates.localGpuIdx);
 
     // Copy transport types to GPU — override RDMA → PROXY for inter-node peers
     int worldSize = states->bootStates->worldSize;
@@ -648,12 +649,11 @@ void GpuStateInit(ShmemStates* states) {
       if (types[i] == application::TransportType::RDMA)
         types[i] = application::TransportType::PROXY;
     }
-    HIP_RUNTIME_CHECK(
-        hipMalloc(&states->gpuStates.transportTypes,
-                  sizeof(application::TransportType) * worldSize));
-    HIP_RUNTIME_CHECK(hipMemcpy(
-        states->gpuStates.transportTypes, types.data(),
-        sizeof(application::TransportType) * worldSize, hipMemcpyHostToDevice));
+    HIP_RUNTIME_CHECK(hipMalloc(&states->gpuStates.transportTypes,
+                                sizeof(application::TransportType) * worldSize));
+    HIP_RUNTIME_CHECK(hipMemcpy(states->gpuStates.transportTypes, types.data(),
+                                sizeof(application::TransportType) * worldSize,
+                                hipMemcpyHostToDevice));
   } else {
     // Copy communication metadata to GPU
     CopyTransportTypesToGpu(states);
@@ -782,10 +782,16 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
           if (nicIdx < (int)perNicRkeys.size() && pe < (int)perNicRkeys[nicIdx].size()) {
             rkey = perNicRkeys[nicIdx][pe];
           }
-          bool nativeAtomics = (hostEndpoints[i].vendorId == application::RdmaDeviceVendorId::Mellanox);
-          nicQps[i] = {hostEndpoints[i].ibvHandle.qp, hostEndpoints[i].ibvHandle.cq, lkey, rkey,
-                       hostEndpoints[i].ibvHandle.recvBuf, hostEndpoints[i].ibvHandle.recvLkey,
-                       hostEndpoints[i].ibvHandle.recvCount, nativeAtomics};
+          bool nativeAtomics =
+              (hostEndpoints[i].vendorId == application::RdmaDeviceVendorId::Mellanox);
+          nicQps[i] = {hostEndpoints[i].ibvHandle.qp,
+                       hostEndpoints[i].ibvHandle.cq,
+                       lkey,
+                       rkey,
+                       hostEndpoints[i].ibvHandle.recvBuf,
+                       hostEndpoints[i].ibvHandle.recvLkey,
+                       hostEndpoints[i].ibvHandle.recvCount,
+                       nativeAtomics};
           nicQpCount++;
         }
       }

@@ -1,4 +1,25 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
 // MIT License
 #pragma once
 
@@ -35,8 +56,8 @@ class ProxyThread {
   ProxyThread() = default;
   ~ProxyThread();
 
-  void Init(ProxyRing* ring, std::vector<ProxyQpHandle> qps, int gpuId = 0,
-            uintptr_t heapBase = 0, uintptr_t heapEnd = 0);
+  void Init(ProxyRing* ring, std::vector<ProxyQpHandle> qps, int gpuId = 0, uintptr_t heapBase = 0,
+            uintptr_t heapEnd = 0);
   void Start();
   void Shutdown();
 
@@ -44,9 +65,8 @@ class ProxyThread {
   static void* ThreadFunc(void* arg);
   void MainLoop();
   void DrainCq(ProxyQpHandle& qph);
-  bool BuildWr(volatile ProxyCmd* cmd, ProxyQpHandle& qph,
-               ibv_send_wr& wr, ibv_sge& sge, uint32_t slot_id,
-               InlineBuf& ibuf);
+  bool BuildWr(volatile ProxyCmd* cmd, ProxyQpHandle& qph, ibv_send_wr& wr, ibv_sge& sge,
+               uint32_t slot_id, InlineBuf& ibuf);
 
   ProxyRing* ring_{nullptr};
   std::vector<ProxyQpHandle> qps_;

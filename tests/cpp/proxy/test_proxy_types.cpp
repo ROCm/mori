@@ -1,14 +1,36 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 // Level 1: Host-only unit test for proxy types
 // Tests: struct sizes, alignment, enum values, ring layout
 // No GPU, no RDMA — pure compile+run on any machine
 //
-// Build: g++ -std=c++17 -I<mori>/include -o test_proxy_types test_proxy_types.cpp && ./test_proxy_types
-
-#include "mori/core/transport/rdma/proxy/proxy_types.hpp"
+// Build: g++ -std=c++17 -I<mori>/include -o test_proxy_types test_proxy_types.cpp &&
+// ./test_proxy_types
 
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+
+#include "mori/core/transport/rdma/proxy/proxy_types.hpp"
 
 using namespace mori::core;
 
@@ -104,8 +126,7 @@ void test_ring_slot_independence() {
 
 void test_ring_size() {
   printf("  ProxyCmd size: %zu bytes\n", sizeof(ProxyCmd));
-  printf("  ProxyRing size: %zu bytes (%.1f KB)\n",
-         sizeof(ProxyRing), sizeof(ProxyRing) / 1024.0);
+  printf("  ProxyRing size: %zu bytes (%.1f KB)\n", sizeof(ProxyRing), sizeof(ProxyRing) / 1024.0);
   printf("  ring_size: PASS\n");
 }
 

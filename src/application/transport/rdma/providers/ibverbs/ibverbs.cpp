@@ -259,8 +259,9 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
     int ae = posix_memalign(&ibufAddr, 4096, ibufSize);
     assert(ae == 0 && ibufAddr);
     memset(ibufAddr, 0, ibufSize);
-    ibv_mr* ibufMr = ibv_reg_mr(pd, ibufAddr, ibufSize,
-        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+    ibv_mr* ibufMr =
+        ibv_reg_mr(pd, ibufAddr, ibufSize,
+                   IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
     assert(ibufMr);
     endpoint.atomicIbuf.addr = reinterpret_cast<uintptr_t>(ibufAddr);
     endpoint.atomicIbuf.lkey = ibufMr->lkey;
@@ -409,8 +410,8 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   int re = posix_memalign(&rbuf, 4096, kRecvBufSz);
   if (re == 0 && rbuf) {
     memset(rbuf, 0, kRecvBufSz);
-    ibv_mr* rmr = ibv_reg_mr(pd, rbuf, kRecvBufSz,
-        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    ibv_mr* rmr =
+        ibv_reg_mr(pd, rbuf, kRecvBufSz, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
     if (rmr) {
       std::lock_guard<std::mutex> lock(poolMu);
       proxyRecvInfo[local.qpn] = {rbuf, rmr->lkey, static_cast<uint32_t>(kRecvCount)};

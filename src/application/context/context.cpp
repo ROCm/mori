@@ -293,8 +293,8 @@ void Context::InitializeTopologyAndTransports() {
   assert(rankInNode < 8);
 
   // Init rdma context — proxy uses vendor-agnostic IBVerbs, IBGDA uses DirectVerbs
-  rdmaContext.reset(new RdmaContext(proxyEnabled ? RdmaBackendType::IBVerbs
-                                                 : RdmaBackendType::DirectVerbs));
+  rdmaContext.reset(
+      new RdmaContext(proxyEnabled ? RdmaBackendType::IBVerbs : RdmaBackendType::DirectVerbs));
   const RdmaDeviceList& devices = rdmaContext->GetRdmaDeviceList();
   ActiveDevicePortList activeDevicePortList = GetActiveDevicePortList(devices);
 

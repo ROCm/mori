@@ -1,23 +1,45 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 // Level 2: CPU-only test for proxy thread
 // Tests: proxy thread picks up commands and posts via ibv_post_send
 // Uses loopback RDMA (same node, self-connected QP)
 // Requires: RDMA device available (ionic or mlx5)
 //
-// Build: g++ -std=c++17 -O2 -I<mori>/include -I<mori> -o test_proxy_thread \
+// Build: g++ -std=c++17 -O2 -I<mori>/include -I<mori> -o test_proxy_thread
 //          test_proxy_thread.cpp proxy_thread.cpp -libverbs -lpthread
 // Run:   ./test_proxy_thread -d <rdma_device> -g <gid_index>
 
-#include "mori/core/transport/rdma/proxy/proxy_types.hpp"
-#include "mori/core/transport/rdma/proxy/proxy_thread.hpp"
-
-#include <infiniband/verbs.h>
 #include <arpa/inet.h>
+#include <infiniband/verbs.h>
 #include <unistd.h>
+
 #include <cassert>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <chrono>
+
+#include "mori/core/transport/rdma/proxy/proxy_thread.hpp"
+#include "mori/core/transport/rdma/proxy/proxy_types.hpp"
 
 using namespace mori::core;
 
@@ -39,41 +61,67 @@ static TestCtx setup_loopback(const char* dev_name, int gid_idx) {
   for (int i = 0; i < nd; i++) {
     if (!strcmp(dl[i]->name, dev_name)) d = dl[i];
   }
-  if (!d) { fprintf(stderr, "Device %s not found\n", dev_name); exit(1); }
+  if (!d) {
+    fprintf(stderr, "Device %s not found\n", dev_name);
+    exit(1);
+  }
 
   t.ctx = ibv_open_device(d);
   t.pd = ibv_alloc_pd(t.ctx);
   t.cq = ibv_create_cq(t.ctx, 256, nullptr, nullptr, 0);
 
   ibv_qp_init_attr qa{};
-  qa.send_cq = t.cq; qa.recv_cq = t.cq; qa.qp_type = IBV_QPT_RC;
+  qa.send_cq = t.cq;
+  qa.recv_cq = t.cq;
+  qa.qp_type = IBV_QPT_RC;
   qa.cap = {128, 128, 1, 1, 0};
   t.qp = ibv_create_qp(t.pd, &qa);
 
   t.buf_size = 64 * 1024;
   t.buf = calloc(1, t.buf_size);
   t.mr = ibv_reg_mr(t.pd, t.buf, t.buf_size,
-      IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+                    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
 
   // Self-connect QP (loopback)
   ibv_gid gid;
   ibv_query_gid(t.ctx, 1, gid_idx, &gid);
 
-  { ibv_qp_attr a{}; a.qp_state = IBV_QPS_INIT; a.port_num = 1;
+  {
+    ibv_qp_attr a{};
+    a.qp_state = IBV_QPS_INIT;
+    a.port_num = 1;
     a.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_LOCAL_WRITE;
-    ibv_modify_qp(t.qp, &a, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS); }
+    ibv_modify_qp(t.qp, &a, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+  }
 
-  { ibv_qp_attr a{}; a.qp_state = IBV_QPS_RTR; a.path_mtu = IBV_MTU_4096;
-    a.dest_qp_num = t.qp->qp_num; a.max_dest_rd_atomic = 1; a.min_rnr_timer = 12;
-    memcpy(&a.ah_attr.grh.dgid, &gid, 16); a.ah_attr.grh.sgid_index = gid_idx;
-    a.ah_attr.grh.hop_limit = 1; a.ah_attr.is_global = 1; a.ah_attr.port_num = 1;
-    ibv_modify_qp(t.qp, &a, IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
-        IBV_QP_RQ_PSN | IBV_QP_AV | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER); }
+  {
+    ibv_qp_attr a{};
+    a.qp_state = IBV_QPS_RTR;
+    a.path_mtu = IBV_MTU_4096;
+    a.dest_qp_num = t.qp->qp_num;
+    a.max_dest_rd_atomic = 1;
+    a.min_rnr_timer = 12;
+    memcpy(&a.ah_attr.grh.dgid, &gid, 16);
+    a.ah_attr.grh.sgid_index = gid_idx;
+    a.ah_attr.grh.hop_limit = 1;
+    a.ah_attr.is_global = 1;
+    a.ah_attr.port_num = 1;
+    ibv_modify_qp(t.qp, &a,
+                  IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN | IBV_QP_AV |
+                      IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
+  }
 
-  { ibv_qp_attr a{}; a.qp_state = IBV_QPS_RTS; a.timeout = 14; a.retry_cnt = 7;
-    a.rnr_retry = 7; a.max_rd_atomic = 1;
-    ibv_modify_qp(t.qp, &a, IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT |
-        IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_MAX_QP_RD_ATOMIC); }
+  {
+    ibv_qp_attr a{};
+    a.qp_state = IBV_QPS_RTS;
+    a.timeout = 14;
+    a.retry_cnt = 7;
+    a.rnr_retry = 7;
+    a.max_rd_atomic = 1;
+    ibv_modify_qp(t.qp, &a,
+                  IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+                      IBV_QP_RNR_RETRY | IBV_QP_MAX_QP_RD_ATOMIC);
+  }
 
   ibv_free_device_list(dl);
   return t;
@@ -168,8 +216,7 @@ void test_multiple_writes(TestCtx& t) {
     bool all_done = true;
     for (int i = 0; i < num_ops; i++) {
       uint32_t slot = i & PROXY_RING_MASK;
-      if (ring.cmds[slot].status != PROXY_COMPLETED &&
-          ring.cmds[slot].status != PROXY_FREE) {
+      if (ring.cmds[slot].status != PROXY_COMPLETED && ring.cmds[slot].status != PROXY_FREE) {
         all_done = false;
         break;
       }
@@ -238,16 +285,18 @@ void test_throughput(TestCtx& t) {
 
   double ops_per_sec = num_ops / (us / 1e6);
   double bw = (double)num_ops * xfer_size / (us / 1e6) / 1e9;
-  printf("  throughput: %d ops in %.1f ms = %.0f ops/s, %.2f GB/s, %.1f us/op PASS\n",
-         num_ops, us / 1e3, ops_per_sec, bw, us / num_ops);
+  printf("  throughput: %d ops in %.1f ms = %.0f ops/s, %.2f GB/s, %.1f us/op PASS\n", num_ops,
+         us / 1e3, ops_per_sec, bw, us / num_ops);
 }
 
 int main(int argc, char** argv) {
   const char* dev = "ionic_0";
   int gid = 1;
   for (int i = 1; i < argc; i++) {
-    if (!strcmp(argv[i], "-d")) dev = argv[++i];
-    else if (!strcmp(argv[i], "-g")) gid = atoi(argv[++i]);
+    if (!strcmp(argv[i], "-d"))
+      dev = argv[++i];
+    else if (!strcmp(argv[i], "-g"))
+      gid = atoi(argv[++i]);
   }
 
   printf("=== Level 2: proxy_thread test (dev=%s gid=%d) ===\n", dev, gid);

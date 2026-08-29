@@ -1,4 +1,25 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
 // MIT License
 #pragma once
 
@@ -11,15 +32,15 @@ namespace core {
 
 // Returns sequence number (monotonically increasing). Mask with PROXY_RING_MASK for slot index.
 inline __device__ uint32_t ProxyReserveSlot(volatile ProxyRing* ring) {
-  return __hip_atomic_fetch_add(
-      (uint32_t*)&ring->gpu_head, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  return __hip_atomic_fetch_add((uint32_t*)&ring->gpu_head, 1u, __ATOMIC_RELAXED,
+                                __HIP_MEMORY_SCOPE_AGENT);
 }
 
 inline __device__ void ProxyWaitSlotFree(volatile ProxyRing* ring, uint32_t slot) {
   int spins = 0;
   while (true) {
-    uint32_t st = __hip_atomic_load(
-        (uint32_t*)&ring->cmds[slot].status, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    uint32_t st = __hip_atomic_load((uint32_t*)&ring->cmds[slot].status, __ATOMIC_RELAXED,
+                                    __HIP_MEMORY_SCOPE_SYSTEM);
     if (st == PROXY_FREE || st == PROXY_COMPLETED) break;
     if (++spins % 100000 == 0) __builtin_amdgcn_s_sleep(1);
   }
@@ -27,18 +48,16 @@ inline __device__ void ProxyWaitSlotFree(volatile ProxyRing* ring, uint32_t slot
 
 inline __device__ void ProxyWaitSlotCompleted(volatile ProxyRing* ring, uint32_t slot) {
   while (true) {
-    uint32_t st = __hip_atomic_load(
-        (uint32_t*)&ring->cmds[slot].status, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    uint32_t st = __hip_atomic_load((uint32_t*)&ring->cmds[slot].status, __ATOMIC_RELAXED,
+                                    __HIP_MEMORY_SCOPE_SYSTEM);
     if (st == PROXY_COMPLETED || st == PROXY_ERROR) break;
     __builtin_amdgcn_s_sleep(1);
   }
 }
 
-inline __device__ uint32_t ProxyPostWrite(
-    volatile ProxyRing* ring, uint32_t qp_idx,
-    uint64_t src_addr, uint32_t lkey,
-    uint64_t dst_addr, uint32_t rkey,
-    uint32_t length) {
+inline __device__ uint32_t ProxyPostWrite(volatile ProxyRing* ring, uint32_t qp_idx,
+                                          uint64_t src_addr, uint32_t lkey, uint64_t dst_addr,
+                                          uint32_t rkey, uint32_t length) {
   uint32_t seq = ProxyReserveSlot(ring);
   uint32_t slot = seq & PROXY_RING_MASK;
   ProxyWaitSlotFree(ring, slot);
@@ -57,11 +76,9 @@ inline __device__ uint32_t ProxyPostWrite(
   return seq;
 }
 
-inline __device__ uint32_t ProxyPostWriteInline(
-    volatile ProxyRing* ring, uint32_t qp_idx,
-    const void* src, uint32_t lkey,
-    uint64_t dst_addr, uint32_t rkey,
-    uint32_t length) {
+inline __device__ uint32_t ProxyPostWriteInline(volatile ProxyRing* ring, uint32_t qp_idx,
+                                                const void* src, uint32_t lkey, uint64_t dst_addr,
+                                                uint32_t rkey, uint32_t length) {
   uint32_t seq = ProxyReserveSlot(ring);
   uint32_t slot = seq & PROXY_RING_MASK;
   ProxyWaitSlotFree(ring, slot);
@@ -90,11 +107,10 @@ inline __device__ uint32_t ProxyPostWriteInline(
   return seq;
 }
 
-inline __device__ uint32_t ProxyPostAtomicNonFetch(
-    volatile ProxyRing* ring, uint32_t qp_idx,
-    uint64_t dst_addr, uint32_t rkey,
-    uint64_t add_value, uint32_t lkey,
-    uint64_t ibuf_addr) {
+inline __device__ uint32_t ProxyPostAtomicNonFetch(volatile ProxyRing* ring, uint32_t qp_idx,
+                                                   uint64_t dst_addr, uint32_t rkey,
+                                                   uint64_t add_value, uint32_t lkey,
+                                                   uint64_t ibuf_addr) {
   uint32_t seq = ProxyReserveSlot(ring);
   uint32_t slot = seq & PROXY_RING_MASK;
   ProxyWaitSlotFree(ring, slot);
@@ -117,11 +133,9 @@ inline __device__ uint32_t ProxyPostAtomicNonFetch(
 // Signal write: RDMA_WRITE of value to remote addr on the SAME NIC path
 // as the preceding data write. Used for signals paired with data
 // (ShmemPutMemNbiSignalThread) to ensure PCIe write ordering.
-inline __device__ uint32_t ProxyPostSignalWrite(
-    volatile ProxyRing* ring, uint32_t qp_idx,
-    uint64_t dst_addr, uint32_t rkey,
-    uint64_t value, uint32_t lkey,
-    uint64_t ibuf_addr) {
+inline __device__ uint32_t ProxyPostSignalWrite(volatile ProxyRing* ring, uint32_t qp_idx,
+                                                uint64_t dst_addr, uint32_t rkey, uint64_t value,
+                                                uint32_t lkey, uint64_t ibuf_addr) {
   uint32_t seq = ProxyReserveSlot(ring);
   uint32_t slot = seq & PROXY_RING_MASK;
   ProxyWaitSlotFree(ring, slot);
@@ -141,11 +155,10 @@ inline __device__ uint32_t ProxyPostSignalWrite(
   return seq;
 }
 
-inline __device__ uint64_t ProxyPostAtomicFetch(
-    volatile ProxyRing* ring, uint32_t qp_idx,
-    uint64_t dst_addr, uint32_t rkey,
-    uint64_t add_value, uint32_t lkey,
-    uint64_t ibuf_addr) {
+inline __device__ uint64_t ProxyPostAtomicFetch(volatile ProxyRing* ring, uint32_t qp_idx,
+                                                uint64_t dst_addr, uint32_t rkey,
+                                                uint64_t add_value, uint32_t lkey,
+                                                uint64_t ibuf_addr) {
   uint32_t seq = ProxyReserveSlot(ring);
   uint32_t slot = seq & PROXY_RING_MASK;
   ProxyWaitSlotFree(ring, slot);
@@ -160,7 +173,8 @@ inline __device__ uint64_t ProxyPostAtomicFetch(
   ring->cmds[slot].atomic_arg = add_value;
   ring->cmds[slot].flags = PROXY_FLAGS_FETCH_REQUIRED;
   // Store slot index in inline_data so the remote can send it back in the reply
-  *reinterpret_cast<volatile uint64_t*>(&ring->cmds[slot].inline_data[0]) = static_cast<uint64_t>(slot);
+  *reinterpret_cast<volatile uint64_t*>(&ring->cmds[slot].inline_data[0]) =
+      static_cast<uint64_t>(slot);
   ring->cmds[slot].result = 0;
 
   __threadfence_system();

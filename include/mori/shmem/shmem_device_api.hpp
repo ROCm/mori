@@ -36,17 +36,17 @@ namespace mori {
 namespace shmem {
 
 #ifdef MORI_PROXY_ENABLED
-#define _PROXY_ELSE(func, ...)                                                    \
-  else if (transportType == application::TransportType::PROXY) {                  \
-    func<application::TransportType::PROXY>(__VA_ARGS__);                         \
+#define _PROXY_ELSE(func, ...)                                   \
+  else if (transportType == application::TransportType::PROXY) { \
+    func<application::TransportType::PROXY>(__VA_ARGS__);        \
   }
-#define _PROXY_ELSE_BOOL(func, bp, ...)                                           \
-  else if (transportType == application::TransportType::PROXY) {                  \
-    func<application::TransportType::PROXY, bp>(__VA_ARGS__);                     \
+#define _PROXY_ELSE_BOOL(func, bp, ...)                          \
+  else if (transportType == application::TransportType::PROXY) { \
+    func<application::TransportType::PROXY, bp>(__VA_ARGS__);    \
   }
-#define _PROXY_ELSE_RET(func, type, ...)                                          \
-  else if (transportType == application::TransportType::PROXY) {                  \
-    return func<application::TransportType::PROXY, type>(__VA_ARGS__);            \
+#define _PROXY_ELSE_RET(func, type, ...)                               \
+  else if (transportType == application::TransportType::PROXY) {       \
+    return func<application::TransportType::PROXY, type>(__VA_ARGS__); \
   }
 #else
 #define _PROXY_ELSE(func, ...)
@@ -65,7 +65,9 @@ namespace shmem {
     func<application::TransportType::SDMA>(__VA_ARGS__);                          \
   }                                                                               \
   _PROXY_ELSE(func, __VA_ARGS__)                                                  \
-  else { assert(false); }
+  else {                                                                          \
+    assert(false);                                                                \
+  }
 
 #define DISPATCH_TRANSPORT_TYPE_WITH_BOOL(func, boolParam, pe, ...)               \
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();                           \
@@ -76,7 +78,9 @@ namespace shmem {
     func<application::TransportType::P2P, boolParam>(__VA_ARGS__);                \
   }                                                                               \
   _PROXY_ELSE_BOOL(func, boolParam, __VA_ARGS__)                                  \
-  else { assert(false); }
+  else {                                                                          \
+    assert(false);                                                                \
+  }
 
 #define DISPATCH_TRANSPORT_DATA_TYPE_WITH_RETURN(func, pe, type, ...)               \
   [&]() {                                                                           \

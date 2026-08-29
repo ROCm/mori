@@ -39,7 +39,11 @@ class IBVerbsDeviceContext : public RdmaDeviceContext {
                                uint32_t qpId = 0) override;
   bool DestroyRdmaEndpointNoThrow(const RdmaEndpoint&) noexcept override;
 
-  struct ProxyRecvInfo { void* buf; uint32_t lkey; uint32_t count; };
+  struct ProxyRecvInfo {
+    void* buf;
+    uint32_t lkey;
+    uint32_t count;
+  };
   ProxyRecvInfo GetProxyRecvInfo(uint32_t qpn) const;
 
  private:
