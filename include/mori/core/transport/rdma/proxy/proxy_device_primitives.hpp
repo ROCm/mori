@@ -107,7 +107,7 @@ inline __device__ uint32_t ProxyPostAtomicNonFetch(
   ring->cmds[slot].lkey = lkey;
   ring->cmds[slot].rkey = rkey;
   ring->cmds[slot].atomic_arg = add_value;
-  ring->cmds[slot].flags = 1;
+  ring->cmds[slot].flags = PROXY_FLAGS_DEFAULT;
 
   __threadfence_system();
   ring->cmds[slot].status = PROXY_PENDING;
@@ -158,7 +158,9 @@ inline __device__ uint64_t ProxyPostAtomicFetch(
   ring->cmds[slot].lkey = lkey;
   ring->cmds[slot].rkey = rkey;
   ring->cmds[slot].atomic_arg = add_value;
-  ring->cmds[slot].flags = 1;
+  ring->cmds[slot].flags = PROXY_FLAGS_FETCH_REQUIRED;
+  // Store slot index in inline_data so the remote can send it back in the reply
+  *reinterpret_cast<volatile uint64_t*>(&ring->cmds[slot].inline_data[0]) = static_cast<uint64_t>(slot);
   ring->cmds[slot].result = 0;
 
   __threadfence_system();

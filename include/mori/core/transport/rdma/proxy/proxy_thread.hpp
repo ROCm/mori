@@ -16,7 +16,7 @@ namespace mori {
 namespace core {
 
 struct InlineBuf {
-  uint64_t data[2];
+  uint64_t data[4];
 };
 
 struct ProxyQpHandle {

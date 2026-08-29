@@ -21,6 +21,17 @@ enum ProxyInlineTag : uint32_t {
   PROXY_INLINE_SCALAR_WRITE = 1,
 };
 
+enum ProxyImmTag : uint32_t {
+  PROXY_IMM_ATOMIC_NONFETCH = 0xA70C,
+  PROXY_IMM_ATOMIC_FETCH    = 0xA70F,
+  PROXY_IMM_ATOMIC_REPLY    = 0xA71C,
+};
+
+enum ProxyCmdFlags : uint32_t {
+  PROXY_FLAGS_DEFAULT = 0,
+  PROXY_FLAGS_FETCH_REQUIRED = 1,
+};
+
 enum ProxyCmdStatus : uint32_t {
   PROXY_FREE = 0,
   PROXY_PENDING = 1,

@@ -88,7 +88,19 @@ void ProxyThread::DrainCq(ProxyQpHandle& qph) {
       }
       if (wc[i].opcode == IBV_WC_RECV || wc[i].opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
         uint32_t recv_idx = static_cast<uint32_t>(wc[i].wr_id);
-        if (recv_idx < qph.recv_count && qph.recv_buf && wc[i].byte_len >= 16) {
+        uint32_t imm = ntohl(wc[i].imm_data);
+
+        if (imm == PROXY_IMM_ATOMIC_REPLY && recv_idx < qph.recv_count && qph.recv_buf && wc[i].byte_len >= 16) {
+          // Atomic fetch reply: [old_value, slot_id]
+          struct { uint64_t old_val; uint64_t slot_id; } reply;
+          memcpy(&reply, reinterpret_cast<char*>(qph.recv_buf) + recv_idx * 64, 16);
+          uint32_t slot = static_cast<uint32_t>(reply.slot_id) & PROXY_RING_MASK;
+          ring_->cmds[slot].result = reply.old_val;
+          ring_->cmds[slot].status = PROXY_COMPLETED;
+          ops_completed_++;
+        } else if ((imm == PROXY_IMM_ATOMIC_NONFETCH || imm == PROXY_IMM_ATOMIC_FETCH) &&
+                   recv_idx < qph.recv_count && qph.recv_buf && wc[i].byte_len >= 16) {
+          // Atomic request: do the atomic
           struct { uint64_t addr; uint64_t val; } payload;
           memcpy(&payload, reinterpret_cast<char*>(qph.recv_buf) + recv_idx * 64, 16);
           if (payload.addr == 0 ||
@@ -96,11 +108,35 @@ void ProxyThread::DrainCq(ProxyQpHandle& qph) {
                (payload.addr < heap_base_ || payload.addr + 8 > heap_end_))) {
             MORI_APP_ERROR("proxy: RECV atomic target addr=0x{:x} outside heap [0x{:x}, 0x{:x}), recv_idx={}",
                            payload.addr, heap_base_, heap_end_, recv_idx);
-            continue;
+          } else {
+            volatile uint64_t* target = reinterpret_cast<volatile uint64_t*>(payload.addr);
+            uint64_t old_val = __atomic_fetch_add(target, payload.val, __ATOMIC_SEQ_CST);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+
+            // If fetch-required (PROXY_IMM_ATOMIC_FETCH), send reply with old value
+            if (imm == PROXY_IMM_ATOMIC_FETCH && wc[i].byte_len >= 32) {
+              struct { uint64_t addr; uint64_t val; uint64_t reply_qp; uint64_t reply_slot; } req;
+              memcpy(&req, reinterpret_cast<char*>(qph.recv_buf) + recv_idx * 64, 32);
+              // Send reply back on the same QP
+              InlineBuf reply_buf;
+              reply_buf.data[0] = old_val;
+              reply_buf.data[1] = req.reply_slot;
+              ibv_sge rsge{};
+              rsge.addr = reinterpret_cast<uintptr_t>(&reply_buf.data[0]);
+              rsge.length = 16;
+              ibv_send_wr rwr{}, *rbad = nullptr;
+              rwr.opcode = IBV_WR_SEND_WITH_IMM;
+              rwr.imm_data = htonl(PROXY_IMM_ATOMIC_REPLY);
+              rwr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
+              rwr.sg_list = &rsge;
+              rwr.num_sge = 1;
+              ibv_post_send(qph.qp, &rwr, &rbad);
+            }
           }
-          volatile uint64_t* target = reinterpret_cast<volatile uint64_t*>(payload.addr);
-          __atomic_fetch_add(target, payload.val, __ATOMIC_SEQ_CST);
-          std::atomic_thread_fence(std::memory_order_seq_cst);
+        }
+
+        // Re-post recv WR
+        if (recv_idx < qph.recv_count && qph.recv_buf) {
           ibv_sge rsge{};
           rsge.addr = reinterpret_cast<uintptr_t>(qph.recv_buf) + recv_idx * 64;
           rsge.length = 64;
@@ -116,6 +152,12 @@ void ProxyThread::DrainCq(ProxyQpHandle& qph) {
       uint32_t slot = static_cast<uint32_t>(wc[i].wr_id) & PROXY_RING_MASK;
       if (ring_->cmds[slot].op == PROXY_ATOMIC_FETCH_ADD && qph.use_native_atomics) {
         ring_->cmds[slot].result = *reinterpret_cast<volatile uint64_t*>(ring_->cmds[slot].src_addr);
+      }
+      // For fetch-required emulated atomics, don't complete here — the reply RECV will do it
+      if (ring_->cmds[slot].op == PROXY_ATOMIC_FETCH_ADD &&
+          ring_->cmds[slot].flags == PROXY_FLAGS_FETCH_REQUIRED &&
+          !qph.use_native_atomics) {
+        continue;
       }
       ring_->cmds[slot].status = PROXY_COMPLETED;
       ops_completed_++;
@@ -180,11 +222,21 @@ bool ProxyThread::BuildWr(volatile ProxyCmd* cmd, ProxyQpHandle& qph,
       } else {
         ibuf.data[0] = cmd->dst_addr;
         ibuf.data[1] = cmd->atomic_arg;
-        sge.addr = reinterpret_cast<uintptr_t>(&ibuf.data[0]);
-        sge.length = 16;
-        wr.opcode = IBV_WR_SEND_WITH_IMM;
-        wr.imm_data = htonl(0xA70C);
-        wr.send_flags |= IBV_SEND_INLINE;
+        if (cmd->flags == PROXY_FLAGS_FETCH_REQUIRED) {
+          ibuf.data[2] = cmd->qp_idx;
+          ibuf.data[3] = *reinterpret_cast<volatile uint64_t*>(&cmd->inline_data[0]);
+          sge.addr = reinterpret_cast<uintptr_t>(&ibuf.data[0]);
+          sge.length = 32;
+          wr.opcode = IBV_WR_SEND_WITH_IMM;
+          wr.imm_data = htonl(PROXY_IMM_ATOMIC_FETCH);
+          wr.send_flags |= IBV_SEND_INLINE;
+        } else {
+          sge.addr = reinterpret_cast<uintptr_t>(&ibuf.data[0]);
+          sge.length = 16;
+          wr.opcode = IBV_WR_SEND_WITH_IMM;
+          wr.imm_data = htonl(PROXY_IMM_ATOMIC_NONFETCH);
+          wr.send_flags |= IBV_SEND_INLINE;
+        }
       }
       break;
     }
