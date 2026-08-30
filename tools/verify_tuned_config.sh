@@ -291,7 +291,7 @@ launch_peer() {
 cleanup_peer() {
     kill "$PEER_PID" 2>/dev/null || true
     wait "$PEER_PID" 2>/dev/null || true
-    local KILL_CMD='pkill -9 -f torchrun; pkill -9 -f test_dispatch_combine_internode; pkill -9 -f "multiprocessing.spawn"'
+    local KILL_CMD='pkill -9 -f "[t]orchrun"; pkill -9 -f "[t]est_dispatch_combine_internode"; pkill -9 -f "[m]ultiprocessing.spawn"'
     if [[ -n "$DOCKER" ]]; then
         ssh "${SSH_OPTS[@]}" "$PEER_HOST" \
             "$DOCKER_EXEC $DOCKER bash -c '$KILL_CMD'" 2>/dev/null || true
@@ -302,7 +302,7 @@ cleanup_peer() {
 
 # ---- Pre-run: kill residual processes ----
 echo "Cleaning up residual processes..."
-KILL_ALL='pkill -9 -f torchrun; pkill -9 -f test_dispatch_combine_internode; pkill -9 -f "multiprocessing.spawn"'
+KILL_ALL='pkill -9 -f "[t]orchrun"; pkill -9 -f "[t]est_dispatch_combine_internode"; pkill -9 -f "[m]ultiprocessing.spawn"'
 kill_local "$KILL_ALL"
 if [[ -n "$DOCKER" ]]; then
     ssh "${SSH_OPTS[@]}" "$PEER_HOST" \
@@ -382,7 +382,7 @@ for HIDDEN_DIM in "${HIDDEN_DIM_ARRAY[@]}"; do
         # Always cleanup both ranks. `timeout` kills the local `docker exec`
         # client, not the torchrun it started inside the container, so rank 0
         # needs an explicit kill too or a hung combo poisons the next one.
-        kill_local 'pkill -9 -f torchrun; pkill -9 -f test_dispatch_combine_internode; pkill -9 -f "multiprocessing.spawn"'
+        kill_local 'pkill -9 -f "[t]orchrun"; pkill -9 -f "[t]est_dispatch_combine_internode"; pkill -9 -f "[m]ultiprocessing.spawn"'
         cleanup_peer
         sleep 2
     done
