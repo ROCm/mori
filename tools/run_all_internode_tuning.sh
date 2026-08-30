@@ -38,6 +38,11 @@ HIDDEN_DIMS="7168"
 TOKENS_LIST="64,128,256,512,1024,2048,4096"
 TIMEOUT_LARGE=7200
 CONFIG_OUTPUT="auto"
+LOCAL_DOCKER=""
+RDMA_SL=""
+RDMA_TC=""
+MASTER_PORT=""
+GPU_PER_NODE=""
 
 # ---- Parse args (pass-through to batch_internode_tuning.sh) ----
 while [[ $# -gt 0 ]]; do
@@ -53,6 +58,11 @@ while [[ $# -gt 0 ]]; do
         --tokens-list)   TOKENS_LIST="$2";   shift 2 ;;
         --timeout)       TIMEOUT_LARGE="$2"; shift 2 ;;
         --config-output) CONFIG_OUTPUT="$2"; shift 2 ;;
+        --local-docker)  LOCAL_DOCKER="$2";  shift 2 ;;
+        --rdma-sl)       RDMA_SL="$2";       shift 2 ;;
+        --rdma-tc)       RDMA_TC="$2";       shift 2 ;;
+        --master-port)   MASTER_PORT="$2";   shift 2 ;;
+        --gpu-per-node)  GPU_PER_NODE="$2";  shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -70,8 +80,13 @@ COMMON_ARGS=(
     --hidden-dims "$HIDDEN_DIMS"
     --config-output "$CONFIG_OUTPUT"
 )
-[[ -n "$DOCKER" ]]  && COMMON_ARGS+=(--docker "$DOCKER")
-[[ -n "$SSH_KEY" ]] && COMMON_ARGS+=(--ssh-key "$SSH_KEY")
+[[ -n "$DOCKER" ]]       && COMMON_ARGS+=(--docker "$DOCKER")
+[[ -n "$LOCAL_DOCKER" ]] && COMMON_ARGS+=(--local-docker "$LOCAL_DOCKER")
+[[ -n "$SSH_KEY" ]]      && COMMON_ARGS+=(--ssh-key "$SSH_KEY")
+[[ -n "$RDMA_SL" ]]      && COMMON_ARGS+=(--rdma-sl "$RDMA_SL")
+[[ -n "$RDMA_TC" ]]      && COMMON_ARGS+=(--rdma-tc "$RDMA_TC")
+[[ -n "$MASTER_PORT" ]]  && COMMON_ARGS+=(--master-port "$MASTER_PORT")
+[[ -n "$GPU_PER_NODE" ]] && COMMON_ARGS+=(--gpu-per-node "$GPU_PER_NODE")
 
 # Auto-detect FP8 dtype: OCP (fp8_e4m3) vs FNUZ (fp8_e4m3_fnuz)
 FP8_DTYPE=$(python3 -c "
@@ -171,3 +186,10 @@ echo "# Total: $TOTAL_COMBOS combos"
 echo "# Failed: $TOTAL_FAILED"
 echo "# Results: $RESULT_LOG"
 echo "################################################################"
+
+# Propagate failure. This script ran every combo and then exited 0 regardless,
+# so a caller (or CI) could not tell a clean matrix from one where all six
+# groups died -- which is now easy to hit, since batch_internode_tuning.sh
+# rejects --tuning-scope quick together with a config output in under a second.
+[[ $TOTAL_FAILED -gt 0 ]] && exit 1
+exit 0
