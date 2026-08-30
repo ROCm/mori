@@ -36,7 +36,17 @@ set -euo pipefail
 #       --combine-dtype bf16 --quant-type none \
 #       --tokens-list "4,8,16" --hidden-dims "6144"
 #
-#   # With docker (remote node runs inside a container)
+#   # With docker on both nodes, driver staying on the host. --local-docker
+#   # reaches rank 0's container with `docker exec` the same way --docker
+#   # reaches the peer's, so SSH runs from the host and its keys never have to
+#   # be copied into a container.
+#   bash tools/verify_tuned_config.sh \
+#       --master-addr <HOST0> --peer-host <USER>@<HOST1> --ifname <IFNAME> \
+#       --local-docker <CONTAINER0> --docker <CONTAINER1> \
+#       --kernel-type v1_ll --num-qp 2 --tokens-list "4,8,16" --hidden-dims "6144"
+#
+#   # Driver already running inside a container (omit --local-docker); the
+#   # container then needs its own SSH access to the peer.
 #   bash tools/verify_tuned_config.sh \
 #       --master-addr <HOST0> --peer-host <USER>@<HOST1> --ifname <IFNAME> \
 #       --docker <CONTAINER> --ssh-key <SSH_KEY_PATH> \
@@ -61,6 +71,7 @@ PEER_HOST=""
 IFNAME=""
 REMOTE_REPO_ROOT=""
 DOCKER=""
+LOCAL_DOCKER=""
 SSH_KEY=""
 RDMA_SL=""
 KERNEL_TYPE="v1"
@@ -82,6 +93,7 @@ while [[ $# -gt 0 ]]; do
         --ifname)            IFNAME="$2";            shift 2 ;;
         --remote-repo-root)  REMOTE_REPO_ROOT="$2";  shift 2 ;;
         --docker)            DOCKER="$2";            shift 2 ;;
+        --local-docker)      LOCAL_DOCKER="$2";      shift 2 ;;
         --ssh-key)            SSH_KEY="$2";          shift 2 ;;
         --rdma-sl)            RDMA_SL="$2";           shift 2 ;;
         --kernel-type)        KERNEL_TYPE="$2";       shift 2 ;;
@@ -128,7 +140,8 @@ echo "============================================================"
 echo "  master_addr:         $MASTER_ADDR"
 echo "  peer_host:           $PEER_HOST"
 echo "  ifname:              $IFNAME"
-echo "  docker:              ${DOCKER:-<none, direct execution>}"
+echo "  docker (peer):       ${DOCKER:-<none, direct execution>}"
+echo "  docker (local):      ${LOCAL_DOCKER:-<none, direct execution>}"
 echo "  ssh_key:             ${SSH_KEY:-<default>}"
 echo "  rdma_sl:             ${RDMA_SL:-<not set>}"
 echo "  kernel_type:         $KERNEL_TYPE"
@@ -185,6 +198,44 @@ else
 fi
 echo "SSH OK"
 echo ""
+
+# ---- Resolve how rank 0 is launched ----
+#
+# --local-docker exists so the driver itself can stay on the host while mori
+# lives in a container: rank 0 is then reached with `docker exec` locally, the
+# same way the peer is reached remotely. Without it the driver has to run
+# inside the container, which means the container needs SSH access to the peer
+# -- i.e. a private key has to be placed inside a container purely so the
+# script can reach the other node. Running on the host instead uses the SSH
+# credentials that are already there and keeps them out of the container.
+LOCAL_DOCKER_EXEC=""
+if [[ -n "$LOCAL_DOCKER" ]]; then
+    for candidate in "docker exec" "sudo -n docker exec"; do
+        if $candidate "$LOCAL_DOCKER" bash -c 'echo ok' &>/dev/null; then
+            LOCAL_DOCKER_EXEC="$candidate"
+            break
+        fi
+    done
+    if [[ -z "$LOCAL_DOCKER_EXEC" ]]; then
+        echo "Error: cannot exec into local container '$LOCAL_DOCKER'."
+        echo "       Tried 'docker exec' and 'sudo -n docker exec'. Check that"
+        echo "       the container is running and this user is in the docker"
+        echo "       group (or has sudo rights)."
+        exit 1
+    fi
+    echo "Local rank runs in container '$LOCAL_DOCKER' via: $LOCAL_DOCKER_EXEC"
+    echo ""
+fi
+
+# Run a cleanup command where rank 0 lives, so a timed-out `docker exec` does
+# not leave the torchrun processes running inside the container.
+kill_local() {
+    if [[ -n "$LOCAL_DOCKER" ]]; then
+        $LOCAL_DOCKER_EXEC "$LOCAL_DOCKER" bash -c "$1" 2>/dev/null || true
+    else
+        eval "$1" 2>/dev/null || true
+    fi
+}
 
 # ---- Build common python args (shared by both ranks) ----
 build_py_args() {
@@ -252,7 +303,7 @@ cleanup_peer() {
 # ---- Pre-run: kill residual processes ----
 echo "Cleaning up residual processes..."
 KILL_ALL='pkill -9 -f torchrun; pkill -9 -f test_dispatch_combine_internode; pkill -9 -f "multiprocessing.spawn"'
-eval "$KILL_ALL" 2>/dev/null || true
+kill_local "$KILL_ALL"
 if [[ -n "$DOCKER" ]]; then
     ssh "${SSH_OPTS[@]}" "$PEER_HOST" \
         "$DOCKER_EXEC $DOCKER bash -c '$KILL_ALL'" 2>/dev/null || true
@@ -289,7 +340,14 @@ for HIDDEN_DIM in "${HIDDEN_DIM_ARRAY[@]}"; do
         # Launch local (rank 0) with timeout, capture output to grep for errors
         COMBO_LOG="$(mktemp)"
         set +e
-        timeout "$TIMEOUT_SEC" bash -c "$CMD_RANK0" 2>&1 | tee "$COMBO_LOG" | tee -a "$LOG_FILE"
+        # Unquoted $LOCAL_DOCKER_EXEC on purpose: it is "docker exec" or
+        # "sudo -n docker exec" and has to split into separate words.
+        if [[ -n "$LOCAL_DOCKER" ]]; then
+            LOCAL_RUN=($LOCAL_DOCKER_EXEC -w "$REPO_ROOT" "$LOCAL_DOCKER" bash -c "$CMD_RANK0")
+        else
+            LOCAL_RUN=(bash -c "$CMD_RANK0")
+        fi
+        timeout "$TIMEOUT_SEC" "${LOCAL_RUN[@]}" 2>&1 | tee "$COMBO_LOG" | tee -a "$LOG_FILE"
         EXIT_CODE=${PIPESTATUS[0]}
         set -e
 
@@ -321,7 +379,10 @@ for HIDDEN_DIM in "${HIDDEN_DIM_ARRAY[@]}"; do
             echo "[$(date)] Verified correct [$COMBO_IDX/$TOTAL_COMBOS]"
         fi
 
-        # Always cleanup peer
+        # Always cleanup both ranks. `timeout` kills the local `docker exec`
+        # client, not the torchrun it started inside the container, so rank 0
+        # needs an explicit kill too or a hung combo poisons the next one.
+        kill_local 'pkill -9 -f torchrun; pkill -9 -f test_dispatch_combine_internode; pkill -9 -f "multiprocessing.spawn"'
         cleanup_peer
         sleep 2
     done
