@@ -2161,6 +2161,31 @@ if __name__ == "__main__":
         args_cli.combine_warp_per_block, args_cli.warp_per_block
     )
 
+    # Only --cmd bench forwards these; test/test_sentinel/sweep build their own
+    # ops and let the op resolve the geometry. Silently ignoring nine flags is
+    # how a "control run" ends up measuring the default config while its author
+    # believes otherwise, so say it.
+    if args_cli.cmd != "bench" and any(
+        v is not None
+        for v in (
+            args_cli.block_num,
+            args_cli.warp_per_block,
+            args_cli.rdma_block_num,
+            args_cli.dispatch_block_num,
+            args_cli.dispatch_warp_per_block,
+            args_cli.dispatch_rdma_block_num,
+            args_cli.combine_block_num,
+            args_cli.combine_warp_per_block,
+            args_cli.combine_rdma_block_num,
+        )
+    ):
+        print(
+            f"Warning: block/warp/rdma launch overrides are ignored when "
+            f"--cmd {args_cli.cmd}; only --cmd bench applies them. To pin a "
+            f"geometry elsewhere, use MORI_EP_LAUNCH_CONFIG_MODE=AUTO with a "
+            f"tuning config."
+        )
+
     world_size = num_node * gpu_per_node
     torch.multiprocessing.spawn(
         test_dispatch_combine,
