@@ -689,18 +689,30 @@ bash tools/batch_internode_tuning.sh \
     --tokens-list "128,4096" --tuning-scope full
 ```
 
-**Step 2: Quick sweep**
+**Step 2: Sweep**
 
 ```bash
 # Single group
 bash tools/batch_internode_tuning.sh \
     --master-addr <HOST0> --peer-host <USER>@<HOST1> --ifname <IFNAME> \
     --kernel-type v1 --num-qp 2 --dtype fp4 --combine-dtype bf16 \
-    --quant-type fp8_direct_cast --tuning-scope quick
+    --quant-type fp8_direct_cast
 
 # All 6 groups at once
 bash tools/run_all_internode_tuning.sh \
     --master-addr <HOST0> --peer-host <USER>@<HOST1> --ifname <IFNAME>
+```
+
+Both default to `--tuning-scope full`. `quick` sweeps a reduced candidate
+grid — 3 `warp_per_block` values against full's 5, plus a narrower
+`rdma_block_num` set — so its winner is not a result worth committing, and
+combining it with a config output is rejected rather than silently accepted.
+Use it for exploration only, with saving turned off:
+
+```bash
+bash tools/run_all_internode_tuning.sh \
+    --master-addr <HOST0> --peer-host <USER>@<HOST1> --ifname <IFNAME> \
+    --tuning-scope quick --config-output ''
 ```
 
 For docker environments, add `--docker <CONTAINER> --ssh-key <KEY>`.

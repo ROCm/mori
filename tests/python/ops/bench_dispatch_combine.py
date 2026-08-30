@@ -1227,6 +1227,17 @@ def _bench_dispatch_combine(
             sm_count = torch.cuda.get_device_properties(rank).multi_processor_count
             tuning_scope = os.environ.get("MORI_TUNING_SCOPE", "full")
 
+            if save_tuning_config and tuning_scope == "quick":
+                raise ValueError(
+                    "MORI_TUNING_SCOPE=quick cannot be combined with "
+                    "--save-tuning-config: quick sweeps 3 warp_per_block "
+                    "candidates against full's 9, and only powers of two for "
+                    "block_num against full's step-8 grid over the same "
+                    "range, so a quick-scope winner is not a result worth "
+                    "committing as a saved config. Re-run with "
+                    "MORI_TUNING_SCOPE unset (or =full) to save."
+                )
+
             if tuning_scope == "quick":
                 block_set = set()
                 pow2 = 32

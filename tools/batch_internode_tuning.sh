@@ -15,23 +15,29 @@ set -euo pipefail
 #
 # Usage examples:
 #
-#   # Quick test (single config, quick scope)
+#   # Single shape
 #   bash tools/batch_internode_tuning.sh \
 #       --master-addr <HOST0> --peer-host <USER>@<HOST1> --ifname <IFNAME> \
-#       --kernel-type v1 --num-qp 2 --tokens-list "128" --tuning-scope quick
+#       --kernel-type v1 --num-qp 2 --tokens-list "128"
 #
 #   # With docker (remote node runs inside a container)
 #   bash tools/batch_internode_tuning.sh \
 #       --master-addr <HOST0> --peer-host <USER>@<HOST1> --ifname <IFNAME> \
 #       --docker <CONTAINER> --ssh-key <SSH_KEY_PATH> \
 #       --kernel-type v1 --num-qp 2 --dtype fp4 --combine-dtype bf16 \
-#       --quant-type fp8_direct_cast --tuning-scope quick
+#       --quant-type fp8_direct_cast
 #
-#   # Full tuning: v1_ll, fp8→bf16
+#   # v1_ll, fp8→bf16
 #   bash tools/batch_internode_tuning.sh \
 #       --master-addr <HOST0> --peer-host <USER>@<HOST1> --ifname <IFNAME> \
 #       --kernel-type v1_ll --num-qp 2 --dtype fp8_e4m3_fnuz --combine-dtype bf16 \
-#       --quant-type none --tuning-scope quick
+#       --quant-type none
+#
+#   # Exploratory quick sweep -- reduced candidate grid, cannot be saved, so
+#   # saving has to be turned off explicitly
+#   bash tools/batch_internode_tuning.sh \
+#       --master-addr <HOST0> --peer-host <USER>@<HOST1> --ifname <IFNAME> \
+#       --kernel-type v1 --num-qp 2 --tuning-scope quick --config-output ''
 # ============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -94,6 +100,19 @@ for var in MASTER_ADDR PEER_HOST IFNAME; do
 done
 
 [[ -z "$REMOTE_REPO_ROOT" ]] && REMOTE_REPO_ROOT="$REPO_ROOT"
+
+# Saving requires the full sweep. The tuning script itself refuses this
+# combination, but it does so per combo after both ranks are up; catching it
+# here fails in a second instead of after a two-node launch, and says which of
+# the two knobs to change.
+if [[ "$TUNING_SCOPE" == "quick" && -n "$CONFIG_OUTPUT" ]]; then
+    echo "Error: --tuning-scope quick cannot write a tuning config."
+    echo "       quick sweeps a reduced candidate grid, so its winner is not"
+    echo "       a result worth committing. Either run the full sweep"
+    echo "       (--tuning-scope full) or explore without saving"
+    echo "       (--config-output '')."
+    exit 1
+fi
 
 # ---- SSH options ----
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10)
@@ -231,7 +250,7 @@ launch_peer() {
 cleanup_peer() {
     kill "$PEER_PID" 2>/dev/null || true
     wait "$PEER_PID" 2>/dev/null || true
-    local KILL_CMD='pkill -9 -f torchrun; pkill -9 -f test_dispatch_combine_internode; pkill -9 -f "multiprocessing.spawn"'
+    local KILL_CMD='pkill -9 -f "[t]orchrun"; pkill -9 -f "[t]est_dispatch_combine_internode"; pkill -9 -f "[m]ultiprocessing.spawn"'
     if [[ -n "$DOCKER" ]]; then
         ssh "${SSH_OPTS[@]}" "$PEER_HOST" \
             "$DOCKER_EXEC $DOCKER bash -c '$KILL_CMD'" 2>/dev/null || true
@@ -242,7 +261,7 @@ cleanup_peer() {
 
 # ---- Pre-run: kill residual processes ----
 echo "Cleaning up residual processes..."
-KILL_ALL='pkill -9 -f torchrun; pkill -9 -f test_dispatch_combine_internode; pkill -9 -f "multiprocessing.spawn"'
+KILL_ALL='pkill -9 -f "[t]orchrun"; pkill -9 -f "[t]est_dispatch_combine_internode"; pkill -9 -f "[m]ultiprocessing.spawn"'
 eval "$KILL_ALL" 2>/dev/null || true
 if [[ -n "$DOCKER" ]]; then
     ssh "${SSH_OPTS[@]}" "$PEER_HOST" \

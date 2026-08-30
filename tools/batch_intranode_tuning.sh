@@ -94,6 +94,18 @@ fi
 
 export MORI_TUNING_SCOPE="$TUNING_SCOPE"
 
+# Saving requires the full sweep. bench_dispatch_combine.py refuses this
+# combination too, but only once the ranks are up; catching it here fails
+# immediately and names the two knobs that resolve it.
+if [[ "$TUNING_SCOPE" == "quick" && -n "$CONFIG_OUTPUT" ]]; then
+    echo "Error: --tuning-scope quick cannot write a tuning config."
+    echo "       quick sweeps a reduced candidate grid, so its winner is not"
+    echo "       a result worth committing. Either run the full sweep"
+    echo "       (--tuning-scope full) or explore without saving"
+    echo "       (--config-output '')."
+    exit 1
+fi
+
 # ---- Convert comma-separated lists to arrays ----
 IFS=',' read -ra TOKEN_ARRAY <<< "$TOKENS_LIST"
 IFS=',' read -ra HIDDEN_DIM_ARRAY <<< "$HIDDEN_DIMS"
@@ -137,8 +149,13 @@ PY_COMMON_ARGS=(
     --dtype "$DTYPE"
     --zero-copy "$ZERO_COPY"
     --quant-type "$QUANT_TYPE"
-    --save-tuning-config "$CONFIG_OUTPUT"
 )
+
+# Omit the flag entirely when empty, matching batch_internode_tuning.sh, so
+# --config-output '' means "do not save" rather than passing an empty path.
+if [[ -n "$CONFIG_OUTPUT" ]]; then
+    PY_COMMON_ARGS+=(--save-tuning-config "$CONFIG_OUTPUT")
+fi
 
 if [[ -n "$COMBINE_DTYPE" ]]; then
     PY_COMMON_ARGS+=(--combine-dtype "$COMBINE_DTYPE")
