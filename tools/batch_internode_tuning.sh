@@ -103,7 +103,13 @@ done
 
 # ---- Validate required args ----
 for var in MASTER_ADDR PEER_HOST IFNAME; do
-    [[ -z "${!var}" ]] && { echo "Error: --${var,,} is required"; exit 1; }
+    if [[ -z "${!var}" ]]; then
+        # ${var,,} lowercases but leaves the underscores, which would name a
+        # flag that does not exist (--master_addr for --master-addr).
+        flag="--${var,,}"
+        echo "Error: ${flag//_/-} is required"
+        exit 1
+    fi
 done
 
 [[ -z "$REMOTE_REPO_ROOT" ]] && REMOTE_REPO_ROOT="$REPO_ROOT"
@@ -297,7 +303,7 @@ launch_peer() {
 cleanup_peer() {
     kill "$PEER_PID" 2>/dev/null || true
     wait "$PEER_PID" 2>/dev/null || true
-    local KILL_CMD='pkill -9 -f "[t]orchrun"; pkill -9 -f "[t]est_dispatch_combine_internode"; pkill -9 -f "[m]ultiprocessing.spawn"'
+    local KILL_CMD='pkill -9 -f "[t]orchrun.*test_dispatch_combine_internode"; pkill -9 -f "[t]est_dispatch_combine_internode"'
     if [[ -n "$DOCKER" ]]; then
         ssh "${SSH_OPTS[@]}" "$PEER_HOST" \
             "$DOCKER_EXEC $DOCKER bash -c '$KILL_CMD'" 2>/dev/null || true
@@ -308,7 +314,7 @@ cleanup_peer() {
 
 # ---- Pre-run: kill residual processes ----
 echo "Cleaning up residual processes..."
-KILL_ALL='pkill -9 -f "[t]orchrun"; pkill -9 -f "[t]est_dispatch_combine_internode"; pkill -9 -f "[m]ultiprocessing.spawn"'
+KILL_ALL='pkill -9 -f "[t]orchrun.*test_dispatch_combine_internode"; pkill -9 -f "[t]est_dispatch_combine_internode"'
 kill_local "$KILL_ALL"
 if [[ -n "$DOCKER" ]]; then
     ssh "${SSH_OPTS[@]}" "$PEER_HOST" \
@@ -372,7 +378,7 @@ for HIDDEN_DIM in "${HIDDEN_DIM_ARRAY[@]}"; do
         fi
 
         # Always cleanup peer
-        kill_local 'pkill -9 -f "[t]orchrun"; pkill -9 -f "[t]est_dispatch_combine_internode"; pkill -9 -f "[m]ultiprocessing.spawn"'
+        kill_local 'pkill -9 -f "[t]orchrun.*test_dispatch_combine_internode"; pkill -9 -f "[t]est_dispatch_combine_internode"'
         cleanup_peer
         sleep 2
     done

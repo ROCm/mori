@@ -68,7 +68,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 for var in MASTER_ADDR PEER_HOST IFNAME; do
-    [[ -z "${!var}" ]] && { echo "Error: --${var,,} is required"; exit 1; }
+    if [[ -z "${!var}" ]]; then
+        # ${var,,} lowercases but leaves the underscores, which would name a
+        # flag that does not exist (--master_addr for --master-addr).
+        flag="--${var,,}"
+        echo "Error: ${flag//_/-} is required"
+        exit 1
+    fi
 done
 
 COMMON_ARGS=(
