@@ -74,7 +74,13 @@ inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs<T>& args, in
 
   T* remoteTokenPtr = args.interNodeV1TokBufs.dispatchOut->template GetAs<T*>(destPe);
   const T* localTokenPtr = args.inpTokenBuf;
-  core::WarpCopy(remoteTokenPtr + destTokOffset, localTokenPtr + srcTokOffset, hiddenDim);
+  // Unroll 4. The destination is a peer GPU's uncached symmetric buffer, so each
+  // store crosses xGMI and the cost is latency, not bandwidth: with the default
+  // Unroll=1 a warp keeps a single 16B-per-lane store in flight and the 6KB
+  // payload takes ~9.5us, i.e. 0.6 GB/s. Four in flight brings it to ~7.1us.
+  // Same reason the recv path (WarpCopy<uint8_t, 4>) and the combine gather
+  // (WarpAccumLF) unroll.
+  core::WarpCopy<T, 4>(remoteTokenPtr + destTokOffset, localTokenPtr + srcTokOffset, hiddenDim);
 
   index_t* remoteIndexPtr = args.shmemOutIndicesMemObj->template GetAs<index_t*>(destPe);
   const index_t* localIndexPtr = args.tokenIndices;
