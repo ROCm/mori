@@ -22,6 +22,13 @@ set -euo pipefail
 # itself far slower for a question the sweep doesn't need answered while
 # picking a fastest config).
 #
+# --timeout is PER COMBO and defaults to 600s, which suits small shapes only:
+# each combo runs 500 rounds and run_test_once compares output with per-token
+# Python loops, so cost grows with max_tokens (measured: ~40s for 500 rounds at
+# 4 tokens). The default --tokens-list reaches 4096 and needs far more; a run
+# that is merely slow is reported as "possible kernel hang", so raise --timeout
+# rather than trusting that message.
+#
 # Prerequisites: same as batch_internode_tuning.sh (passwordless SSH to the
 # peer node, matching repo path or --remote-repo-root, --ifname reachable on
 # both nodes). Intended to run right after batch_internode_tuning.sh writes a
@@ -468,7 +475,10 @@ for HIDDEN_DIM in "${HIDDEN_DIM_ARRAY[@]}"; do
             FAILED=$((FAILED + 1))
             HUNG_COMBOS="${HUNG_COMBOS}\n  hidden_dim=$HIDDEN_DIM, max_tokens=$TOKENS"
             echo ""
-            echo "!!! TIMEOUT (${TIMEOUT_SEC}s): hidden_dim=$HIDDEN_DIM, max_tokens=$TOKENS — possible kernel hang !!!"
+            echo "!!! TIMEOUT (${TIMEOUT_SEC}s): hidden_dim=$HIDDEN_DIM, max_tokens=$TOKENS !!!"
+            echo "!!! Either a kernel hang, or just too little time: 500 rounds at this"
+            echo "!!! token count may legitimately need more than ${TIMEOUT_SEC}s. Re-run"
+            echo "!!! this shape with a larger --timeout before calling it a hang."
             echo ""
         elif [[ $EXIT_CODE -ne 0 ]]; then
             FAILED=$((FAILED + 1))
