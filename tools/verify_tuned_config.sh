@@ -52,9 +52,11 @@ set -euo pipefail
 #       --docker <CONTAINER> --ssh-key <SSH_KEY_PATH> \
 #       --kernel-type v1_ll --num-qp 2 --tokens-list "4,8,16" --hidden-dims "6144"
 #
-# Exit status: non-zero if any shape reports a nonzero "error times" on any
-# rank, or times out, or crashes -- the same signal batch_internode_tuning.sh
-# uses for its own per-combo failures.
+# Exit status: non-zero if any shape crashes, times out, or reports a rank
+# error -- the same signal batch_internode_tuning.sh uses for its own per-combo
+# failures. A geometry that produces wrong output shows up as a crash: the
+# comparisons in run_test_once are bare `assert`s, so a mismatch raises rather
+# than being counted.
 # ============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -74,6 +76,7 @@ DOCKER=""
 LOCAL_DOCKER=""
 SSH_KEY=""
 RDMA_SL=""
+RDMA_TC=""
 KERNEL_TYPE="v1"
 NUM_QP=1
 TOKENS_LIST="64,128,256,512,1024,2048,4096"
@@ -96,6 +99,7 @@ while [[ $# -gt 0 ]]; do
         --local-docker)      LOCAL_DOCKER="$2";      shift 2 ;;
         --ssh-key)            SSH_KEY="$2";          shift 2 ;;
         --rdma-sl)            RDMA_SL="$2";           shift 2 ;;
+        --rdma-tc)            RDMA_TC="$2";           shift 2 ;;
         --kernel-type)        KERNEL_TYPE="$2";       shift 2 ;;
         --num-qp)             NUM_QP="$2";            shift 2 ;;
         --tokens-list)        TOKENS_LIST="$2";       shift 2 ;;
@@ -144,6 +148,7 @@ echo "  docker (peer):       ${DOCKER:-<none, direct execution>}"
 echo "  docker (local):      ${LOCAL_DOCKER:-<none, direct execution>}"
 echo "  ssh_key:             ${SSH_KEY:-<default>}"
 echo "  rdma_sl:             ${RDMA_SL:-<not set>}"
+echo "  rdma_tc:             ${RDMA_TC:-<not set>}"
 echo "  kernel_type:         $KERNEL_TYPE"
 echo "  num_qp:              $NUM_QP"
 echo "  gpu_per_node:        $GPU_PER_NODE"
@@ -162,7 +167,9 @@ echo "============================================================"
 echo ""
 echo "Each combo reads block_num/warp_per_block/rdma_block_num from"
 echo "python/mori/ops/tuning_configs/*.json via MORI_EP_LAUNCH_CONFIG_MODE=AUTO"
-echo "-- this verifies whatever is currently on disk, not a fixed geometry."
+echo "-- the preflight below reports which phases actually have a matching"
+echo "rule; a phase without one runs on the built-in geometry and is NOT"
+echo "verified by this run."
 echo ""
 
 # ---- Verify SSH connectivity ----
@@ -268,6 +275,7 @@ build_torchrun_cmd() {
     ENV_VARS+=" MORI_EP_LAUNCH_CONFIG_MODE=AUTO"
     ENV_VARS+=" OMP_NUM_THREADS=4"
     [[ -n "$RDMA_SL" ]] && ENV_VARS+=" MORI_RDMA_SL=$RDMA_SL"
+    [[ -n "$RDMA_TC" ]] && ENV_VARS+=" MORI_RDMA_TC=$RDMA_TC"
 
     echo "cd $THE_REPO_ROOT && $ENV_VARS" \
          "torchrun --nnodes=2 --node_rank=$NODE_RANK --nproc_per_node=1" \
@@ -314,6 +322,83 @@ sleep 2
 echo "Cleanup done"
 echo ""
 
+# ---- Preflight: is there anything on disk for these shapes to verify? ----
+#
+# AUTO mode fails open. If the JSON for this gpu/kernel/ep is missing,
+# unparseable, or simply has no rule matching the dtype the op queries with,
+# dispatch_combine.py falls back to its built-in geometry, logs at DEBUG (this
+# library's logger sits at WARNING), and the run passes -- so without this
+# check the script would report "Verified correct" having verified nothing.
+#
+# Only a necessary condition is checked -- that rules exist for the queried
+# dtype -- rather than replaying lookup()'s full ceiling/topk matching, so this
+# cannot drift out of step with it and silently start passing.
+PREFLIGHT_PY="$LOG_DIR/.verify_preflight.py"
+cat > "$PREFLIGHT_PY" <<'PYEOF'
+import sys
+from mori.ops.tuning_config import (
+    TuningConfigManager, kernel_type_to_config_str, detect_gpu_model,
+)
+from mori.jit.config import detect_gpu_arch
+import mori
+
+kt_arg, ep_size, disp_dtype = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+kt = {
+    "v0": mori.ops.EpDispatchCombineKernelType.IntraNode,
+    "v1": mori.ops.EpDispatchCombineKernelType.InterNodeV1,
+    "v1_ll": mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
+    "async_ll": mori.ops.EpDispatchCombineKernelType.AsyncLL,
+}[kt_arg]
+kt_str = kernel_type_to_config_str(kt)
+arch, model = detect_gpu_arch(), detect_gpu_model()
+mgr = TuningConfigManager.get_instance(arch, kt_str, ep_size, model)
+print("  config file:     %s_%s_%s_ep%d" % (arch, model, kt_str, ep_size))
+ok = True
+for phase, rules in (("dispatch", mgr.dispatch_rules), ("combine", mgr.combine_rules)):
+    rules = rules or []
+    dtypes = sorted({r["dtype"] for r in rules})
+    hit = disp_dtype in dtypes
+    print("  %-8s rules:  %d (dtypes: %s) queried with %s -> %s"
+          % (phase, len(rules), ",".join(dtypes) or "-", disp_dtype,
+             "MATCH" if hit else "NO MATCH"))
+    if not hit:
+        ok = False
+        print("  !! %s has no rule for the queried dtype: it will run on the "
+              "built-in" % phase)
+        print("     geometry, so this run does NOT verify its saved config.")
+        if phase == "combine":
+            print("     Known cause: combine rules are saved under the COMBINE "
+                  "dtype, but")
+            print("     get_launch_config() looks both phases up with "
+                  "config.data_type.")
+sys.exit(0 if ok else 3)
+PYEOF
+
+echo "Resolving which saved rules this run will actually use ..."
+set +e
+if [[ -n "$LOCAL_DOCKER" ]]; then
+    $LOCAL_DOCKER_EXEC -w "$REPO_ROOT" "$LOCAL_DOCKER" \
+        python3 "$PREFLIGHT_PY" "$KERNEL_TYPE" "$((GPU_PER_NODE * 2))" "$DTYPE"
+else
+    python3 "$PREFLIGHT_PY" "$KERNEL_TYPE" "$((GPU_PER_NODE * 2))" "$DTYPE"
+fi
+PREFLIGHT_RC=$?
+set -e
+rm -f "$PREFLIGHT_PY"
+
+if [[ $PREFLIGHT_RC -eq 3 ]]; then
+    PREFLIGHT_INCOMPLETE=1
+    echo ""
+    echo "WARNING: at least one phase will not be verified (see above)."
+elif [[ $PREFLIGHT_RC -ne 0 ]]; then
+    echo "Error: could not resolve the tuning config (exit $PREFLIGHT_RC)."
+    echo "       Refusing to report a verification that would prove nothing."
+    exit 1
+else
+    PREFLIGHT_INCOMPLETE=0
+fi
+echo ""
+
 COMBO_IDX=0
 FAILED=0
 FAILED_COMBOS=""
@@ -351,8 +436,17 @@ for HIDDEN_DIM in "${HIDDEN_DIM_ARRAY[@]}"; do
         EXIT_CODE=${PIPESTATUS[0]}
         set -e
 
-        # test_dispatch_combine() prints one "error times:  N" line per rank;
-        # any nonzero N is a real dispatch/combine output mismatch, not noise.
+        # A wrong result surfaces as a NON-ZERO EXIT, not as a count: every
+        # comparison in run_test_once is a bare `assert`, so the first mismatch
+        # raises and torchrun propagates the failure. The branch below is the
+        # one that catches an incorrect config.
+        #
+        # The "error times: N" line each rank prints is NOT that signal and
+        # cannot currently fire: its counter, error_round, is passed into
+        # run_test_once but never added to anywhere in the file, so N is always
+        # 0. Grepping it anyway costs nothing and starts working if that
+        # counter is ever populated upstream -- but it must not be mistaken for
+        # the correctness check, which is the exit code.
         BAD_RANKS=$(grep -cE "error times: +[1-9]" "$COMBO_LOG" || true)
         rm -f "$COMBO_LOG"
 
@@ -400,6 +494,17 @@ if [[ -n "$HUNG_COMBOS" ]]; then
     echo -e "  Hung:$HUNG_COMBOS"
 fi
 echo "  Log:      $LOG_FILE"
+if [[ "$PREFLIGHT_INCOMPLETE" -eq 1 ]]; then
+    echo ""
+    echo "  NOTE: not every phase was covered -- see the preflight warning at"
+    echo "        the top of this run. A phase with no matching rule ran on the"
+    echo "        built-in geometry, so a pass says nothing about its saved"
+    echo "        config."
+fi
+echo "  Scope:    ranks 0-$((GPU_PER_NODE - 1)) only. The peer node's output is"
+echo "            not captured and its exit status is not collected, so a"
+echo "            peer-side failure surfaces here only as a hang or as rank 0"
+echo "            failing in a collective."
 echo "============================================================"
 
 [[ $FAILED -gt 0 ]] && exit 1
