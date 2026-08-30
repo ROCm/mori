@@ -2161,29 +2161,43 @@ if __name__ == "__main__":
         args_cli.combine_warp_per_block, args_cli.warp_per_block
     )
 
+    _launch_overrides = {
+        "--block-num": args_cli.block_num,
+        "--warp-per-block": args_cli.warp_per_block,
+        "--rdma-block-num": args_cli.rdma_block_num,
+        "--dispatch-block-num": args_cli.dispatch_block_num,
+        "--dispatch-warp-per-block": args_cli.dispatch_warp_per_block,
+        "--dispatch-rdma-block-num": args_cli.dispatch_rdma_block_num,
+        "--combine-block-num": args_cli.combine_block_num,
+        "--combine-warp-per-block": args_cli.combine_warp_per_block,
+        "--combine-rdma-block-num": args_cli.combine_rdma_block_num,
+    }
+    _given = sorted(k for k, v in _launch_overrides.items() if v is not None)
+
+    # AUTO never consults these. A tuning-config hit wins outright, and on a
+    # miss EpDispatchCombineOp's auto_block_num / auto_warp_per_block -- a
+    # per-kernel constant -- still takes precedence over the argument, so the
+    # override is discarded either way. Measured at 8 tokens / hidden 6144 /
+    # v1_ll: under AUTO, `32/4/8` and `256/16/128` both give ~65us, while under
+    # MANUAL the same two give 57.9us and 88.8us. Refusing beats letting someone
+    # conclude a geometry made no difference when it was never applied.
+    if os.environ.get("MORI_EP_LAUNCH_CONFIG_MODE", "MANUAL") == "AUTO" and _given:
+        parser.error(
+            f"MORI_EP_LAUNCH_CONFIG_MODE=AUTO ignores launch overrides, but "
+            f"{', '.join(_given)} were given. AUTO takes the geometry from "
+            f"python/mori/ops/tuning_configs/*.json (falling back to a built-in "
+            f"per-kernel default), so these would have no effect. Drop them, or "
+            f"unset MORI_EP_LAUNCH_CONFIG_MODE to apply them."
+        )
+
     # Only --cmd bench forwards these; test/test_sentinel/sweep build their own
     # ops and let the op resolve the geometry. Silently ignoring nine flags is
     # how a "control run" ends up measuring the default config while its author
     # believes otherwise, so say it.
-    if args_cli.cmd != "bench" and any(
-        v is not None
-        for v in (
-            args_cli.block_num,
-            args_cli.warp_per_block,
-            args_cli.rdma_block_num,
-            args_cli.dispatch_block_num,
-            args_cli.dispatch_warp_per_block,
-            args_cli.dispatch_rdma_block_num,
-            args_cli.combine_block_num,
-            args_cli.combine_warp_per_block,
-            args_cli.combine_rdma_block_num,
-        )
-    ):
+    if args_cli.cmd != "bench" and _given:
         print(
-            f"Warning: block/warp/rdma launch overrides are ignored when "
-            f"--cmd {args_cli.cmd}; only --cmd bench applies them. To pin a "
-            f"geometry elsewhere, use MORI_EP_LAUNCH_CONFIG_MODE=AUTO with a "
-            f"tuning config."
+            f"Warning: {', '.join(_given)} are ignored when --cmd "
+            f"{args_cli.cmd}; only --cmd bench applies them."
         )
 
     world_size = num_node * gpu_per_node

@@ -1778,6 +1778,30 @@ if __name__ == "__main__":
         base_hidden_dim // 2 if _is_fp4x2_dtype(dispatch_dtype) else base_hidden_dim
     )
 
+    # AUTO never consults these: a tuning-config hit wins outright, and on a
+    # miss EpDispatchCombineOp's auto_block_num / auto_warp_per_block -- a
+    # per-kernel constant -- still takes precedence over the argument. Refusing
+    # beats letting someone conclude a geometry made no difference when it was
+    # never applied. Same check as the inter-node benchmark
+    # (examples/ops/dispatch_combine/test_dispatch_combine_internode.py).
+    _launch_overrides = {
+        "--block-num": args.block_num,
+        "--warp-per-block": args.warp_per_block,
+        "--dispatch-block-num": args.dispatch_block_num,
+        "--dispatch-warp-per-block": args.dispatch_warp_per_block,
+        "--combine-block-num": args.combine_block_num,
+        "--combine-warp-per-block": args.combine_warp_per_block,
+    }
+    _given = sorted(k for k, v in _launch_overrides.items() if v is not None)
+    if os.environ.get("MORI_EP_LAUNCH_CONFIG_MODE", "MANUAL") == "AUTO" and _given:
+        parser.error(
+            f"MORI_EP_LAUNCH_CONFIG_MODE=AUTO ignores launch overrides, but "
+            f"{', '.join(_given)} were given. AUTO takes the geometry from "
+            f"python/mori/ops/tuning_configs/*.json (falling back to a built-in "
+            f"per-kernel default), so these would have no effect. Drop them, or "
+            f"unset MORI_EP_LAUNCH_CONFIG_MODE to apply them."
+        )
+
     # Per-phase flag wins over the shared one; None means let the op decide.
     def _phase_param(per_phase, shared):
         return per_phase if per_phase is not None else shared
