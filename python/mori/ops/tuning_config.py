@@ -327,25 +327,55 @@ def _rule_geometry(rule: dict) -> str:
     )
 
 
+def _is_number(value) -> bool:
+    """True for a value a percentage can be computed from.
+
+    Rules are read back from JSON that a person may have edited, so a field can
+    hold a string or null. bool is excluded because ``True`` would otherwise
+    pass as 1.0.
+    """
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def _format_delta(
-    old: float | None, new: float | None, unit: str, comparable: bool = True
+    old: float | None,
+    new: float | None,
+    unit: str,
+    comparable: bool = True,
+    lower_is_better: bool = False,
 ) -> str:
     """`old -> new (+x.x%)`, or a bare value when there is nothing to compare.
 
     ``comparable=False`` still shows both numbers but drops the percentage:
     a percentage between two differently-defined quantities reads as a
     performance change when it is only a change of definition.
+
+    ``lower_is_better`` labels the percentage rather than flipping its sign.
+    Latency and bandwidth are printed on adjacent lines in the same format, so
+    an unlabelled "+30.0%" reads as an improvement on both -- while for latency
+    it is a 30% regression. Since latency is what the inter-node tuner now
+    selects on, that is the line a reviewer reads to judge a run.
     """
     if new is None:
-        return "n/a"
-    if not old:
+        # Still show what is being replaced: dropping it here would make a
+        # replacement of a known value indistinguishable from a fresh rule.
+        return "n/a" if not _is_number(old) else f"{old:.2f} -> n/a"
+    if not _is_number(old):
+        # Only "no comparable old value" -- distinct from old == 0.0, which is
+        # a real reading the writers do emit (_stats_avg returns 0.0 when the
+        # stats dict is empty) and which must not be silently dropped.
         return f"{new:.2f}{unit}"
     if not comparable:
         return (
             f"{old:.2f} -> {new:.2f}{unit} "
             f"(old value used a different metric, not comparable)"
         )
+    if old == 0:
+        return f"{old:.2f} -> {new:.2f}{unit} (old value was 0, no ratio)"
     pct = (new - old) / old * 100.0
+    if lower_is_better and pct != 0.0:
+        label = "worse" if pct > 0 else "better"
+        return f"{old:.2f} -> {new:.2f}{unit} ({pct:+.1f}%, {label})"
     return f"{old:.2f} -> {new:.2f}{unit} ({pct:+.1f}%)"
 
 
@@ -385,7 +415,7 @@ def _report_rule_change(phase: str, merge_key, old_rule: dict, new_rule: dict) -
         f"[mori-tuning] REPLACED {phase} rule {merge_key}\n"
         f"               config:  {geo}\n"
         f"               latency: "
-        f"{_format_delta(_rule_latency(old_rule), _rule_latency(new_rule), 'us')}\n"
+        f"{_format_delta(_rule_latency(old_rule), _rule_latency(new_rule), 'us', lower_is_better=True)}\n"
         f"               bw:      "
         f"{_format_delta(old_rule.get('bandwidth_gbps'), new_rule.get('bandwidth_gbps'), ' GB/s', bw_comparable)}",
         flush=True,
