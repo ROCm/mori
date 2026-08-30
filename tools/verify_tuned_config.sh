@@ -355,7 +355,12 @@ from mori.ops.tuning_config import (
 from mori.jit.config import detect_gpu_arch
 import mori
 
-kt_arg, ep_size, disp_dtype = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+kt_arg, ep_size = sys.argv[1], int(sys.argv[2])
+# Each phase is looked up with the dtype of ITS OWN input tensor: the call
+# sites pass dtype=input.dtype to _resolve_launch_params, and combine's input
+# has already been converted to the combine dtype. Checking combine against the
+# dispatch dtype would report a mismatch that the runtime does not have.
+queried = {"dispatch": sys.argv[3], "combine": sys.argv[4] or sys.argv[3]}
 kt = {
     "v0": mori.ops.EpDispatchCombineKernelType.IntraNode,
     "v1": mori.ops.EpDispatchCombineKernelType.InterNodeV1,
@@ -370,20 +375,17 @@ ok = True
 for phase, rules in (("dispatch", mgr.dispatch_rules), ("combine", mgr.combine_rules)):
     rules = rules or []
     dtypes = sorted({r["dtype"] for r in rules})
-    hit = disp_dtype in dtypes
+    dt = queried[phase]
+    hit = dt in dtypes
     print("  %-8s rules:  %d (dtypes: %s) queried with %s -> %s"
-          % (phase, len(rules), ",".join(dtypes) or "-", disp_dtype,
+          % (phase, len(rules), ",".join(dtypes) or "-", dt,
              "MATCH" if hit else "NO MATCH"))
     if not hit:
         ok = False
-        print("  !! %s has no rule for the queried dtype: it will run on the "
-              "built-in" % phase)
-        print("     geometry, so this run does NOT verify its saved config.")
-        if phase == "combine":
-            print("     Known cause: combine rules are saved under the COMBINE "
-                  "dtype, but")
-            print("     get_launch_config() looks both phases up with "
-                  "config.data_type.")
+        print("  !! %s has no rule for the dtype it is looked up with, so it "
+              "will run" % phase)
+        print("     on the built-in geometry and this run does NOT verify its "
+              "saved config.")
 sys.exit(0 if ok else 3)
 PYEOF
 
@@ -391,9 +393,9 @@ echo "Resolving which saved rules this run will actually use ..."
 set +e
 if [[ -n "$LOCAL_DOCKER" ]]; then
     $LOCAL_DOCKER_EXEC -w "$REPO_ROOT" "$LOCAL_DOCKER" \
-        python3 "$PREFLIGHT_PY" "$KERNEL_TYPE" "$((GPU_PER_NODE * 2))" "$DTYPE"
+        python3 "$PREFLIGHT_PY" "$KERNEL_TYPE" "$((GPU_PER_NODE * 2))" "$DTYPE" "$COMBINE_DTYPE"
 else
-    python3 "$PREFLIGHT_PY" "$KERNEL_TYPE" "$((GPU_PER_NODE * 2))" "$DTYPE"
+    python3 "$PREFLIGHT_PY" "$KERNEL_TYPE" "$((GPU_PER_NODE * 2))" "$DTYPE" "$COMBINE_DTYPE"
 fi
 PREFLIGHT_RC=$?
 set -e

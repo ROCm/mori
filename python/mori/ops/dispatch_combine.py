@@ -1007,6 +1007,19 @@ class EpDispatchCombineOp:
     def get_launch_config(
         self, is_dispatch=True, block_num=-1, rdma_block_num=-1, warp_per_block=-1
     ):
+        """Resolve saved launch params. Not the path dispatch()/combine() take.
+
+        Those call _resolve_launch_params with ``dtype=input.dtype``, i.e. each
+        phase is looked up with the dtype of its own input tensor. This method
+        has no such argument and uses ``config.data_type`` for both, which is
+        the *dispatch* dtype (and is itself deprecated -- the kernel infers the
+        real dtype from the input tensor). So for a combine rule saved under a
+        different combine dtype, this returns None where the runtime matches.
+
+        Nothing in the repository calls this; it is kept as public API. A
+        caller that wants the combine geometry for a mixed-dtype config should
+        look the rule up directly with the combine dtype.
+        """
         rules = self._dispatch_rules if is_dispatch else self._combine_rules
         if rules:
             from mori.ops.tuning_config import TuningConfigManager
