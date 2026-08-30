@@ -1194,19 +1194,25 @@ torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">
 <span class="w">      </span><span class="nt">"rdma_block_num"</span><span class="p">:</span><span class="w"> </span><span class="mi">32</span><span class="p">,</span>
 <span class="w">      </span><span class="nt">"warp_per_block"</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span>
 <span class="w">      </span><span class="nt">"bandwidth_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">4.13</span><span class="p">,</span>
-<span class="w">      </span><span class="nt">"rdma_bandwidth_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">4.13</span><span class="p">,</span>
-<span class="w">      </span><span class="nt">"xgmi_bandwidth_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">13.2</span><span class="p">,</span>
-<span class="w">      </span><span class="nt">"ll_bandwidth_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">16.5</span>
+<span class="w">      </span><span class="nt">"avg_rdma_bandwidth_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">4.13</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"avg_xgmi_bandwidth_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">13.2</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"avg_ll_bandwidth_gbps"</span><span class="p">:</span><span class="w"> </span><span class="mf">16.5</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"avg_latency_us"</span><span class="p">:</span><span class="w"> </span><span class="mf">128.4</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">"bandwidth_metric"</span><span class="p">:</span><span class="w"> </span><span class="s2">"grand_mean"</span>
 <span class="w">    </span><span class="p">}</span>
 <span class="w">  </span><span class="p">]</span>
 <span class="p">}</span>
 </pre></div>
 </div>
 <ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">bandwidth_gbps</span></code> — The primary metric used for keep-best comparison (RDMA BW for v1, LL BW for v1_ll/async_ll).</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">rdma_bandwidth_gbps</span></code> / <code class="docutils literal notranslate"><span class="pre">xgmi_bandwidth_gbps</span></code> / <code class="docutils literal notranslate"><span class="pre">ll_bandwidth_gbps</span></code> — All three BW types recorded for analysis (inter-node only).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">bandwidth_gbps</span></code> — The bandwidth that matters for this kernel (RDMA BW for v1, LL BW for v1_ll/async_ll), recorded for readers. Nothing reads it at runtime: only <code class="docutils literal notranslate"><span class="pre">block_num</span></code> / <code class="docutils literal notranslate"><span class="pre">rdma_block_num</span></code> / <code class="docutils literal notranslate"><span class="pre">warp_per_block</span></code> are.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">avg_rdma_bandwidth_gbps</span></code> / <code class="docutils literal notranslate"><span class="pre">avg_xgmi_bandwidth_gbps</span></code> / <code class="docutils literal notranslate"><span class="pre">avg_ll_bandwidth_gbps</span></code> — All three BW types recorded for analysis (inter-node only).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">avg_latency_us</span></code> — Grand-mean latency, the quantity the inter-node tuner selects on. The intra-node tuner writes this as <code class="docutils literal notranslate"><span class="pre">latency_us</span></code>.</p></li>
 </ul>
-<p>New tuning results merge into existing files using a keep-best strategy: a rule is only updated if the new bandwidth exceeds the existing one.</p>
+<p>New tuning results replace the matching rule unconditionally, printing the old and new config and their latency/bandwidth delta. Two tuning runs come from different hosts, ROCm versions and machine load, so no numeric rule can reliably decide whether a new result is worth keeping — the JSON’s git diff is where that call gets made. Re-run tuning if a printed delta looks wrong.</p>
+<blockquote>
+<div><p>Inter-node <code class="docutils literal notranslate"><span class="pre">bandwidth_gbps</span></code> is the grand mean across ranks and rounds, matching the “Average” row of the table <code class="docutils literal notranslate"><span class="pre">--cmd</span> <span class="pre">bench</span></code> prints, so a saved rule can be checked against a bench run directly. Rules carry <code class="docutils literal notranslate"><span class="pre">bandwidth_metric</span></code> recording this; rules written before it existed hold the slowest-rank mean and have no such field, and a re-tune that replaces one prints both bandwidths without a percentage rather than comparing across the two definitions.</p>
+</div></blockquote>
 </section>
 <section id="intra-node-tuning">
 <h3>Intra-node Tuning<a class="headerlink" href="#intra-node-tuning" title="Link to this heading"></a></h3>
@@ -1353,19 +1359,52 @@ bash<span class="w"> </span>tools/run_all_intranode_tuning.sh<span class="w"> </
 <span class="w">    </span>--tokens-list<span class="w"> </span><span class="s2">"128,4096"</span><span class="w"> </span>--tuning-scope<span class="w"> </span>full
 </pre></div>
 </div>
-<p><strong>Step 2: Quick sweep</strong></p>
+<p><strong>Step 2: Sweep</strong></p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Single group</span>
 bash<span class="w"> </span>tools/batch_internode_tuning.sh<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--master-addr<span class="w"> </span>&lt;HOST0&gt;<span class="w"> </span>--peer-host<span class="w"> </span>&lt;USER&gt;@&lt;HOST1&gt;<span class="w"> </span>--ifname<span class="w"> </span>&lt;IFNAME&gt;<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--kernel-type<span class="w"> </span>v1<span class="w"> </span>--num-qp<span class="w"> </span><span class="m">2</span><span class="w"> </span>--dtype<span class="w"> </span>fp4<span class="w"> </span>--combine-dtype<span class="w"> </span>bf16<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--quant-type<span class="w"> </span>fp8_direct_cast<span class="w"> </span>--tuning-scope<span class="w"> </span>quick
+<span class="w">    </span>--quant-type<span class="w"> </span>fp8_direct_cast
 
 <span class="c1"># All 6 groups at once</span>
 bash<span class="w"> </span>tools/run_all_internode_tuning.sh<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--master-addr<span class="w"> </span>&lt;HOST0&gt;<span class="w"> </span>--peer-host<span class="w"> </span>&lt;USER&gt;@&lt;HOST1&gt;<span class="w"> </span>--ifname<span class="w"> </span>&lt;IFNAME&gt;
 </pre></div>
 </div>
-<p>For docker environments, add <code class="docutils literal notranslate"><span class="pre">--docker</span> <span class="pre">&lt;CONTAINER&gt;</span> <span class="pre">--ssh-key</span> <span class="pre">&lt;KEY&gt;</span></code>.</p>
+<p>Both default to <code class="docutils literal notranslate"><span class="pre">--tuning-scope</span> <span class="pre">full</span></code>. <code class="docutils literal notranslate"><span class="pre">quick</span></code> sweeps a reduced candidate
+grid — 3 <code class="docutils literal notranslate"><span class="pre">warp_per_block</span></code> values against full’s 5, plus a narrower
+<code class="docutils literal notranslate"><span class="pre">rdma_block_num</span></code> set — so its winner is not a result worth committing, and
+combining it with a config output is rejected rather than silently accepted.
+Use it for exploration only, with saving turned off:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>bash<span class="w"> </span>tools/run_all_internode_tuning.sh<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--master-addr<span class="w"> </span>&lt;HOST0&gt;<span class="w"> </span>--peer-host<span class="w"> </span>&lt;USER&gt;@&lt;HOST1&gt;<span class="w"> </span>--ifname<span class="w"> </span>&lt;IFNAME&gt;<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--tuning-scope<span class="w"> </span>quick<span class="w"> </span>--config-output<span class="w"> </span><span class="s1">''</span>
+</pre></div>
+</div>
+<p>For docker environments, add <code class="docutils literal notranslate"><span class="pre">--docker</span> <span class="pre">&lt;PEER_CONTAINER&gt;</span></code>. If the driver node
+also runs mori inside a container, add <code class="docutils literal notranslate"><span class="pre">--local-docker</span> <span class="pre">&lt;RANK0_CONTAINER&gt;</span></code>
+rather than invoking the script from inside that container — the peer is
+reached over SSH, so a containerised driver would need its own SSH key to the
+other node. <code class="docutils literal notranslate"><span class="pre">--ssh-key</span> <span class="pre">&lt;KEY&gt;</span></code> is only needed when the driver’s default key is
+not the right one. Set the RDMA traffic class with <code class="docutils literal notranslate"><span class="pre">--rdma-tc</span> <span class="pre">&lt;TC&gt;</span></code> (and the
+service level with <code class="docutils literal notranslate"><span class="pre">--rdma-sl</span> <span class="pre">&lt;SL&gt;</span></code>); these are passed through to both ranks,
+which do <strong>not</strong> inherit the caller’s environment.</p>
+<p><strong>Step 3: Verify what was written</strong></p>
+<p>The sweep only times each candidate — <code class="docutils literal notranslate"><span class="pre">run_bench_once</span></code> never compares output,
+so nothing in tuning itself confirms the winning geometry is correct. Check the
+JSON before committing it:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>bash<span class="w"> </span>tools/verify_tuned_config.sh<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--master-addr<span class="w"> </span>&lt;HOST0&gt;<span class="w"> </span>--peer-host<span class="w"> </span>&lt;USER&gt;@&lt;HOST1&gt;<span class="w"> </span>--ifname<span class="w"> </span>&lt;IFNAME&gt;<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--local-docker<span class="w"> </span>&lt;RANK0_CONTAINER&gt;<span class="w"> </span>--docker<span class="w"> </span>&lt;PEER_CONTAINER&gt;<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--kernel-type<span class="w"> </span>v1_ll<span class="w"> </span>--num-qp<span class="w"> </span><span class="m">1</span><span class="w"> </span>--dtype<span class="w"> </span>fp8_e4m3_fnuz<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--combine-dtype<span class="w"> </span>bf16<span class="w"> </span>--quant-type<span class="w"> </span>none<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--tokens-list<span class="w"> </span><span class="s2">"4,8,16,32"</span><span class="w"> </span>--hidden-dims<span class="w"> </span><span class="s2">"6144"</span>
+</pre></div>
+</div>
+<p>It re-runs each shape under <code class="docutils literal notranslate"><span class="pre">MORI_EP_LAUNCH_CONFIG_MODE=AUTO</span></code> with <code class="docutils literal notranslate"><span class="pre">--cmd</span> <span class="pre">test</span></code>,
+so every op is built from whatever the JSON now holds and 500 rounds of
+dispatch/combine output are compared against expected values. Exit status is
+non-zero if any shape crashes, hangs, or produces wrong output.</p>
 <p><strong>Scripts:</strong></p>
 <table class="docutils align-default">
 <thead>
@@ -1379,6 +1418,9 @@ bash<span class="w"> </span>tools/run_all_internode_tuning.sh<span class="w"> </
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tools/run_all_internode_tuning.sh</span></code></p></td>
 <td><p>Run all 6 inter-node groups sequentially</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tools/verify_tuned_config.sh</span></code></p></td>
+<td><p>Correctness-check the saved configs before committing them</p></td>
 </tr>
 </tbody>
 </table>

@@ -595,18 +595,23 @@ Each file contains rules sorted by (dtype, hidden_dim, num_tokens):
       "rdma_block_num": 32,
       "warp_per_block": 8,
       "bandwidth_gbps": 4.13,
-      "rdma_bandwidth_gbps": 4.13,
-      "xgmi_bandwidth_gbps": 13.2,
-      "ll_bandwidth_gbps": 16.5
+      "avg_rdma_bandwidth_gbps": 4.13,
+      "avg_xgmi_bandwidth_gbps": 13.2,
+      "avg_ll_bandwidth_gbps": 16.5,
+      "avg_latency_us": 128.4,
+      "bandwidth_metric": "grand_mean"
     }
   ]
 }
 ```
 
-- `bandwidth_gbps` — The primary metric used for keep-best comparison (RDMA BW for v1, LL BW for v1_ll/async_ll).
-- `rdma_bandwidth_gbps` / `xgmi_bandwidth_gbps` / `ll_bandwidth_gbps` — All three BW types recorded for analysis (inter-node only).
+- `bandwidth_gbps` — The bandwidth that matters for this kernel (RDMA BW for v1, LL BW for v1_ll/async_ll), recorded for readers. Nothing reads it at runtime: only `block_num` / `rdma_block_num` / `warp_per_block` are.
+- `avg_rdma_bandwidth_gbps` / `avg_xgmi_bandwidth_gbps` / `avg_ll_bandwidth_gbps` — All three BW types recorded for analysis (inter-node only).
+- `avg_latency_us` — Grand-mean latency, the quantity the inter-node tuner selects on. The intra-node tuner writes this as `latency_us`.
 
-New tuning results merge into existing files using a keep-best strategy: a rule is only updated if the new bandwidth exceeds the existing one.
+New tuning results replace the matching rule unconditionally, printing the old and new config and their latency/bandwidth delta. Two tuning runs come from different hosts, ROCm versions and machine load, so no numeric rule can reliably decide whether a new result is worth keeping — the JSON's git diff is where that call gets made. Re-run tuning if a printed delta looks wrong.
+
+> Inter-node `bandwidth_gbps` is the grand mean across ranks and rounds, matching the "Average" row of the table `--cmd bench` prints, so a saved rule can be checked against a bench run directly. Rules carry `bandwidth_metric` recording this; rules written before it existed hold the slowest-rank mean and have no such field, and a re-tune that replaces one prints both bandwidths without a percentage rather than comparing across the two definitions.
 
 ### Intra-node Tuning
 
@@ -687,21 +692,60 @@ bash tools/batch_internode_tuning.sh \
     --tokens-list "128,4096" --tuning-scope full
 ```
 
-**Step 2: Quick sweep**
+**Step 2: Sweep**
 
 ```bash
 # Single group
 bash tools/batch_internode_tuning.sh \
     --master-addr <HOST0> --peer-host <USER>@<HOST1> --ifname <IFNAME> \
     --kernel-type v1 --num-qp 2 --dtype fp4 --combine-dtype bf16 \
-    --quant-type fp8_direct_cast --tuning-scope quick
+    --quant-type fp8_direct_cast
 
 # All 6 groups at once
 bash tools/run_all_internode_tuning.sh \
     --master-addr <HOST0> --peer-host <USER>@<HOST1> --ifname <IFNAME>
 ```
 
-For docker environments, add `--docker <CONTAINER> --ssh-key <KEY>`.
+Both default to `--tuning-scope full`. `quick` sweeps a reduced candidate
+grid — 3 `warp_per_block` values against full's 5, plus a narrower
+`rdma_block_num` set — so its winner is not a result worth committing, and
+combining it with a config output is rejected rather than silently accepted.
+Use it for exploration only, with saving turned off:
+
+```bash
+bash tools/run_all_internode_tuning.sh \
+    --master-addr <HOST0> --peer-host <USER>@<HOST1> --ifname <IFNAME> \
+    --tuning-scope quick --config-output ''
+```
+
+For docker environments, add `--docker <PEER_CONTAINER>`. If the driver node
+also runs mori inside a container, add `--local-docker <RANK0_CONTAINER>`
+rather than invoking the script from inside that container — the peer is
+reached over SSH, so a containerised driver would need its own SSH key to the
+other node. `--ssh-key <KEY>` is only needed when the driver's default key is
+not the right one. Set the RDMA traffic class with `--rdma-tc <TC>` (and the
+service level with `--rdma-sl <SL>`); these are passed through to both ranks,
+which do **not** inherit the caller's environment.
+
+**Step 3: Verify what was written**
+
+The sweep only times each candidate — `run_bench_once` never compares output,
+so nothing in tuning itself confirms the winning geometry is correct. Check the
+JSON before committing it:
+
+```bash
+bash tools/verify_tuned_config.sh \
+    --master-addr <HOST0> --peer-host <USER>@<HOST1> --ifname <IFNAME> \
+    --local-docker <RANK0_CONTAINER> --docker <PEER_CONTAINER> \
+    --kernel-type v1_ll --num-qp 1 --dtype fp8_e4m3_fnuz \
+    --combine-dtype bf16 --quant-type none \
+    --tokens-list "4,8,16,32" --hidden-dims "6144"
+```
+
+It re-runs each shape under `MORI_EP_LAUNCH_CONFIG_MODE=AUTO` with `--cmd test`,
+so every op is built from whatever the JSON now holds and 500 rounds of
+dispatch/combine output are compared against expected values. Exit status is
+non-zero if any shape crashes, hangs, or produces wrong output.
 
 **Scripts:**
 
@@ -709,6 +753,7 @@ For docker environments, add `--docker <CONTAINER> --ssh-key <KEY>`.
 |--------|---------|
 | `tools/batch_internode_tuning.sh` | Sweep one (kernel, dtype, quant) group across all token sizes |
 | `tools/run_all_internode_tuning.sh` | Run all 6 inter-node groups sequentially |
+| `tools/verify_tuned_config.sh` | Correctness-check the saved configs before committing them |
 
 ### Tuning on a New GPU Platform
 
