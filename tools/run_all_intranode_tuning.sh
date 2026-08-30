@@ -9,10 +9,12 @@ set -euo pipefail
 #   gfx942 (MI300X/MI308X) → fp8_e4m3_fnuz (FNUZ format)
 #
 # Usage:
-#   bash tools/run_all_intranode_tuning.sh [--tuning-scope quick] [--gpus 0,1,2,3,4,5,6,7]
+#   bash tools/run_all_intranode_tuning.sh [--gpus 0,1,2,3,4,5,6,7]
 #
 # Options are forwarded to batch_intranode_tuning.sh. Common overrides:
-#   --tuning-scope quick|full    (default: quick)
+#   --tuning-scope quick|full    (default: full -- quick sweeps a reduced
+#                                 grid and cannot be saved, so pair it with
+#                                 --config-output '')
 #   --tokens-list "128,4096"     (default: 64,128,256,512,1024,2048,4096)
 #   --gpus "0,1,2,3"            (default: all visible)
 #   --timeout 3600               (default: 3600)

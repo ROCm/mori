@@ -47,3 +47,6 @@ python/mori/tools/mori.conf
 
 # crash core dumps
 core.*
+
+# Tuning/bench tool output (tools/*_tuning.sh, tools/verify_tuned_config.sh)
+/logs/

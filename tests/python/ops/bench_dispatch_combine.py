@@ -37,7 +37,49 @@ import os
 
 os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "6G")
 
-_BW_NOISE_MARGIN = 1.0
+# Relative bandwidth improvement a candidate needs to take the lead during the
+# sweep. Default 0: any improvement wins.
+#
+# This was an absolute 1.0 GB/s, which cannot work across the operating range.
+# Where a whole sweep sits in the low single-digit GB/s -- small token counts --
+# nothing after the first candidate can ever clear +1.0, so the sweep silently
+# returns whatever it happened to measure first; where bandwidth is in the
+# hundreds it is under 1%, so it stops filtering noise at all. The inter-node
+# tuner had the same bug and the same fix (MORI_EP_TUNING_MARGIN, shared here
+# so one setting covers both).
+#
+# `os.environ.get(k, default)` only substitutes default when the var is
+# *unset* -- MORI_EP_TUNING_MARGIN="" would reach float("") and crash, so fall
+# back on an empty string too.
+_BW_REL_MARGIN = float(os.environ.get("MORI_EP_TUNING_MARGIN") or "0.0")
+
+
+def _bw_beats(new_bw, new_cfg, best_bw, best_cfg):
+    """Should *new_cfg* take the lead? Higher bandwidth is better here.
+
+    Note the direction: this path selects on bandwidth, while the inter-node
+    tuner selects on latency, so the comparisons are inverted relative to its
+    _beats().
+
+    Wins outright past the margin; within it, ties break on the
+    lexicographically smaller (block_num, warp_per_block), so a tie resolves to
+    the smaller geometry rather than to whichever candidate the sweep reached
+    first.
+
+    As in the inter-node _beats(), the tie-break cannot fire under the current
+    ascending sweep order, and the same caveat applies before reordering it:
+    the caller overwrites best_bw with the winner's bandwidth, so a tie-break
+    win at MORI_EP_TUNING_MARGIN > 0 installs a *lower* bandwidth as the
+    baseline for the next comparison and the incumbent can ratchet downward.
+    Split the comparison baseline from the selected candidate first.
+    """
+    if best_cfg is None:
+        return True
+    if new_bw > best_bw * (1.0 + _BW_REL_MARGIN):
+        return True
+    if new_bw >= best_bw * (1.0 - _BW_REL_MARGIN) and new_cfg < best_cfg:
+        return True
+    return False
 
 
 def _emit_intra_perf(
@@ -1192,6 +1234,17 @@ def _bench_dispatch_combine(
             sm_count = torch.cuda.get_device_properties(rank).multi_processor_count
             tuning_scope = os.environ.get("MORI_TUNING_SCOPE", "full")
 
+            if save_tuning_config and tuning_scope == "quick":
+                raise ValueError(
+                    "MORI_TUNING_SCOPE=quick cannot be combined with "
+                    "--save-tuning-config: quick sweeps 3 warp_per_block "
+                    "candidates against full's 9, and only powers of two for "
+                    "block_num against full's step-8 grid over the same "
+                    "range, so a quick-scope winner is not a result worth "
+                    "committing as a saved config. Re-run with "
+                    "MORI_TUNING_SCOPE unset (or =full) to save."
+                )
+
             if tuning_scope == "quick":
                 block_set = set()
                 pow2 = 32
@@ -1268,13 +1321,14 @@ def _bench_dispatch_combine(
                         call_local_expert_count=call_local_expert_count,
                     )
 
-                    if disp_bw > best_disp_bw + _BW_NOISE_MARGIN:
+                    cand = (block_num, warp_per_block)
+                    if _bw_beats(disp_bw, cand, best_disp_bw, best_disp_config):
                         best_disp_bw = disp_bw
-                        best_disp_config = (block_num, warp_per_block)
+                        best_disp_config = cand
                         best_disp_lat = disp_lat
-                    if comb_bw > best_comb_bw + _BW_NOISE_MARGIN:
+                    if _bw_beats(comb_bw, cand, best_comb_bw, best_comb_config):
                         best_comb_bw = comb_bw
-                        best_comb_config = (block_num, warp_per_block)
+                        best_comb_config = cand
                         best_comb_lat = comb_lat
 
             # --- Extra dispatch sweep: over-subscribe, fix combine at best ---
@@ -1306,9 +1360,10 @@ def _bench_dispatch_combine(
                             call_local_expert_count=call_local_expert_count,
                         )
 
-                        if disp_bw > best_disp_bw + _BW_NOISE_MARGIN:
+                        cand = (block_num, warp_per_block)
+                        if _bw_beats(disp_bw, cand, best_disp_bw, best_disp_config):
                             best_disp_bw = disp_bw
-                            best_disp_config = (block_num, warp_per_block)
+                            best_disp_config = cand
                             best_disp_lat = disp_lat
 
             if rank == 0:
@@ -1479,29 +1534,45 @@ if __name__ == "__main__":
             "'fp8_blockwise' is the BF16<->FP8 blockwise quant path."
         ),
     )
+    # --block-num/--warp-per-block set both phases; the per-phase flags override
+    # them. Same shape as the internode benchmark
+    # (examples/ops/dispatch_combine/test_dispatch_combine_internode.py), which
+    # additionally carries an rdma_block_num triple that has no meaning here.
+    parser.add_argument(
+        "--block-num",
+        type=int,
+        default=None,
+        help="Override block_num for both phases. Ignored when --cmd tuning.",
+    )
+    parser.add_argument(
+        "--warp-per-block",
+        type=int,
+        default=None,
+        help="Override warp_per_block for both phases. Ignored when --cmd tuning.",
+    )
     parser.add_argument(
         "--dispatch-block-num",
         type=int,
         default=None,
-        help="Override dispatch block_num for bench/stress. Ignored when --cmd tuning.",
+        help="Override dispatch block_num for bench/stress (wins over --block-num).",
     )
     parser.add_argument(
         "--dispatch-warp-per-block",
         type=int,
         default=None,
-        help="Override dispatch warp_per_block for bench/stress. Ignored when --cmd tuning.",
+        help="Override dispatch warp_per_block for bench/stress (wins over --warp-per-block).",
     )
     parser.add_argument(
         "--combine-block-num",
         type=int,
         default=None,
-        help="Override combine block_num for bench/stress. Ignored when --cmd tuning.",
+        help="Override combine block_num for bench/stress (wins over --block-num).",
     )
     parser.add_argument(
         "--combine-warp-per-block",
         type=int,
         default=None,
-        help="Override combine warp_per_block for bench/stress. Ignored when --cmd tuning.",
+        help="Override combine warp_per_block for bench/stress (wins over --warp-per-block).",
     )
     parser.add_argument(
         "--world-size",
@@ -1705,6 +1776,19 @@ if __name__ == "__main__":
     base_hidden_dim = args.hidden_dim
     dispatch_hidden_dim = (
         base_hidden_dim // 2 if _is_fp4x2_dtype(dispatch_dtype) else base_hidden_dim
+    )
+
+    # Per-phase flag wins over the shared one; None means let the op decide.
+    def _phase_param(per_phase, shared):
+        return per_phase if per_phase is not None else shared
+
+    args.dispatch_block_num = _phase_param(args.dispatch_block_num, args.block_num)
+    args.dispatch_warp_per_block = _phase_param(
+        args.dispatch_warp_per_block, args.warp_per_block
+    )
+    args.combine_block_num = _phase_param(args.combine_block_num, args.block_num)
+    args.combine_warp_per_block = _phase_param(
+        args.combine_warp_per_block, args.warp_per_block
     )
 
     print(

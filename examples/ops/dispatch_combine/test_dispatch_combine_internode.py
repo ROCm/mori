@@ -46,9 +46,126 @@ _CLI_TO_KERNEL_TYPE_NAME = {
 
 _FP4_DTYPE = getattr(torch, "float4_e2m1fn_x2", None)
 
-# Bandwidth improvement must exceed this margin (GB/s) to update the best
-# config during tuning. Prevents config churn from run-to-run noise.
-_BW_NOISE_MARGIN = 1.0
+# Relative improvement a candidate needs to replace the current best during
+# tuning. Default 0 (any improvement wins); raise via MORI_EP_TUNING_MARGIN
+# for a clearer-win requirement. Must be relative, not an absolute unit: a
+# fixed threshold cannot work across the whole operating range (e.g. a 1.0
+# GB/s bandwidth margin used to be ~40% of the sweep's spread at 4 tokens
+# but under 2% at large ones).
+#
+# `os.environ.get(k, default)` only substitutes default when the var is
+# *unset* -- MORI_EP_TUNING_MARGIN="" would reach float("") and crash at
+# import time, so fall back on an empty string too.
+_TUNING_MARGIN = float(os.environ.get("MORI_EP_TUNING_MARGIN") or "0.0")
+
+# Rounds benchmarked per config, shared by both --cmd bench and --cmd tuning
+# (each candidate during a sweep) so the two measure on equal footing --
+# bench's own number for a config should be comparable to what tuning saw
+# for that same config during its sweep. Override with MORI_EP_ROUNDS;
+# default 10 matches bench's longstanding hardcoded value.
+_EP_ROUNDS = int(os.environ.get("MORI_EP_ROUNDS") or "10")
+if _EP_ROUNDS < 2:
+    # Both call sites drop round 0 as in-loop warmup (`kept = all_data[1:]`);
+    # at 1 round that leaves an empty tensor and _compute_stats'
+    # .min()/.max()/.mean() blow up with a shape error that says nothing
+    # about rounds being the cause.
+    raise ValueError(
+        f"MORI_EP_ROUNDS must be >= 2 (round 0 is dropped as warmup), "
+        f"got {_EP_ROUNDS}"
+    )
+
+# Debug aid only, no effect on selection: print every candidate's full
+# PrettyTable (same _print_phase_table bench uses) instead of just the
+# one-line "disp sel=... comb sel=..." summary, so a candidate's raw
+# Best/Worst/Average can be compared directly against a --cmd bench run of
+# that same block/warp/rdma without re-deriving it from the summary line.
+_TUNING_VERBOSE = os.environ.get("MORI_EP_TUNING_VERBOSE", "0") == "1"
+
+
+def _beats(new_lat, new_cfg, best_lat, best_cfg):
+    """Should *new_cfg* replace *best_cfg* as the tuning winner?
+
+    Selection metric is the grand-mean latency (lower is better) -- the same
+    quantity _build_phase_stats/_compute_stats compute and this file prints
+    as "Average", not a separate slowest-rank bandwidth figure. Picking a
+    config on one metric while reporting another let a config win the sweep
+    on paper yet look worse in the printed table it was supposedly chosen
+    from; using the printed number for both closes that gap by construction.
+
+    Wins outright past the margin; within it, ties break on the
+    lexicographically smaller (block_num, warp_per_block, rdma_block_num)
+    tuple, so a tie resolves to the smaller geometry rather than to whichever
+    candidate happened to be measured first.
+
+    The tie-break cannot fire under the current sweep, which visits
+    block/warp/rdma in ascending order: new_cfg is then always greater than
+    best_cfg. That is deliberate, not an accident to rely on -- but note what
+    would happen if the sweep were reordered or parallelized. The caller
+    overwrites best_lat with the winner's latency, so a tie-break win at
+    MORI_EP_TUNING_MARGIN > 0 installs a *worse* latency as the new baseline,
+    and the next comparison is made against it: the incumbent can ratchet
+    steadily worse, each step individually "within the margin". Before
+    changing the visit order, split the comparison baseline from the selected
+    candidate -- keep the best latency ever seen for the margin test and let
+    only cfg/stats follow the tie-break.
+    """
+    if best_cfg is None:
+        return True
+    if new_lat < best_lat * (1.0 - _TUNING_MARGIN):
+        return True
+    if new_lat <= best_lat * (1.0 + _TUNING_MARGIN) and new_cfg < best_cfg:
+        return True
+    return False
+
+
+def _launch_params_str(block_num, warp_per_block, rdma_block_num):
+    """Render one phase's launch geometry for a table title.
+
+    -1 means "not overridden on the command line", in which case the op resolves
+    the value itself (from the tuning config, else a built-in default), so the
+    number that ends up running is not known here -- say `auto` rather than
+    print -1 as if it were a block count.
+    """
+
+    def _v(x):
+        return "auto" if x is None or x < 0 else str(x)
+
+    return f"block={_v(block_num)} warp={_v(warp_per_block)} rdma={_v(rdma_block_num)}"
+
+
+def _is_ll_kernel(kernel_type):
+    return kernel_type in (
+        mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
+        mori.ops.EpDispatchCombineKernelType.AsyncLL,
+    )
+
+
+def _headline_bw(stats, kernel_type):
+    """The winner's bandwidth for the JSON's top-level bandwidth_gbps.
+
+    Which of the recorded bandwidths is the meaningful one depends on the
+    kernel: LL kernels move their payload over xGMI (reported as LL bandwidth),
+    v1 over RDMA. bandwidth_gbps is that pick, so a reader does not have to
+    know the rule; avg_rdma/xgmi/ll_bandwidth_gbps are all saved alongside it
+    regardless.
+
+    The grand mean -- the same number this file prints as the table's
+    "Average" row, so a saved rule can be checked against a --cmd bench run of
+    that block/warp/rdma without re-deriving anything. It used to be the
+    slowest-rank mean instead, purely so it stayed comparable with rules
+    written by older code: save_tuning_result gated overwriting on
+    `new_bw > old_bw`, and reading higher than a same-performance old entry
+    would have overwritten still-good rules. That gate is gone (nothing
+    numeric decides overwrites now), and with it the reason to report a
+    quantity nothing else prints.
+
+    Rules already on disk keep their slowest-rank value until re-tuned, so
+    bandwidth_gbps is only comparable within one tuning run's output -- which
+    is all it was ever good for, given two runs come from different hosts and
+    load. The slowest-rank figure is still printed next to the winner in the
+    sweep's summary, as a straggler check, just not saved.
+    """
+    return stats["ll"][2] if _is_ll_kernel(kernel_type) else stats["rdma"][2]
 
 
 def _perf_report():
@@ -178,6 +295,8 @@ def _save_internode_tuning_result(
 ):
     from pathlib import Path
     from mori.ops.tuning_config import (
+        BANDWIDTH_METRIC_GRAND_MEAN,
+        BANDWIDTH_METRIC_KEY,
         TuningConfigManager,
         dtype_to_config_str,
         build_config_filename,
@@ -216,6 +335,7 @@ def _save_internode_tuning_result(
         "avg_xgmi_bandwidth_gbps": round(_stats_avg(best_disp_all_bw, "xgmi"), 2),
         "avg_ll_bandwidth_gbps": round(_stats_avg(best_disp_all_bw, "ll"), 2),
         "avg_latency_us": round(_stats_avg(best_disp_all_bw, "lat"), 2),
+        BANDWIDTH_METRIC_KEY: BANDWIDTH_METRIC_GRAND_MEAN,
     }
 
     combine_entry = {
@@ -232,6 +352,7 @@ def _save_internode_tuning_result(
         "avg_xgmi_bandwidth_gbps": round(_stats_avg(best_comb_all_bw, "xgmi"), 2),
         "avg_ll_bandwidth_gbps": round(_stats_avg(best_comb_all_bw, "ll"), 2),
         "avg_latency_us": round(_stats_avg(best_comb_all_bw, "lat"), 2),
+        BANDWIDTH_METRIC_KEY: BANDWIDTH_METRIC_GRAND_MEAN,
     }
 
     if config_path == "auto":
@@ -1010,9 +1131,12 @@ class EpDispatchCombineTestCase:
         op,
         test_data,
         repeat=10,
-        block_num=-1,
-        rdma_block_num=-1,
-        warp_per_block=-1,
+        disp_block_num=-1,
+        disp_rdma_block_num=-1,
+        disp_warp_per_block=-1,
+        comb_block_num=-1,
+        comb_rdma_block_num=-1,
+        comb_warp_per_block=-1,
     ):
         num_events = 3 * repeat + 1
         events = [torch.cuda.Event(enable_timing=True) for i in range(num_events)]
@@ -1039,9 +1163,9 @@ class EpDispatchCombineTestCase:
                 all_rank_weights[self.rank],
                 all_rank_scales[self.rank],
                 all_rank_indices[self.rank],
-                block_num=block_num,
-                rdma_block_num=rdma_block_num,
-                warp_per_block=warp_per_block,
+                block_num=disp_block_num,
+                rdma_block_num=disp_rdma_block_num,
+                warp_per_block=disp_warp_per_block,
             )
             if i == warmup_rounds - 1:
                 torch.cuda.synchronize()
@@ -1052,9 +1176,9 @@ class EpDispatchCombineTestCase:
                 combine_input,
                 None,
                 all_rank_indices[self.rank],
-                block_num=block_num,
-                rdma_block_num=rdma_block_num,
-                warp_per_block=warp_per_block,
+                block_num=comb_block_num,
+                rdma_block_num=comb_rdma_block_num,
+                warp_per_block=comb_warp_per_block,
             )
             torch.cuda.synchronize()
         total_rdma_recv_num_token = compute_rdma_algo_token_count(
@@ -1091,9 +1215,9 @@ class EpDispatchCombineTestCase:
                 all_rank_weights[self.rank],
                 all_rank_scales[self.rank],
                 all_rank_indices[self.rank],
-                block_num=block_num,
-                rdma_block_num=rdma_block_num,
-                warp_per_block=warp_per_block,
+                block_num=disp_block_num,
+                rdma_block_num=disp_rdma_block_num,
+                warp_per_block=disp_warp_per_block,
             )
             events[3 * i + 1].record()
             combine_input = self._convert_for_combine(dispatch_output)
@@ -1103,9 +1227,9 @@ class EpDispatchCombineTestCase:
                 combine_input,
                 None,
                 all_rank_indices[self.rank],
-                block_num=block_num,
-                rdma_block_num=rdma_block_num,
-                warp_per_block=warp_per_block,
+                block_num=comb_block_num,
+                rdma_block_num=comb_rdma_block_num,
+                warp_per_block=comb_warp_per_block,
             )
             events[3 * i + 3].record()
         torch.cuda.synchronize()
@@ -1189,9 +1313,12 @@ class EpDispatchCombineTestCase:
     def bench_dispatch_combine(
         self,
         max_num_token,
-        block_num=-1,
-        rdma_block_num=-1,
-        warp_per_block=-1,
+        disp_block_num=-1,
+        disp_rdma_block_num=-1,
+        disp_warp_per_block=-1,
+        comb_block_num=-1,
+        comb_rdma_block_num=-1,
+        comb_warp_per_block=-1,
         skip_verify=False,
     ):
         op = mori.ops.EpDispatchCombineOp(self.config)
@@ -1201,7 +1328,7 @@ class EpDispatchCombineTestCase:
             only_my_rank=skip_verify,
         )
 
-        repeat = 10
+        repeat = _EP_ROUNDS
 
         if not skip_verify:
             error_round = set()
@@ -1218,9 +1345,12 @@ class EpDispatchCombineTestCase:
             op,
             test_data,
             repeat,
-            block_num=block_num,
-            rdma_block_num=rdma_block_num,
-            warp_per_block=warp_per_block,
+            disp_block_num=disp_block_num,
+            disp_rdma_block_num=disp_rdma_block_num,
+            disp_warp_per_block=disp_warp_per_block,
+            comb_block_num=comb_block_num,
+            comb_rdma_block_num=comb_rdma_block_num,
+            comb_warp_per_block=comb_warp_per_block,
         )
         ll_mode_scale = bench_result[-1]
         all_data, _ = self._all_gather_bench_data(bench_result)
@@ -1246,14 +1376,14 @@ class EpDispatchCombineTestCase:
                     ),
                 ),
             ]
-            for phase, cols in _labels:
-                for i in range(all_data.shape[0]):
-                    rd = all_data[i]
-                    if cols is _labels[0][1]:
-                        print(f"Round {i}")
+            for i in range(all_data.shape[0]):
+                rd = all_data[i]
+                print(f"Round {i}")
+                for phase, cols in _labels:
                     for name, col, unit in cols:
+                        vals = [round(v, 2) for v in rd[:, col].tolist()]
                         print(
-                            f"  {phase} {name} {rd[:, col].int().tolist()}"
+                            f"  {phase} {name} {vals}"
                             f" avg {rd[:, col].mean():.2f} {unit}"
                         )
 
@@ -1266,8 +1396,18 @@ class EpDispatchCombineTestCase:
 
         disp_dtype_str = str(self.config.data_type).split(".")[-1]
         comb_dtype_str = str(self.combine_data_type).split(".")[-1]
-        disp_title = f"Dispatch Performance ({disp_dtype_str})"
-        comb_title = f"Combine Performance ({comb_dtype_str})"
+        # Name the launch config each table was produced with. Dispatch and
+        # combine can be given different values, so a table without it cannot be
+        # matched back to the run that produced it -- which is the whole point of
+        # feeding a tuning result back through bench.
+        disp_title = (
+            f"Dispatch Performance ({disp_dtype_str}) "
+            f"{_launch_params_str(disp_block_num, disp_warp_per_block, disp_rdma_block_num)}"
+        )
+        comb_title = (
+            f"Combine Performance ({comb_dtype_str}) "
+            f"{_launch_params_str(comb_block_num, comb_warp_per_block, comb_rdma_block_num)}"
+        )
         if self.combine_data_type != self.config.data_type:
             disp_elem = torch.tensor([], dtype=self.config.data_type).element_size()
             comb_elem = torch.tensor([], dtype=self.combine_data_type).element_size()
@@ -1302,16 +1442,24 @@ class EpDispatchCombineTestCase:
     def _build_phase_stats(self, kept, col_rdma, col_xgmi, col_lat, ll_scale):
         """Compute (worst, best, avg) stats for one phase from gathered data.
 
-        Returns dict with keys rdma, xgmi, ll, lat — each a (worst, best, avg) tuple.
-        Uses the same ``_compute_stats`` as PrettyTable, so values are identical.
+        Returns dict with keys rdma, xgmi, ll, lat — each a (worst, best, avg)
+        tuple identical to what PrettyTable prints — plus rdma_worst_rank and
+        ll_worst_rank, the per-rank means' minimum. Those two are printed
+        alongside the tuning summary as a straggler check and are not saved or
+        used for selection; "worst" inside the tuples above is the minimum over
+        individual samples, which is a different (noisier) quantity.
         """
         _s = self._compute_stats
         xgmi_s = _s(kept[:, :, col_xgmi])
+        rdma_worst_rank = kept[:, :, col_rdma].mean(dim=0).min().item()
+        xgmi_worst_rank = kept[:, :, col_xgmi].mean(dim=0).min().item()
         return {
             "rdma": _s(kept[:, :, col_rdma]),
             "xgmi": xgmi_s,
             "ll": tuple(v * ll_scale for v in xgmi_s),
             "lat": _s(kept[:, :, col_lat]),
+            "rdma_worst_rank": rdma_worst_rank,
+            "ll_worst_rank": xgmi_worst_rank * ll_scale,
         }
 
     @staticmethod
@@ -1403,14 +1551,34 @@ class EpDispatchCombineTestCase:
     def tuning_dispatch_combine(
         self, max_num_token, save_tuning_config=None, skip_verify=False
     ):
+        tuning_scope = os.environ.get("MORI_TUNING_SCOPE", "full")
+        if save_tuning_config and tuning_scope == "quick":
+            raise ValueError(
+                "MORI_TUNING_SCOPE=quick cannot be combined with "
+                "--save-tuning-config: quick only sweeps 3 warp_per_block "
+                "candidates against full's 5, plus a narrower rdma_block_num "
+                "set, so a quick-scope winner is not a result worth "
+                "committing as a saved config. Re-run with MORI_TUNING_SCOPE "
+                "unset (or =full) to save."
+            )
+
         op = mori.ops.EpDispatchCombineOp(self.config)
         sm_count = torch.cuda.get_device_properties(
             self.rank % self.gpu_per_node
         ).multi_processor_count
 
-        tuning_scope = os.environ.get("MORI_TUNING_SCOPE", "full")
-
         block_set = set()
+        # Small-block candidates below the doubling sequence's usual 32 floor.
+        # Measured on MI300X EP16 v1_ll (tok=4/8/16/32): 8 loses everywhere;
+        # 16 ties the eventual winner at 4 tokens (48.83 vs 48.46us, within
+        # noise) but is clearly worse from 8 tokens up (e.g. 56.29 vs
+        # 49.01us dispatch at 8 tokens). Left in the sweep rather than
+        # hardcoded per-arch, so a re-tune (including on a different
+        # sm_count like MI308's 80) empirically finds out whether either
+        # actually wins there instead of assuming this MI300X result holds.
+        for extra in (8, 16):
+            if extra < sm_count:
+                block_set.add(extra)
         pow2 = 32
         while pow2 <= sm_count:
             block_set.add(pow2)
@@ -1434,12 +1602,6 @@ class EpDispatchCombineTestCase:
                 set(v for v in [bn // 4, bn // 2, bn * 2 // 3] if 1 <= v < bn)
             )
 
-        is_ll_kernel = self.config.kernel_type in (
-            mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
-            mori.ops.EpDispatchCombineKernelType.AsyncLL,
-        )
-        bw_label = "LL BW" if is_ll_kernel else "RDMA BW"
-
         total_configs = sum(
             len(warp_list) * len(rdma_candidates_for(bn)) for bn in block_list
         )
@@ -1449,12 +1611,12 @@ class EpDispatchCombineTestCase:
                 f"skip_verify={skip_verify}\n"
                 f"block_num candidates ({len(block_list)}): {block_list}\n"
                 f"warp_per_block candidates: {warp_list}\n"
-                f"BW metric: {bw_label}\n"
+                f"Selection metric: grand-mean latency (same as printed Average)\n"
                 f"Total configurations: {total_configs}"
             )
 
-        best_disp_bw = 0
-        best_comb_bw = 0
+        best_disp_lat = float("inf")
+        best_comb_lat = float("inf")
         best_disp_config = None
         best_comb_config = None
         _zero_stats = {
@@ -1462,6 +1624,8 @@ class EpDispatchCombineTestCase:
             "xgmi": (0, 0, 0),
             "ll": (0, 0, 0),
             "lat": (0, 0, 0),
+            "rdma_worst_rank": 0,
+            "ll_worst_rank": 0,
         }
         best_disp_stats = dict(_zero_stats)
         best_comb_stats = dict(_zero_stats)
@@ -1477,6 +1641,9 @@ class EpDispatchCombineTestCase:
                 self.run_test_once(op, test_data, error_round, wr_i)
             assert len(error_round) == 0, f"Warmup failed: {error_round}"
 
+        disp_dtype_str = str(self.config.data_type).split(".")[-1]
+        comb_dtype_str = str(self.combine_data_type).split(".")[-1]
+
         config_idx = 0
         for bn in block_list:
             for warp in warp_list:
@@ -1486,58 +1653,71 @@ class EpDispatchCombineTestCase:
                         print(
                             f"\n{'=' * 60}\n"
                             f"[{config_idx}/{total_configs}] "
-                            f"block_num={bn}, warp={warp}, rdma_block_num={rdma_bn}\n"
+                            f"block={bn} warp={warp} rdma={rdma_bn}\n"
                             f"{'=' * 60}"
                         )
+                    # Common sweep: one candidate drives both phases, so a
+                    # single pass times dispatch and combine under the same
+                    # geometry. The two argmins below are still independent --
+                    # the winners may differ, and each is saved on its own.
                     bench_result = self.run_bench_once(
                         max_num_token,
                         op,
                         test_data,
-                        repeat=5,
-                        block_num=bn,
-                        rdma_block_num=rdma_bn,
-                        warp_per_block=warp,
+                        repeat=_EP_ROUNDS,
+                        disp_block_num=bn,
+                        disp_rdma_block_num=rdma_bn,
+                        disp_warp_per_block=warp,
+                        comb_block_num=bn,
+                        comb_rdma_block_num=rdma_bn,
+                        comb_warp_per_block=warp,
                     )
                     all_data, ll_scale = self._all_gather_bench_data(bench_result)
                     kept = all_data[1:]  # skip round 0, same as bench
                     # kept: (rounds, world_size, 6)
                     # cols: d_rdma, d_xgmi, d_lat, c_rdma, c_xgmi, c_lat
 
-                    # Selection: per-rank avg across kept rounds, min rank
-                    rank_means = kept.mean(dim=0)  # (world_size, 6)
-                    if is_ll_kernel:
-                        disp_bw = (rank_means[:, 1] * ll_scale).min().item()
-                        comb_bw = (rank_means[:, 4] * ll_scale).min().item()
-                    else:
-                        disp_bw = rank_means[:, 0].min().item()
-                        comb_bw = rank_means[:, 3].min().item()
-
-                    # Stats via shared code (same as bench PrettyTable)
+                    # Stats via shared code (same as bench PrettyTable). Selection
+                    # uses disp_stats["lat"][2]/comb_stats["lat"][2] below -- the
+                    # exact grand-mean latency this same dict prints as "Average"
+                    # (see _beats' docstring for why that identity matters).
                     disp_stats = self._build_phase_stats(kept, 0, 1, 2, ll_scale)
                     comb_stats = self._build_phase_stats(kept, 3, 4, 5, ll_scale)
+                    disp_lat = disp_stats["lat"][2]
+                    comb_lat = comb_stats["lat"][2]
 
-                    if disp_bw > best_disp_bw + _BW_NOISE_MARGIN:
-                        best_disp_bw = disp_bw
-                        best_disp_config = (bn, warp, rdma_bn)
+                    cand = (bn, warp, rdma_bn)
+                    if _beats(disp_lat, cand, best_disp_lat, best_disp_config):
+                        best_disp_lat = disp_lat
+                        best_disp_config = cand
                         best_disp_stats = disp_stats
-                    if comb_bw > best_comb_bw + _BW_NOISE_MARGIN:
-                        best_comb_bw = comb_bw
-                        best_comb_config = (bn, warp, rdma_bn)
+                    if _beats(comb_lat, cand, best_comb_lat, best_comb_config):
+                        best_comb_lat = comb_lat
+                        best_comb_config = cand
                         best_comb_stats = comb_stats
 
                     if self.rank == 0:
                         da, ca = disp_stats["xgmi"][2], comb_stats["xgmi"][2]
                         print(
-                            f"  disp sel={disp_bw:.1f} xgmi={da:.1f}  "
-                            f"comb sel={comb_bw:.1f} xgmi={ca:.1f}  "
-                            f"(best disp={best_disp_bw:.1f} comb={best_comb_bw:.1f})"
+                            f"  disp sel={disp_lat:.1f}us xgmi={da:.1f}  "
+                            f"comb sel={comb_lat:.1f}us xgmi={ca:.1f}  "
+                            f"(best disp={best_disp_lat:.1f}us comb={best_comb_lat:.1f}us)"
                         )
+                        if _TUNING_VERBOSE:
+                            self._print_phase_table(
+                                f"Dispatch ({disp_dtype_str}) "
+                                f"block={bn} warp={warp} rdma={rdma_bn}",
+                                disp_stats,
+                            )
+                            self._print_phase_table(
+                                f"Combine ({comb_dtype_str}) "
+                                f"block={bn} warp={warp} rdma={rdma_bn}",
+                                comb_stats,
+                            )
 
         if self.rank == 0:
-            disp_dtype_str = str(self.config.data_type).split(".")[-1]
-            comb_dtype_str = str(self.combine_data_type).split(".")[-1]
             print(f"\n{'=' * 70}")
-            print("Tuning Result (best config chosen by slowest-rank XGMI BW)")
+            print("Tuning Result (best config chosen by grand-mean latency)")
             print(f"{'=' * 70}")
             for label, dtype_s, cfg, st in [
                 ("Dispatch", disp_dtype_str, best_disp_config, best_disp_stats),
@@ -1546,6 +1726,21 @@ class EpDispatchCombineTestCase:
                 self._print_phase_table(
                     f"{label} ({dtype_s}) block={cfg[0]} warp={cfg[1]} rdma={cfg[2]}",
                     st,
+                )
+                # Slowest-rank bandwidth, for reference only -- neither the
+                # sweep nor the saved rule uses it. Worth seeing next to the
+                # table's Average because a large gap between the two means the
+                # ranks disagree, i.e. that Average is smoothing over a
+                # straggler rather than describing every rank.
+                worst_key = (
+                    "ll_worst_rank"
+                    if _is_ll_kernel(self.config.kernel_type)
+                    else "rdma_worst_rank"
+                )
+                print(
+                    f"  {label.strip()} slowest-rank bandwidth: "
+                    f"{st[worst_key]:.2f} GB/s "
+                    f"(table Average: {_headline_bw(st, self.config.kernel_type):.2f} GB/s)"
                 )
             print(f"{'=' * 70}")
 
@@ -1558,10 +1753,10 @@ class EpDispatchCombineTestCase:
                     combine_hidden_dim=self.combine_hidden_dim,
                     combine_data_type=self.combine_data_type,
                     best_disp_config=best_disp_config,
-                    best_disp_bw=best_disp_bw,
+                    best_disp_bw=_headline_bw(best_disp_stats, self.config.kernel_type),
                     best_disp_all_bw=best_disp_stats,
                     best_comb_config=best_comb_config,
-                    best_comb_bw=best_comb_bw,
+                    best_comb_bw=_headline_bw(best_comb_stats, self.config.kernel_type),
                     best_comb_all_bw=best_comb_stats,
                 )
 
@@ -1668,9 +1863,12 @@ def test_dispatch_combine(
     cmd="test",
     sweep_token_interval=64,
     combine_dtype=None,
-    block_num=-1,
-    rdma_block_num=-1,
-    warp_per_block=-1,
+    disp_block_num=-1,
+    disp_rdma_block_num=-1,
+    disp_warp_per_block=-1,
+    comb_block_num=-1,
+    comb_rdma_block_num=-1,
+    comb_warp_per_block=-1,
     max_total_recv_tokens=0,
     hidden_dim=7168,
     save_tuning_config=None,
@@ -1705,9 +1903,12 @@ def test_dispatch_combine(
         elif cmd == "bench":
             bench_stats = test_case.bench_dispatch_combine(
                 max_tokens,
-                block_num=block_num,
-                rdma_block_num=rdma_block_num,
-                warp_per_block=warp_per_block,
+                disp_block_num=disp_block_num,
+                disp_rdma_block_num=disp_rdma_block_num,
+                disp_warp_per_block=disp_warp_per_block,
+                comb_block_num=comb_block_num,
+                comb_rdma_block_num=comb_rdma_block_num,
+                comb_warp_per_block=comb_warp_per_block,
                 skip_verify=skip_verify,
             )
             if global_rank == 0 and bench_stats is not None:
@@ -1823,23 +2024,67 @@ parser.add_argument(
         "'fp8_direct_cast' is the current BF16<->FP8 direct cast path."
     ),
 )
+# Launch geometry for bench mode. Tuning selects dispatch and combine
+# independently and saves a separate block/warp/rdma triple for each, so bench
+# has to be able to set them separately too -- otherwise a saved tuning result
+# whose two triples differ cannot be replayed through bench at all.
+#
+# --block-num/--warp-per-block/--rdma-block-num set both phases; the per-phase
+# flags override them. Naming matches the intranode benchmark
+# (tests/python/ops/bench_dispatch_combine.py).
 parser.add_argument(
     "--block-num",
     type=int,
     default=None,
-    help="Override block_num for bench mode.",
+    help="Override block_num for both phases in bench mode.",
 )
 parser.add_argument(
     "--warp-per-block",
     type=int,
     default=None,
-    help="Override warp_per_block for bench mode.",
+    help="Override warp_per_block for both phases in bench mode.",
 )
 parser.add_argument(
     "--rdma-block-num",
     type=int,
     default=None,
-    help="Override rdma_block_num for bench mode.",
+    help="Override rdma_block_num for both phases in bench mode.",
+)
+parser.add_argument(
+    "--dispatch-block-num",
+    type=int,
+    default=None,
+    help="Override block_num for dispatch only (wins over --block-num).",
+)
+parser.add_argument(
+    "--dispatch-warp-per-block",
+    type=int,
+    default=None,
+    help="Override warp_per_block for dispatch only (wins over --warp-per-block).",
+)
+parser.add_argument(
+    "--dispatch-rdma-block-num",
+    type=int,
+    default=None,
+    help="Override rdma_block_num for dispatch only (wins over --rdma-block-num).",
+)
+parser.add_argument(
+    "--combine-block-num",
+    type=int,
+    default=None,
+    help="Override block_num for combine only (wins over --block-num).",
+)
+parser.add_argument(
+    "--combine-warp-per-block",
+    type=int,
+    default=None,
+    help="Override warp_per_block for combine only (wins over --warp-per-block).",
+)
+parser.add_argument(
+    "--combine-rdma-block-num",
+    type=int,
+    default=None,
+    help="Override rdma_block_num for combine only (wins over --rdma-block-num).",
 )
 parser.add_argument(
     "--max-recv-total-tokens",
@@ -1894,6 +2139,53 @@ if __name__ == "__main__":
     if sentinel_pattern.isdigit():
         sentinel_pattern = int(sentinel_pattern)
 
+    def _phase_param(per_phase, shared):
+        """Per-phase flag wins over the shared one; -1 means let the op decide."""
+        for v in (per_phase, shared):
+            if v is not None:
+                return v
+        return -1
+
+    disp_block_num = _phase_param(args_cli.dispatch_block_num, args_cli.block_num)
+    disp_rdma_block_num = _phase_param(
+        args_cli.dispatch_rdma_block_num, args_cli.rdma_block_num
+    )
+    disp_warp_per_block = _phase_param(
+        args_cli.dispatch_warp_per_block, args_cli.warp_per_block
+    )
+    comb_block_num = _phase_param(args_cli.combine_block_num, args_cli.block_num)
+    comb_rdma_block_num = _phase_param(
+        args_cli.combine_rdma_block_num, args_cli.rdma_block_num
+    )
+    comb_warp_per_block = _phase_param(
+        args_cli.combine_warp_per_block, args_cli.warp_per_block
+    )
+
+    # Only --cmd bench forwards these; test/test_sentinel/sweep build their own
+    # ops and let the op resolve the geometry. Silently ignoring nine flags is
+    # how a "control run" ends up measuring the default config while its author
+    # believes otherwise, so say it.
+    if args_cli.cmd != "bench" and any(
+        v is not None
+        for v in (
+            args_cli.block_num,
+            args_cli.warp_per_block,
+            args_cli.rdma_block_num,
+            args_cli.dispatch_block_num,
+            args_cli.dispatch_warp_per_block,
+            args_cli.dispatch_rdma_block_num,
+            args_cli.combine_block_num,
+            args_cli.combine_warp_per_block,
+            args_cli.combine_rdma_block_num,
+        )
+    ):
+        print(
+            f"Warning: block/warp/rdma launch overrides are ignored when "
+            f"--cmd {args_cli.cmd}; only --cmd bench applies them. To pin a "
+            f"geometry elsewhere, use MORI_EP_LAUNCH_CONFIG_MODE=AUTO with a "
+            f"tuning config."
+        )
+
     world_size = num_node * gpu_per_node
     torch.multiprocessing.spawn(
         test_dispatch_combine,
@@ -1908,9 +2200,12 @@ if __name__ == "__main__":
             args_cli.cmd,
             args_cli.sweep_token_interval,
             combine_dtype,
-            args_cli.block_num if args_cli.block_num is not None else -1,
-            args_cli.rdma_block_num if args_cli.rdma_block_num is not None else -1,
-            args_cli.warp_per_block if args_cli.warp_per_block is not None else -1,
+            disp_block_num,
+            disp_rdma_block_num,
+            disp_warp_per_block,
+            comb_block_num,
+            comb_rdma_block_num,
+            comb_warp_per_block,
             args_cli.max_recv_total_tokens,
             args_cli.hidden_dim,
             args_cli.save_tuning_config,
