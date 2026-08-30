@@ -744,6 +744,37 @@ __global__ void EpDispatchInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> a
 }
 
 /* ---------------------------------------------------------------------------------------------- */
+/*                       Attribution-only phase splits (MORI_SPLIT_DISP=1)                        */
+/* ---------------------------------------------------------------------------------------------- */
+// The dispatch kernel interleaves sending, receiving and the closing sync, and a
+// single kernel duration cannot say which of the three the time belongs to.
+// These run one phase per launch so a kernel profile attributes it. Splitting
+// serialises phases that otherwise overlap, so they are for measurement only and
+// the launcher only uses them when MORI_SPLIT_DISP is set.
+template <typename T>
+__device__ void EpDispatchLLSendPhase_body(EpDispatchCombineArgs<T> args) {
+  DEF_COMMON_VARS;
+  if (blockId < args.rdmaBlockNum) {
+    v1::DispatchInterNodeLLSend<T>(args);
+  } else {
+    v1::DispatchIntraNode(args);
+  }
+}
+
+template <typename T>
+__device__ void EpDispatchLLRecvPhase_body(EpDispatchCombineArgs<T> args) {
+  DEF_COMMON_VARS;
+  if (blockId < args.rdmaBlockNum) {
+    v1::DispatchInterNodeLLRecv(args);
+  }
+}
+
+template <typename T>
+__device__ void EpDispatchLLSyncPhase_body(EpDispatchCombineArgs<T> args) {
+  v1::DispatchSync(args);
+}
+
+/* ---------------------------------------------------------------------------------------------- */
 /*                                   EpCombineInterNodeV1Kernel                                   */
 /* ---------------------------------------------------------------------------------------------- */
 namespace v1 {

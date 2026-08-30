@@ -121,6 +121,7 @@ def _hipcc_device_bc(
         *_nic_defines(),
         *_ccqe_defines(),
         *_profiler_defines(),
+        *_tunable_defines(),
         *(extra_defines or []),
     ]
     for d in include_dirs:
@@ -270,6 +271,17 @@ def is_ccqe_enabled() -> bool:
 
 def _ccqe_defines() -> list[str]:
     return ["-DIONIC_CCQE"] if is_ccqe_enabled() else []
+
+
+def _env_defines() -> list[str]:
+    """Extra -D flags from MORI_JIT_DEFINES, for one-off device-side probes.
+
+    Comma separated, e.g. MORI_JIT_DEFINES=MORI_TIME_PUT. The cache hash already
+    covers the real -D list, so a different setting lands in a different cache
+    entry rather than reusing a stale object.
+    """
+    raw = os.environ.get("MORI_JIT_DEFINES", "").strip()
+    return [f"-D{d.strip()}" for d in raw.split(",") if d.strip()]
 
 
 def _nic_defines() -> list[str]:
@@ -441,8 +453,11 @@ def _tunable_defines() -> list[str]:
     cache.get_cache_dir keys the build on, so a future value-carrying -D has one place to go and
     cannot end up in the compile without being in the key -- which is the bug that made a run with
     the quantise pass deleted load the full build's object and report the full build's time.
+
+    MORI_JIT_DEFINES goes through here for exactly that reason: a one-off device
+    probe changes the emitted code, so it has to change the cache directory too.
     """
-    return []
+    return _env_defines()
 
 
 def _hipcc_genco(

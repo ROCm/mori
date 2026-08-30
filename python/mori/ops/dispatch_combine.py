@@ -188,6 +188,12 @@ def _normalize_quant_type(quant_type):
     )
 
 
+# Attribution only: run one dispatch phase per launch so a kernel-level profile
+# can say whether the time is send, recv or sync. Splitting serialises phases
+# that otherwise overlap, so this is for measurement, not production.
+_SPLIT_DISP = os.environ.get("MORI_SPLIT_DISP") == "1"
+
+
 def _current_stream():
     # torch.cuda.current_stream() re-resolves the device index and builds a
     # Stream object on every call (~4.9us measured); the raw binding it wraps
@@ -1274,17 +1280,35 @@ class EpDispatchCombineOp:
             )
         elif kt == EpDispatchCombineKernelType.InterNodeV1LL.value:
             mp = self._handle_info["multi_processor_count"]
-            self._launch_multi(
-                [
-                    f"EpDispatchCopyToStaging_{sfx}",
-                    f"EpDispatchInterNodeV1KernelLowLatency_{sfx}",
-                ],
-                [mp, actual_bn],
-                [self._warp_size * actual_wpb, self._warp_size * actual_wpb],
-                [0, shared_mem],
-                stream,
-                args_ptr,
-            )
+            bsz = self._warp_size * actual_wpb
+            if _SPLIT_DISP:
+                # Attribution only: one launch per phase so a kernel profile can
+                # say whether dispatch time is send, recv or sync.
+                self._launch_multi(
+                    [
+                        f"EpDispatchCopyToStaging_{sfx}",
+                        f"EpDispatchLLSendPhase_{sfx}",
+                        f"EpDispatchLLRecvPhase_{sfx}",
+                        f"EpDispatchLLSyncPhase_{sfx}",
+                    ],
+                    [mp, actual_bn, actual_bn, actual_bn],
+                    [bsz, bsz, bsz, bsz],
+                    [0, shared_mem, shared_mem, shared_mem],
+                    stream,
+                    args_ptr,
+                )
+            else:
+                self._launch_multi(
+                    [
+                        f"EpDispatchCopyToStaging_{sfx}",
+                        f"EpDispatchInterNodeV1KernelLowLatency_{sfx}",
+                    ],
+                    [mp, actual_bn],
+                    [bsz, bsz],
+                    [0, shared_mem],
+                    stream,
+                    args_ptr,
+                )
         elif kt == EpDispatchCombineKernelType.IntraNode.value:
             self._launch(
                 self._intranode_dispatch_kernel(sfx),

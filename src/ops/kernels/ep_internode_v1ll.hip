@@ -7,6 +7,11 @@ WRAP_ALL_TYPES(EpDispatchCopyToStaging)
 WRAP_ALL_TYPES_BOOL(EpDispatchInterNodeV1KernelLowLatency, , false)
 WRAP_ALL_TYPES_BOOL(EpDispatchInterNodeV1KernelLowLatency, _stdmoe, true)
 
+// Attribution-only, gated by MORI_SPLIT_DISP at launch time.
+WRAP_ALL_TYPES(EpDispatchLLSendPhase)
+WRAP_ALL_TYPES(EpDispatchLLRecvPhase)
+WRAP_ALL_TYPES(EpDispatchLLSyncPhase)
+
 WRAP_ALL_TYPES(EpCombineSync)
 WRAP_ALL_TYPES(EpCombineSyncBarrier)
 WRAP_ALL_TYPES_BOOL(EpCombineInterNodeV1KernelLowLatency, , false)
