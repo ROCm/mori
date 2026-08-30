@@ -62,9 +62,16 @@ def _bw_beats(new_bw, new_cfg, best_bw, best_cfg):
     _beats().
 
     Wins outright past the margin; within it, ties break on the
-    lexicographically smaller (block_num, warp_per_block) so re-tuning the same
-    hardware is deterministic instead of depending on which candidate the sweep
-    reached first.
+    lexicographically smaller (block_num, warp_per_block), so a tie resolves to
+    the smaller geometry rather than to whichever candidate the sweep reached
+    first.
+
+    As in the inter-node _beats(), the tie-break cannot fire under the current
+    ascending sweep order, and the same caveat applies before reordering it:
+    the caller overwrites best_bw with the winner's bandwidth, so a tie-break
+    win at MORI_EP_TUNING_MARGIN > 0 installs a *lower* bandwidth as the
+    baseline for the next comparison and the incumbent can ratchet downward.
+    Split the comparison baseline from the selected candidate first.
     """
     if best_cfg is None:
         return True

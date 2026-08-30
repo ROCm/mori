@@ -969,10 +969,14 @@ class EpDispatchCombineOp:
         dispatch+combine round measured ~60us of host time, and at small token
         counts the host submission path is what paces the GPU.
 
-        The cache key includes the pointer, so if a buffer were ever
-        reallocated the lookup misses and a correct view is built rather than a
-        stale one being returned. Entries are bounded by the number of distinct
-        (shape, dtype) a given op is called with -- one, for a fixed model.
+        The cache key includes the pointer so that shape/dtype/pointer together
+        determine the entry. It is not protection against reallocation: the
+        pointers themselves are snapshotted once in __init__ and never
+        refreshed, so a realloc would leave both the key and the view stale.
+        That assumption is pre-existing -- the buffers are handle-owned and have
+        no realloc path -- and this cache does not weaken it. Entries are
+        bounded by the number of distinct (shape, dtype) a given op is called
+        with -- one, for a fixed model.
 
         The returned tensor aliases exactly the memory a fresh view would, and
         the kernels overwrite it in place either way, so callers see no change

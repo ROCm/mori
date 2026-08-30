@@ -94,12 +94,20 @@ def _beats(new_lat, new_cfg, best_lat, best_cfg):
 
     Wins outright past the margin; within it, ties break on the
     lexicographically smaller (block_num, warp_per_block, rdma_block_num)
-    tuple so re-tuning the same hardware is deterministic regardless of sweep
-    order. (Comparing only new_cfg[0] here used to be equivalent to a no-op:
-    the sweep visits block_num in ascending order, so a later candidate's
-    block_num is never smaller than the incumbent's -- the full-tuple
-    comparison actually does the tie-break instead of relying on visitation
-    order, so this keeps working if the sweep is ever parallelized.)
+    tuple, so a tie resolves to the smaller geometry rather than to whichever
+    candidate happened to be measured first.
+
+    The tie-break cannot fire under the current sweep, which visits
+    block/warp/rdma in ascending order: new_cfg is then always greater than
+    best_cfg. That is deliberate, not an accident to rely on -- but note what
+    would happen if the sweep were reordered or parallelized. The caller
+    overwrites best_lat with the winner's latency, so a tie-break win at
+    MORI_EP_TUNING_MARGIN > 0 installs a *worse* latency as the new baseline,
+    and the next comparison is made against it: the incumbent can ratchet
+    steadily worse, each step individually "within the margin". Before
+    changing the visit order, split the comparison baseline from the selected
+    candidate -- keep the best latency ever seen for the margin test and let
+    only cfg/stats follow the tie-break.
     """
     if best_cfg is None:
         return True
@@ -139,8 +147,8 @@ def _headline_bw(stats, kernel_type):
     Rules already on disk keep their slowest-rank value until re-tuned, so
     bandwidth_gbps is only comparable within one tuning run's output -- which
     is all it was ever good for, given two runs come from different hosts and
-    load. The slowest-rank figure is still printed per candidate for reference
-    (see the sweep's summary), just not saved.
+    load. The slowest-rank figure is still printed next to the winner in the
+    sweep's summary, as a straggler check, just not saved.
     """
     return stats["ll"][2] if _is_ll_kernel(kernel_type) else stats["rdma"][2]
 
