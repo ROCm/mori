@@ -118,6 +118,21 @@ def _beats(new_lat, new_cfg, best_lat, best_cfg):
     return False
 
 
+def _launch_params_str(block_num, warp_per_block, rdma_block_num):
+    """Render one phase's launch geometry for a table title.
+
+    -1 means "not overridden on the command line", in which case the op resolves
+    the value itself (from the tuning config, else a built-in default), so the
+    number that ends up running is not known here -- say `auto` rather than
+    print -1 as if it were a block count.
+    """
+
+    def _v(x):
+        return "auto" if x is None or x < 0 else str(x)
+
+    return f"block={_v(block_num)} warp={_v(warp_per_block)} rdma={_v(rdma_block_num)}"
+
+
 def _is_ll_kernel(kernel_type):
     return kernel_type in (
         mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
@@ -1116,9 +1131,12 @@ class EpDispatchCombineTestCase:
         op,
         test_data,
         repeat=10,
-        block_num=-1,
-        rdma_block_num=-1,
-        warp_per_block=-1,
+        disp_block_num=-1,
+        disp_rdma_block_num=-1,
+        disp_warp_per_block=-1,
+        comb_block_num=-1,
+        comb_rdma_block_num=-1,
+        comb_warp_per_block=-1,
     ):
         num_events = 3 * repeat + 1
         events = [torch.cuda.Event(enable_timing=True) for i in range(num_events)]
@@ -1145,9 +1163,9 @@ class EpDispatchCombineTestCase:
                 all_rank_weights[self.rank],
                 all_rank_scales[self.rank],
                 all_rank_indices[self.rank],
-                block_num=block_num,
-                rdma_block_num=rdma_block_num,
-                warp_per_block=warp_per_block,
+                block_num=disp_block_num,
+                rdma_block_num=disp_rdma_block_num,
+                warp_per_block=disp_warp_per_block,
             )
             if i == warmup_rounds - 1:
                 torch.cuda.synchronize()
@@ -1158,9 +1176,9 @@ class EpDispatchCombineTestCase:
                 combine_input,
                 None,
                 all_rank_indices[self.rank],
-                block_num=block_num,
-                rdma_block_num=rdma_block_num,
-                warp_per_block=warp_per_block,
+                block_num=comb_block_num,
+                rdma_block_num=comb_rdma_block_num,
+                warp_per_block=comb_warp_per_block,
             )
             torch.cuda.synchronize()
         total_rdma_recv_num_token = compute_rdma_algo_token_count(
@@ -1197,9 +1215,9 @@ class EpDispatchCombineTestCase:
                 all_rank_weights[self.rank],
                 all_rank_scales[self.rank],
                 all_rank_indices[self.rank],
-                block_num=block_num,
-                rdma_block_num=rdma_block_num,
-                warp_per_block=warp_per_block,
+                block_num=disp_block_num,
+                rdma_block_num=disp_rdma_block_num,
+                warp_per_block=disp_warp_per_block,
             )
             events[3 * i + 1].record()
             combine_input = self._convert_for_combine(dispatch_output)
@@ -1209,9 +1227,9 @@ class EpDispatchCombineTestCase:
                 combine_input,
                 None,
                 all_rank_indices[self.rank],
-                block_num=block_num,
-                rdma_block_num=rdma_block_num,
-                warp_per_block=warp_per_block,
+                block_num=comb_block_num,
+                rdma_block_num=comb_rdma_block_num,
+                warp_per_block=comb_warp_per_block,
             )
             events[3 * i + 3].record()
         torch.cuda.synchronize()
@@ -1295,9 +1313,12 @@ class EpDispatchCombineTestCase:
     def bench_dispatch_combine(
         self,
         max_num_token,
-        block_num=-1,
-        rdma_block_num=-1,
-        warp_per_block=-1,
+        disp_block_num=-1,
+        disp_rdma_block_num=-1,
+        disp_warp_per_block=-1,
+        comb_block_num=-1,
+        comb_rdma_block_num=-1,
+        comb_warp_per_block=-1,
         skip_verify=False,
     ):
         op = mori.ops.EpDispatchCombineOp(self.config)
@@ -1324,9 +1345,12 @@ class EpDispatchCombineTestCase:
             op,
             test_data,
             repeat,
-            block_num=block_num,
-            rdma_block_num=rdma_block_num,
-            warp_per_block=warp_per_block,
+            disp_block_num=disp_block_num,
+            disp_rdma_block_num=disp_rdma_block_num,
+            disp_warp_per_block=disp_warp_per_block,
+            comb_block_num=comb_block_num,
+            comb_rdma_block_num=comb_rdma_block_num,
+            comb_warp_per_block=comb_warp_per_block,
         )
         ll_mode_scale = bench_result[-1]
         all_data, _ = self._all_gather_bench_data(bench_result)
@@ -1372,8 +1396,18 @@ class EpDispatchCombineTestCase:
 
         disp_dtype_str = str(self.config.data_type).split(".")[-1]
         comb_dtype_str = str(self.combine_data_type).split(".")[-1]
-        disp_title = f"Dispatch Performance ({disp_dtype_str})"
-        comb_title = f"Combine Performance ({comb_dtype_str})"
+        # Name the launch config each table was produced with. Dispatch and
+        # combine can be given different values, so a table without it cannot be
+        # matched back to the run that produced it -- which is the whole point of
+        # feeding a tuning result back through bench.
+        disp_title = (
+            f"Dispatch Performance ({disp_dtype_str}) "
+            f"{_launch_params_str(disp_block_num, disp_warp_per_block, disp_rdma_block_num)}"
+        )
+        comb_title = (
+            f"Combine Performance ({comb_dtype_str}) "
+            f"{_launch_params_str(comb_block_num, comb_warp_per_block, comb_rdma_block_num)}"
+        )
         if self.combine_data_type != self.config.data_type:
             disp_elem = torch.tensor([], dtype=self.config.data_type).element_size()
             comb_elem = torch.tensor([], dtype=self.combine_data_type).element_size()
@@ -1622,14 +1656,21 @@ class EpDispatchCombineTestCase:
                             f"block={bn} warp={warp} rdma={rdma_bn}\n"
                             f"{'=' * 60}"
                         )
+                    # Common sweep: one candidate drives both phases, so a
+                    # single pass times dispatch and combine under the same
+                    # geometry. The two argmins below are still independent --
+                    # the winners may differ, and each is saved on its own.
                     bench_result = self.run_bench_once(
                         max_num_token,
                         op,
                         test_data,
                         repeat=_EP_ROUNDS,
-                        block_num=bn,
-                        rdma_block_num=rdma_bn,
-                        warp_per_block=warp,
+                        disp_block_num=bn,
+                        disp_rdma_block_num=rdma_bn,
+                        disp_warp_per_block=warp,
+                        comb_block_num=bn,
+                        comb_rdma_block_num=rdma_bn,
+                        comb_warp_per_block=warp,
                     )
                     all_data, ll_scale = self._all_gather_bench_data(bench_result)
                     kept = all_data[1:]  # skip round 0, same as bench
@@ -1822,9 +1863,12 @@ def test_dispatch_combine(
     cmd="test",
     sweep_token_interval=64,
     combine_dtype=None,
-    block_num=-1,
-    rdma_block_num=-1,
-    warp_per_block=-1,
+    disp_block_num=-1,
+    disp_rdma_block_num=-1,
+    disp_warp_per_block=-1,
+    comb_block_num=-1,
+    comb_rdma_block_num=-1,
+    comb_warp_per_block=-1,
     max_total_recv_tokens=0,
     hidden_dim=7168,
     save_tuning_config=None,
@@ -1859,9 +1903,12 @@ def test_dispatch_combine(
         elif cmd == "bench":
             bench_stats = test_case.bench_dispatch_combine(
                 max_tokens,
-                block_num=block_num,
-                rdma_block_num=rdma_block_num,
-                warp_per_block=warp_per_block,
+                disp_block_num=disp_block_num,
+                disp_rdma_block_num=disp_rdma_block_num,
+                disp_warp_per_block=disp_warp_per_block,
+                comb_block_num=comb_block_num,
+                comb_rdma_block_num=comb_rdma_block_num,
+                comb_warp_per_block=comb_warp_per_block,
                 skip_verify=skip_verify,
             )
             if global_rank == 0 and bench_stats is not None:
@@ -1977,23 +2024,67 @@ parser.add_argument(
         "'fp8_direct_cast' is the current BF16<->FP8 direct cast path."
     ),
 )
+# Launch geometry for bench mode. Tuning selects dispatch and combine
+# independently and saves a separate block/warp/rdma triple for each, so bench
+# has to be able to set them separately too -- otherwise a saved tuning result
+# whose two triples differ cannot be replayed through bench at all.
+#
+# --block-num/--warp-per-block/--rdma-block-num set both phases; the per-phase
+# flags override them. Naming matches the intranode benchmark
+# (tests/python/ops/bench_dispatch_combine.py).
 parser.add_argument(
     "--block-num",
     type=int,
     default=None,
-    help="Override block_num for bench mode.",
+    help="Override block_num for both phases in bench mode.",
 )
 parser.add_argument(
     "--warp-per-block",
     type=int,
     default=None,
-    help="Override warp_per_block for bench mode.",
+    help="Override warp_per_block for both phases in bench mode.",
 )
 parser.add_argument(
     "--rdma-block-num",
     type=int,
     default=None,
-    help="Override rdma_block_num for bench mode.",
+    help="Override rdma_block_num for both phases in bench mode.",
+)
+parser.add_argument(
+    "--dispatch-block-num",
+    type=int,
+    default=None,
+    help="Override block_num for dispatch only (wins over --block-num).",
+)
+parser.add_argument(
+    "--dispatch-warp-per-block",
+    type=int,
+    default=None,
+    help="Override warp_per_block for dispatch only (wins over --warp-per-block).",
+)
+parser.add_argument(
+    "--dispatch-rdma-block-num",
+    type=int,
+    default=None,
+    help="Override rdma_block_num for dispatch only (wins over --rdma-block-num).",
+)
+parser.add_argument(
+    "--combine-block-num",
+    type=int,
+    default=None,
+    help="Override block_num for combine only (wins over --block-num).",
+)
+parser.add_argument(
+    "--combine-warp-per-block",
+    type=int,
+    default=None,
+    help="Override warp_per_block for combine only (wins over --warp-per-block).",
+)
+parser.add_argument(
+    "--combine-rdma-block-num",
+    type=int,
+    default=None,
+    help="Override rdma_block_num for combine only (wins over --rdma-block-num).",
 )
 parser.add_argument(
     "--max-recv-total-tokens",
@@ -2048,6 +2139,28 @@ if __name__ == "__main__":
     if sentinel_pattern.isdigit():
         sentinel_pattern = int(sentinel_pattern)
 
+    def _phase_param(per_phase, shared):
+        """Per-phase flag wins over the shared one; -1 means let the op decide."""
+        for v in (per_phase, shared):
+            if v is not None:
+                return v
+        return -1
+
+    disp_block_num = _phase_param(args_cli.dispatch_block_num, args_cli.block_num)
+    disp_rdma_block_num = _phase_param(
+        args_cli.dispatch_rdma_block_num, args_cli.rdma_block_num
+    )
+    disp_warp_per_block = _phase_param(
+        args_cli.dispatch_warp_per_block, args_cli.warp_per_block
+    )
+    comb_block_num = _phase_param(args_cli.combine_block_num, args_cli.block_num)
+    comb_rdma_block_num = _phase_param(
+        args_cli.combine_rdma_block_num, args_cli.rdma_block_num
+    )
+    comb_warp_per_block = _phase_param(
+        args_cli.combine_warp_per_block, args_cli.warp_per_block
+    )
+
     world_size = num_node * gpu_per_node
     torch.multiprocessing.spawn(
         test_dispatch_combine,
@@ -2062,9 +2175,12 @@ if __name__ == "__main__":
             args_cli.cmd,
             args_cli.sweep_token_interval,
             combine_dtype,
-            args_cli.block_num if args_cli.block_num is not None else -1,
-            args_cli.rdma_block_num if args_cli.rdma_block_num is not None else -1,
-            args_cli.warp_per_block if args_cli.warp_per_block is not None else -1,
+            disp_block_num,
+            disp_rdma_block_num,
+            disp_warp_per_block,
+            comb_block_num,
+            comb_rdma_block_num,
+            comb_warp_per_block,
             args_cli.max_recv_total_tokens,
             args_cli.hidden_dim,
             args_cli.save_tuning_config,

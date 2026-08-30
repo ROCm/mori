@@ -1534,29 +1534,45 @@ if __name__ == "__main__":
             "'fp8_blockwise' is the BF16<->FP8 blockwise quant path."
         ),
     )
+    # --block-num/--warp-per-block set both phases; the per-phase flags override
+    # them. Same shape as the internode benchmark
+    # (examples/ops/dispatch_combine/test_dispatch_combine_internode.py), which
+    # additionally carries an rdma_block_num triple that has no meaning here.
+    parser.add_argument(
+        "--block-num",
+        type=int,
+        default=None,
+        help="Override block_num for both phases. Ignored when --cmd tuning.",
+    )
+    parser.add_argument(
+        "--warp-per-block",
+        type=int,
+        default=None,
+        help="Override warp_per_block for both phases. Ignored when --cmd tuning.",
+    )
     parser.add_argument(
         "--dispatch-block-num",
         type=int,
         default=None,
-        help="Override dispatch block_num for bench/stress. Ignored when --cmd tuning.",
+        help="Override dispatch block_num for bench/stress (wins over --block-num).",
     )
     parser.add_argument(
         "--dispatch-warp-per-block",
         type=int,
         default=None,
-        help="Override dispatch warp_per_block for bench/stress. Ignored when --cmd tuning.",
+        help="Override dispatch warp_per_block for bench/stress (wins over --warp-per-block).",
     )
     parser.add_argument(
         "--combine-block-num",
         type=int,
         default=None,
-        help="Override combine block_num for bench/stress. Ignored when --cmd tuning.",
+        help="Override combine block_num for bench/stress (wins over --block-num).",
     )
     parser.add_argument(
         "--combine-warp-per-block",
         type=int,
         default=None,
-        help="Override combine warp_per_block for bench/stress. Ignored when --cmd tuning.",
+        help="Override combine warp_per_block for bench/stress (wins over --warp-per-block).",
     )
     parser.add_argument(
         "--world-size",
@@ -1760,6 +1776,19 @@ if __name__ == "__main__":
     base_hidden_dim = args.hidden_dim
     dispatch_hidden_dim = (
         base_hidden_dim // 2 if _is_fp4x2_dtype(dispatch_dtype) else base_hidden_dim
+    )
+
+    # Per-phase flag wins over the shared one; None means let the op decide.
+    def _phase_param(per_phase, shared):
+        return per_phase if per_phase is not None else shared
+
+    args.dispatch_block_num = _phase_param(args.dispatch_block_num, args.block_num)
+    args.dispatch_warp_per_block = _phase_param(
+        args.dispatch_warp_per_block, args.warp_per_block
+    )
+    args.combine_block_num = _phase_param(args.combine_block_num, args.block_num)
+    args.combine_warp_per_block = _phase_param(
+        args.combine_warp_per_block, args.warp_per_block
     )
 
     print(
