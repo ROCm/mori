@@ -14,6 +14,7 @@
 #include <thread>
 #include <vector>
 
+#include "umbp/distributed/peer/backend/instrumented_backend.h"
 #include "umbp/distributed/peer/backend/mock_backend.h"
 #include "umbp/distributed/peer/backend/page_backend.h"
 #include "umbp/distributed/pool/peer_pool.h"
@@ -41,6 +42,7 @@ void RegisterPageBackend(BackendRegistry* registry, TransferEngine* engine,
   PageBackend::OwnershipConfig ownership;
   ownership.buffer_sizes = {pages * page_size};
   auto backend = MakePageBackend(tier, page_size, ownership, kNoExpiry, read_lease_ttl);
+  backend = MakeInstrumentedBackend(std::move(backend));
   ASSERT_TRUE(backend->Init(engine));
   ASSERT_TRUE(registry->Register(name, std::move(backend)));
 }
