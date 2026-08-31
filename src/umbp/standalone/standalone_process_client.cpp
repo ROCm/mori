@@ -51,19 +51,16 @@ namespace {
 
 std::atomic<uint64_t> g_client_counter{0};
 
-// Travels with a ranged get that names its keys by handle, so the server can
-// check the handle still stands for the list the caller means. It is a check,
-// not the lookup: both sides also hold the keys themselves and the client side
-// compares them in full, so a collision costs a resend and never a wrong read.
+// Travels with a handle so the server can check it still stands for the list the
+// caller means. A check, not the lookup: the client compares the keys in full,
+// so a collision costs a resend and never a wrong read.
 //
-// Computed once per key set, on the call that introduces it -- the same call
-// that pays to serialize the keys anyway -- and reused for every call after.
+// Computed once per key set, on the call that already pays to serialize it.
 // Zero is reserved to mean "do not bother remembering this set".
+//
+// A word at a time: byte-wise FNV-1a retires one byte per multiply latency,
+// which at a thousand ~128-byte keys is tens of microseconds.
 uint64_t FingerprintKeys(const std::vector<std::string>& keys) {
-  // A word at a time. Byte-wise FNV-1a is one byte per multiply latency, and a
-  // layer-wise restore introduces a key set of a thousand ~128-byte keys, which
-  // put this in the tens of microseconds -- charged to the very call the handle
-  // exists to make cheaper.
   constexpr uint64_t kMul1 = 0x9e3779b97f4a7c15ULL;
   constexpr uint64_t kMul2 = 0xc2b2ae3d27d4eb4fULL;
   uint64_t hash = 1469598103934665603ULL;
@@ -88,7 +85,6 @@ uint64_t FingerprintKeys(const std::vector<std::string>& keys) {
       mix_word(tail);
     }
   }
-  // Zero is reserved to mean "do not bother remembering this set".
   return hash == 0 ? kMul1 : hash;
 }
 
@@ -475,9 +471,8 @@ uint64_t StandaloneProcessClient::LookupKeyHandle(const std::vector<std::string>
   {
     std::lock_guard<std::mutex> lock(key_handle_mu_);
     for (size_t i = 0; i < key_handles_.size(); ++i) {
-      // Size, then the two ends, then the whole thing. The cheap checks reject
-      // a different set outright; the full compare runs only for the set that
-      // is about to be a hit, and is what makes the match exact.
+      // Size, then the two ends, then the whole thing: the cheap tests reject a
+      // different set outright, so the full compare runs only for a hit.
       const KeyHandle& entry = key_handles_[i];
       if (entry.keys.size() != keys.size()) continue;
       if (entry.keys.front() != keys.front() || entry.keys.back() != keys.back()) continue;
@@ -537,9 +532,8 @@ std::vector<bool> StandaloneProcessClient::BatchGetRanges(
     }
   }
 
-  // At most twice: once naming a handle, and if the server no longer holds it,
-  // once carrying the keys. A handle is only ever offered after the server
-  // handed it out, so the retry is the rare path.
+  // At most twice: once naming a handle, then -- only if the server no longer
+  // holds it -- once carrying the keys.
   for (int attempt = 0; attempt < 2; ++attempt) {
     if (handle != 0) {
       req.set_key_handle(handle);

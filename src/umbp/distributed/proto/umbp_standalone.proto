@@ -101,17 +101,15 @@ message BatchRangeDataRequest {
   repeated uint64 object_offsets = 7;
   // Put only: the expected full object size, one per key. Empty for get.
   repeated uint64 object_sizes = 8;
-  // Get only, optional. A layer-wise reader names one key set once per layer
-  // group, changing only which bytes it wants, so the keys are the one part of
-  // the request that does not change between the calls. Non-zero key_handle
-  // names a key list the server minted on an earlier call and still holds, and
-  // `keys` is then empty.
+  // Get only, optional. Non-zero key_handle names a key list the server minted
+  // on an earlier call and still holds; `keys` is then empty. A layer-wise
+  // reader asks about one set once per layer group, so this is the part of the
+  // request worth not repeating.
   //
-  // This is a hint and nothing more: a handle the server no longer holds --
-  // evicted, or from an earlier server -- is answered with key_handle_unknown
-  // and the caller simply repeats the call carrying its keys. key_fingerprint
-  // is checked against the one recorded when the handle was minted, so a handle
-  // can never bind to a key list other than the one it was minted for.
+  // A hint and nothing more: a handle the server no longer holds is answered
+  // with key_handle_unknown, and the caller repeats the call carrying its keys.
+  // key_fingerprint is checked against the one recorded at mint, so a handle
+  // can never bind to a list other than the one it was minted for.
   uint64 key_handle = 9;
   uint64 key_fingerprint = 10;
 }
@@ -127,13 +125,11 @@ message BatchDataWithDepthRequest {
 
 message BatchBoolResponse {
   repeated bool ok = 1;
-  // BatchGetRanges only. Non-zero when the server took this call's key list and
-  // minted a handle for it; the caller may name that handle instead of the keys
-  // next time it asks about the same set.
+  // BatchGetRanges only. Non-zero when the server minted a handle for this
+  // call's key list; name it instead of the keys next time.
   uint64 key_handle = 2;
-  // The offered key_handle is not one the server holds, or does not match the
-  // offered fingerprint. Nothing was read; `ok` is empty. Repeat the call with
-  // the keys.
+  // The offered key_handle is unknown, or does not match the offered
+  // fingerprint. Nothing was read and `ok` is empty; repeat the call with keys.
   bool key_handle_unknown = 3;
 }
 

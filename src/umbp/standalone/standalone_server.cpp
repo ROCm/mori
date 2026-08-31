@@ -169,23 +169,15 @@ class ConditionalReadLock {
   std::unique_lock<std::shared_mutex> exclusive_;
 };
 
-// The key lists BatchGetRanges callers have asked the server to remember.
+// Key lists a BatchGetRanges caller has asked the server to remember, so that a
+// layer-wise reader naming one set once per layer group sends them only once.
 //
-// A layer-wise restore names one key set once per layer group -- eight times
-// over at UMBP_LAYER_GROUP=8 -- and the keys are the only part of the request
-// that is identical across those calls. At a thousand-odd ~128-byte keys that
-// is over a hundred kilobytes serialized, then a heap allocation per key to
-// deserialize, seven times for nothing.
+// Deliberately only a hint: the table is bounded and evicts, and a handle it no
+// longer holds is reported unknown rather than failed, so nothing has to be
+// closed or revoked and a crashed client leaves nothing behind.
 //
-// A handle stands in for the list. It is deliberately only a hint: the table is
-// bounded and evicts, a handle it no longer holds is reported unknown and the
-// caller repeats the call carrying its keys, and nothing has to be closed or
-// revoked for the entry to go away. That is what keeps a client crash, a server
-// restart, or a caller that simply forgets from mattering at all.
-//
-// The fingerprint is the safety property. It is recorded when the handle is
-// minted and checked on every use, so the handle cannot name a list other than
-// the one it was minted for even if a caller confuses two of its own.
+// The fingerprint is the safety property -- recorded at mint, checked on every
+// use, so a handle cannot name a list other than the one it was minted for.
 class KeyHandleTable {
  public:
   using Keys = std::shared_ptr<const std::vector<std::string>>;
@@ -208,9 +200,7 @@ class KeyHandleTable {
 
   uint64_t Insert(Keys keys, uint64_t fingerprint) {
     std::lock_guard<std::mutex> lock(mu_);
-    // Never reused within a process, so a handle that is found is always the
-    // list it was minted for; across processes the table starts empty, and the
-    // fingerprint covers the rest.
+    // Never reused within a process; across processes the table starts empty.
     const uint64_t handle = next_++;
     ++mints_;
     lru_.push_front(handle);
@@ -223,11 +213,8 @@ class KeyHandleTable {
   }
 
  private:
-  // Whether the handle is doing anything is not something a caller can see:
-  // a hit and a miss both return the right bytes, and a miss only shows up as
-  // a request that was larger than it had to be. UMBP_KEY_HANDLE_DEBUG=1 makes
-  // the hit rate observable so a deployment can tell "working" from "silently
-  // resending every time".
+  // A hit and a miss both return the right bytes, so a handle that never hits is
+  // invisible. UMBP_KEY_HANDLE_DEBUG=1 makes the hit rate observable.
   static bool DebugEnabled() {
     static const bool enabled = [] {
       const char* raw = std::getenv("UMBP_KEY_HANDLE_DEBUG");
@@ -247,9 +234,8 @@ class KeyHandleTable {
         entries_.size());
   }
 
-  // A restore has one key set in flight per pool it reads, and the reader
-  // chunks a pool's keys by a range budget, so a handful of sets are live at
-  // once. Sized well past that; the cost of being wrong is a resend.
+  // A restore has a handful of key sets live at once -- one per pool, chunked by
+  // a range budget. Sized well past that; being wrong costs a resend.
   static constexpr size_t kCapacity = 64;
   static constexpr uint64_t kReportEvery = 512;
 
@@ -526,9 +512,9 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
 
   grpc::Status BatchGetRanges(grpc::ServerContext*, const ::umbp::BatchRangeDataRequest* request,
                               ::umbp::BatchBoolResponse* response) override {
-    // The key list either rides on the request or is one the server was asked
-    // to remember on an earlier call. A handle it no longer holds is not an
-    // error -- say so, and the caller repeats the call carrying its keys.
+    // The keys either ride on the request or are named by a handle from an
+    // earlier call. A handle the server no longer holds is not an error: say so,
+    // and the caller repeats the call carrying its keys.
     KeyHandleTable::Keys keys;
     if (request->key_handle() != 0) {
       if (request->keys_size() != 0) {
@@ -543,8 +529,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     } else {
       auto owned = std::make_shared<std::vector<std::string>>(request->keys().begin(),
                                                               request->keys().end());
-      // A zero fingerprint means the caller does not intend to come back, so
-      // there is nothing to remember for it.
+      // Zero fingerprint: the caller will not come back, so remember nothing.
       if (request->key_fingerprint() != 0) {
         response->set_key_handle(key_handles_.Insert(owned, request->key_fingerprint()));
       }

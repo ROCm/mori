@@ -135,28 +135,20 @@ class StandaloneProcessClient : public IUMBPClient {
   std::string client_id_;
   std::vector<RegisteredRegion> regions_;
 
-  // The key lists this client has already sent, and the handles the server
-  // gave back for them.
+  // Key lists already sent, and the handles the server gave back for them, so a
+  // layer-wise restore serializes its keys once instead of once per layer group.
   //
-  // A layer-wise restore asks about one key set once per layer group, so the
-  // keys are the only part of a ranged get that does not change between those
-  // calls -- and at a thousand-odd ~128-byte keys they are the expensive part
-  // to serialize. Naming a remembered list instead costs a comparison against
-  // what was sent last time.
-  //
-  // Matching is by full equality of the key vector, not by hash, so nothing
-  // here can select the wrong list: the fingerprint travels only so the server
-  // can make the same check on its side. A handle the server has dropped comes
-  // back as key_handle_unknown, the entry is discarded, and the call is simply
-  // repeated carrying the keys.
+  // Matching is by full equality of the key vector, never by hash, so nothing
+  // here can select the wrong list; the fingerprint travels only so the server
+  // can make the same check.
   struct KeyHandle {
     std::vector<std::string> keys;
     uint64_t handle = 0;
     uint64_t fingerprint = 0;
   };
 
-  // A restore has one key set in flight per pool it reads. Small enough that a
-  // linear scan is cheaper than any index, and a miss only costs a resend.
+  // One key set in flight per pool: small enough that a linear scan beats an
+  // index, and a miss only costs a resend.
   static constexpr size_t kKeyHandleSlots = 8;
 
   // Returns 0 when this set has not been sent before, and fills *fingerprint

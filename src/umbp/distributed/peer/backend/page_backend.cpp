@@ -462,13 +462,9 @@ ResolvedEntry PageBackend::Resolve(const std::string& key) {
 namespace {
 
 // Only picks a cache candidate; a hit is confirmed by comparing every key, so
-// this needs to be fast and well-spread, not cryptographic.
-//
-// A word at a time rather than a byte at a time. Byte-wise FNV-1a is a serial
-// xor-multiply chain -- one byte per multiply latency -- and a layer-wise
-// restore hashes a thousand ~128-byte keys per call, which put it in the tens
-// of microseconds. That is worth more than it sounds: this used to run inside
-// the backend mutex, where every rank on the node queues.
+// this needs to be fast and well-spread, not cryptographic. A word at a time
+// because byte-wise FNV-1a retires one byte per multiply latency, which at a
+// thousand ~128-byte keys per call is tens of microseconds.
 uint64_t FingerprintKeys(const std::vector<std::string>& keys) {
   constexpr uint64_t kMul1 = 0x9e3779b97f4a7c15ULL;
   constexpr uint64_t kMul2 = 0xc2b2ae3d27d4eb4fULL;
@@ -512,12 +508,9 @@ std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::stri
 std::shared_ptr<const std::vector<ResolvedEntry>> PageBackend::BatchResolveShared(
     const std::vector<std::string>& keys, bool include_descs) {
   if (keys.empty()) return std::make_shared<const std::vector<ResolvedEntry>>();
-  // Hashed before the lock, not inside it. Every rank on the node reaches this
-  // backend through the one standalone server and queues on this mutex, so work
-  // that depends only on the caller's own argument must not be done while
-  // holding it -- adding tens of microseconds to the critical section costs
-  // that much times the number of ranks, which is how a cache meant to save
-  // time ends up losing it.
+  // Hashed before the lock, not inside it: every rank on the node queues on this
+  // mutex, so tens of microseconds added to the critical section is paid once
+  // per rank -- which is how a cache meant to save time ends up losing it.
   const uint64_t fingerprint = FingerprintKeys(keys);
   std::lock_guard<std::mutex> lock(mutex_);
   return ResolveBatchLocked(keys, include_descs, fingerprint);
@@ -537,9 +530,9 @@ std::shared_ptr<const std::vector<ResolvedEntry>> PageBackend::ResolveBatchLocke
     const bool usable = entry.generation == eviction_generation_ &&
                         entry.include_descs == include_descs && entry.keys == keys;
     if (usable) {
-      // Renew through the pointers rather than re-hashing every key.  The
-      // window between resolving and copying is still fenced by the lease, so
-      // a reused answer must not come with a stale one.
+      // Renewed through the stored pointers rather than by re-hashing. A reused
+      // answer must not carry a stale lease: the window between resolving and
+      // copying is still fenced by it.
       for (OwnedSlot* slot : entry.slots) {
         if (slot != nullptr) slot->read_lease_until = lease_deadline;
       }
@@ -569,14 +562,11 @@ std::shared_ptr<const std::vector<ResolvedEntry>> PageBackend::ResolveBatchLocke
     slots[i] = &it->second;
   }
 
-  // Only a batch that hit on every key is reusable.
-  //
-  // The generation covers keys LEAVING owned_, not keys arriving: a Commit does
-  // not move it, and making it do so would be useless anyway because offload
-  // commits run continuously alongside a restore and would invalidate the cache
-  // on every one.  So a remembered "not found" could outlive the key showing
-  // up.  A full hit has no such hole -- the only way one of its keys can change
-  // is eviction, which does move the generation.
+  // Only a batch that hit on every key is reusable. The generation covers keys
+  // LEAVING owned_, not arriving -- Commit does not move it, and making it do so
+  // would invalidate the cache on every offload -- so a remembered "not found"
+  // could outlive the key showing up. A full hit has no such hole: the only way
+  // one of its keys can change is eviction, which does move the generation.
   if (!all_found) return out;
 
   if (resolve_cache_.size() >= kResolveCacheCapacity) {
