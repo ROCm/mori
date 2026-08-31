@@ -50,6 +50,7 @@
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/device_copy.h"
+#include "umbp/distributed/config.h"
 #include "umbp/standalone/external_kv_identity_client.h"
 #include "umbp/standalone/ipc.h"
 #include "umbp/umbp_client.h"
@@ -120,7 +121,20 @@ UMBPConfig NormalizeBackendConfig(UMBPConfig config) {
   // server constructor. The server backend must never consume that field,
   // otherwise CreateUMBPClient would recursively create a client to itself.
   config.standalone_process.reset();
-  return config;
+  // Resolve the deployment here rather than leaving it to CreateUMBPClient:
+  // the server keeps this config and answers questions about the backend from
+  // it (peer address, external-KV identity), so it has to describe the backend
+  // that was actually built.  Without this, a server started with no
+  // distributed environment would hold distributed=nullopt while its client
+  // reported Distributed, and every external-identity registration would fail
+  // on a config field the client no longer agreed with.
+  return WithEmbeddedDefaults(config);
+}
+
+// The live medium, or DRAM for a config that names none (which cannot happen
+// after NormalizeBackendConfig, and is the harmless answer if it did).
+UMBPMedium BackendMedium(const UMBPConfig& config) {
+  return config.distributed.has_value() ? config.distributed->medium : UMBPMedium::DRAM;
 }
 
 ::umbp::StandaloneBackendMode BackendModeToProto(UMBPDeploymentMode mode) {
@@ -173,9 +187,12 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   Impl(const UMBPConfig& config, std::string address)
       : backend_config_(NormalizeBackendConfig(config)),
         client_(CreateUMBPClient(backend_config_)),
-        shared_reads_((client_->GetDeploymentMode() == UMBPDeploymentMode::Local ||
-                       client_->GetDeploymentMode() == UMBPDeploymentMode::Distributed) &&
-                      !backend_config_.ssd.enabled),
+        // Concurrent reads for every medium but SSD, whose manager serializes
+        // around its staging arena.  Keyed on the LIVE medium rather than on
+        // ssd.enabled: that flag defaults to true and now describes a tier the
+        // backend may not serve at all, so reading it here would serialize a
+        // DRAM server for no reason.
+        shared_reads_(BackendMedium(backend_config_) != UMBPMedium::SSD),
         address_(std::move(address)),
         fd_socket_path_(DeriveFdSocketPath(address_)) {}
 
@@ -219,13 +236,10 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     chmod(grpc_path.c_str(), 0600);
     MORI_UMBP_INFO("[StandaloneServer] listening grpc={} fd_socket={}", address_, fd_socket_path_);
     if (shared_reads_) {
-      MORI_UMBP_INFO("[StandaloneServer] data plane: concurrent reads ({} backend, SSD disabled)",
-                     client_->GetDeploymentMode() == UMBPDeploymentMode::Distributed ? "distributed"
-                                                                                     : "local");
-    } else if (client_->GetDeploymentMode() != UMBPDeploymentMode::Local) {
-      MORI_UMBP_INFO("[StandaloneServer] data plane: serialized reads (non-local backend)");
+      MORI_UMBP_INFO("[StandaloneServer] data plane: concurrent reads (medium={})",
+                     TierTypeName(ToTierType(BackendMedium(backend_config_))));
     } else {
-      MORI_UMBP_INFO("[StandaloneServer] data plane: serialized reads (SSD enabled)");
+      MORI_UMBP_INFO("[StandaloneServer] data plane: serialized reads (SSD medium)");
     }
     return true;
   }
@@ -933,14 +947,14 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   void RegisterGpuIpc(const ::umbp::RegisterMemoryRequest& request,
                       ::umbp::BoolResponse* response) {
     const UMBPDeploymentMode mode = client_->GetDeploymentMode();
-    if (mode != UMBPDeploymentMode::Local && mode != UMBPDeploymentMode::Distributed) {
-      SetBool(response, false, "GPU IPC registration requires a Local or Distributed backend");
+    if (mode != UMBPDeploymentMode::Distributed) {
+      SetBool(response, false, "GPU IPC registration requires a Distributed backend");
       return;
     }
-    if (backend_config_.ssd.enabled) {
+    if (BackendMedium(backend_config_) == UMBPMedium::SSD) {
       SetBool(response, false,
-              "GPU IPC registration requires SSD to be disabled "
-              "(start the server with UMBP_SSD_ENABLED=0)");
+              "GPU IPC registration is not supported on an SSD medium "
+              "(run this server on the DRAM medium)");
       return;
     }
     if (request.client_id().empty() || request.worker_base() == 0 || request.size() == 0 ||

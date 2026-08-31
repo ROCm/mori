@@ -149,10 +149,10 @@ struct UMBPSsdConfig {
   double low_watermark = 0.7;
 
   // SSD backend selection. "file" uses the segmented-log SSDTier; "spdk" /
-  // "spdk_proxy" use the SPDK NVMe path (direct SpdkSsdTier in standalone, or
+  // "spdk_proxy" use the SPDK NVMe path (direct SpdkSsdTier for one process, or
   // SpdkProxyTier when sharing the device across processes).  Kept here (rather
-  // than at UMBPConfig top level) so both the standalone LocalStorageManager and
-  // the distributed PeerSsdManager select the backend from the same config.
+  // than at UMBPConfig top level) so PeerSsdManager and any direct SSDTier user
+  // select the backend from the same config.
   std::string ssd_backend = "file";       // "file", "spdk" or "spdk_proxy"
   std::string spdk_bdev_name;             // e.g. "Malloc0" or "NVMe0n1"
   std::string spdk_reactor_mask = "0x1";  // CPU core mask for SPDK reactors
@@ -455,11 +455,17 @@ struct UMBPConfig {
   UMBPEvictionConfig eviction;
   UMBPCopyPipelineConfig copy_pipeline;
 
-  // Role is the source of truth for runtime behavior.
+  // Compatibility only.  These selected the shared-SSD leader/follower
+  // behaviour of the local storage manager, which is gone: a shared pool is a
+  // deployment now (a master, or a standalone server), not a role a private
+  // client plays over a shared directory.  Nothing reads them any more; they
+  // stay so existing Python and C++ callers still compile and so
+  // FromEnvironment keeps accepting UMBP_ROLE.
+  //
+  // The one place the distinction survives is where it always belonged: an
+  // SSDTier opened with SSDAccessMode::ReadOnlyShared reads a segment log
+  // another process writes.
   UMBPRole role = UMBPRole::Standalone;
-
-  // Backward compatibility fields for older Python/C++ callers.
-  // New code should set `role` instead.
   bool follower_mode = false;
   bool force_ssd_copy_on_write = false;
 

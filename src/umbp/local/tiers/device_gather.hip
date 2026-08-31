@@ -100,14 +100,14 @@ DescriptorStaging* StagingFor(int device_id, size_t count) {
   DeviceGatherFragment* device = nullptr;
   hipError_t status = hipHostMalloc(reinterpret_cast<void**>(&host), bytes, hipHostMallocDefault);
   if (status != hipSuccess) {
-    MORI_UMBP_ERROR("[DRAMTier] hipHostMalloc for {} gather descriptors failed on device {}: {}",
+    MORI_UMBP_ERROR("[DeviceGather] hipHostMalloc for {} gather descriptors failed on device {}: {}",
                     capacity, device_id, hipGetErrorString(status));
     (void)hipGetLastError();
     return nullptr;
   }
   status = hipMalloc(reinterpret_cast<void**>(&device), bytes);
   if (status != hipSuccess) {
-    MORI_UMBP_ERROR("[DRAMTier] hipMalloc for {} gather descriptors failed on device {}: {}",
+    MORI_UMBP_ERROR("[DeviceGather] hipMalloc for {} gather descriptors failed on device {}: {}",
                     capacity, device_id, hipGetErrorString(status));
     (void)hipGetLastError();
     (void)hipHostFree(host);
@@ -162,7 +162,7 @@ bool LaunchDeviceGather(const DeviceGatherFragment* fragments, size_t count, int
       hipMemcpyAsync(staging->device, staging->host, count * sizeof(DeviceGatherFragment),
                      hipMemcpyHostToDevice, stream);
   if (status != hipSuccess) {
-    MORI_UMBP_ERROR("[DRAMTier] gather descriptor upload failed on device {}: {}", device_id,
+    MORI_UMBP_ERROR("[DeviceGather] gather descriptor upload failed on device {}: {}", device_id,
                     hipGetErrorString(status));
     (void)hipGetLastError();
     return false;
@@ -173,7 +173,7 @@ bool LaunchDeviceGather(const DeviceGatherFragment* fragments, size_t count, int
                      dim3(kThreadsPerBlock), 0, stream, staging->device, blocks_per_fragment);
   status = hipGetLastError();
   if (status != hipSuccess) {
-    MORI_UMBP_ERROR("[DRAMTier] gather kernel launch failed on device {} (fragments={}): {}",
+    MORI_UMBP_ERROR("[DeviceGather] gather kernel launch failed on device {} (fragments={}): {}",
                     device_id, count, hipGetErrorString(status));
     return false;
   }

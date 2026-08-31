@@ -223,7 +223,7 @@ TEST(StandaloneShmIpcTest, GpuRegistrationRejectsSsdBackedServer) {
   std::filesystem::remove_all(ssd_path);
 }
 
-TEST(StandaloneShmIpcTest, StandaloneClientUsesNonZeroOffsetsAndCanReregister) {
+TEST(StandaloneShmIpcTest, WorkerRegistrationUsesNonZeroOffsetsAndCanReregister) {
   const std::string address =
       "unix:///tmp/umbp_standalone_e2e_" + std::to_string(getpid()) + ".grpc.sock";
   const std::string grpc_path = standalone::UnixPathFromGrpcAddress(address);
@@ -282,7 +282,7 @@ TEST(StandaloneShmIpcTest, StandaloneClientUsesNonZeroOffsetsAndCanReregister) {
   unlink(fd_path.c_str());
 }
 
-TEST(StandaloneShmIpcTest, StandaloneClientResolvesAcrossMultipleRegions) {
+TEST(StandaloneShmIpcTest, WorkerRegistrationResolvesAcrossMultipleRegions) {
   const std::string address =
       "unix:///tmp/umbp_standalone_multiregion_" + std::to_string(getpid()) + ".grpc.sock";
   const std::string grpc_path = standalone::UnixPathFromGrpcAddress(address);

@@ -98,11 +98,11 @@
 //                            [--interleave-groups] [--local-only] [--local-mode]
 //                            [--verify]
 //
-// --local-only and --local-mode are different questions.  --local-only keeps
-// the distributed client and puts every key on the reading node, so the local
-// half of the distributed path is what runs.  --local-mode swaps the client for
-// StandaloneClient, which has no master, peer or arena at all -- the floor the
-// distributed numbers are measured against.
+// --local-only and --local-mode are different questions.  --local-only keeps a
+// master-backed client and puts every key on the reading node, so the local
+// half of the routed path is what runs.  --local-mode deploys the same client
+// embedded -- no master, no peer, no arena at all -- the floor the distributed
+// numbers are measured against.
 //
 // CSV (stdout): one row per rank count in --ranks
 //   ranks,layers,group,pages,object_kib,restore_ms_p50,restore_ms_p95,
@@ -139,7 +139,7 @@
 #include "umbp/distributed/master/master_server.h"
 #include "umbp/distributed/peer/backend/medium_backend.h"
 #include "umbp/distributed/pool_client.h"
-#include "umbp/local/standalone_client.h"
+#include "umbp/umbp_client.h"
 
 using mori::umbp::MasterServer;
 using mori::umbp::MasterServerConfig;
@@ -265,9 +265,9 @@ struct BenchOpts {
   // live here.  It isolates the per-key and per-range CPU cost of the
   // distributed path from anything to do with the wire.
   bool local_only = false;
-  // Run the whole bench against local mode (StandaloneClient: no master, no
-  // peer, no arena) instead of distributed mode.  Same loop, same shapes, so
-  // the difference between the two runs is the deployment.
+  // Run the whole bench against an embedded deployment (no master, no peer, no
+  // arena) instead of a master-backed one.  Same client class, same loop, same
+  // shapes, so the difference between the two runs is the deployment alone.
   bool local_mode = false;
   // Check every restored page byte-for-byte after each request.  Off by
   // default because the comparison lands inside the measured window; on, this
@@ -675,21 +675,26 @@ class DistributedRangedClient final : public RangedClient {
   PoolClient* client_;
 };
 
-// Local mode: StandaloneClient, no master, no peer, no network.  The floor the
-// distributed numbers are measured against.
+// Embedded mode: the same client class as the distributed arm, deployed with
+// no master, no peer and no arena.  The floor the distributed numbers are
+// measured against -- and, since the convergence, a measurement of the
+// deployment rather than of a second implementation.
 class LocalRangedClient final : public RangedClient {
  public:
-  explicit LocalRangedClient(size_t dram_capacity) {
+  LocalRangedClient(size_t dram_capacity, size_t page_bytes) {
     mori::umbp::UMBPConfig cfg;
     cfg.dram.capacity_bytes = dram_capacity;
-    // UMBPConfig enables an SSD tier by default, which brings a demotion
-    // pipeline with its own threads.  The distributed side of this comparison
-    // has DRAM only, so leaving it on would measure two different storage
-    // stacks rather than two deployments of the same one.
+    // UMBPConfig enables an SSD tier by default; an embedded deployment serves
+    // one medium and would only warn about it.  The distributed side of this
+    // comparison is DRAM, so say so.
     cfg.ssd.enabled = false;
-    client_ = std::make_unique<mori::umbp::StandaloneClient>(cfg);
+    cfg = mori::umbp::WithEmbeddedDefaults(cfg);
+    // The pool is paged, so the page has to match the objects being stored or
+    // the two arms are not sizing the same way.
+    cfg.distributed->dram_page_size = page_bytes;
+    client_ = mori::umbp::CreateUMBPClient(cfg);
     if (!client_->SupportsRangedIO()) {
-      std::cerr << "local client reports no ranged I/O support\n";
+      std::cerr << "embedded client reports no ranged I/O support\n";
       std::exit(2);
     }
   }
@@ -736,7 +741,7 @@ class LocalRangedClient final : public RangedClient {
     return out;
   }
 
-  std::unique_ptr<mori::umbp::StandaloneClient> client_;
+  std::unique_ptr<mori::umbp::IUMBPClient> client_;
 };
 
 void WaitAllVisible(RangedClient* client, const std::vector<std::string>& keys,
@@ -1098,7 +1103,7 @@ void RunOne(const BenchOpts& o, size_t ranks) {
   std::unique_ptr<RangedClient> node_client;
   std::unique_ptr<RangedClient> peer_client;
   if (o.local_mode) {
-    node_client = std::make_unique<LocalRangedClient>(seeded_capacity);
+    node_client = std::make_unique<LocalRangedClient>(seeded_capacity, o.medium_page_bytes());
   } else {
     cluster = std::make_unique<Cluster>(node_capacity, peer_capacity, scratch_bytes,
                                         o.medium_page_bytes(), o.locality_prefetch);
