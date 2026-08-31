@@ -36,6 +36,7 @@
 #include <cerrno>
 #include <chrono>
 #include <climits>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <list>
@@ -194,8 +195,14 @@ class KeyHandleTable {
     if (handle == 0) return nullptr;
     std::lock_guard<std::mutex> lock(mu_);
     auto it = entries_.find(handle);
-    if (it == entries_.end() || it->second.fingerprint != fingerprint) return nullptr;
+    if (it == entries_.end() || it->second.fingerprint != fingerprint) {
+      ++misses_;
+      MaybeReportLocked();
+      return nullptr;
+    }
     lru_.splice(lru_.begin(), lru_, it->second.position);
+    ++hits_;
+    MaybeReportLocked();
     return it->second.keys;
   }
 
@@ -205,6 +212,7 @@ class KeyHandleTable {
     // list it was minted for; across processes the table starts empty, and the
     // fingerprint covers the rest.
     const uint64_t handle = next_++;
+    ++mints_;
     lru_.push_front(handle);
     entries_.emplace(handle, Entry{std::move(keys), fingerprint, lru_.begin()});
     while (lru_.size() > kCapacity) {
@@ -215,10 +223,35 @@ class KeyHandleTable {
   }
 
  private:
+  // Whether the handle is doing anything is not something a caller can see:
+  // a hit and a miss both return the right bytes, and a miss only shows up as
+  // a request that was larger than it had to be. UMBP_KEY_HANDLE_DEBUG=1 makes
+  // the hit rate observable so a deployment can tell "working" from "silently
+  // resending every time".
+  static bool DebugEnabled() {
+    static const bool enabled = [] {
+      const char* raw = std::getenv("UMBP_KEY_HANDLE_DEBUG");
+      return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+    }();
+    return enabled;
+  }
+
+  void MaybeReportLocked() {
+    if (!DebugEnabled()) return;
+    const uint64_t total = hits_ + misses_;
+    if (total == 0 || total % kReportEvery != 0) return;
+    MORI_UMBP_INFO(
+        "[KeyHandleTable] ranged-get key handles: hits={} misses={} mints={} hit_rate={:.1f}% "
+        "held={}",
+        hits_, misses_, mints_, 100.0 * static_cast<double>(hits_) / static_cast<double>(total),
+        entries_.size());
+  }
+
   // A restore has one key set in flight per pool it reads, and the reader
   // chunks a pool's keys by a range budget, so a handful of sets are live at
   // once. Sized well past that; the cost of being wrong is a resend.
   static constexpr size_t kCapacity = 64;
+  static constexpr uint64_t kReportEvery = 512;
 
   struct Entry {
     Keys keys;
@@ -230,6 +263,9 @@ class KeyHandleTable {
   std::list<uint64_t> lru_;  // front = most recently used
   std::unordered_map<uint64_t, Entry> entries_;
   uint64_t next_ = 1;
+  uint64_t hits_ = 0;
+  uint64_t misses_ = 0;
+  uint64_t mints_ = 0;
 };
 
 }  // namespace
