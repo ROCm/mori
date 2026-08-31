@@ -990,6 +990,15 @@ def _torch_symm_extension():
     mode = _torch_symm_mode()
     if mode == "OFF":
         return []
+    # rendezvous() is a cco window now, so the extension links libmori_cco.
+    if not _env_flag("BUILD_CCO", "ON"):
+        if mode == "ON":
+            raise RuntimeError(
+                "BUILD_TORCH_SYMM=ON needs BUILD_CCO=ON: the SymmetricMemory backend "
+                "links libmori_cco"
+            )
+        print("[mori] BUILD_CCO=OFF, so the torch SymmetricMemory backend is skipped")
+        return []
     if _TorchCppExtension is None:
         if mode == "ON":
             raise RuntimeError(
@@ -1003,8 +1012,11 @@ def _torch_symm_extension():
         name="mori.mori_torch_symm",
         sources=["src/allocator/symm_backend.cpp"],
         include_dirs=[str(_root_dir.resolve() / "include"), f"{rocm}/include"],
-        library_dirs=[f"{rocm}/lib"],
-        libraries=["amdhip64", "c10_hip", "torch_hip"],
+        # libmori_cco is the peer-exchange half of the backend; it lands next to this
+        # module in the package, hence the $ORIGIN runpath.
+        library_dirs=[f"{rocm}/lib", str(_root_dir.resolve() / "python" / "mori")],
+        libraries=["amdhip64", "c10_hip", "torch_hip", "mori_cco"],
+        runtime_library_dirs=["$ORIGIN"],
         extra_compile_args=["-std=c++17"]
         # barrier/put_signal/wait_signal are unimplemented, so the signal pad is not
         # reserved by default; it would cost a whole 2 MiB page on a page-aligned window.

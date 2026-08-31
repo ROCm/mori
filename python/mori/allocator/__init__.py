@@ -21,8 +21,12 @@
 # SOFTWARE.
 """Register mori as a torch SymmetricMemory backend. Requires **torch >= 2.9**.
 
-Self-contained: plain HIP VMM, no shmem or cco allocator involved, so no mori bootstrap
-is needed -- torch's process group is the only rendezvous::
+torch owns the allocation and its lifetime; CCO owns the peer addressing. ``alloc`` is
+plain HIP VMM, and ``rendezvous`` hands that allocation to ``ccoWindowRegister``, which
+aliases it into CCO's flat LSA space -- so ``buffer_ptrs`` are ``ccoGetPeerPtr`` results
+and agree with the device-side ``Window.lsa_ptr`` by construction. CCO's communicator is
+created on the first rendezvous of a process group and its unique id travels over torch's
+own Store, so there is no second bootstrap channel to configure::
 
     import torch.distributed._symmetric_memory as symm_mem
     from mori.allocator import register_symm_backend
@@ -44,7 +48,12 @@ for the staged plan.
 
 The handle type is probed per device: fabric where supported, POSIX fd otherwise. gfx9
 (MI300/MI355) has no fabric support -- ``hipMemCreate`` itself reports "operation not
-supported" -- so those fall back to fd, which needs no configuration.
+supported" -- so those fall back to fd, which needs no configuration. The allocation and
+CCO's own export have to agree on that type, since CCO re-exports what it imports.
+
+``MORI_SYMM_PER_RANK_VMM`` sizes the communicator's flat VA reservation (default 4 GiB).
+It is a floor rather than a budget -- CCO quantises it up to 4 GiB -- and it bounds live
+symmetric memory per rank, not allocations over time, because slots are recycled on free.
 
 ``barrier``/``put_signal``/``wait_signal`` are not implemented and raise, so no signal
 pad is reserved in the window -- torch's 9216-byte pad would cost a whole extra 2 MiB page
@@ -71,6 +80,7 @@ rebuilding mori itself.
 import atexit
 import logging
 import os
+from pathlib import Path
 from typing import Literal
 
 __all__ = [
@@ -136,12 +146,20 @@ def _jit_ext():
     }:
         flags.append("-DMORI_SYMM_SIGNAL_PAD=1")
     logger.info("compiling mori_torch_symm from %s", source)
+    # libmori_cco sits in the package directory, wherever mori was installed.
+    pkg = str(Path(__file__).resolve().parent.parent)
     return load(
         name="mori_torch_symm",
         sources=[str(source)],
         extra_include_paths=[str(root / "include"), f"{rocm}/include"],
         extra_cflags=flags,
-        extra_ldflags=[f"-L{rocm}/lib", "-lamdhip64"],
+        extra_ldflags=[
+            f"-L{rocm}/lib",
+            "-lamdhip64",
+            f"-L{pkg}",
+            "-lmori_cco",
+            f"-Wl,-rpath,{pkg}",
+        ],
     )
 
 
