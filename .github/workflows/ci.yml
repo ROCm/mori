@@ -619,17 +619,22 @@ jobs:
             pkill -9 -f '[t]orchrun.*test_dispatch_combine_internode' 2>/dev/null || true
           }
           cleanup_host
-          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "
-            $CT ps -a --format '{{.Names}}' | { grep -E '^mori' || true; } | while read -r c; do
-              [ \"\$c\" = \"$CONTAINER\" ] && continue
-              echo \"Removing stale container: \$c\"
-              $CT rm -f \"\$c\" 2>/dev/null || true
-            done
-            pkill -9 -f '[c]oncurrent_put_thread' 2>/dev/null || true
-            pkill -9 -f '[t]est_dispatch_combine_internode' 2>/dev/null || true
-            pkill -9 -f '[t]ests\.python\.io\.benchmark' 2>/dev/null || true
-            pkill -9 -f '[t]orchrun.*test_dispatch_combine_internode' 2>/dev/null || true
-          "
+          # Feed cleanup via stdin so pkill patterns are not visible in the
+          # remote ssh "bash -c ..." cmdline (otherwise pkill can match and
+          # kill the session, returning ssh exit 255).
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST bash -s "$CT" "$CONTAINER" <<'EOF'
+          CT=$1
+          CONTAINER=$2
+          $CT ps -a --format '{{.Names}}' | { grep -E '^mori' || true; } | while read -r c; do
+            [ "$c" = "$CONTAINER" ] && continue
+            echo "Removing stale container: $c"
+            $CT rm -f "$c" 2>/dev/null || true
+          done
+          pkill -9 -f '[c]oncurrent_put_thread' 2>/dev/null || true
+          pkill -9 -f '[t]est_dispatch_combine_internode' 2>/dev/null || true
+          pkill -9 -f '[t]ests\.python\.io\.benchmark' 2>/dev/null || true
+          pkill -9 -f '[t]orchrun.*test_dispatch_combine_internode' 2>/dev/null || true
+          EOF
 
       - name: Start container on node1
         run: |
