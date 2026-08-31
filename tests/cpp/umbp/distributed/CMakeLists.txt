@@ -377,6 +377,20 @@ target_link_libraries(
   PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
           gtest_main)
 
+# Standalone-process ranged wire bench: what a layer-wise restore costs over
+# the unix socket, isolated from the GPU end-to-end harness that can only show
+# it diluted.  Host only -- no GPU, RDMA or hugepages -- so it runs anywhere.
+# Standalone executable; not a CTest target.
+add_executable(bench_umbp_standalone_ranged_wire bench_standalone_ranged_wire.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(bench_umbp_standalone_ranged_wire PRIVATE
+                      -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  bench_umbp_standalone_ranged_wire
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+
 # RoutePut strategy bench: compares batch put / put-then-get performance and
 # placement distribution across UMBP_ROUTE_PUT_SELECT_ALGO x
 # UMBP_ROUTE_PUT_NODE_AFFINITY under roomy/tight capacity regimes.  Standalone
