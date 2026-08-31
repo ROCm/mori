@@ -22,6 +22,7 @@
 #include <gtest/gtest.h>
 
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -107,29 +108,6 @@ class LocalityAwareGetStrategy : public RouteGetStrategy {
   }
 };
 
-TEST(CustomRouteGetStrategyTest, PrefersLocalReplica) {
-  LocalityAwareGetStrategy strategy;
-  std::vector<Location> locations = {
-      MakeLoc("node-a", "loc-1"),
-      MakeLoc("node-b", "loc-2"),
-      MakeLoc("node-c", "loc-3"),
-  };
-
-  auto selected = strategy.Select(locations, "node-b");
-  EXPECT_EQ(selected.node_id, "node-b");
-}
-
-TEST(CustomRouteGetStrategyTest, FallsBackToFirstWhenNoLocalReplica) {
-  LocalityAwareGetStrategy strategy;
-  std::vector<Location> locations = {
-      MakeLoc("node-a", "loc-1"),
-      MakeLoc("node-b", "loc-2"),
-  };
-
-  auto selected = strategy.Select(locations, "node-x");
-  EXPECT_EQ(selected.node_id, "node-a");
-}
-
 // ---- BatchSelect tests ----
 
 TEST(RouteGetBatchSelectTest, ReturnsOneResultPerKeyInOrder) {
@@ -193,6 +171,66 @@ TEST(RouteGetBatchSelectTest, CustomStrategyUsesBaseDefaultLoop) {
   EXPECT_EQ(out[0].node_id, "node-a");  // no local replica -> first
   EXPECT_TRUE(out[1].node_id.empty());  // empty -> Select not invoked
   EXPECT_EQ(out[2].node_id, "node-c");  // local replica preferred
+}
+
+// ---- LocalPreferringRouteGetStrategy tests ----
+
+Location MakeLoc(const std::string& node_id, TierType tier) {
+  Location loc;
+  loc.node_id = node_id;
+  loc.size = 4096;
+  loc.tier = tier;
+  return loc;
+}
+
+TEST(LocalPreferringRouteGetStrategyTest, LocalReplicaBeatsRemotePeersOnTheSameTier) {
+  LocalPreferringRouteGetStrategy strategy;
+  std::vector<Location> locations = {
+      MakeLoc("dram-a", TierType::DRAM),
+      MakeLoc("requester", TierType::DRAM),
+      MakeLoc("dram-c", TierType::DRAM),
+  };
+
+  for (int i = 0; i < 100; ++i) {
+    EXPECT_EQ(strategy.Select(locations, "requester").node_id, "requester");
+  }
+}
+
+// With every medium equivalent, a non-local request can reach every replica
+// rather than being confined to a preferred tier.
+TEST(LocalPreferringRouteGetStrategyTest, NonLocalRequesterSpreadsAcrossEveryTier) {
+  LocalPreferringRouteGetStrategy strategy;
+  std::vector<Location> locations = {
+      MakeLoc("dram-a", TierType::DRAM),
+      MakeLoc("dram-b", TierType::DRAM),
+      MakeLoc("hbm-x", TierType::HBM),
+      MakeLoc("ssd-y", TierType::SSD),
+  };
+
+  std::set<std::string> seen;
+  for (int i = 0; i < 2000; ++i) {
+    seen.insert(strategy.Select(locations, "requester").node_id);
+  }
+  EXPECT_EQ(seen.size(), 4u) << "every replica should be reachable, regardless of tier";
+}
+
+TEST(LocalPreferringRouteGetStrategyTest, EmptyRequesterFallsBackToRandom) {
+  LocalPreferringRouteGetStrategy strategy;
+  std::vector<Location> locations = {
+      MakeLoc("node-a", TierType::DRAM),
+      MakeLoc("node-b", TierType::DRAM),
+  };
+
+  std::set<std::string> seen;
+  for (int i = 0; i < 500; ++i) seen.insert(strategy.Select(locations, "").node_id);
+  EXPECT_EQ(seen.size(), 2u);
+}
+
+TEST(LocalPreferringRouteGetStrategyTest, EmptyReturnsDefault) {
+  LocalPreferringRouteGetStrategy strategy;
+  auto selected = strategy.Select({}, "requester");
+  EXPECT_EQ(selected.tier, TierType::UNKNOWN);
+  EXPECT_TRUE(selected.node_id.empty());
 }
 
 }  // namespace

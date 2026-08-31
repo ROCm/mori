@@ -48,14 +48,40 @@ enum class TierType : int {
 //
 // A backend id is the other half of a buffer address (see BufferMemoryDescBytes)
 // and the registry hands them out densely from 0, so this is also the width of
-// the reader's per-backend buffer shelves.  One per TierType is all the registry
-// can hold today; the slack is headroom for a registry that allows two backends
-// on one tier.
-inline constexpr uint32_t kMaxBackendsPerPeer = 8;
+// the reader's per-backend buffer shelves.
+//
+// Sized for the topology a logical tier policy expands into rather than for one
+// backend per TierType: an 8-GPU node whose HBM is declared once expands to
+// eight instances, and a policy that also names hot and warm DRAM plus a pair of
+// SSDs lands at twelve.  The shelves are vectors, so unused ids cost a pointer
+// triple each.
+inline constexpr uint32_t kMaxBackendsPerPeer = 16;
 
 struct TierCapacity {
   uint64_t total_bytes = 0;
   uint64_t available_bytes = 0;
+  // Largest single value the tier can currently admit. Zero means
+  // available_bytes for backward-compatible single-backend reports.
+  uint64_t max_allocatable_bytes = 0;
+};
+
+struct LogicalTierCapacity {
+  TierType representative_tier = TierType::UNKNOWN;
+  TierCapacity capacity;
+  bool put_eligible = false;
+  // What the watermark comparison actually reads: the highest utilization among
+  // this tier's own backends. `capacity` aggregates instead, and for the entry
+  // tier it aggregates every tier reachable by offload, so neither of its
+  // ratios can be checked against this tier's watermarks.
+  double peak_member_utilization = 0.0;
+};
+
+struct TierTransitionMetrics {
+  uint64_t attempted = 0;
+  uint64_t succeeded = 0;
+  uint64_t failed = 0;
+  uint64_t offloaded_bytes = 0;
+  uint64_t promoted_bytes = 0;
 };
 
 struct ExternalKvHitCountEntry {
@@ -71,9 +97,11 @@ struct Location {
   std::string node_id;
   uint64_t size = 0;
   TierType tier = TierType::UNKNOWN;
+  std::string logical_tier;
 
   bool operator==(const Location& other) const {
-    return node_id == other.node_id && size == other.size && tier == other.tier;
+    return node_id == other.node_id && size == other.size && tier == other.tier &&
+           logical_tier == other.logical_tier;
   }
 };
 
@@ -199,6 +227,7 @@ struct KvEvent {
   std::string key;
   TierType tier = TierType::UNKNOWN;
   uint64_t size = 0;  // ADD only; REMOVE leaves this 0
+  std::string logical_tier;
 };
 
 struct EventBundle {
@@ -218,6 +247,7 @@ struct ClientRecord {
   std::chrono::system_clock::time_point last_heartbeat;
   std::chrono::system_clock::time_point registered_at;
   std::map<TierType, TierCapacity> tier_capacities;
+  std::map<std::string, LogicalTierCapacity> logical_tier_capacities;
 
   std::string peer_address;
   std::vector<uint8_t> engine_desc_bytes;
@@ -239,6 +269,7 @@ struct ClientRegistration {
   std::string node_id;
   std::string node_address;
   std::map<TierType, TierCapacity> tier_capacities;
+  std::map<std::string, LogicalTierCapacity> logical_tier_capacities;
   std::string peer_address;
   std::vector<uint8_t> engine_desc_bytes;
   std::vector<std::string> tags;
@@ -266,6 +297,21 @@ inline const char* TierTypeName(TierType t) {
       return "SSD";
     default:
       return "UNKNOWN";
+  }
+}
+
+// Stable name used when legacy one-backend configuration is lowered into the
+// named multi-backend model.
+inline const char* DefaultBackendInstanceName(TierType t) {
+  switch (t) {
+    case TierType::HBM:
+      return "hbm";
+    case TierType::DRAM:
+      return "dram";
+    case TierType::SSD:
+      return "ssd";
+    default:
+      return "unknown";
   }
 }
 

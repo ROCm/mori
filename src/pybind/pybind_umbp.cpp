@@ -260,6 +260,11 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("cache_remote_admission", &UMBPDistributedConfig::cache_remote_admission)
       .def_readwrite("admission_max_block_bytes", &UMBPDistributedConfig::admission_max_block_bytes)
       .def_readwrite("dram_page_size", &UMBPDistributedConfig::dram_page_size)
+      .def_readwrite("backend_policy_path", &UMBPDistributedConfig::backend_policy_path)
+      .def_readwrite("workload_trace_path", &UMBPDistributedConfig::workload_trace_path)
+      .def_readwrite("workload_trace_client_id",
+                     &UMBPDistributedConfig::workload_trace_client_id)
+      .def_readwrite("workload_trace_seed", &UMBPDistributedConfig::workload_trace_seed)
       .def_readwrite("medium", &UMBPDistributedConfig::medium)
       .def_readwrite("hbm", &UMBPDistributedConfig::hbm);
 

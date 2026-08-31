@@ -49,6 +49,7 @@ struct RoutePutResult {
   std::string node_id;
   std::string peer_address;
   TierType tier = TierType::UNKNOWN;
+  std::string logical_tier;
 };
 
 /// Abstract interface for batch RoutePut node placement.  Implement this to
@@ -119,7 +120,8 @@ class ConfigurableRoutePutStrategy : public RoutePutStrategy {
   /// preference.
   std::optional<RoutePutResult> TrySelectOnNodeTier(
       const std::vector<ClientRecord>& candidates, const std::string& node_id, TierType tier,
-      uint64_t block_size, const std::unordered_set<std::string>& exclude_nodes) const;
+      uint64_t block_size, const std::unordered_set<std::string>& exclude_nodes,
+      const std::string& logical_tier = {}) const;
 
   /// Try only @p node_id, on whichever of its tiers has the most room; nullopt
   /// if none can fit @p block_size.  Performs no cross-node fallback — that is

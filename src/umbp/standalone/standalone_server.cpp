@@ -814,8 +814,13 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   void StopFdListener() {
     if (!fd_running_.exchange(false)) return;
     if (listen_fd_ >= 0) shutdown(listen_fd_, SHUT_RDWR);
-    int active_fd = active_fd_client_.load();
-    if (active_fd >= 0) shutdown(active_fd, SHUT_RDWR);
+    {
+      // The lock pairs with the accept loop's publish: either we interrupt a
+      // connection that is already blocked in the handshake, or the loop sees
+      // fd_running_ false and drops the connection without ever blocking.
+      std::lock_guard<std::mutex> lock(active_fd_mu_);
+      if (active_fd_client_ >= 0) shutdown(active_fd_client_, SHUT_RDWR);
+    }
     if (fd_thread_.joinable()) fd_thread_.join();
     if (listen_fd_ >= 0) {
       close(listen_fd_);
@@ -832,13 +837,23 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
         }
         continue;
       }
-      active_fd_client_.store(client_fd);
+      {
+        std::lock_guard<std::mutex> lock(active_fd_mu_);
+        if (!fd_running_.load()) {
+          close(client_fd);
+          break;
+        }
+        active_fd_client_ = client_fd;
+      }
       if (!SetFdSocketTimeouts(client_fd, FdHandshakeTimeout())) {
         MORI_UMBP_WARN("[StandaloneServer] failed to set fd socket timeout: {}",
                        std::strerror(errno));
       }
       HandleFdConnection(client_fd);
-      active_fd_client_.store(-1);
+      {
+        std::lock_guard<std::mutex> lock(active_fd_mu_);
+        active_fd_client_ = -1;
+      }
       close(client_fd);
     }
   }
@@ -1272,7 +1287,8 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
 
   std::atomic<bool> fd_running_{false};
   int listen_fd_ = -1;
-  std::atomic<int> active_fd_client_{-1};
+  std::mutex active_fd_mu_;
+  int active_fd_client_ = -1;
   std::thread fd_thread_;
 };
 

@@ -31,6 +31,7 @@
 #include <string>
 #include <vector>
 
+#include "umbp/distributed/peer/backend/medium_backend.h"
 #include "umbp/distributed/types.h"
 #include "umbp_peer.pb.h"
 
@@ -39,6 +40,7 @@ namespace mori::umbp {
 // Host-side view of one resolved key, independent of the generated proto.
 // Used as the encoder input on the peer side.
 struct ResolvedKeyEntry {
+  ResolveOutcome outcome = ResolveOutcome::kMissing;
   bool found = false;
   TierType tier = TierType::UNKNOWN;
   uint64_t size = 0;
@@ -52,6 +54,7 @@ struct ResolvedKeyEntry {
 // One key decoded out of the SoA response (page_size and descs are batch-level
 // and live on DecodedBatchResolve, not here).
 struct DecodedResolveKey {
+  ResolveOutcome outcome = ResolveOutcome::kMissing;
   bool found = false;
   TierType tier = TierType::UNKNOWN;
   uint64_t size = 0;
@@ -93,6 +96,35 @@ inline ::umbp::TierType BatchResolveTierToProto(TierType t) {
   }
 }
 
+inline ::umbp::ResolveStatus ResolveOutcomeToProto(ResolveOutcome outcome) {
+  switch (outcome) {
+    case ResolveOutcome::kFound:
+      return ::umbp::RESOLVE_STATUS_FOUND;
+    case ResolveOutcome::kBusy:
+      return ::umbp::RESOLVE_STATUS_BUSY;
+    case ResolveOutcome::kFailed:
+      return ::umbp::RESOLVE_STATUS_FAILED;
+    case ResolveOutcome::kMissing:
+    default:
+      return ::umbp::RESOLVE_STATUS_MISSING;
+  }
+}
+
+inline ResolveOutcome ResolveOutcomeFromProto(::umbp::ResolveStatus status) {
+  switch (status) {
+    case ::umbp::RESOLVE_STATUS_FOUND:
+      return ResolveOutcome::kFound;
+    case ::umbp::RESOLVE_STATUS_BUSY:
+      return ResolveOutcome::kBusy;
+    case ::umbp::RESOLVE_STATUS_FAILED:
+      return ResolveOutcome::kFailed;
+    case ::umbp::RESOLVE_STATUS_MISSING:
+    case ::umbp::RESOLVE_STATUS_UNSPECIFIED:
+    default:
+      return ResolveOutcome::kMissing;
+  }
+}
+
 // Encode resolved keys into the SoA response.  `descs` are the batch-level
 // deduplicated buffer descriptors (by buffer_index); pass an empty vector to
 // omit them (honoring BatchResolveKeysRequest.omit_descs).  Clears `resp`
@@ -118,11 +150,14 @@ inline void EncodeBatchResolveResponse(const std::vector<ResolvedKeyEntry>& keys
   resp->mutable_size()->Reserve(static_cast<int>(keys.size()));
   resp->mutable_page_count()->Reserve(static_cast<int>(keys.size()));
   resp->mutable_backend_id()->Reserve(static_cast<int>(keys.size()));
+  resp->mutable_resolve_status()->Reserve(static_cast<int>(keys.size()));
   resp->mutable_buffer_index()->Reserve(static_cast<int>(total_pages));
   resp->mutable_page_index()->Reserve(static_cast<int>(total_pages));
 
   for (const auto& k : keys) {
-    resp->add_found(k.found);
+    const ResolveOutcome outcome = k.found ? ResolveOutcome::kFound : k.outcome;
+    resp->add_found(outcome == ResolveOutcome::kFound);
+    resp->add_resolve_status(ResolveOutcomeToProto(outcome));
     resp->add_tier(BatchResolveTierToProto(k.tier));
     resp->add_size(k.size);
     resp->add_backend_id(k.backend_id);
@@ -167,6 +202,7 @@ inline DecodedBatchResolve DecodeBatchResolveResponse(
       resp.backend_id_size() != n || resp.buffer_index_size() != resp.page_index_size()) {
     return out;
   }
+  if (resp.resolve_status_size() != 0 && resp.resolve_status_size() != n) return out;
 
   size_t total_pages = 0;
   for (int i = 0; i < n; ++i) total_pages += resp.page_count(i);
@@ -178,7 +214,10 @@ inline DecodedBatchResolve DecodeBatchResolveResponse(
   size_t cursor = 0;
   for (int i = 0; i < n; ++i) {
     DecodedResolveKey k;
-    k.found = resp.found(i);
+    k.outcome = resp.resolve_status_size() == n
+                    ? ResolveOutcomeFromProto(resp.resolve_status(i))
+                    : (resp.found(i) ? ResolveOutcome::kFound : ResolveOutcome::kMissing);
+    k.found = k.outcome == ResolveOutcome::kFound;
     k.tier = BatchResolveTierFromProto(resp.tier(i));
     k.size = resp.size(i);
     k.backend_id = resp.backend_id(i);

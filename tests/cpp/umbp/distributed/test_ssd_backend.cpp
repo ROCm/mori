@@ -35,6 +35,7 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <string>
@@ -88,7 +89,8 @@ class SsdBackendTest : public ::testing::Test {
   // `staging_pages` is the backend's real concurrency limit, so tests that care
   // about exhaustion set it small.
   SsdBackend* Start(uint32_t staging_pages = 8,
-                    std::chrono::milliseconds read_lease_ttl = std::chrono::milliseconds{500}) {
+                    std::chrono::milliseconds read_lease_ttl = std::chrono::milliseconds{500},
+                    uint64_t ssd_capacity = 64ULL * 1024 * 1024) {
     SsdBackend::Config cfg;
     cfg.page_size = kPageSize;
     cfg.staging_pages = staging_pages;
@@ -96,7 +98,7 @@ class SsdBackendTest : public ::testing::Test {
     cfg.ssd.enabled = true;
     cfg.ssd.ssd.enabled = true;
     cfg.ssd.ssd.storage_dir = dir_.string();
-    cfg.ssd.ssd.capacity_bytes = 64ULL * 1024 * 1024;
+    cfg.ssd.ssd.capacity_bytes = ssd_capacity;
     cfg.ssd.ssd.io.backend = UMBPIoBackend::Posix;  // avoid io_uring container flakiness
 
     auto owned = std::make_unique<SsdBackend>(std::move(cfg));
@@ -205,6 +207,44 @@ TEST_F(SsdBackendTest, PutThenGetReturnsTheSameBytes) {
   EXPECT_EQ(std::memcmp(readback.data(), payload.data(), payload.size()), 0);
 }
 
+TEST_F(SsdBackendTest, MultiPageObjectRoundTripsWithoutChangingPageSize) {
+  SsdBackend* backend = Start(/*staging_pages=*/4);
+  const auto payload = Payload(2 * kPageSize + 123, 17);
+
+  auto allocated = backend->BatchAllocate({AllocateRequest{"large", payload.size()}});
+  ASSERT_EQ(allocated.size(), 1u);
+  ASSERT_EQ(allocated[0].outcome, AllocateOutcome::kSuccessAllocated);
+  ASSERT_EQ(allocated[0].pages.size(), 3u);
+  EXPECT_EQ(allocated[0].page_size, kPageSize);
+  EXPECT_EQ(allocated[0].pages[1].page_index, allocated[0].pages[0].page_index + 1);
+  EXPECT_EQ(allocated[0].pages[2].page_index, allocated[0].pages[1].page_index + 1);
+  ASSERT_TRUE(backend->BatchAbort({allocated[0].slot_id})[0]);
+
+  ASSERT_TRUE(Put(backend, "large", payload));
+  auto resolved = backend->BatchResolve({"large"}, false);
+  ASSERT_TRUE(resolved[0].found);
+  EXPECT_EQ(resolved[0].pages.size(), 3u);
+  std::vector<char> readback;
+  ASSERT_TRUE(Get(backend, "large", &readback));
+  EXPECT_EQ(readback, payload);
+}
+
+TEST_F(SsdBackendTest, DsV4SizedObjectRoundTripsWith64KiBPages) {
+  constexpr size_t kDsV4SwaObjectSize = 9135360;
+  SsdBackend* backend = Start(/*staging_pages=*/160);
+  const auto payload = Payload(kDsV4SwaObjectSize, 23);
+
+  ASSERT_TRUE(Put(backend, "deepseek-v4-swa", payload));
+  auto resolved = backend->BatchResolve({"deepseek-v4-swa"}, false);
+  ASSERT_TRUE(resolved[0].found);
+  EXPECT_EQ(resolved[0].pages.size(),
+            (kDsV4SwaObjectSize + kPageSize - 1) / kPageSize);
+
+  std::vector<char> readback;
+  ASSERT_TRUE(Get(backend, "deepseek-v4-swa", &readback));
+  EXPECT_EQ(readback, payload);
+}
+
 TEST_F(SsdBackendTest, GetOfAnUnknownKeyMisses) {
   SsdBackend* backend = Start();
   auto resolved = backend->BatchResolve({"never-written"}, false);
@@ -290,13 +330,44 @@ TEST_F(SsdBackendTest, CommitOfAnAbortedSlotFails) {
   EXPECT_FALSE(committed[0].success);
 }
 
-// A key bigger than one page is refused outright rather than reported as "no
-// space": no other peer would do better, so the writer must not retry elsewhere.
-TEST_F(SsdBackendTest, RejectsAKeyLargerThanOnePage) {
-  SsdBackend* backend = Start();
-  auto allocated = backend->BatchAllocate({AllocateRequest{"too-big", kPageSize + 1}});
+TEST_F(SsdBackendTest, AbortReturnsEveryPageOfAMultiPageSpan) {
+  SsdBackend* backend = Start(/*staging_pages=*/3);
+  auto allocated = backend->BatchAllocate({AllocateRequest{"large", 2 * kPageSize}});
+  ASSERT_EQ(allocated[0].outcome, AllocateOutcome::kSuccessAllocated);
+  ASSERT_EQ(allocated[0].pages.size(), 2u);
+
+  EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"also-large", 2 * kPageSize}})[0].outcome,
+            AllocateOutcome::kFailedNoSpace);
+  ASSERT_TRUE(backend->BatchAbort({allocated[0].slot_id})[0]);
+
+  auto all_pages = backend->BatchAllocate({AllocateRequest{"largest", 3 * kPageSize}});
+  ASSERT_EQ(all_pages[0].outcome, AllocateOutcome::kSuccessAllocated);
+  EXPECT_EQ(all_pages[0].pages.size(), 3u);
+}
+
+// An object larger than the entire arena is a permanent shape failure, not
+// transient pressure that another allocation retry could solve.
+TEST_F(SsdBackendTest, RejectsAKeyLargerThanTheStagingArena) {
+  SsdBackend* backend = Start(/*staging_pages=*/2);
+  auto allocated = backend->BatchAllocate({AllocateRequest{"too-big", 2 * kPageSize + 1}});
   ASSERT_EQ(allocated.size(), 1u);
   EXPECT_EQ(allocated[0].outcome, AllocateOutcome::kFailed);
+}
+
+TEST_F(SsdBackendTest, RejectsAKeyLargerThanSsdEvenWhenItFitsStaging) {
+  SsdBackend* backend =
+      Start(/*staging_pages=*/4, std::chrono::milliseconds{500}, /*ssd_capacity=*/2 * kPageSize);
+  auto allocated = backend->BatchAllocate({AllocateRequest{"too-big", 2 * kPageSize + 1}});
+  ASSERT_EQ(allocated.size(), 1u);
+  EXPECT_EQ(allocated[0].outcome, AllocateOutcome::kFailed);
+  EXPECT_EQ(backend->Capacity().max_allocatable_bytes, 2 * kPageSize);
+}
+
+TEST_F(SsdBackendTest, RejectsAnOverflowingStagingArenaConfiguration) {
+  SsdBackend::Config cfg;
+  cfg.page_size = std::numeric_limits<uint64_t>::max();
+  cfg.staging_pages = 2;
+  EXPECT_THROW((void)SsdBackend(std::move(cfg)), std::invalid_argument);
 }
 
 TEST_F(SsdBackendTest, DedupsAKeyAlreadyOnTheTier) {
@@ -343,11 +414,20 @@ TEST_F(SsdBackendTest, ConcurrentResolvesShareOneStagedPage) {
   EXPECT_EQ(first[0].size, second[0].size);
 }
 
-// Exhaustion degrades a Get to a miss.  Asserted because it is a KNOWN wrong
-// shape (the client will retry another peer for a key this node does hold) —
-// documented in ssd_backend.h, and pinned here so a future control-plane fix
-// has a test to change deliberately rather than discovering the behavior.
-TEST_F(SsdBackendTest, ResolveDegradesToAMissWhenStagingIsExhausted) {
+TEST_F(SsdBackendTest, DuplicateKeysInOneBatchShareOneMultiPageSpan) {
+  SsdBackend* backend = Start(/*staging_pages=*/3);
+  ASSERT_TRUE(Put(backend, "large", Payload(2 * kPageSize + 1, 9)));
+
+  auto resolved = backend->BatchResolve({"large", "large"}, false);
+  ASSERT_EQ(resolved.size(), 2u);
+  ASSERT_TRUE(resolved[0].found);
+  ASSERT_TRUE(resolved[1].found);
+  ASSERT_EQ(resolved[0].pages.size(), 3u);
+  EXPECT_EQ(resolved[0].pages, resolved[1].pages);
+  EXPECT_EQ(resolved[0].size, resolved[1].size);
+}
+
+TEST_F(SsdBackendTest, ResolveReportsBusyWhenStagingIsExhausted) {
   SsdBackend* backend = Start(/*staging_pages=*/1);
   ASSERT_TRUE(Put(backend, "key-a", Payload(1024, 1)));
   ASSERT_TRUE(Put(backend, "key-b", Payload(1024, 2)));
@@ -356,7 +436,37 @@ TEST_F(SsdBackendTest, ResolveDegradesToAMissWhenStagingIsExhausted) {
   ASSERT_TRUE(a[0].found);  // takes the only page and holds it under a lease
 
   auto b = backend->BatchResolve({"key-b"}, false);
-  EXPECT_FALSE(b[0].found) << "expected the documented degrade-to-miss";
+  EXPECT_FALSE(b[0].found);
+  EXPECT_EQ(b[0].outcome, ResolveOutcome::kBusy);
+}
+
+TEST_F(SsdBackendTest, BusyBatchRollsBackEveryNewReservation) {
+  SsdBackend* backend = Start(/*staging_pages=*/4);
+  ASSERT_TRUE(Put(backend, "blocker", Payload(1024, 1)));
+  ASSERT_TRUE(Put(backend, "large-a", Payload(2 * kPageSize, 2)));
+  ASSERT_TRUE(Put(backend, "large-b", Payload(2 * kPageSize, 3)));
+  ASSERT_TRUE(backend->BatchResolve({"blocker"}, false)[0].found);  // one page remains leased
+
+  auto resolved = backend->BatchResolve({"large-a", "large-b"}, false);
+  ASSERT_EQ(resolved.size(), 2u);
+  EXPECT_EQ(resolved[0].outcome, ResolveOutcome::kBusy);
+  EXPECT_EQ(resolved[1].outcome, ResolveOutcome::kBusy);
+
+  // The first two-page reservation was returned when the second could not fit:
+  // all three pages not held by blocker are available to one writer.
+  auto allocated = backend->BatchAllocate({AllocateRequest{"three-pages", 3 * kPageSize}});
+  EXPECT_EQ(allocated[0].outcome, AllocateOutcome::kSuccessAllocated);
+}
+
+TEST_F(SsdBackendTest, BatchLargerThanArenaFailsWithoutRetryLoop) {
+  SsdBackend* backend = Start(/*staging_pages=*/3);
+  ASSERT_TRUE(Put(backend, "large-a", Payload(2 * kPageSize, 2)));
+  ASSERT_TRUE(Put(backend, "large-b", Payload(2 * kPageSize, 3)));
+
+  auto resolved = backend->BatchResolve({"large-a", "large-b"}, false);
+  ASSERT_EQ(resolved.size(), 2u);
+  EXPECT_EQ(resolved[0].outcome, ResolveOutcome::kFailed);
+  EXPECT_EQ(resolved[1].outcome, ResolveOutcome::kFailed);
 }
 
 // ---------------------------------------------------------------------------
