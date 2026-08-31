@@ -301,6 +301,16 @@ struct PoolClientConfig {
   // (2 MiB by default).  Set to an explicit byte count to override.
   uint64_t dram_page_size = 0;
 
+  // Watermarks for the paged medium's own eviction, used ONLY when this node
+  // has no master (PoolClient::Init enables it exactly then).  With a master,
+  // eviction is a cluster-wide decision shipped as Evict RPCs and these are
+  // ignored; without one, nothing else would ever free a page.  Lowered from
+  // UMBPDramConfig::high_watermark / low_watermark, which is where the
+  // deleted local backend read the same policy from.  The SSD medium has its
+  // own pair inside UMBPSsdConfig and does not consult these.
+  double local_evict_high_watermark = 0.9;
+  double local_evict_low_watermark = 0.7;
+
   UMBPCopyPipelineConfig copy_pipeline = [] {
     UMBPCopyPipelineConfig c;
     c.worker_threads = 1;
@@ -343,7 +353,9 @@ struct PoolClientConfig {
 // caller-supplied at all — they are derived from BackendRegistry::Capacity()
 // after Init (backend-agnostic refactor Phase 2).
 inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
-                                           DramOwnershipConfig dram, PeerSsdConfig ssd = {}) {
+                                           DramOwnershipConfig dram, PeerSsdConfig ssd = {},
+                                           double dram_high_watermark = 0.9,
+                                           double dram_low_watermark = 0.7) {
   PoolClientConfig pc;
   pc.master_config = dc.master_config;
   pc.io_engine = dc.io_engine;
@@ -376,6 +388,8 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   // caller-supplied parameter.
   pc.hbm.device = dc.hbm.device;
   if (dc.hbm.capacity_bytes > 0) pc.hbm.buffer_sizes = {dc.hbm.capacity_bytes};
+  pc.local_evict_high_watermark = dram_high_watermark;
+  pc.local_evict_low_watermark = dram_low_watermark;
   pc.medium = ToTierType(dc.medium);
   // The medium is what opts the SSD tier in; PeerSsdManager keys off this.
   pc.ssd.enabled = (pc.medium == TierType::SSD);

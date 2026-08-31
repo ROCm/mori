@@ -52,10 +52,10 @@ struct SsdReadOutcome {
 // read-prepare and local-eviction paths.  Reached from the distributed data
 // plane through SsdBackend : MediumBackend, which forwards to it.
 //
-// It deliberately reuses ONLY the low-level TierBackend (SSDTier); it must NOT
-// pull in LocalStorageManager / LocalBlockIndex, which carry their own DRAM
-// tier + demote/promote — peer DRAM is owned by PageBackend, and two DRAM
-// concepts would scramble ownership.
+// It reuses ONLY the low-level TierBackend (SSDTier).  Peer DRAM is owned by
+// PageBackend, and a second thing here that also held DRAM and demoted between
+// the two would scramble that ownership — which is what the deleted
+// LocalStorageManager did, and part of why it went.
 class PeerSsdManager {
  public:
   explicit PeerSsdManager(const PeerSsdConfig& cfg);
@@ -171,6 +171,11 @@ class PeerSsdManager {
   // Same shape as OwnedLocationSource (see the class comment above) — all
   // events carry TierType::SSD.
   std::vector<KvEvent> DrainPendingEvents();
+
+  // False stops recording ADD/REMOVE and drops what is queued.  The outbox has
+  // exactly one consumer -- MasterClient's heartbeat -- so a node with no
+  // master would otherwise grow it by one entry per written key forever.
+  void SetEventPublishing(bool enabled);
   std::vector<KvEvent> SnapshotOwnedKeys() const;
 
   // Full-sync snapshot that also atomically drops the event outbox under the
@@ -247,6 +252,8 @@ class PeerSsdManager {
   std::unordered_map<std::string, OwnedEntry> owned_;
   std::list<std::string> lru_;  // front = most-recently-used, back = LRU
   std::vector<KvEvent> pending_events_;
+  // Guarded by mutex_ alongside pending_events_.  See SetEventPublishing.
+  bool event_publishing_ = true;
 
   // One follower attached to a leader's read.  Delivery is a memcpy into
   // {dst, cap} out of the leader's staging slot.

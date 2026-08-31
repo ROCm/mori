@@ -900,6 +900,20 @@ bool PoolClient::Init() {
     // every named backend, including multiple instances of the same medium.
     backend = MakeInstrumentedBackend(std::move(backend));
 
+    // A node with no master owns its whole storage policy, and both halves of
+    // that follow from the same fact: nobody will ever call Evict() on this
+    // backend, and nobody will ever drain its heartbeat outbox.  So the backend
+    // evicts for itself, and stops recording events addressed to a master that
+    // does not exist.  Both are no-ops in a cluster -- master-driven eviction
+    // stays the only policy there, and the outbox keeps feeding the heartbeat.
+    //
+    // Before Init(), which is the contract EnableLocalEviction states.
+    if (!master_client_) {
+      backend->SetEventPublishing(false);
+      backend->EnableLocalEviction(config_.local_evict_high_watermark,
+                                   config_.local_evict_low_watermark);
+    }
+
     // Narrowed to MemoryRegistrar: a backend publishes endpoints, it does not
     // move bytes, and that is a compile-time fact (design doc §5 Rule C).
     if (!backend->Init(static_cast<MemoryRegistrar*>(transfer_engine_.get()))) {
@@ -3029,6 +3043,13 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   }
   if (dbg != nullptr) dbg->remote_keys = missed.size();
   if (missed.empty()) return results;
+
+  // No master, no remote phase: nothing can route these keys anywhere, so a
+  // local miss is the final answer (the same disposition BatchGet takes).
+  // Returning here rather than falling into the arena check matters because an
+  // embedded deployment allocates no arena -- without this, every ordinary
+  // cache miss would report itself as a scratch-arena error.
+  if (!HasMaster()) return results;
 
   // ---- Phase 2: the rest, through the GET scratch arena ----
   //

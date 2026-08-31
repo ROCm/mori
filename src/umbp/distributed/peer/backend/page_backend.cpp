@@ -289,8 +289,17 @@ void HostPageMemorySource::Release() {
 // ---------------------------------------------------------------------------
 
 AllocateResult PageBackend::Allocate(const std::string& key, uint64_t size) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return AllocateLocked(key, size);
+  AllocateResult out;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    out = AllocateLocked(key, size);
+  }
+  // A full pool is the one state the commit-time round cannot have prevented
+  // (one object larger than the headroom, or a burst that never reached
+  // commit).  Evicting here does not rescue THIS allocation -- it is not
+  // retried -- but it stops the pool staying wedged for every put after it.
+  if (out.outcome == AllocateOutcome::kFailedNoSpace) MaybeEvictToLowWatermark();
+  return out;
 }
 
 AllocateResult PageBackend::AllocateLocked(const std::string& key, uint64_t size) {
@@ -347,13 +356,18 @@ std::vector<AllocateResult> PageBackend::BatchAllocate(
     const std::vector<AllocateRequest>& entries) {
   std::vector<AllocateResult> out(entries.size());
   if (entries.empty()) return out;
-  std::lock_guard<std::mutex> lock(mutex_);
-  for (size_t i = 0; i < entries.size(); ++i) {
-    out[i] = AllocateLocked(entries[i].key, entries[i].size);
-    if (out[i].outcome == AllocateOutcome::kSuccessAllocated) {
-      out[i].descs = BuildBufferDescsLocked(out[i].pages);
+  bool no_space = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (size_t i = 0; i < entries.size(); ++i) {
+      out[i] = AllocateLocked(entries[i].key, entries[i].size);
+      if (out[i].outcome == AllocateOutcome::kSuccessAllocated) {
+        out[i].descs = BuildBufferDescsLocked(out[i].pages);
+      }
+      no_space = no_space || out[i].outcome == AllocateOutcome::kFailedNoSpace;
     }
   }
+  if (no_space) MaybeEvictToLowWatermark();
   return out;
 }
 
@@ -362,8 +376,16 @@ std::vector<AllocateResult> PageBackend::BatchAllocate(
 // ---------------------------------------------------------------------------
 
 bool PageBackend::Commit(uint64_t slot_id, const std::string& key, uint64_t& bytes_committed) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return CommitLocked(slot_id, key, bytes_committed);
+  bool ok = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ok = CommitLocked(slot_id, key, bytes_committed);
+  }
+  // Check-after-write, on the committing thread: there is no eviction thread,
+  // and a commit is the only event that grows usage.  Outside the lock because
+  // a round takes mutex_ itself.  No-op unless local eviction is enabled.
+  MaybeEvictToLowWatermark();
+  return ok;
 }
 
 bool PageBackend::CommitLocked(uint64_t slot_id, const std::string& key,
@@ -402,6 +424,7 @@ bool PageBackend::CommitLocked(uint64_t slot_id, const std::string& key,
   owned.size = it->second.size;
   QueueEventLocked(KvEvent{KvEvent::Kind::ADD, key, tier_, owned.size});
   owned_[key] = std::move(owned);
+  TouchLruLocked(key, owned_[key]);
   pending_.erase(it);
   bytes_committed = owned_[key].size;
   return true;
@@ -410,10 +433,15 @@ bool PageBackend::CommitLocked(uint64_t slot_id, const std::string& key,
 std::vector<CommitResult> PageBackend::BatchCommit(const std::vector<CommitRequest>& entries) {
   std::vector<CommitResult> out(entries.size());
   if (entries.empty()) return out;
-  std::lock_guard<std::mutex> lock(mutex_);
-  for (size_t i = 0; i < entries.size(); ++i) {
-    out[i].success = CommitLocked(entries[i].slot_id, entries[i].key, out[i].bytes_committed);
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (size_t i = 0; i < entries.size(); ++i) {
+      out[i].success = CommitLocked(entries[i].slot_id, entries[i].key, out[i].bytes_committed);
+    }
   }
+  // One round for the whole batch, not one per key: a batch is a single burst
+  // of growth and a round already frees down to the low watermark.
+  MaybeEvictToLowWatermark();
   return out;
 }
 
@@ -456,6 +484,7 @@ ResolvedEntry PageBackend::Resolve(const std::string& key) {
   // this key.  steady_clock is monotonic and read_lease_ttl_ is fixed,
   // so this assignment is always >= any previous deadline for the key.
   it->second.read_lease_until = std::chrono::steady_clock::now() + read_lease_ttl_;
+  TouchLruLocked(key, it->second);
   return r;
 }
 
@@ -478,6 +507,7 @@ std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::stri
     entry.page_size = page_size_;
     if (include_descs) entry.descs = BuildBufferDescsLocked(it->second.pages);
     it->second.read_lease_until = lease_deadline;
+    TouchLruLocked(keys[i], it->second);
   }
   return out;
 }
@@ -538,6 +568,7 @@ std::vector<EvictResult> PageBackend::Evict(const std::vector<std::string>& keys
     if (allocator_) allocator_->Deallocate(it->second.pages);
     r.bytes_freed = it->second.size;
     QueueEventLocked(KvEvent{KvEvent::Kind::REMOVE, key, tier_, 0});
+    RemoveFromLruLocked(it->second);
     owned_.erase(it);
     out.push_back(std::move(r));
   }
@@ -638,6 +669,7 @@ void PageBackend::ClearLocal() {
     if (allocator_) allocator_->Deallocate(slot.pages);
   }
   owned_.clear();
+  lru_.clear();
 
   // Deadlines that mattered are already in deferred_frees_; the rest went
   // with owned_.
@@ -660,6 +692,9 @@ void PageBackend::ClearFullSyncAcked() {
 // ---------------------------------------------------------------------------
 
 void PageBackend::QueueEventLocked(KvEvent event) {
+  // No master, no consumer: DrainPendingEvents is called only by the
+  // heartbeat, so queueing here would grow by one entry per put forever.
+  if (!event_publishing_) return;
   pending_events_.push_back(std::move(event));
   // Wake the heartbeat the moment the outbox first reaches the threshold.
   // Events are appended one at a time, so `==` fires at most once per
@@ -679,6 +714,119 @@ std::vector<KvEvent> PageBackend::DrainPendingEvents() {
   std::vector<KvEvent> drained;
   drained.swap(pending_events_);
   return drained;
+}
+
+void PageBackend::SetEventPublishing(bool enabled) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  event_publishing_ = enabled;
+  // Whatever is already queued has no consumer either; drop it rather than
+  // hold it for a master that will never register.
+  if (!enabled) pending_events_.clear();
+}
+
+// ---------------------------------------------------------------------------
+//  Local eviction (no-master deployments; see EnableLocalEviction)
+// ---------------------------------------------------------------------------
+
+void PageBackend::EnableLocalEviction(double high_watermark, double low_watermark) {
+  if (!(high_watermark > 0.0 && high_watermark <= 1.0 && low_watermark > 0.0 &&
+        low_watermark < high_watermark)) {
+    MORI_UMBP_WARN(
+        "[PageBackend] ignoring local eviction watermarks high={} low={} "
+        "(require 0 < low < high <= 1) — local eviction stays OFF",
+        high_watermark, low_watermark);
+    return;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  local_evict_enabled_ = true;
+  local_evict_high_wm_ = high_watermark;
+  local_evict_low_wm_ = low_watermark;
+  // Keys committed before this call are not in lru_ and would therefore be
+  // invisible to a round.  Enabling before Init is the contract, but seed
+  // anyway so a late enable degrades to "wrong order", not "never evicted".
+  for (auto& [key, slot] : owned_) TouchLruLocked(key, slot);
+  MORI_UMBP_INFO("[PageBackend] local eviction ON tier={} high={} low={}", static_cast<int>(tier_),
+                 high_watermark, low_watermark);
+}
+
+void PageBackend::TouchLruLocked(const std::string& key, OwnedSlot& slot) {
+  if (!local_evict_enabled_) return;
+  if (slot.in_lru) {
+    lru_.splice(lru_.begin(), lru_, slot.lru_it);
+    return;
+  }
+  lru_.push_front(key);
+  slot.lru_it = lru_.begin();
+  slot.in_lru = true;
+}
+
+void PageBackend::RemoveFromLruLocked(OwnedSlot& slot) {
+  if (!slot.in_lru) return;
+  lru_.erase(slot.lru_it);
+  slot.in_lru = false;
+}
+
+size_t PageBackend::MaybeEvictToLowWatermark() {
+  // Only one round at a time.  A second committing thread backs off rather
+  // than over-evicting, and try_lock keeps the put path non-blocking.
+  std::unique_lock<std::mutex> round(local_evict_round_mutex_, std::try_to_lock);
+  if (!round.owns_lock()) return 0;
+
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!local_evict_enabled_ || !allocator_) return 0;
+
+  const uint64_t total = allocator_->TotalBytes();
+  if (total == 0) return 0;
+  const uint64_t used = allocator_->UsedBytes();
+  if (static_cast<double>(used) < local_evict_high_wm_ * static_cast<double>(total)) return 0;
+
+  const auto low_bytes = static_cast<uint64_t>(local_evict_low_wm_ * static_cast<double>(total));
+  if (used <= low_bytes) return 0;
+  const uint64_t to_free = used - low_bytes;
+
+  // Oldest first.  Two passes so the list is not mutated under its own
+  // reverse iterator; the selection pass is where the skips happen.
+  const auto now = std::chrono::steady_clock::now();
+  uint64_t selected_bytes = 0;
+  std::vector<std::string> victims;
+  for (auto it = lru_.rbegin(); it != lru_.rend() && selected_bytes < to_free; ++it) {
+    auto owned_it = owned_.find(*it);
+    if (owned_it == owned_.end()) continue;  // defensive; lru_/owned_ stay in sync
+    // Same two protections master-driven Evict honours: an in-flight read owns
+    // the pages until its lease expires, and a copy pin until the worker is
+    // done.  A round that finds only protected keys frees what it can and
+    // stops — it must not spin waiting for a reader.
+    if (HasActiveReadLeaseLocked(owned_it->second, now)) continue;
+    if (HasActivePinLocked(*it)) continue;
+    victims.push_back(*it);
+    selected_bytes += static_cast<uint64_t>(owned_it->second.pages.size()) * page_size_;
+  }
+
+  size_t freed = 0;
+  for (const auto& key : victims) {
+    auto owned_it = owned_.find(key);
+    if (owned_it == owned_.end()) continue;
+    if (allocator_) allocator_->Deallocate(owned_it->second.pages);
+    // A REMOVE is queued for symmetry with master-driven Evict; with no master
+    // event publishing is off and this is a no-op, so nothing accumulates.
+    QueueEventLocked(KvEvent{KvEvent::Kind::REMOVE, key, tier_, 0});
+    RemoveFromLruLocked(owned_it->second);
+    owned_.erase(owned_it);
+    ++freed;
+  }
+  if (freed > 0) {
+    MORI_UMBP_DEBUG("[PageBackend] local eviction freed {} key(s) ({} bytes) tier={}", freed,
+                    selected_bytes, static_cast<int>(tier_));
+    local_evict_warned_ = false;
+  } else if (!local_evict_warned_) {
+    // Latched: a wedged pool would otherwise log this on every commit.
+    local_evict_warned_ = true;
+    MORI_UMBP_WARN(
+        "[PageBackend] local eviction found no reclaimable key at {}/{} bytes used "
+        "(all leased or pinned) tier={}",
+        used, total, static_cast<int>(tier_));
+  }
+  return freed;
 }
 
 void PageBackend::SetAutoFlushHook(size_t threshold, std::function<void()> cb) {

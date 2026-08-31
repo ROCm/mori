@@ -231,7 +231,9 @@ bool PeerSsdManager::Write(const std::string& key,
     } else {
       lru_.push_front(key);
       owned_.emplace(key, OwnedEntry{total_size, lru_.begin()});
-      pending_events_.push_back(KvEvent{KvEvent::Kind::ADD, key, TierType::SSD, total_size});
+      if (event_publishing_) {
+        pending_events_.push_back(KvEvent{KvEvent::Kind::ADD, key, TierType::SSD, total_size});
+      }
     }
     // Keep the just-written key out of this write's own watermark victim set.
     // A successful Write must imply the key still exists when it returns.
@@ -342,7 +344,9 @@ std::vector<bool> PeerSsdManager::WriteBatch(const std::vector<std::string>& key
       } else {
         lru_.push_front(keys[i]);
         owned_.emplace(keys[i], OwnedEntry{sizes[i], lru_.begin()});
-        pending_events_.push_back(KvEvent{KvEvent::Kind::ADD, keys[i], TierType::SSD, sizes[i]});
+        if (event_publishing_) {
+          pending_events_.push_back(KvEvent{KvEvent::Kind::ADD, keys[i], TierType::SSD, sizes[i]});
+        }
       }
     }
   }
@@ -411,7 +415,9 @@ bool PeerSsdManager::Evict(const std::string& key) {
     metrics_.evict_bytes_freed.fetch_add(it->second.size, std::memory_order_relaxed);
     lru_.erase(it->second.lru_it);
     owned_.erase(it);
-    pending_events_.push_back(KvEvent{KvEvent::Kind::REMOVE, key, TierType::SSD, 0});
+    if (event_publishing_) {
+      pending_events_.push_back(KvEvent{KvEvent::Kind::REMOVE, key, TierType::SSD, 0});
+    }
   }
   return true;
 }
@@ -892,6 +898,12 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(const std::vector<s
 // ---------------------------------------------------------------------------
 //  OwnedLocationSource (heartbeat event drain / snapshot)
 // ---------------------------------------------------------------------------
+
+void PeerSsdManager::SetEventPublishing(bool enabled) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  event_publishing_ = enabled;
+  if (!enabled) pending_events_.clear();
+}
 
 std::vector<KvEvent> PeerSsdManager::DrainPendingEvents() {
   std::lock_guard<std::mutex> lock(mutex_);
