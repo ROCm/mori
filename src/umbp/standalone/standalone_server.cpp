@@ -38,6 +38,7 @@
 #include <climits>
 #include <cstring>
 #include <limits>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -46,6 +47,7 @@
 #include <string>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 #include "mori/utils/mori_log.hpp"
@@ -164,6 +166,70 @@ class ConditionalReadLock {
  private:
   std::shared_lock<std::shared_mutex> shared_;
   std::unique_lock<std::shared_mutex> exclusive_;
+};
+
+// The key lists BatchGetRanges callers have asked the server to remember.
+//
+// A layer-wise restore names one key set once per layer group -- eight times
+// over at UMBP_LAYER_GROUP=8 -- and the keys are the only part of the request
+// that is identical across those calls. At a thousand-odd ~128-byte keys that
+// is over a hundred kilobytes serialized, then a heap allocation per key to
+// deserialize, seven times for nothing.
+//
+// A handle stands in for the list. It is deliberately only a hint: the table is
+// bounded and evicts, a handle it no longer holds is reported unknown and the
+// caller repeats the call carrying its keys, and nothing has to be closed or
+// revoked for the entry to go away. That is what keeps a client crash, a server
+// restart, or a caller that simply forgets from mattering at all.
+//
+// The fingerprint is the safety property. It is recorded when the handle is
+// minted and checked on every use, so the handle cannot name a list other than
+// the one it was minted for even if a caller confuses two of its own.
+class KeyHandleTable {
+ public:
+  using Keys = std::shared_ptr<const std::vector<std::string>>;
+
+  // Nullptr when the handle is not held, or is held for different keys.
+  Keys Lookup(uint64_t handle, uint64_t fingerprint) {
+    if (handle == 0) return nullptr;
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = entries_.find(handle);
+    if (it == entries_.end() || it->second.fingerprint != fingerprint) return nullptr;
+    lru_.splice(lru_.begin(), lru_, it->second.position);
+    return it->second.keys;
+  }
+
+  uint64_t Insert(Keys keys, uint64_t fingerprint) {
+    std::lock_guard<std::mutex> lock(mu_);
+    // Never reused within a process, so a handle that is found is always the
+    // list it was minted for; across processes the table starts empty, and the
+    // fingerprint covers the rest.
+    const uint64_t handle = next_++;
+    lru_.push_front(handle);
+    entries_.emplace(handle, Entry{std::move(keys), fingerprint, lru_.begin()});
+    while (lru_.size() > kCapacity) {
+      entries_.erase(lru_.back());
+      lru_.pop_back();
+    }
+    return handle;
+  }
+
+ private:
+  // A restore has one key set in flight per pool it reads, and the reader
+  // chunks a pool's keys by a range budget, so a handful of sets are live at
+  // once. Sized well past that; the cost of being wrong is a resend.
+  static constexpr size_t kCapacity = 64;
+
+  struct Entry {
+    Keys keys;
+    uint64_t fingerprint;
+    std::list<uint64_t>::iterator position;
+  };
+
+  std::mutex mu_;
+  std::list<uint64_t> lru_;  // front = most recently used
+  std::unordered_map<uint64_t, Entry> entries_;
+  uint64_t next_ = 1;
 };
 
 }  // namespace
@@ -321,7 +387,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   grpc::Status BatchPutRanges(grpc::ServerContext*, const ::umbp::BatchRangeDataRequest* request,
                               ::umbp::BatchBoolResponse* response) override {
     size_t total_ranges = 0;
-    if (!ValidateRangeRequest(*request, /*put=*/true, &total_ranges)) {
+    if (!ValidateRangeRequest(*request, /*put=*/true, request->keys_size(), &total_ranges)) {
       FillFalse(request->keys_size(), response);
       return grpc::Status::OK;
     }
@@ -424,9 +490,35 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
 
   grpc::Status BatchGetRanges(grpc::ServerContext*, const ::umbp::BatchRangeDataRequest* request,
                               ::umbp::BatchBoolResponse* response) override {
+    // The key list either rides on the request or is one the server was asked
+    // to remember on an earlier call. A handle it no longer holds is not an
+    // error -- say so, and the caller repeats the call carrying its keys.
+    KeyHandleTable::Keys keys;
+    if (request->key_handle() != 0) {
+      if (request->keys_size() != 0) {
+        FillFalse(request->keys_size(), response);
+        return grpc::Status::OK;
+      }
+      keys = key_handles_.Lookup(request->key_handle(), request->key_fingerprint());
+      if (keys == nullptr) {
+        response->set_key_handle_unknown(true);
+        return grpc::Status::OK;
+      }
+    } else {
+      auto owned = std::make_shared<std::vector<std::string>>(request->keys().begin(),
+                                                              request->keys().end());
+      // A zero fingerprint means the caller does not intend to come back, so
+      // there is nothing to remember for it.
+      if (request->key_fingerprint() != 0) {
+        response->set_key_handle(key_handles_.Insert(owned, request->key_fingerprint()));
+      }
+      keys = std::move(owned);
+    }
+
+    const size_t key_count = keys->size();
     size_t total_ranges = 0;
-    if (!ValidateRangeRequest(*request, /*put=*/false, &total_ranges)) {
-      FillFalse(request->keys_size(), response);
+    if (!ValidateRangeRequest(*request, /*put=*/false, key_count, &total_ranges)) {
+      FillFalse(static_cast<int>(key_count), response);
       return grpc::Status::OK;
     }
 
@@ -442,16 +534,15 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     std::vector<uintptr_t> flat_ptrs;
     if (!ResolveRanges(request->client_id(), queries, &flat_ptrs, /*allow_zero=*/true) ||
         shutdown_.load()) {
-      FillFalse(request->keys_size(), response);
+      FillFalse(static_cast<int>(key_count), response);
       return grpc::Status::OK;
     }
 
-    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
-    std::vector<std::vector<uintptr_t>> ptrs(keys.size());
-    std::vector<std::vector<size_t>> sizes(keys.size());
-    std::vector<std::vector<size_t>> offsets(keys.size());
+    std::vector<std::vector<uintptr_t>> ptrs(key_count);
+    std::vector<std::vector<size_t>> sizes(key_count);
+    std::vector<std::vector<size_t>> offsets(key_count);
     size_t cursor = 0;
-    for (size_t i = 0; i < keys.size(); ++i) {
+    for (size_t i = 0; i < key_count; ++i) {
       const size_t count = request->range_counts(static_cast<int>(i));
       ptrs[i].reserve(count);
       sizes[i].reserve(count);
@@ -463,7 +554,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
             static_cast<size_t>(request->object_offsets(static_cast<int>(cursor))));
       }
     }
-    FillResults(client_->BatchGetRanges(keys, ptrs, sizes, offsets), response);
+    FillResults(client_->BatchGetRanges(*keys, ptrs, sizes, offsets), response);
     return grpc::Status::OK;
   }
 
@@ -1186,10 +1277,13 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     return ResolveRanges(request.client_id(), queries, ptrs, /*allow_zero=*/false);
   }
 
+  // `key_count` rather than request.keys_size(): a get may name its keys by a
+  // handle, in which case the request carries none.
   static bool ValidateRangeRequest(const ::umbp::BatchRangeDataRequest& request, bool put,
-                                   size_t* total_ranges) {
-    if (!total_ranges || request.range_counts_size() != request.keys_size()) return false;
-    if ((put && request.object_sizes_size() != request.keys_size()) ||
+                                   size_t key_count, size_t* total_ranges) {
+    if (!total_ranges || static_cast<size_t>(request.range_counts_size()) != key_count)
+      return false;
+    if ((put && static_cast<size_t>(request.object_sizes_size()) != key_count) ||
         (!put && request.object_sizes_size() != 0)) {
       return false;
     }
@@ -1284,6 +1378,8 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   std::mutex external_identity_lifecycle_mu_;
   std::mutex external_identity_mu_;
   std::map<std::string, std::shared_ptr<ExternalKvIdentityClient>> external_identities_;
+
+  KeyHandleTable key_handles_;
 
   std::atomic<bool> fd_running_{false};
   int listen_fd_ = -1;

@@ -704,5 +704,226 @@ TEST(StandaloneShmIpcTest, ShutdownDoesNotHangOnHalfOpenFdConnection) {
   unlink(fd_path.c_str());
 }
 
+// A layer-wise reader asks about one key set once per layer group, changing
+// only which bytes it wants. The keys are then the one part of the request that
+// is worth not sending again -- and the handle that stands in for them has to
+// be an optimisation only: never able to name the wrong list, and never able to
+// turn a readable batch into a failure just because the server forgot it.
+TEST(StandaloneShmIpcTest, RangedGetKeyHandleReplacesTheKeysAndFailsSafe) {
+  const std::string address =
+      "unix:///tmp/umbp_standalone_keyhandle_" + std::to_string(getpid()) + ".grpc.sock";
+  const std::string grpc_path = standalone::UnixPathFromGrpcAddress(address);
+  const std::string fd_path = standalone::DeriveFdSocketPath(address);
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+
+  UMBPConfig server_cfg;
+  server_cfg.dram.capacity_bytes = 1 << 20;
+  server_cfg.ssd.enabled = false;
+  UMBPStandaloneProcessConfig sp_cfg;
+  sp_cfg.address = address;
+  sp_cfg.startup_timeout_ms = 5000;
+  server_cfg.standalone_process = sp_cfg;
+
+  standalone::StandaloneServer server(server_cfg, address);
+  ASSERT_TRUE(server.Start());
+  std::thread server_thread([&]() { server.Run(); });
+
+  UMBPConfig client_cfg = server_cfg;
+  auto client = CreateUMBPClient(client_cfg);
+  ASSERT_EQ(client->GetDeploymentMode(), UMBPDeploymentMode::StandaloneProcess);
+
+  HostMemAllocator allocator;
+  HostBufferOptions opts;
+  opts.backing = HostBufferBacking::kAnonymousShm;
+  opts.prefault = false;
+  HostBufferHandle region = allocator.Alloc(65536, opts);
+  ASSERT_TRUE(region.valid());
+  auto* bytes = static_cast<unsigned char*>(region.ptr);
+  ASSERT_TRUE(client->RegisterMemory(reinterpret_cast<uintptr_t>(region.ptr), region.mapped_size));
+
+  // Four objects of 32 bytes, each read back later in two 16-byte halves --
+  // the two halves standing in for two layer groups over one key set.
+  constexpr size_t kKeys = 4;
+  constexpr size_t kObject = 32;
+  constexpr size_t kHalf = kObject / 2;
+  std::vector<std::string> keys;
+  std::vector<uintptr_t> srcs;
+  std::vector<size_t> put_sizes;
+  for (size_t k = 0; k < kKeys; ++k) {
+    keys.push_back("handle-key-" + std::to_string(k));
+    unsigned char* src = bytes + 1024 + k * kObject;
+    for (size_t i = 0; i < kObject; ++i) src[i] = static_cast<unsigned char>(k * 16 + i);
+    srcs.push_back(reinterpret_cast<uintptr_t>(src));
+    put_sizes.push_back(kObject);
+  }
+  ASSERT_EQ(client->BatchPut(keys, srcs, put_sizes), std::vector<bool>(kKeys, true));
+
+  // Read the same key set twice, each pass asking for the other half. The
+  // second pass is the one that rides on a handle; both must land the bytes
+  // the object actually holds.
+  for (size_t pass = 0; pass < 2; ++pass) {
+    const size_t object_offset = pass * kHalf;
+    std::vector<std::vector<uintptr_t>> dsts(kKeys);
+    std::vector<std::vector<size_t>> sizes(kKeys, {kHalf});
+    std::vector<std::vector<size_t>> offsets(kKeys, {object_offset});
+    for (size_t k = 0; k < kKeys; ++k) {
+      unsigned char* dst = bytes + 8192 + (pass * kKeys + k) * kHalf;
+      std::memset(dst, 0, kHalf);
+      dsts[k] = {reinterpret_cast<uintptr_t>(dst)};
+    }
+    ASSERT_EQ(client->BatchGetRanges(keys, dsts, sizes, offsets), std::vector<bool>(kKeys, true))
+        << "pass " << pass;
+    for (size_t k = 0; k < kKeys; ++k) {
+      const unsigned char* dst = bytes + 8192 + (pass * kKeys + k) * kHalf;
+      for (size_t i = 0; i < kHalf; ++i) {
+        EXPECT_EQ(dst[i], static_cast<unsigned char>(k * 16 + object_offset + i))
+            << "pass " << pass << " key " << k << " byte " << i;
+      }
+    }
+  }
+
+  // A second, different key set must not be answered from the first one's
+  // handle, and must not disturb it: go back to the first set afterwards.
+  ASSERT_EQ(client->BatchPut({"other-key"}, {reinterpret_cast<uintptr_t>(bytes + 1024)}, {kObject}),
+            std::vector<bool>({true}));
+  {
+    unsigned char* dst = bytes + 16384;
+    std::memset(dst, 0, kObject);
+    ASSERT_EQ(client->BatchGetRanges({"other-key"}, {{reinterpret_cast<uintptr_t>(dst)}},
+                                     {{kObject}}, {{0}}),
+              std::vector<bool>({true}));
+    for (size_t i = 0; i < kObject; ++i) EXPECT_EQ(dst[i], static_cast<unsigned char>(i));
+  }
+  {
+    unsigned char* dst = bytes + 20480;
+    std::memset(dst, 0, kKeys * kObject);
+    std::vector<std::vector<uintptr_t>> dsts(kKeys);
+    for (size_t k = 0; k < kKeys; ++k) {
+      dsts[k] = {reinterpret_cast<uintptr_t>(dst + k * kObject)};
+    }
+    ASSERT_EQ(client->BatchGetRanges(keys, dsts, std::vector<std::vector<size_t>>(kKeys, {kObject}),
+                                     std::vector<std::vector<size_t>>(kKeys, {0})),
+              std::vector<bool>(kKeys, true));
+    for (size_t k = 0; k < kKeys; ++k) {
+      for (size_t i = 0; i < kObject; ++i) {
+        EXPECT_EQ(dst[k * kObject + i], static_cast<unsigned char>(k * 16 + i));
+      }
+    }
+  }
+
+  // Now drive the wire directly, which is the only way to see the handle
+  // itself and to offer one the client would never construct. This stub has
+  // registered no memory of its own, so no bytes move for it -- what it can
+  // observe is how the handle table answers, which is the point.
+  auto raw_stub = ::umbp::UMBPStandalone::NewStub(
+      grpc::CreateChannel(address, grpc::InsecureChannelCredentials()));
+  const auto build = [&](::umbp::BatchRangeDataRequest* req, size_t key_count) {
+    req->set_client_id("raw-wire-client");
+    for (size_t k = 0; k < key_count; ++k) {
+      req->add_range_counts(1);
+      req->add_shm_offsets(32768 + k * kObject);
+      req->add_region_bases(0);
+      req->add_sizes(kObject);
+      req->add_object_offsets(0);
+    }
+  };
+
+  // Sending the keys with a fingerprint is what mints a handle.
+  constexpr uint64_t kFingerprint = 0x1234567890abcdefULL;
+  uint64_t minted = 0;
+  {
+    ::umbp::BatchRangeDataRequest req;
+    build(&req, kKeys);
+    req.set_key_fingerprint(kFingerprint);
+    for (const auto& key : keys) req.add_keys(key);
+    grpc::ClientContext ctx;
+    ::umbp::BatchBoolResponse resp;
+    ASSERT_TRUE(raw_stub->BatchGetRanges(&ctx, req, &resp).ok());
+    minted = resp.key_handle();
+    EXPECT_NE(minted, 0u);
+  }
+
+  // The handle alone stands for the four keys: the request carries none, and
+  // the reply is still four elements wide, which it can only be if validation
+  // took its key count from the remembered list.
+  {
+    ::umbp::BatchRangeDataRequest req;
+    build(&req, kKeys);
+    req.set_key_handle(minted);
+    req.set_key_fingerprint(kFingerprint);
+    grpc::ClientContext ctx;
+    ::umbp::BatchBoolResponse resp;
+    ASSERT_TRUE(raw_stub->BatchGetRanges(&ctx, req, &resp).ok());
+    EXPECT_FALSE(resp.key_handle_unknown());
+    EXPECT_EQ(resp.ok_size(), static_cast<int>(kKeys));
+  }
+
+  // A handle the server never minted is reported unknown rather than guessed
+  // at, so the caller can simply repeat the call with its keys.
+  {
+    ::umbp::BatchRangeDataRequest req;
+    build(&req, kKeys);
+    req.set_key_handle(minted + 0x5000);
+    req.set_key_fingerprint(kFingerprint);
+    grpc::ClientContext ctx;
+    ::umbp::BatchBoolResponse resp;
+    ASSERT_TRUE(raw_stub->BatchGetRanges(&ctx, req, &resp).ok());
+    EXPECT_TRUE(resp.key_handle_unknown());
+    EXPECT_EQ(resp.ok_size(), 0);
+  }
+
+  // A real handle offered with the wrong fingerprint is the case the
+  // fingerprint exists for: it must not resolve to the list it was minted for.
+  {
+    ::umbp::BatchRangeDataRequest req;
+    build(&req, kKeys);
+    req.set_key_handle(minted);
+    req.set_key_fingerprint(kFingerprint ^ 1ULL);
+    grpc::ClientContext ctx;
+    ::umbp::BatchBoolResponse resp;
+    ASSERT_TRUE(raw_stub->BatchGetRanges(&ctx, req, &resp).ok());
+    EXPECT_TRUE(resp.key_handle_unknown());
+    EXPECT_EQ(resp.ok_size(), 0);
+  }
+
+  // Naming a handle AND carrying keys is contradictory. Two keys against a
+  // handle minted for four: the reply is two elements wide, so the request was
+  // refused on what it carried rather than one of the two silently winning.
+  {
+    ::umbp::BatchRangeDataRequest req;
+    build(&req, 2);
+    req.set_key_handle(minted);
+    req.set_key_fingerprint(kFingerprint);
+    req.add_keys(keys[0]);
+    req.add_keys(keys[1]);
+    grpc::ClientContext ctx;
+    ::umbp::BatchBoolResponse resp;
+    ASSERT_TRUE(raw_stub->BatchGetRanges(&ctx, req, &resp).ok());
+    EXPECT_FALSE(resp.key_handle_unknown());
+    EXPECT_EQ(resp.ok_size(), 2);
+  }
+
+  // Sending keys without a fingerprint asks for nothing to be remembered, so
+  // no handle comes back -- a caller that will not repeat pays no bookkeeping.
+  {
+    ::umbp::BatchRangeDataRequest req;
+    build(&req, kKeys);
+    for (const auto& key : keys) req.add_keys(key);
+    grpc::ClientContext ctx;
+    ::umbp::BatchBoolResponse resp;
+    ASSERT_TRUE(raw_stub->BatchGetRanges(&ctx, req, &resp).ok());
+    EXPECT_EQ(resp.key_handle(), 0u);
+    EXPECT_EQ(resp.ok_size(), static_cast<int>(kKeys));
+  }
+
+  client->Close();
+  allocator.Free(region);
+  server.Shutdown();
+  server_thread.join();
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+}
+
 }  // namespace
 }  // namespace mori::umbp

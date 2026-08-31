@@ -51,6 +51,31 @@ namespace {
 
 std::atomic<uint64_t> g_client_counter{0};
 
+// Travels with a ranged get that names its keys by handle, so the server can
+// check the handle still stands for the list the caller means. It is a check,
+// not the lookup: both sides also hold the keys themselves and the client side
+// compares them in full, so a collision costs a resend and never a wrong read.
+//
+// Computed once per key set, on the call that introduces it -- the same call
+// that pays to serialize the keys anyway -- and reused for every call after.
+// Zero is reserved to mean "do not bother remembering this set".
+uint64_t FingerprintKeys(const std::vector<std::string>& keys) {
+  constexpr uint64_t kOffsetBasis = 1469598103934665603ULL;
+  constexpr uint64_t kPrime = 1099511628211ULL;
+  uint64_t hash = kOffsetBasis;
+  const auto mix = [&hash](unsigned char byte) {
+    hash ^= byte;
+    hash *= kPrime;
+  };
+  for (const std::string& key : keys) {
+    // Length-delimited, so that concatenations that happen to agree do not.
+    const uint64_t length = key.size();
+    for (int shift = 0; shift < 64; shift += 8) mix(static_cast<unsigned char>(length >> shift));
+    for (char c : key) mix(static_cast<unsigned char>(c));
+  }
+  return hash == 0 ? kPrime : hash;
+}
+
 ::umbp::TierType TierToProto(TierType tier) {
   switch (tier) {
     case TierType::HBM:
@@ -423,6 +448,44 @@ std::vector<bool> StandaloneProcessClient::BatchGet(const std::vector<std::strin
   return std::vector<bool>(resp.ok().begin(), resp.ok().end());
 }
 
+uint64_t StandaloneProcessClient::LookupKeyHandle(const std::vector<std::string>& keys,
+                                                  uint64_t* fingerprint) {
+  {
+    std::lock_guard<std::mutex> lock(key_handle_mu_);
+    for (size_t i = 0; i < key_handles_.size(); ++i) {
+      // Size, then the two ends, then the whole thing. The cheap checks reject
+      // a different set outright; the full compare runs only for the set that
+      // is about to be a hit, and is what makes the match exact.
+      const KeyHandle& entry = key_handles_[i];
+      if (entry.keys.size() != keys.size() || keys.empty()) continue;
+      if (entry.keys.front() != keys.front() || entry.keys.back() != keys.back()) continue;
+      if (entry.keys != keys) continue;
+      *fingerprint = entry.fingerprint;
+      const uint64_t handle = entry.handle;
+      if (i != 0)
+        std::rotate(key_handles_.begin(), key_handles_.begin() + i, key_handles_.begin() + i + 1);
+      return handle;
+    }
+  }
+  *fingerprint = FingerprintKeys(keys);
+  return 0;
+}
+
+void StandaloneProcessClient::RememberKeyHandle(const std::vector<std::string>& keys,
+                                                uint64_t handle, uint64_t fingerprint) {
+  if (handle == 0) return;
+  std::lock_guard<std::mutex> lock(key_handle_mu_);
+  key_handles_.insert(key_handles_.begin(), KeyHandle{keys, handle, fingerprint});
+  if (key_handles_.size() > kKeyHandleSlots) key_handles_.resize(kKeyHandleSlots);
+}
+
+void StandaloneProcessClient::ForgetKeyHandle(uint64_t handle) {
+  std::lock_guard<std::mutex> lock(key_handle_mu_);
+  key_handles_.erase(std::remove_if(key_handles_.begin(), key_handles_.end(),
+                                    [handle](const KeyHandle& e) { return e.handle == handle; }),
+                     key_handles_.end());
+}
+
 std::vector<bool> StandaloneProcessClient::BatchGetRanges(
     const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dsts,
     const std::vector<std::vector<size_t>>& sizes,
@@ -432,11 +495,14 @@ std::vector<bool> StandaloneProcessClient::BatchGetRanges(
   std::shared_lock lk(op_mutex_);
   if (closed_ || !RangeBatchShapeValid(keys.size(), dsts, sizes, src_offsets)) return failed;
 
+  uint64_t fingerprint = 0;
+  uint64_t handle = LookupKeyHandle(keys, &fingerprint);
+
   ::umbp::BatchRangeDataRequest req;
   req.set_client_id(ClientId());
+  req.set_key_fingerprint(fingerprint);
   for (size_t i = 0; i < keys.size(); ++i) {
     if (dsts[i].size() > std::numeric_limits<uint32_t>::max()) return failed;
-    req.add_keys(keys[i]);
     req.add_range_counts(static_cast<uint32_t>(dsts[i].size()));
     for (size_t j = 0; j < dsts[i].size(); ++j) {
       uint64_t shm_offset = 0;
@@ -449,11 +515,33 @@ std::vector<bool> StandaloneProcessClient::BatchGetRanges(
     }
   }
 
-  grpc::ClientContext ctx;
-  ::umbp::BatchBoolResponse resp;
-  const grpc::Status status = stub_->BatchGetRanges(&ctx, req, &resp);
-  if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) return failed;
-  return std::vector<bool>(resp.ok().begin(), resp.ok().end());
+  // At most twice: once naming a handle, and if the server no longer holds it,
+  // once carrying the keys. A handle is only ever offered after the server
+  // handed it out, so the retry is the rare path.
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    if (handle != 0) {
+      req.set_key_handle(handle);
+      req.clear_keys();
+    } else {
+      req.set_key_handle(0);
+      req.mutable_keys()->Reserve(static_cast<int>(keys.size()));
+      for (const auto& key : keys) req.add_keys(key);
+    }
+
+    grpc::ClientContext ctx;
+    ::umbp::BatchBoolResponse resp;
+    const grpc::Status status = stub_->BatchGetRanges(&ctx, req, &resp);
+    if (!status.ok()) return failed;
+    if (resp.key_handle_unknown()) {
+      ForgetKeyHandle(handle);
+      handle = 0;
+      continue;
+    }
+    if (resp.ok_size() != static_cast<int>(keys.size())) return failed;
+    RememberKeyHandle(keys, resp.key_handle(), fingerprint);
+    return std::vector<bool>(resp.ok().begin(), resp.ok().end());
+  }
+  return failed;
 }
 
 std::vector<bool> StandaloneProcessClient::BatchPutRanges(
