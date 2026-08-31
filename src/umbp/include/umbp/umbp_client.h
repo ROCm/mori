@@ -37,6 +37,13 @@
 namespace mori::umbp {
 
 enum class UMBPDeploymentMode : int {
+  // No client reports Local any more: the local backend is gone and an
+  // embedded deployment is a DistributedClient with no master, which reports
+  // Distributed (config alone decides what a process is -- an embedded store
+  // is not a different implementation).  The value is kept, and kept at 0, so
+  // an out-of-tree consumer that names it still compiles and so the
+  // STANDALONE_BACKEND_LOCAL wire value keeps its meaning; treat receiving it
+  // as "a server older than this change".
   Local = 0,
   StandaloneProcess = 1,
   Distributed = 2,
@@ -44,10 +51,18 @@ enum class UMBPDeploymentMode : int {
 
 /// Abstract interface for UMBP storage clients.
 ///
-/// Three implementations exist behind this interface:
-///   - StandaloneClient: purely local DRAM+SSD storage, no networking.
-///   - StandaloneProcessClient: gRPC forwarding to a standalone server.
-///   - DistributedClient: master-led global routing + RDMA data plane.
+/// Two implementations exist behind this interface:
+///   - DistributedClient: this node's medium, plus master-led global routing
+///     and an RDMA data plane WHEN a master address is configured.  With none,
+///     the same class is an embedded, single-process store: same backends,
+///     same transfer engine, no routing, no registration, no heartbeat.
+///   - StandaloneProcessClient: gRPC forwarding to a standalone server, which
+///     runs a DistributedClient of its own (with or without a master).
+///
+/// There is deliberately no third, local-only implementation.  "Local" is a
+/// property of a deployment -- no master address -- not a separate client, so
+/// embedded and distributed, standalone-process and in-process, are the same
+/// code path with different configuration.
 ///
 /// Use CreateUMBPClient() to obtain the appropriate implementation based on
 /// UMBPConfig. All methods are zero-copy and pointer-based, designed for
@@ -132,7 +147,8 @@ class IUMBPClient {
 
   /// Returns the concrete deployment mode behind this client.
   virtual UMBPDeploymentMode GetDeploymentMode() const {
-    return IsDistributed() ? UMBPDeploymentMode::Distributed : UMBPDeploymentMode::Local;
+    return IsDistributed() ? UMBPDeploymentMode::Distributed
+                           : UMBPDeploymentMode::StandaloneProcess;
   }
 
   /// Returns the backend behind a forwarding client. For direct clients this
@@ -218,9 +234,25 @@ class IUMBPClient {
   }
 };
 
+/// Fill in an embedded (in-process, no master, no networking) distributed
+/// block for a config that names no deployment, and return the result.
+///
+/// This is what makes "no configuration" mean "a private store in this
+/// process" now that there is no separate local client: the medium comes from
+/// the top-level dram/ssd blocks, identity is synthesized, and everything that
+/// needs a peer -- master address, IO engine host, peer service port -- is left
+/// empty so no socket is opened and no thread is started for a cluster this
+/// process is not part of.
+///
+/// A config that already names a deployment (`distributed` or
+/// `standalone_process`) is returned unchanged, so an explicit configuration
+/// always wins.
+UMBPConfig WithEmbeddedDefaults(const UMBPConfig& config);
+
 /// Factory: creates the appropriate IUMBPClient implementation.
-/// Creates StandaloneClient when config.distributed is not set,
-/// DistributedClient when it is.
+/// StandaloneProcessClient when config.standalone_process is set; otherwise a
+/// DistributedClient, over config.distributed if present and over
+/// WithEmbeddedDefaults(config) if not.
 std::unique_ptr<IUMBPClient> CreateUMBPClient(const UMBPConfig& config = UMBPConfig{});
 
 }  // namespace mori::umbp
