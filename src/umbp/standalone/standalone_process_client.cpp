@@ -60,20 +60,36 @@ std::atomic<uint64_t> g_client_counter{0};
 // that pays to serialize the keys anyway -- and reused for every call after.
 // Zero is reserved to mean "do not bother remembering this set".
 uint64_t FingerprintKeys(const std::vector<std::string>& keys) {
-  constexpr uint64_t kOffsetBasis = 1469598103934665603ULL;
-  constexpr uint64_t kPrime = 1099511628211ULL;
-  uint64_t hash = kOffsetBasis;
-  const auto mix = [&hash](unsigned char byte) {
-    hash ^= byte;
-    hash *= kPrime;
+  // A word at a time. Byte-wise FNV-1a is one byte per multiply latency, and a
+  // layer-wise restore introduces a key set of a thousand ~128-byte keys, which
+  // put this in the tens of microseconds -- charged to the very call the handle
+  // exists to make cheaper.
+  constexpr uint64_t kMul1 = 0x9e3779b97f4a7c15ULL;
+  constexpr uint64_t kMul2 = 0xc2b2ae3d27d4eb4fULL;
+  uint64_t hash = 1469598103934665603ULL;
+  const auto mix_word = [&hash](uint64_t word) {
+    hash ^= word * kMul1;
+    hash = ((hash << 31) | (hash >> 33)) * kMul2;
   };
+  mix_word(keys.size());
   for (const std::string& key : keys) {
     // Length-delimited, so that concatenations that happen to agree do not.
-    const uint64_t length = key.size();
-    for (int shift = 0; shift < 64; shift += 8) mix(static_cast<unsigned char>(length >> shift));
-    for (char c : key) mix(static_cast<unsigned char>(c));
+    mix_word(key.size());
+    const char* data = key.data();
+    size_t i = 0;
+    for (; i + 8 <= key.size(); i += 8) {
+      uint64_t word;
+      std::memcpy(&word, data + i, sizeof(word));  // unaligned-safe, no aliasing UB
+      mix_word(word);
+    }
+    if (i < key.size()) {
+      uint64_t tail = 0;
+      std::memcpy(&tail, data + i, key.size() - i);
+      mix_word(tail);
+    }
   }
-  return hash == 0 ? kPrime : hash;
+  // Zero is reserved to mean "do not bother remembering this set".
+  return hash == 0 ? kMul1 : hash;
 }
 
 ::umbp::TierType TierToProto(TierType tier) {

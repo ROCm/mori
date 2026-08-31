@@ -463,21 +463,38 @@ namespace {
 
 // Only picks a cache candidate; a hit is confirmed by comparing every key, so
 // this needs to be fast and well-spread, not cryptographic.
+//
+// A word at a time rather than a byte at a time. Byte-wise FNV-1a is a serial
+// xor-multiply chain -- one byte per multiply latency -- and a layer-wise
+// restore hashes a thousand ~128-byte keys per call, which put it in the tens
+// of microseconds. That is worth more than it sounds: this used to run inside
+// the backend mutex, where every rank on the node queues.
 uint64_t FingerprintKeys(const std::vector<std::string>& keys) {
-  uint64_t h = 1469598103934665603ULL;  // FNV-1a offset basis
-  auto mix = [&h](const void* data, size_t len) {
-    const auto* p = static_cast<const unsigned char*>(data);
-    for (size_t i = 0; i < len; ++i) {
-      h ^= p[i];
-      h *= 1099511628211ULL;
+  constexpr uint64_t kMul1 = 0x9e3779b97f4a7c15ULL;
+  constexpr uint64_t kMul2 = 0xc2b2ae3d27d4eb4fULL;
+  uint64_t h = 1469598103934665603ULL;
+  const auto mix_word = [&h](uint64_t word) {
+    h ^= word * kMul1;
+    h = ((h << 31) | (h >> 33)) * kMul2;
+  };
+  const auto mix_bytes = [&mix_word](const char* data, size_t len) {
+    size_t i = 0;
+    for (; i + 8 <= len; i += 8) {
+      uint64_t word;
+      std::memcpy(&word, data + i, sizeof(word));  // unaligned-safe, no aliasing UB
+      mix_word(word);
+    }
+    if (i < len) {
+      uint64_t tail = 0;
+      std::memcpy(&tail, data + i, len - i);
+      mix_word(tail);
     }
   };
-  const uint64_t count = keys.size();
-  mix(&count, sizeof(count));
+  mix_word(keys.size());
   for (const auto& key : keys) {
-    const uint64_t len = key.size();
-    mix(&len, sizeof(len));
-    mix(key.data(), key.size());
+    // Length-delimited, so that concatenations that happen to agree do not.
+    mix_word(key.size());
+    mix_bytes(key.data(), key.size());
   }
   return h;
 }
@@ -487,23 +504,30 @@ uint64_t FingerprintKeys(const std::vector<std::string>& keys) {
 std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::string>& keys,
                                                      bool include_descs) {
   if (keys.empty()) return {};
+  const uint64_t fingerprint = FingerprintKeys(keys);
   std::lock_guard<std::mutex> lock(mutex_);
-  return *ResolveBatchLocked(keys, include_descs);
+  return *ResolveBatchLocked(keys, include_descs, fingerprint);
 }
 
 std::shared_ptr<const std::vector<ResolvedEntry>> PageBackend::BatchResolveShared(
     const std::vector<std::string>& keys, bool include_descs) {
   if (keys.empty()) return std::make_shared<const std::vector<ResolvedEntry>>();
+  // Hashed before the lock, not inside it. Every rank on the node reaches this
+  // backend through the one standalone server and queues on this mutex, so work
+  // that depends only on the caller's own argument must not be done while
+  // holding it -- adding tens of microseconds to the critical section costs
+  // that much times the number of ranks, which is how a cache meant to save
+  // time ends up losing it.
+  const uint64_t fingerprint = FingerprintKeys(keys);
   std::lock_guard<std::mutex> lock(mutex_);
-  return ResolveBatchLocked(keys, include_descs);
+  return ResolveBatchLocked(keys, include_descs, fingerprint);
 }
 
 std::shared_ptr<const std::vector<ResolvedEntry>> PageBackend::ResolveBatchLocked(
-    const std::vector<std::string>& keys, bool include_descs) {
+    const std::vector<std::string>& keys, bool include_descs, uint64_t fingerprint) {
   // One now() for the batch: it runs in well under a millisecond against a
   // TTL measured in seconds, so the last key loses nothing worth a syscall.
   const auto lease_deadline = std::chrono::steady_clock::now() + read_lease_ttl_;
-  const uint64_t fingerprint = FingerprintKeys(keys);
 
   auto cached = resolve_cache_.find(fingerprint);
   if (cached != resolve_cache_.end()) {

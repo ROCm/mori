@@ -37,16 +37,25 @@
 // so it can be run anywhere -- which is the point, since the nodes that have
 // those are the scarce thing.
 //
+// --threads is the dimension that matters most and is easiest to miss: in a
+// real deployment every rank on the node reaches one standalone server, so the
+// per-call work inside the backend's mutex is paid once per rank, serially. A
+// single-threaded measurement cannot see that, and a change that adds work to
+// that critical section looks free right up until it is deployed.
+//
 // Usage: bench_standalone_ranged_wire [--keys N] [--groups N] [--repeats N]
 //                                     [--key-bytes N] [--object-bytes N]
+//                                     [--threads N]
 
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -94,6 +103,8 @@ int main(int argc, char** argv) {
   const size_t repeats = static_cast<size_t>(ArgOr(argc, argv, "--repeats", 20));
   const size_t key_bytes = static_cast<size_t>(ArgOr(argc, argv, "--key-bytes", 128));
   const size_t object_bytes = static_cast<size_t>(ArgOr(argc, argv, "--object-bytes", 8192));
+  const size_t threads_n =
+      static_cast<size_t>(std::max<int64_t>(1, ArgOr(argc, argv, "--threads", 1)));
 
   const std::string address =
       "unix:///tmp/umbp_wire_bench_" + std::to_string(getpid()) + ".grpc.sock";
@@ -115,77 +126,94 @@ int main(int argc, char** argv) {
   }
   std::thread server_thread([&] { server.Run(); });
 
-  UMBPConfig client_cfg = cfg;
-  auto client = CreateUMBPClient(client_cfg);
-
-  // One registered region holding both the objects written and the buffers read
-  // back into, so every range resolves through the registration table the way a
-  // worker's KV pool does.
+  // One client per thread, each with its own keys and its own slice of one
+  // registered region: the shape of N ranks against one standalone server.
   const size_t slice = object_bytes / groups;
-  const size_t region_bytes = keys_n * object_bytes * 2 + (1 << 20);
+  const size_t per_thread_bytes = keys_n * object_bytes * 2;
+  const size_t region_bytes = threads_n * per_thread_bytes + (1 << 20);
   HostMemAllocator allocator;
   HostBufferOptions opts;
   opts.backing = HostBufferBacking::kAnonymousShm;
   opts.prefault = true;
   HostBufferHandle region = allocator.Alloc(region_bytes, opts);
-  if (!region.valid() ||
-      !client->RegisterMemory(reinterpret_cast<uintptr_t>(region.ptr), region.mapped_size)) {
-    std::fprintf(stderr, "registration failed\n");
+  if (!region.valid()) {
+    std::fprintf(stderr, "allocation failed\n");
     return 1;
   }
   auto* bytes = static_cast<unsigned char*>(region.ptr);
 
-  std::vector<std::string> keys;
-  keys.reserve(keys_n);
-  std::vector<uintptr_t> srcs;
-  std::vector<size_t> put_sizes;
-  for (size_t k = 0; k < keys_n; ++k) {
-    keys.push_back(MakeKey(k, key_bytes));
-    unsigned char* src = bytes + k * object_bytes;
-    std::memset(src, static_cast<int>(k & 0xff), object_bytes);
-    srcs.push_back(reinterpret_cast<uintptr_t>(src));
-    put_sizes.push_back(object_bytes);
-  }
-  const auto put_ok = client->BatchPut(keys, srcs, put_sizes);
-  if (std::count(put_ok.begin(), put_ok.end(), true) != static_cast<long>(keys_n)) {
-    std::fprintf(stderr, "put failed\n");
-    return 1;
+  std::vector<std::unique_ptr<IUMBPClient>> clients;
+  std::vector<std::vector<std::string>> thread_keys(threads_n);
+  for (size_t t = 0; t < threads_n; ++t) {
+    UMBPConfig client_cfg = cfg;
+    auto client = CreateUMBPClient(client_cfg);
+    if (!client->RegisterMemory(reinterpret_cast<uintptr_t>(region.ptr), region.mapped_size)) {
+      std::fprintf(stderr, "registration failed for thread %zu\n", t);
+      return 1;
+    }
+    unsigned char* base = bytes + t * per_thread_bytes;
+    std::vector<uintptr_t> srcs;
+    std::vector<size_t> put_sizes;
+    for (size_t k = 0; k < keys_n; ++k) {
+      thread_keys[t].push_back(MakeKey(t * keys_n + k, key_bytes));
+      unsigned char* src = base + k * object_bytes;
+      std::memset(src, static_cast<int>(k & 0xff), object_bytes);
+      srcs.push_back(reinterpret_cast<uintptr_t>(src));
+      put_sizes.push_back(object_bytes);
+    }
+    const auto put_ok = client->BatchPut(thread_keys[t], srcs, put_sizes);
+    if (std::count(put_ok.begin(), put_ok.end(), true) != static_cast<long>(keys_n)) {
+      std::fprintf(stderr, "put failed for thread %zu\n", t);
+      return 1;
+    }
+    clients.push_back(std::move(client));
   }
 
-  // One range per key per call: the group's slice of the object.
-  std::vector<std::vector<uintptr_t>> dsts(keys_n);
-  std::vector<std::vector<size_t>> sizes(keys_n, {slice});
-  unsigned char* read_base = bytes + keys_n * object_bytes;
-  for (size_t k = 0; k < keys_n; ++k) {
-    dsts[k] = {reinterpret_cast<uintptr_t>(read_base + k * object_bytes)};
-  }
-
-  std::vector<double> per_restore_ms;
-  std::vector<double> per_call_us;
-  for (size_t r = 0; r < repeats + 2; ++r) {
-    const auto t0 = std::chrono::steady_clock::now();
-    for (size_t g = 0; g < groups; ++g) {
-      std::vector<std::vector<size_t>> offsets(keys_n, {g * slice});
-      const auto ok = client->BatchGetRanges(keys, dsts, sizes, offsets);
-      if (std::count(ok.begin(), ok.end(), true) != static_cast<long>(keys_n)) {
-        std::fprintf(stderr, "get failed at repeat %zu group %zu\n", r, g);
-        return 1;
+  // Every thread's restore is timed separately and the medians pooled, so the
+  // number reported is what one rank waited, not how long the slowest took.
+  std::vector<std::vector<double>> per_thread_ms(threads_n);
+  std::atomic<bool> failed{false};
+  const auto run_thread = [&](size_t t) {
+    unsigned char* read_base = bytes + t * per_thread_bytes + keys_n * object_bytes;
+    std::vector<std::vector<uintptr_t>> dsts(keys_n);
+    std::vector<std::vector<size_t>> sizes(keys_n, {slice});
+    for (size_t k = 0; k < keys_n; ++k) {
+      dsts[k] = {reinterpret_cast<uintptr_t>(read_base + k * object_bytes)};
+    }
+    for (size_t r = 0; r < repeats + 2 && !failed.load(); ++r) {
+      const auto t0 = std::chrono::steady_clock::now();
+      for (size_t g = 0; g < groups; ++g) {
+        std::vector<std::vector<size_t>> offsets(keys_n, {g * slice});
+        const auto ok = clients[t]->BatchGetRanges(thread_keys[t], dsts, sizes, offsets);
+        if (std::count(ok.begin(), ok.end(), true) != static_cast<long>(keys_n)) {
+          std::fprintf(stderr, "get failed on thread %zu repeat %zu group %zu\n", t, r, g);
+          failed.store(true);
+          return;
+        }
       }
+      const double ms =
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      // First two are warm-up: the first mints a handle, the second settles.
+      if (r >= 2) per_thread_ms[t].push_back(ms);
     }
-    const double ms =
-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    if (r >= 2) {  // first two are warm-up: the first mints, the second settles
-      per_restore_ms.push_back(ms);
-      per_call_us.push_back(ms * 1000.0 / static_cast<double>(groups));
-    }
-  }
+  };
 
-  std::printf("keys,groups,key_bytes,object_bytes,key_mib_per_call,restore_ms_p50,call_us_p50\n");
-  std::printf("%zu,%zu,%zu,%zu,%.3f,%.3f,%.1f\n", keys_n, groups, key_bytes, object_bytes,
-              static_cast<double>(keys_n * key_bytes) / (1024.0 * 1024.0), MedianOf(per_restore_ms),
-              MedianOf(per_call_us));
+  std::vector<std::thread> workers;
+  for (size_t t = 1; t < threads_n; ++t) workers.emplace_back(run_thread, t);
+  run_thread(0);
+  for (auto& w : workers) w.join();
+  if (failed.load()) return 1;
 
-  client->Close();
+  std::vector<double> pooled;
+  for (const auto& v : per_thread_ms) pooled.insert(pooled.end(), v.begin(), v.end());
+
+  std::printf(
+      "keys,threads,groups,key_bytes,object_bytes,key_mib_per_call,restore_ms_p50,call_us_p50\n");
+  std::printf("%zu,%zu,%zu,%zu,%zu,%.3f,%.3f,%.1f\n", keys_n, threads_n, groups, key_bytes,
+              object_bytes, static_cast<double>(keys_n * key_bytes) / (1024.0 * 1024.0),
+              MedianOf(pooled), MedianOf(pooled) * 1000.0 / static_cast<double>(groups));
+
+  for (auto& c : clients) c->Close();
   allocator.Free(region);
   server.Shutdown();
   server_thread.join();

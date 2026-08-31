@@ -450,8 +450,10 @@ class PageBackend : public MediumBackend {
   uint64_t resolve_cache_clock_ = 0;
 
   // Caller MUST hold `mutex_`.
+  // `fingerprint` is FingerprintKeys(keys), computed by the caller before it
+  // took the lock.
   std::shared_ptr<const std::vector<ResolvedEntry>> ResolveBatchLocked(
-      const std::vector<std::string>& keys, bool include_descs);
+      const std::vector<std::string>& keys, bool include_descs, uint64_t fingerprint);
   std::vector<KvEvent> pending_events_;
 
   // Auto-flush state (see QueueEventLocked):
