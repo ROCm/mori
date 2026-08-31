@@ -129,7 +129,8 @@ Python wrapper construct one) — they are read once.
 |---|---|---|
 | `UMBP_DRAM_CAPACITY` | 4 GiB | `dram.capacity_bytes`. |
 | `UMBP_DRAM_HIGH_WM` / `UMBP_DRAM_LOW_WM` | `0.9` / `0.7` | DRAM tier eviction watermarks. |
-| `UMBP_SSD_ENABLED` | `1` | `0` to disable the SSD tier entirely. |
+| `UMBP_SSD_ENABLED` | `1` | `0` to disable the SSD tier entirely.  **This no longer selects a medium**: a single-medium SSD node is chosen with `UMBP_DISTRIBUTED_MEDIUM=SSD` (or `distributed.medium`), or named as a backend in `UMBP_BACKEND_POLICY`, and `umbp_standalone_server` refuses to start if this is set while neither named one, rather than quietly serving DRAM. |
+| `UMBP_EMBEDDED_DRAM_PAGE_SIZE` | 2 MiB | Allocation granularity of the pool an **embedded** deployment gets when the config names no deployment at all.  The pool is paged, so a value smaller than a page still occupies one: a caller storing KV pages should set this to the page's exact byte size, and one storing small values wants it smaller.  Ignored once `distributed` is configured — set `distributed.dram_page_size` there instead. |
 | `UMBP_SSD_DIR` | `/tmp/umbp_ssd` | POSIX backend root(s).  **Comma-separated for multi-drive**, one directory per physical drive (e.g. `/mnt/nvme0,/mnt/nvme1`).  More than one turns the tier into a `ShardedSsdTier`: keys are placed on the drive with the most free space and batch IO runs on every drive at once, so the tier delivers their aggregate bandwidth. |
 | `UMBP_SSD_CAPACITY` | 32 GiB | `ssd.capacity_bytes`.  With multiple `UMBP_SSD_DIR` entries this is the TOTAL budget, split evenly across the drives.  Charged in **padded** on-disk bytes (see `UMBP_SSD_DIRECT_IO`), not raw value bytes. |
 | `UMBP_SSD_DIRECT_IO` | `1` | `ssd.direct_io` — `1` opens segments `O_DIRECT`, bypassing the page cache.  **On by default**; set `0` only to deliberately measure or exploit the page cache.  Buffered can serve an entire working set from page cache and move **zero** bytes to the device, which makes drive-count and DRAM-vs-SSD comparisons meaningless — that is why the default is direct.  Requires record format v3 (already unconditional), so a directory reads back either way. |
@@ -170,12 +171,12 @@ operators can find them in one place.
 
 | Env var | Description |
 |---|---|
-| `UMBP_MASTER_ADDRESS` | `host:port` of the master to connect to (e.g. `10.0.0.1:15558`). |
+| `UMBP_MASTER_ADDRESS` | `host:port` of the master to connect to (e.g. `10.0.0.1:15558`).  **Optional.**  Without it the same client is an embedded deployment: same backends and transfer engine, nothing routed, registered or heartbeated, and a local miss is the final answer.  It is also what decides whether the backend evicts for itself and whether it records heartbeat events at all. |
 | `UMBP_BACKEND_POLICY` | JSON backend/tier policy used by a distributed-backed standalone server. |
 | `UMBP_MASTER_LISTEN` | `host:port` the master should listen on (when starting it locally). |
 | `UMBP_MASTER_AUTO_START` | `true`/`false`: auto-spawn `umbp_master` on this node before connecting. |
 | `UMBP_MASTER_BIN` | Path to the `umbp_master` binary. The Python `mori.umbp` package auto-fills this from the packaged binary; override to point at a custom build. |
-| `UMBP_NODE_ADDRESS` | This node's address as advertised to peers. Must be reachable from every other node. |
+| `UMBP_NODE_ADDRESS` | This node's address as advertised to peers. Must be reachable from every other node.  Required only **with** a master: with none, nothing registers and no peer can dial in, so `umbp_standalone_server` synthesizes it (as it does `UMBP_NODE_ID`) and omitting `UMBP_IO_ENGINE_HOST` simply builds no RDMA engine. |
 | `UMBP_IO_ENGINE_HOST` | `mori::io::IOEngine` listener host (typically `127.0.0.1`). |
 | `UMBP_IO_ENGINE_PORT` / `UMBP_IO_ENGINE_PORTS` | IO engine port (single port, or comma-separated list for multi-engine deployments). |
 | `UMBP_PEER_SERVICE_PORT` | Port `PeerServiceServer` should bind. |
