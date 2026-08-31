@@ -212,8 +212,9 @@ int MaybeAddRelaxedOrderingFlag(int accessFlag);
 // Export a dmabuf fd for the GPU buffer at `ptr`, reporting the byte offset of
 // `ptr` within the exported dmabuf via `*offset`. Returns -1 (and leaves fd
 // closed) if dmabuf export is unsupported. Caller owns the returned fd and must
-// close() it after registration. Used for both payload MRs and, on providers
-// that support it, GPU control-ring umems (mlx5 CQ/WQ/DBR).
+// close() it once done with it (after registration; for Ionic CQ/SQ/RQ rings,
+// when the ring is freed). Used for both payload MRs and, on providers that
+// support it, GPU control-ring umems (mlx5 CQ/WQ/DBR) and Ionic rings.
 int TryExportDmabufFd(void* ptr, size_t size, uint64_t* offset);
 
 /* -------------------------------------------------------------------------- */

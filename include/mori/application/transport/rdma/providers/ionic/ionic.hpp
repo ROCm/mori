@@ -25,6 +25,9 @@
 #include <hsa/hsa.h>
 #include <hsa/hsa_ext_amd.h>
 
+#include <mutex>
+#include <unordered_map>
+
 #include "mori/application/transport/rdma/providers/dv_loader.hpp"
 #include "mori/application/transport/rdma/providers/ionic/ionic_dv.h"
 #include "mori/application/transport/rdma/rdma.hpp"
@@ -151,9 +154,24 @@ class IonicDeviceContext : public RdmaDeviceContext {
   static void pd_release(ibv_pd* pd, void* pd_context, void* ptr, uint64_t resource_type);
   static void* pd_alloc_device_uncached(ibv_pd* pd, void* pd_context, size_t size, size_t alignment,
                                         uint64_t resource_type);
+  // Descriptor-ring allocators handing the provider a dmabuf fd instead of a bare VA, so the
+  // CQ/SQ/RQ rings are registered the same way the data path registers user buffers.
+  static int pd_alloc_dmabuf(ibv_pd* pd, void* pd_context, size_t size, uint64_t resource_type,
+                             struct ionic_dmabuf_alloc_result* result);
+  static void pd_free_dmabuf(ibv_pd* pd, void* pd_context, int fd, uint64_t offset,
+                             uint64_t resource_type);
   void create_parent_domain(ibv_context* context, struct ibv_pd* pd_orig);
 
  private:
+  // Backing device allocation for a ring handed out through pd_alloc_dmabuf, keyed by the
+  // dmabuf fd since that plus the offset is all pd_free_dmabuf gets back.
+  struct DmabufRing {
+    void* devPtr;
+    uint64_t offset;
+  };
+  std::mutex dmabufRingsMutex;
+  std::unordered_map<int, DmabufRing> dmabufRings;
+
   uint32_t pdn;
   struct ibv_pd* pd_uxdma[2];
 
