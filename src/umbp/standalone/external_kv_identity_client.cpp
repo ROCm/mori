@@ -32,6 +32,7 @@
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp.grpc.pb.h"
+#include "umbp/common/grpc_limits.h"
 
 namespace mori::umbp::standalone {
 namespace {
@@ -82,8 +83,7 @@ ExternalKvIdentityClient::ExternalKvIdentityClient(Config config)
     : config_(std::move(config)),
       stub_(nullptr, [](void* p) { delete static_cast<::umbp::UMBPMaster::Stub*>(p); }) {
   grpc::ChannelArguments args;
-  args.SetMaxReceiveMessageSize(64 * 1024 * 1024);
-  args.SetMaxSendMessageSize(64 * 1024 * 1024);
+  ApplyGrpcLimits(&args);
   auto channel =
       grpc::CreateCustomChannel(config_.master_address, grpc::InsecureChannelCredentials(), args);
   channel_ = channel;

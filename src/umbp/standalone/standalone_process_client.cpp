@@ -42,6 +42,7 @@
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/device_copy.h"
+#include "umbp/common/grpc_limits.h"
 #include "umbp/common/range_utils.h"
 #include "umbp/local/host_mem_allocator.h"
 #include "umbp/standalone/ipc.h"
@@ -196,7 +197,8 @@ StandaloneProcessClient::StandaloneProcessClient(const UMBPConfig& config) : con
 
   address_ = standalone_config_.address;
   fd_socket_path_ = DeriveFdSocketPath(address_);
-  channel_ = grpc::CreateChannel(address_, grpc::InsecureChannelCredentials());
+  channel_ =
+      grpc::CreateCustomChannel(address_, grpc::InsecureChannelCredentials(), GrpcChannelArgs());
   stub_ = ::umbp::UMBPStandalone::NewStub(channel_);
 
   MaybeAutoStart();

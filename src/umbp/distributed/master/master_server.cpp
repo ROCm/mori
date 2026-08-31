@@ -35,6 +35,7 @@
 #include "mori/utils/mori_log.hpp"
 #include "umbp.grpc.pb.h"
 #include "umbp/common/env_time.h"
+#include "umbp/common/grpc_limits.h"
 #include "umbp/distributed/master/evict_strategy.h"
 #include "umbp/distributed/master/in_memory_master_metadata_store.h"
 #include "umbp/distributed/master/master_metadata_store.h"
@@ -171,7 +172,8 @@ class MasterPeerStubPool : public EvictKeyDispatcher {
     auto it = entries_.find(node_id);
     if (it != entries_.end() && it->second.peer_address == peer_address) return it->second.stub;
 
-    auto channel = grpc::CreateChannel(peer_address, grpc::InsecureChannelCredentials());
+    auto channel = grpc::CreateCustomChannel(peer_address, grpc::InsecureChannelCredentials(),
+                                             GrpcChannelArgs());
     if (channel == nullptr) return nullptr;
     std::shared_ptr<::umbp::UMBPPeer::Stub> stub(::umbp::UMBPPeer::NewStub(channel).release());
     entries_[node_id] = Entry{peer_address, stub};
@@ -934,8 +936,7 @@ void MasterServer::Run() {
   StartHitIndexGc();
 
   grpc::ServerBuilder builder;
-  builder.SetMaxReceiveMessageSize(64 * 1024 * 1024);
-  builder.SetMaxSendMessageSize(64 * 1024 * 1024);
+  ApplyGrpcLimits(&builder);
   // Size the sync-server poller/handler thread pool to the client fan-out.
   // The default sync server runs only a couple of poller threads, which also
   // execute the RPC handlers; under many concurrent clients a burst of large

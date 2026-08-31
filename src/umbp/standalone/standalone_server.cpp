@@ -50,6 +50,7 @@
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/device_copy.h"
+#include "umbp/common/grpc_limits.h"
 #include "umbp/distributed/config.h"
 #include "umbp/standalone/external_kv_identity_client.h"
 #include "umbp/standalone/ipc.h"
@@ -216,8 +217,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     if (!StartFdListener()) return false;
 
     grpc::ServerBuilder builder;
-    builder.SetMaxReceiveMessageSize(64 * 1024 * 1024);
-    builder.SetMaxSendMessageSize(64 * 1024 * 1024);
+    ApplyGrpcLimits(&builder);
     builder.SetSyncServerOption(grpc::ServerBuilder::SyncServerOption::MIN_POLLERS, 4);
     builder.SetSyncServerOption(grpc::ServerBuilder::SyncServerOption::MAX_POLLERS, 32);
 

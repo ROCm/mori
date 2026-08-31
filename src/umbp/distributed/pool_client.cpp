@@ -47,6 +47,7 @@
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/device_copy.h"
 #include "umbp/common/env_time.h"
+#include "umbp/common/grpc_limits.h"
 #include "umbp/common/parallel_for.h"
 #include "umbp/common/range_utils.h"
 #include "umbp/distributed/master/master_metrics.h"
@@ -4288,7 +4289,8 @@ bool PoolClient::EnsurePeerServiceConnection(PeerConnection& peer) {
     return true;
   }
 
-  auto channel = grpc::CreateChannel(peer.peer_address, grpc::InsecureChannelCredentials());
+  auto channel = grpc::CreateCustomChannel(peer.peer_address, grpc::InsecureChannelCredentials(),
+                                           GrpcChannelArgs());
   auto stub = ::umbp::UMBPPeer::NewStub(channel);
   if (!hydrate_from_peer(stub.get())) {
     return false;
