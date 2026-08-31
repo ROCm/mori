@@ -28,7 +28,9 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -66,13 +68,10 @@ namespace mori::umbp {
 // single monotonic seq — never one seq per medium (that breaks the ack /
 // seq-gap full-sync recovery).
 //
-// Every medium is currently treated as EQUIVALENT: no read priority, no
-// put-eligibility flag.  Phase 4 deleted the routing plane's two hardcoded tier
-// orders outright rather than re-expressing them as advertised properties, so
-// there is deliberately no BackendProperties here.  A medium that genuinely
-// differs — SSD, which takes no direct puts — brings the trait back with it
-// (design doc §3 / §5 Phase 4); until one exists, an advertised order would be
-// scaffolding nothing exercises.
+// The backend contract treats media as equivalent: it has no built-in read
+// priority or put-eligibility flag. Legacy policies retain that behavior. The
+// optional JSON TieredPlacementPolicy supplies ordering and offload topology
+// above this interface, keeping physical storage implementations policy-free.
 //
 // Threading: implementations must be safe to call from the peer service's gRPC
 // handler threads and the heartbeat thread concurrently.
@@ -87,10 +86,10 @@ namespace mori::umbp {
 //   * a staging / bounce pool — belongs to the transfer engine, the only layer
 //     that can observe completion.  A pool here would have to fall back to a
 //     TTL, which is the deleted PrepareSsdRead lease under another name.
-//   * a "not ready, retry here" resolve state — only needed to express
-//     staging-pool exhaustion, which is no longer a backend resource.  Note it
-//     must NOT be spelled as found=false: the client excludes a missing node
-//     and retries elsewhere, which is wrong for a node that does hold the key.
+//   * byte-moving or staging methods — staging ownership stays an
+//     implementation detail.  ResolveOutcome::kBusy is intentionally part of
+//     the RESULT, however: a staged backend must distinguish transient pressure
+//     from kMissing or the client excludes a node that does hold the key.
 //   * local mode's TierBackend (blocking read/write of bytes) — a different
 //     medium contract at a different layer, fenced off by lint in Phase 5
 //   * single-key Allocate/Commit/Abort/Resolve — the single-key RPCs are
@@ -153,7 +152,22 @@ struct CommitResult {
   uint64_t bytes_committed = 0;
 };
 
+// A resolve needs one more state than a cache lookup.  kBusy means this backend
+// owns the key but cannot publish its bytes until a transient resource (SSD
+// staging) becomes available; callers must retry THIS peer rather than exclude
+// it as they do for kMissing.  kFailed is a permanent shape/backend error and
+// must not be retried indefinitely.
+enum class ResolveOutcome {
+  kMissing,
+  kFound,
+  kBusy,
+  kFailed,
+};
+
 struct ResolvedEntry {
+  ResolveOutcome outcome = ResolveOutcome::kMissing;
+  // Kept for source and wire compatibility.  New code should set outcome too;
+  // readers accept found=true as kFound for older backend implementations.
   bool found = false;
   std::vector<PageLocation> pages;
   uint64_t size = 0;
@@ -162,6 +176,10 @@ struct ResolvedEntry {
   // from GetPeerInfo), or when found=false.
   std::vector<BufferMemoryDescBytes> descs;
 };
+
+inline ResolveOutcome EffectiveResolveOutcome(const ResolvedEntry& entry) {
+  return entry.found ? ResolveOutcome::kFound : entry.outcome;
+}
 
 struct EvictResult {
   std::string key;
@@ -282,6 +300,21 @@ class MediumBackend : public MetricSource {
   virtual std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
                                                   bool include_descs) = 0;
 
+  // Acquire a peer-local migration pin and resolve the key without changing or
+  // cancelling normal RPC read leases. The caller must release a successful
+  // acquisition after its synchronous transfer completes.
+  virtual bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved) {
+    (void)key;
+    (void)resolved;
+    return false;
+  }
+  virtual void ReleaseMigrationRead(const std::string& key) { (void)key; }
+
+  // Authoritative metadata lookup with no staging, descriptor construction, or
+  // read-lease side effects. Pool placement validation must use this instead of
+  // interpreting a temporarily unresolvable object as absent.
+  virtual bool Contains(const std::string& key) const = 0;
+
   // Master-driven eviction.  Idempotent; see EvictResult::bytes_freed.  One
   // result per key, in request order — the peer service relies on that to sum
   // freed bytes for a key mirrored across media.
@@ -322,65 +355,78 @@ class MediumBackend : public MetricSource {
   MediumBackend() = default;
 };
 
-// Owns every medium live on this peer, keyed by tier.  Held by PoolClient; the
-// registration call sites are the single place in the tree where a concrete
-// backend type is named, which is what the Phase 5 lint enforces.
-//
-// std::map iterates in ascending TierType order, so All() is both the
-// enumeration and the (deterministic, arbitrary) order callers walk media in —
-// with every medium equivalent there is no priority to express.
+// Owns every backend instance live on this peer. Names are stable
+// configuration identities; backend ids are dense peer-local wire identities.
 class BackendRegistry {
  public:
   // Defined in types.h so the transfer layer can size its per-backend buffer
   // shelves without depending on this header (see kMaxBackendsPerPeer).
   static constexpr uint32_t kMaxBackends = kMaxBackendsPerPeer;
 
-  // Replaces any backend already registered for that tier.  Null is ignored.
-  //
-  // Assigns the backend its peer-local id here.  The id is the missing half of
-  // a buffer address: buffer_index is backend-local (every backend numbers from
-  // 0, and each publishes exactly one buffer today, so index 0 collides across
-  // every live medium), and the wire and the reader's cache both key on the
-  // pair.  The backend is never told its id — the peer service stamps it at the
-  // wire boundary — so a new backend cannot get this wrong by forgetting to
-  // participate.
-  //
-  // Returns false when the backend cannot join this peer's address space, which
-  // PoolClient::Init treats as fatal.  Better a refused startup than a node
-  // that serves reads out of the wrong medium.
+  struct Entry {
+    uint32_t backend_id = 0;
+    std::string name;
+    TierType tier = TierType::UNKNOWN;
+    std::unique_ptr<MediumBackend> backend;
+  };
+
+  // Legacy registration keeps one conventional name per tier. Registering the
+  // same name again replaces that instance and preserves its backend id.
   bool Register(std::unique_ptr<MediumBackend> backend) {
     if (backend == nullptr) return true;
-    const TierType tier = backend->Tier();
+    return Register(DefaultBackendInstanceName(backend->Tier()), std::move(backend));
+  }
 
-    // Every wire that carries pages carries ONE page_size
-    // (GetPeerInfoResponse.page_size, BatchResolveKeysResponse.page_size), and
-    // SsdBackend::Config already documents that its page size must match the
-    // others.  Enforce that documented requirement instead of trusting it: a
-    // mismatch produces page arithmetic that looks consistent and reads that
-    // are not.
-    if (!backends_.empty() && backend->PageSize() != page_size_) {
-      MORI_UMBP_ERROR(
-          "[BackendRegistry] backend tier={} page_size={} disagrees with the peer's page_size={}; "
-          "every medium on a node must agree",
-          static_cast<int>(tier), backend->PageSize(), page_size_);
+  bool Register(std::string name, std::unique_ptr<MediumBackend> backend) {
+    if (backend == nullptr) return true;
+    if (name.empty()) {
+      MORI_UMBP_ERROR("[BackendRegistry] backend instance name must not be empty");
       return false;
     }
 
-    auto existing = id_by_tier_.find(tier);
-    uint32_t id;
-    if (existing != id_by_tier_.end()) {
-      id = existing->second;  // replacing a tier reuses its id, keeping ids dense
-    } else {
-      if (next_backend_id_ >= kMaxBackends) {
-        MORI_UMBP_ERROR("[BackendRegistry] too many backends (max {})", kMaxBackends);
-        return false;
-      }
-      id = next_backend_id_++;
-      id_by_tier_[tier] = id;
+    const TierType tier = backend->Tier();
+    auto existing = id_by_name_.find(name);
+    const uint32_t replacing_id =
+        existing == id_by_name_.end() ? kMaxBackends : existing->second;
+
+    // Every wire carrying pages has one peer-global page size. When replacing
+    // an entry, compare against the other live instances so replacing the sole
+    // backend may legitimately establish a new size.
+    uint64_t expected_page_size = 0;
+    for (const auto& entry : entries_) {
+      if (entry->backend_id == replacing_id) continue;
+      expected_page_size = entry->backend->PageSize();
+      break;
+    }
+    if (expected_page_size != 0 && backend->PageSize() != expected_page_size) {
+      MORI_UMBP_ERROR(
+          "[BackendRegistry] backend '{}' tier={} page_size={} disagrees with the peer's "
+          "page_size={}; every instance on a node must agree",
+          name, static_cast<int>(tier), backend->PageSize(), expected_page_size);
+      return false;
     }
 
-    page_size_ = backend->PageSize();
-    backends_[tier] = std::move(backend);
+    if (existing != id_by_name_.end()) {
+      auto& entry = entries_[existing->second];
+      entry->tier = tier;
+      entry->backend = std::move(backend);
+      page_size_ = entries_.front()->backend->PageSize();
+      return true;
+    }
+
+    if (entries_.size() >= kMaxBackends) {
+      MORI_UMBP_ERROR("[BackendRegistry] too many backends (max {})", kMaxBackends);
+      return false;
+    }
+    const uint32_t id = static_cast<uint32_t>(entries_.size());
+    auto entry = std::make_unique<Entry>();
+    entry->backend_id = id;
+    entry->name = std::move(name);
+    entry->tier = tier;
+    entry->backend = std::move(backend);
+    id_by_name_[entry->name] = id;
+    entries_.push_back(std::move(entry));
+    page_size_ = entries_.front()->backend->PageSize();
     return true;
   }
 
@@ -388,8 +434,10 @@ class BackendRegistry {
   // page set it produces.  kMaxBackends for an unregistered backend.
   uint32_t BackendId(const MediumBackend* backend) const {
     if (backend == nullptr) return kMaxBackends;
-    auto it = id_by_tier_.find(backend->Tier());
-    return it == id_by_tier_.end() ? kMaxBackends : it->second;
+    for (const auto& entry : entries_) {
+      if (entry->backend.get() == backend) return entry->backend_id;
+    }
+    return kMaxBackends;
   }
 
   // Uniform across every registered backend (see Register).  Zero when empty.
@@ -399,25 +447,58 @@ class BackendRegistry {
   // (e.g. a node configured with DRAM only), not an error.  Callers respond to
   // a request for an absent tier with found=false / success=false.
   MediumBackend* Get(TierType tier) const {
-    auto it = backends_.find(tier);
-    return it == backends_.end() ? nullptr : it->second.get();
+    for (const auto& entry : entries_) {
+      if (entry->tier == tier) return entry->backend.get();
+    }
+    return nullptr;
   }
 
-  bool Empty() const { return backends_.empty(); }
-  size_t Size() const { return backends_.size(); }
+  MediumBackend* Get(const std::string& name) const {
+    const Entry* entry = GetEntry(name);
+    return entry == nullptr ? nullptr : entry->backend.get();
+  }
 
-  // Every live backend, ascending by TierType.
+  MediumBackend* Get(uint32_t backend_id) const {
+    const Entry* entry = GetEntry(backend_id);
+    return entry == nullptr ? nullptr : entry->backend.get();
+  }
+
+  const Entry* GetEntry(const std::string& name) const {
+    auto it = id_by_name_.find(name);
+    return it == id_by_name_.end() ? nullptr : GetEntry(it->second);
+  }
+
+  Entry* GetEntry(const std::string& name) {
+    return const_cast<Entry*>(std::as_const(*this).GetEntry(name));
+  }
+
+  const Entry* GetEntry(uint32_t backend_id) const {
+    return backend_id < entries_.size() ? entries_[backend_id].get() : nullptr;
+  }
+
+  Entry* GetEntry(uint32_t backend_id) {
+    return const_cast<Entry*>(std::as_const(*this).GetEntry(backend_id));
+  }
+
+  const Entry* GetEntry(const MediumBackend* backend) const {
+    const uint32_t id = BackendId(backend);
+    return id == kMaxBackends ? nullptr : GetEntry(id);
+  }
+
+  bool Empty() const { return entries_.empty(); }
+  size_t Size() const { return entries_.size(); }
+
+  // Every live backend in dense backend-id order.
   std::vector<MediumBackend*> All() const {
     std::vector<MediumBackend*> out;
-    out.reserve(backends_.size());
-    for (const auto& [tier, backend] : backends_) out.push_back(backend.get());
+    out.reserve(entries_.size());
+    for (const auto& entry : entries_) out.push_back(entry->backend.get());
     return out;
   }
 
  private:
-  std::map<TierType, std::unique_ptr<MediumBackend>> backends_;
-  std::map<TierType, uint32_t> id_by_tier_;
-  uint32_t next_backend_id_ = 0;
+  std::vector<std::unique_ptr<Entry>> entries_;
+  std::unordered_map<std::string, uint32_t> id_by_name_;
   uint64_t page_size_ = 0;
 };
 
@@ -435,12 +516,44 @@ class BackendRegistry {
 // monotonic seq — concat here, never one bundle/seq per medium (that breaks the
 // ack / seq-gap full-sync recovery).  Null entries are skipped.
 inline std::vector<KvEvent> DrainAllBackends(const std::vector<MediumBackend*>& backends) {
-  std::vector<KvEvent> merged;
+  std::vector<KvEvent> raw;
   for (auto* backend : backends) {
     if (backend == nullptr) continue;
     auto events = backend->DrainPendingEvents();
-    merged.insert(merged.end(), std::make_move_iterator(events.begin()),
-                  std::make_move_iterator(events.end()));
+    raw.insert(raw.end(), std::make_move_iterator(events.begin()),
+               std::make_move_iterator(events.end()));
+  }
+
+  // Master locations are (node, physical tier), not backend instances. A
+  // same-tier migration therefore must not publish the source REMOVE after the
+  // target ADD as if the node had lost the key. Coalesce by (tier,key) against
+  // authoritative current ownership across all instances.
+  struct EventState {
+    std::optional<KvEvent> add;
+    bool saw_remove = false;
+  };
+  std::map<std::pair<TierType, std::string>, EventState> states;
+  for (auto& event : raw) {
+    auto& state = states[{event.tier, event.key}];
+    if (event.kind == KvEvent::Kind::ADD) {
+      state.add = std::move(event);
+    } else {
+      state.saw_remove = true;
+    }
+  }
+  std::vector<KvEvent> merged;
+  merged.reserve(states.size());
+  for (auto& [identity, state] : states) {
+    const auto& [tier, key] = identity;
+    const bool still_owned = std::any_of(
+        backends.begin(), backends.end(), [&](MediumBackend* backend) {
+          return backend != nullptr && backend->Tier() == tier && backend->Contains(key);
+        });
+    if (state.add.has_value() && (still_owned || !state.saw_remove)) {
+      merged.push_back(std::move(*state.add));
+    } else if (state.saw_remove && !still_owned) {
+      merged.push_back(KvEvent{KvEvent::Kind::REMOVE, key, tier, 0});
+    }
   }
   return merged;
 }

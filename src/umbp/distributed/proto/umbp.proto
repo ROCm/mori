@@ -19,6 +19,22 @@ message TierCapacity {
   TierType tier                     = 1;
   uint64   total_capacity_bytes     = 2;   // Total capacity on this tier
   uint64   available_capacity_bytes = 3;   // Current free capacity on this tier
+  uint64   max_allocatable_bytes    = 4;   // Largest value one backend can admit
+}
+
+message LogicalTierCapacity {
+  string   name                     = 1;
+  TierType representative_tier      = 2;
+  uint64   total_capacity_bytes     = 3;
+  uint64   available_capacity_bytes = 4;
+  uint64   max_allocatable_bytes    = 5;
+  bool     put_eligible              = 6;
+  // The tier's own pressure as the offload decision measures it: the highest
+  // utilization among its backends, not the aggregate above. The two differ
+  // whenever a tier mixes backend sizes, and for the entry tier the aggregate
+  // covers every tier it can spill into, so this is the only field a reader can
+  // compare against the tier's watermarks.
+  double   peak_member_utilization  = 7;
 }
 
 // One page slot inside one of a node's DRAM/HBM buffers.  Carried by the
@@ -72,10 +88,13 @@ message RegisterClientRequest {
   string peer_address                 = 4;   // PeerService gRPC address
   bytes  engine_desc                  = 5;   // packed EngineDesc
   repeated string tags                = 13;  // opaque key=value labels (e.g. "sgl_role=prefill")
+  repeated LogicalTierCapacity logical_tier_capacities = 14;
 }
 message RegisterClientResponse {
   uint64 heartbeat_interval_ms = 1;  // Recommended heartbeat interval
   uint64 ack_seq               = 2;  // Initial heartbeat seq peer should send (= 0)
+  bool supports_max_allocatable_bytes = 3;
+  bool supports_logical_tiers = 4;
 }
 
 message UnregisterClientRequest {
@@ -100,6 +119,7 @@ message KvEvent {
   string        key   = 2;
   TierType      tier  = 3;
   uint64        size  = 4;   // ADD only
+  string logical_tier = 5;
 }
 
 message EventBundle {
@@ -121,6 +141,7 @@ message HeartbeatRequest {
   repeated TierCapacity tier_capacities = 4; // ground truth from peer's allocator
   uint64 delta_seq_baseline = 6;    // valid for full-sync; master adopts this cursor
   repeated TierKvCount  tier_kv_counts  = 7; // live owned-key count per tier (client-reported)
+  repeated LogicalTierCapacity logical_tier_capacities = 8;
 }
 message HeartbeatResponse {
   ClientStatus status            = 1;
@@ -145,6 +166,7 @@ message RoutePutResponse {
   string          node_id      = 2;
   TierType        tier         = 3;
   string          peer_address = 4;
+  string          logical_tier = 5;
 }
 
 message RouteGetRequest {
@@ -158,6 +180,7 @@ message RouteGetResponse {
   TierType tier         = 3;
   uint64   size         = 4;
   string   peer_address = 5;
+  string   logical_tier = 6;
 }
 
 // ============================================================
@@ -183,6 +206,7 @@ message BatchRoutePutEntry {
   string          node_id      = 2;
   TierType        tier         = 3;
   string          peer_address = 4;
+  string          logical_tier = 5;
 }
 message BatchRoutePutResponse {
   repeated BatchRoutePutEntry entries = 1;
@@ -212,6 +236,7 @@ message BatchRouteGetResponse {
   repeated uint32   node_ref = 2;  // per key; 1-based index into nodes, 0 = not found  [packed]
   repeated TierType tier     = 3;  // per key  [packed]
   repeated uint64   size     = 4;  // per key  [packed]
+  repeated string   logical_tier = 5; // per key
 }
 
 // Read-only batched existence probe.  Unlike BatchRouteGet, this does

@@ -54,6 +54,8 @@ class HeartbeatResponse;
 
 namespace mori::umbp {
 
+class PeerPool;
+
 inline constexpr std::size_t kMasterClientMaxPendingHistograms = 15000;
 
 // Result of RouteGet — pure routing advisory.  The reader follows up
@@ -65,6 +67,7 @@ struct RouteGetResult {
   TierType tier = TierType::UNKNOWN;
   uint64_t size = 0;
   std::string peer_address;
+  std::string logical_tier;
 };
 
 class MasterClient {
@@ -85,7 +88,9 @@ class MasterClient {
   // source of per-tier capacity, including SSD (TierType::SSD).
   grpc::Status RegisterSelf(const std::map<TierType, TierCapacity>& tier_capacities,
                             const std::string& peer_address = "",
-                            const std::vector<uint8_t>& engine_desc_bytes = {});
+                            const std::vector<uint8_t>& engine_desc_bytes = {},
+                            const std::map<std::string, LogicalTierCapacity>&
+                                logical_tier_capacities = {});
   grpc::Status UnregisterSelf();
 
   // --- Router ---
@@ -128,6 +133,20 @@ class MasterClient {
   // before StartHeartbeat() — the heartbeat thread reads the registry once per
   // tick.
   void SetBackendRegistry(BackendRegistry* registry);
+  void SetPeerPool(PeerPool* pool) { peer_pool_ = pool; }
+
+  // Weighted placement makes every same-tier instance reachable through one
+  // tier route, so capacity heartbeats may aggregate them. Must be configured
+  // before StartHeartbeat().
+  void SetAggregateBackendCapacities(bool enabled) {
+    aggregate_backend_capacities_requested_ = enabled;
+    aggregate_backend_capacities_ =
+        enabled && supports_max_allocatable_capacity_;
+  }
+  bool SupportsMaxAllocatableCapacity() const {
+    return supports_max_allocatable_capacity_;
+  }
+  bool SupportsLogicalTiers() const { return supports_logical_tiers_; }
 
   void StartHeartbeat();
   void StopHeartbeat();
@@ -223,6 +242,16 @@ class MasterClient {
   // gate.  Non-owning; lifetime is managed by PoolClient.  Bound before
   // StartHeartbeat(); read-only afterwards (no lock needed).
   BackendRegistry* registry_ = nullptr;
+  PeerPool* peer_pool_ = nullptr;
+  bool aggregate_backend_capacities_requested_ = false;
+  bool aggregate_backend_capacities_ = false;
+  bool supports_max_allocatable_capacity_ = false;
+  bool supports_logical_tiers_ = false;
+  // Initial conservative registration payload, retained so an UNKNOWN response
+  // can rebuild the full peer record after Master state loss.
+  std::map<TierType, TierCapacity> registration_capacities_;
+  std::string registered_peer_address_;
+  std::vector<uint8_t> registered_engine_desc_bytes_;
 
   // Serializes the actual Heartbeat RPC: at most one full-sync or
   // delta heartbeat is on the wire at a time. ClearFullSync() takes

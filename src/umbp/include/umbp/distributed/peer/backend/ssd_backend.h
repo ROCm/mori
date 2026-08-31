@@ -87,20 +87,16 @@ namespace mori::umbp {
 //
 //   This is the one place SSD's asymmetry with DRAM shows through the
 //   interface: a Resolve does real IO and can fail, and it consumes a scarce
-//   resource (a staging page) that a DRAM resolve does not.  Exhaustion is
-//   reported as found=false, which medium_backend.h warns is imperfect
-//   ("the client excludes a missing node and retries elsewhere, which is wrong
-//   for a node that does hold the key") — the rejected "not ready, retry here"
-//   state is what this case wanted.  It is the honest limit of staging without
-//   a control-plane change, and it is why the staging arena should be sized for
-//   the read concurrency, not for one page.
+//   resource (staging pages) that a DRAM resolve does not.  A transient
+//   shortfall is reported as kBusy, after rolling back every reservation made
+//   by that backend batch.  PoolClient retries the whole response so no page
+//   location survives across attempts.  A batch whose own working set exceeds
+//   the arena is kFailed instead: unchanged retries can never make it fit.
 //
-// LIMIT: ONE KEY, ONE PAGE.  A key larger than page_size is refused at
-// BatchAllocate.  In distributed mode master's page_size IS the KV block size
-// so 1 key == 1 page (the same assumption LocalCopyEngine documents), and a
-// contiguous staging page is what PeerSsdManager::PrepareRead requires — it
-// takes a single (ptr, capacity), not a scatter list.  Lifting this means a
-// scatter-gather PrepareRead, not a change to this class's shape.
+// A key may span several staging pages.  Runs are contiguous inside the one
+// registered arena because PeerSsdManager::PrepareRead takes one (ptr,
+// capacity), while AllocateResult / ResolvedEntry publish every page so the
+// ordinary transfer path can address the object at page granularity.
 class SsdBackend : public MediumBackend {
  public:
   struct Config {
@@ -108,9 +104,9 @@ class SsdBackend : public MediumBackend {
     // batch spanning media stays self-describing only if every medium agrees.
     uint64_t page_size = 2ULL * 1024 * 1024;
 
-    // Staging pages held in host DRAM.  This is the backend's concurrency
-    // limit: in-flight writes + leased reads cannot exceed it, and a Resolve
-    // that cannot get one degrades to a miss (see the class comment).
+    // Staging pages held in host DRAM.  This is the backend's aggregate
+    // in-flight capacity: an object of N pages consumes N entries until its
+    // write commits or its read lease expires.
     uint32_t staging_pages = 64;
 
     // Back the staging arena with hugetlbfs pages.  Every byte this backend
@@ -124,7 +120,7 @@ class SsdBackend : public MediumBackend {
     PeerSsdConfig ssd;
 
     std::chrono::milliseconds pending_ttl{30000};
-    std::chrono::milliseconds read_lease_ttl{500};
+    std::chrono::milliseconds read_lease_ttl{3000};
     std::chrono::milliseconds reaper_interval{200};
   };
 
@@ -167,6 +163,9 @@ class SsdBackend : public MediumBackend {
   std::vector<bool> BatchAbort(const std::vector<uint64_t>& slot_ids) override;
   std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
                                           bool include_descs) override;
+  bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved) override;
+  void ReleaseMigrationRead(const std::string& key) override;
+  bool Contains(const std::string& key) const override;
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys) override;
 
   void SetAutoFlushHook(size_t threshold, std::function<void()> cb) override;
@@ -185,24 +184,30 @@ class SsdBackend : public MediumBackend {
   void RunReaperOnceForTest() { ReaperSweep(); }
 
  private:
-  // A staging page borrowed for a write (pending slot) or a read (lease).
+  struct StagingSpan {
+    uint32_t first_page = 0;
+    uint32_t page_count = 0;
+  };
+
+  // A contiguous staging span borrowed for a write (pending slot) or read.
   struct PendingSlot {
     uint64_t slot_id = 0;
     std::string key;
-    uint32_t page_index = 0;
+    StagingSpan span;
     uint64_t size = 0;
     std::chrono::steady_clock::time_point deadline;
   };
 
   struct ReadLease {
-    uint32_t page_index = 0;
+    StagingSpan span;
     uint64_t size = 0;
     std::chrono::steady_clock::time_point expires_at;
   };
 
-  // Caller MUST hold mutex_.  Returns UINT32_MAX when the arena is exhausted.
-  uint32_t AcquireStagingPageLocked();
-  void ReleaseStagingPageLocked(uint32_t page_index);
+  // Caller MUST hold mutex_.  A zero-length result means no contiguous run of
+  // the requested size is currently available.
+  StagingSpan AcquireStagingSpanLocked(uint32_t page_count);
+  void ReleaseStagingSpanLocked(StagingSpan span);
 
   // Local address of a staging page.  Valid after Init.
   void* StagingPagePtr(uint32_t page_index) const;
@@ -230,10 +235,11 @@ class SsdBackend : public MediumBackend {
   uint64_t staging_size_ = 0;
   TransferRef buffer_ref_;
   std::vector<uint8_t> buffer_desc_;
-  std::vector<uint32_t> free_pages_;  // stack of free page indices
+  std::vector<bool> staging_page_used_;
 
   std::unordered_map<uint64_t, PendingSlot> pending_;
   std::unordered_map<std::string, ReadLease> read_leases_;
+  std::unordered_map<std::string, ReadLease> migration_reads_;
 
   size_t unshipped_events_ = 0;
   size_t auto_flush_threshold_ = SIZE_MAX;
@@ -243,13 +249,13 @@ class SsdBackend : public MediumBackend {
   std::atomic<bool> clear_full_sync_pending_{false};
 
   // Staging-arena observability.  Relaxed atomics, never correctness state.
-  // slot_full_rejects_ is the one to watch: it counts Resolves that reported a
-  // miss for a key this node actually HOLDS, purely because the arena was full
-  // (see the class comment on why exhaustion has to surface that way).
+  // slot_full_rejects_ is the one to watch: it counts resolve batches that
+  // returned BUSY because the arena was temporarily full.
   std::atomic<uint64_t> slot_full_rejects_{0};
   std::atomic<uint64_t> staging_expired_reclaims_{0};
-  // Live arena occupancy, mirrored out of free_pages_ so SampleMetrics can read
-  // it without taking mutex_ (the metrics tick must never contend with a read).
+  // Live arena occupancy, mirrored out of staging_page_used_ so SampleMetrics
+  // can read it without taking mutex_ (the metrics tick must never contend with
+  // a read).
   std::atomic<uint64_t> staging_pages_in_use_{0};
   bool initialized_ = false;
   MemoryRegistrar* registrar_ = nullptr;

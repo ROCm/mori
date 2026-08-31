@@ -171,9 +171,9 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
       // arena in a 2 MiB-page run.
       //
       // The slot count is the number worth showing, because it is the SSD
-      // medium's read-concurrency limit: a BatchGet wider than this cannot get
-      // a staging page for every key, and SsdBackend reports that shortfall as
-      // found=false (a MISS), not as backpressure.
+      // medium's read-concurrency limit.  Transient shortfalls now surface as
+      // BUSY and are retried; a batch whose own working set exceeds the arena
+      // is a permanent resolve failure.
       medium_desc = "SSD pool=" + mb(config_.ssd.capacity_bytes) +
                     "MB backend=" + config_.ssd.ssd_backend + " dir=" + config_.ssd.storage_dir +
                     " staging_slots=" + std::to_string(dc.ssd_staging_buffer_slots);

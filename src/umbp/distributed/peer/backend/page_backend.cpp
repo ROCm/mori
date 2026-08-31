@@ -447,6 +447,7 @@ ResolvedEntry PageBackend::Resolve(const std::string& key) {
   ResolvedEntry r;
   auto it = owned_.find(key);
   if (it == owned_.end()) return r;
+  r.outcome = ResolveOutcome::kFound;
   r.found = true;
   r.pages = it->second.pages;
   r.size = it->second.size;
@@ -470,6 +471,7 @@ std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::stri
     auto it = owned_.find(keys[i]);
     if (it == owned_.end()) continue;
     auto& entry = out[i];
+    entry.outcome = ResolveOutcome::kFound;
     entry.found = true;
     entry.pages = it->second.pages;
     entry.size = it->second.size;
@@ -478,6 +480,31 @@ std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::stri
     it->second.read_lease_until = lease_deadline;
   }
   return out;
+}
+
+bool PageBackend::AcquireMigrationRead(const std::string& key,
+                                       ResolvedEntry* resolved) {
+  if (resolved == nullptr) return false;
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto owned = owned_.find(key);
+  if (owned == owned_.end() || pins_.find(key) != pins_.end()) return false;
+  resolved->outcome = ResolveOutcome::kFound;
+  resolved->found = true;
+  resolved->pages = owned->second.pages;
+  resolved->size = owned->second.size;
+  resolved->page_size = page_size_;
+  pins_[key] = PinState{next_pin_token_++, std::chrono::steady_clock::now()};
+  return true;
+}
+
+void PageBackend::ReleaseMigrationRead(const std::string& key) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  pins_.erase(key);
+}
+
+bool PageBackend::Contains(const std::string& key) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return owned_.find(key) != owned_.end();
 }
 
 // ---------------------------------------------------------------------------
@@ -701,6 +728,7 @@ TierCapacity PageBackend::Capacity() const {
   if (allocator_) {
     cap.total_bytes = allocator_->TotalBytes();
     cap.available_bytes = allocator_->AvailableBytes();
+    cap.max_allocatable_bytes = cap.available_bytes;
   }
   return cap;
 }

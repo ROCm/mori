@@ -213,6 +213,29 @@ TEST(InMemoryStore, HeartbeatDeltaAddRemove) {
   EXPECT_TRUE(store.LookupBlock("k1").empty());
 }
 
+TEST(InMemoryStore, NamedLogicalTiersAreDistinctLocations) {
+  InMemoryMasterMetadataStore store;
+  RegisterAlive(store, "n1");
+  auto hot = Add("k1", TierType::DRAM, 10);
+  hot.logical_tier = "hot";
+  auto warm = Add("k1", TierType::DRAM, 10);
+  warm.logical_tier = "warm";
+  ASSERT_EQ(Beat(store, "n1", 1, {hot, warm}, kT0).status,
+            HeartbeatResult::APPLIED);
+
+  auto locations = store.LookupBlock("k1");
+  ASSERT_EQ(locations.size(), 2u);
+  EXPECT_NE(locations[0].logical_tier, locations[1].logical_tier);
+
+  auto remove_hot = Remove("k1", TierType::DRAM);
+  remove_hot.logical_tier = "hot";
+  ASSERT_EQ(Beat(store, "n1", 2, {remove_hot}, kT0).status,
+            HeartbeatResult::APPLIED);
+  locations = store.LookupBlock("k1");
+  ASSERT_EQ(locations.size(), 1u);
+  EXPECT_EQ(locations.front().logical_tier, "warm");
+}
+
 TEST(InMemoryStore, HeartbeatFullSyncReplaces) {
   InMemoryMasterMetadataStore store;
   RegisterAlive(store, "n1");

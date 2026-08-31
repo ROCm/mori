@@ -264,6 +264,18 @@ elseif(NOT _PROTOBUF_MM)
   message(FATAL_ERROR "[UMBP] cannot determine libprotobuf header version.")
 endif()
 
+# umbp_peer.proto declares a proto3 `optional` field. protoc only accepts that
+# behind an opt-in flag before 3.15, and Dockerfile.dev still pins Ubuntu
+# jammy's 3.12.
+set(_PROTOC_PROTO3_OPTIONAL_ARGS)
+if(_PROTOC_MM VERSION_LESS "3.15")
+  list(APPEND _PROTOC_PROTO3_OPTIONAL_ARGS --experimental_allow_proto3_optional)
+  message(
+    STATUS
+      "[UMBP] protoc ${_PROTOC_MM} < 3.15 — enabling --experimental_allow_proto3_optional"
+  )
+endif()
+
 message(
   STATUS "[UMBP] gRPC + Protobuf found — distributed control plane ENABLED")
 
@@ -273,6 +285,7 @@ set(UMBP_PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/distributed/proto")
 set(UMBP_PROTO_FILE "${UMBP_PROTO_DIR}/umbp.proto")
 set(UMBP_PEER_PROTO_FILE "${UMBP_PROTO_DIR}/umbp_peer.proto")
 set(UMBP_STANDALONE_PROTO_FILE "${UMBP_PROTO_DIR}/umbp_standalone.proto")
+set(UMBP_WORKLOAD_PROTO_FILE "${UMBP_PROTO_DIR}/umbp_workload.proto")
 set(UMBP_PROTO_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/proto_gen")
 file(MAKE_DIRECTORY ${UMBP_PROTO_GEN_DIR})
 
@@ -291,13 +304,17 @@ set(UMBP_STANDALONE_PROTO_HDRS "${UMBP_PROTO_GEN_DIR}/umbp_standalone.pb.h")
 set(UMBP_STANDALONE_GRPC_SRCS "${UMBP_PROTO_GEN_DIR}/umbp_standalone.grpc.pb.cc")
 set(UMBP_STANDALONE_GRPC_HDRS "${UMBP_PROTO_GEN_DIR}/umbp_standalone.grpc.pb.h")
 
+set(UMBP_WORKLOAD_PROTO_SRCS "${UMBP_PROTO_GEN_DIR}/umbp_workload.pb.cc")
+set(UMBP_WORKLOAD_PROTO_HDRS "${UMBP_PROTO_GEN_DIR}/umbp_workload.pb.h")
+
 add_custom_command(
   OUTPUT ${UMBP_PROTO_SRCS} ${UMBP_PROTO_HDRS} ${UMBP_GRPC_SRCS}
          ${UMBP_GRPC_HDRS}
   COMMAND
     ${_PROTOBUF_PROTOC} --proto_path=${UMBP_PROTO_DIR}
     --cpp_out=${UMBP_PROTO_GEN_DIR} --grpc_out=${UMBP_PROTO_GEN_DIR}
-    --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN} ${UMBP_PROTO_FILE}
+    --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN}
+    ${_PROTOC_PROTO3_OPTIONAL_ARGS} ${UMBP_PROTO_FILE}
   DEPENDS ${UMBP_PROTO_FILE}
   COMMENT "Generating UMBP protobuf/gRPC C++ sources"
   VERBATIM)
@@ -308,7 +325,8 @@ add_custom_command(
   COMMAND
     ${_PROTOBUF_PROTOC} --proto_path=${UMBP_PROTO_DIR}
     --cpp_out=${UMBP_PROTO_GEN_DIR} --grpc_out=${UMBP_PROTO_GEN_DIR}
-    --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN} ${UMBP_PEER_PROTO_FILE}
+    --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN}
+    ${_PROTOC_PROTO3_OPTIONAL_ARGS} ${UMBP_PEER_PROTO_FILE}
   # umbp_peer.proto imports umbp.proto for shared types (TierType, PageLocation,
   # BufferMemoryDesc) — protoc reads it at generation time and the generated
   # peer headers include "umbp.pb.h", so the peer generation depends on the
@@ -323,10 +341,24 @@ add_custom_command(
   COMMAND
     ${_PROTOBUF_PROTOC} --proto_path=${UMBP_PROTO_DIR}
     --cpp_out=${UMBP_PROTO_GEN_DIR} --grpc_out=${UMBP_PROTO_GEN_DIR}
-    --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN} ${UMBP_STANDALONE_PROTO_FILE}
+    --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN}
+    ${_PROTOC_PROTO3_OPTIONAL_ARGS} ${UMBP_STANDALONE_PROTO_FILE}
   DEPENDS ${UMBP_STANDALONE_PROTO_FILE} ${UMBP_PROTO_FILE} ${UMBP_PROTO_HDRS}
   COMMENT "Generating UMBP Standalone protobuf/gRPC C++ sources"
   VERBATIM)
+
+add_custom_command(
+  OUTPUT ${UMBP_WORKLOAD_PROTO_SRCS} ${UMBP_WORKLOAD_PROTO_HDRS}
+  COMMAND
+    ${_PROTOBUF_PROTOC} --proto_path=${UMBP_PROTO_DIR}
+    --cpp_out=${UMBP_PROTO_GEN_DIR} ${_PROTOC_PROTO3_OPTIONAL_ARGS}
+    ${UMBP_WORKLOAD_PROTO_FILE}
+  DEPENDS ${UMBP_WORKLOAD_PROTO_FILE}
+  COMMENT "Generating UMBP workload trace protobuf C++ sources"
+  VERBATIM)
+add_custom_target(umbp_workload_proto
+                  DEPENDS ${UMBP_WORKLOAD_PROTO_SRCS}
+                          ${UMBP_WORKLOAD_PROTO_HDRS})
 
 # ---------- Static library: umbp_common ---------------------------------------
 # Shared between PoolClient integration and standalone control-plane tools.
@@ -339,6 +371,13 @@ add_library(
   ${UMBP_PEER_GRPC_SRCS}
   ${UMBP_STANDALONE_PROTO_SRCS}
   ${UMBP_STANDALONE_GRPC_SRCS}
+  ${UMBP_WORKLOAD_PROTO_SRCS}
+  # Trace capture is a client feature: PoolClient records live traffic when
+  # UMBP_WORKLOAD_TRACE_PATH is set, so the writer ships with the library. The
+  # rest of the workload harness drives benchmarks and lives in
+  # umbp_workload_bench instead.
+  distributed/benchmark/workload_trace.cpp
+  distributed/benchmark/workload_trace_recorder.cpp
   distributed/master/in_memory_master_metadata_store.cpp
   distributed/master/master_metadata_store_factory.cpp
   distributed/master/master_server.cpp
@@ -361,6 +400,10 @@ add_library(
   distributed/transfer/composite_transfer_engine.cpp
   distributed/peer/ssd/peer_ssd_manager.cpp
   distributed/peer/ssd/ssd_copy_pipeline.cpp
+  distributed/pool/policy_config.cpp
+  distributed/pool/tier_graph.cpp
+  distributed/pool/tier_transition.cpp
+  distributed/pool/peer_pool.cpp
   distributed/peer/peer_service.cpp
   distributed/pool_client.cpp
   distributed/distributed_client.cpp
@@ -368,6 +411,7 @@ add_library(
   standalone/ipc.cpp
   standalone/standalone_process_client.cpp
   standalone/standalone_server.cpp)
+add_dependencies(umbp_common umbp_workload_proto)
 
 target_include_directories(
   umbp_common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${UMBP_PROTO_GEN_DIR}
@@ -477,6 +521,35 @@ target_link_libraries(umbp_client PRIVATE umbp_common ${_PROTOBUF_LIBS}
 set_target_properties(umbp_client PROPERTIES BUILD_RPATH "$ORIGIN"
                                              INSTALL_RPATH "$ORIGIN"
                                              BUILD_WITH_INSTALL_RPATH TRUE)
+
+# ---------- Workload harness for benchmarks ----------------------------------
+# Generates synthetic workloads, replays traces, and drives them against a
+# client. Nothing in the data path needs it, so it stays out of umbp_common and
+# is linked only by the benchmark tool and the tests that exercise it.
+add_library(
+  umbp_workload_bench STATIC
+  distributed/benchmark/payload.cpp
+  distributed/benchmark/workload_source.cpp
+  distributed/benchmark/workload_runner.cpp)
+add_dependencies(umbp_workload_bench umbp_workload_proto)
+target_link_libraries(umbp_workload_bench PUBLIC umbp_common)
+target_compile_features(umbp_workload_bench PUBLIC cxx_std_17)
+
+# ---------- Distributed tier-management benchmark ---------------------------
+# Manual synthetic/trace-replay tool. It starts an in-process master and real
+# PoolClients, so it exercises routing, peer placement, transfer, heartbeat,
+# capacity, and eviction without depending on an inference framework.
+add_executable(umbp_tier_bench distributed/bin/tier_benchmark_main.cpp)
+add_dependencies(umbp_tier_bench umbp_workload_proto)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(umbp_tier_bench PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(umbp_tier_bench PRIVATE umbp_workload_bench
+                                               ${_PROTOBUF_LIBS}
+                                               ${_GRPCPP_LIB})
+set_target_properties(umbp_tier_bench PROPERTIES BUILD_RPATH "$ORIGIN"
+                                                  INSTALL_RPATH "$ORIGIN"
+                                                  BUILD_WITH_INSTALL_RPATH TRUE)
 
 # ---------- Standalone-process executable ------------------------------------
 

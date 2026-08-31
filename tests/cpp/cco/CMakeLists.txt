@@ -17,6 +17,10 @@
 # link only mori_cco (+ pthread; HIP/MPI added per-target below).
 set(CCO_TEST_COMMON_LIBS mori_cco pthread)
 set(CCO_TEST_MPI_RANKS 8)
+# These tests wait on real GPU/NIC completions, so a missing or busy device
+# makes them block forever rather than fail. Without a cap one such test stalls
+# the whole `ctest` run, which is how a hang here hides unrelated failures.
+set(CCO_TEST_TIMEOUT_SECONDS 300)
 
 # MPI is a direct dependency of the cco tests (bootstrap + test_multiprocess).
 # Previously it came transitively via mori_application; find it here now that the
@@ -81,11 +85,15 @@ function(add_cco_test src)
                INSTALL_RPATH_USE_LINK_PATH TRUE)
 
   add_test(NAME cco_${short} COMMAND ${target})
+  set_tests_properties(cco_${short} PROPERTIES TIMEOUT
+                                               ${CCO_TEST_TIMEOUT_SECONDS})
   if(uses_mpi AND WITH_MPI)
     add_test(
       NAME cco_${short}_mpi
       COMMAND ${MPIEXEC_EXECUTABLE} --allow-run-as-root ${MPIEXEC_NUMPROC_FLAG}
               ${CCO_TEST_MPI_RANKS} $<TARGET_FILE:${target}>)
+    set_tests_properties(cco_${short}_mpi
+                         PROPERTIES TIMEOUT ${CCO_TEST_TIMEOUT_SECONDS})
   endif()
 endfunction()
 

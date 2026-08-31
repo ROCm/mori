@@ -32,6 +32,7 @@
 
 #include "umbp/common/config.h"
 #include "umbp/common/env_time.h"
+#include "umbp/distributed/pool/policy_config.h"
 #include "umbp/distributed/types.h"
 
 namespace mori::umbp {
@@ -83,6 +84,14 @@ struct ClientRegistryConfig {
   // (UMBPDistributedConfig / PoolClientConfig) default their
   // `dram_page_size` to 0 and rely on this value to materialize.
   uint64_t default_dram_page_size = 2ULL * 1024 * 1024;  // 2 MiB
+
+  // Current Masters advertise this so weighted peers may heartbeat aggregate
+  // same-tier capacity together with max_allocatable_bytes. A pre-weighted
+  // Master leaves it false (proto3 default); peers then keep heartbeats at the
+  // first instance per tier so rolling upgrades cannot over-admit a value no
+  // single backend can hold. Tests set this false to emulate that Master.
+  bool advertise_max_allocatable_bytes = true;
+  bool advertise_logical_tiers = true;
 };
 
 struct EvictionConfig {
@@ -193,6 +202,28 @@ struct PeerSsdConfig {
   UMBPSsdConfig ssd;
 };
 
+enum class PoolPlacementPolicy {
+  SINGLE_BACKEND = 0,
+  WEIGHTED = 1,
+  TIERED = 2,
+};
+
+// One named backend instance on a peer. Only the ownership block selected by
+// `tier` is read. Page size remains peer-global because the RPC wire carries a
+// single page_size for batches that may span instances.
+struct BackendInstanceConfig {
+  std::string name;
+  TierType tier = TierType::UNKNOWN;
+  DramOwnershipConfig dram;
+  HbmOwnershipConfig hbm;
+  PeerSsdConfig ssd;
+  int ssd_staging_buffer_slots = 16;
+  // Relative admission share within this tier when WEIGHTED placement is
+  // enabled. Must be positive; legacy and SINGLE_BACKEND paths ignore it.
+  // Appended to preserve existing positional aggregate initializers.
+  uint32_t placement_weight = 1;
+};
+
 struct PoolClientConfig {
   UMBPMasterClientConfig master_config;
   UMBPIoEngineConfig io_engine;
@@ -214,11 +245,9 @@ struct PoolClientConfig {
   void* ranged_put_scratch_buffer = nullptr;
   size_t ranged_put_scratch_size = 0;
 
-  // SSD read-staging tuning (peer side).  More slots reduce NO_SLOT under large
-  // concurrent prefetch batches, but shrink per-slot size (= staging_buffer_size
-  // / slots), which must stay >= the largest single SSD block.  The slot lease
-  // TTL (the primary slot-reclaim mechanism; ReleaseSsdLease is best-effort) is
-  // resolved from UMBP_SSD_READ_LEASE_MS at PeerService construction, not here.
+  // SSD read-staging tuning. More slots increase concurrent reads and writes;
+  // each policy-created SsdBackend owns `slots * page_size` staging bytes. Its
+  // read lease is resolved from UMBP_SSD_READ_LEASE_MS during PoolClient::Init.
   int ssd_staging_buffer_slots = 16;
 
   // Backs ssd_staging_buffer_, allocated only when ssd.enabled. A remote SSD
@@ -226,24 +255,24 @@ struct PoolClientConfig {
   // must be >= the largest single-key page KV (61-layer MLA page ~= 4.5 MB).
   size_t ssd_staging_buffer_size = 268435456;  // 256 MiB
 
-  // Back the SSD staging arena with hugetlbfs pages.  Every byte the SSD
-  // backend moves crosses that arena twice (device <-> arena, arena <-> wire),
-  // so its TLB behaviour sits on the critical path in a way an ordinary
-  // buffer's does not.  Falls back to 4 KiB pages when no hugetlb pages are
-  // free — a node must still come up.
+  // Back the SSD staging arena with hugetlbfs pages. Every SSD backend this
+  // client registers uses the same node-wide setting. Falls back to 4 KiB
+  // pages when no hugetlb pages are free so the node can still start.
   bool ssd_staging_use_hugepages = false;
   size_t ssd_staging_hugepage_size = 2ULL * 1024 * 1024;  // 2 MiB
 
-  // The one medium this node registers a backend for (design note in
-  // common/config.h's UMBPMedium: UMBP routes across nodes, it does not tier
-  // within one, so a second local backend would mirror rather than demote).
-  // PoolClient::Init reads exactly one of the three ownership blocks below,
-  // chosen by this field; the other two are ignored, not validated.
+  // Legacy one-medium selector. Used only when `backends` is empty; in that
+  // mode PoolClient::Init reads exactly one ownership block below.
   TierType medium = TierType::DRAM;
 
   DramOwnershipConfig dram;
   HbmOwnershipConfig hbm;
   PeerSsdConfig ssd;
+
+  // Named multi-backend configuration. Empty selects the legacy fields above;
+  // PoolClient lowers them at Init time so mutations made after
+  // ToPoolClientConfig() remain authoritative.
+  std::vector<BackendInstanceConfig> backends;
 
   uint16_t peer_service_port = 0;
 
@@ -277,6 +306,29 @@ struct PoolClientConfig {
     c.worker_threads = 1;
     return c;
   }();
+
+  // Compatibility is the default. WEIGHTED distributes new keys among all
+  // configured same-tier instances according to placement_weight. Appended to
+  // preserve existing positional aggregate initializers.
+  PoolPlacementPolicy placement_policy = PoolPlacementPolicy::SINGLE_BACKEND;
+
+  // Opt-in ephemeral peer service for test/benchmark harnesses. When true,
+  // PoolClient starts the service even when peer_service_port is zero and
+  // advertises the port selected atomically by gRPC, avoiding probe/bind races.
+  bool auto_peer_service_port = false;
+
+  // Optional declarative policy. policy_config_path is loaded at Init and
+  // lowered into named backends plus logical_tiers. Callers that load JSON
+  // themselves may populate logical_tiers directly. Empty fields preserve the
+  // legacy SINGLE_BACKEND/WEIGHTED behavior. Appended for aggregate-init
+  // compatibility.
+  std::string policy_config_path;
+  std::vector<LogicalTierConfig> logical_tiers;
+
+  // Optional production traffic recorder. Empty path disables recording.
+  std::string workload_trace_path;
+  uint32_t workload_trace_client_id = 0;
+  uint64_t workload_trace_seed = 0;
 };
 
 // Lower a user-facing UMBPDistributedConfig to the internal PoolClientConfig.
@@ -312,6 +364,10 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   // proto -> ClientRegistry, where it is interpreted as "use the
   // registry-wide default_dram_page_size".
   pc.dram_page_size = dc.dram_page_size;
+  pc.policy_config_path = dc.backend_policy_path;
+  pc.workload_trace_path = dc.workload_trace_path;
+  pc.workload_trace_client_id = dc.workload_trace_client_id;
+  pc.workload_trace_seed = dc.workload_trace_seed;
   pc.dram = std::move(dram);
   pc.ssd = std::move(ssd);
   // Unlike dram/ssd, UMBPHbmConfig carries no ownership knobs that live
@@ -323,6 +379,8 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.medium = ToTierType(dc.medium);
   // The medium is what opts the SSD tier in; PeerSsdManager keys off this.
   pc.ssd.enabled = (pc.medium == TierType::SSD);
+  // Deliberately leave pc.backends empty. PoolClient synthesizes the legacy
+  // instance at Init so callers may still mutate medium/dram/hbm/ssd afterward.
   return pc;
 }
 

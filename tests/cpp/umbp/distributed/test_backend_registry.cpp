@@ -20,11 +20,9 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// Proves BackendRegistry dispatch across two distinct MediumBackend
-// implementations (design doc §5 Phase 2, default option (b)): registering a
-// MockBackend alongside a real one and driving both purely through the
-// registry / MediumBackend interface, with no concrete type named at the call
-// site.
+// BackendRegistry dispatch and cross-backend event aggregation. MockBackend is
+// only the test double; its own behavior is exercised transitively here and by
+// the PeerPool / PeerService suites.
 
 #include <gtest/gtest.h>
 
@@ -36,51 +34,6 @@
 #include "umbp/distributed/peer/backend/mock_backend.h"
 
 namespace mori::umbp {
-
-TEST(MockBackend, ZeroCapacityByDesign) {
-  MockBackend b(TierType::HBM);
-  EXPECT_EQ(b.Capacity().total_bytes, 0u);
-  EXPECT_EQ(b.Capacity().available_bytes, 0u);
-}
-
-TEST(MockBackend, AllocateCommitResolveEvictRoundTrip) {
-  MockBackend b(TierType::HBM);
-  ASSERT_TRUE(b.Init(nullptr));
-
-  auto allocated = b.BatchAllocate({{"k", 128}});
-  ASSERT_EQ(allocated.size(), 1u);
-  ASSERT_EQ(allocated[0].outcome, AllocateOutcome::kSuccessAllocated);
-
-  auto committed = b.BatchCommit({{allocated[0].slot_id, "k"}});
-  ASSERT_EQ(committed.size(), 1u);
-  EXPECT_TRUE(committed[0].success);
-  EXPECT_EQ(committed[0].bytes_committed, 128u);
-  EXPECT_EQ(b.OwnedKeyCount(), 1u);
-
-  auto resolved = b.BatchResolve({"k", "missing"}, /*include_descs=*/true);
-  ASSERT_EQ(resolved.size(), 2u);
-  EXPECT_TRUE(resolved[0].found);
-  EXPECT_EQ(resolved[0].size, 128u);
-  EXPECT_FALSE(resolved[1].found);
-
-  auto evicted = b.Evict({"k"});
-  ASSERT_EQ(evicted.size(), 1u);
-  EXPECT_EQ(evicted[0].bytes_freed, 128u);
-  EXPECT_EQ(b.OwnedKeyCount(), 0u);
-}
-
-TEST(MockBackend, DrainAndSnapshotEvents) {
-  MockBackend b(TierType::HBM);
-  auto allocated = b.BatchAllocate({{"a", 8}, {"b", 8}});
-  b.BatchCommit({{allocated[0].slot_id, "a"}, {allocated[1].slot_id, "b"}});
-
-  auto drained = b.DrainPendingEvents();
-  EXPECT_EQ(drained.size(), 2u);
-  EXPECT_TRUE(b.DrainPendingEvents().empty());  // outbox cleared
-
-  auto snap = b.SnapshotOwnedKeys();
-  EXPECT_EQ(snap.size(), 2u);
-}
 
 // The registry dispatches to whichever concrete backend is registered for a
 // tier, without the caller naming MockBackend anywhere below this line — this
@@ -102,6 +55,29 @@ TEST(BackendRegistryDispatch, RoutesByTierThroughTheInterfaceOnly) {
 
   ASSERT_EQ(registry.All().size(), 1u);
   EXPECT_EQ(registry.All()[0], hbm);
+}
+
+TEST(BackendRegistryDispatch, NamedSameTierInstancesKeepDenseStableIds) {
+  BackendRegistry registry;
+  ASSERT_TRUE(registry.Register("dram-primary", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("dram-secondary", std::make_unique<MockBackend>(TierType::DRAM)));
+
+  ASSERT_EQ(registry.Size(), 2u);
+  EXPECT_EQ(registry.Get(TierType::DRAM), registry.Get("dram-primary"));
+  EXPECT_EQ(registry.Get(0u), registry.Get("dram-primary"));
+  EXPECT_EQ(registry.Get(1u), registry.Get("dram-secondary"));
+  EXPECT_EQ(registry.BackendId(registry.Get("dram-secondary")), 1u);
+
+  auto allocated = registry.Get("dram-primary")->BatchAllocate({{"old-state", 8}});
+  registry.Get("dram-primary")->BatchCommit({{allocated.front().slot_id, "old-state"}});
+  ASSERT_EQ(registry.Get("dram-primary")->OwnedKeyCount(), 1u);
+  ASSERT_TRUE(registry.Register("dram-primary", std::make_unique<MockBackend>(TierType::DRAM)));
+  EXPECT_EQ(registry.Get("dram-primary")->OwnedKeyCount(), 0u);
+  EXPECT_EQ(registry.Size(), 2u);
+  EXPECT_EQ(registry.BackendId(registry.Get("dram-primary")), 0u);
+  ASSERT_EQ(registry.All().size(), 2u);
+  EXPECT_EQ(registry.All()[0], registry.Get("dram-primary"));
+  EXPECT_EQ(registry.All()[1], registry.Get("dram-secondary"));
 }
 
 // ---- Heartbeat event aggregation -------------------------------------------
@@ -154,6 +130,25 @@ TEST(BackendEventAgg, FullSyncSnapshotAlsoDropsTheOutbox) {
   auto snap = SnapshotAllBackendsForFullSync({&b});
   ASSERT_EQ(snap.size(), 1u);
   EXPECT_TRUE(DrainAllBackends({&b}).empty());
+}
+
+TEST(BackendEventAgg, SameTierRelocationKeepsMasterLocation) {
+  MockBackend source(TierType::SSD);
+  MockBackend target(TierType::SSD);
+  CommitOne(&source, "moved", 8);
+  ASSERT_EQ(DrainAllBackends({&source, &target}).size(), 1u);
+
+  CommitOne(&target, "moved", 8);
+  source.Evict({"moved"});
+  auto relocated = DrainAllBackends({&source, &target});
+  ASSERT_EQ(relocated.size(), 1u);
+  EXPECT_EQ(relocated.front().kind, KvEvent::Kind::ADD);
+  EXPECT_EQ(relocated.front().tier, TierType::SSD);
+
+  target.Evict({"moved"});
+  auto removed = DrainAllBackends({&source, &target});
+  ASSERT_EQ(removed.size(), 1u);
+  EXPECT_EQ(removed.front().kind, KvEvent::Kind::REMOVE);
 }
 
 TEST(BackendEventAgg, NullBackendsAreSkipped) {

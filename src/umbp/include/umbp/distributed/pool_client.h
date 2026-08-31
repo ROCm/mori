@@ -50,7 +50,12 @@
 
 namespace mori::umbp {
 
+namespace benchmark {
+class WorkloadTraceRecorder;
+}
+
 class PeerServiceServer;
+class PeerPool;
 class HbmCopyEngine;
 
 // Short name for log output. Generic FAILED maps to "FAILED" — the
@@ -194,12 +199,15 @@ class PoolClient {
 
   MasterClient& Master();
 
-  // The storage medium live on this node (exactly one — see PoolClient::Init).
-  // Callers reach it by tier (Backends().Get(Medium())) and use it through
+  // Every named storage backend live on this node.  Callers use them through
   // MediumBackend — no concrete backend type is named outside PoolClient::Init.
   BackendRegistry& Backends();
+  TierTransitionMetrics TransitionMetrics() const;
+  std::map<std::string, uint64_t> TierReadHits() const;
+  std::string LogicalTierForBackend(uint32_t backend_id) const;
 
-  // Which medium this node serves.  Valid after Init.
+  // Legacy default medium: the first configured backend's tier.  Valid after
+  // Init and retained for callers that have not adopted named instances.
   TierType Medium() const { return medium_; }
 
   // Whether this node is part of a master-coordinated cluster.  False is the
@@ -250,8 +258,8 @@ class PoolClient {
   // on a data-plane path.
   //
   // There is no per-component code here and no place to add any: a component is
-  // a MetricSource, the labels that identify it come from its own Tier()/Name(),
-  // and MetricPublisher does the differencing.  That is what makes a new backend
+  // a MetricSource, the labels that identify it come from Tier() plus the
+  // registry instance name, and MetricPublisher does the differencing. That makes a new backend
   // or a new transfer engine visible in Grafana without touching this file.
   void PublishComponentMetrics();
 
@@ -264,15 +272,17 @@ class PoolClient {
 
   // Every storage medium live on this node.  Owned here because PoolClient is
   // the natural lifetime anchor for the per-process IO engine + backend pools.
-  // PeerServiceServer and MasterClient both borrow the registry and dispatch
-  // through it (backend-agnostic refactor Phase 3).
+  // MasterClient borrows it for heartbeat aggregation; default_pool_ borrows it
+  // for logical placement and peer/local dispatch.
   BackendRegistry registry_;
 
-  // The one tier registry_ holds, cached from the backend at Init.  Read by the
-  // few paths that must name a LOCAL destination with no route to dispatch on
-  // (the re-cache installer); everything with a route uses route.tier.  Kept in
-  // sync with config_.medium by construction — Init sets it from the backend it
-  // actually built, not from config.
+  // The implicit default logical pool. It borrows registry_, owns placement
+  // state and policy, and is the dispatch surface for local and peer RPC paths.
+  std::unique_ptr<PeerPool> default_pool_;
+  std::unique_ptr<benchmark::WorkloadTraceRecorder> workload_recorder_;
+
+  // Legacy default tier, cached from the first configured backend. Read by
+  // re-cache paths that do not yet carry a PoolPolicy decision.
   TierType medium_ = TierType::DRAM;
 
   std::unique_ptr<PeerServiceServer> peer_service_;
@@ -353,9 +363,10 @@ class PoolClient {
   enum class GetAttemptOutcome { kSuccess, kRetry, kFatal };
 
   PutAttemptOutcome ExecuteLocalPut(const std::string& key, const void* src, size_t size,
-                                    TierType tier);
+                                    TierType tier, const std::string& logical_tier = {});
+  GetAttemptOutcome ExecuteLocalGet(const std::string& key, void* dst, size_t size);
 
-  // Resolve `keys` against this node's own media.  On return holders[i] is the
+  // Resolve `keys` through the PeerPool. On return holders[i] is the
   // backend that owns keys[i] (nullptr when nothing here does) and, when it is
   // non-null, resolutions[i] is that backend's entry.  Both are sized to
   // keys.size(); `candidates` selects which indices are asked about, so a
@@ -365,15 +376,8 @@ class PoolClient {
   // key is here -- an Exists does, and materializing an entry per key costs it
   // a pages vector and a descs vector it never reads (measured 6-15%).
   //
-  // One BatchResolve per BACKEND rather than one per key: the backend mutex is
-  // shared with Allocate / Commit / Evict, and in standalone-process mode every
-  // rank on the node shares this client, so a per-key walk is where they
-  // serialize.  Backends are tried in registry order and the first hit wins, so
-  // a second medium is asked only about what the first one missed.
-  //
-  // A hit here is conclusive: the backend owns the bytes.  A miss is conclusive
-  // only about THIS node; the key may still live on a peer, which is why every
-  // caller sends its misses to the master.
+  // One pool batch preserves placement/read-order, tier touches, and promotion
+  // semantics while avoiding one resolve call per key.
   void ResolveLocalBatch(const std::vector<std::string>& keys,
                          const std::vector<size_t>& candidates,
                          std::vector<MediumBackend*>* holders,
@@ -446,6 +450,7 @@ class PoolClient {
     size_t object_size = 0;
     std::vector<ObjectRange> ranges;
     TierType tier = TierType::UNKNOWN;
+    std::string logical_tier;
   };
 
   // Allocate a slot per request, write the ranges straight into its pages, and

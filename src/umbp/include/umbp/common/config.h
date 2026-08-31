@@ -281,15 +281,16 @@ struct UMBPHbmConfig {
   uint64_t capacity_bytes = 0;  // single-buffer pool size
 };
 
-// The one storage medium a distributed node serves.
+// The one storage medium a legacy distributed node serves.
 //
 // UMBP's routing plane does not tier: every advertised medium is an equally
 // valid put target (see medium_backend.h and Phase 4 of the backend-agnostic
 // refactor), so a node registering two backends MIRRORS across them rather
 // than promoting/demoting between them — which is not what "DRAM + SSD" reads
-// like, and costs capacity for nothing. Rather than build a local tiering
-// policy nobody asked for, a node picks exactly one medium and the cluster
-// gets its heterogeneity from having different nodes pick differently.
+// like, and costs capacity for nothing. Without backend_policy_path, a node
+// picks exactly one medium and the cluster gets its heterogeneity from having
+// different nodes pick differently. A JSON backend policy explicitly opts
+// into peer-local heterogeneous tiering.
 //
 // The medium each key lands on is therefore a property of the node master
 // routed it to, not of a per-node tier order.
@@ -405,8 +406,9 @@ struct UMBPDistributedConfig {
   // (2 MiB by default).  Set to an explicit byte count to override.
   uint64_t dram_page_size = 0;
 
-  // Which medium this node's distributed data plane serves — exactly one.
-  // Defaults to DRAM, so an existing deployment is bit-identical.
+  // Which medium the legacy distributed data plane serves. Ignored when
+  // backend_policy_path is set. Defaults to DRAM, so existing deployments are
+  // bit-identical.
   //
   // The selected medium's sizing knobs come from the config it names:
   //   DRAM -> UMBPConfig::dram   (capacity, hugepages, NUMA, prefault)
@@ -417,6 +419,18 @@ struct UMBPDistributedConfig {
   UMBPMedium medium = UMBPMedium::DRAM;
 
   UMBPHbmConfig hbm;
+
+  // Optional JSON backend/tier policy. When set, it replaces the legacy
+  // single-medium ownership settings with named heterogeneous backends,
+  // weighted logical tiers, and peer-local offload rules. Appended for
+  // aggregate-init compatibility.
+  std::string backend_policy_path;
+
+  // Optional production PUT/GET trace. Payload bytes are regenerated during
+  // replay, so production traces should disable payload validation.
+  std::string workload_trace_path;
+  uint32_t workload_trace_client_id = 0;
+  uint64_t workload_trace_seed = 0;
 };
 
 // User-facing same-host standalone-process configuration.  Set
@@ -527,7 +541,8 @@ struct UMBPConfig {
       }
       // Only the selected medium's sizing is checked: a node that serves HBM
       // still carries a defaulted dram/ssd block it never allocates from.
-      if (d.medium == UMBPMedium::HBM && d.hbm.capacity_bytes == 0) {
+      if (d.backend_policy_path.empty() && d.medium == UMBPMedium::HBM &&
+          d.hbm.capacity_bytes == 0) {
         if (error_message)
           *error_message =
               "distributed.hbm.capacity_bytes must be > 0 when distributed.medium is HBM";
@@ -536,7 +551,7 @@ struct UMBPConfig {
       // Not ssd.Validate(): that returns early on ssd.enabled == false, and
       // selecting SSD here IS the opt-in (DistributedClient enables the tier
       // from `medium`, so an unset ssd.enabled must not skip the sizing check).
-      if (d.medium == UMBPMedium::SSD) {
+      if (d.backend_policy_path.empty() && d.medium == UMBPMedium::SSD) {
         if (ssd.capacity_bytes == 0) {
           if (error_message)
             *error_message = "ssd.capacity_bytes must be > 0 when distributed.medium is SSD";

@@ -24,16 +24,16 @@
 //
 // 1. MasterClientMetricsTest — unit tests for MasterClient::AddCounter,
 //    SetGauge, and Observe buffering.  Uses a fake recording server that
-//    returns a 100ms heartbeat interval, allowing the flush to be verified
-//    within a short wall-clock window.
+//    captures ReportMetrics calls. main() sets the metrics reporting interval
+//    to 10ms so buffering semantics can be verified without one-second waits.
 //
 // 2. PoolClientLocalByteTrackingTest — integration test verifying that a
 //    single-node PoolClient reports correct Put/Get byte counts (traffic=local)
 //    through the full pipeline: PoolClient → MasterClient buffer →
 //    ReportMetrics RPC → MasterServer → Prometheus HTTP endpoint.
 //
-// main() sets UMBP_HEARTBEAT_TTL_SEC=1 before any test runs so that the real
-// MasterServer in suite 2 returns ≈500ms heartbeat/metrics flush intervals.
+// main() shortens the independently configured heartbeat and metrics intervals
+// before either suite constructs a client.
 
 #include <arpa/inet.h>
 #include <grpcpp/grpcpp.h>
@@ -60,6 +60,7 @@
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/master/master_client.h"
 #include "umbp/distributed/master/master_server.h"
+#include "umbp/distributed/pool/policy_config.h"
 #include "umbp/distributed/pool_client.h"
 
 namespace mori::umbp {
@@ -90,17 +91,14 @@ static uint16_t AllocPort() {
 
 // ============================================================
 //  Fake gRPC server that captures ReportMetrics calls.
-//  RegisterClient returns a configurable heartbeat interval so
-//  the metrics flush cadence is under test control.
+//  RegisterClient returns a short heartbeat interval; the independent
+//  metrics cadence is controlled by UMBP_METRICS_REPORT_INTERVAL_MS in main().
 // ============================================================
 class RecordingMasterService final : public ::umbp::UMBPMaster::Service {
  public:
-  explicit RecordingMasterService(int heartbeat_interval_ms)
-      : heartbeat_interval_ms_(heartbeat_interval_ms) {}
-
   grpc::Status RegisterClient(grpc::ServerContext*, const ::umbp::RegisterClientRequest*,
                               ::umbp::RegisterClientResponse* resp) override {
-    resp->set_heartbeat_interval_ms(heartbeat_interval_ms_);
+    resp->set_heartbeat_interval_ms(100);
     return grpc::Status::OK;
   }
 
@@ -139,7 +137,6 @@ class RecordingMasterService final : public ::umbp::UMBPMaster::Service {
   }
 
  private:
-  int heartbeat_interval_ms_;
   std::mutex mu_;
   std::condition_variable cv_;
   std::vector<::umbp::ReportMetricsRequest> requests_;
@@ -180,10 +177,8 @@ static double SumCounterDelta(const std::vector<::umbp::MetricSample>& samples,
 // ============================================================
 class MasterClientMetricsTest : public ::testing::Test {
  protected:
-  static constexpr int kFlushIntervalMs = 100;
-
   void SetUp() override {
-    service_ = std::make_unique<RecordingMasterService>(kFlushIntervalMs);
+    service_ = std::make_unique<RecordingMasterService>();
 
     grpc::ServerBuilder builder;
     int selected_port = 0;
@@ -435,9 +430,15 @@ class PoolClientLocalByteTrackingTest : public ::testing::Test {
     cfg.io_engine.host = "0.0.0.0";
     cfg.io_engine.port = 0;
     cfg.dram_page_size = kLocalPageSize;
-    cfg.dram.buffer_sizes = {kLocalBufSize};
+    ConfigureClient(&cfg);
     client_ = std::make_unique<PoolClient>(std::move(cfg));
     ASSERT_TRUE(client_->Init());
+  }
+
+  // Lets a fixture put a richer topology behind the same master bring-up. The
+  // base case is the one flat DRAM backend the byte-tracking tests expect.
+  virtual void ConfigureClient(PoolClientConfig* config) {
+    config->dram.buffer_sizes = {kLocalBufSize};
   }
 
   void TearDown() override {
@@ -636,10 +637,10 @@ TEST_F(PoolClientLocalByteTrackingTest, BackendAndTransferSeriesReachPrometheus)
     return -1.0;
   };
 
-  // The medium is a LABEL on a shared metric name.  DRAM is what this fixture
-  // configures; no assertion here knows anything else about it, which is the
-  // property that lets a new backend reuse these series and these panels.
-  const std::vector<std::string> dram = {"tier=\"DRAM\"", "backend=\"PageBackend\""};
+  // The medium and named backend instance are labels on shared metric names.
+  // Legacy one-backend configuration lowers to the stable instance name
+  // "dram"; explicit multi-backend policies use their configured names.
+  const std::vector<std::string> dram = {"tier=\"DRAM\"", "backend=\"dram\""};
 
   auto with = [&dram](std::vector<std::string> extra) {
     std::vector<std::string> out = dram;
@@ -737,14 +738,108 @@ TEST_F(PoolClientLocalByteTrackingTest, TierCapacityGaugesPublished) {
   EXPECT_NEAR(util1, used1 / total1, 1e-3) << "utilization must equal used / total";
 }
 
+// Two DRAM backends in different logical tiers, which is the case the
+// per-medium gauges cannot describe: both are tier="DRAM", so they land on one
+// series and the hierarchy is unreadable.
+class PoolClientLogicalTierMetricsTest : public PoolClientLocalByteTrackingTest {
+ protected:
+  static constexpr uint64_t kHotBytes = 1ULL << 20;
+  static constexpr uint64_t kColdBytes = 4ULL << 20;
+
+  void ConfigureClient(PoolClientConfig* config) override {
+    static constexpr char kPolicy[] = R"json({
+      "schema_version": 1,
+      "entry_tier": "hot",
+      "backends": {
+        "dram_hot": {"type": "dram", "capacity": "1MiB"},
+        "dram_cold": {"type": "dram", "capacity": "4MiB"}
+      },
+      "tiers": [
+        {
+          "name": "hot",
+          "backends": {"dram_hot": 100},
+          "offload_to": ["cold"],
+          "offload_trigger": "watermark",
+          "high_watermark": 0.9,
+          "low_watermark": 0.7
+        },
+        {"name": "cold", "backends": {"dram_cold": 100}, "promote_trigger": "on_read"}
+      ]
+    })json";
+    auto loaded = LoadBackendPolicyJson(kPolicy);
+    ASSERT_TRUE(loaded.ok()) << loaded.error;
+    std::string error;
+    ASSERT_TRUE(ApplyBackendPolicy(*loaded.config, config, &error)) << error;
+  }
+};
+
+// Each logical tier has to reach Prometheus as its own series, carrying the
+// name the policy gave it. Without this a two-DRAM-tier policy publishes one
+// tier="DRAM" series holding the sum, which cannot answer where a key sits, or
+// whether a drain reached its low watermark, or which tiers take new PUTs.
+TEST_F(PoolClientLogicalTierMetricsTest, PublishesCapacityPerLogicalTier) {
+  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+  const std::string body = FetchPrometheusMetrics(metrics_port_);
+  ASSERT_FALSE(body.empty()) << "Could not fetch Prometheus metrics from port " << metrics_port_;
+
+  const std::string hot = "logical_tier=\"hot\"";
+  const std::string cold = "logical_tier=\"cold\"";
+  const double hot_total =
+      ParseMetricValue(body, "mori_umbp_client_logical_tier_capacity_total_bytes", hot);
+  const double cold_total =
+      ParseMetricValue(body, "mori_umbp_client_logical_tier_capacity_total_bytes", cold);
+  ASSERT_GE(hot_total, 0.0) << "hot tier missing from /metrics";
+  ASSERT_GE(cold_total, 0.0) << "cold tier missing from /metrics";
+
+  // Cold is its own backends' sum. The entry tier is not: its capacity covers
+  // everything a PUT addressed to it can spill into, because that is what the
+  // router needs. Pinning both shapes keeps the difference from being read as
+  // one tier's occupancy.
+  EXPECT_NEAR(cold_total, static_cast<double>(kColdBytes), 16.0);
+  EXPECT_NEAR(hot_total, static_cast<double>(kHotBytes + kColdBytes), 16.0)
+      << "entry tier capacity should aggregate every offload-reachable tier";
+
+  for (const std::string& tier : {hot, cold}) {
+    const double avail =
+        ParseMetricValue(body, "mori_umbp_client_logical_tier_capacity_available_bytes", tier);
+    const double used =
+        ParseMetricValue(body, "mori_umbp_client_logical_tier_capacity_used_bytes", tier);
+    const double total =
+        ParseMetricValue(body, "mori_umbp_client_logical_tier_capacity_total_bytes", tier);
+    const double util =
+        ParseMetricValue(body, "mori_umbp_client_logical_tier_capacity_utilization_ratio", tier);
+    const double eligible =
+        ParseMetricValue(body, "mori_umbp_client_logical_tier_put_eligible", tier);
+    const double peak = ParseMetricValue(
+        body, "mori_umbp_client_logical_tier_peak_member_utilization_ratio", tier);
+    ASSERT_GE(avail, 0.0) << tier << " available missing";
+    ASSERT_GE(used, 0.0) << tier << " used missing";
+    ASSERT_GE(util, 0.0) << tier << " utilization missing";
+    ASSERT_GE(eligible, 0.0) << tier << " put_eligible missing";
+    // The watermark comparison reads this one, so its absence is what made a
+    // drain unobservable even with the aggregate gauges present.
+    ASSERT_GE(peak, 0.0) << tier << " peak_member_utilization missing";
+    EXPECT_LE(peak, 1.0);
+    EXPECT_NEAR(used + avail, total, 16.0);
+    EXPECT_NEAR(util, used / total, 1e-3);
+  }
+
+  // Only the entry tier takes new PUTs; cold is reachable by offload alone.
+  EXPECT_EQ(ParseMetricValue(body, "mori_umbp_client_logical_tier_put_eligible", hot), 1.0);
+  EXPECT_EQ(ParseMetricValue(body, "mori_umbp_client_logical_tier_put_eligible", cold), 0.0);
+}
+
 }  // namespace
 }  // namespace mori::umbp
 
 int main(int argc, char** argv) {
   // Must be set before any GetEnvSeconds("UMBP_HEARTBEAT_TTL_SEC") static
-  // is initialized.  TTL=1s → recommended interval ≈ 500ms, which the
-  // metrics flush thread reuses.
+  // is initialized. TTL=1s keeps the real-server heartbeat tests short.
   ::setenv("UMBP_HEARTBEAT_TTL_SEC", "1", 1);
+  // MetricsReportIntervalMs() caches this on the first MasterClient
+  // construction. A short interval keeps the mock-server buffering tests
+  // deterministic without sleeping for the production default of one second.
+  ::setenv("UMBP_METRICS_REPORT_INTERVAL_MS", "10", 1);
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
