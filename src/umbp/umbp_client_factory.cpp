@@ -71,6 +71,30 @@ uint64_t EmbeddedPageSize() {
   return static_cast<uint64_t>(parsed);
 }
 
+// Shrink the page to something the pool can actually hold.
+//
+// The pool is paged and the allocator hands out whole pages, so a page larger
+// than the pool means ZERO pages -- and then every put fails with NO_SPACE,
+// silently, because a failed put is a legal answer rather than an error.  The
+// deleted local backend allocated exact sizes and had no such cliff, so a
+// small pool that used to work would simply stop working.  Fit instead, and
+// say so.
+uint64_t FitPageSizeToPool(uint64_t requested, uint64_t capacity_bytes) {
+  constexpr uint64_t kMinPages = 8;  // a pool that holds fewer is not a cache
+  constexpr uint64_t kMinPageSize = 4096;
+  if (capacity_bytes == 0 || requested <= capacity_bytes / kMinPages) return requested;
+
+  uint64_t fitted = kMinPageSize;
+  while (fitted * 2 <= capacity_bytes / kMinPages) fitted *= 2;
+  if (fitted >= requested) return requested;
+  MORI_UMBP_WARN(
+      "[UMBP] embedded page size {} KiB does not fit a {} MiB pool; using {} KiB "
+      "so the pool holds at least {} pages. Size the pool for the page (or set "
+      "UMBP_EMBEDDED_DRAM_PAGE_SIZE) to choose deliberately.",
+      requested / 1024, capacity_bytes / (1024 * 1024), fitted / 1024, kMinPages);
+  return fitted;
+}
+
 }  // namespace
 
 UMBPConfig WithEmbeddedDefaults(const UMBPConfig& config) {
@@ -102,7 +126,7 @@ UMBPConfig WithEmbeddedDefaults(const UMBPConfig& config) {
   // true and would silently make every unconfigured caller an SSD node.
   // Serving SSD is an explicit choice -- set distributed.medium.
   dist.medium = UMBPMedium::DRAM;
-  dist.dram_page_size = EmbeddedPageSize();
+  dist.dram_page_size = FitPageSizeToPool(EmbeddedPageSize(), out.dram.capacity_bytes);
 
   // Nothing can be remote, so every remote-path resource is off: no ranged
   // scratch arenas to allocate or register, and no re-cache of fetches that
