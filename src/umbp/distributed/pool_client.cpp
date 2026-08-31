@@ -539,11 +539,6 @@ std::vector<PoolResolvedEntry> ResolveLocalBatchWithBusyRetry(
   }
 }
 
-inline uint64_t LogicalPageBytes(size_t i, size_t num_pages, uint64_t page_size,
-                                 size_t total_size) {
-  return (i + 1 == num_pages) ? (total_size - i * page_size) : page_size;
-}
-
 // Classify a caller's buffer so engine selection can see what it really is.
 //
 // An unregistered pointer used to be described unconditionally as host bytes,
@@ -3475,14 +3470,10 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
   if (workload_recorder_ != nullptr) {
     std::vector<benchmark::WorkloadTraceOutcome> recorded(results.size());
     for (size_t i = 0; i < results.size(); ++i) {
-      // No route means the master had no location for the key: a cache miss,
-      // which is workload information. Anything else that failed is a fault.
       recorded[i] = results[i] ? benchmark::WorkloadTraceOutcome::kSuccess
-                    : (i < routes.size() && !routes[i].has_value())
-                        ? benchmark::WorkloadTraceOutcome::kMiss
-                        : benchmark::WorkloadTraceOutcome::kFailure;
+                               : benchmark::WorkloadTraceOutcome::kFailure;
     }
-    workload_recorder_->RecordBatchGet(keys, sizes, recorded);
+    workload_recorder_->RecordBatchPut(keys, object_sizes, recorded);
   }
   return results;
 }
@@ -4326,42 +4317,32 @@ void PoolClient::PublishComponentMetrics() {
   // labels above collapse every instance of a medium into one series, which
   // hides which tier actually served a read.
   if (default_pool_ != nullptr) {
-    // Same absolute-to-delta rebasing as the backend counters above; these are
-    // cumulative and AddCounter takes an increment.
-    const auto publish = [&](const char* name, const char* help,
-                             MasterClient::Labels labels, uint64_t value) {
-      std::string id = "pool";
-      id += '\0';
-      id += name;
-      for (const auto& [k, v] : labels) {
-        id += '\0';
-        id += k;
-        id += '=';
-        id += v;
-      }
-      uint64_t& last = backend_counter_last_[id];
-      if (value > last) {
-        master_client_->AddCounter(name, help, labels, static_cast<double>(value - last));
-      }
-      last = value;
+    std::vector<MetricSample> samples;
+    const auto sample = [&samples](const char* name, const char* help,
+                                   MetricLabels labels, uint64_t value) {
+      samples.push_back(MetricSample{name, help, std::move(labels), value});
     };
 
     const TierTransitionMetrics tiers = default_pool_->TransitionMetrics();
-    publish(MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS, MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS_HELP,
-            {{"outcome", "attempted"}}, tiers.attempted);
-    publish(MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS, MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS_HELP,
-            {{"outcome", "succeeded"}}, tiers.succeeded);
-    publish(MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS, MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS_HELP,
-            {{"outcome", "failed"}}, tiers.failed);
-    publish(MORI_UMBP_METRIC_CLIENT_TIER_OFFLOADED_BYTES,
-            MORI_UMBP_METRIC_CLIENT_TIER_OFFLOADED_BYTES_HELP, {}, tiers.offloaded_bytes);
-    publish(MORI_UMBP_METRIC_CLIENT_TIER_PROMOTED_BYTES,
-            MORI_UMBP_METRIC_CLIENT_TIER_PROMOTED_BYTES_HELP, {}, tiers.promoted_bytes);
+    sample(MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS,
+           MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS_HELP,
+           {{"outcome", "attempted"}}, tiers.attempted);
+    sample(MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS,
+           MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS_HELP,
+           {{"outcome", "succeeded"}}, tiers.succeeded);
+    sample(MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS,
+           MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS_HELP,
+           {{"outcome", "failed"}}, tiers.failed);
+    sample(MORI_UMBP_METRIC_CLIENT_TIER_OFFLOADED_BYTES,
+           MORI_UMBP_METRIC_CLIENT_TIER_OFFLOADED_BYTES_HELP, {}, tiers.offloaded_bytes);
+    sample(MORI_UMBP_METRIC_CLIENT_TIER_PROMOTED_BYTES,
+           MORI_UMBP_METRIC_CLIENT_TIER_PROMOTED_BYTES_HELP, {}, tiers.promoted_bytes);
 
     for (const auto& [tier, hits] : default_pool_->TierReadHits()) {
-      publish(MORI_UMBP_METRIC_CLIENT_TIER_READ_HITS, MORI_UMBP_METRIC_CLIENT_TIER_READ_HITS_HELP,
-              {{"tier", tier}}, hits);
+      sample(MORI_UMBP_METRIC_CLIENT_TIER_READ_HITS,
+             MORI_UMBP_METRIC_CLIENT_TIER_READ_HITS_HELP, {{"tier", tier}}, hits);
     }
+    metric_publisher_.Publish("pool", {}, samples, sink);
   }
 }
 

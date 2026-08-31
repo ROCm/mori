@@ -138,14 +138,16 @@ uint64_t PeerSsdManager::SizeOf(const std::string& key) const {
 bool PeerSsdManager::PinForMigration(const std::string& key) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (owned_.find(key) == owned_.end() || evicting_.count(key) != 0) return false;
-  ++inflight_reads_[key];
+  auto& slot = inflight_reads_[key];
+  if (!slot) slot = std::make_unique<InflightRead>();
+  ++slot->refs;
   return true;
 }
 
 void PeerSsdManager::UnpinForMigration(const std::string& key) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto it = inflight_reads_.find(key);
-  if (it != inflight_reads_.end() && --it->second <= 0) inflight_reads_.erase(it);
+  if (it != inflight_reads_.end() && --it->second->refs <= 0) inflight_reads_.erase(it);
   if (inflight_reads_.empty()) reads_drained_cv_.notify_all();
 }
 
@@ -233,7 +235,9 @@ bool PeerSsdManager::Write(const std::string& key,
     }
     // Keep the just-written key out of this write's own watermark victim set.
     // A successful Write must imply the key still exists when it returns.
-    ++inflight_reads_[key];
+    auto& slot = inflight_reads_[key];
+    if (!slot) slot = std::make_unique<InflightRead>();
+    ++slot->refs;
   }
 
   // Check-after-write trigger, on this copy worker (no dedicated thread).

@@ -77,6 +77,7 @@ class InstrumentedBackend final : public MediumBackend {
   // ---- control plane ----
   TierCapacity Capacity() const override { return inner_->Capacity(); }
   uint64_t OwnedKeyCount() const override { return inner_->OwnedKeyCount(); }
+  bool Contains(const std::string& key) const override { return inner_->Contains(key); }
   std::vector<KvEvent> DrainPendingEvents() override { return inner_->DrainPendingEvents(); }
   std::vector<KvEvent> SnapshotOwnedKeys() const override { return inner_->SnapshotOwnedKeys(); }
   std::vector<KvEvent> SnapshotOwnedKeysForFullSync() override {

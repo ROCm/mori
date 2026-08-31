@@ -637,10 +637,10 @@ TEST_F(PoolClientLocalByteTrackingTest, BackendAndTransferSeriesReachPrometheus)
     return -1.0;
   };
 
-  // The medium is a LABEL on a shared metric name.  DRAM is what this fixture
-  // configures; no assertion here knows anything else about it, which is the
-  // property that lets a new backend reuse these series and these panels.
-  const std::vector<std::string> dram = {"tier=\"DRAM\"", "backend=\"PageBackend\""};
+  // The medium and named backend instance are labels on shared metric names.
+  // Legacy one-backend configuration lowers to the stable instance name
+  // "dram"; explicit multi-backend policies use their configured names.
+  const std::vector<std::string> dram = {"tier=\"DRAM\"", "backend=\"dram\""};
 
   auto with = [&dram](std::vector<std::string> extra) {
     std::vector<std::string> out = dram;
