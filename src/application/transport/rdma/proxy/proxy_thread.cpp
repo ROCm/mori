@@ -93,6 +93,13 @@ void ProxyThread::DrainCq(ProxyQpHandle& qph) {
   int n;
   while ((n = ibv_poll_cq(qph.cq, 64, wc)) > 0) {
     for (int i = 0; i < n; i++) {
+      if (wc[i].wr_id & PROXY_WRID_INTERNAL) {
+        if (wc[i].status != IBV_WC_SUCCESS) {
+          MORI_APP_ERROR("proxy: internal reply SEND failed status={} ({})", wc[i].status,
+                         ibv_wc_status_str(wc[i].status));
+        }
+        continue;
+      }
       if (wc[i].status != IBV_WC_SUCCESS) {
         if (wc[i].opcode & IBV_WC_RECV) {
           MORI_APP_ERROR("proxy: RECV CQE error status={} ({}) ibvQP={}", wc[i].status,
@@ -158,6 +165,7 @@ void ProxyThread::DrainCq(ProxyQpHandle& qph) {
               rsge.addr = reinterpret_cast<uintptr_t>(&reply_buf.data[0]);
               rsge.length = 16;
               ibv_send_wr rwr{}, *rbad = nullptr;
+              rwr.wr_id = PROXY_WRID_INTERNAL;
               rwr.opcode = IBV_WR_SEND_WITH_IMM;
               rwr.imm_data = htonl(PROXY_IMM_ATOMIC_REPLY);
               rwr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
