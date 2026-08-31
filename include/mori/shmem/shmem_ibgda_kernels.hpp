@@ -332,14 +332,8 @@ inline __device__ void ShmemQuietThreadKernelPsdImpl(int pe, int qpId) {
   }
 }
 
-// Drain a collapsed CQ (cc=1, oi=1) and advance wq.doneIdx. The NIC keeps the
-// latest completion in CQE[0]; reconstruct the 32-bit completion from the 16-bit
-// wqe_counter against doneIdx (a lower bound, since outstanding < sqWqeNum <
-// 65536). Lock-free / multi-warp safe via atomicMax on doneIdx.
-//
-// DrainToLive=false: exit at a snapshot of dbTouchIdx (recycle gate -- just free
-// some slots). true: re-read the live postIdx and wait until every reserved WQE
-// has completed, so no send can still be reading its source (final quiet).
+// Collapsed CQ (cc=1): NIC keeps the latest completion in CQE[0]; rebuild doneIdx from
+// wqe_counter. Caller must hold pollCqLock (see ShmemQuietThreadKernelMlnxImpl).
 template <bool DrainToLive = false>
 inline __device__ void Mlx5CollapsedCqDrain(core::WorkQueueHandle& wq,
                                             core::CompletionQueueHandle& cq) {
@@ -350,11 +344,10 @@ inline __device__ void Mlx5CollapsedCqDrain(core::WorkQueueHandle& wq,
   if (cons >= exitTarget) return;
 
   volatile core::Mlx5Cqe64* cqe = reinterpret_cast<volatile core::Mlx5Cqe64*>(cq.cqAddr);
-  // Device scope: CQE read fresh via volatile from the uncached CQ; doneIdx is a
-  // GPU-only counter. Nothing here orders memory the NIC reads.
   __threadfence();
 
   do {
+    uint32_t prevCons = cons;
     uint16_t wqeCounter = BE16TOH(cqe->wqe_counter);
     uint8_t opcode =
         (reinterpret_cast<volatile uint8_t*>(cq.cqAddr)[sizeof(core::Mlx5Cqe64) - 1]) >> 4;
@@ -366,19 +359,16 @@ inline __device__ void Mlx5CollapsedCqDrain(core::WorkQueueHandle& wq,
       return;
     }
 
-    // Rebuild the 32-bit completion from the 16-bit wqe_counter via the forward
-    // delta, bounded by outstanding (<65536) to drop stale CQEs sitting behind cons.
     uint16_t comp16 = static_cast<uint16_t>(wqeCounter + 1);
     uint16_t delta = static_cast<uint16_t>(comp16 - static_cast<uint16_t>(cons));
-    uint32_t live = __hip_atomic_load(&wq.postIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    uint32_t window = live - cons;
-    uint32_t completed = cons;
-    if (delta != 0 && delta <= window) {
-      completed = cons + delta;
+    uint32_t bound =
+        DrainToLive ? __hip_atomic_load(&wq.postIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)
+                    : __hip_atomic_load(&wq.dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    if (delta != 0 && static_cast<int32_t>(delta) <= static_cast<int32_t>(bound - cons)) {
+      __hip_atomic_fetch_max(&wq.doneIdx, cons + delta, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
-
-    __hip_atomic_fetch_max(&wq.doneIdx, completed, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     cons = __hip_atomic_load(&wq.doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    if (cons == prevCons) break;
     if constexpr (DrainToLive) {
       exitTarget = __hip_atomic_load(&wq.postIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
@@ -386,14 +376,34 @@ inline __device__ void Mlx5CollapsedCqDrain(core::WorkQueueHandle& wq,
   __threadfence();
 }
 
+// Collapsed CQ (cc=1): lane 0 drains under pollCqLock; retry final quiet when CQE[0]
+// makes no progress.
 template <bool DrainToLive = false>
 inline __device__ void ShmemQuietThreadKernelMlnxImpl(int pe, int qpId) {
+  if (core::GetActiveLaneNum() != 0) return;
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle& wq = ep[epIndex].wqHandle;
   core::CompletionQueueHandle& cq = ep[epIndex].cqHandle;
-  Mlx5CollapsedCqDrain<DrainToLive>(wq, cq);
+
+  while (true) {
+    if constexpr (DrainToLive) {
+      uint32_t done = __hip_atomic_load(&wq.doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      uint32_t post = __hip_atomic_load(&wq.postIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      if (done >= post) return;
+    }
+    if (__hip_atomic_load(&cq.pollCqLock, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) == 0 &&
+        core::AcquireLockOnce(&cq.pollCqLock)) {
+      Mlx5CollapsedCqDrain<DrainToLive>(wq, cq);
+      core::ReleaseLock(&cq.pollCqLock);
+      if constexpr (DrainToLive) {
+        continue;
+      }
+      return;
+    }
+    if constexpr (!DrainToLive) return;
+  }
 }
 
 // DrainToLive=false (recycle gate, per-QP): snapshot drain. The caller holds its

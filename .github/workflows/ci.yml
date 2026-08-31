@@ -45,11 +45,22 @@ jobs:
         include:
           - platform: MI355X_AINIC
             runner: [self-hosted, MI355X-AINIC-TW]
+          - platform: MI300X_MLX
+            runner: [self-hosted, 300_mlx_p19_29]
           # Runner 325_bnxt_108 is decommissioned.
           # - platform: MI325X_BNXT
           #   runner: [self-hosted, 325_bnxt_108]
     timeout-minutes: 15
     steps:
+      - name: Fix workspace permissions
+        run: |
+          # Docker pytest/pip runs as root; stale root-owned files break actions/checkout cleanup.
+          WS="${GITHUB_WORKSPACE}"
+          if [ -d "$WS" ]; then
+            $CT run --rm -v "$WS:$WS" "$BASE_IMAGE" \
+              chown -R $(id -u):$(id -g) "$WS" 2>/dev/null || true
+          fi
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -97,6 +108,14 @@ jobs:
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
+          # 8x ConnectX-7 NDR on InfiniBand, so no rdma_sl/rdma_tc: mlx5 applies
+          # both only on the RoCE path. mlx5_8 is deliberately not in
+          # rdma_devices -- it is the 100GbE port behind ens14np0 (the TCP
+          # rendezvous interface), not one of the 8 rails.
+          - platform: MI300X_MLX
+            runner: [self-hosted, 300_mlx_p19_29]
+            rdma_devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+            socket_ifname: ens14np0
           # Runner 325_bnxt_108 is decommissioned.
           # - platform: MI325X_BNXT
           #   runner: [self-hosted, 325_bnxt_108]
@@ -112,6 +131,14 @@ jobs:
       NCCL_SOCKET_IFNAME: ${{ matrix.socket_ifname }}
     timeout-minutes: 45
     steps:
+      - name: Fix workspace permissions
+        run: |
+          WS="${GITHUB_WORKSPACE}"
+          if [ -d "$WS" ]; then
+            $CT run --rm -v "$WS:$WS" "$BASE_IMAGE" \
+              chown -R $(id -u):$(id -g) "$WS" 2>/dev/null || true
+          fi
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -354,6 +381,14 @@ jobs:
           #   gpu_arch: gfx942
     timeout-minutes: 90
     steps:
+      - name: Fix workspace permissions
+        run: |
+          WS="${GITHUB_WORKSPACE}"
+          if [ -d "$WS" ]; then
+            $CT run --rm -v "$WS:$WS" "$BASE_IMAGE" \
+              chown -R $(id -u):$(id -g) "$WS" 2>/dev/null || true
+          fi
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -419,6 +454,14 @@ jobs:
             runner: [self-hosted, MI355X-AINIC-TW]
     timeout-minutes: 30
     steps:
+      - name: Fix workspace permissions
+        run: |
+          WS="${GITHUB_WORKSPACE}"
+          if [ -d "$WS" ]; then
+            $CT run --rm -v "$WS:$WS" "$BASE_IMAGE" \
+              chown -R $(id -u):$(id -g) "$WS" 2>/dev/null || true
+          fi
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -482,6 +525,24 @@ jobs:
             rdma_sl: 3
             rdma_tc: 104
             ct: podman
+            timeout_minutes: 45
+          # 8x ConnectX-7 NDR on InfiniBand, so no rdma_sl/rdma_tc: mlx5 applies
+          # both only on the RoCE path. mlx5_8 is deliberately not in
+          # rdma_devices -- it is the 100GbE port behind ens14np0 (the TCP
+          # rendezvous interface), not one of the 8 rails.
+          # node1 is the runner itself (banff-ccs-aus-p19-29); node2 is the peer
+          # it drives over ssh (banff-ccs-aus-p20-29). Both addresses are the
+          # ens14np0 100GbE port used for TCP rendezvous.
+          - platform: MI300X_MLX
+            runner: [self-hosted, 300_mlx_p19_29]
+            node1_host: 10.194.134.84
+            node2_host: 10.194.132.59
+            node2_port: 22
+            node1_ifname: ens14np0
+            node2_ifname: ens14np0
+            rdma_devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+            ct: docker
+            timeout_minutes: 90
           # Runner 325_bnxt_108 is decommissioned.
           # - platform: MI325X_BNXT
           #   runner: [self-hosted, 325_bnxt_108]
@@ -494,6 +555,7 @@ jobs:
           #   rdma_sl: 3
           #   rdma_tc: 104
           #   ct: docker
+          #   timeout_minutes: 45
     env:
       CT: ${{ matrix.ct }}
       SSH_OPTS: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
@@ -506,8 +568,16 @@ jobs:
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
-    timeout-minutes: 45
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     steps:
+      - name: Fix workspace permissions
+        run: |
+          WS="${GITHUB_WORKSPACE}"
+          if [ -d "$WS" ]; then
+            $CT run --rm -v "$WS:$WS" "$BASE_IMAGE" \
+              chown -R $(id -u):$(id -g) "$WS" 2>/dev/null || true
+          fi
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -537,8 +607,8 @@ jobs:
           $CT rm -f $CONTAINER 2>/dev/null || true
           CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
             -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
-            -e MORI_RDMA_SL=$MORI_RDMA_SL \
-            -e MORI_RDMA_TC=$MORI_RDMA_TC \
+            ${MORI_RDMA_SL:+-e MORI_RDMA_SL=$MORI_RDMA_SL} \
+            ${MORI_RDMA_TC:+-e MORI_RDMA_TC=$MORI_RDMA_TC} \
             -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
             -e GLOO_SOCKET_IFNAME=$NODE1_IFNAME \
             -e NCCL_SOCKET_IFNAME=$NODE1_IFNAME \
@@ -563,8 +633,8 @@ jobs:
             $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev . &&
             CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
               -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
-              -e MORI_RDMA_SL=$MORI_RDMA_SL \
-              -e MORI_RDMA_TC=$MORI_RDMA_TC \
+              ${MORI_RDMA_SL:+-e MORI_RDMA_SL=$MORI_RDMA_SL} \
+              ${MORI_RDMA_TC:+-e MORI_RDMA_TC=$MORI_RDMA_TC} \
               -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
               -e GLOO_SOCKET_IFNAME=$NODE2_IFNAME \
               -e NCCL_SOCKET_IFNAME=$NODE2_IFNAME \
@@ -594,20 +664,20 @@ jobs:
             $CT exec $CONTAINER bash $SCRIPT
             --rank 1 --master-addr $NODE1_HOST --master-port $PORT
             --ifname $NODE2_IFNAME
-            -- --op-type write --transfer-batch-size 128 --all
-            --sweep-start-size 1024 --sweep-max-size 16777216 --iters 4
-            --enable-sess --enable-batch-transfer
-            --num-qp-per-transfer 2
+            -- --op-type write --buffer-size 65536 --transfer-batch-size 256 --all
+            --sweep-start-size 1024 --sweep-max-size 16777216 --iters 128
+            --batch-contiguous --enable-sess --enable-batch-transfer
+            --num-qp-per-transfer 8 --num-worker-threads 8
             --num-initiator-dev 8 --num-target-dev 8
           )
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
           $CT exec $CONTAINER bash $SCRIPT \
             --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
             --ifname $NODE1_IFNAME \
-            -- --op-type write --transfer-batch-size 128 --all \
-            --sweep-start-size 1024 --sweep-max-size 16777216 --iters 4 \
-            --enable-sess --enable-batch-transfer \
-            --num-qp-per-transfer 2 \
+            -- --op-type write --buffer-size 65536 --transfer-batch-size 256 --all \
+            --sweep-start-size 1024 --sweep-max-size 16777216 --iters 128 \
+            --batch-contiguous --enable-sess --enable-batch-transfer \
+            --num-qp-per-transfer 8 --num-worker-threads 8 \
             --num-initiator-dev 8 --num-target-dev 8
           wait
 
@@ -754,6 +824,15 @@ jobs:
             --target-dev-offset 5
           wait
 
+      - name: Reset GPU processes before EP internode bench
+        run: |
+          # IO internode steps leave many short-lived torchrun/mp.spawn workers; if any
+          # linger they keep HIP UAR host mappings and the EP bench hits hipHostRegister
+          # "already mapped" on mlx5. Best-effort cleanup on both nodes.
+          $CT exec $CONTAINER bash -c 'pkill -9 -f "[t]ests\.python\.io\.benchmark" 2>/dev/null || true; pkill -9 -f "[t]est_dispatch_combine_internode" 2>/dev/null || true; sleep 2'
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
+            "$CT exec $CONTAINER bash -c 'pkill -9 -f \"[t]ests\\.python\\.io\\.benchmark\" 2>/dev/null || true; pkill -9 -f \"[t]est_dispatch_combine_internode\" 2>/dev/null || true; sleep 2'"
+
       - name: MORI-EP internode normal kernel bench
         run: |
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
@@ -877,7 +956,8 @@ jobs:
               $CT exec
               -e MORI_ENABLE_SDMA=1 -e MORI_INTERNODE_TIMEOUT=300
               -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES
-              -e MORI_RDMA_SL=$MORI_RDMA_SL -e MORI_RDMA_TC=$MORI_RDMA_TC
+              ${MORI_RDMA_SL:+-e MORI_RDMA_SL=$MORI_RDMA_SL}
+              ${MORI_RDMA_TC:+-e MORI_RDMA_TC=$MORI_RDMA_TC}
               $CONTAINER bash $SCRIPT
               --rank 1 --master-addr $NODE1_HOST --master-port $PORT
               --ifname $NODE2_IFNAME --handle $HANDLE --sizes-mb 8,64
@@ -887,7 +967,8 @@ jobs:
               -e MORI_ENABLE_SDMA=1 \
               -e MORI_INTERNODE_TIMEOUT=300 \
               -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
-              -e MORI_RDMA_SL=$MORI_RDMA_SL -e MORI_RDMA_TC=$MORI_RDMA_TC \
+              ${MORI_RDMA_SL:+-e MORI_RDMA_SL=$MORI_RDMA_SL} \
+              ${MORI_RDMA_TC:+-e MORI_RDMA_TC=$MORI_RDMA_TC} \
               $CONTAINER bash $SCRIPT \
               --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
               --ifname $NODE1_IFNAME --handle $HANDLE --sizes-mb 8,64
@@ -919,6 +1000,14 @@ jobs:
     runs-on: [self-hosted, MI355X-AINIC-TW]
     timeout-minutes: 180
     steps:
+      - name: Fix workspace permissions
+        run: |
+          WS="${GITHUB_WORKSPACE}"
+          if [ -d "$WS" ]; then
+            $CT run --rm -v "$WS:$WS" "$BASE_IMAGE" \
+              chown -R $(id -u):$(id -g) "$WS" 2>/dev/null || true
+          fi
+
       - name: Checkout MoRI
         uses: actions/checkout@v4
         with:

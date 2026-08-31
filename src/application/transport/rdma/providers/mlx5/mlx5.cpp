@@ -25,6 +25,7 @@
 #include <infiniband/verbs.h>
 
 #include <iostream>
+#include <unordered_map>
 
 #include "mori/application/transport/rdma/providers/mlx5/mlx5_ifc.hpp"
 #include "mori/application/transport/rdma/providers/mlx5/mlx5_prm.hpp"
@@ -34,6 +35,54 @@
 
 namespace mori {
 namespace application {
+
+namespace {
+
+// Multiple MLX5 QPs can share the same devx UAR reg_addr. hipHostRegister is
+// once-per-host-range per process; ref-count so we only unregister after the
+// last QP using that address is torn down. hipErrorAlreadyMapped is treated as
+// reuse (e.g. shared UAR page, or a prior registration still visible to HIP).
+struct Mlx5UarHostRegInfo {
+  int refs{0};
+  bool registered{false};  // true only if this process called hipHostRegister successfully
+};
+
+std::unordered_map<void*, Mlx5UarHostRegInfo> g_mlx5_uar_host_regs;
+
+void Mlx5RegisterUarHost(void* reg_addr, size_t size) {
+  auto& info = g_mlx5_uar_host_regs[reg_addr];
+  if (info.refs == 0) {
+    uint32_t flag = hipHostRegisterPortable | hipHostRegisterMapped;
+    hipError_t err = hipHostRegister(reg_addr, size, flag);
+    if (err == hipSuccess) {
+      info.registered = true;
+    } else if (err != hipErrorAlreadyMapped) {
+      fprintf(stderr, "[%s:%d] hip failed with %s \n", __FILE__, __LINE__, hipGetErrorString(err));
+      exit(-1);
+    }
+  }
+  ++info.refs;
+}
+
+void Mlx5UnregisterUarHost(void* reg_addr) {
+  auto it = g_mlx5_uar_host_regs.find(reg_addr);
+  if (it == g_mlx5_uar_host_regs.end()) return;
+  auto& info = it->second;
+  assert(info.refs > 0);
+  if (--info.refs == 0) {
+    if (info.registered) {
+      hipError_t err = hipHostUnregister(reg_addr);
+      if (err != hipSuccess && err != hipErrorHostMemoryNotRegistered) {
+        fprintf(stderr, "[%s:%d] hip failed with %s \n", __FILE__, __LINE__,
+                hipGetErrorString(err));
+        exit(-1);
+      }
+    }
+    g_mlx5_uar_host_regs.erase(it);
+  }
+}
+
+}  // namespace
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Device Attributes                                       */
@@ -290,8 +339,7 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
   assert(qpUar->page_id != 0);
 
   if (config.onGpu) {
-    uint32_t flag = hipHostRegisterPortable | hipHostRegisterMapped;
-    HIP_RUNTIME_CHECK(hipHostRegister(qpUar->reg_addr, QueryHcaCap(context).dbrRegSize, flag));
+    Mlx5RegisterUarHost(qpUar->reg_addr, QueryHcaCap(context).dbrRegSize);
     HIP_RUNTIME_CHECK(hipHostGetDevicePointer(&qpUarPtr, qpUar->reg_addr, 0));
   } else {
     qpUarPtr = qpUar->reg_addr;
@@ -379,12 +427,7 @@ void Mlx5QpContainer::DestroyQueuePair() {
   }
   if (qpUar) {
     if (config.onGpu) {
-      hipPointerAttribute_t attr;
-      HIP_RUNTIME_CHECK(hipPointerGetAttributes(&attr, qpUar->reg_addr));
-      // Multiple qp may share the same uar address, only unregister once
-      if ((attr.type == hipMemoryTypeHost) && (attr.hostPointer != nullptr)) {
-        HIP_RUNTIME_CHECK(hipHostUnregister(qpUar->reg_addr));
-      }
+      Mlx5UnregisterUarHost(qpUar->reg_addr);
     }
     Mlx5DvApi::Instance().devx_free_uar(qpUar);
   }

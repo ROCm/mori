@@ -32,6 +32,15 @@ from tests.python.ops.dispatch_combine_test_utils import (
     run_ep_dispatch_local_expert_count_test,
 )
 
+
+def _combine_fp4_supported():
+    # Packed-FP4 combine needs the gfx950 OCP FP4 conversion instructions.
+    try:
+        return "gfx950" in torch.cuda.get_device_properties(0).gcnArchName
+    except Exception:
+        return False
+
+
 # Kernel-type string → (EpDispatchCombineKernelType, block_num, rdma_block_num, warp_num_per_block)
 _KERNEL_CONFIGS = {
     "internode_v1": (
@@ -342,6 +351,10 @@ def test_blockwise_combine_unsupported_internode(
     kernel_type,
     quant_type,
 ):
+    if quant_type == "fp4_blockwise" and not _combine_fp4_supported():
+        pytest.skip(
+            "fp4_blockwise combine requires a gfx950 GPU (OCP FP4 instructions)"
+        )
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
             (
