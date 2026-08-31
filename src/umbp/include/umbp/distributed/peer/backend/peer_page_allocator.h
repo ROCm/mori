@@ -56,6 +56,23 @@ class PageBitmapAllocator {
     uint32_t total_pages = 0;
     std::vector<bool> bitmap;  // true = page is currently allocated
     uint32_t free_count = 0;
+    // Next-fit cursor: where the last successful search STOPPED.
+    //
+    // Both searches used to restart at index 0 on every Allocate, which is
+    // O(total_pages) per call regardless of how much was already allocated.
+    // That is invisible on a coarse pool and crippling on a fine one: a 64 GiB
+    // pool of 1728 B pages -- what the sglang direct linker mandates, since its
+    // page must not exceed the smallest per-layer object -- has 39.8 MILLION
+    // pages, so every allocation rescanned tens of millions of bits and got
+    // slower as the pool filled.  Measured on an 8-rank embedded deployment:
+    // BatchAllocateSlots was 93.8% of remote put time at ~280 us per page.
+    //
+    // The cursor makes the common case proportional to the run actually
+    // examined rather than to the pool.  Correctness is unaffected: both
+    // searches wrap and still cover every page before reporting failure, so
+    // they find a run exactly when the old scan would have.  Only the CHOSEN
+    // run differs, and no caller depends on which free pages it gets.
+    uint32_t cursor = 0;
   };
 
   // Construct an allocator from a list of per-buffer byte sizes.
@@ -102,6 +119,8 @@ class PageBitmapAllocator {
           pages.push_back({buf.buffer_index, idx});
         }
         buf.free_count -= num_pages;
+        // Resume the next search just past this run.
+        buf.cursor = (*run_start + num_pages) % buf.total_pages;
         return pages;
       }
     }
@@ -118,6 +137,7 @@ class PageBitmapAllocator {
         pages.push_back({buf.buffer_index, idx});
       }
       buf.free_count -= num_pages;
+      if (!idxs.empty()) buf.cursor = (idxs.back() + 1) % buf.total_pages;
       return pages;
     }
 
@@ -187,13 +207,26 @@ class PageBitmapAllocator {
  private:
   // Find a contiguous run of `n` free pages in `buf`.  Returns the starting
   // page_index on success, nullopt if no such run exists.  O(total_pages).
+  // Next-fit: start where the last search stopped and wrap once.  A run may
+  // straddle the wrap point only if it starts before it, so the second pass
+  // scans [0, cursor + n) -- the overlap is what keeps this exhaustive.
   static std::optional<uint32_t> FindContinuousFreeRun(const BufferState& buf, uint32_t n) {
     if (n == 0 || n > buf.total_pages) return std::nullopt;
+    const uint32_t start = buf.cursor < buf.total_pages ? buf.cursor : 0;
     uint32_t run = 0;
-    for (uint32_t i = 0; i < buf.total_pages; ++i) {
+    for (uint32_t i = start; i < buf.total_pages; ++i) {
       if (!buf.bitmap[i]) {
-        ++run;
-        if (run == n) return i + 1 - n;
+        if (++run == n) return i + 1 - n;
+      } else {
+        run = 0;
+      }
+    }
+    run = 0;
+    const uint32_t wrap_end = std::min<uint64_t>(static_cast<uint64_t>(start) + n,
+                                                 static_cast<uint64_t>(buf.total_pages));
+    for (uint32_t i = 0; i < wrap_end; ++i) {
+      if (!buf.bitmap[i]) {
+        if (++run == n) return i + 1 - n;
       } else {
         run = 0;
       }
@@ -206,7 +239,14 @@ class PageBitmapAllocator {
   static std::vector<uint32_t> CollectFirstNFree(const BufferState& buf, uint32_t n) {
     std::vector<uint32_t> result;
     result.reserve(n);
-    for (uint32_t i = 0; i < buf.total_pages && result.size() < n; ++i) {
+    // Same next-fit start as the run search, and the same exhaustiveness
+    // argument: the wrap pass covers [0, start), so together they visit every
+    // page.  free_count >= n is the caller's guarantee that this succeeds.
+    const uint32_t start = buf.cursor < buf.total_pages ? buf.cursor : 0;
+    for (uint32_t i = start; i < buf.total_pages && result.size() < n; ++i) {
+      if (!buf.bitmap[i]) result.push_back(i);
+    }
+    for (uint32_t i = 0; i < start && result.size() < n; ++i) {
       if (!buf.bitmap[i]) result.push_back(i);
     }
     return result;
