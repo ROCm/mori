@@ -1363,6 +1363,25 @@ class UMBPLocalBackend(Backend):
         # rather than inferred from ssd.enabled.  Without this block the client
         # would synthesize an embedded DRAM deployment and an --ssd run would
         # quietly measure DRAM.
+        #
+        # UMBP_LOCAL_FACTORY_DEFAULTS=1 leaves it unnamed on purpose: the
+        # factory then synthesizes the deployment (WithEmbeddedDefaults), which
+        # is the path a caller that configures nothing actually takes.  DRAM
+        # only, since that is what the factory picks.
+        if os.environ.get("UMBP_LOCAL_FACTORY_DEFAULTS", "0") not in ("0", ""):
+            if tier != "dram":
+                raise SystemExit(
+                    "UMBP_LOCAL_FACTORY_DEFAULTS only applies to --tier dram: "
+                    "the factory synthesizes a DRAM deployment."
+                )
+            self._client = UMBPClient(cfg)
+            print(
+                "embedded via factory defaults: "
+                f"mode={self._client.get_deployment_mode()} "
+                f"ranged={self._client.supports_ranged_io()}",
+                flush=True,
+            )
+            return
         dist = UMBPDistributedConfig()
         dist.master_config.node_id = f"umbp-bench-local-{os.getpid()}"
         dist.master_config.node_address = "127.0.0.1"
