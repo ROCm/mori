@@ -377,7 +377,12 @@ class PoolClient {
   // a pages vector and a descs vector it never reads (measured 6-15%).
   //
   // One pool batch preserves placement/read-order, tier touches, and promotion
-  // semantics while avoiding one resolve call per key.
+  // semantics while avoiding one resolve call per key. A layer-wise restore
+  // asks about the SAME key set once per layer group; once PeerPool has
+  // learned each key's placement (after the first call) every later call for
+  // that set routes whole to one backend, which is what lets that backend's
+  // own resolve cache -- see PageBackend::BatchResolveShared -- serve it
+  // without rehashing or re-walking its map.
   void ResolveLocalBatch(const std::vector<std::string>& keys,
                          const std::vector<size_t>& candidates,
                          std::vector<MediumBackend*>* holders,

@@ -509,6 +509,105 @@ TEST(PageBackend, BatchResolveMixedHitsAndMisses) {
   EXPECT_FALSE(results[3].found);
 }
 
+// The dangerous case for a cached resolve: a key is evicted and its pages are
+// handed to a DIFFERENT key.  Anything reusing the old answer would hand back
+// page locations that now belong to someone else -- correct-looking, silently
+// wrong.  Assert the observable thing (the page list is the new key's own),
+// not that some counter moved.
+TEST(PageBackend, ResolveAfterEvictAndReuseDoesNotServeTheOldPageList) {
+  auto a = std::make_unique<PageBackend>(TierType::DRAM, kPageSize, MakeDramCfg(),
+                                         /*pending_ttl=*/std::chrono::milliseconds{5000},
+                                         /*read_lease_ttl=*/std::chrono::milliseconds{0});
+  uint64_t committed = 0;
+  auto p_a = AllocateOk(*a, "alpha", kPageSize);
+  ASSERT_TRUE(p_a.has_value());
+  ASSERT_TRUE(a->Commit(p_a->slot_id, "alpha", committed));
+
+  // Warm the cache for this exact key set.
+  auto first = a->BatchResolve({"alpha"}, /*include_descs=*/false);
+  ASSERT_EQ(first.size(), 1u);
+  ASSERT_TRUE(first[0].found);
+  const auto alpha_pages = first[0].pages;
+  ASSERT_FALSE(alpha_pages.empty());
+
+  // Zero lease TTL, so eviction is allowed to take it immediately.
+  auto evicted = a->Evict({"alpha"});
+  ASSERT_EQ(evicted.size(), 1u);
+  ASSERT_GT(evicted[0].bytes_freed, 0u);
+
+  // The freed pages are the only ones available, so beta gets them.
+  auto p_b = AllocateOk(*a, "beta", kPageSize);
+  ASSERT_TRUE(p_b.has_value());
+  ASSERT_TRUE(a->Commit(p_b->slot_id, "beta", committed));
+
+  // Same key set as the warmed entry -- and alpha must now be a miss, not the
+  // page list beta is using.
+  auto again = a->BatchResolve({"alpha"}, /*include_descs=*/false);
+  ASSERT_EQ(again.size(), 1u);
+  EXPECT_FALSE(again[0].found) << "evicted key served from a stale cached resolve";
+
+  auto beta = a->BatchResolve({"beta"}, /*include_descs=*/false);
+  ASSERT_EQ(beta.size(), 1u);
+  ASSERT_TRUE(beta[0].found);
+  EXPECT_EQ(beta[0].pages, alpha_pages) << "test is not exercising page reuse";
+}
+
+// Repeating a key set must return the same answer every time -- that is the
+// whole point -- and it must still see a key committed in between.
+TEST(PageBackend, RepeatedResolveOfOneKeySetStaysCorrectAcrossCommits) {
+  auto a = std::make_unique<PageBackend>(TierType::DRAM, kPageSize, MakeDramCfg(),
+                                         /*pending_ttl=*/std::chrono::milliseconds{5000},
+                                         /*read_lease_ttl=*/std::chrono::milliseconds{5000});
+  uint64_t committed = 0;
+  auto p_x = AllocateOk(*a, "x", kPageSize);
+  ASSERT_TRUE(p_x.has_value());
+  ASSERT_TRUE(a->Commit(p_x->slot_id, "x", committed));
+
+  const std::vector<std::string> batch = {"x", "y"};
+  auto r1 = a->BatchResolve(batch, /*include_descs=*/false);
+  ASSERT_EQ(r1.size(), 2u);
+  EXPECT_TRUE(r1[0].found);
+  EXPECT_FALSE(r1[1].found);
+
+  // Second pass over the identical key set: same answer.
+  auto r2 = a->BatchResolve(batch, /*include_descs=*/false);
+  ASSERT_EQ(r2.size(), 2u);
+  EXPECT_TRUE(r2[0].found);
+  EXPECT_EQ(r2[0].pages, r1[0].pages);
+  EXPECT_FALSE(r2[1].found);
+
+  // y appears; the repeat must pick it up rather than replay "not found".
+  auto p_y = AllocateOk(*a, "y", kPageSize);
+  ASSERT_TRUE(p_y.has_value());
+  ASSERT_TRUE(a->Commit(p_y->slot_id, "y", committed));
+  auto r3 = a->BatchResolve(batch, /*include_descs=*/false);
+  ASSERT_EQ(r3.size(), 2u);
+  EXPECT_TRUE(r3[0].found);
+  EXPECT_TRUE(r3[1].found) << "a key committed after the batch was first resolved was missed";
+}
+
+// include_descs is part of the answer's shape, so the two forms must not be
+// served from one another.
+TEST(PageBackend, ResolveDoesNotServeDescsFromADescLessAnswer) {
+  auto a = std::make_unique<PageBackend>(TierType::DRAM, kPageSize, MakeDramCfg(),
+                                         /*pending_ttl=*/std::chrono::milliseconds{5000},
+                                         /*read_lease_ttl=*/std::chrono::milliseconds{5000});
+  uint64_t committed = 0;
+  auto p = AllocateOk(*a, "k", kPageSize);
+  ASSERT_TRUE(p.has_value());
+  ASSERT_TRUE(a->Commit(p->slot_id, "k", committed));
+
+  auto without = a->BatchResolve({"k"}, /*include_descs=*/false);
+  ASSERT_EQ(without.size(), 1u);
+  ASSERT_TRUE(without[0].found);
+  EXPECT_TRUE(without[0].descs.empty());
+
+  auto with = a->BatchResolve({"k"}, /*include_descs=*/true);
+  ASSERT_EQ(with.size(), 1u);
+  ASSERT_TRUE(with[0].found);
+  EXPECT_FALSE(with[0].descs.empty()) << "descs request served from a desc-less cached answer";
+}
+
 TEST(PageBackend, BatchResolveExtendsLeaseForHitsOnly) {
   auto a = std::make_unique<PageBackend>(TierType::DRAM, kPageSize, MakeDramCfg(),
                                          /*pending_ttl=*/std::chrono::milliseconds{5000},
