@@ -347,12 +347,26 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
   finishedWarp = __shfl(finishedWarp, 0);
   if ((finishedWarp + 1) == (args.rdmaBlockNum * warpNum)) {
     if (laneId < nNodes) {
-      int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
-      index_t numTokenSignal =
-          core::AtomicLoadRelaxed(args.blockFlagCounter + laneId) * warpSize + 1;
-      shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(args.nodeRecvTokenNumMemObj,
-                                                     myNode * sizeof(uint64_t), numTokenSignal,
-                                                     core::AMO_ADD, proxyPe);
+      // nodeRecvTokenNum lets the peer tell "this chunk slot will never be
+      // signalled" apart from "it has not arrived yet", and tells combine how
+      // far to iterate. Both only need it when we left a slot unsignalled: if
+      // every slot the peer looks at got a signal from a put, its poll always
+      // terminates on chunkFlag and combine can use the static maxChunkNum
+      // bound. chunksSent <= maxChunkNum always holds, so equality means full
+      // coverage.
+      //
+      // Worth the branch because this is a second GPU-initiated RDMA atomic
+      // issued by the warp that just issued the put, and it sits on the critical
+      // path -- measured at ~3.3us of the send phase. At 4-32 tokens/rank one
+      // chunk covers everything, so it is always skipped there.
+      index_t chunksSent = core::AtomicLoadRelaxed(args.blockFlagCounter + laneId);
+      if (chunksSent < maxChunkNum) {
+        int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
+        index_t numTokenSignal = chunksSent * warpSize + 1;
+        shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(args.nodeRecvTokenNumMemObj,
+                                                       myNode * sizeof(uint64_t), numTokenSignal,
+                                                       core::AMO_ADD, proxyPe);
+      }
     }
     if (laneId == 0) args.interNodeBlocksBarrier[1] = 0;
   }
@@ -1110,8 +1124,14 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs<T>
   int rdmaWarpNum = args.rdmaBlockNum * warpNum;
   for (int n = 0; n < (nNodes - 1); n++) {
     int node = (myNode + n + 1) % nNodes;
+    // The sender only signals nodeRecvTokenNum when it left a chunk slot without
+    // a signal (see DispatchInterNodeLLSend). A zero therefore means "every slot
+    // was signalled", not "nothing arrived", and the static maxChunkNum bound is
+    // the right one -- slots with no data read chunkFlag == 0 and are skipped
+    // inside the loop either way.
     uint64_t nodeCount = nodeRecvTokenNum[node];
-    if (nodeCount > 0) nodeCount -= 1;
+    nodeCount =
+        (nodeCount > 0) ? (nodeCount - 1) : static_cast<uint64_t>(maxChunkNum) * warpSize;
     if (nodeCount == 0) continue;
 
     // One whole vector step per warp. warpsPerToken was a fixed 4, which for
