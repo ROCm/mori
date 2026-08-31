@@ -450,6 +450,12 @@ std::vector<bool> StandaloneProcessClient::BatchGet(const std::vector<std::strin
 
 uint64_t StandaloneProcessClient::LookupKeyHandle(const std::vector<std::string>& keys,
                                                   uint64_t* fingerprint) {
+  // Nothing to name, and nothing worth remembering: a zero fingerprint tells
+  // the server not to mint a handle for it.
+  if (keys.empty()) {
+    *fingerprint = 0;
+    return 0;
+  }
   {
     std::lock_guard<std::mutex> lock(key_handle_mu_);
     for (size_t i = 0; i < key_handles_.size(); ++i) {
@@ -457,7 +463,7 @@ uint64_t StandaloneProcessClient::LookupKeyHandle(const std::vector<std::string>
       // a different set outright; the full compare runs only for the set that
       // is about to be a hit, and is what makes the match exact.
       const KeyHandle& entry = key_handles_[i];
-      if (entry.keys.size() != keys.size() || keys.empty()) continue;
+      if (entry.keys.size() != keys.size()) continue;
       if (entry.keys.front() != keys.front() || entry.keys.back() != keys.back()) continue;
       if (entry.keys != keys) continue;
       *fingerprint = entry.fingerprint;
