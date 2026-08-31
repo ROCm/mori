@@ -93,9 +93,11 @@ void ccoSdmaSetupCommQueues(ccoComm* comm, int requestedChannels) {
   comm->ctx->EnsureSdmaTransport(requestedChannels);
   comm->sdmaNumQueue = comm->ctx->SdmaChannels();
 
-  // sdmaDevHandles is lsaSize × sdmaNumQueue, indexed by lsaRank. Assumes ranks
-  // bind 1:1 to GPUs within a node (rank lsa ⇒ GPU lsa).
-  int srcDeviceId = comm->hipDev;
+  // sdmaDevHandles is lsaSize × sdmaNumQueue, indexed by lsaRank (kernel-facing
+  // logical slot). The anvil queue lookup, however, is keyed on the host-global
+  // KFD node id of each GPU (exchanged in Context), so it stays correct even
+  // under sliced HIP_VISIBLE_DEVICES where HIP ordinals diverge from topology.
+  int srcNode = comm->ctx->LocalKfdNode();
   size_t numSlots = static_cast<size_t>(comm->lsaSize) * comm->sdmaNumQueue;
   HIP_RUNTIME_CHECK(hipMalloc(&comm->sdmaDevHandles, numSlots * sizeof(ccoSdmaQueueDeviceHandle*)));
   HIP_RUNTIME_CHECK(
@@ -104,11 +106,11 @@ void ccoSdmaSetupCommQueues(ccoComm* comm, int requestedChannels) {
   for (int lsa = 0; lsa < comm->lsaSize; lsa++) {
     int pe = comm->myNodeStart + lsa;
     if (!comm->ctx->GetPeerCapabilities(pe).canSDMA) continue;
-    int dstDeviceId = lsa;
+    int dstNode = comm->ctx->KfdNodeId(pe);
     for (int q = 0; q < comm->sdmaNumQueue; q++) {
       // anvil returns its own SdmaQueueDeviceHandle*; cco stores it as an opaque
       // ccoSdmaQueueDeviceHandle* (layout-compatible, byte-copied by sizeof).
-      auto* handle = anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
+      auto* handle = anvil::anvil.getSdmaQueue(srcNode, dstNode, q)->deviceHandle();
       HIP_RUNTIME_CHECK(hipMemcpy(&comm->sdmaDevHandles[lsa * comm->sdmaNumQueue + q], &handle,
                                   sizeof(handle), hipMemcpyHostToDevice));
     }

@@ -29,7 +29,10 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <string>
@@ -145,6 +148,8 @@ void Context::BuildInitialEndpoints() {
 
 Context::~Context() {}
 
+namespace {
+
 std::string GetLocalIP() {
   struct ifaddrs *ifaddr, *ifa;
   char host[NI_MAXHOST];
@@ -178,6 +183,8 @@ std::string GetLocalIP() {
   return localIP;
 }
 
+}  // namespace
+
 bool Context::CanUseP2P(int destRank) const {
   if (destRank == LocalRank()) {
     return false;  // Cannot use P2P with self
@@ -197,51 +204,50 @@ void Context::CollectHostNames() {
   gethostname(hostname, HOST_NAME_MAX);
   myHostname = std::string(hostname);
 
+  int hipDev = 0;
+  HIP_RUNTIME_CHECK(hipGetDevice(&hipDev));
   // Key co-location on node id, not hostname: identical hostnames would mark
   // cross-node ranks as co-located, over-counting rankInNode (trips assert below).
   std::string nodeId = ResolveNodeId(myHostname);
+  // Allgather a fixed-layout {pid, kfdNodeId, railFlag, nodeId} record.
+  struct Pack {
+    pid_t pid;
+    int32_t kfdNodeId;
+    bool railFlag;
+    char nodeId[256];
+  } my = {
+      .pid = getpid(),
+      // Local GPU's KFD node id (host-global, HIP_VISIBLE_DEVICES-independent). Used
+      // as the stable key for wiring SDMA queues to same-host peers.
+      .kfdNodeId = anvil::anvil.kfdNodeIdForHipDevice(hipDev),
+      .railFlag =
+          env::IsEnvVarEnabled("MORI_ENABLE_RAIL_ONLY") || env::IsEnvVarEnabled("MORI_ENABLE_RAIL"),
+  };
+  snprintf(my.nodeId, sizeof(my.nodeId), "%s", nodeId.c_str());
 
-  // Allgather a fixed-layout {pid, railFlag, nodeId} record.
-  constexpr int kPidSize = sizeof(pid_t);
-  constexpr int kFlagSize = sizeof(uint8_t);
-  constexpr int kStrMax = 256;
-  constexpr int kRecordSize = kPidSize + kFlagSize + kStrMax;
+  std::vector<Pack> global(WorldSize());
+  bootNet.Allgather(&my, global.data(), sizeof(Pack));
 
-  pid_t myPid = getpid();
-  uint8_t myRailFlag =
-      env::IsEnvVarEnabled("MORI_ENABLE_RAIL_ONLY") || env::IsEnvVarEnabled("MORI_ENABLE_RAIL");
-  char localBuffer[kRecordSize] = {};
-  memcpy(localBuffer, &myPid, kPidSize);
-  memcpy(localBuffer + kPidSize, &myRailFlag, kFlagSize);
-  snprintf(localBuffer + kPidSize + kFlagSize, kStrMax, "%s", nodeId.c_str());
-
-  std::vector<char> global(kRecordSize * WorldSize());
-  bootNet.Allgather(localBuffer, global.data(), kRecordSize);
-
-  std::string myNodeId(localBuffer + kPidSize + kFlagSize);
   peerInfos.resize(WorldSize());
   std::map<std::string, int> seenPerNode;
   bool anyRailMismatch = false;
   for (int i = 0; i < WorldSize(); i++) {
-    const char* rec = global.data() + i * kRecordSize;
-    pid_t peerPid;
-    memcpy(&peerPid, rec, kPidSize);
-    uint8_t peerRailFlag;
-    memcpy(&peerRailFlag, rec + kPidSize, kFlagSize);
-    std::string peerNodeId(rec + kPidSize + kFlagSize);
-    peerInfos[i].sameHost = (peerNodeId == myNodeId);
-    peerInfos[i].sameProcess = peerInfos[i].sameHost && (peerPid == myPid);
+    const Pack& other = global[i];
+    std::string peerNodeId(other.nodeId);
+    peerInfos[i].sameHost = (peerNodeId == my.nodeId);
+    peerInfos[i].sameProcess = peerInfos[i].sameHost && (other.pid == my.pid);
     peerInfos[i].rankInNode = seenPerNode[peerNodeId]++;
-    if (peerRailFlag != myRailFlag) {
+    peerInfos[i].kfdNodeId = other.kfdNodeId;
+    if (other.railFlag != my.railFlag) {
       MORI_APP_ERROR("MORI_ENABLE_RAIL_ONLY mismatch: rank {} has {}={}, this rank ({}) has {}", i,
-                     peerRailFlag ? "on" : "off", peerRailFlag, LocalRank(),
-                     myRailFlag ? "on" : "off");
+                     other.railFlag ? "on" : "off", other.railFlag, LocalRank(),
+                     my.railFlag ? "on" : "off");
       anyRailMismatch = true;
     }
     if (LocalRank() == 0) {
-      MORI_APP_TRACE("rank {} nodeId={} pid={} rankInNode={} sameHost={} sameProcess={}", i,
-                     peerNodeId, peerPid, peerInfos[i].rankInNode, peerInfos[i].sameHost,
-                     peerInfos[i].sameProcess);
+      MORI_APP_TRACE("rank {} nodeId={} pid={} rankInNode={} kfdNode={} sameHost={} sameProcess={}",
+                     i, peerNodeId, other.pid, peerInfos[i].rankInNode, other.kfdNodeId,
+                     peerInfos[i].sameHost, peerInfos[i].sameProcess);
     }
   }
   if (anyRailMismatch) {
@@ -278,18 +284,10 @@ bool Context::RailOnlyEligible() const {
 // / Context::IsP2PDisabled() instead of getenv anywhere outside the
 // constructor.
 
-int Context::SameHostPeersBefore(int rank) const {
-  int n = 0;
-  for (int j = 0; j < rank; j++)
-    if (peerInfos[j].sameHost) n++;
-  return n;
-}
-
 void Context::InitializeTopologyAndTransports() {
-  // Find my rank in node
-  for (int i = 0; i <= LocalRank(); i++) {
-    if (peerInfos[i].sameHost) rankInNode++;
-  }
+  // Local rank within this host. Already derived in CollectHostNames from the
+  // exchanged nodeId ordering (seenPerNode), so reuse it instead of recounting.
+  int rankInNode = peerInfos[LocalRank()].rankInNode;
   assert(rankInNode < 8);
 
   // Init rdma context — proxy uses vendor-agnostic IBVerbs, IBGDA uses DirectVerbs
@@ -321,8 +319,7 @@ void Context::InitializeTopologyAndTransports() {
     std::cout << "MORI Topology detection is disabled, use static matching" << std::endl;
     if (!activeDevicePortList.empty()) {
       devicePortId = (rankInNode % activeDevicePortList.size());
-      device = activeDevicePortList[devicePortId].first;
-      portId = activeDevicePortList[devicePortId].second;
+      std::tie(device, portId) = activeDevicePortList[devicePortId];
       rdmaDeviceContext.reset(device->CreateRdmaDeviceContext());
     }
   } else {
@@ -422,11 +419,6 @@ void Context::InitializeTopologyAndTransports() {
       savedEpConfig.onGpu = true;
     }
   }
-
-  // rankInNode bookkeeping (used by NIC selection above and as
-  // LocalRankInNode() accessor). Kept here so capability discovery still
-  // computes it as a derived fact.
-  // (already computed at the top of this function)
 }
 
 /* ------------------------------------------------------------------------ */
@@ -482,15 +474,24 @@ void Context::EnsureSdmaTransport(int requestedChannels) {
   }
   MORI_APP_INFO("SDMA num channels per GPU pair: {}", sdmaNumChannels);
 
-  // Within-node HIP device id = count of same-host peers before the rank
-  // (not globalRank % 8, which faults under sliced HIP_VISIBLE_DEVICES).
-  int localDevId = SameHostPeersBefore(LocalRank());
+  // Key SDMA queues on the KFD topology node id (host-global, exchanged in
+  // CollectHostNames), NOT a HIP device ordinal. This is correct even under
+  // sliced HIP_VISIBLE_DEVICES, where a peer GPU is not in this process's HIP
+  // device list.
+  int localNode = LocalKfdNode();
+  if (localNode < 0) {
+    MORI_APP_ERROR("EnsureSdmaTransport: local KFD node id unresolved for rank {}", LocalRank());
+    std::abort();
+  }
   for (int i = 0; i < WorldSize(); i++) {
     if (!peerCaps[i].canSDMA) continue;
-    // Peer within-node device id: count of same-host peers before it.
-    int peerDevId = SameHostPeersBefore(i);
-    if (i != LocalRank()) anvil::EnablePeerAccess(localDevId, peerDevId);
-    anvil::anvil.connect(localDevId, peerDevId, sdmaNumChannels);
+    int peerNode = KfdNodeId(i);
+    if (peerNode < 0) {
+      MORI_APP_ERROR("EnsureSdmaTransport: peer {} KFD node id unresolved for rank {}", i,
+                     LocalRank());
+      std::abort();
+    }
+    anvil::anvil.connect(localNode, peerNode, sdmaNumChannels);
   }
   sdmaChannels_ = sdmaNumChannels;
   sdmaSetupDone = true;

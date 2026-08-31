@@ -78,7 +78,6 @@ class Context {
 
   int LocalRank() const { return bootNet.GetLocalRank(); }
   int WorldSize() const { return bootNet.GetWorldSize(); }
-  int LocalRankInNode() const { return rankInNode; }
   const std::string& HostName() const { return myHostname; }
 
   // Single-value transport selection driven by Context's default policy
@@ -94,6 +93,15 @@ class Context {
   // QPs to intra-node peers even though canP2P is also true).
   const PeerCapabilities& GetPeerCapabilities(int destRank) const { return peerCaps[destRank]; }
   const std::vector<PeerCapabilities>& GetAllPeerCapabilities() const { return peerCaps; }
+
+  // KFD topology node id (== HSA_AGENT_INFO_NODE) of a peer's GPU. This is a
+  // process-independent, host-global identity: it does not depend on
+  // HIP_VISIBLE_DEVICES, so it is the correct key for wiring SDMA queues to a
+  // peer even when the peer GPU is not in this process's HIP device list.
+  // -1 if the peer's node id could not be resolved. Populated in
+  // CollectHostNames() via an allgather.
+  int KfdNodeId(int destRank) const { return peerInfos[destRank].kfdNodeId; }
+  int LocalKfdNode() const { return peerInfos[LocalRank()].kfdNodeId; }
 
   RdmaContext* GetRdmaContext() const { return rdmaContext.get(); }
   RdmaDeviceContext* GetRdmaDeviceContext() const { return rdmaDeviceContext.get(); }
@@ -184,16 +192,13 @@ class Context {
     bool sameHost{false};
     bool sameProcess{false};
     int rankInNode{-1};
+    int kfdNodeId{-1};  // KFD topology node id of this rank's GPU (host-global)
   };
 
   bool RailOnlyEligible() const;
 
  private:
-  // Number of same-host peers with rank < `rank` (a peer's within-node device id).
-  int SameHostPeersBefore(int rank) const;
-
   BootstrapNetwork& bootNet;
-  int rankInNode{-1};
   int numQpPerPe{4};
   bool sdmaEnabled{false};
   bool p2pDisabled{false};
