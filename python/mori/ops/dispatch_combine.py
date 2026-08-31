@@ -190,11 +190,26 @@ def _normalize_quant_type(quant_type):
 
 def _current_stream():
     # torch.cuda.current_stream() re-resolves the device index and builds a
-    # Stream object on every call (~4.9us measured); the raw binding it wraps
-    # costs ~0.16us and returns (stream_ptr, device_index, device_type). At small
-    # token counts the host submission path is what paces the GPU, so this is
-    # real latency rather than bookkeeping.
-    return torch._C._cuda_getCurrentStream(torch.cuda.current_device())[0]
+    # Stream object on every call (~4.8us measured). _cuda_getCurrentRawStream
+    # skips that and returns the same raw cudaStream_t/hipStream_t pointer
+    # (~0.6us), which is what _launch's hipModuleLaunchKernel call needs.
+    #
+    # This used to call _cuda_getCurrentStream(...)[0] instead, which is
+    # *not* the raw pointer: it is CUDAStream's packed stream_id (pool index +
+    # per-pool stream index + priority, not an address). That happened to work
+    # outside CUDA graph capture because the default stream's packed id is 0,
+    # which coincides with the null-stream sentinel HIP already treats as "the
+    # current stream". Inside torch.cuda.graph(), the capture stream is a real
+    # non-default stream with a non-zero packed id (e.g. 3), and passing that
+    # to hipModuleLaunchKernel as a stream pointer launches on garbage address
+    # 0x3 instead of the capture stream -- the capture then sees no kernels
+    # ("UserWarning: The CUDA Graph is empty"), and replaying/using that
+    # invalid handle afterwards corrupts the context (HIP error 709,
+    # hipErrorContextIsDestroyed). Reproduced with
+    # PYTHONPATH=$(pwd) python3 tests/python/ops/bench_dispatch_combine.py
+    # --world-size 8 --cmd bench, whose default path captures dispatch/combine
+    # into CUDA graphs.
+    return torch._C._cuda_getCurrentRawStream(torch.cuda.current_device())
 
 
 @dataclass
