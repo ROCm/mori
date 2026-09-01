@@ -122,7 +122,6 @@ def main():
     dist.init_process_group("gloo", rank=rank, world_size=nranks)
     group_name = dist.group.WORLD.group_name
     symm_mem.set_backend("MORI")
-    symm_mem.enable_symm_mem_for_group(group_name)
 
     recv = symm_mem.empty(nranks * CHUNK_ELEMS, dtype=torch.int32, device=device)
     recv.zero_()

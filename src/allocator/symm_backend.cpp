@@ -53,6 +53,7 @@
 #include <mori/cco/cco.hpp>
 #include <mutex>
 #include <string>
+#include <torch/csrc/distributed/c10d/GroupRegistry.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/CUDASymmetricMemoryUtils.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/SymmetricMemory.hpp>
 #include <unordered_map>
@@ -441,16 +442,21 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
     auto name = group_name.has_value() ? group_name : block->default_group_name;
     TORCH_CHECK(name.has_value(),
                 "mori symm backend: group_name given neither at allocation nor rendezvous");
-    auto& info = c10d::symmetric_memory::get_group_info(*name);
-    const int rank = info.rank;
-    const int world_size = info.world_size;
+    // Resolve the process group directly rather than going through torch's GroupInfo
+    // registry. That registry is only ever populated by enable_symm_mem_for_group(),
+    // which torch has deprecated -- and torch's own CUDA and NCCL backends both take
+    // this route instead, so callers no longer have to make that deprecated call.
+    auto group = c10d::resolve_process_group(*name);
+    const int rank = group->getRank();
+    const int world_size = group->getSize();
+    auto store = group->getStore();
 
     DeviceGuard guard(block->device_idx);
 
     // torch's contract is that every rank hands in the same size. cco's register is
     // collective and would deadlock or mismap on a mismatch, so say so first.
     SizeCheck local{block->alloc_size, block->buffer_size};
-    auto sizes = store_exchange_.all_gather(info.store, rank, world_size, local);
+    auto sizes = store_exchange_.all_gather(store, rank, world_size, local);
     for (int r = 0; r < world_size; ++r) {
       TORCH_CHECK(
           sizes[r].alloc_size == local.alloc_size && sizes[r].buffer_size == local.buffer_size,
@@ -459,23 +465,24 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
           "; symm_mem.empty must be symmetric across ranks");
     }
 
-    auto group = GetOrCreateGroup(*name, info);
+    auto cco_group = GetOrCreateGroup(*name, store, rank, world_size);
 
     // Overload C: retain the tensor's VMM handle, alias it into the flat LSA slot,
     // and register the window. No copy, and no second peer exchange of our own --
     // this is the exchange the backend used to hand-roll over SCM_RIGHTS.
     ccoWindow_t win{};
     void* local_ptr = nullptr;
-    MORI_CCO_CHECK(
-        mori::cco::ccoWindowRegister(group->comm, block->ptr, block->alloc_size, &win, &local_ptr));
+    MORI_CCO_CHECK(mori::cco::ccoWindowRegister(cco_group->comm, block->ptr, block->alloc_size,
+                                                &win, &local_ptr));
 
     // torch's signal pad, as its own allocation and window rather than a tail on the
     // user's buffer. cco owns this one outright, so it is overload B.
     void* pad_ptr = nullptr;
-    MORI_CCO_CHECK(mori::cco::ccoMemAlloc(group->comm, kSignalPadBytes, &pad_ptr));
+    MORI_CCO_CHECK(mori::cco::ccoMemAlloc(cco_group->comm, kSignalPadBytes, &pad_ptr));
     MORI_HIP_CHECK(hipMemset(pad_ptr, 0, kSignalPadBytes));
     ccoWindow_t pad_win{};
-    MORI_CCO_CHECK(mori::cco::ccoWindowRegister(group->comm, pad_ptr, kSignalPadBytes, &pad_win));
+    MORI_CCO_CHECK(
+        mori::cco::ccoWindowRegister(cco_group->comm, pad_ptr, kSignalPadBytes, &pad_win));
 
     // buffer_ptrs is now one source of truth with the device-side lsa_ptr: both are
     // flatBase + peerLsaRank*stride + slotOffset. A peer outside the LSA team comes back
@@ -483,14 +490,14 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
     // a peer that has to be reached by RDMA rather than by load/store.
     std::vector<void*> buffers(world_size), pads(world_size);
     for (int r = 0; r < world_size; ++r) {
-      buffers[r] = mori::cco::ccoGetPeerPtr(group->comm, local_ptr, r);
-      pads[r] = mori::cco::ccoGetPeerPtr(group->comm, pad_ptr, r);
+      buffers[r] = mori::cco::ccoGetPeerPtr(cco_group->comm, local_ptr, r);
+      pads[r] = mori::cco::ccoGetPeerPtr(cco_group->comm, pad_ptr, r);
     }
     TORCH_CHECK(buffers[rank] != nullptr,
                 "mori symm backend: cco did not map this rank's own window");
 
     auto symm = c10::make_intrusive<MoriSymmetricMemory>(
-        group, win, local_ptr, pad_win, pad_ptr, std::move(buffers), std::move(pads),
+        cco_group, win, local_ptr, pad_win, pad_ptr, std::move(buffers), std::move(pads),
         block->buffer_size, rank, world_size, block->device_idx);
     block->symm = symm;
     return symm;
@@ -572,7 +579,8 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
   // One communicator per group, built on first use. The uid rides torch's own
   // Store, so cco's rendezvous needs no second bootstrap channel.
   std::shared_ptr<CcoGroup> GetOrCreateGroup(const std::string& name,
-                                             const c10d::symmetric_memory::GroupInfo& info) {
+                                             const c10::intrusive_ptr<c10d::Store>& store, int rank,
+                                             int world_size) {
     {
       std::lock_guard<std::mutex> lock(mutex_);
       auto it = cco_groups_.find(name);
@@ -580,12 +588,12 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
     }
 
     mori::cco::ccoUniqueId uid{};
-    if (info.rank == 0) MORI_CCO_CHECK(mori::cco::ccoGetUniqueId(&uid));
-    auto ids = store_exchange_.all_gather(info.store, info.rank, info.world_size, uid);
+    if (rank == 0) MORI_CCO_CHECK(mori::cco::ccoGetUniqueId(&uid));
+    auto ids = store_exchange_.all_gather(store, rank, world_size, uid);
 
     auto group = std::make_shared<CcoGroup>();
-    MORI_CCO_CHECK(mori::cco::ccoCommCreate(ids[0], info.world_size, info.rank, PerRankVmmSize(),
-                                            &group->comm));
+    MORI_CCO_CHECK(
+        mori::cco::ccoCommCreate(ids[0], world_size, rank, PerRankVmmSize(), &group->comm));
     // ccoCommCreate leaves a tolerated probe failure latched in HIP's per-thread
     // sticky slot. torch checks that slot around every launch, so without this the
     // caller's next kernel is blamed for it. Consuming it here, at the call site that

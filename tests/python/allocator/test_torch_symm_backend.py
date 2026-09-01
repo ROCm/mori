@@ -42,7 +42,6 @@ def _run(rank, world_size, port):
 
         symm_mem.set_backend("MORI")
         assert symm_mem.get_backend(device) == "MORI"
-        symm_mem.enable_symm_mem_for_group(group_name)
         assert handle_type(rank) in ("fabric", "posix_fd")
 
         n = 1024
@@ -114,7 +113,6 @@ def _run_release(rank, world_size, port):
         torch.cuda.set_device(device)
         group_name = dist.group.WORLD.group_name
         symm_mem.set_backend("MORI")
-        symm_mem.enable_symm_mem_for_group(group_name)
 
         mib = 1 << 20
         rounds = 4

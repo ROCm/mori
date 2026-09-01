@@ -125,7 +125,6 @@ def main() -> int:
 
     group_name = dist.group.WORLD.group_name
     symm_mem.set_backend("MORI")
-    symm_mem.enable_symm_mem_for_group(group_name)
     recv = symm_mem.empty(world_size * elems, dtype=torch.int32, device=device)
     recv.zero_()
     send = torch.empty(world_size * elems, dtype=torch.int32, device=device)

@@ -151,7 +151,6 @@ def main():
     group_name = dist.group.WORLD.group_name
 
     symm_mem.set_backend("MORI")
-    symm_mem.enable_symm_mem_for_group(group_name)
 
     chunk_bytes = args.chunk_kib * 1024
     elems = chunk_bytes // 4

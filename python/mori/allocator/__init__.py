@@ -37,6 +37,10 @@ own Store, so there is no second bootstrap channel to configure::
     hdl = symm_mem.rendezvous(t, group_name)
     peer = hdl.get_buffer(1, (1024,), torch.bfloat16)
 
+``enable_symm_mem_for_group()`` is not needed: the group is resolved with
+``resolve_process_group()``, the way torch's own CUDA and NCCL backends do it, rather
+than through the ``GroupInfo`` registry that only that deprecated call populates.
+
 Peers are exposed the way torch's model expects, as the ``buffer_ptrs`` /
 ``buffer_ptrs_dev`` array -- one base address per rank, same as every other backend.
 
