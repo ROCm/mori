@@ -782,20 +782,33 @@ namespace combine_impl {
 //     of it.
 constexpr size_t kCombineVecBytes = 16;
 
+// How many vector steps of a token's hidden dimension go into one warp's slice.
+//
+// This only sets the split -- CombineVecStep() feeds warpsPerToken below, and
+// the slice is rounded up to a whole number of steps so no warp gets less than
+// one. It does not reach inside the gather: WarpAccum advances exactly one step
+// (warpSize * kCombineVecBytes) per inner iteration regardless of what is set
+// here, so a slice of 2 steps simply means each warp runs two iterations.
+//
+// 2 measures faster than 1 at every token count tried, which is a statement
+// about how wide to spread a token, not about the gather's inner loop.
+constexpr int kCombineStepsPerWarpSlice = 2;
+
 inline __device__ bool CombineVecAligned(size_t tokHiddenBytes, size_t tokCombXferBytes) {
   return ((tokHiddenBytes % kCombineVecBytes) == 0) && ((tokCombXferBytes % kCombineVecBytes) == 0);
 }
 
 template <typename TokT>
 inline __device__ size_t CombineVecStep(int warpSizeRt) {
-  return static_cast<size_t>(WARP_ACCUM_UNROLL) * warpSizeRt * (kCombineVecBytes / sizeof(TokT));
+  return static_cast<size_t>(kCombineStepsPerWarpSlice) * warpSizeRt *
+         (kCombineVecBytes / sizeof(TokT));
 }
 
 template <typename TokT>
 inline __device__ void CombineGather(TokT* dest, TokT** srcPtrs, int accumNum, size_t nelems,
                                      bool vecAligned) {
   if (vecAligned) {
-    core::WarpAccumLF<TokT, kCombineVecBytes>(dest, srcPtrs, nullptr, accumNum, nelems);
+    core::WarpAccum<TokT, kCombineVecBytes>(dest, srcPtrs, nullptr, accumNum, nelems);
   } else {
     core::WarpAccum<TokT, 4>(dest, srcPtrs, nullptr, accumNum, nelems);
   }
