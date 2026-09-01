@@ -29,6 +29,7 @@ NUM_QP=2
 MAX_TOKENS=""
 QUANT_TYPE=""
 DTYPE=""
+TOPK=""
 ENTRY="examples/ops/dispatch_combine/test_dispatch_combine_internode.py"
 
 while [[ $# -gt 0 ]]; do
@@ -43,6 +44,7 @@ while [[ $# -gt 0 ]]; do
     --max-tokens)   MAX_TOKENS="$2";   shift 2 ;;
     --quant-type)   QUANT_TYPE="$2";   shift 2 ;;
     --dtype)        DTYPE="$2";        shift 2 ;;
+    --topk)         TOPK="$2";         shift 2 ;;
     --entry)        ENTRY="$2";        shift 2 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
@@ -60,9 +62,16 @@ cd "$REPO_ROOT"
 
 [[ -f "$ENTRY" ]] || { echo "--entry not found under $REPO_ROOT: $ENTRY"; exit 1; }
 
+# torchrun puts the entry's own directory on sys.path, not the repo root, so an
+# entry that imports "tests.python.*" (the v2 one does, for the shared test
+# utils) cannot resolve it. Under pytest the rootdir covers this; here nothing
+# does.
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+
 EXTRA_ARGS=()
 [[ -n "$QUANT_TYPE" ]] && EXTRA_ARGS+=(--quant-type "$QUANT_TYPE")
 [[ -n "$DTYPE" ]]       && EXTRA_ARGS+=(--dtype "$DTYPE")
+[[ -n "$TOPK" ]]        && EXTRA_ARGS+=(--topk "$TOPK")
 
 exec timeout "${MORI_INTERNODE_TIMEOUT:-120}" torchrun \
   --nnodes=2 \

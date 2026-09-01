@@ -872,19 +872,8 @@ if __name__ == "__main__":
     # nproc_per_node is 1 by design: the harness reads WORLD_SIZE as the node
     # count and spawns gpu_per_node workers of its own on top of it.
     import runpy
-    import sys
 
     import torch.multiprocessing
-
-    _repo_root = os.path.dirname(os.path.abspath(__file__))
-    for _ in range(4):  # dispatch_combine_v2 -> ops -> python -> tests -> root
-        _repo_root = os.path.dirname(_repo_root)
-
-    # sys.path[0] under torchrun is this file's own directory, not the repo root,
-    # so the import below needs the root put there first. Doing it here rather
-    # than leaving it to PYTHONPATH keeps the entry usable from any launcher.
-    if _repo_root not in sys.path:
-        sys.path.insert(0, _repo_root)
 
     # Self, under the package name. Anything handed to spawn is pickled as
     # module + qualname, and this file's __name__ here is "__main__" -- whose
@@ -902,6 +891,10 @@ if __name__ == "__main__":
         return _real_spawn(_self._spawn_worker, args=(fn, args), nprocs=nprocs, **kwargs)
 
     torch.multiprocessing.spawn = _spawn
+
+    _repo_root = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(4):  # dispatch_combine_v2 -> ops -> python -> tests -> root
+        _repo_root = os.path.dirname(_repo_root)
 
     # run_name="__main__" because the harness keeps its driver under its own
     # __main__ guard; importing it would only parse argv and define classes. Our
