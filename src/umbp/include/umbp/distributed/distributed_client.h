@@ -35,9 +35,13 @@
 
 namespace mori::umbp {
 
-/// Distributed IUMBPClient implementation — master-led global routing
-/// with RDMA/MORI-IO data plane.  All routing decisions go through the
-/// Master; this client does not use LocalStorageManager or LocalBlockIndex.
+/// The IUMBPClient implementation: this node's medium, plus master-led global
+/// routing over an RDMA/MORI-IO data plane when a master address is configured.
+///
+/// With none it is an embedded, single-process store — the same backends and
+/// the same transfer engine, with nothing routed, registered or heartbeated,
+/// and a local miss as the final answer.  Configuration alone decides which,
+/// which is why there is no separate local implementation.
 class DistributedClient : public IUMBPClient {
  public:
   explicit DistributedClient(const UMBPConfig& config);
@@ -125,6 +129,11 @@ class DistributedClient : public IUMBPClient {
   void* ranged_put_scratch_ = nullptr;
   size_t ranged_put_scratch_size_ = 0;
   HostBufferHandle ranged_put_scratch_handle_;
+  // No master address => no routing => this node can never hold, fetch or
+  // serve a remote key.  Set once at construction; read by SupportsRangedIO,
+  // which is the one place the distinction changes an answer rather than just
+  // a code path.
+  bool local_only_ = false;
   std::unique_ptr<PoolClient> pool_client_;
   std::atomic<bool> closing_{false};
   mutable std::shared_mutex op_mutex_;

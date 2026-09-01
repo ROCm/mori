@@ -197,7 +197,13 @@ TEST(StandaloneShmIpcTest, GpuRegistrationRejectsSsdBackedServer) {
   config.dram.capacity_bytes = 1 << 20;
   config.ssd.enabled = true;
   config.ssd.storage_dir = ssd_path;
-  config.ssd.capacity_bytes = 1 << 20;
+  config.ssd.capacity_bytes = 4 << 20;
+  config.ssd.segment_size_bytes = 1 << 20;
+  // Serving SSD is now a MEDIUM, not the ssd.enabled flag: a server can carry
+  // SSD sizing and still serve DRAM, and GPU IPC is fine on DRAM.  Name the
+  // medium, or this asserts against a server that has no reason to refuse.
+  config = WithEmbeddedDefaults(config);
+  config.distributed->medium = UMBPMedium::SSD;
   standalone::StandaloneServer server(config, address);
   ASSERT_TRUE(server.Start());
   std::thread server_thread([&]() { server.Run(); });
@@ -223,7 +229,7 @@ TEST(StandaloneShmIpcTest, GpuRegistrationRejectsSsdBackedServer) {
   std::filesystem::remove_all(ssd_path);
 }
 
-TEST(StandaloneShmIpcTest, StandaloneClientUsesNonZeroOffsetsAndCanReregister) {
+TEST(StandaloneShmIpcTest, WorkerRegistrationUsesNonZeroOffsetsAndCanReregister) {
   const std::string address =
       "unix:///tmp/umbp_standalone_e2e_" + std::to_string(getpid()) + ".grpc.sock";
   const std::string grpc_path = standalone::UnixPathFromGrpcAddress(address);
@@ -246,7 +252,9 @@ TEST(StandaloneShmIpcTest, StandaloneClientUsesNonZeroOffsetsAndCanReregister) {
   UMBPConfig client_cfg = server_cfg;
   auto client = CreateUMBPClient(client_cfg);
   ASSERT_EQ(client->GetDeploymentMode(), UMBPDeploymentMode::StandaloneProcess);
-  EXPECT_EQ(client->GetBackendMode(), UMBPDeploymentMode::Local);
+  // The server's backend is a DistributedClient with no master -- there is no
+  // Local backend any more, and an embedded deployment is not a separate mode.
+  EXPECT_EQ(client->GetBackendMode(), UMBPDeploymentMode::Distributed);
   EXPECT_TRUE(client->SupportsRangedIO());
 
   HostMemAllocator allocator;
@@ -282,7 +290,7 @@ TEST(StandaloneShmIpcTest, StandaloneClientUsesNonZeroOffsetsAndCanReregister) {
   unlink(fd_path.c_str());
 }
 
-TEST(StandaloneShmIpcTest, StandaloneClientResolvesAcrossMultipleRegions) {
+TEST(StandaloneShmIpcTest, WorkerRegistrationResolvesAcrossMultipleRegions) {
   const std::string address =
       "unix:///tmp/umbp_standalone_multiregion_" + std::to_string(getpid()) + ".grpc.sock";
   const std::string grpc_path = standalone::UnixPathFromGrpcAddress(address);

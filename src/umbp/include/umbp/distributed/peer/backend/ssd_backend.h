@@ -170,6 +170,9 @@ class SsdBackend : public MediumBackend {
 
   void SetAutoFlushHook(size_t threshold, std::function<void()> cb) override;
 
+  // MediumBackend contract; forwarded to the manager that owns the outbox.
+  void SetEventPublishing(bool enabled) override;
+
   // PeerSsdManager's read/eviction counters plus this class's own staging-arena
   // counters, as monotonic values.  PoolClient ships the deltas.
   std::vector<MetricSample> SampleMetrics() const override;

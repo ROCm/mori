@@ -31,6 +31,7 @@
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/env_time.h"
+#include "umbp/common/grpc_limits.h"
 #include "umbp/distributed/master/master_client.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/peer/backend/medium_backend.h"
@@ -490,6 +491,7 @@ bool PeerServiceServer::Start(uint16_t port) {
   std::string address = "0.0.0.0:" + std::to_string(port);
 
   grpc::ServerBuilder builder;
+  ApplyGrpcLimits(&builder);
   // gRPC turns SO_REUSEPORT ON by default for TCP servers on Linux, which means
   // a SECOND server binding this same port SUCCEEDS and the kernel then splits
   // incoming connections between the two.  For a peer service that is never

@@ -43,9 +43,9 @@ struct TierCapabilities {
   bool ranged_read = false;
 };
 
-// Abstract base class for storage tier backends (DRAM, SSD, NVM, ...).
+// Abstract base class for storage tier backends (SSD, SPDK, ...).
 // All tiers share a common interface for write/read/evict; tier-specific
-// extensions (e.g., DRAMTier::ReadPtr) live in the concrete subclass.
+// extensions (e.g. SSDTier::direct_io_active) live in the concrete subclass.
 class TierBackend {
  public:
   virtual ~TierBackend() = default;

@@ -39,6 +39,7 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   }
 
   const auto& dc = config.distributed.value();
+  local_only_ = dc.master_config.master_address.empty();
 
   // All three ownership blocks are lowered unconditionally; dc.medium selects
   // the one PoolClient::Init actually builds a backend from (exactly one medium
@@ -104,7 +105,8 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
     ranged_put_scratch_size_ = ranged_put_scratch_handle_.mapped_size;
   }
 
-  auto pc_config = ToPoolClientConfig(dc, std::move(dram_ownership), std::move(ssd_ownership));
+  auto pc_config = ToPoolClientConfig(dc, std::move(dram_ownership), std::move(ssd_ownership),
+                                      config.dram.high_watermark, config.dram.low_watermark);
   pc_config.ranged_get_scratch_buffer = ranged_get_scratch_;
   pc_config.ranged_get_scratch_size = ranged_get_scratch_size_;
   pc_config.ranged_put_scratch_buffer = ranged_put_scratch_;
@@ -429,6 +431,14 @@ bool DistributedClient::SupportsRangedIO() const {
   // happen.  Making the device read follow the requested extent needs an extent
   // on the resolve path and is a separate change (doc/design-ssd-ranged-io.md,
   // D1) -- this flag was never what stood in its way.
+  //
+  // The one exception is a node with no master.  Nothing can route a key off
+  // this node, so every ranged operation it will ever serve is the local path
+  // -- which reads and writes the medium's own pages directly and never
+  // touches an arena.  Requiring one there would make an embedded deployment
+  // either report ranged I/O as unsupported or allocate two arenas it cannot
+  // use.
+  if (local_only_) return true;
   return ranged_get_scratch_size_ != 0 && ranged_put_scratch_size_ != 0;
 }
 

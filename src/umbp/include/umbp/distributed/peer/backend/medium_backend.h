@@ -260,6 +260,25 @@ class MediumBackend : public MetricSource {
   // disable.
   virtual void SetAutoFlushHook(size_t threshold, std::function<void()> cb) = 0;
 
+  // Turn the heartbeat outbox off.  Every ADD/REMOVE a backend queues is
+  // addressed to a master, and the ONLY consumer is MasterClient's heartbeat
+  // (DrainAllBackends below).  A node with no master therefore queues an event
+  // per put that nothing will ever drain — an unbounded outbox on the one
+  // deployment that has no reason to keep one.  PoolClient::Init turns
+  // publishing off when it builds no MasterClient; a backend that ignores the
+  // call (the default) simply has no outbox worth gating.
+  virtual void SetEventPublishing(bool /*enabled*/) {}
+
+  // Turn on the backend's OWN eviction, for a node with no master.
+  //
+  // Evict(keys) above is a master decision: it picks victims with a
+  // cluster-wide view of who else holds the key.  Nothing in the system calls
+  // it otherwise, so a masterless node needs some medium-local policy or it
+  // simply fills up.  A backend that already self-evicts (SsdBackend, whose
+  // PeerSsdManager runs its own watermark loop from UMBPSsdConfig) ignores
+  // this; the default is to ignore it.
+  virtual void EnableLocalEviction(double /*high_watermark*/, double /*low_watermark*/) {}
+
   // ---- observability ----
   //
   // A backend does NOT report its own operation counts, byte volumes or

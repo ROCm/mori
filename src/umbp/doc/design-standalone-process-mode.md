@@ -102,9 +102,8 @@ Two new roles, named after Mooncake's split for consistency:
  │  Fd-handoff listener (raw AF_UNIX, SEPARATE socket path from     │
  │    the gRPC UDS — gRPC cannot carry an fd)                       │
  │                                                                   │
- │  client_ : IUMBPClient — either                                  │
- │    StandaloneClient   (local-backend, §3.1)                      │
- │    DistributedClient  (distributed-backend, §6)                  │
+ │  client_ : IUMBPClient — a DistributedClient, deployed either    │
+ │    with no master (embedded, §3.1) or with one (§6)              │
  │                                                                   │
  │  Per-worker shm registry: client_id → {fd, base, size, offset}   │
  └─────────────────────────────────────────────────────────────────┘
@@ -120,18 +119,23 @@ separate raw `AF_UNIX` socket alongside the gRPC control-plane UDS.
 constructed through the existing `CreateUMBPClient(config)` factory
 (`umbp_client_factory.cpp`). This yields three deployment shapes:
 
+> **Superseded.** `StandaloneClient` no longer exists.  The server's
+> backend is always a `DistributedClient`; what the shapes below called
+> "local-backend" is now that same client deployed with no master, which
+> the factory synthesizes when the config names no deployment.  The
+> distinction the table draws is real, but it is a property of the
+> configuration, not of which class is constructed.
+
 | Shape | `client_` backend | Cross-node | Server's own storage |
 |---|---|---|---|
-| **local-backend** (same-host, fallback/dev-convenience) | `StandaloneClient` | no | `LocalStorageManager` (DRAM+SSD tiers, private anonymous/hugetlb memory — reused unmodified from `local/`) |
-| **distributed-backend, backend enabled** (Mooncake-parity shape) | `DistributedClient` | yes, via Master + RDMA | `DistributedClient`'s own DRAM pool (a distinct concept from `LocalStorageManager` — see §6.5) |
-| **distributed-backend, backend disabled/unconfigured** | `StandaloneClient` | no | same as local-backend |
+| **embedded** (same-host, no master) | `DistributedClient`, `master_address` empty | no | its own DRAM pool; nothing routed, registered or heartbeated, and it evicts on its own watermarks |
+| **master-backed** (Mooncake-parity shape) | `DistributedClient`, `master_address` set | yes, via Master + RDMA | its own DRAM pool, with eviction driven by master |
 
-**distributed-backend is the primary target this feature builds
-toward**, since it is the shape that actually matches Mooncake parity
-(goal 2). **local-backend is a same-host fallback / dev-convenience
-shape**, not a co-equal alternative — it remains fully supported and
-is the default when the server has no distributed-backend
-configuration.
+**master-backed is the primary target this feature builds toward**,
+since it is the shape that actually matches Mooncake parity (goal 2).
+**embedded is a same-host fallback / dev-convenience shape**, not a
+co-equal alternative — it remains fully supported and is what the
+server runs when given no distributed configuration.
 
 Existing data-path RPC handlers (Put/Get/BatchPut/BatchGet/Exists/
 Clear/Flush) require no logic changes across these shapes: they

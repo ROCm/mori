@@ -260,6 +260,10 @@ void SsdBackend::ClearFullSyncAcked() {
   clear_full_sync_pending_.store(false, std::memory_order_release);
 }
 
+void SsdBackend::SetEventPublishing(bool enabled) {
+  if (ssd_) ssd_->SetEventPublishing(enabled);
+}
+
 void SsdBackend::SetAutoFlushHook(size_t threshold, std::function<void()> cb) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto_flush_threshold_ = threshold == 0 ? 1 : threshold;
