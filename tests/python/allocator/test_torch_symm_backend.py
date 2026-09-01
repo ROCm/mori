@@ -85,8 +85,10 @@ def _run(rank, world_size, port):
         # torch's handle has no slot for it, same as NCCL's get_window().
         from mori.allocator import window_handle
 
-        assert window_handle(t.data_ptr()) != 0
-        assert window_handle(t.data_ptr(), signal_pad=True) != 0
+        assert window_handle(t) != 0
+        assert window_handle(t, signal_pad=True) != 0
+        # The window belongs to the storage, so a view resolves to the same one.
+        assert window_handle(t[n // 2 :]) == window_handle(t)
 
         # A DevComm is parameterised by the algorithm that will run, so it is cached per
         # (group, key) rather than per group -- two collectives want two of them.

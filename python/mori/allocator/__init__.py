@@ -230,16 +230,21 @@ def signal_pad_supported() -> bool:
     return bool(_ext().signal_pad_supported)
 
 
-def window_handle(data_ptr: int, signal_pad: bool = False) -> int:
+def window_handle(tensor, signal_pad: bool = False) -> int:
     """The cco window backing a rendezvous'd tensor, as an integer handle.
 
     Backend-specific on purpose: torch's ``SymmetricMemory`` has nowhere to carry a
-    window, so NCCL's backend exposes ``get_window()`` on its own class and this does
-    the same, keyed by the tensor pointer. Pass it to a kernel that addresses peers with
-    cco's device API (``mori.ir.triton.cco.Window.lsa_ptr``) instead of walking
-    ``buffer_ptrs``.
+    window, so NCCL's backend exposes ``get_window()`` on its own class. Python only ever
+    sees the base class, so this is a lookup keyed by the tensor instead.
+
+    Takes the tensor rather than a pointer because the window belongs to the *storage*:
+    ``rendezvous(t[512:])`` registers the whole storage, so a view has to resolve to the
+    same window rather than to "pointer is not a mori allocation".
+
+    Pass the result to a kernel that addresses peers with cco's device API
+    (``mori.ir.triton.cco.Window.lsa_ptr``) instead of walking ``buffer_ptrs``.
     """
-    return _ext().window_handle(data_ptr, signal_pad)
+    return _ext().window_handle(tensor.untyped_storage().data_ptr(), signal_pad)
 
 
 def dev_comm(group_name: str, key: str = "default", lsa_barrier_count: int = 1) -> int:

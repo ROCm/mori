@@ -132,7 +132,7 @@ def main():
     torch.cuda.synchronize()
 
     hdl = symm_mem.rendezvous(recv, group_name)
-    window = mori.allocator.window_handle(recv.data_ptr())
+    window = mori.allocator.window_handle(recv)
     if rank == 0:
         print(
             f"{nranks} ranks, backend={symm_mem.get_backend(device)}, "

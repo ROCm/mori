@@ -30,7 +30,7 @@ comes straight out of the backend::
 
     t   = symm_mem.empty(...)              # MORI backend, HIP VMM
     hdl = symm_mem.rendezvous(t, group)    # registers the CCO window
-    win = mori.allocator.window_handle(t.data_ptr())
+    win = mori.allocator.window_handle(t)
     ...
     addr = cco.Window.lsa_ptr(window, peer, offset)     # inside the kernel
 
@@ -133,7 +133,7 @@ def main() -> int:
     torch.cuda.synchronize()
 
     hdl = symm_mem.rendezvous(recv, group_name)
-    window = mori.allocator.window_handle(recv.data_ptr())
+    window = mori.allocator.window_handle(recv)
     blocks_per_peer = _blocks_per_peer(elems, world_size, device)
     extern_libs = cco.get_extern_libs()
 

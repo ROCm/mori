@@ -71,7 +71,7 @@ address.
 
 ```python
 hdl    = symm_mem.rendezvous(recv, group_name)                  # registers the cco window
-window = mori.allocator.window_handle(recv.data_ptr())          # hand it to the kernel
+window = mori.allocator.window_handle(recv)                      # hand it to the kernel
 addr   = cco.Window.lsa_ptr(window, peer, rank_id * chunk_bytes)  # inside the kernel
 ```
 
