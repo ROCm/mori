@@ -69,6 +69,70 @@ def _require_sdma_env(class_name: str) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# AllReduce transport selection
+# ---------------------------------------------------------------------------
+# MORI_CCL_ALLREDUCE_BACKEND picks which engine carries the cross-GPU bytes.
+# Default is sdma on every architecture, including gfx125x. tdm requires gfx125x
+# because the TDM engine does not exist elsewhere, and because ccl_kernels.hip
+# only emits the TdmAllreduce* symbols under that arch guard -- asking for them
+# on another target would fail at kernel lookup rather than here.
+_ALLREDUCE_BACKENDS = ("sdma", "tdm")
+
+
+def _detect_arch_str() -> str:
+    """The arch the JIT will compile for. Deliberately the same source as
+    --offload-arch (mori.jit.config.detect_gpu_arch) so a host-side decision
+    here cannot disagree with what ends up in the code object."""
+    try:
+        from mori.jit.config import detect_gpu_arch
+
+        return str(detect_gpu_arch())
+    except Exception:
+        return ""
+
+
+def _resolve_allreduce_backend() -> str:
+    raw = os.environ.get("MORI_CCL_ALLREDUCE_BACKEND", "").strip().lower()
+    if raw in ("", "sdma"):
+        return "sdma"
+    if raw not in _ALLREDUCE_BACKENDS:
+        raise ValueError(
+            f"MORI_CCL_ALLREDUCE_BACKEND={raw!r} is not one of {_ALLREDUCE_BACKENDS}"
+        )
+    arch = _detect_arch_str()
+    if not arch.startswith("gfx125"):
+        raise RuntimeError(
+            f"MORI_CCL_ALLREDUCE_BACKEND=tdm requires a gfx125x GPU (detected "
+            f"arch {arch!r}); the TDM engine does not exist on this target."
+        )
+    return "tdm"
+
+
+# Must equal MORI_CCL_TDM_TILE_BYTES in
+# include/mori/collective/allreduce/twoshot_tdm_kernel.hpp. The kernel indexes
+# its LDS by warp against this number, so reserving less is an out-of-bounds LDS
+# access, which on this hardware means an unkillable process rather than an error.
+_TDM_TILE_BYTES = 256 * 8 * 4
+# gfx125x is wave32. Not read from the device: get_warp_size() is known to
+# misreport 64 on gfx1250 (src/jit/v2/toolchain.cpp), and this path is
+# gfx125x-only anyway.
+_TDM_WAVE_SIZE = 32
+# 64 blocks x 16 wave32 puts 1024 warps in flight. That number, not the CU
+# count, is what bounds a TDM payload phase: the EP dispatch sweep reaches the
+# same 1366 GB/s at 64 blocks x 16 warps and at 128 blocks x 8 warps, and only
+# 1278 at 64 x 8 (python/mori/ops/dispatch_combine.py, _resolve_launch_params).
+# Also stays well under the CU count, which the kernel's grid rendezvous needs
+# because it spins on blocks being co-resident.
+_TDM_MAX_BLOCKS = 64
+_TDM_THREADS = 512
+
+
+def _tdm_shared_mem(threads: int) -> int:
+    warps = (threads + _TDM_WAVE_SIZE - 1) // _TDM_WAVE_SIZE
+    return warps * _TDM_TILE_BYTES
+
+
 _TORCH_DTYPE_TO_NUMPY = {
     torch.uint32: "<u4",
     torch.int32: "<i4",
@@ -1072,6 +1136,10 @@ class AllreduceSdma:
         self._element_size = torch.empty((), dtype=dtype).element_size()
         self._async_oneshot = False
         self.mode = mode
+        # Resolved once, in the constructor, so every call in a process uses the
+        # same transport: the flag protocol is shared state, and two ranks
+        # disagreeing about which kernel is running would hang rather than fail.
+        self._backend = _resolve_allreduce_backend()
         self._type_suffix = _DTYPE_TO_SUFFIX.get(dtype)
         if self._type_suffix is None:
             raise ValueError(
@@ -1096,6 +1164,34 @@ class AllreduceSdma:
                 my_pe, npes, 512 * 1024 * 1024, copy_output_to_user
             )
 
+    def _use_tdm(self, count: int) -> bool:
+        """TDM carries only the two-shot sizes. Below the one-shot threshold the
+        LDS round trip every TDM tile pays is not amortized, and that range is
+        where SDMA's one-descriptor-per-chunk form is already efficient, so small
+        messages stay on SDMA even when the TDM backend is selected."""
+        return (
+            self._backend == "tdm"
+            and count * self._element_size > self._ONESHOT_MAX_BYTES
+        )
+
+    def _tdm_grid(self, count: int):
+        """Blocks are capped at _TDM_MAX_BLOCKS and scaled down for messages too
+        small to occupy it, sized against both phases: one warp per tile for the
+        scatter, one thread per 16-byte pack for the local reduce."""
+        threads = _TDM_THREADS
+        warps_per_block = threads // _TDM_WAVE_SIZE
+        per_rank_elems = count // self.npes
+        per_rank_bytes = per_rank_elems * self._element_size
+        tiles = (per_rank_bytes + _TDM_TILE_BYTES - 1) // _TDM_TILE_BYTES
+        pack_size = 16 // self._element_size
+        packed_per_rank = (per_rank_elems + pack_size - 1) // pack_size
+        need = max(
+            (tiles + warps_per_block - 1) // warps_per_block,
+            (packed_per_rank + threads - 1) // threads,
+        )
+        blocks = max(1, min(_TDM_MAX_BLOCKS, need))
+        return blocks, threads
+
     def _run_sync(
         self,
         input_data,
@@ -1106,6 +1202,25 @@ class AllreduceSdma:
     ) -> bool:
         s = _stream_to_int(stream)
         sfx = self._type_suffix
+
+        if self._use_tdm(count):
+            blocks, threads = self._tdm_grid(count)
+            lds = _tdm_shared_mem(threads)
+            args = self._handle.prepare_reduce_scatter(
+                input_data.data_ptr(), output_data.data_ptr(), count, s
+            )
+            _get_ccl_func(f"TdmReduceScatterKernel_{sfx}").launch_struct(
+                (blocks,), (threads,), lds, s, args
+            )
+            args = self._handle.prepare_allgather(count, s)
+            _get_ccl_func(f"TdmAllGatherKernel_{sfx}").launch_struct(
+                (blocks,), (threads,), lds, s, args
+            )
+            self._handle.finish_sync(
+                output_data.data_ptr(), count, s, force_copy_output
+            )
+            return True
+
         # Step 1: ReduceScatter
         args = self._handle.prepare_reduce_scatter(
             input_data.data_ptr(), output_data.data_ptr(), count, s
@@ -1142,8 +1257,23 @@ class AllreduceSdma:
         args = self._handle.prepare_async_reduce_scatter(
             input_data.data_ptr(), output_data.data_ptr(), count, s
         )
-        blocks, threads = self._handle.get_reduce_scatter_grid(count)
         self._async_oneshot = count * self._element_size <= self._ONESHOT_MAX_BYTES
+
+        if self._use_tdm(count):
+            blocks, threads = self._tdm_grid(count)
+            lds = _tdm_shared_mem(threads)
+            _get_ccl_func(f"TdmReduceScatterKernel_{sfx}").launch_struct(
+                (blocks,), (threads,), lds, s, args
+            )
+            args = self._handle.prepare_async_allgather_put(count, s)
+            _get_ccl_func(f"TdmAllGatherKernel_{sfx}").launch_struct(
+                (blocks,), (threads,), lds, s, args
+            )
+            capturing = torch.cuda.is_current_stream_capturing()
+            self._handle.after_async_start(capturing)
+            return True
+
+        blocks, threads = self._handle.get_reduce_scatter_grid(count)
         kernel = (
             "SdmaOneShotAllreduceKernel"
             if self._async_oneshot

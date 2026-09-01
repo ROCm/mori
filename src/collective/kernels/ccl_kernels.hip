@@ -37,6 +37,16 @@
 #include "mori/collective/allreduce/twoshot_sdma_kernel.hpp"
 #include "mori/collective/inter_node/kernels/all_gather.hpp"
 
+// The TDM AllReduce transport exists only where the engine does. Guarding the include rather than
+// the header's contents follows src/ops/dispatch_combine/intranode_entry.hpp: the arch test lives at
+// the one place that chooses, so the implementation never interleaves arch tests with the code they
+// guard. On any other target the TdmAllreduce* symbols are simply absent from the .hsaco, and
+// python/mori/ccl/collective.py refuses the TDM backend before it can ask for them.
+#if defined(__gfx1250__) || defined(__gfx1251__)
+#define MORI_CCL_HAS_TDM_ALLREDUCE 1
+#include "mori/collective/allreduce/twoshot_tdm_kernel.hpp"
+#endif
+
 #include "mori/collective/ccl_kernel_args.hpp"
 
 // Each .hsaco needs its own globalGpuStates, initialized via ShmemModuleInit.
@@ -236,6 +246,19 @@ CCL_ALLREDUCE_ALL_TYPES(CCL_WRAP_ALLREDUCE_AG_REDUCED_PUT, AllGatherReducedSdmaP
 // --- SDMA gather from protected reduced shard into compact scratch output ---
 CCL_ALLREDUCE_ALL_TYPES(CCL_WRAP_ALLREDUCE_PROTECTED_AG,
                         AllGatherSdmaFromProtectedKernel)
+
+// ============================================================================
+// AllReduce, TDM transport (gfx125x only)
+// ============================================================================
+// Same two wrapper macros the SDMA path uses, so these kernels take the same
+// CclAllreduceArgs<T> and need no pybind or host-class change. The TDM
+// allgather reads the reduced slot unconditionally, which is why it wraps with
+// CCL_WRAP_ALLREDUCE_AG rather than needing the PROTECTED variant's extra
+// source-offset argument.
+#if defined(MORI_CCL_HAS_TDM_ALLREDUCE)
+CCL_ALLREDUCE_ALL_TYPES(CCL_WRAP_ALLREDUCE_RS, TdmReduceScatterKernel)
+CCL_ALLREDUCE_ALL_TYPES(CCL_WRAP_ALLREDUCE_AG, TdmAllGatherKernel)
+#endif
 
 // ============================================================================
 // Inter-node RDMA ring AllGather
