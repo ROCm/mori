@@ -355,7 +355,7 @@ command = args.command
 # family so every existing `backend_name == "umbp"` test keeps its meaning, and
 # `deployment` carries which one:
 #   distributed        -- DistributedClient in this process, talks to a master
-#   local              -- StandaloneClient in this process, no network at all
+#   local              -- embedded client in this process, no network at all
 #   standalone-server  -- forwards over gRPC/shm to a standalone UMBP server,
 #                         which itself may be local- or distributed-backed
 _DEPLOYMENT_OF = {
@@ -1293,12 +1293,13 @@ def _wait_visible_via_exists(client, keys: list, timeout: float) -> int:
 
 
 class UMBPLocalBackend(Backend):
-    """Local mode: a StandaloneClient in this process.  No master, no network.
+    """Embedded mode: an in-process client with no master and no network.
 
-    The point of keeping this alongside the networked deployments is that it is
-    the only configuration where a measurement is purely the storage tier --
-    no RDMA, no gRPC, no staging arena -- so it is the baseline that says
-    whether a distributed number is bounded by the medium or by the transport.
+    Same client class as the distributed deployment, deployed without a master,
+    an IO engine or a peer service.  It is the only configuration where a
+    measurement is purely the storage medium -- no RDMA, no gRPC, no staging
+    arena -- so it is the baseline that says whether a distributed number is
+    bounded by the medium or by the transport.
     """
 
     @classmethod
@@ -1358,6 +1359,39 @@ class UMBPLocalBackend(Backend):
         cfg.eviction.auto_promote_on_read = os.environ.get(
             "UMBP_AUTO_PROMOTE_ON_READ", "0"
         ) not in ("0", "")
+        # A node serves ONE medium, so the tier being measured has to be named
+        # rather than inferred from ssd.enabled.  Without this block the client
+        # would synthesize an embedded DRAM deployment and an --ssd run would
+        # quietly measure DRAM.
+        #
+        # UMBP_LOCAL_FACTORY_DEFAULTS=1 leaves it unnamed on purpose: the
+        # factory then synthesizes the deployment (WithEmbeddedDefaults), which
+        # is the path a caller that configures nothing actually takes.  DRAM
+        # only, since that is what the factory picks.
+        if os.environ.get("UMBP_LOCAL_FACTORY_DEFAULTS", "0") not in ("0", ""):
+            if tier != "dram":
+                raise SystemExit(
+                    "UMBP_LOCAL_FACTORY_DEFAULTS only applies to --tier dram: "
+                    "the factory synthesizes a DRAM deployment."
+                )
+            self._client = UMBPClient(cfg)
+            print(
+                "embedded via factory defaults: "
+                f"mode={self._client.get_deployment_mode()} "
+                f"ranged={self._client.supports_ranged_io()}",
+                flush=True,
+            )
+            return
+        dist = UMBPDistributedConfig()
+        dist.master_config.node_id = f"umbp-bench-local-{os.getpid()}"
+        dist.master_config.node_address = "127.0.0.1"
+        dist.medium = UMBPMedium.SSD if tier == "ssd" else UMBPMedium.DRAM
+        dist.dram_page_size = int(
+            os.environ.get("UMBP_EMBEDDED_DRAM_PAGE_SIZE", 2 << 20)
+        )
+        dist.cache_remote_fetches = False
+        dist.ranged_locality_prefetch = False
+        cfg.distributed = dist
         self._client = UMBPClient(cfg)
 
     def put(self, key: str, payload: bytes, ptr: int, size: int) -> bool:

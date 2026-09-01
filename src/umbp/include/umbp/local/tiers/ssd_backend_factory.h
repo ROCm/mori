@@ -32,8 +32,8 @@ namespace mori::umbp {
 // Build the `file`-backend SSD tier: one storage directory yields a plain
 // SSDTier, several (comma-separated, one mount per drive) a ShardedSsdTier.
 // capacity_bytes is the total budget, split evenly across the directories.
-// Both PeerSsdManager and LocalStorageManager go through here, so multi-drive
-// behaves identically in either deployment.  SPDK backends are unaffected —
+// PeerSsdManager goes through here, so every SSD deployment gets identical
+// multi-drive behaviour.  SPDK backends are unaffected —
 // they get multi-device support from SpdkEnv's RAID0 one level down.
 std::unique_ptr<TierBackend> MakeFileSsdBackend(
     const UMBPSsdConfig& ssd_config, SSDAccessMode access_mode = SSDAccessMode::ReadWrite);

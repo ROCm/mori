@@ -442,6 +442,27 @@ class PoolClient {
   bool CopyRangesToContiguous(const std::vector<ObjectRange>& ranges, void* dst,
                               size_t object_size);
 
+  // Item-building halves of the two copies above.  They append to `items`
+  // instead of transferring, so a caller with MANY objects can issue ONE
+  // Transfer for all of them.
+  //
+  // This is the difference between the local and remote ranged paths, and it
+  // was worth ~65% of remote transfer time: ExecuteLocalPutRangesBatch
+  // accumulates every request's items and transfers once, while the remote
+  // arena loop called CopyRangesToContiguous per key -- one blocking transfer,
+  // one kernel launch and one hipStreamSynchronize EACH.  Measured on an
+  // 8-rank embedded deployment: 369 transfers carrying 369 segments, 14.5 us
+  // apiece, of which only ~5 us was the copy.
+  //
+  // `tag` is the caller's key index; a failure comes back through
+  // Transfer's failed_tags so one bad object does not fail the batch.
+  bool BuildRangesToContiguousItems(const std::vector<ObjectRange>& ranges, void* dst,
+                                    size_t object_size, size_t tag,
+                                    std::vector<TransferItem>* items);
+  bool BuildContiguousToRangesItems(const TransferRef& src, uint64_t src_base, size_t object_size,
+                                    const std::vector<ObjectRange>& ranges, size_t tag,
+                                    std::vector<TransferItem>* items);
+
   // One locally-routed ranged put.  `result_index` is the caller's key index,
   // which is what gets written back into the results vector.
   struct LocalRangeWriteRequest {

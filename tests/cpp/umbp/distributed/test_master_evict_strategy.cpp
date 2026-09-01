@@ -31,6 +31,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "umbp/common/grpc_limits.h"
 #include "umbp/distributed/master/evict_strategy.h"
 #include "umbp/distributed/types.h"
 
@@ -98,6 +99,64 @@ TEST(LruMasterEvictStrategy, SkipsTiersWithNoBudget) {
   std::unordered_map<std::string, std::map<TierType, int64_t>> budget;  // empty: nothing to free
   auto victims = strategy.SelectVictims(candidates, budget);
   EXPECT_TRUE(victims.empty());
+}
+
+// ---------------------------------------------------------------------------
+//  gRPC batch chunking (grpc_limits.h)
+//
+//  The eviction round that exposed this selected 155,157 victims -- 18.7 MB of
+//  `repeated string` against a 4 MiB receive limit -- and protobuf refused the
+//  whole message, so 81 consecutive rounds freed nothing and the tier could not
+//  un-fill itself.  These pin the split, not the transport.
+// ---------------------------------------------------------------------------
+
+namespace {
+std::vector<std::string> MakeKeys(size_t n, size_t key_len) {
+  std::vector<std::string> keys;
+  keys.reserve(n);
+  for (size_t i = 0; i < n; ++i) keys.emplace_back(key_len, 'k');
+  return keys;
+}
+}  // namespace
+
+TEST(GrpcBatchChunkingTest, SmallListGoesInOneChunk) {
+  const auto keys = MakeKeys(100, 117);
+  EXPECT_EQ(GrpcMaxItemsPerBatch(keys, 0), 100u);
+}
+
+TEST(GrpcBatchChunkingTest, EveryChunkFitsUnderTheLimit) {
+  // 155,157 keys of the length the real deployment used.
+  const auto keys = MakeKeys(155157, 117);
+  const size_t limit = GrpcMaxMessageBytes();
+
+  size_t sent = 0, chunks = 0;
+  while (sent < keys.size()) {
+    const size_t take = GrpcMaxItemsPerBatch(keys, sent);
+    ASSERT_GT(take, 0u) << "a zero-sized chunk would loop forever";
+
+    size_t bytes = 0;
+    for (size_t i = sent; i < sent + take; ++i) bytes += keys[i].size() + 8;
+    EXPECT_LE(bytes, limit) << "chunk " << chunks << " would be refused";
+
+    sent += take;
+    ++chunks;
+  }
+  EXPECT_EQ(sent, keys.size()) << "chunking must cover every key exactly once";
+  EXPECT_GE(chunks, 1u);
+}
+
+TEST(GrpcBatchChunkingTest, OversizedSingleItemStillMakesProgress) {
+  // One key larger than the whole budget: returning 0 here would spin the
+  // dispatch loop forever, which is worse than letting the RPC fail.
+  const auto keys = MakeKeys(1, static_cast<size_t>(GrpcMaxMessageBytes()) + 1024);
+  EXPECT_EQ(GrpcMaxItemsPerBatch(keys, 0), 1u);
+}
+
+TEST(GrpcBatchChunkingTest, LimitHasAFloorAndADefault) {
+  // The default must not be below what the master surfaces already used, or
+  // this change would silently lower a working limit.
+  EXPECT_GE(GrpcMaxMessageBytes(), kMinGrpcMaxMessageBytes);
+  EXPECT_GE(kDefaultGrpcMaxMessageBytes, 64u * 1024u * 1024u);
 }
 
 }  // namespace

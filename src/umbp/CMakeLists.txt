@@ -92,17 +92,14 @@ endif()
 # Core static library
 set(UMBP_CORE_SRCS
     common/device_copy.cpp
-    local/block_index/local_block_index.cpp
     storage/io/storage_io_driver.cpp
     storage/io/posix_storage_io_driver.cpp
     storage/io/io_uring_storage_io_driver.cpp
-    local/tiers/copy_pipeline.cpp
     local/tiers/segment/segment_format.cpp
     local/tiers/segment/segment_index.cpp
     local/tiers/segment/segment_scanner.cpp
     local/tiers/segment/segment_writer.cpp
     local/tiers/tier_backend.cpp
-    local/tiers/dram_tier.cpp
     local/tiers/host_registration.cpp
     local/tiers/device_gather.hip
     local/host_mem_allocator.cpp
@@ -110,8 +107,6 @@ set(UMBP_CORE_SRCS
     local/tiers/sharded_ssd_tier.cpp
     local/tiers/ssd_backend_factory.cpp
     local/tiers/dummy_ssd_tier.cpp
-    local/tiers/local_storage_manager.cpp
-    local/standalone_client.cpp
     storage/spdk/offset_allocator.cpp)
 
 # SPDK Proxy client (shared memory IPC, no SPDK dependency — Linux only)
@@ -128,9 +123,9 @@ endif()
 add_library(umbp_core STATIC ${UMBP_CORE_SRCS})
 target_include_directories(umbp_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(umbp_core PRIVATE pthread)
-# The DRAM tier registers its region for GPU access and gathers scattered
-# copies in a kernel, so the core library now needs the HIP runtime. PUBLIC
-# because dram_tier.h exposes no HIP types but device_gather.hip is linked in.
+# The tiers register their regions for GPU access and gather scattered copies
+# in a kernel, so the core library needs the HIP runtime. PUBLIC because no
+# tier header exposes HIP types but device_gather.hip is linked in.
 target_link_libraries(umbp_core PUBLIC hip::host)
 if(UNIX)
   target_link_libraries(umbp_core PRIVATE rt)
@@ -487,14 +482,16 @@ if(MORI_UMBP_TESTING)
   target_compile_definitions(umbp_common PUBLIC MORI_UMBP_TESTING)
 endif()
 
-# NOTE: umbp_core no longer depends on umbp_common.  StandaloneClient has no
-# gRPC/Protobuf dependency.  Targets that need distributed features should link
-# umbp_common directly.
+# NOTE: umbp_core no longer depends on umbp_common.  It holds the storage tiers
+# (SSD/SPDK/segment) and the host allocator, none of which need gRPC/Protobuf;
+# umbp_common's PeerSsdManager builds on them.  Targets that need the clients
+# should link umbp_common directly.
 target_link_libraries(umbp_core PUBLIC mori_logging)
 
-# Factory: references both StandaloneClient and DistributedClient, so it belongs
-# in umbp_common (which has the distributed symbols).  Runtime switching is via
-# config.distributed.has_value().
+# Factory: every client it can return (DistributedClient, StandaloneProcessClient)
+# lives in umbp_common, so it belongs there too.  Which one a config selects --
+# including the embedded deployment it synthesizes when a config names none --
+# is decided at runtime in WithEmbeddedDefaults/CreateUMBPClient.
 target_sources(umbp_common
                PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/umbp_client_factory.cpp)
 

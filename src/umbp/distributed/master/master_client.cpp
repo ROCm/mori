@@ -35,6 +35,7 @@
 #include "mori/utils/mori_log.hpp"
 #include "umbp.grpc.pb.h"
 #include "umbp/common/env_time.h"
+#include "umbp/common/grpc_limits.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/master/rpc_latency_timer.h"
 #include "umbp/distributed/pool/peer_pool.h"
@@ -172,8 +173,7 @@ MasterClient::MasterClient(const UMBPMasterClientConfig& config)
     : config_(config),
       stub_(nullptr, [](void* p) { delete static_cast<::umbp::UMBPMaster::Stub*>(p); }) {
   grpc::ChannelArguments args;
-  args.SetMaxReceiveMessageSize(64 * 1024 * 1024);
-  args.SetMaxSendMessageSize(64 * 1024 * 1024);
+  ApplyGrpcLimits(&args);
   channel_ =
       grpc::CreateCustomChannel(config.master_address, grpc::InsecureChannelCredentials(), args);
   stub_.reset(::umbp::UMBPMaster::NewStub(channel_).release());

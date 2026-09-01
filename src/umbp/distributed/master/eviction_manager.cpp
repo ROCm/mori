@@ -23,6 +23,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <iterator>
 #include <map>
 #include <string>
 #include <thread>
@@ -31,6 +32,7 @@
 #include <vector>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/grpc_limits.h"
 #include "umbp/distributed/master/evict_strategy.h"
 #include "umbp/distributed/master/master_metadata_store.h"
 #include "umbp/distributed/types.h"
@@ -176,10 +178,32 @@ void EvictionManager::RunOnce() {
                       node_id, keys.size());
       continue;
     }
-    // Master state is unchanged here — REMOVE events on the peer's
-    // next heartbeat are what shrink the index.  Re-eviction next
-    // round is safe because peer Evict is idempotent.
-    dispatcher_->DispatchEvictKey(node_id, it->second, std::move(keys));
+    // Chunked to the shared gRPC message limit.  An eviction round frees a
+    // FRACTION of the tier, so the victim list grows with the deployment while
+    // the limit does not: at 512 GiB a round selected 155,157 keys, which is
+    // 18.7 MB of `repeated string` and was refused whole on all 81 rounds --
+    // protobuf has no partial delivery, so being over the limit freed nothing
+    // rather than freeing most of it, and the tier could not un-fill itself.
+    //
+    // Splitting is safe in a way that most batch APIs are not: peer Evict is
+    // idempotent, master state is unchanged here (REMOVE events on the peer's
+    // next heartbeat are what shrink the index), and a chunk that fails is
+    // retried next round.  So N chunks reach the same state as one message
+    // would have, and a partial round still makes progress.
+    size_t sent = 0;
+    size_t chunks = 0;
+    while (sent < keys.size()) {
+      const size_t take = GrpcMaxItemsPerBatch(keys, sent);
+      std::vector<std::string> chunk(std::make_move_iterator(keys.begin() + sent),
+                                     std::make_move_iterator(keys.begin() + sent + take));
+      sent += take;
+      ++chunks;
+      dispatcher_->DispatchEvictKey(node_id, it->second, std::move(chunk));
+    }
+    if (chunks > 1) {
+      MORI_UMBP_DEBUG("[EvictionManager] node={} {} keys dispatched in {} chunks", node_id,
+                      keys.size(), chunks);
+    }
   }
 }
 

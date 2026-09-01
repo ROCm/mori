@@ -92,6 +92,11 @@ class InstrumentedBackend final : public MediumBackend {
   void ClearLocal() override { inner_->ClearLocal(); }
   void ClearFullSyncAcked() override { inner_->ClearFullSyncAcked(); }
   bool IsClearFullSyncPending() const override { return inner_->IsClearFullSyncPending(); }
+  void SetEventPublishing(bool enabled) override { inner_->SetEventPublishing(enabled); }
+  void EnableLocalEviction(double high_watermark, double low_watermark) override {
+    inner_->EnableLocalEviction(high_watermark, low_watermark);
+  }
+
   void SetAutoFlushHook(size_t threshold, std::function<void()> cb) override {
     inner_->SetAutoFlushHook(threshold, std::move(cb));
   }

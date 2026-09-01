@@ -43,10 +43,12 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/device_copy.h"
 #include "umbp/common/env_time.h"
+#include "umbp/common/grpc_limits.h"
 #include "umbp/common/parallel_for.h"
 #include "umbp/common/range_utils.h"
 #include "umbp/distributed/master/master_metrics.h"
@@ -335,8 +337,8 @@ class RangedStats {
         "[RangedCall][dbg] SUMMARY {} calls={} total={:.3f}s mean_call={:.1f}us bytes={:.2f}GiB "
         "items_per_call={:.0f} | resolve={:.1f}% classify={:.1f}% build={:.1f}% validate={:.1f}% "
         "commit={:.1f}% route={:.1f}% xfer={:.1f}%(plan={:.1f}% submit={:.1f}% wait={:.1f}%) "
-        "lock={:.1f}% remote={:.1f}% other={:.1f}% "
-        "| xfer_only={:.2f}GiB/s end2end={:.2f}GiB/s",
+        "lock={:.1f}% remote={:.1f}% "
+        "other={:.1f}% | xfer_only={:.2f}GiB/s end2end={:.2f}GiB/s",
         name, t.calls, t.total, 1e6 * t.total / t.calls, t.bytes / (1024.0 * 1024 * 1024),
         static_cast<double>(t.items) / t.calls, share(t.resolve), share(t.classify), share(t.build),
         share(t.validate), share(t.commit), share(t.route), share(t.xfer), share(t.xfer_plan),
@@ -899,6 +901,20 @@ bool PoolClient::Init() {
     // Apply the generic operation/byte/latency instrumentation uniformly to
     // every named backend, including multiple instances of the same medium.
     backend = MakeInstrumentedBackend(std::move(backend));
+
+    // A node with no master owns its whole storage policy, and both halves of
+    // that follow from the same fact: nobody will ever call Evict() on this
+    // backend, and nobody will ever drain its heartbeat outbox.  So the backend
+    // evicts for itself, and stops recording events addressed to a master that
+    // does not exist.  Both are no-ops in a cluster -- master-driven eviction
+    // stays the only policy there, and the outbox keeps feeding the heartbeat.
+    //
+    // Before Init(), which is the contract EnableLocalEviction states.
+    if (!master_client_) {
+      backend->SetEventPublishing(false);
+      backend->EnableLocalEviction(config_.local_evict_high_watermark,
+                                   config_.local_evict_low_watermark);
+    }
 
     // Narrowed to MemoryRegistrar: a backend publishes endpoints, it does not
     // move bytes, and that is a compile-time fact (design doc §5 Rule C).
@@ -1574,44 +1590,71 @@ bool PoolClient::CopyContiguousToRanges(const void* src, size_t object_size,
                                 /*src_base=*/0, object_size, ranges);
 }
 
+bool PoolClient::BuildContiguousToRangesItems(const TransferRef& src, uint64_t src_base,
+                                              size_t object_size,
+                                              const std::vector<ObjectRange>& ranges, size_t tag,
+                                              std::vector<TransferItem>* items) {
+  const size_t before = items->size();
+  for (const auto& range : ranges) {
+    // All-or-nothing per object: a partially appended object would be
+    // transferred as a torn read, so roll back to the batch's prior end.
+    if (range.size == 0 || range.user == nullptr ||
+        IsObjectRangeOverflow(range.object_offset, range.size, object_size)) {
+      items->resize(before);
+      return false;
+    }
+    TransferItem item;
+    item.size = range.size;
+    item.tag = tag;
+    item.src = src;
+    item.src_offset = src_base + range.object_offset;
+    item.dst = ClassifiedUserBytes(range.user, range.size);
+    item.dst_offset = 0;
+    items->push_back(std::move(item));
+  }
+  return items->size() > before;
+}
+
 bool PoolClient::CopyContiguousToRanges(const TransferRef& src, uint64_t src_base,
                                         size_t object_size,
                                         const std::vector<ObjectRange>& ranges) {
   std::vector<TransferItem> items;
   items.reserve(ranges.size());
-  for (const auto& range : ranges) {
-    if (range.size == 0 || range.user == nullptr) return false;
-    if (IsObjectRangeOverflow(range.object_offset, range.size, object_size)) return false;
-    TransferItem item;
-    item.size = range.size;
-    item.tag = 0;
-    item.src = src;
-    item.src_offset = src_base + range.object_offset;
-    item.dst = ClassifiedUserBytes(range.user, range.size);
-    item.dst_offset = 0;
-    items.push_back(std::move(item));
+  if (!BuildContiguousToRangesItems(src, src_base, object_size, ranges, /*tag=*/0, &items)) {
+    return false;
   }
-  return !items.empty() && transfer_engine_->Transfer(items, /*failed_tags=*/nullptr);
+  return transfer_engine_->Transfer(items, /*failed_tags=*/nullptr);
 }
 
-bool PoolClient::CopyRangesToContiguous(const std::vector<ObjectRange>& ranges, void* dst,
-                                        size_t object_size) {
+bool PoolClient::BuildRangesToContiguousItems(const std::vector<ObjectRange>& ranges, void* dst,
+                                              size_t object_size, size_t tag,
+                                              std::vector<TransferItem>* items) {
   const TransferRef object_ref = TransferRef::HostBytes(dst, object_size);
-  std::vector<TransferItem> items;
-  items.reserve(ranges.size());
+  const size_t before = items->size();
   for (const auto& range : ranges) {
-    if (range.size == 0 || range.user == nullptr) return false;
-    if (IsObjectRangeOverflow(range.object_offset, range.size, object_size)) return false;
+    if (range.size == 0 || range.user == nullptr ||
+        IsObjectRangeOverflow(range.object_offset, range.size, object_size)) {
+      items->resize(before);
+      return false;
+    }
     TransferItem item;
     item.size = range.size;
-    item.tag = 0;
+    item.tag = tag;
     item.src = ClassifiedUserBytes(range.user, range.size);
     item.src_offset = 0;
     item.dst = object_ref;
     item.dst_offset = range.object_offset;
-    items.push_back(std::move(item));
+    items->push_back(std::move(item));
   }
-  return !items.empty() && transfer_engine_->Transfer(items, /*failed_tags=*/nullptr);
+  return items->size() > before;
+}
+
+bool PoolClient::CopyRangesToContiguous(const std::vector<ObjectRange>& ranges, void* dst,
+                                        size_t object_size) {
+  std::vector<TransferItem> items;
+  items.reserve(ranges.size());
+  if (!BuildRangesToContiguousItems(ranges, dst, object_size, /*tag=*/0, &items)) return false;
+  return transfer_engine_->Transfer(items, /*failed_tags=*/nullptr);
 }
 
 void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteRequest>& requests,
@@ -2203,8 +2246,13 @@ void PoolClient::ExecuteBatchPutPlan(const BatchPutPlan& plan,
   // failed, now just works.
   std::vector<std::unique_ptr<RemotePutInFlight>> inflights;
   inflights.reserve(plan.remote_groups.size());
-  for (const auto& [node_id, items] : plan.remote_groups) {
-    if (auto f = SubmitRemoteBatchPut(items, results)) inflights.push_back(std::move(f));
+  {
+    // NOTE: SubmitRemoteBatchPut's BatchAllocateSlots is a SYNCHRONOUS RPC, so
+    // this loop serializes one allocate round trip per peer even though the
+    // comment above promises overlap -- only the RDMA that follows overlaps.
+    for (const auto& [node_id, items] : plan.remote_groups) {
+      if (auto f = SubmitRemoteBatchPut(items, results)) inflights.push_back(std::move(f));
+    }
   }
   run_local_put();
   for (auto& f : inflights) WaitRemoteBatchPut(*f, results);
@@ -3030,6 +3078,13 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   if (dbg != nullptr) dbg->remote_keys = missed.size();
   if (missed.empty()) return results;
 
+  // No master, no remote phase: nothing can route these keys anywhere, so a
+  // local miss is the final answer (the same disposition BatchGet takes).
+  // Returning here rather than falling into the arena check matters because an
+  // embedded deployment allocates no arena -- without this, every ordinary
+  // cache miss would report itself as a scratch-arena error.
+  if (!HasMaster()) return results;
+
   // ---- Phase 2: the rest, through the GET scratch arena ----
   //
   // Only the requested spans cross the wire, packed back-to-back into the
@@ -3224,13 +3279,42 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
     // restored by MaybePrefetchWholeObject below instead.
     ExecuteRemoteBatchGetPlan(plan, &fetched, /*recache_remote=*/false);
 
+    // Scatter EVERY fetched unit out of the arena with ONE transfer, for the
+    // same reason the put side assembles with one (see BatchPutRanges): a
+    // per-unit CopyContiguousToRanges is a blocking Transfer each, and the
+    // launch + synchronize dominates the copy at these object sizes.
+    std::vector<TransferItem> scatter_items;
+    std::vector<size_t> scatter_tag_to_j;
+    scatter_items.reserve(count);
+    scatter_tag_to_j.reserve(count);
+    for (size_t j = 0; j < count; ++j) {
+      if (!fetched[j]) continue;
+      const auto& unit = units[pos + j];
+      const size_t tag = scatter_tag_to_j.size();
+      if (!BuildContiguousToRangesItems(TransferRef::HostBytes(sub_dsts[j], unit.bytes),
+                                        /*src_base=*/0, unit.bytes, unit.packed, tag,
+                                        &scatter_items)) {
+        continue;
+      }
+      scatter_tag_to_j.push_back(j);
+    }
+    std::unordered_set<size_t> scatter_failed;
+    if (!scatter_items.empty()) {
+      std::vector<size_t> failed_tags;
+      transfer_engine_->Transfer(scatter_items, &failed_tags);
+      for (size_t tag : failed_tags) {
+        if (tag < scatter_tag_to_j.size()) scatter_failed.insert(scatter_tag_to_j[tag]);
+      }
+    }
+    std::unordered_set<size_t> scattered(scatter_tag_to_j.begin(), scatter_tag_to_j.end());
+
     for (size_t j = 0; j < count; ++j) {
       const auto& unit = units[pos + j];
       if (!fetched[j]) {
         unit_ok[unit.original] = false;
         continue;
       }
-      if (!CopyContiguousToRanges(sub_dsts[j], unit.bytes, unit.packed)) {
+      if (scattered.count(j) == 0 || scatter_failed.count(j) != 0) {
         unit_ok[unit.original] = false;
         continue;
       }
@@ -3433,13 +3517,50 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
     sub_sizes.reserve(count);
     sub_routes.reserve(count);
     sub_originals.reserve(count);
+    // Assemble EVERY object in this arena round with ONE transfer.
+    //
+    // This used to call CopyRangesToContiguous per key, and each of those is a
+    // blocking Transfer -- its own kernel launch and hipStreamSynchronize.  On
+    // an 8-rank embedded deployment that showed up as 369 transfers carrying
+    // 369 segments, 14.5 us apiece for ~5 us of actual copy: ~65% of remote
+    // transfer time was per-call overhead.  The local path
+    // (ExecuteLocalPutRangesBatch) already accumulates across requests and
+    // transfers once; this makes the remote path match it.
+    //
+    // Tagged by j so a single unassemblable object fails alone, which is what
+    // the per-key call gave us for free.
+    std::vector<TransferItem> assembly_items;
+    std::vector<size_t> assembly_tag_to_j;
+    assembly_items.reserve(count);
+    assembly_tag_to_j.reserve(count);
+    for (size_t j = 0; j < count; ++j) {
+      const size_t original = valid[remote[pos + j]];
+      void* slice = scratch_base + scratch_offsets[j];
+      const size_t tag = assembly_tag_to_j.size();
+      if (!BuildRangesToContiguousItems(
+              MakeWriteRanges(srcs[original], sizes[original], dst_offsets[original]), slice,
+              object_sizes[original], tag, &assembly_items)) {
+        MORI_UMBP_ERROR("[PoolClient] BatchPutRanges: assembly plan failed for key='{}'",
+                        keys[original]);
+        continue;
+      }
+      assembly_tag_to_j.push_back(j);
+    }
+    std::unordered_set<size_t> assembly_failed;
+    if (!assembly_items.empty()) {
+      std::vector<size_t> failed_tags;
+      transfer_engine_->Transfer(assembly_items, &failed_tags);
+      for (size_t tag : failed_tags) {
+        if (tag < assembly_tag_to_j.size()) assembly_failed.insert(assembly_tag_to_j[tag]);
+      }
+    }
+    std::unordered_set<size_t> assembled(assembly_tag_to_j.begin(), assembly_tag_to_j.end());
+
     for (size_t j = 0; j < count; ++j) {
       const size_t route_index = remote[pos + j];
       const size_t original = valid[route_index];
       void* slice = scratch_base + scratch_offsets[j];
-      if (!CopyRangesToContiguous(
-              MakeWriteRanges(srcs[original], sizes[original], dst_offsets[original]), slice,
-              object_sizes[original])) {
+      if (assembled.count(j) == 0 || assembly_failed.count(j) != 0) {
         MORI_UMBP_ERROR("[PoolClient] BatchPutRanges: assembly failed for key='{}'",
                         keys[original]);
         continue;
@@ -4267,7 +4388,8 @@ bool PoolClient::EnsurePeerServiceConnection(PeerConnection& peer) {
     return true;
   }
 
-  auto channel = grpc::CreateChannel(peer.peer_address, grpc::InsecureChannelCredentials());
+  auto channel = grpc::CreateCustomChannel(peer.peer_address, grpc::InsecureChannelCredentials(),
+                                           GrpcChannelArgs());
   auto stub = ::umbp::UMBPPeer::NewStub(channel);
   if (!hydrate_from_peer(stub.get())) {
     return false;
