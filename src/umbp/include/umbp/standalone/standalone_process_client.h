@@ -134,6 +134,32 @@ class StandaloneProcessClient : public IUMBPClient {
   mutable std::mutex registration_mu_;
   std::string client_id_;
   std::vector<RegisteredRegion> regions_;
+
+  // Key lists already sent, and the handles the server gave back for them, so a
+  // layer-wise restore serializes its keys once instead of once per layer group.
+  //
+  // Matching is by full equality of the key vector, never by hash, so nothing
+  // here can select the wrong list; the fingerprint travels only so the server
+  // can make the same check.
+  struct KeyHandle {
+    std::vector<std::string> keys;
+    uint64_t handle = 0;
+    uint64_t fingerprint = 0;
+  };
+
+  // One key set in flight per pool: small enough that a linear scan beats an
+  // index, and a miss only costs a resend.
+  static constexpr size_t kKeyHandleSlots = 8;
+
+  // Returns 0 when this set has not been sent before, and fills *fingerprint
+  // either way.
+  uint64_t LookupKeyHandle(const std::vector<std::string>& keys, uint64_t* fingerprint);
+  void RememberKeyHandle(const std::vector<std::string>& keys, uint64_t handle,
+                         uint64_t fingerprint);
+  void ForgetKeyHandle(uint64_t handle);
+
+  std::mutex key_handle_mu_;
+  std::vector<KeyHandle> key_handles_;  // most recently used first
 };
 
 }  // namespace mori::umbp::standalone

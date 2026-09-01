@@ -459,18 +459,99 @@ ResolvedEntry PageBackend::Resolve(const std::string& key) {
   return r;
 }
 
+namespace {
+
+// Only picks a cache candidate; a hit is confirmed by comparing every key, so
+// this needs to be fast and well-spread, not cryptographic. A word at a time
+// because byte-wise FNV-1a retires one byte per multiply latency, which at a
+// thousand ~128-byte keys per call is tens of microseconds.
+uint64_t FingerprintKeys(const std::vector<std::string>& keys) {
+  constexpr uint64_t kMul1 = 0x9e3779b97f4a7c15ULL;
+  constexpr uint64_t kMul2 = 0xc2b2ae3d27d4eb4fULL;
+  uint64_t h = 1469598103934665603ULL;
+  const auto mix_word = [&h](uint64_t word) {
+    h ^= word * kMul1;
+    h = ((h << 31) | (h >> 33)) * kMul2;
+  };
+  const auto mix_bytes = [&mix_word](const char* data, size_t len) {
+    size_t i = 0;
+    for (; i + 8 <= len; i += 8) {
+      uint64_t word;
+      std::memcpy(&word, data + i, sizeof(word));  // unaligned-safe, no aliasing UB
+      mix_word(word);
+    }
+    if (i < len) {
+      uint64_t tail = 0;
+      std::memcpy(&tail, data + i, len - i);
+      mix_word(tail);
+    }
+  };
+  mix_word(keys.size());
+  for (const auto& key : keys) {
+    // Length-delimited, so that concatenations that happen to agree do not.
+    mix_word(key.size());
+    mix_bytes(key.data(), key.size());
+  }
+  return h;
+}
+
+}  // namespace
+
 std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::string>& keys,
                                                      bool include_descs) {
-  std::vector<ResolvedEntry> out(keys.size());
-  if (keys.empty()) return out;
+  if (keys.empty()) return {};
+  const uint64_t fingerprint = FingerprintKeys(keys);
   std::lock_guard<std::mutex> lock(mutex_);
+  return *ResolveBatchLocked(keys, include_descs, fingerprint);
+}
+
+std::shared_ptr<const std::vector<ResolvedEntry>> PageBackend::BatchResolveShared(
+    const std::vector<std::string>& keys, bool include_descs) {
+  if (keys.empty()) return std::make_shared<const std::vector<ResolvedEntry>>();
+  // Hashed before the lock, not inside it: every rank on the node queues on this
+  // mutex, so tens of microseconds added to the critical section is paid once
+  // per rank -- which is how a cache meant to save time ends up losing it.
+  const uint64_t fingerprint = FingerprintKeys(keys);
+  std::lock_guard<std::mutex> lock(mutex_);
+  return ResolveBatchLocked(keys, include_descs, fingerprint);
+}
+
+std::shared_ptr<const std::vector<ResolvedEntry>> PageBackend::ResolveBatchLocked(
+    const std::vector<std::string>& keys, bool include_descs, uint64_t fingerprint) {
   // One now() for the batch: it runs in well under a millisecond against a
   // TTL measured in seconds, so the last key loses nothing worth a syscall.
   const auto lease_deadline = std::chrono::steady_clock::now() + read_lease_ttl_;
+
+  auto cached = resolve_cache_.find(fingerprint);
+  if (cached != resolve_cache_.end()) {
+    ResolveCacheEntry& entry = cached->second;
+    // generation first: it is the cheap check, and it is what makes the stored
+    // OwnedSlot pointers safe to touch at all.
+    const bool usable = entry.generation == eviction_generation_ &&
+                        entry.include_descs == include_descs && entry.keys == keys;
+    if (usable) {
+      // Renewed through the stored pointers rather than by re-hashing. A reused
+      // answer must not carry a stale lease: the window between resolving and
+      // copying is still fenced by it.
+      for (OwnedSlot* slot : entry.slots) {
+        if (slot != nullptr) slot->read_lease_until = lease_deadline;
+      }
+      entry.last_used = ++resolve_cache_clock_;
+      return entry.result;
+    }
+    resolve_cache_.erase(cached);
+  }
+
+  auto out = std::make_shared<std::vector<ResolvedEntry>>(keys.size());
+  std::vector<OwnedSlot*> slots(keys.size(), nullptr);
+  bool all_found = true;
   for (size_t i = 0; i < keys.size(); ++i) {
     auto it = owned_.find(keys[i]);
-    if (it == owned_.end()) continue;
-    auto& entry = out[i];
+    if (it == owned_.end()) {
+      all_found = false;
+      continue;
+    }
+    auto& entry = (*out)[i];
     entry.outcome = ResolveOutcome::kFound;
     entry.found = true;
     entry.pages = it->second.pages;
@@ -478,7 +559,31 @@ std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::stri
     entry.page_size = page_size_;
     if (include_descs) entry.descs = BuildBufferDescsLocked(it->second.pages);
     it->second.read_lease_until = lease_deadline;
+    slots[i] = &it->second;
   }
+
+  // Only a batch that hit on every key is reusable. The generation covers keys
+  // LEAVING owned_, not arriving -- Commit does not move it, and making it do so
+  // would invalidate the cache on every offload -- so a remembered "not found"
+  // could outlive the key showing up. A full hit has no such hole: the only way
+  // one of its keys can change is eviction, which does move the generation.
+  if (!all_found) return out;
+
+  if (resolve_cache_.size() >= kResolveCacheCapacity) {
+    auto oldest = resolve_cache_.begin();
+    for (auto it = resolve_cache_.begin(); it != resolve_cache_.end(); ++it) {
+      if (it->second.last_used < oldest->second.last_used) oldest = it;
+    }
+    resolve_cache_.erase(oldest);
+  }
+  ResolveCacheEntry entry;
+  entry.keys = keys;
+  entry.slots = std::move(slots);
+  entry.result = out;
+  entry.generation = eviction_generation_;
+  entry.include_descs = include_descs;
+  entry.last_used = ++resolve_cache_clock_;
+  resolve_cache_.emplace(fingerprint, std::move(entry));
   return out;
 }
 
@@ -539,6 +644,10 @@ std::vector<EvictResult> PageBackend::Evict(const std::vector<std::string>& keys
     r.bytes_freed = it->second.size;
     QueueEventLocked(KvEvent{KvEvent::Kind::REMOVE, key, tier_, 0});
     owned_.erase(it);
+    // These pages can now be handed to another key, so every cached resolve
+    // that might name them is stale -- and the OwnedSlot just erased must not
+    // be dereferenced again.
+    ++eviction_generation_;
     out.push_back(std::move(r));
   }
   return out;
@@ -638,6 +747,8 @@ void PageBackend::ClearLocal() {
     if (allocator_) allocator_->Deallocate(slot.pages);
   }
   owned_.clear();
+  ++eviction_generation_;
+  resolve_cache_.clear();
 
   // Deadlines that mattered are already in deferred_frees_; the rest went
   // with owned_.
@@ -842,6 +953,8 @@ void PageBackend::ReaperSweep() {
   for (auto it = deferred_frees_.begin(); it != deferred_frees_.end();) {
     if (it->release_at <= now) {
       if (allocator_) allocator_->Deallocate(it->pages);
+      // Deferred from ClearLocal: the pages become reusable only now.
+      ++eviction_generation_;
       MORI_UMBP_DEBUG("[PageBackend] released deferred key='{}' pages={}", it->key,
                       it->pages.size());
       it = deferred_frees_.erase(it);

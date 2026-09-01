@@ -101,6 +101,17 @@ message BatchRangeDataRequest {
   repeated uint64 object_offsets = 7;
   // Put only: the expected full object size, one per key. Empty for get.
   repeated uint64 object_sizes = 8;
+  // Get only, optional. Non-zero key_handle names a key list the server minted
+  // on an earlier call and still holds; `keys` is then empty. A layer-wise
+  // reader asks about one set once per layer group, so this is the part of the
+  // request worth not repeating.
+  //
+  // A hint and nothing more: a handle the server no longer holds is answered
+  // with key_handle_unknown, and the caller repeats the call carrying its keys.
+  // key_fingerprint is checked against the one recorded at mint, so a handle
+  // can never bind to a list other than the one it was minted for.
+  uint64 key_handle = 9;
+  uint64 key_fingerprint = 10;
 }
 
 message BatchDataWithDepthRequest {
@@ -114,6 +125,12 @@ message BatchDataWithDepthRequest {
 
 message BatchBoolResponse {
   repeated bool ok = 1;
+  // BatchGetRanges only. Non-zero when the server minted a handle for this
+  // call's key list; name it instead of the keys next time.
+  uint64 key_handle = 2;
+  // The offered key_handle is unknown, or does not match the offered
+  // fingerprint. Nothing was read and `ok` is empty; repeat the call with keys.
+  bool key_handle_unknown = 3;
 }
 
 enum MemoryKind {

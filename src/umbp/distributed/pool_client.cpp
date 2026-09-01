@@ -1451,12 +1451,20 @@ void PoolClient::ResolveLocalBatch(const std::vector<std::string>& keys,
   if (resolutions != nullptr) resolutions->assign(keys.size(), ResolvedEntry{});
   if (candidates.empty() || default_pool_ == nullptr || registry_.Empty()) return;
 
+  // The whole-batch case -- every key a candidate, none claimed yet -- is what a
+  // layer-wise restore does, and there `keys` IS the query PeerPool needs. Naming
+  // it directly skips a per-key string copy of the entire set; a partial set
+  // (some keys already served from elsewhere) still needs its own vector.
+  const std::vector<std::string>* query = &keys;
   std::vector<std::string> batch;
-  batch.reserve(candidates.size());
-  for (size_t i : candidates) batch.push_back(keys[i]);
+  if (candidates.size() != keys.size()) {
+    batch.reserve(candidates.size());
+    for (size_t i : candidates) batch.push_back(keys[i]);
+    query = &batch;
+  }
 
   auto found =
-      ResolveLocalBatchWithBusyRetry(default_pool_.get(), batch, /*include_descs=*/false);
+      ResolveLocalBatchWithBusyRetry(default_pool_.get(), *query, /*include_descs=*/false);
   for (size_t j = 0; j < candidates.size() && j < found.size(); ++j) {
     if (!found[j].resolved.found) continue;
     auto* backend = registry_.Get(found[j].backend_id);
@@ -2968,11 +2976,11 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
     if (sizes[i].empty()) continue;  // asked for nothing; stays false
 
     MediumBackend* const holder = holders[i];
-    const ResolvedEntry& resolved = resolutions[i];
     if (holder == nullptr) {
       missed.push_back(i);
       continue;
     }
+    const ResolvedEntry& resolved = resolutions[i];
     // The get API takes no object_sizes; the resolved entry is where the true
     // stored size becomes known.  First hit labels the call.
     if (dbg != nullptr && dbg->object_size == 0) {

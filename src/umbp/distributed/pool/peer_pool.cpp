@@ -555,21 +555,35 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
   const auto resolve = [&](uint32_t backend_id, const std::vector<size_t>& indices) {
     auto* backend = backends_->Get(backend_id);
     if (backend == nullptr || indices.empty()) return;
+
+    // Once a key's placement is learned (bottom of this function), every
+    // later call for that key routes here via preferred_groups on the same
+    // backend_id -- and both call sites below build their index list by
+    // walking 0..keys.size()-1 in order and only ever appending, so a full-size
+    // `indices` is exactly the identity permutation. A layer-wise restore hits
+    // this every time after the first layer group: same keys, same backend.
+    // Passing `keys` directly (instead of copying `indices` out of it) is what
+    // lets the backend recognise the query as one it already answered and
+    // serve the cached resolve instead of re-hashing and re-probing per key.
+    const std::vector<std::string>* query = &keys;
     std::vector<std::string> backend_keys;
-    backend_keys.reserve(indices.size());
-    for (size_t index : indices) {
-      attempted[index][backend_id] = true;
-      backend_keys.push_back(keys[index]);
+    if (indices.size() != keys.size()) {
+      backend_keys.reserve(indices.size());
+      for (size_t index : indices) backend_keys.push_back(keys[index]);
+      query = &backend_keys;
     }
-    auto results = backend->BatchResolve(backend_keys, include_descs);
-    for (size_t i = 0; i < indices.size() && i < results.size(); ++i) {
+    for (size_t index : indices) attempted[index][backend_id] = true;
+
+    auto results = backend->BatchResolveShared(*query, include_descs);
+    for (size_t i = 0; results != nullptr && i < indices.size() && i < results->size(); ++i) {
       const size_t index = indices[i];
-      const ResolveOutcome outcome = EffectiveResolveOutcome(results[i]);
+      const ResolvedEntry& result = (*results)[i];
+      const ResolveOutcome outcome = EffectiveResolveOutcome(result);
       if (outcome == ResolveOutcome::kFound) {
         if (out[index].resolved.found) continue;
         out[index].backend_id = backend_id;
         out[index].tier = backend->Tier();
-        out[index].resolved = std::move(results[i]);
+        out[index].resolved = result;
         out[index].resolved.outcome = ResolveOutcome::kFound;
         continue;
       }
