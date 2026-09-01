@@ -565,6 +565,7 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
 void IonicDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
                                          const RdmaEndpointHandle& remote, uint32_t qpn) {
   uint32_t local_qpn = local.qpn;
+
   assert(qpPool.find(local_qpn) != qpPool.end());
   IonicQpContainer* qp = qpPool.at(local_qpn);
 
