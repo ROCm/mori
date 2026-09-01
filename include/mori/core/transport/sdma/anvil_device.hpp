@@ -52,9 +52,7 @@ constexpr long long MAX_RETRIES = 1LL << 34;
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
 
-// gfx12 dropped the s_waitcnt intrinsic. This gate only makes the header build
-// for gfx1250 -- the packets below are still the gfx9 layout, with no npd/scope
-// fields, so this path is not ported to gfx12.5 (see cco.hpp for one that is).
+// gfx12 dropped the s_waitcnt intrinsic; a release fence to agent scope replaces it.
 __device__ __forceinline__ void PublishStores() {
 #if defined(__gfx1250__)
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
@@ -63,13 +61,41 @@ __device__ __forceinline__ void PublishStores() {
 #endif
 }
 
-// SDMA_PKT_COPY_LINEAR DW2 (PARAMETER_UNION) stays 0: peak D2D/XGMI copy BW.
+// gfx12.5 reads cache scope and temporal hints out of bits gfx9 leaves reserved, gated
+// by the COPY header's npd bit; ROCr makes the same split between BlitSdmaV6 and V4.
+// gfx9 wants those bits zero for peak xGMI bandwidth.
+//
+// sdma_pkt_struct.h carries the gfx9 field names, and the two layouts disagree on which
+// bits those names cover, so the gfx12.5 bits are set on the raw dword instead. The bit
+// positions come from cco.hpp's CCO_SDMA_PKT_* structs -- the copy gfx1250 is known to
+// work with, since the whole cco SDMA test suite passes on it.
+//
+// MORI_ANVIL_SDMA_NO_SCOPE exists so both packet layouts can be built from THIS file:
+// an A/B that swaps files instead mixes the change with whatever else differs between
+// the two trees.
+#if defined(__gfx1250__) && !defined(MORI_ANVIL_SDMA_NO_SCOPE)
+#define MORI_ANVIL_SDMA_SCOPE_FIELDS 1
+constexpr uint32_t SDMA_SCOPE_SYS = 3u;
+// COPY_LINEAR: DW0 bit 28 = npd. DW2 bits 18-19 = dst_scope, bits 26-27 = src_scope.
+constexpr uint32_t SDMA_COPY_NPD_BIT = 1u << 28;
+constexpr uint32_t SDMA_COPY_DST_SCOPE_SHIFT = 18;
+constexpr uint32_t SDMA_COPY_SRC_SCOPE_SHIFT = 26;
+// ATOMIC: DW0 bits 20-21 = scope. `operation` sits at bits 25-31 in both layouts, which
+// is why the existing named assignment to it is already correct here.
+constexpr uint32_t SDMA_ATOMIC_SCOPE_SHIFT = 20;
+#endif
+
 __device__ __forceinline__ SDMA_PKT_COPY_LINEAR CreateCopyPacket(void* srcBuf, void* dstBuf,
                                                                  long long int packetSize) {
   SDMA_PKT_COPY_LINEAR copy_packet = {};
 
   copy_packet.HEADER_UNION.op = SDMA_OP_COPY;
   copy_packet.HEADER_UNION.sub_op = SDMA_SUBOP_COPY_LINEAR;
+#ifdef MORI_ANVIL_SDMA_SCOPE_FIELDS
+  copy_packet.HEADER_UNION.DW_0_DATA |= SDMA_COPY_NPD_BIT;
+  copy_packet.PARAMETER_UNION.DW_2_DATA |= (SDMA_SCOPE_SYS << SDMA_COPY_DST_SCOPE_SHIFT) |
+                                           (SDMA_SCOPE_SYS << SDMA_COPY_SRC_SCOPE_SHIFT);
+#endif
 
   copy_packet.COUNT_UNION.count = (uint32_t)(packetSize - 1);
   copy_packet.SRC_ADDR_LO_UNION.src_addr_31_0 = (uint32_t)(uintptr_t)srcBuf;
@@ -85,6 +111,9 @@ __device__ __forceinline__ SDMA_PKT_ATOMIC CreateAtomicIncPacket(HSAuint64* sign
 
   packet.HEADER_UNION.op = SDMA_OP_ATOMIC;
   packet.HEADER_UNION.operation = SDMA_ATOMIC_ADD64;
+#ifdef MORI_ANVIL_SDMA_SCOPE_FIELDS
+  packet.HEADER_UNION.DW_0_DATA |= SDMA_SCOPE_SYS << SDMA_ATOMIC_SCOPE_SHIFT;
+#endif
 
   packet.ADDR_LO_UNION.addr_31_0 = (uint32_t)((uintptr_t)signal);
   packet.ADDR_HI_UNION.addr_63_32 = (uint32_t)((uintptr_t)signal >> 32);
