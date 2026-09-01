@@ -27,6 +27,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "umbp/distributed/peer/backend/page_pool.h"
 #include "umbp/distributed/types.h"
 
 namespace mori::umbp {
@@ -48,7 +49,12 @@ namespace mori::umbp {
 // THREAD SAFETY: PageBitmapAllocator holds NO internal mutex.  Callers MUST
 // serialize every method via the owning object's mutex (e.g.
 // `ClientRegistry::mutex_` on master, `PageBackend::mutex_` on peer).
-class PageBitmapAllocator {
+//
+// This is the default PagePool implementation.  It is a bitmap with a next-fit
+// cursor: cheap to reason about and allocation-free, but its search is still
+// proportional to the run it examines rather than O(1).  See page_pool.h for
+// why that seam exists and what a faster implementation would look like.
+class PageBitmapAllocator : public PagePool {
  public:
   struct BufferState {
     uint32_t buffer_index = 0;
@@ -103,7 +109,7 @@ class PageBitmapAllocator {
 
   // All-or-nothing allocate.  See class doc for strategy ordering; nullopt
   // leaves every bitmap bit untouched.
-  std::optional<std::vector<PageLocation>> Allocate(uint32_t num_pages) {
+  std::optional<std::vector<PageLocation>> Allocate(uint32_t num_pages) override {
     if (num_pages == 0) return std::nullopt;
 
     // Strategy 1: same-buffer continuous run.
@@ -169,7 +175,7 @@ class PageBitmapAllocator {
   // Idempotent free: for each entry, only flip true -> false.  Out-of-range
   // buffer_index / page_index and already-free pages are silently skipped
   // (do NOT throw, do NOT underflow free_count).
-  void Deallocate(const std::vector<PageLocation>& pages) {
+  void Deallocate(const std::vector<PageLocation>& pages) override {
     for (const auto& p : pages) {
       if (p.buffer_index >= buffers_.size()) continue;
       auto& buf = buffers_[p.buffer_index];
@@ -180,7 +186,7 @@ class PageBitmapAllocator {
     }
   }
 
-  uint64_t TotalBytes() const {
+  uint64_t TotalBytes() const override {
     uint64_t sum = 0;
     for (const auto& b : buffers_) {
       sum += static_cast<uint64_t>(b.total_pages) * page_size_;
@@ -188,16 +194,17 @@ class PageBitmapAllocator {
     return sum;
   }
 
-  uint64_t AvailableBytes() const {
+  uint64_t AvailableBytes() const override {
     uint64_t free_pages = 0;
     for (const auto& b : buffers_) free_pages += b.free_count;
     return free_pages * page_size_;
   }
 
-  uint64_t UsedBytes() const { return TotalBytes() - AvailableBytes(); }
-
-  uint64_t PageSize() const { return page_size_; }
-  size_t NumBuffers() const { return buffers_.size(); }
+  uint64_t PageSize() const override { return page_size_; }
+  size_t NumBuffers() const override { return buffers_.size(); }
+  uint32_t BufferPageCount(size_t buffer_index) const override {
+    return buffer_index < buffers_.size() ? buffers_[buffer_index].total_pages : 0;
+  }
 
   // Read-only access to per-buffer state (e.g. for diagnostics / Heartbeat
   // status reporting).  Returned reference is invalidated by any subsequent

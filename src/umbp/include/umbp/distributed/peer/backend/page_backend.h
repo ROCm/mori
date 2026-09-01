@@ -37,6 +37,7 @@
 
 #include "mori/io/engine.hpp"
 #include "umbp/distributed/peer/backend/medium_backend.h"
+#include "umbp/distributed/peer/backend/page_pool.h"
 #include "umbp/distributed/peer/backend/peer_page_allocator.h"
 #include "umbp/distributed/types.h"
 #include "umbp/local/host_mem_allocator.h"
@@ -462,7 +463,11 @@ class PageBackend : public MediumBackend {
   std::chrono::milliseconds read_lease_ttl_;
   std::chrono::milliseconds reaper_interval_;
 
-  std::unique_ptr<PageBitmapAllocator> allocator_;
+  // Held as the interface, not the concrete bitmap: swapping the page-
+  // allocation strategy is a one-line change at the two construction sites in
+  // Init/InstallTierConfig, and nothing else in this class learns which pool
+  // it got.  See page_pool.h.
+  std::unique_ptr<PagePool> allocator_;
   std::vector<std::vector<uint8_t>> buffer_descs_;
   // Local host base pointer per buffer_index.  Source of truth for page ->
   // local pointer, used by AcquireDramCopyPin.

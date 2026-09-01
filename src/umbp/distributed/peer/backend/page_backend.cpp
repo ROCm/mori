@@ -142,11 +142,11 @@ void PageBackend::InstallTierConfig(TierConfig cfg) {
 void PageBackend::BuildBufferRefs() {
   buffer_refs_.clear();
   if (!allocator_) return;
-  const auto& buffers = allocator_->Buffers();
-  buffer_refs_.resize(buffers.size());
-  for (size_t i = 0; i < buffers.size(); ++i) {
+  const size_t buffer_count = allocator_->NumBuffers();
+  buffer_refs_.resize(buffer_count);
+  for (size_t i = 0; i < buffer_count; ++i) {
     TransferRef ref;
-    ref.size = static_cast<uint64_t>(buffers[i].total_pages) * page_size_;
+    ref.size = static_cast<uint64_t>(allocator_->BufferPageCount(i)) * page_size_;
     // From the source that allocated these bytes, not assumed.  This is what
     // makes a local transfer against this backend select the right engine:
     // HbmCopyEngine claims the pair on loc == GPU, LocalCopyEngine on both CPU.
