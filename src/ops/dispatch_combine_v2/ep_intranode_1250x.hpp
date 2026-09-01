@@ -291,6 +291,10 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   const int aWarp = globalWarpId;
   const int aWarps = (int)gridDim.x * warpNum;
 
+  constexpr int kPresigCap = 512;
+  constexpr bool _presigOn = ((int)kCfg.maxTokPerRank <= kPresigCap) && (npes <= WS);
+  index_t _preSig = 1;
+
   const int _tpi = (topk > 0 && topk <= WS && (WS % topk) == 0) ? (WS / topk) : 1;
   const int _qTok = (aWarps > 0) ? (int)(((long long)args.numTokens + aWarps - 1) / aWarps) : _tpi;
   const int _etpi = (_tpi > 1 && _qTok >= 1 && _qTok < _tpi) ? _qTok : _tpi;
@@ -380,6 +384,10 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   const bool _blkMapNeeded = !((_bmPerTok > 0) && (((_bmTileB - 384) / _bmPerTok) > 0));
   for (int p = thdId; p < npes; p += blockDim.x) {
     index_t n = s_N[p];
+    if (_presigOn && globalWarpId == 0 && laneId < npes) {
+      _preSig = __hip_atomic_load(EpPeer<index_t>(win, laneId, args.offRecvNum) + myPe,
+                                  __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
     if (_blkMapNeeded) _cusplit_blkCount[(size_t)blockIdx.x * npes + p] = n;
     if (n > 0) {
       s_base[p] = __hip_atomic_fetch_add(EpPeer<index_t>(win, p, args.offTokOff), n,
@@ -675,7 +683,8 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
 
     for (int destPe = laneId; destPe < npes; destPe += WS) {
       index_t* signal = EpPeer<index_t>(win, destPe, args.offRecvNum) + myPe;
-      EpWaitEq(signal, 0);
+      if constexpr (_presigOn) asm volatile("" : "+v"(_preSig));
+      if (!_presigOn || _preSig != 0) EpWaitEq(signal, 0);
       index_t numTokenSignal = __hip_atomic_load(args.destPeTokenCounter + destPe, __ATOMIC_RELAXED,
                                                  __HIP_MEMORY_SCOPE_AGENT) +
                                1;
