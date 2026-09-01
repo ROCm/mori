@@ -782,20 +782,28 @@ namespace combine_impl {
 //     of it.
 constexpr size_t kCombineVecBytes = 16;
 
+// Vector steps issued before accumulating any of them. The shared
+// WARP_ACCUM_UNROLL default of 2 costs registers (Unroll*AccumNum vectors per
+// lane) and halves warpsPerToken via CombineVecStep(); at these token counts
+// the grid has warps to spare, so 1 measures faster. Scoped here rather than
+// changed globally -- the default also feeds the intra-node combine path.
+constexpr int kCombineAccumUnroll = 1;
+
 inline __device__ bool CombineVecAligned(size_t tokHiddenBytes, size_t tokCombXferBytes) {
   return ((tokHiddenBytes % kCombineVecBytes) == 0) && ((tokCombXferBytes % kCombineVecBytes) == 0);
 }
 
 template <typename TokT>
 inline __device__ size_t CombineVecStep(int warpSizeRt) {
-  return static_cast<size_t>(WARP_ACCUM_UNROLL) * warpSizeRt * (kCombineVecBytes / sizeof(TokT));
+  return static_cast<size_t>(kCombineAccumUnroll) * warpSizeRt * (kCombineVecBytes / sizeof(TokT));
 }
 
 template <typename TokT>
 inline __device__ void CombineGather(TokT* dest, TokT** srcPtrs, int accumNum, size_t nelems,
                                      bool vecAligned) {
   if (vecAligned) {
-    core::WarpAccumLF<TokT, kCombineVecBytes>(dest, srcPtrs, nullptr, accumNum, nelems);
+    core::WarpAccumLF<TokT, kCombineVecBytes, kCombineAccumUnroll>(dest, srcPtrs, nullptr, accumNum,
+                                                                   nelems);
   } else {
     core::WarpAccum<TokT, 4>(dest, srcPtrs, nullptr, accumNum, nelems);
   }
