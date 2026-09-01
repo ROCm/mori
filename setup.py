@@ -990,15 +990,12 @@ def _torch_symm_extension():
     mode = _torch_symm_mode()
     if mode == "OFF":
         return []
-    # rendezvous() is a cco window now, so the extension links libmori_cco.
-    if not _env_flag("BUILD_CCO", "ON"):
-        if mode == "ON":
-            raise RuntimeError(
-                "BUILD_TORCH_SYMM=ON needs BUILD_CCO=ON: the SymmetricMemory backend "
-                "links libmori_cco"
-            )
-        print("[mori] BUILD_CCO=OFF, so the torch SymmetricMemory backend is skipped")
-        return []
+    # rendezvous() is a cco window now, so the extension links libmori_cco. There is
+    # deliberately no BUILD_CCO check here: that env var is not forwarded to cmake
+    # (only BUILD_CCO_SDMA is), so reading it would gate on a flag that does not
+    # control whether libmori_cco is built. A build that really has no libmori_cco
+    # -- CMAKE_ARGS="-DBUILD_CCO=OFF" -- fails at link, which AUTO already reports
+    # and skips, and which BUILD_TORCH_SYMM=ON already turns into a hard error.
     if _TorchCppExtension is None:
         if mode == "ON":
             raise RuntimeError(

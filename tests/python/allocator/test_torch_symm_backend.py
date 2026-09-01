@@ -87,7 +87,8 @@ def _run(rank, world_size, port):
 
         assert window_handle(t) != 0
         assert window_handle(t, signal_pad=True) != 0
-        # The window belongs to the storage, so a view resolves to the same one.
+        # The wrapper resolves a view to its storage, so both name the same window.
+        # (This pins the Python side; the C++ lookup only ever sees the storage base.)
         assert window_handle(t[n // 2 :]) == window_handle(t)
 
         # A DevComm is parameterised by the algorithm that will run, so it is cached per
@@ -98,6 +99,11 @@ def _run(rank, world_size, port):
         assert a != 0
         assert dev_comm(group_name, key="all2all") == a, "same key must reuse"
         assert dev_comm(group_name, key="reduce") != a, "different key must not share"
+        # The key is supposed to encode the parameterisation, so asking for a bigger
+        # barrier array under a key that already exists must complain rather than hand
+        # back the smaller one.
+        with pytest.raises(RuntimeError, match="already exists"):
+            dev_comm(group_name, key="all2all", lsa_barrier_count=8)
         with pytest.raises(RuntimeError, match="rendezvous"):
             dev_comm("no-such-group")
 

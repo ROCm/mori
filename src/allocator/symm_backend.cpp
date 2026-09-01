@@ -25,10 +25,11 @@
 // register_availability() makes "MORI" selectable; torch then drives symm_mem.empty ->
 // alloc, symm_mem.rendezvous -> rendezvous, and torch.ops.symm_mem.* on the result.
 //
-// Deliberately does not use mori's shmem or cco allocators: both keep peer offsets
-// aligned only while every rank allocates AND frees in the same order, which torch cannot
-// hold (tensors die on Python GC, whose order is not synchronised across ranks). Here each
-// allocation is independent and free() is local, so divergent free order is harmless.
+// alloc() is plain HIP VMM, kept independent per rank; CCO owns the peer mapping from
+// rendezvous() onward. Window teardown is local -- ccoWindowDeregister runs no collective
+// -- so tensors may die in whatever order Python's GC picks. The POSIX-fd path does embed
+// the local slot offset in its rendezvous socket path, so a genuinely rank-divergent free
+// order can make a *later* register fail; it fails loudly rather than silently.
 //
 // Peers are published torch's way, as the buffer_ptrs / buffer_ptrs_dev array. They happen
 // to sit in one flat span (peer(r) == flat_base + r*stride) because that is the cheapest
@@ -131,6 +132,7 @@ struct CcoGroup {
   struct DevCommEntry {
     mori::cco::ccoDevComm host{};
     mori::cco::ccoDevComm* device = nullptr;  // kernel-argument copy
+    int lsa_barrier_count = 0;                // what it was built with
   };
   std::mutex dev_mu;
   std::unordered_map<std::string, DevCommEntry> dev_comms;
@@ -271,9 +273,9 @@ class MoriSymmetricMemory : public SymmetricMemory {
     if (buffers_dev_) (void)hipFree(buffers_dev_);
     if (signal_pads_dev_) (void)hipFree(signal_pads_dev_);
     if (rank_to_global_rank_dev_) (void)hipFree(rank_to_global_rank_dev_);
-    // Purely local: ccoWindowDeregister unmaps this rank's view of its peers and
-    // drops the handles it imported, with no collective inside. That is what lets
-    // torch tensors die in whatever order Python's GC picks.
+    // Purely local: ccoWindowDeregister unmaps this rank's view of its peers and drops
+    // the handles it imported, with no collective inside, so this can run on whichever
+    // thread drops the last reference and in whatever order across ranks.
     if (group_ && group_->comm) {
       (void)mori::cco::ccoWindowDeregister(group_->comm, pad_win_);
       (void)mori::cco::ccoMemFree(group_->comm, pad_ptr_);
@@ -479,7 +481,15 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
     // user's buffer. cco owns this one outright, so it is overload B.
     void* pad_ptr = nullptr;
     MORI_CCO_CHECK(mori::cco::ccoMemAlloc(cco_group->comm, kSignalPadBytes, &pad_ptr));
-    MORI_HIP_CHECK(hipMemset(pad_ptr, 0, kSignalPadBytes));
+    // Not hipMemset: ccoMemAlloc memory is fabric-exportable, and hipMemset returns
+    // hipErrorOutOfMemory on UALink fabric pools (ROCm 7.15). cco hit this first and
+    // routes its own DevComm resource window around it -- see CcoZeroWindowMem in
+    // src/cco/cco_init.cpp. A host->device copy is also synchronous, so the pad is
+    // observably zero before the collective register below lets a peer write to it.
+    {
+      const std::vector<char> zeros(kSignalPadBytes, 0);
+      MORI_HIP_CHECK(hipMemcpy(pad_ptr, zeros.data(), kSignalPadBytes, hipMemcpyHostToDevice));
+    }
     ccoWindow_t pad_win{};
     MORI_CCO_CHECK(
         mori::cco::ccoWindowRegister(cco_group->comm, pad_ptr, kSignalPadBytes, &pad_win));
@@ -541,8 +551,23 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
       group = it->second;
     }
 
+    int dev = -1;
+    MORI_HIP_CHECK(hipGetDevice(&dev));
+    DeviceGuard guard(dev);
+
     std::lock_guard<std::mutex> lock(group->dev_mu);
     auto it = group->dev_comms.find(key);
+    if (it != group->dev_comms.end()) {
+      // The key is supposed to encode the parameterisation, so a mismatch means two
+      // callers disagree about what this key means. Returning the first one's DevComm
+      // would hand the second a barrier array smaller than the ids its kernel uses.
+      TORCH_CHECK(it->second.lsa_barrier_count == lsa_barrier_count,
+                  "mori symm backend: dev_comm key '", key,
+                  "' already exists with "
+                  "lsa_barrier_count=",
+                  it->second.lsa_barrier_count, ", cannot serve ", lsa_barrier_count,
+                  "; use a different key");
+    }
     if (it == group->dev_comms.end()) {
       CcoGroup::DevCommEntry e{};
       mori::cco::ccoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
@@ -552,7 +577,11 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
       reqs.lsaBarrierCount = lsa_barrier_count;
       MORI_CCO_CHECK(mori::cco::ccoDevCommCreate(group->comm, &reqs, &e.host));
       e.device = mori::cco::ccoDevCommCopyToDevice(&e.host);
-      TORCH_CHECK(e.device != nullptr, "mori symm backend: ccoDevCommCopyToDevice failed");
+      if (e.device == nullptr) {
+        (void)mori::cco::ccoDevCommDestroy(group->comm, &e.host);
+        TORCH_CHECK(false, "mori symm backend: ccoDevCommCopyToDevice failed");
+      }
+      e.lsa_barrier_count = lsa_barrier_count;
       it = group->dev_comms.emplace(key, e).first;
     }
     return reinterpret_cast<uint64_t>(it->second.device);
