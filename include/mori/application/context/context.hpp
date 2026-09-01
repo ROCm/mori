@@ -103,6 +103,10 @@ class Context {
   int KfdNodeId(int destRank) const { return peerInfos[destRank].kfdNodeId; }
   int LocalKfdNode() const { return peerInfos[LocalRank()].kfdNodeId; }
 
+  // Local rank within this host (0-based index among same-host peers).
+  // Derived from peerInfos rather than a separately-tracked member.
+  int LocalRankInNode() const { return peerInfos[LocalRank()].rankInNode; }
+
   RdmaContext* GetRdmaContext() const { return rdmaContext.get(); }
   RdmaDeviceContext* GetRdmaDeviceContext() const { return rdmaDeviceContext.get(); }
   const std::vector<std::unique_ptr<RdmaDeviceContext>>& GetAllRdmaDeviceContexts() const {

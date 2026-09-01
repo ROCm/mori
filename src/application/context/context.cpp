@@ -88,7 +88,7 @@ void Context::BuildInitialEndpoints() {
 
   // (C) Build & connect the initial QP set (worldSize × numQpPerPe).
   //     Under MORI_ENABLE_RAIL_ONLY, cross-rail cross-node peers get stubs.
-  int myRail = peerInfos[LocalRank()].rankInNode;
+  int myRail = LocalRankInNode();
   auto shouldConnect = [&](int i) {
     if (transportTypes[i] != TransportType::RDMA) return false;
     if (railOnly && !peerInfos[i].sameHost && peerInfos[i].rankInNode != myRail) return false;
