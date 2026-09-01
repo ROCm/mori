@@ -121,8 +121,26 @@ size_t PerRankVmmSize() {
 // reserves the flat VA once, so the two lifetimes do not line up without this.
 struct CcoGroup {
   ccoComm* comm = nullptr;
+
+  // group -> key -> devcomm, the shape torch's NCCL backend uses. A DevComm is
+  // parameterised by ccoDevCommRequirements -- signal counts, QP counts, connection
+  // type -- and those are properties of the algorithm that will run, not of the group,
+  // so two collectives on one group need two of them. NCCL keys this on
+  // __builtin_FUNCTION(); callers here pass the key explicitly.
+  struct DevCommEntry {
+    mori::cco::ccoDevComm host{};
+    mori::cco::ccoDevComm* device = nullptr;  // kernel-argument copy
+  };
+  std::mutex dev_mu;
+  std::unordered_map<std::string, DevCommEntry> dev_comms;
+
   ~CcoGroup() {
-    if (comm && !c10d::symmetric_memory::is_finalizing()) (void)mori::cco::ccoCommDestroy(comm);
+    if (!comm || c10d::symmetric_memory::is_finalizing()) return;
+    for (auto& [key, e] : dev_comms) {
+      if (e.device) mori::cco::ccoDevCommFreeDeviceCopy(e.device);
+      (void)mori::cco::ccoDevCommDestroy(comm, &e.host);
+    }
+    (void)mori::cco::ccoCommDestroy(comm);
   }
 };
 
@@ -502,6 +520,37 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
     }
   }
 
+  // A device communicator for this group, created on first use and cached under `key`.
+  // Deliberately not built during rendezvous: rendezvous knows a buffer and a group, and
+  // nothing about how many signals or QPs the kernel that follows will want.
+  uint64_t DevCommPtr(const std::string& group_name, const std::string& key,
+                      int lsa_barrier_count) {
+    std::shared_ptr<CcoGroup> group;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto it = cco_groups_.find(group_name);
+      TORCH_CHECK(it != cco_groups_.end(), "mori symm backend: no communicator for group ",
+                  group_name, ". Have you rendezvoused a tensor with this group?");
+      group = it->second;
+    }
+
+    std::lock_guard<std::mutex> lock(group->dev_mu);
+    auto it = group->dev_comms.find(key);
+    if (it == group->dev_comms.end()) {
+      CcoGroup::DevCommEntry e{};
+      mori::cco::ccoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
+      // Intra-node only for now: no RDMA connections, just LSA barriers. Scale-out is
+      // where the caller will need to choose these, which is the reason for the key.
+      reqs.gdaConnectionType = mori::cco::CCO_GDA_CONNECTION_NONE;
+      reqs.lsaBarrierCount = lsa_barrier_count;
+      MORI_CCO_CHECK(mori::cco::ccoDevCommCreate(group->comm, &reqs, &e.host));
+      e.device = mori::cco::ccoDevCommCopyToDevice(&e.host);
+      TORCH_CHECK(e.device != nullptr, "mori symm backend: ccoDevCommCopyToDevice failed");
+      it = group->dev_comms.emplace(key, e).first;
+    }
+    return reinterpret_cast<uint64_t>(it->second.device);
+  }
+
   // The backend-specific escape hatch, keyed by the tensor pointer because torch's
   // handle has nowhere to carry it. Returns the cco window a kernel can address through.
   uint64_t WindowHandle(void* ptr, bool signal_pad) {
@@ -571,6 +620,10 @@ uint64_t WindowHandle(uint64_t data_ptr, bool signal_pad) {
   return AllocatorSingleton()->WindowHandle(reinterpret_cast<void*>(data_ptr), signal_pad);
 }
 
+uint64_t DevCommPtr(const std::string& group_name, const std::string& key, int lsa_barrier_count) {
+  return AllocatorSingleton()->DevCommPtr(group_name, key, lsa_barrier_count);
+}
+
 std::string HandleTypeName(int dev) {
   return ProbeHandleType(dev) == hipMemHandleTypeFabricCompat ? "fabric" : "posix_fd";
 }
@@ -609,5 +662,8 @@ PYBIND11_MODULE(mori_torch_symm, m) {
         "cco window handle for a rendezvous'd tensor (backend-specific; torch's "
         "SymmetricMemory has no slot for it)");
   // The pad is its own cco window now, so it is always there.
+  m.def("dev_comm", &mori::allocator::DevCommPtr, py::arg("group_name"), py::arg("key") = "default",
+        py::arg("lsa_barrier_count") = 1,
+        "device ccoDevComm pointer for a group, cached per (group, key)");
   m.attr("signal_pad_supported") = true;
 }

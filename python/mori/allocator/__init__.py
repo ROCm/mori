@@ -90,6 +90,7 @@ __all__ = [
     "register_symm_backend",
     "signal_pad_supported",
     "window_handle",
+    "dev_comm",
 ]
 
 logger = logging.getLogger(__name__)
@@ -235,6 +236,21 @@ def window_handle(data_ptr: int, signal_pad: bool = False) -> int:
     ``buffer_ptrs``.
     """
     return _ext().window_handle(data_ptr, signal_pad)
+
+
+def dev_comm(group_name: str, key: str = "default", lsa_barrier_count: int = 1) -> int:
+    """Device ``ccoDevComm`` pointer for a group, as a kernel argument.
+
+    Created on first use and cached per ``(group_name, key)``. The key exists because a
+    DevComm is parameterised by signal counts, QP counts and connection type -- properties
+    of the algorithm about to run, not of the group -- so two collectives over one group
+    want two of them. torch's NCCL backend keys the same cache on ``__builtin_FUNCTION()``;
+    from Python that would be stack inspection, so pass a key explicitly instead.
+
+    Rendezvous a tensor with the group first: that is what creates the communicator this
+    hangs off. Intra-node only today -- the connection type is fixed to NONE.
+    """
+    return _ext().dev_comm(group_name, key, lsa_barrier_count)
 
 
 def _register_on_import() -> None:

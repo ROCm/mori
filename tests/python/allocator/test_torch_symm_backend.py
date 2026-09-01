@@ -89,6 +89,17 @@ def _run(rank, world_size, port):
         assert window_handle(t.data_ptr()) != 0
         assert window_handle(t.data_ptr(), signal_pad=True) != 0
 
+        # A DevComm is parameterised by the algorithm that will run, so it is cached per
+        # (group, key) rather than per group -- two collectives want two of them.
+        from mori.allocator import dev_comm
+
+        a = dev_comm(group_name, key="all2all")
+        assert a != 0
+        assert dev_comm(group_name, key="all2all") == a, "same key must reuse"
+        assert dev_comm(group_name, key="reduce") != a, "different key must not share"
+        with pytest.raises(RuntimeError, match="rendezvous"):
+            dev_comm("no-such-group")
+
         dist.barrier()
 
 
