@@ -68,16 +68,26 @@ def _run(rank, world_size, port):
             peer = hdl.get_buffer(pe, (4,), torch.float32)
             assert abs(peer[0].item() - (pe + 1)) < 1e-6, f"peer {pe} mismatch"
 
-        # torch's own collective, on mori memory. It barriers on the device, so it needs
-        # the signal pad; without it the backend must say so rather than corrupt memory.
+        # The signal pad is its own cco window now, so it is always there and torch's
+        # own collectives -- which synchronise through it -- work unconditionally.
+        assert signal_pad_supported()
+        pads = hdl.signal_pad_ptrs
+        assert len(pads) == world_size and all(p for p in pads)
+
         expect = float(sum(r + 1 for r in range(world_size)))
-        if signal_pad_supported():
-            out = torch.ops.symm_mem.one_shot_all_reduce(t, "sum", group_name)
-            torch.cuda.synchronize()
-            assert abs(out[0].item() - expect) < 1e-3
-        else:
-            with pytest.raises(RuntimeError, match="MORI_SYMM_SIGNAL_PAD"):
-                torch.ops.symm_mem.one_shot_all_reduce(t, "sum", group_name)
+        out = torch.ops.symm_mem.one_shot_all_reduce(t, "sum", group_name)
+        torch.cuda.synchronize()
+        assert abs(out[0].item() - expect) < 1e-3
+
+        # The backend's own barrier, over cco's host barrier.
+        hdl.barrier(0)
+
+        # Backend-specific escape hatch: the cco window a kernel can address through.
+        # torch's handle has no slot for it, same as NCCL's get_window().
+        from mori.allocator import window_handle
+
+        assert window_handle(t.data_ptr()) != 0
+        assert window_handle(t.data_ptr(), signal_pad=True) != 0
 
         dist.barrier()
 

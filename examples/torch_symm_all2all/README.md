@@ -217,12 +217,8 @@ this backend exposes the pointer array anyway, kernels would not notice.
 
 ## Notes
 
-`dist.barrier()` is used between the kernel and the reads because the backend has no
-device-side barrier yet (`barrier`/`put_signal`/`wait_signal` raise). Since none of them
-are implemented, the signal pad is not reserved either — appending torch's 9216-byte pad
-to a page-aligned window would cost a whole extra 2 MiB page, physical backing being
-2 MiB-paged. Build with `MORI_SYMM_SIGNAL_PAD=ON` to reserve it and
-`mori.allocator.signal_pad_supported()` to check at run time; torch's own `symm_mem`
-collectives synchronise through that pad, so they need the flag even though they never call
-this backend's `barrier()`. A real workload would want signal-pad synchronisation instead,
-which is why the timed loop measures the kernel alone.
+`dist.barrier()` is used between the kernel and the reads because the examples predate the
+backend's own `barrier()`, which now runs over cco's host barrier. The signal pad is always
+present -- its own cco window rather than a tail on the buffer -- so torch's `symm_mem`
+collectives work without a build flag. `put_signal`/`wait_signal` still raise: they need a
+`ccoDevComm`, which the backend does not create yet.

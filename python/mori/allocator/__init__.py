@@ -55,12 +55,14 @@ CCO's own export have to agree on that type, since CCO re-exports what it import
 It is a floor rather than a budget -- CCO quantises it up to 4 GiB -- and it bounds live
 symmetric memory per rank, not allocations over time, because slots are recycled on free.
 
-``barrier``/``put_signal``/``wait_signal`` are not implemented and raise, so no signal
-pad is reserved in the window -- torch's 9216-byte pad would cost a whole extra 2 MiB page
-on a page-aligned allocation. Build with ``MORI_SYMM_SIGNAL_PAD=ON`` to reserve it, and
-check ``signal_pad_supported()`` at run time. torch's own ``symm_mem`` collectives
-synchronise through the pad, so they need that build; ``dist.barrier()`` is the stand-in
-without it.
+The signal pad is always there, as its own CCO allocation and window rather than a tail
+appended to the buffer -- the same split NCCL's backend uses. torch's own ``symm_mem``
+collectives synchronise through it, so they work without any build flag.
+
+``barrier()`` runs over CCO's host barrier, which means the current stream is drained
+first: stronger than the device-side barrier torch asks for, and heavier.
+``put_signal``/``wait_signal`` still raise -- point-to-point signalling needs a
+``ccoDevComm``, which this backend does not create yet.
 
 ``rendezvous()`` takes the tensor's *storage* base, so ``get_offset()`` is 0 by
 construction: every ``alloc()`` is its own VMM allocation. Handing it a view
@@ -73,8 +75,7 @@ The extension is optional and its ABI tracks the installed torch, so it is a plu
 makes a failure fatal, ``OFF`` skips it), and a build that did not happen or no longer
 loads is compiled here on first import from the sources shipped in ``_jit-sources``. So
 switching torch does not require reinstalling mori. ``MORI_SYMM_FORCE_JIT=1`` ignores the
-prebuilt module, which is also how ``MORI_SYMM_SIGNAL_PAD=ON`` can be turned on without
-rebuilding mori itself.
+prebuilt module.
 """
 
 import atexit
@@ -88,6 +89,7 @@ __all__ = [
     "handle_type",
     "register_symm_backend",
     "signal_pad_supported",
+    "window_handle",
 ]
 
 logger = logging.getLogger(__name__)
@@ -138,13 +140,6 @@ def _jit_ext():
 
     rocm = os.environ.get("ROCM_PATH", "/opt/rocm")
     flags = ["-std=c++17", "-O3", "-D__HIP_PLATFORM_AMD__=1", "-DUSE_ROCM=1"]
-    if os.environ.get("MORI_SYMM_SIGNAL_PAD", "OFF").strip().upper() in {
-        "1",
-        "ON",
-        "TRUE",
-        "YES",
-    }:
-        flags.append("-DMORI_SYMM_SIGNAL_PAD=1")
     logger.info("compiling mori_torch_symm from %s", source)
     # libmori_cco sits in the package directory, wherever mori was installed.
     pkg = str(Path(__file__).resolve().parent.parent)
@@ -224,12 +219,22 @@ def handle_type(device_index: int = 0) -> Literal["fabric", "posix_fd"]:
 def signal_pad_supported() -> bool:
     """Whether windows carry torch's signal pad.
 
-    False unless built with ``MORI_SYMM_SIGNAL_PAD=ON``. Without the pad, torch's own
-    ``symm_mem`` collectives raise -- their kernels synchronise through it -- and
-    ``dist.barrier()`` is the stand-in. With it they work, since they use the pad
-    directly; this backend's ``barrier``/``put_signal``/``wait_signal`` raise either way.
+    Always true now: the pad is its own CCO window. Kept because callers written against
+    the earlier build-flag behaviour still check it.
     """
     return bool(_ext().signal_pad_supported)
+
+
+def window_handle(data_ptr: int, signal_pad: bool = False) -> int:
+    """The cco window backing a rendezvous'd tensor, as an integer handle.
+
+    Backend-specific on purpose: torch's ``SymmetricMemory`` has nowhere to carry a
+    window, so NCCL's backend exposes ``get_window()`` on its own class and this does
+    the same, keyed by the tensor pointer. Pass it to a kernel that addresses peers with
+    cco's device API (``mori.ir.triton.cco.Window.lsa_ptr``) instead of walking
+    ``buffer_ptrs``.
+    """
+    return _ext().window_handle(data_ptr, signal_pad)
 
 
 def _register_on_import() -> None:
