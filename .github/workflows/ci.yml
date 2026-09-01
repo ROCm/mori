@@ -111,7 +111,7 @@ jobs:
           # 8x ConnectX-7 NDR on InfiniBand, so no rdma_sl/rdma_tc: mlx5 applies
           # both only on the RoCE path. mlx5_8 is deliberately not in
           # rdma_devices -- it is the 100GbE port behind ens14np0 (the TCP
-          # rendezvous interface), not one of the 8 rails.
+          # rendezvous interface), not one of the 8 rails
           - platform: MI300X_MLX
             runner: [self-hosted, 300_mlx_p19_29]
             rdma_devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
