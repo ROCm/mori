@@ -31,7 +31,9 @@ whole exchange through CCO, so the two halves of mori meet:
   * ``mori.allocator`` owns the allocation and its lifetime -- it is a torch
     tensor, freed when Python drops it;
   * CCO owns the peer addressing -- ``rendezvous()`` registers the CCO window,
-    and ``window_handle()`` hands it back for the kernel to address through.
+    and ``window_handle()`` hands it back for the kernel to address through;
+    ``dev_comm()`` hands over the matching device communicator, which is what
+    tells the kernel which LSA rank it is.
 
 No ``Communicator`` is built here: the backend keeps one per process group and
 creates it on the first rendezvous. The kernel is Triton (``mori.ir.triton.cco``)
@@ -73,16 +75,21 @@ def _free_port() -> int:
         return int(sk.getsockname()[1])
 
 
-@triton.jit(do_not_specialize=["chunk_elems", "rank_id"])
-def a2a_lsa_kernel(window, send_ptr, chunk_elems, rank_id, BLOCK: tl.constexpr):
+@triton.jit(do_not_specialize=["chunk_elems"])
+def a2a_lsa_kernel(window, dev_comm, send_ptr, chunk_elems, BLOCK: tl.constexpr):
     """One program per (peer, block): push my chunk into that peer's slot."""
     peer = tl.program_id(0)
     blk = tl.program_id(1)
 
+    # lsa_ptr indexes by LSA rank, which is what the DevComm answers. On one node it
+    # equals the world rank; asking the DevComm is what keeps that an implementation
+    # detail rather than an assumption baked into the kernel.
+    my_lsa = cco.DevComm.lsa_rank(dev_comm)
+
     chunk = chunk_elems.to(tl.int64)
     # The peer's window base plus the slot it reserves for me. lsa_ptr is
     # arithmetic on the flat VA, so no pointer table is dereferenced.
-    dst_addr = cco.Window.lsa_ptr(window, peer, rank_id.to(tl.int64) * chunk * 4)
+    dst_addr = cco.Window.lsa_ptr(window, peer, my_lsa.to(tl.int64) * chunk * 4)
     dst = dst_addr.to(tl.pointer_type(tl.int32), bitcast=True)
     src = (
         send_ptr.to(tl.pointer_type(tl.int32), bitcast=True) + peer.to(tl.int64) * chunk
@@ -133,20 +140,21 @@ def main():
 
     hdl = symm_mem.rendezvous(recv, group_name)
     window = mori.allocator.window_handle(recv)
+    dev_comm = mori.allocator.dev_comm(group_name, key="a2a_lsa")
     if rank == 0:
         print(
             f"{nranks} ranks, backend={symm_mem.get_backend(device)}, "
             f"{CHUNK_ELEMS * 4} B per peer"
         )
-    print(f"[rank {rank}] cco window {window:#x}", flush=True)
+    print(f"[rank {rank}] cco window {window:#x}, dev_comm {dev_comm:#x}", flush=True)
 
     hdl.barrier(0)
     grid = (nranks, (CHUNK_ELEMS + BLOCK - 1) // BLOCK)
     a2a_lsa_kernel[grid](
         window,
+        dev_comm,
         send.data_ptr(),
         CHUNK_ELEMS,
-        rank,
         BLOCK=BLOCK,
         extern_libs=cco.get_extern_libs(),
     )

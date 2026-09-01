@@ -31,8 +31,9 @@ comes straight out of the backend::
     t   = symm_mem.empty(...)              # MORI backend, HIP VMM
     hdl = symm_mem.rendezvous(t, group)    # registers the CCO window
     win = mori.allocator.window_handle(t)
+    dc  = mori.allocator.dev_comm(group, key="all2all_lsa")
     ...
-    addr = cco.Window.lsa_ptr(window, peer, offset)     # inside the kernel
+    addr = cco.Window.lsa_ptr(window, cco.DevComm.lsa_rank(dev_comm), offset)
 
 Run it the same way as its siblings::
 
@@ -62,12 +63,12 @@ BLOCK = 1024
 NUM_WARPS = 4
 
 
-@triton.jit(do_not_specialize=["chunk_elems", "rank_id", "blocks_per_peer"])
+@triton.jit(do_not_specialize=["chunk_elems", "blocks_per_peer"])
 def all2all_push_lsa(
     window,
+    dev_comm,
     send_ptr,
     chunk_elems,
-    rank_id,
     blocks_per_peer,
     BLOCK: tl.constexpr,
 ):
@@ -76,11 +77,16 @@ def all2all_push_lsa(
     peer = pid // blocks_per_peer
     sub = pid % blocks_per_peer
 
+    # Both indices lsa_ptr takes are LSA ranks, not world ranks -- the two coincide on one
+    # node and stop coinciding the moment there is a second. The DevComm is what answers
+    # "which one am I", so the kernel does not need the rank passed in at all.
+    my_lsa = cco.DevComm.lsa_rank(dev_comm)
+
     # peer's window base + my slot within it. No pointer array is dereferenced:
     # lsa_ptr is arithmetic on the flat VA, so the address is known without a load.
     # 64-bit from here on: chunk_elems*world_size overflows i32 past 8 GiB of window.
     chunk = chunk_elems.to(tl.int64)
-    dst_addr = cco.Window.lsa_ptr(window, peer, rank_id.to(tl.int64) * chunk * 4)
+    dst_addr = cco.Window.lsa_ptr(window, peer, my_lsa.to(tl.int64) * chunk * 4)
     dst = dst_addr.to(tl.pointer_type(tl.int32), bitcast=True)
     src = (
         send_ptr.to(tl.pointer_type(tl.int32), bitcast=True) + peer.to(tl.int64) * chunk
@@ -134,6 +140,10 @@ def main() -> int:
 
     hdl = symm_mem.rendezvous(recv, group_name)
     window = mori.allocator.window_handle(recv)
+    # The second handle the backend hands out: topology and barriers for the kernel.
+    # Cached per (group, key) -- a different collective would ask under its own key,
+    # because the resources it needs are its own.
+    dev_comm = mori.allocator.dev_comm(group_name, key="all2all_lsa")
     blocks_per_peer = _blocks_per_peer(elems, world_size, device)
     extern_libs = cco.get_extern_libs()
 
@@ -142,14 +152,14 @@ def main() -> int:
             f"kernel=Triton/LSA  world={world_size}  chunk={args.chunk_kib} KiB  "
             f"blocks_per_peer={blocks_per_peer}"
         )
-        print(f"cco window: {window:#x}")
+        print(f"cco window: {window:#x}, dev_comm: {dev_comm:#x}")
 
     def push():
         all2all_push_lsa[(world_size * blocks_per_peer,)](
             window,
+            dev_comm,
             send.data_ptr(),
             elems,
-            rank_id,
             blocks_per_peer,
             BLOCK=BLOCK,
             num_warps=NUM_WARPS,

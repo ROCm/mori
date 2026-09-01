@@ -70,10 +70,19 @@ tensor's VMM handle into cco's flat LSA space, and the kernel asks the window fo
 address.
 
 ```python
-hdl    = symm_mem.rendezvous(recv, group_name)                  # registers the cco window
-window = mori.allocator.window_handle(recv)                      # hand it to the kernel
-addr   = cco.Window.lsa_ptr(window, peer, rank_id * chunk_bytes)  # inside the kernel
+hdl      = symm_mem.rendezvous(recv, group_name)          # registers the cco window
+window   = mori.allocator.window_handle(recv)             # where to write
+dev_comm = mori.allocator.dev_comm(group_name, key="all2all_lsa")   # who I am
+...
+my_lsa = cco.DevComm.lsa_rank(dev_comm)                   # inside the kernel
+addr   = cco.Window.lsa_ptr(window, peer, my_lsa * chunk_bytes)
 ```
+
+Both indices `lsa_ptr` takes are **LSA** ranks. On one node they equal world ranks, which
+is why passing `rank_id` in from Python also works today and would quietly stop working
+with a second node. The DevComm is what answers it properly, and it is cached per
+`(group, key)` because the resources a collective needs — signal counts, QP counts,
+connection type — belong to that collective, not to the group.
 
 No `Communicator` is built: `rendezvous()` *is* the cco window registration, and the
 backend keeps one communicator per process group. `window_handle()` is the backend's own
