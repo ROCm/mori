@@ -654,9 +654,15 @@ jobs:
 
       - name: Start container on node2
         run: |
+          # node2 gets no checkout, so nothing there ever resets ownership the
+          # way "Fix workspace permissions" does on node1. The CI container runs
+          # as root, so the previous job leaves root-owned build output in the
+          # workspace and the rsync below dies on EPERM before anything builds.
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "
             $CT rm -f $CONTAINER 2>/dev/null || true
             mkdir -p $GITHUB_WORKSPACE
+            $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $BASE_IMAGE \
+              chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           "
           rsync -az --exclude='.git' \
             -e "ssh $SSH_OPTS -p $NODE2_PORT" \
