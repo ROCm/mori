@@ -70,15 +70,16 @@ tensor's VMM handle into cco's flat LSA space, and the kernel asks the window fo
 address.
 
 ```python
-win  = comm.register_external_window(recv.data_ptr(), recv.nbytes)   # no copy
-addr = cco.Window.lsa_ptr(window, peer, rank_id * chunk_bytes)       # in the kernel
+hdl    = symm_mem.rendezvous(recv, group_name)                  # registers the cco window
+window = mori.allocator.window_handle(recv.data_ptr())          # hand it to the kernel
+addr   = cco.Window.lsa_ptr(window, peer, rank_id * chunk_bytes)  # inside the kernel
 ```
 
-`symm_mem.rendezvous()` is never called: the backend's own peer exchange would duplicate
-what `ccoWindowRegister` already does. torch keeps the allocation and its lifetime, cco
-takes the addressing. cco has its own rendezvous, so the example passes a `ccoUniqueId`
-through torch's process group; and `import torch` must come before `import mori.cco`, or
-the two LLVM copies collide at import time.
+No `Communicator` is built: `rendezvous()` *is* the cco window registration, and the
+backend keeps one communicator per process group. `window_handle()` is the backend's own
+accessor -- torch's handle has nowhere to carry a window -- and it mirrors
+`NCCLSymmetricMemory::get_window()`. The example also uses `hdl.barrier(0)`, the backend's
+barrier over cco's, in place of `dist.barrier()`.
 
 It measures the same as the pointer array — 8×gfx950, 4 MiB per peer, three repeats each:
 
