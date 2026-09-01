@@ -1,7 +1,8 @@
-# v2 HIP backend, host side. The kernel body (ep_intranode_kernel.hpp) is reached
-# solely through the JIT-generated TU, never by anything compiled here -- that is
-# what keeps this target buildable without hipcc.
-add_library(mori_ops_v2 SHARED ep_spec.cpp)
+# v2 HIP backend, host side. The kernel bodies (ep_intranode_kernel.hpp,
+# ep_internode_kernel.hpp) are reached solely through the JIT-generated TU,
+# never by anything compiled here -- that is what keeps this target buildable
+# without hipcc.
+add_library(mori_ops_v2 SHARED ep_spec.cpp ep_internode_spec.cpp)
 
 target_include_directories(mori_ops_v2 PUBLIC ${CMAKE_SOURCE_DIR}/)
 target_include_directories(mori_ops_v2 PUBLIC ${CMAKE_SOURCE_DIR}/include)

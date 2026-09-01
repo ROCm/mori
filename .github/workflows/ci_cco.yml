@@ -243,6 +243,32 @@ jobs:
             cd $GITHUB_WORKSPACE && \
             python -m pytest tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_intranode.py -v"
 
+      - name: Run ops-v2 dispatch/combine internode test (EP8, 8 ranks)
+        run: |
+          # One host, so gpu_per_node is the whole world and no RDMA leg runs: this
+          # covers the intra-node half of the internode kernels, and both backends,
+          # which is what a single runner can reach. The RDMA leg is the
+          # cco-internode-test job below, cco only.
+          #
+          # The backends are separate invocations because they cannot share one. The
+          # cases run on a reused worker pool, and a shmem case that follows a cco
+          # case in the same session hangs -- the class patch is undone but the
+          # comm the handle was built on is not. Splitting them is the fix, not
+          # tidiness, so keep them as two execs even if the step grows.
+          #
+          # Scoped to small_shapes: every distinct Cfg is its own JIT compile, and
+          # -k cco over the whole file (84 cases) ran past 20 minutes without
+          # finishing, against this job's 30-minute budget for all steps. The
+          # correctness and cross_dtype matrices want a measured budget of their own
+          # before they go anywhere near a per-PR job.
+          F=tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py
+          for BACKEND in cco shmem; do
+            echo "=== internode backend=$BACKEND ==="
+            $CT exec $CONTAINER bash -c "\
+              cd $GITHUB_WORKSPACE && \
+              timeout 600 python -m pytest $F::test_internode_small_shapes -k $BACKEND -v"
+          done
+
       - name: Run ops-v2 HIP backend (EP8, 8 ranks)
         run: |
           # The step above drives the FlyDSL backend; this one drives the HIP kernels
@@ -320,3 +346,204 @@ jobs:
           $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           # Graceful stop so GPU ranks release HIP/KFD contexts (not SIGKILLed).
           CONTAINER_RUNTIME=$CT bash docker/ci_stop.sh $CONTAINER || true
+
+  cco-internode-test:
+    name: CCO internode test (${{ matrix.platform }})
+    # Serialised behind the single-node job rather than run beside it: both want
+    # all 8 GPUs and the same NICs on node1.
+    needs: cco-unit-test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Same pair, ifnames and NIC list as ci.yml's internode-test, which is the
+        # configuration these two hosts are known to talk over. Note the device
+        # names differ from the single-node job's rdma0-7 above.
+        include:
+          - platform: MI355X_AINIC
+            runner: [self-hosted, MI355X-AINIC]
+            node1_host: 10.2.80.22
+            node2_host: 10.2.80.20
+            node2_port: 22
+            node1_ifname: enp193s0f1np1
+            node2_ifname: enp193s0f1np1
+            rdma_devices: rocep105s0,rocep121s0,rocep137s0,rocep153s0,rocep233s0,rocep249s0,rocep25s0,rocep9s0
+            rdma_sl: 3
+            rdma_tc: 104
+    env:
+      # Overrides the workflow-level name, which is keyed by run_id alone: sharing
+      # it would have this job's cleanup delete the other job's container.
+      CONTAINER: mori_cco_ci_xnode_${{ github.run_id }}
+      SSH_OPTS: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+      NODE1_HOST: ${{ matrix.node1_host }}
+      NODE2_HOST: ${{ matrix.node2_host }}
+      NODE2_PORT: ${{ matrix.node2_port }}
+      NODE1_IFNAME: ${{ matrix.node1_ifname }}
+      NODE2_IFNAME: ${{ matrix.node2_ifname }}
+      MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
+      MORI_RDMA_SL: ${{ matrix.rdma_sl }}
+      MORI_RDMA_TC: ${{ matrix.rdma_tc }}
+      MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
+      ENTRY: tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Build CI image
+        run: |
+          $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE \
+            --build-arg GPU_ARCHS="gfx950 gfx1250" --build-arg WITH_FLYDSL=1 \
+            -t $IMAGE -f docker/Dockerfile.dev .
+
+      - name: Start container on node1
+        run: |
+          $CT rm -f $CONTAINER 2>/dev/null || true
+          CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
+            -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
+            -e MORI_RDMA_SL=$MORI_RDMA_SL \
+            -e MORI_RDMA_TC=$MORI_RDMA_TC \
+            -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
+            -e GLOO_SOCKET_IFNAME=$NODE1_IFNAME \
+            -e NCCL_SOCKET_IFNAME=$NODE1_IFNAME \
+            -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
+            -w $GITHUB_WORKSPACE \
+            $IMAGE sleep infinity
+          $CT exec $CONTAINER \
+            git config --global --add safe.directory $GITHUB_WORKSPACE
+
+      - name: Start container on node2
+        run: |
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "
+            $CT rm -f $CONTAINER 2>/dev/null || true
+            mkdir -p $GITHUB_WORKSPACE
+          "
+          rsync -az --exclude='.git' \
+            -e "ssh $SSH_OPTS -p $NODE2_PORT" \
+            $GITHUB_WORKSPACE/ \
+            $(whoami)@$NODE2_HOST:$GITHUB_WORKSPACE/
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "
+            cd $GITHUB_WORKSPACE &&
+            $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE \
+              --build-arg GPU_ARCHS='gfx950 gfx1250' --build-arg WITH_FLYDSL=1 \
+              -t $IMAGE -f docker/Dockerfile.dev . &&
+            CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
+              -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
+              -e MORI_RDMA_SL=$MORI_RDMA_SL \
+              -e MORI_RDMA_TC=$MORI_RDMA_TC \
+              -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
+              -e GLOO_SOCKET_IFNAME=$NODE2_IFNAME \
+              -e NCCL_SOCKET_IFNAME=$NODE2_IFNAME \
+              -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
+              -w $GITHUB_WORKSPACE \
+              $IMAGE sleep infinity &&
+            $CT exec $CONTAINER \
+              git config --global --add safe.directory $GITHUB_WORKSPACE
+          "
+
+      - name: Install mori (node1)
+        run: |
+          # prettytable is not optional here: the bench prints its results through
+          # it on the last rank, after the work is done, so a missing package fails
+          # the run as a rendezvous timeout on the peer rather than an ImportError.
+          $CT exec $CONTAINER bash -c \
+            "cd $GITHUB_WORKSPACE && pip install . && pip install prettytable"
+
+      - name: Install mori (node2)
+        run: |
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
+            "$CT exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && pip install . && pip install prettytable'"
+
+      - name: MORI-EP internode CCO kernel test
+        run: |
+          # Correctness first, so a bench hang further down is not the first thing
+          # this job says about the RDMA leg. The entry pins MORI_EP_COMM=cco and
+          # installs the JIT redirect, so these launches land on the v2 CCO plans;
+          # the shmem path over the same harness is ci.yml's internode-test.
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
+          PORT=29240
+          for TOKENS in 128 4096; do
+            echo "=== cco test max-tokens=$TOKENS port=$PORT ==="
+            NODE2_CMD=(
+              $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT
+              --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+              --ifname $NODE2_IFNAME --entry $ENTRY
+              --cmd test --kernel-type v1 --quant-type none --dtype bf16
+              --max-tokens $TOKENS
+            )
+            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+            $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT \
+              --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+              --ifname $NODE1_IFNAME --entry $ENTRY \
+              --cmd test --kernel-type v1 --quant-type none --dtype bf16 \
+              --max-tokens $TOKENS
+            wait
+            sleep 1
+            PORT=$((PORT + 1))
+          done
+
+      - name: MORI-EP internode CCO kernel bench
+        run: |
+          # Two token counts against ci.yml's five, and no v1_ll: on this path every
+          # distinct config is its own JIT compile where the shmem kernels are AOT,
+          # and the compiles are what the budget goes on, not the transfers. 4096 is
+          # the one that matters -- the wider the token count, the longer a WQE sits
+          # reserved but not rung, which is the window the doorbell-ordering
+          # deadlock needs.
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
+          PORT=29260
+          for TOKENS in 128 4096; do
+            echo "=== cco bench max-tokens=$TOKENS port=$PORT ==="
+            NODE2_CMD=(
+              $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT
+              --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+              --ifname $NODE2_IFNAME --entry $ENTRY
+              --cmd bench --kernel-type v1 --dtype bf16 --max-tokens $TOKENS
+            )
+            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+            $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT \
+              --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+              --ifname $NODE1_IFNAME --entry $ENTRY \
+              --cmd bench --kernel-type v1 --dtype bf16 --max-tokens $TOKENS
+            wait
+            sleep 1
+            PORT=$((PORT + 1))
+          done
+
+      - name: MORI-EP internode CCO kernel stress
+        run: |
+          # 4096 only. This is the step that would have caught the doorbell-ordering
+          # deadlock: under the old flushAsync it hung within a few hundred rounds
+          # at this token count, and the round loop is what makes the window get
+          # hit at all -- a single bench pass can clear it by luck.
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
+          PORT=29280
+          echo "=== cco stress max-tokens=4096 port=$PORT ==="
+          NODE2_CMD=(
+            $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT
+            --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+            --ifname $NODE2_IFNAME --entry $ENTRY
+            --cmd stress --kernel-type v1 --dtype bf16 --max-tokens 4096
+          )
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+          $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT \
+            --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+            --ifname $NODE1_IFNAME --entry $ENTRY \
+            --cmd stress --kernel-type v1 --dtype bf16 --max-tokens 4096
+          wait
+
+      - name: Cleanup node1
+        if: always()
+        run: |
+          $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          CONTAINER_RUNTIME=$CT bash docker/ci_stop.sh $CONTAINER || true
+
+      - name: Cleanup node2
+        if: always()
+        run: |
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "
+            $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+            cd $GITHUB_WORKSPACE && CONTAINER_RUNTIME=$CT bash docker/ci_stop.sh $CONTAINER || true
+          " || true

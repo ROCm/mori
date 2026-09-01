@@ -814,43 +814,43 @@ __device__ inline static void getImpl(core::RdmaEndpointDevice* ep, uint32_t qpn
   }
 }
 
-// FlushAsync: ring doorbell for pending WQEs (skip if already rung),
-// return the postIdx for later wait.
+// FlushAsync: snapshot the reservation counter so a later wait() can drain to it.
+//
+// It deliberately neither rings a doorbell nor touches dbTouchIdx. postIdx is a
+// *reservation* counter: putImpl/putValueImpl/signalImpl bump it before they write
+// their WQEs and before they reach ringDoorbellOrdered, so a snapshot routinely
+// covers slots whose owner is still in flight. Every posting path rings its own
+// doorbell -- the ccoGdaOptFlagsAggregateRequests opt-out has no caller -- and
+// ringDoorbellOrdered hands the turn on by advancing dbTouchIdx in reservation
+// order, so the queue drains on its own and the draining belongs to quietUntil.
+//
+// Acting on the snapshot here corrupts that chain three ways:
+//   - ringing for a reservation whose WQEs are not written yet points the NIC at a
+//     stale SQ slot;
+//   - storing dbTouchIdx = curPostIdx steps over an owner still waiting for its
+//     turn, and that wait compares for *equality* against a monotonically
+//     increasing counter, so the owner is never released and the tokens behind its
+//     reservation are never sent -- a silent, permanent hang whose only symptom is
+//     one wavefront parked in ringDoorbellOrdered;
+//   - charging cq->needConsIdx from here races with a second flush on the same QP:
+//     both read the same (dbTouchIdx, postIdx) pair, both add the same pending
+//     count, and the dbTouchIdx store is idempotent, so the inflated CQ credit is
+//     the only trace. It does not double-count against ringDoorbellOrdered -- an
+//     owner that got leapfrogged never reaches its own charge.
+//
+// Re-enabling aggregation would need a separate "WQEs written" counter to ring
+// from; postIdx cannot serve, because it runs ahead of the writes.
 template <core::ProviderType PrvdType>
 __device__ inline static void flushAsyncImpl(core::RdmaEndpointDevice* ep, uint32_t qpn,
                                              uint32_t* outPostIdx) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
-  core::CompletionQueueHandle* cq = &ep->cqHandle;
 
-  uint32_t curPostIdx = wq->postIdx;
-  *outPostIdx = curPostIdx;
+  *outPostIdx = static_cast<uint32_t>(
+      __hip_atomic_load(&wq->postIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT));
 
-  uint64_t dbTouched =
-      __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-  if (dbTouched == curPostIdx) return;
-
-  uint32_t numPendingWqes = curPostIdx - static_cast<uint32_t>(dbTouched);
-  uint64_t dbrVal = buildFlushDbrVal<PrvdType>(wq, curPostIdx, qpn);
-
+  // Keep flush's release semantics: prior local writes must be visible before the
+  // caller treats the transfer as handed off.
   __threadfence_system();
-
-  // flush() is multi-lane (each lane flushes a different peer/QP), so PSD/BNXT
-  // must serialize doorbells per lane (shared dbrAddr/UAR); MLX5 has a per-QP
-  // dbrAddr and rings directly.
-  if constexpr (PrvdType == core::ProviderType::MLX5) {
-    core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, curPostIdx);
-    __threadfence_system();
-    core::RingDoorbell<PrvdType>(wq->dbrAddr, dbrVal);
-  } else {
-    ringDoorbellWalk<PrvdType>(wq, curPostIdx, dbrVal);
-  }
-
-  __threadfence_system();
-
-  __hip_atomic_fetch_add(&cq->needConsIdx, numPendingWqes, __ATOMIC_RELAXED,
-                         __HIP_MEMORY_SCOPE_AGENT);
-  __hip_atomic_store(&wq->dbTouchIdx, static_cast<uint64_t>(curPostIdx), __ATOMIC_RELAXED,
-                     __HIP_MEMORY_SCOPE_AGENT);
 }
 
 template <core::ProviderType PrvdType>

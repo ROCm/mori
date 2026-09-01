@@ -21,6 +21,7 @@ fail=0
 SHARED_HEADERS=(
   "include/mori/jit/v2/render.hpp"
   "include/mori/ops/dispatch_combine_v2/ep_cfg.hpp"
+  "include/mori/ops/dispatch_combine_v2/ep_internode_cfg.hpp"
 )
 
 tmp=$(mktemp -d)
@@ -64,7 +65,8 @@ done
 # one, or the host build starts needing hipcc. A path appearing inside a string
 # literal is fine -- that is the renderer emitting the include for the DEVICE TU,
 # which is exactly how it is supposed to get there.
-DEVICE_ONLY_HEADERS=("ep_intranode_kernel.hpp" "ep_intranode_1250x.hpp")
+DEVICE_ONLY_HEADERS=("ep_intranode_kernel.hpp" "ep_intranode_1250x.hpp"
+                     "ep_internode_kernel.hpp")
 pattern=$(printf '|%s' "${DEVICE_ONLY_HEADERS[@]}")
 pattern=${pattern:1}
 # Only HOST sources are candidates -- a device header may include another one
