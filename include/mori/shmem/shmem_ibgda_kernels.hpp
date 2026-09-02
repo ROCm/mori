@@ -361,10 +361,16 @@ inline __device__ void Mlx5CollapsedCqDrain(core::WorkQueueHandle& wq,
 
     uint16_t comp16 = static_cast<uint16_t>(wqeCounter + 1);
     uint16_t delta = static_cast<uint16_t>(comp16 - static_cast<uint16_t>(cons));
-    uint32_t bound =
-        DrainToLive ? __hip_atomic_load(&wq.postIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)
-                    : __hip_atomic_load(&wq.dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    if (delta != 0 && static_cast<int32_t>(delta) <= static_cast<int32_t>(bound - cons)) {
+    // Clamp against dbTouchIdx even when draining to postIdx. A completion cannot
+    // exist for a WQE that was never doorbelled, and postIdx counts reservations
+    // whose WQEs are not in the SQ yet, so it runs tens of thousands ahead here.
+    // Bounding by it accepts a wqe_counter that does not belong to the live window
+    // -- the 16-bit value then wraps into a plausible-looking delta -- and pushes
+    // doneIdx past WQEs the NIC has not fetched. The recycle gate hands those still
+    // live SQ slots out for reuse and the overwritten writes are silently dropped.
+    uint32_t doorbelled =
+        __hip_atomic_load(&wq.dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    if (delta != 0 && static_cast<int32_t>(delta) <= static_cast<int32_t>(doorbelled - cons)) {
       __hip_atomic_fetch_max(&wq.doneIdx, cons + delta, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
     cons = __hip_atomic_load(&wq.doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
