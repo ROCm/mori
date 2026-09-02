@@ -60,7 +60,7 @@ from mori.ops import utils as gpu_utils
 _MI308X_EP16_H6144 = (
     # max_tok, disp_block, disp_rdma, disp_warp, comb_block, comb_rdma, comb_warp
     (4, 64, 32, 8, 32, 21, 6),
-    (8, 64, 32, 8, 64, 32, 4),
+    (8, 64, 32, 8, 32, 21, 6),
     (16, 80, 48, 8, 80, 40, 8),
     (None, 80, 48, 8, 80, 40, 8),
 )
