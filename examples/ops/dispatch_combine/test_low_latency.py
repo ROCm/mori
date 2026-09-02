@@ -371,10 +371,13 @@ def test_main(
         combine_block_num, combine_warp_per_block = block_num, warp_num_per_block
         rdma_block_num = 0
 
-    # Under AUTO the op resolves block/warp/rdma itself (tuning rule, else its
-    # own fallback); -1 means "you decide". Passing the hardcoded numbers above
-    # would only half-apply that, since a tuning rule wins over an explicit arg
-    # but the fallback doesn't.
+    # Under AUTO the op resolves block/warp/rdma itself; -1 means "you decide".
+    # For InterNodeV1LL (the kernel type below) this happens to be a no-op
+    # today -- see _resolve_launch_params in dispatch_combine.py, whose AUTO
+    # fallback for this kernel type is fully non-zero and so always wins over
+    # whatever's passed here, matched tuning rule or not. Kept anyway: it's
+    # what "let AUTO decide" is supposed to mean, and stops these numbers from
+    # silently doing something once that fallback logic changes.
     auto_launch = os.getenv("MORI_EP_LAUNCH_CONFIG_MODE", "MANUAL").upper() == "AUTO"
     if auto_launch:
         dispatch_block_num = dispatch_warp_per_block = -1

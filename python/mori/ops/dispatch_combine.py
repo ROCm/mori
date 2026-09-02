@@ -811,6 +811,13 @@ class EpDispatchCombineOp:
             )
             if params is not None:
                 return params.block_num, params.rdma_block_num, params.warp_per_block
+        # No matching rule: fall back to the per-kernel-type AUTO default set in
+        # __init__. For kernel types whose default is fully non-zero (currently
+        # InterNodeV1 and InterNodeV1LL), that default always wins here -- the
+        # caller's block_num/rdma_block_num/warp_per_block is never reached,
+        # matched rule or not. Passing an explicit value under AUTO for those
+        # kernel types is a no-op; only IntraNode's zero rdma default actually
+        # falls through to the caller's argument.
         bn = self.auto_block_num if self.auto_block_num else block_num
         rbn = self.auto_rdma_block_num if self.auto_rdma_block_num else rdma_block_num
         wpb = self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block
