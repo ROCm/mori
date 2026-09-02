@@ -81,6 +81,17 @@ class SymmMemManager {
   SymmMemObjPtr GetVMMHeapObj() const { return vmmHeapObj; }
   size_t GetVMMChunkSize() const { return vmmChunkSize; }
 
+  // Per-NIC keys for send-side routing (proxy mode).
+  // perNicLkeys[nic] = lkey for MY buffer registered on nic's PD.
+  // perNicPeerRkeys[nic][peer] = rkey for peer's buffer registered on nic's PD.
+  std::vector<uint32_t> perNicLkeys;
+  std::vector<std::vector<uint32_t>> perNicPeerRkeys;
+
+  // Cached heap rkeys — sub-allocations reuse these instead of doing
+  // redundant ibv_reg_mr + Allgather for each shmem_malloc.
+  uint32_t heapLkey_{0};
+  std::vector<uint32_t> heapRkeys_;
+
   // Common Utilities
   SymmMemObjPtr Get(void* localPtr) const;
   HeapVAManager* GetHeapVAManager() const { return heapVAManager.get(); }

@@ -26,6 +26,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -36,6 +37,7 @@
 #include "mori/application/application.hpp"
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/application/utils/cpu_affinity.hpp"
+#include "mori/core/transport/rdma/proxy/proxy_thread.hpp"
 #include "mori/core/utils/utils.hpp"
 #include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem_api.hpp"
@@ -43,6 +45,9 @@
 
 namespace mori {
 namespace shmem {
+
+static std::vector<std::unique_ptr<core::ProxyThread>> proxyThreads;
+static void* proxyRingsHost[core::PROXY_MAX_NICS] = {};
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                      ShmemStatesSingleton                                     */
@@ -593,8 +598,66 @@ void GpuStateInit(ShmemStates* states) {
   states->gpuStates.worldSize = states->bootStates->worldSize;
   states->gpuStates.numQpPerPe = states->rdmaStates->commContext->GetNumQpPerPe();
 
-  // Copy communication metadata to GPU
-  CopyTransportTypesToGpu(states);
+  // Check if IBGDA proxy mode is requested
+  if (states->rdmaStates->commContext->IsProxyEnabled()) {
+    MORI_SHMEM_INFO("Rank {}: CPU host proxy RDMA mode enabled", states->bootStates->rank);
+    // Determine number of NICs for per-NIC ring allocation
+    int numNics = 1;
+    if (states->rdmaStates && states->rdmaStates->commContext) {
+      numNics =
+          static_cast<int>(states->rdmaStates->commContext->GetAllRdmaDeviceContexts().size());
+      if (numNics < 1) numNics = 1;
+      if (numNics > core::PROXY_MAX_NICS) numNics = core::PROXY_MAX_NICS;
+    }
+
+    // Allocate one ProxyRing per NIC. Each ring has its own gpu_head so
+    // GPU warps targeting different NICs don't contend on the same atomic.
+    // proxyRingsHost[] keeps the host pointer for the CPU proxy thread and cleanup.
+    // gpuStates.proxyRings[] stores the GPU device pointer for the GPU kernels.
+    int allocated = 0;
+    for (int n = 0; n < numNics; n++) {
+      void* ringPtr = nullptr;
+      int allocErr = posix_memalign(&ringPtr, 4096, sizeof(core::ProxyRing));
+      if (allocErr == 0 && ringPtr) {
+        auto* ring = static_cast<core::ProxyRing*>(ringPtr);
+        hipError_t regErr = hipHostRegister(ring, sizeof(core::ProxyRing),
+                                            hipHostRegisterMapped | hipHostRegisterPortable);
+        if (regErr == hipSuccess) {
+          memset(ring, 0, sizeof(core::ProxyRing));
+          proxyRingsHost[n] = ring;
+          void* ringDev = nullptr;
+          hipHostGetDevicePointer(&ringDev, ring, 0);
+          states->gpuStates.proxyRings[n] = ringDev ? static_cast<core::ProxyRing*>(ringDev) : ring;
+          allocated++;
+        } else {
+          free(ringPtr);
+        }
+      }
+    }
+    states->gpuStates.numProxyRings = allocated;
+    states->gpuStates.numNics = numNics;
+    states->gpuStates.localGpuIdx = states->gpuStates.rank % numNics;
+    MORI_SHMEM_INFO("Proxy: {} rings allocated for {} NICs, localGpuIdx={}", allocated, numNics,
+                    states->gpuStates.localGpuIdx);
+
+    // Copy transport types to GPU — override RDMA → PROXY for inter-node peers
+    int worldSize = states->bootStates->worldSize;
+    std::vector<application::TransportType> types(
+        states->rdmaStates->commContext->GetTransportTypes().begin(),
+        states->rdmaStates->commContext->GetTransportTypes().end());
+    for (int i = 0; i < worldSize; i++) {
+      if (types[i] == application::TransportType::RDMA)
+        types[i] = application::TransportType::PROXY;
+    }
+    HIP_RUNTIME_CHECK(hipMalloc(&states->gpuStates.transportTypes,
+                                sizeof(application::TransportType) * worldSize));
+    HIP_RUNTIME_CHECK(hipMemcpy(states->gpuStates.transportTypes, types.data(),
+                                sizeof(application::TransportType) * worldSize,
+                                hipMemcpyHostToDevice));
+  } else {
+    // Copy communication metadata to GPU
+    CopyTransportTypesToGpu(states);
+  }
   CopyRdmaEndpointsToGpu(states);
 
   // Configure heap information for GPU access
@@ -691,6 +754,57 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
   MemoryStatesInit(states);
   GpuStateInit(states);
 
+  // Start per-NIC proxy threads if proxy mode is enabled
+  if (states->rdmaStates->commContext->IsProxyEnabled() && states->gpuStates.numProxyRings > 0) {
+    auto* ctx = states->rdmaStates->commContext;
+    const auto& hostEndpoints = ctx->GetRdmaEndpoints();
+    int numNics = states->gpuStates.numNics;
+    int numQpPerPe = ctx->GetNumQpPerPe();
+    const auto& perNicLkeys = states->memoryStates->symmMemMgr->perNicLkeys;
+    const auto& perNicRkeys = states->memoryStates->symmMemMgr->perNicPeerRkeys;
+    int myLocalGpu = states->gpuStates.localGpuIdx;
+    int gpuId = states->gpuStates.rank % numNics;
+
+    for (int n = 0; n < numNics; n++) {
+      if (!states->gpuStates.proxyRings[n]) continue;
+
+      // Build QP vector for this NIC only (full size, nulls for other NICs' QPs)
+      std::vector<core::ProxyQpHandle> nicQps(hostEndpoints.size());
+      int nicQpCount = 0;
+      for (size_t i = 0; i < hostEndpoints.size(); i++) {
+        if (hostEndpoints[i].ibvHandle.qp != nullptr) {
+          int pe = i / numQpPerPe;
+          int peerLocalGpu = pe % numNics;
+          int nicIdx = (numNics > 1) ? (std::max(myLocalGpu, peerLocalGpu) % numNics) : 0;
+          if (nicIdx != n) continue;
+          uint32_t lkey = (nicIdx < (int)perNicLkeys.size()) ? perNicLkeys[nicIdx] : 0;
+          uint32_t rkey = 0;
+          if (nicIdx < (int)perNicRkeys.size() && pe < (int)perNicRkeys[nicIdx].size()) {
+            rkey = perNicRkeys[nicIdx][pe];
+          }
+          bool nativeAtomics =
+              (hostEndpoints[i].vendorId == application::RdmaDeviceVendorId::Mellanox);
+          nicQps[i] = {hostEndpoints[i].ibvHandle.qp,
+                       hostEndpoints[i].ibvHandle.cq,
+                       lkey,
+                       rkey,
+                       hostEndpoints[i].ibvHandle.recvBuf,
+                       hostEndpoints[i].ibvHandle.recvLkey,
+                       hostEndpoints[i].ibvHandle.recvCount,
+                       nativeAtomics};
+          nicQpCount++;
+        }
+      }
+      if (nicQpCount > 0) {
+        auto thread = std::make_unique<core::ProxyThread>();
+        thread->Init(static_cast<core::ProxyRing*>(proxyRingsHost[n]), std::move(nicQps), gpuId,
+                     states->gpuStates.heapBaseAddr, states->gpuStates.heapEndAddr);
+        thread->Start();
+        proxyThreads.push_back(std::move(thread));
+      }
+    }
+  }
+
   states->status = ShmemStatesStatus::Initialized;
   MORI_SHMEM_INFO("Shmem initialization completed");
   return 0;
@@ -705,6 +819,20 @@ bool ShmemIsInitialized() {
 /* ---------------------------------------------------------------------------------------------- */
 
 static void FinalizeGpuStates(ShmemStates* states) {
+  // Shutdown all per-NIC proxy threads before freeing rings
+  for (auto& t : proxyThreads) {
+    if (t) t->Shutdown();
+  }
+  proxyThreads.clear();
+  for (int n = 0; n < core::PROXY_MAX_NICS; n++) {
+    if (proxyRingsHost[n]) {
+      hipHostUnregister(proxyRingsHost[n]);
+      free(proxyRingsHost[n]);
+      proxyRingsHost[n] = nullptr;
+      states->gpuStates.proxyRings[n] = nullptr;
+    }
+  }
+
   (void)hipDeviceSynchronize();
   (void)hipGetLastError();
   HIP_RUNTIME_CHECK(hipFree(states->gpuStates.transportTypes));

@@ -530,13 +530,13 @@ jobs:
           # both only on the RoCE path. mlx5_8 is deliberately not in
           # rdma_devices -- it is the 100GbE port behind ens14np0 (the TCP
           # rendezvous interface), not one of the 8 rails.
-          # node1 is the runner itself (banff-ccs-aus-p19-29); node2 is the peer
-          # it drives over ssh (banff-ccs-aus-p20-29). Both addresses are the
+          # node1 is the runner itself (banff-ccs-aus-p19-05); node2 is the peer
+          # it drives over ssh (banff-ccs-aus-p19-14). Both addresses are the
           # ens14np0 100GbE port used for TCP rendezvous.
           - platform: MI300X_MLX
             runner: [self-hosted, 300_mlx_p19_29]
-            node1_host: 10.194.134.84
-            node2_host: 10.194.132.59
+            node1_host: 10.194.132.110
+            node2_host: 10.194.132.71
             node2_port: 22
             node1_ifname: ens14np0
             node2_ifname: ens14np0
@@ -620,9 +620,15 @@ jobs:
 
       - name: Start container on node2
         run: |
+          # node2 gets no checkout, so nothing there ever resets ownership the
+          # way "Fix workspace permissions" does on node1. The CI container runs
+          # as root, so the previous job leaves root-owned build output in the
+          # workspace and the rsync below dies on EPERM before anything builds.
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "
             $CT rm -f $CONTAINER 2>/dev/null || true
             mkdir -p $GITHUB_WORKSPACE
+            $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $BASE_IMAGE \
+              chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           "
           rsync -az --exclude='.git' \
             -e "ssh $SSH_OPTS -p $NODE2_PORT" \

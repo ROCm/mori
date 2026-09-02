@@ -21,6 +21,12 @@
 # SOFTWARE.
 from mori import cpp as mori_cpp
 from mori.tensor_utils import from_gpu_ptr, dtype_to_int
+
+# Imported here rather than inside the per-call helpers: both sit on the
+# dispatch/combine hot path, where a repeated `from ... import ...` is pure
+# interpreter overhead.
+from mori.jit.hip_driver import launch_multi
+from mori.ops.tuning_config import TuningConfigManager
 import logging
 import os
 from dataclasses import dataclass
@@ -183,7 +189,27 @@ def _normalize_quant_type(quant_type):
 
 
 def _current_stream():
-    return torch.cuda.current_stream().cuda_stream
+    # torch.cuda.current_stream() re-resolves the device index and builds a
+    # Stream object on every call (~4.8us measured). _cuda_getCurrentRawStream
+    # skips that and returns the same raw cudaStream_t/hipStream_t pointer
+    # (~0.6us), which is what _launch's hipModuleLaunchKernel call needs.
+    #
+    # This used to call _cuda_getCurrentStream(...)[0] instead, which is
+    # *not* the raw pointer: it is CUDAStream's packed stream_id (pool index +
+    # per-pool stream index + priority, not an address). That happened to work
+    # outside CUDA graph capture because the default stream's packed id is 0,
+    # which coincides with the null-stream sentinel HIP already treats as "the
+    # current stream". Inside torch.cuda.graph(), the capture stream is a real
+    # non-default stream with a non-zero packed id (e.g. 3), and passing that
+    # to hipModuleLaunchKernel as a stream pointer launches on garbage address
+    # 0x3 instead of the capture stream -- the capture then sees no kernels
+    # ("UserWarning: The CUDA Graph is empty"), and replaying/using that
+    # invalid handle afterwards corrupts the context (HIP error 709,
+    # hipErrorContextIsDestroyed). Reproduced with
+    # PYTHONPATH=$(pwd) python3 tests/python/ops/bench_dispatch_combine.py
+    # --world-size 8 --cmd bench, whose default path captures dispatch/combine
+    # into CUDA graphs.
+    return torch._C._cuda_getCurrentRawStream(torch.cuda.current_device())
 
 
 @dataclass
@@ -774,8 +800,6 @@ class EpDispatchCombineOp:
         is_push_transport=False,
     ):
         if tuning_rules and dtype is not None:
-            from mori.ops.tuning_config import TuningConfigManager
-
             params = TuningConfigManager.lookup(
                 tuning_rules,
                 dtype,
@@ -787,6 +811,13 @@ class EpDispatchCombineOp:
             )
             if params is not None:
                 return params.block_num, params.rdma_block_num, params.warp_per_block
+        # No matching rule: fall back to the per-kernel-type AUTO default set in
+        # __init__. For kernel types whose default is fully non-zero (currently
+        # InterNodeV1 and InterNodeV1LL), that default always wins here -- the
+        # caller's block_num/rdma_block_num/warp_per_block is never reached,
+        # matched rule or not. Passing an explicit value under AUTO for those
+        # kernel types is a no-op; only IntraNode's zero rdma default actually
+        # falls through to the caller's argument.
         bn = self.auto_block_num if self.auto_block_num else block_num
         rbn = self.auto_rdma_block_num if self.auto_rdma_block_num else rdma_block_num
         wpb = self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block
@@ -996,8 +1027,6 @@ class EpDispatchCombineOp:
         func.launch_struct(grid, block, shared_mem, stream, args_ptr)
 
     def _launch_multi(self, func_names, grids, blocks, shared_mems, stream, args_ptr):
-        from mori.jit.hip_driver import launch_multi
-
         funcs = [self._get_func(name)._func for name in func_names]
         launch_multi(funcs, grids, blocks, shared_mems, stream, args_ptr)
 
