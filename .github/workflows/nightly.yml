@@ -61,6 +61,11 @@ jobs:
             $IMAGE bash -c "
               git config --global --add safe.directory '*'
 
+              # The builder is an MI355X box, so setup.py would otherwise detect
+              # gfx950 and emit a single-arch wheel that cannot launch a kernel on
+              # the MI300X_MLX test runners (gfx942).
+              export MORI_GPU_ARCHS='gfx942;gfx950'
+
               echo '=== Building CI test wheel (amd_mori ${GH_VERSION}) ==='
               SETUPTOOLS_SCM_PRETEND_VERSION=${GH_VERSION} \
                 python3 -m pip wheel --no-deps -w /tmp/dist .
@@ -156,6 +161,7 @@ jobs:
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
+            timeout_minutes: 45
 
           - platform: MI355X_AINIC
             python: "3.12"
@@ -164,6 +170,19 @@ jobs:
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
+            timeout_minutes: 45
+          # 8x ConnectX-7 NDR on InfiniBand, so no rdma_sl/rdma_tc: mlx5 applies
+          # both only on the RoCE path. mlx5_8 is deliberately not in
+          # rdma_devices -- it is the 100GbE port behind ens14np0 (the TCP
+          # rendezvous interface), not one of the 8 rails. py3.12 only: that base
+          # image is what ci.yml validates this runner against.
+          - platform: MI300X_MLX
+            python: "3.12"
+            runner: [self-hosted, 300_mlx_p19_29]
+            base_image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+            rdma_devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+            socket_ifname: ens14np0
+            timeout_minutes: 90
           # Runner 325_bnxt_108 is decommissioned.
           # - platform: MI325X_BNXT
           #   python: "3.12"
@@ -188,7 +207,7 @@ jobs:
       MORI_PERF_COMMIT: ${{ github.sha }}
       MORI_PERF_PLATFORM: ${{ matrix.platform }}
       MORI_PERF_PYTHON: ${{ matrix.python }}
-    timeout-minutes: 45
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -382,6 +401,7 @@ jobs:
             rdma_sl: 3
             rdma_tc: 104
             ct: podman
+            timeout_minutes: 45
           - platform: MI355X_AINIC
             python: "3.12"
             runner: [self-hosted, MI355X-AINIC]
@@ -395,6 +415,26 @@ jobs:
             rdma_sl: 3
             rdma_tc: 104
             ct: podman
+            timeout_minutes: 45
+          # 8x ConnectX-7 NDR on InfiniBand, so no rdma_sl/rdma_tc: mlx5 applies
+          # both only on the RoCE path. mlx5_8 is deliberately not in
+          # rdma_devices -- it is the 100GbE port behind ens14np0 (the TCP
+          # rendezvous interface), not one of the 8 rails.
+          # node1 is the runner itself (banff-ccs-aus-p19-05); node2 is the peer
+          # it drives over ssh (banff-ccs-aus-p19-14). Both addresses are the
+          # ens14np0 100GbE port used for TCP rendezvous.
+          - platform: MI300X_MLX
+            python: "3.12"
+            runner: [self-hosted, 300_mlx_p19_29]
+            base_image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+            node1_host: 10.194.132.110
+            node2_host: 10.194.132.71
+            node2_port: 22
+            node1_ifname: ens14np0
+            node2_ifname: ens14np0
+            rdma_devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+            ct: docker
+            timeout_minutes: 90
           # Runner 325_bnxt_108 is decommissioned.
           # - platform: MI325X_BNXT
           #   python: "3.12"
@@ -428,7 +468,7 @@ jobs:
       MORI_PERF_COMMIT: ${{ github.sha }}
       MORI_PERF_PLATFORM: ${{ matrix.platform }}
       MORI_PERF_PYTHON: ${{ matrix.python }}
-    timeout-minutes: 45
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -468,9 +508,15 @@ jobs:
 
       - name: Start container on node2
         run: |
+          # node2 gets no checkout, and "Cleanup node2" only drops the container,
+          # so nothing there ever resets ownership. The CI container runs as root,
+          # so a previous run leaves root-owned build output in the workspace and
+          # the rsync below dies on EPERM before anything installs.
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "
             $CT rm -f $CONTAINER 2>/dev/null || true
             mkdir -p $GITHUB_WORKSPACE
+            $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE ${{ matrix.base_image }} \
+              chown -R \$(id -u):\$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           "
           rsync -az --exclude='.git' \
             -e "ssh $SSH_OPTS -p $NODE2_PORT" \
