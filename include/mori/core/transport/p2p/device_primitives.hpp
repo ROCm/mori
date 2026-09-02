@@ -867,10 +867,9 @@ __forceinline__ __device__ void WarpAccumLF(T* __restrict__ dest, T* const* __re
   static_assert((VecBytes <= 16) && (VecBytes >= 4) && IsPowerOf2(VecBytes));
   static_assert(Unroll >= 1);
   size_t offset = 0;
-#define WARP_ACCUM_LF_CASE(AccumNum)                                                 \
-  case AccumNum:                                                                     \
-    WarpAccumLFImpl<T, VecBytes, AccumNum, Unroll>(dest, srcs, srcScales, offset,    \
-                                                   nelems);                          \
+#define WARP_ACCUM_LF_CASE(AccumNum)                                                       \
+  case AccumNum:                                                                           \
+    WarpAccumLFImpl<T, VecBytes, AccumNum, Unroll>(dest, srcs, srcScales, offset, nelems); \
     break;
   switch (accumNum) {
     WARP_ACCUM_LF_CASE(1)

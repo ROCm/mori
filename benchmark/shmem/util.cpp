@@ -27,8 +27,8 @@
 #include <string>
 
 #include "hip/hip_runtime.h"
-#include "mori/application/utils/check.hpp"
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
+#include "mori/application/utils/check.hpp"
 #include "mori/shmem/shmem_api.hpp"
 
 namespace mori::shmem::benchmark {
