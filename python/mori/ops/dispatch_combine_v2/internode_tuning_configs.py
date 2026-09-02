@@ -48,13 +48,19 @@ untuned dtypes fall back to "fp8".
 from mori.ops import utils as gpu_utils
 
 # ── MI308X (gfx942, 80 CU) — EP16, hidden 6144, topk 8. Tuned fp8-dispatch +
-# bf16-combine on skyriver07+04 (2-node). dispatch is fabric-bound (low rdma at
-# small tok, block<=80); combine is xGMI-bandwidth-bound (small block at small
-# tok, block 80 / rdma 40 / warp 8 at mid tok). All block_num <= 80.
+# bf16-combine on skyriver07+04 (2-node), block_num <= 80.
+#
+# dispatch and combine are coupled, not independent: dispatch and combine share
+# the same CUDA-graph replay and the same QPs, and a dispatch with too few
+# rdma_block_num leaves the combine that follows it markedly slower (~+18us at
+# 4/8 tokens for rdma 16 vs 32). So the small-token dispatch is NOT tuned for
+# dispatch latency alone -- it holds rdma at 32 to keep the paired combine fast,
+# which is the lower total. combine wants a small block at small tok (32/64) and
+# block 80 / rdma 40 at mid tok.
 _MI308X_EP16_H6144 = (
     # max_tok, disp_block, disp_rdma, disp_warp, comb_block, comb_rdma, comb_warp
-    (4, 32, 16, 6, 32, 21, 6),
-    (8, 64, 16, 4, 64, 32, 4),
+    (4, 64, 32, 8, 32, 21, 6),
+    (8, 64, 32, 8, 64, 32, 4),
     (16, 80, 48, 8, 80, 40, 8),
     (None, 80, 48, 8, 80, 40, 8),
 )
