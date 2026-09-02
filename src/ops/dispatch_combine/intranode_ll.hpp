@@ -260,9 +260,12 @@ __device__ void EpDispatchIntraNodeLLKernel_body(EpDispatchCombineArgs<T> args) 
   const int numTokens = args.curRankNumToken;
   const bool hasScales = args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0);
 
+  // The generator groups slots by source file, so this file's slots live in
+  // IntranodeLlSlot, not IntranodeSlot -- initializing the intranode context
+  // here makes Slot:: resolve to the wrong enum and fails to compile.
   IF_ENABLE_PROFILER(
       int globalWarpId = blockIdx.x * warpNum + warpId;
-      INTRANODE_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
+      INTRANODE_LL_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SEQ(seq, profiler);
   MORI_TRACE_NEXT(seq, Slot::DispatchSendTokens);
 
