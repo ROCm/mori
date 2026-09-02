@@ -232,9 +232,10 @@ class RdmaDeviceContext {
   // dmabuf registration with iova=0 (CCO symmetric flat-VA path; BNXT GDA).
   virtual RdmaMemoryRegion RegisterRdmaMemoryRegionDmabufIova0(
       void* ptr, size_t size, int dmabuf_fd, int accessFlag = MR_DEFAULT_ACCESS_FLAG);
-  // ibv_reg_mr-first registration; falls back to dmabuf. Set MORI_ENABLE_DMABUF_REG to try
+  // ibv_reg_mr-first registration; falls back to dmabuf. Set MORI_ENABLE_DMABUF_REG=1 to try
   // dmabuf first instead (falling back to ibv_reg_mr). This is the vendor-agnostic payload
-  // MR path; independent of the mlx5-specific MORI_MLX5_DMABUF knob.
+  // MR path; the same switch also enables dmabuf Ionic CQ/SQ/RQ rings, while mlx5 control
+  // rings use the separate MORI_MLX5_DMABUF knob.
   virtual RdmaMemoryRegion RegisterRdmaMemoryRegionAuto(void* ptr, size_t size,
                                                         int accessFlag = MR_DEFAULT_ACCESS_FLAG);
   virtual void DeregisterRdmaMemoryRegion(void* ptr);
