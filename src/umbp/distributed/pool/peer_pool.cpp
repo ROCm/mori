@@ -70,10 +70,12 @@ void PeerPool::StopTransitionWorker() {
 
 void PeerPool::TouchLocked(const std::string& key) {
   auto access = last_access_.find(key);
-  if (access != last_access_.end()) access_order_.erase(access->second);
-  const uint64_t stamp = ++access_clock_;
-  last_access_[key] = stamp;
-  access_order_[stamp] = key;
+  if (access != last_access_.end()) {
+    access_order_.splice(access_order_.begin(), access_order_, access->second);
+    return;
+  }
+  access_order_.push_front(key);
+  last_access_.emplace(key, access_order_.begin());
 }
 
 void PeerPool::ForgetAccessLocked(const std::string& key) {
@@ -130,10 +132,10 @@ size_t PeerPool::EnqueueWatermarkCandidatesLocked(LogicalTierGraph::TierIndex ti
     candidates.push_back({TierTransitionKind::kOffload, key, backend_id, tier_index});
   };
 
-  // Coldest first: access_order_ is keyed by access stamp, so the keys least
-  // likely to be read again leave the tier before the rest.
-  for (const auto& [stamp, key] : access_order_) {
-    (void)stamp;
+  // Coldest first: access_order_ keeps the hottest key at the front, so walking
+  // it backwards reaches the keys least likely to be read again first.
+  for (auto it = access_order_.rbegin(); it != access_order_.rend(); ++it) {
+    const std::string& key = *it;
     auto placement = placements_.find(key);
     if (placement == placements_.end()) continue;
     consider(key, placement->second);
@@ -539,29 +541,52 @@ std::vector<bool> PeerPool::BatchAbort(const std::vector<PoolSlotRef>& slots) {
 
 std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::string>& keys,
                                                       bool include_descs) {
-  std::lock_guard<std::mutex> operation_lock(operation_mutex_);
+  // Three phases, and only the first and last hold operation_mutex_. The backend
+  // lookups in between are the expensive part of a resolve, and every backend
+  // guards itself, so holding the pool lock across them only serializes callers
+  // that could have run side by side. Under TP that is every rank at once: the
+  // ranged-call timers showed resolve queueing into a 0 -> 30 ms staircase
+  // across a wave of concurrent batches, 84% of ranged-get time.
+  //
+  // placements_ is a hint, so acting on a stale one costs at most one extra
+  // backend probe, and phase 3 repairs it exactly as the miss path already did.
   std::vector<PoolResolvedEntry> out(keys.size());
-  if (backends_ == nullptr || policy_ == nullptr || keys.empty()) return out;
+  if (keys.empty()) return out;
 
   std::vector<std::optional<uint32_t>> preferred(keys.size());
-  for (size_t i = 0; i < keys.size(); ++i) {
-    auto it = placements_.find(keys[i]);
-    if (it != placements_.end()) preferred[i] = it->second;
+  std::vector<uint32_t> read_order;
+  {
+    std::lock_guard<std::mutex> operation_lock(operation_mutex_);
+    if (backends_ == nullptr || policy_ == nullptr) return out;
+    for (size_t i = 0; i < keys.size(); ++i) {
+      auto it = placements_.find(keys[i]);
+      if (it != placements_.end()) preferred[i] = it->second;
+    }
+    // Snapshot the order under the lock so a concurrent backend add or remove
+    // cannot be observed halfway through the walk below.
+    read_order = policy_->ReadOrder(*backends_);
   }
 
-  std::vector<std::vector<bool>> attempted(
-      keys.size(), std::vector<bool>(BackendRegistry::kMaxBackends, false));
+  // One bit per (key, backend) in a flat word per key. A vector<bool> per key
+  // heap-allocated once per key, and a 1023-key batch is the common shape here.
+  static_assert(BackendRegistry::kMaxBackends <= 16, "attempted mask is 16 bits wide");
+  std::vector<uint16_t> attempted(keys.size(), 0);
 
   const auto resolve = [&](uint32_t backend_id, const std::vector<size_t>& indices) {
     auto* backend = backends_->Get(backend_id);
     if (backend == nullptr || indices.empty()) return;
+    // The single-backend tier -- the common deployment -- sends every key to one
+    // backend in order, so hand it `keys` directly. Copying it first cost an
+    // allocation and a ~128-byte string copy per key for nothing.
+    bool identity = indices.size() == keys.size();
+    for (size_t i = 0; identity && i < indices.size(); ++i) identity = indices[i] == i;
     std::vector<std::string> backend_keys;
-    backend_keys.reserve(indices.size());
+    if (!identity) backend_keys.reserve(indices.size());
     for (size_t index : indices) {
-      attempted[index][backend_id] = true;
-      backend_keys.push_back(keys[index]);
+      attempted[index] |= static_cast<uint16_t>(1u << backend_id);
+      if (!identity) backend_keys.push_back(keys[index]);
     }
-    auto results = backend->BatchResolve(backend_keys, include_descs);
+    auto results = backend->BatchResolve(identity ? keys : backend_keys, include_descs);
     for (size_t i = 0; i < indices.size() && i < results.size(); ++i) {
       const size_t index = indices[i];
       const ResolveOutcome outcome = EffectiveResolveOutcome(results[i]);
@@ -594,12 +619,13 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
   }
   for (const auto& [backend_id, indices] : preferred_groups) resolve(backend_id, indices);
 
-  const auto read_order = policy_->ReadOrder(*backends_);
   for (uint32_t backend_id : read_order) {
     if (backend_id >= BackendRegistry::kMaxBackends) continue;
     std::vector<size_t> unresolved;
     for (size_t i = 0; i < keys.size(); ++i) {
-      if (!out[i].resolved.found && !attempted[i][backend_id]) unresolved.push_back(i);
+      if (!out[i].resolved.found && (attempted[i] & (1u << backend_id)) == 0) {
+        unresolved.push_back(i);
+      }
     }
     resolve(backend_id, unresolved);
   }
@@ -612,6 +638,22 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
   });
   if (batch_busy) return out;
 
+  // Probe the backends for the keys that resolved to nothing before retaking the
+  // lock: Contains() is another backend call, and phase 3 exists to mutate maps,
+  // not to wait on media.
+  std::vector<std::optional<uint32_t>> repaired(keys.size());
+  for (size_t i = 0; i < keys.size(); ++i) {
+    if (out[i].resolved.found) continue;
+    for (uint32_t backend_id : read_order) {
+      auto* backend = backends_->Get(backend_id);
+      if (backend != nullptr && backend->Contains(keys[i])) {
+        repaired[i] = backend_id;
+        break;
+      }
+    }
+  }
+
+  std::lock_guard<std::mutex> operation_lock(operation_mutex_);
   for (size_t i = 0; i < keys.size(); ++i) {
     if (out[i].resolved.found) {
       placements_[keys[i]] = out[i].backend_id;
@@ -628,22 +670,13 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
               {TierTransitionKind::kPromotion, keys[i], out[i].backend_id, *source_tier});
         }
       }
+    } else if (repaired[i].has_value()) {
+      placements_[keys[i]] = *repaired[i];
     } else {
-      bool exists = false;
-      for (uint32_t backend_id : read_order) {
-        auto* backend = backends_->Get(backend_id);
-        if (backend != nullptr && backend->Contains(keys[i])) {
-          placements_[keys[i]] = backend_id;
-          exists = true;
-          break;
-        }
-      }
       // A key the backends no longer hold must leave the access index too, or
       // it accumulates there for the life of the process and skews LRU order.
-      if (!exists) {
-        placements_.erase(keys[i]);
-        ForgetAccessLocked(keys[i]);
-      }
+      placements_.erase(keys[i]);
+      ForgetAccessLocked(keys[i]);
     }
   }
   return out;
