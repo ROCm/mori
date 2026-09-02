@@ -236,6 +236,146 @@ def test_dispatch_combine(
     assert_worker_results(torch_dist_process_manager, world_size)
 
 
+def _test_dispatch_combine_sbo(rank, world_size, zero_source_rank):
+    config = _make_intranode_config(
+        rank=rank,
+        world_size=world_size,
+        data_type=torch.bfloat16,
+        hidden_dim=7168,
+        max_num_inp_token_per_rank=8,
+        num_experts_per_rank=48,
+        num_experts_per_token=6,
+        use_external_inp_buf=True,
+        quant_type="fp8_blockwise",
+    )
+    op = mori.ops.EpDispatchCombineOp(config)
+    test_case = EpDispatchCombineTestCase(config)
+    test_data = test_case.gen_test_data(
+        use_max_token_num=not zero_source_rank,
+        num_token_override=(
+            [0] + [8] * (world_size - 1) if zero_source_rank else None
+        ),
+    )
+    _, all_rank_indices, all_rank_input, all_rank_weights, all_rank_scales = test_data
+
+    dispatch_output, dispatch_weights, _, _, dispatch_recv_num_token = op.dispatch(
+        all_rank_input[rank],
+        all_rank_weights[rank],
+        all_rank_scales[rank],
+        all_rank_indices[rank],
+    )
+    test_case.sync()
+    total_recv = int(dispatch_recv_num_token[0].item())
+    combine_input = test_case._get_combine_input(
+        op, dispatch_output, num_token=total_recv
+    )
+
+    route_tiles = torch.full(
+        (combine_input.shape[0], 6),
+        -1,
+        dtype=torch.int32,
+        device=combine_input.device,
+    )
+    if total_recv > 0:
+        published_tiles = max(
+            1,
+            (total_recv * config.num_experts_per_token + 31) // 32
+            + config.num_experts_per_rank * config.world_size * 4,
+        )
+        rows = torch.arange(
+            total_recv, dtype=torch.int32, device=combine_input.device
+        )[:, None]
+        slots = torch.arange(
+            config.num_experts_per_token,
+            dtype=torch.int32,
+            device=combine_input.device,
+        )[None, :]
+        route_tiles[:total_recv] = (rows + slots) % published_tiles
+    tile_state = torch.zeros(
+        max(
+            1,
+            (combine_input.shape[0] * config.num_experts_per_token + 31) // 32
+            + config.num_experts_per_rank * config.world_size * 4,
+        ),
+        dtype=torch.int32,
+        device=combine_input.device,
+    )
+    init_done = torch.cuda.Event()
+    init_done.record()
+
+    with pytest.raises(ValueError, match="route width"):
+        op.combine(
+            combine_input,
+            dispatch_weights,
+            all_rank_indices[rank],
+            block_num=1,
+            sbo_route_tiles=route_tiles[:, :5].contiguous(),
+            sbo_tile_state=tile_state,
+            sbo_expected_n_tiles=56,
+        )
+    with pytest.raises(ValueError, match="tile_state"):
+        op.combine(
+            combine_input,
+            dispatch_weights,
+            all_rank_indices[rank],
+            block_num=1,
+            sbo_route_tiles=route_tiles,
+            sbo_tile_state=tile_state[:1],
+            sbo_expected_n_tiles=56,
+        )
+    with pytest.raises(ValueError, match="expected_n_tiles"):
+        op.combine(
+            combine_input,
+            dispatch_weights,
+            all_rank_indices[rank],
+            block_num=1,
+            sbo_route_tiles=route_tiles,
+            sbo_tile_state=tile_state,
+            sbo_expected_n_tiles=55,
+        )
+
+    producer_stream = torch.cuda.Stream()
+    producer_stream.wait_event(init_done)
+    with torch.cuda.stream(producer_stream):
+        torch.cuda._sleep(1_000_000)
+        tile_state.fill_(56)
+
+    combine_stream = torch.cuda.Stream()
+    combine_stream.wait_event(init_done)
+    with torch.cuda.stream(combine_stream):
+        combine_output, combine_output_weight = op.combine(
+            combine_input,
+            dispatch_weights,
+            all_rank_indices[rank],
+            block_num=1,
+            sbo_route_tiles=route_tiles,
+            sbo_tile_state=tile_state,
+            sbo_expected_n_tiles=56,
+        )
+
+    test_case.sync()
+    test_case.check_combine_result(
+        op,
+        test_data,
+        combine_output,
+        combine_output_weight,
+        combine_data_type=torch.bfloat16,
+    )
+    assert op._last_combine_kernel_name.endswith("_sbo")
+
+
+@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("zero_source_rank", (False, True))
+def test_dispatch_combine_sbo_waits_for_delayed_producer(
+    torch_dist_process_manager, world_size, zero_source_rank
+):
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (_test_dispatch_combine_sbo, [world_size, zero_source_rank])
+        )
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
 def _test_dispatch_combine_cross_dtype(
     rank,
     world_size,

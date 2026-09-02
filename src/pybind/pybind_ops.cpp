@@ -84,6 +84,21 @@ int64_t BuildArgs(mori::moe::EpDispatchCombineHandle& handle, int rdmaBlockNum, 
   return reinterpret_cast<int64_t>(&args);
 }
 
+int64_t BuildArgsSbo(mori::moe::EpDispatchCombineHandle& handle, int rdmaBlockNum, int hiddenDim,
+                     int useExternalInpBuf, int64_t routeTilesPtr, int64_t tileStatePtr, int topK,
+                     int expectedNTiles) {
+  if (routeTilesPtr == 0 || tileStatePtr == 0 || topK <= 0 || expectedNTiles <= 0) {
+    throw std::invalid_argument("MORI SBO v1 requires non-null buffers and positive metadata");
+  }
+  auto argsPtr = BuildArgs(handle, rdmaBlockNum, hiddenDim, useExternalInpBuf);
+  auto* args = reinterpret_cast<mori::moe::EpDispatchCombineArgsRaw*>(argsPtr);
+  args->sboRouteTiles = reinterpret_cast<mori::moe::index_t*>(routeTilesPtr);
+  args->sboTileState = reinterpret_cast<mori::moe::index_t*>(tileStatePtr);
+  args->sboTopK = topK;
+  args->sboExpectedNTiles = expectedNTiles;
+  return argsPtr;
+}
+
 // BuildArgs variant that reads routing from caller-owned tensors; replayMode toggles cache vs
 // replay routing.
 int64_t BuildArgsWithRouting(mori::moe::EpDispatchCombineHandle& handle, int rdmaBlockNum,
@@ -316,6 +331,10 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
         py::arg("indices_ptr"));
   m.def("build_args", &BuildArgs, py::arg("handle"), py::arg("rdma_block_num") = -1,
         py::arg("hidden_dim") = -1, py::arg("use_external_inp_buf") = -1);
+  m.def("build_args_sbo", &BuildArgsSbo, py::arg("handle"), py::arg("rdma_block_num") = -1,
+        py::arg("hidden_dim") = -1, py::arg("use_external_inp_buf") = -1,
+        py::arg("route_tiles_ptr"), py::arg("tile_state_ptr"), py::arg("topk"),
+        py::arg("expected_n_tiles"));
   m.def("build_args_with_routing", &BuildArgsWithRouting, py::arg("handle"),
         py::arg("rdma_block_num") = -1, py::arg("hidden_dim") = -1,
         py::arg("use_external_inp_buf") = -1, py::arg("replay_mode") = false,

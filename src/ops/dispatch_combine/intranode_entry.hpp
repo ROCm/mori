@@ -55,7 +55,8 @@ __device__ __forceinline__ void EpDispatchIntraNodeKernel_entry(EpDispatchCombin
 
 template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,
           bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false, bool UseWeights = true,
-          int Vec8Top8BlockElems = 0, int Vec8AccumNum = 8, bool UseFp4Combine = false>
+          int Vec8Top8BlockElems = 0, int Vec8AccumNum = 8, bool UseFp4Combine = false,
+          bool EnableSboWait = false>
 __device__ __forceinline__ void EpCombineIntraNodeKernel_entry(EpDispatchCombineArgs<T> args) {
 #if defined(__gfx1250__) || defined(__gfx1251__)
   // Only the unquantized combine takes the TDM body, and the TDM body is written for that case
@@ -75,16 +76,17 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_entry(EpDispatchCombine
   //     best tuning against 169.2us for bf16 moving twice the bytes, so the fold was buying speed
   //     for a transport nobody should pick, at the price of the scale plumbing threaded through
   //     every loop of the TDM body.
-  if constexpr (!UseFp8DirectCast && !UseFp8BlockwiseQuant && !UseFp4Combine) {
+  if constexpr (!UseFp8DirectCast && !UseFp8BlockwiseQuant && !UseFp4Combine && !EnableSboWait) {
     EpCombineIntraNodeKernel_1250x_body<T, UseP2PRead, EnableStdMoE, UseWeights>(args);
   } else {
     EpCombineIntraNodeKernel_body<T, UseP2PRead, EnableStdMoE, UseFp8DirectCast,
                                   UseFp8BlockwiseQuant, UseWeights, Vec8Top8BlockElems,
-                                  Vec8AccumNum, UseFp4Combine>(args);
+                                  Vec8AccumNum, UseFp4Combine, EnableSboWait>(args);
   }
 #else
   EpCombineIntraNodeKernel_body<T, UseP2PRead, EnableStdMoE, UseFp8DirectCast, UseFp8BlockwiseQuant,
-                                UseWeights, Vec8Top8BlockElems, Vec8AccumNum, UseFp4Combine>(args);
+                                UseWeights, Vec8Top8BlockElems, Vec8AccumNum, UseFp4Combine,
+                                EnableSboWait>(args);
 #endif
 }
 

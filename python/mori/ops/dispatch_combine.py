@@ -394,6 +394,10 @@ def _load_hip_modules(kernel_type, init_shmem=True):
 
 
 class EpDispatchCombineOp:
+    @staticmethod
+    def supports_sbo_tile_signal_v1() -> bool:
+        return hasattr(mori_cpp, "build_args_sbo")
+
     def __init__(self, config):
         self.config = config
         # Wavefront size of THIS device (32 on gfx1250, 64 on gfx9xx). Used for
@@ -1453,6 +1457,9 @@ class EpDispatchCombineOp:
         call_reset: bool = False,
         *,
         routing: "EpDispatchRoutingHandle | None" = None,
+        sbo_route_tiles: "torch.Tensor | None" = None,
+        sbo_tile_state: "torch.Tensor | None" = None,
+        sbo_expected_n_tiles: int = 0,
     ):
         """Reduce post-expert tokens back onto this rank's tokens.
 
@@ -1477,6 +1484,64 @@ class EpDispatchCombineOp:
             else int(self.config.use_external_inp_buf)
         )
         is_zero_copy = not actual_use_ext
+        sbo_enabled = sbo_route_tiles is not None or sbo_tile_state is not None
+        if sbo_enabled:
+            if sbo_route_tiles is None or sbo_tile_state is None:
+                raise ValueError("MORI SBO requires both route_tiles and tile_state")
+            if routing is not None:
+                raise ValueError("MORI SBO v1 does not support routing handles")
+            if (
+                sbo_route_tiles.dtype != torch.int32
+                or sbo_tile_state.dtype != torch.int32
+                or not sbo_route_tiles.is_contiguous()
+                or not sbo_tile_state.is_contiguous()
+            ):
+                raise ValueError("MORI SBO buffers must be contiguous int32 tensors")
+            if (
+                sbo_route_tiles.device != input.device
+                or sbo_tile_state.device != input.device
+            ):
+                raise ValueError("MORI SBO buffers must be on the combine input device")
+            if sbo_route_tiles.ndim != 2 or sbo_route_tiles.shape[0] != input.shape[0]:
+                raise ValueError(
+                    "MORI SBO route_tiles must be [recv_capacity, topk], "
+                    f"got {tuple(sbo_route_tiles.shape)} for input {tuple(input.shape)}"
+                )
+            if sbo_route_tiles.shape[1] != self.config.num_experts_per_token:
+                raise ValueError(
+                    "MORI SBO route width must match configured top-k "
+                    f"{self.config.num_experts_per_token}, got "
+                    f"{sbo_route_tiles.shape[1]}"
+                )
+            # v1 permits sort_block_m up to 128 with an M32 Stage2 producer:
+            # reserve four counter slots per global expert for padding gaps.
+            min_tile_capacity = (
+                sbo_route_tiles.numel() + 31
+            ) // 32 + (
+                self.config.num_experts_per_rank * self.config.world_size * 4
+            )
+            if sbo_tile_state.ndim != 1 or sbo_tile_state.numel() < min_tile_capacity:
+                raise ValueError(
+                    "MORI SBO tile_state must cover per-expert sorted padding: "
+                    f"need at least {min_tile_capacity}, got {sbo_tile_state.numel()}"
+                )
+            expected_n_tiles = (input.shape[1] + 127) // 128
+            if sbo_expected_n_tiles != expected_n_tiles:
+                raise ValueError(
+                    f"MORI SBO expected_n_tiles must be {expected_n_tiles}, "
+                    f"got {sbo_expected_n_tiles}"
+                )
+            if (
+                self.config.kernel_type != EpDispatchCombineKernelType.IntraNode
+                or _normalize_quant_type(self.config.quant_type)
+                != EpDispatchCombineQuantType.Fp8BlockwiseQuant
+                or input.dtype != torch.bfloat16
+                or not actual_use_ext
+            ):
+                raise ValueError(
+                    "MORI SBO v1 requires IntraNode bf16 input with external "
+                    "FP8-blockwise combine"
+                )
         cur_n = (
             self._routing_source_token_count(routing)
             if routing is not None
@@ -1508,6 +1573,11 @@ class EpDispatchCombineOp:
             is_push_transport=is_push,
         )
         self._cached_combine_launch = (actual_bn, actual_rbn, actual_wpb)
+        if sbo_enabled and actual_bn >= self._handle_info["multi_processor_count"]:
+            raise ValueError(
+                "MORI SBO combine must reserve at least one CU for its producer: "
+                f"blocks={actual_bn}, CUs={self._handle_info['multi_processor_count']}"
+            )
         stream = _current_stream()
         self._combine_dtype = input.dtype
         sfx = _DTYPE_SUFFIX[input.dtype]
@@ -1528,6 +1598,17 @@ class EpDispatchCombineOp:
                 hidden_dim=hidden_dim,
                 replay_mode=False,
                 use_external_inp_buf=use_external_inp_buf,
+            )
+        elif sbo_enabled:
+            args_ptr = mori_cpp.build_args_sbo(
+                self._handle,
+                rdma_block_num=actual_rbn,
+                hidden_dim=hidden_dim,
+                use_external_inp_buf=use_external_inp_buf,
+                route_tiles_ptr=sbo_route_tiles.data_ptr(),
+                tile_state_ptr=sbo_tile_state.data_ptr(),
+                topk=sbo_route_tiles.shape[1],
+                expected_n_tiles=sbo_expected_n_tiles,
             )
         else:
             args_ptr = mori_cpp.build_args(
@@ -1667,6 +1748,17 @@ class EpDispatchCombineOp:
                     assert (
                         kernel_name in _FP4_COMBINE_KERNELS
                     ), f"fp4_blockwise combine selected unregistered kernel '{kernel_name}'"
+                if sbo_enabled:
+                    if (
+                        quant_type
+                        != EpDispatchCombineQuantType.Fp8BlockwiseQuant
+                        or kernel_name
+                        != "EpCombineIntraNodeKernel_bf16_nop2p_fp8_blockwise"
+                    ):
+                        raise ValueError(
+                            "MORI SBO v1 requires generic IntraNode FP8-blockwise combine"
+                        )
+                    kernel_name += "_sbo"
                 shared_mem = self._combine_shared_mem(
                     actual_wpb, use_weights=not use_vec8_top8
                 )

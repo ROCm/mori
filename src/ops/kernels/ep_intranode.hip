@@ -19,6 +19,13 @@ WRAP_ALL_TYPES_BOOL3_ENTRY(EpCombineIntraNodeKernel, _p2p_stdmoe, true, true, fa
 WRAP_BOOL3_ENTRY(EpCombineIntraNodeKernel, bf16_nop2p_fp8cast, hip_bfloat16, false, false, true)
 MORI_FP8_ANY(WRAP_BOOL4_ENTRY(EpCombineIntraNodeKernel, bf16_nop2p_fp8_blockwise, hip_bfloat16,
                               false, false, false, true))
+#if defined(MORI_FP8_TYPE_FNUZ_ENABLED) || defined(MORI_FP8_TYPE_OCP_ENABLED)
+extern "C" __global__ void EpCombineIntraNodeKernel_bf16_nop2p_fp8_blockwise_sbo(
+    EpDispatchCombineArgs<hip_bfloat16> args) {
+  EpCombineIntraNodeKernel_entry<hip_bfloat16, false, false, false, true, true, 0, 8, false,
+                                 true>(args);
+}
+#endif
 // PULL blockwise and its separately-launched quantise pass used to be registered here. Both existed
 // only to put blockwise on the gfx125x TDM tile fold -- that was worth 3646.2us -> 1410.9us, and
 // splitting the quantise out took it to 367.6us. intranode_entry.hpp now keeps quantization out of

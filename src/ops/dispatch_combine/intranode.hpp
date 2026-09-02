@@ -243,7 +243,8 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,
           bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false, bool UseWeights = true,
-          int Vec8Top8BlockElems = 0, int Vec8AccumNum = 8, bool UseFp4Combine = false>
+          int Vec8Top8BlockElems = 0, int Vec8AccumNum = 8, bool UseFp4Combine = false,
+          bool EnableSboWait = false>
 __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   using TokT =
       std::conditional_t<UseFp8DirectCast || UseFp8BlockwiseQuant, core::CombineInternalFp8, T>;
@@ -337,8 +338,32 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
             ? args.dispTokIdToSrcTokIdLocal
             : args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(myPe);
     const decltype(totalRecvTokenNum) _cPushEnd = totalRecvTokenNum;
+    auto _cWaitSbo = [&](const int tokenIdx) {
+      if constexpr (EnableSboWait) {
+        for (int slot = 0; slot < args.sboTopK; ++slot) {
+          int tile = -1;
+          if (laneId == 0) {
+            tile = __hip_atomic_load(args.sboRouteTiles + tokenIdx * args.sboTopK + slot,
+                                     __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+          }
+          tile = __shfl(tile, 0);
+          if (tile < 0) continue;
+          int ready = 0;
+          do {
+            if (laneId == 0) {
+              ready = __hip_atomic_load(args.sboTileState + tile, __ATOMIC_ACQUIRE,
+                                        __HIP_MEMORY_SCOPE_AGENT);
+              if (ready < args.sboExpectedNTiles) __builtin_amdgcn_s_sleep(1);
+            }
+            ready = __shfl(ready, 0);
+          } while (ready < args.sboExpectedNTiles);
+        }
+        __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE);
+      }
+    };
 #ifdef ENABLE_PROFILER
     for (int tokenIdx = globalWarpId; tokenIdx < totalRecvTokenNum; tokenIdx += globalWarpNum) {
+      _cWaitSbo(tokenIdx);
       index_t destTokId = localSrcMap[tokenIdx];
       index_t destPe = PeFromFlatTokenIndex(config, destTokId);
       index_t destLocalTokId = LocalTokIdFromFlatTokenIndex(config, destTokId);
@@ -377,6 +402,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
     }
 #else
     auto _cSendTok = [&](const int tokenIdx) {
+      _cWaitSbo(tokenIdx);
       index_t destTokId = localSrcMap[tokenIdx];
       index_t destPe = PeFromFlatTokenIndex(config, destTokId);
       index_t destLocalTokId = LocalTokIdFromFlatTokenIndex(config, destTokId);

@@ -521,6 +521,12 @@ struct EpDispatchCombineArgs {
   index_t* interNodeDispDestTokIdMap{nullptr};
   index_t* interNodeChunkFlagCombine{nullptr};
   index_t* interNodeDispSendMap{nullptr};
+  // MORI SBO v1: AITER maps each recv-row/top-k route to a sorted-M tile and
+  // release-increments tileState once per completed N tile.
+  index_t* sboRouteTiles{nullptr};
+  index_t* sboTileState{nullptr};
+  index_t sboTopK{0};
+  index_t sboExpectedNTiles{0};
 #ifdef ENABLE_PROFILER
   mori::core::profiler::ProfilerConfig profilerConfig;
 #endif
@@ -586,6 +592,10 @@ struct EpDispatchCombineArgsRaw {
   index_t* interNodeDispDestTokIdMap{nullptr};
   index_t* interNodeChunkFlagCombine{nullptr};
   index_t* interNodeDispSendMap{nullptr};
+  index_t* sboRouteTiles{nullptr};
+  index_t* sboTileState{nullptr};
+  index_t sboTopK{0};
+  index_t sboExpectedNTiles{0};
 #ifdef ENABLE_PROFILER
   mori::core::profiler::ProfilerConfig profilerConfig;
 #endif
