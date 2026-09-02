@@ -41,6 +41,14 @@ own Store, so there is no second bootstrap channel to configure::
 ``resolve_process_group()``, the way torch's own CUDA and NCCL backends do it, rather
 than through the ``GroupInfo`` registry that only that deprecated call populates.
 
+Known constraint on the POSIX-fd path (gfx9, i.e. MI300/MI355): CCO names its rendezvous
+socket after the local slot offset, and freeing a window returns that slot to a per-rank
+allocator. Ranks that free symmetric tensors in *different* orders therefore get different
+offsets, and a later ``rendezvous()`` fails with a P2P fd exchange timeout. Free order is
+unconstrained as far as torch is concerned, so keep it uniform across ranks until that
+naming changes. The fabric path is unaffected -- peer addressing is computed from each
+rank's own offset.
+
 Peers are exposed the way torch's model expects, as the ``buffer_ptrs`` /
 ``buffer_ptrs_dev`` array -- one base address per rank, same as every other backend.
 
