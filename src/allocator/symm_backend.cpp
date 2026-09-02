@@ -134,7 +134,15 @@ struct CcoGroup {
     mori::cco::ccoDevComm* device = nullptr;  // kernel-argument copy
     int lsa_barrier_count = 0;                // what it was built with
   };
-  std::mutex dev_mu;
+  // Serialises everything this process does with `comm`. cco's own allocMutex is
+  // documented as covering allocTable/windows/windowTableEntries against concurrent
+  // MemAlloc/MemFree/WindowRegister/WindowDeregister (include/mori/cco/cco.hpp), but
+  // only MemAlloc/MemImport/MemFree actually take it -- the window paths do not. That
+  // did not matter while cco was driven from explicit single-threaded user code; it
+  // does now, because torch drops the last reference to a tensor on whatever thread
+  // happens to hold it, so ~MoriSymmetricMemory can deregister a window while another
+  // thread is registering one. Also guards dev_comms, so there is no lock ordering.
+  std::mutex mu;
   std::unordered_map<std::string, DevCommEntry> dev_comms;
 
   ~CcoGroup() {
@@ -277,6 +285,7 @@ class MoriSymmetricMemory : public SymmetricMemory {
     // the handles it imported, with no collective inside, so this can run on whichever
     // thread drops the last reference and in whatever order across ranks.
     if (group_ && group_->comm) {
+      std::lock_guard<std::mutex> lock(group_->mu);
       (void)mori::cco::ccoWindowDeregister(group_->comm, pad_win_);
       (void)mori::cco::ccoMemFree(group_->comm, pad_ptr_);
       (void)mori::cco::ccoWindowDeregister(group_->comm, win_);
@@ -472,6 +481,9 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
     // Overload C: retain the tensor's VMM handle, alias it into the flat LSA slot,
     // and register the window. No copy, and no second peer exchange of our own --
     // this is the exchange the backend used to hand-roll over SCM_RIGHTS.
+    // Held across the registers and the peer-pointer reads: see CcoGroup::mu.
+    std::unique_lock<std::mutex> cco_lock(cco_group->mu);
+
     ccoWindow_t win{};
     void* local_ptr = nullptr;
     MORI_CCO_CHECK(mori::cco::ccoWindowRegister(cco_group->comm, block->ptr, block->alloc_size,
@@ -505,6 +517,7 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
     }
     TORCH_CHECK(buffers[rank] != nullptr,
                 "mori symm backend: cco did not map this rank's own window");
+    cco_lock.unlock();
 
     auto symm = c10::make_intrusive<MoriSymmetricMemory>(
         cco_group, win, local_ptr, pad_win, pad_ptr, std::move(buffers), std::move(pads),
@@ -555,7 +568,7 @@ class MoriSymmAllocator : public SymmetricMemoryAllocator {
     MORI_HIP_CHECK(hipGetDevice(&dev));
     DeviceGuard guard(dev);
 
-    std::lock_guard<std::mutex> lock(group->dev_mu);
+    std::lock_guard<std::mutex> lock(group->mu);
     auto it = group->dev_comms.find(key);
     if (it != group->dev_comms.end()) {
       // The key is supposed to encode the parameterisation, so a mismatch means two
