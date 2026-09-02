@@ -313,6 +313,7 @@ def test_main(
     seed: int = 0,
     enable_dedup: bool = True,
     fused_moe_adaption: bool = True,
+    num_qp_per_pe: int = -1,
 ):
     torch.manual_seed(seed + rank)
     random.seed(seed + rank)
@@ -370,6 +371,22 @@ def test_main(
         combine_block_num, combine_warp_per_block = block_num, warp_num_per_block
         rdma_block_num = 0
 
+    # Under AUTO the op resolves block/warp/rdma itself (tuning rule, else its
+    # own fallback); -1 means "you decide". Passing the hardcoded numbers above
+    # would only half-apply that, since a tuning rule wins over an explicit arg
+    # but the fallback doesn't.
+    auto_launch = os.getenv("MORI_EP_LAUNCH_CONFIG_MODE", "MANUAL").upper() == "AUTO"
+    if auto_launch:
+        dispatch_block_num = dispatch_warp_per_block = -1
+        combine_block_num = combine_warp_per_block = -1
+
+    # QP count isn't in the tuning lookup key, so AUTO can't pick it. -1 keeps
+    # the long-standing default; at 4-32 tokens/rank, hidden 6144, 1 measures
+    # ~20% faster than the default 4 on 2x8 MI308X (small batches don't have
+    # enough chunks in flight to earn back the extra QPs' per-QP overhead).
+    if num_qp_per_pe <= 0:
+        num_qp_per_pe = 4 if multi_node else 1
+
     mori.shmem.shmem_torch_process_group_init("default")
 
     config = mori.ops.EpDispatchCombineConfig(
@@ -389,7 +406,7 @@ def test_main(
         kernel_type=kernel_type,
         gpu_per_node=num_ranks // num_nodes,
         rdma_block_num=rdma_block_num,
-        num_qp_per_pe=4 if multi_node else 1,
+        num_qp_per_pe=num_qp_per_pe,
     )
     op = mori.ops.EpDispatchCombineOp(config)
 
@@ -513,7 +530,9 @@ def test_main(
             topk_idx,
             block_num=combine_block_num,
             warp_per_block=(
-                4 if zero_copy and not multi_node else combine_warp_per_block
+                4
+                if zero_copy and not multi_node and not auto_launch
+                else combine_warp_per_block
             ),
             use_external_inp_buf=not zero_copy,
         )
@@ -554,7 +573,9 @@ def test_main(
             topk_idx,
             block_num=combine_block_num,
             warp_per_block=(
-                4 if zero_copy and not multi_node else combine_warp_per_block
+                4
+                if zero_copy and not multi_node and not auto_launch
+                else combine_warp_per_block
             ),
             use_external_inp_buf=not zero_copy,
         )
@@ -664,6 +685,7 @@ def test_loop(
     num_topk: int = 8,
     num_experts: int = 288,
     do_pressure_test: bool = False,
+    num_qp_per_pe: int = -1,
 ):
     rank, num_ranks, group, num_nodes = init_dist(local_rank, num_local_ranks)
 
@@ -677,6 +699,7 @@ def test_loop(
         num_nodes,
         group,
         seed=1,
+        num_qp_per_pe=num_qp_per_pe,
     )
 
     for seed in range(int(1e9) if do_pressure_test else 0):
@@ -692,6 +715,7 @@ def test_loop(
             num_nodes,
             group,
             seed=seed,
+            num_qp_per_pe=num_qp_per_pe,
         )
         for i in range(20):
             assert (
@@ -705,6 +729,7 @@ def test_loop(
                     num_nodes,
                     group,
                     seed=seed,
+                    num_qp_per_pe=num_qp_per_pe,
                 )
                 == ref_hash
             ), f"Error: seed={seed}"
@@ -727,6 +752,13 @@ def parse_args():
         "--num-processes", type=int, default=8, help="ranks per node (GPUs to use)"
     )
     p.add_argument(
+        "--num-qp",
+        type=int,
+        default=-1,
+        help="QPs per peer. -1 keeps the default (4 multi-node, 1 single-node); "
+        "AUTO doesn't cover this, only block/warp/rdma",
+    )
+    p.add_argument(
         "--pressure-test",
         action="store_true",
         help="loop over seeds forever, re-checking the output hash each time",
@@ -746,6 +778,7 @@ if __name__ == "__main__":
             args.num_topk,
             args.num_experts,
             args.pressure_test,
+            args.num_qp,
         ),
         nprocs=args.num_processes,
     )
