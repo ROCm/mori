@@ -1177,13 +1177,22 @@ static void CcoWindowRegisterMr(ccoComm* comm, ccoWindowHost* wh, bool isFabric,
 }
 
 int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin) {
-  auto it = comm->allocTable.find(ptr);
-  if (it == comm->allocTable.end()) {
-    MORI_SHMEM_ERROR("ccoWindowRegister: ptr {} not in allocTable", ptr);
-    return -1;
+  // allocMutex only for the lookup, not for the whole function: the peer exchange
+  // below is collective, and the callers that allocate (the other two overloads)
+  // reach ccoMemAlloc / ccoMemImport, which take this mutex themselves. Holding a
+  // reference past the unlock is fine -- rehashing invalidates iterators, not
+  // references to elements.
+  ccoComm::AllocMeta* metaPtr = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(comm->allocMutex);
+    auto it = comm->allocTable.find(ptr);
+    if (it == comm->allocTable.end()) {
+      MORI_SHMEM_ERROR("ccoWindowRegister: ptr {} not in allocTable", ptr);
+      return -1;
+    }
+    metaPtr = &it->second;
   }
-
-  auto& meta = it->second;
+  auto& meta = *metaPtr;
   size_t slotOffset = meta.slotOffset;
   void* localPtr = ptr;
   int worldSize = comm->worldSize;
@@ -1454,13 +1463,18 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
 
   if (comm->windowMrsEnabled) CcoWindowRegisterMr(comm, wh, useFabric, meta.shareFd);
 
-  // Publish into the per-comm window table (drives findWindow lookups).
+  // Publish into the per-comm window table (drives findWindow lookups), under the lock:
+  // ccoWindowDeregister walks these vectors, and a push_back that reallocates under it
+  // invalidates the index and the pointer it is holding.
   ccoComm::WindowTableEntry tableEntry;
   tableEntry.base = reinterpret_cast<uintptr_t>(localPtr);
   tableEntry.size = static_cast<uintptr_t>(size);
   tableEntry.devPtr = devPtr;
-  comm->windowTableEntries.push_back(tableEntry);
-  comm->windows.push_back(wh);
+  {
+    std::lock_guard<std::mutex> lock(comm->allocMutex);
+    comm->windowTableEntries.push_back(tableEntry);
+    comm->windows.push_back(wh);
+  }
 
   *outWin = devPtr;
 
@@ -1538,6 +1552,12 @@ void* ccoGetPeerPtr(ccoComm* comm, void* localPtr, int pe) {
 /* ========================================================================== */
 
 int ccoWindowDeregister(ccoComm* comm, ccoWindow_t win) {
+  // Whole function: it searches and mutates windows / windowTableEntries, reads
+  // allocTable, and deletes the host record. Unlike the register overloads it calls
+  // nothing that takes this mutex, so holding it throughout is safe. The HIP calls
+  // inside will block a concurrent MemAlloc, which is acceptable -- window teardown
+  // is rare and already serialised against itself by the caller in practice.
+  std::lock_guard<std::mutex> lock(comm->allocMutex);
   ccoWindowHost* wh = nullptr;
   size_t idx = 0;
   for (size_t i = 0; i < comm->windows.size(); i++) {
@@ -1697,17 +1717,22 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   // collectives (only FULL can resolve to non-NONE when lsaSize == worldSize).
   if (reqs->gdaConnectionType == CCO_GDA_CONNECTION_FULL && !comm->windowMrsEnabled) {
     comm->windowMrsEnabled = true;
-    for (ccoWindowHost* wh : comm->windows) {
-      bool isFabric = false;
-      int shareFd = -1;
-      {
-        std::lock_guard<std::mutex> lock(comm->allocMutex);
+    // Snapshot under the lock, register outside it: CcoWindowRegisterMr is collective.
+    struct Pending {
+      ccoWindowHost* wh;
+      bool isFabric;
+      int shareFd;
+    };
+    std::vector<Pending> pending;
+    {
+      std::lock_guard<std::mutex> lock(comm->allocMutex);
+      pending.reserve(comm->windows.size());
+      for (ccoWindowHost* wh : comm->windows) {
         const auto& meta = comm->allocTable.at(wh->localPtr);
-        isFabric = meta.isFabric;
-        shareFd = meta.shareFd;
+        pending.push_back({wh, meta.isFabric, meta.shareFd});
       }
-      CcoWindowRegisterMr(comm, wh, isFabric, shareFd);
     }
+    for (const Pending& p : pending) CcoWindowRegisterMr(comm, p.wh, p.isFabric, p.shareFd);
   }
 
   if (connType != CCO_GDA_CONNECTION_NONE && comm->ctx->RdmaTransportEnabled()) {
