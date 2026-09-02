@@ -601,6 +601,7 @@ RdmaEndpoint BnxtDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
 void BnxtDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
                                         const RdmaEndpointHandle& remote, uint32_t qpId) {
   uint32_t local_qpn = local.qpn;
+
   assert(qpPool.find(local_qpn) != qpPool.end());
   BnxtQpContainer* qp = qpPool.at(local_qpn);
   RdmaDevice* rdmaDevice = GetRdmaDevice();

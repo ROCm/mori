@@ -121,6 +121,7 @@ def _hipcc_device_bc(
         *_nic_defines(),
         *_ccqe_defines(),
         *_profiler_defines(),
+        *_tunable_defines(),
         *(extra_defines or []),
     ]
     for d in include_dirs:
@@ -442,7 +443,10 @@ def _tunable_defines() -> list[str]:
     cannot end up in the compile without being in the key -- which is the bug that made a run with
     the quantise pass deleted load the full build's object and report the full build's time.
     """
-    return []
+    defs: list[str] = []
+    if os.environ.get("MORI_ENABLE_HOST_PROXY") == "1":
+        defs.append("-DMORI_PROXY_ENABLED")
+    return defs
 
 
 def _hipcc_genco(
