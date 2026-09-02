@@ -21,8 +21,12 @@
 # SOFTWARE.
 """Register mori as a torch SymmetricMemory backend. Requires **torch >= 2.9**.
 
-Self-contained: plain HIP VMM, no shmem or cco allocator involved, so no mori bootstrap
-is needed -- torch's process group is the only rendezvous::
+torch owns the allocation and its lifetime; CCO owns the peer addressing. ``alloc`` is
+plain HIP VMM, and ``rendezvous`` hands that allocation to ``ccoWindowRegister``, which
+aliases it into CCO's flat LSA space -- so ``buffer_ptrs`` are ``ccoGetPeerPtr`` results
+and agree with the device-side ``Window.lsa_ptr`` by construction. CCO's communicator is
+created on the first rendezvous of a process group and its unique id travels over torch's
+own Store, so there is no second bootstrap channel to configure::
 
     import torch.distributed._symmetric_memory as symm_mem
     from mori.allocator import register_symm_backend
@@ -32,6 +36,18 @@ is needed -- torch's process group is the only rendezvous::
     t   = symm_mem.empty(1024, dtype=torch.bfloat16, device=device)
     hdl = symm_mem.rendezvous(t, group_name)
     peer = hdl.get_buffer(1, (1024,), torch.bfloat16)
+
+``enable_symm_mem_for_group()`` is not needed: the group is resolved with
+``resolve_process_group()``, the way torch's own CUDA and NCCL backends do it, rather
+than through the ``GroupInfo`` registry that only that deprecated call populates.
+
+Known constraint on the POSIX-fd path (gfx9, i.e. MI300/MI355): CCO names its rendezvous
+socket after the local slot offset, and freeing a window returns that slot to a per-rank
+allocator. Ranks that free symmetric tensors in *different* orders therefore get different
+offsets, and a later ``rendezvous()`` fails with a P2P fd exchange timeout. Free order is
+unconstrained as far as torch is concerned, so keep it uniform across ranks until that
+naming changes. The fabric path is unaffected -- peer addressing is computed from each
+rank's own offset.
 
 Peers are exposed the way torch's model expects, as the ``buffer_ptrs`` /
 ``buffer_ptrs_dev`` array -- one base address per rank, same as every other backend.
@@ -44,14 +60,21 @@ for the staged plan.
 
 The handle type is probed per device: fabric where supported, POSIX fd otherwise. gfx9
 (MI300/MI355) has no fabric support -- ``hipMemCreate`` itself reports "operation not
-supported" -- so those fall back to fd, which needs no configuration.
+supported" -- so those fall back to fd, which needs no configuration. The allocation and
+CCO's own export have to agree on that type, since CCO re-exports what it imports.
 
-``barrier``/``put_signal``/``wait_signal`` are not implemented and raise, so no signal
-pad is reserved in the window -- torch's 9216-byte pad would cost a whole extra 2 MiB page
-on a page-aligned allocation. Build with ``MORI_SYMM_SIGNAL_PAD=ON`` to reserve it, and
-check ``signal_pad_supported()`` at run time. torch's own ``symm_mem`` collectives
-synchronise through the pad, so they need that build; ``dist.barrier()`` is the stand-in
-without it.
+``MORI_SYMM_PER_RANK_VMM`` sizes the communicator's flat VA reservation (default 4 GiB).
+It is a floor rather than a budget -- CCO quantises it up to 4 GiB -- and it bounds live
+symmetric memory per rank, not allocations over time, because slots are recycled on free.
+
+The signal pad is always there, as its own CCO allocation and window rather than a tail
+appended to the buffer -- the same split NCCL's backend uses. torch's own ``symm_mem``
+collectives synchronise through it, so they work without any build flag.
+
+``barrier()`` runs over CCO's host barrier, which means the current stream is drained
+first: stronger than the device-side barrier torch asks for, and heavier.
+``put_signal``/``wait_signal`` still raise -- point-to-point signalling needs a
+``ccoDevComm``, which this backend does not create yet.
 
 ``rendezvous()`` takes the tensor's *storage* base, so ``get_offset()`` is 0 by
 construction: every ``alloc()`` is its own VMM allocation. Handing it a view
@@ -64,13 +87,13 @@ The extension is optional and its ABI tracks the installed torch, so it is a plu
 makes a failure fatal, ``OFF`` skips it), and a build that did not happen or no longer
 loads is compiled here on first import from the sources shipped in ``_jit-sources``. So
 switching torch does not require reinstalling mori. ``MORI_SYMM_FORCE_JIT=1`` ignores the
-prebuilt module, which is also how ``MORI_SYMM_SIGNAL_PAD=ON`` can be turned on without
-rebuilding mori itself.
+prebuilt module.
 """
 
 import atexit
 import logging
 import os
+from pathlib import Path
 from typing import Literal
 
 __all__ = [
@@ -78,6 +101,8 @@ __all__ = [
     "handle_type",
     "register_symm_backend",
     "signal_pad_supported",
+    "window_handle",
+    "dev_comm",
 ]
 
 logger = logging.getLogger(__name__)
@@ -128,20 +153,21 @@ def _jit_ext():
 
     rocm = os.environ.get("ROCM_PATH", "/opt/rocm")
     flags = ["-std=c++17", "-O3", "-D__HIP_PLATFORM_AMD__=1", "-DUSE_ROCM=1"]
-    if os.environ.get("MORI_SYMM_SIGNAL_PAD", "OFF").strip().upper() in {
-        "1",
-        "ON",
-        "TRUE",
-        "YES",
-    }:
-        flags.append("-DMORI_SYMM_SIGNAL_PAD=1")
     logger.info("compiling mori_torch_symm from %s", source)
+    # libmori_cco sits in the package directory, wherever mori was installed.
+    pkg = str(Path(__file__).resolve().parent.parent)
     return load(
         name="mori_torch_symm",
         sources=[str(source)],
         extra_include_paths=[str(root / "include"), f"{rocm}/include"],
         extra_cflags=flags,
-        extra_ldflags=[f"-L{rocm}/lib", "-lamdhip64"],
+        extra_ldflags=[
+            f"-L{rocm}/lib",
+            "-lamdhip64",
+            f"-L{pkg}",
+            "-lmori_cco",
+            f"-Wl,-rpath,{pkg}",
+        ],
     )
 
 
@@ -206,12 +232,42 @@ def handle_type(device_index: int = 0) -> Literal["fabric", "posix_fd"]:
 def signal_pad_supported() -> bool:
     """Whether windows carry torch's signal pad.
 
-    False unless built with ``MORI_SYMM_SIGNAL_PAD=ON``. Without the pad, torch's own
-    ``symm_mem`` collectives raise -- their kernels synchronise through it -- and
-    ``dist.barrier()`` is the stand-in. With it they work, since they use the pad
-    directly; this backend's ``barrier``/``put_signal``/``wait_signal`` raise either way.
+    Always true now: the pad is its own CCO window. Kept because callers written against
+    the earlier build-flag behaviour still check it.
     """
     return bool(_ext().signal_pad_supported)
+
+
+def window_handle(tensor, signal_pad: bool = False) -> int:
+    """The cco window backing a rendezvous'd tensor, as an integer handle.
+
+    Backend-specific on purpose: torch's ``SymmetricMemory`` has nowhere to carry a
+    window, so NCCL's backend exposes ``get_window()`` on its own class. Python only ever
+    sees the base class, so this is a lookup keyed by the tensor instead.
+
+    Takes the tensor rather than a pointer because the window belongs to the *storage*:
+    ``rendezvous(t[512:])`` registers the whole storage, so a view has to resolve to the
+    same window rather than to "pointer is not a mori allocation".
+
+    Pass the result to a kernel that addresses peers with cco's device API
+    (``mori.ir.triton.cco.Window.lsa_ptr``) instead of walking ``buffer_ptrs``.
+    """
+    return _ext().window_handle(tensor.untyped_storage().data_ptr(), signal_pad)
+
+
+def dev_comm(group_name: str, key: str = "default", lsa_barrier_count: int = 1) -> int:
+    """Device ``ccoDevComm`` pointer for a group, as a kernel argument.
+
+    Created on first use and cached per ``(group_name, key)``. The key exists because a
+    DevComm is parameterised by signal counts, QP counts and connection type -- properties
+    of the algorithm about to run, not of the group -- so two collectives over one group
+    want two of them. torch's NCCL backend keys the same cache on ``__builtin_FUNCTION()``;
+    from Python that would be stack inspection, so pass a key explicitly instead.
+
+    Rendezvous a tensor with the group first: that is what creates the communicator this
+    hangs off. Intra-node only today -- the connection type is fixed to NONE.
+    """
+    return _ext().dev_comm(group_name, key, lsa_barrier_count)
 
 
 def _register_on_import() -> None:

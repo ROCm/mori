@@ -70,15 +70,25 @@ tensor's VMM handle into cco's flat LSA space, and the kernel asks the window fo
 address.
 
 ```python
-win  = comm.register_external_window(recv.data_ptr(), recv.nbytes)   # no copy
-addr = cco.Window.lsa_ptr(window, peer, rank_id * chunk_bytes)       # in the kernel
+hdl      = symm_mem.rendezvous(recv, group_name)          # registers the cco window
+window   = mori.allocator.window_handle(recv)             # where to write
+dev_comm = mori.allocator.dev_comm(group_name, key="all2all_lsa")   # who I am
+...
+my_lsa = cco.DevComm.lsa_rank(dev_comm)                   # inside the kernel
+addr   = cco.Window.lsa_ptr(window, peer, my_lsa * chunk_bytes)
 ```
 
-`symm_mem.rendezvous()` is never called: the backend's own peer exchange would duplicate
-what `ccoWindowRegister` already does. torch keeps the allocation and its lifetime, cco
-takes the addressing. cco has its own rendezvous, so the example passes a `ccoUniqueId`
-through torch's process group; and `import torch` must come before `import mori.cco`, or
-the two LLVM copies collide at import time.
+Both indices `lsa_ptr` takes are **LSA** ranks. On one node they equal world ranks, which
+is why passing `rank_id` in from Python also works today and would quietly stop working
+with a second node. The DevComm is what answers it properly, and it is cached per
+`(group, key)` because the resources a collective needs — signal counts, QP counts,
+connection type — belong to that collective, not to the group.
+
+No `Communicator` is built: `rendezvous()` *is* the cco window registration, and the
+backend keeps one communicator per process group. `window_handle()` is the backend's own
+accessor -- torch's handle has nowhere to carry a window -- and it mirrors
+`NCCLSymmetricMemory::get_window()`. The example also uses `hdl.barrier(0)`, the backend's
+barrier over cco's, in place of `dist.barrier()`.
 
 It measures the same as the pointer array — 8×gfx950, 4 MiB per peer, three repeats each:
 
@@ -217,12 +227,8 @@ this backend exposes the pointer array anyway, kernels would not notice.
 
 ## Notes
 
-`dist.barrier()` is used between the kernel and the reads because the backend has no
-device-side barrier yet (`barrier`/`put_signal`/`wait_signal` raise). Since none of them
-are implemented, the signal pad is not reserved either — appending torch's 9216-byte pad
-to a page-aligned window would cost a whole extra 2 MiB page, physical backing being
-2 MiB-paged. Build with `MORI_SYMM_SIGNAL_PAD=ON` to reserve it and
-`mori.allocator.signal_pad_supported()` to check at run time; torch's own `symm_mem`
-collectives synchronise through that pad, so they need the flag even though they never call
-this backend's `barrier()`. A real workload would want signal-pad synchronisation instead,
-which is why the timed loop measures the kernel alone.
+`dist.barrier()` is used between the kernel and the reads because the examples predate the
+backend's own `barrier()`, which now runs over cco's host barrier. The signal pad is always
+present -- its own cco window rather than a tail on the buffer -- so torch's `symm_mem`
+collectives work without a build flag. `put_signal`/`wait_signal` still raise: they need a
+`ccoDevComm`, which the backend does not create yet.
