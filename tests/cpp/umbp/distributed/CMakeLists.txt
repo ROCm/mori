@@ -629,3 +629,14 @@ if(USE_REDIS_BACKEND)
   target_compile_features(test_sharded_read PRIVATE cxx_std_17)
   add_test(NAME test_sharded_read COMMAND test_sharded_read)
 endif()
+
+# GDS-vs-staging A/B for SSD reads into device memory.  Run twice, once with
+# UMBP_ENABLE_GDS=1, and diff the CSV.  Standalone executable; not a CTest
+# target, because it needs a real block-backed --dir to measure anything.
+add_executable(bench_umbp_gds_ssd_get bench_gds_ssd_get.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(bench_umbp_gds_ssd_get PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  bench_umbp_gds_ssd_get
+  PRIVATE umbp_core umbp_common hip::host ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB})
