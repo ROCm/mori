@@ -169,6 +169,48 @@ def main():
         torch.cuda.synchronize()
         dist.barrier()
 
+    def check_dispatch(op, total, routing):
+        """Every received row must equal, BYTE FOR BYTE, the source row it claims.
+
+        dispatch only transports -- "mori does no quantizing here: fp8/fp4 payloads
+        arrive already packed" (hip_backend.py) -- so the bytes that land must be
+        the bytes that were sent, for every wire dtype. Comparing them needs no
+        conversion and no arithmetic, which is what makes this the one check fp4
+        can pass: torch has no fp4 cast kernel at all, and combine cannot take fp4
+        anyway. It is also sharper than the end-to-end check, which sums U copies
+        and can average a wrong byte away.
+
+        Each rank's payload is a pure function of (SEED, its rank), so a receiver
+        can regenerate any sender's tensor locally and look up the row that the
+        reverse map says a slot came from. That determinism is what makes this
+        possible; before the seed was configurable it was not.
+        """
+        if not CHECK or total == 0:
+            return 0
+        tis = routing.disp_tok_id_to_src_tok_id_local[:total].cpu()
+        src_pe, src_tok = (tis // M).to(torch.int64), (tis % M).to(torch.int64)
+        got = op.recv_tokens()[:total].cpu().view(torch.uint8)
+        bad = 0
+        for pe in src_pe.unique().tolist():  # one regeneration per source rank
+            sel = src_pe == pe
+            ref = _data.make_payload(
+                (M, HIDDEN),
+                INIT,
+                _data.make_generator(_data.seed_for(SEED, int(pe))),
+                _DISP_DT,
+                constant=CONST_VAL,
+            ).view(torch.uint8)
+            bad += int((got[sel] != ref[src_tok[sel]]).any(dim=1).sum())
+        n = torch.tensor([bad])
+        dist.all_reduce(n)
+        if rank == 0 and n.item():
+            print(
+                f"  [{op.backend_name}] DISPATCH BYTE MISMATCH: "
+                f"{int(n.item())} rows across {world} ranks",
+                flush=True,
+            )
+        return int(n.item())
+
     def prime(op, ct, i_, w_, x_):
         """One full pair, untimed. Reads total_recv for the host, builds the buffer
         the timed loop will reuse, and with CHECK verifies the result through that
@@ -178,19 +220,23 @@ def main():
         combine would stage twice the tokens and run past the arena.
         Returns (total_recv, buf, ok, checked)."""
         *_, total_t, r = op.dispatch(i_, w_, None, x_, return_routing=True)
-        lockstep()
+        lockstep()  # the reverse map is only valid after this barrier
         total = int(total_t.cpu().item())
+        dispatch_bad = check_dispatch(op, total, r)
         stage = op.combine_in_view()[:total]
-        # fp4 combine is too lossy to compare; an all-zero payload reduces the
-        # identity-expert check to 0 == 0, which holds however wrong the kernel is.
+        # An all-zero payload reduces the identity-expert check to 0 == 0, which
+        # holds however wrong the kernel is. fp4 cannot go through combine at all
+        # (hip has no fp4 combine), so for it check_dispatch is the whole story.
         checked = bool(CHECK) and not _FP4 and not _data.verifies_nothing(INIT)
         if checked:  # identity expert: stage the dispatched tokens unchanged
             stage.copy_(op.recv_tokens()[:total].to(stage.dtype))
         buf = stage.clone() if COMBINE_IN == "staged" else stage
         out, _ = op.combine(buf, routing=r)
         lockstep()
+        if dispatch_bad:
+            return total, buf, False, True
         if not checked:
-            return total, buf, True, False
+            return total, buf, True, bool(CHECK)
         exp = U[:ct].view(ct, 1).float() * inp[:ct].float().cpu()
         lossy = _DISP_DT is torch.float8_e4m3fn
         atol, rtol = (1.0, 1.5e-1) if lossy else (2e-2, 2e-2)
@@ -309,19 +355,16 @@ def main():
         # Say how many points were verified, not just that none failed -- with
         # CHECK=0 or DISP=fp4 nothing is compared, and a skipped check is not a
         # passing one.
-        why = (
-            " (fp4 not compared)"
-            if _FP4
-            else (
-                " (CHECK=0)"
-                if not CHECK
-                else (
-                    f" ({INIT} payload verifies nothing)"
-                    if _data.verifies_nothing(INIT)
-                    else ""
-                )
-            )
-        )
+        # Say what was actually verified. fp4 skips the identity-expert check
+        # (hip has no fp4 combine) but its dispatch bytes ARE compared.
+        if _FP4:
+            why = " (fp4: dispatch bytes only, combine not compared)"
+        elif not CHECK:
+            why = " (CHECK=0)"
+        elif _data.verifies_nothing(INIT):
+            why = f" ({INIT} payload: dispatch bytes only, combine check is vacuous)"
+        else:
+            why = ""
         print(
             f"# {'FAIL' if failures else 'PASS'}: {failures} failed, "
             f"{checked}/{points} points verified{why}"
