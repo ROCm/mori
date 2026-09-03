@@ -72,6 +72,20 @@ _TUNING_MARGIN = float(os.environ.get("MORI_EP_TUNING_MARGIN") or "0.0")
 # noisier sweep.
 _EP_ROUNDS = int(os.environ.get("MORI_EP_ROUNDS") or "30")
 
+# Leading timed rounds to discard from the stats. Override with MORI_EP_DROP_ROUNDS.
+#
+# Default 1: drop round 0 only, the same for both backends -- kept symmetric on
+# purpose so cco and shmem are measured identically rather than each tuned to its
+# own warm-up length. There is a real start transient: the dist.barrier() before
+# the timed loop releases all ranks at once, so the first timed rounds' collectives
+# fire simultaneously and hit peak fabric contention (thundering herd) before the
+# rounds self-stagger. It is worse and longer on the CCO/GDA path (first round
+# ~1.6-2.5x steady, still elevated through round ~2) than on shmem (recovered by
+# round 1). If you want that transient out of the reported Best/Worst, raise this
+# (e.g. MORI_EP_DROP_ROUNDS=3 covers the CCO ramp); it is left at 1 by default so
+# the default number matches the historical one and both backends drop the same.
+_EP_DROP_ROUNDS = int(os.environ.get("MORI_EP_DROP_ROUNDS") or "1")
+
 # In-loop warmup rounds run before the timed loop, discarded. Override with
 # MORI_EP_WARMUP.
 #
@@ -99,14 +113,14 @@ _EP_PERROUND_SYNC = os.environ.get("MORI_EP_PERROUND_SYNC", "0").strip().lower()
     "false",
     "no",
 )
-if _EP_ROUNDS < 2:
-    # Both call sites drop round 0 as in-loop warmup (`kept = all_data[1:]`);
-    # at 1 round that leaves an empty tensor and _compute_stats'
-    # .min()/.max()/.mean() blow up with a shape error that says nothing
-    # about rounds being the cause.
+if _EP_ROUNDS <= _EP_DROP_ROUNDS + 1:
+    # Both call sites drop the first _EP_DROP_ROUNDS rounds (`all_data[_EP_DROP_ROUNDS:]`);
+    # with too few left this leaves an empty/one-row tensor and _compute_stats'
+    # .min()/.max()/.mean() blow up with a shape error that says nothing about
+    # rounds being the cause. Need at least 2 kept rounds.
     raise ValueError(
-        f"MORI_EP_ROUNDS must be >= 2 (round 0 is dropped as warmup), "
-        f"got {_EP_ROUNDS}"
+        f"MORI_EP_ROUNDS ({_EP_ROUNDS}) must exceed MORI_EP_DROP_ROUNDS "
+        f"({_EP_DROP_ROUNDS}) by at least 2 so >=2 timed rounds remain"
     )
 
 # Debug aid only, no effect on selection: print every candidate's full
@@ -1448,7 +1462,7 @@ class EpDispatchCombineTestCase:
         if repeat == 1:
             return
 
-        kept = all_data[1:]  # skip round 0
+        kept = all_data[_EP_DROP_ROUNDS:]  # skip the cold leading rounds
         disp_stats = self._build_phase_stats(kept, 0, 1, 2, ll_mode_scale)
         comb_stats = self._build_phase_stats(kept, 3, 4, 5, ll_mode_scale)
 
@@ -1742,7 +1756,7 @@ class EpDispatchCombineTestCase:
                         comb_warp_per_block=warp,
                     )
                     all_data, ll_scale = self._all_gather_bench_data(bench_result)
-                    kept = all_data[1:]  # skip round 0, same as bench
+                    kept = all_data[_EP_DROP_ROUNDS:]  # skip cold leading rounds, same as bench
                     # kept: (rounds, world_size, 6)
                     # cols: d_rdma, d_xgmi, d_lat, c_rdma, c_xgmi, c_lat
 
