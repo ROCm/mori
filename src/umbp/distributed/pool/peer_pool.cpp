@@ -42,6 +42,13 @@ PeerPool::PeerPool(BackendRegistry* backends, std::unique_ptr<PoolPolicy> policy
     tier_scan_backoff_.assign(tier_graph_->TierCount(),
                               std::chrono::steady_clock::time_point{});
     queued_by_tier_.assign(tier_graph_->TierCount(), 0);
+    for (size_t tier = 0; tier < tier_graph_->TierCount(); ++tier) {
+      const auto& node = tier_graph_->NodeAt(tier);
+      if (node.trigger == PoolOffloadTrigger::kWatermark && !node.offload_to.empty()) {
+        track_access_order_ = true;
+        break;
+      }
+    }
     transition_worker_ = std::thread(&PeerPool::TransitionWorkerLoop, this);
   }
 }
@@ -69,6 +76,7 @@ void PeerPool::StopTransitionWorker() {
 }
 
 void PeerPool::TouchLocked(const std::string& key) {
+  if (!track_access_order_) return;
   auto access = last_access_.find(key);
   if (access != last_access_.end()) {
     access_order_.splice(access_order_.begin(), access_order_, access->second);
@@ -541,43 +549,95 @@ std::vector<bool> PeerPool::BatchAbort(const std::vector<PoolSlotRef>& slots) {
 
 std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::string>& keys,
                                                       bool include_descs) {
-  // Three phases, and only the first and last hold operation_mutex_. The backend
-  // lookups in between are the expensive part of a resolve, and every backend
-  // guards itself, so holding the pool lock across them only serializes callers
-  // that could have run side by side. Under TP that is every rank at once: the
-  // ranged-call timers showed resolve queueing into a 0 -> 30 ms staircase
-  // across a wave of concurrent batches, 84% of ranged-get time.
-  //
-  // placements_ is a hint, so acting on a stale one costs at most one extra
-  // backend probe, and phase 3 repairs it exactly as the miss path already did.
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
   std::vector<PoolResolvedEntry> out(keys.size());
   if (keys.empty()) return out;
 
+  // A no-tier, single-backend pool needs placement metadata for allocate,
+  // commit, and eviction, but a hit whose placement already names that sole
+  // backend cannot repair or transition anything. Resolve it directly and
+  // avoid building the preferred/attempted/group vectors plus taking the
+  // metadata lock again after backend IO. This is the common no-master,
+  // 100%-hit restore shape.
+  uint32_t direct_backend_id = BackendRegistry::kMaxBackends;
+  MediumBackend* direct_backend = nullptr;
+  {
+    std::lock_guard<std::mutex> operation_lock(operation_mutex_);
+    if (backends_ != nullptr && policy_ != nullptr && tier_graph_ == nullptr &&
+        !track_access_order_ && backends_->Size() == 1) {
+      const std::vector<uint32_t> order = policy_->ReadOrder(*backends_);
+      if (order.size() == 1 && order.front() < BackendRegistry::kMaxBackends) {
+        const uint32_t backend_id = order.front();
+        bool all_placed_here = true;
+        for (const auto& key : keys) {
+          const auto placement = placements_.find(key);
+          if (placement == placements_.end() || placement->second != backend_id) {
+            all_placed_here = false;
+            break;
+          }
+        }
+        if (all_placed_here) {
+          direct_backend_id = backend_id;
+          direct_backend = backends_->Get(backend_id);
+        }
+      }
+    }
+  }
+  if (direct_backend != nullptr) {
+    auto resolved = direct_backend->BatchResolve(keys, include_descs);
+    bool batch_busy = false;
+    bool all_found = resolved.size() == keys.size();
+    std::vector<bool> failed_but_owned(keys.size(), false);
+    for (size_t i = 0; i < resolved.size() && i < out.size(); ++i) {
+      const ResolveOutcome outcome = EffectiveResolveOutcome(resolved[i]);
+      batch_busy |= outcome == ResolveOutcome::kBusy;
+      all_found &= outcome == ResolveOutcome::kFound;
+      if (outcome == ResolveOutcome::kFailed) {
+        failed_but_owned[i] = direct_backend->Contains(keys[i]);
+      }
+      out[i].backend_id = direct_backend_id;
+      out[i].tier = direct_backend->Tier();
+      out[i].resolved = std::move(resolved[i]);
+      out[i].resolved.outcome = outcome;
+    }
+    if (batch_busy || all_found) return out;
+    // A plain miss is authoritative, while kFailed needs one ownership probe:
+    // a backend can still own a key whose descriptor shape it cannot return.
+    // Finalize stale placements here instead of running the whole routing
+    // pipeline and resolving the same backend a second time.
+    std::lock_guard<std::mutex> operation_lock(operation_mutex_);
+    for (size_t i = 0; i < out.size(); ++i) {
+      if (out[i].resolved.found || failed_but_owned[i]) continue;
+      const auto placement = placements_.find(keys[i]);
+      if (placement == placements_.end() || placement->second != direct_backend_id) continue;
+      placements_.erase(placement);
+      ForgetAccessLocked(keys[i]);
+    }
+    return out;
+  }
+
+  uint64_t planned_clear_epoch = 0;
   std::vector<std::optional<uint32_t>> preferred(keys.size());
   std::vector<uint32_t> read_order;
   {
     std::lock_guard<std::mutex> operation_lock(operation_mutex_);
     if (backends_ == nullptr || policy_ == nullptr) return out;
+    planned_clear_epoch = clear_epoch_;
     for (size_t i = 0; i < keys.size(); ++i) {
       auto it = placements_.find(keys[i]);
       if (it != placements_.end()) preferred[i] = it->second;
     }
-    // Snapshot the order under the lock so a concurrent backend add or remove
-    // cannot be observed halfway through the walk below.
     read_order = policy_->ReadOrder(*backends_);
   }
 
-  // One bit per (key, backend) in a flat word per key. A vector<bool> per key
-  // heap-allocated once per key, and a 1023-key batch is the common shape here.
+  // A flat mask avoids one heap allocation per key in the common 1023-key
+  // ranged-get batch.
   static_assert(BackendRegistry::kMaxBackends <= 16, "attempted mask is 16 bits wide");
   std::vector<uint16_t> attempted(keys.size(), 0);
 
   const auto resolve = [&](uint32_t backend_id, const std::vector<size_t>& indices) {
     auto* backend = backends_->Get(backend_id);
     if (backend == nullptr || indices.empty()) return;
-    // The single-backend tier -- the common deployment -- sends every key to one
-    // backend in order, so hand it `keys` directly. Copying it first cost an
-    // allocation and a ~128-byte string copy per key for nothing.
     bool identity = indices.size() == keys.size();
     for (size_t i = 0; identity && i < indices.size(); ++i) identity = indices[i] == i;
     std::vector<std::string> backend_keys;
@@ -630,38 +690,67 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
     resolve(backend_id, unresolved);
   }
 
-  // A caller retries the whole batch on BUSY and discards this response.  Do
+  // Classify once. A 100%-hit restore must not allocate a key-sized repair
+  // vector merely to discover that there is nothing to repair.
+  bool batch_busy = false;
+  bool all_found = true;
+  for (const auto& entry : out) {
+    batch_busy |= EffectiveResolveOutcome(entry.resolved) == ResolveOutcome::kBusy;
+    all_found &= entry.resolved.found;
+  }
+  // A caller retries the whole batch on BUSY and discards this response. Do
   // not count hits, repair placements, or enqueue promotions for a response
   // whose page locations will never be consumed.
-  const bool batch_busy = std::any_of(out.begin(), out.end(), [](const auto& entry) {
-    return EffectiveResolveOutcome(entry.resolved) == ResolveOutcome::kBusy;
-  });
   if (batch_busy) return out;
 
-  // Probe the backends for the keys that resolved to nothing before retaking the
-  // lock: Contains() is another backend call, and phase 3 exists to mutate maps,
-  // not to wait on media.
-  std::vector<std::optional<uint32_t>> repaired(keys.size());
-  for (size_t i = 0; i < keys.size(); ++i) {
-    if (out[i].resolved.found) continue;
-    for (uint32_t backend_id : read_order) {
-      auto* backend = backends_->Get(backend_id);
+  // Contains is backend work too; keep it off the pool metadata lock. A
+  // placement snapshot check below prevents this repair from overwriting a
+  // commit or migration that publishes while these probes are running.
+  std::vector<std::optional<uint32_t>> repaired;
+  if (!all_found) {
+    repaired.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+      if (out[i].resolved.found) continue;
+      // kMissing is an authoritative negative result from every attempted
+      // backend. Only kFailed is ambiguous: the selected backend may still own
+      // the key but be unable to materialize its descriptor.
+      if (EffectiveResolveOutcome(out[i].resolved) != ResolveOutcome::kFailed) continue;
+      auto* backend = backends_->Get(out[i].backend_id);
       if (backend != nullptr && backend->Contains(keys[i])) {
-        repaired[i] = backend_id;
-        break;
+        repaired[i] = out[i].backend_id;
       }
     }
   }
 
   std::lock_guard<std::mutex> operation_lock(operation_mutex_);
+  // ClearLocal takes lifecycle_mutex_ exclusively, so this is defensive
+  // against future lifecycle paths that may invalidate an in-flight plan.
+  if (clear_epoch_ != planned_clear_epoch) return out;
+
+  const auto placement_unchanged = [&](size_t index) {
+    auto current = placements_.find(keys[index]);
+    if (!preferred[index].has_value()) return current == placements_.end();
+    return current != placements_.end() && current->second == *preferred[index];
+  };
+
   for (size_t i = 0; i < keys.size(); ++i) {
     if (out[i].resolved.found) {
-      placements_[keys[i]] = out[i].backend_id;
-      TouchLocked(keys[i]);
+      // A migration or commit may have published a newer owner while backend
+      // IO ran. Repair only the placement snapshot this resolve actually used;
+      // never move the logical owner backwards to a source that is draining.
+      const bool metadata_current = placement_unchanged(i);
+      if (metadata_current) placements_[keys[i]] = out[i].backend_id;
+      // A concurrent discard may have removed the key entirely. Do not
+      // resurrect only its LRU entry from a resolve that started earlier.
+      const bool still_placed =
+          metadata_current || placements_.find(keys[i]) != placements_.end();
+      if (still_placed) TouchLocked(keys[i]);
       if (tier_graph_ != nullptr) {
         ++tier_read_hits_[tier_graph_->NameForBackend(out[i].backend_id)];
         const auto source_tier = tier_graph_->TierIndexForBackendId(out[i].backend_id);
-        if (source_tier.has_value() && *source_tier != tier_graph_->EntryTierIndex() &&
+        if (metadata_current && source_tier.has_value() &&
+            *source_tier != tier_graph_->EntryTierIndex() &&
+            migrating_keys_.count(keys[i]) == 0 &&
             !tier_graph_->AtOrAbove(tier_graph_->EntryTierIndex(),
                                     tier_graph_->NodeAt(tier_graph_->EntryTierIndex())
                                         .high_watermark) &&
@@ -670,9 +759,14 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
               {TierTransitionKind::kPromotion, keys[i], out[i].backend_id, *source_tier});
         }
       }
-    } else if (repaired[i].has_value()) {
-      placements_[keys[i]] = *repaired[i];
     } else {
+      // A concurrent commit or transition changed the placement after the
+      // snapshot; its publication is newer than this miss and must win.
+      if (!placement_unchanged(i)) continue;
+      if (repaired[i].has_value()) {
+        placements_[keys[i]] = *repaired[i];
+        continue;
+      }
       // A key the backends no longer hold must leave the access index too, or
       // it accumulates there for the life of the process and skews LRU order.
       placements_.erase(keys[i]);
@@ -768,6 +862,7 @@ std::vector<EvictResult> PeerPool::Evict(const std::vector<std::string>& keys,
 }
 
 void PeerPool::ClearLocal() {
+  std::unique_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
   std::unique_lock<std::mutex> operation_lock(operation_mutex_);
   {
     std::lock_guard<std::mutex> lock(transition_mutex_);
@@ -789,6 +884,7 @@ void PeerPool::ClearLocal() {
   last_access_.clear();
   access_order_.clear();
   promote_hit_counts_.clear();
+  ++clear_epoch_;
 }
 
 std::vector<KvEvent> PeerPool::DrainPendingEvents() {

@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -152,15 +153,22 @@ class PeerPool {
   TransferEngine* transfer_engine_;
   std::shared_ptr<const LogicalTierGraph> tier_graph_;
   TierTransitionExecutor transition_executor_;
+  // Only watermark-driven offload consumes recency order. On-evict policies
+  // name their victim explicitly, and non-tiered pools never read the LRU.
+  bool track_access_order_ = false;
 
+  // Resolve dispatch deliberately drops operation_mutex_ while thread-safe
+  // backends do their work. ClearLocal takes this exclusively so it cannot
+  // invalidate an SSD staging result while a resolve is between its plan and
+  // publish phases.
+  mutable std::shared_mutex lifecycle_mutex_;
   // Serializes policy decisions with backend lifecycle operations. The first
-  // Pool favors correctness over concurrent dispatch; later policies can shard
-  // this by key without changing the public interface.
+  // Pool still uses one metadata lock, but slow resolve dispatch does not hold
+  // it; later policies can shard the protected state by key without changing
+  // the public interface.
   mutable std::mutex operation_mutex_;
-  // Unordered on purpose: every use is a point lookup, insert or erase, and
-  // BatchResolve publishes one entry per key with the pool lock held, where an
-  // ordered tree spends that critical section on string comparisons for an
-  // ordering nothing reads.
+  // Every use is a point lookup, insert or erase. Keeping this unordered avoids
+  // string comparisons in BatchResolve's publish critical section.
   std::unordered_map<std::string, uint32_t> placements_;
   // A migration may install its target while an independent read lease delays
   // source deletion. Eviction retries must drain only that source, never fan
@@ -179,11 +187,8 @@ class PeerPool {
   // promotion is queued and whenever the key leaves the access index, so it
   // cannot outlive the key it counts for.
   std::unordered_map<std::string, uint32_t> promote_hit_counts_;
-  // Reverse index of last_access_, hottest at the front, so the least recently
-  // used key is reached without sorting every placement. An intrusive list
-  // rather than a stamp-keyed tree: BatchResolve touches one entry per resolved
-  // key with the pool lock held, and a tree insert paid a node allocation plus
-  // a copy of the ~128-byte key each time. A splice pays neither.
+  // Hottest key is at the front. Stable list iterators let a touch splice an
+  // existing key without allocating a tree node or copying the key.
   std::list<std::string> access_order_;
   // Earliest next scan per tier, moved forward only when a scan found nothing
   // to queue. A pressured tier with no candidates must not make every commit
@@ -191,6 +196,8 @@ class PeerPool {
   std::vector<std::chrono::steady_clock::time_point> tier_scan_backoff_;
   TierTransitionMetrics transition_metrics_;
   std::map<std::string, uint64_t> tier_read_hits_;
+  // Invalidates a resolve plan if a clear completed while it was dispatched.
+  uint64_t clear_epoch_ = 0;
 
   std::mutex transition_mutex_;
   std::condition_variable transition_cv_;

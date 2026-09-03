@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "umbp/distributed/peer/backend/instrumented_backend.h"
@@ -145,6 +146,46 @@ class BlockingAllocateBackend final : public MockBackend {
     std::vector<AllocateResult> results(entries.size());
     for (auto& result : results) result.outcome = AllocateOutcome::kFailedNoSpace;
     return results;
+  }
+
+  bool WaitUntilEntered() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return cv_.wait_for(lock, std::chrono::seconds(5), [this] { return entered_; });
+  }
+
+  void Release() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      released_ = true;
+    }
+    cv_.notify_all();
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  bool entered_ = false;
+  bool released_ = false;
+};
+
+// Parks one backend resolve so the test can prove PeerPool does not retain its
+// peer-wide metadata lock while a medium performs slow IO.
+class BlockingResolveBackend final : public MockBackend {
+ public:
+  explicit BlockingResolveBackend(TierType tier) : MockBackend(tier) {}
+
+  std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
+                                          bool include_descs) override {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      entered_ = true;
+    }
+    cv_.notify_all();
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      cv_.wait_for(lock, std::chrono::seconds(5), [this] { return released_; });
+    }
+    return MockBackend::BatchResolve(keys, include_descs);
   }
 
   bool WaitUntilEntered() {
@@ -701,6 +742,92 @@ TEST(PeerPool, MigrationDoesNotBlockConcurrentPoolOperations) {
   EXPECT_EQ(concurrent.wait_for(std::chrono::seconds(2)), std::future_status::ready);
   blocking->Release();
   EXPECT_EQ(concurrent.get(), 1u);
+}
+
+TEST(PeerPool, SlowResolveDoesNotBlockUnrelatedPreferredBackend) {
+  BackendRegistry registry;
+  auto slow = std::make_unique<BlockingResolveBackend>(TierType::SSD);
+  auto* blocking = slow.get();
+  ASSERT_TRUE(registry.Register("slow", std::move(slow)));
+  ASSERT_TRUE(registry.Register("fast", std::make_unique<MockBackend>(TierType::DRAM)));
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+  CommitKey(&pool, "fast-key", "fast");
+
+  auto slow_resolve =
+      std::async(std::launch::async, [&] { return pool.BatchResolve({"missing"}, false); });
+  ASSERT_TRUE(blocking->WaitUntilEntered());
+
+  // The preferred placement resolves entirely on the fast backend. It must
+  // not queue behind unrelated IO already running on another medium.
+  auto fast_resolve =
+      std::async(std::launch::async, [&] { return pool.BatchResolve({"fast-key"}, false); });
+  const auto status = fast_resolve.wait_for(std::chrono::seconds(2));
+  blocking->Release();
+
+  EXPECT_EQ(status, std::future_status::ready);
+  auto fast_result = fast_resolve.get();
+  ASSERT_EQ(fast_result.size(), 1u);
+  EXPECT_TRUE(fast_result.front().resolved.found);
+  EXPECT_EQ(slow_resolve.get().size(), 1u);
+}
+
+TEST(PeerPool, ResolveMissDoesNotEraseConcurrentCommit) {
+  BackendRegistry registry;
+  auto slow = std::make_unique<BlockingResolveBackend>(TierType::SSD);
+  auto* blocking = slow.get();
+  ASSERT_TRUE(registry.Register("slow", std::move(slow)));
+  ASSERT_TRUE(registry.Register("fast", std::make_unique<MockBackend>(TierType::DRAM)));
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+
+  auto stale_resolve =
+      std::async(std::launch::async, [&] { return pool.BatchResolve({"raced"}, false); });
+  ASSERT_TRUE(blocking->WaitUntilEntered());
+
+  auto concurrent_commit = std::async(std::launch::async, [&] {
+    auto allocation = pool.BatchAllocate({PutRequest("raced", "fast")}).front();
+    bool committed = false;
+    if (allocation.allocation.outcome == AllocateOutcome::kSuccessAllocated) {
+      committed =
+          pool.BatchCommit({PoolCommitRequest{
+                                {allocation.backend_id, allocation.allocation.slot_id},
+                                "raced"}})
+              .front()
+              .commit.success;
+    }
+    return std::make_pair(allocation, committed);
+  });
+  const auto status = concurrent_commit.wait_for(std::chrono::seconds(2));
+  blocking->Release();
+
+  EXPECT_EQ(status, std::future_status::ready);
+  const auto [allocation, committed] = concurrent_commit.get();
+  EXPECT_TRUE(committed);
+  EXPECT_EQ(allocation.backend_id, registry.BackendId(registry.Get("fast")));
+  EXPECT_EQ(stale_resolve.get().size(), 1u);
+  EXPECT_EQ(pool.PlacementBackend("raced"),
+            std::optional<uint32_t>{registry.BackendId(registry.Get("fast"))});
+}
+
+TEST(PeerPool, ClearWaitsForInFlightResolveAndLeavesNoStalePlacement) {
+  BackendRegistry registry;
+  auto backend = std::make_unique<BlockingResolveBackend>(TierType::DRAM);
+  auto* blocking = backend.get();
+  ASSERT_TRUE(registry.Register("dram", std::move(backend)));
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+  CommitKey(&pool, "clear-race", "dram");
+
+  auto resolve =
+      std::async(std::launch::async, [&] { return pool.BatchResolve({"clear-race"}, false); });
+  ASSERT_TRUE(blocking->WaitUntilEntered());
+
+  auto clear = std::async(std::launch::async, [&] { pool.ClearLocal(); });
+  EXPECT_EQ(clear.wait_for(std::chrono::milliseconds(100)), std::future_status::timeout);
+  blocking->Release();
+
+  ASSERT_TRUE(resolve.get().front().resolved.found);
+  clear.get();
+  EXPECT_EQ(pool.PlacementBackend("clear-race"), std::nullopt);
+  EXPECT_FALSE(registry.Get("dram")->Contains("clear-race"));
 }
 
 TEST(PeerPool, ReadPromotesColdKeyWithoutDeletingSource) {
