@@ -128,16 +128,9 @@ inline FwCheck CheckNicFirmware(const std::string& vendorId, const std::string& 
 
   if (vendorId == "0x14e4") {  // Broadcom bnxt_re
     const std::string major = fw.substr(0, fw.find('.'));
-    if (major == "231") {
-      return {FwVerdict::Bad, "Broadcom firmware " + fw +
-                                  " is on the 231.x branch, which is too old for IBGDA "
-                                  "-- upgrade to >= " +
-                                  kBnxtMin235 + " or >= " + kBnxtMin237};
-    }
-    if (major == "232") {
-      return {FwVerdict::Bad, "Broadcom firmware " + fw +
-                                  " is on the 232.x branch, which is known not to work on Thor2 "
-                                  "-- upgrade to >= " +
+    if (major == "231" || major == "232") {
+      return {FwVerdict::Bad, "Broadcom firmware " + fw + " is on the " + major +
+                                  ".x branch, which is too old for IBGDA -- upgrade to >= " +
                                   kBnxtMin235 + " or >= " + kBnxtMin237};
     }
     const char* min = major == "235" ? kBnxtMin235 : (major == "237" ? kBnxtMin237 : nullptr);

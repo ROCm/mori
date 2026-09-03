@@ -142,16 +142,12 @@ Non-obvious package roles:
   ionic firmware/QoS/DCQCN checks with `Invalid card handle`.
 - `sudo` — ionic/bnxt paths of `mori check`/`mori setup` invoke `nicctl`,
   `dcb`, `ethtool`, sysfs writes via `sudo`.
-- `perftest` — `ib_write_bw`/`ib_write_lat` for bandwidth/latency checks.
-  The distro package covers the host-memory mesh, but the GPU-memory pass in
-  steps 5/6 needs a build with ROCm support (`--use_rocm`), which distro
-  builds generally lack — build it yourself or use
-  `mori check --install-perftest` (Step 7). `mori check` resolves the binary
-  from `$MORI_PERFTEST_PREFIX/bin` (default `~/.local/mori-perftest`) **first**,
-  and only then `$PATH` — the prefix is only ever populated deliberately, so it
-  outranks a distro perftest sitting on `$PATH` without ROCm support. It is
-  needed on the **peer** as well for steps 5/6; on a cluster with shared
-  `/home`, the default prefix covers both nodes at once.
+- `perftest` — `ib_write_bw`/`ib_write_lat` for the bandwidth/latency checks
+  (steps 4/5/6). A perftest without ROCm support covers the host-memory mesh,
+  but the GPU-memory pass in step 5 needs a build with ROCm support
+  (`--use_rocm`). `mori check` never builds it — if a ROCm-capable perftest is
+  missing it warns and prints the build command, then skips the GPU-memory
+  pass. It is needed on the **peer** as well for steps 5/6.
 - `iproute2` — provides `dcb`, needed by `mori setup` on bnxt.
 - `libgrpc++-dev` + protobuf packages — build defaults to `BUILD_UMBP=ON`,
   whose CMake step needs gRPC headers. (`cmake`/`ninja`/`pybind11` come from
@@ -243,9 +239,8 @@ nicctl --version
 
 > **Recommended version**: for cross-node MORI (EP over RDMA / IBGDA), Broadcom firmware
 > is solid on `237.1.137.x` (official Broadcom release) and `235.2.86.x` (customer-specific
-> build). Known bad: `231.x` is too old for IBGDA, and `232.x` does not work on Thor2 — if
-> the host is on either branch, flag it to the user and recommend upgrading. Any other
-> branch is unverified and treated the same way.
+> build). Known bad: `231.x` and `232.x` — if the host is on either branch, flag it to the
+> user and recommend upgrading. Any other branch is unverified and treated the same way.
 > The userspace library (`libbnxt_re`, 3b.2) must match the kernel
 > driver version detected in 3b.1.
 
@@ -542,50 +537,37 @@ same intent):
 Steps 5/6 are skipped without a peer IP — run from both nodes to test cross-node connectivity.
 
 **GPU memory.** Only **Step 5 (inter-node bandwidth)** runs a GPU-memory pass;
-Step 6 (latency) is host-memory only. Step 5 first runs the host-memory mesh
-(reachability across all NIC pairs), then a GPU-memory pass over the pairs host
-memory already proved reachable via `--use_rocm` (each NIC paired to its
-PCIe-closest GPU), and finally a **serial pass over the rail-aligned pairs**
-(`local[i]` ↔ `remote[i]`) for the per-rail numbers that carry the bandwidth
-threshold. That rail-aligned diagonal is the path MORI actually transfers over,
-so a rail failing there while the host mesh passed points at GPUDirect rather
-than the fabric. Step 4 stays on host memory deliberately: it is a fabric
-reachability probe, and MORI moves data intra-node over XGMI, not RDMA.
-
-GPU runs pay a HIP init per process, so their timeouts scale automatically;
-the host-memory mesh keeps its original budget. If perftest lacks ROCm support
-or no GPUs are visible, the GPU pass is skipped with a single warning and the
-host mesh still runs. `--no-gpu-mem` forces host memory everywhere.
+Steps 4 and 6 are host-memory only. Step 5 first runs the host-memory mesh
+(reachability across all NIC pairs), then a GPU pass (`--use_rocm`, each NIC on
+its PCIe-closest GPU) over the pairs host memory proved reachable, and finally a
+**serial pass over the rail-aligned pairs** (`local[i]` ↔ `remote[i]`) for the
+per-rail numbers that carry the bandwidth threshold. That diagonal is the path
+MORI actually transfers over, so a rail failing there while the host mesh passed
+points at GPUDirect rather than the fabric. GPU runs pay a HIP init per process,
+so their timeouts scale up automatically. If perftest lacks ROCm support or no
+GPU is visible, the GPU pass is skipped with a warning and the host mesh still
+runs; `--no-gpu-mem` forces host memory everywhere.
 
 **peer_mem vs dma-buf.** `--use_rocm` registers GPU memory with an ordinary
 `ibv_reg_mr`, which needs a peer-memory client in the kernel; `--use_rocm_dmabuf`
 registers via `ibv_reg_dmabuf_mr` and needs none. `mori check` picks between
 them by *trying* one tiny loopback transfer, then reports which it used
-(`... via peer_mem` / `... via dma-buf`), warning when it had to fall back.
-Static detection is not used on purpose: `/sys/kernel/mm/memory_peers` is a
-Mellanox-OFED artefact that the in-tree AMD client never creates (amdgpu
-registers through `ib_uverbs` leaving no sysfs trace), and `/proc/kallsyms` is
-routinely restricted in containers — both would misreport a working peer_mem
-as absent. The dma-buf fallback needs perftest built with
-`--enable-rocm-dmabuf`, which `--install-perftest` attempts and silently drops
-on kernels/ROCm too old for it.
+(`... via peer_mem` / `... via dma-buf`).
+
+`mori check` never builds perftest — if a ROCm-capable one is missing it warns
+and skips the GPU pass. Build it once per node (or once on a shared `/home`):
 
 ```bash
-# build a ROCm-capable perftest into $MORI_PERFTEST_PREFIX (default
-# ~/.local/mori-perftest); opt-in, never triggered implicitly
-sudo docker exec $CONTAINER_NAME bash -c "mori check --install-perftest"
+sudo docker exec $CONTAINER_NAME bash -c '
+  git clone https://github.com/linux-rdma/perftest.git /tmp/perftest &&
+  cd /tmp/perftest && ./autogen.sh &&
+  ./configure --enable-rocm --enable-rocm-dmabuf --with-rocm=${ROCM_PATH:-/opt/rocm} &&
+  make -j && make install'
 ```
 
-That builds upstream `linux-rdma/perftest` with
-`--enable-rocm --enable-rocm-dmabuf --with-rocm=$ROCM_PATH`, retrying without
-`--enable-rocm-dmabuf` if configure rejects it. Prefer it over `ROCm/rdma-perftest`,
-which exposes the same flags but has not moved since 2025-05.
-
-The build needs `libtoolize` (not the `libtool` wrapper — `configure` generates
-that), plus `git autoconf automake make gcc` and ibverbs headers. Note the
-resolved binary comes from `$MORI_PERFTEST_PREFIX/bin` in preference to `$PATH`:
-distros ship a perftest built without ROCm, and letting it win would mean
-`--install-perftest` silently has no effect.
+Drop `--enable-rocm-dmabuf` if `configure` rejects it on an older kernel/ROCm
+(peer_mem still works). The build needs `libtoolize` plus
+`git autoconf automake make gcc` and ibverbs headers.
 
 **mlx5 note:** native IB ports don't use PFC/DSCP/DCQCN (IB has its own
 credit-based flow control managed by the fabric SM) — steps 2/3 only run

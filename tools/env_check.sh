@@ -7,8 +7,8 @@
 # has never been validated. Only an undetectable version downgrades to a warning.
 #   - AINIC     : >= 1.117.5-a-45 is solid. The 1.117.1 major does NOT support IBGDA.
 #   - Broadcom  : solid on 237.1.137.x (official release) and 235.2.86.x
-#                 (customer-specific build). Known bad: 231.x is too old for
-#                 IBGDA, and 232.x does not work on Thor2.
+#                 (customer-specific build). Known bad: 231.x and 232.x are too
+#                 old for IBGDA.
 #   - Mellanox  : good backward compatibility, no known minimum version.
 # For all NICs, the userspace library must match the corresponding kernel driver.
 
@@ -19,14 +19,14 @@ set -uo pipefail
 # Set by parse_args() below (it runs after the logging helpers are defined, so
 # that a bad flag can die() with a formatted message).
 PEER_IP=""
-INSTALL_PERFTEST=false   # --install-perftest: build perftest instead of just warning
 USE_GPU_MEM=true         # --no-gpu-mem: force the mesh onto host memory
-# Where --install-perftest installs to, and the first place resolve_perftest()
-# looks after $PATH. Override to point at an existing build.
+# First place resolve_perftest() looks, ahead of $PATH. Point this at a
+# ROCm-capable perftest build if one is not already on $PATH.
 MORI_PERFTEST_PREFIX="${MORI_PERFTEST_PREFIX:-$HOME/.local/mori-perftest}"
 # Upstream perftest carries ROCm support (--enable-rocm / --use_rocm) and is
 # actively maintained; ROCm/rdma-perftest has the same flags but has not moved
-# since 2025-05.
+# since 2025-05. Referenced only in the build hint printed when perftest is
+# missing -- the check never builds it.
 PERFTEST_REPO="https://github.com/linux-rdma/perftest.git"
 BW_THRESHOLD=300    # Gbps
 LAT_THRESHOLD=10    # microseconds
@@ -98,18 +98,13 @@ Usage: $(basename "$0") [options] [peer_ip]
                           this host as well (steps 5 and 6). Local-only if omitted.
 
 Options:
-  --install-perftest      build perftest from $PERFTEST_REPO into
-                          \$MORI_PERFTEST_PREFIX (default $MORI_PERFTEST_PREFIX)
-                          if it is not already available. Off by default: a
-                          check should not silently compile software.
   --no-gpu-mem            run the bandwidth/latency mesh on host memory instead
                           of GPU memory. The mesh uses GPU memory by default,
                           since that is the path MORI actually transfers over.
   -h, --help              show this help
 
 Environment:
-  MORI_PERFTEST_PREFIX    where to find/install perftest (searched before \$PATH)
-  ROCM_PATH               ROCm install used to build perftest (default /opt/rocm)
+  MORI_PERFTEST_PREFIX    where to find perftest (searched before \$PATH)
   SSH_USER                user for peer access (default \$SUDO_USER, else \$(whoami))
 
 Exit status:
@@ -124,7 +119,6 @@ EOF
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --install-perftest) INSTALL_PERFTEST=true ;;
             --no-gpu-mem)       USE_GPU_MEM=false ;;
             -h|--help)          usage; exit 0 ;;
             -*)                 usage >&2; die "unknown option: $1" ;;
@@ -424,10 +418,10 @@ build_gid_map() {
 # resolve there even when the local shell finds it fine.
 #
 # $MORI_PERFTEST_PREFIX wins over $PATH. Distros ship a perftest built without
-# ROCm, and it sits on PATH: searching PATH first means --install-perftest builds
-# a ROCm-capable binary that is then never used, and the GPU pass is skipped
-# advising the reader to run --install-perftest, which they just did. The prefix
-# is only populated deliberately, so treat it as the stronger signal.
+# ROCm, and it sits on PATH: searching PATH first would pick that host-only
+# binary over a ROCm-capable build placed in the prefix, and the GPU pass would
+# be skipped even though a usable perftest is installed. The prefix is only
+# populated deliberately, so treat it as the stronger signal.
 _PERFTEST_RESOLVE_SNIPPET='t="$1"; p="$2";
 if [ -x "$p/bin/$t" ]; then echo "$p/bin/$t";
 else c=$(command -v "$t" 2>/dev/null); if [ -n "$c" ]; then readlink -f "$c"; fi; fi'
@@ -607,56 +601,16 @@ build_gpu_map() {
     (( ${#_g[@]} > 0 ))
 }
 
-# install_perftest -- only ever called via --install-perftest. A check should not
-# compile software as a side effect of being run.
-install_perftest() {
-    local prefix="$MORI_PERFTEST_PREFIX" rocm="${ROCM_PATH:-/opt/rocm}"
-    local missing=() c
-    for c in git autoconf automake libtoolize make gcc; do
-        command -v "$c" >/dev/null 2>&1 || missing+=("$c")
-    done
-    [[ -d "$rocm" ]] || missing+=("rocm at $rocm (set ROCM_PATH)")
-    if (( ${#missing[@]} )); then
-        log_fail "cannot build perftest, missing: ${missing[*]}"
-        return 1
-    fi
-
-    local src; src=$(mktemp -d)
-    log_ok "building perftest from $PERFTEST_REPO into $prefix (this takes a few minutes)"
-    if ! git clone --depth 1 "$PERFTEST_REPO" "$src/perftest" >/dev/null 2>&1; then
-        log_fail "git clone $PERFTEST_REPO failed"; rm -rf "$src"; return 1
-    fi
-    # Try with dma-buf first: without it the check has no fallback when the
-    # kernel has no peer-memory client. Older kernels/ROCm lack the headers it
-    # needs, so drop back rather than failing the whole install.
-    (
-        cd "$src/perftest" || exit 1
-        ./autogen.sh || exit 1
-        if ! ./configure --enable-rocm --enable-rocm-dmabuf \
-                         --with-rocm="$rocm" --prefix="$prefix"; then
-            echo "=== configure with --enable-rocm-dmabuf failed, retrying without ==="
-            make distclean >/dev/null 2>&1 || true
-            ./configure --enable-rocm --with-rocm="$rocm" --prefix="$prefix" || exit 1
-        fi
-        make -j"$(nproc)" &&
-        make install
-    ) >"$src/build.log" 2>&1
-    local rc=$?
-    if (( rc != 0 )); then
-        log_fail "perftest build failed; build tree kept at $src for inspection"
-        log_fail "last lines of $src/build.log:"
-        tail -15 "$src/build.log" >&2
-        return 1
-    fi
-    rm -rf "$src"
-    log_ok "perftest installed into $prefix/bin"
-}
-
+# perftest_hint -- printed when a ROCm-capable perftest is missing. The check
+# reports state and points at how to get one; it never builds software itself.
+# Install into $MORI_PERFTEST_PREFIX (searched ahead of $PATH) so the GPU-memory
+# pass finds it, and do the same on the peer -- steps 5/6 skip otherwise.
 perftest_hint() {
-    log_warn "  install with: $(basename "$0") --install-perftest"
-    log_warn "  or manually : git clone $PERFTEST_REPO && cd perftest && ./autogen.sh &&"
-    log_warn "                ./configure --enable-rocm --enable-rocm-dmabuf --with-rocm=${ROCM_PATH:-/opt/rocm} &&"
-    log_warn "                make -j && make install     (drop --enable-rocm-dmabuf if configure rejects it)"
+    log_warn "  build a ROCm-capable perftest on this host and the peer:"
+    log_warn "    git clone $PERFTEST_REPO && cd perftest && ./autogen.sh &&"
+    log_warn "    ./configure --enable-rocm --enable-rocm-dmabuf --with-rocm=${ROCM_PATH:-/opt/rocm} \\"
+    log_warn "                --prefix=$MORI_PERFTEST_PREFIX &&"
+    log_warn "    make -j && make install     (drop --enable-rocm-dmabuf if configure rejects it)"
 }
 
 # State shared with mesh_execute. Set by mesh_prepare, read in the pair loop.
@@ -790,7 +744,7 @@ mesh_prepare() {
             log_fail "GPU memory unreachable via peer_mem or dma-buf -- GPUDirect RDMA unusable"
         else
             log_fail "GPU memory unreachable via peer_mem, and this perftest has no dma-buf support"
-            log_warn "  rebuild with --enable-rocm-dmabuf (or rerun with --install-perftest)"
+            log_warn "  rebuild perftest with --enable-rocm-dmabuf"
         fi
         MESH_RGPU=(); MESH_CGPU=(); return 0
     fi
@@ -1285,8 +1239,7 @@ check_bnxt_version_recommendation() {
     [[ "$ver" =~ ^[0-9]+(\.[0-9]+)+$ ]] || {
         log_warn "cannot parse Broadcom firmware version '$ver' against requirement"; return; }
     case "$major" in
-        231) log_fail "Broadcom firmware $ver is on the 231.x branch, which is too old for IBGDA — upgrade to >= $BNXT_MIN_VER_235 or >= $BNXT_MIN_VER_237"; return ;;
-        232) log_fail "Broadcom firmware $ver is on the 232.x branch, which is known not to work on Thor2 — upgrade to >= $BNXT_MIN_VER_235 or >= $BNXT_MIN_VER_237"; return ;;
+        231|232) log_fail "Broadcom firmware $ver is on the $major.x branch, which is too old for IBGDA — upgrade to >= $BNXT_MIN_VER_235 or >= $BNXT_MIN_VER_237"; return ;;
         235) min="$BNXT_MIN_VER_235" ;;
         237) min="$BNXT_MIN_VER_237" ;;
         *)   log_fail "Broadcom firmware $ver is on an unverified branch ($major.x) — required: >= $BNXT_MIN_VER_235 on 235.x or >= $BNXT_MIN_VER_237 on 237.x; known-bad: 231.x, 232.x"; return ;;
@@ -2259,19 +2212,6 @@ check_inter_node_lat() {
 # [[ $EUID -eq 0 ]] || die "please run as root"
 
 LOCAL_DEVS=()
-
-# Runs before the numbered checks and deliberately does not call step(): the
-# check is documented as a fixed 6-step sequence, and an optional flag should
-# not renumber it.
-if [[ "$INSTALL_PERFTEST" == "true" ]]; then
-    echo ""; echo -e "${CYAN}=== install perftest (--install-perftest) ===${NC}"
-    _pt=$(resolve_perftest ib_write_bw)
-    if [[ -n "$_pt" ]] && perftest_has_rocm "$_pt"; then
-        log_ok "perftest with ROCm support already present at $_pt, nothing to do"
-    else
-        install_perftest || true
-    fi
-fi
 
 # Detect NICs by PCI vendor id (stable), not IB device name (ionic cards may
 # show up as ionic_*, roceensp*, etc.). On mixed-vendor hosts, run the checks
