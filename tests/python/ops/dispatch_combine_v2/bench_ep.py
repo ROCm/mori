@@ -56,6 +56,8 @@ import torch.distributed as dist
 import mori.cco as cco
 from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig, EpDispatchCombineOp
 
+import _data
+
 HIDDEN = int(os.environ.get("HIDDEN", 7168))
 TOPK = int(os.environ.get("TOPK", 8))
 EPR = int(os.environ.get("EPR", 32))
@@ -75,6 +77,10 @@ MODES = os.environ.get("MODES", "eager,graph").split(",")
 # copy -- what a real pipeline does. "staged": a separate buffer, copy included.
 COMBINE_IN = os.environ.get("COMBINE_IN", "inplace")
 CHECK = int(os.environ.get("CHECK", 1))
+# Payload distribution and RNG seed: DATA_INIT=zero|constant|uniform|norm, SEED,
+# CONST_VAL. Same names and meanings as aiter's test_common, so the two harnesses
+# describe the same input. Defaults reproduce this file's previous behaviour.
+INIT, SEED, CONST_VAL = _data.env_config()
 # What dispatch transports; combine is always bf16, so anything else is asymmetric.
 _DISP_DT = {
     "bf16": torch.bfloat16,
@@ -98,24 +104,21 @@ def main():
 
     n_experts = world * EPR
     M = max(SWEEP)
-    g = torch.Generator(device="cpu").manual_seed(1234 + rank)
     # Inputs before the communicator: comm_create leaves a latched HIP error that
     # the next torch call reports as its own.
-    if _FP4:  # no float cast path; generate packed bytes and reinterpret
-        inp = (
-            torch.randint(0, 256, (M, HIDDEN // 2), generator=g, dtype=torch.uint8)
-            .view(_DISP_DT)
-            .to(dev)
-        )
-    else:
-        inp = (
-            torch.randn(M, HIDDEN, generator=g, dtype=torch.float32)
-            .to(_DISP_DT)
-            .to(dev)
-        )
-    wts = torch.rand(M, TOPK, generator=g, dtype=torch.float32).to(dev)
+    #
+    # Payload and routing draw from SEPARATE streams. Sharing one made the routing
+    # depend on how much randomness the payload happened to consume, so changing
+    # SWEEP -- which changes M, which changes the payload's shape -- silently
+    # resampled the routing and moved the measured time.
+    gp = _data.make_generator(_data.seed_for(SEED, rank))
+    gr = _data.make_generator(_data.seed_for(SEED, rank, routing=True))
+    inp = _data.make_payload(
+        (M, HIDDEN), INIT, gp, _DISP_DT, constant=CONST_VAL
+    ).to(dev)
+    wts = torch.rand(M, TOPK, generator=gr, dtype=torch.float32).to(dev)
     idx = (
-        torch.stack([torch.randperm(n_experts, generator=g)[:TOPK] for _ in range(M)])
+        torch.stack([torch.randperm(n_experts, generator=gr)[:TOPK] for _ in range(M)])
         .to(torch.int32)
         .to(dev)
     )
@@ -156,6 +159,7 @@ def main():
     if rank == 0:
         print(
             f"# EP{world} hidden={HIDDEN} topk={TOPK} epr={EPR} "
+            f"init={INIT} seed={SEED} "
             f"disp={_DISP_DT} comb=bf16 backends={BACKENDS} modes={MODES} "
             f"iters={ITERS} combine_in={COMBINE_IN} check={CHECK}",
             flush=True,
@@ -177,7 +181,9 @@ def main():
         lockstep()
         total = int(total_t.cpu().item())
         stage = op.combine_in_view()[:total]
-        checked = bool(CHECK) and not _FP4  # fp4 combine is too lossy to compare
+        # fp4 combine is too lossy to compare; an all-zero payload reduces the
+        # identity-expert check to 0 == 0, which holds however wrong the kernel is.
+        checked = bool(CHECK) and not _FP4 and not _data.verifies_nothing(INIT)
         if checked:  # identity expert: stage the dispatched tokens unchanged
             stage.copy_(op.recv_tokens()[:total].to(stage.dtype))
         buf = stage.clone() if COMBINE_IN == "staged" else stage
@@ -303,7 +309,15 @@ def main():
         # Say how many points were verified, not just that none failed -- with
         # CHECK=0 or DISP=fp4 nothing is compared, and a skipped check is not a
         # passing one.
-        why = " (fp4 not compared)" if _FP4 else "" if CHECK else " (CHECK=0)"
+        why = (
+            " (fp4 not compared)"
+            if _FP4
+            else " (CHECK=0)"
+            if not CHECK
+            else f" ({INIT} payload verifies nothing)"
+            if _data.verifies_nothing(INIT)
+            else ""
+        )
         print(
             f"# {'FAIL' if failures else 'PASS'}: {failures} failed, "
             f"{checked}/{points} points verified{why}"
