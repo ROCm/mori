@@ -113,9 +113,9 @@ def main():
     # resampled the routing and moved the measured time.
     gp = _data.make_generator(_data.seed_for(SEED, rank))
     gr = _data.make_generator(_data.seed_for(SEED, rank, routing=True))
-    inp = _data.make_payload(
-        (M, HIDDEN), INIT, gp, _DISP_DT, constant=CONST_VAL
-    ).to(dev)
+    inp = _data.make_payload((M, HIDDEN), INIT, gp, _DISP_DT, constant=CONST_VAL).to(
+        dev
+    )
     wts = torch.rand(M, TOPK, generator=gr, dtype=torch.float32).to(dev)
     idx = (
         torch.stack([torch.randperm(n_experts, generator=gr)[:TOPK] for _ in range(M)])
@@ -312,11 +312,15 @@ def main():
         why = (
             " (fp4 not compared)"
             if _FP4
-            else " (CHECK=0)"
-            if not CHECK
-            else f" ({INIT} payload verifies nothing)"
-            if _data.verifies_nothing(INIT)
-            else ""
+            else (
+                " (CHECK=0)"
+                if not CHECK
+                else (
+                    f" ({INIT} payload verifies nothing)"
+                    if _data.verifies_nothing(INIT)
+                    else ""
+                )
+            )
         )
         print(
             f"# {'FAIL' if failures else 'PASS'}: {failures} failed, "

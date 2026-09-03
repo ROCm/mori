@@ -81,12 +81,15 @@ def env_config(default_init="norm", default_seed=1234):
     payload, seed 1234.
     """
     init = os.environ.get("DATA_INIT", default_init)
-    if init == "gaussian":
+    # aiter spells it "normal" in one PR and "norm" in the other; take either.
+    if init in ("gaussian", "normal"):
         init = "norm"
     if init not in DATA_DISTS:
         raise ValueError(f"DATA_INIT must be one of {DATA_DISTS}, got {init!r}")
-    return init, int(os.environ.get("SEED", default_seed)), float(
-        os.environ.get("CONST_VAL", 1.0)
+    return (
+        init,
+        int(os.environ.get("SEED", default_seed)),
+        float(os.environ.get("CONST_VAL", 1.0)),
     )
 
 
