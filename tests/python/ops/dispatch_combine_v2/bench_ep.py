@@ -56,6 +56,8 @@ import torch.distributed as dist
 import mori.cco as cco
 from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig, EpDispatchCombineOp
 
+import _data
+
 HIDDEN = int(os.environ.get("HIDDEN", 7168))
 TOPK = int(os.environ.get("TOPK", 8))
 EPR = int(os.environ.get("EPR", 32))
@@ -75,6 +77,10 @@ MODES = os.environ.get("MODES", "eager,graph").split(",")
 # copy -- what a real pipeline does. "staged": a separate buffer, copy included.
 COMBINE_IN = os.environ.get("COMBINE_IN", "inplace")
 CHECK = int(os.environ.get("CHECK", 1))
+# Payload distribution and RNG seed: DATA_INIT=zero|constant|uniform|norm, SEED,
+# CONST_VAL. Same names and meanings as aiter's test_common, so the two harnesses
+# describe the same input. Defaults reproduce this file's previous behaviour.
+INIT, SEED, CONST_VAL = _data.env_config()
 # What dispatch transports; combine is always bf16, so anything else is asymmetric.
 _DISP_DT = {
     "bf16": torch.bfloat16,
@@ -98,24 +104,21 @@ def main():
 
     n_experts = world * EPR
     M = max(SWEEP)
-    g = torch.Generator(device="cpu").manual_seed(1234 + rank)
     # Inputs before the communicator: comm_create leaves a latched HIP error that
     # the next torch call reports as its own.
-    if _FP4:  # no float cast path; generate packed bytes and reinterpret
-        inp = (
-            torch.randint(0, 256, (M, HIDDEN // 2), generator=g, dtype=torch.uint8)
-            .view(_DISP_DT)
-            .to(dev)
-        )
-    else:
-        inp = (
-            torch.randn(M, HIDDEN, generator=g, dtype=torch.float32)
-            .to(_DISP_DT)
-            .to(dev)
-        )
-    wts = torch.rand(M, TOPK, generator=g, dtype=torch.float32).to(dev)
+    #
+    # Payload and routing draw from SEPARATE streams. Sharing one made the routing
+    # depend on how much randomness the payload happened to consume, so changing
+    # SWEEP -- which changes M, which changes the payload's shape -- silently
+    # resampled the routing and moved the measured time.
+    gp = _data.make_generator(_data.seed_for(SEED, rank))
+    gr = _data.make_generator(_data.seed_for(SEED, rank, routing=True))
+    inp = _data.make_payload((M, HIDDEN), INIT, gp, _DISP_DT, constant=CONST_VAL).to(
+        dev
+    )
+    wts = torch.rand(M, TOPK, generator=gr, dtype=torch.float32).to(dev)
     idx = (
-        torch.stack([torch.randperm(n_experts, generator=g)[:TOPK] for _ in range(M)])
+        torch.stack([torch.randperm(n_experts, generator=gr)[:TOPK] for _ in range(M)])
         .to(torch.int32)
         .to(dev)
     )
@@ -156,6 +159,7 @@ def main():
     if rank == 0:
         print(
             f"# EP{world} hidden={HIDDEN} topk={TOPK} epr={EPR} "
+            f"init={INIT} seed={SEED} "
             f"disp={_DISP_DT} comb=bf16 backends={BACKENDS} modes={MODES} "
             f"iters={ITERS} combine_in={COMBINE_IN} check={CHECK}",
             flush=True,
@@ -164,6 +168,48 @@ def main():
     def lockstep():
         torch.cuda.synchronize()
         dist.barrier()
+
+    def check_dispatch(op, total, routing):
+        """Every received row must equal, BYTE FOR BYTE, the source row it claims.
+
+        dispatch only transports -- "mori does no quantizing here: fp8/fp4 payloads
+        arrive already packed" (hip_backend.py) -- so the bytes that land must be
+        the bytes that were sent, for every wire dtype. Comparing them needs no
+        conversion and no arithmetic, which is what makes this the one check fp4
+        can pass: torch has no fp4 cast kernel at all, and combine cannot take fp4
+        anyway. It is also sharper than the end-to-end check, which sums U copies
+        and can average a wrong byte away.
+
+        Each rank's payload is a pure function of (SEED, its rank), so a receiver
+        can regenerate any sender's tensor locally and look up the row that the
+        reverse map says a slot came from. That determinism is what makes this
+        possible; before the seed was configurable it was not.
+        """
+        if not CHECK or total == 0:
+            return 0
+        tis = routing.disp_tok_id_to_src_tok_id_local[:total].cpu()
+        src_pe, src_tok = (tis // M).to(torch.int64), (tis % M).to(torch.int64)
+        got = op.recv_tokens()[:total].cpu().view(torch.uint8)
+        bad = 0
+        for pe in src_pe.unique().tolist():  # one regeneration per source rank
+            sel = src_pe == pe
+            ref = _data.make_payload(
+                (M, HIDDEN),
+                INIT,
+                _data.make_generator(_data.seed_for(SEED, int(pe))),
+                _DISP_DT,
+                constant=CONST_VAL,
+            ).view(torch.uint8)
+            bad += int((got[sel] != ref[src_tok[sel]]).any(dim=1).sum())
+        n = torch.tensor([bad])
+        dist.all_reduce(n)
+        if rank == 0 and n.item():
+            print(
+                f"  [{op.backend_name}] DISPATCH BYTE MISMATCH: "
+                f"{int(n.item())} rows across {world} ranks",
+                flush=True,
+            )
+        return int(n.item())
 
     def prime(op, ct, i_, w_, x_):
         """One full pair, untimed. Reads total_recv for the host, builds the buffer
@@ -174,17 +220,23 @@ def main():
         combine would stage twice the tokens and run past the arena.
         Returns (total_recv, buf, ok, checked)."""
         *_, total_t, r = op.dispatch(i_, w_, None, x_, return_routing=True)
-        lockstep()
+        lockstep()  # the reverse map is only valid after this barrier
         total = int(total_t.cpu().item())
+        dispatch_bad = check_dispatch(op, total, r)
         stage = op.combine_in_view()[:total]
-        checked = bool(CHECK) and not _FP4  # fp4 combine is too lossy to compare
+        # An all-zero payload reduces the identity-expert check to 0 == 0, which
+        # holds however wrong the kernel is. fp4 cannot go through combine at all
+        # (hip has no fp4 combine), so for it check_dispatch is the whole story.
+        checked = bool(CHECK) and not _FP4 and not _data.verifies_nothing(INIT)
         if checked:  # identity expert: stage the dispatched tokens unchanged
             stage.copy_(op.recv_tokens()[:total].to(stage.dtype))
         buf = stage.clone() if COMBINE_IN == "staged" else stage
         out, _ = op.combine(buf, routing=r)
         lockstep()
+        if dispatch_bad:
+            return total, buf, False, True
         if not checked:
-            return total, buf, True, False
+            return total, buf, True, bool(CHECK)
         exp = U[:ct].view(ct, 1).float() * inp[:ct].float().cpu()
         lossy = _DISP_DT is torch.float8_e4m3fn
         atol, rtol = (1.0, 1.5e-1) if lossy else (2e-2, 2e-2)
@@ -303,7 +355,16 @@ def main():
         # Say how many points were verified, not just that none failed -- with
         # CHECK=0 or DISP=fp4 nothing is compared, and a skipped check is not a
         # passing one.
-        why = " (fp4 not compared)" if _FP4 else "" if CHECK else " (CHECK=0)"
+        # Say what was actually verified. fp4 skips the identity-expert check
+        # (hip has no fp4 combine) but its dispatch bytes ARE compared.
+        if _FP4:
+            why = " (fp4: dispatch bytes only, combine not compared)"
+        elif not CHECK:
+            why = " (CHECK=0)"
+        elif _data.verifies_nothing(INIT):
+            why = f" ({INIT} payload: dispatch bytes only, combine check is vacuous)"
+        else:
+            why = ""
         print(
             f"# {'FAIL' if failures else 'PASS'}: {failures} failed, "
             f"{checked}/{points} points verified{why}"
