@@ -2284,29 +2284,111 @@ PoolClient::BatchPutPlan PoolClient::PartitionBatchPutTargets(
 
 void PoolClient::ExecuteBatchPutPlan(const BatchPutPlan& plan,
                                      std::vector<PutEntryOutcome>* results) {
-  // Deferred local puts, parallel: per-key memcpy is lock-free (the allocator
-  // serializes Allocate/Commit); results is not vector<bool>-bit-packed, so
-  // workers write distinct indices directly. AddCounter / timing stay here.
+  // Deferred local puts.  Allocate and commit are one pool call each for the
+  // whole batch: PeerPool takes its operation lock, consults placement and
+  // pending state and builds its per-round containers once per call, so
+  // driving it a key at a time made that fixed cost -- not the copy -- the
+  // dominant term of a local put.  Only the copy is inherently per-key, and
+  // that is what stays parallel: distinct slots, distinct result indices, so
+  // workers still write directly.  Same shape as ExecuteLocalPutRangesBatch,
+  // which is why the ranged path never paid this.
   auto run_local_put = [&]() {
     const auto& local = plan.local_items;
     if (local.empty()) return;
+    if (default_pool_ == nullptr || registry_.Empty()) {
+      MORI_UMBP_ERROR("[PoolClient] Local Put requested but no default pool is initialized");
+      return;
+    }
     const int nthr = LocalCopyThreads("UMBP_DRAM_WRITE_THREADS");
     const auto t0 = std::chrono::steady_clock::now();
-    ParallelFor(local.size(), nthr, [&](size_t k) {
+
+    std::vector<PoolPlacementRequest> asks;
+    asks.reserve(local.size());
+    for (const auto& item : local) {
+      asks.push_back(PoolPlacementRequest{*item.key, item.size, item.route.tier,
+                                          /*backend_name=*/{}, item.route.logical_tier});
+    }
+    auto allocations = default_pool_->BatchAllocate(asks);
+    allocations.resize(local.size());
+
+    // `staged` carries the keys that reached the copy phase; every slot that
+    // does not survive placement, copy or commit lands in `to_abort`.
+    std::vector<PoolSlotRef> to_abort;
+    std::vector<size_t> staged;
+    std::vector<MediumBackend*> backend_of(local.size(), nullptr);
+    staged.reserve(local.size());
+    for (size_t k = 0; k < local.size(); ++k) {
+      const auto& alloc = allocations[k].allocation;
+      if (alloc.outcome == AllocateOutcome::kSuccessAlreadyExists) {
+        (*results)[local[k].index] = PutEntryOutcome::kAlreadyExists;
+        continue;
+      }
+      if (alloc.outcome != AllocateOutcome::kSuccessAllocated) continue;
+      auto* backend = registry_.Get(allocations[k].backend_id);
+      // A medium that publishes no buffer endpoints cannot be reached in-process
+      // at all; drop the reservation rather than fill a slot we cannot write.
+      if (backend == nullptr || backend->BufferCount() == 0) {
+        MORI_UMBP_WARN("[PoolClient] Local Put: tier={} has no in-process-addressable backend",
+                       static_cast<int>(local[k].route.tier));
+        to_abort.push_back(PoolSlotRef{allocations[k].backend_id, alloc.slot_id});
+        continue;
+      }
+      backend_of[k] = backend;
+      staged.push_back(k);
+    }
+
+    // vector<char>, not vector<bool>: workers write distinct indices.
+    std::vector<char> copied(local.size(), 0);
+    ParallelFor(staged.size(), nthr, [&](size_t s) {
+      const size_t k = staged[s];
       const auto& item = local[k];
-      switch (ExecuteLocalPut(*item.key, item.src, item.size, item.route.tier,
-                              item.route.logical_tier)) {
-        case PutAttemptOutcome::kSuccess:
-          (*results)[item.index] = PutEntryOutcome::kSucceeded;
-          break;
-        case PutAttemptOutcome::kSuccessAlreadyExists:
-          (*results)[item.index] = PutEntryOutcome::kAlreadyExists;
-          break;
-        case PutAttemptOutcome::kRetry:
-        case PutAttemptOutcome::kFatal:
-          break;
+      const auto& alloc = allocations[k].allocation;
+      std::vector<TransferItem> items;
+      if (BuildLocalPageTransfers(backend_of[k], alloc.pages, alloc.page_size,
+                                  const_cast<void*>(item.src), item.size, /*to_backend=*/true,
+                                  &items) &&
+          transfer_engine_->Transfer(items, /*failed_tags=*/nullptr)) {
+        copied[k] = 1;
       }
     });
+
+    std::vector<PoolCommitRequest> commits;
+    std::vector<size_t> commit_owner;
+    commits.reserve(staged.size());
+    commit_owner.reserve(staged.size());
+    for (size_t k : staged) {
+      const PoolSlotRef slot{allocations[k].backend_id, allocations[k].allocation.slot_id};
+      if (copied[k] == 0) {
+        to_abort.push_back(slot);
+        continue;
+      }
+      commits.push_back(PoolCommitRequest{slot, *local[k].key});
+      commit_owner.push_back(k);
+    }
+
+    double put_bytes = 0.0;
+    auto outcomes = default_pool_->BatchCommit(commits);
+    for (size_t j = 0; j < commit_owner.size(); ++j) {
+      if (j >= outcomes.size() || !outcomes[j].commit.success) {
+        to_abort.push_back(commits[j].slot);
+        continue;
+      }
+      const size_t k = commit_owner[j];
+      (*results)[local[k].index] = PutEntryOutcome::kSucceeded;
+      put_bytes += static_cast<double>(local[k].size);
+    }
+    if (!to_abort.empty()) default_pool_->BatchAbort(to_abort);
+
+    if (put_bytes > 0.0) {
+      // One update for the batch rather than two per key; the totals are the
+      // same, and AddCounter locks and materializes its help text every call.
+      CountMetric(MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL,
+                  MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL_HELP, {{"traffic", "local"}},
+                  put_bytes);
+      CountMetric(MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL,
+                  MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL_HELP, {{"traffic", "local"}},
+                  put_bytes);
+    }
     if (std::getenv("UMBP_LOCAL_COPY_TIMING")) {
       double sec = std::chrono::duration_cast<std::chrono::duration<double>>(
                        std::chrono::steady_clock::now() - t0)
@@ -4325,11 +4407,14 @@ std::vector<bool> PoolClient::BatchExists(const std::vector<std::string>& keys) 
   std::vector<std::string> unknown;
   std::vector<size_t> unknown_indices;
   if (config_.local_first) {
-    std::vector<size_t> all(keys.size());
-    std::iota(all.begin(), all.end(), 0);
-    std::vector<MediumBackend*> holders;
-    ResolveLocalBatch(keys, all, &holders, /*resolutions=*/nullptr);
-    for (size_t i = 0; i < keys.size(); ++i) out[i] = holders[i] != nullptr;
+    // Containment, not resolution: this only needs to know whether the key is
+    // here. A resolve would heap-copy the page vector of every key it finds and
+    // renew a read lease on it, and every byte of that is discarded one line
+    // below.
+    if (default_pool_ != nullptr) {
+      const auto local = default_pool_->BatchContains(keys);
+      for (size_t i = 0; i < keys.size() && i < local.size(); ++i) out[i] = local[i];
+    }
     for (size_t i = 0; i < keys.size(); ++i) {
       if (!out[i]) {
         unknown.push_back(keys[i]);

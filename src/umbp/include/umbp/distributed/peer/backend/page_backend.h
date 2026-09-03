@@ -30,6 +30,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -259,6 +260,7 @@ class PageBackend : public MediumBackend {
   bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved) override;
   void ReleaseMigrationRead(const std::string& key) override;
   bool Contains(const std::string& key) const override;
+  std::vector<bool> BatchContains(const std::vector<std::string>& keys) const override;
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys) override;
 
   uint64_t PageSize() const override { return page_size_; }
@@ -384,14 +386,60 @@ class PageBackend : public MediumBackend {
     uint64_t size = 0;
     // Eviction fence, renewed by every Resolve.  Lives here rather than in a
     // map keyed by the same string, which cost a second hash of a ~128-byte
-    // key per resolve.  Default-constructed means no lease.
-    std::chrono::steady_clock::time_point read_lease_until{};
+    // key per resolve.  Zero means no lease.
+    //
+    // Atomic, and stored as a steady_clock nanosecond count rather than a
+    // time_point, because the resolve paths renew it under a SHARED lock:
+    // many readers may renew the same key at once.  Renewal is a CAS-max
+    // (RenewLeaseAtomic) so a slower thread can never shorten a lease another
+    // thread already extended.
+    std::atomic<int64_t> read_lease_ns{0};
     // Position in lru_, valid only while in_lru is true (local eviction on).
     // Held here for the same reason as the lease: the alternative is a second
     // map keyed by the same string.
+    //
+    // GUARDED BY lru_mutex_, not mutex_ -- the resolve paths touch the LRU
+    // while holding only a shared lock on mutex_.
     std::list<std::string>::iterator lru_it{};
     bool in_lru = false;
+
+    // std::atomic is neither copyable nor movable, but OwnedSlot is stored by
+    // value in owned_ and moved into place on commit, so the moves are spelled
+    // out.  Relaxed is enough: the map slot is exclusively owned at this point.
+    OwnedSlot() = default;
+    OwnedSlot(OwnedSlot&& other) noexcept
+        : pages(std::move(other.pages)),
+          size(other.size),
+          read_lease_ns(other.read_lease_ns.load(std::memory_order_relaxed)),
+          lru_it(other.lru_it),
+          in_lru(other.in_lru) {}
+    OwnedSlot& operator=(OwnedSlot&& other) noexcept {
+      if (this == &other) return *this;
+      pages = std::move(other.pages);
+      size = other.size;
+      read_lease_ns.store(other.read_lease_ns.load(std::memory_order_relaxed),
+                          std::memory_order_relaxed);
+      lru_it = other.lru_it;
+      in_lru = other.in_lru;
+      return *this;
+    }
+    OwnedSlot(const OwnedSlot&) = delete;
+    OwnedSlot& operator=(const OwnedSlot&) = delete;
   };
+
+  // steady_clock <-> the atomic lease representation.
+  static int64_t SteadyNs(std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
+  }
+  // Extend `slot`'s lease to `deadline_ns` without ever shortening it.  Safe
+  // under a shared lock; concurrent renewals settle on the latest deadline.
+  static void RenewLeaseAtomic(OwnedSlot& slot, int64_t deadline_ns) {
+    int64_t current = slot.read_lease_ns.load(std::memory_order_relaxed);
+    while (current < deadline_ns &&
+           !slot.read_lease_ns.compare_exchange_weak(
+               current, deadline_ns, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+  }
 
   AllocateResult AllocateLocked(const std::string& key, uint64_t size);
   bool CommitLocked(uint64_t slot_id, const std::string& key, uint64_t& bytes_committed);
@@ -436,12 +484,17 @@ class PageBackend : public MediumBackend {
 
   // ---- local eviction (no-master deployments; see EnableLocalEviction) ----
 
-  // Caller MUST hold `mutex_`.  Move `key` to the MRU end, inserting it if it
-  // is not yet tracked.  No-op when local eviction is off.
+  // Caller MUST hold `lru_mutex_`.  Move `key` to the MRU end, inserting it if
+  // it is not yet tracked.  No-op when local eviction is off.
   void TouchLruLocked(const std::string& key, OwnedSlot& slot);
 
-  // Caller MUST hold `mutex_`.  Drop `key` from the LRU if tracked.
+  // Caller MUST hold `lru_mutex_`.  Drop `key` from the LRU if tracked.
   void RemoveFromLruLocked(OwnedSlot& slot);
+
+  // Self-locking wrappers for single-key callers.  Lock order is always
+  // mutex_ -> lru_mutex_, never the reverse.
+  void TouchLru(const std::string& key, OwnedSlot& slot);
+  void RemoveFromLru(OwnedSlot& slot);
 
   // Run one round if local eviction is on and usage has reached the high
   // watermark.  Takes `mutex_` itself, so callers must NOT hold it.  Returns
@@ -457,7 +510,14 @@ class PageBackend : public MediumBackend {
   };
 
   TierType tier_;
-  mutable std::mutex mutex_;
+  // Reader/writer, not exclusive: Resolve, BatchResolve and Contains are the
+  // hot path of a 100%-hit restore and only read owned_/pending_, so they take
+  // a shared lock and run concurrently.  Everything that mutates the index
+  // (Allocate, Commit, Abort, Evict, pins, ClearLocal) takes it exclusively.
+  // The two things the resolve paths still write -- the read lease and the LRU
+  // position -- were moved off this lock: the lease is an atomic on the slot,
+  // the LRU has lru_mutex_.
+  mutable std::shared_mutex mutex_;
   uint64_t page_size_;
   std::chrono::milliseconds pending_ttl_;
   std::chrono::milliseconds read_lease_ttl_;
@@ -502,6 +562,11 @@ class PageBackend : public MediumBackend {
   // Front = most recently committed/resolved, back = eviction candidate.
   // Empty and unmaintained unless local_evict_enabled_.
   std::list<std::string> lru_;
+  // Guards lru_ and the per-slot lru_it/in_lru fields.  Separate from mutex_
+  // so a resolve can record an access while holding only a shared lock; the
+  // critical section is a list splice, not a hash lookup plus a page-vector
+  // copy.  Always taken after mutex_ when both are held.
+  mutable std::mutex lru_mutex_;
   bool local_evict_enabled_ = false;
   double local_evict_high_wm_ = 0.9;
   double local_evict_low_wm_ = 0.7;
