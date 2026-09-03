@@ -65,7 +65,8 @@ TransferItem MakeItem(const TransferRef& src, uint64_t src_off, const TransferRe
 
 TEST(GdsEngine, ClaimsFileToGpuOnly) {
   GdsEngine engine;
-  TransferRef file = TransferRef::File(/*fd=*/7, /*offset=*/0, /*n=*/4096, reinterpret_cast<void*>(0x1));
+  TransferRef file =
+      TransferRef::File(/*fd=*/7, /*offset=*/0, /*n=*/4096, reinterpret_cast<void*>(0x1));
   std::vector<char> stub(4096);
   TransferRef gpu = GpuBuf(stub.data(), stub.size());
   TransferRef host = TransferRef::HostBytes(stub.data(), stub.size());  // CPU
@@ -84,8 +85,7 @@ TEST(GdsEngine, PlansOneRangePerItemAndBoundsToBuffer) {
   TransferRef gpu = GpuBuf(stub.data(), stub.size());
 
   std::vector<TransferItem> items{
-      MakeItem(file, 0, gpu, 0, 2048, 0),
-      MakeItem(file, 2048, gpu, 2048, 2048, 1),
+      MakeItem(file, 0, gpu, 0, 2048, 0), MakeItem(file, 2048, gpu, 2048, 2048, 1),
       MakeItem(file, 0, gpu, 0, 8192, 2),  // overruns the 4096-byte buffer
   };
   TransferPlanSet planned = engine.Plan(items);
