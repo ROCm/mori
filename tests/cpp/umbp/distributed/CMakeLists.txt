@@ -466,6 +466,17 @@ target_link_libraries(test_component_metrics PRIVATE umbp_common
 target_compile_features(test_component_metrics PRIVATE cxx_std_17)
 add_test(NAME test_component_metrics COMMAND test_component_metrics)
 
+# test_gds_engine — GdsEngine routing/planning (no GPU) plus a GPU + hipFile
+# read round trip (skipped without a device, or on a filesystem that rejects
+# O_DIRECT). Built only when hipfile is available; umbp_common already carries
+# hip::hipfile and the UMBP_ENABLE_GDS definition in that case.
+if(TARGET hip::hipfile)
+  add_executable(test_gds_engine test_gds_engine.cpp)
+  target_link_libraries(test_gds_engine PRIVATE umbp_common hip::host GTest::gtest_main)
+  target_compile_features(test_gds_engine PRIVATE cxx_std_17)
+  add_test(NAME test_gds_engine COMMAND test_gds_engine)
+endif()
+
 # test_hbm_backend — the HBM medium and the engine that had to exist for it:
 # HbmCopyEngine's selection/planner (no GPU needed) plus real H2D/D2H/D2D bytes
 # and a Put/Get round trip against an hipMalloc'd pool (skipped without a GPU).
@@ -618,3 +629,14 @@ if(USE_REDIS_BACKEND)
   target_compile_features(test_sharded_read PRIVATE cxx_std_17)
   add_test(NAME test_sharded_read COMMAND test_sharded_read)
 endif()
+
+# GDS-vs-staging A/B for SSD reads into device memory.  Run twice, once with
+# UMBP_ENABLE_GDS=1, and diff the CSV.  Standalone executable; not a CTest
+# target, because it needs a real block-backed --dir to measure anything.
+add_executable(bench_umbp_gds_ssd_get bench_gds_ssd_get.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(bench_umbp_gds_ssd_get PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  bench_umbp_gds_ssd_get
+  PRIVATE umbp_core umbp_common hip::host ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB})

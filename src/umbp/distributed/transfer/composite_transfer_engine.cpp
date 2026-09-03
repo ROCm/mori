@@ -165,6 +165,18 @@ TransferRef CompositeTransferEngine::RegisterMemory(void* base, size_t size,
   return merged;
 }
 
+TransferRef CompositeTransferEngine::RegisterFile(int fd, uint64_t offset, uint64_t size) {
+  // Unlike RegisterMemory, a file range fans out to exactly one taker: only a
+  // file-capable engine (GdsEngine) claims it, and it owns the fd registration
+  // outright.  First match wins; an invalid ref means no file engine is
+  // configured and the caller must fall back to a memory path.
+  for (auto& engine : engines_) {
+    TransferRef part = engine->RegisterFile(fd, offset, size);
+    if (part.IsFile()) return part;
+  }
+  return TransferRef{};
+}
+
 void CompositeTransferEngine::Deregister(const TransferRef& ref) {
   for (auto& engine : engines_) engine->Deregister(ref);
 }

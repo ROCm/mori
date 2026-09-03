@@ -151,6 +151,15 @@ void PeerSsdManager::UnpinForMigration(const std::string& key) {
   if (inflight_reads_.empty()) reads_drained_cv_.notify_all();
 }
 
+std::optional<RecordLocation> PeerSsdManager::LocateRecord(const std::string& key) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (backend_ == nullptr) return std::nullopt;
+  // A key mid-eviction is a miss, exactly as PrepareRead treats it.
+  if (evicting_.count(key) != 0) return std::nullopt;
+  if (owned_.find(key) == owned_.end()) return std::nullopt;
+  return backend_->LocateRecord(key);
+}
+
 void PeerSsdManager::TouchLocked(const std::string& key) {
   auto it = owned_.find(key);
   if (it == owned_.end()) return;

@@ -431,6 +431,20 @@ target_link_libraries(
 
 target_compile_features(umbp_common PUBLIC cxx_std_17)
 
+# ---------- Optional hipfile GDS transfer engine -----------------------------
+# GdsEngine reads an SSD segment's byte range straight into GPU memory via
+# hipFileRead (no host bounce). Auto-enabled when hipfile is installed; a build
+# without it keeps only the memory engines and the host-staged SSD path.
+find_package(hipfile QUIET CONFIG GLOBAL)
+if(TARGET hip::hipfile)
+  message(STATUS "[UMBP] hipfile found — GDS transfer engine ENABLED")
+  target_sources(umbp_common PRIVATE distributed/transfer/gds_engine.cpp)
+  target_link_libraries(umbp_common PUBLIC hip::hipfile)
+  target_compile_definitions(umbp_common PUBLIC UMBP_ENABLE_GDS)
+else()
+  message(STATUS "[UMBP] hipfile not found — GDS transfer engine disabled")
+endif()
+
 # ---------- Optional Redis / RESP master metadata backend --------------------
 # Makes the master stateless by storing all metadata in an external RESP store
 # (Redis / Dragonfly / Valkey). OFF by default so existing builds are

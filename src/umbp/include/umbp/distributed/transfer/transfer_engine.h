@@ -71,15 +71,22 @@ namespace mori::umbp {
 //                             or a node with no RDMA configured)
 // An endpoint with neither is invalid and no engine will accept it.
 //
-// DELIBERATELY ABSENT: a file / object endpoint, and MemoryRegistrar::
-// RegisterFile.  §4 specified both, but no engine in tree consumes one yet, and
-// this plan has already refused to land an abstraction nothing exercises once
-// (§3: BackendProperties was proposed and then NOT adopted, because "an
-// advertised order would have been scaffolding nothing exercises").  The same
-// test applies here: SsdBackend is what needs a FileRef, so SsdBackend brings
-// it — adding a `kind` tag and a second handle set is a one-file change to this
-// header, and CanHandle already exists to route it.
+// FILE ENDPOINT (kind == File): the "one-file change" the note below predicted.
+// A `kind` tag plus a second handle set — an O_DIRECT fd, a file offset, and an
+// opaque engine handle — lets a backend publish a byte range of a file that a
+// file engine (GdsEngine) moves straight between the drive and device memory,
+// with no host bounce.  The memory-only engines ignore it for free: their
+// CanHandle keys on HasHostPtr()/HasMemoryDesc(), both false for a file ref, so
+// the existing per-pair selection already routes it to the only engine that
+// claims it.  SsdBackend is the backend that needed it (design doc §4/§6).
 struct TransferRef {
+  enum class Kind : uint8_t { Memory, File };
+
+  // Which handle set below is authoritative.  Memory refs (the default) carry a
+  // process-local pointer and/or a mori-io descriptor; File refs carry an
+  // O_DIRECT fd and offset.
+  Kind kind = Kind::Memory;
+
   // Process-local view.  Set for anything this node allocated or a caller
   // handed us; null for a peer's memory.
   void* host_ptr = nullptr;
@@ -91,9 +98,18 @@ struct TransferRef {
   // (local), or they were hydrated from a peer's published descriptor (remote).
   mori::io::MemoryDesc mem{};
 
+  // File view (kind == File).  A byte range [file_offset, file_offset + size) of
+  // an O_DIRECT file.  gds_handle is a file engine's opaque registration of the
+  // fd (a hipFileHandle_t), left null until RegisterFile fills it; `size` above
+  // is reused for the range length.
+  int file_fd = -1;
+  uint64_t file_offset = 0;
+  void* gds_handle = nullptr;
+
   bool HasHostPtr() const { return host_ptr != nullptr && size > 0; }
   bool HasMemoryDesc() const { return mem.size > 0; }
-  bool Valid() const { return HasHostPtr() || HasMemoryDesc(); }
+  bool IsFile() const { return kind == Kind::File && file_fd >= 0; }
+  bool Valid() const { return HasHostPtr() || HasMemoryDesc() || IsFile(); }
 
   // Unregistered, directly-addressable bytes: a caller's Put src / Get dst that
   // was never passed to RegisterMemory.
@@ -115,6 +131,18 @@ struct TransferRef {
     r.loc = desc.loc;
     r.device = desc.deviceId;
     r.mem = std::move(desc);
+    return r;
+  }
+
+  // A byte range of an O_DIRECT file, addressable only by a file engine.
+  // `handle` is the engine's registration of `fd`, filled in by RegisterFile.
+  static TransferRef File(int fd, uint64_t offset, uint64_t n, void* handle = nullptr) {
+    TransferRef r;
+    r.kind = Kind::File;
+    r.file_fd = fd;
+    r.file_offset = offset;
+    r.size = n;
+    r.gds_handle = handle;
     return r;
   }
 };
@@ -146,6 +174,19 @@ class MemoryRegistrar {
   // still gets a usable local-only endpoint rather than a failure.
   virtual TransferRef RegisterMemory(void* base, size_t size, mori::io::MemoryLocationType loc,
                                      int device) = 0;
+
+  // Register an O_DIRECT file range so a file engine can move it directly
+  // between the drive and device memory, returning a File TransferRef with the
+  // engine's handle filled in.  Default: no file-capable engine, so the range
+  // is unservable and an invalid ref comes back.  Only GdsEngine (and the
+  // composite that fans out to it) overrides this — the memory-only engines
+  // never touch a file.
+  virtual TransferRef RegisterFile(int fd, uint64_t offset, uint64_t size) {
+    (void)fd;
+    (void)offset;
+    (void)size;
+    return TransferRef{};
+  }
 
   // Release every registration held in `ref`.  Tolerates an invalid ref.
   virtual void Deregister(const TransferRef& ref) = 0;

@@ -74,6 +74,14 @@ bool SsdBackend::Init(MemoryRegistrar* registrar) {
 
   registrar_ = registrar;
 
+  // Opt-in switch for the file->GPU (GDS) read path.  Off by default even when
+  // the build has hipfile; set UMBP_ENABLE_GDS=1 to route O_DIRECT SSD reads
+  // through the GdsEngine instead of the staging arena (no rebuild needed).
+  if (const char* env = std::getenv("UMBP_ENABLE_GDS")) {
+    const std::string v(env);
+    gds_enabled_ = (v == "1" || v == "true" || v == "TRUE" || v == "on" || v == "ON");
+  }
+
   // ONE buffer covering every staging page, so each page is contiguous and a
   // single registration serves the arena.  Host memory deliberately: this is
   // what the backend publishes, and publishing ordinary registered DRAM is the
@@ -137,6 +145,17 @@ void SsdBackend::Shutdown() {
   if (registrar_ != nullptr && buffer_ref_.Valid()) registrar_->Deregister(buffer_ref_);
   buffer_ref_ = TransferRef{};
   buffer_desc_.clear();
+
+  // Release the GDS file handles obtained lazily during resolves.
+  {
+    std::lock_guard<std::mutex> lock(gds_mutex_);
+    if (registrar_ != nullptr) {
+      for (auto& [fd, handle] : gds_handles_) {
+        if (handle != nullptr) registrar_->Deregister(TransferRef::File(fd, 0, 0, handle));
+      }
+    }
+    gds_handles_.clear();
+  }
 
   // Deregister before release, same ordering rule as PageBackend::Shutdown.
   if (staging_source_ != nullptr) staging_source_->Release();
@@ -252,6 +271,18 @@ void SsdBackend::ClearLocal() {
     unshipped_events_ = 0;
   }
   for (const auto& key : migration_keys) ssd_->UnpinForMigration(key);
+  // The SSD wipe below can close and reopen segment fds, so drop the cached GDS
+  // handles (they are re-registered lazily on the next resolve) rather than risk
+  // a stale handle if an fd number is later reused.
+  {
+    std::lock_guard<std::mutex> lock(gds_mutex_);
+    if (registrar_ != nullptr) {
+      for (auto& [fd, handle] : gds_handles_) {
+        if (handle != nullptr) registrar_->Deregister(TransferRef::File(fd, 0, 0, handle));
+      }
+    }
+    gds_handles_.clear();
+  }
   clear_full_sync_pending_.store(true, std::memory_order_release);
   ssd_->ClearLocal();
 }
@@ -430,7 +461,7 @@ std::vector<bool> SsdBackend::BatchAbort(const std::vector<uint64_t>& slot_ids) 
 }
 
 std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::string>& keys,
-                                                    bool include_descs) {
+                                                    bool include_descs, bool allow_file_refs) {
   std::vector<ResolvedEntry> results(keys.size());
   if (keys.empty()) return results;
   const auto now = std::chrono::steady_clock::now();
@@ -482,6 +513,30 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
       if (duplicate != scheduled.end()) {
         result_groups[duplicate->second].push_back(i);
         continue;
+      }
+
+      // Zero-copy GDS (UMBP_ENABLE_GDS): when the caller can read a file ref,
+      // the switch is on, a file engine is present, and the record is on an
+      // O_DIRECT fd, publish a FileRef and skip the staging arena — the reader
+      // (GdsEngine) DMAs the range into device memory.
+      //
+      // allow_file_refs is tested FIRST on purpose.  A caller that cannot use a
+      // file ref — a peer serving the wire, or an existence check reading only
+      // `found` — must fall through to the staging path and get real pages, and
+      // testing it first also spares it LocateRecord and the hipFile
+      // registration GdsHandleForFd performs as a side effect.
+      std::optional<RecordLocation> loc;
+      if (allow_file_refs && gds_enabled_ && (loc = ssd_->LocateRecord(keys[i])) &&
+          loc->direct_io && loc->fd >= 0) {
+        if (void* handle = GdsHandleForFd(loc->fd)) {
+          results[i].outcome = ResolveOutcome::kFound;
+          results[i].found = true;
+          results[i].size = loc->value_size;
+          results[i].page_size = cfg_.page_size;
+          results[i].file_ref =
+              TransferRef::File(loc->fd, loc->value_offset, loc->readable_size, handle);
+          continue;
+        }
       }
 
       const uint64_t size = ssd_->SizeOf(keys[i]);
@@ -675,6 +730,22 @@ std::vector<BufferMemoryDescBytes> SsdBackend::AllBufferDescs() const {
 TransferRef SsdBackend::BufferRef(uint32_t buffer_index) const {
   if (buffer_index != kStagingBufferIndex) return TransferRef{};
   return buffer_ref_;
+}
+
+void* SsdBackend::GdsHandleForFd(int fd) {
+  std::lock_guard<std::mutex> lock(gds_mutex_);
+  auto it = gds_handles_.find(fd);
+  if (it != gds_handles_.end()) return it->second;  // cached, possibly nullptr
+  // A zero-length RegisterFile just obtains (and ref-counts) the fd's handle;
+  // the per-key ranges are built by BatchResolve.  An invalid ref means no file
+  // engine is configured — cache nullptr so the fd is not probed again.
+  void* handle = nullptr;
+  if (registrar_ != nullptr) {
+    TransferRef ref = registrar_->RegisterFile(fd, 0, 0);
+    if (ref.IsFile()) handle = ref.gds_handle;
+  }
+  gds_handles_[fd] = handle;
+  return handle;
 }
 
 // ---------------------------------------------------------------------------
