@@ -612,14 +612,21 @@ jobs:
 
       - name: Build MORI-IO C++ bench_engine (both nodes)
         run: |
-          BUILD_CMD="cd $GITHUB_WORKSPACE && cmake -B build -DBUILD_IO=ON -DBUILD_TESTS=ON -DBUILD_EXAMPLES=OFF -DBUILD_PYBINDS=OFF&& cmake --build build --target bench_engine -j && ls -la build/tests/cpp/bench_engine"
+          # Dedicated build dir, wiped each run. The runner workspace is shared with
+          # ci.yml, whose pip build leaves a build/CMakeCache.txt whose
+          # CMAKE_MAKE_PROGRAM points into an ephemeral /tmp/pip-build-env-*/overlay
+          # that pip has already removed, so configuring into "build" fails with
+          # "Running '<...>/ninja' '--version' failed with: No such file or
+          # directory". A private dir also keeps this configure from inheriting a
+          # cache written by a different cmake or base image.
+          BUILD_CMD="cd $GITHUB_WORKSPACE && rm -rf build-cpp && cmake -B build-cpp -DBUILD_IO=ON -DBUILD_TESTS=ON -DBUILD_EXAMPLES=OFF -DBUILD_PYBINDS=OFF && cmake --build build-cpp --target bench_engine -j && ls -la build-cpp/tests/cpp/bench_engine"
           $CT exec $CONTAINER bash -c "$BUILD_CMD"
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "$CT exec $CONTAINER bash -c \"$BUILD_CMD\""
 
       - name: MORI-IO C++ bench_engine write sweep (batch 1 and 64)
         run: |
-          BIN=$GITHUB_WORKSPACE/build/tests/cpp/bench_engine
-          LDP="LD_LIBRARY_PATH=$GITHUB_WORKSPACE/build/src/io:$GITHUB_WORKSPACE/build/src/application"
+          BIN=$GITHUB_WORKSPACE/build-cpp/tests/cpp/bench_engine
+          LDP="LD_LIBRARY_PATH=$GITHUB_WORKSPACE/build-cpp/src/io:$GITHUB_WORKSPACE/build-cpp/src/application"
           PORT=29130
           for BATCH in 1 64; do
             echo "=== C++ bench_engine GPU write sweep, batch=$BATCH, port=$PORT ==="
