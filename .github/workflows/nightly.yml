@@ -647,6 +647,37 @@ jobs:
             --num-initiator-dev 8 --num-target-dev 8
           wait
 
+      # Read counterpart of the write sweep above: same geometry (full 1K-16M
+      # sweep, 8 QP, 8 threads, batch-contiguous), so read bandwidth lands on the
+      # perf dashboard alongside write. Unlike the 4KB smoke read below it does
+      # NOT use --poll_cq_mode event, so the batch-into-one-WR hang that gates
+      # that step does not apply here.
+      - name: MORI-IO internode read sweep
+        run: |
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
+          PORT=29122
+          echo "=== MORI-IO internode benchmark: wide-read-sweep port=$PORT ==="
+          NODE2_CMD=(
+            $CT exec $CONTAINER bash $SCRIPT
+            --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+            --ifname $NODE2_IFNAME
+            -- --op-type read --buffer-size 65536 --transfer-batch-size 256 --all
+            --sweep-start-size 1024 --sweep-max-size 16777216 --iters 128
+            --batch-contiguous --enable-sess --enable-batch-transfer
+            --num-qp-per-transfer 8 --num-worker-threads 8
+            --num-initiator-dev 8 --num-target-dev 8
+          )
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+          $CT exec $CONTAINER bash $SCRIPT \
+            --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+            --ifname $NODE1_IFNAME \
+            -- --op-type read --buffer-size 65536 --transfer-batch-size 256 --all \
+            --sweep-start-size 1024 --sweep-max-size 16777216 --iters 128 \
+            --batch-contiguous --enable-sess --enable-batch-transfer \
+            --num-qp-per-transfer 8 --num-worker-threads 8 \
+            --num-initiator-dev 8 --num-target-dev 8
+          wait
+
       # Correctness/smoke check only: a fixed 4KB single-point read, not a sweep.
       # The numbers are far below what the write sweep reports, so this step runs
       # with MORI_PERF_OUT cleared and contributes nothing to the perf report.
