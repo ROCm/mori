@@ -1,6 +1,27 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
 //
 // MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
 #pragma once
 
 #include <cstddef>
@@ -20,9 +41,8 @@ namespace mori::umbp {
 
 uint64_t StablePlacementHash(std::string_view key);
 
-std::vector<uint32_t> WeightedBackendOrder(
-    const std::vector<LogicalTierBackendConfig>& members, const BackendRegistry& backends,
-    std::string_view key);
+std::vector<uint32_t> WeightedBackendOrder(const std::vector<LogicalTierBackendConfig>& members,
+                                           const BackendRegistry& backends, std::string_view key);
 
 class LogicalTierGraph {
  public:
@@ -66,8 +86,7 @@ class LogicalTierGraph {
 
   std::vector<uint32_t> WeightedMemberOrder(TierIndex tier, std::string_view key) const;
   std::vector<uint32_t> PutOrder(std::string_view key) const;
-  std::vector<uint32_t> PutOrderFromTier(std::string_view name,
-                                         std::string_view key) const;
+  std::vector<uint32_t> PutOrderFromTier(std::string_view name, std::string_view key) const;
   std::vector<uint32_t> TransitionTargetOrder(TierIndex source, std::string_view key) const;
   std::vector<uint32_t> PromoteTargetOrder(TierIndex source, std::string_view key) const;
   std::vector<uint32_t> ReadOrder() const;

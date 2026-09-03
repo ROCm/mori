@@ -237,8 +237,7 @@ TEST_F(SsdBackendTest, DsV4SizedObjectRoundTripsWith64KiBPages) {
   ASSERT_TRUE(Put(backend, "deepseek-v4-swa", payload));
   auto resolved = backend->BatchResolve({"deepseek-v4-swa"}, false);
   ASSERT_TRUE(resolved[0].found);
-  EXPECT_EQ(resolved[0].pages.size(),
-            (kDsV4SwaObjectSize + kPageSize - 1) / kPageSize);
+  EXPECT_EQ(resolved[0].pages.size(), (kDsV4SwaObjectSize + kPageSize - 1) / kPageSize);
 
   std::vector<char> readback;
   ASSERT_TRUE(Get(backend, "deepseek-v4-swa", &readback));

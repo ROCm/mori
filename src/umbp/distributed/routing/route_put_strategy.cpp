@@ -109,12 +109,10 @@ std::vector<PlacementSlot> CollectEligibleSlots(
     if (exclude_nodes.count(client.node_id)) continue;
     if (!client.logical_tier_capacities.empty()) {
       for (const auto& [name, logical] : client.logical_tier_capacities) {
-        if (!logical.put_eligible ||
-            AllocatableBytes(logical.capacity) < block_size) {
+        if (!logical.put_eligible || AllocatableBytes(logical.capacity) < block_size) {
           continue;
         }
-        slots.push_back(
-            {i, logical.representative_tier, name, logical.capacity.available_bytes});
+        slots.push_back({i, logical.representative_tier, name, logical.capacity.available_bytes});
       }
     } else {
       for (const auto& [tier, cap] : client.tier_capacities) {
@@ -173,8 +171,7 @@ bool ApplyProjectedDeduction(std::vector<ClientRecord>& candidates, const RouteP
     return false;
   }
   if (!result.logical_tier.empty()) {
-    auto logical_it =
-        client_it->logical_tier_capacities.find(result.logical_tier);
+    auto logical_it = client_it->logical_tier_capacities.find(result.logical_tier);
     if (logical_it == client_it->logical_tier_capacities.end() ||
         logical_it->second.capacity.available_bytes < block_size) {
       MORI_UMBP_ERROR(
@@ -419,9 +416,8 @@ std::vector<std::optional<RoutePutResult>> ConfigurableRoutePutStrategy::SelectB
     } else if (affinity_ == NodeAffinity::kSame) {
       // Whole-batch hit: keep every key on the pinned node AND tier.
       if (anchor_tier) {
-        selected =
-            TrySelectOnNodeTier(candidates, *anchor_node, *anchor_tier, block_size,
-                                exclude_nodes, anchor_logical_tier);
+        selected = TrySelectOnNodeTier(candidates, *anchor_node, *anchor_tier, block_size,
+                                       exclude_nodes, anchor_logical_tier);
       }
       if (!selected) {
         // The pinned tier is full.  Drop the tier pin, keep preferring the
@@ -442,9 +438,8 @@ std::vector<std::optional<RoutePutResult>> ConfigurableRoutePutStrategy::SelectB
     // failure, never as a route (capture available_bytes before the deduction
     // so the INFO reflects the snapshot the decision was made on).
     if (selected && selected->outcome == RoutePutOutcome::kRouted) {
-      const uint64_t available =
-          LookupAvailableBytes(candidates, selected->node_id, selected->tier,
-                               selected->logical_tier);
+      const uint64_t available = LookupAvailableBytes(candidates, selected->node_id, selected->tier,
+                                                      selected->logical_tier);
       if (ApplyProjectedDeduction(candidates, *selected, block_size)) {
         MORI_UMBP_INFO(
             "[RoutePutStrategy] block_size={} tier={} selected node={} available_bytes={} "

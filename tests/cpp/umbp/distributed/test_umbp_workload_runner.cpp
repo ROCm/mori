@@ -1,4 +1,25 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: MIT
 #include <gtest/gtest.h>
 
@@ -18,9 +39,8 @@ namespace {
 
 using Event = ::umbp::benchmark::WorkloadEvent;
 
-Event MakeEvent(uint32_t client, uint64_t id, Event::Operation operation,
-                const std::string& key, uint64_t timestamp_ns = 0,
-                uint64_t batch_id = 0) {
+Event MakeEvent(uint32_t client, uint64_t id, Event::Operation operation, const std::string& key,
+                uint64_t timestamp_ns = 0, uint64_t batch_id = 0) {
   Event event;
   event.set_client_id(client);
   event.set_operation_id(id);
@@ -86,17 +106,15 @@ class FakeClient final : public WorkloadClient {
     return ClientResult::kSuccess;
   }
 
-  std::vector<ClientResult> BatchPut(
-      uint32_t client_id, const std::vector<std::string>& keys,
-      const std::vector<std::vector<uint8_t>>& values) override {
+  std::vector<ClientResult> BatchPut(uint32_t client_id, const std::vector<std::string>& keys,
+                                     const std::vector<std::vector<uint8_t>>& values) override {
     ++batch_put_calls;
     return WorkloadClient::BatchPut(client_id, keys, values);
   }
 
-  std::vector<ClientResult> BatchGet(
-      uint32_t client_id, const std::vector<std::string>& keys,
-      const std::vector<size_t>& sizes,
-      std::vector<std::vector<uint8_t>>* values) override {
+  std::vector<ClientResult> BatchGet(uint32_t client_id, const std::vector<std::string>& keys,
+                                     const std::vector<size_t>& sizes,
+                                     std::vector<std::vector<uint8_t>>* values) override {
     ++batch_get_calls;
     return WorkloadClient::BatchGet(client_id, keys, sizes, values);
   }
@@ -111,9 +129,7 @@ class FakeClient final : public WorkloadClient {
 
  private:
   mutable std::mutex mutex_;
-  std::unordered_map<uint32_t,
-                     std::unordered_map<std::string, std::vector<uint8_t>>>
-      values_;
+  std::unordered_map<uint32_t, std::unordered_map<std::string, std::vector<uint8_t>>> values_;
   std::vector<ClientCall> calls_;
 };
 
@@ -208,12 +224,9 @@ TEST(WorkloadRunnerTest, GroupsCompatibleBatchIds) {
 
 TEST(WorkloadRunnerTest, AccountsForFailuresAndComputesPercentiles) {
   std::vector<Event> events = {
-      MakeEvent(0, 1, Event::PUT, "good"),
-      MakeEvent(0, 1, Event::GET, "good"),
-      MakeEvent(0, 2, Event::GET, "missing"),
-      MakeEvent(0, 3, Event::PUT, "put-fail"),
-      MakeEvent(0, 4, Event::PUT, "corrupt"),
-      MakeEvent(0, 4, Event::GET, "corrupt"),
+      MakeEvent(0, 1, Event::PUT, "good"),    MakeEvent(0, 1, Event::GET, "good"),
+      MakeEvent(0, 2, Event::GET, "missing"), MakeEvent(0, 3, Event::PUT, "put-fail"),
+      MakeEvent(0, 4, Event::PUT, "corrupt"), MakeEvent(0, 4, Event::GET, "corrupt"),
   };
   VectorSource source(std::move(events));
   FakeClient client;

@@ -810,8 +810,8 @@ TEST_F(PoolClientLogicalTierMetricsTest, PublishesCapacityPerLogicalTier) {
         ParseMetricValue(body, "mori_umbp_client_logical_tier_capacity_utilization_ratio", tier);
     const double eligible =
         ParseMetricValue(body, "mori_umbp_client_logical_tier_put_eligible", tier);
-    const double peak = ParseMetricValue(
-        body, "mori_umbp_client_logical_tier_peak_member_utilization_ratio", tier);
+    const double peak =
+        ParseMetricValue(body, "mori_umbp_client_logical_tier_peak_member_utilization_ratio", tier);
     ASSERT_GE(avail, 0.0) << tier << " available missing";
     ASSERT_GE(used, 0.0) << tier << " used missing";
     ASSERT_GE(util, 0.0) << tier << " utilization missing";

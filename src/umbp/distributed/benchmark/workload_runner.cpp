@@ -1,4 +1,25 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: MIT
 #include "umbp/distributed/benchmark/workload_runner.h"
 
@@ -100,9 +121,10 @@ std::vector<ClientResult> WorkloadClient::BatchPut(
   return results;
 }
 
-std::vector<ClientResult> WorkloadClient::BatchGet(
-    uint32_t client_id, const std::vector<std::string>& keys,
-    const std::vector<size_t>& sizes, std::vector<std::vector<uint8_t>>* values) {
+std::vector<ClientResult> WorkloadClient::BatchGet(uint32_t client_id,
+                                                   const std::vector<std::string>& keys,
+                                                   const std::vector<size_t>& sizes,
+                                                   std::vector<std::vector<uint8_t>>* values) {
   if (keys.size() != sizes.size() || values == nullptr) {
     throw std::invalid_argument("BatchGet arguments are invalid");
   }
@@ -149,13 +171,11 @@ WorkloadMetrics WorkloadRunner::Run(WorkloadSource* source) {
     // legitimately overwrites keys, so the invariant applies to generated
     // traces being validated, not to replay in general.
     if (event.operation() == Event::PUT && options_.validate_get_payloads) {
-      const auto [found, inserted] =
-          put_identity.emplace(event.key(),
-                               std::make_pair(event.operation_id(), event.value_size()));
+      const auto [found, inserted] = put_identity.emplace(
+          event.key(), std::make_pair(event.operation_id(), event.value_size()));
       if (!inserted) {
-        const bool conflicting =
-            found->second.first != event.operation_id() ||
-            found->second.second != event.value_size();
+        const bool conflicting = found->second.first != event.operation_id() ||
+                                 found->second.second != event.value_size();
         throw std::invalid_argument(
             conflicting
                 ? "workload contains conflicting PUT payload identities for an immutable key"
@@ -163,8 +183,7 @@ WorkloadMetrics WorkloadRunner::Run(WorkloadSource* source) {
       }
     }
     auto& events = client_events[event.client_id()];
-    if (!events.empty() &&
-        event.relative_timestamp_ns() < events.back().relative_timestamp_ns()) {
+    if (!events.empty() && event.relative_timestamp_ns() < events.back().relative_timestamp_ns()) {
       throw std::invalid_argument("per-client workload timestamps must be nondecreasing");
     }
     events.push_back(event);
@@ -186,8 +205,7 @@ WorkloadMetrics WorkloadRunner::Run(WorkloadSource* source) {
         while (begin < events.size()) {
           size_t end = begin + 1;
           if (events[begin].batch_id() != 0) {
-            while (end < events.size() &&
-                   events[end].batch_id() == events[begin].batch_id() &&
+            while (end < events.size() && events[end].batch_id() == events[begin].batch_id() &&
                    events[end].operation() == events[begin].operation()) {
               ++end;
             }
@@ -200,8 +218,7 @@ WorkloadMetrics WorkloadRunner::Run(WorkloadSource* source) {
             if (scaled > static_cast<long double>(std::numeric_limits<int64_t>::max())) {
               throw std::overflow_error("scaled workload timestamp is too large");
             }
-            const auto target =
-                start + std::chrono::nanoseconds(static_cast<int64_t>(scaled));
+            const auto target = start + std::chrono::nanoseconds(static_cast<int64_t>(scaled));
             std::this_thread::sleep_until(target);
           }
 
@@ -233,8 +250,7 @@ WorkloadMetrics WorkloadRunner::Run(WorkloadSource* source) {
             values.reserve(end - begin);
             for (size_t i = begin; i < end; ++i) {
               values.push_back(GenerateDeterministicPayload(
-                  events[i].key(), events[i].operation_id(), payload_seed,
-                  sizes[i - begin]));
+                  events[i].key(), events[i].operation_id(), payload_seed, sizes[i - begin]));
             }
             results = client_->BatchPut(client_id, keys, values);
           } else {
@@ -244,8 +260,8 @@ WorkloadMetrics WorkloadRunner::Run(WorkloadSource* source) {
 
           for (size_t i = begin; i < end; ++i) {
             const size_t result_index = i - begin;
-            ClientResult result = result_index < results.size() ? results[result_index]
-                                                                : ClientResult::kFailed;
+            ClientResult result =
+                result_index < results.size() ? results[result_index] : ClientResult::kFailed;
             bool success = result == ClientResult::kSuccess;
             if (events[i].operation() == Event::GET) {
               if (result == ClientResult::kNotFound) {
@@ -253,9 +269,9 @@ WorkloadMetrics WorkloadRunner::Run(WorkloadSource* source) {
               } else if (success && options_.validate_get_payloads) {
                 if (result_index >= values.size() ||
                     values[result_index].size() != sizes[result_index] ||
-                    !ValidateDeterministicPayload(
-                        events[i].key(), events[i].operation_id(), payload_seed,
-                        values[result_index].data(), values[result_index].size())) {
+                    !ValidateDeterministicPayload(events[i].key(), events[i].operation_id(),
+                                                  payload_seed, values[result_index].data(),
+                                                  values[result_index].size())) {
                   ++local.get_validation_failures;
                   success = false;
                 }

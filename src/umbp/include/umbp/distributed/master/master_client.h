@@ -86,11 +86,10 @@ class MasterClient {
   // membership + capacity-snapshot metadata is shipped — DRAM/HBM
   // descriptors are peer-internal now.  `tier_capacities` is the single
   // source of per-tier capacity, including SSD (TierType::SSD).
-  grpc::Status RegisterSelf(const std::map<TierType, TierCapacity>& tier_capacities,
-                            const std::string& peer_address = "",
-                            const std::vector<uint8_t>& engine_desc_bytes = {},
-                            const std::map<std::string, LogicalTierCapacity>&
-                                logical_tier_capacities = {});
+  grpc::Status RegisterSelf(
+      const std::map<TierType, TierCapacity>& tier_capacities, const std::string& peer_address = "",
+      const std::vector<uint8_t>& engine_desc_bytes = {},
+      const std::map<std::string, LogicalTierCapacity>& logical_tier_capacities = {});
   grpc::Status UnregisterSelf();
 
   // --- Router ---
@@ -140,12 +139,9 @@ class MasterClient {
   // before StartHeartbeat().
   void SetAggregateBackendCapacities(bool enabled) {
     aggregate_backend_capacities_requested_ = enabled;
-    aggregate_backend_capacities_ =
-        enabled && supports_max_allocatable_capacity_;
+    aggregate_backend_capacities_ = enabled && supports_max_allocatable_capacity_;
   }
-  bool SupportsMaxAllocatableCapacity() const {
-    return supports_max_allocatable_capacity_;
-  }
+  bool SupportsMaxAllocatableCapacity() const { return supports_max_allocatable_capacity_; }
   bool SupportsLogicalTiers() const { return supports_logical_tiers_; }
 
   void StartHeartbeat();

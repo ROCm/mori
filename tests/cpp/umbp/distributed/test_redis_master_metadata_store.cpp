@@ -268,8 +268,7 @@ class RedisStoreTest : public ::testing::TestWithParam<StoreMode> {
     r.node_id = id;
     r.node_address = id + ".addr";
     r.peer_address = id + ".peer:1234";
-    r.tier_capacities[TierType::DRAM] =
-        TierCapacity{1u << 30, 1u << 30, 1u << 29};
+    r.tier_capacities[TierType::DRAM] = TierCapacity{1u << 30, 1u << 30, 1u << 29};
     r.tags = {"sgl_role=prefill", "zone=a"};
     return r;
   }
@@ -343,8 +342,7 @@ TEST_P(RedisStoreTest, PreservesLogicalTierPeakUtilization) {
   auto record = store_->GetClient("n1");
   ASSERT_TRUE(record.has_value());
   ASSERT_EQ(record->logical_tier_capacities.count("hot"), 1u);
-  EXPECT_DOUBLE_EQ(record->logical_tier_capacities.at("hot").peak_member_utilization,
-                   0.875);
+  EXPECT_DOUBLE_EQ(record->logical_tier_capacities.at("hot").peak_member_utilization, 0.875);
 }
 
 TEST_P(RedisStoreTest, RegisterRejectsAliveDuplicateButAllowsStale) {

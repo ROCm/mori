@@ -1,6 +1,27 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
 //
 // MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
 #include "umbp/distributed/pool/tier_transition.h"
 
 #include <algorithm>
@@ -8,9 +29,9 @@
 
 namespace mori::umbp {
 
-bool TierTransitionExecutor::BuildTransfers(
-    MediumBackend* source, const ResolvedEntry& resolved, MediumBackend* target,
-    const AllocateResult& allocation, std::vector<TransferItem>* items) {
+bool TierTransitionExecutor::BuildTransfers(MediumBackend* source, const ResolvedEntry& resolved,
+                                            MediumBackend* target, const AllocateResult& allocation,
+                                            std::vector<TransferItem>* items) {
   if (source == nullptr || target == nullptr || items == nullptr || resolved.size == 0 ||
       resolved.page_size == 0 || allocation.page_size == 0 || resolved.pages.empty() ||
       allocation.pages.empty() || allocation.size != resolved.size) {
@@ -34,9 +55,8 @@ bool TierTransitionExecutor::BuildTransfers(
 
     const uint64_t source_offset = copied % resolved.page_size;
     const uint64_t target_offset = copied % allocation.page_size;
-    const uint64_t size =
-        std::min({resolved.size - copied, resolved.page_size - source_offset,
-                  allocation.page_size - target_offset});
+    const uint64_t size = std::min({resolved.size - copied, resolved.page_size - source_offset,
+                                    allocation.page_size - target_offset});
     TransferItem item;
     item.tag = items->size();
     item.src = std::move(source_ref);
@@ -91,8 +111,7 @@ TierTransitionResult TierTransitionExecutor::Execute(
     }
 
     ResolvedEntry target_read;
-    if (!target->AcquireMigrationRead(key, &target_read) ||
-        target_read.size != resolved.size) {
+    if (!target->AcquireMigrationRead(key, &target_read) || target_read.size != resolved.size) {
       if (target_read.found) target->ReleaseMigrationRead(key);
       if (allocation.outcome == AllocateOutcome::kSuccessAllocated) target->Evict({key});
       continue;

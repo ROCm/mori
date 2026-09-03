@@ -1,6 +1,27 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
 //
 // MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
 #pragma once
 
 #include <algorithm>
@@ -37,8 +58,8 @@ class PoolPolicy {
 
   // Ordered candidates for one placement attempt, best first. A single-choice
   // policy returns one id; others append deterministic no-space fallbacks.
-  virtual std::vector<uint32_t> PutOrder(
-      const BackendRegistry& backends, const PoolPlacementRequest& request) const = 0;
+  virtual std::vector<uint32_t> PutOrder(const BackendRegistry& backends,
+                                         const PoolPlacementRequest& request) const = 0;
 
   virtual std::vector<uint32_t> ReadOrder(const BackendRegistry& backends) const = 0;
   virtual std::shared_ptr<const LogicalTierGraph> TierGraph() const { return {}; }
@@ -61,8 +82,8 @@ inline std::vector<uint32_t> AllBackendIds(const BackendRegistry& backends) {
 // used, exactly matching the pre-Pool behavior.
 class SingleBackendPolicy final : public PoolPolicy {
  public:
-  std::vector<uint32_t> PutOrder(
-      const BackendRegistry& backends, const PoolPlacementRequest& request) const override {
+  std::vector<uint32_t> PutOrder(const BackendRegistry& backends,
+                                 const PoolPlacementRequest& request) const override {
     MediumBackend* backend = nullptr;
     if (!request.backend_name.empty()) {
       backend = backends.Get(request.backend_name);
@@ -72,8 +93,7 @@ class SingleBackendPolicy final : public PoolPolicy {
     }
     if (backend == nullptr) return {};
     const uint32_t id = backends.BackendId(backend);
-    return id < BackendRegistry::kMaxBackends ? std::vector<uint32_t>{id}
-                                             : std::vector<uint32_t>{};
+    return id < BackendRegistry::kMaxBackends ? std::vector<uint32_t>{id} : std::vector<uint32_t>{};
   }
 
   std::vector<uint32_t> ReadOrder(const BackendRegistry& backends) const override {
@@ -98,8 +118,8 @@ class WeightedPlacementPolicy final : public PoolPolicy {
   explicit WeightedPlacementPolicy(std::vector<BackendPlacementWeight> weights)
       : weights_(std::move(weights)) {}
 
-  std::vector<uint32_t> PutOrder(
-      const BackendRegistry& backends, const PoolPlacementRequest& request) const override {
+  std::vector<uint32_t> PutOrder(const BackendRegistry& backends,
+                                 const PoolPlacementRequest& request) const override {
     if (!request.backend_name.empty()) {
       auto* backend = backends.Get(request.backend_name);
       if (backend == nullptr || backend->Tier() != request.tier) return {};
@@ -136,8 +156,8 @@ class TieredPlacementPolicy final : public PoolPolicy {
   explicit TieredPlacementPolicy(std::shared_ptr<const LogicalTierGraph> graph)
       : graph_(std::move(graph)) {}
 
-  std::vector<uint32_t> PutOrder(
-      const BackendRegistry& backends, const PoolPlacementRequest& request) const override {
+  std::vector<uint32_t> PutOrder(const BackendRegistry& backends,
+                                 const PoolPlacementRequest& request) const override {
     if (!request.backend_name.empty()) {
       auto* backend = backends.Get(request.backend_name);
       if (backend == nullptr) return {};

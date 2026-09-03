@@ -1,4 +1,25 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: MIT
 
 #include <gtest/gtest.h>
@@ -53,7 +74,8 @@ std::string AdvertisedDramDebug(MasterServer* master, const std::string& node_id
          " max_alloc=" + std::to_string(found->second.max_allocatable_bytes);
 }
 
-bool WaitForAdvertisedDram(MasterServer* master, const std::string& node_id, uint64_t expected_total,
+bool WaitForAdvertisedDram(MasterServer* master, const std::string& node_id,
+                           uint64_t expected_total,
                            std::optional<uint64_t> expected_available = std::nullopt) {
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
   do {
@@ -118,22 +140,21 @@ std::vector<Event> MakeReplay() {
   for (uint32_t client_id = 0; client_id < 2; ++client_id) {
     for (size_t key_index = 0; key_index < kKeysPerClient; ++key_index) {
       const uint64_t operation_id = client_id * kKeysPerClient + key_index + 1;
-      events.push_back(MakeEvent(
-          client_id, operation_id, Event::PUT,
-          "tier-smoke-" + std::to_string(client_id) + "-" + std::to_string(key_index),
-          100 + client_id));
+      events.push_back(
+          MakeEvent(client_id, operation_id, Event::PUT,
+                    "tier-smoke-" + std::to_string(client_id) + "-" + std::to_string(key_index),
+                    100 + client_id));
     }
     for (size_t key_index = 0; key_index < kKeysPerClient; ++key_index) {
       const uint64_t operation_id = client_id * kKeysPerClient + key_index + 1;
-      events.push_back(MakeEvent(
-          client_id, operation_id, Event::GET,
-          "tier-smoke-" + std::to_string(client_id) + "-" + std::to_string(key_index),
-          200 + client_id));
+      events.push_back(
+          MakeEvent(client_id, operation_id, Event::GET,
+                    "tier-smoke-" + std::to_string(client_id) + "-" + std::to_string(key_index),
+                    200 + client_id));
     }
   }
   return events;
 }
-
 
 // Every case here needs the same thing before it can say anything about
 // placement: one in-process master on an ephemeral port, and PoolClients that
@@ -165,11 +186,9 @@ class InProcessClusterTest : public ::testing::Test {
 
   // Weighted placement across named DRAM backends, which is the configuration
   // under test in every case; callers supply the backends.
-  void StartClient(const std::string& node_id,
-                   const std::vector<BackendInstanceConfig>& backends) {
+  void StartClient(const std::string& node_id, const std::vector<BackendInstanceConfig>& backends) {
     PoolClientConfig config;
-    config.master_config.master_address =
-        "127.0.0.1:" + std::to_string(master_->GetBoundPort());
+    config.master_config.master_address = "127.0.0.1:" + std::to_string(master_->GetBoundPort());
     config.master_config.node_id = node_id;
     config.master_config.node_address = "127.0.0.1";
     config.master_config.auto_heartbeat = true;
@@ -226,10 +245,9 @@ class TierBenchmarkSmokeTest : public InProcessClusterTest {
   void SetUp() override {
     ASSERT_NO_FATAL_FAILURE(StartMaster());
     for (uint32_t client_id = 0; client_id < 2; ++client_id) {
-      ASSERT_NO_FATAL_FAILURE(
-          StartClient("tier-smoke-node-" + std::to_string(client_id),
-                      {DramBackend("dram-0", kBackendCapacity, 1),
-                       DramBackend("dram-1", kBackendCapacity, 2)}));
+      ASSERT_NO_FATAL_FAILURE(StartClient("tier-smoke-node-" + std::to_string(client_id),
+                                          {DramBackend("dram-0", kBackendCapacity, 1),
+                                           DramBackend("dram-1", kBackendCapacity, 2)}));
     }
     ASSERT_EQ(clients_.size(), 2u);
     Settle(std::chrono::milliseconds(100));
@@ -241,9 +259,8 @@ TEST_F(TierBenchmarkSmokeTest, ReplaysValidatedBatchesAcrossWeightedDramBackends
   VectorSource source(MakeReplay(), kPayloadSeed);
   // Client B may read a key client A only just wrote, so the reader waits out
   // the peer-event to master-index publication window instead of missing.
-  bench::PoolWorkloadClient adapter(&clients_,
-                                    {std::chrono::seconds(5), std::chrono::seconds(5),
-                                     std::chrono::milliseconds(25)});
+  bench::PoolWorkloadClient adapter(
+      &clients_, {std::chrono::seconds(5), std::chrono::seconds(5), std::chrono::milliseconds(25)});
   bench::WorkloadRunnerOptions options;
   options.max_throughput = true;
   options.validate_get_payloads = true;
@@ -316,8 +333,8 @@ TEST_F(TierBenchmarkSmokeTest, ClientBReadsClientAKeysWithPayloadValidation) {
       std::this_thread::sleep_for(std::chrono::milliseconds(25));
     } while (std::chrono::steady_clock::now() < deadline);
     ASSERT_TRUE(ok) << "client B missed client A's key " << keys[i];
-    EXPECT_TRUE(bench::ValidateDeterministicPayload(keys[i], i + 1, kPayloadSeed, got.data(),
-                                                    got.size()));
+    EXPECT_TRUE(
+        bench::ValidateDeterministicPayload(keys[i], i + 1, kPayloadSeed, got.data(), got.size()));
   }
 }
 
@@ -330,9 +347,9 @@ class TinyWeightedPoolTest : public InProcessClusterTest {
 
   void SetUp() override {
     ASSERT_NO_FATAL_FAILURE(StartMaster(Affinity::kLocal));
-    ASSERT_NO_FATAL_FAILURE(StartClient("tier-tiny-node-0",
-                                        {DramBackend("dram-0", kTinyCapacity, 100),
-                                         DramBackend("dram-1", kTinyCapacity, 1)}));
+    ASSERT_NO_FATAL_FAILURE(StartClient(
+        "tier-tiny-node-0",
+        {DramBackend("dram-0", kTinyCapacity, 100), DramBackend("dram-1", kTinyCapacity, 1)}));
     Settle(std::chrono::milliseconds(100));
   }
 };
@@ -358,8 +375,7 @@ TEST_F(TinyWeightedPoolTest, FallsBackThenFailsWithoutLeakingSlots) {
 
   EXPECT_EQ(succeeded, 2 * kTinyPages);
   EXPECT_EQ(failed, 4u);
-  EXPECT_EQ(primary->OwnedKeyCount(), kTinyPages)
-      << "weight 100:1 should fill dram-0 first";
+  EXPECT_EQ(primary->OwnedKeyCount(), kTinyPages) << "weight 100:1 should fill dram-0 first";
   EXPECT_EQ(fallback->OwnedKeyCount(), kTinyPages)
       << "no-space on the primary must fall back to dram-1";
   EXPECT_EQ(primary->OwnedKeyCount() + fallback->OwnedKeyCount(), succeeded);
@@ -398,9 +414,8 @@ class UnequalDramWeightedPoolTest : public InProcessClusterTest {
 
   void StartCluster(bool advertise_max_allocatable_bytes) {
     ASSERT_NO_FATAL_FAILURE(StartMaster(Affinity::kLocal, advertise_max_allocatable_bytes));
-    ASSERT_NO_FATAL_FAILURE(StartClient(kNodeId,
-                                        {DramBackend("dram-0", kPrimaryCapacity, 1),
-                                         DramBackend("dram-1", kSecondaryCapacity, 1)}));
+    ASSERT_NO_FATAL_FAILURE(StartClient(kNodeId, {DramBackend("dram-0", kPrimaryCapacity, 1),
+                                                  DramBackend("dram-1", kSecondaryCapacity, 1)}));
     Settle(std::chrono::milliseconds(150));
     client()->Master().FlushHeartbeat();
   }

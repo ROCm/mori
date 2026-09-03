@@ -1,4 +1,25 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: MIT
 #include "umbp/distributed/benchmark/workload_trace_recorder.h"
 
@@ -8,12 +29,10 @@
 namespace mori::umbp::benchmark {
 namespace {
 
-::umbp::benchmark::WorkloadTraceHeader MakeHeader(
-    const WorkloadTraceRecorderOptions& options) {
+::umbp::benchmark::WorkloadTraceHeader MakeHeader(const WorkloadTraceRecorderOptions& options) {
   ::umbp::benchmark::WorkloadTraceHeader header;
   header.set_schema_version(kWorkloadTraceSchemaVersion);
-  header.set_time_unit(
-      ::umbp::benchmark::WorkloadTraceHeader::TIME_UNIT_NANOSECONDS);
+  header.set_time_unit(::umbp::benchmark::WorkloadTraceHeader::TIME_UNIT_NANOSECONDS);
   header.set_seed(options.seed);
   auto& metadata = *header.mutable_metadata();
   metadata["source"] = "production";
@@ -23,8 +42,7 @@ namespace {
   return header;
 }
 
-void ValidateBatch(const std::vector<std::string>& keys,
-                   const std::vector<size_t>& sizes,
+void ValidateBatch(const std::vector<std::string>& keys, const std::vector<size_t>& sizes,
                    const std::vector<WorkloadTraceOutcome>& outcomes) {
   if (keys.size() != sizes.size() || keys.size() != outcomes.size()) {
     throw std::invalid_argument(
@@ -60,8 +78,7 @@ WorkloadTraceRecorder::~WorkloadTraceRecorder() {
 
 uint64_t WorkloadTraceRecorder::RelativeTimestampNs() const {
   return static_cast<uint64_t>(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start_)
-          .count());
+      std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start_).count());
 }
 
 bool WorkloadTraceRecorder::WriteLocked(const ::umbp::benchmark::WorkloadEvent& event) {
@@ -81,9 +98,9 @@ bool WorkloadTraceRecorder::WriteLocked(const ::umbp::benchmark::WorkloadEvent& 
 }
 
 void WorkloadTraceRecorder::RecordBatch(::umbp::benchmark::WorkloadEvent::Operation operation,
-                                       const std::vector<std::string>& keys,
-                                       const std::vector<size_t>& sizes,
-                                       const std::vector<WorkloadTraceOutcome>& outcomes) {
+                                        const std::vector<std::string>& keys,
+                                        const std::vector<size_t>& sizes,
+                                        const std::vector<WorkloadTraceOutcome>& outcomes) {
   ValidateBatch(keys, sizes, outcomes);
   std::lock_guard<std::mutex> lock(mutex_);
   if (failed_) return;

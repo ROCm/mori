@@ -1,4 +1,25 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: MIT
 
 #include <gtest/gtest.h>
@@ -45,10 +66,8 @@ TEST(BackendPolicyConfig, ParsesAndLowersShippedExample) {
   // One backend with two devices lowers to one member per device, splitting the
   // declared capacity evenly, so the tier weights stay equal.
   ASSERT_EQ(output.logical_tiers[0].members.size(), 2u);
-  EXPECT_EQ(output.logical_tiers[0].members[0].weight,
-            output.logical_tiers[0].members[1].weight);
-  EXPECT_EQ(output.logical_tiers[0].offload_to,
-            (std::vector<std::string>{"dram", "ssd_a"}));
+  EXPECT_EQ(output.logical_tiers[0].members[0].weight, output.logical_tiers[0].members[1].weight);
+  EXPECT_EQ(output.logical_tiers[0].offload_to, (std::vector<std::string>{"dram", "ssd_a"}));
   EXPECT_EQ(output.logical_tiers[0].trigger, PoolOffloadTrigger::kOnEvict);
   EXPECT_EQ(output.logical_tiers[0].name, "hot");
   EXPECT_TRUE(output.logical_tiers[0].entry);

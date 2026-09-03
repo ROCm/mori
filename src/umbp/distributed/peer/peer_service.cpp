@@ -272,9 +272,8 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     // — master sizes its next eviction round off this total.
     std::vector<std::string> keys(request->keys().begin(), request->keys().end());
     if (keys.empty()) return grpc::Status::OK;
-    auto evicted = pool_ == nullptr
-                       ? std::vector<EvictResult>{}
-                       : pool_->Evict(keys, PoolEvictMode::kReclaim);
+    auto evicted =
+        pool_ == nullptr ? std::vector<EvictResult>{} : pool_->Evict(keys, PoolEvictMode::kReclaim);
     for (size_t i = 0; i < keys.size(); ++i) {
       auto* entry = response->add_evicted();
       entry->set_key(keys[i]);
@@ -324,8 +323,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       }
       out->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
       out->set_slot_id(TagSlotId(results[i].backend_id, result.slot_id));
-      FillPagesAndDescs(out, result.pages, result.page_size, result.descs,
-                        results[i].backend_id);
+      FillPagesAndDescs(out, result.pages, result.page_size, result.descs, results[i].backend_id);
       out->set_pending_ttl_ms(result.pending_ttl_ms);
     }
     return grpc::Status::OK;
@@ -370,8 +368,8 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     std::vector<PoolSlotRef> slots;
     slots.reserve(n);
     for (int i = 0; i < n; ++i) {
-      slots.push_back(
-          PoolSlotRef{BackendIdFromSlotId(request->slot_ids(i)), LocalSlotId(request->slot_ids(i))});
+      slots.push_back(PoolSlotRef{BackendIdFromSlotId(request->slot_ids(i)),
+                                  LocalSlotId(request->slot_ids(i))});
     }
 
     auto results = pool_->BatchAbort(slots);
@@ -394,9 +392,8 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     std::vector<BufferMemoryDescBytes> batch_descs;
     std::vector<std::vector<bool>> desc_seen(BackendRegistry::kMaxBackends);
     uint64_t total_bytes = 0;
-    auto resolved =
-        pool_ == nullptr ? std::vector<PoolResolvedEntry>{}
-                         : pool_->BatchResolve(keys, /*include_descs=*/!omit_descs);
+    auto resolved = pool_ == nullptr ? std::vector<PoolResolvedEntry>{}
+                                     : pool_->BatchResolve(keys, /*include_descs=*/!omit_descs);
     for (size_t i = 0; i < resolved.size() && i < entries.size(); ++i) {
       auto& result = resolved[i];
       auto& r = result.resolved;

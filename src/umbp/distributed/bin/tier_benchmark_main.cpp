@@ -1,4 +1,25 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: MIT
 #include <algorithm>
 #include <atomic>
@@ -24,6 +45,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
 #include "umbp/distributed/benchmark/pool_workload_client.h"
 #include "umbp/distributed/benchmark/workload_runner.h"
 #include "umbp/distributed/benchmark/workload_source.h"
@@ -130,9 +152,10 @@ bool ParseBool(std::string_view text, const char* option) {
 }
 uint64_t ParseSize(std::string_view text, const char* option) {
   uint64_t scale = 1;
-  for (const auto& suffix :
-       {std::pair<std::string_view, uint64_t>{"GiB", 1ULL << 30},
-        {"MiB", 1ULL << 20}, {"KiB", 1ULL << 10}, {"B", 1}}) {
+  for (const auto& suffix : {std::pair<std::string_view, uint64_t>{"GiB", 1ULL << 30},
+                             {"MiB", 1ULL << 20},
+                             {"KiB", 1ULL << 10},
+                             {"B", 1}}) {
     if (text.size() >= suffix.first.size() &&
         text.substr(text.size() - suffix.first.size()) == suffix.first) {
       text.remove_suffix(suffix.first.size());
@@ -155,8 +178,7 @@ Options ParseOptions(int argc, char** argv) {
     PrintHelp();
     std::exit(0);
   }
-  if (options.command != "run" && options.command != "generate" &&
-      options.command != "replay") {
+  if (options.command != "run" && options.command != "generate" && options.command != "replay") {
     UsageError("unknown subcommand: " + options.command);
   }
   for (int i = 2; i < argc; ++i) {
@@ -282,8 +304,7 @@ void ValidateOptions(Options* options) {
   if (options->put_strategy != "most_available" && options->put_strategy != "random") {
     UsageError("--put-strategy must be most_available or random");
   }
-  if (options->affinity != "none" && options->affinity != "same" &&
-      options->affinity != "local") {
+  if (options->affinity != "none" && options->affinity != "same" && options->affinity != "local") {
     UsageError("--affinity must be none, same, or local");
   }
   if (options->get_strategy != "local" && options->get_strategy != "random") {
@@ -328,12 +349,10 @@ void LoadPolicy(Options* options) {
     }
     const uint64_t ssd_capacity = backend.ssd.ssd.capacity_bytes;
     options->max_ssd_staging_object_bytes =
-        std::min({options->max_ssd_staging_object_bytes, pages * options->page_size,
-                  ssd_capacity});
+        std::min({options->max_ssd_staging_object_bytes, pages * options->page_size, ssd_capacity});
   }
 }
-void AddTraceMetadata(const Options& options,
-                      ::umbp::benchmark::WorkloadTraceHeader* header) {
+void AddTraceMetadata(const Options& options, ::umbp::benchmark::WorkloadTraceHeader* header) {
   auto& metadata = *header->mutable_metadata();
   metadata["profile"] = options.profile;
   metadata["seed"] = std::to_string(options.workload.seed);
@@ -365,9 +384,8 @@ int GenerateTrace(const Options& options) {
     ++events;
   }
   writer.Close();
-  std::cout << "trace_path,events,seed,schema_version\n\"" << options.trace_path << "\","
-            << events << ',' << options.workload.seed << ','
-            << bench::kWorkloadTraceSchemaVersion << '\n';
+  std::cout << "trace_path,events,seed,schema_version\n\"" << options.trace_path << "\"," << events
+            << ',' << options.workload.seed << ',' << bench::kWorkloadTraceSchemaVersion << '\n';
   return 0;
 }
 class MasterHarness {
@@ -376,18 +394,17 @@ class MasterHarness {
     MasterServerConfig config;
     config.listen_address = "127.0.0.1:0";
     config.registry_config.default_dram_page_size = options.page_size;
-    const auto algorithm =
-        options.put_strategy == "random"
-            ? ConfigurableRoutePutStrategy::SelectAlgo::kRandom
-            : ConfigurableRoutePutStrategy::SelectAlgo::kMostAvailable;
+    const auto algorithm = options.put_strategy == "random"
+                               ? ConfigurableRoutePutStrategy::SelectAlgo::kRandom
+                               : ConfigurableRoutePutStrategy::SelectAlgo::kMostAvailable;
     auto affinity = ConfigurableRoutePutStrategy::NodeAffinity::kNone;
     if (options.affinity == "same") {
       affinity = ConfigurableRoutePutStrategy::NodeAffinity::kSame;
     } else if (options.affinity == "local") {
       affinity = ConfigurableRoutePutStrategy::NodeAffinity::kLocal;
     }
-    config.put_strategy = std::make_unique<ConfigurableRoutePutStrategy>(
-        algorithm, affinity, options.workload.seed);
+    config.put_strategy =
+        std::make_unique<ConfigurableRoutePutStrategy>(algorithm, affinity, options.workload.seed);
     if (options.get_strategy == "random") {
       config.get_strategy = std::make_unique<RandomRouteGetStrategy>();
     } else {
@@ -415,9 +432,7 @@ class MasterHarness {
   }
 
   ~MasterHarness() { Stop(); }
-  std::string Address() const {
-    return "127.0.0.1:" + std::to_string(server_->GetBoundPort());
-  }
+  std::string Address() const { return "127.0.0.1:" + std::to_string(server_->GetBoundPort()); }
 
  private:
   void Stop() {
@@ -439,8 +454,8 @@ BackendInstanceConfig DefaultBackend(uint64_t capacity) {
   backend.dram.buffer_sizes = {capacity};
   return backend;
 }
-std::vector<std::unique_ptr<PoolClient>> StartClients(
-    const Options& options, const std::string& master_address) {
+std::vector<std::unique_ptr<PoolClient>> StartClients(const Options& options,
+                                                      const std::string& master_address) {
   std::vector<std::unique_ptr<PoolClient>> clients;
   const auto& policy = options.policy;
   for (uint32_t node = 0; node < options.workload.client_count; ++node) {
@@ -458,8 +473,8 @@ std::vector<std::unique_ptr<PoolClient>> StartClients(
     config.cache_remote_fetches = false;
     if (policy.has_value()) {
       std::string error;
-      if (!mori::umbp::ApplyBackendPolicy(
-              *policy, &config, &error, "-tier-benchmark-node-" + std::to_string(node))) {
+      if (!mori::umbp::ApplyBackendPolicy(*policy, &config, &error,
+                                          "-tier-benchmark-node-" + std::to_string(node))) {
         throw std::runtime_error("failed to apply backend policy: " + error);
       }
     } else {
@@ -486,14 +501,12 @@ std::string Csv(std::string_view value) {
   }
   return result + '"';
 }
-void PrintSummary(const Options& options, const bench::WorkloadMetrics& metrics,
-                  uint64_t seed,
+void PrintSummary(const Options& options, const bench::WorkloadMetrics& metrics, uint64_t seed,
                   uint64_t wall_ns) {
   const double seconds = static_cast<double>(wall_ns) / 1e9;
   const double ops_per_second = seconds == 0 ? 0 : metrics.total.succeeded / seconds;
   const double gib_per_second =
-      seconds == 0 ? 0 : metrics.total.succeeded_bytes / static_cast<double>(1ULL << 30) /
-                                seconds;
+      seconds == 0 ? 0 : metrics.total.succeeded_bytes / static_cast<double>(1ULL << 30) / seconds;
   // When a recorded trace supplies the workload, the generator's knobs kept
   // their defaults and describe nothing; reporting them invents a shape the run
   // never had. The topology is always reported from the pool itself below.
@@ -506,47 +519,43 @@ void PrintSummary(const Options& options, const bench::WorkloadMetrics& metrics,
     text << value;
     return text.str();
   };
-  std::cout
-      << "config\n"
-      << "command,trace,policy,seed,profile,operations,keys,min_value_bytes,max_value_bytes,"
-         "size_distribution,read_ratio,clients,batch,qps,backend_capacity,page_size,"
-         "put_strategy,affinity,get_strategy,scheduling,time_scale,payload_validation,"
-         "settle_ms\n"
-      << Csv(options.command) << ',' << Csv(options.trace_path) << ','
-      << Csv(options.policy_path) << ',' << seed << ','
-      << generated(options.profile) << ',' << options.workload.operation_count << ','
-      << generated_number(options.workload.key_count) << ','
-      << generated_number(options.workload.min_value_size) << ','
-      << generated_number(options.workload.max_value_size) << ','
-      << generated(options.size_distribution) << ','
-      << generated_number(options.workload.read_ratio) << ','
-      << options.workload.client_count << ','
-      << generated_number(options.workload.batch_size) << ','
-      << generated_number(options.workload.qps) << ','
-      << (options.policy_path.empty() ? std::to_string(options.backend_capacity)
-                                      : std::string{})
-      << ',' << options.page_size << ','
-      << Csv(options.put_strategy) << ',' << Csv(options.affinity) << ','
-      << Csv(options.get_strategy) << ','
-      << Csv(options.runner.max_throughput ? "max-throughput" : "open-loop") << ','
-      << options.runner.time_scale << ','
-      << (options.runner.validate_get_payloads ? "true" : "false") << ','
-      << options.settle_ms << '\n'
-      << "summary\n"
-      << "seed,attempted,succeeded,failed,succeeded_bytes,puts,puts_failed,gets,gets_failed,"
-         "get_misses,validation_failures,recorded_misses,recorded_failures,"
-         "wall_time_ns,ops_per_s,GiB_per_s,latency_p50_ns,"
-         "latency_p95_ns,latency_p99_ns,latency_max_ns,schedule_lag_p99_ns\n"
-      << seed << ',' << metrics.total.attempted << ',' << metrics.total.succeeded << ','
-      << metrics.total.failed << ',' << metrics.total.succeeded_bytes << ','
-      << metrics.puts.succeeded << ',' << metrics.puts.failed << ','
-      << metrics.gets.succeeded << ',' << metrics.gets.failed << ','
-      << metrics.get_misses << ',' << metrics.get_validation_failures << ','
-      << metrics.recorded_misses << ',' << metrics.recorded_failures << ',' << wall_ns
-      << ',' << std::setprecision(10) << ops_per_second << ',' << gib_per_second << ','
-      << metrics.latency.p50_ns << ',' << metrics.latency.p95_ns << ','
-      << metrics.latency.p99_ns << ',' << metrics.latency.max_ns << ','
-      << metrics.schedule_lag.p99_ns << '\n';
+  std::cout << "config\n"
+            << "command,trace,policy,seed,profile,operations,keys,min_value_bytes,max_value_bytes,"
+               "size_distribution,read_ratio,clients,batch,qps,backend_capacity,page_size,"
+               "put_strategy,affinity,get_strategy,scheduling,time_scale,payload_validation,"
+               "settle_ms\n"
+            << Csv(options.command) << ',' << Csv(options.trace_path) << ','
+            << Csv(options.policy_path) << ',' << seed << ',' << generated(options.profile) << ','
+            << options.workload.operation_count << ','
+            << generated_number(options.workload.key_count) << ','
+            << generated_number(options.workload.min_value_size) << ','
+            << generated_number(options.workload.max_value_size) << ','
+            << generated(options.size_distribution) << ','
+            << generated_number(options.workload.read_ratio) << ',' << options.workload.client_count
+            << ',' << generated_number(options.workload.batch_size) << ','
+            << generated_number(options.workload.qps) << ','
+            << (options.policy_path.empty() ? std::to_string(options.backend_capacity)
+                                            : std::string{})
+            << ',' << options.page_size << ',' << Csv(options.put_strategy) << ','
+            << Csv(options.affinity) << ',' << Csv(options.get_strategy) << ','
+            << Csv(options.runner.max_throughput ? "max-throughput" : "open-loop") << ','
+            << options.runner.time_scale << ','
+            << (options.runner.validate_get_payloads ? "true" : "false") << ',' << options.settle_ms
+            << '\n'
+            << "summary\n"
+            << "seed,attempted,succeeded,failed,succeeded_bytes,puts,puts_failed,gets,gets_failed,"
+               "get_misses,validation_failures,recorded_misses,recorded_failures,"
+               "wall_time_ns,ops_per_s,GiB_per_s,latency_p50_ns,"
+               "latency_p95_ns,latency_p99_ns,latency_max_ns,schedule_lag_p99_ns\n"
+            << seed << ',' << metrics.total.attempted << ',' << metrics.total.succeeded << ','
+            << metrics.total.failed << ',' << metrics.total.succeeded_bytes << ','
+            << metrics.puts.succeeded << ',' << metrics.puts.failed << ',' << metrics.gets.succeeded
+            << ',' << metrics.gets.failed << ',' << metrics.get_misses << ','
+            << metrics.get_validation_failures << ',' << metrics.recorded_misses << ','
+            << metrics.recorded_failures << ',' << wall_ns << ',' << std::setprecision(10)
+            << ops_per_second << ',' << gib_per_second << ',' << metrics.latency.p50_ns << ','
+            << metrics.latency.p95_ns << ',' << metrics.latency.p99_ns << ','
+            << metrics.latency.max_ns << ',' << metrics.schedule_lag.p99_ns << '\n';
 }
 void PrintBackendPlacement(const std::vector<std::unique_ptr<PoolClient>>& clients) {
   // logical_tier is the topology as the pool actually built it, which is the
@@ -563,18 +572,18 @@ void PrintBackendPlacement(const std::vector<std::unique_ptr<PoolClient>>& clien
       std::cout << Csv(client->NodeId()) << ','
                 << Csv(entry == nullptr ? backend->Name() : entry->name) << ','
                 << Csv(client->LogicalTierForBackend(registry.BackendId(backend))) << ','
-                << Csv(mori::umbp::TierTypeName(backend->Tier())) << ','
-                << backend->OwnedKeyCount() << ',' << capacity.total_bytes << ','
-                << capacity.available_bytes << ',' << capacity.max_allocatable_bytes << '\n';
+                << Csv(mori::umbp::TierTypeName(backend->Tier())) << ',' << backend->OwnedKeyCount()
+                << ',' << capacity.total_bytes << ',' << capacity.available_bytes << ','
+                << capacity.max_allocatable_bytes << '\n';
     }
   }
   std::cout << "tier_transitions\n"
             << "node,attempted,succeeded,failed,offloaded_bytes,promoted_bytes\n";
   for (const auto& client : clients) {
     const auto metrics = client->TransitionMetrics();
-    std::cout << Csv(client->NodeId()) << ',' << metrics.attempted << ','
-              << metrics.succeeded << ',' << metrics.failed << ','
-              << metrics.offloaded_bytes << ',' << metrics.promoted_bytes << '\n';
+    std::cout << Csv(client->NodeId()) << ',' << metrics.attempted << ',' << metrics.succeeded
+              << ',' << metrics.failed << ',' << metrics.offloaded_bytes << ','
+              << metrics.promoted_bytes << '\n';
   }
   // Which tier answered the reads: a hierarchy whose hot tier serves few of them
   // is misconfigured even when the throughput number looks acceptable.
@@ -596,7 +605,8 @@ void InspectReplayTrace(Options* options) {
   if (const auto* value = metadata_value("profile")) options->profile = *value;
   // A recorded trace carries keys and sizes but not payloads, so the expected
   // bytes cannot be rederived and GET validation would fail on every hit.
-  if (const auto* value = metadata_value("payload_mode"); value != nullptr && *value == "external") {
+  if (const auto* value = metadata_value("payload_mode");
+      value != nullptr && *value == "external") {
     options->runner.validate_get_payloads = false;
   }
   if (const auto* value = metadata_value("source"); value != nullptr && *value == "production") {
@@ -645,8 +655,7 @@ void InspectReplayTrace(Options* options) {
     }
   }
   options->workload.operation_count = event_count;
-  if (!options->clients_explicit &&
-      metadata.find("clients") == metadata.end() && has_events) {
+  if (!options->clients_explicit && metadata.find("clients") == metadata.end() && has_events) {
     if (max_client == std::numeric_limits<uint32_t>::max()) {
       UsageError("trace client id is too large");
     }
@@ -674,9 +683,9 @@ int RunBenchmark(Options options) {
   bench::WorkloadRunner runner(&adapter, options.runner);
   const auto start = std::chrono::steady_clock::now();
   const auto metrics = runner.Run(source.get());
-  const uint64_t wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                               std::chrono::steady_clock::now() - start)
-                               .count();
+  const uint64_t wall_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
+          .count();
   Settle(clients, options.settle_ms);
   PrintSummary(options, metrics, source->seed(), wall_ns);
   PrintBackendPlacement(clients);

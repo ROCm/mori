@@ -319,12 +319,10 @@ class IMasterMetadataStore {
   // (e.g. 100k events) here, and have the peer fragment larger
   // resyncs into multiple full_sync calls or shift to a snapshot-
   // then-delta protocol before the Redis backend ships.
-  virtual HeartbeatResult ApplyHeartbeat(const std::string& node_id, uint64_t seq,
-                                         std::chrono::system_clock::time_point now,
-                                         const std::map<TierType, TierCapacity>& caps,
-                                         const std::vector<KvEvent>& events, bool is_full_sync,
-                                         const std::map<std::string, LogicalTierCapacity>&
-                                             logical_caps = {}) = 0;
+  virtual HeartbeatResult ApplyHeartbeat(
+      const std::string& node_id, uint64_t seq, std::chrono::system_clock::time_point now,
+      const std::map<TierType, TierCapacity>& caps, const std::vector<KvEvent>& events,
+      bool is_full_sync, const std::map<std::string, LogicalTierCapacity>& logical_caps = {}) = 0;
 
   // Reaper pass. Atomically:
   //   - Flips status ALIVE → EXPIRED for every record with

@@ -99,9 +99,8 @@ uint64_t MetricsReportIntervalMs() {
 TierType FromProtoTier(::umbp::TierType t) { return static_cast<TierType>(t); }
 
 uint64_t SaturatingAdd(uint64_t lhs, uint64_t rhs) {
-  return rhs > std::numeric_limits<uint64_t>::max() - lhs
-             ? std::numeric_limits<uint64_t>::max()
-             : lhs + rhs;
+  return rhs > std::numeric_limits<uint64_t>::max() - lhs ? std::numeric_limits<uint64_t>::max()
+                                                          : lhs + rhs;
 }
 
 ::umbp::KvEvent::Kind ToProtoEventKind(KvEvent::Kind kind) {
@@ -154,8 +153,7 @@ void FillTierKvCounts(::google::protobuf::RepeatedPtrField<::umbp::TierKvCount>*
   }
 }
 
-void FillBundle(::umbp::EventBundle* dst, const EventBundle& src,
-                bool include_logical_tiers) {
+void FillBundle(::umbp::EventBundle* dst, const EventBundle& src, bool include_logical_tiers) {
   dst->set_seq(src.seq);
   for (const auto& ev : src.events) {
     auto* pe = dst->add_events();
@@ -189,11 +187,10 @@ MasterClient::~MasterClient() {
   }
 }
 
-grpc::Status MasterClient::RegisterSelf(const std::map<TierType, TierCapacity>& tier_capacities,
-                                        const std::string& peer_address,
-                                        const std::vector<uint8_t>& engine_desc_bytes,
-                                        const std::map<std::string, LogicalTierCapacity>&
-                                            logical_tier_capacities) {
+grpc::Status MasterClient::RegisterSelf(
+    const std::map<TierType, TierCapacity>& tier_capacities, const std::string& peer_address,
+    const std::vector<uint8_t>& engine_desc_bytes,
+    const std::map<std::string, LogicalTierCapacity>& logical_tier_capacities) {
   ScopedRpcTimer _rpc_timer(this, "RegisterClient");
   if (registered_) {
     return grpc::Status(grpc::StatusCode::ALREADY_EXISTS, "node is already registered");
@@ -205,8 +202,7 @@ grpc::Status MasterClient::RegisterSelf(const std::map<TierType, TierCapacity>& 
   req.set_peer_address(peer_address);
   req.set_engine_desc(engine_desc_bytes.data(), engine_desc_bytes.size());
   FillTierCapacities(req.mutable_tier_capacities(), tier_capacities);
-  FillLogicalTierCapacities(req.mutable_logical_tier_capacities(),
-                            logical_tier_capacities);
+  FillLogicalTierCapacities(req.mutable_logical_tier_capacities(), logical_tier_capacities);
   for (const auto& tag : config_.tags) req.add_tags(tag);
 
   ::umbp::RegisterClientResponse resp;

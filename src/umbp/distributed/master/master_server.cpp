@@ -321,10 +321,9 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
         c.max_allocatable_bytes = tc.max_allocatable_bytes();
         caps[static_cast<TierType>(tc.tier())] = c;
       }
-      auto logical_caps =
-          config_.advertise_logical_tiers
-              ? LogicalCapsFromProto(request->logical_tier_capacities())
-              : std::map<std::string, LogicalTierCapacity>{};
+      auto logical_caps = config_.advertise_logical_tiers
+                              ? LogicalCapsFromProto(request->logical_tier_capacities())
+                              : std::map<std::string, LogicalTierCapacity>{};
 
       std::vector<EventBundle> bundles;
       bundles.reserve(static_cast<size_t>(request->bundles_size()));
@@ -859,8 +858,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
   }
 
   void UpdateClientLogicalTierMetrics(
-      const std::string& node_id,
-      const std::map<std::string, LogicalTierCapacity>& logical_caps) {
+      const std::string& node_id, const std::map<std::string, LogicalTierCapacity>& logical_caps) {
     if (!metrics_) return;
     for (const auto& [name, logical] : logical_caps) {
       const auto& cap = logical.capacity;

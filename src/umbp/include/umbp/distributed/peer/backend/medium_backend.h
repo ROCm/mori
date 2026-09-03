@@ -405,8 +405,7 @@ class BackendRegistry {
 
     const TierType tier = backend->Tier();
     auto existing = id_by_name_.find(name);
-    const uint32_t replacing_id =
-        existing == id_by_name_.end() ? kMaxBackends : existing->second;
+    const uint32_t replacing_id = existing == id_by_name_.end() ? kMaxBackends : existing->second;
 
     // Every wire carrying pages has one peer-global page size. When replacing
     // an entry, compare against the other live instances so replacing the sole
@@ -564,8 +563,8 @@ inline std::vector<KvEvent> DrainAllBackends(const std::vector<MediumBackend*>& 
   merged.reserve(states.size());
   for (auto& [identity, state] : states) {
     const auto& [tier, key] = identity;
-    const bool still_owned = std::any_of(
-        backends.begin(), backends.end(), [&](MediumBackend* backend) {
+    const bool still_owned =
+        std::any_of(backends.begin(), backends.end(), [&](MediumBackend* backend) {
           return backend != nullptr && backend->Tier() == tier && backend->Contains(key);
         });
     if (state.add.has_value() && (still_owned || !state.saw_remove)) {

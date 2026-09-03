@@ -1,8 +1,32 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
 //
 // MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
 
 #include "umbp/distributed/pool/policy_config.h"
+
+#include <google/protobuf/struct.pb.h>
+#include <google/protobuf/util/json_util.h>
 
 #include <algorithm>
 #include <cmath>
@@ -17,9 +41,6 @@
 #include <unordered_set>
 #include <utility>
 
-#include <google/protobuf/struct.pb.h>
-#include <google/protobuf/util/json_util.h>
-
 #include "umbp/distributed/config.h"
 
 namespace mori::umbp {
@@ -29,9 +50,7 @@ using google::protobuf::ListValue;
 using google::protobuf::Struct;
 using google::protobuf::Value;
 
-[[noreturn]] void Invalid(const std::string& message) {
-  throw std::runtime_error(message);
-}
+[[noreturn]] void Invalid(const std::string& message) { throw std::runtime_error(message); }
 
 const char* ValueTypeName(const Value& value) {
   switch (value.kind_case()) {
@@ -65,15 +84,12 @@ const Value* OptionalField(const Struct& object, const std::string& field) {
   return it == object.fields().end() ? nullptr : &it->second;
 }
 
-void RejectUnknownFields(const Struct& object,
-                         std::initializer_list<std::string_view> allowed,
+void RejectUnknownFields(const Struct& object, std::initializer_list<std::string_view> allowed,
                          const std::string& context) {
   for (const auto& [name, value] : object.fields()) {
     (void)value;
-    const bool known =
-        std::any_of(allowed.begin(), allowed.end(), [&](std::string_view candidate) {
-          return candidate == name;
-        });
+    const bool known = std::any_of(allowed.begin(), allowed.end(),
+                                   [&](std::string_view candidate) { return candidate == name; });
     if (!known) Invalid(context + ": unknown field '" + name + "'");
   }
 }
@@ -155,8 +171,7 @@ uint64_t ParseCapacity(std::string_view text, const std::string& context) {
   }
 
   static constexpr std::pair<std::string_view, uint64_t> kUnits[] = {
-      {"B", 1}, {"KiB", 1ULL << 10}, {"MiB", 1ULL << 20},
-      {"GiB", 1ULL << 30}, {"TiB", 1ULL << 40}};
+      {"B", 1}, {"KiB", 1ULL << 10}, {"MiB", 1ULL << 20}, {"GiB", 1ULL << 30}, {"TiB", 1ULL << 40}};
   const std::string_view unit = text.substr(split);
   uint64_t multiplier = 0;
   for (const auto& [name, scale] : kUnits) {
@@ -226,16 +241,16 @@ PolicyBackendSpec ParseBackend(const std::string& name, const Value& value) {
 LogicalTierConfig ParseLogicalTier(const Value& value, size_t index) {
   const std::string context = "tiers[" + std::to_string(index) + "]";
   const Struct& object = AsObject(value, context);
-  RejectUnknownFields(object,
-                      {"name", "backends", "placement_policy", "offload_to",
-                       "offload_trigger", "high_watermark", "low_watermark",
-                       "promote_trigger", "promote_hits", "promote_mode"},
-                      context);
+  RejectUnknownFields(
+      object,
+      {"name", "backends", "placement_policy", "offload_to", "offload_trigger", "high_watermark",
+       "low_watermark", "promote_trigger", "promote_hits", "promote_mode"},
+      context);
 
   LogicalTierConfig tier;
   const Value* name = OptionalField(object, "name");
-  tier.name = name == nullptr ? "tier_" + std::to_string(index)
-                              : AsString(*name, context + ".name");
+  tier.name =
+      name == nullptr ? "tier_" + std::to_string(index) : AsString(*name, context + ".name");
   if (tier.name.empty()) Invalid(context + ".name: must not be empty");
 
   // Placement within a tier is weighted by construction; the field exists so a
@@ -254,10 +269,9 @@ LogicalTierConfig ParseLogicalTier(const Value& value, size_t index) {
     tier.members.push_back(
         {backend_name, AsPositiveUint32(weight, context + ".backends." + backend_name)});
   }
-  std::sort(tier.members.begin(), tier.members.end(),
-            [](const auto& left, const auto& right) {
-              return left.backend_name < right.backend_name;
-            });
+  std::sort(tier.members.begin(), tier.members.end(), [](const auto& left, const auto& right) {
+    return left.backend_name < right.backend_name;
+  });
 
   if (const Value* targets_field = OptionalField(object, "offload_to")) {
     const ListValue& targets = AsArray(*targets_field, context + ".offload_to");
@@ -268,10 +282,9 @@ LogicalTierConfig ParseLogicalTier(const Value& value, size_t index) {
   }
 
   if (const Value* trigger = OptionalField(object, "offload_trigger")) {
-    tier.trigger = AsEnum<PoolOffloadTrigger>(
-        *trigger, context + ".offload_trigger",
-        {{"on_evict", PoolOffloadTrigger::kOnEvict},
-         {"watermark", PoolOffloadTrigger::kWatermark}});
+    tier.trigger = AsEnum<PoolOffloadTrigger>(*trigger, context + ".offload_trigger",
+                                              {{"on_evict", PoolOffloadTrigger::kOnEvict},
+                                               {"watermark", PoolOffloadTrigger::kWatermark}});
   } else if (!tier.offload_to.empty()) {
     Invalid(context + ": offload_trigger is required when offload_to is not empty");
   }
@@ -283,11 +296,10 @@ LogicalTierConfig ParseLogicalTier(const Value& value, size_t index) {
     tier.low_watermark = AsNumber(*low, context + ".low_watermark");
   }
   if (const Value* promote = OptionalField(object, "promote_trigger")) {
-    tier.promote_trigger = AsEnum<PoolPromoteTrigger>(
-        *promote, context + ".promote_trigger",
-        {{"never", PoolPromoteTrigger::kNever},
-         {"on_read", PoolPromoteTrigger::kOnRead},
-         {"on_hits", PoolPromoteTrigger::kOnHits}});
+    tier.promote_trigger = AsEnum<PoolPromoteTrigger>(*promote, context + ".promote_trigger",
+                                                      {{"never", PoolPromoteTrigger::kNever},
+                                                       {"on_read", PoolPromoteTrigger::kOnRead},
+                                                       {"on_hits", PoolPromoteTrigger::kOnHits}});
   }
   // A hit threshold has no meaningful default, so accepting it where nothing
   // reads it would hide the misconfiguration instead of reporting it. The
@@ -296,15 +308,14 @@ LogicalTierConfig ParseLogicalTier(const Value& value, size_t index) {
     if (tier.promote_trigger != PoolPromoteTrigger::kOnHits) {
       Invalid(context + ".promote_hits: only valid when promote_trigger is 'on_hits'");
     }
-    tier.promote_hits =
-        static_cast<uint32_t>(AsInt(*hits, 2, context + ".promote_hits"));
+    tier.promote_hits = static_cast<uint32_t>(AsInt(*hits, 2, context + ".promote_hits"));
   } else if (tier.promote_trigger == PoolPromoteTrigger::kOnHits) {
     Invalid(context + ": promote_hits is required when promote_trigger is 'on_hits'");
   }
   if (const Value* mode = OptionalField(object, "promote_mode")) {
-    tier.promote_mode = AsEnum<PoolTransitionMode>(*mode, context + ".promote_mode",
-                                                     {{"copy", PoolTransitionMode::kCopy},
-                                                      {"move", PoolTransitionMode::kMove}});
+    tier.promote_mode = AsEnum<PoolTransitionMode>(
+        *mode, context + ".promote_mode",
+        {{"copy", PoolTransitionMode::kCopy}, {"move", PoolTransitionMode::kMove}});
   }
   return tier;
 }
@@ -313,8 +324,8 @@ LogicalTierConfig ParseLogicalTier(const Value& value, size_t index) {
 // trigger declared there can never fire: the read path tests the same condition
 // and skips it. Checked wherever the entry tier is finally known, because
 // naming it in `entry_tier` can move it after the per-tier pass.
-std::string RejectEntryTierPromotion(const std::vector<LogicalTierConfig>& tiers,
-                                     size_t entry_tier, const std::string& name) {
+std::string RejectEntryTierPromotion(const std::vector<LogicalTierConfig>& tiers, size_t entry_tier,
+                                     const std::string& name) {
   if (entry_tier >= tiers.size() ||
       tiers[entry_tier].promote_trigger == PoolPromoteTrigger::kNever) {
     return {};
@@ -362,15 +373,14 @@ LogicalTierIndex ValidateBackendPolicy(const BackendPolicyConfig& policy) {
   }
 
   LogicalTierIndex index;
-  if (const std::string error = IndexLogicalTiers(policy.logical_tiers, &index);
-      !error.empty()) {
+  if (const std::string error = IndexLogicalTiers(policy.logical_tiers, &index); !error.empty()) {
     Invalid(error);
   }
   for (size_t i = 0; i < policy.logical_tiers.size(); ++i) {
     for (const auto& member : policy.logical_tiers[i].members) {
       if (defined.count(member.backend_name) == 0) {
-        Invalid("logical tier '" + index.names[i] + "': undefined backend '" +
-                member.backend_name + "'");
+        Invalid("logical tier '" + index.names[i] + "': undefined backend '" + member.backend_name +
+                "'");
       }
     }
   }
@@ -392,8 +402,8 @@ LogicalTierIndex ValidateBackendPolicy(const BackendPolicyConfig& policy) {
               "' but a different logical tier is flagged as the entry tier");
     }
     index.entry_tier = named->second;
-    if (const std::string error = RejectEntryTierPromotion(
-            policy.logical_tiers, index.entry_tier, index.names[index.entry_tier]);
+    if (const std::string error = RejectEntryTierPromotion(policy.logical_tiers, index.entry_tier,
+                                                           index.names[index.entry_tier]);
         !error.empty()) {
       Invalid(error);
     }
@@ -412,8 +422,7 @@ BackendPolicyConfig ParsePolicy(const Struct& root) {
     policy.entry_tier = AsString(*entry, "policy.entry_tier");
     if (policy.entry_tier.empty()) Invalid("policy.entry_tier: must not be empty");
   }
-  const Struct& backends =
-      AsObject(RequiredField(root, "backends", "policy"), "policy.backends");
+  const Struct& backends = AsObject(RequiredField(root, "backends", "policy"), "policy.backends");
   if (backends.fields().empty()) Invalid("policy.backends: must not be empty");
   policy.backends.reserve(backends.fields_size());
   for (const auto& [name, value] : backends.fields()) {
@@ -527,8 +536,7 @@ std::string IndexLogicalTiers(const std::vector<LogicalTierConfig>& tiers,
       if (seen.insert(resolved).second) index->offload_to[i].push_back(resolved);
     }
   }
-  return RejectEntryTierPromotion(tiers, index->entry_tier,
-                                  index->names[index->entry_tier]);
+  return RejectEntryTierPromotion(tiers, index->entry_tier, index->names[index->entry_tier]);
 }
 
 BackendPolicyLoadResult LoadBackendPolicyJson(std::string_view json) {
@@ -584,9 +592,8 @@ bool ApplyBackendPolicy(const BackendPolicyConfig& policy, PoolClientConfig* con
         for (size_t i = 0; i < backend.devices.size(); ++i) {
           const int device = backend.devices[i];
           BackendInstanceConfig instance;
-          instance.name = backend.devices.size() == 1
-                              ? backend.name
-                              : backend.name + "@" + std::to_string(device);
+          instance.name = backend.devices.size() == 1 ? backend.name
+                                                      : backend.name + "@" + std::to_string(device);
           instance.tier = TierType::HBM;
           instance.hbm.device = device;
           instance.hbm.buffer_sizes = {base + (i < remainder ? 1 : 0)};

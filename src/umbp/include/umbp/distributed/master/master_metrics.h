@@ -145,8 +145,7 @@
 
 // A tier that stopped accepting PUTs is indistinguishable from one nothing
 // happens to be writing to unless the eligibility itself is published.
-#define MORI_UMBP_METRIC_CLIENT_LOGICAL_PUT_ELIGIBLE \
-  "mori_umbp_client_logical_tier_put_eligible"
+#define MORI_UMBP_METRIC_CLIENT_LOGICAL_PUT_ELIGIBLE "mori_umbp_client_logical_tier_put_eligible"
 #define MORI_UMBP_METRIC_CLIENT_LOGICAL_PUT_ELIGIBLE_HELP \
   "1 when a logical tier currently accepts new PUTs, 0 when it does not"
 
@@ -169,8 +168,7 @@
   "Logical tier transitions on this client's pool, by outcome"
 
 #define MORI_UMBP_METRIC_CLIENT_TIER_OFFLOADED_BYTES "mori_umbp_client_tier_offloaded_bytes_total"
-#define MORI_UMBP_METRIC_CLIENT_TIER_OFFLOADED_BYTES_HELP \
-  "Bytes moved to a later tier by offload"
+#define MORI_UMBP_METRIC_CLIENT_TIER_OFFLOADED_BYTES_HELP "Bytes moved to a later tier by offload"
 
 #define MORI_UMBP_METRIC_CLIENT_TIER_PROMOTED_BYTES "mori_umbp_client_tier_promoted_bytes_total"
 #define MORI_UMBP_METRIC_CLIENT_TIER_PROMOTED_BYTES_HELP \

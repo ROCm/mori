@@ -1,4 +1,25 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: MIT
 #include "umbp/distributed/benchmark/workload_source.h"
 
@@ -41,10 +62,9 @@ SyntheticWorkloadSource::SyntheticWorkloadSource(SyntheticWorkloadConfig config)
   last_put_operation_.assign(config_.key_count, 0);
   last_put_size_.assign(config_.key_count, 0);
   if (config_.profile == SyntheticProfile::kHotsetZipf) {
-    const uint64_t hot_keys =
-        std::max<uint64_t>(1, static_cast<uint64_t>(std::ceil(
-                                  static_cast<double>(config_.key_count) *
-                                  config_.hotset_fraction)));
+    const uint64_t hot_keys = std::max<uint64_t>(
+        1, static_cast<uint64_t>(
+               std::ceil(static_cast<double>(config_.key_count) * config_.hotset_fraction)));
     zipf_cdf_.reserve(hot_keys);
     double sum = 0.0;
     for (uint64_t rank = 1; rank <= hot_keys; ++rank) {
@@ -68,9 +88,8 @@ uint64_t SyntheticWorkloadSource::SelectKeyIndex(uint64_t sequence) {
       return sequence;
     case SyntheticProfile::kHotsetZipf: {
       const double sample = std::generate_canonical<double, 53>(random_);
-      return static_cast<uint64_t>(
-          std::lower_bound(zipf_cdf_.begin(), zipf_cdf_.end(), sample) -
-          zipf_cdf_.begin());
+      return static_cast<uint64_t>(std::lower_bound(zipf_cdf_.begin(), zipf_cdf_.end(), sample) -
+                                   zipf_cdf_.begin());
     }
     case SyntheticProfile::kUniform:
       return std::uniform_int_distribution<uint64_t>(0, config_.key_count - 1)(random_);
@@ -132,10 +151,8 @@ bool SyntheticWorkloadSource::Next(::umbp::benchmark::WorkloadEvent* event) {
   if (!is_read && tracks_working_set) ++key_versions_[key_index];
   event->set_key(config_.key_prefix + std::to_string(key_index) + "-v" +
                  std::to_string(tracks_working_set ? key_versions_[key_index] : 1));
-  event->set_batch_id(sequence /
-                          (static_cast<uint64_t>(config_.batch_size) *
-                           config_.client_count) +
-                      1);
+  event->set_batch_id(
+      sequence / (static_cast<uint64_t>(config_.batch_size) * config_.client_count) + 1);
 
   const uint64_t new_operation_id = sequence + 1;
   if (is_read) {

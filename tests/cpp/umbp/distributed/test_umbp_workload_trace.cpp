@@ -1,6 +1,28 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: MIT
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <chrono>
@@ -12,8 +34,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-
-#include <unistd.h>
 
 #include "umbp/distributed/benchmark/payload.h"
 #include "umbp/distributed/benchmark/workload_source.h"
@@ -35,8 +55,7 @@ std::string TempPath(const std::string& suffix) {
 ::umbp::benchmark::WorkloadTraceHeader Header() {
   ::umbp::benchmark::WorkloadTraceHeader header;
   header.set_schema_version(kWorkloadTraceSchemaVersion);
-  header.set_time_unit(
-      ::umbp::benchmark::WorkloadTraceHeader::TIME_UNIT_NANOSECONDS);
+  header.set_time_unit(::umbp::benchmark::WorkloadTraceHeader::TIME_UNIT_NANOSECONDS);
   header.set_seed(42);
   (*header.mutable_metadata())["profile"] = "test";
   return header;
@@ -133,15 +152,13 @@ TEST(WorkloadTraceTest, PayloadIsDeterministicAndValidatable) {
   EXPECT_TRUE(ValidateDeterministicPayload("alpha", 17, 99, first.data(), first.size()));
   auto damaged = first;
   damaged[13] ^= 1;
-  EXPECT_FALSE(ValidateDeterministicPayload("alpha", 17, 99, damaged.data(),
-                                            damaged.size()));
+  EXPECT_FALSE(ValidateDeterministicPayload("alpha", 17, 99, damaged.data(), damaged.size()));
 }
 
 TEST(WorkloadTraceTest, SyntheticGenerationIsDeterministicAcrossProfiles) {
-  for (SyntheticProfile profile :
-       {SyntheticProfile::kSequential, SyntheticProfile::kUniform,
-        SyntheticProfile::kHotsetZipf, SyntheticProfile::kReadAfterWrite,
-        SyntheticProfile::kMixed, SyntheticProfile::kCapacityPressure}) {
+  for (SyntheticProfile profile : {SyntheticProfile::kSequential, SyntheticProfile::kUniform,
+                                   SyntheticProfile::kHotsetZipf, SyntheticProfile::kReadAfterWrite,
+                                   SyntheticProfile::kMixed, SyntheticProfile::kCapacityPressure}) {
     SyntheticWorkloadConfig config;
     config.profile = profile;
     config.seed = 123;
@@ -184,11 +201,9 @@ TEST(WorkloadTraceTest, SyntheticKeysAreImmutableAndDependenciesStayOnOneClient)
   while (source.Next(&event)) {
     const size_t version_separator = event.key().find("-v", config.key_prefix.size());
     ASSERT_NE(version_separator, std::string::npos);
-    const uint64_t base_key =
-        std::stoull(event.key().substr(config.key_prefix.size(),
-                                      version_separator - config.key_prefix.size()));
-    EXPECT_EQ(event.client_id(),
-              base_key % config.client_count);
+    const uint64_t base_key = std::stoull(
+        event.key().substr(config.key_prefix.size(), version_separator - config.key_prefix.size()));
+    EXPECT_EQ(event.client_id(), base_key % config.client_count);
     if (event.operation() == ::umbp::benchmark::WorkloadEvent::PUT) {
       EXPECT_TRUE(put_ids.emplace(event.key(), event.operation_id()).second);
     } else {

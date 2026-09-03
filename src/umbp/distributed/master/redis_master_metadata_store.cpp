@@ -118,8 +118,7 @@ std::map<TierType, TierCapacity> DecodeCaps(const std::string& blob) {
       const uint64_t total = std::stoull(tok.substr(c1 + 1, c2 - c1 - 1));
       const uint64_t avail =
           std::stoull(tok.substr(c2 + 1, c3 == std::string::npos ? c3 : c3 - c2 - 1));
-      const uint64_t max_alloc =
-          c3 == std::string::npos ? 0 : std::stoull(tok.substr(c3 + 1));
+      const uint64_t max_alloc = c3 == std::string::npos ? 0 : std::stoull(tok.substr(c3 + 1));
       caps[static_cast<TierType>(tier)] = TierCapacity{total, avail, max_alloc};
     } catch (const std::exception&) {
       // best-effort decode; skip malformed token
@@ -128,8 +127,7 @@ std::map<TierType, TierCapacity> DecodeCaps(const std::string& blob) {
   return caps;
 }
 
-std::string EncodeLogicalCaps(
-    const std::map<std::string, LogicalTierCapacity>& caps) {
+std::string EncodeLogicalCaps(const std::map<std::string, LogicalTierCapacity>& caps) {
   std::string out;
   for (const auto& [name, logical] : caps) {
     out += std::to_string(name.size()) + ':' + name + ':';
@@ -143,19 +141,16 @@ std::string EncodeLogicalCaps(
   return out;
 }
 
-std::map<std::string, LogicalTierCapacity> DecodeLogicalCaps(
-    const std::string& blob) {
+std::map<std::string, LogicalTierCapacity> DecodeLogicalCaps(const std::string& blob) {
   std::map<std::string, LogicalTierCapacity> caps;
   size_t pos = 0;
   while (pos < blob.size()) {
     try {
       const size_t length_end = blob.find(':', pos);
       if (length_end == std::string::npos) break;
-      const size_t name_size =
-          std::stoull(blob.substr(pos, length_end - pos));
+      const size_t name_size = std::stoull(blob.substr(pos, length_end - pos));
       const size_t name_begin = length_end + 1;
-      if (name_size > blob.size() - name_begin ||
-          name_begin + name_size >= blob.size() ||
+      if (name_size > blob.size() - name_begin || name_begin + name_size >= blob.size() ||
           blob[name_begin + name_size] != ':') {
         break;
       }
@@ -176,8 +171,7 @@ std::map<std::string, LogicalTierCapacity> DecodeLogicalCaps(
       }
       pos = record_end + 1;
       LogicalTierCapacity logical;
-      logical.representative_tier =
-          static_cast<TierType>(std::stoi(fields[0]));
+      logical.representative_tier = static_cast<TierType>(std::stoi(fields[0]));
       logical.capacity.total_bytes = std::stoull(fields[1]);
       logical.capacity.available_bytes = std::stoull(fields[2]);
       logical.capacity.max_allocatable_bytes = std::stoull(fields[3]);
@@ -502,8 +496,7 @@ void RedisMasterMetadataStore::UnregisterClient(const std::string& node_id) {
 HeartbeatResult RedisMasterMetadataStore::ApplyHeartbeat(
     const std::string& node_id, uint64_t seq, std::chrono::system_clock::time_point now,
     const std::map<TierType, TierCapacity>& caps, const std::vector<KvEvent>& events,
-    bool is_full_sync,
-    const std::map<std::string, LogicalTierCapacity>& logical_caps) {
+    bool is_full_sync, const std::map<std::string, LogicalTierCapacity>& logical_caps) {
   ScopedStoreOp _op(metrics_, "ApplyHeartbeat");
   RespValue r;
   if (!split_writes()) {
@@ -531,10 +524,10 @@ HeartbeatResult RedisMasterMetadataStore::ApplyHeartbeat(
   } else {
     // Multi-endpoint: control step (seq-CAS + record + alive/peers) only; block
     // events are applied per shard afterwards if this heartbeat is APPLIED.
-    r = control().Eval(redis::kApplyHeartbeatControlLua, {keys_.Node(node_id)},
-                       {keys_.Tag(), node_id, std::to_string(seq), std::to_string(ToEpochMs(now)),
-                        is_full_sync ? "1" : "0", EncodeCaps(caps),
-                        EncodeLogicalCaps(logical_caps)});
+    r = control().Eval(
+        redis::kApplyHeartbeatControlLua, {keys_.Node(node_id)},
+        {keys_.Tag(), node_id, std::to_string(seq), std::to_string(ToEpochMs(now)),
+         is_full_sync ? "1" : "0", EncodeCaps(caps), EncodeLogicalCaps(logical_caps)});
   }
 
   if (r.is_error()) throw std::runtime_error("[RedisStore] ApplyHeartbeat: " + r.str);

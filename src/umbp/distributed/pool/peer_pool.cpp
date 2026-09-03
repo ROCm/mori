@@ -1,6 +1,27 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
 //
 // MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
 #include "umbp/distributed/pool/peer_pool.h"
 
 #include <algorithm>
@@ -39,8 +60,7 @@ PeerPool::PeerPool(BackendRegistry* backends, std::unique_ptr<PoolPolicy> policy
           "PeerPool: a tiered policy requires a TransferEngine to move bytes between "
           "backends");
     }
-    tier_scan_backoff_.assign(tier_graph_->TierCount(),
-                              std::chrono::steady_clock::time_point{});
+    tier_scan_backoff_.assign(tier_graph_->TierCount(), std::chrono::steady_clock::time_point{});
     queued_by_tier_.assign(tier_graph_->TierCount(), 0);
     for (size_t tier = 0; tier < tier_graph_->TierCount(); ++tier) {
       const auto& node = tier_graph_->NodeAt(tier);
@@ -262,8 +282,7 @@ void PeerPool::TransitionWorkerLoop() {
       if (tier_graph_ != nullptr) {
         const auto& tier = tier_graph_->NodeAt(job.source_tier);
         const bool watermark_driven = WatermarkDrivenLocked(job);
-        if (!watermark_driven ||
-            tier_graph_->AtOrAbove(job.source_tier, tier.low_watermark)) {
+        if (!watermark_driven || tier_graph_->AtOrAbove(job.source_tier, tier.low_watermark)) {
           const auto result = RunTransition(lock, job);
           const bool still_pressured =
               watermark_driven && tier_graph_->AtOrAbove(job.source_tier, tier.low_watermark);
@@ -280,8 +299,7 @@ void PeerPool::TransitionWorkerLoop() {
       }
     }
     if (retry) {
-      std::this_thread::sleep_for(
-          std::chrono::milliseconds(uint64_t{1} << job.attempts));
+      std::this_thread::sleep_for(std::chrono::milliseconds(uint64_t{1} << job.attempts));
     }
     {
       std::lock_guard<std::mutex> lock(transition_mutex_);
@@ -292,8 +310,7 @@ void PeerPool::TransitionWorkerLoop() {
         queued_transition_keys_.insert(job.key);
         transition_queue_.push_back(std::move(job));
         transition_cv_.notify_one();
-      } else if (source_tier < queued_by_tier_.size() &&
-                 queued_by_tier_[source_tier] > 0) {
+      } else if (source_tier < queued_by_tier_.size() && queued_by_tier_[source_tier] > 0) {
         --queued_by_tier_[source_tier];
       }
     }
@@ -408,11 +425,9 @@ std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
             const uint64_t slot_id = out[index].allocation.slot_id;
             const auto ttl_ms = out[index].allocation.pending_ttl_ms;
             const auto expires_at =
-                ttl_ms == 0
-                    ? std::chrono::steady_clock::time_point::max()
-                    : std::chrono::steady_clock::now() + std::chrono::milliseconds(ttl_ms);
-            pending_keys_[requests[index].key] =
-                PendingPlacement{backend_id, slot_id, expires_at};
+                ttl_ms == 0 ? std::chrono::steady_clock::time_point::max()
+                            : std::chrono::steady_clock::now() + std::chrono::milliseconds(ttl_ms);
+            pending_keys_[requests[index].key] = PendingPlacement{backend_id, slot_id, expires_at};
             pending_slots_[{backend_id, slot_id}] = requests[index].key;
             break;
           }
@@ -742,18 +757,16 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
       if (metadata_current) placements_[keys[i]] = out[i].backend_id;
       // A concurrent discard may have removed the key entirely. Do not
       // resurrect only its LRU entry from a resolve that started earlier.
-      const bool still_placed =
-          metadata_current || placements_.find(keys[i]) != placements_.end();
+      const bool still_placed = metadata_current || placements_.find(keys[i]) != placements_.end();
       if (still_placed) TouchLocked(keys[i]);
       if (tier_graph_ != nullptr) {
         ++tier_read_hits_[tier_graph_->NameForBackend(out[i].backend_id)];
         const auto source_tier = tier_graph_->TierIndexForBackendId(out[i].backend_id);
         if (metadata_current && source_tier.has_value() &&
-            *source_tier != tier_graph_->EntryTierIndex() &&
-            migrating_keys_.count(keys[i]) == 0 &&
-            !tier_graph_->AtOrAbove(tier_graph_->EntryTierIndex(),
-                                    tier_graph_->NodeAt(tier_graph_->EntryTierIndex())
-                                        .high_watermark) &&
+            *source_tier != tier_graph_->EntryTierIndex() && migrating_keys_.count(keys[i]) == 0 &&
+            !tier_graph_->AtOrAbove(
+                tier_graph_->EntryTierIndex(),
+                tier_graph_->NodeAt(tier_graph_->EntryTierIndex()).high_watermark) &&
             PromoteOnReadLocked(keys[i], *source_tier)) {
           EnqueueTransition(
               {TierTransitionKind::kPromotion, keys[i], out[i].backend_id, *source_tier});
@@ -776,8 +789,7 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
   return out;
 }
 
-std::vector<EvictResult> PeerPool::Evict(const std::vector<std::string>& keys,
-                                         PoolEvictMode mode) {
+std::vector<EvictResult> PeerPool::Evict(const std::vector<std::string>& keys, PoolEvictMode mode) {
   std::unique_lock<std::mutex> operation_lock(operation_mutex_);
   std::vector<EvictResult> out;
   out.reserve(keys.size());
@@ -817,8 +829,8 @@ std::vector<EvictResult> PeerPool::Evict(const std::vector<std::string>& keys,
     }
 
     auto placement = placements_.find(keys[i]);
-    const uint32_t source_id = placement != placements_.end() ? placement->second
-                                                              : FindOwnerLocked(keys[i]);
+    const uint32_t source_id =
+        placement != placements_.end() ? placement->second : FindOwnerLocked(keys[i]);
     if (tier_graph_ == nullptr) continue;
     const auto tier_index = tier_graph_->TierIndexForBackendId(source_id);
     if (!tier_index.has_value()) continue;
@@ -826,8 +838,8 @@ std::vector<EvictResult> PeerPool::Evict(const std::vector<std::string>& keys,
     if (tier.trigger != PoolOffloadTrigger::kOnEvict || tier.offload_to.empty()) {
       continue;
     }
-    auto migrated = RunTransition(
-        operation_lock, {TierTransitionKind::kOffload, keys[i], source_id, *tier_index});
+    auto migrated = RunTransition(operation_lock,
+                                  {TierTransitionKind::kOffload, keys[i], source_id, *tier_index});
     handled[i] = migrated.success;
     out[i].bytes_freed = migrated.bytes_freed;
   }
@@ -898,9 +910,9 @@ std::vector<KvEvent> PeerPool::DrainPendingEvents() {
   const auto all_backends = backends_->All();
   for (auto* backend : all_backends) {
     auto drained = backend->DrainPendingEvents();
-    const std::string logical =
-        tier_graph_ == nullptr ? std::string{}
-                               : tier_graph_->NameForBackend(backends_->BackendId(backend));
+    const std::string logical = tier_graph_ == nullptr
+                                    ? std::string{}
+                                    : tier_graph_->NameForBackend(backends_->BackendId(backend));
     for (auto& event : drained) {
       event.logical_tier = logical;
       auto& state = states[{logical, event.tier, event.key}];
@@ -916,21 +928,17 @@ std::vector<KvEvent> PeerPool::DrainPendingEvents() {
   for (auto& [identity, state] : states) {
     const auto& [logical, tier, key] = identity;
     const bool still_owned =
-        std::any_of(all_backends.begin(), all_backends.end(),
-                    [&](MediumBackend* backend) {
-                      if (backend == nullptr || backend->Tier() != tier ||
-                          !backend->Contains(key)) {
-                        return false;
-                      }
-                      return tier_graph_ == nullptr ||
-                             tier_graph_->NameForBackend(
-                                 backends_->BackendId(backend)) == logical;
-                    });
+        std::any_of(all_backends.begin(), all_backends.end(), [&](MediumBackend* backend) {
+          if (backend == nullptr || backend->Tier() != tier || !backend->Contains(key)) {
+            return false;
+          }
+          return tier_graph_ == nullptr ||
+                 tier_graph_->NameForBackend(backends_->BackendId(backend)) == logical;
+        });
     if (state.add.has_value() && (still_owned || !state.saw_remove)) {
       events.push_back(std::move(*state.add));
     } else if (state.saw_remove && !still_owned) {
-      events.push_back(
-          KvEvent{KvEvent::Kind::REMOVE, key, tier, 0, logical});
+      events.push_back(KvEvent{KvEvent::Kind::REMOVE, key, tier, 0, logical});
     }
   }
   return events;
@@ -942,9 +950,9 @@ std::vector<KvEvent> PeerPool::SnapshotOwnedKeysForFullSync() {
   std::map<std::tuple<std::string, TierType, std::string>, KvEvent> unique;
   for (auto* backend : backends_->All()) {
     auto snapshot = backend->SnapshotOwnedKeysForFullSync();
-    const std::string logical =
-        tier_graph_ == nullptr ? std::string{}
-                               : tier_graph_->NameForBackend(backends_->BackendId(backend));
+    const std::string logical = tier_graph_ == nullptr
+                                    ? std::string{}
+                                    : tier_graph_->NameForBackend(backends_->BackendId(backend));
     for (auto& event : snapshot) {
       event.logical_tier = logical;
       unique[{logical, event.tier, event.key}] = std::move(event);

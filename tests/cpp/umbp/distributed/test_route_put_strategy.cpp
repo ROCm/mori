@@ -86,14 +86,11 @@ TEST(MostAvailableNoneTest, PicksTheRoomiestTierOnANodeRegardlessOfMedium) {
 
 TEST(MostAvailableNoneTest, RoutesOnlyToNamedEntryPool) {
   ConfigurableRoutePutStrategy strategy(Algo::kMostAvailable, Affinity::kNone);
-  auto client = MakeClient(
-      "node-a", "addr-a", {{TierType::DRAM, TierCapacity{100 * GB, 90 * GB}}});
+  auto client = MakeClient("node-a", "addr-a", {{TierType::DRAM, TierCapacity{100 * GB, 90 * GB}}});
   client.logical_tier_capacities["hot"] =
-      LogicalTierCapacity{TierType::HBM, TierCapacity{20 * GB, 10 * GB, 10 * GB},
-                          true};
+      LogicalTierCapacity{TierType::HBM, TierCapacity{20 * GB, 10 * GB, 10 * GB}, true};
   client.logical_tier_capacities["warm"] =
-      LogicalTierCapacity{TierType::DRAM, TierCapacity{80 * GB, 40 * GB, 40 * GB},
-                          false};
+      LogicalTierCapacity{TierType::DRAM, TierCapacity{80 * GB, 40 * GB, 40 * GB}, false};
 
   auto result = SelectOne(strategy, {client}, 4096, {});
   ASSERT_TRUE(result.has_value());
@@ -163,8 +160,7 @@ TEST(MostAvailableNoneTest, ReturnsNulloptWhenBlockTooLarge) {
 TEST(MostAvailableNoneTest, RejectsValueLargerThanAnyBackendInAggregatedTier) {
   ConfigurableRoutePutStrategy strategy(Algo::kMostAvailable, Affinity::kNone);
   std::vector<ClientRecord> clients = {
-      MakeClient("node-a", "addr-a",
-                 {{TierType::DRAM, TierCapacity{20 * GB, 20 * GB, 10 * GB}}}),
+      MakeClient("node-a", "addr-a", {{TierType::DRAM, TierCapacity{20 * GB, 20 * GB, 10 * GB}}}),
   };
 
   EXPECT_FALSE(SelectOne(strategy, clients, 11 * GB, /*exclude=*/{}).has_value());
@@ -174,8 +170,7 @@ TEST(MostAvailableNoneTest, RejectsValueLargerThanAnyBackendInAggregatedTier) {
 TEST(MostAvailableNoneTest, ZeroMaxAllocatablePreservesLegacyCapacitySemantics) {
   ConfigurableRoutePutStrategy strategy(Algo::kMostAvailable, Affinity::kNone);
   std::vector<ClientRecord> clients = {
-      MakeClient("node-a", "addr-a",
-                 {{TierType::DRAM, TierCapacity{20 * GB, 20 * GB}}}),
+      MakeClient("node-a", "addr-a", {{TierType::DRAM, TierCapacity{20 * GB, 20 * GB}}}),
   };
 
   EXPECT_TRUE(SelectOne(strategy, clients, 15 * GB, /*exclude=*/{}).has_value());

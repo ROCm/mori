@@ -129,10 +129,9 @@ void EvictionManager::RunOnce() {
   buckets.reserve(bytes_to_free.size());
   for (const auto& [ntk, _bytes] : bytes_to_free) buckets.push_back(ntk);
 
-  auto candidates_by_bucket =
-      store_.EnumerateEvictionCandidates(buckets, EvictionOrder::kLeastRecentlyAccessed,
-                                         config_.evict_batch_size,
-                                         std::chrono::system_clock::now());
+  auto candidates_by_bucket = store_.EnumerateEvictionCandidates(
+      buckets, EvictionOrder::kLeastRecentlyAccessed, config_.evict_batch_size,
+      std::chrono::system_clock::now());
   if (candidates_by_bucket.empty()) {
     MORI_UMBP_DEBUG("[EvictionManager] No eviction candidates found");
     return;

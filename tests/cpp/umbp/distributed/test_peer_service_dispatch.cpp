@@ -450,10 +450,8 @@ TEST_F(PeerServiceDispatchTest, EvictOfAnAbsentKeyReportsZeroBytes) {
 
 TEST(PeerServiceSameTierDispatch, NamedInstancesAllocateAndCommitIndependently) {
   BackendRegistry registry;
-  ASSERT_TRUE(
-      registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));
-  ASSERT_TRUE(
-      registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
 
   PeerPool pool(&registry, MakeSingleBackendPolicy());
   PeerServiceServer server(pool);

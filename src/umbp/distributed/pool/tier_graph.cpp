@@ -1,6 +1,27 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
 //
 // MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
 
 #include "umbp/distributed/pool/tier_graph.h"
 
@@ -17,9 +38,8 @@ LogicalTierGraph::CompileResult CompileError(std::string error) {
 }
 
 uint64_t SaturatingAdd(uint64_t lhs, uint64_t rhs) {
-  return rhs > std::numeric_limits<uint64_t>::max() - lhs
-             ? std::numeric_limits<uint64_t>::max()
-             : lhs + rhs;
+  return rhs > std::numeric_limits<uint64_t>::max() - lhs ? std::numeric_limits<uint64_t>::max()
+                                                          : lhs + rhs;
 }
 
 }  // namespace
@@ -33,9 +53,8 @@ uint64_t StablePlacementHash(std::string_view key) {
   return hash;
 }
 
-std::vector<uint32_t> WeightedBackendOrder(
-    const std::vector<LogicalTierBackendConfig>& members, const BackendRegistry& backends,
-    std::string_view key) {
+std::vector<uint32_t> WeightedBackendOrder(const std::vector<LogicalTierBackendConfig>& members,
+                                           const BackendRegistry& backends, std::string_view key) {
   struct Candidate {
     uint32_t backend_id;
     uint32_t weight;
@@ -70,10 +89,10 @@ std::vector<uint32_t> WeightedBackendOrder(
   return order;
 }
 
-LogicalTierGraph::LogicalTierGraph(
-    const BackendRegistry& backends, std::vector<Node> nodes,
-    std::vector<std::vector<TierIndex>> upstream,
-    std::unordered_map<uint32_t, TierIndex> tier_by_backend_id, TierIndex entry_tier)
+LogicalTierGraph::LogicalTierGraph(const BackendRegistry& backends, std::vector<Node> nodes,
+                                   std::vector<std::vector<TierIndex>> upstream,
+                                   std::unordered_map<uint32_t, TierIndex> tier_by_backend_id,
+                                   TierIndex entry_tier)
     : backends_(&backends),
       nodes_(std::move(nodes)),
       upstream_(std::move(upstream)),
@@ -125,8 +144,7 @@ LogicalTierGraph::CompileResult LogicalTierGraph::Compile(
 std::optional<LogicalTierGraph::TierIndex> LogicalTierGraph::TierIndexForBackendId(
     uint32_t backend_id) const {
   const auto it = tier_by_backend_id_.find(backend_id);
-  return it == tier_by_backend_id_.end() ? std::nullopt
-                                         : std::optional<TierIndex>{it->second};
+  return it == tier_by_backend_id_.end() ? std::nullopt : std::optional<TierIndex>{it->second};
 }
 
 std::string LogicalTierGraph::NameForBackend(uint32_t backend_id) const {
@@ -146,14 +164,12 @@ std::map<std::string, LogicalTierCapacity> LogicalTierGraph::CapacitySnapshot() 
       if (logical.representative_tier == TierType::UNKNOWN) {
         logical.representative_tier = backend->Tier();
       }
-      logical.capacity.total_bytes =
-          SaturatingAdd(logical.capacity.total_bytes, cap.total_bytes);
+      logical.capacity.total_bytes = SaturatingAdd(logical.capacity.total_bytes, cap.total_bytes);
       logical.capacity.available_bytes =
           SaturatingAdd(logical.capacity.available_bytes, cap.available_bytes);
-      const uint64_t allocatable =
-          cap.max_allocatable_bytes == 0 ? cap.available_bytes
-                                         : std::min(cap.available_bytes,
-                                                    cap.max_allocatable_bytes);
+      const uint64_t allocatable = cap.max_allocatable_bytes == 0
+                                       ? cap.available_bytes
+                                       : std::min(cap.available_bytes, cap.max_allocatable_bytes);
       logical.capacity.max_allocatable_bytes =
           std::max(logical.capacity.max_allocatable_bytes, allocatable);
     }
@@ -163,8 +179,7 @@ std::map<std::string, LogicalTierCapacity> LogicalTierGraph::CapacitySnapshot() 
   TierCapacity entry_pool;
   for (TierIndex tier : ReachableTierOrder(entry_tier_, false, true)) {
     const auto& capacity = snapshot.at(NodeAt(tier).name).capacity;
-    entry_pool.total_bytes =
-        SaturatingAdd(entry_pool.total_bytes, capacity.total_bytes);
+    entry_pool.total_bytes = SaturatingAdd(entry_pool.total_bytes, capacity.total_bytes);
     entry_pool.available_bytes =
         SaturatingAdd(entry_pool.available_bytes, capacity.available_bytes);
     entry_pool.max_allocatable_bytes =
@@ -255,13 +270,13 @@ std::vector<uint32_t> LogicalTierGraph::PutOrderFromTier(std::string_view name,
   return {};
 }
 
-std::vector<uint32_t> LogicalTierGraph::TransitionTargetOrder(
-    TierIndex source, std::string_view key) const {
+std::vector<uint32_t> LogicalTierGraph::TransitionTargetOrder(TierIndex source,
+                                                              std::string_view key) const {
   return BackendOrder(ReachableTierOrder(source, false, false), key);
 }
 
-std::vector<uint32_t> LogicalTierGraph::PromoteTargetOrder(
-    TierIndex source, std::string_view key) const {
+std::vector<uint32_t> LogicalTierGraph::PromoteTargetOrder(TierIndex source,
+                                                           std::string_view key) const {
   return BackendOrder(ReachableTierOrder(source, true, false), key);
 }
 

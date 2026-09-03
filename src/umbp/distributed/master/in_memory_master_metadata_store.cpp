@@ -70,8 +70,7 @@ std::pair<Location*, bool> FindOrInsertLocation(std::vector<Location>& locations
                                                 const std::string& node_id, TierType tier,
                                                 const std::string& logical_tier) {
   for (auto& loc : locations) {
-    if (loc.node_id == node_id && loc.tier == tier &&
-        loc.logical_tier == logical_tier) {
+    if (loc.node_id == node_id && loc.tier == tier && loc.logical_tier == logical_tier) {
       return {&loc, false};
     }
   }
@@ -107,8 +106,7 @@ size_t InMemoryMasterMetadataStore::ApplyAddOrRemoveLocked(
       entry.last_accessed_rep.store(now.time_since_epoch().count(), std::memory_order_release);
       entry.atomic_access_count.store(0, std::memory_order_relaxed);
     }
-    auto [loc, inserted] =
-        FindOrInsertLocation(entry.locations, node_id, ev.tier, ev.logical_tier);
+    auto [loc, inserted] = FindOrInsertLocation(entry.locations, node_id, ev.tier, ev.logical_tier);
     // Idempotent; must run on duplicate ADDs too.
     shard.node_to_keys[node_id].insert(ev.key);
     if (!inserted) {
@@ -126,13 +124,12 @@ size_t InMemoryMasterMetadataStore::ApplyAddOrRemoveLocked(
   if (it == shard.entries.end()) return 0;
   auto& locs = it->second.locations;
   const size_t before = locs.size();
-  locs.erase(
-      std::remove_if(locs.begin(), locs.end(),
-                     [&](const Location& l) {
-                       return l.node_id == node_id && l.tier == ev.tier &&
-                              l.logical_tier == ev.logical_tier;
-                     }),
-      locs.end());
+  locs.erase(std::remove_if(locs.begin(), locs.end(),
+                            [&](const Location& l) {
+                              return l.node_id == node_id && l.tier == ev.tier &&
+                                     l.logical_tier == ev.logical_tier;
+                            }),
+             locs.end());
   if (locs.size() == before) return 0;
   // find(), not operator[]: don't grow an empty bucket for strangers.
   if (!HasLocationForNode(it->second.locations, node_id)) {
@@ -333,8 +330,7 @@ void InMemoryMasterMetadataStore::UnregisterClient(const std::string& node_id) {
 HeartbeatResult InMemoryMasterMetadataStore::ApplyHeartbeat(
     const std::string& node_id, uint64_t seq, std::chrono::system_clock::time_point now,
     const std::map<TierType, TierCapacity>& caps, const std::vector<KvEvent>& events,
-    bool is_full_sync,
-    const std::map<std::string, LogicalTierCapacity>& logical_caps) {
+    bool is_full_sync, const std::map<std::string, LogicalTierCapacity>& logical_caps) {
   // Cross-domain write (approach A), hot path: seq-CAS + client-record update
   // under meta_mutex_, then the block apply AFTER releasing it so heartbeats to
   // different shards apply in parallel (PR #440's win) instead of serializing on

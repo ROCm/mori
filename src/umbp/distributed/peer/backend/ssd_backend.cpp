@@ -112,8 +112,8 @@ bool SsdBackend::Init(MemoryRegistrar* registrar) {
 
   // A bitmap lets a multi-page object reserve one contiguous run while keeping
   // the transfer-visible page size unchanged.
-  const uint32_t usable_pages = static_cast<uint32_t>(
-      std::min<uint64_t>(cfg_.staging_pages, staging_size_ / cfg_.page_size));
+  const uint32_t usable_pages =
+      static_cast<uint32_t>(std::min<uint64_t>(cfg_.staging_pages, staging_size_ / cfg_.page_size));
   staging_page_used_.assign(usable_pages, false);
 
   // Crash-restart leftover: metadata is gone but files may remain, so used
@@ -184,8 +184,8 @@ SsdBackend::StagingSpan SsdBackend::AcquireStagingSpanLocked(uint32_t page_count
 
 void SsdBackend::ReleaseStagingSpanLocked(StagingSpan span) {
   if (span.page_count == 0 || span.first_page >= staging_page_used_.size()) return;
-  const uint32_t end = std::min<uint64_t>(
-      staging_page_used_.size(), static_cast<uint64_t>(span.first_page) + span.page_count);
+  const uint32_t end = std::min<uint64_t>(staging_page_used_.size(),
+                                          static_cast<uint64_t>(span.first_page) + span.page_count);
   for (uint32_t page = span.first_page; page < end; ++page) {
     staging_page_used_[page] = false;
   }
@@ -303,8 +303,7 @@ std::vector<AllocateResult> SsdBackend::BatchAllocate(const std::vector<Allocate
     AllocateResult& out = results[i];
 
     const uint32_t page_count = SizeToPages(req.size, cfg_.page_size);
-    if (page_count == 0 || req.size > ssd_capacity ||
-        page_count > staging_page_used_.size()) {
+    if (page_count == 0 || req.size > ssd_capacity || page_count > staging_page_used_.size()) {
       // The object can never fit this backend's staging arena. This is a shape
       // failure, not transient arena pressure, so another identical peer would
       // not do better.
@@ -326,8 +325,8 @@ std::vector<AllocateResult> SsdBackend::BatchAllocate(const std::vector<Allocate
     }
 
     const uint64_t slot_id = next_slot_id_.fetch_add(1, std::memory_order_relaxed);
-    pending_.emplace(
-        slot_id, PendingSlot{slot_id, req.key, span, req.size, now + cfg_.pending_ttl});
+    pending_.emplace(slot_id,
+                     PendingSlot{slot_id, req.key, span, req.size, now + cfg_.pending_ttl});
 
     out.outcome = AllocateOutcome::kSuccessAllocated;
     out.slot_id = slot_id;
@@ -460,12 +459,12 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
   // successful subset while retries compete for the remainder.  On transient
   // pressure this call therefore publishes kBusy and keeps none of its new
   // reservations.
-  std::vector<size_t> todo;            // keys needing a device read
-  std::vector<uint32_t> page_counts;   // parallel to todo
-  std::vector<StagingSpan> spans;      // parallel to todo
-  std::vector<void*> dsts;             // parallel to todo
-  std::vector<size_t> caps;            // parallel to todo
-  std::vector<std::string> read_keys;  // parallel to todo
+  std::vector<size_t> todo;                        // keys needing a device read
+  std::vector<uint32_t> page_counts;               // parallel to todo
+  std::vector<StagingSpan> spans;                  // parallel to todo
+  std::vector<void*> dsts;                         // parallel to todo
+  std::vector<size_t> caps;                        // parallel to todo
+  std::vector<std::string> read_keys;              // parallel to todo
   std::vector<std::vector<size_t>> result_groups;  // duplicate input indices per device read
   std::unordered_map<std::string, size_t> scheduled;
   todo.reserve(keys.size());
@@ -576,8 +575,7 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
   return results;
 }
 
-bool SsdBackend::AcquireMigrationRead(const std::string& key,
-                                      ResolvedEntry* resolved) {
+bool SsdBackend::AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved) {
   if (resolved == nullptr) return false;
   if (!ssd_->PinForMigration(key)) return false;
   const uint64_t size = ssd_->SizeOf(key);
@@ -599,8 +597,7 @@ bool SsdBackend::AcquireMigrationRead(const std::string& key,
       ssd_->UnpinForMigration(key);
       return false;
     }
-    migration_reads_[key] =
-        ReadLease{span, size, std::chrono::steady_clock::time_point::max()};
+    migration_reads_[key] = ReadLease{span, size, std::chrono::steady_clock::time_point::max()};
   }
   const SsdReadOutcome outcome = ssd_->PrepareRead(
       key, StagingPagePtr(span.first_page), static_cast<size_t>(span.page_count) * cfg_.page_size);

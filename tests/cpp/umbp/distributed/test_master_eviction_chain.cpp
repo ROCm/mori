@@ -2,6 +2,27 @@
 //
 // MIT License
 //
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
 // The master decides what to evict and the peer executes it, and until now the
 // two halves were only tested apart: test_master_evict_strategy covers victim
 // selection given candidates, and test_peer_pool covers PeerPool::Evict given
@@ -43,8 +64,8 @@ constexpr uint64_t kPageSize = 64;
 constexpr auto kNoExpiry = std::chrono::milliseconds(30000);
 constexpr char kNodeId[] = "node-a";
 
-void RegisterPageBackend(BackendRegistry* registry, TransferEngine* engine,
-                         const std::string& name, TierType tier, uint64_t pages) {
+void RegisterPageBackend(BackendRegistry* registry, TransferEngine* engine, const std::string& name,
+                         TierType tier, uint64_t pages) {
   PageBackend::OwnershipConfig ownership;
   ownership.buffer_sizes = {pages * kPageSize};
   auto backend = MakePageBackend(tier, kPageSize, ownership, kNoExpiry, kNoExpiry);
@@ -315,16 +336,16 @@ TEST(MasterEvictionChain, MasterRoundReclaimsTheParkedSourceOfAMovePromotion) {
   request.logical_tier = "cold";
   auto allocation = pool.BatchAllocate({request}).front();
   ASSERT_EQ(allocation.allocation.outcome, AllocateOutcome::kSuccessAllocated);
-  ASSERT_TRUE(pool.BatchCommit({PoolCommitRequest{
-                                   {allocation.backend_id, allocation.allocation.slot_id},
-                                   "moved"}})
-                  .front()
-                  .commit.success);
+  ASSERT_TRUE(
+      pool.BatchCommit(
+              {PoolCommitRequest{{allocation.backend_id, allocation.allocation.slot_id}, "moved"}})
+          .front()
+          .commit.success);
   ASSERT_TRUE(registry.Get("cold")->Contains("moved"));
 
   ASSERT_TRUE(pool.BatchResolve({"moved"}, false).front().resolved.found);
-  ASSERT_TRUE(WaitFor([&] { return registry.Get("hot")->Contains("moved"); },
-                      std::chrono::seconds(2)))
+  ASSERT_TRUE(
+      WaitFor([&] { return registry.Get("hot")->Contains("moved"); }, std::chrono::seconds(2)))
       << "promotion never reached the hot tier";
   // The source is still there: this is the deferral, not a failure.
   EXPECT_TRUE(registry.Get("cold")->Contains("moved"))
@@ -336,8 +357,8 @@ TEST(MasterEvictionChain, MasterRoundReclaimsTheParkedSourceOfAMovePromotion) {
   PoolDispatcher dispatcher(&pool);
   EvictionManager manager(store, OneSecondRounds(), &dispatcher);
   manager.Start();
-  const bool reclaimed = WaitFor([&] { return !registry.Get("cold")->Contains("moved"); },
-                                 std::chrono::seconds(8));
+  const bool reclaimed =
+      WaitFor([&] { return !registry.Get("cold")->Contains("moved"); }, std::chrono::seconds(8));
   manager.Stop();
 
   EXPECT_TRUE(reclaimed) << "the parked source outlived a master eviction round that named it";
@@ -469,9 +490,8 @@ TEST(MasterEvictionChain, ParkedMoveSourceIsNamedLastAmongColderKeys) {
   PoolDispatcher dispatcher(&pool);
   EvictionManager manager(store, OneSecondRounds(), &dispatcher);
   manager.Start();
-  const bool dispatched =
-      WaitFor([&] { return dispatcher.Dispatched().size() >= colder.size(); },
-              std::chrono::seconds(8));
+  const bool dispatched = WaitFor([&] { return dispatcher.Dispatched().size() >= colder.size(); },
+                                  std::chrono::seconds(8));
   manager.Stop();
 
   ASSERT_TRUE(dispatched) << "master never named the colder keys";
