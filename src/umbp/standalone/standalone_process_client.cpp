@@ -272,6 +272,11 @@ void StandaloneProcessClient::MaybeAutoStart() {
 bool StandaloneProcessClient::OffsetFor(uintptr_t ptr, size_t size, uint64_t* offset,
                                         uint64_t* region_base) const {
   std::lock_guard<std::mutex> lock(registration_mu_);
+  return OffsetForLocked(ptr, size, offset, region_base);
+}
+
+bool StandaloneProcessClient::OffsetForLocked(uintptr_t ptr, size_t size, uint64_t* offset,
+                                              uint64_t* region_base) const {
   for (const auto& region : regions_) {
     if (ptr < region.base) continue;
     uintptr_t rel = ptr - region.base;
@@ -436,18 +441,21 @@ std::vector<bool> StandaloneProcessClient::BatchGetRanges(
 
   ::umbp::BatchRangeDataRequest req;
   req.set_client_id(ClientId());
-  for (size_t i = 0; i < keys.size(); ++i) {
-    if (dsts[i].size() > std::numeric_limits<uint32_t>::max()) return failed;
-    req.add_keys(keys[i]);
-    req.add_range_counts(static_cast<uint32_t>(dsts[i].size()));
-    for (size_t j = 0; j < dsts[i].size(); ++j) {
-      uint64_t shm_offset = 0;
-      uint64_t region_base = 0;
-      if (!OffsetFor(dsts[i][j], sizes[i][j], &shm_offset, &region_base)) return failed;
-      req.add_shm_offsets(shm_offset);
-      req.add_region_bases(region_base);
-      req.add_sizes(sizes[i][j]);
-      req.add_object_offsets(src_offsets[i][j]);
+  {
+    std::lock_guard<std::mutex> registration_lock(registration_mu_);
+    for (size_t i = 0; i < keys.size(); ++i) {
+      if (dsts[i].size() > std::numeric_limits<uint32_t>::max()) return failed;
+      req.add_keys(keys[i]);
+      req.add_range_counts(static_cast<uint32_t>(dsts[i].size()));
+      for (size_t j = 0; j < dsts[i].size(); ++j) {
+        uint64_t shm_offset = 0;
+        uint64_t region_base = 0;
+        if (!OffsetForLocked(dsts[i][j], sizes[i][j], &shm_offset, &region_base)) return failed;
+        req.add_shm_offsets(shm_offset);
+        req.add_region_bases(region_base);
+        req.add_sizes(sizes[i][j]);
+        req.add_object_offsets(src_offsets[i][j]);
+      }
     }
   }
 
@@ -472,19 +480,22 @@ std::vector<bool> StandaloneProcessClient::BatchPutRanges(
 
   ::umbp::BatchRangeDataRequest req;
   req.set_client_id(ClientId());
-  for (size_t i = 0; i < keys.size(); ++i) {
-    if (srcs[i].size() > std::numeric_limits<uint32_t>::max()) return failed;
-    req.add_keys(keys[i]);
-    req.add_object_sizes(object_sizes[i]);
-    req.add_range_counts(static_cast<uint32_t>(srcs[i].size()));
-    for (size_t j = 0; j < srcs[i].size(); ++j) {
-      uint64_t shm_offset = 0;
-      uint64_t region_base = 0;
-      if (!OffsetFor(srcs[i][j], sizes[i][j], &shm_offset, &region_base)) return failed;
-      req.add_shm_offsets(shm_offset);
-      req.add_region_bases(region_base);
-      req.add_sizes(sizes[i][j]);
-      req.add_object_offsets(dst_offsets[i][j]);
+  {
+    std::lock_guard<std::mutex> registration_lock(registration_mu_);
+    for (size_t i = 0; i < keys.size(); ++i) {
+      if (srcs[i].size() > std::numeric_limits<uint32_t>::max()) return failed;
+      req.add_keys(keys[i]);
+      req.add_object_sizes(object_sizes[i]);
+      req.add_range_counts(static_cast<uint32_t>(srcs[i].size()));
+      for (size_t j = 0; j < srcs[i].size(); ++j) {
+        uint64_t shm_offset = 0;
+        uint64_t region_base = 0;
+        if (!OffsetForLocked(srcs[i][j], sizes[i][j], &shm_offset, &region_base)) return failed;
+        req.add_shm_offsets(shm_offset);
+        req.add_region_bases(region_base);
+        req.add_sizes(sizes[i][j]);
+        req.add_object_offsets(dst_offsets[i][j]);
+      }
     }
   }
 

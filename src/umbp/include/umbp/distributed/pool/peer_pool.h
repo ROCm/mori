@@ -7,10 +7,12 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -151,14 +153,23 @@ class PeerPool {
   TransferEngine* transfer_engine_;
   std::shared_ptr<const LogicalTierGraph> tier_graph_;
   TierTransitionExecutor transition_executor_;
+  // Only watermark-driven offload consumes recency order. On-evict policies
+  // name their victim explicitly, and non-tiered pools never read the LRU.
+  bool track_access_order_ = false;
 
+  // Resolve dispatch deliberately drops operation_mutex_ while thread-safe
+  // backends do their work. ClearLocal takes this exclusively so it cannot
+  // invalidate an SSD staging result while a resolve is between its plan and
+  // publish phases.
+  mutable std::shared_mutex lifecycle_mutex_;
   // Serializes policy decisions with backend lifecycle operations. The first
-  // Pool favors correctness over concurrent dispatch; later policies can shard
-  // this by key without changing the public interface.
+  // Pool still uses one metadata lock, but slow resolve dispatch does not hold
+  // it; later policies can shard the protected state by key without changing
+  // the public interface.
   mutable std::mutex operation_mutex_;
-  // Ordered so watermark offload can walk candidates in key order without
-  // materializing and sorting every placement first.
-  std::map<std::string, uint32_t> placements_;
+  // Every use is a point lookup, insert or erase. Keeping this unordered avoids
+  // string comparisons in BatchResolve's publish critical section.
+  std::unordered_map<std::string, uint32_t> placements_;
   // A migration may install its target while an independent read lease delays
   // source deletion. Eviction retries must drain only that source, never fan
   // out and delete the durable target.
@@ -170,22 +181,23 @@ class PeerPool {
   std::condition_variable transition_idle_cv_;
   std::unordered_map<std::string, PendingPlacement> pending_keys_;
   std::map<std::pair<uint32_t, uint64_t>, std::string> pending_slots_;
-  std::unordered_map<std::string, uint64_t> last_access_;
+  std::unordered_map<std::string, std::list<std::string>::iterator> last_access_;
   // Reads served for a key from a tier whose trigger is kOnHits. Separate from
-  // last_access_, which is an LRU stamp and carries no count. Cleared when the
+  // last_access_, which is an LRU position and carries no count. Cleared when the
   // promotion is queued and whenever the key leaves the access index, so it
   // cannot outlive the key it counts for.
   std::unordered_map<std::string, uint32_t> promote_hit_counts_;
-  // Reverse index of last_access_, so the least recently used key is the first
-  // element rather than the result of sorting every placement.
-  std::map<uint64_t, std::string> access_order_;
-  uint64_t access_clock_ = 0;
+  // Hottest key is at the front. Stable list iterators let a touch splice an
+  // existing key without allocating a tree node or copying the key.
+  std::list<std::string> access_order_;
   // Earliest next scan per tier, moved forward only when a scan found nothing
   // to queue. A pressured tier with no candidates must not make every commit
   // batch pay for another walk.
   std::vector<std::chrono::steady_clock::time_point> tier_scan_backoff_;
   TierTransitionMetrics transition_metrics_;
   std::map<std::string, uint64_t> tier_read_hits_;
+  // Invalidates a resolve plan if a clear completed while it was dispatched.
+  uint64_t clear_epoch_ = 0;
 
   std::mutex transition_mutex_;
   std::condition_variable transition_cv_;

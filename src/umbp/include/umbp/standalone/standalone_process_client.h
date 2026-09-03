@@ -99,6 +99,11 @@ class StandaloneProcessClient : public IUMBPClient {
   // Resolves `ptr` against the registered host regions. On success writes the
   // region-relative `offset` and the matched region's worker VA `region_base`.
   bool OffsetFor(uintptr_t ptr, size_t size, uint64_t* offset, uint64_t* region_base) const;
+  // The batch paths translate one pointer per RANGE -- a 1023-key ranged get
+  // carries roughly 5k of them -- so they take registration_mu_ once for the
+  // whole request and call this instead of a lock round trip per range.
+  bool OffsetForLocked(uintptr_t ptr, size_t size, uint64_t* offset,
+                       uint64_t* region_base) const;
   // Not const: a successful Ping is where the server's backend mode and ranged
   // capability become known, and they are cached on the client.
   bool WaitReady(int timeout_ms);
