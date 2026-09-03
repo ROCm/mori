@@ -557,7 +557,11 @@ jobs:
             $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE ${{ matrix.base_image }} \
               chown -R \$(id -u):\$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           "
-          rsync -az --exclude='.git' \
+          # --delete: node2 gets no checkout, so without it the workspace only ever
+          # accumulates. A second run left two amd_mori-*.whl in _wheels, the glob
+          # below then handed pip two versions of the same package, and pip bailed
+          # out with ResolutionImpossible. Excluded paths (.git) are not deleted.
+          rsync -az --delete --exclude='.git' \
             -e "ssh $SSH_OPTS -p $NODE2_PORT" \
             $GITHUB_WORKSPACE/ \
             $(whoami)@$NODE2_HOST:$GITHUB_WORKSPACE/
@@ -578,19 +582,28 @@ jobs:
               git config --global --add safe.directory $GITHUB_WORKSPACE
           "
 
+      # set -e plus the import check: bash -c returns only the last command's
+      # status, so a failed wheel install used to be masked by the pip install
+      # that followed it. The step went green with no mori installed and the
+      # benchmark below then hung until its 600s timeout instead of reporting the
+      # ModuleNotFoundError.
       - name: Install wheel (node1)
         run: |
           $CT exec $CONTAINER bash -c "
+            set -e
             pip install $GITHUB_WORKSPACE/_wheels/amd_mori-*.whl
             pip install prettytable
+            python3 -c 'import mori; print(\"mori \" + mori.__version__ + \" imported OK\")'
           "
 
       - name: Install wheel (node2)
         run: |
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
             "$CT exec $CONTAINER bash -c '
+              set -e
               pip install $GITHUB_WORKSPACE/_wheels/amd_mori-*.whl
               pip install prettytable
+              python3 -c \"import mori; print(\\\"mori \\\" + mori.__version__ + \\\" imported OK\\\")\"
             '"
 
       - name: MORI-IO internode write sweep
