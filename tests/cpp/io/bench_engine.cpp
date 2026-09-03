@@ -921,6 +921,11 @@ void WritePerfRecords(const Args& a, const std::vector<SweepResult>& rows) {
   int fd = fileno(fh);
   if (fd >= 0) flock(fd, LOCK_EX);
   std::fputs(payload.str().c_str(), fh);
+  // Flush the FILE* buffer to the fd while the lock is still held. fputs only
+  // fills the stdio buffer; the actual write() can otherwise be deferred to
+  // fclose() below, after the unlock, letting another initiator's payload
+  // interleave mid-line. build_report.py then silently drops the mangled line.
+  std::fflush(fh);
   if (fd >= 0) flock(fd, LOCK_UN);
   std::fclose(fh);
 }
@@ -1242,11 +1247,6 @@ int RunDistributed(const Args& a, int localRank) {
     std::fflush(stdout);
   }
 
-  // Perf report: each initiator appends its own rows (matches the Python bench's
-  // per-rank _emit_io_perf; build_report.py dedups by op/backend/msg/batch).
-  // No-op unless MORI_PERF_OUT is set.
-  if (isInitiator) WritePerfRecords(a, mine);
-
   // Correctness check on the last sweep point, matching the Python benchmark's
   // always-on validation. Runs after the timed region so it cannot perturb the
   // reported numbers.
@@ -1254,6 +1254,24 @@ int RunDistributed(const Args& a, int localRank) {
   const bool valid = ValidateTransfer(rdv, buf, last.first, last.second,
                                       a.enable_batch_transfer && last.second > 1,
                                       a.batch_contiguous, isInitiator, !a.skip_validate, label);
+
+  // Aggregate every rank's validity before publishing perf: allgather the flag
+  // (a world-wide collective, so all ranks call it in the same order) and let
+  // only rank 0 write. Two reasons this is gated on globalRank == 0 AND allValid:
+  //  - one deterministic writer: isInitiator is true in all initiator processes,
+  //    so writing per-initiator appends identical-key rows that build_report.py
+  //    dedups by scheduling order rather than by policy.
+  //  - never publish a failed run: the nightly workflow uploads the JSONL with
+  //    if: always(), so a corrupt-but-completed transfer must not land a row.
+  const char myFlag = valid ? 1 : 0;
+  const auto flags = rdv.AllgatherBlobs(std::string(1, myFlag));
+  bool allValid = true;
+  for (const auto& f : flags)
+    if (f.size() == 1 && f[0] == 0) allValid = false;
+
+  // No-op unless MORI_PERF_OUT is set.
+  if (globalRank == 0 && allValid) WritePerfRecords(a, mine);
+
   return valid ? 0 : 1;
 }
 
@@ -1308,10 +1326,6 @@ int RunXgmiSingleProcess(const Args& a) {
   std::cout << "XGMI single-process: GPU" << src << " -> GPU" << dst << std::endl;
   std::cout << "MsgSize(B)  Batch  Iters  AvgBW(GB/s)  AvgLat(us)  TotalDur(us)" << std::endl;
   const auto results = RunSweep(a, engine, srcBuf.Desc(), dstBuf.Desc(), plan, "");
-  // Emit perf records here too: this path returns before the distributed writer,
-  // and the equivalent Python XGMI mode records perf. No-op unless MORI_PERF_OUT
-  // is set.
-  WritePerfRecords(a, results);
 
   // Both buffers are local, so the checksums compare directly -- no exchange.
   const auto& last = plan.back();
@@ -1321,7 +1335,15 @@ int RunXgmiSingleProcess(const Args& a) {
                                       a.batch_contiguous, wanted);
   const auto peer = TransferChecksums(dstBuf.Data(), last.first, last.second, batched,
                                       a.batch_contiguous, wanted);
-  return CompareChecksums(mine, peer, last.first, last.second, "") ? 0 : 1;
+  const bool valid = CompareChecksums(mine, peer, last.first, last.second, "");
+
+  // Publish perf only after validation succeeds, matching the distributed path:
+  // the nightly workflow uploads the JSONL with if: always(), so a
+  // corrupt-but-completed transfer must not land a row. No-op unless
+  // MORI_PERF_OUT is set.
+  if (valid) WritePerfRecords(a, results);
+
+  return valid ? 0 : 1;
 }
 
 // ------------------------------ main ---------------------------------------
