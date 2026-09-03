@@ -146,7 +146,7 @@ std::string FormatPlanInfo(unsigned grid, unsigned block, unsigned sharedBytes,
 }  // namespace mori
 
 // ===========================================================================
-// C ABI — ten symbols, the same for every kernel. ctypes rather than pybind11: this
+// C ABI — eleven symbols, the same for every kernel. ctypes rather than pybind11: this
 // carries only pointers and scalars, and it keeps torch out of every header on
 // this side (MORI_JIT_V2_DESIGN §3.5).
 // ===========================================================================
@@ -280,6 +280,39 @@ MORI_JIT_API int mori_jit_plan_launch(void* plan, const void* argBuf, int argSiz
     SetPlanError(e.what());
     return -1;
   }
+}
+
+// Launch several plans that share one argument buffer, in order, with a single
+// crossing of this ABI. The EP internode sequence is N kernels (2 for dispatch,
+// 4 for combine) over one EpInterNodeCcoArgs -- all eight passes publish the same
+// args schema -- so the caller fills the struct once and hands the whole run
+// here. That collapses N ctypes crossings and N Python arg-marshals into one; the
+// N hipModuleLaunchKernel calls still happen, one per plan, on the same stream.
+// On failure the plan index is folded into the error so a fault is attributable.
+MORI_JIT_API int mori_jit_plan_launch_multi(void* const* plans, int nplans, const void* argBuf,
+                                            int argSize, void* stream) {
+  if (nplans < 0) {
+    SetPlanError("negative plan count");
+    return -1;
+  }
+  if (nplans > 0 && !plans) {
+    SetPlanError("null plans array");
+    return -1;
+  }
+  for (int i = 0; i < nplans; ++i) {
+    auto* h = static_cast<PlanHandle*>(plans[i]);
+    if (!h) {
+      SetPlanError("null plan at index " + std::to_string(i));
+      return -1;
+    }
+    try {
+      h->vt->launch(h->impl, argBuf, static_cast<size_t>(argSize), stream);
+    } catch (const std::exception& e) {
+      SetPlanError("plan " + std::to_string(i) + ": " + e.what());
+      return -1;
+    }
+  }
+  return 0;
 }
 
 // Fills `buf` with "key=value\n..." and returns the number of bytes the full
