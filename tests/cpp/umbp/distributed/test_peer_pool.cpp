@@ -1,6 +1,27 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
 //
 // MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
 #include <gtest/gtest.h>
 
 #include <chrono>
@@ -35,9 +56,8 @@ PoolPlacementRequest PutRequest(std::string key, std::string backend_name = {}) 
 constexpr auto kNoExpiry = std::chrono::milliseconds(30000);
 
 // A page backend the tier tests can move real bytes through.
-void RegisterPageBackend(BackendRegistry* registry, TransferEngine* engine,
-                         const std::string& name, TierType tier, uint64_t page_size,
-                         uint64_t pages,
+void RegisterPageBackend(BackendRegistry* registry, TransferEngine* engine, const std::string& name,
+                         TierType tier, uint64_t page_size, uint64_t pages,
                          std::chrono::milliseconds read_lease_ttl = kNoExpiry) {
   PageBackend::OwnershipConfig ownership;
   ownership.buffer_sizes = {pages * page_size};
@@ -74,8 +94,7 @@ PoolAllocateResult CommitKey(PeerPool* pool, const std::string& key,
   auto allocation = pool->BatchAllocate({request}).front();
   EXPECT_EQ(allocation.allocation.outcome, AllocateOutcome::kSuccessAllocated) << key;
   EXPECT_TRUE(pool->BatchCommit({PoolCommitRequest{
-                                     {allocation.backend_id, allocation.allocation.slot_id},
-                                     key}})
+                                    {allocation.backend_id, allocation.allocation.slot_id}, key}})
                   .front()
                   .commit.success)
       << key;
@@ -84,8 +103,7 @@ PoolAllocateResult CommitKey(PeerPool* pool, const std::string& key,
 
 // Transitions run on a worker thread, so arrival is observed rather than
 // awaited.
-bool WaitForKey(BackendRegistry* registry, const std::string& backend,
-                const std::string& key) {
+bool WaitForKey(BackendRegistry* registry, const std::string& backend, const std::string& key) {
   for (int attempt = 0; attempt < 100 && !registry->Get(backend)->Contains(key); ++attempt) {
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   }
@@ -96,8 +114,7 @@ class NoSpaceBackend final : public MockBackend {
  public:
   explicit NoSpaceBackend(TierType tier) : MockBackend(tier) {}
 
-  std::vector<AllocateResult> BatchAllocate(
-      const std::vector<AllocateRequest>& entries) override {
+  std::vector<AllocateResult> BatchAllocate(const std::vector<AllocateRequest>& entries) override {
     std::vector<AllocateResult> results(entries.size());
     for (auto& result : results) result.outcome = AllocateOutcome::kFailedNoSpace;
     return results;
@@ -108,9 +125,9 @@ class BusyResolveBackend final : public MockBackend {
  public:
   explicit BusyResolveBackend(TierType tier) : MockBackend(tier) {}
 
-  std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
-                                          bool include_descs) override {
-    if (!busy_) return MockBackend::BatchResolve(keys, include_descs);
+  std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool include_descs,
+                                          bool allow_file_refs = false) override {
+    if (!busy_) return MockBackend::BatchResolve(keys, include_descs, allow_file_refs);
     std::vector<ResolvedEntry> results(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
       if (Contains(keys[i])) results[i].outcome = ResolveOutcome::kBusy;
@@ -128,11 +145,9 @@ class BusyResolveBackend final : public MockBackend {
 // transition performs, so a test can observe the pool while bytes are moving.
 class BlockingAllocateBackend final : public MockBackend {
  public:
-  BlockingAllocateBackend(TierType tier, uint64_t page_size)
-      : MockBackend(tier, page_size) {}
+  BlockingAllocateBackend(TierType tier, uint64_t page_size) : MockBackend(tier, page_size) {}
 
-  std::vector<AllocateResult> BatchAllocate(
-      const std::vector<AllocateRequest>& entries) override {
+  std::vector<AllocateResult> BatchAllocate(const std::vector<AllocateRequest>& entries) override {
     {
       std::lock_guard<std::mutex> lock(mutex_);
       entered_ = true;
@@ -169,10 +184,8 @@ class BlockingAllocateBackend final : public MockBackend {
 
 TEST(PeerPool, DefaultPolicyPreservesTierOnlySelection) {
   BackendRegistry registry;
-  ASSERT_TRUE(
-      registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));
-  ASSERT_TRUE(
-      registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
   PeerPool pool(&registry, MakeSingleBackendPolicy());
 
   auto allocated = pool.BatchAllocate({PutRequest("k")}).front();
@@ -201,10 +214,8 @@ TEST(PeerPool, PreservesBusyOwnerInsteadOfTurningItIntoAMiss) {
 
 TEST(PeerPool, NamedBackendCommitBuildsLogicalPlacement) {
   BackendRegistry registry;
-  ASSERT_TRUE(
-      registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));
-  ASSERT_TRUE(
-      registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
   PeerPool pool(&registry, MakeSingleBackendPolicy());
 
   auto allocated = pool.BatchAllocate({PutRequest("k", "dram_b")}).front();
@@ -238,10 +249,8 @@ TEST(PeerPool, NamedBackendCommitBuildsLogicalPlacement) {
 
 TEST(PeerPool, ResolveFallbackRepairsPlacementIndex) {
   BackendRegistry registry;
-  ASSERT_TRUE(
-      registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));
-  ASSERT_TRUE(
-      registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
   PeerPool pool(&registry, MakeSingleBackendPolicy());
 
   auto* second = registry.Get("dram_b");
@@ -257,10 +266,8 @@ TEST(PeerPool, ResolveFallbackRepairsPlacementIndex) {
 
 TEST(PeerPool, ColdIndexDoesNotDuplicatePersistentKey) {
   BackendRegistry registry;
-  ASSERT_TRUE(
-      registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));
-  ASSERT_TRUE(
-      registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
   auto* second = registry.Get("dram_b");
   auto physical = second->BatchAllocate({AllocateRequest{"persistent", 32}}).front();
   ASSERT_TRUE(second->BatchCommit({CommitRequest{physical.slot_id, "persistent"}}).front().success);
@@ -274,8 +281,7 @@ TEST(PeerPool, ColdIndexDoesNotDuplicatePersistentKey) {
 
 TEST(PeerPool, ClearDropsPhysicalAndLogicalState) {
   BackendRegistry registry;
-  ASSERT_TRUE(
-      registry.Register("dram", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("dram", std::make_unique<MockBackend>(TierType::DRAM)));
   PeerPool pool(&registry, MakeSingleBackendPolicy());
 
   auto allocated = pool.BatchAllocate({PutRequest("k")}).front();
@@ -292,10 +298,8 @@ TEST(PeerPool, ClearDropsPhysicalAndLogicalState) {
 
 TEST(PeerPool, BatchResultsRemainPositionalAcrossBackends) {
   BackendRegistry registry;
-  ASSERT_TRUE(
-      registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));
-  ASSERT_TRUE(
-      registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
   PeerPool pool(&registry, MakeSingleBackendPolicy());
 
   auto results = pool.BatchAllocate(
@@ -310,22 +314,17 @@ TEST(PeerPool, BatchResultsRemainPositionalAcrossBackends) {
 
 TEST(PeerPool, ReservesDuplicateKeysUntilCommitOrAbort) {
   BackendRegistry registry;
-  ASSERT_TRUE(
-      registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));
-  ASSERT_TRUE(
-      registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
   PeerPool pool(&registry, MakeSingleBackendPolicy());
 
-  auto results =
-      pool.BatchAllocate({PutRequest("same", "dram_a"), PutRequest("same", "dram_b")});
+  auto results = pool.BatchAllocate({PutRequest("same", "dram_a"), PutRequest("same", "dram_b")});
   ASSERT_EQ(results.size(), 2u);
   EXPECT_EQ(results[0].allocation.outcome, AllocateOutcome::kSuccessAllocated);
   EXPECT_EQ(results[1].allocation.outcome, AllocateOutcome::kFailed);
 
-  ASSERT_TRUE(pool
-                  .BatchAbort(
-                      {PoolSlotRef{results[0].backend_id, results[0].allocation.slot_id}})
-                  .front());
+  ASSERT_TRUE(
+      pool.BatchAbort({PoolSlotRef{results[0].backend_id, results[0].allocation.slot_id}}).front());
   auto retried = pool.BatchAllocate({PutRequest("same", "dram_b")}).front();
   EXPECT_EQ(retried.allocation.outcome, AllocateOutcome::kSuccessAllocated);
   EXPECT_EQ(retried.backend_id, registry.BackendId(registry.Get("dram_b")));
@@ -333,8 +332,7 @@ TEST(PeerPool, ReservesDuplicateKeysUntilCommitOrAbort) {
 
 TEST(PeerPool, CommitMustMatchReservedSlotAndKey) {
   BackendRegistry registry;
-  ASSERT_TRUE(
-      registry.Register("dram", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("dram", std::make_unique<MockBackend>(TierType::DRAM)));
   PeerPool pool(&registry, MakeSingleBackendPolicy());
 
   auto allocated = pool.BatchAllocate({PutRequest("reserved")}).front();
@@ -346,17 +344,14 @@ TEST(PeerPool, CommitMustMatchReservedSlotAndKey) {
   PoolCommitRequest correct = wrong;
   correct.key = "reserved";
   EXPECT_TRUE(pool.BatchCommit({correct}).front().commit.success);
-  EXPECT_EQ(pool.PlacementBackend("reserved"),
-            std::optional<uint32_t>{allocated.backend_id});
+  EXPECT_EQ(pool.PlacementBackend("reserved"), std::optional<uint32_t>{allocated.backend_id});
   EXPECT_FALSE(pool.PlacementBackend("different").has_value());
 }
 
 TEST(PeerPool, StalePlacementDoesNotSuppressNewAllocation) {
   BackendRegistry registry;
-  ASSERT_TRUE(
-      registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));
-  ASSERT_TRUE(
-      registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
   PeerPool pool(&registry, MakeSingleBackendPolicy());
 
   auto allocated = pool.BatchAllocate({PutRequest("stale", "dram_a")}).front();
@@ -375,14 +370,10 @@ TEST(PeerPool, StalePlacementDoesNotSuppressNewAllocation) {
 
 TEST(WeightedPlacementPolicy, DistributesDeterministicallyWithinRequestedTier) {
   BackendRegistry registry;
-  ASSERT_TRUE(
-      registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));
-  ASSERT_TRUE(
-      registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
-  ASSERT_TRUE(
-      registry.Register("ssd_a", std::make_unique<MockBackend>(TierType::SSD)));
-  auto policy = MakeWeightedPlacementPolicy(
-      {{"dram_a", 3}, {"dram_b", 7}, {"ssd_a", 100}});
+  ASSERT_TRUE(registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("ssd_a", std::make_unique<MockBackend>(TierType::SSD)));
+  auto policy = MakeWeightedPlacementPolicy({{"dram_a", 3}, {"dram_b", 7}, {"ssd_a", 100}});
 
   const uint32_t dram_a = registry.BackendId(registry.Get("dram_a"));
   const uint32_t dram_b = registry.BackendId(registry.Get("dram_b"));
@@ -408,10 +399,8 @@ TEST(WeightedPlacementPolicy, DistributesDeterministicallyWithinRequestedTier) {
 
 TEST(WeightedPlacementPolicy, ExplicitBackendNameOverridesWeightedSelection) {
   BackendRegistry registry;
-  ASSERT_TRUE(
-      registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));
-  ASSERT_TRUE(
-      registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
   auto policy = MakeWeightedPlacementPolicy({{"dram_a", 1}, {"dram_b", 100}});
 
   auto order = policy->PutOrder(registry, PutRequest("forced", "dram_a"));
@@ -421,12 +410,9 @@ TEST(WeightedPlacementPolicy, ExplicitBackendNameOverridesWeightedSelection) {
 
 TEST(PeerPool, WeightedPolicyPlacesNewKeysOnMultipleBackends) {
   BackendRegistry registry;
-  ASSERT_TRUE(
-      registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));
-  ASSERT_TRUE(
-      registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
-  PeerPool pool(
-      &registry, MakeWeightedPlacementPolicy({{"dram_a", 1}, {"dram_b", 1}}));
+  ASSERT_TRUE(registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
+  PeerPool pool(&registry, MakeWeightedPlacementPolicy({{"dram_a", 1}, {"dram_b", 1}}));
 
   std::vector<PoolPlacementRequest> requests;
   for (size_t i = 0; i < 128; ++i) {
@@ -452,10 +438,8 @@ TEST(PeerPool, WeightedPolicyPlacesNewKeysOnMultipleBackends) {
 
 TEST(PeerPool, WeightedPolicyFallsBackWhenPrimaryHasNoSpace) {
   BackendRegistry registry;
-  ASSERT_TRUE(
-      registry.Register("dram_a", std::make_unique<NoSpaceBackend>(TierType::DRAM)));
-  ASSERT_TRUE(
-      registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("dram_a", std::make_unique<NoSpaceBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
   auto policy = MakeWeightedPlacementPolicy({{"dram_a", 1}, {"dram_b", 1}});
 
   PoolPlacementRequest request;
@@ -480,8 +464,7 @@ TEST(PeerPool, WeightedPolicyFallsBackWhenPrimaryHasNoSpace) {
 
 TEST(TieredPlacementPolicy, RejectsTierGraphWithoutTransferEngine) {
   BackendRegistry registry;
-  ASSERT_TRUE(
-      registry.Register("only", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("only", std::make_unique<MockBackend>(TierType::DRAM)));
   auto compiled = LogicalTierGraph::Compile({LogicalTierConfig{{{"only", 1}}}}, registry);
   ASSERT_TRUE(compiled.ok()) << compiled.error;
   EXPECT_THROW(PeerPool(&registry, MakeTieredPlacementPolicy(compiled.graph)),
@@ -491,12 +474,9 @@ TEST(TieredPlacementPolicy, RejectsTierGraphWithoutTransferEngine) {
 TEST(TieredPlacementPolicy, IgnoresPhysicalRouteAndSpillsToConfiguredTarget) {
   LocalCopyEngine engine;
   BackendRegistry registry;
-  ASSERT_TRUE(
-      registry.Register("hot", std::make_unique<NoSpaceBackend>(TierType::HBM)));
-  ASSERT_TRUE(
-      registry.Register("cold", std::make_unique<MockBackend>(TierType::SSD)));
-  auto compiled =
-      LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
+  ASSERT_TRUE(registry.Register("hot", std::make_unique<NoSpaceBackend>(TierType::HBM)));
+  ASSERT_TRUE(registry.Register("cold", std::make_unique<MockBackend>(TierType::SSD)));
+  auto compiled = LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
   ASSERT_TRUE(compiled.ok()) << compiled.error;
   PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
 
@@ -512,8 +492,7 @@ TEST(TieredPlacementPolicy, HonorsExplicitLogicalTierAndTagsEvents) {
   BackendRegistry registry;
   ASSERT_TRUE(registry.Register("hot", std::make_unique<MockBackend>(TierType::DRAM)));
   ASSERT_TRUE(registry.Register("cold", std::make_unique<MockBackend>(TierType::DRAM)));
-  auto compiled =
-      LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
+  auto compiled = LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
   ASSERT_TRUE(compiled.ok()) << compiled.error;
   PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
 
@@ -534,8 +513,7 @@ TEST(PeerPool, OnEvictMigratesBytesToConfiguredBackend) {
   BackendRegistry registry;
   RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kPageSize, 2);
   RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kPageSize, 2);
-  auto compiled =
-      LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
+  auto compiled = LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
   ASSERT_TRUE(compiled.ok()) << compiled.error;
   PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
 
@@ -548,8 +526,7 @@ TEST(PeerPool, OnEvictMigratesBytesToConfiguredBackend) {
                   allocation.allocation.pages[0].page_index * kPageSize,
               payload.data(), payload.size());
   ASSERT_TRUE(pool.BatchCommit({PoolCommitRequest{
-                                   {allocation.backend_id, allocation.allocation.slot_id},
-                                   "move"}})
+                                   {allocation.backend_id, allocation.allocation.slot_id}, "move"}})
                   .front()
                   .commit.success);
 
@@ -563,8 +540,7 @@ TEST(PeerPool, OnEvictMigratesBytesToConfiguredBackend) {
 
   auto resolved = pool.BatchResolve({"move"}, false).front();
   ASSERT_TRUE(resolved.resolved.found);
-  auto target_ref =
-      registry.Get("cold")->BufferRef(resolved.resolved.pages[0].buffer_index);
+  auto target_ref = registry.Get("cold")->BufferRef(resolved.resolved.pages[0].buffer_index);
   ASSERT_TRUE(target_ref.HasHostPtr());
   EXPECT_EQ(std::string(static_cast<char*>(target_ref.host_ptr) +
                             resolved.resolved.pages[0].page_index * kPageSize,
@@ -579,8 +555,7 @@ TEST(PeerPool, EvictionRetryDrainsLeasedSourceWithoutDeletingTarget) {
   BackendRegistry registry;
   RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kPageSize, 2, kShortLease);
   RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kPageSize, 2, kShortLease);
-  auto compiled =
-      LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
+  auto compiled = LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
   ASSERT_TRUE(compiled.ok()) << compiled.error;
   PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
 
@@ -606,8 +581,7 @@ TEST(PeerPool, DiscardDeletesInsteadOfDemoting) {
   RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kPageSize, 2);
   RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kPageSize, 2);
   // The same on_evict topology that demotes under kReclaim.
-  auto compiled =
-      LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
+  auto compiled = LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
   ASSERT_TRUE(compiled.ok()) << compiled.error;
   PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
 
@@ -634,8 +608,7 @@ TEST(PeerPool, WatermarkMigratesCommittedKey) {
   // Fails loudly if the granularity assumption above ever stops holding.
   ASSERT_EQ(registry.Get("hot")->Capacity().total_bytes, 2 * kPageSize);
 
-  auto compiled =
-      LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kWatermark), registry);
+  auto compiled = LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kWatermark), registry);
   ASSERT_TRUE(compiled.ok()) << compiled.error;
   PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
 
@@ -659,8 +632,7 @@ TEST(PeerPool, WatermarkFollowsTheFullestMemberOfAMixedTier) {
   parallel.high_watermark = 0.4;
   parallel.low_watermark = 0.2;
   auto compiled = LogicalTierGraph::Compile(
-      {parallel, LogicalTierConfig{{{"cold", 1}}, {}, PoolOffloadTrigger::kOnEvict}},
-      registry);
+      {parallel, LogicalTierConfig{{{"cold", 1}}, {}, PoolOffloadTrigger::kOnEvict}}, registry);
   ASSERT_TRUE(compiled.ok()) << compiled.error;
   PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
 
@@ -685,8 +657,7 @@ TEST(PeerPool, MigrationDoesNotBlockConcurrentPoolOperations) {
   auto* blocking = cold.get();
   ASSERT_TRUE(registry.Register("cold", std::move(cold)));
 
-  auto compiled =
-      LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kWatermark), registry);
+  auto compiled = LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kWatermark), registry);
   ASSERT_TRUE(compiled.ok()) << compiled.error;
   PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
 
@@ -695,9 +666,8 @@ TEST(PeerPool, MigrationDoesNotBlockConcurrentPoolOperations) {
 
   // The transition is parked mid-copy. An unrelated resolve must not wait for
   // it, which is only true while the copy runs without the pool lock.
-  auto concurrent = std::async(std::launch::async, [&] {
-    return pool.BatchResolve({"unrelated"}, false).size();
-  });
+  auto concurrent = std::async(std::launch::async,
+                               [&] { return pool.BatchResolve({"unrelated"}, false).size(); });
   EXPECT_EQ(concurrent.wait_for(std::chrono::seconds(2)), std::future_status::ready);
   blocking->Release();
   EXPECT_EQ(concurrent.get(), 1u);
@@ -805,11 +775,11 @@ TEST(PeerPool, ReadPromotesWithMoveDrainsSourceAndKeepsBytes) {
   std::memcpy(static_cast<char*>(source_ref.host_ptr) +
                   allocation.allocation.pages[0].page_index * kPageSize,
               payload.data(), payload.size());
-  ASSERT_TRUE(pool.BatchCommit({PoolCommitRequest{
-                                   {allocation.backend_id, allocation.allocation.slot_id},
-                                   "moved"}})
-                  .front()
-                  .commit.success);
+  ASSERT_TRUE(
+      pool.BatchCommit(
+              {PoolCommitRequest{{allocation.backend_id, allocation.allocation.slot_id}, "moved"}})
+          .front()
+          .commit.success);
 
   ASSERT_TRUE(pool.BatchResolve({"moved"}, false).front().resolved.found);
   EXPECT_TRUE(WaitForKey(&registry, "hot", "moved"));

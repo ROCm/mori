@@ -81,9 +81,7 @@ class InstrumentedBackend final : public MediumBackend {
   bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved) override {
     return inner_->AcquireMigrationRead(key, resolved);
   }
-  void ReleaseMigrationRead(const std::string& key) override {
-    inner_->ReleaseMigrationRead(key);
-  }
+  void ReleaseMigrationRead(const std::string& key) override { inner_->ReleaseMigrationRead(key); }
   std::vector<KvEvent> DrainPendingEvents() override { return inner_->DrainPendingEvents(); }
   std::vector<KvEvent> SnapshotOwnedKeys() const override { return inner_->SnapshotOwnedKeys(); }
   std::vector<KvEvent> SnapshotOwnedKeysForFullSync() override {
@@ -112,8 +110,8 @@ class InstrumentedBackend final : public MediumBackend {
   std::vector<AllocateResult> BatchAllocate(const std::vector<AllocateRequest>& reqs) override;
   std::vector<CommitResult> BatchCommit(const std::vector<CommitRequest>& reqs) override;
   std::vector<bool> BatchAbort(const std::vector<uint64_t>& slot_ids) override;
-  std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
-                                          bool include_descs) override;
+  std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool include_descs,
+                                          bool allow_file_refs = false) override;
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys) override;
 
   // ---- bootstrap / local endpoints: pass-through ----

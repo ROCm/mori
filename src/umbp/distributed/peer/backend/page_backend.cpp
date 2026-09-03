@@ -489,7 +489,8 @@ ResolvedEntry PageBackend::Resolve(const std::string& key) {
 }
 
 std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::string>& keys,
-                                                     bool include_descs) {
+                                                     bool include_descs, bool allow_file_refs) {
+  (void)allow_file_refs;  // pages are this medium's storage; there is no file to name
   std::vector<ResolvedEntry> out(keys.size());
   if (keys.empty()) return out;
   std::lock_guard<std::mutex> lock(mutex_);
@@ -512,8 +513,7 @@ std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::stri
   return out;
 }
 
-bool PageBackend::AcquireMigrationRead(const std::string& key,
-                                       ResolvedEntry* resolved) {
+bool PageBackend::AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved) {
   if (resolved == nullptr) return false;
   std::lock_guard<std::mutex> lock(mutex_);
   auto owned = owned_.find(key);

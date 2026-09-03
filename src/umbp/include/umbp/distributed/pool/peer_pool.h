@@ -1,6 +1,27 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
 //
 // MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
 #pragma once
 
 #include <chrono>
@@ -74,12 +95,11 @@ class PeerPool {
 
   BackendRegistry* Backends() const { return backends_; }
 
-  std::vector<PoolAllocateResult> BatchAllocate(
-      const std::vector<PoolPlacementRequest>& requests);
+  std::vector<PoolAllocateResult> BatchAllocate(const std::vector<PoolPlacementRequest>& requests);
   std::vector<PoolCommitResult> BatchCommit(const std::vector<PoolCommitRequest>& requests);
   std::vector<bool> BatchAbort(const std::vector<PoolSlotRef>& slots);
   std::vector<PoolResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
-                                              bool include_descs);
+                                              bool include_descs, bool allow_file_refs = false);
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys, PoolEvictMode mode);
   void ClearLocal();
   std::vector<KvEvent> DrainPendingEvents();
@@ -98,8 +118,7 @@ class PeerPool {
   struct PendingPlacement {
     uint32_t backend_id = BackendRegistry::kMaxBackends;
     uint64_t local_slot_id = 0;
-    std::chrono::steady_clock::time_point expires_at =
-        std::chrono::steady_clock::time_point::max();
+    std::chrono::steady_clock::time_point expires_at = std::chrono::steady_clock::time_point::max();
   };
 
   struct TransitionJob {
@@ -134,8 +153,7 @@ class PeerPool {
   // and reports how many it queued. Bounded on purpose: a peer can hold
   // millions of placements, so neither the scan nor the queue may be
   // proportional to that.
-  size_t EnqueueWatermarkCandidatesLocked(LogicalTierGraph::TierIndex tier,
-                                          size_t max_count);
+  size_t EnqueueWatermarkCandidatesLocked(LogicalTierGraph::TierIndex tier, size_t max_count);
   void MaybeEnqueueWatermarkOffloadLocked();
   bool WatermarkDrivenLocked(const TransitionJob& job) const;
   TransitionPlan PlanTransitionLocked(const TransitionJob& job);
@@ -143,8 +161,7 @@ class PeerPool {
   // Plans under `lock`, releases it for the byte copy, then reacquires it to
   // publish the outcome. Holding it across the copy would stall every
   // allocate / commit / resolve on the peer for the duration of an SSD write.
-  TierTransitionResult RunTransition(std::unique_lock<std::mutex>& lock,
-                                     const TransitionJob& job);
+  TierTransitionResult RunTransition(std::unique_lock<std::mutex>& lock, const TransitionJob& job);
 
   BackendRegistry* backends_;
   std::unique_ptr<PoolPolicy> policy_;

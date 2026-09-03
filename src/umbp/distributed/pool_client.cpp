@@ -21,8 +21,6 @@
 // SOFTWARE.
 #include "umbp/distributed/pool_client.h"
 
-#include "umbp/distributed/benchmark/workload_trace_recorder.h"
-
 #include <grpcpp/grpcpp.h>
 
 #include <algorithm>
@@ -51,6 +49,7 @@
 #include "umbp/common/grpc_limits.h"
 #include "umbp/common/parallel_for.h"
 #include "umbp/common/range_utils.h"
+#include "umbp/distributed/benchmark/workload_trace_recorder.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/peer/backend/hbm_backend.h"
 #include "umbp/distributed/peer/backend/instrumented_backend.h"
@@ -519,14 +518,16 @@ inline std::chrono::milliseconds ResolveBusyRetryTimeout() {
   return std::chrono::milliseconds(std::min<uint64_t>(ms, 300000));
 }
 
-std::vector<PoolResolvedEntry> ResolveLocalBatchWithBusyRetry(
-    PeerPool* pool, const std::vector<std::string>& keys, bool include_descs) {
+std::vector<PoolResolvedEntry> ResolveLocalBatchWithBusyRetry(PeerPool* pool,
+                                                              const std::vector<std::string>& keys,
+                                                              bool include_descs,
+                                                              bool allow_file_refs) {
   if (pool == nullptr) return std::vector<PoolResolvedEntry>(keys.size());
   const auto deadline = std::chrono::steady_clock::now() + ResolveBusyRetryTimeout();
   std::chrono::milliseconds backoff{1};
   size_t attempts = 0;
   while (true) {
-    auto resolved = pool->BatchResolve(keys, include_descs);
+    auto resolved = pool->BatchResolve(keys, include_descs, allow_file_refs);
     const bool busy = std::any_of(resolved.begin(), resolved.end(), [](const auto& entry) {
       return EffectiveResolveOutcome(entry.resolved) == ResolveOutcome::kBusy;
     });
@@ -557,6 +558,13 @@ TransferRef ClassifiedUserBytes(void* ptr, uint64_t size) {
   const PointerLocation location = DetectPointerLocation(ptr);
   if (!location.IsDevice()) return TransferRef::HostBytes(ptr, size);
   return TransferRef::HostBytes(ptr, size, mori::io::MemoryLocationType::GPU, location.device_id);
+}
+
+// A file ref can only be READ into device memory: GdsEngine claims the
+// (file, GPU) pair and no engine claims (file, host).  Callers use this to
+// decide whether asking a medium for a file ref is even useful.
+bool DestinationIsDevice(void* ptr, uint64_t size) {
+  return ClassifiedUserBytes(ptr, size).loc == mori::io::MemoryLocationType::GPU;
 }
 
 // Read-side range validity: inside the object and non-overlapping.  Weaker than
@@ -707,8 +715,7 @@ std::vector<BackendInstanceConfig> EffectiveBackendConfigs(const PoolClientConfi
 }
 
 std::unique_ptr<MediumBackend> MakeConfiguredBackend(const BackendInstanceConfig& config,
-                                                     uint64_t page_size,
-                                                     bool staging_use_hugepages,
+                                                     uint64_t page_size, bool staging_use_hugepages,
                                                      uint64_t staging_hugepage_size) {
   switch (config.tier) {
     case TierType::DRAM: {
@@ -747,8 +754,7 @@ std::unique_ptr<MediumBackend> MakeConfiguredBackend(const BackendInstanceConfig
 
 std::unique_ptr<PoolPolicy> MakeConfiguredPoolPolicy(
     const PoolClientConfig& config, const std::vector<BackendInstanceConfig>& backends,
-    const BackendRegistry& registry,
-    std::shared_ptr<const LogicalTierGraph>* tier_graph) {
+    const BackendRegistry& registry, std::shared_ptr<const LogicalTierGraph>* tier_graph) {
   switch (config.placement_policy) {
     case PoolPlacementPolicy::SINGLE_BACKEND:
       return MakeSingleBackendPolicy();
@@ -803,8 +809,7 @@ bool PoolClient::Init() {
     }
   }
   if (const char* value = std::getenv("UMBP_WORKLOAD_TRACE_CLIENT_ID")) {
-    config_.workload_trace_client_id =
-        static_cast<uint32_t>(std::strtoull(value, nullptr, 10));
+    config_.workload_trace_client_id = static_cast<uint32_t>(std::strtoull(value, nullptr, 10));
   }
   if (const char* value = std::getenv("UMBP_WORKLOAD_TRACE_SEED")) {
     config_.workload_trace_seed = std::strtoull(value, nullptr, 10);
@@ -815,8 +820,7 @@ bool PoolClient::Init() {
     std::string error;
     if (!loaded.ok() || !ApplyBackendPolicy(*loaded.config, &config_, &error)) {
       MORI_UMBP_ERROR("[PoolClient] failed to load backend policy '{}': {}",
-                      config_.policy_config_path,
-                      loaded.ok() ? error : loaded.error);
+                      config_.policy_config_path, loaded.ok() ? error : loaded.error);
       initialized_.store(false);
       return false;
     }
@@ -897,12 +901,12 @@ bool PoolClient::Init() {
       Shutdown();
       return false;
     }
-    auto backend = MakeConfiguredBackend(backend_config, page_size,
-                                         config_.ssd_staging_use_hugepages,
-                                         config_.ssd_staging_hugepage_size);
+    auto backend =
+        MakeConfiguredBackend(backend_config, page_size, config_.ssd_staging_use_hugepages,
+                              config_.ssd_staging_hugepage_size);
     if (backend == nullptr) {
-      MORI_UMBP_ERROR("[PoolClient] backend '{}' has unknown medium {}",
-                      backend_config.name, static_cast<int>(backend_config.tier));
+      MORI_UMBP_ERROR("[PoolClient] backend '{}' has unknown medium {}", backend_config.name,
+                      static_cast<int>(backend_config.tier));
       Shutdown();
       return false;
     }
@@ -948,11 +952,10 @@ bool PoolClient::Init() {
     Shutdown();
     return false;
   }
-  default_pool_ = std::make_unique<PeerPool>(
-      &registry_, std::move(placement_policy), transfer_engine_.get());
-  const bool weighted_placement =
-      config_.placement_policy == PoolPlacementPolicy::WEIGHTED ||
-      config_.placement_policy == PoolPlacementPolicy::TIERED;
+  default_pool_ =
+      std::make_unique<PeerPool>(&registry_, std::move(placement_policy), transfer_engine_.get());
+  const bool weighted_placement = config_.placement_policy == PoolPlacementPolicy::WEIGHTED ||
+                                  config_.placement_policy == PoolPlacementPolicy::TIERED;
   if (master_client_) {
     master_client_->SetAggregateBackendCapacities(weighted_placement);
     master_client_->SetBackendRegistry(&registry_);
@@ -1031,11 +1034,11 @@ bool PoolClient::Init() {
     tier_caps[backend->Tier()] = cap;
   }
   if (master_client_) {
-    const auto logical_caps =
-        default_pool_ == nullptr ? std::map<std::string, LogicalTierCapacity>{}
-                                 : default_pool_->LogicalTierCapacities();
-    auto status = master_client_->RegisterSelf(tier_caps, peer_address, engine_desc_bytes,
-                                               logical_caps);
+    const auto logical_caps = default_pool_ == nullptr
+                                  ? std::map<std::string, LogicalTierCapacity>{}
+                                  : default_pool_->LogicalTierCapacities();
+    auto status =
+        master_client_->RegisterSelf(tier_caps, peer_address, engine_desc_bytes, logical_caps);
     if (!status.ok()) {
       MORI_UMBP_ERROR("[PoolClient] RegisterSelf failed: {}", status.error_message());
       Shutdown();
@@ -1070,8 +1073,7 @@ bool PoolClient::Init() {
       options.seed = config_.workload_trace_seed;
       options.node_id = config_.master_config.node_id;
       options.backend_policy = config_.policy_config_path;
-      workload_recorder_ =
-          std::make_unique<benchmark::WorkloadTraceRecorder>(std::move(options));
+      workload_recorder_ = std::make_unique<benchmark::WorkloadTraceRecorder>(std::move(options));
     } catch (const std::exception& exception) {
       MORI_UMBP_ERROR("[PoolClient] failed to open workload trace '{}': {}",
                       config_.workload_trace_path, exception.what());
@@ -1103,8 +1105,7 @@ void PoolClient::Shutdown() {
     try {
       workload_recorder_->Close();
     } catch (const std::exception& exception) {
-      MORI_UMBP_ERROR("[PoolClient] workload trace is incomplete: {}",
-                      exception.what());
+      MORI_UMBP_ERROR("[PoolClient] workload trace is incomplete: {}", exception.what());
     }
     workload_recorder_.reset();
   }
@@ -1198,8 +1199,7 @@ std::string PoolClient::LogicalTierForBackend(uint32_t backend_id) const {
 }
 
 TierTransitionMetrics PoolClient::TransitionMetrics() const {
-  return default_pool_ == nullptr ? TierTransitionMetrics{}
-                                  : default_pool_->TransitionMetrics();
+  return default_pool_ == nullptr ? TierTransitionMetrics{} : default_pool_->TransitionMetrics();
 }
 
 // ---------------------------------------------------------------------------
@@ -1432,7 +1432,9 @@ PoolClient::GetAttemptOutcome PoolClient::ExecuteLocalGet(const std::string& key
     return GetAttemptOutcome::kFatal;
   }
   auto pool_resolved =
-      ResolveLocalBatchWithBusyRetry(default_pool_.get(), {key}, /*include_descs=*/false).front();
+      ResolveLocalBatchWithBusyRetry(default_pool_.get(), {key}, /*include_descs=*/false,
+                                     /*allow_file_refs=*/true)
+          .front();
   auto* backend = registry_.Get(pool_resolved.backend_id);
   bool served = pool_resolved.resolved.found && backend != nullptr;
   if (served) {
@@ -1480,7 +1482,8 @@ PoolClient::GetAttemptOutcome PoolClient::ExecuteLocalGet(const std::string& key
 void PoolClient::ResolveLocalBatch(const std::vector<std::string>& keys,
                                    const std::vector<size_t>& candidates,
                                    std::vector<MediumBackend*>* holders,
-                                   std::vector<ResolvedEntry>* resolutions) {
+                                   std::vector<ResolvedEntry>* resolutions,
+                                   const std::function<bool(size_t)>& dst_is_device) {
   holders->assign(keys.size(), nullptr);
   if (resolutions != nullptr) resolutions->assign(keys.size(), ResolvedEntry{});
   if (candidates.empty() || default_pool_ == nullptr || registry_.Empty()) return;
@@ -1489,8 +1492,39 @@ void PoolClient::ResolveLocalBatch(const std::vector<std::string>& keys,
   batch.reserve(candidates.size());
   for (size_t i : candidates) batch.push_back(keys[i]);
 
-  auto found =
-      ResolveLocalBatchWithBusyRetry(default_pool_.get(), batch, /*include_descs=*/false);
+  // Both readers fed from here — ServeLocalGets and BatchGetRanges — can
+  // consume a file ref, and this resolve never leaves the process, so ask for
+  // one whenever the caller can say where the bytes land.
+  const bool want_file_refs = static_cast<bool>(dst_is_device);
+  auto found = ResolveLocalBatchWithBusyRetry(default_pool_.get(), batch,
+                                              /*include_descs=*/false,
+                                              /*allow_file_refs=*/want_file_refs);
+
+  // A file ref is unreadable into HOST memory, and the medium cannot know the
+  // destination at resolve time.  Re-resolve those keys with file refs off so
+  // they come back on staged pages -- correct, just not zero-copy.
+  //
+  // Deliberately a second pass rather than classifying every destination up
+  // front: with GDS off nothing publishes a file ref, this loop finds nothing,
+  // and the ordinary local read pays no extra HIP call at all.
+  if (want_file_refs) {
+    std::vector<std::string> restage;
+    std::vector<size_t> restage_at;
+    for (size_t j = 0; j < candidates.size() && j < found.size(); ++j) {
+      if (!found[j].resolved.file_ref.IsFile()) continue;
+      if (dst_is_device(candidates[j])) continue;
+      restage.push_back(batch[j]);
+      restage_at.push_back(j);
+    }
+    if (!restage.empty()) {
+      auto staged = ResolveLocalBatchWithBusyRetry(default_pool_.get(), restage,
+                                                   /*include_descs=*/false,
+                                                   /*allow_file_refs=*/false);
+      for (size_t k = 0; k < restage_at.size() && k < staged.size(); ++k) {
+        found[restage_at[k]] = std::move(staged[k]);
+      }
+    }
+  }
   for (size_t j = 0; j < candidates.size() && j < found.size(); ++j) {
     if (!found[j].resolved.found) continue;
     auto* backend = registry_.Get(found[j].backend_id);
@@ -1505,6 +1539,38 @@ void PoolClient::ResolveLocalBatch(const std::vector<std::string>& keys,
 // ---------------------------------------------------------------------------
 //  Ranged I/O — object ranges onto tier pages
 // ---------------------------------------------------------------------------
+
+// The file-ref counterpart of BuildLocalRangeTransfers: the medium published a
+// range of its own storage instead of staged pages, so each caller range is one
+// read at (value start + range offset) -- GdsEngine adds src_offset to the
+// ref's file_offset.  No page walk, because there are no pages to walk.
+//
+// The ranges a layer-wise reader asks for are not 4 KiB aligned in general,
+// while the file ref's own start and length are.  That is not a correctness
+// problem: hipFile serves an unaligned range through its compat path, which
+// gives up the DMA fastpath for that read but returns the right bytes.
+bool PoolClient::BuildLocalFileRangeTransfers(const TransferRef& file_ref,
+                                              const std::vector<ObjectRange>& ranges, size_t tag,
+                                              std::vector<TransferItem>* items) {
+  if (!file_ref.IsFile() || ranges.empty()) return false;
+  items->reserve(items->size() + ranges.size());
+  for (const ObjectRange& r : ranges) {
+    if (r.size == 0) continue;
+    // Same reason BuildLocalRangeTransfers prefers the registration table: a
+    // registered ref names the region BASE, so every range landing in one
+    // caller buffer shares a (src, dst) pair and folds into a single plan.
+    const auto [dst_ref, dst_base_offset] = UserBufferRef(r.user, r.size);
+    TransferItem item;
+    item.src = file_ref;
+    item.src_offset = r.object_offset;
+    item.dst = dst_ref;
+    item.dst_offset = dst_base_offset;
+    item.size = r.size;
+    item.tag = tag;
+    items->push_back(std::move(item));
+  }
+  return true;
+}
 
 bool PoolClient::BuildLocalRangeTransfers(MediumBackend* backend,
                                           const std::vector<PageLocation>& pages,
@@ -2653,7 +2719,8 @@ void PoolClient::ServeLocalGets(const std::vector<std::string>& keys,
 
   std::vector<MediumBackend*> holders;
   std::vector<ResolvedEntry> resolutions;
-  ResolveLocalBatch(keys, indices, &holders, &resolutions);
+  ResolveLocalBatch(keys, indices, &holders, &resolutions,
+                    [&](size_t i) { return DestinationIsDevice(dsts[i], sizes[i]); });
 
   const auto t0 = std::chrono::steady_clock::now();
   std::vector<TransferItem> items;
@@ -2676,8 +2743,17 @@ void PoolClient::ServeLocalGets(const std::vector<std::string>& keys,
       continue;
     }
     const size_t before = items.size();
-    if (!BuildLocalPageTransfers(holder, resolved.pages, resolved.page_size, dsts[i], sizes[i],
-                                 /*to_backend=*/false, &items)) {
+    if (resolved.file_ref.IsFile()) {
+      // Zero-copy GDS path, the same one ExecuteLocalGet takes: the backend
+      // published a file range rather than staged pages, so read it straight
+      // into the caller's device buffer and let the planner pick GdsEngine.
+      TransferItem item;
+      item.src = resolved.file_ref;
+      item.dst = ClassifiedUserBytes(dsts[i], sizes[i]);
+      item.size = sizes[i];
+      items.push_back(std::move(item));
+    } else if (!BuildLocalPageTransfers(holder, resolved.pages, resolved.page_size, dsts[i],
+                                        sizes[i], /*to_backend=*/false, &items)) {
       // This medium holds the key but publishes no in-process endpoint for its
       // buffers.  Drop what was appended for it -- a half-built key must not
       // ride along in the batch -- and route it instead.
@@ -3027,7 +3103,16 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   std::vector<ResolvedEntry> resolutions;
   {
     PhaseTimer resolve_timer(dbg ? &dbg->resolve : nullptr);
-    ResolveLocalBatch(keys, candidates, &holders, &resolutions);
+    ResolveLocalBatch(keys, candidates, &holders, &resolutions, [&](size_t i) {
+      // One key's ranges normally share a caller allocation, but nothing
+      // guarantees it; a single host range makes the whole key unservable
+      // from a file ref, so require all of them.
+      const std::vector<void*>& key_dsts = dsts[i];
+      for (size_t r = 0; r < key_dsts.size(); ++r) {
+        if (!DestinationIsDevice(key_dsts[r], sizes[i][r])) return false;
+      }
+      return !key_dsts.empty();
+    });
   }
 
   for (size_t i = 0; i < n; ++i) {
@@ -3057,9 +3142,12 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
       // Refilled per key rather than returned fresh: one allocation for the
       // call instead of one per key.
       FillReadRanges(dsts[i], sizes[i], src_offsets[i], &key_ranges);
-      built = BuildLocalRangeTransfers(
-          holder, resolved.pages, resolved.page_size, resolved.size, key_ranges,
-          /*to_backend=*/false, /*tag=*/i, &local_items, dbg ? &dbg->classify : nullptr);
+      built =
+          resolved.file_ref.IsFile()
+              ? BuildLocalFileRangeTransfers(resolved.file_ref, key_ranges, /*tag=*/i, &local_items)
+              : BuildLocalRangeTransfers(holder, resolved.pages, resolved.page_size, resolved.size,
+                                         key_ranges, /*to_backend=*/false,
+                                         /*tag=*/i, &local_items, dbg ? &dbg->classify : nullptr);
     }
     if (!built) {
       // The medium holds the key but cannot be read in-process.  Same call as
@@ -3989,9 +4077,8 @@ bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
     if (decoded.keys.size() != items.size()) {
       // Malformed (mismatched parallel arrays); fail the whole batch rather
       // than partially reading it.
-      MORI_UMBP_WARN(
-          "[PoolClient] BatchResolveKeys malformed response on {}: {} keys for {} items",
-          items.front().route.node_id, decoded.keys.size(), items.size());
+      MORI_UMBP_WARN("[PoolClient] BatchResolveKeys malformed response on {}: {} keys for {} items",
+                     items.front().route.node_id, decoded.keys.size(), items.size());
       for (const auto& item : items) (*results)[item.index] = false;
       return false;
     }
@@ -4006,9 +4093,9 @@ bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
     // progress impossible; it can also leave stale page locations if a retry
     // outlives the lease.
     ++busy_attempts;
-    const auto sleep_for = std::min(
-        backoff, std::chrono::duration_cast<std::chrono::milliseconds>(
-                     retry_deadline - std::chrono::steady_clock::now()));
+    const auto sleep_for =
+        std::min(backoff, std::chrono::duration_cast<std::chrono::milliseconds>(
+                              retry_deadline - std::chrono::steady_clock::now()));
     if (sleep_for.count() > 0) std::this_thread::sleep_for(sleep_for);
     backoff = std::min(backoff * 2, std::chrono::milliseconds{50});
   }
@@ -4437,8 +4524,7 @@ void PoolClient::PublishComponentMetrics() {
   for (MediumBackend* backend : registry_.All()) {
     if (backend == nullptr) continue;
     const auto* entry = registry_.GetEntry(backend);
-    const std::string backend_name =
-        entry == nullptr ? std::string(backend->Name()) : entry->name;
+    const std::string backend_name = entry == nullptr ? std::string(backend->Name()) : entry->name;
     const MetricLabels labels = {{"tier", TierTypeName(backend->Tier())},
                                  {"backend", backend_name}};
     metric_publisher_.Publish(std::string("backend:") + backend_name, labels, *backend, sink);
@@ -4458,20 +4544,17 @@ void PoolClient::PublishComponentMetrics() {
   // hides which tier actually served a read.
   if (default_pool_ != nullptr) {
     std::vector<MetricSample> samples;
-    const auto sample = [&samples](const char* name, const char* help,
-                                   MetricLabels labels, uint64_t value) {
+    const auto sample = [&samples](const char* name, const char* help, MetricLabels labels,
+                                   uint64_t value) {
       samples.push_back(MetricSample{name, help, std::move(labels), value});
     };
 
     const TierTransitionMetrics tiers = default_pool_->TransitionMetrics();
-    sample(MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS,
-           MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS_HELP,
+    sample(MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS, MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS_HELP,
            {{"outcome", "attempted"}}, tiers.attempted);
-    sample(MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS,
-           MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS_HELP,
+    sample(MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS, MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS_HELP,
            {{"outcome", "succeeded"}}, tiers.succeeded);
-    sample(MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS,
-           MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS_HELP,
+    sample(MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS, MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS_HELP,
            {{"outcome", "failed"}}, tiers.failed);
     sample(MORI_UMBP_METRIC_CLIENT_TIER_OFFLOADED_BYTES,
            MORI_UMBP_METRIC_CLIENT_TIER_OFFLOADED_BYTES_HELP, {}, tiers.offloaded_bytes);
@@ -4479,8 +4562,8 @@ void PoolClient::PublishComponentMetrics() {
            MORI_UMBP_METRIC_CLIENT_TIER_PROMOTED_BYTES_HELP, {}, tiers.promoted_bytes);
 
     for (const auto& [tier, hits] : default_pool_->TierReadHits()) {
-      sample(MORI_UMBP_METRIC_CLIENT_TIER_READ_HITS,
-             MORI_UMBP_METRIC_CLIENT_TIER_READ_HITS_HELP, {{"tier", tier}}, hits);
+      sample(MORI_UMBP_METRIC_CLIENT_TIER_READ_HITS, MORI_UMBP_METRIC_CLIENT_TIER_READ_HITS_HELP,
+             {{"tier", tier}}, hits);
     }
     metric_publisher_.Publish("pool", {}, samples, sink);
   }

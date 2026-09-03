@@ -156,8 +156,9 @@ class MockBackend : public MediumBackend {
     return out;
   }
 
-  std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
-                                          bool include_descs) override {
+  std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool include_descs,
+                                          bool allow_file_refs = false) override {
+    (void)allow_file_refs;  // this mock stages everything; it publishes no file refs
     std::vector<ResolvedEntry> out(keys.size());
     std::lock_guard<std::mutex> lock(mutex_);
     for (size_t i = 0; i < keys.size(); ++i) {
