@@ -399,7 +399,12 @@ jobs:
         include:
           - platform: MI355X_AINIC
             runner: [self-hosted, MI355X-AINIC-TW]
-    timeout-minutes: 30
+            rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+            rdma_sl: 3
+            rdma_tc: 104
+    # Raised from 30 for the primitive concurrency gate, which sweeps five
+    # primitives over four rank counts against two server deployments.
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -438,6 +443,36 @@ jobs:
             timeout 300 ctest --output-on-failure \
               -R '^(umbp_|test_dummy_ssd_tier|test_prefix_aware_eviction|test_ssd_tier)'
           "
+
+      # Five client primitives -- put / get / exists / put_ranges / get_ranges
+      # -- swept over 1, 2, 4 and 8 concurrent client processes, against a
+      # standalone server run both without a master and with one.  Gates on
+      # correctness at every rank count, and on batch_exists throughput still
+      # growing with concurrency: a control plane that serializes reads looks
+      # healthy at one rank and collapses at eight, which no single-concurrency
+      # latency number can see.  See tests/python/umbp/umbp_prim_ci.py.
+      - name: UMBP primitive concurrency gate (standalone, with and without master)
+        run: |
+          $CT exec \
+            -e MORI_RDMA_DEVICES=${{ matrix.rdma_devices }} \
+            -e MORI_RDMA_SL=${{ matrix.rdma_sl }} \
+            -e MORI_RDMA_TC=${{ matrix.rdma_tc }} \
+            $CONTAINER bash -c "
+              cd $GITHUB_WORKSPACE
+              timeout 2400 python3 tests/python/umbp/umbp_prim_ci.py \
+                --arms nomaster master \
+                --ranks 1 2 4 8 \
+                --out-dir $GITHUB_WORKSPACE/umbp_prim_ci_results
+            "
+
+      - name: Upload primitive gate results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: umbp-prim-ci-${{ github.run_id }}
+          path: |
+            ${{ github.workspace }}/umbp_prim_ci_results
+          if-no-files-found: warn
 
       - name: Cleanup
         if: always()
