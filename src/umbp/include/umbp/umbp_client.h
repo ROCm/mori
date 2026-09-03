@@ -30,12 +30,20 @@
 #include <unordered_set>
 #include <vector>
 
+#include "mori/io/enum.hpp"
 #include "umbp/common/config.h"
 #include "umbp/distributed/types.h"
 
 namespace mori::umbp {
 
 enum class UMBPDeploymentMode : int {
+  // No client reports Local any more: the local backend is gone and an
+  // embedded deployment is a DistributedClient with no master, which reports
+  // Distributed (config alone decides what a process is -- an embedded store
+  // is not a different implementation).  The value is kept, and kept at 0, so
+  // an out-of-tree consumer that names it still compiles and so the
+  // STANDALONE_BACKEND_LOCAL wire value keeps its meaning; treat receiving it
+  // as "a server older than this change".
   Local = 0,
   StandaloneProcess = 1,
   Distributed = 2,
@@ -44,8 +52,17 @@ enum class UMBPDeploymentMode : int {
 /// Abstract interface for UMBP storage clients.
 ///
 /// Two implementations exist behind this interface:
-///   - StandaloneClient: purely local DRAM+SSD storage, no networking.
-///   - DistributedClient: master-led global routing + RDMA data plane.
+///   - DistributedClient: this node's medium, plus master-led global routing
+///     and an RDMA data plane WHEN a master address is configured.  With none,
+///     the same class is an embedded, single-process store: same backends,
+///     same transfer engine, no routing, no registration, no heartbeat.
+///   - StandaloneProcessClient: gRPC forwarding to a standalone server, which
+///     runs a DistributedClient of its own (with or without a master).
+///
+/// There is deliberately no third, local-only implementation.  "Local" is a
+/// property of a deployment -- no master address -- not a separate client, so
+/// embedded and distributed, standalone-process and in-process, are the same
+/// code path with different configuration.
 ///
 /// Use CreateUMBPClient() to obtain the appropriate implementation based on
 /// UMBPConfig. All methods are zero-copy and pointer-based, designed for
@@ -84,6 +101,21 @@ class IUMBPClient {
                                      const std::vector<uintptr_t>& dsts,
                                      const std::vector<size_t>& sizes) = 0;
 
+  /// Read byte ranges of stored objects into scattered user buffers. Shape
+  /// errors fail the whole batch; data errors are reported per key.
+  virtual std::vector<bool> BatchGetRanges(const std::vector<std::string>& keys,
+                                           const std::vector<std::vector<uintptr_t>>& dsts,
+                                           const std::vector<std::vector<size_t>>& sizes,
+                                           const std::vector<std::vector<size_t>>& src_offsets) = 0;
+
+  /// Atomically publish objects assembled from scattered buffers. The ranges
+  /// for each key must exactly tile [0, object_sizes[i]).
+  virtual std::vector<bool> BatchPutRanges(const std::vector<std::string>& keys,
+                                           const std::vector<size_t>& object_sizes,
+                                           const std::vector<std::vector<uintptr_t>>& srcs,
+                                           const std::vector<std::vector<size_t>>& sizes,
+                                           const std::vector<std::vector<size_t>>& dst_offsets) = 0;
+
   virtual std::vector<bool> BatchExists(const std::vector<std::string>& keys) const = 0;
 
   /// Returns the number of keys that exist consecutively from index 0.
@@ -115,8 +147,17 @@ class IUMBPClient {
 
   /// Returns the concrete deployment mode behind this client.
   virtual UMBPDeploymentMode GetDeploymentMode() const {
-    return IsDistributed() ? UMBPDeploymentMode::Distributed : UMBPDeploymentMode::Local;
+    return IsDistributed() ? UMBPDeploymentMode::Distributed
+                           : UMBPDeploymentMode::StandaloneProcess;
   }
+
+  /// Returns the backend behind a forwarding client. For direct clients this
+  /// equals GetDeploymentMode(); StandaloneProcessClient overrides it with the
+  /// mode reported by the server's Ping response.
+  virtual UMBPDeploymentMode GetBackendMode() const { return GetDeploymentMode(); }
+
+  /// Whether this concrete backend implements ranged multi-buffer I/O.
+  virtual bool SupportsRangedIO() const { return false; }
 
   // ---- Optional zero-copy hooks ----
   //
@@ -127,7 +168,19 @@ class IUMBPClient {
   // that *do* require registration MUST override; callers may treat a
   // `true` return as "registered or not-needed", and `false` as a hard
   // failure that must be surfaced.
-  virtual bool RegisterMemory(uintptr_t /*ptr*/, size_t /*size*/) { return true; }
+  /// `loc`/`device` describe the CALLER's allocation (CPU or a GPU ordinal),
+  /// not any storage medium — a GPU-resident src/dst (e.g. sglang HiCache
+  /// device-resident KV pages) must be registered as such so the transfer
+  /// layer picks HbmCopyEngine instead of assuming host memory.
+  /// `mode` picks whether the region is pinned and exported to the IO engine
+  /// or merely recorded for engine selection; see MemoryRegistration. A backend
+  /// with nothing to pin may ignore it.
+  virtual bool RegisterMemory(
+      uintptr_t /*ptr*/, size_t /*size*/,
+      mori::io::MemoryLocationType /*loc*/ = mori::io::MemoryLocationType::CPU, int /*device*/ = -1,
+      MemoryRegistration /*mode*/ = MemoryRegistration::kPinned) {
+    return true;
+  }
   virtual void DeregisterMemory(uintptr_t /*ptr*/) {}
 
   // ---- External KV Events (for unmanaged L1/L2 cache blocks) ----
@@ -181,9 +234,39 @@ class IUMBPClient {
   }
 };
 
+/// Fill in an embedded (in-process, no master, no networking) distributed
+/// block for a config that names no deployment, and return the result.
+///
+/// This is what makes "no configuration" mean "a private store in this
+/// process" now that there is no separate local client: the medium comes from
+/// the top-level dram/ssd blocks, identity is synthesized, and everything that
+/// needs a peer -- master address, IO engine host, peer service port -- is left
+/// empty so no socket is opened and no thread is started for a cluster this
+/// process is not part of.
+///
+/// Being embedded (in this process) and having a master are independent: a
+/// `distributed` block does NOT mean "not embedded", it means "I have opinions
+/// about some fields". Such a config keeps every value it sets and only has its
+/// blanks filled -- identity, and `dram_page_size` when it is 0 -- so a caller
+/// wanting one field need not hand-build the whole struct. The one value that
+/// is adjusted rather than merely filled is that page size, and only for a pool
+/// no peer shares (`peer_service_port == 0`): a page larger than the pool
+/// yields zero pages and makes every put fail with NO_SPACE silently, so an
+/// impossible size is shrunk to fit and warned about whether it was defaulted
+/// or asked for. The full set of embedded choices above is applied only
+/// when no `distributed` block was given at all, since only then is there no
+/// choice of the caller's to overwrite.
+///
+/// Two configs are returned unchanged: one naming `standalone_process` (a
+/// different client entirely -- the pool lives in the server process) and one
+/// whose `master_config.master_address` is non-empty (a cluster member, whose
+/// settings belong to the deployment rather than to us).
+UMBPConfig WithEmbeddedDefaults(const UMBPConfig& config);
+
 /// Factory: creates the appropriate IUMBPClient implementation.
-/// Creates StandaloneClient when config.distributed is not set,
-/// DistributedClient when it is.
+/// StandaloneProcessClient when config.standalone_process is set; otherwise a
+/// DistributedClient over WithEmbeddedDefaults(config), which covers a cluster
+/// member, a self-configured masterless node and a bare config alike.
 std::unique_ptr<IUMBPClient> CreateUMBPClient(const UMBPConfig& config = UMBPConfig{});
 
 }  // namespace mori::umbp

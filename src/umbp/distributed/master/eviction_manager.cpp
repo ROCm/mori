@@ -23,6 +23,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <iterator>
 #include <map>
 #include <string>
 #include <thread>
@@ -31,6 +32,7 @@
 #include <vector>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/grpc_limits.h"
 #include "umbp/distributed/master/evict_strategy.h"
 #include "umbp/distributed/master/master_metadata_store.h"
 #include "umbp/distributed/types.h"
@@ -96,11 +98,12 @@ void EvictionManager::RunOnce() {
 
   for (const auto& client : clients) {
     for (const auto& [tier, cap] : client.tier_capacities) {
-      // SSD eviction is purely peer-local.  Master must NOT turn an SSD
-      // overload into an EvictKey: EvictKey only acts on the peer's
-      // PeerDramAllocator, so it would wrongly evict the DRAM copy of the same
-      // key while leaving SSD untouched.
-      if (tier == TierType::SSD) continue;
+      // No tier is special-cased here any more (backend-agnostic refactor
+      // Phase 4).  The old `if (tier == SSD) continue` existed because EvictKey
+      // only ever reached the peer's DRAM allocator, so an SSD overload would
+      // have evicted the DRAM copy of the key instead; since Phase 3 EvictKey
+      // fans out to every backend by key, so an overloaded medium evicts from
+      // the medium that is actually overloaded.
       if (cap.total_bytes == 0) continue;
       uint64_t used = cap.total_bytes - cap.available_bytes;
       double usage = static_cast<double>(used) / static_cast<double>(cap.total_bytes);
@@ -120,15 +123,15 @@ void EvictionManager::RunOnce() {
   // Ask the store for eviction-eligible candidates in the overloaded buckets.
   // The store is policy-neutral: it returns rows ordered by the hint (LRU here,
   // so an indexed backend can push the ordering down) but makes no eviction
-  // decision and never sees the byte budget.  max_per_bucket=0 → no cap, so the
-  // strategy gets full candidate visibility.
+  // decision and never sees the byte budget. Limit each bucket to the configured
+  // round size; a still-overloaded bucket is revisited on the next interval.
   std::vector<NodeTierKey> buckets;
   buckets.reserve(bytes_to_free.size());
   for (const auto& [ntk, _bytes] : bytes_to_free) buckets.push_back(ntk);
 
-  auto candidates_by_bucket =
-      store_.EnumerateEvictionCandidates(buckets, EvictionOrder::kLeastRecentlyAccessed,
-                                         /*max_per_bucket=*/0, std::chrono::system_clock::now());
+  auto candidates_by_bucket = store_.EnumerateEvictionCandidates(
+      buckets, EvictionOrder::kLeastRecentlyAccessed, config_.evict_batch_size,
+      std::chrono::system_clock::now());
   if (candidates_by_bucket.empty()) {
     MORI_UMBP_DEBUG("[EvictionManager] No eviction candidates found");
     return;
@@ -174,10 +177,32 @@ void EvictionManager::RunOnce() {
                       node_id, keys.size());
       continue;
     }
-    // Master state is unchanged here — REMOVE events on the peer's
-    // next heartbeat are what shrink the index.  Re-eviction next
-    // round is safe because peer Evict is idempotent.
-    dispatcher_->DispatchEvictKey(node_id, it->second, std::move(keys));
+    // Chunked to the shared gRPC message limit.  An eviction round frees a
+    // FRACTION of the tier, so the victim list grows with the deployment while
+    // the limit does not: at 512 GiB a round selected 155,157 keys, which is
+    // 18.7 MB of `repeated string` and was refused whole on all 81 rounds --
+    // protobuf has no partial delivery, so being over the limit freed nothing
+    // rather than freeing most of it, and the tier could not un-fill itself.
+    //
+    // Splitting is safe in a way that most batch APIs are not: peer Evict is
+    // idempotent, master state is unchanged here (REMOVE events on the peer's
+    // next heartbeat are what shrink the index), and a chunk that fails is
+    // retried next round.  So N chunks reach the same state as one message
+    // would have, and a partial round still makes progress.
+    size_t sent = 0;
+    size_t chunks = 0;
+    while (sent < keys.size()) {
+      const size_t take = GrpcMaxItemsPerBatch(keys, sent);
+      std::vector<std::string> chunk(std::make_move_iterator(keys.begin() + sent),
+                                     std::make_move_iterator(keys.begin() + sent + take));
+      sent += take;
+      ++chunks;
+      dispatcher_->DispatchEvictKey(node_id, it->second, std::move(chunk));
+    }
+    if (chunks > 1) {
+      MORI_UMBP_DEBUG("[EvictionManager] node={} {} keys dispatched in {} chunks", node_id,
+                      keys.size(), chunks);
+    }
   }
 }
 

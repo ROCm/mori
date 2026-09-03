@@ -58,10 +58,10 @@
 #include "umbp/distributed/routing/route_get_strategy.h"
 #include "umbp/distributed/types.h"
 
+using mori::umbp::LocalPreferringRouteGetStrategy;
 using mori::umbp::Location;
 using mori::umbp::RandomRouteGetStrategy;
 using mori::umbp::RouteGetStrategy;
-using mori::umbp::TierPriorityRouteGetStrategy;
 using mori::umbp::TierType;
 
 namespace {
@@ -83,7 +83,11 @@ void Usage() {
 // Resolve the --get-strategy name to a concrete RouteGetStrategy.
 std::unique_ptr<RouteGetStrategy> MakeGetStrategy(const std::string& name) {
   if (name == "random") return std::make_unique<RandomRouteGetStrategy>();
-  if (name == "tier-priority") return std::make_unique<TierPriorityRouteGetStrategy>();
+  // "tier-priority" kept as an alias so existing invocations keep working; the
+  // strategy no longer ranks tiers (backend-agnostic refactor Phase 4).
+  if (name == "local-preferring" || name == "tier-priority") {
+    return std::make_unique<LocalPreferringRouteGetStrategy>();
+  }
   std::cerr << "Unknown --get-strategy: " << name << " (expected random|tier-priority)\n";
   std::exit(2);
 }

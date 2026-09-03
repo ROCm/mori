@@ -23,11 +23,13 @@
 //
 // MIT License
 #include <pthread.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <exception>
@@ -108,6 +110,15 @@ bool ParseBoolEnv(const char* name, bool* out, std::string* error) {
   return false;
 }
 
+// Identity for a masterless server: unique enough to tell two of them apart in
+// a log, and never published anywhere.
+std::string DefaultNodeId() {
+  char host[256] = {0};
+  if (gethostname(host, sizeof(host) - 1) != 0) host[0] = '\0';
+  const std::string hostname = host[0] != '\0' ? host : "localhost";
+  return "umbp-server-" + hostname + "-" + std::to_string(static_cast<long>(getpid()));
+}
+
 bool AnyEnv(const std::vector<const char*>& names) {
   for (const char* name : names) {
     if (EnvString(name).has_value()) return true;
@@ -117,15 +128,28 @@ bool AnyEnv(const std::vector<const char*>& names) {
 
 bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
                                           bool* distributed_requested, std::string* error) {
-  static const std::vector<const char*> kRequiredDistributedEnv = {
-      "UMBP_MASTER_ADDRESS",
-      "UMBP_NODE_ADDRESS",
-      "UMBP_NODE_ID",
-      "UMBP_IO_ENGINE_HOST",
+  // Any one of these asks for an explicitly configured backend.  Selecting the
+  // medium counts: a pure-SSD server is configured by naming SSD and nothing
+  // else, which is the whole command for a node that serves storage locally.
+  static const std::vector<const char*> kDistributedSelectorEnv = {
+      "UMBP_MASTER_ADDRESS", "UMBP_NODE_ADDRESS",       "UMBP_NODE_ID",
+      "UMBP_IO_ENGINE_HOST", "UMBP_DISTRIBUTED_MEDIUM",
   };
 
-  *distributed_requested = AnyEnv(kRequiredDistributedEnv);
+  *distributed_requested = AnyEnv(kDistributedSelectorEnv);
   if (!*distributed_requested) {
+    // Nothing configured: the factory fills in an embedded DRAM deployment.
+    // Refuse the one case where that would silently do the wrong thing --
+    // someone who explicitly asked for SSD and would otherwise get DRAM.
+    const char* ssd_enabled = std::getenv("UMBP_SSD_ENABLED");
+    if (ssd_enabled != nullptr && ssd_enabled[0] != '\0' && ssd_enabled[0] != '0') {
+      *error =
+          "UMBP_SSD_ENABLED is set but no medium was selected. A node serves one "
+          "medium: set UMBP_DISTRIBUTED_MEDIUM=SSD (with UMBP_SSD_DIR / "
+          "UMBP_SSD_CAPACITY) to serve storage, or unset UMBP_SSD_ENABLED to "
+          "serve DRAM.";
+      return false;
+    }
     config->distributed.reset();
     return true;
   }
@@ -134,28 +158,39 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
   auto node_address = EnvString("UMBP_NODE_ADDRESS");
   auto node_id = EnvString("UMBP_NODE_ID");
   auto io_engine_host = EnvString("UMBP_IO_ENGINE_HOST");
-  std::vector<const char*> missing;
-  if (!master_address.has_value()) missing.push_back("UMBP_MASTER_ADDRESS");
-  if (!node_address.has_value()) missing.push_back("UMBP_NODE_ADDRESS");
-  if (!node_id.has_value()) missing.push_back("UMBP_NODE_ID");
-  if (!io_engine_host.has_value()) missing.push_back("UMBP_IO_ENGINE_HOST");
-  if (!missing.empty()) {
-    std::ostringstream oss;
-    oss << "distributed-backed standalone server requested but missing required env:";
-    for (const char* name : missing) oss << " " << name;
-    *error = oss.str();
-    return false;
+
+  // With a master this node is a cluster member: peers reach it at an address
+  // it must state, and identity is how master tells it apart, so all three are
+  // required.  Without one, none of them has a consumer -- there is no
+  // registration, no routing and therefore no peer that could dial in -- so
+  // they are optional and an omitted IO engine host means no RDMA engine is
+  // constructed at all.
+  const bool has_master = master_address.has_value() && !master_address->empty();
+  if (has_master) {
+    std::vector<const char*> missing;
+    if (!node_address.has_value()) missing.push_back("UMBP_NODE_ADDRESS");
+    if (!node_id.has_value()) missing.push_back("UMBP_NODE_ID");
+    if (!io_engine_host.has_value()) missing.push_back("UMBP_IO_ENGINE_HOST");
+    if (!missing.empty()) {
+      std::ostringstream oss;
+      oss << "master-backed standalone server requested but missing required env:";
+      for (const char* name : missing) oss << " " << name;
+      *error = oss.str();
+      return false;
+    }
   }
 
   mori::umbp::UMBPDistributedConfig dist;
-  dist.master_config.master_address = *master_address;
-  dist.master_config.node_address = *node_address;
-  dist.master_config.node_id = *node_id;
-  dist.io_engine.host = *io_engine_host;
+  dist.master_config.master_address = master_address.value_or("");
+  dist.master_config.node_address = node_address.value_or("127.0.0.1");
+  dist.master_config.node_id = node_id.value_or(DefaultNodeId());
+  dist.io_engine.host = io_engine_host.value_or("");
 
   if (!ParseUint16Env("UMBP_IO_ENGINE_PORT", &dist.io_engine.port, error)) return false;
   if (!ParseUint16Env("UMBP_PEER_SERVICE_PORT", &dist.peer_service_port, error)) return false;
   if (!ParseSizeEnv("UMBP_DISTRIBUTED_STAGING_BUFFER_SIZE", &dist.staging_buffer_size, error))
+    return false;
+  if (!ParseSizeEnv("UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES", &dist.ranged_scratch_size, error))
     return false;
   if (!ParseSizeEnv("UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SIZE", &dist.ssd_staging_buffer_size,
                     error)) {
@@ -169,11 +204,50 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
     *error = "UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS must be > 0";
     return false;
   }
+  if (!ParseBoolEnv("UMBP_DISTRIBUTED_SSD_STAGING_USE_HUGEPAGES", &dist.ssd_staging_use_hugepages,
+                    error)) {
+    return false;
+  }
+  if (!ParseSizeEnv("UMBP_DISTRIBUTED_SSD_STAGING_HUGEPAGE_SIZE", &dist.ssd_staging_hugepage_size,
+                    error)) {
+    return false;
+  }
+  // The one medium this node serves.  Selecting SSD here is the whole opt-in
+  // for a storage node — there is no separate "pure-SSD mode" flag.  Unknown
+  // values are rejected rather than silently defaulting to DRAM, since serving
+  // the wrong medium is not something a node should discover at runtime.
+  if (const char* medium_env = std::getenv("UMBP_DISTRIBUTED_MEDIUM")) {
+    const std::string m(medium_env);
+    if (m == "DRAM" || m == "dram") {
+      dist.medium = mori::umbp::UMBPMedium::DRAM;
+    } else if (m == "HBM" || m == "hbm") {
+      dist.medium = mori::umbp::UMBPMedium::HBM;
+    } else if (m == "SSD" || m == "ssd") {
+      dist.medium = mori::umbp::UMBPMedium::SSD;
+    } else {
+      *error = "UMBP_DISTRIBUTED_MEDIUM must be one of: DRAM, HBM, SSD";
+      return false;
+    }
+  }
   if (!ParseBoolEnv("UMBP_DISTRIBUTED_CACHE_REMOTE_FETCHES", &dist.cache_remote_fetches, error))
     return false;
+  if (!ParseBoolEnv("UMBP_DISTRIBUTED_RANGED_LOCALITY_PREFETCH", &dist.ranged_locality_prefetch,
+                    error)) {
+    return false;
+  }
+  if (!ParseBoolEnv("UMBP_DISTRIBUTED_LOCAL_FIRST", &dist.local_first, error)) {
+    return false;
+  }
   size_t dram_page_size = static_cast<size_t>(dist.dram_page_size);
   if (!ParseSizeEnv("UMBP_DISTRIBUTED_DRAM_PAGE_SIZE", &dram_page_size, error)) return false;
   dist.dram_page_size = static_cast<uint64_t>(dram_page_size);
+  if (dist.dram_page_size == 0) {
+    *error = "UMBP_DISTRIBUTED_DRAM_PAGE_SIZE must be explicitly set to > 0";
+    return false;
+  }
+  if (auto policy = EnvString("UMBP_BACKEND_POLICY"); policy.has_value()) {
+    dist.backend_policy_path = *policy;
+  }
 
   config->distributed = dist;
   return true;
@@ -252,7 +326,7 @@ int main(int argc, char** argv) {
   });
 
   MORI_UMBP_INFO("[StandaloneServer] running on {} backend={}", address,
-                 distributed_requested ? "distributed" : "local");
+                 distributed_requested ? "configured" : "embedded (DRAM, no master)");
   server->Run();
 
   stop_signal_waiter = true;

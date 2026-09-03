@@ -99,6 +99,42 @@ def test_put_from_ptr_get_into_ptr_round_trip():
     assert client.clear()
 
 
+def test_batch_put_get_ranges_round_trip_and_shape_failure():
+    client = _make_client()
+    a = (ctypes.c_ubyte * 4)(*b"AAAA")
+    b = (ctypes.c_ubyte * 4)(*b"BBBB")
+    c = (ctypes.c_ubyte * 4)(*b"CCCC")
+
+    assert client.batch_put_ranges_from_ptr(
+        ["range_key"],
+        [12],
+        [[ctypes.addressof(b), ctypes.addressof(c), ctypes.addressof(a)]],
+        [[4, 4, 4]],
+        [[4, 8, 0]],
+    ) == [True]
+    assert client.exists("range_key")
+
+    prefix = (ctypes.c_ubyte * 4)()
+    suffix = (ctypes.c_ubyte * 4)()
+    assert client.batch_get_ranges_into_ptr(
+        ["range_key"],
+        [[ctypes.addressof(suffix), ctypes.addressof(prefix)]],
+        [[4, 4]],
+        [[8, 0]],
+    ) == [True]
+    assert bytes(prefix) == b"AAAA"
+    assert bytes(suffix) == b"CCCC"
+
+    # A ragged inner vector is a whole-call shape error.
+    assert client.batch_get_ranges_into_ptr(
+        ["range_key", "missing"],
+        [[ctypes.addressof(prefix)], [ctypes.addressof(suffix)]],
+        [[4, 4], [4]],
+        [[0], [0]],
+    ) == [False, False]
+    assert client.clear()
+
+
 def test_batch_put_get_multiple_page_components():
     client = _make_client()
     mem_pool = MockPageFirstKVCache(num_pages=4, page_size=1, element_size=256)

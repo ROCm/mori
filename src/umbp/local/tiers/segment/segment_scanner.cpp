@@ -27,10 +27,12 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cstring>
 #include <filesystem>
 #include <string>
 #include <vector>
 
+#include "umbp/common/aligned_buffer.h"
 #include "umbp/local/tiers/segment/segment_format.h"
 
 namespace fs = std::filesystem;
@@ -39,7 +41,7 @@ namespace mori::umbp::segment {
 
 bool Scanner::RefreshFromDisk(const std::string& dir, StorageIoDriver& io_driver, Index& index,
                               bool read_only_shared, bool force_full_rescan,
-                              std::string* error_message) const {
+                              std::string* error_message, int extra_open_flags) const {
   if (force_full_rescan) index.ResetMetadata();
 
   std::vector<uint64_t> ids;
@@ -64,7 +66,8 @@ bool Scanner::RefreshFromDisk(const std::string& dir, StorageIoDriver& io_driver
     Meta seg;
     seg.id = sid;
     seg.path = dir + "/" + BuildFileName(sid);
-    seg.fd = open(seg.path.c_str(), read_only_shared ? O_RDONLY : (O_RDWR | O_CREAT), 0644);
+    seg.fd = open(seg.path.c_str(),
+                  (read_only_shared ? O_RDONLY : (O_RDWR | O_CREAT)) | extra_open_flags, 0644);
     if (seg.fd < 0) {
       if (error_message) *error_message = "failed to open segment " + seg.path;
       return false;
@@ -92,30 +95,48 @@ bool Scanner::RefreshFromDisk(const std::string& dir, StorageIoDriver& io_driver
     uint64_t file_size = static_cast<uint64_t>(st.st_size);
     uint64_t offset = force_full_rescan ? 0 : seg.scanned_offset;
 
-    while (offset + sizeof(RecordHeader) <= file_size) {
+    // Header and key live in the record's aligned prefix, so one kRecordAlign
+    // block covers both for any key short enough to fit — always true for the
+    // hashed keys this tier stores, with a re-read for the pathological case.
+    // Reading whole aligned blocks into an aligned buffer is what keeps this
+    // loop legal when the fd carries O_DIRECT.
+    AlignedBuffer prefix(static_cast<size_t>(kRecordAlign));
+
+    while (offset + kRecordAlign <= file_size) {
+      IoStatus blk = io_driver.ReadAt(seg.fd, prefix.data(), prefix.padded_size(), offset);
+      if (!blk.ok()) break;
+
       RecordHeader hdr;
-      IoStatus hdr_status = io_driver.ReadAt(seg.fd, &hdr, sizeof(hdr), offset);
-      if (!hdr_status.ok()) break;
+      std::memcpy(&hdr, prefix.data(), sizeof(hdr));
       if (hdr.magic != kRecordMagic || hdr.version != kRecordVersion || hdr.key_len == 0) break;
-      const uint64_t rec_size =
-          sizeof(RecordHeader) + static_cast<uint64_t>(hdr.key_len) + hdr.value_size;
+
+      const uint64_t prefix_bytes = PrefixBytes(hdr.key_len);
+      const uint64_t rec_size = RecordBytes(hdr.key_len, hdr.value_size);
       if (offset + rec_size > file_size) break;
+
+      // Key spills past the first block (key_len > kRecordAlign - 32): widen the
+      // buffer and re-read the whole prefix, still aligned on both ends.
+      if (prefix_bytes > prefix.padded_size()) {
+        prefix.Resize(static_cast<size_t>(prefix_bytes));
+        IoStatus wide = io_driver.ReadAt(seg.fd, prefix.data(), prefix.padded_size(), offset);
+        if (!wide.ok()) break;
+      }
+
       if ((hdr.flags & kFlagCommitted) == 0) {
         offset += rec_size;
         continue;
       }
 
-      std::string key;
-      key.resize(hdr.key_len);
-      IoStatus key_status = io_driver.ReadAt(seg.fd, key.data(), hdr.key_len, offset + sizeof(hdr));
-      if (!key_status.ok()) break;
+      const std::string key(prefix.data() + sizeof(hdr), hdr.key_len);
 
       KeyMeta meta;
       meta.segment_id = seg.id;
-      meta.value_offset = offset + sizeof(hdr) + hdr.key_len;
+      meta.value_offset = offset + prefix_bytes;
       meta.size = hdr.value_size;
       meta.crc32 = hdr.crc32;
       meta.generation = hdr.generation;
+      meta.crc_valid = (hdr.flags & kFlagNoCrc) == 0;
+      meta.disk_bytes = static_cast<uint32_t>(rec_size);
       index.RecordRecoveredEntry(key, meta);
       offset += rec_size;
     }

@@ -45,7 +45,6 @@
 
 #include <atomic>
 #include <cstdint>
-#include <ctime>
 #include <memory>
 #include <optional>
 #include <string>
@@ -60,15 +59,6 @@
 
 namespace mori::umbp {
 namespace {
-
-static uint16_t AllocPort() {
-  static std::atomic<uint16_t> next{0};
-  if (next.load() == 0) {
-    std::srand(static_cast<unsigned>(std::time(nullptr)));
-    next.store(static_cast<uint16_t>(52000 + (std::rand() % 1500)));
-  }
-  return next.fetch_add(7);
-}
 
 // Canned per-key routing answer the mock server hands back.  A nullopt entry
 // (or a key absent from the table) is "not found".
@@ -136,13 +126,19 @@ class MockMasterService final : public ::umbp::UMBPMaster::Service {
 class BatchRouteGetColumnarTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    address_ = "127.0.0.1:" + std::to_string(AllocPort());
     service_ = std::make_unique<MockMasterService>();
+
+    // Port 0 asks the OS for a free one and reports it back; a guessed port
+    // collides on a busy host and BuildAndStart signals that only by
+    // returning nullptr.
+    int selected_port = 0;
     grpc::ServerBuilder builder;
-    builder.AddListeningPort(address_, grpc::InsecureServerCredentials());
+    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &selected_port);
     builder.RegisterService(service_.get());
     server_ = builder.BuildAndStart();
     ASSERT_NE(server_, nullptr);
+    ASSERT_NE(selected_port, 0);
+    address_ = "127.0.0.1:" + std::to_string(selected_port);
 
     UMBPMasterClientConfig cfg;
     cfg.node_id = "caller";

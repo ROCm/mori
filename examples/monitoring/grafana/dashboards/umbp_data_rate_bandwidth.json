@@ -498,6 +498,158 @@
           "refId": "E"
         }
       ]
+    },
+    {
+      "id": 104,
+      "title": "Ranged Bandwidth",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 68 },
+      "panels": []
+    },
+    {
+      "id": 33,
+      "title": "BatchPutRanges Per-Call Bandwidth - Local (GiB/s)",
+      "description": "Mean BatchPutRanges bandwidth (GiB/s, e2e call duration) for local traffic, per client. Bytes are the RANGE bytes committed, not whole objects.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 69 },
+      "fieldConfig": { "defaults": { "unit": "none", "min": 0 } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "rate(mori_umbp_client_batch_put_ranges_bandwidth_gibps_sum{traffic=\"local\"}[30s]) / rate(mori_umbp_client_batch_put_ranges_bandwidth_gibps_count{traffic=\"local\"}[30s])",
+          "legendFormat": "{{client}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 34,
+      "title": "BatchPutRanges Per-Call Bandwidth - Remote (GiB/s)",
+      "description": "Mean BatchPutRanges bandwidth (GiB/s, e2e call duration) for remote traffic, per client. Bytes are the RANGE bytes committed, not whole objects -- a remote ranged put assembles the object in the scratch arena before sending, so ranges and object size agree here.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 69 },
+      "fieldConfig": { "defaults": { "unit": "none", "min": 0 } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "rate(mori_umbp_client_batch_put_ranges_bandwidth_gibps_sum{traffic=\"remote\"}[30s]) / rate(mori_umbp_client_batch_put_ranges_bandwidth_gibps_count{traffic=\"remote\"}[30s])",
+          "legendFormat": "{{client}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 35,
+      "title": "BatchGetRanges Per-Call Bandwidth - Local (GiB/s)",
+      "description": "Mean BatchGetRanges bandwidth (GiB/s, e2e call duration) for local traffic, per client. Bytes are the RANGE bytes delivered, not whole objects.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 77 },
+      "fieldConfig": { "defaults": { "unit": "none", "min": 0 } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "rate(mori_umbp_client_batch_get_ranges_bandwidth_gibps_sum{traffic=\"local\"}[30s]) / rate(mori_umbp_client_batch_get_ranges_bandwidth_gibps_count{traffic=\"local\"}[30s])",
+          "legendFormat": "{{client}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 36,
+      "title": "BatchGetRanges Per-Call Bandwidth - Remote (GiB/s)",
+      "description": "Mean BatchGetRanges bandwidth (GiB/s, e2e call duration) for remote traffic, per client. Bytes are the RANGE bytes delivered, not whole objects -- a remote ranged get still pulls the FULL object over the wire into the scratch arena, so this understates wire traffic; see the inbound/outbound get byte counters above for that.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 77 },
+      "fieldConfig": { "defaults": { "unit": "none", "min": 0 } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "rate(mori_umbp_client_batch_get_ranges_bandwidth_gibps_sum{traffic=\"remote\"}[30s]) / rate(mori_umbp_client_batch_get_ranges_bandwidth_gibps_count{traffic=\"remote\"}[30s])",
+          "legendFormat": "{{client}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 37,
+      "title": "Global BatchPutRanges Per-Call Bandwidth (GiB/s, all clients)",
+      "description": "Global ranged-put bandwidth aggregated across all clients and traffic types (local+remote). Mean is exact (sum/count); percentiles use histogram_quantile over aggregated buckets.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 85 },
+      "fieldConfig": { "defaults": { "unit": "none", "min": 0 } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(rate(mori_umbp_client_batch_put_ranges_bandwidth_gibps_sum[30s])) / sum(rate(mori_umbp_client_batch_put_ranges_bandwidth_gibps_count[30s]))",
+          "legendFormat": "mean",
+          "refId": "A"
+        }
+,        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.50, sum by (le)(rate(mori_umbp_client_batch_put_ranges_bandwidth_gibps_bucket[30s])))",
+          "legendFormat": "p50",
+          "refId": "B"
+        }
+,        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.90, sum by (le)(rate(mori_umbp_client_batch_put_ranges_bandwidth_gibps_bucket[30s])))",
+          "legendFormat": "p90",
+          "refId": "C"
+        }
+,        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.95, sum by (le)(rate(mori_umbp_client_batch_put_ranges_bandwidth_gibps_bucket[30s])))",
+          "legendFormat": "p95",
+          "refId": "D"
+        }
+,        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.99, sum by (le)(rate(mori_umbp_client_batch_put_ranges_bandwidth_gibps_bucket[30s])))",
+          "legendFormat": "p99",
+          "refId": "E"
+        }
+      ]
+    },
+    {
+      "id": 38,
+      "title": "Global BatchGetRanges Per-Call Bandwidth (GiB/s, all clients)",
+      "description": "Global ranged-get bandwidth aggregated across all clients and traffic types (local+remote). Mean is exact (sum/count); percentiles use histogram_quantile over aggregated buckets. Compare against sglang:tree_connector_load_bandwidth_gb_s, which counts the same range bytes on the caller side.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 85 },
+      "fieldConfig": { "defaults": { "unit": "none", "min": 0 } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(rate(mori_umbp_client_batch_get_ranges_bandwidth_gibps_sum[30s])) / sum(rate(mori_umbp_client_batch_get_ranges_bandwidth_gibps_count[30s]))",
+          "legendFormat": "mean",
+          "refId": "A"
+        }
+,        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.50, sum by (le)(rate(mori_umbp_client_batch_get_ranges_bandwidth_gibps_bucket[30s])))",
+          "legendFormat": "p50",
+          "refId": "B"
+        }
+,        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.90, sum by (le)(rate(mori_umbp_client_batch_get_ranges_bandwidth_gibps_bucket[30s])))",
+          "legendFormat": "p90",
+          "refId": "C"
+        }
+,        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.95, sum by (le)(rate(mori_umbp_client_batch_get_ranges_bandwidth_gibps_bucket[30s])))",
+          "legendFormat": "p95",
+          "refId": "D"
+        }
+,        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.99, sum by (le)(rate(mori_umbp_client_batch_get_ranges_bandwidth_gibps_bucket[30s])))",
+          "legendFormat": "p99",
+          "refId": "E"
+        }
+      ]
     }
   ]
 }

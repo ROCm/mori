@@ -70,7 +70,16 @@ endif()
 target_link_libraries(
   test_umbp_client_metrics PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB}
                                    ${_TEST_GRPCPP_LIB} gtest)
-add_test(NAME umbp_client_metrics COMMAND test_umbp_client_metrics)
+# Registered as two cases from one binary: the buffering suites talk to a mock
+# service, while PoolClientLocalByteTracking stands up a real MasterServer and
+# belongs to the integration tier below. The default case excludes by name, so a
+# newly added suite lands there instead of silently going unrun.
+add_test(NAME umbp_client_metrics
+         COMMAND test_umbp_client_metrics
+                 --gtest_filter=-PoolClientLocalByteTrackingTest.*)
+add_test(NAME umbp_client_metrics_pool_bytes
+         COMMAND test_umbp_client_metrics
+                 --gtest_filter=PoolClientLocalByteTrackingTest.*)
 
 # ScopedRpcTimer / MasterClient RPC latency instrumentation.
 add_executable(test_umbp_master_client_rpc_latency
@@ -110,7 +119,13 @@ endif()
 target_link_libraries(
   test_umbp_tags PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB}
                          ${_TEST_GRPCPP_LIB} gtest_main)
-add_test(NAME umbp_tags COMMAND test_umbp_tags)
+# Split like umbp_client_metrics: RealMasterServerTags needs a live MasterServer
+# with a Prometheus port; the other suites run against the store or a mock
+# service.
+add_test(NAME umbp_tags
+         COMMAND test_umbp_tags --gtest_filter=-RealMasterServerTagsTest.*)
+add_test(NAME umbp_tags_real_master
+         COMMAND test_umbp_tags --gtest_filter=RealMasterServerTagsTest.*)
 
 # --------------------------------------------------------------------------
 # Unit tests (pure logic; no gRPC / RDMA).  Linked against umbp_common only.
@@ -119,6 +134,34 @@ add_test(NAME umbp_tags COMMAND test_umbp_tags)
 add_executable(test_umbp_types test_types.cpp)
 target_link_libraries(test_umbp_types PRIVATE umbp_common gtest_main)
 add_test(NAME umbp_types COMMAND test_umbp_types)
+
+add_executable(test_umbp_backend_policy_config test_backend_policy_config.cpp)
+target_link_libraries(test_umbp_backend_policy_config PRIVATE umbp_common
+                                                              gtest_main)
+# The test loads the example policy shipped in configs/ instead of keeping its
+# own copy, so the file and the parser cannot drift apart unnoticed.
+target_compile_definitions(
+  test_umbp_backend_policy_config
+  PRIVATE
+    UMBP_EXAMPLE_POLICY_PATH="${CMAKE_SOURCE_DIR}/examples/umbp/multi_backend_policy.json"
+)
+add_test(NAME umbp_backend_policy_config
+         COMMAND test_umbp_backend_policy_config)
+
+# Versioned workload trace codec, deterministic payloads, synthetic generators,
+# and the transport-neutral replay scheduler. These are hermetic unit tests;
+# the real PoolClient adapter is covered by the integration smoke below.
+add_executable(test_umbp_workload_trace test_umbp_workload_trace.cpp)
+add_dependencies(test_umbp_workload_trace umbp_workload_proto)
+target_link_libraries(test_umbp_workload_trace PRIVATE umbp_workload_bench
+                                                       gtest_main)
+add_test(NAME umbp_workload_trace COMMAND test_umbp_workload_trace)
+
+add_executable(test_umbp_workload_runner test_umbp_workload_runner.cpp)
+add_dependencies(test_umbp_workload_runner umbp_workload_proto)
+target_link_libraries(test_umbp_workload_runner PRIVATE umbp_workload_bench
+                                                        gtest_main)
+add_test(NAME umbp_workload_runner COMMAND test_umbp_workload_runner)
 
 # env_time helpers are header-only; tests only exercise the parser path. NOTE:
 # Production callers cache results in function-local statics that cannot be
@@ -137,14 +180,25 @@ target_link_libraries(test_umbp_route_put_strategy PRIVATE umbp_common
                                                            gtest_main)
 add_test(NAME umbp_route_put_strategy COMMAND test_umbp_route_put_strategy)
 
-# Master eviction policy plug-in: default LRU behavior + the EvictionManager DI
-# seam.  The seam test calls EvictionManager::RunOnce() directly (a public
-# single-pass trigger), so no special compile flags are needed.
+# Master eviction policy plug-in: the default LRU victim selection in isolation,
+# given candidates and a per-(node, tier) byte budget.
 add_executable(test_umbp_master_evict_strategy test_master_evict_strategy.cpp)
 target_link_libraries(test_umbp_master_evict_strategy PRIVATE umbp_common
                                                               gtest_main)
 add_test(NAME umbp_master_evict_strategy
          COMMAND test_umbp_master_evict_strategy)
+
+# The master-to-peer eviction chain, which the two tests above and test_peer_pool
+# only cover from their own ends: watermark detection, victim selection, and the
+# dispatch, wired into a real PeerPool so on_evict offload is driven the way a
+# deployed master drives it.  RunOnce() is private, so rounds are driven by
+# Start() at the one-second floor rather than called directly.
+add_executable(test_umbp_master_eviction_chain test_master_eviction_chain.cpp)
+target_link_libraries(test_umbp_master_eviction_chain PRIVATE umbp_common
+                                                             GTest::gtest_main)
+target_compile_features(test_umbp_master_eviction_chain PRIVATE cxx_std_17)
+add_test(NAME umbp_master_eviction_chain
+         COMMAND test_umbp_master_eviction_chain)
 
 # PageBitmapAllocator (peer-side per-tier page allocator primitive).
 add_executable(test_umbp_page_bitmap_allocator test_page_bitmap_allocator.cpp)
@@ -157,15 +211,6 @@ add_test(NAME umbp_page_bitmap_allocator
 # Integration tests (stand up in-process servers; gRPC + RDMA data path).
 # Registered as CTest cases under the "integration" label.
 # --------------------------------------------------------------------------
-
-add_executable(test_umbp_peer_service test_peer_service.cpp)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_link_options(test_umbp_peer_service PRIVATE -Wl,--no-as-needed)
-endif()
-target_link_libraries(
-  test_umbp_peer_service PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB}
-                                 ${_TEST_GRPCPP_LIB} gtest_main)
-add_test(NAME umbp_peer_service COMMAND test_umbp_peer_service)
 
 add_executable(test_umbp_cross_node_smoke test_cross_node_smoke.cpp)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -189,8 +234,103 @@ target_link_libraries(
 add_test(NAME umbp_pool_client_batch_put
          COMMAND test_umbp_pool_client_batch_put)
 
-set_tests_properties(umbp_peer_service umbp_cross_node_smoke
-                     umbp_pool_client_batch_put PROPERTIES LABELS "integration")
+# End-to-end workload replay through a live in-process master, two PoolClients,
+# and weighted same-tier backends. This needs the real gRPC + transfer path.
+add_executable(test_umbp_tier_benchmark test_umbp_tier_benchmark.cpp)
+add_dependencies(test_umbp_tier_benchmark umbp_workload_proto)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_tier_benchmark PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_tier_benchmark
+  PRIVATE umbp_core umbp_workload_bench ${_TEST_PROTOBUF_LIB}
+          ${_TEST_GRPCPP_LIB} gtest_main)
+add_test(NAME umbp_tier_benchmark COMMAND test_umbp_tier_benchmark)
+
+# test_umbp_medium_selection — one medium per node: the UMBPMedium -> TierType
+# lowering, the per-medium validation, and (live, 2-node) the registry holding
+# exactly one backend plus a cross-node BatchPut onto an SSD-only peer.
+add_executable(test_umbp_medium_selection test_medium_selection.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_medium_selection PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_medium_selection
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+add_test(NAME umbp_medium_selection COMMAND test_umbp_medium_selection)
+
+# test_umbp_local_first — PoolClientConfig::local_first: a fully-local batch
+# never contacts the master.  Asserted by STOPPING the master and reading
+# anyway, with a local_first=false twin that must fail on the same data.
+add_executable(test_umbp_local_first test_local_first.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_local_first PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_local_first
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+add_test(NAME umbp_local_first COMMAND test_umbp_local_first)
+
+# test_umbp_no_master — the distributed client with master_address empty: same
+# data plane, no routing/registration/heartbeat, a local miss is final.  No
+# master is started in that file, so reaching for one hangs or crashes rather
+# than passing quietly.
+add_executable(test_umbp_no_master test_no_master.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_no_master PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_no_master
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+add_test(NAME umbp_no_master COMMAND test_umbp_no_master)
+
+# test_umbp_pool_client_ranges — ranged multi-buffer I/O through PoolClient:
+# local range reads/writes against the node's own medium, the remote path via
+# the scratch arena, range validation, and GPU caller buffers.
+add_executable(test_umbp_pool_client_ranges test_pool_client_ranges.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_pool_client_ranges PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_pool_client_ranges
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+add_test(NAME umbp_pool_client_ranges COMMAND test_umbp_pool_client_ranges)
+
+# test_umbp_ssd_ranged_io — ranged multi-buffer I/O on an SSD-medium node
+# (doc/design-ssd-ranged-io.md, D0): the capability flag now turning on the
+# arena alone, plus local and remote ranged put/get against an SSD-only peer.
+add_executable(test_umbp_ssd_ranged_io test_ssd_ranged_io.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_ssd_ranged_io PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_ssd_ranged_io
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+add_test(NAME umbp_ssd_ranged_io COMMAND test_umbp_ssd_ranged_io)
+
+# test_umbp_range_map — the object-range -> page-range arithmetic on its own.
+# Header-only and node-free, so it is a plain unit test rather than an
+# integration one: the shapes that matter (short last page, range ending on the
+# object's last byte, one byte past the end) are awkward to reach through a
+# live two-node fixture, and a mistake there corrupts a KV block silently
+# rather than failing.
+add_executable(test_umbp_range_map test_range_map.cpp)
+target_link_libraries(test_umbp_range_map PRIVATE umbp_common gtest_main)
+add_test(NAME umbp_range_map COMMAND test_umbp_range_map)
+
+set_tests_properties(umbp_cross_node_smoke umbp_pool_client_batch_put
+                     umbp_medium_selection umbp_tier_benchmark
+                     umbp_client_metrics_pool_bytes umbp_tags_real_master
+                     umbp_pool_client_ranges umbp_ssd_ranged_io
+                     PROPERTIES
+                       LABELS "integration"
+                       ENVIRONMENT
+                         "MORI_IO_QP_MAX_SEND_WR=1024;MORI_IO_QP_MAX_CQE=4096")
 
 # --------------------------------------------------------------------------
 # Benchmarks (manual; built but NOT registered with add_test).
@@ -223,6 +363,20 @@ target_link_libraries(
   PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
           gtest_main)
 
+# Layer-wise ranged-restore bench: drives BatchGetRanges the way the sglang
+# tree connector does (N ranks walking layer groups over the same keys) and
+# reports TTFL, wire bytes and repeat-remote alongside latency.  Standalone
+# executable, not a CTest target.
+add_executable(bench_umbp_pool_client_ranges bench_pool_client_ranges.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(bench_umbp_pool_client_ranges PRIVATE
+                      -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  bench_umbp_pool_client_ranges
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+
 # RoutePut strategy bench: compares batch put / put-then-get performance and
 # placement distribution across UMBP_ROUTE_PUT_SELECT_ALGO x
 # UMBP_ROUTE_PUT_NODE_AFFINITY under roomy/tight capacity regimes.  Standalone
@@ -244,23 +398,21 @@ target_link_libraries(bench_umbp_route_strategy PRIVATE umbp_common)
 
 # ===========================================================================
 # Metadata-store / external-KV / SSD-tier suite (migrated from src/umbp/tests).
-# These link umbp_common (pure logic) except test_peer_ssd_read_rpc, which
-# exercises the gRPC peer service and links umbp_core + protobuf/gRPC. Each
-# binary is registered as a single ctest via add_test (see the NOTE above).
+# These link umbp_common (pure logic). Each binary is registered as a single
+# ctest via add_test (see the NOTE above).
 # ===========================================================================
 
-# test_master_metadata_store_interface — Phase 1 compile/instantiation gate for
-# IMasterMetadataStore. Includes an isolated self-compile TU (proves the header
-# is self-contained) and a GMock mock instantiation/signature-completeness test.
-add_executable(
-  test_master_metadata_store_interface test_master_metadata_store_interface.cpp
-                                       master_metadata_store_self_compile.cpp)
-target_include_directories(test_master_metadata_store_interface
-                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(test_master_metadata_store_interface
-                      PRIVATE umbp_common GTest::gmock GTest::gtest_main)
-target_compile_features(test_master_metadata_store_interface PRIVATE cxx_std_17)
-add_test(NAME test_master_metadata_store_interface COMMAND test_master_metadata_store_interface)
+# IMasterMetadataStore header self-compile gate: this TU includes only the
+# interface header, so building it proves the header is self-contained. No
+# add_test — there is nothing to assert at runtime, and the interface's
+# polymorphic use is exercised for real by test_in_memory_master_metadata_store,
+# which drives every case through IMasterMetadataStore&.
+add_library(umbp_master_metadata_store_self_compile OBJECT
+            master_metadata_store_self_compile.cpp)
+target_link_libraries(umbp_master_metadata_store_self_compile
+                      PRIVATE umbp_common)
+target_compile_features(umbp_master_metadata_store_self_compile
+                        PRIVATE cxx_std_17)
 
 # test_in_memory_master_metadata_store — Phase 2 behavioral suite for the
 # InMemoryMasterMetadataStore implementation of IMasterMetadataStore (§6a).
@@ -271,12 +423,91 @@ target_link_libraries(test_in_memory_master_metadata_store
 target_compile_features(test_in_memory_master_metadata_store PRIVATE cxx_std_17)
 add_test(NAME test_in_memory_master_metadata_store COMMAND test_in_memory_master_metadata_store)
 
-# test_peer_dram_allocator
-add_executable(test_peer_dram_allocator test_peer_dram_allocator.cpp)
-target_link_libraries(test_peer_dram_allocator PRIVATE umbp_common
-                                                       GTest::gtest_main)
-target_compile_features(test_peer_dram_allocator PRIVATE cxx_std_17)
-add_test(NAME test_peer_dram_allocator COMMAND test_peer_dram_allocator)
+# test_page_backend — PageBackend (formerly PeerDramAllocator), one instance
+# == one medium (backend-agnostic refactor Phase 2)
+add_executable(test_page_backend test_page_backend.cpp)
+target_link_libraries(test_page_backend PRIVATE umbp_common
+                                                GTest::gtest_main)
+target_compile_features(test_page_backend PRIVATE cxx_std_17)
+add_test(NAME test_page_backend COMMAND test_page_backend)
+
+# BackendRegistry dispatch and the heartbeat event aggregation MediumBackend
+# absorbed from OwnedLocationSource. MockBackend is only the test double.
+add_executable(test_backend_registry test_backend_registry.cpp)
+target_link_libraries(test_backend_registry PRIVATE umbp_common GTest::gtest_main)
+target_compile_features(test_backend_registry PRIVATE cxx_std_17)
+add_test(NAME test_backend_registry COMMAND test_backend_registry)
+
+# test_peer_pool — implicit default Pool, SingleBackendPolicy compatibility,
+# logical key placement, named same-tier backend dispatch, and recovery fallback.
+# Registered under the umbp_ prefix so CI's ctest filter picks it up.
+add_executable(test_peer_pool test_peer_pool.cpp)
+target_link_libraries(test_peer_pool PRIVATE umbp_common GTest::gtest_main)
+target_compile_features(test_peer_pool PRIVATE cxx_std_17)
+add_test(NAME umbp_peer_pool COMMAND test_peer_pool)
+
+# test_transfer_engine — the Phase 6 transfer layer without gRPC or RDMA:
+# LocalCopyEngine's planner/executor and CompositeTransferEngine's fan-out
+# registration + per-pair engine selection.  MoriIoEngine needs a real fabric
+# and is covered end-to-end by test_cross_node_smoke instead.
+add_executable(test_transfer_engine test_transfer_engine.cpp)
+target_link_libraries(test_transfer_engine PRIVATE umbp_common GTest::gtest_main)
+target_compile_features(test_transfer_engine PRIVATE cxx_std_17)
+add_test(NAME test_transfer_engine COMMAND test_transfer_engine)
+
+# test_component_metrics — the observability seam: MetricPublisher's delta /
+# gauge / baseline rules, InstrumentedBackend deriving the generic backend
+# series from the MediumBackend interface alone (asserted against MockBackend,
+# which carries no metrics code — that is the genericity guarantee), and the
+# composite transfer engine's per-engine byte/plan accounting.
+add_executable(test_component_metrics test_component_metrics.cpp)
+target_link_libraries(test_component_metrics PRIVATE umbp_common
+                                                     GTest::gtest_main)
+target_compile_features(test_component_metrics PRIVATE cxx_std_17)
+add_test(NAME test_component_metrics COMMAND test_component_metrics)
+
+# test_gds_engine — GdsEngine routing/planning (no GPU) plus a GPU + hipFile
+# read round trip (skipped without a device, or on a filesystem that rejects
+# O_DIRECT). Built only when hipfile is available; umbp_common already carries
+# hip::hipfile and the UMBP_ENABLE_GDS definition in that case.
+if(TARGET hip::hipfile)
+  add_executable(test_gds_engine test_gds_engine.cpp)
+  target_link_libraries(test_gds_engine PRIVATE umbp_common hip::host GTest::gtest_main)
+  target_compile_features(test_gds_engine PRIVATE cxx_std_17)
+  add_test(NAME test_gds_engine COMMAND test_gds_engine)
+endif()
+
+# test_hbm_backend — the HBM medium and the engine that had to exist for it:
+# HbmCopyEngine's selection/planner (no GPU needed) plus real H2D/D2H/D2D bytes
+# and a Put/Get round trip against an hipMalloc'd pool (skipped without a GPU).
+add_executable(test_hbm_backend test_hbm_backend.cpp)
+target_link_libraries(test_hbm_backend PRIVATE umbp_common hip::host
+                                               GTest::gtest_main)
+target_compile_features(test_hbm_backend PRIVATE cxx_std_17)
+add_test(NAME test_hbm_backend COMMAND test_hbm_backend)
+
+# test_ssd_backend — SSD as a MediumBackend, staged through registered host
+# DRAM: Put spills to the tier, Get stages back under a read lease, and the
+# staging arena's exhaustion / reaping / eviction interactions.
+add_executable(test_ssd_backend test_ssd_backend.cpp)
+target_link_libraries(test_ssd_backend PRIVATE umbp_common GTest::gtest_main)
+target_compile_features(test_ssd_backend PRIVATE cxx_std_17)
+add_test(NAME test_ssd_backend COMMAND test_ssd_backend)
+
+# test_peer_service_dispatch — PeerServiceServer dispatch through
+# BackendRegistry: tier compatibility, named same-tier instances, the
+# backend-id-tagged opaque slot_id that makes Commit/Abort unambiguous,
+# mixed-backend batch ordering, and resolve/evict fan-out. Drives the real gRPC
+# surface, so it needs the generated proto + protobuf.
+add_executable(test_peer_service_dispatch test_peer_service_dispatch.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_peer_service_dispatch PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_peer_service_dispatch PRIVATE umbp_common ${_TEST_PROTOBUF_LIB}
+                                     GTest::gtest_main)
+target_compile_features(test_peer_service_dispatch PRIVATE cxx_std_17)
+add_test(NAME test_peer_service_dispatch COMMAND test_peer_service_dispatch)
 
 # test_router_dedup — master-side BatchRoutePut dedup via IMasterMetadataStore
 add_executable(test_router_dedup test_router_dedup.cpp)
@@ -284,12 +515,20 @@ target_link_libraries(test_router_dedup PRIVATE umbp_common GTest::gtest_main)
 target_compile_features(test_router_dedup PRIVATE cxx_std_17)
 add_test(NAME test_router_dedup COMMAND test_router_dedup)
 
-# test_peer_ssd_manager — SSD tier ownership + owned-location source
+# test_peer_ssd_manager — SSD tier ownership (reachable again: SsdBackend is the
+# MediumBackend adapter that drives it)
 add_executable(test_peer_ssd_manager test_peer_ssd_manager.cpp)
 target_link_libraries(test_peer_ssd_manager PRIVATE umbp_common
                                                     GTest::gtest_main)
 target_compile_features(test_peer_ssd_manager PRIVATE cxx_std_17)
 add_test(NAME test_peer_ssd_manager COMMAND test_peer_ssd_manager)
+
+# test_peer_ssd_single_flight — same-key read coalescing (leader/follower)
+add_executable(test_peer_ssd_single_flight test_peer_ssd_single_flight.cpp)
+target_link_libraries(test_peer_ssd_single_flight PRIVATE umbp_common
+                                                          GTest::gtest_main)
+target_compile_features(test_peer_ssd_single_flight PRIVATE cxx_std_17)
+add_test(NAME test_peer_ssd_single_flight COMMAND test_peer_ssd_single_flight)
 
 # test_peer_ssd_eviction — LRU + watermark eviction + in-flight guard
 add_executable(test_peer_ssd_eviction test_peer_ssd_eviction.cpp)
@@ -304,42 +543,6 @@ target_link_libraries(test_ssd_copy_pipeline PRIVATE umbp_common
                                                      GTest::gtest_main)
 target_compile_features(test_ssd_copy_pipeline PRIVATE cxx_std_17)
 add_test(NAME test_ssd_copy_pipeline COMMAND test_ssd_copy_pipeline)
-
-# test_tier_priority_route_get — RouteGet tier-priority strategy
-add_executable(test_tier_priority_route_get test_tier_priority_route_get.cpp)
-target_link_libraries(test_tier_priority_route_get PRIVATE umbp_common
-                                                           GTest::gtest_main)
-target_compile_features(test_tier_priority_route_get PRIVATE cxx_std_17)
-add_test(NAME test_tier_priority_route_get COMMAND test_tier_priority_route_get)
-
-# test_peer_ssd_read_rpc — SSD read RPC over a gRPC loopback. Needs the gRPC
-# peer service + generated stubs (umbp_core) and protobuf/gRPC.
-add_executable(test_peer_ssd_read_rpc test_peer_ssd_read_rpc.cpp)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_link_options(test_peer_ssd_read_rpc PRIVATE -Wl,--no-as-needed)
-endif()
-target_link_libraries(
-  test_peer_ssd_read_rpc PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB}
-                                 ${_TEST_GRPCPP_LIB} GTest::gtest_main)
-target_compile_features(test_peer_ssd_read_rpc PRIVATE cxx_std_17)
-add_test(NAME test_peer_ssd_read_rpc COMMAND test_peer_ssd_read_rpc)
-
-# test_ssd_read_lease_gating — pure reader-side lease gating decision logic
-# (ssd_read_lease.h). Header-only under test (no gRPC / RDMA deps).
-add_executable(test_ssd_read_lease_gating test_ssd_read_lease_gating.cpp)
-target_link_libraries(test_ssd_read_lease_gating PRIVATE umbp_common
-                                                         GTest::gtest_main)
-target_compile_features(test_ssd_read_lease_gating PRIVATE cxx_std_17)
-add_test(NAME test_ssd_read_lease_gating COMMAND test_ssd_read_lease_gating)
-
-# test_ssd_reliability — cross-component reliability: owned-source DRAM+SSD
-# merge, SSD evict -> REMOVE -> master index convergence, tier-priority over the
-# real index, crash-restart discard, and observability counters.
-add_executable(test_ssd_reliability test_ssd_reliability.cpp)
-target_link_libraries(test_ssd_reliability PRIVATE umbp_common
-                                                   GTest::gtest_main)
-target_compile_features(test_ssd_reliability PRIVATE cxx_std_17)
-add_test(NAME test_ssd_reliability COMMAND test_ssd_reliability)
 
 # test_cache_remote_admission — cache_remote_fetches admission-gate unit test
 # (hermetic; no GPU/RDMA/master).
@@ -425,17 +628,15 @@ if(USE_REDIS_BACKEND)
   target_link_libraries(test_sharded_read PRIVATE umbp_common GTest::gtest_main)
   target_compile_features(test_sharded_read PRIVATE cxx_std_17)
   add_test(NAME test_sharded_read COMMAND test_sharded_read)
-
-  # redis-plus-plus link/build smoke test. Proves the submodule compiles with
-  # this toolchain and links (static redis++ + system hiredis) before any store
-  # code depends on it; at runtime it connects to UMBP_REDIS_URI if reachable,
-  # else skips. redis++_static carries its own include dirs; hiredis must be
-  # linked explicitly (the system hiredis ships no CMake config, so redis++ does
-  # not propagate it for the static lib).
-  add_executable(test_redispp_smoke test_redispp_smoke.cpp)
-  target_link_libraries(test_redispp_smoke
-                        PRIVATE redis++_static ${HIREDIS_LIB} GTest::gtest_main)
-  target_include_directories(test_redispp_smoke PRIVATE ${HIREDIS_INCLUDE_DIR})
-  target_compile_features(test_redispp_smoke PRIVATE cxx_std_17)
-  add_test(NAME test_redispp_smoke COMMAND test_redispp_smoke)
 endif()
+
+# GDS-vs-staging A/B for SSD reads into device memory.  Run twice, once with
+# UMBP_ENABLE_GDS=1, and diff the CSV.  Standalone executable; not a CTest
+# target, because it needs a real block-backed --dir to measure anything.
+add_executable(bench_umbp_gds_ssd_get bench_gds_ssd_get.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(bench_umbp_gds_ssd_get PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  bench_umbp_gds_ssd_get
+  PRIVATE umbp_core umbp_common hip::host ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB})

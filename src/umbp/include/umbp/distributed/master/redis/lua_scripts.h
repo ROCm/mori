@@ -67,7 +67,7 @@ namespace mori::umbp::redis {
 
 // register_client:
 //   KEYS[1] = node key
-//   ARGV = [tag, node_id, now_ms, stale_after_ms, addr, peer, caps, engine, tags]
+//   ARGV = [tag, node_id, now_ms, stale_after_ms, addr, peer, caps, engine, tags, lcaps]
 //   Returns 1 if registered/revived, 0 if rejected (ALIVE and not stale).
 inline const std::string kRegisterClientLua = R"LUA(--!df flags=allow-undeclared-keys
 local nodeKey = KEYS[1]
@@ -87,7 +87,7 @@ redis.call('DEL', nodeKey)
 redis.call('HSET', nodeKey,
   'status', 1, 'last_hb', now, 'reg_at', now, 'seq', 0,
   'addr', ARGV[5], 'peer', ARGV[6], 'caps', ARGV[7],
-  'engine', ARGV[8], 'tags', ARGV[9])
+  'engine', ARGV[8], 'tags', ARGV[9], 'lcaps', ARGV[10])
 redis.call('SADD', tag .. ':nodes:alive', nodeId)
 redis.call('HSET', tag .. ':alive_peers', nodeId, ARGV[6])
 return 1
@@ -95,8 +95,8 @@ return 1
 
 // apply_heartbeat:
 //   KEYS[1] = node key
-//   ARGV = [tag, node_id, seq, now_ms, is_full_sync, caps_blob, n_events,
-//           then per event: kind, block_key, tier, size]
+//   ARGV = [tag, node_id, seq, now_ms, is_full_sync, caps_blob, lcaps_blob, n_events,
+//           then per event: kind, block_key, tier, size, logical_tier]
 //   `block_key` is the FULL (already sharded) block key composed by the caller
 //   (KeySchema::Block), so this script never has to know the shard layout. The
 //   node's reverse-index set stores these full block keys as members.
@@ -110,7 +110,8 @@ local seq = tonumber(ARGV[3])
 local now = tonumber(ARGV[4])
 local full = tonumber(ARGV[5])
 local caps = ARGV[6]
-local nev = tonumber(ARGV[7])
+local lcaps = ARGV[7]
+local nev = tonumber(ARGV[8])
 
 if redis.call('EXISTS', nodeKey) == 0 then
   return { 'UNKNOWN', '0' }
@@ -127,7 +128,8 @@ if full == 0 and seq ~= last + 1 then
   return { 'SEQ_GAP', tostring(last) }
 end
 
-redis.call('HSET', nodeKey, 'last_hb', now, 'status', 1, 'seq', seq, 'caps', caps)
+redis.call('HSET', nodeKey, 'last_hb', now, 'status', 1, 'seq', seq,
+  'caps', caps, 'lcaps', lcaps)
 redis.call('SADD', aliveSet, nodeId)
 redis.call('HSET', peers, nodeId, peer)
 
@@ -143,19 +145,25 @@ local function cleanupEmpty(bk)
   if not anyLoc then redis.call('DEL', bk) end
 end
 
-local function addLoc(blockKey, tier, size)
+local function locationField(tier, logical)
+  local field = 'l|' .. nodeId .. '|' .. tier
+  if logical ~= '' then field = field .. '|' .. logical end
+  return field
+end
+
+local function addLoc(blockKey, tier, size, logical)
   if redis.call('EXISTS', blockKey) == 0 then
     redis.call('HSET', blockKey, '_created', now, '_lacc', now, '_acnt', 0)
   end
-  local field = 'l|' .. nodeId .. '|' .. tier
+  local field = locationField(tier, logical)
   if redis.call('HEXISTS', blockKey, field) == 0 then
     redis.call('HSET', blockKey, field, size)
     redis.call('SADD', blocksSet, blockKey)
   end
 end
 
-local function removeLoc(blockKey, tier)
-  local field = 'l|' .. nodeId .. '|' .. tier
+local function removeLoc(blockKey, tier, logical)
+  local field = locationField(tier, logical)
   if redis.call('HDEL', blockKey, field) == 1 then
     local flds = redis.call('HKEYS', blockKey)
     local nodeStill = false
@@ -180,18 +188,18 @@ if full == 1 then
   end
   redis.call('DEL', blocksSet)
   for i = 0, nev - 1 do
-    local base = 8 + i * 4
+    local base = 9 + i * 5
     if tonumber(ARGV[base]) == 0 then
-      addLoc(ARGV[base + 1], ARGV[base + 2], ARGV[base + 3])
+      addLoc(ARGV[base + 1], ARGV[base + 2], ARGV[base + 3], ARGV[base + 4])
     end
   end
 else
   for i = 0, nev - 1 do
-    local base = 8 + i * 4
+    local base = 9 + i * 5
     if tonumber(ARGV[base]) == 0 then
-      addLoc(ARGV[base + 1], ARGV[base + 2], ARGV[base + 3])
+      addLoc(ARGV[base + 1], ARGV[base + 2], ARGV[base + 3], ARGV[base + 4])
     else
-      removeLoc(ARGV[base + 1], ARGV[base + 2])
+      removeLoc(ARGV[base + 1], ARGV[base + 2], ARGV[base + 4])
     end
   end
 end
@@ -204,7 +212,7 @@ return { 'APPLIED', tostring(seq) }
 //     KEYS stays single-slot on Redis Cluster / one proactor on Dragonfly).
 //   ARGV = [now_ms, lease_ms, n_exclude, exclude_node_1..exclude_node_k]
 //   Returns an array of n elements; element i is a flat array
-//   [node, size, tier, node, size, tier, ...] of the surviving locations.
+//   [node, size, tier, logical_tier, ...] of the surviving locations.
 //   Only keys with >=1 surviving location get a lease + access bump.
 //
 //   The per-key HGETALL already returns _acnt, so the lease/access bump folds
@@ -234,11 +242,15 @@ for i = 1, #KEYS do
       local sep = string.find(rest, '|', 1, true)
       if sep ~= nil then
         local node = string.sub(rest, 1, sep - 1)
-        local tier = string.sub(rest, sep + 1)
+        local tail = string.sub(rest, sep + 1)
+        local tierSep = string.find(tail, '|', 1, true)
+        local tier = tierSep and string.sub(tail, 1, tierSep - 1) or tail
+        local logical = tierSep and string.sub(tail, tierSep + 1) or ''
         if not excl[node] then
           locs[#locs + 1] = node
           locs[#locs + 1] = v
           locs[#locs + 1] = tier
+          locs[#locs + 1] = logical
           touched = true
         end
       end
@@ -402,7 +414,7 @@ return dead
 
 // apply_heartbeat_control (control instance):
 //   KEYS[1] = node key
-//   ARGV = [tag, node_id, seq, now_ms, is_full_sync, caps_blob]
+//   ARGV = [tag, node_id, seq, now_ms, is_full_sync, caps_blob, lcaps_blob]
 //   seq-CAS + record + nodes:alive/alive_peers ONLY (no block work).
 //   Returns { status_string, acked_seq_string } like apply_heartbeat.
 inline const std::string kApplyHeartbeatControlLua = R"LUA(--!df flags=allow-undeclared-keys
@@ -413,6 +425,7 @@ local seq = tonumber(ARGV[3])
 local now = tonumber(ARGV[4])
 local full = tonumber(ARGV[5])
 local caps = ARGV[6]
+local lcaps = ARGV[7]
 if redis.call('EXISTS', nodeKey) == 0 then
   return { 'UNKNOWN', '0' }
 end
@@ -426,7 +439,8 @@ if full == 0 and seq ~= last + 1 then
   redis.call('HSET', peers, nodeId, peer)
   return { 'SEQ_GAP', tostring(last) }
 end
-redis.call('HSET', nodeKey, 'last_hb', now, 'status', 1, 'seq', seq, 'caps', caps)
+redis.call('HSET', nodeKey, 'last_hb', now, 'status', 1, 'seq', seq,
+  'caps', caps, 'lcaps', lcaps)
 redis.call('SADD', aliveSet, nodeId)
 redis.call('HSET', peers, nodeId, peer)
 return { 'APPLIED', tostring(seq) }
@@ -434,7 +448,7 @@ return { 'APPLIED', tostring(seq) }
 
 // apply_block_events (one shard's instance):
 //   ARGV = [revidx_key, node_prefix, is_full_sync, now_ms, n_events,
-//           then per event: kind, block_key, tier, size]
+//           then per event: kind, block_key, tier, size, logical_tier]
 //   `revidx_key` is this (node, shard) reverse-index set; `node_prefix` is
 //   'l|<node>|'. All block keys passed in ARGV are on this instance/slot.
 //   Idempotent: ADD overwrites, REMOVE of a missing loc is a no-op, full_sync
@@ -455,19 +469,25 @@ local function cleanupEmpty(bk)
   redis.call('DEL', bk)
 end
 
-local function addLoc(bk, tier, size)
+local function locationField(tier, logical)
+  local field = nodePfx .. tier
+  if logical ~= '' then field = field .. '|' .. logical end
+  return field
+end
+
+local function addLoc(bk, tier, size, logical)
   if redis.call('EXISTS', bk) == 0 then
     redis.call('HSET', bk, '_created', now, '_lacc', now, '_acnt', 0)
   end
-  local field = nodePfx .. tier
+  local field = locationField(tier, logical)
   if redis.call('HEXISTS', bk, field) == 0 then
     redis.call('HSET', bk, field, size)
     redis.call('SADD', revidx, bk)
   end
 end
 
-local function removeLoc(bk, tier)
-  local field = nodePfx .. tier
+local function removeLoc(bk, tier, logical)
+  local field = locationField(tier, logical)
   if redis.call('HDEL', bk, field) == 1 then
     local flds = redis.call('HKEYS', bk)
     local still = false
@@ -490,16 +510,16 @@ if full == 1 then
   end
   redis.call('DEL', revidx)
   for i = 0, nev - 1 do
-    local base = 6 + i * 4
-    if tonumber(ARGV[base]) == 0 then addLoc(ARGV[base + 1], ARGV[base + 2], ARGV[base + 3]) end
+    local base = 6 + i * 5
+    if tonumber(ARGV[base]) == 0 then addLoc(ARGV[base + 1], ARGV[base + 2], ARGV[base + 3], ARGV[base + 4]) end
   end
 else
   for i = 0, nev - 1 do
-    local base = 6 + i * 4
+    local base = 6 + i * 5
     if tonumber(ARGV[base]) == 0 then
-      addLoc(ARGV[base + 1], ARGV[base + 2], ARGV[base + 3])
+      addLoc(ARGV[base + 1], ARGV[base + 2], ARGV[base + 3], ARGV[base + 4])
     else
-      removeLoc(ARGV[base + 1], ARGV[base + 2])
+      removeLoc(ARGV[base + 1], ARGV[base + 2], ARGV[base + 4])
     end
   end
 end
@@ -871,7 +891,9 @@ for ki = 1, #KEYS do
           local sep = string.find(rest, '|', 1, true)
           if sep ~= nil then
             local node = string.sub(rest, 1, sep - 1)
-            local tier = string.sub(rest, sep + 1)
+            local tail = string.sub(rest, sep + 1)
+            local tierSep = string.find(tail, '|', 1, true)
+            local tier = tierSep and string.sub(tail, 1, tierSep - 1) or tail
             if wanted[node] and wanted[node][tier] then
               cands[#cands + 1] = bk
               cands[#cands + 1] = node

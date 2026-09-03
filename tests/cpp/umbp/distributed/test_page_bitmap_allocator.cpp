@@ -25,7 +25,7 @@
 #include <stdexcept>
 #include <vector>
 
-#include "umbp/distributed/peer/peer_page_allocator.h"
+#include "umbp/distributed/peer/backend/peer_page_allocator.h"
 #include "umbp/distributed/types.h"
 
 namespace {

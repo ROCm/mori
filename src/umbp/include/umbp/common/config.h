@@ -78,12 +78,67 @@ struct UMBPDurabilityConfig {
 
 struct UMBPSsdConfig {
   bool enabled = true;
+  // Comma-separated (same convention as spdk_nvme_pci_addr).  Naming >1 directory
+  // — normally one mount point per drive — fans the tier across them via
+  // ShardedSsdTier for their aggregate bandwidth.  capacity_bytes is the TOTAL,
+  // split evenly among the directories.
   std::string storage_dir = "/tmp/umbp_ssd";
   size_t capacity_bytes = 32ULL * 1024 * 1024 * 1024;
   UMBPSsdLayoutMode layout_mode = UMBPSsdLayoutMode::SegmentedLog;
   size_t segment_size_bytes = 256ULL * 1024 * 1024;
   UMBPIoConfig io;
   UMBPDurabilityConfig durability;
+
+  // Threads for the sharded tier's batch paths, i.e. ACROSS drives.  0 = one per
+  // shard, which is what saturates N drives.  Ignored with a single directory.
+  int shard_io_threads = 0;
+
+  // Threads for the CPU-bound phases WITHIN one SSDTier (CRC verify on read, CRC
+  // + record assembly on write).  Defaults to 4 to match the DRAM tier, so a
+  // DRAM-vs-SSD comparison is not silently 4 threads against 1.
+  int tier_io_threads = 4;
+
+  // Bypass the page cache (O_DIRECT).  On by default: the tier is itself a cache,
+  // so buffered I/O adds a second unmanaged DRAM cache that steals host memory
+  // from the DRAM tier and makes any drive measurement meaningless (a run can be
+  // served entirely from RAM, moving zero bytes to the device).  Safe as a default
+  // because the tier probes O_DIRECT at startup and falls back to buffered with a
+  // warning on tmpfs/overlayfs.  Set false to deliberately exploit the page cache.
+  bool direct_io = true;
+
+  // Coalesce concurrent reads of the same key: only the first touches the drive,
+  // the rest are served by memcpy from its buffer.  For MLA + TP, where every
+  // attention-TP rank GETs a byte-identical key; MHA keys carry a per-rank suffix
+  // and never collide, so it is a no-op there.  NOTE: UMBP_SSD_SINGLE_FLIGHT only
+  // reaches configs built by FromEnvironment() (the standalone server); sglang
+  // constructs UMBPConfig directly and needs the pybind field.  [SsdPerf/peer]
+  // reports merged=/merged_total=, which is what tells you it fired.
+  bool single_flight_reads = true;
+
+  // Checksum on write, verify on read.  Turning it off isolates how much of the
+  // SSD path's cost is integrity work (the DRAM tier does none).  Records written
+  // with it off are marked kFlagNoCrc and stay readable either way.
+  bool verify_crc = true;
+
+  // Split storage_dir on ',' — one entry per drive.  Always returns at least
+  // one element (falls back to the default when the string is empty).
+  std::vector<std::string> StorageDirs() const {
+    std::vector<std::string> dirs;
+    size_t start = 0;
+    while (start <= storage_dir.size()) {
+      size_t comma = storage_dir.find(',', start);
+      if (comma == std::string::npos) comma = storage_dir.size();
+      std::string part = storage_dir.substr(start, comma - start);
+      // Trim surrounding whitespace so "a, b" works as well as "a,b".
+      size_t b = part.find_first_not_of(" \t");
+      size_t e = part.find_last_not_of(" \t");
+      if (b != std::string::npos) dirs.push_back(part.substr(b, e - b + 1));
+      if (comma == storage_dir.size()) break;
+      start = comma + 1;
+    }
+    if (dirs.empty()) dirs.push_back("/tmp/umbp_ssd");
+    return dirs;
+  }
 
   // Local SSD-tier capacity watermarks for the distributed PeerSsdManager's
   // local eviction.  When used/total crosses high_watermark the owner
@@ -94,10 +149,10 @@ struct UMBPSsdConfig {
   double low_watermark = 0.7;
 
   // SSD backend selection. "file" uses the segmented-log SSDTier; "spdk" /
-  // "spdk_proxy" use the SPDK NVMe path (direct SpdkSsdTier in standalone, or
+  // "spdk_proxy" use the SPDK NVMe path (direct SpdkSsdTier for one process, or
   // SpdkProxyTier when sharing the device across processes).  Kept here (rather
-  // than at UMBPConfig top level) so both the standalone LocalStorageManager and
-  // the distributed PeerSsdManager select the backend from the same config.
+  // than at UMBPConfig top level) so PeerSsdManager and any direct SSDTier user
+  // select the backend from the same config.
   std::string ssd_backend = "file";       // "file", "spdk" or "spdk_proxy"
   std::string spdk_bdev_name;             // e.g. "Malloc0" or "NVMe0n1"
   std::string spdk_reactor_mask = "0x1";  // CPU core mask for SPDK reactors
@@ -139,6 +194,13 @@ struct UMBPSsdConfig {
     }
     if (segment_size_bytes == 0) {
       if (error_message) *error_message = "ssd.segment_size_bytes must be > 0";
+      return false;
+    }
+    // Records are padded to segment::kRecordAlign (4096), so a segment whose
+    // size is not a multiple of it would leave the append cursor unaligned at
+    // the roll-over and break direct I/O on the next segment.
+    if (segment_size_bytes % 4096 != 0) {
+      if (error_message) *error_message = "ssd.segment_size_bytes must be a multiple of 4096";
       return false;
     }
     // Watermarks must satisfy 0 < low < high <= 1.  Fail fast on a misconfigured
@@ -207,6 +269,37 @@ inline bool ShouldAdmitReCache(bool cache_remote_fetches, CacheRemoteAdmission p
   return true;  // ALWAYS, or SIZE within cap
 }
 
+// User-facing HBM-tier knobs for distributed mode. Unlike dram/ssd, HBM has
+// no local (non-distributed) mode, so it lives only here rather than on the
+// top-level UMBPConfig. Mirrors HbmOwnershipConfig's shape (device +
+// buffer_sizes) deliberately: hipMalloc has no hugepage/NUMA/prefault
+// dimension the way host memory does, so there is nothing else to expose.
+// No `enabled` flag: UMBPDistributedConfig::medium is the single selector,
+// and these knobs are read only when it names HBM.
+struct UMBPHbmConfig {
+  int device = 0;               // GPU ordinal the pool is allocated on
+  uint64_t capacity_bytes = 0;  // single-buffer pool size
+};
+
+// The one storage medium a legacy distributed node serves.
+//
+// UMBP's routing plane does not tier: every advertised medium is an equally
+// valid put target (see medium_backend.h and Phase 4 of the backend-agnostic
+// refactor), so a node registering two backends MIRRORS across them rather
+// than promoting/demoting between them — which is not what "DRAM + SSD" reads
+// like, and costs capacity for nothing. Without backend_policy_path, a node
+// picks exactly one medium and the cluster gets its heterogeneity from having
+// different nodes pick differently. A JSON backend policy explicitly opts
+// into peer-local heterogeneous tiering.
+//
+// The medium each key lands on is therefore a property of the node master
+// routed it to, not of a per-node tier order.
+enum class UMBPMedium {
+  DRAM,  // host memory (default; the pre-selector behaviour)
+  HBM,   // device memory on UMBPHbmConfig::device
+  SSD,   // local NVMe/file storage, staged through registered host memory
+};
+
 // User-facing distributed configuration. Set UMBPConfig::distributed to enable
 // distributed mode. Internally translated to PoolClientConfig by DistributedClient.
 struct UMBPDistributedConfig {
@@ -215,7 +308,24 @@ struct UMBPDistributedConfig {
 
   size_t staging_buffer_size = 64ULL * 1024 * 1024;  // 64 MB
 
-  // Dedicated SSD read staging, allocated only when ssd.enabled. Per-slot
+  // Registered host arena used by ranged multi-buffer I/O. Remote objects are
+  // fetched into disjoint slices here before being installed into the local
+  // medium; ranged puts routed to another node assemble their scattered ranges
+  // into a matching arena. Purely a remote-path resource — ranged I/O served by
+  // this node's own medium never touches it.
+  //
+  // This sizes EACH of the two arenas UMBP allocates: a separate GET arena and
+  // PUT arena, each under its own mutex, so a remote ranged get and a remote
+  // ranged put run concurrently instead of serializing on one lock. Each must
+  // hold at least one whole object.
+  //
+  // Zero keeps ranged remote I/O disabled without allocating or registering
+  // additional host memory; callers that need it must opt in explicitly. An
+  // existing distributed deployment that never issues ranged I/O therefore
+  // stops paying for an arena it does not use.
+  size_t ranged_scratch_size = 0;
+
+  // Dedicated SSD read staging, allocated only when medium == SSD. Per-slot
   // (this / ssd_staging_buffer_slots) must be >= the largest single-key page KV
   // (61-layer MLA page ~= 4.5 MB).
   size_t ssd_staging_buffer_size = 268435456;  // 256 MiB
@@ -223,9 +333,63 @@ struct UMBPDistributedConfig {
   // Remote SSD read staging slots; per-slot = ssd_staging_buffer_size / this.
   int ssd_staging_buffer_slots = 16;
 
+  // Back the SSD staging arena with hugetlbfs pages.  Every byte the SSD
+  // backend moves crosses that arena twice (device <-> arena, arena <-> wire),
+  // so its TLB behaviour sits on the critical path in a way an ordinary
+  // buffer's does not.  Falls back to 4 KiB pages when no hugetlb pages are
+  // free — a node must still come up.
+  bool ssd_staging_use_hugepages = false;
+  size_t ssd_staging_hugepage_size = 2ULL * 1024 * 1024;  // 2 MiB
+
   uint16_t peer_service_port = 0;  // gRPC peer service port
 
   bool cache_remote_fetches = true;  // cache remotely-fetched blocks locally
+
+  // After a remote RANGED read, pull the whole object into this node's medium
+  // in the background so the next read of the key is a local hit.
+  //
+  // Separate from cache_remote_fetches on purpose.  That flag gates a re-cache
+  // that copies out of the caller's destination buffer, which a GPU-destination
+  // deployment cannot use and therefore has to turn off; this one never touches
+  // the caller's buffer — it reads the peer straight into a freshly allocated
+  // local slot — so the same deployment can keep locality.
+  //
+  // The traffic is duplicate: the layer-wise reader will pull the same object a
+  // slice at a time regardless, so this costs up to one extra copy of the
+  // object on the wire, in exchange for the object being local for the NEXT
+  // request. Best-effort throughout — bounded queue, drop on full, admission
+  // gated by cache_remote_admission / admission_max_block_bytes.
+  bool ranged_locality_prefetch = true;
+
+  // Ask this node's own media before asking the master.
+  //
+  // A read is a two-part question: "who holds this key" (master) and "give me
+  // the bytes" (whoever holds it).  When this node holds the key itself, the
+  // first part is answered by its own backends, and the routing RPC only
+  // confirms what a local resolve already knew.  A single-node deployment —
+  // one peer, master on localhost — never gets a different answer, so every
+  // routing round trip on that path is pure latency.
+  //
+  // With this on, BatchGet and BatchExists resolve locally first and contact
+  // the master ONLY for the keys this node missed; a fully-local batch issues
+  // no RPC at all.  A local hit is conclusive (the backends own the bytes), so
+  // this cannot invent a hit; a local MISS is not conclusive — another node may
+  // hold the key — which is why the misses still go to the master.
+  //
+  // The cost is on multi-node deployments: local and remote reads stop
+  // overlapping (the local half is served before the routing RPC is issued
+  // rather than inside its in-flight window), and a batch whose keys are mostly
+  // remote pays a local resolve that mostly misses.  Set false to restore
+  // route-first ordering.
+  //
+  // One visible consequence: on a node that holds the key, Exists() now answers
+  // as soon as the put commits, rather than a heartbeat publication interval
+  // later once the master's index has it.  That is a more current answer about
+  // the key, but it means Exists() on the HOLDER is no longer a barrier for
+  // "the rest of the cluster can route to this".  Poll the node that will
+  // actually read it -- which has to go to the master -- when that is what is
+  // being waited for.
+  bool local_first = true;
 
   // Admission gate for re-caching. Only consulted when cache_remote_fetches is true.
   CacheRemoteAdmission cache_remote_admission = CacheRemoteAdmission::SIZE;
@@ -234,13 +398,39 @@ struct UMBPDistributedConfig {
   // 0 means unlimited (no size gate). Default 16 MB.
   size_t admission_max_block_bytes = 16ULL * 1024 * 1024;
 
-  // Page size used by Master's PageBitmapAllocator for this node's DRAM/HBM
-  // tier.  Reported via RegisterClient.  Same value applies to both DRAM
-  // and HBM.  Forwarded to PoolClientConfig::dram_page_size by
-  // DistributedClient unmodified.
+  // Page size used by Master's PageBitmapAllocator for this node's medium.
+  // Reported via RegisterClient.  Forwarded to PoolClientConfig::dram_page_size
+  // by DistributedClient unmodified.  (Named for DRAM because the wire field
+  // is; it applies to whichever medium this node serves.)
   // 0 = delegate to Master's ClientRegistryConfig::default_dram_page_size
   // (2 MiB by default).  Set to an explicit byte count to override.
   uint64_t dram_page_size = 0;
+
+  // Which medium the legacy distributed data plane serves. Ignored when
+  // backend_policy_path is set. Defaults to DRAM, so existing deployments are
+  // bit-identical.
+  //
+  // The selected medium's sizing knobs come from the config it names:
+  //   DRAM -> UMBPConfig::dram   (capacity, hugepages, NUMA, prefault)
+  //   HBM  -> distributed.hbm    (device, capacity)
+  //   SSD  -> UMBPConfig::ssd    (storage_dir, capacity, layout, io, backend)
+  // The other two are ignored rather than validated, so a config that carries
+  // all three (a common deployment template) selects by this field alone.
+  UMBPMedium medium = UMBPMedium::DRAM;
+
+  UMBPHbmConfig hbm;
+
+  // Optional JSON backend/tier policy. When set, it replaces the legacy
+  // single-medium ownership settings with named heterogeneous backends,
+  // weighted logical tiers, and peer-local offload rules. Appended for
+  // aggregate-init compatibility.
+  std::string backend_policy_path;
+
+  // Optional production PUT/GET trace. Payload bytes are regenerated during
+  // replay, so production traces should disable payload validation.
+  std::string workload_trace_path;
+  uint32_t workload_trace_client_id = 0;
+  uint64_t workload_trace_seed = 0;
 };
 
 // User-facing same-host standalone-process configuration.  Set
@@ -265,11 +455,17 @@ struct UMBPConfig {
   UMBPEvictionConfig eviction;
   UMBPCopyPipelineConfig copy_pipeline;
 
-  // Role is the source of truth for runtime behavior.
+  // Compatibility only.  These selected the shared-SSD leader/follower
+  // behaviour of the local storage manager, which is gone: a shared pool is a
+  // deployment now (a master, or a standalone server), not a role a private
+  // client plays over a shared directory.  Nothing reads them any more; they
+  // stay so existing Python and C++ callers still compile and so
+  // FromEnvironment keeps accepting UMBP_ROLE.
+  //
+  // The one place the distinction survives is where it always belonged: an
+  // SSDTier opened with SSDAccessMode::ReadOnlyShared reads a segment log
+  // another process writes.
   UMBPRole role = UMBPRole::Standalone;
-
-  // Backward compatibility fields for older Python/C++ callers.
-  // New code should set `role` instead.
   bool follower_mode = false;
   bool force_ssd_copy_on_write = false;
 
@@ -334,11 +530,12 @@ struct UMBPConfig {
     }
     if (distributed.has_value()) {
       const auto& d = distributed.value();
-      if (d.master_config.master_address.empty()) {
-        if (error_message)
-          *error_message = "distributed.master_config.master_address must not be empty";
-        return false;
-      }
+      // master_address MAY be empty.  That is the single-node deployment: the
+      // client keeps its whole data plane -- backends, transfer engine, peer
+      // service -- and simply never consults a master.  Every read already
+      // resolves locally first (see local_first), and on one node a local miss
+      // is the final answer, so there is nothing a master could add.  Setting
+      // the address later is what turns the same process into a cluster member.
       if (d.master_config.node_id.empty()) {
         if (error_message) *error_message = "distributed.master_config.node_id must not be empty";
         return false;
@@ -347,6 +544,30 @@ struct UMBPConfig {
         if (error_message)
           *error_message = "distributed.master_config.node_address must not be empty";
         return false;
+      }
+      // Only the selected medium's sizing is checked: a node that serves HBM
+      // still carries a defaulted dram/ssd block it never allocates from.
+      if (d.backend_policy_path.empty() && d.medium == UMBPMedium::HBM &&
+          d.hbm.capacity_bytes == 0) {
+        if (error_message)
+          *error_message =
+              "distributed.hbm.capacity_bytes must be > 0 when distributed.medium is HBM";
+        return false;
+      }
+      // Not ssd.Validate(): that returns early on ssd.enabled == false, and
+      // selecting SSD here IS the opt-in (DistributedClient enables the tier
+      // from `medium`, so an unset ssd.enabled must not skip the sizing check).
+      if (d.backend_policy_path.empty() && d.medium == UMBPMedium::SSD) {
+        if (ssd.capacity_bytes == 0) {
+          if (error_message)
+            *error_message = "ssd.capacity_bytes must be > 0 when distributed.medium is SSD";
+          return false;
+        }
+        if (ssd.segment_size_bytes == 0) {
+          if (error_message)
+            *error_message = "ssd.segment_size_bytes must be > 0 when distributed.medium is SSD";
+          return false;
+        }
       }
     }
     if (distributed.has_value() && standalone_process.has_value()) {
@@ -391,6 +612,30 @@ struct UMBPConfig {
     cfg.ssd.enabled = getenv_int("UMBP_SSD_ENABLED", cfg.ssd.enabled ? 1 : 0) != 0;
     cfg.ssd.storage_dir = getenv_str("UMBP_SSD_DIR", cfg.ssd.storage_dir);
     cfg.ssd.capacity_bytes = getenv_size("UMBP_SSD_CAPACITY", cfg.ssd.capacity_bytes);
+    cfg.ssd.shard_io_threads = getenv_int("UMBP_SSD_SHARD_IO_THREADS", cfg.ssd.shard_io_threads);
+    cfg.ssd.tier_io_threads = getenv_int("UMBP_SSD_TIER_IO_THREADS", cfg.ssd.tier_io_threads);
+    cfg.ssd.direct_io = getenv_int("UMBP_SSD_DIRECT_IO", cfg.ssd.direct_io ? 1 : 0) != 0;
+    cfg.ssd.single_flight_reads =
+        getenv_int("UMBP_SSD_SINGLE_FLIGHT", cfg.ssd.single_flight_reads ? 1 : 0) != 0;
+    cfg.ssd.verify_crc = getenv_int("UMBP_SSD_VERIFY_CRC", cfg.ssd.verify_crc ? 1 : 0) != 0;
+    // Durability of the SSD cache tier.  "strict" (default) fdatasync()s every
+    // batch write; "relaxed" leaves the data in the page cache and lets the
+    // kernel flush it.  Relaxed is safe for a pure cache — the bytes are
+    // re-fetchable, and the distributed peer discards leftover segments at
+    // startup anyway (see PeerSsdManager::DiscardLeftoverOnStartup) — so the
+    // flush buys nothing there while costing a large share of write time.
+    {
+      const std::string durability =
+          getenv_str("UMBP_SSD_DURABILITY",
+                     cfg.ssd.durability.mode == UMBPDurabilityMode::Relaxed ? "relaxed" : "strict");
+      if (durability == "relaxed" || durability == "RELAXED") {
+        cfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
+      } else if (durability == "strict" || durability == "STRICT") {
+        cfg.ssd.durability.mode = UMBPDurabilityMode::Strict;
+      }
+      // Any other value leaves the configured mode untouched; Validate() does
+      // not police this field, so silently keeping the default beats guessing.
+    }
     cfg.eviction.policy = getenv_str("UMBP_EVICTION_POLICY", cfg.eviction.policy);
     cfg.dram.high_watermark = getenv_double("UMBP_DRAM_HIGH_WM", cfg.dram.high_watermark);
     cfg.dram.low_watermark = getenv_double("UMBP_DRAM_LOW_WM", cfg.dram.low_watermark);

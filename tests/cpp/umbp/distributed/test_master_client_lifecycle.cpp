@@ -33,8 +33,6 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <cstdlib>
-#include <ctime>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -49,15 +47,6 @@ namespace {
 
 constexpr int kHeartbeatIntervalMs = 50;  // fast loop so heartbeat enters quickly
 constexpr int kDestructorBudgetMs = 7000;
-
-static uint16_t AllocPort() {
-  static std::atomic<uint16_t> next{0};
-  if (next.load() == 0) {
-    std::srand(static_cast<unsigned>(std::time(nullptr)));
-    next.store(static_cast<uint16_t>(54000 + (std::rand() % 1500)));
-  }
-  return next.fetch_add(7);
-}
 
 // Fake master service: RegisterClient returns immediately so the client
 // can proceed to start its heartbeat loop.  Heartbeat and UnregisterClient
@@ -121,15 +110,20 @@ class BlackholeMasterService final : public ::umbp::UMBPMaster::Service {
 class MasterClientLifecycleTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    port_ = AllocPort();
-    address_ = "127.0.0.1:" + std::to_string(port_);
     service_ = std::make_unique<BlackholeMasterService>(kHeartbeatIntervalMs);
 
+    // Port 0 asks the OS for a free one and reports it back; a guessed port
+    // collides on a busy host and BuildAndStart signals that only by
+    // returning nullptr.
+    int selected_port = 0;
     grpc::ServerBuilder builder;
-    builder.AddListeningPort(address_, grpc::InsecureServerCredentials());
+    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &selected_port);
     builder.RegisterService(service_.get());
     server_ = builder.BuildAndStart();
     ASSERT_NE(server_, nullptr);
+    ASSERT_NE(selected_port, 0);
+    port_ = static_cast<uint16_t>(selected_port);
+    address_ = "127.0.0.1:" + std::to_string(port_);
   }
 
   void TearDown() override {

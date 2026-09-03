@@ -35,11 +35,26 @@ namespace mori::umbp {
 // ---------------------------------------------------------------------------
 namespace {
 
-// SSD is intentionally excluded: there is no direct SSD put — the SSD copy is
-// filled asynchronously by copy-on-commit.  RoutePut must never steer a put at
-// a tier with no direct-put semantics, even though SSD capacity is reported via
-// heartbeat.
-constexpr std::array<TierType, 2> kPutTierOrder = {TierType::HBM, TierType::DRAM};
+// One placement candidate: a (node, tier) pair with room for the block.
+//
+// There is no tier order.  The former kPutTierOrder = {HBM, DRAM} (with SSD
+// excluded as a non-direct-put target) was deleted in the backend-agnostic
+// refactor Phase 4 rather than reimplemented: every medium is currently
+// equivalent, so a tier a node advertises capacity for is a tier it accepts
+// puts on.  Re-introducing "this medium takes no direct puts" — which SSD will
+// need when it returns as an SsdBackend — means the backend advertising it
+// (design doc §3 BackendProperties::put_eligible), not a tier list here.
+struct PlacementSlot {
+  size_t index;  // into `candidates`
+  TierType tier;
+  std::string logical_tier;
+  uint64_t available;
+};
+
+uint64_t AllocatableBytes(const TierCapacity& capacity) {
+  if (capacity.max_allocatable_bytes == 0) return capacity.available_bytes;
+  return std::min(capacity.available_bytes, capacity.max_allocatable_bytes);
+}
 
 std::string JoinStrings(const std::vector<std::string>& items) {
   if (items.empty()) return "";
@@ -82,27 +97,41 @@ std::string SummarizeClientTiers(const std::vector<ClientRecord>& alive_clients)
 }
 
 // Indices of candidates that can fit block_size on a single @p tier.
-std::vector<size_t> CollectEligibleOnTier(const std::vector<ClientRecord>& candidates,
-                                          TierType tier, uint64_t block_size,
-                                          const std::unordered_set<std::string>& exclude_nodes) {
-  std::vector<size_t> indices;
+// Every (node, tier) pair that can hold `block_size`.  tier_capacities is a
+// std::map, so the pairs come out in ascending TierType per node — the order is
+// deterministic, which keeps most-available tie-breaks reproducible.
+std::vector<PlacementSlot> CollectEligibleSlots(
+    const std::vector<ClientRecord>& candidates, uint64_t block_size,
+    const std::unordered_set<std::string>& exclude_nodes) {
+  std::vector<PlacementSlot> slots;
   for (size_t i = 0; i < candidates.size(); ++i) {
     const auto& client = candidates[i];
     if (exclude_nodes.count(client.node_id)) continue;
-    auto it = client.tier_capacities.find(tier);
-    if (it == client.tier_capacities.end()) continue;
-    if (it->second.available_bytes < block_size) continue;
-    indices.push_back(i);
+    if (!client.logical_tier_capacities.empty()) {
+      for (const auto& [name, logical] : client.logical_tier_capacities) {
+        if (!logical.put_eligible || AllocatableBytes(logical.capacity) < block_size) {
+          continue;
+        }
+        slots.push_back({i, logical.representative_tier, name, logical.capacity.available_bytes});
+      }
+    } else {
+      for (const auto& [tier, cap] : client.tier_capacities) {
+        if (AllocatableBytes(cap) < block_size) continue;
+        slots.push_back({i, tier, {}, cap.available_bytes});
+      }
+    }
   }
-  return indices;
+  return slots;
 }
 
-RoutePutResult MakeRouted(const ClientRecord& client, TierType tier) {
+RoutePutResult MakeRouted(const ClientRecord& client, TierType tier,
+                          std::string logical_tier = {}) {
   return RoutePutResult{
       .outcome = RoutePutOutcome::kRouted,
       .node_id = client.node_id,
       .peer_address = client.peer_address,
       .tier = tier,
+      .logical_tier = std::move(logical_tier),
   };
 }
 
@@ -110,10 +139,17 @@ RoutePutResult MakeRouted(const ClientRecord& client, TierType tier) {
 // 0 when the node or tier is absent.  Used only to report the pre-deduction
 // figure in the routed INFO log.
 uint64_t LookupAvailableBytes(const std::vector<ClientRecord>& candidates,
-                              const std::string& node_id, TierType tier) {
+                              const std::string& node_id, TierType tier,
+                              const std::string& logical_tier) {
   auto client_it = std::find_if(candidates.begin(), candidates.end(),
                                 [&](const ClientRecord& c) { return c.node_id == node_id; });
   if (client_it == candidates.end()) return 0;
+  if (!logical_tier.empty()) {
+    auto logical_it = client_it->logical_tier_capacities.find(logical_tier);
+    return logical_it == client_it->logical_tier_capacities.end()
+               ? 0
+               : logical_it->second.capacity.available_bytes;
+  }
   auto tier_it = client_it->tier_capacities.find(tier);
   if (tier_it == client_it->tier_capacities.end()) return 0;
   return tier_it->second.available_bytes;
@@ -133,6 +169,18 @@ bool ApplyProjectedDeduction(std::vector<ClientRecord>& candidates, const RouteP
     MORI_UMBP_ERROR("[RoutePutStrategy] projected-deduction: selected node not in candidates: {}",
                     result.node_id);
     return false;
+  }
+  if (!result.logical_tier.empty()) {
+    auto logical_it = client_it->logical_tier_capacities.find(result.logical_tier);
+    if (logical_it == client_it->logical_tier_capacities.end() ||
+        logical_it->second.capacity.available_bytes < block_size) {
+      MORI_UMBP_ERROR(
+          "[RoutePutStrategy] projected-deduction: selected logical tier absent/full on node {}",
+          result.node_id);
+      return false;
+    }
+    logical_it->second.capacity.available_bytes -= block_size;
+    return true;
   }
   auto tier_it = client_it->tier_capacities.find(result.tier);
   if (tier_it == client_it->tier_capacities.end()) {
@@ -191,13 +239,22 @@ size_t ConfigurableRoutePutStrategy::PickWeighted(const std::vector<uint64_t>& w
 
 std::optional<RoutePutResult> ConfigurableRoutePutStrategy::TrySelectOnNodeTier(
     const std::vector<ClientRecord>& candidates, const std::string& node_id, TierType tier,
-    uint64_t block_size, const std::unordered_set<std::string>& exclude_nodes) const {
+    uint64_t block_size, const std::unordered_set<std::string>& exclude_nodes,
+    const std::string& logical_tier) const {
   if (node_id.empty() || exclude_nodes.count(node_id)) return std::nullopt;
   auto it = std::find_if(candidates.begin(), candidates.end(),
                          [&](const ClientRecord& c) { return c.node_id == node_id; });
   if (it == candidates.end()) return std::nullopt;
+  if (!logical_tier.empty()) {
+    auto cap = it->logical_tier_capacities.find(logical_tier);
+    if (cap == it->logical_tier_capacities.end() || !cap->second.put_eligible ||
+        AllocatableBytes(cap->second.capacity) < block_size) {
+      return std::nullopt;
+    }
+    return MakeRouted(*it, cap->second.representative_tier, logical_tier);
+  }
   auto cap = it->tier_capacities.find(tier);
-  if (cap == it->tier_capacities.end() || cap->second.available_bytes < block_size) {
+  if (cap == it->tier_capacities.end() || AllocatableBytes(cap->second) < block_size) {
     return std::nullopt;
   }
   return MakeRouted(*it, tier);
@@ -206,49 +263,68 @@ std::optional<RoutePutResult> ConfigurableRoutePutStrategy::TrySelectOnNodeTier(
 std::optional<RoutePutResult> ConfigurableRoutePutStrategy::TrySelectOnNode(
     const std::vector<ClientRecord>& candidates, const std::string& node_id, uint64_t block_size,
     const std::unordered_set<std::string>& exclude_nodes) const {
-  for (TierType tier : kPutTierOrder) {
-    if (auto r = TrySelectOnNodeTier(candidates, node_id, tier, block_size, exclude_nodes)) {
-      return r;
+  if (node_id.empty() || exclude_nodes.count(node_id)) return std::nullopt;
+  auto it = std::find_if(candidates.begin(), candidates.end(),
+                         [&](const ClientRecord& c) { return c.node_id == node_id; });
+  if (it == candidates.end()) return std::nullopt;
+
+  // With every medium equivalent, "the best tier on this node" is just the one
+  // with the most room; ascending-TierType map order breaks ties.
+  const TierCapacity* best = nullptr;
+  TierType best_tier = TierType::UNKNOWN;
+  std::string best_logical;
+  if (!it->logical_tier_capacities.empty()) {
+    for (const auto& [name, logical] : it->logical_tier_capacities) {
+      if (!logical.put_eligible) continue;
+      const auto& cap = logical.capacity;
+      if (AllocatableBytes(cap) < block_size) continue;
+      if (best == nullptr || cap.available_bytes > best->available_bytes) {
+        best = &cap;
+        best_tier = logical.representative_tier;
+        best_logical = name;
+      }
+    }
+  } else {
+    for (const auto& [tier, cap] : it->tier_capacities) {
+      if (AllocatableBytes(cap) < block_size) continue;
+      if (best == nullptr || cap.available_bytes > best->available_bytes) {
+        best = &cap;
+        best_tier = tier;
+      }
     }
   }
-  return std::nullopt;
+  if (best == nullptr) return std::nullopt;
+  return MakeRouted(*it, best_tier, best_logical);
 }
 
 std::optional<RoutePutResult> ConfigurableRoutePutStrategy::SelectByAlgo(
     const std::vector<ClientRecord>& candidates, uint64_t block_size,
     const std::unordered_set<std::string>& exclude_nodes,
     const std::optional<std::string>& preferred_node) {
-  for (TierType tier : kPutTierOrder) {
-    // Node preference applies only within this tier, so a preferred node that is
-    // full on the faster tier never preempts a remote node that still has room
-    // there: tier priority is preserved.
-    if (preferred_node) {
-      if (auto r =
-              TrySelectOnNodeTier(candidates, *preferred_node, tier, block_size, exclude_nodes)) {
-        return r;
-      }
+  // A preferred node now wins outright when it has room anywhere: with no tier
+  // order left, there is no "remote HBM beats local DRAM" case for it to break.
+  if (preferred_node) {
+    if (auto r = TrySelectOnNode(candidates, *preferred_node, block_size, exclude_nodes)) {
+      return r;
     }
-    std::vector<size_t> eligible =
-        CollectEligibleOnTier(candidates, tier, block_size, exclude_nodes);
-    if (eligible.empty()) continue;
-
-    auto available = [&](size_t idx) {
-      return candidates[idx].tier_capacities.at(tier).available_bytes;
-    };
-    size_t chosen = eligible.front();
-    if (algo_ == SelectAlgo::kRandom) {
-      std::vector<uint64_t> weights;
-      weights.reserve(eligible.size());
-      for (size_t idx : eligible) weights.push_back(available(idx));
-      chosen = eligible[PickWeighted(weights)];
-    } else {
-      for (size_t idx : eligible) {
-        if (available(idx) > available(chosen)) chosen = idx;
-      }
-    }
-    return MakeRouted(candidates[chosen], tier);
   }
-  return std::nullopt;
+
+  std::vector<PlacementSlot> slots = CollectEligibleSlots(candidates, block_size, exclude_nodes);
+  if (slots.empty()) return std::nullopt;
+
+  size_t chosen = 0;
+  if (algo_ == SelectAlgo::kRandom) {
+    std::vector<uint64_t> weights;
+    weights.reserve(slots.size());
+    for (const auto& slot : slots) weights.push_back(slot.available);
+    chosen = PickWeighted(weights);
+  } else {
+    for (size_t k = 1; k < slots.size(); ++k) {
+      if (slots[k].available > slots[chosen].available) chosen = k;
+    }
+  }
+  return MakeRouted(candidates[slots[chosen].index], slots[chosen].tier,
+                    slots[chosen].logical_tier);
 }
 
 std::vector<std::optional<RoutePutResult>> ConfigurableRoutePutStrategy::SelectBatch(
@@ -283,6 +359,7 @@ std::vector<std::optional<RoutePutResult>> ConfigurableRoutePutStrategy::SelectB
   //             pick as nodes fill.
   std::optional<std::string> anchor_node;
   std::optional<TierType> anchor_tier;  // pinned only for the kSame whole-batch hit
+  std::string anchor_logical_tier;
   if (affinity_ == NodeAffinity::kLocal) {
     if (!requester_node_id.empty()) anchor_node = requester_node_id;
   } else if (affinity_ == NodeAffinity::kSame) {
@@ -296,6 +373,7 @@ std::vector<std::optional<RoutePutResult>> ConfigurableRoutePutStrategy::SelectB
       if (auto whole = SelectByAlgo(candidates, total, exclude_nodes)) {
         anchor_node = whole->node_id;
         anchor_tier = whole->tier;
+        anchor_logical_tier = whole->logical_tier;
       }
     }
   }
@@ -330,7 +408,7 @@ std::vector<std::optional<RoutePutResult>> ConfigurableRoutePutStrategy::SelectB
 
     std::optional<RoutePutResult> selected;
     if (affinity_ == NodeAffinity::kLocal) {
-      // Node-first: local HBM -> local DRAM, then global HBM -> DRAM fallback.
+      // Node-first: the local node's roomiest tier, then a global fallback.
       if (anchor_node) {
         selected = TrySelectOnNode(candidates, *anchor_node, block_size, exclude_nodes);
       }
@@ -338,15 +416,15 @@ std::vector<std::optional<RoutePutResult>> ConfigurableRoutePutStrategy::SelectB
     } else if (affinity_ == NodeAffinity::kSame) {
       // Whole-batch hit: keep every key on the pinned node AND tier.
       if (anchor_tier) {
-        selected =
-            TrySelectOnNodeTier(candidates, *anchor_node, *anchor_tier, block_size, exclude_nodes);
+        selected = TrySelectOnNodeTier(candidates, *anchor_node, *anchor_tier, block_size,
+                                       exclude_nodes, anchor_logical_tier);
       }
       if (!selected) {
-        // Tier-first with the sticky node only preferred within each tier, so a
-        // spill never prefers the anchor's DRAM over a remote node's HBM.  Drop
-        // the tier pin and re-anchor to wherever this key actually landed.
+        // The pinned tier is full.  Drop the tier pin, keep preferring the
+        // sticky node, and re-anchor to wherever this key actually landed.
         selected = SelectByAlgo(candidates, block_size, exclude_nodes, anchor_node);
         anchor_tier = std::nullopt;
+        anchor_logical_tier.clear();
         if (selected && selected->outcome == RoutePutOutcome::kRouted) {
           anchor_node = selected->node_id;
         }
@@ -360,8 +438,8 @@ std::vector<std::optional<RoutePutResult>> ConfigurableRoutePutStrategy::SelectB
     // failure, never as a route (capture available_bytes before the deduction
     // so the INFO reflects the snapshot the decision was made on).
     if (selected && selected->outcome == RoutePutOutcome::kRouted) {
-      const uint64_t available =
-          LookupAvailableBytes(candidates, selected->node_id, selected->tier);
+      const uint64_t available = LookupAvailableBytes(candidates, selected->node_id, selected->tier,
+                                                      selected->logical_tier);
       if (ApplyProjectedDeduction(candidates, *selected, block_size)) {
         MORI_UMBP_INFO(
             "[RoutePutStrategy] block_size={} tier={} selected node={} available_bytes={} "

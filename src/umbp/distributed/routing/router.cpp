@@ -30,12 +30,11 @@ namespace mori::umbp {
 Router::Router(IMasterMetadataStore& store, std::unique_ptr<RouteGetStrategy> get_strategy,
                std::unique_ptr<RoutePutStrategy> put_strategy)
     : store_(store) {
-  // Default to tier-priority (HBM > DRAM > SSD): with the SSD cold tier live, a
-  // random pick could route a key that also has a DRAM/HBM copy to the slow
-  // SSD.  Callers can still inject RandomRouteGetStrategy (or any other) via
-  // config_.get_strategy.
+  // Default to locality-preferring: a requester that already holds a replica
+  // reads its own copy instead of RDMA-ing a peer's.  Callers can still inject
+  // RandomRouteGetStrategy (or any other) via config_.get_strategy.
   get_strategy_ =
-      get_strategy ? std::move(get_strategy) : std::make_unique<TierPriorityRouteGetStrategy>();
+      get_strategy ? std::move(get_strategy) : std::make_unique<LocalPreferringRouteGetStrategy>();
   // Default to most-available / no-affinity: the single built-in put strategy.
   // Callers can still inject any RoutePutStrategy (e.g. an env-configured
   // ConfigurableRoutePutStrategy from master startup) via config_.put_strategy.

@@ -37,7 +37,7 @@
 //     the get.  This wait is OUTSIDE the timed regions.
 //   * Keys are never reclaimed and a remote BatchGet leaves a ~500ms read lease
 //     that defers capacity free on Clear().  So every measured iter starts by
-//     Clear()-ing all nodes and polling each allocator's TierCapacitiesSnapshot
+//     Clear()-ing all nodes and polling each allocator's Capacity()
 //     until available==total (lease-deferred frees released by the reaper).
 //   * Placement is observed via reader->Master().BatchRouteGet (returns per-key
 //     node_id).  This bumps lease/access; the subsequent timed BatchGet RouteGets
@@ -95,7 +95,7 @@
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/master/master_client.h"
 #include "umbp/distributed/master/master_server.h"
-#include "umbp/distributed/peer/peer_dram_allocator.h"
+#include "umbp/distributed/peer/backend/page_backend.h"
 #include "umbp/distributed/pool_client.h"
 
 using mori::umbp::MasterServer;
@@ -264,8 +264,7 @@ uint64_t NodeStorageBytes(const std::string& regime, size_t peers, uint64_t batc
 // One symmetric node: exportable storage DRAM (receives writes) plus a private
 // io buffer used as the put src (when requester) and the get dst (when reader).
 struct Node {
-  std::vector<char> storage;  // master-managed exportable DRAM
-  std::vector<char> io;       // registered src/dst region
+  std::vector<char> io;  // registered src/dst region
   std::unique_ptr<PoolClient> client;
 };
 
@@ -292,7 +291,6 @@ class Cluster {
 
     nodes_.resize(peers);
     for (size_t k = 0; k < peers; ++k) {
-      nodes_[k].storage.assign(node_storage_bytes, 0);
       nodes_[k].io.assign(io_bytes, 0);
       PoolClientConfig cc;
       cc.master_config.node_id = "node-" + std::to_string(k);
@@ -302,8 +300,7 @@ class Cluster {
       cc.io_engine.port = 0;
       cc.peer_service_port = NextPeerServicePort();
       cc.dram_page_size = page_bytes;
-      cc.dram_buffers = {{nodes_[k].storage.data(), nodes_[k].storage.size()}};
-      cc.tier_capacities = {{TierType::DRAM, {nodes_[k].storage.size(), nodes_[k].storage.size()}}};
+      cc.dram.buffer_sizes = {node_storage_bytes};
       nodes_[k].client = std::make_unique<PoolClient>(std::move(cc));
       if (!nodes_[k].client->Init()) {
         std::cerr << "node " << k << " init failed\n";
@@ -333,9 +330,10 @@ class Cluster {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     for (auto& n : nodes_) {
       while (true) {
-        auto caps = n.client->DramAllocator()->TierCapacitiesSnapshot();
-        auto it = caps.find(TierType::DRAM);
-        const bool full = it != caps.end() && it->second.available_bytes == it->second.total_bytes;
+        auto* dram = n.client->Backends().Get(TierType::DRAM);
+        if (dram == nullptr) return false;
+        auto cap = dram->Capacity();
+        const bool full = cap.available_bytes == cap.total_bytes;
         if (full) break;
         if (std::chrono::steady_clock::now() > deadline) return false;
         std::this_thread::sleep_for(std::chrono::milliseconds(10));

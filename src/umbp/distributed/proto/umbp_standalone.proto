@@ -9,8 +9,10 @@ service UMBPStandalone {
   rpc Put(PutRequest) returns (BoolResponse);
   rpc Get(GetRequest) returns (BoolResponse);
   rpc BatchPut(BatchDataRequest) returns (BatchBoolResponse);
+  rpc BatchPutRanges(BatchRangeDataRequest) returns (BatchBoolResponse);
   rpc BatchPutWithDepth(BatchDataWithDepthRequest) returns (BatchBoolResponse);
   rpc BatchGet(BatchDataRequest) returns (BatchBoolResponse);
+  rpc BatchGetRanges(BatchRangeDataRequest) returns (BatchBoolResponse);
   rpc Exists(KeyRequest) returns (BoolResponse);
   rpc BatchExists(BatchKeysRequest) returns (BatchBoolResponse);
   rpc BatchExistsConsecutive(BatchKeysRequest) returns (CountResponse);
@@ -33,6 +35,7 @@ message Empty {}
 message PingResponse {
   bool ready = 1;
   StandaloneBackendMode deployment_mode = 2;
+  bool supports_ranged_io = 3;
 }
 
 message BoolResponse {
@@ -86,6 +89,20 @@ message BatchDataRequest {
   repeated uint64 region_bases = 5;
 }
 
+message BatchRangeDataRequest {
+  repeated string keys = 1;
+  string client_id = 2;
+  // The remaining fields are flattened over entries. range_counts[i] records
+  // how many ranges belong to keys[i].
+  repeated uint32 range_counts = 3;
+  repeated uint64 shm_offsets = 4;
+  repeated uint64 region_bases = 5;
+  repeated uint64 sizes = 6;
+  repeated uint64 object_offsets = 7;
+  // Put only: the expected full object size, one per key. Empty for get.
+  repeated uint64 object_sizes = 8;
+}
+
 message BatchDataWithDepthRequest {
   repeated string keys = 1;
   string client_id = 2;
@@ -99,6 +116,11 @@ message BatchBoolResponse {
   repeated bool ok = 1;
 }
 
+enum MemoryKind {
+  MEMORY_KIND_HOST_SHM = 0;
+  MEMORY_KIND_GPU_IPC = 1;
+}
+
 message RegisterMemoryRequest {
   string client_id = 1;
   uint64 worker_base = 2;
@@ -106,6 +128,11 @@ message RegisterMemoryRequest {
   string worker_node_id = 4;
   string worker_node_address = 5;
   repeated string tags = 6;
+  MemoryKind kind = 7;
+  int32 device_id = 8;
+  bytes ipc_handle = 9;
+  uint64 ipc_offset = 10;
+  uint64 alloc_base = 11;
 }
 
 message DeregisterMemoryRequest {

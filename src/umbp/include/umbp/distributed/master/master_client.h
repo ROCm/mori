@@ -42,7 +42,7 @@
 #include <vector>
 
 #include "umbp/distributed/config.h"
-#include "umbp/distributed/peer/owned_location_source.h"
+#include "umbp/distributed/peer/backend/medium_backend.h"
 #include "umbp/distributed/routing/route_put_strategy.h"
 #include "umbp/distributed/types.h"
 
@@ -54,8 +54,7 @@ class HeartbeatResponse;
 
 namespace mori::umbp {
 
-class PeerDramAllocator;
-class PeerSsdManager;
+class PeerPool;
 
 inline constexpr std::size_t kMasterClientMaxPendingHistograms = 15000;
 
@@ -68,6 +67,7 @@ struct RouteGetResult {
   TierType tier = TierType::UNKNOWN;
   uint64_t size = 0;
   std::string peer_address;
+  std::string logical_tier;
 };
 
 class MasterClient {
@@ -86,9 +86,10 @@ class MasterClient {
   // membership + capacity-snapshot metadata is shipped — DRAM/HBM
   // descriptors are peer-internal now.  `tier_capacities` is the single
   // source of per-tier capacity, including SSD (TierType::SSD).
-  grpc::Status RegisterSelf(const std::map<TierType, TierCapacity>& tier_capacities,
-                            const std::string& peer_address = "",
-                            const std::vector<uint8_t>& engine_desc_bytes = {});
+  grpc::Status RegisterSelf(
+      const std::map<TierType, TierCapacity>& tier_capacities, const std::string& peer_address = "",
+      const std::vector<uint8_t>& engine_desc_bytes = {},
+      const std::map<std::string, LogicalTierCapacity>& logical_tier_capacities = {});
   grpc::Status UnregisterSelf();
 
   // --- Router ---
@@ -122,24 +123,26 @@ class MasterClient {
   grpc::Status BatchLookup(const std::vector<std::string>& keys, std::vector<bool>* out);
 
   // --- Heartbeat (event-driven) ---
-  // Bind a PeerDramAllocator whose outbox the heartbeat thread will
-  // drain.  Pass nullptr for SSD-only peers (skipped, not registered).
-  // Also keeps the concrete pointer for DRAM-specific duties the
-  // OwnedLocationSource interface does not cover (capacity snapshot,
-  // owned-key counts, distributed-clear write gate).  Must be set before
-  // StartHeartbeat() — the heartbeat thread reads sources once per tick.
-  void SetPeerDramAllocator(PeerDramAllocator* dram_alloc);
+  // Bind every storage medium live on this peer.  The heartbeat drains each
+  // backend's outbox and concatenates them into ONE bundle under a single
+  // monotonic seq, and derives tier_capacities / tier_kv_counts by aggregating
+  // over the same set — so a backend added to the registry participates with
+  // no change here (backend-agnostic refactor Phase 3).  Also installs the
+  // auto-flush hook on each backend.  Pass nullptr to unbind.  Must be set
+  // before StartHeartbeat() — the heartbeat thread reads the registry once per
+  // tick.
+  void SetBackendRegistry(BackendRegistry* registry);
+  void SetPeerPool(PeerPool* pool) { peer_pool_ = pool; }
 
-  // Bind the SSD manager: registers it as an owned-location event source
-  // AND keeps the concrete pointer so heartbeat can merge live SSD
-  // capacity into tier_capacities.  Pass nullptr to skip.  Must be set
+  // Weighted placement makes every same-tier instance reachable through one
+  // tier route, so capacity heartbeats may aggregate them. Must be configured
   // before StartHeartbeat().
-  void SetPeerSsdManager(PeerSsdManager* ssd_manager);
-
-  // Register an additional owned-location event source whose events are
-  // drained/snapshotted into the same heartbeat bundle (single monotonic
-  // seq).  Null is ignored.  Must be set before StartHeartbeat().
-  void AddOwnedLocationSource(OwnedLocationSource* source);
+  void SetAggregateBackendCapacities(bool enabled) {
+    aggregate_backend_capacities_requested_ = enabled;
+    aggregate_backend_capacities_ = enabled && supports_max_allocatable_capacity_;
+  }
+  bool SupportsMaxAllocatableCapacity() const { return supports_max_allocatable_capacity_; }
+  bool SupportsLogicalTiers() const { return supports_logical_tiers_; }
 
   void StartHeartbeat();
   void StopHeartbeat();
@@ -147,13 +150,12 @@ class MasterClient {
   void FlushHeartbeat();
 
   // Synchronously clear this node's UMBP-owned and external HiCache
-  // placement from master. When peer_alloc_ is bound, caller MUST have
-  // already invoked peer_alloc_->ClearLocal() (PoolClient::Clear()
-  // handles this); SSD-only peers skip that step. Returns true only
-  // after both the full-sync heartbeat and the external KV revoke RPC
-  // are acknowledged by master; on any failure returns false and leaves
-  // PeerDramAllocator::clear_full_sync_pending_ closed for the caller
-  // to retry.
+  // placement from master. When a registry is bound, caller MUST have already
+  // invoked ClearLocal() on every backend (PoolClient::Clear() handles this);
+  // SSD-only peers skip that step. Returns true only after both the full-sync
+  // heartbeat and the external KV revoke RPC are acknowledged by master; on any
+  // failure returns false and leaves each backend's clear-full-sync gate closed
+  // for the caller to retry.
   bool ClearFullSync();
 
   // --- Client-side metrics ---
@@ -226,27 +228,26 @@ class MasterClient {
   std::mutex hb_cv_mutex_;
   std::condition_variable hb_cv_;
 
-  // Cached tier capacities — heartbeat reports the latest peer
-  // allocator snapshot when the bound PeerDramAllocator is non-null,
-  // else falls back to whatever was last set here.
+  // Cached tier capacities — heartbeat reports the live per-backend snapshot
+  // when a registry is bound, else falls back to whatever was last set here.
   std::mutex caps_mutex_;
   std::map<TierType, TierCapacity> current_capacities_;
 
-  // Peer-event source for the heartbeat thread.  Non-owning; lifetime
-  // is managed by PoolClient.  Kept as a concrete pointer (in addition to
-  // its slot in owned_sources_) for DRAM-specific duties the
-  // OwnedLocationSource interface does not cover: TierCapacitiesSnapshot,
-  // OwnedKeyCountByTier, ClearLocal/ClearFullSyncAcked.
-  PeerDramAllocator* peer_alloc_ = nullptr;
-
-  // Non-owning.  Kept concrete (in addition to owned_sources_) so heartbeat
-  // can merge live SSD capacity into tier_capacities.
-  PeerSsdManager* ssd_manager_ = nullptr;
-
-  // All owned-location event sources (DRAM allocator + SSD manager).  Drained
-  // and snapshotted into a single heartbeat bundle under one monotonic seq.
-  // Populated before StartHeartbeat(); read-only afterwards (no lock needed).
-  std::vector<OwnedLocationSource*> owned_sources_;
+  // Every storage medium on this peer: the heartbeat's event sources AND the
+  // source of tier_capacities / tier_kv_counts / the distributed-clear write
+  // gate.  Non-owning; lifetime is managed by PoolClient.  Bound before
+  // StartHeartbeat(); read-only afterwards (no lock needed).
+  BackendRegistry* registry_ = nullptr;
+  PeerPool* peer_pool_ = nullptr;
+  bool aggregate_backend_capacities_requested_ = false;
+  bool aggregate_backend_capacities_ = false;
+  bool supports_max_allocatable_capacity_ = false;
+  bool supports_logical_tiers_ = false;
+  // Initial conservative registration payload, retained so an UNKNOWN response
+  // can rebuild the full peer record after Master state loss.
+  std::map<TierType, TierCapacity> registration_capacities_;
+  std::string registered_peer_address_;
+  std::vector<uint8_t> registered_engine_desc_bytes_;
 
   // Serializes the actual Heartbeat RPC: at most one full-sync or
   // delta heartbeat is on the wire at a time. ClearFullSync() takes
@@ -274,12 +275,17 @@ class MasterClient {
                                       ::umbp::HeartbeatResponse* resp);
 
   // Snapshot the freshest tier capacities and refresh the
-  // current_capacities_ fallback cache. When peer_alloc_ is bound,
-  // returns its bitmap-derived snapshot (DRAM/HBM) merged with cached
-  // entries for tiers it does not manage (e.g. SSD). When peer_alloc_
-  // is null, returns the cached snapshot unchanged. Acquires
-  // caps_mutex_ internally.
+  // current_capacities_ fallback cache. When a registry is bound, returns each
+  // backend's live (bitmap-derived) capacity merged with cached entries for
+  // tiers no backend manages (e.g. SSD). When it is null, returns the cached
+  // snapshot unchanged. Acquires caps_mutex_ internally.
   std::map<TierType, TierCapacity> SnapshotAndCacheTierCapacities();
+
+  // Owned-key count per tier, aggregated over every registered backend.
+  std::map<TierType, uint64_t> OwnedKeyCountsByTier() const;
+
+  // Every live backend, or empty when no registry is bound.
+  std::vector<MediumBackend*> Backends() const;
 
   // --- Metrics buffering ---
   struct PendingSample {

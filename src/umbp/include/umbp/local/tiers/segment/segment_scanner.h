@@ -30,9 +30,13 @@ namespace mori::umbp::segment {
 
 class Scanner {
  public:
+  // `extra_open_flags` is OR'd into open() for segments the scanner discovers —
+  // O_DIRECT when the tier runs unbuffered, so the fds it installs in the index
+  // match the ones SSDTier opens itself.  All of the scanner's own reads are
+  // issued in aligned kRecordAlign blocks so they are legal on such an fd.
   bool RefreshFromDisk(const std::string& dir, StorageIoDriver& io_driver, Index& index,
-                       bool read_only_shared, bool force_full_rescan,
-                       std::string* error_message) const;
+                       bool read_only_shared, bool force_full_rescan, std::string* error_message,
+                       int extra_open_flags = 0) const;
 };
 
 }  // namespace mori::umbp::segment
