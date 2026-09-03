@@ -287,46 +287,63 @@ __device__ inline static void quietUntil(core::RdmaEndpointDevice* ep, uint32_t 
     }
 #else
     // Non-CCQE: warp-parallel poll with color bit alternation.
-    const uint64_t activeMask = core::GetActiveLaneMask();
-    const uint32_t myLogicalLaneId = core::GetActiveLaneNum(activeMask);
+    //
+    // The poll below is only correct when every participating lane shares one
+    // CQ: the pollCqLock is acquired by the first active lane and broadcast to
+    // the rest, each lane derives its CQ slot from its index within the active
+    // mask, and a ballot elects a single lane to commit cq_consumer/doneIdx.
+    // Callers can legitimately arrive with lanes on different endpoints (e.g.
+    // flush() fans peers across the cooperative group), so group the active
+    // lanes by CQ and give each distinct CQ its own turn.
     const int myLaneId = core::WarpLaneId();
     constexpr uint32_t MAX_GREED = 10;
     constexpr uint32_t CQ_DOORBELL_GRACE = 100;
-    uint32_t wqeCounter;
+    const unsigned long long myCqKey = reinterpret_cast<unsigned long long>(cq);
 
-    while ((wq->doneIdx - targetIdx) & PENDING_WORK_MASK) {
-      if (!core::spin_lock_try_acquire_shared(&cq->pollCqLock, activeMask)) continue;
-      uint32_t greedRemaining = MAX_GREED;
+    bool needTurn = true;
+    for (uint64_t turns = __ballot(needTurn); turns != 0; turns = __ballot(needTurn)) {
+      const int lead = __ffsll(static_cast<unsigned long long>(turns)) - 1;
+      if (myCqKey != __shfl(myCqKey, lead)) continue;
+      needTurn = false;
+
+      const uint64_t activeMask = core::GetActiveLaneMask();
+      const uint32_t myLogicalLaneId = core::GetActiveLaneNum(activeMask);
+      uint32_t wqeCounter;
+
       while ((wq->doneIdx - targetIdx) & PENDING_WORK_MASK) {
-        const uint64_t oldDoneIdx = wq->doneIdx;
-        const uint32_t curConsIdx = cq->cq_consumer;
-        uint32_t myCqPos = curConsIdx + myLogicalLaneId;
-        const int opcode =
-            core::PollCq<core::ProviderType::PSD>(cq->cqAddr, cq->cqeNum, &myCqPos, &wqeCounter);
-        if (opcode > 0) {
-          MORI_PRINTF("quietUntil[PSD]: poll err %d\n", opcode);
-          assert(false);
-        }
-        asm volatile("" ::: "memory");
-        const uint64_t successMask = __ballot(opcode == 0);
-        const int highestLane = core::GetLastActiveLaneID(successMask);
-        if (highestLane == -1) continue;
-        if (myLaneId == highestLane) {
-          cq->cq_consumer = myCqPos + 1;
-          if (((cq->cq_consumer - cq->cq_dbpos) & (cq->cqeNum - 1)) >= CQ_DOORBELL_GRACE) {
-            cq->cq_dbpos = cq->cq_consumer;
-            core::UpdateCqDbrRecord<core::ProviderType::PSD>(*cq, myCqPos + 1);
+        if (!core::spin_lock_try_acquire_shared(&cq->pollCqLock, activeMask)) continue;
+        uint32_t greedRemaining = MAX_GREED;
+        while ((wq->doneIdx - targetIdx) & PENDING_WORK_MASK) {
+          const uint64_t oldDoneIdx = wq->doneIdx;
+          const uint32_t curConsIdx = cq->cq_consumer;
+          uint32_t myCqPos = curConsIdx + myLogicalLaneId;
+          const int opcode =
+              core::PollCq<core::ProviderType::PSD>(cq->cqAddr, cq->cqeNum, &myCqPos, &wqeCounter);
+          if (opcode > 0) {
+            MORI_PRINTF("quietUntil[PSD]: poll err %d\n", opcode);
+            assert(false);
           }
-          wq->doneIdx = wqeCounter;
+          asm volatile("" ::: "memory");
+          const uint64_t successMask = __ballot(opcode == 0);
+          const int highestLane = core::GetLastActiveLaneID(successMask);
+          if (highestLane == -1) continue;
+          if (myLaneId == highestLane) {
+            cq->cq_consumer = myCqPos + 1;
+            if (((cq->cq_consumer - cq->cq_dbpos) & (cq->cqeNum - 1)) >= CQ_DOORBELL_GRACE) {
+              cq->cq_dbpos = cq->cq_consumer;
+              core::UpdateCqDbrRecord<core::ProviderType::PSD>(*cq, myCqPos + 1);
+            }
+            wq->doneIdx = wqeCounter;
+          }
+          if (!((wq->doneIdx - targetIdx) & PENDING_WORK_MASK)) {
+            if (wq->doneIdx == oldDoneIdx) break;
+            if (greedRemaining == 0) break;
+            --greedRemaining;
+          }
         }
-        if (!((wq->doneIdx - targetIdx) & PENDING_WORK_MASK)) {
-          if (wq->doneIdx == oldDoneIdx) break;
-          if (greedRemaining == 0) break;
-          --greedRemaining;
-        }
+        core::spin_lock_release_shared(&cq->pollCqLock, activeMask);
+        break;
       }
-      core::spin_lock_release_shared(&cq->pollCqLock, activeMask);
-      break;
     }
 #endif
   } else if constexpr (PrvdType == core::ProviderType::MLX5) {
