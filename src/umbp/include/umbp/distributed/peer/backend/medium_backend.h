@@ -351,6 +351,17 @@ class MediumBackend : public MetricSource {
   // interpreting a temporarily unresolvable object as absent.
   virtual bool Contains(const std::string& key) const = 0;
 
+  // Containment for a whole batch, in request order. Exists answers from this
+  // rather than from BatchResolve because a resolve builds -- and heap-copies --
+  // the page vector of every key it finds, which an existence check throws away.
+  // The default is the honest per-key loop; a backend that can answer the batch
+  // under one lock should override it.
+  virtual std::vector<bool> BatchContains(const std::vector<std::string>& keys) const {
+    std::vector<bool> out(keys.size(), false);
+    for (size_t i = 0; i < keys.size(); ++i) out[i] = Contains(keys[i]);
+    return out;
+  }
+
   // Master-driven eviction.  Idempotent; see EvictResult::bytes_freed.  One
   // result per key, in request order — the peer service relies on that to sum
   // freed bytes for a key mirrored across media.

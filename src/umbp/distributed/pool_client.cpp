@@ -4407,11 +4407,14 @@ std::vector<bool> PoolClient::BatchExists(const std::vector<std::string>& keys) 
   std::vector<std::string> unknown;
   std::vector<size_t> unknown_indices;
   if (config_.local_first) {
-    std::vector<size_t> all(keys.size());
-    std::iota(all.begin(), all.end(), 0);
-    std::vector<MediumBackend*> holders;
-    ResolveLocalBatch(keys, all, &holders, /*resolutions=*/nullptr);
-    for (size_t i = 0; i < keys.size(); ++i) out[i] = holders[i] != nullptr;
+    // Containment, not resolution: this only needs to know whether the key is
+    // here. A resolve would heap-copy the page vector of every key it finds and
+    // renew a read lease on it, and every byte of that is discarded one line
+    // below.
+    if (default_pool_ != nullptr) {
+      const auto local = default_pool_->BatchContains(keys);
+      for (size_t i = 0; i < keys.size() && i < local.size(); ++i) out[i] = local[i];
+    }
     for (size_t i = 0; i < keys.size(); ++i) {
       if (!out[i]) {
         unknown.push_back(keys[i]);

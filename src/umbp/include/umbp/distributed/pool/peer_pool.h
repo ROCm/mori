@@ -102,6 +102,11 @@ class PeerPool {
   std::vector<bool> BatchAbort(const std::vector<PoolSlotRef>& slots);
   std::vector<PoolResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
                                               bool include_descs, bool allow_file_refs = false);
+  // Existence only, in request order. Cheaper than BatchResolve, which
+  // heap-copies the page vector of every key it finds -- work an existence
+  // check discards. Takes no read lease and does not touch recency: asking
+  // whether a key is here is not a read of it.
+  std::vector<bool> BatchContains(const std::vector<std::string>& keys);
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys, PoolEvictMode mode);
   void ClearLocal();
   std::vector<KvEvent> DrainPendingEvents();
