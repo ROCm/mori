@@ -551,6 +551,16 @@ bool PageBackend::Contains(const std::string& key) const {
   return owned_.find(key) != owned_.end();
 }
 
+std::vector<bool> PageBackend::BatchContains(const std::vector<std::string>& keys) const {
+  std::vector<bool> out(keys.size(), false);
+  if (keys.empty()) return out;
+  // One lock and one hash lookup per key, and nothing allocated per key: an
+  // existence answer needs no page vector, no lease renewal and no LRU touch.
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  for (size_t i = 0; i < keys.size(); ++i) out[i] = owned_.find(keys[i]) != owned_.end();
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 //  Eviction (skips leased / copy-pinned keys; emits REMOVE)
 // ---------------------------------------------------------------------------

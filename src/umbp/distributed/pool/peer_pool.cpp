@@ -26,7 +26,9 @@
 
 #include <algorithm>
 #include <map>
+#include <numeric>
 #include <set>
+#include <shared_mutex>
 #include <stdexcept>
 #include <tuple>
 #include <utility>
@@ -786,6 +788,48 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
       placements_.erase(keys[i]);
       ForgetAccessLocked(keys[i]);
     }
+  }
+  return out;
+}
+
+std::vector<bool> PeerPool::BatchContains(const std::vector<std::string>& keys) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  std::vector<bool> out(keys.size(), false);
+  if (keys.empty()) return out;
+
+  std::vector<uint32_t> read_order;
+  {
+    std::lock_guard<std::mutex> operation_lock(operation_mutex_);
+    if (backends_ == nullptr || policy_ == nullptr) return out;
+    read_order = policy_->ReadOrder(*backends_);
+  }
+
+  // Carry only the still-unanswered indices from one backend to the next, so a
+  // second medium is asked about exactly what the first one missed. Same shape
+  // as the resolve paths, and for the same reason: one call per backend, not
+  // one per key. The backend calls stay outside operation_mutex_.
+  std::vector<size_t> pending(keys.size());
+  std::iota(pending.begin(), pending.end(), 0);
+  std::vector<std::string> batch;
+  std::vector<size_t> still_missing;
+  for (uint32_t backend_id : read_order) {
+    if (pending.empty()) break;
+    auto* backend = backends_->Get(backend_id);
+    if (backend == nullptr) continue;
+    batch.clear();
+    batch.reserve(pending.size());
+    for (size_t i : pending) batch.push_back(keys[i]);
+
+    const auto hits = backend->BatchContains(batch);
+    still_missing.clear();
+    for (size_t j = 0; j < pending.size(); ++j) {
+      if (j < hits.size() && hits[j]) {
+        out[pending[j]] = true;
+      } else {
+        still_missing.push_back(pending[j]);
+      }
+    }
+    pending.swap(still_missing);
   }
   return out;
 }
