@@ -32,6 +32,23 @@ jobs:
           - python: "3.12"
             base_image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
     steps:
+      # Must precede Checkout: later steps run as root inside the CI container
+      # and write build output into the mounted workspace. Cleanup chowns it
+      # back, but a cancelled or killed job never reaches that step, and then
+      # actions/checkout can no longer unlink the leftovers ("EACCES: permission
+      # denied, unlink") and fails every later run on this runner until someone
+      # chowns the workspace by hand. Every job that mounts the workspace into a
+      # container repeats this step.
+      - name: Reset workspace ownership
+        run: |
+          mkdir -p $GITHUB_WORKSPACE
+          for IMG in $IMAGE ${{ matrix.base_image }}; do
+            $CT image inspect "$IMG" >/dev/null 2>&1 || continue
+            $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE "$IMG" \
+              chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE >/dev/null 2>&1 && break
+          done
+          exit 0
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -209,6 +226,17 @@ jobs:
       MORI_PERF_PYTHON: ${{ matrix.python }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     steps:
+      # Must precede Checkout: see the matching step in the build-wheel job.
+      - name: Reset workspace ownership
+        run: |
+          mkdir -p $GITHUB_WORKSPACE
+          for IMG in $IMAGE ${{ matrix.base_image }}; do
+            $CT image inspect "$IMG" >/dev/null 2>&1 || continue
+            $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE "$IMG" \
+              chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE >/dev/null 2>&1 && break
+          done
+          exit 0
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -470,6 +498,17 @@ jobs:
       MORI_PERF_PYTHON: ${{ matrix.python }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     steps:
+      # Must precede Checkout: see the matching step in the build-wheel job.
+      - name: Reset workspace ownership
+        run: |
+          mkdir -p $GITHUB_WORKSPACE
+          for IMG in $IMAGE ${{ matrix.base_image }}; do
+            $CT image inspect "$IMG" >/dev/null 2>&1 || continue
+            $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE "$IMG" \
+              chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE >/dev/null 2>&1 && break
+          done
+          exit 0
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -749,9 +788,13 @@ jobs:
       - name: Cleanup node2
         if: always()
         run: |
+          # Best effort: the remote command already swallows its own failures, so
+          # let ssh itself do the same. A transient connect failure here used to
+          # fail the whole job even when every test had passed.
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=15 \
             -p $NODE2_PORT $(whoami)@$NODE2_HOST \
-            "$CT rm -f $CONTAINER || true"
+            "$CT rm -f $CONTAINER || true" || true
 
   # ── Stage 2c: Performance report ───────────────────────────────────────────
   # Aggregates the perf JSON emitted by the intra/internode/IO benchmarks into a
