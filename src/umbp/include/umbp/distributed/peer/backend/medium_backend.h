@@ -322,8 +322,19 @@ class MediumBackend : public MetricSource {
   // not registerable publishes a descriptor naming its storage (a file/object
   // ref) rather than a memory one — the engine decides how to reach it, and
   // supplies a bounce buffer if the chosen path needs one.
+  //
+  // `allow_file_refs` says the caller can consume a TransferRef::File -- it
+  // will read the medium's own storage directly (GdsEngine DMAs the range into
+  // the destination) instead of a staged page.  It defaults to FALSE because a
+  // file ref only means something IN THIS PROCESS: an fd plus a locally
+  // registered hipFile handle is meaningless to a peer, and a resolve that put
+  // one on the wire would ship a slot carrying no pages at all.  Callers that
+  // serve a remote reader, and callers that only test `found`, leave it off.
+  // Every declaration of this method repeats the same default deliberately --
+  // a default argument on a virtual binds statically, so they must not drift.
   virtual std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
-                                                  bool include_descs) = 0;
+                                                  bool include_descs,
+                                                  bool allow_file_refs = false) = 0;
 
   // Acquire a peer-local migration pin and resolve the key without changing or
   // cancelling normal RPC read leases. The caller must release a successful

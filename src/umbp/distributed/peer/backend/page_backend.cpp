@@ -489,7 +489,8 @@ ResolvedEntry PageBackend::Resolve(const std::string& key) {
 }
 
 std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::string>& keys,
-                                                     bool include_descs) {
+                                                     bool include_descs, bool allow_file_refs) {
+  (void)allow_file_refs;  // pages are this medium's storage; there is no file to name
   std::vector<ResolvedEntry> out(keys.size());
   if (keys.empty()) return out;
   std::lock_guard<std::mutex> lock(mutex_);

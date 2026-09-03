@@ -461,7 +461,7 @@ std::vector<bool> SsdBackend::BatchAbort(const std::vector<uint64_t>& slot_ids) 
 }
 
 std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::string>& keys,
-                                                    bool include_descs) {
+                                                    bool include_descs, bool allow_file_refs) {
   std::vector<ResolvedEntry> results(keys.size());
   if (keys.empty()) return results;
   const auto now = std::chrono::steady_clock::now();
@@ -515,11 +515,19 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
         continue;
       }
 
-      // Zero-copy GDS (UMBP_ENABLE_GDS): when enabled, a file engine is present,
-      // and the record is on an O_DIRECT fd, publish a FileRef and skip the
-      // staging arena — the reader (GdsEngine) DMAs the range into device memory.
+      // Zero-copy GDS (UMBP_ENABLE_GDS): when the caller can read a file ref,
+      // the switch is on, a file engine is present, and the record is on an
+      // O_DIRECT fd, publish a FileRef and skip the staging arena — the reader
+      // (GdsEngine) DMAs the range into device memory.
+      //
+      // allow_file_refs is tested FIRST on purpose.  A caller that cannot use a
+      // file ref — a peer serving the wire, or an existence check reading only
+      // `found` — must fall through to the staging path and get real pages, and
+      // testing it first also spares it LocateRecord and the hipFile
+      // registration GdsHandleForFd performs as a side effect.
       std::optional<RecordLocation> loc;
-      if (gds_enabled_ && (loc = ssd_->LocateRecord(keys[i])) && loc->direct_io && loc->fd >= 0) {
+      if (allow_file_refs && gds_enabled_ && (loc = ssd_->LocateRecord(keys[i])) &&
+          loc->direct_io && loc->fd >= 0) {
         if (void* handle = GdsHandleForFd(loc->fd)) {
           results[i].outcome = ResolveOutcome::kFound;
           results[i].found = true;

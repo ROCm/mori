@@ -378,10 +378,15 @@ class PoolClient {
   //
   // One pool batch preserves placement/read-order, tier touches, and promotion
   // semantics while avoiding one resolve call per key.
+  // `dst_is_device` answers, for an ORIGINAL key index, whether that key's
+  // destination is device memory -- the only place a file ref can be read.
+  // Empty (the default) means the caller cannot consume a file ref at all, so
+  // none is requested and every key resolves onto staged pages.
   void ResolveLocalBatch(const std::vector<std::string>& keys,
                          const std::vector<size_t>& candidates,
                          std::vector<MediumBackend*>* holders,
-                         std::vector<ResolvedEntry>* resolutions);
+                         std::vector<ResolvedEntry>* resolutions,
+                         const std::function<bool(size_t)>& dst_is_device = {});
 
   // One TransferItem per page between a caller buffer and `backend`'s own
   // buffers.  `to_backend` is Put (user -> pages), false is Get (pages -> user).
@@ -426,6 +431,12 @@ class PoolClient {
                                 uint64_t page_size, uint64_t stored_size,
                                 const std::vector<ObjectRange>& ranges, bool to_backend, size_t tag,
                                 std::vector<TransferItem>* items, double* classify_sink = nullptr);
+
+  // The file-ref counterpart of BuildLocalRangeTransfers, for a medium that
+  // published a range of its own storage instead of staged pages.
+  bool BuildLocalFileRangeTransfers(const TransferRef& file_ref,
+                                    const std::vector<ObjectRange>& ranges, size_t tag,
+                                    std::vector<TransferItem>* items);
 
   // Copy between one contiguous host object and a set of caller ranges, through
   // the transfer engine so a device-resident caller buffer is handled by

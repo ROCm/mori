@@ -158,12 +158,13 @@ std::vector<bool> InstrumentedBackend::BatchAbort(const std::vector<uint64_t>& s
 }
 
 std::vector<ResolvedEntry> InstrumentedBackend::BatchResolve(const std::vector<std::string>& keys,
-                                                             bool include_descs) {
+                                                             bool include_descs,
+                                                             bool allow_file_refs) {
   ops_[kResolve].batches.fetch_add(1, std::memory_order_relaxed);
   std::vector<ResolvedEntry> out;
   {
     ScopedNanos timer(ops_[kResolve].nanos);
-    out = inner_->BatchResolve(keys, include_descs);
+    out = inner_->BatchResolve(keys, include_descs, allow_file_refs);
   }
   uint64_t bytes = 0;
   for (const ResolvedEntry& r : out) {

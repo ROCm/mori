@@ -101,7 +101,7 @@ class PeerPool {
   std::vector<PoolCommitResult> BatchCommit(const std::vector<PoolCommitRequest>& requests);
   std::vector<bool> BatchAbort(const std::vector<PoolSlotRef>& slots);
   std::vector<PoolResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
-                                              bool include_descs);
+                                              bool include_descs, bool allow_file_refs = false);
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys, PoolEvictMode mode);
   void ClearLocal();
   std::vector<KvEvent> DrainPendingEvents();
