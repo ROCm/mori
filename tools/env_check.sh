@@ -1,10 +1,12 @@
 #!/bin/bash
 
-# NIC version requirements for cross-node MORI (EP over RDMA / IBGDA).
+# NIC version requirements for cross-node MORI over IBGDA.
 # The wrong NIC firmware/driver version is a common blocker, so `mori check`
 # validates the detected version against these known-good/known-bad ranges and
-# FAILS anything that is not known-good -- including firmware on a branch that
-# has never been validated. Only an undetectable version downgrades to a warning.
+# WARNS on anything that is not known-good -- including firmware on a branch that
+# has never been validated. It warns rather than fails because the host-proxy
+# backend (MORI_ENABLE_HOST_PROXY=1) does cross-node RDMA without IBGDA, so an
+# old firmware still runs; only IBGDA needs the minimum.
 #   - AINIC     : >= 1.117.5-a-45 is solid. The 1.117.1 major does NOT support IBGDA.
 #   - Broadcom  : solid on 237.1.137.x (official release) and 235.2.86.x
 #                 (customer-specific build). Known bad: 231.x and 232.x are too
@@ -1204,11 +1206,11 @@ version_ge() {
 }
 
 # check_ainic_version_recommendation <fw_version>
-#   fails if the AINIC firmware is on the IBGDA-incapable 1.117.1 branch, or
-#   below the required minimum for cross-node MORI (EP over RDMA / IBGDA).
-#   Anything that is not a known-good version fails: the wrong firmware is a
-#   hard blocker for cross-node MORI, not an advisory. An *undetectable*
-#   version stays a warning -- that is a tooling gap, not a firmware verdict.
+#   warns if the AINIC firmware is on the IBGDA-incapable 1.117.1 branch, or
+#   below the required minimum for cross-node IBGDA. It is a warning, not a
+#   failure: IBGDA needs the minimum, but the host-proxy backend
+#   (MORI_ENABLE_HOST_PROXY=1) does cross-node RDMA without IBGDA, so an old
+#   firmware still runs. An *undetectable* version also warns.
 check_ainic_version_recommendation() {
     local ver="$1"
     [[ -n "$ver" ]] || { log_warn "cannot verify AINIC firmware version against requirement (empty)"; return; }
@@ -1216,21 +1218,20 @@ check_ainic_version_recommendation() {
     [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || {
         log_warn "cannot parse AINIC firmware version '$ver' against requirement"; return; }
     if [[ "$ver" =~ ^1\.117\.1([.-]|$) ]]; then
-        log_fail "AINIC firmware $ver is on the 1.117.1 branch, which does NOT support IBGDA — upgrade to >= $AINIC_MIN_VER"
+        log_warn "AINIC firmware $ver is on the 1.117.1 branch, which does NOT support IBGDA — upgrade to >= $AINIC_MIN_VER for IBGDA, or use MORI_ENABLE_HOST_PROXY=1"
     elif version_ge "$ver" "$AINIC_MIN_VER"; then
         log_ok "AINIC firmware $ver meets the required minimum (>= $AINIC_MIN_VER) for cross-node IBGDA"
     else
-        log_fail "AINIC firmware $ver is below the required minimum (>= $AINIC_MIN_VER) for cross-node IBGDA"
+        log_warn "AINIC firmware $ver is below the minimum (>= $AINIC_MIN_VER) for cross-node IBGDA — upgrade for IBGDA, or use MORI_ENABLE_HOST_PROXY=1"
     fi
 }
 
 # check_bnxt_version_recommendation <fw_version>
 #   classifies Broadcom firmware by major branch against known-good/known-bad
-#   ranges for cross-node MORI (EP over RDMA / IBGDA).
-#   Anything that is not a known-good version fails, including an unverified
-#   branch: "we have never validated this firmware" is not a pass. An
-#   *undetectable* version stays a warning -- that is a tooling gap (no niccli),
-#   not a verdict on the firmware itself.
+#   ranges for cross-node IBGDA. Firmware that is not known-good warns rather
+#   than fails, including an unverified branch: IBGDA wants the minimum, but the
+#   host-proxy backend (MORI_ENABLE_HOST_PROXY=1) does cross-node RDMA without
+#   IBGDA, so an old firmware still runs. An *undetectable* version also warns.
 check_bnxt_version_recommendation() {
     local ver="$1" major="${1%%.*}" min=""
     [[ -n "$ver" ]] || { log_warn "cannot verify Broadcom firmware version against requirement (empty)"; return; }
@@ -1239,15 +1240,15 @@ check_bnxt_version_recommendation() {
     [[ "$ver" =~ ^[0-9]+(\.[0-9]+)+$ ]] || {
         log_warn "cannot parse Broadcom firmware version '$ver' against requirement"; return; }
     case "$major" in
-        231|232) log_fail "Broadcom firmware $ver is on the $major.x branch, which is too old for IBGDA — upgrade to >= $BNXT_MIN_VER_235 or >= $BNXT_MIN_VER_237"; return ;;
+        231|232) log_warn "Broadcom firmware $ver is on the $major.x branch, which is too old for IBGDA — upgrade to >= $BNXT_MIN_VER_235 or >= $BNXT_MIN_VER_237 for IBGDA, or use MORI_ENABLE_HOST_PROXY=1"; return ;;
         235) min="$BNXT_MIN_VER_235" ;;
         237) min="$BNXT_MIN_VER_237" ;;
-        *)   log_fail "Broadcom firmware $ver is on an unverified branch ($major.x) — required: >= $BNXT_MIN_VER_235 on 235.x or >= $BNXT_MIN_VER_237 on 237.x; known-bad: 231.x, 232.x"; return ;;
+        *)   log_warn "Broadcom firmware $ver is on an unverified branch ($major.x) — known-good: >= $BNXT_MIN_VER_235 on 235.x or >= $BNXT_MIN_VER_237 on 237.x; known-bad: 231.x, 232.x. Use MORI_ENABLE_HOST_PROXY=1 if IBGDA is unavailable"; return ;;
     esac
     if version_ge "$ver" "$min"; then
         log_ok "Broadcom firmware $ver is solid (>= $min on the $major.x branch)"
     else
-        log_fail "Broadcom firmware $ver is below the required minimum on the $major.x branch (>= $min)"
+        log_warn "Broadcom firmware $ver is below the minimum on the $major.x branch (>= $min) for IBGDA — upgrade for IBGDA, or use MORI_ENABLE_HOST_PROXY=1"
     fi
 }
 

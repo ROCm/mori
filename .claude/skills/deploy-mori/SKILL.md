@@ -525,8 +525,10 @@ sudo docker exec $CONTAINER_NAME bash -c "mori check"
 same intent):
 
 1. **firmware & driver** — versions consistent. Firmware that is not
-   known-good **fails**, including an unverified branch; only an undetectable
-   version downgrades to a warning.
+   known-good (below the IBGDA minimum, a known-bad or unverified branch, or
+   undetectable) **warns** rather than fails: the host-proxy backend
+   (`MORI_ENABLE_HOST_PROXY=1`) does cross-node RDMA without IBGDA, so only
+   IBGDA needs the minimum.
 2. **QoS / SL / TC** — PFC + lossless TC; selects SL/TC for MORI
 3. **DCQCN** — congestion control enabled on all RoCE devices
 4. **intra-node bandwidth** — `ib_write_bw` full mesh, host memory
