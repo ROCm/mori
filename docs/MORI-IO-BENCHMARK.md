@@ -2,13 +2,14 @@
 
 ## Table of Contents
 
-- [Benchmark Commands](#benchmark-commands)
-  - [Fabric (cross-node scale-up UALink super-node)](#fabric-cross-node-scale-up-ualink-super-node)
-- [C++ Benchmark (nixlbench-matching)](#c-benchmark-nixlbench-matching)
+- [Which benchmark to use](#which-benchmark-to-use)
+- [C++ Benchmark (default, nixlbench-matching)](#c-benchmark-default-nixlbench-matching)
   - [Build](#build)
   - [Run (two nodes)](#run-two-nodes)
   - [Sweep modes](#sweep-modes)
   - [Differences from the Python flags](#differences-from-the-python-flags)
+- [Python Benchmark](#python-benchmark)
+  - [Fabric (cross-node scale-up UALink super-node)](#fabric-cross-node-scale-up-ualink-super-node)
 - [Benchmark Arguments](#benchmark-arguments)
 - [Results: Thor2 RDMA Read](#results-thor2-rdma-read)
 - [Results: Thor2 RDMA Write](#results-thor2-rdma-write)
@@ -24,46 +25,38 @@
   - [Parameters that usually do not help (or can hurt)](#parameters-that-usually-do-not-help-or-can-hurt)
   - [Host (CPU) vs GPU memory](#host-cpu-vs-gpu-memory)
 
-## Benchmark Commands
+## Which benchmark to use
+
+MORI-IO ships two benchmarks that measure the same transfer paths:
+
+- **C++ (`tests/cpp/io/bench_engine`) — the default.** No Python interpreter in
+  the measurement loop, and its timing matches
+  [nixlbench](https://github.com/ai-dynamo/nixl) so MORI-IO and NIXL numbers are
+  directly comparable. This is what `tools/run_internode_io_benchmark.sh` runs by
+  default and what CI reports. Start here.
+- **Python (`tests/python/io/benchmark.py`) — kept for parity.** Uses `torchrun`
+  for rendezvous; convenient when you are already in a torch/torchrun workflow.
+  Select it with `run_internode_io_benchmark.sh --engine python`.
+
+Both accept the same workload flags (op, sweep, batch, QP, session); the C++ tool
+also accepts the Python spellings as aliases. See
+[Differences from the Python flags](#differences-from-the-python-flags).
+
+The two-node runner picks the engine with `--engine`:
 
 ```bash
-cd /path/to/mori
-export PYTHONPATH=/path/to/mori:$PYTHONPATH
-export GLOO_SOCKET_IFNAME=ens14np0  # Set to your NIC interface
+# C++ engine (default)
+tools/run_internode_io_benchmark.sh --rank 0 --master-addr <ip> --ifname <nic> \
+    -- --op write --all --enable-sess --enable-batch-transfer
 
-# Run on two nodes (replace node_rank and master_addr)
-torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
-    --master_addr="10.194.129.65" --master_port=1234 \
-    tests/python/io/benchmark.py --host="10.194.129.65"
+# Python engine
+tools/run_internode_io_benchmark.sh --engine python --rank 0 --master-addr <ip> \
+    --ifname <nic> -- --op-type write --all --enable-sess --enable-batch-transfer
 ```
 
-### Fabric (cross-node scale-up UALink super-node)
+## C++ Benchmark (default, nixlbench-matching)
 
-The `fabric` backend transfers between two nodes that share the same scale-up
-fabric domain (**same vPOD** — verify with `amd-smi fabric` that `PPOD_ID` and
-`VPOD_ID` match and `ACCEL_STATE` is `READY` on both). Buffers are allocated as
-fabric-exportable VMM memory internally, so no `--host`/QP options are needed;
-OOB metadata is still exchanged over gloo (torchrun).
-
-```bash
-# node A (initiator)
-torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
-    --master_addr="<nodeA_ip>" --master_port=1234 \
-    tests/python/io/benchmark.py --backend fabric \
-    --all --enable-sess --enable-batch-transfer --transfer-batch-size 1 \
-    --sweep-start-size 1048576 --sweep-max-size 268435456 --op-type read
-
-# node B (target): same command with --node_rank=1
-```
-
-> Requires ROCm ≥ 7.15 (HIP fabric VMM APIs). Only GPU memory is supported
-> (`--mem-type gpu`). If the two nodes are not in the same vPOD, session creation
-> fails fast with a clear error.
-
-## C++ Benchmark (nixlbench-matching)
-
-The commands above use the **Python** benchmark (`tests/python/io/benchmark.py`).
-There is also a native **C++** benchmark, `tests/cpp/io/bench_engine.cpp`, whose
+The **C++** benchmark, `tests/cpp/io/bench_engine.cpp`, is the default. Its
 measurement loop is written to **match [nixlbench](https://github.com/ai-dynamo/nixl)**
 (NVIDIA NIXL's `xferbench`) exactly, so MORI-IO and NIXL RDMA numbers are
 apples-to-apples on the same fabric. Use it when you want a head-to-head
@@ -217,6 +210,46 @@ Most flags share names with the Python benchmark (`--op-type`/`--op`,
 > `P+1 … P+2N` for the engines — leave that range free. Each side forks `N-1`
 > children before touching HIP, so a failure in one pair still reaps the others
 > rather than leaving them holding ports.
+
+## Python Benchmark
+
+Kept for parity with the C++ default (select it in the runner with
+`--engine python`). It uses `torchrun` for the out-of-band rendezvous instead of
+MORI's socket bootstrap.
+
+```bash
+cd /path/to/mori
+export PYTHONPATH=/path/to/mori:$PYTHONPATH
+export GLOO_SOCKET_IFNAME=ens14np0  # Set to your NIC interface
+
+# Run on two nodes (replace node_rank and master_addr)
+torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
+    --master_addr="10.194.129.65" --master_port=1234 \
+    tests/python/io/benchmark.py --host="10.194.129.65"
+```
+
+### Fabric (cross-node scale-up UALink super-node)
+
+The `fabric` backend transfers between two nodes that share the same scale-up
+fabric domain (**same vPOD** — verify with `amd-smi fabric` that `PPOD_ID` and
+`VPOD_ID` match and `ACCEL_STATE` is `READY` on both). Buffers are allocated as
+fabric-exportable VMM memory internally, so no `--host`/QP options are needed;
+OOB metadata is still exchanged over gloo (torchrun).
+
+```bash
+# node A (initiator)
+torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
+    --master_addr="<nodeA_ip>" --master_port=1234 \
+    tests/python/io/benchmark.py --backend fabric \
+    --all --enable-sess --enable-batch-transfer --transfer-batch-size 1 \
+    --sweep-start-size 1048576 --sweep-max-size 268435456 --op-type read
+
+# node B (target): same command with --node_rank=1
+```
+
+> Requires ROCm ≥ 7.15 (HIP fabric VMM APIs). Only GPU memory is supported
+> (`--mem-type gpu`). If the two nodes are not in the same vPOD, session creation
+> fails fast with a clear error. The C++ benchmark also supports `--backend fabric`.
 
 ## Benchmark Arguments
 
@@ -456,13 +489,16 @@ or single-transfer workloads may prefer different settings.
 
 ### Recommended starting config
 
+These workload flags apply to both engines (the C++ default and Python); only the
+launch wrapper differs. Shown against the C++ binary:
+
 ```bash
-tests/python/io/benchmark.py \
-    --op-type write \
+tests/cpp/io/bench_engine --op write \
     --enable-sess --enable-batch-transfer --batch-contiguous \
     --disable-chunking \
     --num-qp-per-transfer 8 --num-worker-threads 8 \
     --transfer-batch-size 128 --num-initiator-dev 1 --num-target-dev 1
+    # (plus --rank/--master-ip/--self-ip/--port for the two-node rendezvous)
 ```
 
 On a 400G-class NIC this typically reaches ~95%+ of link rate across the

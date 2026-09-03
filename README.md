@@ -295,11 +295,14 @@ export PYTHONPATH=/path/to/mori:$PYTHONPATH
 # Correctness tests
 pytest tests/python/io/
 
-# Benchmark performance (two nodes)
-export GLOO_SOCKET_IFNAME=ens14np0
-torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr="10.194.129.65" --master_port=1234 \
-  tests/python/io/benchmark.py --host="10.194.129.65" --enable-batch-transfer --enable-sess --buffer-size 32768 --transfer-batch-size 128
+# Benchmark performance (two nodes). The runner defaults to the native C++
+# benchmark (tests/cpp/io/bench_engine); pass --engine python for the torchrun path.
+tools/run_internode_io_benchmark.sh --rank 0 --master-addr "10.194.129.65" --ifname ens14np0 \
+  -- --op write --enable-batch-transfer --enable-sess --buffer-size 32768 --transfer-batch-size 128
+# (run the same command on the second node with --rank 1)
 ```
+
+See [docs/MORI-IO-BENCHMARK.md](docs/MORI-IO-BENCHMARK.md) for both engines and tuning.
 
 ### Test MORI-IR (Triton + shmem integration, [guide](python/mori/ir/README.md))
 
