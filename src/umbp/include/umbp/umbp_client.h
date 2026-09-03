@@ -244,15 +244,29 @@ class IUMBPClient {
 /// empty so no socket is opened and no thread is started for a cluster this
 /// process is not part of.
 ///
-/// A config that already names a deployment (`distributed` or
-/// `standalone_process`) is returned unchanged, so an explicit configuration
-/// always wins.
+/// Being embedded (in this process) and having a master are independent: a
+/// `distributed` block does NOT mean "not embedded", it means "I have opinions
+/// about some fields". Such a config keeps every value it sets and only has its
+/// blanks filled -- identity, and `dram_page_size` when it is 0 -- so a caller
+/// wanting one field need not hand-build the whole struct. The one value that
+/// is adjusted rather than merely filled is that page size, and only for a pool
+/// no peer shares (`peer_service_port == 0`): a page larger than the pool
+/// yields zero pages and makes every put fail with NO_SPACE silently, so an
+/// impossible size is shrunk to fit and warned about whether it was defaulted
+/// or asked for. The full set of embedded choices above is applied only
+/// when no `distributed` block was given at all, since only then is there no
+/// choice of the caller's to overwrite.
+///
+/// Two configs are returned unchanged: one naming `standalone_process` (a
+/// different client entirely -- the pool lives in the server process) and one
+/// whose `master_config.master_address` is non-empty (a cluster member, whose
+/// settings belong to the deployment rather than to us).
 UMBPConfig WithEmbeddedDefaults(const UMBPConfig& config);
 
 /// Factory: creates the appropriate IUMBPClient implementation.
 /// StandaloneProcessClient when config.standalone_process is set; otherwise a
-/// DistributedClient, over config.distributed if present and over
-/// WithEmbeddedDefaults(config) if not.
+/// DistributedClient over WithEmbeddedDefaults(config), which covers a cluster
+/// member, a self-configured masterless node and a bare config alike.
 std::unique_ptr<IUMBPClient> CreateUMBPClient(const UMBPConfig& config = UMBPConfig{});
 
 }  // namespace mori::umbp
