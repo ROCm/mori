@@ -1086,13 +1086,22 @@ int ccoMemFree(ccoComm* comm, void* ptr) {
 /* ========================================================================== */
 
 int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin) {
-  auto it = comm->allocTable.find(ptr);
-  if (it == comm->allocTable.end()) {
-    MORI_SHMEM_ERROR("ccoWindowRegister: ptr {} not in allocTable", ptr);
-    return -1;
+  // allocMutex only for the lookup, not for the whole function: the peer exchange
+  // below is collective, and the callers that allocate (the other two overloads)
+  // reach ccoMemAlloc / ccoMemImport, which take this mutex themselves. Holding a
+  // reference past the unlock is fine -- rehashing invalidates iterators, not
+  // references to elements.
+  ccoComm::AllocMeta* metaPtr = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(comm->allocMutex);
+    auto it = comm->allocTable.find(ptr);
+    if (it == comm->allocTable.end()) {
+      MORI_SHMEM_ERROR("ccoWindowRegister: ptr {} not in allocTable", ptr);
+      return -1;
+    }
+    metaPtr = &it->second;
   }
-
-  auto& meta = it->second;
+  auto& meta = *metaPtr;
   size_t slotOffset = meta.slotOffset;
   void* localPtr = ptr;
   int worldSize = comm->worldSize;
@@ -1385,7 +1394,6 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
   tableEntry.base = reinterpret_cast<uintptr_t>(localPtr);
   tableEntry.size = static_cast<uintptr_t>(size);
   tableEntry.devPtr = devPtr;
-  comm->windowTableEntries.push_back(tableEntry);
 
   auto* wh = new ccoWindowHost();
   wh->localPtr = localPtr;
@@ -1393,7 +1401,15 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
   wh->devPtr = devPtr;
   wh->peerRkeys_gpu = peerRkeys_gpu;
   wh->peerImportedHandles = std::move(p2pImportedHandles);
-  comm->windows.push_back(wh);
+
+  // Publish both under the lock: ccoWindowDeregister walks these vectors, and a
+  // push_back that reallocates under it invalidates the index and the pointer it is
+  // holding.
+  {
+    std::lock_guard<std::mutex> lock(comm->allocMutex);
+    comm->windowTableEntries.push_back(tableEntry);
+    comm->windows.push_back(wh);
+  }
 
   *outWin = devPtr;
 
@@ -1479,6 +1495,12 @@ void* ccoGetPeerPtr(ccoComm* comm, void* localPtr, int pe) {
 /* ========================================================================== */
 
 int ccoWindowDeregister(ccoComm* comm, ccoWindow_t win) {
+  // Whole function: it searches and mutates windows / windowTableEntries, reads
+  // allocTable, and deletes the host record. Unlike the register overloads it calls
+  // nothing that takes this mutex, so holding it throughout is safe. The HIP calls
+  // inside will block a concurrent MemAlloc, which is acceptable -- window teardown
+  // is rare and already serialised against itself by the caller in practice.
+  std::lock_guard<std::mutex> lock(comm->allocMutex);
   ccoWindowHost* wh = nullptr;
   size_t idx = 0;
   for (size_t i = 0; i < comm->windows.size(); i++) {
