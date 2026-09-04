@@ -5,7 +5,13 @@
 #   run_internode_test.sh --rank <0|1> --master-addr <ip> --ifname <nic> \
 #                         --cmd <bench|stress|test> --max-tokens <N> \
 #                         [--master-port <port>] [--kernel-type <v1|v1_ll|async_ll>] \
-#                         [--num-qp <N>] [--quant-type <none|...>] [--dtype <bf16|...>]
+#                         [--num-qp <N>] [--quant-type <none|...>] [--dtype <bf16|...>] \
+#                         [--entry <path>]
+#
+# --entry selects which driver torchrun runs, defaulting to the shmem AOT harness.
+# The v2 CCO entry takes the same CLI and differs only in installing the JIT
+# redirect before the harness builds its first op, so the two are interchangeable
+# here; anything else would have to parse these same flags.
 #
 # Environment variables GLOO_SOCKET_IFNAME and MORI_SOCKET_IFNAME are set
 # automatically from --ifname. All other env vars (MORI_RDMA_SL, MORI_SHMEM_MODE,
@@ -23,6 +29,8 @@ NUM_QP=2
 MAX_TOKENS=""
 QUANT_TYPE=""
 DTYPE=""
+TOPK=""
+ENTRY="examples/ops/dispatch_combine/test_dispatch_combine_internode.py"
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -36,6 +44,8 @@ while [[ $# -gt 0 ]]; do
     --max-tokens)   MAX_TOKENS="$2";   shift 2 ;;
     --quant-type)   QUANT_TYPE="$2";   shift 2 ;;
     --dtype)        DTYPE="$2";        shift 2 ;;
+    --topk)         TOPK="$2";         shift 2 ;;
+    --entry)        ENTRY="$2";        shift 2 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
@@ -50,9 +60,18 @@ export MORI_SOCKET_IFNAME="$IFNAME"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
+[[ -f "$ENTRY" ]] || { echo "--entry not found under $REPO_ROOT: $ENTRY"; exit 1; }
+
+# torchrun puts the entry's own directory on sys.path, not the repo root, so an
+# entry that imports "tests.python.*" (the v2 one does, for the shared test
+# utils) cannot resolve it. Under pytest the rootdir covers this; here nothing
+# does.
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+
 EXTRA_ARGS=()
 [[ -n "$QUANT_TYPE" ]] && EXTRA_ARGS+=(--quant-type "$QUANT_TYPE")
 [[ -n "$DTYPE" ]]       && EXTRA_ARGS+=(--dtype "$DTYPE")
+[[ -n "$TOPK" ]]        && EXTRA_ARGS+=(--topk "$TOPK")
 
 exec timeout "${MORI_INTERNODE_TIMEOUT:-120}" torchrun \
   --nnodes=2 \
@@ -60,7 +79,7 @@ exec timeout "${MORI_INTERNODE_TIMEOUT:-120}" torchrun \
   --nproc_per_node=1 \
   --master_addr="$MASTER_ADDR" \
   --master_port="$MASTER_PORT" \
-  examples/ops/dispatch_combine/test_dispatch_combine_internode.py \
+  "$ENTRY" \
   --cmd "$CMD" \
   --kernel-type "$KERNEL_TYPE" \
   --num-qp "$NUM_QP" \

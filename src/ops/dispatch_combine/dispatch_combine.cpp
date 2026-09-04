@@ -245,6 +245,7 @@ mori::application::SymmMemObjPtr EpDispatchCombineHandle::MallocSymm(size_t size
                              ", have " + std::to_string(ccoArenaSize - ccoArenaBump) + ")");
   }
   void* localPtr = static_cast<char*>(ccoArenaLocalPtr) + ccoArenaBump;
+  const size_t winOffset = ccoArenaBump;
   ccoArenaBump += aligned;  // sub-region already zeroed by the arena memset
 
   const int ws = config.worldSize;
@@ -261,6 +262,10 @@ mori::application::SymmMemObjPtr EpDispatchCombineHandle::MallocSymm(size_t size
   cpuObj->p2pPeerPtrs = p2pDev;  // device array; only dereferenced on device
   cpuObj->size = size;
   cpuObj->worldSize = ws;
+  // Every sub-region shares the one arena window, so a cross-node put is
+  // (arena window, winOffset + intra-buffer offset). See SymmMemObj::ccoWin.
+  cpuObj->ccoWin = ccoArenaWin;
+  cpuObj->ccoWinOffset = winOffset;
 
   mori::application::SymmMemObj* gpuObj = nullptr;
   HIP_RUNTIME_CHECK(hipMalloc(&gpuObj, sizeof(mori::application::SymmMemObj)));

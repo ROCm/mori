@@ -478,6 +478,7 @@ class EpDispatchCombineTestCase:
         hidden_dim=7168,
         combine_dtype=None,
         max_total_recv_tokens=0,
+        topk=8,
     ):
         self.rank = rank
         self.gpu_per_node = gpu_per_node
@@ -507,7 +508,7 @@ class EpDispatchCombineTestCase:
             scale_type_size=4,
             max_num_inp_token_per_rank=max_tokens,
             num_experts_per_rank=256 // self.world_size,
-            num_experts_per_token=8,
+            num_experts_per_token=topk,
             warp_num_per_block=8,
             block_num=96,
             max_token_type_size=2,
@@ -1874,6 +1875,7 @@ def test_dispatch_combine(
     save_tuning_config=None,
     skip_verify=False,
     sentinel_pattern="every_other",
+    topk=8,
 ):
     world_size = num_node * gpu_per_node
     node_rank = int(os.environ["RANK"])
@@ -1892,6 +1894,7 @@ def test_dispatch_combine(
             hidden_dim=hidden_dim,
             combine_dtype=combine_dtype,
             max_total_recv_tokens=max_total_recv_tokens,
+            topk=topk,
         )
         test_case.setup()
         if cmd == "test":
@@ -2099,6 +2102,12 @@ parser.add_argument(
     help="Base hidden dimension for the model (default: 7168)",
 )
 parser.add_argument(
+    "--topk",
+    type=int,
+    default=8,
+    help="Experts per token (default: 8)",
+)
+parser.add_argument(
     "--save-tuning-config",
     type=str,
     default=None,
@@ -2211,6 +2220,7 @@ if __name__ == "__main__":
             args_cli.save_tuning_config,
             args_cli.skip_verify,
             args_cli.sentinel_pattern,
+            args_cli.topk,
         ),
         nprocs=gpu_per_node,
         join=True,

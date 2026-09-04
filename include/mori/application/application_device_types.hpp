@@ -111,6 +111,13 @@ struct SymmMemObj {
   VMMChunkKey* vmmRkeyInfo{nullptr};
   size_t vmmNumChunks{0};  // Total number of chunks in VMM heap
   int worldSize{0};
+  // For CCO scale-out (GDA): RDMA names a remote buffer as (window, byte offset)
+  // with iova=0, so unlike p2pPeerPtrs there is no peer VA to hand the NIC.
+  // These say which arena window this object was carved from and where in it.
+  // Null on the shmem backend, which addresses RDMA through peerPtrs/peerRkeys.
+  void* ccoWin{nullptr};  // ccoWindow_t; opaque here to keep cco out of this header
+  size_t ccoWinOffset{0};
+
   // For IPC
   hipIpcMemHandle_t* ipcMemHandles{nullptr};  // should only placed on cpu
 
