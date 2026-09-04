@@ -942,8 +942,13 @@ class MoriIoBenchmark:
             transfer_uids.append(self.engine.allocate_transfer_uid())
 
         func, arg_list = None, []
+        if not self.batch_contiguous:
+            stride = buffer_size + 1
+            offsets = [i * stride for i in range(transfer_batch_size)]
+        else:
+            offsets = [i * buffer_size for i in range(transfer_batch_size)]
         for i in range(transfer_batch_size):
-            offset = buffer_size * i
+            offset = offsets[i]
             if self.enable_sess:
                 func = self.sess.read if self.op_type == "read" else self.sess.write
                 arg_list.append(
