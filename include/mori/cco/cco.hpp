@@ -270,6 +270,9 @@ struct ccoIbgdaWin {
 };
 
 struct ccoWindowDevice {
+  // ccoWindowRegister allocates this metadata object with hipMalloc, so a
+  // ccoWindow_t always points into device global memory. winBase below is the
+  // separately reserved flat-VA slot containing the window payload.
   // LSA flat-VA addressing (intra-node only). winBase is the window's slot in
   // the LSA-sized flat VA reservation. Peer addressing uses LSA rank, not
   // world rank. Cross-node access goes through ibgdaWin (iova=0 + offset).
