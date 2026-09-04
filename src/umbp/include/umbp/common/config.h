@@ -215,6 +215,13 @@ struct UMBPDistributedConfig {
 
   size_t staging_buffer_size = 64ULL * 1024 * 1024;  // 64 MB
 
+  // Registered host arena used by ranged multi-buffer I/O. Remote objects are
+  // fetched into disjoint slices here before being installed into the local
+  // tier; ranged puts assemble their scattered GPU ranges into the same arena.
+  // Zero keeps ranged remote I/O disabled without allocating or registering
+  // additional host memory; callers that need it must opt in explicitly.
+  size_t ranged_scratch_size = 0;
+
   // Dedicated SSD read staging, allocated only when ssd.enabled. Per-slot
   // (this / ssd_staging_buffer_slots) must be >= the largest single-key page KV
   // (61-layer MLA page ~= 4.5 MB).

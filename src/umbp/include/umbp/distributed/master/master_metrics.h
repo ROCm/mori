@@ -166,6 +166,11 @@
 #define MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP \
   "Total bytes delivered to this client (inbound reads) split by local/remote traffic"
 
+#define MORI_UMBP_METRIC_RANGED_REMOTE_INSTALL_FAILURES_TOTAL \
+  "mori_umbp_ranged_remote_install_failures_total"
+#define MORI_UMBP_METRIC_RANGED_REMOTE_INSTALL_FAILURES_TOTAL_HELP \
+  "Remote ranged objects that could not be synchronously installed in the local DRAM tier"
+
 // --- Heartbeat / event-shipping counters (master-as-advisor) ----------------
 
 #define MORI_UMBP_METRIC_HEARTBEAT_EVENTS_APPLIED_TOTAL "mori_umbp_heartbeat_events_applied_total"

@@ -494,7 +494,7 @@ jobs:
 
       - name: UMBP C++ unit tests (local + distributed)
         run: |
-          $CT exec $CONTAINER bash -c "
+          $CT exec -e MORI_UMBP_LOG_LEVEL=warn $CONTAINER bash -c "
             cd $GITHUB_WORKSPACE/build
             timeout 300 ctest --output-on-failure \
               -R '^(umbp_|test_dummy_ssd_tier|test_prefix_aware_eviction|test_ssd_tier)'

@@ -19,6 +19,8 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+#include <hip/hip_runtime_api.h>
+
 #include <cassert>
 #include <cstring>
 #include <iostream>
@@ -184,6 +186,64 @@ void test_put_from_ptr_get_into_ptr() {
   std::cout << "PASSED" << std::endl;
 }
 
+void test_gpu_put_get() {
+  std::cout << "test_gpu_put_get... ";
+  int device_count = 0;
+  if (hipGetDeviceCount(&device_count) != hipSuccess || device_count == 0) {
+    (void)hipGetLastError();
+    std::cout << "SKIPPED (no GPU)" << std::endl;
+    return;
+  }
+
+  UMBPConfig config;
+  config.dram.capacity_bytes = 1 * 1024 * 1024;
+  config.ssd.enabled = false;
+  StandaloneClient client(config);
+
+  constexpr size_t kSize = 4096;
+  std::vector<unsigned char> host_a(kSize, 0x2a);
+  std::vector<unsigned char> host_b(kSize, 0x7c);
+  void* device_buffer = nullptr;
+  assert(hipMalloc(&device_buffer, 2 * kSize) == hipSuccess);
+  assert(hipMemcpy(device_buffer, host_a.data(), kSize, hipMemcpyHostToDevice) == hipSuccess);
+  assert(hipMemcpy(static_cast<char*>(device_buffer) + kSize, host_b.data(), kSize,
+                   hipMemcpyHostToDevice) == hipSuccess);
+
+  // Exercise the single-item Write/ReadIntoPtr paths.
+  assert(client.Put("gpu-single", reinterpret_cast<uintptr_t>(device_buffer), kSize));
+  assert(hipMemset(device_buffer, 0, kSize) == hipSuccess);
+  assert(client.Get("gpu-single", reinterpret_cast<uintptr_t>(device_buffer), kSize));
+  std::vector<unsigned char> single_result(kSize);
+  assert(hipMemcpy(single_result.data(), device_buffer, kSize, hipMemcpyDeviceToHost) ==
+         hipSuccess);
+  assert(single_result == host_a);
+
+  // Exercise the batched stream path in both directions.
+  assert(hipMemcpy(device_buffer, host_a.data(), kSize, hipMemcpyHostToDevice) == hipSuccess);
+  assert(hipMemcpy(static_cast<char*>(device_buffer) + kSize, host_b.data(), kSize,
+                   hipMemcpyHostToDevice) == hipSuccess);
+  const std::vector<std::string> keys{"gpu-batch-a", "gpu-batch-b"};
+  const std::vector<uintptr_t> ptrs{reinterpret_cast<uintptr_t>(device_buffer),
+                                    reinterpret_cast<uintptr_t>(device_buffer) + kSize};
+  const std::vector<size_t> sizes{kSize, kSize};
+  const auto put_results = client.BatchPut(keys, ptrs, sizes);
+  assert(put_results.size() == 2 && put_results[0] && put_results[1]);
+
+  assert(hipMemset(device_buffer, 0, 2 * kSize) == hipSuccess);
+  const auto get_results = client.BatchGet(keys, ptrs, sizes);
+  assert(get_results.size() == 2 && get_results[0] && get_results[1]);
+  std::vector<unsigned char> batch_a(kSize);
+  std::vector<unsigned char> batch_b(kSize);
+  assert(hipMemcpy(batch_a.data(), device_buffer, kSize, hipMemcpyDeviceToHost) == hipSuccess);
+  assert(hipMemcpy(batch_b.data(), static_cast<char*>(device_buffer) + kSize, kSize,
+                   hipMemcpyDeviceToHost) == hipSuccess);
+  assert(batch_a == host_a);
+  assert(batch_b == host_b);
+
+  assert(hipFree(device_buffer) == hipSuccess);
+  std::cout << "PASSED" << std::endl;
+}
+
 void test_dram_full_demote_with_index() {
   std::cout << "test_dram_full_demote_with_index... ";
 
@@ -332,6 +392,7 @@ int main() {
   test_batch_put_get();
   test_clear();
   test_put_from_ptr_get_into_ptr();
+  test_gpu_put_get();
   test_dram_full_demote_with_index();
   test_batch_get_ssd_tier();
   test_batch_get_follower();

@@ -228,6 +228,7 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("master_config", &UMBPDistributedConfig::master_config)
       .def_readwrite("io_engine", &UMBPDistributedConfig::io_engine)
       .def_readwrite("staging_buffer_size", &UMBPDistributedConfig::staging_buffer_size)
+      .def_readwrite("ranged_scratch_size", &UMBPDistributedConfig::ranged_scratch_size)
       .def_readwrite("ssd_staging_buffer_size", &UMBPDistributedConfig::ssd_staging_buffer_size)
       .def_readwrite("ssd_staging_buffer_slots", &UMBPDistributedConfig::ssd_staging_buffer_slots)
       .def_readwrite("peer_service_port", &UMBPDistributedConfig::peer_service_port)
@@ -275,6 +276,12 @@ void RegisterMoriUmbp(py::module_& m) {
            py::call_guard<py::gil_scoped_release>())
       .def("batch_get_into_ptr", &IUMBPClient::BatchGet, py::arg("keys"), py::arg("ptrs"),
            py::arg("sizes"), py::call_guard<py::gil_scoped_release>())
+      .def("batch_get_ranges_into_ptr", &IUMBPClient::BatchGetRanges, py::arg("keys"),
+           py::arg("ptrs"), py::arg("sizes"), py::arg("src_offsets"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("batch_put_ranges_from_ptr", &IUMBPClient::BatchPutRanges, py::arg("keys"),
+           py::arg("object_sizes"), py::arg("ptrs"), py::arg("sizes"), py::arg("dst_offsets"),
+           py::call_guard<py::gil_scoped_release>())
       .def("batch_exists", &IUMBPClient::BatchExists, py::arg("keys"),
            py::call_guard<py::gil_scoped_release>())
       .def("batch_exists_consecutive", &IUMBPClient::BatchExistsConsecutive, py::arg("keys"),
@@ -283,6 +290,8 @@ void RegisterMoriUmbp(py::module_& m) {
       .def("flush", &IUMBPClient::Flush, py::call_guard<py::gil_scoped_release>())
       .def("is_distributed", &IUMBPClient::IsDistributed)           // pure getter, no I/O
       .def("get_deployment_mode", &IUMBPClient::GetDeploymentMode)  // pure getter, no I/O
+      .def("get_backend_mode", &IUMBPClient::GetBackendMode)        // pure getter, no I/O
+      .def("supports_ranged_io", &IUMBPClient::SupportsRangedIO)    // pure getter, no I/O
       .def("register_memory", &IUMBPClient::RegisterMemory, py::arg("ptr"), py::arg("size"),
            py::call_guard<py::gil_scoped_release>())
       .def("deregister_memory", &IUMBPClient::DeregisterMemory, py::arg("ptr"),

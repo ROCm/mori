@@ -72,12 +72,22 @@ class LocalStorageManager {
                                       const std::vector<uintptr_t>& srcs,
                                       const std::vector<size_t>& sizes,
                                       StorageTier tier = StorageTier::CPU_DRAM);
+  std::vector<bool> WriteBatchRangesFromPtr(const std::vector<std::string>& keys,
+                                            const std::vector<size_t>& object_sizes,
+                                            const std::vector<std::vector<uintptr_t>>& srcs,
+                                            const std::vector<std::vector<size_t>>& sizes,
+                                            const std::vector<std::vector<size_t>>& dst_offsets,
+                                            StorageTier tier = StorageTier::CPU_DRAM);
 
   bool ReadIntoPtr(const std::string& key, uintptr_t dst, size_t size);
   bool ReadIntoPtrNoPromote(const std::string& key, uintptr_t dst, size_t size);
   std::vector<bool> ReadBatchIntoPtr(const std::vector<std::string>& keys,
                                      const std::vector<uintptr_t>& dst_ptrs,
                                      const std::vector<size_t>& sizes);
+  std::vector<bool> ReadBatchRangesIntoPtr(const std::vector<std::string>& keys,
+                                           const std::vector<std::vector<uintptr_t>>& dst_ptrs,
+                                           const std::vector<std::vector<size_t>>& sizes,
+                                           const std::vector<std::vector<size_t>>& src_offsets);
   bool Exists(const std::string& key) const;
   bool Evict(const std::string& key);
   std::pair<size_t, size_t> Capacity(StorageTier tier) const;
@@ -155,6 +165,10 @@ class LocalStorageManager {
   // if no metadata is available.
   // Returns empty string if the tier is empty.
   std::string SelectVictim(TierBackend* tier);
+
+  bool WriteRangesFromPtr(const std::string& key, size_t object_size,
+                          const std::vector<uintptr_t>& srcs, const std::vector<size_t>& sizes,
+                          const std::vector<size_t>& dst_offsets, StorageTier tier);
 
   // -----------------------------------------------------------------------
   // Existing helpers

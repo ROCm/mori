@@ -375,5 +375,72 @@ TEST_F(BatchPutWarnTest, ZeroSizeGetEntriesFailOthersSucceed) {
   EXPECT_TRUE(gres[2]) << "key=" << gkeys[2];
 }
 
+// ---------------------------------------------------------------------------
+// Multi-page objects exercise the tier-page run merging in LocalPutPages /
+// LocalGetPages. Every other test here uses exactly one page per key, so the
+// merge path never runs there.
+//
+// A wrong run boundary or a miscomputed run length still returns true, so these
+// assert bytes rather than status. The fill pattern varies per byte so a
+// shifted, duplicated or truncated run is visible.
+// ---------------------------------------------------------------------------
+
+namespace {
+void FillPattern(char* buf, size_t bytes, uint8_t seed) {
+  for (size_t i = 0; i < bytes; ++i) {
+    buf[i] = static_cast<char>((i * 31u + seed) & 0xFFu);
+  }
+}
+}  // namespace
+
+TEST_F(BatchPutWarnTest, MultiPageObjectRoundTripsByteExact) {
+  constexpr size_t kPages = 4;
+  constexpr size_t kSize = kPages * kPageSize;  // whole pages, no partial tail
+
+  std::vector<char> src(kSize);
+  FillPattern(src.data(), kSize, 0x5A);
+  std::vector<std::string> keys = {"mp-full"};
+  std::vector<const void*> srcs = {src.data()};
+  std::vector<size_t> sizes = {kSize};
+  auto pres = target_->BatchPut(keys, srcs, sizes);
+  ASSERT_EQ(pres.size(), 1u);
+  ASSERT_TRUE(pres[0]);
+
+  std::vector<char> dst(kSize, 0);
+  std::vector<void*> dsts = {dst.data()};
+  auto gres = target_->BatchGet(keys, dsts, sizes);
+  ASSERT_EQ(gres.size(), 1u);
+  ASSERT_TRUE(gres[0]);
+  EXPECT_EQ(std::memcmp(src.data(), dst.data(), kSize), 0)
+      << "multi-page object did not round trip byte-exact";
+}
+
+TEST_F(BatchPutWarnTest, MultiPageObjectWithPartialTailRoundTripsByteExact) {
+  // Deliberately not a page multiple: the final page is short, which is the
+  // one place LogicalPageBytes differs and the easiest boundary to get wrong
+  // when accumulating a run length.
+  constexpr size_t kSize = 3 * kPageSize + 1234;
+
+  std::vector<char> src(kSize);
+  FillPattern(src.data(), kSize, 0xA5);
+  std::vector<std::string> keys = {"mp-tail"};
+  std::vector<const void*> srcs = {src.data()};
+  std::vector<size_t> sizes = {kSize};
+  auto pres = target_->BatchPut(keys, srcs, sizes);
+  ASSERT_EQ(pres.size(), 1u);
+  ASSERT_TRUE(pres[0]);
+
+  // One extra byte of guard on each side catches a run that copies too much.
+  std::vector<char> dst(kSize + 2, 0x7E);
+  std::vector<void*> dsts = {dst.data() + 1};
+  auto gres = target_->BatchGet(keys, dsts, sizes);
+  ASSERT_EQ(gres.size(), 1u);
+  ASSERT_TRUE(gres[0]);
+  EXPECT_EQ(std::memcmp(src.data(), dst.data() + 1, kSize), 0)
+      << "partial-tail object did not round trip byte-exact";
+  EXPECT_EQ(dst.front(), static_cast<char>(0x7E)) << "run underran the destination";
+  EXPECT_EQ(dst.back(), static_cast<char>(0x7E)) << "run overran the destination";
+}
+
 }  // namespace
 }  // namespace mori::umbp
