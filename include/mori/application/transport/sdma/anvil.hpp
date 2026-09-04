@@ -47,13 +47,12 @@ namespace anvil {
 
 class SdmaQueue {
  public:
-  SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAgent, uint32_t engineId);
+  SdmaQueue(uint32_t localNodeId, uint32_t engineId);
   ~SdmaQueue();
 
   SdmaQueueDeviceHandle* deviceHandle() const;
 
  private:
-  int remoteDeviceId_;  // TODO unused
   uint64_t* cachedWptr_;
   uint64_t* committedWptr_;
   void* queueBuffer_;
@@ -76,8 +75,25 @@ class AnvilLib {
 
  public:
   void init();
-  bool connect(int srcDeviceId, int dstDeviceId, int numChannels = 1);
-  SdmaQueue* getSdmaQueue(int srcDeviceId, int dstDeviceId, int channelIdx = 0);
+  // srcNode/dstNode are KFD topology node ids (== HSA_AGENT_INFO_NODE), a
+  // host-global GPU identity that does NOT depend on HIP_VISIBLE_DEVICES. This
+  // is the correct key for a peer even when the peer GPU is not in this
+  // process's HIP device list. Channels for a pair are shared process-wide.
+  bool connect(int srcNode, int dstNode, int numChannels = 1);
+
+  // Get the SDMA queue for a given src/dst node pair and channel index.
+  SdmaQueue* getSdmaQueue(int srcNode, int dstNode, int channelIdx = 0);
+
+  // Map a HIP device ordinal to its KFD node id. For single-process callers
+  // (e.g. the examples) that only have HIP device ids; multi-process collectives
+  // should exchange node ids out-of-band instead (see Context::KfdNodeId).
+  static uint32_t nodeForHipDevice(int hipDev);
+
+  // Resolve the KFD topology node id of the given HIP device WITHOUT initializing
+  // HSA. The KFD node id (the directory index under /sys/class/kfd/kfd/topology/nodes)
+  // is identical to what HSA_AGENT_INFO_NODE / hsaKmtGetNodeProperties report,
+  // and is a host-global identity independent of HIP_VISIBLE_DEVICES.
+  static int kfdNodeIdForHipDevice(int hipDev);
 
  private:
   /*
@@ -101,25 +117,23 @@ class AnvilLib {
                                                      {5, 3, 2, 4, 6, 1, 0, 7},
                                                      {3, 6, 4, 2, 1, 5, 7, 0}}};
 
-  int getOamId(int deviceId);
+  // xGMI physical (OAM) id for a KFD node, read from the GPU's PCI sysfs.
+  int getOamId(int node);
 
-  int getSdmaEngineId(int srcDeviceId, int dstDeviceId);
-
-  // KFD topology node id for a HIP device id.
-  uint32_t getNodeId(int deviceId);
+  int getSdmaEngineId(int srcNode, int dstNode);
 
   // Bitmask of SDMA engine ids KFD recommends for the src->dst xGMI link to
   // reach maximum bandwidth (sysfs recommended_sdma_engine_id_mask). Returns 0
   // if the link or property is unavailable, in which case callers fall back to
   // the static OAM map.
-  uint32_t getRecommendedEngineMask(int srcDeviceId, int dstDeviceId);
+  uint32_t getRecommendedEngineMask(int srcNode, int dstNode);
 
   // Bitmask of the general (CPU-link, non-xGMI) SDMA engines. Zero if the node
   // reports no CPU link. Used to spread loopback channels on gfx1250.
-  uint32_t getHostLinkEngineMask(int srcDeviceId);
+  uint32_t getHostLinkEngineMask(int srcNode);
 
   // True for gfx1250 (gfx12.5), the only arch that spreads loopback channels.
-  bool isGfx1250(int deviceId);
+  bool isGfx1250(int node);
 
   struct PairHash {
     std::size_t operator()(const std::pair<int, int>& p) const {
@@ -144,22 +158,6 @@ inline void checkHipError(hipError_t err, const char* msg, const char* file, int
 }
 
 #define CHECK_HIP_ERROR(cmd) anvil::checkHipError((cmd), #cmd, __FILE__, __LINE__)
-// Allow access to peerDeviceId from deviceId
-inline void EnablePeerAccess(int const deviceId, int const peerDeviceId) {
-  int canAccess;
-  CHECK_HIP_ERROR(hipDeviceCanAccessPeer(&canAccess, deviceId, peerDeviceId));
-  if (!canAccess) {
-    std::cerr << "Unable to enable peer access from GPU devices " << deviceId << " to "
-              << peerDeviceId << "\n";
-  }
-
-  CHECK_HIP_ERROR(hipSetDevice(deviceId));
-  hipError_t error = hipDeviceEnablePeerAccess(peerDeviceId, 0);
-  if (error != hipSuccess && error != hipErrorPeerAccessAlreadyEnabled) {
-    std::cerr << "Unable to enable peer to peer access from " << deviceId << "  to " << peerDeviceId
-              << " (" << hipGetErrorString(error) << ")\n";
-  }
-}
 // Hardware cap on SDMA channels per GPU pair on CDNA (4 queues/engine ×
 // 2 recommended engines). Requests above this are clamped, not failed.
 inline constexpr int kMaxSdmaChannelsPerPair = 8;

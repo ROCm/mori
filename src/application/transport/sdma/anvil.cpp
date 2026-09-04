@@ -37,18 +37,19 @@
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
+
+#include "mori/utils/mori_log.hpp"
 namespace anvil {
 
-auto checkHsaError = [](hsa_status_t s, const char* msg, const char* file, int line) {
-  if (s != HSA_STATUS_SUCCESS) {
-    const char* hsa_err_msg;
-    hsa_status_string(s, &hsa_err_msg);
-    throw(std::runtime_error{std::string("HSA error at ") + file + std::string(":") +
-                             std::to_string(line) + std::string(" - ") + hsa_err_msg});
-  }
-};
+namespace {
 
-#define CHECK_HSA_ERROR(cmd) checkHsaError((cmd), #cmd, __FILE__, __LINE__)
+#define CHECK_HSA_ERROR(cmd)                                                               \
+  if (auto s = (cmd); s != HSA_STATUS_SUCCESS) {                                           \
+    const char* hsa_err_msg;                                                               \
+    hsa_status_string(s, &hsa_err_msg);                                                    \
+    throw std::runtime_error{std::string("HSA error at " __FILE__ ":") +                   \
+                             std::to_string(__LINE__) + std::string(" - ") + hsa_err_msg}; \
+  }
 
 #define CHECK_HSAKMT_SUCCESS(call, msg)                                                       \
   do {                                                                                        \
@@ -58,39 +59,6 @@ auto checkHsaError = [](hsa_status_t s, const char* msg, const char* file, int l
       exit(EXIT_FAILURE);                                                                     \
     }                                                                                         \
   } while (0)
-
-#if 0
-inline void checkHipError(hipError_t err, const char* msg, const char* file, int line)
-{
-   if (err != hipSuccess)
-   {
-      std::cerr << "HIP error at " << file << ":" << line << " — " << msg << "\n"
-                << "  Code: " << err << " (" << hipGetErrorString(err) << ")" << std::endl;
-      std::exit(EXIT_FAILURE);
-   }
-}
-
-#define CHECK_HIP_ERROR(cmd) checkHipError((cmd), #cmd, __FILE__, __LINE__)
-
-// Allow access to peerDeviceId from deviceId
-inline void EnablePeerAccess(int const deviceId, int const peerDeviceId)
-{
-   int canAccess;
-   CHECK_HIP_ERROR(hipDeviceCanAccessPeer(&canAccess, deviceId, peerDeviceId));
-   if (!canAccess)
-   {
-      std::cerr << "Unable to enable peer access from GPU devices " << deviceId << " to " << peerDeviceId << "\n";
-   }
-
-   CHECK_HIP_ERROR(hipSetDevice(deviceId));
-   hipError_t error = hipDeviceEnablePeerAccess(peerDeviceId, 0);
-   if (error != hipSuccess && error != hipErrorPeerAccessAlreadyEnabled)
-   {
-      std::cerr << "Unable to enable peer to peer access from " << deviceId << "  to " << peerDeviceId << " ("
-                << hipGetErrorString(error) << ")\n";
-   }
-}
-#endif
 
 // HSA agents
 std::vector<hsa_agent_t> cpuAgents_;
@@ -135,18 +103,38 @@ void SetUpKFD() {
 
 void CloseKFD() { (void)hsaKmtCloseKFD(); }
 
-// Convert a logical deviceId index to the NVML device minor number
-static const std::string getBusId(int deviceId) {
+// PCI bus id ("domain:bus:dev.func") of a HIP device ordinal.
+// Optionally returns the domain.
+uint32_t getBusId(int deviceId, uint32_t* pdomain = nullptr) {
   // On most systems, the PCI bus ID comes back as in the 0000:00:00.0
   // format. Still need to allocate proper space in case PCI domain goes
   // higher.
-  char busIdChar[] = "00000000:00:00.0";
-  CHECK_HIP_ERROR(hipDeviceGetPCIBusId(busIdChar, sizeof(busIdChar), deviceId));
-  // we need the hex in lower case format
-  for (size_t i = 0; i < sizeof(busIdChar); i++) {
-    busIdChar[i] = std::tolower(busIdChar[i]);
+  char busId[] = "00000000:00:00.0";
+  CHECK_HIP_ERROR(hipDeviceGetPCIBusId(busId, sizeof(busId), deviceId));
+  uint32_t domain = 0, bus = 0, dev = 0, func = 0;
+  if (std::sscanf(busId, "%x:%x:%x.%x", &domain, &bus, &dev, &func) != 4) {
+    MORI_APP_ERROR("Failed to parse PCI bus ID for device {}", deviceId);
+    return ~0u;
   }
-  return std::string(busIdChar);
+  if (pdomain) *pdomain = domain;
+  return ((bus & 0xFF) << 8) | ((dev & 0x1F) << 3) | (func & 0x7);
+}
+
+std::pair<uint32_t, uint32_t> locIdAndDomainForNode(int node) {
+  uint32_t locId = ~0u, domain = ~0u;
+  std::string path = "/sys/class/kfd/kfd/topology/nodes/" + std::to_string(node) + "/properties";
+  std::ifstream f(path);
+  if (!f.is_open()) return std::pair{locId, domain};
+  std::string key, valStr;
+  // Read tokens as strings: some KFD properties (e.g. hive_id) are 64-bit values
+  // that would fail a numeric extraction and abort the scan early.
+  while (f >> key >> valStr) {
+    if (key == "location_id")
+      locId = std::strtol(valStr.c_str(), nullptr, 0);
+    else if (key == "domain")
+      domain = std::strtol(valStr.c_str(), nullptr, 0);
+  }
+  return std::pair{locId, domain};
 }
 
 // hsa_iterate_agents (SetUp) enumerates ALL physical GPU agents in HSA order,
@@ -159,25 +147,20 @@ static const std::string getBusId(int deviceId) {
 // so the selection is correct in all cases. In the common HIP_VISIBLE_DEVICES=
 // 0..N-1 case this resolves to the identity map (BDF matches at the same index)
 // so the default path is behavior-identical.
-static int gpuAgentIndexForHipDevice(int hipDeviceId) {
+hsa_agent_t gpuAgentForHipDevice(int hipDeviceId) {
   static std::mutex mapMutex;
   static std::unordered_map<int, int> hipToAgent;
   std::lock_guard<std::mutex> lock(mapMutex);
   auto it = hipToAgent.find(hipDeviceId);
-  if (it != hipToAgent.end()) return it->second;
+  if (it != hipToAgent.end()) return gpuAgents_[it->second];
 
   // BDF of the HIP device, parsed from its "domain:bus:device.function" string.
-  std::string busId = getBusId(hipDeviceId);
-  unsigned domain = 0, bus = 0, dev = 0, func = 0;
-  std::sscanf(busId.c_str(), "%x:%x:%x.%x", &domain, &bus, &dev, &func);
-  uint32_t hipBdf = ((bus & 0xFF) << 8) | ((dev & 0x1F) << 3) | (func & 0x7);
-
+  uint32_t hipBdf = getBusId(hipDeviceId);
   // HSA_AMD_AGENT_INFO_BDFID exposes only the 16-bit bus/device/function, not the
   // PCI domain, so on a multi-segment machine two GPUs can share the same 16-bit
   // BDF. Only trust the match when it is UNIQUE; otherwise keep the identity
   // fallback rather than risk selecting the wrong agent. domain is parsed but
   // cannot be matched against the HSA side.
-  (void)domain;
   int match = hipDeviceId;  // identity fallback (also correct when HIP and HSA order align)
   int nMatch = 0, firstMatch = -1;
   for (size_t a = 0; a < gpuAgents_.size(); ++a) {
@@ -192,25 +175,12 @@ static int gpuAgentIndexForHipDevice(int hipDeviceId) {
   }
   if (nMatch == 1) match = firstMatch;
   hipToAgent[hipDeviceId] = match;
-  return match;
+  return gpuAgents_[match];
 }
 
-SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAgent,
-                     uint32_t engineId)
-    : remoteDeviceId_(remoteDeviceId) {
-  // cachedWptr_(detail::gpuCallocUncachedShared<uint64_t>()),
-  // committedWptr_(detail::gpuCallocUncachedShared<uint64_t>()) {
-  int originalDeviceId;
+}  // namespace
 
-  CHECK_HIP_ERROR(hipGetDevice(&originalDeviceId));  // Save the current device
-
-  uint32_t localNodeId;
-  hsa_status_t status = hsa_agent_get_info(localAgent, HSA_AGENT_INFO_NODE, &localNodeId);
-  if (status != HSA_STATUS_SUCCESS) {
-    printf("Failure to get device info: 0x%x", status);
-    // return status;
-  }
-
+SdmaQueue::SdmaQueue(uint32_t localNodeId, uint32_t engineId) {
   // Allocate SDMA queue buffer on device side, requires ExecuteAccess
   HsaMemFlags memFlags = {};
   memFlags.ui32.NonPaged = 1;
@@ -307,13 +277,36 @@ void AnvilLib::init() {
   });
 }
 
-bool AnvilLib::connect(int srcDeviceId, int dstDeviceId, int numChannels) {
+// Map a HIP device ordinal to its KFD node id.
+/*static*/ uint32_t AnvilLib::nodeForHipDevice(int hipDev) {
+  uint32_t nodeId = 0;
+  CHECK_HSA_ERROR(hsa_agent_get_info(gpuAgentForHipDevice(hipDev), HSA_AGENT_INFO_NODE, &nodeId));
+  return nodeId;
+}
+
+// Resolve the KFD topology node id of the given HIP device WITHOUT initializing HSA.
+/*static*/ int AnvilLib::kfdNodeIdForHipDevice(int hipDev) {
+  uint32_t wantDomain = 0, wantLocId = getBusId(hipDev, &wantDomain);
+  // KFD node ids are contiguous from 0; stop at the first gap.
+  for (int node = 0;; node++) {
+    auto [locId, domain] = locIdAndDomainForNode(node);
+    if (locId == ~0u && domain == ~0u) break;
+    if (locId == wantLocId && domain == wantDomain) {
+      return node;
+    }
+  }
+  MORI_APP_ERROR("Failed to find KFD node for device {}", hipDev);
+  return -1;
+}
+
+bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
   std::lock_guard<std::mutex> lock(channels_mutex_);
   // Spread the channels across the engines recommended for this peer link. On
   // MI350 the mask typically reports 2 engines per peer; on platforms with a
   // single recommended engine all channels share it.
   std::vector<uint32_t> engines;
-  if (srcDeviceId == dstDeviceId) {
+  engines.reserve(2);
+  if (srcNode == dstNode) {
     // Loopback has no self io_link, so KFD recommends no engine. On gfx1250 each
     // engine holds only 6 queues and ROCr's blit queues already sit on the low
     // ones, so pinning every loopback channel to engine 0 hits NO_MEMORY at the
@@ -321,51 +314,41 @@ bool AnvilLib::connect(int srcDeviceId, int dstDeviceId, int numChannels) {
     // Other archs are not engine-0-bound for loopback (gfx950: 8 queues/engine,
     // only engines 0-1 general) and regress if a channel lands on a busy engine,
     // so keep them pinned to engine 0.
-    if (isGfx1250(srcDeviceId)) {
-      uint32_t mask = getHostLinkEngineMask(srcDeviceId);
+    if (isGfx1250(srcNode)) {
+      uint32_t mask = getHostLinkEngineMask(srcNode);
       for (uint32_t b = 0; b < 32; ++b) {
         if (mask & (1u << b)) engines.push_back(b);
       }
     }
     if (engines.empty()) engines.push_back(0);
   } else {
-    uint32_t mask = getRecommendedEngineMask(srcDeviceId, dstDeviceId);
+    uint32_t mask = getRecommendedEngineMask(srcNode, dstNode);
     for (uint32_t b = 0; b < 32; ++b) {
       if (mask & (1u << b)) engines.push_back(b);
     }
     // Fall back to the static OAM table if KFD did not report a mask.
     if (engines.empty()) {
-      int e = getSdmaEngineId(srcDeviceId, dstDeviceId);
+      int e = getSdmaEngineId(srcNode, dstNode);
       engines.push_back(e);
     }
   }
   int numEngines = static_cast<int>(engines.size());
 
   // Queues live in this process-global singleton and are shared across every
-  // Context/comm for this device pair (getSdmaQueue keys on device ids, not on
+  // Context/comm for this node pair (getSdmaQueue keys on KFD node ids, not on
   // the comm), and are only reclaimed when the process exits. So create just the
   // shortfall: appending on every connect() would pile up unused duplicate
   // hardware queues (getSdmaQueue only ever indexes the first numChannels) and
   // eventually exhaust the per-engine queue slots.
-  auto& channels = sdma_channels_[std::make_pair(srcDeviceId, dstDeviceId)];
+  auto& channels = sdma_channels_[std::make_pair(srcNode, dstNode)];
   for (int c = static_cast<int>(channels.size()); c < numChannels; ++c) {
     uint32_t engineId = engines[c % numEngines];
-    channels.emplace_back(std::make_unique<SdmaQueue>(
-        srcDeviceId, dstDeviceId, gpuAgents_[gpuAgentIndexForHipDevice(srcDeviceId)], engineId));
+    channels.emplace_back(std::make_unique<SdmaQueue>(srcNode, engineId));
   }
   return true;
 }
 
-uint32_t AnvilLib::getNodeId(int deviceId) {
-  uint32_t nodeId = 0;
-  CHECK_HSA_ERROR(hsa_agent_get_info(gpuAgents_[gpuAgentIndexForHipDevice(deviceId)],
-                                     HSA_AGENT_INFO_NODE, &nodeId));
-  return nodeId;
-}
-
-uint32_t AnvilLib::getRecommendedEngineMask(int srcDeviceId, int dstDeviceId) {
-  uint32_t srcNode = getNodeId(srcDeviceId), dstNode = getNodeId(dstDeviceId);
-
+uint32_t AnvilLib::getRecommendedEngineMask(int srcNode, int dstNode) {
   HsaNodeProperties props{};
   if (hsaKmtGetNodeProperties(srcNode, &props) != HSAKMT_STATUS_SUCCESS || props.NumIOLinks == 0) {
     return 0;
@@ -386,8 +369,7 @@ uint32_t AnvilLib::getRecommendedEngineMask(int srcDeviceId, int dstDeviceId) {
 
 // Engines KFD recommends for this GPU's link to a CPU node, i.e. the general
 // (non-xGMI) ones. Zero if the node reports no such link.
-uint32_t AnvilLib::getHostLinkEngineMask(int srcDeviceId) {
-  const uint32_t srcNode = getNodeId(srcDeviceId);
+uint32_t AnvilLib::getHostLinkEngineMask(int srcNode) {
   HsaNodeProperties props{};
   if (hsaKmtGetNodeProperties(srcNode, &props) != HSAKMT_STATUS_SUCCESS || props.NumIOLinks == 0) {
     return 0;
@@ -408,15 +390,15 @@ uint32_t AnvilLib::getHostLinkEngineMask(int srcDeviceId) {
 
 // gfx12.5+ (gfx1250): the only arch whose loopback channels are spread over
 // engines. See connect() for why.
-bool AnvilLib::isGfx1250(int deviceId) {
+bool AnvilLib::isGfx1250(int node) {
   HsaNodeProperties props{};
-  if (hsaKmtGetNodeProperties(getNodeId(deviceId), &props) != HSAKMT_STATUS_SUCCESS) return false;
+  if (hsaKmtGetNodeProperties(node, &props) != HSAKMT_STATUS_SUCCESS) return false;
   return props.EngineId.ui32.Major == 12 && props.EngineId.ui32.Minor == 5;
 }
 
-SdmaQueue* AnvilLib::getSdmaQueue(int srcDeviceId, int dstDeviceId, int channel_idx) {
+SdmaQueue* AnvilLib::getSdmaQueue(int srcNode, int dstNode, int channel_idx) {
   std::lock_guard<std::mutex> lock(channels_mutex_);
-  auto key = std::make_pair(srcDeviceId, dstDeviceId);
+  auto key = std::make_pair(srcNode, dstNode);
   auto it = sdma_channels_.find(key);
   if (it == sdma_channels_.end()) {
     return nullptr;
@@ -437,24 +419,27 @@ AnvilLib& AnvilLib::getInstance() {
   return *instance;
 }
 
-int AnvilLib::getOamId(int deviceId) {
-  std::string busId = getBusId(deviceId);
-  std::string file_str = "/sys/bus/pci/devices/" + busId + "/xgmi_physical_id";
-  std::ifstream file(file_str);
+int AnvilLib::getOamId(int node) {
+  auto [locId, domain] = locIdAndDomainForNode(node);
+  uint32_t bus = (locId >> 8) & 0xFF, dev = (locId >> 3) & 0x1F, func = locId & 0x7;
+
+  char fpath[128];
+  std::snprintf(fpath, sizeof(fpath), "/sys/bus/pci/devices/%04x:%02x:%02x.%01x/xgmi_physical_id",
+                domain, bus, dev, func);
+  std::ifstream file(fpath);
   int xgmi_physical_id;
-  if (file.is_open()) {
-    if (!(file >> xgmi_physical_id)) {
-      throw std::runtime_error("Failed to read xGMI physical id from file: " + file_str);
-    }
-  } else {
-    throw std::runtime_error("Failed to open file: " + file_str);
+  if (!file.is_open()) {
+    throw std::runtime_error("Failed to open file: " + std::string(fpath));
+  }
+  if (!(file >> xgmi_physical_id)) {
+    throw std::runtime_error("Failed to read xGMI physical id from file: " + std::string(fpath));
   }
   return xgmi_physical_id;
 }
 
-int AnvilLib::getSdmaEngineId(int srcDeviceId, int dstDeviceId) {
-  int srcOamId = getOamId(srcDeviceId);
-  int dstOamId = getOamId(dstDeviceId);
+int AnvilLib::getSdmaEngineId(int srcNode, int dstNode) {
+  int srcOamId = getOamId(srcNode);
+  int dstOamId = getOamId(dstNode);
 
   // Use even engines only
   return mi300xOamMap[srcOamId][dstOamId] * 2;
