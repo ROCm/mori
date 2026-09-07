@@ -29,3 +29,16 @@ set_target_properties(
   PROPERTIES BUILD_RPATH "$ORIGIN;${ROCM_PATH}/lib"
              INSTALL_RPATH "$ORIGIN;${ROCM_PATH}/lib"
              BUILD_WITH_INSTALL_RPATH TRUE)
+
+# ── libfabric (OFI backend) ─────────────────────────────────────────────────
+if(MORI_USE_LIBFABRIC)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(LIBFABRIC REQUIRED libfabric)
+  message(STATUS "libfabric include: ${LIBFABRIC_INCLUDE_DIRS}")
+  message(STATUS "libfabric lib:     ${LIBFABRIC_LIBRARIES}")
+  target_sources(mori_io PRIVATE ofi/backend_impl.cpp)
+  target_include_directories(mori_io PRIVATE ${LIBFABRIC_INCLUDE_DIRS})
+  target_link_libraries(mori_io ${LIBFABRIC_LIBRARIES})
+  target_compile_definitions(mori_io PUBLIC MORI_USE_LIBFABRIC)
+  target_link_directories(mori_io PUBLIC ${LIBFABRIC_LIBRARY_DIRS})
+endif()

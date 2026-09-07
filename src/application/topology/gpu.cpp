@@ -27,6 +27,7 @@
 #include <cstdlib>
 
 #include "mori/application/utils/check.hpp"
+#include "mori/utils/mori_log.hpp"
 
 namespace mori {
 namespace application {
@@ -153,6 +154,7 @@ TopoNodeGpu* TopoSystemGpu::GetGpuByLogicalId(int id) const {
   std::string str;
   str.resize(13);
   HIP_RUNTIME_CHECK(hipDeviceGetPCIBusId(str.data(), str.size(), id));
+  MORI_APP_INFO("DeviceID={}, pciBusId={}", id, str);
   PciBusId target{str};
   for (auto& gpuPtr : gpus) {
     TopoNodeGpu* gpu = gpuPtr.get();

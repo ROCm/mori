@@ -88,6 +88,28 @@ inline std::ostream& operator<<(std::ostream& os, const RdmaBackendConfig& c) {
             << "] maxCqeNum[" << c.maxCqeNum << "] maxMsgSge[" << c.maxMsgSge << "]";
 }
 
+
+struct OfiBackendConfig : public BackendConfig {
+  OfiBackendConfig() : BackendConfig(BackendType::OFI) {}
+
+  // OFI provider hint, e.g. "cxi" for Slingshot, "verbs" for IB, "tcp" for dev/test.
+  // Empty string → let libfabric auto-select.
+  std::string providerHint{""};
+  // fi_cq polling: completions per fi_cq_read call.
+  int cqReadBatch{64};
+  // Pre-posted MR access flags (remote read + write).
+  uint64_t mrAccessFlags{0};  // 0 = auto-set in constructor
+  // Domain threading model (FI_THREAD_DOMAIN or FI_THREAD_SAFE).
+  int threadingModel{0};  // 0 = FI_THREAD_DOMAIN
+
+  OfiBackendConfig(const std::string& provider, int cqBatch = 64)
+      : BackendConfig(BackendType::OFI), providerHint(provider), cqReadBatch(cqBatch) {}
+};
+
+inline std::ostream& operator<<(std::ostream& os, const OfiBackendConfig& c) {
+  return os << "providerHint[" << c.providerHint << "] cqReadBatch[" << c.cqReadBatch << "]";
+}
+
 struct XgmiBackendConfig : public BackendConfig {
   XgmiBackendConfig() : BackendConfig(BackendType::XGMI) {}
   XgmiBackendConfig(int numStreams_, int numEvents_)
@@ -194,6 +216,10 @@ class Backend {
                                         TransferStatus* status) = 0;
 
   virtual bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const { return true; }
+
+  // Backend-specific descriptor bytes advertised to peers via EngineDesc.
+  // Default is empty; backends override to publish their own metadata.
+  virtual DescBlob GetEngineDescBlob() const { return {}; }
 };
 
 }  // namespace io

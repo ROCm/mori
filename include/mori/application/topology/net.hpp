@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -55,6 +56,9 @@ class TopoSystemNet {
 
  private:
   void Load();
+  // Enumerate HPE Slingshot (CXI) NICs from /sys/class/cxi. Fallback used only
+  // when ibverbs discovers no NICs (verbs-less hosts).
+  void LoadCxiNics();
 
  private:
   std::vector<std::unique_ptr<TopoNodeNic>> nics;
