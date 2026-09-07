@@ -93,6 +93,12 @@ class Dist:
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
         return int(t.item())
 
+    def allreduce_minmax(self, lo, hi):
+        """Extremes across ranks, for the same best/worst the v1 harness prints."""
+        t = torch.tensor([lo, -hi], dtype=torch.int64)
+        dist.all_reduce(t, op=dist.ReduceOp.MIN)
+        return int(t[0].item()), -int(t[1].item())
+
     def shutdown(self):
         if dist.is_initialized():
             dist.destroy_process_group()
@@ -241,17 +247,28 @@ def _bench(op, cfg, d, dev, a, comm):
     keep = slice(a.drop_rounds, None)
     disp = [ev[3 * i].elapsed_time(ev[3 * i + 1]) * 1e3 for i in range(n)][keep]
     comb = [ev[3 * i + 2].elapsed_time(ev[3 * i + 3]) * 1e3 for i in range(n)][keep]
-    dm = sum(disp) / len(disp)
-    cm = sum(comb) / len(comb)
-    dm = d.allreduce_sum(int(dm * 1000)) / d.world / 1000
-    cm = d.allreduce_sum(int(cm * 1000)) / d.world / 1000
+
+    # AVERAGE over rounds x ranks, plus BEST and WORST over the same sample set --
+    # the three numbers run_bench_once prints, so a reading here can be put beside
+    # one from the v1 harness without converting estimators. The average is the
+    # robust one; best/worst are extremes and noise-dominated, but they are what
+    # makes a single stalled round visible. Reporting only a minimum hides exactly
+    # that (an earlier version of this comparison did, and buried a 227us outlier).
+    def _stats(v):
+        m = d.allreduce_sum(int(sum(v) / len(v) * 1000)) / d.world / 1000
+        lo, hi = d.allreduce_minmax(int(min(v) * 1000), int(max(v) * 1000))
+        return m, lo / 1000, hi / 1000
+
+    dm, dlo, dhi = _stats(disp)
+    cm, clo, chi = _stats(comb)
     if d.rank == 0:
         print(
             f"# BENCH tok={ct} dtype={a.dtype}->{a.combine_dtype or a.dtype} "
             f"hidden={cfg.hidden_dim} topk={cfg.num_experts_per_token} "
             f"kernel={a.kernel_type or 'auto'} "
-            f"dispatch={dm:.1f}us combine={cm:.1f}us total={dm + cm:.1f}us "
-            f"[wall={wall:.1f}us]",
+            f"dispatch={dm:.1f}us [{dlo:.1f}/{dhi:.1f}] "
+            f"combine={cm:.1f}us [{clo:.1f}/{chi:.1f}] "
+            f"total={dm + cm:.1f}us [wall={wall:.1f}us]",
             flush=True,
         )
     return 0
