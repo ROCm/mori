@@ -110,6 +110,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self.dev = dev
         self._recv_cap = cfg.effective_max_recv
         self._closed = False
+        # Arena views, built once. Every one below is a pure function of cfg and
+        # of an arena pointer that never moves, yet dispatch() rebuilt five of
+        # them per call -- torch.as_tensor + view showed up in the host profile at
+        # ~27us a round, on a path where the host already paces the GPU.
+        self._views = {}
         # gfx125x routes to the TDM kernel, which needs a superset arena (plan A).
         _arch = getattr(torch.cuda.get_device_properties(dev), "gcnArchName", "") or ""
         self._is1250 = _arch.split(":")[0].startswith("gfx125")
@@ -863,34 +868,51 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return inter if self.cfg.is_internode else intra
 
     def recv_tokens(self):
+        v = self._views.get("recv_tokens")
+        if v is not None:
+            return v
         # fp4 packs 2 e2m1 per element of the torch dtype -> last dim is hidden/2.
         cols = self.cfg.hidden_dim // 2 if self.cfg.is_fp4 else self.cfg.hidden_dim
-        return from_gpu_ptr(
+        v = from_gpu_ptr(
             self.arena.local_ptr(self._region("disp_out")),
             (self._recv_cap, cols),
             self.cfg.dispatch_dtype,
         )
+        self._views["recv_tokens"] = v
+        return v
 
     def combine_in_view(self):
-        return from_gpu_ptr(
-            self.arena.local_ptr(self._region("out_tok")),
-            (self._recv_cap, self.cfg.hidden_dim),
-            self.cfg.combine_dtype,
-        )
+        v = self._views.get("combine_in")
+        if v is None:
+            v = from_gpu_ptr(
+                self.arena.local_ptr(self._region("out_tok")),
+                (self._recv_cap, self.cfg.hidden_dim),
+                self.cfg.combine_dtype,
+            )
+            self._views["combine_in"] = v
+        return v
 
     def recv_weights(self):
-        return from_gpu_ptr(
-            self.arena.local_ptr(self._region("out_wts")),
-            (self._recv_cap, self.cfg.num_experts_per_token),
-            torch.float32,
-        )
+        v = self._views.get("recv_weights")
+        if v is None:
+            v = from_gpu_ptr(
+                self.arena.local_ptr(self._region("out_wts")),
+                (self._recv_cap, self.cfg.num_experts_per_token),
+                torch.float32,
+            )
+            self._views["recv_weights"] = v
+        return v
 
     def recv_indices(self):
-        return from_gpu_ptr(
-            self.arena.local_ptr(self._region("out_idx")),
-            (self._recv_cap, self.cfg.num_experts_per_token),
-            torch.int32,
-        )
+        v = self._views.get("recv_indices")
+        if v is None:
+            v = from_gpu_ptr(
+                self.arena.local_ptr(self._region("out_idx")),
+                (self._recv_cap, self.cfg.num_experts_per_token),
+                torch.int32,
+            )
+            self._views["recv_indices"] = v
+        return v
 
     def recv_scales(self):
         """The forwarded scale rows, or None when the transport is off -- the same
@@ -900,6 +922,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         Strided, not packed: the rows sit scale_stride_bytes() apart. Anything
         reading the region by pointer needs that pitch, not this shape.
         """
+        v = self._views.get("recv_scales")
+        if v is not None:
+            return v
         n_i32 = self._scale_i32(self.cfg)
         if not n_i32:
             return None
@@ -909,7 +934,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             (self._recv_cap, stride_i32),
             torch.int32,
         )
-        return rows[:, :n_i32]
+        v = rows[:, :n_i32]
+        self._views["recv_scales"] = v
+        return v
 
     def local_expert_count(self):
         raise NotImplementedError(

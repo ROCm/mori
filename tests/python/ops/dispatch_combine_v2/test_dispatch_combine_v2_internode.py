@@ -113,6 +113,12 @@ def _parse_args(argv):
     p.add_argument("--scale-dim", type=int, default=0)
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--drop-rounds", type=int, default=1)
+    # Diagnostic, matching _EP_PERROUND_SYNC in the examples harness. Re-aligns
+    # the ranks every round. These kernels spin on their peers, so any host skew
+    # shows up as KERNEL time; if this moves the numbers, the gap is skew rather
+    # than kernel work. It folds the barrier wait into the next round's dispatch
+    # window, so dispatch is not clean under it -- combine is.
+    p.add_argument("--per-round-sync", action="store_true")
     # Both members of the LL / non-LL pair are compiled either way; this picks
     # which one runs. Default (None) leaves the backend's token-count rule alone,
     # which selects LL below 2048 tokens. Naming it explicitly is what makes a
@@ -193,6 +199,9 @@ def _bench(op, cfg, d, dev, a, comm):
         ev[3 * i + 2].record()
         op.combine(x, wts, routing=r[5])
         ev[3 * i + 3].record()
+        if a.per_round_sync:
+            torch.cuda.synchronize()
+            comm.barrier()
     torch.cuda.synchronize()
     wall = (time.perf_counter() - t0) * 1e6 / n
 

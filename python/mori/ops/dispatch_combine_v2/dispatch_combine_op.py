@@ -844,12 +844,17 @@ class EpDispatchCombineOp:
 
         # A live arena view: the reverse map is cloned lazily on first access,
         # which must happen after the caller's post-dispatch barrier (see
-        # EpDispatchRoutingHandle).
-        reverse = from_gpu_ptr(
-            self.arena.local_ptr(self._region("recv_to_src_token")),
-            (self._recv_cap,),
-            torch.int32,
-        )
+        # EpDispatchRoutingHandle). Built once -- the pointer and the shape are
+        # fixed for the op's lifetime, and rebuilding it per dispatch is pure
+        # host cost on a path where the host already paces the GPU.
+        reverse = getattr(self, "_reverse_view", None)
+        if reverse is None:
+            reverse = from_gpu_ptr(
+                self.arena.local_ptr(self._region("recv_to_src_token")),
+                (self._recv_cap,),
+                torch.int32,
+            )
+            self._reverse_view = reverse
         handle = EpDispatchRoutingHandle(
             disp_dest_tok_id_map=dest_map,
             inter_node_disp_dest_tok_id_map=self._empty_i32,

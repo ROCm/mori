@@ -109,7 +109,7 @@ using EpDispatchCombineArgs = EpInterNodeArgs<T>;
 // v1's common.hpp macro, with the config type swapped. Everything else is
 // verbatim, including the assert: numExpertPerToken must fit in a ballot.
 #define DEF_COMMON_VARS                                                           \
-  const EpInterNodeDeviceCfg config = EpInterNodeDeviceCfgOf(kConfig, args.rank); \
+  constexpr EpInterNodeDeviceCfg config = EpInterNodeDeviceCfgOf(kConfig);        \
   int thdId = threadIdx.x;                                                        \
   int thdNum = blockDim.x;                                                        \
   int laneId = threadIdx.x & (warpSize - 1);                                      \
@@ -122,7 +122,7 @@ using EpDispatchCombineArgs = EpInterNodeArgs<T>;
   int globalWarpId = blockIdx.x * warpNum + warpId;                               \
   int globalWarpNum = gridDim.x * warpNum;                                        \
   int nullTokenId = NullFlatTokenIndex(config);                                   \
-  int myPe = config.rank;                                                         \
+  int myPe = args.rank;                                                           \
   int npes = config.worldSize;                                                    \
   int myNode = myPe / config.gpuPerNode;                                          \
   int nNodes = npes / config.gpuPerNode;                                          \
@@ -300,7 +300,7 @@ inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs<T>& args, in
 
       core::AtomicStoreRelaxedSystem(
           args.reg(args.offDispTokIdToSrcTokId)->template GetAs<index_t*>(destPe) + destTokId,
-          static_cast<index_t>(FlatTokenIndex(config, config.rank, tokenId)));
+          static_cast<index_t>(FlatTokenIndex(config, myPe, tokenId)));
     }
     destTokId = __shfl(destTokId, 0);
   } else {
@@ -406,7 +406,7 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args,
   // Then send to other nodes
   for (int i = warpId; i < nNodes; i += warpNum) {
     if (i == myNode) continue;
-    int proxyPe = i * config.gpuPerNode + (config.rank % config.gpuPerNode);
+    int proxyPe = i * config.gpuPerNode + (myPe % config.gpuPerNode);
     if (DEDUP) {
       for (int tokenId = startTokenIdx + laneId; tokenId < endTokenIdx; tokenId += warpSize) {
         bool shouldSend = false;
@@ -523,7 +523,7 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args,
     // shmem's atomic resolved a local peer to a plain store, hence no guard here
     // originally.
     if ((laneId < nNodes) && (laneId != myNode)) {
-      int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
+      int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
       index_t numTokenSignal =
           core::AtomicLoadRelaxed(args.blockFlagCounter + laneId) * warpSize + 1;
       EpInterNodeAtomicAdd(comm, args.reg(args.offNodeRecvTokenNum), myNode * sizeof(uint64_t),
@@ -550,7 +550,7 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args,
       std::min(chunkStartTokenIdx + blockChunkNum * warpSize, args.curRankNumToken);
   for (int i = warpId; i < nNodes; i += warpNum) {
     if (i == myNode) continue;
-    int proxyPe = i * config.gpuPerNode + (config.rank % config.gpuPerNode);
+    int proxyPe = i * config.gpuPerNode + (myPe % config.gpuPerNode);
 
     for (int tokenId = chunkStartTokenIdx + laneId; tokenId < chunkEndTokenIdx;
          tokenId += warpSize) {
@@ -595,7 +595,7 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args,
   if ((finishedWarp + 1) == (args.rdmaBlockNum * warpNum)) {
     // Skips the local node for the same reason as DispatchInterNodeSend above.
     if ((laneId < nNodes) && (laneId != myNode)) {
-      int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
+      int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
       index_t numTokenSignal =
           core::AtomicLoadRelaxed(args.blockFlagCounter + laneId) * warpSize + 1;
       EpInterNodeAtomicAdd(comm, args.reg(args.offNodeRecvTokenNum), myNode * sizeof(uint64_t),
@@ -889,7 +889,7 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args,
     // node faults. shmem's ShmemQuietThread tolerated the self peer, which is
     // why the original loop covered every node.
     if (i == myNode) continue;
-    int proxyPe = i * config.gpuPerNode + (config.rank % config.gpuPerNode);
+    int proxyPe = i * config.gpuPerNode + (myPe % config.gpuPerNode);
     EpInterNodeQuiet(comm, proxyPe, config.numQpPerPe);
   }
 }
@@ -945,7 +945,7 @@ __device__ void EpDispatchCopyToStaging_body(EpDispatchCombineArgs<T> args) {
     if (laneId == 0)
       reinterpret_cast<index_t*>(stagingPtr + stagingTokOffset + hiddenBytes + indexBytes +
                                  weightBytes + scaleBytes)[0] =
-          static_cast<index_t>(FlatTokenIndex(config, config.rank, tokenId));
+          static_cast<index_t>(FlatTokenIndex(config, myPe, tokenId));
   }
 }
 
@@ -1268,7 +1268,7 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs<T>& 
                 core::AtomicStoreRelaxedSystem(
                     args.interNodeChunkFlagCombine + node * maxChunkNum + k, index_t{0});
               }
-              int proxyPe = node * config.gpuPerNode + (config.rank % config.gpuPerNode);
+              int proxyPe = node * config.gpuPerNode + (myPe % config.gpuPerNode);
               int qpId = k % config.numQpPerPe;
               EpInterNodePut(
                   comm, args.reg(args.offStaging),
@@ -1308,7 +1308,7 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs<T>& 
     }
     if ((laneId < nNodes) &&
         (laneId != myNode)) {  // avoid setting myNode, it will be set in intra node branch
-      int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
+      int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
       for (int i = 0; i < config.numQpPerPe; i++) {
         EpInterNodeAtomicAdd(comm, args.reg(args.offCrossDeviceBarrier),
                              args.rank * sizeof(uint64_t), 1, proxyPe, i);
@@ -1318,7 +1318,7 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs<T>& 
 
     uint64_t* localBarrierPtr = args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>();
     if ((laneId < nNodes) && (laneId != myNode)) {
-      int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
+      int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
       while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
              (barrierFlag * config.numQpPerPe)) {
       }
@@ -1420,7 +1420,7 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs<T>
           core::AtomicStoreRelaxedSystem(args.interNodeChunkFlagCombine + node * maxChunkNum + k,
                                          index_t{0});
         }
-        int proxyPe = node * config.gpuPerNode + (config.rank % config.gpuPerNode);
+        int proxyPe = node * config.gpuPerNode + (myPe % config.gpuPerNode);
         int qpId = k % config.numQpPerPe;
         EpInterNodePut(comm, args.reg(args.offStaging),
                        SendBufSlotOffset(config, myNode + nNodes, startTokenIdx) * tokCombXferBytes,
@@ -1451,7 +1451,7 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs<T>
     }
     if ((laneId < nNodes) &&
         (laneId != myNode)) {  // avoid setting myNode, it will be set in intra node branch
-      int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
+      int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
       for (int i = 0; i < config.numQpPerPe; i++) {
         EpInterNodeAtomicAdd(comm, args.reg(args.offCrossDeviceBarrier),
                              args.rank * sizeof(uint64_t), 1, proxyPe, i);
@@ -1463,7 +1463,7 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs<T>
     // Wait other nodes
     uint64_t* localBarrierPtr = args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>();
     if ((laneId < nNodes) && (laneId != myNode)) {
-      int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
+      int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
       while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
              (barrierFlag * config.numQpPerPe)) {
       }

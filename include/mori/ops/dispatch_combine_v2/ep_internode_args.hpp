@@ -138,7 +138,12 @@ struct EpInterNodeRegion {
 // over one shared arena.
 // ---------------------------------------------------------------------------
 struct EpInterNodeDeviceCfg {
-  int rank{0};
+  // No `rank`. Every field here is a compiled-in shape constant, so the whole
+  // struct is constexpr and each read folds to a literal. Carrying the rank
+  // would make it a runtime object the compiler has to keep live in scalar
+  // registers across every inlined helper -- measured as dispatch_ll's SGPR
+  // spill count going 1 -> 15 against the pre-refactor kernel. The rank is
+  // `myPe` in DEF_COMMON_VARS, straight off args.
   int worldSize{8};
   int hiddenDim{4096};
   int scaleDim{0};

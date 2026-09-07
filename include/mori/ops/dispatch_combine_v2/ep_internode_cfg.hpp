@@ -169,17 +169,16 @@ struct EpInterNodeKernelCfg {
   EpQuantType quantType{EpQuantType::None};
 };
 
-// The device-side config the bodies read, built from the compiled-in shape plus
-// the one value that is genuinely per-rank.
+// The device-side config the bodies read: purely the compiled-in shape, so the
+// result is constexpr and every field folds to a literal at its use.
 //
 // This replaces EpInterNodeBindConfig, which used to copy the same twelve fields
 // over a by-value args member at kernel entry so the optimiser could constant-
 // fold them. Constructing it from kConfig directly says the same thing without
 // carrying 56 bytes of kernarg that the host fills and the kernel immediately
 // overwrites -- a duplication that had to agree and had nothing checking it.
-constexpr EpInterNodeDeviceCfg EpInterNodeDeviceCfgOf(const EpInterNodeKernelCfg& k, int rank) {
+constexpr EpInterNodeDeviceCfg EpInterNodeDeviceCfgOf(const EpInterNodeKernelCfg& k) {
   EpInterNodeDeviceCfg d{};
-  d.rank = rank;
   d.worldSize = k.worldSize;
   d.hiddenDim = k.hiddenDim;
   d.scaleDim = k.scaleDim;
