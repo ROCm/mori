@@ -80,6 +80,20 @@ _SCALE_ALIGN = 128
 _FP8_TUNING_DTYPES = (torch.float8_e4m3fnuz, torch.float8_e4m3fn)
 
 
+def _raw_stream() -> int:
+    """The current stream as a raw pointer.
+
+    `torch.cuda.current_stream().cuda_stream` builds a Python Stream wrapper on
+    every call -- ~14us a launch in the host profile, on a path where the host
+    already paces the GPU. The private entry returns the pointer directly; it is
+    what torch.compile's generated code uses. Fall back if it is ever renamed.
+    """
+    try:
+        return torch._C._cuda_getCurrentRawStream(torch.cuda.current_device())
+    except AttributeError:
+        return torch.cuda.current_stream().cuda_stream
+
+
 def scale_stride_bytes(scale_bytes: int) -> int:
     """What a DESTINATION scale row is laid down at: EpScaleStride in ep_cfg.hpp.
 
@@ -686,7 +700,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             combine={comb_spec: self._wrap_internode("combine")},
             dispatch_replay=None,
             stages_in_kernel=True,
-            self_resets_counters=False,
+            # copystaging zeroes total_recv as its first act, so the host does not
+            # have to -- that zero_() was a fill kernel enqueued ahead of the
+            # dispatch sequence, delaying the kernels it protected.
+            self_resets_counters=True,
             capabilities=frozenset({"gather", "scales", "internode"}),
         )
 
@@ -780,7 +797,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     f"rdma={args['rdmaBlockNum']} passes={names}",
                     flush=True,
                 )
-            group.launch(torch.cuda.current_stream().cuda_stream, **args)
+            group.launch(_raw_stream(), **args)
 
         return run
 

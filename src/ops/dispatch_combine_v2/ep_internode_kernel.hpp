@@ -108,33 +108,33 @@ using EpDispatchCombineArgs = EpInterNodeArgs<T>;
 
 // v1's common.hpp macro, with the config type swapped. Everything else is
 // verbatim, including the assert: numExpertPerToken must fit in a ballot.
-#define DEF_COMMON_VARS                                                           \
-  constexpr EpInterNodeDeviceCfg config = EpInterNodeDeviceCfgOf(kConfig);        \
-  int thdId = threadIdx.x;                                                        \
-  int thdNum = blockDim.x;                                                        \
-  int laneId = threadIdx.x & (warpSize - 1);                                      \
-  int warpId = thdId / warpSize;                                                  \
-  int warpNum = blockDim.x / warpSize;                                            \
-  int blockNum = gridDim.x;                                                       \
-  int blockId = blockIdx.x;                                                       \
-  int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;                        \
-  int globalThdNum = gridDim.x * blockDim.x;                                      \
-  int globalWarpId = blockIdx.x * warpNum + warpId;                               \
-  int globalWarpNum = gridDim.x * warpNum;                                        \
-  int nullTokenId = NullFlatTokenIndex(config);                                   \
-  int myPe = args.rank;                                                           \
-  int npes = config.worldSize;                                                    \
-  int myNode = myPe / config.gpuPerNode;                                          \
-  int nNodes = npes / config.gpuPerNode;                                          \
-  int numExpertPerToken = config.numExpertPerToken;                               \
-  assert(numExpertPerToken < warpSize);                                           \
-  size_t hiddenDim = config.HiddenDimSz();                                        \
-  size_t hiddenBytes = config.HiddenBytes(sizeof(T));                             \
-  size_t indexBytes = config.IndexBytes();                                        \
-  size_t weightBytes = config.WeightBytes();                                      \
-  size_t srcTokenIdBytes = config.SrcTokenIdBytes();                              \
-  size_t scaleBytes = config.ScaleBytes();                                        \
-  size_t xferBytes = config.XferBytesPerToken(sizeof(T));                         \
+#define DEF_COMMON_VARS                                                    \
+  constexpr EpInterNodeDeviceCfg config = EpInterNodeDeviceCfgOf(kConfig); \
+  int thdId = threadIdx.x;                                                 \
+  int thdNum = blockDim.x;                                                 \
+  int laneId = threadIdx.x & (warpSize - 1);                               \
+  int warpId = thdId / warpSize;                                           \
+  int warpNum = blockDim.x / warpSize;                                     \
+  int blockNum = gridDim.x;                                                \
+  int blockId = blockIdx.x;                                                \
+  int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;                 \
+  int globalThdNum = gridDim.x * blockDim.x;                               \
+  int globalWarpId = blockIdx.x * warpNum + warpId;                        \
+  int globalWarpNum = gridDim.x * warpNum;                                 \
+  int nullTokenId = NullFlatTokenIndex(config);                            \
+  int myPe = args.rank;                                                    \
+  int npes = config.worldSize;                                             \
+  int myNode = myPe / config.gpuPerNode;                                   \
+  int nNodes = npes / config.gpuPerNode;                                   \
+  int numExpertPerToken = config.numExpertPerToken;                        \
+  assert(numExpertPerToken < warpSize);                                    \
+  size_t hiddenDim = config.HiddenDimSz();                                 \
+  size_t hiddenBytes = config.HiddenBytes(sizeof(T));                      \
+  size_t indexBytes = config.IndexBytes();                                 \
+  size_t weightBytes = config.WeightBytes();                               \
+  size_t srcTokenIdBytes = config.SrcTokenIdBytes();                       \
+  size_t scaleBytes = config.ScaleBytes();                                 \
+  size_t xferBytes = config.XferBytesPerToken(sizeof(T));                  \
   size_t combXferBytes = (args.weightsBuf == nullptr) ? hiddenBytes : hiddenBytes + weightBytes;
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -915,6 +915,17 @@ __device__ void EpDispatchCopyToStaging_body(EpDispatchCombineArgs<T> args) {
   IF_ENABLE_PROFILER(
       INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SPAN(profiler, Slot::EpDispatchCopyToStaging);
+
+  // Zero the receive counter here rather than from the host. DispatchSync
+  // accumulates into it with atomicAdd, so it has to start at 0 every dispatch;
+  // EpCombineAll clears it at the end of the pair, but that only covers a caller
+  // that always combines. The host's `total_recv.zero_()` covered the rest at the
+  // cost of a whole fill kernel enqueued AHEAD of the dispatch sequence on the
+  // same stream -- it delayed the kernels it was protecting. This is the first
+  // pass of that sequence and runs entirely before dispatch_ll, so stream order
+  // is the ordering guarantee. Before the empty-input return: zero tokens still
+  // needs the counter cleared.
+  if (globalThdId == 0) args.totalRecvTokenNum[0] = 0;
   if (args.curRankNumToken == 0) return;
 
   MultiWarpIter mwIter(globalWarpNum, args.curRankNumToken, hiddenDim);

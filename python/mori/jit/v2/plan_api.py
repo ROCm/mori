@@ -701,7 +701,7 @@ class LaunchGroup:
     it; there is no per-launch check for that, which is the point.
     """
 
-    __slots__ = ("_plans", "_lead", "_handles", "_n", "_argsize")
+    __slots__ = ("_plans", "_lead", "_handles", "_n", "_argsize", "_fn")
 
     def __init__(self, plans):
         plans = list(plans)
@@ -725,16 +725,23 @@ class LaunchGroup:
         self._n = len(plans)
         self._handles = (ctypes.c_void_p * self._n)(*[p._handle.value for p in plans])
         self._argsize = ctypes.sizeof(lead._args_t)
+        # Bind the entry point too. `_load()` is memoised but still a call and a
+        # lookup per launch, on a path measured at ~14us a call.
+        self._fn = _load().mori_jit_plan_launch_multi
 
     def launch(self, stream=0, **args) -> None:
         """Fill the shared argument struct once, then launch every plan in order."""
         buf = self._lead._launch_buf(args)
-        rc = _load().mori_jit_plan_launch_multi(
+        rc = self._fn(
             self._handles,
             self._n,
             ctypes.byref(buf),
             self._argsize,
-            ctypes.c_void_p(_as_ptr(stream)),
+            (
+                ctypes.c_void_p(stream)
+                if isinstance(stream, int)
+                else ctypes.c_void_p(_as_ptr(stream))
+            ),
         )
         if rc != 0:
             raise RuntimeError(f"mori jit launch_multi: {_error()}")
