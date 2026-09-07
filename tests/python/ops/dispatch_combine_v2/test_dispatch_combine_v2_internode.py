@@ -48,6 +48,7 @@ the shmem harness's flags that means anything here.
 import argparse
 import os
 import sys
+import time
 
 import numpy as np
 import torch
@@ -112,10 +113,11 @@ def _parse_args(argv):
     p.add_argument("--scale-dim", type=int, default=0)
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--drop-rounds", type=int, default=1)
-    # Accepted and ignored: both members of the LL / non-LL pair are compiled
-    # either way and the launch picks one from the token count. Kept so the
-    # shared runner script can pass identical flags to both harnesses.
-    p.add_argument("--kernel-type", default=None)
+    # Both members of the LL / non-LL pair are compiled either way; this picks
+    # which one runs. Default (None) leaves the backend's token-count rule alone,
+    # which selects LL below 2048 tokens. Naming it explicitly is what makes a
+    # benchmark number comparable to another harness's.
+    p.add_argument("--kernel-type", default=None, choices=[None, "v1", "v1_ll"])
     return p.parse_args(argv)
 
 
@@ -137,47 +139,77 @@ def _gen_round(rng, cfg, ct, dev, dtype):
 
 
 def _bench(op, cfg, d, dev, a, comm):
-    """Per-phase latency, measured the way the shmem harness measures it.
+    """Per-phase latency, structured to match ``run_bench_once`` in
+    ``examples/ops/dispatch_combine/test_dispatch_combine_internode.py``.
 
-    Warmup then timed rounds, each phase timed on its own events, and the
-    reported number is the mean over ranks of the per-round mean -- the leading
-    rounds are dropped because the first ones after a barrier are dominated by
-    the thundering herd rather than by the kernels.
+    Apple-to-apple means only the op call differs, so everything around it is
+    copied from there rather than invented here:
+
+    * ONE event before the loop, then three per round. Round i's dispatch window
+      is [end of round i-1's combine, end of this dispatch]; its combine window
+      is [end of the combine-input conversion, end of this combine]. The
+      conversion sits between two events of its own and is charged to neither.
+    * Nothing synchronises or barriers inside the timed loop. Events are stream
+      markers, so a host that has to stop and build the next launch shows up as
+      GPU idle inside the window; free-running lets the host stay ahead. (An
+      earlier version here synced per round and read 460us at 4 tokens against a
+      41us reference -- 11x of host overhead, none of it kernel.)
+    * Warmup is untimed and ends on sync + barrier; the leading `drop_rounds`
+      timed rounds are discarded because the first after a barrier is thundering
+      herd, not kernel.
+    * The reported number is the AVERAGE over rounds and ranks, as there.
+
+    `wall` is reported alongside as an honesty check, not as part of the
+    measurement: it is the whole loop's wall time per round. The host is running
+    ahead only while wall stays at or below dispatch+combine. Above it, the host
+    is the pacer and the phase numbers carry host stall.
     """
     rng = torch.Generator(device=dev)
     rng.manual_seed(4242 + d.rank)
     ct = a.max_tokens
     inp, idx, wts = _gen_round(rng, cfg, ct, dev, cfg.dispatch_dtype)
+    if a.kernel_type is not None:
+        op._internode_force_ll = a.kernel_type == "v1_ll"
 
-    def one():
-        e = [torch.cuda.Event(enable_timing=True) for _ in range(3)]
-        e[0].record()
-        r = op.dispatch(inp, wts, None, idx, return_routing=True)
-        e[1].record()
-        op.combine(r[0], wts, routing=r[5])
-        e[2].record()
-        torch.cuda.synchronize()
-        return e[0].elapsed_time(e[1]) * 1e3, e[1].elapsed_time(e[2]) * 1e3
+    # The examples harness's _convert_for_combine: the combine leg reads its
+    # input as its own element type, so an asymmetric config has to cast first.
+    def convert(x):
+        return x.to(cfg.combine_dtype) if cfg.is_asymmetric_dtype else x
 
     for _ in range(a.warmup):
-        one()
-        comm.barrier()
-    disp, comb = [], []
-    for _ in range(a.rounds):
-        dt, ct_us = one()
-        comm.barrier()
-        disp.append(dt)
-        comb.append(ct_us)
+        r = op.dispatch(inp, wts, None, idx, return_routing=True)
+        op.combine(convert(r[0]), wts, routing=r[5])
+    torch.cuda.synchronize()
+    comm.barrier()
+
+    n = a.rounds
+    ev = [torch.cuda.Event(enable_timing=True) for _ in range(3 * n + 1)]
+    t0 = time.perf_counter()
+    ev[0].record()
+    for i in range(n):
+        r = op.dispatch(inp, wts, None, idx, return_routing=True)
+        ev[3 * i + 1].record()
+        x = convert(r[0])
+        ev[3 * i + 2].record()
+        op.combine(x, wts, routing=r[5])
+        ev[3 * i + 3].record()
+    torch.cuda.synchronize()
+    wall = (time.perf_counter() - t0) * 1e6 / n
+
     keep = slice(a.drop_rounds, None)
-    dm = sum(disp[keep]) / max(1, len(disp[keep]))
-    cm = sum(comb[keep]) / max(1, len(comb[keep]))
+    disp = [ev[3 * i].elapsed_time(ev[3 * i + 1]) * 1e3 for i in range(n)][keep]
+    comb = [ev[3 * i + 2].elapsed_time(ev[3 * i + 3]) * 1e3 for i in range(n)][keep]
+    dm = sum(disp) / len(disp)
+    cm = sum(comb) / len(comb)
     dm = d.allreduce_sum(int(dm * 1000)) / d.world / 1000
     cm = d.allreduce_sum(int(cm * 1000)) / d.world / 1000
     if d.rank == 0:
         print(
             f"# BENCH tok={ct} dtype={a.dtype}->{a.combine_dtype or a.dtype} "
             f"hidden={cfg.hidden_dim} topk={cfg.num_experts_per_token} "
-            f"dispatch={dm:.1f}us combine={cm:.1f}us total={dm + cm:.1f}us",
+            f"kernel={a.kernel_type or 'auto'} "
+            f"dispatch={dm:.1f}us combine={cm:.1f}us total={dm + cm:.1f}us "
+            f"[wall={wall:.1f}us]",
             flush=True,
         )
     return 0
