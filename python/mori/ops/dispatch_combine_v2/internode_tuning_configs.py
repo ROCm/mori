@@ -57,11 +57,20 @@ from mori.ops import utils as gpu_utils
 # dispatch latency alone -- it holds rdma at 32 to keep the paired combine fast,
 # which is the lower total. combine wants a small block at small tok (32/64) and
 # block 80 / rdma 40 at mid tok.
+#
+# Re-tune (2026-09-04, full-scope sweep x3 + A/B validation, same 2-node rig):
+# the 4/8/32 rows were confirmed at or better than anything the sweep found (the
+# independent per-phase argmins the sweep prints do NOT reproduce once dispatch
+# and combine run at different geometries -- the coupling above -- so tok8 stays
+# on the current 32/21/6 combine, which A/B-beat the sweep's 64/16/8). Only tok16
+# moved: a single shared 80/rdma40/warp4 geometry for both phases beat the old
+# 80/48/8 + 80/40/8 by ~4us total (disp 41.3 vs 43.6, comb 51.1 vs 53.1),
+# reproducible across two A/B batches.
 _MI308X_EP16_H6144 = (
     # max_tok, disp_block, disp_rdma, disp_warp, comb_block, comb_rdma, comb_warp
     (4, 64, 32, 8, 32, 21, 6),
     (8, 64, 32, 8, 32, 21, 6),
-    (16, 80, 48, 8, 80, 40, 8),
+    (16, 80, 40, 4, 80, 40, 4),
     (None, 80, 48, 8, 80, 40, 8),
 )
 

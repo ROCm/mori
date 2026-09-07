@@ -67,6 +67,7 @@ import torch
 import torch.distributed as dist
 
 import mori
+from mori.jit.v2 import plan_api as _jit_plan_api
 from mori.ops.dispatch_combine_v2.ep_plans import EP_INTERNODE_PLANS, INTERNODE_DTYPES
 from tests.python.ops.dispatch_combine_test_utils import (
     EpDispatchCombineTestCase,
@@ -137,6 +138,17 @@ _bench_only = pytest.mark.skipif(
 _TRACE_PATH = os.environ.get("MORI_INTERNODE_TRACE")
 _TRACE_CFG = bool(os.environ.get("MORI_INTERNODE_TRACE_CFG"))
 _TRACE_SYNC = bool(os.environ.get("MORI_INTERNODE_TRACE_SYNC"))
+# Batch the N-pass launch through one ABI crossing (launch_multi). On by default;
+# set MORI_INTERNODE_BATCH_LAUNCH=0 to fall back to per-pass plan.launch, which
+# is the A/B control for measuring what the batch saves on the eager host path.
+_BATCH_LAUNCH = os.environ.get(
+    "MORI_INTERNODE_BATCH_LAUNCH", "1"
+).strip().lower() not in (
+    "",
+    "0",
+    "false",
+    "no",
+)
 
 
 def _trace(msg):
@@ -330,6 +342,7 @@ def _install_jit_redirect():
         _trace(f"launch_multi enter {[p for p, _ in passes]}")
         dev_comm = _dev_comm_host_ptr(self)
         _trace(f"  dev_comm={dev_comm:#x}")
+        plans = []
         for (pass_name, dtype), grid, block, smem in zip(
             passes, grids, blocks, shared_mems
         ):
@@ -338,19 +351,35 @@ def _install_jit_redirect():
                 self, pass_name, dtype, grid, wpb, mp_count, (grid, block, smem)
             )
             _trace(f"  plan ready {pass_name}")
-            _trace(f"  launching {pass_name} grid={grid} block={block} smem={smem}")
-            plan.launch(raw=args_ptr, devComm=dev_comm, stream=stream)
-            _trace(f"  launched {pass_name}")
-            if _TRACE_SYNC:
-                # Kernel errors are asynchronous, so without a sync per pass a
-                # fault is reported against whichever call happens to sync next
-                # -- or takes the process down with no attribution at all.
-                try:
-                    torch.cuda.synchronize()
-                    _trace(f"  synced {pass_name} ok")
-                except Exception as exc:
-                    _trace(f"  synced {pass_name} FAILED {type(exc).__name__}: {exc}")
-                    raise
+            plans.append(plan)
+
+        if _TRACE_PATH or _TRACE_SYNC or not _BATCH_LAUNCH:
+            # Per-pass on the debug path, so a fault is attributable: kernel errors
+            # are asynchronous, and a batch launch would report one pass's fault
+            # against whichever call syncs next -- or take the process down with no
+            # attribution at all.
+            for plan, (pass_name, _), grid, block, smem in zip(
+                plans, passes, grids, blocks, shared_mems
+            ):
+                _trace(f"  launching {pass_name} grid={grid} block={block} smem={smem}")
+                plan.launch(raw=args_ptr, devComm=dev_comm, stream=stream)
+                _trace(f"  launched {pass_name}")
+                if _TRACE_SYNC:
+                    try:
+                        torch.cuda.synchronize()
+                        _trace(f"  synced {pass_name} ok")
+                    except Exception as exc:
+                        _trace(
+                            f"  synced {pass_name} FAILED {type(exc).__name__}: {exc}"
+                        )
+                        raise
+        else:
+            # Fast path: one ABI crossing for the whole N-pass sequence. All passes
+            # share the EpInterNodeCcoArgs schema and the same raw/devComm, so the
+            # arg struct is filled once and every plan launches against it in order.
+            _jit_plan_api.launch_multi(
+                plans, raw=args_ptr, devComm=dev_comm, stream=stream
+            )
 
     Op._launch_multi = _launch_multi
 

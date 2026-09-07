@@ -61,17 +61,68 @@ _TUNING_MARGIN = float(os.environ.get("MORI_EP_TUNING_MARGIN") or "0.0")
 # Rounds benchmarked per config, shared by both --cmd bench and --cmd tuning
 # (each candidate during a sweep) so the two measure on equal footing --
 # bench's own number for a config should be comparable to what tuning saw
-# for that same config during its sweep. Override with MORI_EP_ROUNDS;
-# default 10 matches bench's longstanding hardcoded value.
-_EP_ROUNDS = int(os.environ.get("MORI_EP_ROUNDS") or "10")
-if _EP_ROUNDS < 2:
-    # Both call sites drop round 0 as in-loop warmup (`kept = all_data[1:]`);
-    # at 1 round that leaves an empty tensor and _compute_stats'
-    # .min()/.max()/.mean() blow up with a shape error that says nothing
-    # about rounds being the cause.
+# for that same config during its sweep. Override with MORI_EP_ROUNDS.
+#
+# Default 30 (was 10): the CCO/GDA low-latency kernels reach steady state far
+# more slowly than the shmem/IBGDA ones -- at 10 measured rounds their per-round
+# fabric jitter does not average out and the mean swings ~20% run to run, while
+# shmem is already stable by round 3. 30 rounds averages that jitter down to a
+# few percent so a single bench is reproducible without a same-session A/B. The
+# extra rounds cost is small at these token counts; lower it for a faster,
+# noisier sweep.
+_EP_ROUNDS = int(os.environ.get("MORI_EP_ROUNDS") or "30")
+
+# Leading timed rounds to discard from the stats. Override with MORI_EP_DROP_ROUNDS.
+#
+# Default 1: drop round 0 only, the same for both backends -- kept symmetric on
+# purpose so cco and shmem are measured identically rather than each tuned to its
+# own warm-up length. There is a real start transient: the dist.barrier() before
+# the timed loop releases all ranks at once, so the first timed rounds' collectives
+# fire simultaneously and hit peak fabric contention (thundering herd) before the
+# rounds self-stagger. It is worse and longer on the CCO/GDA path (first round
+# ~1.6-2.5x steady, still elevated through round ~2) than on shmem (recovered by
+# round 1). If you want that transient out of the reported Best/Worst, raise this
+# (e.g. MORI_EP_DROP_ROUNDS=3 covers the CCO ramp); it is left at 1 by default so
+# the default number matches the historical one and both backends drop the same.
+_EP_DROP_ROUNDS = int(os.environ.get("MORI_EP_DROP_ROUNDS") or "1")
+
+# In-loop warmup rounds run before the timed loop, discarded. Override with
+# MORI_EP_WARMUP.
+#
+# Default 20 (was a hardcoded 3): 3 is enough for shmem but leaves the CCO/GDA
+# kernels in their transient, which biases the first *timed* rounds high. 20
+# warmup rounds put every timed round in steady state; combined with the higher
+# _EP_ROUNDS above, CCO combine at small token counts stops reading ~15% high.
+# Warmup rounds are cheaper than timed ones (no per-round events), so this is
+# nearly free; it matters most on the CCO backend and is harmless for shmem.
+_EP_WARMUP = int(os.environ.get("MORI_EP_WARMUP") or "20")
+
+# Diagnostic only (default off): sync + cross-rank barrier after each timed round.
+# The timed loop otherwise free-runs with no per-round barrier, so ranks drift and
+# a round that catches a large skew reads slow -- which is the main source of the
+# combine Best/Worst spread on this 2-node harness. Turning this on re-aligns the
+# ranks every round, so the per-round COMBINE latency reflects the kernel rather
+# than accumulated drift: if the combine spread collapses toward shmem's with this
+# on, the spread was drift, not the kernel. NOTE: it also serialises rounds and
+# folds the barrier wait into the NEXT round's dispatch window (the dispatch/
+# combine share one boundary event), so DISPATCH numbers are meaningless in this
+# mode -- read only the combine distribution. Not for real perf numbers.
+_EP_PERROUND_SYNC = os.environ.get(
+    "MORI_EP_PERROUND_SYNC", "0"
+).strip().lower() not in (
+    "",
+    "0",
+    "false",
+    "no",
+)
+if _EP_ROUNDS <= _EP_DROP_ROUNDS + 1:
+    # Both call sites drop the first _EP_DROP_ROUNDS rounds (`all_data[_EP_DROP_ROUNDS:]`);
+    # with too few left this leaves an empty/one-row tensor and _compute_stats'
+    # .min()/.max()/.mean() blow up with a shape error that says nothing about
+    # rounds being the cause. Need at least 2 kept rounds.
     raise ValueError(
-        f"MORI_EP_ROUNDS must be >= 2 (round 0 is dropped as warmup), "
-        f"got {_EP_ROUNDS}"
+        f"MORI_EP_ROUNDS ({_EP_ROUNDS}) must exceed MORI_EP_DROP_ROUNDS "
+        f"({_EP_DROP_ROUNDS}) by at least 2 so >=2 timed rounds remain"
     )
 
 # Debug aid only, no effect on selection: print every candidate's full
@@ -80,6 +131,21 @@ if _EP_ROUNDS < 2:
 # Best/Worst/Average can be compared directly against a --cmd bench run of
 # that same block/warp/rdma without re-deriving it from the summary line.
 _TUNING_VERBOSE = os.environ.get("MORI_EP_TUNING_VERBOSE", "0") == "1"
+
+# Variance-aware winner selection (default off). The sweep normally picks the
+# config with the lowest grand-mean latency (_beats). With MORI_EP_TUNING_TAIL=1
+# it instead picks, among the configs whose mean is within MORI_EP_TUNING_TAIL_TOL
+# of the best mean, the one with the smallest round-to-round STD (lat_std) -- the
+# most reproducible of the near-best configs, for a serving path that cares about
+# a tight, predictable latency more than the last microsecond of the average.
+# Selecting on the std of the per-round means (not a single worst sample) is what
+# makes this robust; it is only meaningful with enough rounds (raise
+# MORI_EP_ROUNDS) so the std is estimated well, and ideally averaged over several
+# tuning passes. Note: on this 2-node rig the spread is largely intrinsic fabric
+# jitter (a per-round barrier and the RDMA QoS lane both barely move it), so this
+# trades a little mean for a modestly tighter distribution, not a dramatic one.
+_TUNING_TAIL = os.environ.get("MORI_EP_TUNING_TAIL", "0") == "1"
+_TUNING_TAIL_TOL = float(os.environ.get("MORI_EP_TUNING_TAIL_TOL") or "0.05")
 
 
 def _beats(new_lat, new_cfg, best_lat, best_cfg):
@@ -1150,7 +1216,7 @@ class EpDispatchCombineTestCase:
             all_rank_scales,
         ) = test_data
 
-        warmup_rounds = 3
+        warmup_rounds = _EP_WARMUP
         for i in range(warmup_rounds):
             (
                 dispatch_output,
@@ -1233,6 +1299,13 @@ class EpDispatchCombineTestCase:
                 warp_per_block=comb_warp_per_block,
             )
             events[3 * i + 3].record()
+            if _EP_PERROUND_SYNC:
+                # Re-align ranks each round so the combine distribution reflects
+                # the kernel, not accumulated cross-rank drift. Diagnostic only;
+                # see _EP_PERROUND_SYNC. The combine events above are already
+                # recorded, so combine timing stays clean; dispatch does not.
+                torch.cuda.synchronize()
+                dist.barrier()
         torch.cuda.synchronize()
 
         disp_element_size = all_rank_input[self.rank].element_size()
@@ -1391,7 +1464,7 @@ class EpDispatchCombineTestCase:
         if repeat == 1:
             return
 
-        kept = all_data[1:]  # skip round 0
+        kept = all_data[_EP_DROP_ROUNDS:]  # skip the cold leading rounds
         disp_stats = self._build_phase_stats(kept, 0, 1, 2, ll_mode_scale)
         comb_stats = self._build_phase_stats(kept, 3, 4, 5, ll_mode_scale)
 
@@ -1454,11 +1527,18 @@ class EpDispatchCombineTestCase:
         xgmi_s = _s(kept[:, :, col_xgmi])
         rdma_worst_rank = kept[:, :, col_rdma].mean(dim=0).min().item()
         xgmi_worst_rank = kept[:, :, col_xgmi].mean(dim=0).min().item()
+        # Round-to-round std of the per-round mean latency: how reproducible this
+        # config is, the metric the variance-aware tuner minimises. Uses the
+        # per-round means (not all samples) so it measures run-level jitter rather
+        # than the intra-round rank spread. 0.0 when there is a single round.
+        lat_per_round = kept[:, :, col_lat].mean(dim=1)
+        lat_std = lat_per_round.std().item() if lat_per_round.numel() > 1 else 0.0
         return {
             "rdma": _s(kept[:, :, col_rdma]),
             "xgmi": xgmi_s,
             "ll": tuple(v * ll_scale for v in xgmi_s),
             "lat": _s(kept[:, :, col_lat]),
+            "lat_std": lat_std,
             "rdma_worst_rank": rdma_worst_rank,
             "ll_worst_rank": xgmi_worst_rank * ll_scale,
         }
@@ -1625,11 +1705,15 @@ class EpDispatchCombineTestCase:
             "xgmi": (0, 0, 0),
             "ll": (0, 0, 0),
             "lat": (0, 0, 0),
+            "lat_std": 0.0,
             "rdma_worst_rank": 0,
             "ll_worst_rank": 0,
         }
         best_disp_stats = dict(_zero_stats)
         best_comb_stats = dict(_zero_stats)
+        # Every candidate's (cfg, disp_stats, comb_stats), for the optional
+        # tail-aware re-selection after the sweep (MORI_EP_TUNING_TAIL).
+        sweep_records = []
 
         test_data = self.gen_test_data(
             max_num_token=max_num_token,
@@ -1674,7 +1758,9 @@ class EpDispatchCombineTestCase:
                         comb_warp_per_block=warp,
                     )
                     all_data, ll_scale = self._all_gather_bench_data(bench_result)
-                    kept = all_data[1:]  # skip round 0, same as bench
+                    kept = all_data[
+                        _EP_DROP_ROUNDS:
+                    ]  # skip cold leading rounds, same as bench
                     # kept: (rounds, world_size, 6)
                     # cols: d_rdma, d_xgmi, d_lat, c_rdma, c_xgmi, c_lat
 
@@ -1696,12 +1782,13 @@ class EpDispatchCombineTestCase:
                         best_comb_lat = comb_lat
                         best_comb_config = cand
                         best_comb_stats = comb_stats
+                    if _TUNING_TAIL:
+                        sweep_records.append((cand, disp_stats, comb_stats))
 
                     if self.rank == 0:
-                        da, ca = disp_stats["xgmi"][2], comb_stats["xgmi"][2]
                         print(
-                            f"  disp sel={disp_lat:.1f}us xgmi={da:.1f}  "
-                            f"comb sel={comb_lat:.1f}us xgmi={ca:.1f}  "
+                            f"  disp sel={disp_lat:.1f}us (std {disp_stats['lat_std']:.1f}) "
+                            f"comb sel={comb_lat:.1f}us (std {comb_stats['lat_std']:.1f})  "
                             f"(best disp={best_disp_lat:.1f}us comb={best_comb_lat:.1f}us)"
                         )
                         if _TUNING_VERBOSE:
@@ -1716,9 +1803,52 @@ class EpDispatchCombineTestCase:
                                 comb_stats,
                             )
 
+        # Optional variance-aware re-selection: among the near-best-mean configs,
+        # prefer the one with the smallest round-to-round std. Overrides the
+        # min-mean winner from _beats so the final table and any saved config
+        # reflect the variance-aware pick.
+        if _TUNING_TAIL and sweep_records:
+
+            def _reselect(stat_idx, best_avg):
+                cand_stats = [(rec[0], rec[stat_idx]) for rec in sweep_records]
+                near = [
+                    (cand, st)
+                    for cand, st in cand_stats
+                    if st["lat"][2] <= best_avg * (1.0 + _TUNING_TAIL_TOL)
+                ]
+                if not near:
+                    return None
+                # Among the near-best-mean configs, the most reproducible one:
+                # smallest round-to-round std. This is the whole distribution, not
+                # a single worst sample, so it is far less noisy to select on than
+                # the max -- which is what makes running enough rounds (so the std
+                # is meaningful) and, ideally, several tuning passes worthwhile.
+                return min(near, key=lambda cs: cs[1]["lat_std"])
+
+            d = _reselect(1, best_disp_lat)
+            if d is not None:
+                best_disp_config, best_disp_stats = d
+                best_disp_lat = best_disp_stats["lat"][2]
+            c = _reselect(2, best_comb_lat)
+            if c is not None:
+                best_comb_config, best_comb_stats = c
+                best_comb_lat = best_comb_stats["lat"][2]
+            if self.rank == 0:
+                print(
+                    f"\n[variance-aware] re-selected winners within "
+                    f"{_TUNING_TAIL_TOL:.0%} of the best mean by smallest "
+                    f"round-to-round std"
+                )
+
         if self.rank == 0:
             print(f"\n{'=' * 70}")
-            print("Tuning Result (best config chosen by grand-mean latency)")
+            _sel_by = (
+                "smallest round-to-round std within "
+                f"{_TUNING_TAIL_TOL:.0%} of best mean"
+                if _TUNING_TAIL
+                else "grand-mean latency"
+            )
+            print(f"Tuning Result (best config chosen by {_sel_by})")
             print(f"{'=' * 70}")
             for label, dtype_s, cfg, st in [
                 ("Dispatch", disp_dtype_str, best_disp_config, best_disp_stats),

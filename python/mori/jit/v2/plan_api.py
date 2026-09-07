@@ -52,6 +52,7 @@ from pathlib import Path
 __all__ = [
     "load_library",
     "make_plan",
+    "launch_multi",
     "precompile",
     "registered_plans",
     "library_path",
@@ -233,6 +234,15 @@ def _bind(lib: ctypes.CDLL) -> None:
         ctypes.c_void_p,
         ctypes.c_int,
         ctypes.c_void_p,
+    ]
+
+    lib.mori_jit_plan_launch_multi.restype = ctypes.c_int
+    lib.mori_jit_plan_launch_multi.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),  # plans
+        ctypes.c_int,  # nplans
+        ctypes.c_void_p,  # argBuf
+        ctypes.c_int,  # argSize
+        ctypes.c_void_p,  # stream
     ]
 
     lib.mori_jit_plan_info.restype = ctypes.c_int
@@ -537,17 +547,18 @@ def make_plan(kernel: str, enums: dict | None = None) -> type:
                 self._defaults[wire] = v
             self._buf = None  # pinned values changed; rebuild the cached struct
 
-        def launch(self, stream=0, **args) -> None:
-            """Arguments by name, snake_case or the C++ spelling, per the schema."""
-            if self._handle is None:
-                raise RuntimeError("launch on a closed plan")
+        def _launch_buf(self, args) -> ctypes.Structure:
+            """Fill (and cache) the launch argument struct for `args` -- a dict of
+            snake_case or C++-spelled names. Shared by launch() and the batch
+            launch_multi(), which fills one buffer and hands it to several plans.
 
-            # A serving loop calls this with the same argument NAMES every time,
-            # so the struct-filling work repeats identically while only a few
-            # values differ. Cache the struct instead of rebuilding it: on f01-2
-            # this path cost 10-20us per launch against a ~36us kernel, which is
-            # what made the eager host path -- not the GPU -- the bottleneck at
-            # small token counts (HANDOFF §16.13).
+            A serving loop calls this with the same argument NAMES every time,
+            so the struct-filling work repeats identically while only a few
+            values differ. Cache the struct instead of rebuilding it: on f01-2
+            this path cost 10-20us per launch against a ~36us kernel, which is
+            what made the eager host path -- not the GPU -- the bottleneck at
+            small token counts (HANDOFF §16.13).
+            """
             #
             # What may be cached: a _defaults entry that is an int, since bind()
             # is the only way to change one and it drops the cache. Everything
@@ -588,6 +599,13 @@ def make_plan(kernel: str, enums: dict | None = None) -> type:
                     _set_arg(buf, wire, args[k])
                 for wire in self._dyn_defs:
                     _set_arg(buf, wire, self._defaults[wire])
+            return buf
+
+        def launch(self, stream=0, **args) -> None:
+            """Arguments by name, snake_case or the C++ spelling, per the schema."""
+            if self._handle is None:
+                raise RuntimeError("launch on a closed plan")
+            buf = self._launch_buf(args)
             rc = _load().mori_jit_plan_launch(
                 self._handle,
                 ctypes.byref(buf),
@@ -654,6 +672,44 @@ def make_plan(kernel: str, enums: dict | None = None) -> type:
         + f"\nLaunch: {', '.join(_camel_to_snake(a) for a in arg_names)}"
     )
     return Plan
+
+
+def launch_multi(plans, stream=0, **args) -> None:
+    """Launch several plans that share one args schema, with a single ABI crossing.
+
+    The EP internode sequence is N kernels over one EpInterNodeCcoArgs -- every
+    pass publishes the same args schema and, in the redirect, is handed the same
+    ``raw``/``devComm`` -- so the argument struct is filled once (on ``plans[0]``,
+    reusing its per-plan cache) and every plan is launched against it in order on
+    ``stream``. That collapses N Python arg-marshals and N ctypes crossings into
+    one; the N ``hipModuleLaunchKernel`` calls still happen, one per plan.
+
+    ``plans`` is a sequence of Plan instances from ``make_plan``; they must share
+    one args layout (asserted by size, since a wrong argSize would silently launch
+    against a mis-sized buffer). Empty ``plans`` is a no-op.
+    """
+    plans = list(plans)
+    if not plans:
+        return
+    lead = plans[0]
+    if any(p._handle is None for p in plans):
+        raise RuntimeError("launch_multi on a closed plan")
+    lead_size = ctypes.sizeof(lead._args_t)
+    if any(ctypes.sizeof(p._args_t) != lead_size for p in plans):
+        raise ValueError("launch_multi: plans do not share one args layout")
+
+    buf = lead._launch_buf(args)
+    n = len(plans)
+    handles = (ctypes.c_void_p * n)(*[p._handle.value for p in plans])
+    rc = _load().mori_jit_plan_launch_multi(
+        handles,
+        n,
+        ctypes.byref(buf),
+        ctypes.sizeof(buf),
+        ctypes.c_void_p(_as_ptr(stream)),
+    )
+    if rc != 0:
+        raise RuntimeError(f"mori jit launch_multi: {_error()}")
 
 
 def precompile(kernel: str, arch: str | None = None) -> int:
