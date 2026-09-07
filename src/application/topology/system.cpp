@@ -32,6 +32,7 @@
 
 #include "mori/application/transport/rdma/rdma.hpp"
 #include "mori/application/utils/check.hpp"
+#include "mori/utils/mori_log.hpp"
 
 namespace mori {
 namespace application {
@@ -63,14 +64,25 @@ std::vector<Candidate> CollectAndSortCandidates(TopoSystem* sys, int id) {
   TopoSystemNet* net = sys->GetTopoSystemNet();
 
   TopoNodeGpu* dev = gpu->GetGpuByLogicalId(id);
-  NumaNodeId gpuNumaNodeId = pci->Node(dev->busId)->NumaNode();
+  if (dev == nullptr) {
+    MORI_APP_WARN("Topology: GPU logical id {} not found; no NIC candidates", id);
+    return {};
+  }
+  TopoNodePci* devPci = pci->Node(dev->busId);
+  if (devPci == nullptr) {
+    MORI_APP_WARN("Topology: GPU {} bdf {} not in PCI tree; no NIC candidates", id,
+                  dev->busId.String());
+    return {};
+  }
+  NumaNodeId gpuNumaNodeId = devPci->NumaNode();
 
   // Collect nic candidates
   auto nics = net->GetNics();
   std::vector<Candidate> candidates;
   for (auto* nic : nics) {
-    TopoPathPci* path = pci->Path(dev->busId, nic->busId);
     TopoNodePci* nicPci = pci->Node(nic->busId);
+    if (!nicPci) continue;  // NIC BDF not present in the scanned PCI tree
+    TopoPathPci* path = pci->Path(dev->busId, nic->busId);
     if (!path) continue;
     candidates.push_back({path, nicPci, nic});
   }

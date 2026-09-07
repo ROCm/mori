@@ -99,6 +99,19 @@ if(BUILD_IO)
     set_target_properties(test_discrete_buffer PROPERTIES HIP_ARCHITECTURES
                                                           "${GPU_TARGETS}")
   endif()
+
+  # OFI/Slingshot correctness test — needs MPI to launch 2 ranks.
+  if(WITH_MPI)
+    find_package(MPI REQUIRED)
+    add_executable(ofi_slingshot_test io/ofi_slingshot_test.cpp)
+    target_include_directories(ofi_slingshot_test
+                               PUBLIC ${CMAKE_SOURCE_DIR}/include)
+    target_include_directories(ofi_slingshot_test PUBLIC ${CMAKE_SOURCE_DIR})
+    target_include_directories(ofi_slingshot_test
+                               PUBLIC ${MPI_CXX_INCLUDE_DIRS})
+    target_link_libraries(ofi_slingshot_test mori_application mori_io
+                          ${MPI_CXX_LIBRARIES})
+  endif()
 endif()
 
 if(BUILD_OPS_DEVICE AND WITH_MPI)
