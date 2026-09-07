@@ -184,6 +184,10 @@ void ConcurrentPutImmThread() {
     HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(buff2), myPe, numEle));
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
+    // Without this, PE 0's put-imm can land before PE 1 has run its memset, which
+    // then overwrites the delivered 42s -- PE 1's kernel spins on them forever.
+    MPI_Barrier(MPI_COMM_WORLD);
+
     if (myPe == 0) {
       printf("Running pure address API test...\n");
     }

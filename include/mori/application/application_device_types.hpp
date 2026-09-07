@@ -55,7 +55,7 @@ namespace application {
 /*                                       Transport Types                                          */
 /* ---------------------------------------------------------------------------------------------- */
 
-enum TransportType { RDMA = 0, P2P = 1, SDMA = 2 };
+enum TransportType { RDMA = 0, P2P = 1, SDMA = 2, PROXY = 3 };
 
 // Atomic internal buffer configuration. Defined here (device-safe) rather than in
 // the host transport/rdma/rdma.hpp so device kernels (e.g. shmem_ibgda_kernels) can

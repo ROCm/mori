@@ -858,16 +858,18 @@ __forceinline__ __device__ void WarpAccumLFImpl(T* __restrict__ dest, T* const* 
   }
 }
 
-template <typename T, int VecBytes>
+// Unroll is a template parameter so a caller can override it without changing
+// the default for every other user of this primitive.
+template <typename T, int VecBytes, int Unroll = WARP_ACCUM_UNROLL>
 __forceinline__ __device__ void WarpAccumLF(T* __restrict__ dest, T* const* __restrict__ srcs,
                                             const float* __restrict__ srcScales, size_t accumNum,
                                             size_t nelems) {
   static_assert((VecBytes <= 16) && (VecBytes >= 4) && IsPowerOf2(VecBytes));
+  static_assert(Unroll >= 1);
   size_t offset = 0;
-#define WARP_ACCUM_LF_CASE(AccumNum)                                                         \
-  case AccumNum:                                                                             \
-    WarpAccumLFImpl<T, VecBytes, AccumNum, WARP_ACCUM_UNROLL>(dest, srcs, srcScales, offset, \
-                                                              nelems);                       \
+#define WARP_ACCUM_LF_CASE(AccumNum)                                                       \
+  case AccumNum:                                                                           \
+    WarpAccumLFImpl<T, VecBytes, AccumNum, Unroll>(dest, srcs, srcScales, offset, nelems); \
     break;
   switch (accumNum) {
     WARP_ACCUM_LF_CASE(1)

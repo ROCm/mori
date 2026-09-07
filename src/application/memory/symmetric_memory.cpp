@@ -195,18 +195,53 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
       break;
     }
   }
-  // SDMA/P2P-only transits pass rdmaRegister=false to skip ibv_reg_mr (the
-  // buffer is never an RDMA src/dst). This dodges the ionic single-MR limit
-  // (ibv_reg_mr fails at >=~2 GiB) for the hierarchical AllGather's intra
-  // node-block. The rkey stays 0 and the Allgather below still runs, so the
-  // collective register stays in lockstep.
-  if (rdmaDeviceContext && anyRdmaPeer && rdmaRegister) {
-    application::RdmaMemoryRegion mr =
-        rdmaDeviceContext->RegisterRdmaMemoryRegionAuto(localPtr, size);
-    cpuMemObj->lkey = mr.lkey;
-    cpuMemObj->peerRkeys[rank] = mr.rkey;
+  if (context.IsProxyEnabled() && rdmaDeviceContext && anyRdmaPeer && rdmaRegister) {
+    if (heap_begin) {
+      application::RdmaMemoryRegion mr =
+          rdmaDeviceContext->RegisterRdmaMemoryRegionAuto(localPtr, size);
+      cpuMemObj->lkey = mr.lkey;
+      cpuMemObj->peerRkeys[rank] = mr.rkey;
+      bootNet.Allgather(&cpuMemObj->peerRkeys[rank], cpuMemObj->peerRkeys, sizeof(uint32_t));
+      heapLkey_ = mr.lkey;
+      heapRkeys_.assign(cpuMemObj->peerRkeys, cpuMemObj->peerRkeys + worldSize);
+
+      const auto& allCtxs = context.GetAllRdmaDeviceContexts();
+      int numNics = static_cast<int>(allCtxs.size());
+      if (numNics > 1) {
+        perNicLkeys.resize(numNics, 0);
+        perNicPeerRkeys.resize(numNics);
+        for (int n = 0; n < numNics; n++) {
+          bootNet.Barrier();
+          perNicPeerRkeys[n].resize(worldSize, 0);
+          if (allCtxs[n]) {
+            auto mr2 = allCtxs[n]->RegisterRdmaMemoryRegionAuto(localPtr, size);
+            perNicLkeys[n] = mr2.lkey;
+            perNicPeerRkeys[n][rank] = mr2.rkey;
+          }
+          bootNet.Allgather(&perNicPeerRkeys[n][rank], perNicPeerRkeys[n].data(), sizeof(uint32_t));
+        }
+      }
+    } else {
+      cpuMemObj->lkey = heapLkey_;
+      if (!heapRkeys_.empty()) {
+        memcpy(cpuMemObj->peerRkeys, heapRkeys_.data(), worldSize * sizeof(uint32_t));
+      }
+    }
+  } else {
+    // Native path — main's original code
+    // SDMA/P2P-only transits pass rdmaRegister=false to skip ibv_reg_mr (the
+    // buffer is never an RDMA src/dst). This dodges the ionic single-MR limit
+    // (ibv_reg_mr fails at >=~2 GiB) for the hierarchical AllGather's intra
+    // node-block. The rkey stays 0 and the Allgather below still runs, so the
+    // collective register stays in lockstep.
+    if (rdmaDeviceContext && anyRdmaPeer && rdmaRegister) {
+      application::RdmaMemoryRegion mr =
+          rdmaDeviceContext->RegisterRdmaMemoryRegionAuto(localPtr, size);
+      cpuMemObj->lkey = mr.lkey;
+      cpuMemObj->peerRkeys[rank] = mr.rkey;
+    }
+    bootNet.Allgather(&cpuMemObj->peerRkeys[rank], cpuMemObj->peerRkeys, sizeof(uint32_t));
   }
-  bootNet.Allgather(&cpuMemObj->peerRkeys[rank], cpuMemObj->peerRkeys, sizeof(uint32_t));
 
   // Copy memory object to GPU memory, we need to access it from GPU directly
   SymmMemObj* gpuMemObj;

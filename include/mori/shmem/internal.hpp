@@ -25,6 +25,7 @@
 #include <cassert>  // assert() — used in device code below, needed in both host/device compiles
 
 #include "mori/application/application_device_types.hpp"
+#include "mori/core/transport/rdma/proxy/proxy_types.hpp"
 #include "mori/core/utils/utils.hpp"
 #include "mori/hip_compat.hpp"
 #include "mori/utils/limits.hpp"
@@ -128,6 +129,14 @@ struct GpuStates {
   uintptr_t heapEndAddr{0};                   // End address of symmetric heap (base + size)
   application::SymmMemObj* heapObj{nullptr};  // Pointer to the heap's SymmMemObj on device
   uint64_t* internalSyncPtr{nullptr};         // Pointer to the internal synchronization object
+
+  // Proxy fields — used when MORI_ENABLE_HOST_PROXY=1
+  uint64_t _proxyPad{0};  // alignment padding
+  core::ProxyRing* proxyRings[core::PROXY_MAX_NICS]{};
+  uint32_t proxyQuietHead[core::PROXY_MAX_NICS]{};
+  int numProxyRings{0};
+  int numNics{0};
+  int localGpuIdx{0};
 };
 
 // Changed from __constant__ to __device__ to allow hipMemcpyToSymbol updates (like rocshmem)
@@ -178,7 +187,7 @@ struct ShmemStates {
   RdmaStates* rdmaStates{nullptr};
   MemoryStates* memoryStates{nullptr};
   ModuleStates moduleStates;  // JIT module state for this GPU
-  GpuStates gpuStates;        // host-side copy of device GpuStates for this GPU
+  GpuStates gpuStates;
 
   // Asserts that ShmemInit has been called and the slot is currently usable.
   // Used by APIs that touch GPU state (allocation, barrier, module init)

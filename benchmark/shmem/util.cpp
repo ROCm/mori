@@ -27,6 +27,7 @@
 #include <string>
 
 #include "hip/hip_runtime.h"
+#include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/application/utils/check.hpp"
 #include "mori/shmem/shmem_api.hpp"
 
@@ -189,6 +190,44 @@ int PerfInit(int argc, char** argv, struct PerfContext* ctx) {
   ctx->args = PerfArgs{};
   PerfArgs& args = ctx->args;
 
+  // Socket bootstrap (no MPI) when MASTER_ADDR is set: launch one process per node
+  // with RANK/WORLD_SIZE/LOCAL_RANK/MASTER_ADDR/MASTER_PORT env, like the EP tests.
+  const char* master_addr = std::getenv("MASTER_ADDR");
+  if (master_addr != nullptr) {
+    ctx->world_rank = std::atoi(std::getenv("RANK"));
+    const int ws = std::atoi(std::getenv("WORLD_SIZE"));
+    ctx->local_rank = std::getenv("LOCAL_RANK") ? std::atoi(std::getenv("LOCAL_RANK")) : 0;
+    const int port = std::getenv("MASTER_PORT") ? std::atoi(std::getenv("MASTER_PORT")) : 29500;
+    ctx->local_comm = MPI_COMM_NULL;
+
+    rc = ParseArgs(argc, argv, &args);
+    if (rc) {
+      if (ctx->world_rank == 0) PrintUsage(argv[0]);
+      return rc;
+    }
+    if (args.min_size % sizeof(double) != 0) {
+      args.min_size = (args.min_size + sizeof(double) - 1) / sizeof(double) * sizeof(double);
+    }
+    HIP_RUNTIME_CHECK(hipGetDeviceCount(&ctx->device_count));
+    assert(ctx->device_count);
+    const int device_id = ctx->local_rank % ctx->device_count;
+    HIP_RUNTIME_CHECK(hipSetDevice(device_id));
+    HIP_RUNTIME_CHECK(
+        hipDeviceGetAttribute(&ctx->device_warp_size, hipDeviceAttributeWarpSize, device_id));
+
+    auto* bootNet = new application::SocketBootstrapNetwork(
+        application::SocketBootstrapNetwork::GenerateUniqueId(master_addr, port), ctx->world_rank,
+        ws);
+    rc = ShmemInit(bootNet);  // takes ownership + initializes internally
+    if (rc) {
+      std::fprintf(stderr, "ShmemInit(socket) failed: %d\n", rc);
+      return 1;
+    }
+    ctx->my_pe = ShmemMyPe();
+    ctx->npes = ShmemNPes();
+    return 0;
+  }
+
   MPI_Init(&argc, &argv);
   MPI_Comm_rank(MPI_COMM_WORLD, &ctx->world_rank);
 
@@ -245,7 +284,9 @@ int PerfInit(int argc, char** argv, struct PerfContext* ctx) {
 }
 
 void PerfFinalize(struct PerfContext* ctx) {
-  MPI_Comm_free(&ctx->local_comm);
+  if (ctx->local_comm != MPI_COMM_NULL) {
+    MPI_Comm_free(&ctx->local_comm);
+  }
   ShmemFinalize();
 }
 

@@ -23,6 +23,9 @@
 import json
 import warnings
 from collections import defaultdict
+
+import numpy as np
+
 from mori import cpp as mori_cpp
 
 
@@ -30,39 +33,36 @@ def _parse_trace_events(trace_buffer):
     """Parse trace event stream: [ts0, meta0, ts1, meta1, ...]
     Meta encoding: [warpId:16][slot:14][type:2]
     Returns list of (ts, warp_id, slot, event_type)
-    """
-    events = []
 
+    The buffer is sized for the worst case (MAX_TRACE_EVENTS_PER_WARP *
+    PROFILER_WARPS_PER_RANK, i.e. ~134M int64 = 1 GiB) and is almost entirely
+    zeros in practice, so this decodes with numpy rather than element-wise:
+    at one .item() per element a real buffer takes hours to parse.
+    """
     if trace_buffer.is_cuda:
         trace_buffer = trace_buffer.cpu()
 
-    num_elements = trace_buffer.numel()
-    warp_stride = 32768  # C++ uses 16384 events * 2 int64 = 32768
+    # (num_events, 2) view over the flat [ts, meta] pairs. Warp boundaries do
+    # not matter here: the caller only wants a single globally ordered stream.
+    pairs = trace_buffer.contiguous().numpy().reshape(-1, 2)
+    used = pairs[:, 0] != 0
+    ts = pairs[:, 0][used]
+    meta = pairs[:, 1][used]
 
-    for base in range(0, num_elements, warp_stride):
-        warp_buffer = trace_buffer[base : base + warp_stride]
+    if ts.size == 0:
+        return []
 
-        warp_events = []
-        for i in range(0, warp_stride, 2):
-            ts = warp_buffer[i].item()
-            meta = warp_buffer[i + 1].item()
+    # Stable sort so that events sharing a timestamp keep buffer order, which
+    # is what the previous per-warp-then-global sort produced.
+    order = np.argsort(ts, kind="stable")
+    ts = ts[order]
+    meta = meta[order]
 
-            if ts == 0:
-                continue
+    event_type = meta & 0x3
+    slot = (meta >> 2) & 0x3FFF
+    warp_id = (meta >> 16) & 0xFFFF
 
-            warp_events.append((ts, meta))
-
-        warp_events.sort(key=lambda x: x[0])
-
-        for ts, meta in warp_events:
-            event_type = meta & 0x3
-            slot = (meta >> 2) & 0x3FFF
-            warp_id = (meta >> 16) & 0xFFFF
-
-            events.append((ts, warp_id, slot, event_type))
-
-    events.sort(key=lambda x: x[0])
-    return events
+    return list(zip(ts.tolist(), warp_id.tolist(), slot.tolist(), event_type.tolist()))
 
 
 def _sanitize_events(raw_events, drop_orphan_ends=True, drop_orphan_begins=True):

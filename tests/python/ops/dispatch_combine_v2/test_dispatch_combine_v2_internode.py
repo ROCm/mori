@@ -356,11 +356,27 @@ def _install_jit_redirect():
 
     # build_args takes the hidden dim from the input tensor, and the kernel gets
     # it as a compiled constant, so the plan must be built for the same value.
+    from mori.ops.dispatch_combine_v2 import internode_tuning_configs as _ep_tuning
+
     for name in ("dispatch", "combine"):
         orig = getattr(Op, name)
 
-        def wrapper(self, input, *a, _orig=orig, **kw):
+        def wrapper(self, input, *a, _orig=orig, _phase=name, **kw):
             self.__dict__["_internode_hidden_dim"] = input.size(1)
+            # The redirect is the internode path's only geometry hook: left alone
+            # it inherits dispatch_combine.py's grid, which is not CU-aware and
+            # over-subscribes MI308 at these token counts. When the caller pinned
+            # nothing, pin the per-device, CU-bounded, per-token geometry instead.
+            if kw.get("block_num", -1) <= 0:
+                geom = _ep_tuning.lookup(
+                    self.config.world_size,
+                    self.config.hidden_dim,
+                    self.config.num_experts_per_token,
+                    int(input.size(0)),
+                )
+                if geom is not None:
+                    b, r, w = geom[_phase]
+                    kw["block_num"], kw["rdma_block_num"], kw["warp_per_block"] = b, r, w
             return _orig(self, input, *a, **kw)
 
         setattr(Op, name, wrapper)
