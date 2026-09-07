@@ -667,6 +667,16 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   if (thdId == 0) atomicAdd(args.gridBarrier, 1u);
   index_t* recvTokenNums = EpLocal<index_t>(win, args.offRecvNum);
   if (globalWarpId == 0) {
+    // Drain the destination's signal slot BEFORE spinning on the grid barrier.
+    // That read is against uncached peer memory, so it costs a full fabric round
+    // trip even though the slot has long been zero, and its address depends only
+    // on destPe -- nothing about it needs the barrier satisfied. Issuing it while
+    // the barrier is still spinning is what hides the round trip; done after, it
+    // sits fully exposed on the critical path. Same trick as v1's 1250x body.
+    // The wire format is untouched: both are pure spin-waits that write nothing,
+    // and the signal store below still happens after both.
+    for (int destPe = laneId; destPe < npes; destPe += WS)
+      EpWaitEq(EpPeer<index_t>(win, destPe, args.offRecvNum) + myPe, (index_t)0);
     // Grid barrier hoisted before the peer loop so wide EP (worldSize > waveSize)
     // multi-iterates safely — the barrier is consumed and reset exactly once.
     EpWaitEq(args.gridBarrier, static_cast<unsigned int>(gridDim.x));
@@ -674,7 +684,6 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
 
     for (int destPe = laneId; destPe < npes; destPe += WS) {
       index_t* signal = EpPeer<index_t>(win, destPe, args.offRecvNum) + myPe;
-      EpWaitEq(signal, 0);
       index_t numTokenSignal = __hip_atomic_load(args.destPeTokenCounter + destPe, __ATOMIC_RELAXED,
                                                  __HIP_MEMORY_SCOPE_AGENT) +
                                1;
