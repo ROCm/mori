@@ -27,6 +27,7 @@
 #include <cstdlib>
 
 #include "mori/application/utils/check.hpp"
+#include "mori/utils/mori_log.hpp"
 
 namespace mori {
 namespace application {
