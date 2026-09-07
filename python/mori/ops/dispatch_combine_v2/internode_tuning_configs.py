@@ -23,14 +23,19 @@
 """Per-device launch geometry for the v2 CCO internode (InterNodeV1LL)
 dispatch/combine kernels.
 
-The internode kernels reach their grid a different way than the intranode ones:
-the launch redirect (see the v2 internode test) inherits geometry from
-``dispatch_combine.py`` -- the shmem resolve -- rather than a per-token schedule
-the kernel selects at runtime. So the *host* picks a per-token bucket here and
-pins the resulting block/rdma/warp on ``op.dispatch`` / ``op.combine``. That is
-why this table, unlike ``tuning_configs.py`` (flydsl intranode) and
-``hip_tuning_configs.py``, carries an ``rdma_block_num`` per phase and is looked
-up with the live ``num_tokens`` rather than compiled into a schedule.
+The internode kernels reach their grid a different way than the intranode ones.
+An intranode kernel is compiled once per (block, warp) the schedule can name and
+picks among those at launch; an internode *pass sequence* is compiled per
+geometry, because ``rdma_block_num`` splits the grid between the RDMA blocks and
+the intra-node ones and the kernel branches on it. So the host resolves a bucket
+here from the live ``num_tokens`` and launches the plan set built for it --
+``HipBackend._internode_geometry_buckets`` walks this whole table at build time
+so that resolution can never trigger a compile.
+
+That is also why this table, unlike ``tuning_configs.py`` (flydsl intranode) and
+``hip_tuning_configs.py``, carries an ``rdma_block_num`` per phase: dispatch and
+combine are tuned to different values at the same token count over one shared
+arena, which a single geometry per bucket cannot express.
 
 Devices are told apart the same way as ``tuning_configs.py`` -- PCI DID first
 (MI300X and MI308X are both gfx942, differing only in CU count), then arch. The
@@ -117,4 +122,9 @@ def lookup(world_size, hidden_dim, topk, num_tokens, dtype="fp8"):
 
     cu = gpu_utils.cu_count() or 80
     db, cb = min(db, cu), min(cb, cu)  # never over-subscribe the CUs
+    # rdma_block_num partitions the SAME grid: blocks below it talk to the
+    # network, the rest do the intra-node half. Clamping block without clamping
+    # rdma can leave rdma >= block, which is not slow but wrong -- no block is
+    # left for the intra-node side and the dispatch barrier never completes.
+    dr, cr = min(dr, max(1, db - 1)), min(cr, max(1, cb - 1))
     return {"dispatch": (db, dr, dw), "combine": (cb, cr, cw)}
