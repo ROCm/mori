@@ -658,6 +658,22 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             self._internode_plans[geom] = built
             self._plans.extend(built.values())
 
+        # One bound launch group per (geometry, phase, low-latency). The set of
+        # plans a launch fires is fixed by that triple, so the validation and the
+        # ctypes handle array belong here rather than on the launch path. A
+        # geometry only carries the passes it actually serves, hence the subset
+        # test -- the shipped table gives dispatch and combine the same triple at
+        # 16 tokens but different ones elsewhere.
+        from mori.jit.v2 import plan_api
+
+        self._internode_groups = {}
+        for geom, built in self._internode_plans.items():
+            for key, names in self._INTERNODE_SEQ.items():
+                if all(n in built for n in names):
+                    self._internode_groups[(geom, key)] = plan_api.make_launch_group(
+                        [built[n] for n in names]
+                    )
+
         disp_spec = (cfg.dispatch_block_num, cfg.warp_num_per_block)
         comb_spec = (cfg.combine_block_num, cfg.combine_warp_num_per_block)
         return KernelSet(
@@ -686,7 +702,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         crossings become one, and a JIT-compile failure on a later pass aborts
         before any earlier one is enqueued.
         """
-        from mori.jit.v2 import plan_api
 
         def run(*, input, num_tokens, dest_map, **kw):
             # The low-latency pair is chosen by token count. `_internode_force_ll`
@@ -702,7 +717,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             )
             names = self._INTERNODE_SEQ[(phase, ll)]
             geom = self._internode_geom_for(phase, num_tokens)
-            plans = [self._internode_plans[geom][n] for n in names]
+            group = self._internode_groups[(geom, (phase, ll))]
 
             # Two of the kernel's arguments are set by dispatch and READ AGAIN by
             # combine, but the base only hands them to dispatch -- combine's
@@ -760,9 +775,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     f"rdma={args['rdmaBlockNum']} passes={names}",
                     flush=True,
                 )
-            plan_api.launch_multi(
-                plans, stream=torch.cuda.current_stream().cuda_stream, **args
-            )
+            group.launch(torch.cuda.current_stream().cuda_stream, **args)
 
         return run
 

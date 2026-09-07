@@ -674,6 +674,79 @@ def make_plan(kernel: str, enums: dict | None = None) -> type:
     return Plan
 
 
+def _args_layout(plan):
+    """The plan's args layout as (name, offset, size) per field.
+
+    Not `sizeof`. Eight of the fields are bare pointers, so two schemas that swap
+    a pair of same-typed fields have identical size and a caller filling one and
+    launching the other reads the wrong buffer in silence -- the exact failure the
+    ascending-offset static_assert exists to catch on the C++ side.
+    """
+    t = plan._args_t
+    return tuple((n, getattr(t, n).offset, getattr(t, n).size) for n in plan._arg_names)
+
+
+class LaunchGroup:
+    """A fixed set of plans over one args layout, validated once.
+
+    `launch_multi` redoes per call what depends only on the set: copying the plan
+    list, checking every handle, comparing every args layout, building the ctypes
+    handle array. A serving loop holds the set fixed -- one per (phase, geometry)
+    -- so it belongs here, leaving the launch path with the argument fill and the
+    one ABI crossing. Measured on the EP internode sequence, that per-call work
+    was ~17us against kernels of ~40us.
+
+    The group keeps its plans alive, so a handle cannot dangle by garbage
+    collection. Explicitly `close()`ing a plan still invalidates every group over
+    it; there is no per-launch check for that, which is the point.
+    """
+
+    __slots__ = ("_plans", "_lead", "_handles", "_n", "_argsize")
+
+    def __init__(self, plans):
+        plans = list(plans)
+        if not plans:
+            raise ValueError("launch group needs at least one plan")
+        for i, p in enumerate(plans):
+            if p._handle is None:
+                raise RuntimeError(f"launch group over a closed plan at index {i}")
+        lead = plans[0]
+        want = _args_layout(lead)
+        for i, p in enumerate(plans[1:], 1):
+            got = _args_layout(p)
+            if got != want:
+                diff = [a for a, b in zip(want, got) if a != b] or ["field count"]
+                raise ValueError(
+                    f"launch group: plan {i} ({p._kernel}) does not share "
+                    f"{lead._kernel}'s args layout; first difference at {diff[0]}"
+                )
+        self._plans = plans
+        self._lead = lead
+        self._n = len(plans)
+        self._handles = (ctypes.c_void_p * self._n)(*[p._handle.value for p in plans])
+        self._argsize = ctypes.sizeof(lead._args_t)
+
+    def launch(self, stream=0, **args) -> None:
+        """Fill the shared argument struct once, then launch every plan in order."""
+        buf = self._lead._launch_buf(args)
+        rc = _load().mori_jit_plan_launch_multi(
+            self._handles,
+            self._n,
+            ctypes.byref(buf),
+            self._argsize,
+            ctypes.c_void_p(_as_ptr(stream)),
+        )
+        if rc != 0:
+            raise RuntimeError(f"mori jit launch_multi: {_error()}")
+
+    __call__ = launch
+
+
+def make_launch_group(plans) -> LaunchGroup:
+    """Bind a fixed plan sequence for repeated launching. See LaunchGroup."""
+    return LaunchGroup(plans)
+
+
 def launch_multi(plans, stream=0, **args) -> None:
     """Launch several plans that share one args schema, with a single ABI crossing.
 
@@ -691,25 +764,7 @@ def launch_multi(plans, stream=0, **args) -> None:
     plans = list(plans)
     if not plans:
         return
-    lead = plans[0]
-    if any(p._handle is None for p in plans):
-        raise RuntimeError("launch_multi on a closed plan")
-    lead_size = ctypes.sizeof(lead._args_t)
-    if any(ctypes.sizeof(p._args_t) != lead_size for p in plans):
-        raise ValueError("launch_multi: plans do not share one args layout")
-
-    buf = lead._launch_buf(args)
-    n = len(plans)
-    handles = (ctypes.c_void_p * n)(*[p._handle.value for p in plans])
-    rc = _load().mori_jit_plan_launch_multi(
-        handles,
-        n,
-        ctypes.byref(buf),
-        ctypes.sizeof(buf),
-        ctypes.c_void_p(_as_ptr(stream)),
-    )
-    if rc != 0:
-        raise RuntimeError(f"mori jit launch_multi: {_error()}")
+    LaunchGroup(plans).launch(stream, **args)
 
 
 def precompile(kernel: str, arch: str | None = None) -> int:
