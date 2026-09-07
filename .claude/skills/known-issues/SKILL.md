@@ -7,7 +7,10 @@ description: >-
   (EPv2) but not mori-shmem (EPv1). Use when EPv2 / dispatch_combine_v2 / cco is much slower
   than expected, when EPv2 is far slower than EPv1 on the same box, when a2a bandwidth does
   not scale with the number of peers, or when the user asks whether a perf problem is a
-  MORI bug or an environment problem.
+  MORI bug or an environment/toolchain problem. Also: (2) on ROCm 7.0-7.2.x a clr
+  hipMemSetAccess sub-buffer bug makes mori-cco 2-node ccoDevCommCreate fail with
+  "hipMemSetAccess ... invalid argument"; (3) on ROCm 7.2.x clr routes uncached VMM
+  allocations to the coarse-grained pool, making cco combine ~10-15us slower.
 ---
 
 # MORI Known Issues
@@ -241,3 +244,83 @@ stay idle, which is itself the tell that the peers are not the destination.
 - **Micro-benchmarking peer bandwidth is noisy.** Use ≥1024 blocks per stream and take the
   best of several repetitions. An under-parallelised harness produced a 1.5x spread between
   consecutive identical runs, which is more than enough to invent or hide a regression.
+
+---
+
+## Issue 2 — ROCm 7.0–7.2.x: `hipMemSetAccess` sub-buffer bug (cco 2-node cannot start)
+
+**Affects:** `mori-cco` (EPv2) **multi-node**. A clr/HIP-runtime bug present in **all ROCm
+7.0 → 7.2.x releases** (regression from 6.4.x; fixed on clr `develop` 2026-01-26 but not
+back-ported to any 7.2.x release branch). ROCm **7.14+** already has the fix. `mori-shmem`
+(EPv1) is unaffected.
+
+**Symptom:** `ccoDevCommCreate` fails during window setup:
+
+```
+[shmem] [error] ccoMemAlloc: hipMemSetAccess failed after retries: 1 (invalid argument)
+[shmem] [error] ccoDevCommCreate: resource window MemAlloc failed
+RuntimeError: ccoDevCommCreate failed: -1
+```
+
+Single-node cco usually still passes; the failure shows up cross-node. **`CCO_GDR_CAPABLE=0`
+does not help** — the trigger is sub-buffer geometry, not GPUDirect-RDMA.
+
+**Root cause:** `hipMemSetAccess` validates coverage by walking the parent reservation's
+sub-buffers **from sub-buffer 0, ignoring the `ptr` argument**, and returns `InvalidValue`
+whenever `size` is not a prefix-sum of sub-buffer sizes starting at sub-buffer 0. cco
+reserves one flat VA (`hipMemAddressReserve`) and maps several **different-sized** windows
+(sub-buffers) into it, each with its own `hipMemSetAccess`, so every window after the first
+fails. (SWDEV-568260 / ROCm/rocm-systems#2451, commit `be8bcd059`.)
+
+**Fix — upgrade, or rebuild clr with the upstream fix and swap `libamdhip64.so`.**
+
+Prefer **ROCm 7.14+**. If you must stay on 7.2.x, rebuild `clr` for your exact version and
+cherry-pick the fix (this is what `docker/Dockerfile.cco` did before the 7.14 move —
+`git log -S be8bcd059 -- docker/` for the original recipe):
+
+```bash
+V=$(cat /opt/rocm/.info/version | head -c5)          # e.g. 7.2.3
+git clone --depth 1 --branch rocm-$V https://github.com/ROCm/clr.git /tmp/clr
+git clone --depth 1 --branch rocm-$V https://github.com/ROCm/HIP.git /tmp/hip
+cd /tmp/clr && git fetch origin develop && git cherry-pick be8bcd059     # clean on 7.2.x
+cmake -B build -DHIP_COMMON_DIR=/tmp/hip -DCMAKE_PREFIX_PATH=/opt/rocm \
+      -DCLR_BUILD_HIP=ON -DCLR_BUILD_OCL=OFF -DHIP_PLATFORM=amd \
+      -D__HIP_ENABLE_RTC=OFF -D__HIP_ENABLE_PCH=OFF
+make -C build amdhip64 -j$(nproc)
+# back up and replace the real file behind the libamdhip64.so.7 symlink, keeping its name:
+T=$(readlink -f /opt/rocm/lib/libamdhip64.so.7)
+cp "$T" "$T.orig" && cp build/hipamd/lib/libamdhip64.so.*-* "$T"
+```
+
+The rebuilt lib links the system `libhsa-runtime64.so.1` (ROCR is not touched). Deploy by
+replacing the file (or `LD_PRELOAD`) and restarting the process; it only works on the
+**exact** matching ROCm version (soname must match, e.g. `libamdhip64.so.7.2.70203` for
+7.2.3).
+
+---
+
+## Issue 3 — ROCm 7.2.x: uncached VMM allocations land in the coarse-grained pool (cco combine slow)
+
+**Affects:** `mori-cco` (EPv2) **combine latency** on ROCm **7.2.x** (fixed on clr
+`develop`, not in 7.2.x release; 7.14+ is fine). Correctness is unaffected — this is a
+pure perf issue, and it usually rides along with Issue 2 on the same 7.2.x box.
+
+**Symptom:** cco combine is ~10–15 µs slower than on ROCm 7.14 for the same shape, and
+requesting uncached memory (the default) is **no faster than forcing cached**
+(`CCO_UNCACHED_WINDOW=0` gives the same time). Example: v1_ll combine, tok16, hidden 6144,
+fp8/bf16, EP16 → ~65 µs on 7.2.x vs ~54 µs on 7.14; dispatch is roughly unchanged.
+
+**Root cause:** rocclr's VMM path (`deviceVmemAlloc`) always allocates from the
+coarse-grained `gpuvm_segment_`, **ignoring `hipMemAllocationTypeUncached`**. cco's
+symmetric window therefore stays cached, so a GPU spinning on an RDMA "done" flag hits a
+dirty L2 line and waits for coarse-grained coherence. The non-VMM path (`deviceLocalAlloc`
+/ `hipMalloc`, which mori-shmem uses via `hipDeviceMallocUncached`) already routes uncached
+requests to the extended fine-grained pool; only the VMM path missed it.
+
+**Fix — upgrade to ROCm 7.14+, or add the same routing to the clr rebuild from Issue 2**
+(this is the upstream `develop` behavior): in `rocclr/device/rocm/rocmemory.cpp` propagate
+the uncached flag into `deviceVmemAlloc` (it is hard-coded to `0`), and in
+`rocclr/device/rocm/rocdevice.cpp` `Device::deviceVmemAlloc` select
+`gpu_ext_fine_grained_segment_` when the uncached flag is set and that pool exists, else
+fall back to `gpuvm_segment_` (unchanged for every non-uncached allocation). Both Issue 2
+and Issue 3 ship in a single rebuilt `libamdhip64.so`.
