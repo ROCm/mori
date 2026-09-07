@@ -292,10 +292,28 @@ def main(argv):
                     f"(expected U[0]={int(U[0])})",
                     flush=True,
                 )
-                # What KIND of wrong matters more than that it is wrong: all
-                # zeros means the output never landed, a constant factor means
-                # the reduce counted the wrong number of contributions, and
-                # noise means the routing or the staging offsets are off.
+                # The worst violator with everything needed to classify it:
+                # a relative error near the wire dtype's half-ulp is rounding,
+                # one far above it is not, and a `want` at the staging format's
+                # saturation point says the partial sum clipped rather than
+                # rounded.
+                viol = (got - exp).abs() - bound
+                if bool((viol > 0).any()):
+                    fi = int(viol.argmax())
+                    t, d = fi // cfg.hidden_dim, fi % cfg.hidden_dim
+                    g, e, pin = (
+                        float(got[t, d]),
+                        float(exp[t, d]),
+                        float(per_elem[t, d]),
+                    )
+                    print(
+                        f"#   worst: tok={t} dim={d} got={g:.6g} want={e:.6g} "
+                        f"input={pin:.6g} U={int(Ut[t])} "
+                        f"|diff|={abs(g - e):.6g} bound={float(bound[t, d]):.6g} "
+                        f"rel={abs(g - e) / max(abs(e), 1e-9):.4f} "
+                        f"nviol={int((viol > 0).sum())}",
+                        flush=True,
+                    )
                 want = exp
                 print(
                     f"#   hidden: max|diff|={(got - want).abs().max():.4g} "

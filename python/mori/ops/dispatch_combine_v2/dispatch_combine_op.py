@@ -162,7 +162,14 @@ class EpDispatchCombineConfig:
             raise ValueError(
                 f"combine_mode must be gather|scatter, got {self.combine_mode!r}"
             )
-        if self.quant_type != "none":
+        # Intranode only. There, a quantised combine scatters: each destination
+        # writes its own partial back. The internode fp8_direct_cast combine does
+        # not -- fp8 is the *staging* format, the accumulation is still a gather
+        # (EpCombineAllInternalFp8 reduces nNodes slots into one bf16 output), and
+        # its T stays the combine dtype. Forcing scatter here made
+        # quant_type='fp8_direct_cast' unreachable on the internode path: the
+        # backend accepts it, then rejects the scatter this rule had just set.
+        if self.quant_type != "none" and not self.is_internode:
             self.combine_mode = "scatter"
         # Token copy moves whole 16 B (vec4) chunks; a non-16 B-aligned per-token
         # size would over-read/write a few dwords past the token.
