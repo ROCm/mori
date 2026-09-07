@@ -142,7 +142,12 @@ Non-obvious package roles:
   ionic firmware/QoS/DCQCN checks with `Invalid card handle`.
 - `sudo` — ionic/bnxt paths of `mori check`/`mori setup` invoke `nicctl`,
   `dcb`, `ethtool`, sysfs writes via `sudo`.
-- `perftest` — `ib_write_bw`/`ib_write_lat` for bandwidth/latency checks.
+- `perftest` — `ib_write_bw`/`ib_write_lat` for the bandwidth/latency checks
+  (steps 4/5/6). A perftest without ROCm support covers the host-memory mesh,
+  but the GPU-memory pass in step 5 needs a build with ROCm support
+  (`--use_rocm`). `mori check` never builds it — if a ROCm-capable perftest is
+  missing it warns and prints the build command, then skips the GPU-memory
+  pass. It is needed on the **peer** as well for steps 5/6.
 - `iproute2` — provides `dcb`, needed by `mori setup` on bnxt.
 - `libgrpc++-dev` + protobuf packages — build defaults to `BUILD_UMBP=ON`,
   whose CMake step needs gRPC headers. (`cmake`/`ninja`/`pybind11` come from
@@ -234,8 +239,9 @@ nicctl --version
 
 > **Recommended version**: for cross-node MORI (EP over RDMA / IBGDA), Broadcom firmware
 > is solid on `237.1.137.x` (official Broadcom release) and `235.2.86.x` (customer-specific
-> build). `231.x` is too old for IBGDA — if the host is on that branch, flag it to the user
-> and recommend upgrading. The userspace library (`libbnxt_re`, 3b.2) must match the kernel
+> build). Known bad: `231.x` and `232.x` — if the host is on either branch, flag it to the
+> user and recommend upgrading. Any other branch is unverified and treated the same way.
+> The userspace library (`libbnxt_re`, 3b.2) must match the kernel
 > driver version detected in 3b.1.
 
 The bnxt path of `mori check` / `mori setup` needs two NIC-specific pieces installed
@@ -266,7 +272,10 @@ https://packages.broadcom.com/artifactory/ethernet-nic-debian-public jammy main"
 apt-get update
 # pin to match the host bnxt_re version from 3b.1; list options: apt-cache madison bnxt-rocelib
 apt-get install -y ibverbs-utils bnxt-rocelib=235.2.86.0
-# mori check looks for libbnxt_re-<ver>.so under /usr/local/lib — make it visible there
+# Make the out-of-tree provider visible on a standard path. `mori check` also
+# accepts the rdma-core in-tree provider (libbnxt_re-rdmav<abi>.so under a
+# libibverbs dir) and honours $LD_LIBRARY_PATH, so this copy is only needed to
+# have the *Broadcom* build take precedence and get its version reported.
 cp /usr/local/lib/x86_64-linux-gnu/libbnxt_re* /usr/local/lib/.
 ldconfig
 '
@@ -515,14 +524,52 @@ sudo docker exec $CONTAINER_NAME bash -c "mori check"
 `mori check` validates the RDMA stack in 6 steps (vendor-specific variants,
 same intent):
 
-1. **firmware & driver** — versions consistent
+1. **firmware & driver** — versions consistent. Firmware that is not
+   known-good (below the IBGDA minimum, a known-bad or unverified branch, or
+   undetectable) **warns** rather than fails: the host-proxy backend
+   (`MORI_ENABLE_HOST_PROXY=1`) does cross-node RDMA without IBGDA, so only
+   IBGDA needs the minimum.
 2. **QoS / SL / TC** — PFC + lossless TC; selects SL/TC for MORI
 3. **DCQCN** — congestion control enabled on all RoCE devices
-4. **intra-node bandwidth** — `ib_write_bw` full mesh (needs `perftest`)
+4. **intra-node bandwidth** — `ib_write_bw` full mesh, host memory
+   (needs `perftest`)
 5. **inter-node bandwidth** — `ib_write_bw` to a peer: `mori check <peer_ip>`
 6. **inter-node latency** — `ib_write_lat` to a peer: same peer IP
 
 Steps 5/6 are skipped without a peer IP — run from both nodes to test cross-node connectivity.
+
+**GPU memory.** Only **Step 5 (inter-node bandwidth)** runs a GPU-memory pass;
+Steps 4 and 6 are host-memory only. Step 5 first runs the host-memory mesh
+(reachability across all NIC pairs), then a GPU pass (`--use_rocm`, each NIC on
+its PCIe-closest GPU) over the pairs host memory proved reachable, and finally a
+**serial pass over the rail-aligned pairs** (`local[i]` ↔ `remote[i]`) for the
+per-rail numbers that carry the bandwidth threshold. That diagonal is the path
+MORI actually transfers over, so a rail failing there while the host mesh passed
+points at GPUDirect rather than the fabric. GPU runs pay a HIP init per process,
+so their timeouts scale up automatically. If perftest lacks ROCm support or no
+GPU is visible, the GPU pass is skipped with a warning and the host mesh still
+runs; `--no-gpu-mem` forces host memory everywhere.
+
+**peer_mem vs dma-buf.** `--use_rocm` registers GPU memory with an ordinary
+`ibv_reg_mr`, which needs a peer-memory client in the kernel; `--use_rocm_dmabuf`
+registers via `ibv_reg_dmabuf_mr` and needs none. `mori check` picks between
+them by *trying* one tiny loopback transfer, then reports which it used
+(`... via peer_mem` / `... via dma-buf`).
+
+`mori check` never builds perftest — if a ROCm-capable one is missing it warns
+and skips the GPU pass. Build it once per node (or once on a shared `/home`):
+
+```bash
+sudo docker exec $CONTAINER_NAME bash -c '
+  git clone https://github.com/linux-rdma/perftest.git /tmp/perftest &&
+  cd /tmp/perftest && ./autogen.sh &&
+  ./configure --enable-rocm --enable-rocm-dmabuf --with-rocm=${ROCM_PATH:-/opt/rocm} &&
+  make -j && make install'
+```
+
+Drop `--enable-rocm-dmabuf` if `configure` rejects it on an older kernel/ROCm
+(peer_mem still works). The build needs `libtoolize` plus
+`git autoconf automake make gcc` and ibverbs headers.
 
 **mlx5 note:** native IB ports don't use PFC/DSCP/DCQCN (IB has its own
 credit-based flow control managed by the fabric SM) — steps 2/3 only run
