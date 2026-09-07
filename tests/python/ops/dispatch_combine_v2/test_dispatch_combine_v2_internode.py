@@ -141,7 +141,9 @@ _TRACE_SYNC = bool(os.environ.get("MORI_INTERNODE_TRACE_SYNC"))
 # Batch the N-pass launch through one ABI crossing (launch_multi). On by default;
 # set MORI_INTERNODE_BATCH_LAUNCH=0 to fall back to per-pass plan.launch, which
 # is the A/B control for measuring what the batch saves on the eager host path.
-_BATCH_LAUNCH = os.environ.get("MORI_INTERNODE_BATCH_LAUNCH", "1").strip().lower() not in (
+_BATCH_LAUNCH = os.environ.get(
+    "MORI_INTERNODE_BATCH_LAUNCH", "1"
+).strip().lower() not in (
     "",
     "0",
     "false",
@@ -367,7 +369,9 @@ def _install_jit_redirect():
                         torch.cuda.synchronize()
                         _trace(f"  synced {pass_name} ok")
                     except Exception as exc:
-                        _trace(f"  synced {pass_name} FAILED {type(exc).__name__}: {exc}")
+                        _trace(
+                            f"  synced {pass_name} FAILED {type(exc).__name__}: {exc}"
+                        )
                         raise
         else:
             # Fast path: one ABI crossing for the whole N-pass sequence. All passes
@@ -401,7 +405,11 @@ def _install_jit_redirect():
                 )
                 if geom is not None:
                     b, r, w = geom[_phase]
-                    kw["block_num"], kw["rdma_block_num"], kw["warp_per_block"] = b, r, w
+                    kw["block_num"], kw["rdma_block_num"], kw["warp_per_block"] = (
+                        b,
+                        r,
+                        w,
+                    )
             return _orig(self, input, *a, **kw)
 
         setattr(Op, name, wrapper)
@@ -929,7 +937,9 @@ if __name__ == "__main__":
     _real_spawn = torch.multiprocessing.spawn
 
     def _spawn(fn, args=(), nprocs=1, **kwargs):
-        return _real_spawn(_self._spawn_worker, args=(fn, args), nprocs=nprocs, **kwargs)
+        return _real_spawn(
+            _self._spawn_worker, args=(fn, args), nprocs=nprocs, **kwargs
+        )
 
     torch.multiprocessing.spawn = _spawn
 

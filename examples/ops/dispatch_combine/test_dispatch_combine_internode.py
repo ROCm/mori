@@ -107,7 +107,9 @@ _EP_WARMUP = int(os.environ.get("MORI_EP_WARMUP") or "20")
 # folds the barrier wait into the NEXT round's dispatch window (the dispatch/
 # combine share one boundary event), so DISPATCH numbers are meaningless in this
 # mode -- read only the combine distribution. Not for real perf numbers.
-_EP_PERROUND_SYNC = os.environ.get("MORI_EP_PERROUND_SYNC", "0").strip().lower() not in (
+_EP_PERROUND_SYNC = os.environ.get(
+    "MORI_EP_PERROUND_SYNC", "0"
+).strip().lower() not in (
     "",
     "0",
     "false",
@@ -1756,7 +1758,9 @@ class EpDispatchCombineTestCase:
                         comb_warp_per_block=warp,
                     )
                     all_data, ll_scale = self._all_gather_bench_data(bench_result)
-                    kept = all_data[_EP_DROP_ROUNDS:]  # skip cold leading rounds, same as bench
+                    kept = all_data[
+                        _EP_DROP_ROUNDS:
+                    ]  # skip cold leading rounds, same as bench
                     # kept: (rounds, world_size, 6)
                     # cols: d_rdma, d_xgmi, d_lat, c_rdma, c_xgmi, c_lat
 
@@ -1782,7 +1786,6 @@ class EpDispatchCombineTestCase:
                         sweep_records.append((cand, disp_stats, comb_stats))
 
                     if self.rank == 0:
-                        da, ca = disp_stats["xgmi"][2], comb_stats["xgmi"][2]
                         print(
                             f"  disp sel={disp_lat:.1f}us (std {disp_stats['lat_std']:.1f}) "
                             f"comb sel={comb_lat:.1f}us (std {comb_stats['lat_std']:.1f})  "
