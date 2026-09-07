@@ -43,6 +43,33 @@ without a QP.
 
 ``tools/run_internode_test.sh`` drives both ranks; the CLI below is the subset of
 the shmem harness's flags that means anything here.
+
+COMPARING AGAINST THE v1 BENCH
+------------------------------
+The reference numbers come from ``run_bench_once`` in
+``examples/ops/dispatch_combine/test_dispatch_combine_internode.py``, driven
+through v1's op. The timed loop here is structured the same way and reports the
+same three statistics, but the two harnesses do NOT build the same shape by
+default. Every difference found by reading both, and what to pass to close it:
+
+  what                     v1 bench          here (default)     to align
+  ----------------------   ---------------   ----------------   ------------------
+  combine weights          None (no fold)    None               (aligned)
+  num_experts_per_rank     256 // world      --experts-per-rank --experts-per-rank 16
+                                             = 32               at world 16
+  scale_dim                32                --scale-dim = 0    --scale-dim 32
+  scale_type_size          4                 4 when scale_dim   (aligned)
+  warmup / rounds / drop   20 / 30 / 1       same               (aligned)
+  routing                  randperm[:topk]   same               (aligned)
+  tokens per rank          max on every rank same               (aligned)
+  statistic                avg over          same               (aligned)
+                           rounds x ranks
+
+The two that move real work: the weight fold costs an extra peer read per
+(token, destination) plus an accumulate in three kernels and a wider staging slot,
+and v1's scale_dim=32 makes ITS dispatch carry 128 more bytes per token than a
+--scale-dim 0 run here. They push in opposite directions, so a comparison that
+leaves both unaligned is not bounded in either direction.
 """
 
 import argparse
@@ -117,6 +144,13 @@ def _parse_args(argv):
     p.add_argument("--num-qp", type=int, default=2)
     p.add_argument("--rounds", type=int, default=3)
     p.add_argument("--scale-dim", type=int, default=0)
+    # The v1 bench calls combine with weights=None, so it does not pay for the
+    # weight fold: an extra peer read per (token, destination) plus an accumulate
+    # in three kernels, and a wider staging slot (combXferBytes = hidden + weights).
+    # Off by default so a reading here is comparable to one from that harness;
+    # --bench-weights measures the fold when that is what you want. The
+    # correctness path always folds -- it is checking the weights.
+    p.add_argument("--bench-weights", action="store_true")
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--drop-rounds", type=int, default=1)
     # Diagnostic, matching _EP_PERROUND_SYNC in the examples harness. Re-aligns
@@ -188,9 +222,11 @@ def _bench(op, cfg, d, dev, a, comm):
     def convert(x):
         return x.to(cfg.combine_dtype) if cfg.is_asymmetric_dtype else x
 
+    cw = wts if a.bench_weights else None
+
     for _ in range(a.warmup):
         r = op.dispatch(inp, wts, None, idx, return_routing=True)
-        op.combine(convert(r[0]), wts, routing=r[5])
+        op.combine(convert(r[0]), cw, routing=r[5])
     torch.cuda.synchronize()
     comm.barrier()
 
@@ -203,7 +239,7 @@ def _bench(op, cfg, d, dev, a, comm):
         ev[3 * i + 1].record()
         x = convert(r[0])
         ev[3 * i + 2].record()
-        op.combine(x, wts, routing=r[5])
+        op.combine(x, cw, routing=r[5])
         ev[3 * i + 3].record()
         if a.per_round_sync:
             torch.cuda.synchronize()
@@ -228,7 +264,7 @@ def _bench(op, cfg, d, dev, a, comm):
         pr.enable()
         for _ in range(n):
             rp = op.dispatch(inp, wts, None, idx, return_routing=True)
-            op.combine(convert(rp[0]), wts, routing=rp[5])
+            op.combine(convert(rp[0]), cw, routing=rp[5])
         pr.disable()
         torch.cuda.synchronize()
         comm.barrier()
@@ -311,7 +347,7 @@ def main(argv):
             dispatch_data_type=dtype if combine_dtype is not None else None,
             combine_data_type=combine_dtype,
             scale_dim=a.scale_dim,
-            scale_type_size=1 if a.scale_dim else 0,
+            scale_type_size=4 if a.scale_dim else 0,
             quant_type=a.quant_type,
             gpu_per_node=gpu_per_node,
             num_qp_per_pe=a.num_qp,
