@@ -664,22 +664,35 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   }
   __syncthreads();
 
-  if (thdId == 0) atomicAdd(args.gridBarrier, 1u);
+  // Tickets on the arrival counter instead of a spin on it: every block draws
+  // one, the first arriver draws a second once its drain read is done, and the
+  // highest draw implies both preconditions of the signal store -- all blocks in
+  // (destPeTokenCounter is a complete sum) and the drain observed.
+  constexpr unsigned kNoTicket = ~0u;
+  unsigned arriveTicket = 0;
+  if (thdId == 0) arriveTicket = atomicAdd(args.gridBarrier, 1u);
   index_t* recvTokenNums = EpLocal<index_t>(win, args.offRecvNum);
-  if (globalWarpId == 0) {
-    // Drain the destination's signal slot BEFORE spinning on the grid barrier.
-    // That read is against uncached peer memory, so it costs a full fabric round
-    // trip even though the slot has long been zero, and its address depends only
-    // on destPe -- nothing about it needs the barrier satisfied. Issuing it while
-    // the barrier is still spinning is what hides the round trip; done after, it
-    // sits fully exposed on the critical path. Same trick as v1's 1250x body.
-    // The wire format is untouched: both are pure spin-waits that write nothing,
-    // and the signal store below still happens after both.
+  if (warpId == 0) arriveTicket = (unsigned)__shfl((int)arriveTicket, 0);
+  const bool isFirstArriver = (warpId == 0) && (arriveTicket == 0u);
+
+  // The drain read belongs to the first arriver because it is uncached peer
+  // memory -- a full fabric round trip even when the slot has long been zero --
+  // and its address depends only on destPe, so it needs nothing the barrier gives.
+  unsigned drainTicket = kNoTicket;
+  if (isFirstArriver) {
     for (int destPe = laneId; destPe < npes; destPe += WS)
       EpWaitEq(EpPeer<index_t>(win, destPe, args.offRecvNum) + myPe, (index_t)0);
-    // Grid barrier hoisted before the peer loop so wide EP (worldSize > waveSize)
-    // multi-iterates safely — the barrier is consumed and reset exactly once.
-    EpWaitEq(args.gridBarrier, static_cast<unsigned int>(gridDim.x));
+    __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    if (laneId == 0) drainTicket = atomicAdd(args.gridBarrier, 1u);
+    drainTicket = (unsigned)__shfl((int)drainTicket, 0);
+  }
+
+  // atomicAdd returns the pre-increment value, so the gridDim.x + 1 draws read
+  // 0 .. gridDim.x: the highest ticket, not the counter's final value.
+  const unsigned kHighestTicket = static_cast<unsigned>(gridDim.x);
+  const bool holdsHighestTicket =
+      (warpId == 0) && (arriveTicket == kHighestTicket || drainTicket == kHighestTicket);
+  if (holdsHighestTicket) {
     __hip_atomic_store(args.gridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 
     for (int destPe = laneId; destPe < npes; destPe += WS) {
@@ -689,16 +702,23 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
                                1;
       __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
       __hip_atomic_store(signal, numTokenSignal, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      // Cleared here, not in the inbound loop: that runs on another block now,
+      // and a peer signalling this rank says nothing about whether this rank has
+      // read its own send counts yet.
+      args.destPeTokenCounter[destPe] = 0;
     }
   }
-  if (globalWarpId == 0) {
+  // Inbound rides the first arriver so it is already parked when the peers'
+  // signals land. It cannot simply move above the outbound store on the same
+  // warp: this rank would wait on a peer that is waiting on this rank, with
+  // neither having sent. Separate tickets are what break that cycle.
+  if (isFirstArriver) {
     index_t myRecv = 0;
     for (int srcPe = laneId; srcPe < npes; srcPe += WS) {
       index_t* signal = recvTokenNums + srcPe;
       index_t recvTokenNum = EpWaitGt(signal, 0) - 1;
       __hip_atomic_store(signal, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
       myRecv += recvTokenNum;
-      args.destPeTokenCounter[srcPe] = 0;
     }
     for (int off = WS / 2; off > 0; off >>= 1) myRecv += __shfl_down(myRecv, off, WS);
     if (laneId == 0) {
