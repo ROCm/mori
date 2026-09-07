@@ -83,8 +83,10 @@ class Index {
   void TouchLRU(const std::string& key);
   void RemoveLRU(const std::string& key);
 
+  // Reserves aligned space for one record.  `crc_valid` false records that the
+  // writer skipped checksumming, so readers know not to verify `crc32`.
   bool PrepareWrite(const std::string& key, size_t size, size_t key_len, uint32_t crc32, Meta* seg,
-                    WriteReservation* out);
+                    WriteReservation* out, bool crc_valid = true);
   void RollbackWrite(const WriteReservation& reservation);
   void RecordRecoveredEntry(const std::string& key, const KeyMeta& meta);
   bool EraseKey(const std::string& key);

@@ -32,12 +32,9 @@
 #include <thread>
 #include <vector>
 
-#include "umbp/distributed/peer/peer_dram_allocator.h"
-#include "umbp/distributed/peer/peer_ssd_manager.h"
-#include "umbp/distributed/peer/ssd_copy_pipeline.h"
-#include "umbp/local/block_index/local_block_index.h"
-#include "umbp/local/tiers/copy_pipeline.h"
-#include "umbp/local/tiers/local_storage_manager.h"
+#include "umbp/distributed/peer/backend/page_backend.h"
+#include "umbp/distributed/peer/ssd/peer_ssd_manager.h"
+#include "umbp/distributed/peer/ssd/ssd_copy_pipeline.h"
 
 namespace mori::umbp {
 namespace {
@@ -47,7 +44,7 @@ namespace fs = std::filesystem;
 constexpr uint64_t kPageSize = 1024;
 
 // Concatenate a pin's segments into one buffer for content comparison.
-std::string Concat(const PeerDramAllocator::DramCopyPin& pin) {
+std::string Concat(const PageBackend::DramCopyPin& pin) {
   std::string out;
   for (const auto& [ptr, len] : pin.segments) {
     out.append(static_cast<const char*>(ptr), len);
@@ -55,42 +52,40 @@ std::string Concat(const PeerDramAllocator::DramCopyPin& pin) {
   return out;
 }
 
-// ---- DramCopyPin unit tests (direct on PeerDramAllocator) -------------------
+// ---- DramCopyPin unit tests (direct on PageBackend) -------------------
 
 class DramCopyPinTest : public ::testing::Test {
  protected:
   void SetUp() override {
     backing_.assign(kPageSize * 8, 0);
-    PeerDramAllocator::TierConfig dram;
+    PageBackend::TierConfig dram;
     dram.buffer_sizes = {kPageSize * 8};
     dram.buffer_descs = {{0x01, 0x02}};
     dram.buffer_bases = {backing_.data()};
-    dram_ = std::make_unique<PeerDramAllocator>(kPageSize, std::move(dram),
-                                                PeerDramAllocator::TierConfig{},
-                                                /*pending_ttl=*/std::chrono::milliseconds{5000},
-                                                /*read_lease_ttl=*/std::chrono::milliseconds{0});
+    dram_ = std::make_unique<PageBackend>(TierType::DRAM, kPageSize, std::move(dram),
+                                          /*pending_ttl=*/std::chrono::milliseconds{5000},
+                                          /*read_lease_ttl=*/std::chrono::milliseconds{0});
   }
 
   // Allocate, write `value` into its pages, commit.  Backing memory is owned
   // by the test, so we resolve pages -> offset exactly like the real writer.
   void PutLocal(const std::string& key, const std::string& value) {
-    auto res = dram_->Allocate(key, value.size(), TierType::DRAM);
-    ASSERT_EQ(res.outcome, PeerDramAllocator::Outcome::kSuccessAllocated);
-    const auto& slot = *res.slot;
+    auto res = dram_->Allocate(key, value.size());
+    ASSERT_EQ(res.outcome, AllocateOutcome::kSuccessAllocated);
     size_t off = 0;
-    for (const auto& p : slot.pages) {
+    for (const auto& p : res.pages) {
       const size_t bytes = std::min<size_t>(kPageSize, value.size() - off);
       std::memcpy(backing_.data() + static_cast<size_t>(p.page_index) * kPageSize,
                   value.data() + off, bytes);
       off += bytes;
     }
     uint64_t committed = 0;
-    ASSERT_TRUE(dram_->Commit(slot.slot_id, key, committed));
+    ASSERT_TRUE(dram_->Commit(res.slot_id, key, committed));
     ASSERT_EQ(committed, value.size());
   }
 
   std::vector<char> backing_;
-  std::unique_ptr<PeerDramAllocator> dram_;
+  std::unique_ptr<PageBackend> dram_;
 };
 
 TEST_F(DramCopyPinTest, AcquireResolvesSegmentsToCommittedBytes) {
@@ -143,28 +138,27 @@ TEST_F(DramCopyPinTest, EvictBlockedWhilePinnedThenAllowedAfterRelease) {
 TEST(DramCopyPinNonContiguous, SegmentsSpanMultipleBuffers) {
   // Two 1-page buffers force a cross-buffer page set for a 2-page key.
   std::vector<char> b0(kPageSize, 0), b1(kPageSize, 0);
-  PeerDramAllocator::TierConfig dram;
+  PageBackend::TierConfig dram;
   dram.buffer_sizes = {kPageSize, kPageSize};
   dram.buffer_descs = {{0x01}, {0x02}};
   dram.buffer_bases = {b0.data(), b1.data()};
-  PeerDramAllocator alloc(kPageSize, std::move(dram), PeerDramAllocator::TierConfig{},
-                          std::chrono::milliseconds{5000}, std::chrono::milliseconds{0});
+  PageBackend alloc(TierType::DRAM, kPageSize, std::move(dram), std::chrono::milliseconds{5000},
+                    std::chrono::milliseconds{0});
 
   const std::string value(kPageSize + 5, 'Q');
-  auto res = alloc.Allocate("k", value.size(), TierType::DRAM);
-  ASSERT_EQ(res.outcome, PeerDramAllocator::Outcome::kSuccessAllocated);
-  const auto& slot = *res.slot;
-  ASSERT_EQ(slot.pages.size(), 2u);
+  auto res = alloc.Allocate("k", value.size());
+  ASSERT_EQ(res.outcome, AllocateOutcome::kSuccessAllocated);
+  ASSERT_EQ(res.pages.size(), 2u);
   std::vector<char*> bases = {b0.data(), b1.data()};
   size_t off = 0;
-  for (const auto& p : slot.pages) {
+  for (const auto& p : res.pages) {
     const size_t bytes = std::min<size_t>(kPageSize, value.size() - off);
     std::memcpy(bases[p.buffer_index] + static_cast<size_t>(p.page_index) * kPageSize,
                 value.data() + off, bytes);
     off += bytes;
   }
   uint64_t committed = 0;
-  ASSERT_TRUE(alloc.Commit(slot.slot_id, "k", committed));
+  ASSERT_TRUE(alloc.Commit(res.slot_id, "k", committed));
 
   auto pin = alloc.AcquireDramCopyPin("k");
   ASSERT_TRUE(pin.has_value());
@@ -184,13 +178,13 @@ class SsdCopyPipelineTest : public ::testing::Test {
     fs::remove_all(dir_);
 
     backing_.assign(kPageSize * 16, 0);
-    PeerDramAllocator::TierConfig dram;
+    PageBackend::TierConfig dram;
     dram.buffer_sizes = {kPageSize * 16};
     dram.buffer_descs = {{0x01}};
     dram.buffer_bases = {backing_.data()};
-    dram_ = std::make_unique<PeerDramAllocator>(
-        kPageSize, std::move(dram), PeerDramAllocator::TierConfig{},
-        std::chrono::milliseconds{5000}, std::chrono::milliseconds{0});
+    dram_ = std::make_unique<PageBackend>(TierType::DRAM, kPageSize, std::move(dram),
+                                          std::chrono::milliseconds{5000},
+                                          std::chrono::milliseconds{0});
 
     PeerSsdConfig ssd_cfg;
     ssd_cfg.enabled = true;
@@ -207,18 +201,17 @@ class SsdCopyPipelineTest : public ::testing::Test {
   }
 
   void PutLocal(const std::string& key, const std::string& value) {
-    auto res = dram_->Allocate(key, value.size(), TierType::DRAM);
-    ASSERT_EQ(res.outcome, PeerDramAllocator::Outcome::kSuccessAllocated);
-    const auto& slot = *res.slot;
+    auto res = dram_->Allocate(key, value.size());
+    ASSERT_EQ(res.outcome, AllocateOutcome::kSuccessAllocated);
     size_t off = 0;
-    for (const auto& p : slot.pages) {
+    for (const auto& p : res.pages) {
       const size_t bytes = std::min<size_t>(kPageSize, value.size() - off);
       std::memcpy(backing_.data() + static_cast<size_t>(p.page_index) * kPageSize,
                   value.data() + off, bytes);
       off += bytes;
     }
     uint64_t committed = 0;
-    ASSERT_TRUE(dram_->Commit(slot.slot_id, key, committed));
+    ASSERT_TRUE(dram_->Commit(res.slot_id, key, committed));
   }
 
   bool WaitForSsd(const std::string& key, std::chrono::milliseconds timeout) {
@@ -232,7 +225,7 @@ class SsdCopyPipelineTest : public ::testing::Test {
 
   fs::path dir_;
   std::vector<char> backing_;
-  std::unique_ptr<PeerDramAllocator> dram_;
+  std::unique_ptr<PageBackend> dram_;
   std::unique_ptr<PeerSsdManager> ssd_;
 };
 
@@ -339,34 +332,5 @@ TEST_F(SsdCopyPipelineTest, QuiesceThenClearLeavesNoStaleSsdState) {
 
   pipeline.Stop();
 }
-
-TEST(LocalCopyPipelineDrainTest, DrainWaitsForQueuedCopies) {
-  UMBPConfig cfg;
-  cfg.role = UMBPRole::SharedSSDLeader;
-  cfg.force_ssd_copy_on_write = true;
-  cfg.dram.capacity_bytes = 1 << 20;
-  cfg.ssd.enabled = true;
-  cfg.ssd.ssd_backend = "dummy_storage";
-  cfg.ssd.capacity_bytes = 1 << 20;
-  cfg.copy_pipeline.async_enabled = true;
-  cfg.copy_pipeline.worker_threads = 1;
-  cfg.copy_pipeline.queue_depth = 8;
-
-  LocalBlockIndex index;
-  LocalStorageManager storage(cfg, &index);
-  CopyPipeline pipeline(storage, cfg.copy_pipeline, cfg.ResolveRole());
-
-  std::string payload = "copy-pipeline-drain";
-  ASSERT_TRUE(
-      storage.WriteFromPtr("k", reinterpret_cast<uintptr_t>(payload.data()), payload.size()));
-  index.Insert("k", {StorageTier::CPU_DRAM, 0, payload.size()});
-
-  ASSERT_TRUE(pipeline.MaybeCopyToSharedSSD("k"));
-  EXPECT_TRUE(pipeline.Drain(std::chrono::seconds(2)));
-  auto* ssd = storage.GetTier(StorageTier::LOCAL_SSD);
-  ASSERT_NE(ssd, nullptr);
-  EXPECT_TRUE(ssd->Exists("k"));
-}
-
 }  // namespace
 }  // namespace mori::umbp

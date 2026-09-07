@@ -36,6 +36,17 @@ struct KeyMeta {
   uint32_t size = 0;
   uint32_t crc32 = 0;
   uint64_t generation = 0;
+  // Bytes this record actually occupies in the segment, i.e. `size` plus the
+  // header, key and v3 alignment padding.  Capacity is accounted in these rather
+  // than in `size` so a store of small values cannot overrun capacity_bytes on
+  // disk: padding rounds every record up to a kRecordAlign multiple, which for a
+  // 4 KiB value is 2x its size (and for the multi-MiB KV pages this tier
+  // normally holds, under 0.1%).
+  uint32_t disk_bytes = 0;
+  // False for records written with checksumming disabled (kFlagNoCrc).  Readers
+  // must skip verification for those regardless of their own verify_crc setting,
+  // otherwise every such key reads back as corrupt.
+  bool crc_valid = true;
 };
 
 struct Meta {

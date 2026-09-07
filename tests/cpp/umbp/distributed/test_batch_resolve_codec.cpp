@@ -49,10 +49,10 @@ BufferMemoryDescBytes MakeDesc(uint32_t buffer_index, const std::string& bytes) 
   return d;
 }
 
-// A representative batch: 4 keys mixing found / not-found, varying page counts
+// A representative batch mixing found / not-found / busy, varying page counts
 // (including a found-but-zero-page key), and several tiers.
 std::vector<ResolvedKeyEntry> SampleEntries() {
-  std::vector<ResolvedKeyEntry> entries(4);
+  std::vector<ResolvedKeyEntry> entries(5);
 
   entries[0].found = true;
   entries[0].tier = TierType::HBM;
@@ -71,11 +71,15 @@ std::vector<ResolvedKeyEntry> SampleEntries() {
   entries[3].size = 0;  // found but zero pages (degenerate but legal)
   entries[3].pages = {};
 
+  entries[4].outcome = ResolveOutcome::kBusy;
+  entries[4].tier = TierType::SSD;
+
   return entries;
 }
 
 void ExpectKeyMatches(const ResolvedKeyEntry& src, const DecodedResolveKey& dec) {
   EXPECT_EQ(src.found, dec.found);
+  EXPECT_EQ(src.found ? ResolveOutcome::kFound : src.outcome, dec.outcome);
   if (!src.found) return;
   EXPECT_EQ(src.tier, dec.tier);
   EXPECT_EQ(src.size, dec.size);
@@ -177,6 +181,23 @@ TEST(BatchResolveCodec, EmptyBatch) {
   DecodedBatchResolve decoded = DecodeBatchResolveResponse(resp);
   EXPECT_TRUE(decoded.keys.empty());
   EXPECT_EQ(decoded.page_size, 4096u);
+}
+
+TEST(BatchResolveCodec, DecodesLegacyFoundOnlyResponse) {
+  ::umbp::BatchResolveKeysResponse resp;
+  resp.set_page_size(4096);
+  resp.add_found(true);
+  resp.add_tier(::umbp::TIER_DRAM);
+  resp.add_size(4096);
+  resp.add_page_count(1);
+  resp.add_backend_id(0);
+  resp.add_buffer_index(0);
+  resp.add_page_index(7);
+
+  DecodedBatchResolve decoded = DecodeBatchResolveResponse(resp);
+  ASSERT_EQ(decoded.keys.size(), 1u);
+  EXPECT_TRUE(decoded.keys[0].found);
+  EXPECT_EQ(decoded.keys[0].outcome, ResolveOutcome::kFound);
 }
 
 TEST(BatchResolveCodec, MalformedMismatchedArraysRejected) {

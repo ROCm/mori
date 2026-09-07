@@ -36,11 +36,28 @@ struct TierCapabilities {
   bool zero_copy_read = false;
   bool batch_write = false;
   bool batch_read = false;
+  // Whether ReadBatchRangesIntoPtr is really implemented.  The base class
+  // provides an all-false default, which is indistinguishable from "every key
+  // missed"; callers route on this flag instead so an unsupported tier falls
+  // through to another one rather than reporting a phantom miss.
+  bool ranged_read = false;
 };
 
-// Abstract base class for storage tier backends (DRAM, SSD, NVM, ...).
+// Physical location of a value inside a segment file, for a zero-copy reader
+// (GdsEngine) that DMAs the bytes itself with hipFileRead instead of asking the
+// tier to copy them.  Only the segment-file SSD tiers can answer; every other
+// tier reports "no stable file location".
+struct RecordLocation {
+  int fd = -1;                 // O_DIRECT segment descriptor
+  uint64_t value_offset = 0;   // 4 KiB-aligned start of the value in the file
+  uint64_t readable_size = 0;  // 4 KiB-aligned padded length safe to read
+  uint64_t value_size = 0;     // logical value length (<= readable_size)
+  bool direct_io = false;      // fd is O_DIRECT — a hipFile fastpath precondition
+};
+
+// Abstract base class for storage tier backends (SSD, SPDK, ...).
 // All tiers share a common interface for write/read/evict; tier-specific
-// extensions (e.g., DRAMTier::ReadPtr) live in the concrete subclass.
+// extensions (e.g. SSDTier::direct_io_active) live in the concrete subclass.
 class TierBackend {
  public:
   virtual ~TierBackend() = default;
@@ -85,6 +102,10 @@ class TierBackend {
   virtual std::vector<bool> ReadBatchIntoPtr(const std::vector<std::string>& keys,
                                              const std::vector<uintptr_t>& dst_ptrs,
                                              const std::vector<size_t>& sizes);
+  virtual std::vector<bool> ReadBatchRangesIntoPtr(
+      const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dst_ptrs,
+      const std::vector<std::vector<size_t>>& sizes,
+      const std::vector<std::vector<size_t>>& src_offsets);
 
   // Return the LRU key, or empty string if empty.
   // Default returns "". Override in tiers with LRU tracking.
@@ -99,6 +120,11 @@ class TierBackend {
   virtual std::vector<bool> BatchWrite(const std::vector<std::string>& keys,
                                        const std::vector<const void*>& data_ptrs,
                                        const std::vector<size_t>& sizes);
+  virtual std::vector<bool> BatchWriteRanges(const std::vector<std::string>& keys,
+                                             const std::vector<size_t>& object_sizes,
+                                             const std::vector<std::vector<const void*>>& src_ptrs,
+                                             const std::vector<std::vector<size_t>>& sizes,
+                                             const std::vector<std::vector<size_t>>& dst_offsets);
 
   // Batch read into user pointers. Default loops over ReadIntoPtr().
   virtual std::vector<bool> BatchReadIntoPtr(const std::vector<std::string>& keys,
@@ -117,6 +143,15 @@ class TierBackend {
   // Return an opaque location identifier for a previously written key.
   // Callers prepend the store index before publishing to the Master.
   virtual std::optional<std::string> GetLocationId(const std::string& key) const;
+
+  // Physical location of |key|'s value for a zero-copy reader that DMAs it
+  // itself (GdsEngine).  Default: no stable file location — only the
+  // segment-file SSD tiers override it.  Read-only: acquires no lock the caller
+  // must hold and does not touch LRU, so a Resolve can call it without
+  // perturbing recency.
+  virtual std::optional<RecordLocation> LocateRecord(const std::string& /*key*/) const {
+    return std::nullopt;
+  }
 
   // Which StorageTier does this backend represent?
   StorageTier tier_id() const { return tier_id_; }

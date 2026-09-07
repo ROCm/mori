@@ -23,19 +23,20 @@
 
 #include <grpcpp/grpcpp.h>
 
-#include <algorithm>
 #include <chrono>
-#include <cstring>
+#include <limits>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/env_time.h"
+#include "umbp/common/grpc_limits.h"
 #include "umbp/distributed/master/master_client.h"
 #include "umbp/distributed/master/master_metrics.h"
+#include "umbp/distributed/peer/backend/medium_backend.h"
 #include "umbp/distributed/peer/batch_resolve_codec.h"
-#include "umbp/distributed/peer/peer_dram_allocator.h"
-#include "umbp/distributed/peer/peer_ssd_manager.h"
-#include "umbp/distributed/peer/ssd_copy_pipeline.h"
+#include "umbp/distributed/pool/peer_pool.h"
 #include "umbp/distributed/types.h"
 #include "umbp_peer.grpc.pb.h"
 
@@ -48,58 +49,6 @@ std::chrono::seconds GrpcShutdownDeadline() {
       GetEnvSeconds("UMBP_GRPC_SHUTDOWN_DEADLINE_SEC", std::chrono::seconds(3), /*min_allowed=*/1);
   return v;
 }
-
-// Free -> Preparing -> Leased.  Preparing slots (IO in flight) are never
-// reclaimed, so a slow IO can't have its slot reassigned mid-write.  The TTL is
-// anchored at request receipt (leased_at = received_at, set on promotion) to
-// align the peer's reclaim point (received_at + ttl) with the reader's deadline
-// (t_send + ttl, t_send < received_at).  A reader trusting bytes from a slot
-// reclaimed mid-use is prevented by Preparing (IO safety) + the reader's own
-// lease gating (see ssd_read_lease.h).
-enum class SlotState { kFree, kPreparing, kLeased };
-
-struct StagingSlot {
-  SlotState state = SlotState::kFree;
-  uint64_t lease_id = 0;
-  size_t allocated_size = 0;
-  std::chrono::steady_clock::time_point leased_at;  // valid only while kLeased
-};
-
-// Reclaim TTL-expired leased slots, then claim a free one as Preparing (TTL not
-// yet started) and return its index, or -1 if none free.
-int ClaimStagingSlot(std::vector<StagingSlot>& slots, std::atomic<uint64_t>& next_lease_id,
-                     std::chrono::milliseconds lease_timeout, StagingMetrics& metrics) {
-  auto now = std::chrono::steady_clock::now();
-  for (auto& slot : slots) {
-    if (slot.state == SlotState::kLeased && now - slot.leased_at > lease_timeout) {
-      metrics.expired_reclaims.fetch_add(1, std::memory_order_relaxed);
-      MORI_UMBP_WARN("[PeerService] Reclaiming expired slot (lease_id={})", slot.lease_id);
-      slot.state = SlotState::kFree;
-    }
-  }
-  for (auto& slot : slots) {
-    if (slot.state == SlotState::kFree) {
-      slot.state = SlotState::kPreparing;
-      slot.lease_id = next_lease_id.fetch_add(1, std::memory_order_relaxed);
-      slot.allocated_size = 0;
-      return static_cast<int>(&slot - &slots[0]);
-    }
-  }
-  return -1;
-}
-
-bool ReleaseSlotByLeaseId(std::vector<StagingSlot>& slots, uint64_t lease_id) {
-  for (auto& slot : slots) {
-    if (slot.state == SlotState::kLeased && slot.lease_id == lease_id) {
-      slot.state = SlotState::kFree;
-      return true;
-    }
-  }
-  return false;
-}
-}  // namespace
-
-namespace {
 
 // Translate proto TierType <-> umbp::TierType.  Defined inline because
 // only the peer service handlers need them.
@@ -115,52 +64,56 @@ TierType FromProtoTier(::umbp::TierType t) {
       return TierType::UNKNOWN;
   }
 }
-::umbp::TierType ToProtoTier(TierType t) {
-  switch (t) {
-    case TierType::HBM:
-      return ::umbp::TIER_HBM;
-    case TierType::DRAM:
-      return ::umbp::TIER_DRAM;
-    case TierType::SSD:
-      return ::umbp::TIER_SSD;
-    default:
-      return ::umbp::TIER_UNKNOWN;
-  }
-}
 
-// Map a PeerSsdManager read outcome (data-level: ok/not_found/size/error) to the
-// wire status.  NO_SLOT is a staging-layer concern owned by the peer service,
-// not PeerSsdManager, and is set directly by the handler.  Lease expiry is not
-// a wire status: the reader decides it locally and the peer reclaims by TTL.
-::umbp::SsdReadStatus ToProtoReadStatus(SsdReadStatus s) {
-  switch (s) {
-    case SsdReadStatus::kOk:
-      return ::umbp::SSD_READ_OK;
-    case SsdReadStatus::kNotFound:
-      return ::umbp::SSD_READ_NOT_FOUND;
-    case SsdReadStatus::kSizeTooLarge:
-      return ::umbp::SSD_READ_SIZE_TOO_LARGE;
-    case SsdReadStatus::kError:
-      return ::umbp::SSD_READ_ERROR;
-  }
-  return ::umbp::SSD_READ_ERROR;
+// ---------------------------------------------------------------------------
+//  Slot-id backend tagging
+//
+//  Commit / Abort carry only a slot_id — the proto has no tier field on them,
+//  and umbp_peer.proto documents the id as "opaque; echoed back by Commit /
+//  Abort".  Every backend numbers its own slots from 1 independently, so a bare
+//  id is ambiguous the moment a second medium is live.
+//
+//  So the peer service tags the backend instance id into the high byte on the
+//  way out and strips it on the way back in.  TierType is not sufficient: a
+//  topology may contain ssd_a and ssd_b.  The tag is peer-local — PoolClient's
+//  local fast path talks to a backend directly and never sees a tagged id.
+//
+//  next_slot_id_ is a per-backend counter starting at 1, so the low 56 bits
+//  cannot reach the tag in any realistic process lifetime.
+// ---------------------------------------------------------------------------
+constexpr int kSlotBackendShift = 56;
+constexpr uint64_t kSlotLocalMask = (1ULL << kSlotBackendShift) - 1;
+
+uint64_t TagSlotId(uint32_t backend_id, uint64_t local_id) {
+  return (static_cast<uint64_t>(backend_id) << kSlotBackendShift) | (local_id & kSlotLocalMask);
 }
+uint32_t BackendIdFromSlotId(uint64_t tagged) {
+  return static_cast<uint32_t>(tagged >> kSlotBackendShift);
+}
+uint64_t LocalSlotId(uint64_t tagged) { return tagged & kSlotLocalMask; }
 
 // Drop a (pages, page_size, descs) tuple into a slot-shaped response
 // that exposes those fields directly.  Templated so the same body
 // covers AllocateSlotResponse and ResolveKeyResponse.
+//
+// `backend_id` is stamped here rather than inside the backend: a backend
+// numbers its buffers from 0 and knows nothing of its siblings, so the owning
+// backend is a fact only this boundary has.  See BufferMemoryDesc in
+// umbp.proto.
 template <typename Response>
 void FillPagesAndDescs(Response* resp, const std::vector<PageLocation>& pages, uint64_t page_size,
-                       const std::vector<BufferMemoryDescBytes>& descs) {
+                       const std::vector<BufferMemoryDescBytes>& descs, uint32_t backend_id) {
   for (const auto& p : pages) {
     auto* pl = resp->add_pages();
     pl->set_buffer_index(p.buffer_index);
     pl->set_page_index(p.page_index);
   }
   resp->set_page_size(page_size);
+  resp->set_backend_id(backend_id);
   for (const auto& d : descs) {
     auto* desc = resp->add_descs();
     desc->set_buffer_index(d.buffer_index);
+    desc->set_backend_id(backend_id);
     desc->set_desc(std::string(d.desc_bytes.begin(), d.desc_bytes.end()));
   }
 }
@@ -169,142 +122,53 @@ void FillPagesAndDescs(Response* resp, const std::vector<PageLocation>& pages, u
 
 class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Service {
  public:
-  UMBPPeerServiceImpl(void* ssd_staging_base, size_t ssd_staging_size,
-                      const std::vector<uint8_t>& ssd_staging_mem_desc_bytes,
-                      PeerSsdManager* peer_ssd, PeerDramAllocator* dram_alloc,
-                      MasterClient* master_client, StagingMetrics& metrics, int num_read_slots,
-                      std::chrono::milliseconds lease_timeout,
-                      const std::vector<uint8_t>& engine_desc_bytes, SsdCopyPipeline* copy_pipeline)
-      : ssd_staging_base_(ssd_staging_base),
-        ssd_staging_size_(ssd_staging_size),
-        ssd_staging_mem_desc_bytes_(ssd_staging_mem_desc_bytes),
-        peer_ssd_(peer_ssd),
-        dram_alloc_(dram_alloc),
-        copy_pipeline_(copy_pipeline),
+  UMBPPeerServiceImpl(PeerPool* pool, MasterClient* master_client,
+                      const std::vector<uint8_t>& engine_desc_bytes)
+      : pool_(pool),
+        registry_(pool == nullptr ? nullptr : pool->Backends()),
+        // All() allocates, and Resolve is the hot read path — so the medium
+        // list is snapshotted once here rather than rebuilt per RPC.  This is
+        // why the registry MUST be fully populated before the peer service is
+        // constructed (PoolClient::Init registers every backend first, then
+        // starts this server).
+        media_(registry_ == nullptr ? std::vector<MediumBackend*>{} : registry_->All()),
         engine_desc_bytes_(engine_desc_bytes),
-        metrics_(metrics),
-        lease_timeout_(std::max(lease_timeout, std::chrono::milliseconds{1})),
-        num_read_slots_(std::max(num_read_slots, 1)),
-        // The whole staging buffer is the read region now: the lower half used
-        // to be direct-put write staging, removed in the SSD-tier redesign and
-        // reclaimed here so reads get more / larger slots.
-        read_region_base_(0),
-        read_slot_size_(ssd_staging_size / static_cast<size_t>(std::max(num_read_slots, 1))),
-        read_slots_(std::max(num_read_slots, 1)),
-        master_client_(master_client) {
-    if (num_read_slots <= 0) {
-      MORI_UMBP_ERROR("[PeerService] num_read_slots={} invalid, clamped to 1", num_read_slots);
-    }
-  }
+        master_client_(master_client) {}
 
   grpc::Status GetPeerInfo(grpc::ServerContext* /*context*/,
                            const ::umbp::GetPeerInfoRequest* /*request*/,
                            ::umbp::GetPeerInfoResponse* response) override {
-    response->set_ssd_staging_mem_desc(
-        std::string(ssd_staging_mem_desc_bytes_.begin(), ssd_staging_mem_desc_bytes_.end()));
-    response->set_ssd_staging_size(ssd_staging_size_);
     if (!engine_desc_bytes_.empty()) {
       response->set_engine_desc(std::string(engine_desc_bytes_.begin(), engine_desc_bytes_.end()));
     }
-    if (dram_alloc_ != nullptr) {
-      // Ship every configured DRAM/HBM buffer's desc so first-contact
-      // writers can hydrate without a follow-up Allocate / Resolve.
-      // DRAM and HBM share a single page_size in this design, so the
-      // single field on the response is sufficient.
-      auto dram_descs = dram_alloc_->AllBufferDescs(TierType::DRAM);
-      auto hbm_descs = dram_alloc_->AllBufferDescs(TierType::HBM);
-      for (const auto& d : dram_descs) {
-        auto* out = response->add_dram_memory_descs();
+    // Ship EVERY backend's buffer descs so first-contact writers can hydrate
+    // without a follow-up Allocate / Resolve.
+    //
+    // This used to publish one medium and log an error about the rest, because
+    // the wire carried a flat buffer_index space with no way to say which
+    // backend an index belonged to.  That was not merely incomplete: the reader
+    // caches descriptors by index and asks the peer to omit them once it
+    // believes it has them (BatchResolveKeysRequest.omit_descs), so an
+    // unadvertised medium's pages were resolved against the advertised
+    // medium's memory — a hit, with bytes from the wrong pool.  Every backend
+    // publishes exactly one buffer today, so index 0 collided on every
+    // mixed-media node and the corruption was deterministic.
+    //
+    // BufferMemoryDesc.backend_id closes it.  buffer_index stays backend-local
+    // and no backend changed; the id is stamped here, at the boundary that
+    // knows it.
+    for (auto* backend : Media()) {
+      const uint32_t backend_id = registry_->BackendId(backend);
+      for (const auto& d : backend->AllBufferDescs()) {
+        auto* out = response->add_buffer_descs();
+        out->set_backend_id(backend_id);
         out->set_buffer_index(d.buffer_index);
         out->set_desc(std::string(d.desc_bytes.begin(), d.desc_bytes.end()));
       }
-      for (const auto& d : hbm_descs) {
-        auto* out = response->add_dram_memory_descs();
-        out->set_buffer_index(d.buffer_index);
-        out->set_desc(std::string(d.desc_bytes.begin(), d.desc_bytes.end()));
-      }
-      response->set_dram_page_size(dram_alloc_->PageSize());
     }
-    return grpc::Status::OK;
-  }
-
-  // ---- SSD read staging: PrepareSsdRead + ReleaseSsdLease ----
-  // Key-based: claim a slot -> PeerSsdManager::PrepareRead fills it -> reader
-  // RDMAs the bytes out of the published staging buffer -> best-effort release.
-  grpc::Status PrepareSsdRead(grpc::ServerContext* /*context*/,
-                              const ::umbp::PrepareSsdReadRequest* request,
-                              ::umbp::PrepareSsdReadResponse* response) override {
-    if (!SsdRpcAvailable()) {
-      response->set_status(::umbp::SSD_READ_ERROR);
-      return grpc::Status::OK;
-    }
-
-    // Anchor the lease TTL at request receipt (see SlotState comment): the slot
-    // is promoted to Leased with this timestamp once the IO completes, so the
-    // peer's reclaim point stays aligned with the reader's t_send-based
-    // deadline rather than starting only after the (variable) SSD IO.
-    const auto received_at = std::chrono::steady_clock::now();
-
-    // Claim a slot first (Preparing — not yet TTL-tracked).  NO_SLOT is a
-    // transient/retryable condition, not a miss.
-    int slot_idx;
-    uint64_t offset, lease_id;
-    {
-      std::lock_guard<std::mutex> lock(read_slots_mutex_);
-      slot_idx = ClaimStagingSlot(read_slots_, next_lease_id_, lease_timeout_, metrics_);
-      if (slot_idx < 0) {
-        metrics_.slot_full_rejects.fetch_add(1, std::memory_order_relaxed);
-        MORI_UMBP_WARN("[PeerService] PrepareSsdRead: no free staging slots");
-        response->set_status(::umbp::SSD_READ_NO_SLOT);
-        return grpc::Status::OK;
-      }
-      offset = read_region_base_ + static_cast<uint64_t>(slot_idx) * read_slot_size_;
-      lease_id = read_slots_[slot_idx].lease_id;
-    }
-
-    // Cap the read at min(reader capacity, slot size); PrepareRead rejects an
-    // over-cap key BEFORE doing any SSD IO, so an oversized key costs no read.
-    void* dst = static_cast<uint8_t*>(ssd_staging_base_) + offset;
-    size_t cap = std::min<uint64_t>(request->max_size(), read_slot_size_);
-    SsdReadOutcome outcome = peer_ssd_->PrepareRead(request->key(), dst, cap);
-
-    if (outcome.status != SsdReadStatus::kOk) {
-      std::lock_guard<std::mutex> lock(read_slots_mutex_);
-      read_slots_[slot_idx].state = SlotState::kFree;  // give the slot straight back
-      response->set_status(ToProtoReadStatus(outcome.status));
-      response->set_size(outcome.size);
-      return grpc::Status::OK;
-    }
-
-    // Data is in the slot: promote Preparing -> Leased with the request-receipt
-    // TTL anchor (leased_at = received_at).
-    {
-      std::lock_guard<std::mutex> lock(read_slots_mutex_);
-      auto& slot = read_slots_[slot_idx];
-      slot.state = SlotState::kLeased;
-      slot.leased_at = received_at;
-      slot.allocated_size = outcome.size;
-    }
-    response->set_status(::umbp::SSD_READ_OK);
-    response->set_staging_offset(offset);
-    response->set_size(outcome.size);
-    response->set_lease_id(lease_id);
-    response->set_lease_ttl_ms(static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(lease_timeout_).count()));
-    MORI_UMBP_DEBUG(
-        "[PeerService] PrepareSsdRead: key={}, slot={}, offset={}, size={}, lease_id={}",
-        request->key(), slot_idx, offset, outcome.size, lease_id);
-    return grpc::Status::OK;
-  }
-
-  grpc::Status ReleaseSsdLease(grpc::ServerContext* /*context*/,
-                               const ::umbp::ReleaseSsdLeaseRequest* request,
-                               ::umbp::ReleaseSsdLeaseResponse* response) override {
-    // Best-effort fast release; correctness does not depend on it (the slot is
-    // also reclaimed by the lease TTL).  Returns false only when the lease is
-    // already gone (released earlier or TTL-reclaimed).
-    std::lock_guard<std::mutex> lock(read_slots_mutex_);
-    response->set_success(ReleaseSlotByLeaseId(read_slots_, request->lease_id()));
+    // Uniform across backends; BackendRegistry::Register refuses a backend that
+    // disagrees, so there is one page size to report.
+    if (registry_ != nullptr) response->set_page_size(registry_->PageSize());
     return grpc::Status::OK;
   }
 
@@ -312,91 +176,108 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
   //  DRAM/HBM allocator + key map (master-as-advisor design)
   // ============================================================
 
+  // The single-key RPCs below are served by one-element batches (design doc §3)
+  // — there is no separate single-key path on MediumBackend to keep in sync.
+
   grpc::Status AllocateSlot(grpc::ServerContext* /*ctx*/,
                             const ::umbp::AllocateSlotRequest* request,
                             ::umbp::AllocateSlotResponse* response) override {
-    if (dram_alloc_ == nullptr) {
+    if (pool_ == nullptr) {
       response->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_FAILED);
       return grpc::Status::OK;
     }
-    auto result =
-        dram_alloc_->Allocate(request->key(), request->size(), FromProtoTier(request->tier()));
+    PoolPlacementRequest entry;
+    entry.key = request->key();
+    entry.size = request->size();
+    entry.tier = FromProtoTier(request->tier());
+    entry.backend_name = request->backend_name();
+    entry.logical_tier = request->logical_tier();
+    auto pool_result = pool_->BatchAllocate({entry}).front();
+    auto* backend = Backend(pool_result.backend_id);
+    const auto& result = pool_result.allocation;
     switch (result.outcome) {
-      case PeerDramAllocator::Outcome::kSuccessAlreadyExists:
+      case AllocateOutcome::kSuccessAlreadyExists:
         response->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALREADY_EXISTS);
         return grpc::Status::OK;
-      case PeerDramAllocator::Outcome::kFailed:
+      case AllocateOutcome::kFailed:
         response->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_FAILED);
         return grpc::Status::OK;
-      case PeerDramAllocator::Outcome::kFailedNoSpace:
+      case AllocateOutcome::kFailedNoSpace:
         response->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_FAILED_NO_SPACE);
         return grpc::Status::OK;
-      case PeerDramAllocator::Outcome::kSuccessAllocated:
+      case AllocateOutcome::kSuccessAllocated:
         break;
     }
-    const auto& pending = *result.slot;
-    auto descs = dram_alloc_->BufferDescsForPages(pending.tier, pending.pages);
+    if (backend == nullptr) {
+      response->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_FAILED);
+      return grpc::Status::OK;
+    }
     response->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
-    response->set_slot_id(pending.slot_id);
-    FillPagesAndDescs(response, pending.pages, dram_alloc_->PageSize(), descs);
-    response->set_pending_ttl_ms(dram_alloc_->PendingTtlMs());
+    response->set_slot_id(TagSlotId(pool_result.backend_id, result.slot_id));
+    FillPagesAndDescs(response, result.pages, result.page_size, result.descs,
+                      pool_result.backend_id);
+    response->set_pending_ttl_ms(result.pending_ttl_ms);
     return grpc::Status::OK;
   }
 
   grpc::Status CommitSlot(grpc::ServerContext* /*ctx*/, const ::umbp::CommitSlotRequest* request,
                           ::umbp::CommitSlotResponse* response) override {
-    if (dram_alloc_ == nullptr) {
+    if (pool_ == nullptr) {
       response->set_success(false);
       return grpc::Status::OK;
     }
-    uint64_t committed_bytes = 0;
-    const bool ok = dram_alloc_->Commit(request->slot_id(), request->key(), committed_bytes);
-    response->set_success(ok);
-    if (ok) {
-      RecordInboundPut(committed_bytes, "remote");
-      EnqueueSsdCopy(request->key(), committed_bytes);
+    PoolCommitRequest entry;
+    entry.slot.backend_id = BackendIdFromSlotId(request->slot_id());
+    entry.slot.local_slot_id = LocalSlotId(request->slot_id());
+    entry.key = request->key();
+    const auto result = pool_->BatchCommit({entry}).front().commit;
+    response->set_success(result.success);
+    if (result.success) {
+      RecordInboundPut(result.bytes_committed, "remote");
     }
     return grpc::Status::OK;
   }
 
   grpc::Status AbortSlot(grpc::ServerContext* /*ctx*/, const ::umbp::AbortSlotRequest* request,
                          ::umbp::AbortSlotResponse* response) override {
-    if (dram_alloc_ == nullptr) {
+    if (pool_ == nullptr) {
       response->set_success(true);  // idempotent: nothing to drop
       return grpc::Status::OK;
     }
-    response->set_success(dram_alloc_->Abort(request->slot_id()));
+    PoolSlotRef slot{BackendIdFromSlotId(request->slot_id()), LocalSlotId(request->slot_id())};
+    auto results = pool_->BatchAbort({slot});
+    response->set_success(results.front());
     return grpc::Status::OK;
   }
 
   grpc::Status ResolveKey(grpc::ServerContext* /*ctx*/, const ::umbp::ResolveKeyRequest* request,
                           ::umbp::ResolveKeyResponse* response) override {
-    if (dram_alloc_ == nullptr) {
-      response->set_found(false);
-      return grpc::Status::OK;
-    }
-    auto r = dram_alloc_->Resolve(request->key());
-    response->set_found(r.found);
-    if (!r.found) return grpc::Status::OK;
-    auto descs = dram_alloc_->BufferDescsForPages(r.tier, r.pages);
-    FillPagesAndDescs(response, r.pages, dram_alloc_->PageSize(), descs);
-    response->set_size(r.size);
-    RecordInboundGet(r.size, "remote");
+    if (pool_ == nullptr) return grpc::Status::OK;
+    auto result = pool_->BatchResolve({request->key()}, /*include_descs=*/true).front();
+    if (!result.resolved.found) return grpc::Status::OK;
+    response->set_found(true);
+    FillPagesAndDescs(response, result.resolved.pages, result.resolved.page_size,
+                      result.resolved.descs, result.backend_id);
+    response->set_size(result.resolved.size);
+    RecordInboundGet(result.resolved.size, "remote");
     return grpc::Status::OK;
   }
 
   grpc::Status EvictKey(grpc::ServerContext* /*ctx*/, const ::umbp::EvictKeyRequest* request,
                         ::umbp::EvictKeyResponse* response) override {
-    if (dram_alloc_ == nullptr) {
-      // No DRAM/HBM tier on this peer — nothing to evict, treat as success.
-      return grpc::Status::OK;
-    }
+    // Eviction carries no tier either.  Master drives this to reclaim capacity
+    // it measured per (node, tier), so the pool is free to demote where a tier
+    // configures on_evict offload; otherwise a key mirrored across media is
+    // dropped from ALL of them.  Either way the freed bytes are summed per key
+    // — master sizes its next eviction round off this total.
     std::vector<std::string> keys(request->keys().begin(), request->keys().end());
-    auto results = dram_alloc_->Evict(keys);
-    for (const auto& r : results) {
+    if (keys.empty()) return grpc::Status::OK;
+    auto evicted =
+        pool_ == nullptr ? std::vector<EvictResult>{} : pool_->Evict(keys, PoolEvictMode::kReclaim);
+    for (size_t i = 0; i < keys.size(); ++i) {
       auto* entry = response->add_evicted();
-      entry->set_key(r.key);
-      entry->set_bytes_freed(r.bytes_freed);
+      entry->set_key(keys[i]);
+      entry->set_bytes_freed(i < evicted.size() ? evicted[i].bytes_freed : 0);
     }
     return grpc::Status::OK;
   }
@@ -406,45 +287,44 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
   grpc::Status BatchAllocateSlots(grpc::ServerContext* /*ctx*/,
                                   const ::umbp::BatchAllocateSlotsRequest* request,
                                   ::umbp::BatchAllocateSlotsResponse* response) override {
-    if (dram_alloc_ == nullptr) {
-      for (int i = 0; i < request->entries_size(); ++i) {
-        auto* out = response->add_entries();
-        out->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_FAILED);
-      }
-      return grpc::Status::OK;
+    const int n = request->entries_size();
+    for (int i = 0; i < n; ++i) {
+      response->add_entries()->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_FAILED);
     }
+    if (pool_ == nullptr) return grpc::Status::OK;
 
-    std::vector<PeerDramAllocator::AllocateRequest> entries;
-    entries.reserve(request->entries_size());
-    for (const auto& entry : request->entries()) {
-      PeerDramAllocator::AllocateRequest alloc_entry;
-      alloc_entry.key = entry.key();
-      alloc_entry.size = entry.size();
-      alloc_entry.tier = FromProtoTier(entry.tier());
-      entries.push_back(std::move(alloc_entry));
+    std::vector<PoolPlacementRequest> entries;
+    entries.reserve(n);
+    for (int i = 0; i < n; ++i) {
+      PoolPlacementRequest entry;
+      entry.key = request->entries(i).key();
+      entry.size = request->entries(i).size();
+      entry.tier = FromProtoTier(request->entries(i).tier());
+      entry.backend_name = request->entries(i).backend_name();
+      entry.logical_tier = request->entries(i).logical_tier();
+      entries.push_back(std::move(entry));
     }
-
-    auto results = dram_alloc_->BatchAllocate(entries);
-    for (const auto& result : results) {
-      auto* out = response->add_entries();
+    auto results = pool_->BatchAllocate(entries);
+    for (size_t i = 0; i < results.size() && i < static_cast<size_t>(n); ++i) {
+      const auto& result = results[i].allocation;
+      auto* out = response->mutable_entries(static_cast<int>(i));
       switch (result.outcome) {
-        case PeerDramAllocator::Outcome::kSuccessAlreadyExists:
+        case AllocateOutcome::kSuccessAlreadyExists:
           out->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALREADY_EXISTS);
           continue;
-        case PeerDramAllocator::Outcome::kFailed:
+        case AllocateOutcome::kFailed:
           out->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_FAILED);
           continue;
-        case PeerDramAllocator::Outcome::kFailedNoSpace:
+        case AllocateOutcome::kFailedNoSpace:
           out->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_FAILED_NO_SPACE);
           continue;
-        case PeerDramAllocator::Outcome::kSuccessAllocated:
+        case AllocateOutcome::kSuccessAllocated:
           break;
       }
-      const auto& pending = *result.slot;
       out->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
-      out->set_slot_id(pending.slot_id);
-      FillPagesAndDescs(out, pending.pages, dram_alloc_->PageSize(), result.descs);
-      out->set_pending_ttl_ms(dram_alloc_->PendingTtlMs());
+      out->set_slot_id(TagSlotId(results[i].backend_id, result.slot_id));
+      FillPagesAndDescs(out, result.pages, result.page_size, result.descs, results[i].backend_id);
+      out->set_pending_ttl_ms(result.pending_ttl_ms);
     }
     return grpc::Status::OK;
   }
@@ -452,29 +332,25 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
   grpc::Status BatchCommitSlots(grpc::ServerContext* /*ctx*/,
                                 const ::umbp::BatchCommitSlotsRequest* request,
                                 ::umbp::BatchCommitSlotsResponse* response) override {
-    if (dram_alloc_ == nullptr) {
-      for (int i = 0; i < request->entries_size(); ++i) response->add_success(false);
-      return grpc::Status::OK;
+    const int n = request->entries_size();
+    for (int i = 0; i < n; ++i) response->add_success(false);
+    if (pool_ == nullptr) return grpc::Status::OK;
+
+    std::vector<PoolCommitRequest> entries;
+    entries.reserve(n);
+    for (int i = 0; i < n; ++i) {
+      PoolCommitRequest entry;
+      entry.slot.backend_id = BackendIdFromSlotId(request->entries(i).slot_id());
+      entry.slot.local_slot_id = LocalSlotId(request->entries(i).slot_id());
+      entry.key = request->entries(i).key();
+      entries.push_back(std::move(entry));
     }
 
-    std::vector<PeerDramAllocator::CommitRequest> entries;
-    entries.reserve(request->entries_size());
-    for (const auto& entry : request->entries()) {
-      PeerDramAllocator::CommitRequest commit_entry;
-      commit_entry.slot_id = entry.slot_id();
-      commit_entry.key = entry.key();
-      entries.push_back(std::move(commit_entry));
-    }
-
-    auto results = dram_alloc_->BatchCommit(entries);
     uint64_t total_committed = 0;
-    for (size_t i = 0; i < results.size(); ++i) {
-      const auto& result = results[i];
-      response->add_success(result.success);
-      if (result.success) {
-        total_committed += result.bytes_committed;
-        EnqueueSsdCopy(entries[i].key, result.bytes_committed);
-      }
+    auto results = pool_->BatchCommit(entries);
+    for (size_t i = 0; i < results.size() && i < static_cast<size_t>(n); ++i) {
+      response->set_success(static_cast<int>(i), results[i].commit.success);
+      if (results[i].commit.success) total_committed += results[i].commit.bytes_committed;
     }
     if (total_committed > 0) RecordInboundPut(total_committed, "remote");
     return grpc::Status::OK;
@@ -483,15 +359,22 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
   grpc::Status BatchAbortSlots(grpc::ServerContext* /*ctx*/,
                                const ::umbp::BatchAbortSlotsRequest* request,
                                ::umbp::BatchAbortSlotsResponse* response) override {
-    if (dram_alloc_ == nullptr) {
-      for (int i = 0; i < request->slot_ids_size(); ++i) response->add_success(true);
-      return grpc::Status::OK;
+    const int n = request->slot_ids_size();
+    // Abort is idempotent: an unknown slot (including one whose backend is no
+    // longer live) reports true — there is nothing left to drop.
+    for (int i = 0; i < n; ++i) response->add_success(true);
+    if (pool_ == nullptr) return grpc::Status::OK;
+
+    std::vector<PoolSlotRef> slots;
+    slots.reserve(n);
+    for (int i = 0; i < n; ++i) {
+      slots.push_back(PoolSlotRef{BackendIdFromSlotId(request->slot_ids(i)),
+                                  LocalSlotId(request->slot_ids(i))});
     }
 
-    std::vector<uint64_t> slot_ids(request->slot_ids().begin(), request->slot_ids().end());
-    auto results = dram_alloc_->BatchAbort(slot_ids);
-    for (bool ok : results) {
-      response->add_success(ok);
+    auto results = pool_->BatchAbort(slots);
+    for (size_t i = 0; i < results.size() && i < static_cast<size_t>(n); ++i) {
+      response->set_success(static_cast<int>(i), results[i]);
     }
     return grpc::Status::OK;
   }
@@ -499,61 +382,62 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
   grpc::Status BatchResolveKeys(grpc::ServerContext* /*ctx*/,
                                 const ::umbp::BatchResolveKeysRequest* request,
                                 ::umbp::BatchResolveKeysResponse* response) override {
-    if (dram_alloc_ == nullptr) {
-      std::vector<ResolvedKeyEntry> misses(request->keys_size());
-      EncodeBatchResolveResponse(misses, /*page_size=*/0, /*descs=*/{}, response);
-      return grpc::Status::OK;
-    }
     // The client can suppress descs entirely via omit_descs when it already
-    // hydrated them from GetPeerInfo — skip BuildBufferDescsLocked for the
-    // whole batch in that case rather than computing and discarding it.
+    // hydrated them from GetPeerInfo — skip building them for the whole batch
+    // in that case rather than computing and discarding them.
     const bool omit_descs = request->omit_descs();
     std::vector<std::string> keys(request->keys().begin(), request->keys().end());
-    auto resolved = dram_alloc_->BatchResolve(keys, /*include_descs=*/!omit_descs);
 
-    // Project to the encoder's host shape and deduplicate the buffer
-    // descriptors once for the whole batch (their bytes are identical across
-    // keys for a given buffer_index).
-    std::vector<ResolvedKeyEntry> entries;
-    entries.reserve(resolved.size());
+    std::vector<ResolvedKeyEntry> entries(keys.size());
     std::vector<BufferMemoryDescBytes> batch_descs;
-    std::vector<bool> desc_seen;  // indexed by buffer_index
+    std::vector<std::vector<bool>> desc_seen(BackendRegistry::kMaxBackends);
     uint64_t total_bytes = 0;
-    for (auto& r : resolved) {
-      ResolvedKeyEntry e;
-      e.found = r.found;
-      if (r.found) {
-        e.tier = r.tier;
-        e.size = r.size;
-        e.pages = std::move(r.pages);
-        total_bytes += r.size;
-        if (!omit_descs) {
-          for (const auto& d : r.descs) {
-            if (d.buffer_index >= desc_seen.size()) desc_seen.resize(d.buffer_index + 1, false);
-            if (desc_seen[d.buffer_index]) continue;
-            desc_seen[d.buffer_index] = true;
-            batch_descs.push_back(d);
-          }
-        }
+    auto resolved = pool_ == nullptr ? std::vector<PoolResolvedEntry>{}
+                                     : pool_->BatchResolve(keys, /*include_descs=*/!omit_descs);
+    for (size_t i = 0; i < resolved.size() && i < entries.size(); ++i) {
+      auto& result = resolved[i];
+      auto& r = result.resolved;
+      entries[i].outcome = EffectiveResolveOutcome(r);
+      if (result.backend_id < BackendRegistry::kMaxBackends) {
+        entries[i].tier = result.tier;
+        entries[i].backend_id = result.backend_id;
       }
-      entries.push_back(std::move(e));
+      if (!r.found || result.backend_id >= BackendRegistry::kMaxBackends) continue;
+      entries[i].found = true;
+      entries[i].outcome = ResolveOutcome::kFound;
+      entries[i].tier = result.tier;
+      entries[i].backend_id = result.backend_id;
+      entries[i].size = r.size;
+      entries[i].pages = std::move(r.pages);
+      total_bytes += r.size;
+
+      if (omit_descs) continue;
+      auto& seen = desc_seen[result.backend_id];
+      for (auto& d : r.descs) {
+        if (d.buffer_index >= seen.size()) seen.resize(d.buffer_index + 1, false);
+        if (seen[d.buffer_index]) continue;
+        seen[d.buffer_index] = true;
+        d.backend_id = result.backend_id;
+        batch_descs.push_back(std::move(d));
+      }
     }
-    EncodeBatchResolveResponse(entries, dram_alloc_->PageSize(), batch_descs, response);
+
+    // Page size is uniform across backends (BackendRegistry::Register), so a
+    // batch spanning media still has one to report.
+    EncodeBatchResolveResponse(entries, registry_ == nullptr ? 0 : registry_->PageSize(),
+                               batch_descs, response);
     RecordInboundGet(total_bytes, "remote");
     return grpc::Status::OK;
   }
 
  private:
-  bool SsdRpcAvailable() const {
-    return peer_ssd_ != nullptr && ssd_staging_base_ != nullptr && ssd_staging_size_ > 0;
+  MediumBackend* Backend(uint32_t backend_id) const {
+    return registry_ == nullptr ? nullptr : registry_->Get(backend_id);
   }
 
-  // Best-effort enqueue of an async SSD copy after a successful DRAM commit.
-  // No-op when SSD is disabled; never blocks (a full/stopped queue drops).
-  void EnqueueSsdCopy(const std::string& key, uint64_t bytes) {
-    if (copy_pipeline_ == nullptr) return;
-    copy_pipeline_->Enqueue(SsdCopyTask{key, TierType::DRAM, static_cast<size_t>(bytes)});
-  }
+  // Every backend on this peer, snapshotted at construction for bootstrap
+  // descriptor publication. Placement/read order lives in PoolPolicy.
+  const std::vector<MediumBackend*>& Media() const { return media_; }
 
   void RecordInboundPut(uint64_t bytes, const char* traffic) {
     if (master_client_ == nullptr || bytes == 0) return;
@@ -571,69 +455,72 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
                                static_cast<double>(bytes));
   }
 
-  void* ssd_staging_base_;
-  size_t ssd_staging_size_;
-  const std::vector<uint8_t>& ssd_staging_mem_desc_bytes_;
-  PeerSsdManager* peer_ssd_;
-  PeerDramAllocator* dram_alloc_;
-  SsdCopyPipeline* copy_pipeline_;
-  MasterClient* master_client_;
+  PeerPool* pool_;
+  BackendRegistry* registry_;
+  const std::vector<MediumBackend*> media_;
   const std::vector<uint8_t>& engine_desc_bytes_;
-  StagingMetrics& metrics_;
-
-  const std::chrono::milliseconds lease_timeout_;
-  const int num_read_slots_;
-  const uint64_t read_region_base_;
-  const size_t read_slot_size_;
-
-  std::mutex read_slots_mutex_;
-  std::vector<StagingSlot> read_slots_;
-  std::atomic<uint64_t> next_lease_id_{1};
-
- public:
-  // SSD read staging slots currently busy (Preparing or Leased).  Sampled once
-  // per metrics flush by PoolClient's provider; a brief lock + small scan
-  // (num_read_slots, default 16) — not a busy loop.
-  size_t ReadSlotsInUse() {
-    std::lock_guard<std::mutex> lock(read_slots_mutex_);
-    size_t in_use = 0;
-    for (const auto& slot : read_slots_) {
-      if (slot.state != SlotState::kFree) ++in_use;
-    }
-    return in_use;
-  }
+  MasterClient* master_client_;
 };
 
-PeerServiceServer::PeerServiceServer(PeerDramAllocator* dram_alloc, PeerSsdManager* peer_ssd,
-                                     void* ssd_staging_base, size_t ssd_staging_size,
-                                     std::vector<uint8_t> ssd_staging_mem_desc_bytes,
-                                     int num_read_slots, std::chrono::milliseconds lease_timeout,
-                                     std::vector<uint8_t> engine_desc_bytes,
-                                     MasterClient* master_client, SsdCopyPipeline* copy_pipeline)
-    : ssd_staging_base_(ssd_staging_base),
-      ssd_staging_size_(ssd_staging_size),
-      peer_ssd_(peer_ssd),
-      dram_alloc_(dram_alloc),
+PeerServiceServer::PeerServiceServer(PeerPool& pool, std::vector<uint8_t> engine_desc_bytes,
+                                     MasterClient* master_client)
+    : pool_(&pool),
       master_client_(master_client),
-      copy_pipeline_(copy_pipeline),
-      ssd_staging_mem_desc_bytes_(std::move(ssd_staging_mem_desc_bytes)),
       engine_desc_bytes_(std::move(engine_desc_bytes)) {
-  service_ = std::make_unique<UMBPPeerServiceImpl>(
-      ssd_staging_base_, ssd_staging_size_, ssd_staging_mem_desc_bytes_, peer_ssd_, dram_alloc_,
-      master_client_, metrics_, num_read_slots, lease_timeout, engine_desc_bytes_, copy_pipeline_);
+  service_ = std::make_unique<UMBPPeerServiceImpl>(pool_, master_client_, engine_desc_bytes_);
+}
+
+PeerServiceServer::PeerServiceServer(BackendRegistry* registry,
+                                     std::vector<uint8_t> engine_desc_bytes,
+                                     MasterClient* master_client)
+    : owned_pool_(registry == nullptr
+                      ? nullptr
+                      : std::make_unique<PeerPool>(registry, MakeSingleBackendPolicy())),
+      pool_(owned_pool_.get()),
+      master_client_(master_client),
+      engine_desc_bytes_(std::move(engine_desc_bytes)) {
+  service_ = std::make_unique<UMBPPeerServiceImpl>(pool_, master_client_, engine_desc_bytes_);
 }
 
 PeerServiceServer::~PeerServiceServer() { Stop(); }
-
-size_t PeerServiceServer::SnapshotReadSlotsInUse() const {
-  return service_ ? service_->ReadSlotsInUse() : 0;
-}
 
 bool PeerServiceServer::Start(uint16_t port) {
   std::string address = "0.0.0.0:" + std::to_string(port);
 
   grpc::ServerBuilder builder;
-  builder.AddListeningPort(address, grpc::InsecureServerCredentials());
+  ApplyGrpcLimits(&builder);
+  // gRPC turns SO_REUSEPORT ON by default for TCP servers on Linux, which means
+  // a SECOND server binding this same port SUCCEEDS and the kernel then splits
+  // incoming connections between the two.  For a peer service that is never
+  // right: a client dialing this address would be answered, some fraction of
+  // the time, by a different process's peer service with different backends
+  // registered — a wrong answer rather than a connection error.  It also made
+  // the "port may be in use" check below dead code, since BuildAndStart could
+  // not fail that way.  Exactly one peer service owns a port.
+  builder.AddChannelArgument(GRPC_ARG_ALLOW_REUSEPORT, 0);
+
+  // gRPC's default sync poller pool is small, and every peer RPC that stages
+  // SSD bytes occupies one of those threads for the whole device read.  On a
+  // loopback read (reader and owner are the same node) the default pool is the
+  // binding constraint rather than the drive — the same head-of-line blocking
+  // the master server widens its pool for.  Tunable for large deployments.
+  {
+    auto env_pollers = [](const char* name, int def) -> int {
+      const char* v = std::getenv(name);
+      if (v == nullptr) return def;
+      char* end = nullptr;
+      long n = std::strtol(v, &end, 10);
+      return (end == v || n <= 0) ? def : static_cast<int>(n);
+    };
+    const int min_pollers = env_pollers("UMBP_PEER_MIN_POLLERS", 8);
+    int max_pollers = env_pollers("UMBP_PEER_MAX_POLLERS", 64);
+    if (max_pollers < min_pollers) max_pollers = min_pollers;
+    builder.SetSyncServerOption(grpc::ServerBuilder::SyncServerOption::MIN_POLLERS, min_pollers);
+    builder.SetSyncServerOption(grpc::ServerBuilder::SyncServerOption::MAX_POLLERS, max_pollers);
+  }
+
+  int selected_port = 0;
+  builder.AddListeningPort(address, grpc::InsecureServerCredentials(), &selected_port);
   builder.RegisterService(service_.get());
   server_ = builder.BuildAndStart();
 
@@ -641,7 +528,15 @@ bool PeerServiceServer::Start(uint16_t port) {
     MORI_UMBP_ERROR("[PeerService] Failed to start on {} (port may be in use)", address);
     return false;
   }
-  MORI_UMBP_INFO("[PeerService] Listening on {}", address);
+  if (selected_port <= 0 || selected_port > std::numeric_limits<uint16_t>::max()) {
+    MORI_UMBP_ERROR("[PeerService] invalid selected port {} for {}", selected_port, address);
+    server_->Shutdown();
+    server_->Wait();
+    server_.reset();
+    return false;
+  }
+  bound_port_ = static_cast<uint16_t>(selected_port);
+  MORI_UMBP_INFO("[PeerService] Listening on 0.0.0.0:{}", bound_port_);
   return true;
 }
 
@@ -652,10 +547,11 @@ void PeerServiceServer::Stop() {
     server_->Shutdown(deadline);
     // Block until every in-flight handler has returned (Shutdown's deadline
     // force-cancels any that overrun).  This guarantees no RPC handler is still
-    // touching borrowed state (dram_alloc_ / copy_pipeline_) after Stop()
-    // returns, so PoolClient can safely tear those down next.
+    // touching borrowed state (pool_ and its backends) after Stop()
+    // returns, so PoolClient can safely tear it down next.
     server_->Wait();
     server_.reset();
+    bound_port_ = 0;
   }
 }
 

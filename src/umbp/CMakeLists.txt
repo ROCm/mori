@@ -91,22 +91,22 @@ endif()
 
 # Core static library
 set(UMBP_CORE_SRCS
-    local/block_index/local_block_index.cpp
+    common/device_copy.cpp
     storage/io/storage_io_driver.cpp
     storage/io/posix_storage_io_driver.cpp
     storage/io/io_uring_storage_io_driver.cpp
-    local/tiers/copy_pipeline.cpp
     local/tiers/segment/segment_format.cpp
     local/tiers/segment/segment_index.cpp
     local/tiers/segment/segment_scanner.cpp
     local/tiers/segment/segment_writer.cpp
     local/tiers/tier_backend.cpp
-    local/tiers/dram_tier.cpp
+    local/tiers/host_registration.cpp
+    local/tiers/device_gather.hip
     local/host_mem_allocator.cpp
     local/tiers/ssd_tier.cpp
+    local/tiers/sharded_ssd_tier.cpp
+    local/tiers/ssd_backend_factory.cpp
     local/tiers/dummy_ssd_tier.cpp
-    local/tiers/local_storage_manager.cpp
-    local/standalone_client.cpp
     storage/spdk/offset_allocator.cpp)
 
 # SPDK Proxy client (shared memory IPC, no SPDK dependency — Linux only)
@@ -123,6 +123,10 @@ endif()
 add_library(umbp_core STATIC ${UMBP_CORE_SRCS})
 target_include_directories(umbp_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(umbp_core PRIVATE pthread)
+# The tiers register their regions for GPU access and gather scattered copies
+# in a kernel, so the core library needs the HIP runtime. PUBLIC because no
+# tier header exposes HIP types but device_gather.hip is linked in.
+target_link_libraries(umbp_core PUBLIC hip::host)
 if(UNIX)
   target_link_libraries(umbp_core PRIVATE rt)
 endif()
@@ -255,6 +259,18 @@ elseif(NOT _PROTOBUF_MM)
   message(FATAL_ERROR "[UMBP] cannot determine libprotobuf header version.")
 endif()
 
+# umbp_peer.proto declares a proto3 `optional` field. protoc only accepts that
+# behind an opt-in flag before 3.15, and Dockerfile.dev still pins Ubuntu
+# jammy's 3.12.
+set(_PROTOC_PROTO3_OPTIONAL_ARGS)
+if(_PROTOC_MM VERSION_LESS "3.15")
+  list(APPEND _PROTOC_PROTO3_OPTIONAL_ARGS --experimental_allow_proto3_optional)
+  message(
+    STATUS
+      "[UMBP] protoc ${_PROTOC_MM} < 3.15 — enabling --experimental_allow_proto3_optional"
+  )
+endif()
+
 message(
   STATUS "[UMBP] gRPC + Protobuf found — distributed control plane ENABLED")
 
@@ -264,6 +280,7 @@ set(UMBP_PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/distributed/proto")
 set(UMBP_PROTO_FILE "${UMBP_PROTO_DIR}/umbp.proto")
 set(UMBP_PEER_PROTO_FILE "${UMBP_PROTO_DIR}/umbp_peer.proto")
 set(UMBP_STANDALONE_PROTO_FILE "${UMBP_PROTO_DIR}/umbp_standalone.proto")
+set(UMBP_WORKLOAD_PROTO_FILE "${UMBP_PROTO_DIR}/umbp_workload.proto")
 set(UMBP_PROTO_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/proto_gen")
 file(MAKE_DIRECTORY ${UMBP_PROTO_GEN_DIR})
 
@@ -282,13 +299,17 @@ set(UMBP_STANDALONE_PROTO_HDRS "${UMBP_PROTO_GEN_DIR}/umbp_standalone.pb.h")
 set(UMBP_STANDALONE_GRPC_SRCS "${UMBP_PROTO_GEN_DIR}/umbp_standalone.grpc.pb.cc")
 set(UMBP_STANDALONE_GRPC_HDRS "${UMBP_PROTO_GEN_DIR}/umbp_standalone.grpc.pb.h")
 
+set(UMBP_WORKLOAD_PROTO_SRCS "${UMBP_PROTO_GEN_DIR}/umbp_workload.pb.cc")
+set(UMBP_WORKLOAD_PROTO_HDRS "${UMBP_PROTO_GEN_DIR}/umbp_workload.pb.h")
+
 add_custom_command(
   OUTPUT ${UMBP_PROTO_SRCS} ${UMBP_PROTO_HDRS} ${UMBP_GRPC_SRCS}
          ${UMBP_GRPC_HDRS}
   COMMAND
     ${_PROTOBUF_PROTOC} --proto_path=${UMBP_PROTO_DIR}
     --cpp_out=${UMBP_PROTO_GEN_DIR} --grpc_out=${UMBP_PROTO_GEN_DIR}
-    --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN} ${UMBP_PROTO_FILE}
+    --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN}
+    ${_PROTOC_PROTO3_OPTIONAL_ARGS} ${UMBP_PROTO_FILE}
   DEPENDS ${UMBP_PROTO_FILE}
   COMMENT "Generating UMBP protobuf/gRPC C++ sources"
   VERBATIM)
@@ -299,7 +320,8 @@ add_custom_command(
   COMMAND
     ${_PROTOBUF_PROTOC} --proto_path=${UMBP_PROTO_DIR}
     --cpp_out=${UMBP_PROTO_GEN_DIR} --grpc_out=${UMBP_PROTO_GEN_DIR}
-    --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN} ${UMBP_PEER_PROTO_FILE}
+    --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN}
+    ${_PROTOC_PROTO3_OPTIONAL_ARGS} ${UMBP_PEER_PROTO_FILE}
   # umbp_peer.proto imports umbp.proto for shared types (TierType, PageLocation,
   # BufferMemoryDesc) — protoc reads it at generation time and the generated
   # peer headers include "umbp.pb.h", so the peer generation depends on the
@@ -314,10 +336,24 @@ add_custom_command(
   COMMAND
     ${_PROTOBUF_PROTOC} --proto_path=${UMBP_PROTO_DIR}
     --cpp_out=${UMBP_PROTO_GEN_DIR} --grpc_out=${UMBP_PROTO_GEN_DIR}
-    --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN} ${UMBP_STANDALONE_PROTO_FILE}
+    --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN}
+    ${_PROTOC_PROTO3_OPTIONAL_ARGS} ${UMBP_STANDALONE_PROTO_FILE}
   DEPENDS ${UMBP_STANDALONE_PROTO_FILE} ${UMBP_PROTO_FILE} ${UMBP_PROTO_HDRS}
   COMMENT "Generating UMBP Standalone protobuf/gRPC C++ sources"
   VERBATIM)
+
+add_custom_command(
+  OUTPUT ${UMBP_WORKLOAD_PROTO_SRCS} ${UMBP_WORKLOAD_PROTO_HDRS}
+  COMMAND
+    ${_PROTOBUF_PROTOC} --proto_path=${UMBP_PROTO_DIR}
+    --cpp_out=${UMBP_PROTO_GEN_DIR} ${_PROTOC_PROTO3_OPTIONAL_ARGS}
+    ${UMBP_WORKLOAD_PROTO_FILE}
+  DEPENDS ${UMBP_WORKLOAD_PROTO_FILE}
+  COMMENT "Generating UMBP workload trace protobuf C++ sources"
+  VERBATIM)
+add_custom_target(umbp_workload_proto
+                  DEPENDS ${UMBP_WORKLOAD_PROTO_SRCS}
+                          ${UMBP_WORKLOAD_PROTO_HDRS})
 
 # ---------- Static library: umbp_common ---------------------------------------
 # Shared between PoolClient integration and standalone control-plane tools.
@@ -330,6 +366,13 @@ add_library(
   ${UMBP_PEER_GRPC_SRCS}
   ${UMBP_STANDALONE_PROTO_SRCS}
   ${UMBP_STANDALONE_GRPC_SRCS}
+  ${UMBP_WORKLOAD_PROTO_SRCS}
+  # Trace capture is a client feature: PoolClient records live traffic when
+  # UMBP_WORKLOAD_TRACE_PATH is set, so the writer ships with the library. The
+  # rest of the workload harness drives benchmarks and lives in
+  # umbp_workload_bench instead.
+  distributed/benchmark/workload_trace.cpp
+  distributed/benchmark/workload_trace_recorder.cpp
   distributed/master/in_memory_master_metadata_store.cpp
   distributed/master/master_metadata_store_factory.cpp
   distributed/master/master_server.cpp
@@ -340,9 +383,22 @@ add_library(
   distributed/routing/router.cpp
   distributed/routing/route_get_strategy.cpp
   distributed/routing/route_put_strategy.cpp
-  distributed/peer/peer_dram_allocator.cpp
-  distributed/peer/peer_ssd_manager.cpp
-  distributed/peer/ssd_copy_pipeline.cpp
+  distributed/metrics/component_metrics.cpp
+  distributed/peer/backend/page_backend.cpp
+  distributed/peer/backend/hbm_backend.cpp
+  distributed/peer/backend/ssd_backend.cpp
+  distributed/peer/backend/instrumented_backend.cpp
+  distributed/transfer/transfer_engine.cpp
+  distributed/transfer/mori_io_engine.cpp
+  distributed/transfer/local_copy_engine.cpp
+  distributed/transfer/hbm_copy_engine.cpp
+  distributed/transfer/composite_transfer_engine.cpp
+  distributed/peer/ssd/peer_ssd_manager.cpp
+  distributed/peer/ssd/ssd_copy_pipeline.cpp
+  distributed/pool/policy_config.cpp
+  distributed/pool/tier_graph.cpp
+  distributed/pool/tier_transition.cpp
+  distributed/pool/peer_pool.cpp
   distributed/peer/peer_service.cpp
   distributed/pool_client.cpp
   distributed/distributed_client.cpp
@@ -350,6 +406,7 @@ add_library(
   standalone/ipc.cpp
   standalone/standalone_process_client.cpp
   standalone/standalone_server.cpp)
+add_dependencies(umbp_common umbp_workload_proto)
 
 target_include_directories(
   umbp_common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${UMBP_PROTO_GEN_DIR}
@@ -373,6 +430,20 @@ target_link_libraries(
                      ${_PROTOBUF_LIBS} ${_GRPCPP_LIB})
 
 target_compile_features(umbp_common PUBLIC cxx_std_17)
+
+# ---------- Optional hipfile GDS transfer engine -----------------------------
+# GdsEngine reads an SSD segment's byte range straight into GPU memory via
+# hipFileRead (no host bounce). Auto-enabled when hipfile is installed; a build
+# without it keeps only the memory engines and the host-staged SSD path.
+find_package(hipfile QUIET CONFIG GLOBAL)
+if(TARGET hip::hipfile)
+  message(STATUS "[UMBP] hipfile found — GDS transfer engine ENABLED")
+  target_sources(umbp_common PRIVATE distributed/transfer/gds_engine.cpp)
+  target_link_libraries(umbp_common PUBLIC hip::hipfile)
+  target_compile_definitions(umbp_common PUBLIC UMBP_ENABLE_GDS)
+else()
+  message(STATUS "[UMBP] hipfile not found — GDS transfer engine disabled")
+endif()
 
 # ---------- Optional Redis / RESP master metadata backend --------------------
 # Makes the master stateless by storing all metadata in an external RESP store
@@ -425,14 +496,16 @@ if(MORI_UMBP_TESTING)
   target_compile_definitions(umbp_common PUBLIC MORI_UMBP_TESTING)
 endif()
 
-# NOTE: umbp_core no longer depends on umbp_common.  StandaloneClient has no
-# gRPC/Protobuf dependency.  Targets that need distributed features should link
-# umbp_common directly.
+# NOTE: umbp_core no longer depends on umbp_common.  It holds the storage tiers
+# (SSD/SPDK/segment) and the host allocator, none of which need gRPC/Protobuf;
+# umbp_common's PeerSsdManager builds on them.  Targets that need the clients
+# should link umbp_common directly.
 target_link_libraries(umbp_core PUBLIC mori_logging)
 
-# Factory: references both StandaloneClient and DistributedClient, so it belongs
-# in umbp_common (which has the distributed symbols).  Runtime switching is via
-# config.distributed.has_value().
+# Factory: every client it can return (DistributedClient, StandaloneProcessClient)
+# lives in umbp_common, so it belongs there too.  Which one a config selects --
+# including the embedded deployment it synthesizes when a config names none --
+# is decided at runtime in WithEmbeddedDefaults/CreateUMBPClient.
 target_sources(umbp_common
                PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/umbp_client_factory.cpp)
 
@@ -459,6 +532,35 @@ target_link_libraries(umbp_client PRIVATE umbp_common ${_PROTOBUF_LIBS}
 set_target_properties(umbp_client PROPERTIES BUILD_RPATH "$ORIGIN;${ROCM_PATH}/lib"
                                              INSTALL_RPATH "$ORIGIN;${ROCM_PATH}/lib"
                                              BUILD_WITH_INSTALL_RPATH TRUE)
+
+# ---------- Workload harness for benchmarks ----------------------------------
+# Generates synthetic workloads, replays traces, and drives them against a
+# client. Nothing in the data path needs it, so it stays out of umbp_common and
+# is linked only by the benchmark tool and the tests that exercise it.
+add_library(
+  umbp_workload_bench STATIC
+  distributed/benchmark/payload.cpp
+  distributed/benchmark/workload_source.cpp
+  distributed/benchmark/workload_runner.cpp)
+add_dependencies(umbp_workload_bench umbp_workload_proto)
+target_link_libraries(umbp_workload_bench PUBLIC umbp_common)
+target_compile_features(umbp_workload_bench PUBLIC cxx_std_17)
+
+# ---------- Distributed tier-management benchmark ---------------------------
+# Manual synthetic/trace-replay tool. It starts an in-process master and real
+# PoolClients, so it exercises routing, peer placement, transfer, heartbeat,
+# capacity, and eviction without depending on an inference framework.
+add_executable(umbp_tier_bench distributed/bin/tier_benchmark_main.cpp)
+add_dependencies(umbp_tier_bench umbp_workload_proto)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(umbp_tier_bench PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(umbp_tier_bench PRIVATE umbp_workload_bench
+                                               ${_PROTOBUF_LIBS}
+                                               ${_GRPCPP_LIB})
+set_target_properties(umbp_tier_bench PROPERTIES BUILD_RPATH "$ORIGIN"
+                                                  INSTALL_RPATH "$ORIGIN"
+                                                  BUILD_WITH_INSTALL_RPATH TRUE)
 
 # ---------- Standalone-process executable ------------------------------------
 

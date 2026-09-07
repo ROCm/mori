@@ -47,6 +47,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -65,20 +66,30 @@ namespace {
 //  Helpers
 // ---------------------------------------------------------------------------
 
+// Only for ports that must be chosen before the thing that binds them exists
+// (MasterServerConfig::metrics_port). Prefer letting the server bind :0 and
+// report back where an accessor exists — this reserve-and-release sequence has
+// a window in which the port can be taken.
+//
+// Failure throws rather than returning a fixed fallback: a hardcoded port is
+// what every caller then collides on, which is the failure this helper exists
+// to avoid.
 static uint16_t AllocPort() {
-  // Bind to :0 and let the kernel pick a free port, then close immediately.
   int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) return 50400;
+  if (fd < 0) throw std::runtime_error("AllocPort socket() failed");
   struct sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_port = 0;
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   if (::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
     ::close(fd);
-    return 50400;
+    throw std::runtime_error("AllocPort bind() failed");
   }
   socklen_t len = sizeof(addr);
-  ::getsockname(fd, reinterpret_cast<struct sockaddr*>(&addr), &len);
+  if (::getsockname(fd, reinterpret_cast<struct sockaddr*>(&addr), &len) != 0) {
+    ::close(fd);
+    throw std::runtime_error("AllocPort getsockname() failed");
+  }
   ::close(fd);
   return ntohs(addr.sin_port);
 }
@@ -246,15 +257,20 @@ class CapturingMasterService final : public ::umbp::UMBPMaster::Service {
 class MasterClientTagsE2ETest : public ::testing::Test {
  protected:
   void SetUp() override {
-    port_ = AllocPort();
-    addr_ = "127.0.0.1:" + std::to_string(port_);
-
     svc_ = std::make_unique<CapturingMasterService>();
+
+    // Bind the port through the builder rather than reserving one with
+    // AllocPort first: the reserve-close-rebind sequence leaves a window in
+    // which anything else on the host can take the port back.
+    int selected_port = 0;
     grpc::ServerBuilder builder;
-    builder.AddListeningPort(addr_, grpc::InsecureServerCredentials());
+    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &selected_port);
     builder.RegisterService(svc_.get());
     server_ = builder.BuildAndStart();
     ASSERT_NE(server_, nullptr);
+    ASSERT_NE(selected_port, 0);
+    port_ = static_cast<uint16_t>(selected_port);
+    addr_ = "127.0.0.1:" + std::to_string(port_);
   }
 
   void TearDown() override {
@@ -334,18 +350,45 @@ class RealMasterServerTagsTest : public ::testing::Test {
     setenv("UMBP_HEARTBEAT_TTL_SEC", "2", 1);
     setenv("UMBP_METRICS_REPORT_INTERVAL_MS", "50", 1);
 
-    port_ = AllocPort();
-    metrics_port_ = AllocPort();
+    // The gRPC port is bound as :0 and read back, so it is never reserved and
+    // released. metrics_port_ cannot be: MasterServerConfig takes it as a
+    // number, treats 0 as "no metrics server", and exposes no accessor for
+    // what it bound — so AllocPort's reserve-close-rebind window is
+    // unavoidable there. Losing that race throws inside MetricsServer's
+    // constructor on the Run() thread, which is std::terminate rather than a
+    // test failure, so retry the whole server on a fresh port instead.
+    constexpr int kMaxAttempts = 8;
+    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+      metrics_port_ = AllocPort();
+
+      MasterServerConfig cfg = MasterServerConfig::FromEnvironment();
+      cfg.listen_address = "127.0.0.1:0";
+      cfg.metrics_port = metrics_port_;
+      server_ = std::make_unique<MasterServer>(std::move(cfg));
+      run_failed_.store(false);
+      server_thread_ = std::thread([this] {
+        try {
+          server_->Run();
+        } catch (const std::exception&) {
+          run_failed_.store(true);
+        }
+      });
+
+      if (WaitFor([this] { return server_->GetBoundPort() != 0 || run_failed_.load(); },
+                  std::chrono::seconds(5)) &&
+          !run_failed_.load()) {
+        break;
+      }
+
+      server_->Shutdown();
+      if (server_thread_.joinable()) server_thread_.join();
+      server_.reset();
+    }
+    ASSERT_NE(server_, nullptr);
+    ASSERT_FALSE(run_failed_.load()) << "MasterServer::Run() kept failing to bind a metrics port";
+    ASSERT_NE(server_->GetBoundPort(), 0);
+    port_ = static_cast<uint16_t>(server_->GetBoundPort());
     addr_ = "127.0.0.1:" + std::to_string(port_);
-
-    MasterServerConfig cfg = MasterServerConfig::FromEnvironment();
-    cfg.listen_address = addr_;
-    cfg.metrics_port = metrics_port_;
-    server_ = std::make_unique<MasterServer>(std::move(cfg));
-    server_thread_ = std::thread([this] { server_->Run(); });
-
-    // Wait for the gRPC port to be bound
-    ASSERT_TRUE(WaitFor([this] { return server_->GetBoundPort() != 0; }, std::chrono::seconds(5)));
   }
 
   void TearDown() override {
@@ -395,6 +438,7 @@ class RealMasterServerTagsTest : public ::testing::Test {
   std::string addr_;
   std::unique_ptr<MasterServer> server_;
   std::thread server_thread_;
+  std::atomic<bool> run_failed_{false};
   std::unique_ptr<MasterClient> client_;
 };
 

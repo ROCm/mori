@@ -38,7 +38,7 @@
 #include <utility>
 #include <vector>
 
-#include "umbp/distributed/peer/peer_ssd_manager.h"
+#include "umbp/distributed/peer/ssd/peer_ssd_manager.h"
 #include "umbp/local/tiers/tier_backend.h"
 
 namespace mori::umbp {
@@ -221,6 +221,13 @@ TEST(PeerSsdEviction, WatermarkTriggersEvictionDownToLow) {
   EXPECT_TRUE(HasRemove(events, "k1"));
   EXPECT_TRUE(HasRemove(events, "k2"));
   EXPECT_EQ(CountKind(events, KvEvent::Kind::REMOVE), 2);
+}
+
+TEST(PeerSsdEviction, SuccessfulWriteDoesNotEvictItself) {
+  auto h = MakeHarness(/*capacity=*/100, /*high=*/0.9, /*low=*/0.7);
+  std::string value(90, 'x');
+  ASSERT_TRUE(h.mgr->Write("only", OneSeg(value), value.size()));
+  EXPECT_TRUE(h.mgr->Exists("only"));
 }
 
 TEST(PeerSsdEviction, EnospcTriggersEvictThenRetry) {

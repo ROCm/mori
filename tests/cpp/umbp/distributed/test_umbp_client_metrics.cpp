@@ -24,16 +24,16 @@
 //
 // 1. MasterClientMetricsTest — unit tests for MasterClient::AddCounter,
 //    SetGauge, and Observe buffering.  Uses a fake recording server that
-//    returns a 100ms heartbeat interval, allowing the flush to be verified
-//    within a short wall-clock window.
+//    captures ReportMetrics calls. main() sets the metrics reporting interval
+//    to 10ms so buffering semantics can be verified without one-second waits.
 //
 // 2. PoolClientLocalByteTrackingTest — integration test verifying that a
 //    single-node PoolClient reports correct Put/Get byte counts (traffic=local)
 //    through the full pipeline: PoolClient → MasterClient buffer →
 //    ReportMetrics RPC → MasterServer → Prometheus HTTP endpoint.
 //
-// main() sets UMBP_HEARTBEAT_TTL_SEC=1 before any test runs so that the real
-// MasterServer in suite 2 returns ≈500ms heartbeat/metrics flush intervals.
+// main() shortens the independently configured heartbeat and metrics intervals
+// before either suite constructs a client.
 
 #include <arpa/inet.h>
 #include <grpcpp/grpcpp.h>
@@ -60,6 +60,7 @@
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/master/master_client.h"
 #include "umbp/distributed/master/master_server.h"
+#include "umbp/distributed/pool/policy_config.h"
 #include "umbp/distributed/pool_client.h"
 
 namespace mori::umbp {
@@ -90,17 +91,14 @@ static uint16_t AllocPort() {
 
 // ============================================================
 //  Fake gRPC server that captures ReportMetrics calls.
-//  RegisterClient returns a configurable heartbeat interval so
-//  the metrics flush cadence is under test control.
+//  RegisterClient returns a short heartbeat interval; the independent
+//  metrics cadence is controlled by UMBP_METRICS_REPORT_INTERVAL_MS in main().
 // ============================================================
 class RecordingMasterService final : public ::umbp::UMBPMaster::Service {
  public:
-  explicit RecordingMasterService(int heartbeat_interval_ms)
-      : heartbeat_interval_ms_(heartbeat_interval_ms) {}
-
   grpc::Status RegisterClient(grpc::ServerContext*, const ::umbp::RegisterClientRequest*,
                               ::umbp::RegisterClientResponse* resp) override {
-    resp->set_heartbeat_interval_ms(heartbeat_interval_ms_);
+    resp->set_heartbeat_interval_ms(100);
     return grpc::Status::OK;
   }
 
@@ -139,7 +137,6 @@ class RecordingMasterService final : public ::umbp::UMBPMaster::Service {
   }
 
  private:
-  int heartbeat_interval_ms_;
   std::mutex mu_;
   std::condition_variable cv_;
   std::vector<::umbp::ReportMetricsRequest> requests_;
@@ -180,10 +177,8 @@ static double SumCounterDelta(const std::vector<::umbp::MetricSample>& samples,
 // ============================================================
 class MasterClientMetricsTest : public ::testing::Test {
  protected:
-  static constexpr int kFlushIntervalMs = 100;
-
   void SetUp() override {
-    service_ = std::make_unique<RecordingMasterService>(kFlushIntervalMs);
+    service_ = std::make_unique<RecordingMasterService>();
 
     grpc::ServerBuilder builder;
     int selected_port = 0;
@@ -372,77 +367,95 @@ constexpr size_t kLocalBufSize = 8 << 20;
 class PoolClientLocalByteTrackingTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    // Kernel-assigned ephemeral ports are expected to be plentiful in CI;
-    // bounded retries protect against pathological duplicate picks.
-    constexpr int kMaxPortAllocAttempts = 32;  // far above expected collision rate in CI
-    auto alloc_unique_port = [&](std::initializer_list<uint16_t> used) {
-      for (int attempt = 0; attempt < kMaxPortAllocAttempts; ++attempt) {
-        const uint16_t candidate = AllocPort();
-        bool duplicate = false;
-        for (const uint16_t port : used) {
-          if (candidate == port) {
-            duplicate = true;
-            break;
-          }
-        }
-        if (!duplicate) return candidate;
-      }
-      throw std::runtime_error("Failed to allocate unique test port");
-    };
-
-    master_port_ = AllocPort();
-    metrics_port_ = alloc_unique_port({master_port_});
-    io_port_ = alloc_unique_port({master_port_, metrics_port_});
-
-    buf_ = std::malloc(kLocalBufSize);
     src_ = std::malloc(kLocalPageSize);
     dst_ = std::malloc(kLocalPageSize);
-    ASSERT_NE(buf_, nullptr);
     ASSERT_NE(src_, nullptr);
     ASSERT_NE(dst_, nullptr);
-    std::memset(buf_, 0, kLocalBufSize);
     std::memset(src_, 0xAB, kLocalPageSize);
     std::memset(dst_, 0, kLocalPageSize);
 
-    MasterServerConfig master_cfg;
-    // Short TTL so the recommended heartbeat/metrics interval is ≈100ms.
-    master_cfg.registry_config.heartbeat_ttl = std::chrono::seconds(1);
-    master_cfg.listen_address = "0.0.0.0:" + std::to_string(master_port_);
-    master_cfg.metrics_port = metrics_port_;
-    master_ = std::make_unique<MasterServer>(std::move(master_cfg));
-    server_thread_ = std::thread([this] { master_->Run(); });
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    // The master's gRPC port and the IO engine's port are requested as 0 and
+    // read back, so neither is reserved and released. metrics_port_ cannot be:
+    // MasterServerConfig takes it as a number, treats 0 as "no metrics server",
+    // and exposes no accessor for what it bound. Losing AllocPort's
+    // reserve-close-rebind race throws inside MetricsServer's constructor on
+    // the Run() thread, which is std::terminate rather than a test failure, so
+    // retry the whole server on a fresh port instead.
+    constexpr int kMaxAttempts = 8;
+    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+      metrics_port_ = AllocPort();
+
+      MasterServerConfig master_cfg;
+      // Short TTL so the recommended heartbeat/metrics interval is ≈100ms.
+      master_cfg.registry_config.heartbeat_ttl = std::chrono::seconds(1);
+      master_cfg.listen_address = "0.0.0.0:0";
+      master_cfg.metrics_port = metrics_port_;
+      master_ = std::make_unique<MasterServer>(std::move(master_cfg));
+      run_failed_.store(false);
+      server_thread_ = std::thread([this] {
+        try {
+          master_->Run();
+        } catch (const std::exception&) {
+          run_failed_.store(true);
+        }
+      });
+
+      // Wait for the assigned port rather than sleeping a fixed interval and
+      // hoping: it has to be read back anyway, and it is only non-zero once the
+      // server is actually listening.
+      bool ready = false;
+      for (int i = 0; i < 500; ++i) {
+        if (master_->GetBoundPort() != 0) {
+          ready = true;
+          break;
+        }
+        if (run_failed_.load()) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+      if (ready && !run_failed_.load()) break;
+
+      master_->Shutdown();
+      if (server_thread_.joinable()) server_thread_.join();
+      master_.reset();
+    }
+    ASSERT_NE(master_, nullptr);
+    ASSERT_FALSE(run_failed_.load()) << "MasterServer::Run() kept failing to bind a metrics port";
+    ASSERT_NE(master_->GetBoundPort(), 0);
+    master_port_ = static_cast<uint16_t>(master_->GetBoundPort());
 
     PoolClientConfig cfg;
     cfg.master_config.node_id = "node-local";
     cfg.master_config.node_address = "127.0.0.1";
     cfg.master_config.master_address = "localhost:" + std::to_string(master_port_);
     cfg.io_engine.host = "0.0.0.0";
-    cfg.io_engine.port = io_port_;
+    cfg.io_engine.port = 0;
     cfg.dram_page_size = kLocalPageSize;
-    cfg.dram_buffers = {{buf_, kLocalBufSize}};
-    cfg.tier_capacities = {{TierType::DRAM, {kLocalBufSize, kLocalBufSize}}};
+    ConfigureClient(&cfg);
     client_ = std::make_unique<PoolClient>(std::move(cfg));
     ASSERT_TRUE(client_->Init());
+  }
+
+  // Lets a fixture put a richer topology behind the same master bring-up. The
+  // base case is the one flat DRAM backend the byte-tracking tests expect.
+  virtual void ConfigureClient(PoolClientConfig* config) {
+    config->dram.buffer_sizes = {kLocalBufSize};
   }
 
   void TearDown() override {
     if (client_) client_->Shutdown();
     if (master_) master_->Shutdown();
     if (server_thread_.joinable()) server_thread_.join();
-    std::free(buf_);
     std::free(src_);
     std::free(dst_);
   }
 
   uint16_t master_port_ = 0;
   uint16_t metrics_port_ = 0;
-  uint16_t io_port_ = 0;
-  void* buf_ = nullptr;
   void* src_ = nullptr;
   void* dst_ = nullptr;
   std::unique_ptr<MasterServer> master_;
   std::thread server_thread_;
+  std::atomic<bool> run_failed_{false};
   std::unique_ptr<PoolClient> client_;
 };
 
@@ -524,6 +537,148 @@ TEST_F(PoolClientLocalByteTrackingTest, LocalPutGetBytesCounted) {
       << "Unexpected remote batch-get bandwidth series in single-node setup";
 }
 
+// The ranged siblings get their OWN histograms, and the reason they are worth a
+// test is that they are the only bandwidth series with early returns between
+// the first byte and the observation: a batch served entirely from the local
+// medium returns before the remote phase exists.  If ScopedBatchBandwidth ever
+// stops covering that path, the tree-connector panels silently render empty
+// while ranged I/O runs at full rate.
+TEST_F(PoolClientLocalByteTrackingTest, LocalRangedPutGetBandwidthCounted) {
+  const std::string key = "ranged-metric-key";
+  constexpr size_t kHalf = kLocalPageSize / 2;
+
+  // A put must TILE its object; a get may take any subset.
+  const std::vector<std::vector<const void*>> put_srcs = {
+      {src_, static_cast<const char*>(src_) + kHalf}};
+  const std::vector<std::vector<size_t>> put_sizes = {{kHalf, kHalf}};
+  const std::vector<std::vector<size_t>> put_offsets = {{0, kHalf}};
+  ASSERT_TRUE(
+      client_->BatchPutRanges({key}, {kLocalPageSize}, put_srcs, put_sizes, put_offsets).front());
+
+  const std::vector<std::vector<void*>> get_dsts = {{dst_}};
+  const std::vector<std::vector<size_t>> get_sizes = {{kHalf}};
+  const std::vector<std::vector<size_t>> get_offsets = {{kHalf}};
+  ASSERT_TRUE(client_->BatchGetRanges({key}, get_dsts, get_sizes, get_offsets).front());
+  EXPECT_EQ(std::memcmp(dst_, static_cast<const char*>(src_) + kHalf, kHalf), 0)
+      << "Ranged get did not return the bytes the ranged put committed";
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+
+  const std::string body = FetchPrometheusMetrics(metrics_port_);
+  ASSERT_FALSE(body.empty()) << "Could not fetch Prometheus metrics from port " << metrics_port_;
+
+  auto hist = [&](const std::string& name, const std::string& suffix, const std::string& traffic) {
+    return ParseMetricValue(body, name + suffix, "traffic=\"" + traffic + "\"");
+  };
+
+  for (const char* name : {"mori_umbp_client_batch_put_ranges_bandwidth_gibps",
+                           "mori_umbp_client_batch_get_ranges_bandwidth_gibps"}) {
+    EXPECT_GT(hist(name, "_sum", "local"), 0.0)
+        << "Expected local " << name << " sum > 0; Prometheus shows "
+        << hist(name, "_sum", "local");
+    EXPECT_GT(hist(name, "_count", "local"), 0.0)
+        << "Expected local " << name << " count > 0; Prometheus shows "
+        << hist(name, "_count", "local");
+    EXPECT_EQ(hist(name, "_sum", "remote"), -1.0)
+        << "Unexpected remote " << name << " series in single-node setup";
+  }
+
+  // Distinct series from the whole-object families: a ranged call moves a
+  // subset, so folding them together would make bytes-per-call meaningless.
+  EXPECT_EQ(hist("mori_umbp_client_batch_get_bandwidth_gibps", "_count", "local"), -1.0)
+      << "Ranged get leaked into the whole-object BatchGet bandwidth histogram";
+}
+
+// End-to-end proof that the refactored data plane is still wired to Prometheus:
+// a Put and a Get on the live path must show up as the GENERIC backend and
+// transfer series, carrying the medium and the engine as labels.
+//
+// This is the test that fails if someone unwires the instrumentation decorator
+// in PoolClient::Init, or reintroduces medium-specific metric names — either of
+// which leaves the dashboard rendering an empty panel while the system runs
+// perfectly, which is exactly how the SSD panels ended up dead.
+TEST_F(PoolClientLocalByteTrackingTest, BackendAndTransferSeriesReachPrometheus) {
+  ASSERT_TRUE(client_->Put("generic-metrics-key", src_, kLocalPageSize));
+  ASSERT_TRUE(client_->Get("generic-metrics-key", dst_, kLocalPageSize));
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+
+  const std::string body = FetchPrometheusMetrics(metrics_port_);
+  ASSERT_FALSE(body.empty()) << "Could not fetch Prometheus metrics from port " << metrics_port_;
+
+  // ParseMetricValue matches ONE substring, and label order in the rendered
+  // line follows insertion order (node, tags, source labels, sample labels), so
+  // match every label independently rather than betting on that order.
+  auto value_with = [&body](const std::string& name,
+                            const std::vector<std::string>& label_substrs) -> double {
+    size_t pos = 0;
+    while (pos < body.size()) {
+      const size_t nl = body.find('\n', pos);
+      const std::string line =
+          body.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+      pos = (nl == std::string::npos) ? body.size() : nl + 1;
+      if (line.empty() || line.front() == '#') continue;
+      if (line.rfind(name, 0) != 0) continue;  // metric name starts the line
+      bool all = true;
+      for (const auto& sub : label_substrs) {
+        if (line.find(sub) == std::string::npos) {
+          all = false;
+          break;
+        }
+      }
+      if (!all) continue;
+      const size_t sp = line.rfind(' ');
+      if (sp == std::string::npos) continue;
+      try {
+        return std::stod(line.substr(sp + 1));
+      } catch (...) {
+      }
+    }
+    return -1.0;
+  };
+
+  // The medium and named backend instance are labels on shared metric names.
+  // Legacy one-backend configuration lowers to the stable instance name
+  // "dram"; explicit multi-backend policies use their configured names.
+  const std::vector<std::string> dram = {"tier=\"DRAM\"", "backend=\"dram\""};
+
+  auto with = [&dram](std::vector<std::string> extra) {
+    std::vector<std::string> out = dram;
+    out.insert(out.end(), extra.begin(), extra.end());
+    return out;
+  };
+
+  EXPECT_GE(value_with("mori_umbp_backend_ops_total", with({"op=\"allocate\"", "status=\"ok\""})),
+            1.0)
+      << "no allocate recorded for the live medium";
+  EXPECT_GE(value_with("mori_umbp_backend_ops_total", with({"op=\"commit\"", "status=\"ok\""})),
+            1.0);
+  EXPECT_GE(value_with("mori_umbp_backend_ops_total", with({"op=\"resolve\"", "status=\"ok\""})),
+            1.0);
+  EXPECT_GE(value_with("mori_umbp_backend_bytes_total", with({"op=\"commit\""})),
+            static_cast<double>(kLocalPageSize));
+  EXPECT_GE(value_with("mori_umbp_backend_bytes_total", with({"op=\"resolve\""})),
+            static_cast<double>(kLocalPageSize));
+  EXPECT_GE(value_with("mori_umbp_backend_batches_total", with({"op=\"commit\""})), 1.0);
+  EXPECT_GT(value_with("mori_umbp_backend_op_seconds_total", with({"op=\"commit\""})), 0.0);
+
+  // The transfer layer, charged to whichever engine carried the plans.  Both
+  // endpoints are on this node, so the local engine took them.
+  EXPECT_GE(value_with("mori_umbp_transfer_bytes_total",
+                       {"engine=\"LocalCopyEngine\"", "direction=\"local\""}),
+            static_cast<double>(kLocalPageSize));
+  EXPECT_GE(value_with("mori_umbp_transfer_ops_total",
+                       {"engine=\"LocalCopyEngine\"", "direction=\"local\"", "status=\"ok\""}),
+            1.0);
+
+  // Nothing may be published under a name that spells the medium: such a metric
+  // needs its own panel, and one panel per medium is the arrangement the single
+  // dashboard replaced.
+  EXPECT_EQ(body.find("mori_umbp_dram_"), std::string::npos);
+  EXPECT_EQ(body.find("mori_umbp_ssd_"), std::string::npos);
+  EXPECT_EQ(body.find("mori_umbp_hbm_"), std::string::npos);
+}
+
 // Verifies that the four per-(node,tier) capacity gauges (total / available /
 // used / utilization_ratio) reach Prometheus via the heartbeat path, and that
 // available/used/utilization react to an allocation.
@@ -583,14 +738,108 @@ TEST_F(PoolClientLocalByteTrackingTest, TierCapacityGaugesPublished) {
   EXPECT_NEAR(util1, used1 / total1, 1e-3) << "utilization must equal used / total";
 }
 
+// Two DRAM backends in different logical tiers, which is the case the
+// per-medium gauges cannot describe: both are tier="DRAM", so they land on one
+// series and the hierarchy is unreadable.
+class PoolClientLogicalTierMetricsTest : public PoolClientLocalByteTrackingTest {
+ protected:
+  static constexpr uint64_t kHotBytes = 1ULL << 20;
+  static constexpr uint64_t kColdBytes = 4ULL << 20;
+
+  void ConfigureClient(PoolClientConfig* config) override {
+    static constexpr char kPolicy[] = R"json({
+      "schema_version": 1,
+      "entry_tier": "hot",
+      "backends": {
+        "dram_hot": {"type": "dram", "capacity": "1MiB"},
+        "dram_cold": {"type": "dram", "capacity": "4MiB"}
+      },
+      "tiers": [
+        {
+          "name": "hot",
+          "backends": {"dram_hot": 100},
+          "offload_to": ["cold"],
+          "offload_trigger": "watermark",
+          "high_watermark": 0.9,
+          "low_watermark": 0.7
+        },
+        {"name": "cold", "backends": {"dram_cold": 100}, "promote_trigger": "on_read"}
+      ]
+    })json";
+    auto loaded = LoadBackendPolicyJson(kPolicy);
+    ASSERT_TRUE(loaded.ok()) << loaded.error;
+    std::string error;
+    ASSERT_TRUE(ApplyBackendPolicy(*loaded.config, config, &error)) << error;
+  }
+};
+
+// Each logical tier has to reach Prometheus as its own series, carrying the
+// name the policy gave it. Without this a two-DRAM-tier policy publishes one
+// tier="DRAM" series holding the sum, which cannot answer where a key sits, or
+// whether a drain reached its low watermark, or which tiers take new PUTs.
+TEST_F(PoolClientLogicalTierMetricsTest, PublishesCapacityPerLogicalTier) {
+  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+  const std::string body = FetchPrometheusMetrics(metrics_port_);
+  ASSERT_FALSE(body.empty()) << "Could not fetch Prometheus metrics from port " << metrics_port_;
+
+  const std::string hot = "logical_tier=\"hot\"";
+  const std::string cold = "logical_tier=\"cold\"";
+  const double hot_total =
+      ParseMetricValue(body, "mori_umbp_client_logical_tier_capacity_total_bytes", hot);
+  const double cold_total =
+      ParseMetricValue(body, "mori_umbp_client_logical_tier_capacity_total_bytes", cold);
+  ASSERT_GE(hot_total, 0.0) << "hot tier missing from /metrics";
+  ASSERT_GE(cold_total, 0.0) << "cold tier missing from /metrics";
+
+  // Cold is its own backends' sum. The entry tier is not: its capacity covers
+  // everything a PUT addressed to it can spill into, because that is what the
+  // router needs. Pinning both shapes keeps the difference from being read as
+  // one tier's occupancy.
+  EXPECT_NEAR(cold_total, static_cast<double>(kColdBytes), 16.0);
+  EXPECT_NEAR(hot_total, static_cast<double>(kHotBytes + kColdBytes), 16.0)
+      << "entry tier capacity should aggregate every offload-reachable tier";
+
+  for (const std::string& tier : {hot, cold}) {
+    const double avail =
+        ParseMetricValue(body, "mori_umbp_client_logical_tier_capacity_available_bytes", tier);
+    const double used =
+        ParseMetricValue(body, "mori_umbp_client_logical_tier_capacity_used_bytes", tier);
+    const double total =
+        ParseMetricValue(body, "mori_umbp_client_logical_tier_capacity_total_bytes", tier);
+    const double util =
+        ParseMetricValue(body, "mori_umbp_client_logical_tier_capacity_utilization_ratio", tier);
+    const double eligible =
+        ParseMetricValue(body, "mori_umbp_client_logical_tier_put_eligible", tier);
+    const double peak =
+        ParseMetricValue(body, "mori_umbp_client_logical_tier_peak_member_utilization_ratio", tier);
+    ASSERT_GE(avail, 0.0) << tier << " available missing";
+    ASSERT_GE(used, 0.0) << tier << " used missing";
+    ASSERT_GE(util, 0.0) << tier << " utilization missing";
+    ASSERT_GE(eligible, 0.0) << tier << " put_eligible missing";
+    // The watermark comparison reads this one, so its absence is what made a
+    // drain unobservable even with the aggregate gauges present.
+    ASSERT_GE(peak, 0.0) << tier << " peak_member_utilization missing";
+    EXPECT_LE(peak, 1.0);
+    EXPECT_NEAR(used + avail, total, 16.0);
+    EXPECT_NEAR(util, used / total, 1e-3);
+  }
+
+  // Only the entry tier takes new PUTs; cold is reachable by offload alone.
+  EXPECT_EQ(ParseMetricValue(body, "mori_umbp_client_logical_tier_put_eligible", hot), 1.0);
+  EXPECT_EQ(ParseMetricValue(body, "mori_umbp_client_logical_tier_put_eligible", cold), 0.0);
+}
+
 }  // namespace
 }  // namespace mori::umbp
 
 int main(int argc, char** argv) {
   // Must be set before any GetEnvSeconds("UMBP_HEARTBEAT_TTL_SEC") static
-  // is initialized.  TTL=1s → recommended interval ≈ 500ms, which the
-  // metrics flush thread reuses.
+  // is initialized. TTL=1s keeps the real-server heartbeat tests short.
   ::setenv("UMBP_HEARTBEAT_TTL_SEC", "1", 1);
+  // MetricsReportIntervalMs() caches this on the first MasterClient
+  // construction. A short interval keeps the mock-server buffering tests
+  // deterministic without sleeping for the production default of one second.
+  ::setenv("UMBP_METRICS_REPORT_INTERVAL_MS", "10", 1);
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }

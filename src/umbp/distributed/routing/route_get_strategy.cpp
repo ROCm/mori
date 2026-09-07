@@ -43,30 +43,6 @@ namespace {
   return oss.str();
 }
 
-// Lower rank = higher read priority.  SSD is the slow cold tier, so it ranks
-// last among the real tiers; UNKNOWN sorts after everything so a malformed
-// location never wins over a usable one.
-int TierReadRank(TierType tier) {
-  switch (tier) {
-    case TierType::HBM:
-      return 0;
-    case TierType::DRAM:
-      return 1;
-    case TierType::SSD:
-      return 2;
-    default:
-      return 3;
-  }
-}
-
-// Pick a uniformly random element of a non-empty index list using the shared
-// thread_local RNG.
-size_t PickRandomIndex(const std::vector<size_t>& indices) {
-  thread_local std::mt19937 rng{std::random_device{}()};
-  std::uniform_int_distribution<size_t> dist(0, indices.size() - 1);
-  return indices[dist(rng)];
-}
-
 // Core selection cores shared by the single-key Select and the batched
 // BatchSelect.  Precondition: `locations` is non-empty (callers guarantee it).
 Location PickRandomReplica(const std::vector<Location>& locations) {
@@ -91,46 +67,32 @@ Location PickRandomReplica(const std::vector<Location>& locations) {
   return selected;
 }
 
-Location PickTierPriorityReplica(const std::vector<Location>& locations,
-                                 const std::string& node_id) {
-  // Find the best (lowest-rank) tier present, then collect every replica on it
-  // and choose one at random so load still spreads within a tier.
-  int best_rank = TierReadRank(locations[0].tier);
-  for (const auto& loc : locations) {
-    best_rank = std::min(best_rank, TierReadRank(loc.tier));
-  }
-  std::vector<size_t> best_tier_indices;
-  for (size_t i = 0; i < locations.size(); ++i) {
-    if (TierReadRank(locations[i].tier) == best_rank) best_tier_indices.push_back(i);
-  }
-
-  // Requester-local preference: if the asking node itself holds a replica in the
-  // best tier, serve it locally instead of a random peer. This is what makes
-  // cache_remote_fetches pay off — a node that re-cached a remotely-fetched block
-  // reads its own copy on the next Get (no RDMA), matching the local-first
-  // behavior of the pre-dual-scheme UMBPClient. Non-replica requesters still
-  // spread randomly. Empty node_id (unknown caller) falls through to random.
+Location PickLocalPreferringReplica(const std::vector<Location>& locations,
+                                    const std::string& node_id) {
+  // No tier ranking: every medium is equivalent, so any replica is as good as
+  // any other and the choice is made on locality and load alone (backend-
+  // agnostic refactor Phase 4 — the HBM > DRAM > SSD order is deleted, not
+  // replaced).  Re-introducing a preference means advertising it from the
+  // backend, not hardcoding a tier list here.
+  //
+  // Requester-local preference: if the asking node itself holds a replica, serve
+  // it locally instead of a random peer. This is what makes cache_remote_fetches
+  // pay off — a node that re-cached a remotely-fetched block reads its own copy
+  // on the next Get (no RDMA), matching the local-first behavior of the
+  // pre-dual-scheme UMBPClient. Non-replica requesters still spread randomly.
+  // Empty node_id (unknown caller) falls through to random.
   if (!node_id.empty()) {
-    for (size_t i : best_tier_indices) {
-      if (locations[i].node_id == node_id) {
+    for (const auto& loc : locations) {
+      if (loc.node_id == node_id) {
         MORI_UMBP_DEBUG(
-            "[TierPriorityRouteGetStrategy] requester-local hit node={} tier={} size={}",
-            locations[i].node_id, TierTypeName(locations[i].tier), locations[i].size);
-        return locations[i];
+            "[LocalPreferringRouteGetStrategy] requester-local hit node={} tier={} size={}",
+            loc.node_id, TierTypeName(loc.tier), loc.size);
+        return loc;
       }
     }
   }
 
-  size_t choice = PickRandomIndex(best_tier_indices);
-  const auto& selected = locations[choice];
-  // NOTE: temporarily disabled — the macro args are evaluated even when the log
-  // level suppresses output; SummarizeLocations() dominated the hot path.
-  // MORI_UMBP_DEBUG(
-  //     "[TierPriorityRouteGetStrategy] {} candidates -> best_tier={} ({} replicas) choice node={}
-  //     " "tier={} size={}, candidates=[{}]", locations.size(), TierTypeName(selected.tier),
-  //     best_tier_indices.size(), selected.node_id, TierTypeName(selected.tier), selected.size,
-  //     SummarizeLocations(locations));
-  return selected;
+  return PickRandomReplica(locations);
 }
 
 }  // namespace
@@ -169,22 +131,23 @@ std::vector<Location> RandomRouteGetStrategy::BatchSelect(
   return out;
 }
 
-Location TierPriorityRouteGetStrategy::Select(const std::vector<Location>& locations,
-                                              const std::string& node_id) {
+Location LocalPreferringRouteGetStrategy::Select(const std::vector<Location>& locations,
+                                                 const std::string& node_id) {
   if (locations.empty()) {
     MORI_UMBP_WARN(
-        "[TierPriorityRouteGetStrategy] received empty location set; returning default Location");
+        "[LocalPreferringRouteGetStrategy] received empty location set; returning default "
+        "Location");
     return {};
   }
-  return PickTierPriorityReplica(locations, node_id);
+  return PickLocalPreferringReplica(locations, node_id);
 }
 
-std::vector<Location> TierPriorityRouteGetStrategy::BatchSelect(
+std::vector<Location> LocalPreferringRouteGetStrategy::BatchSelect(
     const std::vector<std::vector<Location>>& per_key_locations, const std::string& node_id) {
   std::vector<Location> out(per_key_locations.size());
   for (size_t i = 0; i < per_key_locations.size(); ++i) {
     if (per_key_locations[i].empty()) continue;  // not routed; leave default
-    out[i] = PickTierPriorityReplica(per_key_locations[i], node_id);
+    out[i] = PickLocalPreferringReplica(per_key_locations[i], node_id);
   }
   return out;
 }

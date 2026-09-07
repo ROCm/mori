@@ -23,20 +23,22 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdlib>
 #include <iterator>
+#include <limits>
 #include <set>
 #include <system_error>
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp.grpc.pb.h"
 #include "umbp/common/env_time.h"
+#include "umbp/common/grpc_limits.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/master/rpc_latency_timer.h"
-#include "umbp/distributed/peer/peer_dram_allocator.h"
-#include "umbp/distributed/peer/peer_ssd_manager.h"
+#include "umbp/distributed/pool/peer_pool.h"
 
 namespace mori::umbp {
 
@@ -53,6 +55,36 @@ int RpcShutdownTimeoutMs() {
   return v;
 }
 
+int HeartbeatRpcTimeoutMs() {
+  static const int timeout = [] {
+    const char* raw = std::getenv("UMBP_HEARTBEAT_RPC_TIMEOUT_MS");
+    if (!raw || raw[0] == '\0') return 3000;
+    const int parsed = std::atoi(raw);
+    return parsed > 0 ? parsed : 3000;
+  }();
+  return timeout;
+}
+
+size_t HeartbeatEventsPerBundle() {
+  static const size_t value = [] {
+    const char* raw = std::getenv("UMBP_HEARTBEAT_EVENTS_PER_BUNDLE");
+    if (!raw || raw[0] == '\0') return size_t{1024};
+    const unsigned long long parsed = std::strtoull(raw, nullptr, 10);
+    return parsed > 0 ? static_cast<size_t>(parsed) : size_t{1024};
+  }();
+  return value;
+}
+
+size_t HeartbeatMaxBundlesPerRpc() {
+  static const size_t value = [] {
+    const char* raw = std::getenv("UMBP_HEARTBEAT_MAX_BUNDLES_PER_RPC");
+    if (!raw || raw[0] == '\0') return size_t{16};
+    const unsigned long long parsed = std::strtoull(raw, nullptr, 10);
+    return parsed > 0 ? static_cast<size_t>(parsed) : size_t{16};
+  }();
+  return value;
+}
+
 uint64_t MetricsReportIntervalMs() {
   static const uint64_t v =
       static_cast<uint64_t>(GetEnvMilliseconds("UMBP_METRICS_REPORT_INTERVAL_MS",
@@ -65,6 +97,11 @@ uint64_t MetricsReportIntervalMs() {
 
 ::umbp::TierType ToProtoTier(TierType t) { return static_cast<::umbp::TierType>(t); }
 TierType FromProtoTier(::umbp::TierType t) { return static_cast<TierType>(t); }
+
+uint64_t SaturatingAdd(uint64_t lhs, uint64_t rhs) {
+  return rhs > std::numeric_limits<uint64_t>::max() - lhs ? std::numeric_limits<uint64_t>::max()
+                                                          : lhs + rhs;
+}
 
 ::umbp::KvEvent::Kind ToProtoEventKind(KvEvent::Kind kind) {
   switch (kind) {
@@ -83,6 +120,22 @@ void FillTierCapacities(::google::protobuf::RepeatedPtrField<::umbp::TierCapacit
     tc->set_tier(ToProtoTier(tier));
     tc->set_total_capacity_bytes(cap.total_bytes);
     tc->set_available_capacity_bytes(cap.available_bytes);
+    tc->set_max_allocatable_bytes(cap.max_allocatable_bytes);
+  }
+}
+
+void FillLogicalTierCapacities(
+    ::google::protobuf::RepeatedPtrField<::umbp::LogicalTierCapacity>* dst,
+    const std::map<std::string, LogicalTierCapacity>& src) {
+  for (const auto& [name, logical] : src) {
+    auto* cap = dst->Add();
+    cap->set_name(name);
+    cap->set_representative_tier(ToProtoTier(logical.representative_tier));
+    cap->set_total_capacity_bytes(logical.capacity.total_bytes);
+    cap->set_available_capacity_bytes(logical.capacity.available_bytes);
+    cap->set_max_allocatable_bytes(logical.capacity.max_allocatable_bytes);
+    cap->set_put_eligible(logical.put_eligible);
+    cap->set_peak_member_utilization(logical.peak_member_utilization);
   }
 }
 
@@ -100,7 +153,7 @@ void FillTierKvCounts(::google::protobuf::RepeatedPtrField<::umbp::TierKvCount>*
   }
 }
 
-void FillBundle(::umbp::EventBundle* dst, const EventBundle& src) {
+void FillBundle(::umbp::EventBundle* dst, const EventBundle& src, bool include_logical_tiers) {
   dst->set_seq(src.seq);
   for (const auto& ev : src.events) {
     auto* pe = dst->add_events();
@@ -108,6 +161,7 @@ void FillBundle(::umbp::EventBundle* dst, const EventBundle& src) {
     pe->set_key(ev.key);
     pe->set_tier(ToProtoTier(ev.tier));
     pe->set_size(ev.size);
+    if (include_logical_tiers) pe->set_logical_tier(ev.logical_tier);
   }
 }
 
@@ -117,8 +171,7 @@ MasterClient::MasterClient(const UMBPMasterClientConfig& config)
     : config_(config),
       stub_(nullptr, [](void* p) { delete static_cast<::umbp::UMBPMaster::Stub*>(p); }) {
   grpc::ChannelArguments args;
-  args.SetMaxReceiveMessageSize(64 * 1024 * 1024);
-  args.SetMaxSendMessageSize(64 * 1024 * 1024);
+  ApplyGrpcLimits(&args);
   channel_ =
       grpc::CreateCustomChannel(config.master_address, grpc::InsecureChannelCredentials(), args);
   stub_.reset(::umbp::UMBPMaster::NewStub(channel_).release());
@@ -134,9 +187,10 @@ MasterClient::~MasterClient() {
   }
 }
 
-grpc::Status MasterClient::RegisterSelf(const std::map<TierType, TierCapacity>& tier_capacities,
-                                        const std::string& peer_address,
-                                        const std::vector<uint8_t>& engine_desc_bytes) {
+grpc::Status MasterClient::RegisterSelf(
+    const std::map<TierType, TierCapacity>& tier_capacities, const std::string& peer_address,
+    const std::vector<uint8_t>& engine_desc_bytes,
+    const std::map<std::string, LogicalTierCapacity>& logical_tier_capacities) {
   ScopedRpcTimer _rpc_timer(this, "RegisterClient");
   if (registered_) {
     return grpc::Status(grpc::StatusCode::ALREADY_EXISTS, "node is already registered");
@@ -148,6 +202,7 @@ grpc::Status MasterClient::RegisterSelf(const std::map<TierType, TierCapacity>& 
   req.set_peer_address(peer_address);
   req.set_engine_desc(engine_desc_bytes.data(), engine_desc_bytes.size());
   FillTierCapacities(req.mutable_tier_capacities(), tier_capacities);
+  FillLogicalTierCapacities(req.mutable_logical_tier_capacities(), logical_tier_capacities);
   for (const auto& tag : config_.tags) req.add_tags(tag);
 
   ::umbp::RegisterClientResponse resp;
@@ -160,17 +215,24 @@ grpc::Status MasterClient::RegisterSelf(const std::map<TierType, TierCapacity>& 
   }
 
   if (resp.heartbeat_interval_ms() > 0) heartbeat_interval_ms_ = resp.heartbeat_interval_ms();
+  supports_max_allocatable_capacity_ = resp.supports_max_allocatable_bytes();
+  supports_logical_tiers_ = resp.supports_logical_tiers();
+  aggregate_backend_capacities_ =
+      aggregate_backend_capacities_requested_ && supports_max_allocatable_capacity_;
   {
     std::lock_guard lock(hb_state_mutex_);
     hb_last_acked_seq_ = 0;
     next_bundle_seq_ = 1;
     outbox_.clear();
-    full_sync_pending_ = false;
+    full_sync_pending_ = supports_logical_tiers_ && peer_pool_ != nullptr;
   }
   {
     std::lock_guard lock(caps_mutex_);
     current_capacities_ = tier_capacities;
   }
+  registration_capacities_ = tier_capacities;
+  registered_peer_address_ = peer_address;
+  registered_engine_desc_bytes_ = engine_desc_bytes;
   registered_ = true;
   MORI_UMBP_INFO("[Client] Registered with master (heartbeat={}ms)", heartbeat_interval_ms_);
   StartMetricsReporting();
@@ -220,6 +282,7 @@ grpc::Status MasterClient::RoutePut(const std::string& key, uint64_t block_size,
           .node_id = resp.node_id(),
           .peer_address = resp.peer_address(),
           .tier = FromProtoTier(resp.tier()),
+          .logical_tier = resp.logical_tier(),
       };
       break;
     case ::umbp::ROUTE_PUT_OUTCOME_ALREADY_EXISTS:
@@ -259,6 +322,7 @@ grpc::Status MasterClient::RouteGet(const std::string& key,
   r.tier = FromProtoTier(resp.tier());
   r.size = resp.size();
   r.peer_address = resp.peer_address();
+  r.logical_tier = resp.logical_tier();
   *out_result = std::move(r);
   return grpc::Status::OK;
 }
@@ -297,6 +361,7 @@ grpc::Status MasterClient::BatchRoutePut(const std::vector<std::string>& keys,
             .node_id = e.node_id(),
             .peer_address = e.peer_address(),
             .tier = FromProtoTier(e.tier()),
+            .logical_tier = e.logical_tier(),
         };
         break;
       case ::umbp::ROUTE_PUT_OUTCOME_ALREADY_EXISTS:
@@ -333,7 +398,8 @@ grpc::Status MasterClient::BatchRouteGet(const std::vector<std::string>& keys,
   // Columnar response: node_ref[i] is a 1-based index into resp.nodes()
   // (0 = not found); tier[i] / size[i] are parallel per-key arrays.
   const int n = resp.node_ref_size();
-  if (resp.tier_size() != n || resp.size_size() != n) {
+  if (resp.tier_size() != n || resp.size_size() != n ||
+      (resp.logical_tier_size() != 0 && resp.logical_tier_size() != n)) {
     return grpc::Status(grpc::StatusCode::INTERNAL,
                         "BatchRouteGet: malformed columnar response (array length mismatch)");
   }
@@ -350,6 +416,7 @@ grpc::Status MasterClient::BatchRouteGet(const std::vector<std::string>& keys,
     r.tier = FromProtoTier(resp.tier(i));
     r.size = resp.size(i);
     r.peer_address = node.peer_address();
+    if (resp.logical_tier_size() == n) r.logical_tier = resp.logical_tier(i);
     (*out)[i] = std::move(r);
   }
   return grpc::Status::OK;
@@ -399,22 +466,25 @@ size_t AutoFlushEventThreshold() {
 }
 }  // namespace
 
-void MasterClient::SetPeerDramAllocator(PeerDramAllocator* dram_alloc) {
-  peer_alloc_ = dram_alloc;
-  AddOwnedLocationSource(dram_alloc);
-  if (dram_alloc != nullptr) {
-    dram_alloc->SetAutoFlushHook(AutoFlushEventThreshold(), [this] { FlushHeartbeat(); });
+void MasterClient::SetBackendRegistry(BackendRegistry* registry) {
+  registry_ = registry;
+  // Every medium's outbox feeds the same single-bundle heartbeat, so each one
+  // gets the same auto-flush hook — a backend added to the registry starts
+  // flushing without any change here.
+  const size_t threshold = AutoFlushEventThreshold();
+  for (auto* backend : Backends()) {
+    backend->SetAutoFlushHook(threshold, [this] { FlushHeartbeat(); });
   }
 }
 
-void MasterClient::SetPeerSsdManager(PeerSsdManager* ssd_manager) {
-  ssd_manager_ = ssd_manager;
-  AddOwnedLocationSource(ssd_manager);
+std::vector<MediumBackend*> MasterClient::Backends() const {
+  return registry_ == nullptr ? std::vector<MediumBackend*>{} : registry_->All();
 }
 
-void MasterClient::AddOwnedLocationSource(OwnedLocationSource* source) {
-  if (source == nullptr) return;
-  owned_sources_.push_back(source);
+std::map<TierType, uint64_t> MasterClient::OwnedKeyCountsByTier() const {
+  std::map<TierType, uint64_t> counts;
+  for (auto* backend : Backends()) counts[backend->Tier()] += backend->OwnedKeyCount();
+  return counts;
 }
 
 bool MasterClient::ClearFullSync() {
@@ -422,13 +492,16 @@ bool MasterClient::ClearFullSync() {
   if (!registered_) return false;
 
   auto caps = SnapshotAndCacheTierCapacities();
-  std::map<TierType, uint64_t> kv_counts;
-  if (peer_alloc_ != nullptr) kv_counts = peer_alloc_->OwnedKeyCountByTier();
+  auto kv_counts = OwnedKeyCountsByTier();
 
   ::umbp::HeartbeatRequest req;
   req.set_node_id(config_.node_id);
   req.set_is_full_sync(true);
   FillTierCapacities(req.mutable_tier_capacities(), caps);
+  if (supports_logical_tiers_ && peer_pool_ != nullptr) {
+    FillLogicalTierCapacities(req.mutable_logical_tier_capacities(),
+                              peer_pool_->LogicalTierCapacities());
+  }
   FillTierKvCounts(req.mutable_tier_kv_counts(), kv_counts);
   {
     std::lock_guard state_lock(hb_state_mutex_);
@@ -449,9 +522,11 @@ bool MasterClient::ClearFullSync() {
     return false;
   }
 
-  if (peer_alloc_ != nullptr) {
-    peer_alloc_->ClearFullSyncAcked();
-    MORI_UMBP_INFO("[Client] Clear full-sync acked by master; allocator writes re-enabled");
+  auto backends = Backends();
+  for (auto* backend : backends) backend->ClearFullSyncAcked();
+  if (!backends.empty()) {
+    MORI_UMBP_INFO("[Client] Clear full-sync acked by master; writes re-enabled on {} backend(s)",
+                   backends.size());
   }
   return true;
 }
@@ -509,17 +584,23 @@ void MasterClient::HeartbeatLoop() {
 std::map<TierType, TierCapacity> MasterClient::SnapshotAndCacheTierCapacities() {
   std::map<TierType, TierCapacity> caps;
   bool have_live = false;
-  if (peer_alloc_ != nullptr) {
-    caps = peer_alloc_->TierCapacitiesSnapshot();  // DRAM/HBM, bitmap-derived
-    have_live = true;
-  }
-  if (ssd_manager_ != nullptr) {
-    auto [used, total] = ssd_manager_->Capacity();
-    if (total > 0) {
-      const uint64_t avail = used < total ? total - used : 0;
-      caps[TierType::SSD] = TierCapacity{total, avail};
-      have_live = true;
+  for (auto* backend : Backends()) {
+    auto backend_cap = backend->Capacity();
+    if (aggregate_backend_capacities_) {
+      backend_cap.max_allocatable_bytes =
+          backend_cap.max_allocatable_bytes == 0
+              ? backend_cap.available_bytes
+              : std::min(backend_cap.max_allocatable_bytes, backend_cap.available_bytes);
     }
+    auto [it, inserted] = caps.try_emplace(backend->Tier(), backend_cap);
+    if (!inserted && aggregate_backend_capacities_) {
+      it->second.total_bytes = SaturatingAdd(it->second.total_bytes, backend_cap.total_bytes);
+      it->second.available_bytes =
+          SaturatingAdd(it->second.available_bytes, backend_cap.available_bytes);
+      it->second.max_allocatable_bytes =
+          std::max(it->second.max_allocatable_bytes, backend_cap.max_allocatable_bytes);
+    }
+    have_live = true;
   }
   std::lock_guard lock(caps_mutex_);
   if (!have_live) return current_capacities_;
@@ -536,8 +617,7 @@ bool MasterClient::SendHeartbeatOnce() {
   if (!registered_) return false;
 
   auto caps = SnapshotAndCacheTierCapacities();
-  std::map<TierType, uint64_t> kv_counts;
-  if (peer_alloc_ != nullptr) kv_counts = peer_alloc_->OwnedKeyCountByTier();
+  auto kv_counts = OwnedKeyCountsByTier();
 
   bool do_full_sync;
   {
@@ -560,6 +640,10 @@ bool MasterClient::SendFullSyncHeartbeatLocked(const std::map<TierType, TierCapa
   req.set_node_id(config_.node_id);
   req.set_is_full_sync(true);
   FillTierCapacities(req.mutable_tier_capacities(), caps);
+  if (supports_logical_tiers_ && peer_pool_ != nullptr) {
+    FillLogicalTierCapacities(req.mutable_logical_tier_capacities(),
+                              peer_pool_->LogicalTierCapacities());
+  }
   FillTierKvCounts(req.mutable_tier_kv_counts(), kv_counts);
 
   EventBundle snapshot;
@@ -568,8 +652,10 @@ bool MasterClient::SendFullSyncHeartbeatLocked(const std::map<TierType, TierCapa
     snapshot.seq = next_bundle_seq_ - 1;
     req.set_delta_seq_baseline(snapshot.seq);
   }
-  snapshot.events = SnapshotAllSourcesForFullSync(owned_sources_);
-  FillBundle(req.add_bundles(), snapshot);
+  snapshot.events = supports_logical_tiers_ && peer_pool_ != nullptr
+                        ? peer_pool_->SnapshotOwnedKeysForFullSync()
+                        : SnapshotAllBackendsForFullSync(Backends());
+  FillBundle(req.add_bundles(), snapshot, supports_logical_tiers_);
 
   ::umbp::HeartbeatResponse resp;
   grpc::Status status = SendHeartbeatRpcLocked(req, &resp);
@@ -585,21 +671,40 @@ bool MasterClient::SendDeltaHeartbeatLocked(const std::map<TierType, TierCapacit
   // Drain every owned-location source (DRAM allocator + SSD manager) and
   // concat into ONE bundle under ONE monotonic seq — never one seq per source,
   // which would break ack / seq-gap full-sync recovery.
-  auto new_events = DrainAllSources(owned_sources_);
+  auto new_events = supports_logical_tiers_ && peer_pool_ != nullptr
+                        ? peer_pool_->DrainPendingEvents()
+                        : DrainAllBackends(Backends());
   if (!new_events.empty()) {
     std::lock_guard state_lock(hb_state_mutex_);
-    outbox_.push_back(EventBundle{next_bundle_seq_++, std::move(new_events)});
+    const size_t per_bundle = HeartbeatEventsPerBundle();
+    for (size_t begin = 0; begin < new_events.size(); begin += per_bundle) {
+      const size_t end = std::min(new_events.size(), begin + per_bundle);
+      EventBundle bundle;
+      bundle.seq = next_bundle_seq_++;
+      bundle.events.reserve(end - begin);
+      std::move(new_events.begin() + begin, new_events.begin() + end,
+                std::back_inserter(bundle.events));
+      outbox_.push_back(std::move(bundle));
+    }
   }
 
   ::umbp::HeartbeatRequest req;
   req.set_node_id(config_.node_id);
   req.set_is_full_sync(false);
   FillTierCapacities(req.mutable_tier_capacities(), caps);
+  if (supports_logical_tiers_ && peer_pool_ != nullptr) {
+    FillLogicalTierCapacities(req.mutable_logical_tier_capacities(),
+                              peer_pool_->LogicalTierCapacities());
+  }
   FillTierKvCounts(req.mutable_tier_kv_counts(), kv_counts);
   {
     std::lock_guard state_lock(hb_state_mutex_);
+    size_t added = 0;
     for (const auto& bundle : outbox_) {
-      if (bundle.seq > hb_last_acked_seq_) FillBundle(req.add_bundles(), bundle);
+      if (bundle.seq <= hb_last_acked_seq_) continue;
+      if (added >= HeartbeatMaxBundlesPerRpc()) break;
+      FillBundle(req.add_bundles(), bundle, supports_logical_tiers_);
+      ++added;
     }
   }
 
@@ -617,7 +722,25 @@ bool MasterClient::SendDeltaHeartbeatLocked(const std::map<TierType, TierCapacit
     ::umbp::RegisterClientRequest re_req;
     re_req.set_node_id(config_.node_id);
     re_req.set_node_address(config_.node_address);
-    FillTierCapacities(re_req.mutable_tier_capacities(), caps);
+    re_req.set_peer_address(registered_peer_address_);
+    re_req.set_engine_desc(registered_engine_desc_bytes_.data(),
+                           registered_engine_desc_bytes_.size());
+    // Re-register conservatively until the replacement Master confirms support
+    // for aggregate-tier single-allocation limits.
+    const auto live_backends = Backends();
+    std::map<TierType, TierCapacity> conservative_caps;
+    if (live_backends.empty()) {
+      conservative_caps = registration_capacities_;
+    } else {
+      for (auto* backend : live_backends) {
+        conservative_caps.try_emplace(backend->Tier(), backend->Capacity());
+      }
+    }
+    FillTierCapacities(re_req.mutable_tier_capacities(), conservative_caps);
+    if (supports_logical_tiers_ && peer_pool_ != nullptr) {
+      FillLogicalTierCapacities(re_req.mutable_logical_tier_capacities(),
+                                peer_pool_->LogicalTierCapacities());
+    }
     for (const auto& tag : config_.tags) re_req.add_tags(tag);
     ::umbp::RegisterClientResponse re_resp;
     grpc::ClientContext re_ctx;
@@ -628,6 +751,11 @@ bool MasterClient::SendDeltaHeartbeatLocked(const std::map<TierType, TierCapacit
       _rpc_timer.SetStatus(re_status);
     }
     if (re_status.ok() || re_status.error_code() == grpc::StatusCode::ALREADY_EXISTS) {
+      supports_max_allocatable_capacity_ =
+          re_status.ok() && re_resp.supports_max_allocatable_bytes();
+      supports_logical_tiers_ = re_status.ok() && re_resp.supports_logical_tiers();
+      aggregate_backend_capacities_ =
+          aggregate_backend_capacities_requested_ && supports_max_allocatable_capacity_;
       registered_ = true;
       std::lock_guard state_lock(hb_state_mutex_);
       hb_last_acked_seq_ = 0;
@@ -654,7 +782,7 @@ grpc::Status MasterClient::SendHeartbeatRpcLocked(::umbp::HeartbeatRequest& req,
                                                   ::umbp::HeartbeatResponse* resp) {
   grpc::ClientContext ctx;
   ctx.set_deadline(std::chrono::system_clock::now() +
-                   std::chrono::milliseconds(RpcShutdownTimeoutMs()));
+                   std::chrono::milliseconds(HeartbeatRpcTimeoutMs()));
   grpc::Status status;
   {
     ScopedRpcTimer _rpc_timer(this, "Heartbeat");
@@ -662,10 +790,23 @@ grpc::Status MasterClient::SendHeartbeatRpcLocked(::umbp::HeartbeatRequest& req,
     _rpc_timer.SetStatus(status);
   }
   if (!status.ok()) return status;
-  std::lock_guard state_lock(hb_state_mutex_);
-  hb_last_acked_seq_ = resp->acked_seq();
-  while (!outbox_.empty() && outbox_.front().seq <= hb_last_acked_seq_) {
-    outbox_.pop_front();
+  bool more_pending = false;
+  bool made_progress = false;
+  {
+    std::lock_guard state_lock(hb_state_mutex_);
+    const uint64_t previous_ack = hb_last_acked_seq_;
+    hb_last_acked_seq_ = std::max(hb_last_acked_seq_, resp->acked_seq());
+    made_progress = hb_last_acked_seq_ > previous_ack;
+    while (!outbox_.empty() && outbox_.front().seq <= hb_last_acked_seq_) {
+      outbox_.pop_front();
+    }
+    more_pending = !outbox_.empty();
+  }
+  // Drain a bounded backlog immediately in consecutive RPCs instead of paying
+  // one heartbeat interval per chunk. Each RPC remains independently bounded.
+  if (more_pending && made_progress && heartbeat_running_) {
+    flush_requested_ = true;
+    hb_cv_.notify_one();
   }
   return status;
 }
@@ -821,8 +962,8 @@ void MasterClient::MetricsLoop() {
   // Final flush: ship the last sub-interval of provider deltas before the
   // thread exits.  PoolClient::Shutdown calls StopMetricsReporting() BEFORE
   // UnregisterSelf, so the master is still reachable here; without this final
-  // flush the last (<metrics_interval_ms_) of SSD counter deltas would be
-  // dropped at shutdown.
+  // flush the last (<metrics_interval_ms_) of every component's counter deltas
+  // would be dropped at shutdown.
   FlushMetricsOnce();
 }
 

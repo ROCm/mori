@@ -806,14 +806,12 @@ int main(int argc, char** argv) {
   const size_t io_bytes = o.batch * o.page_bytes;                      // src / dst staging
 
   // ---- clients ----
-  std::vector<std::vector<char>> dram_bufs(N);
   std::vector<std::vector<char>> src_bufs(N);
   std::vector<std::vector<char>> dst_bufs(N);
   std::vector<std::unique_ptr<PoolClient>> clients(N);
   const bool need_dst = (o.get_mode != GetMode::kExists);
 
   for (size_t id = 0; id < N; ++id) {
-    dram_bufs[id].assign(peer_buf_bytes, 0);
     src_bufs[id].assign(io_bytes, 0x5a);
     if (need_dst) dst_bufs[id].assign(io_bytes, 0);
 
@@ -828,8 +826,7 @@ int main(int argc, char** argv) {
     cfg.io_engine.port = 0;
     cfg.peer_service_port = NextPeerServicePort();
     cfg.dram_page_size = o.page_bytes;
-    cfg.dram_buffers = {{dram_bufs[id].data(), dram_bufs[id].size()}};
-    cfg.tier_capacities = {{TierType::DRAM, {dram_bufs[id].size(), dram_bufs[id].size()}}};
+    cfg.dram.buffer_sizes = {peer_buf_bytes};
     clients[id] = std::make_unique<PoolClient>(std::move(cfg));
     if (!clients[id]->Init()) {
       std::fprintf(stderr, "client %zu init failed\n", id);

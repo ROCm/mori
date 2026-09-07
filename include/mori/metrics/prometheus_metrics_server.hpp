@@ -102,9 +102,16 @@ class MetricsServer {
   void setGauge(std::string_view name, std::string_view help, const Labels& labels, double value);
 
   // Add `delta` to a monotonically-increasing counter (default delta = 1).
-  void addCounter(std::string_view name, std::string_view help, uint64_t delta = 1);
+  //
+  // `delta` is a double because a Prometheus counter is a double, and because
+  // not every counter counts whole things: a *_seconds_total accumulates
+  // fractions of a second, and taking a uint64 here silently floored every one
+  // of them to zero.  Whole-number counters are unaffected — see FormatValue in
+  // the .cpp, which serialises an integral double exactly rather than through
+  // the six-significant-digit default that would round a byte total.
+  void addCounter(std::string_view name, std::string_view help, double delta = 1);
   void addCounter(std::string_view name, std::string_view help, const Labels& labels,
-                  uint64_t delta = 1);
+                  double delta = 1);
 
   // Record one histogram observation.
   // `bounds` is an ascending list of finite upper-bound values; the implicit
@@ -149,12 +156,12 @@ class MetricsServer {
 
   struct CounterEntry {
     std::string help;
-    uint64_t value{0};
+    double value{0.0};
   };
 
   struct LabeledCounterFamily {
     std::string help;
-    std::map<std::string, uint64_t> series;
+    std::map<std::string, double> series;
   };
 
   struct LabeledGaugeFamily {
