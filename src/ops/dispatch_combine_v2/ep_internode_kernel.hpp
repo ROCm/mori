@@ -179,56 +179,34 @@ __device__ __forceinline__ size_t EpInterNodeOff(const EpInterNodeRegion obj, si
   return obj->off + byteOffset;
 }
 
-// ── the one primitive ccoGda does not expose ─────────────────────────────────
+// ── the remote actions ───────────────────────────────────────────────────────
 //
 // v1's chunk-flag protocol needs a remote atomic add at an *arbitrary* window
 // offset: one slot per (node, chunk) in EP's own arena, count scaling with the
-// token capacity, polled and cleared by the receiver. ccoGda's remote actions
-// (ccoGda_SignalInc / ccoGda_SignalAdd) address only the resource window's
-// signal pool -- a fixed gdaSignalCount slots read through waitSignal's
-// consume-on-read shadow -- so neither the address nor the semantics fit.
+// token capacity, polled and cleared by the receiver. ccoGda_SignalInc /
+// ccoGda_SignalAdd cannot name that target -- they resolve to
+// `signalId * sizeof(uint64_t)` in the DevComm's own resourceWindow -- so EP
+// passes ccoGda_WindowSignalAdd, which carries (window, offset, value) instead
+// of a slot id. Same NIC atomic, same single reservation; only the raddr/rkey
+// lookup differs.
 //
-// So the two lookups the facade would do -- (window, offset) -> (rkey, raddr)
-// and (pe, qpId) -> endpoint -- happen here and the WQE is posted through
-// mori::cco::impl. No warp protocol is duplicated: signalImpl posts one WQE for
-// its caller, and putImpl runs the same warp aggregation the facade would have
-// run.
-//
-// THIS IS A LAYERING VIOLATION AND SHOULD NOT BE COPIED. cco_scale_out.hpp says
-// of that namespace: "Device kernels use the public ccoGda<> facade ... never
-// these directly", and EP is its only caller outside cco. It is here because the
-// facade cannot currently express the operation, not because reaching past it is
-// acceptable: the resolver pins a remote action to
-// `signalId * sizeof(uint64_t)` in comm.resourceWindow, and EP's chunk flags are
-// at an arbitrary offset in EP's own window.
-//
-// The fix belongs in cco, and is small: a remote-action type carrying
-// (window, offset, value) alongside ccoGda_SignalInc / ccoGda_SignalAdd, plus one
-// `else if constexpr` per resolver site. `put` and `signal` are already templated
-// on RemoteAction, so both of the calls below would then go through the facade
-// unchanged and this block would delete. Until then, folding the flag atomic into
-// the put's own reservation is worth keeping -- the facade route costs one extra
-// doorbell and CQE per chunk, on the critical path of a latency-bound kernel.
+// The tradeoff that comes with naming your own window: waitSignal / readSignal /
+// resetSignal do not see these, because they are written against the resource
+// window's signal pool and its consume-on-read shadow. EP polls and clears the
+// flags itself, which is what its protocol did anyway.
 
-__device__ __forceinline__ ::mori::core::RdmaEndpointDevice* EpInterNodeEndpoint(
-    const ::mori::cco::ccoDevComm& comm, int pe, int qpId) {
-  auto* ibgda = const_cast<::mori::cco::ccoIbgdaContext*>(&comm.ibgda);
-  // endpoints and peerRkeys are world-indexed; v1 always passes a world rank,
-  // which is what CCO_TEAM_WORLD means at the ccoGda calls below.
-  return &ibgda->endpoints[pe * ibgda->numQpPerPe + (qpId % ibgda->numQpPerPe)];
-}
-
-__device__ __forceinline__ uint32_t EpInterNodeRkey(const EpInterNodeRegion obj, int pe) {
-  return EpInterNodeWin(obj)->ibgdaWin.peerRkeys[pe];
+__device__ __forceinline__ ::mori::cco::ccoGda_WindowSignalAdd EpInterNodeFlagAdd(
+    const EpInterNodeRegion flag, size_t flagOffset, uint64_t value) {
+  return ::mori::cco::ccoGda_WindowSignalAdd{EpInterNodeWin(flag), EpInterNodeOff(flag, flagOffset),
+                                             value};
 }
 
 __device__ __forceinline__ void EpInterNodeAtomicAdd(const ::mori::cco::ccoDevComm& comm,
                                                      const EpInterNodeRegion dst, size_t dstOffset,
                                                      uint64_t value, int pe, int qpId = 0) {
-  ::mori::core::RdmaEndpointDevice* ep = EpInterNodeEndpoint(comm, pe, qpId);
-  ::mori::cco::impl::signalImpl<kEpInterNodeProvider>(ep, ep->qpn, EpInterNodeOff(dst, dstOffset),
-                                                      EpInterNodeRkey(dst, pe),
-                                                      ::mori::cco::ccoGdaSignalAdd, value);
+  ::mori::cco::ccoGda<kEpInterNodeProvider> gda{comm, qpId};
+  gda.template signal<::mori::cco::CCO_TEAM_WORLD>(pe, EpInterNodeFlagAdd(dst, dstOffset, value),
+                                                   ::mori::cco::ccoCoopThread{});
 }
 
 // RDMA write with the flag atomic fused into the same reservation. The ordering
@@ -238,34 +216,30 @@ __device__ __forceinline__ void EpInterNodeAtomicAdd(const ::mori::cco::ccoDevCo
 // write, with the slot index doubling as the PSN (BNXT reserves its signal PSN
 // behind the data PSNs for the same reason).
 //
-// This is the signalled put shmem had. Going through ccoGda's facade cannot
-// express it: ccoGda_SignalAdd resolves its target as
-// signalId * sizeof(uint64_t) in the resource window, and v1's chunk flags live
-// at an arbitrary offset in EP's own arena, so the facade would have to issue a
-// bare put and leave us to post the atomic as a second reservation -- one extra
-// doorbell and CQE per chunk. impl::putImpl takes the signal as a raw
-// (raddr, rkey, op, arg), which is exactly the triple EpInterNodeAtomicAdd already
-// hands to impl::signalImpl, so the flag buffer drops straight in.
+// This is the signalled put shmem had, and it stays ONE reservation: issuing a
+// bare put and posting the atomic separately would cost an extra doorbell and
+// CQE per chunk, on the critical path of a latency-bound kernel.
 //
-// One atomic per warp group, posted by putImpl's leader lane. That is the shape
-// shmem had and the dedup call site depends on it: its active lanes carry the
-// same flag slot and the same value, so a single add per group is the protocol,
-// not a saving. Every active lane must also agree on pe and qpId -- calling
-// putImpl directly skips the facade's group-by-peer ballot, and all three call
-// sites are warp-uniform in both (proxyPe follows the warp's node, and
-// startTokenIdx is a multiple of warpSize so tokenId / warpSize is too).
+// ccoGdaThreadAggregate, not ThreadIndependent: the latter runs a group-by-peer
+// ballot before posting, which every call site here would resolve in a single
+// iteration anyway -- all three are warp-uniform in pe and qpId (proxyPe follows
+// the warp's node, and startTokenIdx is a multiple of warpSize so
+// tokenId / warpSize is too). Aggregate skips the ballot and posts directly,
+// which is the shape shmem had. The warp aggregation itself is unaffected: it
+// lives in putImpl, below the ThreadMode branch, so one atomic per warp group
+// from the leader lane either way -- the shape the dedup call site depends on,
+// since its active lanes carry the same flag slot and the same value.
 __device__ __forceinline__ void EpInterNodePutSignal(const ::mori::cco::ccoDevComm& comm,
                                                      const EpInterNodeRegion dst, size_t dstOffset,
                                                      const EpInterNodeRegion src, size_t srcOffset,
                                                      size_t bytes, const EpInterNodeRegion signal,
                                                      size_t signalOffset, uint64_t signalValue,
                                                      int pe, int qpId) {
-  ::mori::core::RdmaEndpointDevice* ep = EpInterNodeEndpoint(comm, pe, qpId);
-  ::mori::cco::impl::putImpl<kEpInterNodeProvider>(
-      ep, ep->qpn, EpInterNodeOff(src, srcOffset), EpInterNodeWin(src)->ibgdaWin.lkey,
-      EpInterNodeOff(dst, dstOffset), EpInterNodeRkey(dst, pe), bytes, /*hasSignal=*/true,
-      EpInterNodeOff(signal, signalOffset), EpInterNodeRkey(signal, pe),
-      ::mori::cco::ccoGdaSignalAdd, signalValue);
+  ::mori::cco::ccoGda<kEpInterNodeProvider> gda{comm, qpId};
+  gda.template put<::mori::cco::CCO_TEAM_WORLD, ::mori::cco::ccoGdaThreadAggregate>(
+      pe, EpInterNodeWin(dst), EpInterNodeOff(dst, dstOffset), EpInterNodeWin(src),
+      EpInterNodeOff(src, srcOffset), bytes, EpInterNodeFlagAdd(signal, signalOffset, signalValue),
+      ::mori::cco::ccoCoopThread{});
 }
 
 __device__ __forceinline__ void EpInterNodePut(const ::mori::cco::ccoDevComm& comm,

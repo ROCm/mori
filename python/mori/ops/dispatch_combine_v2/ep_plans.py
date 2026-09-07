@@ -56,10 +56,10 @@ plan_api.load_library(_LIB_NAME, extra_dirs=_extra_dirs())
 EpDispatchPlan = make_plan("ep_dispatch")
 EpCombinePlan = make_plan("ep_combine")
 
-# The v1 internode sequence. Eight plans rather than two: v1's dispatch and
-# combine are several passes each, and each pass is its own module. The two name
-# tables must match the C++ enums -- EpInterNodeDType in ep_internode_cfg.hpp and
-# QuantType in dispatch_combine.hpp.
+# The internode sequence. Eight plans rather than two: its dispatch and combine
+# are several passes each, and each pass is its own module. Both name tables must
+# match the C++ enums, which are now v2's own -- EpInterNodeDType and
+# EpQuantType, both in ep_internode_cfg.hpp.
 INTERNODE_DTYPES = {"bf16": 0, "f32": 1, "fp8_fnuz": 2, "fp8_ocp": 3, "fp4": 4}
 INTERNODE_QUANT_TYPES = {
     "none": 0,

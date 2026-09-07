@@ -111,6 +111,32 @@ struct ccoGda_SignalAdd {
   __device__ inline ccoGda_SignalAdd(ccoGdaSignal_t id, uint64_t val) : signalId(id), value(val) {}
 };
 
+// Atomic add at an arbitrary offset in a caller-owned window, rather than at a
+// signal slot in the DevComm's resource window.
+//
+// ccoGda_SignalInc / ccoGda_SignalAdd address the resource window's signal pool:
+// gdaSignalCount fixed slots, at signalId * sizeof(uint64_t), read back through
+// waitSignal's consume-on-read shadow. That fits a caller whose flags are the
+// signals; it does not fit one whose flags are a data structure of its own --
+// EP's internode chunk-flag protocol, for instance, keeps one slot per (node,
+// chunk) in its own arena, scaling with token capacity, and polls and clears
+// them itself.
+//
+// The remote op is identical (a NIC atomic add); only the target resolution
+// differs, so this rides the same single-reservation path as ccoGda_SignalAdd --
+// fused into `put`'s own doorbell when passed to put, no extra WQE. `offset` is
+// window-relative with iova=0, the same convention as put's dstOffset.
+//
+// waitSignal/readSignal/resetSignal do NOT see these: the target is the caller's
+// window, so the caller polls it directly.
+struct ccoGda_WindowSignalAdd {
+  ccoWindow_t win;
+  size_t offset;
+  uint64_t value;
+  __device__ inline ccoGda_WindowSignalAdd(ccoWindow_t w, size_t off, uint64_t val)
+      : win(w), offset(off), value(val) {}
+};
+
 struct ccoGda_CounterInc {
   ccoGdaCounter_t counterId;
   __device__ inline ccoGda_CounterInc(ccoGdaCounter_t id) : counterId(id) {}
@@ -1091,6 +1117,14 @@ __device__ inline void ccoGda<PrvdType>::put(int peer, ccoWindow_t dstWin, size_
       signalRkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[worldPeer];
       signalOp = ccoGdaSignalAdd;
       signalOpArg = remoteAction.value;
+    } else if constexpr (std::is_same_v<RemoteAction, ccoGda_WindowSignalAdd>) {
+      // Caller's window, not the resource window: the offset is already
+      // window-relative (iova=0), so it is the raddr as-is.
+      signalRaddr = remoteAction.offset;
+      signalRkey =
+          reinterpret_cast<ccoWindowDevice*>(remoteAction.win)->ibgdaWin.peerRkeys[worldPeer];
+      signalOp = ccoGdaSignalAdd;
+      signalOpArg = remoteAction.value;
     }
 
     // Only mixed-peer thread scope needs per-peer grouping; ThreadAggregate and
@@ -1154,6 +1188,14 @@ __device__ inline void ccoGda<PrvdType>::putValue(int peer, ccoWindow_t dstWin, 
     } else if constexpr (std::is_same_v<RemoteAction, ccoGda_SignalAdd>) {
       signalRaddr = remoteAction.signalId * sizeof(uint64_t);
       signalRkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[worldPeer];
+      signalOp = ccoGdaSignalAdd;
+      signalOpArg = remoteAction.value;
+    } else if constexpr (std::is_same_v<RemoteAction, ccoGda_WindowSignalAdd>) {
+      // Caller's window, not the resource window: the offset is already
+      // window-relative (iova=0), so it is the raddr as-is.
+      signalRaddr = remoteAction.offset;
+      signalRkey =
+          reinterpret_cast<ccoWindowDevice*>(remoteAction.win)->ibgdaWin.peerRkeys[worldPeer];
       signalOp = ccoGdaSignalAdd;
       signalOpArg = remoteAction.value;
     }
@@ -1249,6 +1291,14 @@ __device__ inline void ccoGda<PrvdType>::signal(int peer, RemoteAction remoteAct
     } else if constexpr (std::is_same_v<RemoteAction, ccoGda_SignalAdd>) {
       signalRaddr = remoteAction.signalId * sizeof(uint64_t);
       signalRkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[worldPeer];
+      signalOp = ccoGdaSignalAdd;
+      signalOpArg = remoteAction.value;
+    } else if constexpr (std::is_same_v<RemoteAction, ccoGda_WindowSignalAdd>) {
+      // Caller's window, not the resource window: the offset is already
+      // window-relative (iova=0), so it is the raddr as-is.
+      signalRaddr = remoteAction.offset;
+      signalRkey =
+          reinterpret_cast<ccoWindowDevice*>(remoteAction.win)->ibgdaWin.peerRkeys[worldPeer];
       signalOp = ccoGdaSignalAdd;
       signalOpArg = remoteAction.value;
     }
