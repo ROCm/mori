@@ -248,7 +248,16 @@ def main(argv):
             comm.barrier()
 
             # Identity expert: recv_x already holds the dispatched tokens.
-            out, out_w = op.combine(recv_x, wts, routing=routing)
+            #
+            # Converting it is the CALLER's job when the two legs have different
+            # element types, exactly as v1's harness does it (_get_combine_input
+            # -> _to_combine_dtype). The combine kernel's T is the combine dtype
+            # and it reads inpTokenBuf as T*, so handing it the fp8 dispatch
+            # output unconverted reinterprets fp8 bytes as bf16.
+            combine_in = (
+                recv_x.to(cfg.combine_dtype) if cfg.is_asymmetric_dtype else recv_x
+            )
+            out, out_w = op.combine(combine_in, wts, routing=routing)
             torch.cuda.synchronize()
             comm.barrier()
 
@@ -300,16 +309,17 @@ def main(argv):
                 viol = (got - exp).abs() - bound
                 if bool((viol > 0).any()):
                     fi = int(viol.argmax())
-                    t, d = fi // cfg.hidden_dim, fi % cfg.hidden_dim
+                    # NOT `t, d` -- `d` is the Dist handle in this scope.
+                    vt, vd = fi // cfg.hidden_dim, fi % cfg.hidden_dim
                     g, e, pin = (
-                        float(got[t, d]),
-                        float(exp[t, d]),
-                        float(per_elem[t, d]),
+                        float(got[vt, vd]),
+                        float(exp[vt, vd]),
+                        float(per_elem[vt, vd]),
                     )
                     print(
-                        f"#   worst: tok={t} dim={d} got={g:.6g} want={e:.6g} "
-                        f"input={pin:.6g} U={int(Ut[t])} "
-                        f"|diff|={abs(g - e):.6g} bound={float(bound[t, d]):.6g} "
+                        f"#   worst: tok={vt} dim={vd} got={g:.6g} want={e:.6g} "
+                        f"input={pin:.6g} U={int(Ut[vt])} "
+                        f"|diff|={abs(g - e):.6g} bound={float(bound[vt, vd]):.6g} "
                         f"rel={abs(g - e) / max(abs(e), 1e-9):.4f} "
                         f"nviol={int((viol > 0).sum())}",
                         flush=True,

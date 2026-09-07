@@ -291,20 +291,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 f"quant_type={cfg.quant_type!r} "
                 "(the internode combine implements none and fp8_direct_cast)"
             )
-        # The internode kernel is single-T: EpDispatchCombineArgs<T> carries one
-        # element type, and `hiddenBytes = hiddenDim * sizeof(T)` sizes both the
-        # dispatch payload and the combine output. A dispatch dtype narrower than
-        # the combine dtype does not fault -- the kernel writes hidden*sizeof(fp8)
-        # bytes and the combine_out view reads hidden*sizeof(bf16), so half the
-        # output is whatever was already there. Reject it: on this path an fp8
-        # transport is spelled quant_type='fp8_direct_cast', which keeps T at the
-        # combine dtype and uses fp8 for the staging slots only.
-        if cfg.is_asymmetric_dtype:
-            bad.append(
-                f"asymmetric dtype (dispatch {cfg.dispatch_dtype} -> combine "
-                f"{cfg.combine_dtype}): the internode kernel has a single element "
-                "type; use quant_type='fp8_direct_cast' for an fp8 transport"
-            )
         # The same-destination dedup is a ballot with one lane per expert.
         from .dispatch_combine_op import WAVE
 
@@ -423,6 +409,24 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         torch.float32: "f32",
         torch.float8_e4m3fnuz: "fp8_fnuz",
         torch.float8_e4m3fn: "fp8_ocp",
+    }
+
+    # Which leg each pass belongs to. The two legs are separate Plans and carry
+    # DIFFERENT element types, exactly as the intranode path does: the kernel's
+    # `T` is "elements of this leg's dtype", and `hiddenBytes = hiddenDim *
+    # sizeof(T)` sizes the dispatch payload in one and the combine output in the
+    # other. Compiling all eight with the dispatch dtype is what made an fp8
+    # dispatch write hidden*sizeof(fp8) bytes where the bf16 combine_out view
+    # reads hidden*sizeof(bf16) -- half the output left as whatever was there.
+    _INTERNODE_LEG = {
+        "copystaging": "dispatch",
+        "dispatch": "dispatch",
+        "dispatch_ll": "dispatch",
+        "combinesync": "combine",
+        "combinesyncbarrier": "combine",
+        "combine": "combine",
+        "combine_ll": "combine",
+        "combineall": "combine",
     }
 
     # (phase, low_latency) -> the pass sequence, in launch order. Two for
@@ -579,14 +583,22 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return out
 
     def _build_internode_kernels(self, cfg) -> KernelSet:
-        dtype_tag = self._INTERNODE_DTYPE.get(cfg.dispatch_dtype)
-        if dtype_tag is None:
+        # One tag per leg, not one for the op: see _INTERNODE_LEG.
+        leg_dtype = {
+            "dispatch": self._INTERNODE_DTYPE.get(cfg.dispatch_dtype),
+            "combine": self._INTERNODE_DTYPE.get(cfg.combine_dtype),
+        }
+        missing = [
+            f"{leg} dtype "
+            f"{cfg.dispatch_dtype if leg == 'dispatch' else cfg.combine_dtype}"
+            for leg, tag in leg_dtype.items()
+            if tag is None
+        ]
+        if missing:
             return KernelSet(
                 dispatch={},
                 combine={},
-                unsupported=(
-                    f"dispatch dtype {cfg.dispatch_dtype} has no internode entry",
-                ),
+                unsupported=tuple(f"{m} has no internode entry" for m in missing),
             )
 
         self._internode_buckets = self._internode_geometry_buckets(cfg)
@@ -619,8 +631,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 needed.setdefault(geom, set()).update(names)
         for geom, names in needed.items():
             block, rdma, warp = geom
-            req = self._internode_request(cfg, dtype_tag, block, warp, rdma)
-            built = {n: cb.EP_INTERNODE_PLANS[n](**req) for n in sorted(names)}
+            built = {}
+            for n in sorted(names):
+                req = self._internode_request(
+                    cfg, leg_dtype[self._INTERNODE_LEG[n]], block, warp, rdma
+                )
+                built[n] = cb.EP_INTERNODE_PLANS[n](**req)
             self._internode_plans[geom] = built
             self._plans.extend(built.values())
 
