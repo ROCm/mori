@@ -196,6 +196,39 @@ def _bench(op, cfg, d, dev, a, comm):
     torch.cuda.synchronize()
     wall = (time.perf_counter() - t0) * 1e6 / n
 
+    # Host profile, opt-in. Whenever wall exceeds dispatch+combine the loop above
+    # is host-paced, and then its phase numbers are wrapper cost rather than
+    # kernel cost. This says which wrapper. It runs its OWN untimed loop so the
+    # profiler's overhead can never land in a reported number.
+    if os.environ.get("MORI_EP_HOST_PROFILE"):
+        import cProfile
+        import pstats
+
+        # EVERY rank runs the loop; only rank 0 prints. dispatch and combine are
+        # collectives -- a rank that enters them alone spins in the kernel's
+        # wait-for-peers loop forever, which reads as one GPU pinned at 100% with
+        # every other idle. Guarding the loop itself on rank 0 (rather than just
+        # the reporting) is exactly that hang.
+        pr = cProfile.Profile()
+        pr.enable()
+        for _ in range(n):
+            rp = op.dispatch(inp, wts, None, idx, return_routing=True)
+            op.combine(convert(rp[0]), wts, routing=rp[5])
+        pr.disable()
+        torch.cuda.synchronize()
+        comm.barrier()
+        if d.rank != 0:
+            return 0
+        st = pstats.Stats(pr)
+        rows = sorted(st.stats.items(), key=lambda kv: -kv[1][2])[:20]
+        print(f"# HOST PROFILE tok={ct}  (us/round, sorted by self time)", flush=True)
+        for (fn, ln, name), (_, nc, tt, _ct, _) in rows:
+            print(
+                f"#   self={tt / n * 1e6:8.1f}  cum={_ct / n * 1e6:8.1f}  "
+                f"n={nc / n:5.1f}  {os.path.basename(fn)}:{ln}({name})",
+                flush=True,
+            )
+
     keep = slice(a.drop_rounds, None)
     disp = [ev[3 * i].elapsed_time(ev[3 * i + 1]) * 1e3 for i in range(n)][keep]
     comb = [ev[3 * i + 2].elapsed_time(ev[3 * i + 3]) * 1e3 for i in range(n)][keep]

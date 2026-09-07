@@ -80,7 +80,6 @@ _SCALE_ALIGN = 128
 _FP8_TUNING_DTYPES = (torch.float8_e4m3fnuz, torch.float8_e4m3fn)
 
 
-
 def scale_stride_bytes(scale_bytes: int) -> int:
     """What a DESTINATION scale row is laid down at: EpScaleStride in ep_cfg.hpp.
 
@@ -281,6 +280,17 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             torch.float32,
         )
 
+        # Pin everything fixed for the op's lifetime, now that every buffer it
+        # names exists. The launch path re-fills every field passed through
+        # `args` on every call -- only bound values reach the plan's cached
+        # struct -- so passing the whole 36-field schema each time cost ~40
+        # ctypes field writes per phase, measured as the largest single item in
+        # the host profile (80 _set_arg calls per round). Binding leaves eight.
+        static = self._internode_static_args()
+        for built in self._internode_plans.values():
+            for plan in built.values():
+                plan.bind(**static)
+
     def _internode_unsupported(self, cfg) -> tuple[str, ...]:
         bad = []
         if cfg.is_scatter:
@@ -477,7 +487,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             mpCount=self._mp_count,
         )
 
-    def _internode_arena_args(self):
+    def _internode_static_args(self):
         """The window handle, the seventeen offsets and the local pointers.
 
         Everything here is fixed for the life of the op, so it is built once and
@@ -486,7 +496,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         per pass sequence, on a path where the host is already the thing the GPU
         waits for.
         """
-        cached = getattr(self, "_internode_static_args", None)
+        cached = getattr(self, "_internode_static_cache", None)
         if cached is not None:
             return cached
         a = self.arena
@@ -496,7 +506,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         def ptr(t):
             return 0 if t is None else t.data_ptr()
 
-        self._internode_static_args = dict(
+        self._internode_static_cache = dict(
             window=a.handle,
             offDispatchInp=off("inter_dispatch_inp"),
             offCombineInp=off("inter_combine_inp"),
@@ -535,7 +545,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # embed a ccoDevComm by value, so the binding memcpys from host memory.
             devComm=self._dev_comm._dev_comm.host_ptr,
         )
-        return self._internode_static_args
+        return self._internode_static_cache
 
     # Below this token count the LL variants win; above it the plain ones do.
     # The same split v1's bench selects at, and both variants are compiled either
@@ -728,8 +738,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 weights_ptr = 0
             indices_ptr = getattr(self, "_internode_indices_ptr", 0)
 
-            args = dict(self._internode_arena_args())
-            args.update(
+            # Only what varies. The rest is bound on the plan; see
+            # _build_internode_kernels.
+            args = dict(
                 curRankNumToken=num_tokens,
                 replayMode=0,
                 dispDestTokIdMap=dest_map.data_ptr(),
@@ -746,7 +757,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     f"[trace] {phase} ll={ll} tokens={num_tokens} "
                     f"weightsBuf={weights_ptr:#x} tokenIndices={indices_ptr:#x} "
                     f"dispDestTokIdMap={args['dispDestTokIdMap']:#x} "
-                    f"offCombineOutWeights={args['offCombineOutWeights']} "
                     f"rdma={args['rdmaBlockNum']} passes={names}",
                     flush=True,
                 )
