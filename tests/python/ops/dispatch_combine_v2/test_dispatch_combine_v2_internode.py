@@ -241,6 +241,25 @@ def _parse_args(argv):
     # with its own error; before it is written into the table it gets one long
     # head-to-head against what it would replace.
     p.add_argument("--tuning-candidate", default=None)
+    # What a candidate is selected ON. "total" by default, and deliberately:
+    # internode_tuning_configs.py records that the two phases are COUPLED -- a
+    # dispatch with too few rdma blocks leaves the following combine ~18us slower
+    # at 4/8 tokens -- so the shipped small-token dispatch is NOT the dispatch
+    # argmin, it holds rdma high to keep the paired combine fast. Selecting a
+    # dispatch geometry on dispatch time alone reproduces exactly the mistake
+    # that comment warns about. "phase" is kept for looking at a phase in
+    # isolation, which is a diagnostic, not a way to choose a table row.
+    p.add_argument("--tuning-metric", default="total", choices=["total", "phase"])
+    # Greedy chaining (v1's shape: a winner becomes the incumbent) is OFF by
+    # default here. With a chain, one lucky early win moves the baseline and
+    # every later candidate is judged against it, so the outcome depends on the
+    # order noise arrived in: five repeats of the same 29-candidate sweep at 15
+    # paired reps returned five different winners -- (80,53,4), (16,10,4) twice,
+    # (16,8,4), (8,5,8) -- plus (32,21,8) on two earlier runs. Holding the
+    # incumbent FIXED at the shipped geometry makes every candidate an
+    # independent paired test against the thing it would replace, which is both
+    # what we want to know and reproducible across repeats.
+    p.add_argument("--tuning-greedy", action="store_true")
     # How much better a candidate must be, on the paired difference, to take
     # over. Whichever of the two is larger. Not 0: see the note in _tune.
     p.add_argument("--tuning-margin-us", type=float, default=1.5)
@@ -835,6 +854,11 @@ def _build_op(cfg, comm, dgeom, cgeom):
                 os.environ[k] = v
 
 
+def _med(xs):
+    v = sorted(xs)
+    return v[len(v) // 2]
+
+
 def _tune(cfg, d, dev, a, comm):
     """Sweep launch geometries and report the winner for this token count.
 
@@ -906,7 +930,10 @@ def _tune(cfg, d, dev, a, comm):
     # after it slower) and a per-phase argmin measured against a DIFFERENT other
     # phase does not carry over.
     geoms = lambda g: ((g, inc_c) if phase == "dispatch" else (inc_d, g))
-    pick = (lambda dv, cv: dv) if phase == "dispatch" else (lambda dv, cv: cv)
+    if a.tuning_metric == "total":
+        pick = lambda dv, cv: dv + cv
+    else:
+        pick = (lambda dv, cv: dv) if phase == "dispatch" else (lambda dv, cv: cv)
 
     best_op = _build_op(cfg, comm, *geoms(start))
     if a.kernel_type is not None:
@@ -914,6 +941,7 @@ def _tune(cfg, d, dev, a, comm):
     comm.barrier()
     best = start
     best_med = None
+    fixed_wins = []  # non-greedy: every candidate that beat the fixed incumbent
 
     for k, cand in enumerate(cands):
         try:
@@ -927,11 +955,14 @@ def _tune(cfg, d, dev, a, comm):
         comm.barrier()
 
         bt, ct_ = [], []
+        bph, cph = [], []  # (dispatch, combine) per rep, to show the coupling
         for _ in range(a.tuning_reps):
             dv, cv = _timed_pass(best_op, cfg, d, a, inp, idx, wts, sc, cw, convert, a.rounds, a.warmup)
             bt.append(pick(dv, cv))
+            bph.append((dv, cv))
             dv, cv = _timed_pass(cand_op, cfg, d, a, inp, idx, wts, sc, cw, convert, a.rounds, a.warmup)
             ct_.append(pick(dv, cv))
+            cph.append((dv, cv))
         bm, cm = sorted(bt)[len(bt) // 2], sorted(ct_)[len(ct_) // 2]
         # PAIRED comparison, not a difference of medians. The two arms are
         # measured alternately inside one rep, so both see the same regime -- and
@@ -953,18 +984,38 @@ def _tune(cfg, d, dev, a, comm):
             print(
                 f"#   [{k + 1}/{len(cands)}] {cand} med={cm:6.1f}us vs "
                 f"incumbent {best} med={bm:6.1f}us  paired={dmed:+6.1f}us "
-                f"[{lo:+.1f},{hi:+.1f}]  {'WIN' if win else '--'}",
+                f"[{lo:+.1f},{hi:+.1f}]  {'WIN' if win else '--'}"
+                f"   d/c cand={_med(x for x, _ in cph):.1f}/{_med(y for _, y in cph):.1f}"
+                f" inc={_med(x for x, _ in bph):.1f}/{_med(y for _, y in bph):.1f}",
                 flush=True,
             )
-        if win:
+        if win and a.tuning_greedy:
             best_op.close()
             best_op, best, best_med = cand_op, cand, cm
         else:
             cand_op.close()
+            if not a.tuning_greedy and win:
+                fixed_wins.append((dmed, cand, cm, bm))
             best_med = bm
         comm.barrier()
 
     best_op.close()
+    if d.rank == 0 and not a.tuning_greedy:
+        fixed_wins.sort()
+        print(
+            f"# TUNING tok={a.max_tokens} phase={phase}: {len(fixed_wins)} of "
+            f"{len(cands)} candidates beat the fixed incumbent {start}",
+            flush=True,
+        )
+        for dm, cd, cm2, bm2 in fixed_wins[:5]:
+            print(
+                f"#   BEAT {cd} paired={dm:+.1f}us (cand med={cm2:.1f} "
+                f"inc med={bm2:.1f})",
+                flush=True,
+            )
+        if fixed_wins:
+            best = fixed_wins[0][1]
+            best_med = fixed_wins[0][2]
     if d.rank == 0:
         d_out = best if phase == "dispatch" else inc_d
         c_out = best if phase == "combine" else inc_c

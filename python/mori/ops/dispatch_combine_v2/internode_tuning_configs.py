@@ -71,9 +71,35 @@ from mori.ops import utils as gpu_utils
 # moved: a single shared 80/rdma40/warp4 geometry for both phases beat the old
 # 80/48/8 + 80/40/8 by ~4us total (disp 41.3 vs 43.6, comb 51.1 vs 53.1),
 # reproducible across two A/B batches.
+#
+# Re-tune (2026-09-08, v2 CCO path, `--cmd tuning` in the v2 harness): only the
+# 4-token DISPATCH moved, 64/32/8 -> 32/16/4. Everything else in this table was
+# re-swept and held: 4-token combine, both phases at 8, 16 and 32 tokens -- 0
+# reproducible wins over 3 repeats each (16 and 32 gave 0 wins in all 6 runs).
+#
+# That row is the one change because it is the only one that reproduced. Three
+# independent 29-candidate sweeps ranked 32/16/4 first every time (-2.4, -2.6,
+# -2.8us paired against the fixed incumbent), and eight 51-rep head-to-heads gave
+# a median of -2.3us with 6 of 8 clearing the margin. The per-phase split is
+# consistent across all eight: dispatch 36.9-38.4us against 39.2-40.9us, combine
+# 46.2-46.9 against 45.8-46.6 -- so the gain is ~6% of dispatch and the combine
+# after it is unchanged.
+#
+# That last part matters, because the coupling note above predicts the opposite:
+# it records rdma 16 costing ~+18us on the paired combine at 4/8 tokens, which is
+# why this row held rdma at 32. On the v2 CCO path that penalty does not appear
+# (46.5 vs 46.5 in the validation runs), so the reason for keeping rdma high at 4
+# tokens has gone with it. The note is left standing for the 8-token row, whose
+# sweep found nothing better and which still carries rdma 32.
+#
+# Methodology, because a sweep on this path is easy to get wrong: candidates are
+# judged by a PAIRED comparison against a FIXED incumbent, not by a chain. v1's
+# greedy shape (a winner becomes the incumbent) is unusable at this noise level
+# -- five repeats of one sweep returned five different winners. See _tune in
+# tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py.
 _MI308X_EP16_H6144 = (
     # max_tok, disp_block, disp_rdma, disp_warp, comb_block, comb_rdma, comb_warp
-    (4, 64, 32, 8, 32, 21, 6),
+    (4, 32, 16, 4, 32, 21, 6),
     (8, 64, 32, 8, 32, 21, 6),
     (16, 80, 40, 4, 80, 40, 4),
     (None, 80, 48, 8, 80, 40, 8),
