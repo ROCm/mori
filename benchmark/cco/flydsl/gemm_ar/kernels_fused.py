@@ -1282,20 +1282,27 @@ def compile_fused_gemm_scatter(
         base_row = block_m * BLOCK_M + wave_m_offset
         base_col = block_n * BLOCK_N + wave_n_offset
 
-        if const_expr(fuse):
-            # Re-balance the half-wave barrier counts before the epilogue.
-            # The prologue's `if wave_m == 1: s_barrier()` gives waves 4-7 one
-            # extra barrier, so every later rendezvous pairs w1's k-th barrier
-            # with w0's (k+1)-th and waves 0-3 run one phase ahead. A one-shot
-            # GEMM does not care -- the trailing barrier is released when the
-            # other half exits. The fused epilogue does: `wait_barrier(0)` after
-            # store_c is supposed to mean "every wave's C tile has retired", and
-            # under the offset it instead rendezvouses waves 0-3 (which hold
-            # thread 0, hence the counter and the put) with waves 4-7 sitting at
-            # the *previous* barrier -- before their stores. Thread 0 then counts
-            # the tile and can issue the transfer while half the tile is unwritten.
-            if wave_m == 0:
-                rocdl.s_barrier()
+        # Close the half-wave barrier pairing the prologue opened. Its
+        # `if wave_m == 1: s_barrier()` gives waves 4-7 one extra barrier, and
+        # s_barrier is a counting rendezvous, so from then on waves 0-3 run one
+        # phase ahead -- which is the intended stagger for the double-buffered
+        # main loop, and wrong for anything that comes after it. gcnasm closes
+        # the pair here too and does it unconditionally
+        # (opus_gemm_a2a_lsa/gemm_a16w16_quad_subtile_kernel_template.hpp:693,
+        # outside its `if constexpr (ChunkFused)`); aiter's 8-wave kernel opens
+        # the stagger at gemm_a8w8_8wave.py:449 and never closes it.
+        #
+        # Not gated on `fuse`: with the offset live, `wait_barrier(0)` after
+        # store_c does not mean "every wave's C tile has retired" -- it
+        # rendezvouses waves 0-3, which hold thread 0 and therefore the counter
+        # and the transfer, with waves 4-7 still sitting at the previous barrier,
+        # before their stores. That is what made --chunks 2 fail one run in
+        # three. The split path has nothing after store_c so it cannot observe
+        # the imbalance today, but leaving the counts unbalanced makes the next
+        # thing added after the epilogue silently wrong, which is exactly how
+        # this bug got here.
+        if wave_m == 0:
+            rocdl.s_barrier()
 
         store_c.store(c00_frag, base_row + 0, base_col + 0)
         store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
