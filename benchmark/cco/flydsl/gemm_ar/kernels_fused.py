@@ -260,51 +260,50 @@ and it is nowhere near enough. Halving BLOCK_M would free roughly 16 by halving
 the accumulator count, but moves the tile count to 896 -- remainder 128, where
 gcnasm measured +0.41%. There is no version of this that pays.
 
-## Direct LSA (``--mode fused-lsa``): the structure works, the store does not
+## Direct LSA (``--mode fused-lsa``): correct now, and still slower than split
 
 gcnasm's best mode has the GEMM epilogue store *straight into the destination
-rank's window*, so there is no staging buffer, no copy engine and nothing to
-publish mid-kernel. Ported here, and the structural half is emphatic
-(rocprofv3 --kernel-trace, us):
+rank's window*, so there is no staging buffer, no copy engine and nothing to hand
+to one. The structural half is emphatic -- the scatter collapses from 136.8us to
+about 10us, the transfer is entirely absorbed -- and it was wrong for a long time.
 
-    config                gemm   scatter/barrier  reduce  gather    sum
-    split-sdma            39.1        136.8         13.5   137.3   326.8
-    fused-sdma c=1        62.7        129.0         13.0   136.2   341.0
-    fused-lsa (Direct)   166.6         13.3         11.1   135.5   326.6
+What was missing: **the producing kernel has to publish.** In the LSA 2-stage
+all-reduce the producer fences (``ar/kernels_lsa.py``, every lane of every block,
+right after the ``tmp`` stores). Here the producer is the GEMM, and the only
+fence was in the separate barrier kernel -- one block, so one XCD's L2 out of
+eight. The other seven kept the peer-homed lines dirty while the LSA flag, being
+a system-scope atomic, overtook them. Adding ``cco_system_fence`` at the end of
+the GEMM fixes it: 10 runs of 10 at the fp8 floor.
 
-The scatter collapses from 136.8us to 13.3us -- the transfer is *entirely*
-absorbed, which is what fused-sdma never managed. And the un-coalesced store is
-nowhere near as bad as expected: 7.34MB per link in 166.6us is ~44 GB/s, 82% of
-the SDMA scatter's 53.7, against the 0.26x gcnasm measured for a lane-scatter
-pushed to a peer.
+The fence can be ``leaderOnly``, which is worth 80us (434us -> 355). That is only
+legal because the half-wave barrier pair is closed (see below): ``wait_barrier(0)``
+now really does mean every wave's stores have retired into this CU's L2, so one
+wave writing it back covers all eight. Measured as incorrect before that fix,
+which is what made a per-wave release look mandatory.
 
-It is nonetheless **not correct**, and the reason makes the ``StoreC`` coalescing
-rewrite a correctness prerequisite rather than an optimisation:
+Two things that did *not* work, both worth recording because they look obvious:
 
-* **Cached peer stores validate 2-3 runs in 6.** The lines are homed in the
-  peer's memory but sit dirty in whichever XCD's L2 the block ran on. Nothing
-  downstream can clean that up -- the barrier kernel is one block, and
-  ``buffer_wbl2`` writes back only the L2 of the XCD it runs on, one of eight.
-* **Uncached (sc0|sc1) peer stores are consistently wrong** (relL2 ~3e-2, never
-  right) **and slower** (426us against 341). ``_store_bf16`` writes one bf16, so
-  bypassing L2 makes every store a 2-byte partial-line write; concurrent sub-32B
-  writes into the same sector across the fabric lose updates. Adding an uncached
-  recv load in the reduce does not change it, so this is the store, not a stale
-  read.
+* **Uncached (``sc0|sc1``) peer stores**, so there would be nothing to flush.
+  Consistently wrong, ~1.7e-2, at 2 bytes per lane and still at 16 after the
+  permlane stage -- so the earlier "2-byte partial-line writes lose updates"
+  explanation was not it, and the cause is unknown.
+* **The 3-stage C store**, which is worth 6.7% on a local store, is worth nothing
+  here: 189.4us of GEMM either way. The peer store crosses the fabric and that
+  phase is bounded by ~44 GB/s of link bandwidth, not by issue rate or
+  coalescing.
 
-So L2 merging is what makes the narrow store work at all, and L2 residency is
-what makes it invisible. The two are only separable by widening the store --
-gcnasm's wave-local ``ds_bpermute`` pair-coalesced C store (their "C-store mode
-2"; staging C through LDS regressed 1-3%). That is why they needed it.
+Per-kernel, 8 ranks, [4096, 7168], K=1024, with the 3-stage C store:
 
-Even coalesced, this does not obviously win. The fused sum is 326.6us against
-split-lsa's ~324: LSA's 2-stage does read + reduce + write in a single pass over
-the wire, so its reduce is free, whereas Direct LSA writes to the peer and then
-pays a separate local reduce pass -- and its store rate is ~18% under LSA's read
-rate. The prize for coalescing is correctness plus maybe a few percent, not a
-step change.
+    config                gemm    barrier  reduce  gather     sum     e2e
+    split-lsa             35.7      (one all-reduce kernel, 274.3)   318.8us
+    fused-lsa            189.4       10.1    10.9   135.6   346.0   359.0us
 
-## What gcnasm does differently, and why its GEMM+a2a wins
+So it is correct and 12% slower. The reason is structural: LSA's stage 1 does
+read + reduce + write in a single pass over the wire, so its reduce is free,
+while Direct LSA writes to the peer and then pays a separate local reduce pass --
+and its store rate is ~44 GB/s against LSA's ~51 GB/s read rate.
+
+## What gcnasm does differently## What gcnasm does differently, and why its GEMM+a2a wins
 
 ``/workspace/gcnasm/opus_gemm_dist/opus_gemm_a2a_lsa`` fuses a GEMM with an
 all-to-all and gets 16-27% out of it. Reading it explains most of why this does
@@ -368,31 +367,39 @@ Repeated runs remain the only way to judge any of this;
 ``test_fused_is_stable_across_repeats`` requires three runs to be *identical*,
 not merely each small, because every individual relL2 here looks plausible.
 
-## Result: fused-sdma reaches parity, and does not beat LSA
+## Result: split-lsa still wins
 
-8 ranks, [4096, 7168], K=1024, graph replay, median of 3-4 runs:
+8 ranks, [4096, 7168], K=1024, graph replay, with the 3-stage C store. Failures
+are out of 10 runs, counting any result that is not the 2.35e-3 fp8 floor:
 
-                             default C-store   + 3-stage C-store
-    split-lsa                      326.8us            321.8us
-    split-sdma                     334.6              330.9
-    fused-sdma  chunks=2           326.2              323.0
-    fused-lsa                      341.0    racy, see above
+    mode                            time    wrong
+    split-lsa                     318.8us    0/10
+    fused-sdma  chunks=1          342        0/10
+    fused-sdma  chunks=2          325        3/10   <- fastest, still racy
+    split-sdma                    329.7      0/10
+    fused-lsa   3-stage, leader   359.0      0/10
 
-Per-kernel for the SDMA paths (rocprofv3 --kernel-trace, us):
+Per-kernel:
 
-    config                gemm   scatter/drain  reduce  gather    sum
-    split-sdma            39.1        136.8      13.5   137.3   326.8
-    fused-sdma chunks=2   60.9        126.9      13.1   135.1   336.1
+    config                gemm  scatter/barrier  reduce  gather     sum
+    split-sdma            35.7        136.8       13.5   135.5   321.5
+    fused-sdma chunks=1   57.6        130.4       13.1   135.1   336.2
+    fused-lsa            189.4         10.1       10.9   135.6   346.0
 
-So the fusion is no longer a loss -- it beats split-sdma by ~2.5% and ties
-split-lsa -- but it does not win. The overlap it buys (scatter 136.8 -> 126.9)
-is roughly cancelled by what the epilogue costs the GEMM (39.1 -> 60.9), and the
-reduce and all-gather, 46% of the pipeline, are untouched by construction.
+Neither fusion beats ``split-lsa``, and the reason is the same for both: LSA's
+2-stage does read + reduce + write in one pass over the wire, so its reduce is
+free, while every fused variant here writes somewhere and then pays a separate
+local reduce. On top of that ``fused-lsa``'s peer store runs at ~44 GB/s against
+LSA's ~51 GB/s read, and ``fused-sdma``'s overlap (scatter 136.8 -> 130.4 at
+chunks=1) is cancelled by what the epilogue costs the GEMM (35.7 -> 57.6).
 
-An ATT thread trace puts the epilogue at 26% of the kernel's latency, almost all
-of it one instruction waiting on the release fence's writeback -- 13.9% of the
-kernel, more than any main-loop stall. The fence discussion under ``--fence``
-covers why that is quadratic and what did and did not help.
+``--chunks 2`` is the one configuration that is genuinely faster than the best
+split path would suggest -- 325us against split-sdma's 329.7 -- and it is wrong
+3 runs in 10. The barrier-phase fix took it from about 1 in 3 to 3 in 10, so
+whatever remains is a second, rarer bug. Default is 1.
+
+Reduce and all-gather are 46% of the pipeline and untouched by any of this,
+which caps what fusing the scatter can ever be worth.
 
 ## Pinned copy
 
@@ -449,6 +456,7 @@ from flydsl._mlir.dialects import llvm as _llvm_d  # noqa: E402
 from flydsl._mlir.dialects import scf  # noqa: E402
 
 from _compat import (  # noqa: E402
+    CM_CACHED,
     CM_SC0_SC1,
     atomic_add_u32,
     atomic_store_u32,
@@ -668,6 +676,7 @@ class _PermlaneStoreC(_SwapABStoreC):
 
     _adjacent_probe = False
     _lane_transpose = False
+    _peer_uncached = False
 
     def store(self, c_frag, base_row, base_col):
         self._emit(c_frag, base_row, base_col,
@@ -758,7 +767,20 @@ class _PermlaneStoreC(_SwapABStoreC):
             oob = fx.Int32(self.c_rows * self.c_cols)
             idx = arith.select(col + 7 < self.c_cols, row * self.c_cols + col, oob)
             if self._peer_rsrc is not None:
-                buffer_store(out8, self._peer_rsrc, fx.Int32(idx) - self._elem_base)
+                # The store goes to a *peer*, so a cached one leaves the line
+                # dirty in whichever XCD's L2 this block ran on, where nothing
+                # downstream can reach it -- the barrier kernel is one block and
+                # buffer_wbl2 writes back only its own XCD's L2, one of eight.
+                # sc0|sc1 skips both. That was not usable while the store was one
+                # bf16 (a 2-byte partial-line write over the fabric loses
+                # updates), but the permlane stage makes it 16 bytes per lane and
+                # 64 contiguous per row, which is what makes it viable now.
+                buffer_store(
+                    out8,
+                    self._peer_rsrc,
+                    fx.Int32(idx) - self._elem_base,
+                    cache_modifier=CM_SC0_SC1 if self._peer_uncached else CM_CACHED,
+                )
             else:
                 fx.memref_store_vec(out8, self.reg_bf16_8)
                 fx.copy(
@@ -771,6 +793,12 @@ class _LaneTransposeStoreC(_PermlaneStoreC):
     """``_PermlaneStoreC`` plus gcnasm's ds_bpermute lane transpose."""
 
     _lane_transpose = True
+
+
+class _LaneTransposeUncachedPeerStoreC(_LaneTransposeStoreC):
+    """Same, but the peer store bypasses L1 and L2 (Direct LSA only)."""
+
+    _peer_uncached = True
 
 
 class _AdjacentLaneProbeC(_PermlaneStoreC):
@@ -923,6 +951,8 @@ def compile_fused_gemm_scatter(
     permlane: bool = False,
     lane_transpose: bool = False,
     hoist_scales: bool = False,
+    peer_uncached: bool = False,
+    direct_fence: str = "leader",
     transport: str = "sdma",
     fence: str = "none",
     emit_put: bool = True,
@@ -1027,7 +1057,7 @@ def compile_fused_gemm_scatter(
         raise ValueError(
             f"fence must be all/agent/leader/none/writethrough/wt-agent, got {fence!r}"
         )
-    _kname_tag = f"{'S' if swap_ab else ''}{'P' if permlane else ''}{'T' if lane_transpose else ''}{'H' if hoist_scales else ''}{'W' if store_probe else ''}c{chunks}{'r' if rotated else 'l'}{fence[0]}"
+    _kname_tag = f"{'S' if swap_ab else ''}{'P' if permlane else ''}{'T' if lane_transpose else ''}{'H' if hoist_scales else ''}{'U' if peer_uncached else ''}{direct_fence[0]}{'W' if store_probe else ''}c{chunks}{'r' if rotated else 'l'}{fence[0]}"
     counter_off = cfg.counter_off
     lock_off = cfg.lock_off
     in_off = cfg.input_off
@@ -1157,7 +1187,12 @@ def compile_fused_gemm_scatter(
             )
         elif const_expr(direct_lsa and swap_ab and permlane and lane_transpose):
             dest_blk = block_m // fx.Int32(m_tiles_per_peer)
-            store_c = _LaneTransposeStoreC(
+            _cls = (
+                _LaneTransposeUncachedPeerStoreC
+                if const_expr(peer_uncached)
+                else _LaneTransposeStoreC
+            )
+            store_c = _cls(
                 A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B,
                 peer_rsrc=create_buffer_resource_from_addr(
                     wave_uniform_i64(w_pre.lsa_ptr(dest_blk, my_recv_slot)),
@@ -1370,6 +1405,23 @@ def compile_fused_gemm_scatter(
             store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
             store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
         # ---- end pinned copy ----
+
+        if const_expr(direct_lsa):
+            # Publish the peer stores from the blocks that made them. This is the
+            # one thing Direct LSA cannot inherit from the split path: in the LSA
+            # 2-stage all-reduce the producing kernel fences (ar/kernels_lsa.py,
+            # every lane of every block, right after the tmp stores), whereas
+            # here the producer is the GEMM and the only fence was in the
+            # separate barrier kernel -- one block, hence one XCD's L2 out of
+            # eight. The other seven XCDs kept the peer-homed lines dirty and the
+            # LSA flag, being a system-scope atomic, overtook them.
+            wait_barrier(0)
+            # leaderOnly is legal here only because the barrier pair above is
+            # now closed: wait_barrier(0) really does mean every wave's stores
+            # have retired into this CU's L2, so one wave writing it back covers
+            # all eight. It was measured as incorrect before that fix, which is
+            # what made it look like a per-wave release was mandatory.
+            raw_cco.cco_system_fence(fx.Int32(1 if direct_fence == "leader" else 0))
 
         if const_expr(fuse and not direct_lsa):
             # Retire every lane's C stores, then agree block-wide that they are

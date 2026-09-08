@@ -156,8 +156,11 @@ def run(args) -> int:
     # done, which under the rotated tile order is the end of the GEMM, so nothing
     # overlaps. It was pinned to 1 for a while because it raced; the cause was the
     # half-wave barrier offset, fixed in kernels_fused's epilogue.
-    m_tiles_per_peer = max(1, (args.m // world_size) // args.block_m)
-    chunks = args.chunks if args.chunks else m_tiles_per_peer
+    # 1. >1 is what creates the overlap and is measurably faster (~325us vs
+    # ~342), and it is still wrong 3 runs in 10 -- see the race note in
+    # kernels_fused. The barrier-phase fix took it from 1-in-3 to 3-in-10, not
+    # to zero.
+    chunks = args.chunks if args.chunks else 1
     cfg = ArConfig(
         world_size=world_size,
         m=args.m,
@@ -208,6 +211,8 @@ def run(args) -> int:
             permlane=args.permlane,
             lane_transpose=args.lane_transpose,
             hoist_scales=args.hoist_scales,
+            peer_uncached=args.peer_uncached,
+            direct_fence=args.direct_fence,
             rotated=None if args.tile_order == "auto" else args.tile_order == "rotated",
             fence=args.fence,
             emit_put=not args.no_put,
@@ -272,7 +277,11 @@ def run(args) -> int:
             rel_l2 = diff / denom if denom else diff
             # fp8 inputs, so this is quantization error, not a collective error;
             # the collective itself is checked bit-exactly in test_flydsl_ar.py.
-            validated = rel_l2 < 5e-3
+            # 3e-3, not 5e-3. The fp8 quantisation floor for these inputs is
+            # 2.35e-3 and the corruption this pipeline produces lands at
+            # 4-9e-3, so a looser gate reports a corrupt run as validated -- one
+            # did, at 3.97e-3, while the fused path was racing.
+            validated = rel_l2 < 3e-3
             if not validated:
                 print(f"[rank {rank}] VALIDATION FAILED relL2={rel_l2:.3e}", flush=True)
             del acc
@@ -418,6 +427,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="load each A/B scale once for the four half-tile stores instead of "
         "twice (needs --permlane)",
+    )
+    p.add_argument(
+        "--peer-uncached",
+        action="store_true",
+        help="fused-lsa: store to the peer with sc0|sc1 so nothing is left dirty "
+        "in a local L2 the barrier cannot reach",
+    )
+    p.add_argument(
+        "--direct-fence",
+        choices=("all", "leader"),
+        default="leader",
+        help="fused-lsa: whether every lane or only thread 0 publishes the "
+        "block's peer stores. leader is legal because the barrier pair is closed "
+        "and is worth 80us (355 vs 434)",
     )
     p.add_argument("--sdma-queues", type=int, default=8)
     p.add_argument("--warmup", type=int, default=10)
