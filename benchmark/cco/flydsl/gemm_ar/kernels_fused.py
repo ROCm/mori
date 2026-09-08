@@ -156,6 +156,57 @@ All three stages are candidates to push back into aiter's ``StoreC``: bit-exact,
 no register cost, and the 6.7% is on the GEMM itself, independent of any
 all-reduce.
 
+## Persistent tiles: tried, and not viable on FlyDSL today
+
+gcnasm builds this kernel family both ways (``PERSISTENT=1|0``) and its README
+has a tail-balance sweep: the win is entirely a function of the remainder after
+whole 256-CTA batches -- +9.97% at remainder 8, +8.41% at 32, and only +0.77% at
+192. wo_b is 16 x 28 = 448 tiles on 256 CUs, i.e. remainder **192**, the benign
+end of that curve.
+
+The tail itself is real here, and large. Sweeping N at M=4096, K=1024
+(gemm-only, best of 3, 8 ranks):
+
+    N       tiles  remainder   time
+    4096      256      0      32.64us
+    4352      272     16      45.88us     <- 6% more work, 40% more time
+    4608      288     32      44.68
+    5120      320     64      45.24
+    6144      384    128      47.40
+    7168      448    192      49.80
+
+So a persistent scheduler was worth trying rather than arguing about. It was
+implemented (one workgroup per CU, striding over tiles) and made bit-exact, and
+it is a **~2x regression**, for a reason that has nothing to do with scheduling:
+
+    variant                       gemm     scratch
+    one workgroup per tile       38.54us      0 B
+    body wrapped in an scf.for   74.48us    156 B/thread
+
+Wrapping the pipeline in a runtime loop makes FlyDSL spill the MFMA
+accumulators. ``fly-promote-regmem-to-vectorssa`` does not promote
+``make_rmem_tensor`` values declared inside an ``scf.for`` region, and 156 bytes
+per thread of scratch in the inner pipeline costs more than the entire tail. The
+persistent version does beat the *looped* baseline by ~3% (82.3 vs 84.8us at
+remainder 192, 76.8 vs 79.8 at remainder 16), which matches gcnasm's numbers --
+but that is a gain over an already 94%-regressed kernel.
+
+Two things worth keeping from the attempt:
+
+* **The half-wave barrier does not survive a loop.** The prologue's
+  ``if wave_m == 1: rocdl.s_barrier()`` deliberately runs the two half-waves one
+  barrier out of phase. That is fine once, but in a persistent loop the offset
+  accumulates by one per tile, so from the second tile on the halves rendezvous
+  at mismatched program points and the LDS double-buffering races -- silently,
+  partial corruption inside otherwise-correct tiles. A compensating
+  ``if wave_m == 0: s_barrier()`` at the end of each tile fixes it exactly.
+* **The LDS handles must be rebound per tile**, not hoisted: the pipeline swaps
+  those Python bindings as it advances, and hoisting makes eight
+  shared-address-space pointers loop-carried, which fails to legalize.
+
+Reviving this needs the FlyDSL promotion fix first. Until then the ceiling is
+gcnasm's +0.77% at our remainder, against a 94% floor.
+
 ## Direct LSA (``--mode fused-lsa``)## Direct LSA (``--mode fused-lsa``)## Direct LSA (``--mode fused-lsa``)## Direct LSA (``--mode fused-lsa``): the structure works, the store does not
 
 gcnasm's best mode has the GEMM epilogue store *straight into the destination
