@@ -131,9 +131,27 @@ def test_decode_shape_picks_two_stage():
 
 
 def test_blocks_are_capped_and_never_zero():
-    assert _cfg(m=16384).blocks == layout.K_MAX_BLOCKS
+    assert _cfg(m=16384).blocks == layout.LSA_BLOCK_CAP
     assert _cfg(m=1).blocks >= 1
-    assert _cfg(m=1).blocks <= layout.K_MAX_BLOCKS
+    assert _cfg(m=1).blocks <= layout.LSA_BLOCK_CAP
+    # the cap is a tuning knob, the signal array is the correctness bound
+    assert layout.LSA_BLOCK_CAP <= layout.K_MAX_BLOCKS
+
+
+def test_blocks_stride_the_index_space_by_threads_not_by_peer_group():
+    """One thread owns one index across all peers, so a block covers `threads`."""
+    c = _cfg(m=4096)
+    small = layout.ArConfig(world_size=8, m=8, n=7168)
+    assert small.packs_per_rank == 896
+    assert small.blocks == 2  # ceil(896/512), not aiter's ceil(896/64) = 14
+    assert c.blocks == layout.LSA_BLOCK_CAP
+
+
+def test_force_blocks_must_fit_the_signal_array():
+    with pytest.raises(ValueError, match="force_blocks"):
+        layout.ArConfig(
+            world_size=8, m=4096, n=7168, force_blocks=layout.K_MAX_BLOCKS + 1
+        ).validate()
 
 
 def test_remote_traffic_model():

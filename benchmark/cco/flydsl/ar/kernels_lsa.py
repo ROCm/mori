@@ -41,10 +41,18 @@ Protocol parity with ``aiter/csrc/include/custom_all_reduce.cuh``:
   visibility is only guaranteed between threads with the same tid
   (``custom_all_reduce.cuh:556-560``).
 
-Deliberate divergence: aiter's 2-stage stages every peer's pack through LDS and
-reduces on ``warp_id == 0`` only, costing two ``__syncthreads()`` per iteration
-at 1/8 occupancy. Here each thread reads all peers straight into registers. The
-benchmark A/Bs the two.
+Deliberate divergence: aiter's 2-stage stage 1 assigns one peer per warp
+(``tid = blockIdx.x * tnum_gpu + lane_id``, ``warp_id`` selects the peer), stages
+each pack through LDS and reduces on ``warp_id == 0`` only, at the cost of two
+``__syncthreads()`` per iteration. Here each thread reads all peers straight into
+registers, which needs no LDS and no block-wide sync and keeps 8x more loads in
+flight per thread. That extra concurrency is why the grid has to be much smaller
+than aiter's -- see ``layout.LSA_BLOCK_CAP``. Measured within 5-10% of aiter at
+M >= 2048 and faster at M = 8192; see ``bench_ar.py`` for the table.
+
+What is *not* a legitimate divergence is the all-gather loop nesting -- see the
+comment in ``ar_2stage``. Getting that wrong costs ~3x and is invisible in the
+output, so it is a selectable variant rather than a deleted mistake.
 
 Each kernel is specialised on the Python ``rank`` so every window offset folds
 to a constant, as ``examples/cco/python/07_flydsl_sdma`` does.
@@ -106,13 +114,27 @@ def _spin_until(rsrc, flag):
         scf.YieldOp([nxt.ir_value() if hasattr(nxt, "ir_value") else nxt])
 
 
-def build_lsa_ar(cfg, rank: int, *, force_stage: int | None = None):
+#: All-gather loop nestings that ``build_lsa_ar`` can emit. See ``ar_2stage``.
+GATHER_VARIANTS = ("interleaved", "sequential")
+
+
+def build_lsa_ar(
+    cfg,
+    rank: int,
+    *,
+    force_stage: int | None = None,
+    gather: str = "interleaved",
+):
     """Compile an LSA all-reduce launcher for ``cfg`` on ``rank``.
 
     Returns ``(run, stage)`` where ``run(dev_comm, win, stream=...)`` performs one
     in-place all-reduce of the window's input region into its output region.
+
+    ``gather`` selects the 2-stage all-gather loop nesting; see ``ar_2stage``.
     """
     cfg.validate()
+    if gather not in GATHER_VARIANTS:
+        raise ValueError(f"gather must be one of {GATHER_VARIANTS}, got {gather!r}")
     ws = cfg.world_size
     stage = force_stage if force_stage is not None else cfg.stage
     if stage not in (1, 2):
@@ -266,21 +288,51 @@ def build_lsa_ar(cfg, rank: int, *, force_stage: int | None = None):
         # --- stage 2: all-gather. Thread `gtid` reads exactly the tmp indices it
         # wrote in stage 1 -- cross-device visibility only holds between threads
         # with the same tid.
+        #
+        # The loop nesting is the whole ballgame here. `interleaved` puts the
+        # peer loop *inside* the index loop and unrolls it (aiter's
+        # `#pragma unroll for i < ngpus` at custom_all_reduce.cuh:566), so one
+        # iteration has 8 loads outstanding against 8 different peers and all 8
+        # xGMI links stream at once. `sequential` drains one peer completely
+        # before starting the next, which pins the all-gather to a single link:
+        # 7 remote passes x (nbytes/8 / 55GB/s) instead of one. At M=4096 that is
+        # the difference between ~133us and ~660us for this half of the kernel.
+        # Kept selectable because it is the cleaner-looking code and the trap is
+        # not obvious from reading it.
         out = create_buffer_resource_from_addr(wave_uniform_i64(w.lsa_ptr(rank, out_off)))
-        for j in range_constexpr(ws):
-            src_rank = (rank + j) % ws
-            src = create_buffer_resource_from_addr(
-                wave_uniform_i64(w.lsa_ptr(src_rank, tmp_off))
+        srcs = [
+            create_buffer_resource_from_addr(
+                wave_uniform_i64(w.lsa_ptr((rank + j) % ws, tmp_off))
             )
-            dst_base = src_rank * part
-            n_here = cfg.owner_pack_range(src_rank)[1] - dst_base
-            for pk in range(gtid, n_here, stride_packs):
-                v = buffer_load(
-                    src, pk * I32_PER_PACK, vec_width=4, dtype=i32_type()
-                )
-                buffer_store(
-                    v, out, (dst_base + pk) * I32_PER_PACK, cache_modifier=CM_CACHED
-                )
+            for j in range(ws)
+        ]
+        # validate() forces num_packs % world == 0, so every rank owns exactly
+        # `part` packs and aiter's `idx < part || from == ngpus-1` guard is moot.
+        if gather == "interleaved":
+            for pk in range(gtid, part, stride_packs):
+                # Issue every load before any store so the 8 links overlap; a
+                # load/store pair per peer would serialise on each s_waitcnt.
+                vals = [
+                    buffer_load(
+                        srcs[j], pk * I32_PER_PACK, vec_width=4, dtype=i32_type()
+                    )
+                    for j in range_constexpr(ws)
+                ]
+                for j in range_constexpr(ws):
+                    dst = ((rank + j) % ws) * part + pk
+                    buffer_store(
+                        vals[j], out, dst * I32_PER_PACK, cache_modifier=CM_CACHED
+                    )
+        else:
+            for j in range_constexpr(ws):
+                dst_base = ((rank + j) % ws) * part
+                for pk in range(gtid, part, stride_packs):
+                    v = buffer_load(
+                        srcs[j], pk * I32_PER_PACK, vec_width=4, dtype=i32_type()
+                    )
+                    buffer_store(
+                        v, out, (dst_base + pk) * I32_PER_PACK, cache_modifier=CM_CACHED
+                    )
 
     kernel = ar_1stage if stage == 1 else ar_2stage
 

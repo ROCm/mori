@@ -31,10 +31,10 @@ kernel-for-kernel:
 * ``Signal { start[kMaxBlocks][8]; end[kMaxBlocks][8]; _flag[kMaxBlocks] }``,
   each region 128-byte aligned -- the slots are per (block, peer) so blocks
   synchronise independently (``custom_all_reduce.cuh:43-51``).
-* ``blocks = min(80, ceil((size_packs / world) / (threads / world)))`` with
-  ``threads = 512`` (``custom_all_reduce.cuh:3790-3796``).
 * 1-stage below the size thresholds, 2-stage above
   (``custom_all_reduce.cuh:3771-3788``).
+
+The launch geometry deliberately does *not* follow aiter -- see ``LSA_BLOCK_CAP``.
 
 The transport is the only thing this file does not model: LSA and SDMA share the
 window layout, they differ only in how bytes move.
@@ -50,6 +50,19 @@ THREADS = 512  # THREAD_NUM / __launch_bounds__(512, 1)
 MAX_WORLD = 8  # Signal::start[..][8] fixes the peer fan-out at 8
 PACK_BYTES = 16  # one 16B pack is the atomic transfer unit
 SIGNAL_ALIGN = 128  # alignas(128) on each Signal region
+
+# Grid cap for the LSA kernels. NOT aiter's 80: aiter gives each thread one pack
+# from one peer (its `warp_id` selects the peer), while ours gives each thread one
+# index across all `world` peers -- 8x the in-flight bytes per thread. Matching
+# aiter's grid therefore over-subscribes the xGMI request queues, and measurably
+# so: at [4096, 7168] bf16 on 8x MI355X the time rises monotonically past ~32
+# blocks (286us @28 -> 361 @80 -> 583 @256). Measured plateau is 24-36; 24 is
+# chosen because it is also the optimum at [512, 7168], where the curve is
+# sharper (64.0us @24 vs 68.5 @32).
+#
+# The signal array still has K_MAX_BLOCKS rows, so this cap can be raised for
+# experiments without touching the window layout.
+LSA_BLOCK_CAP = 24
 
 # 1-stage thresholds, in bytes (custom_all_reduce.cuh:3779).
 ONE_STAGE_MAX_BYTES_LE4 = 160 * 1024
@@ -91,7 +104,12 @@ class ArConfig:
     n: int
     elem_bytes: int = 2  # bf16
     threads: int = THREADS
-    max_blocks: int = K_MAX_BLOCKS
+    max_blocks: int = K_MAX_BLOCKS  # signal-array rows, never the launched grid
+    block_cap: int = LSA_BLOCK_CAP
+    #: Override the computed grid. Only the signal array bounds the grid for
+    #: correctness (``start[max_blocks][8]``), so raising this also needs
+    #: ``max_blocks`` raised. Exists so the benchmark can sweep occupancy.
+    force_blocks: int | None = None
 
     # --- basic sizes ---
 
@@ -151,12 +169,15 @@ class ArConfig:
 
     @property
     def blocks(self) -> int:
-        per_block = self.threads_per_peer
-        if self.stage == 1:
-            need = (self.num_packs + per_block - 1) // per_block
-        else:
-            need = (self.packs_per_rank + per_block - 1) // per_block
-        return max(1, min(self.max_blocks, need))
+        # One thread owns one pack index and reduces it across every peer, so a
+        # block advances the index space by `threads` per iteration -- not by
+        # `threads_per_peer` as in aiter, whose threads are split across peers.
+        if self.force_blocks is not None:
+            return self.force_blocks
+        per_block = self.threads
+        covered = self.num_packs if self.stage == 1 else self.packs_per_rank
+        need = (covered + per_block - 1) // per_block
+        return max(1, min(self.block_cap, need))
 
     # --- symmetric window layout: [ signal | input | output | tmp ] ---
     # ``tmp`` holds each rank's reduced slice during 2-stage; peers all-gather
@@ -237,6 +258,11 @@ class ArConfig:
                 "vectorized path applies (aiter: DISPATCH_REDUCE falls back to "
                 "_naive otherwise)"
             )
+        if self.force_blocks is not None and not 1 <= self.force_blocks <= self.max_blocks:
+            raise ValueError(
+                f"force_blocks={self.force_blocks} outside [1, {self.max_blocks}]; "
+                "the signal array has one row per block, so raise max_blocks too"
+            )
         if self.elem_bytes not in (2, 4):
             raise ValueError(f"elem_bytes must be 2 or 4, got {self.elem_bytes}")
 
@@ -245,6 +271,7 @@ __all__ = [
     "ArConfig",
     "select_stage",
     "K_MAX_BLOCKS",
+    "LSA_BLOCK_CAP",
     "THREADS",
     "MAX_WORLD",
     "PACK_BYTES",

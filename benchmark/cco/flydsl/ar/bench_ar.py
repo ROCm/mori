@@ -29,6 +29,29 @@ benchmarks can be read side by side.
     MORI_SOCKET_IFNAME=lo MORI_ENABLE_SDMA=1 \\
     torchrun --standalone --nproc_per_node=8 bench_ar.py \\
         --backend lsa -m 4096 -n 7168 --warmup 5 --iters 51
+
+Measured on 8x MI355X (gfx950), ROCm 7.2, ``[M, 7168]`` bf16, CUDA-graph replay,
+best of 3 runs of 101 iterations each. aiter baseline is
+``tensor_model_parallel_all_reduce`` with ``set_custom_all_reduce(True)``:
+
+    M     aiter    LSA     ratio
+    64    25.6us   30.7us  1.20
+    128   27.2     41.8    1.54
+    512   53.6     66.5    1.24
+    1024  85.6    100.6    1.17
+    2048 146.1    160.3    1.10
+    4096 271.1    285.9    1.05
+    8192 558.8    531.7    0.95
+
+Read those with two caveats. First, both implementations have a payload-independent
+floor -- ours is ~28us and does not move between M=8 and M=64 -- so the small-M
+ratios are two constants divided, not a throughput result. Second, single runs of
+either implementation vary by up to 1.7x (aiter's M=64 spanned 25.6-44.0us across
+three runs), which is why this uses best-of-3; do not compare single runs.
+
+This box is affected by mori known-issue 3 (ROCm 7.2 routes uncached VMM
+allocations to the coarse-grained pool): ``CCO_UNCACHED_WINDOW=0`` changes nothing,
+which is the documented tell. aiter is on IPC handles and does not pay it.
 """
 
 from __future__ import annotations
@@ -127,7 +150,13 @@ def _median_us(fn, warmup: int, iters: int, *, graph: bool = True) -> float:
 
 def run(args) -> int:
     local_rank, rank, world_size, uid = _setup_distributed()
-    cfg = ArConfig(world_size=world_size, m=args.m, n=args.n)
+    cfg = ArConfig(
+        world_size=world_size,
+        m=args.m,
+        n=args.n,
+        max_blocks=max(args.max_blocks, args.blocks or 0),
+        force_blocks=args.blocks,
+    )
     cfg.validate()
 
     vmm = max(4 * cfg.window_bytes + VMM_SLACK, VMM_SLACK)
@@ -155,7 +184,9 @@ def run(args) -> int:
         if args.backend == "lsa":
             from kernels_lsa import build_lsa_ar
 
-            launch, stage = build_lsa_ar(cfg, rank, force_stage=args.force_stage)
+            launch, stage = build_lsa_ar(
+                cfg, rank, force_stage=args.force_stage, gather=args.gather
+            )
         elif args.backend == "sdma":
             from kernels_sdma import build_sdma_ar
 
@@ -230,6 +261,7 @@ def run(args) -> int:
             result = {
                 "backend": args.backend,
                 "stage": stage,
+                "gather": args.gather if args.backend == "lsa" else None,
                 "world_size": world_size,
                 "m": cfg.m,
                 "n": cfg.n,
@@ -274,6 +306,26 @@ def build_parser() -> argparse.ArgumentParser:
         choices=(1, 2),
         default=None,
         help="override the size-based 1-stage/2-stage choice (LSA only)",
+    )
+    p.add_argument(
+        "--gather",
+        choices=("interleaved", "sequential"),
+        default="interleaved",
+        help="2-stage all-gather loop nesting (LSA only): 'interleaved' unrolls "
+        "the peer loop inside the index loop so all links stream at once; "
+        "'sequential' drains one peer at a time and is ~3x slower",
+    )
+    p.add_argument(
+        "--blocks",
+        type=int,
+        default=None,
+        help="override the grid size (default: aiter's formula, capped at 80)",
+    )
+    p.add_argument(
+        "--max-blocks",
+        type=int,
+        default=80,
+        help="signal-array rows; must be >= --blocks",
     )
     p.add_argument("--sdma-queues", type=int, default=8)
     p.add_argument("--warmup", type=int, default=5)
