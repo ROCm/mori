@@ -192,6 +192,7 @@ def test_swap_ab_is_bitwise_identical(m, n, k):
         {},
         {"permlane": True},
         {"permlane": True, "lane_transpose": True},
+        {"permlane": True, "lane_transpose": True, "hoist_scales": True},
     ):
         gemm = compile_fused_gemm_scatter(
             cfg, 0, K=k, BLOCK_M=256, BLOCK_N=256, b_preshuffled=True,

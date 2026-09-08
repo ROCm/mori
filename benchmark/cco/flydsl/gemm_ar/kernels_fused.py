@@ -131,6 +131,33 @@ own latency falls **14,604 -> 3,852**, which is the coalescer being sensitive to
 lane adjacency and not just to the address set -- exactly what gcnasm's
 "pair-coalesced" comment is about. The 64 ``ds_bpermute`` cost 9,604 cycles.
 
+### ``--hoist-scales``: a real redundancy that does not pay to remove
+
+The epilogue calls ``store_c.store`` four times, and those calls share base rows
+pairwise and base columns pairwise, so every scale is fetched twice. The
+source-attributed thread trace counts it exactly: 16 ``buffer_load_dwordx4`` at
+``gemm_a8w8_8wave.py:191`` where only 8 addresses are distinct, and 8
+``buffer_load_dword`` at :199 where only 4 are -- 12 of 24 loads redundant, plus
+12 redundant address computations, 4,276 cycles or 0.8% of the kernel. The
+compiler cannot merge them because all four calls write the same ``reg_f32_*``
+register buffer, which makes them a chain of overwrites rather than pure loads.
+
+``store_all`` loads each scale once. It removes exactly the predicted loads --
+A-scale 16 -> 8, B-scale 8 -> 4 -- and is slightly **slower**:
+
+    variant                VGPR  scratch  instrs  dwordx4  dword    gemm
+    --permlane --lane-transpose  254    0B     1581      72     16   33.32us
+      + --hoist-scales           256    0B     1595      68      8   33.96us
+
+Keeping both scale sets live across all four stores costs more in register
+moves and re-materialised addresses than the twelve loads were worth, and it
+spends the last 2 VGPRs of headroom (254 -> 256). Bit-exact either way.
+
+Kept as a switch rather than deleted: the redundant fraction grows with
+``N_TILES_B``, so a larger ``BLOCK_N`` would change the arithmetic, and if
+register pressure ever loosens this flips sign. It is also cheaper to re-measure
+a flag than to re-derive why it was rejected.
+
 Two limits. **It is worth nothing on ``fused-lsa``**, where the store goes to a
 peer over xGMI rather than to local memory::
 
@@ -643,20 +670,46 @@ class _PermlaneStoreC(_SwapABStoreC):
     _lane_transpose = False
 
     def store(self, c_frag, base_row, base_col):
+        self._emit(c_frag, base_row, base_col,
+                   self._a_scales(base_row), self._b_scales(base_col))
+
+    def store_all(self, frags, base_row, base_col, row_step, col_step):
+        """All four half-tiles, loading each scale once instead of twice.
+
+        The four ``store`` calls the epilogue makes share base rows pairwise and
+        base columns pairwise, so calling them individually issues every scale
+        load twice -- 16 ``buffer_load_dwordx4`` for A where 8 addresses are
+        distinct, 8 ``buffer_load_dword`` for B where 4 are. The compiler cannot
+        merge them because they all write the same ``reg_f32_*`` register buffer,
+        which turns them into a chain of overwrites rather than pure loads.
+        """
+        a = [self._a_scales(base_row + r * row_step) for r in range_constexpr(2)]
+        b = [self._b_scales(base_col + c * col_step) for c in range_constexpr(2)]
+        for frag, r, c in frags:
+            self._emit(frag, base_row + r * row_step, base_col + c * col_step,
+                       a[r], b[c])
+
+    def _a_scales(self, base_row):
+        lane = self.lane_id
+        return [
+            self._load_a_scale_scalar(base_row + ti * 16 + lane % 16)
+            for ti in range_constexpr(self.n_tiles_a)
+        ]
+
+    def _b_scales(self, base_col):
+        grp = self.lane_id // 16
+        return [
+            self._load_b_scale_vec4(base_col + tj * 16 + grp * 4)
+            for tj in range_constexpr(self.n_tiles_b)
+        ]
+
+    def _emit(self, c_frag, base_row, base_col, a_scales, b_scales):
         assert self.n_tiles_b == 2, (
             "the permlane mapping pairs exactly two N-tiles (BLOCK_N == 256); "
             f"got n_tiles_b={self.n_tiles_b}"
         )
         lane = self.lane_id
         grp = lane // 16
-        a_scales = [
-            self._load_a_scale_scalar(base_row + ti * 16 + lane % 16)
-            for ti in range_constexpr(self.n_tiles_a)
-        ]
-        b_scales = [
-            self._load_b_scale_vec4(base_col + tj * 16 + grp * 4)
-            for tj in range_constexpr(self.n_tiles_b)
-        ]
         for ti in range_constexpr(self.n_tiles_a):
             row = base_row + ti * 16 + lane % 16
             dwords = []
@@ -869,6 +922,7 @@ def compile_fused_gemm_scatter(
     store_probe: bool = False,
     permlane: bool = False,
     lane_transpose: bool = False,
+    hoist_scales: bool = False,
     transport: str = "sdma",
     fence: str = "none",
     emit_put: bool = True,
@@ -973,7 +1027,7 @@ def compile_fused_gemm_scatter(
         raise ValueError(
             f"fence must be all/agent/leader/none/writethrough/wt-agent, got {fence!r}"
         )
-    _kname_tag = f"{'S' if swap_ab else ''}{'P' if permlane else ''}{'T' if lane_transpose else ''}{'W' if store_probe else ''}c{chunks}{'r' if rotated else 'l'}{fence[0]}"
+    _kname_tag = f"{'S' if swap_ab else ''}{'P' if permlane else ''}{'T' if lane_transpose else ''}{'H' if hoist_scales else ''}{'W' if store_probe else ''}c{chunks}{'r' if rotated else 'l'}{fence[0]}"
     counter_off = cfg.counter_off
     lock_off = cfg.lock_off
     in_off = cfg.input_off
@@ -1304,10 +1358,17 @@ def compile_fused_gemm_scatter(
         if wave_m == 0:
             rocdl.s_barrier()
 
-        store_c.store(c00_frag, base_row + 0, base_col + 0)
-        store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
-        store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
-        store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
+        if const_expr(hoist_scales) and hasattr(store_c, "store_all"):
+            store_c.store_all(
+                [(c00_frag, 0, 0), (c01_frag, 0, 1),
+                 (c10_frag, 1, 0), (c11_frag, 1, 1)],
+                base_row, base_col, LDS_BLOCK_M, LDS_BLOCK_N,
+            )
+        else:
+            store_c.store(c00_frag, base_row + 0, base_col + 0)
+            store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
+            store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
+            store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
         # ---- end pinned copy ----
 
         if const_expr(fuse and not direct_lsa):

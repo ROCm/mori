@@ -207,6 +207,7 @@ def run(args) -> int:
             store_probe=args.store_probe,
             permlane=args.permlane,
             lane_transpose=args.lane_transpose,
+            hoist_scales=args.hoist_scales,
             rotated=None if args.tile_order == "auto" else args.tile_order == "rotated",
             fence=args.fence,
             emit_put=not args.no_put,
@@ -411,6 +412,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="with --swap-ab --permlane: one ds_bpermute per dword so adjacent "
         "lanes cover one C row (gcnasm kernel_template.hpp:491-510)",
+    )
+    p.add_argument(
+        "--hoist-scales",
+        action="store_true",
+        help="load each A/B scale once for the four half-tile stores instead of "
+        "twice (needs --permlane)",
     )
     p.add_argument("--sdma-queues", type=int, default=8)
     p.add_argument("--warmup", type=int, default=10)
