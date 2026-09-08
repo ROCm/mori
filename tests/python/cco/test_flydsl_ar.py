@@ -75,6 +75,32 @@ def test_window_regions_are_disjoint_and_ordered():
     assert c.flag_off + c.max_blocks * 4 <= c.input_off
 
 
+def test_recv_region_is_absent_unless_sdma_asks_for_it():
+    """LSA reduces out of the peers' inputs, so it must not pay for landing slots."""
+    lsa = _cfg()
+    assert lsa.recv_bytes == 0
+    assert lsa.window_bytes == lsa.tmp_off + lsa.tmp_bytes
+    with pytest.raises(IndexError, match="no landing slot"):
+        lsa.recv_slot_off(0)
+
+
+def test_recv_slots_are_one_contiguous_slice_per_peer():
+    c = _cfg(recv_slots=8)
+    assert c.recv_off == c.tmp_off + c.tmp_bytes
+    assert c.recv_bytes == 8 * c.slice_bytes
+    assert c.window_bytes == c.recv_off + c.recv_bytes
+    offs = [c.recv_slot_off(p) for p in range(8)]
+    assert offs == sorted(offs)
+    assert all(b - a == c.slice_bytes for a, b in zip(offs, offs[1:]))
+    with pytest.raises(IndexError):
+        c.recv_slot_off(8)
+
+
+def test_validate_rejects_more_recv_slots_than_peers():
+    with pytest.raises(ValueError, match="recv_slots"):
+        _cfg(recv_slots=9).validate()
+
+
 def test_signal_slot_is_block_major_over_peers():
     c = _cfg()
     assert c.signal_slot(0, 0) == 0

@@ -106,6 +106,12 @@ class ArConfig:
     threads: int = THREADS
     max_blocks: int = K_MAX_BLOCKS  # signal-array rows, never the launched grid
     block_cap: int = LSA_BLOCK_CAP
+    #: SDMA landing slots, one slice per peer. LSA needs none -- it reduces
+    #: straight out of the peers' input regions -- but a copy engine has to be
+    #: given somewhere to write, so the SDMA backend reserves ``world_size``
+    #: slices (slot ``rank`` goes unused; keeping it makes the index be the
+    #: peer rank, which is worth one slice of VRAM).
+    recv_slots: int = 0
     #: Override the computed grid. Only the signal array bounds the grid for
     #: correctness (``start[max_blocks][8]``), so raising this also needs
     #: ``max_blocks`` raised. Exists so the benchmark can sweep occupancy.
@@ -179,9 +185,10 @@ class ArConfig:
         need = (covered + per_block - 1) // per_block
         return max(1, min(self.block_cap, need))
 
-    # --- symmetric window layout: [ signal | input | output | tmp ] ---
+    # --- symmetric window layout: [ signal | input | output | tmp | recv ] ---
     # ``tmp`` holds each rank's reduced slice during 2-stage; peers all-gather
     # straight out of it, which is why it lives inside the registered window.
+    # ``recv`` is SDMA-only and empty unless ``recv_slots`` is set.
 
     @property
     def signal_bytes(self) -> int:
@@ -227,8 +234,26 @@ class ArConfig:
         return self.largest_pack_part * PACK_BYTES
 
     @property
-    def window_bytes(self) -> int:
+    def recv_off(self) -> int:
         return self.tmp_off + self.tmp_bytes
+
+    @property
+    def recv_bytes(self) -> int:
+        return self.recv_slots * self.slice_bytes
+
+    def recv_slot_off(self, peer: int) -> int:
+        """Where peer ``peer``'s contribution to *my* slice lands."""
+        if not 0 <= peer < self.world_size:
+            raise IndexError(f"peer {peer} outside [0, {self.world_size})")
+        if peer >= self.recv_slots:
+            raise IndexError(
+                f"peer {peer} has no landing slot; recv_slots={self.recv_slots}"
+            )
+        return self.recv_off + peer * self.slice_bytes
+
+    @property
+    def window_bytes(self) -> int:
+        return self.recv_off + self.recv_bytes
 
     # --- traffic model, for reporting alongside measured time ---
 
@@ -262,6 +287,11 @@ class ArConfig:
             raise ValueError(
                 f"force_blocks={self.force_blocks} outside [1, {self.max_blocks}]; "
                 "the signal array has one row per block, so raise max_blocks too"
+            )
+        if not 0 <= self.recv_slots <= self.world_size:
+            raise ValueError(
+                f"recv_slots must be in [0, world_size={self.world_size}], "
+                f"got {self.recv_slots}"
             )
         if self.elem_bytes not in (2, 4):
             raise ValueError(f"elem_bytes must be 2 or 4, got {self.elem_bytes}")

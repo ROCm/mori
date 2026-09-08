@@ -34,20 +34,24 @@ Measured on 8x MI355X (gfx950), ROCm 7.2, ``[M, 7168]`` bf16, CUDA-graph replay,
 best of 3 runs of 101 iterations each. aiter baseline is
 ``tensor_model_parallel_all_reduce`` with ``set_custom_all_reduce(True)``:
 
-    M     aiter    LSA     ratio
-    64    25.6us   30.7us  1.20
-    128   27.2     41.8    1.54
-    512   53.6     66.5    1.24
-    1024  85.6    100.6    1.17
-    2048 146.1    160.3    1.10
-    4096 271.1    285.9    1.05
-    8192 558.8    531.7    0.95
+    M     aiter    LSA    (/aiter)   SDMA   (/LSA)
+    64    25.6us   30.7us  1.20      47.4us  1.54
+    128   27.2     41.8    1.54      51.7    1.24
+    512   53.6     66.5    1.24      79.2    1.19
+    1024  85.6    100.6    1.17     116.4    1.16
+    2048 146.1    160.3    1.10     194.2    1.21
+    4096 271.1    285.9    1.05     342.4    1.20
+    8192 558.8    531.7    0.95     637.8    1.20
 
-Read those with two caveats. First, both implementations have a payload-independent
-floor -- ours is ~28us and does not move between M=8 and M=64 -- so the small-M
-ratios are two constants divided, not a throughput result. Second, single runs of
-either implementation vary by up to 1.7x (aiter's M=64 spanned 25.6-44.0us across
-three runs), which is why this uses best-of-3; do not compare single runs.
+Read those with three caveats. First, all three have a payload-independent floor
+-- LSA's is ~28us and SDMA's ~40us, neither moving between M=8 and M=64 -- so the
+small-M ratios are two constants divided, not a throughput result. The 12us
+between the two floors is the copy engine's ~6us dispatch cost, paid once per
+transfer phase. Second, single runs vary by up to 1.7x (aiter's M=64 spanned
+25.6-44.0us across three runs), which is why this uses best-of-3; do not compare
+single runs. Third, SDMA is ~18% slower than LSA even after removing the floor,
+so it does not win on bandwidth and is not meant to -- it wins by leaving the CUs
+free, which only pays off once a GEMM is running underneath it.
 
 This box is affected by mori known-issue 3 (ROCm 7.2 routes uncached VMM
 allocations to the coarse-grained pool): ``CCO_UNCACHED_WINDOW=0`` changes nothing,
@@ -156,6 +160,9 @@ def run(args) -> int:
         n=args.n,
         max_blocks=max(args.max_blocks, args.blocks or 0),
         force_blocks=args.blocks,
+        # LSA reduces straight out of the peers' input regions; SDMA has to be
+        # given somewhere for the copy engine to land each peer's slice.
+        recv_slots=world_size if args.backend == "sdma" else 0,
     )
     cfg.validate()
 
@@ -190,7 +197,9 @@ def run(args) -> int:
         elif args.backend == "sdma":
             from kernels_sdma import build_sdma_ar
 
-            launch, stage = build_sdma_ar(cfg, rank, queues=args.sdma_queues)
+            launch, stage = build_sdma_ar(
+                cfg, rank, queues=args.sdma_queues, signal=args.sdma_signal
+            )
         else:
             raise ValueError(f"unknown backend {args.backend!r}")
 
@@ -328,6 +337,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="signal-array rows; must be >= --blocks",
     )
     p.add_argument("--sdma-queues", type=int, default=8)
+    p.add_argument(
+        "--sdma-signal",
+        action="store_true",
+        help="attach put's trailing local ATOMIC. Nothing polls it and quiet is "
+        "documented as signal-independent, so this only exists to measure the "
+        "claim in FlyDSL's Sdma docstring that no-signal puts cannot be drained",
+    )
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--iters", type=int, default=51)
     p.add_argument(
