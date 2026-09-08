@@ -257,6 +257,25 @@ def local_store_u32(ptr, value):
     _llvm_d.store(fx.Int32(value).ir_value(), ptr, alignment=4, volatile_=True)
 
 
+def atomic_add_u32(ptr, value):
+    """Device-scope ``fetch_add``; returns the value *before* the add.
+
+    Agent scope, because the tile counters it serves are only ever touched by
+    blocks of the same kernel on this GPU -- a system-scope RMW would be a
+    fabric round trip per tile. ``acq_rel``: the release half publishes this
+    block's C stores to whoever observes the count, and the acquire half is what
+    lets the winning block read every other block's tile.
+    """
+    return _llvm_d.atomicrmw(
+        _llvm_d.AtomicBinOp.add,
+        ptr,
+        fx.Int32(value).ir_value(),
+        _llvm_d.AtomicOrdering.acq_rel,
+        syncscope=_AGENT_SCOPE,
+        alignment=4,
+    )
+
+
 def i32_type():
     return _dtype("i32")
 
@@ -273,6 +292,7 @@ __all__ = [
     "signal_load_u32",
     "local_load_u32",
     "local_store_u32",
+    "atomic_add_u32",
     "i32_type",
     "CM_CACHED",
     "CM_SC1",

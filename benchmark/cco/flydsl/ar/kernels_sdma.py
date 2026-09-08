@@ -71,8 +71,8 @@ import sys
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr import gpu as fgpu
-from flydsl.expr import range_constexpr
 from flydsl.expr.typing import Int64
 
 import mori.cco.device.flydsl as cco
@@ -100,12 +100,13 @@ from layout import MAX_WORLD  # noqa: E402
 PUSH_THREADS = 64
 
 
-def build_sdma_ar(cfg, rank: int, *, queues: int = 8, signal: bool = False):
-    """Compile an SDMA all-reduce launcher for ``cfg`` on ``rank``.
+def build_sdma_phases(cfg, rank: int, *, queues: int = 8, signal: bool = False):
+    """Compile the phases separately, so the fused GEMM can reuse the tail.
 
-    Returns ``(run, stage)``; ``stage`` is always 2 -- there is no 1-stage SDMA
-    variant, since a copy engine gains nothing from broadcasting the whole
-    payload to every peer.
+    Returns ``{"scatter", "drain", "reduce", "gather"}``, each a launcher taking
+    ``(dev_comm, win, stream=...)``. ``scatter`` pushes *and* drains; ``drain``
+    only drains and barriers, and exists for the fused path, where the pushes
+    were already issued from inside the GEMM epilogue.
 
     ``queues`` must match ``reqs.sdma_queue_count``; one queue per peer keeps
     concurrently-issuing warps per queue at 1, which is cco's stated rule.
@@ -158,13 +159,15 @@ def build_sdma_ar(cfg, rank: int, *, queues: int = 8, signal: bool = False):
         self_arr = fx.Int64(w.lsa_ptr(rank, arr_off))
         _spin_until(signal_ptr(self_arr + fx.Int64(tid) * fx.Int64(4)), flag)
 
-    def _push_kernel(arr_off, dst_off_of_peer, src_off_expr):
+    def _push_kernel(arr_off, dst_off_of_peer=None, src_off_expr=None):
         """A push phase: one put per peer, drain, then the cross-rank barrier.
 
         ``dst_off_of_peer`` is a constant byte offset *in the destination's*
         window; ``src_off_expr(tid)`` builds the offset in mine, which may depend
-        on which peer the lane is serving.
+        on which peer the lane is serving. Passing neither emits a drain-only
+        kernel -- the pushes are assumed already issued elsewhere.
         """
+        pushes = dst_off_of_peer is not None
 
         @flyc.kernel(known_block_size=[PUSH_THREADS, 1, 1])
         def push(dev_comm: Int64, win: Int64):
@@ -175,19 +178,21 @@ def build_sdma_ar(cfg, rank: int, *, queues: int = 8, signal: bool = False):
             flag, flag_rsrc = _next_flag(w, 0)
             if tid < ws:
                 if tid != rank:
-                    # Lane `tid` owns peer `tid` and queue `tid`: distinct queues
-                    # per lane, so the posts do not serialise on one commit chain.
-                    sdma.put(
-                        tid,
-                        win,
-                        fx.Int64(dst_off_of_peer),
-                        win,
-                        src_off_expr(tid),
-                        fx.Int64(slice_bytes),
-                        tid,
-                        coop=cco.CoopScope.THREAD,
-                        signal=signal,
-                    )
+                    if const_expr(pushes):
+                        # Lane `tid` owns peer `tid` and queue `tid`: distinct
+                        # queues per lane, so the posts do not serialise on one
+                        # commit chain.
+                        sdma.put(
+                            tid,
+                            win,
+                            fx.Int64(dst_off_of_peer),
+                            win,
+                            src_off_expr(tid),
+                            fx.Int64(slice_bytes),
+                            tid,
+                            coop=cco.CoopScope.THREAD,
+                            signal=signal,
+                        )
                     sdma.quiet_queue(tid, tid)
                 # Release before publishing arrival. The bytes were moved by the
                 # copy engine rather than by this CU, so there is nothing of ours
@@ -265,19 +270,44 @@ def build_sdma_ar(cfg, rank: int, *, queues: int = 8, signal: bool = False):
         src_off_expr=lambda tid: fx.Int64(out_off + my_slice_off),
     )
 
-    @flyc.jit
-    def run(dev_comm: Int64, win: Int64, stream=fx.Stream(None)):
-        scatter(dev_comm, win).launch(
-            grid=(1, 1, 1), block=[PUSH_THREADS, 1, 1], stream=stream
-        )
-        sdma_reduce(dev_comm, win).launch(
-            grid=(blocks, 1, 1), block=[threads, 1, 1], stream=stream
-        )
-        gather(dev_comm, win).launch(
-            grid=(1, 1, 1), block=[PUSH_THREADS, 1, 1], stream=stream
-        )
+    # Drain-only twin of `scatter`: same barrier, no puts. The fused GEMM issues
+    # the puts from its epilogue, but still has to drain the queues and tell the
+    # peers their slices landed.
+    drain = _push_kernel(start_off)
+
+    def _phase(kern, grid, blk):
+        @flyc.jit
+        def go(dev_comm: Int64, win: Int64, stream=fx.Stream(None)):
+            kern(dev_comm, win).launch(
+                grid=(grid, 1, 1), block=[blk, 1, 1], stream=stream
+            )
+
+        return go
+
+    return {
+        "scatter": _phase(scatter, 1, PUSH_THREADS),
+        "drain": _phase(drain, 1, PUSH_THREADS),
+        "reduce": _phase(sdma_reduce, blocks, threads),
+        "gather": _phase(gather, 1, PUSH_THREADS),
+    }
+
+
+def build_sdma_ar(cfg, rank: int, *, queues: int = 8, signal: bool = False):
+    """Compile a whole SDMA all-reduce for ``cfg`` on ``rank``.
+
+    Returns ``(run, stage)``; ``stage`` is always 2 -- there is no 1-stage SDMA
+    variant, since a copy engine gains nothing from broadcasting the whole
+    payload to every peer.
+    """
+    parts = build_sdma_phases(cfg, rank, queues=queues, signal=signal)
+    scatter, reduce_, gather = parts["scatter"], parts["reduce"], parts["gather"]
+
+    def run(dev_comm, win, stream=fx.Stream(None)):
+        scatter(dev_comm, win, stream=stream)
+        reduce_(dev_comm, win, stream=stream)
+        gather(dev_comm, win, stream=stream)
 
     return run, 2
 
 
-__all__ = ["build_sdma_ar", "PUSH_THREADS"]
+__all__ = ["build_sdma_ar", "build_sdma_phases", "PUSH_THREADS"]

@@ -112,6 +112,11 @@ class ArConfig:
     #: slices (slot ``rank`` goes unused; keeping it makes the index be the
     #: peer rank, which is worth one slice of VRAM).
     recv_slots: int = 0
+    #: Sub-slices each peer's landing region is pushed in, for the fused GEMM.
+    #: 1 means "one put per destination"; more lets a destination's first chunk
+    #: leave while the GEMM is still computing its later ones. Only the fused
+    #: path reads this; the standalone SDMA all-reduce always pushes whole slices.
+    counter_chunks: int = 1
     #: Override the computed grid. Only the signal array bounds the grid for
     #: correctness (``start[max_blocks][8]``), so raising this also needs
     #: ``max_blocks`` raised. Exists so the benchmark can sweep occupancy.
@@ -192,9 +197,7 @@ class ArConfig:
 
     @property
     def signal_bytes(self) -> int:
-        row = _align_up(self.max_blocks * MAX_WORLD * 4, SIGNAL_ALIGN)
-        flag = _align_up(self.max_blocks * 4, SIGNAL_ALIGN)
-        return row * 2 + flag  # start[] + end[] + _flag[]
+        return self.counter_off + self.counter_bytes
 
     @property
     def start_off(self) -> int:
@@ -207,6 +210,27 @@ class ArConfig:
     @property
     def flag_off(self) -> int:
         return self.end_off * 2
+
+    @property
+    def counter_off(self) -> int:
+        """Monotonic tile counters for the fused GEMM, one per (dest, chunk).
+
+        Its own 128-byte-aligned region rather than slack in ``_flag``: the count
+        is ``world_size * counter_chunks`` and grows with M, so borrowing the 16
+        spare ``_flag`` slots would silently stop fitting at M >= 8192.
+        """
+        return _align_up(self.flag_off + self.max_blocks * 4, SIGNAL_ALIGN)
+
+    @property
+    def counter_bytes(self) -> int:
+        return _align_up(self.world_size * self.counter_chunks * 4, SIGNAL_ALIGN)
+
+    def counter_slot(self, dest: int, chunk: int) -> int:
+        if not 0 <= dest < self.world_size:
+            raise IndexError(f"dest {dest} outside [0, {self.world_size})")
+        if not 0 <= chunk < self.counter_chunks:
+            raise IndexError(f"chunk {chunk} outside [0, {self.counter_chunks})")
+        return dest * self.counter_chunks + chunk
 
     def signal_slot(self, block: int, peer: int) -> int:
         """Element index into ``start``/``end`` for (block, peer)."""
@@ -288,6 +312,8 @@ class ArConfig:
                 f"force_blocks={self.force_blocks} outside [1, {self.max_blocks}]; "
                 "the signal array has one row per block, so raise max_blocks too"
             )
+        if self.counter_chunks < 1:
+            raise ValueError(f"counter_chunks must be >= 1, got {self.counter_chunks}")
         if not 0 <= self.recv_slots <= self.world_size:
             raise ValueError(
                 f"recv_slots must be in [0, world_size={self.world_size}], "
