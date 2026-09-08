@@ -156,7 +156,7 @@ All three stages are candidates to push back into aiter's ``StoreC``: bit-exact,
 no register cost, and the 6.7% is on the GEMM itself, independent of any
 all-reduce.
 
-## Persistent tiles: tried, and not viable on FlyDSL today
+## Persistent tiles: tried, and there is no register budget for it
 
 gcnasm builds this kernel family both ways (``PERSISTENT=1|0``) and its README
 has a tail-balance sweep: the win is entirely a function of the remainder after
@@ -175,37 +175,63 @@ The tail itself is real here, and large. Sweeping N at M=4096, K=1024
     6144      384    128      47.40
     7168      448    192      49.80
 
-So a persistent scheduler was worth trying rather than arguing about. It was
-implemented (one workgroup per CU, striding over tiles) and made bit-exact, and
-it is a **~2x regression**, for a reason that has nothing to do with scheduling:
+So it was implemented (one workgroup per CU, striding over tiles) and made
+bit-exact. It is a ~2x regression, and the reason is a hard resource wall rather
+than anything to do with scheduling. From the kernel metadata in the final ISA:
 
-    variant                       gemm     scratch
-    one workgroup per tile       38.54us      0 B
-    body wrapped in an scf.for   74.48us    156 B/thread
+    variant                 VGPR  AGPR  SGPR  V-spill  scratch  instrs   gemm
+    as committed             256     0    50        0       0B    2052  38.54us
+      + 3-stage C store      254     0    51        0       0B    1573  35.74us
+    body inside an scf.for   256     0    68       38     156B    2260  74.72us
+    persistent, grid 256     256     0    67       38     156B    2264  72.22us
 
-Wrapping the pipeline in a runtime loop makes FlyDSL spill the MFMA
-accumulators. ``fly-promote-regmem-to-vectorssa`` does not promote
-``make_rmem_tensor`` values declared inside an ``scf.for`` region, and 156 bytes
-per thread of scratch in the inner pipeline costs more than the entire tail. The
-persistent version does beat the *looped* baseline by ~3% (82.3 vs 84.8us at
-remainder 192, 76.8 vs 79.8 at remainder 16), which matches gcnasm's numbers --
-but that is a gain over an already 94%-regressed kernel.
+**The baseline already uses all 256 VGPRs with zero spill.** Wrapping the
+pipeline in a runtime loop asks for 38 more -- the K pipeline's accumulators and
+operand fragments die at the end of a tile in the flat version, but a loop makes
+the compiler assume they may be live across the back-edge -- and there is nowhere
+to put them. ``--amdgpu-num-vgpr 256/512`` changes nothing, because the cap was
+never the constraint. Persistent and non-persistent spill identically, which
+confirms the cost is ``scf.for`` itself and not the scheduling idea.
 
-Two things worth keeping from the attempt:
+Note ``fly-promote-regmem-to-vectorssa`` is **not** the problem, contrary to what
+an earlier version of this note claimed. It handles ``scf::ForOp``, it promoted
+all 451 register allocas here (zero left afterwards, zero ``llvm.alloca`` in the
+final IR), and the emitted loop carries no ``iter_args`` at all. The 156 bytes
+are ordinary register-allocator spill: ``.vgpr_spill_count: 38``, 38
+``scratch_store_dword`` / 38 ``scratch_load_dword``.
+
+The pass does have one real inefficiency, just not one we hit: an alloca declared
+*outside* a loop is carried as an ``iter_arg`` unconditionally, even when it is
+fully overwritten every iteration, because ``collectTouchedRegAllocaInRegion``
+records on any load *or* store with no liveness test. Allocas declared *inside*
+the loop are correctly materialised as ``ub.poison`` and not carried, and ours
+are all inside.
+
+Two bugs the attempt surfaced, worth knowing if anyone loops this pipeline:
 
 * **The half-wave barrier does not survive a loop.** The prologue's
   ``if wave_m == 1: rocdl.s_barrier()`` deliberately runs the two half-waves one
-  barrier out of phase. That is fine once, but in a persistent loop the offset
-  accumulates by one per tile, so from the second tile on the halves rendezvous
-  at mismatched program points and the LDS double-buffering races -- silently,
-  partial corruption inside otherwise-correct tiles. A compensating
-  ``if wave_m == 0: s_barrier()`` at the end of each tile fixes it exactly.
-* **The LDS handles must be rebound per tile**, not hoisted: the pipeline swaps
-  those Python bindings as it advances, and hoisting makes eight
-  shared-address-space pointers loop-carried, which fails to legalize.
+  barrier out of phase. Fine once; in a loop the offset accumulates by one per
+  tile, so from the second tile on the halves rendezvous at mismatched program
+  points and the LDS double-buffering races -- silently, as partial corruption
+  inside otherwise-correct tiles. A compensating ``if wave_m == 0: s_barrier()``
+  at the end of each tile fixes it exactly.
+* **The LDS handles must be rebound per tile.** The pipeline swaps those Python
+  bindings as it advances, so hoisting them makes eight shared-address-space
+  pointers loop-carried, which fails to legalize.
 
-Reviving this needs the FlyDSL promotion fix first. Until then the ceiling is
-gcnasm's +0.77% at our remainder, against a 94% floor.
+And a FlyDSL gotcha: ``range(...)`` must appear literally in the ``for``
+statement or the AST rewriter does not see it and Python evaluates it eagerly
+("dynamic 'ArithValue' has no Python integer representation"). Assigning it to a
+variable first does not work, so a kernel cannot cheaply offer both a looped and
+a flat form from one body.
+
+Reviving this needs 38 VGPRs from somewhere. The 3-stage C store is the only
+change measured to *reduce* pressure (256 -> 254, and 2052 -> 1573 instructions,
+since 128 two-byte stores need 128 addresses and 128 predicates live at once),
+and it is nowhere near enough. Halving BLOCK_M would free roughly 16 by halving
+the accumulator count, but moves the tile count to 896 -- remainder 128, where
+gcnasm measured +0.41%. There is no version of this that pays.
 
 ## Direct LSA (``--mode fused-lsa``)## Direct LSA (``--mode fused-lsa``)## Direct LSA (``--mode fused-lsa``)## Direct LSA (``--mode fused-lsa``): the structure works, the store does not
 
