@@ -1488,15 +1488,24 @@ void PoolClient::ResolveLocalBatch(const std::vector<std::string>& keys,
   if (resolutions != nullptr) resolutions->assign(keys.size(), ResolvedEntry{});
   if (candidates.empty() || default_pool_ == nullptr || registry_.Empty()) return;
 
-  std::vector<std::string> batch;
-  batch.reserve(candidates.size());
-  for (size_t i : candidates) batch.push_back(keys[i]);
+  // A whole batch -- every key a candidate, in order -- is what a restore asks
+  // for, and there `keys` already IS the query.  Naming it directly saves
+  // copying the entire key set, which for a layer-wise reader is a thousand-odd
+  // ~128-byte strings rebuilt once per layer group for a query it just made.
+  // A partial batch still has to be gathered.
+  std::vector<std::string> gathered;
+  const std::vector<std::string>* batch = &keys;
+  if (candidates.size() != keys.size()) {
+    gathered.reserve(candidates.size());
+    for (size_t i : candidates) gathered.push_back(keys[i]);
+    batch = &gathered;
+  }
 
   // Both readers fed from here — ServeLocalGets and BatchGetRanges — can
   // consume a file ref, and this resolve never leaves the process, so ask for
   // one whenever the caller can say where the bytes land.
   const bool want_file_refs = static_cast<bool>(dst_is_device);
-  auto found = ResolveLocalBatchWithBusyRetry(default_pool_.get(), batch,
+  auto found = ResolveLocalBatchWithBusyRetry(default_pool_.get(), *batch,
                                               /*include_descs=*/false,
                                               /*allow_file_refs=*/want_file_refs);
 
@@ -1513,7 +1522,7 @@ void PoolClient::ResolveLocalBatch(const std::vector<std::string>& keys,
     for (size_t j = 0; j < candidates.size() && j < found.size(); ++j) {
       if (!found[j].resolved.file_ref.IsFile()) continue;
       if (dst_is_device(candidates[j])) continue;
-      restage.push_back(batch[j]);
+      restage.push_back((*batch)[j]);
       restage_at.push_back(j);
     }
     if (!restage.empty()) {
