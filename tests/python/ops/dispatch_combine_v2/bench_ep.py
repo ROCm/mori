@@ -108,6 +108,19 @@ _DISP_DT = {
 }[_DISP]
 _DISP_NBYTES = {torch.bfloat16: 2, torch.float8_e4m3fn: 1}.get(_DISP_DT, 0.5)
 _FP4 = _DISP_DT is torch.float4_e2m1fn_x2
+# What the correctness gate covers, as one token. A bool cannot say it: fp4 and
+# an all-zero payload verify the dispatch bytes but never compare combine's
+# output, and a row claiming "verified" next to a combine_us nobody checked is
+# the machine-readable half losing what the human summary spells out.
+VERIFY_SCOPE = (
+    "none"
+    if not CHECK
+    else (
+        "dispatch_bytes"
+        if _FP4 or _data.verifies_nothing(INIT)
+        else "dispatch_bytes+combine"
+    )
+)
 # Geometry, same spelling as tools/ep_test.sh. Unset = the backend's tuned default.
 _G = {
     k: (int(os.environ[k]) if os.environ.get(k) else None)
@@ -365,7 +378,19 @@ def main():
 
         want = max(1, int(SMI_DURATION / SMI_INTERVAL))
         metrics = mon.summary(start_s=t0, end_s=t1)
-        n = sum(1 for s in mon.samples if t0 <= s["timestamp_s"] <= t1)
+        inside = [s for s in mon.samples if t0 <= s["timestamp_s"] <= t1]
+        # Count samples that CARRY THE CLOCK, not samples that exist. A metric
+        # query that raises is swallowed so one bad read cannot stop the polling
+        # thread, but the sample is still appended with only its timestamp -- so
+        # counting samples would report a healthy "ok" for a rank whose clock was
+        # never readable at all, which is the rank this telemetry exists to find.
+        n_clk = sum(1 for s in inside if s.get("gfx_clk_mhz") is not None)
+        if n_clk == 0:
+            status = "no_metrics"
+        elif n_clk >= max(2, want // 2):
+            status = "ok"
+        else:
+            status = "insufficient"
         local = {
             "label": label,
             "device": torch.cuda.current_device(),
@@ -373,8 +398,9 @@ def main():
             "interval_s": SMI_INTERVAL,
             "duration_s": t1 - t0,
             "launches": rounds * batch,
-            "samples": n,
-            "sample_status": "ok" if n >= max(2, want // 2) else "insufficient",
+            "samples": len(inside),
+            "clock_samples": n_clk,
+            "sample_status": status,
             "metrics": metrics,
         }
         every = [None] * world
@@ -405,15 +431,22 @@ def main():
 
     def clocks(records):
         """Cross-rank clock columns. The MIN over ranks is the point of these:
-        one throttled GPU sets the pair time for all of them, and a mean hides it."""
+        one throttled GPU sets the pair time for all of them, and a mean hides it.
+
+        A rank whose clock never read is EXCLUDED from that min, so the status
+        column has to say so: silently narrowing the min to the readable ranks
+        would report the healthiest GPUs as if they were all of them.
+        """
+        if not records:
+            return {}
         med = [
             r["metrics"]["gfx_clk_mhz"]["median"]
-            for r in records or []
+            for r in records
             if "gfx_clk_mhz" in r["metrics"]
         ]
         pwr = [
             r["metrics"]["power_w"]["median"]
-            for r in records or []
+            for r in records
             if "power_w" in r["metrics"]
         ]
         out = {}
@@ -422,12 +455,13 @@ def main():
             out["gfx_clk_mhz_min"] = round(min(med), 1)
         if pwr:
             out["power_w"] = round(sum(pwr) / len(pwr), 1)
-        if records:
-            out["smi_status"] = (
-                "ok"
-                if all(r["sample_status"] == "ok" for r in records)
-                else "insufficient"
-            )
+        seen = {r["sample_status"] for r in records}
+        # Worst rank wins, and how many ranks the numbers above came from.
+        for worst in ("no_metrics", "insufficient", "ok"):
+            if worst in seen:
+                break
+        out["smi_status"] = worst
+        out["smi_ranks"] = f"{len(med)}/{len(records)}"
         return out
 
     rows = []
@@ -480,12 +514,19 @@ def main():
                 d_us, c_us, run_d, run_c = time_pairs(
                     mode, one_pair, capture_pair if mode == "graph" else eager_legs
                 )
-                # Bytes off this rank; the legs differ whenever dispatch is narrower.
-                d_bw = total * HIDDEN * _DISP_NBYTES / (1000**3) / (d_us / 1e6)
-                c_bw = total * HIDDEN * 2 / (1000**3) / (c_us / 1e6)
                 got = torch.tensor([d_us, c_us, float(total)], dtype=torch.float64)
                 dist.all_reduce(got)
                 n = world
+                d_us_m, c_us_m = float(got[0]) / n, float(got[1]) / n
+                recv_m = float(got[2]) / n
+                # Bytes off one rank over that leg's time, BOTH cross-rank means,
+                # so the reported bandwidth follows from the recv_tokens and us
+                # this same row reports. Mixing a local byte count with a mean
+                # time gave a row whose columns did not agree with each other,
+                # and recv counts vary between ranks with the routing. The legs
+                # differ whenever dispatch is narrower than combine.
+                d_bw = recv_m * HIDDEN * _DISP_NBYTES / (1000**3) / (d_us_m / 1e6)
+                c_bw = recv_m * HIDDEN * 2 / (1000**3) / (c_us_m / 1e6)
                 if rank == 0:
                     print(
                         f"  ct={ct:<5d} [{name}/{mode}] "
@@ -498,7 +539,7 @@ def main():
                 smi = smi_window(
                     f"bench_ep/dispatch_combine/backend={name}/mode={mode}"
                     f"/M={ct}/disp={_DISP}",
-                    float((got[0] + got[1]) / n),
+                    d_us_m + c_us_m,
                     run_d,
                     run_c,
                 )
@@ -507,13 +548,13 @@ def main():
                     rows.append(
                         dict(
                             case(ct, name, mode),
-                            recv_tokens=round(float(got[2]) / n),
-                            dispatch_us=round(float(got[0]) / n, 2),
-                            combine_us=round(float(got[1]) / n, 2),
-                            pair_us=round(float(got[0] + got[1]) / n, 2),
+                            recv_tokens=round(recv_m),
+                            dispatch_us=round(d_us_m, 2),
+                            combine_us=round(c_us_m, 2),
+                            pair_us=round(d_us_m + c_us_m, 2),
                             dispatch_gbps=round(d_bw, 1),
                             combine_gbps=round(c_bw, 1),
-                            verified=bool(was_checked),
+                            verified=VERIFY_SCOPE,
                             **clocks(smi),
                         )
                     )
