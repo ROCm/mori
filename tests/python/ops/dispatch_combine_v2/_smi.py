@@ -28,9 +28,10 @@ on a background thread, and summarises only the samples that fall inside a
 caller-supplied window -- so warmup, compilation and input generation stay out of
 the reported clocks.
 
-Names, env vars and the emitted record are aiter's (``op_tests/smi_monitor.py``),
-so ``bench_gfx1250_combo.py`` can consume mori's rows with the collector it
-already has. It is a copy, not an import, for the same reason as ``_data.py``.
+The emitted record is aiter's (``op_tests/smi_monitor.py``), so
+``bench_gfx1250_combo.py`` can consume mori's rows with the collector it already
+has. It is a copy, not an import, for the same reason as ``_data.py``. Settings
+answer to either spelling, ``MORI_SMI_*`` or ``AITER_SMI_*``.
 
 ROCm ships the amdsmi binding without a setup.py, so the import falls back to
 ``/opt/rocm/share/amd_smi`` without leaving that path on ``sys.path``. When the
@@ -297,24 +298,33 @@ def available() -> bool:
     return _AVAILABLE
 
 
-def env_config():
-    """(enabled, interval_s, duration_s) from AITER_SMI_MONITOR/INTERVAL/DURATION.
+def _env(name, default=None):
+    """MORI_SMI_<name> if set, else AITER_SMI_<name>.
 
-    aiter's spelling, so one driver can turn telemetry on for both harnesses.
-    SMI_MONITOR is accepted as a shorter alias when running this bench directly.
+    Two spellings for one setting: MORI_ is what a mori run should have to know
+    about, AITER_ is the interop contract -- a driver that already exports it for
+    aiter turns mori's telemetry on with no extra plumbing.
     """
-    on = os.environ.get("AITER_SMI_MONITOR", os.environ.get("SMI_MONITOR", "0")) == "1"
-    interval = float(os.environ.get("AITER_SMI_INTERVAL", "0.05"))
-    duration = float(os.environ.get("AITER_SMI_DURATION", "1.0"))
+    value = os.environ.get(f"MORI_SMI_{name}")
+    if value is None:
+        value = os.environ.get(f"AITER_SMI_{name}")
+    return default if value is None else value
+
+
+def env_config():
+    """(enabled, interval_s, duration_s) from {MORI,AITER}_SMI_MONITOR/INTERVAL/DURATION."""
+    on = _env("MONITOR", "0") == "1"
+    interval = float(_env("INTERVAL", "0.05"))
+    duration = float(_env("DURATION", "1.0"))
     if on and (interval <= 0 or duration <= 0):
-        raise ValueError("AITER_SMI_INTERVAL and AITER_SMI_DURATION must be positive")
+        raise ValueError("SMI interval and duration must be positive")
     return on, interval, duration
 
 
 def emit(record: dict) -> None:
     """Write one telemetry record to the shared JSONL sink, or to stdout."""
     line = SMI_RESULT_PREFIX + json.dumps(record, sort_keys=True)
-    path = os.environ.get("AITER_SMI_OUTPUT_PATH")
+    path = _env("OUTPUT_PATH")
     if path:
         with open(path, "a", encoding="utf-8") as sink:
             sink.write(line + "\n")

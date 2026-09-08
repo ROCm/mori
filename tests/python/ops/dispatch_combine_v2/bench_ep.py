@@ -46,14 +46,14 @@ scales and recv-cap, across both backends.
 Two machine-readable outputs sit alongside the human table. A final JSON line in
 aiter's print_json_table shape carries every point, one row per (backend, mode,
 m), so a parent driver reads results instead of parsing columns. And with
-AITER_SMI_MONITOR=1 each point also replays under amdsmi: the clocks a number was
+MORI_SMI_MONITOR=1 each point also replays under amdsmi: the clocks a number was
 measured at belong with the number, since a throttled part reports a different
 time for the same kernel. That replay is a window of its own, AFTER warmup and
 graph capture, because ITERS pairs are ~10 ms against a 50 ms sampling tick.
 
     torchrun --standalone --nproc_per_node=8 bench_ep.py
     BACKENDS=flydsl,hip SWEEP=512,4096 ITERS=200 torchrun ... bench_ep.py
-    AITER_SMI_MONITOR=1 AITER_SMI_DURATION=1.0 torchrun ... bench_ep.py
+    MORI_SMI_MONITOR=1 MORI_SMI_DURATION=1.0 torchrun ... bench_ep.py
 """
 
 import math
