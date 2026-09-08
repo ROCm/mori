@@ -202,6 +202,7 @@ def run(args) -> int:
             transport="lsa" if direct_lsa else "sdma",
             swap_ab=args.swap_ab,
             store_probe=args.store_probe,
+            permlane=args.permlane,
             rotated=None if args.tile_order == "auto" else args.tile_order == "rotated",
             fence=args.fence,
             emit_put=not args.no_put,
@@ -393,6 +394,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="PERF PROBE, output is wrong by construction: emit the 16B-per-lane "
         "store pattern the permlane stage would produce, without the shuffle, to "
         "price it before building it. Requires --swap-ab; use --skip-validation",
+    )
+    p.add_argument(
+        "--permlane",
+        action="store_true",
+        help="with --swap-ab: two permlane16_swap per M-tile so each lane owns 16 "
+        "contiguous bytes and each row gets 64. This is the real version of what "
+        "--store-probe prices",
     )
     p.add_argument("--sdma-queues", type=int, default=8)
     p.add_argument("--warmup", type=int, default=10)

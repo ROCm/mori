@@ -71,56 +71,78 @@ of the GEMM and nothing overlaps. The rotation is gcnasm's
 ``opus_direct_stripe_tile`` idea. It costs nothing: 49.72us against 49.80us for
 the GEMM alone.
 
-## Store width: the operand swap works and does not pay
+## Store width: --swap-ab --permlane is worth 3.3%, for a reason that is not width
 
-``StoreC`` emits 128 ``buffer_store_short`` per block -- one bf16 at a time -- and
-the reason is the MFMA accumulator layout, not a missed vectorization. Lane ``l``
-holds ``D[4*(l/16)+i][l%16]``: four consecutive *rows*, stride ``c_cols``, so a
-lane's four values are 14336 bytes apart in a row-major C. The eight bf16 that
-would make a 16-byte store, ``C[r][c..c+7]``, live in eight *different* lanes.
-(The same class loads A's scale 128 bits at a time, because that one is indexed
-by row and a lane owns four consecutive rows.)
+``StoreC`` emits 128 ``buffer_store_short`` per block -- one bf16 at a time --
+because of the MFMA accumulator layout, not a missed vectorization. Lane ``l``
+holds ``D[4*(l/16)+i][l%16]``: four consecutive *rows*, stride ``c_cols``, so its
+four values are 14336 bytes apart in a row-major C, and the eight bf16 that would
+make a 16-byte store live in eight different lanes. (The same class already loads
+A's scale 128 bits at a time -- that one is indexed by row, and a lane owns four
+consecutive rows.)
 
-``--swap-ab`` is gcnasm's ``mfma_adaptor_swap_ab`` (opus.hpp:2064, literally
-``base::operator()(b, a, c)`` with ``dim_c()`` redefined): computing ``B^T A^T =
-(A B)^T`` in the accumulator's own layout moves a lane to
-``D[l%16][4*(l/16)+k]`` -- four consecutive *columns*, 8 contiguous bytes. The
-A and B scale loads swap with it, scalar for A and vec4 for B.
+Two steps fix it, both from gcnasm:
 
-It is bit-identical to aiter's kernel at [512,512,256], [1024,768,512] and the
-wo_b shape (``test_swap_ab_is_bitwise_identical``), and it is **slower**:
+* ``--swap-ab`` is ``mfma_adaptor_swap_ab`` (opus.hpp:2064, literally
+  ``base::operator()(b, a, c)`` with ``dim_c()`` redefined). Computing
+  ``B^T A^T = (A B)^T`` in the accumulator's own layout moves a lane to
+  ``D[l%16][4*(l/16)+k]`` -- four consecutive *columns*, 8 contiguous bytes.
+* ``--permlane`` adds two ``v_permlane16_swap_b32`` per M-tile. Its semantics,
+  measured on hardware rather than assumed, are
+  ``vdst' = [X.r0, Y.r0, X.r2, Y.r2]`` and ``vsrc' = [X.r1, Y.r1, X.r3, Y.r3]``,
+  so::
 
-    variant                 per lane  lanes/row  bytes/row  rows/instr   gemm-only
-    unswapped (128 short)      2B        16         32B         4        50.4us
-    --swap-ab (32 dwordx2)     8B         4         32B        16        55.6us
-    + 16B/lane (probe)        16B         4         64B        16        48.1us
+      (A, B) = permlane16_swap(tile0.d0, tile1.d0)
+      (C, D) = permlane16_swap(tile0.d1, tile1.d1)
+      lane group g stores (A, C, B, D)
 
-Store instructions drop 4x and total kernel instructions 30%, and none of that
-matters, because the number of memory transactions does not change: both layouts
-put 32 bytes in a row and need 16 of them. The swap only moves those 16
-transactions from four instructions onto one, quadrupling the per-instruction
-address fan-out -- ATT puts ``buffer_store_dwordx2`` at 1022 cycles each against
-``buffer_store_short``'s 114.
+  lands g = 0,1,2,3 on columns 0-7, 16-23, 8-15, 24-31. The four groups together
+  cover columns 0..31 contiguously: 16 bytes per lane, 64 per row. The column
+  permutation is absorbed into the address, so no ``ds_bpermute`` and no LDS.
 
-What actually helps is 64 bytes per row, and only a little. ``--store-probe``
-emits that access pattern with deliberately wrong data, so it is an upper bound
-with the cross-lane shuffle's cost removed: 48.1us against 50.4, i.e. **-4.6% at
-best**, before paying for the ``permlane16_swap`` + ``shfl`` that would make it
-correct. Not worth building.
+Both are bit-identical to aiter's kernel at [512,512,256], [1024,768,512] and the
+wo_b shape (``test_swap_ab_is_bitwise_identical``). Measured, 8 ranks, GEMM kernel
+median over 42 dispatches:
 
-And it does nothing at all on the path where the store dominates. On
-``fused-lsa``, where the store is 14% of the kernel with 60x the stall of the
-local case, the same probe measures 340.8/338.7/333.1us against the current
-336.4/335.3/337.7 -- a wash. That phase is limited by xGMI bandwidth, not by
-transaction count, so halving the transactions buys nothing.
+    variant                bytes/row  store instrs  store cycles   gemm kernel
+    unswapped                  32B      128 short        14,608      38.30us
+    --swap-ab                  32B       32 dwordx2      32,720      slower
+    --swap-ab --permlane       64B       16 dwordx4      14,604      37.04us
 
-The 16-column MFMA tile is the real floor here: 16 bf16 is 32 bytes, a quarter of
-a 128-byte line, whatever the operand order. Reaching 64B needs two N-tiles
-merged (they are 16 columns apart in *both* layouts, so it needs a shuffle
-either way), and 128B needs merging across waves through LDS -- which gcnasm
-measured at a 1-3% regression.
+**The store is not where the time goes.** Its total latency is the same before and
+after -- 14,608 against 14,604 -- and ``--swap-ab`` alone is *slower* because at
+32 bytes per row the same 16 transactions get squeezed onto a quarter as many
+instructions, quadrupling per-instruction address fan-out (1022 cycles each
+against 114). ``permlane``'s 64-byte rows halve the transactions, which is only
+enough to put the store back where it started.
 
-## Direct LSA (``--mode fused-lsa``)## Direct LSA (``--mode fused-lsa``): the structure works, the store does not
+What actually pays is everything a 2-byte store drags along with it. From the
+thread trace, unswapped -> permlane:
+
+    v_mul_f32_e32              257 ->   1     17,664 ->     68 cyc
+    v_pk_mul_f32                 0 -> 128          0 ->  9,276
+    v_lshlrev_b32_e32          159 ->  45     11,304 ->  3,828
+    v_add_u32_e32              133 ->  21      8,944 ->  1,604
+    v_cndmask_b32_e64           96 ->   8      6,368 ->    656
+    v_cvt_pk_bf16_f32          128 ->  64      8,384 ->  4,244
+    v_permlane16_swap_b32_e64    0 ->  32          0 ->  4,260
+
+128 stores need 128 addresses, 128 bounds predicates and 128 scalar multiplies;
+16 stores need 16. And the swapped layout makes B's scale a vec4, so the scaling
+packs into ``v_pk_mul_f32``. Total kernel instructions drop 2062 -> 1421 and the
+permlanes cost 4,260 cycles to save roughly 33,000.
+
+Two limits worth recording. This does nothing on ``fused-lsa``
+(335-338us either way), where the store phase is xGMI bandwidth-limited rather
+than transaction- or issue-limited. And 64 bytes is the ceiling for one wave: a
+wave owns ``N_TILES_B * 16 = 32`` columns, so 128-byte lines would need merging
+across waves through LDS, which gcnasm measured at a 1-3% regression.
+
+This is a candidate to push back into aiter's own ``StoreC`` -- it is bit-exact,
+costs no registers (VGPR 128 / SGPR 112 / 0 scratch, unchanged), and the 3.3% is
+on the GEMM itself rather than on anything to do with the all-reduce.
+
+## Direct LSA (``--mode fused-lsa``)## Direct LSA (``--mode fused-lsa``)## Direct LSA (``--mode fused-lsa``): the structure works, the store does not
 
 gcnasm's best mode has the GEMM epilogue store *straight into the destination
 rank's window*, so there is no staging buffer, no copy engine and nothing to
@@ -288,6 +310,7 @@ from mori.cco.device.flydsl import _bindings as raw_cco
 _AR_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ar")
 sys.path.insert(0, _AR_DIR)
 from flydsl._mlir import ir  # noqa: E402
+from flydsl._mlir.dialects import llvm as _llvm_d  # noqa: E402
 from flydsl._mlir.dialects import scf  # noqa: E402
 
 from _compat import (  # noqa: E402
@@ -397,10 +420,14 @@ class _SwapABStoreC(StoreC):
     while B's is indexed by column, now 4 consecutive, so a vec4.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, peer_rsrc=None, elem_base=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.out_atom_4 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.BFloat16)
         self.reg_bf16_4 = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.BFloat16)
+        self.out_atom_8 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+        self.reg_bf16_8 = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
+        self._peer_rsrc = peer_rsrc
+        self._elem_base = elem_base
 
     def _load_a_scale_scalar(self, row):
         fx.copy(
@@ -453,6 +480,92 @@ class _SwapABStoreC(StoreC):
                 self._store_bf16x4(vals, arith.select(col_valid, c_index, oob))
 
 
+def _permlane16_swap(x, y):
+    """gfx950 ``v_permlane16_swap_b32``: exchange 16-lane rows between two VGPRs.
+
+    Verified on hardware rather than assumed::
+
+        vdst_new = [X.r0, Y.r0, X.r2, Y.r2]
+        vsrc_new = [X.r1, Y.r1, X.r3, Y.r3]
+
+    Position *within* a row is preserved, so a lane keeps its ``lane % 16`` and
+    therefore its C row -- which is what lets the A-scale stay correct across the
+    shuffle.
+    """
+    st = ir.Type.parse("!llvm.struct<(i32, i32)>")
+    raw = lambda v: v.ir_value() if hasattr(v, "ir_value") else v
+    res = fx.rocdl.permlane16_swap(st, raw(x), raw(y), False, True)
+    i32 = ir.IntegerType.get_signless(32)
+    return (
+        fx.Int32(_llvm_d.ExtractValueOp(i32, res, ir.DenseI64ArrayAttr.get([0])).result),
+        fx.Int32(_llvm_d.ExtractValueOp(i32, res, ir.DenseI64ArrayAttr.get([1])).result),
+    )
+
+
+class _PermlaneStoreC(_SwapABStoreC):
+    """A/B-swapped MFMA + one cross-lane step, giving 16B per lane and 64B rows.
+
+    After the swap a lane owns 4 consecutive columns of one N-tile, i.e. 8 bytes,
+    and the two N-tiles it holds are 16 columns apart -- so a row still only gets
+    32 bytes per instruction. Two ``permlane16_swap`` fix that exactly, with no
+    ``ds_bpermute`` and no LDS:
+
+        (A, B) = permlane16_swap(tile0.d0, tile1.d0)
+        (C, D) = permlane16_swap(tile0.d1, tile1.d1)
+        lane group g stores (A, C, B, D)
+
+    which lands g = 0,1,2,3 on columns 0-7, 16-23, 8-15, 24-31. The four groups
+    together cover columns 0..31 contiguously: 64 bytes per row, from 16 bytes per
+    lane. The column permutation is absorbed into the address, so it is free.
+
+    Scaling happens before the shuffle, in the lane that owns the value; the
+    shuffle only moves whole 16-lane rows, so every lane keeps its own C row.
+    """
+
+    def store(self, c_frag, base_row, base_col):
+        assert self.n_tiles_b == 2, (
+            "the permlane mapping pairs exactly two N-tiles (BLOCK_N == 256); "
+            f"got n_tiles_b={self.n_tiles_b}"
+        )
+        lane = self.lane_id
+        grp = lane // 16
+        a_scales = [
+            self._load_a_scale_scalar(base_row + ti * 16 + lane % 16)
+            for ti in range_constexpr(self.n_tiles_a)
+        ]
+        b_scales = [
+            self._load_b_scale_vec4(base_col + tj * 16 + grp * 4)
+            for tj in range_constexpr(self.n_tiles_b)
+        ]
+        for ti in range_constexpr(self.n_tiles_a):
+            row = base_row + ti * 16 + lane % 16
+            dwords = []
+            for tj in range_constexpr(self.n_tiles_b):
+                vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
+                packed = Vec.from_elements(
+                    [
+                        (vec_f32[k] * (a_scales[ti] * b_scales[tj][k])).to(fx.BFloat16)
+                        for k in range_constexpr(4)
+                    ],
+                    fx.BFloat16,
+                ).bitcast(fx.Int32)
+                dwords.append((packed[0], packed[1]))
+            a, b = _permlane16_swap(dwords[0][0], dwords[1][0])
+            c, d = _permlane16_swap(dwords[0][1], dwords[1][1])
+            out8 = Vec.from_elements([a, c, b, d], fx.Int32).bitcast(fx.BFloat16)
+            col = base_col + (grp % 2) * 16 + (grp // 2) * 8
+            oob = fx.Int32(self.c_rows * self.c_cols)
+            idx = arith.select(col + 7 < self.c_cols, row * self.c_cols + col, oob)
+            if self._peer_rsrc is not None:
+                buffer_store(out8, self._peer_rsrc, fx.Int32(idx) - self._elem_base)
+            else:
+                fx.memref_store_vec(out8, self.reg_bf16_8)
+                fx.copy(
+                    self.out_atom_8, self.reg_bf16_8,
+                    fx.slice(self.c_div, (None, fx.Int32(idx))),
+                )
+
+
 class _WideStoreProbeC(_SwapABStoreC):
     """PERF PROBE ONLY -- the output is wrong on purpose.
 
@@ -468,15 +581,7 @@ class _WideStoreProbeC(_SwapABStoreC):
     ``permlane16_swap`` step; this probe skips it and keeps only its cost profile.
     """
 
-    def __init__(self, *args, peer_rsrc=None, elem_base=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.out_atom_8 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
-        self.reg_bf16_8 = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
-        # When set, the 16B stores go straight to the owning peer (Direct LSA)
-        # rather than to local C, so the probe can price the same access pattern
-        # on the path where the store actually dominates.
-        self._peer_rsrc = peer_rsrc
-        self._elem_base = elem_base
+
 
     def store(self, c_frag, base_row, base_col):
         lane = self.lane_id
@@ -602,6 +707,7 @@ def compile_fused_gemm_scatter(
     rotated: bool | None = None,
     swap_ab: bool = False,
     store_probe: bool = False,
+    permlane: bool = False,
     transport: str = "sdma",
     fence: str = "none",
     emit_put: bool = True,
@@ -684,7 +790,7 @@ def compile_fused_gemm_scatter(
         raise ValueError(
             f"fence must be all/agent/leader/none/writethrough/wt-agent, got {fence!r}"
         )
-    _kname_tag = f"{'S' if swap_ab else ''}{'W' if store_probe else ''}c{chunks}{'r' if rotated else 'l'}{fence[0]}"
+    _kname_tag = f"{'S' if swap_ab else ''}{'P' if permlane else ''}{'W' if store_probe else ''}c{chunks}{'r' if rotated else 'l'}{fence[0]}"
     counter_off = cfg.counter_off
     lock_off = cfg.lock_off
     in_off = cfg.input_off
@@ -792,13 +898,27 @@ def compile_fused_gemm_scatter(
         b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
         a_s2r = S2RLoader(wave_m, N_TILES_A)
         b_s2r = S2RLoader(wave_n, N_TILES_B)
-        if const_expr(swap_ab and store_probe and not direct_lsa):
+        if const_expr(swap_ab and permlane and not direct_lsa):
+            store_c = _PermlaneStoreC(
+                A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B
+            )
+        elif const_expr(swap_ab and store_probe and not direct_lsa):
             store_c = _WideStoreProbeC(
                 A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B
             )
         elif const_expr(swap_ab and not direct_lsa):
             store_c = _SwapABStoreC(
                 A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B
+            )
+        elif const_expr(direct_lsa and swap_ab and permlane):
+            dest_blk = block_m // fx.Int32(m_tiles_per_peer)
+            store_c = _PermlaneStoreC(
+                A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B,
+                peer_rsrc=create_buffer_resource_from_addr(
+                    wave_uniform_i64(w_pre.lsa_ptr(dest_blk, my_recv_slot)),
+                    num_records_bytes=cfg.slice_bytes,
+                ),
+                elem_base=dest_blk * fx.Int32(slice_rows) * c_n,
             )
         elif const_expr(direct_lsa and swap_ab and store_probe):
             dest_blk = block_m // fx.Int32(m_tiles_per_peer)

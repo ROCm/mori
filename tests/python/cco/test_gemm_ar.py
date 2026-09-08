@@ -162,9 +162,10 @@ def test_swap_ab_is_bitwise_identical(m, n, k):
 
     ``fx.gemm(atom, c, b, a, c)`` computes ``(A B)^T`` in the accumulator's own
     layout: same products, same fp32 accumulation order along k, only the
-    register-to-(row, col) mapping differs. So this is exactly reproducible, and
-    anything less than bit-equality means the store's index math drifted rather
-    than that the arithmetic changed.
+    register-to-(row, col) mapping differs. Adding ``permlane`` only moves whole
+    16-lane rows between registers. So both are exactly reproducible, and
+    anything less than bit-equality means an index or a lane mapping drifted,
+    not that the arithmetic changed.
     """
     if not torch.cuda.is_available():
         pytest.skip("requires a GPU")
@@ -187,19 +188,20 @@ def test_swap_ab_is_bitwise_identical(m, n, k):
     flydsl_8wave_gemm_a8(a, b_shuf, sa, sb, ref, 256, 256)
 
     cfg = layout.ArConfig(world_size=2, m=m, n=n)
-    gemm = compile_fused_gemm_scatter(
-        cfg, 0, K=k, BLOCK_M=256, BLOCK_N=256, b_preshuffled=True,
-        fuse=False, swap_ab=True,
-    )
-    got = torch.zeros(m, n, device="cuda", dtype=torch.bfloat16)
-    gemm(
-        a.contiguous().view(torch.int8).view(-1),
-        b_shuf.contiguous().view(torch.int8).view(-1),
-        got.view(-1), sa, sb, m, n, 0, 0,
-        stream=fx.Stream(torch.cuda.current_stream()),
-    )
-    torch.cuda.synchronize()
-    assert torch.equal(got, ref)
+    for extra in ({}, {"permlane": True}):
+        gemm = compile_fused_gemm_scatter(
+            cfg, 0, K=k, BLOCK_M=256, BLOCK_N=256, b_preshuffled=True,
+            fuse=False, swap_ab=True, **extra,
+        )
+        got = torch.zeros(m, n, device="cuda", dtype=torch.bfloat16)
+        gemm(
+            a.contiguous().view(torch.int8).view(-1),
+            b_shuf.contiguous().view(torch.int8).view(-1),
+            got.view(-1), sa, sb, m, n, 0, 0,
+            stream=fx.Stream(torch.cuda.current_stream()),
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(got, ref), f"swap_ab {extra} drifted from aiter"
 
 
 def test_rotated_tile_order_is_a_permutation_of_the_linear_one():
