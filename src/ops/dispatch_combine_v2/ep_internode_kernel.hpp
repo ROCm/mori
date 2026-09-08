@@ -128,7 +128,8 @@ using EpDispatchCombineArgs = EpInterNodeArgs;
   int myNode = myPe / config.gpuPerNode;                                   \
   int nNodes = npes / config.gpuPerNode;                                   \
   int numExpertPerToken = config.numExpertPerToken;                        \
-  assert(numExpertPerToken < warpSize);                                    \
+  static_assert(kConfig.numExpertPerToken < warpSize,                       \
+                "numExpertPerToken must fit in a ballot");                   \
   size_t hiddenDim = config.HiddenDimSz();                                 \
   size_t hiddenBytes = config.HiddenBytes(sizeof(T));                      \
   size_t indexBytes = config.IndexBytes();                                 \
