@@ -44,6 +44,35 @@ without a QP.
 ``tools/run_internode_test.sh`` drives both ranks; the CLI below is the subset of
 the shmem harness's flags that means anything here.
 
+CCO's TAIL IS NOT THE FABRIC'S: WHAT SHMEM DOES ON THE SAME WIRE
+----------------------------------------------------------------
+Run the v1 harness in the same session for a reference. It drives the shmem/IBGDA
+transport over the SAME NICs, rails, switch and QoS, at the same shape, so it
+isolates what is specific to the CCO path. Note it spawns its own 8 workers per
+node, so it takes --nproc_per_node=1, not 8:
+
+    GPU_PER_NODE=8 MORI_EP_LAUNCH_CONFIG_MODE=AUTO MORI_RDMA_TC=160 MORI_RDMA_SL=5 \\
+    torchrun --nnodes=2 --node_rank=N --nproc_per_node=1 --master_addr=... \\
+      examples/ops/dispatch_combine/test_dispatch_combine_internode.py \\
+      --cmd bench --kernel-type v1_ll --num-qp 1 --max-tokens 4 \\
+      --hidden-dim 6144 --dtype fp8_e4m3_fnuz --combine-dtype bf16 --quant-type none
+
+Measured, 29 kept rounds x 16 ranks = 464 samples per phase:
+
+                       shmem/IBGDA          CCO/GDA (here)
+    dispatch mean         47.4us              40-47us
+    combine  mean         59.1us              46-52us
+    max/mean              1.19x / 1.18x       2-6x
+    rounds >1.8x base     0 of 29             11 of ~260
+    cross-rank spread     median 9-13us       up to 207us (34 -> 241)
+
+Two things follow. CCO is FASTER in the mean -- combine by ~20% -- so the port is
+not simply worse. And the tail belongs to the CCO path, not to the fabric: shmem
+shares every wire and shows no spiked round at all, which rules out the rail and
+switch explanations that the {i, i+8} pattern below otherwise suggests.
+
+Both harnesses do have a huge round 0 (shmem's spans 83-614us) and both drop 1.
+
 READING THE PER-RANK SERIES (MORI_EP_ROUND_SERIES)
 --------------------------------------------------
 Every rank prints its own per-round series. These are spin-wait collectives, so
