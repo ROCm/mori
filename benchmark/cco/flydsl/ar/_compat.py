@@ -276,6 +276,18 @@ def atomic_add_u32(ptr, value):
     )
 
 
+def release_fence(scope="agent"):
+    """Release fence at an explicit scope, for producers of copy-engine input.
+
+    cco only exposes ``cco_system_fence`` (``__threadfence_system``), which on
+    gfx950 writes back through to memory. An SDMA engine reading a buffer we just
+    wrote lives on the *same* device, so agent scope is the scope that actually
+    describes the handoff; system scope over-synchronises against host and peers
+    that are not the reader here.
+    """
+    _llvm_d.fence(_llvm_d.AtomicOrdering.release, syncscope=scope)
+
+
 def i32_type():
     return _dtype("i32")
 
@@ -293,6 +305,7 @@ __all__ = [
     "local_load_u32",
     "local_store_u32",
     "atomic_add_u32",
+    "release_fence",
     "i32_type",
     "CM_CACHED",
     "CM_SC1",

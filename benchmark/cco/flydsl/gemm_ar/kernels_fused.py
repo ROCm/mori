@@ -71,48 +71,63 @@ of the GEMM and nothing overlaps. The rotation is gcnasm's
 ``opus_direct_stripe_tile`` idea. It costs nothing: 49.72us against 49.80us for
 the GEMM alone.
 
-## Result: this fusion does not pay at the wo_b shape
+## Result: the fusion works, and the release fence costs more than it saves
 
-8x MI355X, [4096, 7168] bf16 out, K=1024, CUDA-graph replay, median of 51:
+Per-kernel, from ``rocprofv3 --kernel-trace`` on 8x MI355X, [4096, 7168] out,
+K=1024, median of 11 (times in us):
 
-    gemm-only                    49.6us
-    split-lsa   gemm + LSA AR   327.0
-    split-sdma  gemm + SDMA AR  382.0
-    fused-sdma  chunks=2        450.2
+    config              gemm   scatter/drain  reduce  gather    sum   correct
+    split               39.1        136.8      59.0   137.3   372.3     yes
+    fused --fence none  64.5        103.4      59.8   136.6   364.2     NO
+    fused --fence leader 83.5        96.9      59.9   136.2   376.5     NO
+    fused --fence agent 156.1         67.3     59.8   137.0   420.1     yes
+    fused --fence all   175.9         71.1     59.3   137.3   443.6     yes
 
-Fused is *worse*, by 66-68us -- and by the same 66-68us at K=4096 and K=8192, so
-it is a fixed cost, not a scaling one. It is the release fence, and the fence is
-not negotiable:
+The overlap is real and large: the scatter collapses from 136.8us to 67.3us. But
+every microsecond of that, and more, reappears inside the GEMM, which goes from
+39.1us to 156.1us. Splitting that +117us three ways:
 
-* ``--fence all`` (every lane, the only correct form) costs 70us across the 448
-  blocks: 452.0us against 382.4 for ``--fence leader``.
-* ``--fence leader`` is *wrong*, which is a measurement and not an inference:
-  relL2 goes from 2.35e-3 to 8.9e-3 on 8 ranks. `s_waitcnt vmcnt(0)` plus
-  `s_barrier` retires every lane's stores, and it is still not enough -- exactly
-  what ``cco_device_wrapper.cpp:105-111`` warns, that leaderOnly orders thread 0
-  only and does not substitute for a release from every producer lane.
-* ``--fence none`` is incorrect too, and exists only to price the ceiling: it
-  gives 373.0us against split's 382.0. So **even with a free fence the overlap is
-  worth ~9us**, against a GEMM of 49.6us.
+* **+25us** for the tail itself with no fence at all -- ``s_waitcnt vmcnt(0)``,
+  the block-wide barrier, the atomic, and the copy engine reading C while the
+  GEMM is still writing it.
+* **+92us** for ``buffer_wbl2 sc1`` and the ``s_waitcnt vmcnt(0)`` that waits on
+  it. This is the whole problem, and it is **quadratic**: ``buffer_wbl2`` flushes
+  the entire L2, so block k writes back every tile blocks 1..k-1 already wrote,
+  448 blocks over. The split path gets one bulk release at kernel end instead,
+  for free.
+* **+20us** more if the fence is system-scoped rather than agent-scoped. The ISA
+  says why: ``__threadfence_system`` is bidirectional, so it emits
+  ``buffer_wbl2 sc0 sc1 ; s_waitcnt ; buffer_inv sc0 sc1`` -- and that
+  ``buffer_inv`` discards the B weights the GEMM is streaming, 3584 times.
 
-Why the overlap is ~9us and not ~50us: 448 blocks over 256 CUs is 1.75 waves, so
-no destination's first chunk can complete before ~57% of the GEMM has elapsed,
-and each push then pays the copy engine's ~6us dispatch. Only the tail of the
-GEMM is available to hide anything in. Finer chunking helps as far as it can go
-(chunks=2 is 450.2us against chunks=1's 505.6), but at this shape the slice is
-only 2 BLOCK_M row-bands, so 2 is the maximum.
+Three things were tried to make the release cheap, and all three failed:
 
-The underlying ratio is the real obstacle, and it is the one the plan flagged:
-the transfer is ~2.7x the GEMM (a 7.3MB slice per link at ~50GB/s is ~147us,
-twice, against 49.6us of compute), so the links are the critical path with or
-without overlap and perfect fusion could remove at most the GEMM. Raising K does
-not rescue it -- K=4096 and K=8192 show the same constant deficit -- because N
-and M set both the C traffic and the collective, and K only buys compute the
-collective still has to wait for.
+* **Agent scope instead of system.** Correct (relL2 2.35e-3, same as split) and
+  it does drop the ``buffer_inv``, but it only buys 20us of the 112. Worth
+  keeping as the default anyway -- and note cco exposes no agent-scope release,
+  only ``cco_system_fence``, so this had to be emitted as a raw ``llvm.fence``.
+* **One fence per block instead of per wave** (``--fence leader``). Incorrect:
+  relL2 9.6e-3, indistinguishable from no fence at all, even though every lane
+  has already passed ``s_waitcnt vmcnt(0)`` and a block barrier. So the release
+  really is per-wave, which is where the factor of 8 in 3584 comes from.
+* **Write-through C stores** (``--fence writethrough``), so no writeback would be
+  needed. Not a release on its own (relL2 1.72e-2), and pairing it with the agent
+  fence (``--fence wt-agent``, 432.5us) is indistinguishable from the agent fence
+  alone (432.4us) -- ``buffer_wbl2`` costs the same whether or not the lines it
+  is asked to flush are dirty.
 
-Read the numbers against ``split-lsa`` (327.0us), not ``split-sdma``: the
-question a fused SDMA path has to answer is whether it beats the *best* split
-pipeline, and it is 38% behind that.
+So the honest conclusion is narrower than "the ratio is wrong", though the ratio
+does cap the prize: what is missing is a **per-tile release**. Every primitive
+available here publishes the whole cache, and the GEMM needs to publish 448
+tiles, so the release is O(blocks^2) against an overlap worth at most one GEMM.
+Even the incorrect ``--fence none`` configuration only reaches 364.2us against
+split's 372.3 -- and both lose to ``gemm + LSA`` at 327.0us, which remains the
+number any fused SDMA path has to beat.
+
+The completion-counter machinery and the destination-rotated tile order are both
+sound and are what produced the 69.5us of genuine overlap; they would pay
+immediately on a transport whose producer-side release is per-tile rather than
+per-cache.
 
 ## Pinned copy
 
@@ -162,7 +177,31 @@ from mori.cco.device.flydsl import _bindings as raw_cco
 
 _AR_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ar")
 sys.path.insert(0, _AR_DIR)
-from _compat import atomic_add_u32, signal_ptr  # noqa: E402
+from _compat import (  # noqa: E402
+    CM_SC0_SC1,
+    atomic_add_u32,
+    release_fence,
+    signal_ptr,
+)
+
+
+class _WriteThroughStoreC(StoreC):
+    """``StoreC`` whose C stores bypass L1 and L2 instead of being written back.
+
+    The only change is the copy atom's cache modifier. It exists because a
+    per-block release fence is quadratic: ``buffer_wbl2`` flushes the *whole* L2,
+    so block k redundantly writes back every tile blocks 1..k-1 already wrote,
+    448 times over. Writing C through in the first place makes the release free --
+    ``s_waitcnt vmcnt(0)`` is then all the copy engine needs -- and adds no
+    traffic, since C has to reach memory regardless.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.out_atom_1 = fx.make_copy_atom(
+            fx.rocdl.BufferCopy16b(CM_SC0_SC1), fx.BFloat16
+        )
+
 
 BLOCK_K = 128
 
@@ -179,7 +218,7 @@ def compile_fused_gemm_scatter(
     xcd_swizzle: int = 0,
     fuse: bool = True,
     rotated: bool | None = None,
-    fence: str = "all",
+    fence: str = "agent",
 ):
     """Compile the GEMM, with (``fuse=True``) or without the scatter epilogue.
 
@@ -248,8 +287,10 @@ def compile_fused_gemm_scatter(
     tiles_per_chunk = m_tiles_per_chunk * n_blocks_const
     chunk_bytes = cfg.slice_bytes // chunks
 
-    if fence not in ("all", "leader", "none"):
-        raise ValueError(f"fence must be all/leader/none, got {fence!r}")
+    if fence not in ("all", "agent", "leader", "none", "writethrough", "wt-agent"):
+        raise ValueError(
+            f"fence must be all/agent/leader/none/writethrough/wt-agent, got {fence!r}"
+        )
     _kname_tag = f"c{chunks}{'r' if rotated else 'l'}{fence[0]}"
     counter_off = cfg.counter_off
     in_off = cfg.input_off
@@ -348,7 +389,14 @@ def compile_fused_gemm_scatter(
         b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
         a_s2r = S2RLoader(wave_m, N_TILES_A)
         b_s2r = S2RLoader(wave_n, N_TILES_B)
-        store_c = StoreC(A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
+        if const_expr(fence in ("writethrough", "wt-agent")):
+            store_c = _WriteThroughStoreC(
+                A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B
+            )
+        else:
+            store_c = StoreC(
+                A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B
+            )
 
         c00_frag = [mfma.zero_value] * N_ACCUMS
         c01_frag = [mfma.zero_value] * N_ACCUMS
@@ -476,6 +524,10 @@ def compile_fused_gemm_scatter(
                 raw_cco.cco_system_fence(fx.Int32(0))
             elif const_expr(fence == "leader"):
                 raw_cco.cco_system_fence(fx.Int32(1))
+            elif const_expr(fence in ("agent", "wt-agent")):
+                release_fence("agent")
+            # "writethrough": nothing to do -- the stores already went to memory,
+            # and wait_barrier(0) above retired them.
 
             w = cco.Window(win)
             sdma = cco.DevComm(dev_comm).sdma()

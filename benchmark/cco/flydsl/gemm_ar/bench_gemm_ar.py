@@ -44,13 +44,13 @@ Headline, 8x MI355X, [4096, 7168] out, K=1024, graph replay, median of 51:
     gemm-only     49.6us
     split-lsa    327.0
     split-sdma   382.0
-    fused-sdma   450.2   (chunks=2)
+    fused-sdma   432.4   (chunks=2, --fence agent)
 
-Fusing loses, by a fixed 66-68us that is the mandatory all-lane release fence.
-``kernels_fused.py`` has the decomposition; the short version is that the fence
-costs 70us while the overlap available is ~9us. ``--fence`` and ``--stop-after``
-exist to reproduce that attribution, not because either has a correct non-default
-setting.
+Fusing loses. The overlap is real -- a kernel trace shows the scatter dropping
+from 136.8us to 67.3us -- but the release fence the epilogue needs adds more than
+that back inside the GEMM, which goes from 39.1us to 156.1us. ``kernels_fused.py``
+has the full per-kernel decomposition. ``--fence`` and ``--stop-after`` exist to
+reproduce that attribution.
 """
 
 from __future__ import annotations
@@ -328,11 +328,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--fence",
-        choices=("all", "leader", "none"),
-        default="all",
-        help="release before the epilogue push. Only 'all' is correct: 'leader' "
-        "measurably corrupts (relL2 8.9e-3 vs 2.35e-3 on 8 ranks) and 'none' more "
-        "so. Both exist only to price the fence",
+        choices=("all", "agent", "leader", "none", "writethrough", "wt-agent"),
+        default="agent",
+        help="release before the epilogue push. Correct: 'agent' (default, "
+        "cheapest) and 'all' (system scope, adds a buffer_inv that costs 20us). "
+        "Incorrect, and present only to price the fence: 'leader', 'none', "
+        "'writethrough'. 'wt-agent' is correct but no faster than 'agent'",
     )
     p.add_argument(
         "--stop-after",
