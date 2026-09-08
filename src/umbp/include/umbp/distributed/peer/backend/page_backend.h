@@ -541,6 +541,52 @@ class PageBackend : public MediumBackend {
   std::unordered_map<std::string, OwnedSlot> owned_;
   std::vector<KvEvent> pending_events_;
 
+  // ---- repeat-resolve cache -------------------------------------------------
+  //
+  // A layer-wise reader asks about ONE key set once per layer group, changing
+  // only which bytes it wants.  Resolution is stateless, so seven of every
+  // eight answers are rebuilt identically: per key a hash of a ~128-byte
+  // string and a probe of a several-hundred-thousand entry map.
+  //
+  // Keyed on the identity of the caller's vector, not a hash of it.  Hashing
+  // 64 KiB of keys costs more than the probes it would save; the caller that
+  // repeats a set passes the same vector object each time (the standalone
+  // server holds it by shared_ptr for exactly this reason), so the address and
+  // size pick the candidate and a full key comparison confirms it.  A wrong
+  // guess therefore costs a re-resolve and can never yield a wrong page list.
+  //
+  // Two things make a hit safe to trust:
+  //
+  //   * `generation` -- bumped wherever an owned key's pages stop being that
+  //     key's.  Unchanged means no key was erased, which is also what keeps the
+  //     stored OwnedSlot pointers valid: unordered_map keeps element pointers
+  //     stable across rehash, and a Commit for a key that already exists keeps
+  //     the prior slot rather than replacing it.
+  //   * only a batch that hit on EVERY key is cached.  The generation covers
+  //     keys leaving owned_, not arriving, so a remembered "not found" could
+  //     outlive the key showing up; a full hit has no such hole.
+  //
+  // Its own lock, and a shared one: every rank on the node reaches this backend
+  // through the one standalone server, so a plain mutex here would reintroduce
+  // the serialization that made resolve scale flat in the first place.
+  struct ResolveCacheEntry {
+    std::vector<std::string> keys;
+    std::vector<ResolvedEntry> result;
+    std::vector<OwnedSlot*> slots;
+    uint64_t generation = 0;
+    bool include_descs = false;
+    bool allow_file_refs = false;
+  };
+
+  // A restore has one key set in flight per pool it reads; sized past that.
+  static constexpr size_t kResolveCacheCapacity = 8;
+
+  // Bumped under a unique lock on mutex_ wherever a key leaves owned_.
+  uint64_t eviction_generation_ = 0;
+
+  mutable std::shared_mutex resolve_cache_mutex_;
+  std::unordered_map<uintptr_t, ResolveCacheEntry> resolve_cache_;
+
   // Auto-flush state (see QueueEventLocked):
   size_t auto_flush_threshold_ = SIZE_MAX;  // events before a flush; default = never
   std::function<void()> auto_flush_cb_;     // set once at startup; wakes the heartbeat

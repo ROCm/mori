@@ -502,14 +502,51 @@ std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::stri
   // One now() for the batch: it runs in well under a millisecond against a
   // TTL measured in seconds, so the last key loses nothing worth a syscall.
   const int64_t lease_deadline = SteadyNs(std::chrono::steady_clock::now() + read_lease_ttl_);
+
+  // The set this caller asked about last time, if it is asking again.  Held
+  // under mutex_, so the stored OwnedSlot pointers cannot be going away while
+  // this runs.  See ResolveCacheEntry for why identity plus a full compare is
+  // both cheaper and safer here than hashing the keys.
+  const uintptr_t identity = reinterpret_cast<uintptr_t>(keys.data());
+  {
+    std::shared_lock<std::shared_mutex> cache_lock(resolve_cache_mutex_);
+    auto cached = resolve_cache_.find(identity);
+    if (cached != resolve_cache_.end()) {
+      const ResolveCacheEntry& entry = cached->second;
+      // Generation first: it is the cheap check, and it is what makes the
+      // stored pointers safe to touch at all.
+      if (entry.generation == eviction_generation_ && entry.include_descs == include_descs &&
+          entry.allow_file_refs == allow_file_refs && entry.keys == keys) {
+        out = entry.result;
+        // Renewed through the stored pointers rather than by hashing the keys
+        // again.  A reused answer must not carry a stale lease: the window
+        // between resolving and copying is still fenced by it.
+        for (OwnedSlot* slot : entry.slots) RenewLeaseAtomic(*slot, lease_deadline);
+        if (local_evict_enabled_) {
+          std::lock_guard<std::mutex> lru_lock(lru_mutex_);
+          for (size_t i = 0; i < entry.slots.size(); ++i) {
+            TouchLruLocked(entry.keys[i], *entry.slots[i]);
+          }
+        }
+        return out;
+      }
+    }
+  }
+
   // Collect the hits, then touch the LRU once for the whole batch instead of
   // taking lru_mutex_ per key.  Nothing here can invalidate the pointers: a
   // shared lock excludes every writer of owned_.
   std::vector<std::pair<const std::string*, OwnedSlot*>> touched;
   if (local_evict_enabled_) touched.reserve(keys.size());
+  std::vector<OwnedSlot*> slots;
+  slots.reserve(keys.size());
+  bool all_found = true;
   for (size_t i = 0; i < keys.size(); ++i) {
     auto it = owned_.find(keys[i]);
-    if (it == owned_.end()) continue;
+    if (it == owned_.end()) {
+      all_found = false;
+      continue;
+    }
     auto& entry = out[i];
     entry.outcome = ResolveOutcome::kFound;
     entry.found = true;
@@ -518,11 +555,28 @@ std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::stri
     entry.page_size = page_size_;
     if (include_descs) entry.descs = BuildBufferDescsLocked(it->second.pages);
     RenewLeaseAtomic(it->second, lease_deadline);
+    slots.push_back(&it->second);
     if (local_evict_enabled_) touched.emplace_back(&keys[i], &it->second);
   }
   if (!touched.empty()) {
     std::lock_guard<std::mutex> lru_lock(lru_mutex_);
     for (auto& [key, slot] : touched) TouchLruLocked(*key, *slot);
+  }
+
+  // Only a full hit is reusable; see ResolveCacheEntry.
+  if (all_found) {
+    std::unique_lock<std::shared_mutex> cache_lock(resolve_cache_mutex_);
+    if (resolve_cache_.size() >= kResolveCacheCapacity &&
+        resolve_cache_.find(identity) == resolve_cache_.end()) {
+      resolve_cache_.clear();  // small and identity-keyed; a sweep beats an LRU
+    }
+    ResolveCacheEntry& entry = resolve_cache_[identity];
+    entry.keys = keys;
+    entry.result = out;
+    entry.slots = std::move(slots);
+    entry.generation = eviction_generation_;
+    entry.include_descs = include_descs;
+    entry.allow_file_refs = allow_file_refs;
   }
   return out;
 }
@@ -594,6 +648,7 @@ std::vector<EvictResult> PageBackend::Evict(const std::vector<std::string>& keys
     QueueEventLocked(KvEvent{KvEvent::Kind::REMOVE, key, tier_, 0});
     RemoveFromLru(it->second);
     owned_.erase(it);
+    ++eviction_generation_;
     out.push_back(std::move(r));
   }
   return out;
@@ -695,6 +750,7 @@ void PageBackend::ClearLocal() {
     if (allocator_) allocator_->Deallocate(slot.pages);
   }
   owned_.clear();
+  ++eviction_generation_;
   {
     std::lock_guard<std::mutex> lru_lock(lru_mutex_);
     lru_.clear();
@@ -858,6 +914,7 @@ size_t PageBackend::MaybeEvictToLowWatermark() {
     QueueEventLocked(KvEvent{KvEvent::Kind::REMOVE, key, tier_, 0});
     RemoveFromLru(owned_it->second);
     owned_.erase(owned_it);
+    ++eviction_generation_;
     ++freed;
   }
   if (freed > 0) {
