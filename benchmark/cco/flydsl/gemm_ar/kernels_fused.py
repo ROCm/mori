@@ -73,61 +73,71 @@ the GEMM alone.
 
 ## Result: the fusion works, and the release fence costs more than it saves
 
-Per-kernel, from ``rocprofv3 --kernel-trace`` on 8x MI355X, [4096, 7168] out,
-K=1024, median of 11 (times in us):
+Per-kernel, ``rocprofv3 --kernel-trace``, 8x MI355X, [4096, 7168] out, K=1024,
+median of 11 (us):
 
-    config              gemm   scatter/drain  reduce  gather    sum   correct
-    split               39.1        136.8      59.0   137.3   372.3     yes
-    fused --fence none  64.5        103.4      59.8   136.6   364.2     NO
-    fused --fence leader 83.5        96.9      59.9   136.2   376.5     NO
-    fused --fence agent 156.1         67.3     59.8   137.0   420.1     yes
-    fused --fence all   175.9         71.1     59.3   137.3   443.6     yes
+    config               gemm   scatter/drain  reduce  gather    sum   correct
+    split                39.1        136.8      59.0   137.3   372.3    yes
+    fused --fence none   64.5        103.4      59.8   136.6   364.2    NO
+    fused --fence leader 83.5         96.9      59.9   136.2   376.5    NO
+    fused --fence agent 136.9         72.3      59.3   137.7   406.2    yes
+    fused --fence all   175.9         71.1      59.3   137.3   443.6    yes
 
-The overlap is real and large: the scatter collapses from 136.8us to 67.3us. But
-every microsecond of that, and more, reappears inside the GEMM, which goes from
-39.1us to 156.1us. Splitting that +117us three ways:
+The overlap is real and large: the scatter collapses from 136.8us to 72.3us, a
+saving bigger than the entire 39.1us GEMM. But more than that reappears *inside*
+the GEMM, which goes from 39.1us to 136.9us.
 
-* **+25us** for the tail itself with no fence at all -- ``s_waitcnt vmcnt(0)``,
-  the block-wide barrier, the atomic, and the copy engine reading C while the
-  GEMM is still writing it.
-* **+92us** for ``buffer_wbl2 sc1`` and the ``s_waitcnt vmcnt(0)`` that waits on
-  it. This is the whole problem, and it is **quadratic**: ``buffer_wbl2`` flushes
-  the entire L2, so block k writes back every tile blocks 1..k-1 already wrote,
-  448 blocks over. The split path gets one bulk release at kernel end instead,
-  for free.
-* **+20us** more if the fence is system-scoped rather than agent-scoped. The ISA
-  says why: ``__threadfence_system`` is bidirectional, so it emits
-  ``buffer_wbl2 sc0 sc1 ; s_waitcnt ; buffer_inv sc0 sc1`` -- and that
-  ``buffer_inv`` discards the B weights the GEMM is streaming, 3584 times.
+An ATT thread trace (``rocprofv3 --att --att-library-path /opt/rocm/lib``)
+attributes the epilogue tail exactly -- it is 26% of the kernel's latency, and
+essentially all of it is one instruction waiting:
 
-Three things were tried to make the release cheap, and all three failed:
+    vaddr    cycles   % kernel  instruction
+    19396     91336      5.1%   s_waitcnt vmcnt(0)     retire this block's C
+    19400     22984      1.3%   s_barrier
+    19404       292      0.0%   buffer_wbl2 sc1        <- the op itself is free
+    19412    246804     13.9%   s_waitcnt vmcnt(0)     <- waiting on the writeback
+    19608+    91612      5.1%   waits bracketing the counter atomic
 
-* **Agent scope instead of system.** Correct (relL2 2.35e-3, same as split) and
-  it does drop the ``buffer_inv``, but it only buys 20us of the 112. Worth
-  keeping as the default anyway -- and note cco exposes no agent-scope release,
-  only ``cco_system_fence``, so this had to be emitted as a raw ``llvm.fence``.
+The writeback wait is the single largest line item in the whole kernel, larger
+than any main-loop stall, and it is **quadratic**: ``buffer_wbl2`` flushes the
+entire L2, so block k waits for every tile blocks 1..k-1 already wrote, 448
+blocks over. The split path gets one bulk release at kernel end instead, free.
+
+Two costs the trace found that *were* removable, both now fixed:
+
+* The counter atomic was ``acq_rel``, so it emitted its own ``buffer_wbl2`` /
+  ``buffer_inv`` pair -- 91.6k cycles, more per wave than the explicit fence.
+  Both halves were redundant (the caller already released; the winner never
+  reads what it counts, the copy engine does). Relaxed: 156.1us -> 136.9us.
+* System scope emitted ``buffer_inv sc0 sc1`` on top of the writeback, and that
+  invalidate discards the B weights the GEMM streams, 3584 times. Agent scope
+  drops it: 175.9us -> 156.1us. cco exposes no agent-scope release, only
+  ``cco_system_fence``, so it is emitted as a raw ``llvm.fence``
+  (``_compat.release_fence``) -- a gap worth closing in the device API.
+
+Two more attempts that did *not* work, kept selectable so they stay disprovable:
+
 * **One fence per block instead of per wave** (``--fence leader``). Incorrect:
   relL2 9.6e-3, indistinguishable from no fence at all, even though every lane
   has already passed ``s_waitcnt vmcnt(0)`` and a block barrier. So the release
-  really is per-wave, which is where the factor of 8 in 3584 comes from.
+  is genuinely per-wave -- that is the factor of 8 in 3584.
 * **Write-through C stores** (``--fence writethrough``), so no writeback would be
-  needed. Not a release on its own (relL2 1.72e-2), and pairing it with the agent
-  fence (``--fence wt-agent``, 432.5us) is indistinguishable from the agent fence
-  alone (432.4us) -- ``buffer_wbl2`` costs the same whether or not the lines it
-  is asked to flush are dirty.
+  needed. Not a release on its own (relL2 1.72e-2), and paired with the agent
+  fence (``--fence wt-agent``, 432.5us) it is indistinguishable from the agent
+  fence alone -- ``buffer_wbl2`` costs the same whether or not the lines it is
+  asked to flush are dirty.
 
-So the honest conclusion is narrower than "the ratio is wrong", though the ratio
-does cap the prize: what is missing is a **per-tile release**. Every primitive
-available here publishes the whole cache, and the GEMM needs to publish 448
-tiles, so the release is O(blocks^2) against an overlap worth at most one GEMM.
-Even the incorrect ``--fence none`` configuration only reaches 364.2us against
-split's 372.3 -- and both lose to ``gemm + LSA`` at 327.0us, which remains the
-number any fused SDMA path has to beat.
+So the conclusion is narrower and more useful than "the compute:comm ratio is
+wrong", though the ratio does cap the prize: what is missing is a **per-tile
+release**. Every primitive available publishes the whole cache, and the GEMM has
+448 tiles to publish, so the release is O(blocks^2) against an overlap worth at
+most one GEMM. Profiling took the fused path from 450.2us to 406-413us, and it
+still loses to split-sdma at 372.3 and to ``gemm + LSA`` at 327.0, which remains
+the number any fused SDMA path has to beat.
 
 The completion-counter machinery and the destination-rotated tile order are both
-sound and are what produced the 69.5us of genuine overlap; they would pay
-immediately on a transport whose producer-side release is per-tile rather than
-per-cache.
+sound -- they are what produced the 64.5us of genuine overlap -- and would pay
+immediately on a transport whose producer-side release is per-tile.
 
 ## Pinned copy
 

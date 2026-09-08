@@ -44,11 +44,11 @@ Headline, 8x MI355X, [4096, 7168] out, K=1024, graph replay, median of 51:
     gemm-only     49.6us
     split-lsa    327.0
     split-sdma   382.0
-    fused-sdma   432.4   (chunks=2, --fence agent)
+    fused-sdma   413.4   (chunks=2, --fence agent)
 
 Fusing loses. The overlap is real -- a kernel trace shows the scatter dropping
-from 136.8us to 67.3us -- but the release fence the epilogue needs adds more than
-that back inside the GEMM, which goes from 39.1us to 156.1us. ``kernels_fused.py``
+from 136.8us to 72.3us -- but the release fence the epilogue needs adds more than
+that back inside the GEMM, which goes from 39.1us to 136.9us. ``kernels_fused.py``
 has the full per-kernel decomposition. ``--fence`` and ``--stop-after`` exist to
 reproduce that attribution.
 """

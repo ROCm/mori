@@ -257,20 +257,26 @@ def local_store_u32(ptr, value):
     _llvm_d.store(fx.Int32(value).ir_value(), ptr, alignment=4, volatile_=True)
 
 
-def atomic_add_u32(ptr, value):
+def atomic_add_u32(ptr, value, *, ordering="monotonic"):
     """Device-scope ``fetch_add``; returns the value *before* the add.
 
     Agent scope, because the tile counters it serves are only ever touched by
-    blocks of the same kernel on this GPU -- a system-scope RMW would be a
-    fabric round trip per tile. ``acq_rel``: the release half publishes this
-    block's C stores to whoever observes the count, and the acquire half is what
-    lets the winning block read every other block's tile.
+    blocks of the same kernel on this GPU -- a system-scope RMW would be a fabric
+    round trip per tile.
+
+    ``monotonic`` (relaxed), not ``acq_rel``, and that is worth 5% of the fused
+    GEMM. An ordered RMW is bracketed by its own ``buffer_wbl2`` /
+    ``buffer_inv``, and a thread trace showed those costing 91.6k cycles -- more
+    per wave than the explicit release fence itself. Both halves are redundant
+    here: the caller has already issued that release, and the winner never reads
+    the data it is counting (the copy engine does), so it needs no acquire. Pass
+    ``ordering="acq_rel"`` if a caller ever does need the fence.
     """
     return _llvm_d.atomicrmw(
         _llvm_d.AtomicBinOp.add,
         ptr,
         fx.Int32(value).ir_value(),
-        _llvm_d.AtomicOrdering.acq_rel,
+        getattr(_llvm_d.AtomicOrdering, ordering),
         syncscope=_AGENT_SCOPE,
         alignment=4,
     )
