@@ -56,12 +56,21 @@ cco's own chunking is not a factor: ``CCO_SDMA_MAX_COPY_BYTES`` is 1GB, so every
 slice we push is a single packet.
 
 Measured on 8x MI355X, [M, 7168] bf16, against the LSA kernel (full table in
-``bench_ar.py``): ~1.20x slower across M >= 128, of which ~12us is a fixed floor
-(two transfer phases x the engine's ~6us dispatch cost) and the rest is ~18%
-lower sustained bandwidth than CU-issued loads over the same links. Both are
-expected. This backend is not here to be faster -- it is here because the
-transfers occupy one warp of one block instead of the whole grid, which is what
-makes an in-GEMM epilogue possible in step 3.
+``bench_ar.py``): within 5% of LSA for M >= 2048, and faster than aiter at
+M = 8192. What is left is mostly a fixed ~40us floor -- two transfer phases times
+the engine's ~6us dispatch -- so decode sizes still lose by ~1.5x, as expected
+for 114KB slices.
+
+Getting there needed one non-obvious thing: the reduce kernel must **not** share
+the LSA all-reduce's grid. Its loads are local HBM, not xGMI, so the cap that
+throttles outstanding xGMI requests starves it instead -- 24 blocks left it at
+1.11 TB/s on an ~8 TB/s part. Sized independently it runs at 4.9 TB/s, worth 48us
+at M=4096 (342 -> 294) and turning a 1.20x deficit against LSA into 1.03x. See
+``SDMA_REDUCE_BLOCK_CAP``.
+
+The other reason this backend exists is that its transfers occupy one warp of one
+block instead of the whole grid, which is what makes an in-GEMM epilogue possible
+in step 3.
 """
 
 from __future__ import annotations
@@ -100,7 +109,9 @@ from layout import MAX_WORLD  # noqa: E402
 PUSH_THREADS = 64
 
 
-def build_sdma_phases(cfg, rank: int, *, queues: int = 8, signal: bool = False):
+def build_sdma_phases(
+    cfg, rank: int, *, queues: int = 8, signal: bool = False, reduce_blocks=None
+):
     """Compile the phases separately, so the fused GEMM can reuse the tail.
 
     Returns ``{"scatter", "drain", "reduce", "gather"}``, each a launcher taking
@@ -132,6 +143,13 @@ def build_sdma_phases(cfg, rank: int, *, queues: int = 8, signal: bool = False):
         )
 
     threads, blocks = cfg.threads, cfg.blocks
+    # The reduce is a *local HBM* kernel, so it must not inherit the grid the LSA
+    # all-reduce uses. LSA_BLOCK_CAP is small on purpose -- it caps the number of
+    # outstanding xGMI requests -- but here every load is local, and 24x512
+    # threads x 8 packs is only 1.6MB in flight, about a fifth of what it takes to
+    # cover HBM latency. Sized independently, and swept by bench_ar.py.
+    red_blocks = reduce_blocks if reduce_blocks else cfg.reduce_blocks
+    red_stride = red_blocks * threads
     elem_dtype = fx.BFloat16 if cfg.elem_bytes == 2 else fx.Float32
     stride_packs = blocks * threads
     part = cfg.packs_per_rank
@@ -243,7 +261,7 @@ def build_sdma_phases(cfg, rank: int, *, queues: int = 8, signal: bool = False):
         )
 
         gtid = bid * threads + tid
-        for pk in range(gtid, part, stride_packs):
+        for pk in range(gtid, part, red_stride):
             i32_off = pk * I32_PER_PACK
             acc = None
             for j in range_constexpr(ws):
@@ -287,7 +305,7 @@ def build_sdma_phases(cfg, rank: int, *, queues: int = 8, signal: bool = False):
     return {
         "scatter": _phase(scatter, 1, PUSH_THREADS),
         "drain": _phase(drain, 1, PUSH_THREADS),
-        "reduce": _phase(sdma_reduce, blocks, threads),
+        "reduce": _phase(sdma_reduce, red_blocks, threads),
         "gather": _phase(gather, 1, PUSH_THREADS),
     }
 

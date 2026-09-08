@@ -297,7 +297,7 @@ def compile_fused_gemm_scatter(
     tiles_per_chunk = m_tiles_per_chunk * n_blocks_const
     chunk_bytes = cfg.slice_bytes // chunks
 
-    if fence not in ("all", "agent", "leader", "none", "writethrough", "wt-agent"):
+    if fence not in ("all", "agent", "agent-leader", "leader", "none", "writethrough", "wt-agent"):
         raise ValueError(
             f"fence must be all/agent/leader/none/writethrough/wt-agent, got {fence!r}"
         )
@@ -542,6 +542,12 @@ def compile_fused_gemm_scatter(
             w = cco.Window(win)
             sdma = cco.DevComm(dev_comm).sdma()
             if fx.thread_idx.x == 0:
+                # One release per *block* instead of per wave. cco's leaderOnly
+                # form was already shown incorrect, but that went through an
+                # extern wrapper; emitting the fence inline rules out the
+                # compiler having sunk it past the atomic.
+                if const_expr(fence == "agent-leader"):
+                    release_fence("agent")
                 dest = block_m // fx.Int32(m_tiles_per_peer)
                 chunk = (block_m % fx.Int32(m_tiles_per_peer)) // fx.Int32(
                     m_tiles_per_chunk

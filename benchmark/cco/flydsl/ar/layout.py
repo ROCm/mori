@@ -64,6 +64,12 @@ SIGNAL_ALIGN = 128  # alignas(128) on each Signal region
 # experiments without touching the window layout.
 LSA_BLOCK_CAP = 24
 
+# Grid cap for the SDMA all-reduce's local reduce kernel. Deliberately not
+# LSA_BLOCK_CAP: that one throttles outstanding xGMI requests, whereas this
+# kernel's loads are all local HBM and want the opposite. See the sweep in
+# bench_ar.py.
+SDMA_REDUCE_BLOCK_CAP = 256
+
 # 1-stage thresholds, in bytes (custom_all_reduce.cuh:3779).
 ONE_STAGE_MAX_BYTES_LE4 = 160 * 1024
 ONE_STAGE_MAX_BYTES_LE8 = 80 * 1024
@@ -117,6 +123,10 @@ class ArConfig:
     #: leave while the GEMM is still computing its later ones. Only the fused
     #: path reads this; the standalone SDMA all-reduce always pushes whole slices.
     counter_chunks: int = 1
+    #: Grid for the SDMA reduce. Independent of ``block_cap`` because that cap
+    #: throttles *xGMI* requests, while this kernel reads local HBM and wants as
+    #: much in flight as it can get.
+    force_reduce_blocks: int = 0
     #: Override the computed grid. Only the signal array bounds the grid for
     #: correctness (``start[max_blocks][8]``), so raising this also needs
     #: ``max_blocks`` raised. Exists so the benchmark can sweep occupancy.
@@ -210,6 +220,13 @@ class ArConfig:
     @property
     def flag_off(self) -> int:
         return self.end_off * 2
+
+    @property
+    def reduce_blocks(self) -> int:
+        if self.force_reduce_blocks:
+            return self.force_reduce_blocks
+        need = (self.packs_per_rank + self.threads - 1) // self.threads
+        return max(1, min(SDMA_REDUCE_BLOCK_CAP, need))
 
     @property
     def counter_off(self) -> int:
@@ -328,6 +345,7 @@ __all__ = [
     "select_stage",
     "K_MAX_BLOCKS",
     "LSA_BLOCK_CAP",
+    "SDMA_REDUCE_BLOCK_CAP",
     "THREADS",
     "MAX_WORLD",
     "PACK_BYTES",

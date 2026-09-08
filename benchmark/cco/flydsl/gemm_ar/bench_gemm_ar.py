@@ -328,7 +328,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--fence",
-        choices=("all", "agent", "leader", "none", "writethrough", "wt-agent"),
+        choices=("all", "agent", "agent-leader", "leader", "none", "writethrough", "wt-agent"),
         default="agent",
         help="release before the epilogue push. Correct: 'agent' (default, "
         "cheapest) and 'all' (system scope, adds a buffer_inv that costs 20us). "
