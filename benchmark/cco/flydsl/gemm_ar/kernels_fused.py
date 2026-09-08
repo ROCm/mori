@@ -131,8 +131,23 @@ own latency falls **14,604 -> 3,852**, which is the coalescer being sensitive to
 lane adjacency and not just to the address set -- exactly what gcnasm's
 "pair-coalesced" comment is about. The 64 ``ds_bpermute`` cost 9,604 cycles.
 
-Two limits. It does nothing on ``fused-lsa`` (335-338us either way), where the
-store phase is xGMI bandwidth-limited rather than issue- or coalescing-limited.
+Two limits. **It is worth nothing on ``fused-lsa``**, where the store goes to a
+peer over xGMI rather than to local memory::
+
+                        gemm    barrier  reduce  gather     sum
+    fused-lsa          177.4us     5.4    11.1   135.3    329.1
+    + all three        175.6us     7.8    11.1   135.0    329.4
+
+against 39.0 -> 35.7us for the same three stages on the split path's local
+store. Stage 3 buys the local memory pipeline's sensitivity to lane adjacency;
+a peer store crosses the fabric instead, and that phase is limited by ~44 GB/s
+of link bandwidth, which no amount of transaction shaping changes. (This was
+first "measured" with only stages 1 and 2 wired into the direct path -- which
+are exactly the two that do *not* speed the store up -- and the conclusion was
+right by accident. The direct-LSA branch for stage 3 exists now, and the
+argument-validation above is there so a missing branch fails loudly instead of
+silently running a weaker variant.)
+
 And 64 bytes is one wave's ceiling here, since a wave owns
 ``N_TILES_B * 16 = 32`` columns; gcnasm reaches a full 128-byte line only by
 having four ``wave_id_n`` waves tile adjacent 16-column runs.
@@ -785,6 +800,28 @@ def compile_fused_gemm_scatter(
     M, N = cfg.m, cfg.n
     if transport not in ("sdma", "lsa"):
         raise ValueError(f"transport must be sdma or lsa, got {transport!r}")
+    # The C-store variant is picked by a chain of const_expr branches, so an
+    # unimplemented combination does not fail -- it quietly falls through to a
+    # weaker one. That already cost a wrong conclusion once: --lane-transpose had
+    # no direct-LSA branch, so `--mode fused-lsa --lane-transpose` silently ran
+    # stages 1+2 and was measured as "no benefit from stage 3".
+    if permlane and not swap_ab:
+        raise ValueError("--permlane requires --swap-ab")
+    if lane_transpose and not permlane:
+        raise ValueError("--lane-transpose requires --permlane")
+    if store_probe and not swap_ab:
+        raise ValueError("--store-probe requires --swap-ab")
+    if store_probe and lane_transpose:
+        raise ValueError(
+            "--store-probe and --lane-transpose are alternatives: the probe emits "
+            "the adjacent-lane access pattern without the shuffle that makes it "
+            "correct, which is what --lane-transpose then implements"
+        )
+    if transport == "lsa" and store_probe and permlane:
+        raise ValueError(
+            "no peer-direct variant of the adjacent-lane probe; use "
+            "--lane-transpose for the real thing on --mode fused-lsa"
+        )
     direct_lsa = fuse and transport == "lsa"
     rotated = fuse if rotated is None else rotated
 
@@ -969,6 +1006,16 @@ def compile_fused_gemm_scatter(
         elif const_expr(swap_ab and not direct_lsa):
             store_c = _SwapABStoreC(
                 A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B
+            )
+        elif const_expr(direct_lsa and swap_ab and permlane and lane_transpose):
+            dest_blk = block_m // fx.Int32(m_tiles_per_peer)
+            store_c = _LaneTransposeStoreC(
+                A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B,
+                peer_rsrc=create_buffer_resource_from_addr(
+                    wave_uniform_i64(w_pre.lsa_ptr(dest_blk, my_recv_slot)),
+                    num_records_bytes=cfg.slice_bytes,
+                ),
+                elem_base=dest_blk * fx.Int32(slice_rows) * c_n,
             )
         elif const_expr(direct_lsa and swap_ab and permlane):
             dest_blk = block_m // fx.Int32(m_tiles_per_peer)
