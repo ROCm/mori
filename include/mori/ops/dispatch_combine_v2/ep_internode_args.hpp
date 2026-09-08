@@ -292,7 +292,6 @@ __device__ inline int NullSendBufSlotOffset(const EpInterNodeDeviceCfg& config) 
 #define MORI_EP_INTERNODE_ARGS_SCHEMA \
   MORI_EP_INTERNODE_ARGS_FIELDS(MORI_EP_INTERNODE_ARGS_SCHEMA_ENTRY)
 
-template <typename T>
 struct EpInterNodeArgs {
   uint64_t window{0};
 
@@ -329,7 +328,10 @@ struct EpInterNodeArgs {
   int32_t curRankNumToken{0};
 
   ep_index_t* tokenIndices{nullptr};
-  T* inpTokenBuf{nullptr};
+  // void*, like the intranode EpArgs: callers cast at the use site. Keeping it
+  // T* made this struct a template for one member, which then needed an
+  // untyped alias, layout asserts across T, and a memcpy to pun between them.
+  const void* inpTokenBuf{nullptr};
   float* weightsBuf{nullptr};
   uint8_t* scalesBuf{nullptr};
 
@@ -359,20 +361,10 @@ struct EpInterNodeArgs {
   }
 };
 
-// The untyped spelling. T appears in one member, so every instantiation has the
-// same layout -- which is what lets the host, the schema and the plan
-// registration name one non-template type while each kernel reads its own T.
-using EpInterNodeArgsRaw = EpInterNodeArgs<void>;
-
-static_assert(sizeof(EpInterNodeArgs<float>) == sizeof(EpInterNodeArgsRaw),
-              "EpInterNodeArgs must be layout-identical across T");
-static_assert(alignof(EpInterNodeArgs<float>) == alignof(EpInterNodeArgsRaw),
-              "EpInterNodeArgs alignment must not depend on T");
-
 namespace detail {
 
 #define MORI_EP_INTERNODE_ARGS_OFFSET(name, tag) \
-  offsetof(::mori::ops::v2::EpInterNodeArgsRaw, name),
+  offsetof(::mori::ops::v2::EpInterNodeArgs, name),
 inline constexpr size_t kEpInterNodeArgsOffsets[] = {
     MORI_EP_INTERNODE_ARGS_FIELDS(MORI_EP_INTERNODE_ARGS_OFFSET)};
 #undef MORI_EP_INTERNODE_ARGS_OFFSET
@@ -400,12 +392,12 @@ static_assert(detail::EpInterNodeArgsOffsetsAscend(),
 // global filled by the host after every hipModuleLoad. It is the one opaque
 // member, because it is cco's struct and not EP's to name.
 struct EpInterNodeCcoArgs {
-  EpInterNodeArgsRaw args;
+  EpInterNodeArgs args;
   ::mori::cco::ccoDevComm devComm;
 };
 
 static_assert(sizeof(EpInterNodeCcoArgs) ==
-                  sizeof(EpInterNodeArgsRaw) + sizeof(::mori::cco::ccoDevComm),
+                  sizeof(EpInterNodeArgs) + sizeof(::mori::cco::ccoDevComm),
               "EpInterNodeCcoArgs has interior padding -- the schema describes it as the "
               "argument fields followed by one byte range and would place devComm wrong");
 

@@ -90,7 +90,7 @@ namespace v2 {
 // v2 spellings, under the names the bodies below already use.
 //
 // The bodies live in this namespace and say `index_t`, `QuantType::...`,
-// `EpDispatchCombineArgs<T>` and the flat-index helpers unqualified. Introducing
+// `EpDispatchCombineArgs` and the flat-index helpers unqualified. Introducing
 // the v2 types under those names is what lets the argument surface change
 // without touching the ~250 `args.` sites, the 39 index-helper calls or the 29
 // signatures -- the surface moves, the algorithm does not, and the two want to
@@ -103,8 +103,9 @@ namespace v2 {
 using index_t = ep_index_t;
 using QuantType = EpQuantType;
 
-template <typename T>
-using EpDispatchCombineArgs = EpInterNodeArgs<T>;
+// v1's spelling, now a plain alias: the struct stopped depending on T when
+// inpTokenBuf became void*, matching the intranode EpArgs.
+using EpDispatchCombineArgs = EpInterNodeArgs;
 
 // v1's common.hpp macro, with the config type swapped. Everything else is
 // verbatim, including the assert: numExpertPerToken must fit in a ballot.
@@ -284,7 +285,7 @@ __device__ __forceinline__ int32_t EpInterNodeWaitGt(int32_t* addr, int32_t val)
 /* ---------------------------------------------------------------------------------------------- */
 namespace internode {
 template <EpInterNodeKernelCfg kConfig, typename T>
-inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs<T>& args, int tokenId,
+inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs& args, int tokenId,
                                               int expId, int destPe, int& localPeTokenCounter) {
   DEF_COMMON_VARS;
 
@@ -314,7 +315,7 @@ inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs<T>& args, in
   size_t destTokOffset = destTokId * hiddenDim;
 
   T* remoteTokenPtr = args.reg(args.offDispatchOut)->template GetAs<T*>(destPe);
-  const T* localTokenPtr = args.inpTokenBuf;
+  const T* localTokenPtr = static_cast<const T*>(args.inpTokenBuf);
   core::WarpCopy(remoteTokenPtr + destTokOffset, localTokenPtr + srcTokOffset, hiddenDim);
 
   index_t* remoteIndexPtr = args.reg(args.offOutIndices)->template GetAs<index_t*>(destPe);
@@ -335,7 +336,7 @@ inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs<T>& args, in
 }
 
 template <EpInterNodeKernelCfg kConfig, typename T>
-inline __device__ void DispatchIntraNode(EpDispatchCombineArgs<T>& args) {
+inline __device__ void DispatchIntraNode(EpDispatchCombineArgs& args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
       INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
@@ -378,7 +379,7 @@ inline __device__ void DispatchIntraNode(EpDispatchCombineArgs<T>& args) {
           args.dispDestTokIdMap[expertOffset] = NullFlatTokenIndex(config);
         continue;
       }
-      DispatchIntraNodeBlock<kConfig>(args, tokenId, inTokenExpertId, destPe, localPeTokenCounter);
+      DispatchIntraNodeBlock<kConfig, T>(args, tokenId, inTokenExpertId, destPe, localPeTokenCounter);
     }
   }
 
@@ -389,7 +390,7 @@ inline __device__ void DispatchIntraNode(EpDispatchCombineArgs<T>& args) {
 }
 
 template <EpInterNodeKernelCfg kConfig, typename T, bool DEDUP>
-inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args,
+inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs& args,
                                              const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
@@ -534,7 +535,7 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args,
 }
 
 template <EpInterNodeKernelCfg kConfig, typename T>
-inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args,
+inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs& args,
                                                const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
@@ -606,7 +607,7 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args,
 }
 
 template <EpInterNodeKernelCfg kConfig, typename T>
-inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
+inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs& args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
       INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
@@ -730,7 +731,7 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
 }
 
 template <EpInterNodeKernelCfg kConfig, typename T>
-inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs<T>& args) {
+inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs& args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
       INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
@@ -838,7 +839,7 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs<T>& args) {
 }
 
 template <EpInterNodeKernelCfg kConfig, typename T>
-inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args,
+inline __device__ void DispatchSync(EpDispatchCombineArgs& args,
                                     const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
@@ -897,20 +898,20 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args,
 }  // namespace internode
 
 template <EpInterNodeKernelCfg kConfig, typename T>
-__device__ void EpDispatchInterNodeV1Kernel_body(EpDispatchCombineArgs<T> args,
+__device__ void EpDispatchInterNodeV1Kernel_body(EpDispatchCombineArgs args,
                                                  const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
   if (blockId < args.rdmaBlockNum) {
     internode::DispatchInterNodeSend<kConfig, T, true>(args, comm);
-    internode::DispatchInterNodeRecv<kConfig>(args);
+    internode::DispatchInterNodeRecv<kConfig, T>(args);
   } else {
-    internode::DispatchIntraNode<kConfig>(args);
+    internode::DispatchIntraNode<kConfig, T>(args);
   }
-  internode::DispatchSync<kConfig>(args, comm);
+  internode::DispatchSync<kConfig, T>(args, comm);
 }
 
 template <EpInterNodeKernelCfg kConfig, typename T>
-__device__ void EpDispatchCopyToStaging_body(EpDispatchCombineArgs<T> args) {
+__device__ void EpDispatchCopyToStaging_body(EpDispatchCombineArgs args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
       INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
@@ -939,7 +940,7 @@ __device__ void EpDispatchCopyToStaging_body(EpDispatchCombineArgs<T> args) {
     uint8_t* stagingPtr = args.reg(args.offDispatchStaging)->template GetAs<uint8_t*>();
     size_t stagingTokOffset = tokenId * xferBytes;
     core::WarpCopy<uint8_t, 4>(stagingPtr + stagingTokOffset + hiddenDimOffset * sizeof(T),
-                               reinterpret_cast<uint8_t*>(args.inpTokenBuf) +
+                               static_cast<const uint8_t*>(args.inpTokenBuf) +
                                    tokenId * hiddenBytes + hiddenDimOffset * sizeof(T),
                                hiddenDimSize * sizeof(T));
     if (inTokenPartId != 0) continue;
@@ -961,16 +962,16 @@ __device__ void EpDispatchCopyToStaging_body(EpDispatchCombineArgs<T> args) {
 }
 
 template <EpInterNodeKernelCfg kConfig, typename T>
-__device__ void EpDispatchInterNodeV1KernelLowLatency_body(EpDispatchCombineArgs<T> args,
+__device__ void EpDispatchInterNodeV1KernelLowLatency_body(EpDispatchCombineArgs args,
                                                            const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
   if (blockId < args.rdmaBlockNum) {
     internode::DispatchInterNodeLLSend<kConfig, T>(args, comm);
-    internode::DispatchInterNodeLLRecv<kConfig>(args);
+    internode::DispatchInterNodeLLRecv<kConfig, T>(args);
   } else {
-    internode::DispatchIntraNode<kConfig>(args);
+    internode::DispatchIntraNode<kConfig, T>(args);
   }
-  internode::DispatchSync<kConfig>(args, comm);
+  internode::DispatchSync<kConfig, T>(args, comm);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -979,7 +980,7 @@ __device__ void EpDispatchInterNodeV1KernelLowLatency_body(EpDispatchCombineArgs
 namespace internode {
 
 template <EpInterNodeKernelCfg kConfig, typename T>
-inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
+inline __device__ void CombineSync(EpDispatchCombineArgs& args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
       INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
@@ -993,12 +994,13 @@ inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
     if constexpr (kConfig.quantType == QuantType::Fp8DirectCast) {
       using Fp8T = core::CombineInternalFp8;
       Fp8T* dst = args.reg(args.offCombineInp)->template GetAs<Fp8T*>();
-      const T* src = args.inpTokenBuf;
+      const T* src = static_cast<const T*>(args.inpTokenBuf);
       const size_t base = tokenId * hiddenDim;
       core::WarpCastBf16ToCombineInternalFp8<T>(dst + base, src + base, hiddenDim, laneId);
     } else {
       core::WarpCopy(args.reg(args.offCombineInp)->template GetAs<T*>() + tokenId * hiddenDim,
-                     args.inpTokenBuf + tokenId * hiddenDim, hiddenDim);
+                     static_cast<const T*>(args.inpTokenBuf) + tokenId * hiddenDim,
+                     hiddenDim);
     }
   }
   if (args.weightsBuf) {
@@ -1064,7 +1066,7 @@ inline __device__ void CombineGather(TokT* dest, TokT** srcPtrs, int accumNum, s
 }
 
 template <EpInterNodeKernelCfg kConfig, typename TokT, typename T>
-__forceinline__ __device__ void CombineIntraNodeTyped(EpDispatchCombineArgs<T>& args,
+__forceinline__ __device__ void CombineIntraNodeTyped(EpDispatchCombineArgs& args,
                                                       size_t tokHiddenBytes,
                                                       size_t tokCombXferBytes) {
   DEF_COMMON_VARS;
@@ -1109,7 +1111,7 @@ __forceinline__ __device__ void CombineIntraNodeTyped(EpDispatchCombineArgs<T>& 
 }
 
 template <EpInterNodeKernelCfg kConfig, typename TokT, typename T>
-__forceinline__ __device__ void CombineIntraNodeLLTyped(EpDispatchCombineArgs<T>& args,
+__forceinline__ __device__ void CombineIntraNodeLLTyped(EpDispatchCombineArgs& args,
                                                         size_t tokHiddenBytes,
                                                         size_t tokCombXferBytes) {
   DEF_COMMON_VARS;
@@ -1164,7 +1166,7 @@ __forceinline__ __device__ void CombineIntraNodeLLTyped(EpDispatchCombineArgs<T>
 }
 
 template <EpInterNodeKernelCfg kConfig, typename TokT, typename T>
-__forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs<T>& args,
+__forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& args,
                                                       size_t tokHiddenBytes,
                                                       size_t tokCombXferBytes,
                                                       const ::mori::cco::ccoDevComm& comm) {
@@ -1338,7 +1340,7 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs<T>& 
 }
 
 template <EpInterNodeKernelCfg kConfig, typename TokT, typename T>
-__forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs<T>& args,
+__forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& args,
                                                         size_t tokHiddenBytes,
                                                         size_t tokCombXferBytes,
                                                         const ::mori::cco::ccoDevComm& comm) {
@@ -1485,7 +1487,7 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs<T>
 }  // namespace combine_impl
 
 template <EpInterNodeKernelCfg kConfig, typename T>
-inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
+inline __device__ void CombineIntraNode(EpDispatchCombineArgs& args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
       INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
@@ -1495,15 +1497,15 @@ inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
     const size_t tokHiddenBytes = hiddenDim * sizeof(TokT);
     const size_t tokCombXferBytes =
         (args.weightsBuf == nullptr) ? tokHiddenBytes : tokHiddenBytes + weightBytes;
-    combine_impl::CombineIntraNodeTyped<kConfig, TokT>(args, tokHiddenBytes, tokCombXferBytes);
+    combine_impl::CombineIntraNodeTyped<kConfig, TokT, T>(args, tokHiddenBytes, tokCombXferBytes);
     return;
   }
 
-  combine_impl::CombineIntraNodeTyped<kConfig, T>(args, hiddenBytes, combXferBytes);
+  combine_impl::CombineIntraNodeTyped<kConfig, T, T>(args, hiddenBytes, combXferBytes);
 }
 
 template <EpInterNodeKernelCfg kConfig, typename T>
-inline __device__ void CombineIntraNodeLL(EpDispatchCombineArgs<T>& args) {
+inline __device__ void CombineIntraNodeLL(EpDispatchCombineArgs& args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
       INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
@@ -1515,14 +1517,14 @@ inline __device__ void CombineIntraNodeLL(EpDispatchCombineArgs<T>& args) {
     const size_t tokHiddenBytes = hiddenDim * sizeof(TokT);
     const size_t tokCombXferBytes =
         (args.weightsBuf == nullptr) ? tokHiddenBytes : tokHiddenBytes + weightBytes;
-    combine_impl::CombineIntraNodeLLTyped<kConfig, TokT>(args, tokHiddenBytes, tokCombXferBytes);
+    combine_impl::CombineIntraNodeLLTyped<kConfig, TokT, T>(args, tokHiddenBytes, tokCombXferBytes);
     return;
   }
-  combine_impl::CombineIntraNodeLLTyped<kConfig, T>(args, hiddenBytes, combXferBytes);
+  combine_impl::CombineIntraNodeLLTyped<kConfig, T, T>(args, hiddenBytes, combXferBytes);
 }
 
 template <EpInterNodeKernelCfg kConfig, typename T>
-inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args,
+inline __device__ void CombineInterNode(EpDispatchCombineArgs& args,
                                         const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
@@ -1534,15 +1536,15 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args,
     const size_t tokHiddenBytes = hiddenDim * sizeof(TokT);
     const size_t tokCombXferBytes =
         (args.weightsBuf == nullptr) ? tokHiddenBytes : tokHiddenBytes + weightBytes;
-    combine_impl::CombineInterNodeTyped<kConfig, TokT>(args, tokHiddenBytes, tokCombXferBytes,
+    combine_impl::CombineInterNodeTyped<kConfig, TokT, T>(args, tokHiddenBytes, tokCombXferBytes,
                                                        comm);
     return;
   }
-  combine_impl::CombineInterNodeTyped<kConfig, T>(args, hiddenBytes, combXferBytes, comm);
+  combine_impl::CombineInterNodeTyped<kConfig, T, T>(args, hiddenBytes, combXferBytes, comm);
 }
 
 template <EpInterNodeKernelCfg kConfig, typename T>
-inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args,
+inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs& args,
                                           const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
@@ -1553,30 +1555,30 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args,
     const size_t tokHiddenBytes = hiddenDim * sizeof(TokT);
     const size_t tokCombXferBytes =
         (args.weightsBuf == nullptr) ? tokHiddenBytes : tokHiddenBytes + weightBytes;
-    combine_impl::CombineInterNodeLLTyped<kConfig, TokT>(args, tokHiddenBytes, tokCombXferBytes,
+    combine_impl::CombineInterNodeLLTyped<kConfig, TokT, T>(args, tokHiddenBytes, tokCombXferBytes,
                                                          comm);
     return;
   }
-  combine_impl::CombineInterNodeLLTyped<kConfig, T>(args, hiddenBytes, combXferBytes, comm);
+  combine_impl::CombineInterNodeLLTyped<kConfig, T, T>(args, hiddenBytes, combXferBytes, comm);
 }
 }  // namespace internode
 
 template <EpInterNodeKernelCfg kConfig, typename T>
-__device__ void EpCombineInterNodeV1Kernel_body(EpDispatchCombineArgs<T> args,
+__device__ void EpCombineInterNodeV1Kernel_body(EpDispatchCombineArgs args,
                                                 const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
 
   if (blockId < args.rdmaBlockNum) {
-    internode::CombineInterNode<kConfig>(args, comm);
+    internode::CombineInterNode<kConfig, T>(args, comm);
   } else {
-    internode::CombineIntraNode<kConfig>(args);
+    internode::CombineIntraNode<kConfig, T>(args);
   }
 }
 
 namespace combine_all_impl {
 
 template <EpInterNodeKernelCfg kConfig, typename T>
-__forceinline__ __device__ void EpCombineAllInternalFp8(EpDispatchCombineArgs<T>& args,
+__forceinline__ __device__ void EpCombineAllInternalFp8(EpDispatchCombineArgs& args,
                                                         size_t fp8HiddenBytes,
                                                         size_t fp8CombXferBytes) {
   DEF_COMMON_VARS;
@@ -1633,7 +1635,7 @@ __forceinline__ __device__ void EpCombineAllInternalFp8(EpDispatchCombineArgs<T>
 }
 
 template <EpInterNodeKernelCfg kConfig, typename T>
-__forceinline__ __device__ void EpCombineAllGeneric(EpDispatchCombineArgs<T>& args) {
+__forceinline__ __device__ void EpCombineAllGeneric(EpDispatchCombineArgs& args) {
   DEF_COMMON_VARS;
 
   extern __shared__ char sharedMem[];
@@ -1686,7 +1688,7 @@ __forceinline__ __device__ void EpCombineAllGeneric(EpDispatchCombineArgs<T>& ar
 }  // namespace combine_all_impl
 
 template <EpInterNodeKernelCfg kConfig, typename T>
-__device__ void EpCombineAll_body(EpDispatchCombineArgs<T> args) {
+__device__ void EpCombineAll_body(EpDispatchCombineArgs args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
       INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
@@ -1703,32 +1705,32 @@ __device__ void EpCombineAll_body(EpDispatchCombineArgs<T> args) {
     const size_t fp8HiddenBytes = hiddenDim * sizeof(Fp8T);
     const size_t fp8CombXferBytes =
         (args.weightsBuf == nullptr) ? fp8HiddenBytes : fp8HiddenBytes + weightBytes;
-    combine_all_impl::EpCombineAllInternalFp8<kConfig>(args, fp8HiddenBytes, fp8CombXferBytes);
+    combine_all_impl::EpCombineAllInternalFp8<kConfig, T>(args, fp8HiddenBytes, fp8CombXferBytes);
     return;
   }
-  combine_all_impl::EpCombineAllGeneric<kConfig>(args);
+  combine_all_impl::EpCombineAllGeneric<kConfig, T>(args);
 }
 
 template <EpInterNodeKernelCfg kConfig, typename T>
-__device__ void EpCombineInterNodeV1KernelLowLatency_body(EpDispatchCombineArgs<T> args,
+__device__ void EpCombineInterNodeV1KernelLowLatency_body(EpDispatchCombineArgs args,
                                                           const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
 
   if (blockId < args.rdmaBlockNum) {
-    internode::CombineInterNodeLL<kConfig>(args, comm);
+    internode::CombineInterNodeLL<kConfig, T>(args, comm);
   } else {
-    internode::CombineIntraNodeLL<kConfig>(args);
+    internode::CombineIntraNodeLL<kConfig, T>(args);
   }
 }
 
 template <EpInterNodeKernelCfg kConfig, typename T>
-__device__ void EpCombineSync_body(EpDispatchCombineArgs<T> args) {
+__device__ void EpCombineSync_body(EpDispatchCombineArgs args) {
   DEF_COMMON_VARS;
-  internode::CombineSync<kConfig>(args);
+  internode::CombineSync<kConfig, T>(args);
 }
 
 template <EpInterNodeKernelCfg kConfig, typename T>
-__device__ void EpCombineSyncBarrier_body(EpDispatchCombineArgs<T> args) {
+__device__ void EpCombineSyncBarrier_body(EpDispatchCombineArgs args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
       INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
@@ -1769,18 +1771,6 @@ namespace mori {
 namespace ops {
 namespace v2 {
 
-// EpInterNodeArgsRaw is EpInterNodeArgs<void>: the same struct with the single
-// T-dependent member spelled void*, static_asserted in ep_internode_args.hpp to
-// have identical size and alignment for every T. So the host fills one untyped
-// struct and each kernel reads it as its own T at the same addresses.
-template <typename T>
-__device__ __forceinline__ EpDispatchCombineArgs<T> EpInterNodeAsArgs(
-    const ::mori::ops::v2::EpInterNodeCcoArgs& a) {
-  EpDispatchCombineArgs<T> typed;
-  __builtin_memcpy(&typed, &a.args, sizeof(::mori::ops::v2::EpInterNodeArgsRaw));
-  return typed;
-}
-
 }  // namespace v2
 }  // namespace ops
 }  // namespace mori
@@ -1794,7 +1784,7 @@ __device__ __forceinline__ EpDispatchCombineArgs<T> EpInterNodeAsArgs(
 // Kernels that reach the network.
 #define MORI_EP_INTERNODE_CCO_ENTRY(entry, body)                                                  \
   extern "C" __global__ void entry(::mori::ops::v2::EpInterNodeCcoArgs a) {                       \
-    ::mori::ops::v2::body<kConfig, TokT>(::mori::ops::v2::EpInterNodeAsArgs<TokT>(a), a.devComm); \
+    ::mori::ops::v2::body<kConfig, TokT>(a.args, a.devComm); \
   }
 
 // Staging, sync and the final reduction: local or intra-node only, so they take
@@ -1802,5 +1792,5 @@ __device__ __forceinline__ EpDispatchCombineArgs<T> EpInterNodeAsArgs(
 // launch path for the whole sequence.
 #define MORI_EP_INTERNODE_CCO_ENTRY_LOCAL(entry, body)                                 \
   extern "C" __global__ void entry(::mori::ops::v2::EpInterNodeCcoArgs a) {            \
-    ::mori::ops::v2::body<kConfig, TokT>(::mori::ops::v2::EpInterNodeAsArgs<TokT>(a)); \
+    ::mori::ops::v2::body<kConfig, TokT>(a.args); \
   }
