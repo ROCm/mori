@@ -200,6 +200,8 @@ def run(args) -> int:
             xcd_swizzle=args.xcd_swizzle,
             fuse=fused,
             transport="lsa" if direct_lsa else "sdma",
+            swap_ab=args.swap_ab,
+            store_probe=args.store_probe,
             rotated=None if args.tile_order == "auto" else args.tile_order == "rotated",
             fence=args.fence,
             emit_put=not args.no_put,
@@ -294,6 +296,7 @@ def run(args) -> int:
                 "block_n": args.block_n,
                 "chunks": chunks if fused else None,
                 "tile_order": args.tile_order,
+                "swap_ab": args.swap_ab,
                 "fence": args.fence if fused else None,
                 "stop_after": args.stop_after,
                 "max_rank_time_us": per_rank[max_rank],
@@ -376,6 +379,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="ordering on the tile counter. The winner needs the acquire half to "
         "order the other blocks' releases before its put; 'monotonic' drops it "
         "and races",
+    )
+    p.add_argument(
+        "--swap-ab",
+        action="store_true",
+        help="exchange the MFMA operands so each lane owns 4 consecutive N, "
+        "letting C be stored 64 bits at a time instead of 16 "
+        "(gcnasm mfma_adaptor_swap_ab)",
+    )
+    p.add_argument(
+        "--store-probe",
+        action="store_true",
+        help="PERF PROBE, output is wrong by construction: emit the 16B-per-lane "
+        "store pattern the permlane stage would produce, without the shuffle, to "
+        "price it before building it. Requires --swap-ab; use --skip-validation",
     )
     p.add_argument("--sdma-queues", type=int, default=8)
     p.add_argument("--warmup", type=int, default=10)

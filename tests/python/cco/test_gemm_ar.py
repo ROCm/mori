@@ -156,6 +156,52 @@ def test_pinned_copy_matches_aiter_kernel_bitwise(m, n, k):
     )
 
 
+@pytest.mark.parametrize("m,n,k", [(512, 512, 256), (4096, 7168, 1024)])
+def test_swap_ab_is_bitwise_identical(m, n, k):
+    """Exchanging the MFMA operands must not change a single bit.
+
+    ``fx.gemm(atom, c, b, a, c)`` computes ``(A B)^T`` in the accumulator's own
+    layout: same products, same fp32 accumulation order along k, only the
+    register-to-(row, col) mapping differs. So this is exactly reproducible, and
+    anything less than bit-equality means the store's index math drifted rather
+    than that the arithmetic changed.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires a GPU")
+    pytest.importorskip("aiter", reason="aiter not importable (set PYTHONPATH)")
+    from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import flydsl_8wave_gemm_a8
+    from aiter.ops.shuffle import shuffle_weight
+
+    import flydsl.expr as fx
+
+    from kernels_fused import compile_fused_gemm_scatter
+
+    g = torch.Generator(device="cuda").manual_seed(7)
+    a = (torch.randn(m, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
+    b = (torch.randn(n, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
+    sa = torch.rand(m, generator=g, device="cuda", dtype=torch.float32) * 0.01 + 0.01
+    sb = torch.rand(n, generator=g, device="cuda", dtype=torch.float32) * 0.01 + 0.01
+    b_shuf = shuffle_weight(b, layout=(16, 16))
+
+    ref = torch.zeros(m, n, device="cuda", dtype=torch.bfloat16)
+    flydsl_8wave_gemm_a8(a, b_shuf, sa, sb, ref, 256, 256)
+
+    cfg = layout.ArConfig(world_size=2, m=m, n=n)
+    gemm = compile_fused_gemm_scatter(
+        cfg, 0, K=k, BLOCK_M=256, BLOCK_N=256, b_preshuffled=True,
+        fuse=False, swap_ab=True,
+    )
+    got = torch.zeros(m, n, device="cuda", dtype=torch.bfloat16)
+    gemm(
+        a.contiguous().view(torch.int8).view(-1),
+        b_shuf.contiguous().view(torch.int8).view(-1),
+        got.view(-1), sa, sb, m, n, 0, 0,
+        stream=fx.Stream(torch.cuda.current_stream()),
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(got, ref)
+
+
 def test_rotated_tile_order_is_a_permutation_of_the_linear_one():
     """Reordering tiles must not change which tiles exist -- checked on the host.
 

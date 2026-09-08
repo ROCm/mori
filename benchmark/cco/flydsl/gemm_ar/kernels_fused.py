@@ -71,7 +71,56 @@ of the GEMM and nothing overlaps. The rotation is gcnasm's
 ``opus_direct_stripe_tile`` idea. It costs nothing: 49.72us against 49.80us for
 the GEMM alone.
 
-## Direct LSA (``--mode fused-lsa``): the structure works, the store does not
+## Store width: the operand swap works and does not pay
+
+``StoreC`` emits 128 ``buffer_store_short`` per block -- one bf16 at a time -- and
+the reason is the MFMA accumulator layout, not a missed vectorization. Lane ``l``
+holds ``D[4*(l/16)+i][l%16]``: four consecutive *rows*, stride ``c_cols``, so a
+lane's four values are 14336 bytes apart in a row-major C. The eight bf16 that
+would make a 16-byte store, ``C[r][c..c+7]``, live in eight *different* lanes.
+(The same class loads A's scale 128 bits at a time, because that one is indexed
+by row and a lane owns four consecutive rows.)
+
+``--swap-ab`` is gcnasm's ``mfma_adaptor_swap_ab`` (opus.hpp:2064, literally
+``base::operator()(b, a, c)`` with ``dim_c()`` redefined): computing ``B^T A^T =
+(A B)^T`` in the accumulator's own layout moves a lane to
+``D[l%16][4*(l/16)+k]`` -- four consecutive *columns*, 8 contiguous bytes. The
+A and B scale loads swap with it, scalar for A and vec4 for B.
+
+It is bit-identical to aiter's kernel at [512,512,256], [1024,768,512] and the
+wo_b shape (``test_swap_ab_is_bitwise_identical``), and it is **slower**:
+
+    variant                 per lane  lanes/row  bytes/row  rows/instr   gemm-only
+    unswapped (128 short)      2B        16         32B         4        50.4us
+    --swap-ab (32 dwordx2)     8B         4         32B        16        55.6us
+    + 16B/lane (probe)        16B         4         64B        16        48.1us
+
+Store instructions drop 4x and total kernel instructions 30%, and none of that
+matters, because the number of memory transactions does not change: both layouts
+put 32 bytes in a row and need 16 of them. The swap only moves those 16
+transactions from four instructions onto one, quadrupling the per-instruction
+address fan-out -- ATT puts ``buffer_store_dwordx2`` at 1022 cycles each against
+``buffer_store_short``'s 114.
+
+What actually helps is 64 bytes per row, and only a little. ``--store-probe``
+emits that access pattern with deliberately wrong data, so it is an upper bound
+with the cross-lane shuffle's cost removed: 48.1us against 50.4, i.e. **-4.6% at
+best**, before paying for the ``permlane16_swap`` + ``shfl`` that would make it
+correct. Not worth building.
+
+And it does nothing at all on the path where the store dominates. On
+``fused-lsa``, where the store is 14% of the kernel with 60x the stall of the
+local case, the same probe measures 340.8/338.7/333.1us against the current
+336.4/335.3/337.7 -- a wash. That phase is limited by xGMI bandwidth, not by
+transaction count, so halving the transactions buys nothing.
+
+The 16-column MFMA tile is the real floor here: 16 bf16 is 32 bytes, a quarter of
+a 128-byte line, whatever the operand order. Reaching 64B needs two N-tiles
+merged (they are 16 columns apart in *both* layouts, so it needs a shuffle
+either way), and 128B needs merging across waves through LDS -- which gcnasm
+measured at a 1-3% regression.
+
+## Direct LSA (``--mode fused-lsa``)## Direct LSA (``--mode fused-lsa``): the structure works, the store does not
 
 gcnasm's best mode has the GEMM epilogue store *straight into the destination
 rank's window*, so there is no staging buffer, no copy engine and nothing to
@@ -215,9 +264,10 @@ import sys
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr import gpu as fgpu
 from flydsl.expr.typing import Int64
+from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels.gemm_a8w8_8wave import (
     G2SLoader,
@@ -310,6 +360,164 @@ class _RawWriteThroughStoreC(StoreC):
         buffer_store(value_bf16, self._c_rsrc, c_index, cache_modifier=CM_SC0_SC1)
 
 
+class _SwappedMfma:
+    """``Mfma16x16x128`` with the A/B operands exchanged at every call.
+
+    Thin on purpose: the accumulator registers, the atom and ``zero_value`` are
+    the wrapped object's, only the operand order and the ``idx`` argument order
+    change. ``idx(ti, tj)`` here forwards to the wrapped ``idx(tj, ti)`` so the
+    store can keep indexing in (M-tile, N-tile) order.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.zero_value = inner.zero_value
+
+    def idx(self, i, j):
+        return self._inner.idx(j, i)
+
+    def call(self, a, b, c, *, set_prio=True):
+        return self._inner.call(b, a, c, set_prio=set_prio)
+
+
+class _SwapABStoreC(StoreC):
+    """C store for an A/B-swapped MFMA: 4 consecutive N per lane -> 64-bit store.
+
+    ``fx.gemm(atom, c, b, a, c)`` computes ``B^T A^T = (A B)^T`` in the
+    accumulator's native layout, so lane ``l`` value ``k`` moves from
+    ``D[4*(l/16)+k][l%16]`` (4 consecutive *rows*, stride c_cols) to
+    ``D[l%16][4*(l/16)+k]`` (4 consecutive *columns*). In a row-major C that is
+    8 contiguous bytes, which is the whole point -- the unswapped layout can only
+    ever emit ``buffer_store_short``. This is gcnasm's ``mfma_adaptor_swap_ab``,
+    which does literally ``base::operator()(b, a, c)`` and redefines ``dim_c()``
+    to match (opus.hpp:2064).
+
+    The scale loads swap with it, and stay equally well vectorized: A's scale is
+    indexed by row, which is now ``lane % 16`` -- one row, so a scalar load --
+    while B's is indexed by column, now 4 consecutive, so a vec4.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.out_atom_4 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.BFloat16)
+        self.reg_bf16_4 = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.BFloat16)
+
+    def _load_a_scale_scalar(self, row):
+        fx.copy(
+            self.scale_atom_1,
+            fx.slice(self.sa_div, (None, fx.Int32(row))),
+            self.reg_f32_1,
+        )
+        return Vec(fx.memref_load_vec(self.reg_f32_1))[0]
+
+    def _load_b_scale_vec4(self, col):
+        fx.copy(
+            self.scale_atom_4,
+            fx.slice(self.sb_div, (None, fx.Int32(col))),
+            self.reg_f32_4,
+        )
+        return Vec(fx.memref_load_vec(self.reg_f32_4))
+
+    def _store_bf16x4(self, values, c_index):
+        fx.memref_store_vec(Vec.from_elements(values, fx.BFloat16), self.reg_bf16_4)
+        fx.copy(
+            self.out_atom_4,
+            self.reg_bf16_4,
+            fx.slice(self.c_div, (None, fx.Int32(c_index))),
+        )
+
+    def store(self, c_frag, base_row, base_col):
+        lane = self.lane_id
+        a_scales = [
+            self._load_a_scale_scalar(base_row + ti * 16 + lane % 16)
+            for ti in range_constexpr(self.n_tiles_a)
+        ]
+        b_scales = [
+            self._load_b_scale_vec4(base_col + tj * 16 + (lane // 16) * 4)
+            for tj in range_constexpr(self.n_tiles_b)
+        ]
+        for ti in range_constexpr(self.n_tiles_a):
+            row = base_row + ti * 16 + lane % 16
+            for tj in range_constexpr(self.n_tiles_b):
+                col = base_col + tj * 16 + (lane // 16) * 4
+                # BLOCK_N divides N in every shape this builds for, so the four
+                # columns are either all in range or all out; one predicate.
+                col_valid = col + 3 < self.c_cols
+                oob = fx.Int32(self.c_rows * self.c_cols)
+                vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
+                vals = [
+                    (vec_f32[k] * (a_scales[ti] * b_scales[tj][k])).to(fx.BFloat16)
+                    for k in range_constexpr(4)
+                ]
+                c_index = row * self.c_cols + col
+                self._store_bf16x4(vals, arith.select(col_valid, c_index, oob))
+
+
+class _WideStoreProbeC(_SwapABStoreC):
+    """PERF PROBE ONLY -- the output is wrong on purpose.
+
+    Answers "is 16B per lane / 64B per row actually faster?" before anyone builds
+    the cross-lane shuffle that would make it correct. It emits exactly the access
+    pattern the shuffled version would have -- one 128-bit store per lane at
+    ``col = (lane//16)*8``, so 4 lanes cover a row's 32 columns as 64 contiguous
+    bytes -- but feeds it the two N-tiles' values concatenated, which is not what
+    belongs at those addresses.
+
+    Correct would need lane ``(a, r)`` to gather cols ``8a..8a+7``, which live in
+    two *other* lanes' registers (``a'=2a`` and ``2a+1`` of one tile). That is the
+    ``permlane16_swap`` step; this probe skips it and keeps only its cost profile.
+    """
+
+    def __init__(self, *args, peer_rsrc=None, elem_base=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.out_atom_8 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+        self.reg_bf16_8 = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
+        # When set, the 16B stores go straight to the owning peer (Direct LSA)
+        # rather than to local C, so the probe can price the same access pattern
+        # on the path where the store actually dominates.
+        self._peer_rsrc = peer_rsrc
+        self._elem_base = elem_base
+
+    def store(self, c_frag, base_row, base_col):
+        lane = self.lane_id
+        a_scales = [
+            self._load_a_scale_scalar(base_row + ti * 16 + lane % 16)
+            for ti in range_constexpr(self.n_tiles_a)
+        ]
+        b_scales = [
+            self._load_b_scale_vec4(base_col + tj * 16 + (lane // 16) * 4)
+            for tj in range_constexpr(self.n_tiles_b)
+        ]
+        for ti in range_constexpr(self.n_tiles_a):
+            row = base_row + ti * 16 + lane % 16
+            vals = []
+            for tj in range_constexpr(self.n_tiles_b):
+                vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
+                vals += [
+                    (vec_f32[k] * (a_scales[ti] * b_scales[tj][k])).to(fx.BFloat16)
+                    for k in range_constexpr(4)
+                ]
+            col = base_col + (lane // 16) * 8
+            oob = fx.Int32(self.c_rows * self.c_cols)
+            c_index = row * self.c_cols + col
+            idx = arith.select(col + 7 < self.c_cols, c_index, oob)
+            if self._peer_rsrc is not None:
+                buffer_store(
+                    Vec.from_elements(vals, fx.BFloat16),
+                    self._peer_rsrc,
+                    fx.Int32(idx) - self._elem_base,
+                )
+            else:
+                fx.memref_store_vec(
+                    Vec.from_elements(vals, fx.BFloat16), self.reg_bf16_8
+                )
+                fx.copy(
+                    self.out_atom_8,
+                    self.reg_bf16_8,
+                    fx.slice(self.c_div, (None, fx.Int32(idx))),
+                )
+
+
 class _PeerDirectStoreC(StoreC):
     """``StoreC`` that writes its tile straight into the owning peer's window.
 
@@ -392,6 +600,8 @@ def compile_fused_gemm_scatter(
     xcd_swizzle: int = 0,
     fuse: bool = True,
     rotated: bool | None = None,
+    swap_ab: bool = False,
+    store_probe: bool = False,
     transport: str = "sdma",
     fence: str = "none",
     emit_put: bool = True,
@@ -474,7 +684,7 @@ def compile_fused_gemm_scatter(
         raise ValueError(
             f"fence must be all/agent/leader/none/writethrough/wt-agent, got {fence!r}"
         )
-    _kname_tag = f"c{chunks}{'r' if rotated else 'l'}{fence[0]}"
+    _kname_tag = f"{'S' if swap_ab else ''}{'W' if store_probe else ''}c{chunks}{'r' if rotated else 'l'}{fence[0]}"
     counter_off = cfg.counter_off
     lock_off = cfg.lock_off
     in_off = cfg.input_off
@@ -568,14 +778,39 @@ def compile_fused_gemm_scatter(
             lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=b_preshuffled
         )
 
-        mfma = Mfma16x16x128(N_TILES_A, N_TILES_B)
+        if const_expr(swap_ab):
+            # Tile counts swap with the operands so Mfma's own asserts and its
+            # idx() line up; the store then addresses the accumulator as
+            # idx(tj, ti).
+            mfma_raw = Mfma16x16x128(N_TILES_B, N_TILES_A)
+            mfma = _SwappedMfma(mfma_raw)
+        else:
+            mfma = Mfma16x16x128(N_TILES_A, N_TILES_B)
         w_pre = cco.Window(win)
 
         a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
         b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
         a_s2r = S2RLoader(wave_m, N_TILES_A)
         b_s2r = S2RLoader(wave_n, N_TILES_B)
-        if const_expr(direct_lsa):
+        if const_expr(swap_ab and store_probe and not direct_lsa):
+            store_c = _WideStoreProbeC(
+                A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B
+            )
+        elif const_expr(swap_ab and not direct_lsa):
+            store_c = _SwapABStoreC(
+                A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B
+            )
+        elif const_expr(direct_lsa and swap_ab and store_probe):
+            dest_blk = block_m // fx.Int32(m_tiles_per_peer)
+            store_c = _WideStoreProbeC(
+                A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B,
+                peer_rsrc=create_buffer_resource_from_addr(
+                    wave_uniform_i64(w_pre.lsa_ptr(dest_blk, my_recv_slot)),
+                    num_records_bytes=cfg.slice_bytes,
+                ),
+                elem_base=dest_blk * fx.Int32(slice_rows) * c_n,
+            )
+        elif const_expr(direct_lsa):
             # dest is uniform across the block; readfirstlane keeps the peer
             # descriptor scalar and avoids a waterfall around every store.
             dest_blk = block_m // fx.Int32(m_tiles_per_peer)
