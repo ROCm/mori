@@ -260,48 +260,56 @@ and it is nowhere near enough. Halving BLOCK_M would free roughly 16 by halving
 the accumulator count, but moves the tile count to 896 -- remainder 128, where
 gcnasm measured +0.41%. There is no version of this that pays.
 
-## Direct LSA (``--mode fused-lsa``): correct now, and still slower than split
+## Direct LSA (``--mode fused-lsa``): correct now, still slower than split
 
 gcnasm's best mode has the GEMM epilogue store *straight into the destination
-rank's window*, so there is no staging buffer, no copy engine and nothing to hand
-to one. The structural half is emphatic -- the scatter collapses from 136.8us to
-about 10us, the transfer is entirely absorbed -- and it was wrong for a long time.
+rank's window*: no staging buffer, no copy engine, nothing to publish mid-kernel.
+Ported here, the structural half is emphatic -- the scatter collapses from
+136.8us to 10.1us, i.e. the transfer is entirely absorbed, which fused-sdma never
+managed. And the un-coalesced store is nowhere near as bad as feared: 7.34MB per
+link in 166.6us is ~44 GB/s, 82% of the SDMA scatter's 53.7, against the 0.26x
+gcnasm measured for a lane-scatter pushed to a peer.
 
-What was missing: **the producing kernel has to publish.** In the LSA 2-stage
-all-reduce the producer fences (``ar/kernels_lsa.py``, every lane of every block,
-right after the ``tmp`` stores). Here the producer is the GEMM, and the only
-fence was in the separate barrier kernel -- one block, so one XCD's L2 out of
-eight. The other seven kept the peer-homed lines dirty while the LSA flag, being
-a system-scope atomic, overtook them. Adding ``cco_system_fence`` at the end of
-the GEMM fixes it: 10 runs of 10 at the fp8 floor.
+It was wrong for a long time, and the fix is one line in the right place. The LSA
+2-stage all-reduce publishes from the kernel that produced the data --
+``ar/kernels_lsa.py`` fences right after its ``tmp`` stores, in every block.
+Direct LSA's producer is the GEMM, and the only fence was in the *separate*
+barrier kernel: one block, therefore one XCD's L2 out of eight. The other seven
+kept the peer-homed lines dirty, and the LSA flag, being a system-scope atomic,
+overtook them. Moving the fence into the GEMM fixes it: **10/10 runs bit-correct**
+where it had been 2-3 in 6.
 
-The fence can be ``leaderOnly``, which is worth 80us (434us -> 355). That is only
-legal because the half-wave barrier pair is closed (see below): ``wait_barrier(0)``
-now really does mean every wave's stores have retired into this CU's L2, so one
-wave writing it back covers all eight. Measured as incorrect before that fix,
-which is what made a per-wave release look mandatory.
+``--direct-fence leader`` (thread 0 only, the default) rather than every lane is
+worth 80us, 434 -> 355. It is legal only because the half-wave barrier pair is
+now closed -- ``wait_barrier(0)`` really does mean every wave's stores have
+retired into this CU's L2, so one wave writing it back covers all eight. Measured
+as incorrect before that fix, which is what made a per-wave release look
+mandatory.
 
-Two things that did *not* work, both worth recording because they look obvious:
+Two things that did *not* work, and are worth not re-trying:
 
-* **Uncached (``sc0|sc1``) peer stores**, so there would be nothing to flush.
-  Consistently wrong, ~1.7e-2, at 2 bytes per lane and still at 16 after the
-  permlane stage -- so the earlier "2-byte partial-line writes lose updates"
-  explanation was not it, and the cause is unknown.
-* **The 3-stage C store**, which is worth 6.7% on a local store, is worth nothing
-  here: 189.4us of GEMM either way. The peer store crosses the fabric and that
-  phase is bounded by ~44 GB/s of link bandwidth, not by issue rate or
-  coalescing.
+* **Uncached (sc0|sc1) peer stores**, so there would be nothing to publish. Wrong
+  consistently, ~1.7e-2, at every store width. The first time this was tried the
+  store was one bf16 and the explanation looked like partial-line writes losing
+  updates over the fabric; with ``--permlane --lane-transpose`` making it 16
+  bytes per lane and 64 contiguous per row it is *still* wrong, so that
+  explanation was not it and the real one is unknown.
+* An uncached recv load in the reduce. No effect, which is what rules out a stale
+  read on the consumer side.
 
-Per-kernel, 8 ranks, [4096, 7168], K=1024, with the 3-stage C store:
+It does not beat the split path. Per-kernel (rocprofv3, 8 ranks, [4096,7168]
+K=1024, with all three C-store stages):
 
-    config                gemm    barrier  reduce  gather     sum     e2e
-    split-lsa             35.7      (one all-reduce kernel, 274.3)   318.8us
-    fused-lsa            189.4       10.1    10.9   135.6   346.0   359.0us
+    fused-lsa   gemm 189.4  barrier 10.1  reduce 10.9  gather 135.6   sum 346.0
+    split-lsa   gemm  35.7  + one LSA all-reduce kernel                sum ~310
 
-So it is correct and 12% slower. The reason is structural: LSA's stage 1 does
-read + reduce + write in a single pass over the wire, so its reduce is free,
-while Direct LSA writes to the peer and then pays a separate local reduce pass --
-and its store rate is ~44 GB/s against LSA's ~51 GB/s read rate.
+    end to end, median of 4:   split-lsa 318.8us     fused-lsa 359.0us
+
+The 41us gap is structural, not tuning. LSA's 2-stage does read + reduce + write
+in a single pass over the wire, so its reduce is free; Direct LSA writes to the
+peer and then pays a separate 10.9us local reduce pass, its store rate is ~14%
+under LSA's read rate, and it adds the publishing fence LSA gets from being
+local. Absorbing the scatter completely still does not cover that.
 
 ## What gcnasm does differently## What gcnasm does differently, and why its GEMM+a2a wins
 
@@ -330,76 +338,66 @@ not, and one of its lessons was worth ~90us here.
    (fused 440us -> 350us on removing it). Its ISA shows the atomic already emits
    its own ``buffer_wbl2``/``buffer_inv`` pair, on thread 0 only.
 
-## The race that pinned chunks=1: a barrier phase, not a queue
+## The chunks race: much better understood, still not gone
 
 The prologue's ``if wave_m == 1: rocdl.s_barrier()`` gives waves 4-7 one *extra*
 barrier. ``s_barrier`` is a counting rendezvous, so from then on every arrival
 pairs waves 4-7's k-th barrier with waves 0-3's (k+1)-th, and waves 0-3 run one
-phase ahead for the rest of the kernel. A one-shot GEMM does not care: the
-trailing unmatched barrier is released when the other half exits, and the offset
-is the point -- it staggers the two halves of the M dimension.
+phase ahead. A one-shot GEMM does not care -- the trailing unmatched barrier is
+released when the other half exits, and the offset is the point, it staggers the
+two halves of M. The fused epilogue does care: ``wait_barrier(0)`` after
+``store_c`` is supposed to mean "every wave's C tile has retired", and under the
+offset it rendezvouses waves 0-3, which hold thread 0 and therefore the counter
+and the transfer, with waves 4-7 still at the *previous* barrier, before their
+stores.
 
-The fused epilogue does care. ``wait_barrier(0)`` after ``store_c`` is supposed
-to mean "every wave's C tile has retired". Under the offset it instead
-rendezvouses waves 0-3 -- which contain thread 0, hence the counter and the
-transfer -- with waves 4-7 sitting at the *previous* barrier, before their
-stores. Thread 0 then counts the tile complete and can push it while half of it
-is still unwritten.
+Closing the pair (``if wave_m == 0: s_barrier()`` before ``store_c``, which is
+what gcnasm does at kernel_template.hpp:693, unconditionally) took ``--chunks 2``
+from failing about 1 run in 3 to **3 in 10**. Better, not fixed, so the default
+stays 1 -- which is 10/10 over the same sample and costs ~17us, since with one
+chunk the counter only fires when the whole slice is done and nothing overlaps.
 
-One ``if wave_m == 0: rocdl.s_barrier()`` before ``store_c`` re-balances the
-counts and fixes it: ``--chunks 2`` goes from failing about one run in three to
-12 of 12, and it is the configuration that actually overlaps.
+What is left is not the fence. Adding one makes it *worse*, reproducibly:
 
-Two things were blamed for this before it was found, and both were wrong:
+    --fence none (default)   6/6 correct
+    --fence leader           3/6 wrong
+    --fence agent            5/6 wrong
 
-* **A shared SDMA queue.** With two chunks per destination the modulo test elects
-  two winners that both post to queue ``dest``, so gcnasm's per-destination
-  submit lock was ported (ISA-verified: test-and-set with ``s_sleep`` backoff).
-  It fixed nothing. It is kept because cco's rule of at most one issuing warp per
-  queue still applies, but it was not the bug.
-* **The counter atomic's ordering.** ``acq_rel`` appeared to lower the failure
-  rate against ``monotonic``, which is how the acquire half got justified. With a
-  one-in-three intermittent failure that comparison was noise. ``acq_rel`` stays
-  because release/acquire on the counter is right for a producer handing tiles to
-  a consumer, not because it was measured.
+Two earlier diagnoses of this race were wrong and are recorded so they are not
+retried:
 
-Repeated runs remain the only way to judge any of this;
-``test_fused_is_stable_across_repeats`` requires three runs to be *identical*,
-not merely each small, because every individual relL2 here looks plausible.
+* **A shared SDMA queue.** gcnasm's per-destination submit lock was ported and
+  ISA-verified (test-and-set, ``s_sleep`` backoff). It fixed nothing. Kept
+  because cco's one-issuing-warp-per-queue rule still applies.
+* **The counter atomic's ordering.** ``acq_rel`` appeared to beat ``monotonic``,
+  which is how the acquire half got justified. Against a 1-in-3 intermittent
+  failure that comparison was noise. ``acq_rel`` stays because release/acquire is
+  right for a producer handing tiles to a consumer, not because it was measured.
 
-## Result: split-lsa still wins
+Repeated runs are the only way to judge any of this, and the gate has to be
+tight: the corruption lands at 4-9e-3 against an fp8 floor of 2.35e-3, so a
+5e-3 threshold reported a corrupt run as validated (it did, at 3.97e-3). The
+bench now gates at 3e-3, and ``test_fused_is_stable_across_repeats`` requires
+three runs to be *identical* rather than each small.
 
-8 ranks, [4096, 7168], K=1024, graph replay, with the 3-stage C store. Failures
-are out of 10 runs, counting any result that is not the 2.35e-3 fp8 floor:
+## Result: nothing beats split-lsa
 
-    mode                            time    wrong
-    split-lsa                     318.8us    0/10
-    fused-sdma  chunks=1          342        0/10
-    fused-sdma  chunks=2          325        3/10   <- fastest, still racy
-    split-sdma                    329.7      0/10
-    fused-lsa   3-stage, leader   359.0      0/10
+8 ranks, [4096, 7168], K=1024, graph replay, all three C-store stages on,
+median of 4, correctness over 10 runs:
 
-Per-kernel:
+    mode                        time     correct
+    split-lsa                  318.8us    10/10     <- best
+    fused-sdma  chunks=2       325.0       7/10     racy
+    split-sdma                 329.7      10/10
+    fused-sdma  chunks=1       342.0      10/10
+    fused-lsa                  359.0      10/10
 
-    config                gemm  scatter/barrier  reduce  gather     sum
-    split-sdma            35.7        136.8       13.5   135.5   321.5
-    fused-sdma chunks=1   57.6        130.4       13.1   135.1   336.2
-    fused-lsa            189.4         10.1       10.9   135.6   346.0
-
-Neither fusion beats ``split-lsa``, and the reason is the same for both: LSA's
-2-stage does read + reduce + write in one pass over the wire, so its reduce is
-free, while every fused variant here writes somewhere and then pays a separate
-local reduce. On top of that ``fused-lsa``'s peer store runs at ~44 GB/s against
-LSA's ~51 GB/s read, and ``fused-sdma``'s overlap (scatter 136.8 -> 130.4 at
-chunks=1) is cancelled by what the epilogue costs the GEMM (35.7 -> 57.6).
-
-``--chunks 2`` is the one configuration that is genuinely faster than the best
-split path would suggest -- 325us against split-sdma's 329.7 -- and it is wrong
-3 runs in 10. The barrier-phase fix took it from about 1 in 3 to 3 in 10, so
-whatever remains is a second, rarer bug. Default is 1.
-
-Reduce and all-gather are 46% of the pipeline and untouched by any of this,
-which caps what fusing the scatter can ever be worth.
+Both transports were taken to correctness and neither wins. fused-sdma's overlap
+is real but small (scatter 136.8 -> 126.9) and roughly cancelled by what the
+epilogue costs the GEMM; fused-lsa absorbs the scatter completely (136.8 -> 10.1)
+and loses it again to a separate reduce pass, a lower store rate and the
+publishing fence. And in both, reduce plus all-gather -- 46% of the pipeline --
+are untouchable by construction.
 
 ## Pinned copy
 
