@@ -260,8 +260,12 @@ def _parse_args(argv):
     # independent paired test against the thing it would replace, which is both
     # what we want to know and reproducible across repeats.
     p.add_argument("--tuning-greedy", action="store_true")
-    # Workers to spawn per node (0 = off: one torchrun process per rank).
-    p.add_argument("--spawn", type=int, default=0)
+    # Workers to spawn per node. 8 by default, which means this harness expects
+    # --nproc_per_node=1 and builds the rest of the ranks itself -- the same
+    # process tree the examples harness uses, so the two are comparable without
+    # remembering to pass a flag. --spawn 0 turns it off for the old shape (one
+    # torchrun process per rank).
+    p.add_argument("--spawn", type=int, default=8)
     # How much better a candidate must be, on the paired difference, to take
     # over. Whichever of the two is larger. Not 0: see the note in _tune.
     p.add_argument("--tuning-margin-us", type=float, default=1.5)
@@ -1063,6 +1067,16 @@ def main(argv):
     # able to switch because host time on this path converts to measured "kernel"
     # time about 1:1, so how the ranks are parented is not obviously neutral.
     if a.spawn and not os.environ.get("_MORI_EP_SPAWN_CHILD"):
+        # Both topologies at once would be nprocs x spawn ranks per node, each
+        # claiming a GPU index it does not own. Refuse rather than deadlock in
+        # the rendezvous, and say which of the two to drop.
+        lws = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+        if lws > 1:
+            raise SystemExit(
+                f"--spawn {a.spawn} with torchrun --nproc_per_node={lws}: that is "
+                f"{lws * a.spawn} ranks per node. Use --nproc_per_node=1 (spawn "
+                f"builds the ranks), or pass --spawn 0 to let torchrun do it."
+            )
         node_rank = int(os.environ["RANK"])
         nnodes = int(os.environ["WORLD_SIZE"])
         torch.multiprocessing.spawn(
