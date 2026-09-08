@@ -44,6 +44,29 @@ without a QP.
 ``tools/run_internode_test.sh`` drives both ranks; the CLI below is the subset of
 the shmem harness's flags that means anything here.
 
+READING THE PER-RANK SERIES (MORI_EP_ROUND_SERIES)
+--------------------------------------------------
+Every rank prints its own per-round series. These are spin-wait collectives, so
+the rank that arrives LAST waits LEAST: on a slow round the straggler is the
+MINIMUM, not the maximum, and the other fifteen are just showing what they waited
+for. Threshold per NODE, not globally -- the two nodes routinely sit at different
+levels in the same round (151 vs 237us was measured), and a global threshold then
+misses a rank that is low within its own node.
+
+The shape of the low set says what happened, and they are not all the same:
+
+  {i, i+8}          one RAIL. Local rank i selects bnxt_re_bond<i> ("rank 1
+                    rankInNode 1 select device [1] bnxt_re_bond1"), so the same
+                    local index on both nodes is one NIC-to-NIC path.
+  {i}               one rank.
+  all of one node    a node-level event; the other node's eight ranks all wait.
+  empty             every rank waited, including the fastest -- no straggler
+                    exists and no single card can explain it.
+
+Measured over 11 spiked rounds in 9 runs: 5 empty, 3 rail pairs (rails 1, 5 and 7,
+once each), 2 single ranks, 1 other. So no one card is at fault; when there is a
+straggler its identity rotates.
+
 RoCE QoS: SET MORI_RDMA_TC AND MORI_RDMA_SL
 -------------------------------------------
 Unset, ``bnxt.cpp`` takes ``ReadRdmaServiceLevelEnv().value_or(1)`` and leaves
