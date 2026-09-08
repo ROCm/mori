@@ -50,12 +50,21 @@
 #include "mori/core/transport/p2p/device_primitives.hpp"
 #include "mori/ops/dispatch_combine_v2/ep_cfg.hpp"
 #include "src/ops/dispatch_combine_v2/ep_intranode_kernel.hpp"
+#include "src/ops/dispatch_combine_v2/tdm_align.hpp"
 
 namespace mori {
 namespace ops {
 namespace v2 {
 
 using index_t = int32_t;
+
+using tdm::kTdmRowBytes;
+using tdm::TdmAddrOnRow;
+using tdm::TdmPlanXfer4B;
+using tdm::TdmSplit128;
+using tdm::TdmSplitDim0;
+using tdm::TdmSplitDim1;
+using tdm::TdmXferOk;
 
 #define MORI_COMB_TDM 2
 #define MORI_COMB_QUAD 2
@@ -120,9 +129,25 @@ __device__ __forceinline__ gfx1250_TDM_GROUP1 TdmShape(int hiddenDim) {
   g1.tileDim1(1);
   return g1;
 }
+#if defined(MORI_TDM_STRICT)
+#define MORI_TDM_CHECK_ADDR(p)                                 \
+  do {                                                         \
+    if (!::mori::tdm::TdmAddrOnRow((const void*)(p))) __trap(); \
+  } while (0)
+#define MORI_TDM_CHECK_XFER(src, dst, n, sp)                                       \
+  do {                                                                             \
+    if (!::mori::tdm::TdmXferOk((const void*)(src), (const void*)(dst), (n), (sp))) \
+      __trap();                                                                    \
+  } while (0)
+#else
+#define MORI_TDM_CHECK_ADDR(p) ((void)0)
+#define MORI_TDM_CHECK_XFER(src, dst, n, sp) ((void)0)
+#endif
+
 template <typename T, int TH = 0, int SCOPE = 0>
 __device__ __forceinline__ void TdmIssueLoad(T* ldsTile, const T* src,
                                              const gfx1250_TDM_GROUP1& g1) {
+  MORI_TDM_CHECK_ADDR(src);
   typedef int _tdm_v4i __attribute__((ext_vector_type(4)));
   typedef int _tdm_v8i __attribute__((ext_vector_type(8)));
   gfx1250_TDM_GROUP0 g0;
@@ -149,6 +174,7 @@ __device__ __forceinline__ gfx1250_TDM_GROUP1 TdmShapeGather(int rowElems, int n
 }
 template <typename T, int TH = 0, int SCOPE = 0>
 __device__ __forceinline__ void TdmIssueStore(T* dst, T* ldsTile, const gfx1250_TDM_GROUP1& g1) {
+  MORI_TDM_CHECK_ADDR(dst);
   typedef int _tdm_v4i __attribute__((ext_vector_type(4)));
   typedef int _tdm_v8i __attribute__((ext_vector_type(8)));
   gfx1250_TDM_GROUP0 g0;
@@ -171,49 +197,17 @@ __device__ __forceinline__ gfx1250_TDM_GROUP1 TdmShape2D(int dim0, int dim1) {
   g1.tileDim1(dim1);
   return g1;
 }
-struct TdmSplit128 {
-  int head;
-  int body;
-  int rows;
-};
-__device__ __forceinline__ TdmSplit128 TdmAlignSplit128(size_t phase, int nElems) {
-  constexpr int P = 32;
-  int head = (int)((P - (phase & (size_t)(P - 1))) & (size_t)(P - 1));
-  if (head > nElems) head = nElems;
-  int rows = (nElems - head) / P;
-  if (rows < 2) return TdmSplit128{nElems, 0, 0};
-  return TdmSplit128{head, rows * P, rows};
-}
-__device__ __forceinline__ int TdmCheapDim1(int nElems) {
-  if ((nElems & 7) == 0 && (nElems >> 3) >= 32) return 8;
-  if ((nElems & 3) == 0 && (nElems >> 2) >= 32) return 4;
-  if ((nElems & 1) == 0 && (nElems >> 1) >= 32) return 2;
-  return 0;
-}
-__device__ __forceinline__ TdmSplit128 TdmWholeOrSplit128(size_t phase, int nElems) {
-  const TdmSplit128 sp = TdmAlignSplit128(phase, nElems);
-  if (sp.head == 0 && sp.body == nElems) return sp;
-  if (TdmCheapDim1(nElems)) return TdmSplit128{0, nElems, 0};
-  if (nElems >= 4 && (nElems & 1) == 0) return TdmSplit128{0, nElems, 0};
-  return sp;
-}
-__device__ __forceinline__ gfx1250_TDM_GROUP1 TdmSplitShape(const TdmSplit128& sp, int nElems) {
-  if (sp.rows == 0) {
-    const int d1 = TdmCheapDim1(nElems);
-    if (d1 > 0) return TdmShape2D(nElems / d1, d1);
-    if (nElems >= 4 && (nElems & 1) == 0) return TdmShape2D(nElems / 2, 2);
-    return TdmShape2D(32, 2);
-  }
-  return TdmShape2D(32, sp.rows);
+__device__ __forceinline__ gfx1250_TDM_GROUP1 TdmSplitShape(const TdmSplit128& sp) {
+  return TdmShape2D(TdmSplitDim0(sp), TdmSplitDim1(sp));
 }
 
 #define CUSPLIT_POOL_SLOTS (MORI_EP_WORLD_SIZE * MORI_EP_MAX_RECV)
 #define CUSPLIT_MAX_BLOCKS 512
 #define CUSPLIT_MAX_TOPK 16
 
-__device__ index_t _cusplit_stgIdx[CUSPLIT_POOL_SLOTS * CUSPLIT_MAX_TOPK];
-__device__ float _cusplit_stgWt[CUSPLIT_POOL_SLOTS * CUSPLIT_MAX_TOPK];
-__device__ index_t _cusplit_stgSrc[CUSPLIT_POOL_SLOTS];
+alignas(kTdmRowBytes) __device__ index_t _cusplit_stgIdx[CUSPLIT_POOL_SLOTS * CUSPLIT_MAX_TOPK];
+alignas(kTdmRowBytes) __device__ float _cusplit_stgWt[CUSPLIT_POOL_SLOTS * CUSPLIT_MAX_TOPK];
+alignas(kTdmRowBytes) __device__ index_t _cusplit_stgSrc[CUSPLIT_POOL_SLOTS];
 __device__ index_t _cusplit_blkBase[CUSPLIT_MAX_BLOCKS * MORI_EP_WORLD_SIZE];
 __device__ index_t _cusplit_blkCount[CUSPLIT_MAX_BLOCKS * MORI_EP_WORLD_SIZE];
 // Per-token scale rows, staged like the other meta fields so they ship to a peer as
@@ -262,8 +256,8 @@ static_assert(kEpScaleStride == 0 || (size_t)kEpScaleSlots * kEpScaleStride <= (
               "EP scale staging exceeds 1 GiB per compiled variant -- it grows as "
               "world_size^2 * maxTokPerRank * EpScaleStride; re-index it block-locally "
               "before going wider");
-// Rows are already a multiple of 128 apart; __align__ makes the BASE match, which
-// TdmWholeOrSplit128 needs for the same split it uses on the peer side.
+static_assert(EpScaleAlign % kTdmRowBytes == 0,
+              "the scale staging base must sit on a TDM row for the metadata tile to reach it");
 constexpr size_t kEpScaleStgBytes = kEpScaleSlots * (kEpScaleStride > 0 ? kEpScaleStride : 1);
 __device__ __align__(EpScaleAlign) unsigned char _cusplit_stgScale[kEpScaleStgBytes];
 
@@ -533,9 +527,10 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
                           ? (EpPeer<float>(win, peer, args.offOutWts) + (size_t)ab * tkM)
                           : nullptr;
           index_t* dR = EpPeer<index_t>(win, peer, args.offRecvToSrc) + (size_t)ab;
-          const TdmSplit128 spI = TdmWholeOrSplit128((size_t)ab * tkM, nIdxB);
-          const TdmSplit128 spW = (dW != nullptr) ? spI : TdmSplit128{0, 0, 0};
-          const TdmSplit128 spR = TdmWholeOrSplit128((size_t)ab, cc);
+          const TdmSplit128 spI = TdmPlanXfer4B(sI, dI, nIdxB);
+          const TdmSplit128 spW =
+              (dW != nullptr) ? TdmPlanXfer4B(sW, dW, nWtB) : TdmSplit128{0, 0, 0};
+          const TdmSplit128 spR = TdmPlanXfer4B(sR, dR, cc);
           // Scale rides as a fourth field: same run, same tile, one more descriptor.
           // The stride, not the caller's row: it is what puts `ab * kSdw` on a
           // 128 B boundary, so this run gets a body instead of a scalar tail.
@@ -548,7 +543,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
                   ? (EpPeer<unsigned int>(win, peer, args.offOutScales) + (size_t)ab * kSdw)
                   : nullptr;
           const TdmSplit128 spS =
-              (dS != nullptr) ? TdmWholeOrSplit128((size_t)ab * kSdw, nScB) : TdmSplit128{0, 0, 0};
+              (dS != nullptr) ? TdmPlanXfer4B(sS, dS, nScB) : TdmSplit128{0, 0, 0};
           int* tI = reinterpret_cast<int*>(_m4);
           int* tW = tI + ((spI.body + 31) & ~31);
           int* tR = tW + ((spW.body + 31) & ~31);
@@ -558,10 +553,14 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
             __builtin_amdgcn_s_wait_tensorcnt(0);
             _mPend = false;
           }
-          if (spI.body) gI = TdmSplitShape(spI, spI.body);
-          if (spW.body) gW = TdmSplitShape(spW, spW.body);
-          if (spR.body) gR = TdmSplitShape(spR, spR.body);
-          if (spS.body) gS = TdmSplitShape(spS, spS.body);
+          MORI_TDM_CHECK_XFER(sI, dI, nIdxB, spI);
+          MORI_TDM_CHECK_XFER(sW, dW, nWtB, spW);
+          MORI_TDM_CHECK_XFER(sR, dR, cc, spR);
+          MORI_TDM_CHECK_XFER(sS, dS, nScB, spS);
+          if (spI.body) gI = TdmSplitShape(spI);
+          if (spW.body) gW = TdmSplitShape(spW);
+          if (spR.body) gR = TdmSplitShape(spR);
+          if (spS.body) gS = TdmSplitShape(spS);
           if (spI.body) TdmIssueLoad<int>(tI, reinterpret_cast<int*>(sI + spI.head), gI);
           if (spW.body) TdmIssueLoad<int>(tW, reinterpret_cast<int*>(sW + spW.head), gW);
           if (spR.body) TdmIssueLoad<int>(tR, reinterpret_cast<int*>(sR + spR.head), gR);
