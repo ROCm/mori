@@ -1,150 +1,174 @@
-# EP internode v2: where the CCO tail comes from
+# EP internode v2: the "tail" is a bistable whole-run regime
 
-Notes from investigating why the v2 CCO/GDA internode path has a latency tail
-that the shmem/IBGDA path does not. Kept out of the test's module docstring so
-that file stays close in shape to the examples harness it mirrors,
+Notes from investigating why the v2 CCO/GDA internode bench reports a large
+worst/mean ratio at small token counts. Kept out of the test's module docstring
+so that file stays close in shape to the examples harness it mirrors,
 `examples/ops/dispatch_combine/test_dispatch_combine_internode.py`.
 
-CCO's TAIL IS NOT THE FABRIC'S: WHAT SHMEM DOES ON THE SAME WIRE
-----------------------------------------------------------------
-Run the v1 harness in the same session for a reference. It drives the shmem/IBGDA
-transport over the SAME NICs, rails, switch and QoS, at the same shape, so it
-isolates what is specific to the CCO path. Note it spawns its own 8 workers per
-node, so it takes --nproc_per_node=1, not 8:
+Read this before running another A/B on this path. The single most expensive
+mistake available here is to compare two configurations across runs that landed
+in different regimes and believe the difference.
 
-    GPU_PER_NODE=8 MORI_EP_LAUNCH_CONFIG_MODE=AUTO MORI_RDMA_TC=160 MORI_RDMA_SL=5 \\
-    torchrun --nnodes=2 --node_rank=N --nproc_per_node=1 --master_addr=... \\
-      examples/ops/dispatch_combine/test_dispatch_combine_internode.py \\
-      --cmd bench --kernel-type v1_ll --num-qp 1 --max-tokens 4 \\
-      --hidden-dim 6144 --dtype fp8_e4m3_fnuz --combine-dtype bf16 --quant-type none
+WHAT IT ACTUALLY IS
+-------------------
+Not a tail. Every run of the 4-token EP16 bench lands in one of two regimes and
+stays there:
 
-Measured, 29 kept rounds x 16 ranks = 464 samples per phase:
+                     fast regime        slow regime
+    dispatch mean      37-40us            50-70us
+    combine  mean      45-48us            72-79us
+    host wall/round    ~105us             ~150us
 
-                       shmem/IBGDA          CCO/GDA (here)
-    dispatch mean         47.4us              40-47us
-    combine  mean         59.1us              46-52us
-    max/mean              1.19x / 1.18x       2-6x
-    rounds >1.8x base     0 of 29             11 of ~260
-    cross-rank spread     median 9-13us       up to 207us (34 -> 241)
+Per-round series (`MORI_EP_ROUND_SERIES=1`) show the transition directly: a run
+that is going to be slow runs 4-8 rounds at fast-regime numbers, steps up over a
+single round, and holds the higher level for every remaining round. A fast run
+never steps. Within a regime the per-round scatter is small.
 
-Two things follow. CCO is FASTER in the mean -- combine by ~20% -- so the port is
-not simply worse. And the tail belongs to the CCO path, not to the fabric: shmem
-shares every wire and shows no spiked round at all, which rules out the rail and
-switch explanations that the {i, i+8} pattern below otherwise suggests.
+The reported worst/mean ratio is an artifact of this: the mean is a blend of the
+two levels, so a run that stepped early reports ~2.3x while the same binary that
+did not step reports ~1.2x. Chasing "the tail" as if it were a few bad rounds is
+chasing the wrong shape.
 
-Both harnesses do have a huge round 0 (shmem's spans 83-614us) and both drop 1.
+IT IS ENVIRONMENTAL, AND WE AMPLIFY IT
+--------------------------------------
+Interleaved against the #625 baseline (v1 host + the same v2 CCO kernels, so the
+same transport on the same wire), four pairs back to back:
 
-READING THE PER-RANK SERIES (MORI_EP_ROUND_SERIES)
---------------------------------------------------
-Every rank prints its own per-round series. These are spin-wait collectives, so
-the rank that arrives LAST waits LEAST: on a slow round the straggler is the
-MINIMUM, not the maximum, and the other fifteen are just showing what they waited
-for. Threshold per NODE, not globally -- the two nodes routinely sit at different
-levels in the same round (151 vs 237us was measured), and a global threshold then
-misses a rank that is low within its own node.
+                    #625 dispatch   #625 combine   ours dispatch   ours combine
+    fast pair 1        39.8            41.8           40.3            48.1
+    fast pair 2        38.4            40.3           38.0            47.4
+    slow pair 3        41.1            51.0           52.8            78.7
+    slow pair 4        40.7            50.6           69.9            72.0
 
-The shape of the low set says what happened, and they are not all the same:
+Both implementations step into the slow regime on the same runs -- so the trigger
+is environmental, not ours -- but ours degrades about three times as far
+(combine +60% against #625's +22%, dispatch +32% against +2%). Whatever the
+trigger is, our path is more sensitive to it. That sensitivity is the thing worth
+fixing; the trigger itself is not in our code.
 
-  {i, i+8}          one RAIL. Local rank i selects bnxt_re_bond<i> ("rank 1
-                    rankInNode 1 select device [1] bnxt_re_bond1"), so the same
-                    local index on both nodes is one NIC-to-NIC path.
-  {i}               one rank.
-  all of one node    a node-level event; the other node's eight ranks all wait.
-  empty             every rank waited, including the fastest -- no straggler
-                    exists and no single card can explain it.
+The step is NOT caused by, all eliminated by direct measurement:
 
-Measured over 11 spiked rounds in 9 runs: 5 empty, 3 rail pairs (rails 1, 5 and 7,
-once each), 2 single ranks, 1 other. So no one card is at fault; when there is a
-straggler its identity rotates.
+  * the caching allocator -- `segment.all.allocated`, `num_device_alloc` and
+    `num_alloc_retries` are all +0 across the timed loop, in every run
+  * launch-queue depth -- `--per-round-drain` (a bare `cuda.synchronize()` each
+    round, no barrier) does not remove the step
+  * warm-up -- `--warmup 200` steps at the same place as `--warmup 20`
+  * RoCE congestion or loss -- `~/harness/_nic_snap.sh` before and after: 0 for
+    np_ecn_marked_roce_packets, np_cnp_sent, rp_cnp_handled, out_of_sequence,
+    packet_seq_err, roce_adp_retrans, rx/tx_roce_discards, out_of_buffer
+  * PFC pause -- `~/harness/_pfc_snap.sh`: rx/tx_pfc_ena_frames_pri5 and the
+    pri5 transition counters are all +0, fast runs and slow runs alike
+  * GPU clocks -- sampling pp_dpm_{sclk,fclk,socclk} across the loop window puts
+    sclk within 4% and fclk, if anything, HIGHER on the slow runs
+  * the host -- see below
 
-## CORRECTION: the tail is not the transport's alone
+`--per-round-sync` cannot be used to test any of this: its gloo barrier costs
+~1.3ms a round here and injects far more rank skew than it removes (dispatch
+reads ~1370us under it). `--per-round-drain` is the usable version.
 
-An earlier revision of this file concluded "the tail belongs to the CCO path, not
-the fabric", from shmem-vs-CCO. That compared two transports AND two kernels at
-once. Adding the missing arm -- the #625 baseline, which is v1's host code with
-its `_launch_multi` redirected to the v2 CCO plans, so same transport and
-effectively the same kernels -- splits it in two. Interleaved, six pairs at 4
-tokens, max/mean:
+WHERE THE EXCESS LANDS: THE PER-PASS SPLIT
+------------------------------------------
+`MORI_EP_SPLIT_PASSES=1` launches the eight passes individually instead of as one
+`LaunchGroup` and stamps an event after each, then prints, per rank, the round
+series and the three worst rounds broken down against the median round. Splitting
+roughly triples the absolute numbers -- eight ABI crossings instead of one, and
+every rank's spin-wait pass absorbs the others' launch skew -- so read the
+deltas, not the levels.
 
-                        dispatch      combine
-    shmem / IBGDA        1.16          1.23
-    CCO/GDA, #625 base   1.27-1.31     1.46-1.56
-    CCO/GDA, this branch 2.31          1.75
+Dispatch, worst round against median (three ranks agreeing):
 
-So there are two separate effects:
+    copystaging     7.0us     median 7.0us      +0.0
+    dispatch_ll   304-307us   median 114us    +190us
 
-  * COMBINE's tail is mostly the transport's: CCO adds +27% over shmem, this
-    branch adds only +12% on top.
-  * DISPATCH's tail is mostly OURS: CCO adds +13% over shmem, this branch adds
-    +76% on top. The #625 baseline never exceeded 1.44 in six runs and had zero
-    spiked rounds; this branch reaches 2.1-3.3 in five of six.
+Combine:
 
-Note also that this branch is FASTER in the mean than the baseline it replaces --
-dispatch -7%, combine -14% over those same six pairs -- so the trade is mean for
-tail, not a plain regression.
+    combinesync           6.4us    median 6.4us     +0.0
+    combine_ll           29.6us    median 29.4us    +0.2
+    combinesyncbarrier  152.3us    median 79.0us   +73.4
+    combineall            6.1us    median 7.0us     -0.8
 
-## Ruled out for the dispatch tail
+So on both legs the entire excess is in the one pass that waits on peers, and
+none of it is in the passes that do local work. `combine_ll` -- combine's actual
+data movement -- is flat to 1% even on the worst round: combine has no tail of
+its own, it inherits one through its barrier. Any fix aimed at combine's
+data path is aimed at the wrong pass.
 
-The architectural difference is host-side: #625 keeps v1's op (its buffers, its
-argument building, its geometry from v1's JSON tuning tables) and only redirects
-the launch, whereas this branch is v2-native (SymmArena, LaunchGroup, its own
-tuning table). Checked and NOT the cause:
+THE HOST IS NOT THE PACER (and how that was settled)
+----------------------------------------------------
+`MORI_EP_ROUND_SERIES=1` prints, per rank, five aligned series: `disp`, `conv`,
+`comb` (GPU, from the events), `hdis`/`hcom` (host time inside the two calls) and
+`hwal` (host wall per round).
 
-  * Kernel logic. A normalised diff over the 27 functions present in both leaves
-    only renames, `if constexpr` for the quant branch, and two guards that REMOVE
-    work (the local-node skip, required because ccoGda has no P2P path).
-  * Region packing. SymmArena packs regions 256B-aligned in one window where v1
-    allocates separately, but the per-region sizes are identical, so the
-    cache-line sharing a peer's RDMA writes contend on is the same.
-  * Counter zeroing. total_recv is a local tensor cleared in-stream by
-    copystaging; node_recv_token_num is zeroed in the combine path of BOTH.
-  * Launch geometry. The two run different geometries -- v1's table gives
-    dispatch 16/10/4 at 4 tokens against our 32/16/4 -- but running ours at v1's
-    geometry does not move the tail: 1.67/2.31/1.21 against 1.22/1.22/2.00.
+The host cost inside the measured windows is real and large -- ~15us in dispatch
+and ~25us in combine, i.e. roughly 40 of the ~85us "kernel" total is the Python
+wrapper. But it is not what moves:
 
-## Not resolved
+  * rounds where `hdis` or `hcom` spike to 50-60us show completely normal `disp`
+    and `comb`. The GPU is behind, so it absorbs a host hiccup entirely.
+  * rounds where `disp` or `comb` spike to 150-300us show completely normal
+    `hdis`/`hcom`/`hwal`.
+  * summed over a 60-round loop, `hwal` (~86us/round) is far below
+    disp+conv+comb (~141us/round) and `wall` -- which is measured after the final
+    `cuda.synchronize()` -- matches the GPU sum. The host runs ahead and the GPU
+    is the bottleneck.
 
-The dispatch tail is bimodal in itself: the same geometry has produced 1.22 and
-2.31 in the same afternoon. That is why three-run comparisons cannot separate
-mechanisms here, and why the numbers above are six interleaved pairs rather than
-two batches. Whatever it is, it is host-side and intermittent, and it was not
-found by reading.
+Over a long run (5000 rounds) the two converge exactly: wall 94.5us/round against
+disp+conv+comb 94.3us/round.
 
-## Eliminated by direct measurement
+READING THE PER-RANK SERIES
+---------------------------
+These are spin-wait collectives, so a stall on one rank appears as a long phase
+on every OTHER rank; the culprit is the rank reporting the SHORTEST time. Both
+nodes must be read together (`/tmp/v2n_rank0.log` and `/tmp/v2n_rank1.log`).
 
-Each of these was tested and came back negative, rather than argued away:
-garbage collection (traced per round -- zero collections during the timed loop),
-GPU clocks (identical 1650-1780MHz in fast and slow runs), host launch-queue
-saturation (~50us of headroom, and the slow regime has more), RoCE traffic class
-(interleaved A/B over four pairs, within noise), host load average (six runs
-across loadavg 11.5-15.3, no ordering), a single bad GPU, a single bad rail, QP
-count, window cacheability, and process topology (`--spawn` reproduces the
-examples harness's process tree; interleaved A/B is equal in the mean and keeps
-the tail under both).
+Two shapes seen, and they mean different things:
 
-## Where the time actually goes
+  * both nodes long in the same phase on the same round -- one ~120us delivery
+    delay that everyone waited out.
+  * node 0 long in combine while node 1 is long in dispatch on the same round --
+    the same single event, seen from the two sides of a phase-offset pipeline.
+    Do not read this as two separate problems.
 
-`MORI_EP_SPLIT_PASSES=1` launches the pass sequence one plan at a time with a
-timing event after each -- the only way to attribute a slow round to a kernel,
-since the launch group crosses the ABI once and runs the passes back to back.
-Worst round against the median round of the same phase, three runs at 4 tokens:
+A step that appears on one node only (node 0's ranks step, node 1's stay flat for
+the whole run) is also seen. In that case node 1 is not waiting at all: its
+time lands outside the measured windows.
 
-    copystaging          median   7.0   worst   7.1   delta  +0.1
-    dispatch_ll          median  49.2   worst 109.3   delta +60.1
-    combinesync          median   6.4   worst   6.5   delta  +0.1
-    combinesyncbarrier   median  24.3   worst  34.9   delta +10.6
-    combine_ll           median  47.4   worst  69.5   delta +22.1
-    combineall           median   7.1   worst   6.5   delta  -0.6
+RIG RECIPE
+----------
+Ours, and the #625 baseline for comparison:
 
-Every microsecond of the excess is in the passes that wait on remote data; the
-three purely local passes are constant to within 0.2us.
+    EXTRA_ENV="-e MORI_EP_ROUND_SERIES=1" bash ~/harness/_run_v2native.sh PORT \\
+      --cmd bench --kernel-type v1_ll --num-qp 1 --max-tokens 4 --rounds 60 \\
+      --dtype fp8_e4m3_fnuz --combine-dtype bf16 --hidden-dim 6144 --topk 8 \\
+      --experts-per-rank 16 --scale-dim 32
 
-It is also not the fabric erroring. Summing the bnxt RoCE hardware counters over
-all eight devices before and after each run -- packet_seq_err, out_of_sequence,
-implied_nak_seq_err, local_ack_timeout_err, max_retry_exceeded,
-rnr_nak_retry_err, roce_adp_retrans, roce_slow_restart, rx/tx_roce_discards,
-out_of_buffer, np_ecn_marked_roce_packets, np_cnp_sent, rp_cnp_handled,
-duplicate_request -- every delta was zero across four runs including the slowest
-(139.1us total, worst 155/163).
+    bash ~/harness/_run_cust.sh PORT --cmd bench --kernel-type v1_ll --num-qp 1 \\
+      --max-tokens 4 --dtype fp8_e4m3_fnuz --combine-dtype bf16 \\
+      --hidden-dim 6144 --topk 8
 
-Not root-caused.
+Both need `--nproc_per_node=1` (the runners set it): each spawns its own 8
+workers per node. `MORI_RDMA_TC=160 MORI_RDMA_SL=5` are set by the runners.
+
+METHOD
+------
+  * Always interleave A/B. Because of the regime, the same configuration back to
+    back has read 85us and 134us total. A non-interleaved sweep will hand you a
+    winner that is really just a run that did not step.
+  * Judge a candidate by a PAIRED comparison against a FIXED incumbent, never by
+    a chain in which each winner becomes the next incumbent -- five repeats of
+    the greedy shape returned five different winners. See `_tune`.
+  * Prefer max/mean over the mean when comparing across sessions: the mean drifts
+    with the regime, the ratio is more stable. But now that the regime is known,
+    reporting which regime each run landed in is better than either.
+  * Compile the kernel offline before going to the cluster. A TU instantiating
+    all eight `MORI_EP_INTERNODE_CCO_ENTRY*` entries reports every template error
+    at once; finding them one per cluster run costs an afternoon.
+
+NEXT
+----
+Everything outside the GPU has been eliminated, and the per-pass split puts the
+excess inside `dispatch_ll` and inside `combinesyncbarrier` -- both of which mix
+posting with waiting, so the split cannot go further from the host side. The next
+step is device-side timestamps inside `dispatch_ll` separating the send-post from
+the receive spin, which would say whether the extra time is spent getting the
+data out or waiting for a peer's.

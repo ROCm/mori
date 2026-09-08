@@ -63,8 +63,9 @@ only traffic on the fabric. It is worth setting because a number measured in the
 wrong traffic class does not transfer to a shared one, not because it is a
 speedup.
 
-Findings from the CCO-vs-shmem investigation -- why the tail is CCO-specific, and
-how to read the per-rank series for straggler attribution -- live in
+What the tail investigation found -- that it is not a tail but a bistable
+whole-run regime, what has been eliminated as its cause, and how to read the
+per-rank series and the per-pass split -- lives in
 ``docs/EP_INTERNODE_V2_TAIL.md`` rather than here, so this file stays close in
 shape to the examples harness it mirrors.
 
@@ -184,7 +185,9 @@ def _parse_args(argv):
     p.add_argument("--tuning-reps", type=int, default=3)
     # Smoke-test / bisect aid: stop after N candidates (0 = sweep all).
     p.add_argument("--tuning-limit", type=int, default=0)
-    p.add_argument("--tuning-phase", default="dispatch", choices=["dispatch", "combine"])
+    p.add_argument(
+        "--tuning-phase", default="dispatch", choices=["dispatch", "combine"]
+    )
     # Validation mode: sweep exactly one named candidate against the shipped
     # geometry. A sweep winner is chosen by a greedy chain of paired tests, each
     # with its own error; before it is written into the table it gets one long
@@ -234,6 +237,12 @@ def _parse_args(argv):
     # than kernel work. It folds the barrier wait into the next round's dispatch
     # window, so dispatch is not clean under it -- combine is.
     p.add_argument("--per-round-sync", action="store_true")
+    # Sync WITHOUT the barrier. --per-round-sync costs ~1.3ms a round here (gloo
+    # over TCP) and injects more rank skew than it removes, so it cannot test the
+    # one thing it was meant to. This keeps the local launch queue drained --
+    # which is the question when the host is running ahead -- and adds nothing
+    # cross-rank.
+    p.add_argument("--per-round-drain", action="store_true")
     # Both members of the LL / non-LL pair are compiled either way; this picks
     # which one runs. Default (None) leaves the backend's token-count rule alone,
     # which selects LL below 2048 tokens. Naming it explicitly is what makes a
@@ -326,7 +335,11 @@ def _v1_loop_defaults():
     import ast
 
     path = os.path.join(
-        _ROOT, "examples", "ops", "dispatch_combine", "test_dispatch_combine_internode.py"
+        _ROOT,
+        "examples",
+        "ops",
+        "dispatch_combine",
+        "test_dispatch_combine_internode.py",
     )
     names = {
         "_EP_ROUNDS": "rounds",
@@ -461,12 +474,35 @@ def _bench(op, cfg, d, dev, a, comm):
     if _marks is not None:
         del _marks[:]
 
+    _series = bool(os.environ.get("MORI_EP_ROUND_SERIES"))
+
+    # Caching-allocator segments, opt-in. A cudaMalloc inside the timed loop
+    # blocks the host for ~100us and lands on every rank in the same round (the
+    # ranks are symmetric), which is exactly what an early-round synchronous
+    # spike looks like. Counting segments before and after says whether any
+    # happened, without having to infer it from the shape of the series.
+    _seg = _series and torch.cuda.memory_stats()
+
+    # Host time INSIDE the two calls, plus a host timestamp per round. The phase
+    # events bracket the call, so whatever the wrapper does on the host before
+    # the launch lands in the reported phase time and is indistinguishable from
+    # kernel time there; this is what separates them. Off unless the series is
+    # asked for -- perf_counter is only ~0.1us, but it would sit inside the
+    # measured window and the default path should carry nothing it does not need.
+    hd = [0.0] * n
+    hc = [0.0] * n
+    tr = [0.0] * (n + 1)
+
+    _ep0 = time.time()
     t0 = time.perf_counter()
     ev[0].record()
 
-
     for i in range(n):
+        if _series:
+            tr[i] = time.perf_counter()
         r = op.dispatch(inp, wts, sc, idx, return_routing=True)
+        if _series:
+            hd[i] = (time.perf_counter() - tr[i]) * 1e6
         ev[3 * i + 1].record()
         x = convert(r[0])
         ev[3 * i + 2].record()
@@ -474,11 +510,19 @@ def _bench(op, cfg, d, dev, a, comm):
             t = time.perf_counter()
             while time.perf_counter() - t < inject:
                 pass
+        if _series:
+            _h = time.perf_counter()
         op.combine(x, cw, routing=r[5])
+        if _series:
+            hc[i] = (time.perf_counter() - _h) * 1e6
         ev[3 * i + 3].record()
         if a.per_round_sync:
             torch.cuda.synchronize()
             comm.barrier()
+        elif a.per_round_drain:
+            torch.cuda.synchronize()
+    if _series:
+        tr[n] = time.perf_counter()
     torch.cuda.synchronize()
     wall = (time.perf_counter() - t0) * 1e6 / n
     # Which PASS owns the slow round. The marks are (name, event) in launch
@@ -486,7 +530,7 @@ def _bench(op, cfg, d, dev, a, comm):
     # Consecutive deltas are per-pass GPU durations, so the round with the largest
     # total can be broken down against the median round of the same phase -- which
     # is the question, since the tail is a few rounds and the median is the rest.
-    if _marks and d.rank == 0:
+    if _marks:
         per_round = []  # [(phase, [(name, us), ...]), ...] in order
         cur_name, cur_ev, cur = None, None, []
         for name, evm in _marks:
@@ -506,23 +550,31 @@ def _bench(op, cfg, d, dev, a, comm):
             if not rounds:
                 continue
             totals = [sum(v for _, v in r) for r in rounds]
-            wi = max(range(len(totals)), key=totals.__getitem__)
             order = sorted(range(len(totals)), key=totals.__getitem__)
             mi = order[len(order) // 2]
-            names = [nm for nm, _ in rounds[wi]]
+            names = [nm for nm, _ in rounds[mi]]
+            # EVERY rank prints. The tail is measured over rounds x ranks and a
+            # spike is usually on one rank, so a rank-0-only breakdown reports the
+            # median round of a quiet rank and says nothing about the tail.
+            pfx = f"# SPLIT[{d.rank}] {phase}"
             print(
-                f"# SPLIT {phase}: worst round {wi} = {totals[wi]:.1f}us, "
-                f"median round = {totals[mi]:.1f}us",
+                f"{pfx}: mean={sum(totals) / len(totals):.1f} "
+                f"max={totals[order[-1]]:.1f} med={totals[mi]:.1f} "
+                f"ratio={totals[order[-1]] / (sum(totals) / len(totals)):.2f}",
                 flush=True,
             )
-            for k, nm in enumerate(names):
-                w, m = rounds[wi][k][1], rounds[mi][k][1]
-                print(
-                    f"#    {nm:<20} worst={w:8.1f}  median={m:7.1f}  "
-                    f"delta={w - m:+8.1f}",
-                    flush=True,
-                )
-
+            print(f"{pfx} rounds: " + " ".join(f"{t:.0f}" for t in totals), flush=True)
+            # Top 3, not just the worst: one round can be an artifact, three
+            # agreeing on the same pass is a mechanism.
+            for wi in reversed(order[-3:]):
+                print(f"{pfx} round {wi} = {totals[wi]:.1f}us vs med {totals[mi]:.1f}")
+                for k, nm in enumerate(names):
+                    w, m = rounds[wi][k][1], rounds[mi][k][1]
+                    print(
+                        f"#    {nm:<20} this={w:8.1f}  median={m:7.1f}  "
+                        f"delta={w - m:+8.1f}",
+                        flush=True,
+                    )
 
     # Host profile, opt-in. Whenever wall exceeds dispatch+combine the loop above
     # is host-paced, and then its phase numbers are wrapper cost rather than
@@ -578,13 +630,50 @@ def _bench(op, cfg, d, dev, a, comm):
     # spin-wait collectives, so one slow rank shows as a slow round on all of
     # them and only the rank-local series separates a straggler from a
     # whole-round event. See docs/EP_INTERNODE_V2_TAIL.md for how to read it.
-    if os.environ.get("MORI_EP_ROUND_SERIES"):
+    if _seg:
+        now = torch.cuda.memory_stats()
+        keys = ("segment.all.allocated", "num_alloc_retries", "num_device_alloc")
+        print(
+            "# alloc r%d: " % d.rank
+            + " ".join(
+                f"{k.split('.')[-1]}+{now.get(k, 0) - _seg.get(k, 0)}" for k in keys
+            ),
+            flush=True,
+        )
+
+    if _series:
         print(
             "# rounds r%d disp: " % d.rank + " ".join("%.0f" % x for x in disp),
             flush=True,
         )
         print(
             "# rounds r%d comb: " % d.rank + " ".join("%.0f" % x for x in comb),
+            flush=True,
+        )
+        print(
+            "# rounds r%d hdis: " % d.rank + " ".join("%.0f" % x for x in hd[keep]),
+            flush=True,
+        )
+        print(
+            "# rounds r%d hcom: " % d.rank + " ".join("%.0f" % x for x in hc[keep]),
+            flush=True,
+        )
+        # Host wall per round and the convert window. With disp/comb/hdis/hcom
+        # above, these close the accounting: a round whose hwal exceeds
+        # disp+conv+comb has a hole somewhere the other series do not cover.
+        print(
+            "# rounds r%d conv: " % d.rank + " ".join("%.0f" % x for x in conv),
+            flush=True,
+        )
+        # Epoch bounds of the timed loop, so an external sampler (clocks, NIC)
+        # can be lined up with it. perf_counter has no epoch; time.time does.
+        print(
+            "# loop r%d t0=%.4f t1=%.4f" % (d.rank, _ep0, time.time()),
+            flush=True,
+        )
+        hwal = [(tr[i + 1] - tr[i]) * 1e6 for i in range(n)][keep]
+        print(
+            "# rounds r%d hwal: " % d.rank + " ".join("%.0f" % x for x in hwal),
             flush=True,
         )
 
@@ -613,7 +702,6 @@ def _bench(op, cfg, d, dev, a, comm):
             flush=True,
         )
     return 0
-
 
 
 def _timed_pass(op, cfg, d, a, inp, idx, wts, sc, cw, convert, n, warm):
@@ -701,7 +789,11 @@ def _tune(cfg, d, dev, a, comm):
     warps = [4, 8, 16] if a.tuning_scope == "quick" else [4, 6, 8, 12, 16]
 
     def rdmas(bn):
-        frac = (bn // 2, bn * 2 // 3) if a.tuning_scope == "quick" else (bn // 4, bn // 2, bn * 2 // 3)
+        frac = (
+            (bn // 2, bn * 2 // 3)
+            if a.tuning_scope == "quick"
+            else (bn // 4, bn // 2, bn * 2 // 3)
+        )
         return sorted({v for v in frac if 1 <= v < bn})
 
     cands = [(b, r, w) for b in sorted(blocks) for w in warps for r in rdmas(b)]
@@ -712,7 +804,9 @@ def _tune(cfg, d, dev, a, comm):
 
     from mori.ops.dispatch_combine_v2.internode_tuning_configs import lookup
 
-    tbl = lookup(cfg.world_size, cfg.hidden_dim, cfg.num_experts_per_token, a.max_tokens)
+    tbl = lookup(
+        cfg.world_size, cfg.hidden_dim, cfg.num_experts_per_token, a.max_tokens
+    )
     # The incumbent is the SHIPPED pair, so a win means "better than what we ship".
     inc_d = tuple(tbl["dispatch"]) if tbl else cands[0]
     inc_c = tuple(tbl["combine"]) if tbl else cands[0]
@@ -732,7 +826,11 @@ def _tune(cfg, d, dev, a, comm):
     rng = torch.Generator(device=dev)
     rng.manual_seed(4242 + d.rank)
     inp, idx, wts, sc = _gen_round(rng, cfg, a.max_tokens, dev, cfg.dispatch_dtype)
-    convert = (lambda x: x.to(cfg.combine_dtype)) if cfg.is_asymmetric_dtype else (lambda x: x)
+    convert = (
+        (lambda x: x.to(cfg.combine_dtype))
+        if cfg.is_asymmetric_dtype
+        else (lambda x: x)
+    )
     cw = wts if a.bench_weights else None
 
     # Only the swept phase varies; the other stays at the shipped value, because
@@ -767,10 +865,14 @@ def _tune(cfg, d, dev, a, comm):
         bt, ct_ = [], []
         bph, cph = [], []  # (dispatch, combine) per rep, to show the coupling
         for _ in range(a.tuning_reps):
-            dv, cv = _timed_pass(best_op, cfg, d, a, inp, idx, wts, sc, cw, convert, a.rounds, a.warmup)
+            dv, cv = _timed_pass(
+                best_op, cfg, d, a, inp, idx, wts, sc, cw, convert, a.rounds, a.warmup
+            )
             bt.append(pick(dv, cv))
             bph.append((dv, cv))
-            dv, cv = _timed_pass(cand_op, cfg, d, a, inp, idx, wts, sc, cw, convert, a.rounds, a.warmup)
+            dv, cv = _timed_pass(
+                cand_op, cfg, d, a, inp, idx, wts, sc, cw, convert, a.rounds, a.warmup
+            )
             ct_.append(pick(dv, cv))
             cph.append((dv, cv))
         bm, cm = sorted(bt)[len(bt) // 2], sorted(ct_)[len(ct_) // 2]
