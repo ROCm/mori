@@ -174,14 +174,10 @@ def _parse_args(argv):
     p.add_argument("--combine-dtype", default=None, choices=list(_DTYPES))
     p.add_argument("--quant-type", default="none", choices=["none", "fp8_direct_cast"])
     p.add_argument("--num-qp", type=int, default=2)
-    # 30, matching _EP_ROUNDS in the examples harness -- and for the reason its
-    # comment gives, which applies here with full force: the CCO/GDA path reaches
-    # steady state slowly, so at 10 rounds its per-round jitter does not average
-    # out and the mean swings ~20% run to run. This defaulted to 3 while claiming
-    # alignment, which with --drop-rounds 1 keeps rounds 1 and 2 -- precisely the
-    # two that harness documents as still elevated. A single spike then carries
-    # half the average AND is the reported worst, so this side read a wide tail
-    # against a 29-round mean. Not a small-sample caveat: a different estimator.
+    # 30, matching _EP_ROUNDS in the examples harness. Lower is not a
+    # small-sample caveat but a different estimator: at --rounds 3 with
+    # --drop-rounds 1 the two kept rounds are the ones that harness documents as
+    # still in the CCO ramp, so one spike carries half the mean AND is the worst.
     p.add_argument("--rounds", type=int, default=30)
     p.add_argument("--scale-dim", type=int, default=0)
     p.add_argument("--tuning-scope", default="quick", choices=["quick", "full"])
@@ -349,14 +345,10 @@ def _v1_loop_defaults():
         key = names.get(getattr(tgt, "id", None))
         if key is None:
             continue
-        # `int(os.environ.get("MORI_EP_ROUNDS") or "30")` -- the default is the
-        # only digit-string literal in the expression.
-        #
-        # Accept both spellings of a string literal. Python >= 3.8 gives
-        # ast.Constant; 3.6/3.7 give ast.Str, and the host python here is 3.6
-        # while the container's is 3.12. Matching only Constant makes this
-        # silently return {} on the older one -- which would disable the very
-        # check whose absence caused the problem it exists to catch.
+        # The default is the only digit-string literal in the expression. Accept
+        # both spellings: 3.8+ gives ast.Constant, 3.6/3.7 ast.Str, and matching
+        # only Constant silently returns {} on the older one -- disabling the
+        # very check whose absence caused the problem it exists to catch.
         for sub in ast.walk(node.value):
             lit = None
             if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
@@ -421,12 +413,9 @@ def _bench(op, cfg, d, dev, a, comm):
     if a.kernel_type is not None:
         op._internode_force_ll = a.kernel_type == "v1_ll"
 
-    # Check BEFORE measuring, as bench_dispatch_combine does (it runs
-    # run_test_once and asserts before run_bench_once). A configuration that is
-    # silently wrong still produces timings, and this harness has shipped two of
-    # those -- the weight fold reading the wrong buffer, and both legs compiled
-    # with the dispatch dtype. One round, folding weights whatever --bench-weights
-    # says, because the point is to check them.
+    # Check BEFORE measuring, as bench_dispatch_combine does: a silently wrong
+    # configuration still produces timings. Always folds weights, whatever
+    # --bench-weights says, because the point is to check them.
     ok = _verify_once(op, cfg, d, dev, a, comm, inp, idx, wts, sc)
     bad = d.allreduce_sum(0 if ok else 1)
     if bad:
@@ -459,15 +448,10 @@ def _bench(op, cfg, d, dev, a, comm):
     torch.cuda.synchronize()
     comm.barrier()
 
-    # Causal test for "is the host pacing the GPU", opt-in. Busy-waits a known
-    # number of microseconds on the HOST between the convert-end event and the
-    # combine enqueue -- pure host time, no GPU work, no extra kernel. If the
-    # host is running ahead of the GPU, the GPU still has queued work to chew on
-    # and the measured combine barely moves. If the GPU is already waiting on the
-    # host, the injected delay is added GPU idle inside the combine window and
-    # the measured combine rises by about the injected amount. The slope of
-    # measured-combine against injected microseconds is the answer, and it needs
-    # no assumption about what any window "should" cost.
+    # Causal probe for host pacing, opt-in: busy-wait known host microseconds
+    # before the combine enqueue, no GPU work. The slope of measured-combine
+    # against injected microseconds is the answer (measured ~1.0 beyond ~30us of
+    # headroom), and it assumes nothing about what a window "should" cost.
     inject = float(os.environ.get("MORI_EP_INJECT_HOST_US") or 0) / 1e6
 
     # Per-pass marks accumulate inside the backend when MORI_EP_SPLIT_PASSES is
@@ -582,37 +566,18 @@ def _bench(op, cfg, d, dev, a, comm):
     keep = slice(a.drop_rounds, None)
     disp = [ev[3 * i].elapsed_time(ev[3 * i + 1]) * 1e3 for i in range(n)][keep]
     comb = [ev[3 * i + 2].elapsed_time(ev[3 * i + 3]) * 1e3 for i in range(n)][keep]
-    # The third window, which neither harness reports and which is the honest
-    # host-gap meter.
-    #
-    # The events TILE the timed region: ev[3i+3] ends round i's combine and IS
-    # ev[3(i+1)], the start of round i+1's dispatch window. There is no gap
-    # between windows for host time to hide in -- every microsecond between
-    # ev[0] and ev[3n] is inside exactly one of the three. So if the host falls
-    # behind, the GPU idles at the head of whichever segment it is waiting for
-    # and that idle is charged to that window as if it were kernel time.
-    #
-    # This window contains ONE cast. Its kernel cost is a few microseconds at
-    # these token counts and does not grow with anything we tune, so whatever it
-    # reads above that is GPU idle waiting for the host -- which makes it a
-    # measure of host lag that does not require trusting `wall`. (`wall` cannot
-    # show this: wall - (dispatch + combine) is this window BY CONSTRUCTION, so
-    # quoting that difference as evidence of host pacing assumes the conclusion.)
+    # The events TILE the timed region -- ev[3i+3] ends round i's combine and IS
+    # ev[3(i+1)] -- so host time cannot hide between windows: if the host falls
+    # behind, the GPU idles at the head of a segment and that idle is charged to
+    # it as kernel time. This window holds one cast, whose cost is small and
+    # fixed, so what it reads above that is host lag. (wall - (dispatch+combine)
+    # IS this window by construction, so it cannot be used as evidence instead.)
     conv = [ev[3 * i + 1].elapsed_time(ev[3 * i + 2]) * 1e3 for i in range(n)][keep]
 
-    # Which round stalled, opt-in. EVERY rank prints its own series, because the
-    # question the averages cannot answer is whether a spike lands on the same
-    # round index across ranks or on one rank alone:
-    #   same round, all ranks   -> a whole-round event; every rank waits for the
-    #                              same thing, so the cause is host-side (a launch
-    #                              that took longer to build, an allocation, GC)
-    #                              or a fabric stall that stops everyone.
-    #   one rank, one round     -> a straggler; the others are only showing the
-    #                              spin-wait for it. Chasing the peak on the ranks
-    #                              that merely waited leads nowhere.
-    # These are collective kernels, so a single slow rank prints as a slow round
-    # on all of them -- which is why the RANK-LOCAL series is what separates the
-    # two, and rank 0's alone cannot.
+    # Which round stalled, opt-in. EVERY rank prints its own series: these are
+    # spin-wait collectives, so one slow rank shows as a slow round on all of
+    # them and only the rank-local series separates a straggler from a
+    # whole-round event. See docs/EP_INTERNODE_V2_TAIL.md for how to read it.
     if os.environ.get("MORI_EP_ROUND_SERIES"):
         print(
             "# rounds r%d disp: " % d.rank + " ".join("%.0f" % x for x in disp),
@@ -809,18 +774,11 @@ def _tune(cfg, d, dev, a, comm):
             ct_.append(pick(dv, cv))
             cph.append((dv, cv))
         bm, cm = sorted(bt)[len(bt) // 2], sorted(ct_)[len(ct_) // 2]
-        # PAIRED comparison, not a difference of medians. The two arms are
-        # measured alternately inside one rep, so both see the same regime -- and
-        # the regime moves a lot during a sweep: the SAME incumbent geometry has
-        # read 84.9us on one candidate and 126.0us on the next. Differencing
-        # within a rep cancels that; differencing the medians does not, and the
-        # first version of this promoted three candidates on gaps under 1us
-        # (125.7 vs 126.0) that were pure regime noise being written into the
-        # table as if they were tuning results.
-        #
-        # The margin is then a floor on how big the paired improvement has to be.
-        # v1's equivalent (MORI_EP_TUNING_MARGIN) defaults to 0 -- any improvement
-        # wins -- which is safe at its 1.19x max/mean and is not safe here.
+        # PAIRED, not a difference of medians: the regime moves during a sweep
+        # (the same incumbent geometry has read 84.9us on one candidate and
+        # 126.0us on the next), and differencing within a rep cancels that. The
+        # margin then floors the improvement; v1's equivalent defaults to 0,
+        # which is safe at its 1.19x max/mean and not here.
         diffs = sorted(c - b_ for b_, c in zip(bt, ct_))
         lo, hi = diffs[0], diffs[-1]
         dmed = diffs[len(diffs) // 2]
