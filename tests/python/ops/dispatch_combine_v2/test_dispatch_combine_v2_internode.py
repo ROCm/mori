@@ -289,14 +289,18 @@ def _bench(op, cfg, d, dev, a, comm):
 
     cw = wts if a.bench_weights else None
 
+    # Allocated before the warmup, where run_bench_once allocates them. (Priming
+    # them with a record here was tried and did not move the tail, so it is not
+    # done -- run_bench_once does not either.)
+    n = a.rounds
+    ev = [torch.cuda.Event(enable_timing=True) for _ in range(3 * n + 1)]
+
     for _ in range(a.warmup):
         r = op.dispatch(inp, wts, sc, idx, return_routing=True)
         op.combine(convert(r[0]), cw, routing=r[5])
     torch.cuda.synchronize()
     comm.barrier()
 
-    n = a.rounds
-    ev = [torch.cuda.Event(enable_timing=True) for _ in range(3 * n + 1)]
     t0 = time.perf_counter()
     ev[0].record()
     for i in range(n):
@@ -348,6 +352,13 @@ def _bench(op, cfg, d, dev, a, comm):
     keep = slice(a.drop_rounds, None)
     disp = [ev[3 * i].elapsed_time(ev[3 * i + 1]) * 1e3 for i in range(n)][keep]
     comb = [ev[3 * i + 2].elapsed_time(ev[3 * i + 3]) * 1e3 for i in range(n)][keep]
+
+    # Which round stalled, opt-in. A worst that lands on the same round in both
+    # phases is a whole-round event (host); one that moves between ranks is
+    # fabric. The averages cannot tell those apart.
+    if os.environ.get("MORI_EP_ROUND_SERIES") and d.rank == 0:
+        print("# rounds disp: " + " ".join("%.0f" % x for x in disp), flush=True)
+        print("# rounds comb: " + " ".join("%.0f" % x for x in comb), flush=True)
 
     # AVERAGE over rounds x ranks, plus BEST and WORST over the same sample set --
     # the three numbers run_bench_once prints, so a reading here can be put beside
