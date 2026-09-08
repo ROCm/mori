@@ -732,16 +732,16 @@ class LaunchGroup:
     def launch(self, stream=0, **args) -> None:
         """Fill the shared argument struct once, then launch every plan in order."""
         buf = self._lead._launch_buf(args)
+        # The stream parameter is declared c_void_p in argtypes, so ctypes does
+        # the conversion at the boundary and an int passes straight through.
+        # Wrapping it in a c_void_p here built a Python object per launch only for
+        # ctypes to unwrap it again. Only a non-int still needs _as_ptr.
         rc = self._fn(
             self._handles,
             self._n,
             ctypes.byref(buf),
             self._argsize,
-            (
-                ctypes.c_void_p(stream)
-                if isinstance(stream, int)
-                else ctypes.c_void_p(_as_ptr(stream))
-            ),
+            stream if type(stream) is int else _as_ptr(stream),
         )
         if rc != 0:
             raise RuntimeError(f"mori jit launch_multi: {_error()}")

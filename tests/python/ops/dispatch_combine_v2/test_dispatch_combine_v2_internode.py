@@ -142,7 +142,15 @@ def _parse_args(argv):
     p.add_argument("--combine-dtype", default=None, choices=list(_DTYPES))
     p.add_argument("--quant-type", default="none", choices=["none", "fp8_direct_cast"])
     p.add_argument("--num-qp", type=int, default=2)
-    p.add_argument("--rounds", type=int, default=3)
+    # 30, matching _EP_ROUNDS in the examples harness -- and for the reason its
+    # comment gives, which applies here with full force: the CCO/GDA path reaches
+    # steady state slowly, so at 10 rounds its per-round jitter does not average
+    # out and the mean swings ~20% run to run. This defaulted to 3 while claiming
+    # alignment, which with --drop-rounds 1 keeps rounds 1 and 2 -- precisely the
+    # two that harness documents as still elevated. A single spike then carries
+    # half the average AND is the reported worst, so this side read a wide tail
+    # against a 29-round mean. Not a small-sample caveat: a different estimator.
+    p.add_argument("--rounds", type=int, default=30)
     p.add_argument("--scale-dim", type=int, default=0)
     # The v1 bench calls combine with weights=None, so it does not pay for the
     # weight fold: an extra peer read per (token, destination) plus an accumulate
@@ -339,6 +347,11 @@ def _bench(op, cfg, d, dev, a, comm):
         comm.barrier()
         if d.rank != 0:
             return 0
+        # Rank 0 must leave through here too. The stats below are allreduces, and
+        # every other rank has already returned -- rank 0 entering them alone is a
+        # hang, then a nonzero exit with no BENCH line. Profiling is a diagnostic
+        # mode, so ending the run after the profile is right; ending it on 15 of
+        # 16 ranks is not.
         st = pstats.Stats(pr)
         rows = sorted(st.stats.items(), key=lambda kv: -kv[1][2])[:20]
         print(f"# HOST PROFILE tok={ct}  (us/round, sorted by self time)", flush=True)
@@ -348,17 +361,34 @@ def _bench(op, cfg, d, dev, a, comm):
                 f"n={nc / n:5.1f}  {os.path.basename(fn)}:{ln}({name})",
                 flush=True,
             )
+        return 0
 
     keep = slice(a.drop_rounds, None)
     disp = [ev[3 * i].elapsed_time(ev[3 * i + 1]) * 1e3 for i in range(n)][keep]
     comb = [ev[3 * i + 2].elapsed_time(ev[3 * i + 3]) * 1e3 for i in range(n)][keep]
 
-    # Which round stalled, opt-in. A worst that lands on the same round in both
-    # phases is a whole-round event (host); one that moves between ranks is
-    # fabric. The averages cannot tell those apart.
-    if os.environ.get("MORI_EP_ROUND_SERIES") and d.rank == 0:
-        print("# rounds disp: " + " ".join("%.0f" % x for x in disp), flush=True)
-        print("# rounds comb: " + " ".join("%.0f" % x for x in comb), flush=True)
+    # Which round stalled, opt-in. EVERY rank prints its own series, because the
+    # question the averages cannot answer is whether a spike lands on the same
+    # round index across ranks or on one rank alone:
+    #   same round, all ranks   -> a whole-round event; every rank waits for the
+    #                              same thing, so the cause is host-side (a launch
+    #                              that took longer to build, an allocation, GC)
+    #                              or a fabric stall that stops everyone.
+    #   one rank, one round     -> a straggler; the others are only showing the
+    #                              spin-wait for it. Chasing the peak on the ranks
+    #                              that merely waited leads nowhere.
+    # These are collective kernels, so a single slow rank prints as a slow round
+    # on all of them -- which is why the RANK-LOCAL series is what separates the
+    # two, and rank 0's alone cannot.
+    if os.environ.get("MORI_EP_ROUND_SERIES"):
+        print(
+            "# rounds r%d disp: " % d.rank + " ".join("%.0f" % x for x in disp),
+            flush=True,
+        )
+        print(
+            "# rounds r%d comb: " % d.rank + " ".join("%.0f" % x for x in comb),
+            flush=True,
+        )
 
     # AVERAGE over rounds x ranks, plus BEST and WORST over the same sample set --
     # the three numbers run_bench_once prints, so a reading here can be put beside

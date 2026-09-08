@@ -79,17 +79,30 @@ _SCALE_ALIGN = 128
 # Which tuning-table dtype column a dispatch dtype reads.
 _FP8_TUNING_DTYPES = (torch.float8_e4m3fnuz, torch.float8_e4m3fn)
 
+# Read once. Both of these gate diagnostics inside the per-launch path, and
+# `os.environ.get` is a C-level dict lookup wrapped in encode/decode: the host
+# profile charged the two of them 5us per round (4 lookups: two diagnostics x
+# two launches) on a path where the host already paces the GPU. Reading them at
+# import costs nothing and cannot be forgotten at a third call site.
+_DEBUG_GEOM = bool(os.environ.get("MORI_EP_DEBUG_GEOM"))
+_TRACE_ARGS = bool(os.environ.get("MORI_INTERNODE_TRACE_ARGS"))
 
-def _raw_stream() -> int:
-    """The current stream as a raw pointer.
+
+def _raw_stream(dev_index: int) -> int:
+    """The current stream on `dev_index`, as a raw pointer.
 
     `torch.cuda.current_stream().cuda_stream` builds a Python Stream wrapper on
     every call -- ~14us a launch in the host profile, on a path where the host
     already paces the GPU. The private entry returns the pointer directly; it is
     what torch.compile's generated code uses. Fall back if it is ever renamed.
+
+    The device index is passed in rather than queried: `torch.cuda.current_device()`
+    is a lazy-init check plus a C call (~1.5us a launch in the same profile) for a
+    value the op fixes at construction. The STREAM still has to be read every call
+    -- a caller may run us under a different one.
     """
     try:
-        return torch._C._cuda_getCurrentRawStream(torch.cuda.current_device())
+        return torch._C._cuda_getCurrentRawStream(dev_index)
     except AttributeError:
         return torch.cuda.current_stream().cuda_stream
 
@@ -120,7 +133,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     def __init__(self, cfg, comm):
         self.cfg = cfg
         self.comm = comm
-        dev = torch.device("cuda", torch.cuda.current_device())
+        self._dev_index = torch.cuda.current_device()
+        dev = torch.device("cuda", self._dev_index)
         self.dev = dev
         self._recv_cap = cfg.effective_max_recv
         self._closed = False
@@ -674,6 +688,19 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     cfg, leg_dtype[self._INTERNODE_LEG[n]], block, warp, rdma
                 )
                 built[n] = cb.EP_INTERNODE_PLANS[n](**req)
+                # Two launch arguments that never vary for THIS plan, so they
+                # belong on the plan rather than in every launch's dict:
+                #   rdmaBlockNum  a plan is compiled per geometry and lives in
+                #                 exactly one `_internode_plans[geom]`, so the
+                #                 value a launch could pass is always geom[1].
+                #   replayMode    this backend has no replay path (KernelSet
+                #                 carries dispatch_replay=None); it is always 0.
+                # bind() stores ints in the plan's cached struct, and _launch_buf
+                # re-writes only the per-call names and the non-int defaults --
+                # so a bound int is written once at bind time and never again,
+                # while a passed one costs a _set_arg every launch (~1.2us each,
+                # x2 args x2 launches per round).
+                built[n].bind(rdmaBlockNum=rdma, replayMode=0)
             self._internode_plans[geom] = built
             self._plans.extend(built.values())
 
@@ -741,6 +768,24 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             geom = self._internode_geom_for(phase, num_tokens)
             group = self._internode_groups[(geom, (phase, ll))]
 
+            # Opt-in: what actually reached the launch. The tuning table resolving
+            # correctly when called offline does not prove the geometry a launch
+            # runs at -- the bucket walk, the CU clamp and the rdma clamp all sit
+            # between them, and a plan is compiled per geometry, so a wrong pick
+            # is a silently different kernel rather than an error. Printed once
+            # per distinct (phase, ll, geom, tokens) so it cannot pace the loop.
+            if _DEBUG_GEOM:
+                seen = self.__dict__.setdefault("_geom_logged", set())
+                k = (phase, ll, geom, int(num_tokens))
+                if k not in seen:
+                    seen.add(k)
+                    print(
+                        f"# GEOM rank={self.cfg.rank} {phase} ll={ll} "
+                        f"tok={int(num_tokens)} -> block/rdma/warp={geom} "
+                        f"buckets={self._internode_buckets}",
+                        flush=True,
+                    )
+
             # Two of the kernel's arguments are set by dispatch and READ AGAIN by
             # combine, but the base only hands them to dispatch -- combine's
             # signature carries no indices and treats `weights` as a request
@@ -776,10 +821,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             indices_ptr = getattr(self, "_internode_indices_ptr", 0)
 
             # Only what varies. The rest is bound on the plan; see
-            # _build_internode_kernels.
+            # _build_internode_kernels -- rdmaBlockNum and replayMode used to be
+            # passed here and are bound there now, since neither can differ
+            # between two launches that reach the same plan.
             args = dict(
                 curRankNumToken=num_tokens,
-                replayMode=0,
                 dispDestTokIdMap=dest_map.data_ptr(),
                 tokenIndices=indices_ptr,
                 inpTokenBuf=input.data_ptr(),
@@ -787,17 +833,16 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 scalesBuf=(
                     kw["scales"].data_ptr() if kw.get("scales") is not None else 0
                 ),
-                rdmaBlockNum=geom[1],
             )
-            if os.environ.get("MORI_INTERNODE_TRACE_ARGS") and self.cfg.rank == 0:
+            if _TRACE_ARGS and self.cfg.rank == 0:
                 print(
                     f"[trace] {phase} ll={ll} tokens={num_tokens} "
                     f"weightsBuf={weights_ptr:#x} tokenIndices={indices_ptr:#x} "
                     f"dispDestTokIdMap={args['dispDestTokIdMap']:#x} "
-                    f"rdma={args['rdmaBlockNum']} passes={names}",
+                    f"rdma={geom[1]} passes={names}",
                     flush=True,
                 )
-            group.launch(_raw_stream(), **args)
+            group.launch(_raw_stream(self._dev_index), **args)
 
         return run
 
