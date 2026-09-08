@@ -233,7 +233,7 @@ and it is nowhere near enough. Halving BLOCK_M would free roughly 16 by halving
 the accumulator count, but moves the tile count to 896 -- remainder 128, where
 gcnasm measured +0.41%. There is no version of this that pays.
 
-## Direct LSA (``--mode fused-lsa``)## Direct LSA (``--mode fused-lsa``)## Direct LSA (``--mode fused-lsa``)## Direct LSA (``--mode fused-lsa``): the structure works, the store does not
+## Direct LSA (``--mode fused-lsa``): the structure works, the store does not
 
 gcnasm's best mode has the GEMM epilogue store *straight into the destination
 rank's window*, so there is no staging buffer, no copy engine and nothing to
@@ -277,7 +277,7 @@ pays a separate local reduce pass -- and its store rate is ~18% under LSA's read
 rate. The prize for coalescing is correctness plus maybe a few percent, not a
 step change.
 
-## What gcnasm does differently## What gcnasm does differently, and why its GEMM+a2a wins
+## What gcnasm does differently, and why its GEMM+a2a wins
 
 ``/workspace/gcnasm/opus_gemm_dist/opus_gemm_a2a_lsa`` fuses a GEMM with an
 all-to-all and gets 16-27% out of it. Reading it explains most of why this does
@@ -304,51 +304,68 @@ not, and one of its lessons was worth ~90us here.
    (fused 440us -> 350us on removing it). Its ISA shows the atomic already emits
    its own ``buffer_wbl2``/``buffer_inv`` pair, on thread 0 only.
 
-## The chunking race, unexplained
+## The race that pinned chunks=1: a barrier phase, not a queue
 
-Overlap requires more than one chunk per destination: with one, the counter only
-fires when the whole slice is done, which under the rotated tile order is the end
-of the GEMM, so nothing overlaps (measured: scatter 129.0us against split's
-136.8 -- a 7.8us gain, i.e. none).
+The prologue's ``if wave_m == 1: rocdl.s_barrier()`` gives waves 4-7 one *extra*
+barrier. ``s_barrier`` is a counting rendezvous, so from then on every arrival
+pairs waves 4-7's k-th barrier with waves 0-3's (k+1)-th, and waves 0-3 run one
+phase ahead for the rest of the kernel. A one-shot GEMM does not care: the
+trailing unmatched barrier is released when the other half exits, and the offset
+is the point -- it staggers the two halves of the M dimension.
 
-``--chunks 2`` is worth it on paper -- 328us, which would beat split-sdma's 338
-and tie split-lsa's 324 -- and it is **intermittently wrong**, in roughly 1 run in
-3. Ruled out, each by measurement rather than argument:
+The fused epilogue does care. ``wait_barrier(0)`` after ``store_c`` is supposed
+to mean "every wave's C tile has retired". Under the offset it instead
+rendezvouses waves 0-3 -- which contain thread 0, hence the counter and the
+transfer -- with waves 4-7 sitting at the *previous* barrier, before their
+stores. Thread 0 then counts the tile complete and can push it while half of it
+is still unwritten.
 
-* the per-destination submit lock (gcnasm's, ISA-verified: test-and-set,
-  ``s_sleep`` backoff, correct spin) -- still 2/6 wrong;
-* the post-submit barrier gcnasm keeps -- still 4/6 wrong;
-* the release fence, at both agent and system scope -- still 3/6 wrong;
-* the counter atomic's ordering, ``acq_rel`` vs relaxed -- helps, does not fix.
+One ``if wave_m == 0: rocdl.s_barrier()`` before ``store_c`` re-balances the
+counts and fixes it: ``--chunks 2`` goes from failing about one run in three to
+12 of 12, and it is the configuration that actually overlaps.
 
-The one factor that separates working from broken is *when* the put is issued. At
-chunks=1 it lands at the very end of the GEMM; at chunks=2 the first one is
-issued mid-kernel and the engine reads C while the rest of the GEMM is still
-running. gcnasm's ChunkFused path does the same thing successfully, but its GEMM
-is 13x longer, so its chunk boundaries are far apart in time. Whether chunks=1
-here is *correct* or merely always-lucky is not established -- the mechanism
-suggests the latter, so treat the fused path as unproven either way.
+Two things were blamed for this before it was found, and both were wrong:
 
-## Result: the fusion does not pay
+* **A shared SDMA queue.** With two chunks per destination the modulo test elects
+  two winners that both post to queue ``dest``, so gcnasm's per-destination
+  submit lock was ported (ISA-verified: test-and-set with ``s_sleep`` backoff).
+  It fixed nothing. It is kept because cco's rule of at most one issuing warp per
+  queue still applies, but it was not the bug.
+* **The counter atomic's ordering.** ``acq_rel`` appeared to lower the failure
+  rate against ``monotonic``, which is how the acquire half got justified. With a
+  one-in-three intermittent failure that comparison was noise. ``acq_rel`` stays
+  because release/acquire on the counter is right for a producer handing tiles to
+  a consumer, not because it was measured.
 
-Correct-as-measured configurations only, 8 ranks, [4096, 7168], K=1024:
+Repeated runs remain the only way to judge any of this;
+``test_fused_is_stable_across_repeats`` requires three runs to be *identical*,
+not merely each small, because every individual relL2 here looks plausible.
 
-    split-lsa                            324.4us
-    split-sdma                           338.0
-    fused-sdma  chunks=1, no fence       348.5   (stable 6/6)
-    fused-sdma  chunks=1, agent fence    440.0   (the fence is 90us of waste)
+## Result: fused-sdma reaches parity, and does not beat LSA
 
-Per-kernel (rocprofv3 --kernel-trace, us):
+8 ranks, [4096, 7168], K=1024, graph replay, median of 3-4 runs:
 
-    config                     gemm   scatter  reduce  gather    sum
-    split-sdma                 39.1     136.8    13.5   137.3   326.8
-    fused c=1, no fence        62.7     129.0    13.0   136.2   341.0
-    fused c=1, agent fence    152.4     132.7    13.6   135.4   434.1
+                             default C-store   + 3-stage C-store
+    split-lsa                      326.8us            321.8us
+    split-sdma                     334.6              330.9
+    fused-sdma  chunks=2           326.2              323.0
+    fused-lsa                      341.0    racy, see above
 
-So with the fence removed the whole remaining deficit is +23.6us inside the GEMM
--- the block-wide barrier, the acq_rel counter, and the copy engine reading C
-while the GEMM writes it -- against a 7.8us overlap gain. The structure is sound;
-the shape is wrong for it.
+Per-kernel for the SDMA paths (rocprofv3 --kernel-trace, us):
+
+    config                gemm   scatter/drain  reduce  gather    sum
+    split-sdma            39.1        136.8      13.5   137.3   326.8
+    fused-sdma chunks=2   60.9        126.9      13.1   135.1   336.1
+
+So the fusion is no longer a loss -- it beats split-sdma by ~2.5% and ties
+split-lsa -- but it does not win. The overlap it buys (scatter 136.8 -> 126.9)
+is roughly cancelled by what the epilogue costs the GEMM (39.1 -> 60.9), and the
+reduce and all-gather, 46% of the pipeline, are untouched by construction.
+
+An ATT thread trace puts the epilogue at 26% of the kernel's latency, almost all
+of it one instruction waiting on the release fence's writeback -- 13.9% of the
+kernel, more than any main-loop stall. The fence discussion under ``--fence``
+covers why that is quadratic and what did and did not help.
 
 ## Pinned copy
 
