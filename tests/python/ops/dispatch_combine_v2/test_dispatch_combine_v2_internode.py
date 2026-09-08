@@ -485,6 +485,12 @@ def _bench(op, cfg, d, dev, a, comm):
         gc.disable()
 
     _sclk_before = _sclk_levels() if os.environ.get("MORI_EP_SCLK") else None
+    # Per-pass marks accumulate inside the backend when MORI_EP_SPLIT_PASSES is
+    # set. Clear them here so only the timed loop's are read; the warmup ran with
+    # the same code path and left its own behind.
+    _marks = getattr(op, "_pass_marks", None)
+    if _marks is not None:
+        del _marks[:]
 
     t0 = time.perf_counter()
     ev[0].record()
@@ -499,10 +505,18 @@ def _bench(op, cfg, d, dev, a, comm):
     # wall-clock either way. perf_counter is ~50ns, far below what it resolves.
     hdisp = [0.0] * n
     hcomb = [0.0] * n
+    # WHEN each round started on this rank, relative to the loop start. Durations
+    # cannot see a rank that entered the round late -- only one that took long
+    # once inside -- and a spin-wait collective punishes lateness, not slowness.
+    # All ranks barrier immediately before t0, so these are comparable across
+    # ranks to within the barrier skew even though the two nodes' clocks are not
+    # synchronised (t0 is each rank's own zero).
+    hstart = [0.0] * n
 
     for i in range(n):
         _cur[0] = i
         _h = time.perf_counter()
+        hstart[i] = (_h - t0) * 1e6
         r = op.dispatch(inp, wts, sc, idx, return_routing=True)
         hdisp[i] = (time.perf_counter() - _h) * 1e6
         ev[3 * i + 1].record()
@@ -521,6 +535,48 @@ def _bench(op, cfg, d, dev, a, comm):
             comm.barrier()
     torch.cuda.synchronize()
     wall = (time.perf_counter() - t0) * 1e6 / n
+    # Which PASS owns the slow round. The marks are (name, event) in launch
+    # order: one "<phase>:start" then one per pass, repeating per phase per round.
+    # Consecutive deltas are per-pass GPU durations, so the round with the largest
+    # total can be broken down against the median round of the same phase -- which
+    # is the question, since the tail is a few rounds and the median is the rest.
+    if _marks and d.rank == 0:
+        per_round = []  # [(phase, [(name, us), ...]), ...] in order
+        cur_name, cur_ev, cur = None, None, []
+        for name, evm in _marks:
+            if name.endswith(":start"):
+                if cur:
+                    per_round.append((cur_name, cur))
+                cur_name, cur, cur_ev = name.split(":")[0], [], evm
+                continue
+            if cur_ev is not None:
+                cur.append((name, cur_ev.elapsed_time(evm) * 1e3))
+                cur_ev = evm
+        if cur:
+            per_round.append((cur_name, cur))
+
+        for phase in ("dispatch", "combine"):
+            rounds = [c for ph, c in per_round if ph == phase][a.drop_rounds :]
+            if not rounds:
+                continue
+            totals = [sum(v for _, v in r) for r in rounds]
+            wi = max(range(len(totals)), key=totals.__getitem__)
+            order = sorted(range(len(totals)), key=totals.__getitem__)
+            mi = order[len(order) // 2]
+            names = [nm for nm, _ in rounds[wi]]
+            print(
+                f"# SPLIT {phase}: worst round {wi} = {totals[wi]:.1f}us, "
+                f"median round = {totals[mi]:.1f}us",
+                flush=True,
+            )
+            for k, nm in enumerate(names):
+                w, m = rounds[wi][k][1], rounds[mi][k][1]
+                print(
+                    f"#    {nm:<20} worst={w:8.1f}  median={m:7.1f}  "
+                    f"delta={w - m:+8.1f}",
+                    flush=True,
+                )
+
     if _sclk_before is not None and d.rank == 0:
         print(f"# SCLK before: {_sclk_before}", flush=True)
         print(f"# SCLK after:  {_sclk_levels()}", flush=True)
@@ -630,6 +686,10 @@ def _bench(op, cfg, d, dev, a, comm):
         print(
             "# hostus r%d comb: " % d.rank
             + " ".join("%.0f" % x for x in hcomb[keep]),
+            flush=True,
+        )
+        print(
+            "# entry r%d: " % d.rank + " ".join("%.0f" % x for x in hstart[keep]),
             flush=True,
         )
 

@@ -85,6 +85,17 @@ _FP8_TUNING_DTYPES = (torch.float8_e4m3fnuz, torch.float8_e4m3fn)
 # two launches) on a path where the host already paces the GPU. Reading them at
 # import costs nothing and cannot be forgotten at a third call site.
 _DEBUG_GEOM = bool(os.environ.get("MORI_EP_DEBUG_GEOM"))
+# Diagnostic: launch the pass sequence one plan at a time with a timing event
+# after each, instead of as one launch group. This is the only way to see which
+# KERNEL owns a slow round -- the group crosses the ABI once and the passes run
+# back to back, so no event can be placed between them from outside.
+#
+# It costs host time (one extra ABI crossing and one event per pass, ~5 of each
+# per round), and host time converts to measured time roughly 1:1 on this path,
+# so the ABSOLUTE numbers under it read high. The decomposition is still valid:
+# the spike being hunted is ~120us against ~25us of added overhead, and what is
+# wanted is which pass grew, not what it costs.
+_SPLIT_PASSES = bool(os.environ.get("MORI_EP_SPLIT_PASSES"))
 _TRACE_ARGS = bool(os.environ.get("MORI_INTERNODE_TRACE_ARGS"))
 
 
@@ -159,6 +170,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # them per call -- torch.as_tensor + view showed up in the host profile at
         # ~27us a round, on a path where the host already paces the GPU.
         self._views = {}
+        # (pass_name, event) appended per launch when MORI_EP_SPLIT_PASSES is on.
+        self._pass_marks = []
         # gfx125x routes to the TDM kernel, which needs a superset arena (plan A).
         _arch = getattr(torch.cuda.get_device_properties(dev), "gcnArchName", "") or ""
         self._is1250 = _arch.split(":")[0].startswith("gfx125")
@@ -877,7 +890,20 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     f"rdma={geom[1]} passes={names}",
                     flush=True,
                 )
-            group.launch(_raw_stream(self._dev_index), **args)
+            if _SPLIT_PASSES:
+                stream = _raw_stream(self._dev_index)
+                built = self._internode_plans[geom]
+                marks = self._pass_marks
+                e = torch.cuda.Event(enable_timing=True)
+                e.record()
+                marks.append((phase + ":start", e))
+                for nm in names:
+                    built[nm].launch(stream, **args)
+                    e = torch.cuda.Event(enable_timing=True)
+                    e.record()
+                    marks.append((nm, e))
+            else:
+                group.launch(_raw_stream(self._dev_index), **args)
 
         return run
 
