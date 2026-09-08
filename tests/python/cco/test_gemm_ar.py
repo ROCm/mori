@@ -212,6 +212,33 @@ def _run_bench(world_size, mode, m, n, k, extra=()):
     return records[0]
 
 
+def test_fused_is_stable_across_repeats():
+    """A single passing run proves nothing about the fused path.
+
+    Its epilogue publishes tiles from 448 blocks and elects one of them to issue
+    the transfer, so every ordering bug in it is intermittent -- and each
+    individual relL2 looks "small" on its own. Two real races were shipped here
+    behind exactly that: a shared SDMA queue when a destination has more than one
+    chunk, and a counter atomic that had lost its acquire half. Both passed a
+    one-shot check repeatedly before failing.
+
+    Needs the full world size: the race needs more than one chunk per
+    destination, and at 2 ranks the wo_b shape only has one.
+    """
+    if torch.cuda.device_count() < 8:
+        pytest.skip("the fused race only reproduces at world_size=8")
+    pytest.importorskip("aiter", reason="aiter not importable (set PYTHONPATH)")
+    seen = []
+    for _ in range(3):
+        record = _run_bench(8, "fused-sdma", 4096, 7168, 1024)
+        seen.append(record["rel_l2"])
+    assert all(v == pytest.approx(seen[0], rel=1e-6) for v in seen), (
+        f"fused all-reduce is not deterministic across runs: relL2 = {seen}. "
+        "That is an ordering bug in the epilogue, not numerical noise."
+    )
+    assert all(v < 5e-3 for v in seen), seen
+
+
 @pytest.mark.parametrize("mode", ["split-sdma", "fused-sdma", "split-lsa"])
 def test_gemm_ar_modes_agree(mode):
     """All three paths must land on the same all-reduced result.

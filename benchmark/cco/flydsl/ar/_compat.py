@@ -49,21 +49,37 @@ from flydsl._mlir import ir
 
 FLYDSL_VERSION = getattr(flydsl, "__version__", "unknown")
 
-# Cache-modifier (``aux``) bits. **These are CDNA3/CDNA4-dependent.**
+# Cache-modifier (``aux``) values. This is the LLVM ``CPol`` operand, **not** the
+# hardware bit positions, and the two do not line up -- which is worth stating
+# because getting it wrong is silent.
 #
-# On gfx950 the encoding is bit0=SC0, bit1=NT, bit2=SC1, so the gfx942 spelling
-# used by ``examples/cco/python/05_flydsl_lsa_allreduce`` (SC1=2, SC0|SC1=3)
-# silently compiles to ``nt`` and ``sc0 nt`` here -- non-temporal hints that do
-# **not** bypass L2. Verified by reading the emitted ISA: aux=3 produced
-# ``buffer_store_dwordx4 ... sc0 nt``, aux=5 produces ``... sc0 sc1``.
+# Established by assembling each policy and diffing the encoding::
 #
-# The examples get away with it because their inputs are host-written before the
-# kernel, so nothing there actually depends on the barrier ordering.
+#     echo 'buffer_store_short v0, v1, s[0:3], 0 offen <pol>' \
+#       | llvm-mc -triple=amdgcn-amd-amdhsa -mcpu=gfx950 -show-encoding
+#
+#     pol         encoding byte1/byte2      delta
+#     (none)      0x10 0x68                 --
+#     sc0         0x50 0x68                 byte1 bit6  -> insn bit 14
+#     sc1         0x90 0x68                 byte1 bit7  -> insn bit 15
+#     nt          0x10 0x6a                 byte2 bit1  -> insn bit 17
+#
+# Insn bit 14 is GLC, 15 is SCC, 17 is SLC, and CPol spells those 1, 16, 2. So
+# SC1 is **16**, not 4 -- 4 is DLC, which is RDNA-only and silently ignored on
+# CDNA. An earlier version of this file had ``CM_SC1 = 4`` and a comment
+# claiming aux=5 emitted ``sc0 sc1``; it emits ``sc0`` alone, leaving the line
+# dirty in L2. Nothing depended on it (the barrier uses atomics and the payload
+# stores use CM_CACHED), but two experiments were invalidated before it showed
+# up in the ISA.
+#
+# Note also that ``fx.rocdl.BufferCopy*(cache_modifier)`` does **not** take these
+# values: its modifier is a two-value enum (0=cached, 2=nt). Reaching sc0/sc1
+# needs ``buffer_store`` below, which passes aux through.
 CM_CACHED = 0
-CM_SC0 = 1  # bypass L1
-CM_NT = 2  # non-temporal
-CM_SC1 = 4  # bypass L2 -- required to observe a peer's fresh write
-CM_SC0_SC1 = CM_SC0 | CM_SC1  # 5: publish past L1+L2
+CM_SC0 = 1  # bypass L1  (GLC)
+CM_NT = 2  # non-temporal (SLC)
+CM_SC1 = 16  # bypass L2 -- required to observe a peer's fresh write  (SCC)
+CM_SC0_SC1 = CM_SC0 | CM_SC1  # 17: publish past L1+L2
 
 # V# flags word for CDNA (gfx9xx): DATA_FORMAT=7, NUM_FORMAT=4. Bit 24 and
 # OOB_SELECT are RDNA-only; this benchmark is gfx95x/gfx94x.

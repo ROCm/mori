@@ -71,73 +71,97 @@ of the GEMM and nothing overlaps. The rotation is gcnasm's
 ``opus_direct_stripe_tile`` idea. It costs nothing: 49.72us against 49.80us for
 the GEMM alone.
 
-## Result: the fusion works, and the release fence costs more than it saves
+## Correctness first: two races, and what is actually demonstrable
 
-Per-kernel, ``rocprofv3 --kernel-trace``, 8x MI355X, [4096, 7168] out, K=1024,
-median of 11 (us):
+Repeated runs matter more than any timing here. Validating once and reporting the
+number was how several wrong results in this file's history got published; the
+failure mode is intermittent and every individual relL2 looks "small".
 
-    config               gemm   scatter/drain  reduce  gather    sum   correct
-    split                39.1        136.8      59.0   137.3   372.3    yes
-    fused --fence none   64.5        103.4      59.8   136.6   364.2    NO
-    fused --fence leader 83.5         96.9      59.9   136.2   376.5    NO
-    fused --fence agent 136.9         72.3      59.3   137.7   406.2    yes
-    fused --fence all   175.9         71.1      59.3   137.3   443.6    yes
+Measured over repeated 8-rank runs at [4096, 7168], K=1024:
 
-The overlap is real and large: the scatter collapses from 136.8us to 72.3us, a
-saving bigger than the entire 39.1us GEMM. But more than that reappears *inside*
-the GEMM, which goes from 39.1us to 136.9us.
+    config                                    passes   note
+    chunks=1, --fence agent, acq_rel atomic    6/6     the only stable one
+    chunks=2, --fence agent, acq_rel atomic    5/6     RACY
+    chunks=2, --fence agent, monotonic atomic  3/5     RACY, worse
+    chunks=1, --fence raw-wt-agent             2/4     RACY
+    standalone SDMA all-reduce (control)       5/5     stable
 
-An ATT thread trace (``rocprofv3 --att --att-library-path /opt/rocm/lib``)
-attributes the epilogue tail exactly -- it is 26% of the kernel's latency, and
-essentially all of it is one instruction waiting:
+Two independent races, both mine:
+
+1. **``chunks > 1`` shares an SDMA queue.** The modulo test elects exactly one
+   block per *chunk*, not one per *queue*, so with two chunks per destination two
+   winning blocks post to queue ``dest`` at the same time. The plan called for a
+   per-destination submit lock (gcnasm has one) and this skipped it on the
+   argument that the counter already elects a single CTA. That argument was about
+   the wrong thing. Default is now 1; ``--chunks 2`` reproduces the race.
+
+2. **The counter atomic needs its acquire half.** It was changed to relaxed for a
+   19us win on the reasoning that the winner never reads the data it counts (the
+   copy engine does). Wrong: the winner needs the acquire so the other blocks'
+   releases are ordered before *its put*. ``acq_rel`` is the default again, and it
+   measurably reduces the failure rate.
+
+Write-through C stores (``--fence raw-wt``, ``raw-wt-agent``) are kept only as
+disproved options. The idea was to make the per-block ``buffer_wbl2`` unnecessary
+by having C reach memory at the store. It looked excellent -- GEMM 139.1us ->
+97.6us, total 333.8 against split-lsa's 327 -- and it is racy even at chunks=1,
+so those numbers describe a kernel that does not reliably compute the right
+answer. Note the sub-experiment was worth running anyway: it showed the
+un-coalesced per-lane 2-byte store does **not** collapse when it bypasses L2,
+which was the open question about whether ``StoreC`` has to be coalesced first.
+
+## Result: the fusion does not pay
+
+Correct configurations only, 8 ranks, [4096, 7168], K=1024, graph replay:
+
+    split-lsa                      324.4us
+    split-sdma                     338.0us
+    fused-sdma  chunks=1, agent    440.0us
+
+Per-kernel for the racy chunks=2 variant, which is the best case the structure
+can aspire to if the queue lock were built (rocprofv3 --kernel-trace, us):
+
+    config              gemm   scatter/drain  reduce  gather    sum
+    split                39.1        136.8      13.5   137.3   326.7
+    fused --fence none   64.5        103.4      13.5   136.6   318.0
+    fused --fence agent 139.1         66.3      13.5   136.5   355.4
+
+The overlap is real -- the scatter collapses from 136.8us to 66.3us -- and it is
+still not enough, because the release fence adds more than that back inside the
+GEMM. An ATT thread trace puts the epilogue tail at 26% of the kernel's latency,
+almost all of it one instruction:
 
     vaddr    cycles   % kernel  instruction
     19396     91336      5.1%   s_waitcnt vmcnt(0)     retire this block's C
     19400     22984      1.3%   s_barrier
     19404       292      0.0%   buffer_wbl2 sc1        <- the op itself is free
     19412    246804     13.9%   s_waitcnt vmcnt(0)     <- waiting on the writeback
-    19608+    91612      5.1%   waits bracketing the counter atomic
 
-The writeback wait is the single largest line item in the whole kernel, larger
-than any main-loop stall, and it is **quadratic**: ``buffer_wbl2`` flushes the
-entire L2, so block k waits for every tile blocks 1..k-1 already wrote, 448
-blocks over. The split path gets one bulk release at kernel end instead, free.
+That wait is the largest single item in the whole kernel, larger than any
+main-loop stall, and it is **quadratic**: ``buffer_wbl2`` flushes the entire L2,
+so block k waits for every tile blocks 1..k-1 already wrote, 448 blocks over. The
+split path gets one bulk release at kernel end, free.
 
-Two costs the trace found that *were* removable, both now fixed:
+Everything tried to make it cheaper, and what happened:
 
-* The counter atomic was ``acq_rel``, so it emitted its own ``buffer_wbl2`` /
-  ``buffer_inv`` pair -- 91.6k cycles, more per wave than the explicit fence.
-  Both halves were redundant (the caller already released; the winner never
-  reads what it counts, the copy engine does). Relaxed: 156.1us -> 136.9us.
-* System scope emitted ``buffer_inv sc0 sc1`` on top of the writeback, and that
-  invalidate discards the B weights the GEMM streams, 3584 times. Agent scope
-  drops it: 175.9us -> 156.1us. cco exposes no agent-scope release, only
-  ``cco_system_fence``, so it is emitted as a raw ``llvm.fence``
-  (``_compat.release_fence``) -- a gap worth closing in the device API.
+* **Agent scope instead of system.** Correct and worth 20us: ``__threadfence_system``
+  is bidirectional and emits ``buffer_wbl2 sc0 sc1 ; s_waitcnt ; buffer_inv sc0
+  sc1``, and that ``buffer_inv`` discards the B weights the GEMM streams, 3584
+  times. cco exposes no agent-scope release, only ``cco_system_fence``, so it is
+  emitted as a raw ``llvm.fence`` (``_compat.release_fence``). Kept.
+* **One fence per block instead of per wave** (``--fence agent-leader``, and cco's
+  ``leaderOnly``). Incorrect in both spellings, including emitted inline in this
+  kernel to rule out the compiler sinking it. So the release is genuinely
+  per-wave. Its *time* is the useful part: 322.5us, i.e. an 8x cut in fence count
+  would be worth 41us and would win -- if it were legal.
+* **Non-temporal C stores** (``--fence nt-agent``). Worse, 411.2us.
+* **Write-through C stores.** Racy, see above.
 
-Two more attempts that did *not* work, kept selectable so they stay disprovable:
-
-* **One fence per block instead of per wave** (``--fence leader``). Incorrect:
-  relL2 9.6e-3, indistinguishable from no fence at all, even though every lane
-  has already passed ``s_waitcnt vmcnt(0)`` and a block barrier. So the release
-  is genuinely per-wave -- that is the factor of 8 in 3584.
-* **Write-through C stores** (``--fence writethrough``), so no writeback would be
-  needed. Not a release on its own (relL2 1.72e-2), and paired with the agent
-  fence (``--fence wt-agent``, 432.5us) it is indistinguishable from the agent
-  fence alone -- ``buffer_wbl2`` costs the same whether or not the lines it is
-  asked to flush are dirty.
-
-So the conclusion is narrower and more useful than "the compute:comm ratio is
-wrong", though the ratio does cap the prize: what is missing is a **per-tile
-release**. Every primitive available publishes the whole cache, and the GEMM has
-448 tiles to publish, so the release is O(blocks^2) against an overlap worth at
-most one GEMM. Profiling took the fused path from 450.2us to 406-413us, and it
-still loses to split-sdma at 372.3 and to ``gemm + LSA`` at 327.0, which remains
-the number any fused SDMA path has to beat.
-
-The completion-counter machinery and the destination-rotated tile order are both
-sound -- they are what produced the 64.5us of genuine overlap -- and would pay
-immediately on a transport whose producer-side release is per-tile.
+So what is missing is a **per-tile release**. Every primitive here publishes the
+whole cache, and the GEMM has 448 tiles to publish, so the cost is O(blocks^2)
+against an overlap worth at most one GEMM. The completion-counter machinery and
+the destination-rotated tile order are sound and produced the real overlap; they
+would pay immediately on a transport whose producer-side release is per-tile.
 
 ## Pinned copy
 
@@ -190,9 +214,39 @@ sys.path.insert(0, _AR_DIR)
 from _compat import (  # noqa: E402
     CM_SC0_SC1,
     atomic_add_u32,
+    buffer_store,
+    create_buffer_resource_from_addr,
     release_fence,
     signal_ptr,
 )
+
+
+class _RawWriteThroughStoreC(StoreC):
+    """``StoreC`` whose C stores really do bypass L1 *and* L2.
+
+    ``StoreC`` stores through a copy atom whose ``cache_modifier`` is a two-value
+    enum (0=cached, 2=nt), so ``sc0|sc1`` is not expressible there -- asking for
+    it emits a plain ``sc0`` and leaves the line dirty in L2, which is why the
+    earlier ``--fence writethrough`` probe measured nothing. This goes around the
+    atom to ``raw_ptr_buffer_store``, whose ``aux`` operand is the real cache
+    policy, so the data reaches memory at the store and the per-block
+    ``buffer_wbl2`` release becomes unnecessary.
+
+    The descriptor is built from the window rather than from the ``C`` argument
+    because in the fused kernel they are the same bytes: C *is* the all-reduce's
+    input region. ``num_records`` still bounds it, so ``store``'s out-of-bounds
+    index for masked columns is dropped exactly as before.
+
+    Deliberately *not* coalesced: the point of this variant is to find out
+    whether the coalescing rewrite is needed before paying for it.
+    """
+
+    def __init__(self, *args, c_rsrc=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._c_rsrc = c_rsrc
+
+    def _store_bf16(self, value_bf16, c_index):
+        buffer_store(value_bf16, self._c_rsrc, c_index, cache_modifier=CM_SC0_SC1)
 
 
 class _NonTemporalStoreC(StoreC):
@@ -244,6 +298,7 @@ def compile_fused_gemm_scatter(
     rotated: bool | None = None,
     fence: str = "agent",
     emit_put: bool = True,
+    atomic_order: str = "acq_rel",
 ):
     """Compile the GEMM, with (``fuse=True``) or without the scatter epilogue.
 
@@ -314,7 +369,7 @@ def compile_fused_gemm_scatter(
 
     if fence not in (
         "all", "agent", "agent-leader", "nt-agent", "leader", "none",
-        "writethrough", "wt-agent",
+        "writethrough", "wt-agent", "raw-wt", "raw-wt-agent", "raw-wt-leader",
     ):
         raise ValueError(
             f"fence must be all/agent/leader/none/writethrough/wt-agent, got {fence!r}"
@@ -327,7 +382,8 @@ def compile_fused_gemm_scatter(
 
     _kname = (
         f"mori_fused_{'sdma' if fuse else 'split'}_8w_"
-        f"{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_k{K}_{_kname_tag}{'p' if emit_put else 'x'}_r{rank}"
+        f"{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_k{K}_{_kname_tag}"
+        f"{'p' if emit_put else 'x'}{atomic_order[0]}_r{rank}"
     )
 
     @fx.struct
@@ -420,6 +476,21 @@ def compile_fused_gemm_scatter(
         if const_expr(fence in ("writethrough", "wt-agent")):
             store_c = _WriteThroughStoreC(
                 A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B
+            )
+        elif const_expr(fence in ("raw-wt", "raw-wt-agent", "raw-wt-leader")):
+            store_c = _RawWriteThroughStoreC(
+                A_scale,
+                B_scale,
+                C,
+                c_m,
+                c_n,
+                mfma.idx,
+                N_TILES_A,
+                N_TILES_B,
+                c_rsrc=create_buffer_resource_from_addr(
+                    fx.Int64(cco.Window(win).lsa_ptr(rank, in_off)),
+                    num_records_bytes=cfg.nbytes,
+                ),
             )
         elif const_expr(fence == "nt-agent"):
             store_c = _NonTemporalStoreC(
@@ -556,7 +627,7 @@ def compile_fused_gemm_scatter(
                 raw_cco.cco_system_fence(fx.Int32(0))
             elif const_expr(fence == "leader"):
                 raw_cco.cco_system_fence(fx.Int32(1))
-            elif const_expr(fence in ("agent", "wt-agent", "nt-agent")):
+            elif const_expr(fence in ("agent", "wt-agent", "nt-agent", "raw-wt-agent")):
                 release_fence("agent")
             # "writethrough": nothing to do -- the stores already went to memory,
             # and wait_barrier(0) above retired them.
@@ -568,7 +639,7 @@ def compile_fused_gemm_scatter(
                 # form was already shown incorrect, but that went through an
                 # extern wrapper; emitting the fence inline rules out the
                 # compiler having sunk it past the atomic.
-                if const_expr(fence == "agent-leader"):
+                if const_expr(fence in ("agent-leader", "raw-wt-leader")):
                     release_fence("agent")
                 dest = block_m // fx.Int32(m_tiles_per_peer)
                 chunk = (block_m % fx.Int32(m_tiles_per_peer)) // fx.Int32(
@@ -579,7 +650,9 @@ def compile_fused_gemm_scatter(
                     fx.Int64(w.lsa_ptr(rank, counter_off))
                     + fx.Int64(slot) * fx.Int64(4)
                 )
-                seq = fx.Int32(atomic_add_u32(ctr, 1)) + fx.Int32(1)
+                seq = fx.Int32(
+                    atomic_add_u32(ctr, 1, ordering=atomic_order)
+                ) + fx.Int32(1)
                 # Monotonic: the counters are never reset, so "last tile of this
                 # chunk, this epoch" is a modulo test rather than a compare. Same
                 # reason the barrier flags in ar/kernels_lsa are never reset -- it

@@ -77,8 +77,6 @@ from mori.cco.device.flydsl import _bindings as raw_cco
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _compat import (  # noqa: E402
     CM_CACHED,
-    CM_SC0_SC1,
-    CM_SC1,
     buffer_load,
     buffer_store,
     create_buffer_resource_from_addr,

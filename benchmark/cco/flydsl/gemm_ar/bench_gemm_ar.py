@@ -41,16 +41,14 @@ because LSA is the faster collective, and a fused SDMA path has to beat
 
 Headline, 8x MI355X, [4096, 7168] out, K=1024, graph replay, median of 51:
 
-    gemm-only     49.6us
-    split-lsa    327.0
-    split-sdma   382.0
-    fused-sdma   413.4   (chunks=2, --fence agent)
+    split-lsa                    324.4us
+    split-sdma                   338.0
+    fused-sdma  chunks=1, agent  440.0
 
-Fusing loses. The overlap is real -- a kernel trace shows the scatter dropping
-from 136.8us to 72.3us -- but the release fence the epilogue needs adds more than
-that back inside the GEMM, which goes from 39.1us to 136.9us. ``kernels_fused.py``
-has the full per-kernel decomposition. ``--fence`` and ``--stop-after`` exist to
-reproduce that attribution.
+Fusing loses. Read ``kernels_fused.py`` before trusting any faster fused number
+from this benchmark: several of its options are intermittently wrong, and a
+single passing run proves nothing. ``--chunks`` > 1 and every ``raw-wt`` fence
+mode are known-racy and kept only to reproduce that.
 """
 
 from __future__ import annotations
@@ -149,8 +147,12 @@ def run(args) -> int:
     # One push per BLOCK_M row-band by default: the finest granularity the tile
     # order can signal, and at the wo_b shape still a 3.7MB transfer, well past
     # the ~1MB where SDMA bandwidth flattens out.
-    m_tiles_per_peer = max(1, (args.m // world_size) // args.block_m)
-    chunks = args.chunks if args.chunks else m_tiles_per_peer
+    # Default 1, NOT one push per row-band. With more than one chunk per
+    # destination, two winning blocks post to the same SDMA queue concurrently
+    # and the result is intermittently wrong -- see the race note in
+    # kernels_fused. Fixing it needs the per-destination submit lock that the
+    # gcnasm protocol has and this does not.
+    chunks = args.chunks if args.chunks else 1
     cfg = ArConfig(
         world_size=world_size,
         m=args.m,
@@ -198,6 +200,7 @@ def run(args) -> int:
             rotated=None if args.tile_order == "auto" else args.tile_order == "rotated",
             fence=args.fence,
             emit_put=not args.no_put,
+            atomic_order=args.atomic,
         )
         a_i8 = a.contiguous().view(torch.int8).view(-1)
         b_i8 = b_shuf.contiguous().view(torch.int8).view(-1)
@@ -318,8 +321,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--chunks",
         type=int,
         default=0,
-        help="pushes per destination (0 = one per BLOCK_M row-band, the finest "
-        "the tile order can signal)",
+        help="pushes per destination (0 = 1). Values > 1 are RACY: two winners "
+        "then share one SDMA queue. Kept settable only to reproduce that",
     )
     p.add_argument(
         "--tile-order",
@@ -331,7 +334,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--fence",
         choices=(
             "all", "agent", "agent-leader", "nt-agent", "leader", "none",
-            "writethrough", "wt-agent",
+            "writethrough", "wt-agent", "raw-wt", "raw-wt-agent",
+            "raw-wt-leader",
         ),
         default="agent",
         help="release before the epilogue push. Correct: 'agent' (default, "
@@ -353,6 +357,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="keep the epilogue but drop the transfer, to price how much of its "
         "cost is the copy engine reading C while the GEMM writes it. Output is "
         "wrong by construction; use with --skip-validation",
+    )
+    p.add_argument(
+        "--atomic",
+        choices=("acq_rel", "acquire", "release", "monotonic"),
+        default="acq_rel",
+        help="ordering on the tile counter. The winner needs the acquire half to "
+        "order the other blocks' releases before its put; 'monotonic' drops it "
+        "and races",
     )
     p.add_argument("--sdma-queues", type=int, default=8)
     p.add_argument("--warmup", type=int, default=10)
