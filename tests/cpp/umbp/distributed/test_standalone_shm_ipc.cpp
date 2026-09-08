@@ -933,5 +933,90 @@ TEST(StandaloneShmIpcTest, RangedGetKeyHandleReplacesTheKeysAndFailsSafe) {
   unlink(fd_path.c_str());
 }
 
+// A reader does not hold one key set: it chunks a pool's keys to fit a range
+// budget and walks the chunks in order, once per layer group, so the sets come
+// round as a cycle. This mints a cycle far longer than the eight the table used
+// to hold and then asks for every one of them back.
+//
+// It is a guard against both halves of that regression. A small capacity fails
+// it outright. An LRU of any capacity below the cycle fails it in the specific
+// way that matters -- the eviction lands on the set that comes round next, so
+// the hit rate is 0 rather than reduced -- which is why the sets are asked for
+// in the same order they were minted rather than in reverse.
+TEST(StandaloneShmIpcTest, RangedGetKeyHandlesSurviveALongerCycleThanTheOldCapacity) {
+  const std::string address =
+      "unix:///tmp/umbp_standalone_keycycle_" + std::to_string(getpid()) + ".grpc.sock";
+  const std::string grpc_path = standalone::UnixPathFromGrpcAddress(address);
+  const std::string fd_path = standalone::DeriveFdSocketPath(address);
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+
+  UMBPConfig server_cfg;
+  server_cfg.dram.capacity_bytes = 1 << 20;
+  server_cfg.ssd.enabled = false;
+  UMBPStandaloneProcessConfig sp_cfg;
+  sp_cfg.address = address;
+  sp_cfg.startup_timeout_ms = 5000;
+  server_cfg.standalone_process = sp_cfg;
+
+  standalone::StandaloneServer server(server_cfg, address);
+  ASSERT_TRUE(server.Start());
+  std::thread server_thread([&]() { server.Run(); });
+
+  auto raw_stub = ::umbp::UMBPStandalone::NewStub(
+      grpc::CreateChannel(address, grpc::InsecureChannelCredentials()));
+
+  // Comfortably past the old capacity of eight, and inside the current one, so
+  // the assertion is "every set survived" rather than a rate to be tuned. No
+  // memory is registered for this stub, so no bytes move; what is under test is
+  // which key list the handle stands for.
+  constexpr size_t kCycle = 40;
+  constexpr size_t kKeysPerSet = 2;
+  const auto build = [&](::umbp::BatchRangeDataRequest* req) {
+    req->set_client_id("cycle-wire-client");
+    for (size_t k = 0; k < kKeysPerSet; ++k) {
+      req->add_range_counts(1);
+      req->add_shm_offsets(k * 32);
+      req->add_region_bases(0);
+      req->add_sizes(32);
+      req->add_object_offsets(0);
+    }
+  };
+
+  std::vector<uint64_t> handles(kCycle);
+  std::vector<uint64_t> fingerprints(kCycle);
+  for (size_t set = 0; set < kCycle; ++set) {
+    ::umbp::BatchRangeDataRequest req;
+    build(&req);
+    fingerprints[set] = 0x9e3779b97f4a7c15ULL + set;
+    req.set_key_fingerprint(fingerprints[set]);
+    for (size_t k = 0; k < kKeysPerSet; ++k) {
+      req.add_keys("cycle-" + std::to_string(set) + "-key-" + std::to_string(k));
+    }
+    grpc::ClientContext ctx;
+    ::umbp::BatchBoolResponse resp;
+    ASSERT_TRUE(raw_stub->BatchGetRanges(&ctx, req, &resp).ok()) << "set " << set;
+    handles[set] = resp.key_handle();
+    ASSERT_NE(handles[set], 0u) << "set " << set;
+  }
+
+  for (size_t set = 0; set < kCycle; ++set) {
+    ::umbp::BatchRangeDataRequest req;
+    build(&req);
+    req.set_key_handle(handles[set]);
+    req.set_key_fingerprint(fingerprints[set]);
+    grpc::ClientContext ctx;
+    ::umbp::BatchBoolResponse resp;
+    ASSERT_TRUE(raw_stub->BatchGetRanges(&ctx, req, &resp).ok()) << "set " << set;
+    EXPECT_FALSE(resp.key_handle_unknown()) << "set " << set << " was dropped from the table";
+    EXPECT_EQ(resp.ok_size(), static_cast<int>(kKeysPerSet)) << "set " << set;
+  }
+
+  server.Shutdown();
+  server_thread.join();
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+}
+
 }  // namespace
 }  // namespace mori::umbp
