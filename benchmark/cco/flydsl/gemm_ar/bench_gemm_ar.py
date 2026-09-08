@@ -41,9 +41,9 @@ because LSA is the faster collective, and a fused SDMA path has to beat
 
 Headline, 8x MI355X, [4096, 7168] out, K=1024, graph replay, median of 51:
 
-    split-lsa                    324.4us
-    split-sdma                   338.0
-    fused-sdma  chunks=1, agent  440.0
+    split-lsa                       324.4us
+    split-sdma                      338.0
+    fused-sdma  chunks=1, no fence  348.5
 
 Fusing loses. Read ``kernels_fused.py`` before trusting any faster fused number
 from this benchmark: several of its options are intermittently wrong, and a
@@ -144,14 +144,10 @@ def run(args) -> int:
     local_rank, rank, world_size, uid = _setup_distributed()
     fused = args.mode == "fused-sdma"
     needs_sdma = args.mode in ("split-sdma", "fused-sdma")
-    # One push per BLOCK_M row-band by default: the finest granularity the tile
-    # order can signal, and at the wo_b shape still a 3.7MB transfer, well past
-    # the ~1MB where SDMA bandwidth flattens out.
-    # Default 1, NOT one push per row-band. With more than one chunk per
-    # destination, two winning blocks post to the same SDMA queue concurrently
-    # and the result is intermittently wrong -- see the race note in
-    # kernels_fused. Fixing it needs the per-destination submit lock that the
-    # gcnasm protocol has and this does not.
+    # 1, even though >1 is what would create the overlap. A chunk boundary means
+    # the copy engine starts reading C *while the GEMM is still running*, and no
+    # combination of submit lock, post-submit barrier, release fence or atomic
+    # ordering made that reliable here -- see the race note in kernels_fused.
     chunks = args.chunks if args.chunks else 1
     cfg = ArConfig(
         world_size=world_size,
@@ -321,8 +317,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--chunks",
         type=int,
         default=0,
-        help="pushes per destination (0 = 1). Values > 1 are RACY: two winners "
-        "then share one SDMA queue. Kept settable only to reproduce that",
+        help="pushes per destination (0 = one per BLOCK_M row-band). >1 is what "
+        "produces the overlap, and requires the submit lock",
     )
     p.add_argument(
         "--tile-order",
@@ -337,7 +333,7 @@ def build_parser() -> argparse.ArgumentParser:
             "writethrough", "wt-agent", "raw-wt", "raw-wt-agent",
             "raw-wt-leader",
         ),
-        default="agent",
+        default="none",
         help="release before the epilogue push. Correct: 'agent' (default, "
         "cheapest) and 'all' (system scope, adds a buffer_inv that costs 20us). "
         "Incorrect, and present only to price the fence: 'leader', 'none', "

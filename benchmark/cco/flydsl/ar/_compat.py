@@ -298,6 +298,28 @@ def atomic_add_u32(ptr, value, *, ordering="monotonic"):
     )
 
 
+def atomic_xchg_u32(ptr, value, *, ordering="acquire"):
+    """Device-scope exchange; returns the previous value. Used as a test-and-set."""
+    return _llvm_d.atomicrmw(
+        _llvm_d.AtomicBinOp.xchg,
+        ptr,
+        fx.Int32(value).ir_value(),
+        getattr(_llvm_d.AtomicOrdering, ordering),
+        syncscope=_AGENT_SCOPE,
+        alignment=4,
+    )
+
+
+def atomic_store_u32(ptr, value, *, ordering="release"):
+    _llvm_d.store(
+        fx.Int32(value).ir_value(),
+        ptr,
+        alignment=4,
+        ordering=getattr(_llvm_d.AtomicOrdering, ordering),
+        syncscope=_AGENT_SCOPE,
+    )
+
+
 def release_fence(scope="agent"):
     """Release fence at an explicit scope, for producers of copy-engine input.
 
@@ -328,6 +350,8 @@ __all__ = [
     "local_store_u32",
     "atomic_add_u32",
     "release_fence",
+    "atomic_xchg_u32",
+    "atomic_store_u32",
     "i32_type",
     "CM_CACHED",
     "CM_SC1",

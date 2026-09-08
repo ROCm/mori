@@ -207,7 +207,7 @@ class ArConfig:
 
     @property
     def signal_bytes(self) -> int:
-        return self.counter_off + self.counter_bytes
+        return self.lock_off + self.lock_bytes
 
     @property
     def start_off(self) -> int:
@@ -241,6 +241,20 @@ class ArConfig:
     @property
     def counter_bytes(self) -> int:
         return _align_up(self.world_size * self.counter_chunks * 4, SIGNAL_ALIGN)
+
+    @property
+    def lock_off(self) -> int:
+        """One submit lock per destination, for the fused GEMM's epilogue.
+
+        Needed as soon as a destination has more than one chunk: the tile
+        counter elects one block per *chunk*, so two of them can reach the SDMA
+        submit for the same queue at once.
+        """
+        return self.counter_off + self.counter_bytes
+
+    @property
+    def lock_bytes(self) -> int:
+        return _align_up(self.world_size * 4, SIGNAL_ALIGN)
 
     def counter_slot(self, dest: int, chunk: int) -> int:
         if not 0 <= dest < self.world_size:

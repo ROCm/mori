@@ -71,97 +71,78 @@ of the GEMM and nothing overlaps. The rotation is gcnasm's
 ``opus_direct_stripe_tile`` idea. It costs nothing: 49.72us against 49.80us for
 the GEMM alone.
 
-## Correctness first: two races, and what is actually demonstrable
+## What gcnasm does differently, and why its GEMM+a2a wins
 
-Repeated runs matter more than any timing here. Validating once and reporting the
-number was how several wrong results in this file's history got published; the
-failure mode is intermittent and every individual relL2 looks "small".
+``/workspace/gcnasm/opus_gemm_dist/opus_gemm_a2a_lsa`` fuses a GEMM with an
+all-to-all and gets 16-27% out of it. Reading it explains most of why this does
+not, and one of its lessons was worth ~90us here.
 
-Measured over repeated 8-rank runs at [4096, 7168], K=1024:
+1. **Its collective is one phase; this one is three.** An a2a scatters the GEMM
+   output once. An all-reduce is scatter + reduce + all-gather, and fusion only
+   touches the scatter -- reduce + gather is 150us of the 327us baseline, 46%,
+   untouchable by construction.
+2. **Its ratio is inverted.** M=2048 N=18432 K=8192 gives ~518us of GEMM against
+   ~200us of comm, 2.6:1. wo_b is 39us against 137us per phase, 0.29:1. Overlap
+   can hide at most the smaller of the two, so theirs hides most of the comm and
+   this hides at most one GEMM.
+3. **Its best mode has no producer/consumer handoff at all.** "Direct LSA" has
+   the GEMM epilogue store *straight into the destination rank's buffer*. No
+   staging, no copy engine, nothing to publish mid-kernel -- the only sync is the
+   barrier at the end. The publication problem this file spends all its time on
+   simply does not exist there.
+4. **Its fused-SDMA path uses no cache fence.** ``opus_chunk_sdma_submit`` is
+   ``s_waitcnt vmcnt(0)``, ``s_barrier``, an ``__ATOMIC_ACQ_REL`` counter, and a
+   per-destination submit spin lock -- no ``__threadfence_system``, no
+   ``buffer_wbl2``. That is the lesson that transferred: the acq_rel counter *is*
+   the release, and the explicit fence added here was 90us of pure waste
+   (fused 440us -> 350us on removing it). Its ISA shows the atomic already emits
+   its own ``buffer_wbl2``/``buffer_inv`` pair, on thread 0 only.
 
-    config                                    passes   note
-    chunks=1, --fence agent, acq_rel atomic    6/6     the only stable one
-    chunks=2, --fence agent, acq_rel atomic    5/6     RACY
-    chunks=2, --fence agent, monotonic atomic  3/5     RACY, worse
-    chunks=1, --fence raw-wt-agent             2/4     RACY
-    standalone SDMA all-reduce (control)       5/5     stable
+## The chunking race, unexplained
 
-Two independent races, both mine:
+Overlap requires more than one chunk per destination: with one, the counter only
+fires when the whole slice is done, which under the rotated tile order is the end
+of the GEMM, so nothing overlaps (measured: scatter 129.0us against split's
+136.8 -- a 7.8us gain, i.e. none).
 
-1. **``chunks > 1`` shares an SDMA queue.** The modulo test elects exactly one
-   block per *chunk*, not one per *queue*, so with two chunks per destination two
-   winning blocks post to queue ``dest`` at the same time. The plan called for a
-   per-destination submit lock (gcnasm has one) and this skipped it on the
-   argument that the counter already elects a single CTA. That argument was about
-   the wrong thing. Default is now 1; ``--chunks 2`` reproduces the race.
+``--chunks 2`` is worth it on paper -- 328us, which would beat split-sdma's 338
+and tie split-lsa's 324 -- and it is **intermittently wrong**, in roughly 1 run in
+3. Ruled out, each by measurement rather than argument:
 
-2. **The counter atomic needs its acquire half.** It was changed to relaxed for a
-   19us win on the reasoning that the winner never reads the data it counts (the
-   copy engine does). Wrong: the winner needs the acquire so the other blocks'
-   releases are ordered before *its put*. ``acq_rel`` is the default again, and it
-   measurably reduces the failure rate.
+* the per-destination submit lock (gcnasm's, ISA-verified: test-and-set,
+  ``s_sleep`` backoff, correct spin) -- still 2/6 wrong;
+* the post-submit barrier gcnasm keeps -- still 4/6 wrong;
+* the release fence, at both agent and system scope -- still 3/6 wrong;
+* the counter atomic's ordering, ``acq_rel`` vs relaxed -- helps, does not fix.
 
-Write-through C stores (``--fence raw-wt``, ``raw-wt-agent``) are kept only as
-disproved options. The idea was to make the per-block ``buffer_wbl2`` unnecessary
-by having C reach memory at the store. It looked excellent -- GEMM 139.1us ->
-97.6us, total 333.8 against split-lsa's 327 -- and it is racy even at chunks=1,
-so those numbers describe a kernel that does not reliably compute the right
-answer. Note the sub-experiment was worth running anyway: it showed the
-un-coalesced per-lane 2-byte store does **not** collapse when it bypasses L2,
-which was the open question about whether ``StoreC`` has to be coalesced first.
+The one factor that separates working from broken is *when* the put is issued. At
+chunks=1 it lands at the very end of the GEMM; at chunks=2 the first one is
+issued mid-kernel and the engine reads C while the rest of the GEMM is still
+running. gcnasm's ChunkFused path does the same thing successfully, but its GEMM
+is 13x longer, so its chunk boundaries are far apart in time. Whether chunks=1
+here is *correct* or merely always-lucky is not established -- the mechanism
+suggests the latter, so treat the fused path as unproven either way.
 
 ## Result: the fusion does not pay
 
-Correct configurations only, 8 ranks, [4096, 7168], K=1024, graph replay:
+Correct-as-measured configurations only, 8 ranks, [4096, 7168], K=1024:
 
-    split-lsa                      324.4us
-    split-sdma                     338.0us
-    fused-sdma  chunks=1, agent    440.0us
+    split-lsa                            324.4us
+    split-sdma                           338.0
+    fused-sdma  chunks=1, no fence       348.5   (stable 6/6)
+    fused-sdma  chunks=1, agent fence    440.0   (the fence is 90us of waste)
 
-Per-kernel for the racy chunks=2 variant, which is the best case the structure
-can aspire to if the queue lock were built (rocprofv3 --kernel-trace, us):
+Per-kernel (rocprofv3 --kernel-trace, us):
 
-    config              gemm   scatter/drain  reduce  gather    sum
-    split                39.1        136.8      13.5   137.3   326.7
-    fused --fence none   64.5        103.4      13.5   136.6   318.0
-    fused --fence agent 139.1         66.3      13.5   136.5   355.4
+    config                     gemm   scatter  reduce  gather    sum
+    split-sdma                 39.1     136.8    13.5   137.3   326.8
+    fused c=1, no fence        62.7     129.0    13.0   136.2   341.0
+    fused c=1, agent fence    152.4     132.7    13.6   135.4   434.1
 
-The overlap is real -- the scatter collapses from 136.8us to 66.3us -- and it is
-still not enough, because the release fence adds more than that back inside the
-GEMM. An ATT thread trace puts the epilogue tail at 26% of the kernel's latency,
-almost all of it one instruction:
-
-    vaddr    cycles   % kernel  instruction
-    19396     91336      5.1%   s_waitcnt vmcnt(0)     retire this block's C
-    19400     22984      1.3%   s_barrier
-    19404       292      0.0%   buffer_wbl2 sc1        <- the op itself is free
-    19412    246804     13.9%   s_waitcnt vmcnt(0)     <- waiting on the writeback
-
-That wait is the largest single item in the whole kernel, larger than any
-main-loop stall, and it is **quadratic**: ``buffer_wbl2`` flushes the entire L2,
-so block k waits for every tile blocks 1..k-1 already wrote, 448 blocks over. The
-split path gets one bulk release at kernel end, free.
-
-Everything tried to make it cheaper, and what happened:
-
-* **Agent scope instead of system.** Correct and worth 20us: ``__threadfence_system``
-  is bidirectional and emits ``buffer_wbl2 sc0 sc1 ; s_waitcnt ; buffer_inv sc0
-  sc1``, and that ``buffer_inv`` discards the B weights the GEMM streams, 3584
-  times. cco exposes no agent-scope release, only ``cco_system_fence``, so it is
-  emitted as a raw ``llvm.fence`` (``_compat.release_fence``). Kept.
-* **One fence per block instead of per wave** (``--fence agent-leader``, and cco's
-  ``leaderOnly``). Incorrect in both spellings, including emitted inline in this
-  kernel to rule out the compiler sinking it. So the release is genuinely
-  per-wave. Its *time* is the useful part: 322.5us, i.e. an 8x cut in fence count
-  would be worth 41us and would win -- if it were legal.
-* **Non-temporal C stores** (``--fence nt-agent``). Worse, 411.2us.
-* **Write-through C stores.** Racy, see above.
-
-So what is missing is a **per-tile release**. Every primitive here publishes the
-whole cache, and the GEMM has 448 tiles to publish, so the cost is O(blocks^2)
-against an overlap worth at most one GEMM. The completion-counter machinery and
-the destination-rotated tile order are sound and produced the real overlap; they
-would pay immediately on a transport whose producer-side release is per-tile.
+So with the fence removed the whole remaining deficit is +23.6us inside the GEMM
+-- the block-wide barrier, the acq_rel counter, and the copy engine reading C
+while the GEMM writes it -- against a 7.8us overlap gain. The structure is sound;
+the shape is wrong for it.
 
 ## Pinned copy
 
@@ -191,6 +172,7 @@ import sys
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr, rocdl
+from flydsl.expr import gpu as fgpu
 from flydsl.expr.typing import Int64
 
 from aiter.ops.flydsl.kernels.gemm_a8w8_8wave import (
@@ -211,14 +193,46 @@ from mori.cco.device.flydsl import _bindings as raw_cco
 
 _AR_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ar")
 sys.path.insert(0, _AR_DIR)
+from flydsl._mlir import ir  # noqa: E402
+from flydsl._mlir.dialects import scf  # noqa: E402
+
 from _compat import (  # noqa: E402
     CM_SC0_SC1,
     atomic_add_u32,
+    atomic_store_u32,
+    atomic_xchg_u32,
+    i32_type,
     buffer_store,
     create_buffer_resource_from_addr,
     release_fence,
     signal_ptr,
 )
+
+
+def _acquire_peer_lock(lock_ptr):
+    """Test-and-set spin on one destination's submit lock.
+
+    Transferred from gcnasm ``opus_chunk_sdma_submit``: with more than one chunk
+    per destination the tile counter elects one block per *chunk*, so two of them
+    can reach the SDMA submit for the same queue at once. Serialising only the
+    submit -- not the GEMM work -- is the point.
+
+    Termination: the contending blocks are elected in chunk order, and chunk c's
+    tiles are dispatched before chunk c+1's, so a spinning block is always
+    waiting on one that has already run.
+    """
+    i32 = i32_type()
+    first = atomic_xchg_u32(lock_ptr, 1)
+    loop = scf.WhileOp([i32], [first])
+    cond = ir.Block.create_at_start(loop.before, [i32])
+    body = ir.Block.create_at_start(loop.after, [i32])
+    with ir.InsertionPoint(cond):
+        held = fx.Uint32(fx.Int32(cond.arguments[0])) > fx.Uint32(fx.Int32(0))
+        scf.ConditionOp(held.ir_value(), [cond.arguments[0]])
+    with ir.InsertionPoint(body):
+        fx.rocdl.s_sleep(1)
+        nxt = atomic_xchg_u32(lock_ptr, 1)
+        scf.YieldOp([nxt])
 
 
 class _RawWriteThroughStoreC(StoreC):
@@ -296,7 +310,7 @@ def compile_fused_gemm_scatter(
     xcd_swizzle: int = 0,
     fuse: bool = True,
     rotated: bool | None = None,
-    fence: str = "agent",
+    fence: str = "none",
     emit_put: bool = True,
     atomic_order: str = "acq_rel",
 ):
@@ -376,6 +390,7 @@ def compile_fused_gemm_scatter(
         )
     _kname_tag = f"c{chunks}{'r' if rotated else 'l'}{fence[0]}"
     counter_off = cfg.counter_off
+    lock_off = cfg.lock_off
     in_off = cfg.input_off
     my_recv_slot = cfg.recv_slot_off(rank) if cfg.recv_slots else 0
     slice_bytes = cfg.slice_bytes
@@ -665,6 +680,12 @@ def compile_fused_gemm_scatter(
                         # short issue only, and they share one xGMI link either
                         # way, so a queue each would buy nothing.
                         off = fx.Int64(chunk) * fx.Int64(chunk_bytes)
+                        lock = signal_ptr(
+                            fx.Int64(w.lsa_ptr(rank, lock_off))
+                            + fx.Int64(dest) * fx.Int64(4)
+                        )
+                        if const_expr(chunks > 1):
+                            _acquire_peer_lock(lock)
                         sdma.put(
                             dest,
                             win,
@@ -678,6 +699,11 @@ def compile_fused_gemm_scatter(
                             coop=cco.CoopScope.THREAD,
                             signal=False,
                         )
+                        if const_expr(chunks > 1):
+                            atomic_store_u32(lock, 0)
+            # gcnasm closes its ChunkFused epilogue with a barrier here; its
+            # README lists removing it as a rejected experiment that deadlocked.
+            fgpu.barrier()
 
     @flyc.jit
     def launch(
