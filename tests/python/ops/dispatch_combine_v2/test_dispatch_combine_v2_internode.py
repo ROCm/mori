@@ -44,58 +44,6 @@ without a QP.
 ``tools/run_internode_test.sh`` drives both ranks; the CLI below is the subset of
 the shmem harness's flags that means anything here.
 
-CCO's TAIL IS NOT THE FABRIC'S: WHAT SHMEM DOES ON THE SAME WIRE
-----------------------------------------------------------------
-Run the v1 harness in the same session for a reference. It drives the shmem/IBGDA
-transport over the SAME NICs, rails, switch and QoS, at the same shape, so it
-isolates what is specific to the CCO path. Note it spawns its own 8 workers per
-node, so it takes --nproc_per_node=1, not 8:
-
-    GPU_PER_NODE=8 MORI_EP_LAUNCH_CONFIG_MODE=AUTO MORI_RDMA_TC=160 MORI_RDMA_SL=5 \\
-    torchrun --nnodes=2 --node_rank=N --nproc_per_node=1 --master_addr=... \\
-      examples/ops/dispatch_combine/test_dispatch_combine_internode.py \\
-      --cmd bench --kernel-type v1_ll --num-qp 1 --max-tokens 4 \\
-      --hidden-dim 6144 --dtype fp8_e4m3_fnuz --combine-dtype bf16 --quant-type none
-
-Measured, 29 kept rounds x 16 ranks = 464 samples per phase:
-
-                       shmem/IBGDA          CCO/GDA (here)
-    dispatch mean         47.4us              40-47us
-    combine  mean         59.1us              46-52us
-    max/mean              1.19x / 1.18x       2-6x
-    rounds >1.8x base     0 of 29             11 of ~260
-    cross-rank spread     median 9-13us       up to 207us (34 -> 241)
-
-Two things follow. CCO is FASTER in the mean -- combine by ~20% -- so the port is
-not simply worse. And the tail belongs to the CCO path, not to the fabric: shmem
-shares every wire and shows no spiked round at all, which rules out the rail and
-switch explanations that the {i, i+8} pattern below otherwise suggests.
-
-Both harnesses do have a huge round 0 (shmem's spans 83-614us) and both drop 1.
-
-READING THE PER-RANK SERIES (MORI_EP_ROUND_SERIES)
---------------------------------------------------
-Every rank prints its own per-round series. These are spin-wait collectives, so
-the rank that arrives LAST waits LEAST: on a slow round the straggler is the
-MINIMUM, not the maximum, and the other fifteen are just showing what they waited
-for. Threshold per NODE, not globally -- the two nodes routinely sit at different
-levels in the same round (151 vs 237us was measured), and a global threshold then
-misses a rank that is low within its own node.
-
-The shape of the low set says what happened, and they are not all the same:
-
-  {i, i+8}          one RAIL. Local rank i selects bnxt_re_bond<i> ("rank 1
-                    rankInNode 1 select device [1] bnxt_re_bond1"), so the same
-                    local index on both nodes is one NIC-to-NIC path.
-  {i}               one rank.
-  all of one node    a node-level event; the other node's eight ranks all wait.
-  empty             every rank waited, including the fastest -- no straggler
-                    exists and no single card can explain it.
-
-Measured over 11 spiked rounds in 9 runs: 5 empty, 3 rail pairs (rails 1, 5 and 7,
-once each), 2 single ranks, 1 other. So no one card is at fault; when there is a
-straggler its identity rotates.
-
 RoCE QoS: SET MORI_RDMA_TC AND MORI_RDMA_SL
 -------------------------------------------
 Unset, ``bnxt.cpp`` takes ``ReadRdmaServiceLevelEnv().value_or(1)`` and leaves
@@ -114,6 +62,11 @@ contradictory: a lossless priority class buys nothing when the benchmark is the
 only traffic on the fabric. It is worth setting because a number measured in the
 wrong traffic class does not transfer to a shared one, not because it is a
 speedup.
+
+Findings from the CCO-vs-shmem investigation -- why the tail is CCO-specific, and
+how to read the per-rank series for straggler attribution -- live in
+``docs/EP_INTERNODE_V2_TAIL.md`` rather than here, so this file stays close in
+shape to the examples harness it mirrors.
 
 COMPARING AGAINST THE v1 BENCH
 ------------------------------
@@ -356,32 +309,6 @@ def _verify_once(op, cfg, d, dev, a, comm, inp, idx, wts, sc):
     return ok and ok_w
 
 
-def _sclk_levels():
-    """Active DPM shader-clock level of every GPU on this host, as a string.
-
-    The amdgpu driver publishes the level table per card with a `*` on the
-    active one; on this rig that is 88MHz idle / 500MHz / 1850MHz with
-    power_dpm_force_performance_level=auto, so a run that never boosts is
-    several times slower at identical code. Cards are not numbered contiguously
-    (card0, card16, card24...) and the HIP device order does not have to match
-    the DRM order, so this reports ALL of them rather than pretending to know
-    which one is ours -- the question is whether the node boosted, not which
-    card did. A plain sysfs read, microseconds, no subprocess.
-    """
-    import glob
-
-    out = []
-    for path in sorted(glob.glob("/sys/class/drm/card*/device/pp_dpm_sclk")):
-        try:
-            for line in open(path):
-                if "*" in line:
-                    out.append(line.split(":")[1].split("*")[0].strip())
-                    break
-        except OSError:
-            pass
-    return " ".join(out) if out else "n/a"
-
-
 def _v1_loop_defaults():
     """The examples harness's rounds/warmup/drop defaults, read from its source.
 
@@ -543,42 +470,9 @@ def _bench(op, cfg, d, dev, a, comm):
     # no assumption about what any window "should" cost.
     inject = float(os.environ.get("MORI_EP_INJECT_HOST_US") or 0) / 1e6
 
-    # Which round a garbage collection lands in, opt-in. The spikes are GLOBAL --
-    # 12 to 16 of 16 ranks spike in the same round -- so the cause is something
-    # every rank does on its own schedule, not a straggler one rank produces. A
-    # generational GC is exactly that shape: it fires on allocation counts, and
-    # every rank allocates the same objects per round, so they all reach the
-    # threshold on the same round. This records the collections rather than
-    # inferring them from an A/B. (gc.disable() was A/B'd before and read
-    # negative, but that run had 2 kept rounds and a round-8 event was not in the
-    # sample at all -- the test could not have detected what it was testing for.)
-    gc_hits = []
-    gc_cb = None
-    _cur = [-1]
-    if os.environ.get("MORI_EP_GC_TRACE"):
-        import gc
-
-        def gc_cb(phase, info):
-            if phase == "stop":
-                gc_hits.append((_cur[0], info.get("generation"), info.get("collected")))
-
-        gc.callbacks.append(gc_cb)
-
-    # Opt-in counterpart: freeze everything already alive and stop collecting for
-    # the timed loop. gc.freeze() moves the existing objects to a permanent
-    # generation so re-enabling later does not immediately pay for them.
-    _no_gc = bool(os.environ.get("MORI_EP_NO_GC"))
-    if _no_gc:
-        import gc
-
-        gc.collect()
-        gc.freeze()
-        gc.disable()
-
-    _sclk_before = _sclk_levels() if os.environ.get("MORI_EP_SCLK") else None
     # Per-pass marks accumulate inside the backend when MORI_EP_SPLIT_PASSES is
-    # set. Clear them here so only the timed loop's are read; the warmup ran with
-    # the same code path and left its own behind.
+    # set. Cleared here so only the timed loop's are read; the warmup ran the
+    # same code path and left its own behind.
     _marks = getattr(op, "_pass_marks", None)
     if _marks is not None:
         del _marks[:]
@@ -586,30 +480,9 @@ def _bench(op, cfg, d, dev, a, comm):
     t0 = time.perf_counter()
     ev[0].record()
 
-    # Host-side duration of each enqueue, opt-in via the same flag as the round
-    # series. These calls are asynchronous: while the host runs ahead of the GPU
-    # they return as soon as the work is queued, so this reads as pure Python
-    # cost. Once the launch queue is full they BLOCK until the GPU retires
-    # something, and the number jumps. That transition is the thing to look for
-    # -- it says the loop stopped measuring the kernel and started measuring the
-    # host, and it is invisible in the event timings, which report the same
-    # wall-clock either way. perf_counter is ~50ns, far below what it resolves.
-    hdisp = [0.0] * n
-    hcomb = [0.0] * n
-    # WHEN each round started on this rank, relative to the loop start. Durations
-    # cannot see a rank that entered the round late -- only one that took long
-    # once inside -- and a spin-wait collective punishes lateness, not slowness.
-    # All ranks barrier immediately before t0, so these are comparable across
-    # ranks to within the barrier skew even though the two nodes' clocks are not
-    # synchronised (t0 is each rank's own zero).
-    hstart = [0.0] * n
 
     for i in range(n):
-        _cur[0] = i
-        _h = time.perf_counter()
-        hstart[i] = (_h - t0) * 1e6
         r = op.dispatch(inp, wts, sc, idx, return_routing=True)
-        hdisp[i] = (time.perf_counter() - _h) * 1e6
         ev[3 * i + 1].record()
         x = convert(r[0])
         ev[3 * i + 2].record()
@@ -617,9 +490,7 @@ def _bench(op, cfg, d, dev, a, comm):
             t = time.perf_counter()
             while time.perf_counter() - t < inject:
                 pass
-        _h = time.perf_counter()
         op.combine(x, cw, routing=r[5])
-        hcomb[i] = (time.perf_counter() - _h) * 1e6
         ev[3 * i + 3].record()
         if a.per_round_sync:
             torch.cuda.synchronize()
@@ -668,24 +539,6 @@ def _bench(op, cfg, d, dev, a, comm):
                     flush=True,
                 )
 
-    if _sclk_before is not None and d.rank == 0:
-        print(f"# SCLK before: {_sclk_before}", flush=True)
-        print(f"# SCLK after:  {_sclk_levels()}", flush=True)
-    if _no_gc:
-        import gc
-
-        gc.enable()
-        gc.unfreeze()
-    if gc_cb is not None:
-        import gc
-
-        gc.callbacks.remove(gc_cb)
-        if gc_hits:
-            print(
-                "# GC r%d: " % d.rank
-                + " ".join("round%d/gen%s/n%s" % h for h in gc_hits),
-                flush=True,
-            )
 
     # Host profile, opt-in. Whenever wall exceeds dispatch+combine the loop above
     # is host-paced, and then its phase numbers are wrapper cost rather than
@@ -767,20 +620,6 @@ def _bench(op, cfg, d, dev, a, comm):
         )
         print(
             "# rounds r%d comb: " % d.rank + " ".join("%.0f" % x for x in comb),
-            flush=True,
-        )
-        print(
-            "# hostus r%d disp: " % d.rank
-            + " ".join("%.0f" % x for x in hdisp[keep]),
-            flush=True,
-        )
-        print(
-            "# hostus r%d comb: " % d.rank
-            + " ".join("%.0f" % x for x in hcomb[keep]),
-            flush=True,
-        )
-        print(
-            "# entry r%d: " % d.rank + " ".join("%.0f" % x for x in hstart[keep]),
             flush=True,
         )
 
