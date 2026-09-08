@@ -212,7 +212,7 @@ class Dist:
 
 def _parse_args(argv):
     p = argparse.ArgumentParser(description="v2 internode dispatch/combine test")
-    p.add_argument("--cmd", default="test", choices=["test", "bench"])
+    p.add_argument("--cmd", default="test", choices=["test", "bench", "tuning"])
     p.add_argument("--max-tokens", type=int, default=128)
     p.add_argument("--hidden-dim", type=int, default=7168)
     p.add_argument("--topk", type=int, default=8)
@@ -231,6 +231,20 @@ def _parse_args(argv):
     # against a 29-round mean. Not a small-sample caveat: a different estimator.
     p.add_argument("--rounds", type=int, default=30)
     p.add_argument("--scale-dim", type=int, default=0)
+    p.add_argument("--tuning-scope", default="quick", choices=["quick", "full"])
+    p.add_argument("--tuning-reps", type=int, default=3)
+    # Smoke-test / bisect aid: stop after N candidates (0 = sweep all).
+    p.add_argument("--tuning-limit", type=int, default=0)
+    p.add_argument("--tuning-phase", default="dispatch", choices=["dispatch", "combine"])
+    # Validation mode: sweep exactly one named candidate against the shipped
+    # geometry. A sweep winner is chosen by a greedy chain of paired tests, each
+    # with its own error; before it is written into the table it gets one long
+    # head-to-head against what it would replace.
+    p.add_argument("--tuning-candidate", default=None)
+    # How much better a candidate must be, on the paired difference, to take
+    # over. Whichever of the two is larger. Not 0: see the note in _tune.
+    p.add_argument("--tuning-margin-us", type=float, default=1.5)
+    p.add_argument("--tuning-margin-frac", type=float, default=0.02)
     # The v1 bench calls combine with weights=None, so it does not pay for the
     # weight fold: an extra peer read per (token, destination) plus an accumulate
     # in three kernels, and a wider staging slot (combXferBytes = hidden + weights).
@@ -772,6 +786,199 @@ def _bench(op, cfg, d, dev, a, comm):
     return 0
 
 
+
+def _timed_pass(op, cfg, d, a, inp, idx, wts, sc, cw, convert, n, warm):
+    """One warmup+timed block; returns (dispatch_us, combine_us) as grand means
+    over rounds x ranks -- the same statistic _bench and run_bench_once report."""
+    ev = [torch.cuda.Event(enable_timing=True) for _ in range(3 * n + 1)]
+    for _ in range(warm):
+        r = op.dispatch(inp, wts, sc, idx, return_routing=True)
+        op.combine(convert(r[0]), cw, routing=r[5])
+    torch.cuda.synchronize()
+    ev[0].record()
+    for i in range(n):
+        r = op.dispatch(inp, wts, sc, idx, return_routing=True)
+        ev[3 * i + 1].record()
+        x = convert(r[0])
+        ev[3 * i + 2].record()
+        op.combine(x, cw, routing=r[5])
+        ev[3 * i + 3].record()
+    torch.cuda.synchronize()
+    keep = slice(a.drop_rounds, None)
+    dv = [ev[3 * i].elapsed_time(ev[3 * i + 1]) * 1e3 for i in range(n)][keep]
+    cv = [ev[3 * i + 2].elapsed_time(ev[3 * i + 3]) * 1e3 for i in range(n)][keep]
+    gm = lambda v: d.allreduce_sum(int(sum(v) / len(v) * 1000)) / d.world / 1000
+    return gm(dv), gm(cv)
+
+
+def _build_op(cfg, comm, dgeom, cgeom):
+    """An op whose dispatch plans are compiled for `dgeom` and its combine plans
+    for `cgeom`. Goes through the MORI_EP_*_GEOM hook the backend already exposes
+    for sweeps: a geometry is a compile-time identity there, read once at build
+    time, so it cannot be selected per launch the way v1's can.
+
+    The two are SEPARATE because the shipped table gives them separate values
+    (tokens 4: dispatch 64/32/8, combine 32/21/6). Driving both from one geometry
+    means the sweep's incumbent is not the configuration actually shipped, so
+    "beats the incumbent" would not mean "beats what we ship".
+    """
+    old = (os.environ.get("MORI_EP_DISP_GEOM"), os.environ.get("MORI_EP_COMB_GEOM"))
+    os.environ["MORI_EP_DISP_GEOM"] = "%d,%d,%d" % dgeom
+    os.environ["MORI_EP_COMB_GEOM"] = "%d,%d,%d" % cgeom
+    try:
+        return EpDispatchCombineOp(cfg, comm)
+    finally:
+        for k, v in zip(("MORI_EP_DISP_GEOM", "MORI_EP_COMB_GEOM"), old):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def _tune(cfg, d, dev, a, comm):
+    """Sweep launch geometries and report the winner for this token count.
+
+    Structured after tuning_dispatch_combine in the examples harness -- same
+    candidate construction (block doubling plus 8/16, warp list, rdma as a
+    fraction of block), same selection metric (grand-mean latency) -- with ONE
+    deliberate difference, which the numbers force.
+
+    That harness measures each candidate once and compares the means. It can:
+    its transport's max/mean is 1.19 and its run-to-run spread is a few percent.
+    Ours is not: the same geometry measured back to back has produced 86us and
+    137us total, and a straight sweep here already "found" 64,32,4 beating the
+    shipped 64,32,8 by 5% on the mean and 30% on the worst -- which vanished
+    entirely when the two were run alternately, four pairs. A one-shot sweep on
+    this path selects noise and writes it into the table as if it were tuning.
+
+    So the incumbent stays LIVE and every candidate is measured against it
+    alternately, `reps` times each, comparing medians. Two ops hold symmetric
+    windows at once; the loser is closed immediately. Drift, whatever its cause,
+    then applies to both arms of every comparison instead of to whichever
+    candidate happened to run during it.
+    """
+    sm = torch.cuda.get_device_properties(dev).multi_processor_count
+    blocks = {b for b in (8, 16) if b < sm}
+    p = 32
+    while p <= sm:
+        blocks.add(p)
+        p <<= 1
+    blocks.add(sm)
+    warps = [4, 8, 16] if a.tuning_scope == "quick" else [4, 6, 8, 12, 16]
+
+    def rdmas(bn):
+        frac = (bn // 2, bn * 2 // 3) if a.tuning_scope == "quick" else (bn // 4, bn // 2, bn * 2 // 3)
+        return sorted({v for v in frac if 1 <= v < bn})
+
+    cands = [(b, r, w) for b in sorted(blocks) for w in warps for r in rdmas(b)]
+    if a.tuning_candidate:
+        cands = [tuple(int(x) for x in a.tuning_candidate.split(","))]
+    elif a.tuning_limit:
+        cands = cands[: a.tuning_limit]
+
+    from mori.ops.dispatch_combine_v2.internode_tuning_configs import lookup
+
+    tbl = lookup(cfg.world_size, cfg.hidden_dim, cfg.num_experts_per_token, a.max_tokens)
+    # The incumbent is the SHIPPED pair, so a win means "better than what we ship".
+    inc_d = tuple(tbl["dispatch"]) if tbl else cands[0]
+    inc_c = tuple(tbl["combine"]) if tbl else cands[0]
+    phase = a.tuning_phase
+    start = inc_d if phase == "dispatch" else inc_c
+    if start in cands:
+        cands.remove(start)
+
+    if d.rank == 0:
+        print(
+            f"# TUNING tok={a.max_tokens} phase={phase} scope={a.tuning_scope} "
+            f"reps={a.tuning_reps} sm={sm} candidates={len(cands)} "
+            f"shipped dispatch={inc_d} combine={inc_c}",
+            flush=True,
+        )
+
+    rng = torch.Generator(device=dev)
+    rng.manual_seed(4242 + d.rank)
+    inp, idx, wts, sc = _gen_round(rng, cfg, a.max_tokens, dev, cfg.dispatch_dtype)
+    convert = (lambda x: x.to(cfg.combine_dtype)) if cfg.is_asymmetric_dtype else (lambda x: x)
+    cw = wts if a.bench_weights else None
+
+    # Only the swept phase varies; the other stays at the shipped value, because
+    # the two are coupled (a dispatch with too few rdma blocks leaves the combine
+    # after it slower) and a per-phase argmin measured against a DIFFERENT other
+    # phase does not carry over.
+    geoms = lambda g: ((g, inc_c) if phase == "dispatch" else (inc_d, g))
+    pick = (lambda dv, cv: dv) if phase == "dispatch" else (lambda dv, cv: cv)
+
+    best_op = _build_op(cfg, comm, *geoms(start))
+    if a.kernel_type is not None:
+        best_op._internode_force_ll = a.kernel_type == "v1_ll"
+    comm.barrier()
+    best = start
+    best_med = None
+
+    for k, cand in enumerate(cands):
+        try:
+            cand_op = _build_op(cfg, comm, *geoms(cand))
+        except Exception as exc:  # a geometry the backend rejects is not a failure
+            if d.rank == 0:
+                print(f"#   [{k + 1}/{len(cands)}] {cand} rejected: {exc}", flush=True)
+            continue
+        if a.kernel_type is not None:
+            cand_op._internode_force_ll = a.kernel_type == "v1_ll"
+        comm.barrier()
+
+        bt, ct_ = [], []
+        for _ in range(a.tuning_reps):
+            dv, cv = _timed_pass(best_op, cfg, d, a, inp, idx, wts, sc, cw, convert, a.rounds, a.warmup)
+            bt.append(pick(dv, cv))
+            dv, cv = _timed_pass(cand_op, cfg, d, a, inp, idx, wts, sc, cw, convert, a.rounds, a.warmup)
+            ct_.append(pick(dv, cv))
+        bm, cm = sorted(bt)[len(bt) // 2], sorted(ct_)[len(ct_) // 2]
+        # PAIRED comparison, not a difference of medians. The two arms are
+        # measured alternately inside one rep, so both see the same regime -- and
+        # the regime moves a lot during a sweep: the SAME incumbent geometry has
+        # read 84.9us on one candidate and 126.0us on the next. Differencing
+        # within a rep cancels that; differencing the medians does not, and the
+        # first version of this promoted three candidates on gaps under 1us
+        # (125.7 vs 126.0) that were pure regime noise being written into the
+        # table as if they were tuning results.
+        #
+        # The margin is then a floor on how big the paired improvement has to be.
+        # v1's equivalent (MORI_EP_TUNING_MARGIN) defaults to 0 -- any improvement
+        # wins -- which is safe at its 1.19x max/mean and is not safe here.
+        diffs = sorted(c - b_ for b_, c in zip(bt, ct_))
+        lo, hi = diffs[0], diffs[-1]
+        dmed = diffs[len(diffs) // 2]
+        win = dmed < -max(a.tuning_margin_us, bm * a.tuning_margin_frac)
+        if d.rank == 0:
+            print(
+                f"#   [{k + 1}/{len(cands)}] {cand} med={cm:6.1f}us vs "
+                f"incumbent {best} med={bm:6.1f}us  paired={dmed:+6.1f}us "
+                f"[{lo:+.1f},{hi:+.1f}]  {'WIN' if win else '--'}",
+                flush=True,
+            )
+        if win:
+            best_op.close()
+            best_op, best, best_med = cand_op, cand, cm
+        else:
+            cand_op.close()
+            best_med = bm
+        comm.barrier()
+
+    best_op.close()
+    if d.rank == 0:
+        d_out = best if phase == "dispatch" else inc_d
+        c_out = best if phase == "combine" else inc_c
+        print(
+            f"# TUNING RESULT tok={a.max_tokens} phase={phase}: "
+            f"block/rdma/warp={best} median {phase}={best_med:.1f}us "
+            f"(shipped was {start})\n"
+            f"#   table row: ({a.max_tokens}, {d_out[0]}, {d_out[1]}, {d_out[2]}, "
+            f"{c_out[0]}, {c_out[1]}, {c_out[2]}),",
+            flush=True,
+        )
+    return 0
+
+
 def main(argv):
     a = _parse_args(argv)
     d = Dist()
@@ -821,6 +1028,14 @@ def main(argv):
         if a.cmd == "bench":
             rc = _bench(op, cfg, d, dev, a, comm)
             op.close()
+            d.shutdown()
+            return rc
+
+        if a.cmd == "tuning":
+            # The sweep builds its own ops, one per candidate geometry; this one
+            # only proved the config is constructible.
+            op.close()
+            rc = _tune(cfg, d, dev, a, comm)
             d.shutdown()
             return rc
 
