@@ -90,6 +90,7 @@ from mori.cco.device.flydsl import _bindings as raw_cco
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _compat import (  # noqa: E402
     CM_CACHED,
+    CM_SC1,
     buffer_load,
     buffer_store,
     create_buffer_resource_from_addr,
@@ -110,7 +111,14 @@ PUSH_THREADS = 64
 
 
 def build_sdma_phases(
-    cfg, rank: int, *, queues: int = 8, signal: bool = False, reduce_blocks=None
+    cfg,
+    rank: int,
+    *,
+    queues: int = 8,
+    signal: bool = False,
+    reduce_blocks=None,
+    reduce_self_from_recv: bool = False,
+    recv_uncached: bool = False,
 ):
     """Compile the phases separately, so the fused GEMM can reuse the tail.
 
@@ -246,9 +254,17 @@ def build_sdma_phases(
         bid = fx.block_idx.x
         w = cco.Window(win)
 
+        # j=0 is my own contribution. Normally it is still sitting in my input
+        # region; with the Direct-LSA fused GEMM the epilogue wrote it into my own
+        # recv slot instead, along with everyone else's.
+        self_off = (
+            cfg.recv_slot_off(rank)
+            if reduce_self_from_recv
+            else in_off + my_slice_off
+        )
         srcs = [
             create_buffer_resource_from_addr(
-                wave_uniform_i64(w.lsa_ptr(rank, in_off + my_slice_off))
+                wave_uniform_i64(w.lsa_ptr(rank, self_off))
             )
         ] + [
             create_buffer_resource_from_addr(
@@ -265,8 +281,18 @@ def build_sdma_phases(
             i32_off = pk * I32_PER_PACK
             acc = None
             for j in range_constexpr(ws):
+                # recv is filled by a *peer*. When the copy engine wrote it the
+                # lines are coherent, but when a peer's CUs stored into it over
+                # xGMI our own L2 is never invalidated, so a cached load here can
+                # return the previous iteration's bytes. SC1 skips L2 for those.
                 raw = fx.Vector(
-                    buffer_load(srcs[j], i32_off, vec_width=4, dtype=i32_type())
+                    buffer_load(
+                        srcs[j],
+                        i32_off,
+                        vec_width=4,
+                        dtype=i32_type(),
+                        cache_modifier=CM_SC1 if recv_uncached else CM_CACHED,
+                    )
                 )
                 v = (
                     raw.bitcast(fx.Float32)

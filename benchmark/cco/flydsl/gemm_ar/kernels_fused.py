@@ -71,7 +71,51 @@ of the GEMM and nothing overlaps. The rotation is gcnasm's
 ``opus_direct_stripe_tile`` idea. It costs nothing: 49.72us against 49.80us for
 the GEMM alone.
 
-## What gcnasm does differently, and why its GEMM+a2a wins
+## Direct LSA (``--mode fused-lsa``): the structure works, the store does not
+
+gcnasm's best mode has the GEMM epilogue store *straight into the destination
+rank's window*, so there is no staging buffer, no copy engine and nothing to
+publish mid-kernel. Ported here, and the structural half is emphatic
+(rocprofv3 --kernel-trace, us):
+
+    config                gemm   scatter/barrier  reduce  gather    sum
+    split-sdma            39.1        136.8         13.5   137.3   326.8
+    fused-sdma c=1        62.7        129.0         13.0   136.2   341.0
+    fused-lsa (Direct)   166.6         13.3         11.1   135.5   326.6
+
+The scatter collapses from 136.8us to 13.3us -- the transfer is *entirely*
+absorbed, which is what fused-sdma never managed. And the un-coalesced store is
+nowhere near as bad as expected: 7.34MB per link in 166.6us is ~44 GB/s, 82% of
+the SDMA scatter's 53.7, against the 0.26x gcnasm measured for a lane-scatter
+pushed to a peer.
+
+It is nonetheless **not correct**, and the reason makes the ``StoreC`` coalescing
+rewrite a correctness prerequisite rather than an optimisation:
+
+* **Cached peer stores validate 2-3 runs in 6.** The lines are homed in the
+  peer's memory but sit dirty in whichever XCD's L2 the block ran on. Nothing
+  downstream can clean that up -- the barrier kernel is one block, and
+  ``buffer_wbl2`` writes back only the L2 of the XCD it runs on, one of eight.
+* **Uncached (sc0|sc1) peer stores are consistently wrong** (relL2 ~3e-2, never
+  right) **and slower** (426us against 341). ``_store_bf16`` writes one bf16, so
+  bypassing L2 makes every store a 2-byte partial-line write; concurrent sub-32B
+  writes into the same sector across the fabric lose updates. Adding an uncached
+  recv load in the reduce does not change it, so this is the store, not a stale
+  read.
+
+So L2 merging is what makes the narrow store work at all, and L2 residency is
+what makes it invisible. The two are only separable by widening the store --
+gcnasm's wave-local ``ds_bpermute`` pair-coalesced C store (their "C-store mode
+2"; staging C through LDS regressed 1-3%). That is why they needed it.
+
+Even coalesced, this does not obviously win. The fused sum is 326.6us against
+split-lsa's ~324: LSA's 2-stage does read + reduce + write in a single pass over
+the wire, so its reduce is free, whereas Direct LSA writes to the peer and then
+pays a separate local reduce pass -- and its store rate is ~18% under LSA's read
+rate. The prize for coalescing is correctness plus maybe a few percent, not a
+step change.
+
+## What gcnasm does differently## What gcnasm does differently, and why its GEMM+a2a wins
 
 ``/workspace/gcnasm/opus_gemm_dist/opus_gemm_a2a_lsa`` fuses a GEMM with an
 all-to-all and gets 16-27% out of it. Reading it explains most of why this does
@@ -201,7 +245,10 @@ from _compat import (  # noqa: E402
     atomic_add_u32,
     atomic_store_u32,
     atomic_xchg_u32,
+    buffer_store,
+    create_buffer_resource_from_addr,
     i32_type,
+    wave_uniform_i64,
     buffer_store,
     create_buffer_resource_from_addr,
     release_fence,
@@ -263,6 +310,41 @@ class _RawWriteThroughStoreC(StoreC):
         buffer_store(value_bf16, self._c_rsrc, c_index, cache_modifier=CM_SC0_SC1)
 
 
+class _PeerDirectStoreC(StoreC):
+    """``StoreC`` that writes its tile straight into the owning peer's window.
+
+    This is gcnasm's "Direct LSA" shape (``opus_gemm_a2a_lsa``), and its whole
+    point is that there is no producer/consumer handoff inside the kernel: the
+    bytes go to the destination as they are produced, so nothing has to be
+    published mid-kernel, there is no completion counter, no submit lock and no
+    release fence. The only synchronisation left is the cross-rank barrier after
+    the kernel, where a kernel-end release has already happened for free.
+
+    A block's rows all belong to one destination (``block_m // m_tiles_per_peer``),
+    so the peer descriptor is uniform per block and is built once.
+
+    ``elem_base`` rebases the global row index onto the destination's slice.
+    ``StoreC.store`` masks out-of-range columns by redirecting them to
+    ``c_rows * c_cols``, and that stays out of range after rebasing: the largest
+    ``elem_base`` is ``(world-1) * slice_rows * c_cols``, which leaves exactly
+    ``slice_rows * c_cols`` elements -- one past the end of the descriptor.
+    """
+
+    def __init__(self, *args, peer_rsrc=None, elem_base=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._peer_rsrc = peer_rsrc
+        self._elem_base = elem_base
+
+    def _store_bf16(self, value_bf16, c_index):
+        # Cached, and that is the unresolved half of this variant. See the
+        # "Direct LSA" note in the module docstring: uncached (sc0|sc1) is
+        # *consistently* wrong here because a 2-byte store bypassing L2 is a
+        # partial-line write, and cached is only intermittently right because the
+        # dirty peer-homed lines cannot be flushed out of eight XCDs' L2s
+        # afterwards. Coalescing the store first resolves both.
+        buffer_store(value_bf16, self._peer_rsrc, c_index - self._elem_base)
+
+
 class _NonTemporalStoreC(StoreC):
     """``StoreC`` with non-temporal C stores (the copy atom's only other mode).
 
@@ -310,6 +392,7 @@ def compile_fused_gemm_scatter(
     xcd_swizzle: int = 0,
     fuse: bool = True,
     rotated: bool | None = None,
+    transport: str = "sdma",
     fence: str = "none",
     emit_put: bool = True,
     atomic_order: str = "acq_rel",
@@ -332,6 +415,9 @@ def compile_fused_gemm_scatter(
     cfg.validate()
     ws = cfg.world_size
     M, N = cfg.m, cfg.n
+    if transport not in ("sdma", "lsa"):
+        raise ValueError(f"transport must be sdma or lsa, got {transport!r}")
+    direct_lsa = fuse and transport == "lsa"
     rotated = fuse if rotated is None else rotated
 
     assert BLOCK_M >= 128 and BLOCK_N >= 256
@@ -396,7 +482,7 @@ def compile_fused_gemm_scatter(
     slice_bytes = cfg.slice_bytes
 
     _kname = (
-        f"mori_fused_{'sdma' if fuse else 'split'}_8w_"
+        f"mori_fused_{(transport if fuse else 'split')}_8w_"
         f"{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_k{K}_{_kname_tag}"
         f"{'p' if emit_put else 'x'}{atomic_order[0]}_r{rank}"
     )
@@ -483,12 +569,32 @@ def compile_fused_gemm_scatter(
         )
 
         mfma = Mfma16x16x128(N_TILES_A, N_TILES_B)
+        w_pre = cco.Window(win)
 
         a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
         b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
         a_s2r = S2RLoader(wave_m, N_TILES_A)
         b_s2r = S2RLoader(wave_n, N_TILES_B)
-        if const_expr(fence in ("writethrough", "wt-agent")):
+        if const_expr(direct_lsa):
+            # dest is uniform across the block; readfirstlane keeps the peer
+            # descriptor scalar and avoids a waterfall around every store.
+            dest_blk = block_m // fx.Int32(m_tiles_per_peer)
+            store_c = _PeerDirectStoreC(
+                A_scale,
+                B_scale,
+                C,
+                c_m,
+                c_n,
+                mfma.idx,
+                N_TILES_A,
+                N_TILES_B,
+                peer_rsrc=create_buffer_resource_from_addr(
+                    wave_uniform_i64(w_pre.lsa_ptr(dest_blk, my_recv_slot)),
+                    num_records_bytes=cfg.slice_bytes,
+                ),
+                elem_base=dest_blk * fx.Int32(slice_rows) * c_n,
+            )
+        elif const_expr(fence in ("writethrough", "wt-agent")):
             store_c = _WriteThroughStoreC(
                 A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B
             )
@@ -626,7 +732,7 @@ def compile_fused_gemm_scatter(
         store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
         # ---- end pinned copy ----
 
-        if const_expr(fuse):
+        if const_expr(fuse and not direct_lsa):
             # Retire every lane's C stores, then agree block-wide that they are
             # retired. `wait_barrier` is aiter's own `s_waitcnt vmcnt(0);
             # s_barrier` pair, reused so the tail matches the main loop's idiom.

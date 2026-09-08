@@ -31,6 +31,9 @@ result on every rank):
 
     split-sdma   gemm -> scatter -> reduce -> gather   (4 kernels)
     fused-sdma   gemm+scatter -> drain -> reduce -> gather   (4 kernels)
+    fused-lsa    gemm writing straight into the peers -> barrier -> reduce
+                 -> gather. gcnasm's "Direct LSA" shape: no staging, no copy
+                 engine, and nothing to publish mid-kernel
     split-lsa    gemm -> LSA 2-stage all-reduce        (2 kernels)
     gemm-only    the GEMM alone, to size the ceiling
 
@@ -44,6 +47,7 @@ Headline, 8x MI355X, [4096, 7168] out, K=1024, graph replay, median of 51:
     split-lsa                       324.4us
     split-sdma                      338.0
     fused-sdma  chunks=1, no fence  348.5
+    fused-lsa                       341.0   RACY, see kernels_fused
 
 Fusing loses. Read ``kernels_fused.py`` before trusting any faster fused number
 from this benchmark: several of its options are intermittently wrong, and a
@@ -80,7 +84,7 @@ from kernels_sdma import build_sdma_phases  # noqa: E402
 from layout import ArConfig  # noqa: E402
 
 VMM_SLACK = 512 * 1024 * 1024
-MODES = ("gemm-only", "split-sdma", "fused-sdma", "split-lsa")
+MODES = ("gemm-only", "split-sdma", "fused-sdma", "fused-lsa", "split-lsa")
 
 
 def _setup_distributed():
@@ -142,8 +146,10 @@ def run(args) -> int:
     from aiter.ops.shuffle import shuffle_weight
 
     local_rank, rank, world_size, uid = _setup_distributed()
-    fused = args.mode == "fused-sdma"
-    needs_sdma = args.mode in ("split-sdma", "fused-sdma")
+    direct_lsa = args.mode == "fused-lsa"
+    fused = args.mode in ("fused-sdma", "fused-lsa")
+    # fused-lsa still uses the SDMA reduce/gather tail, so it wants queues too.
+    needs_sdma = args.mode in ("split-sdma", "fused-sdma", "fused-lsa")
     # 1, even though >1 is what would create the overlap. A chunk boundary means
     # the copy engine starts reading C *while the GEMM is still running*, and no
     # combination of submit lock, post-submit barrier, release fence or atomic
@@ -193,6 +199,7 @@ def run(args) -> int:
             waves_per_eu=args.waves_per_eu,
             xcd_swizzle=args.xcd_swizzle,
             fuse=fused,
+            transport="lsa" if direct_lsa else "sdma",
             rotated=None if args.tile_order == "auto" else args.tile_order == "rotated",
             fence=args.fence,
             emit_put=not args.no_put,
@@ -207,7 +214,13 @@ def run(args) -> int:
                  stream=stream)
 
         if needs_sdma:
-            parts = build_sdma_phases(cfg, rank, queues=args.sdma_queues)
+            parts = build_sdma_phases(
+                cfg,
+                rank,
+                queues=args.sdma_queues,
+                reduce_self_from_recv=direct_lsa,
+                recv_uncached=direct_lsa,
+            )
         if args.mode == "split-lsa":
             lsa_ar, _ = build_lsa_ar(cfg, rank)
 
@@ -219,8 +232,10 @@ def run(args) -> int:
             if args.mode == "split-lsa":
                 lsa_ar(dc.ptr, win.handle, stream=stream)
                 return
-            # fused: the scatter puts were already issued from the epilogue, so
-            # only the drain runs here; split: the full scatter kernel.
+            # fused-sdma: the puts were issued from the epilogue, so only the
+            # drain runs. fused-lsa: the epilogue already wrote into the peers,
+            # so this is a pure cross-rank barrier (its quiet drains nothing).
+            # split: the full scatter kernel.
             parts["drain" if fused else "scatter"](dc.ptr, win.handle, stream=stream)
             if args.stop_after == "scatter":
                 return
