@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <shared_mutex>
 #include <string>
 #include <vector>
@@ -159,9 +160,24 @@ class StandaloneProcessClient : public IUMBPClient {
     uint64_t fingerprint = 0;
   };
 
-  // A restore has one key set in flight per pool it reads. Small enough that a
-  // linear scan is cheaper than any index, and a miss only costs a resend.
-  static constexpr size_t kKeyHandleSlots = 8;
+  // A restore does NOT have one key set in flight per pool, which is what this
+  // held eight slots for. A layer-wise reader splits a pool's keys to fit a
+  // per-call range budget and walks the pieces in order, once per layer group,
+  // so the sets arrive as a fixed-order cycle. That is the one access pattern
+  // LRU cannot serve at all: below the cycle length the entry it evicts is
+  // always the next one wanted, so the hit rate is 0 rather than degraded.
+  // Measured on the wire bench at 512-key chunks: 100% at eight sets, 0% at
+  // nine, with 495 of 504 mints re-minting a set that had just been used.
+  //
+  // Replacement is therefore random. No access order can drive it into that
+  // failure, and past capacity it decays as capacity/cycle instead of falling
+  // off a cliff -- which matters because the cycle length belongs to the
+  // caller's chunking, and is not something this side gets to know.
+  //
+  // Capacity is a guess at that chunking, so UMBP_KEY_HANDLE_SLOTS overrides
+  // it. Each slot holds one key set: for the thousand-odd 128-byte keys a
+  // layer group asks about, roughly 160 KiB.
+  static size_t KeyHandleSlots();
 
   // Returns 0 when this set has not been sent before, and fills *fingerprint
   // either way.
@@ -171,7 +187,10 @@ class StandaloneProcessClient : public IUMBPClient {
   void ForgetKeyHandle(uint64_t handle);
 
   std::mutex key_handle_mu_;
-  std::vector<KeyHandle> key_handles_;  // most recently used first
+  std::vector<KeyHandle> key_handles_;  // unordered: the victim is drawn, not aged
+  // Only has to be uncorrelated with the caller's access order, so a fixed
+  // seed is deliberate: it keeps a run reproducible.
+  std::minstd_rand key_handle_rng_{0x9e3779b9};
 };
 
 }  // namespace mori::umbp::standalone

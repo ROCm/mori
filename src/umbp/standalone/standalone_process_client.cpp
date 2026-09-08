@@ -474,22 +474,43 @@ uint64_t StandaloneProcessClient::LookupKeyHandle(const std::vector<std::string>
       if (entry.keys.front() != keys.front() || entry.keys.back() != keys.back()) continue;
       if (entry.keys != keys) continue;
       *fingerprint = entry.fingerprint;
-      const uint64_t handle = entry.handle;
-      if (i != 0)
-        std::rotate(key_handles_.begin(), key_handles_.begin() + i, key_handles_.begin() + i + 1);
-      return handle;
+      return entry.handle;
     }
   }
   *fingerprint = FingerprintKeys(keys);
   return 0;
 }
 
+size_t StandaloneProcessClient::KeyHandleSlots() {
+  static const size_t slots = [] {
+    // Enough for a layer group's worth of chunks several times over. The cost
+    // of being too small is a resend, the cost of being too large is memory,
+    // and only one of those is recoverable at runtime.
+    size_t configured = 128;
+    if (const char* raw = std::getenv("UMBP_KEY_HANDLE_SLOTS")) {
+      char* end = nullptr;
+      const unsigned long long parsed = std::strtoull(raw, &end, 10);
+      if (end != raw && *end == '\0') configured = static_cast<size_t>(parsed);
+    }
+    return configured;
+  }();
+  return slots;
+}
+
 void StandaloneProcessClient::RememberKeyHandle(const std::vector<std::string>& keys,
                                                 uint64_t handle, uint64_t fingerprint) {
   if (handle == 0) return;
+  const size_t slots = KeyHandleSlots();
+  if (slots == 0) return;  // a way to turn the mechanism off outright
   std::lock_guard<std::mutex> lock(key_handle_mu_);
-  key_handles_.insert(key_handles_.begin(), KeyHandle{keys, handle, fingerprint});
-  if (key_handles_.size() > kKeyHandleSlots) key_handles_.resize(kKeyHandleSlots);
+  if (key_handles_.size() < slots) {
+    key_handles_.push_back(KeyHandle{keys, handle, fingerprint});
+    return;
+  }
+  // Full: draw the victim rather than dropping the oldest. See the header --
+  // the sets arrive as a fixed-order cycle, and evicting by age under a cycle
+  // means evicting exactly the set about to be asked for.
+  key_handles_[key_handle_rng_() % key_handles_.size()] = KeyHandle{keys, handle, fingerprint};
 }
 
 void StandaloneProcessClient::ForgetKeyHandle(uint64_t handle) {

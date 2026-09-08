@@ -46,6 +46,7 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <random>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -231,7 +232,6 @@ class KeyHandleTable {
       MaybeReportLocked();
       return nullptr;
     }
-    lru_.splice(lru_.begin(), lru_, it->second.position);
     ++hits_;
     MaybeReportLocked();
     return it->second.keys;
@@ -244,12 +244,20 @@ class KeyHandleTable {
     // fingerprint covers the rest.
     const uint64_t handle = next_++;
     ++mints_;
-    lru_.push_front(handle);
-    entries_.emplace(handle, Entry{std::move(keys), fingerprint, lru_.begin()});
-    while (lru_.size() > kCapacity) {
-      entries_.erase(lru_.back());
-      lru_.pop_back();
+    const size_t capacity = Capacity();
+    while (!held_.empty() && held_.size() >= capacity) {
+      // Drawn, not aged: the readers behind this table cycle through their key
+      // sets in a fixed order, and evicting by age under a cycle evicts
+      // precisely the set that is about to be asked for. Random replacement
+      // has no such worst case; past capacity it decays as capacity/cycle.
+      const size_t victim = rng_() % held_.size();
+      entries_.erase(held_[victim]);
+      held_[victim] = held_.back();
+      held_.pop_back();
     }
+    if (capacity == 0) return handle;  // remembering disabled; the handle is simply never found
+    entries_.emplace(handle, Entry{std::move(keys), fingerprint});
+    held_.push_back(handle);
     return handle;
   }
 
@@ -265,21 +273,39 @@ class KeyHandleTable {
         entries_.size());
   }
 
-  // A restore has one key set in flight per pool it reads, and the reader
-  // chunks a pool's keys by a range budget, so a handful of sets are live at
-  // once. Sized well past that; the cost of being wrong is a resend.
-  static constexpr size_t kCapacity = 64;
+  // One table serves every rank on the node, and each of them has as many key
+  // sets live as its reader's chunking produces -- not the handful this was
+  // sized for. Defaulted to eight ranks' worth of a generous per-rank count,
+  // and settable because that chunking belongs to the caller: an entry holds
+  // one key set, so roughly 160 KiB for the thousand-odd 128-byte keys a layer
+  // group asks about, and this default is therefore some 80 MiB against a node
+  // whose tier is measured in terabytes.
+  static size_t Capacity() {
+    static const size_t capacity = [] {
+      size_t configured = 512;
+      if (const char* raw = std::getenv("UMBP_KEY_HANDLE_CAPACITY")) {
+        char* end = nullptr;
+        const unsigned long long parsed = std::strtoull(raw, &end, 10);
+        if (end != raw && *end == '\0') configured = static_cast<size_t>(parsed);
+      }
+      return configured;
+    }();
+    return capacity;
+  }
+
   static constexpr uint64_t kReportEvery = 512;
 
   struct Entry {
     Keys keys;
     uint64_t fingerprint;
-    std::list<uint64_t>::iterator position;
   };
 
   std::mutex mu_;
-  std::list<uint64_t> lru_;  // front = most recently used
+  std::vector<uint64_t> held_;  // unordered: the victim is drawn, not aged
   std::unordered_map<uint64_t, Entry> entries_;
+  // Only has to be uncorrelated with the callers' access order, so a fixed
+  // seed is deliberate: it keeps a run reproducible.
+  std::minstd_rand rng_{0x9e3779b9};
   uint64_t next_ = 1;
   uint64_t hits_ = 0;
   uint64_t misses_ = 0;
