@@ -59,11 +59,19 @@ default. Every difference found by reading both, and what to pass to close it:
                                              = 32               at world 16
   scale_dim                32                --scale-dim = 0    --scale-dim 32
   scale_type_size          4                 4 when scale_dim   (aligned)
-  warmup / rounds / drop   20 / 30 / 1       same               (aligned)
+  warmup / rounds / drop   20 / 30 / 1       same, and CHECKED  (aligned)
   routing                  randperm[:topk]   same               (aligned)
   tokens per rank          max on every rank same               (aligned)
   statistic                avg over          same               (aligned)
                            rounds x ranks
+
+Only ONE row of this table is enforced: `_report_loop_alignment` reads the three
+loop constants out of that harness's source and warns, next to the numbers, when
+they differ from ours. Every other row is a claim a reader has to re-check, and
+one of them was wrong for as long as it was written -- `--rounds` sat at 3
+against that harness's 30 while this row said "same", because a table asserting
+three numbers had been checked for two. Prefer extending the check to adding a
+row.
 
 The two that move real work: the weight fold costs an extra peer read per
 (token, destination) plus an accumulate in three kernels and a wider staging slot,
@@ -238,6 +246,84 @@ def _verify_once(op, cfg, d, dev, a, comm, inp, idx, wts, sc):
     return ok and ok_w
 
 
+def _v1_loop_defaults():
+    """The examples harness's rounds/warmup/drop defaults, read from its source.
+
+    The alignment table in this module's docstring used to ASSERT that these
+    matched ours. It was written from intent, not from the file: --rounds sat at
+    3 against that harness's 30 for as long as the row claimed "same", because
+    nothing ever compared the two. A comment cannot notice when the other side
+    moves, and neither can a reader who wrote the comment.
+
+    Read, do not import. Importing that module pulls in the v1 op, and this test
+    depends on v1 nowhere else -- buying a consistency check with a dependency on
+    the thing we are trying to be independent of is a bad trade. Parsing three
+    integer literals out of its AST costs nothing and keeps the coupling at zero.
+
+    Returns ``{"rounds": int, "warmup": int, "drop_rounds": int}``, or ``{}`` if
+    the file is missing or has been restructured -- a missing reference is a
+    reason to skip the check, never to fail the run.
+    """
+    import ast
+
+    path = os.path.join(
+        _ROOT, "examples", "ops", "dispatch_combine", "test_dispatch_combine_internode.py"
+    )
+    names = {
+        "_EP_ROUNDS": "rounds",
+        "_EP_WARMUP": "warmup",
+        "_EP_DROP_ROUNDS": "drop_rounds",
+    }
+    out = {}
+    try:
+        tree = ast.parse(open(path).read())
+    except (OSError, SyntaxError):
+        return {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        tgt = node.targets[0]
+        key = names.get(getattr(tgt, "id", None))
+        if key is None:
+            continue
+        # `int(os.environ.get("MORI_EP_ROUNDS") or "30")` -- the default is the
+        # only digit-string literal in the expression.
+        #
+        # Accept both spellings of a string literal. Python >= 3.8 gives
+        # ast.Constant; 3.6/3.7 give ast.Str, and the host python here is 3.6
+        # while the container's is 3.12. Matching only Constant makes this
+        # silently return {} on the older one -- which would disable the very
+        # check whose absence caused the problem it exists to catch.
+        for sub in ast.walk(node.value):
+            lit = None
+            if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                lit = sub.value
+            elif sub.__class__.__name__ == "Str":
+                lit = sub.s
+            if lit is not None and lit.isdigit():
+                out[key] = int(lit)
+                break
+    return out
+
+
+def _report_loop_alignment(a, rank):
+    """Say out loud when this harness's timed loop is shaped differently from the
+    reference one. Printed with the numbers, not buried in a docstring, because
+    the numbers are what gets quoted."""
+    ref = _v1_loop_defaults()
+    if not ref or rank != 0:
+        return
+    mine = {"rounds": a.rounds, "warmup": a.warmup, "drop_rounds": a.drop_rounds}
+    off = {k: (mine[k], v) for k, v in ref.items() if mine.get(k) != v}
+    if off:
+        detail = " ".join(f"{k}={m}(ref {r})" for k, (m, r) in sorted(off.items()))
+        print(
+            f"# WARNING: timed loop differs from run_bench_once: {detail} -- "
+            f"these numbers are not directly comparable to that harness's",
+            flush=True,
+        )
+
+
 def _bench(op, cfg, d, dev, a, comm):
     """Per-phase latency, structured to match ``run_bench_once`` in
     ``examples/ops/dispatch_combine/test_dispatch_combine_internode.py``.
@@ -264,6 +350,7 @@ def _bench(op, cfg, d, dev, a, comm):
     ahead only while wall stays at or below dispatch+combine. Above it, the host
     is the pacer and the phase numbers carry host stall.
     """
+    _report_loop_alignment(a, d.rank)
     rng = torch.Generator(device=dev)
     rng.manual_seed(4242 + d.rank)
     ct = a.max_tokens
@@ -311,11 +398,26 @@ def _bench(op, cfg, d, dev, a, comm):
 
     t0 = time.perf_counter()
     ev[0].record()
+    # Causal test for "is the host pacing the GPU", opt-in. Busy-waits a known
+    # number of microseconds on the HOST between the convert-end event and the
+    # combine enqueue -- pure host time, no GPU work, no extra kernel. If the
+    # host is running ahead of the GPU, the GPU still has queued work to chew on
+    # and the measured combine barely moves. If the GPU is already waiting on the
+    # host, the injected delay is added GPU idle inside the combine window and
+    # the measured combine rises by about the injected amount. The slope of
+    # measured-combine against injected microseconds is the answer, and it needs
+    # no assumption about what any window "should" cost.
+    inject = float(os.environ.get("MORI_EP_INJECT_HOST_US") or 0) / 1e6
+
     for i in range(n):
         r = op.dispatch(inp, wts, sc, idx, return_routing=True)
         ev[3 * i + 1].record()
         x = convert(r[0])
         ev[3 * i + 2].record()
+        if inject:
+            t = time.perf_counter()
+            while time.perf_counter() - t < inject:
+                pass
         op.combine(x, cw, routing=r[5])
         ev[3 * i + 3].record()
         if a.per_round_sync:
@@ -366,6 +468,23 @@ def _bench(op, cfg, d, dev, a, comm):
     keep = slice(a.drop_rounds, None)
     disp = [ev[3 * i].elapsed_time(ev[3 * i + 1]) * 1e3 for i in range(n)][keep]
     comb = [ev[3 * i + 2].elapsed_time(ev[3 * i + 3]) * 1e3 for i in range(n)][keep]
+    # The third window, which neither harness reports and which is the honest
+    # host-gap meter.
+    #
+    # The events TILE the timed region: ev[3i+3] ends round i's combine and IS
+    # ev[3(i+1)], the start of round i+1's dispatch window. There is no gap
+    # between windows for host time to hide in -- every microsecond between
+    # ev[0] and ev[3n] is inside exactly one of the three. So if the host falls
+    # behind, the GPU idles at the head of whichever segment it is waiting for
+    # and that idle is charged to that window as if it were kernel time.
+    #
+    # This window contains ONE cast. Its kernel cost is a few microseconds at
+    # these token counts and does not grow with anything we tune, so whatever it
+    # reads above that is GPU idle waiting for the host -- which makes it a
+    # measure of host lag that does not require trusting `wall`. (`wall` cannot
+    # show this: wall - (dispatch + combine) is this window BY CONSTRUCTION, so
+    # quoting that difference as evidence of host pacing assumes the conclusion.)
+    conv = [ev[3 * i + 1].elapsed_time(ev[3 * i + 2]) * 1e3 for i in range(n)][keep]
 
     # Which round stalled, opt-in. EVERY rank prints its own series, because the
     # question the averages cannot answer is whether a spike lands on the same
@@ -403,6 +522,7 @@ def _bench(op, cfg, d, dev, a, comm):
 
     dm, dlo, dhi = _stats(disp)
     cm, clo, chi = _stats(comb)
+    vm, _, _ = _stats(conv)
     if d.rank == 0:
         print(
             f"# BENCH tok={ct} dtype={a.dtype}->{a.combine_dtype or a.dtype} "
@@ -410,7 +530,7 @@ def _bench(op, cfg, d, dev, a, comm):
             f"kernel={a.kernel_type or 'auto'} "
             f"dispatch={dm:.1f}us [{dlo:.1f}/{dhi:.1f}] "
             f"combine={cm:.1f}us [{clo:.1f}/{chi:.1f}] "
-            f"total={dm + cm:.1f}us [wall={wall:.1f}us]",
+            f"total={dm + cm:.1f}us [conv={vm:.1f}us wall={wall:.1f}us]",
             flush=True,
         )
     return 0
