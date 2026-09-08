@@ -197,6 +197,7 @@ def run(args) -> int:
             fuse=fused,
             rotated=None if args.tile_order == "auto" else args.tile_order == "rotated",
             fence=args.fence,
+            emit_put=not args.no_put,
         )
         a_i8 = a.contiguous().view(torch.int8).view(-1)
         b_i8 = b_shuf.contiguous().view(torch.int8).view(-1)
@@ -328,7 +329,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--fence",
-        choices=("all", "agent", "agent-leader", "leader", "none", "writethrough", "wt-agent"),
+        choices=(
+            "all", "agent", "agent-leader", "nt-agent", "leader", "none",
+            "writethrough", "wt-agent",
+        ),
         default="agent",
         help="release before the epilogue push. Correct: 'agent' (default, "
         "cheapest) and 'all' (system scope, adds a buffer_inv that costs 20us). "
@@ -342,6 +346,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="'scatter' stops after the reduce-scatter transfer has landed, "
         "which is the only phase fusion can affect; use it to attribute a "
         "fused-vs-split difference instead of inferring it from the total",
+    )
+    p.add_argument(
+        "--no-put",
+        action="store_true",
+        help="keep the epilogue but drop the transfer, to price how much of its "
+        "cost is the copy engine reading C while the GEMM writes it. Output is "
+        "wrong by construction; use with --skip-validation",
     )
     p.add_argument("--sdma-queues", type=int, default=8)
     p.add_argument("--warmup", type=int, default=10)

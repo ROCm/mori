@@ -195,6 +195,20 @@ from _compat import (  # noqa: E402
 )
 
 
+class _NonTemporalStoreC(StoreC):
+    """``StoreC`` with non-temporal C stores (the copy atom's only other mode).
+
+    Probes whether ``buffer_wbl2`` gets cheaper when the lines it is asked to
+    flush have already been evicted. The atom's ``cache_modifier`` is a two-value
+    enum, 0=cached / 2=nt -- it is *not* the aux bitmask that
+    ``raw_ptr_buffer_store`` takes, so sc0|sc1 cannot be requested this way.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.out_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy16b(2), fx.BFloat16)
+
+
 class _WriteThroughStoreC(StoreC):
     """``StoreC`` whose C stores bypass L1 and L2 instead of being written back.
 
@@ -229,6 +243,7 @@ def compile_fused_gemm_scatter(
     fuse: bool = True,
     rotated: bool | None = None,
     fence: str = "agent",
+    emit_put: bool = True,
 ):
     """Compile the GEMM, with (``fuse=True``) or without the scatter epilogue.
 
@@ -297,7 +312,10 @@ def compile_fused_gemm_scatter(
     tiles_per_chunk = m_tiles_per_chunk * n_blocks_const
     chunk_bytes = cfg.slice_bytes // chunks
 
-    if fence not in ("all", "agent", "agent-leader", "leader", "none", "writethrough", "wt-agent"):
+    if fence not in (
+        "all", "agent", "agent-leader", "nt-agent", "leader", "none",
+        "writethrough", "wt-agent",
+    ):
         raise ValueError(
             f"fence must be all/agent/leader/none/writethrough/wt-agent, got {fence!r}"
         )
@@ -309,7 +327,7 @@ def compile_fused_gemm_scatter(
 
     _kname = (
         f"mori_fused_{'sdma' if fuse else 'split'}_8w_"
-        f"{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_k{K}_{_kname_tag}_r{rank}"
+        f"{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_k{K}_{_kname_tag}{'p' if emit_put else 'x'}_r{rank}"
     )
 
     @fx.struct
@@ -401,6 +419,10 @@ def compile_fused_gemm_scatter(
         b_s2r = S2RLoader(wave_n, N_TILES_B)
         if const_expr(fence in ("writethrough", "wt-agent")):
             store_c = _WriteThroughStoreC(
+                A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B
+            )
+        elif const_expr(fence == "nt-agent"):
+            store_c = _NonTemporalStoreC(
                 A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B
             )
         else:
@@ -534,7 +556,7 @@ def compile_fused_gemm_scatter(
                 raw_cco.cco_system_fence(fx.Int32(0))
             elif const_expr(fence == "leader"):
                 raw_cco.cco_system_fence(fx.Int32(1))
-            elif const_expr(fence in ("agent", "wt-agent")):
+            elif const_expr(fence in ("agent", "wt-agent", "nt-agent")):
                 release_fence("agent")
             # "writethrough": nothing to do -- the stores already went to memory,
             # and wait_barrier(0) above retired them.
@@ -563,7 +585,7 @@ def compile_fused_gemm_scatter(
                 # reason the barrier flags in ar/kernels_lsa are never reset -- it
                 # is what makes graph replay behave like a fresh launch.
                 if seq % fx.Int32(tiles_per_chunk) == fx.Int32(0):
-                    if dest != fx.Int32(rank):
+                    if const_expr(emit_put) and dest != fx.Int32(rank):
                         # One queue per destination. Two chunks of the same
                         # destination can be elected at nearly the same moment and
                         # will then post to the same queue; that serialises the
