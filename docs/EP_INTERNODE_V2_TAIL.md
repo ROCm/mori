@@ -57,6 +57,59 @@ Measured over 11 spiked rounds in 9 runs: 5 empty, 3 rail pairs (rails 1, 5 and 
 once each), 2 single ranks, 1 other. So no one card is at fault; when there is a
 straggler its identity rotates.
 
+## CORRECTION: the tail is not the transport's alone
+
+An earlier revision of this file concluded "the tail belongs to the CCO path, not
+the fabric", from shmem-vs-CCO. That compared two transports AND two kernels at
+once. Adding the missing arm -- the #625 baseline, which is v1's host code with
+its `_launch_multi` redirected to the v2 CCO plans, so same transport and
+effectively the same kernels -- splits it in two. Interleaved, six pairs at 4
+tokens, max/mean:
+
+                        dispatch      combine
+    shmem / IBGDA        1.16          1.23
+    CCO/GDA, #625 base   1.27-1.31     1.46-1.56
+    CCO/GDA, this branch 2.31          1.75
+
+So there are two separate effects:
+
+  * COMBINE's tail is mostly the transport's: CCO adds +27% over shmem, this
+    branch adds only +12% on top.
+  * DISPATCH's tail is mostly OURS: CCO adds +13% over shmem, this branch adds
+    +76% on top. The #625 baseline never exceeded 1.44 in six runs and had zero
+    spiked rounds; this branch reaches 2.1-3.3 in five of six.
+
+Note also that this branch is FASTER in the mean than the baseline it replaces --
+dispatch -7%, combine -14% over those same six pairs -- so the trade is mean for
+tail, not a plain regression.
+
+## Ruled out for the dispatch tail
+
+The architectural difference is host-side: #625 keeps v1's op (its buffers, its
+argument building, its geometry from v1's JSON tuning tables) and only redirects
+the launch, whereas this branch is v2-native (SymmArena, LaunchGroup, its own
+tuning table). Checked and NOT the cause:
+
+  * Kernel logic. A normalised diff over the 27 functions present in both leaves
+    only renames, `if constexpr` for the quant branch, and two guards that REMOVE
+    work (the local-node skip, required because ccoGda has no P2P path).
+  * Region packing. SymmArena packs regions 256B-aligned in one window where v1
+    allocates separately, but the per-region sizes are identical, so the
+    cache-line sharing a peer's RDMA writes contend on is the same.
+  * Counter zeroing. total_recv is a local tensor cleared in-stream by
+    copystaging; node_recv_token_num is zeroed in the combine path of BOTH.
+  * Launch geometry. The two run different geometries -- v1's table gives
+    dispatch 16/10/4 at 4 tokens against our 32/16/4 -- but running ours at v1's
+    geometry does not move the tail: 1.67/2.31/1.21 against 1.22/1.22/2.00.
+
+## Not resolved
+
+The dispatch tail is bimodal in itself: the same geometry has produced 1.22 and
+2.31 in the same afternoon. That is why three-run comparisons cannot separate
+mechanisms here, and why the numbers above are six interleaved pairs rather than
+two batches. Whatever it is, it is host-side and intermittent, and it was not
+found by reading.
+
 ## Eliminated by direct measurement
 
 Each of these was tested and came back negative, rather than argued away:
