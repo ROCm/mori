@@ -188,7 +188,11 @@ def test_swap_ab_is_bitwise_identical(m, n, k):
     flydsl_8wave_gemm_a8(a, b_shuf, sa, sb, ref, 256, 256)
 
     cfg = layout.ArConfig(world_size=2, m=m, n=n)
-    for extra in ({}, {"permlane": True}):
+    for extra in (
+        {},
+        {"permlane": True},
+        {"permlane": True, "lane_transpose": True},
+    ):
         gemm = compile_fused_gemm_scatter(
             cfg, 0, K=k, BLOCK_M=256, BLOCK_N=256, b_preshuffled=True,
             fuse=False, swap_ab=True, **extra,

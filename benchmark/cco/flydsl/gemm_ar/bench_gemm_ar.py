@@ -203,6 +203,7 @@ def run(args) -> int:
             swap_ab=args.swap_ab,
             store_probe=args.store_probe,
             permlane=args.permlane,
+            lane_transpose=args.lane_transpose,
             rotated=None if args.tile_order == "auto" else args.tile_order == "rotated",
             fence=args.fence,
             emit_put=not args.no_put,
@@ -401,6 +402,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="with --swap-ab: two permlane16_swap per M-tile so each lane owns 16 "
         "contiguous bytes and each row gets 64. This is the real version of what "
         "--store-probe prices",
+    )
+    p.add_argument(
+        "--lane-transpose",
+        action="store_true",
+        help="with --swap-ab --permlane: one ds_bpermute per dword so adjacent "
+        "lanes cover one C row (gcnasm kernel_template.hpp:491-510)",
     )
     p.add_argument("--sdma-queues", type=int, default=8)
     p.add_argument("--warmup", type=int, default=10)
