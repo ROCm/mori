@@ -1265,6 +1265,21 @@ def compile_fused_gemm_scatter(
         base_row = block_m * BLOCK_M + wave_m_offset
         base_col = block_n * BLOCK_N + wave_n_offset
 
+        if const_expr(fuse):
+            # Re-balance the half-wave barrier counts before the epilogue.
+            # The prologue's `if wave_m == 1: s_barrier()` gives waves 4-7 one
+            # extra barrier, so every later rendezvous pairs w1's k-th barrier
+            # with w0's (k+1)-th and waves 0-3 run one phase ahead. A one-shot
+            # GEMM does not care -- the trailing barrier is released when the
+            # other half exits. The fused epilogue does: `wait_barrier(0)` after
+            # store_c is supposed to mean "every wave's C tile has retired", and
+            # under the offset it instead rendezvouses waves 0-3 (which hold
+            # thread 0, hence the counter and the put) with waves 4-7 sitting at
+            # the *previous* barrier -- before their stores. Thread 0 then counts
+            # the tile and can issue the transfer while half the tile is unwritten.
+            if wave_m == 0:
+                rocdl.s_barrier()
+
         store_c.store(c00_frag, base_row + 0, base_col + 0)
         store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
         store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)

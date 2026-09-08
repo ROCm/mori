@@ -44,10 +44,11 @@ because LSA is the faster collective, and a fused SDMA path has to beat
 
 Headline, 8x MI355X, [4096, 7168] out, K=1024, graph replay, median of 51:
 
-    split-lsa                       324.4us
-    split-sdma                      338.0
-    fused-sdma  chunks=1, no fence  348.5
-    fused-lsa                       341.0   RACY, see kernels_fused
+                             default C-store   + 3-stage C-store
+    split-lsa                      326.8us            321.8us
+    split-sdma                     334.6              330.9
+    fused-sdma  chunks=2           326.2              323.0
+    fused-lsa                      341.0    RACY, see kernels_fused
 
 Fusing loses. Read ``kernels_fused.py`` before trusting any faster fused number
 from this benchmark: several of its options are intermittently wrong, and a
@@ -150,11 +151,13 @@ def run(args) -> int:
     fused = args.mode in ("fused-sdma", "fused-lsa")
     # fused-lsa still uses the SDMA reduce/gather tail, so it wants queues too.
     needs_sdma = args.mode in ("split-sdma", "fused-sdma", "fused-lsa")
-    # 1, even though >1 is what would create the overlap. A chunk boundary means
-    # the copy engine starts reading C *while the GEMM is still running*, and no
-    # combination of submit lock, post-submit barrier, release fence or atomic
-    # ordering made that reliable here -- see the race note in kernels_fused.
-    chunks = args.chunks if args.chunks else 1
+    # One push per BLOCK_M row-band. This is what creates the overlap: with a
+    # single chunk per destination the counter only fires once the whole slice is
+    # done, which under the rotated tile order is the end of the GEMM, so nothing
+    # overlaps. It was pinned to 1 for a while because it raced; the cause was the
+    # half-wave barrier offset, fixed in kernels_fused's epilogue.
+    m_tiles_per_peer = max(1, (args.m // world_size) // args.block_m)
+    chunks = args.chunks if args.chunks else m_tiles_per_peer
     cfg = ArConfig(
         world_size=world_size,
         m=args.m,
