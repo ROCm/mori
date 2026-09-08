@@ -44,6 +44,25 @@ without a QP.
 ``tools/run_internode_test.sh`` drives both ranks; the CLI below is the subset of
 the shmem harness's flags that means anything here.
 
+RoCE QoS: SET MORI_RDMA_TC AND MORI_RDMA_SL
+-------------------------------------------
+Unset, ``bnxt.cpp`` takes ``ReadRdmaServiceLevelEnv().value_or(1)`` and leaves
+``grh.traffic_class`` alone, so every transfer goes out on SL 1 / DSCP 0 -- the
+default lossy class -- no matter how the NIC and switch are programmed. The
+values must match the fabric: on the 2-node bnxt rig here the NIC is programmed
+``roce_dscp=0x28`` (40), so ``MORI_RDMA_TC=160`` (40 << 2) and
+``MORI_RDMA_SL=5``. ``tools/env_setup.sh`` derives both from ROCE_DSCP/ROCE_PRIO
+and exports them; its checked-in 26/3 are reference defaults its own comment says
+to align with the switch. Confirm they arrived with ``MORI_APP_LOG_LEVEL=info``:
+``bnxt attr.ah_attr.sl:5 attr.ah_attr.grh.traffic_class:160``.
+
+Measured, it changes nothing HERE -- interleaved A/B over four pairs at 4 tokens
+put 160/5 and 0/1 within noise of each other. That is expected rather than
+contradictory: a lossless priority class buys nothing when the benchmark is the
+only traffic on the fabric. It is worth setting because a number measured in the
+wrong traffic class does not transfer to a shared one, not because it is a
+speedup.
+
 COMPARING AGAINST THE v1 BENCH
 ------------------------------
 The reference numbers come from ``run_bench_once`` in
