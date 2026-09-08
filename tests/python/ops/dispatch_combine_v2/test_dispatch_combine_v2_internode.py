@@ -181,7 +181,53 @@ def _gen_round(rng, cfg, ct, dev, dtype):
         ]
     ).to(torch.int32)
     wts = torch.rand(ct, cfg.num_experts_per_token, generator=rng, device=dev)
-    return inp, idx, wts
+    # Real scales when the transport is on. The dispatch send path copies
+    # scale_dim * scale_type_size bytes per token whether or not a buffer was
+    # handed in -- only the staging copy is guarded on the pointer -- so passing
+    # None with scale_dim > 0 transports uninitialised staging. Same byte count,
+    # but not something to measure against.
+    scales = (
+        torch.rand(ct, cfg.scale_dim, generator=rng, device=dev)
+        if cfg.scale_dim
+        else None
+    )
+    return inp, idx, wts, scales
+
+
+def _verify_once(op, cfg, d, dev, a, comm, inp, idx, wts, sc):
+    """One dispatch+combine against the analytic golden. True if this rank agrees.
+
+    Same expectation as `--cmd test`: an identity expert makes combine[t] equal
+    U[t] * input[t] over the DISTINCT destination ranks. Weights are always folded
+    here even when the timed loop will not fold them -- an unchecked weight path
+    is how this harness shipped a silent bug twice.
+    """
+    r = op.dispatch(inp, wts, sc, idx, return_routing=True)
+    torch.cuda.synchronize()
+    comm.barrier()
+    x = r[0].to(cfg.combine_dtype) if cfg.is_asymmetric_dtype else r[0]
+    out, out_w = op.combine(x, wts, routing=r[5])
+    torch.cuda.synchronize()
+    comm.barrier()
+
+    ct = inp.shape[0]
+    idx_c = idx.cpu()
+    U = np.array(
+        [
+            len({int(idx_c[t, j]) // cfg.num_experts_per_rank for j in range(a.topk)})
+            for t in range(ct)
+        ]
+    )
+    Ut = torch.from_numpy(U).view(ct, 1).float()
+    got = out.float().cpu()
+    exp = Ut * inp.float().cpu()
+    per_elem = inp.float().cpu().abs()
+    eps = 3e-1 if (a.quant_type != "none" or cfg.dispatch_dtype in _FP8) else 8e-3
+    ok = bool(((got - exp).abs() <= eps * Ut * per_elem.clamp(min=1.0)).all())
+    ok_w = bool(((out_w.cpu() - Ut * wts.float().cpu()).abs() <= 2e-3 * Ut).all())
+    if not (ok and ok_w) and d.rank == 0:
+        print(f"#   pre-bench check: hidden_ok={ok} weights_ok={ok_w}", flush=True)
+    return ok and ok_w
 
 
 def _bench(op, cfg, d, dev, a, comm):
@@ -213,9 +259,28 @@ def _bench(op, cfg, d, dev, a, comm):
     rng = torch.Generator(device=dev)
     rng.manual_seed(4242 + d.rank)
     ct = a.max_tokens
-    inp, idx, wts = _gen_round(rng, cfg, ct, dev, cfg.dispatch_dtype)
+    inp, idx, wts, sc = _gen_round(rng, cfg, ct, dev, cfg.dispatch_dtype)
     if a.kernel_type is not None:
         op._internode_force_ll = a.kernel_type == "v1_ll"
+
+    # Check BEFORE measuring, as bench_dispatch_combine does (it runs
+    # run_test_once and asserts before run_bench_once). A configuration that is
+    # silently wrong still produces timings, and this harness has shipped two of
+    # those -- the weight fold reading the wrong buffer, and both legs compiled
+    # with the dispatch dtype. One round, folding weights whatever --bench-weights
+    # says, because the point is to check them.
+    ok = _verify_once(op, cfg, d, dev, a, comm, inp, idx, wts, sc)
+    bad = d.allreduce_sum(0 if ok else 1)
+    if bad:
+        if d.rank == 0:
+            print(
+                f"# BENCH ABORTED: {bad} of {d.world} ranks failed the "
+                f"pre-bench check; the numbers below would be meaningless",
+                flush=True,
+            )
+        return 1
+    torch.cuda.synchronize()
+    comm.barrier()
 
     # The examples harness's _convert_for_combine: the combine leg reads its
     # input as its own element type, so an asymmetric config has to cast first.
@@ -225,7 +290,7 @@ def _bench(op, cfg, d, dev, a, comm):
     cw = wts if a.bench_weights else None
 
     for _ in range(a.warmup):
-        r = op.dispatch(inp, wts, None, idx, return_routing=True)
+        r = op.dispatch(inp, wts, sc, idx, return_routing=True)
         op.combine(convert(r[0]), cw, routing=r[5])
     torch.cuda.synchronize()
     comm.barrier()
@@ -235,7 +300,7 @@ def _bench(op, cfg, d, dev, a, comm):
     t0 = time.perf_counter()
     ev[0].record()
     for i in range(n):
-        r = op.dispatch(inp, wts, None, idx, return_routing=True)
+        r = op.dispatch(inp, wts, sc, idx, return_routing=True)
         ev[3 * i + 1].record()
         x = convert(r[0])
         ev[3 * i + 2].record()
@@ -263,7 +328,7 @@ def _bench(op, cfg, d, dev, a, comm):
         pr = cProfile.Profile()
         pr.enable()
         for _ in range(n):
-            rp = op.dispatch(inp, wts, None, idx, return_routing=True)
+            rp = op.dispatch(inp, wts, sc, idx, return_routing=True)
             op.combine(convert(rp[0]), cw, routing=rp[5])
         pr.disable()
         torch.cuda.synchronize()
@@ -366,7 +431,7 @@ def main(argv):
         for r in range(a.rounds):
             rng.manual_seed(1234 + r * 977 + rank)
             ct = M
-            inp, idx, wts = _gen_round(rng, cfg, ct, dev, cfg.dispatch_dtype)
+            inp, idx, wts, sc = _gen_round(rng, cfg, ct, dev, cfg.dispatch_dtype)
 
             recv_x, recv_w, recv_s, recv_i, total_recv, routing = op.dispatch(
                 inp, wts, None, idx, return_routing=True
