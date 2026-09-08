@@ -260,6 +260,8 @@ def _parse_args(argv):
     # independent paired test against the thing it would replace, which is both
     # what we want to know and reproducible across repeats.
     p.add_argument("--tuning-greedy", action="store_true")
+    # Workers to spawn per node (0 = off: one torchrun process per rank).
+    p.add_argument("--spawn", type=int, default=0)
     # How much better a candidate must be, on the paired difference, to take
     # over. Whichever of the two is larger. Not 0: see the note in _tune.
     p.add_argument("--tuning-margin-us", type=float, default=1.5)
@@ -1030,8 +1032,47 @@ def _tune(cfg, d, dev, a, comm):
     return 0
 
 
+def _spawn_entry(local_rank, argv, node_rank, nnodes, per_node):
+    """One spawned worker. Rewrites the rank env, then re-enters main().
+
+    torchrun gives ONE process per node here (RANK = node rank, WORLD_SIZE =
+    node count), and the workers are children of it -- the shape the examples
+    harness uses. Everything downstream reads its identity from the environment,
+    so setting it here is the whole adaptation; no call site changes.
+
+    LOCAL_WORLD_SIZE has to be rewritten too. torchrun sets it to 1 under
+    --nproc_per_node=1, and main() derives gpu_per_node from it, which decides
+    the node grouping the internode path is gated on.
+    """
+    os.environ["_MORI_EP_SPAWN_CHILD"] = "1"
+    os.environ["RANK"] = str(node_rank * per_node + local_rank)
+    os.environ["LOCAL_RANK"] = str(local_rank)
+    os.environ["WORLD_SIZE"] = str(nnodes * per_node)
+    os.environ["LOCAL_WORLD_SIZE"] = str(per_node)
+    rc = main(argv)
+    if rc:
+        raise SystemExit(rc)
+
+
 def main(argv):
     a = _parse_args(argv)
+
+    # --spawn N reproduces the examples harness's process topology: one torchrun
+    # process per node that spawns N workers, instead of N torchrun processes.
+    # Same kernels, same bench, different process tree -- which is worth being
+    # able to switch because host time on this path converts to measured "kernel"
+    # time about 1:1, so how the ranks are parented is not obviously neutral.
+    if a.spawn and not os.environ.get("_MORI_EP_SPAWN_CHILD"):
+        node_rank = int(os.environ["RANK"])
+        nnodes = int(os.environ["WORLD_SIZE"])
+        torch.multiprocessing.spawn(
+            _spawn_entry,
+            args=(argv, node_rank, nnodes, a.spawn),
+            nprocs=a.spawn,
+            join=True,
+        )
+        return 0
+
     d = Dist()
     rank, npes = d.rank, d.world
     dev = torch.device("cuda", d.local_rank)
