@@ -237,15 +237,19 @@ class KeyHandleTable {
     return it->second.keys;
   }
 
+  // Zero when this table is remembering nothing, which the caller reads as
+  // "do not offer a handle back". Handing one out that will never be found
+  // would cost every later call an extra round trip to be told so.
   uint64_t Insert(Keys keys, uint64_t fingerprint) {
+    const size_t capacity = Capacity();
+    if (capacity == 0) return 0;
     std::lock_guard<std::mutex> lock(mu_);
     // Never reused within a process, so a handle that is found is always the
     // list it was minted for; across processes the table starts empty, and the
     // fingerprint covers the rest.
     const uint64_t handle = next_++;
     ++mints_;
-    const size_t capacity = Capacity();
-    while (!held_.empty() && held_.size() >= capacity) {
+    while (held_.size() >= capacity) {
       // Drawn, not aged: the readers behind this table cycle through their key
       // sets in a fixed order, and evicting by age under a cycle evicts
       // precisely the set that is about to be asked for. Random replacement
@@ -255,7 +259,6 @@ class KeyHandleTable {
       held_[victim] = held_.back();
       held_.pop_back();
     }
-    if (capacity == 0) return handle;  // remembering disabled; the handle is simply never found
     entries_.emplace(handle, Entry{std::move(keys), fingerprint});
     held_.push_back(handle);
     return handle;
