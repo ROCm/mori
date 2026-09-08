@@ -522,8 +522,12 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs& args,
     // and DispatchInterNodeRecv only ever polls slots of remote nodes, so that
     // write is dead. It is also unroutable: RAIL connects cross-node same-rail
     // peers only, so a local peer has no QP and EpInterNodeAtomicAdd would fault.
-    // shmem's atomic resolved a local peer to a plain store, hence no guard here
-    // originally.
+    // v1 needed no guard because shmem dispatches per peer on
+    // globalGpuStates->transportTypes[pe] (shmem_device_api.hpp): a same-node
+    // peer is TransportType::P2P, so the atomic became a local XGMI atomic and
+    // never touched a NIC. ccoGda has no such dispatch -- cco_scale_out.hpp
+    // mentions neither P2P nor locality -- so scale-out is the only path it can
+    // take, and it has nowhere to send this.
     if ((laneId < nNodes) && (laneId != myNode)) {
       int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
       index_t numTokenSignal =
