@@ -88,6 +88,22 @@ _DEBUG_GEOM = bool(os.environ.get("MORI_EP_DEBUG_GEOM"))
 _TRACE_ARGS = bool(os.environ.get("MORI_INTERNODE_TRACE_ARGS"))
 
 
+def _geom_env(name):
+    """``"block,rdma,warp"`` from the environment, or None.
+
+    Sweep-only. Read at build time (see _internode_geometry_buckets): the
+    internode plans are compiled per geometry, so a geometry cannot be chosen at
+    launch and a sweep has to pin it before the op is constructed.
+    """
+    raw = os.environ.get(name)
+    if not raw:
+        return None
+    parts = tuple(int(x) for x in raw.replace(" ", "").split(","))
+    if len(parts) != 3:
+        raise ValueError(f"{name}={raw!r}: want three ints, block,rdma,warp")
+    return parts
+
+
 def _raw_stream(dev_index: int) -> int:
     """The current stream on `dev_index`, as a raw pointer.
 
@@ -598,6 +614,25 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         is why a bucket carries two triples rather than one.
         """
         from .internode_tuning_configs import _TABLE, _device_key, lookup
+
+        # Sweep hook: pin one geometry for every token count, bypassing the table.
+        # A geometry is a compile-time identity here, so a sweep cannot select one
+        # at launch the way the intranode path can -- it has to be fixed before
+        # the plans are built, which is before the op exists. Hence an env var
+        # rather than a CLI flag threaded through the config.
+        pin = _geom_env("MORI_EP_DISP_GEOM"), _geom_env("MORI_EP_COMB_GEOM")
+        if pin[0] or pin[1]:
+            base_d = (
+                cfg.dispatch_block_num,
+                cfg.dispatch_rdma_block_num,
+                cfg.warp_num_per_block,
+            )
+            base_c = (
+                cfg.combine_block_num,
+                cfg.combine_rdma_block_num,
+                cfg.combine_warp_num_per_block,
+            )
+            return [(None, pin[0] or base_d, pin[1] or base_c)]
 
         dtype = "fp8" if cfg.dispatch_dtype in _FP8_TUNING_DTYPES else "bf16"
         key = (_device_key(), cfg.world_size, cfg.hidden_dim, cfg.num_experts_per_token)

@@ -246,6 +246,32 @@ def _verify_once(op, cfg, d, dev, a, comm, inp, idx, wts, sc):
     return ok and ok_w
 
 
+def _sclk_levels():
+    """Active DPM shader-clock level of every GPU on this host, as a string.
+
+    The amdgpu driver publishes the level table per card with a `*` on the
+    active one; on this rig that is 88MHz idle / 500MHz / 1850MHz with
+    power_dpm_force_performance_level=auto, so a run that never boosts is
+    several times slower at identical code. Cards are not numbered contiguously
+    (card0, card16, card24...) and the HIP device order does not have to match
+    the DRM order, so this reports ALL of them rather than pretending to know
+    which one is ours -- the question is whether the node boosted, not which
+    card did. A plain sysfs read, microseconds, no subprocess.
+    """
+    import glob
+
+    out = []
+    for path in sorted(glob.glob("/sys/class/drm/card*/device/pp_dpm_sclk")):
+        try:
+            for line in open(path):
+                if "*" in line:
+                    out.append(line.split(":")[1].split("*")[0].strip())
+                    break
+        except OSError:
+            pass
+    return " ".join(out) if out else "n/a"
+
+
 def _v1_loop_defaults():
     """The examples harness's rounds/warmup/drop defaults, read from its source.
 
@@ -396,8 +422,6 @@ def _bench(op, cfg, d, dev, a, comm):
     torch.cuda.synchronize()
     comm.barrier()
 
-    t0 = time.perf_counter()
-    ev[0].record()
     # Causal test for "is the host pacing the GPU", opt-in. Busy-waits a known
     # number of microseconds on the HOST between the convert-end event and the
     # combine enqueue -- pure host time, no GPU work, no extra kernel. If the
@@ -409,8 +433,59 @@ def _bench(op, cfg, d, dev, a, comm):
     # no assumption about what any window "should" cost.
     inject = float(os.environ.get("MORI_EP_INJECT_HOST_US") or 0) / 1e6
 
+    # Which round a garbage collection lands in, opt-in. The spikes are GLOBAL --
+    # 12 to 16 of 16 ranks spike in the same round -- so the cause is something
+    # every rank does on its own schedule, not a straggler one rank produces. A
+    # generational GC is exactly that shape: it fires on allocation counts, and
+    # every rank allocates the same objects per round, so they all reach the
+    # threshold on the same round. This records the collections rather than
+    # inferring them from an A/B. (gc.disable() was A/B'd before and read
+    # negative, but that run had 2 kept rounds and a round-8 event was not in the
+    # sample at all -- the test could not have detected what it was testing for.)
+    gc_hits = []
+    gc_cb = None
+    _cur = [-1]
+    if os.environ.get("MORI_EP_GC_TRACE"):
+        import gc
+
+        def gc_cb(phase, info):
+            if phase == "stop":
+                gc_hits.append((_cur[0], info.get("generation"), info.get("collected")))
+
+        gc.callbacks.append(gc_cb)
+
+    # Opt-in counterpart: freeze everything already alive and stop collecting for
+    # the timed loop. gc.freeze() moves the existing objects to a permanent
+    # generation so re-enabling later does not immediately pay for them.
+    _no_gc = bool(os.environ.get("MORI_EP_NO_GC"))
+    if _no_gc:
+        import gc
+
+        gc.collect()
+        gc.freeze()
+        gc.disable()
+
+    _sclk_before = _sclk_levels() if os.environ.get("MORI_EP_SCLK") else None
+
+    t0 = time.perf_counter()
+    ev[0].record()
+
+    # Host-side duration of each enqueue, opt-in via the same flag as the round
+    # series. These calls are asynchronous: while the host runs ahead of the GPU
+    # they return as soon as the work is queued, so this reads as pure Python
+    # cost. Once the launch queue is full they BLOCK until the GPU retires
+    # something, and the number jumps. That transition is the thing to look for
+    # -- it says the loop stopped measuring the kernel and started measuring the
+    # host, and it is invisible in the event timings, which report the same
+    # wall-clock either way. perf_counter is ~50ns, far below what it resolves.
+    hdisp = [0.0] * n
+    hcomb = [0.0] * n
+
     for i in range(n):
+        _cur[0] = i
+        _h = time.perf_counter()
         r = op.dispatch(inp, wts, sc, idx, return_routing=True)
+        hdisp[i] = (time.perf_counter() - _h) * 1e6
         ev[3 * i + 1].record()
         x = convert(r[0])
         ev[3 * i + 2].record()
@@ -418,13 +493,33 @@ def _bench(op, cfg, d, dev, a, comm):
             t = time.perf_counter()
             while time.perf_counter() - t < inject:
                 pass
+        _h = time.perf_counter()
         op.combine(x, cw, routing=r[5])
+        hcomb[i] = (time.perf_counter() - _h) * 1e6
         ev[3 * i + 3].record()
         if a.per_round_sync:
             torch.cuda.synchronize()
             comm.barrier()
     torch.cuda.synchronize()
     wall = (time.perf_counter() - t0) * 1e6 / n
+    if _sclk_before is not None and d.rank == 0:
+        print(f"# SCLK before: {_sclk_before}", flush=True)
+        print(f"# SCLK after:  {_sclk_levels()}", flush=True)
+    if _no_gc:
+        import gc
+
+        gc.enable()
+        gc.unfreeze()
+    if gc_cb is not None:
+        import gc
+
+        gc.callbacks.remove(gc_cb)
+        if gc_hits:
+            print(
+                "# GC r%d: " % d.rank
+                + " ".join("round%d/gen%s/n%s" % h for h in gc_hits),
+                flush=True,
+            )
 
     # Host profile, opt-in. Whenever wall exceeds dispatch+combine the loop above
     # is host-paced, and then its phase numbers are wrapper cost rather than
@@ -506,6 +601,16 @@ def _bench(op, cfg, d, dev, a, comm):
         )
         print(
             "# rounds r%d comb: " % d.rank + " ".join("%.0f" % x for x in comb),
+            flush=True,
+        )
+        print(
+            "# hostus r%d disp: " % d.rank
+            + " ".join("%.0f" % x for x in hdisp[keep]),
+            flush=True,
+        )
+        print(
+            "# hostus r%d comb: " % d.rank
+            + " ".join("%.0f" % x for x in hcomb[keep]),
             flush=True,
         )
 
