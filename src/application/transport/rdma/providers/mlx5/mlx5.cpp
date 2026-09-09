@@ -149,6 +149,45 @@ mlx5dv_devx_umem* Mlx5RegisterControlUmem(ibv_context* context, void* addr, size
   return umem;
 }
 
+// Register an ibv MR for GPU memory, preferring dmabuf and falling back to
+// plain ibv_reg_mr (peermem). Respects the same MORI_MLX5_CONTROL_DMABUF knob.
+ibv_mr* Mlx5RegisterMrDmabuf(ibv_pd* pd, void* addr, size_t size, int accessFlag,
+                             const char* what) {
+  ControlDmabufMode mode = GetControlDmabufMode();
+
+  if (mode != ControlDmabufMode::kOff) {
+    uint64_t dmabufOffset = 0;
+    int dmabufFd = TryExportDmabufFd(addr, size, &dmabufOffset);
+    if (dmabufFd >= 0) {
+      ibv_mr* mr = ibv_reg_dmabuf_mr(pd, dmabufOffset, size, reinterpret_cast<uint64_t>(addr),
+                                     dmabufFd, accessFlag);
+      close(dmabufFd);
+      if (mr) {
+        MORI_APP_TRACE("MLX5 MR [{}] registered via dmabuf: addr=0x{:x}, size={}, offset={}", what,
+                       reinterpret_cast<uintptr_t>(addr), size, dmabufOffset);
+        return mr;
+      }
+      MORI_APP_WARN("MLX5 MR [{}] dmabuf registration failed (addr=0x{:x}, size={})", what,
+                    reinterpret_cast<uintptr_t>(addr), size);
+    } else {
+      MORI_APP_WARN("MLX5 MR [{}] dmabuf export unavailable (addr=0x{:x}, size={})", what,
+                    reinterpret_cast<uintptr_t>(addr), size);
+    }
+    if (mode == ControlDmabufMode::kForce) {
+      MORI_APP_ERROR(
+          "MLX5 MR [{}] dmabuf required (MORI_MLX5_CONTROL_DMABUF=force) but unavailable; "
+          "aborting",
+          what);
+      std::abort();
+    }
+  }
+
+  ibv_mr* mr = ibv_reg_mr(pd, addr, size, accessFlag);
+  MORI_APP_TRACE("MLX5 MR [{}] registered via peermem: addr=0x{:x}, size={}", what,
+                 reinterpret_cast<uintptr_t>(addr), size);
+  return mr;
+}
+
 }  // namespace
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -411,8 +450,13 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
   int atomicIbufAccessFlag =
       MaybeAddRelaxedOrderingFlag(IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
                                   IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
-  atomicIbufMr =
-      ibv_reg_mr(device_context->GetIbvPd(), atomicIbufAddr, atomicIbufSize, atomicIbufAccessFlag);
+  if (config.onGpu) {
+    atomicIbufMr = Mlx5RegisterMrDmabuf(device_context->GetIbvPd(), atomicIbufAddr, atomicIbufSize,
+                                        atomicIbufAccessFlag, "atomic_ibuf");
+  } else {
+    atomicIbufMr = ibv_reg_mr(device_context->GetIbvPd(), atomicIbufAddr, atomicIbufSize,
+                              atomicIbufAccessFlag);
+  }
   assert(atomicIbufMr);
 
   MORI_APP_TRACE(
