@@ -33,16 +33,26 @@
 // Load a shared library at runtime. Returns the handle, or nullptr on failure.
 void* DvLoadLibrary(const char* lib_name);
 
-// Load a symbol from a library handle. Returns nullptr on failure.
-void* DvLoadSymbol(void* handle, const char* symbol_name);
+// Load a symbol from a library handle. Returns nullptr on failure. Set
+// warn_on_miss=false for optional symbols whose absence is expected and handled
+// by the caller (e.g. a newer-rdma-core entry point with a runtime fallback), so
+// a miss stays silent instead of logging a misleading warning.
+void* DvLoadSymbol(void* handle, const char* symbol_name, bool warn_on_miss = true);
 
 // ============================================================================
 // MLX5 direct-verbs function pointers
 // ============================================================================
+// struct mlx5dv_devx_umem_in is defined either by <infiniband/mlx5dv.h> or, when
+// that header is absent, by mlx5_dv.h. It is only used here through a pointer, so
+// an incomplete forward declaration suffices (same as mlx5dv_devx_umem below).
+struct mlx5dv_devx_umem_in;
+
 struct Mlx5DvApi {
   using devx_general_cmd_t = int (*)(struct ibv_context*, const void*, size_t, void*, size_t);
   using devx_umem_reg_t = struct mlx5dv_devx_umem* (*)(struct ibv_context*, void*, size_t,
                                                        uint32_t);
+  using devx_umem_reg_ex_t = struct mlx5dv_devx_umem* (*)(struct ibv_context*,
+                                                          struct mlx5dv_devx_umem_in*);
   using devx_umem_dereg_t = int (*)(struct mlx5dv_devx_umem*);
   using devx_alloc_uar_t = struct mlx5dv_devx_uar* (*)(struct ibv_context*, uint32_t);
   using devx_free_uar_t = void (*)(struct mlx5dv_devx_uar*);
@@ -55,6 +65,7 @@ struct Mlx5DvApi {
 
   devx_general_cmd_t devx_general_cmd = nullptr;
   devx_umem_reg_t devx_umem_reg = nullptr;
+  devx_umem_reg_ex_t devx_umem_reg_ex = nullptr;
   devx_umem_dereg_t devx_umem_dereg = nullptr;
   devx_alloc_uar_t devx_alloc_uar = nullptr;
   devx_free_uar_t devx_free_uar = nullptr;
@@ -72,6 +83,11 @@ struct Mlx5DvApi {
 
     devx_general_cmd = (devx_general_cmd_t)DvLoadSymbol(handle, "mlx5dv_devx_general_cmd");
     devx_umem_reg = (devx_umem_reg_t)DvLoadSymbol(handle, "mlx5dv_devx_umem_reg");
+    // Optional: only present on newer rdma-core. Absence just disables the dmabuf
+    // control-ring path and falls back to peermem umem registration, so resolve it
+    // with warn_on_miss=false to keep the miss silent on older libmlx5.
+    devx_umem_reg_ex =
+        (devx_umem_reg_ex_t)DvLoadSymbol(handle, "mlx5dv_devx_umem_reg_ex", /*warn_on_miss=*/false);
     devx_umem_dereg = (devx_umem_dereg_t)DvLoadSymbol(handle, "mlx5dv_devx_umem_dereg");
     devx_alloc_uar = (devx_alloc_uar_t)DvLoadSymbol(handle, "mlx5dv_devx_alloc_uar");
     devx_free_uar = (devx_free_uar_t)DvLoadSymbol(handle, "mlx5dv_devx_free_uar");

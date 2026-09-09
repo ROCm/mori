@@ -85,6 +85,23 @@ struct mlx5dv_devx_umem {
   uint32_t umem_id;
 };
 
+// Input to mlx5dv_devx_umem_reg_ex. With comp_mask=MLX5DV_UMEM_MASK_DMABUF and a
+// valid dmabuf_fd, a GPU control ring (CQ/WQ/DBR) is registered by dmabuf instead
+// of by virtual address, so it works without peer-mem (e.g. KVM guests). `addr`
+// is the dmabuf-relative byte offset in that mode.
+struct mlx5dv_devx_umem_in {
+  void* addr;
+  size_t size;
+  uint32_t access;
+  uint64_t pgsz_bitmap;
+  uint64_t comp_mask;
+  int dmabuf_fd;
+};
+
+enum mlx5dv_devx_umem_in_mask {
+  MLX5DV_UMEM_MASK_DMABUF = 1 << 0,
+};
+
 struct mlx5dv_devx_uar {
   void* reg_addr;
   void* base_addr;
