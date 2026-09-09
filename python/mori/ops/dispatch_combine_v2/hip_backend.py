@@ -338,10 +338,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             bad.append("combine_mode='scatter' (the internode kernels gather)")
         if cfg.enable_std_moe:
             bad.append("enable_std_moe (not implemented on the internode path)")
-        if cfg.quant_type not in ("none", "fp8_direct_cast"):
+        if cfg.quant_type != "none":
             bad.append(
-                f"quant_type={cfg.quant_type!r} "
-                "(the internode combine implements none and fp8_direct_cast)"
+                f"quant_type={cfg.quant_type!r} (the internode combine is unquantised)"
             )
         # The same-destination dedup is a ballot with one lane per expert.
         from .dispatch_combine_op import WAVE

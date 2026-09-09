@@ -140,14 +140,12 @@ constexpr int EpInterNodeBlockThreads(const EpInterNodeCfg& c) {
   return c.warpPerBlock * c.waveSize;
 }
 
-// Combine's pointer arrays: one per warp for the topk sources, a second for the
-// weights, a third for the scales when the quant type is blockwise. Mirrors
-// combine_shared_mem() in launch.cpp with use_weight_ptrs=true.
+// Combine's pointer arrays: one per warp for the topk sources and a second for
+// the weights. Mirrors combine_shared_mem() in launch.cpp with
+// use_weight_ptrs=true, minus its third array -- that one is for blockwise
+// scales, and no quant type reaches the internode path.
 constexpr int EpInterNodeCombineSharedBytes(const EpInterNodeCfg& c) {
-  const bool blockwise = c.kernelCfg.quantType == EpQuantType::Fp8BlockwiseQuant ||
-                         c.kernelCfg.quantType == EpQuantType::Fp4BlockwiseQuant;
-  const int ptrArrays = 2 + (blockwise ? 1 : 0);
-  return c.warpPerBlock * c.kernelCfg.numExpertPerToken * ptrArrays * 8;
+  return c.warpPerBlock * c.kernelCfg.numExpertPerToken * 2 * 8;
 }
 
 // ---------------------------------------------------------------------------

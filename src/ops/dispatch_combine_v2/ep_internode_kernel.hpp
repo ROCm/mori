@@ -65,7 +65,6 @@ namespace v2 {
 
 // v2 types introduced under the names the ported bodies already use.
 using index_t = ep_index_t;
-using QuantType = EpQuantType;
 
 // v1's spelling, now a plain alias: the struct stopped depending on T when
 // inpTokenBuf became void*, matching the intranode EpArgs.
@@ -889,17 +888,8 @@ inline __device__ void CombineSync(EpDispatchCombineArgs& args) {
   int startTokenIdx = blockId * tokenPerBlock;
   int endTokenIdx = std::min(startTokenIdx + tokenPerBlock, totalRecvTokenNum);
   for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
-    if constexpr (kConfig.quantType == QuantType::Fp8DirectCast) {
-      using Fp8T = core::CombineInternalFp8;
-      Fp8T* dst = args.reg(args.offCombineInp)->template GetAs<Fp8T*>();
-      const T* src = static_cast<const T*>(args.inpTokenBuf);
-      const size_t base = tokenId * hiddenDim;
-      core::WarpCastBf16ToCombineInternalFp8<T>(dst + base, src + base, hiddenDim, laneId);
-    } else {
-      core::WarpCopy(args.reg(args.offCombineInp)->template GetAs<T*>() + tokenId * hiddenDim,
-                     static_cast<const T*>(args.inpTokenBuf) + tokenId * hiddenDim,
-                     hiddenDim);
-    }
+    core::WarpCopy(args.reg(args.offCombineInp)->template GetAs<T*>() + tokenId * hiddenDim,
+                   static_cast<const T*>(args.inpTokenBuf) + tokenId * hiddenDim, hiddenDim);
   }
   if (args.weightsBuf) {
     for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
@@ -1380,14 +1370,6 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
 template <EpInterNodeKernelCfg kConfig, typename T>
 inline __device__ void CombineIntraNode(EpDispatchCombineArgs& args) {
   DEF_COMMON_VARS;
-  if constexpr (kConfig.quantType == QuantType::Fp8DirectCast) {
-    using TokT = core::CombineInternalFp8;
-    const size_t tokHiddenBytes = hiddenDim * sizeof(TokT);
-    const size_t tokCombXferBytes =
-        (args.weightsBuf == nullptr) ? tokHiddenBytes : tokHiddenBytes + weightBytes;
-    combine_impl::CombineIntraNodeTyped<kConfig, TokT, T>(args, tokHiddenBytes, tokCombXferBytes);
-    return;
-  }
 
   combine_impl::CombineIntraNodeTyped<kConfig, T, T>(args, hiddenBytes, combXferBytes);
 }
@@ -1397,14 +1379,6 @@ inline __device__ void CombineIntraNodeLL(EpDispatchCombineArgs& args) {
   DEF_COMMON_VARS;
 
   if (args.curRankNumToken == 0) return;
-  if constexpr (kConfig.quantType == QuantType::Fp8DirectCast) {
-    using TokT = core::CombineInternalFp8;
-    const size_t tokHiddenBytes = hiddenDim * sizeof(TokT);
-    const size_t tokCombXferBytes =
-        (args.weightsBuf == nullptr) ? tokHiddenBytes : tokHiddenBytes + weightBytes;
-    combine_impl::CombineIntraNodeLLTyped<kConfig, TokT, T>(args, tokHiddenBytes, tokCombXferBytes);
-    return;
-  }
   combine_impl::CombineIntraNodeLLTyped<kConfig, T, T>(args, hiddenBytes, combXferBytes);
 }
 
@@ -1413,15 +1387,6 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs& args,
                                         const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
 
-  if constexpr (kConfig.quantType == QuantType::Fp8DirectCast) {
-    using TokT = core::CombineInternalFp8;
-    const size_t tokHiddenBytes = hiddenDim * sizeof(TokT);
-    const size_t tokCombXferBytes =
-        (args.weightsBuf == nullptr) ? tokHiddenBytes : tokHiddenBytes + weightBytes;
-    combine_impl::CombineInterNodeTyped<kConfig, TokT, T>(args, tokHiddenBytes, tokCombXferBytes,
-                                                       comm);
-    return;
-  }
   combine_impl::CombineInterNodeTyped<kConfig, T, T>(args, hiddenBytes, combXferBytes, comm);
 }
 
@@ -1429,15 +1394,6 @@ template <EpInterNodeKernelCfg kConfig, typename T>
 inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs& args,
                                           const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
-  if constexpr (kConfig.quantType == QuantType::Fp8DirectCast) {
-    using TokT = core::CombineInternalFp8;
-    const size_t tokHiddenBytes = hiddenDim * sizeof(TokT);
-    const size_t tokCombXferBytes =
-        (args.weightsBuf == nullptr) ? tokHiddenBytes : tokHiddenBytes + weightBytes;
-    combine_impl::CombineInterNodeLLTyped<kConfig, TokT, T>(args, tokHiddenBytes, tokCombXferBytes,
-                                                         comm);
-    return;
-  }
   combine_impl::CombineInterNodeLLTyped<kConfig, T, T>(args, hiddenBytes, combXferBytes, comm);
 }
 }  // namespace internode
@@ -1455,63 +1411,6 @@ __device__ void EpCombineInterNodeV2_body(EpDispatchCombineArgs args,
 }
 
 namespace combine_all_impl {
-
-template <EpInterNodeKernelCfg kConfig, typename T>
-__forceinline__ __device__ void EpCombineAllInternalFp8(EpDispatchCombineArgs& args,
-                                                        size_t fp8HiddenBytes,
-                                                        size_t fp8CombXferBytes) {
-  DEF_COMMON_VARS;
-  using Fp8T = core::CombineInternalFp8;
-
-  extern __shared__ char sharedMem[];
-  Fp8T** srcPtrs = reinterpret_cast<Fp8T**>(sharedMem) + warpId * config.numExpertPerToken;
-  float** srcWeightsPtrs = reinterpret_cast<float**>(sharedMem) +
-                           warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
-  uint8_t* stagingPtr = args.reg(args.offStaging)->template GetAs<uint8_t*>() +
-                        SendBufSlotOffset(config, nNodes, 0) * fp8CombXferBytes;
-
-  MultiWarpIter mwIter(globalWarpNum, args.curRankNumToken, hiddenDim);
-
-  for (int i = globalWarpId; i < (args.curRankNumToken * mwIter.warpsPerItem); i += globalWarpNum) {
-    int tokenId, inTokenPartId;
-    size_t hiddenDimOffset, hiddenDimSize;
-    mwIter.Decode(i, tokenId, inTokenPartId, hiddenDimOffset, hiddenDimSize);
-
-    int lanePe = -1, laneNode = -1;
-    if (laneId < config.numExpertPerToken) {
-      index_t laneExpert = args.tokenIndices[tokenId * numExpertPerToken + laneId];
-      if (laneExpert >= 0) {
-        lanePe = laneExpert / config.numExpertPerRank;
-        laneNode = lanePe / config.gpuPerNode;
-      }
-    }
-
-    if (laneId < nNodes) {
-      srcPtrs[laneId] = nullptr;
-      srcWeightsPtrs[laneId] = nullptr;
-    }
-
-    for (int n = 0; n < nNodes; n++) {
-      if (__any(laneNode == n) && (laneId == 0)) {
-        int mappedId = (n == myNode) ? tokenId : args.interNodeDispSendMap[nNodes * tokenId + n];
-        uint8_t* base = stagingPtr + SendBufSlotOffset(config, n, mappedId) * fp8CombXferBytes;
-        srcPtrs[n] = reinterpret_cast<Fp8T*>(base) + hiddenDimOffset;
-        srcWeightsPtrs[n] = reinterpret_cast<float*>(base + fp8HiddenBytes);
-      }
-    }
-
-    T* out =
-        args.reg(args.offCombineOut)->template GetAs<T*>() + tokenId * hiddenDim + hiddenDimOffset;
-    core::WarpAccumCombineInternalFp8ToBf16(out, reinterpret_cast<const Fp8T* const*>(srcPtrs),
-                                            nNodes, laneId, hiddenDimSize);
-
-    if (args.weightsBuf && (inTokenPartId == mwIter.warpsPerItem - 1)) {
-      core::WarpAccum<float, 4>(args.reg(args.offCombineOutWeights)->template GetAs<float*>() +
-                                    tokenId * config.numExpertPerToken,
-                                srcWeightsPtrs, nullptr, nNodes, config.numExpertPerToken);
-    }
-  }
-}
 
 template <EpInterNodeKernelCfg kConfig, typename T>
 __forceinline__ __device__ void EpCombineAllGeneric(EpDispatchCombineArgs& args) {
@@ -1575,14 +1474,6 @@ __device__ void EpCombineAll_body(EpDispatchCombineArgs args) {
     if (laneId < nNodes) args.blockFlagCounter[laneId] = 0;
   }
   if (args.curRankNumToken == 0) return;
-  if constexpr (kConfig.quantType == QuantType::Fp8DirectCast) {
-    using Fp8T = core::CombineInternalFp8;
-    const size_t fp8HiddenBytes = hiddenDim * sizeof(Fp8T);
-    const size_t fp8CombXferBytes =
-        (args.weightsBuf == nullptr) ? fp8HiddenBytes : fp8HiddenBytes + weightBytes;
-    combine_all_impl::EpCombineAllInternalFp8<kConfig, T>(args, fp8HiddenBytes, fp8CombXferBytes);
-    return;
-  }
   combine_all_impl::EpCombineAllGeneric<kConfig, T>(args);
 }
 
