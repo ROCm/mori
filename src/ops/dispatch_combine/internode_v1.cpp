@@ -379,6 +379,7 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
        bid += args.rdmaBlockNum) {
     int k = bid / (numRecvBlock * (nNodes - 1));
     int i = (bid / numRecvBlock) % (nNodes - 1);
+    // 第i个节点的第k个chunk
 
     int node = (myNode + 1 + i) % nNodes;
     int startTokenIdx = k * warpSize;
