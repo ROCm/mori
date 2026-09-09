@@ -111,10 +111,20 @@ from mori.ops import utils as gpu_utils
 # a multiple-comparison problem and the sweep alone cannot tell a real effect
 # from the best of 165 draws. The bar applied here is: the tuned phase's median
 # must be better in all three head-to-heads.
-#   4. A plain interleaved bench A/B of the resulting TABLE. Stage 3 runs two ops
-#      at once -- incumbent and candidate each holding a symmetric window, run
-#      alternately -- which is not the shipping condition, so its verdict does
-#      not transfer on its own.
+#   4. A plain interleaved bench A/B of the resulting TABLE. This stage cannot be
+#      replaced by a better statistic inside the tuner, and that was measured
+#      rather than assumed. Two things differ, both verified on (32,12,6):
+#        * the ESTIMATOR -- the tuner takes the median over 21 paired passes,
+#          the bench the mean over 30 rounds of ONE pass. The two geometries have
+#          the SAME median round (42.0 against 41-42); the candidate spikes to
+#          4-5x on one round in thirty, which moves a bench mean and which a
+#          median over passes discards.
+#        * the ENVIRONMENT -- the tuner holds two ops alive, each with its own
+#          symmetric window, alternating. That makes BOTH arms spike: worst round
+#          124/127, 127/127, 127/133 over three runs, against 79 and 65 for the
+#          incumbent and 162 and 205 for the candidate in a plain bench. The
+#          candidate's own spike is invisible because the environment supplies
+#          one to both arms.
 #
 # Stage 4 rejected 8-token dispatch (32,12,6), which had passed stage 3 on both
 # the median (39.0/39.2/40.2 against 40.9/41.0/41.3) and the worst. In a plain

@@ -831,7 +831,15 @@ def _timed_pass(op, cfg, d, a, inp, idx, wts, sc, cw, convert, n, warm):
     dv = [ev[3 * i].elapsed_time(ev[3 * i + 1]) * 1e3 for i in range(n)][keep]
     cv = [ev[3 * i + 2].elapsed_time(ev[3 * i + 3]) * 1e3 for i in range(n)][keep]
     gm = lambda v: d.allreduce_sum(int(sum(v) / len(v) * 1000)) / d.world / 1000
-    return gm(dv), gm(cv)
+    # The worst ROUND, across ranks, alongside the grand means. Without it a
+    # sweep cannot see the failure mode that matters here: a geometry whose
+    # median round is identical but which spikes to 4-5x on one round in thirty.
+    # A pass mean hides that (160us over 30 rounds moves the mean by 4us, inside
+    # the noise) and a median over paired passes discards it entirely -- which is
+    # exactly how (32,12,6) won the 8-token sweep and then lost the bench.
+    _, wd = d.allreduce_minmax(0, int(max(dv) * 1000))
+    _, wc = d.allreduce_minmax(0, int(max(cv) * 1000))
+    return gm(dv), gm(cv), wd / 1000, wc / 1000
 
 
 def _build_op(cfg, comm, dgeom, cgeom):
@@ -984,23 +992,31 @@ def _tune(cfg, d, dev, a, comm):
 
         bt, ct_ = [], []
         bph, cph = [], []  # (dispatch, combine) per rep, to show the coupling
+        bw, cw_ = [], []  # worst ROUND per pass, per arm
         for _ in range(a.tuning_reps):
-            dv, cv = _timed_pass(
+            dv, cv, wd, wc = _timed_pass(
                 best_op, cfg, d, a, inp, idx, wts, sc, cw, convert, a.rounds, a.warmup
             )
             bt.append(pick(dv, cv))
             bph.append((dv, cv))
-            dv, cv = _timed_pass(
+            bw.append(pick(wd, wc))
+            dv, cv, wd, wc = _timed_pass(
                 cand_op, cfg, d, a, inp, idx, wts, sc, cw, convert, a.rounds, a.warmup
             )
             ct_.append(pick(dv, cv))
             cph.append((dv, cv))
+            cw_.append(pick(wd, wc))
         bm, cm = sorted(bt)[len(bt) // 2], sorted(ct_)[len(ct_) // 2]
         # Worst of the paired reps, as a tail proxy. _timed_pass returns a grand
         # mean, so this is run-to-run spread rather than a worst ROUND -- which is
         # the right thing here anyway, since the risk being guarded against is a
         # geometry that lands in a bad regime more often.
-        bmax, cmax = max(bt), max(ct_)
+        # MEDIAN of the per-pass worst ROUND, not the worst pass mean. The
+        # median across passes keeps one unlucky pass from vetoing a candidate,
+        # while the per-pass max is what makes a recurring single-round spike
+        # visible at all.
+        bmax = sorted(bw)[len(bw) // 2]
+        cmax = sorted(cw_)[len(cw_) // 2]
         # PAIRED, not a difference of medians: the regime moves during a sweep
         # (the same incumbent geometry has read 84.9us on one candidate and
         # 126.0us on the next), and differencing within a rep cancels that. The
