@@ -492,6 +492,7 @@ def make_plan(kernel: str, enums: dict | None = None) -> type:
             # bind(), so pinned arguments are never served from a stale cache.
             self._buf = None
             self._buf_shape = None
+            self._last = {}
             self._dyn_args = ()
             self._dyn_defs = ()
             # Known at construction, so the caller need not repeat them per launch.
@@ -593,10 +594,34 @@ def make_plan(kernel: str, enums: dict | None = None) -> type:
                     for w, v in self._defaults.items()
                     if w in arg_names and (not isinstance(v, int) or w in arg_blobs)
                 )
+                self._last = {}
             else:
                 buf = self._buf
+                last = self._last
                 for k, wire in self._dyn_args:
-                    _set_arg(buf, wire, args[k])
+                    v = args[k]
+                    # Skip a field whose INT value is what is already in the
+                    # buffer. Same reasoning as the _dyn_defs filter above: the
+                    # struct persists between launches, so re-writing an
+                    # unchanged int is pure cost. A caller that hands over
+                    # tensor addresses (every EP one does -- hip_backend passes
+                    # .data_ptr() results) repeats them every round, and each
+                    # write costs a Python call, a dict lookup, a hasattr and a
+                    # setattr. A moved allocation changes the int, misses here,
+                    # and is written.
+                    #
+                    # NOT for a blob: it crosses by value, and an unchanged
+                    # address is no evidence the bytes behind it held still.
+                    # NOT for a non-int either -- resolving it is the only way to
+                    # know its address, and `!=` on a tensor does not even return
+                    # a bool.
+                    if type(v) is int and wire not in arg_blobs:
+                        if last.get(wire) == v:
+                            continue
+                        _set_arg(buf, wire, v)
+                        last[wire] = v
+                    else:
+                        _set_arg(buf, wire, v)
                 for wire in self._dyn_defs:
                     _set_arg(buf, wire, self._defaults[wire])
             return buf
@@ -674,6 +699,86 @@ def make_plan(kernel: str, enums: dict | None = None) -> type:
     return Plan
 
 
+def _args_layout(plan):
+    """The plan's args layout as (name, offset, size) per field.
+
+    Not `sizeof`. Eight of the fields are bare pointers, so two schemas that swap
+    a pair of same-typed fields have identical size and a caller filling one and
+    launching the other reads the wrong buffer in silence -- the exact failure the
+    ascending-offset static_assert exists to catch on the C++ side.
+    """
+    t = plan._args_t
+    return tuple((n, getattr(t, n).offset, getattr(t, n).size) for n in plan._arg_names)
+
+
+class LaunchGroup:
+    """A fixed set of plans over one args layout, validated once.
+
+    `launch_multi` redoes per call what depends only on the set: copying the plan
+    list, checking every handle, comparing every args layout, building the ctypes
+    handle array. A serving loop holds the set fixed -- one per (phase, geometry)
+    -- so it belongs here, leaving the launch path with the argument fill and the
+    one ABI crossing. Measured on the EP internode sequence, that per-call work
+    was ~17us against kernels of ~40us.
+
+    The group keeps its plans alive, so a handle cannot dangle by garbage
+    collection. Explicitly `close()`ing a plan still invalidates every group over
+    it; there is no per-launch check for that, which is the point.
+    """
+
+    __slots__ = ("_plans", "_lead", "_handles", "_n", "_argsize", "_fn")
+
+    def __init__(self, plans):
+        plans = list(plans)
+        if not plans:
+            raise ValueError("launch group needs at least one plan")
+        for i, p in enumerate(plans):
+            if p._handle is None:
+                raise RuntimeError(f"launch group over a closed plan at index {i}")
+        lead = plans[0]
+        want = _args_layout(lead)
+        for i, p in enumerate(plans[1:], 1):
+            got = _args_layout(p)
+            if got != want:
+                diff = [a for a, b in zip(want, got) if a != b] or ["field count"]
+                raise ValueError(
+                    f"launch group: plan {i} ({p._kernel}) does not share "
+                    f"{lead._kernel}'s args layout; first difference at {diff[0]}"
+                )
+        self._plans = plans
+        self._lead = lead
+        self._n = len(plans)
+        self._handles = (ctypes.c_void_p * self._n)(*[p._handle.value for p in plans])
+        self._argsize = ctypes.sizeof(lead._args_t)
+        # Bind the entry point too. `_load()` is memoised but still a call and a
+        # lookup per launch, on a path measured at ~14us a call.
+        self._fn = _load().mori_jit_plan_launch_multi
+
+    def launch(self, stream=0, **args) -> None:
+        """Fill the shared argument struct once, then launch every plan in order."""
+        buf = self._lead._launch_buf(args)
+        # The stream parameter is declared c_void_p in argtypes, so ctypes does
+        # the conversion at the boundary and an int passes straight through.
+        # Wrapping it in a c_void_p here built a Python object per launch only for
+        # ctypes to unwrap it again. Only a non-int still needs _as_ptr.
+        rc = self._fn(
+            self._handles,
+            self._n,
+            ctypes.byref(buf),
+            self._argsize,
+            stream if type(stream) is int else _as_ptr(stream),
+        )
+        if rc != 0:
+            raise RuntimeError(f"mori jit launch_multi: {_error()}")
+
+    __call__ = launch
+
+
+def make_launch_group(plans) -> LaunchGroup:
+    """Bind a fixed plan sequence for repeated launching. See LaunchGroup."""
+    return LaunchGroup(plans)
+
+
 def launch_multi(plans, stream=0, **args) -> None:
     """Launch several plans that share one args schema, with a single ABI crossing.
 
@@ -691,25 +796,7 @@ def launch_multi(plans, stream=0, **args) -> None:
     plans = list(plans)
     if not plans:
         return
-    lead = plans[0]
-    if any(p._handle is None for p in plans):
-        raise RuntimeError("launch_multi on a closed plan")
-    lead_size = ctypes.sizeof(lead._args_t)
-    if any(ctypes.sizeof(p._args_t) != lead_size for p in plans):
-        raise ValueError("launch_multi: plans do not share one args layout")
-
-    buf = lead._launch_buf(args)
-    n = len(plans)
-    handles = (ctypes.c_void_p * n)(*[p._handle.value for p in plans])
-    rc = _load().mori_jit_plan_launch_multi(
-        handles,
-        n,
-        ctypes.byref(buf),
-        ctypes.sizeof(buf),
-        ctypes.c_void_p(_as_ptr(stream)),
-    )
-    if rc != 0:
-        raise RuntimeError(f"mori jit launch_multi: {_error()}")
+    LaunchGroup(plans).launch(stream, **args)
 
 
 def precompile(kernel: str, arch: str | None = None) -> int:

@@ -40,27 +40,26 @@ struct KernelDesc {
   const char* tag;   // goes in the entry name
   const char* body;  // the *_body function in ep_internode_kernel.hpp
   bool takesComm;    // false for the passes with no cross-node traffic
-  bool takesStdMoE;  // the LL pair is additionally specialised on it
 };
 
 KernelDesc DescFor(EpInterNodeKernel k) {
   switch (k) {
     case EpInterNodeKernel::CopyToStaging:
-      return {"copystaging", "EpDispatchCopyToStaging_body", false, false};
+      return {"copystaging", "EpDispatchCopyToStaging_body", false};
     case EpInterNodeKernel::Dispatch:
-      return {"dispatch", "EpDispatchInterNodeV1Kernel_body", true, false};
+      return {"dispatch", "EpDispatchInterNodeV1Kernel_body", true};
     case EpInterNodeKernel::DispatchLL:
-      return {"dispatch_ll", "EpDispatchInterNodeV1KernelLowLatency_body", true, true};
+      return {"dispatch_ll", "EpDispatchInterNodeV1KernelLowLatency_body", true};
     case EpInterNodeKernel::CombineSync:
-      return {"combinesync", "EpCombineSync_body", false, false};
+      return {"combinesync", "EpCombineSync_body", false};
     case EpInterNodeKernel::CombineSyncBarrier:
-      return {"combinesyncbarrier", "EpCombineSyncBarrier_body", false, false};
+      return {"combinesyncbarrier", "EpCombineSyncBarrier_body", false};
     case EpInterNodeKernel::Combine:
-      return {"combine", "EpCombineInterNodeV1Kernel_body", true, false};
+      return {"combine", "EpCombineInterNodeV1Kernel_body", true};
     case EpInterNodeKernel::CombineLL:
-      return {"combine_ll", "EpCombineInterNodeV1KernelLowLatency_body", true, true};
+      return {"combine_ll", "EpCombineInterNodeV1KernelLowLatency_body", true};
     case EpInterNodeKernel::CombineAll:
-      return {"combineall", "EpCombineAll_body", false, false};
+      return {"combineall", "EpCombineAll_body", false};
   }
   throw std::runtime_error("mori ep v1 jit: unknown kernel");
 }
@@ -98,7 +97,6 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
   c.kernelCfg.quantType = req.quantType;
 
   c.dtype = req.dtype;
-  c.enableStdMoE = req.enableStdMoE;
 
   c.waveSize = mori::jit::v2::WaveSizeForArch(arch);
 
@@ -155,7 +153,6 @@ std::string EpInterNodeEntryName(const EpInterNodeCfg& cfg, EpInterNodeKernel ki
   s += d.tag;
   s += '_';
   s += EpInterNodeDTypeTag(cfg.dtype);
-  if (d.takesStdMoE && cfg.enableStdMoE) s += "_stdmoe";
   return s;
 }
 
@@ -188,14 +185,6 @@ std::string EpInterNodeRenderSource(const EpInterNodeCfg& cfg, EpInterNodeKernel
     src += entry;
     src += ", ";
     src += d.body;
-    src += ")\n";
-  } else if (d.takesStdMoE) {
-    src += "MORI_EP_INTERNODE_CCO_ENTRY_STDMOE(";
-    src += entry;
-    src += ", ";
-    src += d.body;
-    src += ", ";
-    src += cfg.enableStdMoE ? "true" : "false";
     src += ")\n";
   } else {
     src += "MORI_EP_INTERNODE_CCO_ENTRY(";

@@ -151,6 +151,16 @@ mori_ep_dispatch_bf16_ws8_h2048_k8_64x16(EpArgs args) { EpDispatchBody<kCfg, Tok
 hash = sha256(name $$ hipcc签名 $$ nic $$ flags $$ include哈希 $$ 源码文本)
 ```
 
+> **⚠️ 开发期陷阱：JIT 默认不编译你的 `src/`。** `DetectSourceRoot()`
+> （`src/jit/v2/toolchain.cpp`）按 `MORI_SOURCE_ROOT` → **`.so` 旁边的 `_jit-sources`** →
+> `MORI_JIT_SOURCE_DIR` 的顺序解析。`python/mori/_jit-sources/` 是 `setup.py` 在
+> pip-install 时做的一份**实拷贝**，editable 安装下它优先命中——于是改
+> `src/ops/**/*.hpp` 或 `include/**` 对 JIT **无效，且静默**：include 哈希也是对那份陈旧
+> 拷贝算的，连缓存目录名都不变。诊断办法是往头文件末尾加 `#error`、清掉
+> `~/.mori/jit/<arch>_<nic>`、重编，若仍然成功就说明编的不是你的树。
+> 开发时导出 `MORI_SOURCE_ROOT=<repo root>`；`pip install -e .` 也能刷新那份拷贝，
+> 但下次编辑又会过期，环境变量不会。
+
 `include 哈希`是对 `SourceDeps()` 列出的目录做一次排序递归遍历，把每个头文件的**相对路径和内容**
 都摘进去。粗粒度是刻意的：它可能过度失效，但不会漏失效。EP 的依赖集是
 `include/mori`、`src/ops/dispatch_combine_v2`、`src/cco`。
@@ -325,13 +335,24 @@ dispatch 的 dtype**——它只归约 bf16/fp32 的暂存区，不管前面搬�
 
 ## 6. Python 绑定
 
-C ABI 是**十个符号，对所有 kernel 永久有效**：
+C ABI 是**十一个符号，对所有 kernel 永久有效**：
 
 ```
-mori_jit_plan_create / _launch / _destroy / _info
+mori_jit_plan_create / _launch / _launch_multi / _destroy / _info
 mori_jit_plan_args_schema / _args_size / _request_schema
 mori_jit_precompile / mori_jit_registered_plans / mori_jit_last_error
 ```
+
+`_launch_multi` 是批量发射：N 个共享同一 args 布局的 plan，填一次参数结构、穿一次 ABI，
+然后按序发射（C++ 侧就是对同一个 `argBuf` 循环 `vt->launch`，不认识任何具体 kernel）。
+EP 的 internode 序列一次 dispatch 是 2 个 pass、一次 combine 是 4 个，本来要穿 6 次。
+
+Python 侧对应 `plan_api.LaunchGroup`：**plan 集合固定时把校验和 handle 数组挪到构建期**，
+发射路径只剩填参数和那一次 ABI 调用。「共享同一 args 布局」按完整的
+`(name, offset, size)` 序列比对，不是只比 `sizeof`——理由见 §3.2：八个裸指针字段，
+调换两个同类型的所有尺寸校验都过，然后按 `plans[0]` 的 schema 填、发给其余 plan，
+静默读错 buffer。代价是 group 缓存了 handle：显式 `close()` 一个 plan 会让它失效，
+而发射路径不再逐次检查——这正是省下来的那部分。
 
 | | 机制 |
 |---|---|

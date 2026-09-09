@@ -30,10 +30,11 @@
 // either. Attribute-free and standard C++ -- no __host__/__device__ here, or
 // every host TU that touches a Cfg would need hipcc.
 //
-// Kept separate from ep_cfg.hpp rather than merged: dispatch_combine.hpp below
-// costs ~200 headers (`hipcc -E -H`: 14 for ep_cfg.hpp, 219 here), and merging
-// would charge that, and the warpSize dance, to the intranode kernels on every
-// JIT compile.
+// Kept separate from ep_cfg.hpp rather than merged: this one pulls cco.hpp (and
+// the warpSize dance around it) for the device communicator, and merging would
+// charge that to the intranode kernels on every JIT compile. It no longer pulls
+// v1 -- ep_internode_args.hpp owns the argument struct, the config the bodies
+// read, index_t and QuantType.
 // ---------------------------------------------------------------------------
 #pragma once
 
@@ -41,7 +42,7 @@
 #include <string>
 
 #include "mori/jit/v2/render.hpp"
-#include "mori/ops/dispatch_combine/dispatch_combine.hpp"
+#include "mori/ops/dispatch_combine_v2/ep_internode_args.hpp"
 
 // cco.hpp declares mori::cco::impl::warpSize(); mori/core/utils/utils.hpp may
 // already have defined `warpSize` as a macro. See ep_internode_kernel.hpp.
@@ -51,27 +52,24 @@
 #pragma pop_macro("warpSize")
 
 namespace mori {
-namespace moe {
-
-// jit::v2::Fields calls RenderValue unqualified, so the overload for a config
-// enum has to live in the enum's own namespace for ADL to find it.
-inline std::string RenderValue(QuantType q) {
-  switch (q) {
-    case QuantType::Fp8DirectCast:
-      return "::mori::moe::QuantType::Fp8DirectCast";
-    case QuantType::Fp8BlockwiseQuant:
-      return "::mori::moe::QuantType::Fp8BlockwiseQuant";
-    case QuantType::Fp4BlockwiseQuant:
-      return "::mori::moe::QuantType::Fp4BlockwiseQuant";
-    default:
-      return "::mori::moe::QuantType::None";
-  }
-}
-
-}  // namespace moe
-
 namespace ops {
 namespace v2 {
+
+// jit::v2::Fields calls RenderValue unqualified, so the overload for a config
+// enum has to live in the enum's own namespace for ADL to find it. That is
+// mori::ops::v2 now that EpQuantType is v2's own enum rather than v1's.
+inline std::string RenderValue(EpQuantType q) {
+  switch (q) {
+    case EpQuantType::Fp8DirectCast:
+      return "::mori::ops::v2::EpQuantType::Fp8DirectCast";
+    case EpQuantType::Fp8BlockwiseQuant:
+      return "::mori::ops::v2::EpQuantType::Fp8BlockwiseQuant";
+    case EpQuantType::Fp4BlockwiseQuant:
+      return "::mori::ops::v2::EpQuantType::Fp4BlockwiseQuant";
+    default:
+      return "::mori::ops::v2::EpQuantType::None";
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Transported element type. v1 keeps the two fp8 encodings and fp4 apart, which
@@ -168,8 +166,33 @@ struct EpInterNodeKernelCfg {
   int maxTotalRecvTokens{0};
   int gpuPerNode{8};
   int numQpPerPe{1};
-  mori::moe::QuantType quantType{mori::moe::QuantType::None};
+  EpQuantType quantType{EpQuantType::None};
 };
+
+// The device-side config the bodies read: purely the compiled-in shape, so the
+// result is constexpr and every field folds to a literal at its use.
+//
+// This replaces EpInterNodeBindConfig, which used to copy the same twelve fields
+// over a by-value args member at kernel entry so the optimiser could constant-
+// fold them. Constructing it from kConfig directly says the same thing without
+// carrying 56 bytes of kernarg that the host fills and the kernel immediately
+// overwrites -- a duplication that had to agree and had nothing checking it.
+constexpr EpInterNodeDeviceCfg EpInterNodeDeviceCfgOf(const EpInterNodeKernelCfg& k) {
+  EpInterNodeDeviceCfg d{};
+  d.worldSize = k.worldSize;
+  d.hiddenDim = k.hiddenDim;
+  d.scaleDim = k.scaleDim;
+  d.scaleTypeSize = k.scaleTypeSize;
+  d.maxTokenTypeSize = k.maxTokenTypeSize;
+  d.maxNumInpTokenPerRank = k.maxNumInpTokenPerRank;
+  d.numExpertPerRank = k.numExpertPerRank;
+  d.numExpertPerToken = k.numExpertPerToken;
+  d.maxTotalRecvTokens = k.maxTotalRecvTokens;
+  d.gpuPerNode = k.gpuPerNode;
+  d.numQpPerPe = k.numQpPerPe;
+  d.quantType = k.quantType;
+  return d;
+}
 
 template <typename Self, typename Visit>
 inline void VisitFields(Self& c, const EpInterNodeKernelCfg& d, Visit&& v) {
@@ -227,22 +250,6 @@ inline bool operator==(const EpInterNodeKernelCfg& a, const EpInterNodeKernelCfg
 // those two disagree the moment a caller passes hidden_dim -- and since the
 // kernel's EpInterNodeBindConfig OVERWRITES args.config with the NTTP, sourcing the
 // constants from the stale one silently runs the kernel against other numbers.
-inline EpInterNodeKernelCfg MakeEpInterNodeKernelCfg(const mori::moe::EpDispatchCombineConfig& c) {
-  EpInterNodeKernelCfg s;
-  s.worldSize = c.worldSize;
-  s.hiddenDim = c.hiddenDim;
-  s.scaleDim = c.scaleDim;
-  s.scaleTypeSize = c.scaleTypeSize;
-  s.maxTokenTypeSize = c.maxTokenTypeSize;
-  s.maxNumInpTokenPerRank = c.maxNumInpTokenPerRank;
-  s.numExpertPerRank = c.numExpertPerRank;
-  s.numExpertPerToken = c.numExpertPerToken;
-  s.maxTotalRecvTokens = c.maxTotalRecvTokens;
-  s.gpuPerNode = c.gpuPerNode;
-  s.numQpPerPe = c.numQpPerPe;
-  s.quantType = c.quantType;
-  return s;
-}
 
 // A zero in any divisor is a division by a literal zero once the cfg is an
 // NTTP -- hipcc either rejects the TU or emits a poison value, and neither
@@ -258,35 +265,21 @@ inline bool EpInterNodeKernelCfgIsValid(const EpInterNodeKernelCfg& s) {
 // ep_internode_kernel.hpp includes this header rather than redeclaring it, so
 // the two cannot disagree about the layout.
 //
-// EpDispatchCombineArgsRaw is what the AOT launcher already passes, and it is
-// static_asserted to share a layout with EpDispatchCombineArgs<T>. The device
-// communicator rides alongside it because that is how a JIT module gets its
-// endpoints.
+// EpInterNodeCcoArgs itself now lives in ep_internode_args.hpp, next to the
+// argument struct it wraps: it is device-side shape, and keeping it there is
+// what lets this header stop including v1 entirely.
 // ---------------------------------------------------------------------------
-struct EpInterNodeCcoArgs {
-  mori::moe::EpDispatchCombineArgsRaw raw;
-  ::mori::cco::ccoDevComm devComm;
-};
-
-static_assert(
-    sizeof(EpInterNodeCcoArgs) ==
-        sizeof(mori::moe::EpDispatchCombineArgsRaw) + sizeof(::mori::cco::ccoDevComm),
-    "EpInterNodeCcoArgs has interior padding -- EpInterNodeArgsSchema() describes it as two "
-    "back-to-back byte ranges and would place devComm at the wrong offset");
 
 // The args schema, in the form plan_api publishes.
 //
-// EpArgs crosses as 22 named scalars because it was designed for this boundary.
-// These args cannot: every value in them is produced by EpDispatchCombineHandle
-// (53 fields, 15 of them SymmMemObjPtr, 3 nested ShmemBufs*), and a caller on
-// the far side of the ABI holds them only as the opaque buffer BuildArgs hands
-// back. So they cross as byte ranges -- named, sized, and size-checked against
-// C++'s own sizeof like any other schema, but copied wholesale rather than
-// filled field by field.
+// Named fields, exactly like EpArgs: the field list, this string and the
+// offset-order assert are all generated from MORI_EP_INTERNODE_ARGS_FIELDS in
+// ep_internode_args.hpp, so the binding builds its ctypes struct from what C++
+// declares rather than from a parallel copy. The one byte range is devComm,
+// which is cco's struct and not EP's to name.
 inline const char* EpInterNodeArgsSchema() {
-  static const std::string s = "raw:b" +
-                               std::to_string(sizeof(mori::moe::EpDispatchCombineArgsRaw)) +
-                               ",devComm:b" + std::to_string(sizeof(::mori::cco::ccoDevComm)) + ",";
+  static const std::string s = std::string(MORI_EP_INTERNODE_ARGS_SCHEMA) + "devComm:b" +
+                               std::to_string(sizeof(::mori::cco::ccoDevComm)) + ",";
   return s.c_str();
 }
 

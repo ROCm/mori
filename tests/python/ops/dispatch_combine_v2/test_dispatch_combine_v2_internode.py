@@ -19,944 +19,1527 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""InterNodeV1 / InterNodeV1LL on the CCO kernels the v2 JIT plans compile.
+"""Internode correctness for the v2 EP op, over CCO/GDA.
 
-The internode counterpart to ``test_dispatch_combine_v2_intranode.py``, and the
-CCO counterpart to ``test_dispatch_combine_internode_v1.py`` -- which covers the
-same two kernels on the shmem AOT path and is the model this file follows: the
-same worker-pool fan-out, the same analytic golden from
-``EpDispatchCombineTestCase``, the same ``_KERNELS`` geometry pairs. Expectations
-are computed analytically, so a pass means "matches the intended semantics",
-not "matches the other backend".
+Identity expert -- the received tokens are combined unchanged -- so
+``combine[t] == U[t] * input[t]`` and ``out_weights[t] == U[t] * wts[t]``, where
+U is the number of DISTINCT destination ranks token t routed to. The expectation
+is analytic: a pass means "matches the intended semantics", not "matches some
+other implementation", which is the property that has to survive the kernel being
+rewritten underneath it.
 
-``backend`` is the axis this file adds. ``cco`` builds the handle on the CCO
-communicator and redirects every InterNodeV1 launch to a v2 JIT plan (see the
-launch-redirect section below); ``shmem`` is the stock AOT path, present as a
-control -- if a case fails on both, suspect the shape or the harness rather than
-the CCO port.
+TWO NODES ARE REQUIRED, and not merely for coverage -- the op refuses to build
+otherwise. ``gpu_per_node < world_size`` is what selects the internode path, and
+the op checks EP's node grouping against the communicator's LSA team; on one host
+CCO reports the whole world as one team, so a config claiming two nodes is
+rejected rather than silently running the intranode half. Lowering gpu_per_node
+on a single host does not emulate this either: RAIL leaves same-host peers
+without a QP.
 
-Three modes, in one file, because they want opposite settings:
+    # rank 0 of 2, 8 GPUs each
+    torchrun --nnodes=2 --node_rank=0 --nproc_per_node=8 \\
+        --master_addr=<ip> --master_port=<port> \\
+        test_dispatch_combine_v2_internode.py --max-tokens 128
 
-``correctness``
-    One checked round per case. Default; this is the mode that gates a merge.
+``tools/run_internode_test.sh`` drives both ranks; the CLI below is the subset of
+the shmem harness's flags that means anything here.
 
-``stress`` (``MORI_INTERNODE_TEST_STRESS=1``)
-    Hundreds of rounds, checked once at the start and then run unchecked. Finds
-    what a single round cannot: chunk flags that are never reset, recv counters
-    that drift, send-slot reuse. The shmem suite does the same thing in
-    ``test_dispatch_combine_internode.py``.
+RoCE QoS: SET MORI_RDMA_TC AND MORI_RDMA_SL
+-------------------------------------------
+Unset, ``bnxt.cpp`` takes ``ReadRdmaServiceLevelEnv().value_or(1)`` and leaves
+``grh.traffic_class`` alone, so every transfer goes out on SL 1 / DSCP 0 -- the
+default lossy class -- no matter how the NIC and switch are programmed. The
+values must match the fabric: on the 2-node bnxt rig here the NIC is programmed
+``roce_dscp=0x28`` (40), so ``MORI_RDMA_TC=160`` (40 << 2) and
+``MORI_RDMA_SL=5``. ``tools/env_setup.sh`` derives both from ROCE_DSCP/ROCE_PRIO
+and exports them; its checked-in 26/3 are reference defaults its own comment says
+to align with the switch. Confirm they arrived with ``MORI_APP_LOG_LEVEL=info``:
+``bnxt attr.ah_attr.sl:5 attr.ah_attr.grh.traffic_class:160``.
 
-``bench`` (``MORI_INTERNODE_TEST_BENCH=1``)
-    Latency and algorithmic bandwidth for both backends. **Asserts nothing about
-    speed.** This machine's absolute throughput moves ~25% between batches with
-    no code change, so a threshold would be a coin flip; the pair is printed
-    (use ``-s``) and the comparison left to a human. Only same-invocation pairs
-    are meaningful.
+Measured, it changes nothing HERE -- interleaved A/B over four pairs at 4 tokens
+put 160/5 and 0/1 within noise of each other. That is expected rather than
+contradictory: a lossless priority class buys nothing when the benchmark is the
+only traffic on the fabric. It is worth setting because a number measured in the
+wrong traffic class does not transfer to a shared one, not because it is a
+speedup.
 
-One host means one CCO node. CCO derives its node grouping from the physical
-topology, so ``gpu_per_node`` stays at the whole world here: lowering it changes
-only EP's idea of a node, and the RDMA path then issues puts to peers RAIL left
-without a QP. The intra-node half of these kernels is what runs; the network
-path needs two hosts and a driver that is machine-specific glue.
+What the tail investigation found -- that it is not a tail but a bistable
+whole-run regime, what has been eliminated as its cause, and how to read the
+per-rank series and the per-pass split -- lives in
+``docs/EP_INTERNODE_V2_TAIL.md`` rather than here, so this file stays close in
+shape to the examples harness it mirrors.
+
+COMPARING AGAINST THE v1 BENCH
+------------------------------
+The reference numbers come from ``run_bench_once`` in
+``examples/ops/dispatch_combine/test_dispatch_combine_internode.py``, driven
+through v1's op. The timed loop here is structured the same way and reports the
+same three statistics, but the two harnesses do NOT build the same shape by
+default. Every difference found by reading both, and what to pass to close it:
+
+  what                     v1 bench          here (default)     to align
+  ----------------------   ---------------   ----------------   ------------------
+  combine weights          None (no fold)    None               (aligned)
+  num_experts_per_rank     256 // world      256 // world       (aligned)
+  scale_dim                32                32                 (aligned)
+  scale_type_size          4                 4 when scale_dim   (aligned)
+  warmup / rounds / drop   20 / 30 / 1       same, and CHECKED  (aligned)
+  routing                  randperm[:topk]   same               (aligned)
+  tokens per rank          max on every rank same               (aligned)
+  statistic                avg over          same               (aligned)
+                           rounds x ranks
+
+Only ONE row of this table is enforced: `_report_loop_alignment` reads the three
+loop constants out of that harness's source and warns, next to the numbers, when
+they differ from ours. Every other row is a claim a reader has to re-check, and
+one of them was wrong for as long as it was written -- `--rounds` sat at 3
+against that harness's 30 while this row said "same", because a table asserting
+three numbers had been checked for two. Prefer extending the check to adding a
+row.
+
+Both of those defaults used to differ and had to be passed by hand, which is a
+bad way to keep a comparison honest: scale_dim=32 makes dispatch carry 128 more
+bytes per token, so forgetting it silently flattered this side. They now default
+to v1's values. The remaining row that moves real work is the weight fold, which
+is off in both by default -- it costs an extra peer read per (token, destination)
+plus an accumulate in three kernels and a wider staging slot.
 """
-import os
-import statistics
 
-import pytest
+import argparse
+import ctypes
+import os
+import sys
+import time
+
+import numpy as np
 import torch
 import torch.distributed as dist
 
-import mori
-from mori.jit.v2 import plan_api as _jit_plan_api
-from mori.ops.dispatch_combine_v2.ep_plans import EP_INTERNODE_PLANS, INTERNODE_DTYPES
-from tests.python.ops.dispatch_combine_test_utils import (
-    EpDispatchCombineTestCase,
-    _all_data_types,
-    assert_worker_results,
-    cross_dtype_hidden_dims,
-    cross_dtype_skip_reason,
-    run_ep_dispatch_combine_test,
-)
+from mori.cco import Communicator
+from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig, EpDispatchCombineOp
 
-# kernel -> (type, block_num, rdma_block_num, warp_num_per_block). The pairs
-# test_dispatch_combine_internode_v1.py ships: the bandwidth table uses V1, the
-# latency table V1LL, and the two want different grids.
-_KERNELS = {
-    "v1": (mori.ops.EpDispatchCombineKernelType.InterNodeV1, 96, 64, 8),
-    "v1_ll": (mori.ops.EpDispatchCombineKernelType.InterNodeV1LL, 256, 128, 8),
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", "..", ".."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+_DTYPES = {
+    "bf16": torch.bfloat16,
+    "fp32": torch.float32,
+    "fp8_e4m3_fnuz": torch.float8_e4m3fnuz,
+    "fp8_e4m3": torch.float8_e4m3fn,
 }
-
-# InterNodeV1 is what the reference bench selects at >=4096 tokens and V1LL
-# below it, so each kernel is exercised at a count it actually ships for.
-_BENCH_TOKENS = {"v1": 4096, "v1_ll": 128}
-
-# CCO's LL path needs thousands of rounds to reach steady state where shmem
-# needs under ten; a few hundred reads a transient. V1 at 4096 tokens covers the
-# same cumulative work in far fewer rounds, which is why the two differ.
-_BENCH_WARMUP = {"v1": 20, "v1_ll": 2000}
-
-_WORLD_SIZE = 8
+_FP8 = (torch.float8_e4m3fnuz, torch.float8_e4m3fn)
 
 
-def _enabled(name):
-    return os.environ.get(name, "0").strip().lower() not in ("", "0", "false", "no")
+class Dist:
+    """torchrun/gloo bootstrap. gloo is only the courier for the cco unique id
+    and the pass/fail counts; every byte of payload moves over cco."""
+
+    def __init__(self):
+        self.rank = int(os.environ["RANK"])
+        self.world = int(os.environ["WORLD_SIZE"])
+        self.local_rank = int(os.environ["LOCAL_RANK"])
+        if not dist.is_initialized():
+            dist.init_process_group(backend="gloo")
+        torch.cuda.set_device(self.local_rank)
+
+    def bcast_uid(self, uid):
+        objs = [uid if self.rank == 0 else None]
+        dist.broadcast_object_list(objs, src=0)
+        return objs[0]
+
+    def allreduce_sum(self, value):
+        t = torch.tensor([value], dtype=torch.int64)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        return int(t.item())
+
+    def all_gather_rows(self, row):
+        """(world, len(row)) float64 from each rank's `row`. gloo, so CPU."""
+        t = torch.tensor(row, dtype=torch.float64)
+        out = [torch.zeros_like(t) for _ in range(self.world)]
+        dist.all_gather(out, t)
+        return torch.stack(out)
+
+    def allreduce_minmax(self, lo, hi):
+        """Extremes across ranks, for the same best/worst the v1 harness prints."""
+        t = torch.tensor([lo, -hi], dtype=torch.int64)
+        dist.all_reduce(t, op=dist.ReduceOp.MIN)
+        return int(t[0].item()), -int(t[1].item())
+
+    def shutdown(self):
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
-_stress_only = pytest.mark.skipif(
-    not _enabled("MORI_INTERNODE_TEST_STRESS"),
-    reason="stress mode is opt-in: set MORI_INTERNODE_TEST_STRESS=1",
-)
-_bench_only = pytest.mark.skipif(
-    not _enabled("MORI_INTERNODE_TEST_BENCH"),
-    reason="bench mode is opt-in: set MORI_INTERNODE_TEST_BENCH=1",
-)
-
-
-# ---------------------------------------------------------------------------
-# launch redirect: the only caller the CCO internode kernels have
-# ---------------------------------------------------------------------------
-#
-# v1 internode exists twice over, as two implementations sharing only a handle
-# and an args struct:
-#
-#   shmem  src/ops/dispatch_combine/internode_v1.cpp, entries
-#          ``EpDispatchInterNodeV1Kernel_<dt>``, which dispatch_combine.py drives.
-#   cco    src/ops/dispatch_combine_v2/ep_internode_kernel.hpp, entries
-#          ``mori_ep_internode_*`` -- what the JIT v2 plans compile, and what has
-#          no caller anywhere else in the tree.
-#
-# ``EpDispatchCombineOp._launch_multi`` is the single funnel every InterNodeV1
-# launch goes through, so redirecting it to the plans leaves argument building,
-# routing and output tensors on the existing code. It is swapped for the whole
-# process rather than per call: the cco kernels need a cco-backed handle, and the
-# shmem kernels address the shmem heap, so on such a handle they fault.
-
-
-# Read once: these sit on the per-launch path, which runs as often as the kernels
-# do, and an os.environ lookup there is pure overhead in the common case where
-# none of them is set.
-_TRACE_PATH = os.environ.get("MORI_INTERNODE_TRACE")
-_TRACE_CFG = bool(os.environ.get("MORI_INTERNODE_TRACE_CFG"))
-_TRACE_SYNC = bool(os.environ.get("MORI_INTERNODE_TRACE_SYNC"))
-# Batch the N-pass launch through one ABI crossing (launch_multi). On by default;
-# set MORI_INTERNODE_BATCH_LAUNCH=0 to fall back to per-pass plan.launch, which
-# is the A/B control for measuring what the batch saves on the eager host path.
-_BATCH_LAUNCH = os.environ.get(
-    "MORI_INTERNODE_BATCH_LAUNCH", "1"
-).strip().lower() not in (
-    "",
-    "0",
-    "false",
-    "no",
-)
-
-
-def _trace(msg):
-    """Progress markers to a file, enabled by MORI_INTERNODE_TRACE.
-
-    The workers this runs in are spawned by the test's process manager, which
-    keeps no handle on their stdout; when one dies the buffered output goes with
-    it, so a stage that hangs or faults leaves no trace at all on stdout.
-    """
-    if not _TRACE_PATH:
-        return
-    with open(f"{_TRACE_PATH}.{os.environ.get('RANK', os.getpid())}", "a") as f:
-        f.write(msg + "\n")
-
-
-# The AOT entry base name of each pass, mapped to the plan that supplies it.
-_PASS_BY_ENTRY = {
-    "EpDispatchCopyToStaging": "copystaging",
-    "EpDispatchInterNodeV1Kernel": "dispatch",
-    "EpDispatchInterNodeV1KernelLowLatency": "dispatch_ll",
-    "EpCombineSync": "combinesync",
-    "EpCombineSyncBarrier": "combinesyncbarrier",
-    "EpCombineInterNodeV1Kernel": "combine",
-    "EpCombineInterNodeV1KernelLowLatency": "combine_ll",
-    "EpCombineAll": "combineall",
-}
-# Longest-first so "..._fp8_ocp" is not read as dtype "ocp", and so
-# "...V1Kernel" does not swallow "...V1KernelLowLatency".
-_DTYPES_LONGEST_FIRST = sorted(INTERNODE_DTYPES, key=len, reverse=True)
-
-# Cfg field -> the get_handle_info key reporting the same thing, for the
-# consistency dump. Fields the handle does not report are simply absent.
-_HANDLE_INFO_KEY = {
-    "worldSize": "world_size",
-    "scaleDim": "scale_dim",
-    "scaleTypeSize": "scale_type_size",
-    "maxTokenTypeSize": "max_token_type_size",
-    "maxNumInpTokenPerRank": "max_num_inp_token_per_rank",
-    "numExpertPerRank": "num_expert_per_rank",
-    "numExpertPerToken": "num_expert_per_token",
-    "gpuPerNode": "gpu_per_node",
-    "rdmaBlockNum": "rdma_block_num",
-    "quantType": "quant_type",
-}
-
-
-def _split_entry(func_name):
-    """``EpCombineAll_bf16`` -> ``("combineall", "bf16")``; None if not a v1 pass."""
-    for dtype in _DTYPES_LONGEST_FIRST:
-        if not func_name.endswith("_" + dtype):
-            continue
-        base = func_name[: -len(dtype) - 1]
-        if base in _PASS_BY_ENTRY:
-            return _PASS_BY_ENTRY[base], dtype
-    return None
-
-
-def _dev_comm_host_ptr(op):
-    """Address of the host-side ``ccoDevComm``, which the args hold by value.
-
-    ``DevComm.ptr`` is the device-side copy, for kernels taking a pointer; this
-    has to be the host struct, because ``EpInterNodeCcoArgs`` embeds one.
-    """
-    cached = op.__dict__.get("_internode_dev_comm")
-    if cached is not None:
-        return cached
-    if op._cco_comm is None:
-        raise RuntimeError(
-            "the cco v1 internode kernels need a cco-backed handle; "
-            "set MORI_EP_COMM=cco before building the op"
-        )
-    from mori.cco import cco as _cco
-    from mori.cco.communicator import DevCommHandle
-
-    # These requirements are what the kernels are written against, and since the
-    # C++ side has no devComm of its own this is the only place they are chosen.
-    # The defaults are not close enough to work: v1 talks only to its own local
-    # rank on other nodes, so it asks for RAIL rather than the CROSSNODE default,
-    # and ccoGda picks its QP as contextId % numQpPerPe, so a smaller context
-    # count than numQpPerPe silently collapses the stripes onto fewer QPs.
-    # A production path would need to make the same two choices.
-    reqs = _cco.DevCommRequirements()
-    reqs.gda_connection_type = _cco.GDA_CONNECTION_RAIL
-    reqs.gda_context_count = max(1, op.config.num_qp_per_pe)
-
-    handle = DevCommHandle(op._cco_comm, requirements=reqs)
-    op.__dict__["_internode_dev_comm_handle"] = handle  # keep it alive
-    # lsa_size is CCO's own view of how many ranks share a node, which comes from
-    # the physical topology and not from config.gpuPerNode. Under RAIL there are
-    # QPs only to cross-node peers, so lsa_size == world_size means none exist.
-    _trace(
-        f"  devComm world_size={handle.world_size} lsa_size={handle.lsa_size} "
-        f"rank={handle.rank} lsa_rank={handle.lsa_rank}"
+def _parse_args(argv):
+    p = argparse.ArgumentParser(description="v2 internode dispatch/combine test")
+    p.add_argument("--cmd", default="test", choices=["test", "bench", "tuning"])
+    p.add_argument("--max-tokens", type=int, default=128)
+    p.add_argument("--hidden-dim", type=int, default=7168)
+    p.add_argument("--topk", type=int, default=8)
+    # None -> 256 // world_size, which is what the v1 harness hardcodes
+    # (examples/.../test_dispatch_combine_internode.py:576). world_size is not
+    # known until the workers start, so the default has to be resolved there.
+    p.add_argument("--experts-per-rank", type=int, default=None)
+    p.add_argument("--dtype", default="bf16", choices=list(_DTYPES))
+    p.add_argument("--combine-dtype", default=None, choices=list(_DTYPES))
+    p.add_argument("--quant-type", default="none", choices=["none", "fp8_direct_cast"])
+    p.add_argument("--num-qp", type=int, default=2)
+    # 30, matching _EP_ROUNDS in the examples harness. Lower is not a
+    # small-sample caveat but a different estimator: at --rounds 3 with
+    # --drop-rounds 1 the two kept rounds are the ones that harness documents as
+    # still in the CCO ramp, so one spike carries half the mean AND is the worst.
+    p.add_argument("--rounds", type=int, default=30)
+    # 32 to match v1, which hardcodes scale_dim=32 / scale_type_size=4. It is not
+    # free -- it makes dispatch carry 128 more bytes per token -- which is exactly
+    # why it should not be something a comparison has to remember to pass.
+    p.add_argument("--scale-dim", type=int, default=32)
+    p.add_argument("--tuning-scope", default="quick", choices=["quick", "full"])
+    p.add_argument("--tuning-reps", type=int, default=3)
+    # Smoke-test / bisect aid: stop after N candidates (0 = sweep all).
+    p.add_argument("--tuning-limit", type=int, default=0)
+    p.add_argument(
+        "--tuning-phase", default="dispatch", choices=["dispatch", "combine"]
     )
-    ptr = handle._dev_comm.host_ptr
-    op.__dict__["_internode_dev_comm"] = ptr
-    return ptr
+    # Validation mode: sweep exactly one named candidate against the shipped
+    # geometry. A sweep winner is chosen by a greedy chain of paired tests, each
+    # with its own error; before it is written into the table it gets one long
+    # head-to-head against what it would replace.
+    p.add_argument("--tuning-candidate", default=None)
+    # What a candidate is selected ON. "total" by default, and deliberately:
+    # internode_tuning_configs.py records that the two phases are COUPLED -- a
+    # dispatch with too few rdma blocks leaves the following combine ~18us slower
+    # at 4/8 tokens -- so the shipped small-token dispatch is NOT the dispatch
+    # argmin, it holds rdma high to keep the paired combine fast. Selecting a
+    # dispatch geometry on dispatch time alone reproduces exactly the mistake
+    # that comment warns about. "phase" is kept for looking at a phase in
+    # isolation, which is a diagnostic, not a way to choose a table row.
+    p.add_argument("--tuning-metric", default="total", choices=["total", "phase"])
+    # Greedy chaining (v1's shape: a winner becomes the incumbent) is OFF by
+    # default here. With a chain, one lucky early win moves the baseline and
+    # every later candidate is judged against it, so the outcome depends on the
+    # order noise arrived in: five repeats of the same 29-candidate sweep at 15
+    # paired reps returned five different winners -- (80,53,4), (16,10,4) twice,
+    # (16,8,4), (8,5,8) -- plus (32,21,8) on two earlier runs. Holding the
+    # incumbent FIXED at the shipped geometry makes every candidate an
+    # independent paired test against the thing it would replace, which is both
+    # what we want to know and reproducible across repeats.
+    p.add_argument("--tuning-greedy", action="store_true")
+    # Workers to spawn per node. 8 by default, which means this harness expects
+    # --nproc_per_node=1 and builds the rest of the ranks itself -- the same
+    # process tree the examples harness uses, so the two are comparable without
+    # remembering to pass a flag. --spawn 0 turns it off for the old shape (one
+    # torchrun process per rank).
+    p.add_argument("--spawn", type=int, default=8)
+    # How much better a candidate must be, on the paired difference, to take
+    # over. Whichever of the two is larger. Not 0: see the note in _tune.
+    p.add_argument("--tuning-margin-us", type=float, default=1.5)
+    p.add_argument("--tuning-margin-frac", type=float, default=0.02)
+    # How much worst-of-reps regression a median win may carry, and how much
+    # worst-of-reps improvement makes a median TIE interesting. Fraction of the
+    # incumbent's median.
+    p.add_argument("--tuning-tail-frac", type=float, default=0.10)
+    # The v1 bench calls combine with weights=None, so it does not pay for the
+    # weight fold: an extra peer read per (token, destination) plus an accumulate
+    # in three kernels, and a wider staging slot (combXferBytes = hidden + weights).
+    # Off by default so a reading here is comparable to one from that harness;
+    # --bench-weights measures the fold when that is what you want. The
+    # correctness path always folds -- it is checking the weights.
+    p.add_argument("--bench-weights", action="store_true")
+    p.add_argument("--warmup", type=int, default=20)
+    p.add_argument("--drop-rounds", type=int, default=1)
+    # Diagnostic, matching _EP_PERROUND_SYNC in the examples harness. Re-aligns
+    # the ranks every round. These kernels spin on their peers, so any host skew
+    # shows up as KERNEL time; if this moves the numbers, the gap is skew rather
+    # than kernel work. It folds the barrier wait into the next round's dispatch
+    # window, so dispatch is not clean under it -- combine is.
+    p.add_argument("--per-round-sync", action="store_true")
+    # Sync WITHOUT the barrier. --per-round-sync costs ~1.3ms a round here (gloo
+    # over TCP) and injects more rank skew than it removes, so it cannot test the
+    # one thing it was meant to. This keeps the local launch queue drained --
+    # which is the question when the host is running ahead -- and adds nothing
+    # cross-rank.
+    p.add_argument("--per-round-drain", action="store_true")
+    p.add_argument("--no-bench-tables", action="store_true")
+    p.add_argument("--pre-barriers", type=int, default=1)
+    p.add_argument("--pre-sleep-ms", type=float, default=0.0)
+    # gloo by default to match the v1 harness, which uses dist.barrier() at this
+    # same boundary (examples/.../test_dispatch_combine_internode.py:1270) and
+    # nowhere uses mori.shmem's own barrier. Both kinds are host-side socket
+    # collectives, but they are not the same implementation or the same socket
+    # path -- measured exit skew differs (gloo 265-500us typical against cco
+    # 332-2760us) -- and a comparison should not carry that difference at the
+    # measurement boundary. Only THIS barrier changed; the comm.barrier() calls
+    # elsewhere are CCO collectives that may also order the symmetric window.
+    p.add_argument("--barrier-kind", default="gloo", choices=["cco", "gloo", "both"])
+    # Re-align the ranks every N rounds. The slow regime is a stable inter-node
+    # phase offset, and a rendezvous does not remove one -- this asks whether an
+    # explicit re-alignment escapes the offset fixed point or whether the loop
+    # falls straight back into it. N is chosen so the gloo barrier's ~1.3ms is
+    # amortised: at 20 it costs ~65us a round against a ~100us round, which is
+    # far too much for a benchmark number but fine for answering the question.
+    p.add_argument("--realign-every", type=int, default=0)
+    # Both members of the LL / non-LL pair are compiled either way; this picks
+    # which one runs. Default (None) leaves the backend's token-count rule alone,
+    # which selects LL below 2048 tokens. Naming it explicitly is what makes a
+    # benchmark number comparable to another harness's.
+    p.add_argument("--kernel-type", default=None, choices=[None, "v1", "v1_ll"])
+    return p.parse_args(argv)
 
 
-def _plan_for(op, pass_name, dtype, block_num, warp_per_block, mp_count, want=None):
-    """One plan per (pass, dtype, geometry). Geometry is outside the JIT cache
-    key, so the geometry variants share one compiled binary.
-
-    ``want`` is the (grid, block, smem) dispatch_combine.py computed. It is
-    checked against EpInterNodeGeometry once per plan rather than once per launch:
-    reading ``plan.info`` parses the whole Cfg out of a key=value blob, and the
-    two arithmetics cannot start agreeing or stop agreeing between launches of
-    the same plan.
-    """
-    key = (pass_name, dtype, block_num, warp_per_block, mp_count)
-    cache = op.__dict__.setdefault("_internode_plans", {})
-    plan = cache.get(key)
-    if plan is not None:
-        return plan
-
-    info = op._handle_info
-    cfg = op.config
-    # Shape comes from what C++ resolved on the handle rather than from the
-    # Python config: these become compiled-in constants that the kernel's
-    # EpInterNodeBindConfig writes back over args.config, so a constant disagreeing
-    # with what the launch carries would silently change behaviour. hiddenDim is
-    # the exception, overridden per call by build_args from the input tensor.
-    plan = EP_INTERNODE_PLANS[pass_name](
-        worldSize=info["world_size"],
-        hiddenDim=op.__dict__.get("_internode_hidden_dim") or info["hidden_dim"],
-        scaleDim=info["scale_dim"],
-        scaleTypeSize=info["scale_type_size"],
-        maxTokenTypeSize=info["max_token_type_size"],
-        maxNumInpTokenPerRank=info["max_num_inp_token_per_rank"],
-        numExpertPerRank=info["num_expert_per_rank"],
-        numExpertPerToken=info["num_expert_per_token"],
-        maxTotalRecvTokens=cfg.max_total_recv_tokens,
-        gpuPerNode=info["gpu_per_node"],
-        numQpPerPe=cfg.num_qp_per_pe,
-        quantType=int(info["quant_type"]),  # the handle reports the code, not the name
-        dtype=dtype,
-        blockNum=block_num,
-        warpPerBlock=warp_per_block,
-        rdmaBlockNum=info["rdma_block_num"],
-        mpCount=mp_count,
-    )
-    got = plan.info
-    if _TRACE_CFG:
-        # The kernel's EpInterNodeBindConfig overwrites args.config with the constants
-        # compiled in, so any field where the two disagree is a silent behaviour
-        # change rather than an error.
-        hi = op._handle_info
-        for k, v in sorted(got.items()):
-            mine = hi.get(_HANDLE_INFO_KEY.get(k, ""), "-")
-            flag = "" if str(mine) in ("-", str(v)) else "  <== DIFFERS"
-            _trace(f"    cfg {k}={v} handle={mine}{flag}")
-    # Geometry is arrived at twice -- once by dispatch_combine.py, once by
-    # EpInterNodeGeometry -- so a disagreement means the host arithmetic drifted.
-    if want is not None:
-        have = (got["gridX"], got["blockX"], got["sharedBytes"])
-        if want != have:
-            raise AssertionError(
-                f"{pass_name}: geometry drift, dispatch_combine.py wants "
-                f"grid/block/smem {want}, EpInterNodeGeometry says {have}"
-            )
-    cache[key] = plan
-    return plan
-
-
-def _install_jit_redirect():
-    """Route every InterNodeV1 launch in this process to the JIT v2 plans.
-
-    Pair with _uninstall_jit_redirect(): the patch is on the class, so leaving it
-    in place would have a later shmem case launch cco plans against a shmem
-    handle.
-    """
-    import mori.ops.dispatch_combine as dc
-
-    Op = dc.EpDispatchCombineOp
-    if getattr(Op, "_internode_installed", False):
-        return
-    orig_launch_multi = Op._launch_multi
-    Op._internode_saved = {
-        "_launch_multi": orig_launch_multi,
-        "dispatch": Op.dispatch,
-        "combine": Op.combine,
-    }
-
-    def _launch_multi(self, func_names, grids, blocks, shared_mems, stream, args_ptr):
-        passes = [_split_entry(n) for n in func_names]
-        if any(p is None for p in passes):
-            return orig_launch_multi(
-                self, func_names, grids, blocks, shared_mems, stream, args_ptr
-            )
-        mp_count = self._handle_info["multi_processor_count"]
-        _trace(f"launch_multi enter {[p for p, _ in passes]}")
-        dev_comm = _dev_comm_host_ptr(self)
-        _trace(f"  dev_comm={dev_comm:#x}")
-        plans = []
-        for (pass_name, dtype), grid, block, smem in zip(
-            passes, grids, blocks, shared_mems
-        ):
-            wpb = max(1, block // self._warp_size)
-            plan = _plan_for(
-                self, pass_name, dtype, grid, wpb, mp_count, (grid, block, smem)
-            )
-            _trace(f"  plan ready {pass_name}")
-            plans.append(plan)
-
-        if _TRACE_PATH or _TRACE_SYNC or not _BATCH_LAUNCH:
-            # Per-pass on the debug path, so a fault is attributable: kernel errors
-            # are asynchronous, and a batch launch would report one pass's fault
-            # against whichever call syncs next -- or take the process down with no
-            # attribution at all.
-            for plan, (pass_name, _), grid, block, smem in zip(
-                plans, passes, grids, blocks, shared_mems
-            ):
-                _trace(f"  launching {pass_name} grid={grid} block={block} smem={smem}")
-                plan.launch(raw=args_ptr, devComm=dev_comm, stream=stream)
-                _trace(f"  launched {pass_name}")
-                if _TRACE_SYNC:
-                    try:
-                        torch.cuda.synchronize()
-                        _trace(f"  synced {pass_name} ok")
-                    except Exception as exc:
-                        _trace(
-                            f"  synced {pass_name} FAILED {type(exc).__name__}: {exc}"
-                        )
-                        raise
-        else:
-            # Fast path: one ABI crossing for the whole N-pass sequence. All passes
-            # share the EpInterNodeCcoArgs schema and the same raw/devComm, so the
-            # arg struct is filled once and every plan launches against it in order.
-            _jit_plan_api.launch_multi(
-                plans, raw=args_ptr, devComm=dev_comm, stream=stream
-            )
-
-    Op._launch_multi = _launch_multi
-
-    # build_args takes the hidden dim from the input tensor, and the kernel gets
-    # it as a compiled constant, so the plan must be built for the same value.
-    from mori.ops.dispatch_combine_v2 import internode_tuning_configs as _ep_tuning
-
-    for name in ("dispatch", "combine"):
-        orig = getattr(Op, name)
-
-        def wrapper(self, input, *a, _orig=orig, _phase=name, **kw):
-            self.__dict__["_internode_hidden_dim"] = input.size(1)
-            # The redirect is the internode path's only geometry hook: left alone
-            # it inherits dispatch_combine.py's grid, which is not CU-aware and
-            # over-subscribes MI308 at these token counts. When the caller pinned
-            # nothing, pin the per-device, CU-bounded, per-token geometry instead.
-            if kw.get("block_num", -1) <= 0:
-                geom = _ep_tuning.lookup(
-                    self.config.world_size,
-                    self.config.hidden_dim,
-                    self.config.num_experts_per_token,
-                    int(input.size(0)),
-                )
-                if geom is not None:
-                    b, r, w = geom[_phase]
-                    kw["block_num"], kw["rdma_block_num"], kw["warp_per_block"] = (
-                        b,
-                        r,
-                        w,
-                    )
-            return _orig(self, input, *a, **kw)
-
-        setattr(Op, name, wrapper)
-
-    Op._internode_installed = True
-
-
-def _uninstall_jit_redirect():
-    """Undo _install_jit_redirect(), returning the op to the stock AOT launch path.
-
-    The cached plans and devComm need no cleanup: they hang off the op instance,
-    not the class, so they go when the op does.
-    """
-    import mori.ops.dispatch_combine as dc
-
-    Op = dc.EpDispatchCombineOp
-    saved = getattr(Op, "_internode_saved", None)
-    if not getattr(Op, "_internode_installed", False) or saved is None:
-        return
-    Op._launch_multi = saved["_launch_multi"]
-    Op.dispatch = saved["dispatch"]
-    Op.combine = saved["combine"]
-    Op._internode_installed = False
-    Op._internode_saved = None
-
-
-def _install_backend(backend):
-    """Select the implementation. Must precede the op: the backend decides what
-    the handle can host, and the JIT redirect has to be in place for the first
-    launch. The shmem branch uninstalls rather than merely not installing,
-    because a cco case earlier in the session has already patched the class.
-    """
-    if backend == "cco":
-        os.environ["MORI_EP_COMM"] = "cco"
-        _install_jit_redirect()
-    else:
-        os.environ.pop("MORI_EP_COMM", None)
-        _uninstall_jit_redirect()
-
-
-def _make_config(
-    rank,
-    world_size,
-    kernel,
-    data_type,
-    hidden_dim,
-    max_num_inp_token_per_rank,
-    num_experts_per_rank,
-    num_experts_per_token,
-    scale_dim=0,
-    scale_type_size=1,
-    quant_type="none",
-    combine_data_type=None,
-):
-    kernel_type, block_num, rdma_block_num, warp_num_per_block = _KERNELS[kernel]
-    _, _, config_hidden_dim = cross_dtype_hidden_dims(
-        hidden_dim, data_type, combine_data_type or data_type
-    )
-    return mori.ops.EpDispatchCombineConfig(
-        data_type=data_type,
-        rank=rank,
-        world_size=world_size,
-        hidden_dim=config_hidden_dim,
-        scale_dim=scale_dim,
-        scale_type_size=scale_type_size,
-        max_num_inp_token_per_rank=max_num_inp_token_per_rank,
-        num_experts_per_rank=num_experts_per_rank,
-        num_experts_per_token=num_experts_per_token,
-        max_token_type_size=2,
-        block_num=block_num,
-        rdma_block_num=rdma_block_num,
-        warp_num_per_block=warp_num_per_block,
-        kernel_type=kernel_type,
-        # One node here, and it has to match LOCAL_WORLD_SIZE -- see the module
-        # docstring.
-        gpu_per_node=world_size,
-        # The field defaults to 1, which starves the cross-node path by ~1.5x.
-        # It also sizes the CCO side, where gdaContextCount == numQpPerPe, so
-        # both backends are measured at the value the published bench uses.
-        num_qp_per_pe=2,
-        quant_type=quant_type,
-    )
-
-
-def _fanout(manager, func, args):
-    for _ in range(_WORLD_SIZE):
-        manager.task_queue.put((func, args))
-    assert_worker_results(manager, _WORLD_SIZE)
-
-
-# ---------------------------------------------------------------------------
-# correctness
-# ---------------------------------------------------------------------------
-
-
-def _worker_correctness(
-    rank,
-    backend,
-    kernel,
-    data_type,
-    hidden_dim,
-    max_num_inp_token_per_rank,
-    num_experts_per_rank,
-    num_experts_per_token,
-    scale_dim,
-    scale_type_size,
-):
-    _install_backend(backend)
-    config = _make_config(
-        rank=rank,
-        world_size=_WORLD_SIZE,
-        kernel=kernel,
-        data_type=data_type,
-        hidden_dim=hidden_dim,
-        max_num_inp_token_per_rank=max_num_inp_token_per_rank,
-        num_experts_per_rank=num_experts_per_rank,
-        num_experts_per_token=num_experts_per_token,
-        scale_dim=scale_dim,
-        scale_type_size=scale_type_size,
-    )
-    run_ep_dispatch_combine_test(
-        config, EpDispatchCombineTestCase, use_max_token_num=True
-    )
-
-
-@pytest.mark.parametrize("backend", ("cco", "shmem"))
-@pytest.mark.parametrize("kernel", tuple(_KERNELS))
-@pytest.mark.parametrize("data_type", _all_data_types())
-@pytest.mark.parametrize("hidden_dim", (7168, 4096))
-@pytest.mark.parametrize("max_num_inp_token_per_rank", (32, 128))
-@pytest.mark.parametrize("scale_dim, scale_type_size", ((0, 1), (32, 4)))
-def test_internode_correctness(
-    torch_dist_process_manager,
-    backend,
-    kernel,
-    data_type,
-    hidden_dim,
-    max_num_inp_token_per_rank,
-    scale_dim,
-    scale_type_size,
-):
-    """dispatch + combine must match the analytic golden."""
-    _fanout(
-        torch_dist_process_manager,
-        _worker_correctness,
+def _gen_round(rng, cfg, ct, dev, dtype):
+    """Seeded per-round input, routing and weights, so a failure is reproducible
+    from the round number and the rank alone."""
+    inp = torch.randn(ct, cfg.hidden_dim, generator=rng, device=dev).to(dtype)
+    n_experts = cfg.world_size * cfg.num_experts_per_rank
+    idx = torch.stack(
         [
-            backend,
-            kernel,
-            data_type,
-            hidden_dim,
-            max_num_inp_token_per_rank,
-            32,  # num_experts_per_rank
-            8,  # num_experts_per_token
-            scale_dim,
-            scale_type_size,
-        ],
+            torch.randperm(n_experts, generator=rng, device=dev)[
+                : cfg.num_experts_per_token
+            ]
+            for _ in range(ct)
+        ]
+    ).to(torch.int32)
+    wts = torch.rand(ct, cfg.num_experts_per_token, generator=rng, device=dev)
+    # Real scales when the transport is on. The dispatch send path copies
+    # scale_dim * scale_type_size bytes per token whether or not a buffer was
+    # handed in -- only the staging copy is guarded on the pointer -- so passing
+    # None with scale_dim > 0 transports uninitialised staging. Same byte count,
+    # but not something to measure against.
+    scales = (
+        torch.rand(ct, cfg.scale_dim, generator=rng, device=dev)
+        if cfg.scale_dim
+        else None
     )
+    return inp, idx, wts, scales
 
 
-def _worker_cross_dtype(
-    rank,
-    backend,
-    kernel,
-    data_type,
-    combine_data_type,
-    hidden_dim,
-    max_num_inp_token_per_rank,
-    quant_type,
-):
-    _install_backend(backend)
-    dispatch_hidden_dim, combine_hidden_dim, _ = cross_dtype_hidden_dims(
-        hidden_dim, data_type, combine_data_type
-    )
-    config = _make_config(
-        rank=rank,
-        world_size=_WORLD_SIZE,
-        kernel=kernel,
-        data_type=data_type,
-        hidden_dim=hidden_dim,
-        max_num_inp_token_per_rank=max_num_inp_token_per_rank,
-        num_experts_per_rank=32,
-        num_experts_per_token=8,
-        quant_type=quant_type,
-        combine_data_type=combine_data_type,
-    )
-    run_ep_dispatch_combine_test(
-        config,
-        EpDispatchCombineTestCase,
-        use_max_token_num=True,
-        combine_data_type=combine_data_type,
-        combine_hidden_dim=combine_hidden_dim,
-        dispatch_hidden_dim=dispatch_hidden_dim,
-    )
+def _verify_once(op, cfg, d, dev, a, comm, inp, idx, wts, sc):
+    """One dispatch+combine against the analytic golden. True if this rank agrees.
 
-
-@pytest.mark.parametrize("backend", ("cco", "shmem"))
-@pytest.mark.parametrize("kernel", tuple(_KERNELS))
-@pytest.mark.parametrize("data_type", _all_data_types())
-@pytest.mark.parametrize("quant_type", ("none", "fp8_direct_cast"))
-def test_internode_cross_dtype(
-    torch_dist_process_manager, backend, kernel, data_type, quant_type
-):
-    """FP8/FP4 dispatch with a BF16 combine -- the pairing the tuning matrix
-    ships, and the one the CCO path's FP8 and LL branches were never exercised
-    on before this port."""
-    combine_data_type = torch.bfloat16
-    skip = cross_dtype_skip_reason(quant_type, data_type, combine_data_type)
-    if skip:
-        pytest.skip(skip)
-
-    _fanout(
-        torch_dist_process_manager,
-        _worker_cross_dtype,
-        [backend, kernel, data_type, combine_data_type, 7168, 128, quant_type],
-    )
-
-
-def _worker_small_shapes(rank, backend, kernel, tokens):
-    _install_backend(backend)
-    config = _make_config(
-        rank=rank,
-        world_size=_WORLD_SIZE,
-        kernel=kernel,
-        data_type=torch.bfloat16,
-        hidden_dim=4096,
-        max_num_inp_token_per_rank=tokens,
-        num_experts_per_rank=32,
-        num_experts_per_token=8,
-    )
-    run_ep_dispatch_combine_test(
-        config, EpDispatchCombineTestCase, use_max_token_num=True
-    )
-
-
-@pytest.mark.parametrize("backend", ("cco", "shmem"))
-@pytest.mark.parametrize("kernel", tuple(_KERNELS))
-@pytest.mark.parametrize("tokens", (1, 32))
-def test_internode_small_shapes(torch_dist_process_manager, backend, kernel, tokens):
-    """One token per rank is where an off-by-one in the chunk count or an empty
-    chunk-flag range shows up; the shipping shapes never produce a single-token
-    chunk."""
-    _fanout(torch_dist_process_manager, _worker_small_shapes, [backend, kernel, tokens])
-
-
-# ---------------------------------------------------------------------------
-# stress
-# ---------------------------------------------------------------------------
-
-
-def _round(case, op, test_data, check=False):
-    """One dispatch+combine, mirroring EpDispatchCombineTestCase.run_test_once
-    but with ``call_reset=True`` so the counters are returned to their initial
-    state -- a loop that leaves them dirty measures the second round against the
-    first round's leftovers."""
-    (_, all_rank_indices, all_rank_input, all_rank_weights, all_rank_scales) = test_data
-    rank = case.config.rank
-    (
-        dispatch_output,
-        dispatch_weights,
-        _,
-        dispatch_indices,
-        dispatch_recv_num_token,
-    ) = op.dispatch(
-        all_rank_input[rank],
-        all_rank_weights[rank],
-        all_rank_scales[rank],
-        all_rank_indices[rank],
-    )
-    # Read it here, between the two calls: combine reuses this counter, so after
-    # combine it reads back as zero.
-    total_recv = dispatch_recv_num_token[0].item()
-    if check:
-        num_experts = case.config.num_experts_per_rank * case.config.world_size
-        max_expert = dispatch_indices[:total_recv].max().item()
-        assert max_expert < num_experts, (
-            f"rank[{rank}] dispatch returned expert id {max_expert} "
-            f">= {num_experts}"
-        )
-    combine_input = case._get_combine_input(op, dispatch_output, num_token=total_recv)
-    op.combine(
-        combine_input,
-        dispatch_weights,
-        all_rank_indices[rank],
-        call_reset=True,
-    )
-    case.sync()
-    return total_recv
-
-
-def _worker_stress(rank, backend, kernel, tokens, reps):
-    _install_backend(backend)
-    config = _make_config(
-        rank=rank,
-        world_size=_WORLD_SIZE,
-        kernel=kernel,
-        data_type=torch.bfloat16,
-        hidden_dim=7168,
-        max_num_inp_token_per_rank=tokens,
-        num_experts_per_rank=32,
-        num_experts_per_token=8,
-    )
-    op = mori.ops.EpDispatchCombineOp(config)
-    case = EpDispatchCombineTestCase(config)
-    test_data = case.gen_test_data(use_max_token_num=True)
-
-    # One fully checked round first, so a path that silently moves nothing
-    # cannot pass this test by being fast.
-    case.run_test_once(op, test_data, check_results=True)
-
-    for i in range(reps):
-        _round(case, op, test_data, check=True)
-        if rank == 0 and (i + 1) % 50 == 0:
-            print(f"[stress] {backend}/{kernel} {i + 1}/{reps}", flush=True)
-
-
-@_stress_only
-@pytest.mark.parametrize("backend", ("cco", "shmem"))
-@pytest.mark.parametrize("kernel", tuple(_KERNELS))
-def test_internode_stress(torch_dist_process_manager, backend, kernel):
-    """Many rounds on one op. What breaks at round 300 and not at round 1 is
-    state that survives a round, and none of it is visible to a single-shot
-    check."""
-    _fanout(
-        torch_dist_process_manager,
-        _worker_stress,
-        [backend, kernel, _BENCH_TOKENS[kernel], 300],
-    )
-
-
-@_stress_only
-@pytest.mark.parametrize("backend", ("cco", "shmem"))
-def test_internode_large_tokens(torch_dist_process_manager, backend):
-    """4096 tokens/rank, the largest shape that completes.
-
-    Deliberately not 8192: cco at 7168/8192 runs past a 1500s timeout while
-    shmem finishes the same config in ~30s, still unexplained. Raise this when
-    that is fixed -- leaving it at 4096 keeps the test from being a slow way to
-    rediscover a known hang. Few rounds, because at this size the one checked
-    round dominates the cost.
+    Same expectation as `--cmd test`: an identity expert makes combine[t] equal
+    U[t] * input[t] over the DISTINCT destination ranks. Weights are always folded
+    here even when the timed loop will not fold them -- an unchecked weight path
+    is how this harness shipped a silent bug twice.
     """
-    _fanout(torch_dist_process_manager, _worker_stress, [backend, "v1", 4096, 20])
+    r = op.dispatch(inp, wts, sc, idx, return_routing=True)
+    torch.cuda.synchronize()
+    comm.barrier()
+    x = r[0].to(cfg.combine_dtype) if cfg.is_asymmetric_dtype else r[0]
+    out, out_w = op.combine(x, wts, routing=r[5])
+    torch.cuda.synchronize()
+    comm.barrier()
 
-
-# ---------------------------------------------------------------------------
-# bench
-# ---------------------------------------------------------------------------
-
-
-def _worker_bench(rank, backend, kernel, data_type, tokens, warmup, iters):
-    _install_backend(backend)
-    config = _make_config(
-        rank=rank,
-        world_size=_WORLD_SIZE,
-        kernel=kernel,
-        data_type=data_type,
-        hidden_dim=7168,
-        max_num_inp_token_per_rank=tokens,
-        num_experts_per_rank=32,
-        num_experts_per_token=8,
+    ct = inp.shape[0]
+    idx_c = idx.cpu()
+    U = np.array(
+        [
+            len({int(idx_c[t, j]) // cfg.num_experts_per_rank for j in range(a.topk)})
+            for t in range(ct)
+        ]
     )
-    op = mori.ops.EpDispatchCombineOp(config)
-    case = EpDispatchCombineTestCase(config)
-    test_data = case.gen_test_data(use_max_token_num=True)
+    Ut = torch.from_numpy(U).view(ct, 1).float()
+    got = out.float().cpu()
+    exp = Ut * inp.float().cpu()
+    per_elem = inp.float().cpu().abs()
+    eps = 3e-1 if (a.quant_type != "none" or cfg.dispatch_dtype in _FP8) else 8e-3
+    ok = bool(((got - exp).abs() <= eps * Ut * per_elem.clamp(min=1.0)).all())
+    ok_w = bool(((out_w.cpu() - Ut * wts.float().cpu()).abs() <= 2e-3 * Ut).all())
+    if not (ok and ok_w) and d.rank == 0:
+        print(f"#   pre-bench check: hidden_ok={ok} weights_ok={ok_w}", flush=True)
+    return ok and ok_w
 
-    # Checked once before timing: a measurement of a path that drops tokens is
-    # worse than no measurement.
-    case.run_test_once(op, test_data, check_results=True)
 
-    (_, all_rank_indices, all_rank_input, all_rank_weights, all_rank_scales) = test_data
-    total_recv = _round(case, op, test_data)
+def _v1_loop_defaults():
+    """The examples harness's rounds/warmup/drop defaults, read from its source.
 
-    # Routing is fixed by the test data, so the combine input is resolved once
-    # rather than per round -- in zero-copy mode that call is a device copy, and
-    # timing it would attribute a harness cost to the kernel.
-    d_us, c_us = [], []
-    for i in range(warmup + iters):
-        d0, d1 = torch.cuda.Event(True), torch.cuda.Event(True)
-        c0, c1 = torch.cuda.Event(True), torch.cuda.Event(True)
+    The alignment table in this module's docstring used to ASSERT that these
+    matched ours. It was written from intent, not from the file: --rounds sat at
+    3 against that harness's 30 for as long as the row claimed "same", because
+    nothing ever compared the two. A comment cannot notice when the other side
+    moves, and neither can a reader who wrote the comment.
 
-        d0.record()
-        out, weights, _, _, _ = op.dispatch(
-            all_rank_input[rank],
-            all_rank_weights[rank],
-            all_rank_scales[rank],
-            all_rank_indices[rank],
-        )
-        d1.record()
-        combine_input = case._get_combine_input(op, out, num_token=total_recv)
-        c0.record()
-        op.combine(combine_input, weights, all_rank_indices[rank], call_reset=True)
-        c1.record()
-        case.sync()
+    Read, do not import. Importing that module pulls in the v1 op, and this test
+    depends on v1 nowhere else -- buying a consistency check with a dependency on
+    the thing we are trying to be independent of is a bad trade. Parsing three
+    integer literals out of its AST costs nothing and keeps the coupling at zero.
 
-        if i >= warmup:
-            d_us.append(d0.elapsed_time(d1) * 1000.0)
-            c_us.append(c0.elapsed_time(c1) * 1000.0)
+    Returns ``{"rounds": int, "warmup": int, "drop_rounds": int}``, or ``{}`` if
+    the file is missing or has been restructured -- a missing reference is a
+    reason to skip the check, never to fail the run.
+    """
+    import ast
 
-    elem = torch.tensor([], dtype=data_type).element_size()
-
-    def bw(us):
-        # Algorithmic bandwidth, the bench_dispatch_combine.py definition:
-        # received payload over elapsed time, covering both the XGMI and the
-        # RDMA leg.
-        return total_recv * config.hidden_dim * elem / (us * 1e-6) / 1e9
-
-    mine = {
-        "rank": rank,
-        "d": statistics.mean(d_us),
-        "c": statistics.mean(c_us),
-        "recv": total_recv,
+    path = os.path.join(
+        _ROOT,
+        "examples",
+        "ops",
+        "dispatch_combine",
+        "test_dispatch_combine_internode.py",
+    )
+    names = {
+        "_EP_ROUNDS": "rounds",
+        "_EP_WARMUP": "warmup",
+        "_EP_DROP_ROUNDS": "drop_rounds",
     }
-    gathered = [None] * _WORLD_SIZE
-    dist.all_gather_object(gathered, mine)
-    if rank == 0:
-        d = statistics.mean(g["d"] for g in gathered)
-        c = statistics.mean(g["c"] for g in gathered)
-        # Mean and worst both matter: these are collective passes, so a round is
-        # not over until the slowest rank finishes.
+    out = {}
+    try:
+        tree = ast.parse(open(path).read())
+    except (OSError, SyntaxError):
+        return {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        tgt = node.targets[0]
+        key = names.get(getattr(tgt, "id", None))
+        if key is None:
+            continue
+        # The default is the only digit-string literal in the expression. Accept
+        # both spellings: 3.8+ gives ast.Constant, 3.6/3.7 ast.Str, and matching
+        # only Constant silently returns {} on the older one -- disabling the
+        # very check whose absence caused the problem it exists to catch.
+        for sub in ast.walk(node.value):
+            lit = None
+            if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                lit = sub.value
+            elif sub.__class__.__name__ == "Str":
+                lit = sub.s
+            if lit is not None and lit.isdigit():
+                out[key] = int(lit)
+                break
+    return out
+
+
+def _report_loop_alignment(a, rank):
+    """Say out loud when this harness's timed loop is shaped differently from the
+    reference one. Printed with the numbers, not buried in a docstring, because
+    the numbers are what gets quoted."""
+    ref = _v1_loop_defaults()
+    if not ref or rank != 0:
+        return
+    mine = {"rounds": a.rounds, "warmup": a.warmup, "drop_rounds": a.drop_rounds}
+    off = {k: (mine[k], v) for k, v in ref.items() if mine.get(k) != v}
+    if off:
+        detail = " ".join(f"{k}={m}(ref {r})" for k, (m, r) in sorted(off.items()))
         print(
-            f"[bench] {backend:5s} {kernel:5s} {str(data_type).split('.')[-1]:14s} "
-            f"tokens={tokens} recv={total_recv} "
-            f"dispatch={d:8.1f}us (worst {max(g['d'] for g in gathered):8.1f}) "
-            f"{bw(d):6.1f} GB/s  "
-            f"combine={c:8.1f}us (worst {max(g['c'] for g in gathered):8.1f}) "
-            f"{bw(c):6.1f} GB/s",
+            f"# WARNING: timed loop differs from run_bench_once: {detail} -- "
+            f"these numbers are not directly comparable to that harness's",
             flush=True,
         )
 
 
-@_bench_only
-@pytest.mark.parametrize("kernel", tuple(_KERNELS))
-@pytest.mark.parametrize(
-    "data_type",
-    [
-        pytest.param(torch.bfloat16, id="bf16"),
-        pytest.param(
-            torch.float8_e4m3fn,
-            id="fp8",
-            marks=pytest.mark.skipif(
-                not torch.cuda.is_available()
-                or not torch.cuda.get_device_properties(0)
-                .gcnArchName.split(":")[0]
-                .startswith("gfx95"),
-                reason="float8_e4m3fn (OCP) is gfx950-only",
-            ),
-        ),
-    ],
-)
-def test_internode_bench(torch_dist_process_manager, kernel, data_type):
-    """Latency and algorithmic bandwidth for both backends, printed as a pair.
+def _geom_for_report(op, cfg, a):
+    """The (block, rdma, warp) each phase actually launched with, for the table
+    titles -- the point v1's `_launch_params_str` makes: a table that does not
+    name its launch config cannot be matched back to the run that produced it.
+    Read from the backend rather than from the config, because on the internode
+    path cfg.dispatch_block_num is a dict key and not a grid."""
+    try:
+        # EpDispatchCombineOpHip IS the backend -- it subclasses the op.
+        return (
+            tuple(op._internode_geom_for("dispatch", a.max_tokens)),
+            tuple(op._internode_geom_for("combine", a.max_tokens)),
+        )
+    except Exception:
+        from mori.ops.dispatch_combine_v2.internode_tuning_configs import lookup
 
-    No speed assertion, and both backends run inside one test rather than as two
-    parametrized cases: absolute numbers here move ~25% between batches with no
-    code change, so the only defensible comparison is cco against shmem measured
-    close together. Use ``-s`` to see the lines.
+        t = lookup(
+            cfg.world_size, cfg.hidden_dim, cfg.num_experts_per_token, a.max_tokens
+        )
+        if t:
+            return tuple(t["dispatch"]), tuple(t["combine"])
+        return (0, 0, 0), (0, 0, 0)
 
-    Two things these numbers are not. They are **one host**, so nNodes=1 and no
-    RDMA leg runs -- they do not reproduce, and must not be compared against,
-    the two-node figures. And ``shmem``/``v1_ll``/combine carries a fixed ~1.39ms
-    here (against cco's ~55us) that does not scale with tokens and does not
-    appear on ``v1``; it looks like the local-peer handling these kernels
-    inherited rather than a real cco win, so read that one cell with suspicion.
+
+def _rdma_algo_token_count(idx, cfg, ll):
+    """(token, destination-node) pairs this rank emits, DeepEP's definition and
+    the numerator of the RDMA bandwidth column.
+
+    Reimplemented rather than imported: this file keeps zero coupling to the v1
+    harness, which is what lets the two be compared without one dragging the
+    other's op in. The formula is v1's `compute_rdma_algo_token_count`.
+
+    The LL kernel does not deduplicate across expert slots, so every token
+    contributes one entry per node unconditionally.
     """
-    for backend in ("shmem", "cco"):
-        _fanout(
-            torch_dist_process_manager,
-            _worker_bench,
-            [
-                backend,
-                kernel,
-                data_type,
-                _BENCH_TOKENS[kernel],
-                _BENCH_WARMUP[kernel],
-                50,
-            ],
+    nodes = cfg.world_size // cfg.gpu_per_node
+    if ll:
+        return idx.shape[0] * nodes
+    per_node = cfg.num_experts_per_rank * cfg.gpu_per_node
+    seen = torch.zeros(idx.shape[0], nodes, dtype=torch.bool, device=idx.device)
+    seen.scatter_((idx // per_node).long().clamp_(0, nodes - 1), 1, True)
+    return int(seen.sum().item())
+
+
+def _phase_stats(col):
+    """(worst, best, avg) over a (rounds, ranks) tensor, as v1's _compute_stats:
+    worst/best are extremes over individual samples, avg is the grand mean."""
+    return col.min().item(), col.max().item(), col.mean(dim=1).mean().item()
+
+
+def _print_phase_table(title, rdma, xgmi, ll, lat):
+    from prettytable import PrettyTable
+
+    t = PrettyTable()
+    t.title = title
+    t.field_names = [
+        "Metrics",
+        "RDMA Bandwidth (GB/s)",
+        "XGMI Bandwidth (GB/s)",
+        "LL Bandwidth (GB/s)",
+        "Latency (us)",
+    ]
+    r = lambda v: round(v, 2)
+    # Bandwidth "Best" is the MAX and latency "Best" is the MIN, so the two
+    # columns index the same tuple from opposite ends. v1 does this too; it is
+    # the reason Best/Worst are not simply [1]/[0] throughout.
+    t.add_rows(
+        [
+            ["Best", r(rdma[1]), r(xgmi[1]), r(ll[1]), r(lat[0])],
+            ["Worst", r(rdma[0]), r(xgmi[0]), r(ll[0]), r(lat[1])],
+            ["Average", r(rdma[2]), r(xgmi[2]), r(ll[2]), r(lat[2])],
+        ]
+    )
+    print(t, flush=True)
+
+
+def _report_tables(d, cfg, a, disp, comb, total_recv, idx, ll, geom):
+    """v1's bench output: a per-round dump and the two performance tables.
+
+    Every rank computes its OWN bandwidths from its own byte counts and the
+    numbers are then gathered, which is what v1 does -- gathering durations and
+    applying one rank's byte count to all of them would be wrong the moment the
+    routing is not perfectly balanced.
+    """
+    ct = a.max_tokens
+    d_elem = torch.tensor([], dtype=cfg.dispatch_dtype).element_size()
+    c_elem = torch.tensor([], dtype=cfg.combine_dtype).element_size()
+    d_bytes = total_recv * cfg.hidden_dim * d_elem
+    c_bytes = total_recv * cfg.hidden_dim * c_elem
+    rdma_tok = _rdma_algo_token_count(idx, cfg, ll)
+    d_rdma_bytes = rdma_tok * cfg.hidden_dim * d_elem
+    c_rdma_bytes = rdma_tok * cfg.hidden_dim * c_elem
+    # LL packs a fixed slot per (token, expert) rather than only what routed, so
+    # its wire bytes exceed the payload by this factor. v1 scales the XGMI
+    # column by it to get the LL column.
+    ll_scale = ct * cfg.num_experts_per_token / (total_recv + 1)
+
+    # bw in GB/s from a duration in MICROseconds: bytes/1e9 / (us/1e6).
+    bw = lambda b, us: b / (1000.0 * us) if us > 0 else 0.0
+    row = []
+    for dv, cv in zip(disp, comb):
+        row += [
+            bw(d_rdma_bytes, dv),
+            bw(d_bytes, dv),
+            dv,
+            bw(c_rdma_bytes, cv),
+            bw(c_bytes, cv),
+            cv,
+        ]
+    g = d.all_gather_rows(row).reshape(d.world, len(disp), 6).permute(1, 0, 2)
+    if d.rank != 0:
+        return
+
+    for i in range(g.shape[0]):
+        rd = g[i]
+        print(f"Round {i}", flush=True)
+        for phase, cols in (
+            (
+                "dispatch",
+                (
+                    ("duration", 2, "us"),
+                    ("rdma bandwidth", 0, "GB/s"),
+                    ("bandwidth", 1, "GB/s"),
+                ),
+            ),
+            (
+                "combine",
+                (
+                    ("duration", 5, "us"),
+                    ("rdma bandwidth", 3, "GB/s"),
+                    ("bandwidth", 4, "GB/s"),
+                ),
+            ),
+        ):
+            for name, c, unit in cols:
+                vals = [round(v, 2) for v in rd[:, c].tolist()]
+                print(
+                    f"  {phase} {name} {vals} avg {rd[:, c].mean():.2f} {unit}",
+                    flush=True,
+                )
+
+    # Config header immediately above the tables. The `# BENCH` one-liner is
+    # printed before the per-round dump, which at 30 rounds is 180 lines earlier
+    # -- by the time the tables are on screen it has scrolled away, and a table
+    # whose configuration you have to scroll to find is a table you will
+    # eventually misattribute.
+    nodes = cfg.world_size // cfg.gpu_per_node
+    print(
+        f"\n# CONFIG tok={ct} dtype={str(cfg.dispatch_dtype).split('.')[-1]}"
+        f"->{str(cfg.combine_dtype).split('.')[-1]} hidden={cfg.hidden_dim} "
+        f"topk={cfg.num_experts_per_token} kernel={'v1_ll' if ll else 'v1'} "
+        f"world={cfg.world_size} nodes={nodes}x{cfg.gpu_per_node} "
+        f"experts/rank={cfg.num_experts_per_rank} scale_dim={cfg.scale_dim} "
+        f"qp={cfg.num_qp_per_pe}",
+        flush=True,
+    )
+    print(
+        f"# CONFIG dispatch block/rdma/warp={geom[0]}  combine={geom[1]}  "
+        f"rounds={a.rounds} warmup={a.warmup}  "
+        f"recv_tokens={total_recv} rdma_algo_tokens={rdma_tok}",
+        flush=True,
+    )
+
+    for name, (cr, cx, cl), dt, gm, elem in (
+        ("Dispatch", (0, 1, 2), cfg.dispatch_dtype, geom[0], d_elem),
+        ("Combine", (3, 4, 5), cfg.combine_dtype, geom[1], c_elem),
+    ):
+        xg = _phase_stats(g[:, :, cx])
+        _print_phase_table(
+            f"{name} Performance ({str(dt).split('.')[-1]}) "
+            f"block={gm[0]} warp={gm[2]} rdma={gm[1]} "
+            f"~{ct * cfg.hidden_dim * elem / (1024 ** 2):.1f} MB/rank",
+            _phase_stats(g[:, :, cr]),
+            xg,
+            tuple(v * ll_scale for v in xg),
+            _phase_stats(g[:, :, cl]),
         )
 
 
-# ---------------------------------------------------------------------------
-# two-host entry, under torchrun
-# ---------------------------------------------------------------------------
+def _bench(op, cfg, d, dev, a, comm):
+    """Per-phase latency, structured to match ``run_bench_once`` in
+    ``examples/ops/dispatch_combine/test_dispatch_combine_internode.py``.
 
+    Apple-to-apple means only the op call differs, so everything around it is
+    copied from there rather than invented here:
 
-def _spawn_worker(rank, fn, args):
-    """Install the redirect in the worker, then hand off to the harness.
+    * ONE event before the loop, then three per round. Round i's dispatch window
+      is [end of round i-1's combine, end of this dispatch]; its combine window
+      is [end of the combine-input conversion, end of this combine]. The
+      conversion sits between two events of its own and is charged to neither.
+    * Nothing synchronises or barriers inside the timed loop. Events are stream
+      markers, so a host that has to stop and build the next launch shows up as
+      GPU idle inside the window; free-running lets the host stay ahead. (An
+      earlier version here synced per round and read 460us at 4 tokens against a
+      41us reference -- 11x of host overhead, none of it kernel.)
+    * Warmup is untimed and ends on sync + barrier; the leading `drop_rounds`
+      timed rounds are discarded because the first after a barrier is thundering
+      herd, not kernel.
+    * The reported number is the AVERAGE over rounds and ranks, as there.
 
-    The harness fans out with torch.multiprocessing.spawn, and a spawned worker
-    is a fresh interpreter that re-imports mori -- so the class patch the parent
-    made is not there. MORI_EP_COMM travels with the environment and does arrive,
-    which is the dangerous half: the worker would build a cco-backed handle and
-    then launch the shmem AOT entries at it, and those address the shmem heap, so
-    the result is a fault at 0x0 rather than a clean failure.
+    `wall` is reported alongside as an honesty check, not as part of the
+    measurement: it is the whole loop's wall time per round. The host is running
+    ahead only while wall stays at or below dispatch+combine. Above it, the host
+    is the pacer and the phase numbers carry host stall.
     """
-    _install_jit_redirect()
-    return fn(rank, *args)
+    _report_loop_alignment(a, d.rank)
+    rng = torch.Generator(device=dev)
+    rng.manual_seed(4242 + d.rank)
+    ct = a.max_tokens
+    inp, idx, wts, sc = _gen_round(rng, cfg, ct, dev, cfg.dispatch_dtype)
+    if a.kernel_type is not None:
+        op._internode_force_ll = a.kernel_type == "v1_ll"
+
+    # Check BEFORE measuring, as bench_dispatch_combine does: a silently wrong
+    # configuration still produces timings. Always folds weights, whatever
+    # --bench-weights says, because the point is to check them.
+    ok = _verify_once(op, cfg, d, dev, a, comm, inp, idx, wts, sc)
+    bad = d.allreduce_sum(0 if ok else 1)
+    if bad:
+        if d.rank == 0:
+            print(
+                f"# BENCH ABORTED: {bad} of {d.world} ranks failed the "
+                f"pre-bench check; the numbers below would be meaningless",
+                flush=True,
+            )
+        return 1
+    torch.cuda.synchronize()
+    comm.barrier()
+
+    # The examples harness's _convert_for_combine: the combine leg reads its
+    # input as its own element type, so an asymmetric config has to cast first.
+    def convert(x):
+        return x.to(cfg.combine_dtype) if cfg.is_asymmetric_dtype else x
+
+    cw = wts if a.bench_weights else None
+
+    # Allocated before the warmup, where run_bench_once allocates them. (Priming
+    # them with a record here was tried and did not move the tail, so it is not
+    # done -- run_bench_once does not either.)
+    n = a.rounds
+    ev = [torch.cuda.Event(enable_timing=True) for _ in range(3 * n + 1)]
+
+    total_recv = 0
+    for i in range(a.warmup):
+        r = op.dispatch(inp, wts, sc, idx, return_routing=True)
+        if i == a.warmup - 1:
+            # Read it here, not in the timed loop: .item() synchronises.
+            torch.cuda.synchronize()
+            total_recv = int(r[4][0].item())
+        op.combine(convert(r[0]), cw, routing=r[5])
+    torch.cuda.synchronize()
+
+    # THE pre-loop barrier. One site, so the default cannot drift. (It briefly
+    # did: a probe loop with a max(1,..) sat below an unconditional barrier and
+    # silently made the default two.)
+    #
+    # v1 documents the transient this creates and reaches the same conclusion
+    # from the other side (see _EP_DROP_ROUNDS there): the first timed rounds
+    # run elevated, "worse and longer on the CCO/GDA path ... than on shmem",
+    # and it suggests MORI_EP_DROP_ROUNDS=3 to cover it. Its stated mechanism --
+    # all ranks released at once, thundering herd -- does not survive
+    # measurement here: the exit skew is 200-800us, i.e. 2-9 rounds, so they are
+    # NOT released at once, and the skew does not correlate with the run's
+    # outcome. The transient is real; that account of it is not.
+    #
+    # Both kinds are CPU-side collectives over sockets -- comm.barrier() is
+    # ccoBarrierAll, dist.barrier() is gloo -- so neither releases its ranks at
+    # one instant, and the timestamp after each is what measures that.
+    _bt = []
+    for _k in range(max(1, a.pre_barriers)):
+        if a.barrier_kind in ("cco", "both"):
+            comm.barrier()
+        if a.barrier_kind in ("gloo", "both"):
+            dist.barrier()
+        _bt.append(time.time())
+    # The control for the barrier-count effect: idle for the same wall time
+    # instead of barriering. If sleeping reproduces the benefit then what helps
+    # is elapsed time, not the collective.
+    if a.pre_sleep_ms:
+        time.sleep(a.pre_sleep_ms / 1000.0)
+        _bt.append(time.time())
+
+    # KEEP THE BARRIER. The first one to three TIMED rounds run 4-5x slow even
+    # though 20 warmup rounds precede them, and the obvious reading -- that the
+    # barrier releases all 16 ranks at one instant and the first rounds are a
+    # maximally synchronised start -- is WRONG. Tested by inserting un-timed,
+    # un-barriered rounds between the barrier and the loop: they do remove the
+    # opening spike (first rounds 42/45/43 instead of 67/38/41), and in three of
+    # four pairs the whole run then sat in the slow regime, 128-134us total
+    # against 89-91. The barrier is what keeps the ranks aligned; extra rounds
+    # after it let the inter-node phase offset re-establish before timing starts.
+    # So the opening rounds are the settling cost of alignment, and warmup cannot
+    # remove them because warmup happens BEFORE the barrier. Drop them from the
+    # statistics (--drop-rounds) rather than trying to warm them away.
+    # Causal probe for host pacing, opt-in: busy-wait known host microseconds
+    # before the combine enqueue, no GPU work. The slope of measured-combine
+    # against injected microseconds is the answer (measured ~1.0 beyond ~30us of
+    # headroom), and it assumes nothing about what a window "should" cost.
+    inject = float(os.environ.get("MORI_EP_INJECT_HOST_US") or 0) / 1e6
+
+    # Per-pass marks accumulate inside the backend when MORI_EP_SPLIT_PASSES is
+    # set. Cleared here so only the timed loop's are read; the warmup ran the
+    # same code path and left its own behind.
+    _marks = getattr(op, "_pass_marks", None)
+    if _marks is not None:
+        del _marks[:]
+
+    _series = bool(os.environ.get("MORI_EP_ROUND_SERIES"))
+
+    # Which physical CPU this rank is actually ON, sampled around the loop.
+    # sched_getaffinity only gives the ALLOWED set, and after the NUMA bind that
+    # is 192 CPUs shared by four ranks -- so it cannot answer whether two ranks
+    # landed on the two SMT siblings of one core, which is the mechanism that
+    # produced the 2x host-loop time earlier. sched_getcpu can.
+    def _cpu():
+        try:
+            return int(ctypes.CDLL("libc.so.6", use_errno=True).sched_getcpu())
+        except Exception:
+            return -1
+
+    _cpu0 = _cpu()
+
+    # Caching-allocator segments, opt-in. A cudaMalloc inside the timed loop
+    # blocks the host for ~100us and lands on every rank in the same round (the
+    # ranks are symmetric), which is exactly what an early-round synchronous
+    # spike looks like. Counting segments before and after says whether any
+    # happened, without having to infer it from the shape of the series.
+    _seg = _series and torch.cuda.memory_stats()
+
+    # Host time INSIDE the two calls, plus a host timestamp per round. The phase
+    # events bracket the call, so whatever the wrapper does on the host before
+    # the launch lands in the reported phase time and is indistinguishable from
+    # kernel time there; this is what separates them. Off unless the series is
+    # asked for -- perf_counter is only ~0.1us, but it would sit inside the
+    # measured window and the default path should carry nothing it does not need.
+    hd = [0.0] * n
+    hc = [0.0] * n
+    tr = [0.0] * (n + 1)
+
+    _ep0 = time.time()
+    t0 = time.perf_counter()
+    ev[0].record()
+
+    for i in range(n):
+        if _series:
+            tr[i] = time.perf_counter()
+        r = op.dispatch(inp, wts, sc, idx, return_routing=True)
+        if _series:
+            hd[i] = (time.perf_counter() - tr[i]) * 1e6
+        ev[3 * i + 1].record()
+        x = convert(r[0])
+        ev[3 * i + 2].record()
+        if inject:
+            t = time.perf_counter()
+            while time.perf_counter() - t < inject:
+                pass
+        if _series:
+            _h = time.perf_counter()
+        op.combine(x, cw, routing=r[5])
+        if _series:
+            hc[i] = (time.perf_counter() - _h) * 1e6
+        ev[3 * i + 3].record()
+        if a.per_round_sync:
+            torch.cuda.synchronize()
+            comm.barrier()
+        elif a.per_round_drain:
+            torch.cuda.synchronize()
+        if a.realign_every and (i % a.realign_every) == (a.realign_every - 1):
+            torch.cuda.synchronize()
+            comm.barrier()
+    if _series:
+        tr[n] = time.perf_counter()
+    torch.cuda.synchronize()
+    wall = (time.perf_counter() - t0) * 1e6 / n
+
+    # Which PASS owns the slow round. The marks are (name, event) in launch
+    # order: one "<phase>:start" then one per pass, repeating per phase per round.
+    # Consecutive deltas are per-pass GPU durations, so the round with the largest
+    # total can be broken down against the median round of the same phase -- which
+    # is the question, since the tail is a few rounds and the median is the rest.
+    if _marks:
+        per_round = []  # [(phase, [(name, us), ...]), ...] in order
+        cur_name, cur_ev, cur = None, None, []
+        for name, evm in _marks:
+            if name.endswith(":start"):
+                if cur:
+                    per_round.append((cur_name, cur))
+                cur_name, cur, cur_ev = name.split(":")[0], [], evm
+                continue
+            if cur_ev is not None:
+                cur.append((name, cur_ev.elapsed_time(evm) * 1e3))
+                cur_ev = evm
+        if cur:
+            per_round.append((cur_name, cur))
+
+        for phase in ("dispatch", "combine"):
+            rounds = [c for ph, c in per_round if ph == phase][a.drop_rounds :]
+            if not rounds:
+                continue
+            totals = [sum(v for _, v in r) for r in rounds]
+            order = sorted(range(len(totals)), key=totals.__getitem__)
+            mi = order[len(order) // 2]
+            names = [nm for nm, _ in rounds[mi]]
+            # EVERY rank prints. The tail is measured over rounds x ranks and a
+            # spike is usually on one rank, so a rank-0-only breakdown reports the
+            # median round of a quiet rank and says nothing about the tail.
+            pfx = f"# SPLIT[{d.rank}] {phase}"
+            print(
+                f"{pfx}: mean={sum(totals) / len(totals):.1f} "
+                f"max={totals[order[-1]]:.1f} med={totals[mi]:.1f} "
+                f"ratio={totals[order[-1]] / (sum(totals) / len(totals)):.2f}",
+                flush=True,
+            )
+            print(f"{pfx} rounds: " + " ".join(f"{t:.0f}" for t in totals), flush=True)
+            # STEP attribution. A run that lands in the slow regime does a few
+            # rounds at the fast level, steps over one round, and holds -- so the
+            # question "which pass owns the step" is answered by the first rounds
+            # against the last, and is a different question from "which pass owns
+            # the worst round". Both are printed because they need not have the
+            # same answer: a step in a pass that only does local work would mean
+            # something quite different from a step in the pass that waits.
+            k = max(3, len(rounds) // 12)
+            for nm_i, nm in enumerate(names):
+                first = sum(r[nm_i][1] for r in rounds[:k]) / k
+                last = sum(r[nm_i][1] for r in rounds[-k:]) / k
+                print(
+                    f"{pfx} step {nm:<20} first{k}={first:8.1f}  "
+                    f"last{k}={last:8.1f}  delta={last - first:+8.1f}",
+                    flush=True,
+                )
+            # Top 3, not just the worst: one round can be an artifact, three
+            # agreeing on the same pass is a mechanism.
+            for wi in reversed(order[-3:]):
+                print(f"{pfx} round {wi} = {totals[wi]:.1f}us vs med {totals[mi]:.1f}")
+                for k, nm in enumerate(names):
+                    w, m = rounds[wi][k][1], rounds[mi][k][1]
+                    print(
+                        f"#    {nm:<20} this={w:8.1f}  median={m:7.1f}  "
+                        f"delta={w - m:+8.1f}",
+                        flush=True,
+                    )
+
+    # Host profile, opt-in. Whenever wall exceeds dispatch+combine the loop above
+    # is host-paced, and then its phase numbers are wrapper cost rather than
+    # kernel cost. This says which wrapper. It runs its OWN untimed loop so the
+    # profiler's overhead can never land in a reported number.
+    if os.environ.get("MORI_EP_HOST_PROFILE"):
+        import cProfile
+        import pstats
+
+        # EVERY rank runs the loop; only rank 0 prints. dispatch and combine are
+        # collectives -- a rank that enters them alone spins in the kernel's
+        # wait-for-peers loop forever, which reads as one GPU pinned at 100% with
+        # every other idle. Guarding the loop itself on rank 0 (rather than just
+        # the reporting) is exactly that hang.
+        pr = cProfile.Profile()
+        pr.enable()
+        for _ in range(n):
+            rp = op.dispatch(inp, wts, sc, idx, return_routing=True)
+            op.combine(convert(rp[0]), cw, routing=rp[5])
+        pr.disable()
+        torch.cuda.synchronize()
+        comm.barrier()
+        if d.rank != 0:
+            return 0
+        # Rank 0 must leave through here too. The stats below are allreduces, and
+        # every other rank has already returned -- rank 0 entering them alone is a
+        # hang, then a nonzero exit with no BENCH line. Profiling is a diagnostic
+        # mode, so ending the run after the profile is right; ending it on 15 of
+        # 16 ranks is not.
+        st = pstats.Stats(pr)
+        rows = sorted(st.stats.items(), key=lambda kv: -kv[1][2])[:20]
+        print(f"# HOST PROFILE tok={ct}  (us/round, sorted by self time)", flush=True)
+        for (fn, ln, name), (_, nc, tt, _ct, _) in rows:
+            print(
+                f"#   self={tt / n * 1e6:8.1f}  cum={_ct / n * 1e6:8.1f}  "
+                f"n={nc / n:5.1f}  {os.path.basename(fn)}:{ln}({name})",
+                flush=True,
+            )
+        return 0
+
+    keep = slice(a.drop_rounds, None)
+    disp = [ev[3 * i].elapsed_time(ev[3 * i + 1]) * 1e3 for i in range(n)][keep]
+    comb = [ev[3 * i + 2].elapsed_time(ev[3 * i + 3]) * 1e3 for i in range(n)][keep]
+    # The events TILE the timed region -- ev[3i+3] ends round i's combine and IS
+    # ev[3(i+1)] -- so host time cannot hide between windows: if the host falls
+    # behind, the GPU idles at the head of a segment and that idle is charged to
+    # it as kernel time. This window holds one cast, whose cost is small and
+    # fixed, so what it reads above that is host lag. (wall - (dispatch+combine)
+    # IS this window by construction, so it cannot be used as evidence instead.)
+    conv = [ev[3 * i + 1].elapsed_time(ev[3 * i + 2]) * 1e3 for i in range(n)][keep]
+
+    # Which round stalled, opt-in. EVERY rank prints its own series: these are
+    # spin-wait collectives, so one slow rank shows as a slow round on all of
+    # them and only the rank-local series separates a straggler from a
+    # whole-round event. See docs/EP_INTERNODE_V2_TAIL.md for how to read it.
+    if _seg:
+        now = torch.cuda.memory_stats()
+        keys = ("segment.all.allocated", "num_alloc_retries", "num_device_alloc")
+        print(
+            "# alloc r%d: " % d.rank
+            + " ".join(
+                f"{k.split('.')[-1]}+{now.get(k, 0) - _seg.get(k, 0)}" for k in keys
+            ),
+            flush=True,
+        )
+
+    if _series:
+        print(
+            "# rounds r%d disp: " % d.rank + " ".join("%.0f" % x for x in disp),
+            flush=True,
+        )
+        print(
+            "# rounds r%d comb: " % d.rank + " ".join("%.0f" % x for x in comb),
+            flush=True,
+        )
+        print(
+            "# rounds r%d hdis: " % d.rank + " ".join("%.0f" % x for x in hd[keep]),
+            flush=True,
+        )
+        print(
+            "# rounds r%d hcom: " % d.rank + " ".join("%.0f" % x for x in hc[keep]),
+            flush=True,
+        )
+        # Host wall per round and the convert window. With disp/comb/hdis/hcom
+        # above, these close the accounting: a round whose hwal exceeds
+        # disp+conv+comb has a hole somewhere the other series do not cover.
+        print(
+            "# rounds r%d conv: " % d.rank + " ".join("%.0f" % x for x in conv),
+            flush=True,
+        )
+        # Epoch bounds of the timed loop, so an external sampler (clocks, NIC)
+        # can be lined up with it. perf_counter has no epoch; time.time does.
+        print(
+            "# loop r%d t0=%.4f t1=%.4f" % (d.rank, _ep0, time.time()),
+            flush=True,
+        )
+        print("# barr r%d: " % d.rank + " ".join("%.6f" % x for x in _bt), flush=True)
+        print("# cpu  r%d: %d %d" % (d.rank, _cpu0, _cpu()), flush=True)
+        hwal = [(tr[i + 1] - tr[i]) * 1e6 for i in range(n)][keep]
+        print(
+            "# rounds r%d hwal: " % d.rank + " ".join("%.0f" % x for x in hwal),
+            flush=True,
+        )
+
+    # AVERAGE over rounds x ranks, plus BEST and WORST over the same sample set --
+    # the three numbers run_bench_once prints, so a reading here can be put beside
+    # one from the v1 harness without converting estimators. The average is the
+    # robust one; best/worst are extremes and noise-dominated, but they are what
+    # makes a single stalled round visible. Reporting only a minimum hides exactly
+    # that (an earlier version of this comparison did, and buried a 227us outlier).
+    def _stats(v):
+        m = d.allreduce_sum(int(sum(v) / len(v) * 1000)) / d.world / 1000
+        lo, hi = d.allreduce_minmax(int(min(v) * 1000), int(max(v) * 1000))
+        return m, lo / 1000, hi / 1000
+
+    dm, dlo, dhi = _stats(disp)
+    cm, clo, chi = _stats(comb)
+    vm, _, _ = _stats(conv)
+    if d.rank == 0:
+        print(
+            f"# BENCH tok={ct} dtype={a.dtype}->{a.combine_dtype or a.dtype} "
+            f"hidden={cfg.hidden_dim} topk={cfg.num_experts_per_token} "
+            f"kernel={a.kernel_type or 'auto'} "
+            f"dispatch={dm:.1f}us [{dlo:.1f}/{dhi:.1f}] "
+            f"combine={cm:.1f}us [{clo:.1f}/{chi:.1f}] "
+            f"total={dm + cm:.1f}us [conv={vm:.1f}us wall={wall:.1f}us]",
+            flush=True,
+        )
+
+    # v1's bench output on top of ours: the per-round dump and the two
+    # performance tables. Off with --no-bench-tables; it costs one all_gather
+    # after the timed loop and nothing inside it.
+    if not a.no_bench_tables:
+        ll = bool(getattr(op, "_internode_force_ll", a.max_tokens <= 2048))
+        geom = _geom_for_report(op, cfg, a)
+        _report_tables(d, cfg, a, disp, comb, total_recv, idx, ll, geom)
+    return 0
+
+
+def _timed_pass(op, cfg, d, a, inp, idx, wts, sc, cw, convert, n, warm):
+    """One warmup+timed block; returns (dispatch_us, combine_us) as grand means
+    over rounds x ranks -- the same statistic _bench and run_bench_once report."""
+    ev = [torch.cuda.Event(enable_timing=True) for _ in range(3 * n + 1)]
+    for _ in range(warm):
+        r = op.dispatch(inp, wts, sc, idx, return_routing=True)
+        op.combine(convert(r[0]), cw, routing=r[5])
+    torch.cuda.synchronize()
+    ev[0].record()
+    for i in range(n):
+        r = op.dispatch(inp, wts, sc, idx, return_routing=True)
+        ev[3 * i + 1].record()
+        x = convert(r[0])
+        ev[3 * i + 2].record()
+        op.combine(x, cw, routing=r[5])
+        ev[3 * i + 3].record()
+    torch.cuda.synchronize()
+    keep = slice(a.drop_rounds, None)
+    dv = [ev[3 * i].elapsed_time(ev[3 * i + 1]) * 1e3 for i in range(n)][keep]
+    cv = [ev[3 * i + 2].elapsed_time(ev[3 * i + 3]) * 1e3 for i in range(n)][keep]
+    gm = lambda v: d.allreduce_sum(int(sum(v) / len(v) * 1000)) / d.world / 1000
+    # The worst ROUND, across ranks, alongside the grand means. Without it a
+    # sweep cannot see the failure mode that matters here: a geometry whose
+    # median round is identical but which spikes to 4-5x on one round in thirty.
+    # A pass mean hides that (160us over 30 rounds moves the mean by 4us, inside
+    # the noise) and a median over paired passes discards it entirely -- which is
+    # exactly how (32,12,6) won the 8-token sweep and then lost the bench.
+    _, wd = d.allreduce_minmax(0, int(max(dv) * 1000))
+    _, wc = d.allreduce_minmax(0, int(max(cv) * 1000))
+    return gm(dv), gm(cv), wd / 1000, wc / 1000
+
+
+def _build_op(cfg, comm, dgeom, cgeom):
+    """An op whose dispatch plans are compiled for `dgeom` and its combine plans
+    for `cgeom`. Goes through the MORI_EP_*_GEOM hook the backend already exposes
+    for sweeps: a geometry is a compile-time identity there, read once at build
+    time, so it cannot be selected per launch the way v1's can.
+
+    The two are SEPARATE because the shipped table gives them separate values
+    (tokens 4: dispatch 64/32/8, combine 32/21/6). Driving both from one geometry
+    means the sweep's incumbent is not the configuration actually shipped, so
+    "beats the incumbent" would not mean "beats what we ship".
+    """
+    old = (os.environ.get("MORI_EP_DISP_GEOM"), os.environ.get("MORI_EP_COMB_GEOM"))
+    os.environ["MORI_EP_DISP_GEOM"] = "%d,%d,%d" % dgeom
+    os.environ["MORI_EP_COMB_GEOM"] = "%d,%d,%d" % cgeom
+    try:
+        return EpDispatchCombineOp(cfg, comm)
+    finally:
+        for k, v in zip(("MORI_EP_DISP_GEOM", "MORI_EP_COMB_GEOM"), old):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def _med(xs):
+    v = sorted(xs)
+    return v[len(v) // 2]
+
+
+def _tune(cfg, d, dev, a, comm):
+    """Sweep launch geometries and report the winner for this token count.
+
+    Structured after tuning_dispatch_combine in the examples harness -- same
+    candidate construction (block doubling plus 8/16, warp list, rdma as a
+    fraction of block), same selection metric (grand-mean latency) -- with ONE
+    deliberate difference, which the numbers force.
+
+    That harness measures each candidate once and compares the means. It can:
+    its transport's max/mean is 1.19 and its run-to-run spread is a few percent.
+    Ours is not: the same geometry measured back to back has produced 86us and
+    137us total, and a straight sweep here already "found" 64,32,4 beating the
+    shipped 64,32,8 by 5% on the mean and 30% on the worst -- which vanished
+    entirely when the two were run alternately, four pairs. A one-shot sweep on
+    this path selects noise and writes it into the table as if it were tuning.
+
+    So the incumbent stays LIVE and every candidate is measured against it
+    alternately, `reps` times each, comparing medians. Two ops hold symmetric
+    windows at once; the loser is closed immediately. Drift, whatever its cause,
+    then applies to both arms of every comparison instead of to whichever
+    candidate happened to run during it.
+    """
+    sm = torch.cuda.get_device_properties(dev).multi_processor_count
+    blocks = {b for b in (8, 16) if b < sm}
+    p = 32
+    while p <= sm:
+        blocks.add(p)
+        p <<= 1
+    blocks.add(sm)
+    warps = [4, 8, 16] if a.tuning_scope == "quick" else [4, 6, 8, 12, 16]
+
+    def rdmas(bn):
+        # rdma_block_num partitions the SAME grid between the blocks that talk to
+        # the network and the rest, so the optimum is a fraction of block and can
+        # sit anywhere in (0, 1). Three points was too coarse to say anything
+        # about the shape -- and it could not even reach the shipped 32-token row,
+        # whose rdma=48 against block=80 is 0.6 and is not 1/4, 1/2 or 2/3.
+        # Eighths plus 2/3 covers it at a cost of ~70s a sweep against ~31s.
+        frac = (
+            (bn // 2, bn * 2 // 3)
+            if a.tuning_scope == "quick"
+            else (
+                bn // 8,
+                bn // 4,
+                3 * bn // 8,
+                bn // 2,
+                5 * bn // 8,
+                bn * 2 // 3,
+                3 * bn // 4,
+            )
+        )
+        return sorted({v for v in frac if 1 <= v < bn})
+
+    cands = [(b, r, w) for b in sorted(blocks) for w in warps for r in rdmas(b)]
+    if a.tuning_candidate:
+        cands = [tuple(int(x) for x in a.tuning_candidate.split(","))]
+    elif a.tuning_limit:
+        cands = cands[: a.tuning_limit]
+
+    from mori.ops.dispatch_combine_v2.internode_tuning_configs import lookup
+
+    tbl = lookup(
+        cfg.world_size, cfg.hidden_dim, cfg.num_experts_per_token, a.max_tokens
+    )
+    # The incumbent is the SHIPPED pair, so a win means "better than what we ship".
+    inc_d = tuple(tbl["dispatch"]) if tbl else cands[0]
+    inc_c = tuple(tbl["combine"]) if tbl else cands[0]
+    phase = a.tuning_phase
+    start = inc_d if phase == "dispatch" else inc_c
+    if start in cands:
+        cands.remove(start)
+
+    if d.rank == 0:
+        print(
+            f"# TUNING tok={a.max_tokens} phase={phase} scope={a.tuning_scope} "
+            f"reps={a.tuning_reps} sm={sm} candidates={len(cands)} "
+            f"shipped dispatch={inc_d} combine={inc_c}",
+            flush=True,
+        )
+
+    rng = torch.Generator(device=dev)
+    rng.manual_seed(4242 + d.rank)
+    inp, idx, wts, sc = _gen_round(rng, cfg, a.max_tokens, dev, cfg.dispatch_dtype)
+    convert = (
+        (lambda x: x.to(cfg.combine_dtype))
+        if cfg.is_asymmetric_dtype
+        else (lambda x: x)
+    )
+    cw = wts if a.bench_weights else None
+
+    # Only the swept phase varies; the other stays at the shipped value, because
+    # the two are coupled (a dispatch with too few rdma blocks leaves the combine
+    # after it slower) and a per-phase argmin measured against a DIFFERENT other
+    # phase does not carry over.
+    geoms = lambda g: ((g, inc_c) if phase == "dispatch" else (inc_d, g))
+    if a.tuning_metric == "total":
+        pick = lambda dv, cv: dv + cv
+    else:
+        pick = (lambda dv, cv: dv) if phase == "dispatch" else (lambda dv, cv: cv)
+
+    best_op = _build_op(cfg, comm, *geoms(start))
+    if a.kernel_type is not None:
+        best_op._internode_force_ll = a.kernel_type == "v1_ll"
+    comm.barrier()
+    best = start
+    best_med = None
+    fixed_wins = []  # non-greedy: every candidate that beat the fixed incumbent
+
+    for k, cand in enumerate(cands):
+        try:
+            cand_op = _build_op(cfg, comm, *geoms(cand))
+        except Exception as exc:  # a geometry the backend rejects is not a failure
+            if d.rank == 0:
+                print(f"#   [{k + 1}/{len(cands)}] {cand} rejected: {exc}", flush=True)
+            continue
+        if a.kernel_type is not None:
+            cand_op._internode_force_ll = a.kernel_type == "v1_ll"
+        comm.barrier()
+
+        bt, ct_ = [], []
+        bph, cph = [], []  # (dispatch, combine) per rep, to show the coupling
+        bw, cw_ = [], []  # worst ROUND per pass, per arm
+        for _ in range(a.tuning_reps):
+            dv, cv, wd, wc = _timed_pass(
+                best_op, cfg, d, a, inp, idx, wts, sc, cw, convert, a.rounds, a.warmup
+            )
+            bt.append(pick(dv, cv))
+            bph.append((dv, cv))
+            bw.append(pick(wd, wc))
+            dv, cv, wd, wc = _timed_pass(
+                cand_op, cfg, d, a, inp, idx, wts, sc, cw, convert, a.rounds, a.warmup
+            )
+            ct_.append(pick(dv, cv))
+            cph.append((dv, cv))
+            cw_.append(pick(wd, wc))
+        bm, cm = sorted(bt)[len(bt) // 2], sorted(ct_)[len(ct_) // 2]
+        # Worst of the paired reps, as a tail proxy. _timed_pass returns a grand
+        # mean, so this is run-to-run spread rather than a worst ROUND -- which is
+        # the right thing here anyway, since the risk being guarded against is a
+        # geometry that lands in a bad regime more often.
+        # MEDIAN of the per-pass worst ROUND, not the worst pass mean. The
+        # median across passes keeps one unlucky pass from vetoing a candidate,
+        # while the per-pass max is what makes a recurring single-round spike
+        # visible at all.
+        bmax = sorted(bw)[len(bw) // 2]
+        cmax = sorted(cw_)[len(cw_) // 2]
+        # PAIRED, not a difference of medians: the regime moves during a sweep
+        # (the same incumbent geometry has read 84.9us on one candidate and
+        # 126.0us on the next), and differencing within a rep cancels that. The
+        # margin then floors the improvement; v1's equivalent defaults to 0,
+        # which is safe at its 1.19x max/mean and not here.
+        diffs = sorted(c - b_ for b_, c in zip(bt, ct_))
+        lo, hi = diffs[0], diffs[-1]
+        dmed = diffs[len(diffs) // 2]
+        margin = max(a.tuning_margin_us, bm * a.tuning_margin_frac)
+        tail_room = bm * a.tuning_tail_frac
+        # A median win is not enough on its own. Selecting purely on the median
+        # would accept a geometry that gains 2us at the median and gives back 30
+        # at the worst, and this table is used for a latency-bound collective
+        # where the worst round is what the caller waits for.
+        win = dmed < -margin and (cmax - bmax) <= tail_room
+        # And when the medians TIE, a clearly better worst is worth surfacing --
+        # this is the "same average, better tail" rule, made explicit rather than
+        # applied by hand after the fact.
+        tie = abs(dmed) <= margin and (bmax - cmax) > tail_room
+        if d.rank == 0:
+            print(
+                f"#   [{k + 1}/{len(cands)}] {cand} med={cm:6.1f}us vs "
+                f"incumbent {best} med={bm:6.1f}us  paired={dmed:+6.1f}us "
+                f"[{lo:+.1f},{hi:+.1f}] worst {cmax:.0f}/{bmax:.0f}  "
+                f"{'WIN' if win else ('TAIL' if tie else '--')}"
+                f"   d/c cand={_med(x for x, _ in cph):.1f}/{_med(y for _, y in cph):.1f}"
+                f" inc={_med(x for x, _ in bph):.1f}/{_med(y for _, y in bph):.1f}",
+                flush=True,
+            )
+        if win and a.tuning_greedy:
+            best_op.close()
+            best_op, best, best_med = cand_op, cand, cm
+        else:
+            cand_op.close()
+            if not a.tuning_greedy and (win or tie):
+                # Sort key puts real median wins ahead of tail-only ties.
+                # Rank real median wins ahead of tail-only ties: the two keys
+                # are different quantities and must not be sorted against each
+                # other, or a -20us tail tie outranks a -3us median win.
+                fixed_wins.append(
+                    (
+                        0 if win else 1,
+                        dmed if win else (cmax - bmax),
+                        cand,
+                        cm,
+                        bm,
+                        win,
+                        cmax,
+                        bmax,
+                    )
+                )
+            best_med = bm
+        comm.barrier()
+
+    best_op.close()
+    if d.rank == 0 and not a.tuning_greedy:
+        fixed_wins.sort()
+        print(
+            f"# TUNING tok={a.max_tokens} phase={phase}: {len(fixed_wins)} of "
+            f"{len(cands)} candidates beat the fixed incumbent {start}",
+            flush=True,
+        )
+        for _, dm, cd, cm2, bm2, w, cx, bx in fixed_wins[:5]:
+            print(
+                f"#   {'BEAT' if w else 'TAIL'} {cd} paired={dm:+.1f}us "
+                f"(cand med={cm2:.1f} inc med={bm2:.1f} worst {cx:.0f}/{bx:.0f})",
+                flush=True,
+            )
+        if fixed_wins:
+            best = fixed_wins[0][1]
+            best_med = fixed_wins[0][2]
+    if d.rank == 0:
+        d_out = best if phase == "dispatch" else inc_d
+        c_out = best if phase == "combine" else inc_c
+        print(
+            f"# TUNING RESULT tok={a.max_tokens} phase={phase}: "
+            f"block/rdma/warp={best} median {phase}={best_med:.1f}us "
+            f"(shipped was {start})\n"
+            f"#   table row: ({a.max_tokens}, {d_out[0]}, {d_out[1]}, {d_out[2]}, "
+            f"{c_out[0]}, {c_out[1]}, {c_out[2]}),",
+            flush=True,
+        )
+    return 0
+
+
+def _spawn_entry(local_rank, argv, node_rank, nnodes, per_node):
+    """One spawned worker. Rewrites the rank env, then re-enters main().
+
+    torchrun gives ONE process per node here (RANK = node rank, WORLD_SIZE =
+    node count), and the workers are children of it -- the shape the examples
+    harness uses. Everything downstream reads its identity from the environment,
+    so setting it here is the whole adaptation; no call site changes.
+
+    LOCAL_WORLD_SIZE has to be rewritten too. torchrun sets it to 1 under
+    --nproc_per_node=1, and main() derives gpu_per_node from it, which decides
+    the node grouping the internode path is gated on.
+    """
+    os.environ["_MORI_EP_SPAWN_CHILD"] = "1"
+    os.environ["RANK"] = str(node_rank * per_node + local_rank)
+    os.environ["LOCAL_RANK"] = str(local_rank)
+    os.environ["WORLD_SIZE"] = str(nnodes * per_node)
+    os.environ["LOCAL_WORLD_SIZE"] = str(per_node)
+    rc = main(argv)
+    if rc:
+        raise SystemExit(rc)
+
+
+def main(argv):
+    a = _parse_args(argv)
+
+    # --spawn N reproduces the examples harness's process topology: one torchrun
+    # process per node that spawns N workers, instead of N torchrun processes.
+    # Same kernels, same bench, different process tree -- which is worth being
+    # able to switch because host time on this path converts to measured "kernel"
+    # time about 1:1, so how the ranks are parented is not obviously neutral.
+    if a.spawn and not os.environ.get("_MORI_EP_SPAWN_CHILD"):
+        # Both topologies at once would be nprocs x spawn ranks per node, each
+        # claiming a GPU index it does not own. Refuse rather than deadlock in
+        # the rendezvous, and say which of the two to drop.
+        lws = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+        if lws > 1:
+            raise SystemExit(
+                f"--spawn {a.spawn} with torchrun --nproc_per_node={lws}: that is "
+                f"{lws * a.spawn} ranks per node. Use --nproc_per_node=1 (spawn "
+                f"builds the ranks), or pass --spawn 0 to let torchrun do it."
+            )
+        node_rank = int(os.environ["RANK"])
+        nnodes = int(os.environ["WORLD_SIZE"])
+        torch.multiprocessing.spawn(
+            _spawn_entry,
+            args=(argv, node_rank, nnodes, a.spawn),
+            nprocs=a.spawn,
+            join=True,
+        )
+        return 0
+
+    d = Dist()
+    rank, npes = d.rank, d.world
+    dev = torch.device("cuda", d.local_rank)
+
+    gpu_per_node = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+    if npes <= gpu_per_node:
+        raise SystemExit(
+            f"this test needs more than one node: world_size={npes} with "
+            f"{gpu_per_node} GPUs per node is a single node"
+        )
+
+    dtype = _DTYPES[a.dtype]
+    combine_dtype = _DTYPES[a.combine_dtype] if a.combine_dtype else None
+    M = a.max_tokens
+
+    uid = Communicator.get_unique_id() if rank == 0 else None
+    uid = d.bcast_uid(uid)
+    # internode_regions sizes the arena exactly; this is the VMM budget it is
+    # carved out of, with room for the communicator's own resource window.
+    win_bytes = npes * M * a.hidden_dim * 4 * 2 + (1 << 24)
+    failures = 0
+    with Communicator.init(
+        npes, rank, uid, per_rank_vmm=2 * win_bytes + (1 << 28)
+    ) as comm:
+        cfg = EpDispatchCombineConfig(
+            rank=rank,
+            world_size=npes,
+            hidden_dim=a.hidden_dim,
+            max_num_inp_token_per_rank=M,
+            num_experts_per_rank=(
+                a.experts_per_rank if a.experts_per_rank else 256 // npes
+            ),
+            num_experts_per_token=a.topk,
+            data_type=dtype if combine_dtype is None else torch.bfloat16,
+            dispatch_data_type=dtype if combine_dtype is not None else None,
+            combine_data_type=combine_dtype,
+            scale_dim=a.scale_dim,
+            scale_type_size=4 if a.scale_dim else 0,
+            quant_type=a.quant_type,
+            gpu_per_node=gpu_per_node,
+            num_qp_per_pe=a.num_qp,
+            kernel_backend="hip",
+        )
+        op = EpDispatchCombineOp(cfg, comm)
+        comm.barrier()
+
+        if a.cmd == "bench":
+            rc = _bench(op, cfg, d, dev, a, comm)
+            op.close()
+            d.shutdown()
+            return rc
+
+        if a.cmd == "tuning":
+            # The sweep builds its own ops, one per candidate geometry; this one
+            # only proved the config is constructible.
+            op.close()
+            rc = _tune(cfg, d, dev, a, comm)
+            d.shutdown()
+            return rc
+
+        rng = torch.Generator(device=dev)
+        for r in range(a.rounds):
+            rng.manual_seed(1234 + r * 977 + rank)
+            ct = M
+            inp, idx, wts, sc = _gen_round(rng, cfg, ct, dev, cfg.dispatch_dtype)
+
+            recv_x, recv_w, recv_s, recv_i, total_recv, routing = op.dispatch(
+                inp, wts, None, idx, return_routing=True
+            )
+            torch.cuda.synchronize()
+            comm.barrier()
+
+            # Identity expert: recv_x already holds the dispatched tokens.
+            #
+            # Converting it is the CALLER's job when the two legs have different
+            # element types, exactly as v1's harness does it (_get_combine_input
+            # -> _to_combine_dtype). The combine kernel's T is the combine dtype
+            # and it reads inpTokenBuf as T*, so handing it the fp8 dispatch
+            # output unconverted reinterprets fp8 bytes as bf16.
+            combine_in = (
+                recv_x.to(cfg.combine_dtype) if cfg.is_asymmetric_dtype else recv_x
+            )
+            out, out_w = op.combine(combine_in, wts, routing=routing)
+            torch.cuda.synchronize()
+            comm.barrier()
+
+            idx_c = idx.cpu()
+            U = np.array(
+                [
+                    len(
+                        {
+                            int(idx_c[t, j]) // cfg.num_experts_per_rank
+                            for j in range(a.topk)
+                        }
+                    )
+                    for t in range(ct)
+                ]
+            )
+            Ut = torch.from_numpy(U).view(ct, 1).float()
+            exp_w = Ut * wts.float().cpu()
+            exp = Ut * inp.float().cpu()
+
+            # The bound has to scale with U: combine sums U contributions in the
+            # wire dtype, so the error grows with the number of terms and with the
+            # magnitude being summed -- not with |expected| at that element, which
+            # cancellation can make arbitrarily small. This is the same shape of
+            # bound v1's harness uses (it scales its per-element bound by
+            # unique_pes) rather than a flat allclose.
+            got = out.float().cpu()
+            per_elem = inp.float().cpu().abs()
+            eps = 3e-1 if (a.quant_type != "none" or dtype in _FP8) else 8e-3
+            bound = eps * Ut * per_elem.clamp(min=1.0)
+            ok = bool(((got - exp).abs() <= bound).all())
+            # Weights are transported as f32 and summed the same way, so their
+            # bound is much tighter -- but still proportional to U.
+            gw = out_w.cpu()
+            ok_w = bool(((gw - exp_w).abs() <= 2e-3 * Ut).all())
+
+            if not (ok and ok_w) and rank == 0:
+                print(f"#   hidden_ok={ok} weights_ok={ok_w}", flush=True)
+                ratio = (out_w.cpu() / wts.float().cpu().clamp(min=1e-6))[:4]
+                print(
+                    f"#   effective multiplier got_w/wts[0,:4]={ratio[0, :4].tolist()} "
+                    f"(expected U[0]={int(U[0])})",
+                    flush=True,
+                )
+                # The worst violator with everything needed to classify it:
+                # a relative error near the wire dtype's half-ulp is rounding,
+                # one far above it is not, and a `want` at the staging format's
+                # saturation point says the partial sum clipped rather than
+                # rounded.
+                viol = (got - exp).abs() - bound
+                if bool((viol > 0).any()):
+                    fi = int(viol.argmax())
+                    # NOT `t, d` -- `d` is the Dist handle in this scope.
+                    vt, vd = fi // cfg.hidden_dim, fi % cfg.hidden_dim
+                    g, e, pin = (
+                        float(got[vt, vd]),
+                        float(exp[vt, vd]),
+                        float(per_elem[vt, vd]),
+                    )
+                    print(
+                        f"#   worst: tok={vt} dim={vd} got={g:.6g} want={e:.6g} "
+                        f"input={pin:.6g} U={int(Ut[vt])} "
+                        f"|diff|={abs(g - e):.6g} bound={float(bound[vt, vd]):.6g} "
+                        f"rel={abs(g - e) / max(abs(e), 1e-9):.4f} "
+                        f"nviol={int((viol > 0).sum())}",
+                        flush=True,
+                    )
+                want = exp
+                print(
+                    f"#   hidden: max|diff|={(got - want).abs().max():.4g} "
+                    f"got[0,:4]={got[0, :4].tolist()} want[0,:4]={want[0, :4].tolist()} "
+                    f"got_nonzero={int((got != 0).sum())}/{got.numel()}",
+                    flush=True,
+                )
+                ww = exp_w
+                # Distinguish "the kernel never wrote it" from "the base reads
+                # the wrong place": read the region the kernel targets directly.
+                from mori.tensor_utils import from_gpu_ptr
+
+                for rn in (
+                    "combine_out_weights",
+                    "inp_weights",
+                    "dispatch_out_weights",
+                ):
+                    v = from_gpu_ptr(
+                        op.arena.local_ptr(rn), (min(8, a.topk * 2),), torch.float32
+                    )
+                    print(f"#   region {rn}[:8] = {v.cpu().tolist()}", flush=True)
+                print(
+                    f"#   weights: max|diff|={(gw - ww).abs().max():.4g} "
+                    f"got[0,:4]={gw[0, :4].tolist()} want[0,:4]={ww[0, :4].tolist()} "
+                    f"U[:4]={U[:4].tolist()} total_recv={int(total_recv[0])}",
+                    flush=True,
+                )
+            errs = d.allreduce_sum(0 if (ok and ok_w) else 1)
+            failures += errs
+            if rank == 0:
+                print(
+                    f"# round {r} tokens={ct}: {'PASS' if errs == 0 else 'FAIL'} "
+                    f"({errs} of {npes} ranks disagree)",
+                    flush=True,
+                )
+        op.close()
+
+    d.shutdown()
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
-    # Everything above is one host: the cases fan out through the process manager
-    # and _WORLD_SIZE is a single node's worth of ranks, so no RDMA leg runs. The
-    # cross-node numbers need two hosts, and the harness that knows how to drive
-    # them is the shmem one in examples/ -- it owns the CLI, the shapes and the
-    # result tables. All this entry adds is the cco redirect.
-    #
-    #   torchrun --nnodes=2 --node_rank=N --nproc_per_node=1 \
-    #     tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py \
-    #     --kernel-type v1 --cmd bench --dtype bf16 --max-tokens 4096
-    #
-    # nproc_per_node is 1 by design: the harness reads WORLD_SIZE as the node
-    # count and spawns gpu_per_node workers of its own on top of it.
-    import runpy
-
-    import torch.multiprocessing
-
-    # Self, under the package name. Anything handed to spawn is pickled as
-    # module + qualname, and this file's __name__ here is "__main__" -- whose
-    # counterpart in the worker is the harness, not this module, so a
-    # "__main__._spawn_worker" reference would not resolve there.
-    from tests.python.ops.dispatch_combine_v2 import (
-        test_dispatch_combine_v2_internode as _self,
-    )
-
-    os.environ["MORI_EP_COMM"] = "cco"
-
-    _real_spawn = torch.multiprocessing.spawn
-
-    def _spawn(fn, args=(), nprocs=1, **kwargs):
-        return _real_spawn(
-            _self._spawn_worker, args=(fn, args), nprocs=nprocs, **kwargs
-        )
-
-    torch.multiprocessing.spawn = _spawn
-
-    _repo_root = os.path.dirname(os.path.abspath(__file__))
-    for _ in range(4):  # dispatch_combine_v2 -> ops -> python -> tests -> root
-        _repo_root = os.path.dirname(_repo_root)
-
-    # run_name="__main__" because the harness keeps its driver under its own
-    # __main__ guard; importing it would only parse argv and define classes. Our
-    # argv is already the harness's argv, and argparse ignores argv[0].
-    runpy.run_path(
-        os.path.join(
-            _repo_root,
-            "examples",
-            "ops",
-            "dispatch_combine",
-            "test_dispatch_combine_internode.py",
-        ),
-        run_name="__main__",
-    )
+    sys.exit(main(sys.argv[1:]))

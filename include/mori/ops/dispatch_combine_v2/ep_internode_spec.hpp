@@ -62,7 +62,6 @@ struct EpInterNodeCfg {
   EpInterNodeDType dtype{EpInterNodeDType::Bf16};
   // Only meaningful for the LL dispatch/combine pair, which the standard-MoE
   // adapter specialises on; the other six entries ignore it.
-  bool enableStdMoE{false};
 
   // ---- launch geometry (host-derived; see MakeEpInterNodeCfg). NOT rendered. ----
   int blockNum{64};
@@ -82,7 +81,6 @@ inline void VisitFields(Self& c, const EpInterNodeCfg& d, Visit&& v) {
 #define MORI_FIELD(x) v(#x, c.x, d.x)
   MORI_FIELD(kernelCfg);
   MORI_FIELD(dtype);
-  MORI_FIELD(enableStdMoE);
   MORI_FIELD(blockNum);
   MORI_FIELD(warpPerBlock);
   MORI_FIELD(rdmaBlockNum);
@@ -92,7 +90,7 @@ inline void VisitFields(Self& c, const EpInterNodeCfg& d, Visit&& v) {
 }
 
 MORI_JIT_ASSERT_FIELD_COUNT(
-    EpInterNodeCfg, 8, "added an EpInterNodeCfg field -- update VisitFields(EpInterNodeCfg) too");
+    EpInterNodeCfg, 7, "added an EpInterNodeCfg field -- update VisitFields(EpInterNodeCfg) too");
 
 // The whole Cfg as text, for the plan's `info` and for logs. NOT the source
 // text: RenderSource renders kernelCfg alone, because geometry must not enter
@@ -149,15 +147,15 @@ constexpr int EpInterNodeDispatchSharedBytes(const EpInterNodeCfg& c) {
   const int wpb = c.warpPerBlock;
   return (c.kernelCfg.worldSize * wpb + c.kernelCfg.numExpertPerRank * wpb +
           c.kernelCfg.numExpertPerRank) *
-         static_cast<int>(sizeof(mori::moe::index_t));
+         static_cast<int>(sizeof(ep_index_t));
 }
 
 // Combine's pointer arrays: one per warp for the topk sources, a second for the
 // weights, a third for the scales when the quant type is blockwise. Mirrors
 // combine_shared_mem() in launch.cpp with use_weight_ptrs=true.
 constexpr int EpInterNodeCombineSharedBytes(const EpInterNodeCfg& c) {
-  const bool blockwise = c.kernelCfg.quantType == mori::moe::QuantType::Fp8BlockwiseQuant ||
-                         c.kernelCfg.quantType == mori::moe::QuantType::Fp4BlockwiseQuant;
+  const bool blockwise = c.kernelCfg.quantType == EpQuantType::Fp8BlockwiseQuant ||
+                         c.kernelCfg.quantType == EpQuantType::Fp4BlockwiseQuant;
   const int ptrArrays = 2 + (blockwise ? 1 : 0);
   return c.warpPerBlock * c.kernelCfg.numExpertPerToken * ptrArrays * 8;
 }
@@ -180,10 +178,9 @@ struct EpInterNodeRequest {
   int maxTotalRecvTokens = 0;
   int gpuPerNode = 8;
   int numQpPerPe = 1;
-  mori::moe::QuantType quantType = mori::moe::QuantType::None;
+  EpQuantType quantType = EpQuantType::None;
   // specialisation
   EpInterNodeDType dtype = EpInterNodeDType::Bf16;
-  bool enableStdMoE = false;
   // geometry; 0 = the placeholder MakeEpInterNodeCfg picks
   int blockNum = 0;
   int warpPerBlock = 0;
@@ -207,7 +204,6 @@ inline void VisitFields(Self& r, const EpInterNodeRequest& d, Visit&& v) {
   MORI_FIELD(numQpPerPe);
   MORI_FIELD(quantType);
   MORI_FIELD(dtype);
-  MORI_FIELD(enableStdMoE);
   MORI_FIELD(blockNum);
   MORI_FIELD(warpPerBlock);
   MORI_FIELD(rdmaBlockNum);
@@ -216,7 +212,7 @@ inline void VisitFields(Self& r, const EpInterNodeRequest& d, Visit&& v) {
 }
 
 MORI_JIT_ASSERT_FIELD_COUNT(
-    EpInterNodeRequest, 18,
+    EpInterNodeRequest, 17,
     "added an EpInterNodeRequest field -- update VisitFields(EpInterNodeRequest) too");
 
 std::string EpInterNodeRequestSchema();

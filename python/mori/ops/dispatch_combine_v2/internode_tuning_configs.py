@@ -23,14 +23,19 @@
 """Per-device launch geometry for the v2 CCO internode (InterNodeV1LL)
 dispatch/combine kernels.
 
-The internode kernels reach their grid a different way than the intranode ones:
-the launch redirect (see the v2 internode test) inherits geometry from
-``dispatch_combine.py`` -- the shmem resolve -- rather than a per-token schedule
-the kernel selects at runtime. So the *host* picks a per-token bucket here and
-pins the resulting block/rdma/warp on ``op.dispatch`` / ``op.combine``. That is
-why this table, unlike ``tuning_configs.py`` (flydsl intranode) and
-``hip_tuning_configs.py``, carries an ``rdma_block_num`` per phase and is looked
-up with the live ``num_tokens`` rather than compiled into a schedule.
+The internode kernels reach their grid a different way than the intranode ones.
+An intranode kernel is compiled once per (block, warp) the schedule can name and
+picks among those at launch; an internode *pass sequence* is compiled per
+geometry, because ``rdma_block_num`` splits the grid between the RDMA blocks and
+the intra-node ones and the kernel branches on it. So the host resolves a bucket
+here from the live ``num_tokens`` and launches the plan set built for it --
+``HipBackend._internode_geometry_buckets`` walks this whole table at build time
+so that resolution can never trigger a compile.
+
+That is also why this table, unlike ``tuning_configs.py`` (flydsl intranode) and
+``hip_tuning_configs.py``, carries an ``rdma_block_num`` per phase: dispatch and
+combine are tuned to different values at the same token count over one shared
+arena, which a single geometry per bucket cannot express.
 
 Devices are told apart the same way as ``tuning_configs.py`` -- PCI DID first
 (MI300X and MI308X are both gfx942, differing only in CU count), then arch. The
@@ -66,12 +71,89 @@ from mori.ops import utils as gpu_utils
 # moved: a single shared 80/rdma40/warp4 geometry for both phases beat the old
 # 80/48/8 + 80/40/8 by ~4us total (disp 41.3 vs 43.6, comb 51.1 vs 53.1),
 # reproducible across two A/B batches.
+#
+# Re-tune (2026-09-08, v2 CCO path, `--cmd tuning` in the v2 harness): only the
+# 4-token DISPATCH moved, 64/32/8 -> 32/16/4. Everything else in this table was
+# re-swept and held: 4-token combine, both phases at 8, 16 and 32 tokens -- 0
+# reproducible wins over 3 repeats each (16 and 32 gave 0 wins in all 6 runs).
+#
+# That row is the one change because it is the only one that reproduced. Three
+# independent 29-candidate sweeps ranked 32/16/4 first every time (-2.4, -2.6,
+# -2.8us paired against the fixed incumbent), and eight 51-rep head-to-heads gave
+# a median of -2.3us with 6 of 8 clearing the margin. The per-phase split is
+# consistent across all eight: dispatch 36.9-38.4us against 39.2-40.9us, combine
+# 46.2-46.9 against 45.8-46.6 -- so the gain is ~6% of dispatch and the combine
+# after it is unchanged.
+#
+# That last part matters, because the coupling note above predicts the opposite:
+# it records rdma 16 costing ~+18us on the paired combine at 4/8 tokens, which is
+# why this row held rdma at 32. On the v2 CCO path that penalty does not appear
+# (46.5 vs 46.5 in the validation runs), so the reason for keeping rdma high at 4
+# tokens has gone with it. The note is left standing for the 8-token row, whose
+# sweep found nothing better and which still carries rdma 32.
+#
+# Re-tune (2026-09-09) after the CCO NUMA-binding fix. EVERY number above this
+# line was tuned with the ranks unbound, i.e. every A/B in it raced a +-40us
+# random term from CPU placement, so the table had to be re-derived rather than
+# trusted. ONE row moved: 32-token combine 80/40/8 -> 64/48/6.
+#
+# Method, FOUR stages. The fourth is not optional and I learned that the hard way:
+#   1. Full sweep, 165 candidates (the rdma grid was widened from three points to
+#      eighths -- the old one could not even reach the shipped 32-token rdma=48),
+#      three repeats per (token, phase).
+#   2. Keep only candidates that won in at least two of the three repeats. At 4
+#      tokens the three sweeps returned 15 winners and NONE repeated, which is
+#      the whole argument for this stage.
+#   3. Head-to-head against the shipped row, 21 paired reps, three times.
+#
+# Stage 3 is not a formality. 16-token combine (64,40,6) won all THREE sweeps and
+# then lost all three head-to-heads -- picking a winner out of 165 candidates is
+# a multiple-comparison problem and the sweep alone cannot tell a real effect
+# from the best of 165 draws. The bar applied here is: the tuned phase's median
+# must be better in all three head-to-heads.
+#   4. A plain interleaved bench A/B of the resulting TABLE. This stage cannot be
+#      replaced by a better statistic inside the tuner, and that was measured
+#      rather than assumed. Two things differ, both verified on (32,12,6):
+#        * the ESTIMATOR -- the tuner takes the median over 21 paired passes,
+#          the bench the mean over 30 rounds of ONE pass. The two geometries have
+#          the SAME median round (42.0 against 41-42); the candidate spikes to
+#          4-5x on one round in thirty, which moves a bench mean and which a
+#          median over passes discards.
+#        * the ENVIRONMENT -- the tuner holds two ops alive, each with its own
+#          symmetric window, alternating. That makes BOTH arms spike: worst round
+#          124/127, 127/127, 127/133 over three runs, against 79 and 65 for the
+#          incumbent and 162 and 205 for the candidate in a plain bench. The
+#          candidate's own spike is invisible because the environment supplies
+#          one to both arms.
+#
+# Stage 4 rejected 8-token dispatch (32,12,6), which had passed stage 3 on both
+# the median (39.0/39.2/40.2 against 40.9/41.0/41.3) and the worst. In a plain
+# bench it read 118.1/118.8/115.9 against the shipped row's 92.0/94.3, with one
+# dispatch worst of 374us -- best-in-class once and much worse three times. That
+# geometry leaves only 20 of 32 blocks for the intra-node half and is bimodal;
+# 8-token dispatch is therefore UNCHANGED.
+#
+# 32-token combine (64,48,6) passed stage 4: interleaved against the shipped row,
+# three pairs, 113.6/114.6/114.3 against 116.1/116.1/118.3, with combine itself
+# 65.0/64.9/64.9 against 66.7/66.8/67.3. That is the one row this re-tune moved.
+# 4- and 32-token dispatch had no candidate reproduce at all and are unchanged.
+#
+# Two candidates cleared the tail bar but not the median one and are NOT applied,
+# recorded so they are not re-derived: 4-token combine (64,16,8) and 8-token
+# combine (80,50,4). Both tie on the median and cut the worst of the paired reps
+# by 15-25us. They are a real trade, not noise; they want their own decision.
+#
+# Methodology, because a sweep on this path is easy to get wrong: candidates are
+# judged by a PAIRED comparison against a FIXED incumbent, not by a chain. v1's
+# greedy shape (a winner becomes the incumbent) is unusable at this noise level
+# -- five repeats of one sweep returned five different winners. See _tune in
+# tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py.
 _MI308X_EP16_H6144 = (
     # max_tok, disp_block, disp_rdma, disp_warp, comb_block, comb_rdma, comb_warp
-    (4, 64, 32, 8, 32, 21, 6),
+    (4, 32, 16, 4, 32, 21, 6),
     (8, 64, 32, 8, 32, 21, 6),
     (16, 80, 40, 4, 80, 40, 4),
-    (None, 80, 48, 8, 80, 40, 8),
+    (None, 80, 48, 8, 64, 48, 6),
 )
 
 # (device_key, world_size, hidden_dim, topk) -> {dtype: schedule}
@@ -117,4 +199,9 @@ def lookup(world_size, hidden_dim, topk, num_tokens, dtype="fp8"):
 
     cu = gpu_utils.cu_count() or 80
     db, cb = min(db, cu), min(cb, cu)  # never over-subscribe the CUs
+    # rdma_block_num partitions the SAME grid: blocks below it talk to the
+    # network, the rest do the intra-node half. Clamping block without clamping
+    # rdma can leave rdma >= block, which is not slow but wrong -- no block is
+    # left for the intra-node side and the dispatch barrier never completes.
+    dr, cr = min(dr, max(1, db - 1)), min(cr, max(1, cb - 1))
     return {"dispatch": (db, dr, dw), "combine": (cb, cr, cw)}
