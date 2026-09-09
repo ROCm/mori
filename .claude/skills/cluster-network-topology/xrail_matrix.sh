@@ -18,35 +18,60 @@ JOB=${1:?job label}; RUNDIR=${2:?run dir}
 me=$(hostname)
 PORT_BASE=${PORT_BASE:-18600}
 BW_PORT_BASE=${BW_PORT_BASE:-19600}
-IB_ROOT=/sys/class/infiniband
-GID_INDEX=${GID_INDEX:-1}          # RoCEv2 IPv6-ULA rails are commonly at index 1
 log() { echo "[$me] $*"; }
 
 # ---------- detect ACTIVE rail devices, excluding the mgmt NIC ----------
-MGMT_NDEV=$(ip route show default 2>/dev/null | awk '/default/{print $5; exit}')
-DEVS=(); declare -A NDEV ADDR
-for d in $(ls "$IB_ROOT" 2>/dev/null | sort -V); do
-  P="$IB_ROOT/$d/ports/1"
-  [ "$(awk '{print $2}' "$P/state" 2>/dev/null)" = ACTIVE ] || continue
-  [ "$(cat "$P/gid_attrs/types/$GID_INDEX" 2>/dev/null)" = "RoCE v2" ] || continue
-  nd=$(cat "$P/gid_attrs/ndevs/$GID_INDEX" 2>/dev/null)
-  [ -n "$nd" ] || continue
-  [ -n "$MGMT_NDEV" ] && [ "$nd" = "$MGMT_NDEV" ] && continue
-  a=$(ip -o -6 addr show "$nd" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
-  [ -n "$a" ] || continue
-  DEVS+=("$d"); NDEV[$d]=$nd; ADDR[$d]=$a
-done
+# Shared with probe_topology.sh and xrail_worker.sh: each device's GID index is
+# auto-detected, and rails addressed as IPv4-mapped are found as well as IPv6.
+RAIL_LIB="${RAIL_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/rail_detect.sh}"
+[ -r "$RAIL_LIB" ] || { log "cannot read $RAIL_LIB (set RAIL_LIB)"; exit 1; }
+# shellcheck source=rail_detect.sh
+. "$RAIL_LIB"
+rail_detect
+IB_ROOT="$RAIL_IB_ROOT"
+DEVS=(${RAIL_ACTIVE[@]+"${RAIL_ACTIVE[@]}"})
 NR=${#DEVS[@]}
 log "rails: ${DEVS[*]:-none}"
 
+# Every sweep below is cross-rail, so it needs a second rail to aim at. Say why
+# and write it down: a pre-flight tool that meets a machine it does not
+# understand should produce a diagnosis, not an unbound-variable abort.
+if [ "$NR" -lt 2 ]; then
+  log "need >=2 active rails, found $NR — nothing to sweep"
+  {
+    echo "cross-rail RDMA verification   node=$me  job=$JOB"
+    echo "date=$(date -u +%FT%TZ)"
+    echo
+    echo "ABORTED: need >=2 active RoCE rails, found $NR."
+    echo "all RDMA devices seen: ${RAIL_ALL[*]:-none}"
+    echo "rails (addressable):   ${RAIL_DEVS[*]:-none}"
+    echo "rails (ACTIVE):        ${RAIL_ACTIVE[*]:-none}"
+    echo "mgmt netdev excluded:  ${RAIL_MGMT_NDEV:-none}"
+    echo
+    echo "Run 'rail_detect.sh --dump' on this node to see why devices were dropped."
+  } > "$RUNDIR/matrix.txt"
+  exit 0
+fi
+d0=${DEVS[0]}; d1=${DEVS[1]}
+
 : > "$RUNDIR/addrs.$me"
-for i in "${!DEVS[@]}"; do d=${DEVS[$i]}; echo "$i $d ${NDEV[$d]} ${ADDR[$d]}" >> "$RUNDIR/addrs.$me"; done
+for i in "${!DEVS[@]}"; do d=${DEVS[$i]}; echo "$i $d ${RAIL_NDEV[$d]} ${RAIL_ADDR[$d]}" >> "$RUNDIR/addrs.$me"; done
 touch "$RUNDIR/host.$me"
 
-for _ in $(seq 1 30); do [ "$(ls "$RUNDIR"/host.* 2>/dev/null | wc -l)" -ge 2 ] && break; sleep 1; done
+# Schedulers that dispatch the batch body per-node (Spur >= 0.10) can start the peer
+# tens of seconds after us, so wait generously.
+PEER_WAIT=${PEER_WAIT:-180}
+for _ in $(seq 1 "$PEER_WAIT"); do [ "$(ls "$RUNDIR"/host.* 2>/dev/null | wc -l)" -ge 2 ] && break; sleep 1; done
 HOSTS=(); for f in "$RUNDIR"/host.*; do b=$(basename "$f"); HOSTS+=("${b#host.}"); done
 IFS=$'\n' HOSTS=($(printf '%s\n' "${HOSTS[@]}" | sort -u)); unset IFS
-A=${HOSTS[0]:-$me}; B=${HOSTS[1]:-$me}
+# Defaulting B to ourselves here would produce a plausible-looking loopback matrix
+# that silently answers a different question. Fail loudly instead.
+[ "${#HOSTS[@]}" -ge 2 ] || {
+  log "FATAL: only ${#HOSTS[@]} host(s) registered in $RUNDIR after ${PEER_WAIT}s: ${HOSTS[*]:-none}"
+  log "       the peer node never started — check the allocation, do not trust a 1-node run"
+  exit 1
+}
+A=${HOSTS[0]}; B=${HOSTS[1]}
 log "A(tester)=$A  B(target)=$B"
 
 # ---------- Phase 1: environment dump (both nodes) ----------
@@ -59,17 +84,17 @@ log "A(tester)=$A  B(target)=$B"
     printf "%-9s fw=%-16s mtu_active=%-8s rate=%-14s ndev=%-11s gid%s=%s\n" \
       "$d" "$(cat "$IB_ROOT/$d/fw_ver" 2>/dev/null)" \
       "$(awk '{print $2}' "$P/rate" 2>/dev/null; cat "$P/active_mtu" 2>/dev/null)" \
-      "$(cat "$P/rate" 2>/dev/null)" "${NDEV[$d]}" "$GID_INDEX" "${ADDR[$d]}"
+      "$(cat "$P/rate" 2>/dev/null)" "${RAIL_NDEV[$d]}" "${RAIL_GIDIDX[$d]}" "${RAIL_ADDR[$d]}"
   done
   echo "--- netdev MTU ---"
   for d in "${DEVS[@]}"; do
-    printf "%-9s %-11s mtu=%s\n" "$d" "${NDEV[$d]}" "$(cat /sys/class/net/${NDEV[$d]}/mtu 2>/dev/null)"
+    printf "%-9s %-11s mtu=%s\n" "$d" "${RAIL_NDEV[$d]}" "$(cat /sys/class/net/${RAIL_NDEV[$d]}/mtu 2>/dev/null)"
   done
   echo "--- QoS / PFC / DSCP / ECN ---"
   echo "nicctl: $(command -v nicctl || echo ABSENT)"
   echo "mlnx_qos: $(command -v mlnx_qos || echo ABSENT)"
   echo "dcb: $(command -v dcb || echo ABSENT)"
-  n0=${NDEV[${DEVS[0]}]:-}
+  n0=${RAIL_NDEV[$d0]:-}
   if [ -n "$n0" ]; then
     echo "[dcb pfc show dev $n0]"; dcb pfc show dev "$n0" 2>&1 | head -12
     echo "[dcb app show dev $n0]"; dcb app show dev "$n0" 2>&1 | head -12
@@ -94,20 +119,20 @@ if [ "$me" = "$B" ] && [ "$have_pp" = 1 ]; then
   for t in "${!DEVS[@]}"; do
     d=${DEVS[$t]}
     ( for _ in $(seq 1 200); do
-        timeout 10 ibv_rc_pingpong -d "$d" -g "$GID_INDEX" -p "$((PORT_BASE+t))" -n 20 >/dev/null 2>&1
+        timeout 10 ibv_rc_pingpong -d "$d" -g "${RAIL_GIDIDX[$d]}" -p "$((PORT_BASE+t))" -n 20 >/dev/null 2>&1
       done ) &
   done
   # servers for the SL sweep on rail 1 (dest), one per SL
   for sl in 0 1 2 3 4 5 6 7; do
     ( for _ in $(seq 1 12); do
-        timeout 10 ibv_rc_pingpong -d "${DEVS[1]}" -g "$GID_INDEX" -p "$((PORT_BASE+40+sl))" -n 20 -l "$sl" >/dev/null 2>&1
+        timeout 10 ibv_rc_pingpong -d "$d1" -g "${RAIL_GIDIDX[$d1]}" -p "$((PORT_BASE+40+sl))" -n 20 -l "$sl" >/dev/null 2>&1
       done ) &
   done
   # servers for the MTU sweep on rail 1 (dest)
   mi=0
   for m in 256 512 1024 2048 4096; do
     ( for _ in $(seq 1 12); do
-        timeout 10 ibv_rc_pingpong -d "${DEVS[1]}" -g "$GID_INDEX" -p "$((PORT_BASE+60+mi))" -n 20 -m "$m" >/dev/null 2>&1
+        timeout 10 ibv_rc_pingpong -d "$d1" -g "${RAIL_GIDIDX[$d1]}" -p "$((PORT_BASE+60+mi))" -n 20 -m "$m" >/dev/null 2>&1
       done ) &
     mi=$((mi+1))
   done
@@ -115,7 +140,7 @@ if [ "$me" = "$B" ] && [ "$have_pp" = 1 ]; then
     ti=0
     for tc in 0 8 16 26 46 96 106 136; do
       ( for _ in $(seq 1 12); do
-          timeout 15 ib_write_bw -d "${DEVS[1]}" -x "$GID_INDEX" -p "$((BW_PORT_BASE+ti))" \
+          timeout 15 ib_write_bw -d "$d1" -x "${RAIL_GIDIDX[$d1]}" -p "$((BW_PORT_BASE+ti))" \
             -n 200 -s 4096 --tclass="$tc" >/dev/null 2>&1
         done ) &
       ti=$((ti+1))
@@ -135,7 +160,10 @@ if [ "$me" = "$A" ] && mkdir "$RUNDIR/lock" 2>/dev/null; then
 
   {
     echo "cross-rail RDMA verification   tester=$A  target=$B  job=$JOB"
-    echo "rails A=$NR  rails B=$BNR   gid_index=$GID_INDEX"
+    echo "rails A=$NR  rails B=$BNR   gid_index=${GID_INDEX:-auto}"
+    for d in ${DEVS[@]+"${DEVS[@]}"}; do
+      echo "  A.$d  gid=${RAIL_GIDIDX[$d]}  ndev=${RAIL_NDEV[$d]}  addr=${RAIL_ADDR[$d]}"
+    done
     echo "date=$(date -u +%FT%TZ)"
     echo
   } >> "$R"
@@ -145,7 +173,7 @@ if [ "$me" = "$A" ] && mkdir "$RUNDIR/lock" 2>/dev/null; then
     local dev=$1 port=$2 extra=${3:-} r
     for r in 1 2; do
       # shellcheck disable=SC2086
-      timeout 8 ibv_rc_pingpong -d "$dev" -g "$GID_INDEX" -p "$port" -n 20 $extra "$B" >/dev/null 2>&1 \
+      timeout 8 ibv_rc_pingpong -d "$dev" -g "${RAIL_GIDIDX[$dev]}" -p "$port" -n 20 $extra "$B" >/dev/null 2>&1 \
         && { echo OK; return; }
       sleep 1
     done
@@ -176,19 +204,19 @@ if [ "$me" = "$A" ] && mkdir "$RUNDIR/lock" 2>/dev/null; then
 
   # ---- Phase 3: SL sweep on cross-rail r0 -> r1 ----
   {
-    echo "### Phase 3 — service-level sweep, A.${DEVS[0]} -> B.rail1 (cross-rail)"
+    echo "### Phase 3 — service-level sweep, A.$d0 -> B.rail1 (cross-rail)"
     for sl in 0 1 2 3 4 5 6 7; do
-      printf "sl=%-3s %s\n" "$sl" "$(try_pp "${DEVS[0]}" "$((PORT_BASE+40+sl))" "-l $sl")"
+      printf "sl=%-3s %s\n" "$sl" "$(try_pp "$d0" "$((PORT_BASE+40+sl))" "-l $sl")"
     done
     echo
   } >> "$R"
 
   # ---- Phase 4: path-MTU sweep on cross-rail r0 -> r1 ----
   {
-    echo "### Phase 4 — path-MTU sweep, A.${DEVS[0]} -> B.rail1 (cross-rail)"
+    echo "### Phase 4 — path-MTU sweep, A.$d0 -> B.rail1 (cross-rail)"
     mi=0
     for m in 256 512 1024 2048 4096; do
-      printf "mtu=%-6s %s\n" "$m" "$(try_pp "${DEVS[0]}" "$((PORT_BASE+60+mi))" "-m $m")"
+      printf "mtu=%-6s %s\n" "$m" "$(try_pp "$d0" "$((PORT_BASE+60+mi))" "-m $m")"
       mi=$((mi+1))
     done
     echo
@@ -196,11 +224,11 @@ if [ "$me" = "$A" ] && mkdir "$RUNDIR/lock" 2>/dev/null; then
 
   # ---- Phase 5: traffic-class sweep via ib_write_bw ----
   {
-    echo "### Phase 5 — traffic-class (DSCP) sweep, A.${DEVS[0]} -> B.rail1 (cross-rail)"
+    echo "### Phase 5 — traffic-class (DSCP) sweep, A.$d0 -> B.rail1 (cross-rail)"
     if [ "$have_bw" = 1 ]; then
       ti=0
       for tc in 0 8 16 26 46 96 106 136; do
-        out=$(timeout 20 ib_write_bw -d "${DEVS[0]}" -x "$GID_INDEX" -p "$((BW_PORT_BASE+ti))" \
+        out=$(timeout 20 ib_write_bw -d "$d0" -x "${RAIL_GIDIDX[$d0]}" -p "$((BW_PORT_BASE+ti))" \
                 -n 200 -s 4096 --tclass="$tc" "$B" 2>&1)
         bw=$(echo "$out" | awk '/^ *4096/{print $4" MB/s"; found=1} END{if(!found) print "no-data"}')
         printf "tclass=%-5s %s\n" "$tc" "$bw"

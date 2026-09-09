@@ -25,7 +25,13 @@ description: >-
 Companion to `mori check` (`tools/env_check.sh`) and the `deploy-mori` skill: those
 answer "is this host configured correctly?", this answers "what is the fabric, and which
 tier broke?". The scripts referenced throughout ship beside this file —
-`probe_topology.sh`, `xrail_matrix.sh`, `xrail_matrix.sbatch`, `make_report.py`.
+`rail_detect.sh`, `probe_topology.sh`, `xrail_worker.sh`, `xrail_worker.sbatch`,
+`xrail_matrix.sh`, `xrail_matrix.sbatch`, `make_diagrams.py`, `make_report.py`.
+
+`rail_detect.sh` is the shared rail-discovery library the other scripts source: it
+auto-detects each device's global RoCEv2 GID index and address (IPv4-mapped or IPv6
+ULA/GUA, skipping `fe80::` link-local), so the tools never disagree about the same
+machine. Run it alone to see what a node looks like: `bash rail_detect.sh --dump`.
 
 A "rail-optimized" GPU cluster gives each GPU its own NIC, and each NIC lives on its
 own isolated L2/L3 domain (a "rail"). Rails may or may not be routable to each other:
@@ -82,7 +88,8 @@ unexamined assumption is a liability.
 ## Step 1 — Discover the layout
 
 Prefer the bundled `probe_topology.sh` (auto-detects NICs, GIDs incl. IPv6-ULA rails,
-GPUs, same-PCI-domain affinity; emits `topo.mmd` + `topo.dot`). Run it inside the
+GPUs, GPU model, same-PCI-domain affinity; emits `topo_report.<host>.txt` plus a raw
+`topology_<host>_node.auto.{mmd,dot}`). Run it inside the
 container/host that owns the devices:
 
 ```bash
@@ -253,13 +260,46 @@ You need coordinated processes on **two different** nodes. Pitfalls learned the 
   batch script must wait on its own sentinel files or it falls off the end and kills the
   workers); `srun` may **not propagate the submitter's environment** (pass knobs via
   files in a shared run dir); `scontrol show hostnames` may be unsupported and
-  `--ntasks-per-node` rejected. Don't expand the nodelist — launch `srun -N2 -n2
-  --overlap` and have the workers **self-organize by `$(hostname)`** (sort the names;
-  lower = tester A, higher = target B). The batch script may run from a **spool copy**,
+  `--ntasks-per-node` rejected. Don't expand the nodelist — where `srun` exists, launch
+  `srun -N2 -n2 --overlap`; either way have the workers **self-organize by `$(hostname)`**
+  (sort the names; lower = tester A, higher = target B), which is what makes the same
+  worker correct under both fan-out models below. The batch script may run from a **spool copy**,
   so use `$SLURM_SUBMIT_DIR`, not `$BASH_SOURCE`.
+- **On Spur, `srun` often does not exist on the compute nodes at all** — measured absent
+  on two unrelated Spur clusters (0.7.0 and 0.10.0), where it is a login-node client only
+  and `/opt/spur` holds nothing but `hooks/prolog.sh`/`epilog.sh`. A batch body doing
+  `srun -N2 -n2 --overlap` there dies with `command not found`. Instead the **batch body
+  itself is dispatched to every allocated node**, which is the exact inverse of Slurm,
+  where it runs on the first node only. The bundled wrappers branch on
+  `command -v srun` and run the worker in place when it is missing, so one file covers
+  both models.
+
+  **Determine the fan-out model empirically — do not infer it from the Spur version.**
+  Measured: Spur 0.7.0 fanned a plain `sbatch <script>` out to both nodes, while Spur
+  0.10.0 ran the same submission on **one** node and needed `--wrap` to spread. One
+  10-second job settles it, and the failure mode it prevents (a silent single-node run)
+  is expensive:
+
+  ```bash
+  sbatch -N2 -n2 -t 00:02:00 --wrap='echo $(hostname) >> ~/fanout.txt'
+  # 2 hostnames -> the wrapped command fans out. Now repeat with your real script as a
+  # FILE: if that yields only 1 hostname, deliver the per-node body via --wrap instead:
+  sbatch -N2 -n2 --gres=gpu:8 --wrap="bash \$HOME/railcheck/xrail_worker.sbatch"
+  ```
+
+  Two further traps in that same shell: the batch body is **not a login shell**, so the
+  scheduler's `PATH` and controller address from `/etc/profile.d` are missing — yet
+  sourcing those drop-ins under `set -u` aborts the job, because they are not written to
+  be `-u` safe (wrap the sourcing in `set +u` / `set -u`). And `squeue -j $JOB` run
+  *inside* its own job may return nothing forever, so a "wait until RUNNING" loop needs
+  an escape hatch or it burns its entire budget before doing any work.
 - **Files on shared storage can read back empty** on the peer node. Never silently
   default on an empty read — it desynchronizes the two sides asymmetrically and produces
-  a plausible-looking wrong result. Retry, then fail loudly.
+  a plausible-looking wrong result. Retry, then fail loudly. The same rule covers peer
+  *discovery*: under per-node dispatch the peer can start a minute or more after you, so
+  wait generously (`PEER_WAIT`, default 180 s) and **abort** if only one host registered.
+  Defaulting the target to your own hostname yields a loopback run that looks like a
+  clean pass while answering an entirely different question.
 - **Avoid write races:** only the tester writes results, guarded by an atomic
   `mkdir <lock>` (a scheduler may also spawn the same wrapper twice on one node); run the
   RDMA **server in a re-listen loop** and **retry the client** a few times (a first
@@ -284,14 +324,26 @@ sbatch -p <partition> -A <acct> --qos=<qos> --gres=gpu:8 xrail_matrix.sbatch
 # if the job is held: scontrol release <jid>
 ```
 
+Two workers ship, both driven the same way and both writing the same output folder:
+
+| worker | what it runs | use it when |
+|---|---|---|
+| `xrail_worker.sh` (+ `.sbatch`) | one same-rail + one cross-rail RDMA probe, then the full IP ping matrix; writes `result.txt` | classifying the fabric — this is the fast answer, and the file `make_report.py` reads |
+| `xrail_matrix.sh` (+ `.sbatch`) | the NxN RDMA matrix plus the SL / MTU / TC sweeps; writes `matrix.txt` | the fabric is *not* full-mesh and you need to know which rail pairs and which tunables are implicated |
+
+Start with `xrail_worker.sbatch`. Reach for `xrail_matrix.sbatch` once Step 2 says
+cross-rail fails, since the sweeps take much longer.
+
 All artifacts land in a per-run **output folder**: `<XRAIL_OUT>/job-<jid>/` (default
-`XRAIL_OUT=<submit_dir>/xrail-output`) — containing `result.txt`, `run.log`, and the
+`XRAIL_OUT=<submit_dir>/xrail-output`) — containing `result.txt`, `topo_report.<host>.txt`,
+`routes.<host>`, `run.log` (or `run.log.<host>` when every node runs the body), and the
 `host.*`/`addrs.*` coordination files. Optional env overrides (export before `sbatch`):
 
 | Env | Purpose | Default |
 |---|---|---|
 | `XRAIL_OUT` | base output folder | `<submit_dir>/xrail-output` |
-| `WORKER` | path to `xrail_matrix.sh` | next to the sbatch script |
+| `WORKER` | path to `xrail_matrix.sh` / `xrail_worker.sh` | next to the sbatch script |
+| `RAIL_LIB` | path to `rail_detect.sh` | next to the worker script |
 | `RAIL_DEV_REGEX` | only consider RDMA devices matching this ERE | `.*` |
 | `EXCLUDE_DEV_REGEX` | drop RDMA devices matching this ERE | (none) |
 | `INCLUDE_MGMT=1` | keep the default-route (mgmt) device as a rail | drop it |
@@ -302,16 +354,38 @@ All artifacts land in a per-run **output folder**: `<XRAIL_OUT>/job-<jid>/` (def
 Rail index = position of the device in the `sort -V` order of `/sys/class/infiniband`
 (consistent across homogeneous nodes).
 
+**`result.txt` grammar.** `make_report.py` parses this file, so a hand-written or
+site-modified worker must emit the same shape. Everything else in the file is free text
+and ignored; only these three line forms are read:
+
+```
+same-rail  A.<dev> -> B.rail<N> : REACHABLE|UNREACHABLE      # RDMA, one line
+cross-rail A.<dev> -> B.rail<M> : REACHABLE|UNREACHABLE|SKIPPED
+rail<N>(<ndev>)  rail<M>  OK|FAIL  same-rail|cross-rail      # IP, one line per pair
+```
+
+Rules the parser actually enforces:
+- The RDMA lines are matched by the **leading token** (`same-rail` / `cross-rail`,
+  case-insensitive) plus a `:` somewhere on the line. `UNREACHABLE` is tested before
+  `REACHABLE`, so the substring overlap is safe. `SKIPPED` on the cross-rail line means
+  "not attempted" and renders as `-`, not as a failure.
+- The IP rows must match `^rail\d+\S*\s+rail\d+\s+(\S+)\s+(same-rail|cross-rail)` —
+  the `(<ndev>)` suffix on the source rail is optional, column padding is free, and any
+  status token other than the literal `OK` counts as a failure.
+- Same/cross tallies come only from the IP rows; the header, the rail map and the
+  `###` section titles are decorative.
+
 **Per-job artifact checklist** — capture all of these every run, on both nodes:
 
 ```
 addrs.<node>     idx dev netdev addr, all rails         (the addressing plan, Step 3a)
+topo_report.<node>.txt   NIC/GPU/GID/PCI/NUMA inventory  (drives the diagrams, Step 1)
 routes.<node>    ip -6/-4 route show table all; ip route show default; ip -6 neigh
 env.<node>       ibv_devinfo, fw_ver, mtu, numa_node, PCI paths, tool inventory
 stats.<node>     /sys/class/net/*/statistics before+after
 matrix.txt       the N x N RDMA matrix, both directions of the pair recorded
 paired.txt       the back-to-back IP-vs-RDMA rows for one pair (2b)
-run.log          everything, timestamped, including the failures
+run.log[.<node>] everything, timestamped, including the failures
 ```
 
 ---
@@ -590,27 +664,45 @@ This is in the library's control and is a real gap when it is missing. Contrast:
 
 ## Step 6 — Draw it
 
-Two portable options (no AI image tools — topology must be exact):
+**The diagrams are generated, not drawn by hand** (no AI image tools — topology must be
+exact). `make_diagrams.py` reads the run folder and emits both diagrams; `make_report.py`
+calls it automatically for anything missing, so in the normal flow Step 6 is Step 8.
 
-- **Mermaid** (`topo.mmd`): paste into `https://mermaid.live`, GitHub, or any Markdown.
-- **Graphviz** (`topo.dot`): `dot -Tpng topo.dot -o topo.png` (or `-Tsvg`).
+```bash
+python3 make_diagrams.py <output_folder>          # or just run make_report.py
+python3 make_diagrams.py <output_folder> --force  # redraw after re-measuring
+```
 
-Single-node diagram conventions:
-- One subgraph per **NUMA / PCI domain**; GPU boxes linked to their rail-local NIC
-  (label the PCIe bus). Rail-optimized boxes split first-half/second-half across the two.
-- A legend documenting GPU model, RoCE GID index + address family (v4 / IPv6-ULA), and
-  the fabric classification.
+It consumes `topo_report*.txt` (single-node) and `*result*.txt` + `addrs.<hostB>`
+(cross-rail), and writes names that `make_report.py`'s globs pick up:
+`topology_<host>_node.{dot,png}` and `topology_<A>__<B>_crossrail.{dot,png}`. Rendering
+shells out to graphviz `dot`; without it you still get the `.dot` files and the report
+shows their source plus the render command.
 
-Two-node cross-rail diagram (example: `topology_crossrail_2node.dot`/`.png`, built from
-`xrail_matrix` output; see also `topology_two_node.dot`):
-- Left = Node A, right = Node B, a **middle column of rail leaves** (one per rail).
-- **Green solid** = same-rail links that work (ICMP **and** RDMA OK).
-- **Red dashed** = cross-rail links that fail at RDMA. If ICMP crosses but RDMA does not,
-  say so explicitly in the legend (green-at-IP / red-at-RDMA) — it's the whole point.
-- If Step 3a derived a grouping, draw the **upper tier** as a box above the leaves and
-  mark which measured link crossed it. Draw it **dashed/greyed and labelled "inferred
-  from addressing plan; not directly observed"** — never present a derived tier as a
-  measured one.
+What it produces, and the conventions to preserve if you extend a diagram by hand:
+
+*Single-node* — one subgraph per **(NUMA, PCI domain)**; each GPU box linked to its
+rail-local NIC, labelled with the PCIe bus and the rail address; the mgmt/default-route
+NIC drawn dashed and grey **outside** the rail groups; a legend note carrying GPU model,
+rail-NIC count, RoCE GID index + address family, what was excluded and why, and the
+fabric verdict with its evidence.
+
+*Two-node cross-rail* — left = Node A, right = Node B, a **middle column of rail leaves**
+(one per rail). **Green solid** = same-rail links that passed. The cross-rail edge is
+drawn from the measurement, never assumed: **red dashed** when cross-rail fails,
+**green dashed** when it passes, labelled with the ICMP tally and the RDMA result. If
+ICMP crosses but RDMA does not, the legend says so explicitly (green-at-IP /
+red-at-RDMA) — it's the whole point.
+
+**The one thing you still add by hand:** if Step 3a *derived* a grouping, draw the
+**upper tier** as a box above the leaves and mark which measured link crossed it — drawn
+**dashed/greyed and labelled "inferred from addressing plan; not directly observed."**
+No script should fabricate a tier it did not measure, so `make_diagrams.py` does not emit
+one. Edit the generated `.dot` and re-render, and say in the summary that you did.
+
+`probe_topology.sh` also drops a raw `topology_<host>_node.auto.{dot,mmd}` pair. The
+Mermaid one pastes into `https://mermaid.live`, GitHub, or any Markdown; the report
+prefers the richer generated diagram over the `.auto.` one.
 
 ---
 
@@ -645,23 +737,42 @@ Bundle everything into a single self-contained HTML page that a non-expert can r
 glance: the fabric verdict, the diagrams, the summary, and the raw data. Use the bundled
 **`make_report.py`** (no dependencies; embeds the PNGs as base64 so the file is shareable).
 
-Collect your artifacts for the run into one **output folder** (the diagrams, the `.md`
-summary, the cross-rail `result.txt`, and the `topo_report*.txt`), then:
+**Collect on the cluster, render on your workstation.** Login and compute nodes generally
+do not have graphviz, and you should not have to install it there. Everything the
+cluster produces is plain text, and the run folder is self-contained, so it survives a
+copy intact:
 
 ```bash
-# one report per output folder -> <folder>/report.html
-python3 make_report.py <output_folder>
+# 1. on the cluster: probe + cross-rail test, text only
+sbatch -A <account> -p <partition> --qos=<qos> --gres=gpu:8 xrail_worker.sbatch
+#    -> $XRAIL_OUT/job-<jobid>/{result.txt,addrs.*,routes.*,topo_report.<host>.txt,run.log*}
+#    the sbatch wrapper already runs probe_topology.sh + route capture in the SAME
+#    allocation, so one submission leaves a complete folder (compute nodes reject SSH,
+#    so there is no second chance once the job ends)
+
+# 2. copy the whole run folder down
+scp -r <login-node>:<XRAIL_OUT>/job-<jobid> ./job-<jobid>
+
+# 3. locally (needs graphviz `dot`): diagrams + report in one step
+python3 make_report.py ./job-<jobid>            # -> ./job-<jobid>/report.html
 
 # optional: a comparison landing page across several clusters -> index.html
 python3 make_report.py --index index.html <folder1> <folder2> <folder3>
 ```
 
+Step 3 generates any missing diagrams via `make_diagrams.py` first (`--no-diagrams` opts
+out). Run it on a machine without `dot` and it degrades rather than fails: the report
+carries the DOT source and the command to render it elsewhere.
+
 The generator auto-discovers files by glob (`*node*.png`, `*crossrail*.png`,
-`topology_*.md`, `*result*.txt`, `topo_report*.txt`), derives the **fabric verdict** from
-the summary's `Fabric classification:` line (FULL-MESH / RDMA RAIL-ONLY / RAIL-ONLY
-IP+RDMA), and renders the `.md` (headings, tables, code). Author the summary `.md` with a
-top-level `#` title and a `## Fabric classification: <verdict> …` line so the report picks
-them up.
+`topology_*.md`, `*result*.txt`, `topo_report*.txt`), derives a **Node summary** table
+(GPU ↔ rail NIC ↔ netdev ↔ PCI ↔ address ↔ NUMA) from `topo_report.txt`, and takes the
+**fabric verdict** from the summary's `Fabric classification:` line (FULL-MESH / RDMA
+RAIL-ONLY / RAIL-ONLY IP+RDMA) — or, when there is no summary `.md`, from the measured
+cross-rail evidence in `result.txt`. Author the summary `.md` with a top-level `#` title
+and a `## Fabric classification: <verdict> …` line so the report picks them up; the
+interpretation prose stays hand-written, since auto-generating it would be inventing
+analysis.
 
 It also parses `result.txt` into a **verdict evidence table** showing *both* experiments —
 IP (`ping`) and RDMA — as same-rail vs cross-rail (green/red). This is important: a fabric
@@ -826,7 +937,8 @@ resolved via `_script_path()`, and every script must degrade gracefully to non-r
    model with `rocm-smi --showproductname`.
 4. Classify **both layers** between two nodes: full N×N ping matrix **and** N×N RDMA
    matrix, plus the paired back-to-back control. Under a scheduler use
-   `xrail_matrix.sbatch` (Step 2d), which drives `xrail_matrix.sh` on both nodes.
+   `xrail_worker.sbatch` (Step 2d) for the classification, then `xrail_matrix.sbatch`
+   for the N×N matrix and sweeps if cross-rail fails.
 5. Before believing a diagonal, run the **confound register** (Step 2c). The cheapest
    close on the `hop_limit = 1` confound is to count router hops on a *passing* path
    with `mtr` — if the pass already crossed a router, the hardcoded hop limit was never
@@ -841,8 +953,10 @@ resolved via `_script_path()`, and every script must degrade gracefully to non-r
    upper tier and usually settles shared vs partitioned without switch access. Then take
    the remaining operator questions (Step 3d) to the vendor, bringing your answer rather
    than asking cold.
-10. Render `topo.dot`/`topo.mmd` and a 2-node cross-rail diagram; mark derived tiers as
-    derived.
-11. `make_report.py <folder>` → self-contained `report.html` with an explicit open-
-    questions section; `--index` for a multi-cluster comparison page. This is the final,
-    user-facing deliverable.
+10. **Copy the run folder down** (`scp -r <login>:<XRAIL_OUT>/job-<jid> .`) — the cluster
+    produces text, your workstation (which has graphviz) produces the pictures.
+11. `make_report.py <folder>` → generates both diagrams via `make_diagrams.py`, then a
+    self-contained `report.html` with an explicit open-questions section; `--index` for a
+    multi-cluster comparison page. This is the final, user-facing deliverable. Hand-add
+    only what was *derived* rather than measured (e.g. an inferred upper tier), and mark
+    it as derived.

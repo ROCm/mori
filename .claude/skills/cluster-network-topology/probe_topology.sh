@@ -7,81 +7,60 @@
 #   ./probe_topology.sh --peer <PEER_IP_OR_HOST>   # also run cross-rail reachability
 #   GID_INDEX=1 ./probe_topology.sh           # override RoCE GID index (default: auto)
 #
-# Outputs: ./topo_report.txt  ./topo.mmd  ./topo.dot
+# Outputs (in $OUT_DIR, default .):
+#   topo_report.<host>.txt             machine-readable probe report
+#   topology_<host>_node.auto.{dot,mmd}  raw GPU<->NIC graph
+#
+# Then, on a machine with graphviz:  python3 make_report.py <OUT_DIR>
 set -uo pipefail
 
 OUT_DIR="${OUT_DIR:-.}"
-REPORT="$OUT_DIR/topo_report.txt"
-MMD="$OUT_DIR/topo.mmd"
-DOT="$OUT_DIR/topo.dot"
 PEER=""
 [ "${1:-}" = "--peer" ] && PEER="${2:-}"
+
+hostn=$(hostname)
+# Host-suffixed: a 2-node run drops both nodes' probes into one folder, and on
+# schedulers with no srun the batch body runs on every node at once. Still matches
+# the topo_report*.txt glob make_report.py looks for.
+REPORT="$OUT_DIR/topo_report.$hostn.txt"
+# ".auto" keeps these raw emissions distinct from make_diagrams.py's richer
+# topology_<host>_node.dot, which is what make_report.py embeds.
+MMD="$OUT_DIR/topology_${hostn}_node.auto.mmd"
+DOT="$OUT_DIR/topology_${hostn}_node.auto.dot"
 : > "$REPORT"
 
 log() { echo "$@" | tee -a "$REPORT"; }
 
-hostn=$(hostname)
 log "=== node: $hostn ==="
 
 # ---- 1. RDMA devices ------------------------------------------------------
-declare -A NIC_NDEV NIC_IP NIC_GIDTYPE NIC_PCI NIC_NUMA NIC_STATE
-IB_ROOT=/sys/class/infiniband
-GID_INDEX="${GID_INDEX:-}"
+# Detection is shared with xrail_worker.sh / xrail_matrix.sh so the tools never
+# disagree about the same machine.
+RAIL_LIB="${RAIL_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/rail_detect.sh}"
+[ -r "$RAIL_LIB" ] || { echo "cannot read $RAIL_LIB (set RAIL_LIB)" >&2; exit 1; }
+# shellcheck source=rail_detect.sh
+. "$RAIL_LIB"
+rail_detect
 
-nics=()
-[ -d "$IB_ROOT" ] && nics=($(ls "$IB_ROOT" 2>/dev/null | sort -V))
+nics=(${RAIL_ALL[@]+"${RAIL_ALL[@]}"})
 log ""; log "--- RDMA devices (${#nics[@]}) ---"
-for d in "${nics[@]}"; do
-  P="$IB_ROOT/$d/ports/1"
-  state=$(cat "$P/state" 2>/dev/null | awk '{print $2}')
-  # pick GID index: explicit ($GID_INDEX), else first RoCEv2 entry with a GLOBAL
-  # (routable) address. Rails may be addressed as IPv4-mapped (::ffff:AABBCCDD) OR
-  # global IPv6 — commonly a ULA (fc00::/7), each rail its own /64. Skip fe80::
-  # link-local and the all-zero entry. IPv4-mapped is preferred when present.
-  gi="$GID_INDEX"
-  if [ -z "$gi" ]; then
-    for i in $(seq 0 7); do
-      g=$(cat "$P/gids/$i" 2>/dev/null)
-      t=$(cat "$P/gid_attrs/types/$i" 2>/dev/null)
-      [ "$t" = "RoCE v2" ] || continue
-      case "$g" in
-        0000:0000:0000:0000:0000:0000:0000:0000) : ;;                 # empty
-        fe80:*) : ;;                                                   # link-local, skip
-        0000:0000:0000:0000:0000:ffff:*) gi=$i; break ;;              # IPv4-mapped (best)
-        *) [ -z "${gi:-}" ] && gi=$i ;;                                # first global IPv6 (ULA/GUA)
-      esac
-    done
-    gi="${gi:-1}"
-  fi
-  gid=$(cat "$P/gids/$gi" 2>/dev/null)
-  gtype=$(cat "$P/gid_attrs/types/$gi" 2>/dev/null)
-  ndev=$(cat "$P/gid_attrs/ndevs/$gi" 2>/dev/null)
-  # derive the rail address from the chosen GID
-  ip=""
-  case "$gid" in
-    0000:0000:0000:0000:0000:ffff:*)   # IPv4-mapped -> dotted quad
-      tail4=$(echo "$gid" | awk -F: '{print $7$8}')
-      ip=$(printf "%d.%d.%d.%d" 0x${tail4:0:2} 0x${tail4:2:2} 0x${tail4:4:2} 0x${tail4:6:2} 2>/dev/null) ;;
-    ""|0000:0000:0000:0000:0000:0000:0000:0000) : ;;
-    *)                                 # global IPv6 (ULA/GUA) -> read netdev's global v6
-      [ -n "$ndev" ] && ip=$(ip -o -6 addr show "$ndev" scope global 2>/dev/null | awk '{print $4}' | head -1) ;;
-  esac
-  pci=$(basename "$(readlink -f "$IB_ROOT/$d/device" 2>/dev/null)" 2>/dev/null)
-  numa=$(cat "$IB_ROOT/$d/device/numa_node" 2>/dev/null)
-  NIC_NDEV[$d]=$ndev; NIC_IP[$d]=$ip; NIC_GIDTYPE[$d]=$gtype
-  NIC_PCI[$d]=$pci; NIC_NUMA[$d]=$numa; NIC_STATE[$d]=$state
-  log "$d  state=$state  ndev=$ndev  gid[$gi]=$gtype  ip=$ip  pci=$pci  numa=$numa"
+for d in ${nics[@]+"${nics[@]}"}; do
+  log "$d  state=${RAIL_STATE[$d]}  ndev=${RAIL_NDEV[$d]}  gid[${RAIL_GIDIDX[$d]:-none}]=${RAIL_GIDTYPE[$d]}  ip=${RAIL_ADDR[$d]}  pci=${RAIL_PCI[$d]}  numa=${RAIL_NUMA[$d]}"
 done
 
 # ---- 2. GPUs --------------------------------------------------------------
 declare -A GPU_PCI
 log ""; log "--- GPUs ---"
 GPU_TMP=$(mktemp)
+GPU_MODEL=""
 if command -v rocm-smi >/dev/null 2>&1; then
   rocm-smi --showbus 2>/dev/null | sed -nE 's/^GPU\[([0-9]+)\].*PCI Bus: ([0-9A-Fa-f:.]+)/\1 \2/p' > "$GPU_TMP"
+  GPU_MODEL=$(rocm-smi --showproductname 2>/dev/null | sed -nE 's/.*Card Series:[[:space:]]+(.+[^[:space:]])[[:space:]]*$/\1/p' | head -1)
 elif command -v nvidia-smi >/dev/null 2>&1; then
   nvidia-smi --query-gpu=index,pci.bus_id --format=csv,noheader 2>/dev/null | tr -d ' ' | awk -F, '{print $1" "$2}' > "$GPU_TMP"
+  GPU_MODEL=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
 fi
+[ -n "$GPU_MODEL" ] && log "GPU model: $GPU_MODEL"
 while read -r idx bus; do [ -n "$idx" ] && GPU_PCI[$idx]=$bus; done < "$GPU_TMP"
 rm -f "$GPU_TMP"
 for k in $(echo "${!GPU_PCI[@]}" | tr ' ' '\n' | sort -n); do log "GPU$k  pci=${GPU_PCI[$k]}"; done
@@ -91,26 +70,20 @@ for k in $(echo "${!GPU_PCI[@]}" | tr ' ' '\n' | sort -n); do log "GPU$k  pci=${
 # boxes place each GPU on the same PCIe domain as its rail NIC; pair the k-th
 # GPU with the k-th NIC within that domain (sorted by full PCI address).
 #
-# First isolate the RAIL NICs: exclude the management/front-end NIC(s) — the one
-# on the default route, and any with no global address — otherwise an interspersed
-# mgmt NIC shifts the ordinal pairing (single-domain boxes list mgmt + rail NICs
-# together, e.g. mlx5 eth0/eth1 among rdma0..7).
-MGMT_NDEV=$(ip route show default 2>/dev/null | awk '/default/{print $5; exit}')
-railnics=()
-for d in "${nics[@]}"; do
-  [ -n "$MGMT_NDEV" ] && [ "${NIC_NDEV[$d]}" = "$MGMT_NDEV" ] && continue  # default route = mgmt
-  [ -z "${NIC_IP[$d]}" ] && continue                                       # no global addr = not a rail
-  railnics+=("$d")
-done
-[ ${#railnics[@]} -gt 0 ] || railnics=("${nics[@]}")   # fallback: use all if filter emptied
+# RAIL_DEVS has already excluded the management/front-end NIC(s) — the one on the
+# default route, and any with no global address — otherwise an interspersed mgmt
+# NIC shifts the ordinal pairing (single-domain boxes list mgmt + rail NICs
+# together, e.g. mlx5 eth0/eth1 among rdma0..7). It deliberately keeps NICs whose
+# link is down, since dropping one would shift the ordinal just as badly.
+railnics=(${RAIL_DEVS[@]+"${RAIL_DEVS[@]}"})
 
 log ""; log "--- GPU <-> NIC PCIe affinity (same-domain ordinal; rail NICs only) ---"
-log "rail NICs: ${railnics[*]}   (mgmt/default-route NIC excluded: ${MGMT_NDEV:-none})"
+log "rail NICs: ${railnics[*]:-none}   (mgmt/default-route NIC excluded: ${RAIL_MGMT_NDEV:-none})"
 declare -A GPU_NIC
 domains=$(for k in "${!GPU_PCI[@]}"; do echo "${GPU_PCI[$k]%%:*}"; done | sort -u)
 for dom in $domains; do
   gpus_d=$(for k in "${!GPU_PCI[@]}"; do echo "${GPU_PCI[$k]} $k"; done | grep -i "^${dom}:" | sort | awk '{print $2}')
-  nics_d=$(for d in "${railnics[@]}"; do echo "${NIC_PCI[$d]} $d"; done | grep -i "^${dom}:" | sort | awk '{print $2}')
+  nics_d=$(for d in ${railnics[@]+"${railnics[@]}"}; do echo "${RAIL_PCI[$d]} $d"; done | grep -i "^${dom}:" | sort | awk '{print $2}')
   set -- $nics_d
   for k in $gpus_d; do
     GPU_NIC[$k]="${1:-}"; [ -n "${1:-}" ] && shift
@@ -118,15 +91,15 @@ for dom in $domains; do
 done
 for k in $(echo "${!GPU_PCI[@]}" | tr ' ' '\n' | sort -n); do
   d=${GPU_NIC[$k]}
-  log "GPU$k (${GPU_PCI[$k]}) -> ${d:-?} (${NIC_PCI[$d]:-none}) rail-local"
+  log "GPU$k (${GPU_PCI[$k]}) -> ${d:-?} (${RAIL_PCI[$d]:-none}) rail-local"
 done
 
 # ---- 4. Rail reachability (optional, needs --peer) ------------------------
 if [ -n "$PEER" ]; then
   log ""; log "--- Rail reachability to peer $PEER ---"
   log "(rail-aligned should pass; cross-rail failing => rail-only fabric)"
-  for d in "${nics[@]}"; do
-    nd=${NIC_NDEV[$d]}; ip=${NIC_IP[$d]}
+  for d in ${nics[@]+"${nics[@]}"}; do
+    nd=${RAIL_NDEV[$d]}; ip=${RAIL_ADDR[$d]}
     [ -z "$nd" ] && continue
     # derive peer same-rail IP by swapping the last octet is site-specific;
     # here we just ping the peer's per-rail IP if provided via PEER_IPS map.
@@ -143,7 +116,7 @@ fi
   echo "  subgraph NODE[$hostn]"
   for k in $(echo "${!GPU_PCI[@]}" | tr ' ' '\n' | sort -n); do
     d=${GPU_NIC[$k]}
-    echo "    G$k[\"GPU$k<br/>${GPU_PCI[$k]}\"] --- N_$d[\"$d / ${NIC_NDEV[$d]}<br/>${NIC_IP[$d]}\"]"
+    echo "    G$k[\"GPU$k<br/>${GPU_PCI[$k]}\"] --- N_$d[\"$d / ${RAIL_NDEV[$d]}<br/>${RAIL_ADDR[$d]}\"]"
   done
   echo "  end"
 } > "$MMD"
@@ -155,12 +128,13 @@ fi
   echo "  label=\"$hostn RDMA/GPU topology\";"
   for k in $(echo "${!GPU_PCI[@]}" | tr ' ' '\n' | sort -n); do
     d=${GPU_NIC[$k]}
-    echo "  \"GPU$k\" -> \"$d\\n${NIC_IP[$d]}\" [dir=none, style=dotted, label=\"PCIe\"];"
+    echo "  \"GPU$k\" -> \"$d\\n${RAIL_ADDR[$d]}\" [dir=none, style=dotted, label=\"PCIe\"];"
   done
   echo "}"
 } > "$DOT"
 
 log ""
 log "Wrote: $REPORT  $MMD  $DOT"
-log "Render DOT:     dot -Tpng $DOT -o topo.png"
+log "Next:  python3 make_report.py $OUT_DIR   # builds the richer diagrams + HTML report"
+log "Render this raw DOT directly: dot -Tpng $DOT -o ${DOT%.dot}.png"
 log "Render Mermaid: paste $MMD into https://mermaid.live"

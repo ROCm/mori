@@ -1,4 +1,25 @@
 #!/usr/bin/env python3
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 """Generate a self-contained HTML report from a cluster-topology output folder.
 
 Per-folder report:
@@ -17,15 +38,28 @@ File discovery (by glob within the folder):
   topology_*.md / *.md        -> summary
   *result*.txt                -> cross-rail result
   topo_report*.txt            -> probe report
+
+Missing diagrams are generated on the fly by make_diagrams.py (disable with
+--no-diagrams). That needs the graphviz `dot` binary; without it the report falls
+back to showing the DOT source and the command to render it elsewhere.
 """
-import sys, os, re, glob, base64, html, argparse
+import argparse
+import base64
+import glob
+import html
+import os
+import re
+import sys
+
 
 # ---------- helpers ----------
-def find(folder, pat, exclude=None):
+def find(folder, pat, exclude=()):
+    if isinstance(exclude, str):
+        exclude = (exclude,)
     hits = sorted(glob.glob(os.path.join(folder, pat)))
-    if exclude:
-        hits = [h for h in hits if exclude not in os.path.basename(h)]
+    hits = [h for h in hits if not any(x in os.path.basename(h) for x in exclude)]
     return hits[0] if hits else None
+
 
 def read(path):
     if not path or not os.path.isfile(path):
@@ -33,59 +67,133 @@ def read(path):
     with open(path, encoding="utf-8", errors="replace") as f:
         return f.read()
 
+
 def img_data_uri(path):
     if not path or not os.path.isfile(path):
         return ""
     b = base64.b64encode(open(path, "rb").read()).decode()
     return "data:image/png;base64," + b
 
+
 def detect_gpu(text):
     m = re.search(r"MI\d{3}X(?:\s*VF)?", text)
     return m.group(0) if m else "GPU"
 
+
 def parse_result(text):
     """From a cross-rail result.txt, summarize both experiments as same/cross-rail status.
-    Returns dict: rdma_same, rdma_cross ('OK'/'FAIL'/'-'), ip_same, ip_cross (ok,total)."""
+    Returns dict: rdma_same, rdma_cross ('OK'/'FAIL'/'-'), ip_same, ip_cross (ok,total).
+    """
     rdma_same = rdma_cross = "-"
-    ip_same = [0, 0]; ip_cross = [0, 0]
+    ip_same = [0, 0]
+    ip_cross = [0, 0]
     for ln in text.splitlines():
         s = ln.strip()
         low = s.lower()
         if low.startswith("same-rail") and ":" in s:
-            rdma_same = "OK" if ("REACHABLE" in s and "UNREACHABLE" not in s) else ("FAIL" if "UNREACHABLE" in s else "-")
+            rdma_same = (
+                "OK"
+                if ("REACHABLE" in s and "UNREACHABLE" not in s)
+                else ("FAIL" if "UNREACHABLE" in s else "-")
+            )
         elif low.startswith("cross-rail") and ":" in s:
-            if "SKIPPED" in s: rdma_cross = "-"
-            else: rdma_cross = "OK" if ("REACHABLE" in s and "UNREACHABLE" not in s) else ("FAIL" if "UNREACHABLE" in s else "-")
+            if "SKIPPED" in s:
+                rdma_cross = "-"
+            else:
+                rdma_cross = (
+                    "OK"
+                    if ("REACHABLE" in s and "UNREACHABLE" not in s)
+                    else ("FAIL" if "UNREACHABLE" in s else "-")
+                )
         else:
             m = re.match(r"^rail\d+\S*\s+rail\d+\s+(\S+)\s+(same-rail|cross-rail)", s)
             if m:
                 ok = 1 if m.group(1) == "OK" else 0
                 (ip_same if m.group(2) == "same-rail" else ip_cross)[0] += ok
                 (ip_same if m.group(2) == "same-rail" else ip_cross)[1] += 1
-    return {"rdma_same": rdma_same, "rdma_cross": rdma_cross, "ip_same": ip_same, "ip_cross": ip_cross}
+    return {
+        "rdma_same": rdma_same,
+        "rdma_cross": rdma_cross,
+        "ip_same": ip_same,
+        "ip_cross": ip_cross,
+    }
+
 
 def ip_cell(pair):
     o, t = pair
-    if t == 0: return ("n/a", "muted")
-    if o == t: return (f"OK ({o}/{t})", "ok")
-    if o == 0: return (f"FAIL (0/{t})", "bad")
+    if t == 0:
+        return ("n/a", "muted")
+    if o == t:
+        return (f"OK ({o}/{t})", "ok")
+    if o == 0:
+        return (f"FAIL (0/{t})", "bad")
     return (f"mixed ({o}/{t})", "warn")
+
 
 def rdma_cell(v):
     return {"OK": ("OK", "ok"), "FAIL": ("FAIL", "bad")}.get(v, ("n/a", "muted"))
 
-def detect_fabric(text):
+
+def classify(measured):
+    """Fabric verdict from the measured cross-rail evidence alone."""
+    rdma, ip = measured["rdma_cross"], measured["ip_cross"]
+    if rdma == "OK":
+        return ("FULL-MESH", "cross-rail RDMA works (all-to-all / EP supported)", "ok")
+    if rdma == "FAIL":
+        if ip[1] and ip[0] == 0:
+            return (
+                "RAIL-ONLY (IP + RDMA)",
+                "rails fully isolated; no cross-rail at any layer",
+                "bad",
+            )
+        return (
+            "RDMA RAIL-ONLY",
+            "IP routable cross-rail, but RDMA cross-rail fails",
+            "warn",
+        )
+    if ip[1]:
+        if ip[0] == 0:
+            return (
+                "IP RAIL-ONLY",
+                "cross-rail IP fails; RDMA cross-rail not measured",
+                "bad",
+            )
+        if ip[0] == ip[1]:
+            return (
+                "IP FULL-MESH",
+                "cross-rail IP works; RDMA cross-rail not measured",
+                "warn",
+            )
+    return ("UNDETERMINED", "see details", "warn")
+
+
+def detect_fabric(text, measured=None):
     # Prefer the explicit "Fabric classification:" heading so we don't get fooled by
-    # a comparison table that mentions every fabric type.
+    # a comparison table that mentions every fabric type. Absent that heading, the
+    # measurements decide — sniffing the whole document for "rdma" would call any
+    # run rail-only, including a full-mesh one.
     m = re.search(r"Fabric\s+class(?:ification)?:\s*(.+)", text, re.I)
-    scope = m.group(1).lower() if m else text.lower()
+    if not m:
+        if measured:
+            return classify(measured)
+        return ("UNDETERMINED", "see details", "warn")
+    scope = m.group(1).lower()
     if "full-mesh" in scope:
         return ("FULL-MESH", "cross-rail RDMA works (all-to-all / EP supported)", "ok")
     if "both" in scope or "100% loss" in scope:
-        return ("RAIL-ONLY (IP + RDMA)", "rails fully isolated; no cross-rail at any layer", "bad")
+        return (
+            "RAIL-ONLY (IP + RDMA)",
+            "rails fully isolated; no cross-rail at any layer",
+            "bad",
+        )
     if "rail-only" in scope or "rdma" in scope:
-        return ("RDMA RAIL-ONLY", "IP routable cross-rail, but RDMA cross-rail fails", "warn")
+        return (
+            "RDMA RAIL-ONLY",
+            "IP routable cross-rail, but RDMA cross-rail fails",
+            "warn",
+        )
     return ("UNDETERMINED", "see details", "warn")
+
 
 # ---------- minimal markdown -> HTML ----------
 def md_inline(s):
@@ -93,6 +201,7 @@ def md_inline(s):
     s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
     s = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", s)
     return s
+
 
 def md_to_html(md):
     out, i, lines = [], 0, md.splitlines()
@@ -102,7 +211,8 @@ def md_to_html(md):
             buf = []
             i += 1
             while i < len(lines) and not lines[i].startswith("```"):
-                buf.append(html.escape(lines[i])); i += 1
+                buf.append(html.escape(lines[i]))
+                i += 1
             i += 1
             out.append("<pre class='code'>" + "\n".join(buf) + "</pre>")
             continue
@@ -110,37 +220,55 @@ def md_to_html(md):
         if m:
             lvl = len(m.group(1))
             out.append(f"<h{lvl}>{md_inline(m.group(2))}</h{lvl}>")
-            i += 1; continue
+            i += 1
+            continue
         if ln.strip().startswith("|") and "|" in ln.strip()[1:]:
             tbl = []
             while i < len(lines) and lines[i].strip().startswith("|"):
-                tbl.append(lines[i]); i += 1
-            out.append(render_table(tbl)); continue
+                tbl.append(lines[i])
+                i += 1
+            out.append(render_table(tbl))
+            continue
         if re.match(r"^\s*[-*]\s+", ln):
             items = []
             while i < len(lines) and re.match(r"^\s*[-*]\s+", lines[i]):
-                items.append("<li>" + md_inline(re.sub(r"^\s*[-*]\s+", "", lines[i])) + "</li>")
+                items.append(
+                    "<li>" + md_inline(re.sub(r"^\s*[-*]\s+", "", lines[i])) + "</li>"
+                )
                 i += 1
-            out.append("<ul>" + "".join(items) + "</ul>"); continue
+            out.append("<ul>" + "".join(items) + "</ul>")
+            continue
         if ln.strip() == "":
-            i += 1; continue
+            i += 1
+            continue
         para = []
-        while i < len(lines) and lines[i].strip() != "" and not lines[i].startswith(("#", "|", "```")) \
-                and not re.match(r"^\s*[-*]\s+", lines[i]):
-            para.append(lines[i]); i += 1
+        while (
+            i < len(lines)
+            and lines[i].strip() != ""
+            and not lines[i].startswith(("#", "|", "```"))
+            and not re.match(r"^\s*[-*]\s+", lines[i])
+        ):
+            para.append(lines[i])
+            i += 1
         out.append("<p>" + md_inline(" ".join(para)) + "</p>")
     return "\n".join(out)
+
 
 def render_table(rows):
     def cells(r):
         return [c.strip() for c in r.strip().strip("|").split("|")]
+
     if len(rows) >= 2 and set(rows[1].replace("|", "").strip()) <= set("-: "):
         head, body = cells(rows[0]), rows[2:]
     else:
         head, body = cells(rows[0]), rows[1:]
     h = "".join(f"<th>{md_inline(c)}</th>" for c in head)
-    b = "".join("<tr>" + "".join(f"<td>{md_inline(c)}</td>" for c in cells(r)) + "</tr>" for r in body)
+    b = "".join(
+        "<tr>" + "".join(f"<td>{md_inline(c)}</td>" for c in cells(r)) + "</tr>"
+        for r in body
+    )
     return f"<table><thead><tr>{h}</tr></thead><tbody>{b}</tbody></table>"
+
 
 # ---------- styling ----------
 CSS = """
@@ -172,69 +300,178 @@ a{color:var(--accent)}
 td.ok{background:var(--okbg)}td.bad{background:var(--badbg)}td.warn{background:var(--warnbg)}
 """
 
+
 def page(title, body):
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{html.escape(title)}</title><style>{CSS}</style></head>
 <body><div class="wrap">{body}</div></body></html>"""
 
+
+def maybe_generate(folder):
+    """Render any missing diagrams. Never fatal — a report without pictures beats none."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    try:
+        import make_diagrams
+
+        make_diagrams.generate(folder)
+    except Exception as e:  # noqa: BLE001 - diagrams are a nice-to-have
+        print(f"warning: diagram generation skipped ({e})")
+
+
+def node_summary_html(probe_txt):
+    """Derive the per-node GPU/NIC table from the probe report."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    try:
+        import make_diagrams
+
+        p = make_diagrams.parse_probe(probe_txt)
+    except Exception:  # noqa: BLE001
+        return ""
+    if not p["pairs"]:
+        return ""
+    devs = {d["dev"]: d for d in p["devices"]}
+    gpu_pci = {g["idx"]: g["pci"] for g in p["gpus"]}
+    numas = sorted({devs.get(x["dev"], {}).get("numa", "?") for x in p["pairs"]})
+    gid = next((d["gid"] for d in p["devices"] if d["gid"] not in ("", "none")), "?")
+    rows = []
+    for x in p["pairs"]:
+        d = devs.get(x["dev"], {})
+        rows.append(
+            f"<tr><td>GPU{x['gpu']}</td><td><code>{html.escape(x['gpu_pci'])}</code></td>"
+            f"<td>{html.escape(x['dev'])}</td><td>{html.escape(d.get('ndev', ''))}</td>"
+            f"<td><code>{html.escape(x['dev_pci'])}</code></td>"
+            f"<td><code>{html.escape(d.get('ip', ''))}</code></td>"
+            f"<td>{html.escape(d.get('numa', '?'))}</td></tr>"
+        )
+    lead = (
+        f"{len(gpu_pci)} GPU : {len(p['rail_devs'])} rail NIC, 1:1 rail-local, "
+        f"split across NUMA {'/'.join(numas)}, RoCEv2 GID index {gid}"
+    )
+    if p["mgmt_ndev"]:
+        lead += f", mgmt <code>{html.escape(p['mgmt_ndev'])}</code> excluded"
+    return (
+        f"<h2>Node summary</h2><div class='card'><p>{lead}"
+        f" &mdash; set <code>NCCL_IB_GID_INDEX={html.escape(gid)}</code>.</p>"
+        "<table><thead><tr><th>GPU</th><th>GPU PCI</th><th>Rail NIC</th><th>netdev</th>"
+        "<th>NIC PCI</th><th>Rail addr</th><th>NUMA</th></tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table></div>"
+    )
+
+
+def dot_fallback_html(folder):
+    """For any .dot with no rendered .png, show the source and how to render it."""
+    blocks = []
+    for dot in sorted(glob.glob(os.path.join(folder, "*.dot"))):
+        if os.path.isfile(os.path.splitext(dot)[0] + ".png"):
+            continue
+        if os.path.basename(dot).endswith(".auto.dot"):
+            continue  # raw probe output, superseded by the generated diagram
+        name = os.path.basename(dot)
+        cmd = f"dot -Tpng {name} -o {os.path.splitext(name)[0]}.png"
+        blocks.append(
+            f"<details><summary>{html.escape(name)} (not rendered &mdash; graphviz "
+            f"<code>dot</code> unavailable)</summary>"
+            f"<p>Render it on a machine that has graphviz:</p>"
+            f"<pre class='code'>{html.escape(cmd)}</pre>"
+            f"<pre class='raw'>{html.escape(read(dot))}</pre></details>"
+        )
+    if not blocks:
+        return ""
+    return "<h2>Diagram sources</h2><div class='card'>" + "".join(blocks) + "</div>"
+
+
 # ---------- per-folder report ----------
-def build_report(folder, title=None):
+def build_report(folder, title=None, diagrams=True):
+    if diagrams:
+        maybe_generate(folder)
     md_path = find(folder, "topology_*.md") or find(folder, "*.md")
-    node_png = find(folder, "*node*.png", exclude="crossrail") or find(folder, "*node*.png")
+    # ".auto" is probe_topology.sh's raw graph; prefer make_diagrams.py's richer one.
+    node_png = find(folder, "*node*.png", exclude=("crossrail", ".auto.")) or find(
+        folder, "*node*.png", exclude="crossrail"
+    )
     xr_png = find(folder, "*crossrail*.png")
     result = find(folder, "*result*.txt")
     probe = find(folder, "topo_report*.txt")
 
     md = read(md_path)
     res_txt = read(result)
-    title = title or (re.search(r"^#\s+(.*)$", md, re.M).group(1) if re.search(r"^#\s+(.*)$", md, re.M) else os.path.basename(os.path.abspath(folder)))
-    gpu = detect_gpu(md)
-    fab, fab_desc, fab_cls = detect_fabric(md + "\n" + res_txt)
+    title = title or (
+        re.search(r"^#\s+(.*)$", md, re.M).group(1)
+        if re.search(r"^#\s+(.*)$", md, re.M)
+        else os.path.basename(os.path.abspath(folder))
+    )
+    gpu = detect_gpu(md + "\n" + read(probe))
+    fab, fab_desc, fab_cls = detect_fabric(
+        md, parse_result(res_txt) if res_txt.strip() else None
+    )
 
     b = []
     b.append(f"<h1>{html.escape(title)}</h1>")
-    b.append(f"""<div class="card"><div class="verdict">
+    b.append(
+        f"""<div class="card"><div class="verdict">
       <span class="chip {fab_cls}">Fabric: {html.escape(fab)}</span>
       <span class="chip warn" style="background:#eef2f8;color:#2f6fed">GPU: {html.escape(gpu)}</span>
-      <span class="sub">{html.escape(fab_desc)}</span></div></div>""")
+      <span class="sub">{html.escape(fab_desc)}</span></div></div>"""
+    )
 
     # verdict evidence table — both experiments, same-rail vs cross-rail
     if res_txt.strip():
         r = parse_result(res_txt)
+
         def td(pair_or_val, is_ip):
             txt, cls = ip_cell(pair_or_val) if is_ip else rdma_cell(pair_or_val)
             return f"<td class='{cls}'>{txt}</td>"
-        b.append(f"""<h2>Verdict — measured evidence</h2><div class="card">
+
+        b.append(
+            f"""<h2>Verdict — measured evidence</h2><div class="card">
           <table><thead><tr><th>Experiment</th><th>Same-rail</th><th>Cross-rail</th></tr></thead><tbody>
           <tr><td>IP reachability &mdash; ICMP <code>ping</code></td>{td(r['ip_same'],True)}{td(r['ip_cross'],True)}</tr>
           <tr><td>RDMA &mdash; <code>ibv_rc_pingpong</code> (RoCEv2)</td>{td(r['rdma_same'],False)}{td(r['rdma_cross'],False)}</tr>
           </tbody></table>
           <p class="sub">Fabric verdict: <strong>{html.escape(fab)}</strong> &mdash; {html.escape(fab_desc)}.
           Cross-rail must pass at the <em>RDMA</em> layer for all-to-all / expert-parallel to work;
-          IP (ping) passing alone is not sufficient.</p></div>""")
+          IP (ping) passing alone is not sufficient.</p></div>"""
+        )
 
     figs = []
     if node_png:
-        figs.append(f'<figure><img src="{img_data_uri(node_png)}"><figcaption>Single-node GPU &harr; rail NIC topology</figcaption></figure>')
+        figs.append(
+            f'<figure><img src="{img_data_uri(node_png)}"><figcaption>Single-node GPU &harr; rail NIC topology</figcaption></figure>'
+        )
     if xr_png:
-        figs.append(f'<figure><img src="{img_data_uri(xr_png)}"><figcaption>2-node cross-rail fabric</figcaption></figure>')
+        figs.append(
+            f'<figure><img src="{img_data_uri(xr_png)}"><figcaption>2-node cross-rail fabric</figcaption></figure>'
+        )
     if figs:
-        b.append("<h2>Diagrams</h2>" + "".join(f'<div class="card">{f}</div>' for f in figs))
+        b.append(
+            "<h2>Diagrams</h2>" + "".join(f'<div class="card">{f}</div>' for f in figs)
+        )
+    b.append(dot_fallback_html(folder))
+
+    b.append(node_summary_html(read(probe)))
 
     if md:
         b.append('<h2>Summary</h2><div class="card">' + md_to_html(md) + "</div>")
 
     raw = []
     if result:
-        raw.append(f"<details><summary>Cross-rail result ({html.escape(os.path.basename(result))})</summary><pre class='raw'>{html.escape(read(result))}</pre></details>")
+        raw.append(
+            f"<details><summary>Cross-rail result ({html.escape(os.path.basename(result))})</summary><pre class='raw'>{html.escape(read(result))}</pre></details>"
+        )
     if probe:
-        raw.append(f"<details><summary>Probe report ({html.escape(os.path.basename(probe))})</summary><pre class='raw'>{html.escape(read(probe))}</pre></details>")
+        raw.append(
+            f"<details><summary>Probe report ({html.escape(os.path.basename(probe))})</summary><pre class='raw'>{html.escape(read(probe))}</pre></details>"
+        )
     if raw:
         b.append("<h2>Raw data</h2><div class='card'>" + "".join(raw) + "</div>")
 
-    b.append('<div class="foot">Generated by cluster-rdma-topology <code>make_report.py</code> — self-contained (images embedded).</div>')
+    b.append(
+        '<div class="foot">Generated by cluster-rdma-topology <code>make_report.py</code> — self-contained (images embedded).</div>'
+    )
     return page(title, "\n".join(b))
+
 
 # ---------- combined index ----------
 def build_index(folders, out_dir):
@@ -245,28 +482,37 @@ def build_index(folders, out_dir):
         title = re.search(r"^#\s+(.*)$", md, re.M)
         title = title.group(1) if title else os.path.basename(os.path.abspath(folder))
         gpu = detect_gpu(md)
-        fab, fab_desc, cls = detect_fabric(md + "\n" + res_txt)
         r = parse_result(res_txt)
+        fab, fab_desc, cls = detect_fabric(md, r if res_txt.strip() else None)
         ic_txt, ic_cls = ip_cell(r["ip_cross"])
         rc_txt, rc_cls = rdma_cell(r["rdma_cross"])
         xr = find(folder, "*crossrail*.png")
         rel = os.path.relpath(os.path.join(folder, "report.html"), out_dir)
-        rows.append(f"<tr><td><a href='{html.escape(rel)}'>{html.escape(title)}</a></td><td>{html.escape(gpu)}</td>"
-                    f"<td><span class='chip {cls}'>{html.escape(fab)}</span></td>"
-                    f"<td class='{ic_cls}'>{ic_txt}</td><td class='{rc_cls}'>{rc_txt}</td></tr>")
+        rows.append(
+            f"<tr><td><a href='{html.escape(rel)}'>{html.escape(title)}</a></td><td>{html.escape(gpu)}</td>"
+            f"<td><span class='chip {cls}'>{html.escape(fab)}</span></td>"
+            f"<td class='{ic_cls}'>{ic_txt}</td><td class='{rc_cls}'>{rc_txt}</td></tr>"
+        )
         img = f'<img src="{img_data_uri(xr)}">' if xr else ""
-        cards.append(f"<div class='card'><h3><a href='{html.escape(rel)}'>{html.escape(title)}</a></h3>"
-                     f"<div class='verdict'><span class='chip {cls}'>{html.escape(fab)}</span>"
-                     f"<span class='sub'>{html.escape(gpu)} &mdash; {html.escape(fab_desc)}</span></div><figure>{img}</figure></div>")
-    body = ["<h1>Cluster RDMA / GPU Topology — Comparison</h1>",
-            "<div class='card'><table><thead><tr><th>Cluster</th><th>GPU</th><th>Fabric verdict</th>"
-            "<th>Cross-rail IP (ping)</th><th>Cross-rail RDMA</th></tr></thead><tbody>"
-            + "".join(rows) + "</tbody></table>"
-            "<p class='sub'>Green = works, red = fails. A fabric supports all-to-all / expert-parallel"
-            " only when <strong>cross-rail RDMA</strong> is green.</p></div>",
-            "<h2>Clusters</h2>", "<div class='grid'>" + "".join(cards) + "</div>",
-            '<div class="foot">Generated by cluster-rdma-topology <code>make_report.py --index</code>.</div>']
+        cards.append(
+            f"<div class='card'><h3><a href='{html.escape(rel)}'>{html.escape(title)}</a></h3>"
+            f"<div class='verdict'><span class='chip {cls}'>{html.escape(fab)}</span>"
+            f"<span class='sub'>{html.escape(gpu)} &mdash; {html.escape(fab_desc)}</span></div><figure>{img}</figure></div>"
+        )
+    body = [
+        "<h1>Cluster RDMA / GPU Topology — Comparison</h1>",
+        "<div class='card'><table><thead><tr><th>Cluster</th><th>GPU</th><th>Fabric verdict</th>"
+        "<th>Cross-rail IP (ping)</th><th>Cross-rail RDMA</th></tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table>"
+        "<p class='sub'>Green = works, red = fails. A fabric supports all-to-all / expert-parallel"
+        " only when <strong>cross-rail RDMA</strong> is green.</p></div>",
+        "<h2>Clusters</h2>",
+        "<div class='grid'>" + "".join(cards) + "</div>",
+        '<div class="foot">Generated by cluster-rdma-topology <code>make_report.py --index</code>.</div>',
+    ]
     return page("Cluster Topology Comparison", "\n".join(body))
+
 
 # ---------- cli ----------
 def main():
@@ -275,16 +521,27 @@ def main():
     ap.add_argument("--title")
     ap.add_argument("--out", default="report.html")
     ap.add_argument("--index", metavar="INDEX_HTML")
+    ap.add_argument(
+        "--no-diagrams",
+        action="store_true",
+        help="do not generate missing diagrams via make_diagrams.py",
+    )
     a = ap.parse_args()
     if a.index:
+        if not a.no_diagrams:
+            for f in a.paths:
+                maybe_generate(f)
         out_dir = os.path.dirname(os.path.abspath(a.index)) or "."
         open(a.index, "w", encoding="utf-8").write(build_index(a.paths, out_dir))
         print("wrote", a.index)
     else:
         folder = a.paths[0]
         out = a.out if os.path.isabs(a.out) else os.path.join(folder, a.out)
-        open(out, "w", encoding="utf-8").write(build_report(folder, a.title))
+        open(out, "w", encoding="utf-8").write(
+            build_report(folder, a.title, diagrams=not a.no_diagrams)
+        )
         print("wrote", out)
+
 
 if __name__ == "__main__":
     main()
