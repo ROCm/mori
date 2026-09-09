@@ -467,8 +467,12 @@ class PoolClient {
   //
   // `tag` is the caller's key index; a failure comes back through
   // Transfer's failed_tags so one bad object does not fail the batch.
-  bool BuildRangesToContiguousItems(const std::vector<ObjectRange>& ranges, void* dst,
-                                    size_t object_size, size_t tag,
+  // `dst` is a REF plus a base offset rather than a raw pointer so the arena
+  // caller can name the whole registered arena once instead of one ref per
+  // slice; see BuildContiguousToRangesItems for what that costs when it does
+  // not happen.
+  bool BuildRangesToContiguousItems(const std::vector<ObjectRange>& ranges, const TransferRef& dst,
+                                    uint64_t dst_base, size_t object_size, size_t tag,
                                     std::vector<TransferItem>* items);
   bool BuildContiguousToRangesItems(const TransferRef& src, uint64_t src_base, size_t object_size,
                                     const std::vector<ObjectRange>& ranges, size_t tag,
