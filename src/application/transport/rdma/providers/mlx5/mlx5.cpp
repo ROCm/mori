@@ -128,22 +128,22 @@ mlx5dv_devx_umem* Mlx5RegisterControlUmem(ibv_context* context, void* addr, size
             reinterpret_cast<uintptr_t>(addr), size, dmabufOffset);
         return umem;
       }
-      MORI_APP_WARN("MLX5 control umem [{}] dmabuf registration failed (addr=0x{:x}, size={})", what,
-                    reinterpret_cast<uintptr_t>(addr), size);
+      MORI_APP_WARN("MLX5 control umem [{}] dmabuf registration failed (addr=0x{:x}, size={})",
+                    what, reinterpret_cast<uintptr_t>(addr), size);
     } else {
       MORI_APP_WARN("MLX5 control umem [{}] dmabuf export unavailable (addr=0x{:x}, size={})", what,
                     reinterpret_cast<uintptr_t>(addr), size);
     }
     if (mode == ControlDmabufMode::kForce) {
-      MORI_APP_ERROR("MLX5 control umem [{}] dmabuf required (MORI_MLX5_CONTROL_DMABUF=force) but "
-                     "unavailable; aborting",
-                     what);
+      MORI_APP_ERROR(
+          "MLX5 control umem [{}] dmabuf required (MORI_MLX5_CONTROL_DMABUF=force) but "
+          "unavailable; aborting",
+          what);
       std::abort();
     }
   }
 
-  mlx5dv_devx_umem* umem =
-      Mlx5DvApi::Instance().devx_umem_reg(context, addr, size, accessFlag);
+  mlx5dv_devx_umem* umem = Mlx5DvApi::Instance().devx_umem_reg(context, addr, size, accessFlag);
   MORI_APP_TRACE("MLX5 control umem [{}] registered via peermem: addr=0x{:x}, size={}", what,
                  reinterpret_cast<uintptr_t>(addr), size);
   return umem;
@@ -368,7 +368,8 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
   }
 
   if (config.onGpu) {
-    qpUmem = Mlx5RegisterControlUmem(context, qpUmemAddr, qpTotalSize, IBV_ACCESS_LOCAL_WRITE, "wq");
+    qpUmem =
+        Mlx5RegisterControlUmem(context, qpUmemAddr, qpTotalSize, IBV_ACCESS_LOCAL_WRITE, "wq");
   } else {
     qpUmem = Mlx5DvApi::Instance().devx_umem_reg(context, qpUmemAddr, qpTotalSize,
                                                  IBV_ACCESS_LOCAL_WRITE);
