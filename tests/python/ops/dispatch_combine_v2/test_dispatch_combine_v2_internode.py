@@ -106,6 +106,7 @@ leaves both unaligned is not bounded in either direction.
 """
 
 import argparse
+import ctypes
 import os
 import sys
 import time
@@ -152,6 +153,13 @@ class Dist:
         t = torch.tensor([value], dtype=torch.int64)
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
         return int(t.item())
+
+    def all_gather_rows(self, row):
+        """(world, len(row)) float64 from each rank's `row`. gloo, so CPU."""
+        t = torch.tensor(row, dtype=torch.float64)
+        out = [torch.zeros_like(t) for _ in range(self.world)]
+        dist.all_gather(out, t)
+        return torch.stack(out)
 
     def allreduce_minmax(self, lo, hi):
         """Extremes across ranks, for the same best/worst the v1 harness prints."""
@@ -247,6 +255,10 @@ def _parse_args(argv):
     # which is the question when the host is running ahead -- and adds nothing
     # cross-rank.
     p.add_argument("--per-round-drain", action="store_true")
+    p.add_argument("--no-bench-tables", action="store_true")
+    p.add_argument("--pre-barriers", type=int, default=1)
+    p.add_argument("--pre-sleep-ms", type=float, default=0.0)
+    p.add_argument("--barrier-kind", default="cco", choices=["cco", "gloo", "both"])
     # Re-align the ranks every N rounds. The slow regime is a stable inter-node
     # phase offset, and a rendezvous does not remove one -- this asks whether an
     # explicit re-alignment escapes the offset fixed point or whether the loop
@@ -403,6 +415,184 @@ def _report_loop_alignment(a, rank):
         )
 
 
+def _geom_for_report(op, cfg, a):
+    """The (block, rdma, warp) each phase actually launched with, for the table
+    titles -- the point v1's `_launch_params_str` makes: a table that does not
+    name its launch config cannot be matched back to the run that produced it.
+    Read from the backend rather than from the config, because on the internode
+    path cfg.dispatch_block_num is a dict key and not a grid."""
+    try:
+        # EpDispatchCombineOpHip IS the backend -- it subclasses the op.
+        return (
+            tuple(op._internode_geom_for("dispatch", a.max_tokens)),
+            tuple(op._internode_geom_for("combine", a.max_tokens)),
+        )
+    except Exception:
+        from mori.ops.dispatch_combine_v2.internode_tuning_configs import lookup
+
+        t = lookup(
+            cfg.world_size, cfg.hidden_dim, cfg.num_experts_per_token, a.max_tokens
+        )
+        if t:
+            return tuple(t["dispatch"]), tuple(t["combine"])
+        return (0, 0, 0), (0, 0, 0)
+
+
+def _rdma_algo_token_count(idx, cfg, ll):
+    """(token, destination-node) pairs this rank emits, DeepEP's definition and
+    the numerator of the RDMA bandwidth column.
+
+    Reimplemented rather than imported: this file keeps zero coupling to the v1
+    harness, which is what lets the two be compared without one dragging the
+    other's op in. The formula is v1's `compute_rdma_algo_token_count`.
+
+    The LL kernel does not deduplicate across expert slots, so every token
+    contributes one entry per node unconditionally.
+    """
+    nodes = cfg.world_size // cfg.gpu_per_node
+    if ll:
+        return idx.shape[0] * nodes
+    per_node = cfg.num_experts_per_rank * cfg.gpu_per_node
+    seen = torch.zeros(idx.shape[0], nodes, dtype=torch.bool, device=idx.device)
+    seen.scatter_((idx // per_node).long().clamp_(0, nodes - 1), 1, True)
+    return int(seen.sum().item())
+
+
+def _phase_stats(col):
+    """(worst, best, avg) over a (rounds, ranks) tensor, as v1's _compute_stats:
+    worst/best are extremes over individual samples, avg is the grand mean."""
+    return col.min().item(), col.max().item(), col.mean(dim=1).mean().item()
+
+
+def _print_phase_table(title, rdma, xgmi, ll, lat):
+    from prettytable import PrettyTable
+
+    t = PrettyTable()
+    t.title = title
+    t.field_names = [
+        "Metrics",
+        "RDMA Bandwidth (GB/s)",
+        "XGMI Bandwidth (GB/s)",
+        "LL Bandwidth (GB/s)",
+        "Latency (us)",
+    ]
+    r = lambda v: round(v, 2)
+    # Bandwidth "Best" is the MAX and latency "Best" is the MIN, so the two
+    # columns index the same tuple from opposite ends. v1 does this too; it is
+    # the reason Best/Worst are not simply [1]/[0] throughout.
+    t.add_rows(
+        [
+            ["Best", r(rdma[1]), r(xgmi[1]), r(ll[1]), r(lat[0])],
+            ["Worst", r(rdma[0]), r(xgmi[0]), r(ll[0]), r(lat[1])],
+            ["Average", r(rdma[2]), r(xgmi[2]), r(ll[2]), r(lat[2])],
+        ]
+    )
+    print(t, flush=True)
+
+
+def _report_tables(d, cfg, a, disp, comb, total_recv, idx, ll, geom):
+    """v1's bench output: a per-round dump and the two performance tables.
+
+    Every rank computes its OWN bandwidths from its own byte counts and the
+    numbers are then gathered, which is what v1 does -- gathering durations and
+    applying one rank's byte count to all of them would be wrong the moment the
+    routing is not perfectly balanced.
+    """
+    ct = a.max_tokens
+    d_elem = torch.tensor([], dtype=cfg.dispatch_dtype).element_size()
+    c_elem = torch.tensor([], dtype=cfg.combine_dtype).element_size()
+    d_bytes = total_recv * cfg.hidden_dim * d_elem
+    c_bytes = total_recv * cfg.hidden_dim * c_elem
+    rdma_tok = _rdma_algo_token_count(idx, cfg, ll)
+    d_rdma_bytes = rdma_tok * cfg.hidden_dim * d_elem
+    c_rdma_bytes = rdma_tok * cfg.hidden_dim * c_elem
+    # LL packs a fixed slot per (token, expert) rather than only what routed, so
+    # its wire bytes exceed the payload by this factor. v1 scales the XGMI
+    # column by it to get the LL column.
+    ll_scale = ct * cfg.num_experts_per_token / (total_recv + 1)
+
+    # bw in GB/s from a duration in MICROseconds: bytes/1e9 / (us/1e6).
+    bw = lambda b, us: b / (1000.0 * us) if us > 0 else 0.0
+    row = []
+    for dv, cv in zip(disp, comb):
+        row += [
+            bw(d_rdma_bytes, dv),
+            bw(d_bytes, dv),
+            dv,
+            bw(c_rdma_bytes, cv),
+            bw(c_bytes, cv),
+            cv,
+        ]
+    g = d.all_gather_rows(row).reshape(d.world, len(disp), 6).permute(1, 0, 2)
+    if d.rank != 0:
+        return
+
+    for i in range(g.shape[0]):
+        rd = g[i]
+        print(f"Round {i}", flush=True)
+        for phase, cols in (
+            (
+                "dispatch",
+                (
+                    ("duration", 2, "us"),
+                    ("rdma bandwidth", 0, "GB/s"),
+                    ("bandwidth", 1, "GB/s"),
+                ),
+            ),
+            (
+                "combine",
+                (
+                    ("duration", 5, "us"),
+                    ("rdma bandwidth", 3, "GB/s"),
+                    ("bandwidth", 4, "GB/s"),
+                ),
+            ),
+        ):
+            for name, c, unit in cols:
+                vals = [round(v, 2) for v in rd[:, c].tolist()]
+                print(
+                    f"  {phase} {name} {vals} avg {rd[:, c].mean():.2f} {unit}",
+                    flush=True,
+                )
+
+    # Config header immediately above the tables. The `# BENCH` one-liner is
+    # printed before the per-round dump, which at 30 rounds is 180 lines earlier
+    # -- by the time the tables are on screen it has scrolled away, and a table
+    # whose configuration you have to scroll to find is a table you will
+    # eventually misattribute.
+    nodes = cfg.world_size // cfg.gpu_per_node
+    print(
+        f"\n# CONFIG tok={ct} dtype={str(cfg.dispatch_dtype).split('.')[-1]}"
+        f"->{str(cfg.combine_dtype).split('.')[-1]} hidden={cfg.hidden_dim} "
+        f"topk={cfg.num_experts_per_token} kernel={'v1_ll' if ll else 'v1'} "
+        f"world={cfg.world_size} nodes={nodes}x{cfg.gpu_per_node} "
+        f"experts/rank={cfg.num_experts_per_rank} scale_dim={cfg.scale_dim} "
+        f"qp={cfg.num_qp_per_pe}",
+        flush=True,
+    )
+    print(
+        f"# CONFIG dispatch block/rdma/warp={geom[0]}  combine={geom[1]}  "
+        f"rounds={a.rounds} warmup={a.warmup}  "
+        f"recv_tokens={total_recv} rdma_algo_tokens={rdma_tok}",
+        flush=True,
+    )
+
+    for name, (cr, cx, cl), dt, gm, elem in (
+        ("Dispatch", (0, 1, 2), cfg.dispatch_dtype, geom[0], d_elem),
+        ("Combine", (3, 4, 5), cfg.combine_dtype, geom[1], c_elem),
+    ):
+        xg = _phase_stats(g[:, :, cx])
+        _print_phase_table(
+            f"{name} Performance ({str(dt).split('.')[-1]}) "
+            f"block={gm[0]} warp={gm[2]} rdma={gm[1]} "
+            f"~{ct * cfg.hidden_dim * elem / (1024 ** 2):.1f} MB/rank",
+            _phase_stats(g[:, :, cr]),
+            xg,
+            tuple(v * ll_scale for v in xg),
+            _phase_stats(g[:, :, cl]),
+        )
+
+
 def _bench(op, cfg, d, dev, a, comm):
     """Per-phase latency, structured to match ``run_bench_once`` in
     ``examples/ops/dispatch_combine/test_dispatch_combine_internode.py``.
@@ -466,12 +656,48 @@ def _bench(op, cfg, d, dev, a, comm):
     n = a.rounds
     ev = [torch.cuda.Event(enable_timing=True) for _ in range(3 * n + 1)]
 
-    for _ in range(a.warmup):
+    total_recv = 0
+    for i in range(a.warmup):
         r = op.dispatch(inp, wts, sc, idx, return_routing=True)
+        if i == a.warmup - 1:
+            # Read it here, not in the timed loop: .item() synchronises.
+            torch.cuda.synchronize()
+            total_recv = int(r[4][0].item())
         op.combine(convert(r[0]), cw, routing=r[5])
     torch.cuda.synchronize()
     comm.barrier()
 
+    # Barrier-skew probe. comm.barrier() is ccoBarrierAll, a CPU-side collective
+    # over the bootstrap sockets, and dist.barrier() is gloo -- same family, both
+    # tree/ring shaped, so neither releases its ranks at one instant. Timestamp
+    # after EACH of N barriers so the question "is the first one just ragged, or
+    # is every one ragged" has an answer instead of a guess.
+    _bt = []
+    for _k in range(max(1, a.pre_barriers)):
+        if a.barrier_kind in ("cco", "both"):
+            comm.barrier()
+        if a.barrier_kind in ("gloo", "both"):
+            dist.barrier()
+        _bt.append(time.time())
+    # The control for the barrier-count effect: idle for the same wall time
+    # instead of barriering. If sleeping reproduces the benefit then what helps
+    # is elapsed time, not the collective.
+    if a.pre_sleep_ms:
+        time.sleep(a.pre_sleep_ms / 1000.0)
+        _bt.append(time.time())
+
+    # KEEP THE BARRIER. The first one to three TIMED rounds run 4-5x slow even
+    # though 20 warmup rounds precede them, and the obvious reading -- that the
+    # barrier releases all 16 ranks at one instant and the first rounds are a
+    # maximally synchronised start -- is WRONG. Tested by inserting un-timed,
+    # un-barriered rounds between the barrier and the loop: they do remove the
+    # opening spike (first rounds 42/45/43 instead of 67/38/41), and in three of
+    # four pairs the whole run then sat in the slow regime, 128-134us total
+    # against 89-91. The barrier is what keeps the ranks aligned; extra rounds
+    # after it let the inter-node phase offset re-establish before timing starts.
+    # So the opening rounds are the settling cost of alignment, and warmup cannot
+    # remove them because warmup happens BEFORE the barrier. Drop them from the
+    # statistics (--drop-rounds) rather than trying to warm them away.
     # Causal probe for host pacing, opt-in: busy-wait known host microseconds
     # before the combine enqueue, no GPU work. The slope of measured-combine
     # against injected microseconds is the answer (measured ~1.0 beyond ~30us of
@@ -493,6 +719,19 @@ def _bench(op, cfg, d, dev, a, comm):
         op.dbg_round = dict.fromkeys(op.dbg_round, 0)
 
     _series = bool(os.environ.get("MORI_EP_ROUND_SERIES"))
+
+    # Which physical CPU this rank is actually ON, sampled around the loop.
+    # sched_getaffinity only gives the ALLOWED set, and after the NUMA bind that
+    # is 192 CPUs shared by four ranks -- so it cannot answer whether two ranks
+    # landed on the two SMT siblings of one core, which is the mechanism that
+    # produced the 2x host-loop time earlier. sched_getcpu can.
+    def _cpu():
+        try:
+            return int(ctypes.CDLL("libc.so.6", use_errno=True).sched_getcpu())
+        except Exception:
+            return -1
+
+    _cpu0 = _cpu()
 
     # Caching-allocator segments, opt-in. A cudaMalloc inside the timed loop
     # blocks the host for ~100us and lands on every rank in the same round (the
@@ -777,6 +1016,8 @@ def _bench(op, cfg, d, dev, a, comm):
             "# loop r%d t0=%.4f t1=%.4f" % (d.rank, _ep0, time.time()),
             flush=True,
         )
+        print("# barr r%d: " % d.rank + " ".join("%.6f" % x for x in _bt), flush=True)
+        print("# cpu  r%d: %d %d" % (d.rank, _cpu0, _cpu()), flush=True)
         hwal = [(tr[i + 1] - tr[i]) * 1e6 for i in range(n)][keep]
         print(
             "# rounds r%d hwal: " % d.rank + " ".join("%.0f" % x for x in hwal),
@@ -807,6 +1048,14 @@ def _bench(op, cfg, d, dev, a, comm):
             f"total={dm + cm:.1f}us [conv={vm:.1f}us wall={wall:.1f}us]",
             flush=True,
         )
+
+    # v1's bench output on top of ours: the per-round dump and the two
+    # performance tables. Off with --no-bench-tables; it costs one all_gather
+    # after the timed loop and nothing inside it.
+    if not a.no_bench_tables:
+        ll = bool(getattr(op, "_internode_force_ll", a.max_tokens <= 2048))
+        geom = _geom_for_report(op, cfg, a)
+        _report_tables(d, cfg, a, disp, comb, total_recv, idx, ll, geom)
     return 0
 
 
