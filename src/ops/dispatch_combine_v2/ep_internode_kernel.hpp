@@ -292,7 +292,7 @@ __device__ __forceinline__ int32_t EpInterNodeWaitGt(int32_t* addr, int32_t val)
 // shader clock has been observed to vary by several percent, so a shader-clock
 // timer cannot tell "waited longer" from "clocked lower". wall_clock64 is the
 // fixed reference counter; measured on this gfx942 rig at 100.008 MHz.
-constexpr int kEpDbgTsSlots = 16;
+constexpr int kEpDbgTsSlots = 24;
 
 __device__ __forceinline__ void EpDbgTs(const EpDispatchCombineArgs& args, int slot) {
   if (args.dbgTsBuf == nullptr) return;
@@ -1764,9 +1764,15 @@ __device__ void EpCombineAll_body(EpDispatchCombineArgs args) {
     const size_t fp8CombXferBytes =
         (args.weightsBuf == nullptr) ? fp8HiddenBytes : fp8HiddenBytes + weightBytes;
     combine_all_impl::EpCombineAllInternalFp8<kConfig, T>(args, fp8HiddenBytes, fp8CombXferBytes);
+    // Slot 14 marks the end of the LAST pass of the combine phase, on both
+    // exits. Paired with slot 12 of the NEXT round's dispatch it gives the true
+    // GPU-timeline gap between the two phases -- the quantity that the phase
+    // events cannot separate from host time.
+    if ((blockId == 0) && (thdId == 0)) EpDbgTs(args, 14);
     return;
   }
   combine_all_impl::EpCombineAllGeneric<kConfig, T>(args);
+  if ((blockId == 0) && (thdId == 0)) EpDbgTs(args, 14);
 }
 
 template <EpInterNodeKernelCfg kConfig, typename T>
@@ -1785,12 +1791,22 @@ __device__ void EpCombineInterNodeV1KernelLowLatency_body(EpDispatchCombineArgs 
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpCombineSync_body(EpDispatchCombineArgs args) {
   DEF_COMMON_VARS;
+  // 18/19 bracket combinesync, the FIRST pass of the combine phase. With 7->18
+  // this splits pre_bar into "everything between the two mori calls" -- the
+  // torch convert and the launch path -- and the kernel itself.
+  if ((blockId == 0) && (thdId == 0)) EpDbgTs(args, 18);
   internode::CombineSync<kConfig, T>(args);
+  if ((blockId == 0) && (thdId == 0)) EpDbgTs(args, 19);
 }
 
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpCombineSyncBarrier_body(EpDispatchCombineArgs args) {
   DEF_COMMON_VARS;
+  // 16/17 bracket the cross-device barrier that OPENS the combine phase. It
+  // sits between dispatch_ll ending and combine_ll starting, so the phase
+  // events charge it to neither -- and the closed per-round accounting put both
+  // the largest term and the whole regime delta in exactly that window.
+  if ((blockId == 0) && (thdId == 0)) EpDbgTs(args, 16);
   IF_ENABLE_PROFILER(
       INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SPAN(profiler, Slot::EpCombineSyncBarrier);
@@ -1808,6 +1824,7 @@ __device__ void EpCombineSyncBarrier_body(EpDispatchCombineArgs args) {
     while (core::AtomicLoadRelaxedSystem(localBarrierPtr + destPe) != barrierFlag) {
     }
   }
+  if ((blockId == 0) && (thdId == 0)) EpDbgTs(args, 17);
 }
 
 }  // namespace v2

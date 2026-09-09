@@ -550,10 +550,18 @@ def _bench(op, cfg, d, dev, a, comm):
         # wrong unit is visible rather than silently scaling every number.
         khz = mori_cpp.get_cur_device_wall_clock_freq_mhz()
         # Rows are launch-indexed, so the same drop the phase series uses.
-        ts = _ts.view(-1, 16)[a.drop_rounds : n].cpu().to(torch.float64)
+        ts = _ts.view(-1, 24)[a.drop_rounds : n].cpu().to(torch.float64)
 
         def _us(b, e):
             return ((ts[:, e] - ts[:, b]) * 1e3 / khz).tolist()
+
+        # GPU-timeline gap between the previous round's LAST combine kernel and
+        # this round's FIRST dispatch kernel. Both are wall_clock64 on the same
+        # device, so this is the real inter-phase idle -- the thing the CUDA
+        # event window folds together with host time. Row 0 has no predecessor.
+        interphase = [float("nan")] + [
+            (ts[j, 12] - ts[j - 1, 14]) * 1e3 / khz for j in range(1, ts.shape[0])
+        ]
 
         pfx = "# DEVTS r%d" % d.rank
         if d.rank == 0:
@@ -564,6 +572,14 @@ def _bench(op, cfg, d, dev, a, comm):
             # not the kernel: they are stamped by different warps, and anything
             # the phase spends outside this span belongs to another block, to
             # copystaging, or to the host.
+            # The whole GPU span of the dispatch phase, and the gap BETWEEN its
+            # two kernels. Both endpoints are wall_clock64 on the same device in
+            # the same row, so their difference is meaningful even though CUDA
+            # event times and wall_clock64 do not share an origin. `disp -
+            # d_gpu` is then what is left outside the kernels entirely: the host
+            # enqueue and the two phase boundaries.
+            ("d_gpu", _us(12, 7)),
+            ("d_k2k", _us(13, 0)),  # copystaging end -> dispatch_ll start
             ("d_stag", _us(12, 13)),  # the copystaging kernel itself
             ("d_kern", _us(0, 7)),
             ("d_head", _us(0, 1)),  # kernel entry -> first post
@@ -574,6 +590,15 @@ def _bench(op, cfg, d, dev, a, comm):
             ("d_sync", _us(6, 7)),  # DispatchSync grid barrier
             ("c_post", _us(8, 9)),  # combine entry -> put
             ("c_spin", _us(10, 11)),  # combine cross-node barrier wait
+            ("d2sync", _us(7, 18)),  # dispatch end -> combinesync start
+            ("cs_sync", _us(18, 19)),  # the combinesync kernel
+            ("sync2bar", _us(19, 16)),  # combinesync end -> barrier start
+            ("cs_bar", _us(16, 17)),  # the cross-device barrier itself
+            ("pre_bar", _us(7, 16)),  # dispatch end -> barrier start (holds conv)
+            ("post_bar", _us(17, 8)),  # barrier end -> combine_ll start
+            ("c_gpu", _us(8, 14)),  # combine's whole GPU span
+            ("gap_dc", _us(7, 8)),  # dispatch end -> combine start (holds conv)
+            ("gap_cd", interphase),  # combine end -> next dispatch start (GPU)
         ):
             print("%s %s: " % (pfx, nm) + " ".join("%.1f" % x for x in v), flush=True)
     # Which PASS owns the slow round. The marks are (name, event) in launch

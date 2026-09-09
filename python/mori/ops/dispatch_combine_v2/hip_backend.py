@@ -106,7 +106,7 @@ _TRACE_ARGS = bool(os.environ.get("MORI_INTERNODE_TRACE_ARGS"))
 # supplies the row index; that is only correct because dispatch and combine are
 # each called exactly once per round.
 _DEV_TS = bool(os.environ.get("MORI_EP_DEV_TS"))
-_TS_SLOTS = 16  # must equal kEpDbgTsSlots in ep_internode_kernel.hpp
+_TS_SLOTS = 24  # must equal kEpDbgTsSlots in ep_internode_kernel.hpp
 _TS_ROUNDS = 4096
 
 

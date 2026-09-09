@@ -244,6 +244,73 @@ So the send/recv question is answered, and the answer is neither: it is not the
 local GPU->NIC post (`d_post` flat) and not waiting for the peer's write
 (`d_spin` flat). Nothing inside either kernel moves.
 
+THE ANSWER: A STABLE INTER-NODE PHASE OFFSET
+--------------------------------------------
+The slow regime is not slower work. It is the two nodes running a fixed number
+of microseconds out of phase, with the cross-node rendezvous converting that
+offset into wait time, every round, forever.
+
+Closed per-round GPU accounting (all spans from wall_clock64, and the four terms
+sum to the CUDA-event round to within 1us -- 94.2 against 94.0, 107.2 against
+106.5, so nothing is unaccounted):
+
+    d_gpu    dispatch's two kernels            22-26us
+    d2sync   dispatch end -> combinesync       25-35us  (holds the torch convert)
+    cs_sync  combinesync kernel                   2.3us  flat always
+    cs_bar   cross-device barrier              see below
+    c_gpu    combine_ll + combineall           29-34us
+    gap_cd   combine end -> next dispatch         4.2us  flat always
+
+Per node, median over rounds, four runs of the same binary:
+
+    run     total   n0 c_spin  n0 cs_bar   n1 c_spin  n1 cs_bar
+    rep1    135.6      31.9        5.3         0.4       39.7
+    rep2    104.0       0.4       11.9        11.9        6.2
+    rep3     96.6       2.3        5.8         5.5        6.3
+    rep4     90.8       4.2        6.4         3.8        6.7
+
+`c_spin` is combine_ll's cross-node wait; `cs_bar` is the cross-device barrier
+that opens the combine phase. Read the table as a phase offset:
+
+- rep1: node 0 is ~35us BEHIND. It pays the offset inside `c_spin` (31.9us,
+  and all eight of its ranks read 31-37us); node 1 pays it one rendezvous later
+  at `cs_bar` (39.7us, all eight ranks). Two waits, opposite sides of the round,
+  same offset.
+- rep2 is the MIRROR IMAGE at smaller magnitude -- node 1 behind by ~12us, so
+  node 1 waits in `c_spin` and node 0 waits in `cs_bar`. The sign flips.
+- rep3 and rep4 are aligned: every wait is 2-7us.
+- The total tracks the offset: 90.8 aligned, 104.0 at ~12us, 135.6 at ~35us.
+
+Everything else is flat across all four: `d_post`, `c_post`, `cs_sync`,
+`gap_cd`, `post_bar`, and both hosts (hwal 75us, hdis 16us, hcom 25-27us on BOTH
+nodes in BOTH regimes). No kernel does more work in the slow regime. The host is
+not the pacer and is not asymmetric.
+
+Why it is bistable and why it never recovers: a rendezvous makes everyone wait
+for the last arrival, which PRESERVES an offset rather than removing it. Aligned
+and offset are both fixed points of the round loop. Which one a run falls into is
+decided in the first handful of rounds and then locked -- exactly the step seen
+in the per-round series.
+
+That also explains the rest of the file: both #625 and this branch step on the
+same runs because both run the same rendezvous structure, and nothing in the
+fabric, the clocks, the allocator, PCIe or PFC has to move for the offset to
+exist.
+
+Two mechanisms, not one. The whole-run REGIME is the offset above. The isolated
+single-round SPIKES are something else: they land in `d2sync`, the window between
+the two mori calls that holds the torch convert and the launch path (+44.9,
++17.1, +51.1 on spiked rounds), with `hdis` moving in step on some runs and not
+others. The convert kernel itself is flat at 9us.
+
+WHAT WOULD ACTUALLY HELP
+------------------------
+Not geometry tuning: no kernel is slower, so no schedule can win the time back.
+The lever is the number of serialised cross-node rendezvous per round. There are
+at least two (`combine_ll`'s `c_spin` and `combinesyncbarrier`), and each one
+converts the standing offset into wait time again. Removing one, or making one of
+them absorb skew instead of preserving it, is what changes the fixed point.
+
 NEXT
 ----
 Everything outside the GPU has been eliminated, and the per-pass split puts the
