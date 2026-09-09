@@ -165,6 +165,11 @@ __device__ void OneShotAllGatherSdmaAsyncWaitKernel_body(
   }
   __syncthreads();
 
+  // SYSTEM-scope loads, a seq-cst acquire on exit and a tail system fence, as
+  // OneShotAllGatherSdmaKernel_body already does: the flags are written by a
+  // peer GPU's SDMA engine, so a device-scope load does not order the payload
+  // behind them. Callers passing finish_async_wait(capturing=true) have no
+  // host sync left to establish that visibility for the consumer kernel.
   for (int sender = 0; sender < npes; ++sender) {
     if (sender == myPe) {
       continue;
@@ -173,16 +178,19 @@ __device__ void OneShotAllGatherSdmaAsyncWaitKernel_body(
     if (threadLinearId == 0) {
       int spinCount = 0;
       bool warned = false;
-      while (core::AtomicLoadRelaxed(flags + sender) < flagVal) {
+      while (core::AtomicLoadRelaxedSystem(flags + sender) < flagVal) {
         ++spinCount;
         if (!warned && spinCount > 10000000) {
           printf("PE %d: Slow wait for data from peer %d (still waiting)\n", myPe, sender);
           warned = true;
         }
       }
+      (void)core::AtomicLoadSeqCstSystem(flags + sender);
     }
     __syncthreads();
   }
+  if (threadLinearId == 0) __threadfence_system();
+  __syncthreads();
 
   // Monotonic generation flags; no reset needed.
 }

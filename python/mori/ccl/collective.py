@@ -250,7 +250,9 @@ class AllgatherSdma:
                 my_pe, npes, 512 * 1024 * 1024, copy_output_to_user
             )
 
-    def __call__(self, input_data, output_data, count: int, stream=None) -> bool:
+    def __call__(
+        self, input_data, output_data, count: int, stream=None, capturing: bool = False
+    ) -> bool:
         byte_count = count * input_data.element_size()
         u32_count = (byte_count + 3) // 4
         s = _stream_to_int(stream)
@@ -260,7 +262,9 @@ class AllgatherSdma:
         _get_ccl_func("OneShotAllGatherSdmaKernel_u32").launch_struct(
             (1,), (512,), 0, s, args
         )
-        self._handle.finish_sync(output_data.data_ptr(), u32_count, s)
+        self._handle.finish_sync(
+            output_data.data_ptr(), u32_count, s, capturing=capturing
+        )
         return True
 
     def enqueue_param_contiguous(
@@ -334,13 +338,21 @@ class AllgatherSdma:
         self._handle.after_async_start()
         return True
 
-    def wait_async(self, stream=None) -> float:
+    def wait_async(self, stream=None, capturing: bool = False) -> float:
+        """Enqueue the completion wait.
+
+        ``capturing=True`` skips the host-side stream syncs: the wait kernel
+        and the copy-out are stream-ordered, so a consumer enqueued on the same
+        stream still sees complete data, and the launch thread stays free. The
+        returned duration is meaningless then, nothing having waited for the
+        transfer to land.
+        """
         s = _stream_to_int(stream)
         args = self._handle.prepare_async_wait(s)
         _get_ccl_func("OneShotAllGatherSdmaAsyncWaitKernel_u32").launch_struct(
             (1,), (64,), 0, s, args
         )
-        return self._handle.finish_async_wait(s)
+        return self._handle.finish_async_wait(s, capturing=capturing)
 
     def is_async_in_progress(self) -> bool:
         return self._handle.is_async_in_progress()

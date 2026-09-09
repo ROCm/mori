@@ -430,28 +430,23 @@ int64_t AllgatherSdma<T>::prepare_sync_param_contiguous(T* input, T* output, siz
 }
 
 template <typename T>
-double AllgatherSdma<T>::finish_sync(T* output, size_t total_count, hipStream_t stream) {
-  if (stream != nullptr) {
-    hipError_t err = hipStreamSynchronize(stream);
+double AllgatherSdma<T>::finish_sync(T* output, size_t total_count, hipStream_t stream,
+                                     bool capturing) {
+  // See the header: the fused kernel already blocks on every peer's flag
+  // before it retires, so these syncs are not what makes the result visible.
+  if (!capturing) {
+    hipError_t err = stream ? hipStreamSynchronize(stream) : hipDeviceSynchronize();
     if (err != hipSuccess) {
-      fprintf(stderr, "PE %d: Stream synchronization failed: %s\n", myPe_, hipGetErrorString(err));
-      throw std::runtime_error("Stream synchronization failed");
-    }
-  } else {
-    hipError_t err = hipDeviceSynchronize();
-    if (err != hipSuccess) {
-      fprintf(stderr, "PE %d: Device synchronization failed: %s\n", myPe_, hipGetErrorString(err));
-      throw std::runtime_error("Device synchronization failed");
+      fprintf(stderr, "PE %d: Synchronization failed: %s\n", myPe_, hipGetErrorString(err));
+      throw std::runtime_error("Synchronization failed");
     }
   }
 
   bool direct = find_registered(output).first.IsValid();
   if (!direct && copy_output_to_user_) {
     copy_output_to_user(output, total_count, stream);
-    if (stream != nullptr) {
-      (void)hipStreamSynchronize(stream);
-    } else {
-      (void)hipDeviceSynchronize();
+    if (!capturing) {
+      (void)(stream ? hipStreamSynchronize(stream) : hipDeviceSynchronize());
     }
   }
 
@@ -558,36 +553,30 @@ int64_t AllgatherSdma<T>::prepare_async_wait(hipStream_t stream) {
 }
 
 template <typename T>
-double AllgatherSdma<T>::finish_async_wait(hipStream_t stream) {
+double AllgatherSdma<T>::finish_async_wait(hipStream_t stream, bool capturing) {
   if (!async_in_progress_) {
     throw std::runtime_error("No async operation in progress");
   }
 
   hipStream_t wait_stream = (stream != nullptr) ? stream : async_stream_;
 
-  if (wait_stream != nullptr) {
-    hipError_t err = hipStreamSynchronize(wait_stream);
+  // Under `capturing` the stream already carries the ordering: the wait kernel
+  // does not retire until every peer's flag is set, and the copy-out below is
+  // enqueued behind it. Only the returned duration becomes meaningless.
+  if (!capturing) {
+    hipError_t err = wait_stream ? hipStreamSynchronize(wait_stream) : hipDeviceSynchronize();
     if (err != hipSuccess) {
-      fprintf(stderr, "PE %d: Stream synchronization failed: %s\n", myPe_, hipGetErrorString(err));
+      fprintf(stderr, "PE %d: Synchronization failed: %s\n", myPe_, hipGetErrorString(err));
       cancel_async();
-      throw std::runtime_error("Stream synchronization failed");
-    }
-  } else {
-    hipError_t err = hipDeviceSynchronize();
-    if (err != hipSuccess) {
-      fprintf(stderr, "PE %d: Device synchronization failed: %s\n", myPe_, hipGetErrorString(err));
-      cancel_async();
-      throw std::runtime_error("Device synchronization failed");
+      throw std::runtime_error("Synchronization failed");
     }
   }
 
   bool direct = find_registered(async_output_).first.IsValid();
   if (!direct && copy_output_to_user_) {
     copy_output_to_user(async_output_, async_total_count_, wait_stream);
-    if (wait_stream != nullptr) {
-      (void)hipStreamSynchronize(wait_stream);
-    } else {
-      (void)hipDeviceSynchronize();
+    if (!capturing) {
+      (void)(wait_stream ? hipStreamSynchronize(wait_stream) : hipDeviceSynchronize());
     }
   }
 
