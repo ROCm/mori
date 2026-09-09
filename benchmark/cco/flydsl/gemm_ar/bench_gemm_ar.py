@@ -42,18 +42,32 @@ compiled out, so the two differ in one thing only. ``split-lsa`` is included
 because LSA is the faster collective, and a fused SDMA path has to beat
 ``gemm + LSA``, not just ``gemm + SDMA``, to be worth anything.
 
-Headline, 8x MI355X, [4096, 7168] out, K=1024, graph replay, median of 51:
+Headline at the shape the model actually runs -- ``[16384, 7168]`` out, K=2048,
+which is a ``--chunked-prefill-size 16384`` TP8 prefill chunk of DSV4-Pro
+``wo_b`` (1792 tiles of 256x256 per rank). 8x MI355X, graph replay, median of
+31, max over ranks, on an idle box:
 
-                             default C-store   + 3-stage C-store
-    split-lsa                      326.8us            321.8us
-    split-sdma                     334.6              330.9
-    fused-sdma  chunks=2           326.2              323.0
-    fused-lsa                      341.0    RACY, see kernels_fused
+                       3-stage C-store   without it (--no-swap-ab ...)
+    split-sdma              1260.8us            1269.8us
+    split-lsa               1263.8              1275.2
+    fused-sdma              1299.9              1342.6
+    fused-lsa               1563.2              1600.9
+    gemm-only                230.8               243.0
 
-Fusing loses. Read ``kernels_fused.py`` before trusting any faster fused number
-from this benchmark: several of its options are intermittently wrong, and a
-single passing run proves nothing. ``--chunks`` > 1 and every ``raw-wt`` fence
-mode are known-racy and kept only to reproduce that.
+For scale, the same layer in the running model costs 1491.3us (GEMM 348.0 +
+NCCL 1143.3, medians over its 61 layers), and the collective on its own is
+1043us for LSA / 1047 for SDMA against 1113 for NCCL.
+
+Fusing loses, in both transports. The per-kernel breakdown says why: at this
+shape ``fused-sdma`` overlaps *nothing* -- its drain costs 502.6us against the
+split scatter's 499.0 -- and it pays 76us to issue the puts, while
+``fused-lsa`` spends 730us of its GEMM pushing C over xGMI where the copy
+engines do the same bytes in 499.
+
+Read ``kernels_fused.py`` before trusting any faster fused number from this
+benchmark: several of its options are intermittently wrong, and a single
+passing run proves nothing. ``--chunks`` > 1 and every ``raw-wt`` fence mode
+are known-racy and kept only to reproduce that.
 """
 
 from __future__ import annotations
@@ -325,6 +339,8 @@ def run(args) -> int:
                 "chunks": chunks if fused else None,
                 "tile_order": args.tile_order,
                 "swap_ab": args.swap_ab,
+                "permlane": args.permlane,
+                "lane_transpose": args.lane_transpose,
                 "fence": args.fence if fused else None,
                 "stop_after": args.stop_after,
                 "max_rank_time_us": per_rank[max_rank],
@@ -408,12 +424,29 @@ def build_parser() -> argparse.ArgumentParser:
         "order the other blocks' releases before its put; 'monotonic' drops it "
         "and races",
     )
+    # The three C-store stages are ON by default. They compose as a ladder --
+    # each needs the one before it -- and measured together at [16384, 7168]
+    # K=2048 on 8x MI355X they help every mode and change no output:
+    # gemm-only -5.0%, fused-sdma -3.2%, fused-lsa -2.4%, split-lsa -0.9%,
+    # split-sdma -0.7%, all still at relL2 2.350e-3. Turn one off with its
+    # --no- form (and the ones above it in the ladder).
+    #
+    # Note where the win is: the stages coalesce the *store issue*, so they pay
+    # off when C lands in local memory (fused-sdma's GEMM 297.3 -> 256.6 us)
+    # and not when it goes straight to a peer (fused-lsa's GEMM 954.5 -> 952.1,
+    # i.e. nothing -- that path is xGMI-bound, and ATT shows 99% of its store
+    # time is stall, not issue).
+    #
+    # ``compile_fused_gemm_scatter`` still defaults them to False: there the
+    # default has to stay "aiter's kernel verbatim", which is what
+    # ``test_pinned_copy_matches_aiter_kernel_bitwise`` checks.
     p.add_argument(
         "--swap-ab",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="exchange the MFMA operands so each lane owns 4 consecutive N, "
         "letting C be stored 64 bits at a time instead of 16 "
-        "(gcnasm mfma_adaptor_swap_ab)",
+        "(gcnasm mfma_adaptor_swap_ab). On by default",
     )
     p.add_argument(
         "--store-probe",
@@ -424,16 +457,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--permlane",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="with --swap-ab: two permlane16_swap per M-tile so each lane owns 16 "
         "contiguous bytes and each row gets 64. This is the real version of what "
-        "--store-probe prices",
+        "--store-probe prices. On by default",
     )
     p.add_argument(
         "--lane-transpose",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="with --swap-ab --permlane: one ds_bpermute per dword so adjacent "
-        "lanes cover one C row (gcnasm kernel_template.hpp:491-510)",
+        "lanes cover one C row (gcnasm kernel_template.hpp:491-510). On by "
+        "default",
     )
     p.add_argument(
         "--hoist-scales",

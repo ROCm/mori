@@ -989,11 +989,18 @@ def compile_fused_gemm_scatter(
     # no direct-LSA branch, so `--mode fused-lsa --lane-transpose` silently ran
     # stages 1+2 and was measured as "no benefit from stage 3".
     if permlane and not swap_ab:
-        raise ValueError("--permlane requires --swap-ab")
+        raise ValueError(
+            "--permlane requires --swap-ab. Both are on by default in "
+            "bench_gemm_ar.py, so pass --no-permlane alongside --no-swap-ab"
+        )
     if lane_transpose and not permlane:
-        raise ValueError("--lane-transpose requires --permlane")
+        raise ValueError(
+            "--lane-transpose requires --permlane. Both are on by default in "
+            "bench_gemm_ar.py, so pass --no-lane-transpose alongside "
+            "--no-permlane"
+        )
     if store_probe and not swap_ab:
-        raise ValueError("--store-probe requires --swap-ab")
+        raise ValueError("--store-probe requires --swap-ab (on by default)")
     if store_probe and lane_transpose:
         raise ValueError(
             "--store-probe and --lane-transpose are alternatives: the probe emits "
