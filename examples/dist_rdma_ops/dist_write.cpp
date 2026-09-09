@@ -119,7 +119,7 @@ inline __device__ void QuietSerial(RdmaEndpoint* endpoint) {
     // core::UpdateCqDbrRecord<P>(cq, cq.dbrRecAddr, (uint32_t)(my_cq_consumer + 1), cq.cqeNum);
 
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
-    __hip_atomic_fetch_max(&wq.doneIdx, wqe_id, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    AtomicMaxSerial(&wq.doneIdx, wqe_id);
   }
   ReleaseLock(&cq.pollCqLock);
 }
@@ -194,8 +194,7 @@ __device__ void Quiet(RdmaEndpoint* endpoint) {
       UpdateCqDbrRecord<P>(endpoint->cqHandle, (uint32_t)(warp_cq_consumer + quiet_amount));
 
       uint64_t doneIdx = wqe_broadcast[warp_id];
-      __hip_atomic_fetch_max(&endpoint->wqHandle.doneIdx, doneIdx, __ATOMIC_RELAXED,
-                             __HIP_MEMORY_SCOPE_AGENT);
+      AtomicMaxSerial(&endpoint->wqHandle.doneIdx, static_cast<uint32_t>(doneIdx));
       __hip_atomic_fetch_add(&cqHandle->consIdx, quiet_amount, __ATOMIC_RELAXED,
                              __HIP_MEMORY_SCOPE_AGENT);
     }
@@ -302,8 +301,7 @@ __device__ void Write(RdmaEndpoint* endpoint, RdmaMemoryRegion localMr, RdmaMemo
       core::atomic_add_packed_msn_and_psn(&wqHandle->msnPack, num_wqes, psnCnt * num_wqes,
                                           &warp_msntbl_counter, &warp_psn_counter);
       warp_sq_counter = warp_msntbl_counter;
-      __hip_atomic_fetch_max(&wqHandle->postIdx, warp_sq_counter + num_wqes, __ATOMIC_RELAXED,
-                             __HIP_MEMORY_SCOPE_AGENT);
+      AtomicMaxSerial(&wqHandle->postIdx, warp_sq_counter + num_wqes);
     } else if constexpr (P == core::ProviderType::PSD) {
       warp_sq_counter = __hip_atomic_fetch_add(&wqHandle->postIdx, num_wqes, __ATOMIC_RELAXED,
                                                __HIP_MEMORY_SCOPE_AGENT);
@@ -327,13 +325,13 @@ __device__ void Write(RdmaEndpoint* endpoint, RdmaMemoryRegion localMr, RdmaMemo
   }
 
   while (true) {
-    uint64_t db_touched =
+    uint32_t db_touched =
         __hip_atomic_load(&wqHandle->dbTouchIdx, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
-    uint64_t db_done =
+    uint32_t db_done =
         __hip_atomic_load(&wqHandle->doneIdx, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
-    uint64_t num_active_sq_entries = db_touched - db_done;
-    uint64_t num_free_entries = wqHandle->sqWqeNum - num_active_sq_entries;
-    uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
+    uint32_t num_active_sq_entries = db_touched - db_done;
+    uint32_t num_free_entries = wqHandle->sqWqeNum - num_active_sq_entries;
+    uint32_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
     if (num_free_entries > num_entries_until_warp_last_entry) {
       break;
     }
