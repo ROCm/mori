@@ -62,6 +62,8 @@ DEFAULT_BACKEND = "flydsl"
 
 _QUANT_TYPES = ("none", "fp8_direct_cast", "fp8_blockwise")
 
+_INTERNODE_KERNELS = ("auto", "v2", "v2_ll")
+
 _DT = {
     torch.bfloat16: 2,
     torch.float32: 4,
@@ -124,6 +126,19 @@ class EpDispatchCombineConfig:
     # internode_tuning_configs), so one compiled-in value cannot serve both.
     dispatch_rdma_block_num: int = None
     combine_rdma_block_num: int = None
+    # Which of the two internode kernel families runs. "v2" and "v2_ll" are
+    # SEPARATE kernels -- separate JIT modules, entry symbols and cache keys, not
+    # two branches of one body -- so naming one here compiles only that one.
+    #   "v2"     the general path: chunked, deduplicating, sized for wide tokens.
+    #   "v2_ll"  low latency: no dedup across expert slots, one entry per node
+    #            per token, which wins while the wire is not the bottleneck.
+    #   "auto"   compile BOTH and pick per launch from the token count, at
+    #            internode_ll_max_tokens. This is the only mode that can switch
+    #            at runtime, and it is the only one that pays for both compiles.
+    internode_kernel: str = "auto"
+    # The "auto" crossover, in tokens per rank: <= this takes v2_ll. Read only
+    # when internode_kernel == "auto".
+    internode_ll_max_tokens: int = 512
     # Which kernel backend serves this op: "flydsl" (default, full feature set)
     # or "hip" (HIP/JIT, bf16/fp32 gather only). None = MORI_V2_KERNEL_BACKEND,
     # else the default. Only consulted when constructing the BASE class; naming a
@@ -157,6 +172,16 @@ class EpDispatchCombineConfig:
         if self.quant_type not in _QUANT_TYPES:
             raise ValueError(
                 f"quant_type must be one of {_QUANT_TYPES}, got {self.quant_type!r}"
+            )
+        if self.internode_kernel not in _INTERNODE_KERNELS:
+            raise ValueError(
+                f"internode_kernel must be one of {_INTERNODE_KERNELS}, got "
+                f"{self.internode_kernel!r}"
+            )
+        if self.internode_ll_max_tokens < 0:
+            raise ValueError(
+                "internode_ll_max_tokens must be >= 0, got "
+                f"{self.internode_ll_max_tokens}"
             )
         if self.combine_mode not in ("gather", "scatter"):
             raise ValueError(

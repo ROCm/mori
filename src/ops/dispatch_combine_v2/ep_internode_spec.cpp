@@ -47,21 +47,21 @@ KernelDesc DescFor(EpInterNodeKernel k) {
     case EpInterNodeKernel::CopyToStaging:
       return {"copystaging", "EpDispatchCopyToStaging_body", false};
     case EpInterNodeKernel::Dispatch:
-      return {"dispatch", "EpDispatchInterNodeV1Kernel_body", true};
+      return {"dispatch", "EpDispatchInterNodeV2_body", true};
     case EpInterNodeKernel::DispatchLL:
-      return {"dispatch_ll", "EpDispatchInterNodeV1KernelLowLatency_body", true};
+      return {"dispatch_ll", "EpDispatchInterNodeV2LL_body", true};
     case EpInterNodeKernel::CombineSync:
       return {"combinesync", "EpCombineSync_body", false};
     case EpInterNodeKernel::CombineSyncBarrier:
       return {"combinesyncbarrier", "EpCombineSyncBarrier_body", false};
     case EpInterNodeKernel::Combine:
-      return {"combine", "EpCombineInterNodeV1Kernel_body", true};
+      return {"combine", "EpCombineInterNodeV2_body", true};
     case EpInterNodeKernel::CombineLL:
-      return {"combine_ll", "EpCombineInterNodeV1KernelLowLatency_body", true};
+      return {"combine_ll", "EpCombineInterNodeV2LL_body", true};
     case EpInterNodeKernel::CombineAll:
       return {"combineall", "EpCombineAll_body", false};
   }
-  throw std::runtime_error("mori ep v1 jit: unknown kernel");
+  throw std::runtime_error("mori ep internode v2 jit: unknown kernel");
 }
 
 // Header subtrees whose contents invalidate a compiled module. Coarser than the
@@ -113,7 +113,7 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
 
   if (!EpInterNodeKernelCfgIsValid(c.kernelCfg)) {
     throw std::runtime_error(
-        "mori ep v1: unusable config " + Render(c.kernelCfg) +
+        "mori ep internode v2: unusable config " + Render(c.kernelCfg) +
         "; every divisor must be positive and worldSize must be a multiple of gpuPerNode");
   }
 
@@ -121,7 +121,7 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
   // generic launch failure with no mention of which knob was too large.
   const int threads = EpInterNodeBlockThreads(c);
   if (threads <= 0 || threads > 1024) {
-    throw std::runtime_error("mori ep v1: warpPerBlock " + std::to_string(c.warpPerBlock) +
+    throw std::runtime_error("mori ep internode v2: warpPerBlock " + std::to_string(c.warpPerBlock) +
                              " x waveSize " + std::to_string(c.waveSize) + " = " +
                              std::to_string(threads) + " threads per block, which exceeds 1024");
   }
@@ -161,7 +161,7 @@ std::string EpInterNodeRenderSource(const EpInterNodeCfg& cfg, EpInterNodeKernel
   // rejects it, but a Cfg can also be aggregate-initialised by hand, and this is
   // the one funnel every compile goes through.
   if (!EpInterNodeKernelCfgIsValid(cfg.kernelCfg)) {
-    throw std::runtime_error("mori ep v1 jit: unusable config " + Render(cfg.kernelCfg));
+    throw std::runtime_error("mori ep internode v2 jit: unusable config " + Render(cfg.kernelCfg));
   }
 
   const KernelDesc d = DescFor(kind);

@@ -246,7 +246,7 @@ __device__ __forceinline__ int32_t EpInterNodeWaitGt(int32_t* addr, int32_t val)
 }
 
 /* ---------------------------------------------------------------------------------------------- */
-/*                                   EpDispatchInterNodeV1Kernel                                  */
+/*                                   EpDispatchInterNodeV2                                  */
 /* ---------------------------------------------------------------------------------------------- */
 namespace internode {
 template <EpInterNodeKernelCfg kConfig, typename T>
@@ -806,7 +806,7 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs& args,
 }  // namespace internode
 
 template <EpInterNodeKernelCfg kConfig, typename T>
-__device__ void EpDispatchInterNodeV1Kernel_body(EpDispatchCombineArgs args,
+__device__ void EpDispatchInterNodeV2_body(EpDispatchCombineArgs args,
                                                  const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
   if (blockId < args.rdmaBlockNum) {
@@ -858,7 +858,7 @@ __device__ void EpDispatchCopyToStaging_body(EpDispatchCombineArgs args) {
 }
 
 template <EpInterNodeKernelCfg kConfig, typename T>
-__device__ void EpDispatchInterNodeV1KernelLowLatency_body(EpDispatchCombineArgs args,
+__device__ void EpDispatchInterNodeV2LL_body(EpDispatchCombineArgs args,
                                                            const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
   if (blockId < args.rdmaBlockNum) {
@@ -871,7 +871,7 @@ __device__ void EpDispatchInterNodeV1KernelLowLatency_body(EpDispatchCombineArgs
 }
 
 /* ---------------------------------------------------------------------------------------------- */
-/*                                   EpCombineInterNodeV1Kernel                                   */
+/*                                   EpCombineInterNodeV2                                   */
 /* ---------------------------------------------------------------------------------------------- */
 namespace internode {
 
@@ -1438,7 +1438,7 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs& args,
 }  // namespace internode
 
 template <EpInterNodeKernelCfg kConfig, typename T>
-__device__ void EpCombineInterNodeV1Kernel_body(EpDispatchCombineArgs args,
+__device__ void EpCombineInterNodeV2_body(EpDispatchCombineArgs args,
                                                 const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
 
@@ -1582,7 +1582,7 @@ __device__ void EpCombineAll_body(EpDispatchCombineArgs args) {
 }
 
 template <EpInterNodeKernelCfg kConfig, typename T>
-__device__ void EpCombineInterNodeV1KernelLowLatency_body(EpDispatchCombineArgs args,
+__device__ void EpCombineInterNodeV2LL_body(EpDispatchCombineArgs args,
                                                           const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
 

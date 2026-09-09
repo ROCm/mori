@@ -4,7 +4,7 @@
 # Usage:
 #   run_internode_test.sh --rank <0|1> --master-addr <ip> --ifname <nic> \
 #                         --cmd <bench|stress|test|test_sentinel> --max-tokens <N> \
-#                         [--master-port <port>] [--kernel-type <v1|v1_ll|async_ll>] \
+#                         [--master-port <port>] [--kernel-type <see below>] \
 #                         [--num-qp <N>] [--quant-type <none|...>] [--dtype <bf16|...>] \
 #                         [--combine-dtype <bf16|...>] [--hidden-dim <N>] [--topk <N>] \
 #                         [--max-recv-total-tokens <N>] [--sentinel-pattern <p>] \
@@ -20,7 +20,8 @@
 #
 # --entry selects which driver torchrun runs, defaulting to the shmem AOT harness.
 # The v2 CCO entry takes a SUBSET of the same CLI: --cmd is only test|bench|tuning
-# (no stress/test_sentinel/sweep_bench/profile), --kernel-type only v1|v1_ll, and
+# (no stress/test_sentinel/sweep_bench/profile), --kernel-type is auto|v2|v2_ll
+# against v1's v1|v1_ll|async_ll (they are different kernels, not a renaming), and
 # it accepts neither --max-recv-total-tokens nor --sentinel-pattern. It is the
 # only entry that takes --rounds.
 #

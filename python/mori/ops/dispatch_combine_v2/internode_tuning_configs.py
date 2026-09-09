@@ -20,7 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Per-device launch geometry for the v2 CCO internode (InterNodeV1LL)
+"""Per-device launch geometry for the v2 CCO internode (v2_ll)
 dispatch/combine kernels.
 
 The internode kernels reach their grid a different way than the intranode ones.

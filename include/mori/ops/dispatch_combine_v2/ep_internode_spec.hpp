@@ -21,13 +21,14 @@
 // SOFTWARE.
 //
 // ---------------------------------------------------------------------------
-// Host side of the v1 internode kernels on cco: what the caller asks for, how
+// Host side of the v2 internode kernels on cco: what the caller asks for, how
 // that becomes an EpInterNodeCfg, and the Specs.
 //
 // Same shape as ep_spec.hpp: a Request, a Cfg, and KernelSpec subclasses that
 // supply RenderSource/Geometry and inherit hashing, caching, module load and
-// launch. Eight entries instead of two, because the v1 dispatch and combine
-// sequences are several passes each and every pass is its own module.
+// launch. Eight entries instead of two, because the dispatch and combine
+// sequences are several passes each and every pass is its own module, and
+// because v2 and v2_ll are separate kernels rather than one with a branch.
 //
 // Host-only, and the device TU must never include it -- everything shared with
 // the kernel lives in ep_internode_cfg.hpp.
@@ -206,8 +207,10 @@ MORI_JIT_ASSERT_FIELD_COUNT(
 
 std::string EpInterNodeRequestSchema();
 
-// Which of the v1 internode entry points. The dispatch and combine sequences are
-// several kernels each; every one of them is its own JIT module.
+// Which of the internode entry points. The dispatch and combine sequences are
+// several kernels each; every one of them is its own JIT module, and the LL
+// members (v2_ll) are distinct kernels from the plain ones (v2), not a runtime
+// branch inside them.
 enum class EpInterNodeKernel {
   CopyToStaging,
   Dispatch,

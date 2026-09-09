@@ -21,7 +21,7 @@
 // SOFTWARE.
 //
 // ---------------------------------------------------------------------------
-// What the host and the JIT-generated device TU BOTH need for the v1 internode
+// What the host and the JIT-generated device TU BOTH need for the v2 internode
 // kernels: the specialised-on config, its rendering, and the argument struct.
 //
 // The counterpart of ep_cfg.hpp for the intranode pair, and it exists for the

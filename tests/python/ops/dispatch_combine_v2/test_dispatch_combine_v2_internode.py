@@ -247,11 +247,12 @@ def _parse_args(argv):
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--drop-rounds", type=int, default=1)
     p.add_argument("--no-bench-tables", action="store_true")
-    # Both members of the LL / non-LL pair are compiled either way; this picks
-    # which one runs. Default (None) leaves the backend's token-count rule alone,
-    # which selects LL below 2048 tokens. Naming it explicitly is what makes a
-    # benchmark number comparable to another harness's.
-    p.add_argument("--kernel-type", default=None, choices=[None, "v1", "v1_ll"])
+    # v2 and v2_ll are separate kernels. Naming one compiles only that one and
+    # runs it at every token count, which is what makes a benchmark number
+    # comparable to another harness's. "auto" compiles both and picks per launch
+    # at --ll-max-tokens.
+    p.add_argument("--kernel-type", default="auto", choices=["auto", "v2", "v2_ll"])
+    p.add_argument("--ll-max-tokens", type=int, default=512)
     return p.parse_args(argv)
 
 
@@ -538,7 +539,7 @@ def _report_tables(d, cfg, a, disp, comb, total_recv, idx, ll, geom):
     print(
         f"\n# CONFIG tok={ct} dtype={str(cfg.dispatch_dtype).split('.')[-1]}"
         f"->{str(cfg.combine_dtype).split('.')[-1]} hidden={cfg.hidden_dim} "
-        f"topk={cfg.num_experts_per_token} kernel={'v1_ll' if ll else 'v1'} "
+        f"topk={cfg.num_experts_per_token} kernel={'v2_ll' if ll else 'v2'} "
         f"world={cfg.world_size} nodes={nodes}x{cfg.gpu_per_node} "
         f"experts/rank={cfg.num_experts_per_rank} scale_dim={cfg.scale_dim} "
         f"qp={cfg.num_qp_per_pe}",
@@ -598,8 +599,6 @@ def _bench(op, cfg, d, dev, a, comm):
     rng.manual_seed(4242 + d.rank)
     ct = a.max_tokens
     inp, idx, wts, sc = _gen_round(rng, cfg, ct, dev, cfg.dispatch_dtype)
-    if a.kernel_type is not None:
-        op._internode_force_ll = a.kernel_type == "v1_ll"
 
     # Check BEFORE measuring, as bench_dispatch_combine does: a silently wrong
     # configuration still produces timings. Always folds weights, whatever
@@ -766,11 +765,15 @@ def _bench(op, cfg, d, dev, a, comm):
     dm, dlo, dhi = _stats(disp)
     cm, clo, chi = _stats(comb)
     vm, _, _ = _stats(conv)
+    # Report the family that RAN, not the request: under "auto" the request does
+    # not name one, and a number is only comparable to another harness's if the
+    # kernel behind it is named.
+    ran = "v2_ll" if op._internode_use_ll(ct) else "v2"
     if d.rank == 0:
         print(
             f"# BENCH tok={ct} dtype={a.dtype}->{a.combine_dtype or a.dtype} "
             f"hidden={cfg.hidden_dim} topk={cfg.num_experts_per_token} "
-            f"kernel={a.kernel_type or 'auto'} "
+            f"kernel={ran}{'(auto)' if a.kernel_type == 'auto' else ''} "
             f"dispatch={dm:.1f}us [{dlo:.1f}/{dhi:.1f}] "
             f"combine={cm:.1f}us [{clo:.1f}/{chi:.1f}] "
             f"total={dm + cm:.1f}us [conv={vm:.1f}us wall={wall:.1f}us]",
@@ -781,7 +784,7 @@ def _bench(op, cfg, d, dev, a, comm):
     # performance tables. Off with --no-bench-tables; it costs one all_gather
     # after the timed loop and nothing inside it.
     if not a.no_bench_tables:
-        ll = bool(getattr(op, "_internode_force_ll", a.max_tokens <= 2048))
+        ll = op._internode_use_ll(a.max_tokens)
         geom = _geom_for_report(op, cfg, a)
         _report_tables(d, cfg, a, disp, comb, total_recv, idx, ll, geom)
     return 0
@@ -949,8 +952,6 @@ def _tune(cfg, d, dev, a, comm):
         pick = (lambda dv, cv: dv) if phase == "dispatch" else (lambda dv, cv: cv)
 
     best_op = _build_op(cfg, comm, *geoms(start))
-    if a.kernel_type is not None:
-        best_op._internode_force_ll = a.kernel_type == "v1_ll"
     comm.barrier()
     best = start
     best_med = None
@@ -963,8 +964,6 @@ def _tune(cfg, d, dev, a, comm):
             if d.rank == 0:
                 print(f"#   [{k + 1}/{len(cands)}] {cand} rejected: {exc}", flush=True)
             continue
-        if a.kernel_type is not None:
-            cand_op._internode_force_ll = a.kernel_type == "v1_ll"
         comm.barrier()
 
         bt, ct_ = [], []
@@ -1170,6 +1169,8 @@ def main(argv):
             quant_type=a.quant_type,
             gpu_per_node=gpu_per_node,
             num_qp_per_pe=a.num_qp,
+            internode_kernel=a.kernel_type,
+            internode_ll_max_tokens=a.ll_max_tokens,
             kernel_backend="hip",
         )
         op = EpDispatchCombineOp(cfg, comm)

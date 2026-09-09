@@ -586,10 +586,35 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         )
         return self._internode_static_cache
 
-    # Below this token count the LL variants win; above it the plain ones do.
-    # The same split v1's bench selects at, and both variants are compiled either
-    # way, so this only chooses which of eight already-built plans a launch uses.
-    _INTERNODE_LL_MAX_TOKENS = 2048
+    def _internode_variants(self, phase):
+        """The kernel names of `phase` this config needs compiled.
+
+        "v2" and "v2_ll" are separate JIT modules, so naming one in the config
+        compiles one; only "auto" needs both, because only "auto" chooses per
+        launch. Returned as a tuple so it can be concatenated with the passes
+        that are common to both.
+        """
+        k = self.cfg.internode_kernel
+        plain, ll = phase, phase + "_ll"
+        if k == "v2":
+            return (plain,)
+        if k == "v2_ll":
+            return (ll,)
+        return (plain, ll)
+
+    def _internode_use_ll(self, num_tokens):
+        """Which of the two families this launch runs.
+
+        Fixed by the config unless it is "auto", where the token count decides at
+        the configured crossover. An explicit choice cannot fall back: the other
+        family was never compiled.
+        """
+        k = self.cfg.internode_kernel
+        if k == "v2":
+            return False
+        if k == "v2_ll":
+            return True
+        return num_tokens <= self.cfg.internode_ll_max_tokens
 
     def _internode_geometry_buckets(self, cfg):
         """``[(max_tok | None, disp_geom, comb_geom)]``, coarsest last.
@@ -692,16 +717,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         needed = {}
         for _, disp_geom, comb_geom in self._internode_buckets:
             for geom, names in (
-                (disp_geom, ("copystaging", "dispatch", "dispatch_ll")),
+                (disp_geom, ("copystaging",) + self._internode_variants("dispatch")),
                 (
                     comb_geom,
-                    (
-                        "combinesync",
-                        "combinesyncbarrier",
-                        "combine",
-                        "combine_ll",
-                        "combineall",
-                    ),
+                    ("combinesync", "combinesyncbarrier")
+                    + self._internode_variants("combine")
+                    + ("combineall",),
                 ),
             ):
                 needed.setdefault(geom, set()).update(names)
@@ -775,17 +796,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         """
 
         def run(*, input, num_tokens, dest_map, **kw):
-            # The low-latency pair is chosen by token count. `_internode_force_ll`
-            # overrides it (True/False) so a benchmark can name the variant it is
-            # reporting instead of inferring it from the shape -- the two are
-            # separate compiled entries, and a number is only comparable to
-            # another harness's if both ran the same one.
-            forced = getattr(self, "_internode_force_ll", None)
-            ll = (
-                (num_tokens <= self._INTERNODE_LL_MAX_TOKENS)
-                if forced is None
-                else forced
-            )
+            ll = self._internode_use_ll(num_tokens)
             geom = self._internode_geom_for(phase, num_tokens)
             group = self._internode_groups[(geom, (phase, ll))]
 
