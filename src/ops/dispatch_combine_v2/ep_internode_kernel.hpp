@@ -875,6 +875,12 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs& args) {
     int destPe = myNode * config.gpuPerNode + laneId;
     int counter = atomicAdd(args.destPeTokenCounter + destPe, localPeTokenCounter);
   }
+  // Slot 6 closes the recv half. 5->6 is everything AFTER the peer data has
+  // landed: unpacking the staging slots and WarpCopy-ing each token into the
+  // destination rank's buffer, which for a same-node destPe is an XGMI peer
+  // write. The 4-token measurement put the whole regime delta in this span,
+  // with the post and the spin both flat, so it needs its own bracket.
+  if ((globalWarpId == 0) && (laneId == 0)) EpDbgTs(args, 6);
 }
 
 template <EpInterNodeKernelCfg kConfig, typename T>
@@ -965,6 +971,7 @@ __device__ void EpDispatchCopyToStaging_body(EpDispatchCombineArgs args) {
   // pass of that sequence and runs entirely before dispatch_ll, so stream order
   // is the ordering guarantee. Before the empty-input return: zero tokens still
   // needs the counter cleared.
+  if ((blockId == 0) && (thdId == 0)) EpDbgTs(args, 12);
   if (globalThdId == 0) args.totalRecvTokenNum[0] = 0;
   if (args.curRankNumToken == 0) return;
 
@@ -998,6 +1005,11 @@ __device__ void EpDispatchCopyToStaging_body(EpDispatchCombineArgs args) {
                                  weightBytes + scaleBytes)[0] =
           static_cast<index_t>(FlatTokenIndex(config, myPe, tokenId));
   }
+  // Slots 12/13 bracket copystaging. It is the ONLY other kernel in the
+  // dispatch phase, and the phase's whole regime delta sits outside
+  // dispatch_ll, so this is what separates 'the staging copy got slower' from
+  // 'the gap between the two launches grew'.
+  if ((blockId == 0) && (thdId == 0)) EpDbgTs(args, 13);
 }
 
 template <EpInterNodeKernelCfg kConfig, typename T>
@@ -1012,6 +1024,8 @@ __device__ void EpDispatchInterNodeV1KernelLowLatency_body(EpDispatchCombineArgs
     internode::DispatchIntraNode<kConfig, T>(args);
   }
   internode::DispatchSync<kConfig, T>(args, comm);
+  // 6->7 is DispatchSync, the grid-wide barrier that ends the kernel.
+  if ((blockId == 0) && (thdId == 0)) EpDbgTs(args, 7);
 }
 
 /* ---------------------------------------------------------------------------------------------- */

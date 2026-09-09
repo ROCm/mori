@@ -559,10 +559,19 @@ def _bench(op, cfg, d, dev, a, comm):
         if d.rank == 0:
             print("%s wallclock_khz=%d (expect 100000)" % (pfx, khz), flush=True)
         for nm, v in (
+            # 0->7 is the WHOLE dispatch_ll kernel as block 0 sees it, entry to
+            # after DispatchSync. Printed because the sum of the inner spans is
+            # not the kernel: they are stamped by different warps, and anything
+            # the phase spends outside this span belongs to another block, to
+            # copystaging, or to the host.
+            ("d_stag", _us(12, 13)),  # the copystaging kernel itself
+            ("d_kern", _us(0, 7)),
             ("d_head", _us(0, 1)),  # kernel entry -> first post
             ("d_post", _us(1, 2)),  # WQE build + doorbell: LOCAL
             ("d_gap", _us(2, 4)),  # post returns -> spin entry (warp skew)
             ("d_spin", _us(4, 5)),  # waiting for the peer's write: REMOTE
+            ("d_recv", _us(5, 6)),  # unpack + XGMI peer write of each token
+            ("d_sync", _us(6, 7)),  # DispatchSync grid barrier
             ("c_post", _us(8, 9)),  # combine entry -> put
             ("c_spin", _us(10, 11)),  # combine cross-node barrier wait
         ):

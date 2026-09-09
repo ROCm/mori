@@ -285,8 +285,8 @@ __device__ inline int NullSendBufSlotOffset(const EpInterNodeDeviceCfg& config) 
   X(combineGridBarrier, "p")             \
   X(interNodeBlocksBarrier, "p")         \
   X(crossDeviceBarrierFlag, "p")         \
-  X(dbgTsBuf, "p")                       \
-  X(dbgRound, "i32")
+  X(dbgRound, "i32")                     \
+  X(dbgTsBuf, "p")
 
 #define MORI_EP_INTERNODE_ARGS_SCHEMA_ENTRY(name, tag) #name ":" tag ","
 // Trailing comma: the binding skips empty items, so there is no last-element
@@ -360,11 +360,13 @@ struct EpInterNodeArgs {
   // host -- the null is what turns every stamp site in the kernel off. The
   // round index has to come from the host: the kernel has no notion of which
   // benchmark round it is in, and deriving one from a device atomic would put
-  // a global atomic inside the region being measured. Pointer first so the
-  // offsets stay ascending with the rest of the pointer block and the trailing
-  // int32 becomes tail padding, which is what EpInterNodeCcoArgs needs.
-  uint64_t* dbgTsBuf{nullptr};
+  // a global atomic inside the region being measured.
+  //
+  // ORDER MATTERS, and not for the reason it looks like. The int32 goes FIRST
+  // so the pointer is last and this struct ends with no tail padding; see the
+  // no-tail-padding static_assert below for what happens otherwise.
   int32_t dbgRound{0};
+  uint64_t* dbgTsBuf{nullptr};
 
   // An offset as something addressable. Built per access; the three members are
   // all the accessors need, so this costs nothing at -O2.
@@ -398,6 +400,22 @@ static_assert(detail::kEpInterNodeArgsFieldCount == 41,
 static_assert(detail::EpInterNodeArgsOffsetsAscend(),
               "MORI_EP_INTERNODE_ARGS_FIELDS is not in declaration order -- the binding "
               "would write each argument into the wrong slot");
+
+// The last field must end exactly at sizeof, i.e. no tail padding.
+//
+// This is not pedantry, it cost a run of eight GPU memory faults. The binding
+// builds a ctypes struct from the schema and appends devComm as a BYTE RANGE,
+// whose alignment is 1 -- so ctypes places it immediately after the last field,
+// while C++ places it at sizeof(EpInterNodeArgs), after any tail padding. End
+// the struct with an int32 and the two disagree by 4 bytes: every launch then
+// writes the communicator 4 bytes low and the kernel dereferences garbage QP
+// state. Nothing else catches it -- both layouts have the SAME sizeof, so the
+// binding's size check passes, and the ascending-offset assert above is about
+// the fields, not about what follows them.
+static_assert(offsetof(EpInterNodeArgs, dbgTsBuf) + sizeof(EpInterNodeArgs::dbgTsBuf) ==
+                  sizeof(EpInterNodeArgs),
+              "EpInterNodeArgs has tail padding -- the binding would place devComm before "
+              "C++ does. Keep an 8-byte member last (update the name here if it changes)");
 
 // What crosses into a JIT module: the arguments plus the communicator. Passing
 // the comm by value is the point of the CCO port; mori-shmem needed a device

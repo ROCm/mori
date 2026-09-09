@@ -204,12 +204,54 @@ METHOD
     all eight `MORI_EP_INTERNODE_CCO_ENTRY*` entries reports every template error
     at once; finding them one per cluster run costs an afternoon.
 
+DEVICE TIMESTAMPS: NEITHER KERNEL GETS SLOWER
+---------------------------------------------
+`MORI_EP_DEV_TS=1` stamps `wall_clock64()` (fixed 100.008 MHz on this gfx942,
+10 ns; NOT `clock64()`, which is the shader clock and moves with DVFS) at twelve
+points and reports per-round spans per rank. Comparing slow rounds against fast
+rounds WITHIN one run and one rank:
+
+    span                        fast     slow    delta
+    d_stag  copystaging kernel   2.6      2.6     +0.0
+    d_kern  whole dispatch_ll   21.1     21.6     +0.5
+      d_post  WQE + doorbell     5.6      5.4     -0.2
+      d_spin  wait for peer     17.7     18.2     +0.5
+      d_recv  unpack + XGMI      1.0      1.1     +0.1
+      d_sync  grid barrier       1.0      1.0     +0.0
+    residual (phase - kernels)  33.0     78.8    +45.9   <-- all of it
+    disp    the phase           55.5    103.0    +47.5
+
+Reproduced on every run that had slow rounds (+45.9 and +64.8 in two runs).
+**Both kernels in the dispatch phase are flat to under 1 microsecond.** The
+excess is entirely in the launch/scheduling path: host enqueue plus GPU-side gap
+between the two kernels. Splitting that residual further, the mix varies by run
+-- one run had the host flat (+1.0) with a +35 GPU-side gap, another had the
+host itself +24 -- but the kernels are flat in both.
+
+This REVERSES the per-pass split's attribution above. Under
+`MORI_EP_SPLIT_PASSES` the excess appeared to be in `dispatch_ll`, but split
+mode launches each pass separately and the spin passes absorb every other
+launch's skew -- which is exactly the effect being measured here. Trust the
+in-kernel timestamps in batched mode over the split.
+
+Combine is different and simpler: `c_spin`, its cross-node barrier wait, takes
+the whole regime shift (0.7 -> 28.5 against `comb` 48 -> 77) and its spikes
+(+63, +110 on single rounds), while `c_post` is flat. Combine does no extra
+work; it waits longer for peers. It is a victim of dispatch's skew, not a
+source.
+
+So the send/recv question is answered, and the answer is neither: it is not the
+local GPU->NIC post (`d_post` flat) and not waiting for the peer's write
+(`d_spin` flat). Nothing inside either kernel moves.
+
 NEXT
 ----
 Everything outside the GPU has been eliminated, and the per-pass split puts the
 excess inside `dispatch_ll` and inside `combinesyncbarrier` -- both of which mix
 posting with waiting, so the split cannot go further from the host side. The next
-step is device-side timestamps inside `dispatch_ll` separating the send-post from
-the receive spin, which would say whether the extra time is spent getting the
-data out or waiting for a peer's. The step attribution above says the target is
-right: whatever it is, it is on the remote-access path and not in local work.
+step is to decompose the residual: the phase window holds only two kernels, both
+now proven flat, so what remains is the enqueue path and the GPU-side gaps
+around them. Stamping the host at each individual pass launch (rather than
+around the whole `op.dispatch()` call) would split "the host was late" from "the
+command processor was late", which is the last division available from outside
+the kernels.
