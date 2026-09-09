@@ -29,8 +29,42 @@ two levels, so a run that stepped early reports ~2.3x while the same binary that
 did not step reports ~1.2x. Chasing "the tail" as if it were a few bad rounds is
 chasing the wrong shape.
 
-IT IS ENVIRONMENTAL, AND WE AMPLIFY IT
---------------------------------------
+RE-RUN AGAINST #625 WITH BOTH SIDES BOUND
+-----------------------------------------
+The comparison below ("we amplify it ~3x") was made with #625 bound and this
+branch unbound, and is superseded. Re-run after the CCO bind fix, eight
+interleaved pairs, ours matched to #625's environment (OMP_NUM_THREADS=4, the
+same 30-round loop):
+
+    pair   #625 disp  comb   total  |  ours disp  comb   total  |  diff
+      1      39.51  50.87   90.38   |   37.2   46.0    83.2   |   -7.2
+      2      39.50  52.41   91.91   |   38.2   47.4    85.6   |   -6.3
+      3      39.54  51.63   91.17   |   50.7   59.4   110.1   |  +18.9
+      4      39.52  54.93   94.45   |   37.2   49.8    87.0   |   -7.5
+      5      39.32  51.52   90.84   |   37.5   46.1    83.6   |   -7.2
+      6      38.72  54.40   93.12   |   39.2   47.7    86.9   |   -6.2
+      7      43.08  64.44  107.52   |   37.0   46.0    83.0   |  -24.5
+      8      48.82  62.90  111.72   |   39.1   46.7    85.8   |  -25.9
+
+              #625 median   ours median   paired median   ours wins
+    dispatch     39.52         37.85       -2.06us (-5.2%)    6/8
+    combine      53.41         47.05       -5.28us (-9.9%)    7/8
+    TOTAL        92.52         85.70       -7.21us (-7.8%)    7/8
+
+    spread   #625 max/med 1.21     ours max/med 1.28
+
+So with both sides bound this branch is faster on BOTH legs, and the spread is
+comparable rather than 2x worse. The "3x more sensitive" result was an artifact
+of the bind difference and is withdrawn.
+
+Caveats: #625's harness reports only per-rank means, so only means are compared
+(its own run-to-run variance is visible -- two of its eight runs are elevated).
+n=8. And one of our eight was elevated (110.1) with NO host doubling and max
+per-rank hwal 86 -- so a smaller residual mechanism survives the bind; it is not
+the 2x one.
+
+IT IS ENVIRONMENTAL, AND WE AMPLIFY IT (SUPERSEDED -- see above)
+----------------------------------------------------------------
 Interleaved against the #625 baseline (v1 host + the same v2 CCO kernels, so the
 same transport on the same wire), four pairs back to back:
 
