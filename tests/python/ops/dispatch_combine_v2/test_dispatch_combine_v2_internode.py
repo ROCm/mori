@@ -80,9 +80,8 @@ default. Every difference found by reading both, and what to pass to close it:
   what                     v1 bench          here (default)     to align
   ----------------------   ---------------   ----------------   ------------------
   combine weights          None (no fold)    None               (aligned)
-  num_experts_per_rank     256 // world      --experts-per-rank --experts-per-rank 16
-                                             = 32               at world 16
-  scale_dim                32                --scale-dim = 0    --scale-dim 32
+  num_experts_per_rank     256 // world      256 // world       (aligned)
+  scale_dim                32                32                 (aligned)
   scale_type_size          4                 4 when scale_dim   (aligned)
   warmup / rounds / drop   20 / 30 / 1       same, and CHECKED  (aligned)
   routing                  randperm[:topk]   same               (aligned)
@@ -98,11 +97,12 @@ against that harness's 30 while this row said "same", because a table asserting
 three numbers had been checked for two. Prefer extending the check to adding a
 row.
 
-The two that move real work: the weight fold costs an extra peer read per
-(token, destination) plus an accumulate in three kernels and a wider staging slot,
-and v1's scale_dim=32 makes ITS dispatch carry 128 more bytes per token than a
---scale-dim 0 run here. They push in opposite directions, so a comparison that
-leaves both unaligned is not bounded in either direction.
+Both of those defaults used to differ and had to be passed by hand, which is a
+bad way to keep a comparison honest: scale_dim=32 makes dispatch carry 128 more
+bytes per token, so forgetting it silently flattered this side. They now default
+to v1's values. The remaining row that moves real work is the weight fold, which
+is off in both by default -- it costs an extra peer read per (token, destination)
+plus an accumulate in three kernels and a wider staging slot.
 """
 
 import argparse
@@ -178,7 +178,10 @@ def _parse_args(argv):
     p.add_argument("--max-tokens", type=int, default=128)
     p.add_argument("--hidden-dim", type=int, default=7168)
     p.add_argument("--topk", type=int, default=8)
-    p.add_argument("--experts-per-rank", type=int, default=32)
+    # None -> 256 // world_size, which is what the v1 harness hardcodes
+    # (examples/.../test_dispatch_combine_internode.py:576). world_size is not
+    # known until the workers start, so the default has to be resolved there.
+    p.add_argument("--experts-per-rank", type=int, default=None)
     p.add_argument("--dtype", default="bf16", choices=list(_DTYPES))
     p.add_argument("--combine-dtype", default=None, choices=list(_DTYPES))
     p.add_argument("--quant-type", default="none", choices=["none", "fp8_direct_cast"])
@@ -188,7 +191,10 @@ def _parse_args(argv):
     # --drop-rounds 1 the two kept rounds are the ones that harness documents as
     # still in the CCO ramp, so one spike carries half the mean AND is the worst.
     p.add_argument("--rounds", type=int, default=30)
-    p.add_argument("--scale-dim", type=int, default=0)
+    # 32 to match v1, which hardcodes scale_dim=32 / scale_type_size=4. It is not
+    # free -- it makes dispatch carry 128 more bytes per token -- which is exactly
+    # why it should not be something a comparison has to remember to pass.
+    p.add_argument("--scale-dim", type=int, default=32)
     p.add_argument("--tuning-scope", default="quick", choices=["quick", "full"])
     p.add_argument("--tuning-reps", type=int, default=3)
     # Smoke-test / bisect aid: stop after N candidates (0 = sweep all).
@@ -258,7 +264,15 @@ def _parse_args(argv):
     p.add_argument("--no-bench-tables", action="store_true")
     p.add_argument("--pre-barriers", type=int, default=1)
     p.add_argument("--pre-sleep-ms", type=float, default=0.0)
-    p.add_argument("--barrier-kind", default="cco", choices=["cco", "gloo", "both"])
+    # gloo by default to match the v1 harness, which uses dist.barrier() at this
+    # same boundary (examples/.../test_dispatch_combine_internode.py:1270) and
+    # nowhere uses mori.shmem's own barrier. Both kinds are host-side socket
+    # collectives, but they are not the same implementation or the same socket
+    # path -- measured exit skew differs (gloo 265-500us typical against cco
+    # 332-2760us) -- and a comparison should not carry that difference at the
+    # measurement boundary. Only THIS barrier changed; the comm.barrier() calls
+    # elsewhere are CCO collectives that may also order the symmetric window.
+    p.add_argument("--barrier-kind", default="gloo", choices=["cco", "gloo", "both"])
     # Re-align the ranks every N rounds. The slow regime is a stable inter-node
     # phase offset, and a rendezvous does not remove one -- this asks whether an
     # explicit re-alignment escapes the offset fixed point or whether the loop
@@ -665,13 +679,23 @@ def _bench(op, cfg, d, dev, a, comm):
             total_recv = int(r[4][0].item())
         op.combine(convert(r[0]), cw, routing=r[5])
     torch.cuda.synchronize()
-    comm.barrier()
 
-    # Barrier-skew probe. comm.barrier() is ccoBarrierAll, a CPU-side collective
-    # over the bootstrap sockets, and dist.barrier() is gloo -- same family, both
-    # tree/ring shaped, so neither releases its ranks at one instant. Timestamp
-    # after EACH of N barriers so the question "is the first one just ragged, or
-    # is every one ragged" has an answer instead of a guess.
+    # THE pre-loop barrier. One site, so the default cannot drift. (It briefly
+    # did: a probe loop with a max(1,..) sat below an unconditional barrier and
+    # silently made the default two.)
+    #
+    # v1 documents the transient this creates and reaches the same conclusion
+    # from the other side (see _EP_DROP_ROUNDS there): the first timed rounds
+    # run elevated, "worse and longer on the CCO/GDA path ... than on shmem",
+    # and it suggests MORI_EP_DROP_ROUNDS=3 to cover it. Its stated mechanism --
+    # all ranks released at once, thundering herd -- does not survive
+    # measurement here: the exit skew is 200-800us, i.e. 2-9 rounds, so they are
+    # NOT released at once, and the skew does not correlate with the run's
+    # outcome. The transient is real; that account of it is not.
+    #
+    # Both kinds are CPU-side collectives over sockets -- comm.barrier() is
+    # ccoBarrierAll, dist.barrier() is gloo -- so neither releases its ranks at
+    # one instant, and the timestamp after each is what measures that.
     _bt = []
     for _k in range(max(1, a.pre_barriers)):
         if a.barrier_kind in ("cco", "both"):
@@ -1431,7 +1455,9 @@ def main(argv):
             world_size=npes,
             hidden_dim=a.hidden_dim,
             max_num_inp_token_per_rank=M,
-            num_experts_per_rank=a.experts_per_rank,
+            num_experts_per_rank=(
+                a.experts_per_rank if a.experts_per_rank else 256 // npes
+            ),
             num_experts_per_token=a.topk,
             data_type=dtype if combine_dtype is None else torch.bfloat16,
             dispatch_data_type=dtype if combine_dtype is not None else None,
