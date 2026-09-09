@@ -173,6 +173,17 @@ class EpDispatchCombineConfig:
             raise ValueError(
                 f"quant_type must be one of {_QUANT_TYPES}, got {self.quant_type!r}"
             )
+        if self.is_internode and self.max_num_inp_token_per_rank % WAVE:
+            # The internode send buffer is addressed as pe * m + slot, but slots
+            # are handed out in whole wavefronts: the largest index a full last
+            # chunk produces is ceil(m/WAVE)*WAVE - 1, which exceeds m whenever m
+            # is not a multiple of WAVE. Rounding the capacity up makes the two
+            # agree by construction, without changing the layout the kernel and
+            # the region table both assume. (Inherited from v1, which computes
+            # the same stride and the same chunk count.)
+            self.max_num_inp_token_per_rank = (
+                (self.max_num_inp_token_per_rank + WAVE - 1) // WAVE
+            ) * WAVE
         if self.internode_kernel not in _INTERNODE_KERNELS:
             raise ValueError(
                 f"internode_kernel must be one of {_INTERNODE_KERNELS}, got "

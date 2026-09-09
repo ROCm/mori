@@ -65,6 +65,16 @@ jobs:
           $CT exec $CONTAINER bash -c \
             "cd $GITHUB_WORKSPACE && BUILD_TESTS=ON BUILD_EXAMPLES=ON BUILD_BENCHMARK=ON MORI_WITH_MPI=ON BUILD_UMBP=OFF BUILD_CCO_SDMA=ON pip install ."
 
+      - name: Check internode arena region invariants
+        run: |
+          # Pure function of the config: no GPU, no process group, no RDMA, so it
+          # runs here rather than in the two-node job -- the only place the
+          # internode region sizes are checked at all.
+          $CT exec $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE && \
+            timeout 120 python -m pytest -v \
+              tests/python/ops/dispatch_combine_v2/test_internode_regions.py"
+
       - name: Run CCO unit tests (fork mode, 4 ranks)
         run: |
           # MORI_CCO_SKIP_GDA_FULL=1: the MI355X-AINIC runner has no intranode

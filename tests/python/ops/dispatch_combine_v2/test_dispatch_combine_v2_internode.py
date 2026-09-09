@@ -179,6 +179,11 @@ def _parse_args(argv):
     # (examples/.../test_dispatch_combine_internode.py:576). world_size is not
     # known until the workers start, so the default has to be resolved there.
     p.add_argument("--experts-per-rank", type=int, default=None)
+    # Where tokens go. "uniform" keeps every chunk full and so never exercises
+    # the empty-chunk path; "skewed" and "local" do. See _gen_round.
+    p.add_argument(
+        "--routing", default="uniform", choices=["uniform", "skewed", "local"]
+    )
     p.add_argument("--dtype", default="bf16", choices=list(_DTYPES))
     p.add_argument("--combine-dtype", default=None, choices=list(_DTYPES))
     p.add_argument("--quant-type", default="none", choices=["none", "fp8_direct_cast"])
@@ -256,19 +261,54 @@ def _parse_args(argv):
     return p.parse_args(argv)
 
 
-def _gen_round(rng, cfg, ct, dev, dtype):
+def _gen_round(rng, cfg, ct, dev, dtype, routing="uniform"):
     """Seeded per-round input, routing and weights, so a failure is reproducible
-    from the round number and the rank alone."""
+    from the round number and the rank alone.
+
+    ``routing`` shapes WHERE the tokens go, which is what decides whether the
+    cross-node chunk protocol is exercised at all:
+
+    ``uniform``  every token draws topk experts from the whole world. With topk
+                 well above the node count, essentially every token reaches every
+                 node, so every chunk a peer polls for does arrive. This is the
+                 easy case and it hides anything to do with an EMPTY chunk.
+    ``skewed``   one token in eight draws its experts remotely, the rest locally.
+                 The remote node then receives far fewer tokens than the sender's
+                 chunk space, so most chunks are empty and the receiver must rely
+                 on the per-node token count to retire them.
+    ``local``    every expert is on the sender's own node, so a peer receives
+                 NOTHING and every one of its chunks is empty. The extreme.
+    """
     inp = torch.randn(ct, cfg.hidden_dim, generator=rng, device=dev).to(dtype)
     n_experts = cfg.world_size * cfg.num_experts_per_rank
-    idx = torch.stack(
-        [
-            torch.randperm(n_experts, generator=rng, device=dev)[
-                : cfg.num_experts_per_token
+    if routing == "uniform":
+        idx = torch.stack(
+            [
+                torch.randperm(n_experts, generator=rng, device=dev)[
+                    : cfg.num_experts_per_token
+                ]
+                for _ in range(ct)
             ]
-            for _ in range(ct)
-        ]
-    ).to(torch.int32)
+        ).to(torch.int32)
+    else:
+        per_node = cfg.gpu_per_node * cfg.num_experts_per_rank
+        my_node = cfg.rank // cfg.gpu_per_node
+        n_nodes = cfg.world_size // cfg.gpu_per_node
+        rows = []
+        for t in range(ct):
+            remote = routing == "skewed" and (
+                int(torch.randint(0, 8, (1,), generator=rng, device=dev).item()) == 0
+            )
+            if remote and n_nodes > 1:
+                off = int(
+                    torch.randint(1, n_nodes, (1,), generator=rng, device=dev).item()
+                )
+                node = (my_node + off) % n_nodes
+            else:
+                node = my_node
+            pool = torch.randperm(per_node, generator=rng, device=dev)
+            rows.append(pool[: cfg.num_experts_per_token] + node * per_node)
+        idx = torch.stack(rows).to(torch.int32)
     wts = torch.rand(ct, cfg.num_experts_per_token, generator=rng, device=dev)
     # Real scales when the transport is on. The dispatch send path copies
     # scale_dim * scale_type_size bytes per token whether or not a buffer was
@@ -598,7 +638,7 @@ def _bench(op, cfg, d, dev, a, comm):
     rng = torch.Generator(device=dev)
     rng.manual_seed(4242 + d.rank)
     ct = a.max_tokens
-    inp, idx, wts, sc = _gen_round(rng, cfg, ct, dev, cfg.dispatch_dtype)
+    inp, idx, wts, sc = _gen_round(rng, cfg, ct, dev, cfg.dispatch_dtype, a.routing)
 
     # Check BEFORE measuring, as bench_dispatch_combine does: a silently wrong
     # configuration still produces timings. Always folds weights, whatever
@@ -1194,7 +1234,9 @@ def main(argv):
         for r in range(a.rounds):
             rng.manual_seed(1234 + r * 977 + rank)
             ct = M
-            inp, idx, wts, sc = _gen_round(rng, cfg, ct, dev, cfg.dispatch_dtype)
+            inp, idx, wts, sc = _gen_round(
+                rng, cfg, ct, dev, cfg.dispatch_dtype, a.routing
+            )
 
             recv_x, recv_w, recv_s, recv_i, total_recv, routing = op.dispatch(
                 inp, wts, sc, idx, return_routing=True

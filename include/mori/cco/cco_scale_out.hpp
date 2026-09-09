@@ -90,7 +90,11 @@ enum ccoGdaThreadMode : uint32_t {
 enum ccoGdaOptFlags {
   ccoGdaOptFlagsDefault = 0,
   ccoGdaOptFlagsMaySkipCreditCheck = (1 << 0),
-  ccoGdaOptFlagsAggregateRequests = (1 << 1),
+  // Bit 1 is reserved, not free: it used to mean "post without ringing, someone
+  // else rings later". Nothing can ring for you today -- flushAsync only
+  // snapshots postIdx, which is a *reservation* counter that runs ahead of the
+  // WQE writes, so a deferred doorbell has no safe bound. Supporting deferral
+  // needs a separate "WQEs written" counter the posting paths publish to.
 };
 
 typedef enum ccoGdaSignalOp_t {
@@ -676,8 +680,7 @@ __device__ inline static void putImpl(
             *wq, signalSlot, signalSlot, sigPsn, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
             signalRemoteAddr, signalRemoteKey, signalOpArg, 0 /*compare*/, core::AMO_FETCH_ADD);
       }
-      if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
-        ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
+      ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
     }
   } else {
     // MLX5/PSD: the WQE slot index doubles as the PSN.
@@ -693,8 +696,7 @@ __device__ inline static void putImpl(
             atomicLkey, signalRemoteAddr, signalRemoteKey, signalOpArg, 0 /*compare*/,
             core::AMO_FETCH_ADD);
       }
-      if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
-        ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
+      ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
     }
   }
 }
@@ -745,8 +747,7 @@ __device__ inline static void putValueImpl(core::RdmaEndpointDevice* ep, uint32_
             *wq, signalSlot, signalSlot, sigPsn, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
             signalRemoteAddr, signalRemoteKey, signalOpArg, 0, core::AMO_FETCH_ADD);
       }
-      if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
-        ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
+      ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
     }
   } else {
     // MLX5/PSD: the WQE slot index doubles as the PSN.
@@ -761,8 +762,7 @@ __device__ inline static void putValueImpl(core::RdmaEndpointDevice* ep, uint32_
             *wq, signalSlot, signalSlot, signalSlot, true /*cqeSignal*/, qpn, atomicLaddr,
             atomicLkey, signalRemoteAddr, signalRemoteKey, signalOpArg, 0, core::AMO_FETCH_ADD);
       }
-      if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
-        ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
+      ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
     }
   }
 }
@@ -799,16 +799,14 @@ __device__ inline static void getImpl(core::RdmaEndpointDevice* ep, uint32_t qpn
         core::PostRead<PrvdType>(*wq, mySlot, mySlot, dataPsn, true /*cqeSignal*/, qpn, localAddr,
                                  localKey, remoteAddr, remoteKey, bytes);
     __threadfence();
-    if (isLeader && !(optFlags & ccoGdaOptFlagsAggregateRequests))
-      ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
+    if (isLeader) ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
   } else {
     // MLX5/PSD: the WQE slot index doubles as the PSN.
     waitSqSpace<PrvdType>(ep, base, totalWqes);
     uint64_t dbrVal = core::PostRead<PrvdType>(*wq, mySlot, mySlot, mySlot, true /*cqeSignal*/, qpn,
                                                localAddr, localKey, remoteAddr, remoteKey, bytes);
     __threadfence();
-    if (isLeader && !(optFlags & ccoGdaOptFlagsAggregateRequests))
-      ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
+    if (isLeader) ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
   }
 }
 
@@ -857,16 +855,14 @@ __device__ inline static void signalImpl(core::RdmaEndpointDevice* ep, uint32_t 
     uint64_t dbrVal = core::PostAtomic<PrvdType, uint64_t>(
         *wq, curPostIdx, curPostIdx, psnBase, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
         signalRemoteAddr, signalRemoteKey, addValue, 0 /*compare*/, core::AMO_FETCH_ADD);
-    if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
-      ringDoorbellOrdered<PrvdType>(ep, curPostIdx, 1, dbrVal);
+    ringDoorbellOrdered<PrvdType>(ep, curPostIdx, 1, dbrVal);
   } else {
     // MLX5/PSD: the WQE slot index doubles as the PSN.
     uint32_t curPostIdx = reserveWqeSlots<PrvdType>(ep, 1);
     uint64_t dbrVal = core::PostAtomic<PrvdType, uint64_t>(
         *wq, curPostIdx, curPostIdx, curPostIdx, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
         signalRemoteAddr, signalRemoteKey, addValue, 0 /*compare*/, core::AMO_FETCH_ADD);
-    if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
-      ringDoorbellOrdered<PrvdType>(ep, curPostIdx, 1, dbrVal);
+    ringDoorbellOrdered<PrvdType>(ep, curPostIdx, 1, dbrVal);
   }
 }
 

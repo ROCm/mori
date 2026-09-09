@@ -103,7 +103,10 @@ def internode_regions(cfg):
         # --- weights ---------------------------------------------------------
         ("inp_weights", recv * topk * _F32),
         ("dispatch_out_weights", recv * topk * _F32),
-        ("combine_out_weights", recv * topk * _F32),
+        # Sized by m, not recv: EpCombineAll indexes this by the LOCAL token id,
+        # the same index that sizes inter_combine_out. recv < m once
+        # max_total_recv_tokens clamps.
+        ("combine_out_weights", m * topk * _F32),
         # --- indices ---------------------------------------------------------
         ("out_indices", recv * topk * _I32),
         # --- token-count signals ---------------------------------------------

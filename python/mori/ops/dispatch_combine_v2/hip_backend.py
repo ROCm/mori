@@ -164,6 +164,18 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         )
 
         self.arena = SymmArena(comm, self._regions(cfg))
+        try:
+            self._build(cfg, comm)
+        except BaseException:
+            # Everything past SymmArena() takes device resources the interpreter
+            # does not own (a symmetric window, QPs, JIT plans); a partial
+            # __init__ leaves no object for close() to run on, so unwind here.
+            self._close_backend()
+            self.arena.close()
+            raise
+
+    def _build(self, cfg, comm):
+        dev = self.dev
         self.arena.zero()
 
         self._dispatch_specs, self._combine_specs = self._specs_from(cfg)
@@ -243,26 +255,40 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         reqs.gda_context_count = max(1, cfg.num_qp_per_pe)
         handle = DevCommHandle(comm, requirements=reqs)
 
-        # EP derives "which ranks share a node" from cfg.gpu_per_node; CCO derives
-        # its LSA team from the physical topology. Nothing forces the two to
-        # agree, and the kernel resolves a same-node peer as `worldPe - lsaBase`,
-        # which is only an LSA rank if they do. A mismatch does not fault -- it
-        # reads the wrong rank's copy -- so it is checked once, here, where both
-        # numbers are visible.
-        if handle.lsa_size != cfg.gpu_per_node:
-            raise ValueError(
-                f"EP's gpu_per_node ({cfg.gpu_per_node}) != CCO's lsa_size "
-                f"({handle.lsa_size}): EP's idea of a node and the flat-VA team "
-                "are different sets, so a peer-indexed access would resolve to "
-                "the wrong rank"
-            )
-        expected = cfg.rank % cfg.gpu_per_node
-        if handle.lsa_rank != expected:
-            raise ValueError(
-                f"rank {cfg.rank} has CCO lsa_rank {handle.lsa_rank} but EP's node "
-                f"layout implies {expected}: world ranks are not laid out "
-                "node-major, so worldPe - lsaBase is not an LSA rank"
-            )
+        # A rejected handle still owns its QPs, so every exit below its
+        # construction has to release it.
+        try:
+            # The kernels address peers by world rank out of this communicator, so
+            # a cfg.world_size that disagrees names ranks that do not exist.
+            if handle.world_size != cfg.world_size:
+                raise ValueError(
+                    f"EP's world_size ({cfg.world_size}) != CCO's world_size "
+                    f"({handle.world_size}): the kernels index peers by world rank "
+                    "out of this communicator"
+                )
+            # EP derives "which ranks share a node" from cfg.gpu_per_node; CCO
+            # derives its LSA team from the physical topology. Nothing forces the
+            # two to agree, and the kernel resolves a same-node peer as
+            # `worldPe - lsaBase`, which is only an LSA rank if they do. A mismatch
+            # does not fault -- it reads the wrong rank's copy -- so it is checked
+            # once, here, where both numbers are visible.
+            if handle.lsa_size != cfg.gpu_per_node:
+                raise ValueError(
+                    f"EP's gpu_per_node ({cfg.gpu_per_node}) != CCO's lsa_size "
+                    f"({handle.lsa_size}): EP's idea of a node and the flat-VA team "
+                    "are different sets, so a peer-indexed access would resolve to "
+                    "the wrong rank"
+                )
+            expected = cfg.rank % cfg.gpu_per_node
+            if handle.lsa_rank != expected:
+                raise ValueError(
+                    f"rank {cfg.rank} has CCO lsa_rank {handle.lsa_rank} but EP's node "
+                    f"layout implies {expected}: world ranks are not laid out "
+                    "node-major, so worldPe - lsaBase is not an LSA rank"
+                )
+        except BaseException:
+            handle.close()
+            raise
         return handle
 
     def _alloc_internode_buffers(self, cfg):
@@ -334,6 +360,18 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     def _internode_unsupported(self, cfg) -> tuple[str, ...]:
         bad = []
+        # Checked HERE rather than where the plans are built: _build_internode_kernels
+        # runs after the arena and the dev comm are taken, and its caller does not
+        # gate on what it returns.
+        for leg, dt in (
+            ("dispatch", cfg.dispatch_dtype),
+            ("combine", cfg.combine_dtype),
+        ):
+            if dt not in self._INTERNODE_DTYPE:
+                bad.append(
+                    f"{leg} dtype {dt} has no internode kernel "
+                    f"(have {', '.join(self._INTERNODE_DTYPE.values())})"
+                )
         if cfg.is_scatter:
             bad.append("combine_mode='scatter' (the internode kernels gather)")
         if cfg.enable_std_moe:
@@ -341,6 +379,16 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         if cfg.quant_type != "none":
             bad.append(
                 f"quant_type={cfg.quant_type!r} (the internode combine is unquantised)"
+            )
+        # The internode kernel lays the scale rows down PACKED, and recv_scales()
+        # hands them back as an int32 view; a row that is not a whole number of
+        # dwords has no such view, and rounding it up runs off the region.
+        raw_scale_bytes = cfg.scale_dim * cfg.scale_type_size
+        if raw_scale_bytes % 4:
+            bad.append(
+                f"per-token scale row of {raw_scale_bytes} B "
+                f"(scale_dim={cfg.scale_dim} x {cfg.scale_type_size}); "
+                "the row must be a whole number of dwords"
             )
         # The same-destination dedup is a ballot with one lane per expert.
         from .dispatch_combine_op import WAVE
@@ -372,8 +420,13 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return (cfg.scale_dim * cfg.scale_type_size + 3) // 4
 
     def scale_stride_bytes(self) -> int:
-        """Padded to 128 B here; the base returns the row unchanged. Use the
-        module-level function when there is no op yet (sizing an arena)."""
+        """Padded to 128 B on the INTRANODE path; the base returns the row
+        unchanged. The internode kernel lays its rows down packed
+        (`destTokId * ScaleBytes`, ScaleBytes = scaleDim * scaleTypeSize) and
+        internode_regions sizes out_scales that way, so there it is the row itself.
+        Use the module-level function when there is no op yet (sizing an arena)."""
+        if self.cfg.is_internode:
+            return self._scale_row_bytes()
         return scale_stride_bytes(self._scale_row_bytes())
 
     @classmethod
@@ -704,23 +757,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return out
 
     def _build_internode_kernels(self, cfg) -> KernelSet:
-        # One tag per leg, not one for the op: see _INTERNODE_LEG.
+        # One tag per leg, not one for the op: see _INTERNODE_LEG. Both keys are
+        # present -- _internode_unsupported rejected the config otherwise.
         leg_dtype = {
-            "dispatch": self._INTERNODE_DTYPE.get(cfg.dispatch_dtype),
-            "combine": self._INTERNODE_DTYPE.get(cfg.combine_dtype),
+            "dispatch": self._INTERNODE_DTYPE[cfg.dispatch_dtype],
+            "combine": self._INTERNODE_DTYPE[cfg.combine_dtype],
         }
-        missing = [
-            f"{leg} dtype "
-            f"{cfg.dispatch_dtype if leg == 'dispatch' else cfg.combine_dtype}"
-            for leg, tag in leg_dtype.items()
-            if tag is None
-        ]
-        if missing:
-            return KernelSet(
-                dispatch={},
-                combine={},
-                unsupported=tuple(f"{m} has no internode entry" for m in missing),
-            )
 
         self._internode_buckets = self._internode_geometry_buckets(cfg)
         self._plans = []
@@ -802,10 +844,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     def _internode_geom_for(self, phase, num_tokens):
         """The tuned geometry for this token count. Buckets are ordered, coarsest
-        last, exactly as `_pick` walks the intranode schedule."""
-        for max_tok, disp_geom, comb_geom in self._internode_buckets:
-            if max_tok is None or num_tokens <= max_tok:
-                return disp_geom if phase == "dispatch" else comb_geom
+        last, and a schedule with no None sentinel falls back to the last one --
+        exactly as `_pick` walks the intranode schedule."""
+        bucket = self._internode_buckets[-1]
+        for row in self._internode_buckets:
+            if row[0] is None or num_tokens <= row[0]:
+                bucket = row
+                break
+        return bucket[1] if phase == "dispatch" else bucket[2]
 
     def _wrap_internode(self, phase):
         """One ABI crossing for the whole pass sequence.
@@ -830,10 +876,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             #                 (args.tokenIndices[tokenId * topk + laneId]), so a
             #                 null is a fault, not a skipped branch.
             #   weightsBuf    it is a DIFFERENT tensor in each phase, and its
-            #                 NULLNESS additionally sets the staging slot stride
-            #                 (`combXferBytes = hidden + (weights ? wt : 0)`),
-            #                 which both phases index -- so the two must agree on
-            #                 null-ness while disagreeing on the buffer.
+            #                 NULLNESS is the kernel's only gate on the fold. It
+            #                 also sets `combXferBytes = hidden + (weights ? wt :
+            #                 0)`, but only the four combine passes index that, so
+            #                 the phases need not agree on null-ness.
             #
             # Dispatch's weightsBuf is the caller's per-input-token weights and is
             # indexed by source token id. Combine's is indexed by RECEIVED token
@@ -846,13 +892,27 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             if phase == "dispatch":
                 w, ix = kw.get("weights"), kw.get("indices")
                 self._internode_has_weights = w is not None
-                self._internode_indices_ptr = 0 if ix is None else ix.data_ptr()
+                # The TENSOR, not just its address: combine dereferences this
+                # pointer on a LATER call, and nothing else keeps the caller's
+                # indices alive that long.
+                self._internode_indices = ix
                 weights_ptr = 0 if w is None else w.data_ptr()
-            elif getattr(self, "_internode_has_weights", False):
+            elif kw.get("want_weights", False):
+                # The fold's source is what dispatch delivered, so there is nothing
+                # to fold if it delivered none -- and the region still holds the
+                # previous round's values, which would be returned as this one's.
+                if not getattr(self, "_internode_has_weights", False):
+                    raise ValueError(
+                        "combine(weights=...) asks for the weight fold, but the "
+                        "preceding dispatch carried no weights: the internode "
+                        "combine folds the weights dispatch delivered, not the "
+                        "argument"
+                    )
                 weights_ptr = self.arena.local_ptr("dispatch_out_weights")
             else:
                 weights_ptr = 0
-            indices_ptr = getattr(self, "_internode_indices_ptr", 0)
+            held = getattr(self, "_internode_indices", None)
+            indices_ptr = 0 if held is None else held.data_ptr()
 
             # Only what varies. The rest is bound on the plan; see
             # _build_internode_kernels -- rdmaBlockNum and replayMode used to be
@@ -937,6 +997,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     def _close_backend(self):
         for plan in getattr(self, "_plans", ()):
             plan.close()
+        # After the plans: they embed the ccoDevComm by value and their kernels
+        # dereference its QPs. The static args cache the host struct's address, so
+        # it goes too -- nothing may re-read it once the handle is gone.
+        dev_comm = getattr(self, "_dev_comm", None)
+        if dev_comm is not None:
+            self._dev_comm = None
+            self._internode_static_cache = None
+            dev_comm.close()
 
     # -- views (same contract as the FlyDSL backend) -----------------------
 
@@ -1007,8 +1075,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         answer FlyDSL gives, and the same (recv_cap, dwords) int32 view, so a caller
         cannot tell the backends apart.
 
-        Strided, not packed: the rows sit scale_stride_bytes() apart. Anything
-        reading the region by pointer needs that pitch, not this shape.
+        The rows sit scale_stride_bytes() apart -- 128 B-padded on the intranode
+        path, packed on the internode one. Anything reading the region by pointer
+        needs that pitch, not this shape.
         """
         v = self._views.get("recv_scales")
         if v is not None:
@@ -1016,7 +1085,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         n_i32 = self._scale_i32(self.cfg)
         if not n_i32:
             return None
-        stride_i32 = self._scale_stride_i32(self.cfg)
+        stride_i32 = self.scale_stride_bytes() // 4
         rows = from_gpu_ptr(
             self.arena.local_ptr(self._region("out_scales")),
             (self._recv_cap, stride_i32),

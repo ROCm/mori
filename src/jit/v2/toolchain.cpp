@@ -163,7 +163,13 @@ std::string DetectSourceRoot() {
 std::string DetectNic() {
   std::string v = EnvOr("MORI_DEVICE_NIC", "mlx5");
   for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  return v.empty() ? "mlx5" : v;
+  // Closed set, checked here rather than in Flags(): mlx5 is the #else of both
+  // Flags() and cco_scale_out.hpp, so an unrecognised spelling would compile
+  // ccoGda<MLX5> against a bnxt/ionic QP and produce a silently wrong kernel.
+  if (v != "mlx5" && v != "bnxt" && v != "ionic") {
+    throw std::runtime_error("mori jit: MORI_DEVICE_NIC='" + v + "' is not one of mlx5/bnxt/ionic");
+  }
+  return v;
 }
 
 std::string DetectHipcc(const std::string& rocmPath) {

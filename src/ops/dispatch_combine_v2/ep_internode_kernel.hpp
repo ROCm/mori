@@ -287,10 +287,13 @@ inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs& args, int t
   core::WarpCopy(remoteIndexPtr + destTokId * config.numExpertPerToken,
                  localIndexPtr + tokenId * config.numExpertPerToken, config.numExpertPerToken);
 
-  float* remoteWeightPtr = args.reg(args.offDispatchOutWeights)->template GetAs<float*>(destPe);
-  const float* localWeightPtr = args.weightsBuf;
-  core::WarpCopy(remoteWeightPtr + destTokId * config.numExpertPerToken,
-                 localWeightPtr + tokenId * config.numExpertPerToken, config.numExpertPerToken);
+  // weightsBuf is null when the caller dispatches without weights.
+  if (args.weightsBuf) {
+    float* remoteWeightPtr = args.reg(args.offDispatchOutWeights)->template GetAs<float*>(destPe);
+    const float* localWeightPtr = args.weightsBuf;
+    core::WarpCopy(remoteWeightPtr + destTokId * config.numExpertPerToken,
+                   localWeightPtr + tokenId * config.numExpertPerToken, config.numExpertPerToken);
+  }
 
   if (args.scalesBuf && (scaleBytes > 0)) {
     core::WarpCopy(
@@ -696,10 +699,15 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs& args) {
     int globalTokenId = SendBufSlotOffset(config, node, tokenId);
     index_t* indices =
         reinterpret_cast<index_t*>(stagingPtr + globalTokenId * xferBytes + hiddenBytes);
+    // Sentinel lanes (-1 expert) get a unique impossible destPe to avoid false
+    // dup-matches, exactly as DispatchInterNodeRecv does. -1 / numExpertPerRank
+    // truncates toward zero, so without this an unfilled slot reads as PE 0.
     int lanePe = -1;
     if (laneId < config.numExpertPerToken) {
-      lanePe = indices[laneId] / config.numExpertPerRank;
-      assert((lanePe < config.worldSize) && (lanePe >= 0));
+      index_t laneExpert = indices[laneId];
+      lanePe = (laneExpert < 0) ? (-1 - static_cast<int>(laneId))
+                                : (laneExpert / config.numExpertPerRank);
+      assert((laneExpert < 0) || ((lanePe < config.worldSize) && (lanePe >= 0)));
     }
     index_t srcTokId =
         reinterpret_cast<index_t*>(stagingPtr + globalTokenId * xferBytes + hiddenBytes +
@@ -847,9 +855,13 @@ __device__ void EpDispatchCopyToStaging_body(EpDispatchCombineArgs args) {
     core::WarpCopy<uint8_t, 4>(stagingPtr + stagingTokOffset + hiddenBytes,
                                reinterpret_cast<uint8_t*>(args.tokenIndices) + tokenId * indexBytes,
                                indexBytes);
-    core::WarpCopy<uint8_t, 4>(stagingPtr + stagingTokOffset + hiddenBytes + indexBytes,
-                               reinterpret_cast<uint8_t*>(args.weightsBuf) + tokenId * weightBytes,
-                               weightBytes);
+    // weightsBuf is null when the caller dispatches without weights; the slot's
+    // weight bytes are then only forwarded, never accumulated -- every reader of
+    // the weights regions is itself weightsBuf-guarded.
+    if (args.weightsBuf)
+      core::WarpCopy<uint8_t, 4>(
+          stagingPtr + stagingTokOffset + hiddenBytes + indexBytes,
+          reinterpret_cast<uint8_t*>(args.weightsBuf) + tokenId * weightBytes, weightBytes);
     if (args.scalesBuf && (scaleBytes > 0))
       core::WarpCopy<uint8_t, 4>(
           stagingPtr + stagingTokOffset + hiddenBytes + indexBytes + weightBytes,
@@ -1063,7 +1075,7 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& arg
   int maxChunkNum = core::CeilDiv(config.MaxNumTokensToSendPerRank(), warpSize);
 
   uint64_t* chunkFlag = args.reg(args.offChunkFlag)->template GetAs<uint64_t*>();
-  index_t* nodeRecvTokenNum = args.reg(args.offNodeRecvTokenNum)->template GetAs<index_t*>();
+  uint64_t* nodeRecvTokenNum = args.reg(args.offNodeRecvTokenNum)->template GetAs<uint64_t*>();
 
   extern __shared__ char sharedMem[];
   TokT** srcPtrs = reinterpret_cast<TokT**>(sharedMem) + warpId * config.numExpertPerToken;
@@ -1106,7 +1118,7 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& arg
           if (laneId == 0) {
             thisChunkTokenNum = chunkFlag[node * maxChunkNum + k];
             if (thisChunkTokenNum == 0) {
-              index_t nodeFlag = core::AtomicLoadRelaxedSystem(&nodeRecvTokenNum[node]);
+              uint64_t nodeFlag = core::AtomicLoadRelaxedSystem(&nodeRecvTokenNum[node]);
               if ((nodeFlag > 0) && (startTokenIdx >= (nodeFlag - 1))) {
                 thisChunkTokenNum = 1;
               }

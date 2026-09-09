@@ -712,6 +712,27 @@ def _args_layout(plan):
     return tuple((n, getattr(t, n).offset, getattr(t, n).size) for n in plan._arg_names)
 
 
+_UNSET = object()  # "no default bound", distinct from every bound value
+
+
+def _bound_defaults(plan) -> dict:
+    """The plan's bound defaults, keyed for comparison across a group.
+
+    Compared the way launch would write each one: an int by value, a
+    pointer-like value by the address it resolves to, anything else by identity.
+    """
+    out = {}
+    for name, v in plan._defaults.items():
+        if type(v) is int:
+            out[name] = v
+            continue
+        try:
+            out[name] = ("p", _as_ptr(v))
+        except TypeError:
+            out[name] = ("o", id(v))
+    return out
+
+
 class LaunchGroup:
     """A fixed set of plans over one args layout, validated once.
 
@@ -737,6 +758,7 @@ class LaunchGroup:
                 raise RuntimeError(f"launch group over a closed plan at index {i}")
         lead = plans[0]
         want = _args_layout(lead)
+        want_defs = _bound_defaults(lead)
         for i, p in enumerate(plans[1:], 1):
             got = _args_layout(p)
             if got != want:
@@ -744,6 +766,23 @@ class LaunchGroup:
                 raise ValueError(
                     f"launch group: plan {i} ({p._kernel}) does not share "
                     f"{lead._kernel}'s args layout; first difference at {diff[0]}"
+                )
+            # launch() fills the LEAD's buffer and hands it to every plan, so a
+            # default bound on a non-lead plan is never written. Disagreement is
+            # a caller bug; filling every buffer instead would silently move the
+            # per-plan fill work back onto the launch path.
+            got_defs = _bound_defaults(p)
+            if got_defs != want_defs:
+                field = sorted(
+                    k
+                    for k in set(want_defs) | set(got_defs)
+                    if want_defs.get(k, _UNSET) != got_defs.get(k, _UNSET)
+                )[0]
+                raise ValueError(
+                    f"launch group: plan {i} ({p._kernel}) binds {field}="
+                    f"{p._defaults.get(field, '<unset>')!r}, but lead "
+                    f"{lead._kernel} binds {lead._defaults.get(field, '<unset>')!r}; "
+                    "every plan in a group must agree on its bound defaults"
                 )
         self._plans = plans
         self._lead = lead
