@@ -281,24 +281,6 @@ __device__ __forceinline__ int32_t EpInterNodeWaitGt(int32_t* addr, int32_t val)
   return observed;
 }
 
-// Device timestamps, opt-in. args.dbgTsBuf is null unless MORI_EP_DEV_TS is set
-// on the host, so each site below is one wave-uniform scalar compare against a
-// kernarg. EVERY site sits OUTSIDE a spin loop: the whole point is to time the
-// loops, and an instruction added inside one would change what is measured.
-//
-// wall_clock64() and not mori::cco::clock64(): the latter is
-// __builtin_readcyclecounter(), the SHADER clock, which moves with DVFS. This
-// measurement compares a slow round against a fast one on a box where the
-// shader clock has been observed to vary by several percent, so a shader-clock
-// timer cannot tell "waited longer" from "clocked lower". wall_clock64 is the
-// fixed reference counter; measured on this gfx942 rig at 100.008 MHz.
-constexpr int kEpDbgTsSlots = 24;
-
-__device__ __forceinline__ void EpDbgTs(const EpDispatchCombineArgs& args, int slot) {
-  if (args.dbgTsBuf == nullptr) return;
-  args.dbgTsBuf[args.dbgRound * kEpDbgTsSlots + slot] = static_cast<uint64_t>(wall_clock64());
-}
-
 /* ---------------------------------------------------------------------------------------------- */
 /*                                   EpDispatchInterNodeV1Kernel                                  */
 /* ---------------------------------------------------------------------------------------------- */
@@ -603,17 +585,11 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs& args,
         size_t stagingTokOffset = tokenId * xferBytes;
         int qpId = (tokenId / warpSize) % config.numQpPerPe;
 
-        // Slots 1/2 bracket the ONE thing that is purely local on the send
-        // side: building the WQE and ringing the doorbell. At 4 tokens there is
-        // exactly one post per pass so this is exact; above 64 tokens it is
-        // last-write-wins and reports the final chunk.
-        EpDbgTs(args, 1);
         EpInterNodePutSignal(comm, args.reg(args.offDispatchInp), remoteIdx * xferBytes,
                              args.reg(args.offDispatchStaging), stagingTokOffset,
                              tokenNum * xferBytes, args.reg(args.offChunkFlag),
                              (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t), tokenNum + 1,
                              proxyPe, qpId);
-        EpDbgTs(args, 2);
       }
       if (shouldSend) args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
     }
@@ -633,10 +609,6 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs& args,
     }
     if (laneId == 0) args.interNodeBlocksBarrier[1] = 0;
   }
-  // End of the send half. This is a fan-in (atomicAdd), not a barrier -- nobody
-  // blocks -- so slot 3 measures warp-arrival skew plus the tail atomic, and
-  // must not be read as "barrier time".
-  if ((globalWarpId == 0) && (laneId == 0)) EpDbgTs(args, 3);
 }
 
 template <EpInterNodeKernelCfg kConfig, typename T>
@@ -795,11 +767,6 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs& args) {
     index_t nodeFlag = 0;
     if (laneId == 0) {
       uint64_t barrierFlag = args.crossDeviceBarrierFlag[0];
-      // Slots 4/5 bracket the wait for the peer's write to land. Guarded to one
-      // warp so the 32 spinning lanes do not all write the same slot; at 4
-      // tokens globalWarp 0 runs the outer loop exactly once, so it is
-      // unambiguous which wait this is.
-      if (globalWarpId == 0) EpDbgTs(args, 4);
       while (1) {
         thisChunkTokenNum = core::AtomicLoadRelaxedSystem(&chunkFlag[node * maxChunkNum + k]);
         if (thisChunkTokenNum > 0) break;
@@ -810,7 +777,6 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs& args) {
           break;
         }
       }
-      if (globalWarpId == 0) EpDbgTs(args, 5);
     }
     thisChunkTokenNum = __shfl(thisChunkTokenNum, 0) - 1;
     int endTokenIdx = startTokenIdx + thisChunkTokenNum;
@@ -875,12 +841,6 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs& args) {
     int destPe = myNode * config.gpuPerNode + laneId;
     int counter = atomicAdd(args.destPeTokenCounter + destPe, localPeTokenCounter);
   }
-  // Slot 6 closes the recv half. 5->6 is everything AFTER the peer data has
-  // landed: unpacking the staging slots and WarpCopy-ing each token into the
-  // destination rank's buffer, which for a same-node destPe is an XGMI peer
-  // write. The 4-token measurement put the whole regime delta in this span,
-  // with the post and the spin both flat, so it needs its own bracket.
-  if ((globalWarpId == 0) && (laneId == 0)) EpDbgTs(args, 6);
 }
 
 template <EpInterNodeKernelCfg kConfig, typename T>
@@ -962,16 +922,6 @@ __device__ void EpDispatchCopyToStaging_body(EpDispatchCombineArgs args) {
       INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SPAN(profiler, Slot::EpDispatchCopyToStaging);
 
-  // Zero the receive counter here rather than from the host. DispatchSync
-  // accumulates into it with atomicAdd, so it has to start at 0 every dispatch;
-  // EpCombineAll clears it at the end of the pair, but that only covers a caller
-  // that always combines. The host's `total_recv.zero_()` covered the rest at the
-  // cost of a whole fill kernel enqueued AHEAD of the dispatch sequence on the
-  // same stream -- it delayed the kernels it was protecting. This is the first
-  // pass of that sequence and runs entirely before dispatch_ll, so stream order
-  // is the ordering guarantee. Before the empty-input return: zero tokens still
-  // needs the counter cleared.
-  if ((blockId == 0) && (thdId == 0)) EpDbgTs(args, 12);
   if (globalThdId == 0) args.totalRecvTokenNum[0] = 0;
   if (args.curRankNumToken == 0) return;
 
@@ -1005,18 +955,12 @@ __device__ void EpDispatchCopyToStaging_body(EpDispatchCombineArgs args) {
                                  weightBytes + scaleBytes)[0] =
           static_cast<index_t>(FlatTokenIndex(config, myPe, tokenId));
   }
-  // Slots 12/13 bracket copystaging. It is the ONLY other kernel in the
-  // dispatch phase, and the phase's whole regime delta sits outside
-  // dispatch_ll, so this is what separates 'the staging copy got slower' from
-  // 'the gap between the two launches grew'.
-  if ((blockId == 0) && (thdId == 0)) EpDbgTs(args, 13);
 }
 
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpDispatchInterNodeV1KernelLowLatency_body(EpDispatchCombineArgs args,
                                                            const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
-  if ((blockId == 0) && (thdId == 0)) EpDbgTs(args, 0);
   if (blockId < args.rdmaBlockNum) {
     internode::DispatchInterNodeLLSend<kConfig, T>(args, comm);
     internode::DispatchInterNodeLLRecv<kConfig, T>(args);
@@ -1024,8 +968,6 @@ __device__ void EpDispatchInterNodeV1KernelLowLatency_body(EpDispatchCombineArgs
     internode::DispatchIntraNode<kConfig, T>(args);
   }
   internode::DispatchSync<kConfig, T>(args, comm);
-  // 6->7 is DispatchSync, the grid-wide barrier that ends the kernel.
-  if ((blockId == 0) && (thdId == 0)) EpDbgTs(args, 7);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -1489,7 +1431,6 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
         }
         int proxyPe = node * config.gpuPerNode + (myPe % config.gpuPerNode);
         int qpId = k % config.numQpPerPe;
-        EpDbgTs(args, 9);
         EpInterNodePut(comm, args.reg(args.offStaging),
                        SendBufSlotOffset(config, myNode + nNodes, startTokenIdx) * tokCombXferBytes,
                        args.reg(args.offStaging),
@@ -1532,12 +1473,9 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
     uint64_t* localBarrierPtr = args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>();
     if ((laneId < nNodes) && (laneId != myNode)) {
       int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
-      // Slots 10/11: combine's only cross-node wait.
-      EpDbgTs(args, 10);
       while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
              (barrierFlag * config.numQpPerPe)) {
       }
-      EpDbgTs(args, 11);
     }
   }
 }
@@ -1764,22 +1702,15 @@ __device__ void EpCombineAll_body(EpDispatchCombineArgs args) {
     const size_t fp8CombXferBytes =
         (args.weightsBuf == nullptr) ? fp8HiddenBytes : fp8HiddenBytes + weightBytes;
     combine_all_impl::EpCombineAllInternalFp8<kConfig, T>(args, fp8HiddenBytes, fp8CombXferBytes);
-    // Slot 14 marks the end of the LAST pass of the combine phase, on both
-    // exits. Paired with slot 12 of the NEXT round's dispatch it gives the true
-    // GPU-timeline gap between the two phases -- the quantity that the phase
-    // events cannot separate from host time.
-    if ((blockId == 0) && (thdId == 0)) EpDbgTs(args, 14);
     return;
   }
   combine_all_impl::EpCombineAllGeneric<kConfig, T>(args);
-  if ((blockId == 0) && (thdId == 0)) EpDbgTs(args, 14);
 }
 
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpCombineInterNodeV1KernelLowLatency_body(EpDispatchCombineArgs args,
                                                           const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
-  if ((blockId == 0) && (thdId == 0)) EpDbgTs(args, 8);
 
   if (blockId < args.rdmaBlockNum) {
     internode::CombineInterNodeLL<kConfig, T>(args, comm);
@@ -1791,22 +1722,12 @@ __device__ void EpCombineInterNodeV1KernelLowLatency_body(EpDispatchCombineArgs 
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpCombineSync_body(EpDispatchCombineArgs args) {
   DEF_COMMON_VARS;
-  // 18/19 bracket combinesync, the FIRST pass of the combine phase. With 7->18
-  // this splits pre_bar into "everything between the two mori calls" -- the
-  // torch convert and the launch path -- and the kernel itself.
-  if ((blockId == 0) && (thdId == 0)) EpDbgTs(args, 18);
   internode::CombineSync<kConfig, T>(args);
-  if ((blockId == 0) && (thdId == 0)) EpDbgTs(args, 19);
 }
 
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpCombineSyncBarrier_body(EpDispatchCombineArgs args) {
   DEF_COMMON_VARS;
-  // 16/17 bracket the cross-device barrier that OPENS the combine phase. It
-  // sits between dispatch_ll ending and combine_ll starting, so the phase
-  // events charge it to neither -- and the closed per-round accounting put both
-  // the largest term and the whole regime delta in exactly that window.
-  if ((blockId == 0) && (thdId == 0)) EpDbgTs(args, 16);
   IF_ENABLE_PROFILER(
       INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SPAN(profiler, Slot::EpCombineSyncBarrier);
@@ -1824,7 +1745,6 @@ __device__ void EpCombineSyncBarrier_body(EpDispatchCombineArgs args) {
     while (core::AtomicLoadRelaxedSystem(localBarrierPtr + destPe) != barrierFlag) {
     }
   }
-  if ((blockId == 0) && (thdId == 0)) EpDbgTs(args, 17);
 }
 
 }  // namespace v2

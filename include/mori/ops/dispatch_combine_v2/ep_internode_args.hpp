@@ -284,9 +284,7 @@ __device__ inline int NullSendBufSlotOffset(const EpInterNodeDeviceCfg& config) 
   X(dispatchGridBarrier, "p")            \
   X(combineGridBarrier, "p")             \
   X(interNodeBlocksBarrier, "p")         \
-  X(crossDeviceBarrierFlag, "p")         \
-  X(dbgRound, "i32")                     \
-  X(dbgTsBuf, "p")
+  X(crossDeviceBarrierFlag, "p")
 
 #define MORI_EP_INTERNODE_ARGS_SCHEMA_ENTRY(name, tag) #name ":" tag ","
 // Trailing comma: the binding skips empty items, so there is no last-element
@@ -356,17 +354,6 @@ struct EpInterNodeArgs {
   uint32_t* interNodeBlocksBarrier{nullptr};
   uint64_t* crossDeviceBarrierFlag{nullptr};
 
-  // Device timestamps, opt-in and NULL unless MORI_EP_DEV_TS is set on the
-  // host -- the null is what turns every stamp site in the kernel off. The
-  // round index has to come from the host: the kernel has no notion of which
-  // benchmark round it is in, and deriving one from a device atomic would put
-  // a global atomic inside the region being measured.
-  //
-  // ORDER MATTERS, and not for the reason it looks like. The int32 goes FIRST
-  // so the pointer is last and this struct ends with no tail padding; see the
-  // no-tail-padding static_assert below for what happens otherwise.
-  int32_t dbgRound{0};
-  uint64_t* dbgTsBuf{nullptr};
 
   // An offset as something addressable. Built per access; the three members are
   // all the accessors need, so this costs nothing at -O2.
@@ -394,7 +381,7 @@ constexpr bool EpInterNodeArgsOffsetsAscend() {
 
 }  // namespace detail
 
-static_assert(detail::kEpInterNodeArgsFieldCount == 41,
+static_assert(detail::kEpInterNodeArgsFieldCount == 39,
               "added an EpInterNodeArgs field -- add it to MORI_EP_INTERNODE_ARGS_FIELDS in "
               "the same position and bump this count");
 static_assert(detail::EpInterNodeArgsOffsetsAscend(),
@@ -412,7 +399,8 @@ static_assert(detail::EpInterNodeArgsOffsetsAscend(),
 // state. Nothing else catches it -- both layouts have the SAME sizeof, so the
 // binding's size check passes, and the ascending-offset assert above is about
 // the fields, not about what follows them.
-static_assert(offsetof(EpInterNodeArgs, dbgTsBuf) + sizeof(EpInterNodeArgs::dbgTsBuf) ==
+static_assert(offsetof(EpInterNodeArgs, crossDeviceBarrierFlag) +
+                      sizeof(EpInterNodeArgs::crossDeviceBarrierFlag) ==
                   sizeof(EpInterNodeArgs),
               "EpInterNodeArgs has tail padding -- the binding would place devComm before "
               "C++ does. Keep an 8-byte member last (update the name here if it changes)");

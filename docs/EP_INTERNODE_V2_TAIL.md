@@ -240,10 +240,18 @@ METHOD
 
 DEVICE TIMESTAMPS: NEITHER KERNEL GETS SLOWER
 ---------------------------------------------
-`MORI_EP_DEV_TS=1` stamps `wall_clock64()` (fixed 100.008 MHz on this gfx942,
-10 ns; NOT `clock64()`, which is the shader clock and moves with DVFS) at twelve
-points and reports per-round spans per rank. Comparing slow rounds against fast
-rounds WITHIN one run and one rank:
+The instrumentation behind this section has been REMOVED (it was `MORI_EP_DEV_TS`,
+twelve `wall_clock64()` stamp sites carried on an `EpInterNodeArgs` pointer). Its
+switch was a runtime null check, so instrumented and uninstrumented shared one
+binary and the +2 VGPR / +4 SGPR-spill cost sat on the default path forever. An
+interleaved A/B put any time cost below this rig's noise, but the findings were
+already banked and a diagnostic that has served its purpose should not be a
+permanent tax. Recover it from git history (`[EP] Device timestamps splitting
+send-post from recv-spin`) if the residual is picked up again; note that
+`wall_clock64()` is the only correct source -- `clock64()` is the shader clock
+and moves with DVFS, which is exactly what such a comparison must not do.
+
+Comparing slow rounds against fast rounds WITHIN one run and one rank:
 
     span                        fast     slow    delta
     d_stag  copystaging kernel   2.6      2.6     +0.0

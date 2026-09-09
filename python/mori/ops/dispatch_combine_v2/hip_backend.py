@@ -98,17 +98,6 @@ _DEBUG_GEOM = bool(os.environ.get("MORI_EP_DEBUG_GEOM"))
 _SPLIT_PASSES = bool(os.environ.get("MORI_EP_SPLIT_PASSES"))
 _TRACE_ARGS = bool(os.environ.get("MORI_INTERNODE_TRACE_ARGS"))
 
-# Device timestamps inside dispatch_ll and combine_ll, opt-in. Read once here for
-# the same reason as the two above. When off the buffer is not allocated and the
-# args pointer stays null, and the null is what turns off every stamp site in the
-# kernel -- there is one binary either way, so the JIT cache key does not depend
-# on this. The kernel cannot know which benchmark round it is in, so the host
-# supplies the row index; that is only correct because dispatch and combine are
-# each called exactly once per round.
-_DEV_TS = bool(os.environ.get("MORI_EP_DEV_TS"))
-_TS_SLOTS = 24  # must equal kEpDbgTsSlots in ep_internode_kernel.hpp
-_TS_ROUNDS = 4096
-
 
 def _geom_env(name):
     """``"block,rdma,warp"`` from the environment, or None.
@@ -183,11 +172,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._views = {}
         # (pass_name, event) appended per launch when MORI_EP_SPLIT_PASSES is on.
         self._pass_marks = []
-        # Set here rather than only on the internode path so run() can test it
-        # unconditionally; the buffer itself is allocated with the other
-        # internode buffers, and stays None for an intranode config.
-        self.dbg_ts = None
-        self.dbg_round = {"dispatch": 0, "combine": 0}
         # gfx125x routes to the TDM kernel, which needs a superset arena (plan A).
         _arch = getattr(torch.cuda.get_device_properties(dev), "gcnArchName", "") or ""
         self._is1250 = _arch.split(":")[0].startswith("gfx125")
@@ -342,16 +326,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # Zero, not one: the internode kernels start their cross-device epoch at
         # 0 (v1 seeds it that way for exactly these kernel types).
         self.cross_device_flag = torch.zeros(1, dtype=torch.int64, device=dev)
-
-        # Plain local device memory, deliberately NOT an arena region: nothing
-        # reads these remotely, and the arena is the uncached symmetric window
-        # whose behaviour is what the timestamps are measuring -- storing into it
-        # would perturb the thing under test.
-        self.dbg_ts = (
-            torch.zeros(_TS_ROUNDS * _TS_SLOTS, dtype=torch.int64, device=dev)
-            if _DEV_TS
-            else None
-        )
 
         # Views onto the arena, NOT fresh tensors: EpCombineAll writes the
         # symmetric regions, so a local buffer here would be returned to the
@@ -629,7 +603,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             combineGridBarrier=ptr(self.combine_barrier),
             interNodeBlocksBarrier=ptr(self.inter_blocks_barrier),
             crossDeviceBarrierFlag=ptr(self.cross_device_flag),
-            dbgTsBuf=ptr(self.dbg_ts) if self.dbg_ts is not None else 0,
             # The HOST struct, not DevCommHandle.ptr (the device-side copy): the args
             # embed a ccoDevComm by value, so the binding memcpys from host memory.
             devComm=self._dev_comm._dev_comm.host_ptr,
@@ -909,14 +882,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     kw["scales"].data_ptr() if kw.get("scales") is not None else 0
                 ),
             )
-            if self.dbg_ts is not None:
-                # Which row of the timestamp buffer this launch writes. The key
-                # is present on every launch when on and absent on every launch
-                # when off, so the per-launch arg-buffer cache key is stable
-                # either way and this costs one _set_arg, not a cache miss.
-                r = self.dbg_round[phase]
-                args["dbgRound"] = min(r, _TS_ROUNDS - 1)
-                self.dbg_round[phase] = r + 1
             if _TRACE_ARGS and self.cfg.rank == 0:
                 print(
                     f"[trace] {phase} ll={ll} tokens={num_tokens} "
