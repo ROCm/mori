@@ -492,6 +492,7 @@ def make_plan(kernel: str, enums: dict | None = None) -> type:
             # bind(), so pinned arguments are never served from a stale cache.
             self._buf = None
             self._buf_shape = None
+            self._last = {}
             self._dyn_args = ()
             self._dyn_defs = ()
             # Known at construction, so the caller need not repeat them per launch.
@@ -593,10 +594,34 @@ def make_plan(kernel: str, enums: dict | None = None) -> type:
                     for w, v in self._defaults.items()
                     if w in arg_names and (not isinstance(v, int) or w in arg_blobs)
                 )
+                self._last = {}
             else:
                 buf = self._buf
+                last = self._last
                 for k, wire in self._dyn_args:
-                    _set_arg(buf, wire, args[k])
+                    v = args[k]
+                    # Skip a field whose INT value is what is already in the
+                    # buffer. Same reasoning as the _dyn_defs filter above: the
+                    # struct persists between launches, so re-writing an
+                    # unchanged int is pure cost. A caller that hands over
+                    # tensor addresses (every EP one does -- hip_backend passes
+                    # .data_ptr() results) repeats them every round, and each
+                    # write costs a Python call, a dict lookup, a hasattr and a
+                    # setattr. A moved allocation changes the int, misses here,
+                    # and is written.
+                    #
+                    # NOT for a blob: it crosses by value, and an unchanged
+                    # address is no evidence the bytes behind it held still.
+                    # NOT for a non-int either -- resolving it is the only way to
+                    # know its address, and `!=` on a tensor does not even return
+                    # a bool.
+                    if type(v) is int and wire not in arg_blobs:
+                        if last.get(wire) == v:
+                            continue
+                        _set_arg(buf, wire, v)
+                        last[wire] = v
+                    else:
+                        _set_arg(buf, wire, v)
                 for wire in self._dyn_defs:
                     _set_arg(buf, wire, self._defaults[wire])
             return buf
