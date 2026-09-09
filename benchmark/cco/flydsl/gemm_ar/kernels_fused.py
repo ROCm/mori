@@ -1058,13 +1058,25 @@ def compile_fused_gemm_scatter(
         )
     direct_lsa = fuse and transport == "lsa"
     rotated = fuse if rotated is None else rotated
+    # n_stripe spans 1..N//BLOCK_N; the top of the range *is* chunk-major, so
+    # 0 ("per-mode default") resolves to it rather than to a separate branch.
     if n_stripe is None:
-        n_stripe = 2 if (fuse and transport == "lsa") else 0  # 0 -> chunk-major
+        n_stripe = 2 if direct_lsa else 0
     if n_stripe == 0:
-        n_stripe = N // BLOCK_N  # chunk-major == stripe of a whole chunk
-    if n_stripe < 1:
-        raise ValueError(f"n_stripe must be >= 1, got {n_stripe}")
-    if n_stripe != 1 and not rotated:
+        n_stripe = N // BLOCK_N
+    if n_stripe < 1 or n_stripe > N // BLOCK_N:
+        raise ValueError(
+            f"n_stripe must be in [1, {N // BLOCK_N}], got {n_stripe}"
+        )
+    if (N // BLOCK_N) % n_stripe:
+        raise ValueError(
+            f"n_stripe={n_stripe} must divide the {N // BLOCK_N} N-tiles"
+        )
+    # Only a *real* stripe needs the rotated order. Chunk-major is the
+    # unstriped case and is what the linear order already does per destination,
+    # so leaving it on a non-rotated build is not an error -- the split
+    # baseline compiles that way.
+    if n_stripe < N // BLOCK_N and not rotated:
         raise ValueError("a striped tile order needs --tile-order rotated")
 
     assert BLOCK_M >= 128 and BLOCK_N >= 256
