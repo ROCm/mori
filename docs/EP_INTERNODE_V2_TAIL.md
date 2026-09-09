@@ -60,11 +60,51 @@ The step is NOT caused by, all eliminated by direct measurement:
     pri5 transition counters are all +0, fast runs and slow runs alike
   * GPU clocks -- sampling pp_dpm_{sclk,fclk,socclk} across the loop window puts
     sclk within 4% and fclk, if anything, HIGHER on the slow runs
+  * xGMI per-link power down -- `~/harness/_plpd.sh 0` (plpd_disallow on all 16
+    GPUs) against stock, four interleaved pairs: slow runs appear under both
+  * PCIe -- `~/harness/_pcie_snap.sh` before and after: no link speed or width
+    change on any GPU or NIC, and TOTAL_ERR_COR/NONFATAL/FATAL all +0, on slow
+    runs as much as fast ones
+  * the VMM/dma-buf placement problem in `.claude/skills/known-issues`
+    (Issue 1) -- both nodes have CONFIG_DMABUF_MOVE_NOTIFY=y and
+    CONFIG_PCI_P2PDMA=y on the running 6.8.12 kernel, and `vmm_peer_probe`
+    returns `VERDICT: OK` on both. Its *family* is right (see the pass split
+    below) but its specific compile-time cause is absent here
   * the host -- see below
+
+A note on the counter probes: `_nic_snap.sh` now reads tx_pkts/tx_bytes/
+rx_pkts/tx_write_req alongside the error counters, as a check on the probe
+itself. A 60-round run moves +20111 packets / +49.6 MB / +12960 write requests
+on each node, so the zeroes above are measured zeroes and not an unwired probe.
+That check was added after noticing that a table of zeroes reads identically
+either way.
 
 `--per-round-sync` cannot be used to test any of this: its gloo barrier costs
 ~1.3ms a round here and injects far more rank skew than it removes (dispatch
 reads ~1370us under it). `--per-round-drain` is the usable version.
+
+ONLY THE PASSES THAT TOUCH REMOTE MEMORY DEGRADE
+------------------------------------------------
+The split also attributes the STEP, by first-k rounds against last-k (a
+different question from which pass owns the worst round, and it need not have
+the same answer). Three runs:
+
+              copystaging   dispatch_ll   combinesync  combine_ll  combineall
+    rep1        +0.0          +33.1         +0.1        -0.3        +0.2
+    rep2        +0.0          +45.8         +0.1       +47.3        -0.0
+    rep3        +0.0          +67.0         +0.0       +66.0        +0.0
+
+`dispatch_ll` and `combine_ll` are the passes that read and write PEER memory.
+`copystaging` (7.0us, local staging copy), `combinesync` and `combineall` touch
+only local memory. The local passes are flat to under 1% in every run; the
+remote ones roughly double.
+
+So the degradation is confined to the remote-access path, and is not a general
+slowdown of the GPU. That is the same family as known-issues Issue 1 -- peer
+traffic getting more expensive than it should -- even though Issue 1's own
+compile-time cause is ruled out here. The remaining candidates all live in that
+family: NIC address-translation/MTT cache pressure, or page placement of the
+symmetric window.
 
 WHERE THE EXCESS LANDS: THE PER-PASS SPLIT
 ------------------------------------------
@@ -171,4 +211,5 @@ excess inside `dispatch_ll` and inside `combinesyncbarrier` -- both of which mix
 posting with waiting, so the split cannot go further from the host side. The next
 step is device-side timestamps inside `dispatch_ll` separating the send-post from
 the receive spin, which would say whether the extra time is spent getting the
-data out or waiting for a peer's.
+data out or waiting for a peer's. The step attribution above says the target is
+right: whatever it is, it is on the remote-access path and not in local work.

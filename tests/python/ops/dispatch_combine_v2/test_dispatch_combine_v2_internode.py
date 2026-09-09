@@ -564,6 +564,22 @@ def _bench(op, cfg, d, dev, a, comm):
                 flush=True,
             )
             print(f"{pfx} rounds: " + " ".join(f"{t:.0f}" for t in totals), flush=True)
+            # STEP attribution. A run that lands in the slow regime does a few
+            # rounds at the fast level, steps over one round, and holds -- so the
+            # question "which pass owns the step" is answered by the first rounds
+            # against the last, and is a different question from "which pass owns
+            # the worst round". Both are printed because they need not have the
+            # same answer: a step in a pass that only does local work would mean
+            # something quite different from a step in the pass that waits.
+            k = max(3, len(rounds) // 12)
+            for nm_i, nm in enumerate(names):
+                e = sum(r[nm_i][1] for r in rounds[:k]) / k
+                l = sum(r[nm_i][1] for r in rounds[-k:]) / k
+                print(
+                    f"{pfx} step {nm:<20} first{k}={e:8.1f}  last{k}={l:8.1f}  "
+                    f"delta={l - e:+8.1f}",
+                    flush=True,
+                )
             # Top 3, not just the worst: one round can be an artifact, three
             # agreeing on the same pass is a mechanism.
             for wi in reversed(order[-3:]):
