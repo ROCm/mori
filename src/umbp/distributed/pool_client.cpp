@@ -218,10 +218,35 @@ struct RangedPhases {
   double xfer_wait = 0.0;
   double lock = 0.0;
   double remote = 0.0;
+  // remote split four ways.  Once the arena stopped serializing, `remote` was
+  // ~88% of a cross-node call with nothing inside it to point at: the resolve
+  // RPC, the RDMA itself, and the arena->GPU scatter are three different fixes.
+  double rmt_resolve = 0.0;  // BatchResolveKeys round trip to the owning peer
+  double rmt_build = 0.0;    // describing the transfer + planning it + posting it
+  // ...and rmt_build split, once it became the largest item: describing the
+  // spans, bucketing them into plans, and posting the RDMA are three costs.
+  double rmt_bld_items = 0.0;
+  double rmt_bld_plan = 0.0;
+  double rmt_bld_post = 0.0;
+  double rmt_wait = 0.0;     // the RDMA read itself
+  double rmt_scatter = 0.0;  // arena -> caller buffers
+  // ...and the scatter split the same three ways as `xfer`, because the device
+  // gather kernel's own timer says it moves those bytes in an eighth of what
+  // the phase costs -- so most of it is not the copy.
+  double scat_plan = 0.0;
+  double scat_submit = 0.0;
+  double scat_wait = 0.0;
   size_t keys = 0;
   // TransferItems handed to the engine.  Grows with ranges, not keys, and is
   // what makes the item-per-range cost visible next to the phase times.
   size_t items = 0;
+  // Remote-leg shape.  The phase timers say WHERE the time goes; these say
+  // whether it is one cost repeated too often.  A segment that failed to
+  // coalesce shows up here long before it shows up as a percentage.
+  size_t rmt_items = 0;    // TransferItems handed to the RDMA planner
+  size_t rmt_plans = 0;    // plans it produced -- items/plans is the fan-in
+  size_t scat_items = 0;   // no plan count: getting one costs a second Plan()
+                           // pass, inside the very phase being measured
   size_t local_keys = 0;
   size_t remote_keys = 0;
   double bytes = 0.0;
@@ -259,6 +284,34 @@ class PhaseTimer {
   std::chrono::steady_clock::time_point start_;
 };
 
+// Sinks for the three legs that live inside the remote phase.  They are taken
+// in SubmitRemoteBatchGet / WaitRemoteBatchGet, three calls below the ranged
+// entry point and shared with the non-ranged path, so publishing them here
+// beats threading a debug pointer through five signatures no other caller
+// wants.  Null whenever the ranged debug is off, which is the normal case.
+struct RemoteLegSinks {
+  size_t* items = nullptr;
+  size_t* plans = nullptr;
+  double* resolve = nullptr;
+  double* build = nullptr;
+  double* build_items = nullptr;
+  double* build_plan = nullptr;
+  double* build_post = nullptr;
+  double* wait = nullptr;
+};
+thread_local RemoteLegSinks* t_remote_leg = nullptr;
+
+class ScopedRemoteLeg {
+ public:
+  explicit ScopedRemoteLeg(RemoteLegSinks* sinks) : prev_(t_remote_leg) { t_remote_leg = sinks; }
+  ~ScopedRemoteLeg() { t_remote_leg = prev_; }
+  ScopedRemoteLeg(const ScopedRemoteLeg&) = delete;
+  ScopedRemoteLeg& operator=(const ScopedRemoteLeg&) = delete;
+
+ private:
+  RemoteLegSinks* prev_;
+};
+
 class RangedStats {
  public:
   void Record(const char* op, const RangedPhases& p, double total) {
@@ -279,8 +332,21 @@ class RangedStats {
     t.xfer_wait += p.xfer_wait;
     t.lock += p.lock;
     t.remote += p.remote;
+    t.rmt_resolve += p.rmt_resolve;
+    t.rmt_build += p.rmt_build;
+    t.rmt_bld_items += p.rmt_bld_items;
+    t.rmt_bld_plan += p.rmt_bld_plan;
+    t.rmt_bld_post += p.rmt_bld_post;
+    t.rmt_wait += p.rmt_wait;
+    t.rmt_scatter += p.rmt_scatter;
+    t.scat_plan += p.scat_plan;
+    t.scat_submit += p.scat_submit;
+    t.scat_wait += p.scat_wait;
     t.bytes += p.bytes;
     t.items += p.items;
+    t.rmt_items += p.rmt_items;
+    t.rmt_plans += p.rmt_plans;
+    t.scat_items += p.scat_items;
 
     // Per-component totals, keyed by object size (one call = one pool).  The
     // sample key is stored once per (op, size) so the log proves the
@@ -321,8 +387,12 @@ class RangedStats {
   struct Totals {
     uint64_t calls = 0;
     uint64_t items = 0;
+    uint64_t rmt_items = 0, rmt_plans = 0, scat_items = 0;
     double total = 0, resolve = 0, classify = 0, build = 0, validate = 0, commit = 0, route = 0,
-           xfer = 0, xfer_plan = 0, xfer_submit = 0, xfer_wait = 0, lock = 0, remote = 0, bytes = 0;
+           xfer = 0, xfer_plan = 0, xfer_submit = 0, xfer_wait = 0, lock = 0, remote = 0,
+           rmt_resolve = 0, rmt_build = 0, rmt_bld_items = 0, rmt_bld_plan = 0,
+           rmt_bld_post = 0, rmt_wait = 0, rmt_scatter = 0, scat_plan = 0,
+           scat_submit = 0, scat_wait = 0, bytes = 0;
   };
   struct Component {
     uint64_t calls = 0;
@@ -337,14 +407,22 @@ class RangedStats {
     auto share = [&](double v) { return t.total > 0 ? 100.0 * v / t.total : 0.0; };
     MORI_UMBP_INFO(
         "[RangedCall][dbg] SUMMARY {} calls={} total={:.3f}s mean_call={:.1f}us bytes={:.2f}GiB "
-        "items_per_call={:.0f} | resolve={:.1f}% classify={:.1f}% build={:.1f}% validate={:.1f}% "
+        "items_per_call={:.0f} rmt_items={:.0f}/{:.0f}pl scat_items={:.0f} | "
+        "resolve={:.1f}% classify={:.1f}% build={:.1f}% validate={:.1f}% "
         "commit={:.1f}% route={:.1f}% xfer={:.1f}%(plan={:.1f}% submit={:.1f}% wait={:.1f}%) "
-        "lock={:.1f}% remote={:.1f}% "
+        "lock={:.1f}% remote={:.1f}%(rslv={:.1f}% bld={:.1f}%[it={:.1f}% pl={:.1f}% "
+        "po={:.1f}%] rdma={:.1f}% "
+        "scat={:.1f}%[pl={:.1f}% sub={:.1f}% wt={:.1f}%]) "
         "other={:.1f}% | xfer_only={:.2f}GiB/s end2end={:.2f}GiB/s",
         name, t.calls, t.total, 1e6 * t.total / t.calls, t.bytes / (1024.0 * 1024 * 1024),
-        static_cast<double>(t.items) / t.calls, share(t.resolve), share(t.classify), share(t.build),
+        static_cast<double>(t.items) / t.calls, static_cast<double>(t.rmt_items) / t.calls,
+        static_cast<double>(t.rmt_plans) / t.calls, static_cast<double>(t.scat_items) / t.calls,
+        share(t.resolve), share(t.classify), share(t.build),
         share(t.validate), share(t.commit), share(t.route), share(t.xfer), share(t.xfer_plan),
-        share(t.xfer_submit), share(t.xfer_wait), share(t.lock), share(t.remote), share(other),
+        share(t.xfer_submit), share(t.xfer_wait), share(t.lock), share(t.remote),
+        share(t.rmt_resolve), share(t.rmt_build), share(t.rmt_bld_items), share(t.rmt_bld_plan),
+        share(t.rmt_bld_post), share(t.rmt_wait), share(t.rmt_scatter),
+        share(t.scat_plan), share(t.scat_submit), share(t.scat_wait), share(other),
         t.xfer > 0 ? (t.bytes / t.xfer) / (1024.0 * 1024 * 1024) : 0.0,
         t.total > 0 ? (t.bytes / t.total) / (1024.0 * 1024 * 1024) : 0.0);
   }
@@ -409,13 +487,15 @@ class ScopedRangedReport {
         "[RangedCall][dbg] op={} obj={} key0='{}' keys={} items={} local={} remote={} bytes={} "
         "total={:.1f}us resolve={:.1f}us classify={:.1f}us build={:.1f}us validate={:.1f}us "
         "commit={:.1f}us route={:.1f}us xfer={:.1f}us(plan={:.1f} submit={:.1f} wait={:.1f}) "
-        "lock={:.1f}us remote_phase={:.1f}us other={:.1f}us",
+        "lock={:.1f}us remote_phase={:.1f}us(rslv={:.1f} bld={:.1f} rdma={:.1f} scat={:.1f}) "
+        "other={:.1f}us",
         op_, phases_.object_size, phases_.key0 != nullptr ? *phases_.key0 : std::string("?"),
         phases_.keys, phases_.items, phases_.local_keys, phases_.remote_keys, phases_.bytes,
         total * 1e6, phases_.resolve * 1e6, phases_.classify * 1e6, phases_.build * 1e6,
         phases_.validate * 1e6, phases_.commit * 1e6, phases_.route * 1e6, phases_.xfer * 1e6,
         phases_.xfer_plan * 1e6, phases_.xfer_submit * 1e6, phases_.xfer_wait * 1e6,
-        phases_.lock * 1e6, phases_.remote * 1e6, other * 1e6);
+        phases_.lock * 1e6, phases_.remote * 1e6, phases_.rmt_resolve * 1e6,
+        phases_.rmt_build * 1e6, phases_.rmt_wait * 1e6, phases_.rmt_scatter * 1e6, other * 1e6);
   }
 
  private:
@@ -1721,8 +1801,15 @@ bool PoolClient::BuildContiguousToRangesItems(const TransferRef& src, uint64_t s
     item.tag = tag;
     item.src = src;
     item.src_offset = src_base + range.object_offset;
-    item.dst = ClassifiedUserBytes(range.user, range.size);
-    item.dst_offset = 0;
+    // By REGION base + offset, not by the range's own address.  A plan is one
+    // (src base, dst base) pair, so describing each range by itself makes every
+    // one of them its own plan -- 8192 plans for one layer-wise load, each
+    // sorted, bucketed and submitted separately.  Sharing the region base
+    // collapses them to one plan per destination buffer, inside which adjacent
+    // segments also coalesce.  This is the same effect standalone_server.cpp
+    // notes for the local path (plan 23.2% -> 1.4% once the region is
+    // declared); the region was declared, but this builder never looked it up.
+    std::tie(item.dst, item.dst_offset) = UserBufferRef(range.user, range.size);
     items->push_back(std::move(item));
   }
   return items->size() > before;
@@ -1739,10 +1826,10 @@ bool PoolClient::CopyContiguousToRanges(const TransferRef& src, uint64_t src_bas
   return transfer_engine_->Transfer(items, /*failed_tags=*/nullptr);
 }
 
-bool PoolClient::BuildRangesToContiguousItems(const std::vector<ObjectRange>& ranges, void* dst,
+bool PoolClient::BuildRangesToContiguousItems(const std::vector<ObjectRange>& ranges,
+                                              const TransferRef& dst, uint64_t dst_base,
                                               size_t object_size, size_t tag,
                                               std::vector<TransferItem>* items) {
-  const TransferRef object_ref = TransferRef::HostBytes(dst, object_size);
   const size_t before = items->size();
   for (const auto& range : ranges) {
     if (range.size == 0 || range.user == nullptr ||
@@ -1753,10 +1840,11 @@ bool PoolClient::BuildRangesToContiguousItems(const std::vector<ObjectRange>& ra
     TransferItem item;
     item.size = range.size;
     item.tag = tag;
-    item.src = ClassifiedUserBytes(range.user, range.size);
-    item.src_offset = 0;
-    item.dst = object_ref;
-    item.dst_offset = range.object_offset;
+    // Region base + offset, for the reason spelled out in
+    // BuildContiguousToRangesItems: this is the assemble side of the same shape.
+    std::tie(item.src, item.src_offset) = UserBufferRef(range.user, range.size);
+    item.dst = dst;
+    item.dst_offset = dst_base + range.object_offset;
     items->push_back(std::move(item));
   }
   return items->size() > before;
@@ -1766,7 +1854,10 @@ bool PoolClient::CopyRangesToContiguous(const std::vector<ObjectRange>& ranges, 
                                         size_t object_size) {
   std::vector<TransferItem> items;
   items.reserve(ranges.size());
-  if (!BuildRangesToContiguousItems(ranges, dst, object_size, /*tag=*/0, &items)) return false;
+  if (!BuildRangesToContiguousItems(ranges, TransferRef::HostBytes(dst, object_size),
+                                    /*dst_base=*/0, object_size, /*tag=*/0, &items)) {
+    return false;
+  }
   return transfer_engine_->Transfer(items, /*failed_tags=*/nullptr);
 }
 
@@ -3533,12 +3624,27 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
         exclusive_arena ? ranged_get_scratch_.AcquireAll() : ranged_get_scratch_.Acquire();
   }
   char* const scratch_base = scratch_lease.base();
+  // The arena described ONCE, by its registered base.  The scatter below keys
+  // its plans on (src base, dst base), so giving each unit its own slice ref
+  // made every unit x destination-region pair a separate plan -- ~8k plans of
+  // one segment each for a layer-wise load, all sorted, bucketed and submitted
+  // individually.  Anchored to the arena base instead, the src half is constant
+  // and the plan count collapses to the number of distinct caller buffers.
+  // Same argument as BuildLocalRangeTransfers makes for the destination half.
+  const auto [arena_ref, arena_base] = UserBufferRef(scratch_base, scratch_size);
 
   // Pack as many units into the arena as fit, fetch that group, then repeat.
   // Units are 64 B apart so two concurrently-filled slices never share a cache
   // line; spans WITHIN a unit are exactly packed, which is what lets a group of
   // adjacent layer ranges coalesce into a single wire segment.
   PhaseTimer remote_timer(dbg ? &dbg->remote : nullptr);
+  RemoteLegSinks leg;
+  if (dbg != nullptr) {
+    leg = {&dbg->rmt_items,     &dbg->rmt_plans,    &dbg->rmt_resolve,
+           &dbg->rmt_build,      &dbg->rmt_bld_items, &dbg->rmt_bld_plan,
+           &dbg->rmt_bld_post,   &dbg->rmt_wait};
+  }
+  ScopedRemoteLeg leg_scope(dbg ? &leg : nullptr);
   size_t pos = 0;
   while (pos < units.size()) {
     std::vector<size_t> scratch_offsets;
@@ -3599,17 +3705,22 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
       if (!fetched[j]) continue;
       const auto& unit = units[pos + j];
       const size_t tag = scatter_tag_to_j.size();
-      if (!BuildContiguousToRangesItems(TransferRef::HostBytes(sub_dsts[j], unit.bytes),
-                                        /*src_base=*/0, unit.bytes, unit.packed, tag,
-                                        &scatter_items)) {
+      if (!BuildContiguousToRangesItems(arena_ref, arena_base + scratch_offsets[j], unit.bytes,
+                                        unit.packed, tag, &scatter_items)) {
         continue;
       }
       scatter_tag_to_j.push_back(j);
     }
     std::unordered_set<size_t> scatter_failed;
     if (!scatter_items.empty()) {
+      PhaseTimer scatter_timer(dbg ? &dbg->rmt_scatter : nullptr);
       std::vector<size_t> failed_tags;
-      transfer_engine_->Transfer(scatter_items, &failed_tags);
+      TransferEngine::StepTiming steps;
+      if (dbg != nullptr) {
+        steps = {&dbg->scat_plan, &dbg->scat_submit, &dbg->scat_wait};
+        dbg->scat_items += scatter_items.size();
+      }
+      transfer_engine_->Transfer(scatter_items, &failed_tags, dbg != nullptr ? &steps : nullptr);
       for (size_t tag : failed_tags) {
         if (tag < scatter_tag_to_j.size()) scatter_failed.insert(scatter_tag_to_j[tag]);
       }
@@ -3798,6 +3909,9 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
         exclusive_arena ? ranged_put_scratch_.AcquireAll() : ranged_put_scratch_.Acquire();
   }
   char* const scratch_base = scratch_lease.base();
+  // The arena named once, by its registered base -- the read side's reason
+  // (see BatchGetRanges) applies unchanged to the assemble side.
+  const auto [arena_ref, arena_base] = UserBufferRef(scratch_base, scratch_size);
 
   PhaseTimer remote_timer(dbg ? &dbg->remote : nullptr);
   size_t pos = 0;
@@ -3853,11 +3967,10 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
     assembly_tag_to_j.reserve(count);
     for (size_t j = 0; j < count; ++j) {
       const size_t original = valid[remote[pos + j]];
-      void* slice = scratch_base + scratch_offsets[j];
       const size_t tag = assembly_tag_to_j.size();
       if (!BuildRangesToContiguousItems(
-              MakeWriteRanges(srcs[original], sizes[original], dst_offsets[original]), slice,
-              object_sizes[original], tag, &assembly_items)) {
+              MakeWriteRanges(srcs[original], sizes[original], dst_offsets[original]), arena_ref,
+              arena_base + scratch_offsets[j], object_sizes[original], tag, &assembly_items)) {
         MORI_UMBP_ERROR("[PoolClient] BatchPutRanges: assembly plan failed for key='{}'",
                         keys[original]);
         continue;
@@ -4191,6 +4304,10 @@ std::unique_ptr<PoolClient::RemoteGetInFlight> PoolClient::SubmitRemoteBatchGet(
     return nullptr;
   }
 
+  // Build + filter + plan + post: everything between the resolve reply and the
+  // RDMA being in flight, which is CPU this thread spends before any wire time.
+  PhaseTimer build_timer(t_remote_leg ? t_remote_leg->build : nullptr);
+  PhaseTimer items_timer(t_remote_leg ? t_remote_leg->build_items : nullptr);
   std::vector<TransferItem> transfer_items;
   if (!BuildRemoteGetTransfers(inflight->entries, first.route.node_id, &transfer_items)) {
     MORI_UMBP_WARN(
@@ -4213,7 +4330,13 @@ std::unique_ptr<PoolClient::RemoteGetInFlight> PoolClient::SubmitRemoteBatchGet(
     return nullptr;
   }
 
+  items_timer.Stop();
+  PhaseTimer plan_timer(t_remote_leg ? t_remote_leg->build_plan : nullptr);
   TransferPlanSet planned = transfer_engine_->Plan(active);
+  if (t_remote_leg != nullptr) {
+    if (t_remote_leg->items != nullptr) *t_remote_leg->items += active.size();
+    if (t_remote_leg->plans != nullptr) *t_remote_leg->plans += planned.plans.size();
+  }
   ApplyRejectedTags(inflight->entries, planned.rejected_tags, "RemoteGet");
   if (planned.plans.empty()) {
     for (auto& entry : inflight->entries) {
@@ -4223,6 +4346,8 @@ std::unique_ptr<PoolClient::RemoteGetInFlight> PoolClient::SubmitRemoteBatchGet(
   }
   // POST; do NOT wait.  Everything the post references is owned by the returned
   // handle, including any bytes staged through the engine's bounce pool.
+  plan_timer.Stop();
+  PhaseTimer post_timer(t_remote_leg ? t_remote_leg->build_post : nullptr);
   inflight->handle = transfer_engine_->Submit(std::move(planned.plans));
   if (inflight->handle == nullptr) {
     for (auto& entry : inflight->entries) (*results)[entry.result_index] = false;
@@ -4236,7 +4361,10 @@ void PoolClient::WaitRemoteBatchGet(RemoteGetInFlight& f, std::vector<bool>* res
   if (f.drained) return;
   f.drained = true;
   std::vector<TransferFailure> failures;
-  if (f.handle != nullptr) f.handle->Wait(&failures);
+  {
+    PhaseTimer wait_timer(t_remote_leg ? t_remote_leg->wait : nullptr);
+    if (f.handle != nullptr) f.handle->Wait(&failures);
+  }
   ApplyTransferFailures(f.entries, failures, "RemoteGet");
   // Nothing to copy out here even for a staged read: the engine owns its bounce
   // pool and lands the bytes in the user's dst before its Wait returns.
@@ -4276,7 +4404,11 @@ bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
       return false;
     }
     resolve_ctx.set_deadline(std::chrono::system_clock::now() + remaining);
-    auto resolve_status = stub->BatchResolveKeys(&resolve_ctx, resolve_req, &resolve_resp);
+    grpc::Status resolve_status;
+    {
+      PhaseTimer resolve_timer(t_remote_leg ? t_remote_leg->resolve : nullptr);
+      resolve_status = stub->BatchResolveKeys(&resolve_ctx, resolve_req, &resolve_resp);
+    }
     if (!resolve_status.ok() ||
         BatchResolveKeyCount(resolve_resp) != static_cast<int>(items.size())) {
       MORI_UMBP_WARN("[PoolClient] BatchResolveKeys failed on {}: {}", items.front().route.node_id,
