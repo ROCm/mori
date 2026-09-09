@@ -284,7 +284,9 @@ __device__ inline int NullSendBufSlotOffset(const EpInterNodeDeviceCfg& config) 
   X(dispatchGridBarrier, "p")            \
   X(combineGridBarrier, "p")             \
   X(interNodeBlocksBarrier, "p")         \
-  X(crossDeviceBarrierFlag, "p")
+  X(crossDeviceBarrierFlag, "p")         \
+  X(dbgTsBuf, "p")                       \
+  X(dbgRound, "i32")
 
 #define MORI_EP_INTERNODE_ARGS_SCHEMA_ENTRY(name, tag) #name ":" tag ","
 // Trailing comma: the binding skips empty items, so there is no last-element
@@ -354,6 +356,16 @@ struct EpInterNodeArgs {
   uint32_t* interNodeBlocksBarrier{nullptr};
   uint64_t* crossDeviceBarrierFlag{nullptr};
 
+  // Device timestamps, opt-in and NULL unless MORI_EP_DEV_TS is set on the
+  // host -- the null is what turns every stamp site in the kernel off. The
+  // round index has to come from the host: the kernel has no notion of which
+  // benchmark round it is in, and deriving one from a device atomic would put
+  // a global atomic inside the region being measured. Pointer first so the
+  // offsets stay ascending with the rest of the pointer block and the trailing
+  // int32 becomes tail padding, which is what EpInterNodeCcoArgs needs.
+  uint64_t* dbgTsBuf{nullptr};
+  int32_t dbgRound{0};
+
   // An offset as something addressable. Built per access; the three members are
   // all the accessors need, so this costs nothing at -O2.
   __device__ __host__ EpInterNodeRegion reg(uint64_t off) const {
@@ -380,7 +392,7 @@ constexpr bool EpInterNodeArgsOffsetsAscend() {
 
 }  // namespace detail
 
-static_assert(detail::kEpInterNodeArgsFieldCount == 39,
+static_assert(detail::kEpInterNodeArgsFieldCount == 41,
               "added an EpInterNodeArgs field -- add it to MORI_EP_INTERNODE_ARGS_FIELDS in "
               "the same position and bump this count");
 static_assert(detail::EpInterNodeArgsOffsetsAscend(),

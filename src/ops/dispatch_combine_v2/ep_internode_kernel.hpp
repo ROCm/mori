@@ -281,6 +281,24 @@ __device__ __forceinline__ int32_t EpInterNodeWaitGt(int32_t* addr, int32_t val)
   return observed;
 }
 
+// Device timestamps, opt-in. args.dbgTsBuf is null unless MORI_EP_DEV_TS is set
+// on the host, so each site below is one wave-uniform scalar compare against a
+// kernarg. EVERY site sits OUTSIDE a spin loop: the whole point is to time the
+// loops, and an instruction added inside one would change what is measured.
+//
+// wall_clock64() and not mori::cco::clock64(): the latter is
+// __builtin_readcyclecounter(), the SHADER clock, which moves with DVFS. This
+// measurement compares a slow round against a fast one on a box where the
+// shader clock has been observed to vary by several percent, so a shader-clock
+// timer cannot tell "waited longer" from "clocked lower". wall_clock64 is the
+// fixed reference counter; measured on this gfx942 rig at 100.008 MHz.
+constexpr int kEpDbgTsSlots = 16;
+
+__device__ __forceinline__ void EpDbgTs(const EpDispatchCombineArgs& args, int slot) {
+  if (args.dbgTsBuf == nullptr) return;
+  args.dbgTsBuf[args.dbgRound * kEpDbgTsSlots + slot] = static_cast<uint64_t>(wall_clock64());
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                   EpDispatchInterNodeV1Kernel                                  */
 /* ---------------------------------------------------------------------------------------------- */
@@ -585,11 +603,17 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs& args,
         size_t stagingTokOffset = tokenId * xferBytes;
         int qpId = (tokenId / warpSize) % config.numQpPerPe;
 
+        // Slots 1/2 bracket the ONE thing that is purely local on the send
+        // side: building the WQE and ringing the doorbell. At 4 tokens there is
+        // exactly one post per pass so this is exact; above 64 tokens it is
+        // last-write-wins and reports the final chunk.
+        EpDbgTs(args, 1);
         EpInterNodePutSignal(comm, args.reg(args.offDispatchInp), remoteIdx * xferBytes,
                              args.reg(args.offDispatchStaging), stagingTokOffset,
                              tokenNum * xferBytes, args.reg(args.offChunkFlag),
                              (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t), tokenNum + 1,
                              proxyPe, qpId);
+        EpDbgTs(args, 2);
       }
       if (shouldSend) args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
     }
@@ -609,6 +633,10 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs& args,
     }
     if (laneId == 0) args.interNodeBlocksBarrier[1] = 0;
   }
+  // End of the send half. This is a fan-in (atomicAdd), not a barrier -- nobody
+  // blocks -- so slot 3 measures warp-arrival skew plus the tail atomic, and
+  // must not be read as "barrier time".
+  if ((globalWarpId == 0) && (laneId == 0)) EpDbgTs(args, 3);
 }
 
 template <EpInterNodeKernelCfg kConfig, typename T>
@@ -767,6 +795,11 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs& args) {
     index_t nodeFlag = 0;
     if (laneId == 0) {
       uint64_t barrierFlag = args.crossDeviceBarrierFlag[0];
+      // Slots 4/5 bracket the wait for the peer's write to land. Guarded to one
+      // warp so the 32 spinning lanes do not all write the same slot; at 4
+      // tokens globalWarp 0 runs the outer loop exactly once, so it is
+      // unambiguous which wait this is.
+      if (globalWarpId == 0) EpDbgTs(args, 4);
       while (1) {
         thisChunkTokenNum = core::AtomicLoadRelaxedSystem(&chunkFlag[node * maxChunkNum + k]);
         if (thisChunkTokenNum > 0) break;
@@ -777,6 +810,7 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs& args) {
           break;
         }
       }
+      if (globalWarpId == 0) EpDbgTs(args, 5);
     }
     thisChunkTokenNum = __shfl(thisChunkTokenNum, 0) - 1;
     int endTokenIdx = startTokenIdx + thisChunkTokenNum;
@@ -970,6 +1004,7 @@ template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpDispatchInterNodeV1KernelLowLatency_body(EpDispatchCombineArgs args,
                                                            const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
+  if ((blockId == 0) && (thdId == 0)) EpDbgTs(args, 0);
   if (blockId < args.rdmaBlockNum) {
     internode::DispatchInterNodeLLSend<kConfig, T>(args, comm);
     internode::DispatchInterNodeLLRecv<kConfig, T>(args);
@@ -1440,6 +1475,7 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
         }
         int proxyPe = node * config.gpuPerNode + (myPe % config.gpuPerNode);
         int qpId = k % config.numQpPerPe;
+        EpDbgTs(args, 9);
         EpInterNodePut(comm, args.reg(args.offStaging),
                        SendBufSlotOffset(config, myNode + nNodes, startTokenIdx) * tokCombXferBytes,
                        args.reg(args.offStaging),
@@ -1482,9 +1518,12 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
     uint64_t* localBarrierPtr = args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>();
     if ((laneId < nNodes) && (laneId != myNode)) {
       int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
+      // Slots 10/11: combine's only cross-node wait.
+      EpDbgTs(args, 10);
       while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
              (barrierFlag * config.numQpPerPe)) {
       }
+      EpDbgTs(args, 11);
     }
   }
 }
@@ -1720,6 +1759,7 @@ template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpCombineInterNodeV1KernelLowLatency_body(EpDispatchCombineArgs args,
                                                           const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
+  if ((blockId == 0) && (thdId == 0)) EpDbgTs(args, 8);
 
   if (blockId < args.rdmaBlockNum) {
     internode::CombineInterNodeLL<kConfig, T>(args, comm);

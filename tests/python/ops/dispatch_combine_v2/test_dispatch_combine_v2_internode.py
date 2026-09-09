@@ -474,6 +474,13 @@ def _bench(op, cfg, d, dev, a, comm):
     if _marks is not None:
         del _marks[:]
 
+    # Same reason as the marks above: the warmup ran the identical path and
+    # burned rounds off the buffer, so only the timed loop's rows are wanted.
+    _ts = getattr(op, "dbg_ts", None)
+    if _ts is not None:
+        _ts.zero_()
+        op.dbg_round = dict.fromkeys(op.dbg_round, 0)
+
     _series = bool(os.environ.get("MORI_EP_ROUND_SERIES"))
 
     # Caching-allocator segments, opt-in. A cudaMalloc inside the timed loop
@@ -525,6 +532,41 @@ def _bench(op, cfg, d, dev, a, comm):
         tr[n] = time.perf_counter()
     torch.cuda.synchronize()
     wall = (time.perf_counter() - t0) * 1e6 / n
+
+    # Device timestamps, opt-in (MORI_EP_DEV_TS on the backend). Exactly ONE
+    # device-to-host copy, after the loop's own synchronize, so nothing here is
+    # inside a measured window -- a per-round readback would serialise the loop
+    # and destroy the thing being measured.
+    #
+    # The point of these is the one split the host cannot make: dispatch_ll and
+    # combine_ll each POST to a peer and then WAIT for a peer, and the phase
+    # events bracket both together. d_post is local work (WQE build + doorbell);
+    # d_spin is waiting for the peer's write to land.
+    if _ts is not None:
+        from mori import cpp as mori_cpp
+
+        # Misnamed accessor: hipDeviceAttributeWallClockRate is kHz, which is
+        # why kernel_profiler divides it by 1e6 to get GHz. Printed once so a
+        # wrong unit is visible rather than silently scaling every number.
+        khz = mori_cpp.get_cur_device_wall_clock_freq_mhz()
+        # Rows are launch-indexed, so the same drop the phase series uses.
+        ts = _ts.view(-1, 16)[a.drop_rounds : n].cpu().to(torch.float64)
+
+        def _us(b, e):
+            return ((ts[:, e] - ts[:, b]) * 1e3 / khz).tolist()
+
+        pfx = "# DEVTS r%d" % d.rank
+        if d.rank == 0:
+            print("%s wallclock_khz=%d (expect 100000)" % (pfx, khz), flush=True)
+        for nm, v in (
+            ("d_head", _us(0, 1)),  # kernel entry -> first post
+            ("d_post", _us(1, 2)),  # WQE build + doorbell: LOCAL
+            ("d_gap", _us(2, 4)),  # post returns -> spin entry (warp skew)
+            ("d_spin", _us(4, 5)),  # waiting for the peer's write: REMOTE
+            ("c_post", _us(8, 9)),  # combine entry -> put
+            ("c_spin", _us(10, 11)),  # combine cross-node barrier wait
+        ):
+            print("%s %s: " % (pfx, nm) + " ".join("%.1f" % x for x in v), flush=True)
     # Which PASS owns the slow round. The marks are (name, event) in launch
     # order: one "<phase>:start" then one per pass, repeating per phase per round.
     # Consecutive deltas are per-pass GPU durations, so the round with the largest
@@ -573,11 +615,11 @@ def _bench(op, cfg, d, dev, a, comm):
             # something quite different from a step in the pass that waits.
             k = max(3, len(rounds) // 12)
             for nm_i, nm in enumerate(names):
-                e = sum(r[nm_i][1] for r in rounds[:k]) / k
-                l = sum(r[nm_i][1] for r in rounds[-k:]) / k
+                first = sum(r[nm_i][1] for r in rounds[:k]) / k
+                last = sum(r[nm_i][1] for r in rounds[-k:]) / k
                 print(
-                    f"{pfx} step {nm:<20} first{k}={e:8.1f}  last{k}={l:8.1f}  "
-                    f"delta={l - e:+8.1f}",
+                    f"{pfx} step {nm:<20} first{k}={first:8.1f}  "
+                    f"last{k}={last:8.1f}  delta={last - first:+8.1f}",
                     flush=True,
                 )
             # Top 3, not just the worst: one round can be an artifact, three
