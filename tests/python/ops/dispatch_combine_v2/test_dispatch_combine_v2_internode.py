@@ -428,7 +428,7 @@ def _rdma_algo_token_count(idx, cfg, ll):
         return idx.shape[0] * nodes
     per_node = cfg.num_experts_per_rank * cfg.gpu_per_node
     seen = torch.zeros(idx.shape[0], nodes, dtype=torch.bool, device=idx.device)
-    seen.scatter_((idx // per_node).long().clamp_(0, nodes - 1), 1, True)
+    seen.scatter_(1, (idx // per_node).long(), True)
     return int(seen.sum().item())
 
 
