@@ -33,9 +33,16 @@ DEVS=(${RAIL_ACTIVE[@]+"${RAIL_ACTIVE[@]}"})
 NR=${#DEVS[@]}
 log "rails: ${DEVS[*]:-none}"
 
+# Register before any early exit. A node that aborts silently looks, from the peer's
+# side, exactly like a node that never booted — and the peer would then report "the
+# peer node never started", blaming the allocation for a local rail-count problem.
+touch "$RUNDIR/host.$me"
+
 # Every sweep below is cross-rail, so it needs a second rail to aim at. Say why
 # and write it down: a pre-flight tool that meets a machine it does not
 # understand should produce a diagnosis, not an unbound-variable abort.
+# Suffix the diagnosis by host: on a 2-node run both nodes can reach this path, and
+# an unsuffixed matrix.txt would have them overwrite each other's explanation.
 if [ "$NR" -lt 2 ]; then
   log "need >=2 active rails, found $NR — nothing to sweep"
   {
@@ -49,14 +56,20 @@ if [ "$NR" -lt 2 ]; then
     echo "mgmt netdev excluded:  ${RAIL_MGMT_NDEV:-none}"
     echo
     echo "Run 'rail_detect.sh --dump' on this node to see why devices were dropped."
-  } > "$RUNDIR/matrix.txt"
+  } > "$RUNDIR/matrix.txt.$me"
   exit 0
 fi
 d0=${DEVS[0]}; d1=${DEVS[1]}
 
+# One grammar for addrs.<host>, shared with xrail_worker.sh and parsed by
+# make_diagrams.py: "idx dev ndev fam gididx addr". Emitting a shorter row here made
+# the parser skip every line, and the cross-rail diagram then silently drew node B
+# using node A's device names.
 : > "$RUNDIR/addrs.$me"
-for i in "${!DEVS[@]}"; do d=${DEVS[$i]}; echo "$i $d ${RAIL_NDEV[$d]} ${RAIL_ADDR[$d]}" >> "$RUNDIR/addrs.$me"; done
-touch "$RUNDIR/host.$me"
+for i in "${!DEVS[@]}"; do
+  d=${DEVS[$i]}
+  echo "$i $d ${RAIL_NDEV[$d]} ${RAIL_FAM[$d]} ${RAIL_GIDIDX[$d]} ${RAIL_ADDR[$d]}" >> "$RUNDIR/addrs.$me"
+done
 
 # Schedulers that dispatch the batch body per-node (Spur >= 0.10) can start the peer
 # tens of seconds after us, so wait generously.
@@ -83,7 +96,7 @@ log "A(tester)=$A  B(target)=$B"
     P="$IB_ROOT/$d/ports/1"
     printf "%-9s fw=%-16s mtu_active=%-8s rate=%-14s ndev=%-11s gid%s=%s\n" \
       "$d" "$(cat "$IB_ROOT/$d/fw_ver" 2>/dev/null)" \
-      "$(awk '{print $2}' "$P/rate" 2>/dev/null; cat "$P/active_mtu" 2>/dev/null)" \
+      "$(cat "$P/active_mtu" 2>/dev/null)" \
       "$(cat "$P/rate" 2>/dev/null)" "${RAIL_NDEV[$d]}" "${RAIL_GIDIDX[$d]}" "${RAIL_ADDR[$d]}"
   done
   echo "--- netdev MTU ---"

@@ -94,9 +94,14 @@ container/host that owns the devices:
 
 ```bash
 ./probe_topology.sh                 # local node
-./probe_topology.sh --peer <host>   # + cross-rail reachability hints
+PEER_IPS='<rail0_ip> <rail1_ip> ...' ./probe_topology.sh --peer <host>   # + IP reachability matrix
 GID_INDEX=1 ./probe_topology.sh     # force a RoCE GID index (else auto)
 ```
+
+`--peer` needs `PEER_IPS` (the peer's addresses in rail order) because deriving them
+would mean guessing the site's addressing plan; without it the section says so rather
+than printing an empty pass. It is **IP only** — prefer `xrail_worker.sbatch`, which
+discovers both sides itself and tests the RDMA layer too.
 
 If doing it by hand, collect these facts per node:
 
@@ -316,7 +321,9 @@ You need coordinated processes on **two different** nodes. Pitfalls learned the 
 Use the bundled **`xrail_matrix.sbatch`** + **`xrail_matrix.sh`** — these are
 **cluster-agnostic**: the worker auto-detects RoCE rail devices, each device's global GID
 index (IPv4-mapped or IPv6 ULA/GUA, skipping `fe80::`) and address, drops the management
-NIC (the one on the default route), and picks `ping`/`ping6` automatically. Nothing
+NIC (the one on the default route), and picks the ping family per destination
+automatically (`ping -4` / `ping -6`, falling back to a separate `ping6` binary on
+iputils too old to accept `-6`). Nothing
 site-specific is baked in — pass partition/account/qos/gres on the command line:
 
 ```bash
@@ -378,15 +385,21 @@ Rules the parser actually enforces:
 **Per-job artifact checklist** — capture all of these every run, on both nodes:
 
 ```
-addrs.<node>     idx dev netdev addr, all rails         (the addressing plan, Step 3a)
+addrs.<node>     idx dev ndev fam gididx addr, all rails (the addressing plan, Step 3a)
+tools.<node>     local tool inventory, so a missing binary on the PEER is not
+                 mistaken for a dead fabric
 topo_report.<node>.txt   NIC/GPU/GID/PCI/NUMA inventory  (drives the diagrams, Step 1)
 routes.<node>    ip -6/-4 route show table all; ip route show default; ip -6 neigh
 env.<node>       ibv_devinfo, fw_ver, mtu, numa_node, PCI paths, tool inventory
-stats.<node>     /sys/class/net/*/statistics before+after
-matrix.txt       the N x N RDMA matrix, both directions of the pair recorded
-paired.txt       the back-to-back IP-vs-RDMA rows for one pair (2b)
+result.txt       the paired IP-vs-RDMA verdicts for one pair (2b), from xrail_worker.sh
+matrix.txt       the N x N RDMA matrix + sweeps, from xrail_matrix.sh
 run.log[.<node>] everything, timestamped, including the failures
 ```
+
+The `addrs.<node>` field order is fixed — `make_diagrams.py` parses it, and both workers
+must emit the same six fields. `stats.<node>` (the `/sys/class/net/*/statistics`
+before/after counters from Step 2a) is **not** produced by these scripts; capture it by
+hand when you need to prove packets really left the rail NIC.
 
 ---
 
@@ -766,7 +779,7 @@ carries the DOT source and the command to render it elsewhere.
 
 The generator auto-discovers files by glob (`*node*.png`, `*crossrail*.png`,
 `topology_*.md`, `*result*.txt`, `topo_report*.txt`), derives a **Node summary** table
-(GPU ↔ rail NIC ↔ netdev ↔ PCI ↔ address ↔ NUMA) from `topo_report.txt`, and takes the
+(GPU ↔ rail NIC ↔ netdev ↔ PCI ↔ address ↔ NUMA) from `topo_report.<host>.txt`, and takes the
 **fabric verdict** from the summary's `Fabric classification:` line (FULL-MESH / RDMA
 RAIL-ONLY / RAIL-ONLY IP+RDMA) — or, when there is no summary `.md`, from the measured
 cross-rail evidence in `result.txt`. Author the summary `.md` with a top-level `#` title

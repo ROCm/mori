@@ -4,7 +4,7 @@
 #
 # Usage:
 #   ./probe_topology.sh                       # local node only
-#   ./probe_topology.sh --peer <PEER_IP_OR_HOST>   # also run cross-rail reachability
+#   PEER_IPS='<rail0_ip> <rail1_ip> ...' ./probe_topology.sh --peer <PEER>  # IP reachability matrix
 #   GID_INDEX=1 ./probe_topology.sh           # override RoCE GID index (default: auto)
 #
 # Outputs (in $OUT_DIR, default .):
@@ -27,9 +27,16 @@ REPORT="$OUT_DIR/topo_report.$hostn.txt"
 # topology_<host>_node.dot, which is what make_report.py embeds.
 MMD="$OUT_DIR/topology_${hostn}_node.auto.mmd"
 DOT="$OUT_DIR/topology_${hostn}_node.auto.dot"
-: > "$REPORT"
+# Build in a private temp and rename at the end. A scheduler can dispatch this body
+# more than once on the same node, and two line-buffered `tee -a` writers interleave
+# into a single file that parses cleanly as a node with twice as many GPUs — a wrong
+# answer that looks like a right one. rename(2) is atomic, so a duplicate run replaces
+# the file wholesale instead of corrupting it.
+REPORT_TMP="$REPORT.$$.tmp"
+: > "$REPORT_TMP"
+trap 'mv -f "$REPORT_TMP" "$REPORT" 2>/dev/null' EXIT
 
-log() { echo "$@" | tee -a "$REPORT"; }
+log() { echo "$@" | tee -a "$REPORT_TMP"; }
 
 log "=== node: $hostn ==="
 
@@ -98,16 +105,36 @@ done
 if [ -n "$PEER" ]; then
   log ""; log "--- Rail reachability to peer $PEER ---"
   log "(rail-aligned should pass; cross-rail failing => rail-only fabric)"
-  for d in ${nics[@]+"${nics[@]}"}; do
-    nd=${RAIL_NDEV[$d]}; ip=${RAIL_ADDR[$d]}
-    [ -z "$nd" ] && continue
-    # derive peer same-rail IP by swapping the last octet is site-specific;
-    # here we just ping the peer's per-rail IP if provided via PEER_IPS map.
-    :
-  done
-  log "NOTE: supply peer per-rail IPs to fully script cross-rail tests, e.g.:"
-  log "  ping -c2 -I <local_rail_dev> <peer_same_rail_ip>   # expect OK"
-  log "  ping -c2 -I <local_rail_dev> <peer_other_rail_ip>  # expect FAIL if rail-only"
+  # Deriving the peer's rail addresses from ours would mean guessing the site's
+  # addressing plan, so require them: PEER_IPS is a space-separated list in rail
+  # order. Without it there is nothing honest to measure from one node, and saying
+  # so beats printing an empty section that looks like a passing test.
+  if [ -z "${PEER_IPS:-}" ]; then
+    log "SKIPPED: set PEER_IPS to the peer's per-rail addresses, in rail order, e.g."
+    log "  PEER_IPS='192.168.50.2 192.168.51.2 ...' ./probe_topology.sh --peer $PEER"
+    log "  (read them off the peer's own topo_report, or just use xrail_worker.sbatch,"
+    log "   which discovers both sides itself and tests RDMA as well as IP)"
+  else
+    read -r -a peer_ips <<< "$PEER_IPS"
+    printf -v _hdr "%-10s %-12s %-8s %s" src_rail src_ndev stat kind; log "$_hdr"
+    si=0
+    for d in ${nics[@]+"${nics[@]}"}; do
+      nd=${RAIL_NDEV[$d]}
+      [ -z "$nd" ] && continue
+      ti=0
+      for pip in "${peer_ips[@]}"; do
+        pf=-4; case $pip in *:*) pf=-6 ;; esac
+        if ping "$pf" -c 2 -W 2 -I "$nd" "$pip" >/dev/null 2>&1; then st=OK; else st=FAIL; fi
+        kind=$([ "$si" = "$ti" ] && echo same-rail || echo cross-rail)
+        printf -v _row "%-10s %-12s %-8s %s -> %s" "rail$si" "$nd" "$st" "$kind" "$pip"
+        log "$_row"
+        ti=$((ti + 1))
+      done
+      si=$((si + 1))
+    done
+    log "NOTE: IP only. Cross-rail ICMP can pass on a fabric whose cross-rail RDMA"
+    log "      still fails — confirm at the RDMA layer before classifying."
+  fi
 fi
 
 # ---- 5. Emit Mermaid ------------------------------------------------------

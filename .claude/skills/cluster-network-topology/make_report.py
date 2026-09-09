@@ -116,6 +116,10 @@ def parse_result(text):
         "rdma_cross": rdma_cross,
         "ip_same": ip_same,
         "ip_cross": ip_cross,
+        # The worker writes DONE last. Without it the run was cut short (scheduler
+        # teardown, time limit), and a partial matrix still parses into a
+        # confident-looking verdict drawn from whichever rails happened to finish.
+        "complete": any(ln.strip() == "DONE" for ln in text.splitlines()),
     }
 
 
@@ -430,6 +434,10 @@ def build_report(folder, title=None, diagrams=True):
           <tr><td>IP reachability &mdash; ICMP <code>ping</code></td>{td(r['ip_same'],True)}{td(r['ip_cross'],True)}</tr>
           <tr><td>RDMA &mdash; <code>ibv_rc_pingpong</code> (RoCEv2)</td>{td(r['rdma_same'],False)}{td(r['rdma_cross'],False)}</tr>
           </tbody></table>
+          {"" if r["complete"] else
+           "<p class='sub' style='color:#b00'><strong>INCOMPLETE:</strong> result.txt has no "
+           "final DONE marker, so the run was cut short and this matrix is partial. "
+           "Treat the verdict as unproven and re-run.</p>"}
           <p class="sub">Fabric verdict: <strong>{html.escape(fab)}</strong> &mdash; {html.escape(fab_desc)}.
           Cross-rail must pass at the <em>RDMA</em> layer for all-to-all / expert-parallel to work;
           IP (ping) passing alone is not sufficient.</p></div>"""

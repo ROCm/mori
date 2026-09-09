@@ -100,6 +100,22 @@ done
   exit 1
 }
 
+# Probe BEFORE the cross-rail test, not after. The test ends when the tester finishes,
+# and on per-node dispatch the allocation is torn down at that moment — a probe queued
+# behind it on the peer never gets to write, so the peer's topo_report goes missing and
+# the diagrams lose a node. Running first costs a couple of seconds and is read-only.
+# It also means one submission leaves a folder with everything make_report.py needs;
+# compute nodes are usually unreachable by SSH, so there is no second chance.
+echo ""
+echo "--- probe_topology.sh at $(date -u +%FT%TZ) ---"
+if [ ! -r "$PROBE" ]; then
+  echo "SKIPPED: probe script not readable: $PROBE"
+elif [ "$HAVE_SRUN" = 1 ]; then
+  srun -N2 -n2 --overlap bash -c "OUT_DIR='$RUNDIR' bash '$PROBE'" || echo "probe rc=$?"
+else
+  OUT_DIR="$RUNDIR" bash "$PROBE" || echo "probe rc=$?"
+fi
+
 rc=1
 if [ "$HAVE_SRUN" = 1 ]; then
   for attempt in 1 2 3 4 5; do
@@ -112,20 +128,6 @@ else
   bash "$WORKER" "$JOB" "$RUNDIR" && rc=0
 fi
 echo "worker rc=$rc"
-
-# Single-node probe in the SAME allocation, so one submission leaves a folder that
-# has everything make_report.py needs (topo_report.txt drives the node diagram and
-# the node-summary table). Compute nodes are usually unreachable by SSH, so there is
-# no second chance to collect this once the job ends.
-echo ""
-echo "--- probe_topology.sh at $(date -u +%FT%TZ) ---"
-if [ ! -r "$PROBE" ]; then
-  echo "SKIPPED: probe script not readable: $PROBE"
-elif [ "$HAVE_SRUN" = 1 ]; then
-  srun -N1 -n1 --overlap bash -c "OUT_DIR='$RUNDIR' bash '$PROBE'" || echo "probe rc=$?"
-else
-  OUT_DIR="$RUNDIR" bash "$PROBE" || echo "probe rc=$?"
-fi
 
 # Cheap artifacts the skill's Step 2d checklist asks for every run: routes decide
 # on-link vs routed, which decides whether the hop_limit confound can bite.
