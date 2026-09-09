@@ -859,8 +859,13 @@ bool PoolClient::Init() {
 #ifdef UMBP_ENABLE_GDS
   // The file->GPU engine for SsdBackend's FileRefs.  It claims only (file,
   // device) pairs, which no memory engine touches, so registration order is
-  // documentation.  Present only when the build found hipfile.
-  composite->AddEngine(std::make_unique<GdsEngine>());
+  // documentation.  Compiled in when the build found the hipfile headers, and
+  // registered only when libhipfile actually dlopen's on this host.
+  if (GdsEngine::Available()) {
+    composite->AddEngine(std::make_unique<GdsEngine>());
+  } else {
+    MORI_UMBP_INFO("[PoolClient] libhipfile unavailable — SSD reads stay host-staged");
+  }
 #endif
   if (!config_.io_engine.host.empty()) {
     mori::io::IOEngineConfig io_cfg;
