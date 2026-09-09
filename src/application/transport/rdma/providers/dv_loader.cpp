@@ -36,9 +36,9 @@ void* DvLoadLibrary(const char* lib_name) {
   return handle;
 }
 
-void* DvLoadSymbol(void* handle, const char* symbol_name) {
+void* DvLoadSymbol(void* handle, const char* symbol_name, bool warn_on_miss) {
   void* sym = dlsym(handle, symbol_name);
-  if (!sym) {
+  if (!sym && warn_on_miss) {
     MORI_APP_WARN("dlsym({}) failed: {}", symbol_name, dlerror());
   }
   return sym;
