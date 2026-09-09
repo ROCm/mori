@@ -333,6 +333,57 @@ synchronize + gloo barrier every 20 rounds) still ended one of two runs in the
 offset state (node0 c_spin 21.7, node1 cs_bar 32.0): the offset re-forms inside
 20 rounds. Re-aligning treats the symptom and the loop walks straight back.
 
+ROOT CAUSE FOUND: THE CCO PATH NEVER BOUND ITS THREAD
+-----------------------------------------------------
+The per-rank host loop is the whole story. In every run that landed in the slow
+regime, a few ranks show an EXACT 2x on their host loop and the rest show
+nothing:
+
+    slow run, hwal per rank (us)
+      node0  r0..r7    75 76 77 77 77 78 77 76
+      node1  r8 r9 r10 75 77 75 | r11 r12 r13 r14 = 146 149 146 146 | r15 78
+
+    fast run: all sixteen ranks 74-78, no rank doubled
+
+`hdis` goes 16 -> 30 and `hcom` 27 -> 50 on exactly those ranks. The extra
+~36us of host time per round IS the phase offset (measured 35-40us), and it
+reaches the peer through the transfer function above: the affected ranks arrive
+late, their node's INTRA-node barrier (`cs_bar`) makes the other seven wait, and
+the peer node then waits at the cross-node rendezvous (`c_spin`).
+
+The 2x is the giveaway. The box is 2 sockets x 96 cores with SMT (sibling of
+physical core c is c+192), so two unbound processes can land on the two
+hyperthreads of ONE physical core and each runs at about half speed.
+
+**The fix already existed in the tree and was wired to the wrong path.**
+`application::BindCallingThreadToGpuNumaOnce()`
+(`include/mori/application/utils/cpu_affinity.hpp`) binds a thread to the CPUs
+local to its GPU's NUMA node, from the same sysfs `local_cpulist` NCCL uses,
+intersected with the existing cpuset. Its ONLY caller was `src/shmem/init.cpp:746`
+-- "the single bind site for the shmem/EP path". A job that used CCO instead of
+shmem ran completely unbound. `ccoCommCreateImpl` now calls it too.
+
+This also means every EP v2 measurement against v1/shmem was unfair in v1's
+favour: the v1 harness calls `shmem_torch_process_group_init`
+(`examples/ops/dispatch_combine/test_dispatch_combine_internode.py:606`) and was
+bound; ours was not. The "we degrade ~3x further than #625" result above was
+measured across that difference and needs re-running before it means anything.
+
+Measured, eight runs each, `MORI_IGNORE_CPU_AFFINITY=1` as the control:
+
+                       unbound            bound
+    median total       88.0us             84.8us
+    worst total        126.0us            97.4us
+    runs with a
+      doubled rank     1 of 4 (and ~1 in  0 of 8
+                       3 across the day)
+
+Eight clean runs do not prove the residual rate is zero: the bind confines four
+ranks to one socket's 192 CPUs, which makes an SMT collision much less likely
+but not impossible. Strict per-rank disjoint pinning also gave 4 of 4 clean. If
+the regime ever reappears, check the per-rank `hwal` series first -- the
+correlation with a doubled rank has been perfect in every run so far.
+
 WHAT WOULD ACTUALLY HELP
 ------------------------
 Not geometry tuning: no kernel is slower, so no schedule can win the time back.
