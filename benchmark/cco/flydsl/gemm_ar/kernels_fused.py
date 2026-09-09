@@ -565,6 +565,164 @@ class _SwappedMfma:
         return self._inner.call(b, a, c, set_prio=set_prio)
 
 
+class _BlockScaleK:
+    """The model's 1x128 / 128x128 fp8 block scales, applied per K-block.
+
+    ``sum_k s_a[m,k] * s_b[nb,k] * d_k`` does not factor, so unlike the
+    per-token/per-channel form these scales cannot wait for the epilogue.
+    ``BLOCK_K`` is already 128, so a mainloop iteration *is* a scale block and
+    there is no sub-block bookkeeping.
+
+    The obvious form -- promote each K-block into a second fp32 accumulator and
+    zero the MFMA one -- does not work here, and the reason is worth recording.
+    Zeroing removes the only dependency between consecutive K-blocks, and the K
+    loop is ``range_constexpr`` (fully unrolled), so the scheduler hoists every
+    block's MFMAs above every promotion: measured at K=512, all 64 MFMAs land in
+    the first 400 instructions and all the promotion arithmetic after, keeping
+    ``K_ITERS`` accumulator sets live at once -- 256 VGPR with **81 spilled**,
+    and the GEMM 10x slower (4052us against a 374us target).
+    ``rocdl.sched_barrier(0)`` between them does not stop it.
+
+    So instead the accumulator carries the running sum *rescaled*, which keeps a
+    real data dependency the scheduler cannot break and needs no second
+    accumulator at all::
+
+        t_0   = d_0
+        t_k   = t_{k-1} * (s_{k-1} / s_k) + d_k
+        out   = t_{K-1} * s_{K-1}
+
+    with the invariant ``t_k = (sum_{j<=k} s_j d_j) / s_k``. The divisions cost
+    ~1e-7 relative each and there are ``K/128`` of them, three orders of
+    magnitude under the fp8 floor of 1.7e-3. It does assume no scale is exactly
+    zero, which a real quantiser never emits.
+
+    Two properties of the tile geometry make the loads cheap, both checked
+    against ``_PermlaneStoreC._emit``'s indexing:
+
+    * every accumulator set lies inside a single 128-column block
+      (``wave_n*32 + tj*16 + 15 <= 127``), so the B scale is **one scalar for
+      the whole set**, uniform across the wave;
+    * ``sa`` is column-major -- the layout
+      ``aiter.gemm_a8w8_blockscale_bpreshuffle`` consumes, via sglang's
+      ``materialize_bpreshuffle_fp8_scale`` -- so element ``(row, kb)`` sits at
+      ``kb * M + row`` and a lane's rows are contiguous. With ``swap_ab`` a lane
+      owns one row per M-tile (a scalar load); without it, four consecutive rows
+      (one vec4).
+    """
+
+    def __init__(self, A_scale, B_scale, m, n, k, *, swap_ab, n_tiles_a):
+        self.kb_count = k // 128
+        self.m = m
+        self.swap_ab = swap_ab
+        self.n_tiles_a = n_tiles_a
+        self.lane = fx.thread_idx.x % 64
+        gSA = fx.rocdl.make_buffer_tensor(
+            A_scale, max_size=False, num_records_bytes=m * self.kb_count * 4
+        )
+        gSB = fx.rocdl.make_buffer_tensor(
+            B_scale, max_size=False, num_records_bytes=(n // 128) * self.kb_count * 4
+        )
+        self.sa_div = fx.logical_divide(gSA, fx.make_layout(1, 1))
+        self.sb_div = fx.logical_divide(gSB, fx.make_layout(1, 1))
+        self.atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+        self.atom_4 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
+        self.reg_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
+        self.reg_4 = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
+
+    def _load1(self, div, index):
+        fx.copy(self.atom_1, fx.slice(div, (None, fx.Int32(index))), self.reg_1)
+        return Vec(fx.memref_load_vec(self.reg_1))[0]
+
+    def _load4(self, div, index):
+        fx.copy(self.atom_4, fx.slice(div, (None, fx.Int32(index))), self.reg_4)
+        return Vec(fx.memref_load_vec(self.reg_4))
+
+    def a_scales(self, base_row, kb):
+        """Per M-tile A scale for this lane's rows at K-block ``kb``."""
+        col = fx.Int32(kb) * fx.Int32(self.m)
+        lane = self.lane
+        if const_expr(self.swap_ab):
+            return [
+                self._load1(self.sa_div, col + base_row + ti * 16 + lane % 16)
+                for ti in range_constexpr(self.n_tiles_a)
+            ]
+        return [
+            self._load4(self.sa_div, col + base_row + ti * 16 + (lane // 16) * 4)
+            for ti in range_constexpr(self.n_tiles_a)
+        ]
+
+    def b_scale(self, n_block, kb):
+        """The single B scale of a 128-column block at K-block ``kb``."""
+        return self._load1(self.sb_div, n_block * fx.Int32(self.kb_count) + fx.Int32(kb))
+
+    def scale_acc(self, acc, a_sc, b_sc, idx_fn, n_tiles_b):
+        """``acc *= s_a * s_b`` elementwise; returns the new accumulator.
+
+        Used both for the running rescale between K-blocks and for the final
+        multiply, which are the same operation with different scale pairs.
+        """
+        res = list(acc)
+        for ti in range_constexpr(self.n_tiles_a):
+            for tj in range_constexpr(n_tiles_b):
+                i = idx_fn(ti, tj)
+                v = Vec(res[i])
+                if const_expr(self.swap_ab):
+                    s = a_sc[ti] * b_sc
+                    vals = [v[e] * s for e in range_constexpr(4)]
+                else:
+                    vals = [v[e] * (a_sc[ti][e] * b_sc) for e in range_constexpr(4)]
+                res[i] = Vec.from_elements(vals, fx.Float32)
+        return res
+
+    @staticmethod
+    def ratio(prev, cur):
+        """``prev / cur`` for a scale pair, elementwise over the M-tile list."""
+        if isinstance(prev, list):
+            return [p / c for p, c in zip(prev, cur)]
+        return prev / cur
+
+
+    def rescale_for(self, kb, accs, prev, *, base_row, nb0, idx_fn, n_tiles_b,
+                    lds_block_m):
+        """Rebase the four accumulators from K-block ``kb-1``'s scales to kb's.
+
+        A method rather than a closure inside the kernel: FlyDSL rewrites the
+        AST of every ``def`` nested in a ``@flyc.kernel`` function, and the
+        rewrite of an ``if`` inside such a nested def turned the captured
+        ``_BlockScaleK`` instance into a local, so reading it raised
+        UnboundLocalError. Module-level methods are ordinary Python at trace
+        time and are left alone.
+        """
+        c00, c01, c10, c11 = accs
+        cur = (
+            self.a_scales(base_row + 0 * lds_block_m, kb),
+            self.a_scales(base_row + 1 * lds_block_m, kb),
+            self.b_scale(nb0 + fx.Int32(0), kb),
+            self.b_scale(nb0 + fx.Int32(1), kb),
+        )
+        if prev is not None:
+            pa0, pa1, pb0, pb1 = prev
+            ca0, ca1, cb0, cb1 = cur
+            ra0, ra1 = self.ratio(pa0, ca0), self.ratio(pa1, ca1)
+            rb0, rb1 = self.ratio(pb0, cb0), self.ratio(pb1, cb1)
+            c00 = self.scale_acc(c00, ra0, rb0, idx_fn, n_tiles_b)
+            c01 = self.scale_acc(c01, ra0, rb1, idx_fn, n_tiles_b)
+            c10 = self.scale_acc(c10, ra1, rb0, idx_fn, n_tiles_b)
+            c11 = self.scale_acc(c11, ra1, rb1, idx_fn, n_tiles_b)
+        return (c00, c01, c10, c11), cur
+
+    def final_scale(self, accs, prev, *, idx_fn, n_tiles_b):
+        """Undo the invariant: multiply by the last K-block's scales."""
+        fa0, fa1, fb0, fb1 = prev
+        c00, c01, c10, c11 = accs
+        return (
+            self.scale_acc(c00, fa0, fb0, idx_fn, n_tiles_b),
+            self.scale_acc(c01, fa0, fb1, idx_fn, n_tiles_b),
+            self.scale_acc(c10, fa1, fb0, idx_fn, n_tiles_b),
+            self.scale_acc(c11, fa1, fb1, idx_fn, n_tiles_b),
+        )
+
+
 class _SwapABStoreC(StoreC):
     """C store for an A/B-swapped MFMA: 4 consecutive N per lane -> 64-bit store.
 
@@ -582,8 +740,14 @@ class _SwapABStoreC(StoreC):
     while B's is indexed by column, now 4 consecutive, so a vec4.
     """
 
-    def __init__(self, *args, peer_rsrc=None, elem_base=None, **kwargs):
+    def __init__(self, *args, peer_rsrc=None, elem_base=None,
+                 scales_preapplied=False, **kwargs):
         super().__init__(*args, **kwargs)
+        # blockscale applies the scales per K-block in the mainloop, so by the
+        # time C reaches here it is already scaled and the epilogue is a plain
+        # fp32 -> bf16 convert. Skipping the loads rather than multiplying by a
+        # constant 1.0 keeps them out of the IR instead of trusting a fold.
+        self._preapplied = scales_preapplied
         self.out_atom_4 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.BFloat16)
         self.reg_bf16_4 = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.BFloat16)
         self.out_atom_8 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
@@ -591,7 +755,15 @@ class _SwapABStoreC(StoreC):
         self._peer_rsrc = peer_rsrc
         self._elem_base = elem_base
 
+    def _scaled(self, v, a, b):
+        """``v * a * b``, or ``v`` when the mainloop already applied them."""
+        if const_expr(self._preapplied):
+            return v
+        return v * (a * b)
+
     def _load_a_scale_scalar(self, row):
+        if const_expr(self._preapplied):
+            return None
         fx.copy(
             self.scale_atom_1,
             fx.slice(self.sa_div, (None, fx.Int32(row))),
@@ -600,6 +772,8 @@ class _SwapABStoreC(StoreC):
         return Vec(fx.memref_load_vec(self.reg_f32_1))[0]
 
     def _load_b_scale_vec4(self, col):
+        if const_expr(self._preapplied):
+            return [None] * 4
         fx.copy(
             self.scale_atom_4,
             fx.slice(self.sb_div, (None, fx.Int32(col))),
@@ -635,7 +809,7 @@ class _SwapABStoreC(StoreC):
                 oob = fx.Int32(self.c_rows * self.c_cols)
                 vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
                 vals = [
-                    (vec_f32[k] * (a_scales[ti] * b_scales[tj][k])).to(fx.BFloat16)
+                    self._scaled(vec_f32[k], a_scales[ti], b_scales[tj][k]).to(fx.BFloat16)
                     for k in range_constexpr(4)
                 ]
                 c_index = row * self.c_cols + col
@@ -745,7 +919,7 @@ class _PermlaneStoreC(_SwapABStoreC):
                 vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
                 packed = Vec.from_elements(
                     [
-                        (vec_f32[k] * (a_scales[ti] * b_scales[tj][k])).to(fx.BFloat16)
+                        self._scaled(vec_f32[k], a_scales[ti], b_scales[tj][k]).to(fx.BFloat16)
                         for k in range_constexpr(4)
                     ],
                     fx.BFloat16,
@@ -859,7 +1033,7 @@ class _WideStoreProbeC(_SwapABStoreC):
             for tj in range_constexpr(self.n_tiles_b):
                 vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
                 vals += [
-                    (vec_f32[k] * (a_scales[ti] * b_scales[tj][k])).to(fx.BFloat16)
+                    self._scaled(vec_f32[k], a_scales[ti], b_scales[tj][k]).to(fx.BFloat16)
                     for k in range_constexpr(4)
                 ]
             col = base_col + (lane // 16) * 8
@@ -966,6 +1140,7 @@ def compile_fused_gemm_scatter(
     fuse: bool = True,
     rotated: bool | None = None,
     n_stripe: int | None = None,
+    quant: str = "ptpc",
     swap_ab: bool = False,
     store_probe: bool = False,
     permlane: bool = False,
@@ -1057,6 +1232,20 @@ def compile_fused_gemm_scatter(
             "--lane-transpose for the real thing on --mode fused-lsa"
         )
     direct_lsa = fuse and transport == "lsa"
+    if quant not in ("ptpc", "blockscale"):
+        raise ValueError(f"quant must be ptpc or blockscale, got {quant!r}")
+    blockscale = quant == "blockscale"
+    if blockscale:
+        if not swap_ab:
+            raise ValueError(
+                "--quant blockscale needs --swap-ab: the unswapped epilogue "
+                "applies its scales inside aiter's StoreC, which this copy does "
+                "not override"
+            )
+        if K % 128:
+            raise ValueError(f"blockscale needs K % 128 == 0, got K={K}")
+        if N % 128:
+            raise ValueError(f"blockscale needs N % 128 == 0, got N={N}")
     rotated = fuse if rotated is None else rotated
     # n_stripe spans 1..N//BLOCK_N; the top of the range *is* chunk-major, so
     # 0 ("per-mode default") resolves to it rather than to a separate branch.
@@ -1133,7 +1322,7 @@ def compile_fused_gemm_scatter(
         raise ValueError(
             f"fence must be all/agent/leader/none/writethrough/wt-agent, got {fence!r}"
         )
-    _kname_tag = f"{'S' if swap_ab else ''}{'P' if permlane else ''}{'T' if lane_transpose else ''}{'H' if hoist_scales else ''}{'U' if peer_uncached else ''}{direct_fence[0]}{'W' if store_probe else ''}c{chunks}{'r' if rotated else 'l'}{'' if n_stripe == 1 else f's{n_stripe}'}{fence[0]}"
+    _kname_tag = f"{'B' if blockscale else ''}{'S' if swap_ab else ''}{'P' if permlane else ''}{'T' if lane_transpose else ''}{'H' if hoist_scales else ''}{'U' if peer_uncached else ''}{direct_fence[0]}{'W' if store_probe else ''}c{chunks}{'r' if rotated else 'l'}{'' if n_stripe == 1 else f's{n_stripe}'}{fence[0]}"
     counter_off = cfg.counter_off
     lock_off = cfg.lock_off
     in_off = cfg.input_off
@@ -1355,6 +1544,29 @@ def compile_fused_gemm_scatter(
             store_c = StoreC(
                 A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B
             )
+        # Bound unconditionally: the kernel body is re-parsed by FlyDSL's AST
+        # rewriter, and names that only exist inside a branch are not reliably
+        # visible to a nested def afterwards (a `nonlocal` on one raised "no
+        # binding" and reading one raised UnboundLocalError).
+        bsk = nb0 = base_row_pre = None
+        if blockscale:
+            # Set after construction rather than threading a kwarg through
+            # thirteen call sites: it is a trace-time Python bool read by
+            # ``const_expr`` and nothing looks at it before the first store.
+            store_c._preapplied = True
+            bsk = _BlockScaleK(
+                A_scale, B_scale, c_m, N, K, swap_ab=swap_ab, n_tiles_a=N_TILES_A
+            )
+            # The B scale is one scalar per 128-column block, and each
+            # accumulator set sits inside exactly one: c*0 is block
+            # ``block_n * (BLOCK_N // 128)``, c*1 the next.
+            nb0 = block_n * fx.Int32(BLOCK_N // 128)
+            # Same expression the epilogue rebuilds at ``base_row`` below; the
+            # rescale needs it one loop earlier.
+            base_row_pre = block_m * BLOCK_M + wave_m * (N_TILES_A * 16)
+        # No second accumulator: the running sum lives in the MFMA registers,
+        # rescaled between K-blocks (see _BlockScaleK).
+        prev_scales = None
 
         c00_frag = [mfma.zero_value] * N_ACCUMS
         c01_frag = [mfma.zero_value] * N_ACCUMS
@@ -1378,6 +1590,17 @@ def compile_fused_gemm_scatter(
         wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
 
         for k in range_constexpr(K_ITERS - 2):
+            if blockscale:
+                (c00_frag, c01_frag, c10_frag, c11_frag), prev_scales = (
+                    bsk.rescale_for(
+                        k,
+                        (c00_frag, c01_frag, c10_frag, c11_frag),
+                        prev_scales,
+                        base_row=base_row_pre, nb0=nb0,
+                        idx_fn=mfma.idx, n_tiles_b=N_TILES_B,
+                        lds_block_m=LDS_BLOCK_M,
+                    )
+                )
             b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
             a0_frag = a_s2r.load(a_cur0)
             a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
@@ -1427,6 +1650,17 @@ def compile_fused_gemm_scatter(
             b_cur1, b_next1 = b_next1, b_cur1
 
         # Step k = K_ITERS - 2
+        if blockscale:
+            (c00_frag, c01_frag, c10_frag, c11_frag), prev_scales = (
+                    bsk.rescale_for(
+                        K_ITERS - 2,
+                        (c00_frag, c01_frag, c10_frag, c11_frag),
+                        prev_scales,
+                        base_row=base_row_pre, nb0=nb0,
+                        idx_fn=mfma.idx, n_tiles_b=N_TILES_B,
+                        lds_block_m=LDS_BLOCK_M,
+                    )
+                )
         b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
         a0_frag = a_s2r.load(a_cur0)
         rocdl.s_barrier()
@@ -1455,6 +1689,17 @@ def compile_fused_gemm_scatter(
         b_cur1, b_next1 = b_next1, b_cur1
 
         # Step k = K_ITERS - 1
+        if blockscale:
+            (c00_frag, c01_frag, c10_frag, c11_frag), prev_scales = (
+                    bsk.rescale_for(
+                        K_ITERS - 1,
+                        (c00_frag, c01_frag, c10_frag, c11_frag),
+                        prev_scales,
+                        base_row=base_row_pre, nb0=nb0,
+                        idx_fn=mfma.idx, n_tiles_b=N_TILES_B,
+                        lds_block_m=LDS_BLOCK_M,
+                    )
+                )
         a0_frag = a_s2r.load(a_cur0)
         wait_barrier(0)
 
@@ -1473,6 +1718,15 @@ def compile_fused_gemm_scatter(
         c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, set_prio=False)
         rocdl.s_setprio(0)
         rocdl.s_barrier()
+
+        if blockscale:
+            # Undo the rescaling invariant: the accumulator holds the true sum
+            # divided by the last K-block's scale. store_c._preapplied makes the
+            # epilogue skip its own scale loads.
+            c00_frag, c01_frag, c10_frag, c11_frag = bsk.final_scale(
+                (c00_frag, c01_frag, c10_frag, c11_frag), prev_scales,
+                idx_fn=mfma.idx, n_tiles_b=N_TILES_B,
+            )
 
         wave_n_offset = wave_n * (N_TILES_B * 16)
         wave_m_offset = wave_m * (N_TILES_A * 16)

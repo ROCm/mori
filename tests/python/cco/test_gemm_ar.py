@@ -156,6 +156,86 @@ def test_pinned_copy_matches_aiter_kernel_bitwise(m, n, k):
     )
 
 
+@pytest.mark.parametrize("m,n,k", [(1024, 512, 512), (2048, 7168, 2048)])
+def test_blockscale_agrees_with_the_kernel_the_model_dispatches(m, n, k):
+    """``--quant blockscale`` against ``gemm_a8w8_blockscale_bpreshuffle``.
+
+    The model's ROCm path quantises A 1x128 and B 128x128 with **fp32** scales
+    and dispatches that aiter kernel; this benchmark's own GEMM has to agree
+    with it, or the fused-vs-split numbers are being drawn at the wrong
+    operating point. Not a bitwise check: the two accumulate in different
+    orders, so both are compared to an fp32 reference and to each other.
+
+    The scale layouts are the ones that kernel consumes -- ``sa`` logically
+    ``[M, K/128]`` but **column-major** (sglang's
+    ``materialize_bpreshuffle_fp8_scale`` is ``t().contiguous().t()``), ``sb``
+    ``[N/128, K/128]`` row-major. Sweeping the four combinations against it,
+    only this one lands at the fp8 floor; the others give 0.17-0.32.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires a GPU")
+    pytest.importorskip("aiter", reason="aiter not importable (set PYTHONPATH)")
+    import flydsl.expr as fx
+    from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_bpreshuffle
+    from aiter.ops.shuffle import shuffle_weight
+
+    sys.path.insert(0, str(GEMM_AR_DIR))
+    sys.path.insert(0, str(AR_DIR))
+    from kernels_fused import compile_fused_gemm_scatter
+
+    BK = 128
+    g = torch.Generator(device="cuda").manual_seed(11)
+    a = (torch.randn(m, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
+    b = (torch.randn(n, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
+    sa = torch.rand(m, k // BK, generator=g, device="cuda", dtype=torch.float32) * 0.01 + 0.01
+    sb = (
+        torch.rand(n // BK, k // BK, generator=g, device="cuda", dtype=torch.float32)
+        * 0.01
+        + 0.01
+    )
+    sa = sa.t().contiguous().t()
+    b_shuf = shuffle_weight(b, layout=(16, 16))
+
+    af, bf = a.float(), b.float()
+    ref = torch.zeros(m, n, device="cuda", dtype=torch.float32)
+    for i in range(k // BK):
+        ks = slice(i * BK, (i + 1) * BK)
+        ref += (
+            (af[:, ks] @ bf[:, ks].T)
+            * sa[:, i][:, None]
+            * sb[:, i].repeat_interleave(BK)[None, :]
+        )
+    rn = ref.norm()
+
+    theirs = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
+    gemm_a8w8_blockscale_bpreshuffle(a, b_shuf, sa, sb, out=theirs)
+
+    cfg = layout.ArConfig(world_size=2, m=m, n=n)
+    gemm = compile_fused_gemm_scatter(
+        cfg, 0, K=k, BLOCK_M=128, BLOCK_N=256, b_preshuffled=True,
+        fuse=False, swap_ab=True, permlane=True, lane_transpose=True,
+        quant="blockscale",
+    )
+    ours = torch.zeros(m, n, device="cuda", dtype=torch.bfloat16)
+    gemm(
+        a.contiguous().view(torch.int8).view(-1),
+        b_shuf.contiguous().view(torch.int8).view(-1),
+        ours.view(-1),
+        sa.t().reshape(-1).contiguous(),
+        sb.reshape(-1).contiguous(),
+        m, n, 0, 0,
+        stream=fx.Stream(torch.cuda.current_stream()),
+    )
+    torch.cuda.synchronize()
+
+    rel_ours = ((ours.float() - ref).norm() / rn).item()
+    rel_theirs = ((theirs.float() - ref).norm() / rn).item()
+    rel_pair = ((ours.float() - theirs.float()).norm() / rn).item()
+    assert rel_ours < 3e-3, f"ours {rel_ours:.3e} vs the fp32 reference"
+    assert rel_theirs < 3e-3, f"aiter {rel_theirs:.3e} vs the fp32 reference"
+    assert rel_pair < 3e-3, f"ours vs aiter {rel_pair:.3e}"
+
+
 @pytest.mark.parametrize("m,n,k", [(512, 512, 256), (4096, 7168, 1024)])
 def test_swap_ab_is_bitwise_identical(m, n, k):
     """Exchanging the MFMA operands must not change a single bit.

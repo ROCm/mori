@@ -47,16 +47,29 @@ which is a ``--chunked-prefill-size 16384`` TP8 prefill chunk of DSV4-Pro
 ``wo_b`` (1792 tiles of 256x256 per rank). 8x MI355X, graph replay, median of
 31, max over ranks, on an idle box, with the current defaults:
 
-    fused-sdma  (chunks=8)       1114.5us
-    split-sdma                   1261.7
-    split-lsa                    1262.4
-    fused-lsa   (n_stripe=2)     1365.6
-    gemm-only                     228.9
+                          --quant ptpc   --quant blockscale
+    fused-sdma  (chunks=8)      1114.5us          1146.2us
+    split-sdma                  1261.7            1465.5
+    split-lsa                   1262.4            1469.9
+    fused-lsa   (n_stripe=2)    1365.6            1699.6
+    gemm-only                    228.9             388.5
+
+``blockscale`` is the quantisation the model actually runs -- A 1x128 and B
+128x128 with fp32 scales -- and is the column to read. ``ptpc`` is the aiter
+8-wave kernel's native per-token/per-channel form, kept because the two bitwise
+tests and every earlier measurement are on it.
 
 For scale, the same layer in the running model costs 1491.3us (GEMM 348.0 +
 NCCL 1143.3, medians over its 61 layers), and the collective on its own is
-1043us for LSA / 1047 for SDMA against 1113 for NCCL. So ``fused-sdma`` is
-**11.7% under split and 25.3% under what the model runs today**.
+1043us for LSA / 1047 for SDMA against 1113 for NCCL. So at the model's own
+quantisation ``fused-sdma`` is **21.8% under split and 23.1% under what the
+model runs today**.
+
+The margin *grows* with blockscale (11.7% -> 21.8%) for the reason the whole
+exercise was about: the GEMM goes 228.9 -> 388.5us while the 489us of link time
+does not move, so there is more compute to hide the transfer behind. Our
+blockscale GEMM at 388.5 is within 4% of the 373.9us the model's own
+``gemm_a8w8_blockscale_bpreshuffle`` measures standalone on this box.
 
 Fusing over SDMA wins, and only because of ``--chunks``; see the table at its
 definition in ``run()``. It was pinned to 1 while the aiter GEMM's
@@ -114,18 +127,63 @@ def _setup_distributed():
     return local_rank, rank, world_size, UniqueId.from_bytes(payload[0])
 
 
-def make_operands(rank: int, m: int, n: int, k: int):
-    """Deterministic per-rank fp8 operands, plus the bf16 reference partial.
+#: fp8 block-scale group size along K. Fixed by the model's quantiser
+#: (``aiter_per1x128_quant``) and by the kernel, whose BLOCK_K is already 128.
+SCALE_BK = 128
+
+
+def make_operands(rank: int, m: int, n: int, k: int, quant: str = "ptpc"):
+    """Deterministic per-rank fp8 operands and their scales.
 
     Values are kept small so the fp8 rounding is the only error source and the
     all-reduce reference can be built on the host from the same recipe.
+
+    ``quant="ptpc"`` is a8w8 per-token/per-channel: ``sa[M]``, ``sb[N]``, one
+    scale for a whole row of A and a whole column of B.
+
+    ``quant="blockscale"`` is what the model actually runs -- A quantised 1x128
+    and B 128x128, so both scales vary along K: ``sa[M, K/128]`` and
+    ``sb[N/128, K/128]``. The layouts match
+    ``aiter.gemm_a8w8_blockscale_bpreshuffle`` so the two can be compared
+    directly: **sa is column-major** (sglang's
+    ``materialize_bpreshuffle_fp8_scale`` does ``t().contiguous().t()``) and sb
+    is row-major. Established by sweeping the four combinations against that
+    kernel: only (sa column-major, sb row-major) lands at the fp8 floor
+    (1.66e-3); the other three give 0.17-0.32.
     """
     g = torch.Generator(device="cuda").manual_seed(1234 + rank)
     a = (torch.randn(m, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
     b = (torch.randn(n, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
-    sa = torch.rand(m, generator=g, device="cuda", dtype=torch.float32) * 0.01 + 0.01
-    sb = torch.rand(n, generator=g, device="cuda", dtype=torch.float32) * 0.01 + 0.01
-    return a, b, sa, sb
+    if quant == "ptpc":
+        sa = torch.rand(m, generator=g, device="cuda", dtype=torch.float32) * 0.01 + 0.01
+        sb = torch.rand(n, generator=g, device="cuda", dtype=torch.float32) * 0.01 + 0.01
+        return a, b, sa, sb
+    if quant != "blockscale":
+        raise ValueError(f"quant must be ptpc or blockscale, got {quant!r}")
+    kb = k // SCALE_BK
+    sa = torch.rand(m, kb, generator=g, device="cuda", dtype=torch.float32) * 0.01 + 0.01
+    sb = (
+        torch.rand(n // SCALE_BK, kb, generator=g, device="cuda", dtype=torch.float32)
+        * 0.01
+        + 0.01
+    )
+    return a, b, sa.t().contiguous().t(), sb.contiguous()
+
+
+def reference_partial(a, b, sa, sb, quant: str) -> torch.Tensor:
+    """One rank's fp32 GEMM reference, matching ``make_operands``' quantisation."""
+    af, bf = a.float(), b.float()
+    if quant == "ptpc":
+        return (af @ bf.T) * sa[:, None] * sb[None, :]
+    out = torch.zeros(a.shape[0], b.shape[0], device=a.device, dtype=torch.float32)
+    for i in range(a.shape[1] // SCALE_BK):
+        ks = slice(i * SCALE_BK, (i + 1) * SCALE_BK)
+        out += (
+            (af[:, ks] @ bf[:, ks].T)
+            * sa[:, i][:, None]
+            * sb[:, i].repeat_interleave(SCALE_BK)[None, :]
+        )
+    return out
 
 
 def _median_us(fn, warmup: int, iters: int, *, graph: bool = True) -> float:
@@ -162,6 +220,11 @@ def run(args) -> int:
     from aiter.ops.shuffle import shuffle_weight
 
     local_rank, rank, world_size, uid = _setup_distributed()
+    # blockscale keeps a second fp32 accumulator for the per-K-block promotion,
+    # which doubles the accumulator VGPRs; 256x256 needs 256 of them and the
+    # kernel already runs at ~254 with zero spill, so the tile has to halve.
+    if not args.block_m:
+        args.block_m = 128 if args.quant == "blockscale" else 256
     direct_lsa = args.mode == "fused-lsa"
     fused = args.mode in ("fused-sdma", "fused-lsa")
     # fused-lsa still uses the SDMA reduce/gather tail, so it wants queues too.
@@ -210,7 +273,7 @@ def run(args) -> int:
     )
     cfg.validate()
 
-    a, b, sa, sb = make_operands(rank, args.m, args.n, args.k)
+    a, b, sa, sb = make_operands(rank, args.m, args.n, args.k, args.quant)
     b_shuf = shuffle_weight(b, layout=(16, 16))
 
     vmm = max(4 * cfg.window_bytes + VMM_SLACK, VMM_SLACK)
@@ -242,6 +305,7 @@ def run(args) -> int:
             BLOCK_M=args.block_m,
             BLOCK_N=args.block_n,
             b_preshuffled=True,
+            quant=args.quant,
             waves_per_eu=args.waves_per_eu,
             xcd_swizzle=args.xcd_swizzle,
             fuse=fused,
@@ -263,9 +327,21 @@ def run(args) -> int:
         b_i8 = b_shuf.contiguous().view(torch.int8).view(-1)
         c_flat = c.view(-1)
 
+        # The kernel indexes both scale buffers linearly, so hand it the
+        # *physical* element order as 1-D contiguous tensors. sa is logically
+        # [M, K/128] but column-major (the layout aiter's blockscale GEMM
+        # consumes), so its physical order is sa.t(); passing the 2-D
+        # non-contiguous view through DLPack would give the kernel the wrong
+        # strides.
+        if args.quant == "blockscale":
+            sa_arg = sa.t().reshape(-1).contiguous()
+            sb_arg = sb.reshape(-1).contiguous()
+        else:
+            sa_arg, sb_arg = sa, sb
+
         def run_gemm(stream):
-            gemm(a_i8, b_i8, c_flat, sa, sb, args.m, args.n, dc.ptr, win.handle,
-                 stream=stream)
+            gemm(a_i8, b_i8, c_flat, sa_arg, sb_arg, args.m, args.n, dc.ptr,
+                 win.handle, stream=stream)
 
         if needs_sdma:
             parts = build_sdma_phases(
@@ -308,7 +384,7 @@ def run(args) -> int:
             # control a GEMM bug reads as an all-reduce bug: every other mode
             # validates the *sum*, so a corrupt partial and a corrupt collective
             # are indistinguishable from the reported relL2.
-            ref = (a.float() @ b.float().T) * sa[:, None] * sb[None, :]
+            ref = reference_partial(a, b, sa, sb, args.quant)
             diff = (c.float() - ref).norm().item()
             denom = ref.norm().item()
             rel_l2 = diff / denom if denom else diff
@@ -324,8 +400,8 @@ def run(args) -> int:
             # Reference: every rank's partial, summed in fp32 on the host side.
             acc = torch.zeros(args.m, args.n, device="cuda", dtype=torch.float32)
             for r in range(world_size):
-                ar, br, sar, sbr = make_operands(r, args.m, args.n, args.k)
-                acc += (ar.float() @ br.float().T) * sar[:, None] * sbr[None, :]
+                ar, br, sar, sbr = make_operands(r, args.m, args.n, args.k, args.quant)
+                acc += reference_partial(ar, br, sar, sbr, args.quant)
             diff = (out.float() - acc).norm().item()
             denom = acc.norm().item()
             rel_l2 = diff / denom if denom else diff
@@ -361,6 +437,7 @@ def run(args) -> int:
                 "m": args.m,
                 "n": args.n,
                 "k": args.k,
+                "quant": args.quant,
                 "block_m": args.block_m,
                 "block_n": args.block_n,
                 "chunks": chunks if fused else None,
@@ -398,7 +475,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-m", type=int, default=4096)
     p.add_argument("-n", type=int, default=7168)
     p.add_argument("-k", type=int, default=1024)
-    p.add_argument("--block-m", type=int, default=256)
+    p.add_argument(
+        "--quant",
+        choices=("ptpc", "blockscale"),
+        default="ptpc",
+        help="a8w8 per-token/per-channel (the aiter 8wave kernel's native form) "
+        "or the model's 1x128 / 128x128 block scale. blockscale applies the "
+        "scales per K-block in the mainloop, which needs a second accumulator "
+        "and therefore --block-m 128",
+    )
+    p.add_argument("--block-m", type=int, default=0,
+                   help="0 = 256 for --quant ptpc, 128 for --quant blockscale")
     p.add_argument("--block-n", type=int, default=256)
     p.add_argument("--waves-per-eu", type=int, default=2)
     p.add_argument("--xcd-swizzle", type=int, default=0)
