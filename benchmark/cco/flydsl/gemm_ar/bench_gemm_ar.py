@@ -262,7 +262,20 @@ def run(args) -> int:
 
         rel_l2 = float("nan")
         validated = True
-        if (
+        if args.mode == "gemm-only" and not args.skip_validation:
+            # The GEMM on its own, against this rank's partial. Without this
+            # control a GEMM bug reads as an all-reduce bug: every other mode
+            # validates the *sum*, so a corrupt partial and a corrupt collective
+            # are indistinguishable from the reported relL2.
+            ref = (a.float() @ b.float().T) * sa[:, None] * sb[None, :]
+            diff = (c.float() - ref).norm().item()
+            denom = ref.norm().item()
+            rel_l2 = diff / denom if denom else diff
+            validated = rel_l2 < 3e-3
+            if not validated:
+                print(f"[rank {rank}] GEMM VALIDATION FAILED relL2={rel_l2:.3e}", flush=True)
+            del ref
+        elif (
             args.mode != "gemm-only"
             and args.stop_after == "all"
             and not args.skip_validation

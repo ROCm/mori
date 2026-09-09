@@ -413,6 +413,13 @@ than copied, so the duplication is the ~90-line pipeline only.
 ``tests/python/cco/test_gemm_ar.py`` asserts this kernel's C output is
 bit-identical to aiter's unfused kernel on the same inputs, which is what stops
 the copy from rotting silently.
+
+The copy carries **one deliberate divergence** from aiter, marked at its site in
+the main loop: the final ``wait_barrier`` count. aiter's is too permissive and
+corrupts the output non-deterministically on large grids; the test above still
+passes because it runs shapes small enough that aiter is correct there too. Do
+not "restore" it when re-syncing the copy -- see the comment at that line, and
+push the fix upstream instead.
 """
 
 # NOTE: no `from __future__ import annotations` here, deliberately, and aiter's
@@ -1307,7 +1314,26 @@ def compile_fused_gemm_scatter(
             c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
 
             b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * B_K_STEP)
-            wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
+            # aiter has `2 * N_LDS_STEPS_A + N_LDS_STEPS_B` here, which lets
+            # too many global->LDS prefetches stay in flight across the barrier:
+            # a wave passes it and refills an LDS buffer that another wave has
+            # not finished consuming. The result is a silent, non-deterministic
+            # partial corruption -- always a whole (wave_m sub-tile x all four
+            # wave_n) region, which is the signature of a shared A-side LDS
+            # buffer -- that only shows up on large grids. Measured boundary at
+            # [16384, 7168] K=512 on 8x MI355X, 4-5 runs each: at 256x256 the
+            # counts 6 (aiter's), 5 and 4 all corrupt while 3, 2 and 0 are
+            # clean; at 128x256 the counts 4 (aiter's) and 3 corrupt while 2, 1
+            # and 0 are clean. Both thresholds are N_LDS_STEPS_A +
+            # N_LDS_STEPS_B - 1. Costs nothing: 241/240/245 us against
+            # 240/246/237 us for aiter's count at [16384, 7168] K=2048.
+            #
+            # Not a complete theory -- 128x512 does not reproduce at all, so the
+            # count is not the only variable, and the same under-wait may exist
+            # at the other sync points (forcing *any* of the 14 in this loop to
+            # vmcnt(0) also fixes it). This is the smallest change that is
+            # measurably correct here, not a proven-general formula.
+            wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B - 1)
 
             c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
 
