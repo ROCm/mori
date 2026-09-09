@@ -245,6 +245,13 @@ struct RangedPhases {
   // coalesce shows up here long before it shows up as a percentage.
   size_t rmt_items = 0;    // TransferItems handed to the RDMA planner
   size_t rmt_plans = 0;    // plans it produced -- items/plans is the fan-in
+  // Of those plans, how many the engine staged through its bounce pool.  A
+  // staged plan is run INLINE and under a global mutex inside Submit, so even
+  // one of them turns a non-blocking post into a blocking round trip that
+  // every other shard then queues behind.  Counted because `po` costs 46% on
+  // the model and 7% on the probe, and this is the difference that would
+  // explain it.
+  size_t rmt_bounce = 0;
   size_t scat_items = 0;   // no plan count: getting one costs a second Plan()
                            // pass, inside the very phase being measured
   size_t local_keys = 0;
@@ -292,6 +299,7 @@ class PhaseTimer {
 struct RemoteLegSinks {
   size_t* items = nullptr;
   size_t* plans = nullptr;
+  size_t* bounce = nullptr;
   double* resolve = nullptr;
   double* build = nullptr;
   double* build_items = nullptr;
@@ -346,6 +354,7 @@ class RangedStats {
     t.items += p.items;
     t.rmt_items += p.rmt_items;
     t.rmt_plans += p.rmt_plans;
+    t.rmt_bounce += p.rmt_bounce;
     t.scat_items += p.scat_items;
 
     // Per-component totals, keyed by object size (one call = one pool).  The
@@ -387,7 +396,7 @@ class RangedStats {
   struct Totals {
     uint64_t calls = 0;
     uint64_t items = 0;
-    uint64_t rmt_items = 0, rmt_plans = 0, scat_items = 0;
+    uint64_t rmt_items = 0, rmt_plans = 0, rmt_bounce = 0, scat_items = 0;
     double total = 0, resolve = 0, classify = 0, build = 0, validate = 0, commit = 0, route = 0,
            xfer = 0, xfer_plan = 0, xfer_submit = 0, xfer_wait = 0, lock = 0, remote = 0,
            rmt_resolve = 0, rmt_build = 0, rmt_bld_items = 0, rmt_bld_plan = 0,
@@ -407,7 +416,7 @@ class RangedStats {
     auto share = [&](double v) { return t.total > 0 ? 100.0 * v / t.total : 0.0; };
     MORI_UMBP_INFO(
         "[RangedCall][dbg] SUMMARY {} calls={} total={:.3f}s mean_call={:.1f}us bytes={:.2f}GiB "
-        "items_per_call={:.0f} rmt_items={:.0f}/{:.0f}pl scat_items={:.0f} | "
+        "items_per_call={:.0f} rmt_items={:.0f}/{:.0f}pl bounce={:.2f} scat_items={:.0f} | "
         "resolve={:.1f}% classify={:.1f}% build={:.1f}% validate={:.1f}% "
         "commit={:.1f}% route={:.1f}% xfer={:.1f}%(plan={:.1f}% submit={:.1f}% wait={:.1f}%) "
         "lock={:.1f}% remote={:.1f}%(rslv={:.1f}% bld={:.1f}%[it={:.1f}% pl={:.1f}% "
@@ -416,7 +425,8 @@ class RangedStats {
         "other={:.1f}% | xfer_only={:.2f}GiB/s end2end={:.2f}GiB/s",
         name, t.calls, t.total, 1e6 * t.total / t.calls, t.bytes / (1024.0 * 1024 * 1024),
         static_cast<double>(t.items) / t.calls, static_cast<double>(t.rmt_items) / t.calls,
-        static_cast<double>(t.rmt_plans) / t.calls, static_cast<double>(t.scat_items) / t.calls,
+        static_cast<double>(t.rmt_plans) / t.calls, static_cast<double>(t.rmt_bounce) / t.calls,
+        static_cast<double>(t.scat_items) / t.calls,
         share(t.resolve), share(t.classify), share(t.build),
         share(t.validate), share(t.commit), share(t.route), share(t.xfer), share(t.xfer_plan),
         share(t.xfer_submit), share(t.xfer_wait), share(t.lock), share(t.remote),
@@ -3640,9 +3650,9 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   PhaseTimer remote_timer(dbg ? &dbg->remote : nullptr);
   RemoteLegSinks leg;
   if (dbg != nullptr) {
-    leg = {&dbg->rmt_items,     &dbg->rmt_plans,    &dbg->rmt_resolve,
-           &dbg->rmt_build,      &dbg->rmt_bld_items, &dbg->rmt_bld_plan,
-           &dbg->rmt_bld_post,   &dbg->rmt_wait};
+    leg = {&dbg->rmt_items,      &dbg->rmt_plans,     &dbg->rmt_bounce,
+           &dbg->rmt_resolve,    &dbg->rmt_build,     &dbg->rmt_bld_items,
+           &dbg->rmt_bld_plan,   &dbg->rmt_bld_post,  &dbg->rmt_wait};
   }
   ScopedRemoteLeg leg_scope(dbg ? &leg : nullptr);
   size_t pos = 0;
@@ -4336,6 +4346,11 @@ std::unique_ptr<PoolClient::RemoteGetInFlight> PoolClient::SubmitRemoteBatchGet(
   if (t_remote_leg != nullptr) {
     if (t_remote_leg->items != nullptr) *t_remote_leg->items += active.size();
     if (t_remote_leg->plans != nullptr) *t_remote_leg->plans += planned.plans.size();
+    if (t_remote_leg->bounce != nullptr) {
+      for (const auto& p : planned.plans) {
+        if (p.uses_bounce) *t_remote_leg->bounce += 1;
+      }
+    }
   }
   ApplyRejectedTags(inflight->entries, planned.rejected_tags, "RemoteGet");
   if (planned.plans.empty()) {
