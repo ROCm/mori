@@ -303,13 +303,63 @@ the two mori calls that holds the torch convert and the launch path (+44.9,
 +17.1, +51.1 on spiked rounds), with `hdis` moving in step on some runs and not
 others. The convert kernel itself is flat at 9us.
 
+THE LOOP HAS NO SLACK: HOST JITTER CONVERTS 1:1 INTO PEER WAIT
+--------------------------------------------------------------
+`MORI_EP_INJECT_HOST_US` busy-waits the host between dispatch and combine, on
+every rank, by a known amount. Summing each node's two cross-node waits
+(`c_spin` + `cs_bar`):
+
+    injected    node0 wait   node1 wait   ratio
+        0us         11.9         4.1        --
+       20us         20.1        18.7       1.01
+       60us         61.5        56.9       1.02
+      120us        119.3       129.7       1.08
+
+**Every microsecond of host delay inserted between the two calls comes back as a
+microsecond of cross-node wait.** The round has no slack to absorb it. (An
+earlier single run read ~1.6x; the four-point curve says 1:1 and supersedes it.)
+
+That closes the causal chain and unifies the two mechanisms above: a host hiccup
+in `d2sync` is a perturbation, the loop converts it one-for-one into peer wait,
+and nothing damps it, so it becomes a standing offset that persists for the rest
+of the run.
+
+It also predicts the production case. In a real MoE the expert compute sits
+exactly in that window, so this is not a benchmark artifact -- it is the same
+window, only larger.
+
+Periodic re-alignment does NOT fix it. `--realign-every 20` (a full
+synchronize + gloo barrier every 20 rounds) still ended one of two runs in the
+offset state (node0 c_spin 21.7, node1 cs_bar 32.0): the offset re-forms inside
+20 rounds. Re-aligning treats the symptom and the loop walks straight back.
+
 WHAT WOULD ACTUALLY HELP
 ------------------------
 Not geometry tuning: no kernel is slower, so no schedule can win the time back.
-The lever is the number of serialised cross-node rendezvous per round. There are
-at least two (`combine_ll`'s `c_spin` and `combinesyncbarrier`), and each one
-converts the standing offset into wait time again. Removing one, or making one of
-them absorb skew instead of preserving it, is what changes the fixed point.
+Not periodic re-alignment: measured, it does not hold. Three things follow from
+the 1:1 transfer, in the order I would try them:
+
+1. **Cut the host wrapper on the critical path.** It is ~42us a round (hdis 16 +
+   hcom 26) inside the measured window, and by the transfer above every
+   microsecond removed is a microsecond of peer wait removed. This is the
+   highest-confidence lever because the transfer function is measured, not
+   assumed, and it needs no semantic change. It also plausibly explains why this
+   branch degrades ~3x further than #625 on the same runs -- worth checking
+   whether v1's host path per round is lighter or steadier than ours.
+
+2. **Give the round slack: decouple consecutive rounds.** The benchmark reuses
+   one set of buffers every round, so round i+1 cannot start until the peer has
+   drained round i -- a false dependency. Double-buffering the arena by round
+   parity lets a node that is ahead keep going instead of converting its lead
+   into a wait. This is the structural fix; it changes the fixed point rather
+   than the symptom.
+
+3. **Reduce the number of serialised cross-node rendezvous.** There are at least
+   three a round (`d_spin`, `cs_bar`, `c_spin`), and each is another place the
+   standing offset is re-converted into wait. `combine_ll` already waits on peer
+   data, so whether the separate `combinesyncbarrier` in front of it is
+   redundant is the first thing to read. Expect this alone to move the offset
+   rather than remove it -- it is worth doing together with (2), not instead.
 
 NEXT
 ----

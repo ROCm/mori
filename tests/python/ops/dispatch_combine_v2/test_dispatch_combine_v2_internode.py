@@ -243,6 +243,13 @@ def _parse_args(argv):
     # which is the question when the host is running ahead -- and adds nothing
     # cross-rank.
     p.add_argument("--per-round-drain", action="store_true")
+    # Re-align the ranks every N rounds. The slow regime is a stable inter-node
+    # phase offset, and a rendezvous does not remove one -- this asks whether an
+    # explicit re-alignment escapes the offset fixed point or whether the loop
+    # falls straight back into it. N is chosen so the gloo barrier's ~1.3ms is
+    # amortised: at 20 it costs ~65us a round against a ~100us round, which is
+    # far too much for a benchmark number but fine for answering the question.
+    p.add_argument("--realign-every", type=int, default=0)
     # Both members of the LL / non-LL pair are compiled either way; this picks
     # which one runs. Default (None) leaves the backend's token-count rule alone,
     # which selects LL below 2048 tokens. Naming it explicitly is what makes a
@@ -528,6 +535,9 @@ def _bench(op, cfg, d, dev, a, comm):
             comm.barrier()
         elif a.per_round_drain:
             torch.cuda.synchronize()
+        if a.realign_every and (i % a.realign_every) == (a.realign_every - 1):
+            torch.cuda.synchronize()
+            comm.barrier()
     if _series:
         tr[n] = time.perf_counter()
     torch.cuda.synchronize()
