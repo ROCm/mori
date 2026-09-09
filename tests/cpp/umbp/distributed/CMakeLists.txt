@@ -468,8 +468,9 @@ add_test(NAME test_component_metrics COMMAND test_component_metrics)
 
 # test_gds_engine — GdsEngine routing/planning (no GPU) plus a GPU + hipFile
 # read round trip (skipped without a device, or on a filesystem that rejects
-# O_DIRECT). Built only when hipfile is available; umbp_common already carries
-# hip::hipfile and the UMBP_ENABLE_GDS definition in that case.
+# O_DIRECT). Built only when the hipfile headers are installed; umbp_common
+# already carries the UMBP_ENABLE_GDS definition in that case and dlopen's
+# libhipfile itself, so this target links no hipfile library.
 if(TARGET hip::hipfile)
   add_executable(test_gds_engine test_gds_engine.cpp)
   target_link_libraries(test_gds_engine PRIVATE umbp_common hip::host GTest::gtest_main)
