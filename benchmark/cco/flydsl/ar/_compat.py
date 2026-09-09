@@ -43,6 +43,8 @@ same constants aiter's ``custom_all_reduce.cuh`` uses for ``start_sync`` /
 
 from __future__ import annotations
 
+import inspect
+
 import flydsl
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -155,18 +157,35 @@ except ImportError:  # flydsl >= 0.3.0
         elem_bytes = elem_ty.width // 8
         return _arith.MulIOp(_as_i32(offset), _const(elem_bytes, 32)).result
 
+    # FlyDSL 0.3.2 moved `aux` on the raw buffer ops from a positional i32
+    # *value* to a keyword-only *attribute*. Both spellings are in use here --
+    # aiter's venv has 0.3.0, sglang's has 0.3.2 -- so probe once and adapt
+    # rather than pinning either.
+    _AUX_IS_KWARG = "aux" in getattr(
+        inspect.signature(_rocdl.raw_ptr_buffer_store), "parameters", {}
+    ) and inspect.signature(
+        _rocdl.raw_ptr_buffer_store
+    ).parameters["aux"].kind is inspect.Parameter.KEYWORD_ONLY
+
+    def _aux_args(cache_modifier):
+        """Positional tail / kwargs for the raw buffer ops' ``aux`` operand."""
+        if _AUX_IS_KWARG:
+            return (), {
+                "aux": ir.IntegerAttr.get(
+                    ir.IntegerType.get_signless(32), int(cache_modifier)
+                )
+            }
+        return (_const(cache_modifier, 32),), {}
+
     def buffer_load(rsrc, offset, vec_width=4, dtype=None, cache_modifier=CM_CACHED):
         """Load ``vec_width`` x ``dtype`` at ELEMENT ``offset`` of ``rsrc``."""
         elem = dtype if dtype is not None else _dtype("f32")
         if hasattr(elem, "ir_type"):
             elem = elem.ir_type
         res = elem if vec_width == 1 else ir.VectorType.get([vec_width], elem)
+        tail, kw = _aux_args(cache_modifier)
         return _rocdl.raw_ptr_buffer_load(
-            res,
-            rsrc,
-            _byte_offset(offset, elem),
-            _const(0, 32),
-            _const(cache_modifier, 32),
+            res, rsrc, _byte_offset(offset, elem), _const(0, 32), *tail, **kw
         )
 
     def buffer_store(data, rsrc, offset, cache_modifier=CM_CACHED):
@@ -177,12 +196,9 @@ except ImportError:  # flydsl >= 0.3.0
             elem = ir.VectorType(ty).element_type
         except (ValueError, TypeError):
             elem = ty
+        tail, kw = _aux_args(cache_modifier)
         return _rocdl.raw_ptr_buffer_store(
-            value,
-            rsrc,
-            _byte_offset(offset, elem),
-            _const(0, 32),
-            _const(cache_modifier, 32),
+            value, rsrc, _byte_offset(offset, elem), _const(0, 32), *tail, **kw
         )
 
 
