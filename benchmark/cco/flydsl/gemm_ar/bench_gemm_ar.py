@@ -416,7 +416,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="with the rotated order: rotate the destination every N N-tiles "
         "instead of after a whole chunk (gcnasm opus_direct_stripe_tile). "
-        "0 = per-mode default, which is 2 for fused-lsa and 1 elsewhere",
+        "0 = per-mode default: 2 for fused-lsa, chunk-major elsewhere. 1 rotates "
+        "the destination on every block",
     )
     p.add_argument(
         "--tile-order",

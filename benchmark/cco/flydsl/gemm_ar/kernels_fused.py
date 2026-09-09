@@ -990,15 +990,34 @@ def compile_fused_gemm_scatter(
     complete. It is separately settable so the benchmark can charge the split
     baseline the same tile order and show that the ordering itself is neutral.
 
-    ``n_stripe`` > 1 rotates the destination every ``n_stripe`` N-tiles instead
-    of after a whole chunk -- gcnasm's ``opus_direct_stripe_tile``, transposed
-    (its destination is on N and ours is on M, so its ``m_stripe`` is our
-    ``n_stripe``). It defaults to 2 for ``fused-lsa`` and 1 everywhere else,
-    which is the same split gcnasm makes: with a PUT to trigger you want a
-    chunk finished as early as possible, and with peer stores you want them
-    spread evenly over the links rather than arriving in same-destination
-    bursts. Measured at [16384, 7168] K=2048 on 8 ranks: fused-lsa 1560.7 ->
-    1366.3us (its GEMM 937.9 -> 788.8), fused-sdma unchanged within noise.
+    ``n_stripe`` is how many N-tiles a block walks before the destination
+    rotates -- gcnasm's ``opus_direct_stripe_tile``, transposed (its
+    destination is on N and ours is on M, so its ``m_stripe`` is our
+    ``n_stripe``). It spans the whole range: 1 rotates on every block, and
+    ``N // BLOCK_N`` is chunk-major, where a destination's whole chunk is
+    finished before moving on. ``None`` picks 2 for ``fused-lsa`` and
+    chunk-major elsewhere.
+
+    Swept at [16384, 7168] K=2048 on 8 ranks (28 N-tiles, so the divisors are
+    1, 2, 4, 7, 14, 28):
+
+        n_stripe     1      2      4      7     14     28
+        fused-lsa  1370.9 1362.5 1404.9 1402.9 1437.0 1569.0
+        fused-sdma 1117.9 1117.1 1114.8 1124.0 1117.5 1115.7
+
+    ``fused-lsa`` is monotone from 28 down to 2 and then flat -- 1 and 2 are the
+    same within noise -- for 13% end to end. ``fused-sdma`` is flat across the
+    whole range: its bytes leave from a staging buffer on the copy engines, so
+    only the moment a chunk *completes* matters, and with 256 resident blocks
+    out of 1792 the first chunk completes inside the first wave of blocks
+    whatever the order.
+
+    Two hypotheses this sweep kills. It is not XCD locality: with
+    ``dest = (block / n_stripe) % 8`` and blocks going round-robin over the 8
+    XCDs, a destination is fed by exactly ``min(n_stripe, 8)`` XCDs, so 14 and
+    28 spread over all eight and 2 over only two -- and 2 is the fast one. And
+    it is not chunk-completion timing, or ``fused-sdma`` would prefer
+    chunk-major, which it does not.
 
     Returns ``launch(A, B_T, C, A_scale, B_scale, c_m, c_n, dev_comm, win,
     stream=...)``.
@@ -1040,11 +1059,13 @@ def compile_fused_gemm_scatter(
     direct_lsa = fuse and transport == "lsa"
     rotated = fuse if rotated is None else rotated
     if n_stripe is None:
-        n_stripe = 2 if (fuse and transport == "lsa") else 1
+        n_stripe = 2 if (fuse and transport == "lsa") else 0  # 0 -> chunk-major
+    if n_stripe == 0:
+        n_stripe = N // BLOCK_N  # chunk-major == stripe of a whole chunk
     if n_stripe < 1:
         raise ValueError(f"n_stripe must be >= 1, got {n_stripe}")
-    if n_stripe > 1 and not rotated:
-        raise ValueError("n_stripe > 1 needs the rotated tile order")
+    if n_stripe != 1 and not rotated:
+        raise ValueError("a striped tile order needs --tile-order rotated")
 
     assert BLOCK_M >= 128 and BLOCK_N >= 256
     assert BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
@@ -1164,7 +1185,7 @@ def compile_fused_gemm_scatter(
             # GEMM. The `+ rank` rotation keeps all 8 ranks from pushing at the
             # same destination simultaneously (gcnasm's opus_direct_stripe_tile).
             # split_row_major_2d(i, n) -> (i // n, i % n)
-            if const_expr(n_stripe == 1):
+            if const_expr(n_stripe >= n_blocks_const):
                 rest, bn = split_row_major_2d(fx.block_idx.x, n_blocks)
                 tile_i, dest_seq = split_row_major_2d(rest, ws)
             else:
