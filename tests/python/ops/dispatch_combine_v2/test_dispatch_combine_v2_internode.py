@@ -222,6 +222,10 @@ def _parse_args(argv):
     # over. Whichever of the two is larger. Not 0: see the note in _tune.
     p.add_argument("--tuning-margin-us", type=float, default=1.5)
     p.add_argument("--tuning-margin-frac", type=float, default=0.02)
+    # How much worst-of-reps regression a median win may carry, and how much
+    # worst-of-reps improvement makes a median TIE interesting. Fraction of the
+    # incumbent's median.
+    p.add_argument("--tuning-tail-frac", type=float, default=0.10)
     # The v1 bench calls combine with weights=None, so it does not pay for the
     # weight fold: an extra peer read per (token, destination) plus an accumulate
     # in three kernels, and a wider staging slot (combXferBytes = hidden + weights).
@@ -891,10 +895,24 @@ def _tune(cfg, d, dev, a, comm):
     warps = [4, 8, 16] if a.tuning_scope == "quick" else [4, 6, 8, 12, 16]
 
     def rdmas(bn):
+        # rdma_block_num partitions the SAME grid between the blocks that talk to
+        # the network and the rest, so the optimum is a fraction of block and can
+        # sit anywhere in (0, 1). Three points was too coarse to say anything
+        # about the shape -- and it could not even reach the shipped 32-token row,
+        # whose rdma=48 against block=80 is 0.6 and is not 1/4, 1/2 or 2/3.
+        # Eighths plus 2/3 covers it at a cost of ~70s a sweep against ~31s.
         frac = (
             (bn // 2, bn * 2 // 3)
             if a.tuning_scope == "quick"
-            else (bn // 4, bn // 2, bn * 2 // 3)
+            else (
+                bn // 8,
+                bn // 4,
+                3 * bn // 8,
+                bn // 2,
+                5 * bn // 8,
+                bn * 2 // 3,
+                3 * bn // 4,
+            )
         )
         return sorted({v for v in frac if 1 <= v < bn})
 
@@ -978,6 +996,11 @@ def _tune(cfg, d, dev, a, comm):
             ct_.append(pick(dv, cv))
             cph.append((dv, cv))
         bm, cm = sorted(bt)[len(bt) // 2], sorted(ct_)[len(ct_) // 2]
+        # Worst of the paired reps, as a tail proxy. _timed_pass returns a grand
+        # mean, so this is run-to-run spread rather than a worst ROUND -- which is
+        # the right thing here anyway, since the risk being guarded against is a
+        # geometry that lands in a bad regime more often.
+        bmax, cmax = max(bt), max(ct_)
         # PAIRED, not a difference of medians: the regime moves during a sweep
         # (the same incumbent geometry has read 84.9us on one candidate and
         # 126.0us on the next), and differencing within a rep cancels that. The
@@ -986,12 +1009,23 @@ def _tune(cfg, d, dev, a, comm):
         diffs = sorted(c - b_ for b_, c in zip(bt, ct_))
         lo, hi = diffs[0], diffs[-1]
         dmed = diffs[len(diffs) // 2]
-        win = dmed < -max(a.tuning_margin_us, bm * a.tuning_margin_frac)
+        margin = max(a.tuning_margin_us, bm * a.tuning_margin_frac)
+        tail_room = bm * a.tuning_tail_frac
+        # A median win is not enough on its own. Selecting purely on the median
+        # would accept a geometry that gains 2us at the median and gives back 30
+        # at the worst, and this table is used for a latency-bound collective
+        # where the worst round is what the caller waits for.
+        win = dmed < -margin and (cmax - bmax) <= tail_room
+        # And when the medians TIE, a clearly better worst is worth surfacing --
+        # this is the "same average, better tail" rule, made explicit rather than
+        # applied by hand after the fact.
+        tie = abs(dmed) <= margin and (bmax - cmax) > tail_room
         if d.rank == 0:
             print(
                 f"#   [{k + 1}/{len(cands)}] {cand} med={cm:6.1f}us vs "
                 f"incumbent {best} med={bm:6.1f}us  paired={dmed:+6.1f}us "
-                f"[{lo:+.1f},{hi:+.1f}]  {'WIN' if win else '--'}"
+                f"[{lo:+.1f},{hi:+.1f}] worst {cmax:.0f}/{bmax:.0f}  "
+                f"{'WIN' if win else ('TAIL' if tie else '--')}"
                 f"   d/c cand={_med(x for x, _ in cph):.1f}/{_med(y for _, y in cph):.1f}"
                 f" inc={_med(x for x, _ in bph):.1f}/{_med(y for _, y in bph):.1f}",
                 flush=True,
@@ -1001,8 +1035,23 @@ def _tune(cfg, d, dev, a, comm):
             best_op, best, best_med = cand_op, cand, cm
         else:
             cand_op.close()
-            if not a.tuning_greedy and win:
-                fixed_wins.append((dmed, cand, cm, bm))
+            if not a.tuning_greedy and (win or tie):
+                # Sort key puts real median wins ahead of tail-only ties.
+                # Rank real median wins ahead of tail-only ties: the two keys
+                # are different quantities and must not be sorted against each
+                # other, or a -20us tail tie outranks a -3us median win.
+                fixed_wins.append(
+                    (
+                        0 if win else 1,
+                        dmed if win else (cmax - bmax),
+                        cand,
+                        cm,
+                        bm,
+                        win,
+                        cmax,
+                        bmax,
+                    )
+                )
             best_med = bm
         comm.barrier()
 
@@ -1014,10 +1063,10 @@ def _tune(cfg, d, dev, a, comm):
             f"{len(cands)} candidates beat the fixed incumbent {start}",
             flush=True,
         )
-        for dm, cd, cm2, bm2 in fixed_wins[:5]:
+        for _, dm, cd, cm2, bm2, w, cx, bx in fixed_wins[:5]:
             print(
-                f"#   BEAT {cd} paired={dm:+.1f}us (cand med={cm2:.1f} "
-                f"inc med={bm2:.1f})",
+                f"#   {'BEAT' if w else 'TAIL'} {cd} paired={dm:+.1f}us "
+                f"(cand med={cm2:.1f} inc med={bm2:.1f} worst {cx:.0f}/{bx:.0f})",
                 flush=True,
             )
         if fixed_wins:

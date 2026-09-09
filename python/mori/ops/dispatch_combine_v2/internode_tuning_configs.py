@@ -92,6 +92,47 @@ from mori.ops import utils as gpu_utils
 # tokens has gone with it. The note is left standing for the 8-token row, whose
 # sweep found nothing better and which still carries rdma 32.
 #
+# Re-tune (2026-09-09) after the CCO NUMA-binding fix. EVERY number above this
+# line was tuned with the ranks unbound, i.e. every A/B in it raced a +-40us
+# random term from CPU placement, so the table had to be re-derived rather than
+# trusted. ONE row moved: 32-token combine 80/40/8 -> 64/48/6.
+#
+# Method, FOUR stages. The fourth is not optional and I learned that the hard way:
+#   1. Full sweep, 165 candidates (the rdma grid was widened from three points to
+#      eighths -- the old one could not even reach the shipped 32-token rdma=48),
+#      three repeats per (token, phase).
+#   2. Keep only candidates that won in at least two of the three repeats. At 4
+#      tokens the three sweeps returned 15 winners and NONE repeated, which is
+#      the whole argument for this stage.
+#   3. Head-to-head against the shipped row, 21 paired reps, three times.
+#
+# Stage 3 is not a formality. 16-token combine (64,40,6) won all THREE sweeps and
+# then lost all three head-to-heads -- picking a winner out of 165 candidates is
+# a multiple-comparison problem and the sweep alone cannot tell a real effect
+# from the best of 165 draws. The bar applied here is: the tuned phase's median
+# must be better in all three head-to-heads.
+#   4. A plain interleaved bench A/B of the resulting TABLE. Stage 3 runs two ops
+#      at once -- incumbent and candidate each holding a symmetric window, run
+#      alternately -- which is not the shipping condition, so its verdict does
+#      not transfer on its own.
+#
+# Stage 4 rejected 8-token dispatch (32,12,6), which had passed stage 3 on both
+# the median (39.0/39.2/40.2 against 40.9/41.0/41.3) and the worst. In a plain
+# bench it read 118.1/118.8/115.9 against the shipped row's 92.0/94.3, with one
+# dispatch worst of 374us -- best-in-class once and much worse three times. That
+# geometry leaves only 20 of 32 blocks for the intra-node half and is bimodal;
+# 8-token dispatch is therefore UNCHANGED.
+#
+# 32-token combine (64,48,6) passed stage 4: interleaved against the shipped row,
+# three pairs, 113.6/114.6/114.3 against 116.1/116.1/118.3, with combine itself
+# 65.0/64.9/64.9 against 66.7/66.8/67.3. That is the one row this re-tune moved.
+# 4- and 32-token dispatch had no candidate reproduce at all and are unchanged.
+#
+# Two candidates cleared the tail bar but not the median one and are NOT applied,
+# recorded so they are not re-derived: 4-token combine (64,16,8) and 8-token
+# combine (80,50,4). Both tie on the median and cut the worst of the paired reps
+# by 15-25us. They are a real trade, not noise; they want their own decision.
+#
 # Methodology, because a sweep on this path is easy to get wrong: candidates are
 # judged by a PAIRED comparison against a FIXED incumbent, not by a chain. v1's
 # greedy shape (a winner becomes the incumbent) is unusable at this noise level
@@ -102,7 +143,7 @@ _MI308X_EP16_H6144 = (
     (4, 32, 16, 4, 32, 21, 6),
     (8, 64, 32, 8, 32, 21, 6),
     (16, 80, 40, 4, 80, 40, 4),
-    (None, 80, 48, 8, 80, 40, 8),
+    (None, 80, 48, 8, 64, 48, 6),
 )
 
 # (device_key, world_size, hidden_dim, topk) -> {dtype: schedule}
