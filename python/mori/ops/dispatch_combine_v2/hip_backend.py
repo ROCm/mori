@@ -616,7 +616,28 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             return True
         return num_tokens <= self.cfg.internode_ll_max_tokens
 
+    @staticmethod
+    def _fit_internode_geom(g):
+        """Force rdma_block_num < block_num.
+
+        The kernel splits the grid: blocks below rdmaBlockNum take the RDMA leg,
+        the rest take the intra-node one. rdma >= block leaves the intra-node
+        half with no blocks AND makes the dispatch fan-in wait for
+        rdmaBlockNum * warpNum arrivals that can never happen -- every peer then
+        spins forever, with no host-side error. internode_tuning_configs.lookup()
+        clamps on the table-hit path; this is the choke point that covers the
+        env-pin and untuned paths too.
+        """
+        block, rdma, warp = g
+        return (block, min(rdma, max(1, block - 1)), warp)
+
     def _internode_geometry_buckets(self, cfg):
+        return [
+            (t, self._fit_internode_geom(d), self._fit_internode_geom(c))
+            for t, d, c in self._internode_geometry_buckets_raw(cfg)
+        ]
+
+    def _internode_geometry_buckets_raw(self, cfg):
         """``[(max_tok | None, disp_geom, comb_geom)]``, coarsest last.
 
         Compilation happens at build time, so every geometry a launch could pick

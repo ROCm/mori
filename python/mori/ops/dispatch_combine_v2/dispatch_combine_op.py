@@ -187,14 +187,26 @@ class EpDispatchCombineConfig:
             raise ValueError(
                 f"combine_mode must be gather|scatter, got {self.combine_mode!r}"
             )
-        # Intranode only. There, a quantised combine scatters: each destination
-        # writes its own partial back. The internode fp8_direct_cast combine does
-        # not -- fp8 is the *staging* format, the accumulation is still a gather
-        # (EpCombineAllInternalFp8 reduces nNodes slots into one bf16 output), and
-        # its T stays the combine dtype. Forcing scatter here made
-        # quant_type='fp8_direct_cast' unreachable on the internode path: the
-        # backend accepts it, then rejects the scatter this rule had just set.
-        if self.quant_type != "none" and not self.is_internode:
+        # A quantised combine scatters: each destination writes its own partial
+        # back. That is intranode-only, and it is what kept quant off the
+        # internode path -- the backend would accept the quant type and then
+        # reject the scatter this rule had just set.
+        #
+        # The internode kernels do carry an fp8 staging path
+        # (EpCombineAllInternalFp8 reduces nNodes fp8 slots into one bf16
+        # output), but it does not produce correct tokens: measured on 2x8
+        # MI308X, weights are exact while ~51% of hidden elements are outside a
+        # 30% tolerance and some are exactly zero. Rejecting here rather than
+        # relying on the scatter rule to reject by accident, because an accepted
+        # config that returns corrupt data is the worst of the three outcomes.
+        if self.quant_type != "none":
+            if self.is_internode:
+                raise ValueError(
+                    f"quant_type={self.quant_type!r} is not supported on the "
+                    "internode path (world_size > gpu_per_node): the fp8 combine "
+                    "staging path there is incomplete and returns wrong tokens. "
+                    "Use quant_type='none', or an intranode config."
+                )
             self.combine_mode = "scatter"
         # Token copy moves whole 16 B (vec4) chunks; a non-16 B-aligned per-token
         # size would over-read/write a few dwords past the token.
@@ -955,7 +967,10 @@ class EpDispatchCombineOp:
         self.dispatch_barrier.zero_()
         self.combine_barrier.zero_()
         self.total_recv.zero_()
-        self.cross_device_flag.fill_(1)
+        # The two backends seed this differently -- intranode starts the epoch at
+        # 1, internode at 0 (see the two constructors in hip_backend) -- so a
+        # single literal here silently desynchronises one of them from its peers.
+        self.cross_device_flag.fill_(0 if self.cfg.is_internode else 1)
 
     def __repr__(self):
         return (

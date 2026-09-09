@@ -567,7 +567,12 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs& args) {
 
     int endTokenIdx = startTokenIdx + thisChunkTokenNum;
 
-    for (int j = startTokenIdx + (blockId % numRecvBlock) * warpNum + warpId; j < endTokenIdx;
+    // bid, NOT blockId: bid strides by rdmaBlockNum, so the two agree only when
+    // rdmaBlockNum % numRecvBlock == 0. With any other rdmaBlockNum the eight
+    // blocks cooperating on a chunk collide on some sub-indices and never issue
+    // others -- tokens silently dropped, and others delivered twice. The combine
+    // twin in CombineInterNodeTyped already uses bid.
+    for (int j = startTokenIdx + (bid % numRecvBlock) * warpNum + warpId; j < endTokenIdx;
          j += numRecvBlock * warpNum) {
       int tokIdx = SendBufSlotOffset(config, node, j);
       index_t* indices = reinterpret_cast<index_t*>(stagingPtr + tokIdx * xferBytes + hiddenBytes);

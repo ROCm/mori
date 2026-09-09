@@ -125,6 +125,19 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
                              " x waveSize " + std::to_string(c.waveSize) + " = " +
                              std::to_string(threads) + " threads per block, which exceeds 1024");
   }
+
+  // The grid is split: blocks below rdmaBlockNum take the RDMA leg, the rest the
+  // intra-node one. rdma >= block leaves the intra-node half with nothing AND
+  // makes the dispatch fan-in wait on rdmaBlockNum * warpNum arrivals that can
+  // never occur, so every peer spins forever. Strict, because == is equally
+  // broken: it leaves xgmiBlockNum == 0.
+  if (c.rdmaBlockNum >= c.blockNum) {
+    throw std::runtime_error("mori ep internode v2: rdmaBlockNum " +
+                             std::to_string(c.rdmaBlockNum) + " must be < blockNum " +
+                             std::to_string(c.blockNum) +
+                             "; the intra-node half would get no blocks and the dispatch "
+                             "barrier would never complete");
+  }
   (void)kind;
   return c;
 }

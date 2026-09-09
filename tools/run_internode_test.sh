@@ -18,6 +18,10 @@
 # run EP2 and left EP16 -- the shape that actually ships -- reachable only by
 # hand-written torchrun lines outside this script.
 #
+# --kernel-type is forwarded only when given, so each entry keeps its own default
+# and its own vocabulary. It used to default to "v1" here and always be passed,
+# which made the v2 entry die in argparse whenever a caller omitted it.
+#
 # --entry selects which driver torchrun runs, defaulting to the shmem AOT harness.
 # The v2 CCO entry takes a SUBSET of the same CLI: --cmd is only test|bench|tuning
 # (no stress/test_sentinel/sweep_bench/profile), --kernel-type is auto|v2|v2_ll
@@ -36,7 +40,7 @@ MASTER_ADDR=""
 MASTER_PORT=1234
 IFNAME=""
 CMD=""
-KERNEL_TYPE="v1"
+KERNEL_TYPE=""
 NUM_QP=2
 MAX_TOKENS=""
 QUANT_TYPE=""
@@ -100,6 +104,7 @@ EXTRA_ARGS=()
   && EXTRA_ARGS+=(--max-recv-total-tokens "$MAX_RECV_TOTAL_TOKENS")
 [[ -n "$SENTINEL_PATTERN" ]] && EXTRA_ARGS+=(--sentinel-pattern "$SENTINEL_PATTERN")
 [[ -n "$ROUNDS" ]]         && EXTRA_ARGS+=(--rounds "$ROUNDS")
+[[ -n "$KERNEL_TYPE" ]]    && EXTRA_ARGS+=(--kernel-type "$KERNEL_TYPE")
 
 exec timeout "${MORI_INTERNODE_TIMEOUT:-120}" torchrun \
   --nnodes=2 \
@@ -109,7 +114,6 @@ exec timeout "${MORI_INTERNODE_TIMEOUT:-120}" torchrun \
   --master_port="$MASTER_PORT" \
   "$ENTRY" \
   --cmd "$CMD" \
-  --kernel-type "$KERNEL_TYPE" \
   --num-qp "$NUM_QP" \
   --max-tokens "$MAX_TOKENS" \
   "${EXTRA_ARGS[@]}"

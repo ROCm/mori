@@ -438,20 +438,25 @@ jobs:
           # shmem path over the v1 harness is ci.yml's internode-test.
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
           PORT=29240
-          for TOKENS in 128 4096; do
-            echo "=== cco test max-tokens=$TOKENS port=$PORT ==="
+          # Both families, because they are separate kernels: naming one in the
+          # config compiles only that one, so a job that never names v2_ll never
+          # even compiles it. 128 is the LL band and 4096 the wide one, so each
+          # family is exercised where it is the one a real caller would get.
+          for CASE in "v2 128" "v2 4096" "v2_ll 128"; do
+            set -- $CASE; KERNEL=$1; TOKENS=$2
+            echo "=== cco test kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
             NODE2_CMD=(
               $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT
               --rank 1 --master-addr $NODE1_HOST --master-port $PORT
               --ifname $NODE2_IFNAME --entry $ENTRY
-              --cmd test --kernel-type v2 --quant-type none --dtype bf16
+              --cmd test --kernel-type $KERNEL --quant-type none --dtype bf16
               --max-tokens $TOKENS
             )
             ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
             $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT \
               --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
               --ifname $NODE1_IFNAME --entry $ENTRY \
-              --cmd test --kernel-type v2 --quant-type none --dtype bf16 \
+              --cmd test --kernel-type $KERNEL --quant-type none --dtype bf16 \
               --max-tokens $TOKENS
             wait
             sleep 1
