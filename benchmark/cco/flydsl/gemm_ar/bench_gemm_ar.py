@@ -47,10 +47,10 @@ which is a ``--chunked-prefill-size 16384`` TP8 prefill chunk of DSV4-Pro
 ``wo_b`` (1792 tiles of 256x256 per rank). 8x MI355X, graph replay, median of
 31, max over ranks, on an idle box, with the current defaults:
 
-    fused-sdma  (chunks=8)       1114.1us
+    fused-sdma  (chunks=8)       1114.5us
     split-sdma                   1261.7
     split-lsa                    1262.4
-    fused-lsa                    1571.4
+    fused-lsa   (n_stripe=2)     1365.6
     gemm-only                     228.9
 
 For scale, the same layer in the running model costs 1491.3us (GEMM 348.0 +
@@ -62,8 +62,8 @@ Fusing over SDMA wins, and only because of ``--chunks``; see the table at its
 definition in ``run()``. It was pinned to 1 while the aiter GEMM's
 under-counted ``s_waitcnt`` made every chunked run intermittently wrong, and
 with one chunk the fused path overlaps nothing at all. Fusing over LSA still
-loses badly: it spends 730us of its GEMM pushing C over xGMI, where the copy
-engines move the same bytes in 499.
+loses, though by much less since ``--n-stripe 2``: it spends 560us of its GEMM
+pushing C over xGMI, where the copy engines move the same bytes in 499.
 
 Read ``kernels_fused.py`` before trusting any fused number from this
 benchmark: several of its options are intermittently wrong, and a single
@@ -254,6 +254,7 @@ def run(args) -> int:
             peer_uncached=args.peer_uncached,
             direct_fence=args.direct_fence,
             rotated=None if args.tile_order == "auto" else args.tile_order == "rotated",
+            n_stripe=args.n_stripe or None,
             fence=args.fence,
             emit_put=not args.no_put,
             atomic_order=args.atomic,
@@ -408,6 +409,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="pushes per destination (0 = the default 8, halved until it "
         "divides the M-tiles per destination). >1 is what produces the "
         "overlap, and requires the submit lock",
+    )
+    p.add_argument(
+        "--n-stripe",
+        type=int,
+        default=0,
+        help="with the rotated order: rotate the destination every N N-tiles "
+        "instead of after a whole chunk (gcnasm opus_direct_stripe_tile). "
+        "0 = per-mode default, which is 2 for fused-lsa and 1 elsewhere",
     )
     p.add_argument(
         "--tile-order",

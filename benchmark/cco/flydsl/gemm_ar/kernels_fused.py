@@ -965,6 +965,7 @@ def compile_fused_gemm_scatter(
     xcd_swizzle: int = 0,
     fuse: bool = True,
     rotated: bool | None = None,
+    n_stripe: int | None = None,
     swap_ab: bool = False,
     store_probe: bool = False,
     permlane: bool = False,
@@ -988,6 +989,16 @@ def compile_fused_gemm_scatter(
     defaults to ``fuse``, since it only matters when something is watching tiles
     complete. It is separately settable so the benchmark can charge the split
     baseline the same tile order and show that the ordering itself is neutral.
+
+    ``n_stripe`` > 1 rotates the destination every ``n_stripe`` N-tiles instead
+    of after a whole chunk -- gcnasm's ``opus_direct_stripe_tile``, transposed
+    (its destination is on N and ours is on M, so its ``m_stripe`` is our
+    ``n_stripe``). It defaults to 2 for ``fused-lsa`` and 1 everywhere else,
+    which is the same split gcnasm makes: with a PUT to trigger you want a
+    chunk finished as early as possible, and with peer stores you want them
+    spread evenly over the links rather than arriving in same-destination
+    bursts. Measured at [16384, 7168] K=2048 on 8 ranks: fused-lsa 1560.7 ->
+    1366.3us (its GEMM 937.9 -> 788.8), fused-sdma unchanged within noise.
 
     Returns ``launch(A, B_T, C, A_scale, B_scale, c_m, c_n, dev_comm, win,
     stream=...)``.
@@ -1028,6 +1039,12 @@ def compile_fused_gemm_scatter(
         )
     direct_lsa = fuse and transport == "lsa"
     rotated = fuse if rotated is None else rotated
+    if n_stripe is None:
+        n_stripe = 2 if (fuse and transport == "lsa") else 1
+    if n_stripe < 1:
+        raise ValueError(f"n_stripe must be >= 1, got {n_stripe}")
+    if n_stripe > 1 and not rotated:
+        raise ValueError("n_stripe > 1 needs the rotated tile order")
 
     assert BLOCK_M >= 128 and BLOCK_N >= 256
     assert BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
@@ -1083,7 +1100,7 @@ def compile_fused_gemm_scatter(
         raise ValueError(
             f"fence must be all/agent/leader/none/writethrough/wt-agent, got {fence!r}"
         )
-    _kname_tag = f"{'S' if swap_ab else ''}{'P' if permlane else ''}{'T' if lane_transpose else ''}{'H' if hoist_scales else ''}{'U' if peer_uncached else ''}{direct_fence[0]}{'W' if store_probe else ''}c{chunks}{'r' if rotated else 'l'}{fence[0]}"
+    _kname_tag = f"{'S' if swap_ab else ''}{'P' if permlane else ''}{'T' if lane_transpose else ''}{'H' if hoist_scales else ''}{'U' if peer_uncached else ''}{direct_fence[0]}{'W' if store_probe else ''}c{chunks}{'r' if rotated else 'l'}{'' if n_stripe == 1 else f's{n_stripe}'}{fence[0]}"
     counter_off = cfg.counter_off
     lock_off = cfg.lock_off
     in_off = cfg.input_off
@@ -1147,8 +1164,21 @@ def compile_fused_gemm_scatter(
             # GEMM. The `+ rank` rotation keeps all 8 ranks from pushing at the
             # same destination simultaneously (gcnasm's opus_direct_stripe_tile).
             # split_row_major_2d(i, n) -> (i // n, i % n)
-            rest, bn = split_row_major_2d(fx.block_idx.x, n_blocks)
-            tile_i, dest_seq = split_row_major_2d(rest, ws)
+            if const_expr(n_stripe == 1):
+                rest, bn = split_row_major_2d(fx.block_idx.x, n_blocks)
+                tile_i, dest_seq = split_row_major_2d(rest, ws)
+            else:
+                # gcnasm's opus_direct_stripe_tile: rotate the destination
+                # every `n_stripe` tiles of the other axis rather than after a
+                # whole chunk, so the peer stores of the resident blocks are
+                # spread over all links instead of arriving in same-destination
+                # bursts. It delays chunk completion by n_groups, which is why
+                # gcnasm keeps it out of its chunked path and so do we by
+                # leaving the default at 1.
+                rest, n_in = split_row_major_2d(fx.block_idx.x, n_stripe)
+                rest, dest_seq = split_row_major_2d(rest, ws)
+                tile_i, n_grp = split_row_major_2d(rest, n_blocks // n_stripe)
+                bn = n_grp * fx.Int32(n_stripe) + n_in
             dest_i = (dest_seq + fx.Int32(rank)) % fx.Int32(ws)
             block_m = dest_i * m_tiles_per_peer + tile_i
             block_n = bn
