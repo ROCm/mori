@@ -338,66 +338,80 @@ not, and one of its lessons was worth ~90us here.
    (fused 440us -> 350us on removing it). Its ISA shows the atomic already emits
    its own ``buffer_wbl2``/``buffer_inv`` pair, on thread 0 only.
 
-## The chunks race: much better understood, still not gone
+## The chunks race: it was the GEMM, and it is gone
 
-The prologue's ``if wave_m == 1: rocdl.s_barrier()`` gives waves 4-7 one *extra*
-barrier. ``s_barrier`` is a counting rendezvous, so from then on every arrival
-pairs waves 4-7's k-th barrier with waves 0-3's (k+1)-th, and waves 0-3 run one
-phase ahead. A one-shot GEMM does not care -- the trailing unmatched barrier is
-released when the other half exits, and the offset is the point, it staggers the
-two halves of M. The fused epilogue does care: ``wait_barrier(0)`` after
-``store_c`` is supposed to mean "every wave's C tile has retired", and under the
-offset it rendezvouses waves 0-3, which hold thread 0 and therefore the counter
-and the transfer, with waves 4-7 still at the *previous* barrier, before their
-stores.
+``--chunks`` > 1 produced wrong output about 3 runs in 10 and was pinned to 1
+for that reason. The cause was not the chunk protocol at all: it was aiter's
+8-wave GEMM under-counting one ``s_waitcnt`` in its main loop, which corrupted
+output non-deterministically on large grids whatever the epilogue did (see the
+comment at that ``wait_barrier`` below). Since that fix, at [16384, 7168]
+K=2048 on 8 ranks:
 
-Closing the pair (``if wave_m == 0: s_barrier()`` before ``store_c``, which is
-what gcnasm does at kernel_template.hpp:693, unconditionally) took ``--chunks 2``
-from failing about 1 run in 3 to **3 in 10**. Better, not fixed, so the default
-stays 1 -- which is 10/10 over the same sample and costs ~17us, since with one
-chunk the counter only fires when the whole slice is done and nothing overlaps.
+* chunks 1/2/4/8, 10 runs each -- 40/40 correct, no hang;
+* chunks=8 alone, 25 more runs -- 25/25 correct, no hang.
 
-What is left is not the fence. Adding one makes it *worse*, reproducibly:
+Two hangs were seen at 8 ranks while the sweep was still being set up and never
+reproduced in the 100+ runs after. The submit lock is a plain test-and-set spin
+(``_acquire_peer_lock``), so a hang is not impossible; use ``timeout`` when
+sweeping and treat one as a finding rather than a flake.
 
-    --fence none (default)   6/6 correct
-    --fence leader           3/6 wrong
-    --fence agent            5/6 wrong
+Two things in this file survived that misdiagnosis and are worth keeping
+straight:
 
-Two earlier diagnoses of this race were wrong and are recorded so they are not
-retried:
+* The half-wave barrier pairing (``if wave_m == 0: s_barrier()`` before
+  ``store_c``) is still needed and still right -- gcnasm does it
+  unconditionally at kernel_template.hpp:693. It took ``--chunks 2`` from
+  1-in-3 failing to 3-in-10, which at the time read as "better but not fixed";
+  the residual 3-in-10 was the GEMM.
+* Two *other* diagnoses were wrong and are recorded so they are not retried.
+  **A shared SDMA queue**: gcnasm's per-destination submit lock was ported and
+  ISA-verified; it fixed nothing, and is kept only because cco's
+  one-issuing-warp-per-queue rule still applies. **The counter atomic's
+  ordering**: ``acq_rel`` appeared to beat ``monotonic``, which is how the
+  acquire half got justified; against a 1-in-3 intermittent failure that
+  comparison was noise. ``acq_rel`` stays because release/acquire is right for
+  a producer handing tiles to a consumer, not because it was measured -- and at
+  chunks=1 it demonstrably orders nothing, since 20 runs of ``monotonic`` pass
+  too.
 
-* **A shared SDMA queue.** gcnasm's per-destination submit lock was ported and
-  ISA-verified (test-and-set, ``s_sleep`` backoff). It fixed nothing. Kept
-  because cco's one-issuing-warp-per-queue rule still applies.
-* **The counter atomic's ordering.** ``acq_rel`` appeared to beat ``monotonic``,
-  which is how the acquire half got justified. Against a 1-in-3 intermittent
-  failure that comparison was noise. ``acq_rel`` stays because release/acquire is
-  right for a producer handing tiles to a consumer, not because it was measured.
-
-Repeated runs are the only way to judge any of this, and the gate has to be
-tight: the corruption lands at 4-9e-3 against an fp8 floor of 2.35e-3, so a
+Repeated runs are still the only way to judge any of this, and the gate has to
+be tight: the corruption landed at 4-9e-3 against an fp8 floor of 2.35e-3, so a
 5e-3 threshold reported a corrupt run as validated (it did, at 3.97e-3). The
-bench now gates at 3e-3, and ``test_fused_is_stable_across_repeats`` requires
-three runs to be *identical* rather than each small.
+bench gates at 3e-3, and ``test_fused_is_stable_across_repeats`` requires three
+runs to be *identical* rather than each small.
 
-## Result: nothing beats split-lsa
+## Result: fused-sdma wins, once the chunks are unblocked
 
-8 ranks, [4096, 7168], K=1024, graph replay, all three C-store stages on,
-median of 4, correctness over 10 runs:
+8 ranks, [16384, 7168] K=2048 -- the real prefill shape -- graph replay, all
+three C-store stages on (now the benchmark default), median of 31, max over
+ranks:
 
-    mode                        time     correct
-    split-lsa                  318.8us    10/10     <- best
-    fused-sdma  chunks=2       325.0       7/10     racy
-    split-sdma                 329.7      10/10
-    fused-sdma  chunks=1       342.0      10/10
-    fused-lsa                  359.0      10/10
+    mode                        time
+    fused-sdma  chunks=8      1114.1us   <- best
+    split-sdma                1261.7
+    split-lsa                 1262.4
+    fused-lsa                 1571.4
+    gemm-only                  228.9
 
-Both transports were taken to correctness and neither wins. fused-sdma's overlap
-is real but small (scatter 136.8 -> 126.9) and roughly cancelled by what the
-epilogue costs the GEMM; fused-lsa absorbs the scatter completely (136.8 -> 10.1)
-and loses it again to a separate reduce pass, a lower store rate and the
-publishing fence. And in both, reduce plus all-gather -- 46% of the pipeline --
-are untouchable by construction.
+Per-kernel, the overlap is visible directly:
+
+    chunks   GEMM   drain  reduce  gather   total
+         1  257.5   493.8    44.0   496.4  1291.7
+         2  266.5   379.4    44.2   496.4  1186.6
+         8  265.0   303.7    43.8   496.6  1109.1
+
+The drain falls 38% while the GEMM grows 7.5us for the extra counter atomics
+and the lock. Going finer is worse: at chunks=8 each PUT is 3.5 MiB, and 16
+(via ``--block-m 128``) halves that to 1.75 MiB, under the knee in the SDMA
+bandwidth curve, for 1130.8us.
+
+fused-lsa still loses, and for a reason that is not going away: it spends 730us
+of its GEMM pushing C over xGMI where the copy engines move the same bytes in
+499, and ATT shows 99% of that store time is *stall*, so coalescing the stores
+(the three C-store stages) buys it nothing -- 954.5 -> 952.1us.
+
+The remaining floor is the tail: reduce plus all-gather is 540us of the 1114,
+and neither is touched by fusing the GEMM.
 
 ## Pinned copy
 

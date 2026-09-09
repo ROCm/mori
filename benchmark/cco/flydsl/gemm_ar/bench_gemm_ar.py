@@ -45,29 +45,30 @@ because LSA is the faster collective, and a fused SDMA path has to beat
 Headline at the shape the model actually runs -- ``[16384, 7168]`` out, K=2048,
 which is a ``--chunked-prefill-size 16384`` TP8 prefill chunk of DSV4-Pro
 ``wo_b`` (1792 tiles of 256x256 per rank). 8x MI355X, graph replay, median of
-31, max over ranks, on an idle box:
+31, max over ranks, on an idle box, with the current defaults:
 
-                       3-stage C-store   without it (--no-swap-ab ...)
-    split-sdma              1260.8us            1269.8us
-    split-lsa               1263.8              1275.2
-    fused-sdma              1299.9              1342.6
-    fused-lsa               1563.2              1600.9
-    gemm-only                230.8               243.0
+    fused-sdma  (chunks=8)       1114.1us
+    split-sdma                   1261.7
+    split-lsa                    1262.4
+    fused-lsa                    1571.4
+    gemm-only                     228.9
 
 For scale, the same layer in the running model costs 1491.3us (GEMM 348.0 +
 NCCL 1143.3, medians over its 61 layers), and the collective on its own is
-1043us for LSA / 1047 for SDMA against 1113 for NCCL.
+1043us for LSA / 1047 for SDMA against 1113 for NCCL. So ``fused-sdma`` is
+**11.7% under split and 25.3% under what the model runs today**.
 
-Fusing loses, in both transports. The per-kernel breakdown says why: at this
-shape ``fused-sdma`` overlaps *nothing* -- its drain costs 502.6us against the
-split scatter's 499.0 -- and it pays 76us to issue the puts, while
-``fused-lsa`` spends 730us of its GEMM pushing C over xGMI where the copy
-engines do the same bytes in 499.
+Fusing over SDMA wins, and only because of ``--chunks``; see the table at its
+definition in ``run()``. It was pinned to 1 while the aiter GEMM's
+under-counted ``s_waitcnt`` made every chunked run intermittently wrong, and
+with one chunk the fused path overlaps nothing at all. Fusing over LSA still
+loses badly: it spends 730us of its GEMM pushing C over xGMI, where the copy
+engines move the same bytes in 499.
 
-Read ``kernels_fused.py`` before trusting any faster fused number from this
+Read ``kernels_fused.py`` before trusting any fused number from this
 benchmark: several of its options are intermittently wrong, and a single
-passing run proves nothing. ``--chunks`` > 1 and every ``raw-wt`` fence mode
-are known-racy and kept only to reproduce that.
+passing run proves nothing. Every ``raw-wt`` fence mode is known-racy and kept
+only to reproduce that.
 """
 
 from __future__ import annotations
@@ -165,16 +166,41 @@ def run(args) -> int:
     fused = args.mode in ("fused-sdma", "fused-lsa")
     # fused-lsa still uses the SDMA reduce/gather tail, so it wants queues too.
     needs_sdma = args.mode in ("split-sdma", "fused-sdma", "fused-lsa")
-    # One push per BLOCK_M row-band. This is what creates the overlap: with a
-    # single chunk per destination the counter only fires once the whole slice is
-    # done, which under the rotated tile order is the end of the GEMM, so nothing
-    # overlaps. It was pinned to 1 for a while because it raced; the cause was the
-    # half-wave barrier offset, fixed in kernels_fused's epilogue.
-    # 1. >1 is what creates the overlap and is measurably faster (~325us vs
-    # ~342), and it is still wrong 3 runs in 10 -- see the race note in
-    # kernels_fused. The barrier-phase fix took it from 1-in-3 to 3-in-10, not
-    # to zero.
-    chunks = args.chunks if args.chunks else 1
+    # Pushes per destination. This is the whole overlap mechanism: with one
+    # chunk the tile counter only fires when a destination's entire slice is
+    # done, which under the rotated tile order is the end of the GEMM, so
+    # nothing overlaps at all -- measured, the drain then costs the same as the
+    # split scatter (493.8 vs 499.0us). With eight, a destination's first chunk
+    # leaves while the GEMM is still computing its later ones.
+    #
+    # Per-kernel medians at [16384, 7168] K=2048, 8x MI355X:
+    #
+    #     chunks   GEMM   drain  reduce  gather   total   end-to-end
+    #          1  257.5   493.8    44.0   496.4  1291.7      1299.6
+    #          2  266.5   379.4    44.2   496.4  1186.6      1194.9
+    #          8  265.0   303.7    43.8   496.6  1109.1      1115.7
+    #
+    # The drain falls 38% while the GEMM grows 7.5us for the extra counter
+    # atomics and the submit lock. 8 hides 190 of the 265us of GEMM it could
+    # possibly hide. More is worse: at 8 each PUT is 3.5 MiB, and 16 (via
+    # --block-m 128) drops that to 1.75 MiB, below the knee in the SDMA
+    # bandwidth curve -- 1130.8us, slower than 8.
+    #
+    # This was pinned to 1 because >1 produced wrong output 3 runs in 10. That
+    # was the aiter GEMM's under-counted s_waitcnt, not the chunk protocol:
+    # since that fix, chunks 1/2/4/8 are 40/40 correct and chunks=8 alone is
+    # 25/25, with no hang. Two hangs were seen at 8 ranks *before* the sweep
+    # settled and never reproduced in 100+ runs after; the submit lock is a
+    # plain test-and-set spin, so treat a hang as possible and use `timeout`
+    # when sweeping.
+    DEFAULT_CHUNKS = 8
+    chunks = args.chunks if args.chunks else DEFAULT_CHUNKS
+    if fused:
+        # Fall back rather than fail: chunks has to divide the M-tiles per
+        # destination, which at small M can be fewer than 8.
+        m_tiles_per_peer = max(1, (args.m + args.block_m - 1) // args.block_m // world_size)
+        while chunks > 1 and m_tiles_per_peer % chunks:
+            chunks //= 2
     cfg = ArConfig(
         world_size=world_size,
         m=args.m,
@@ -379,8 +405,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--chunks",
         type=int,
         default=0,
-        help="pushes per destination (0 = one per BLOCK_M row-band). >1 is what "
-        "produces the overlap, and requires the submit lock",
+        help="pushes per destination (0 = the default 8, halved until it "
+        "divides the M-tiles per destination). >1 is what produces the "
+        "overlap, and requires the submit lock",
     )
     p.add_argument(
         "--tile-order",
