@@ -29,21 +29,9 @@
 //   2. EP internode v1 dispatch + combine, ported from
 //      src/ops/dispatch_combine/internode_v1.cpp.
 //
-// Part 2 is mechanical, in the same sense as ep_intranode_kernel.hpp: the
-// algorithm, the block specialisation, the chunk-flag protocol and the proxy-PE
-// topology are unchanged. `diff` it against the original -- part 1 shows up as
-// one leading block, skip it -- and everything else that comes back is the
-// communication layer:
-//
-//   shmem::ShmemPutMemNbiSignalThread      -> EpInterNodePutSignal      (3 sites)
-//   shmem::ShmemAtomicTypeNonFetchThread   -> EpInterNodeAtomicAdd      (4 sites)
-//   shmem::ShmemPutTypeNbiWarp             -> EpInterNodePut            (2 sites)
-//   shmem::ShmemInt32WaitUntilGreaterThan  -> EpInterNodeWaitGt         (1 site)
-//   shmem::ShmemQuietThread                -> EpInterNodeQuiet          (1 site)
-//
-// plus the `const ccoDevComm& comm` those calls need, threaded down from the
-// entry points, and the entry points themselves (extern "C", one per JIT
-// module, taking the comm by value alongside the v1 arg block).
+// Part 2 is mechanical: the algorithm, the block specialisation, the chunk-flag
+// protocol and the proxy-PE topology are unchanged from v1; only the transport
+// calls and the threaded-down `const ccoDevComm& comm` differ.
 //
 // mori/shmem is deliberately not included. It reaches its endpoints through a
 // device global that the host fills on every hipModuleLoad, and a JIT module
@@ -52,23 +40,12 @@
 
 #pragma once
 
-#include <type_traits>
-
 #include "mori/core/core.hpp"
-#include "mori/core/profiler/constants.hpp"
-#include "mori/core/profiler/kernel_profiler.hpp"
-#ifdef ENABLE_PROFILER
-#include "mori/profiler/profiler.hpp"
-#endif
 // The cfg half only. ep_internode_spec.hpp is host-only -- it pulls in the
 // Compiler, which this TU is the OUTPUT of and must not depend on.
 #include "mori/ops/dispatch_combine_v2/ep_internode_cfg.hpp"
 // The argument surface, the config the bodies read, the flat-index helpers and
-// MultiWarpIter -- everything this TU used to take from v1's dispatch_combine.hpp,
-// common.hpp and application_device_types.hpp. Those three are gone: they cost 219
-// transitive headers per JIT compile against 14 here, and dispatch_combine.hpp is
-// where the ENABLE_PROFILER / ENABLE_STANDARD_MOE_ADAPT conditional struct tail
-// lives that the JIT toolchain never defines and nothing was checking.
+// MultiWarpIter.
 #include "mori/ops/dispatch_combine_v2/ep_internode_args.hpp"
 
 // mori/core/utils/utils.hpp defines `warpSize` as an object-like macro, while
@@ -86,20 +63,7 @@ namespace mori {
 namespace ops {
 namespace v2 {
 
-// ---------------------------------------------------------------------------
-// v2 spellings, under the names the bodies below already use.
-//
-// The bodies live in this namespace and say `index_t`, `QuantType::...`,
-// `EpDispatchCombineArgs` and the flat-index helpers unqualified. Introducing
-// the v2 types under those names is what lets the argument surface change
-// without touching the ~250 `args.` sites, the 39 index-helper calls or the 29
-// signatures -- the surface moves, the algorithm does not, and the two want to
-// be separately reviewable.
-//
-// Scaffolding with a definite end: moving these bodies out of mori::moe deletes
-// this block and makes v1's namespace unreachable from the v2 tree. Nothing
-// else belongs here.
-// ---------------------------------------------------------------------------
+// v2 types introduced under the names the ported bodies already use.
 using index_t = ep_index_t;
 using QuantType = EpQuantType;
 
@@ -107,8 +71,8 @@ using QuantType = EpQuantType;
 // inpTokenBuf became void*, matching the intranode EpArgs.
 using EpDispatchCombineArgs = EpInterNodeArgs;
 
-// v1's common.hpp macro, with the config type swapped. Everything else is
-// verbatim, including the assert: numExpertPerToken must fit in a ballot.
+// v1's common.hpp macro, with the config type swapped and the runtime assert
+// promoted to a static_assert: numExpertPerToken must fit in a ballot.
 #define DEF_COMMON_VARS                                                    \
   constexpr EpInterNodeDeviceCfg config = EpInterNodeDeviceCfgOf(kConfig); \
   int thdId = threadIdx.x;                                                 \
@@ -339,9 +303,6 @@ inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs& args, int t
 template <EpInterNodeKernelCfg kConfig, typename T>
 inline __device__ void DispatchIntraNode(EpDispatchCombineArgs& args) {
   DEF_COMMON_VARS;
-  IF_ENABLE_PROFILER(
-      INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
-  MORI_TRACE_SPAN(profiler, Slot::DispatchIntra);
 
   int blockOffset = args.rdmaBlockNum;
   int xgmiBlockNum = blockNum - args.rdmaBlockNum;
@@ -363,14 +324,13 @@ inline __device__ void DispatchIntraNode(EpDispatchCombineArgs& args) {
     index_t destPe = destExpert / config.numExpertPerRank;
     int destNode = destPe / config.gpuPerNode;
 
-    int lanePe = -1, laneNode = -1;
+    int lanePe = -1;
     if (laneId < numExpertPerToken) {
       index_t laneExpert = args.tokenIndices[tokenId * numExpertPerToken + laneId];
       // Sentinel lanes get a unique impossible destPe so dedup cannot false-match.
       lanePe = (laneExpert < 0) ? (-1 - static_cast<int>(laneId))
                                 : (laneExpert / config.numExpertPerRank);
-      laneNode = lanePe / config.gpuPerNode;
-    };
+    }
 
     // Deduplicate
     index_t inTokenExpertId = i % numExpertPerToken;
@@ -386,17 +346,14 @@ inline __device__ void DispatchIntraNode(EpDispatchCombineArgs& args) {
 
   if (laneId < config.gpuPerNode) {
     int destPe = myNode * config.gpuPerNode + laneId;
-    int counter = atomicAdd(args.destPeTokenCounter + destPe, localPeTokenCounter);
+    atomicAdd(args.destPeTokenCounter + destPe, localPeTokenCounter);
   }
 }
 
-template <EpInterNodeKernelCfg kConfig, typename T, bool DEDUP>
+template <EpInterNodeKernelCfg kConfig, typename T>
 inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs& args,
                                              const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
-  IF_ENABLE_PROFILER(
-      INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
-  MORI_TRACE_SPAN(profiler, Slot::DispatchInterNodeSend);
 
   int maxChunkNum = core::CeilDiv(config.MaxNumTokensToSendPerRank(), warpSize);
   int totalChunkNum = core::CeilDiv(args.curRankNumToken, warpSize);
@@ -409,107 +366,70 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs& args,
   for (int i = warpId; i < nNodes; i += warpNum) {
     if (i == myNode) continue;
     int proxyPe = i * config.gpuPerNode + (myPe % config.gpuPerNode);
-    if (DEDUP) {
-      for (int tokenId = startTokenIdx + laneId; tokenId < endTokenIdx; tokenId += warpSize) {
-        bool shouldSend = false;
-        for (int e = 0; e < config.numExpertPerToken; e++) {
-          index_t laneExpert = args.tokenIndices[tokenId * numExpertPerToken + e];
-          if (laneExpert < 0) continue;
-          int destNode = laneExpert / config.numExpertPerRank / config.gpuPerNode;
-          if (destNode == i) {
-            shouldSend |= true;
-            if (!args.replayMode)
-              args.dispDestTokIdMap[tokenId * numExpertPerToken + e] = NullFlatTokenIndex(config);
-          }
-        }
-        uint64_t mask = __ballot(shouldSend) & __activemask();
-        uint64_t num = __popcll(mask);
-
-        if (num == 0) continue;
-
-        // atomicAdd runs in both paths so blockFlagCounter stays in sync with cache routing.
-        index_t flag = 0;
-        index_t flagSlotId = 0;
-        if (laneId == 0) {
-          flagSlotId = atomicAdd(args.blockFlagCounter + i, 1);
-          flag = num + 1;
-        }
-        flag = __shfl(flag, 0);
-        flagSlotId = __shfl(flagSlotId, 0);
-
-        if (args.replayMode) {
-          // Recover the deterministic flag slot from the cached send map.
-          int firstSender = __ffsll(static_cast<unsigned long long>(mask)) - 1;
-          index_t myCached = shouldSend ? args.interNodeDispSendMap[nNodes * tokenId + i] : 0;
-          flagSlotId = __shfl(myCached, firstSender) / warpSize;
-        }
-
-        index_t destTokIdOffset = flagSlotId * warpSize;
-
-        uint64_t warpOffset = 0;
-        if (laneId > 0) warpOffset = __popcll(mask << (warpSize - laneId));
-        index_t destTokId = destTokIdOffset + warpOffset;
-
-        if (shouldSend) {
-          bool prev = (laneId > 0) ? ((mask >> (laneId - 1)) & 1ULL) : 0;
-          int count = 0;
-          if (!prev) {
-            count = 1;
-            for (int i = laneId + 1; i < warpSize; i++) {
-              if ((mask >> i) & 1ULL) {
-                count++;
-              } else {
-                break;
-              }
-            }
-          }
-          size_t remoteIdx = SendBufSlotOffset(config, myNode, destTokId);
-          if (count > 0) {
-            size_t stagingTokOffset = tokenId * xferBytes;
-            int qpId = (tokenId / warpSize) % config.numQpPerPe;
-            EpInterNodePutSignal(comm, args.reg(args.offDispatchInp), remoteIdx * xferBytes,
-                                 args.reg(args.offDispatchStaging), stagingTokOffset,
-                                 count * xferBytes, args.reg(args.offChunkFlag),
-                                 (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t), flag,
-                                 proxyPe, qpId);
-          }
-          if (!args.replayMode) args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
+    for (int tokenId = startTokenIdx + laneId; tokenId < endTokenIdx; tokenId += warpSize) {
+      bool shouldSend = false;
+      for (int e = 0; e < config.numExpertPerToken; e++) {
+        index_t laneExpert = args.tokenIndices[tokenId * numExpertPerToken + e];
+        if (laneExpert < 0) continue;
+        int destNode = laneExpert / config.numExpertPerRank / config.gpuPerNode;
+        if (destNode == i) {
+          shouldSend |= true;
+          if (!args.replayMode)
+            args.dispDestTokIdMap[tokenId * numExpertPerToken + e] = NullFlatTokenIndex(config);
         }
       }
-    } else {
-      for (int tokenId = startTokenIdx + laneId; tokenId < endTokenIdx; tokenId += warpSize) {
-        bool shouldSend = false;
-        for (int e = 0; e < config.numExpertPerToken; e++) {
-          index_t laneExpert = args.tokenIndices[tokenId * numExpertPerToken + e];
-          if (laneExpert < 0) continue;
-          int destNode = laneExpert / config.numExpertPerRank / config.gpuPerNode;
-          if (destNode == i) {
-            shouldSend |= true;
-            args.dispDestTokIdMap[tokenId * numExpertPerToken + e] = NullFlatTokenIndex(config);
+      uint64_t mask = __ballot(shouldSend) & __activemask();
+      uint64_t num = __popcll(mask);
+
+      if (num == 0) continue;
+
+      // atomicAdd runs in both paths so blockFlagCounter stays in sync with cache routing.
+      index_t flag = 0;
+      index_t flagSlotId = 0;
+      if (laneId == 0) {
+        flagSlotId = atomicAdd(args.blockFlagCounter + i, 1);
+        flag = num + 1;
+      }
+      flag = __shfl(flag, 0);
+      flagSlotId = __shfl(flagSlotId, 0);
+
+      if (args.replayMode) {
+        // Recover the deterministic flag slot from the cached send map.
+        int firstSender = __ffsll(static_cast<unsigned long long>(mask)) - 1;
+        index_t myCached = shouldSend ? args.interNodeDispSendMap[nNodes * tokenId + i] : 0;
+        flagSlotId = __shfl(myCached, firstSender) / warpSize;
+      }
+
+      index_t destTokIdOffset = flagSlotId * warpSize;
+
+      uint64_t warpOffset = 0;
+      if (laneId > 0) warpOffset = __popcll(mask << (warpSize - laneId));
+      index_t destTokId = destTokIdOffset + warpOffset;
+
+      if (shouldSend) {
+        bool prev = (laneId > 0) ? ((mask >> (laneId - 1)) & 1ULL) : 0;
+        int count = 0;
+        if (!prev) {
+          count = 1;
+          for (int i = laneId + 1; i < warpSize; i++) {
+            if ((mask >> i) & 1ULL) {
+              count++;
+            } else {
+              break;
+            }
           }
         }
-
-        index_t flagSlotId = 0;
-        if (laneId == 0) {
-          flagSlotId = atomicAdd(args.blockFlagCounter + i, 1);
-        }
-        flagSlotId = __shfl(flagSlotId, 0);
-
-        index_t destTokIdOffset = flagSlotId * warpSize;
-        index_t destTokId = destTokIdOffset + laneId;
-
         size_t remoteIdx = SendBufSlotOffset(config, myNode, destTokId);
-        if (laneId == 0) {
-          index_t tokenNum = std::min(tokenId + warpSize, endTokenIdx) - tokenId;
+        if (count > 0) {
           size_t stagingTokOffset = tokenId * xferBytes;
           int qpId = (tokenId / warpSize) % config.numQpPerPe;
           EpInterNodePutSignal(comm, args.reg(args.offDispatchInp), remoteIdx * xferBytes,
                                args.reg(args.offDispatchStaging), stagingTokOffset,
-                               tokenNum * xferBytes, args.reg(args.offChunkFlag),
-                               (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t), tokenNum + 1,
+                               count * xferBytes, args.reg(args.offChunkFlag),
+                               (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t), flag,
                                proxyPe, qpId);
         }
-        if (shouldSend) args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
+        if (!args.replayMode) args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
       }
     }
   }
@@ -543,9 +463,6 @@ template <EpInterNodeKernelCfg kConfig, typename T>
 inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs& args,
                                                const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
-  IF_ENABLE_PROFILER(
-      INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
-  MORI_TRACE_SPAN(profiler, Slot::DispatchInterNodeLLSend);
 
   // Then send to other nodes
   int maxChunkNum = core::CeilDiv(config.MaxNumTokensToSendPerRank(), warpSize);
@@ -614,9 +531,6 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs& args,
 template <EpInterNodeKernelCfg kConfig, typename T>
 inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs& args) {
   DEF_COMMON_VARS;
-  IF_ENABLE_PROFILER(
-      INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
-  MORI_TRACE_SPAN(profiler, Slot::DispatchInterNodeRecv);
 
   constexpr int numRecvBlock = 8;
   int maxChunkNum = core::CeilDiv(config.MaxNumTokensToSendPerRank(), warpSize);
@@ -626,7 +540,6 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs& args) {
   uint8_t* stagingPtr = args.reg(args.offDispatchInp)->template GetAs<uint8_t*>();
 
   int localPeTokenCounter = 0;
-  int totalChunkNum = 0;
 
   for (int bid = blockId; bid < numRecvBlock * maxChunkNum * (nNodes - 1);
        bid += args.rdmaBlockNum) {
@@ -651,8 +564,6 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs& args) {
       }
     }
     thisChunkTokenNum = __shfl(thisChunkTokenNum, 0) - 1;
-    nodeFlag = __shfl(nodeFlag, 0) - 1;
-    totalChunkNum += thisChunkTokenNum;
 
     int endTokenIdx = startTokenIdx + thisChunkTokenNum;
 
@@ -677,7 +588,7 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs& args) {
         int destNode = isSentinelSlot ? -1 : destPe / config.gpuPerNode;
 
         // HSA-RCA Signature 1 guard: in Release builds NDEBUG strips the
-        // assert at :387, so an out-of-range expert id (e.g. EPLB physical id
+        // assert above, so an out-of-range expert id (e.g. EPLB physical id
         // >= worldSize*numExpertPerRank, PR #254) yields destPe >= worldSize
         // and an OOB GetAs/WarpCopy/atomicAdd -> HSA page fault. Treat any
         // out-of-range destPe as a dropped token via the existing skip path.
@@ -731,16 +642,13 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs& args) {
 
   if (laneId < config.gpuPerNode) {
     int destPe = myNode * config.gpuPerNode + laneId;
-    int counter = atomicAdd(args.destPeTokenCounter + destPe, localPeTokenCounter);
+    atomicAdd(args.destPeTokenCounter + destPe, localPeTokenCounter);
   }
 }
 
 template <EpInterNodeKernelCfg kConfig, typename T>
 inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs& args) {
   DEF_COMMON_VARS;
-  IF_ENABLE_PROFILER(
-      INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
-  MORI_TRACE_SPAN(profiler, Slot::DispatchInterNodeLLRecv);
 
   int maxChunkNum = core::CeilDiv(config.MaxNumTokensToSendPerRank(), warpSize);
 
@@ -766,7 +674,6 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs& args) {
     uint64_t thisChunkTokenNum = 0;
     index_t nodeFlag = 0;
     if (laneId == 0) {
-      uint64_t barrierFlag = args.crossDeviceBarrierFlag[0];
       while (1) {
         thisChunkTokenNum = core::AtomicLoadRelaxedSystem(&chunkFlag[node * maxChunkNum + k]);
         if (thisChunkTokenNum > 0) break;
@@ -796,8 +703,9 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs& args) {
 
     int destPe = __shfl(lanePe, expertId);
     int destNode = destPe / config.gpuPerNode;
-    // HSA-RCA Signature 1 guard (mirror of the :396 site): out-of-range destPe
-    // (assert at :493 stripped under NDEBUG) is dropped instead of writing OOB.
+    // HSA-RCA Signature 1 guard, mirroring the DispatchInterNodeRecv site: an
+    // out-of-range destPe (the assert above is stripped under NDEBUG) is dropped
+    // instead of writing OOB.
     bool peOutOfRange = (destPe < 0) || (destPe >= config.worldSize);
     bool shouldSkip =
         peOutOfRange || (destNode != myNode) || __any((laneId < expertId) && (destPe == lanePe));
@@ -839,7 +747,7 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs& args) {
 
   if (laneId < config.gpuPerNode) {
     int destPe = myNode * config.gpuPerNode + laneId;
-    int counter = atomicAdd(args.destPeTokenCounter + destPe, localPeTokenCounter);
+    atomicAdd(args.destPeTokenCounter + destPe, localPeTokenCounter);
   }
 }
 
@@ -847,9 +755,6 @@ template <EpInterNodeKernelCfg kConfig, typename T>
 inline __device__ void DispatchSync(EpDispatchCombineArgs& args,
                                     const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
-  IF_ENABLE_PROFILER(
-      INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
-  MORI_TRACE_SPAN(profiler, Slot::DispatchSync);
 
   int nodePeOffset = myNode * config.gpuPerNode;
   int finishedWarp = 0;
@@ -880,8 +785,6 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs& args,
     if (laneId == 0) {
       args.reg(args.offDispTokOffset)->template GetAs<index_t*>()[0] = 0;
       atomicAdd(args.crossDeviceBarrierFlag, 1);
-      __hip_atomic_store(args.combineGridBarrier + 1, 0u, __ATOMIC_RELAXED,
-                         __HIP_MEMORY_SCOPE_AGENT);
     }
   }
 
@@ -907,7 +810,7 @@ __device__ void EpDispatchInterNodeV1Kernel_body(EpDispatchCombineArgs args,
                                                  const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
   if (blockId < args.rdmaBlockNum) {
-    internode::DispatchInterNodeSend<kConfig, T, true>(args, comm);
+    internode::DispatchInterNodeSend<kConfig, T>(args, comm);
     internode::DispatchInterNodeRecv<kConfig, T>(args);
   } else {
     internode::DispatchIntraNode<kConfig, T>(args);
@@ -918,9 +821,6 @@ __device__ void EpDispatchInterNodeV1Kernel_body(EpDispatchCombineArgs args,
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpDispatchCopyToStaging_body(EpDispatchCombineArgs args) {
   DEF_COMMON_VARS;
-  IF_ENABLE_PROFILER(
-      INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
-  MORI_TRACE_SPAN(profiler, Slot::EpDispatchCopyToStaging);
 
   if (globalThdId == 0) args.totalRecvTokenNum[0] = 0;
   if (args.curRankNumToken == 0) return;
@@ -978,9 +878,6 @@ namespace internode {
 template <EpInterNodeKernelCfg kConfig, typename T>
 inline __device__ void CombineSync(EpDispatchCombineArgs& args) {
   DEF_COMMON_VARS;
-  IF_ENABLE_PROFILER(
-      INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
-  MORI_TRACE_SPAN(profiler, Slot::CombineSync);
 
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
   int tokenPerBlock = core::CeilDiv(totalRecvTokenNum, blockNum);
@@ -1013,10 +910,9 @@ namespace combine_impl {
 
 // Gathering a token from its experts reads from up to numExpertPerToken peer
 // GPUs over xGMI, and peer-read *latency* -- not bandwidth -- is what caps it.
-// WarpAccumLF issues AccumNum*Unroll of those reads before accumulating any of
-// them so they overlap; WarpAccum keeps only AccumNum in flight and moves 4B per
-// lane. The intra-node combine path (intranode.hpp) has used the 16B load-first
-// form for a while; the v1 internode path had not.
+// core::WarpAccum issues all AccumNum of those loads before accumulating any of
+// them so they overlap; moving 16B per lane instead of 4B puts 4x the bytes in
+// flight behind each outstanding read.
 //
 // Two constraints come with it:
 //   - Both ends must be 16B-aligned. A combine staging slot interleaves the
@@ -1125,7 +1021,7 @@ __forceinline__ __device__ void CombineIntraNodeLLTyped(EpDispatchCombineArgs& a
                         SendBufSlotOffset(config, nNodes + myNode, 0) * tokCombXferBytes;
 
   // Slices are snapped to a whole vector step so the gather below stays on
-  // WarpAccumLF's vector path instead of its scalar tail.
+  // WarpAccum's vector path instead of its scalar tail.
   MultiWarpIter mwIter(xgmiWarpNum, args.curRankNumToken, hiddenDim,
                        CombineVecStep<TokT>(warpSize));
   const bool vecAligned = CombineVecAligned(tokHiddenBytes, tokCombXferBytes);
@@ -1246,10 +1142,7 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& arg
                       args.reg(args.offInpWeights)->template GetAs<float*>(destPe) +
                       destLocalTokId * config.numExpertPerToken;
                 }
-                // routing-handle callers own this tensor, hence no need to reset.
-                if (args.dispTokIdToSrcTokIdLocal == nullptr) {
-                  args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + laneId] = 0;
-                }
+                args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + laneId] = 0;
               }
 
               core::WarpAccum<TokT, 4>(
@@ -1361,11 +1254,8 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
     if (nodeCount > 0) nodeCount -= 1;
     if (nodeCount == 0) continue;
 
-    // One whole vector step per warp. warpsPerToken was a fixed 4, which for
-    // hidden 6144 bf16 gives a 1536-element slice -- one full 1024-element vector
-    // step plus a 512-element scalar tail, and that tail costs more than the
-    // vector part saves. Sizing the split by the step instead keeps every warp on
-    // the vector path.
+    // One whole vector step per warp: the split never hands a warp less than one
+    // step, which is where the gather falls back to the scalar tail.
     //
     // This has to be a static function of the config: chunkFlag is cleared by
     // whichever warp completes a chunk, so anything derived from the live counts
@@ -1485,9 +1375,6 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
 template <EpInterNodeKernelCfg kConfig, typename T>
 inline __device__ void CombineIntraNode(EpDispatchCombineArgs& args) {
   DEF_COMMON_VARS;
-  IF_ENABLE_PROFILER(
-      INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
-  MORI_TRACE_SPAN(profiler, Slot::CombineIntraNode);
   if constexpr (kConfig.quantType == QuantType::Fp8DirectCast) {
     using TokT = core::CombineInternalFp8;
     const size_t tokHiddenBytes = hiddenDim * sizeof(TokT);
@@ -1503,9 +1390,6 @@ inline __device__ void CombineIntraNode(EpDispatchCombineArgs& args) {
 template <EpInterNodeKernelCfg kConfig, typename T>
 inline __device__ void CombineIntraNodeLL(EpDispatchCombineArgs& args) {
   DEF_COMMON_VARS;
-  IF_ENABLE_PROFILER(
-      INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
-  MORI_TRACE_SPAN(profiler, Slot::CombineIntraNodeLL);
 
   if (args.curRankNumToken == 0) return;
   if constexpr (kConfig.quantType == QuantType::Fp8DirectCast) {
@@ -1523,9 +1407,6 @@ template <EpInterNodeKernelCfg kConfig, typename T>
 inline __device__ void CombineInterNode(EpDispatchCombineArgs& args,
                                         const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
-  IF_ENABLE_PROFILER(
-      INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
-  MORI_TRACE_SPAN(profiler, Slot::CombineInterNode);
 
   if constexpr (kConfig.quantType == QuantType::Fp8DirectCast) {
     using TokT = core::CombineInternalFp8;
@@ -1543,9 +1424,6 @@ template <EpInterNodeKernelCfg kConfig, typename T>
 inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs& args,
                                           const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
-  IF_ENABLE_PROFILER(
-      INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
-  MORI_TRACE_SPAN(profiler, Slot::CombineInterNodeLL);
   if constexpr (kConfig.quantType == QuantType::Fp8DirectCast) {
     using TokT = core::CombineInternalFp8;
     const size_t tokHiddenBytes = hiddenDim * sizeof(TokT);
@@ -1686,13 +1564,9 @@ __forceinline__ __device__ void EpCombineAllGeneric(EpDispatchCombineArgs& args)
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpCombineAll_body(EpDispatchCombineArgs args) {
   DEF_COMMON_VARS;
-  IF_ENABLE_PROFILER(
-      INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
-  MORI_TRACE_SPAN(profiler, Slot::EpCombineAll);
 
   if (globalWarpId == 0) {
-    // routing-handle callers own this tensor hence no need to reset.
-    if (laneId == 0 && args.dispTokIdToSrcTokIdLocal == nullptr) args.totalRecvTokenNum[0] = 0;
+    if (laneId == 0) args.totalRecvTokenNum[0] = 0;
     if (laneId < nNodes) args.blockFlagCounter[laneId] = 0;
   }
   if (args.curRankNumToken == 0) return;
@@ -1728,9 +1602,6 @@ __device__ void EpCombineSync_body(EpDispatchCombineArgs args) {
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpCombineSyncBarrier_body(EpDispatchCombineArgs args) {
   DEF_COMMON_VARS;
-  IF_ENABLE_PROFILER(
-      INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
-  MORI_TRACE_SPAN(profiler, Slot::EpCombineSyncBarrier);
   uint64_t barrierFlag = 0;
   if (laneId == 0) {
     barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
@@ -1762,14 +1633,6 @@ __device__ void EpCombineSyncBarrier_body(EpDispatchCombineArgs args) {
 // value is the whole point of the port: mori-shmem would have needed a device
 // global filled by the host after every hipModuleLoad.
 // ---------------------------------------------------------------------------
-
-namespace mori {
-namespace ops {
-namespace v2 {
-
-}  // namespace v2
-}  // namespace ops
-}  // namespace mori
 
 // `kConfig` and `TokT` are not macro arguments. The generated TU defines both
 // under those names just above the entry, exactly as ep_spec.cpp emits

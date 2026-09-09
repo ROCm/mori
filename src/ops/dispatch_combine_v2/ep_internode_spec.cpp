@@ -66,12 +66,10 @@ KernelDesc DescFor(EpInterNodeKernel k) {
 
 // Header subtrees whose contents invalidate a compiled module. Coarser than the
 // real include graph on purpose (see IncludeTreeHash): over-invalidating costs a
-// rebuild, under-invalidating ships stale code. The v1 kernel body still pulls
-// common.hpp and convert.hpp out of the v1 tree, so that directory is in the set
-// alongside the v2 one.
+// rebuild, under-invalidating ships stale code.
 const std::vector<std::string>& EpInterNodeDeps() {
   static const std::vector<std::string> deps{"include/mori", "src/ops/dispatch_combine_v2",
-                                             "src/ops/dispatch_combine", "src/cco"};
+                                             "src/cco"};
   return deps;
 }
 
@@ -211,7 +209,8 @@ mori::jit::v2::LaunchGeometry EpInterNodeGeometry(const EpInterNodeCfg& cfg,
     case EpInterNodeKernel::Dispatch:
     case EpInterNodeKernel::DispatchLL:
       g.gridX = static_cast<unsigned>(cfg.blockNum);
-      g.sharedBytes = static_cast<unsigned>(EpInterNodeDispatchSharedBytes(cfg));
+      // No dispatch pass declares dynamic shared memory.
+      g.sharedBytes = 0;
       break;
     case EpInterNodeKernel::CombineSync:
       g.gridX = static_cast<unsigned>(cfg.mpCount);

@@ -79,25 +79,6 @@ _SCALE_ALIGN = 128
 # Which tuning-table dtype column a dispatch dtype reads.
 _FP8_TUNING_DTYPES = (torch.float8_e4m3fnuz, torch.float8_e4m3fn)
 
-# Read once. Both of these gate diagnostics inside the per-launch path, and
-# `os.environ.get` is a C-level dict lookup wrapped in encode/decode: the host
-# profile charged the two of them 5us per round (4 lookups: two diagnostics x
-# two launches) on a path where the host already paces the GPU. Reading them at
-# import costs nothing and cannot be forgotten at a third call site.
-_DEBUG_GEOM = bool(os.environ.get("MORI_EP_DEBUG_GEOM"))
-# Diagnostic: launch the pass sequence one plan at a time with a timing event
-# after each, instead of as one launch group. This is the only way to see which
-# KERNEL owns a slow round -- the group crosses the ABI once and the passes run
-# back to back, so no event can be placed between them from outside.
-#
-# It costs host time (one extra ABI crossing and one event per pass, ~5 of each
-# per round), and host time converts to measured time roughly 1:1 on this path,
-# so the ABSOLUTE numbers under it read high. The decomposition is still valid:
-# the spike being hunted is ~120us against ~25us of added overhead, and what is
-# wanted is which pass grew, not what it costs.
-_SPLIT_PASSES = bool(os.environ.get("MORI_EP_SPLIT_PASSES"))
-_TRACE_ARGS = bool(os.environ.get("MORI_INTERNODE_TRACE_ARGS"))
-
 
 def _geom_env(name):
     """``"block,rdma,warp"`` from the environment, or None.
@@ -170,8 +151,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # them per call -- torch.as_tensor + view showed up in the host profile at
         # ~27us a round, on a path where the host already paces the GPU.
         self._views = {}
-        # (pass_name, event) appended per launch when MORI_EP_SPLIT_PASSES is on.
-        self._pass_marks = []
         # gfx125x routes to the TDM kernel, which needs a superset arena (plan A).
         _arch = getattr(torch.cuda.get_device_properties(dev), "gcnArchName", "") or ""
         self._is1250 = _arch.split(":")[0].startswith("gfx125")
@@ -235,10 +214,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     # -- internode -------------------------------------------------------
     #
-    # Multi-node configs run eight passes over a seventeen-region arena with a
-    # device communicator, instead of two kernels over nine regions. Everything
-    # else -- the arena, the plan API, the library -- is the same, which is why
-    # this lives here rather than in a backend of its own.
+    # Multi-node configs run a sequence of passes (2 for dispatch, 4 for
+    # combine) over a seventeen-region arena with a device communicator, instead
+    # of two kernels over nine regions. Everything else -- the arena, the plan
+    # API, the library -- is the same, which is why this lives here rather than
+    # in a backend of its own.
 
     @staticmethod
     def _make_dev_comm(cfg, comm):
@@ -345,9 +325,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # Pin everything fixed for the op's lifetime, now that every buffer it
         # names exists. The launch path re-fills every field passed through
         # `args` on every call -- only bound values reach the plan's cached
-        # struct -- so passing the whole 36-field schema each time cost ~40
-        # ctypes field writes per phase, measured as the largest single item in
-        # the host profile (80 _set_arg calls per round). Binding leaves eight.
+        # struct -- so passing the whole schema each time cost a ctypes field
+        # write per field per launch. Binding leaves six.
         static = self._internode_static_args()
         for built in self._internode_plans.values():
             for plan in built.values():
@@ -598,9 +577,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             destPeTokenCounter=ptr(self.dest_pe_counter),
             blockFlagCounter=ptr(self.block_flag_counter),
             totalRecvTokenNum=ptr(self.total_recv),
-            dispTokIdToSrcTokIdLocal=0,
             dispatchGridBarrier=ptr(self.dispatch_barrier),
-            combineGridBarrier=ptr(self.combine_barrier),
             interNodeBlocksBarrier=ptr(self.inter_blocks_barrier),
             crossDeviceBarrierFlag=ptr(self.cross_device_flag),
             # The HOST struct, not DevCommHandle.ptr (the device-side copy): the args
@@ -788,16 +765,13 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         for max_tok, disp_geom, comb_geom in self._internode_buckets:
             if max_tok is None or num_tokens <= max_tok:
                 return disp_geom if phase == "dispatch" else comb_geom
-        _, disp_geom, comb_geom = self._internode_buckets[-1]
-        return disp_geom if phase == "dispatch" else comb_geom
 
     def _wrap_internode(self, phase):
         """One ABI crossing for the whole pass sequence.
 
         Every pass shares the schema and the same filled struct, so the arguments
-        are written once and each plan launches against them in order -- six
-        crossings become one, and a JIT-compile failure on a later pass aborts
-        before any earlier one is enqueued.
+        are written once and each plan launches against them in order: one ABI
+        crossing for the whole sequence instead of one per pass.
         """
 
         def run(*, input, num_tokens, dest_map, **kw):
@@ -812,27 +786,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 if forced is None
                 else forced
             )
-            names = self._INTERNODE_SEQ[(phase, ll)]
             geom = self._internode_geom_for(phase, num_tokens)
             group = self._internode_groups[(geom, (phase, ll))]
-
-            # Opt-in: what actually reached the launch. The tuning table resolving
-            # correctly when called offline does not prove the geometry a launch
-            # runs at -- the bucket walk, the CU clamp and the rdma clamp all sit
-            # between them, and a plan is compiled per geometry, so a wrong pick
-            # is a silently different kernel rather than an error. Printed once
-            # per distinct (phase, ll, geom, tokens) so it cannot pace the loop.
-            if _DEBUG_GEOM:
-                seen = self.__dict__.setdefault("_geom_logged", set())
-                k = (phase, ll, geom, int(num_tokens))
-                if k not in seen:
-                    seen.add(k)
-                    print(
-                        f"# GEOM rank={self.cfg.rank} {phase} ll={ll} "
-                        f"tok={int(num_tokens)} -> block/rdma/warp={geom} "
-                        f"buckets={self._internode_buckets}",
-                        flush=True,
-                    )
 
             # Two of the kernel's arguments are set by dispatch and READ AGAIN by
             # combine, but the base only hands them to dispatch -- combine's
@@ -882,28 +837,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     kw["scales"].data_ptr() if kw.get("scales") is not None else 0
                 ),
             )
-            if _TRACE_ARGS and self.cfg.rank == 0:
-                print(
-                    f"[trace] {phase} ll={ll} tokens={num_tokens} "
-                    f"weightsBuf={weights_ptr:#x} tokenIndices={indices_ptr:#x} "
-                    f"dispDestTokIdMap={args['dispDestTokIdMap']:#x} "
-                    f"rdma={geom[1]} passes={names}",
-                    flush=True,
-                )
-            if _SPLIT_PASSES:
-                stream = _raw_stream(self._dev_index)
-                built = self._internode_plans[geom]
-                marks = self._pass_marks
-                e = torch.cuda.Event(enable_timing=True)
-                e.record()
-                marks.append((phase + ":start", e))
-                for nm in names:
-                    built[nm].launch(stream, **args)
-                    e = torch.cuda.Event(enable_timing=True)
-                    e.record()
-                    marks.append((nm, e))
-            else:
-                group.launch(_raw_stream(self._dev_index), **args)
+            group.launch(_raw_stream(self._dev_index), **args)
 
         return run
 

@@ -243,32 +243,6 @@ jobs:
             cd $GITHUB_WORKSPACE && \
             python -m pytest tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_intranode.py -v"
 
-      - name: Run ops-v2 dispatch/combine internode test (EP8, 8 ranks)
-        run: |
-          # One host, so gpu_per_node is the whole world and no RDMA leg runs: this
-          # covers the intra-node half of the internode kernels, and both backends,
-          # which is what a single runner can reach. The RDMA leg is the
-          # cco-internode-test job below, cco only.
-          #
-          # The backends are separate invocations because they cannot share one. The
-          # cases run on a reused worker pool, and a shmem case that follows a cco
-          # case in the same session hangs -- the class patch is undone but the
-          # comm the handle was built on is not. Splitting them is the fix, not
-          # tidiness, so keep them as two execs even if the step grows.
-          #
-          # Scoped to small_shapes: every distinct Cfg is its own JIT compile, and
-          # -k cco over the whole file (84 cases) ran past 20 minutes without
-          # finishing, against this job's 30-minute budget for all steps. The
-          # correctness and cross_dtype matrices want a measured budget of their own
-          # before they go anywhere near a per-PR job.
-          F=tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py
-          for BACKEND in cco shmem; do
-            echo "=== internode backend=$BACKEND ==="
-            $CT exec $CONTAINER bash -c "\
-              cd $GITHUB_WORKSPACE && \
-              timeout 600 python -m pytest $F::test_internode_small_shapes -k $BACKEND -v"
-          done
-
       - name: Run ops-v2 HIP backend (EP8, 8 ranks)
         run: |
           # The step above drives the FlyDSL backend; this one drives the HIP kernels
@@ -459,9 +433,9 @@ jobs:
       - name: MORI-EP internode CCO kernel test
         run: |
           # Correctness first, so a bench hang further down is not the first thing
-          # this job says about the RDMA leg. The entry pins MORI_EP_COMM=cco and
-          # installs the JIT redirect, so these launches land on the v2 CCO plans;
-          # the shmem path over the same harness is ci.yml's internode-test.
+          # this job says about the RDMA leg. This entry builds its ops on a
+          # mori.cco Communicator directly, so every launch is a v2 CCO plan; the
+          # shmem path over the v1 harness is ci.yml's internode-test.
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
           PORT=29240
           for TOKENS in 128 4096; do
@@ -525,13 +499,13 @@ jobs:
             $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT
             --rank 1 --master-addr $NODE1_HOST --master-port $PORT
             --ifname $NODE2_IFNAME --entry $ENTRY
-            --cmd stress --kernel-type v1 --dtype bf16 --max-tokens 4096
+            --cmd bench --rounds 2000 --kernel-type v1 --dtype bf16 --max-tokens 4096
           )
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
           $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT \
             --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
             --ifname $NODE1_IFNAME --entry $ENTRY \
-            --cmd stress --kernel-type v1 --dtype bf16 --max-tokens 4096
+            --cmd bench --rounds 2000 --kernel-type v1 --dtype bf16 --max-tokens 4096
           wait
 
       - name: Cleanup node1

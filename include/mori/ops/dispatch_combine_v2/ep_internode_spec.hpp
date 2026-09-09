@@ -60,8 +60,6 @@ struct EpInterNodeCfg {
   // ---- rendered: this is the specialisation ----
   EpInterNodeKernelCfg kernelCfg{};
   EpInterNodeDType dtype{EpInterNodeDType::Bf16};
-  // Only meaningful for the LL dispatch/combine pair, which the standard-MoE
-  // adapter specialises on; the other six entries ignore it.
 
   // ---- launch geometry (host-derived; see MakeEpInterNodeCfg). NOT rendered. ----
   int blockNum{64};
@@ -139,15 +137,6 @@ inline std::string Describe(const EpInterNodeCfg& c) {
 // ---------------------------------------------------------------------------
 constexpr int EpInterNodeBlockThreads(const EpInterNodeCfg& c) {
   return c.warpPerBlock * c.waveSize;
-}
-
-// Dispatch's index arrays: per-warp destination counts plus the per-expert
-// tallies. Mirrors dispatch_shared_mem() in launch.cpp.
-constexpr int EpInterNodeDispatchSharedBytes(const EpInterNodeCfg& c) {
-  const int wpb = c.warpPerBlock;
-  return (c.kernelCfg.worldSize * wpb + c.kernelCfg.numExpertPerRank * wpb +
-          c.kernelCfg.numExpertPerRank) *
-         static_cast<int>(sizeof(ep_index_t));
 }
 
 // Combine's pointer arrays: one per warp for the topk sources, a second for the

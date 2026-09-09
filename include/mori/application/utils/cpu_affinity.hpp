@@ -29,9 +29,9 @@
 #include <cstring>
 #include <fstream>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
-#include <set>
 #include <vector>
 
 #include "mori/utils/env_utils.hpp"
@@ -160,13 +160,10 @@ inline void BindCallingThreadToGpuNumaOnce() {
 
   // Give this rank its OWN physical cores rather than the whole NUMA node.
   //
-  // Binding to the node alone stops cross-socket placement but leaves the eight
-  // per-node ranks sharing 96 physical cores, and the scheduler does put two of
-  // them on the two SMT siblings of one core. Measured with sched_getcpu: in six
-  // runs of an EP bench, every colliding PAIR -- and only the colliding pair --
-  // ran its host loop at exactly 2x (74us -> 136us a round), and each such run
-  // dragged the whole 16-rank collective from ~89us to 116-124us. Ranks never
-  // migrated mid-run, so the placement is a startup lottery that then sticks.
+  // A node-wide bind still lets the scheduler place two ranks on the two SMT
+  // siblings of one physical core, which runs both host loops at about half
+  // speed; hence the split is by physical core, not just by NUMA node. See
+  // docs/EP_INTERNODE_V2_TAIL.md.
   //
   // Slot = this device's index among the devices on the same NUMA node, which
   // is stable, needs no bootstrap (this runs before it) and no launcher
@@ -186,13 +183,10 @@ inline void BindCallingThreadToGpuNumaOnce() {
       const size_t lo = slot * base + std::min(slot, extra);
       const size_t hi = lo + base + (slot < extra ? 1 : 0);
       std::vector<int> mine;
-      for (size_t i = lo; i < hi; ++i)
-        mine.insert(mine.end(), cores[i].begin(), cores[i].end());
-      if (!mine.empty()) {
-        usable.swap(mine);
-        MORI_APP_INFO("CPU affinity: GPU {} takes slot {}/{} of numa node {} ({} cores)",
-                      deviceId, slot, nslots, numaNode, hi - lo);
-      }
+      for (size_t i = lo; i < hi; ++i) mine.insert(mine.end(), cores[i].begin(), cores[i].end());
+      usable.swap(mine);
+      MORI_APP_INFO("CPU affinity: GPU {} takes slot {}/{} of numa node {} ({} cores)", deviceId,
+                    slot, nslots, numaNode, hi - lo);
     } else {
       MORI_APP_WARN(
           "CPU affinity: numa node {} has {} cores for {} GPUs; binding to the whole node",

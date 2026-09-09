@@ -425,22 +425,12 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
                              ccoComm** outComm) {
   // Pin this thread to its GPU's NUMA-local CPUs before the bootstrap, the
   // Context and any worker thread below (new threads inherit the affinity).
-  // This is the single bind site for the CCO path, mirroring shmem's in
-  // src/shmem/init.cpp -- which was, until now, the ONLY caller of this helper,
-  // so a job that used CCO instead of shmem ran unbound.
-  //
-  // It is not a tuning knob. Unbound, the scheduler is free to place two of the
-  // eight per-node ranks on the two SMT siblings of one physical core; both then
-  // run at about half speed, measured as an exact 2x on the EP host loop
-  // (~43 -> ~80us a round) for the affected ranks and no change for the others.
-  // Those ranks arrive ~36us late, their node's intra-node barrier makes the
-  // other seven wait, and the peer node then waits at the cross-node rendezvous
-  // -- which is the whole of the bistable slow regime documented in
-  // docs/EP_INTERNODE_V2_TAIL.md. It also made every EP v2 measurement against
-  // the v1/shmem path unfair in v1's favour, since v1 bound and v2 did not.
-  //
-  // The caller has already hipSetDevice()'d -- the same contract step 2 below
-  // relies on when it caches comm->hipDev. MORI_IGNORE_CPU_AFFINITY=1 disables.
+  // This is the bind site for the CCO path; src/shmem/init.cpp binds the shmem
+  // path, so without this call a CCO-only job runs unbound. Unbound, two
+  // per-node ranks can land on the two SMT siblings of one core and both run at
+  // half speed; see docs/EP_INTERNODE_V2_TAIL.md. Requires the caller to have
+  // hipSetDevice()'d, the same contract step 2 below relies on when it caches
+  // comm->hipDev. MORI_IGNORE_CPU_AFFINITY=1 disables.
   application::BindCallingThreadToGpuNumaOnce();
 
   auto* comm = new ccoComm();

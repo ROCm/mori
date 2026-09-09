@@ -171,12 +171,6 @@ struct EpInterNodeKernelCfg {
 
 // The device-side config the bodies read: purely the compiled-in shape, so the
 // result is constexpr and every field folds to a literal at its use.
-//
-// This replaces EpInterNodeBindConfig, which used to copy the same twelve fields
-// over a by-value args member at kernel entry so the optimiser could constant-
-// fold them. Constructing it from kConfig directly says the same thing without
-// carrying 56 bytes of kernarg that the host fills and the kernel immediately
-// overwrites -- a duplication that had to agree and had nothing checking it.
 constexpr EpInterNodeDeviceCfg EpInterNodeDeviceCfgOf(const EpInterNodeKernelCfg& k) {
   EpInterNodeDeviceCfg d{};
   d.worldSize = k.worldSize;
@@ -233,24 +227,6 @@ inline std::string Render(const EpInterNodeKernelCfg& c) {
 // second field list: the rendered text is what distinguishes two of them.
 inline std::string RenderValue(const EpInterNodeKernelCfg& c) { return Render(c); }
 
-inline bool operator==(const EpInterNodeKernelCfg& a, const EpInterNodeKernelCfg& b) {
-  // Compares the rendered text rather than the fields: the text IS what selects
-  // the cached binary, and it cannot drift out of sync with VisitFields the way
-  // a hand-written field comparison does.
-  return Render(a) == Render(b);
-}
-
-// Project a live config onto the subset the kernel specialises on. For a caller
-// that already holds an EpDispatchCombineHandle; the plan API builds the same
-// thing out of an EpInterNodeRequest instead.
-//
-// Call this on the config a launch is actually about to run with, never on one
-// that merely resembles it. hiddenDim in particular is a per-call argument in
-// v1: LaunchDispatch writes it into args.config, not back into handle.config, so
-// those two disagree the moment a caller passes hidden_dim -- and since the
-// kernel's EpInterNodeBindConfig OVERWRITES args.config with the NTTP, sourcing the
-// constants from the stale one silently runs the kernel against other numbers.
-
 // A zero in any divisor is a division by a literal zero once the cfg is an
 // NTTP -- hipcc either rejects the TU or emits a poison value, and neither
 // diagnoses back to the caller that built it wrong.
@@ -259,16 +235,6 @@ inline bool EpInterNodeKernelCfgIsValid(const EpInterNodeKernelCfg& s) {
          s.numExpertPerToken > 0 && s.maxNumInpTokenPerRank > 0 && s.hiddenDim > 0 &&
          (s.worldSize % s.gpuPerNode) == 0;
 }
-
-// ---------------------------------------------------------------------------
-// The single by-value kernel argument, shared with the device side:
-// ep_internode_kernel.hpp includes this header rather than redeclaring it, so
-// the two cannot disagree about the layout.
-//
-// EpInterNodeCcoArgs itself now lives in ep_internode_args.hpp, next to the
-// argument struct it wraps: it is device-side shape, and keeping it there is
-// what lets this header stop including v1 entirely.
-// ---------------------------------------------------------------------------
 
 // The args schema, in the form plan_api publishes.
 //

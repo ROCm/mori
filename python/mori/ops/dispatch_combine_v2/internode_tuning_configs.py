@@ -52,102 +52,37 @@ untuned dtypes fall back to "fp8".
 
 from mori.ops import utils as gpu_utils
 
-# ── MI308X (gfx942, 80 CU) — EP16, hidden 6144, topk 8. Tuned fp8-dispatch +
-# bf16-combine on skyriver07+04 (2-node), block_num <= 80.
+# MI308X (gfx942, 80 CU) -- EP16, hidden 6144, topk 8. Tuned fp8-dispatch +
+# bf16-combine on a 2-node rig, block_num <= 80.
 #
-# dispatch and combine are coupled, not independent: dispatch and combine share
-# the same CUDA-graph replay and the same QPs, and a dispatch with too few
-# rdma_block_num leaves the combine that follows it markedly slower (~+18us at
-# 4/8 tokens for rdma 16 vs 32). So the small-token dispatch is NOT tuned for
-# dispatch latency alone -- it holds rdma at 32 to keep the paired combine fast,
-# which is the lower total. combine wants a small block at small tok (32/64) and
-# block 80 / rdma 40 at mid tok.
+# Invariant: dispatch and combine are COUPLED -- same graph replay, same QPs, one
+# shared arena -- so these rows are the best PAIR, not the per-phase argmins. Do
+# not re-tune one phase in isolation; the per-phase winners a sweep prints do not
+# reproduce once the two phases run at different geometries. The 4-token row is
+# the one place a low dispatch rdma_block_num is safe: the extra cost it used to
+# impose on the paired combine does not occur on the v2 CCO path. The 8-token row
+# still holds rdma at 32 for that reason.
 #
-# Re-tune (2026-09-04, full-scope sweep x3 + A/B validation, same 2-node rig):
-# the 4/8/32 rows were confirmed at or better than anything the sweep found (the
-# independent per-phase argmins the sweep prints do NOT reproduce once dispatch
-# and combine run at different geometries -- the coupling above -- so tok8 stays
-# on the current 32/21/6 combine, which A/B-beat the sweep's 64/16/8). Only tok16
-# moved: a single shared 80/rdma40/warp4 geometry for both phases beat the old
-# 80/48/8 + 80/40/8 by ~4us total (disp 41.3 vs 43.6, comb 51.1 vs 53.1),
-# reproducible across two A/B batches.
+# Re-tuning protocol -- a sweep on this path is easy to get wrong, and all three
+# guards are required. Only the first is automated.
+#   1. Judge candidates by a PAIRED comparison against a FIXED incumbent, never
+#      greedily: a "winner becomes the next incumbent" chain returns a different
+#      winner on every repeat of the same sweep at this noise level. This is what
+#      `--cmd tuning` does; see _tune in
+#      tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py.
+#   2. MANUAL. Picking the best of a large candidate set is a multiple-comparison
+#      problem, so re-run the sweep winner with `--tuning-candidate` three
+#      separate times and require it to beat the shipped row's median every time.
+#      Sweep-only winners routinely fail this.
+#   3. MANUAL. Finally A/B the resulting TABLE in a plain interleaved bench. The tuner
+#      cannot substitute for this: it takes a median over paired passes, which
+#      discards the rare multi-x spike a bench mean sees, and it holds two ops
+#      (two symmetric windows) alive at once, which makes BOTH arms spike and so
+#      masks a candidate's own spike. Geometries that leave the intra-node half
+#      too few blocks are bimodal and have been caught only at this stage.
 #
-# Re-tune (2026-09-08, v2 CCO path, `--cmd tuning` in the v2 harness): only the
-# 4-token DISPATCH moved, 64/32/8 -> 32/16/4. Everything else in this table was
-# re-swept and held: 4-token combine, both phases at 8, 16 and 32 tokens -- 0
-# reproducible wins over 3 repeats each (16 and 32 gave 0 wins in all 6 runs).
-#
-# That row is the one change because it is the only one that reproduced. Three
-# independent 29-candidate sweeps ranked 32/16/4 first every time (-2.4, -2.6,
-# -2.8us paired against the fixed incumbent), and eight 51-rep head-to-heads gave
-# a median of -2.3us with 6 of 8 clearing the margin. The per-phase split is
-# consistent across all eight: dispatch 36.9-38.4us against 39.2-40.9us, combine
-# 46.2-46.9 against 45.8-46.6 -- so the gain is ~6% of dispatch and the combine
-# after it is unchanged.
-#
-# That last part matters, because the coupling note above predicts the opposite:
-# it records rdma 16 costing ~+18us on the paired combine at 4/8 tokens, which is
-# why this row held rdma at 32. On the v2 CCO path that penalty does not appear
-# (46.5 vs 46.5 in the validation runs), so the reason for keeping rdma high at 4
-# tokens has gone with it. The note is left standing for the 8-token row, whose
-# sweep found nothing better and which still carries rdma 32.
-#
-# Re-tune (2026-09-09) after the CCO NUMA-binding fix. EVERY number above this
-# line was tuned with the ranks unbound, i.e. every A/B in it raced a +-40us
-# random term from CPU placement, so the table had to be re-derived rather than
-# trusted. ONE row moved: 32-token combine 80/40/8 -> 64/48/6.
-#
-# Method, FOUR stages. The fourth is not optional and I learned that the hard way:
-#   1. Full sweep, 165 candidates (the rdma grid was widened from three points to
-#      eighths -- the old one could not even reach the shipped 32-token rdma=48),
-#      three repeats per (token, phase).
-#   2. Keep only candidates that won in at least two of the three repeats. At 4
-#      tokens the three sweeps returned 15 winners and NONE repeated, which is
-#      the whole argument for this stage.
-#   3. Head-to-head against the shipped row, 21 paired reps, three times.
-#
-# Stage 3 is not a formality. 16-token combine (64,40,6) won all THREE sweeps and
-# then lost all three head-to-heads -- picking a winner out of 165 candidates is
-# a multiple-comparison problem and the sweep alone cannot tell a real effect
-# from the best of 165 draws. The bar applied here is: the tuned phase's median
-# must be better in all three head-to-heads.
-#   4. A plain interleaved bench A/B of the resulting TABLE. This stage cannot be
-#      replaced by a better statistic inside the tuner, and that was measured
-#      rather than assumed. Two things differ, both verified on (32,12,6):
-#        * the ESTIMATOR -- the tuner takes the median over 21 paired passes,
-#          the bench the mean over 30 rounds of ONE pass. The two geometries have
-#          the SAME median round (42.0 against 41-42); the candidate spikes to
-#          4-5x on one round in thirty, which moves a bench mean and which a
-#          median over passes discards.
-#        * the ENVIRONMENT -- the tuner holds two ops alive, each with its own
-#          symmetric window, alternating. That makes BOTH arms spike: worst round
-#          124/127, 127/127, 127/133 over three runs, against 79 and 65 for the
-#          incumbent and 162 and 205 for the candidate in a plain bench. The
-#          candidate's own spike is invisible because the environment supplies
-#          one to both arms.
-#
-# Stage 4 rejected 8-token dispatch (32,12,6), which had passed stage 3 on both
-# the median (39.0/39.2/40.2 against 40.9/41.0/41.3) and the worst. In a plain
-# bench it read 118.1/118.8/115.9 against the shipped row's 92.0/94.3, with one
-# dispatch worst of 374us -- best-in-class once and much worse three times. That
-# geometry leaves only 20 of 32 blocks for the intra-node half and is bimodal;
-# 8-token dispatch is therefore UNCHANGED.
-#
-# 32-token combine (64,48,6) passed stage 4: interleaved against the shipped row,
-# three pairs, 113.6/114.6/114.3 against 116.1/116.1/118.3, with combine itself
-# 65.0/64.9/64.9 against 66.7/66.8/67.3. That is the one row this re-tune moved.
-# 4- and 32-token dispatch had no candidate reproduce at all and are unchanged.
-#
-# Two candidates cleared the tail bar but not the median one and are NOT applied,
-# recorded so they are not re-derived: 4-token combine (64,16,8) and 8-token
-# combine (80,50,4). Both tie on the median and cut the worst of the paired reps
-# by 15-25us. They are a real trade, not noise; they want their own decision.
-#
-# Methodology, because a sweep on this path is easy to get wrong: candidates are
-# judged by a PAIRED comparison against a FIXED incumbent, not by a chain. v1's
-# greedy shape (a winner becomes the incumbent) is unusable at this noise level
-# -- five repeats of one sweep returned five different winners. See _tune in
-# tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py.
+# Ranks must be NUMA-bound before any of this: unbound CPU placement adds a large
+# random term that swamps every effect measured here.
 _MI308X_EP16_H6144 = (
     # max_tok, disp_block, disp_rdma, disp_warp, comb_block, comb_rdma, comb_warp
     (4, 32, 16, 4, 32, 21, 6),
@@ -161,16 +96,10 @@ _TABLE = {
     ("mi308x", 16, 6144, 8): {"fp8": _MI308X_EP16_H6144},
 }
 
-# Same die / CU count as a tuned sibling, reuse its table.
-_MODEL_ALIAS = {"mi350x": "mi355x"}
-
 
 def _device_key():
     """Device table key for the current GPU (PCI DID, then arch), or None."""
-    model = gpu_utils.detect_model()
-    if model is not None:
-        return _MODEL_ALIAS.get(model, model)
-    return None
+    return gpu_utils.detect_model()
 
 
 def lookup(world_size, hidden_dim, topk, num_tokens, dtype="fp8"):

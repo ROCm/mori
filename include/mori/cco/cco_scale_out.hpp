@@ -114,13 +114,8 @@ struct ccoGda_SignalAdd {
 // Atomic add at an arbitrary offset in a caller-owned window, rather than at a
 // signal slot in the DevComm's resource window.
 //
-// ccoGda_SignalInc / ccoGda_SignalAdd address the resource window's signal pool:
-// gdaSignalCount fixed slots, at signalId * sizeof(uint64_t), read back through
-// waitSignal's consume-on-read shadow. That fits a caller whose flags are the
-// signals; it does not fit one whose flags are a data structure of its own --
-// EP's internode chunk-flag protocol, for instance, keeps one slot per (node,
-// chunk) in its own arena, scaling with token capacity, and polls and clears
-// them itself.
+// ccoGda_SignalInc / ccoGda_SignalAdd cannot express that: they resolve to
+// signalId * sizeof(uint64_t) in the DevComm's own resource window.
 //
 // The remote op is identical (a NIC atomic add); only the target resolution
 // differs, so this rides the same single-reservation path as ccoGda_SignalAdd --
@@ -225,10 +220,10 @@ struct ccoGda {
   // ── completion ──────────────────────────────────────────────────────────
 
   // flush = flushAsync + wait per peer.
-  // flushAsync rings the doorbell if any WQEs are pending (skips if already
-  // rung), then wait polls CQ until all submitted WQEs complete.
+  // flushAsync snapshots the reservation counter; wait polls the CQ until the
+  // WQEs up to that snapshot complete. Doorbells are rung by the posting paths.
 
-  // flush: ring doorbell + poll CQ for every peer.
+  // flush: poll CQ for every peer.
   // peers are distributed across the Coop group (default: warp).
   // all threads in the group must call flush together.
   template <typename Coop = ccoCoopWarp>
@@ -238,8 +233,8 @@ struct ccoGda {
   template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename Coop = ccoCoopWarp>
   __device__ inline void flush(int peer, Coop coop = Coop{});
 
-  // flushAsync: ring doorbell for peer and return a request handle that
-  // wait() can later be used to wait on individually.
+  // flushAsync: snapshot this peer's QP progress and return a request handle
+  // that wait() can later be used to wait on individually.
   template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename Coop = ccoCoopThread>
   __device__ inline void flushAsync(int peer, ccoGdaRequest_t* outRequest, Coop coop = Coop{});
 
@@ -625,29 +620,6 @@ __device__ inline static uint32_t getAtomicWqeCount(core::atomicType amo_op, uin
   }
 }
 
-template <core::ProviderType PrvdType>
-__device__ inline static uint64_t buildFlushDbrVal(core::WorkQueueHandle* wq, uint32_t postIdx,
-                                                   uint32_t qpn) {
-  // postIdx is the next-free slot; the last posted WQE is at postIdx-1
-  uint32_t lastWqeIdx = (postIdx - 1) & (wq->sqWqeNum - 1);
-
-  if constexpr (PrvdType == core::ProviderType::PSD) {
-    return wq->sq_dbval | (postIdx & (wq->sqWqeNum - 1));
-  } else if constexpr (PrvdType == core::ProviderType::MLX5) {
-    // Read back ctrl seg first qword from SQ buffer
-    uintptr_t wqeAddr =
-        reinterpret_cast<uintptr_t>(wq->sqAddr) + (lastWqeIdx << core::MORI_MLX5_SEND_WQE_SHIFT);
-    return *reinterpret_cast<volatile uint64_t*>(wqeAddr);
-  } else {
-    // BNXT: reconstruct db header
-    uint8_t flags = (postIdx >> (__ffs(wq->sqWqeNum) - 1)) & 0x1;
-    uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
-    return core::bnxt_re_init_db_hdr(
-        ((postIdx & (wq->sqWqeNum - 1)) * BNXT_RE_NUM_SLOT_PER_WQE) | epoch, 0, qpn,
-        BNXT_RE_QUE_TYPE_SQ);
-  }
-}
-
 // putImpl - post one warp-aggregated put for the active lanes (all targeting this
 // ep/qpn; the facade groups by peer). Each lane posts its data WQE into a contiguous
 // reservation; the leader posts the shared signal WQE and rings one doorbell.
@@ -842,33 +814,16 @@ __device__ inline static void getImpl(core::RdmaEndpointDevice* ep, uint32_t qpn
 
 // FlushAsync: snapshot the reservation counter so a later wait() can drain to it.
 //
-// It deliberately neither rings a doorbell nor touches dbTouchIdx. postIdx is a
-// *reservation* counter: putImpl/putValueImpl/signalImpl bump it before they write
-// their WQEs and before they reach ringDoorbellOrdered, so a snapshot routinely
-// covers slots whose owner is still in flight. Every posting path rings its own
-// doorbell -- the ccoGdaOptFlagsAggregateRequests opt-out has no caller -- and
-// ringDoorbellOrdered hands the turn on by advancing dbTouchIdx in reservation
-// order, so the queue drains on its own and the draining belongs to quietUntil.
-//
-// Acting on the snapshot here corrupts that chain three ways:
-//   - ringing for a reservation whose WQEs are not written yet points the NIC at a
-//     stale SQ slot;
-//   - storing dbTouchIdx = curPostIdx steps over an owner still waiting for its
-//     turn, and that wait compares for *equality* against a monotonically
-//     increasing counter, so the owner is never released and the tokens behind its
-//     reservation are never sent -- a silent, permanent hang whose only symptom is
-//     one wavefront parked in ringDoorbellOrdered;
-//   - charging cq->needConsIdx from here races with a second flush on the same QP:
-//     both read the same (dbTouchIdx, postIdx) pair, both add the same pending
-//     count, and the dbTouchIdx store is idempotent, so the inflated CQ credit is
-//     the only trace. It does not double-count against ringDoorbellOrdered -- an
-//     owner that got leapfrogged never reaches its own charge.
-//
-// Re-enabling aggregation would need a separate "WQEs written" counter to ring
-// from; postIdx cannot serve, because it runs ahead of the writes.
+// It must neither ring a doorbell nor touch dbTouchIdx. postIdx is a *reservation*
+// counter: putImpl/putValueImpl/signalImpl bump it before writing their WQEs, so a
+// snapshot routinely covers slots whose owner is still in flight. Every posting
+// path rings its own doorbell, and ringDoorbellOrdered hands the turn on by
+// advancing dbTouchIdx in reservation order while waiting on *equality* against
+// it -- advancing dbTouchIdx from here steps over an owner that then never
+// observes its turn, permanently stranding it and its reservation. Draining to
+// the returned index is quietUntil's job.
 template <core::ProviderType PrvdType>
-__device__ inline static void flushAsyncImpl(core::RdmaEndpointDevice* ep, uint32_t qpn,
-                                             uint32_t* outPostIdx) {
+__device__ inline static void flushAsyncImpl(core::RdmaEndpointDevice* ep, uint32_t* outPostIdx) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
 
   *outPostIdx = static_cast<uint32_t>(
@@ -1326,13 +1281,13 @@ __device__ inline void ccoGda<PrvdType>::flush(Coop coop) {
     int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
     core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     uint32_t postIdx = 0;
-    impl::flushAsyncImpl<PrvdType>(ep, ep->qpn, &postIdx);
+    impl::flushAsyncImpl<PrvdType>(ep, &postIdx);
     impl::waitImpl<PrvdType>(ep, postIdx);
   }
   coop.sync();
 }
 
-// flush single peer: ring doorbell if needed, then poll CQ until complete.
+// flush single peer: snapshot the QP's postIdx, then poll CQ until it completes.
 template <core::ProviderType PrvdType>
 template <ccoTeamMode TeamMode, typename Coop>
 __device__ inline void ccoGda<PrvdType>::flush(int peer, Coop coop) {
@@ -1347,13 +1302,13 @@ __device__ inline void ccoGda<PrvdType>::flush(int peer, Coop coop) {
     int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
     core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     uint32_t postIdx = 0;
-    impl::flushAsyncImpl<PrvdType>(ep, ep->qpn, &postIdx);
+    impl::flushAsyncImpl<PrvdType>(ep, &postIdx);
     impl::waitImpl<PrvdType>(ep, postIdx);
   }
   coop.sync();
 }
 
-// flushAsync: ring doorbell for peer, return a request handle for wait().
+// flushAsync: snapshot this peer's QP, return a request handle for wait().
 template <core::ProviderType PrvdType>
 template <ccoTeamMode TeamMode, typename Coop>
 __device__ inline void ccoGda<PrvdType>::flushAsync(int peer, ccoGdaRequest_t* outRequest,
@@ -1366,7 +1321,7 @@ __device__ inline void ccoGda<PrvdType>::flushAsync(int peer, ccoGdaRequest_t* o
     core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
 
     uint32_t postIdx = 0;
-    impl::flushAsyncImpl<PrvdType>(ep, ep->qpn, &postIdx);
+    impl::flushAsyncImpl<PrvdType>(ep, &postIdx);
 
     outRequest->qpIdx = qpIdx;
     outRequest->postIdx = static_cast<uint64_t>(postIdx);

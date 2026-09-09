@@ -52,7 +52,8 @@ from pathlib import Path
 __all__ = [
     "load_library",
     "make_plan",
-    "launch_multi",
+    "make_launch_group",
+    "LaunchGroup",
     "precompile",
     "registered_plans",
     "library_path",
@@ -83,7 +84,7 @@ _ABI_NAME = "libmori_jit.so"
 #
 # `b<N>` is the one exception: N raw bytes memcpy'd from a pointer the caller
 # supplies, for args a C++ handle produces in one piece and no Python caller can
-# fill field by field (v1's EpDispatchCombineArgsRaw, 53 shmem objects). The
+# fill field by field (cco's devComm, embedded by value). The
 # size still crosses in the schema and is still checked against C++'s sizeof.
 _CTYPE = {
     "p": ctypes.c_void_p,
@@ -445,8 +446,8 @@ def make_plan(kernel: str, enums: dict | None = None) -> type:
             return
         src = _as_ptr(value)
         if not src:
-            # Not optional: an unset blob would launch the kernel against zeroed
-            # shmem objects.
+            # Not optional: an unset blob would launch the kernel against a
+            # zeroed struct (devComm).
             raise ValueError(
                 f"{kernel}: launch argument '{name}' is a {nbytes}B struct "
                 f"and needs a real address"
@@ -550,8 +551,8 @@ def make_plan(kernel: str, enums: dict | None = None) -> type:
 
         def _launch_buf(self, args) -> ctypes.Structure:
             """Fill (and cache) the launch argument struct for `args` -- a dict of
-            snake_case or C++-spelled names. Shared by launch() and the batch
-            launch_multi(), which fills one buffer and hands it to several plans.
+            snake_case or C++-spelled names. Shared by launch() and by
+            LaunchGroup, which fills one buffer and hands it to several plans.
 
             A serving loop calls this with the same argument NAMES every time,
             so the struct-filling work repeats identically while only a few
@@ -702,7 +703,7 @@ def make_plan(kernel: str, enums: dict | None = None) -> type:
 def _args_layout(plan):
     """The plan's args layout as (name, offset, size) per field.
 
-    Not `sizeof`. Eight of the fields are bare pointers, so two schemas that swap
+    Not `sizeof`. Many fields are bare pointers, so two schemas that swap
     a pair of same-typed fields have identical size and a caller filling one and
     launching the other reads the wrong buffer in silence -- the exact failure the
     ascending-offset static_assert exists to catch on the C++ side.
@@ -714,12 +715,11 @@ def _args_layout(plan):
 class LaunchGroup:
     """A fixed set of plans over one args layout, validated once.
 
-    `launch_multi` redoes per call what depends only on the set: copying the plan
-    list, checking every handle, comparing every args layout, building the ctypes
-    handle array. A serving loop holds the set fixed -- one per (phase, geometry)
-    -- so it belongs here, leaving the launch path with the argument fill and the
-    one ABI crossing. Measured on the EP internode sequence, that per-call work
-    was ~17us against kernels of ~40us.
+    Copying the plan list, checking every handle, comparing every args layout and
+    building the ctypes handle array depend only on the set, not on the launch. A
+    serving loop holds the set fixed -- one per (phase, geometry) -- so that work
+    is done once here, leaving the launch path with the argument fill and the one
+    ABI crossing.
 
     The group keeps its plans alive, so a handle cannot dangle by garbage
     collection. Explicitly `close()`ing a plan still invalidates every group over
@@ -777,26 +777,6 @@ class LaunchGroup:
 def make_launch_group(plans) -> LaunchGroup:
     """Bind a fixed plan sequence for repeated launching. See LaunchGroup."""
     return LaunchGroup(plans)
-
-
-def launch_multi(plans, stream=0, **args) -> None:
-    """Launch several plans that share one args schema, with a single ABI crossing.
-
-    The EP internode sequence is N kernels over one EpInterNodeCcoArgs -- every
-    pass publishes the same args schema and, in the redirect, is handed the same
-    ``raw``/``devComm`` -- so the argument struct is filled once (on ``plans[0]``,
-    reusing its per-plan cache) and every plan is launched against it in order on
-    ``stream``. That collapses N Python arg-marshals and N ctypes crossings into
-    one; the N ``hipModuleLaunchKernel`` calls still happen, one per plan.
-
-    ``plans`` is a sequence of Plan instances from ``make_plan``; they must share
-    one args layout (asserted by size, since a wrong argSize would silently launch
-    against a mis-sized buffer). Empty ``plans`` is a no-op.
-    """
-    plans = list(plans)
-    if not plans:
-        return
-    LaunchGroup(plans).launch(stream, **args)
 
 
 def precompile(kernel: str, arch: str | None = None) -> int:

@@ -393,7 +393,7 @@ def start_torch_dist_process_manager(world_size=8, disable_p2p=False):
     return manager
 
 
-def assert_worker_results(manager, world_size, timeout_s=None):
+def assert_worker_results(manager, world_size):
     """Collect one result per rank, or fail naming the ranks that never reported.
 
     The collection is bounded. These kernels are distributed spin-wait protocols
@@ -412,11 +412,7 @@ def assert_worker_results(manager, world_size, timeout_s=None):
     ``MORI_TEST_WORKER_TIMEOUT`` overrides the budget in seconds; it is
     deliberately generous, because a slow case must not be reported as a hang.
     """
-    budget = (
-        float(os.environ.get("MORI_TEST_WORKER_TIMEOUT") or "900")
-        if timeout_s is None
-        else float(timeout_s)
-    )
+    budget = float(os.environ.get("MORI_TEST_WORKER_TIMEOUT") or "900")
     deadline = time.monotonic() + budget
     results = []
     for _ in range(world_size):

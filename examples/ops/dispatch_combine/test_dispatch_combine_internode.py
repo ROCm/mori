@@ -76,10 +76,8 @@ _EP_ROUNDS = int(os.environ.get("MORI_EP_ROUNDS") or "30")
 #
 # Default 1: drop round 0 only, the same for both backends -- kept symmetric on
 # purpose so cco and shmem are measured identically rather than each tuned to its
-# own warm-up length. There is a real start transient: the dist.barrier() before
-# the timed loop releases all ranks at once, so the first timed rounds' collectives
-# fire simultaneously and hit peak fabric contention (thundering herd) before the
-# rounds self-stagger. It is worse and longer on the CCO/GDA path (first round
+# own warm-up length. There is a real start transient after the dist.barrier()
+# that precedes the timed loop. It is worse and longer on the CCO/GDA path (first round
 # ~1.6-2.5x steady, still elevated through round ~2) than on shmem (recovered by
 # round 1). If you want that transient out of the reported Best/Worst, raise this
 # (e.g. MORI_EP_DROP_ROUNDS=3 covers the CCO ramp); it is left at 1 by default so

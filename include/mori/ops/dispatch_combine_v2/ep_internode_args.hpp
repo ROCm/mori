@@ -36,12 +36,10 @@
 // binary, and they measured SLOWER on gfx942 (VGPR 9 -> 22) because the compiler
 // stops treating the base as uniform and rematerialises the address per lane.
 //
-// Nothing in this file names anything from v1. That is the point: this header
-// and the kernel that includes it used to reach dispatch_combine.hpp for the
-// argument struct, the config, the index helpers and index_t, which cost 219
-// transitive headers on every JIT compile and carried a struct whose tail is
-// #ifdef'd on build macros the JIT toolchain never defines -- so the host library
-// and the device module could disagree about its size with nothing to catch it.
+// Nothing in this file names anything from v1, and it must stay that way:
+// reaching into dispatch_combine.hpp costs 219 transitive headers per JIT
+// compile and pulls in a struct whose tail is #ifdef'd on build macros the JIT
+// toolchain never defines, so host and device can disagree about its size.
 // ---------------------------------------------------------------------------
 
 #include <hip/hip_runtime.h>
@@ -92,7 +90,6 @@ struct EpInterNodeRegion {
   int32_t lsaBase{0};
 
   __device__ __host__ const EpInterNodeRegion* operator->() const { return this; }
-  __device__ __host__ bool IsValid() const { return win != 0; }
 
 // Device-only: ccoGetLocalPtr / ccoGetLsaPeerPtr are themselves declared inside
 // cco.hpp's `#if defined(__HIPCC__)`, so a plain C++ TU cannot name them. Host
@@ -115,23 +112,20 @@ struct EpInterNodeRegion {
         ::mori::cco::ccoGetLsaPeerPtr(reinterpret_cast<::mori::cco::ccoWindow_t>(win),
                                       worldPe - lsaBase, static_cast<size_t>(off)));
   }
-
-  __device__ __forceinline__ void* Get() const { return GetAs<void*>(); }
-  __device__ __forceinline__ void* Get(int worldPe) const { return GetAs<void*>(worldPe); }
 #endif
 };
 
 // ---------------------------------------------------------------------------
 // The shape the kernel reads as `args.config`.
 //
-// Thirteen scalars and the derived counts the bodies call: exactly what the
-// `config.` sites touch. EpDispatchCombineConfig has 21 fields and a dozen more
+// Only the scalars and the derived counts the bodies call: exactly what the
+// `config.` sites touch. EpDispatchCombineConfig carries many more fields and
 // helpers; carrying them would re-import the coupling this file removes.
 //
 // Geometry is deliberately NOT here. blockNum and warpNumPerBlock come from
 // gridDim/blockDim, and rdmaBlockNum is a per-launch field of the args below --
 // not for tidiness, but because dispatch and combine are tuned to DIFFERENT
-// values for the same op (internode_tuning_configs: at <=8 tokens dispatch runs
+// values for the same op (internode_tuning_configs: at 8 tokens dispatch runs
 // rdma=32/warp=8 while combine runs rdma=21/warp=6, and the table comment
 // records that the coupling is deliberate). Folding geometry into the config,
 // and thus later into the NTTP, would give the two phases disagreeing configs
@@ -196,9 +190,6 @@ struct EpInterNodeDeviceCfg {
     return HiddenBytes(tokenTypeSize) + IndexBytes() + WeightBytes() + SrcTokenIdBytes() +
            ScaleBytes();
   }
-  __host__ __device__ size_t MaxXferBytesPerToken() const {
-    return XferBytesPerToken(static_cast<size_t>(maxTokenTypeSize));
-  }
 };
 
 // ---------------------------------------------------------------------------
@@ -223,15 +214,6 @@ __device__ inline int NullFlatTokenIndex(const EpInterNodeDeviceCfg& config) {
 // which is what the host allocated per PE.
 __device__ inline int SendBufSlotOffset(const EpInterNodeDeviceCfg& config, int pe, int slotId) {
   return pe * config.MaxNumTokensToSendPerRank() + slotId;
-}
-__device__ inline int PeFromSendBufSlotOffset(const EpInterNodeDeviceCfg& config, int flatIdx) {
-  return flatIdx / config.MaxNumTokensToSendPerRank();
-}
-__device__ inline int SlotIdFromSendBufSlotOffset(const EpInterNodeDeviceCfg& config, int flatIdx) {
-  return flatIdx % config.MaxNumTokensToSendPerRank();
-}
-__device__ inline int NullSendBufSlotOffset(const EpInterNodeDeviceCfg& config) {
-  return config.worldSize * config.MaxNumTokensToSendPerRank();
 }
 
 // ---------------------------------------------------------------------------
@@ -280,9 +262,7 @@ __device__ inline int NullSendBufSlotOffset(const EpInterNodeDeviceCfg& config) 
   X(destPeTokenCounter, "p")             \
   X(blockFlagCounter, "p")               \
   X(totalRecvTokenNum, "p")              \
-  X(dispTokIdToSrcTokIdLocal, "p")       \
   X(dispatchGridBarrier, "p")            \
-  X(combineGridBarrier, "p")             \
   X(interNodeBlocksBarrier, "p")         \
   X(crossDeviceBarrierFlag, "p")
 
@@ -348,12 +328,9 @@ struct EpInterNodeArgs {
   ep_index_t* destPeTokenCounter{nullptr};
   ep_index_t* blockFlagCounter{nullptr};
   ep_index_t* totalRecvTokenNum{nullptr};
-  ep_index_t* dispTokIdToSrcTokIdLocal{nullptr};
   uint32_t* dispatchGridBarrier{nullptr};
-  uint32_t* combineGridBarrier{nullptr};
   uint32_t* interNodeBlocksBarrier{nullptr};
   uint64_t* crossDeviceBarrierFlag{nullptr};
-
 
   // An offset as something addressable. Built per access; the three members are
   // all the accessors need, so this costs nothing at -O2.
@@ -381,7 +358,7 @@ constexpr bool EpInterNodeArgsOffsetsAscend() {
 
 }  // namespace detail
 
-static_assert(detail::kEpInterNodeArgsFieldCount == 39,
+static_assert(detail::kEpInterNodeArgsFieldCount == 37,
               "added an EpInterNodeArgs field -- add it to MORI_EP_INTERNODE_ARGS_FIELDS in "
               "the same position and bump this count");
 static_assert(detail::EpInterNodeArgsOffsetsAscend(),

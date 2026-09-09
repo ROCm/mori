@@ -44,7 +44,7 @@ import pytest
 
 from mori.ops.dispatch_combine_v2.internode_regions import internode_regions
 
-# Every name `HipBackend._internode_arena_args` resolves, transcribed
+# Every name `EpDispatchCombineOpHip._internode_static_args` resolves, transcribed
 # independently. A rename on either side has to be made twice or this fails --
 # which is the only cheap guard left now that the v1 allocator is not around to
 # be compared against.

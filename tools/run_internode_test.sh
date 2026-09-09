@@ -8,19 +8,21 @@
 #                         [--num-qp <N>] [--quant-type <none|...>] [--dtype <bf16|...>] \
 #                         [--combine-dtype <bf16|...>] [--hidden-dim <N>] [--topk <N>] \
 #                         [--max-recv-total-tokens <N>] [--sentinel-pattern <p>] \
-#                         [--nproc-per-node <N>] [--entry <path>]
+#                         [--rounds <N>] [--nproc-per-node <N>] [--entry <path>]
 #
 # The optional shape/dtype flags are pass-throughs to the harness, which already
 # accepts all of them; they are listed here so the cross-node leg can cover the
-# same matrix the single-host pytest file does. Only --nproc-per-node is this
-# script's own: it was pinned at 1, which made every cross-node run EP2 and left
-# EP16 -- the shape that actually ships -- reachable only by hand-written
-# torchrun lines outside this script.
+# same matrix the single-host pytest file does. --nproc-per-node and --entry are
+# this script's own (--rounds is a pass-through the v2 entry accepts and the v1
+# one does not): --nproc-per-node was pinned at 1, which made every cross-node
+# run EP2 and left EP16 -- the shape that actually ships -- reachable only by
+# hand-written torchrun lines outside this script.
 #
 # --entry selects which driver torchrun runs, defaulting to the shmem AOT harness.
-# The v2 CCO entry takes the same CLI and differs only in installing the JIT
-# redirect before the harness builds its first op, so the two are interchangeable
-# here; anything else would have to parse these same flags.
+# The v2 CCO entry takes a SUBSET of the same CLI: --cmd is only test|bench|tuning
+# (no stress/test_sentinel/sweep_bench/profile), --kernel-type only v1|v1_ll, and
+# it accepts neither --max-recv-total-tokens nor --sentinel-pattern. It is the
+# only entry that takes --rounds.
 #
 # Environment variables GLOO_SOCKET_IFNAME and MORI_SOCKET_IFNAME are set
 # automatically from --ifname. All other env vars (MORI_RDMA_SL, MORI_SHMEM_MODE,
@@ -43,6 +45,7 @@ TOPK=""
 HIDDEN_DIM=""
 MAX_RECV_TOTAL_TOKENS=""
 SENTINEL_PATTERN=""
+ROUNDS=""
 NPROC_PER_NODE=1
 ENTRY="examples/ops/dispatch_combine/test_dispatch_combine_internode.py"
 
@@ -65,6 +68,7 @@ while [[ $# -gt 0 ]]; do
     --sentinel-pattern) SENTINEL_PATTERN="$2";      shift 2 ;;
     --nproc-per-node)   NPROC_PER_NODE="$2";        shift 2 ;;
     --entry)            ENTRY="$2";                 shift 2 ;;
+    --rounds)           ROUNDS="$2";                shift 2 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
@@ -81,10 +85,8 @@ cd "$REPO_ROOT"
 
 [[ -f "$ENTRY" ]] || { echo "--entry not found under $REPO_ROOT: $ENTRY"; exit 1; }
 
-# torchrun puts the entry's own directory on sys.path, not the repo root, so an
-# entry that imports "tests.python.*" (the v2 one does, for the shared test
-# utils) cannot resolve it. Under pytest the rootdir covers this; here nothing
-# does.
+# torchrun puts the entry's own directory on sys.path, not the repo root; keep
+# the repo root importable for entries that reach into it.
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 EXTRA_ARGS=()
@@ -96,6 +98,7 @@ EXTRA_ARGS=()
 [[ -n "$MAX_RECV_TOTAL_TOKENS" ]] \
   && EXTRA_ARGS+=(--max-recv-total-tokens "$MAX_RECV_TOTAL_TOKENS")
 [[ -n "$SENTINEL_PATTERN" ]] && EXTRA_ARGS+=(--sentinel-pattern "$SENTINEL_PATTERN")
+[[ -n "$ROUNDS" ]]         && EXTRA_ARGS+=(--rounds "$ROUNDS")
 
 exec timeout "${MORI_INTERNODE_TIMEOUT:-120}" torchrun \
   --nnodes=2 \

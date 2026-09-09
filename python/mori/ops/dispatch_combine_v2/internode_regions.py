@@ -84,7 +84,7 @@ def internode_regions(cfg):
         per_rank = m
     recv = ws * per_rank  # MaxNumTokensToRecv
 
-    # MaxXferBytesPerToken: hidden + index + weight + srcTokenId + scale.
+    # XferBytesPerToken(maxTokenTypeSize): hidden + index + weight + srcTokenId + scale.
     scale_bytes = cfg.scale_dim * cfg.scale_type_size
     xfer = hidden * tsz + topk * _I32 + topk * _F32 + _I32 + scale_bytes
 
