@@ -168,9 +168,27 @@ cuts ours to 16 ``buffer_store_dwordx2`` -- and buys nothing, 387.4us against
 epilogue runs once per block, and with two waves a SIMD the other wave's MFMAs
 cover it. The same caveat applies to the VALU number above.
 
-So the trace has retired the store as well, and what it leaves is the
-MFMA-to-VALU dependency -- our MFMAs 70% stalled against CK's 55%, feeding a
-VALU that is 46% stalled against 31%.
+So the trace has retired the store as well, and the interleaving with it.
+
+The shapes really do differ, and for a reason in the source. CK promotes each
+tile where it is issued -- one MFMA then its four ``v_fmac`` -- and pins that
+with an empty ``asm volatile("" : "+v"(value))`` on the accumulator, so nothing
+can be re-clumped. ``mma_promote`` batches ``num_acc_n`` MFMAs and promotes
+them afterwards, with nothing pinning the order, so LLVM sinks every promote
+below every MFMA: MFMA in clumps, then a 40-80 instruction VALU stretch.
+
+Reproducing CK's shape does not pay. One MFMA per promote plus
+``rocdl.sched_barrier(0)`` after each takes the longest VALU run from 81 down
+to 11 and the median gap from 4 to 6 -- much closer to CK's ``MVVVV`` -- and
+the kernel goes 385.6 -> 393.7us, slightly *worse*. The clumping is not what
+costs the 29%.
+
+What a K sweep does say is where to look. Extrapolating 386.2us at K=2048 and
+1390.1 at K=8192 against CK's 298.4 and 995.5: our fixed cost is *lower*, 51.6
+against 66.0 (CK pays for the CShuffle), and every bit of the gap is
+per-iteration -- 20.9us a K-block against 14.5, 44% more, on a loop body with
+fewer instructions. Occupancy cannot absorb it either: --waves-per-eu 3 and 4
+spill outright (2729 and 4719us), so both kernels sit at two waves a SIMD.
 
 
 Two structural notes that came out of the port. B never touches LDS here --
