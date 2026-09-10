@@ -127,6 +127,17 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
                              " threads per block, which exceeds 1024");
   }
 
+  // Wave64 only. DispatchInterNodeSend builds its intra-warp prefix count as
+  // __popcll(mask << (warpSize - laneId)) on a uint64_t, which drops the lanes
+  // at or above laneId only when the shift width equals the container width.
+  // On wave32 the discarded bits stay inside the 64-bit value and every set bit
+  // is counted, so the send slot is wrong rather than the code merely being
+  // slow. Rejected here rather than left to produce bad offsets.
+  if (c.waveSize != 64) {
+    throw std::runtime_error("mori ep internode v2: waveSize " + std::to_string(c.waveSize) +
+                             " is unsupported; the internode kernels are wave64 only");
+  }
+
   // The grid is split: blocks below rdmaBlockNum take the RDMA leg, the rest the
   // intra-node one. rdma >= block leaves the intra-node half with nothing AND
   // makes the dispatch fan-in wait on rdmaBlockNum * warpNum arrivals that can

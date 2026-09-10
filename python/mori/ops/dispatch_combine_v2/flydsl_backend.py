@@ -127,6 +127,14 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                         cfg.world_size * max_tok_per_rank * cfg.combine_scale_dim * 4,
                     )
                 )
+        # Gate FIRST, as the hip backend does: rejecting after taking the
+        # symmetric window would leak it. The _unsupported hook is not called by
+        # the base -- the only thing that reads it is a KernelSet handed to
+        # _gate -- so a hook that is merely defined never fires.
+        self._gate(
+            KernelSet(dispatch={}, combine={}, unsupported=self._unsupported(cfg))
+        )
+
         self.arena = SymmArena(comm, regions)
         self.arena.zero()
 

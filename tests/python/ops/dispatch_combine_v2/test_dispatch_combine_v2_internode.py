@@ -63,10 +63,12 @@ only traffic on the fabric. It is worth setting because a number measured in the
 wrong traffic class does not transfer to a shared one, not because it is a
 speedup.
 
-Why the small-token bench is bimodal per RUN, how to recognise it from the
-per-rank ``hwal`` series (``MORI_EP_ROUND_SERIES=1``), and how to A/B on this
-path without being fooled by it live in ``docs/EP_INTERNODE_V2_TAIL.md`` rather
-than here, so this file stays close in shape to the examples harness it mirrors.
+The small-token bench is bimodal per RUN, not per round: a run settles into a
+fast or a slow regime and holds it, so a worst/mean ratio is a blend of two
+levels rather than a tail. ``MORI_EP_ROUND_SERIES=1`` prints the per-rank
+``hwal`` series that shows which one this run is in. INTERLEAVE the arms of any
+A/B on this path -- a block of runs can sit in one regime for reasons that have
+nothing to do with the change under test.
 
 COMPARING AGAINST THE v1 BENCH
 ------------------------------
@@ -758,7 +760,8 @@ def _bench(op, cfg, d, dev, a, comm):
     # Which round stalled, opt-in. EVERY rank prints its own series: these are
     # spin-wait collectives, so one slow rank shows as a slow round on all of
     # them and only the rank-local series separates a straggler from a
-    # whole-round event. See docs/EP_INTERNODE_V2_TAIL.md for how to read it.
+    # whole-round event. A rank whose hwal is about twice its peers' is the
+    # signature of two ranks sharing one physical core.
     if _series:
         print(
             "# rounds r%d disp: " % d.rank + " ".join("%.0f" % x for x in disp),

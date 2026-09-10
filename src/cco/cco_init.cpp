@@ -428,7 +428,7 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
   // This is the bind site for the CCO path; src/shmem/init.cpp binds the shmem
   // path, so without this call a CCO-only job runs unbound. Unbound, two
   // per-node ranks can land on the two SMT siblings of one core and both run at
-  // half speed; see docs/EP_INTERNODE_V2_TAIL.md. Requires the caller to have
+  // half speed. Requires the caller to have
   // hipSetDevice()'d, the same contract step 2 below relies on when it caches
   // comm->hipDev. MORI_IGNORE_CPU_AFFINITY=1 disables.
   application::BindCallingThreadToGpuNumaOnce();

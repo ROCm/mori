@@ -162,8 +162,7 @@ inline void BindCallingThreadToGpuNumaOnce() {
   //
   // A node-wide bind still lets the scheduler place two ranks on the two SMT
   // siblings of one physical core, which runs both host loops at about half
-  // speed; hence the split is by physical core, not just by NUMA node. See
-  // docs/EP_INTERNODE_V2_TAIL.md.
+  // speed; hence the split is by physical core, not just by NUMA node.
   //
   // Slot = this device's index among the devices on the same NUMA node, which
   // is stable, needs no bootstrap (this runs before it) and no launcher

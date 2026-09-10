@@ -465,6 +465,15 @@ class EpDispatchCombineConfig:
             if dt == torch.float4_e2m1fn_x2
             else ("fp8" if dt in _FP8_DTYPES else "bf16")
         )
+        # The intranode tables say nothing about an internode config -- they are
+        # keyed on a single node's geometry and carry no rdma_block_num -- and
+        # pre-filling here would be indistinguishable from a caller pin, which
+        # the internode backend honours over its own table. Leave it alone and
+        # let _resolve_geometry / internode_tuning_configs do the work.
+        gpn = kwargs.get("gpu_per_node") or kwargs["world_size"]
+        if kwargs["world_size"] // gpn > 1:
+            return cls(**kwargs)
+
         t = lookup(
             kwargs["world_size"],
             kwargs["hidden_dim"],
@@ -1035,6 +1044,16 @@ class EpDispatchCombineOp:
         # 1, internode at 0 (see the two constructors in hip_backend) -- so a
         # single literal here silently desynchronises one of them from its peers.
         self.cross_device_flag.fill_(0 if self.cfg.is_internode else 1)
+        # The docstring above says the kernels self-reset their counters. That is
+        # true of dest_pe_counter and the two grid barriers, and NOT of the
+        # internode chunk-slot allocator: only EpCombineAll clears
+        # blockFlagCounter, so a reset taken between a dispatch and its combine
+        # would leave it advanced and the next dispatch would address slots past
+        # its node's slice of the send buffer.
+        for name in ("block_flag_counter", "inter_blocks_barrier"):
+            t = getattr(self, name, None)
+            if t is not None:
+                t.zero_()
 
     def __repr__(self):
         return (
