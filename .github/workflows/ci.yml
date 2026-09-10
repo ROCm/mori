@@ -362,6 +362,89 @@ jobs:
                 chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           fi
 
+  # Gate for "does mori still build and run on the next ROCm major". Kept to the
+  # single EP intranode test on one runner: the rest of the intranode suite is
+  # ROCm-version agnostic, and the ROCm 10 base image is a separate ~30GB pull.
+  intranode-test-rocm10:
+    name: mori intranode test (ROCm 10, MI355X_AINIC)
+    needs: build
+    runs-on: [self-hosted, MI355X-AINIC-TW]
+    env:
+      # py3.11 rather than the 7.14 lane's py3.12 — this is the tag the ROCm 10
+      # build was validated on.
+      BASE_IMAGE: rocm/pytorch:rocm10.0_ubuntu24.04_py3.11_pytorch_release_2.13.0
+      IMAGE: rocm/mori:ci-rocm10
+      CONTAINER: mori_ci_rocm10_${{ github.run_id }}
+      MORI_RDMA_DEVICES: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+      MORI_RDMA_SL: 3
+      MORI_RDMA_TC: 104
+    timeout-minutes: 60
+    steps:
+      - name: Fix workspace permissions
+        run: |
+          WS="${GITHUB_WORKSPACE}"
+          if [ -d "$WS" ]; then
+            $CT run --rm -v "$WS:$WS" "$BASE_IMAGE" \
+              chown -R $(id -u):$(id -g) "$WS" 2>/dev/null || true
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      # ROCm 10 ships in a different apt repo than 7.x, hence the ROCM_APT_* args.
+      - name: Build CI image
+        run: |
+          $CT build --network=host \
+            --build-arg BASE_IMAGE=$BASE_IMAGE \
+            --build-arg ROCM_APT_VERSION=10.0 \
+            --build-arg ROCM_APT_GPG=https://stable.repo.amd.com/rocm/gpg/packages.gpg \
+            --build-arg ROCM_APT_LIST="https://stable.repo.amd.com/rocm/core/packages/ubuntu2404 stable main" \
+            -t $IMAGE -f docker/Dockerfile.dev .
+
+      - name: Start container
+        run: |
+          $CT rm -f $CONTAINER 2>/dev/null || true
+          CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
+            -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
+            -e MORI_RDMA_SL=$MORI_RDMA_SL \
+            -e MORI_RDMA_TC=$MORI_RDMA_TC \
+            -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
+            -w $GITHUB_WORKSPACE \
+            $IMAGE sleep infinity
+          $CT exec $CONTAINER \
+            git config --global --add safe.directory $GITHUB_WORKSPACE
+
+      - name: Report ROCm version
+        run: |
+          $CT exec $CONTAINER bash -c "
+            ls -d /opt/rocm/core-* && /opt/rocm/bin/hipconfig --version && echo
+          "
+
+      - name: Install mori
+        run: |
+          $CT exec $CONTAINER bash -c \
+            "cd $GITHUB_WORKSPACE && pip install ."
+
+      - name: Verify installation
+        run: $CT exec $CONTAINER python -c "import mori; print('mori ' + mori.__version__ + ' OK')"
+
+      - name: MORI-EP (intranode)
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE && timeout 360 pytest tests/python/ops/test_dispatch_combine_intranode.py -v
+          "
+
+      - name: Cleanup
+        if: always()
+        run: |
+          $CT rm -f $CONTAINER || true
+          if $CT image inspect $IMAGE &>/dev/null; then
+            $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $IMAGE \
+                chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          fi
+
   jax-intranode-test:
     name: mori JAX intranode test (${{ matrix.platform }})
     needs: build

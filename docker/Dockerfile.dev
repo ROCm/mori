@@ -1,12 +1,21 @@
-# Tested base image (the ROCm 7.14 install below assumes a 7.14/ubuntu24.04
-# base; an older one would end up with two ROCm installs stacked):
-#   rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+# Tested base images (the apt ROCm install below must match the base's ROCm
+# major; mixing them would end up with two ROCm installs stacked):
+#   rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0  (default)
+#   rocm/pytorch:rocm10.0_ubuntu24.04_py3.11_pytorch_release_2.13.0  (ROCM_APT_* below)
 ARG BASE_IMAGE=rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
 FROM ${BASE_IMAGE}
 
 # Space-separated gfx targets to pull ROCm device packages for. The CCO CI
 # image uses "gfx950 gfx1250".
 ARG GPU_ARCHS="gfx942 gfx950"
+# apt ROCm to install when the base image ships no dev stack (see below).
+# 10.0 lives in a different repo than 7.x, so the URLs are args too:
+#   ROCM_APT_VERSION=10.0
+#   ROCM_APT_GPG=https://stable.repo.amd.com/rocm/gpg/packages.gpg
+#   ROCM_APT_LIST="https://stable.repo.amd.com/rocm/core/packages/ubuntu2404 stable main"
+ARG ROCM_APT_VERSION=7.14
+ARG ROCM_APT_GPG=https://repo.amd.com/rocm/packages-multi-arch/gpg/rocm.gpg
+ARG ROCM_APT_LIST="https://repo.amd.com/rocm/packages-multi-arch/ubuntu2404 stable main"
 # 1 installs flydsl, which only the cco Python examples need.
 ARG WITH_FLYDSL=0
 
@@ -16,34 +25,35 @@ RUN apt-get update && \
     openmpi-bin libopenmpi-dev \
     libpci-dev libdw1 locales \
     libgrpc-dev libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc \
+    libnuma-dev libdrm-dev \
     cmake && \
     rm -rf /var/lib/apt/lists/*
 
-# ── ROCm 7.14 dev toolchain (only when the base image lacks one) ──
+# ── apt ROCm dev toolchain (only when the base image lacks one) ──
 #
-# The rocm7.14 pytorch image has no /opt/rocm: ROCm comes from the pip
+# The rocm pytorch images have no /opt/rocm: ROCm comes from the pip
 # `rocm-sdk-core` wheel, which ships runtime .so files and headers but no CMake
 # package configs, so `project(... HIP)` cannot find hip-lang-config.cmake.
-# The apt ROCm 7.14 below installs under /opt/rocm/core-7.14 and registers
-# /opt/rocm/{bin,lib,include,...} via update-alternatives, the layout mori
-# expects.
+# The apt ROCm below installs under /opt/rocm/core-${ROCM_APT_VERSION} and
+# registers /opt/rocm/{bin,lib,include,...} via update-alternatives, the layout
+# mori expects.
 #
 # Older base images (the 7.2.4 ones the py3.10 nightly lane still uses) already
 # ship a full ROCm dev stack, and its apt repo is ubuntu2404-only anyway — so
 # probe for the same file mori's CMakeLists checks and skip if it is there.
 RUN set -ex; \
     if [ -e /opt/rocm/lib/cmake/hip-lang/hip-lang-config.cmake ]; then \
-      echo "ROCm dev stack already present at /opt/rocm — skipping apt ROCm 7.14"; \
+      echo "ROCm dev stack already present at /opt/rocm — skipping apt ROCm ${ROCM_APT_VERSION}"; \
     else \
       apt-get update; \
       apt-get install -y --no-install-recommends wget gnupg ca-certificates; \
       mkdir -p --mode=0755 /etc/apt/keyrings; \
-      wget -qO - https://repo.amd.com/rocm/packages-multi-arch/gpg/rocm.gpg \
+      wget -qO - "${ROCM_APT_GPG}" \
         | gpg --dearmor > /etc/apt/keyrings/amdrocm.gpg; \
-      echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://repo.amd.com/rocm/packages-multi-arch/ubuntu2404 stable main" \
+      echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] ${ROCM_APT_LIST}" \
         > /etc/apt/sources.list.d/amdrocm.list; \
       apt-get update; \
-      for arch in ${GPU_ARCHS}; do pkgs="${pkgs} amdrocm-core-dev7.14-${arch}"; done; \
+      for arch in ${GPU_ARCHS}; do pkgs="${pkgs} amdrocm-core-dev${ROCM_APT_VERSION}-${arch}"; done; \
       apt-get install -y --no-install-recommends ${pkgs}; \
       rm -rf /var/lib/apt/lists/*; \
     fi
