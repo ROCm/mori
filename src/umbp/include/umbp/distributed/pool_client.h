@@ -660,14 +660,13 @@ class PoolClient {
       char* base_ = nullptr;
     };
 
-    // Blocks until a shard is free.  Returns an empty lease if Reset was never
-    // called with a usable buffer, which the caller already rejects upstream.
+    // Blocks until a shard is free, and until no AcquireAll is queued.  Empty
+    // lease if Reset never got a usable buffer; the caller rejects that upstream.
     Lease Acquire();
 
-    // Blocks until EVERY shard is free and leases the whole buffer.  Sharding
-    // must not shrink what a call can serve: a span bigger than one shard was
-    // servable before and still has to be, so such a call takes the arena
-    // exclusively instead of failing.
+    // Blocks until EVERY shard is free, then leases the whole buffer.  Sharding
+    // must not shrink what a call can serve, so a call needing more than a shard
+    // takes the arena exclusively rather than failing.
     Lease AcquireAll();
 
    private:
@@ -675,6 +674,10 @@ class PoolClient {
 
     std::mutex mutex_;
     std::condition_variable cv_;
+    // Queued AcquireAll callers.  Acquire() defers to them, otherwise a steady
+    // stream of single-shard calls can hold at least one shard forever and the
+    // exclusive waiter never runs -- a hang, with no timeout above it.
+    size_t all_waiting_ = 0;
     std::vector<char*> bases_;
     // Not vector<bool>: this is written under the mutex and read by index, and
     // the proxy-reference specialisation buys nothing at these sizes.

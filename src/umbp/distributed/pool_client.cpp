@@ -218,39 +218,28 @@ struct RangedPhases {
   double xfer_wait = 0.0;
   double lock = 0.0;
   double remote = 0.0;
-  // remote split four ways.  Once the arena stopped serializing, `remote` was
-  // ~88% of a cross-node call with nothing inside it to point at: the resolve
-  // RPC, the RDMA itself, and the arena->GPU scatter are three different fixes.
+  // remote, split: the resolve RPC, the RDMA, and the arena->GPU scatter are
+  // three different fixes and were one undifferentiated ~88%.
   double rmt_resolve = 0.0;  // BatchResolveKeys round trip to the owning peer
   double rmt_build = 0.0;    // describing the transfer + planning it + posting it
-  // ...and rmt_build split, once it became the largest item: describing the
-  // spans, bucketing them into plans, and posting the RDMA are three costs.
+  // ...and rmt_build: describing spans, bucketing them, posting the RDMA.
   double rmt_bld_items = 0.0;
   double rmt_bld_plan = 0.0;
   double rmt_bld_post = 0.0;
   double rmt_wait = 0.0;  // the RDMA read itself
-  // Peer bookkeeping before any RPC: GetOrConnectPeer takes peers_mutex_ and
-  // EnsurePeerServiceConnection takes the per-peer conn_mutex, both on EVERY
-  // remote submit.  Two process-wide locks on the hot path is the shape the
-  // scratch arena had (Sec 12.42), so it gets its own timer rather than
-  // sitting in the unaccounted remainder.
+  // Peer bookkeeping before any RPC: two locks taken on every remote submit.
   double rmt_peer = 0.0;
-  // Turning the resolve reply into per-key page vectors.  It is neither the
-  // RPC (`rslv`) nor the transfer build (`bld`), it scales with TOTAL PAGES
-  // rather than keys, and it was the largest thing still sitting in the
-  // unaccounted remainder.
+  // Resolve reply -> per-key page vectors.  Scales with total pages, not keys.
   double rmt_decode = 0.0;
-  // The three things left inside `remote` that nothing timed.  Together they
-  // were ~20% of a cross-node call and invisible.
+  // The rest of `remote`, ~20% of a cross-node call and previously untimed.
   double rmt_sub = 0.0;          // per-group sub_* vectors + PartitionBatchGetRangeTargets
   double rmt_items_build = 0.0;  // BuildContiguousToRangesItems for the scatter
   double rmt_final = 0.0;        // ApplyTransferFailures + FinalizeRemoteGetEntries
   double rmt_medium = 0.0;       // ServeWholeObjectUnitsFromMedium
   double rmt_install = 0.0;      // install-from-arena / background prefetch
   double rmt_scatter = 0.0;      // arena -> caller buffers
-  // ...and the scatter split the same three ways as `xfer`, because the device
-  // gather kernel's own timer says it moves those bytes in an eighth of what
-  // the phase costs -- so most of it is not the copy.
+  // ...and the scatter the same three ways: the gather kernel's own timer says
+  // the copy is an eighth of the phase.
   double scat_plan = 0.0;
   double scat_submit = 0.0;
   double scat_wait = 0.0;
@@ -263,12 +252,9 @@ struct RangedPhases {
   // coalesce shows up here long before it shows up as a percentage.
   size_t rmt_items = 0;  // TransferItems handed to the RDMA planner
   size_t rmt_plans = 0;  // plans it produced -- items/plans is the fan-in
-  // Of those plans, how many the engine staged through its bounce pool.  A
-  // staged plan is run INLINE and under a global mutex inside Submit, so even
-  // one of them turns a non-blocking post into a blocking round trip that
-  // every other shard then queues behind.  Counted because `po` costs 46% on
-  // the model and 7% on the probe, and this is the difference that would
-  // explain it.
+  // Plans the engine staged through its bounce pool.  A staged plan runs inline
+  // under a global mutex in Submit, turning a non-blocking post into a blocking
+  // round trip everything else queues behind.
   size_t rmt_bounce = 0;
   size_t scat_items = 0;  // no plan count: getting one costs a second Plan()
                           // pass, inside the very phase being measured
@@ -309,11 +295,9 @@ class PhaseTimer {
   std::chrono::steady_clock::time_point start_;
 };
 
-// Sinks for the three legs that live inside the remote phase.  They are taken
-// in SubmitRemoteBatchGet / WaitRemoteBatchGet, three calls below the ranged
-// entry point and shared with the non-ranged path, so publishing them here
-// beats threading a debug pointer through five signatures no other caller
-// wants.  Null whenever the ranged debug is off, which is the normal case.
+// Sinks for the legs inside the remote phase.  Published here rather than
+// threaded through five signatures no other caller wants; null when the ranged
+// debug is off.
 struct RemoteLegSinks {
   size_t* items = nullptr;
   size_t* plans = nullptr;
@@ -1837,14 +1821,9 @@ bool PoolClient::BuildContiguousToRangesItems(const TransferRef& src, uint64_t s
                                               const std::vector<ObjectRange>& ranges, size_t tag,
                                               std::vector<TransferItem>* items) {
   const size_t before = items->size();
-  // ONE shared lock for the whole range list, not one per range -- the same
-  // thing BuildLocalRangeTransfers says about itself.  Describing each range
-  // by its REGION base is what keeps the plan count down (a plan is one
-  // (src base, dst base) pair, so self-described ranges make thousands of
-  // single-segment plans), but doing that lookup through UserBufferRef meant
-  // re-taking registered_mem_mutex_ for every one of ~7k ranges a call, on a
-  // path eight TP ranks walk at once.  Hoisting the lock keeps the plan
-  // collapse and drops the lock traffic to one acquisition.
+  // ONE shared lock for the whole list, as BuildLocalRangeTransfers says of
+  // itself.  Going through UserBufferRef per range re-took
+  // registered_mem_mutex_ ~7k times a call, on a path every rank walks at once.
   std::shared_lock<std::shared_mutex> reg_lock(registered_mem_mutex_);
   for (const auto& range : ranges) {
     // All-or-nothing per object: a partially appended object would be
@@ -3244,6 +3223,8 @@ PoolClient::ScratchArena::Lease PoolClient::ScratchArena::Acquire() {
   if (bases_.empty()) return Lease{};
   size_t index = bases_.size();
   cv_.wait(lock, [&] {
+    // Defer to a queued AcquireAll, or it never sees every shard free.
+    if (all_waiting_ != 0) return false;
     for (size_t i = 0; i < busy_.size(); ++i) {
       if (busy_[i] == 0) {
         index = i;
@@ -3259,13 +3240,14 @@ PoolClient::ScratchArena::Lease PoolClient::ScratchArena::Acquire() {
 PoolClient::ScratchArena::Lease PoolClient::ScratchArena::AcquireAll() {
   std::unique_lock<std::mutex> lock(mutex_);
   if (bases_.empty()) return Lease{};
-  // No fairness against Acquire(): an all-shard waiter can be starved by a
-  // steady stream of single-shard ones.  Acceptable because it is the rare path
-  // — a span wider than a shard — and the alternative (a queue) would make the
-  // common path pay for it.
+  // Write-preferring: announce first, so Acquire() stops handing out shards and
+  // the in-flight ones can drain.  Exclusive calls are rare and always finish,
+  // so the shard side cannot starve in turn.
+  ++all_waiting_;
   cv_.wait(lock, [&] {
     return std::all_of(busy_.begin(), busy_.end(), [](uint8_t b) { return b == 0; });
   });
+  --all_waiting_;
   std::fill(busy_.begin(), busy_.end(), 1);
   return Lease{this, 0, busy_.size(), bases_[0]};
 }
@@ -3277,9 +3259,7 @@ void PoolClient::ScratchArena::Release(size_t index, size_t count) {
     const size_t end = std::min(busy_.size(), index + count);
     for (size_t i = index; i < end; ++i) busy_[i] = 0;
   }
-  // notify_all, not notify_one: an all-shard waiter needs to re-check even when
-  // a single-shard waiter is also queued, and waking one of them may wake the
-  // wrong one.
+  // notify_all: waking one waiter may wake the wrong kind.
   cv_.notify_all();
 }
 
@@ -3546,28 +3526,34 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
     return results;
   }
   // Sharding must not change WHAT a call can do, only how many calls overlap.
-  // Two things a smaller arena would break, so both fall back to the whole
-  // arena taken exclusively:
+  // A shard-sized arena breaks two things, so either sends the call down the
+  // exclusive whole-arena path:
   //   * a span wider than a shard is unservable, though it was servable before;
   //   * a key whose spans total more than a shard gets SPLIT across units, and a
-  //     split unit is never holds_whole_object -- which silently costs it the
+  //     split unit is never holds_whole_object -- silently losing the
   //     whole-object medium bypass and the locality install.
-  // Both are bounded by the full arena, so a key too big for that splits either
-  // way and gains nothing from exclusivity.
+  //
+  // Asked PER KEY and OR'd, never as a batch-wide maximum.  A key too big for
+  // even the full arena is no better off exclusive, so it must not answer for
+  // the others: taking the max let one such key veto exclusivity for a
+  // batch-mate that needed it and would have fitted.
   const size_t shard_bytes = ranged_get_scratch_.ShardBytes();
   const size_t full_bytes = config_.ranged_get_scratch_size;
-  size_t widest_span = 0;
-  size_t widest_key_total = 0;
+  bool exclusive_arena = false;
   for (size_t index : missed) {
     size_t key_total = 0;
+    size_t widest_span = 0;
     for (size_t span_bytes : sizes[index]) {
       widest_span = std::max(widest_span, span_bytes);
       key_total += span_bytes;
     }
-    widest_key_total = std::max(widest_key_total, key_total);
+    const bool span_needs_full = widest_span > shard_bytes && widest_span <= full_bytes;
+    const bool total_needs_full = key_total > shard_bytes && key_total <= full_bytes;
+    if (span_needs_full || total_needs_full) {
+      exclusive_arena = true;
+      break;
+    }
   }
-  const bool exclusive_arena = widest_span > shard_bytes ||
-                               (widest_key_total > shard_bytes && widest_key_total <= full_bytes);
   const size_t scratch_size = exclusive_arena ? full_bytes : shard_bytes;
 
   // Routing is a master RPC that never touches the arena, so it runs before a
@@ -3696,13 +3682,9 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
         exclusive_arena ? ranged_get_scratch_.AcquireAll() : ranged_get_scratch_.Acquire();
   }
   char* const scratch_base = scratch_lease.base();
-  // The arena described ONCE, by its registered base.  The scatter below keys
-  // its plans on (src base, dst base), so giving each unit its own slice ref
-  // made every unit x destination-region pair a separate plan -- ~8k plans of
-  // one segment each for a layer-wise load, all sorted, bucketed and submitted
-  // individually.  Anchored to the arena base instead, the src half is constant
-  // and the plan count collapses to the number of distinct caller buffers.
-  // Same argument as BuildLocalRangeTransfers makes for the destination half.
+  // The arena described ONCE, by its registered base.  Plans key on (src base,
+  // dst base), so a per-unit slice ref made every unit x destination pair its
+  // own single-segment plan (~8k of them for a layer-wise load).
   const auto [arena_ref, arena_base] = UserBufferRef(scratch_base, scratch_size);
 
   // Pack as many units into the arena as fit, fetch that group, then repeat.
@@ -3712,9 +3694,8 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   PhaseTimer remote_timer(dbg ? &dbg->remote : nullptr);
   RemoteLegSinks leg;
   if (dbg != nullptr) {
-    // Designated, not positional.  A positional list that falls one element
-    // short leaves the TAIL null and every timer past that point silently
-    // reads 0.0% -- which looks exactly like "that phase is free".
+    // Designated, not positional: a short positional list leaves the tail null
+    // and those timers silently read 0.0%, which looks like "phase is free".
     leg = {.items = &dbg->rmt_items,
            .plans = &dbg->rmt_plans,
            .bounce = &dbg->rmt_bounce,
@@ -3786,9 +3767,8 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
     PhaseTimer items_build_timer(dbg ? &dbg->rmt_items_build : nullptr);
     std::vector<TransferItem> scatter_items;
     std::vector<size_t> scatter_tag_to_j;
-    // By RANGES, not by units.  A unit carries every caller range it packed --
-    // ~14 of them here -- so reserving `count` left the vector to grow itself
-    // from 500 to 7000 while copying TransferItems (two TransferRefs apiece).
+    // By RANGES, not units: a unit carries every range it packed, so reserving
+    // `count` left a ~7k-element vector to grow itself from ~500.
     size_t scatter_range_total = 0;
     for (size_t j = 0; j < count; ++j) scatter_range_total += units[pos + j].packed.size();
     scatter_items.reserve(scatter_range_total);
@@ -3987,15 +3967,22 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
     MORI_UMBP_ERROR("[PoolClient] BatchPutRanges: ranged scratch is absent or not registered");
     return results;
   }
-  // A put stages the WHOLE object and never splits one, so the widest object is
-  // the only thing a shard can make unservable; same whole-arena fallback as the
-  // get path, and the same "too big for the full arena gains nothing" bound.
-  size_t widest_object = 0;
-  for (size_t r : remote) widest_object = std::max(widest_object, object_sizes[valid[r]]);
-  const bool exclusive_arena = widest_object > ranged_put_scratch_.ShardBytes() &&
-                               widest_object <= config_.ranged_put_scratch_size;
-  const size_t scratch_size =
-      exclusive_arena ? config_.ranged_put_scratch_size : ranged_put_scratch_.ShardBytes();
+  // A put stages the WHOLE object and never splits one, so object size is the
+  // only thing a shard can make unservable.  Per key and OR'd, for the reason
+  // the get path spells out: a batch-wide max lets an object too big for the
+  // whole arena veto exclusivity for one that needed it, and that one then gets
+  // rejected at shard size though it was servable before sharding existed.
+  const size_t put_shard_bytes = ranged_put_scratch_.ShardBytes();
+  const size_t put_full_bytes = config_.ranged_put_scratch_size;
+  bool exclusive_arena = false;
+  for (size_t r : remote) {
+    const size_t object_size = object_sizes[valid[r]];
+    if (object_size > put_shard_bytes && object_size <= put_full_bytes) {
+      exclusive_arena = true;
+      break;
+    }
+  }
+  const size_t scratch_size = exclusive_arena ? put_full_bytes : put_shard_bytes;
   ScratchArena::Lease scratch_lease;
   {
     PhaseTimer lock_timer(dbg ? &dbg->lock : nullptr);
@@ -4401,8 +4388,7 @@ std::unique_ptr<PoolClient::RemoteGetInFlight> PoolClient::SubmitRemoteBatchGet(
     return nullptr;
   }
 
-  // Build + filter + plan + post: everything between the resolve reply and the
-  // RDMA being in flight, which is CPU this thread spends before any wire time.
+  // Everything between the resolve reply and the RDMA being in flight.
   PhaseTimer build_timer(t_remote_leg ? t_remote_leg->build : nullptr);
   PhaseTimer items_timer(t_remote_leg ? t_remote_leg->build_items : nullptr);
   std::vector<TransferItem> transfer_items;
