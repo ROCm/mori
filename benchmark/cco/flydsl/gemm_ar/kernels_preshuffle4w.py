@@ -82,15 +82,28 @@ guessing:
 Result: 248 VGPR, no spill, 16 ``buffer_store_dwordx2``, one FMA per element.
 And 387.4us against the unswapped path's 387.5 -- **exactly parity**.
 
-So none of it was the bottleneck: not the promote arithmetic (three ops per
-element down to one), not the spill, not the store width. The +85us the block
-scale costs over this kernel's own 303.1us skeleton survives all three, while
-CK pays ~0 for the same work with the same ``v_mfma_f32_16x16x128_f8f6f4`` and
-the same 2 waves/SIMD. Our VALU/MFMA is already *under* CK's, 4.47 against
-5.81, so what is left is that CK's VALU hides behind its MFMAs and ours does
-not -- scheduling, which for CK is Intrawave plus explicit sched_group_barrier
-placement. That is the next thing to look at, and it is not something the
-instruction mix shows.
+So none of it was the bottleneck. Nor, it turns out, is the block scale:
+replacing the promote's FMA with a plain add measures 387.4us against 385.4
+with it, and feeding constant scales instead of loading them measures 396.8
+against 395.6. **The scale is free in this kernel.** An earlier 303.1us
+reading, taken the same way before the swap work, does not reproduce and should
+not be relied on.
+
+Which moves the question: the gap to CK is the GEMM, not the quantisation. The
+scheduling hypothesis this was chasing is dead too. FlyDSL's ``sched_*``
+helpers cover MFMA/DS/VMEM but not VALU, so nothing pins the promote -- but
+adding VALU groups by hand (``sched_group_barrier(0x002, n, 0)``, LLVM's VALU
+mask) is worth 0-2us at any group size from 2 to 8. So is batching more MFMAs
+before promoting them: 1, 2, 4, 8 and 16 tiles all land within 4us of each
+other. Hoisting the scale addresses' loop invariants out is actively worse, 409
+against 387, because the twelve live values cost more than the signed
+divide-by-128 expansion they remove.
+
+The one thing the ISA does show, and which nothing above changed, is shape:
+CK's loop body interleaves MFMA and VALU evenly -- median 4 VALU between MFMAs,
+2 of 31 gaps empty -- where ours alternates MFMA clusters with 40-80
+instruction VALU stretches, 8 of 31 gaps empty. Whatever produces that sits
+upstream of the group barriers.
 
 Two structural notes that came out of the port. B never touches LDS here --
 ``thr_g2r_B``/``frag_B_stages`` load it global->VGPR double-buffered, as CK's
