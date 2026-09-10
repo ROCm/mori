@@ -318,13 +318,14 @@ def run(args) -> int:
                 in_dtype="fp8",
                 out_dtype="bf16",
                 quant=args.quant,
+                swap_ab=args.p4w_swap_ab,
                 waves_per_eu=args.waves_per_eu,
                 xcd_swizzle=args.xcd_swizzle,
             )
             semaphore = torch.zeros(1, device="cuda", dtype=torch.int32)
             bias_unused = torch.zeros(1, device="cuda", dtype=torch.bfloat16)
 
-        gemm = compile_fused_gemm_scatter(
+        gemm = None if args.gemm_impl == "preshuffle4w" else compile_fused_gemm_scatter(
             cfg,
             rank,
             K=args.k,
@@ -664,6 +665,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tile-m", type=int, default=64, help="preshuffle4w only")
     p.add_argument("--tile-n", type=int, default=256, help="preshuffle4w only")
     p.add_argument("--tile-k", type=int, default=128, help="preshuffle4w only")
+    p.add_argument(
+        "--p4w-swap-ab",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="preshuffle4w: exchange the MFMA operands so a lane owns four "
+        "consecutive N instead of four M. Off by default -- it does what it "
+        "should to the instructions and still loses; see kernels_preshuffle4w.",
+    )
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=51)
     p.add_argument("--eager", action="store_true")

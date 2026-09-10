@@ -47,6 +47,27 @@ different A scales. CK's four values must instead be four *columns* of one row,
 which is what ``kernels_fused``'s ``--swap-ab`` arranges. Closing the last 28%
 means adopting that output layout, not more arithmetic.
 
+``swap_ab`` exchanges the MFMA operands so a lane owns four consecutive N of
+one row instead of four M. It does exactly what it is supposed to on both
+counts CK benefits from -- A's scale collapses to one scalar per tile, so the
+promote is a single FMA like ``c_scale_thread``, and the C store goes from 64
+``buffer_store_short`` to 16 ``buffer_store_dwordx2``:
+
+============================  =========  ==========  ============
+                              VALU/MFMA   C stores    total (us)
+============================  =========  ==========  ============
+off                                5.53   64 short          385.9
+on                                 4.47   16 dwordx2        506.9
+============================  =========  ==========  ============
+
+and it is 31% slower anyway, because at VGPR 248 -> 256 the main loop starts
+spilling: `scratch_load_dwordx2` x3 and `scratch_store_dwordx2` x2 appear
+inside it. Confirmed to be the loop and not the epilogue by quadrupling K --
+the gap widens with it (1.30x at K=2048, 1.47x at K=8192). Moving the store
+registers out of kernel scope does not recover it, so the pressure is
+elsewhere. Left in behind ``swap_ab=False``: the instruction-level result is
+right and reusable, and what blocks it is a register budget, not the idea.
+
 Two structural notes that came out of the port. B never touches LDS here --
 ``thr_g2r_B``/``frag_B_stages`` load it global->VGPR double-buffered, as CK's
 ``blockscale_b_preshuffle_v1`` does with ``b_thread_bufs`` -- and B is already
@@ -192,6 +213,7 @@ def compile_preshuffle_gemm(
     in_dtype: str = "fp8",
     out_dtype: str = "bf16",
     quant: str = "ptpc",  # "ptpc" (upstream) or "blockscale" (A 1x128, B 128x128)
+    swap_ab: bool = False,  # blockscale only; see the module docstring
     epilogue: str = "none",  # "none", "bias", "bias_relu", "bias_silu", "bias_gelu"
     waves_per_eu: int | None = None,
     enable_scheduler: bool = True,
@@ -232,6 +254,7 @@ def compile_preshuffle_gemm(
     if quant not in ("ptpc", "blockscale"):
         raise ValueError(f"quant must be ptpc or blockscale, got {quant!r}")
     is_blockscale = quant == "blockscale"
+    swap_ab = swap_ab and is_blockscale
     if is_blockscale:
         # tile_k == 128 makes one main-loop tile exactly one K-scale block, so
         # the rescale lands on a loop boundary that already exists.
@@ -632,18 +655,45 @@ def compile_preshuffle_gemm(
             gSB = fx.rocdl.make_buffer_tensor(arg_scale_b)
             sa_div = fx.logical_divide(gSA, fx.make_layout(1, 1))
             sb_div = fx.logical_divide(gSB, fx.make_layout(1, 1))
+            # C write-out for the swapped accumulator. The tiled_mma-derived
+            # path (thr_r2g_C / pC_g) partitions C for the *unswapped* layout,
+            # so it would scatter these four values down four rows. They are
+            # four consecutive columns of one row instead, which in a row-major
+            # C is 8 contiguous bytes -- one store, where the unswapped layout
+            # can only ever emit buffer_store_short.
+            gC_flat = fx.rocdl.make_buffer_tensor(
+                fx.Tensor(
+                    fx.make_view(
+                        fx.get_iter(c_tensor),
+                        fx.make_layout(PRESHUFFLE_M_MAX * N, 1),
+                    )
+                ),
+                max_size=False,
+                num_records_bytes=fx.Int64(i32_m)
+                * fx.Int64(N)
+                * fx.Int64(out_elem_bytes),
+            )
+            c_div = fx.logical_divide(gC_flat, fx.make_layout(1, 1))
+            c_atom_64 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), out_elem_cls)
             sc_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
             sc_atom_4 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
             sc_reg_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
+            sa_reg_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
             sc_reg_4 = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
 
         def _load_sa(mi, kb):
-            """This lane's four A-scale rows of M-tile ``mi`` at K-block ``kb``.
+            """This lane's A scale for M-tile ``mi`` at K-block ``kb``.
 
             ``arg_scale_a`` is physically [K/128, M] (column-major [M, K/128]),
-            the layout aiter_per1x128_quant(transpose_scale=True) emits, so the
-            four rows are contiguous and land in one vec4.
+            the layout aiter_per1x128_quant(transpose_scale=True) emits. With
+            the operands swapped a lane owns a single row -- ``lane % 16`` --
+            so this is one scalar, and combined with B's it gives the one
+            per-tile ``c_scale_thread`` CK promotes with.
             """
+            if const_expr(swap_ab):
+                idx = fx.Int32(kb) * fx.Int32(i32_m) + bx_m + mi * 16 + lane_mod_16
+                fx.copy(sc_atom_1, fx.slice(sa_div, (None, fx.Int32(idx))), sa_reg_1)
+                return Vec(fx.memref_load_vec(sa_reg_1))[0]
             idx = fx.Int32(kb) * fx.Int32(i32_m) + bx_m + mi * 16 + lane_div_16 * 4
             fx.copy(sc_atom_4, fx.slice(sa_div, (None, fx.Int32(idx))), sc_reg_4)
             return Vec(fx.memref_load_vec(sc_reg_4))
@@ -704,10 +754,21 @@ def compile_preshuffle_gemm(
                 for ni in range_constexpr(num_acc_n):
                     part = fx.make_rmem_tensor(4, fx.Float32)
                     part.store(Vec.filled(4, 0.0, fx.Float32))
-                    fx.gemm(mma_atom, part, a_op, b_ops[ni], part)
+                    # Operands exchanged: fx.gemm(atom, c, b, a, c) computes
+                    # (A B)^T in the accumulator's native layout, so a lane's
+                    # four values become four consecutive *columns* of one row
+                    # instead of four rows. gcnasm's mfma_adaptor_swap_ab.
+                    if const_expr(swap_ab):
+                        fx.gemm(mma_atom, part, b_ops[ni], a_op, part)
+                    else:
+                        fx.gemm(mma_atom, part, a_op, b_ops[ni], part)
                     parts.append(part)
                 for ni in range_constexpr(num_acc_n):
-                    sab = [sa[ii] * sb[ni] for ii in range_constexpr(4)]
+                    sab = (
+                        [sa * sb[ni]] * 4
+                        if const_expr(swap_ab)
+                        else [sa[ii] * sb[ni] for ii in range_constexpr(4)]
+                    )
                     pv = Vec(parts[ni].load())
                     # Explicit fma: written as ``acc + pv * (sa * sb)`` the
                     # compiler emits v_pk_mul_f32 + v_pk_add_f32, three ops per
@@ -940,7 +1001,34 @@ def compile_preshuffle_gemm(
             )
 
         # ── Epilogue ─────────────────────────────────────────────
-        if const_expr((not is_8bit or is_blockscale) and not _has_epilogue):
+        if const_expr(swap_ab):
+            # Allocated here, not at kernel scope: held across the main loop
+            # these push VGPRs over the 2-waves/SIMD line and the loop spills
+            # to scratch, which cost more than the wider store saved.
+            c_reg_4 = [
+                fx.make_rmem_tensor(fx.make_layout(4, 1), out_elem_cls)
+                for _ in range(m_repeat * num_acc_n)
+            ]
+            acc_vec = Vec(frag_C.load())
+            for mi in range_constexpr(m_repeat):
+                row = bx_m + mi * 16 + lane_mod_16
+                for ni in range_constexpr(num_acc_n):
+                    col = by_n + (ni * num_waves + wave_id) * 16 + lane_div_16 * 4
+                    creg = c_reg_4[mi * num_acc_n + ni]
+                    creg.store(
+                        vector.from_elements(
+                            T.vec(4, out_elem_cls.ir_type),
+                            [
+                                acc_vec[ni * (m_repeat * 4) + mi * 4 + ii].to(
+                                    out_elem_cls
+                                )
+                                for ii in range_constexpr(4)
+                            ],
+                        )
+                    )
+                    idx = fx.Int32(row) * fx.Int32(N) + fx.Int32(col)
+                    fx.copy(c_atom_64, creg, fx.slice(c_div, (None, idx)))
+        elif const_expr((not is_8bit or is_blockscale) and not _has_epilogue):
             frag_C_out.store(Vec(frag_C.load()).to(out_elem_cls))
         else:
             if const_expr(not overlap_epi_load):
@@ -991,7 +1079,8 @@ def compile_preshuffle_gemm(
             )
             frag_C_out.store(out_vec)
 
-        fx.copy(buf_copy_out, frag_C_retile, pC_g)
+        if const_expr(not swap_ab):
+            fx.copy(buf_copy_out, frag_C_retile, pC_g)
         if const_expr(split_k > 1):
             # The store carries sc0|sc1, so waiting on it is the whole release.
             rocdl.s_waitcnt(0)
