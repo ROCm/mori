@@ -72,7 +72,7 @@ GEMM is *not* competitive standalone: 370.5us against CK's 300.4 for its fastest
 blockscale instance (64x256, Intrawave v1) measured the same way. The gap is the
 per-K-block scale, not the GEMM -- unscaled we are 224.0us. See
 ``kernels_preshuffle4w.py``, which ports CK's 4-wave B-out-of-LDS shape and
-lands at 459.5us for exactly that reason.
+lands at 385.9us: aligned on the GEMM, still paying for the scale.
 
 Fusing over SDMA wins, and only because of ``--chunks``; see the table at its
 definition in ``run()``. It was pinned to 1 while the aiter GEMM's

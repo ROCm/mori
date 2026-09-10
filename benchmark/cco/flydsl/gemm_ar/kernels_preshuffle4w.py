@@ -18,46 +18,45 @@ block per CU. B is already preshuffled to ``N0 K0 KLane NLane KPack``, so every
 lane pulls its own MFMA operand with one 128-bit load and there is nothing for
 LDS to amortise.
 
-Measured at ``[16384, 7168] K=2048`` on MI355X, warm cache, and the outcome is
-not the one the shape predicts:
+Measured at ``[16384, 7168] K=2048`` on MI355X, warm cache, tile 64x256x128 --
+CK's own winning shape:
 
-=============================  =========  ===========  ==========
-kernel                          no scale   blockscale   scale cost
-=============================  =========  ===========  ==========
-8-wave 128x256 (kernels_fused)     224.0        370.5      +146.5
-this, 64x128x128                   327.7        459.5      +131.8
-this, 128x128x256                  284.8       2464.6     (spills)
-CK 64x256 Intrawave v1                --        300.4        ~0
-=============================  =========  ===========  ==========
+=============================  =======  ========
+stage                                us   vs CK
+=============================  =======  ========
+whole-fragment rescale (divide)  760.2    +153%
+per-tile promotion               459.5     +53%
+  + explicit fma, scale hoisted  391.7     +30%
+  + MFMAs batched per M-row      385.9     +28%
+this kernel, scale removed       303.1      +1%
+CK 64x256 Intrawave v1           300.4         .
+=============================  =======  ========
 
-Two things that table says. **The shape is not the problem and neither is
-B-in-LDS**: our unscaled 8-wave GEMM at 224.0 is already faster than CK's
-*scaled* kernel, and this one's best unscaled tile is 284.8. What costs us is
-applying the per-K-block scale.
+So the GEMM itself is aligned: strip the scale and this lands on CK. What is
+left is the scale, +82.6us against CK's ~0, and the loop body says why. Per
+128 accumulator elements:
 
-And **CK's structure is the right one, but it is not sufficient here**. The
-scale is applied a tile at a time, mirroring
-``static_ford<MRepeat, NRepeat, num_scale_k_block>`` with k innermost and the
-partial in ``c_thread_buf_per_scale`` -- one ``GetRegSizePerXdlops()`` buffer,
-4 VGPRs. That is worth 36%: the whole-fragment alternatives cost far more, a
-running rescale +204.7us (a divide per element per K-block, of which 88us came
-back with ``v_rcp_f32``) and a whole-fragment promotion 2753us, the same
-duplicate-accumulator spill the 8-wave kernel hit at 4052us. But 131.8us
-remains against CK's ~0.
+    CK             128 v_fmac_f32,  8 v_mul_f32      -> VALU/MFMA 5.81
+    this           128 v_(pk_)fma, 128 v_(pk_)mul    -> VALU/MFMA 5.53
 
-What is left is not algorithm. Per k-step this adds ~150 VALU ops -- zeroing 8
-partials, 6 operand materialisations, 64 promote FMAs -- against ~256 cycles of
-MFMA, and on CDNA that VALU co-issues with the matrix pipe only if there are
-waves to hide it behind. Register pressure here allows very few: the same
-promotion at 128x128x256, whose unscaled form is the fastest tile measured,
-spills outright. So the next lever is occupancy, not the scale loop.
+Our instruction *count* is already under CK's; the shape is not. CK needs one
+FMA per element because ``c_scale_thread`` is a single scalar for a whole MFMA
+tile, where we need a multiply per element first: A's scale is per row
+(ScaleBlockM=1) and an MFMA 16x16 lane holds four different rows, so four
+different A scales. CK's four values must instead be four *columns* of one row,
+which is what ``kernels_fused``'s ``--swap-ab`` arranges. Closing the last 28%
+means adopting that output layout, not more arithmetic.
 
-The operand materialisation is an artefact of this kernel, not of CK's method:
-``fx.gemm`` on the bare atom rejects a sliced fragment view (it leaves a
-``ub.poison`` the rmem-to-SSA promotion pass then fails on), so A and B have to
-be copied into rmem tensors first. ``kernels_fused``'s ``Mfma16x16x128`` already
-materialises per tile for its own reasons, so porting this promotion there
-would not pay that cost -- and it starts from a 224.0us skeleton.
+Two structural notes that came out of the port. B never touches LDS here --
+``thr_g2r_B``/``frag_B_stages`` load it global->VGPR double-buffered, as CK's
+``blockscale_b_preshuffle_v1`` does with ``b_thread_bufs`` -- and B is already
+preshuffled to ``N0 K0 KLane NLane KPack``, the same layout CK's
+``preShuffleBuffer`` emits, so every lane pulls its own MFMA operand with one
+128-bit load. And driving MFMAs per accumulator tile beats one ``fx.gemm`` over
+the whole fragment even before any scaling: 303.1us against 556.0 at this tile.
+
+For scale, the 8-wave kernel in ``kernels_fused`` is 224.0us unscaled and 370.5
+scaled at its own best tile.
 """
 
 import functools
@@ -695,17 +694,30 @@ def compile_preshuffle_gemm(
                 sa = _load_sa(mi, kb)
                 a_op = fx.make_rmem_tensor(8, fx.Int32)
                 a_op.store(Vec(frag_A[None, mi, ki].load()).bitcast(fx.Int32))
+                # All of this M-row's MFMAs are issued before any of their
+                # results is read. With tile_k=128 a scale block is a single
+                # MFMA, so promoting each one where it is issued exposes the
+                # full MFMA latency; CK hides it by keeping k innermost, which
+                # is not available here. num_acc_n partials cost 4*num_acc_n
+                # VGPRs.
+                parts = []
                 for ni in range_constexpr(num_acc_n):
-                    b_op = b_ops[ni]
                     part = fx.make_rmem_tensor(4, fx.Float32)
                     part.store(Vec.filled(4, 0.0, fx.Float32))
-                    fx.gemm(mma_atom, part, a_op, b_op, part)
-                    pv = Vec(part.load())
+                    fx.gemm(mma_atom, part, a_op, b_ops[ni], part)
+                    parts.append(part)
+                for ni in range_constexpr(num_acc_n):
+                    sab = [sa[ii] * sb[ni] for ii in range_constexpr(4)]
+                    pv = Vec(parts[ni].load())
+                    # Explicit fma: written as ``acc + pv * (sa * sb)`` the
+                    # compiler emits v_pk_mul_f32 + v_pk_add_f32, three ops per
+                    # element against CK's one v_fmac_f32. Hoisting the scale
+                    # product and contracting the rest gets it to two.
                     for ii in range_constexpr(4):
                         # frag_C.load() yields logical order: ii fastest, then
                         # m_repeat, then num_acc_n.
                         idx = ni * (m_repeat * 4) + mi * 4 + ii
-                        vals[idx] = vals[idx] + pv[ii] * (sa[ii] * sb[ni])
+                        vals[idx] = fx.math.fma(pv[ii], sab[ii], vals[idx])
             frag_C.store(vector.from_elements(T.vec(acc_size, T.f32), vals))
 
         # ── Pipeline stage (double-buffered B via split fragments) ─
