@@ -155,6 +155,23 @@ CK's profile is the mirror image: it spends its time in LDS (15.5% at 75%
 stalled, against our 3.3%) and in s_nop (9.9%), i.e. in the A pipeline and in
 deliberately filled hazard slots, not waiting on arithmetic.
 
+The C store outlier resolves, and it is a caution about reading these shares.
+It is 64 ``buffer_store_short`` at 36504 cycles against CK's 8
+``buffer_store_dwordx4`` at 5064 -- the same 128 bytes a lane, eight times the
+instructions, seven times the latency. CK earns the wide store with the
+CShuffle its kernel name advertises: the accumulator goes through LDS to be
+reassembled into eight contiguous elements a lane
+(``CShuffleBlockTransferScalarPerVector = 8``), where we store straight out of
+registers at the MFMA's native four-element granularity. ``swap_ab`` already
+cuts ours to 16 ``buffer_store_dwordx2`` -- and buys nothing, 387.4us against
+387.5. **A 5.5% share of attributed latency is not 5.5% of the clock**: the
+epilogue runs once per block, and with two waves a SIMD the other wave's MFMAs
+cover it. The same caveat applies to the VALU number above.
+
+So the trace has retired the store as well, and what it leaves is the
+MFMA-to-VALU dependency -- our MFMAs 70% stalled against CK's 55%, feeding a
+VALU that is 46% stalled against 31%.
+
 
 Two structural notes that came out of the port. B never touches LDS here --
 ``thr_g2r_B``/``frag_B_stages`` load it global->VGPR double-buffered, as CK's
