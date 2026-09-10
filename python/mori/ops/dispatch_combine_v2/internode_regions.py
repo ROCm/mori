@@ -67,64 +67,85 @@ def internode_regions(cfg):
     num_experts_per_rank, num_experts_per_token, max_token_type_size, scale_dim,
     scale_type_size, num_qp_per_pe, max_total_recv_tokens.
     """
-    ws = cfg.world_size
-    gpn = cfg.gpu_per_node
-    if gpn <= 0 or ws % gpn:
-        raise ValueError(f"world_size {ws} must be a multiple of gpu_per_node {gpn}")
-    n_nodes = ws // gpn
+    # Local names are the snake_case of the EpInterNodeDeviceCfg helper each one
+    # transcribes (ep_internode_args.hpp), so the two can be read side by side.
+    world_size = cfg.world_size
+    gpu_per_node = cfg.gpu_per_node
+    if gpu_per_node <= 0 or world_size % gpu_per_node:
+        raise ValueError(
+            f"world_size {world_size} must be a multiple of "
+            f"gpu_per_node {gpu_per_node}"
+        )
+    n_nodes = world_size // gpu_per_node
 
-    m = cfg.max_num_inp_token_per_rank  # MaxNumTokensToSendPerRank
+    max_tokens_to_send_per_rank = cfg.max_num_inp_token_per_rank
     topk = cfg.num_experts_per_token
-    tsz = cfg.max_token_type_size
-    hidden = cfg.hidden_dim
+    max_token_type_size = cfg.max_token_type_size
+    hidden_dim = cfg.hidden_dim
 
     # MaxNumTokensToRecvPerRank clamps by max_total_recv_tokens when set.
     if cfg.max_total_recv_tokens > 0:
-        per_rank = min((cfg.max_total_recv_tokens + ws - 1) // ws, m)
+        max_tokens_to_recv_per_rank = min(
+            (cfg.max_total_recv_tokens + world_size - 1) // world_size,
+            max_tokens_to_send_per_rank,
+        )
     else:
-        per_rank = m
-    recv = ws * per_rank  # MaxNumTokensToRecv
+        max_tokens_to_recv_per_rank = max_tokens_to_send_per_rank
+    max_tokens_to_recv = world_size * max_tokens_to_recv_per_rank
 
     # XferBytesPerToken(maxTokenTypeSize): hidden + index + weight + srcTokenId + scale.
     scale_bytes = cfg.scale_dim * cfg.scale_type_size
-    xfer = hidden * tsz + topk * _I32 + topk * _F32 + _I32 + scale_bytes
+    xfer_bytes = (
+        hidden_dim * max_token_type_size
+        + topk * _I32
+        + topk * _F32
+        + _I32
+        + scale_bytes
+    )
 
     # maxNumOutToken, the stride of the order maps.
-    max_out_token = ws * m * cfg.num_experts_per_rank
-    barrier_bytes = ws * _I32
+    max_out_token = world_size * max_tokens_to_send_per_rank * cfg.num_experts_per_rank
+    barrier_bytes = world_size * _I32
 
     regions = [
         # --- ShmemBufsInterNodeV1, in InitializeShmemBuf's order --------------
-        ("inter_dispatch_inp", n_nodes * m * xfer),
-        ("inter_combine_inp", recv * xfer),  # v1's maxStagingSize
-        ("inter_staging", 2 * n_nodes * m * xfer),
-        ("inter_dispatch_out", recv * hidden * tsz),
-        ("inter_combine_out", m * hidden * tsz),
-        ("inter_dispatch_staging", m * xfer),
+        ("inter_dispatch_inp", n_nodes * max_tokens_to_send_per_rank * xfer_bytes),
+        ("inter_combine_inp", max_tokens_to_recv * xfer_bytes),  # v1's maxStagingSize
+        ("inter_staging", 2 * n_nodes * max_tokens_to_send_per_rank * xfer_bytes),
+        (
+            "inter_dispatch_out",
+            max_tokens_to_recv * hidden_dim * max_token_type_size,
+        ),
+        (
+            "inter_combine_out",
+            max_tokens_to_send_per_rank * hidden_dim * max_token_type_size,
+        ),
+        ("inter_dispatch_staging", max_tokens_to_send_per_rank * xfer_bytes),
         # --- weights ---------------------------------------------------------
-        ("inp_weights", recv * topk * _F32),
-        ("dispatch_out_weights", recv * topk * _F32),
-        # Sized by m, not recv: EpCombineAll indexes this by the LOCAL token id,
-        # the same index that sizes inter_combine_out. recv < m once
-        # max_total_recv_tokens clamps.
-        ("combine_out_weights", m * topk * _F32),
+        ("inp_weights", max_tokens_to_recv * topk * _F32),
+        ("dispatch_out_weights", max_tokens_to_recv * topk * _F32),
+        # Sized by the SEND count, not the recv one: EpCombineAll indexes this by
+        # the LOCAL token id, the same index that sizes inter_combine_out.
+        # max_tokens_to_recv drops below the send count once max_total_recv_tokens
+        # clamps.
+        ("combine_out_weights", max_tokens_to_send_per_rank * topk * _F32),
         # --- indices ---------------------------------------------------------
-        ("out_indices", recv * topk * _I32),
+        ("out_indices", max_tokens_to_recv * topk * _I32),
         # --- token-count signals ---------------------------------------------
-        ("recv_token_num", ws * _I32 * 2 * cfg.num_qp_per_pe),
+        ("recv_token_num", world_size * _I32 * 2 * cfg.num_qp_per_pe),
         ("node_recv_token_num", n_nodes * _U64),
         # --- order maps ------------------------------------------------------
         ("disp_tok_offset", _I32),
         ("disp_tok_id_to_src_tok_id", max_out_token * _I32),
         # --- barriers and flags ----------------------------------------------
         ("cross_device_barrier", barrier_bytes * 2 * _U64),
-        ("inter_node_chunk_flag", n_nodes * m * _U64),
+        ("inter_node_chunk_flag", n_nodes * max_tokens_to_send_per_rank * _U64),
     ]
 
     # Scales are absent, not zero-sized, when the transport is off: the kernel
     # gates on the region being unbound exactly as v1 gated on an invalid
     # SymmMemObjPtr.
     if scale_bytes:
-        regions.append(("out_scales", recv * scale_bytes))
+        regions.append(("out_scales", max_tokens_to_recv * scale_bytes))
 
     return regions

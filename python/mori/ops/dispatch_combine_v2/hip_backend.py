@@ -96,7 +96,7 @@ _SCALE_ALIGN = 128
 _FP8_TUNING_DTYPES = (torch.float8_e4m3fnuz, torch.float8_e4m3fn)
 
 
-def _geom_env(name):
+def _geometry_from_env(name):
     """``"block,rdma,warp"`` from the environment, or None.
 
     Sweep-only. Read at build time (see _internode_geometry_buckets): the
@@ -112,8 +112,8 @@ def _geom_env(name):
     return parts
 
 
-def _raw_stream(dev_index: int) -> int:
-    """The current stream on `dev_index`, as a raw pointer.
+def _raw_stream(device_index: int) -> int:
+    """The current stream on `device_index`, as a raw pointer.
 
     `torch.cuda.current_stream().cuda_stream` builds a Python Stream wrapper on
     every call -- ~14us a launch in the host profile, on a path where the host
@@ -126,7 +126,7 @@ def _raw_stream(dev_index: int) -> int:
     -- a caller may run us under a different one.
     """
     try:
-        return torch._C._cuda_getCurrentRawStream(dev_index)
+        return torch._C._cuda_getCurrentRawStream(device_index)
     except AttributeError:
         return torch.cuda.current_stream().cuda_stream
 
@@ -157,8 +157,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     def __init__(self, cfg, comm):
         self.cfg = cfg
         self.comm = comm
-        self._dev_index = torch.cuda.current_device()
-        dev = torch.device("cuda", self._dev_index)
+        self._device_index = torch.cuda.current_device()
+        dev = torch.device("cuda", self._device_index)
         self.dev = dev
         self._recv_cap = cfg.effective_max_recv
         self._closed = False
@@ -170,7 +170,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # gfx125x routes to the TDM kernel, which needs a superset arena (plan A).
         _arch = getattr(torch.cuda.get_device_properties(dev), "gcnArchName", "") or ""
         self._is1250 = _arch.split(":")[0].startswith("gfx125")
-        self._mp_count = torch.cuda.get_device_properties(dev).multi_processor_count
+        self._multi_processor_count = torch.cuda.get_device_properties(
+            dev
+        ).multi_processor_count
 
         # Gate FIRST: rejecting a config after taking a symmetric window would
         # leak it (the arena is registered with the communicator), and the whole
@@ -267,10 +269,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         from mori.cco import cco as _cco
         from mori.cco.communicator import DevCommHandle
 
-        reqs = _cco.DevCommRequirements()
-        reqs.gda_connection_type = _cco.GDA_CONNECTION_RAIL
-        reqs.gda_context_count = max(1, cfg.num_qp_per_pe)
-        handle = DevCommHandle(comm, requirements=reqs)
+        requirements = _cco.DevCommRequirements()
+        requirements.gda_connection_type = _cco.GDA_CONNECTION_RAIL
+        requirements.gda_context_count = max(1, cfg.num_qp_per_pe)
+        handle = DevCommHandle(comm, requirements=requirements)
 
         # A rejected handle still owns its QPs, so every exit below its
         # construction has to release it.
@@ -296,11 +298,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     "are different sets, so a peer-indexed access would resolve to "
                     "the wrong rank"
                 )
-            expected = cfg.rank % cfg.gpu_per_node
-            if handle.lsa_rank != expected:
+            expected_lsa_rank = cfg.rank % cfg.gpu_per_node
+            if handle.lsa_rank != expected_lsa_rank:
                 raise ValueError(
                     f"rank {cfg.rank} has CCO lsa_rank {handle.lsa_rank} but EP's node "
-                    f"layout implies {expected}: world ranks are not laid out "
+                    f"layout implies {expected_lsa_rank}: world ranks are not laid out "
                     "node-major, so worldPe - lsaBase is not an LSA rank"
                 )
         except BaseException:
@@ -317,12 +319,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         """
         dev = self.dev
         i32 = dict(dtype=torch.int32, device=dev)
-        ws, gpn = cfg.world_size, cfg.gpu_per_node
+        world_size, gpu_per_node = cfg.world_size, cfg.gpu_per_node
         n_nodes = cfg.nodes
-        m = cfg.max_num_inp_token_per_rank
+        max_tokens_per_rank = cfg.max_num_inp_token_per_rank
         topk = cfg.num_experts_per_token
 
-        self.lsa_base = (cfg.rank // gpn) * gpn
+        self.lsa_base = (cfg.rank // gpu_per_node) * gpu_per_node
 
         # The base hands one of these to every dispatch as `dest_map` -- which one
         # depends on whether the caller asked for a routing handle -- and it is
@@ -330,21 +332,27 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # buffer: the kernel indexes it by (token, expert), but v1 allocates the
         # worst case and the region test does not cover it, so this stays
         # conservative rather than clever.
-        self.token_dest_map = torch.zeros(ws * m * cfg.num_experts_per_rank, **i32)
-        self._null_flat = ws * cfg.effective_max_recv
+        self.token_dest_map = torch.zeros(
+            world_size * max_tokens_per_rank * cfg.num_experts_per_rank, **i32
+        )
+        self._null_flat = world_size * cfg.effective_max_recv
         self.routing_dest_map = torch.full_like(self.token_dest_map, self._null_flat)
 
-        self.inter_disp_dest_tok_id_map = torch.zeros(n_nodes * m * topk, **i32)
-        self.inter_disp_send_map = torch.zeros(n_nodes * m, **i32)
+        self.inter_disp_dest_tok_id_map = torch.zeros(
+            n_nodes * max_tokens_per_rank * topk, **i32
+        )
+        self.inter_disp_send_map = torch.zeros(n_nodes * max_tokens_per_rank, **i32)
         # Counts completions. NOT the local half of the symmetric chunk-flag
         # region despite the name: that one is written by dispatch and read+
         # cleared by combine, which enumerates its work from dispatch's leftovers.
-        self.inter_chunk_flag_combine = torch.zeros(n_nodes * m * 2, **i32)
-        self.dest_pe_counter = torch.zeros(ws, **i32)
+        self.inter_chunk_flag_combine = torch.zeros(
+            n_nodes * max_tokens_per_rank * 2, **i32
+        )
+        self.dest_pe_counter = torch.zeros(world_size, **i32)
         self.block_flag_counter = torch.zeros(n_nodes, **i32)
         self.total_recv = torch.zeros(1, **i32)
-        self.dispatch_barrier = torch.zeros(ws, dtype=torch.uint32, device=dev)
-        self.combine_barrier = torch.zeros(ws, dtype=torch.uint32, device=dev)
+        self.dispatch_barrier = torch.zeros(world_size, dtype=torch.uint32, device=dev)
+        self.combine_barrier = torch.zeros(world_size, dtype=torch.uint32, device=dev)
         self.inter_blocks_barrier = torch.zeros(4, dtype=torch.uint32, device=dev)
         # Zero, not one: the internode kernels start their cross-device epoch at
         # 0 (v1 seeds it that way for exactly these kernel types).
@@ -356,12 +364,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # and never learns which layout it is looking at.
         self.combine_out = from_gpu_ptr(
             self.arena.local_ptr("inter_combine_out"),
-            (m * cfg.hidden_dim,),
+            (max_tokens_per_rank * cfg.hidden_dim,),
             cfg.combine_dtype,
         )
         self.combine_out_weights = from_gpu_ptr(
             self.arena.local_ptr("combine_out_weights"),
-            (m * topk,),
+            (max_tokens_per_rank * topk,),
             torch.float32,
         )
 
@@ -370,23 +378,23 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # `args` on every call -- only bound values reach the plan's cached
         # struct -- so passing the whole schema each time cost a ctypes field
         # write per field per launch. Binding leaves six.
-        static = self._internode_static_args()
-        for built in self._internode_plans.values():
-            for plan in built.values():
-                plan.bind(**static)
+        static_args = self._internode_static_args()
+        for plans_by_pass in self._internode_plans.values():
+            for plan in plans_by_pass.values():
+                plan.bind(**static_args)
 
     def _internode_unsupported(self, cfg) -> tuple[str, ...]:
         bad = []
         # Checked HERE rather than where the plans are built: _build_internode_kernels
-        # runs after the arena and the dev comm are taken, and its caller does not
-        # gate on what it returns.
-        for leg, dt in (
+        # runs after the arena and the device communicator are taken, and its caller
+        # does not gate on what it returns.
+        for leg, leg_dtype in (
             ("dispatch", cfg.dispatch_dtype),
             ("combine", cfg.combine_dtype),
         ):
-            if dt not in self._INTERNODE_DTYPE:
+            if leg_dtype not in self._INTERNODE_DTYPE:
                 bad.append(
-                    f"{leg} dtype {dt} has no internode kernel "
+                    f"{leg} dtype {leg_dtype} has no internode kernel "
                     f"(have {', '.join(self._INTERNODE_DTYPE.values())})"
                 )
         if cfg.is_scatter:
@@ -594,7 +602,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             blockNum=block_num,
             warpPerBlock=warp_per_block,
             rdmaBlockNum=rdma_block_num,
-            mpCount=self._mp_count,
+            mpCount=self._multi_processor_count,
         )
 
     def _internode_static_args(self):
@@ -609,34 +617,34 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         cached = getattr(self, "_internode_static_cache", None)
         if cached is not None:
             return cached
-        a = self.arena
-        off = a.offset
-        has_scales = a.has("out_scales")
+        arena = self.arena
+        offset = arena.offset
+        has_scales = arena.has("out_scales")
 
-        def ptr(t):
-            return 0 if t is None else t.data_ptr()
+        def ptr(tensor):
+            return 0 if tensor is None else tensor.data_ptr()
 
         self._internode_static_cache = dict(
-            window=a.handle,
-            offDispatchInp=off("inter_dispatch_inp"),
-            offCombineInp=off("inter_combine_inp"),
-            offStaging=off("inter_staging"),
-            offDispatchOut=off("inter_dispatch_out"),
-            offCombineOut=off("inter_combine_out"),
-            offDispatchStaging=off("inter_dispatch_staging"),
-            offInpWeights=off("inp_weights"),
-            offDispatchOutWeights=off("dispatch_out_weights"),
-            offCombineOutWeights=off("combine_out_weights"),
-            offOutIndices=off("out_indices"),
-            offRecvTokenNum=off("recv_token_num"),
-            offNodeRecvTokenNum=off("node_recv_token_num"),
-            offDispTokOffset=off("disp_tok_offset"),
-            offDispTokIdToSrcTokId=off("disp_tok_id_to_src_tok_id"),
-            offCrossDeviceBarrier=off("cross_device_barrier"),
-            offChunkFlag=off("inter_node_chunk_flag"),
+            window=arena.handle,
+            offDispatchInp=offset("inter_dispatch_inp"),
+            offCombineInp=offset("inter_combine_inp"),
+            offStaging=offset("inter_staging"),
+            offDispatchOut=offset("inter_dispatch_out"),
+            offCombineOut=offset("inter_combine_out"),
+            offDispatchStaging=offset("inter_dispatch_staging"),
+            offInpWeights=offset("inp_weights"),
+            offDispatchOutWeights=offset("dispatch_out_weights"),
+            offCombineOutWeights=offset("combine_out_weights"),
+            offOutIndices=offset("out_indices"),
+            offRecvTokenNum=offset("recv_token_num"),
+            offNodeRecvTokenNum=offset("node_recv_token_num"),
+            offDispTokOffset=offset("disp_tok_offset"),
+            offDispTokIdToSrcTokId=offset("disp_tok_id_to_src_tok_id"),
+            offCrossDeviceBarrier=offset("cross_device_barrier"),
+            offChunkFlag=offset("inter_node_chunk_flag"),
             # Absent, not zero-sized, when the transport is off; the kernel gates
             # on cfg.scaleDim and never dereferences it.
-            offOutScales=off("out_scales") if has_scales else 0,
+            offOutScales=offset("out_scales") if has_scales else 0,
             rank=self.cfg.rank,
             lsaBase=self.lsa_base,
             dispDestTokIdMap=0,  # per-launch: the base passes token_dest_map or routing_dest_map
@@ -663,13 +671,13 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         launch. Returned as a tuple so it can be concatenated with the passes
         that are common to both.
         """
-        k = self.cfg.internode_kernel
-        plain, ll = phase, phase + "_ll"
-        if k == "v2":
+        kernel_family = self.cfg.internode_kernel
+        plain, low_latency = phase, phase + "_ll"
+        if kernel_family == "v2":
             return (plain,)
-        if k == "v2_ll":
-            return (ll,)
-        return (plain, ll)
+        if kernel_family == "v2_ll":
+            return (low_latency,)
+        return (plain, low_latency)
 
     def _internode_use_ll(self, num_tokens):
         """Which of the two families this launch runs.
@@ -678,10 +686,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         the configured crossover. An explicit choice cannot fall back: the other
         family was never compiled.
         """
-        k = self.cfg.internode_kernel
-        if k == "v2":
+        kernel_family = self.cfg.internode_kernel
+        if kernel_family == "v2":
             return False
-        if k == "v2_ll":
+        if kernel_family == "v2_ll":
             return True
         return num_tokens <= self.cfg.internode_auto_ll_max_tokens
 
@@ -698,7 +706,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         ),
     }
 
-    def _pin_over(self, cfg, phase, g):
+    def _overlay_pinned_geometry(self, cfg, phase, geometry):
         """Overlay the caller's pinned geometry on a tuned triple, field by field.
 
         A pinned field is a manual override and beats the table; an unpinned one
@@ -708,12 +716,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         """
         pinned = getattr(cfg, "_pinned_geometry", frozenset())
         return tuple(
-            getattr(cfg, name) if name in pinned else v
-            for name, v in zip(self._PIN_FIELDS[phase], g)
+            getattr(cfg, name) if name in pinned else tuned_value
+            for name, tuned_value in zip(self._PIN_FIELDS[phase], geometry)
         )
 
     @staticmethod
-    def _fit_internode_geom(g):
+    def _fit_internode_geometry(geometry):
         """Force rdma_block_num < block_num.
 
         The kernel splits the grid: blocks below rdmaBlockNum take the RDMA leg,
@@ -724,17 +732,24 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         clamps on the table-hit path; this is the choke point that covers the
         env-pin and untuned paths too.
         """
-        block, rdma, warp = g
+        block, rdma, warp = geometry
         return (block, min(rdma, max(1, block - 1)), warp)
 
     def _internode_geometry_buckets(self, cfg):
         return [
-            (t, self._fit_internode_geom(d), self._fit_internode_geom(c))
-            for t, d, c in self._internode_geometry_buckets_raw(cfg)
+            (
+                max_tokens,
+                self._fit_internode_geometry(dispatch_geometry),
+                self._fit_internode_geometry(combine_geometry),
+            )
+            for max_tokens, dispatch_geometry, combine_geometry in (
+                self._internode_geometry_buckets_raw(cfg)
+            )
         ]
 
     def _internode_geometry_buckets_raw(self, cfg):
-        """``[(max_tok | None, disp_geom, comb_geom)]``, coarsest last.
+        """``[(max_tokens | None, dispatch_geometry, combine_geometry)]``, coarsest
+        last.
 
         Compilation happens at build time, so every geometry a launch could pick
         has to be known now -- which is why this returns the whole schedule and
@@ -752,19 +767,26 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # at launch the way the intranode path can -- it has to be fixed before
         # the plans are built, which is before the op exists. Hence an env var
         # rather than a CLI flag threaded through the config.
-        pin = _geom_env("MORI_EP_DISP_GEOM"), _geom_env("MORI_EP_COMB_GEOM")
-        if pin[0] or pin[1]:
-            base_d = (
+        pinned_dispatch = _geometry_from_env("MORI_EP_DISP_GEOM")
+        pinned_combine = _geometry_from_env("MORI_EP_COMB_GEOM")
+        if pinned_dispatch or pinned_combine:
+            config_dispatch = (
                 cfg.dispatch_block_num,
                 cfg.dispatch_rdma_block_num,
                 cfg.warp_num_per_block,
             )
-            base_c = (
+            config_combine = (
                 cfg.combine_block_num,
                 cfg.combine_rdma_block_num,
                 cfg.combine_warp_num_per_block,
             )
-            return [(None, pin[0] or base_d, pin[1] or base_c)]
+            return [
+                (
+                    None,
+                    pinned_dispatch or config_dispatch,
+                    pinned_combine or config_combine,
+                )
+            ]
 
         dtype = "fp8" if cfg.dispatch_dtype in _FP8_TUNING_DTYPES else "bf16"
         key = (_device_key(), cfg.world_size, cfg.hidden_dim, cfg.num_experts_per_token)
@@ -786,25 +808,27 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     ),
                 )
             ]
-        sched = entry.get(dtype) or entry.get("fp8")
-        out = []
-        for row in sched:
-            max_tok = row[0]
-            g = lookup(
+        schedule = entry.get(dtype) or entry.get("fp8")
+        buckets = []
+        for row in schedule:
+            max_tokens = row[0]
+            geometry = lookup(
                 cfg.world_size,
                 cfg.hidden_dim,
                 cfg.num_experts_per_token,
-                max_tok if max_tok is not None else 1 << 30,
+                max_tokens if max_tokens is not None else 1 << 30,
                 dtype=dtype,
             )
-            out.append(
+            buckets.append(
                 (
-                    max_tok,
-                    self._pin_over(cfg, "dispatch", g["dispatch"]),
-                    self._pin_over(cfg, "combine", g["combine"]),
+                    max_tokens,
+                    self._overlay_pinned_geometry(
+                        cfg, "dispatch", geometry["dispatch"]
+                    ),
+                    self._overlay_pinned_geometry(cfg, "combine", geometry["combine"]),
                 )
             )
-        return out
+        return buckets
 
     def _build_internode_kernels(self, cfg) -> KernelSet:
         # One tag per leg, not one for the op: see _INTERNODE_LEG. Both keys are
@@ -826,31 +850,34 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # the triple alone and skipping an already-present one leaves that
         # geometry holding only whichever phase was seen first -- a KeyError on
         # the other phase's first launch, at run time, not build time.
-        needed = {}
-        for _, disp_geom, comb_geom in self._internode_buckets:
-            for geom, names in (
-                (disp_geom, ("copystaging",) + self._internode_variants("dispatch")),
+        passes_by_geometry = {}
+        for _, dispatch_geometry, combine_geometry in self._internode_buckets:
+            for geometry, names in (
                 (
-                    comb_geom,
+                    dispatch_geometry,
+                    ("copystaging",) + self._internode_variants("dispatch"),
+                ),
+                (
+                    combine_geometry,
                     ("combinesync", "combinesyncbarrier")
                     + self._internode_variants("combine")
                     + ("combineall",),
                 ),
             ):
-                needed.setdefault(geom, set()).update(names)
-        for geom, names in needed.items():
-            block, rdma, warp = geom
-            built = {}
-            for n in sorted(names):
-                req = self._internode_request(
-                    cfg, leg_dtype[self._INTERNODE_LEG[n]], block, warp, rdma
+                passes_by_geometry.setdefault(geometry, set()).update(names)
+        for geometry, names in passes_by_geometry.items():
+            block, rdma, warp = geometry
+            plans_by_pass = {}
+            for pass_name in sorted(names):
+                request = self._internode_request(
+                    cfg, leg_dtype[self._INTERNODE_LEG[pass_name]], block, warp, rdma
                 )
-                built[n] = cb.EP_INTERNODE_PLANS[n](**req)
+                plans_by_pass[pass_name] = cb.EP_INTERNODE_PLANS[pass_name](**request)
                 # Two launch arguments that never vary for THIS plan, so they
                 # belong on the plan rather than in every launch's dict:
                 #   rdmaBlockNum  a plan is compiled per geometry and lives in
-                #                 exactly one `_internode_plans[geom]`, so the
-                #                 value a launch could pass is always geom[1].
+                #                 exactly one `_internode_plans[geometry]`, so the
+                #                 value a launch could pass is always geometry[1].
                 #   replayMode    this backend has no replay path (KernelSet
                 #                 carries dispatch_replay=None); it is always 0.
                 # bind() stores ints in the plan's cached struct, and _launch_buf
@@ -858,9 +885,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 # so a bound int is written once at bind time and never again,
                 # while a passed one costs a _set_arg every launch (~1.2us each,
                 # x2 args x2 launches per round).
-                built[n].bind(rdmaBlockNum=rdma, replayMode=0)
-            self._internode_plans[geom] = built
-            self._plans.extend(built.values())
+                plans_by_pass[pass_name].bind(rdmaBlockNum=rdma, replayMode=0)
+            self._internode_plans[geometry] = plans_by_pass
+            self._plans.extend(plans_by_pass.values())
 
         # One bound launch group per (geometry, phase, low-latency). The set of
         # plans a launch fires is fixed by that triple, so the validation and the
@@ -871,18 +898,20 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         from mori.jit.v2 import plan_api
 
         self._internode_groups = {}
-        for geom, built in self._internode_plans.items():
-            for key, names in self._INTERNODE_SEQ.items():
-                if all(n in built for n in names):
-                    self._internode_groups[(geom, key)] = plan_api.make_launch_group(
-                        [built[n] for n in names]
+        for geometry, plans_by_pass in self._internode_plans.items():
+            for sequence_key, names in self._INTERNODE_SEQ.items():
+                if all(name in plans_by_pass for name in names):
+                    self._internode_groups[(geometry, sequence_key)] = (
+                        plan_api.make_launch_group(
+                            [plans_by_pass[name] for name in names]
+                        )
                     )
 
-        disp_spec = (cfg.dispatch_block_num, cfg.warp_num_per_block)
-        comb_spec = (cfg.combine_block_num, cfg.combine_warp_num_per_block)
+        dispatch_spec = (cfg.dispatch_block_num, cfg.warp_num_per_block)
+        combine_spec = (cfg.combine_block_num, cfg.combine_warp_num_per_block)
         return KernelSet(
-            dispatch={disp_spec: self._wrap_internode("dispatch")},
-            combine={comb_spec: self._wrap_internode("combine")},
+            dispatch={dispatch_spec: self._wrap_internode("dispatch")},
+            combine={combine_spec: self._wrap_internode("combine")},
             dispatch_replay=None,
             stages_in_kernel=True,
             # copystaging zeroes total_recv as its first act, so the host does not
@@ -911,10 +940,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         crossing for the whole sequence instead of one per pass.
         """
 
-        def run(*, input, num_tokens, dest_map, **kw):
-            ll = self._internode_use_ll(num_tokens)
-            geom = self._internode_geom_for(phase, num_tokens)
-            group = self._internode_groups[(geom, (phase, ll))]
+        def run(*, input, num_tokens, dest_map, **kwargs):
+            use_low_latency = self._internode_use_ll(num_tokens)
+            geometry = self._internode_geom_for(phase, num_tokens)
+            group = self._internode_groups[(geometry, (phase, use_low_latency))]
 
             # Two of the kernel's arguments are set by dispatch and READ AGAIN by
             # combine, but the base only hands them to dispatch -- combine's
@@ -940,14 +969,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # Passing the input weights here does not fault: it folds the right
             # number of node slots holding other tokens' weights.
             if phase == "dispatch":
-                w, ix = kw.get("weights"), kw.get("indices")
-                self._internode_has_weights = w is not None
+                weights, indices = kwargs.get("weights"), kwargs.get("indices")
+                self._internode_has_weights = weights is not None
                 # The TENSOR, not just its address: combine dereferences this
                 # pointer on a LATER call, and nothing else keeps the caller's
                 # indices alive that long.
-                self._internode_indices = ix
-                weights_ptr = 0 if w is None else w.data_ptr()
-            elif kw.get("want_weights", False):
+                self._internode_indices = indices
+                weights_ptr = 0 if weights is None else weights.data_ptr()
+            elif kwargs.get("want_weights", False):
                 # The fold's source is what dispatch delivered, so there is nothing
                 # to fold if it delivered none -- and the region still holds the
                 # previous round's values, which would be returned as this one's.
@@ -961,8 +990,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 weights_ptr = self.arena.local_ptr("dispatch_out_weights")
             else:
                 weights_ptr = 0
-            held = getattr(self, "_internode_indices", None)
-            indices_ptr = 0 if held is None else held.data_ptr()
+            held_indices = getattr(self, "_internode_indices", None)
+            indices_ptr = 0 if held_indices is None else held_indices.data_ptr()
 
             # Only what varies. The rest is bound on the plan; see
             # _build_internode_kernels -- rdmaBlockNum and replayMode used to be
@@ -975,10 +1004,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 inpTokenBuf=input.data_ptr(),
                 weightsBuf=weights_ptr,
                 scalesBuf=(
-                    kw["scales"].data_ptr() if kw.get("scales") is not None else 0
+                    kwargs["scales"].data_ptr()
+                    if kwargs.get("scales") is not None
+                    else 0
                 ),
             )
-            group.launch(_raw_stream(self._dev_index), **args)
+            group.launch(_raw_stream(self._device_index), **args)
 
         return run
 
@@ -1070,55 +1101,55 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     }
 
     def _region(self, name):
-        intra, inter = self._VIEW_REGION[name]
-        return inter if self.cfg.is_internode else intra
+        intranode, internode = self._VIEW_REGION[name]
+        return internode if self.cfg.is_internode else intranode
 
     def recv_tokens(self):
-        v = self._views.get("recv_tokens")
-        if v is not None:
-            return v
+        view = self._views.get("recv_tokens")
+        if view is not None:
+            return view
         # fp4 packs 2 e2m1 per element of the torch dtype -> last dim is hidden/2.
         cols = self.cfg.hidden_dim // 2 if self.cfg.is_fp4 else self.cfg.hidden_dim
-        v = from_gpu_ptr(
+        view = from_gpu_ptr(
             self.arena.local_ptr(self._region("disp_out")),
             (self._recv_cap, cols),
             self.cfg.dispatch_dtype,
         )
-        self._views["recv_tokens"] = v
-        return v
+        self._views["recv_tokens"] = view
+        return view
 
     def combine_in_view(self):
-        v = self._views.get("combine_in")
-        if v is None:
-            v = from_gpu_ptr(
+        view = self._views.get("combine_in")
+        if view is None:
+            view = from_gpu_ptr(
                 self.arena.local_ptr(self._region("out_tok")),
                 (self._recv_cap, self.cfg.hidden_dim),
                 self.cfg.combine_dtype,
             )
-            self._views["combine_in"] = v
-        return v
+            self._views["combine_in"] = view
+        return view
 
     def recv_weights(self):
-        v = self._views.get("recv_weights")
-        if v is None:
-            v = from_gpu_ptr(
+        view = self._views.get("recv_weights")
+        if view is None:
+            view = from_gpu_ptr(
                 self.arena.local_ptr(self._region("out_wts")),
                 (self._recv_cap, self.cfg.num_experts_per_token),
                 torch.float32,
             )
-            self._views["recv_weights"] = v
-        return v
+            self._views["recv_weights"] = view
+        return view
 
     def recv_indices(self):
-        v = self._views.get("recv_indices")
-        if v is None:
-            v = from_gpu_ptr(
+        view = self._views.get("recv_indices")
+        if view is None:
+            view = from_gpu_ptr(
                 self.arena.local_ptr(self._region("out_idx")),
                 (self._recv_cap, self.cfg.num_experts_per_token),
                 torch.int32,
             )
-            self._views["recv_indices"] = v
-        return v
+            self._views["recv_indices"] = view
+        return view
 
     def recv_scales(self):
         """The forwarded scale rows, or None when the transport is off -- the same
@@ -1129,9 +1160,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         path, packed on the internode one. Anything reading the region by pointer
         needs that pitch, not this shape.
         """
-        v = self._views.get("recv_scales")
-        if v is not None:
-            return v
+        view = self._views.get("recv_scales")
+        if view is not None:
+            return view
         n_i32 = self._scale_i32(self.cfg)
         if not n_i32:
             return None
@@ -1141,9 +1172,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             (self._recv_cap, stride_i32),
             torch.int32,
         )
-        v = rows[:, :n_i32]
-        self._views["recv_scales"] = v
-        return v
+        view = rows[:, :n_i32]
+        self._views["recv_scales"] = view
+        return view
 
     def local_expert_count(self):
         raise NotImplementedError(

@@ -36,14 +36,14 @@ namespace v2 {
 
 namespace {
 
-struct KernelDesc {
+struct KernelDescriptor {
   const char* tag;   // goes in the entry name
   const char* body;  // the *_body function in ep_internode_kernel.hpp
   bool takesComm;    // false for the passes with no cross-node traffic
 };
 
-KernelDesc DescFor(EpInterNodeKernel k) {
-  switch (k) {
+KernelDescriptor DescriptorFor(EpInterNodeKernel kind) {
+  switch (kind) {
     case EpInterNodeKernel::CopyToStaging:
       return {"copystaging", "EpDispatchCopyToStaging_body", false};
     case EpInterNodeKernel::Dispatch:
@@ -67,7 +67,7 @@ KernelDesc DescFor(EpInterNodeKernel k) {
 // Header subtrees whose contents invalidate a compiled module. Coarser than the
 // real include graph on purpose (see IncludeTreeHash): over-invalidating costs a
 // rebuild, under-invalidating ships stale code.
-const std::vector<std::string>& EpInterNodeDeps() {
+const std::vector<std::string>& EpInterNodeSourceDeps() {
   static const std::vector<std::string> deps{"include/mori", "src/ops/dispatch_combine_v2",
                                              "src/cco"};
   return deps;
@@ -78,53 +78,53 @@ const std::vector<std::string>& EpInterNodeDeps() {
 // ---------------------------------------------------------------------------
 // Request -> Cfg
 // ---------------------------------------------------------------------------
-EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequest& req,
+EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequest& request,
                                   EpInterNodeKernel kind) {
-  EpInterNodeCfg c;
-  c.kernelCfg.worldSize = req.worldSize;
-  c.kernelCfg.hiddenDim = req.hiddenDim;
-  c.kernelCfg.scaleDim = req.scaleDim;
-  c.kernelCfg.scaleTypeSize = req.scaleTypeSize;
-  c.kernelCfg.maxTokenTypeSize = req.maxTokenTypeSize;
-  c.kernelCfg.maxNumInpTokenPerRank = req.maxNumInpTokenPerRank;
-  c.kernelCfg.numExpertPerRank = req.numExpertPerRank;
-  c.kernelCfg.numExpertPerToken = req.numExpertPerToken;
-  c.kernelCfg.maxTotalRecvTokens = req.maxTotalRecvTokens;
-  c.kernelCfg.gpuPerNode = req.gpuPerNode;
-  c.kernelCfg.numQpPerPe = req.numQpPerPe;
-  c.kernelCfg.quantType = req.quantType;
+  EpInterNodeCfg cfg;
+  cfg.kernelCfg.worldSize = request.worldSize;
+  cfg.kernelCfg.hiddenDim = request.hiddenDim;
+  cfg.kernelCfg.scaleDim = request.scaleDim;
+  cfg.kernelCfg.scaleTypeSize = request.scaleTypeSize;
+  cfg.kernelCfg.maxTokenTypeSize = request.maxTokenTypeSize;
+  cfg.kernelCfg.maxNumInpTokenPerRank = request.maxNumInpTokenPerRank;
+  cfg.kernelCfg.numExpertPerRank = request.numExpertPerRank;
+  cfg.kernelCfg.numExpertPerToken = request.numExpertPerToken;
+  cfg.kernelCfg.maxTotalRecvTokens = request.maxTotalRecvTokens;
+  cfg.kernelCfg.gpuPerNode = request.gpuPerNode;
+  cfg.kernelCfg.numQpPerPe = request.numQpPerPe;
+  cfg.kernelCfg.quantType = request.quantType;
 
-  c.dtype = req.dtype;
+  cfg.dtype = request.dtype;
 
-  c.waveSize = mori::jit::v2::WaveSizeForArch(arch);
+  cfg.waveSize = mori::jit::v2::WaveSizeForArch(arch);
 
   // Placeholders for a bare C++ caller only. v1 retunes blocks and warps per
   // token count, so a real caller always passes them; unlike the intranode
   // defaults these are not measured optima, they only have to be launchable.
-  c.blockNum = 64;
-  c.warpPerBlock = 8;
-  c.rdmaBlockNum = 8;
-  c.mpCount = 64;
+  cfg.blockNum = 64;
+  cfg.warpPerBlock = 8;
+  cfg.rdmaBlockNum = 8;
+  cfg.mpCount = 64;
 
-  if (req.blockNum > 0) c.blockNum = req.blockNum;
-  if (req.warpPerBlock > 0) c.warpPerBlock = req.warpPerBlock;
-  if (req.rdmaBlockNum > 0) c.rdmaBlockNum = req.rdmaBlockNum;
-  if (req.mpCount > 0) c.mpCount = req.mpCount;
+  if (request.blockNum > 0) cfg.blockNum = request.blockNum;
+  if (request.warpPerBlock > 0) cfg.warpPerBlock = request.warpPerBlock;
+  if (request.rdmaBlockNum > 0) cfg.rdmaBlockNum = request.rdmaBlockNum;
+  if (request.mpCount > 0) cfg.mpCount = request.mpCount;
 
-  if (!EpInterNodeKernelCfgIsValid(c.kernelCfg)) {
+  if (!EpInterNodeKernelCfgIsValid(cfg.kernelCfg)) {
     throw std::runtime_error(
-        "mori ep internode v2: unusable config " + Render(c.kernelCfg) +
+        "mori ep internode v2: unusable config " + Render(cfg.kernelCfg) +
         "; every divisor must be positive and worldSize must be a multiple of gpuPerNode");
   }
 
   // Caught here rather than by hipModuleLaunchKernel, which reports it as a
   // generic launch failure with no mention of which knob was too large.
-  const int threads = EpInterNodeBlockThreads(c);
-  if (threads <= 0 || threads > 1024) {
-    throw std::runtime_error("mori ep internode v2: warpPerBlock " +
-                             std::to_string(c.warpPerBlock) + " x waveSize " +
-                             std::to_string(c.waveSize) + " = " + std::to_string(threads) +
-                             " threads per block, which exceeds 1024");
+  const int threadsPerBlock = EpInterNodeBlockThreads(cfg);
+  if (threadsPerBlock <= 0 || threadsPerBlock > 1024) {
+    throw std::runtime_error(
+        "mori ep internode v2: warpPerBlock " + std::to_string(cfg.warpPerBlock) + " x waveSize " +
+        std::to_string(cfg.waveSize) + " = " + std::to_string(threadsPerBlock) +
+        " threads per block, which exceeds 1024");
   }
 
   // Wave64 only. DispatchInterNodeSend builds its intra-warp prefix count as
@@ -133,36 +133,36 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
   // On wave32 the discarded bits stay inside the 64-bit value and every set bit
   // is counted, so the send slot is wrong rather than the code merely being
   // slow. Rejected here rather than left to produce bad offsets.
-  if (c.waveSize != 64) {
-    throw std::runtime_error("mori ep internode v2: waveSize " + std::to_string(c.waveSize) +
+  if (cfg.waveSize != 64) {
+    throw std::runtime_error("mori ep internode v2: waveSize " + std::to_string(cfg.waveSize) +
                              " is unsupported; the internode kernels are wave64 only");
   }
 
   // The grid is split: blocks below rdmaBlockNum take the RDMA leg, the rest the
-  // intra-node one. rdma >= block leaves the intra-node half with nothing AND
-  // makes the dispatch fan-in wait on rdmaBlockNum * warpNum arrivals that can
-  // never occur, so every peer spins forever. Strict, because == is equally
-  // broken: it leaves xgmiBlockNum == 0.
-  if (c.rdmaBlockNum >= c.blockNum) {
+  // intra-node one. rdmaBlockNum >= blockNum leaves the intra-node half with
+  // nothing AND makes the dispatch fan-in wait on rdmaBlockNum * warpNum
+  // arrivals that can never occur, so every peer spins forever. Strict, because
+  // rdmaBlockNum == blockNum is equally broken: it leaves xgmiBlockNum == 0.
+  if (cfg.rdmaBlockNum >= cfg.blockNum) {
     throw std::runtime_error("mori ep internode v2: rdmaBlockNum " +
-                             std::to_string(c.rdmaBlockNum) + " must be < blockNum " +
-                             std::to_string(c.blockNum) +
+                             std::to_string(cfg.rdmaBlockNum) + " must be < blockNum " +
+                             std::to_string(cfg.blockNum) +
                              "; the intra-node half would get no blocks and the dispatch "
                              "barrier would never complete");
   }
   (void)kind;
-  return c;
+  return cfg;
 }
 
 std::string EpInterNodeRequestSchema() {
-  mori::jit::v2::SchemaBuilder sb;
-  const EpInterNodeRequest def{};
-  VisitFields(def, def, [&sb](const char* n, const auto& val, const auto&) {
+  mori::jit::v2::SchemaBuilder builder;
+  const EpInterNodeRequest defaults{};
+  VisitFields(defaults, defaults, [&builder](const char* name, const auto& value, const auto&) {
     using mori::jit::v2::WireTag;
     using mori::jit::v2::WireValue;
-    sb.Add(n, WireTag(val), WireValue(val));
+    builder.Add(name, WireTag(value), WireValue(value));
   });
-  return sb.Str();
+  return builder.Str();
 }
 
 // ---------------------------------------------------------------------------
@@ -171,12 +171,12 @@ std::string EpInterNodeRequestSchema() {
 // deliberately absent from the rendered text; see the note on EpInterNodeCfg.
 // ---------------------------------------------------------------------------
 std::string EpInterNodeEntryName(const EpInterNodeCfg& cfg, EpInterNodeKernel kind) {
-  const KernelDesc d = DescFor(kind);
-  std::string s = "mori_ep_internode_";
-  s += d.tag;
-  s += '_';
-  s += EpInterNodeDTypeTag(cfg.dtype);
-  return s;
+  const KernelDescriptor descriptor = DescriptorFor(kind);
+  std::string name = "mori_ep_internode_";
+  name += descriptor.tag;
+  name += '_';
+  name += EpInterNodeDTypeTag(cfg.dtype);
+  return name;
 }
 
 std::string EpInterNodeRenderSource(const EpInterNodeCfg& cfg, EpInterNodeKernel kind) {
@@ -189,34 +189,34 @@ std::string EpInterNodeRenderSource(const EpInterNodeCfg& cfg, EpInterNodeKernel
     throw std::runtime_error("mori ep internode v2 jit: unusable config " + Render(cfg.kernelCfg));
   }
 
-  const KernelDesc d = DescFor(kind);
+  const KernelDescriptor descriptor = DescriptorFor(kind);
   const std::string entry = EpInterNodeEntryName(cfg, kind);
 
   // The two names the entry macros expand against, in the same order and with
   // the same spelling ep_spec.cpp uses for the intranode kernels.
-  std::string src =
+  std::string source =
       "// mori jit — generated, do not edit.\n"
       "#include \"src/ops/dispatch_combine_v2/ep_internode_kernel.hpp\"\n"
       "constexpr ::mori::ops::v2::EpInterNodeKernelCfg kConfig = ";
-  src += Render(cfg.kernelCfg);
-  src += ";\nusing TokT = ";
-  src += EpInterNodeDTypeName(cfg.dtype);
-  src += ";\n";
+  source += Render(cfg.kernelCfg);
+  source += ";\nusing TokT = ";
+  source += EpInterNodeDTypeName(cfg.dtype);
+  source += ";\n";
 
-  if (!d.takesComm) {
-    src += "MORI_EP_INTERNODE_CCO_ENTRY_LOCAL(";
-    src += entry;
-    src += ", ";
-    src += d.body;
-    src += ")\n";
+  if (!descriptor.takesComm) {
+    source += "MORI_EP_INTERNODE_CCO_ENTRY_LOCAL(";
+    source += entry;
+    source += ", ";
+    source += descriptor.body;
+    source += ")\n";
   } else {
-    src += "MORI_EP_INTERNODE_CCO_ENTRY(";
-    src += entry;
-    src += ", ";
-    src += d.body;
-    src += ")\n";
+    source += "MORI_EP_INTERNODE_CCO_ENTRY(";
+    source += entry;
+    source += ", ";
+    source += descriptor.body;
+    source += ")\n";
   }
-  return src;
+  return source;
 }
 
 // The grids v1 launches its passes with, as launch.cpp sizes them for the AOT
@@ -224,40 +224,40 @@ std::string EpInterNodeRenderSource(const EpInterNodeCfg& cfg, EpInterNodeKernel
 // device take the multiprocessor count, and the barrier is a single wavefront.
 mori::jit::v2::LaunchGeometry EpInterNodeGeometry(const EpInterNodeCfg& cfg,
                                                   EpInterNodeKernel kind) {
-  mori::jit::v2::LaunchGeometry g;
-  g.blockX = static_cast<unsigned>(EpInterNodeBlockThreads(cfg));
+  mori::jit::v2::LaunchGeometry geometry;
+  geometry.blockX = static_cast<unsigned>(EpInterNodeBlockThreads(cfg));
   switch (kind) {
     case EpInterNodeKernel::CopyToStaging:
-      g.gridX = static_cast<unsigned>(cfg.mpCount);
-      g.sharedBytes = 0;
+      geometry.gridX = static_cast<unsigned>(cfg.mpCount);
+      geometry.sharedBytes = 0;
       break;
     case EpInterNodeKernel::Dispatch:
     case EpInterNodeKernel::DispatchLL:
-      g.gridX = static_cast<unsigned>(cfg.blockNum);
+      geometry.gridX = static_cast<unsigned>(cfg.blockNum);
       // No dispatch pass declares dynamic shared memory.
-      g.sharedBytes = 0;
+      geometry.sharedBytes = 0;
       break;
     case EpInterNodeKernel::CombineSync:
-      g.gridX = static_cast<unsigned>(cfg.mpCount);
-      g.sharedBytes = 0;
+      geometry.gridX = static_cast<unsigned>(cfg.mpCount);
+      geometry.sharedBytes = 0;
       break;
     case EpInterNodeKernel::CombineSyncBarrier:
       // One wavefront, by construction: the barrier is a single-block fan-in.
-      g.gridX = 1;
-      g.blockX = static_cast<unsigned>(cfg.waveSize);
-      g.sharedBytes = 0;
+      geometry.gridX = 1;
+      geometry.blockX = static_cast<unsigned>(cfg.waveSize);
+      geometry.sharedBytes = 0;
       break;
     case EpInterNodeKernel::Combine:
     case EpInterNodeKernel::CombineLL:
-      g.gridX = static_cast<unsigned>(cfg.blockNum);
-      g.sharedBytes = static_cast<unsigned>(EpInterNodeCombineSharedBytes(cfg));
+      geometry.gridX = static_cast<unsigned>(cfg.blockNum);
+      geometry.sharedBytes = static_cast<unsigned>(EpInterNodeCombineSharedBytes(cfg));
       break;
     case EpInterNodeKernel::CombineAll:
-      g.gridX = static_cast<unsigned>(cfg.mpCount);
-      g.sharedBytes = static_cast<unsigned>(EpInterNodeCombineSharedBytes(cfg));
+      geometry.gridX = static_cast<unsigned>(cfg.mpCount);
+      geometry.sharedBytes = static_cast<unsigned>(EpInterNodeCombineSharedBytes(cfg));
       break;
   }
-  return g;
+  return geometry;
 }
 
 // ---------------------------------------------------------------------------
@@ -273,7 +273,7 @@ mori::jit::v2::LaunchGeometry EpInterNodeGeometry(const EpInterNodeCfg& cfg,
   mori::jit::v2::LaunchGeometry ClassName::Geometry(const Cfg& cfg) { \
     return EpInterNodeGeometry(cfg, EpInterNodeKernel::KIND);         \
   }                                                                   \
-  const std::vector<std::string>& ClassName::SourceDeps() { return EpInterNodeDeps(); }
+  const std::vector<std::string>& ClassName::SourceDeps() { return EpInterNodeSourceDeps(); }
 
 MORI_EP_INTERNODE_DEFINE_SPEC(EpInterNodeCopyToStagingSpec, CopyToStaging)
 MORI_EP_INTERNODE_DEFINE_SPEC(EpInterNodeDispatchSpec, Dispatch)
@@ -299,16 +299,16 @@ MORI_EP_INTERNODE_DEFINE_SPEC(EpInterNodeCombineAllSpec, CombineAll)
 
 namespace {
 
-mori::ops::v2::EpInterNodeCfg EpInterNodeCfgFromFields(const mori::jit::v2::FieldBag& f,
+mori::ops::v2::EpInterNodeCfg EpInterNodeCfgFromFields(const mori::jit::v2::FieldBag& fields,
                                                        mori::ops::v2::EpInterNodeKernel kind) {
   using namespace mori::ops::v2;
-  EpInterNodeRequest req;
+  EpInterNodeRequest request;
   const EpInterNodeRequest defaults{};
-  VisitFields(req, defaults, [&f](const char* n, auto& slot, const auto&) {
+  VisitFields(request, defaults, [&fields](const char* name, auto& slot, const auto&) {
     using mori::jit::v2::WireAssign;
-    if (f.Has(n)) WireAssign(slot, f.Get(n, 0));
+    if (fields.Has(name)) WireAssign(slot, fields.Get(name, 0));
   });
-  return MakeEpInterNodeCfg(mori::jit::v2::GetToolchain().arch, req, kind);
+  return MakeEpInterNodeCfg(mori::jit::v2::GetToolchain().arch, request, kind);
 }
 
 // No C++-side AOT: a precompiled entry only helps if it renders the Cfg a live
@@ -317,15 +317,15 @@ int EpInterNodeNoPrecompile(const std::string&) { return 0; }
 
 }  // namespace
 
-#define MORI_EP_INTERNODE_DEFINE_PLAN(planName, ClassName, KIND)                         \
-  namespace {                                                                            \
-  mori::ops::v2::EpInterNodeCfg planName##FromFields(const mori::jit::v2::FieldBag& f) { \
-    return EpInterNodeCfgFromFields(f, mori::ops::v2::EpInterNodeKernel::KIND);          \
-  }                                                                                      \
-  }                                                                                      \
-  MORI_JIT_DEFINE_PLAN(planName, mori::ops::v2::ClassName, planName##FromFields,         \
-                       mori::ops::v2::EpInterNodeRequestSchema, mori::ops::v2::Describe, \
-                       EpInterNodeNoPrecompile, mori::ops::v2::EpInterNodeCcoArgs,       \
+#define MORI_EP_INTERNODE_DEFINE_PLAN(planName, ClassName, KIND)                              \
+  namespace {                                                                                 \
+  mori::ops::v2::EpInterNodeCfg planName##FromFields(const mori::jit::v2::FieldBag& fields) { \
+    return EpInterNodeCfgFromFields(fields, mori::ops::v2::EpInterNodeKernel::KIND);          \
+  }                                                                                           \
+  }                                                                                           \
+  MORI_JIT_DEFINE_PLAN(planName, mori::ops::v2::ClassName, planName##FromFields,              \
+                       mori::ops::v2::EpInterNodeRequestSchema, mori::ops::v2::Describe,      \
+                       EpInterNodeNoPrecompile, mori::ops::v2::EpInterNodeCcoArgs,            \
                        mori::ops::v2::EpInterNodeArgsSchema())
 
 MORI_EP_INTERNODE_DEFINE_PLAN(ep_internode_copystaging, EpInterNodeCopyToStagingSpec, CopyToStaging)

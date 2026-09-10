@@ -34,7 +34,8 @@ A subclass supplies four hooks -- two with no default, two with one::
 
     _regions(cfg)              -> [(name, nbytes)]   arena layout it needs
     _build_kernels(cfg, arena) -> KernelSet          bound, ready-to-launch kernels
-    _unsupported(cfg)          -> (reason, ...)      configs it cannot serve; () = all
+    _unsupported(cfg)          -> (reason, ...)      why it cannot serve this cfg;
+                                                     empty tuple = it can serve it
     _region(name)              -> name               arena region a shared view reads
 
 That is the HIP backend's route. The FlyDSL one overrides ``__init__`` and builds
@@ -193,13 +194,14 @@ class EpDispatchCombineConfig:
                 f"quant_type must be one of {_QUANT_TYPES}, got {self.quant_type!r}"
             )
         if self.is_internode and self.max_num_inp_token_per_rank % WAVE:
-            # The internode send buffer is addressed as pe * m + slot, but slots
-            # are handed out in whole wavefronts: the largest index a full last
-            # chunk produces is ceil(m/WAVE)*WAVE - 1, which exceeds m whenever m
-            # is not a multiple of WAVE. Rounding the capacity up makes the two
-            # agree by construction, without changing the layout the kernel and
-            # the region table both assume. (Inherited from v1, which computes
-            # the same stride and the same chunk count.)
+            # The internode send buffer is addressed as
+            # pe * max_num_inp_token_per_rank + slot, but slots are handed out in
+            # whole wavefronts: the largest index a full last chunk produces is
+            # ceil(capacity / WAVE) * WAVE - 1, which exceeds the capacity
+            # whenever the capacity is not a multiple of WAVE. Rounding the
+            # capacity up makes the two agree by construction, without changing
+            # the layout the kernel and the region table both assume. (Inherited
+            # from v1, which computes the same stride and the same chunk count.)
             self.max_num_inp_token_per_rank = (
                 (self.max_num_inp_token_per_rank + WAVE - 1) // WAVE
             ) * WAVE
@@ -294,8 +296,8 @@ class EpDispatchCombineConfig:
         # indistinguishable. The internode backend overlays these on top of its
         # tuning table, so a pinned field wins and an unpinned one is tuned.
         self._pinned_geometry = frozenset(
-            n
-            for n in (
+            field_name
+            for field_name in (
                 "dispatch_block_num",
                 "combine_block_num",
                 "warp_num_per_block",
@@ -303,7 +305,7 @@ class EpDispatchCombineConfig:
                 "dispatch_rdma_block_num",
                 "combine_rdma_block_num",
             )
-            if getattr(self, n) is not None
+            if getattr(self, field_name) is not None
         )
 
         self._resolve_geometry()
@@ -470,8 +472,8 @@ class EpDispatchCombineConfig:
         # pre-filling here would be indistinguishable from a caller pin, which
         # the internode backend honours over its own table. Leave it alone and
         # let _resolve_geometry / internode_tuning_configs do the work.
-        gpn = kwargs.get("gpu_per_node") or kwargs["world_size"]
-        if kwargs["world_size"] // gpn > 1:
+        gpu_per_node = kwargs.get("gpu_per_node") or kwargs["world_size"]
+        if kwargs["world_size"] // gpu_per_node > 1:
             return cls(**kwargs)
 
         t = lookup(
@@ -1051,9 +1053,9 @@ class EpDispatchCombineOp:
         # would leave it advanced and the next dispatch would address slots past
         # its node's slice of the send buffer.
         for name in ("block_flag_counter", "inter_blocks_barrier"):
-            t = getattr(self, name, None)
-            if t is not None:
-                t.zero_()
+            counter = getattr(self, name, None)
+            if counter is not None:
+                counter.zero_()
 
     def __repr__(self):
         return (

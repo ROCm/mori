@@ -47,9 +47,9 @@ one hard invariant is the same one that module states: **block_num must stay
 <= CU count**; a grid wider than the CUs runs the tail in a second wave, which a
 latency-bound small-token kernel cannot afford. ``lookup`` clamps to it.
 
-Buckets are ``(max_tok_inclusive | None, disp_block, disp_rdma, disp_warp,
-comb_block, comb_rdma, comb_warp)``, ascending; the first whose ``max_tok``
-covers ``num_tokens`` wins. Filed under the dispatch/token dtype ("fp8" here
+Buckets are ``(max_tokens_inclusive | None, dispatch_block, dispatch_rdma,
+dispatch_warp, combine_block, combine_rdma, combine_warp)``, ascending; the first
+whose ``max_tokens_inclusive`` covers ``num_tokens`` wins. Filed under the dispatch/token dtype ("fp8" here
 means fp8-dispatch + bf16-combine, the pairing the internode bench measures);
 untuned dtypes fall back to "fp8".
 """
@@ -88,7 +88,9 @@ from mori.ops import utils as gpu_utils
 # Ranks must be NUMA-bound before any of this: unbound CPU placement adds a large
 # random term that swamps every effect measured here.
 _MI308X_EP16_H6144 = (
-    # max_tok, disp_block, disp_rdma, disp_warp, comb_block, comb_rdma, comb_warp
+    # max_tokens,
+    # dispatch_block, dispatch_rdma, dispatch_warp,
+    # combine_block, combine_rdma, combine_warp
     (4, 32, 16, 4, 32, 21, 6),
     (8, 64, 32, 8, 32, 21, 6),
     (16, 80, 40, 4, 80, 40, 4),
@@ -119,22 +121,36 @@ def lookup(world_size, hidden_dim, topk, num_tokens, dtype="fp8"):
     entry = _TABLE.get((key, world_size, hidden_dim, topk))
     if not entry:
         return None
-    sched = entry.get(dtype) or entry.get("fp8")
-    if not sched:
+    schedule = entry.get(dtype) or entry.get("fp8")
+    if not schedule:
         return None
 
-    bucket = sched[-1]
-    for b in sched:
-        if b[0] is None or num_tokens <= b[0]:
-            bucket = b
+    bucket = schedule[-1]
+    for row in schedule:
+        if row[0] is None or num_tokens <= row[0]:
+            bucket = row
             break
-    _, db, dr, dw, cb, cr, cw = bucket
+    (
+        _,
+        dispatch_block,
+        dispatch_rdma,
+        dispatch_warp,
+        combine_block,
+        combine_rdma,
+        combine_warp,
+    ) = bucket
 
-    cu = gpu_utils.cu_count() or 80
-    db, cb = min(db, cu), min(cb, cu)  # never over-subscribe the CUs
+    cu_count = gpu_utils.cu_count() or 80
+    # Never over-subscribe the CUs.
+    dispatch_block = min(dispatch_block, cu_count)
+    combine_block = min(combine_block, cu_count)
     # rdma_block_num partitions the SAME grid: blocks below it talk to the
     # network, the rest do the intra-node half. Clamping block without clamping
     # rdma can leave rdma >= block, which is not slow but wrong -- no block is
     # left for the intra-node side and the dispatch barrier never completes.
-    dr, cr = min(dr, max(1, db - 1)), min(cr, max(1, cb - 1))
-    return {"dispatch": (db, dr, dw), "combine": (cb, cr, cw)}
+    dispatch_rdma = min(dispatch_rdma, max(1, dispatch_block - 1))
+    combine_rdma = min(combine_rdma, max(1, combine_block - 1))
+    return {
+        "dispatch": (dispatch_block, dispatch_rdma, dispatch_warp),
+        "combine": (combine_block, combine_rdma, combine_warp),
+    }

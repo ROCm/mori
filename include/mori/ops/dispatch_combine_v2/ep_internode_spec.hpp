@@ -30,8 +30,8 @@
 // sequences are several passes each and every pass is its own module, and
 // because v2 and v2_ll are separate kernels rather than one with a branch.
 //
-// Host-only, and the device TU must never include it -- everything shared with
-// the kernel lives in ep_internode_cfg.hpp.
+// Host-only, and the device translation unit (TU) must never include it --
+// everything shared with the kernel lives in ep_internode_cfg.hpp.
 // ---------------------------------------------------------------------------
 #pragma once
 
@@ -67,17 +67,18 @@ struct EpInterNodeCfg {
   int warpPerBlock{8};
   // v1's third grid dimension: the staging/RDMA passes are sized separately.
   int rdmaBlockNum{8};
-  // The passes that fan out over the whole device (CopyToStaging, CombineSync,
-  // CombineAll) take their grid from this rather than from blockNum. A device
-  // property, so the host has to supply it -- Geometry() must stay a pure
-  // function of the Cfg to remain correct when cross-compiling.
+  // Multiprocessor (compute unit) count. The passes that fan out over the whole
+  // device (CopyToStaging, CombineSync, CombineAll) take their grid from this
+  // rather than from blockNum. A device property, so the host has to supply it --
+  // Geometry() must stay a pure function of the Cfg to remain correct when
+  // cross-compiling.
   int mpCount{64};
   int waveSize{64};
 };
 
 template <typename Self, typename Visit>
-inline void VisitFields(Self& c, const EpInterNodeCfg& d, Visit&& v) {
-#define MORI_FIELD(x) v(#x, c.x, d.x)
+inline void VisitFields(Self& cfg, const EpInterNodeCfg& defaults, Visit&& visit) {
+#define MORI_FIELD(x) visit(#x, cfg.x, defaults.x)
   MORI_FIELD(kernelCfg);
   MORI_FIELD(dtype);
   MORI_FIELD(blockNum);
@@ -95,17 +96,18 @@ MORI_JIT_ASSERT_FIELD_COUNT(
 // text: RenderSource renders kernelCfg alone, because geometry must not enter
 // the cache key. Rendered here anyway so `info` reports what the host actually
 // resolved, geometry included.
-inline std::string Render(const EpInterNodeCfg& c) {
-  const EpInterNodeCfg d{};
-  mori::jit::v2::Fields f;
-  VisitFields(c, d, [&f](const char* name, const auto& value, const auto& dflt) {
-    f.Put(name, value, dflt);
-  });
-  return mori::jit::v2::BraceInit("::mori::ops::v2::EpInterNodeCfg", f);
+inline std::string Render(const EpInterNodeCfg& cfg) {
+  const EpInterNodeCfg defaults{};
+  mori::jit::v2::Fields fields;
+  VisitFields(cfg, defaults,
+              [&fields](const char* name, const auto& value, const auto& defaultValue) {
+                fields.Put(name, value, defaultValue);
+              });
+  return mori::jit::v2::BraceInit("::mori::ops::v2::EpInterNodeCfg", fields);
 }
 
-inline bool operator==(const EpInterNodeCfg& a, const EpInterNodeCfg& b) {
-  return Render(a) == Render(b);
+inline bool operator==(const EpInterNodeCfg& left, const EpInterNodeCfg& right) {
+  return Render(left) == Render(right);
 }
 
 // What the plan's `info` reports. The shape fields are flattened to the top
@@ -113,7 +115,7 @@ inline bool operator==(const EpInterNodeCfg& a, const EpInterNodeCfg& b) {
 // surface a caller reads a resolved plan out of, and EpCfg -- being flat -- puts
 // every field there individually. The names do not collide with the geometry
 // ones, so no prefix is needed to keep them apart.
-inline std::string Describe(const EpInterNodeCfg& c) {
+inline std::string Describe(const EpInterNodeCfg& cfg) {
   std::string out;
   auto emit = [&out](const char* name, const auto& value) {
     using mori::jit::v2::RenderValue;  // ADL for the Ep types, jit's for scalars
@@ -122,11 +124,11 @@ inline std::string Describe(const EpInterNodeCfg& c) {
     out += RenderValue(value);
     out += "\n";
   };
-  VisitFields(c.kernelCfg, c.kernelCfg,
-              [&emit](const char* n, const auto& v, const auto&) { emit(n, v); });
-  VisitFields(c, c, [&emit](const char* n, const auto& v, const auto&) {
-    if (std::string(n) == "kernelCfg") return;  // already flattened above
-    emit(n, v);
+  VisitFields(cfg.kernelCfg, cfg.kernelCfg,
+              [&emit](const char* name, const auto& value, const auto&) { emit(name, value); });
+  VisitFields(cfg, cfg, [&emit](const char* name, const auto& value, const auto&) {
+    if (std::string(name) == "kernelCfg") return;  // already flattened above
+    emit(name, value);
   });
   return out;
 }
@@ -136,16 +138,16 @@ inline std::string Describe(const EpInterNodeCfg& c) {
 // are the formulas launch.cpp uses for the AOT symbols, so the JIT path cannot
 // under-reserve LDS for a kernel that stages into it.
 // ---------------------------------------------------------------------------
-constexpr int EpInterNodeBlockThreads(const EpInterNodeCfg& c) {
-  return c.warpPerBlock * c.waveSize;
+constexpr int EpInterNodeBlockThreads(const EpInterNodeCfg& cfg) {
+  return cfg.warpPerBlock * cfg.waveSize;
 }
 
 // Combine's pointer arrays: one per warp for the topk sources and a second for
 // the weights. Mirrors combine_shared_mem() in launch.cpp with
 // use_weight_ptrs=true, minus its third array -- that one is for blockwise
 // scales, and no quant type reaches the internode path.
-constexpr int EpInterNodeCombineSharedBytes(const EpInterNodeCfg& c) {
-  return c.warpPerBlock * c.kernelCfg.numExpertPerToken * 2 * 8;
+constexpr int EpInterNodeCombineSharedBytes(const EpInterNodeCfg& cfg) {
+  return cfg.warpPerBlock * cfg.kernelCfg.numExpertPerToken * 2 * 8;
 }
 
 // ---------------------------------------------------------------------------
@@ -177,8 +179,8 @@ struct EpInterNodeRequest {
 };
 
 template <typename Self, typename Visit>
-inline void VisitFields(Self& r, const EpInterNodeRequest& d, Visit&& v) {
-#define MORI_FIELD(x) v(#x, r.x, d.x)
+inline void VisitFields(Self& request, const EpInterNodeRequest& defaults, Visit&& visit) {
+#define MORI_FIELD(x) visit(#x, request.x, defaults.x)
   MORI_FIELD(worldSize);
   MORI_FIELD(hiddenDim);
   MORI_FIELD(scaleDim);
@@ -222,7 +224,7 @@ enum class EpInterNodeKernel {
 
 // Geometry rules differ per pass, so the Request -> Cfg step is told which pass
 // it is building for -- the same reason MakeEpCfg takes EpKernelKind.
-EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequest& req,
+EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequest& request,
                                   EpInterNodeKernel kind);
 
 // Rendering, naming and geometry are shared by all eight Specs. Exposed so a
@@ -237,8 +239,8 @@ mori::jit::v2::LaunchGeometry EpInterNodeGeometry(const EpInterNodeCfg& cfg,
 // instantiates and in launch geometry.
 //
 // Declared by macro because the eight are identical: KernelSpec needs kName as a
-// constexpr string, so one class template over EpInterNodeKernel would need a parallel
-// constexpr name table -- more machinery than the lines it would save.
+// constexpr string, so one class template over EpInterNodeKernel would need a
+// parallel constexpr name table -- more machinery than the lines it would save.
 // ---------------------------------------------------------------------------
 #define MORI_EP_INTERNODE_DECLARE_SPEC(ClassName, planName)                       \
   class ClassName : public mori::jit::v2::KernelSpec<ClassName, EpInterNodeCfg> { \

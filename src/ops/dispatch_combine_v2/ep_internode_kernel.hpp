@@ -116,7 +116,8 @@ using EpDispatchCombineArgs = EpInterNodeArgs;
 //   EpInterNodePutSignal / EpInterNodePut / EpInterNodeAtomicAdd   thread scope: every active lane
 //       posts its own data WQE, and the flag atomic comes once from the group
 //       leader. Callers are divergent (they sit under `if (laneId == 0)` and
-//       inside the dedup ballot), so these must not contain a group barrier.
+//       inside the deduplication ballot), so these must not contain a group
+//       barrier.
 //   EpInterNodeQuiet                                 warp-collective. Its one call site
 //       is warp-uniform, and ccoGda::flush requires at least warp scope because
 //       it takes a warp-level CQ poll lock.
@@ -135,12 +136,14 @@ inline constexpr ::mori::core::ProviderType kEpInterNodeProvider = CCO_GDA_BUILD
 // one registered window (EpDispatchCombineHandle::MallocSymm), and RDMA names a
 // remote buffer as (window, byte offset) with iova=0 -- there is no peer VA to
 // hand the NIC, which is why a region is (window, offset).
-__device__ __forceinline__ ::mori::cco::ccoWindow_t EpInterNodeWin(const EpInterNodeRegion obj) {
-  return reinterpret_cast<::mori::cco::ccoWindow_t>(obj->win);
+__device__ __forceinline__ ::mori::cco::ccoWindow_t EpInterNodeWindow(
+    const EpInterNodeRegion region) {
+  return reinterpret_cast<::mori::cco::ccoWindow_t>(region->win);
 }
 
-__device__ __forceinline__ size_t EpInterNodeOff(const EpInterNodeRegion obj, size_t byteOffset) {
-  return obj->off + byteOffset;
+__device__ __forceinline__ size_t EpInterNodeOffset(const EpInterNodeRegion region,
+                                                    size_t byteOffset) {
+  return region->off + byteOffset;
 }
 
 // ── the remote actions ───────────────────────────────────────────────────────
@@ -161,8 +164,8 @@ __device__ __forceinline__ size_t EpInterNodeOff(const EpInterNodeRegion obj, si
 
 __device__ __forceinline__ ::mori::cco::ccoGda_WindowSignalAdd EpInterNodeFlagAdd(
     const EpInterNodeRegion flag, size_t flagOffset, uint64_t value) {
-  return ::mori::cco::ccoGda_WindowSignalAdd{EpInterNodeWin(flag), EpInterNodeOff(flag, flagOffset),
-                                             value};
+  return ::mori::cco::ccoGda_WindowSignalAdd{EpInterNodeWindow(flag),
+                                             EpInterNodeOffset(flag, flagOffset), value};
 }
 
 __device__ __forceinline__ void EpInterNodeAtomicAdd(const ::mori::cco::ccoDevComm& comm,
@@ -191,8 +194,9 @@ __device__ __forceinline__ void EpInterNodeAtomicAdd(const ::mori::cco::ccoDevCo
 // tokenId / warpSize is too). Aggregate skips the ballot and posts directly,
 // which is the shape shmem had. The warp aggregation itself is unaffected: it
 // lives in putImpl, below the ThreadMode branch, so one atomic per warp group
-// from the leader lane either way -- the shape the dedup call site depends on,
-// since its active lanes carry the same flag slot and the same value.
+// from the leader lane either way -- the shape the deduplication call site
+// depends on, since its active lanes carry the same flag slot and the same
+// value.
 __device__ __forceinline__ void EpInterNodePutSignal(const ::mori::cco::ccoDevComm& comm,
                                                      const EpInterNodeRegion dst, size_t dstOffset,
                                                      const EpInterNodeRegion src, size_t srcOffset,
@@ -201,9 +205,9 @@ __device__ __forceinline__ void EpInterNodePutSignal(const ::mori::cco::ccoDevCo
                                                      int pe, int qpId) {
   ::mori::cco::ccoGda<kEpInterNodeProvider> gda{comm, qpId};
   gda.template put<::mori::cco::CCO_TEAM_WORLD, ::mori::cco::ccoGdaThreadAggregate>(
-      pe, EpInterNodeWin(dst), EpInterNodeOff(dst, dstOffset), EpInterNodeWin(src),
-      EpInterNodeOff(src, srcOffset), bytes, EpInterNodeFlagAdd(signal, signalOffset, signalValue),
-      ::mori::cco::ccoCoopThread{});
+      pe, EpInterNodeWindow(dst), EpInterNodeOffset(dst, dstOffset), EpInterNodeWindow(src),
+      EpInterNodeOffset(src, srcOffset), bytes,
+      EpInterNodeFlagAdd(signal, signalOffset, signalValue), ::mori::cco::ccoCoopThread{});
 }
 
 __device__ __forceinline__ void EpInterNodePut(const ::mori::cco::ccoDevComm& comm,
@@ -213,8 +217,8 @@ __device__ __forceinline__ void EpInterNodePut(const ::mori::cco::ccoDevComm& co
   if ((threadIdx.x & (warpSize - 1)) != 0) return;
   ::mori::cco::ccoGda<kEpInterNodeProvider> gda{comm, qpId};
   gda.template put<::mori::cco::CCO_TEAM_WORLD, ::mori::cco::ccoGdaThreadIndependent>(
-      pe, EpInterNodeWin(dst), EpInterNodeOff(dst, dstOffset), EpInterNodeWin(src),
-      EpInterNodeOff(src, srcOffset), bytes, ::mori::cco::ccoGda_NoSignal{},
+      pe, EpInterNodeWindow(dst), EpInterNodeOffset(dst, dstOffset), EpInterNodeWindow(src),
+      EpInterNodeOffset(src, srcOffset), bytes, ::mori::cco::ccoGda_NoSignal{},
       ::mori::cco::ccoCoopThread{});
 }
 
@@ -224,8 +228,8 @@ __device__ __forceinline__ void EpInterNodePut(const ::mori::cco::ccoDevComm& co
 // created with (gdaContextCount).
 __device__ __forceinline__ void EpInterNodeQuiet(const ::mori::cco::ccoDevComm& comm, int pe,
                                                  int numQp) {
-  for (int q = 0; q < numQp; ++q) {
-    ::mori::cco::ccoGda<kEpInterNodeProvider> gda{comm, q};
+  for (int qpId = 0; qpId < numQp; ++qpId) {
+    ::mori::cco::ccoGda<kEpInterNodeProvider> gda{comm, qpId};
     gda.template flush<::mori::cco::CCO_TEAM_WORLD>(pe, ::mori::cco::ccoCoopWarp{});
   }
 }
@@ -1549,15 +1553,15 @@ __device__ void EpCombineSyncBarrier_body(EpDispatchCombineArgs args) {
 // the commas inside its brace initialiser would be taken as argument separators.
 
 // Kernels that reach the network.
-#define MORI_EP_INTERNODE_CCO_ENTRY(entry, body)                            \
-  extern "C" __global__ void entry(::mori::ops::v2::EpInterNodeCcoArgs a) { \
-    ::mori::ops::v2::body<kConfig, TokT>(a.args, a.devComm);                \
+#define MORI_EP_INTERNODE_CCO_ENTRY(entry, body)                                     \
+  extern "C" __global__ void entry(::mori::ops::v2::EpInterNodeCcoArgs kernelArgs) { \
+    ::mori::ops::v2::body<kConfig, TokT>(kernelArgs.args, kernelArgs.devComm);       \
   }
 
 // Staging, sync and the final reduction: local or intra-node only, so they take
 // no communicator. They still take the same argument struct, so the host has one
 // launch path for the whole sequence.
-#define MORI_EP_INTERNODE_CCO_ENTRY_LOCAL(entry, body)                      \
-  extern "C" __global__ void entry(::mori::ops::v2::EpInterNodeCcoArgs a) { \
-    ::mori::ops::v2::body<kConfig, TokT>(a.args);                           \
+#define MORI_EP_INTERNODE_CCO_ENTRY_LOCAL(entry, body)                               \
+  extern "C" __global__ void entry(::mori::ops::v2::EpInterNodeCcoArgs kernelArgs) { \
+    ::mori::ops::v2::body<kConfig, TokT>(kernelArgs.args);                           \
   }
