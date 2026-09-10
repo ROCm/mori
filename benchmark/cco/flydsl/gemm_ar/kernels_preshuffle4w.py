@@ -115,11 +115,15 @@ Two things in the ISA fit that:
   1 to 11 -- MFMA hazard slots filled deliberately rather than covered by a
   wait.
 
-Not settled: feeding constant scales instead of loading them does not change
-the time, which argues the tight waits are on the B fragment rather than on the
-scale loads. Separating a load from its use -- CK advances its scale copies a
-window ahead, ``a_scale_thread_copy`` plus ``MoveSrcSliceWindow`` -- is the
-obvious thing to try next.
+Both were followed up, and both are dead ends. The tight waits are the scale
+loads, not the B fragment: every ``vmcnt(0..1)`` is followed straight by the
+promote's ``v_pk_mul``/``v_pk_fma``, while every wait next to an MFMA sits at
+``vmcnt(14..17)`` -- so our B pipeline already runs where CK's does. And those
+scale waits cost nothing. Issuing the loads a full M-row of MFMAs ahead of
+their use does not relax them (they stay at 0/0/0/1/2) and does not move the
+clock; neither does removing them outright. The data is small and L1-resident,
+so the wait is satisfied as soon as it is reached. A static "tight wait" is not
+a stall.
 
 An ATT capture would settle it directly and did not work out. The single-GPU
 probe route is blocked by an HSA teardown assertion (``ScratchCache not empty
