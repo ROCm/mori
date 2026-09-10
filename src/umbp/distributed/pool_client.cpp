@@ -716,6 +716,37 @@ size_t RangedScratchShards() {
   return n;
 }
 
+// How long a routing answer may be reused.  0 is the default and is
+// bit-identical to routing every call.
+//
+// Read per call rather than cached in a static: the value has to be settable
+// from a test, and a static is fixed by whichever test ran first.  One getenv
+// against a gRPC round trip does not register.
+std::chrono::milliseconds RouteReuseWindow() {
+  long long ms = 0;
+  if (const char* value = std::getenv("UMBP_DISTRIBUTED_ROUTE_REUSE_MS")) {
+    char* end = nullptr;
+    const long long parsed = std::strtoll(value, &end, 10);
+    if (end != value && *end == '\0' && parsed >= 0) ms = parsed;
+  }
+  return std::chrono::milliseconds{ms};
+}
+
+// One entry per key set a load interleaves, which is one per pool.  DSv4 has
+// six; 8 leaves headroom without making the linear scan matter.
+size_t RouteReuseSlots() {
+  static const size_t slots = [] {
+    size_t n = 8;
+    if (const char* value = std::getenv("UMBP_DISTRIBUTED_ROUTE_REUSE_SLOTS")) {
+      char* end = nullptr;
+      const unsigned long long parsed = std::strtoull(value, &end, 10);
+      if (end != value && *end == '\0' && parsed > 0) n = static_cast<size_t>(parsed);
+    }
+    return std::min<size_t>(n, 64);
+  }();
+  return slots;
+}
+
 bool AlignUpChecked(size_t value, size_t alignment, size_t* out) {
   if (!out || alignment == 0) return false;
   const size_t remainder = value % alignment;
@@ -1129,8 +1160,10 @@ bool PoolClient::Init() {
   // plausible numbers, and local_first in particular changes whether the master
   // is consulted at all -- it is worth 30% of a fully-local call.
   MORI_UMBP_INFO(
-      "[PoolClient] routing: local_first={} cache_remote_fetches={} ranged_locality_prefetch={}",
-      config_.local_first, config_.cache_remote_fetches, config_.ranged_locality_prefetch);
+      "[PoolClient] routing: local_first={} cache_remote_fetches={} "
+      "ranged_locality_prefetch={} route_reuse_ms={}",
+      config_.local_first, config_.cache_remote_fetches, config_.ranged_locality_prefetch,
+      RouteReuseWindow().count());
 
   if (master_client_) master_client_->SetBackendRegistry(&registry_);
 
@@ -3289,6 +3322,66 @@ void PoolClient::ScratchArena::Release(size_t index, size_t count) {
   cv_.notify_all();
 }
 
+// BatchRouteGet, answered from the previous call when it asked for the same
+// keys inside the reuse window.  A layer-wise load walks one key set once per
+// layer group, so groups 2..N re-ask what group 1 just asked.
+//
+// The RPC is issued OUTSIDE the lock: holding it across a round trip would
+// serialize every caller on this client, which is the bug sharding the scratch
+// arena just removed.  Two callers missing at once therefore both route, which
+// costs a saving, never correctness.
+bool PoolClient::BatchRouteGetReusing(const std::vector<std::string>& keys, double* route_sink,
+                                      std::vector<std::optional<RouteGetResult>>* out) {
+  const auto window = RouteReuseWindow();
+  const auto now = std::chrono::steady_clock::now();
+  if (window.count() > 0) {
+    std::lock_guard<std::mutex> lock(route_reuse_.mutex);
+    for (const auto& entry : route_reuse_.entries) {
+      if (entry.valid && now - entry.at <= window && entry.keys == keys) {
+        *out = entry.routes;
+        return true;
+      }
+    }
+  }
+
+  std::unordered_set<std::string> excludes{config_.master_config.node_id};
+  {
+    PhaseTimer route_timer(route_sink);
+    auto status = master_client_->BatchRouteGet(keys, excludes, out);
+    if (!status.ok()) {
+      MORI_UMBP_ERROR("[PoolClient] BatchGetRanges: BatchRouteGet failed: {}",
+                      status.error_message());
+      return false;
+    }
+  }
+  out->resize(keys.size());
+
+  if (window.count() > 0) {
+    const size_t slots = RouteReuseSlots();
+    std::lock_guard<std::mutex> lock(route_reuse_.mutex);
+    if (route_reuse_.entries.size() < slots) route_reuse_.entries.resize(slots);
+    // Replace this key set's own entry if it has one, so a repeatedly-refreshed
+    // set cannot push the other pools' entries out.
+    size_t slot = slots;
+    for (size_t i = 0; i < slots; ++i) {
+      if (route_reuse_.entries[i].valid && route_reuse_.entries[i].keys == keys) {
+        slot = i;
+        break;
+      }
+    }
+    if (slot == slots) {
+      slot = route_reuse_.next;
+      route_reuse_.next = (route_reuse_.next + 1) % slots;
+    }
+    auto& entry = route_reuse_.entries[slot];
+    entry.keys = keys;
+    entry.routes = *out;
+    entry.at = std::chrono::steady_clock::now();
+    entry.valid = true;
+  }
+  return true;
+}
+
 // The route-first arm of BatchGetRanges: one BatchRouteGet over EVERY key,
 // issued before anything is served.
 //
@@ -3310,16 +3403,7 @@ bool PoolClient::RouteAllRangesUpFront(const std::vector<std::string>& keys, dou
     preroutes->assign(keys.size(), std::nullopt);
     return true;
   }
-  std::unordered_set<std::string> excludes{config_.master_config.node_id};
-  PhaseTimer route_timer(route_sink);
-  auto status = master_client_->BatchRouteGet(keys, excludes, preroutes);
-  if (!status.ok()) {
-    MORI_UMBP_ERROR("[PoolClient] BatchGetRanges: BatchRouteGet failed: {}",
-                    status.error_message());
-    return false;
-  }
-  preroutes->resize(keys.size());
-  return true;
+  return BatchRouteGetReusing(keys, route_sink, preroutes);
 }
 
 // Routes for the keys the local phase missed, parallel to `missed`.
@@ -3341,15 +3425,8 @@ bool PoolClient::RouteMissedRanges(const std::vector<std::string>& route_keys,
   if (!config_.local_first) {
     routes->reserve(missed.size());
     for (size_t index : missed) routes->push_back(preroutes[index]);
-  } else {
-    std::unordered_set<std::string> excludes{config_.master_config.node_id};
-    PhaseTimer route_timer(route_sink);
-    auto status = master_client_->BatchRouteGet(route_keys, excludes, routes);
-    if (!status.ok()) {
-      MORI_UMBP_ERROR("[PoolClient] BatchGetRanges: BatchRouteGet failed: {}",
-                      status.error_message());
-      return false;
-    }
+  } else if (!BatchRouteGetReusing(route_keys, route_sink, routes)) {
+    return false;
   }
   routes->resize(route_keys.size());
   return true;

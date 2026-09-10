@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <optional>
@@ -1431,6 +1432,88 @@ TEST_F(PoolClientRangesTest, ConcurrentMixedShapesAllReturnCorrectBytes) {
     GTEST_LOG_(INFO) << failures.load()
                      << " reads were refused (capacity), none returned bad bytes";
   }
+}
+
+// Route reuse is off by default, so the two tests below have to switch it on
+// or they would pass without touching the path they exist for.
+class ScopedRouteReuse {
+ public:
+  explicit ScopedRouteReuse(const char* ms) {
+    if (const char* old = std::getenv(kVar)) {
+      had_ = true;
+      old_ = old;
+    }
+    ::setenv(kVar, ms, 1);
+  }
+  ~ScopedRouteReuse() {
+    if (had_) {
+      ::setenv(kVar, old_.c_str(), 1);
+    } else {
+      ::unsetenv(kVar);
+    }
+  }
+
+ private:
+  static constexpr const char* kVar = "UMBP_DISTRIBUTED_ROUTE_REUSE_MS";
+  bool had_ = false;
+  std::string old_;
+};
+
+// The shape route reuse exists for: one key set, read once per layer group.
+TEST_F(PoolClientRangesTest, RepeatedGroupsOverOneKeySetAllReturnTheirBytes) {
+  ScopedRouteReuse reuse("5000");
+  const std::string key = "reuse-groups";
+  std::vector<char> object(kObjectSize);
+  for (size_t i = 0; i < kObjectSize; ++i) object[i] = static_cast<char>((i * 47 + 11) & 0xff);
+  SeedRemoteObject(key, object);
+
+  for (size_t group = 0; group < 4; ++group) {
+    const size_t offset = group * 600;
+    std::vector<char> out(600, 0);
+    std::vector<std::vector<void*>> ptrs = {{out.data()}};
+    std::vector<std::vector<size_t>> sizes = {{600}};
+    std::vector<std::vector<size_t>> offsets = {{offset}};
+    auto got = caller_->BatchGetRanges({key}, ptrs, sizes, offsets);
+    ASSERT_EQ(got.size(), 1u);
+    EXPECT_TRUE(got[0]) << "group " << group;
+    EXPECT_EQ(std::memcmp(out.data(), object.data() + offset, 600), 0) << "group " << group;
+  }
+}
+
+// The failure mode reuse could introduce: a second call that asks about
+// DIFFERENT keys must not be handed the first call's routes.  Both key sets
+// have the same size here, so a comparison that only checked the count would
+// pass the stale answer through and read the wrong object.
+TEST_F(PoolClientRangesTest, RouteReuseDoesNotAnswerADifferentKeySet) {
+  ScopedRouteReuse reuse("5000");
+  const std::string first_key = "reuse-first";
+  const std::string second_key = "reuse-second";
+  std::vector<char> first(kObjectSize), second(kObjectSize);
+  for (size_t i = 0; i < kObjectSize; ++i) {
+    first[i] = static_cast<char>((i * 53 + 13) & 0xff);
+    second[i] = static_cast<char>((i * 59 + 17) & 0xff);
+  }
+  SeedRemoteObject(first_key, first);
+  SeedRemoteObject(second_key, second);
+
+  auto read = [&](const std::string& key, std::vector<char>* out) {
+    out->assign(600, 0);
+    std::vector<std::vector<void*>> ptrs = {{out->data()}};
+    std::vector<std::vector<size_t>> sizes = {{600}};
+    std::vector<std::vector<size_t>> offsets = {{900}};
+    return caller_->BatchGetRanges({key}, ptrs, sizes, offsets);
+  };
+
+  std::vector<char> out_first, out_second;
+  auto got_first = read(first_key, &out_first);
+  ASSERT_EQ(got_first.size(), 1u);
+  ASSERT_TRUE(got_first[0]);
+
+  auto got_second = read(second_key, &out_second);
+  ASSERT_EQ(got_second.size(), 1u);
+  EXPECT_TRUE(got_second[0]);
+  EXPECT_EQ(std::memcmp(out_second.data(), second.data() + 900, 600), 0);
+  EXPECT_NE(out_second, out_first);
 }
 
 }  // namespace

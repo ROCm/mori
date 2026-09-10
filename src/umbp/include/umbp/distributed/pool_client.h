@@ -414,6 +414,34 @@ class PoolClient {
                          const std::vector<std::optional<RouteGetResult>>& preroutes,
                          double* route_sink, std::vector<std::optional<RouteGetResult>>* routes);
 
+  // BatchRouteGet, answered from the previous call when it asked for the same
+  // keys within the reuse window.  A layer-wise load walks one key set once per
+  // layer group, so the second and later groups re-ask the master a question it
+  // has just answered.
+  bool BatchRouteGetReusing(const std::vector<std::string>& keys, double* route_sink,
+                            std::vector<std::optional<RouteGetResult>>* out);
+
+  // The window bounds how stale a reused answer can be, and so also how long
+  // the master can go without seeing a key: BatchLookupBlockForRouteGet records
+  // access and grants a lease, and eviction is LRU on that timestamp.
+  //
+  // Several entries, not one: a load walks its pools inside each layer group,
+  // so consecutive calls alternate between the pools' key sets and a
+  // single-entry cache is evicted by the next pool before the next group can
+  // use it.  Measured: with one entry the hit rate was zero.
+  struct RouteReuseEntry {
+    std::vector<std::string> keys;
+    std::vector<std::optional<RouteGetResult>> routes;
+    std::chrono::steady_clock::time_point at{};
+    bool valid = false;
+  };
+  struct RouteReuse {
+    std::mutex mutex;
+    std::vector<RouteReuseEntry> entries;
+    size_t next = 0;
+  };
+  RouteReuse route_reuse_;
+
   // The ranged counterpart of BuildLocalPageTransfers, and the only place the
   // object-range -> page-range mapping lives.  Emits one TransferItem per
   // (range x page) intersection; the engines coalesce adjacent ones back into
