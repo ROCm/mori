@@ -145,12 +145,15 @@ class EpDispatchCombineConfig:
     #   "v2_ll"  low latency: no dedup across expert slots, one entry per node
     #            per token, which wins while the wire is not the bottleneck.
     #   "auto"   compile BOTH and pick per launch from the token count, at
-    #            internode_ll_max_tokens. This is the only mode that can switch
+    #            internode_auto_ll_max_tokens. This is the only mode that can switch
     #            at runtime, and it is the only one that pays for both compiles.
     internode_kernel: str = "auto"
-    # The "auto" crossover, in tokens per rank: <= this takes v2_ll. Read only
-    # when internode_kernel == "auto".
-    internode_ll_max_tokens: int = 512
+    # The "auto" crossover. Compared against THIS CALL's token count -- dispatch
+    # uses input.shape[0], combine routing.cur_rank_num_token -- so one op
+    # alternates between the families as the batch changes; it is not a property
+    # of the shape. Unrelated to max_num_inp_token_per_rank, which is the
+    # capacity. Read only when internode_kernel == "auto".
+    internode_auto_ll_max_tokens: int = 512
     # Which kernel backend serves this op: "flydsl" (default, full intranode
     # feature set) or "hip" (HIP/JIT: gather only, no quant, no StdMoE, no
     # routing replay; dispatch transports bf16/fp32/fp8/fp4 and combine reduces
@@ -205,10 +208,10 @@ class EpDispatchCombineConfig:
                 f"internode_kernel must be one of {_INTERNODE_KERNELS}, got "
                 f"{self.internode_kernel!r}"
             )
-        if self.internode_ll_max_tokens < 0:
+        if self.internode_auto_ll_max_tokens < 0:
             raise ValueError(
-                "internode_ll_max_tokens must be >= 0, got "
-                f"{self.internode_ll_max_tokens}"
+                "internode_auto_ll_max_tokens must be >= 0, got "
+                f"{self.internode_auto_ll_max_tokens}"
             )
         if self.combine_mode not in ("gather", "scatter"):
             raise ValueError(

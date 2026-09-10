@@ -470,7 +470,7 @@ combinesync + combinesyncbarrier + combine 或 combine_ll + combineall。
 （`EpDispatchCombineConfig.is_internode`）决定，只有 `hip` 后端实现它，FlyDSL 后端在能力门里直接
 报错；走哪一族由 `internode_kernel = auto | v2 | v2_ll` 决定。`v2` 和 `v2_ll` 是**两族独立
 kernel**——独立的 JIT 模块、入口符号和缓存 key，不是一个 body 的两个分支——所以点名一族就只编那一族；
-`auto`（默认）两族都编，按 launch 的 token 数在 `internode_ll_max_tokens`（默认 512）处切换，
+`auto`（默认）两族都编，按 launch 的 token 数在 `internode_auto_ll_max_tokens`（默认 512）处切换，
 也只有它能在运行时切。
 
 ## 10. 测试

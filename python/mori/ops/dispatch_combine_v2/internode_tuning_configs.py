@@ -24,7 +24,7 @@
 
 One table for BOTH internode families: "v2" and "v2_ll" are compiled from the
 same request, so a row's geometry is whichever family the launch resolves to.
-The coarsest row also spans the token counts above ``internode_ll_max_tokens``,
+The coarsest row also spans the token counts above ``internode_auto_ll_max_tokens``,
 where "auto" stops picking the LL family -- there it is "v2" geometry only.
 
 The internode kernels reach their grid a different way than the intranode ones.

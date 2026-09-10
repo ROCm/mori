@@ -255,9 +255,9 @@ def _parse_args(argv):
     # v2 and v2_ll are separate kernels. Naming one compiles only that one and
     # runs it at every token count, which is what makes a benchmark number
     # comparable to another harness's. "auto" compiles both and picks per launch
-    # at --ll-max-tokens.
+    # at --auto-ll-max-tokens.
     p.add_argument("--kernel-type", default="auto", choices=["auto", "v2", "v2_ll"])
-    p.add_argument("--ll-max-tokens", type=int, default=512)
+    p.add_argument("--auto-ll-max-tokens", type=int, default=512)
     return p.parse_args(argv)
 
 
@@ -1230,7 +1230,7 @@ def main(argv):
             gpu_per_node=gpu_per_node,
             num_qp_per_pe=a.num_qp,
             internode_kernel=a.kernel_type,
-            internode_ll_max_tokens=a.ll_max_tokens,
+            internode_auto_ll_max_tokens=a.auto_ll_max_tokens,
             kernel_backend="hip",
         )
         op = EpDispatchCombineOp(cfg, comm)

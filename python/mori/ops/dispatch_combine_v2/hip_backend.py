@@ -40,7 +40,7 @@ gpu_per_node; there is no kernel_type enum on the v2 side):
   leg (no fp4). "v2" and "v2_ll" are two distinct kernel families rather than
   a runtime branch: ``cfg.internode_kernel`` (auto | v2 | v2_ll) says which are
   compiled, and only "auto" compiles both and chooses per launch, at
-  ``cfg.internode_ll_max_tokens``. Geometry is a compile-time identity on this
+  ``cfg.internode_auto_ll_max_tokens``. Geometry is a compile-time identity on this
   path, so every bucket of ``internode_tuning_configs`` is built up front.
   No other backend implements internode.
 
@@ -683,7 +683,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             return False
         if k == "v2_ll":
             return True
-        return num_tokens <= self.cfg.internode_ll_max_tokens
+        return num_tokens <= self.cfg.internode_auto_ll_max_tokens
 
     _PIN_FIELDS = {
         "dispatch": (
