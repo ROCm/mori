@@ -190,6 +190,39 @@ per-iteration -- 20.9us a K-block against 14.5, 44% more, on a loop body with
 fewer instructions. Occupancy cannot absorb it either: --waves-per-eu 3 and 4
 spill outright (2729 and 4719us), so both kernels sit at two waves a SIMD.
 
+Hardware counters close the question of what the difference is *not*
+(``rocprofv3 --pmc``, same shape, 8 ranks against CK's single process):
+
+=========================  ==============  ==============  ======
+counter                            ours              CK     ratio
+=========================  ==============  ==============  ======
+SQ_INSTS_MFMA                   7,340,032       7,340,032    1.00
+SQ_INSTS_VALU                  55,078,912      55,881,728    0.99
+SQ_VALU_MFMA_BUSY_CYCLES      234,881,024     234,881,024    1.00
+MemUnitStalled                      0.11%           0.05%       -
+FetchSize                        483.6 MB        520.5 MB    0.93
+SQ_WAIT_INST_LDS                2,442,413      33,294,145    0.07
+SQ_WAIT_ANY                   156,021,602     120,383,045    1.30
+SQ_WAVE_CYCLES                386,929,422     333,626,547    1.16
+=========================  ==============  ==============  ======
+
+Identical MFMA instructions, identical MFMA-pipe busy cycles, VALU within 1%.
+Memory is not the bottleneck for either -- ``MemUnitStalled`` is ~0 and we
+fetch *less* -- and it is not LDS, where we wait 13x less than CK does. What is
+left is 36M more cycles of ``SQ_WAIT_ANY``, and an MFMA pipe idle 53M cycles
+longer.
+
+``SQ_VALU_MFMA_COEXEC_CYCLES`` looked like the lever and is not. Ours is 50.8M
+against CK's 67.1M, but that is a symptom: with ``swap_ab`` on we issue 44.8M
+VALU instructions against CK's 55.9M and overlap 57.6M cycles, a ratio of 1.28
+against CK's 1.20 -- better overlap per instruction, fewer instructions to
+overlap, still slower. And nothing moves it: promote batch sizes of 1, 2 and 4,
+with and without ``rocdl.sched_barrier(0)`` pinning each group, all measure
+50.8-50.9M.
+
+So the 44%-per-iteration gap is cycles the wave spends waiting on something
+none of these counters name. Recorded rather than solved.
+
 
 Two structural notes that came out of the port. B never touches LDS here --
 ``thr_g2r_B``/``frag_B_stages`` load it global->VGPR double-buffered, as CK's
