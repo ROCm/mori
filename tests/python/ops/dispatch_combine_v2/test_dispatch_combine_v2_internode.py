@@ -176,7 +176,13 @@ class Dist:
 
 def _parse_args(argv):
     parser = argparse.ArgumentParser(description="v2 internode dispatch/combine test")
-    parser.add_argument("--cmd", default="test", choices=["test", "bench", "tuning"])
+    parser.add_argument(
+        "--cmd", default="test", choices=["test", "bench", "tuning", "stress"]
+    )
+    # stress only: how many datasets to cycle, and how often to drain the queue.
+    # v1 uses 128 and 128; matching them keeps the two soaks comparable.
+    parser.add_argument("--stress-datasets", type=int, default=128)
+    parser.add_argument("--stress-sync-interval", type=int, default=128)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--hidden-dim", type=int, default=7168)
     parser.add_argument("--topk", type=int, default=8)
@@ -1065,6 +1071,71 @@ def _median(values):
     return ordered[len(ordered) // 2]
 
 
+def _stress(op, cfg, dist_handle, device, args, comm):
+    """v1's stress case: cycle pre-generated rounds with VARYING token counts.
+
+    Deliberately different from --cmd bench, which sends max_tokens every round
+    from one buffer. Here each rank draws a fresh count in [1, max_tokens] per
+    dataset, so the soak covers what a fixed-size bench cannot: ragged and
+    unequal loads, the chunk protocol's empty-chunk path, and -- under
+    internode_kernel="auto" -- the per-call switch between the v2 and v2_ll
+    families, since the counts fall on both sides of the crossover.
+
+    No per-round verification: this looks for hangs, faults and protocol drift
+    over many rounds, and checking every round would hide them behind the
+    check's own synchronisation. The queue is drained every
+    --stress-sync-interval rounds rather than every round for the same reason.
+
+    v1 follows its soak with a CUDA-graph phase. Not reproduced here: graph
+    capture over the internode plan sequence is untested, and adding it to a
+    soak would confuse a capture bug with a protocol one.
+    """
+    rng = torch.Generator(device=device)
+    rng.manual_seed(20260910 + dist_handle.rank)
+    max_tokens = args.max_tokens
+
+    counts = torch.randint(
+        1, max_tokens + 1, [args.stress_datasets], generator=rng, device=device
+    ).tolist()
+    datasets = [
+        _generate_round(rng, cfg, int(n), device, cfg.dispatch_dtype, args.routing)
+        for n in counts
+    ]
+    used_ll = {n: op._internode_use_ll(n) for n in set(counts)}
+    if dist_handle.rank == 0:
+        families = sorted({("v2_ll" if v else "v2") for v in used_ll.values()})
+        print(
+            f"# STRESS rounds={args.rounds} datasets={args.stress_datasets} "
+            f"tokens=[{min(counts)},{max(counts)}] of {max_tokens} "
+            f"routing={args.routing} kernel={args.kernel_type} "
+            f"families exercised: {'+'.join(families)}",
+            flush=True,
+        )
+
+    dist.barrier()
+    started = time.time()
+    for i in range(args.rounds):
+        inp, idx, wts, sc = datasets[i % len(datasets)]
+        dispatch_out = op.dispatch(inp, wts, sc, idx, return_routing=True)
+        combine_input = (
+            dispatch_out[0].to(cfg.combine_dtype)
+            if cfg.is_asymmetric_dtype
+            else dispatch_out[0]
+        )
+        op.combine(combine_input, wts, routing=dispatch_out[5])
+        if i % args.stress_sync_interval == 0:
+            torch.cuda.synchronize()
+    torch.cuda.synchronize()
+    comm.barrier()
+
+    if dist_handle.rank == 0:
+        print(
+            f"# STRESS OK: {args.rounds} rounds in {time.time() - started:.1f}s",
+            flush=True,
+        )
+    return 0
+
+
 def _tune(cfg, dist_handle, device, args, comm):
     """Sweep launch geometries and report the winner for this token count.
 
@@ -1481,6 +1552,12 @@ def main(argv):
 
         if args.cmd == "bench":
             return_code = _bench(op, cfg, dist_handle, device, args, comm)
+            op.close()
+            dist_handle.shutdown()
+            return return_code
+
+        if args.cmd == "stress":
+            return_code = _stress(op, cfg, dist_handle, device, args, comm)
             op.close()
             dist_handle.shutdown()
             return return_code

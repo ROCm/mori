@@ -24,7 +24,7 @@
 #
 # --entry selects which driver torchrun runs, defaulting to the shmem AOT harness.
 # The v2 CCO entry takes a SUBSET of the same CLI: --cmd is only test|bench|tuning
-# (no stress/test_sentinel/sweep_bench/profile), --kernel-type is auto|v2|v2_ll
+# (no test_sentinel/sweep_bench/profile), --kernel-type is auto|v2|v2_ll
 # against v1's v1|v1_ll|async_ll (they are different kernels, not a renaming), and
 # it accepts neither --max-recv-total-tokens nor --sentinel-pattern. It is the
 # only entry that takes --rounds.

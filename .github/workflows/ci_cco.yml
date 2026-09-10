@@ -507,6 +507,11 @@ jobs:
           # deadlock: under the old flushAsync it hung within a few hundred rounds
           # at this token count, and the round loop is what makes the window get
           # hit at all -- a single bench pass can clear it by luck.
+          #
+          # --cmd stress rather than bench, matching ci.yml's shmem soak: it
+          # cycles datasets with VARYING per-rank token counts, so it also covers
+          # ragged loads, the empty-chunk path, and -- with kernel-type auto --
+          # the per-call switch between the v2 and v2_ll families.
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
           PORT=29280
           echo "=== cco stress max-tokens=4096 port=$PORT ==="
@@ -514,13 +519,13 @@ jobs:
             $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT
             --rank 1 --master-addr $NODE1_HOST --master-port $PORT
             --ifname $NODE2_IFNAME --entry $ENTRY
-            --cmd bench --rounds 2000 --kernel-type v2 --dtype bf16 --max-tokens 4096
+            --cmd stress --rounds 2000 --kernel-type auto --dtype bf16 --max-tokens 4096
           )
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
           $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT \
             --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
             --ifname $NODE1_IFNAME --entry $ENTRY \
-            --cmd bench --rounds 2000 --kernel-type v2 --dtype bf16 --max-tokens 4096
+            --cmd stress --rounds 2000 --kernel-type auto --dtype bf16 --max-tokens 4096
           wait
 
       - name: Cleanup node1
