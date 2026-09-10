@@ -685,6 +685,33 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             return True
         return num_tokens <= self.cfg.internode_ll_max_tokens
 
+    _PIN_FIELDS = {
+        "dispatch": (
+            "dispatch_block_num",
+            "dispatch_rdma_block_num",
+            "warp_num_per_block",
+        ),
+        "combine": (
+            "combine_block_num",
+            "combine_rdma_block_num",
+            "combine_warp_num_per_block",
+        ),
+    }
+
+    def _pin_over(self, cfg, phase, g):
+        """Overlay the caller's pinned geometry on a tuned triple, field by field.
+
+        A pinned field is a manual override and beats the table; an unpinned one
+        keeps what the table chose. cfg._pinned_geometry is the caller's original
+        input -- by this point every field holds a number, because
+        _resolve_geometry() filled the unpinned ones with the untuned fallback.
+        """
+        pinned = getattr(cfg, "_pinned_geometry", frozenset())
+        return tuple(
+            getattr(cfg, name) if name in pinned else v
+            for name, v in zip(self._PIN_FIELDS[phase], g)
+        )
+
     @staticmethod
     def _fit_internode_geom(g):
         """Force rdma_block_num < block_num.
@@ -770,7 +797,13 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 max_tok if max_tok is not None else 1 << 30,
                 dtype=dtype,
             )
-            out.append((max_tok, g["dispatch"], g["combine"]))
+            out.append(
+                (
+                    max_tok,
+                    self._pin_over(cfg, "dispatch", g["dispatch"]),
+                    self._pin_over(cfg, "combine", g["combine"]),
+                )
+            )
         return out
 
     def _build_internode_kernels(self, cfg) -> KernelSet:

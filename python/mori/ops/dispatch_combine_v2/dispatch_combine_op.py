@@ -102,15 +102,11 @@ class EpDispatchCombineConfig:
     # these to opt out. Combine keeps its own warp count -- its K-deep per-lane MLP
     # saturates sooner than dispatch's copy.
     #
-    # Intranode only. On the internode path pinning these does NOT opt out: the
-    # backend takes its geometry from internode_tuning_configs, and on a shape the
-    # table knows (device, world_size, hidden_dim, num_experts_per_token) it reads
-    # none of the six geometry fields: the two rdma ones below are dropped, and
-    # the four block/warp ones survive only as the KernelSet key that names the
-    # one wrapper. They are read on the two paths that leave the table: an untuned
-    # shape, where the six become the single geometry bucket, and a
-    # MORI_EP_DISP_GEOM / MORI_EP_COMB_GEOM pin, which bypasses the table and
-    # falls back to the config triple for whichever of the two legs was not pinned.
+    # Pinning is per FIELD, not all-or-nothing: on the internode path a pinned
+    # field overrides the tuning table for every token bucket while the fields
+    # left None stay tuned, so you can fix one knob without hand-writing the
+    # other five. MORI_EP_DISP_GEOM / MORI_EP_COMB_GEOM override the whole triple
+    # for a leg and bypass the table entirely.
     dispatch_block_num: int = None
     combine_block_num: int = None
     warp_num_per_block: int = None
@@ -129,18 +125,17 @@ class EpDispatchCombineConfig:
     # and must agree with the communicator's LSA team, which the op checks at
     # construction rather than assuming.
     gpu_per_node: int = None
-    # QPs per peer on the RDMA leg. Only read on the internode path; the default
-    # of 1 starves it (~1.5x) but is the safe value for a config that never
-    # reaches RDMA.
-    num_qp_per_pe: int = 1
+    # QPs per peer on the RDMA leg. Only read on the internode path, where 1
+    # starves it (~1.5x); the intranode path never reaches RDMA and ignores it,
+    # so the default is the value the only consumer wants.
+    num_qp_per_pe: int = 2
     # Widest transported element, which is what sizes the staging buffers. None
     # => max over the two legs, which is what the buffers actually have to hold.
     max_token_type_size: int = None
     # RDMA-block split of the grid, per phase. Runtime, never compiled in:
     # dispatch and combine are deliberately tuned to DIFFERENT values (see
     # internode_tuning_configs), so one compiled-in value cannot serve both.
-    # Read only on the untuned-shape and env-pin paths, like the block/warp
-    # fields above.
+    # Pinnable like the block/warp fields above, and clamped to < block_num.
     dispatch_rdma_block_num: int = None
     combine_rdma_block_num: int = None
     # Which of the two internode kernel families runs. "v2" and "v2_ll" are
@@ -290,6 +285,23 @@ class EpDispatchCombineConfig:
                 f"{self.elem_size}, combine {self.combine_elem_size}); it sizes "
                 "the staging regions, so a smaller value corrupts them"
             )
+
+        # What the CALLER pinned, captured before _resolve_geometry() fills the
+        # rest: afterwards every field holds a number and the two are
+        # indistinguishable. The internode backend overlays these on top of its
+        # tuning table, so a pinned field wins and an unpinned one is tuned.
+        self._pinned_geometry = frozenset(
+            n
+            for n in (
+                "dispatch_block_num",
+                "combine_block_num",
+                "warp_num_per_block",
+                "combine_warp_num_per_block",
+                "dispatch_rdma_block_num",
+                "combine_rdma_block_num",
+            )
+            if getattr(self, n) is not None
+        )
 
         self._resolve_geometry()
 

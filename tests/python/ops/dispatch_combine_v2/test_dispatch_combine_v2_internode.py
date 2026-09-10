@@ -187,7 +187,7 @@ def _parse_args(argv):
     p.add_argument("--dtype", default="bf16", choices=list(_DTYPES))
     p.add_argument("--combine-dtype", default=None, choices=list(_DTYPES))
     p.add_argument("--quant-type", default="none", choices=["none", "fp8_direct_cast"])
-    p.add_argument("--num-qp", type=int, default=2)
+    p.add_argument("--num-qp", type=int, default=1)
     # 30, matching _EP_ROUNDS in the examples harness. Lower is not a
     # small-sample caveat but a different estimator: at --rounds 3 with
     # --drop-rounds 1 the two kept rounds are the ones that harness documents as
