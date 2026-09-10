@@ -59,15 +59,20 @@ __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
                                             mori::cco::ccoDevComm devComm,
                                             mori::cco::ccoWindow_t heapWin) {
   // recvBuf's byte offset within the heap window is identical on every rank
-  // (symmetric layout), so dstPe's recv slot resolves via the same offset.
-  const size_t heapBase = reinterpret_cast<uintptr_t>(mori::cco::ccoGetLocalPtr(heapWin));
-  const size_t dstOff = reinterpret_cast<uintptr_t>(recvBuf) - heapBase;
+  // (symmetric layout), so my local recvBuf pointer maps to peer p's copy by the
+  // flat-VA rank delta (pe - lsaRank)*stride4G<<32 -- the same inline LSA
+  // addressing the reduce-scatter/all-reduce push kernels use. winBase cancels
+  // out, so this needs no ccoGetLocalPtr/ccoGetLsaPeerPtr round trip.
+  uint8_t* const localDst = reinterpret_cast<uint8_t*>(recvBuf);
+  const int myLsaRank = heapWin->lsaRank;
+  const uint32_t stride4G = heapWin->stride4G;
   StartSdmaScatter(
       devComm.sdma, npes, /*logS=*/0, numBytes,
       [=](int peer) { return peer == dstPe; },
       [=](int) -> const uint8_t* { return reinterpret_cast<const uint8_t*>(sendBuf); },
       [=](int peer) -> uint8_t* {
-        return reinterpret_cast<uint8_t*>(mori::cco::ccoGetLsaPeerPtr(heapWin, peer, dstOff));
+        int32_t diff = (peer - myLsaRank) * static_cast<int32_t>(stride4G);
+        return localDst + (static_cast<uint64_t>(diff) << 32);
       });
 
   uint64_t* __restrict__ signalBuf = devComm.sdma.signalBuf;
