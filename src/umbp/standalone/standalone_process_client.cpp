@@ -463,6 +463,16 @@ uint64_t StandaloneProcessClient::LookupKeyHandle(const std::vector<std::string>
     *fingerprint = 0;
     return 0;
   }
+  // Same signal when this client keeps no handles at all. Without it the switch
+  // is only half a switch: RememberKeyHandle drops the handle, but the server
+  // has already been told to keep the key set alive for a client that will
+  // never ask for it -- a table of them, at the server's whole capacity. It
+  // also skips fingerprinting every key on a call that has no use for the
+  // answer.
+  if (KeyHandleSlots() == 0) {
+    *fingerprint = 0;
+    return 0;
+  }
   {
     std::lock_guard<std::mutex> lock(key_handle_mu_);
     for (size_t i = 0; i < key_handles_.size(); ++i) {

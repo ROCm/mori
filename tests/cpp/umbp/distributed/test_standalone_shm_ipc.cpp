@@ -1018,5 +1018,128 @@ TEST(StandaloneShmIpcTest, RangedGetKeyHandlesSurviveALongerCycleThanTheOldCapac
   unlink(fd_path.c_str());
 }
 
+// Turning the handles off has to turn off what they cost the server too.
+//
+// The client keeps none when UMBP_KEY_HANDLE_SLOTS=0, but it used to send a
+// fingerprint anyway, and a fingerprint is precisely the server's instruction
+// to remember the key set. The result was a table filled to capacity on behalf
+// of a client that would never name any of it -- the switch turned off the
+// cache and left the bill.
+//
+// The handle counter is what makes this observable without reaching into the
+// server: handles are issued from 1 and never reused, so if the client's whole
+// run minted nothing, the first handle a raw stub can get is still 1.
+//
+// Self-gating on the variable it is about: an assertion at slots=0, and stated
+// as skipped otherwise, because the slot count is read once per process and a
+// test cannot change it for a client another test already built.
+TEST(StandaloneShmIpcTest, DisablingKeyHandlesAlsoStopsTheServerRemembering) {
+  const char* raw_slots = std::getenv("UMBP_KEY_HANDLE_SLOTS");
+  if (raw_slots == nullptr || std::string(raw_slots) != "0") {
+    GTEST_SKIP() << "run with UMBP_KEY_HANDLE_SLOTS=0 to exercise the off path";
+  }
+
+  const std::string address =
+      "unix:///tmp/umbp_standalone_noslots_" + std::to_string(getpid()) + ".grpc.sock";
+  const std::string grpc_path = standalone::UnixPathFromGrpcAddress(address);
+  const std::string fd_path = standalone::DeriveFdSocketPath(address);
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+
+  UMBPConfig server_cfg;
+  server_cfg.dram.capacity_bytes = 1 << 20;
+  server_cfg.ssd.enabled = false;
+  UMBPStandaloneProcessConfig sp_cfg;
+  sp_cfg.address = address;
+  sp_cfg.startup_timeout_ms = 5000;
+  server_cfg.standalone_process = sp_cfg;
+
+  standalone::StandaloneServer server(server_cfg, address);
+  ASSERT_TRUE(server.Start());
+  std::thread server_thread([&]() { server.Run(); });
+
+  UMBPConfig client_cfg = server_cfg;
+  auto client = CreateUMBPClient(client_cfg);
+  ASSERT_EQ(client->GetDeploymentMode(), UMBPDeploymentMode::StandaloneProcess);
+
+  HostMemAllocator allocator;
+  HostBufferOptions opts;
+  opts.backing = HostBufferBacking::kAnonymousShm;
+  opts.prefault = false;
+  HostBufferHandle region = allocator.Alloc(65536, opts);
+  ASSERT_TRUE(region.valid());
+  auto* bytes = static_cast<unsigned char*>(region.ptr);
+  ASSERT_TRUE(client->RegisterMemory(reinterpret_cast<uintptr_t>(region.ptr), region.mapped_size));
+
+  constexpr size_t kKeys = 4;
+  constexpr size_t kObject = 32;
+  std::vector<std::string> keys;
+  std::vector<uintptr_t> srcs;
+  std::vector<size_t> put_sizes;
+  for (size_t k = 0; k < kKeys; ++k) {
+    keys.push_back("noslot-key-" + std::to_string(k));
+    unsigned char* src = bytes + 1024 + k * kObject;
+    for (size_t i = 0; i < kObject; ++i) src[i] = static_cast<unsigned char>(k * 16 + i);
+    srcs.push_back(reinterpret_cast<uintptr_t>(src));
+    put_sizes.push_back(kObject);
+  }
+  ASSERT_EQ(client->BatchPut(keys, srcs, put_sizes), std::vector<bool>(kKeys, true));
+
+  // Several passes over the same set: with handles on this is exactly the
+  // shape that mints one and then rides it, so it is the shape that would
+  // leave something behind if the switch were only half a switch. The bytes
+  // still have to arrive -- turning the mechanism off must not cost
+  // correctness.
+  for (size_t pass = 0; pass < 3; ++pass) {
+    std::vector<std::vector<uintptr_t>> dsts(kKeys);
+    for (size_t k = 0; k < kKeys; ++k) {
+      unsigned char* dst = bytes + 8192 + (pass * kKeys + k) * kObject;
+      std::memset(dst, 0, kObject);
+      dsts[k] = {reinterpret_cast<uintptr_t>(dst)};
+    }
+    ASSERT_EQ(client->BatchGetRanges(keys, dsts, std::vector<std::vector<size_t>>(kKeys, {kObject}),
+                                     std::vector<std::vector<size_t>>(kKeys, {0})),
+              std::vector<bool>(kKeys, true))
+        << "pass " << pass;
+    for (size_t k = 0; k < kKeys; ++k) {
+      const unsigned char* dst = bytes + 8192 + (pass * kKeys + k) * kObject;
+      for (size_t i = 0; i < kObject; ++i) {
+        EXPECT_EQ(dst[i], static_cast<unsigned char>(k * 16 + i))
+            << "pass " << pass << " key " << k << " byte " << i;
+      }
+    }
+  }
+
+  // Nothing the client did should have consumed a handle, so the first one the
+  // server ever hands out is still the first one.
+  auto raw_stub = ::umbp::UMBPStandalone::NewStub(
+      grpc::CreateChannel(address, grpc::InsecureChannelCredentials()));
+  {
+    ::umbp::BatchRangeDataRequest req;
+    req.set_client_id("raw-wire-client");
+    for (size_t k = 0; k < kKeys; ++k) {
+      req.add_range_counts(1);
+      req.add_shm_offsets(32768 + k * kObject);
+      req.add_region_bases(0);
+      req.add_sizes(kObject);
+      req.add_object_offsets(0);
+      req.add_keys(keys[k]);
+    }
+    req.set_key_fingerprint(0x0f1e2d3c4b5a6978ULL);
+    grpc::ClientContext ctx;
+    ::umbp::BatchBoolResponse resp;
+    ASSERT_TRUE(raw_stub->BatchGetRanges(&ctx, req, &resp).ok());
+    EXPECT_EQ(resp.key_handle(), 1u) << "the server minted " << (resp.key_handle() - 1)
+                                     << " handle(s) for a client that keeps none";
+  }
+
+  client->Close();
+  allocator.Free(region);
+  server.Shutdown();
+  server_thread.join();
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+}
+
 }  // namespace
 }  // namespace mori::umbp
