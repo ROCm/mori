@@ -67,9 +67,12 @@ model runs today**.
 
 The margin *grows* with blockscale (11.7% -> 21.8%) for the reason the whole
 exercise was about: the GEMM goes 228.9 -> 388.5us while the 489us of link time
-does not move, so there is more compute to hide the transfer behind. Our
-blockscale GEMM at 388.5 is within 4% of the 373.9us the model's own
-``gemm_a8w8_blockscale_bpreshuffle`` measures standalone on this box.
+does not move, so there is more compute to hide the transfer behind. Our blockscale
+GEMM is *not* competitive standalone: 370.5us against CK's 300.4 for its fastest
+blockscale instance (64x256, Intrawave v1) measured the same way. The gap is the
+per-K-block scale, not the GEMM -- unscaled we are 224.0us. See
+``kernels_preshuffle4w.py``, which ports CK's 4-wave B-out-of-LDS shape and
+lands at 532.4us for exactly that reason.
 
 Fusing over SDMA wins, and only because of ``--chunks``; see the table at its
 definition in ``run()``. It was pinned to 1 while the aiter GEMM's
@@ -108,6 +111,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 sys.path.insert(0, os.path.join(os.path.dirname(_HERE), "ar"))
 from kernels_fused import compile_fused_gemm_scatter  # noqa: E402
+from kernels_preshuffle4w import compile_preshuffle_gemm  # noqa: E402
 from kernels_lsa import build_lsa_ar  # noqa: E402
 from kernels_sdma import build_sdma_phases  # noqa: E402
 from layout import ArConfig  # noqa: E402
@@ -220,6 +224,10 @@ def run(args) -> int:
     from aiter.ops.shuffle import shuffle_weight
 
     local_rank, rank, world_size, uid = _setup_distributed()
+    if args.gemm_impl == "preshuffle4w" and args.mode != "gemm-only":
+        raise SystemExit(
+            "--gemm-impl preshuffle4w has no fused epilogue; use --mode gemm-only"
+        )
     # blockscale keeps a second fp32 accumulator for the per-K-block promotion,
     # which doubles the accumulator VGPRs; 256x256 needs 256 of them and the
     # kernel already runs at ~254 with zero spill, so the tile has to halve.
@@ -298,6 +306,24 @@ def run(args) -> int:
             reqs.sdma_queue_count = args.sdma_queues
         dc = comm.create_dev_comm(reqs)
 
+        if args.gemm_impl == "preshuffle4w":
+            # CK's shape: 4 waves, B never staged in LDS. gemm-only, so the
+            # window's input region is just an ordinary output buffer here.
+            launch4w = compile_preshuffle_gemm(
+                N=args.n,
+                K=args.k,
+                tile_m=args.tile_m,
+                tile_n=args.tile_n,
+                tile_k=args.tile_k,
+                in_dtype="fp8",
+                out_dtype="bf16",
+                quant=args.quant,
+                waves_per_eu=args.waves_per_eu,
+                xcd_swizzle=args.xcd_swizzle,
+            )
+            semaphore = torch.zeros(1, device="cuda", dtype=torch.int32)
+            bias_unused = torch.zeros(1, device="cuda", dtype=torch.bfloat16)
+
         gemm = compile_fused_gemm_scatter(
             cfg,
             rank,
@@ -341,6 +367,10 @@ def run(args) -> int:
             sa_arg, sb_arg = sa, sb
 
         def run_gemm(stream):
+            if args.gemm_impl == "preshuffle4w":
+                launch4w(c, c, semaphore, a, b_shuf, sa_arg, sb_arg, bias_unused,
+                         args.m, args.n, stream=stream)
+                return
             gemm(a_i8, b_i8, c_flat, sa_arg, sb_arg, args.m, args.n, dc.ptr,
                  win.handle, stream=stream)
 
@@ -454,6 +484,12 @@ def run(args) -> int:
                 "rel_l2": rel_l2,
                 "validated": validated,
                 "timing": "eager" if args.eager else "graph",
+                "gemm_impl": args.gemm_impl,
+                "tile": (
+                    [args.tile_m, args.tile_n, args.tile_k]
+                    if args.gemm_impl == "preshuffle4w"
+                    else None
+                ),
             }
             print("RESULT_JSON " + json.dumps(result, sort_keys=True), flush=True)
             print(
@@ -617,6 +653,17 @@ def build_parser() -> argparse.ArgumentParser:
         "and is worth 80us (355 vs 434)",
     )
     p.add_argument("--sdma-queues", type=int, default=8)
+    p.add_argument(
+        "--gemm-impl",
+        choices=("8wave", "preshuffle4w"),
+        default="8wave",
+        help="8wave: the pinned aiter kernel, the only one with a fused "
+        "epilogue. preshuffle4w: CK's shape -- 4 waves, B loaded straight "
+        "to registers instead of through LDS. gemm-only.",
+    )
+    p.add_argument("--tile-m", type=int, default=64, help="preshuffle4w only")
+    p.add_argument("--tile-n", type=int, default=256, help="preshuffle4w only")
+    p.add_argument("--tile-k", type=int, default=128, help="preshuffle4w only")
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=51)
     p.add_argument("--eager", action="store_true")
