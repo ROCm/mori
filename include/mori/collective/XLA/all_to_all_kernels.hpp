@@ -61,11 +61,14 @@ __global__ void AllToAllPushKernel(int myPe, int npes, const AddressPair* __rest
                                    mori::cco::ccoWindow_t heapWin) {
   // Phase 1: push each send slot p to peer p's recv slot for sender myPe (self
   // included). My recv slot has the SAME byte offset within the heap window on
-  // every peer (all ranks Allocate identically), so compute it once from the
-  // local window base and reuse it for every peer. The source is an arbitrary
-  // per-peer local pointer (SDMA reads local VA directly).
-  const size_t heapBase = reinterpret_cast<uintptr_t>(mori::cco::ccoGetLocalPtr(heapWin));
-  const size_t off = reinterpret_cast<uintptr_t>(pairs[myPe].dest) - heapBase;
+  // every peer (all ranks Allocate identically), so peer p's copy of my recv
+  // slot is just my local recv pointer shifted by the flat-VA rank delta
+  // (pe - myPe)*stride4G<<32 -- the same inline LSA addressing the
+  // reduce-scatter/all-reduce push kernels use. winBase cancels out, so this
+  // needs no ccoGetLocalPtr/ccoGetLsaPeerPtr round trip. The source is an
+  // arbitrary per-peer local pointer (SDMA reads local VA directly).
+  uint8_t* const localDst = reinterpret_cast<uint8_t*>(pairs[myPe].dest);
+  const uint32_t stride4G = heapWin->stride4G;
   StartSdmaScatter(
       devComm.sdma, npes, /*logS=*/0, chunkBytes,
       [](int) { return true; },
@@ -73,7 +76,8 @@ __global__ void AllToAllPushKernel(int myPe, int npes, const AddressPair* __rest
         return reinterpret_cast<const uint8_t*>(pairs[peer].source);
       },
       [=](int peer) -> uint8_t* {
-        return reinterpret_cast<uint8_t*>(mori::cco::ccoGetLsaPeerPtr(heapWin, peer, off));
+        int32_t diff = (peer - myPe) * static_cast<int32_t>(stride4G);
+        return localDst + (static_cast<uint64_t>(diff) << 32);
       });
 
   uint64_t* __restrict__ signalBuf = devComm.sdma.signalBuf;
