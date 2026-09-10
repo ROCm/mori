@@ -60,34 +60,37 @@ off                                5.53   64 short          385.9
 on                                 4.47   16 dwordx2        506.9
 ============================  =========  ==========  ============
 
-and it is 26% slower anyway, on a register budget. ``--waves-per-eu 2`` caps
-VGPRs at 256, and compiling the three parts of the swap separately says where
-they go:
+Both are done now, and neither moved the clock. Getting there took two fixes
+that are worth recording, because each was found by attribution rather than by
+guessing:
 
-===========================  ======  =========
-variant                        VGPR   scratch
-===========================  ======  =========
-off (this kernel's default)      256          8
-  exchange MFMA operands         260          8
-  scalar A scale                 240          0
-  explicit C store               284          8
-**operands + scalar scale**  **248**    **0**
-all three (swap_ab=True)         256          8
-===========================  ======  =========
+* ``--waves-per-eu 2`` caps VGPRs at 256, and the swap crosses it. Compiling
+  its three parts separately: the scalar A scale *saves* 16 registers, the
+  operand exchange costs 4, and the hand-written C store costs 28. The store
+  was the whole problem -- and not its landing registers (one measures the same
+  as sixteen), nor ``frag_C_out``, nor the conversion order. Going through the
+  tiled copy against a transposed C partitioning instead costs nothing:
+  ``tiled_mma`` rebuilt with the waves raked along the first mode, partitioning
+  ``C^T[N, M]`` (strides ``(1, N)``), which is the same map with M and N
+  exchanged.
+* That partition wants the fragment in ``(v, n_rep, m_rep)`` order where
+  ``frag_C`` is ``(v, m_rep, n_rep)``. Permuting in the epilogue is correct but
+  costs 8 VGPRs, because source and destination are live together. The slot
+  order is ours to choose, so ``mma_promote`` writes the swapped order from the
+  start and there is nothing to permute.
 
-The scale change *saves* 16 registers and the operand exchange costs 4; both
-together are the only variant here that does not spill, and it spills less than
-the default does. **The whole cost is the C write-out.** Not its registers
-(one shared landing register measures the same as sixteen), not ``frag_C_out``
-left allocated, not the conversion order, and not the addressing -- rebuilding
-the 16 runtime indices as one base plus compile-time strides took it 284 -> 270
-unconstrained and 506.9 -> 485.1us, but under the cap it still spills.
+Result: 248 VGPR, no spill, 16 ``buffer_store_dwordx2``, one FMA per element.
+And 387.4us against the unswapped path's 387.5 -- **exactly parity**.
 
-So the missing piece is a store for the transposed accumulator that costs no
-registers, i.e. the tiled-copy path (``thr_r2g_C``/``pC_g``) rebuilt against a
-transposed C partitioning, rather than written out by hand. Then the measured
-248/0 applies and swap_ab is strictly better than the default, which spills.
-Left in behind ``swap_ab=False`` until that exists.
+So none of it was the bottleneck: not the promote arithmetic (three ops per
+element down to one), not the spill, not the store width. The +85us the block
+scale costs over this kernel's own 303.1us skeleton survives all three, while
+CK pays ~0 for the same work with the same ``v_mfma_f32_16x16x128_f8f6f4`` and
+the same 2 waves/SIMD. Our VALU/MFMA is already *under* CK's, 4.47 against
+5.81, so what is left is that CK's VALU hides behind its MFMAs and ours does
+not -- scheduling, which for CK is Intrawave plus explicit sched_group_barrier
+placement. That is the next thing to look at, and it is not something the
+instruction mix shows.
 
 Two structural notes that came out of the port. B never touches LDS here --
 ``thr_g2r_B``/``frag_B_stages`` load it global->VGPR double-buffered, as CK's
@@ -486,13 +489,55 @@ def compile_preshuffle_gemm(
         out_cpol = CPOL_COHERENT if split_k > 1 else 0
         copy_op = fx.rocdl.BufferCopy32b if split_k > 1 else fx.rocdl.BufferCopy16b
         buf_copy_out = fx.make_copy_atom(copy_op(out_cpol), out_elem_cls)
-        # Only built for the tiled write-out. Under the swapped layout the
-        # explicit store replaces it, and leaving frag_C_out allocated costs
-        # acc_size out-elements of register space for nothing.
-        if const_expr(not swap_ab):
+        frag_C_out = None
+        if const_expr(swap_ab):
+            # The swapped accumulator maps to C with M and N exchanged, so the
+            # ordinary partitioning applied to C^T lands on the right addresses.
+            # C is row-major [M, N], so C^T is [N, M] with strides (1, N) -- a
+            # tile's four values are then contiguous, which is what lets the
+            # store be one 64-bit instead of four 16-bit ones. Going through
+            # the tiled copy rather than by hand is the point: a hand-written
+            # store needs landing registers and costs the 8 VGPRs that push
+            # this over --waves-per-eu 2 and make the main loop spill.
+            tiled_mma_T = fx.make_tiled_mma(
+                mma_atom,
+                fx.make_layout((4, 1, 1), (1, 0, 0)),
+                fx.make_tile(None, None, fx.make_layout((32, 4), (1, 32))),
+            )
+            c_tensor_T = fx.Tensor(
+                fx.make_view(
+                    fx.get_iter(arg_c),
+                    fx.make_layout((N, PRESHUFFLE_M_MAX), (1, N)),
+                )
+            )
+            gC_T = fx.rocdl.make_buffer_tensor(
+                c_tensor_T,
+                max_size=False,
+                num_records_bytes=fx.Int64(i32_m)
+                * fx.Int64(N)
+                * fx.Int64(out_elem_bytes),
+            )
+            tC_T = fx.flat_divide(gC_T, fx.make_tile(tile_n, tile_m))[
+                None, None, bid_y, bid_x
+            ]
+            copy_out_c = fx.make_copy_atom(
+                fx.rocdl.BufferCopy64b(out_cpol), out_elem_cls
+            )
+            # The fragment has to carry the transposed mode order too: the
+            # T-partition expects (v, n_rep, m_rep) where frag_C is
+            # (v, m_rep, n_rep), so the fill below permutes the slots.
+            frag_C_out = fx.make_fragment_like(
+                tiled_mma_T.thr_slice(tid).make_fragment_C(tC_T),
+                out_elem_cls.ir_type,
+            )
+            thr_r2g_C = fx.make_tiled_copy_C(copy_out_c, tiled_mma_T).get_slice(tid)
+            pC_g = thr_r2g_C.partition_S(tC_T)
+            frag_C_retile = thr_r2g_C.retile(frag_C_out)
+        else:
+            frag_C_out = fx.make_fragment_like(frag_C, out_elem_cls.ir_type)
+            copy_out_c = buf_copy_out
             thr_r2g_C = fx.make_tiled_copy_C(buf_copy_out, tiled_mma).get_slice(tid)
             pC_g = thr_r2g_C.partition_S(tC)
-            frag_C_out = fx.make_fragment_like(frag_C, out_elem_cls.ir_type)
             frag_C_retile = thr_r2g_C.retile(frag_C_out)
 
         # ── Async gmem->LDS DMA (buffer_load_lds) for the A tile ──
@@ -680,26 +725,6 @@ def compile_preshuffle_gemm(
             gSB = fx.rocdl.make_buffer_tensor(arg_scale_b)
             sa_div = fx.logical_divide(gSA, fx.make_layout(1, 1))
             sb_div = fx.logical_divide(gSB, fx.make_layout(1, 1))
-            # C write-out for the swapped accumulator. The tiled_mma-derived
-            # path (thr_r2g_C / pC_g) partitions C for the *unswapped* layout,
-            # so it would scatter these four values down four rows. They are
-            # four consecutive columns of one row instead, which in a row-major
-            # C is 8 contiguous bytes -- one store, where the unswapped layout
-            # can only ever emit buffer_store_short.
-            gC_flat = fx.rocdl.make_buffer_tensor(
-                fx.Tensor(
-                    fx.make_view(
-                        fx.get_iter(c_tensor),
-                        fx.make_layout(PRESHUFFLE_M_MAX * N, 1),
-                    )
-                ),
-                max_size=False,
-                num_records_bytes=fx.Int64(i32_m)
-                * fx.Int64(N)
-                * fx.Int64(out_elem_bytes),
-            )
-            c_div = fx.logical_divide(gC_flat, fx.make_layout(1, 1))
-            c_atom_64 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), out_elem_cls)
             sc_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
             sc_atom_4 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
             sc_reg_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
@@ -800,9 +825,17 @@ def compile_preshuffle_gemm(
                     # element against CK's one v_fmac_f32. Hoisting the scale
                     # product and contracting the rest gets it to two.
                     for ii in range_constexpr(4):
-                        # frag_C.load() yields logical order: ii fastest, then
-                        # m_repeat, then num_acc_n.
-                        idx = ni * (m_repeat * 4) + mi * 4 + ii
+                        # Slot order is ours to choose, and choosing it once
+                        # here is free: the swapped write-out wants
+                        # (ii, num_acc_n, m_repeat), and producing the
+                        # accumulator in that order avoids a 64-value permute
+                        # in the epilogue, which costs 8 VGPRs because source
+                        # and destination are live together.
+                        idx = (
+                            mi * (num_acc_n * 4) + ni * 4 + ii
+                            if const_expr(swap_ab)
+                            else ni * (m_repeat * 4) + mi * 4 + ii
+                        )
                         vals[idx] = fx.math.fma(pv[ii], sab[ii], vals[idx])
             frag_C.store(vector.from_elements(T.vec(acc_size, T.f32), vals))
 
@@ -1026,50 +1059,7 @@ def compile_preshuffle_gemm(
             )
 
         # ── Epilogue ─────────────────────────────────────────────
-        if const_expr(swap_ab):
-            # Allocated here, not at kernel scope: held across the main loop
-            # these push VGPRs over the 2-waves/SIMD line and the loop spills
-            # to scratch, which cost more than the wider store saved.
-            c_reg_4 = [
-                fx.make_rmem_tensor(fx.make_layout(4, 1), out_elem_cls)
-                for _ in range(m_repeat * num_acc_n)
-            ]
-            # Convert first, store second: interleaving them keeps the f32
-            # accumulator alive alongside the growing set of converted values.
-            # One base address plus compile-time strides, not 16 runtime
-            # indices: mi steps 16 rows and ni steps num_waves*16 columns, both
-            # static, so the stores use the buffer's immediate offset instead of
-            # a VGPR each.
-            base = (
-                (bx_m + lane_mod_16) * fx.Int32(N)
-                + by_n
-                + wave_id * 16
-                + lane_div_16 * 4
-            )
-            cview = fx.make_view(
-                fx.add_offset(fx.get_iter(gC_flat), fx.Int32(base)),
-                fx.make_layout(
-                    (4, m_repeat, num_acc_n), (1, 16 * N, num_waves * 16)
-                ),
-            )
-            acc_vec = Vec(frag_C.load())
-            out_elems = [
-                acc_vec[p].to(out_elem_cls) for p in range_constexpr(acc_size)
-            ]
-            for mi in range_constexpr(m_repeat):
-                for ni in range_constexpr(num_acc_n):
-                    creg = c_reg_4[mi * num_acc_n + ni]
-                    creg.store(
-                        vector.from_elements(
-                            T.vec(4, out_elem_cls.ir_type),
-                            [
-                                out_elems[ni * (m_repeat * 4) + mi * 4 + ii]
-                                for ii in range_constexpr(4)
-                            ],
-                        )
-                    )
-                    fx.copy(c_atom_64, creg, cview[None, mi, ni])
-        elif const_expr((not is_8bit or is_blockscale) and not _has_epilogue):
+        if const_expr((not is_8bit or is_blockscale) and not _has_epilogue):
             frag_C_out.store(Vec(frag_C.load()).to(out_elem_cls))
         else:
             if const_expr(not overlap_epi_load):
@@ -1120,8 +1110,7 @@ def compile_preshuffle_gemm(
             )
             frag_C_out.store(out_vec)
 
-        if const_expr(not swap_ab):
-            fx.copy(buf_copy_out, frag_C_retile, pC_g)
+        fx.copy(copy_out_c, frag_C_retile, pC_g)
         if const_expr(split_k > 1):
             # The store carries sc0|sc1, so waiting on it is the whole release.
             rocdl.s_waitcnt(0)
