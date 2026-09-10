@@ -674,10 +674,14 @@ class PoolClient {
 
     std::mutex mutex_;
     std::condition_variable cv_;
-    // Queued AcquireAll callers.  Acquire() defers to them, otherwise a steady
-    // stream of single-shard calls can hold at least one shard forever and the
-    // exclusive waiter never runs -- a hang, with no timeout above it.
-    size_t all_waiting_ = 0;
+    // Admission is by ARRIVAL ORDER, which is what makes both directions
+    // starvation-free.  Deferring unconditionally to queued AcquireAll callers
+    // fixes shard-stream-starves-exclusive but creates its mirror; "each
+    // exclusive call finishes" does not mean the exclusive queue ever empties.
+    // A waiter is blocked only by waiters that arrived BEFORE it, and those are
+    // finite in number, so everyone is eventually oldest.
+    uint64_t next_ticket_ = 0;
+    std::deque<uint64_t> exclusive_queue_;
     std::vector<char*> bases_;
     // Not vector<bool>: this is written under the mutex and read by index, and
     // the proxy-reference specialisation buys nothing at these sizes.
