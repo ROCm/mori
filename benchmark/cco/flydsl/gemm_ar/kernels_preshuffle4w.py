@@ -60,13 +60,34 @@ off                                5.53   64 short          385.9
 on                                 4.47   16 dwordx2        506.9
 ============================  =========  ==========  ============
 
-and it is 31% slower anyway, because at VGPR 248 -> 256 the main loop starts
-spilling: `scratch_load_dwordx2` x3 and `scratch_store_dwordx2` x2 appear
-inside it. Confirmed to be the loop and not the epilogue by quadrupling K --
-the gap widens with it (1.30x at K=2048, 1.47x at K=8192). Moving the store
-registers out of kernel scope does not recover it, so the pressure is
-elsewhere. Left in behind ``swap_ab=False``: the instruction-level result is
-right and reusable, and what blocks it is a register budget, not the idea.
+and it is 26% slower anyway, on a register budget. ``--waves-per-eu 2`` caps
+VGPRs at 256, and compiling the three parts of the swap separately says where
+they go:
+
+===========================  ======  =========
+variant                        VGPR   scratch
+===========================  ======  =========
+off (this kernel's default)      256          8
+  exchange MFMA operands         260          8
+  scalar A scale                 240          0
+  explicit C store               284          8
+**operands + scalar scale**  **248**    **0**
+all three (swap_ab=True)         256          8
+===========================  ======  =========
+
+The scale change *saves* 16 registers and the operand exchange costs 4; both
+together are the only variant here that does not spill, and it spills less than
+the default does. **The whole cost is the C write-out.** Not its registers
+(one shared landing register measures the same as sixteen), not ``frag_C_out``
+left allocated, not the conversion order, and not the addressing -- rebuilding
+the 16 runtime indices as one base plus compile-time strides took it 284 -> 270
+unconstrained and 506.9 -> 485.1us, but under the cap it still spills.
+
+So the missing piece is a store for the transposed accumulator that costs no
+registers, i.e. the tiled-copy path (``thr_r2g_C``/``pC_g``) rebuilt against a
+transposed C partitioning, rather than written out by hand. Then the measured
+248/0 applies and swap_ab is strictly better than the default, which spills.
+Left in behind ``swap_ab=False`` until that exists.
 
 Two structural notes that came out of the port. B never touches LDS here --
 ``thr_g2r_B``/``frag_B_stages`` load it global->VGPR double-buffered, as CK's
@@ -465,10 +486,14 @@ def compile_preshuffle_gemm(
         out_cpol = CPOL_COHERENT if split_k > 1 else 0
         copy_op = fx.rocdl.BufferCopy32b if split_k > 1 else fx.rocdl.BufferCopy16b
         buf_copy_out = fx.make_copy_atom(copy_op(out_cpol), out_elem_cls)
-        thr_r2g_C = fx.make_tiled_copy_C(buf_copy_out, tiled_mma).get_slice(tid)
-        pC_g = thr_r2g_C.partition_S(tC)
-        frag_C_out = fx.make_fragment_like(frag_C, out_elem_cls.ir_type)
-        frag_C_retile = thr_r2g_C.retile(frag_C_out)
+        # Only built for the tiled write-out. Under the swapped layout the
+        # explicit store replaces it, and leaving frag_C_out allocated costs
+        # acc_size out-elements of register space for nothing.
+        if const_expr(not swap_ab):
+            thr_r2g_C = fx.make_tiled_copy_C(buf_copy_out, tiled_mma).get_slice(tid)
+            pC_g = thr_r2g_C.partition_S(tC)
+            frag_C_out = fx.make_fragment_like(frag_C, out_elem_cls.ir_type)
+            frag_C_retile = thr_r2g_C.retile(frag_C_out)
 
         # ── Async gmem->LDS DMA (buffer_load_lds) for the A tile ──
         if const_expr(use_async_copy):
@@ -1009,25 +1034,41 @@ def compile_preshuffle_gemm(
                 fx.make_rmem_tensor(fx.make_layout(4, 1), out_elem_cls)
                 for _ in range(m_repeat * num_acc_n)
             ]
+            # Convert first, store second: interleaving them keeps the f32
+            # accumulator alive alongside the growing set of converted values.
+            # One base address plus compile-time strides, not 16 runtime
+            # indices: mi steps 16 rows and ni steps num_waves*16 columns, both
+            # static, so the stores use the buffer's immediate offset instead of
+            # a VGPR each.
+            base = (
+                (bx_m + lane_mod_16) * fx.Int32(N)
+                + by_n
+                + wave_id * 16
+                + lane_div_16 * 4
+            )
+            cview = fx.make_view(
+                fx.add_offset(fx.get_iter(gC_flat), fx.Int32(base)),
+                fx.make_layout(
+                    (4, m_repeat, num_acc_n), (1, 16 * N, num_waves * 16)
+                ),
+            )
             acc_vec = Vec(frag_C.load())
+            out_elems = [
+                acc_vec[p].to(out_elem_cls) for p in range_constexpr(acc_size)
+            ]
             for mi in range_constexpr(m_repeat):
-                row = bx_m + mi * 16 + lane_mod_16
                 for ni in range_constexpr(num_acc_n):
-                    col = by_n + (ni * num_waves + wave_id) * 16 + lane_div_16 * 4
                     creg = c_reg_4[mi * num_acc_n + ni]
                     creg.store(
                         vector.from_elements(
                             T.vec(4, out_elem_cls.ir_type),
                             [
-                                acc_vec[ni * (m_repeat * 4) + mi * 4 + ii].to(
-                                    out_elem_cls
-                                )
+                                out_elems[ni * (m_repeat * 4) + mi * 4 + ii]
                                 for ii in range_constexpr(4)
                             ],
                         )
                     )
-                    idx = fx.Int32(row) * fx.Int32(N) + fx.Int32(col)
-                    fx.copy(c_atom_64, creg, fx.slice(c_div, (None, idx)))
+                    fx.copy(c_atom_64, creg, cview[None, mi, ni])
         elif const_expr((not is_8bit or is_blockscale) and not _has_epilogue):
             frag_C_out.store(Vec(frag_C.load()).to(out_elem_cls))
         else:
