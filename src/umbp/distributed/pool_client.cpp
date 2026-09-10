@@ -3221,11 +3221,23 @@ void PoolClient::ScratchArena::Reset(void* base, size_t bytes, size_t shards) {
 PoolClient::ScratchArena::Lease PoolClient::ScratchArena::Acquire() {
   std::unique_lock<std::mutex> lock(mutex_);
   if (bases_.empty()) return Lease{};
+  // Uncontended: nothing is queued, so nobody can be jumped.
+  if (waiters_.empty()) {
+    for (size_t i = 0; i < busy_.size(); ++i) {
+      if (busy_[i] == 0) {
+        busy_[i] = 1;
+        return Lease{this, i, 1, bases_[i]};
+      }
+    }
+  }
   size_t index = bases_.size();
   const uint64_t ticket = next_ticket_++;
+  waiters_.emplace_back(ticket, false);
   cv_.wait(lock, [&] {
-    // Yield only to exclusive waiters that were already queued when we arrived.
-    if (!exclusive_queue_.empty() && exclusive_queue_.front() < ticket) return false;
+    for (const auto& [t, exclusive] : waiters_) {
+      if (t >= ticket) break;
+      if (exclusive) return false;  // an exclusive waiter got here first
+    }
     for (size_t i = 0; i < busy_.size(); ++i) {
       if (busy_[i] == 0) {
         index = i;
@@ -3234,6 +3246,7 @@ PoolClient::ScratchArena::Lease PoolClient::ScratchArena::Acquire() {
     }
     return false;
   });
+  Forget(ticket);
   busy_[index] = 1;
   return Lease{this, index, 1, bases_[index]};
 }
@@ -3241,17 +3254,28 @@ PoolClient::ScratchArena::Lease PoolClient::ScratchArena::Acquire() {
 PoolClient::ScratchArena::Lease PoolClient::ScratchArena::AcquireAll() {
   std::unique_lock<std::mutex> lock(mutex_);
   if (bases_.empty()) return Lease{};
-  // Queue first, so Acquire() stops admitting arrivals behind us and the shards
-  // held by earlier arrivals can drain.
+  // Queue first, so later arrivals stop being admitted and the shards held by
+  // earlier ones can drain.  Waiting to be the OLDEST waiter -- not merely the
+  // oldest exclusive one -- is what stops a stream of exclusives from stepping
+  // over a shard waiter that was already queued.
   const uint64_t ticket = next_ticket_++;
-  exclusive_queue_.push_back(ticket);
+  waiters_.emplace_back(ticket, true);
   cv_.wait(lock, [&] {
-    return exclusive_queue_.front() == ticket &&
+    return waiters_.front().first == ticket &&
            std::all_of(busy_.begin(), busy_.end(), [](uint8_t b) { return b == 0; });
   });
-  exclusive_queue_.pop_front();
+  Forget(ticket);
   std::fill(busy_.begin(), busy_.end(), 1);
   return Lease{this, 0, busy_.size(), bases_[0]};
+}
+
+void PoolClient::ScratchArena::Forget(uint64_t ticket) {
+  for (auto it = waiters_.begin(); it != waiters_.end(); ++it) {
+    if (it->first == ticket) {
+      waiters_.erase(it);
+      return;
+    }
+  }
 }
 
 void PoolClient::ScratchArena::Release(size_t index, size_t count) {
