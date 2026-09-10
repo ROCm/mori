@@ -3322,6 +3322,15 @@ void PoolClient::ScratchArena::Release(size_t index, size_t count) {
   cv_.notify_all();
 }
 
+// Drop every reused routing answer.  Called when a peer denies a key that was
+// routed to it, which is the only evidence available that a cached placement
+// has gone stale.
+void PoolClient::ForgetRouteReuse() {
+  std::lock_guard<std::mutex> lock(route_reuse_.mutex);
+  for (auto& entry : route_reuse_.entries) entry.valid = false;
+  ++route_reuse_.stale;
+}
+
 // BatchRouteGet, answered from the previous call when it asked for the same
 // keys inside the reuse window.  A layer-wise load walks one key set once per
 // layer group, so groups 2..N re-ask what group 1 just asked.
@@ -3335,13 +3344,27 @@ bool PoolClient::BatchRouteGetReusing(const std::vector<std::string>& keys, doub
   const auto window = RouteReuseWindow();
   const auto now = std::chrono::steady_clock::now();
   if (window.count() > 0) {
-    std::lock_guard<std::mutex> lock(route_reuse_.mutex);
-    for (const auto& entry : route_reuse_.entries) {
-      if (entry.valid && now - entry.at <= window && entry.keys == keys) {
-        *out = entry.routes;
-        return true;
+    bool hit = false;
+    {
+      std::lock_guard<std::mutex> lock(route_reuse_.mutex);
+      for (const auto& entry : route_reuse_.entries) {
+        if (entry.valid && now - entry.at <= window && entry.keys == keys) {
+          *out = entry.routes;
+          hit = true;
+          break;
+        }
+      }
+      // Counted, because "did the cache work" cannot be answered by a test: a
+      // zero hit rate is a performance defect, not a wrong answer, and two
+      // implementations have now looked correct while never hitting.
+      hit ? ++route_reuse_.hits : ++route_reuse_.misses;
+      if ((route_reuse_.hits + route_reuse_.misses) % 512 == 0) {
+        MORI_UMBP_INFO("[PoolClient] route reuse: hits={} misses={} stale={} slots={} window_ms={}",
+                       route_reuse_.hits, route_reuse_.misses, route_reuse_.stale,
+                       route_reuse_.entries.size(), window.count());
       }
     }
+    if (hit) return true;
   }
 
   std::unordered_set<std::string> excludes{config_.master_config.node_id};
@@ -4651,6 +4674,13 @@ bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
         MORI_UMBP_ERROR("[PoolClient] BatchGet: peer reported permanent resolve failure key='{}'",
                         *item.key);
       }
+      // A key routed HERE that this peer does not have is the stale-route
+      // signal: whoever answered the routing question described a placement
+      // that has since changed.  An ordinary cold miss never reaches this
+      // point -- an unroutable key is not grouped onto a peer at all -- so this
+      // does not fire on normal cache behaviour.  Dropping the reused answers
+      // bounds the exposure to this one batch instead of the whole window.
+      ForgetRouteReuse();
       (*results)[item.index] = false;
       continue;
     }

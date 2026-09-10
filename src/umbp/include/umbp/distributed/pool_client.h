@@ -421,6 +421,10 @@ class PoolClient {
   bool BatchRouteGetReusing(const std::vector<std::string>& keys, double* route_sink,
                             std::vector<std::optional<RouteGetResult>>* out);
 
+  // Invalidate every reused answer, on evidence that a cached placement is
+  // stale (a peer denying a key that was routed to it).
+  void ForgetRouteReuse();
+
   // The window bounds how stale a reused answer can be, and so also how long
   // the master can go without seeing a key: BatchLookupBlockForRouteGet records
   // access and grants a lease, and eviction is LRU on that timestamp.
@@ -439,6 +443,9 @@ class PoolClient {
     std::mutex mutex;
     std::vector<RouteReuseEntry> entries;
     size_t next = 0;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t stale = 0;
   };
   RouteReuse route_reuse_;
 
