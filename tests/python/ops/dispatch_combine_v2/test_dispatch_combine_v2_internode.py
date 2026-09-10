@@ -66,7 +66,8 @@ speedup.
 The small-token bench is bimodal per RUN, not per round: a run settles into a
 fast or a slow regime and holds it, so a worst/mean ratio is a blend of two
 levels rather than a tail. ``MORI_EP_ROUND_SERIES=1`` prints the per-rank
-``hwal`` series that shows which one this run is in. INTERLEAVE the arms of any
+per-round host-wall series that shows which one this run is in (the print
+carries a legend for its column tags). INTERLEAVE the arms of any
 A/B on this path -- a block of runs can sit in one regime for reasons that have
 nothing to do with the change under test.
 
@@ -760,9 +761,25 @@ def _bench(op, cfg, d, dev, a, comm):
     # Which round stalled, opt-in. EVERY rank prints its own series: these are
     # spin-wait collectives, so one slow rank shows as a slow round on all of
     # them and only the rank-local series separates a straggler from a
-    # whole-round event. A rank whose hwal is about twice its peers' is the
-    # signature of two ranks sharing one physical core.
+    # whole-round event. A rank whose host wall runs at about twice its peers'
+    # is the signature of two ranks sharing one physical core.
     if _series:
+        # The series carry short tags so the columns line up across sixteen
+        # ranks. Print what they mean rather than making the reader come here.
+        if d.rank == 0:
+            print(
+                "# series legend, one value per round, microseconds:\n"
+                "#   disp  dispatch kernel time (GPU events)\n"
+                "#   comb  combine kernel time (GPU events)\n"
+                "#   conv  the dtype cast between them, when the legs differ\n"
+                "#   hdis  host time inside the op.dispatch() call\n"
+                "#   hcom  host time inside the op.combine() call\n"
+                "#   hwal  host wall clock for the whole round\n"
+                "# A round whose hwal exceeds disp+conv+comb has a gap the other\n"
+                "# series do not account for. A rank whose hwal is ~2x its peers'\n"
+                "# is two ranks on the two SMT siblings of one physical core.",
+                flush=True,
+            )
         print(
             "# rounds r%d disp: " % d.rank + " ".join("%.0f" % x for x in disp),
             flush=True,
@@ -779,9 +796,8 @@ def _bench(op, cfg, d, dev, a, comm):
             "# rounds r%d hcom: " % d.rank + " ".join("%.0f" % x for x in hc[keep]),
             flush=True,
         )
-        # Host wall per round and the convert window. With disp/comb/hdis/hcom
-        # above, these close the accounting: a round whose hwal exceeds
-        # disp+conv+comb has a hole somewhere the other series do not cover.
+        # Host wall per round and the convert window; with the four above they
+        # close the accounting. See the legend.
         print(
             "# rounds r%d conv: " % d.rank + " ".join("%.0f" % x for x in conv),
             flush=True,
