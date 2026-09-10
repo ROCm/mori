@@ -1122,7 +1122,11 @@ def _stress(op, cfg, dist_handle, device, args, comm):
             if cfg.is_asymmetric_dtype
             else dispatch_out[0]
         )
-        op.combine(combine_input, wts, routing=dispatch_out[5])
+        # None, not wts: v1's soak combines without weights
+        # (run_combine(op, combine_input, None, indices)), and since want_weights
+        # is now honoured, passing them would make this a different kernel path
+        # from the case it is meant to mirror.
+        op.combine(combine_input, None, routing=dispatch_out[5])
         if i % args.stress_sync_interval == 0:
             torch.cuda.synchronize()
     torch.cuda.synchronize()
