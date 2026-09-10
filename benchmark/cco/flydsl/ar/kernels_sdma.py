@@ -127,8 +127,18 @@ def build_sdma_phases(
     only drains and barriers, and exists for the fused path, where the pushes
     were already issued from inside the GEMM epilogue.
 
-    ``queues`` must match ``reqs.sdma_queue_count``; one queue per peer keeps
-    concurrently-issuing warps per queue at 1, which is cco's stated rule.
+    ``queues`` must match ``reqs.sdma_queue_count``. Queue ids are taken modulo
+    it, and the hardware queues are per **(source, destination) pair**, so even
+    ``queues=1`` still gives every peer its own queue -- which is all this
+    pipeline needs, since one destination is one xGMI link and cco's rule is
+    about concurrently-issuing *warps* per queue, of which there is one.
+
+    Prefer ``queues=1`` when sharing the process with something else. With
+    ``queues=world_size`` a rank creates ``world_size`` hardware queues per peer
+    and touches exactly one of them: 56 queues to use 7. Standalone that is
+    merely wasteful, but inside a server that already holds SDMA engines for its
+    own copies, ``hsaKmtCreateQueueExt`` starts failing
+    (``anvil.cpp:237``).
 
     ``signal`` selects ``put``'s trailing local ATOMIC. It is off by default:
     ``quiet``/``quietQueue`` drain the queue's read pointer and are documented as
@@ -145,10 +155,8 @@ def build_sdma_phases(
             f"SDMA needs a landing slot per peer: build the ArConfig with "
             f"recv_slots={ws} (got {cfg.recv_slots})"
         )
-    if queues < ws:
-        raise ValueError(
-            f"need one SDMA queue per peer: queues={queues} < world_size={ws}"
-        )
+    if queues < 1:
+        raise ValueError(f"queues must be >= 1, got {queues}")
 
     threads, blocks = cfg.threads, cfg.blocks
     # The reduce is a *local HBM* kernel, so it must not inherit the grid the LSA
@@ -215,11 +223,11 @@ def build_sdma_phases(
                             win,
                             src_off_expr(tid),
                             fx.Int64(slice_bytes),
-                            tid,
+                            tid % fx.Int32(queues),
                             coop=cco.CoopScope.THREAD,
                             signal=signal,
                         )
-                    sdma.quiet_queue(tid, tid)
+                    sdma.quiet_queue(tid, tid % fx.Int32(queues))
                 # Release before publishing arrival. The bytes were moved by the
                 # copy engine rather than by this CU, so there is nothing of ours
                 # to flush; the fence is here to keep the flag store from being

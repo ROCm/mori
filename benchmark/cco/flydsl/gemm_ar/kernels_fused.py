@@ -1141,6 +1141,7 @@ def compile_fused_gemm_scatter(
     rotated: bool | None = None,
     n_stripe: int | None = None,
     quant: str = "ptpc",
+    sdma_queues: int = 8,
     swap_ab: bool = False,
     store_probe: bool = False,
     permlane: bool = False,
@@ -1322,7 +1323,7 @@ def compile_fused_gemm_scatter(
         raise ValueError(
             f"fence must be all/agent/leader/none/writethrough/wt-agent, got {fence!r}"
         )
-    _kname_tag = f"{'B' if blockscale else ''}{'S' if swap_ab else ''}{'P' if permlane else ''}{'T' if lane_transpose else ''}{'H' if hoist_scales else ''}{'U' if peer_uncached else ''}{direct_fence[0]}{'W' if store_probe else ''}c{chunks}{'r' if rotated else 'l'}{'' if n_stripe == 1 else f's{n_stripe}'}{fence[0]}"
+    _kname_tag = f"{'B' if blockscale else ''}{'S' if swap_ab else ''}{'P' if permlane else ''}{'T' if lane_transpose else ''}{'H' if hoist_scales else ''}{'U' if peer_uncached else ''}{direct_fence[0]}{'W' if store_probe else ''}c{chunks}{'r' if rotated else 'l'}q{sdma_queues}{'' if n_stripe == 1 else f's{n_stripe}'}{fence[0]}"
     counter_off = cfg.counter_off
     lock_off = cfg.lock_off
     in_off = cfg.input_off
@@ -1854,7 +1855,11 @@ def compile_fused_gemm_scatter(
                             + fx.Int64(dest) * fx.Int64(slice_bytes)
                             + off,
                             fx.Int64(chunk_bytes),
-                            dest,
+                            # Queues are per (source, destination) pair, so
+                            # every peer gets its own even at sdma_queues=1;
+                            # allocating one per peer *per pair* only wastes
+                            # hardware queues. See build_sdma_phases.
+                            dest % fx.Int32(sdma_queues),
                             coop=cco.CoopScope.THREAD,
                             signal=False,
                         )

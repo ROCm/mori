@@ -306,6 +306,7 @@ def run(args) -> int:
             BLOCK_N=args.block_n,
             b_preshuffled=True,
             quant=args.quant,
+            sdma_queues=args.sdma_queues,
             waves_per_eu=args.waves_per_eu,
             xcd_swizzle=args.xcd_swizzle,
             fuse=fused,
