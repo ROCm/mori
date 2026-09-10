@@ -228,7 +228,7 @@ struct RangedPhases {
   double rmt_bld_items = 0.0;
   double rmt_bld_plan = 0.0;
   double rmt_bld_post = 0.0;
-  double rmt_wait = 0.0;     // the RDMA read itself
+  double rmt_wait = 0.0;  // the RDMA read itself
   // Peer bookkeeping before any RPC: GetOrConnectPeer takes peers_mutex_ and
   // EnsurePeerServiceConnection takes the per-peer conn_mutex, both on EVERY
   // remote submit.  Two process-wide locks on the hot path is the shape the
@@ -242,12 +242,12 @@ struct RangedPhases {
   double rmt_decode = 0.0;
   // The three things left inside `remote` that nothing timed.  Together they
   // were ~20% of a cross-node call and invisible.
-  double rmt_sub = 0.0;    // per-group sub_* vectors + PartitionBatchGetRangeTargets
+  double rmt_sub = 0.0;          // per-group sub_* vectors + PartitionBatchGetRangeTargets
   double rmt_items_build = 0.0;  // BuildContiguousToRangesItems for the scatter
-  double rmt_final = 0.0;  // ApplyTransferFailures + FinalizeRemoteGetEntries
-  double rmt_medium = 0.0;   // ServeWholeObjectUnitsFromMedium
-  double rmt_install = 0.0;  // install-from-arena / background prefetch
-  double rmt_scatter = 0.0;  // arena -> caller buffers
+  double rmt_final = 0.0;        // ApplyTransferFailures + FinalizeRemoteGetEntries
+  double rmt_medium = 0.0;       // ServeWholeObjectUnitsFromMedium
+  double rmt_install = 0.0;      // install-from-arena / background prefetch
+  double rmt_scatter = 0.0;      // arena -> caller buffers
   // ...and the scatter split the same three ways as `xfer`, because the device
   // gather kernel's own timer says it moves those bytes in an eighth of what
   // the phase costs -- so most of it is not the copy.
@@ -261,8 +261,8 @@ struct RangedPhases {
   // Remote-leg shape.  The phase timers say WHERE the time goes; these say
   // whether it is one cost repeated too often.  A segment that failed to
   // coalesce shows up here long before it shows up as a percentage.
-  size_t rmt_items = 0;    // TransferItems handed to the RDMA planner
-  size_t rmt_plans = 0;    // plans it produced -- items/plans is the fan-in
+  size_t rmt_items = 0;  // TransferItems handed to the RDMA planner
+  size_t rmt_plans = 0;  // plans it produced -- items/plans is the fan-in
   // Of those plans, how many the engine staged through its bounce pool.  A
   // staged plan is run INLINE and under a global mutex inside Submit, so even
   // one of them turns a non-blocking post into a blocking round trip that
@@ -270,8 +270,8 @@ struct RangedPhases {
   // the model and 7% on the probe, and this is the difference that would
   // explain it.
   size_t rmt_bounce = 0;
-  size_t scat_items = 0;   // no plan count: getting one costs a second Plan()
-                           // pass, inside the very phase being measured
+  size_t scat_items = 0;  // no plan count: getting one costs a second Plan()
+                          // pass, inside the very phase being measured
   size_t local_keys = 0;
   size_t remote_keys = 0;
   double bytes = 0.0;
@@ -427,8 +427,8 @@ class RangedStats {
     uint64_t rmt_items = 0, rmt_plans = 0, rmt_bounce = 0, scat_items = 0;
     double total = 0, resolve = 0, classify = 0, build = 0, validate = 0, commit = 0, route = 0,
            xfer = 0, xfer_plan = 0, xfer_submit = 0, xfer_wait = 0, lock = 0, remote = 0,
-           rmt_resolve = 0, rmt_build = 0, rmt_bld_items = 0, rmt_bld_plan = 0,
-           rmt_bld_post = 0, rmt_peer = 0, rmt_decode = 0, rmt_sub = 0, rmt_items_build = 0, rmt_final = 0,
+           rmt_resolve = 0, rmt_build = 0, rmt_bld_items = 0, rmt_bld_plan = 0, rmt_bld_post = 0,
+           rmt_peer = 0, rmt_decode = 0, rmt_sub = 0, rmt_items_build = 0, rmt_final = 0,
            rmt_medium = 0, rmt_install = 0, rmt_wait = 0, rmt_scatter = 0, scat_plan = 0,
            scat_submit = 0, scat_wait = 0, bytes = 0;
   };
@@ -449,21 +449,21 @@ class RangedStats {
         "resolve={:.1f}% classify={:.1f}% build={:.1f}% validate={:.1f}% "
         "commit={:.1f}% route={:.1f}% xfer={:.1f}%(plan={:.1f}% submit={:.1f}% wait={:.1f}%) "
         "lock={:.1f}% remote={:.1f}%(rslv={:.1f}% bld={:.1f}%[it={:.1f}% pl={:.1f}% "
-        "po={:.1f}%] peer={:.1f}% dec={:.1f}% sub={:.1f}% ib={:.1f}% fin={:.1f}% med={:.1f}% inst={:.1f}% rdma={:.1f}% "
+        "po={:.1f}%] peer={:.1f}% dec={:.1f}% sub={:.1f}% ib={:.1f}% fin={:.1f}% med={:.1f}% "
+        "inst={:.1f}% rdma={:.1f}% "
         "scat={:.1f}%[pl={:.1f}% sub={:.1f}% wt={:.1f}%]) "
         "other={:.1f}% | xfer_only={:.2f}GiB/s end2end={:.2f}GiB/s",
         name, t.calls, t.total, 1e6 * t.total / t.calls, t.bytes / (1024.0 * 1024 * 1024),
         static_cast<double>(t.items) / t.calls, static_cast<double>(t.rmt_items) / t.calls,
         static_cast<double>(t.rmt_plans) / t.calls, static_cast<double>(t.rmt_bounce) / t.calls,
-        static_cast<double>(t.scat_items) / t.calls,
-        share(t.resolve), share(t.classify), share(t.build),
-        share(t.validate), share(t.commit), share(t.route), share(t.xfer), share(t.xfer_plan),
-        share(t.xfer_submit), share(t.xfer_wait), share(t.lock), share(t.remote),
-        share(t.rmt_resolve), share(t.rmt_build), share(t.rmt_bld_items), share(t.rmt_bld_plan),
-        share(t.rmt_bld_post), share(t.rmt_peer), share(t.rmt_decode), share(t.rmt_sub),
-        share(t.rmt_items_build), share(t.rmt_final), share(t.rmt_medium), share(t.rmt_install),
-        share(t.rmt_wait), share(t.rmt_scatter),
-        share(t.scat_plan), share(t.scat_submit), share(t.scat_wait), share(other),
+        static_cast<double>(t.scat_items) / t.calls, share(t.resolve), share(t.classify),
+        share(t.build), share(t.validate), share(t.commit), share(t.route), share(t.xfer),
+        share(t.xfer_plan), share(t.xfer_submit), share(t.xfer_wait), share(t.lock),
+        share(t.remote), share(t.rmt_resolve), share(t.rmt_build), share(t.rmt_bld_items),
+        share(t.rmt_bld_plan), share(t.rmt_bld_post), share(t.rmt_peer), share(t.rmt_decode),
+        share(t.rmt_sub), share(t.rmt_items_build), share(t.rmt_final), share(t.rmt_medium),
+        share(t.rmt_install), share(t.rmt_wait), share(t.rmt_scatter), share(t.scat_plan),
+        share(t.scat_submit), share(t.scat_wait), share(other),
         t.xfer > 0 ? (t.bytes / t.xfer) / (1024.0 * 1024 * 1024) : 0.0,
         t.total > 0 ? (t.bytes / t.total) / (1024.0 * 1024 * 1024) : 0.0);
   }
@@ -3566,8 +3566,8 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
     }
     widest_key_total = std::max(widest_key_total, key_total);
   }
-  const bool exclusive_arena =
-      widest_span > shard_bytes || (widest_key_total > shard_bytes && widest_key_total <= full_bytes);
+  const bool exclusive_arena = widest_span > shard_bytes ||
+                               (widest_key_total > shard_bytes && widest_key_total <= full_bytes);
   const size_t scratch_size = exclusive_arena ? full_bytes : shard_bytes;
 
   // Routing is a master RPC that never touches the arena, so it runs before a
