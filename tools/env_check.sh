@@ -2124,9 +2124,40 @@ check_mlx5_qos() {
     [[ $fail -eq 0 ]]
 }
 
-# Check DCQCN (ECN-based congestion control) for mlx5 RoCE ports via
-# mlxconfig (firmware NV config: ROCE_CC_PRIO_MASK_P1 / CNP_DSCP_P1).
-# Requires NVIDIA MFT (mst/mlxconfig); skips gracefully if unavailable.
+# DCQCN state from the mlx5 driver's ECN sysfs (/sys/class/net/<eth>/ecn/),
+# the unprivileged counterpart to the mlxconfig query below. Prefer it: it is
+# world-readable and instant, where mlxconfig refuses outright unless it is
+# uid 0 -- it checks geteuid() and exits with "Failed to open the device"
+# without opening anything, so no file permission can be relaxed to allow it.
+# Inside a Slurm step or an unprivileged container the firmware query is simply
+# unavailable and the check degrades to one WARN per port. sysfs is also the
+# better answer: it reports the setting the driver is running with, while
+# ROCE_CC_PRIO_MASK_P1 is only what the firmware will boot with next time.
+#
+# Prints "<mask> <cnp_dscp>" with mask in ROCE_CC_PRIO_MASK_P1 form: bit p set
+# when priority p has DCQCN on both legs -- roce_np (emit a CNP on seeing an ECN
+# mark) and roce_rp (cut the send rate on receiving one). One leg alone cannot
+# close the control loop, so it does not count as enabled.
+# Returns 1 if the tree is absent (pre-ECN-sysfs driver, or a non-mlx5 netdev).
+mlx5_dcqcn_sysfs() {
+    local eth="$1"
+    local base="/sys/class/net/$eth/ecn"
+    [[ -d "$base/roce_np/enable" && -d "$base/roce_rp/enable" ]] || return 1
+
+    local mask=0 p np rp
+    for p in 0 1 2 3 4 5 6 7; do
+        np=$(cat "$base/roce_np/enable/$p" 2>/dev/null) || return 1
+        rp=$(cat "$base/roce_rp/enable/$p" 2>/dev/null) || return 1
+        [[ "$np" == "1" && "$rp" == "1" ]] && mask=$(( mask | (1 << p) ))
+    done
+
+    echo "$mask $(cat "$base/roce_np/cnp_dscp" 2>/dev/null)"
+}
+
+# Check DCQCN (ECN-based congestion control) for mlx5 RoCE ports, from the ECN
+# sysfs where the driver exposes it and from the firmware NV config
+# (ROCE_CC_PRIO_MASK_P1 / CNP_DSCP_P1) otherwise. The latter needs NVIDIA MFT
+# and root; both are optional, and a port with neither only WARNs.
 check_mlx5_dcqcn() {
     step "check mlx5 DCQCN (Mellanox/NVIDIA NICs)"
 
@@ -2134,32 +2165,55 @@ check_mlx5_dcqcn() {
         log_skip "no RoCE-capable mlx5 devices, run check_mlx5_versions first"; return 0
     fi
 
-    if ! command -v mlxconfig >/dev/null 2>&1; then
-        log_warn "mlxconfig not found (NVIDIA MFT not installed), cannot check DCQCN"; return 0
-    fi
-    command -v mst >/dev/null 2>&1 && sudo mst start >/dev/null 2>&1 </dev/null
+    # mlxconfig is the fallback rather than the only source now, so a host
+    # without MFT is no longer a dead end for the whole step. It and "mst start"
+    # both want root, so defer them until a port actually has no sysfs to read.
+    local have_mlxconfig=0 mst_tried=0
+    command -v mlxconfig >/dev/null 2>&1 && have_mlxconfig=1
 
-    # Query each device's firmware NV config serially. mlxconfig is slow
-    # (~4s/device, mostly /dev/mst re-enumeration), but running the queries
-    # in parallel barely helped, so keep it simple. </dev/null keeps
-    # mlxconfig from switching the TTY to raw mode for its progress display.
-    local fail=0 cnp_dscps=() dev pci q mask cnp_dscp
-    for dev in "${MLX5_ROCE_DEVS[@]}"; do
-        pci=$(basename "$(readlink -f "/sys/class/infiniband/$dev/device")" 2>/dev/null)
-        if [[ -z "$pci" ]]; then
-            log_warn "$dev : cannot resolve PCI address"; continue
-        fi
-        q=$(sudo mlxconfig -d "$pci" q 2>/dev/null </dev/null)
-        mask=$(echo "$q" | grep -i "ROCE_CC_PRIO_MASK_P1" | awk '{print $NF}')
-        cnp_dscp=$(echo "$q" | grep -i "CNP_DSCP_P1" | awk '{print $NF}')
-        if [[ -z "$mask" ]]; then
-            log_warn "$dev (pci=$pci) : cannot query ROCE_CC_PRIO_MASK_P1"; continue
-        fi
-        if [[ "$mask" == "0" ]]; then
-            log_fail "$dev (pci=$pci) : DCQCN disabled (ROCE_CC_PRIO_MASK_P1=0)"; fail=1
+    local fail=0 cnp_dscps=() i dev eth pci q mask cnp_dscp sysfs
+    for i in "${!MLX5_ROCE_DEVS[@]}"; do
+        dev="${MLX5_ROCE_DEVS[$i]}"
+        eth="${MLX5_ROCE_ETH[$i]:-}"
+        mask=""; cnp_dscp=""
+
+        if [[ -n "$eth" ]] && sysfs=$(mlx5_dcqcn_sysfs "$eth"); then
+            read -r mask cnp_dscp <<< "$sysfs"
+            if [[ "$mask" == "0" ]]; then
+                log_fail "$dev ($eth) : DCQCN disabled (no priority has both roce_np and roce_rp enabled)"; fail=1
+            else
+                log_ok "$dev ($eth) : DCQCN enabled (live prio mask=$mask, CNP_DSCP=${cnp_dscp:-?})"
+            fi
         else
-            log_ok "$dev (pci=$pci) : DCQCN enabled (ROCE_CC_PRIO_MASK_P1=$mask, CNP_DSCP=${cnp_dscp:-?})"
+            # No ECN sysfs: fall back to the firmware NV config. Query each
+            # device serially -- mlxconfig is slow (~4s/device, mostly /dev/mst
+            # re-enumeration), and running the queries in parallel barely
+            # helped. </dev/null keeps mlxconfig from switching the TTY to raw
+            # mode for its progress display.
+            if [[ $have_mlxconfig -eq 0 ]]; then
+                log_warn "$dev (${eth:-no netdev}) : no ECN sysfs, and mlxconfig not found (NVIDIA MFT not installed), cannot check DCQCN"; continue
+            fi
+            pci=$(basename "$(readlink -f "/sys/class/infiniband/$dev/device")" 2>/dev/null)
+            if [[ -z "$pci" ]]; then
+                log_warn "$dev : cannot resolve PCI address"; continue
+            fi
+            if [[ $mst_tried -eq 0 ]]; then
+                mst_tried=1
+                command -v mst >/dev/null 2>&1 && sudo mst start >/dev/null 2>&1 </dev/null
+            fi
+            q=$(sudo mlxconfig -d "$pci" q 2>/dev/null </dev/null)
+            mask=$(echo "$q" | grep -i "ROCE_CC_PRIO_MASK_P1" | awk '{print $NF}')
+            cnp_dscp=$(echo "$q" | grep -i "CNP_DSCP_P1" | awk '{print $NF}')
+            if [[ -z "$mask" ]]; then
+                log_warn "$dev (pci=$pci) : no ECN sysfs, and mlxconfig cannot query ROCE_CC_PRIO_MASK_P1 (needs root)"; continue
+            fi
+            if [[ "$mask" == "0" ]]; then
+                log_fail "$dev (pci=$pci) : DCQCN disabled (ROCE_CC_PRIO_MASK_P1=0)"; fail=1
+            else
+                log_ok "$dev (pci=$pci) : DCQCN enabled (ROCE_CC_PRIO_MASK_P1=$mask, CNP_DSCP=${cnp_dscp:-?})"
+            fi
         fi
+
         [[ -n "$cnp_dscp" ]] && cnp_dscps+=("$cnp_dscp")
     done
 
