@@ -125,13 +125,36 @@ clock; neither does removing them outright. The data is small and L1-resident,
 so the wait is satisfied as soon as it is reached. A static "tight wait" is not
 a stall.
 
-An ATT capture would settle it directly and did not work out. The single-GPU
-probe route is blocked by an HSA teardown assertion (``ScratchCache not empty
-at shutdown``) that kills the process before rocprofv3 finalises, and exiting
-hard with ``os._exit`` skips the finalisation instead. At 8 ranks the trace
-files come out healthy but every decode paired to a null code object, over
-three attempts at ``[4096, 7168] K=1024`` -- the flakiness ``bench/att/README``
-already documents, where the only lever is to run it again.
+An ATT capture does decode, once ``--eager`` is passed: a hipGraph-replayed
+dispatch pairs to a null code object every time, which is what had made this
+look flaky (0 for 4 with graph timing, 1 for 1 without). See
+``bench/att/README``. What it shows, against CK on the same
+``[4096, 7168] K=1024`` shape, as a share of each kernel's own attributed
+latency:
+
+=============  ===============  ===============
+category        this / stalled    CK / stalled
+=============  ===============  ===============
+VALU              29.3%   46%     18.4%   31%
+global load       24.7%   89%     18.7%   90%
+s_waitcnt         19.4%  100%     20.0%  100%
+MFMA               7.9%   70%      3.8%   55%
+C store            5.5%   79%      0.3%   64%
+LDS                3.3%   26%     15.5%   75%
+s_nop              1.7%  100%      9.9%  100%
+=============  ===============  ===============
+
+Both run about three quarters stalled overall (72% against 75%), so the
+difference is where. Ours is in VALU -- 60% more of the latency and half again
+the stall rate -- and in the MFMAs feeding it, 70% stalled against 55%. That is
+the promote's dependency: a tile's MFMA result is read by the FMA that follows
+it. Which is what the batching sweep was meant to break and did not, so the
+chain survives reordering. The C store is the other outlier, 5.5% against 0.3%.
+
+CK's profile is the mirror image: it spends its time in LDS (15.5% at 75%
+stalled, against our 3.3%) and in s_nop (9.9%), i.e. in the A pipeline and in
+deliberately filled hazard slots, not waiting on arithmetic.
+
 
 Two structural notes that came out of the port. B never touches LDS here --
 ``thr_g2r_B``/``frag_B_stages`` load it global->VGPR double-buffered, as CK's
