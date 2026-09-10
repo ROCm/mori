@@ -2049,7 +2049,17 @@ check_mlx5_qos() {
         local qos_output trust pfc_line data_dscp data_prio dl p pp
         local -a enabled_arr=() nd_prios=()
         local -A prio_dscp=()
-        qos_output=$(sudo mlnx_qos -i "$eth" 2>&1)
+        # The DCB netlink getters mlnx_qos reads are unprivileged, so query
+        # without sudo first. Where sudo needs a password -- a Slurm step, CI,
+        # an unprivileged container -- the sudo call fails outright, every port
+        # parses trust as '?', and the step fails for want of a password rather
+        # than for a real fault. Keep a fallback for hosts that do gate the
+        # netlink getters, with -n so a missing password never blocks on a
+        # prompt (sudo would otherwise try to read a TTY that is not there).
+        qos_output=$(mlnx_qos -i "$eth" 2>&1)
+        if ! grep -q "Priority trust state" <<< "$qos_output"; then
+            qos_output=$(sudo -n mlnx_qos -i "$eth" 2>&1)
+        fi
 
         trust=$(echo "$qos_output" | grep "Priority trust state" | head -1 | awk '{print $NF}')
         if [[ "$trust" != "dscp" ]]; then
