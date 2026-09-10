@@ -130,14 +130,13 @@ __device__ __forceinline__ gfx1250_TDM_GROUP1 TdmShape(int hiddenDim) {
   return g1;
 }
 #if defined(MORI_TDM_STRICT)
-#define MORI_TDM_CHECK_ADDR(p)                                 \
-  do {                                                         \
+#define MORI_TDM_CHECK_ADDR(p)                                  \
+  do {                                                          \
     if (!::mori::tdm::TdmAddrOnRow((const void*)(p))) __trap(); \
   } while (0)
-#define MORI_TDM_CHECK_XFER(src, dst, n, sp)                                       \
-  do {                                                                             \
-    if (!::mori::tdm::TdmXferOk((const void*)(src), (const void*)(dst), (n), (sp))) \
-      __trap();                                                                    \
+#define MORI_TDM_CHECK_XFER(src, dst, n, sp)                                                  \
+  do {                                                                                        \
+    if (!::mori::tdm::TdmXferOk((const void*)(src), (const void*)(dst), (n), (sp))) __trap(); \
   } while (0)
 #else
 #define MORI_TDM_CHECK_ADDR(p) ((void)0)

@@ -224,8 +224,7 @@ void RegisterMoriCcl(pybind11::module_& m) {
             return self.finish_sync(reinterpret_cast<uint32_t*>(output), count,
                                     reinterpret_cast<hipStream_t>(stream), capturing);
           },
-          py::arg("output_ptr"), py::arg("count"), py::arg("stream"),
-          py::arg("capturing") = false)
+          py::arg("output_ptr"), py::arg("count"), py::arg("stream"), py::arg("capturing") = false)
       .def(
           "prepare_async_start",
           [](AllgatherU32& self, uintptr_t input, uintptr_t output, size_t count,
