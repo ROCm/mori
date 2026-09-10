@@ -21,31 +21,43 @@ LDS to amortise.
 Measured at ``[16384, 7168] K=2048`` on MI355X, warm cache, and the outcome is
 not the one the shape predicts:
 
-===========================  =========  ===========  ==========
-kernel                        no scale   blockscale   scale cost
-===========================  =========  ===========  ==========
-8-wave 128x256 (kernels_fused)   224.0        370.5      +146.5
-this, 128x128x256                290.9        857.3      +566.4
-this, 64x128x128 (best)             --        532.4          --
-CK 64x256 Intrawave v1              --        300.4        ~0
-===========================  =========  ===========  ==========
+=============================  =========  ===========  ==========
+kernel                          no scale   blockscale   scale cost
+=============================  =========  ===========  ==========
+8-wave 128x256 (kernels_fused)     224.0        370.5      +146.5
+this, 64x128x128                   327.7        459.5      +131.8
+this, 128x128x256                  284.8       2464.6     (spills)
+CK 64x256 Intrawave v1                --        300.4        ~0
+=============================  =========  ===========  ==========
 
-So **the shape is not the problem and neither is B-in-LDS**. Our unscaled GEMM
-is already faster than CK's scaled one (224.0 against 300.4); what costs us is
-applying the per-K-block scale, and this kernel makes that worse, not better.
+Two things that table says. **The shape is not the problem and neither is
+B-in-LDS**: our unscaled 8-wave GEMM at 224.0 is already faster than CK's
+*scaled* kernel, and this one's best unscaled tile is 284.8. What costs us is
+applying the per-K-block scale.
 
-CK gets it for free because it promotes **one MFMA tile at a time**: the loop is
-``static_ford<MRepeat, NRepeat, num_scale_k_block>`` with k innermost, and the
-partial lives in ``c_thread_buf_per_scale``, a single
-``GetRegSizePerXdlops()``-wide buffer -- 4 VGPRs. ``fx.gemm`` issues the MFMAs
-for a whole fragment at once, so the only two things expressible here are
-whole-fragment, and both are expensive: a running rescale needs a divide per
-element per K-block (660us; 88us of that recovered with ``v_rcp_f32``), and
-whole-fragment promotion needs a duplicate accumulator, which spills -- 2753us
-at 128x128x256, the same failure the 8-wave kernel hit at 4052us.
+And **CK's structure is the right one, but it is not sufficient here**. The
+scale is applied a tile at a time, mirroring
+``static_ford<MRepeat, NRepeat, num_scale_k_block>`` with k innermost and the
+partial in ``c_thread_buf_per_scale`` -- one ``GetRegSizePerXdlops()`` buffer,
+4 VGPRs. That is worth 36%: the whole-fragment alternatives cost far more, a
+running rescale +204.7us (a divide per element per K-block, of which 88us came
+back with ``v_rcp_f32``) and a whole-fragment promotion 2753us, the same
+duplicate-accumulator spill the 8-wave kernel hit at 4052us. But 131.8us
+remains against CK's ~0.
 
-Closing this means driving MFMAs per accumulator tile rather than per fragment,
-which is a deeper change than swapping the pipeline.
+What is left is not algorithm. Per k-step this adds ~150 VALU ops -- zeroing 8
+partials, 6 operand materialisations, 64 promote FMAs -- against ~256 cycles of
+MFMA, and on CDNA that VALU co-issues with the matrix pipe only if there are
+waves to hide it behind. Register pressure here allows very few: the same
+promotion at 128x128x256, whose unscaled form is the fastest tile measured,
+spills outright. So the next lever is occupancy, not the scale loop.
+
+The operand materialisation is an artefact of this kernel, not of CK's method:
+``fx.gemm`` on the bare atom rejects a sliced fragment view (it leaves a
+``ub.poison`` the rmem-to-SSA promotion pass then fails on), so A and B have to
+be copied into rmem tensors first. ``kernels_fused``'s ``Mfma16x16x128`` already
+materialises per tile for its own reasons, so porting this promotion there
+would not pay that cost -- and it starts from a 224.0us skeleton.
 """
 
 import functools
@@ -331,10 +343,12 @@ def compile_preshuffle_gemm(
             )
             bid_x, bid_y = Int32(_bx), Int32(_by)
 
+        mma_atom = None
         if const_expr(use_mfma_scale_128):
             _scale_atom = fx.make_mma_atom(
                 fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, layout_elem)
             )
+            mma_atom = _scale_atom
             tiled_mma = fx.make_tiled_mma(
                 _scale_atom,
                 fx.make_layout((1, 4, 1), (0, 1, 0)),
@@ -646,78 +660,71 @@ def compile_preshuffle_gemm(
             fx.copy(sc_atom_1, fx.slice(sb_div, (None, fx.Int32(idx))), sc_reg_1)
             return Vec(fx.memref_load_vec(sc_reg_1))[0]
 
-        def rebase_to(kb):
-            """Rebase the accumulator from K-block ``kb-1``'s scales to ``kb``'s.
+        def mma_promote(a_stage, cur_frag_B, ki, kb):
+            """One scale block's MFMAs, promoted a tile at a time.
 
-            The accumulator is kept as ``C_k / s_k``: one multiply per element
-            per K-block and no second accumulator, since promotion into a
-            duplicate of a 64-VGPR frag_C is what spilled 81 registers last
-            time. Keeping the multiply on the live accumulator also leaves a
-            real data dependency, so the scheduler cannot hoist every MFMA above
-            every rescale -- the failure `rocdl.sched_barrier(0)` did not stop.
+            CK's shape (blockwise_gemm_pipeline_xdlops_blockscale_b_preshuffle
+            _v1.hpp): the loop is (m0, n0, kscale) with k innermost and the
+            partial lives in ``c_thread_buf_per_scale``, a single
+            ``GetRegSizePerXdlops()``-wide buffer. Only one tile's 4 VGPRs are
+            live at a time, which is why CK pays almost nothing for the block
+            scale where both whole-fragment forms are expensive here: a running
+            rescale needs a divide per element per block (+660us) and a
+            whole-fragment promotion needs a duplicate accumulator and spills
+            (2753us).
 
-            The M-tiles are walked load -> divide -> apply one at a time rather
-            than loading all of them up front. Both orders emit the same
-            arithmetic, but the batched one keeps 2*m_repeat vec4 of scales live
-            at once -- as many registers as the accumulator itself -- and that
-            cost 643us at 128x128x256 against 7 here.
-
-            ``kb - 1`` is clamped rather than branched on: at kb=0 the ratio is
-            1, and the accumulator is zero there anyway.
+            frag_C's modes are ((4,1), m_repeat, num_acc_n) and frag_A /
+            frag_B's are (elems, m_repeat|num_acc_n, k_iters), so one tile is a
+            plain slice of each; ``fx.gemm`` is handed the bare atom rather than
+            tiled_mma, exactly as Mfma16x16x128._do_mma does.
             """
-            kb_i = fx.Int32(kb)
-            zero_i = fx.Int32(0)
-            prev_kb = (kb_i > zero_i).select(kb_i - fx.Int32(1), zero_i)
-            # B first: num_acc_n scalars, and every M-tile needs them.
-            # v_rcp_f32 rather than a divide: an IEEE f32 divide expands to
-            # ~10 VALU ops and there are m_repeat*4 + num_acc_n of them per
-            # K-block, which measured 660us against a 291us kernel. rcp is
-            # 1 ulp, four orders under the 1.66e-3 fp8 floor these operands
-            # already carry.
-            rb = [
-                _load_sb(ni, prev_kb) * fx.Float32(fx.rocdl.rcp(T.f32, _load_sb(ni, kb_i)))
-                for ni in range_constexpr(num_acc_n)
-            ]
+            sb = [_load_sb(ni, kb) for ni in range_constexpr(num_acc_n)]
+            # Operands are materialised into bare rmem tensors, the way
+            # Mfma16x16x128._make_operand_frag does: fx.gemm on the atom does
+            # not take a sliced view, it leaves a ub.poison the rmem-to-SSA
+            # promotion pass then rejects. Each is built once per k-step, not
+            # once per (mi, ni) pair.
+            b_ops = []
+            for ni in range_constexpr(num_acc_n):
+                b_op = fx.make_rmem_tensor(8, fx.Int32)
+                b_op.store(Vec(cur_frag_B[None, ni, ki].load()).bitcast(fx.Int32))
+                b_ops.append(b_op)
             acc = Vec(frag_C.load())
-            vals = [None] * acc_size
+            vals = [acc[p] for p in range_constexpr(acc_size)]
             for mi in range_constexpr(m_repeat):
-                pa = _load_sa(mi, prev_kb)
-                ca = _load_sa(mi, kb_i)
-                ra = [
-                    pa[e] * fx.Float32(fx.rocdl.rcp(T.f32, ca[e]))
-                    for e in range_constexpr(4)
-                ]
+                sa = _load_sa(mi, kb)
+                a_op = fx.make_rmem_tensor(8, fx.Int32)
+                a_op.store(Vec(frag_A[None, mi, ki].load()).bitcast(fx.Int32))
                 for ni in range_constexpr(num_acc_n):
+                    b_op = b_ops[ni]
+                    part = fx.make_rmem_tensor(4, fx.Float32)
+                    part.store(Vec.filled(4, 0.0, fx.Float32))
+                    fx.gemm(mma_atom, part, a_op, b_op, part)
+                    pv = Vec(part.load())
                     for ii in range_constexpr(4):
-                        p = ni * (m_repeat * 4) + mi * 4 + ii
-                        vals[p] = acc[p] * (ra[ii] * rb[ni])
-            frag_C.store(vector.from_elements(T.vec(acc_size, T.f32), vals))
-
-        def final_scale():
-            """Undo the invariant: multiply by the last K-block's scales."""
-            last = fx.Int32(kb_count - 1)
-            sb = [_load_sb(ni, last) for ni in range_constexpr(num_acc_n)]
-            acc = Vec(frag_C.load())
-            vals = [None] * acc_size
-            for mi in range_constexpr(m_repeat):
-                sa = _load_sa(mi, last)
-                for ni in range_constexpr(num_acc_n):
-                    for ii in range_constexpr(4):
-                        p = ni * (m_repeat * 4) + mi * 4 + ii
-                        vals[p] = acc[p] * (sa[ii] * sb[ni])
+                        # frag_C.load() yields logical order: ii fastest, then
+                        # m_repeat, then num_acc_n.
+                        idx = ni * (m_repeat * 4) + mi * 4 + ii
+                        vals[idx] = vals[idx] + pv[ii] * (sa[ii] * sb[ni])
             frag_C.store(vector.from_elements(T.vec(acc_size, T.f32), vals))
 
         # ── Pipeline stage (double-buffered B via split fragments) ─
         def mma_kloop(a_stage, cur_frag_B, tile_idx=None):
             for ki in range_constexpr(k_iters):
-                if const_expr(is_blockscale):
-                    # One MMA k-step is one 128-wide scale block.
-                    rebase_to(fx.Int32(tile_idx) * fx.Int32(k_iters) + fx.Int32(ki))
                 fx.copy(
                     uni_copy,
                     pA_s2r_stages[a_stage][None, None, ki],
                     frag_A_retile[None, None, ki],
                 )
+                if const_expr(is_blockscale):
+                    # One MMA k-step is one 128-wide scale block.
+                    mma_promote(
+                        a_stage,
+                        cur_frag_B,
+                        ki,
+                        fx.Int32(tile_idx) * fx.Int32(k_iters) + fx.Int32(ki),
+                    )
+                    continue
                 k_coord = ki if (use_mfma_scale_128 or use_mfma_k32) else (None, ki)
                 fx.gemm(
                     tiled_mma,
@@ -850,8 +857,8 @@ def compile_preshuffle_gemm(
         def load_epi_operands():
             s_a = s_b = bias = None
             if const_expr(is_blockscale):
-                # Nothing to preload: final_scale() applies the last block's
-                # scales to frag_C directly, so the epilogue below sees an
+                # Nothing to preload: mma_promote() folds every K-block's
+                # scales into frag_C as it goes, so the epilogue below sees an
                 # already-scaled accumulator.
                 pass
             elif const_expr(is_8bit):
@@ -921,8 +928,6 @@ def compile_preshuffle_gemm(
             )
 
         # ── Epilogue ─────────────────────────────────────────────
-        if const_expr(is_blockscale):
-            final_scale()
         if const_expr((not is_8bit or is_blockscale) and not _has_epilogue):
             frag_C_out.store(Vec(frag_C.load()).to(out_elem_cls))
         else:
