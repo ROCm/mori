@@ -99,11 +99,35 @@ other. Hoisting the scale addresses' loop invariants out is actively worse, 409
 against 387, because the twelve live values cost more than the signed
 divide-by-128 expansion they remove.
 
-The one thing the ISA does show, and which nothing above changed, is shape:
-CK's loop body interleaves MFMA and VALU evenly -- median 4 VALU between MFMAs,
-2 of 31 gaps empty -- where ours alternates MFMA clusters with 40-80
-instruction VALU stretches, 8 of 31 gaps empty. Whatever produces that sits
-upstream of the group barriers.
+Reading the two loop bodies against each other says the same thing from the
+other side. Ours is *shorter* than CK's -- 312 instructions swap-off and 272
+swap-on against 322 -- with identical MFMA (32) and LDS (20) counts and fewer
+VALU. Fewer instructions, 29% slower, so the gap is cycles per instruction.
+
+Two things in the ISA fit that:
+
+* **We drain the memory queue far harder.** CK's waits are
+  ``s_waitcnt vmcnt(15)``, ``vmcnt(16)``, ``vmcnt(10)`` -- it keeps ten to
+  sixteen loads in flight and waits only for the oldest. Ours are five
+  ``s_waitcnt vmcnt(1)`` per loop body swap-off (4/7/9 swap-on), i.e. a near
+  full drain, five times per iteration.
+* **CK uses more s_nop, not fewer.** 25 against our 12, spread over nop counts
+  1 to 11 -- MFMA hazard slots filled deliberately rather than covered by a
+  wait.
+
+Not settled: feeding constant scales instead of loading them does not change
+the time, which argues the tight waits are on the B fragment rather than on the
+scale loads. Separating a load from its use -- CK advances its scale copies a
+window ahead, ``a_scale_thread_copy`` plus ``MoveSrcSliceWindow`` -- is the
+obvious thing to try next.
+
+An ATT capture would settle it directly and did not work out. The single-GPU
+probe route is blocked by an HSA teardown assertion (``ScratchCache not empty
+at shutdown``) that kills the process before rocprofv3 finalises, and exiting
+hard with ``os._exit`` skips the finalisation instead. At 8 ranks the trace
+files come out healthy but every decode paired to a null code object, over
+three attempts at ``[4096, 7168] K=1024`` -- the flakiness ``bench/att/README``
+already documents, where the only lever is to run it again.
 
 Two structural notes that came out of the port. B never touches LDS here --
 ``thr_g2r_B``/``frag_B_stages`` load it global->VGPR double-buffered, as CK's
