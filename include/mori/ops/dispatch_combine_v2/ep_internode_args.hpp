@@ -341,8 +341,7 @@ struct EpInterNodeArgs {
 
 namespace detail {
 
-#define MORI_EP_INTERNODE_ARGS_OFFSET(name, tag) \
-  offsetof(::mori::ops::v2::EpInterNodeArgs, name),
+#define MORI_EP_INTERNODE_ARGS_OFFSET(name, tag) offsetof(::mori::ops::v2::EpInterNodeArgs, name),
 inline constexpr size_t kEpInterNodeArgsOffsets[] = {
     MORI_EP_INTERNODE_ARGS_FIELDS(MORI_EP_INTERNODE_ARGS_OFFSET)};
 #undef MORI_EP_INTERNODE_ARGS_OFFSET

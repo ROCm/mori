@@ -72,34 +72,33 @@ using EpDispatchCombineArgs = EpInterNodeArgs;
 
 // v1's common.hpp macro, with the config type swapped and the runtime assert
 // promoted to a static_assert: numExpertPerToken must fit in a ballot.
-#define DEF_COMMON_VARS                                                    \
-  constexpr EpInterNodeDeviceCfg config = EpInterNodeDeviceCfgOf(kConfig); \
-  int thdId = threadIdx.x;                                                 \
-  int thdNum = blockDim.x;                                                 \
-  int laneId = threadIdx.x & (warpSize - 1);                               \
-  int warpId = thdId / warpSize;                                           \
-  int warpNum = blockDim.x / warpSize;                                     \
-  int blockNum = gridDim.x;                                                \
-  int blockId = blockIdx.x;                                                \
-  int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;                 \
-  int globalThdNum = gridDim.x * blockDim.x;                               \
-  int globalWarpId = blockIdx.x * warpNum + warpId;                        \
-  int globalWarpNum = gridDim.x * warpNum;                                 \
-  int nullTokenId = NullFlatTokenIndex(config);                            \
-  int myPe = args.rank;                                                    \
-  int npes = config.worldSize;                                             \
-  int myNode = myPe / config.gpuPerNode;                                   \
-  int nNodes = npes / config.gpuPerNode;                                   \
-  int numExpertPerToken = config.numExpertPerToken;                        \
-  static_assert(kConfig.numExpertPerToken < warpSize,                       \
-                "numExpertPerToken must fit in a ballot");                   \
-  size_t hiddenDim = config.HiddenDimSz();                                 \
-  size_t hiddenBytes = config.HiddenBytes(sizeof(T));                      \
-  size_t indexBytes = config.IndexBytes();                                 \
-  size_t weightBytes = config.WeightBytes();                               \
-  size_t srcTokenIdBytes = config.SrcTokenIdBytes();                       \
-  size_t scaleBytes = config.ScaleBytes();                                 \
-  size_t xferBytes = config.XferBytesPerToken(sizeof(T));                  \
+#define DEF_COMMON_VARS                                                                          \
+  constexpr EpInterNodeDeviceCfg config = EpInterNodeDeviceCfgOf(kConfig);                       \
+  int thdId = threadIdx.x;                                                                       \
+  int thdNum = blockDim.x;                                                                       \
+  int laneId = threadIdx.x & (warpSize - 1);                                                     \
+  int warpId = thdId / warpSize;                                                                 \
+  int warpNum = blockDim.x / warpSize;                                                           \
+  int blockNum = gridDim.x;                                                                      \
+  int blockId = blockIdx.x;                                                                      \
+  int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;                                       \
+  int globalThdNum = gridDim.x * blockDim.x;                                                     \
+  int globalWarpId = blockIdx.x * warpNum + warpId;                                              \
+  int globalWarpNum = gridDim.x * warpNum;                                                       \
+  int nullTokenId = NullFlatTokenIndex(config);                                                  \
+  int myPe = args.rank;                                                                          \
+  int npes = config.worldSize;                                                                   \
+  int myNode = myPe / config.gpuPerNode;                                                         \
+  int nNodes = npes / config.gpuPerNode;                                                         \
+  int numExpertPerToken = config.numExpertPerToken;                                              \
+  static_assert(kConfig.numExpertPerToken < warpSize, "numExpertPerToken must fit in a ballot"); \
+  size_t hiddenDim = config.HiddenDimSz();                                                       \
+  size_t hiddenBytes = config.HiddenBytes(sizeof(T));                                            \
+  size_t indexBytes = config.IndexBytes();                                                       \
+  size_t weightBytes = config.WeightBytes();                                                     \
+  size_t srcTokenIdBytes = config.SrcTokenIdBytes();                                             \
+  size_t scaleBytes = config.ScaleBytes();                                                       \
+  size_t xferBytes = config.XferBytesPerToken(sizeof(T));                                        \
   size_t combXferBytes = (args.weightsBuf == nullptr) ? hiddenBytes : hiddenBytes + weightBytes;
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -249,8 +248,8 @@ __device__ __forceinline__ int32_t EpInterNodeWaitGt(int32_t* addr, int32_t val)
 /* ---------------------------------------------------------------------------------------------- */
 namespace internode {
 template <EpInterNodeKernelCfg kConfig, typename T>
-inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs& args, int tokenId,
-                                              int expId, int destPe, int& localPeTokenCounter) {
+inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs& args, int tokenId, int expId,
+                                              int destPe, int& localPeTokenCounter) {
   DEF_COMMON_VARS;
 
   index_t tokenExpertId = tokenId * config.numExpertPerToken + expId;
@@ -342,7 +341,8 @@ inline __device__ void DispatchIntraNode(EpDispatchCombineArgs& args) {
           args.dispDestTokIdMap[expertOffset] = NullFlatTokenIndex(config);
         continue;
       }
-      DispatchIntraNodeBlock<kConfig, T>(args, tokenId, inTokenExpertId, destPe, localPeTokenCounter);
+      DispatchIntraNodeBlock<kConfig, T>(args, tokenId, inTokenExpertId, destPe,
+                                         localPeTokenCounter);
     }
   }
 
@@ -819,7 +819,7 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs& args,
 
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpDispatchInterNodeV2_body(EpDispatchCombineArgs args,
-                                                 const ::mori::cco::ccoDevComm& comm) {
+                                           const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
   if (blockId < args.rdmaBlockNum) {
     internode::DispatchInterNodeSend<kConfig, T>(args, comm);
@@ -875,7 +875,7 @@ __device__ void EpDispatchCopyToStaging_body(EpDispatchCombineArgs args) {
 
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpDispatchInterNodeV2LL_body(EpDispatchCombineArgs args,
-                                                           const ::mori::cco::ccoDevComm& comm) {
+                                             const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
   if (blockId < args.rdmaBlockNum) {
     internode::DispatchInterNodeLLSend<kConfig, T>(args, comm);
@@ -1412,7 +1412,7 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs& args,
 
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpCombineInterNodeV2_body(EpDispatchCombineArgs args,
-                                                const ::mori::cco::ccoDevComm& comm) {
+                                          const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
 
   if (blockId < args.rdmaBlockNum) {
@@ -1491,7 +1491,7 @@ __device__ void EpCombineAll_body(EpDispatchCombineArgs args) {
 
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpCombineInterNodeV2LL_body(EpDispatchCombineArgs args,
-                                                          const ::mori::cco::ccoDevComm& comm) {
+                                            const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
 
   if (blockId < args.rdmaBlockNum) {
@@ -1549,15 +1549,15 @@ __device__ void EpCombineSyncBarrier_body(EpDispatchCombineArgs args) {
 // the commas inside its brace initialiser would be taken as argument separators.
 
 // Kernels that reach the network.
-#define MORI_EP_INTERNODE_CCO_ENTRY(entry, body)                                                  \
-  extern "C" __global__ void entry(::mori::ops::v2::EpInterNodeCcoArgs a) {                       \
-    ::mori::ops::v2::body<kConfig, TokT>(a.args, a.devComm); \
+#define MORI_EP_INTERNODE_CCO_ENTRY(entry, body)                            \
+  extern "C" __global__ void entry(::mori::ops::v2::EpInterNodeCcoArgs a) { \
+    ::mori::ops::v2::body<kConfig, TokT>(a.args, a.devComm);                \
   }
 
 // Staging, sync and the final reduction: local or intra-node only, so they take
 // no communicator. They still take the same argument struct, so the host has one
 // launch path for the whole sequence.
-#define MORI_EP_INTERNODE_CCO_ENTRY_LOCAL(entry, body)                                 \
-  extern "C" __global__ void entry(::mori::ops::v2::EpInterNodeCcoArgs a) {            \
-    ::mori::ops::v2::body<kConfig, TokT>(a.args); \
+#define MORI_EP_INTERNODE_CCO_ENTRY_LOCAL(entry, body)                      \
+  extern "C" __global__ void entry(::mori::ops::v2::EpInterNodeCcoArgs a) { \
+    ::mori::ops::v2::body<kConfig, TokT>(a.args);                           \
   }

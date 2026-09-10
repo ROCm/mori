@@ -34,13 +34,13 @@
 #include <vector>
 
 #include "hip/hip_runtime_api.h"
-#include "mori/application/utils/cpu_affinity.hpp"
 #include "mori/application/application.hpp"  // Context, BootstrapNetwork
 #include "mori/application/bootstrap/local_bootstrap.hpp"
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/application/memory/va_manager.hpp"  // HeapVAManager
 #include "mori/application/transport/rdma/rdma.hpp"
 #include "mori/application/utils/check.hpp"
+#include "mori/application/utils/cpu_affinity.hpp"
 #include "mori/cco/cco.hpp"  // public, self-contained (opaque ccoComm fwd-decl); defines BUILD_CCO_SDMA
 #if BUILD_CCO_SDMA
 // The anvil (copy-engine) dependency is confined to this TU — pulled in only when

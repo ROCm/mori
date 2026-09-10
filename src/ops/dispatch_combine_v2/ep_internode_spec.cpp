@@ -121,9 +121,10 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
   // generic launch failure with no mention of which knob was too large.
   const int threads = EpInterNodeBlockThreads(c);
   if (threads <= 0 || threads > 1024) {
-    throw std::runtime_error("mori ep internode v2: warpPerBlock " + std::to_string(c.warpPerBlock) +
-                             " x waveSize " + std::to_string(c.waveSize) + " = " +
-                             std::to_string(threads) + " threads per block, which exceeds 1024");
+    throw std::runtime_error("mori ep internode v2: warpPerBlock " +
+                             std::to_string(c.warpPerBlock) + " x waveSize " +
+                             std::to_string(c.waveSize) + " = " + std::to_string(threads) +
+                             " threads per block, which exceeds 1024");
   }
 
   // The grid is split: blocks below rdmaBlockNum take the RDMA leg, the rest the

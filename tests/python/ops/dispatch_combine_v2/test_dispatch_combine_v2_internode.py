@@ -491,7 +491,10 @@ def _print_phase_table(title, rdma, xgmi, ll, lat):
         "LL Bandwidth (GB/s)",
         "Latency (us)",
     ]
-    r = lambda v: round(v, 2)
+
+    def r(v):
+        return round(v, 2)
+
     # Bandwidth "Best" is the MAX and latency "Best" is the MIN, so the two
     # columns index the same tuple from opposite ends. v1 does this too; it is
     # the reason Best/Worst are not simply [1]/[0] throughout.
@@ -527,7 +530,9 @@ def _report_tables(d, cfg, a, disp, comb, total_recv, idx, ll, geom):
     ll_scale = ct * cfg.num_experts_per_token / (total_recv + 1)
 
     # bw in GB/s from a duration in MICROseconds: bytes/1e9 / (us/1e6).
-    bw = lambda b, us: b / (1000.0 * us) if us > 0 else 0.0
+    def bw(b, us):
+        return b / (1000.0 * us) if us > 0 else 0.0
+
     row = []
     for dv, cv in zip(disp, comb):
         row += [
@@ -850,7 +855,10 @@ def _timed_pass(op, d, a, inp, idx, wts, sc, cw, convert, n, warm):
     keep = slice(a.drop_rounds, None)
     dv = [ev[3 * i].elapsed_time(ev[3 * i + 1]) * 1e3 for i in range(n)][keep]
     cv = [ev[3 * i + 2].elapsed_time(ev[3 * i + 3]) * 1e3 for i in range(n)][keep]
-    gm = lambda v: d.allreduce_sum(int(sum(v) / len(v) * 1000)) / d.world / 1000
+
+    def gm(v):
+        return d.allreduce_sum(int(sum(v) / len(v) * 1000)) / d.world / 1000
+
     # The worst ROUND, across ranks, alongside the grand means. Without it a
     # sweep cannot see the failure mode that matters here: a geometry whose
     # median round is identical but which spikes to 4-5x on one round in thirty.
@@ -985,11 +993,23 @@ def _tune(cfg, d, dev, a, comm):
     # the two are coupled (a dispatch with too few rdma blocks leaves the combine
     # after it slower) and a per-phase argmin measured against a DIFFERENT other
     # phase does not carry over.
-    geoms = lambda g: ((g, inc_c) if phase == "dispatch" else (inc_d, g))
+    def geoms(g):
+        return (g, inc_c) if phase == "dispatch" else (inc_d, g)
+
     if a.tuning_metric == "total":
-        pick = lambda dv, cv: dv + cv
+
+        def pick(dv, cv):
+            return dv + cv
+
+    elif phase == "dispatch":
+
+        def pick(dv, cv):
+            return dv
+
     else:
-        pick = (lambda dv, cv: dv) if phase == "dispatch" else (lambda dv, cv: cv)
+
+        def pick(dv, cv):
+            return cv
 
     best_op = _build_op(cfg, comm, *geoms(start))
     comm.barrier()
