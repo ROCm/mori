@@ -671,17 +671,24 @@ class PoolClient {
 
    private:
     void Release(size_t index, size_t count);
+    // Drop an admitted waiter from the arrival queue.
+    void Forget(uint64_t ticket);
 
     std::mutex mutex_;
     std::condition_variable cv_;
-    // Admission is by ARRIVAL ORDER, which is what makes both directions
-    // starvation-free.  Deferring unconditionally to queued AcquireAll callers
-    // fixes shard-stream-starves-exclusive but creates its mirror; "each
-    // exclusive call finishes" does not mean the exclusive queue ever empties.
-    // A waiter is blocked only by waiters that arrived BEFORE it, and those are
-    // finite in number, so everyone is eventually oldest.
+    // One arrival-ordered queue of everything not yet admitted, which is what
+    // makes both directions starvation-free:
+    //   * a shard waiter enters once no EXCLUSIVE waiter arrived ahead of it
+    //     and a shard is free -- so consecutive shard waiters still run
+    //     concurrently, which is the whole point of sharding;
+    //   * an exclusive waiter enters once it is the oldest waiter of EITHER
+    //     kind and every shard is free.
+    // Each is then blocked only by arrivals older than itself, and those are
+    // finite, so neither side can be passed over indefinitely.  Recording only
+    // one of the two kinds gets this wrong in whichever direction is left
+    // invisible.  An uncontended Acquire never touches the queue.
     uint64_t next_ticket_ = 0;
-    std::deque<uint64_t> exclusive_queue_;
+    std::deque<std::pair<uint64_t, bool>> waiters_;  // (ticket, is_exclusive)
     std::vector<char*> bases_;
     // Not vector<bool>: this is written under the mutex and read by index, and
     // the proxy-reference specialisation buys nothing at these sizes.
