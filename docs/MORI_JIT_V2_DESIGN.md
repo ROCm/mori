@@ -55,9 +55,9 @@ mori 特有的简化：走 `.hsaco` + `hipModuleGetFunction` 而非链接，所�
 
 | | 文件 | 内容 | 谁编译 |
 |---|---|---|---|
-| ① Cfg | `include/mori/ops/dispatch_combine_v2/ep_cfg.hpp` | Cfg + Args + `VisitFields` + 共享几何 constexpr | **两侧**（HIP-free） |
-| ② body | `src/ops/dispatch_combine_v2/ep_intranode_kernel.hpp`（portable）<br>`src/ops/dispatch_combine_v2/ep_intranode_1250x.hpp`（gfx125x TDM） | `template <EpCfg kCfg, typename T> __device__ void Body(EpArgs)` | 只有生成的 TU |
-| ③ Spec | `ep_spec.hpp` / `ep_spec.cpp` | Request + `EntryName` + `RenderSource` + `Geometry` + 注册宏 | host |
+| ① Cfg | `include/mori/ops/dispatch_combine_v2/ep_cfg.hpp`（intranode）<br>`include/mori/ops/dispatch_combine_v2/ep_internode_args.hpp` + `ep_internode_cfg.hpp`（internode） | Cfg + Args + `VisitFields` + 共享几何 constexpr | **两侧**（HIP-free） |
+| ② body | `src/ops/dispatch_combine_v2/ep_intranode_kernel.hpp`（portable）<br>`src/ops/dispatch_combine_v2/ep_intranode_1250x.hpp`（gfx125x TDM）<br>`src/ops/dispatch_combine_v2/ep_internode_kernel.hpp`（internode，八个 pass 各一个 body） | `template <EpCfg kCfg, typename T> __device__ void Body(EpArgs)` | 只有生成的 TU |
+| ③ Spec | `ep_spec.hpp` / `ep_spec.cpp`（intranode）<br>`ep_internode_spec.hpp` / `ep_internode_spec.cpp`（internode） | Request + `EntryName` + `RenderSource` + `Geometry` + 注册宏 | host |
 
 新增一个 kernel 就是写这三样。**Python 侧零行**——Plan 类由 C++ 发布的 schema 生成。
 
@@ -98,7 +98,7 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
   MORI_FIELD(worldSize); ... MORI_FIELD(useWeights);
 #undef MORI_FIELD
 }
-MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 11, "加了字段就要同步 VisitFields");
+MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 12, "加了字段就要同步 VisitFields");
 ```
 
 加字段 = 三处编辑（struct、`MORI_FIELD`、计数），漏掉任何一处都是**编译期红字**。
@@ -111,7 +111,7 @@ MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 11, "加了字段就要同步 VisitFields");
 也改了 kernel 代码，文本虽没变但 include 哈希会变，照样重编。两级哈希各管一头。
 
 **`EpArgs` 同理**。它的 wire schema 由一份 `MORI_EP_ARGS_FIELDS(X)` 生成，并按同一顺序取 `offsetof`
-断言递增。只对 `sizeof` 设防不够：22 个字段里 8 个是裸指针，调换两个同类型字段所有尺寸校验都过，
+断言递增。只对 `sizeof` 设防不够：24 个字段里 12 个是裸指针，调换两个同类型字段所有尺寸校验都过，
 kernel 安静地读错 buffer。按 schema 顺序取的 offset 序列一旦不再递增，就是编译期错误。
 
 ### 3.3 生成的源码
@@ -309,7 +309,9 @@ StdMoE、per-token scales、routing replay、`local_expert_count`。能力门在
 再失败。
 
 `_regions` 归子类还消掉一个陷阱：FlyDSL 的 `off_out_tok` 对 dispatch 指 `disp_out`、对 combine 指
-`out_tok`，任何共享的 offset 传递路径都会静默接错 buffer。
+`out_tok`，任何共享的 offset 传递路径都会静默接错 buffer。HIP 后端的 internode 布局又是另一张表，
+在 `internode_regions.py`：16 个具名 region，加上 `scale_dim > 0` 时才有的 `out_scales` 共 17 个，
+尺寸按 v1 的分配顺序逐条转写而不是重新推导。
 
 **选后端只 import 那一个**：`dispatch_combine_op` 不 import 任何后端，选 `hip` 不会拉进 flydsl，
 所以它在没装 FlyDSL 的机器上能跑。
@@ -333,6 +335,15 @@ dispatch 的 dtype**——它只归约 bf16/fp32 的暂存区，不管前面搬�
 取值规则：**性能接近时取更小的几何**，因为少占 CU 在与专家 GEMM 重叠时是真收益。这类 3% 以内的取舍是
 **策略不是测量**（单次 bench 偶尔会偏 20%）；真正由数据定的是桶的**边界**，它们来自 10~40% 的差异。
 
+internode 再是第三张表 `internode_tuning_configs.py`，键是 `(device_key, world_size, hidden_dim, topk)`
+再按 dispatch 的 dtype 分档，值是一串 `(max_tok_inclusive|None, disp_block, disp_rdma, disp_warp,
+comb_block, comb_rdma, comb_warp)`。它和上面两张的差别在 `rdma_block_num`：这一维把 grid 切成 RDMA 一半和
+node 内一半，kernel 对它有分支，所以**一套 pass 序列是按几何整套编出来的**，而不是编一份、launch 时挑；
+`HipBackend._internode_geometry_buckets` 在构建期把整张表走一遍，运行时的解析因此永远不会触发编译。也因为
+dispatch 和 combine 在同一个 token 数、同一块 arena 上调到不同的 rdma/warp，一个 bucket 一套几何表达不了，
+表里每档都是**成对**的行——不要单独重调其中一相。唯一硬不变量还是 `block_num <= CU 数`，`lookup()` 会 clamp。
+目前只有 MI308X EP16 / hidden 6144 / topk 8 一行是实测过的。
+
 ## 6. Python 绑定
 
 C ABI 是**十一个符号，对所有 kernel 永久有效**：
@@ -349,8 +360,8 @@ EP 的 internode 序列一次 dispatch 是 2 个 pass、一次 combine 是 4 个
 
 Python 侧对应 `plan_api.LaunchGroup`：**plan 集合固定时把校验和 handle 数组挪到构建期**，
 发射路径只剩填参数和那一次 ABI 调用。「共享同一 args 布局」按完整的
-`(name, offset, size)` 序列比对，不是只比 `sizeof`——理由见 §3.2：八个裸指针字段，
-调换两个同类型的所有尺寸校验都过，然后按 `plans[0]` 的 schema 填、发给其余 plan，
+`(name, offset, size)` 序列比对，不是只比 `sizeof`——理由见 §3.2：internode 的 args 有 37 个字段，
+其中 14 个是裸指针，调换两个同类型的所有尺寸校验都过，然后按 `plans[0]` 的 schema 填、发给其余 plan，
 静默读错 buffer。代价是 group 缓存了 handle：显式 `close()` 一个 plan 会让它失效，
 而发射路径不再逐次检查——这正是省下来的那部分。
 
@@ -359,14 +370,20 @@ Python 侧对应 `plan_api.LaunchGroup`：**plan 集合固定时把校验和 han
 | **请求** | 以 `(name, value)` 对穿过边界。**没有结构体要声明两次**；未知字段名报错（拼错的旋钮悄悄不生效，正是测量描述错二进制的成因），缺失字段取 C++ 默认 |
 | **参数** | C++ 发布 schema（字段表 + `sizeof`），Python **据此构造** ctypes 结构并断言大小。只有一份声明 |
 
-十个入口全部 `noexcept`：异常穿过 `extern "C"` 进 ctypes 是 UB，实测会不留 traceback 地干掉解释器。
+十一个入口全部 `noexcept`：异常穿过 `extern "C"` 进 ctypes 是 UB，实测会不留 traceback 地干掉解释器。
 所以每个入口都 catch，并按 ABI 的方式报告——返回 null/负值，细节留在 `mori_jit_last_error()`。
 
 通用绑定 `mori.jit.v2.plan_api`（即 libmori_jit.so 的 `mori_jit_*` C ABI 的 Python 侧，与
 `src/jit/v2/plan_api.cpp` 对应）里没有任何 kernel 名字：`make_plan(kernel)` 由 schema 生成 Plan 类。
 EP 专用的只有薄 shim `ops/dispatch_combine_v2/ep_plans.py`——它 `load_library("libmori_ops_v2.so")`
-触发注册，再暴露 `EpDispatchPlan`/`EpCombinePlan`。约定两条：标为 `e` 的字段接受 dtype 名或 torch
-dtype；launch 参数里 `off<Region>` 是 arena region 偏移，传 `arena=` 就绑定一次。
+触发注册，再暴露 intranode 的 `EpDispatchPlan`/`EpCombinePlan`，以及 internode 的
+`EP_INTERNODE_PLANS`：按 pass 名（`copystaging` / `dispatch` / `dispatch_ll` / `combinesync` /
+`combinesyncbarrier` / `combine` / `combine_ll` / `combineall`）索引的八个 plan，因为它的一次
+dispatch/combine 就是一串 pass，每个 pass 各是一个模块。约定两条：标为 `e` 的字段接受 dtype 名或 torch
+dtype；launch 参数里 `off<Region>` 是 arena region 偏移，传 `arena=` 就绑定一次。internode 的枚举不走
+通用的 `DTYPES`，而是 `make_plan(..., enums=...)` 传进去的两张自己的表 `INTERNODE_DTYPES` /
+`INTERNODE_QUANT_TYPES`，取值必须与 C++ 侧 v2 自己的 `EpInterNodeDType` / `EpQuantType` 一致
+（同 §7 的那条：独立编号 = 静默给错 kernel）。
 
 **为什么是 ctypes**：边界只传指针和标量，没有类型转换可做。pybind11 的代价是编译期（aiter 实测
 libtorch+pybind11 的设备 pass 解析 ~15s）。绑定层里**没有 `import torch`**，靠鸭子类型取 `.data_ptr()`。
@@ -442,7 +459,19 @@ PULL/QUAD gather combine。
 scales 转发、routing replay、`local_expert_count`。这些在 FlyDSL 后端都有。注意 fp8/fp4 **dispatch**
 已经支持（§3.7）——那是搬运已量化的载荷，和让 mori 自己量化的 `quant_type` 是两回事。
 
-**cross-node 没有**：v2 只有 intranode 两个 body，op 里也没有 `kernel_type` 的概念。
+**cross-node 也有了**：`src/ops/dispatch_combine_v2/` 现在是三个 body 头文件——两个 intranode
+（portable / gfx125x TDM）加一个 `ep_internode_kernel.hpp`，后者在一个头里放八个 pass 的 body，
+对应 `ep_internode_spec.cpp` 注册的八个 Spec / 八个 plan（`ep_internode_` + `copystaging` /
+`dispatch` / `dispatch_ll` / `combinesync` / `combinesyncbarrier` / `combine` / `combine_ll` /
+`combineall`）。一轮 dispatch 发 copystaging + dispatch 或 dispatch_ll，一轮 combine 发
+combinesync + combinesyncbarrier + combine 或 combine_ll + combineall。
+
+选择仍然没有 `kernel_type` 枚举，但有两级选择器：走不走 internode 由 `gpu_per_node < world_size`
+（`EpDispatchCombineConfig.is_internode`）决定，只有 `hip` 后端实现它，FlyDSL 后端在能力门里直接
+报错；走哪一族由 `internode_kernel = auto | v2 | v2_ll` 决定。`v2` 和 `v2_ll` 是**两族独立
+kernel**——独立的 JIT 模块、入口符号和缓存 key，不是一个 body 的两个分支——所以点名一族就只编那一族；
+`auto`（默认）两族都编，按 launch 的 token 数在 `internode_ll_max_tokens`（默认 512）处切换，
+也只有它能在运行时切。
 
 ## 10. 测试
 
@@ -455,6 +484,8 @@ scales 转发、routing replay、`local_expert_count`。这些在 FlyDSL 后端�
 | `test_ep_backend_parity.py` | EP8，一个进程内两个后端 | 同一输入逐元素比对 |
 | `test_graph_capture.py` | EP8 | dispatch → identity expert → combine 整步捕成一张图并 replay |
 | `test_asym_dtype.py` | EP8 | fp8/fp4 dispatch + bf16 combine |
+| `test_internode_regions.py` | 单进程，不建 op、不碰 GPU | internode arena：region 名与 `_internode_static_args` 的契约（两侧独立转写），以及 kernel 索引算术蕴含的容量上界 |
+| `test_dispatch_combine_v2_internode.py` | 2 节点 × 8 GPU（EP16），torchrun 起，`gpu_per_node < world_size` 才建得起来 | identity expert 对解析 golden 的逐 rank 正确性；`--cmd bench` 对齐 v1 harness 的计时循环，`--cmd tuning` 是 `internode_tuning_configs` 的配对式 sweep；`--kernel-type auto\|v2\|v2_ll` |
 | `bench_ep.py` | EP4/EP8 | 性能 bench（各后端通用）；`DBN`/`DWPB`/`CBN`/`CWPB` 钉住几何即用于 `hip_tuning_configs` 调优 |
 
 `test_jit_binding.py` 在 CI 里**从 `/tmp` 跑**，不是从 checkout 跑：建一个 plan 需要

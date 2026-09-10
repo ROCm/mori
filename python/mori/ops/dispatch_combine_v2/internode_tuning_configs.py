@@ -20,8 +20,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Per-device launch geometry for the v2 CCO internode (v2_ll)
-dispatch/combine kernels.
+"""Per-device launch geometry for the v2 CCO internode dispatch/combine kernels.
+
+One table for BOTH internode families: "v2" and "v2_ll" are compiled from the
+same request, so a row's geometry is whichever family the launch resolves to.
+The coarsest row also spans the token counts above ``internode_ll_max_tokens``,
+where "auto" stops picking the LL family -- there it is "v2" geometry only.
 
 The internode kernels reach their grid a different way than the intranode ones.
 An intranode kernel is compiled once per (block, warp) the schedule can name and
@@ -29,8 +33,8 @@ picks among those at launch; an internode *pass sequence* is compiled per
 geometry, because ``rdma_block_num`` splits the grid between the RDMA blocks and
 the intra-node ones and the kernel branches on it. So the host resolves a bucket
 here from the live ``num_tokens`` and launches the plan set built for it --
-``HipBackend._internode_geometry_buckets`` walks this whole table at build time
-so that resolution can never trigger a compile.
+``EpDispatchCombineOpHip._internode_geometry_buckets`` walks this whole table
+at build time so that resolution can never trigger a compile.
 
 That is also why this table, unlike ``tuning_configs.py`` (flydsl intranode) and
 ``hip_tuning_configs.py``, carries an ``rdma_block_num`` per phase: dispatch and

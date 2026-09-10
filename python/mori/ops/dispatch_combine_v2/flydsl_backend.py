@@ -55,6 +55,21 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
     """FlyDSL-kernel EP op. The full v2 feature set: gather + scatter combine,
     fp8/fp4, quant, StdMoE, per-token scales, routing replay."""
 
+    def _unsupported(self, cfg) -> tuple[str, ...]:
+        """This backend has no cross-node path.
+
+        Without this the default backend would silently build INTRANODE kernels
+        for a config whose world spans nodes, and the run would produce wrong
+        results rather than fail: nothing else here reads gpu_per_node.
+        """
+        if cfg.is_internode:
+            return (
+                f"gpu_per_node={cfg.gpu_per_node} < world_size={cfg.world_size} "
+                "selects the internode path, which only the 'hip' backend "
+                "implements; pass kernel_backend='hip'",
+            )
+        return ()
+
     def __init__(self, cfg: EpDispatchCombineConfig, comm):
         self.cfg = cfg
         self.comm = comm

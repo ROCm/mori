@@ -30,10 +30,15 @@ to flydsl; ``EpDispatchCombineOpHip(cfg, comm)`` is the explicit form, and
 Neither backend is imported here. Selecting one imports only that one, so the HIP
 backend works on a machine with no flydsl.
 
-A subclass supplies exactly two things::
+A subclass supplies four hooks -- two with no default, two with one::
 
     _regions(cfg)              -> [(name, nbytes)]   arena layout it needs
     _build_kernels(cfg, arena) -> KernelSet          bound, ready-to-launch kernels
+    _unsupported(cfg)          -> (reason, ...)      configs it cannot serve; () = all
+    _region(name)              -> name               arena region a shared view reads
+
+That is the HIP backend's route. The FlyDSL one overrides ``__init__`` and builds
+its own arena and KernelSet there, so ``_unsupported`` is the only hook it defines.
 
 Everything else -- arena, scratch buffers, variant selection, lifecycle -- is here.
 Behavioural differences between the backends are *data* on the KernelSet, not
@@ -96,6 +101,16 @@ class EpDispatchCombineConfig:
     # Geometry: None => the tuned schedule for this device/shape/dtype; pin any of
     # these to opt out. Combine keeps its own warp count -- its K-deep per-lane MLP
     # saturates sooner than dispatch's copy.
+    #
+    # Intranode only. On the internode path pinning these does NOT opt out: the
+    # backend takes its geometry from internode_tuning_configs, and on a shape the
+    # table knows (device, world_size, hidden_dim, num_experts_per_token) it reads
+    # none of the six geometry fields: the two rdma ones below are dropped, and
+    # the four block/warp ones survive only as the KernelSet key that names the
+    # one wrapper. They are read on the two paths that leave the table: an untuned
+    # shape, where the six become the single geometry bucket, and a
+    # MORI_EP_DISP_GEOM / MORI_EP_COMB_GEOM pin, which bypasses the table and
+    # falls back to the config triple for whichever of the two legs was not pinned.
     dispatch_block_num: int = None
     combine_block_num: int = None
     warp_num_per_block: int = None
@@ -124,6 +139,8 @@ class EpDispatchCombineConfig:
     # RDMA-block split of the grid, per phase. Runtime, never compiled in:
     # dispatch and combine are deliberately tuned to DIFFERENT values (see
     # internode_tuning_configs), so one compiled-in value cannot serve both.
+    # Read only on the untuned-shape and env-pin paths, like the block/warp
+    # fields above.
     dispatch_rdma_block_num: int = None
     combine_rdma_block_num: int = None
     # Which of the two internode kernel families runs. "v2" and "v2_ll" are
@@ -139,9 +156,13 @@ class EpDispatchCombineConfig:
     # The "auto" crossover, in tokens per rank: <= this takes v2_ll. Read only
     # when internode_kernel == "auto".
     internode_ll_max_tokens: int = 512
-    # Which kernel backend serves this op: "flydsl" (default, full feature set)
-    # or "hip" (HIP/JIT, bf16/fp32 gather only). None = MORI_V2_KERNEL_BACKEND,
-    # else the default. Only consulted when constructing the BASE class; naming a
+    # Which kernel backend serves this op: "flydsl" (default, full intranode
+    # feature set) or "hip" (HIP/JIT: gather only, no quant, no StdMoE, no
+    # routing replay; dispatch transports bf16/fp32/fp8/fp4 and combine reduces
+    # in bf16/fp32). "hip" is the only backend with an internode path -- flydsl's
+    # _unsupported rejects any config whose gpu_per_node < world_size -- so a
+    # multi-node config must name it. None = MORI_V2_KERNEL_BACKEND, else the
+    # default. Only consulted when constructing the BASE class; naming a
     # subclass directly wins.
     kernel_backend: str = None
 
@@ -255,8 +276,20 @@ class EpDispatchCombineConfig:
         # The staging buffers hold whichever leg is wider, so that is the default.
         # Left settable because v1 configs pass it explicitly and the two must
         # agree for the arena sizes to match.
+        widest = max(self.elem_size, self.combine_elem_size)
         if self.max_token_type_size is None:
-            self.max_token_type_size = max(self.elem_size, self.combine_elem_size)
+            self.max_token_type_size = widest
+        elif self.max_token_type_size < widest:
+            # It sizes every staging region the kernel writes and is compiled into
+            # the kernel as the transport stride, so a value below the widest leg
+            # does not fail -- it silently writes past the region into whatever
+            # the arena put next.
+            raise ValueError(
+                f"max_token_type_size={self.max_token_type_size} is smaller than "
+                f"the widest transported element ({widest} bytes: dispatch "
+                f"{self.elem_size}, combine {self.combine_elem_size}); it sizes "
+                "the staging regions, so a smaller value corrupts them"
+            )
 
         self._resolve_geometry()
 
@@ -284,9 +317,10 @@ class EpDispatchCombineConfig:
             # The intranode tables are keyed on a single node's geometry and
             # carry no rdma_block_num, so they have nothing to say about this
             # config. Internode geometry comes from internode_tuning_configs,
-            # which the backend applies per phase and per token count -- and
-            # which keeps dispatch and combine on DIFFERENT rdma/warp values,
-            # something a single `schedule` tuple cannot express.
+            # which the backend applies per phase and per token count. A
+            # `schedule` bucket already carries per-phase block and warp counts,
+            # but it has no rdma_block_num field at all, so it cannot carry the
+            # DIFFERENT rdma values dispatch and combine are tuned to.
             self.schedule = None
             if self.dispatch_block_num is None:
                 self.dispatch_block_num = 96
@@ -550,8 +584,11 @@ class EpDispatchRoutingHandle:
 
     disp_dest_tok_id_map: forward (src_tok,k)->dest flat slot (v2 tok_map).
     disp_tok_id_to_src_tok_id_local: reverse recv-slot->src token (v2 tis).
-    inter_node_*: empty placeholders (v2 is intranode-only; kept for 5-tensor
-    shape parity so downstream unpacking works).
+    inter_node_*: empty placeholders on every path, internode included. v2's
+    combine takes its routing from disp_dest_tok_id_map alone; the internode
+    kernels keep their own send/dest maps in the arena and never hand one back,
+    so there is nothing to put here. Kept for 5-tensor shape parity with v1 so
+    downstream unpacking works.
 
     The reverse map (disp_tok_id_to_src_tok_id_local) is materialized LAZILY on
     first access. recv_to_src_token is written into this rank's arena by peers via
@@ -668,9 +705,10 @@ class EpDispatchCombineOp:
 
     # -- hooks a subclass must supply --------------------------------------
     #
-    # Exactly three, and no more: the arena layout, the kernels, and (optionally)
-    # what the backend cannot do. Everything a caller touches -- dispatch(),
-    # combine(), the views, _pick, close -- is implemented once, here.
+    # Exactly four, and no more: the arena layout, the kernels, and (optionally)
+    # what the backend cannot do and which arena region a shared view reads.
+    # Everything a caller touches -- dispatch(), combine(), the views, _pick,
+    # close -- is implemented once, here.
 
     def _regions(self, cfg) -> list[tuple[str, int]]:
         """[(region_name, nbytes)] this backend needs carved out of the arena.

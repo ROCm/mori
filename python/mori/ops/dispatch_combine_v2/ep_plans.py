@@ -22,9 +22,10 @@
 """EP kernels' JIT plans.
 
 The only EP-specific part of the C++/JIT binding: load ``libmori_ops_v2.so`` so
-its kernels register into the shared JIT registry, then expose the two Plan
-classes. Everything else -- the ABI, the Plan factory, schema-driven arg structs
--- is generic and lives in ``mori.jit.v2.plan_api``.
+its kernels register into the shared JIT registry, then expose the Plan classes:
+the intranode ``EpDispatchPlan`` / ``EpCombinePlan``, plus the eight internode
+passes in ``EP_INTERNODE_PLANS``. Everything else -- the ABI, the Plan factory,
+schema-driven arg structs -- is generic and lives in ``mori.jit.v2.plan_api``.
 
 Importing this module loads the library (raising OSError if it is not built),
 which is what lets the binding test skip cleanly when the .so is absent.

@@ -24,9 +24,25 @@
 Same surface as the FlyDSL backend (``EpDispatchCombineOpFlyDSL``): same
 constructor, same ``dispatch``/``combine`` signatures and return shapes, same
 routing handle. What differs is where the kernels come from, and which configs
-can be served -- this backend implements the gather path with a bf16/fp32 combine
-and a bf16/fp32/fp8/fp4 dispatch, and rejects everything else at CONSTRUCTION
-rather than at launch.
+can be served -- everything out of range is rejected at CONSTRUCTION rather than
+at launch.
+
+Two paths live here, selected by ``cfg.is_internode`` (world_size larger than
+gpu_per_node; there is no kernel_type enum on the v2 side):
+
+* intranode -- one dispatch kernel and one combine kernel, gather only, a
+  bf16/fp32/fp8/fp4 dispatch and a bf16/fp32 combine, one plan compiled per
+  (block, warp) the tuning schedule can select.
+* internode -- a sequence of separately compiled passes over the
+  ``internode_regions`` arena and a device communicator: copystaging +
+  dispatch for a round of dispatch, combinesync + combinesyncbarrier + combine
+  + combineall for a round of combine. Gather only, bf16/fp32/fp8 on either
+  leg (no fp4). "v2" and "v2_ll" are two distinct kernel families rather than
+  a runtime branch: ``cfg.internode_kernel`` (auto | v2 | v2_ll) says which are
+  compiled, and only "auto" compiles both and chooses per launch, at
+  ``cfg.internode_ll_max_tokens``. Geometry is a compile-time identity on this
+  path, so every bucket of ``internode_tuning_configs`` is built up front.
+  No other backend implements internode.
 
 Imports ``ep_plans`` (the C++/JIT plans) but never flydsl, so it works where
 FlyDSL is not installed.
@@ -227,7 +243,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     # -- internode -------------------------------------------------------
     #
     # Multi-node configs run a sequence of passes (2 for dispatch, 4 for
-    # combine) over a seventeen-region arena with a device communicator, instead
+    # combine) over the internode arena (16 regions, 17 with scales) with a
+    # device communicator, instead
     # of two kernels over nine regions. Everything else -- the arena, the plan
     # API, the library -- is the same, which is why this lives here rather than
     # in a backend of its own.
@@ -436,7 +453,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     def _regions(self, cfg):
         if cfg.is_internode:
-            # Seventeen regions, sized exactly. v1 sizes its arena with a 256 MB
+            # Sized exactly, region by region. v1 sizes its arena with a 256 MB
             # slack term on a rough estimate; this is the exact sum, which is both
             # the point (an overrun fails instead of landing in the slack) and the
             # risk (a wrong formula corrupts a neighbour). test_internode_regions
@@ -581,7 +598,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         )
 
     def _internode_static_args(self):
-        """The window handle, the seventeen offsets and the local pointers.
+        """The window handle, the region offsets and the local pointers.
 
         Everything here is fixed for the life of the op, so it is built once and
         merged with the per-launch values at each call. Memoised because it is

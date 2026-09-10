@@ -19,7 +19,8 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""The internode op's symmetric arena: 17 named regions and their sizes.
+"""The internode op's symmetric arena: 16 named regions and their sizes, 17 with
+the scale transport on (``out_scales`` is appended only when there are scales).
 
 Every size here is transcribed from what ``EpDispatchCombineHandle`` allocates on
 the CCO path (``src/ops/dispatch_combine/dispatch_combine.cpp``,

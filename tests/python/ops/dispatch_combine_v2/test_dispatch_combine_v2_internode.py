@@ -37,7 +37,7 @@ on a single host does not emulate this either: RAIL leaves same-host peers
 without a QP.
 
     # rank 0 of 2, 8 GPUs each
-    torchrun --nnodes=2 --node_rank=0 --nproc_per_node=8 \\
+    torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \\
         --master_addr=<ip> --master_port=<port> \\
         test_dispatch_combine_v2_internode.py --max-tokens 128
 
