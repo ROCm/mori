@@ -3222,9 +3222,10 @@ PoolClient::ScratchArena::Lease PoolClient::ScratchArena::Acquire() {
   std::unique_lock<std::mutex> lock(mutex_);
   if (bases_.empty()) return Lease{};
   size_t index = bases_.size();
+  const uint64_t ticket = next_ticket_++;
   cv_.wait(lock, [&] {
-    // Defer to a queued AcquireAll, or it never sees every shard free.
-    if (all_waiting_ != 0) return false;
+    // Yield only to exclusive waiters that were already queued when we arrived.
+    if (!exclusive_queue_.empty() && exclusive_queue_.front() < ticket) return false;
     for (size_t i = 0; i < busy_.size(); ++i) {
       if (busy_[i] == 0) {
         index = i;
@@ -3240,14 +3241,15 @@ PoolClient::ScratchArena::Lease PoolClient::ScratchArena::Acquire() {
 PoolClient::ScratchArena::Lease PoolClient::ScratchArena::AcquireAll() {
   std::unique_lock<std::mutex> lock(mutex_);
   if (bases_.empty()) return Lease{};
-  // Write-preferring: announce first, so Acquire() stops handing out shards and
-  // the in-flight ones can drain.  Exclusive calls are rare and always finish,
-  // so the shard side cannot starve in turn.
-  ++all_waiting_;
+  // Queue first, so Acquire() stops admitting arrivals behind us and the shards
+  // held by earlier arrivals can drain.
+  const uint64_t ticket = next_ticket_++;
+  exclusive_queue_.push_back(ticket);
   cv_.wait(lock, [&] {
-    return std::all_of(busy_.begin(), busy_.end(), [](uint8_t b) { return b == 0; });
+    return exclusive_queue_.front() == ticket &&
+           std::all_of(busy_.begin(), busy_.end(), [](uint8_t b) { return b == 0; });
   });
-  --all_waiting_;
+  exclusive_queue_.pop_front();
   std::fill(busy_.begin(), busy_.end(), 1);
   return Lease{this, 0, busy_.size(), bases_[0]};
 }
