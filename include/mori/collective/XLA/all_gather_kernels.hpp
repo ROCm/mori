@@ -56,19 +56,21 @@ __global__ void AllGatherPushKernel(int myPe, int npes, const void* __restrict__
                                     mori::cco::ccoDevComm devComm,
                                     mori::cco::ccoWindow_t heapWin) {
   // Single block: push my shard to every peer's output[myPe] slot (+ self). The
-  // destination slot is myPe for every peer, so the byte offset is constant; the
-  // source is our single shard (same for all peers). The output buffer's own
-  // offset within the heap window is added so the dst resolves correctly even
-  // when output is not at heap offset 0.
-  const size_t heapBase = reinterpret_cast<uintptr_t>(mori::cco::ccoGetLocalPtr(heapWin));
-  const size_t outOff = reinterpret_cast<uintptr_t>(output) - heapBase;
-  const size_t dstOff = outOff + static_cast<size_t>(myPe) * chunkBytes;
+  // destination slot is myPe for every peer, so my local output[myPe] pointer
+  // maps to peer p's copy by the flat-VA rank delta (pe - myPe)*stride4G<<32 --
+  // the same inline LSA addressing the reduce-scatter/all-reduce push kernels
+  // use. winBase cancels out, so this needs no ccoGetLocalPtr/ccoGetLsaPeerPtr
+  // round trip and keeps no "output at heap offset 0" assumption. The source is
+  // our single shard (same for all peers).
+  uint8_t* const localDst = reinterpret_cast<uint8_t*>(output) + static_cast<size_t>(myPe) * chunkBytes;
+  const uint32_t stride4G = heapWin->stride4G;
   StartSdmaScatter(
       devComm.sdma, npes, /*logS=*/0, chunkBytes,
       [](int) { return true; },
       [=](int) -> const uint8_t* { return reinterpret_cast<const uint8_t*>(input); },
       [=](int peer) -> uint8_t* {
-        return reinterpret_cast<uint8_t*>(mori::cco::ccoGetLsaPeerPtr(heapWin, peer, dstOff));
+        int32_t diff = (peer - myPe) * static_cast<int32_t>(stride4G);
+        return localDst + (static_cast<uint64_t>(diff) << 32);
       });
 
   uint64_t* __restrict__ signalBuf = devComm.sdma.signalBuf;
