@@ -1282,8 +1282,9 @@ template <typename Coop>
 __device__ inline void ccoGda<PrvdType>::flush(Coop coop) {
   static_assert(!std::is_same_v<Coop, ccoCoopThread>,
                 "flush() requires at least ccoCoopWarp. "
-                "ccoCoopThread causes each thread to independently enter quietUntil "
-                "on different QPs, breaking the warp-level pollCqLock.");
+                "ccoCoopThread reports size()==1, so every thread walks every peer and "
+                "flushes each QP once per thread, duplicating doorbell rings and "
+                "advancing cq->needConsIdx once per thread.");
   coop.sync();
   ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
   for (int teamPeer = coop.thread_rank(); teamPeer < this->nRanks; teamPeer += coop.size()) {
@@ -1305,8 +1306,9 @@ template <ccoTeamMode TeamMode, typename Coop>
 __device__ inline void ccoGda<PrvdType>::flush(int peer, Coop coop) {
   static_assert(!std::is_same_v<Coop, ccoCoopThread>,
                 "flush(peer) requires at least ccoCoopWarp. "
-                "ccoCoopThread allows concurrent per-thread calls on different QPs, "
-                "which breaks the warp-level pollCqLock inside quietUntil.");
+                "With ccoCoopThread every thread runs the body, so two threads passing the "
+                "same peer each flush that QP and advance cq->needConsIdx twice. "
+                "(Lanes on *different* QPs are fine: quietUntil groups active lanes by CQ.)");
   coop.sync();
   if (coop.thread_rank() == 0) {
     int worldPeer = resolveWorldPeer<TeamMode>(peer);
@@ -1346,9 +1348,10 @@ template <core::ProviderType PrvdType>
 template <typename Coop>
 __device__ inline void ccoGda<PrvdType>::wait(ccoGdaRequest_t& request, Coop coop) {
   static_assert(!std::is_same_v<Coop, ccoCoopThread>,
-                "wait() requires at least ccoCoopWarp. "
-                "ccoCoopThread allows concurrent per-thread calls on different QPs, "
-                "which breaks the warp-level pollCqLock inside quietUntil.");
+                "wait() requires at least ccoCoopWarp, for consistency with flush(). "
+                "The pollCqLock hazard no longer applies here — the body is a pure poll and "
+                "quietUntil groups active lanes by CQ — so this one is relaxable if a "
+                "per-thread caller ever needs it.");
   coop.sync();
   if (coop.thread_rank() == 0) {
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
@@ -1364,8 +1367,9 @@ template <typename LocalAction, typename Coop>
 __device__ inline void ccoGda<PrvdType>::counter(LocalAction localAction, Coop coop) {
   static_assert(!std::is_same_v<Coop, ccoCoopThread>,
                 "counter() requires at least ccoCoopWarp. "
-                "ccoCoopThread causes each thread to independently enter quietUntil "
-                "on different QPs, breaking the warp-level pollCqLock.");
+                "ccoCoopThread reports size()==1 and makes thread_rank()==0 true for every "
+                "thread, so every thread walks every peer and counterBuf is incremented "
+                "once per thread instead of once.");
   coop.sync();
 
   ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
@@ -1455,8 +1459,9 @@ template <core::ProviderType PrvdType, typename Coop>
 __device__ inline void ccoGdaBarrierSession<PrvdType, Coop>::sync(Coop) {
   static_assert(!std::is_same_v<Coop, ccoCoopThread>,
                 "GDA barrier requires at least ccoCoopWarp. "
-                "ccoCoopThread causes each thread to independently enter signalImpl / "
-                "waitSignalImpl on different QPs, breaking the warp-level pollCqLock.");
+                "ccoCoopThread reports size()==1, so every thread signals every peer and the "
+                "remote signal is incremented once per thread; coop.sync() also degenerates "
+                "to a no-op, removing the phase-1/phase-2 separation.");
   this->coop.sync();
 
   ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(gda._gdaHandle);
