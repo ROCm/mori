@@ -40,6 +40,7 @@
 #include "mori/application/memory/va_manager.hpp"  // HeapVAManager
 #include "mori/application/transport/rdma/rdma.hpp"
 #include "mori/application/utils/check.hpp"
+#include "mori/application/utils/cpu_affinity.hpp"
 #include "mori/cco/cco.hpp"  // public, self-contained (opaque ccoComm fwd-decl); defines BUILD_CCO_SDMA
 #if BUILD_CCO_SDMA
 // The anvil (copy-engine) dependency is confined to this TU — pulled in only when
@@ -422,6 +423,16 @@ static hipError_t CcoZeroWindowMem(void* ptr, size_t bytes) {
 
 static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
                              ccoComm** outComm) {
+  // Pin this thread to its GPU's NUMA-local CPUs before the bootstrap, the
+  // Context and any worker thread below (new threads inherit the affinity).
+  // This is the bind site for the CCO path; src/shmem/init.cpp binds the shmem
+  // path, so without this call a CCO-only job runs unbound. Unbound, two
+  // per-node ranks can land on the two SMT siblings of one core and both run at
+  // half speed. Requires the caller to have
+  // hipSetDevice()'d, the same contract step 2 below relies on when it caches
+  // comm->hipDev. MORI_IGNORE_CPU_AFFINITY=1 disables.
+  application::BindCallingThreadToGpuNumaOnce();
+
   auto* comm = new ccoComm();
   *outComm = comm;
 

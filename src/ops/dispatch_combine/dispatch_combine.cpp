@@ -261,7 +261,6 @@ mori::application::SymmMemObjPtr EpDispatchCombineHandle::MallocSymm(size_t size
   cpuObj->p2pPeerPtrs = p2pDev;  // device array; only dereferenced on device
   cpuObj->size = size;
   cpuObj->worldSize = ws;
-
   mori::application::SymmMemObj* gpuObj = nullptr;
   HIP_RUNTIME_CHECK(hipMalloc(&gpuObj, sizeof(mori::application::SymmMemObj)));
   HIP_RUNTIME_CHECK(

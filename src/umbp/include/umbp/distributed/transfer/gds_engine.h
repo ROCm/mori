@@ -52,6 +52,11 @@ namespace mori::umbp {
 // carries no hipfile dependency; only the .cpp includes <hipfile.h>.
 class GdsEngine final : public TransferEngine {
  public:
+  // libhipfile is dlopen'd, not linked (see hipfile_dl.h), so its presence is a
+  // runtime question: ask before registering this engine.  Without it every
+  // RegisterFile returns an invalid ref and the SSD path stays host-staged.
+  static bool Available();
+
   GdsEngine() = default;
   ~GdsEngine() override;
 

@@ -52,6 +52,8 @@ from pathlib import Path
 __all__ = [
     "load_library",
     "make_plan",
+    "make_launch_group",
+    "LaunchGroup",
     "precompile",
     "registered_plans",
     "library_path",
@@ -79,6 +81,11 @@ _ABI_NAME = "libmori_jit.so"
 
 # Schema type tags -> ctypes. Kept small on purpose: the boundary is pointers
 # and scalars, and anything richer belongs in the Cfg, not the arguments.
+#
+# `b<N>` is the one exception: N raw bytes memcpy'd from a pointer the caller
+# supplies, for args a C++ handle produces in one piece and no Python caller can
+# fill field by field (cco's devComm, embedded by value). The
+# size still crosses in the schema and is still checked against C++'s sizeof.
 _CTYPE = {
     "p": ctypes.c_void_p,
     "u64": ctypes.c_uint64,
@@ -86,6 +93,14 @@ _CTYPE = {
     "i32": ctypes.c_int32,
     "f32": ctypes.c_float,
 }
+
+
+def _blob_bytes(tag: str) -> int | None:
+    """N for a `b<N>` byte-range tag, None for anything else."""
+    if len(tag) > 1 and tag[0] == "b" and tag[1:].isdigit():
+        return int(tag[1:])
+    return None
+
 
 _abi: ctypes.CDLL | None = None  # bound handle exposing the mori_jit_* symbols
 
@@ -222,6 +237,15 @@ def _bind(lib: ctypes.CDLL) -> None:
         ctypes.c_void_p,
     ]
 
+    lib.mori_jit_plan_launch_multi.restype = ctypes.c_int
+    lib.mori_jit_plan_launch_multi.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),  # plans
+        ctypes.c_int,  # nplans
+        ctypes.c_void_p,  # argBuf
+        ctypes.c_int,  # argSize
+        ctypes.c_void_p,  # stream
+    ]
+
     lib.mori_jit_plan_info.restype = ctypes.c_int
     lib.mori_jit_plan_info.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
 
@@ -309,21 +333,31 @@ def _request_schema(kernel: str) -> dict:
 
 
 def _args_struct(kernel: str):
-    """Build the argument struct from the schema C++ publishes, and check it."""
+    """Build the argument struct from the schema C++ publishes, and check it.
+
+    Returns the struct, its field names in order, and {name: size} for the
+    byte-range fields, which launch() copies into instead of assigning.
+    """
     lib = _load()
     raw = lib.mori_jit_plan_args_schema(kernel.encode())
     if not raw:
         raise RuntimeError(f"mori jit: {_error()}")
     fields = []
+    blobs = {}
     for item in raw.decode().split(","):
         if not item:
             continue
         name, _, tag = item.partition(":")
-        if tag not in _CTYPE:
+        nbytes = _blob_bytes(tag)
+        if nbytes is not None:
+            fields.append((name, ctypes.c_char * nbytes))
+            blobs[name] = nbytes
+        elif tag in _CTYPE:
+            fields.append((name, _CTYPE[tag]))
+        else:
             raise RuntimeError(
                 f"mori jit: kernel '{kernel}' schema has unknown type '{tag}'"
             )
-        fields.append((name, _CTYPE[tag]))
 
     struct = type(f"_{kernel}Args", (ctypes.Structure,), {"_fields_": fields})
     want = lib.mori_jit_plan_args_size(kernel.encode())
@@ -332,11 +366,20 @@ def _args_struct(kernel: str):
             f"mori jit: kernel '{kernel}' args are {ctypes.sizeof(struct)}B from the schema "
             f"but {want}B in C++ -- the schema string and the struct disagree"
         )
-    return struct, [f[0] for f in fields]
+    return struct, [f[0] for f in fields], blobs
 
 
-def _coerce(tag: str, name: str, value) -> int:
+def _coerce(tag: str, name: str, value, names: dict | None = None) -> int:
     if tag == "e":
+        if names is not None and not isinstance(value, int):
+            key = (getattr(value, "name", None) or str(value)).rsplit(".", 1)[-1]
+            code = names.get(key.lower())
+            if code is None:
+                raise ValueError(
+                    f"{name}: unsupported value {value!r}; expected one of "
+                    f"{sorted(names)} or an int"
+                )
+            return code
         return _enum_code(value)
     if tag == "b":
         return 1 if value else 0
@@ -364,12 +407,18 @@ def _enum_code(value) -> int:
     return DTYPES[name]
 
 
-def make_plan(kernel: str) -> type:
+def make_plan(kernel: str, enums: dict | None = None) -> type:
     """A Plan class for a kernel registered on the C++ side, generated from its
-    published schemas. Nothing about the kernel is written here."""
+    published schemas. Nothing about the kernel is written here.
 
+    ``enums`` maps an enum-tagged request field to its {name: code} table, for
+    ops whose enums are not the EP dtype in DTYPES. Ints are always accepted,
+    with or without a table.
+    """
+
+    field_enums = enums or {}
     req_schema = _request_schema(kernel)
-    args_t, arg_names = _args_struct(kernel)
+    args_t, arg_names, arg_blobs = _args_struct(kernel)
 
     # Caller-facing names: snake_case, and the arena-offset group folded into
     # `arena=`. A launch argument named `off<Region>` is an arena region offset;
@@ -383,6 +432,30 @@ def make_plan(kernel: str) -> type:
     arg_snake_to_wire = {_camel_to_snake(n): n for n in arg_names}
     _all_regions = sorted(arg_regions.values())
 
+    def _set_arg(buf, name, value):
+        """Fill one args field: a scalar or pointer by assignment, a byte range
+        by copy.
+
+        A blob field is a c_char array, so assigning the caller's address to it
+        raises rather than copying -- both of launch()'s paths have to come
+        through here.
+        """
+        nbytes = arg_blobs.get(name)
+        if nbytes is None:
+            setattr(buf, name, _as_ptr(value))
+            return
+        src = _as_ptr(value)
+        if not src:
+            # Not optional: an unset blob would launch the kernel against a
+            # zeroed struct (devComm).
+            raise ValueError(
+                f"{kernel}: launch argument '{name}' is a {nbytes}B struct "
+                f"and needs a real address"
+            )
+        ctypes.memmove(
+            ctypes.addressof(buf) + getattr(args_t, name).offset, src, nbytes
+        )
+
     class Plan:
         _kernel = kernel
         _args_t = args_t
@@ -392,10 +465,12 @@ def make_plan(kernel: str) -> type:
             lib = _load()
             req = {}
             for snake, wire in snake_to_wire.items():
+                tag = req_schema[wire][0]
+                names = field_enums.get(wire)
                 if snake in kwargs:
-                    req[wire] = _coerce(req_schema[wire][0], wire, kwargs.pop(snake))
+                    req[wire] = _coerce(tag, wire, kwargs.pop(snake), names)
                 elif wire in kwargs:  # the C++ spelling also works
-                    req[wire] = _coerce(req_schema[wire][0], wire, kwargs.pop(wire))
+                    req[wire] = _coerce(tag, wire, kwargs.pop(wire), names)
 
             if kwargs:
                 raise TypeError(
@@ -418,6 +493,7 @@ def make_plan(kernel: str) -> type:
             # bind(), so pinned arguments are never served from a stale cache.
             self._buf = None
             self._buf_shape = None
+            self._last = {}
             self._dyn_args = ()
             self._dyn_defs = ()
             # Known at construction, so the caller need not repeat them per launch.
@@ -473,23 +549,27 @@ def make_plan(kernel: str) -> type:
                 self._defaults[wire] = v
             self._buf = None  # pinned values changed; rebuild the cached struct
 
-        def launch(self, stream=0, **args) -> None:
-            """Arguments by name, snake_case or the C++ spelling, per the schema."""
-            if self._handle is None:
-                raise RuntimeError("launch on a closed plan")
+        def _launch_buf(self, args) -> ctypes.Structure:
+            """Fill (and cache) the launch argument struct for `args` -- a dict of
+            snake_case or C++-spelled names. Shared by launch() and by
+            LaunchGroup, which fills one buffer and hands it to several plans.
 
-            # A serving loop calls this with the same argument NAMES every time,
-            # so the struct-filling work repeats identically while only a few
-            # values differ. Cache the struct instead of rebuilding it: on f01-2
-            # this path cost 10-20us per launch against a ~36us kernel, which is
-            # what made the eager host path -- not the GPU -- the bottleneck at
-            # small token counts (HANDOFF §16.13).
+            A serving loop calls this with the same argument NAMES every time,
+            so the struct-filling work repeats identically while only a few
+            values differ. Cache the struct instead of rebuilding it: on f01-2
+            this path cost 10-20us per launch against a ~36us kernel, which is
+            what made the eager host path -- not the GPU -- the bottleneck at
+            small token counts (HANDOFF §16.13).
+            """
             #
             # What may be cached: a _defaults entry that is an int, since bind()
             # is the only way to change one and it drops the cache. Everything
             # else is re-read every launch -- args because they are the varying
-            # ones (num_tokens is an int that changes per call), and a tensor in
-            # _defaults because its storage may have been reallocated.
+            # ones (num_tokens is an int that changes per call), a tensor in
+            # _defaults because its storage may have been reallocated, and a blob
+            # because it crosses by value: the cached copy goes stale the moment
+            # C++ writes to the struct it was copied from, and an int address is
+            # no evidence the bytes behind it held still.
             #
             # Keyed on the argument names: a call passing a different set must not
             # inherit fields left over from the previous shape.
@@ -506,21 +586,61 @@ def make_plan(kernel: str) -> type:
                 buf = args_t()
                 for name in arg_names:
                     if name in merged:
-                        setattr(buf, name, _as_ptr(merged[name]))
+                        _set_arg(buf, name, merged[name])
                 self._buf = buf
                 self._buf_shape = shape
                 self._dyn_args = tuple((k, arg_snake_to_wire.get(k, k)) for k in args)
                 self._dyn_defs = tuple(
                     w
                     for w, v in self._defaults.items()
-                    if w in arg_names and not isinstance(v, int)
+                    if w in arg_names and (not isinstance(v, int) or w in arg_blobs)
                 )
+                self._last = {}
             else:
                 buf = self._buf
+                last = self._last
                 for k, wire in self._dyn_args:
-                    setattr(buf, wire, _as_ptr(args[k]))
+                    v = args[k]
+                    # Skip a field whose INT value is what is already in the
+                    # buffer. Same reasoning as the _dyn_defs filter above: the
+                    # struct persists between launches, so re-writing an
+                    # unchanged int is pure cost. A caller that hands over
+                    # tensor addresses (every EP one does -- hip_backend passes
+                    # .data_ptr() results) repeats them every round, and each
+                    # write costs a Python call, a dict lookup, a hasattr and a
+                    # setattr. A moved allocation changes the int, misses here,
+                    # and is written.
+                    #
+                    # NOT for a blob: it crosses by value, and an unchanged
+                    # address is no evidence the bytes behind it held still.
+                    # NOT for a non-int either -- resolving it is the only way to
+                    # know its address, and `!=` on a tensor does not even return
+                    # a bool.
+                    if type(v) is int and wire not in arg_blobs:
+                        if last.get(wire) == v:
+                            continue
+                        _set_arg(buf, wire, v)
+                        last[wire] = v
+                    else:
+                        # Forget the field. This branch writes whatever a Tensor
+                        # or None resolves to, and leaving the old int in `last`
+                        # would let the NEXT launch that passes that same int
+                        # skip its write against a buffer no longer holding it:
+                        # `p, p, None, p` would launch the fourth round with the
+                        # null this branch just stored. The ABI takes all three
+                        # spellings for one field (weights_buf, scales_buf), so
+                        # the sequence is a legal one, not a contrived one.
+                        last.pop(wire, None)
+                        _set_arg(buf, wire, v)
                 for wire in self._dyn_defs:
-                    setattr(buf, wire, _as_ptr(self._defaults[wire]))
+                    _set_arg(buf, wire, self._defaults[wire])
+            return buf
+
+        def launch(self, stream=0, **args) -> None:
+            """Arguments by name, snake_case or the C++ spelling, per the schema."""
+            if self._handle is None:
+                raise RuntimeError("launch on a closed plan")
+            buf = self._launch_buf(args)
             rc = _load().mori_jit_plan_launch(
                 self._handle,
                 ctypes.byref(buf),
@@ -587,6 +707,124 @@ def make_plan(kernel: str) -> type:
         + f"\nLaunch: {', '.join(_camel_to_snake(a) for a in arg_names)}"
     )
     return Plan
+
+
+def _args_layout(plan):
+    """The plan's args layout as (name, offset, size) per field.
+
+    Not `sizeof`. Many fields are bare pointers, so two schemas that swap
+    a pair of same-typed fields have identical size and a caller filling one and
+    launching the other reads the wrong buffer in silence -- the exact failure the
+    ascending-offset static_assert exists to catch on the C++ side.
+    """
+    t = plan._args_t
+    return tuple((n, getattr(t, n).offset, getattr(t, n).size) for n in plan._arg_names)
+
+
+_UNSET = object()  # "no default bound", distinct from every bound value
+
+
+def _bound_defaults(plan) -> dict:
+    """The plan's bound defaults, keyed for comparison across a group.
+
+    Compared the way launch would write each one: an int by value, a
+    pointer-like value by the address it resolves to, anything else by identity.
+    """
+    out = {}
+    for name, v in plan._defaults.items():
+        if type(v) is int:
+            out[name] = v
+            continue
+        try:
+            out[name] = ("p", _as_ptr(v))
+        except TypeError:
+            out[name] = ("o", id(v))
+    return out
+
+
+class LaunchGroup:
+    """A fixed set of plans over one args layout, validated once.
+
+    Copying the plan list, checking every handle, comparing every args layout and
+    building the ctypes handle array depend only on the set, not on the launch. A
+    serving loop holds the set fixed -- one per (phase, geometry) -- so that work
+    is done once here, leaving the launch path with the argument fill and the one
+    ABI crossing.
+
+    The group keeps its plans alive, so a handle cannot dangle by garbage
+    collection. Explicitly `close()`ing a plan still invalidates every group over
+    it; there is no per-launch check for that, which is the point.
+    """
+
+    __slots__ = ("_plans", "_lead", "_handles", "_n", "_argsize", "_fn")
+
+    def __init__(self, plans):
+        plans = list(plans)
+        if not plans:
+            raise ValueError("launch group needs at least one plan")
+        for i, p in enumerate(plans):
+            if p._handle is None:
+                raise RuntimeError(f"launch group over a closed plan at index {i}")
+        lead = plans[0]
+        want = _args_layout(lead)
+        want_defs = _bound_defaults(lead)
+        for i, p in enumerate(plans[1:], 1):
+            got = _args_layout(p)
+            if got != want:
+                diff = [a for a, b in zip(want, got) if a != b] or ["field count"]
+                raise ValueError(
+                    f"launch group: plan {i} ({p._kernel}) does not share "
+                    f"{lead._kernel}'s args layout; first difference at {diff[0]}"
+                )
+            # launch() fills the LEAD's buffer and hands it to every plan, so a
+            # default bound on a non-lead plan is never written. Disagreement is
+            # a caller bug; filling every buffer instead would silently move the
+            # per-plan fill work back onto the launch path.
+            got_defs = _bound_defaults(p)
+            if got_defs != want_defs:
+                field = sorted(
+                    k
+                    for k in set(want_defs) | set(got_defs)
+                    if want_defs.get(k, _UNSET) != got_defs.get(k, _UNSET)
+                )[0]
+                raise ValueError(
+                    f"launch group: plan {i} ({p._kernel}) binds {field}="
+                    f"{p._defaults.get(field, '<unset>')!r}, but lead "
+                    f"{lead._kernel} binds {lead._defaults.get(field, '<unset>')!r}; "
+                    "every plan in a group must agree on its bound defaults"
+                )
+        self._plans = plans
+        self._lead = lead
+        self._n = len(plans)
+        self._handles = (ctypes.c_void_p * self._n)(*[p._handle.value for p in plans])
+        self._argsize = ctypes.sizeof(lead._args_t)
+        # Bind the entry point too. `_load()` is memoised but still a call and a
+        # lookup per launch, on a path measured at ~14us a call.
+        self._fn = _load().mori_jit_plan_launch_multi
+
+    def launch(self, stream=0, **args) -> None:
+        """Fill the shared argument struct once, then launch every plan in order."""
+        buf = self._lead._launch_buf(args)
+        # The stream parameter is declared c_void_p in argtypes, so ctypes does
+        # the conversion at the boundary and an int passes straight through.
+        # Wrapping it in a c_void_p here built a Python object per launch only for
+        # ctypes to unwrap it again. Only a non-int still needs _as_ptr.
+        rc = self._fn(
+            self._handles,
+            self._n,
+            ctypes.byref(buf),
+            self._argsize,
+            stream if type(stream) is int else _as_ptr(stream),
+        )
+        if rc != 0:
+            raise RuntimeError(f"mori jit launch_multi: {_error()}")
+
+    __call__ = launch
+
+
+def make_launch_group(plans) -> LaunchGroup:
+    """Bind a fixed plan sequence for repeated launching. See LaunchGroup."""
+    return LaunchGroup(plans)
 
 
 def precompile(kernel: str, arch: str | None = None) -> int:

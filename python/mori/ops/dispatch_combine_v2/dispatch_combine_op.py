@@ -30,10 +30,16 @@ to flydsl; ``EpDispatchCombineOpHip(cfg, comm)`` is the explicit form, and
 Neither backend is imported here. Selecting one imports only that one, so the HIP
 backend works on a machine with no flydsl.
 
-A subclass supplies exactly two things::
+A subclass supplies four hooks -- two with no default, two with one::
 
     _regions(cfg)              -> [(name, nbytes)]   arena layout it needs
     _build_kernels(cfg, arena) -> KernelSet          bound, ready-to-launch kernels
+    _unsupported(cfg)          -> (reason, ...)      why it cannot serve this cfg;
+                                                     empty tuple = it can serve it
+    _region(name)              -> name               arena region a shared view reads
+
+That is the HIP backend's route. The FlyDSL one overrides ``__init__`` and builds
+its own arena and KernelSet there, so ``_unsupported`` is the only hook it defines.
 
 Everything else -- arena, scratch buffers, variant selection, lifecycle -- is here.
 Behavioural differences between the backends are *data* on the KernelSet, not
@@ -61,6 +67,8 @@ DEFAULT_BACKEND = "flydsl"
 
 
 _QUANT_TYPES = ("none", "fp8_direct_cast", "fp8_blockwise")
+
+_INTERNODE_KERNELS = ("auto", "v2", "v2_ll")
 
 _DT = {
     torch.bfloat16: 2,
@@ -94,6 +102,12 @@ class EpDispatchCombineConfig:
     # Geometry: None => the tuned schedule for this device/shape/dtype; pin any of
     # these to opt out. Combine keeps its own warp count -- its K-deep per-lane MLP
     # saturates sooner than dispatch's copy.
+    #
+    # Pinning is per FIELD, not all-or-nothing: on the internode path a pinned
+    # field overrides the tuning table for every token bucket while the fields
+    # left None stay tuned, so you can fix one knob without hand-writing the
+    # other five. MORI_EP_DISP_GEOM / MORI_EP_COMB_GEOM override the whole triple
+    # for a leg and bypass the table entirely.
     dispatch_block_num: int = None
     combine_block_num: int = None
     warp_num_per_block: int = None
@@ -105,13 +119,67 @@ class EpDispatchCombineConfig:
     schedule: tuple = None
     enable_std_moe: bool = False
     max_total_recv_tokens: int = 0  # mori maxTotalRecvTokens; 0 = worst-case ws*M
-    # Which kernel backend serves this op: "flydsl" (default, full feature set)
-    # or "hip" (HIP/JIT, bf16/fp32 gather only). None = MORI_V2_KERNEL_BACKEND,
-    # else the default. Only consulted when constructing the BASE class; naming a
+    # --- internode -----------------------------------------------------------
+    # GPUs per physical node. None => one node (== world_size), which is what
+    # every intranode config is and keeps their behaviour unchanged. Setting it
+    # smaller is what selects the internode path: it is EP's own idea of a node
+    # and must agree with the communicator's LSA team, which the op checks at
+    # construction rather than assuming.
+    gpu_per_node: int = None
+    # QPs per peer on the RDMA leg. Only read on the internode path, where 1
+    # starves it (~1.5x); the intranode path never reaches RDMA and ignores it,
+    # so the default is the value the only consumer wants.
+    num_qp_per_pe: int = 2
+    # Widest transported element, which is what sizes the staging buffers. None
+    # => max over the two legs, which is what the buffers actually have to hold.
+    max_token_type_size: int = None
+    # RDMA-block split of the grid, per phase. Runtime, never compiled in:
+    # dispatch and combine are deliberately tuned to DIFFERENT values (see
+    # internode_tuning_configs), so one compiled-in value cannot serve both.
+    # Pinnable like the block/warp fields above, and clamped to < block_num.
+    dispatch_rdma_block_num: int = None
+    combine_rdma_block_num: int = None
+    # Which of the two internode kernel families runs. "v2" and "v2_ll" are
+    # SEPARATE kernels -- separate JIT modules, entry symbols and cache keys, not
+    # two branches of one body -- so naming one here compiles only that one.
+    #   "v2"     the general path: chunked, deduplicating, sized for wide tokens.
+    #   "v2_ll"  low latency: no dedup across expert slots, one entry per node
+    #            per token, which wins while the wire is not the bottleneck.
+    #   "auto"   compile BOTH and pick per launch from the token count, at
+    #            internode_auto_ll_max_tokens. This is the only mode that can switch
+    #            at runtime, and it is the only one that pays for both compiles.
+    internode_kernel: str = "auto"
+    # The "auto" crossover. Compared against THIS CALL's token count -- dispatch
+    # uses input.shape[0], combine routing.cur_rank_num_token -- so one op
+    # alternates between the families as the batch changes; it is not a property
+    # of the shape. Unrelated to max_num_inp_token_per_rank, which is the
+    # capacity. Read only when internode_kernel == "auto".
+    internode_auto_ll_max_tokens: int = 512
+    # Which kernel backend serves this op: "flydsl" (default, full intranode
+    # feature set) or "hip" (HIP/JIT: gather only, no quant, no StdMoE, no
+    # routing replay; dispatch transports bf16/fp32/fp8/fp4 and combine reduces
+    # in bf16/fp32). "hip" is the only backend with an internode path -- flydsl's
+    # _unsupported rejects any config whose gpu_per_node < world_size -- so a
+    # multi-node config must name it. None = MORI_V2_KERNEL_BACKEND, else the
+    # default. Only consulted when constructing the BASE class; naming a
     # subclass directly wins.
     kernel_backend: str = None
 
     def __post_init__(self):
+        # Node grouping first: is_internode gates checks further down, and the
+        # derived defaults below are cheaper to reason about once it is fixed.
+        if self.gpu_per_node is None:
+            self.gpu_per_node = self.world_size
+        if self.gpu_per_node <= 0 or self.world_size % self.gpu_per_node:
+            raise ValueError(
+                f"world_size ({self.world_size}) must be a positive multiple of "
+                f"gpu_per_node ({self.gpu_per_node}); EP addresses a peer as "
+                "node * gpu_per_node + local rank and a partial node has no such "
+                "encoding"
+            )
+        if self.num_qp_per_pe < 1:
+            raise ValueError(f"num_qp_per_pe must be >= 1, got {self.num_qp_per_pe}")
+
         # all-or-none: setting only one silently defaults the other to data_type.
         if (self.dispatch_data_type is None) != (self.combine_data_type is None):
             raise ValueError(
@@ -125,11 +193,52 @@ class EpDispatchCombineConfig:
             raise ValueError(
                 f"quant_type must be one of {_QUANT_TYPES}, got {self.quant_type!r}"
             )
+        if self.is_internode and self.max_num_inp_token_per_rank % WAVE:
+            # The internode send buffer is addressed as
+            # pe * max_num_inp_token_per_rank + slot, but slots are handed out in
+            # whole wavefronts: the largest index a full last chunk produces is
+            # ceil(capacity / WAVE) * WAVE - 1, which exceeds the capacity
+            # whenever the capacity is not a multiple of WAVE. Rounding the
+            # capacity up makes the two agree by construction, without changing
+            # the layout the kernel and the region table both assume. (Inherited
+            # from v1, which computes the same stride and the same chunk count.)
+            self.max_num_inp_token_per_rank = (
+                (self.max_num_inp_token_per_rank + WAVE - 1) // WAVE
+            ) * WAVE
+        if self.internode_kernel not in _INTERNODE_KERNELS:
+            raise ValueError(
+                f"internode_kernel must be one of {_INTERNODE_KERNELS}, got "
+                f"{self.internode_kernel!r}"
+            )
+        if self.internode_auto_ll_max_tokens < 0:
+            raise ValueError(
+                "internode_auto_ll_max_tokens must be >= 0, got "
+                f"{self.internode_auto_ll_max_tokens}"
+            )
         if self.combine_mode not in ("gather", "scatter"):
             raise ValueError(
                 f"combine_mode must be gather|scatter, got {self.combine_mode!r}"
             )
+        # A quantised combine scatters: each destination writes its own partial
+        # back. That is intranode-only, and it is what kept quant off the
+        # internode path -- the backend would accept the quant type and then
+        # reject the scatter this rule had just set.
+        #
+        # The internode kernels do carry an fp8 staging path
+        # (EpCombineAllInternalFp8 reduces nNodes fp8 slots into one bf16
+        # output), but it does not produce correct tokens: measured on 2x8
+        # MI308X, weights are exact while ~51% of hidden elements are outside a
+        # 30% tolerance and some are exactly zero. Rejecting here rather than
+        # relying on the scatter rule to reject by accident, because an accepted
+        # config that returns corrupt data is the worst of the three outcomes.
         if self.quant_type != "none":
+            if self.is_internode:
+                raise ValueError(
+                    f"quant_type={self.quant_type!r} is not supported on the "
+                    "internode path (world_size > gpu_per_node): the fp8 combine "
+                    "staging path there is incomplete and returns wrong tokens. "
+                    "Use quant_type='none', or an intranode config."
+                )
             self.combine_mode = "scatter"
         # Token copy moves whole 16 B (vec4) chunks; a non-16 B-aligned per-token
         # size would over-read/write a few dwords past the token.
@@ -164,6 +273,41 @@ class EpDispatchCombineConfig:
                     f"combine per-token bytes must be 16 B aligned; combine_data_type="
                     f"{self.combine_data_type} -> {self.combine_token_nbytes}"
                 )
+        # The staging buffers hold whichever leg is wider, so that is the default.
+        # Left settable because v1 configs pass it explicitly and the two must
+        # agree for the arena sizes to match.
+        widest = max(self.elem_size, self.combine_elem_size)
+        if self.max_token_type_size is None:
+            self.max_token_type_size = widest
+        elif self.max_token_type_size < widest:
+            # It sizes every staging region the kernel writes and is compiled into
+            # the kernel as the transport stride, so a value below the widest leg
+            # does not fail -- it silently writes past the region into whatever
+            # the arena put next.
+            raise ValueError(
+                f"max_token_type_size={self.max_token_type_size} is smaller than "
+                f"the widest transported element ({widest} bytes: dispatch "
+                f"{self.elem_size}, combine {self.combine_elem_size}); it sizes "
+                "the staging regions, so a smaller value corrupts them"
+            )
+
+        # What the CALLER pinned, captured before _resolve_geometry() fills the
+        # rest: afterwards every field holds a number and the two are
+        # indistinguishable. The internode backend overlays these on top of its
+        # tuning table, so a pinned field wins and an unpinned one is tuned.
+        self._pinned_geometry = frozenset(
+            field_name
+            for field_name in (
+                "dispatch_block_num",
+                "combine_block_num",
+                "warp_num_per_block",
+                "combine_warp_num_per_block",
+                "dispatch_rdma_block_num",
+                "combine_rdma_block_num",
+            )
+            if getattr(self, field_name) is not None
+        )
+
         self._resolve_geometry()
 
     def _resolve_geometry(self):
@@ -186,6 +330,28 @@ class EpDispatchCombineConfig:
                 self.combine_warp_num_per_block,
             )
         )
+        if self.is_internode:
+            # The intranode tables are keyed on a single node's geometry and
+            # carry no rdma_block_num, so they have nothing to say about this
+            # config. Internode geometry comes from internode_tuning_configs,
+            # which the backend applies per phase and per token count. A
+            # `schedule` bucket already carries per-phase block and warp counts,
+            # but it has no rdma_block_num field at all, so it cannot carry the
+            # DIFFERENT rdma values dispatch and combine are tuned to.
+            self.schedule = None
+            if self.dispatch_block_num is None:
+                self.dispatch_block_num = 96
+            if self.combine_block_num is None:
+                self.combine_block_num = 96
+            if self.warp_num_per_block is None:
+                self.warp_num_per_block = 8
+            if self.combine_warp_num_per_block is None:
+                self.combine_warp_num_per_block = 8
+            if self.dispatch_rdma_block_num is None:
+                self.dispatch_rdma_block_num = 64
+            if self.combine_rdma_block_num is None:
+                self.combine_rdma_block_num = 64
+            return
         if not pinned:
             backend = (
                 self.kernel_backend
@@ -247,6 +413,21 @@ class EpDispatchCombineConfig:
             )
 
     @property
+    def nodes(self):
+        """Physical nodes this op spans. 1 for every intranode config."""
+        return self.world_size // self.gpu_per_node
+
+    @property
+    def is_internode(self):
+        """True when some peer is not reachable over the flat LSA VA.
+
+        This is the whole selector: there is no kernel_type enum on the v2 side.
+        A config whose world fits in one node takes the intranode kernels even if
+        gpu_per_node was passed explicitly.
+        """
+        return self.nodes > 1
+
+    @property
     def is_scatter(self):
         return self.combine_mode == "scatter"
 
@@ -286,6 +467,15 @@ class EpDispatchCombineConfig:
             if dt == torch.float4_e2m1fn_x2
             else ("fp8" if dt in _FP8_DTYPES else "bf16")
         )
+        # The intranode tables say nothing about an internode config -- they are
+        # keyed on a single node's geometry and carry no rdma_block_num -- and
+        # pre-filling here would be indistinguishable from a caller pin, which
+        # the internode backend honours over its own table. Leave it alone and
+        # let _resolve_geometry / internode_tuning_configs do the work.
+        gpu_per_node = kwargs.get("gpu_per_node") or kwargs["world_size"]
+        if kwargs["world_size"] // gpu_per_node > 1:
+            return cls(**kwargs)
+
         t = lookup(
             kwargs["world_size"],
             kwargs["hidden_dim"],
@@ -420,8 +610,11 @@ class EpDispatchRoutingHandle:
 
     disp_dest_tok_id_map: forward (src_tok,k)->dest flat slot (v2 tok_map).
     disp_tok_id_to_src_tok_id_local: reverse recv-slot->src token (v2 tis).
-    inter_node_*: empty placeholders (v2 is intranode-only; kept for 5-tensor
-    shape parity so downstream unpacking works).
+    inter_node_*: empty placeholders on every path, internode included. v2's
+    combine takes its routing from disp_dest_tok_id_map alone; the internode
+    kernels keep their own send/dest maps in the arena and never hand one back,
+    so there is nothing to put here. Kept for 5-tensor shape parity with v1 so
+    downstream unpacking works.
 
     The reverse map (disp_tok_id_to_src_tok_id_local) is materialized LAZILY on
     first access. recv_to_src_token is written into this rank's arena by peers via
@@ -538,9 +731,10 @@ class EpDispatchCombineOp:
 
     # -- hooks a subclass must supply --------------------------------------
     #
-    # Exactly three, and no more: the arena layout, the kernels, and (optionally)
-    # what the backend cannot do. Everything a caller touches -- dispatch(),
-    # combine(), the views, _pick, close -- is implemented once, here.
+    # Exactly four, and no more: the arena layout, the kernels, and (optionally)
+    # what the backend cannot do and which arena region a shared view reads.
+    # Everything a caller touches -- dispatch(), combine(), the views, _pick,
+    # close -- is implemented once, here.
 
     def _regions(self, cfg) -> list[tuple[str, int]]:
         """[(region_name, nbytes)] this backend needs carved out of the arena.
@@ -574,6 +768,16 @@ class EpDispatchCombineOp:
     def _unsupported(self, cfg) -> tuple[str, ...]:
         """Reasons this backend cannot serve `cfg`. Empty = it can."""
         return ()
+
+    def _region(self, name):
+        """Arena region a shared view should read.
+
+        Identity by default -- one layout, one set of names. A backend that
+        serves more than one layout (the HIP one does: intranode and internode
+        arenas hold the same things under different names) overrides this so the
+        views stay a single contract instead of branching at every call site.
+        """
+        return name
 
     # -- shared: capability gate -------------------------------------------
 
@@ -752,10 +956,17 @@ class EpDispatchCombineOp:
 
         # A live arena view: the reverse map is cloned lazily on first access,
         # which must happen after the caller's post-dispatch barrier (see
-        # EpDispatchRoutingHandle).
-        reverse = from_gpu_ptr(
-            self.arena.local_ptr("recv_to_src_token"), (self._recv_cap,), torch.int32
-        )
+        # EpDispatchRoutingHandle). Built once -- the pointer and the shape are
+        # fixed for the op's lifetime, and rebuilding it per dispatch is pure
+        # host cost on a path where the host already paces the GPU.
+        reverse = getattr(self, "_reverse_view", None)
+        if reverse is None:
+            reverse = from_gpu_ptr(
+                self.arena.local_ptr(self._region("recv_to_src_token")),
+                (self._recv_cap,),
+                torch.int32,
+            )
+            self._reverse_view = reverse
         handle = EpDispatchRoutingHandle(
             disp_dest_tok_id_map=dest_map,
             inter_node_disp_dest_tok_id_map=self._empty_i32,
@@ -783,7 +994,7 @@ class EpDispatchCombineOp:
         if not self._kernels.stages_in_kernel and not self.cfg.enable_std_moe:
             # StdMoE has already written the weighted-reduced tokens into out_tok;
             # copying `input` over them would clobber that result.
-            out_tok_ptr = self.arena.local_ptr("out_tok")
+            out_tok_ptr = self.arena.local_ptr(self._region("out_tok"))
             if input.data_ptr() != out_tok_ptr:
                 dst = self.combine_in_view().view(-1)[: input.numel()]
                 dst.copy_(input.reshape(-1))
@@ -831,7 +1042,20 @@ class EpDispatchCombineOp:
         self.dispatch_barrier.zero_()
         self.combine_barrier.zero_()
         self.total_recv.zero_()
-        self.cross_device_flag.fill_(1)
+        # The two backends seed this differently -- intranode starts the epoch at
+        # 1, internode at 0 (see the two constructors in hip_backend) -- so a
+        # single literal here silently desynchronises one of them from its peers.
+        self.cross_device_flag.fill_(0 if self.cfg.is_internode else 1)
+        # The docstring above says the kernels self-reset their counters. That is
+        # true of dest_pe_counter and the two grid barriers, and NOT of the
+        # internode chunk-slot allocator: only EpCombineAll clears
+        # blockFlagCounter, so a reset taken between a dispatch and its combine
+        # would leave it advanced and the next dispatch would address slots past
+        # its node's slice of the send buffer.
+        for name in ("block_flag_counter", "inter_blocks_barrier"):
+            counter = getattr(self, name, None)
+            if counter is not None:
+                counter.zero_()
 
     def __repr__(self):
         return (

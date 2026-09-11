@@ -21,12 +21,11 @@
 // SOFTWARE.
 #include "umbp/distributed/transfer/gds_engine.h"
 
-#include <hipfile.h>
-
 #include <cerrno>
 #include <string>
 #include <utility>
 
+#include "hipfile_dl.h"
 #include "mori/utils/mori_log.hpp"
 
 namespace mori::umbp {
@@ -57,19 +56,23 @@ class SettledHandle final : public TransferHandle {
 // Turn a hipFileRead return code into a human-readable reason.  >= 0 is a byte
 // count (a short read here); -1 is a POSIX errno; any other negative is the
 // negated hipFileOpError_t.
-std::string ReadFailureReason(ssize_t n, size_t want) {
+std::string ReadFailureReason(const HipFileApi& api, ssize_t n, size_t want) {
   if (n == -1) return std::string("errno=") + std::to_string(errno);
-  if (n < 0) return hipFileGetOpErrorString(static_cast<hipFileOpError_t>(-n));
+  if (n < 0) return api.GetOpErrorString(static_cast<hipFileOpError_t>(-n));
   return std::string("short read ") + std::to_string(n) + "/" + std::to_string(want);
 }
 
 }  // namespace
 
+bool GdsEngine::Available() { return HipFile() != nullptr; }
+
 GdsEngine::~GdsEngine() {
   std::lock_guard<std::mutex> lock(handles_mutex_);
+  // Non-empty handles_ implies a successful register, so the API resolved.
+  const HipFileApi* api = HipFile();
   for (auto& [fd, entry] : handles_) {
-    if (entry.handle != nullptr) {
-      hipFileHandleDeregister(static_cast<hipFileHandle_t>(entry.handle));
+    if (entry.handle != nullptr && api != nullptr) {
+      api->HandleDeregister(static_cast<hipFileHandle_t>(entry.handle));
     }
   }
   handles_.clear();
@@ -77,6 +80,8 @@ GdsEngine::~GdsEngine() {
 
 TransferRef GdsEngine::RegisterFile(int fd, uint64_t offset, uint64_t size) {
   if (fd < 0) return TransferRef{};
+  const HipFileApi* api = HipFile();
+  if (api == nullptr) return TransferRef{};
   std::lock_guard<std::mutex> lock(handles_mutex_);
 
   auto it = handles_.find(fd);
@@ -89,10 +94,10 @@ TransferRef GdsEngine::RegisterFile(int fd, uint64_t offset, uint64_t size) {
   descr.type = hipFileHandleTypeOpaqueFD;
   descr.handle.fd = fd;
   hipFileHandle_t handle = nullptr;
-  hipFileError_t err = hipFileHandleRegister(&handle, &descr);
+  hipFileError_t err = api->HandleRegister(&handle, &descr);
   if (err.err != hipFileSuccess || handle == nullptr) {
     MORI_UMBP_ERROR("[GdsEngine] hipFileHandleRegister(fd={}) failed: {}", fd,
-                    hipFileGetOpErrorString(err.err));
+                    api->GetOpErrorString(err.err));
     return TransferRef{};
   }
   handles_.emplace(fd, HandleEntry{static_cast<void*>(handle), 1});
@@ -101,12 +106,13 @@ TransferRef GdsEngine::RegisterFile(int fd, uint64_t offset, uint64_t size) {
 
 void GdsEngine::Deregister(const TransferRef& ref) {
   if (!ref.IsFile()) return;
+  const HipFileApi* api = HipFile();
   std::lock_guard<std::mutex> lock(handles_mutex_);
   auto it = handles_.find(ref.file_fd);
   if (it == handles_.end()) return;
   if (--it->second.refcount <= 0) {
-    if (it->second.handle != nullptr) {
-      hipFileHandleDeregister(static_cast<hipFileHandle_t>(it->second.handle));
+    if (it->second.handle != nullptr && api != nullptr) {
+      api->HandleDeregister(static_cast<hipFileHandle_t>(it->second.handle));
     }
     handles_.erase(it);
   }
@@ -151,6 +157,17 @@ std::unique_ptr<TransferHandle> GdsEngine::Submit(std::vector<TransferPlan> plan
   if (plans.empty()) return nullptr;
   std::vector<TransferFailure> failures;
 
+  const HipFileApi* api = HipFile();
+  if (api == nullptr) {
+    // Unreachable in practice — a plan can only exist for a ref this engine
+    // registered, which requires the library — but fail the batch rather than
+    // dereference null if the composite ever hands us one.
+    for (const auto& plan : plans) {
+      failures.push_back(TransferFailure{plan.tags, 0, "GdsEngine: libhipfile unavailable", "gds"});
+    }
+    return std::make_unique<SettledHandle>(std::move(failures));
+  }
+
   for (const auto& plan : plans) {
     auto fh = static_cast<hipFileHandle_t>(plan.src.gds_handle);
     if (fh == nullptr) {
@@ -163,10 +180,10 @@ std::unique_ptr<TransferHandle> GdsEngine::Submit(std::vector<TransferPlan> plan
     void* dst_base = plan.dst.host_ptr;
     for (size_t i = 0; i < plan.sizes.size(); ++i) {
       const uint64_t file_off = plan.src.file_offset + plan.src_offsets[i];
-      const ssize_t n = hipFileRead(fh, dst_base, plan.sizes[i], static_cast<hoff_t>(file_off),
-                                    static_cast<hoff_t>(plan.dst_offsets[i]));
+      const ssize_t n = api->Read(fh, dst_base, plan.sizes[i], static_cast<hoff_t>(file_off),
+                                  static_cast<hoff_t>(plan.dst_offsets[i]));
       if (n < 0 || static_cast<size_t>(n) != plan.sizes[i]) {
-        const std::string why = ReadFailureReason(n, plan.sizes[i]);
+        const std::string why = ReadFailureReason(*api, n, plan.sizes[i]);
         MORI_UMBP_ERROR("[GdsEngine] hipFileRead file_off={} size={} failed: {}", file_off,
                         plan.sizes[i], why);
         failures.push_back(TransferFailure{plan.tags, 0, "GdsEngine: hipFileRead: " + why, "gds"});

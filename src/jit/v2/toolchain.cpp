@@ -69,6 +69,11 @@ std::vector<std::string> Toolchain::Flags() const {
       "-DHIP_ENABLE_WARP_SYNC_BUILTINS",
   };
   if (arch.rfind("gfx950", 0) == 0) f.push_back("-DHIP_ENABLE_GFX950_OCP_BUILTINS=1");
+  // Picks the GDA provider cco_scale_out.hpp compiles ccoGda<P> for; without it a
+  // JIT TU on a bnxt/ionic host silently builds mlx5 WQEs. Mirrors
+  // MoriDetectDevice.cmake, which likewise emits nothing for mlx5 -- the #else.
+  if (nic == "bnxt") f.push_back("-DMORI_DEVICE_NIC_BNXT");
+  if (nic == "ionic") f.push_back("-DMORI_DEVICE_NIC_IONIC");
   if (const char* extra = std::getenv("MORI_JIT_EXTRA_FLAGS")) {
     for (const std::string& tok : SplitWhitespace(extra)) f.push_back(tok);
   }
@@ -158,7 +163,13 @@ std::string DetectSourceRoot() {
 std::string DetectNic() {
   std::string v = EnvOr("MORI_DEVICE_NIC", "mlx5");
   for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  return v.empty() ? "mlx5" : v;
+  // Closed set, checked here rather than in Flags(): mlx5 is the #else of both
+  // Flags() and cco_scale_out.hpp, so an unrecognised spelling would compile
+  // ccoGda<MLX5> against a bnxt/ionic QP and produce a silently wrong kernel.
+  if (v != "mlx5" && v != "bnxt" && v != "ionic") {
+    throw std::runtime_error("mori jit: MORI_DEVICE_NIC='" + v + "' is not one of mlx5/bnxt/ionic");
+  }
+  return v;
 }
 
 std::string DetectHipcc(const std::string& rocmPath) {
