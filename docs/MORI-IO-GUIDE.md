@@ -225,5 +225,6 @@ Either variable can be enabled alone. Enabled values include `1`, `on`, and
 | `src/pybind/mori.cpp` | IO binding registration (`RegisterMoriIo`) |
 | `examples/io/example.py` | Complete usage examples (read, write, batch, session) |
 | `tests/python/io/test_engine.py` | Comprehensive test suite |
-| `tests/python/io/benchmark.py` | Performance benchmark |
+| `tests/cpp/io/bench_engine.cpp` | Performance benchmark (default, nixlbench-matching) |
+| `tests/python/io/benchmark.py` | Performance benchmark (Python, kept for parity) |
 | `docs/MORI-IO-BENCHMARK.md` | Benchmark commands and results |
