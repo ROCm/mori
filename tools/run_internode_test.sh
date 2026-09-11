@@ -8,7 +8,8 @@
 #                         [--num-qp <N>] [--quant-type <none|...>] [--dtype <bf16|...>] \
 #                         [--combine-dtype <bf16|...>] [--hidden-dim <N>] [--topk <N>] \
 #                         [--max-recv-total-tokens <N>] [--sentinel-pattern <p>] \
-#                         [--rounds <N>] [--nproc-per-node <N>] [--entry <path>]
+#                         [--rounds <N>] [--spawn <N>] [--nproc-per-node <N>] \
+#                         [--entry <path>]
 #
 # The optional shape/dtype flags are pass-throughs to the harness, which already
 # accepts all of them; they are listed here so the cross-node leg can cover the
@@ -27,7 +28,13 @@
 # (no test_sentinel/sweep_bench/profile), --kernel-type is auto|v2|v2_ll
 # against v1's v1|v1_ll|async_ll (they are different kernels, not a renaming), and
 # it accepts neither --max-recv-total-tokens nor --sentinel-pattern. It is the
-# only entry that takes --rounds.
+# only entry that takes --rounds and --spawn.
+#
+# --spawn selects the v2 entry's process topology and has to be reachable from
+# here, because the two ways of getting 8 ranks per node are mutually exclusive:
+# that entry spawns 8 workers by default, so --nproc-per-node 8 asks for 64 and
+# it refuses. Pass --nproc-per-node 8 --spawn 0 for one torchrun process per
+# rank, or leave both alone for the default one-torchrun-plus-spawn.
 #
 # Environment variables GLOO_SOCKET_IFNAME and MORI_SOCKET_IFNAME are set
 # automatically from --ifname. All other env vars (MORI_RDMA_SL, MORI_SHMEM_MODE,
@@ -51,6 +58,7 @@ HIDDEN_DIM=""
 MAX_RECV_TOTAL_TOKENS=""
 SENTINEL_PATTERN=""
 ROUNDS=""
+SPAWN=""
 NPROC_PER_NODE=1
 ENTRY="examples/ops/dispatch_combine/test_dispatch_combine_internode.py"
 
@@ -74,6 +82,7 @@ while [[ $# -gt 0 ]]; do
     --nproc-per-node)   NPROC_PER_NODE="$2";        shift 2 ;;
     --entry)            ENTRY="$2";                 shift 2 ;;
     --rounds)           ROUNDS="$2";                shift 2 ;;
+    --spawn)            SPAWN="$2";                 shift 2 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
@@ -104,6 +113,7 @@ EXTRA_ARGS=()
   && EXTRA_ARGS+=(--max-recv-total-tokens "$MAX_RECV_TOTAL_TOKENS")
 [[ -n "$SENTINEL_PATTERN" ]] && EXTRA_ARGS+=(--sentinel-pattern "$SENTINEL_PATTERN")
 [[ -n "$ROUNDS" ]]         && EXTRA_ARGS+=(--rounds "$ROUNDS")
+[[ -n "$SPAWN" ]]          && EXTRA_ARGS+=(--spawn "$SPAWN")
 [[ -n "$KERNEL_TYPE" ]]    && EXTRA_ARGS+=(--kernel-type "$KERNEL_TYPE")
 
 exec timeout "${MORI_INTERNODE_TIMEOUT:-120}" torchrun \
