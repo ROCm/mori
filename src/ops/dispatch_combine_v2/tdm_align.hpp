@@ -52,9 +52,7 @@ MORI_TDM_FN TdmSplit128 TdmPlanRun(size_t phase, int nElems) {
   return TdmSplit128{head, rows * P, rows};
 }
 
-MORI_TDM_FN int TdmSplitDim0(const TdmSplit128& sp) {
-  return (sp.rows > 0) ? kTdmRowElems4B : 0;
-}
+MORI_TDM_FN int TdmSplitDim0(const TdmSplit128& sp) { return (sp.rows > 0) ? kTdmRowElems4B : 0; }
 
 MORI_TDM_FN int TdmSplitDim1(const TdmSplit128& sp) { return (sp.rows > 0) ? sp.rows : 0; }
 

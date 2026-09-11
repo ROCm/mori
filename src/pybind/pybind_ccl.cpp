@@ -219,11 +219,12 @@ void RegisterMoriCcl(pybind11::module_& m) {
           py::arg("split_offsets_ptr"), py::arg("split_count"), py::arg("stream"))
       .def(
           "finish_sync",
-          [](AllgatherU32& self, uintptr_t output, size_t count, int64_t stream) -> double {
+          [](AllgatherU32& self, uintptr_t output, size_t count, int64_t stream,
+             bool capturing) -> double {
             return self.finish_sync(reinterpret_cast<uint32_t*>(output), count,
-                                    reinterpret_cast<hipStream_t>(stream));
+                                    reinterpret_cast<hipStream_t>(stream), capturing);
           },
-          py::arg("output_ptr"), py::arg("count"), py::arg("stream"))
+          py::arg("output_ptr"), py::arg("count"), py::arg("stream"), py::arg("capturing") = false)
       .def(
           "prepare_async_start",
           [](AllgatherU32& self, uintptr_t input, uintptr_t output, size_t count,
@@ -255,10 +256,10 @@ void RegisterMoriCcl(pybind11::module_& m) {
           py::arg("stream"))
       .def(
           "finish_async_wait",
-          [](AllgatherU32& self, int64_t stream) -> double {
-            return self.finish_async_wait(reinterpret_cast<hipStream_t>(stream));
+          [](AllgatherU32& self, int64_t stream, bool capturing) -> double {
+            return self.finish_async_wait(reinterpret_cast<hipStream_t>(stream), capturing);
           },
-          py::arg("stream"))
+          py::arg("stream"), py::arg("capturing") = false)
       .def("is_async_in_progress", &AllgatherU32::is_async_in_progress)
       .def("cancel_async", &AllgatherU32::cancel_async)
       .def("reset_flags", &AllgatherU32::resetFlags)

@@ -48,13 +48,23 @@ __device__ void OneShotAllGatherSdmaKernel_body(int myPe, int npes, T* input,
                                                 const application::SymmMemObjPtr dstMemObj,
                                                 const application::SymmMemObjPtr flagsMemObj,
                                                 size_t elementCount, size_t dstBaseOffset = 0,
-                                                uint64_t flagVal = 1) {
+                                                uint64_t* genCounter = nullptr) {
   if (elementCount == 0 || npes <= 0) {
     return;
   }
 
   T* __restrict__ inputData = input;
   uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
+
+  // Generation derived on the device so every graph replay gets a fresh value;
+  // see CclAllgatherArgs::genCounter. The counter is local to this PE, so a
+  // relaxed agent-scope load suffices: the previous call's store-back is on the
+  // far side of a kernel boundary on the same stream. A null counter means the
+  // caller keeps no generation state and hands us freshly zeroed flags.
+  // Ranks agree on the value because they all take the early return above and
+  // advance the counter on the same sequence of collective calls.
+  // Non-const: the AMO below takes the value by address.
+  uint64_t flagVal = (genCounter != nullptr) ? core::AtomicLoadRelaxed(genCounter) + 1ULL : 1ULL;
 
   const size_t threadLinearId =
       static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
@@ -118,7 +128,13 @@ __device__ void OneShotAllGatherSdmaKernel_body(int myPe, int npes, T* input,
       (void)core::AtomicLoadSeqCstSystem(flags + sender);
     }
     __syncthreads();
-    if (threadLinearId == 0) __threadfence_system();
+    if (threadLinearId == 0) {
+      __threadfence_system();
+      // Publish only now that every peer's flag is in: the next call derives
+      // its generation from this value, so advancing it earlier would let that
+      // call's wait pass while this transfer is still landing.
+      if (genCounter != nullptr) core::AtomicStoreRelaxed(genCounter, flagVal);
+    }
     __syncthreads();
   }
 
@@ -131,9 +147,9 @@ __global__ void OneShotAllGatherSdmaKernel(int myPe, int npes, T* input,
                                            const application::SymmMemObjPtr dstMemObj,
                                            const application::SymmMemObjPtr flagsMemObj,
                                            size_t elementCount, size_t dstBaseOffset = 0,
-                                           uint64_t flagVal = 1) {
+                                           uint64_t* genCounter = nullptr) {
   OneShotAllGatherSdmaKernel_body<T>(myPe, npes, input, srcMemObj, dstMemObj, flagsMemObj,
-                                     elementCount, dstBaseOffset, flagVal);
+                                     elementCount, dstBaseOffset, genCounter);
 }
 
 // ---------------------------------------------------------------------------
@@ -466,12 +482,17 @@ template <typename T>
 __device__ void OneShotAllGatherSdmaParamContiguousKernel_body(
     int myPe, int npes, T* input, const application::SymmMemObjPtr srcMemObj,
     const application::SymmMemObjPtr dstMemObj, const application::SymmMemObjPtr flagsMemObj,
-    size_t elementCount, size_t dstBaseOffset, uint64_t flagVal, const size_t* splitSizes,
+    size_t elementCount, size_t dstBaseOffset, uint64_t* genCounter, const size_t* splitSizes,
     const size_t* splitOffsets, size_t splitCount) {
   if (elementCount == 0 || npes <= 0 || splitCount == 0 || splitSizes == nullptr ||
       splitOffsets == nullptr) {
     return;
   }
+
+  // Device-derived generation; see OneShotAllGatherSdmaKernel_body. Every rank
+  // must reach or skip this kernel together, split descriptors included, or the
+  // counters drift apart.
+  uint64_t flagVal = (genCounter != nullptr) ? core::AtomicLoadRelaxed(genCounter) + 1ULL : 1ULL;
 
   const size_t threadLinearId =
       static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
@@ -539,6 +560,8 @@ __device__ void OneShotAllGatherSdmaParamContiguousKernel_body(
       (void)core::AtomicLoadSeqCstSystem(flags + sender);
     }
     __threadfence_system();
+    // Advance only after every peer's flag is in (see the flat gather).
+    if (genCounter != nullptr) core::AtomicStoreRelaxed(genCounter, flagVal);
   }
   __syncthreads();
 }
@@ -547,12 +570,12 @@ template <typename T>
 __global__ void OneShotAllGatherSdmaParamContiguousKernel(
     int myPe, int npes, T* input, const application::SymmMemObjPtr srcMemObj,
     const application::SymmMemObjPtr dstMemObj, const application::SymmMemObjPtr flagsMemObj,
-    size_t elementCount, size_t dstBaseOffset = 0, uint64_t flagVal = 1,
+    size_t elementCount, size_t dstBaseOffset = 0, uint64_t* genCounter = nullptr,
     const size_t* splitSizes = nullptr, const size_t* splitOffsets = nullptr,
     size_t splitCount = 0) {
-  OneShotAllGatherSdmaParamContiguousKernel_body<T>(myPe, npes, input, srcMemObj, dstMemObj,
-                                                    flagsMemObj, elementCount, dstBaseOffset,
-                                                    flagVal, splitSizes, splitOffsets, splitCount);
+  OneShotAllGatherSdmaParamContiguousKernel_body<T>(
+      myPe, npes, input, srcMemObj, dstMemObj, flagsMemObj, elementCount, dstBaseOffset, genCounter,
+      splitSizes, splitOffsets, splitCount);
 }
 }  // namespace collective
 }  // namespace mori
