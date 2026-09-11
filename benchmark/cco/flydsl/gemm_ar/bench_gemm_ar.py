@@ -22,7 +22,7 @@
 # SOFTWARE.
 """GEMM + all-reduce at the DSV4-Pro ``wo_b`` shape: fused vs split.
 
-    MORI_SOCKET_IFNAME=lo MORI_ENABLE_SDMA=1 PYTHONPATH=/path/to/aiter \\
+    MORI_SOCKET_IFNAME=lo MORI_ENABLE_SDMA=1 \\
     torchrun --standalone --nproc_per_node=8 bench_gemm_ar.py \\
         --mode fused-sdma -m 4096 -n 7168 -k 1024
 
@@ -55,9 +55,9 @@ which is a ``--chunked-prefill-size 16384`` TP8 prefill chunk of DSV4-Pro
     gemm-only                    228.9             388.5
 
 ``blockscale`` is the quantisation the model actually runs -- A 1x128 and B
-128x128 with fp32 scales -- and is the column to read. ``ptpc`` is the aiter
-8-wave kernel's native per-token/per-channel form, kept because the two bitwise
-tests and every earlier measurement are on it.
+128x128 with fp32 scales -- and is the column to read. ``ptpc`` is the 8-wave
+kernel's native per-token/per-channel form, kept because the swap_ab bitwise
+test and every earlier measurement are on it.
 
 For scale, the same layer in the running model costs 1491.3us (GEMM 348.0 +
 NCCL 1143.3, medians over its 61 layers), and the collective on its own is
@@ -69,20 +69,19 @@ The margin *grows* with blockscale (11.7% -> 21.8%) for the reason the whole
 exercise was about: the GEMM goes 228.9 -> 388.5us while the 489us of link time
 does not move, so there is more compute to hide the transfer behind. Our blockscale
 GEMM is *not* competitive standalone: 370.5us against CK's 300.4 for its fastest
-blockscale instance (64x256, Intrawave v1) measured the same way. The gap is the
-per-K-block scale, not the GEMM -- unscaled we are 224.0us. See
-``kernels_preshuffle4w.py``, which ports CK's 4-wave B-out-of-LDS shape and
-lands at 385.9us: aligned on the GEMM, still paying for the scale.
+blockscale instance (64x256, Intrawave v1) measured the same way. A port of
+that shape reached CK's instruction mix and not its speed; see the closing
+section of ``python/mori/ops/gemm_ar/README.md`` for what that ruled out.
 
 Fusing over SDMA wins, and only because of ``--chunks``; see the table at its
-definition in ``run()``. It was pinned to 1 while the aiter GEMM's
-under-counted ``s_waitcnt`` made every chunked run intermittently wrong, and
+definition in ``run()``. It was pinned to 1 while the GEMM's under-counted
+``s_waitcnt`` made every chunked run intermittently wrong, and
 with one chunk the fused path overlaps nothing at all. Fusing over LSA still
 loses, though by much less since ``--n-stripe 2``: it spends 560us of its GEMM
 pushing C over xGMI, where the copy engines move the same bytes in 499.
 
-Read ``kernels_fused.py`` before trusting any fused number from this
-benchmark: several of its options are intermittently wrong, and a single
+Read ``python/mori/ops/gemm_ar/kernels_fused.py`` before trusting any fused
+number from this benchmark: several of its options are intermittently wrong, and a single
 passing run proves nothing. Every ``raw-wt`` fence mode is known-racy and kept
 only to reproduce that.
 """
@@ -107,14 +106,13 @@ from mori.cco import (
 )
 from mori.tensor_utils import from_gpu_ptr
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, _HERE)
-sys.path.insert(0, os.path.join(os.path.dirname(_HERE), "ar"))
-from kernels_fused import compile_fused_gemm_scatter  # noqa: E402
-from kernels_preshuffle4w import compile_preshuffle_gemm  # noqa: E402
-from kernels_lsa import build_lsa_ar  # noqa: E402
-from kernels_sdma import build_sdma_phases  # noqa: E402
-from layout import ArConfig  # noqa: E402
+from mori.ops.gemm_ar import (
+    ArConfig,
+    build_lsa_ar,
+    build_sdma_phases,
+    compile_fused_gemm_scatter,
+    preshuffle_b,
+)
 
 VMM_SLACK = 512 * 1024 * 1024
 MODES = ("gemm-only", "split-sdma", "fused-sdma", "fused-lsa", "split-lsa")
@@ -221,13 +219,7 @@ def _median_us(fn, warmup: int, iters: int, *, graph: bool = True) -> float:
 
 
 def run(args) -> int:
-    from aiter.ops.shuffle import shuffle_weight
-
     local_rank, rank, world_size, uid = _setup_distributed()
-    if args.gemm_impl == "preshuffle4w" and args.mode != "gemm-only":
-        raise SystemExit(
-            "--gemm-impl preshuffle4w has no fused epilogue; use --mode gemm-only"
-        )
     # blockscale keeps a second fp32 accumulator for the per-K-block promotion,
     # which doubles the accumulator VGPRs; 256x256 needs 256 of them and the
     # kernel already runs at ~254 with zero spill, so the tile has to halve.
@@ -282,7 +274,7 @@ def run(args) -> int:
     cfg.validate()
 
     a, b, sa, sb = make_operands(rank, args.m, args.n, args.k, args.quant)
-    b_shuf = shuffle_weight(b, layout=(16, 16))
+    b_shuf = preshuffle_b(b)
 
     vmm = max(4 * cfg.window_bytes + VMM_SLACK, VMM_SLACK)
     result = None
@@ -306,26 +298,7 @@ def run(args) -> int:
             reqs.sdma_queue_count = args.sdma_queues
         dc = comm.create_dev_comm(reqs)
 
-        if args.gemm_impl == "preshuffle4w":
-            # CK's shape: 4 waves, B never staged in LDS. gemm-only, so the
-            # window's input region is just an ordinary output buffer here.
-            launch4w = compile_preshuffle_gemm(
-                N=args.n,
-                K=args.k,
-                tile_m=args.tile_m,
-                tile_n=args.tile_n,
-                tile_k=args.tile_k,
-                in_dtype="fp8",
-                out_dtype="bf16",
-                quant=args.quant,
-                swap_ab=args.p4w_swap_ab,
-                waves_per_eu=args.waves_per_eu,
-                xcd_swizzle=args.xcd_swizzle,
-            )
-            semaphore = torch.zeros(1, device="cuda", dtype=torch.int32)
-            bias_unused = torch.zeros(1, device="cuda", dtype=torch.bfloat16)
-
-        gemm = None if args.gemm_impl == "preshuffle4w" else compile_fused_gemm_scatter(
+        gemm = compile_fused_gemm_scatter(
             cfg,
             rank,
             K=args.k,
@@ -368,10 +341,6 @@ def run(args) -> int:
             sa_arg, sb_arg = sa, sb
 
         def run_gemm(stream):
-            if args.gemm_impl == "preshuffle4w":
-                launch4w(c, c, semaphore, a, b_shuf, sa_arg, sb_arg, bias_unused,
-                         args.m, args.n, stream=stream)
-                return
             gemm(a_i8, b_i8, c_flat, sa_arg, sb_arg, args.m, args.n, dc.ptr,
                  win.handle, stream=stream)
 
@@ -485,12 +454,6 @@ def run(args) -> int:
                 "rel_l2": rel_l2,
                 "validated": validated,
                 "timing": "eager" if args.eager else "graph",
-                "gemm_impl": args.gemm_impl,
-                "tile": (
-                    [args.tile_m, args.tile_n, args.tile_k]
-                    if args.gemm_impl == "preshuffle4w"
-                    else None
-                ),
             }
             print("RESULT_JSON " + json.dumps(result, sort_keys=True), flush=True)
             print(
@@ -599,9 +562,8 @@ def build_parser() -> argparse.ArgumentParser:
     # i.e. nothing -- that path is xGMI-bound, and ATT shows 99% of its store
     # time is stall, not issue).
     #
-    # ``compile_fused_gemm_scatter`` still defaults them to False: there the
-    # default has to stay "aiter's kernel verbatim", which is what
-    # ``test_pinned_copy_matches_aiter_kernel_bitwise`` checks.
+    # ``compile_fused_gemm_scatter`` still defaults them to False, so that
+    # its default stays the stock pipeline and these stages are opt-in.
     p.add_argument(
         "--swap-ab",
         action=argparse.BooleanOptionalAction,
@@ -654,25 +616,6 @@ def build_parser() -> argparse.ArgumentParser:
         "and is worth 80us (355 vs 434)",
     )
     p.add_argument("--sdma-queues", type=int, default=8)
-    p.add_argument(
-        "--gemm-impl",
-        choices=("8wave", "preshuffle4w"),
-        default="8wave",
-        help="8wave: the pinned aiter kernel, the only one with a fused "
-        "epilogue. preshuffle4w: CK's shape -- 4 waves, B loaded straight "
-        "to registers instead of through LDS. gemm-only.",
-    )
-    p.add_argument("--tile-m", type=int, default=64, help="preshuffle4w only")
-    p.add_argument("--tile-n", type=int, default=256, help="preshuffle4w only")
-    p.add_argument("--tile-k", type=int, default=128, help="preshuffle4w only")
-    p.add_argument(
-        "--p4w-swap-ab",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="preshuffle4w: exchange the MFMA operands so a lane owns four "
-        "consecutive N instead of four M. Off by default -- it does what it "
-        "should to the instructions and still loses; see kernels_preshuffle4w.",
-    )
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=51)
     p.add_argument("--eager", action="store_true")

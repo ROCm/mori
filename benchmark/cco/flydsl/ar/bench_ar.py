@@ -77,8 +77,7 @@ from mori.cco import (
 )
 from mori.tensor_utils import from_gpu_ptr
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from layout import ArConfig  # noqa: E402
+from mori.ops.gemm_ar import ArConfig
 
 VMM_SLACK = 256 * 1024 * 1024
 
@@ -189,13 +188,13 @@ def run(args) -> int:
         dc = comm.create_dev_comm(reqs)
 
         if args.backend == "lsa":
-            from kernels_lsa import build_lsa_ar
+            from mori.ops.gemm_ar import build_lsa_ar
 
             launch, stage = build_lsa_ar(
                 cfg, rank, force_stage=args.force_stage, gather=args.gather
             )
         elif args.backend == "sdma":
-            from kernels_sdma import build_sdma_phases
+            from mori.ops.gemm_ar import build_sdma_phases
 
             parts = build_sdma_phases(
                 cfg,

@@ -26,8 +26,7 @@ from flydsl.expr.typing import Int32, Int64
 import mori.cco.device.flydsl as cco
 from mori.cco import CCODevCommRequirements, Communicator, GDA_CONNECTION_NONE
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _compat import (  # noqa: E402
+from mori.ops.gemm_ar._compat import (
     CM_CACHED,
     FLYDSL_VERSION,
     buffer_load,

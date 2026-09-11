@@ -26,7 +26,6 @@ the kernels depend on without a GPU, the GPU half runs ``bench_ar.py`` under
 torchrun and parses its ``RESULT_JSON`` line.
 """
 
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -36,21 +35,10 @@ import sys
 import pytest
 import torch
 
+from mori.ops.gemm_ar import layout
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 AR_DIR = REPO_ROOT / "benchmark" / "cco" / "flydsl" / "ar"
-sys.path.insert(0, str(AR_DIR))
-
-
-def _load(name, path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-layout = _load("flydsl_ar_layout", AR_DIR / "layout.py")
 
 
 # --------------------------------------------------------------------------
