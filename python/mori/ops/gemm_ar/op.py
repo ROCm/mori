@@ -117,7 +117,9 @@ class GemmAllReduceOp:
     ):
         self.comm = comm
         self.rank = comm.rank
-        self.world_size = comm.world_size
+        # Communicator calls it nranks; DevCommHandle calls the same thing
+        # world_size. Normalise here so the op's own surface has one name.
+        self.world_size = comm.nranks
         self.n, self.k = n, k
         self.block_m, self.block_n = block_m, block_n
         self.sdma_queues = sdma_queues
@@ -151,6 +153,27 @@ class GemmAllReduceOp:
 
         self._cache: dict[int, tuple] = {}
         self._pad_in: Optional[torch.Tensor] = None
+
+    @staticmethod
+    def window_bytes_for(
+        world_size: int, *, m_max: int, n: int, block_m: int = DEFAULT_BLOCK_M
+    ) -> int:
+        """Symmetric-window bytes an op for this shape will allocate.
+
+        Needed before the op exists: the window comes out of the communicator's
+        VMM reservation, so ``Communicator.init(per_rank_vmm=...)`` has to be
+        sized first. Same arithmetic the constructor uses.
+        """
+        m_pad = padded_m(m_max, world_size, block_m)
+        cfg = ArConfig(
+            world_size=world_size,
+            m=m_pad,
+            n=n,
+            recv_slots=world_size,
+            counter_chunks=counter_chunks(m_pad, world_size, block_m),
+        )
+        cfg.validate()
+        return cfg.window_bytes
 
     def padded_m(self, m: int) -> int:
         """``m`` rounded up to what :meth:`__call__` accepts."""
