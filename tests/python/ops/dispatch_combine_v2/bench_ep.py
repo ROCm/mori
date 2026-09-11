@@ -570,7 +570,8 @@ def main():
                         f"dispatch {d_us_m:7.1f} us ({d_bw:6.1f} GB/s)  "
                         f"combine {c_us_m:7.1f} us ({c_bw:6.1f} GB/s)  "
                         f"pair {d_us_m + c_us_m:7.1f} us  recv~{recv_m:.0f}  "
-                        f"min {d[1]:.1f}/{c[1]:.1f}  max {d[4]:.1f}/{c[4]:.1f}",
+                        f"min {d[1]:.1f}/{c[1]:.1f}  p50 {d[2]:.1f}/{c[2]:.1f}  "
+                        f"max {d[4]:.1f}/{c[4]:.1f}",
                         flush=True,
                     )
                 lockstep()
