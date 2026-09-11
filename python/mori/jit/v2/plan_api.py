@@ -622,6 +622,15 @@ def make_plan(kernel: str, enums: dict | None = None) -> type:
                         _set_arg(buf, wire, v)
                         last[wire] = v
                     else:
+                        # Forget the field. This branch writes whatever a Tensor
+                        # or None resolves to, and leaving the old int in `last`
+                        # would let the NEXT launch that passes that same int
+                        # skip its write against a buffer no longer holding it:
+                        # `p, p, None, p` would launch the fourth round with the
+                        # null this branch just stored. The ABI takes all three
+                        # spellings for one field (weights_buf, scales_buf), so
+                        # the sequence is a legal one, not a contrived one.
+                        last.pop(wire, None)
                         _set_arg(buf, wire, v)
                 for wire in self._dyn_defs:
                     _set_arg(buf, wire, self._defaults[wire])
