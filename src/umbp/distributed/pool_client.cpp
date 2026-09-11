@@ -732,17 +732,21 @@ std::chrono::milliseconds RouteReuseWindow() {
   return std::chrono::milliseconds{ms};
 }
 
-// One entry per key set a load interleaves, which is one per pool.  DSv4 has
-// six; 8 leaves headroom without making the linear scan matter.
+// One entry per key set in flight, which is (clients sharing this PoolClient) x
+// (pools per client) -- 48 on DSv4 TP8, not 6, because the standalone server
+// holds one client for every rank.  At 8 the cache thrashed and the measured
+// hit rate on the model was zero; 64 covers that with headroom and costs a few
+// MB.  There is no fixed value that is right for every topology, so this is a
+// floor that stops the cliff, not an answer.
 size_t RouteReuseSlots() {
   static const size_t slots = [] {
-    size_t n = 8;
+    size_t n = 64;
     if (const char* value = std::getenv("UMBP_DISTRIBUTED_ROUTE_REUSE_SLOTS")) {
       char* end = nullptr;
       const unsigned long long parsed = std::strtoull(value, &end, 10);
       if (end != value && *end == '\0' && parsed > 0) n = static_cast<size_t>(parsed);
     }
-    return std::min<size_t>(n, 64);
+    return std::min<size_t>(n, 1024);
   }();
   return slots;
 }
