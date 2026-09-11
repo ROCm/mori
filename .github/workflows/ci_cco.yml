@@ -463,12 +463,16 @@ jobs:
               --max-tokens $TOKENS
             )
             ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+            NODE2_PID=$!
             $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT \
               --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
               --ifname $NODE1_IFNAME --entry $ENTRY \
               --cmd test --kernel-type $KERNEL --quant-type none --dtype bf16 \
               --max-tokens $TOKENS
-            wait
+            # With a pid, not bare: bare `wait` reaps every child and returns 0,
+            # so node2 could fail its check and the job still pass on node1's
+            # status alone. Half of EP16 lives over there.
+            wait "$NODE2_PID"
             sleep 1
             PORT=$((PORT + 1))
           done
@@ -492,11 +496,12 @@ jobs:
               --cmd bench --kernel-type v2 --dtype bf16 --max-tokens $TOKENS
             )
             ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+            NODE2_PID=$!
             $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT \
               --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
               --ifname $NODE1_IFNAME --entry $ENTRY \
               --cmd bench --kernel-type v2 --dtype bf16 --max-tokens $TOKENS
-            wait
+            wait "$NODE2_PID"
             sleep 1
             PORT=$((PORT + 1))
           done
@@ -522,11 +527,12 @@ jobs:
             --cmd stress --rounds 2000 --kernel-type auto --dtype bf16 --max-tokens 4096
           )
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+          NODE2_PID=$!
           $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT \
             --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
             --ifname $NODE1_IFNAME --entry $ENTRY \
             --cmd stress --rounds 2000 --kernel-type auto --dtype bf16 --max-tokens 4096
-          wait
+          wait "$NODE2_PID"
 
       - name: Cleanup node1
         if: always()
