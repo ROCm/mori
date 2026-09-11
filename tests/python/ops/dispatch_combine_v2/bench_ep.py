@@ -34,8 +34,11 @@ first combine of the loop copies anything.
 dispatch is called with return_routing=True, the way a serving stack calls it, so
 the routing handle is inside the measured window. Each leg gets its own cuda event
 pair; the loop does not sync, since a synchronize costs 5-20 us against a 30 us
-kernel. Means over ITERS, not percentiles -- at these sizes the tail is the
-machine, and a mean over enough iterations is the number that composes.
+kernel. The headline is the mean over ITERS -- at these sizes the tail is the
+machine, and a mean over enough iterations is the number that composes -- but min,
+p50 and p95 come with it. The mean sits 10-26% above its own min here and is the
+least reproducible of the four (13% across repeats of one tier, against 1.2% for
+the min), so a mean reported alone cannot be audited by the person reading it.
 
 Every point is correctness-gated first: an identity expert makes combine[t] equal
 U[t]*input[t], where U[t] is how many distinct PEs token t routed to. A geometry
@@ -128,6 +131,22 @@ _G = {
 }
 
 
+def _spread(us):
+    """(mean, min, p50, p95) of one leg's per-iteration times.
+
+    The mean alone cannot be audited. It is also the least stable thing here: over six
+    repeats of one tier the mean moved 13% while the min moved 1.2%, and the mean sits
+    10-26% above the min because the distribution has a long right tail (peer skew, and
+    the machine). Keeping min and p50 next to it is free -- the per-iteration deltas
+    already exist -- and it is what tells a clean point from a polluted one. A sweep
+    taken for the README once read 190 us at a tier that sits at 66; its min would have
+    said so on the spot.
+    """
+    v = sorted(us)
+    q = lambda f: v[min(len(v) - 1, int(len(v) * f))]  # noqa: E731
+    return sum(v) / len(v), v[0], q(0.5), q(0.95)
+
+
 def main():
     dist.init_process_group("gloo")
     rank, world = dist.get_rank(), dist.get_world_size()
@@ -148,12 +167,18 @@ def main():
     inp = _data.make_payload((M, HIDDEN), INIT, gp, _DISP_DT, constant=CONST_VAL).to(
         dev
     )
-    wts = torch.rand(M, TOPK, generator=gr, dtype=torch.float32).to(dev)
+    # idx BEFORE wts, and the order matters. Splitting the streams fixed the payload
+    # half of this, but wts is (M, TOPK) and M is max(SWEEP), so drawing it first made
+    # how much randomness it consumed -- and therefore every tier's routing -- depend
+    # on the sweep list. TOKENS=512 and TOKENS=64,...,16384 disagreed on all 512 rows
+    # of the 512 tier, worth 1.7% of the slowest rank's load. idx consumes exactly one
+    # randperm per row, so drawn first its first ct rows are the same for any M.
     idx = (
         torch.stack([torch.randperm(n_experts, generator=gr)[:TOPK] for _ in range(M)])
         .to(torch.int32)
         .to(dev)
     )
+    wts = torch.rand(M, TOPK, generator=gr, dtype=torch.float32).to(dev)
     # Unique destination PEs per token: what an identity expert makes combine sum.
     U = (
         torch.zeros(M, world, dtype=torch.bool)
@@ -320,9 +345,9 @@ def main():
             ev[3][i].record()
         torch.cuda.synchronize()
         dist.barrier()
-        d = sum(ev[0][i].elapsed_time(ev[1][i]) for i in range(ITERS)) / ITERS * 1000
-        c = sum(ev[2][i].elapsed_time(ev[3][i]) for i in range(ITERS)) / ITERS * 1000
-        return d, c, run_d, run_c
+        d = [ev[0][i].elapsed_time(ev[1][i]) * 1000 for i in range(ITERS)]
+        c = [ev[2][i].elapsed_time(ev[3][i]) * 1000 for i in range(ITERS)]
+        return _spread(d), _spread(c), run_d, run_c
 
     def smi_window(label, pair_us, run_d, run_c):
         """Replay the pair under the GPU monitor and gather every rank's clocks.
@@ -511,14 +536,19 @@ def main():
                 return eager_d, lambda: op.combine(buf, routing=held[0])
 
             for mode in MODES:
-                d_us, c_us, run_d, run_c = time_pairs(
+                d_st, c_st, run_d, run_c = time_pairs(
                     mode, one_pair, capture_pair if mode == "graph" else eager_legs
                 )
-                got = torch.tensor([d_us, c_us, float(total)], dtype=torch.float64)
+                # Every statistic is reduced the same way, so min is the mean across
+                # ranks of each rank's own minimum -- not the global minimum, which
+                # would report one lucky rank as if it were the collective.
+                got = torch.tensor([*d_st, *c_st, float(total)], dtype=torch.float64)
                 dist.all_reduce(got)
                 n = world
-                d_us_m, c_us_m = float(got[0]) / n, float(got[1]) / n
-                recv_m = float(got[2]) / n
+                d = [float(x) / n for x in got[:4]]
+                c = [float(x) / n for x in got[4:8]]
+                d_us_m, c_us_m = d[0], c[0]
+                recv_m = float(got[8]) / n
                 # Bytes off one rank over that leg's time, BOTH cross-rank means,
                 # so the reported bandwidth follows from the recv_tokens and us
                 # this same row reports. Mixing a local byte count with a mean
@@ -528,11 +558,14 @@ def main():
                 d_bw = recv_m * HIDDEN * _DISP_NBYTES / (1000**3) / (d_us_m / 1e6)
                 c_bw = recv_m * HIDDEN * 2 / (1000**3) / (c_us_m / 1e6)
                 if rank == 0:
+                    # min trails the means deliberately: it is the stable number, so a
+                    # mean far above its own min is the tell that the point is dirty.
                     print(
                         f"  ct={ct:<5d} [{name}/{mode}] "
-                        f"dispatch {got[0]/n:7.1f} us ({d_bw:6.1f} GB/s)  "
-                        f"combine {got[1]/n:7.1f} us ({c_bw:6.1f} GB/s)  "
-                        f"pair {(got[0]+got[1])/n:7.1f} us  recv~{got[2]/n:.0f}",
+                        f"dispatch {d_us_m:7.1f} us ({d_bw:6.1f} GB/s)  "
+                        f"combine {c_us_m:7.1f} us ({c_bw:6.1f} GB/s)  "
+                        f"pair {d_us_m + c_us_m:7.1f} us  recv~{recv_m:.0f}  "
+                        f"min {d[1]:.1f}/{c[1]:.1f}",
                         flush=True,
                     )
                 lockstep()
@@ -552,6 +585,12 @@ def main():
                             dispatch_us=round(d_us_m, 2),
                             combine_us=round(c_us_m, 2),
                             pair_us=round(d_us_m + c_us_m, 2),
+                            dispatch_us_min=round(d[1], 2),
+                            dispatch_us_p50=round(d[2], 2),
+                            dispatch_us_p95=round(d[3], 2),
+                            combine_us_min=round(c[1], 2),
+                            combine_us_p50=round(c[2], 2),
+                            combine_us_p95=round(c[3], 2),
                             dispatch_gbps=round(d_bw, 1),
                             combine_gbps=round(c_bw, 1),
                             verified=VERIFY_SCOPE,
