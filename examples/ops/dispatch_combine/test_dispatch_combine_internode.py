@@ -113,6 +113,21 @@ _EP_PERROUND_SYNC = os.environ.get(
     "false",
     "no",
 )
+# Rounds folded into one e2e CUDA graph.
+#
+# 1 is the number that answers "what does one pair cost": a replay of a one-round graph is
+# a single launch covering dispatch+combine, against the two launches the eager per-phase
+# timings pay. What it buys is that launch gap, so it shows up at the short end and fades
+# once the round is long -- on 2x MI300X EP16, hidden 7168, num-qp 1, e2e minus phase sum
+# runs -5 to -20us from 1 to 16 tokens per rank and is +0.1us at 64, by which point the
+# saving is smaller than bench's own run-to-run spread.
+#
+# Raising it amortizes the replay and lets consecutive rounds overlap, which moves the
+# per-round figure *down*, not up: at 64 tokens, 159.3 / 155.4 / 149.3 / 149.7us for
+# 1 / 2 / 4 / 8. That is a sustained-loop number rather than the cost of one pair, so it
+# stays opt-in.
+_E2E_ITERS = int(os.environ.get("MORI_EP_E2E_ITERS") or "1")
+
 if _EP_ROUNDS <= _EP_DROP_ROUNDS + 1:
     # Both call sites drop the first _EP_DROP_ROUNDS rounds (`all_data[_EP_DROP_ROUNDS:]`);
     # with too few left this leaves an empty/one-row tensor and _compute_stats'
@@ -1190,6 +1205,125 @@ class EpDispatchCombineTestCase:
 
         del op
 
+    def measure_e2e(
+        self,
+        op,
+        test_data,
+        disp_block_num=-1,
+        disp_rdma_block_num=-1,
+        disp_warp_per_block=-1,
+        comb_block_num=-1,
+        comb_rdma_block_num=-1,
+        comb_warp_per_block=-1,
+        repeat=None,
+    ):
+        """Grand-mean latency of one dispatch->combine round, replayed from a CUDA graph.
+
+        The per-phase numbers everywhere else are eager launches, so their sum charges a
+        host launch gap twice and still omits whatever runs between the two phases --
+        neither is what a caller pays for the pair. This captures _E2E_ITERS rounds into
+        one graph and replays it as a unit, so at the default of one iteration the pair
+        costs a single launch and the result has to land below the phase sum.
+
+        Only the two kernels go into the graph. The cross-dtype convert the test needs
+        (it has no experts, so it feeds dispatch's own output back into combine) is
+        hoisted out, because a real stack hands combine the expert output already in the
+        combine dtype. Kernel time depends on the routing and recv-count bookkeeping the
+        op keeps on device, not on the payload values, so freezing one buffer and reusing
+        it for every replay does not change the work.
+
+        Statistics match _compute_stats -- round 0 dropped, then mean over ranks and mean
+        over rounds. Returns the grand mean in µs, or None if capture fails.
+        """
+        if repeat is None:
+            repeat = _EP_ROUNDS
+        (
+            _,
+            all_rank_indices,
+            all_rank_input,
+            all_rank_weights,
+            all_rank_scales,
+        ) = test_data
+
+        # combine_in=None converts inline (what the eager warmup rounds want); passing a
+        # frozen buffer keeps the convert out of the captured graph.
+        def one_round(combine_in=None):
+            (dispatch_output, _, _, _, _) = self.run_dispatch(
+                op,
+                all_rank_input[self.rank],
+                all_rank_weights[self.rank],
+                all_rank_scales[self.rank],
+                all_rank_indices[self.rank],
+                block_num=disp_block_num,
+                rdma_block_num=disp_rdma_block_num,
+                warp_per_block=disp_warp_per_block,
+            )
+            self.run_combine(
+                op,
+                (
+                    self._convert_for_combine(dispatch_output)
+                    if combine_in is None
+                    else combine_in
+                ),
+                None,
+                all_rank_indices[self.rank],
+                block_num=comb_block_num,
+                rdma_block_num=comb_rdma_block_num,
+                warp_per_block=comb_warp_per_block,
+            )
+            return dispatch_output
+
+        # A replay must find the op in the same state the capture started from, so run
+        # the pair eagerly first: the recv-token bookkeeping the kernels keep is what
+        # decides how much work a replay does.
+        for _ in range(2):
+            last_dispatch_out = one_round()
+        # Same-dtype needs no buffer: _convert_for_combine hands back the dispatch output
+        # itself, so nothing extra lands in the graph either way.
+        combine_input_buf = None
+        if self.combine_data_type != self.dispatch_data_type:
+            combine_input_buf = self._convert_for_combine(last_dispatch_out).clone()
+        torch.cuda.synchronize()
+        dist.barrier()
+
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph):
+                for _ in range(_E2E_ITERS):
+                    one_round(combine_input_buf)
+        except Exception as exc:  # noqa: BLE001 - capture support is shape-dependent
+            if self.rank == 0:
+                print(f"E2E: CUDA graph capture failed ({exc}); skipping e2e.")
+            return None
+        torch.cuda.synchronize()
+
+        starts = [torch.cuda.Event(enable_timing=True) for _ in range(repeat)]
+        ends = [torch.cuda.Event(enable_timing=True) for _ in range(repeat)]
+        graph.replay()  # warm the replay itself
+        torch.cuda.synchronize()
+        dist.barrier()
+        for i in range(repeat):
+            starts[i].record()
+            graph.replay()
+            ends[i].record()
+        torch.cuda.synchronize()
+
+        # ms for _E2E_ITERS rounds -> µs for one round
+        local = torch.tensor(
+            [s.elapsed_time(e) * 1000.0 / _E2E_ITERS for s, e in zip(starts, ends)],
+            dtype=torch.float64,
+        )
+        gathered = [
+            torch.zeros(repeat, dtype=torch.float64) for _ in range(self.world_size)
+        ]
+        dist.all_gather(gathered, local)
+        data = torch.stack(gathered)  # (world_size, repeat)
+        # Drop the same leading rounds the phase stats drop, for the same reason: the
+        # first replays after the barrier are still in the start transient.
+        drop = _EP_DROP_ROUNDS if repeat > _EP_DROP_ROUNDS + 1 else 0
+        kept = data[:, drop:]
+        return kept.mean(dim=0).mean().item()
+
     def run_bench_once(
         self,
         max_num_token,
@@ -1330,9 +1464,19 @@ class EpDispatchCombineTestCase:
 
         disp_duration_list = []
         comb_duration_list = []
+        # events[3i+1] -> events[3i+2] is the test-only cross-dtype convert that sits
+        # between the two phases. Neither phase duration contains it, so dispatch+combine
+        # is strictly less than one round of this loop; keep it so the gap is visible
+        # rather than showing up unexplained in an end-to-end number.
+        convert_duration_list = []
         for i in range(repeat):
             disp_duration_list.append(events[3 * i].elapsed_time(events[3 * i + 1]))
+            convert_duration_list.append(
+                events[3 * i + 1].elapsed_time(events[3 * i + 2])
+            )
             comb_duration_list.append(events[3 * i + 2].elapsed_time(events[3 * i + 3]))
+        conv_kept = convert_duration_list[_EP_DROP_ROUNDS:] or convert_duration_list
+        self._last_convert_us = 1000.0 * sum(conv_kept) / len(conv_kept)
 
         disp_rdma_bandwidth_list = [
             disp_total_rdma_bytes / (1000**3) / (t / (10**3))
@@ -1489,6 +1633,26 @@ class EpDispatchCombineTestCase:
         if self.rank == 0:
             self._print_phase_table(disp_title, disp_stats)
             self._print_phase_table(comb_title, comb_stats)
+
+        e2e_us = self.measure_e2e(
+            op,
+            test_data,
+            disp_block_num=disp_block_num,
+            disp_rdma_block_num=disp_rdma_block_num,
+            disp_warp_per_block=disp_warp_per_block,
+            comb_block_num=comb_block_num,
+            comb_rdma_block_num=comb_rdma_block_num,
+            comb_warp_per_block=comb_warp_per_block,
+            repeat=repeat,
+        )
+        if (self.rank == 0) and (e2e_us is not None):
+            eager = disp_stats["lat"][2] + comb_stats["lat"][2]
+            conv = getattr(self, "_last_convert_us", None)
+            conv_str = f", rank-0 convert {conv:.2f} us" if conv else ""
+            print(
+                f"  E2E (dispatch+combine, CUDA graph x{_E2E_ITERS}): {e2e_us:.2f} us"
+                f"   [eager phase sum: {eager:.2f} us{conv_str}]"
+            )
 
         del op
 
@@ -1838,6 +2002,24 @@ class EpDispatchCombineTestCase:
                     f"round-to-round std"
                 )
 
+        # The sweep times the two phases separately, so nothing in it says what the pair
+        # costs back to back. Measure that once, and after any variance-aware
+        # re-selection above, so it describes the configs actually reported and saved --
+        # doing it per candidate would multiply the sweep cost for a number that plays no
+        # part in the selection. Collective, so every rank has to call it.
+        best_e2e_us = None
+        if best_disp_config and best_comb_config:
+            best_e2e_us = self.measure_e2e(
+                op,
+                test_data,
+                disp_block_num=best_disp_config[0],
+                disp_warp_per_block=best_disp_config[1],
+                disp_rdma_block_num=best_disp_config[2],
+                comb_block_num=best_comb_config[0],
+                comb_warp_per_block=best_comb_config[1],
+                comb_rdma_block_num=best_comb_config[2],
+            )
+
         if self.rank == 0:
             print(f"\n{'=' * 70}")
             _sel_by = (
@@ -1870,6 +2052,12 @@ class EpDispatchCombineTestCase:
                     f"  {label.strip()} slowest-rank bandwidth: "
                     f"{st[worst_key]:.2f} GB/s "
                     f"(table Average: {_headline_bw(st, self.config.kernel_type):.2f} GB/s)"
+                )
+            if best_e2e_us is not None:
+                phase_sum = best_disp_stats["lat"][2] + best_comb_stats["lat"][2]
+                print(
+                    f"  E2E (dispatch+combine, CUDA graph x{_E2E_ITERS}): "
+                    f"{best_e2e_us:.2f} us   [phase sum: {phase_sum:.2f} us]"
                 )
             print(f"{'=' * 70}")
 
