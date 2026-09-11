@@ -817,7 +817,29 @@ class EpDispatchCombineTestCase:
             )
         return ret
 
-    def run_test_once(self, op, test_data, error_round, round):
+    def run_test_once(
+        self,
+        op,
+        test_data,
+        error_round,
+        round,
+        disp_block_num=-1,
+        disp_rdma_block_num=-1,
+        disp_warp_per_block=-1,
+        comb_block_num=-1,
+        comb_rdma_block_num=-1,
+        comb_warp_per_block=-1,
+    ):
+        """Dispatch+combine once and check the result against the CPU model.
+
+        The geometry arguments default to -1 (let the op resolve it), which is
+        what --cmd test wants. bench passes its candidate triples instead: the
+        launch geometry decides the recv task split and the send chunk-slot
+        order, so a candidate that only ever reaches the timing path is timed
+        on code that was never checked. Verifying the op's default geometry and
+        then timing a different one reports "verified" for a configuration
+        nothing verified.
+        """
         (
             all_rank_num_token,
             all_rank_indices,
@@ -838,6 +860,9 @@ class EpDispatchCombineTestCase:
             all_rank_weights[self.rank],
             all_rank_scales[self.rank],
             all_rank_indices[self.rank],
+            block_num=disp_block_num,
+            rdma_block_num=disp_rdma_block_num,
+            warp_per_block=disp_warp_per_block,
         )
         torch.cuda.synchronize()
 
@@ -890,7 +915,13 @@ class EpDispatchCombineTestCase:
             dispatch_weights = None
         combine_input = self._convert_for_combine(dispatch_output)
         combine_output, combine_output_weight = self.run_combine(
-            op, combine_input, dispatch_weights, all_rank_indices[self.rank]
+            op,
+            combine_input,
+            dispatch_weights,
+            all_rank_indices[self.rank],
+            block_num=comb_block_num,
+            rdma_block_num=comb_rdma_block_num,
+            warp_per_block=comb_warp_per_block,
         )
         torch.cuda.synchronize()
         combine_data_type = self.combine_data_type
@@ -982,10 +1013,19 @@ class EpDispatchCombineTestCase:
         if self.rank % self.gpu_per_node == 0:
             print(f"Node {self.rank // self.gpu_per_node} Combine Pass")
 
-    def test_dispatch_combine(self):
+    def test_dispatch_combine(self, rounds=500, **geometry):
+        """Many rounds at a varying token count, optionally at a pinned geometry.
+
+        bench verifies a candidate once, at a token count equal to the declared
+        capacity. This path is the one that varies the token count round to
+        round, so it is the one that reaches partial tail chunks and uneven
+        ranks -- the cases where the launch geometry decides which warp owns
+        which token. Accepting the geometry here is what lets a swept candidate
+        be checked over that range instead of only at T == cap.
+        """
         error_round = set()
         op = mori.ops.EpDispatchCombineOp(self.config)
-        for i in range(500):
+        for i in range(rounds):
             if self.rank == 0:
                 print(f"Round {i} begin")
             test_data = self.gen_test_data(
@@ -994,7 +1034,7 @@ class EpDispatchCombineTestCase:
             )
             if self.rank == 0:
                 print(f"Round {i} gen test_data done")
-            self.run_test_once(op, test_data, error_round, i)
+            self.run_test_once(op, test_data, error_round, i, **geometry)
         print(
             "rank: ",
             self.rank,
@@ -1320,10 +1360,22 @@ class EpDispatchCombineTestCase:
         comb_rdma_block_num=-1,
         comb_warp_per_block=-1,
         skip_verify=False,
+        bench_num_token=None,
     ):
+        # T and cap are separate inputs. The op was built with
+        # max_num_inp_token_per_rank = max_num_token, and that capacity is what
+        # sizes the buffers and several kernel loop bounds; bench_num_token is
+        # how many tokens each rank actually sends. Passing them equal is the
+        # behaviour this had before and is still the default, but it cannot
+        # distinguish a cost that scales with the declared capacity from one
+        # that scales with the real work.
+        num_token = max_num_token if bench_num_token is None else bench_num_token
+        assert (
+            0 < num_token <= max_num_token
+        ), f"--bench-tokens {num_token} must be in (0, --max-tokens {max_num_token}]"
         op = mori.ops.EpDispatchCombineOp(self.config)
         test_data = self.gen_test_data(
-            max_num_token=max_num_token,
+            max_num_token=num_token,
             use_max_token_num=True,
             only_my_rank=skip_verify,
         )
@@ -1335,13 +1387,24 @@ class EpDispatchCombineTestCase:
             for i in range(1):
                 if self.rank == 0:
                     print(f"WarmUp Round {i} begin")
-                self.run_test_once(op, test_data, error_round, i)
+                self.run_test_once(
+                    op,
+                    test_data,
+                    error_round,
+                    i,
+                    disp_block_num=disp_block_num,
+                    disp_rdma_block_num=disp_rdma_block_num,
+                    disp_warp_per_block=disp_warp_per_block,
+                    comb_block_num=comb_block_num,
+                    comb_rdma_block_num=comb_rdma_block_num,
+                    comb_warp_per_block=comb_warp_per_block,
+                )
             assert (
                 len(error_round) == 0
             ), f"Warmup failed with errors in rounds: {error_round}"
 
         bench_result = self.run_bench_once(
-            max_num_token,
+            num_token,
             op,
             test_data,
             repeat,
@@ -1874,6 +1937,7 @@ def test_dispatch_combine(
     save_tuning_config=None,
     skip_verify=False,
     sentinel_pattern="every_other",
+    bench_num_token=None,
 ):
     world_size = num_node * gpu_per_node
     node_rank = int(os.environ["RANK"])
@@ -1894,8 +1958,19 @@ def test_dispatch_combine(
             max_total_recv_tokens=max_total_recv_tokens,
         )
         test_case.setup()
+        geometry = dict(
+            disp_block_num=disp_block_num,
+            disp_rdma_block_num=disp_rdma_block_num,
+            disp_warp_per_block=disp_warp_per_block,
+            comb_block_num=comb_block_num,
+            comb_rdma_block_num=comb_rdma_block_num,
+            comb_warp_per_block=comb_warp_per_block,
+        )
         if cmd == "test":
-            test_case.test_dispatch_combine()
+            test_case.test_dispatch_combine(
+                rounds=int(os.environ.get("MORI_EP_TEST_ROUNDS") or "500"),
+                **geometry,
+            )
         elif cmd == "test_sentinel":
             test_case.test_sentinel_dispatch_combine(
                 sentinel_pattern=sentinel_pattern,
@@ -1910,6 +1985,7 @@ def test_dispatch_combine(
                 comb_rdma_block_num=comb_rdma_block_num,
                 comb_warp_per_block=comb_warp_per_block,
                 skip_verify=skip_verify,
+                bench_num_token=bench_num_token,
             )
             if global_rank == 0 and bench_stats is not None:
                 _emit_internode_perf(
@@ -1994,6 +2070,18 @@ parser.add_argument(
     type=int,
     default=4096,
     help="Maximum number of input tokens per rank (default: 4096)",
+)
+parser.add_argument(
+    "--bench-tokens",
+    type=int,
+    default=None,
+    help=(
+        "Actual tokens per rank in --cmd bench, with the declared capacity "
+        "left at --max-tokens. Defaults to --max-tokens (T == cap, the "
+        "longstanding behaviour). Needed because several kernel loop bounds "
+        "come from the capacity while the work inside them comes from the "
+        "real token count, and T == cap cannot tell the two apart."
+    ),
 )
 parser.add_argument(
     "--sweep-token-interval",
@@ -2161,11 +2249,11 @@ if __name__ == "__main__":
         args_cli.combine_warp_per_block, args_cli.warp_per_block
     )
 
-    # Only --cmd bench forwards these; test/test_sentinel/sweep build their own
-    # ops and let the op resolve the geometry. Silently ignoring nine flags is
-    # how a "control run" ends up measuring the default config while its author
-    # believes otherwise, so say it.
-    if args_cli.cmd != "bench" and any(
+    # --cmd bench and --cmd test forward these; test_sentinel/stress/profile/
+    # sweep build their own ops and let the op resolve the geometry. Silently
+    # ignoring nine flags is how a "control run" ends up measuring the default
+    # config while its author believes otherwise, so say it.
+    if args_cli.cmd not in ("bench", "test") and any(
         v is not None
         for v in (
             args_cli.block_num,
@@ -2184,6 +2272,13 @@ if __name__ == "__main__":
             f"--cmd {args_cli.cmd}; only --cmd bench applies them. To pin a "
             f"geometry elsewhere, use MORI_EP_LAUNCH_CONFIG_MODE=AUTO with a "
             f"tuning config."
+        )
+
+    if args_cli.bench_tokens is not None and args_cli.cmd != "bench":
+        print(
+            f"Warning: --bench-tokens is ignored when --cmd {args_cli.cmd}; "
+            f"only --cmd bench applies it. --cmd test already varies the token "
+            f"count per round on its own."
         )
 
     world_size = num_node * gpu_per_node
@@ -2211,6 +2306,7 @@ if __name__ == "__main__":
             args_cli.save_tuning_config,
             args_cli.skip_verify,
             args_cli.sentinel_pattern,
+            args_cli.bench_tokens,
         ),
         nprocs=gpu_per_node,
         join=True,
