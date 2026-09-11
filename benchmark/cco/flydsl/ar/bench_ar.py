@@ -79,6 +79,19 @@ from mori.tensor_utils import from_gpu_ptr
 
 from mori.ops.gemm_ar import ArConfig
 
+#: Accepted relL2 for the fp8 wire.
+#:
+#: e4m3 carries 3 mantissa bits, so one rounding at per-row scale costs about
+#: **2.1e-2** on a standard-normal payload -- measured, on this benchmark, at
+#: [4096, 7168] over 8 ranks. That is an order of magnitude more than the
+#: bf16 path (which is exact) and about 5x the 3.7-4.0e-3 the fused wo_b
+#: currently shows end to end in the model, so it is a real cost, not a
+#: rounding detail.
+#:
+#: 4e-2 is a small multiple of that: it passes the quantisation the option asks
+#: for and still catches a structurally wrong kernel, which lands near 0.9.
+FP8_WIRE_TOL = 4e-2
+
 VMM_SLACK = 256 * 1024 * 1024
 
 
@@ -162,6 +175,8 @@ def run(args) -> int:
         # LSA reduces straight out of the peers' input regions; SDMA has to be
         # given somewhere for the copy engine to land each peer's slice.
         recv_slots=world_size if args.backend == "sdma" else 0,
+        scatter_dtype=args.scatter_dtype or args.comm_dtype,
+        gather_dtype=args.gather_dtype or args.comm_dtype,
     )
     cfg.validate()
 
@@ -204,8 +219,11 @@ def run(args) -> int:
                 reduce_blocks=args.reduce_blocks,
             )
 
-            def launch(dc_ptr, win_h, stream=None):
-                for k in ("scatter", "reduce", "gather"):
+            # parts["order"] rather than a literal list: the fp8 wire inserts
+            # a quantise and a dequantise around the gather, and hardcoding the
+            # three-phase order here would skip them and reduce into zeros.
+            def launch(dc_ptr, win_h, stream=None, _seq=None):
+                for k in parts["order"]:
                     parts[k](dc_ptr, win_h, stream=stream)
 
             stage = 2
@@ -237,7 +255,12 @@ def run(args) -> int:
             diff = (out.float() - ref.float()).norm().item()
             denom = ref.float().norm().item()
             rel_l2 = diff / denom if denom else diff
-            validated = rel_l2 == 0.0
+            # The bf16 wire moves the bytes untouched and reduces in a fixed peer
+            # order, so it is *exactly* the reference and anything else is a bug.
+            # The fp8 wire rounds every element that crosses a link, so it gets a
+            # tolerance.
+            tol = FP8_WIRE_TOL if cfg.fp8_wire else 0.0
+            validated = rel_l2 <= tol
             if not validated:
                 # Which owner's slice is wrong localises the bug immediately:
                 # only-mine-right => the all-gather or its barrier; mine-wrong
@@ -249,7 +272,7 @@ def run(args) -> int:
                     lo = r * packs * per_pack
                     hi = cfg.owner_pack_range(r)[1] * per_pack
                     d = out.view(-1)[lo:hi].float() - ref.view(-1)[lo:hi].float()
-                    if d.norm().item() != 0.0:
+                    if d.norm().item() > tol * denom:
                         bad.append(r)
                 print(
                     f"[rank {rank}] VALIDATION FAILED relL2={rel_l2:.3e} "
@@ -314,6 +337,19 @@ def run(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
     p.add_argument("--backend", choices=("lsa", "sdma"), default="lsa")
+    p.add_argument(
+        "--comm-dtype",
+        choices=("bf16", "fp8"),
+        default="bf16",
+        help="what travels on the wire, both legs. fp8 quantises to e4m3 with "
+        "fp32 scales, halving the bytes; the reduce still accumulates in fp32 "
+        "and the output is still bf16. sdma only.",
+    )
+    # The legs are worth setting apart: gather is ~40% of a fused layer and its
+    # payload is final values, while scatter is already hidden behind the GEMM
+    # and its payload is partial sums whose fp8 error compounds across ranks.
+    p.add_argument("--scatter-dtype", choices=("bf16", "fp8"), default=None)
+    p.add_argument("--gather-dtype", choices=("bf16", "fp8"), default=None)
     p.add_argument("-m", type=int, default=4096)
     p.add_argument("-n", type=int, default=7168)
     p.add_argument(

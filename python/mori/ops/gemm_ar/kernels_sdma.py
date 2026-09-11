@@ -85,6 +85,8 @@ from flydsl.expr.typing import Int64
 import mori.cco.device.flydsl as cco
 from mori.cco.device.flydsl import _bindings as raw_cco
 
+from flydsl._mlir import ir
+
 from ._compat import (
     CM_CACHED,
     CM_SC1,
@@ -99,6 +101,90 @@ from ._compat import (
     wave_uniform_i64,
 )
 from .kernels_lsa import _spin_until
+
+#: e4m3's largest finite magnitude. ``scale = amax / FP8_E4M3_MAX`` puts a row's
+#: biggest element exactly at the top of the range.
+FP8_E4M3_MAX = 448.0
+
+#: Wave width, and the width of the amax butterfly below (2**6).
+WAVE = 64
+WAVE_LOG2 = 6
+
+#: Elements one lane converts per chunk: 8 bf16 is one 16B load, and the 8 fp8
+#: it becomes is one 8B store. Both are contiguous across the wave, so both are
+#: perfectly coalesced.
+CHUNK_ELEMS = 8
+
+
+def _raw_value(v):
+    return v.ir_value() if hasattr(v, "ir_value") else v
+
+
+def _bpermute_f32(value, src_lane):
+    """``ds_bpermute`` on an f32, through its i32 bit pattern. Byte-addressed."""
+    i32 = ir.IntegerType.get_signless(32)
+    raw = fx.rocdl.ds_bpermute(
+        i32,
+        _raw_value(fx.Int32(src_lane) * fx.Int32(4)),
+        _raw_value(value.bitcast(fx.Int32)),
+    )
+    return fx.Int32(raw).bitcast(fx.Float32)
+
+
+def _pack8_fp8(v8):
+    """Eight scaled f32 -> eight e4m3 bytes, as a ``vector<2xi32>``.
+
+    ``v_cvt_pk_fp8_f32`` rather than the one-shot ``pk8`` form: the latter is
+    gfx1250, and this has to run on gfx950. Four instructions instead of one,
+    which is nothing in a kernel this memory-bound. Note that
+    ``arith.truncf`` to fp8 is *not* an option -- it has no LLVM lowering and
+    fails in the translation pass, not at trace time.
+
+    ``old`` threads the two halves of a dword through one register: word_sel=0
+    writes the low 16 bits, word_sel=1 the high.
+    """
+    i32 = ir.IntegerType.get_signless(32)
+    poison = fx.Int32(0)
+    words = []
+    for half in range_constexpr(2):
+        acc = _raw_value(poison)
+        for pair in range_constexpr(2):
+            i = half * 4 + pair * 2
+            acc = fx.rocdl.cvt_pk_fp8_f32(
+                i32,
+                _raw_value(v8[i]),
+                _raw_value(v8[i + 1]),
+                acc,
+                pair == 1,
+            )
+        words.append(fx.Int32(acc))
+    return fx.Vector.from_elements(words, fx.Int32)
+
+
+def _unpack8_fp8(v2i32):
+    """Eight e4m3 bytes in a ``vector<2xi32>`` -> eight f32. The inverse."""
+    f32x2 = ir.VectorType.get([2], ir.F32Type.get())
+    out = []
+    for half in range_constexpr(2):
+        word = _raw_value(v2i32[half])
+        for sel in range_constexpr(2):
+            pair = fx.Vector(fx.rocdl.cvt_pk_f32_fp8(f32x2, word, sel == 1))
+            out.append(pair[0])
+            out.append(pair[1])
+    return out
+
+
+def _wave_amax(value, lane):
+    """Max of ``value`` over the wave, as a butterfly -- no LDS, no barrier.
+
+    Every lane ends with the same result, which is what lets each of them scale
+    its own chunk without a second broadcast.
+    """
+    acc = value
+    for k in range_constexpr(WAVE_LOG2):
+        acc = acc.maximumf(_bpermute_f32(acc, lane ^ fx.Int32(1 << k)))
+    return acc
+
 
 #: The push warp. One lane per peer, each on its own queue, so the lanes post in
 #: parallel (cco's ccoSdmaThreadIndependent shape). 64 is the wave size; only the
@@ -153,6 +239,16 @@ def build_sdma_phases(
         )
     if queues < 1:
         raise ValueError(f"queues must be >= 1, got {queues}")
+    if cfg.fp8_scatter:
+        # The regions exist (layout.py sizes them), but nothing writes the
+        # quantised payload yet: on the fused path that is the GEMM epilogue's
+        # job, and on the standalone path it needs its own kernel. Refuse
+        # rather than read an fp8-sized region that still holds bf16, which
+        # faults somewhere unrelated.
+        raise NotImplementedError(
+            "scatter_dtype='fp8' is not wired yet; the gather leg is "
+            "(gather_dtype='fp8'), and it is where the time is"
+        )
 
     threads = cfg.threads
     # The reduce is a *local HBM* kernel, so it must not inherit the grid the LSA
@@ -188,15 +284,28 @@ def build_sdma_phases(
         self_arr = fx.Int64(w.lsa_ptr(rank, arr_off))
         _spin_until(signal_ptr(self_arr + fx.Int64(tid) * fx.Int64(4)), flag)
 
-    def _push_kernel(arr_off, dst_off_of_peer=None, src_off_expr=None):
+    def _push_kernel(
+        arr_off,
+        dst_off_of_peer=None,
+        src_off_expr=None,
+        nbytes=None,
+        extra=None,
+    ):
         """A push phase: one put per peer, drain, then the cross-rank barrier.
 
         ``dst_off_of_peer`` is a constant byte offset *in the destination's*
         window; ``src_off_expr(tid)`` builds the offset in mine, which may depend
         on which peer the lane is serving. Passing neither emits a drain-only
         kernel -- the pushes are assumed already issued elsewhere.
+
+        ``extra`` is an optional second ``(dst_off, src_off_expr, nbytes)`` put on
+        the same queue, for the fp8 wire's scales. It rides the same queue rather
+        than its own so it cannot overtake the payload, and it is ~8 KiB against
+        14 MiB -- about 2us of packet cost, against the ~210us the halved payload
+        saves.
         """
         pushes = dst_off_of_peer is not None
+        put_bytes = slice_bytes if nbytes is None else nbytes
 
         @flyc.kernel(known_block_size=[PUSH_THREADS, 1, 1])
         def push(dev_comm: Int64, win: Int64):
@@ -217,11 +326,23 @@ def build_sdma_phases(
                             fx.Int64(dst_off_of_peer),
                             win,
                             src_off_expr(tid),
-                            fx.Int64(slice_bytes),
+                            fx.Int64(put_bytes),
                             tid % fx.Int32(queues),
                             coop=cco.CoopScope.THREAD,
                             signal=signal,
                         )
+                        if const_expr(extra is not None):
+                            sdma.put(
+                                tid,
+                                win,
+                                fx.Int64(extra[0]),
+                                win,
+                                extra[1](tid),
+                                fx.Int64(extra[2]),
+                                tid % fx.Int32(queues),
+                                coop=cco.CoopScope.THREAD,
+                                signal=signal,
+                            )
                     sdma.quiet_queue(tid, tid % fx.Int32(queues))
                 # Release before publishing arrival. The bytes were moved by the
                 # copy engine rather than by this CU, so there is nothing of ours
@@ -309,12 +430,187 @@ def build_sdma_phases(
             )
             buffer_store(packed, out, i32_off, cache_modifier=CM_CACHED)
 
-    # Gather. My reduced slice goes to the same offset in every peer's output.
-    gather = _push_kernel(
-        end_off,
-        dst_off_of_peer=out_off + my_slice_off,
-        src_off_expr=lambda tid: fx.Int64(out_off + my_slice_off),
-    )
+    # --- fp8 wire: the two conversions that bracket the gather ---------------
+    #
+    # quantise runs after the reduce on my own slice; dequantise runs after the
+    # gather on everybody else's. My own rows never travel, so they stay the
+    # exact bf16 the reduce produced -- only the 7/8 that cross a link are
+    # rounded, and each of them exactly once.
+
+    QUANT_WAVES = 4  # waves per block; one wave owns one row
+    QUANT_THREADS = QUANT_WAVES * WAVE
+
+    if cfg.fp8_gather:
+        if cfg.n % (CHUNK_ELEMS * WAVE):
+            raise ValueError(
+                f"the fp8 wire gives one wave one row and converts "
+                f"{CHUNK_ELEMS} elements per lane per chunk, so n={cfg.n} must "
+                f"be a multiple of {CHUNK_ELEMS * WAVE}"
+            )
+        chunks_per_row = cfg.n // (CHUNK_ELEMS * WAVE)
+        slice_rows = cfg.slice_rows
+        quant_blocks = max(1, min(1024, (slice_rows + QUANT_WAVES - 1) // QUANT_WAVES))
+
+        def _row_addr(w, byte_off):
+            return create_buffer_resource_from_addr(
+                wave_uniform_i64(w.lsa_ptr(rank, byte_off))
+            )
+
+        @flyc.kernel(known_block_size=[QUANT_THREADS, 1, 1])
+        def quantize_gather(dev_comm: Int64, win: Int64):
+            """My reduced slice, bf16 -> fp8 + one fp32 scale per row.
+
+            Reads `output + my_slice` (what the reduce just wrote) and writes
+            `gout + my_slice` plus `gout_scale`. Two passes over the row rather than
+            holding it in registers: 112 fp32 per lane would not fit, and the row is
+            14 KiB and still in L2 from the reduce.
+            """
+            tid = fx.thread_idx.x
+            bid = fx.block_idx.x
+            w = cco.Window(win)
+            lane = tid % fx.Int32(WAVE)
+            wave = tid // fx.Int32(WAVE)
+
+            src = _row_addr(w, out_off + my_slice_off)
+            dst = _row_addr(w, cfg.gout_off + rank * cfg.slice_rows * cfg.n)
+            sca = _row_addr(w, cfg.gout_scale_slice_off(rank))
+
+            for row in range(
+                bid * QUANT_WAVES + wave, slice_rows, quant_blocks * QUANT_WAVES
+            ):
+                # pass 1: this row's amax, over the whole wave
+                local = fx.Float32(0.0)
+                for c in range_constexpr(chunks_per_row):
+                    i32_off = (row * cfg.n + (c * WAVE) * CHUNK_ELEMS) // 2 + lane * 4
+                    v = (
+                        fx.Vector(
+                            buffer_load(
+                                src,
+                                i32_off,
+                                vec_width=4,
+                                dtype=i32_type(),
+                                cache_modifier=CM_CACHED,
+                            )
+                        )
+                        .bitcast(fx.BFloat16)
+                        .to(fx.Float32)
+                    )
+                    for e in range_constexpr(CHUNK_ELEMS):
+                        a = v[e]
+                        local = local.maximumf((-a).maximumf(a))
+                amax = _wave_amax(local, lane)
+
+                # A row of exact zeros would divide by zero; 1.0 keeps it exact.
+                is_zero = amax == fx.Float32(0.0)
+                scale = is_zero.select(
+                    fx.Float32(1.0), amax * fx.Float32(1.0 / FP8_E4M3_MAX)
+                )
+                inv = is_zero.select(fx.Float32(1.0), fx.Float32(FP8_E4M3_MAX) / amax)
+                if lane == fx.Int32(0):
+                    buffer_store(scale, sca, row, cache_modifier=CM_CACHED)
+
+                # pass 2: scale and narrow
+                for c in range_constexpr(chunks_per_row):
+                    base = row * cfg.n + (c * WAVE) * CHUNK_ELEMS
+                    v = (
+                        fx.Vector(
+                            buffer_load(
+                                src,
+                                base // 2 + lane * 4,
+                                vec_width=4,
+                                dtype=i32_type(),
+                                cache_modifier=CM_CACHED,
+                            )
+                        )
+                        .bitcast(fx.BFloat16)
+                        .to(fx.Float32)
+                    )
+                    scaled = v * inv
+                    q = _pack8_fp8([scaled[e] for e in range_constexpr(CHUNK_ELEMS)])
+                    buffer_store(
+                        q,
+                        dst,
+                        (base + lane * CHUNK_ELEMS) // 4,
+                        cache_modifier=CM_CACHED,
+                    )
+
+        @flyc.kernel(known_block_size=[QUANT_THREADS, 1, 1])
+        def dequantize_gather(dev_comm: Int64, win: Int64):
+            """Every peer's gathered slice, fp8 * scale -> bf16 into `output`.
+
+            Skips my own slice: it was never quantised and is already in `output`.
+            """
+            tid = fx.thread_idx.x
+            bid = fx.block_idx.x
+            w = cco.Window(win)
+            lane = tid % fx.Int32(WAVE)
+            wave = tid // fx.Int32(WAVE)
+
+            for j in range_constexpr(1, ws):
+                peer = (rank + j) % ws
+                src = _row_addr(w, cfg.gout_off + peer * cfg.slice_rows * cfg.n)
+                sca = _row_addr(w, cfg.gout_scale_slice_off(peer))
+                dst = _row_addr(w, out_off + peer * cfg.slice_rows * cfg.n * 2)
+
+                for row in range(
+                    bid * QUANT_WAVES + wave, slice_rows, quant_blocks * QUANT_WAVES
+                ):
+                    # Written by a peer's copy engine. SC1 for the same reason the
+                    # reduce uses it on `recv`: our L2 is never invalidated by a
+                    # remote store, so a cached load can return stale bytes.
+                    scale = fx.Float32(
+                        buffer_load(
+                            sca,
+                            row,
+                            vec_width=1,
+                            dtype=fx.Float32,
+                            cache_modifier=CM_SC1,
+                        )
+                    )
+                    for c in range_constexpr(chunks_per_row):
+                        base = row * cfg.n + (c * WAVE) * CHUNK_ELEMS
+                        packed = fx.Vector(
+                            buffer_load(
+                                src,
+                                (base + lane * CHUNK_ELEMS) // 4,
+                                vec_width=2,
+                                dtype=i32_type(),
+                                cache_modifier=CM_SC1,
+                            )
+                        )
+                        wide = [e * scale for e in _unpack8_fp8(packed)]
+                        v = fx.Vector.from_elements(wide, fx.Float32)
+                        buffer_store(
+                            v.to(fx.BFloat16).bitcast(fx.Int32),
+                            dst,
+                            base // 2 + lane * 4,
+                            cache_modifier=CM_CACHED,
+                        )
+
+    # Gather. My reduced slice goes to the same offset in every peer's window.
+    # On the bf16 wire that offset is in `output` and there is nothing to stage;
+    # on the fp8 wire it is `gout`, which `quantize_gather` filled, and the
+    # scales ride along on the same queue.
+    if cfg.fp8_gather:
+        my_gout_off = cfg.gout_off + rank * cfg.slice_rows * cfg.n
+        my_gscale_off = cfg.gout_scale_slice_off(rank)
+        gather = _push_kernel(
+            end_off,
+            dst_off_of_peer=my_gout_off,
+            src_off_expr=lambda tid: fx.Int64(my_gout_off),
+            nbytes=cfg.gather_slice_bytes,
+            extra=(
+                my_gscale_off,
+                lambda tid: fx.Int64(my_gscale_off),
+                cfg.gather_scale_slice_bytes,
+            ),
+        )
+    else:
+        gather = _push_kernel(
+            end_off,
+            dst_off_of_peer=out_off + my_slice_off,
+            src_off_expr=lambda tid: fx.Int64(out_off + my_slice_off),
+        )
 
     # Drain-only twin of `scatter`: same barrier, no puts. The fused GEMM issues
     # the puts from its epilogue, but still has to drain the queues and tell the
@@ -330,12 +626,27 @@ def build_sdma_phases(
 
         return go
 
-    return {
+    phases = {
         "scatter": _phase(scatter, 1, PUSH_THREADS),
         "drain": _phase(drain, 1, PUSH_THREADS),
         "reduce": _phase(sdma_reduce, red_blocks, threads),
         "gather": _phase(gather, 1, PUSH_THREADS),
     }
+    if cfg.fp8_gather:
+        # Bracket the gather. `quantize` has to follow the reduce and precede the
+        # push; `dequantize` has to follow the barrier the push ends with.
+        phases["quantize"] = _phase(quantize_gather, quant_blocks, QUANT_THREADS)
+        phases["dequantize"] = _phase(dequantize_gather, quant_blocks, QUANT_THREADS)
+    # The order a caller must run them in. Carried with the phases rather than
+    # left to each caller to hardcode: the fp8 wire adds two, and a caller that
+    # kept its own ("scatter", "reduce", "gather") list would silently skip them
+    # and all-reduce into zeros.
+    phases["order"] = (
+        ("scatter", "reduce", "quantize", "gather", "dequantize")
+        if cfg.fp8_gather
+        else ("scatter", "reduce", "gather")
+    )
+    return phases
 
 
 def build_sdma_ar(cfg, rank: int, *, queues: int = 8, signal: bool = False):
@@ -346,12 +657,14 @@ def build_sdma_ar(cfg, rank: int, *, queues: int = 8, signal: bool = False):
     payload to every peer.
     """
     parts = build_sdma_phases(cfg, rank, queues=queues, signal=signal)
-    scatter, reduce_, gather = parts["scatter"], parts["reduce"], parts["gather"]
+    # On the fp8 wire this is five kernels, not three: the reduced slice has to
+    # be narrowed before the push and widened after it, and each needs its own
+    # device-wide ordering point for the same reason the original three do.
+    seq = [parts[k] for k in parts["order"]]
 
     def run(dev_comm, win, stream=fx.Stream(None)):
-        scatter(dev_comm, win, stream=stream)
-        reduce_(dev_comm, win, stream=stream)
-        gather(dev_comm, win, stream=stream)
+        for phase in seq:
+            phase(dev_comm, win, stream=stream)
 
     return run, 2
 

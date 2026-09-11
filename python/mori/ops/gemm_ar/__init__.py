@@ -29,7 +29,7 @@
 # touching the op or the kernels raises.
 import importlib
 
-from .layout import ArConfig, MAX_WORLD, select_stage
+from .layout import ArConfig, MAX_WORLD, ar_config, select_stage
 from ._shuffle import preshuffle_b
 
 _LAZY = {
@@ -49,6 +49,7 @@ _LAZY = {
 
 __all__ = [
     "ArConfig",
+    "ar_config",
     "GemmAllReduceOp",
     "MAX_WORLD",
     "build_lsa_ar",

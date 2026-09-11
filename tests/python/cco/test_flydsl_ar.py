@@ -191,7 +191,7 @@ def test_validate_rejects_unvectorizable_payload():
 # --------------------------------------------------------------------------
 
 
-def _run_bench(world_size, backend, m, n, extra_env=None):
+def _run_bench(world_size, backend, m, n, extra_env=None, extra=()):
     env = os.environ.copy()
     env.setdefault("MORI_SOCKET_IFNAME", "lo")
     env.setdefault("MORI_ENABLE_SDMA", "1")
@@ -214,6 +214,7 @@ def _run_bench(world_size, backend, m, n, extra_env=None):
         "1",
         "--iters",
         "3",
+        *extra,
     ]
     result = subprocess.run(
         command, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=600
@@ -238,6 +239,36 @@ def test_flydsl_ar_gpu_smoke(backend, world_size, m, n):
     assert record["validated"] is True
     assert record["max_rank_time_ms"] > 0
     assert record["backend"] == backend
+
+
+@pytest.mark.parametrize("world_size,m,n", [(8, 4096, 7168)])
+def test_fp8_gather_is_correct_and_stays_at_the_e4m3_floor(world_size, m, n):
+    """The fp8 gather leg, against the same host reference the bf16 wire uses.
+
+    Two assertions, and the upper one matters as much as the lower. Below 4e-2
+    says the kernel is right: a structurally broken quantise/gather/dequantise
+    lands near 0.9 (that is sqrt(7/8) -- every slice that travelled arriving as
+    zeros). *Above* 5e-3 says fp8 is actually being used, so a silent fallback
+    to the bf16 path cannot pass this as a success.
+
+    The floor itself is e4m3's 3-bit mantissa and not the scale granularity:
+    per-row costs 2.65e-2 on a normal payload and per-32 costs 2.40e-2, 9%
+    better for 200x the scale bytes. There is no granularity that avoids it.
+    """
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"requires {world_size} GPUs")
+    record = _run_bench(
+        world_size, "sdma", m, n, {"AR_EXTRA": ""}, extra=["--gather-dtype", "fp8"]
+    )
+    assert record["validated"] is True
+    assert record["rel_l2"] < 4e-2, (
+        f"relL2 {record['rel_l2']:.3e}: the fp8 gather is structurally wrong, "
+        f"not merely quantised"
+    )
+    assert record["rel_l2"] > 5e-3, (
+        f"relL2 {record['rel_l2']:.3e} is at the bf16 path's exactness -- the "
+        f"fp8 wire cannot have been taken"
+    )
 
 
 def test_flydsl_ar_matches_aiter_bitwise():

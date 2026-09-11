@@ -88,7 +88,7 @@ def test_bf16_wire_layout_is_unchanged_by_the_fp8_option():
     """
     c = layout.ArConfig(world_size=8, m=16384, n=7168, recv_slots=8, counter_chunks=8)
     c.validate()
-    assert c.comm_dtype == "bf16"
+    assert c.scatter_dtype == "bf16" and c.gather_dtype == "bf16"
     # 700.0056 MiB -- the size the running server logs, before any of the
     # fp8 regions existed.
     assert c.window_bytes == 734009088
@@ -97,11 +97,12 @@ def test_bf16_wire_layout_is_unchanged_by_the_fp8_option():
     assert c.scatter_scale_bytes == 0
     assert c.gather_scale_bytes == 0
     assert c.recv_scale_bytes == 0
-    assert c.wire_slice_bytes == c.slice_bytes
+    assert c.scatter_slice_bytes == c.slice_bytes
+    assert c.gather_slice_bytes == c.slice_bytes
 
 
 def test_fp8_wire_halves_the_payload_and_every_region_is_disjoint():
-    c = layout.ArConfig(
+    c = layout.ar_config(
         world_size=8,
         m=16384,
         n=7168,
@@ -110,13 +111,14 @@ def test_fp8_wire_halves_the_payload_and_every_region_is_disjoint():
         comm_dtype="fp8",
     )
     c.validate()
-    assert c.wire_slice_bytes * 2 == c.slice_bytes
-    assert c.wire_nbytes * 2 == c.nbytes
+    assert c.scatter_slice_bytes * 2 == c.slice_bytes
+    assert c.gather_slice_bytes * 2 == c.slice_bytes
+    assert c.scatter_nbytes * 2 == c.nbytes
     # output stays bf16: it is the consumer's tensor, not a wire format.
     assert c.nbytes == c.m * c.n * 2
 
     regions = [
-        ("input", c.input_off, c.wire_nbytes),
+        ("input", c.input_off, c.scatter_nbytes),
         ("input_scale", c.input_scale_off, c.scatter_scale_bytes),
         ("output", c.output_off, c.nbytes),
         ("gout", c.gout_off, c.gout_bytes),
@@ -133,7 +135,7 @@ def test_fp8_wire_halves_the_payload_and_every_region_is_disjoint():
 
 
 def test_fp8_scale_slots_are_peer_major_and_stay_inside_their_region():
-    c = layout.ArConfig(
+    c = layout.ar_config(
         world_size=8,
         m=16384,
         n=7168,
@@ -156,6 +158,33 @@ def test_fp8_scale_slots_are_peer_major_and_stay_inside_their_region():
         )
 
 
+def test_the_two_wire_legs_are_independent():
+    """Each leg sizes only its own regions.
+
+    They are separate because the gather leg is where nearly all the time is and
+    where fp8 costs one rounding, while the scatter leg is already hidden behind
+    the GEMM and its fp8 error compounds across ranks -- so being able to take
+    one without the other is the point, not a convenience.
+    """
+    gather_only = layout.ArConfig(
+        world_size=8, m=4096, n=7168, recv_slots=8, gather_dtype="fp8"
+    )
+    gather_only.validate()
+    assert gather_only.scatter_slice_bytes == gather_only.slice_bytes  # untouched
+    assert gather_only.gather_slice_bytes * 2 == gather_only.slice_bytes
+    assert gather_only.scatter_scale_bytes == 0
+    assert gather_only.gather_scale_bytes > 0
+
+    scatter_only = layout.ArConfig(
+        world_size=8, m=4096, n=7168, recv_slots=8, scatter_dtype="fp8"
+    )
+    scatter_only.validate()
+    assert scatter_only.scatter_slice_bytes * 2 == scatter_only.slice_bytes
+    assert scatter_only.gather_slice_bytes == scatter_only.slice_bytes
+    assert scatter_only.gather_scale_bytes == 0
+    assert scatter_only.gout_off == scatter_only.output_off  # nothing to stage
+
+
 def test_scatter_scale_granularity_is_finer_than_per_row():
     """The substitution that makes the scatter leg implementable at all.
 
@@ -165,7 +194,7 @@ def test_scatter_scale_granularity_is_finer_than_per_row():
     rather than 1 -- finer, so it cannot be less accurate than what was asked
     for.
     """
-    c = layout.ArConfig(
+    c = layout.ar_config(
         world_size=8,
         m=16384,
         n=7168,
@@ -176,7 +205,7 @@ def test_scatter_scale_granularity_is_finer_than_per_row():
     assert c.scatter_tiles_per_row == 28
     assert c.scatter_scale_bytes >= c.gather_scale_bytes * 28
     # and it is cheap: scales are a few percent of the payload they describe
-    assert c.scatter_scale_bytes < c.wire_nbytes * 0.02
+    assert c.scatter_scale_bytes < c.scatter_nbytes * 0.02
 
 
 # --------------------------------------------------------------------------

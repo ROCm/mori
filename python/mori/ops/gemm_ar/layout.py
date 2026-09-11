@@ -94,6 +94,22 @@ def select_stage(world_size: int, nbytes: int) -> int:
     return 2
 
 
+def ar_config(*, comm_dtype: str | None = None, **kwargs) -> "ArConfig":
+    """``ArConfig`` with ``comm_dtype`` as a shorthand for both wire legs.
+
+    The two legs are separate fields because they are separately useful -- the
+    gather leg is where nearly all of the time is and where fp8 is one rounding,
+    while the scatter leg is mostly hidden behind the GEMM already and its fp8
+    error compounds across ranks. Setting both at once is still the common case.
+    """
+    if comm_dtype is not None:
+        if kwargs.get("scatter_dtype") or kwargs.get("gather_dtype"):
+            raise ValueError("pass comm_dtype or the per-leg dtypes, not both")
+        kwargs["scatter_dtype"] = comm_dtype
+        kwargs["gather_dtype"] = comm_dtype
+    return ArConfig(**kwargs)
+
+
 @dataclass(frozen=True)
 class ArConfig:
     """Shape + world size -> every offset and count the kernels need.
@@ -123,12 +139,18 @@ class ArConfig:
     #: leave while the GEMM is still computing its later ones. Only the fused
     #: path reads this; the standalone SDMA all-reduce always pushes whole slices.
     counter_chunks: int = 1
-    #: What travels on the wire. ``"bf16"`` sends the payload as-is;
-    #: ``"fp8"`` quantises both transfer legs to e4m3 with fp32 scales, halving
-    #: the bytes. The reduce still accumulates in fp32 and ``output`` is still
-    #: bf16 -- only the wire changes. See ``scale_*`` below for the granularity,
-    #: which differs per leg because of where each leg's data lives.
-    comm_dtype: str = "bf16"
+    #: What travels on the wire, per leg. ``"bf16"`` sends the payload as-is;
+    #: ``"fp8"`` quantises to e4m3 with fp32 scales, halving the bytes. The
+    #: reduce always accumulates in fp32 and ``output`` is always bf16 -- only
+    #: the wire changes.
+    #:
+    #: The legs are separate because they are not equivalent. ``gather`` carries
+    #: *finished* values, so fp8 is one rounding; ``scatter`` carries partial
+    #: sums that are then added across every rank, so its error compounds. They
+    #: also quantise in different places, hence the two scale granularities
+    #: below. ``ArConfig(comm_dtype=...)`` sets both at once.
+    scatter_dtype: str = "bf16"
+    gather_dtype: str = "bf16"
     #: N-tile the scatter leg's scales are taken over. Must match the fused
     #: GEMM's ``BLOCK_N``: a block owns ``BLOCK_M x BLOCK_N`` of C, so this is
     #: the widest span of a row it can take an amax over.
@@ -171,22 +193,43 @@ class ArConfig:
     # is the consumer's tensor, and the reduce still accumulates in fp32.
 
     @property
+    def fp8_scatter(self) -> bool:
+        return self.scatter_dtype == "fp8"
+
+    @property
+    def fp8_gather(self) -> bool:
+        return self.gather_dtype == "fp8"
+
+    @property
     def fp8_wire(self) -> bool:
-        return self.comm_dtype == "fp8"
+        """Either leg quantised. Use the per-leg flags for sizing."""
+        return self.fp8_scatter or self.fp8_gather
 
     @property
-    def wire_elem_bytes(self) -> int:
-        """Bytes per element *on the wire*, as opposed to in ``output``."""
-        return 1 if self.fp8_wire else self.elem_bytes
+    def scatter_elem_bytes(self) -> int:
+        return 1 if self.fp8_scatter else self.elem_bytes
 
     @property
-    def wire_nbytes(self) -> int:
-        return self.num_elems * self.wire_elem_bytes
+    def gather_elem_bytes(self) -> int:
+        return 1 if self.fp8_gather else self.elem_bytes
 
     @property
-    def wire_slice_bytes(self) -> int:
-        """One peer slice on the wire. The unit of a single SDMA put."""
-        return self.slice_rows * self.n * self.wire_elem_bytes
+    def scatter_nbytes(self) -> int:
+        """``input``: the GEMM's C, in the scatter leg's dtype."""
+        return self.num_elems * self.scatter_elem_bytes
+
+    @property
+    def gather_nbytes(self) -> int:
+        return self.num_elems * self.gather_elem_bytes
+
+    @property
+    def scatter_slice_bytes(self) -> int:
+        """One peer slice on the scatter leg. The unit of a single SDMA put."""
+        return self.slice_rows * self.n * self.scatter_elem_bytes
+
+    @property
+    def gather_slice_bytes(self) -> int:
+        return self.slice_rows * self.n * self.gather_elem_bytes
 
     @property
     def slice_rows(self) -> int:
@@ -221,27 +264,27 @@ class ArConfig:
     @property
     def scatter_scale_bytes(self) -> int:
         """fp32 scales for the whole ``[m, n]`` payload, scatter granularity."""
-        if not self.fp8_wire:
+        if not self.fp8_scatter:
             return 0
         return _align_up(self.m * self.scatter_tiles_per_row * 4, SIGNAL_ALIGN)
 
     @property
     def scatter_scale_slice_bytes(self) -> int:
         """The scales that travel with one peer slice."""
-        if not self.fp8_wire:
+        if not self.fp8_scatter:
             return 0
         return self.slice_rows * self.scatter_tiles_per_row * 4
 
     @property
     def gather_scale_bytes(self) -> int:
         """fp32 scales for the whole payload, one per row."""
-        if not self.fp8_wire:
+        if not self.fp8_gather:
             return 0
         return _align_up(self.m * 4, SIGNAL_ALIGN)
 
     @property
     def gather_scale_slice_bytes(self) -> int:
-        if not self.fp8_wire:
+        if not self.fp8_gather:
             return 0
         return self.slice_rows * 4
 
@@ -369,7 +412,7 @@ class ArConfig:
     @property
     def input_scale_off(self) -> int:
         """Scatter-leg scales for ``input``. Zero-sized on the bf16 wire."""
-        return _align_up(self.input_off + self.wire_nbytes, SIGNAL_ALIGN)
+        return _align_up(self.input_off + self.scatter_nbytes, SIGNAL_ALIGN)
 
     def input_scale_slice_off(self, peer: int) -> int:
         """Where peer ``peer``'s row band's scales start within ``input_scale``."""
@@ -396,11 +439,11 @@ class ArConfig:
         costs nothing. On the fp8 wire it is its own region, because ``output``
         has to stay bf16 for the consumer while the wire carries fp8.
         """
-        return self.output_end if self.fp8_wire else self.output_off
+        return self.output_end if self.fp8_gather else self.output_off
 
     @property
     def gout_bytes(self) -> int:
-        return self.wire_nbytes if self.fp8_wire else 0
+        return self.gather_nbytes if self.fp8_gather else 0
 
     @property
     def gout_scale_off(self) -> int:
@@ -427,7 +470,7 @@ class ArConfig:
 
     @property
     def recv_bytes(self) -> int:
-        return self.recv_slots * self.wire_slice_bytes
+        return self.recv_slots * self.scatter_slice_bytes
 
     def recv_slot_off(self, peer: int) -> int:
         """Where peer ``peer``'s contribution to *my* slice lands."""
@@ -437,7 +480,7 @@ class ArConfig:
             raise IndexError(
                 f"peer {peer} has no landing slot; recv_slots={self.recv_slots}"
             )
-        return self.recv_off + peer * self.wire_slice_bytes
+        return self.recv_off + peer * self.scatter_slice_bytes
 
     @property
     def recv_scale_off(self) -> int:
