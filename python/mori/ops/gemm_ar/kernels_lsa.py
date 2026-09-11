@@ -60,8 +60,6 @@ to a constant, as ``examples/cco/python/07_flydsl_sdma`` does.
 
 from __future__ import annotations
 
-import os
-import sys
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -74,8 +72,7 @@ from flydsl.expr.typing import Int64
 import mori.cco.device.flydsl as cco
 from mori.cco.device.flydsl import _bindings as raw_cco
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _compat import (  # noqa: E402
+from ._compat import (
     CM_CACHED,
     buffer_load,
     buffer_store,
@@ -88,7 +85,7 @@ from _compat import (  # noqa: E402
     wave_uniform_i64,
     signal_store_u32,
 )
-from layout import MAX_WORLD  # noqa: E402
+from .layout import MAX_WORLD
 
 
 def _spin_until(rsrc, flag):

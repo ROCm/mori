@@ -75,8 +75,6 @@ in step 3.
 
 from __future__ import annotations
 
-import os
-import sys
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -87,8 +85,7 @@ from flydsl.expr.typing import Int64
 import mori.cco.device.flydsl as cco
 from mori.cco.device.flydsl import _bindings as raw_cco
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _compat import (  # noqa: E402
+from ._compat import (
     CM_CACHED,
     CM_SC1,
     buffer_load,
@@ -101,8 +98,8 @@ from _compat import (  # noqa: E402
     signal_store_u32,
     wave_uniform_i64,
 )
-from kernels_lsa import _spin_until  # noqa: E402
-from layout import MAX_WORLD  # noqa: E402
+from .kernels_lsa import _spin_until
+from .layout import MAX_WORLD
 
 #: The push warp. One lane per peer, each on its own queue, so the lanes post in
 #: parallel (cco's ccoSdmaThreadIndependent shape). 64 is the wave size; only the
