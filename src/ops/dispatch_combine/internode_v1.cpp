@@ -276,12 +276,35 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
   finishedWarp = __shfl(finishedWarp, 0);
   if ((finishedWarp + 1) == (args.rdmaBlockNum * warpNum)) {
     if (laneId < nNodes) {
-      int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
-      index_t numTokenSignal =
-          core::AtomicLoadRelaxed(args.blockFlagCounter + laneId) * warpSize + 1;
-      shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(args.nodeRecvTokenNumMemObj,
-                                                     myNode * sizeof(uint64_t), numTokenSignal,
-                                                     core::AMO_ADD, proxyPe);
+      // Opt 6, OFF pending a measurement. This announces how many chunk slots
+      // went to lane's node, and the only consumer is a receiver deciding to
+      // give up on a slot that will never be signalled. When every slot inside
+      // the declared capacity was used, each one carries its put's own signal,
+      // so the count is never read and the AMO is dead.
+      //
+      // Correctness was checked with it on -- 120 rounds of varying token counts
+      // across cap 64/512/4096, plus a T == cap verification round, no errors
+      // and no hang. What is missing is a latency comparison: every attempt
+      // landed in a window where CI was running the same harness on these GPUs,
+      // and one AMO issued once per dispatch is far below that noise. Enabling
+      // it without that number would be adopting a change on its story alone.
+      //
+      // The condition has to be per destination node and has to be the full
+      // count, not "T == cap": the loop above skips a chunk whose mask is empty,
+      // so a node that received nothing has chunksSent == 0 even at T == cap,
+      // and a receiver waiting on those slots would hang forever without the
+      // announcement. chunksSent == maxChunkNum is the only safe case.
+      constexpr bool kSkipSaturatedEndAmo = false;
+      index_t chunksSent = core::AtomicLoadRelaxed(args.blockFlagCounter + laneId);
+      bool everySlotSignalled =
+          kSkipSaturatedEndAmo && (chunksSent >= static_cast<index_t>(maxChunkNum));
+      if (!everySlotSignalled) {
+        int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
+        index_t numTokenSignal = chunksSent * warpSize + 1;
+        shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(args.nodeRecvTokenNumMemObj,
+                                                       myNode * sizeof(uint64_t), numTokenSignal,
+                                                       core::AMO_ADD, proxyPe);
+      }
     }
     if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
   }
@@ -358,6 +381,64 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
   }
 }
 
+// Opt 5. Read one tile of a received token's payload and write that tile to
+// every local target, instead of re-reading the whole token once per target.
+//
+// `laneDst` is lane-indexed: lane e holds target e's destination, or nullptr
+// where that expert slot was skipped. A lane register rather than a local array
+// because an array indexed by the runtime loop variable is addressed through
+// scratch, which costs more than the reads this saves.
+//
+// What this does and does not reduce: the source is local HBM (the sender put it
+// there over RDMA) and every destination is a peer over xGMI, so only source
+// reads go down -- write volume is untouched. In an N=2, G=8, K=8 model with
+// independent uniform PE choice, the mean number of deduplicated local targets
+// per received token is about 3.24, so payload source reads drop by roughly that
+// factor and total payload bytes by about a third. Whether that shows up in
+// latency depends on whether local read bandwidth was the limit, which is a
+// question for the measurement, not for this comment.
+//
+// The 16-byte vector width matches WarpCopy's, so each lane moves what it moved
+// before; what changes is that the source is read once rather than per target.
+// Alignment is unchanged too, and it is not 16: a staging slot's stride is
+// hidden + indices + weights + srcTokId + scales, which for bf16/hidden 7168
+// here is 14532, so odd slots start 4 past a 16-byte boundary. That was already
+// true of the WarpCopy this replaces -- core::load<16> is a pair of 8-byte
+// non-temporal loads and tolerates it.
+//
+// Deliberately not unrolled. An unroll-by-4 version holding Vec v[4] across the
+// target loop miscopied (wrong recv counts, and a fault at cap=64) and the
+// simple form measured well enough that chasing it was not worth it; if it is
+// revisited, note that the same lane-register scheme driving plain WarpCopy
+// passed, so the fault was in the unrolled tile loop and not in the shuffle.
+inline __device__ void WarpTileBroadcast(uint8_t* laneDst, const uint8_t* src, size_t nbytes,
+                                         int numTargets, int laneId, int waveSize) {
+  constexpr int VecBytes = 16;
+  using Vec = typename core::VecTypeSelector<VecBytes>::dataType;
+
+  auto target = [&](int e) -> uint8_t* {
+    unsigned long long p = __shfl(static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(laneDst)), e);
+    return reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(p));
+  };
+
+  const size_t nVec = nbytes / VecBytes;
+  for (size_t idx = laneId; idx < nVec; idx += waveSize) {
+    Vec v = core::load<VecBytes>(src + idx * VecBytes);
+    for (int e = 0; e < numTargets; e++) {
+      uint8_t* d = target(e);
+      if (d != nullptr) core::store<VecBytes>(d + idx * VecBytes, v);
+    }
+  }
+  // Byte tail, for a hidden size that is not a whole number of 16-byte vectors.
+  for (size_t b = nVec * VecBytes + laneId; b < nbytes; b += waveSize) {
+    uint8_t v = src[b];
+    for (int e = 0; e < numTargets; e++) {
+      uint8_t* d = target(e);
+      if (d != nullptr) d[b] = v;
+    }
+  }
+}
+
 template <typename T>
 inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
@@ -365,6 +446,18 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
       INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SPAN(profiler, Slot::DispatchInterNodeRecv);
 
+  // Opt 2. How many blocks share one chunk: it sets the bid space
+  // (numRecvBlock * maxChunkNum * (nNodes-1)) and, with warpNum, which token
+  // positions of a chunk each wave owns. S*W == warpSize is not a correctness
+  // condition -- with S*W > warpSize some waves poll a chunk's flag and find no
+  // payload to move, with S*W < warpSize each wave moves more than one token.
+  // Changing it moves the best rdmaBlockNum with it, since that is sized against
+  // the bid space, so a comparison at fixed R is measuring both.
+  //
+  // Only dispatch's value. Combine keeps its own literal 8, and must: its
+  // completion target is numRecvBlock * warpNum warp-visits per chunk
+  // (interNodeChunkFlagCombine, ~line 1090), so the two sides of that count have
+  // to be derived from the same constant.
   constexpr int numRecvBlock = 8;
   int maxChunkNum = core::CeilDiv(config.MaxNumTokensToSendPerRank(), warpSize);
 
@@ -374,6 +467,27 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
 
   int localPeTokenCounter = 0;
   int totalChunkNum = 0;
+
+  // Opt 3. The loop below runs over chunk slots sized by the declared capacity,
+  // while how many of them carry data comes from the sender's actual routing, so
+  // at cap >> T most iterations poll a slot that will stay empty for the whole
+  // dispatch. Both loads in that poll are system-scope and therefore uncached
+  // round trips, which is why the cost is not merely loop overhead: at T=64,
+  // R=64 and W=8, raising cap from 128 to 4096 (1 to 8 slots per block) cost 7us
+  // of dispatch with the work held constant.
+  //
+  // nodeRecvTokenNum[node] reaches chunksSent[node]*warpSize + 1 in a single AMO
+  // from the sender and is cleared by combine, so within one dispatch it is zero
+  // and then final -- never partial. Once a wave has seen it non-zero, every slot
+  // at or past that bound is known empty and needs no load at all.
+  //
+  // One cached entry rather than one per node: N == 2 has a single remote node,
+  // and an array indexed by a runtime node id would be addressed dynamically and
+  // land in scratch. For N > 2 this still hits whenever a wave revisits the node
+  // it saw last, and where it misses the behaviour is exactly the old path.
+  constexpr bool kSkipKnownEmptyChunks = true;
+  int cachedNode = -1;
+  uint64_t cachedNodeEnd = 0;  // exclusive token index; 0 means "not learnt yet"
 
   for (int bid = blockId; bid < numRecvBlock * maxChunkNum * (nNodes - 1);
        bid += args.rdmaBlockNum) {
@@ -385,26 +499,46 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
     int startTokenIdx = k * warpSize;
 
     uint64_t thisChunkTokenNum = 0;
-    index_t nodeFlag = 0;
-    if (laneId == 0) {
-      while (1) {
-        thisChunkTokenNum = core::AtomicLoadRelaxedSystem(&chunkFlag[node * maxChunkNum + k]);
-        if (thisChunkTokenNum > 0) break;
+    if (kSkipKnownEmptyChunks && (node == cachedNode) && (cachedNodeEnd > 0) &&
+        (static_cast<uint64_t>(startTokenIdx) >= cachedNodeEnd)) {
+      // Encoded the way the poll below leaves it: raw flag value, 1 == empty.
+      thisChunkTokenNum = 1;
+    } else {
+      index_t nodeFlag = 0;
+      if (laneId == 0) {
+        while (1) {
+          thisChunkTokenNum = core::AtomicLoadRelaxedSystem(&chunkFlag[node * maxChunkNum + k]);
+          if (thisChunkTokenNum > 0) break;
 
-        nodeFlag = core::AtomicLoadRelaxedSystem(&nodeRecvTokenNum[node]);
-        if ((nodeFlag > 0) && (startTokenIdx >= (nodeFlag - 1))) {
-          thisChunkTokenNum = 1;
-          break;
+          nodeFlag = core::AtomicLoadRelaxedSystem(&nodeRecvTokenNum[node]);
+          if ((nodeFlag > 0) && (startTokenIdx >= (nodeFlag - 1))) {
+            thisChunkTokenNum = 1;
+            break;
+          }
         }
       }
+      thisChunkTokenNum = __shfl(thisChunkTokenNum, 0);
+      nodeFlag = __shfl(nodeFlag, 0);
+      // Only the empty-slot exit above reads nodeRecvTokenNum, so a slot that had
+      // data leaves nodeFlag at 0 and teaches nothing. That is fine: the bound
+      // gets learnt on the first empty slot, which is where it pays.
+      if (kSkipKnownEmptyChunks && (nodeFlag > 0)) {
+        cachedNode = node;
+        cachedNodeEnd = static_cast<uint64_t>(nodeFlag) - 1;
+      }
     }
-    thisChunkTokenNum = __shfl(thisChunkTokenNum, 0) - 1;
-    nodeFlag = __shfl(nodeFlag, 0) - 1;
+    thisChunkTokenNum -= 1;
     totalChunkNum += thisChunkTokenNum;
 
     int endTokenIdx = startTokenIdx + thisChunkTokenNum;
 
-    for (int j = startTokenIdx + (blockId % numRecvBlock) * warpNum + warpId; j < endTokenIdx;
+    // The shard this iteration owns is encoded in bid, not in blockId: bid walks
+    // by rdmaBlockNum, so the two only agree while rdmaBlockNum is a multiple of
+    // numRecvBlock. Off a multiple, blockId pins one block to one shard for every
+    // chunk it visits, and the numRecvBlock shards of a chunk are then served by
+    // whichever blocks happen to land on it -- some token positions twice, others
+    // never. CombineInterNodeTyped already indexes this loop by bid.
+    for (int j = startTokenIdx + (bid % numRecvBlock) * warpNum + warpId; j < endTokenIdx;
          j += numRecvBlock * warpNum) {
       int tokIdx = SendBufSlotOffset(config, node, j);
       index_t* indices = reinterpret_cast<index_t*>(stagingPtr + tokIdx * xferBytes + hiddenBytes);
@@ -418,6 +552,13 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
       }
       index_t srcTokId = reinterpret_cast<index_t*>(stagingPtr + tokIdx * xferBytes + hiddenBytes +
                                                     indexBytes + weightBytes + scaleBytes)[0];
+
+      // Opt 5: lane e collects target e's payload destination while the expert
+      // loop below resolves slots serially as before, and the payload is moved
+      // once afterwards. Slot acquisition order and every map it writes are
+      // unchanged -- this only defers the payload copy.
+      constexpr bool kReusePayloadTile = true;
+      uint8_t* lanePayloadDst = nullptr;
 
       for (int e = 0; e < config.numExpertPerToken; e++) {
         int destPe = __shfl(lanePe, e);
@@ -455,10 +596,13 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
           destTokId = LocalTokIdFromFlatTokenIndex(config, flat);
         }
         if (!args.replayMode && (destPe % config.gpuPerNode) == laneId) localPeTokenCounter++;
-        core::WarpCopy<uint8_t, 4>(
-            args.interNodeV1TokBufs.dispatchOut->template GetAs<uint8_t*>(destPe) +
-                destTokId * hiddenBytes,
-            stagingPtr + tokIdx * xferBytes, hiddenBytes);
+        uint8_t* payloadDst = args.interNodeV1TokBufs.dispatchOut->template GetAs<uint8_t*>(destPe) +
+                              destTokId * hiddenBytes;
+        if (kReusePayloadTile) {
+          if (laneId == e) lanePayloadDst = payloadDst;
+        } else {
+          core::WarpCopy<uint8_t, 4>(payloadDst, stagingPtr + tokIdx * xferBytes, hiddenBytes);
+        }
         core::WarpCopy<uint8_t, 4>(
             args.shmemOutIndicesMemObj->template GetAs<uint8_t*>(destPe) + destTokId * indexBytes,
             stagingPtr + tokIdx * xferBytes + hiddenBytes, indexBytes);
@@ -471,6 +615,15 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
               args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destTokId * scaleBytes,
               stagingPtr + tokIdx * xferBytes + hiddenBytes + indexBytes + weightBytes, scaleBytes);
         }
+      }
+
+      // Every target's slot is resolved by now, so the payload crosses the
+      // source once. Lanes at or above numExpertPerToken never wrote
+      // lanePayloadDst, and skipped slots left it null, so the broadcast's own
+      // null check is what filters them.
+      if (kReusePayloadTile) {
+        WarpTileBroadcast(lanePayloadDst, stagingPtr + tokIdx * xferBytes, hiddenBytes,
+                             config.numExpertPerToken, laneId, warpSize);
       }
     }
   }
