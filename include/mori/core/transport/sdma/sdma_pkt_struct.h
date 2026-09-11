@@ -42,7 +42,8 @@ const unsigned int SDMA_OP_CONST_FILL = 11;
 const unsigned int SDMA_SUBOP_COPY_LINEAR = 0;
 
 const unsigned int SDMA_SUBOP_WRITE_LINEAR = 0;
-const unsigned int SDMA_ATOMIC_ADD64 = 47;
+const unsigned int SDMA_ATOMIC_ADD64 = 47;  // TC_OP_ATOMIC_ADD_RTN_64 (0x2F)
+const unsigned int SDMA_ATOMIC_ADD32 = 15;  // TC_OP_ATOMIC_ADD_RTN_32 (0x0F)
 
 typedef struct SDMA_PKT_COPY_LINEAR_TAG {
   union {
