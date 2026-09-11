@@ -300,6 +300,7 @@ __device__ inline static void quietUntil(core::RdmaEndpointDevice* ep, uint32_t 
 
   if constexpr (PrvdType == core::ProviderType::PSD) {
     constexpr uint32_t PENDING_WORK_MASK = 0x800000;
+    constexpr uint32_t MSN_MASK = 0xFFFFFF;  // ionic reports a 24-bit MSN
 #ifdef IONIC_CCQE
     // CCQE: cqeNum==1, NIC overwrites CQE[0] with latest MSN.
     volatile ionic_v1_cqe* cqe = reinterpret_cast<volatile ionic_v1_cqe*>(cq->cqAddr);
@@ -307,7 +308,23 @@ __device__ inline static void quietUntil(core::RdmaEndpointDevice* ep, uint32_t 
       uint32_t msn = BE32TOH(*(volatile uint32_t*)(&cqe->send.msg_msn));
       asm volatile("" ::: "memory");
       if (!((msn - targetIdx) & PENDING_WORK_MASK)) {
-        wq->doneIdx = msn;
+        // Widen the 24-bit MSN into doneIdx's 32-bit serial space: advance by the
+        // masked forward delta instead of storing msn raw, else doneIdx ends up in
+        // a different modulus than dbTouchIdx and the in-flight count goes bad past
+        // 2^24. Never advance beyond what was doorbelled -- a WQE the NIC was never
+        // told about cannot have completed, and skipping over it recycles live SQ
+        // slots.
+        // doneIdx is read once into `cur` and written once, so concurrent pollers
+        // computing off the same CQE all land on the same value, as they did when
+        // this was a bare `doneIdx = msn`. A read-modify-write here could reload
+        // between the two and apply delta twice, running doneIdx past the NIC.
+        uint32_t dbTouched =
+            __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        uint32_t cur = wq->doneIdx;
+        uint32_t delta = (msn - cur) & MSN_MASK;
+        if (delta != 0 && static_cast<int32_t>(delta) <= static_cast<int32_t>(dbTouched - cur)) {
+          wq->doneIdx = cur + delta;
+        }
       }
     }
 #else
@@ -353,12 +370,28 @@ __device__ inline static void quietUntil(core::RdmaEndpointDevice* ep, uint32_t 
           const int highestLane = core::GetLastActiveLaneID(successMask);
           if (highestLane == -1) continue;
           if (myLaneId == highestLane) {
-            cq->cq_consumer = myCqPos + 1;
-            if (((cq->cq_consumer - cq->cq_dbpos) & (cq->cqeNum - 1)) >= CQ_DOORBELL_GRACE) {
-              cq->cq_dbpos = cq->cq_consumer;
-              core::UpdateCqDbrRecord<core::ProviderType::PSD>(*cq, myCqPos + 1);
+            // Widen the 24-bit MSN into doneIdx's 32-bit serial space; see the CCQE
+            // branch above for why the raw store is wrong and why dbTouchIdx caps it.
+            uint32_t dbTouched =
+                __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            uint32_t cur = wq->doneIdx;
+            uint32_t delta = (wqeCounter - cur) & MSN_MASK;
+
+            // Decide before consuming: ringDoorbellOrdered rings the doorbell before
+            // publishing dbTouchIdx, so a live MSN can be ahead of the cap, and the
+            // color bit is keyed on cq_consumer -- moving it first would drop that
+            // completion for good. Left in place, a later pass takes it.
+            bool aheadOfDoorbell =
+                delta != 0 && static_cast<int32_t>(delta) > static_cast<int32_t>(dbTouched - cur);
+            if (!aheadOfDoorbell) {
+              if (delta != 0) wq->doneIdx = cur + delta;
+
+              cq->cq_consumer = myCqPos + 1;
+              if (((cq->cq_consumer - cq->cq_dbpos) & (cq->cqeNum - 1)) >= CQ_DOORBELL_GRACE) {
+                cq->cq_dbpos = cq->cq_consumer;
+                core::UpdateCqDbrRecord<core::ProviderType::PSD>(*cq, myCqPos + 1);
+              }
             }
-            wq->doneIdx = wqeCounter;
           }
           if (!((wq->doneIdx - targetIdx) & PENDING_WORK_MASK)) {
             if (wq->doneIdx == oldDoneIdx) break;
@@ -403,7 +436,7 @@ __device__ inline static void quietUntil(core::RdmaEndpointDevice* ep, uint32_t 
       if (delta != 0 && static_cast<int32_t>(delta) <= window) {
         completed = cons + delta;
       }
-      __hip_atomic_fetch_max(&wq->doneIdx, completed, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      core::AtomicMaxSerial(&wq->doneIdx, completed);
       asm volatile("" ::: "memory");
     }
     __threadfence();
@@ -432,12 +465,26 @@ __device__ inline static void quietUntil(core::RdmaEndpointDevice* ep, uint32_t 
           assert(false);
           break;
         }
-        // Largest V <= dbTouchIdx with V % sqWqeNum == con_indx % sqWqeNum.
+        // con_indx is the consumed count mod sqWqeNum: rebuild the serial as a
+        // forward delta from doneIdx, as the mlx5 drain does with wqe_counter.
+        // Anchoring on dbTouchIdx instead (largest congruent V <= dbTouchIdx, minus
+        // sqWqeNum when it overshot) went a whole queue depth *backwards* whenever
+        // the CQE ran ahead of dbTouchIdx -- routine, since the doorbell is rung
+        // before dbTouchIdx is published -- and as a raw word that value won the
+        // atomic max this used to be and pinned doneIdx for good. Issue #626.
+        // Flow control never leaves sqWqeNum WQEs outstanding, so delta == 0 is
+        // unambiguously "nothing new" rather than a full queue.
+        uint32_t cur = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
         uint32_t dbTouch =
             __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-        uint32_t completed = (dbTouch & ~mask) | (wqeCounter & mask);
-        if (completed > dbTouch) completed -= wq->sqWqeNum;
-        __hip_atomic_fetch_max(&wq->doneIdx, completed, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        uint32_t delta = (wqeCounter - cur) & mask;
+        // Still capped at what was doorbelled: con_indx alone cannot tell a live
+        // completion from a stale one. Refusing one costs nothing -- PollSingleCqe is
+        // level-triggered for cqeNum == 1, so the next pass re-reads the same value.
+        if (delta != 0 && static_cast<int32_t>(delta) <= static_cast<int32_t>(dbTouch - cur)) {
+          // Sole writer under pollCqLock, and delta > 0 is already an advance.
+          __hip_atomic_store(&wq->doneIdx, cur + delta, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        }
       }
       __threadfence();
       core::ReleaseLock(&cq->pollCqLock);
@@ -504,12 +551,15 @@ __device__ inline static uint32_t reserveWqeSlots(core::RdmaEndpointDevice* ep,
     if (outPsnBase) *outPsnBase = psnBase;
   }
   while (true) {
-    uint64_t dbTouched =
+    // All uint32_t: widening to uint64_t leaves curPostIdx + numWqesNeeded
+    // wrapping in 32 bits while dbTouched does not, so the difference underflows
+    // and this loop spins forever on an empty SQ. Issue #626.
+    uint32_t dbTouched =
         __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    uint64_t dbDone = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    uint64_t numActiveSqEntries = dbTouched - dbDone;
-    uint64_t numFreeEntries = wq->sqWqeNum - numActiveSqEntries;
-    uint64_t entriesUntilMine = curPostIdx + numWqesNeeded - dbTouched;
+    uint32_t dbDone = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    uint32_t numActiveSqEntries = dbTouched - dbDone;
+    uint32_t numFreeEntries = wq->sqWqeNum - numActiveSqEntries;
+    uint32_t entriesUntilMine = curPostIdx + numWqesNeeded - dbTouched;
     if (numFreeEntries > entriesUntilMine) {
       break;
     }
@@ -532,12 +582,13 @@ __device__ inline static void waitSqSpace(core::RdmaEndpointDevice* ep, uint32_t
                                           uint32_t totalWqes) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
   while (true) {
-    uint64_t dbTouched =
+    // All uint32_t, same reason as reserveWqeSlots above.
+    uint32_t dbTouched =
         __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    uint64_t dbDone = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    uint64_t numActiveSqEntries = dbTouched - dbDone;
-    uint64_t numFreeEntries = wq->sqWqeNum - numActiveSqEntries;
-    uint64_t entriesUntilBatchLast = base + totalWqes - dbTouched;
+    uint32_t dbDone = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    uint32_t numActiveSqEntries = dbTouched - dbDone;
+    uint32_t numFreeEntries = wq->sqWqeNum - numActiveSqEntries;
+    uint32_t entriesUntilBatchLast = base + totalWqes - dbTouched;
     if (numFreeEntries > entriesUntilBatchLast) break;
     if constexpr (PrvdType == core::ProviderType::BNXT) {
       quietUntil<PrvdType>(ep, static_cast<uint32_t>(dbTouched));
