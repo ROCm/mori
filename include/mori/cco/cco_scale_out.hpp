@@ -287,46 +287,63 @@ __device__ inline static void quietUntil(core::RdmaEndpointDevice* ep, uint32_t 
     }
 #else
     // Non-CCQE: warp-parallel poll with color bit alternation.
-    const uint64_t activeMask = core::GetActiveLaneMask();
-    const uint32_t myLogicalLaneId = core::GetActiveLaneNum(activeMask);
+    //
+    // The poll below is only correct when every participating lane shares one
+    // CQ: the pollCqLock is acquired by the first active lane and broadcast to
+    // the rest, each lane derives its CQ slot from its index within the active
+    // mask, and a ballot elects a single lane to commit cq_consumer/doneIdx.
+    // Callers can legitimately arrive with lanes on different endpoints (e.g.
+    // flush() fans peers across the cooperative group), so group the active
+    // lanes by CQ and give each distinct CQ its own turn.
     const int myLaneId = core::WarpLaneId();
     constexpr uint32_t MAX_GREED = 10;
     constexpr uint32_t CQ_DOORBELL_GRACE = 100;
-    uint32_t wqeCounter;
+    const unsigned long long myCqKey = reinterpret_cast<unsigned long long>(cq);
 
-    while ((wq->doneIdx - targetIdx) & PENDING_WORK_MASK) {
-      if (!core::spin_lock_try_acquire_shared(&cq->pollCqLock, activeMask)) continue;
-      uint32_t greedRemaining = MAX_GREED;
+    bool needTurn = true;
+    for (uint64_t turns = __ballot(needTurn); turns != 0; turns = __ballot(needTurn)) {
+      const int lead = __ffsll(static_cast<unsigned long long>(turns)) - 1;
+      if (myCqKey != __shfl(myCqKey, lead)) continue;
+      needTurn = false;
+
+      const uint64_t activeMask = core::GetActiveLaneMask();
+      const uint32_t myLogicalLaneId = core::GetActiveLaneNum(activeMask);
+      uint32_t wqeCounter;
+
       while ((wq->doneIdx - targetIdx) & PENDING_WORK_MASK) {
-        const uint64_t oldDoneIdx = wq->doneIdx;
-        const uint32_t curConsIdx = cq->cq_consumer;
-        uint32_t myCqPos = curConsIdx + myLogicalLaneId;
-        const int opcode =
-            core::PollCq<core::ProviderType::PSD>(cq->cqAddr, cq->cqeNum, &myCqPos, &wqeCounter);
-        if (opcode > 0) {
-          MORI_PRINTF("quietUntil[PSD]: poll err %d\n", opcode);
-          assert(false);
-        }
-        asm volatile("" ::: "memory");
-        const uint64_t successMask = __ballot(opcode == 0);
-        const int highestLane = core::GetLastActiveLaneID(successMask);
-        if (highestLane == -1) continue;
-        if (myLaneId == highestLane) {
-          cq->cq_consumer = myCqPos + 1;
-          if (((cq->cq_consumer - cq->cq_dbpos) & (cq->cqeNum - 1)) >= CQ_DOORBELL_GRACE) {
-            cq->cq_dbpos = cq->cq_consumer;
-            core::UpdateCqDbrRecord<core::ProviderType::PSD>(*cq, myCqPos + 1);
+        if (!core::spin_lock_try_acquire_shared(&cq->pollCqLock, activeMask)) continue;
+        uint32_t greedRemaining = MAX_GREED;
+        while ((wq->doneIdx - targetIdx) & PENDING_WORK_MASK) {
+          const uint64_t oldDoneIdx = wq->doneIdx;
+          const uint32_t curConsIdx = cq->cq_consumer;
+          uint32_t myCqPos = curConsIdx + myLogicalLaneId;
+          const int opcode =
+              core::PollCq<core::ProviderType::PSD>(cq->cqAddr, cq->cqeNum, &myCqPos, &wqeCounter);
+          if (opcode > 0) {
+            MORI_PRINTF("quietUntil[PSD]: poll err %d\n", opcode);
+            assert(false);
           }
-          wq->doneIdx = wqeCounter;
+          asm volatile("" ::: "memory");
+          const uint64_t successMask = __ballot(opcode == 0);
+          const int highestLane = core::GetLastActiveLaneID(successMask);
+          if (highestLane == -1) continue;
+          if (myLaneId == highestLane) {
+            cq->cq_consumer = myCqPos + 1;
+            if (((cq->cq_consumer - cq->cq_dbpos) & (cq->cqeNum - 1)) >= CQ_DOORBELL_GRACE) {
+              cq->cq_dbpos = cq->cq_consumer;
+              core::UpdateCqDbrRecord<core::ProviderType::PSD>(*cq, myCqPos + 1);
+            }
+            wq->doneIdx = wqeCounter;
+          }
+          if (!((wq->doneIdx - targetIdx) & PENDING_WORK_MASK)) {
+            if (wq->doneIdx == oldDoneIdx) break;
+            if (greedRemaining == 0) break;
+            --greedRemaining;
+          }
         }
-        if (!((wq->doneIdx - targetIdx) & PENDING_WORK_MASK)) {
-          if (wq->doneIdx == oldDoneIdx) break;
-          if (greedRemaining == 0) break;
-          --greedRemaining;
-        }
+        core::spin_lock_release_shared(&cq->pollCqLock, activeMask);
+        break;
       }
-      core::spin_lock_release_shared(&cq->pollCqLock, activeMask);
-      break;
     }
 #endif
   } else if constexpr (PrvdType == core::ProviderType::MLX5) {
@@ -1265,8 +1282,9 @@ template <typename Coop>
 __device__ inline void ccoGda<PrvdType>::flush(Coop coop) {
   static_assert(!std::is_same_v<Coop, ccoCoopThread>,
                 "flush() requires at least ccoCoopWarp. "
-                "ccoCoopThread causes each thread to independently enter quietUntil "
-                "on different QPs, breaking the warp-level pollCqLock.");
+                "ccoCoopThread reports size()==1, so every thread walks every peer and "
+                "flushes each QP once per thread, duplicating doorbell rings and "
+                "advancing cq->needConsIdx once per thread.");
   coop.sync();
   ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
   for (int teamPeer = coop.thread_rank(); teamPeer < this->nRanks; teamPeer += coop.size()) {
@@ -1288,8 +1306,9 @@ template <ccoTeamMode TeamMode, typename Coop>
 __device__ inline void ccoGda<PrvdType>::flush(int peer, Coop coop) {
   static_assert(!std::is_same_v<Coop, ccoCoopThread>,
                 "flush(peer) requires at least ccoCoopWarp. "
-                "ccoCoopThread allows concurrent per-thread calls on different QPs, "
-                "which breaks the warp-level pollCqLock inside quietUntil.");
+                "With ccoCoopThread every thread runs the body, so two threads passing the "
+                "same peer each flush that QP and advance cq->needConsIdx twice. "
+                "(Lanes on *different* QPs are fine: quietUntil groups active lanes by CQ.)");
   coop.sync();
   if (coop.thread_rank() == 0) {
     int worldPeer = resolveWorldPeer<TeamMode>(peer);
@@ -1329,9 +1348,10 @@ template <core::ProviderType PrvdType>
 template <typename Coop>
 __device__ inline void ccoGda<PrvdType>::wait(ccoGdaRequest_t& request, Coop coop) {
   static_assert(!std::is_same_v<Coop, ccoCoopThread>,
-                "wait() requires at least ccoCoopWarp. "
-                "ccoCoopThread allows concurrent per-thread calls on different QPs, "
-                "which breaks the warp-level pollCqLock inside quietUntil.");
+                "wait() requires at least ccoCoopWarp, for consistency with flush(). "
+                "The pollCqLock hazard no longer applies here — the body is a pure poll and "
+                "quietUntil groups active lanes by CQ — so this one is relaxable if a "
+                "per-thread caller ever needs it.");
   coop.sync();
   if (coop.thread_rank() == 0) {
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
@@ -1347,8 +1367,9 @@ template <typename LocalAction, typename Coop>
 __device__ inline void ccoGda<PrvdType>::counter(LocalAction localAction, Coop coop) {
   static_assert(!std::is_same_v<Coop, ccoCoopThread>,
                 "counter() requires at least ccoCoopWarp. "
-                "ccoCoopThread causes each thread to independently enter quietUntil "
-                "on different QPs, breaking the warp-level pollCqLock.");
+                "ccoCoopThread reports size()==1 and makes thread_rank()==0 true for every "
+                "thread, so every thread walks every peer and counterBuf is incremented "
+                "once per thread instead of once.");
   coop.sync();
 
   ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
@@ -1438,8 +1459,9 @@ template <core::ProviderType PrvdType, typename Coop>
 __device__ inline void ccoGdaBarrierSession<PrvdType, Coop>::sync(Coop) {
   static_assert(!std::is_same_v<Coop, ccoCoopThread>,
                 "GDA barrier requires at least ccoCoopWarp. "
-                "ccoCoopThread causes each thread to independently enter signalImpl / "
-                "waitSignalImpl on different QPs, breaking the warp-level pollCqLock.");
+                "ccoCoopThread reports size()==1, so every thread signals every peer and the "
+                "remote signal is incremented once per thread; coop.sync() also degenerates "
+                "to a no-op, removing the phase-1/phase-2 separation.");
   this->coop.sync();
 
   ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(gda._gdaHandle);
