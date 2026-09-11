@@ -641,11 +641,15 @@ def build_sdma_phases(
     # left to each caller to hardcode: the fp8 wire adds two, and a caller that
     # kept its own ("scatter", "reduce", "gather") list would silently skip them
     # and all-reduce into zeros.
-    phases["order"] = (
-        ("scatter", "reduce", "quantize", "gather", "dequantize")
+    tail = (
+        ("reduce", "quantize", "gather", "dequantize")
         if cfg.fp8_gather
-        else ("scatter", "reduce", "gather")
+        else ("reduce", "gather")
     )
+    phases["order"] = ("scatter",) + tail
+    #: The same sequence for the fused GEMM, which issued the scatter's puts from
+    #: its own epilogue and only has to drain them.
+    phases["fused_order"] = ("drain",) + tail
     return phases
 
 

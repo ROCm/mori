@@ -47,6 +47,37 @@ emits). `b_scale` is `[N/128, K/128]` fp32 row-major.
 rounds up and `op.pad_rows` zero-extends to it. A padded row produces a zero
 output row, so the caller slices the result back to `m`.
 
+## fp8 on the wire
+
+`gather_dtype="fp8"` sends the all-gather leg as e4m3 with one fp32 scale per
+row, halving its bytes. That leg is ~40% of a fused layer and already runs at
+the xGMI ceiling (470 GB/s over 7 links), so halving the bytes halves the time.
+
+Measured, fused-sdma at `[16384, 7168]` K=2048 on 8x MI355X:
+
+| gather wire | us | relL2 |
+|---|---:|---:|
+| bf16 | 1151.5 | 2.35e-3 |
+| fp8 | **1033.9** (-10.2%) | **2.49e-2** |
+
+It is not free and the cost is not a tuning problem. e4m3 carries 3 mantissa
+bits, so one rounding costs ~2.1e-2 on a normal payload whatever the scale
+granularity -- per-row measures 2.65e-2 and per-32 measures 2.40e-2, 9% better
+for 200x the scale bytes. Going from 2.35e-3 to 2.49e-2 is the price of the
+10%, and whether that is payable is a model-level question, not a kernel one.
+
+It also only pays at large M. The two conversion kernels are a fixed cost
+against a transfer that shrinks with M, so on the standalone all-reduce it is
++2.4% at M=4096 and -11.2% at M=16384. Per phase at M=16384: quantize 12.4us,
+dequantize 88.2us, against ~218us saved on the push.
+
+The scatter leg stays bf16. It carries partial sums that are then added across
+every rank, so its fp8 error compounds rather than being a single rounding, and
+it is already mostly hidden behind the GEMM -- its 1140 GB/s is not a bandwidth,
+it is the tell that the pushes went out from the epilogue and the drain is only
+waiting for the tail. `scatter_dtype="fp8"` sizes its regions but raises
+`NotImplementedError`.
+
 ## Benchmarks and tests
 
 ```bash

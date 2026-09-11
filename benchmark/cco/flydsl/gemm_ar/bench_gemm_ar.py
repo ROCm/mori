@@ -278,6 +278,7 @@ def run(args) -> int:
         n=args.n,
         recv_slots=world_size if needs_sdma else 0,
         counter_chunks=chunks,
+        gather_dtype=args.gather_dtype,
     )
     cfg.validate()
 
@@ -385,11 +386,15 @@ def run(args) -> int:
             # drain runs. fused-lsa: the epilogue already wrote into the peers,
             # so this is a pure cross-rank barrier (its quiet drains nothing).
             # split: the full scatter kernel.
-            parts["drain" if fused else "scatter"](dc.ptr, win.handle, stream=stream)
+            # parts["order"]/["fused_order"] rather than a literal list: the
+            # fp8 gather inserts a quantise and a dequantise, and hardcoding the
+            # three phases would skip them and all-reduce into zeros.
+            order = parts["fused_order" if fused else "order"]
+            parts[order[0]](dc.ptr, win.handle, stream=stream)
             if args.stop_after == "scatter":
                 return
-            parts["reduce"](dc.ptr, win.handle, stream=stream)
-            parts["gather"](dc.ptr, win.handle, stream=stream)
+            for phase in order[1:]:
+                parts[phase](dc.ptr, win.handle, stream=stream)
 
         comm.barrier()
         once()
@@ -433,7 +438,16 @@ def run(args) -> int:
             # 2.35e-3 and the corruption this pipeline produces lands at
             # 4-9e-3, so a looser gate reports a corrupt run as validated -- one
             # did, at 3.97e-3, while the fused path was racing.
-            validated = rel_l2 < 3e-3
+            #
+            # --gather-dtype fp8 adds a second, much larger rounding on top: the
+            # all-gather carries e4m3, which costs ~2.1e-2 on its own. Its gate
+            # has to clear that, and is two-sided -- below 4e-2 says the kernel
+            # is right (a broken one lands near 0.9), above 5e-3 says the fp8
+            # wire was actually taken and not silently skipped.
+            if cfg.fp8_gather:
+                validated = 5e-3 < rel_l2 < 4e-2
+            else:
+                validated = rel_l2 < 3e-3
             if not validated:
                 print(f"[rank {rank}] VALIDATION FAILED relL2={rel_l2:.3e}", flush=True)
             del acc
@@ -649,6 +663,14 @@ def build_parser() -> argparse.ArgumentParser:
         "and is worth 80us (355 vs 434)",
     )
     p.add_argument("--sdma-queues", type=int, default=8)
+    p.add_argument(
+        "--gather-dtype",
+        choices=("bf16", "fp8"),
+        default="bf16",
+        help="what the all-gather leg carries. fp8 halves its bytes -- it is "
+        "~40%% of a fused layer and runs at the xGMI ceiling -- at a cost of "
+        "relL2 ~2.1e-2 against a bf16 wire that is exact.",
+    )
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=51)
     p.add_argument("--eager", action="store_true")

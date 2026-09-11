@@ -114,6 +114,7 @@ class GemmAllReduceOp:
         block_m: int = DEFAULT_BLOCK_M,
         block_n: int = DEFAULT_BLOCK_N,
         sdma_queues: int = 1,
+        gather_dtype: str = "bf16",
     ):
         self.comm = comm
         self.rank = comm.rank
@@ -123,6 +124,10 @@ class GemmAllReduceOp:
         self.n, self.k = n, k
         self.block_m, self.block_n = block_m, block_n
         self.sdma_queues = sdma_queues
+        #: fp8 halves the all-gather's bytes, which is ~40% of a fused layer.
+        #: It costs relL2 ~2.1e-2 against a bf16 wire that is exact -- e4m3's
+        #: mantissa, not a tuning knob -- so it is off unless asked for.
+        self.gather_dtype = gather_dtype
         self.m_max = padded_m(m_max, self.world_size, block_m)
 
         if not supports(self.m_max, n, k, self.world_size, block_n=block_n):
@@ -156,7 +161,12 @@ class GemmAllReduceOp:
 
     @staticmethod
     def window_bytes_for(
-        world_size: int, *, m_max: int, n: int, block_m: int = DEFAULT_BLOCK_M
+        world_size: int,
+        *,
+        m_max: int,
+        n: int,
+        block_m: int = DEFAULT_BLOCK_M,
+        gather_dtype: str = "bf16",
     ) -> int:
         """Symmetric-window bytes an op for this shape will allocate.
 
@@ -171,6 +181,7 @@ class GemmAllReduceOp:
             n=n,
             recv_slots=world_size,
             counter_chunks=counter_chunks(m_pad, world_size, block_m),
+            gather_dtype=gather_dtype,
         )
         cfg.validate()
         return cfg.window_bytes
@@ -186,6 +197,7 @@ class GemmAllReduceOp:
             n=self.n,
             recv_slots=self.world_size,
             counter_chunks=counter_chunks(m, self.world_size, self.block_m),
+            gather_dtype=self.gather_dtype,
         )
         cfg.validate()
         return cfg
@@ -281,7 +293,9 @@ class GemmAllReduceOp:
             self.win.handle,
             stream=stream,
         )
-        parts["drain"](self.dev_comm.ptr, self.win.handle, stream=stream)
-        parts["reduce"](self.dev_comm.ptr, self.win.handle, stream=stream)
-        parts["gather"](self.dev_comm.ptr, self.win.handle, stream=stream)
+        # parts["fused_order"] rather than a literal list: the fp8 wire inserts a
+        # quantise and a dequantise around the gather, and a hardcoded
+        # drain/reduce/gather would skip them and reduce into zeros.
+        for phase in parts["fused_order"]:
+            parts[phase](self.dev_comm.ptr, self.win.handle, stream=stream)
         return out
