@@ -52,6 +52,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -530,12 +531,20 @@ int main(int argc, char** argv) {
     fprintf(stderr, "unknown case '%s'\n", argv[2]);
     return 2;
   }
-  bool unitOnly = argc > 1 && !strcmp(argv[1], "--unit-only");
+  // MORI_CCO_SKIP_GDA_FULL is set per-runner in CI for boxes without intranode
+  // cross-rail RDMA, where part 2's FULL connection cannot form. Part 1 needs no NIC,
+  // so honour the same signal here and run only that rather than being skipped whole.
+  const bool skipGdaFull = getenv("MORI_CCO_SKIP_GDA_FULL") != nullptr;
+  const bool unitOnly = argc > 1 && !strcmp(argv[1], "--unit-only");
 
   // Part 2 wedges QPs and needs peers, so it is pointless to run when the arithmetic
   // it depends on is already broken.
   if (RunUnitCases() != 0) return 1;
   if (unitOnly) return 0;
+  if (skipGdaFull) {
+    printf("=== end-to-end put: SKIPPED (MORI_CCO_SKIP_GDA_FULL) ===\n");
+    return 0;
+  }
 
   return ccoTestMain(argc, argv, "CCO GDA wraparound", "/tmp/cco_gda_wraparound_uid", 19893);
 }
