@@ -650,8 +650,24 @@ include <code class="docutils literal notranslate"><span class="pre">cco.hpp</sp
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_RDMA_SL</span></code></p></td>
 <td><p>RDMA service level (GDA)</p></td>
 </tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_IGNORE_CPU_AFFINITY</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code> skips the CPU bind done at communicator creation, leaving placement to an outer <code class="docutils literal notranslate"><span class="pre">numactl</span></code>/<code class="docutils literal notranslate"><span class="pre">torchrun</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_CPU_AFFINITY_NO_SPLIT</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code> binds to the whole NUMA node instead of this rank’s own slice of it</p></td>
+</tr>
 </tbody>
 </table>
+<p>Communicator creation (<code class="docutils literal notranslate"><span class="pre">ccoCommCreate</span></code>) pins the calling thread to the CPUs
+local to its current HIP device before the bootstrap and any worker thread, so
+new threads inherit the affinity. The GPU-local CPU list (sysfs
+<code class="docutils literal notranslate"><span class="pre">local_cpulist</span></code>) is intersected with the existing cpuset, so cgroup limits and
+an outer binding are respected. Within that set the CPUs are grouped into
+physical cores by <code class="docutils literal notranslate"><span class="pre">thread_siblings_list</span></code> and partitioned into one disjoint
+slice per GPU on the NUMA node, so two ranks cannot end up on the two SMT
+siblings of one core. The split applies only when the process sees more than
+one GPU on that NUMA node and there is at least one physical core per GPU;
+otherwise it falls back to binding the whole node.</p>
 <p>Supported GPUs: MI308X / MI300X / MI325X / MI355X. Supported NICs: AMD Pollara
 (AINIC), Mellanox ConnectX-7, Broadcom Thor2.</p>
 </section>

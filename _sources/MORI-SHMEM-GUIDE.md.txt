@@ -303,7 +303,8 @@ This copies the current GPU states to the `globalGpuStates` symbol in the dynami
 | `MORI_DISABLE_P2P` | Disable P2P (XGMI) transport, force RDMA | Not set |
 | `MORI_ENABLE_RAIL_ONLY` | Only create RDMA QPs to same-rail peers (same index within their node). For rail-isolated fabrics where cross-rail QPs cannot be established. See [Rail-only connections](#rail-only-connections). | Not set |
 | `MORI_DISABLE_TOPO` | Disable topology detection | Not set |
-| `MORI_IGNORE_CPU_AFFINITY` | By default the thread calling `ShmemInit` is pinned to the CPUs local to its GPU (sysfs `local_cpulist`, intersected with the existing cpuset). Set to `1` to disable and leave CPU placement to an outer `numactl`/`torchrun`. Works in SPMT (single-process multi-GPU) too: each per-GPU init thread pins to its own GPU's NUMA node. | Not set (binding on) |
+| `MORI_IGNORE_CPU_AFFINITY` | By default the thread calling `ShmemInit` is pinned to the CPUs local to its GPU (sysfs `local_cpulist`, intersected with the existing cpuset). Within that set the CPUs are grouped into physical cores by `thread_siblings_list` and partitioned into one disjoint slice per GPU on the NUMA node, so two ranks never share the two SMT siblings of one core; the split applies only when the process sees more than one GPU on that NUMA node and there is at least one physical core per GPU, otherwise the whole node is bound. Set to `1` to disable and leave CPU placement to an outer `numactl`/`torchrun`. Works in SPMT (single-process multi-GPU) too: each per-GPU init thread pins to its own GPU's slice. | Not set (binding on) |
+| `MORI_CPU_AFFINITY_NO_SPLIT` | Bind to the whole NUMA node instead of this rank's own slice of it. | Not set (split on) |
 | `MORI_GLOBAL_LOG_LEVEL` | Global log verbosity: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | `INFO` |
 | `MORI_PRECOMPILE` | Precompile all JIT kernels on import | Not set |
 | `MORI_DISABLE_JIT` | Disable JIT compilation of device bitcode | Not set |

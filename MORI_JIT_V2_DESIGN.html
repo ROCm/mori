@@ -416,17 +416,17 @@ mori 特有的简化：走 <code class="docutils literal notranslate"><span clas
 </thead>
 <tbody>
 <tr class="row-even"><td><p>① Cfg</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">include/mori/ops/dispatch_combine_v2/ep_cfg.hpp</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">include/mori/ops/dispatch_combine_v2/ep_cfg.hpp</span></code>（intranode）<br><code class="docutils literal notranslate"><span class="pre">include/mori/ops/dispatch_combine_v2/ep_internode_args.hpp</span></code> + <code class="docutils literal notranslate"><span class="pre">ep_internode_cfg.hpp</span></code>（internode）</p></td>
 <td><p>Cfg + Args + <code class="docutils literal notranslate"><span class="pre">VisitFields</span></code> + 共享几何 constexpr</p></td>
 <td><p><strong>两侧</strong>（HIP-free）</p></td>
 </tr>
 <tr class="row-odd"><td><p>② body</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">src/ops/dispatch_combine_v2/ep_intranode_kernel.hpp</span></code>（portable）<br><code class="docutils literal notranslate"><span class="pre">src/ops/dispatch_combine_v2/ep_intranode_1250x.hpp</span></code>（gfx125x TDM）</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">src/ops/dispatch_combine_v2/ep_intranode_kernel.hpp</span></code>（portable）<br><code class="docutils literal notranslate"><span class="pre">src/ops/dispatch_combine_v2/ep_intranode_1250x.hpp</span></code>（gfx125x TDM）<br><code class="docutils literal notranslate"><span class="pre">src/ops/dispatch_combine_v2/ep_internode_kernel.hpp</span></code>（internode，八个 pass 各一个 body）</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">template</span> <span class="pre">&lt;EpCfg</span> <span class="pre">kCfg,</span> <span class="pre">typename</span> <span class="pre">T&gt;</span> <span class="pre">__device__</span> <span class="pre">void</span> <span class="pre">Body(EpArgs)</span></code></p></td>
 <td><p>只有生成的 TU</p></td>
 </tr>
 <tr class="row-even"><td><p>③ Spec</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">ep_spec.hpp</span></code> / <code class="docutils literal notranslate"><span class="pre">ep_spec.cpp</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ep_spec.hpp</span></code> / <code class="docutils literal notranslate"><span class="pre">ep_spec.cpp</span></code>（intranode）<br><code class="docutils literal notranslate"><span class="pre">ep_internode_spec.hpp</span></code> / <code class="docutils literal notranslate"><span class="pre">ep_internode_spec.cpp</span></code>（internode）</p></td>
 <td><p>Request + <code class="docutils literal notranslate"><span class="pre">EntryName</span></code> + <code class="docutils literal notranslate"><span class="pre">RenderSource</span></code> + <code class="docutils literal notranslate"><span class="pre">Geometry</span></code> + 注册宏</p></td>
 <td><p>host</p></td>
 </tr>
@@ -465,7 +465,7 @@ mori 特有的简化：走 <code class="docutils literal notranslate"><span clas
 <span class="w">  </span><span class="n">MORI_FIELD</span><span class="p">(</span><span class="n">worldSize</span><span class="p">);</span><span class="w"> </span><span class="p">...</span><span class="w"> </span><span class="n">MORI_FIELD</span><span class="p">(</span><span class="n">useWeights</span><span class="p">);</span>
 <span class="cp">#undef MORI_FIELD</span>
 <span class="p">}</span>
-<span class="n">MORI_JIT_ASSERT_FIELD_COUNT</span><span class="p">(</span><span class="n">EpCfg</span><span class="p">,</span><span class="w"> </span><span class="mi">11</span><span class="p">,</span><span class="w"> </span><span class="s">"加了字段就要同步 VisitFields"</span><span class="p">);</span>
+<span class="n">MORI_JIT_ASSERT_FIELD_COUNT</span><span class="p">(</span><span class="n">EpCfg</span><span class="p">,</span><span class="w"> </span><span class="mi">12</span><span class="p">,</span><span class="w"> </span><span class="s">"加了字段就要同步 VisitFields"</span><span class="p">);</span>
 </pre></div>
 </div>
 <p>加字段 = 三处编辑（struct、<code class="docutils literal notranslate"><span class="pre">MORI_FIELD</span></code>、计数），漏掉任何一处都是<strong>编译期红字</strong>。
@@ -475,7 +475,7 @@ mori 特有的简化：走 <code class="docutils literal notranslate"><span clas
 <p><strong>只发非默认字段</strong>：加一个默认不改行为的字段，已有实例的文本不变 → 缓存不失效。若新字段在默认值下
 也改了 kernel 代码，文本虽没变但 include 哈希会变，照样重编。两级哈希各管一头。</p>
 <p><strong><code class="docutils literal notranslate"><span class="pre">EpArgs</span></code> 同理</strong>。它的 wire schema 由一份 <code class="docutils literal notranslate"><span class="pre">MORI_EP_ARGS_FIELDS(X)</span></code> 生成，并按同一顺序取 <code class="docutils literal notranslate"><span class="pre">offsetof</span></code>
-断言递增。只对 <code class="docutils literal notranslate"><span class="pre">sizeof</span></code> 设防不够：22 个字段里 8 个是裸指针，调换两个同类型字段所有尺寸校验都过，
+断言递增。只对 <code class="docutils literal notranslate"><span class="pre">sizeof</span></code> 设防不够：24 个字段里 12 个是裸指针，调换两个同类型字段所有尺寸校验都过，
 kernel 安静地读错 buffer。按 schema 顺序取的 offset 序列一旦不再递增，就是编译期错误。</p>
 </section>
 <section id="id4">
@@ -513,6 +513,17 @@ kernel 安静地读错 buffer。按 schema 顺序取的 offset 序列一旦不�
 hash = sha256(name $$ hipcc签名 $$ nic $$ flags $$ include哈希 $$ 源码文本)
 </pre></div>
 </div>
+<blockquote>
+<div><p><strong>⚠️ 开发期陷阱：JIT 默认不编译你的 <code class="docutils literal notranslate"><span class="pre">src/</span></code>。</strong> <code class="docutils literal notranslate"><span class="pre">DetectSourceRoot()</span></code>
+（<code class="docutils literal notranslate"><span class="pre">src/jit/v2/toolchain.cpp</span></code>）按 <code class="docutils literal notranslate"><span class="pre">MORI_SOURCE_ROOT</span></code> → <strong><code class="docutils literal notranslate"><span class="pre">.so</span></code> 旁边的 <code class="docutils literal notranslate"><span class="pre">_jit-sources</span></code></strong> →
+<code class="docutils literal notranslate"><span class="pre">MORI_JIT_SOURCE_DIR</span></code> 的顺序解析。<code class="docutils literal notranslate"><span class="pre">python/mori/_jit-sources/</span></code> 是 <code class="docutils literal notranslate"><span class="pre">setup.py</span></code> 在
+pip-install 时做的一份<strong>实拷贝</strong>，editable 安装下它优先命中——于是改
+<code class="docutils literal notranslate"><span class="pre">src/ops/**/*.hpp</span></code> 或 <code class="docutils literal notranslate"><span class="pre">include/**</span></code> 对 JIT <strong>无效，且静默</strong>：include 哈希也是对那份陈旧
+拷贝算的，连缓存目录名都不变。诊断办法是往头文件末尾加 <code class="docutils literal notranslate"><span class="pre">#error</span></code>、清掉
+<code class="docutils literal notranslate"><span class="pre">~/.mori/jit/&lt;arch&gt;_&lt;nic&gt;</span></code>、重编，若仍然成功就说明编的不是你的树。
+开发时导出 <code class="docutils literal notranslate"><span class="pre">MORI_SOURCE_ROOT=&lt;repo</span> <span class="pre">root&gt;</span></code>；<code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">-e</span> <span class="pre">.</span></code> 也能刷新那份拷贝，
+但下次编辑又会过期，环境变量不会。</p>
+</div></blockquote>
 <p><code class="docutils literal notranslate"><span class="pre">include</span> <span class="pre">哈希</span></code>是对 <code class="docutils literal notranslate"><span class="pre">SourceDeps()</span></code> 列出的目录做一次排序递归遍历，把每个头文件的<strong>相对路径和内容</strong>
 都摘进去。粗粒度是刻意的：它可能过度失效，但不会漏失效。EP 的依赖集是
 <code class="docutils literal notranslate"><span class="pre">include/mori</span></code>、<code class="docutils literal notranslate"><span class="pre">src/ops/dispatch_combine_v2</span></code>、<code class="docutils literal notranslate"><span class="pre">src/cco</span></code>。</p>
@@ -660,7 +671,9 @@ StdMoE、per-token scales、routing replay、<code class="docutils literal notra
 之前——问它要 scatter 会当场报错并列出缺什么，而不是发射时给出错误数字，也不会先占住一个对称 window
 再失败。</p>
 <p><code class="docutils literal notranslate"><span class="pre">_regions</span></code> 归子类还消掉一个陷阱：FlyDSL 的 <code class="docutils literal notranslate"><span class="pre">off_out_tok</span></code> 对 dispatch 指 <code class="docutils literal notranslate"><span class="pre">disp_out</span></code>、对 combine 指
-<code class="docutils literal notranslate"><span class="pre">out_tok</span></code>，任何共享的 offset 传递路径都会静默接错 buffer。</p>
+<code class="docutils literal notranslate"><span class="pre">out_tok</span></code>，任何共享的 offset 传递路径都会静默接错 buffer。HIP 后端的 internode 布局又是另一张表，
+在 <code class="docutils literal notranslate"><span class="pre">internode_regions.py</span></code>：16 个具名 region，加上 <code class="docutils literal notranslate"><span class="pre">scale_dim</span> <span class="pre">&gt;</span> <span class="pre">0</span></code> 时才有的 <code class="docutils literal notranslate"><span class="pre">out_scales</span></code> 共 17 个，
+尺寸按 v1 的分配顺序逐条转写而不是重新推导。</p>
 <p><strong>选后端只 import 那一个</strong>：<code class="docutils literal notranslate"><span class="pre">dispatch_combine_op</span></code> 不 import 任何后端，选 <code class="docutils literal notranslate"><span class="pre">hip</span></code> 不会拉进 flydsl，
 所以它在没装 FlyDSL 的机器上能跑。</p>
 <section id="dispatch-combine">
@@ -678,16 +691,32 @@ dispatch 的 dtype</strong>——它只归约 bf16/fp32 的暂存区，不管前
 不是省事。没扫过的形状拿不到 schedule，退回单档默认值。</p>
 <p>取值规则：<strong>性能接近时取更小的几何</strong>，因为少占 CU 在与专家 GEMM 重叠时是真收益。这类 3% 以内的取舍是
 <strong>策略不是测量</strong>（单次 bench 偶尔会偏 20%）；真正由数据定的是桶的<strong>边界</strong>，它们来自 10~40% 的差异。</p>
+<p>internode 再是第三张表 <code class="docutils literal notranslate"><span class="pre">internode_tuning_configs.py</span></code>，键是 <code class="docutils literal notranslate"><span class="pre">(device_key,</span> <span class="pre">world_size,</span> <span class="pre">hidden_dim,</span> <span class="pre">topk)</span></code>
+再按 dispatch 的 dtype 分档，值是一串 <code class="docutils literal notranslate"><span class="pre">(max_tok_inclusive|None,</span> <span class="pre">disp_block,</span> <span class="pre">disp_rdma,</span> <span class="pre">disp_warp,</span> <span class="pre">comb_block,</span> <span class="pre">comb_rdma,</span> <span class="pre">comb_warp)</span></code>。它和上面两张的差别在 <code class="docutils literal notranslate"><span class="pre">rdma_block_num</span></code>：这一维把 grid 切成 RDMA 一半和
+node 内一半，kernel 对它有分支，所以<strong>一套 pass 序列是按几何整套编出来的</strong>，而不是编一份、launch 时挑；
+<code class="docutils literal notranslate"><span class="pre">HipBackend._internode_geometry_buckets</span></code> 在构建期把整张表走一遍，运行时的解析因此永远不会触发编译。也因为
+dispatch 和 combine 在同一个 token 数、同一块 arena 上调到不同的 rdma/warp，一个 bucket 一套几何表达不了，
+表里每档都是<strong>成对</strong>的行——不要单独重调其中一相。唯一硬不变量还是 <code class="docutils literal notranslate"><span class="pre">block_num</span> <span class="pre">&lt;=</span> <span class="pre">CU</span> <span class="pre">数</span></code>，<code class="docutils literal notranslate"><span class="pre">lookup()</span></code> 会 clamp。
+目前只有 MI308X EP16 / hidden 6144 / topk 8 一行是实测过的。</p>
 </section>
 </section>
 <section id="python">
 <h2>6. Python 绑定<a class="headerlink" href="#python" title="Link to this heading"></a></h2>
-<p>C ABI 是<strong>十个符号，对所有 kernel 永久有效</strong>：</p>
-<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">mori_jit_plan_create</span> <span class="o">/</span> <span class="n">_launch</span> <span class="o">/</span> <span class="n">_destroy</span> <span class="o">/</span> <span class="n">_info</span>
+<p>C ABI 是<strong>十一个符号，对所有 kernel 永久有效</strong>：</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">mori_jit_plan_create</span> <span class="o">/</span> <span class="n">_launch</span> <span class="o">/</span> <span class="n">_launch_multi</span> <span class="o">/</span> <span class="n">_destroy</span> <span class="o">/</span> <span class="n">_info</span>
 <span class="n">mori_jit_plan_args_schema</span> <span class="o">/</span> <span class="n">_args_size</span> <span class="o">/</span> <span class="n">_request_schema</span>
 <span class="n">mori_jit_precompile</span> <span class="o">/</span> <span class="n">mori_jit_registered_plans</span> <span class="o">/</span> <span class="n">mori_jit_last_error</span>
 </pre></div>
 </div>
+<p><code class="docutils literal notranslate"><span class="pre">_launch_multi</span></code> 是批量发射：N 个共享同一 args 布局的 plan，填一次参数结构、穿一次 ABI，
+然后按序发射（C++ 侧就是对同一个 <code class="docutils literal notranslate"><span class="pre">argBuf</span></code> 循环 <code class="docutils literal notranslate"><span class="pre">vt-&gt;launch</span></code>，不认识任何具体 kernel）。
+EP 的 internode 序列一次 dispatch 是 2 个 pass、一次 combine 是 4 个，本来要穿 6 次。</p>
+<p>Python 侧对应 <code class="docutils literal notranslate"><span class="pre">plan_api.LaunchGroup</span></code>：<strong>plan 集合固定时把校验和 handle 数组挪到构建期</strong>，
+发射路径只剩填参数和那一次 ABI 调用。「共享同一 args 布局」按完整的
+<code class="docutils literal notranslate"><span class="pre">(name,</span> <span class="pre">offset,</span> <span class="pre">size)</span></code> 序列比对，不是只比 <code class="docutils literal notranslate"><span class="pre">sizeof</span></code>——理由见 §3.2：internode 的 args 有 37 个字段，
+其中 14 个是裸指针，调换两个同类型的所有尺寸校验都过，然后按 <code class="docutils literal notranslate"><span class="pre">plans[0]</span></code> 的 schema 填、发给其余 plan，
+静默读错 buffer。代价是 group 缓存了 handle：显式 <code class="docutils literal notranslate"><span class="pre">close()</span></code> 一个 plan 会让它失效，
+而发射路径不再逐次检查——这正是省下来的那部分。</p>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head"><p></p></th>
@@ -703,13 +732,19 @@ dispatch 的 dtype</strong>——它只归约 bf16/fp32 的暂存区，不管前
 </tr>
 </tbody>
 </table>
-<p>十个入口全部 <code class="docutils literal notranslate"><span class="pre">noexcept</span></code>：异常穿过 <code class="docutils literal notranslate"><span class="pre">extern</span> <span class="pre">&quot;C&quot;</span></code> 进 ctypes 是 UB，实测会不留 traceback 地干掉解释器。
+<p>十一个入口全部 <code class="docutils literal notranslate"><span class="pre">noexcept</span></code>：异常穿过 <code class="docutils literal notranslate"><span class="pre">extern</span> <span class="pre">&quot;C&quot;</span></code> 进 ctypes 是 UB，实测会不留 traceback 地干掉解释器。
 所以每个入口都 catch，并按 ABI 的方式报告——返回 null/负值，细节留在 <code class="docutils literal notranslate"><span class="pre">mori_jit_last_error()</span></code>。</p>
 <p>通用绑定 <code class="docutils literal notranslate"><span class="pre">mori.jit.v2.plan_api</span></code>（即 libmori_jit.so 的 <code class="docutils literal notranslate"><span class="pre">mori_jit_*</span></code> C ABI 的 Python 侧，与
 <code class="docutils literal notranslate"><span class="pre">src/jit/v2/plan_api.cpp</span></code> 对应）里没有任何 kernel 名字：<code class="docutils literal notranslate"><span class="pre">make_plan(kernel)</span></code> 由 schema 生成 Plan 类。
 EP 专用的只有薄 shim <code class="docutils literal notranslate"><span class="pre">ops/dispatch_combine_v2/ep_plans.py</span></code>——它 <code class="docutils literal notranslate"><span class="pre">load_library(&quot;libmori_ops_v2.so&quot;)</span></code>
-触发注册，再暴露 <code class="docutils literal notranslate"><span class="pre">EpDispatchPlan</span></code>/<code class="docutils literal notranslate"><span class="pre">EpCombinePlan</span></code>。约定两条：标为 <code class="docutils literal notranslate"><span class="pre">e</span></code> 的字段接受 dtype 名或 torch
-dtype；launch 参数里 <code class="docutils literal notranslate"><span class="pre">off&lt;Region&gt;</span></code> 是 arena region 偏移，传 <code class="docutils literal notranslate"><span class="pre">arena=</span></code> 就绑定一次。</p>
+触发注册，再暴露 intranode 的 <code class="docutils literal notranslate"><span class="pre">EpDispatchPlan</span></code>/<code class="docutils literal notranslate"><span class="pre">EpCombinePlan</span></code>，以及 internode 的
+<code class="docutils literal notranslate"><span class="pre">EP_INTERNODE_PLANS</span></code>：按 pass 名（<code class="docutils literal notranslate"><span class="pre">copystaging</span></code> / <code class="docutils literal notranslate"><span class="pre">dispatch</span></code> / <code class="docutils literal notranslate"><span class="pre">dispatch_ll</span></code> / <code class="docutils literal notranslate"><span class="pre">combinesync</span></code> /
+<code class="docutils literal notranslate"><span class="pre">combinesyncbarrier</span></code> / <code class="docutils literal notranslate"><span class="pre">combine</span></code> / <code class="docutils literal notranslate"><span class="pre">combine_ll</span></code> / <code class="docutils literal notranslate"><span class="pre">combineall</span></code>）索引的八个 plan，因为它的一次
+dispatch/combine 就是一串 pass，每个 pass 各是一个模块。约定两条：标为 <code class="docutils literal notranslate"><span class="pre">e</span></code> 的字段接受 dtype 名或 torch
+dtype；launch 参数里 <code class="docutils literal notranslate"><span class="pre">off&lt;Region&gt;</span></code> 是 arena region 偏移，传 <code class="docutils literal notranslate"><span class="pre">arena=</span></code> 就绑定一次。internode 的枚举不走
+通用的 <code class="docutils literal notranslate"><span class="pre">DTYPES</span></code>，而是 <code class="docutils literal notranslate"><span class="pre">make_plan(...,</span> <span class="pre">enums=...)</span></code> 传进去的两张自己的表 <code class="docutils literal notranslate"><span class="pre">INTERNODE_DTYPES</span></code> /
+<code class="docutils literal notranslate"><span class="pre">INTERNODE_QUANT_TYPES</span></code>，取值必须与 C++ 侧 v2 自己的 <code class="docutils literal notranslate"><span class="pre">EpInterNodeDType</span></code> / <code class="docutils literal notranslate"><span class="pre">EpQuantType</span></code> 一致
+（同 §7 的那条：独立编号 = 静默给错 kernel）。</p>
 <p><strong>为什么是 ctypes</strong>：边界只传指针和标量，没有类型转换可做。pybind11 的代价是编译期（aiter 实测
 libtorch+pybind11 的设备 pass 解析 ~15s）。绑定层里<strong>没有 <code class="docutils literal notranslate"><span class="pre">import</span> <span class="pre">torch</span></code></strong>，靠鸭子类型取 <code class="docutils literal notranslate"><span class="pre">.data_ptr()</span></code>。</p>
 <p><strong>交叉编译是进程级模式</strong>：工具链只解析一次 arch，<code class="docutils literal notranslate"><span class="pre">arch=</span></code> 在那之前经 <code class="docutils literal notranslate"><span class="pre">SetArchOverride()</span></code> 落到一个
@@ -816,7 +851,18 @@ PULL/QUAD gather combine。</p>
 <p><strong>HIP 后端未实现</strong>（由能力门在构造期拒绝）：scatter combine、<code class="docutils literal notranslate"><span class="pre">quant_type</span></code> 量化、StdMoE、per-token
 scales 转发、routing replay、<code class="docutils literal notranslate"><span class="pre">local_expert_count</span></code>。这些在 FlyDSL 后端都有。注意 fp8/fp4 <strong>dispatch</strong>
 已经支持（§3.7）——那是搬运已量化的载荷，和让 mori 自己量化的 <code class="docutils literal notranslate"><span class="pre">quant_type</span></code> 是两回事。</p>
-<p><strong>cross-node 没有</strong>：v2 只有 intranode 两个 body，op 里也没有 <code class="docutils literal notranslate"><span class="pre">kernel_type</span></code> 的概念。</p>
+<p><strong>cross-node 也有了</strong>：<code class="docutils literal notranslate"><span class="pre">src/ops/dispatch_combine_v2/</span></code> 现在是三个 body 头文件——两个 intranode
+（portable / gfx125x TDM）加一个 <code class="docutils literal notranslate"><span class="pre">ep_internode_kernel.hpp</span></code>，后者在一个头里放八个 pass 的 body，
+对应 <code class="docutils literal notranslate"><span class="pre">ep_internode_spec.cpp</span></code> 注册的八个 Spec / 八个 plan（<code class="docutils literal notranslate"><span class="pre">ep_internode_</span></code> + <code class="docutils literal notranslate"><span class="pre">copystaging</span></code> /
+<code class="docutils literal notranslate"><span class="pre">dispatch</span></code> / <code class="docutils literal notranslate"><span class="pre">dispatch_ll</span></code> / <code class="docutils literal notranslate"><span class="pre">combinesync</span></code> / <code class="docutils literal notranslate"><span class="pre">combinesyncbarrier</span></code> / <code class="docutils literal notranslate"><span class="pre">combine</span></code> / <code class="docutils literal notranslate"><span class="pre">combine_ll</span></code> /
+<code class="docutils literal notranslate"><span class="pre">combineall</span></code>）。一轮 dispatch 发 copystaging + dispatch 或 dispatch_ll，一轮 combine 发
+combinesync + combinesyncbarrier + combine 或 combine_ll + combineall。</p>
+<p>选择仍然没有 <code class="docutils literal notranslate"><span class="pre">kernel_type</span></code> 枚举，但有两级选择器：走不走 internode 由 <code class="docutils literal notranslate"><span class="pre">gpu_per_node</span> <span class="pre">&lt;</span> <span class="pre">world_size</span></code>
+（<code class="docutils literal notranslate"><span class="pre">EpDispatchCombineConfig.is_internode</span></code>）决定，只有 <code class="docutils literal notranslate"><span class="pre">hip</span></code> 后端实现它，FlyDSL 后端在能力门里直接
+报错；走哪一族由 <code class="docutils literal notranslate"><span class="pre">internode_kernel</span> <span class="pre">=</span> <span class="pre">auto</span> <span class="pre">|</span> <span class="pre">v2</span> <span class="pre">|</span> <span class="pre">v2_ll</span></code> 决定。<code class="docutils literal notranslate"><span class="pre">v2</span></code> 和 <code class="docutils literal notranslate"><span class="pre">v2_ll</span></code> 是<strong>两族独立
+kernel</strong>——独立的 JIT 模块、入口符号和缓存 key，不是一个 body 的两个分支——所以点名一族就只编那一族；
+<code class="docutils literal notranslate"><span class="pre">auto</span></code>（默认）两族都编，按 launch 的 token 数在 <code class="docutils literal notranslate"><span class="pre">internode_auto_ll_max_tokens</span></code>（默认 512）处切换，
+也只有它能在运行时切。</p>
 </section>
 <section id="id11">
 <h2>10. 测试<a class="headerlink" href="#id11" title="Link to this heading"></a></h2>
@@ -855,6 +901,14 @@ scales 转发、routing replay、<code class="docutils literal notranslate"><spa
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">test_asym_dtype.py</span></code></p></td>
 <td><p>EP8</p></td>
 <td><p>fp8/fp4 dispatch + bf16 combine</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">test_internode_regions.py</span></code></p></td>
+<td><p>单进程，不建 op、不碰 GPU</p></td>
+<td><p>internode arena：region 名与 <code class="docutils literal notranslate"><span class="pre">_internode_static_args</span></code> 的契约（两侧独立转写），以及 kernel 索引算术蕴含的容量上界</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">test_dispatch_combine_v2_internode.py</span></code></p></td>
+<td><p>2 节点 × 8 GPU（EP16），torchrun 起，<code class="docutils literal notranslate"><span class="pre">gpu_per_node</span> <span class="pre">&lt;</span> <span class="pre">world_size</span></code> 才建得起来</p></td>
+<td><p>identity expert 对解析 golden 的逐 rank 正确性；<code class="docutils literal notranslate"><span class="pre">--cmd</span> <span class="pre">bench</span></code> 对齐 v1 harness 的计时循环，<code class="docutils literal notranslate"><span class="pre">--cmd</span> <span class="pre">tuning</span></code> 是 <code class="docutils literal notranslate"><span class="pre">internode_tuning_configs</span></code> 的配对式 sweep；<code class="docutils literal notranslate"><span class="pre">--kernel-type</span> <span class="pre">auto|v2|v2_ll</span></code></p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">bench_ep.py</span></code></p></td>
 <td><p>EP4/EP8</p></td>
