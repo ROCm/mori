@@ -25,28 +25,54 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 
 #include "mori/application/utils/check.hpp"
 
 namespace mori {
 namespace application {
 
-// rocm-smi is loaded via a private dlopen(RTLD_LOCAL) instead of being linked.
-//
-// On the ROCm 7.14 docker we observed that the rsmi_* symbols resolve to two
-// different shared objects in the same process: some calls (e.g. rsmi_init,
-// rsmi_is_P2P_accessible) bind to libamd_smi.so (amdsmi), while the rest bind to
-// librocm_smi64. The two libraries keep separate singletons, so init lands on
-// one and num_monitor_devices on the other -> RSMI_STATUS_INIT_ERROR. This does
-// not happen on ROCm 7.2, so we pin the so ourselves: load librocm_smi64 with
-// RTLD_LOCAL and resolve every rsmi_* symbol from that one handle. Keeping it out
-// of the global scope means all calls hit the same instance.
-//
-// Doing it lazily (after torch has initialized HIP) also lets its NEEDED
-// libamdhip64 resolve to the already-loaded copy instead of pulling in a second
-// HIP runtime, which an LD_PRELOAD of librocm_smi64 would do (causing
-// hipErrorInvalidImage).
+// SMI library is loaded via dlopen(RTLD_LOCAL) instead of being linked.
+// On ROCm 10.1+ (TheRock#6852 removed rocm_smi_lib), we use amd_smi.
+// On ROCm 10.0 and earlier, we use rocm_smi (librocm_smi64).
 namespace {
+
+#if MORI_USE_AMDSMI
+// ---- amd_smi path (ROCm 10.1+) ----
+
+void* OpenAmdSmi() {
+  const char* candidates[] = {
+    std::getenv("MORI_AMD_SMI_PATH"),
+    "libamd_smi.so",
+    "/opt/rocm/lib/libamd_smi.so",
+    std::getenv("MORI_ROCM_SMI_PATH"),
+    "librocm_smi64.so.1",
+    "librocm_smi64.so",
+    "/opt/rocm/lib/librocm_smi64.so.1"
+  };
+  for (const char* path : candidates) {
+    if (path && path[0]) {
+      if (void* h = dlopen(path, RTLD_NOW | RTLD_LOCAL)) return h;
+    }
+  }
+  fprintf(stderr, "[AMD-SMI] dlopen(libamd_smi) failed: %s\n", dlerror());
+  exit(-1);
+}
+
+template <typename Fn>
+Fn Sym(void* handle, const char* name) {
+  void* sym = dlsym(handle, name);
+  if (!sym) {
+    fprintf(stderr, "[AMD-SMI] missing symbol %s\n", name);
+    exit(-1);
+  }
+  return reinterpret_cast<Fn>(sym);
+}
+
+#define AMDSMI_FN(lib, name) auto name = Sym<decltype(&::name)>(lib, #name)
+
+#else
+// ---- rocm_smi path (ROCm <= 10.0) ----
 
 void* OpenRocmSmi() {
   const char* candidates[] = {std::getenv("MORI_ROCM_SMI_PATH"), "librocm_smi64.so.1",
@@ -70,9 +96,9 @@ Fn Sym(void* handle, const char* name) {
   return reinterpret_cast<Fn>(sym);
 }
 
-// Declare a local function pointer `name` resolved from `lib`, reusing the exact
-// signature declared in rocm_smi.h so callers below read like normal rsmi calls.
 #define RSMI_FN(lib, name) auto name = Sym<decltype(&::name)>(lib, #name)
+
+#endif
 
 }  // namespace
 
@@ -82,6 +108,83 @@ Fn Sym(void* handle, const char* name) {
 TopoSystemGpu::TopoSystemGpu() { Load(); }
 
 TopoSystemGpu::~TopoSystemGpu() {}
+
+#if MORI_USE_AMDSMI
+// ---- amd_smi Load() (ROCm 10.1+) ----
+// Uses socket/processor handle model instead of flat device indices.
+
+PciBusId AmdSmiBdf2PciBusId(amdsmi_bdf_t bdf) {
+  uint16_t domain = bdf.domain_number;
+  uint8_t bus = bdf.bus_number;
+  uint8_t dev = bdf.device_number;
+  uint8_t func = bdf.function_number;
+  return PciBusId(domain, bus, dev, func);
+}
+
+void TopoSystemGpu::Load() {
+  void* lib = OpenAmdSmi();
+  AMDSMI_FN(lib, amdsmi_init);
+  AMDSMI_FN(lib, amdsmi_shut_down);
+  AMDSMI_FN(lib, amdsmi_get_socket_handles);
+  AMDSMI_FN(lib, amdsmi_get_processor_handles);
+  AMDSMI_FN(lib, amdsmi_get_gpu_device_bdf);
+  AMDSMI_FN(lib, amdsmi_topo_get_p2p_status);
+  AMDSMI_FN(lib, amdsmi_topo_get_link_type);
+  AMDSMI_FN(lib, amdsmi_topo_get_link_weight);
+  AMDSMI_FN(lib, amdsmi_status_code_to_string);
+
+  ROCM_SMI_CHECK(amdsmi_init(AMDSMI_INIT_AMD_GPUS));
+
+  uint32_t socketCount = 0;
+  ROCM_SMI_CHECK(amdsmi_get_socket_handles(&socketCount, nullptr));
+  std::vector<amdsmi_socket_handle> sockets(socketCount);
+  ROCM_SMI_CHECK(amdsmi_get_socket_handles(&socketCount, sockets.data()));
+
+  uint32_t numGpus = 0;
+  ROCM_SMI_CHECK(amdsmi_get_processor_handles(sockets[0], &numGpus, nullptr));
+  std::vector<amdsmi_processor_handle> handles(numGpus);
+  ROCM_SMI_CHECK(amdsmi_get_processor_handles(sockets[0], &numGpus, handles.data()));
+
+  if (numGpus == 0) {
+    fprintf(stderr, "[AMD-SMI] amdsmi_get_processor_handles reported 0 GPUs\n");
+    exit(-1);
+  }
+
+  for (uint32_t i = 0; i < numGpus; ++i) {
+    TopoNodeGpu* gpu = new TopoNodeGpu();
+    gpus.emplace_back(gpu);
+    amdsmi_bdf_t bdf = {};
+    ROCM_SMI_CHECK(amdsmi_get_gpu_device_bdf(handles[i], &bdf));
+    gpu->busId = AmdSmiBdf2PciBusId(bdf);
+  }
+
+  for (uint32_t i = 0; i < numGpus; ++i) {
+    for (uint32_t j = i; j < numGpus; ++j) {
+      if (i == j) continue;
+      amdsmi_link_type_t link_type = {};
+      amdsmi_p2p_capability_t cap = {};
+      ROCM_SMI_CHECK(amdsmi_topo_get_p2p_status(handles[i], handles[j], &link_type, &cap));
+      if (!cap.is_iolink_coherent && !cap.is_iolink_atomics_32bit && !cap.is_iolink_atomics_64bit) continue;
+
+      TopoNodeGpuP2pLink* p2p = new TopoNodeGpuP2pLink();
+      ROCM_SMI_CHECK(amdsmi_topo_get_link_type(handles[i], handles[j], &p2p->hops, &p2p->type));
+      ROCM_SMI_CHECK(amdsmi_topo_get_link_weight(handles[i], handles[j], &p2p->weight));
+      p2p->gpu1 = gpus[i].get();
+      p2p->gpu2 = gpus[j].get();
+      p2ps.emplace_back(p2p);
+
+      gpus[i]->p2ps.push_back(p2p);
+      gpus[j]->p2ps.push_back(p2p);
+    }
+  }
+
+  ROCM_SMI_CHECK(amdsmi_shut_down());
+  dlclose(lib);
+}
+
+#else
+// ---- rocm_smi Load() (ROCm <= 10.0) ----
+// Uses flat device index model (rsmi_num_monitor_devices, rsmi_dev_pci_id_get).
 
 PciBusId RsmiBusId2PciBusId(uint64_t rsmiBusId) {
   uint16_t domain = (rsmiBusId >> 32);
@@ -117,7 +220,6 @@ void TopoSystemGpu::Load() {
     uint64_t rsmiBusId = 0;
     ROCM_SMI_CHECK(rsmi_dev_pci_id_get(i, &rsmiBusId));
     gpu->busId = RsmiBusId2PciBusId(rsmiBusId);
-    // ROCM_SMI_CHECK(rsmi_topo_numa_affinity_get(reinterpret_cast<uint32_t>(i), &gpu->numaNode));
   }
 
   for (uint32_t i = 0; i < numGpus; ++i) {
@@ -142,6 +244,8 @@ void TopoSystemGpu::Load() {
   ROCM_SMI_CHECK(rsmi_shut_down());
   dlclose(lib);
 }
+
+#endif
 
 std::vector<TopoNodeGpu*> TopoSystemGpu::GetGpus() const {
   std::vector<TopoNodeGpu*> v(gpus.size());
