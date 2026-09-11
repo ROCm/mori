@@ -338,6 +338,48 @@ constexpr int EpScaleStride(const EpCfg& c) {
   return c.scaleBytes <= 0 ? 0 : (c.scaleBytes + EpScaleAlign - 1) / EpScaleAlign * EpScaleAlign;
 }
 
+// The other three pieces of metadata -- out_idx, out_wts and recv_to_src_token --
+// share ONE row per recv slot, padded to 128 B, with the three fields side by side:
+//
+//   [ out_idx(topk) | out_wts(topk) | recv_to_src_token(1) | pad ]
+//
+// The pad is what makes a metadata transfer's destination start on a 128 B
+// boundary for ANY recv slot index. Why that matters: a transfer is a run of
+// consecutive recv slots, and the gfx1250 TDM engine only moves whole 128 B rows.
+// At the natural topk*4 bytes a run starts on a boundary only when slot*topk is a
+// multiple of 32 -- at topk 9, one run in 32 -- and the rest must go as ordinary
+// cross-card stores. Those are not merely slower per byte: as soon as ANY warp in a
+// block issues one, the whole block pays about 10 us, measured by intervention,
+// independent of both the element count and the number of issuing warps
+// (HANDOFF-F01-2 24.2: ct=512 dispatch 50.0us with them, 38.4 without). The slot
+// index cannot be aligned instead -- it comes from one shared atomicAdd per peer and
+// also indexes the payload, so padding it would leave holes in both.
+//
+// One shared row rather than three separately padded ones because the write cost is
+// charged per 128 B line the store touches, not per byte: three regions put three
+// partly-filled lines on the wire per slot (36 + 36 + 4 bytes written into 384), and
+// that costs about 2.5 us per line per slot at ct=4096, which is more than removing
+// the ordinary stores gives back there. Measured by dropping the 4-byte srcmap store
+// from a three-region build: -2.2 to -2.9 us, where per byte it would be -0.1
+// (HANDOFF-F01-2 24.4). One row is one line, and the topk rows are full.
+//
+// Everything that lands in or reads this region must use EpMetaDw plus the field's
+// column, including hip_backend's region size and the recv_* views. The three EpArgs
+// offsets alias one arena region: they are bound from one name, and the fast path
+// ships the whole row in a single transfer, which is only correct because they do.
+constexpr int EpMetaAlign = 128;
+// Dwords per slot, pad included. Every user indexes this region as a 4-byte array.
+constexpr int EpMetaDw(const EpCfg& c) {
+  return ((c.numExpertPerToken * 2 + 1) * 4 + EpMetaAlign - 1) / EpMetaAlign * EpMetaAlign / 4;
+}
+// Column of each field within the row. The columns past the last one are pad, and
+// they are shipped rather than skipped: writing the whole row is one flat transfer
+// instead of a strided one, which measured 1.2 to 3.8 us better at ct=4096
+// (HANDOFF-F01-2 24.4). The pad carries zeros and nobody reads it.
+constexpr int EpMetaIdxDw(const EpCfg&) { return 0; }
+constexpr int EpMetaWtsDw(const EpCfg& c) { return c.numExpertPerToken; }
+constexpr int EpMetaSrcDw(const EpCfg& c) { return c.numExpertPerToken * 2; }
+
 // gfx1250 launch LDS. Dispatch stages one token tile per warp through the TDM
 // engine; combine reserves the whole budget and sizes its tiles at runtime.
 // EpCombine1250xLdsBudget must match MORI_COMB_LDS_BUDGET in ep_intranode_1250x.hpp.

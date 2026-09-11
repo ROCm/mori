@@ -801,6 +801,27 @@ class EpDispatchCombineOp:
         """
         return self._scale_row_bytes()
 
+    def meta_layout(self, field: str):
+        """Where a metadata field lives: (region, dwords per slot, first column,
+        columns). `field` is one of out_idx, out_wts, recv_to_src_token.
+
+        Three packed regions by default, each field at column 0 of its own. A backend
+        that interleaves them into one padded row overrides this -- the HIP intranode
+        path does, so that every slot's landing address is on a 128 B TDM row.
+        """
+        cols = 1 if field == "recv_to_src_token" else self.cfg.num_experts_per_token
+        return self._region(field), cols, 0, cols
+
+    def _meta_view(self, field: str, dtype):
+        """A [recv_cap, columns] view of one metadata field. Strided, so it is a view
+        and not a copy; callers reading the region by pointer need the pitch
+        meta_layout reports rather than this shape."""
+        region, stride_i32, col, ncols = self.meta_layout(field)
+        rows = from_gpu_ptr(
+            self.arena.local_ptr(region), (self._recv_cap, stride_i32), dtype
+        )
+        return rows[:, col : col + ncols]
+
     def _scale_row_bytes(self) -> int:
         """The caller's row in bytes, dword-rounded. 0 when the transport is off."""
         n = self.cfg.scale_dim * self.cfg.scale_type_size
@@ -961,11 +982,9 @@ class EpDispatchCombineOp:
         # host cost on a path where the host already paces the GPU.
         reverse = getattr(self, "_reverse_view", None)
         if reverse is None:
-            reverse = from_gpu_ptr(
-                self.arena.local_ptr(self._region("recv_to_src_token")),
-                (self._recv_cap,),
-                torch.int32,
-            )
+            # One element per slot, but the slot may be a column of a wider shared
+            # row, so ask meta_layout rather than assume the region is packed.
+            reverse = self._meta_view("recv_to_src_token", torch.int32)[:, 0]
             self._reverse_view = reverse
         handle = EpDispatchRoutingHandle(
             disp_dest_tok_id_map=dest_map,

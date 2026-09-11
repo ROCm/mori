@@ -205,7 +205,13 @@ __device__ void EpDispatchBody(EpArgs args) {
         args.dispDestTokIdMap[i] = EpFlatIndex<kCfg>(destPe, destTokId);
         // Tell the destination which global source token owns that slot, so
         // combine can route the reduction back.
-        EpPeer<int>(win, destPe, args.offRecvToSrc)[destTokId] =
+        // One 128 B row per slot with all three metadata fields side by side
+        // (EpMetaAlign in ep_cfg.hpp): the gfx1250 path needs every landing address
+        // on a TDM row, and both kernels share one arena. Here the layout buys
+        // nothing -- this body stores per token -- but the reader cannot tell which
+        // kernel produced the arena, so there is one layout.
+        EpPeer<int>(win, destPe,
+                    args.offRecvToSrc)[(size_t)destTokId * EpMetaDw(kCfg) + EpMetaSrcDw(kCfg)] =
             EpSrcTokIndex<kCfg>(myPe, srcTokId);
       }
       destTokId = __shfl(destTokId, 0);
@@ -213,11 +219,13 @@ __device__ void EpDispatchBody(EpArgs args) {
       if (laneId < kTopk) {
         if constexpr (kCfg.useWeights) {
           if (args.weightsBuf) {
-            EpPeer<float>(win, destPe, args.offOutWts)[destTokId * kTopk + laneId] =
+            EpPeer<float>(win, destPe, args.offOutWts)[(size_t)destTokId * EpMetaDw(kCfg) +
+                                                       EpMetaWtsDw(kCfg) + laneId] =
                 args.weightsBuf[srcTokId * kTopk + laneId];
           }
         }
-        EpPeer<int>(win, destPe, args.offOutIdx)[destTokId * kTopk + laneId] =
+        EpPeer<int>(win, destPe, args.offOutIdx)[(size_t)destTokId * EpMetaDw(kCfg) +
+                                                 EpMetaIdxDw(kCfg) + laneId] =
             args.tokenIndices[srcTokId * kTopk + laneId];
       }
 
@@ -399,7 +407,8 @@ __device__ void EpCombineBody(EpArgs args) {
         srcPtrs[j] =
             EpPeer<T>(win, destPe, args.offOutTok) + destLocalTokId * kHidden + hiddenOffset;
         if constexpr (kCfg.useWeights) {
-          srcWeightPtrs[j] = EpPeer<float>(win, destPe, args.offOutWts) + destLocalTokId * kTopk;
+          srcWeightPtrs[j] = EpPeer<float>(win, destPe, args.offOutWts) +
+                             (size_t)destLocalTokId * EpMetaDw(kCfg) + EpMetaWtsDw(kCfg);
         }
       } else {
         srcPtrs[j] = nullptr;

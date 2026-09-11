@@ -204,9 +204,20 @@ __device__ __forceinline__ gfx1250_TDM_GROUP1 TdmSplitShape(const TdmSplit128& s
 #define CUSPLIT_MAX_BLOCKS 512
 #define CUSPLIT_MAX_TOPK 16
 
-alignas(kTdmRowBytes) __device__ index_t _cusplit_stgIdx[CUSPLIT_POOL_SLOTS * CUSPLIT_MAX_TOPK];
-alignas(kTdmRowBytes) __device__ float _cusplit_stgWt[CUSPLIT_POOL_SLOTS * CUSPLIT_MAX_TOPK];
-alignas(kTdmRowBytes) __device__ index_t _cusplit_stgSrc[CUSPLIT_POOL_SLOTS];
+// idx, weights and srcmap staged INTERLEAVED, one row per (peer, dest slot), laid out
+// exactly as the destination row is -- same pitch, same columns, pad included
+// (EpMetaDw in ep_cfg.hpp). Interleaved rather than three pools because that is what
+// lets a run reach the tile as one TDM load and leave as one TDM store: three pools
+// would need the tile filled column by column with ordinary LDS stores, which
+// measured 4.6 us worse at ct=4096 than letting the engine do it.
+//
+// Same pitch as the destination, so both transfers are flat runs with no stride at
+// all. Staging at the packed 2*topk+1 instead and striding only the store also works
+// and moves less, but measured worse: ct=4096 topk 6 134.7 strided vs 130.9 flat,
+// topk 9 144.6 vs 143.4, 2/2 each (HANDOFF-F01-2 24.4). The pad ships as zeros
+// without anyone writing it: a __device__ array starts zeroed and nothing ever
+// touches those columns.
+alignas(kTdmRowBytes) __device__ index_t _cusplit_stgMeta[CUSPLIT_POOL_SLOTS * MORI_EP_META_DW];
 __device__ index_t _cusplit_blkBase[CUSPLIT_MAX_BLOCKS * MORI_EP_WORLD_SIZE];
 __device__ index_t _cusplit_blkCount[CUSPLIT_MAX_BLOCKS * MORI_EP_WORLD_SIZE];
 // Per-token scale rows, staged like the other meta fields so they ship to a peer as
@@ -223,13 +234,13 @@ constexpr size_t kEpScaleSlots = (size_t)MORI_EP_SCALE_SLOTS;
 // Per-peer stride. NOT _stgCap: that one sizes the idx/wt pool, which is a
 // different (larger) constant, and indexing this array with it walks off the end.
 constexpr size_t kEpScaleRows = (size_t)MORI_EP_SCALE_ROWS;
-constexpr int kMetaFields = 4;  // idx, weights, srcmap, scale
+constexpr int kMetaFields = 2;  // the interleaved idx+weights+srcmap row, and scale
 #else
 constexpr int kEpScaleBytes = 0;
 constexpr int kEpScaleStride = 0;
 constexpr size_t kEpScaleSlots = 1;
 constexpr size_t kEpScaleRows = 1;
-constexpr int kMetaFields = 3;  // idx, weights, srcmap
+constexpr int kMetaFields = 1;  // the interleaved idx+weights+srcmap row
 #endif
 // FOOTPRINT, and it is quadratic in world_size: kEpScaleSlots is
 // worldSize * EpMaxRecv, and EpMaxRecv is itself worldSize * maxTokPerRank. That
@@ -419,7 +430,8 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
         args.dispDestTokIdMap[(size_t)tok * topk + _eLane] =
             EpFlatIndex<kCfg>(myDestPe, myDestTokId);
         if (myDestTokId < _stgCap)
-          _cusplit_stgSrc[(size_t)myDestPe * _stgCap + myDestTokId] =
+          _cusplit_stgMeta[(size_t)myDestPe * _stgCap * MORI_EP_META_DW +
+                           (size_t)myDestTokId * MORI_EP_META_DW + EpMetaSrcDw(kCfg)] =
               EpSrcTokIndex<kCfg>(myPe, tok);
       } else if (act) {
         args.dispDestTokIdMap[(size_t)tok * topk + _eLane] = EpNullFlat<kCfg>();
@@ -441,25 +453,30 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
         int gTok = __shfl(tok, sl);
         if (srcLane < 0) continue;
         if (dt < 0 || dt >= _stgCap) continue;
-        index_t* sIdx =
-            _cusplit_stgIdx + (size_t)d * _stgCap * CUSPLIT_MAX_TOPK + (size_t)dt * topk;
-        float* sWt = _cusplit_stgWt + (size_t)d * _stgCap * CUSPLIT_MAX_TOPK + (size_t)dt * topk;
+        // One staged row per (peer, dest slot), the three fields in the order the
+        // destination row has them. The whole row ships in one transfer, so a column
+        // left unwritten would carry this card's leftovers into a peer's out_wts
+        // rather than merely leave a stale value there: zero it when weights are off.
+        index_t* sRow = _cusplit_stgMeta + (size_t)d * _stgCap * MORI_EP_META_DW +
+                        (size_t)dt * MORI_EP_META_DW;
+        index_t* sIdx = sRow + EpMetaIdxDw(kCfg);
+        float* sWt = reinterpret_cast<float*>(sRow + EpMetaWtsDw(kCfg));
+        const bool wtOn = kCfg.useWeights && args.weightsBuf != nullptr;
         if (_metapreOk) {
           if (myE < topk) {
             sIdx[myE] = _pIdx;
-            if constexpr (kCfg.useWeights) {
-              if (args.weightsBuf) sWt[myE] = _pWt;
-            }
+            if constexpr (kCfg.useWeights) sWt[myE] = wtOn ? _pWt : 0.0f;
           }
         } else {
           for (int e = myE; e < topk; e += gsz)
             sIdx[e] = args.tokenIndices[(size_t)gTok * topk + e];
           if constexpr (kCfg.useWeights) {
-            if (args.weightsBuf) {
-              for (int e = myE; e < topk; e += gsz)
-                sWt[e] = args.weightsBuf[(size_t)gTok * topk + e];
-            }
+            for (int e = myE; e < topk; e += gsz)
+              sWt[e] = wtOn ? args.weightsBuf[(size_t)gTok * topk + e] : 0.0f;
           }
+        }
+        if constexpr (!kCfg.useWeights) {
+          for (int e = myE; e < topk; e += gsz) sWt[e] = 0.0f;
         }
         if constexpr (kEpScaleBytes > 0) {
           if (args.scalesBuf) {
@@ -486,14 +503,21 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
 
   bool _mPend = false;
   if (args.tokenIndices && args.inpTokenBuf) {
-    const int tkM = topk;
     const index_t recvCapM = (index_t)EpMaxRecv(kCfg);
     const index_t _stgCapM = (index_t)(CUSPLIT_POOL_SLOTS / npes);
+    // The destination slot stride, padded to 128 B, and the columns inside it. Every
+    // landing address below is a multiple of the stride, which is what puts each
+    // transfer on a TDM row for any slot index -- see EpMetaAlign in ep_cfg.hpp for
+    // why that is worth 10 us, and why all three fields share one row.
+    constexpr int kMetaDw = EpMetaDw(kCfg);
+    static_assert(MORI_EP_META_DW == EpMetaDw(kCfg),
+                  "MORI_EP_META_DW disagrees with EpMetaDw(Cfg) -- the staging pool would be "
+                  "sized at one pitch and written at another");
     // One warp owns a whole (peer, sub-range) run, moving idx+wt+srcmap through one tile.
     const int mtileBytesM = kSlabBytes;  // the whole slab, see above
-    // idx + weights + srcmap + the scale row, at the stride it is really moved at:
-    // sizing this from the unpadded row would under-size the tile it then holds.
-    const int perTokM = tkM * 4 + tkM * 4 + 4 + EpScaleStride(kCfg);
+    // The interleaved metadata row plus the scale row, at the stride each is really
+    // moved at: sizing this from an unpadded row would under-size the tile.
+    const int perTokM = kMetaDw * 4 + EpScaleStride(kCfg);
     // 128B of slack per field region for the rounding below.
     const int tokCapM = (perTokM > 0) ? ((mtileBytesM - 128 * kMetaFields) / perTokM) : 0;
     if (tokCapM > 0) {
@@ -515,78 +539,44 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
           index_t ab = baseAll + myBeg + cs;
           if (ab + cc > recvCapM) continue;
           if (ab + cc > _stgCapM) continue;
-          const int nIdxB = cc * tkM, nWtB = cc * tkM;
-          index_t* sI =
-              _cusplit_stgIdx + (size_t)peer * _stgCapM * CUSPLIT_MAX_TOPK + (size_t)ab * tkM;
-          float* sW =
-              _cusplit_stgWt + (size_t)peer * _stgCapM * CUSPLIT_MAX_TOPK + (size_t)ab * tkM;
-          index_t* sR = _cusplit_stgSrc + (size_t)peer * _stgCapM + (size_t)ab;
-          index_t* dI = EpPeer<index_t>(win, peer, args.offOutIdx) + (size_t)ab * tkM;
-          float* dW = (kCfg.useWeights && args.weightsBuf)
-                          ? (EpPeer<float>(win, peer, args.offOutWts) + (size_t)ab * tkM)
-                          : nullptr;
-          index_t* dR = EpPeer<index_t>(win, peer, args.offRecvToSrc) + (size_t)ab;
-          const TdmSplit128 spI = TdmPlanXfer4B(sI, dI, nIdxB);
-          const TdmSplit128 spW =
-              (dW != nullptr) ? TdmPlanXfer4B(sW, dW, nWtB) : TdmSplit128{0, 0, 0};
-          const TdmSplit128 spR = TdmPlanXfer4B(sR, dR, cc);
-          // Scale rides as a fourth field: same run, same tile, one more descriptor.
+          // Staged at the same pitch the destination has, so this run is a flat
+          // kMetaDw * cc dword copy on both sides. No transfer has a prefix or a tail
+          // left over, hence no ordinary cross-card store.
+          index_t* sM = _cusplit_stgMeta + (size_t)peer * _stgCapM * MORI_EP_META_DW +
+                        (size_t)ab * kMetaDw;
+          // offOutIdx alone, at column 0: the three metadata offsets are bound from
+          // one arena region (see _REGIONS in hip_backend.py), so this one store
+          // delivers all three fields. Using the other two here would be the same
+          // address; using them would just hide that the layout requires the alias.
+          index_t* dM = EpPeer<index_t>(win, peer, args.offOutIdx) + (size_t)ab * kMetaDw;
+          // Scale rides as a second field: same run, same tile, one more descriptor.
           // The stride, not the caller's row: it is what puts `ab * kSdw` on a
-          // 128 B boundary, so this run gets a body instead of a scalar tail.
+          // 128 B boundary, the same thing the metadata row's pad does.
           constexpr int kSdw = (kEpScaleStride > 0) ? kEpScaleStride / 4 : 0;
-          const int nScB = cc * kSdw;
           unsigned int* sS = reinterpret_cast<unsigned int*>(_cusplit_stgScale) +
                              (size_t)peer * kEpScaleRows * kSdw + (size_t)ab * kSdw;
           unsigned int* dS =
               (kEpScaleBytes > 0 && args.scalesBuf)
                   ? (EpPeer<unsigned int>(win, peer, args.offOutScales) + (size_t)ab * kSdw)
                   : nullptr;
-          const TdmSplit128 spS =
-              (dS != nullptr) ? TdmPlanXfer4B(sS, dS, nScB) : TdmSplit128{0, 0, 0};
-          int* tI = reinterpret_cast<int*>(_m4);
-          int* tW = tI + ((spI.body + 31) & ~31);
-          int* tR = tW + ((spW.body + 31) & ~31);
-          int* tS = tR + ((spR.body + 31) & ~31);
-          gfx1250_TDM_GROUP1 gI{}, gW{}, gR{}, gS{};
+          int* tM = reinterpret_cast<int*>(_m4);
+          int* tS = tM + ((cc * kMetaDw + 31) & ~31);
+          // One descriptor for both directions: rows as wide as the pitch, which is
+          // a flat run. The scale row is staged at a 128 B stride already, so for it
+          // the two pitches coincide in the same way.
+          const gfx1250_TDM_GROUP1 gM = TdmShapeGather<int>(kMetaDw, cc, kMetaDw);
+          gfx1250_TDM_GROUP1 gS{};
+          if constexpr (kSdw > 0) gS = TdmShapeGather<int>(kSdw, cc, kSdw);
           if (_mPend) {
             __builtin_amdgcn_s_wait_tensorcnt(0);
             _mPend = false;
           }
-          MORI_TDM_CHECK_XFER(sI, dI, nIdxB, spI);
-          MORI_TDM_CHECK_XFER(sW, dW, nWtB, spW);
-          MORI_TDM_CHECK_XFER(sR, dR, cc, spR);
-          MORI_TDM_CHECK_XFER(sS, dS, nScB, spS);
-          if (spI.body) gI = TdmSplitShape(spI);
-          if (spW.body) gW = TdmSplitShape(spW);
-          if (spR.body) gR = TdmSplitShape(spR);
-          if (spS.body) gS = TdmSplitShape(spS);
-          if (spI.body) TdmIssueLoad<int>(tI, reinterpret_cast<int*>(sI + spI.head), gI);
-          if (spW.body) TdmIssueLoad<int>(tW, reinterpret_cast<int*>(sW + spW.head), gW);
-          if (spR.body) TdmIssueLoad<int>(tR, reinterpret_cast<int*>(sR + spR.head), gR);
-          if (spS.body) TdmIssueLoad<int>(tS, reinterpret_cast<int*>(sS + spS.head), gS);
-#define _MHT_REM(dstp, glbp, hd, bd, ntot)                                         \
-  do {                                                                             \
-    for (int i = laneId; i < (hd); i += WS) (dstp)[i] = (glbp)[i];                 \
-    for (int i = (hd) + (bd) + laneId; i < (ntot); i += WS) (dstp)[i] = (glbp)[i]; \
-  } while (0)
-          _MHT_REM(reinterpret_cast<int*>(dI), reinterpret_cast<int*>(sI), spI.head, spI.body,
-                   nIdxB);
-          if (dW)
-            _MHT_REM(reinterpret_cast<int*>(dW), reinterpret_cast<int*>(sW), spW.head, spW.body,
-                     nWtB);
-          _MHT_REM(dR, sR, spR.head, spR.body, cc);
-          if (dS)
-            _MHT_REM(reinterpret_cast<int*>(dS), reinterpret_cast<int*>(sS), spS.head, spS.body,
-                     nScB);
-#undef _MHT_REM
-          if (spI.body || spW.body || spR.body || spS.body) {
-            __builtin_amdgcn_s_wait_tensorcnt(0);
-            if (spI.body) TdmIssueStore<int>(reinterpret_cast<int*>(dI + spI.head), tI, gI);
-            if (spW.body) TdmIssueStore<int>(reinterpret_cast<int*>(dW + spW.head), tW, gW);
-            if (spR.body) TdmIssueStore<int>(reinterpret_cast<int*>(dR + spR.head), tR, gR);
-            if (spS.body) TdmIssueStore<int>(reinterpret_cast<int*>(dS + spS.head), tS, gS);
-            _mPend = true;
-          }
+          TdmIssueLoad<int>(tM, reinterpret_cast<int*>(sM), gM);
+          if (dS) TdmIssueLoad<int>(tS, reinterpret_cast<int*>(sS), gS);
+          __builtin_amdgcn_s_wait_tensorcnt(0);
+          TdmIssueStore<int>(reinterpret_cast<int*>(dM), tM, gM);
+          if (dS) TdmIssueStore<int>(reinterpret_cast<int*>(dS), tS, gS);
+          _mPend = true;
         }
       }
     } else {
@@ -594,26 +584,18 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
       for (int item = warpId; item < nItems; item += warpNum) {
         int peer = item / kMetaFields;
         int field = item - peer * kMetaFields;
-        if (field == 1 && !(kCfg.useWeights && args.weightsBuf)) continue;
         index_t cnt = _cusplit_blkCount[(size_t)blockIdx.x * npes + peer];
         if (cnt <= 0) continue;
         index_t ab = _cusplit_blkBase[(size_t)blockIdx.x * npes + peer];
         if (ab + cnt > recvCapM) continue;
         if (ab + cnt > _stgCapM) continue;
+        // Both sides at the same pitch, so this is a flat copy. Reached only when the
+        // tile cannot hold one token, which no shipping config does.
         if (field == 0) {
-          index_t* src =
-              _cusplit_stgIdx + (size_t)peer * _stgCapM * CUSPLIT_MAX_TOPK + (size_t)ab * tkM;
-          index_t* dst = EpPeer<index_t>(win, peer, args.offOutIdx) + (size_t)ab * tkM;
-          for (int i = laneId; i < (int)cnt * tkM; i += WS) dst[i] = src[i];
-        } else if (field == 1) {
-          float* src =
-              _cusplit_stgWt + (size_t)peer * _stgCapM * CUSPLIT_MAX_TOPK + (size_t)ab * tkM;
-          float* dst = EpPeer<float>(win, peer, args.offOutWts) + (size_t)ab * tkM;
-          for (int i = laneId; i < (int)cnt * tkM; i += WS) dst[i] = src[i];
-        } else if (field == 2) {
-          index_t* src = _cusplit_stgSrc + (size_t)peer * _stgCapM + (size_t)ab;
-          index_t* dst = EpPeer<index_t>(win, peer, args.offRecvToSrc) + (size_t)ab;
-          for (int i = laneId; i < (int)cnt; i += WS) dst[i] = src[i];
+          index_t* src = _cusplit_stgMeta + (size_t)peer * _stgCapM * MORI_EP_META_DW +
+                         (size_t)ab * kMetaDw;
+          index_t* dst = EpPeer<index_t>(win, peer, args.offOutIdx) + (size_t)ab * kMetaDw;
+          for (int i = laneId; i < (int)cnt * kMetaDw; i += WS) dst[i] = src[i];
         } else if constexpr (kEpScaleStride > 0) {
           constexpr int kSdw = kEpScaleStride / 4;
           unsigned int* src = reinterpret_cast<unsigned int*>(
@@ -927,7 +909,10 @@ __device__ void EpCombine1250xBody(EpArgs args) {
             index_t _dl = EpLocalTokFromFlat<kCfg>(_dt);
             srcPtrs[_j] = EpPeer<TokT>(win, _dp, args.offOutTok) + (size_t)_dl * hiddenDim;
             if constexpr (kCfg.useWeights) {
-              srcWeightsPtr[_j] = EpPeer<float>(win, _dp, args.offOutWts) + (size_t)_dl * topk;
+              // The row is still topk wide; only the slot stride is padded.
+              srcWeightsPtr[_j] =
+                  EpPeer<float>(win, _dp, args.offOutWts) + (size_t)_dl * EpMetaDw(kCfg) +
+                  EpMetaWtsDw(kCfg);
             }
           } else {
             srcPtrs[_j] = nullptr;
@@ -1159,7 +1144,8 @@ __device__ void EpCombine1250xBody(EpArgs args) {
           srcPtrs[j] = EpPeer<TokT>(win, destPe, args.offOutTok) + destLocalTokId * hiddenDim +
                        hiddenDimOffset;
           if constexpr (kCfg.useWeights) {
-            srcWeightsPtr[j] = EpPeer<float>(win, destPe, args.offOutWts) + destLocalTokId * topk;
+            srcWeightsPtr[j] = EpPeer<float>(win, destPe, args.offOutWts) +
+                               (size_t)destLocalTokId * EpMetaDw(kCfg) + EpMetaWtsDw(kCfg);
           }
         } else {
           srcPtrs[j] = nullptr;

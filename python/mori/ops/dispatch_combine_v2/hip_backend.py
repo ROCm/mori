@@ -66,12 +66,18 @@ from .symm_arena import SymmArena
 # FlyDSL op's, and so do the sizes EXCEPT out_scales -- this backend pads the row,
 # FlyDSL does not. A plan binds offsets, never sizes, so an arena sized for the
 # wrong one is overrun silently: size it from scale_stride_bytes().
+#
+# recvToSrc / outIdx / outWts deliberately map to ONE region: the intranode kernels
+# lay all three down side by side in a single 128 B row per recv slot (EpMetaDw in
+# ep_cfg.hpp), and the fast path ships that row in one transfer, which is only
+# correct if the three offsets are the same address. Column offsets are the kernel's
+# business -- a plan binds a region's base, and there is nowhere to put a column.
 _REGIONS = {
     "tokOff": "tok_off",
     "recvNum": "recv_num",
-    "recvToSrc": "recv_to_src_token",
-    "outIdx": "out_idx",
-    "outWts": "out_wts",
+    "recvToSrc": "out_meta",
+    "outIdx": "out_meta",
+    "outWts": "out_meta",
     "dispOut": "disp_out",
     "outTok": "out_tok",
     "xdb": "cross_device_barrier",
@@ -91,6 +97,23 @@ _DISPATCH_DTYPES = {
 _COMBINE_DTYPES = {torch.bfloat16: 2, torch.float32: 4}
 # Must match EpScaleAlign in include/mori/ops/dispatch_combine_v2/ep_cfg.hpp.
 _SCALE_ALIGN = 128
+# Must match EpMetaAlign there. Same number, separate constant, because it is a
+# separate decision: this one pads the shared out_idx / out_wts / recv_to_src_token
+# row.
+_META_ALIGN = 128
+
+
+def meta_row_bytes(topk: int) -> int:
+    """Bytes per recv slot in the shared metadata region: EpMetaDw in ep_cfg.hpp.
+
+    One row holds out_idx(topk), out_wts(topk) and recv_to_src_token(1) side by side,
+    padded so that every slot's landing address is on a 128 B TDM row -- see
+    EpMetaAlign for what that buys and why one row rather than three. Mirrored from
+    the C++ because sizing happens before any kernel exists. INTRANODE only: the
+    internode kernels keep the three packed and separate.
+    """
+    used = (2 * topk + 1) * 4
+    return (used + _META_ALIGN - 1) // _META_ALIGN * _META_ALIGN
 
 # Which tuning-table dtype column a dispatch dtype reads.
 _FP8_TUNING_DTYPES = (torch.float8_e4m3fnuz, torch.float8_e4m3fn)
@@ -454,6 +477,22 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             return self._scale_row_bytes()
         return scale_stride_bytes(self._scale_row_bytes())
 
+    def meta_layout(self, field: str):
+        """(region, dwords per slot, first column, columns) for a metadata field.
+
+        On the INTRANODE path the three fields share one 128 B-padded row in one
+        region, so each is a column slice of it; internode keeps them packed and
+        separate, which is what the base class already describes."""
+        if self.cfg.is_internode:
+            return super().meta_layout(field)
+        topk = self.cfg.num_experts_per_token
+        col, ncols = {
+            "out_idx": (0, topk),
+            "out_wts": (topk, topk),
+            "recv_to_src_token": (2 * topk, 1),
+        }[field]
+        return "out_meta", meta_row_bytes(topk) // 4, col, ncols
+
     @classmethod
     def _scale_stride_i32(cls, cfg) -> int:
         """Dwords per DESTINATION scale row, 0 when the transport is off."""
@@ -471,12 +510,18 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # only forms that are right for fp4, where 2 values share a byte.
         cap = cfg.effective_max_recv
         topk = cfg.num_experts_per_token
+        # out_idx, out_wts and recv_to_src_token in ONE region, one 128 B-padded row
+        # per slot, because that is the layout the kernels write -- see _REGIONS above
+        # and EpMetaDw in ep_cfg.hpp. Sized by the padded row for the same reason
+        # out_scales is: an arena sized for the packed row is overrun by the last slots.
+        assert SymmArena._ALIGN % _META_ALIGN == 0, (
+            f"SymmArena._ALIGN={SymmArena._ALIGN} does not keep out_meta "
+            f"{_META_ALIGN} B-aligned; the padding in EpMetaDw buys nothing"
+        )
         regions = [
             ("tok_off", 4),
             ("recv_num", cfg.world_size * 4),
-            ("recv_to_src_token", cap * 4),
-            ("out_idx", cap * topk * 4),
-            ("out_wts", cap * topk * 4),
+            ("out_meta", cap * meta_row_bytes(topk)),
             ("disp_out", cap * cfg.token_nbytes),
             ("out_tok", cap * cfg.combine_token_nbytes),
             ("cross_device_barrier", cfg.world_size * 8),
@@ -1094,10 +1139,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     _VIEW_REGION = {
         "disp_out": ("disp_out", "inter_dispatch_out"),
         "out_tok": ("out_tok", "inter_combine_inp"),
-        "out_wts": ("out_wts", "dispatch_out_weights"),
-        "out_idx": ("out_idx", "out_indices"),
+        # The three metadata fields are one intranode region and three internode
+        # ones; meta_layout is what turns a field into a region plus a column.
+        "out_wts": ("out_meta", "dispatch_out_weights"),
+        "out_idx": ("out_meta", "out_indices"),
         "out_scales": ("out_scales", "out_scales"),
-        "recv_to_src_token": ("recv_to_src_token", "disp_tok_id_to_src_tok_id"),
+        "recv_to_src_token": ("out_meta", "disp_tok_id_to_src_tok_id"),
     }
 
     def _region(self, name):
@@ -1132,22 +1179,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     def recv_weights(self):
         view = self._views.get("recv_weights")
         if view is None:
-            view = from_gpu_ptr(
-                self.arena.local_ptr(self._region("out_wts")),
-                (self._recv_cap, self.cfg.num_experts_per_token),
-                torch.float32,
-            )
+            view = self._meta_view("out_wts", torch.float32)
             self._views["recv_weights"] = view
         return view
 
     def recv_indices(self):
         view = self._views.get("recv_indices")
         if view is None:
-            view = from_gpu_ptr(
-                self.arena.local_ptr(self._region("out_idx")),
-                (self._recv_cap, self.cfg.num_experts_per_token),
-                torch.int32,
-            )
+            view = self._meta_view("out_idx", torch.int32)
             self._views["recv_indices"] = view
         return view
 

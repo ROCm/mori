@@ -163,8 +163,14 @@ std::string RenderEpSource(const EpCfg& cfg, const std::string& entry, const cha
                 "\n#define MORI_EP_SCALE_SLOTS " +
                 std::to_string((long long)cfg.worldSize * EpMaxRecv(cfg)) + "\n";
   }
+  // The metadata staging pitch, for the same reason the scale macros exist: the pool
+  // is at file scope, before kCfg. Sized from the Cfg rather than from a worst-case
+  // topk because the pool is worldSize^2 * maxTokPerRank rows -- 33 MB at EP4 with
+  // 16384 tok/rank at topk 6, and a topk-16 constant would double that in every
+  // compiled variant. A static_assert in the header checks it against EpMetaDw.
   std::string worldDef = "#define MORI_EP_WORLD_SIZE " + std::to_string(cfg.worldSize) + "\n" +
-                         "#define MORI_EP_MAX_RECV " + std::to_string(EpMaxRecv(cfg)) + "\n";
+                         "#define MORI_EP_MAX_RECV " + std::to_string(EpMaxRecv(cfg)) + "\n" +
+                         "#define MORI_EP_META_DW " + std::to_string(EpMetaDw(cfg)) + "\n";
   return std::string("// mori jit v2 — generated, do not edit.\n") + worldDef + scaleDefs +
          "#include \"" + header +
          "\"\n"
