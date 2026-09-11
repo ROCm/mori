@@ -79,6 +79,106 @@ def test_validate_rejects_zero_chunks():
         layout.ArConfig(world_size=8, m=4096, n=7168, counter_chunks=0).validate()
 
 
+def test_bf16_wire_layout_is_unchanged_by_the_fp8_option():
+    """Adding the fp8 wire must not move a single bf16 offset.
+
+    The bf16 path is what ships today and what every recorded measurement is
+    on, so the fp8 regions have to be additive. On bf16 ``gout`` aliases
+    ``output`` and every scale region is zero-sized.
+    """
+    c = layout.ArConfig(world_size=8, m=16384, n=7168, recv_slots=8, counter_chunks=8)
+    c.validate()
+    assert c.comm_dtype == "bf16"
+    # 700.0056 MiB -- the size the running server logs, before any of the
+    # fp8 regions existed.
+    assert c.window_bytes == 734009088
+    assert c.gout_off == c.output_off
+    assert c.gout_bytes == 0
+    assert c.scatter_scale_bytes == 0
+    assert c.gather_scale_bytes == 0
+    assert c.recv_scale_bytes == 0
+    assert c.wire_slice_bytes == c.slice_bytes
+
+
+def test_fp8_wire_halves_the_payload_and_every_region_is_disjoint():
+    c = layout.ArConfig(
+        world_size=8,
+        m=16384,
+        n=7168,
+        recv_slots=8,
+        counter_chunks=8,
+        comm_dtype="fp8",
+    )
+    c.validate()
+    assert c.wire_slice_bytes * 2 == c.slice_bytes
+    assert c.wire_nbytes * 2 == c.nbytes
+    # output stays bf16: it is the consumer's tensor, not a wire format.
+    assert c.nbytes == c.m * c.n * 2
+
+    regions = [
+        ("input", c.input_off, c.wire_nbytes),
+        ("input_scale", c.input_scale_off, c.scatter_scale_bytes),
+        ("output", c.output_off, c.nbytes),
+        ("gout", c.gout_off, c.gout_bytes),
+        ("gout_scale", c.gout_scale_off, c.gather_scale_bytes),
+        ("tmp", c.tmp_off, c.tmp_bytes),
+        ("recv", c.recv_off, c.recv_bytes),
+        ("recv_scale", c.recv_scale_off, c.recv_scale_bytes),
+    ]
+    regions.sort(key=lambda r: r[1])
+    for (an, ao, asz), (bn, bo, _) in zip(regions, regions[1:]):
+        assert ao + asz <= bo, f"{an} [{ao}, {ao + asz}) overruns {bn} at {bo}"
+    last_n, last_o, last_sz = regions[-1]
+    assert last_o + last_sz <= c.window_bytes, f"{last_n} past the window"
+
+
+def test_fp8_scale_slots_are_peer_major_and_stay_inside_their_region():
+    c = layout.ArConfig(
+        world_size=8,
+        m=16384,
+        n=7168,
+        recv_slots=8,
+        counter_chunks=8,
+        comm_dtype="fp8",
+    )
+    per_peer = c.scatter_scale_slice_bytes
+    assert per_peer == c.slice_rows * c.scatter_tiles_per_row * 4
+    for peer in range(8):
+        off = c.recv_scale_slot_off(peer)
+        assert off == c.recv_scale_off + peer * per_peer
+        assert off + per_peer <= c.recv_scale_off + c.recv_scale_bytes
+    # the gather leg is one scale per row, so a slice's scales are slice_rows
+    assert c.gather_scale_slice_bytes == c.slice_rows * 4
+    for peer in range(8):
+        off = c.gout_scale_slice_off(peer)
+        assert (
+            off + c.gather_scale_slice_bytes <= c.gout_scale_off + c.gather_scale_bytes
+        )
+
+
+def test_scatter_scale_granularity_is_finer_than_per_row():
+    """The substitution that makes the scatter leg implementable at all.
+
+    A GEMM block owns BLOCK_M x BLOCK_N of C, so with N=7168 and BLOCK_N=256 a
+    row spans 28 blocks and a per-row amax is not available in the epilogue.
+    Per-(row, N-tile) is what a block can compute, and it is 28 scales per row
+    rather than 1 -- finer, so it cannot be less accurate than what was asked
+    for.
+    """
+    c = layout.ArConfig(
+        world_size=8,
+        m=16384,
+        n=7168,
+        recv_slots=8,
+        counter_chunks=8,
+        comm_dtype="fp8",
+    )
+    assert c.scatter_tiles_per_row == 28
+    assert c.scatter_scale_bytes >= c.gather_scale_bytes * 28
+    # and it is cheap: scales are a few percent of the payload they describe
+    assert c.scatter_scale_bytes < c.wire_nbytes * 0.02
+
+
 # --------------------------------------------------------------------------
 # the anti-rot guard: the pinned copy still computes what the pipeline does
 # --------------------------------------------------------------------------

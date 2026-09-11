@@ -123,6 +123,16 @@ class ArConfig:
     #: leave while the GEMM is still computing its later ones. Only the fused
     #: path reads this; the standalone SDMA all-reduce always pushes whole slices.
     counter_chunks: int = 1
+    #: What travels on the wire. ``"bf16"`` sends the payload as-is;
+    #: ``"fp8"`` quantises both transfer legs to e4m3 with fp32 scales, halving
+    #: the bytes. The reduce still accumulates in fp32 and ``output`` is still
+    #: bf16 -- only the wire changes. See ``scale_*`` below for the granularity,
+    #: which differs per leg because of where each leg's data lives.
+    comm_dtype: str = "bf16"
+    #: N-tile the scatter leg's scales are taken over. Must match the fused
+    #: GEMM's ``BLOCK_N``: a block owns ``BLOCK_M x BLOCK_N`` of C, so this is
+    #: the widest span of a row it can take an amax over.
+    scatter_scale_n: int = 256
     #: Grid for the SDMA reduce. Independent of ``block_cap`` because that cap
     #: throttles *xGMI* requests, while this kernel reads local HBM and wants as
     #: much in flight as it can get.
@@ -154,6 +164,86 @@ class ArConfig:
     @property
     def stage(self) -> int:
         return select_stage(self.world_size, self.nbytes)
+
+    # --- wire format -------------------------------------------------------
+    #
+    # Only the two transfer legs change dtype. ``output`` stays bf16 because it
+    # is the consumer's tensor, and the reduce still accumulates in fp32.
+
+    @property
+    def fp8_wire(self) -> bool:
+        return self.comm_dtype == "fp8"
+
+    @property
+    def wire_elem_bytes(self) -> int:
+        """Bytes per element *on the wire*, as opposed to in ``output``."""
+        return 1 if self.fp8_wire else self.elem_bytes
+
+    @property
+    def wire_nbytes(self) -> int:
+        return self.num_elems * self.wire_elem_bytes
+
+    @property
+    def wire_slice_bytes(self) -> int:
+        """One peer slice on the wire. The unit of a single SDMA put."""
+        return self.slice_rows * self.n * self.wire_elem_bytes
+
+    @property
+    def slice_rows(self) -> int:
+        """Rows in one peer's slice. The reduce-scatter shards along m only."""
+        if self.m % self.world_size:
+            raise ValueError(f"m={self.m} must divide by world_size={self.world_size}")
+        return self.m // self.world_size
+
+    # --- scale regions -----------------------------------------------------
+    #
+    # Two granularities, because the two legs quantise in different places.
+    #
+    # scatter: the GEMM epilogue quantises, and a block owns BLOCK_M x BLOCK_N
+    # of C. With N=7168 and BLOCK_N=256 a row spans 28 blocks, so a per-row amax
+    # is not available there at all -- it would need a cross-block reduction,
+    # which serialises exactly what the fusion overlaps. One scale per (row,
+    # N-tile) is what a block can compute, and being 28 scales per row instead
+    # of 1 it is *finer* than per-row, not coarser.
+    #
+    # gather: the reduce kernel owns whole rows of its slice, so amax over all
+    # of n is free and one scale per row is enough.
+
+    @property
+    def scatter_tiles_per_row(self) -> int:
+        if self.n % self.scatter_scale_n:
+            raise ValueError(
+                f"n={self.n} must be a multiple of scatter_scale_n="
+                f"{self.scatter_scale_n}"
+            )
+        return self.n // self.scatter_scale_n
+
+    @property
+    def scatter_scale_bytes(self) -> int:
+        """fp32 scales for the whole ``[m, n]`` payload, scatter granularity."""
+        if not self.fp8_wire:
+            return 0
+        return _align_up(self.m * self.scatter_tiles_per_row * 4, SIGNAL_ALIGN)
+
+    @property
+    def scatter_scale_slice_bytes(self) -> int:
+        """The scales that travel with one peer slice."""
+        if not self.fp8_wire:
+            return 0
+        return self.slice_rows * self.scatter_tiles_per_row * 4
+
+    @property
+    def gather_scale_bytes(self) -> int:
+        """fp32 scales for the whole payload, one per row."""
+        if not self.fp8_wire:
+            return 0
+        return _align_up(self.m * 4, SIGNAL_ALIGN)
+
+    @property
+    def gather_scale_slice_bytes(self) -> int:
+        if not self.fp8_wire:
+            return 0
+        return self.slice_rows * 4
 
     # --- reduce-scatter partition (2-stage), sharded along m ---
 
@@ -273,15 +363,58 @@ class ArConfig:
 
     @property
     def input_off(self) -> int:
+        """The GEMM's C, in the wire dtype. Source of the scatter leg."""
         return _align_up(self.signal_bytes, SIGNAL_ALIGN)
 
     @property
+    def input_scale_off(self) -> int:
+        """Scatter-leg scales for ``input``. Zero-sized on the bf16 wire."""
+        return _align_up(self.input_off + self.wire_nbytes, SIGNAL_ALIGN)
+
+    def input_scale_slice_off(self, peer: int) -> int:
+        """Where peer ``peer``'s row band's scales start within ``input_scale``."""
+        return (
+            self.input_scale_off
+            + peer * self.slice_rows * self.scatter_tiles_per_row * 4
+        )
+
+    @property
     def output_off(self) -> int:
-        return self.input_off + self.nbytes
+        """The consumer's tensor. Always bf16 -- only the wire changes dtype."""
+        return self.input_scale_off + self.scatter_scale_bytes
+
+    @property
+    def output_end(self) -> int:
+        return _align_up(self.output_off + self.nbytes, SIGNAL_ALIGN)
+
+    @property
+    def gout_off(self) -> int:
+        """The reduced result in the wire dtype. Source of the gather leg.
+
+        On the bf16 wire this *aliases* ``output``: the gather pushes the bf16
+        result straight out of it and there is nothing to stage, so the region
+        costs nothing. On the fp8 wire it is its own region, because ``output``
+        has to stay bf16 for the consumer while the wire carries fp8.
+        """
+        return self.output_end if self.fp8_wire else self.output_off
+
+    @property
+    def gout_bytes(self) -> int:
+        return self.wire_nbytes if self.fp8_wire else 0
+
+    @property
+    def gout_scale_off(self) -> int:
+        return _align_up(self.gout_off + self.gout_bytes, SIGNAL_ALIGN)
+
+    def gout_scale_slice_off(self, peer: int) -> int:
+        return self.gout_scale_off + peer * self.slice_rows * 4
 
     @property
     def tmp_off(self) -> int:
-        return self.output_off + self.nbytes
+        # Not simply "after gout_scale": on the bf16 wire gout aliases output and
+        # contributes nothing, so the running offset has to be taken past
+        # output's own bytes explicitly or tmp lands on top of it.
+        return max(self.output_end, self.gout_scale_off + self.gather_scale_bytes)
 
     @property
     def tmp_bytes(self) -> int:
@@ -294,7 +427,7 @@ class ArConfig:
 
     @property
     def recv_bytes(self) -> int:
-        return self.recv_slots * self.slice_bytes
+        return self.recv_slots * self.wire_slice_bytes
 
     def recv_slot_off(self, peer: int) -> int:
         """Where peer ``peer``'s contribution to *my* slice lands."""
@@ -304,11 +437,29 @@ class ArConfig:
             raise IndexError(
                 f"peer {peer} has no landing slot; recv_slots={self.recv_slots}"
             )
-        return self.recv_off + peer * self.slice_bytes
+        return self.recv_off + peer * self.wire_slice_bytes
+
+    @property
+    def recv_scale_off(self) -> int:
+        return _align_up(self.recv_off + self.recv_bytes, SIGNAL_ALIGN)
+
+    @property
+    def recv_scale_bytes(self) -> int:
+        if not self.fp8_wire:
+            return 0
+        return _align_up(self.recv_slots * self.scatter_scale_slice_bytes, SIGNAL_ALIGN)
+
+    def recv_scale_slot_off(self, peer: int) -> int:
+        """Where peer ``peer``'s scales for my slice land."""
+        if not 0 <= peer < self.recv_slots:
+            raise IndexError(
+                f"peer {peer} has no landing slot; recv_slots={self.recv_slots}"
+            )
+        return self.recv_scale_off + peer * self.scatter_scale_slice_bytes
 
     @property
     def window_bytes(self) -> int:
-        return self.recv_off + self.recv_bytes
+        return self.recv_scale_off + self.recv_scale_bytes
 
     # --- traffic model, for reporting alongside measured time ---
 
