@@ -213,18 +213,21 @@ inline __device__ void BnxtCollapsedCqDrain(core::WorkQueueHandle& wq,
       return;
     }
 
-    // Largest V <= dbTouchIdx with V % sqWqeNum == con_indx % sqWqeNum.
+    // con_indx is the consumed count mod sqWqeNum: rebuild the serial as a forward
+    // delta from doneIdx, as Mlx5CollapsedCqDrain does with wqe_counter. Anchoring on
+    // dbTouchIdx instead went a whole queue depth *backwards* whenever the CQE ran
+    // ahead of it -- routine, since the doorbell is rung before dbTouchIdx is
+    // published -- and as a raw word that pinned doneIdx for good. Issue #626.
     uint32_t dbTouch =
         __hip_atomic_load(&wq.dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    uint32_t completed = (dbTouch & ~mask) | (wqeCounter & mask);
-    if (completed > dbTouch) completed -= wq.sqWqeNum;
+    uint32_t delta = (wqeCounter - cons) & mask;
 
-    // Caller holds pollCqLock and nothing else writes doneIdx on this path, so a
-    // compare against the value we already hold replaces the atomic max -- and the
-    // reload after it, which could only return what we just stored.
-    if (static_cast<int32_t>(completed - cons) > 0) {
-      __hip_atomic_store(&wq.doneIdx, completed, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      cons = completed;
+    // Still capped at what was doorbelled: con_indx alone cannot tell a live
+    // completion from a stale one. Refusing one costs nothing -- PollSingleCqe is
+    // level-triggered for cqeNum == 1, so the loop re-reads the same value.
+    if (delta != 0 && static_cast<int32_t>(delta) <= static_cast<int32_t>(dbTouch - cons)) {
+      cons += delta;  // sole writer under pollCqLock, and delta > 0 is already an advance
+      __hip_atomic_store(&wq.doneIdx, cons, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
     if constexpr (DrainToLive) {
       exitTarget = __hip_atomic_load(&wq.postIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -310,35 +313,34 @@ inline __device__ void ShmemQuietThreadKernelPsdImpl(int pe, int qpId) {
       }
 
       if (myLaneId == highestLane) {
-        cqHandle.cq_consumer = myCqPos + 1;
-
-        if (((cqHandle.cq_consumer - cqHandle.cq_dbpos) & (cqHandle.cqeNum - 1)) >=
-            CQ_DOORBELL_GRACE) {
-          cqHandle.cq_dbpos = cqHandle.cq_consumer;
-          core::UpdateCqDbrRecord<core::ProviderType::PSD>(cqHandle, myCqPos + 1);
-        }
-
         // Widen the 24-bit MSN into doneIdx's 32-bit serial space: advance by the
         // masked forward delta instead of storing wqeCounter raw, else doneIdx ends
         // up in a different modulus than dbTouchIdx and the in-flight count goes bad
         // past 2^24. Cap it at what was doorbelled -- a WQE the NIC was never told
-        // about cannot have completed.
-        //
-        // The cap reads dbTouchIdx live rather than reusing dbTouchedIdx: other
-        // warps keep doorbelling while we poll, so a CQE can legitimately report an
-        // MSN past that snapshot. Capping to the stale value would reject it, leave
-        // doneIdx behind after cq_consumer already moved on, and spin here forever.
-        //
-        // doneIdx is read once into `cur` and written once, so concurrent pollers
-        // computing off the same CQE all land on the same value, as they did when
-        // this was a bare `doneIdx = wqeCounter`. A read-modify-write here could
-        // reload between the two and apply delta twice, running doneIdx past the NIC.
+        // about cannot have completed -- reading dbTouchIdx live, since other warps
+        // keep doorbelling while we poll. Read doneIdx once and write it once so
+        // concurrent pollers off one CQE land on the same value; an RMW could reload
+        // in between and apply delta twice, running doneIdx past the NIC.
         uint32_t doorbelled =
             __hip_atomic_load(&wqHandle.dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
         uint32_t cur = wqHandle.doneIdx;
         uint32_t delta = (wqeCounter - cur) & MSN_MASK;
-        if (delta != 0 && static_cast<int32_t>(delta) <= static_cast<int32_t>(doorbelled - cur)) {
-          wqHandle.doneIdx = cur + delta;
+
+        // Decide before consuming: the doorbell is rung before dbTouchIdx is
+        // published, so a live MSN can be ahead of the cap however fresh the load,
+        // and the color bit is keyed on cq_consumer -- moving it first would drop
+        // that completion for good. Left in place, a later pass takes it.
+        bool aheadOfDoorbell =
+            delta != 0 && static_cast<int32_t>(delta) > static_cast<int32_t>(doorbelled - cur);
+        if (!aheadOfDoorbell) {
+          if (delta != 0) wqHandle.doneIdx = cur + delta;
+
+          cqHandle.cq_consumer = myCqPos + 1;
+          if (((cqHandle.cq_consumer - cqHandle.cq_dbpos) & (cqHandle.cqeNum - 1)) >=
+              CQ_DOORBELL_GRACE) {
+            cqHandle.cq_dbpos = cqHandle.cq_consumer;
+            core::UpdateCqDbrRecord<core::ProviderType::PSD>(cqHandle, myCqPos + 1);
+          }
         }
       }
 
