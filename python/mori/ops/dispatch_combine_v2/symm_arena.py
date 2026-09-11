@@ -66,6 +66,15 @@ class SymmArena:
     def total_bytes(self):
         return self._total
 
+    def has(self, name):
+        """Whether this arena carries `name`.
+
+        Regions that are absent are absent, not zero-sized -- the scale transport
+        is the case that matters -- so a caller binding an offset needs to ask
+        rather than index.
+        """
+        return name in self._offsets
+
     def offset(self, name):
         return self._offsets[name]
 

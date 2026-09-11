@@ -90,7 +90,11 @@ enum ccoGdaThreadMode : uint32_t {
 enum ccoGdaOptFlags {
   ccoGdaOptFlagsDefault = 0,
   ccoGdaOptFlagsMaySkipCreditCheck = (1 << 0),
-  ccoGdaOptFlagsAggregateRequests = (1 << 1),
+  // Bit 1 is reserved, not free: it used to mean "post without ringing, someone
+  // else rings later". Nothing can ring for you today -- flushAsync only
+  // snapshots postIdx, which is a *reservation* counter that runs ahead of the
+  // WQE writes, so a deferred doorbell has no safe bound. Supporting deferral
+  // needs a separate "WQEs written" counter the posting paths publish to.
 };
 
 typedef enum ccoGdaSignalOp_t {
@@ -109,6 +113,27 @@ struct ccoGda_SignalAdd {
   ccoGdaSignal_t signalId;
   uint64_t value;
   __device__ inline ccoGda_SignalAdd(ccoGdaSignal_t id, uint64_t val) : signalId(id), value(val) {}
+};
+
+// Atomic add at an arbitrary offset in a caller-owned window, rather than at a
+// signal slot in the DevComm's resource window.
+//
+// ccoGda_SignalInc / ccoGda_SignalAdd cannot express that: they resolve to
+// signalId * sizeof(uint64_t) in the DevComm's own resource window.
+//
+// The remote op is identical (a NIC atomic add); only the target resolution
+// differs, so this rides the same single-reservation path as ccoGda_SignalAdd --
+// fused into `put`'s own doorbell when passed to put, no extra WQE. `offset` is
+// window-relative with iova=0, the same convention as put's dstOffset.
+//
+// waitSignal/readSignal/resetSignal do NOT see these: the target is the caller's
+// window, so the caller polls it directly.
+struct ccoGda_WindowSignalAdd {
+  ccoWindow_t win;
+  size_t offset;
+  uint64_t value;
+  __device__ inline ccoGda_WindowSignalAdd(ccoWindow_t w, size_t off, uint64_t val)
+      : win(w), offset(off), value(val) {}
 };
 
 struct ccoGda_CounterInc {
@@ -199,10 +224,10 @@ struct ccoGda {
   // ── completion ──────────────────────────────────────────────────────────
 
   // flush = flushAsync + wait per peer.
-  // flushAsync rings the doorbell if any WQEs are pending (skips if already
-  // rung), then wait polls CQ until all submitted WQEs complete.
+  // flushAsync snapshots the reservation counter; wait polls the CQ until the
+  // WQEs up to that snapshot complete. Doorbells are rung by the posting paths.
 
-  // flush: ring doorbell + poll CQ for every peer.
+  // flush: poll CQ for every peer.
   // peers are distributed across the Coop group (default: warp).
   // all threads in the group must call flush together.
   template <typename Coop = ccoCoopWarp>
@@ -212,8 +237,8 @@ struct ccoGda {
   template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename Coop = ccoCoopWarp>
   __device__ inline void flush(int peer, Coop coop = Coop{});
 
-  // flushAsync: ring doorbell for peer and return a request handle that
-  // wait() can later be used to wait on individually.
+  // flushAsync: snapshot this peer's QP progress and return a request handle
+  // that wait() can later be used to wait on individually.
   template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename Coop = ccoCoopThread>
   __device__ inline void flushAsync(int peer, ccoGdaRequest_t* outRequest, Coop coop = Coop{});
 
@@ -616,29 +641,6 @@ __device__ inline static uint32_t getAtomicWqeCount(core::atomicType amo_op, uin
   }
 }
 
-template <core::ProviderType PrvdType>
-__device__ inline static uint64_t buildFlushDbrVal(core::WorkQueueHandle* wq, uint32_t postIdx,
-                                                   uint32_t qpn) {
-  // postIdx is the next-free slot; the last posted WQE is at postIdx-1
-  uint32_t lastWqeIdx = (postIdx - 1) & (wq->sqWqeNum - 1);
-
-  if constexpr (PrvdType == core::ProviderType::PSD) {
-    return wq->sq_dbval | (postIdx & (wq->sqWqeNum - 1));
-  } else if constexpr (PrvdType == core::ProviderType::MLX5) {
-    // Read back ctrl seg first qword from SQ buffer
-    uintptr_t wqeAddr =
-        reinterpret_cast<uintptr_t>(wq->sqAddr) + (lastWqeIdx << core::MORI_MLX5_SEND_WQE_SHIFT);
-    return *reinterpret_cast<volatile uint64_t*>(wqeAddr);
-  } else {
-    // BNXT: reconstruct db header
-    uint8_t flags = (postIdx >> (__ffs(wq->sqWqeNum) - 1)) & 0x1;
-    uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
-    return core::bnxt_re_init_db_hdr(
-        ((postIdx & (wq->sqWqeNum - 1)) * BNXT_RE_NUM_SLOT_PER_WQE) | epoch, 0, qpn,
-        BNXT_RE_QUE_TYPE_SQ);
-  }
-}
-
 // putImpl - post one warp-aggregated put for the active lanes (all targeting this
 // ep/qpn; the facade groups by peer). Each lane posts its data WQE into a contiguous
 // reservation; the leader posts the shared signal WQE and rings one doorbell.
@@ -695,8 +697,7 @@ __device__ inline static void putImpl(
             *wq, signalSlot, signalSlot, sigPsn, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
             signalRemoteAddr, signalRemoteKey, signalOpArg, 0 /*compare*/, core::AMO_FETCH_ADD);
       }
-      if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
-        ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
+      ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
     }
   } else {
     // MLX5/PSD: the WQE slot index doubles as the PSN.
@@ -712,8 +713,7 @@ __device__ inline static void putImpl(
             atomicLkey, signalRemoteAddr, signalRemoteKey, signalOpArg, 0 /*compare*/,
             core::AMO_FETCH_ADD);
       }
-      if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
-        ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
+      ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
     }
   }
 }
@@ -764,8 +764,7 @@ __device__ inline static void putValueImpl(core::RdmaEndpointDevice* ep, uint32_
             *wq, signalSlot, signalSlot, sigPsn, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
             signalRemoteAddr, signalRemoteKey, signalOpArg, 0, core::AMO_FETCH_ADD);
       }
-      if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
-        ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
+      ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
     }
   } else {
     // MLX5/PSD: the WQE slot index doubles as the PSN.
@@ -780,8 +779,7 @@ __device__ inline static void putValueImpl(core::RdmaEndpointDevice* ep, uint32_
             *wq, signalSlot, signalSlot, signalSlot, true /*cqeSignal*/, qpn, atomicLaddr,
             atomicLkey, signalRemoteAddr, signalRemoteKey, signalOpArg, 0, core::AMO_FETCH_ADD);
       }
-      if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
-        ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
+      ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
     }
   }
 }
@@ -818,56 +816,37 @@ __device__ inline static void getImpl(core::RdmaEndpointDevice* ep, uint32_t qpn
         core::PostRead<PrvdType>(*wq, mySlot, mySlot, dataPsn, true /*cqeSignal*/, qpn, localAddr,
                                  localKey, remoteAddr, remoteKey, bytes);
     __threadfence();
-    if (isLeader && !(optFlags & ccoGdaOptFlagsAggregateRequests))
-      ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
+    if (isLeader) ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
   } else {
     // MLX5/PSD: the WQE slot index doubles as the PSN.
     waitSqSpace<PrvdType>(ep, base, totalWqes);
     uint64_t dbrVal = core::PostRead<PrvdType>(*wq, mySlot, mySlot, mySlot, true /*cqeSignal*/, qpn,
                                                localAddr, localKey, remoteAddr, remoteKey, bytes);
     __threadfence();
-    if (isLeader && !(optFlags & ccoGdaOptFlagsAggregateRequests))
-      ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
+    if (isLeader) ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
   }
 }
 
-// FlushAsync: ring doorbell for pending WQEs (skip if already rung),
-// return the postIdx for later wait.
+// FlushAsync: snapshot the reservation counter so a later wait() can drain to it.
+//
+// It must neither ring a doorbell nor touch dbTouchIdx. postIdx is a *reservation*
+// counter: putImpl/putValueImpl/signalImpl bump it before writing their WQEs, so a
+// snapshot routinely covers slots whose owner is still in flight. Every posting
+// path rings its own doorbell, and ringDoorbellOrdered hands the turn on by
+// advancing dbTouchIdx in reservation order while waiting on *equality* against
+// it -- advancing dbTouchIdx from here steps over an owner that then never
+// observes its turn, permanently stranding it and its reservation. Draining to
+// the returned index is quietUntil's job.
 template <core::ProviderType PrvdType>
-__device__ inline static void flushAsyncImpl(core::RdmaEndpointDevice* ep, uint32_t qpn,
-                                             uint32_t* outPostIdx) {
+__device__ inline static void flushAsyncImpl(core::RdmaEndpointDevice* ep, uint32_t* outPostIdx) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
-  core::CompletionQueueHandle* cq = &ep->cqHandle;
 
-  uint32_t curPostIdx = wq->postIdx;
-  *outPostIdx = curPostIdx;
+  *outPostIdx = static_cast<uint32_t>(
+      __hip_atomic_load(&wq->postIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT));
 
-  uint64_t dbTouched =
-      __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-  if (dbTouched == curPostIdx) return;
-
-  uint32_t numPendingWqes = curPostIdx - static_cast<uint32_t>(dbTouched);
-  uint64_t dbrVal = buildFlushDbrVal<PrvdType>(wq, curPostIdx, qpn);
-
+  // Keep flush's release semantics: prior local writes must be visible before the
+  // caller treats the transfer as handed off.
   __threadfence_system();
-
-  // flush() is multi-lane (each lane flushes a different peer/QP), so PSD/BNXT
-  // must serialize doorbells per lane (shared dbrAddr/UAR); MLX5 has a per-QP
-  // dbrAddr and rings directly.
-  if constexpr (PrvdType == core::ProviderType::MLX5) {
-    core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, curPostIdx);
-    __threadfence_system();
-    core::RingDoorbell<PrvdType>(wq->dbrAddr, dbrVal);
-  } else {
-    ringDoorbellWalk<PrvdType>(wq, curPostIdx, dbrVal);
-  }
-
-  __threadfence_system();
-
-  __hip_atomic_fetch_add(&cq->needConsIdx, numPendingWqes, __ATOMIC_RELAXED,
-                         __HIP_MEMORY_SCOPE_AGENT);
-  __hip_atomic_store(&wq->dbTouchIdx, static_cast<uint64_t>(curPostIdx), __ATOMIC_RELAXED,
-                     __HIP_MEMORY_SCOPE_AGENT);
 }
 
 template <core::ProviderType PrvdType>
@@ -893,16 +872,14 @@ __device__ inline static void signalImpl(core::RdmaEndpointDevice* ep, uint32_t 
     uint64_t dbrVal = core::PostAtomic<PrvdType, uint64_t>(
         *wq, curPostIdx, curPostIdx, psnBase, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
         signalRemoteAddr, signalRemoteKey, addValue, 0 /*compare*/, core::AMO_FETCH_ADD);
-    if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
-      ringDoorbellOrdered<PrvdType>(ep, curPostIdx, 1, dbrVal);
+    ringDoorbellOrdered<PrvdType>(ep, curPostIdx, 1, dbrVal);
   } else {
     // MLX5/PSD: the WQE slot index doubles as the PSN.
     uint32_t curPostIdx = reserveWqeSlots<PrvdType>(ep, 1);
     uint64_t dbrVal = core::PostAtomic<PrvdType, uint64_t>(
         *wq, curPostIdx, curPostIdx, curPostIdx, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
         signalRemoteAddr, signalRemoteKey, addValue, 0 /*compare*/, core::AMO_FETCH_ADD);
-    if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
-      ringDoorbellOrdered<PrvdType>(ep, curPostIdx, 1, dbrVal);
+    ringDoorbellOrdered<PrvdType>(ep, curPostIdx, 1, dbrVal);
   }
 }
 
@@ -1108,6 +1085,14 @@ __device__ inline void ccoGda<PrvdType>::put(int peer, ccoWindow_t dstWin, size_
       signalRkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[worldPeer];
       signalOp = ccoGdaSignalAdd;
       signalOpArg = remoteAction.value;
+    } else if constexpr (std::is_same_v<RemoteAction, ccoGda_WindowSignalAdd>) {
+      // Caller's window, not the resource window: the offset is already
+      // window-relative (iova=0), so it is the raddr as-is.
+      signalRaddr = remoteAction.offset;
+      signalRkey =
+          reinterpret_cast<ccoWindowDevice*>(remoteAction.win)->ibgdaWin.peerRkeys[worldPeer];
+      signalOp = ccoGdaSignalAdd;
+      signalOpArg = remoteAction.value;
     }
 
     // Only mixed-peer thread scope needs per-peer grouping; ThreadAggregate and
@@ -1171,6 +1156,14 @@ __device__ inline void ccoGda<PrvdType>::putValue(int peer, ccoWindow_t dstWin, 
     } else if constexpr (std::is_same_v<RemoteAction, ccoGda_SignalAdd>) {
       signalRaddr = remoteAction.signalId * sizeof(uint64_t);
       signalRkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[worldPeer];
+      signalOp = ccoGdaSignalAdd;
+      signalOpArg = remoteAction.value;
+    } else if constexpr (std::is_same_v<RemoteAction, ccoGda_WindowSignalAdd>) {
+      // Caller's window, not the resource window: the offset is already
+      // window-relative (iova=0), so it is the raddr as-is.
+      signalRaddr = remoteAction.offset;
+      signalRkey =
+          reinterpret_cast<ccoWindowDevice*>(remoteAction.win)->ibgdaWin.peerRkeys[worldPeer];
       signalOp = ccoGdaSignalAdd;
       signalOpArg = remoteAction.value;
     }
@@ -1268,6 +1261,14 @@ __device__ inline void ccoGda<PrvdType>::signal(int peer, RemoteAction remoteAct
       signalRkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[worldPeer];
       signalOp = ccoGdaSignalAdd;
       signalOpArg = remoteAction.value;
+    } else if constexpr (std::is_same_v<RemoteAction, ccoGda_WindowSignalAdd>) {
+      // Caller's window, not the resource window: the offset is already
+      // window-relative (iova=0), so it is the raddr as-is.
+      signalRaddr = remoteAction.offset;
+      signalRkey =
+          reinterpret_cast<ccoWindowDevice*>(remoteAction.win)->ibgdaWin.peerRkeys[worldPeer];
+      signalOp = ccoGdaSignalAdd;
+      signalOpArg = remoteAction.value;
     }
 
     impl::signalImpl<PrvdType>(ep, qpn, signalRaddr, signalRkey, signalOp, signalOpArg);
@@ -1294,13 +1295,13 @@ __device__ inline void ccoGda<PrvdType>::flush(Coop coop) {
     int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
     core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     uint32_t postIdx = 0;
-    impl::flushAsyncImpl<PrvdType>(ep, ep->qpn, &postIdx);
+    impl::flushAsyncImpl<PrvdType>(ep, &postIdx);
     impl::waitImpl<PrvdType>(ep, postIdx);
   }
   coop.sync();
 }
 
-// flush single peer: ring doorbell if needed, then poll CQ until complete.
+// flush single peer: snapshot the QP's postIdx, then poll CQ until it completes.
 template <core::ProviderType PrvdType>
 template <ccoTeamMode TeamMode, typename Coop>
 __device__ inline void ccoGda<PrvdType>::flush(int peer, Coop coop) {
@@ -1316,13 +1317,13 @@ __device__ inline void ccoGda<PrvdType>::flush(int peer, Coop coop) {
     int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
     core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     uint32_t postIdx = 0;
-    impl::flushAsyncImpl<PrvdType>(ep, ep->qpn, &postIdx);
+    impl::flushAsyncImpl<PrvdType>(ep, &postIdx);
     impl::waitImpl<PrvdType>(ep, postIdx);
   }
   coop.sync();
 }
 
-// flushAsync: ring doorbell for peer, return a request handle for wait().
+// flushAsync: snapshot this peer's QP, return a request handle for wait().
 template <core::ProviderType PrvdType>
 template <ccoTeamMode TeamMode, typename Coop>
 __device__ inline void ccoGda<PrvdType>::flushAsync(int peer, ccoGdaRequest_t* outRequest,
@@ -1335,7 +1336,7 @@ __device__ inline void ccoGda<PrvdType>::flushAsync(int peer, ccoGdaRequest_t* o
     core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
 
     uint32_t postIdx = 0;
-    impl::flushAsyncImpl<PrvdType>(ep, ep->qpn, &postIdx);
+    impl::flushAsyncImpl<PrvdType>(ep, &postIdx);
 
     outRequest->qpIdx = qpIdx;
     outRequest->postIdx = static_cast<uint64_t>(postIdx);
