@@ -132,7 +132,7 @@ _G = {
 
 
 def _spread(us):
-    """(mean, min, p50, p95) of one leg's per-iteration times.
+    """(mean, min, p50, p95, max) of one leg's per-iteration times.
 
     The mean alone cannot be audited. It is also the least stable thing here: over six
     repeats of one tier the mean moved 13% while the min moved 1.2%, and the mean sits
@@ -141,10 +141,15 @@ def _spread(us):
     already exist -- and it is what tells a clean point from a polluted one. A sweep
     taken for the README once read 190 us at a tier that sits at 66; its min would have
     said so on the spot.
+
+    max is the single worst iteration. It is the noisiest of the five and should not
+    be compared between runs, but it is the one that shows an isolated stall: two of
+    six repeats of one tier hit 203 and 241 us against a 59 us median, which moved
+    the mean by only 0.7 us and would otherwise be invisible.
     """
     v = sorted(us)
     q = lambda f: v[min(len(v) - 1, int(len(v) * f))]  # noqa: E731
-    return sum(v) / len(v), v[0], q(0.5), q(0.95)
+    return sum(v) / len(v), v[0], q(0.5), q(0.95), v[-1]
 
 
 def main():
@@ -545,10 +550,10 @@ def main():
                 got = torch.tensor([*d_st, *c_st, float(total)], dtype=torch.float64)
                 dist.all_reduce(got)
                 n = world
-                d = [float(x) / n for x in got[:4]]
-                c = [float(x) / n for x in got[4:8]]
+                d = [float(x) / n for x in got[:5]]
+                c = [float(x) / n for x in got[5:10]]
                 d_us_m, c_us_m = d[0], c[0]
-                recv_m = float(got[8]) / n
+                recv_m = float(got[10]) / n
                 # Bytes off one rank over that leg's time, BOTH cross-rank means,
                 # so the reported bandwidth follows from the recv_tokens and us
                 # this same row reports. Mixing a local byte count with a mean
@@ -565,7 +570,7 @@ def main():
                         f"dispatch {d_us_m:7.1f} us ({d_bw:6.1f} GB/s)  "
                         f"combine {c_us_m:7.1f} us ({c_bw:6.1f} GB/s)  "
                         f"pair {d_us_m + c_us_m:7.1f} us  recv~{recv_m:.0f}  "
-                        f"min {d[1]:.1f}/{c[1]:.1f}",
+                        f"min {d[1]:.1f}/{c[1]:.1f}  max {d[4]:.1f}/{c[4]:.1f}",
                         flush=True,
                     )
                 lockstep()
@@ -588,9 +593,11 @@ def main():
                             dispatch_us_min=round(d[1], 2),
                             dispatch_us_p50=round(d[2], 2),
                             dispatch_us_p95=round(d[3], 2),
+                            dispatch_us_max=round(d[4], 2),
                             combine_us_min=round(c[1], 2),
                             combine_us_p50=round(c[2], 2),
                             combine_us_p95=round(c[3], 2),
+                            combine_us_max=round(c[4], 2),
                             dispatch_gbps=round(d_bw, 1),
                             combine_gbps=round(c_bw, 1),
                             verified=VERIFY_SCOPE,
