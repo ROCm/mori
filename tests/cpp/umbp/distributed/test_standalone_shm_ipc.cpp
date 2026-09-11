@@ -712,5 +712,434 @@ TEST(StandaloneShmIpcTest, ShutdownDoesNotHangOnHalfOpenFdConnection) {
   unlink(fd_path.c_str());
 }
 
+// A layer-wise reader asks about one key set once per layer group, changing
+// only which bytes it wants. The keys are then the one part of the request that
+// is worth not sending again -- and the handle that stands in for them has to
+// be an optimisation only: never able to name the wrong list, and never able to
+// turn a readable batch into a failure just because the server forgot it.
+TEST(StandaloneShmIpcTest, RangedGetKeyHandleReplacesTheKeysAndFailsSafe) {
+  const std::string address =
+      "unix:///tmp/umbp_standalone_keyhandle_" + std::to_string(getpid()) + ".grpc.sock";
+  const std::string grpc_path = standalone::UnixPathFromGrpcAddress(address);
+  const std::string fd_path = standalone::DeriveFdSocketPath(address);
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+
+  UMBPConfig server_cfg;
+  server_cfg.dram.capacity_bytes = 1 << 20;
+  server_cfg.ssd.enabled = false;
+  UMBPStandaloneProcessConfig sp_cfg;
+  sp_cfg.address = address;
+  sp_cfg.startup_timeout_ms = 5000;
+  server_cfg.standalone_process = sp_cfg;
+
+  standalone::StandaloneServer server(server_cfg, address);
+  ASSERT_TRUE(server.Start());
+  std::thread server_thread([&]() { server.Run(); });
+
+  UMBPConfig client_cfg = server_cfg;
+  auto client = CreateUMBPClient(client_cfg);
+  ASSERT_EQ(client->GetDeploymentMode(), UMBPDeploymentMode::StandaloneProcess);
+
+  HostMemAllocator allocator;
+  HostBufferOptions opts;
+  opts.backing = HostBufferBacking::kAnonymousShm;
+  opts.prefault = false;
+  HostBufferHandle region = allocator.Alloc(65536, opts);
+  ASSERT_TRUE(region.valid());
+  auto* bytes = static_cast<unsigned char*>(region.ptr);
+  ASSERT_TRUE(client->RegisterMemory(reinterpret_cast<uintptr_t>(region.ptr), region.mapped_size));
+
+  // Four objects of 32 bytes, each read back later in two 16-byte halves --
+  // the two halves standing in for two layer groups over one key set.
+  constexpr size_t kKeys = 4;
+  constexpr size_t kObject = 32;
+  constexpr size_t kHalf = kObject / 2;
+  std::vector<std::string> keys;
+  std::vector<uintptr_t> srcs;
+  std::vector<size_t> put_sizes;
+  for (size_t k = 0; k < kKeys; ++k) {
+    keys.push_back("handle-key-" + std::to_string(k));
+    unsigned char* src = bytes + 1024 + k * kObject;
+    for (size_t i = 0; i < kObject; ++i) src[i] = static_cast<unsigned char>(k * 16 + i);
+    srcs.push_back(reinterpret_cast<uintptr_t>(src));
+    put_sizes.push_back(kObject);
+  }
+  ASSERT_EQ(client->BatchPut(keys, srcs, put_sizes), std::vector<bool>(kKeys, true));
+
+  // Read the same key set twice, each pass asking for the other half. The
+  // second pass is the one that rides on a handle; both must land the bytes
+  // the object actually holds.
+  for (size_t pass = 0; pass < 2; ++pass) {
+    const size_t object_offset = pass * kHalf;
+    std::vector<std::vector<uintptr_t>> dsts(kKeys);
+    std::vector<std::vector<size_t>> sizes(kKeys, {kHalf});
+    std::vector<std::vector<size_t>> offsets(kKeys, {object_offset});
+    for (size_t k = 0; k < kKeys; ++k) {
+      unsigned char* dst = bytes + 8192 + (pass * kKeys + k) * kHalf;
+      std::memset(dst, 0, kHalf);
+      dsts[k] = {reinterpret_cast<uintptr_t>(dst)};
+    }
+    ASSERT_EQ(client->BatchGetRanges(keys, dsts, sizes, offsets), std::vector<bool>(kKeys, true))
+        << "pass " << pass;
+    for (size_t k = 0; k < kKeys; ++k) {
+      const unsigned char* dst = bytes + 8192 + (pass * kKeys + k) * kHalf;
+      for (size_t i = 0; i < kHalf; ++i) {
+        EXPECT_EQ(dst[i], static_cast<unsigned char>(k * 16 + object_offset + i))
+            << "pass " << pass << " key " << k << " byte " << i;
+      }
+    }
+  }
+
+  // A second, different key set must not be answered from the first one's
+  // handle, and must not disturb it: go back to the first set afterwards.
+  ASSERT_EQ(client->BatchPut({"other-key"}, {reinterpret_cast<uintptr_t>(bytes + 1024)}, {kObject}),
+            std::vector<bool>({true}));
+  {
+    unsigned char* dst = bytes + 16384;
+    std::memset(dst, 0, kObject);
+    ASSERT_EQ(client->BatchGetRanges({"other-key"}, {{reinterpret_cast<uintptr_t>(dst)}},
+                                     {{kObject}}, {{0}}),
+              std::vector<bool>({true}));
+    for (size_t i = 0; i < kObject; ++i) EXPECT_EQ(dst[i], static_cast<unsigned char>(i));
+  }
+  {
+    unsigned char* dst = bytes + 20480;
+    std::memset(dst, 0, kKeys * kObject);
+    std::vector<std::vector<uintptr_t>> dsts(kKeys);
+    for (size_t k = 0; k < kKeys; ++k) {
+      dsts[k] = {reinterpret_cast<uintptr_t>(dst + k * kObject)};
+    }
+    ASSERT_EQ(client->BatchGetRanges(keys, dsts, std::vector<std::vector<size_t>>(kKeys, {kObject}),
+                                     std::vector<std::vector<size_t>>(kKeys, {0})),
+              std::vector<bool>(kKeys, true));
+    for (size_t k = 0; k < kKeys; ++k) {
+      for (size_t i = 0; i < kObject; ++i) {
+        EXPECT_EQ(dst[k * kObject + i], static_cast<unsigned char>(k * 16 + i));
+      }
+    }
+  }
+
+  // Now drive the wire directly, which is the only way to see the handle
+  // itself and to offer one the client would never construct. This stub has
+  // registered no memory of its own, so no bytes move for it -- what it can
+  // observe is how the handle table answers, which is the point.
+  auto raw_stub = ::umbp::UMBPStandalone::NewStub(
+      grpc::CreateChannel(address, grpc::InsecureChannelCredentials()));
+  const auto build = [&](::umbp::BatchRangeDataRequest* req, size_t key_count) {
+    req->set_client_id("raw-wire-client");
+    for (size_t k = 0; k < key_count; ++k) {
+      req->add_range_counts(1);
+      req->add_shm_offsets(32768 + k * kObject);
+      req->add_region_bases(0);
+      req->add_sizes(kObject);
+      req->add_object_offsets(0);
+    }
+  };
+
+  // Sending the keys with a fingerprint is what mints a handle.
+  constexpr uint64_t kFingerprint = 0x1234567890abcdefULL;
+  uint64_t minted = 0;
+  {
+    ::umbp::BatchRangeDataRequest req;
+    build(&req, kKeys);
+    req.set_key_fingerprint(kFingerprint);
+    for (const auto& key : keys) req.add_keys(key);
+    grpc::ClientContext ctx;
+    ::umbp::BatchBoolResponse resp;
+    ASSERT_TRUE(raw_stub->BatchGetRanges(&ctx, req, &resp).ok());
+    minted = resp.key_handle();
+    EXPECT_NE(minted, 0u);
+  }
+
+  // The handle alone stands for the four keys: the request carries none, and
+  // the reply is still four elements wide, which it can only be if validation
+  // took its key count from the remembered list.
+  {
+    ::umbp::BatchRangeDataRequest req;
+    build(&req, kKeys);
+    req.set_key_handle(minted);
+    req.set_key_fingerprint(kFingerprint);
+    grpc::ClientContext ctx;
+    ::umbp::BatchBoolResponse resp;
+    ASSERT_TRUE(raw_stub->BatchGetRanges(&ctx, req, &resp).ok());
+    EXPECT_FALSE(resp.key_handle_unknown());
+    EXPECT_EQ(resp.ok_size(), static_cast<int>(kKeys));
+  }
+
+  // A handle the server never minted is reported unknown rather than guessed
+  // at, so the caller can simply repeat the call with its keys.
+  {
+    ::umbp::BatchRangeDataRequest req;
+    build(&req, kKeys);
+    req.set_key_handle(minted + 0x5000);
+    req.set_key_fingerprint(kFingerprint);
+    grpc::ClientContext ctx;
+    ::umbp::BatchBoolResponse resp;
+    ASSERT_TRUE(raw_stub->BatchGetRanges(&ctx, req, &resp).ok());
+    EXPECT_TRUE(resp.key_handle_unknown());
+    EXPECT_EQ(resp.ok_size(), 0);
+  }
+
+  // A real handle offered with the wrong fingerprint is the case the
+  // fingerprint exists for: it must not resolve to the list it was minted for.
+  {
+    ::umbp::BatchRangeDataRequest req;
+    build(&req, kKeys);
+    req.set_key_handle(minted);
+    req.set_key_fingerprint(kFingerprint ^ 1ULL);
+    grpc::ClientContext ctx;
+    ::umbp::BatchBoolResponse resp;
+    ASSERT_TRUE(raw_stub->BatchGetRanges(&ctx, req, &resp).ok());
+    EXPECT_TRUE(resp.key_handle_unknown());
+    EXPECT_EQ(resp.ok_size(), 0);
+  }
+
+  // Naming a handle AND carrying keys is contradictory. Two keys against a
+  // handle minted for four: the reply is two elements wide, so the request was
+  // refused on what it carried rather than one of the two silently winning.
+  {
+    ::umbp::BatchRangeDataRequest req;
+    build(&req, 2);
+    req.set_key_handle(minted);
+    req.set_key_fingerprint(kFingerprint);
+    req.add_keys(keys[0]);
+    req.add_keys(keys[1]);
+    grpc::ClientContext ctx;
+    ::umbp::BatchBoolResponse resp;
+    ASSERT_TRUE(raw_stub->BatchGetRanges(&ctx, req, &resp).ok());
+    EXPECT_FALSE(resp.key_handle_unknown());
+    EXPECT_EQ(resp.ok_size(), 2);
+  }
+
+  // Sending keys without a fingerprint asks for nothing to be remembered, so
+  // no handle comes back -- a caller that will not repeat pays no bookkeeping.
+  {
+    ::umbp::BatchRangeDataRequest req;
+    build(&req, kKeys);
+    for (const auto& key : keys) req.add_keys(key);
+    grpc::ClientContext ctx;
+    ::umbp::BatchBoolResponse resp;
+    ASSERT_TRUE(raw_stub->BatchGetRanges(&ctx, req, &resp).ok());
+    EXPECT_EQ(resp.key_handle(), 0u);
+    EXPECT_EQ(resp.ok_size(), static_cast<int>(kKeys));
+  }
+
+  client->Close();
+  allocator.Free(region);
+  server.Shutdown();
+  server_thread.join();
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+}
+
+// A reader does not hold one key set: it chunks a pool's keys to fit a range
+// budget and walks the chunks in order, once per layer group, so the sets come
+// round as a cycle. This mints a cycle far longer than the eight the table used
+// to hold and then asks for every one of them back.
+//
+// It is a guard against both halves of that regression. A small capacity fails
+// it outright. An LRU of any capacity below the cycle fails it in the specific
+// way that matters -- the eviction lands on the set that comes round next, so
+// the hit rate is 0 rather than reduced -- which is why the sets are asked for
+// in the same order they were minted rather than in reverse.
+TEST(StandaloneShmIpcTest, RangedGetKeyHandlesSurviveALongerCycleThanTheOldCapacity) {
+  const std::string address =
+      "unix:///tmp/umbp_standalone_keycycle_" + std::to_string(getpid()) + ".grpc.sock";
+  const std::string grpc_path = standalone::UnixPathFromGrpcAddress(address);
+  const std::string fd_path = standalone::DeriveFdSocketPath(address);
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+
+  UMBPConfig server_cfg;
+  server_cfg.dram.capacity_bytes = 1 << 20;
+  server_cfg.ssd.enabled = false;
+  UMBPStandaloneProcessConfig sp_cfg;
+  sp_cfg.address = address;
+  sp_cfg.startup_timeout_ms = 5000;
+  server_cfg.standalone_process = sp_cfg;
+
+  standalone::StandaloneServer server(server_cfg, address);
+  ASSERT_TRUE(server.Start());
+  std::thread server_thread([&]() { server.Run(); });
+
+  auto raw_stub = ::umbp::UMBPStandalone::NewStub(
+      grpc::CreateChannel(address, grpc::InsecureChannelCredentials()));
+
+  // Comfortably past the old capacity of eight, and inside the current one, so
+  // the assertion is "every set survived" rather than a rate to be tuned. No
+  // memory is registered for this stub, so no bytes move; what is under test is
+  // which key list the handle stands for.
+  constexpr size_t kCycle = 40;
+  constexpr size_t kKeysPerSet = 2;
+  const auto build = [&](::umbp::BatchRangeDataRequest* req) {
+    req->set_client_id("cycle-wire-client");
+    for (size_t k = 0; k < kKeysPerSet; ++k) {
+      req->add_range_counts(1);
+      req->add_shm_offsets(k * 32);
+      req->add_region_bases(0);
+      req->add_sizes(32);
+      req->add_object_offsets(0);
+    }
+  };
+
+  std::vector<uint64_t> handles(kCycle);
+  std::vector<uint64_t> fingerprints(kCycle);
+  for (size_t set = 0; set < kCycle; ++set) {
+    ::umbp::BatchRangeDataRequest req;
+    build(&req);
+    fingerprints[set] = 0x9e3779b97f4a7c15ULL + set;
+    req.set_key_fingerprint(fingerprints[set]);
+    for (size_t k = 0; k < kKeysPerSet; ++k) {
+      req.add_keys("cycle-" + std::to_string(set) + "-key-" + std::to_string(k));
+    }
+    grpc::ClientContext ctx;
+    ::umbp::BatchBoolResponse resp;
+    ASSERT_TRUE(raw_stub->BatchGetRanges(&ctx, req, &resp).ok()) << "set " << set;
+    handles[set] = resp.key_handle();
+    ASSERT_NE(handles[set], 0u) << "set " << set;
+  }
+
+  for (size_t set = 0; set < kCycle; ++set) {
+    ::umbp::BatchRangeDataRequest req;
+    build(&req);
+    req.set_key_handle(handles[set]);
+    req.set_key_fingerprint(fingerprints[set]);
+    grpc::ClientContext ctx;
+    ::umbp::BatchBoolResponse resp;
+    ASSERT_TRUE(raw_stub->BatchGetRanges(&ctx, req, &resp).ok()) << "set " << set;
+    EXPECT_FALSE(resp.key_handle_unknown()) << "set " << set << " was dropped from the table";
+    EXPECT_EQ(resp.ok_size(), static_cast<int>(kKeysPerSet)) << "set " << set;
+  }
+
+  server.Shutdown();
+  server_thread.join();
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+}
+
+// Turning the handles off has to turn off what they cost the server too.
+//
+// The client keeps none when UMBP_KEY_HANDLE_SLOTS=0, but it used to send a
+// fingerprint anyway, and a fingerprint is precisely the server's instruction
+// to remember the key set. The result was a table filled to capacity on behalf
+// of a client that would never name any of it -- the switch turned off the
+// cache and left the bill.
+//
+// The handle counter is what makes this observable without reaching into the
+// server: handles are issued from 1 and never reused, so if the client's whole
+// run minted nothing, the first handle a raw stub can get is still 1.
+//
+// Self-gating on the variable it is about: an assertion at slots=0, and stated
+// as skipped otherwise, because the slot count is read once per process and a
+// test cannot change it for a client another test already built.
+TEST(StandaloneShmIpcTest, DisablingKeyHandlesAlsoStopsTheServerRemembering) {
+  const char* raw_slots = std::getenv("UMBP_KEY_HANDLE_SLOTS");
+  if (raw_slots == nullptr || std::string(raw_slots) != "0") {
+    GTEST_SKIP() << "run with UMBP_KEY_HANDLE_SLOTS=0 to exercise the off path";
+  }
+
+  const std::string address =
+      "unix:///tmp/umbp_standalone_noslots_" + std::to_string(getpid()) + ".grpc.sock";
+  const std::string grpc_path = standalone::UnixPathFromGrpcAddress(address);
+  const std::string fd_path = standalone::DeriveFdSocketPath(address);
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+
+  UMBPConfig server_cfg;
+  server_cfg.dram.capacity_bytes = 1 << 20;
+  server_cfg.ssd.enabled = false;
+  UMBPStandaloneProcessConfig sp_cfg;
+  sp_cfg.address = address;
+  sp_cfg.startup_timeout_ms = 5000;
+  server_cfg.standalone_process = sp_cfg;
+
+  standalone::StandaloneServer server(server_cfg, address);
+  ASSERT_TRUE(server.Start());
+  std::thread server_thread([&]() { server.Run(); });
+
+  UMBPConfig client_cfg = server_cfg;
+  auto client = CreateUMBPClient(client_cfg);
+  ASSERT_EQ(client->GetDeploymentMode(), UMBPDeploymentMode::StandaloneProcess);
+
+  HostMemAllocator allocator;
+  HostBufferOptions opts;
+  opts.backing = HostBufferBacking::kAnonymousShm;
+  opts.prefault = false;
+  HostBufferHandle region = allocator.Alloc(65536, opts);
+  ASSERT_TRUE(region.valid());
+  auto* bytes = static_cast<unsigned char*>(region.ptr);
+  ASSERT_TRUE(client->RegisterMemory(reinterpret_cast<uintptr_t>(region.ptr), region.mapped_size));
+
+  constexpr size_t kKeys = 4;
+  constexpr size_t kObject = 32;
+  std::vector<std::string> keys;
+  std::vector<uintptr_t> srcs;
+  std::vector<size_t> put_sizes;
+  for (size_t k = 0; k < kKeys; ++k) {
+    keys.push_back("noslot-key-" + std::to_string(k));
+    unsigned char* src = bytes + 1024 + k * kObject;
+    for (size_t i = 0; i < kObject; ++i) src[i] = static_cast<unsigned char>(k * 16 + i);
+    srcs.push_back(reinterpret_cast<uintptr_t>(src));
+    put_sizes.push_back(kObject);
+  }
+  ASSERT_EQ(client->BatchPut(keys, srcs, put_sizes), std::vector<bool>(kKeys, true));
+
+  // Several passes over the same set: with handles on this is exactly the
+  // shape that mints one and then rides it, so it is the shape that would
+  // leave something behind if the switch were only half a switch. The bytes
+  // still have to arrive -- turning the mechanism off must not cost
+  // correctness.
+  for (size_t pass = 0; pass < 3; ++pass) {
+    std::vector<std::vector<uintptr_t>> dsts(kKeys);
+    for (size_t k = 0; k < kKeys; ++k) {
+      unsigned char* dst = bytes + 8192 + (pass * kKeys + k) * kObject;
+      std::memset(dst, 0, kObject);
+      dsts[k] = {reinterpret_cast<uintptr_t>(dst)};
+    }
+    ASSERT_EQ(client->BatchGetRanges(keys, dsts, std::vector<std::vector<size_t>>(kKeys, {kObject}),
+                                     std::vector<std::vector<size_t>>(kKeys, {0})),
+              std::vector<bool>(kKeys, true))
+        << "pass " << pass;
+    for (size_t k = 0; k < kKeys; ++k) {
+      const unsigned char* dst = bytes + 8192 + (pass * kKeys + k) * kObject;
+      for (size_t i = 0; i < kObject; ++i) {
+        EXPECT_EQ(dst[i], static_cast<unsigned char>(k * 16 + i))
+            << "pass " << pass << " key " << k << " byte " << i;
+      }
+    }
+  }
+
+  // Nothing the client did should have consumed a handle, so the first one the
+  // server ever hands out is still the first one.
+  auto raw_stub = ::umbp::UMBPStandalone::NewStub(
+      grpc::CreateChannel(address, grpc::InsecureChannelCredentials()));
+  {
+    ::umbp::BatchRangeDataRequest req;
+    req.set_client_id("raw-wire-client");
+    for (size_t k = 0; k < kKeys; ++k) {
+      req.add_range_counts(1);
+      req.add_shm_offsets(32768 + k * kObject);
+      req.add_region_bases(0);
+      req.add_sizes(kObject);
+      req.add_object_offsets(0);
+      req.add_keys(keys[k]);
+    }
+    req.set_key_fingerprint(0x0f1e2d3c4b5a6978ULL);
+    grpc::ClientContext ctx;
+    ::umbp::BatchBoolResponse resp;
+    ASSERT_TRUE(raw_stub->BatchGetRanges(&ctx, req, &resp).ok());
+    EXPECT_EQ(resp.key_handle(), 1u) << "the server minted " << (resp.key_handle() - 1)
+                                     << " handle(s) for a client that keeps none";
+  }
+
+  client->Close();
+  allocator.Free(region);
+  server.Shutdown();
+  server_thread.join();
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+}
+
 }  // namespace
 }  // namespace mori::umbp
