@@ -248,7 +248,7 @@ def run(args) -> int:
                 for r in range(world_size):
                     lo = r * packs * per_pack
                     hi = cfg.owner_pack_range(r)[1] * per_pack
-                    d = (out.view(-1)[lo:hi].float() - ref.view(-1)[lo:hi].float())
+                    d = out.view(-1)[lo:hi].float() - ref.view(-1)[lo:hi].float()
                     if d.norm().item() != 0.0:
                         bad.append(r)
                 print(
@@ -258,9 +258,7 @@ def run(args) -> int:
                 )
 
         comm.barrier()
-        elapsed_us = _median_us(
-            once, args.warmup, args.iters, graph=not args.eager
-        )
+        elapsed_us = _median_us(once, args.warmup, args.iters, graph=not args.eager)
         comm.barrier()
 
         stats = torch.tensor([elapsed_us], dtype=torch.float64)

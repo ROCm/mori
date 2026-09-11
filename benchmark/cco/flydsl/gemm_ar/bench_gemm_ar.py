@@ -157,13 +157,19 @@ def make_operands(rank: int, m: int, n: int, k: int, quant: str = "ptpc"):
     a = (torch.randn(m, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
     b = (torch.randn(n, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
     if quant == "ptpc":
-        sa = torch.rand(m, generator=g, device="cuda", dtype=torch.float32) * 0.01 + 0.01
-        sb = torch.rand(n, generator=g, device="cuda", dtype=torch.float32) * 0.01 + 0.01
+        sa = (
+            torch.rand(m, generator=g, device="cuda", dtype=torch.float32) * 0.01 + 0.01
+        )
+        sb = (
+            torch.rand(n, generator=g, device="cuda", dtype=torch.float32) * 0.01 + 0.01
+        )
         return a, b, sa, sb
     if quant != "blockscale":
         raise ValueError(f"quant must be ptpc or blockscale, got {quant!r}")
     kb = k // SCALE_BK
-    sa = torch.rand(m, kb, generator=g, device="cuda", dtype=torch.float32) * 0.01 + 0.01
+    sa = (
+        torch.rand(m, kb, generator=g, device="cuda", dtype=torch.float32) * 0.01 + 0.01
+    )
     sb = (
         torch.rand(n // SCALE_BK, kb, generator=g, device="cuda", dtype=torch.float32)
         * 0.01
@@ -261,7 +267,9 @@ def run(args) -> int:
     if fused:
         # Fall back rather than fail: chunks has to divide the M-tiles per
         # destination, which at small M can be fewer than 8.
-        m_tiles_per_peer = max(1, (args.m + args.block_m - 1) // args.block_m // world_size)
+        m_tiles_per_peer = max(
+            1, (args.m + args.block_m - 1) // args.block_m // world_size
+        )
         while chunks > 1 and m_tiles_per_peer % chunks:
             chunks //= 2
     cfg = ArConfig(
@@ -341,8 +349,18 @@ def run(args) -> int:
             sa_arg, sb_arg = sa, sb
 
         def run_gemm(stream):
-            gemm(a_i8, b_i8, c_flat, sa_arg, sb_arg, args.m, args.n, dc.ptr,
-                 win.handle, stream=stream)
+            gemm(
+                a_i8,
+                b_i8,
+                c_flat,
+                sa_arg,
+                sb_arg,
+                args.m,
+                args.n,
+                dc.ptr,
+                win.handle,
+                stream=stream,
+            )
 
         if needs_sdma:
             parts = build_sdma_phases(
@@ -391,7 +409,10 @@ def run(args) -> int:
             rel_l2 = diff / denom if denom else diff
             validated = rel_l2 < 3e-3
             if not validated:
-                print(f"[rank {rank}] GEMM VALIDATION FAILED relL2={rel_l2:.3e}", flush=True)
+                print(
+                    f"[rank {rank}] GEMM VALIDATION FAILED relL2={rel_l2:.3e}",
+                    flush=True,
+                )
             del ref
         elif (
             args.mode != "gemm-only"
@@ -485,8 +506,12 @@ def build_parser() -> argparse.ArgumentParser:
         "scales per K-block in the mainloop, which needs a second accumulator "
         "and therefore --block-m 128",
     )
-    p.add_argument("--block-m", type=int, default=0,
-                   help="0 = 256 for --quant ptpc, 128 for --quant blockscale")
+    p.add_argument(
+        "--block-m",
+        type=int,
+        default=0,
+        help="0 = 256 for --quant ptpc, 128 for --quant blockscale",
+    )
     p.add_argument("--block-n", type=int, default=256)
     p.add_argument("--waves-per-eu", type=int, default=2)
     p.add_argument("--xcd-swizzle", type=int, default=0)
@@ -516,8 +541,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--fence",
         choices=(
-            "all", "agent", "agent-leader", "nt-agent", "leader", "none",
-            "writethrough", "wt-agent", "raw-wt", "raw-wt-agent",
+            "all",
+            "agent",
+            "agent-leader",
+            "nt-agent",
+            "leader",
+            "none",
+            "writethrough",
+            "wt-agent",
+            "raw-wt",
+            "raw-wt-agent",
             "raw-wt-leader",
         ),
         default="none",

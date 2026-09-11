@@ -57,9 +57,7 @@ def padded_m(m: int, world_size: int, block_m: int = DEFAULT_BLOCK_M) -> int:
     return (m + granule - 1) // granule * granule
 
 
-def counter_chunks(
-    m_pad: int, world_size: int, block_m: int = DEFAULT_BLOCK_M
-) -> int:
+def counter_chunks(m_pad: int, world_size: int, block_m: int = DEFAULT_BLOCK_M) -> int:
     """The largest chunk count that divides the row bands per destination.
 
     Chunks must divide evenly or the completion counter's modulo test never
@@ -193,12 +191,8 @@ class GemmAllReduceOp:
             lane_transpose=True,
         )
         parts = build_sdma_phases(cfg, self.rank, queues=self.sdma_queues)
-        c = from_gpu_ptr(
-            self.mem.ptr + cfg.input_off, (m, self.n), torch.bfloat16
-        )
-        out = from_gpu_ptr(
-            self.mem.ptr + cfg.output_off, (m, self.n), torch.bfloat16
-        )
+        c = from_gpu_ptr(self.mem.ptr + cfg.input_off, (m, self.n), torch.bfloat16)
+        out = from_gpu_ptr(self.mem.ptr + cfg.output_off, (m, self.n), torch.bfloat16)
         hit = (gemm, parts, c, out)
         self._cache[m] = hit
         return hit

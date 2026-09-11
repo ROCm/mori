@@ -338,7 +338,10 @@ class ArConfig:
                 "vectorized path applies (aiter: DISPATCH_REDUCE falls back to "
                 "_naive otherwise)"
             )
-        if self.force_blocks is not None and not 1 <= self.force_blocks <= self.max_blocks:
+        if (
+            self.force_blocks is not None
+            and not 1 <= self.force_blocks <= self.max_blocks
+        ):
             raise ValueError(
                 f"force_blocks={self.force_blocks} outside [1, {self.max_blocks}]; "
                 "the signal array has one row per block, so raise max_blocks too"

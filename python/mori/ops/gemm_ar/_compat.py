@@ -161,11 +161,12 @@ except ImportError:  # flydsl >= 0.3.0
     # *value* to a keyword-only *attribute*. Both spellings are in use here --
     # aiter's venv has 0.3.0, sglang's has 0.3.2 -- so probe once and adapt
     # rather than pinning either.
-    _AUX_IS_KWARG = "aux" in getattr(
-        inspect.signature(_rocdl.raw_ptr_buffer_store), "parameters", {}
-    ) and inspect.signature(
-        _rocdl.raw_ptr_buffer_store
-    ).parameters["aux"].kind is inspect.Parameter.KEYWORD_ONLY
+    _AUX_IS_KWARG = (
+        "aux"
+        in getattr(inspect.signature(_rocdl.raw_ptr_buffer_store), "parameters", {})
+        and inspect.signature(_rocdl.raw_ptr_buffer_store).parameters["aux"].kind
+        is inspect.Parameter.KEYWORD_ONLY
+    )
 
     def _aux_args(cache_modifier):
         """Positional tail / kwargs for the raw buffer ops' ``aux`` operand."""

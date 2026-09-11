@@ -99,7 +99,6 @@ from ._compat import (
     wave_uniform_i64,
 )
 from .kernels_lsa import _spin_until
-from .layout import MAX_WORLD
 
 #: The push warp. One lane per peer, each on its own queue, so the lanes post in
 #: parallel (cco's ccoSdmaThreadIndependent shape). 64 is the wave size; only the
@@ -155,7 +154,7 @@ def build_sdma_phases(
     if queues < 1:
         raise ValueError(f"queues must be >= 1, got {queues}")
 
-    threads, blocks = cfg.threads, cfg.blocks
+    threads = cfg.threads
     # The reduce is a *local HBM* kernel, so it must not inherit the grid the LSA
     # all-reduce uses. LSA_BLOCK_CAP is small on purpose -- it caps the number of
     # outstanding xGMI requests -- but here every load is local, and 24x512
@@ -164,7 +163,6 @@ def build_sdma_phases(
     red_blocks = reduce_blocks if reduce_blocks else cfg.reduce_blocks
     red_stride = red_blocks * threads
     elem_dtype = fx.BFloat16 if cfg.elem_bytes == 2 else fx.Float32
-    stride_packs = blocks * threads
     part = cfg.packs_per_rank
     slice_bytes = cfg.slice_bytes
 
@@ -244,7 +242,8 @@ def build_sdma_phases(
     scatter = _push_kernel(
         start_off,
         dst_off_of_peer=my_recv_slot,
-        src_off_expr=lambda tid: fx.Int64(in_off) + fx.Int64(tid) * fx.Int64(slice_bytes),
+        src_off_expr=lambda tid: fx.Int64(in_off)
+        + fx.Int64(tid) * fx.Int64(slice_bytes),
     )
 
     @flyc.kernel(known_block_size=[threads, 1, 1])
@@ -263,9 +262,7 @@ def build_sdma_phases(
         # region; with the Direct-LSA fused GEMM the epilogue wrote it into my own
         # recv slot instead, along with everyone else's.
         self_off = (
-            cfg.recv_slot_off(rank)
-            if reduce_self_from_recv
-            else in_off + my_slice_off
+            cfg.recv_slot_off(rank) if reduce_self_from_recv else in_off + my_slice_off
         )
         srcs = [
             create_buffer_resource_from_addr(

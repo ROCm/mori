@@ -165,7 +165,10 @@ def test_blockscale_lands_at_the_fp8_floor(m, n, k):
     g = torch.Generator(device="cuda").manual_seed(11)
     a = (torch.randn(m, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
     b = (torch.randn(n, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
-    sa = torch.rand(m, k // BK, generator=g, device="cuda", dtype=torch.float32) * 0.01 + 0.01
+    sa = (
+        torch.rand(m, k // BK, generator=g, device="cuda", dtype=torch.float32) * 0.01
+        + 0.01
+    )
     sb = (
         torch.rand(n // BK, k // BK, generator=g, device="cuda", dtype=torch.float32)
         * 0.01
@@ -187,8 +190,16 @@ def test_blockscale_lands_at_the_fp8_floor(m, n, k):
 
     cfg = layout.ArConfig(world_size=2, m=m, n=n)
     gemm = compile_fused_gemm_scatter(
-        cfg, 0, K=k, BLOCK_M=128, BLOCK_N=256, b_preshuffled=True,
-        fuse=False, swap_ab=True, permlane=True, lane_transpose=True,
+        cfg,
+        0,
+        K=k,
+        BLOCK_M=128,
+        BLOCK_N=256,
+        b_preshuffled=True,
+        fuse=False,
+        swap_ab=True,
+        permlane=True,
+        lane_transpose=True,
         quant="blockscale",
     )
     ours = torch.zeros(m, n, device="cuda", dtype=torch.bfloat16)
@@ -198,7 +209,10 @@ def test_blockscale_lands_at_the_fp8_floor(m, n, k):
         ours.view(-1),
         sa.t().reshape(-1).contiguous(),
         sb.reshape(-1).contiguous(),
-        m, n, 0, 0,
+        m,
+        n,
+        0,
+        0,
         stream=fx.Stream(torch.cuda.current_stream()),
     )
     torch.cuda.synchronize()
@@ -237,14 +251,26 @@ def test_swap_ab_is_bitwise_identical(m, n, k):
     # The reference is the same kernel with the operands unswapped, which is the
     # property under test: swapping must be a pure register relabelling.
     ref_gemm = compile_fused_gemm_scatter(
-        cfg, 0, K=k, BLOCK_M=256, BLOCK_N=256, b_preshuffled=True,
-        fuse=False, swap_ab=False,
+        cfg,
+        0,
+        K=k,
+        BLOCK_M=256,
+        BLOCK_N=256,
+        b_preshuffled=True,
+        fuse=False,
+        swap_ab=False,
     )
     ref = torch.zeros(m, n, device="cuda", dtype=torch.bfloat16)
     ref_gemm(
         a.contiguous().view(torch.int8).view(-1),
         b_shuf.contiguous().view(torch.int8).view(-1),
-        ref.view(-1), sa, sb, m, n, 0, 0,
+        ref.view(-1),
+        sa,
+        sb,
+        m,
+        n,
+        0,
+        0,
         stream=fx.Stream(torch.cuda.current_stream()),
     )
     torch.cuda.synchronize()
@@ -256,20 +282,33 @@ def test_swap_ab_is_bitwise_identical(m, n, k):
         {"permlane": True, "lane_transpose": True, "hoist_scales": True},
     ):
         gemm = compile_fused_gemm_scatter(
-            cfg, 0, K=k, BLOCK_M=256, BLOCK_N=256, b_preshuffled=True,
-            fuse=False, swap_ab=True, **extra,
+            cfg,
+            0,
+            K=k,
+            BLOCK_M=256,
+            BLOCK_N=256,
+            b_preshuffled=True,
+            fuse=False,
+            swap_ab=True,
+            **extra,
         )
         got = torch.zeros(m, n, device="cuda", dtype=torch.bfloat16)
         gemm(
             a.contiguous().view(torch.int8).view(-1),
             b_shuf.contiguous().view(torch.int8).view(-1),
-            got.view(-1), sa, sb, m, n, 0, 0,
+            got.view(-1),
+            sa,
+            sb,
+            m,
+            n,
+            0,
+            0,
             stream=fx.Stream(torch.cuda.current_stream()),
         )
         torch.cuda.synchronize()
-        assert torch.equal(got, ref), (
-            f"swap_ab {extra} is not bit-identical to the unswapped path"
-        )
+        assert torch.equal(
+            got, ref
+        ), f"swap_ab {extra} is not bit-identical to the unswapped path"
 
 
 def test_rotated_tile_order_is_a_permutation_of_the_linear_one():
@@ -290,7 +329,9 @@ def test_rotated_tile_order_is_a_permutation_of_the_linear_one():
             dest_i = (dest_seq + rank) % ws
             seen.add((dest_i * m_tiles_per_peer + tile_i, bn))
         assert len(seen) == total
-        assert seen == {(bm, bn) for bm in range(m // block_m) for bn in range(n_blocks)}
+        assert seen == {
+            (bm, bn) for bm in range(m // block_m) for bn in range(n_blocks)
+        }
 
 
 # --------------------------------------------------------------------------
@@ -309,9 +350,18 @@ def _run_bench(world_size, mode, m, n, k, extra=()):
         "--standalone",
         f"--nproc_per_node={world_size}",
         str(BENCH),
-        "--mode", mode,
-        "-m", str(m), "-n", str(n), "-k", str(k),
-        "--warmup", "1", "--iters", "3",
+        "--mode",
+        mode,
+        "-m",
+        str(m),
+        "-n",
+        str(n),
+        "-k",
+        str(k),
+        "--warmup",
+        "1",
+        "--iters",
+        "3",
         *extra,
     ]
     result = subprocess.run(

@@ -276,7 +276,9 @@ class _BlockScaleK:
 
     def b_scale(self, n_block, kb):
         """The single B scale of a 128-column block at K-block ``kb``."""
-        return self._load1(self.sb_div, n_block * fx.Int32(self.kb_count) + fx.Int32(kb))
+        return self._load1(
+            self.sb_div, n_block * fx.Int32(self.kb_count) + fx.Int32(kb)
+        )
 
     def scale_acc(self, acc, a_sc, b_sc, idx_fn, n_tiles_b):
         """``acc *= s_a * s_b`` elementwise; returns the new accumulator.
@@ -304,9 +306,9 @@ class _BlockScaleK:
             return [p / c for p, c in zip(prev, cur)]
         return prev / cur
 
-
-    def rescale_for(self, kb, accs, prev, *, base_row, nb0, idx_fn, n_tiles_b,
-                    lds_block_m):
+    def rescale_for(
+        self, kb, accs, prev, *, base_row, nb0, idx_fn, n_tiles_b, lds_block_m
+    ):
         """Rebase the four accumulators from K-block ``kb-1``'s scales to kb's.
 
         A method rather than a closure inside the kernel: FlyDSL rewrites the
@@ -363,8 +365,9 @@ class _SwapABStoreC(StoreC):
     while B's is indexed by column, now 4 consecutive, so a vec4.
     """
 
-    def __init__(self, *args, peer_rsrc=None, elem_base=None,
-                 scales_preapplied=False, **kwargs):
+    def __init__(
+        self, *args, peer_rsrc=None, elem_base=None, scales_preapplied=False, **kwargs
+    ):
         super().__init__(*args, **kwargs)
         # blockscale applies the scales per K-block in the mainloop, so by the
         # time C reaches here it is already scaled and the epilogue is a plain
@@ -432,11 +435,18 @@ class _SwapABStoreC(StoreC):
                 oob = fx.Int32(self.c_rows * self.c_cols)
                 vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
                 vals = [
-                    self._scaled(vec_f32[k], a_scales[ti], b_scales[tj][k]).to(fx.BFloat16)
+                    self._scaled(vec_f32[k], a_scales[ti], b_scales[tj][k]).to(
+                        fx.BFloat16
+                    )
                     for k in range_constexpr(4)
                 ]
                 c_index = row * self.c_cols + col
                 self._store_bf16x4(vals, arith.select(col_valid, c_index, oob))
+
+
+def _raw(v):
+    """Unwrap a DSL value to its raw ``ir.Value``, for ops that take one."""
+    return v.ir_value() if hasattr(v, "ir_value") else v
 
 
 def _permlane16_swap(x, y):
@@ -452,21 +462,23 @@ def _permlane16_swap(x, y):
     shuffle.
     """
     st = ir.Type.parse("!llvm.struct<(i32, i32)>")
-    raw = lambda v: v.ir_value() if hasattr(v, "ir_value") else v
-    res = fx.rocdl.permlane16_swap(st, raw(x), raw(y), False, True)
+    res = fx.rocdl.permlane16_swap(st, _raw(x), _raw(y), False, True)
     i32 = ir.IntegerType.get_signless(32)
     return (
-        fx.Int32(_llvm_d.ExtractValueOp(i32, res, ir.DenseI64ArrayAttr.get([0])).result),
-        fx.Int32(_llvm_d.ExtractValueOp(i32, res, ir.DenseI64ArrayAttr.get([1])).result),
+        fx.Int32(
+            _llvm_d.ExtractValueOp(i32, res, ir.DenseI64ArrayAttr.get([0])).result
+        ),
+        fx.Int32(
+            _llvm_d.ExtractValueOp(i32, res, ir.DenseI64ArrayAttr.get([1])).result
+        ),
     )
 
 
 def _ds_bpermute(value, src_lane):
     """Pull ``value`` from ``src_lane``. Byte-addressed, hence the <<2."""
     i32 = ir.IntegerType.get_signless(32)
-    raw = lambda v: v.ir_value() if hasattr(v, "ir_value") else v
     return fx.Int32(
-        fx.rocdl.ds_bpermute(i32, raw(fx.Int32(src_lane) * fx.Int32(4)), raw(value))
+        fx.rocdl.ds_bpermute(i32, _raw(fx.Int32(src_lane) * fx.Int32(4)), _raw(value))
     )
 
 
@@ -495,8 +507,13 @@ class _PermlaneStoreC(_SwapABStoreC):
     _peer_uncached = False
 
     def store(self, c_frag, base_row, base_col):
-        self._emit(c_frag, base_row, base_col,
-                   self._a_scales(base_row), self._b_scales(base_col))
+        self._emit(
+            c_frag,
+            base_row,
+            base_col,
+            self._a_scales(base_row),
+            self._b_scales(base_col),
+        )
 
     def store_all(self, frags, base_row, base_col, row_step, col_step):
         """All four half-tiles, loading each scale once instead of twice.
@@ -511,8 +528,9 @@ class _PermlaneStoreC(_SwapABStoreC):
         a = [self._a_scales(base_row + r * row_step) for r in range_constexpr(2)]
         b = [self._b_scales(base_col + c * col_step) for c in range_constexpr(2)]
         for frag, r, c in frags:
-            self._emit(frag, base_row + r * row_step, base_col + c * col_step,
-                       a[r], b[c])
+            self._emit(
+                frag, base_row + r * row_step, base_col + c * col_step, a[r], b[c]
+            )
 
     def _a_scales(self, base_row):
         lane = self.lane_id
@@ -542,7 +560,9 @@ class _PermlaneStoreC(_SwapABStoreC):
                 vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
                 packed = Vec.from_elements(
                     [
-                        self._scaled(vec_f32[k], a_scales[ti], b_scales[tj][k]).to(fx.BFloat16)
+                        self._scaled(vec_f32[k], a_scales[ti], b_scales[tj][k]).to(
+                            fx.BFloat16
+                        )
                         for k in range_constexpr(4)
                     ],
                     fx.BFloat16,
@@ -600,7 +620,8 @@ class _PermlaneStoreC(_SwapABStoreC):
             else:
                 fx.memref_store_vec(out8, self.reg_bf16_8)
                 fx.copy(
-                    self.out_atom_8, self.reg_bf16_8,
+                    self.out_atom_8,
+                    self.reg_bf16_8,
                     fx.slice(self.c_div, (None, fx.Int32(idx))),
                 )
 
@@ -638,8 +659,6 @@ class _WideStoreProbeC(_SwapABStoreC):
     ``permlane16_swap`` step; this probe skips it and keeps only its cost profile.
     """
 
-
-
     def store(self, c_frag, base_row, base_col):
         lane = self.lane_id
         a_scales = [
@@ -656,7 +675,9 @@ class _WideStoreProbeC(_SwapABStoreC):
             for tj in range_constexpr(self.n_tiles_b):
                 vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
                 vals += [
-                    self._scaled(vec_f32[k], a_scales[ti], b_scales[tj][k]).to(fx.BFloat16)
+                    self._scaled(vec_f32[k], a_scales[ti], b_scales[tj][k]).to(
+                        fx.BFloat16
+                    )
                     for k in range_constexpr(4)
                 ]
             col = base_col + (lane // 16) * 8
@@ -878,13 +899,9 @@ def compile_fused_gemm_scatter(
     if n_stripe == 0:
         n_stripe = N // BLOCK_N
     if n_stripe < 1 or n_stripe > N // BLOCK_N:
-        raise ValueError(
-            f"n_stripe must be in [1, {N // BLOCK_N}], got {n_stripe}"
-        )
+        raise ValueError(f"n_stripe must be in [1, {N // BLOCK_N}], got {n_stripe}")
     if (N // BLOCK_N) % n_stripe:
-        raise ValueError(
-            f"n_stripe={n_stripe} must divide the {N // BLOCK_N} N-tiles"
-        )
+        raise ValueError(f"n_stripe={n_stripe} must divide the {N // BLOCK_N} N-tiles")
     # Only a *real* stripe needs the rotated order. Chunk-major is the
     # unstriped case and is what the linear order already does per destination,
     # so leaving it on a non-rotated build is not an error -- the split
@@ -924,7 +941,6 @@ def compile_fused_gemm_scatter(
     # Compile-time tile accounting for the completion counters.
     n_blocks_const = N // BLOCK_N
     m_tiles_per_peer = slice_rows // BLOCK_M if slice_rows % BLOCK_M == 0 else 0
-    tiles_per_peer = m_tiles_per_peer * n_blocks_const
 
     # Push granularity. A destination's slice is `m_tiles_per_peer` row-bands of
     # BLOCK_M rows; pushing each band as it completes is what lets every link
@@ -940,8 +956,17 @@ def compile_fused_gemm_scatter(
     chunk_bytes = cfg.slice_bytes // chunks
 
     if fence not in (
-        "all", "agent", "agent-leader", "nt-agent", "leader", "none",
-        "writethrough", "wt-agent", "raw-wt", "raw-wt-agent", "raw-wt-leader",
+        "all",
+        "agent",
+        "agent-leader",
+        "nt-agent",
+        "leader",
+        "none",
+        "writethrough",
+        "wt-agent",
+        "raw-wt",
+        "raw-wt-agent",
+        "raw-wt-leader",
     ):
         raise ValueError(
             f"fence must be all/agent/leader/none/writethrough/wt-agent, got {fence!r}"
@@ -1095,7 +1120,14 @@ def compile_fused_gemm_scatter(
                 else _LaneTransposeStoreC
             )
             store_c = _cls(
-                A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B,
+                A_scale,
+                B_scale,
+                C,
+                c_m,
+                c_n,
+                mfma.idx,
+                N_TILES_A,
+                N_TILES_B,
                 peer_rsrc=create_buffer_resource_from_addr(
                     wave_uniform_i64(w_pre.lsa_ptr(dest_blk, my_recv_slot)),
                     num_records_bytes=cfg.slice_bytes,
@@ -1105,7 +1137,14 @@ def compile_fused_gemm_scatter(
         elif const_expr(direct_lsa and swap_ab and permlane):
             dest_blk = block_m // fx.Int32(m_tiles_per_peer)
             store_c = _PermlaneStoreC(
-                A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B,
+                A_scale,
+                B_scale,
+                C,
+                c_m,
+                c_n,
+                mfma.idx,
+                N_TILES_A,
+                N_TILES_B,
                 peer_rsrc=create_buffer_resource_from_addr(
                     wave_uniform_i64(w_pre.lsa_ptr(dest_blk, my_recv_slot)),
                     num_records_bytes=cfg.slice_bytes,
@@ -1115,7 +1154,14 @@ def compile_fused_gemm_scatter(
         elif const_expr(direct_lsa and swap_ab and store_probe):
             dest_blk = block_m // fx.Int32(m_tiles_per_peer)
             store_c = _WideStoreProbeC(
-                A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B,
+                A_scale,
+                B_scale,
+                C,
+                c_m,
+                c_n,
+                mfma.idx,
+                N_TILES_A,
+                N_TILES_B,
                 peer_rsrc=create_buffer_resource_from_addr(
                     wave_uniform_i64(w_pre.lsa_ptr(dest_blk, my_recv_slot)),
                     num_records_bytes=cfg.slice_bytes,
@@ -1215,15 +1261,15 @@ def compile_fused_gemm_scatter(
 
         for k in range_constexpr(K_ITERS - 2):
             if blockscale:
-                (c00_frag, c01_frag, c10_frag, c11_frag), prev_scales = (
-                    bsk.rescale_for(
-                        k,
-                        (c00_frag, c01_frag, c10_frag, c11_frag),
-                        prev_scales,
-                        base_row=base_row_pre, nb0=nb0,
-                        idx_fn=mfma.idx, n_tiles_b=N_TILES_B,
-                        lds_block_m=LDS_BLOCK_M,
-                    )
+                (c00_frag, c01_frag, c10_frag, c11_frag), prev_scales = bsk.rescale_for(
+                    k,
+                    (c00_frag, c01_frag, c10_frag, c11_frag),
+                    prev_scales,
+                    base_row=base_row_pre,
+                    nb0=nb0,
+                    idx_fn=mfma.idx,
+                    n_tiles_b=N_TILES_B,
+                    lds_block_m=LDS_BLOCK_M,
                 )
             b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
             a0_frag = a_s2r.load(a_cur0)
@@ -1275,16 +1321,16 @@ def compile_fused_gemm_scatter(
 
         # Step k = K_ITERS - 2
         if blockscale:
-            (c00_frag, c01_frag, c10_frag, c11_frag), prev_scales = (
-                    bsk.rescale_for(
-                        K_ITERS - 2,
-                        (c00_frag, c01_frag, c10_frag, c11_frag),
-                        prev_scales,
-                        base_row=base_row_pre, nb0=nb0,
-                        idx_fn=mfma.idx, n_tiles_b=N_TILES_B,
-                        lds_block_m=LDS_BLOCK_M,
-                    )
-                )
+            (c00_frag, c01_frag, c10_frag, c11_frag), prev_scales = bsk.rescale_for(
+                K_ITERS - 2,
+                (c00_frag, c01_frag, c10_frag, c11_frag),
+                prev_scales,
+                base_row=base_row_pre,
+                nb0=nb0,
+                idx_fn=mfma.idx,
+                n_tiles_b=N_TILES_B,
+                lds_block_m=LDS_BLOCK_M,
+            )
         b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
         a0_frag = a_s2r.load(a_cur0)
         rocdl.s_barrier()
@@ -1314,16 +1360,16 @@ def compile_fused_gemm_scatter(
 
         # Step k = K_ITERS - 1
         if blockscale:
-            (c00_frag, c01_frag, c10_frag, c11_frag), prev_scales = (
-                    bsk.rescale_for(
-                        K_ITERS - 1,
-                        (c00_frag, c01_frag, c10_frag, c11_frag),
-                        prev_scales,
-                        base_row=base_row_pre, nb0=nb0,
-                        idx_fn=mfma.idx, n_tiles_b=N_TILES_B,
-                        lds_block_m=LDS_BLOCK_M,
-                    )
-                )
+            (c00_frag, c01_frag, c10_frag, c11_frag), prev_scales = bsk.rescale_for(
+                K_ITERS - 1,
+                (c00_frag, c01_frag, c10_frag, c11_frag),
+                prev_scales,
+                base_row=base_row_pre,
+                nb0=nb0,
+                idx_fn=mfma.idx,
+                n_tiles_b=N_TILES_B,
+                lds_block_m=LDS_BLOCK_M,
+            )
         a0_frag = a_s2r.load(a_cur0)
         wait_barrier(0)
 
@@ -1348,8 +1394,10 @@ def compile_fused_gemm_scatter(
             # divided by the last K-block's scale. store_c._preapplied makes the
             # epilogue skip its own scale loads.
             c00_frag, c01_frag, c10_frag, c11_frag = bsk.final_scale(
-                (c00_frag, c01_frag, c10_frag, c11_frag), prev_scales,
-                idx_fn=mfma.idx, n_tiles_b=N_TILES_B,
+                (c00_frag, c01_frag, c10_frag, c11_frag),
+                prev_scales,
+                idx_fn=mfma.idx,
+                n_tiles_b=N_TILES_B,
             )
 
         wave_n_offset = wave_n * (N_TILES_B * 16)
@@ -1381,9 +1429,16 @@ def compile_fused_gemm_scatter(
 
         if const_expr(hoist_scales) and hasattr(store_c, "store_all"):
             store_c.store_all(
-                [(c00_frag, 0, 0), (c01_frag, 0, 1),
-                 (c10_frag, 1, 0), (c11_frag, 1, 1)],
-                base_row, base_col, LDS_BLOCK_M, LDS_BLOCK_N,
+                [
+                    (c00_frag, 0, 0),
+                    (c01_frag, 0, 1),
+                    (c10_frag, 1, 0),
+                    (c11_frag, 1, 1),
+                ],
+                base_row,
+                base_col,
+                LDS_BLOCK_M,
+                LDS_BLOCK_N,
             )
         else:
             store_c.store(c00_frag, base_row + 0, base_col + 0)

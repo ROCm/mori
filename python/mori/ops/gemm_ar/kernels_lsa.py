@@ -137,7 +137,6 @@ def build_lsa_ar(
 
     threads = cfg.threads
     blocks = cfg.blocks
-    elems_per_pack = cfg.elems_per_pack
     elem_dtype = fx.BFloat16 if cfg.elem_bytes == 2 else fx.Float32
     num_packs = cfg.num_packs
     stride_packs = blocks * threads
@@ -216,7 +215,9 @@ def build_lsa_ar(
             create_buffer_resource_from_addr(wave_uniform_i64(w.lsa_ptr(p, in_off)))
             for p in range(ws)
         ]
-        out = create_buffer_resource_from_addr(wave_uniform_i64(w.lsa_ptr(rank, out_off)))
+        out = create_buffer_resource_from_addr(
+            wave_uniform_i64(w.lsa_ptr(rank, out_off))
+        )
 
         gtid = bid * threads + tid
         for pk in range(gtid, num_packs, stride_packs):
@@ -246,7 +247,9 @@ def build_lsa_ar(
             )
             for i in range(ws)
         ]
-        tmp = create_buffer_resource_from_addr(wave_uniform_i64(w.lsa_ptr(rank, tmp_off)))
+        tmp = create_buffer_resource_from_addr(
+            wave_uniform_i64(w.lsa_ptr(rank, tmp_off))
+        )
 
         gtid = bid * threads + tid
         for pk in range(gtid, own_packs, stride_packs):
@@ -294,7 +297,9 @@ def build_lsa_ar(
         # the difference between ~133us and ~660us for this half of the kernel.
         # Kept selectable because it is the cleaner-looking code and the trap is
         # not obvious from reading it.
-        out = create_buffer_resource_from_addr(wave_uniform_i64(w.lsa_ptr(rank, out_off)))
+        out = create_buffer_resource_from_addr(
+            wave_uniform_i64(w.lsa_ptr(rank, out_off))
+        )
         srcs = [
             create_buffer_resource_from_addr(
                 wave_uniform_i64(w.lsa_ptr((rank + j) % ws, tmp_off))
