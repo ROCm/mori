@@ -253,6 +253,12 @@ class AllgatherSdma:
     def __call__(
         self, input_data, output_data, count: int, stream=None, capturing: bool = False
     ) -> bool:
+        """Run a blocking AllGather.
+
+        ``capturing=True`` skips the host-side stream syncs so the call is legal
+        inside ``hipStreamBeginCapture``. The completion generation is derived
+        on the device, so a captured graph is safe to replay.
+        """
         byte_count = count * input_data.element_size()
         u32_count = (byte_count + 3) // 4
         s = _stream_to_int(stream)
@@ -275,6 +281,7 @@ class AllgatherSdma:
         split_sizes,
         split_offsets,
         stream=None,
+        capturing: bool = False,
     ) -> bool:
         if split_sizes.numel() != split_offsets.numel():
             raise ValueError("split_sizes and split_offsets must have the same length")
@@ -293,7 +300,9 @@ class AllgatherSdma:
         _get_ccl_func("OneShotAllGatherSdmaParamContiguousKernel_u32").launch_struct(
             (1,), (512,), 0, s, args
         )
-        self._handle.finish_sync(output_data.data_ptr(), u32_count, s)
+        self._handle.finish_sync(
+            output_data.data_ptr(), u32_count, s, capturing=capturing
+        )
         return True
 
     def start_async(self, input_data, output_data, count: int, stream=None) -> bool:
@@ -343,8 +352,8 @@ class AllgatherSdma:
 
         ``capturing=True`` skips the host-side stream syncs: the wait kernel
         and the copy-out are stream-ordered, so a consumer enqueued on the same
-        stream still sees complete data, and the launch thread stays free. The
-        returned duration is meaningless then, nothing having waited for the
+        stream still sees complete data, and the launch thread stays free. It
+        returns ``-1.0`` rather than a duration, nothing having waited for the
         transfer to land.
         """
         s = _stream_to_int(stream)

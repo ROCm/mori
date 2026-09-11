@@ -71,7 +71,14 @@ struct CclAllgatherArgs {
   application::SymmMemObjPtr flagsMemObj;
   size_t elementCount;
   size_t dstBaseOffset;
-  uint64_t flagVal;
+  // Device-resident generation counter, deliberately a pointer and not a value.
+  // A host-minted token is frozen into the graph node at capture, and since the
+  // completion flags are monotonic and never reset, the wait would already be
+  // satisfied on entry from the second replay onward and let a consumer read a
+  // buffer whose SDMA is still in flight. The kernel derives `*genCounter + 1`
+  // itself and stores it back once every peer's flag is in, so the pointer is
+  // what gets captured and the generation stays fresh on every replay.
+  uint64_t* genCounter;
   const size_t* splitSizes;
   const size_t* splitOffsets;
   size_t splitCount;
