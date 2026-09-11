@@ -674,6 +674,10 @@ inline __device__ void UpdateDbrAndRingDbRecv<ProviderType::BNXT>(void* dbrRecAd
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Completion Queue                                        */
 /* ---------------------------------------------------------------------------------------------- */
+// Collapsed CQ (cqeNum == 1): a level-triggered read of CQE[0]'s con_indx -- no
+// phase check, nothing consumed, consIdx unused. The collapsed-CQ drains rely on
+// that to re-read a completion they refused for running ahead of dbTouchIdx; a
+// one-shot consume here would drop it and hang them.
 inline __device__ int PollSingleCqe(volatile char* cqe, uint32_t consIdx, uint32_t* wqeIdx) {
   // Extract completion index using HIP atomic load
   const uint32_t con_indx = __hip_atomic_load(

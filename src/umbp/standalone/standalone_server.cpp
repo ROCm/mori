@@ -32,20 +32,27 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <climits>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
+#include <random>
 #include <shared_mutex>
 #include <string>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "mori/utils/mori_log.hpp"
@@ -181,6 +188,293 @@ class ConditionalReadLock {
   std::unique_lock<std::shared_mutex> exclusive_;
 };
 
+// The key lists BatchGetRanges callers have asked the server to remember.
+//
+// A layer-wise restore names one key set once per layer group -- eight times
+// over at UMBP_LAYER_GROUP=8 -- and the keys are the only part of the request
+// that is identical across those calls. At a thousand-odd ~128-byte keys that
+// is over a hundred kilobytes serialized, then a heap allocation per key to
+// deserialize, seven times for nothing.
+//
+// A handle stands in for the list. It is deliberately only a hint: the table is
+// bounded and evicts, a handle it no longer holds is reported unknown and the
+// caller repeats the call carrying its keys, and nothing has to be closed or
+// revoked for the entry to go away. That is what keeps a client crash, a server
+// restart, or a caller that simply forgets from mattering at all.
+//
+// The fingerprint is the safety property. It is recorded when the handle is
+// minted and checked on every use, so the handle cannot name a list other than
+// the one it was minted for even if a caller confuses two of its own.
+// Whether the handles are doing anything is not something a caller can see: a
+// hit and a miss both return the right bytes, and a miss only shows up as a
+// request that was larger than it had to be. UMBP_KEY_HANDLE_DEBUG=1 makes the
+// mechanism observable so a deployment can tell "working" from "silently
+// resending every time".
+bool KeyHandleDebugEnabled() {
+  static const bool enabled = [] {
+    const char* raw = std::getenv("UMBP_KEY_HANDLE_DEBUG");
+    return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+  }();
+  return enabled;
+}
+
+class KeyHandleTable {
+ public:
+  using Keys = std::shared_ptr<const std::vector<std::string>>;
+
+  // Nullptr when the handle is not held, or is held for different keys.
+  Keys Lookup(uint64_t handle, uint64_t fingerprint) {
+    if (handle == 0) return nullptr;
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = entries_.find(handle);
+    if (it == entries_.end() || it->second.fingerprint != fingerprint) {
+      ++misses_;
+      MaybeReportLocked();
+      return nullptr;
+    }
+    ++hits_;
+    MaybeReportLocked();
+    return it->second.keys;
+  }
+
+  // Zero when this table is remembering nothing, which the caller reads as
+  // "do not offer a handle back". Handing one out that will never be found
+  // would cost every later call an extra round trip to be told so.
+  uint64_t Insert(Keys keys, uint64_t fingerprint) {
+    const size_t capacity = Capacity();
+    if (capacity == 0) return 0;
+    std::lock_guard<std::mutex> lock(mu_);
+    // Never reused within a process, so a handle that is found is always the
+    // list it was minted for; across processes the table starts empty, and the
+    // fingerprint covers the rest.
+    const uint64_t handle = next_++;
+    ++mints_;
+    while (held_.size() >= capacity) {
+      // Drawn, not aged: the readers behind this table cycle through their key
+      // sets in a fixed order, and evicting by age under a cycle evicts
+      // precisely the set that is about to be asked for. Random replacement
+      // has no such worst case; past capacity it decays as capacity/cycle.
+      const size_t victim = rng_() % held_.size();
+      entries_.erase(held_[victim]);
+      held_[victim] = held_.back();
+      held_.pop_back();
+    }
+    entries_.emplace(handle, Entry{std::move(keys), fingerprint});
+    held_.push_back(handle);
+    return handle;
+  }
+
+ private:
+  void MaybeReportLocked() {
+    if (!KeyHandleDebugEnabled()) return;
+    const uint64_t total = hits_ + misses_;
+    if (total == 0 || total % kReportEvery != 0) return;
+    MORI_UMBP_INFO(
+        "[KeyHandleTable] ranged-get key handles: hits={} misses={} mints={} hit_rate={:.1f}% "
+        "held={}",
+        hits_, misses_, mints_, 100.0 * static_cast<double>(hits_) / static_cast<double>(total),
+        entries_.size());
+  }
+
+  // One table serves every rank on the node, and each of them has as many key
+  // sets live as its reader's chunking produces -- not the handful this was
+  // sized for. Defaulted to eight ranks' worth of a generous per-rank count,
+  // and settable because that chunking belongs to the caller: an entry holds
+  // one key set, so roughly 160 KiB for the thousand-odd 128-byte keys a layer
+  // group asks about, and this default is therefore some 80 MiB against a node
+  // whose tier is measured in terabytes.
+  static size_t Capacity() {
+    static const size_t capacity = [] {
+      size_t configured = 512;
+      if (const char* raw = std::getenv("UMBP_KEY_HANDLE_CAPACITY")) {
+        char* end = nullptr;
+        const unsigned long long parsed = std::strtoull(raw, &end, 10);
+        if (end != raw && *end == '\0') configured = static_cast<size_t>(parsed);
+      }
+      return configured;
+    }();
+    return capacity;
+  }
+
+  static constexpr uint64_t kReportEvery = 512;
+
+  struct Entry {
+    Keys keys;
+    uint64_t fingerprint;
+  };
+
+  std::mutex mu_;
+  std::vector<uint64_t> held_;  // unordered: the victim is drawn, not aged
+  std::unordered_map<uint64_t, Entry> entries_;
+  // Only has to be uncorrelated with the callers' access order, so a fixed
+  // seed is deliberate: it keeps a run reproducible.
+  std::minstd_rand rng_{0x9e3779b9};
+  uint64_t next_ = 1;
+  uint64_t hits_ = 0;
+  uint64_t misses_ = 0;
+  uint64_t mints_ = 0;
+};
+
+// What a hit rate cannot tell you is whether a bigger table would have helped.
+// This measures that directly, because "the handles are not working" and "the
+// handles cannot work at this size" call for different fixes and look the same
+// from a hit count.
+//
+// A key set is identified here by its FINGERPRINT, not by its handle. The
+// fingerprint is the only identifier that survives the client's own cache
+// missing: a set the client has forgotten comes back as a fresh mint carrying
+// a handle the server has never issued, so counting mints of a fingerprint
+// already seen is what exposes thrash on the CLIENT side -- which the server's
+// hit rate hides completely, having never been asked.
+//
+// The measure is reuse distance: how many OTHER key sets a client touched
+// between two uses of one set. An LRU of capacity C hits exactly those reuses
+// whose distance is below C, so the distribution answers "what capacity would
+// be enough" rather than only "the current one is not". It also names the case
+// where no capacity is enough: a reader that cycles through N sets in a fixed
+// order puts every reuse at distance N-1 with nothing below it, and that is
+// the one shape under which LRU degrades to a 0% hit rate instead of a merely
+// worse one -- the eviction always lands on the very next set to be used.
+//
+// Debug-only, and priced accordingly: the distance is a walk of a list bounded
+// by kTrackedSets, paid per ranged get, against an RPC that already resolves a
+// thousand keys. Nothing here runs when the env var is unset.
+class KeyHandleStats {
+ public:
+  enum class Event { kHit, kMiss, kMint };
+
+  void Observe(const std::string& client_id, uint64_t fingerprint, size_t key_count, Event event) {
+    if (!KeyHandleDebugEnabled() || fingerprint == 0) return;
+    std::lock_guard<std::mutex> lock(mu_);
+    ClientState& state = clients_[client_id];
+    switch (event) {
+      case Event::kHit:
+        ++state.hits;
+        break;
+      case Event::kMiss:
+        ++state.misses;
+        break;
+      case Event::kMint:
+        ++state.mints;
+        break;
+    }
+    ++state.key_counts[key_count];
+
+    auto seen = state.at.find(fingerprint);
+    if (seen == state.at.end()) {
+      // Never seen from this client, so not a reuse at all: no cache of any
+      // size could have held it, and the mint it costs is unavoidable.
+      ++state.first_sight;
+    } else {
+      ++state.reuse_bins[BinOf(
+          static_cast<size_t>(std::distance(state.recency.begin(), seen->second)))];
+      if (event == Event::kMint) ++state.reminted;
+      state.recency.erase(seen->second);
+      state.at.erase(seen);
+    }
+    state.recency.push_front(fingerprint);
+    state.at[fingerprint] = state.recency.begin();
+    if (state.recency.size() > kTrackedSets) {
+      state.at.erase(state.recency.back());
+      state.recency.pop_back();
+    }
+    state.tracked_max = std::max(state.tracked_max, state.recency.size());
+
+    if (++events_ % kReportEvery == 0) ReportLocked();
+  }
+
+  void Report() {
+    if (!KeyHandleDebugEnabled()) return;
+    std::lock_guard<std::mutex> lock(mu_);
+    ReportLocked();
+  }
+
+ private:
+  // Past this a reuse is reported as "beyond", which is already the answer:
+  // no table anyone would configure is going to hold a thousand key sets per
+  // client. Bounding it is also what keeps the distance walk affordable.
+  static constexpr size_t kTrackedSets = 1024;
+  static constexpr size_t kBins = 14;  // bin 0 = distance 0, bin i = [2^(i-1), 2^i)
+  static constexpr uint64_t kReportEvery = 512;
+
+  static size_t BinOf(size_t distance) {
+    size_t bin = 0;
+    while (distance > 0 && bin + 1 < kBins) {
+      ++bin;
+      distance >>= 1;
+    }
+    return bin;
+  }
+
+  struct ClientState {
+    std::list<uint64_t> recency;  // MRU front, one entry per distinct key set
+    std::unordered_map<uint64_t, std::list<uint64_t>::iterator> at;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t mints = 0;
+    uint64_t reminted = 0;     // a set seen before, minted again: client-side thrash
+    uint64_t first_sight = 0;  // unavoidable: no cache could have held it
+    std::map<size_t, uint64_t> key_counts;
+    std::array<uint64_t, kBins> reuse_bins{};
+    size_t tracked_max = 0;
+  };
+
+  // "An LRU of this capacity would have hit this share of the reuses." The
+  // candidates bracket what the two tables are set to today so a report can be
+  // read straight off as a sizing decision.
+  static constexpr size_t kCapacityProbes[] = {8, 16, 32, 64, 128, 256, 512, 1024};
+
+  void ReportLocked() const {
+    for (const auto& [client_id, state] : clients_) {
+      const uint64_t reuses =
+          std::accumulate(state.reuse_bins.begin(), state.reuse_bins.end(), uint64_t{0});
+      const uint64_t lookups = state.hits + state.misses;
+      MORI_UMBP_INFO(
+          "[KeyHandleStats] client={} events={} hits={} misses={} mints={} remints={} "
+          "first_sight={} distinct_tracked_max={} server_hit_rate={:.1f}%",
+          client_id, state.hits + state.misses + state.mints, state.hits, state.misses, state.mints,
+          state.reminted, state.first_sight, state.tracked_max,
+          lookups == 0 ? 0.0
+                       : 100.0 * static_cast<double>(state.hits) / static_cast<double>(lookups));
+
+      std::string cdf;
+      uint64_t cumulative = 0;
+      size_t bin = 0;
+      for (size_t capacity : kCapacityProbes) {
+        // Bin i covers [2^(i-1), 2^i), so every bin below capacity is a reuse
+        // an LRU of that capacity would still have been holding.
+        while (bin < kBins && (bin == 0 || (size_t{1} << (bin - 1)) < capacity)) {
+          cumulative += state.reuse_bins[bin];
+          ++bin;
+        }
+        cdf += fmt::format(
+            " <{}:{:.1f}%", capacity,
+            reuses == 0 ? 0.0
+                        : 100.0 * static_cast<double>(cumulative) / static_cast<double>(reuses));
+      }
+      MORI_UMBP_INFO("[KeyHandleStats] client={} reuses={} would-hit-at-capacity:{}", client_id,
+                     reuses, cdf);
+
+      // The tail layer group chunks to a different size than the full groups,
+      // so its key sets are new every time. It shows up here as a second peak.
+      std::vector<std::pair<size_t, uint64_t>> counts(state.key_counts.begin(),
+                                                      state.key_counts.end());
+      std::sort(counts.begin(), counts.end(),
+                [](const auto& a, const auto& b) { return a.second > b.second; });
+      std::string histogram;
+      for (size_t i = 0; i < counts.size() && i < 6; ++i) {
+        histogram += fmt::format(" {}keys:{}", counts[i].first, counts[i].second);
+      }
+      MORI_UMBP_INFO("[KeyHandleStats] client={} distinct_batch_sizes={} top:{}", client_id,
+                     state.key_counts.size(), histogram);
+    }
+  }
+
+  std::mutex mu_;
+  std::unordered_map<std::string, ClientState> clients_;
+  uint64_t events_ = 0;
+};
+
 }  // namespace
 
 class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
@@ -253,6 +547,10 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     if (!shutdown_.compare_exchange_strong(expected, true)) return;
 
     StopFdListener();
+    // Reported here as well as periodically: a run that stops between two
+    // round numbers would otherwise take its last, most-settled window of
+    // measurements with it.
+    key_handle_stats_.Report();
     if (server_) {
       server_->Shutdown(std::chrono::system_clock::now() + ShutdownDeadline());
     }
@@ -335,7 +633,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   grpc::Status BatchPutRanges(grpc::ServerContext*, const ::umbp::BatchRangeDataRequest* request,
                               ::umbp::BatchBoolResponse* response) override {
     size_t total_ranges = 0;
-    if (!ValidateRangeRequest(*request, /*put=*/true, &total_ranges)) {
+    if (!ValidateRangeRequest(*request, /*put=*/true, request->keys_size(), &total_ranges)) {
       FillFalse(request->keys_size(), response);
       return grpc::Status::OK;
     }
@@ -438,9 +736,44 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
 
   grpc::Status BatchGetRanges(grpc::ServerContext*, const ::umbp::BatchRangeDataRequest* request,
                               ::umbp::BatchBoolResponse* response) override {
+    // The key list either rides on the request or is one the server was asked
+    // to remember on an earlier call. A handle it no longer holds is not an
+    // error -- say so, and the caller repeats the call carrying its keys.
+    KeyHandleTable::Keys keys;
+    if (request->key_handle() != 0) {
+      if (request->keys_size() != 0) {
+        FillFalse(request->keys_size(), response);
+        return grpc::Status::OK;
+      }
+      keys = key_handles_.Lookup(request->key_handle(), request->key_fingerprint());
+      // Counted before the early return: a handle the table has dropped is
+      // exactly the event worth measuring, and range_counts still says how
+      // many keys the request was about even when they did not travel.
+      key_handle_stats_.Observe(
+          request->client_id(), request->key_fingerprint(),
+          static_cast<size_t>(request->range_counts_size()),
+          keys == nullptr ? KeyHandleStats::Event::kMiss : KeyHandleStats::Event::kHit);
+      if (keys == nullptr) {
+        response->set_key_handle_unknown(true);
+        return grpc::Status::OK;
+      }
+    } else {
+      auto owned = std::make_shared<std::vector<std::string>>(request->keys().begin(),
+                                                              request->keys().end());
+      // A zero fingerprint means the caller does not intend to come back, so
+      // there is nothing to remember for it.
+      if (request->key_fingerprint() != 0) {
+        response->set_key_handle(key_handles_.Insert(owned, request->key_fingerprint()));
+      }
+      key_handle_stats_.Observe(request->client_id(), request->key_fingerprint(), owned->size(),
+                                KeyHandleStats::Event::kMint);
+      keys = std::move(owned);
+    }
+
+    const size_t key_count = keys->size();
     size_t total_ranges = 0;
-    if (!ValidateRangeRequest(*request, /*put=*/false, &total_ranges)) {
-      FillFalse(request->keys_size(), response);
+    if (!ValidateRangeRequest(*request, /*put=*/false, key_count, &total_ranges)) {
+      FillFalse(static_cast<int>(key_count), response);
       return grpc::Status::OK;
     }
 
@@ -456,16 +789,15 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     std::vector<uintptr_t> flat_ptrs;
     if (!ResolveRanges(request->client_id(), queries, &flat_ptrs, /*allow_zero=*/true) ||
         shutdown_.load()) {
-      FillFalse(request->keys_size(), response);
+      FillFalse(static_cast<int>(key_count), response);
       return grpc::Status::OK;
     }
 
-    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
-    std::vector<std::vector<uintptr_t>> ptrs(keys.size());
-    std::vector<std::vector<size_t>> sizes(keys.size());
-    std::vector<std::vector<size_t>> offsets(keys.size());
+    std::vector<std::vector<uintptr_t>> ptrs(key_count);
+    std::vector<std::vector<size_t>> sizes(key_count);
+    std::vector<std::vector<size_t>> offsets(key_count);
     size_t cursor = 0;
-    for (size_t i = 0; i < keys.size(); ++i) {
+    for (size_t i = 0; i < key_count; ++i) {
       const size_t count = request->range_counts(static_cast<int>(i));
       ptrs[i].reserve(count);
       sizes[i].reserve(count);
@@ -477,7 +809,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
             static_cast<size_t>(request->object_offsets(static_cast<int>(cursor))));
       }
     }
-    FillResults(client_->BatchGetRanges(keys, ptrs, sizes, offsets), response);
+    FillResults(client_->BatchGetRanges(*keys, ptrs, sizes, offsets), response);
     return grpc::Status::OK;
   }
 
@@ -1200,10 +1532,13 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     return ResolveRanges(request.client_id(), queries, ptrs, /*allow_zero=*/false);
   }
 
+  // `key_count` rather than request.keys_size(): a get may name its keys by a
+  // handle, in which case the request carries none.
   static bool ValidateRangeRequest(const ::umbp::BatchRangeDataRequest& request, bool put,
-                                   size_t* total_ranges) {
-    if (!total_ranges || request.range_counts_size() != request.keys_size()) return false;
-    if ((put && request.object_sizes_size() != request.keys_size()) ||
+                                   size_t key_count, size_t* total_ranges) {
+    if (!total_ranges || static_cast<size_t>(request.range_counts_size()) != key_count)
+      return false;
+    if ((put && static_cast<size_t>(request.object_sizes_size()) != key_count) ||
         (!put && request.object_sizes_size() != 0)) {
       return false;
     }
@@ -1298,6 +1633,9 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   std::mutex external_identity_lifecycle_mu_;
   std::mutex external_identity_mu_;
   std::map<std::string, std::shared_ptr<ExternalKvIdentityClient>> external_identities_;
+
+  KeyHandleTable key_handles_;
+  KeyHandleStats key_handle_stats_;
 
   std::atomic<bool> fd_running_{false};
   int listen_fd_ = -1;

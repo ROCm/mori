@@ -28,6 +28,28 @@
 namespace mori {
 namespace core {
 /* ---------------------------------------------------------------------------------------------- */
+/*                                       Serial Number Atomics                                    */
+/* ---------------------------------------------------------------------------------------------- */
+// postIdx / dbTouchIdx / doneIdx are free-running uint32_t serials that wrap at
+// 2^32, so only their order is meaningful, never their magnitude. Issue #626.
+
+// Keep whichever of *addr and value is later in serial order; returns the old
+// value. __hip_atomic_fetch_max compares raw words, so at the wrap it keeps the
+// large pre-wrap value and the counter freezes for good.
+inline __device__ uint32_t AtomicMaxSerial(uint32_t* addr, uint32_t value) {
+  uint32_t old = __hip_atomic_load(addr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  // A failed CAS refreshes `old`, so the loop also exits if another lane already
+  // stored something further along.
+  while (static_cast<int32_t>(value - old) > 0) {
+    if (__hip_atomic_compare_exchange_strong(addr, &old, value, __ATOMIC_RELAXED, __ATOMIC_RELAXED,
+                                             __HIP_MEMORY_SCOPE_AGENT)) {
+      break;
+    }
+  }
+  return old;
+}
+
+/* ---------------------------------------------------------------------------------------------- */
 /*                                          IBGDA Define                                          */
 /* ---------------------------------------------------------------------------------------------- */
 

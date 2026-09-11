@@ -198,7 +198,8 @@ inline __device__ void BnxtCollapsedCqDrain(core::WorkQueueHandle& wq,
       DrainToLive ? __hip_atomic_load(&wq.postIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)
                   : __hip_atomic_load(&wq.dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
   uint32_t cons = __hip_atomic_load(&wq.doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-  if (cons >= exitTarget) return;
+  // Serial-order compare: these wrap at 2^32, a raw >= is wrong there.
+  if (static_cast<int32_t>(cons - exitTarget) >= 0) return;
 
   const uint32_t mask = wq.sqWqeNum - 1;  // sqWqeNum is a power of two
   __threadfence();
@@ -212,18 +213,26 @@ inline __device__ void BnxtCollapsedCqDrain(core::WorkQueueHandle& wq,
       return;
     }
 
-    // Largest V <= dbTouchIdx with V % sqWqeNum == con_indx % sqWqeNum.
+    // con_indx is the consumed count mod sqWqeNum: rebuild the serial as a forward
+    // delta from doneIdx, as Mlx5CollapsedCqDrain does with wqe_counter. Anchoring on
+    // dbTouchIdx instead went a whole queue depth *backwards* whenever the CQE ran
+    // ahead of it -- routine, since the doorbell is rung before dbTouchIdx is
+    // published -- and as a raw word that pinned doneIdx for good. Issue #626.
     uint32_t dbTouch =
         __hip_atomic_load(&wq.dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    uint32_t completed = (dbTouch & ~mask) | (wqeCounter & mask);
-    if (completed > dbTouch) completed -= wq.sqWqeNum;
+    uint32_t delta = (wqeCounter - cons) & mask;
 
-    __hip_atomic_fetch_max(&wq.doneIdx, completed, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    cons = __hip_atomic_load(&wq.doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    // Still capped at what was doorbelled: con_indx alone cannot tell a live
+    // completion from a stale one. Refusing one costs nothing -- PollSingleCqe is
+    // level-triggered for cqeNum == 1, so the loop re-reads the same value.
+    if (delta != 0 && static_cast<int32_t>(delta) <= static_cast<int32_t>(dbTouch - cons)) {
+      cons += delta;  // sole writer under pollCqLock, and delta > 0 is already an advance
+      __hip_atomic_store(&wq.doneIdx, cons, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
     if constexpr (DrainToLive) {
       exitTarget = __hip_atomic_load(&wq.postIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
-  } while (cons < exitTarget);
+  } while (static_cast<int32_t>(cons - exitTarget) < 0);
   __threadfence();
 }
 
@@ -243,7 +252,7 @@ inline __device__ void ShmemQuietThreadKernelSerialImpl(int pe, int qpId) {
     if constexpr (DrainToLive) {
       uint32_t done = __hip_atomic_load(&wq.doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       uint32_t post = __hip_atomic_load(&wq.postIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      if (done >= post) return;
+      if (static_cast<int32_t>(done - post) >= 0) return;
     }
     if (__hip_atomic_load(&cq.pollCqLock, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) == 0 &&
         core::AcquireLockOnce(&cq.pollCqLock)) {
@@ -266,6 +275,7 @@ inline __device__ void ShmemQuietThreadKernelPsdImpl(int pe, int qpId) {
   const int myLaneId = core::WarpLaneId();
 
   constexpr uint32_t PENDING_WORK_MASK = 0x800000;  // Bit 23: sign bit for 24-bit counter
+  constexpr uint32_t MSN_MASK = 0xFFFFFF;           // ionic reports a 24-bit MSN
   const uint32_t dbTouchedIdx = wqHandle.dbTouchIdx;
   constexpr uint32_t MAX_GREED = 10;
   constexpr uint32_t CQ_DOORBELL_GRACE = 100;  // IONIC_CQ_GRACE
@@ -303,17 +313,35 @@ inline __device__ void ShmemQuietThreadKernelPsdImpl(int pe, int qpId) {
       }
 
       if (myLaneId == highestLane) {
-        cqHandle.cq_consumer = myCqPos + 1;
+        // Widen the 24-bit MSN into doneIdx's 32-bit serial space: advance by the
+        // masked forward delta instead of storing wqeCounter raw, else doneIdx ends
+        // up in a different modulus than dbTouchIdx and the in-flight count goes bad
+        // past 2^24. Cap it at what was doorbelled -- a WQE the NIC was never told
+        // about cannot have completed -- reading dbTouchIdx live, since other warps
+        // keep doorbelling while we poll. Read doneIdx once and write it once so
+        // concurrent pollers off one CQE land on the same value; an RMW could reload
+        // in between and apply delta twice, running doneIdx past the NIC.
+        uint32_t doorbelled =
+            __hip_atomic_load(&wqHandle.dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        uint32_t cur = wqHandle.doneIdx;
+        uint32_t delta = (wqeCounter - cur) & MSN_MASK;
 
-        if (((cqHandle.cq_consumer - cqHandle.cq_dbpos) & (cqHandle.cqeNum - 1)) >=
-            CQ_DOORBELL_GRACE) {
-          cqHandle.cq_dbpos = cqHandle.cq_consumer;
-          core::UpdateCqDbrRecord<core::ProviderType::PSD>(cqHandle, myCqPos + 1);
+        // Decide before consuming: the doorbell is rung before dbTouchIdx is
+        // published, so a live MSN can be ahead of the cap however fresh the load,
+        // and the color bit is keyed on cq_consumer -- moving it first would drop
+        // that completion for good. Left in place, a later pass takes it.
+        bool aheadOfDoorbell =
+            delta != 0 && static_cast<int32_t>(delta) > static_cast<int32_t>(doorbelled - cur);
+        if (!aheadOfDoorbell) {
+          if (delta != 0) wqHandle.doneIdx = cur + delta;
+
+          cqHandle.cq_consumer = myCqPos + 1;
+          if (((cqHandle.cq_consumer - cqHandle.cq_dbpos) & (cqHandle.cqeNum - 1)) >=
+              CQ_DOORBELL_GRACE) {
+            cqHandle.cq_dbpos = cqHandle.cq_consumer;
+            core::UpdateCqDbrRecord<core::ProviderType::PSD>(cqHandle, myCqPos + 1);
+          }
         }
-
-        wqHandle.doneIdx = wqeCounter;
-        // __hip_atomic_fetch_max(&wqHandle.doneIdx, wqeCounter, __ATOMIC_RELAXED,
-        // __HIP_MEMORY_SCOPE_AGENT);
       }
 
       if (!((wqHandle.doneIdx - dbTouchedIdx) & PENDING_WORK_MASK)) {
@@ -341,7 +369,8 @@ inline __device__ void Mlx5CollapsedCqDrain(core::WorkQueueHandle& wq,
       DrainToLive ? __hip_atomic_load(&wq.postIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)
                   : __hip_atomic_load(&wq.dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
   uint32_t cons = __hip_atomic_load(&wq.doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-  if (cons >= exitTarget) return;
+  // Serial-order compare: these wrap at 2^32, a raw >= is wrong there.
+  if (static_cast<int32_t>(cons - exitTarget) >= 0) return;
 
   volatile core::Mlx5Cqe64* cqe = reinterpret_cast<volatile core::Mlx5Cqe64*>(cq.cqAddr);
   __threadfence();
@@ -370,15 +399,18 @@ inline __device__ void Mlx5CollapsedCqDrain(core::WorkQueueHandle& wq,
     // live SQ slots out for reuse and the overwritten writes are silently dropped.
     uint32_t doorbelled =
         __hip_atomic_load(&wq.dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    // Caller holds pollCqLock and nothing else writes doneIdx on this path, so a
+    // plain store replaces the atomic max -- delta > 0 already makes it an advance
+    // -- and the reload after it, which could only return what we just stored.
     if (delta != 0 && static_cast<int32_t>(delta) <= static_cast<int32_t>(doorbelled - cons)) {
-      __hip_atomic_fetch_max(&wq.doneIdx, cons + delta, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      cons += delta;
+      __hip_atomic_store(&wq.doneIdx, cons, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
-    cons = __hip_atomic_load(&wq.doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     if (cons == prevCons) break;
     if constexpr (DrainToLive) {
       exitTarget = __hip_atomic_load(&wq.postIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
-  } while (cons < exitTarget);
+  } while (static_cast<int32_t>(cons - exitTarget) < 0);
   __threadfence();
 }
 
@@ -397,7 +429,7 @@ inline __device__ void ShmemQuietThreadKernelMlnxImpl(int pe, int qpId) {
     if constexpr (DrainToLive) {
       uint32_t done = __hip_atomic_load(&wq.doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       uint32_t post = __hip_atomic_load(&wq.postIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      if (done >= post) return;
+      if (static_cast<int32_t>(done - post) >= 0) return;
     }
     if (__hip_atomic_load(&cq.pollCqLock, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) == 0 &&
         core::AcquireLockOnce(&cq.pollCqLock)) {
@@ -594,8 +626,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
         core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_active_lanes, warp_total_psn,
                                             &warp_msntbl_counter, &warp_psn_counter);
         warp_sq_counter = warp_msntbl_counter;
-        __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
-                               __HIP_MEMORY_SCOPE_AGENT);
+        core::AtomicMaxSerial(&wq->postIdx, warp_sq_counter + num_active_lanes);
       } else if constexpr (PrvdType == core::ProviderType::PSD) {
         warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_active_lanes, __ATOMIC_RELAXED,
                                                  __HIP_MEMORY_SCOPE_AGENT);
@@ -619,13 +650,13 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
     }
 
     while (true) {
-      uint64_t db_touched =
+      uint32_t db_touched =
           __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      uint64_t db_done =
+      uint32_t db_done =
           __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      uint64_t num_active_sq_entries = db_touched - db_done;
-      uint64_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
-      uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
+      uint32_t num_active_sq_entries = db_touched - db_done;
+      uint32_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
+      uint32_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
       if (num_free_entries > num_entries_until_warp_last_entry) {
         break;
       }
@@ -783,8 +814,7 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::Sym
       core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_active_lanes, num_active_lanes,
                                           &warp_msntbl_counter, &warp_psn_counter);
       warp_sq_counter = warp_msntbl_counter;
-      __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
-                             __HIP_MEMORY_SCOPE_AGENT);
+      core::AtomicMaxSerial(&wq->postIdx, warp_sq_counter + num_active_lanes);
     }
     warp_sq_counter = __shfl(warp_sq_counter, leader_phys_lane_id);
     warp_msntbl_counter = __shfl(warp_msntbl_counter, leader_phys_lane_id);
@@ -804,12 +834,12 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::Sym
   }
 
   while (true) {
-    uint64_t db_touched =
+    uint32_t db_touched =
         __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    uint64_t db_done = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    uint64_t num_active_sq_entries = db_touched - db_done;
-    uint64_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
-    uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
+    uint32_t db_done = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    uint32_t num_active_sq_entries = db_touched - db_done;
+    uint32_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
+    uint32_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
     if (num_free_entries > num_entries_until_warp_last_entry) {
       break;
     }
@@ -984,8 +1014,7 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
         core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_wqes, warp_total_psn,
                                             &warp_msntbl_counter, &warp_psn_counter);
         warp_sq_counter = warp_msntbl_counter;
-        __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_wqes, __ATOMIC_RELAXED,
-                               __HIP_MEMORY_SCOPE_AGENT);
+        core::AtomicMaxSerial(&wq->postIdx, warp_sq_counter + num_wqes);
       } else if constexpr (PrvdType == core::ProviderType::PSD) {
         warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_wqes, __ATOMIC_RELAXED,
                                                  __HIP_MEMORY_SCOPE_AGENT);
@@ -1014,13 +1043,13 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
     }
 
     while (true) {
-      uint64_t db_touched =
+      uint32_t db_touched =
           __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      uint64_t db_done =
+      uint32_t db_done =
           __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      uint64_t num_active_sq_entries = db_touched - db_done;
-      uint64_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
-      uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_wqes - db_touched;
+      uint32_t num_active_sq_entries = db_touched - db_done;
+      uint32_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
+      uint32_t num_entries_until_warp_last_entry = warp_sq_counter + num_wqes - db_touched;
       if (num_free_entries > num_entries_until_warp_last_entry) {
         break;
       }
@@ -1292,8 +1321,7 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelImpl(
       core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_active_lanes, num_active_lanes,
                                           &warp_msntbl_counter, &warp_psn_counter);
       warp_sq_counter = warp_msntbl_counter;
-      __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
-                             __HIP_MEMORY_SCOPE_AGENT);
+      core::AtomicMaxSerial(&wq->postIdx, warp_sq_counter + num_active_lanes);
     }
     warp_sq_counter = __shfl(warp_sq_counter, leader_phys_lane_id);
     warp_msntbl_counter = __shfl(warp_msntbl_counter, leader_phys_lane_id);
@@ -1313,12 +1341,12 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelImpl(
   }
 
   while (true) {
-    uint64_t db_touched =
+    uint32_t db_touched =
         __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    uint64_t db_done = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    uint64_t num_active_sq_entries = db_touched - db_done;
-    uint64_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
-    uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
+    uint32_t db_done = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    uint32_t num_active_sq_entries = db_touched - db_done;
+    uint32_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
+    uint32_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
     if (num_free_entries > num_entries_until_warp_last_entry) break;
     ShmemQuietThreadKernelImpl<PrvdType>(pe, qpId);
   }
@@ -1476,8 +1504,7 @@ inline __device__ T ShmemAtomicTypeFetchThreadKernelImpl(const application::Symm
       core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_active_lanes, num_active_lanes,
                                           &warp_msntbl_counter, &warp_psn_counter);
       warp_sq_counter = warp_msntbl_counter;
-      __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
-                             __HIP_MEMORY_SCOPE_AGENT);
+      core::AtomicMaxSerial(&wq->postIdx, warp_sq_counter + num_active_lanes);
     }
     warp_sq_counter = __shfl(warp_sq_counter, leader_phys_lane_id);
     warp_msntbl_counter = __shfl(warp_msntbl_counter, leader_phys_lane_id);
@@ -1497,12 +1524,12 @@ inline __device__ T ShmemAtomicTypeFetchThreadKernelImpl(const application::Symm
   }
 
   while (true) {
-    uint64_t db_touched =
+    uint32_t db_touched =
         __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    uint64_t db_done = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    uint64_t num_active_sq_entries = db_touched - db_done;
-    uint64_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
-    uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
+    uint32_t db_done = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    uint32_t num_active_sq_entries = db_touched - db_done;
+    uint32_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
+    uint32_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
     if (num_free_entries > num_entries_until_warp_last_entry) break;
     ShmemQuietThreadKernelImpl<PrvdType>(pe, qpId);
   }
@@ -1729,8 +1756,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelAddrImpl(const void* dest, cons
         core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_active_lanes, warp_total_psn,
                                             &warp_msntbl_counter, &warp_psn_counter);
         warp_sq_counter = warp_msntbl_counter;
-        __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
-                               __HIP_MEMORY_SCOPE_AGENT);
+        core::AtomicMaxSerial(&wq->postIdx, warp_sq_counter + num_active_lanes);
       } else if constexpr (PrvdType == core::ProviderType::PSD) {
         warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_active_lanes, __ATOMIC_RELAXED,
                                                  __HIP_MEMORY_SCOPE_AGENT);
@@ -1754,13 +1780,13 @@ inline __device__ void ShmemPutMemNbiThreadKernelAddrImpl(const void* dest, cons
     }
 
     while (true) {
-      uint64_t db_touched =
+      uint32_t db_touched =
           __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      uint64_t db_done =
+      uint32_t db_done =
           __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      uint64_t num_active_sq_entries = db_touched - db_done;
-      uint64_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
-      uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
+      uint32_t num_active_sq_entries = db_touched - db_done;
+      uint32_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
+      uint32_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
       if (num_free_entries > num_entries_until_warp_last_entry) {
         break;
       }
@@ -1896,8 +1922,7 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelAddrImpl(const void* dest, 
       core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_active_lanes, num_active_lanes,
                                           &warp_msntbl_counter, &warp_psn_counter);
       warp_sq_counter = warp_msntbl_counter;
-      __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
-                             __HIP_MEMORY_SCOPE_AGENT);
+      core::AtomicMaxSerial(&wq->postIdx, warp_sq_counter + num_active_lanes);
     }
     warp_sq_counter = __shfl(warp_sq_counter, leader_phys_lane_id);
     warp_msntbl_counter = __shfl(warp_msntbl_counter, leader_phys_lane_id);
@@ -1917,12 +1942,12 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelAddrImpl(const void* dest, 
   }
 
   while (true) {
-    uint64_t db_touched =
+    uint32_t db_touched =
         __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    uint64_t db_done = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    uint64_t num_active_sq_entries = db_touched - db_done;
-    uint64_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
-    uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
+    uint32_t db_done = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    uint32_t num_active_sq_entries = db_touched - db_done;
+    uint32_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
+    uint32_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
     if (num_free_entries > num_entries_until_warp_last_entry) {
       break;
     }
@@ -2095,8 +2120,7 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelAddrImpl(
         core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_wqes, warp_total_psn,
                                             &warp_msntbl_counter, &warp_psn_counter);
         warp_sq_counter = warp_msntbl_counter;
-        __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_wqes, __ATOMIC_RELAXED,
-                               __HIP_MEMORY_SCOPE_AGENT);
+        core::AtomicMaxSerial(&wq->postIdx, warp_sq_counter + num_wqes);
       } else if constexpr (PrvdType == core::ProviderType::PSD) {
         warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_wqes, __ATOMIC_RELAXED,
                                                  __HIP_MEMORY_SCOPE_AGENT);
@@ -2125,13 +2149,13 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelAddrImpl(
     }
 
     while (true) {
-      uint64_t db_touched =
+      uint32_t db_touched =
           __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      uint64_t db_done =
+      uint32_t db_done =
           __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      uint64_t num_active_sq_entries = db_touched - db_done;
-      uint64_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
-      uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_wqes - db_touched;
+      uint32_t num_active_sq_entries = db_touched - db_done;
+      uint32_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
+      uint32_t num_entries_until_warp_last_entry = warp_sq_counter + num_wqes - db_touched;
       if (num_free_entries > num_entries_until_warp_last_entry) {
         break;
       }
@@ -2368,8 +2392,7 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelAddrImpl(const void* d
       core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_active_lanes, num_active_lanes,
                                           &warp_msntbl_counter, &warp_psn_counter);
       warp_sq_counter = warp_msntbl_counter;
-      __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
-                             __HIP_MEMORY_SCOPE_AGENT);
+      core::AtomicMaxSerial(&wq->postIdx, warp_sq_counter + num_active_lanes);
     }
     warp_sq_counter = __shfl(warp_sq_counter, leader_phys_lane_id);
     warp_msntbl_counter = __shfl(warp_msntbl_counter, leader_phys_lane_id);
@@ -2389,12 +2412,12 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelAddrImpl(const void* d
   }
 
   while (true) {
-    uint64_t db_touched =
+    uint32_t db_touched =
         __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    uint64_t db_done = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    uint64_t num_active_sq_entries = db_touched - db_done;
-    uint64_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
-    uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
+    uint32_t db_done = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    uint32_t num_active_sq_entries = db_touched - db_done;
+    uint32_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
+    uint32_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
     if (num_free_entries > num_entries_until_warp_last_entry) break;
     ShmemQuietThreadKernelImpl<PrvdType>(pe, qpId);
   }
@@ -2516,8 +2539,7 @@ inline __device__ T ShmemAtomicTypeFetchThreadKernelAddrImpl(const void* dest, v
       core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_active_lanes, num_active_lanes,
                                           &warp_msntbl_counter, &warp_psn_counter);
       warp_sq_counter = warp_msntbl_counter;
-      __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
-                             __HIP_MEMORY_SCOPE_AGENT);
+      core::AtomicMaxSerial(&wq->postIdx, warp_sq_counter + num_active_lanes);
     }
     warp_sq_counter = __shfl(warp_sq_counter, leader_phys_lane_id);
     warp_msntbl_counter = __shfl(warp_msntbl_counter, leader_phys_lane_id);
@@ -2537,12 +2559,12 @@ inline __device__ T ShmemAtomicTypeFetchThreadKernelAddrImpl(const void* dest, v
   }
 
   while (true) {
-    uint64_t db_touched =
+    uint32_t db_touched =
         __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    uint64_t db_done = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    uint64_t num_active_sq_entries = db_touched - db_done;
-    uint64_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
-    uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
+    uint32_t db_done = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    uint32_t num_active_sq_entries = db_touched - db_done;
+    uint32_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
+    uint32_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
     if (num_free_entries > num_entries_until_warp_last_entry) break;
     ShmemQuietThreadKernelImpl<PrvdType>(pe, qpId);
   }
@@ -2723,8 +2745,7 @@ inline __device__ void ShmemGetMemNbiThreadKernelImpl(const application::SymmMem
         core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_active_lanes, warp_total_psn,
                                             &warp_msntbl_counter, &warp_psn_counter);
         warp_sq_counter = warp_msntbl_counter;
-        __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
-                               __HIP_MEMORY_SCOPE_AGENT);
+        core::AtomicMaxSerial(&wq->postIdx, warp_sq_counter + num_active_lanes);
       } else if constexpr (PrvdType == core::ProviderType::PSD) {
         warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_active_lanes, __ATOMIC_RELAXED,
                                                  __HIP_MEMORY_SCOPE_AGENT);
@@ -2748,13 +2769,13 @@ inline __device__ void ShmemGetMemNbiThreadKernelImpl(const application::SymmMem
     }
 
     while (true) {
-      uint64_t db_touched =
+      uint32_t db_touched =
           __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      uint64_t db_done =
+      uint32_t db_done =
           __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      uint64_t num_active_sq_entries = db_touched - db_done;
-      uint64_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
-      uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
+      uint32_t num_active_sq_entries = db_touched - db_done;
+      uint32_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
+      uint32_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
       if (num_free_entries > num_entries_until_warp_last_entry) {
         break;
       }
@@ -2936,8 +2957,7 @@ inline __device__ void ShmemGetMemNbiThreadKernelAddrImpl(void* dest, const void
         core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_active_lanes, warp_total_psn,
                                             &warp_msntbl_counter, &warp_psn_counter);
         warp_sq_counter = warp_msntbl_counter;
-        __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
-                               __HIP_MEMORY_SCOPE_AGENT);
+        core::AtomicMaxSerial(&wq->postIdx, warp_sq_counter + num_active_lanes);
       } else if constexpr (PrvdType == core::ProviderType::PSD) {
         warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_active_lanes, __ATOMIC_RELAXED,
                                                  __HIP_MEMORY_SCOPE_AGENT);
@@ -2961,13 +2981,13 @@ inline __device__ void ShmemGetMemNbiThreadKernelAddrImpl(void* dest, const void
     }
 
     while (true) {
-      uint64_t db_touched =
+      uint32_t db_touched =
           __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      uint64_t db_done =
+      uint32_t db_done =
           __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      uint64_t num_active_sq_entries = db_touched - db_done;
-      uint64_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
-      uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
+      uint32_t num_active_sq_entries = db_touched - db_done;
+      uint32_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
+      uint32_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
       if (num_free_entries > num_entries_until_warp_last_entry) {
         break;
       }

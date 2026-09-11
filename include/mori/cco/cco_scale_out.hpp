@@ -90,7 +90,11 @@ enum ccoGdaThreadMode : uint32_t {
 enum ccoGdaOptFlags {
   ccoGdaOptFlagsDefault = 0,
   ccoGdaOptFlagsMaySkipCreditCheck = (1 << 0),
-  ccoGdaOptFlagsAggregateRequests = (1 << 1),
+  // Bit 1 is reserved, not free: it used to mean "post without ringing, someone
+  // else rings later". Nothing can ring for you today -- flushAsync only
+  // snapshots postIdx, which is a *reservation* counter that runs ahead of the
+  // WQE writes, so a deferred doorbell has no safe bound. Supporting deferral
+  // needs a separate "WQEs written" counter the posting paths publish to.
 };
 
 typedef enum ccoGdaSignalOp_t {
@@ -109,6 +113,27 @@ struct ccoGda_SignalAdd {
   ccoGdaSignal_t signalId;
   uint64_t value;
   __device__ inline ccoGda_SignalAdd(ccoGdaSignal_t id, uint64_t val) : signalId(id), value(val) {}
+};
+
+// Atomic add at an arbitrary offset in a caller-owned window, rather than at a
+// signal slot in the DevComm's resource window.
+//
+// ccoGda_SignalInc / ccoGda_SignalAdd cannot express that: they resolve to
+// signalId * sizeof(uint64_t) in the DevComm's own resource window.
+//
+// The remote op is identical (a NIC atomic add); only the target resolution
+// differs, so this rides the same single-reservation path as ccoGda_SignalAdd --
+// fused into `put`'s own doorbell when passed to put, no extra WQE. `offset` is
+// window-relative with iova=0, the same convention as put's dstOffset.
+//
+// waitSignal/readSignal/resetSignal do NOT see these: the target is the caller's
+// window, so the caller polls it directly.
+struct ccoGda_WindowSignalAdd {
+  ccoWindow_t win;
+  size_t offset;
+  uint64_t value;
+  __device__ inline ccoGda_WindowSignalAdd(ccoWindow_t w, size_t off, uint64_t val)
+      : win(w), offset(off), value(val) {}
 };
 
 struct ccoGda_CounterInc {
@@ -199,10 +224,10 @@ struct ccoGda {
   // ── completion ──────────────────────────────────────────────────────────
 
   // flush = flushAsync + wait per peer.
-  // flushAsync rings the doorbell if any WQEs are pending (skips if already
-  // rung), then wait polls CQ until all submitted WQEs complete.
+  // flushAsync snapshots the reservation counter; wait polls the CQ until the
+  // WQEs up to that snapshot complete. Doorbells are rung by the posting paths.
 
-  // flush: ring doorbell + poll CQ for every peer.
+  // flush: poll CQ for every peer.
   // peers are distributed across the Coop group (default: warp).
   // all threads in the group must call flush together.
   template <typename Coop = ccoCoopWarp>
@@ -212,8 +237,8 @@ struct ccoGda {
   template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename Coop = ccoCoopWarp>
   __device__ inline void flush(int peer, Coop coop = Coop{});
 
-  // flushAsync: ring doorbell for peer and return a request handle that
-  // wait() can later be used to wait on individually.
+  // flushAsync: snapshot this peer's QP progress and return a request handle
+  // that wait() can later be used to wait on individually.
   template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename Coop = ccoCoopThread>
   __device__ inline void flushAsync(int peer, ccoGdaRequest_t* outRequest, Coop coop = Coop{});
 
@@ -275,6 +300,7 @@ __device__ inline static void quietUntil(core::RdmaEndpointDevice* ep, uint32_t 
 
   if constexpr (PrvdType == core::ProviderType::PSD) {
     constexpr uint32_t PENDING_WORK_MASK = 0x800000;
+    constexpr uint32_t MSN_MASK = 0xFFFFFF;  // ionic reports a 24-bit MSN
 #ifdef IONIC_CCQE
     // CCQE: cqeNum==1, NIC overwrites CQE[0] with latest MSN.
     volatile ionic_v1_cqe* cqe = reinterpret_cast<volatile ionic_v1_cqe*>(cq->cqAddr);
@@ -282,51 +308,100 @@ __device__ inline static void quietUntil(core::RdmaEndpointDevice* ep, uint32_t 
       uint32_t msn = BE32TOH(*(volatile uint32_t*)(&cqe->send.msg_msn));
       asm volatile("" ::: "memory");
       if (!((msn - targetIdx) & PENDING_WORK_MASK)) {
-        wq->doneIdx = msn;
+        // Widen the 24-bit MSN into doneIdx's 32-bit serial space: advance by the
+        // masked forward delta instead of storing msn raw, else doneIdx ends up in
+        // a different modulus than dbTouchIdx and the in-flight count goes bad past
+        // 2^24. Never advance beyond what was doorbelled -- a WQE the NIC was never
+        // told about cannot have completed, and skipping over it recycles live SQ
+        // slots.
+        // doneIdx is read once into `cur` and written once, so concurrent pollers
+        // computing off the same CQE all land on the same value, as they did when
+        // this was a bare `doneIdx = msn`. A read-modify-write here could reload
+        // between the two and apply delta twice, running doneIdx past the NIC.
+        uint32_t dbTouched =
+            __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        uint32_t cur = wq->doneIdx;
+        uint32_t delta = (msn - cur) & MSN_MASK;
+        if (delta != 0 && static_cast<int32_t>(delta) <= static_cast<int32_t>(dbTouched - cur)) {
+          wq->doneIdx = cur + delta;
+        }
       }
     }
 #else
     // Non-CCQE: warp-parallel poll with color bit alternation.
-    const uint64_t activeMask = core::GetActiveLaneMask();
-    const uint32_t myLogicalLaneId = core::GetActiveLaneNum(activeMask);
+    //
+    // The poll below is only correct when every participating lane shares one
+    // CQ: the pollCqLock is acquired by the first active lane and broadcast to
+    // the rest, each lane derives its CQ slot from its index within the active
+    // mask, and a ballot elects a single lane to commit cq_consumer/doneIdx.
+    // Callers can legitimately arrive with lanes on different endpoints (e.g.
+    // flush() fans peers across the cooperative group), so group the active
+    // lanes by CQ and give each distinct CQ its own turn.
     const int myLaneId = core::WarpLaneId();
     constexpr uint32_t MAX_GREED = 10;
     constexpr uint32_t CQ_DOORBELL_GRACE = 100;
-    uint32_t wqeCounter;
+    const unsigned long long myCqKey = reinterpret_cast<unsigned long long>(cq);
 
-    while ((wq->doneIdx - targetIdx) & PENDING_WORK_MASK) {
-      if (!core::spin_lock_try_acquire_shared(&cq->pollCqLock, activeMask)) continue;
-      uint32_t greedRemaining = MAX_GREED;
+    bool needTurn = true;
+    for (uint64_t turns = __ballot(needTurn); turns != 0; turns = __ballot(needTurn)) {
+      const int lead = __ffsll(static_cast<unsigned long long>(turns)) - 1;
+      if (myCqKey != __shfl(myCqKey, lead)) continue;
+      needTurn = false;
+
+      const uint64_t activeMask = core::GetActiveLaneMask();
+      const uint32_t myLogicalLaneId = core::GetActiveLaneNum(activeMask);
+      uint32_t wqeCounter;
+
       while ((wq->doneIdx - targetIdx) & PENDING_WORK_MASK) {
-        const uint64_t oldDoneIdx = wq->doneIdx;
-        const uint32_t curConsIdx = cq->cq_consumer;
-        uint32_t myCqPos = curConsIdx + myLogicalLaneId;
-        const int opcode =
-            core::PollCq<core::ProviderType::PSD>(cq->cqAddr, cq->cqeNum, &myCqPos, &wqeCounter);
-        if (opcode > 0) {
-          MORI_PRINTF("quietUntil[PSD]: poll err %d\n", opcode);
-          assert(false);
-        }
-        asm volatile("" ::: "memory");
-        const uint64_t successMask = __ballot(opcode == 0);
-        const int highestLane = core::GetLastActiveLaneID(successMask);
-        if (highestLane == -1) continue;
-        if (myLaneId == highestLane) {
-          cq->cq_consumer = myCqPos + 1;
-          if (((cq->cq_consumer - cq->cq_dbpos) & (cq->cqeNum - 1)) >= CQ_DOORBELL_GRACE) {
-            cq->cq_dbpos = cq->cq_consumer;
-            core::UpdateCqDbrRecord<core::ProviderType::PSD>(*cq, myCqPos + 1);
+        if (!core::spin_lock_try_acquire_shared(&cq->pollCqLock, activeMask)) continue;
+        uint32_t greedRemaining = MAX_GREED;
+        while ((wq->doneIdx - targetIdx) & PENDING_WORK_MASK) {
+          const uint64_t oldDoneIdx = wq->doneIdx;
+          const uint32_t curConsIdx = cq->cq_consumer;
+          uint32_t myCqPos = curConsIdx + myLogicalLaneId;
+          const int opcode =
+              core::PollCq<core::ProviderType::PSD>(cq->cqAddr, cq->cqeNum, &myCqPos, &wqeCounter);
+          if (opcode > 0) {
+            MORI_PRINTF("quietUntil[PSD]: poll err %d\n", opcode);
+            assert(false);
           }
-          wq->doneIdx = wqeCounter;
+          asm volatile("" ::: "memory");
+          const uint64_t successMask = __ballot(opcode == 0);
+          const int highestLane = core::GetLastActiveLaneID(successMask);
+          if (highestLane == -1) continue;
+          if (myLaneId == highestLane) {
+            // Widen the 24-bit MSN into doneIdx's 32-bit serial space; see the CCQE
+            // branch above for why the raw store is wrong and why dbTouchIdx caps it.
+            uint32_t dbTouched =
+                __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            uint32_t cur = wq->doneIdx;
+            uint32_t delta = (wqeCounter - cur) & MSN_MASK;
+
+            // Decide before consuming: ringDoorbellOrdered rings the doorbell before
+            // publishing dbTouchIdx, so a live MSN can be ahead of the cap, and the
+            // color bit is keyed on cq_consumer -- moving it first would drop that
+            // completion for good. Left in place, a later pass takes it.
+            bool aheadOfDoorbell =
+                delta != 0 && static_cast<int32_t>(delta) > static_cast<int32_t>(dbTouched - cur);
+            if (!aheadOfDoorbell) {
+              if (delta != 0) wq->doneIdx = cur + delta;
+
+              cq->cq_consumer = myCqPos + 1;
+              if (((cq->cq_consumer - cq->cq_dbpos) & (cq->cqeNum - 1)) >= CQ_DOORBELL_GRACE) {
+                cq->cq_dbpos = cq->cq_consumer;
+                core::UpdateCqDbrRecord<core::ProviderType::PSD>(*cq, myCqPos + 1);
+              }
+            }
+          }
+          if (!((wq->doneIdx - targetIdx) & PENDING_WORK_MASK)) {
+            if (wq->doneIdx == oldDoneIdx) break;
+            if (greedRemaining == 0) break;
+            --greedRemaining;
+          }
         }
-        if (!((wq->doneIdx - targetIdx) & PENDING_WORK_MASK)) {
-          if (wq->doneIdx == oldDoneIdx) break;
-          if (greedRemaining == 0) break;
-          --greedRemaining;
-        }
+        core::spin_lock_release_shared(&cq->pollCqLock, activeMask);
+        break;
       }
-      core::spin_lock_release_shared(&cq->pollCqLock, activeMask);
-      break;
     }
 #endif
   } else if constexpr (PrvdType == core::ProviderType::MLX5) {
@@ -361,7 +436,7 @@ __device__ inline static void quietUntil(core::RdmaEndpointDevice* ep, uint32_t 
       if (delta != 0 && static_cast<int32_t>(delta) <= window) {
         completed = cons + delta;
       }
-      __hip_atomic_fetch_max(&wq->doneIdx, completed, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      core::AtomicMaxSerial(&wq->doneIdx, completed);
       asm volatile("" ::: "memory");
     }
     __threadfence();
@@ -390,12 +465,26 @@ __device__ inline static void quietUntil(core::RdmaEndpointDevice* ep, uint32_t 
           assert(false);
           break;
         }
-        // Largest V <= dbTouchIdx with V % sqWqeNum == con_indx % sqWqeNum.
+        // con_indx is the consumed count mod sqWqeNum: rebuild the serial as a
+        // forward delta from doneIdx, as the mlx5 drain does with wqe_counter.
+        // Anchoring on dbTouchIdx instead (largest congruent V <= dbTouchIdx, minus
+        // sqWqeNum when it overshot) went a whole queue depth *backwards* whenever
+        // the CQE ran ahead of dbTouchIdx -- routine, since the doorbell is rung
+        // before dbTouchIdx is published -- and as a raw word that value won the
+        // atomic max this used to be and pinned doneIdx for good. Issue #626.
+        // Flow control never leaves sqWqeNum WQEs outstanding, so delta == 0 is
+        // unambiguously "nothing new" rather than a full queue.
+        uint32_t cur = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
         uint32_t dbTouch =
             __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-        uint32_t completed = (dbTouch & ~mask) | (wqeCounter & mask);
-        if (completed > dbTouch) completed -= wq->sqWqeNum;
-        __hip_atomic_fetch_max(&wq->doneIdx, completed, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        uint32_t delta = (wqeCounter - cur) & mask;
+        // Still capped at what was doorbelled: con_indx alone cannot tell a live
+        // completion from a stale one. Refusing one costs nothing -- PollSingleCqe is
+        // level-triggered for cqeNum == 1, so the next pass re-reads the same value.
+        if (delta != 0 && static_cast<int32_t>(delta) <= static_cast<int32_t>(dbTouch - cur)) {
+          // Sole writer under pollCqLock, and delta > 0 is already an advance.
+          __hip_atomic_store(&wq->doneIdx, cur + delta, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        }
       }
       __threadfence();
       core::ReleaseLock(&cq->pollCqLock);
@@ -462,12 +551,15 @@ __device__ inline static uint32_t reserveWqeSlots(core::RdmaEndpointDevice* ep,
     if (outPsnBase) *outPsnBase = psnBase;
   }
   while (true) {
-    uint64_t dbTouched =
+    // All uint32_t: widening to uint64_t leaves curPostIdx + numWqesNeeded
+    // wrapping in 32 bits while dbTouched does not, so the difference underflows
+    // and this loop spins forever on an empty SQ. Issue #626.
+    uint32_t dbTouched =
         __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    uint64_t dbDone = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    uint64_t numActiveSqEntries = dbTouched - dbDone;
-    uint64_t numFreeEntries = wq->sqWqeNum - numActiveSqEntries;
-    uint64_t entriesUntilMine = curPostIdx + numWqesNeeded - dbTouched;
+    uint32_t dbDone = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    uint32_t numActiveSqEntries = dbTouched - dbDone;
+    uint32_t numFreeEntries = wq->sqWqeNum - numActiveSqEntries;
+    uint32_t entriesUntilMine = curPostIdx + numWqesNeeded - dbTouched;
     if (numFreeEntries > entriesUntilMine) {
       break;
     }
@@ -490,12 +582,13 @@ __device__ inline static void waitSqSpace(core::RdmaEndpointDevice* ep, uint32_t
                                           uint32_t totalWqes) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
   while (true) {
-    uint64_t dbTouched =
+    // All uint32_t, same reason as reserveWqeSlots above.
+    uint32_t dbTouched =
         __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    uint64_t dbDone = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    uint64_t numActiveSqEntries = dbTouched - dbDone;
-    uint64_t numFreeEntries = wq->sqWqeNum - numActiveSqEntries;
-    uint64_t entriesUntilBatchLast = base + totalWqes - dbTouched;
+    uint32_t dbDone = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    uint32_t numActiveSqEntries = dbTouched - dbDone;
+    uint32_t numFreeEntries = wq->sqWqeNum - numActiveSqEntries;
+    uint32_t entriesUntilBatchLast = base + totalWqes - dbTouched;
     if (numFreeEntries > entriesUntilBatchLast) break;
     if constexpr (PrvdType == core::ProviderType::BNXT) {
       quietUntil<PrvdType>(ep, static_cast<uint32_t>(dbTouched));
@@ -599,29 +692,6 @@ __device__ inline static uint32_t getAtomicWqeCount(core::atomicType amo_op, uin
   }
 }
 
-template <core::ProviderType PrvdType>
-__device__ inline static uint64_t buildFlushDbrVal(core::WorkQueueHandle* wq, uint32_t postIdx,
-                                                   uint32_t qpn) {
-  // postIdx is the next-free slot; the last posted WQE is at postIdx-1
-  uint32_t lastWqeIdx = (postIdx - 1) & (wq->sqWqeNum - 1);
-
-  if constexpr (PrvdType == core::ProviderType::PSD) {
-    return wq->sq_dbval | (postIdx & (wq->sqWqeNum - 1));
-  } else if constexpr (PrvdType == core::ProviderType::MLX5) {
-    // Read back ctrl seg first qword from SQ buffer
-    uintptr_t wqeAddr =
-        reinterpret_cast<uintptr_t>(wq->sqAddr) + (lastWqeIdx << core::MORI_MLX5_SEND_WQE_SHIFT);
-    return *reinterpret_cast<volatile uint64_t*>(wqeAddr);
-  } else {
-    // BNXT: reconstruct db header
-    uint8_t flags = (postIdx >> (__ffs(wq->sqWqeNum) - 1)) & 0x1;
-    uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
-    return core::bnxt_re_init_db_hdr(
-        ((postIdx & (wq->sqWqeNum - 1)) * BNXT_RE_NUM_SLOT_PER_WQE) | epoch, 0, qpn,
-        BNXT_RE_QUE_TYPE_SQ);
-  }
-}
-
 // putImpl - post one warp-aggregated put for the active lanes (all targeting this
 // ep/qpn; the facade groups by peer). Each lane posts its data WQE into a contiguous
 // reservation; the leader posts the shared signal WQE and rings one doorbell.
@@ -678,8 +748,7 @@ __device__ inline static void putImpl(
             *wq, signalSlot, signalSlot, sigPsn, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
             signalRemoteAddr, signalRemoteKey, signalOpArg, 0 /*compare*/, core::AMO_FETCH_ADD);
       }
-      if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
-        ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
+      ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
     }
   } else {
     // MLX5/PSD: the WQE slot index doubles as the PSN.
@@ -695,8 +764,7 @@ __device__ inline static void putImpl(
             atomicLkey, signalRemoteAddr, signalRemoteKey, signalOpArg, 0 /*compare*/,
             core::AMO_FETCH_ADD);
       }
-      if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
-        ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
+      ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
     }
   }
 }
@@ -747,8 +815,7 @@ __device__ inline static void putValueImpl(core::RdmaEndpointDevice* ep, uint32_
             *wq, signalSlot, signalSlot, sigPsn, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
             signalRemoteAddr, signalRemoteKey, signalOpArg, 0, core::AMO_FETCH_ADD);
       }
-      if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
-        ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
+      ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
     }
   } else {
     // MLX5/PSD: the WQE slot index doubles as the PSN.
@@ -763,8 +830,7 @@ __device__ inline static void putValueImpl(core::RdmaEndpointDevice* ep, uint32_
             *wq, signalSlot, signalSlot, signalSlot, true /*cqeSignal*/, qpn, atomicLaddr,
             atomicLkey, signalRemoteAddr, signalRemoteKey, signalOpArg, 0, core::AMO_FETCH_ADD);
       }
-      if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
-        ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
+      ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
     }
   }
 }
@@ -801,56 +867,37 @@ __device__ inline static void getImpl(core::RdmaEndpointDevice* ep, uint32_t qpn
         core::PostRead<PrvdType>(*wq, mySlot, mySlot, dataPsn, true /*cqeSignal*/, qpn, localAddr,
                                  localKey, remoteAddr, remoteKey, bytes);
     __threadfence();
-    if (isLeader && !(optFlags & ccoGdaOptFlagsAggregateRequests))
-      ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
+    if (isLeader) ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
   } else {
     // MLX5/PSD: the WQE slot index doubles as the PSN.
     waitSqSpace<PrvdType>(ep, base, totalWqes);
     uint64_t dbrVal = core::PostRead<PrvdType>(*wq, mySlot, mySlot, mySlot, true /*cqeSignal*/, qpn,
                                                localAddr, localKey, remoteAddr, remoteKey, bytes);
     __threadfence();
-    if (isLeader && !(optFlags & ccoGdaOptFlagsAggregateRequests))
-      ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
+    if (isLeader) ringDoorbellOrdered<PrvdType, /*LeaderOnly=*/true>(ep, base, totalWqes, dbrVal);
   }
 }
 
-// FlushAsync: ring doorbell for pending WQEs (skip if already rung),
-// return the postIdx for later wait.
+// FlushAsync: snapshot the reservation counter so a later wait() can drain to it.
+//
+// It must neither ring a doorbell nor touch dbTouchIdx. postIdx is a *reservation*
+// counter: putImpl/putValueImpl/signalImpl bump it before writing their WQEs, so a
+// snapshot routinely covers slots whose owner is still in flight. Every posting
+// path rings its own doorbell, and ringDoorbellOrdered hands the turn on by
+// advancing dbTouchIdx in reservation order while waiting on *equality* against
+// it -- advancing dbTouchIdx from here steps over an owner that then never
+// observes its turn, permanently stranding it and its reservation. Draining to
+// the returned index is quietUntil's job.
 template <core::ProviderType PrvdType>
-__device__ inline static void flushAsyncImpl(core::RdmaEndpointDevice* ep, uint32_t qpn,
-                                             uint32_t* outPostIdx) {
+__device__ inline static void flushAsyncImpl(core::RdmaEndpointDevice* ep, uint32_t* outPostIdx) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
-  core::CompletionQueueHandle* cq = &ep->cqHandle;
 
-  uint32_t curPostIdx = wq->postIdx;
-  *outPostIdx = curPostIdx;
+  *outPostIdx = static_cast<uint32_t>(
+      __hip_atomic_load(&wq->postIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT));
 
-  uint64_t dbTouched =
-      __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-  if (dbTouched == curPostIdx) return;
-
-  uint32_t numPendingWqes = curPostIdx - static_cast<uint32_t>(dbTouched);
-  uint64_t dbrVal = buildFlushDbrVal<PrvdType>(wq, curPostIdx, qpn);
-
+  // Keep flush's release semantics: prior local writes must be visible before the
+  // caller treats the transfer as handed off.
   __threadfence_system();
-
-  // flush() is multi-lane (each lane flushes a different peer/QP), so PSD/BNXT
-  // must serialize doorbells per lane (shared dbrAddr/UAR); MLX5 has a per-QP
-  // dbrAddr and rings directly.
-  if constexpr (PrvdType == core::ProviderType::MLX5) {
-    core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, curPostIdx);
-    __threadfence_system();
-    core::RingDoorbell<PrvdType>(wq->dbrAddr, dbrVal);
-  } else {
-    ringDoorbellWalk<PrvdType>(wq, curPostIdx, dbrVal);
-  }
-
-  __threadfence_system();
-
-  __hip_atomic_fetch_add(&cq->needConsIdx, numPendingWqes, __ATOMIC_RELAXED,
-                         __HIP_MEMORY_SCOPE_AGENT);
-  __hip_atomic_store(&wq->dbTouchIdx, static_cast<uint64_t>(curPostIdx), __ATOMIC_RELAXED,
-                     __HIP_MEMORY_SCOPE_AGENT);
 }
 
 template <core::ProviderType PrvdType>
@@ -876,16 +923,14 @@ __device__ inline static void signalImpl(core::RdmaEndpointDevice* ep, uint32_t 
     uint64_t dbrVal = core::PostAtomic<PrvdType, uint64_t>(
         *wq, curPostIdx, curPostIdx, psnBase, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
         signalRemoteAddr, signalRemoteKey, addValue, 0 /*compare*/, core::AMO_FETCH_ADD);
-    if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
-      ringDoorbellOrdered<PrvdType>(ep, curPostIdx, 1, dbrVal);
+    ringDoorbellOrdered<PrvdType>(ep, curPostIdx, 1, dbrVal);
   } else {
     // MLX5/PSD: the WQE slot index doubles as the PSN.
     uint32_t curPostIdx = reserveWqeSlots<PrvdType>(ep, 1);
     uint64_t dbrVal = core::PostAtomic<PrvdType, uint64_t>(
         *wq, curPostIdx, curPostIdx, curPostIdx, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
         signalRemoteAddr, signalRemoteKey, addValue, 0 /*compare*/, core::AMO_FETCH_ADD);
-    if (!(optFlags & ccoGdaOptFlagsAggregateRequests))
-      ringDoorbellOrdered<PrvdType>(ep, curPostIdx, 1, dbrVal);
+    ringDoorbellOrdered<PrvdType>(ep, curPostIdx, 1, dbrVal);
   }
 }
 
@@ -1091,6 +1136,14 @@ __device__ inline void ccoGda<PrvdType>::put(int peer, ccoWindow_t dstWin, size_
       signalRkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[worldPeer];
       signalOp = ccoGdaSignalAdd;
       signalOpArg = remoteAction.value;
+    } else if constexpr (std::is_same_v<RemoteAction, ccoGda_WindowSignalAdd>) {
+      // Caller's window, not the resource window: the offset is already
+      // window-relative (iova=0), so it is the raddr as-is.
+      signalRaddr = remoteAction.offset;
+      signalRkey =
+          reinterpret_cast<ccoWindowDevice*>(remoteAction.win)->ibgdaWin.peerRkeys[worldPeer];
+      signalOp = ccoGdaSignalAdd;
+      signalOpArg = remoteAction.value;
     }
 
     // Only mixed-peer thread scope needs per-peer grouping; ThreadAggregate and
@@ -1154,6 +1207,14 @@ __device__ inline void ccoGda<PrvdType>::putValue(int peer, ccoWindow_t dstWin, 
     } else if constexpr (std::is_same_v<RemoteAction, ccoGda_SignalAdd>) {
       signalRaddr = remoteAction.signalId * sizeof(uint64_t);
       signalRkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[worldPeer];
+      signalOp = ccoGdaSignalAdd;
+      signalOpArg = remoteAction.value;
+    } else if constexpr (std::is_same_v<RemoteAction, ccoGda_WindowSignalAdd>) {
+      // Caller's window, not the resource window: the offset is already
+      // window-relative (iova=0), so it is the raddr as-is.
+      signalRaddr = remoteAction.offset;
+      signalRkey =
+          reinterpret_cast<ccoWindowDevice*>(remoteAction.win)->ibgdaWin.peerRkeys[worldPeer];
       signalOp = ccoGdaSignalAdd;
       signalOpArg = remoteAction.value;
     }
@@ -1251,6 +1312,14 @@ __device__ inline void ccoGda<PrvdType>::signal(int peer, RemoteAction remoteAct
       signalRkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[worldPeer];
       signalOp = ccoGdaSignalAdd;
       signalOpArg = remoteAction.value;
+    } else if constexpr (std::is_same_v<RemoteAction, ccoGda_WindowSignalAdd>) {
+      // Caller's window, not the resource window: the offset is already
+      // window-relative (iova=0), so it is the raddr as-is.
+      signalRaddr = remoteAction.offset;
+      signalRkey =
+          reinterpret_cast<ccoWindowDevice*>(remoteAction.win)->ibgdaWin.peerRkeys[worldPeer];
+      signalOp = ccoGdaSignalAdd;
+      signalOpArg = remoteAction.value;
     }
 
     impl::signalImpl<PrvdType>(ep, qpn, signalRaddr, signalRkey, signalOp, signalOpArg);
@@ -1265,8 +1334,9 @@ template <typename Coop>
 __device__ inline void ccoGda<PrvdType>::flush(Coop coop) {
   static_assert(!std::is_same_v<Coop, ccoCoopThread>,
                 "flush() requires at least ccoCoopWarp. "
-                "ccoCoopThread causes each thread to independently enter quietUntil "
-                "on different QPs, breaking the warp-level pollCqLock.");
+                "ccoCoopThread reports size()==1, so every thread walks every peer and "
+                "flushes each QP once per thread, duplicating doorbell rings and "
+                "advancing cq->needConsIdx once per thread.");
   coop.sync();
   ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
   for (int teamPeer = coop.thread_rank(); teamPeer < this->nRanks; teamPeer += coop.size()) {
@@ -1276,20 +1346,21 @@ __device__ inline void ccoGda<PrvdType>::flush(Coop coop) {
     int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
     core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     uint32_t postIdx = 0;
-    impl::flushAsyncImpl<PrvdType>(ep, ep->qpn, &postIdx);
+    impl::flushAsyncImpl<PrvdType>(ep, &postIdx);
     impl::waitImpl<PrvdType>(ep, postIdx);
   }
   coop.sync();
 }
 
-// flush single peer: ring doorbell if needed, then poll CQ until complete.
+// flush single peer: snapshot the QP's postIdx, then poll CQ until it completes.
 template <core::ProviderType PrvdType>
 template <ccoTeamMode TeamMode, typename Coop>
 __device__ inline void ccoGda<PrvdType>::flush(int peer, Coop coop) {
   static_assert(!std::is_same_v<Coop, ccoCoopThread>,
                 "flush(peer) requires at least ccoCoopWarp. "
-                "ccoCoopThread allows concurrent per-thread calls on different QPs, "
-                "which breaks the warp-level pollCqLock inside quietUntil.");
+                "With ccoCoopThread every thread runs the body, so two threads passing the "
+                "same peer each flush that QP and advance cq->needConsIdx twice. "
+                "(Lanes on *different* QPs are fine: quietUntil groups active lanes by CQ.)");
   coop.sync();
   if (coop.thread_rank() == 0) {
     int worldPeer = resolveWorldPeer<TeamMode>(peer);
@@ -1297,13 +1368,13 @@ __device__ inline void ccoGda<PrvdType>::flush(int peer, Coop coop) {
     int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
     core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     uint32_t postIdx = 0;
-    impl::flushAsyncImpl<PrvdType>(ep, ep->qpn, &postIdx);
+    impl::flushAsyncImpl<PrvdType>(ep, &postIdx);
     impl::waitImpl<PrvdType>(ep, postIdx);
   }
   coop.sync();
 }
 
-// flushAsync: ring doorbell for peer, return a request handle for wait().
+// flushAsync: snapshot this peer's QP, return a request handle for wait().
 template <core::ProviderType PrvdType>
 template <ccoTeamMode TeamMode, typename Coop>
 __device__ inline void ccoGda<PrvdType>::flushAsync(int peer, ccoGdaRequest_t* outRequest,
@@ -1316,7 +1387,7 @@ __device__ inline void ccoGda<PrvdType>::flushAsync(int peer, ccoGdaRequest_t* o
     core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
 
     uint32_t postIdx = 0;
-    impl::flushAsyncImpl<PrvdType>(ep, ep->qpn, &postIdx);
+    impl::flushAsyncImpl<PrvdType>(ep, &postIdx);
 
     outRequest->qpIdx = qpIdx;
     outRequest->postIdx = static_cast<uint64_t>(postIdx);
@@ -1329,9 +1400,10 @@ template <core::ProviderType PrvdType>
 template <typename Coop>
 __device__ inline void ccoGda<PrvdType>::wait(ccoGdaRequest_t& request, Coop coop) {
   static_assert(!std::is_same_v<Coop, ccoCoopThread>,
-                "wait() requires at least ccoCoopWarp. "
-                "ccoCoopThread allows concurrent per-thread calls on different QPs, "
-                "which breaks the warp-level pollCqLock inside quietUntil.");
+                "wait() requires at least ccoCoopWarp, for consistency with flush(). "
+                "The pollCqLock hazard no longer applies here — the body is a pure poll and "
+                "quietUntil groups active lanes by CQ — so this one is relaxable if a "
+                "per-thread caller ever needs it.");
   coop.sync();
   if (coop.thread_rank() == 0) {
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
@@ -1347,8 +1419,9 @@ template <typename LocalAction, typename Coop>
 __device__ inline void ccoGda<PrvdType>::counter(LocalAction localAction, Coop coop) {
   static_assert(!std::is_same_v<Coop, ccoCoopThread>,
                 "counter() requires at least ccoCoopWarp. "
-                "ccoCoopThread causes each thread to independently enter quietUntil "
-                "on different QPs, breaking the warp-level pollCqLock.");
+                "ccoCoopThread reports size()==1 and makes thread_rank()==0 true for every "
+                "thread, so every thread walks every peer and counterBuf is incremented "
+                "once per thread instead of once.");
   coop.sync();
 
   ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
@@ -1438,8 +1511,9 @@ template <core::ProviderType PrvdType, typename Coop>
 __device__ inline void ccoGdaBarrierSession<PrvdType, Coop>::sync(Coop) {
   static_assert(!std::is_same_v<Coop, ccoCoopThread>,
                 "GDA barrier requires at least ccoCoopWarp. "
-                "ccoCoopThread causes each thread to independently enter signalImpl / "
-                "waitSignalImpl on different QPs, breaking the warp-level pollCqLock.");
+                "ccoCoopThread reports size()==1, so every thread signals every peer and the "
+                "remote signal is incremented once per thread; coop.sync() also degenerates "
+                "to a no-op, removing the phase-1/phase-2 separation.");
   this->coop.sync();
 
   ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(gda._gdaHandle);

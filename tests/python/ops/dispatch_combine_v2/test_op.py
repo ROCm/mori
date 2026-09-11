@@ -177,7 +177,7 @@ def main():
                 sync()
                 comm.barrier()
             sc_in = scales[:ct] if SCALE_DIM else None
-            recv_x, _out_w, out_s, _out_i, total_recv_t, routing = op.dispatch(
+            recv_x, disp_w, out_s, disp_i, total_recv_t, routing = op.dispatch(
                 inp[:ct], wts[:ct], sc_in, idx[:ct], return_routing=True
             )
             total_recv = int(total_recv_t.cpu().item())
@@ -225,8 +225,48 @@ def main():
                 if rank == 0:
                     print(
                         f"# OP-SCALES ct={ct}: {'PASS' if errs == 0 else 'FAIL'} "
-                        f"(recv={total_recv}, scale_dim={SCALE_DIM}, {sc_n_i32} dwords/tok, "
-                        f"reverse-map ok)",
+                        f"(recv={total_recv}, scale_dim={SCALE_DIM}, "
+                        f"{sc_n_i32} dwords/tok)",
+                        flush=True,
+                    )
+            if not STDMOE:
+                # The two metadata arrays dispatch forwards next to the payload.
+                # Unlike the scales, their contents cannot be derived from the recv
+                # slot, so every rank's inputs get gathered to know what each slot
+                # should hold. Checking them here rather than through combine is
+                # the point: combine only folds the weights, and reads no indices
+                # at all, so a kernel can corrupt both while payload and combine
+                # still pass.
+                srcs_i = [torch.empty_like(idx[:ct]) for _ in range(npes)]
+                srcs_w = [torch.empty_like(wts[:ct]) for _ in range(npes)]
+                dist.all_gather(srcs_i, idx[:ct].contiguous())
+                dist.all_gather(srcs_w, wts[:ct].contiguous())
+                all_i = torch.zeros(npes * M, K, dtype=torch.int32)
+                all_w = torch.zeros(npes * M, K, dtype=torch.float32)
+                for r in range(npes):
+                    all_i[r * M : r * M + ct] = srcs_i[r].cpu()
+                    all_w[r * M : r * M + ct] = srcs_w[r].cpu()
+                tim = routing.disp_tok_id_to_src_tok_id_local[:total_recv].cpu().long()
+                # The reverse map indexes the expected values, here and in the scale
+                # check above, so it is range-checked before being used as an index.
+                # An out-of-range entry is a failure in its own right, and indexing
+                # with it raises IndexError, which would kill this rank and leave the
+                # others in all_reduce -- a product bug reported as a harness crash.
+                ok_map = bool(((tim >= 0) & (tim < npes * M)).all())
+                if ok_map:
+                    ok_i = torch.equal(disp_i[:total_recv].cpu(), all_i[tim])
+                    ok_dw = torch.allclose(
+                        disp_w[:total_recv].cpu(), all_w[tim], atol=2e-3, rtol=2e-3
+                    )
+                else:
+                    ok_i = ok_dw = False
+                errs = d.allreduce_sum(0 if (ok_map and ok_i and ok_dw) else 1)
+                if rank == 0:
+                    print(
+                        f"# OP-META ct={ct}: {'PASS' if errs == 0 else 'FAIL'} "
+                        f"(recv={total_recv}, topk={K}, map="
+                        f"{'ok' if ok_map else 'BAD'}, idx={'ok' if ok_i else 'BAD'}, "
+                        f"wts={'ok' if ok_dw else 'BAD'})",
                         flush=True,
                     )
             if cap is not None:

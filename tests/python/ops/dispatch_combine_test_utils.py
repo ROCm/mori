@@ -19,6 +19,10 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+import os
+import queue
+import time
+
 import pytest
 from tests.python.utils import TorchDistProcessManager, data_type_supported
 import mori
@@ -390,9 +394,44 @@ def start_torch_dist_process_manager(world_size=8, disable_p2p=False):
 
 
 def assert_worker_results(manager, world_size):
+    """Collect one result per rank, or fail naming the ranks that never reported.
+
+    The collection is bounded. These kernels are distributed spin-wait protocols
+    with unbounded polling loops and no in-kernel watchdog, so a protocol bug
+    presents as a rank that never returns, not as an exception. An untimed
+    ``get()`` turns that into a hung session that the outer shell ``timeout``
+    eventually kills with no message and no attribution -- the single most
+    expensive failure mode to debug, because it says nothing about WHICH rank
+    stopped.
+
+    Timing out does not rescue the worker pool: the hung ranks still hold their
+    task and the manager is session-scoped, so tests after this one in the same
+    session are expected to fail too. The point is to name the first casualty
+    while the evidence is still legible.
+
+    ``MORI_TEST_WORKER_TIMEOUT`` overrides the budget in seconds; it is
+    deliberately generous, because a slow case must not be reported as a hang.
+    """
+    budget = float(os.environ.get("MORI_TEST_WORKER_TIMEOUT") or "900")
+    deadline = time.monotonic() + budget
     results = []
     for _ in range(world_size):
-        rank, result = manager.result_queue.get()
+        try:
+            rank, result = manager.result_queue.get(
+                timeout=max(0.0, deadline - time.monotonic())
+            )
+        except queue.Empty:
+            reported = sorted(r for r, _ in results)
+            missing = [r for r in range(world_size) if r not in reported]
+            pytest.fail(
+                f"timed out after {budget:g}s waiting for worker results: "
+                f"{len(missing)} of {world_size} ranks never reported. "
+                f"silent ranks {missing}, reported {reported}. "
+                "A rank that never reports is a hang in the kernel or in the "
+                "collective before it -- not a slow case; raise "
+                "MORI_TEST_WORKER_TIMEOUT only after ruling that out.",
+                pytrace=False,
+            )
         results.append((rank, result))
 
     failures = [

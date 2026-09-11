@@ -231,6 +231,19 @@ ccoCommDestroy(comm);
 | `MORI_RDMA_DEVICES` | Comma-separated RDMA devices to use (GDA) |
 | `MORI_RDMA_TC` | RDMA traffic class (GDA) |
 | `MORI_RDMA_SL` | RDMA service level (GDA) |
+| `MORI_IGNORE_CPU_AFFINITY` | `1` skips the CPU bind done at communicator creation, leaving placement to an outer `numactl`/`torchrun` |
+| `MORI_CPU_AFFINITY_NO_SPLIT` | `1` binds to the whole NUMA node instead of this rank's own slice of it |
+
+Communicator creation (`ccoCommCreate`) pins the calling thread to the CPUs
+local to its current HIP device before the bootstrap and any worker thread, so
+new threads inherit the affinity. The GPU-local CPU list (sysfs
+`local_cpulist`) is intersected with the existing cpuset, so cgroup limits and
+an outer binding are respected. Within that set the CPUs are grouped into
+physical cores by `thread_siblings_list` and partitioned into one disjoint
+slice per GPU on the NUMA node, so two ranks cannot end up on the two SMT
+siblings of one core. The split applies only when the process sees more than
+one GPU on that NUMA node and there is at least one physical core per GPU;
+otherwise it falls back to binding the whole node.
 
 Supported GPUs: MI308X / MI300X / MI325X / MI355X. Supported NICs: AMD Pollara
 (AINIC), Mellanox ConnectX-7, Broadcom Thor2.

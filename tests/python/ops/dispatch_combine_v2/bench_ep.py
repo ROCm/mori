@@ -43,12 +43,23 @@ that computes garbage never gets a bandwidth number. That check is deliberately
 one invariant, not a matrix -- test_op.py owns dtypes, quant, scatter, StdMoE,
 scales and recv-cap, across both backends.
 
+Two machine-readable outputs sit alongside the human table. A final JSON line in
+aiter's print_json_table shape carries every point, one row per (backend, mode,
+m), so a parent driver reads results instead of parsing columns. And with
+MORI_SMI_MONITOR=1 each point also replays under amdsmi: the clocks a number was
+measured at belong with the number, since a throttled part reports a different
+time for the same kernel. That replay is a window of its own, AFTER warmup and
+graph capture, because ITERS pairs are ~10 ms against a 50 ms sampling tick.
+
     torchrun --standalone --nproc_per_node=8 bench_ep.py
     BACKENDS=flydsl,hip SWEEP=512,4096 ITERS=200 torchrun ... bench_ep.py
+    MORI_SMI_MONITOR=1 MORI_SMI_DURATION=1.0 torchrun ... bench_ep.py
 """
 
+import math
 import os
 import sys
+import time
 
 import torch
 import torch.distributed as dist
@@ -57,6 +68,8 @@ import mori.cco as cco
 from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig, EpDispatchCombineOp
 
 import _data
+import _report
+import _smi
 
 HIDDEN = int(os.environ.get("HIDDEN", 7168))
 TOPK = int(os.environ.get("TOPK", 8))
@@ -81,14 +94,33 @@ CHECK = int(os.environ.get("CHECK", 1))
 # CONST_VAL. Same names and meanings as aiter's test_common, so the two harnesses
 # describe the same input. Defaults reproduce this file's previous behaviour.
 INIT, SEED, CONST_VAL = _data.env_config()
+# One machine-readable line per run, aiter's print_json_table format. JSON=0 to
+# drop it; the human table above it is unchanged either way.
+JSON = int(os.environ.get("JSON", 1))
+# Clock/power telemetry, off unless asked for: it adds a replay window per point.
+SMI_ON, SMI_INTERVAL, SMI_DURATION = _smi.env_config()
 # What dispatch transports; combine is always bf16, so anything else is asymmetric.
+_DISP = os.environ.get("DISP", "bf16")
 _DISP_DT = {
     "bf16": torch.bfloat16,
     "fp8": torch.float8_e4m3fn,
     "fp4": torch.float4_e2m1fn_x2,
-}[os.environ.get("DISP", "bf16")]
+}[_DISP]
 _DISP_NBYTES = {torch.bfloat16: 2, torch.float8_e4m3fn: 1}.get(_DISP_DT, 0.5)
 _FP4 = _DISP_DT is torch.float4_e2m1fn_x2
+# What the correctness gate covers, as one token. A bool cannot say it: fp4 and
+# an all-zero payload verify the dispatch bytes but never compare combine's
+# output, and a row claiming "verified" next to a combine_us nobody checked is
+# the machine-readable half losing what the human summary spells out.
+VERIFY_SCOPE = (
+    "none"
+    if not CHECK
+    else (
+        "dispatch_bytes"
+        if _FP4 or _data.verifies_nothing(INIT)
+        else "dispatch_bytes+combine"
+    )
+)
 # Geometry, same spelling as tools/ep_test.sh. Unset = the backend's tuned default.
 _G = {
     k: (int(os.environ[k]) if os.environ.get(k) else None)
@@ -290,8 +322,149 @@ def main():
         dist.barrier()
         d = sum(ev[0][i].elapsed_time(ev[1][i]) for i in range(ITERS)) / ITERS * 1000
         c = sum(ev[2][i].elapsed_time(ev[3][i]) for i in range(ITERS)) / ITERS * 1000
-        return d, c
+        return d, c, run_d, run_c
 
+    def smi_window(label, pair_us, run_d, run_c):
+        """Replay the pair under the GPU monitor and gather every rank's clocks.
+
+        A window of its own, after the timed loop, because ITERS pairs are ~10 ms
+        against a 50 ms sampling tick -- too short to sample even once. Warmup,
+        graph capture and input generation are already behind us, which is what
+        "do not include init in the telemetry" asks for. Nothing here is timed.
+
+        The replay count must be IDENTICAL on every rank: these kernels barrier
+        across devices, so a per-rank duration loop would leave one rank waiting
+        on a peer that has stopped. It is computed on rank 0 and broadcast.
+        Launches are batched between synchronizations so a 40 us pair still keeps
+        the GPU busy across a tick instead of measuring the sync gap.
+        """
+        if not SMI_ON or pair_us <= 0:
+            return None
+        plan = torch.zeros(2, dtype=torch.int64)
+        if rank == 0:
+            batch = max(1, min(1024, int(SMI_INTERVAL * 1e6 / pair_us)))
+            plan[0] = batch
+            plan[1] = max(1, math.ceil(SMI_DURATION * 1e6 / (pair_us * batch)))
+        dist.broadcast(plan, src=0)
+        batch, rounds = int(plan[0]), int(plan[1])
+
+        mon, err = None, None
+        try:
+            mon = _smi.GpuMonitor(torch.cuda.current_device(), interval_s=SMI_INTERVAL)
+            mon.start()
+        except Exception as e:  # noqa: BLE001 - telemetry never fails the bench
+            err = f"rank {rank}: {type(e).__name__}: {e}"
+        # Every rank must agree on whether the replay happens, or the ranks that
+        # skip it deadlock the ones that do not.
+        bad = torch.tensor([1 if err else 0])
+        dist.all_reduce(bad)
+        if bad.item():
+            if mon is not None:
+                mon.stop()
+            if rank == 0:
+                print(f"  [smi] disabled: {err or 'a peer rank failed'}", flush=True)
+            return None
+
+        lockstep()
+        t0 = time.perf_counter()
+        for _ in range(rounds):
+            for _ in range(batch):
+                run_d()
+                run_c()
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        mon.stop()
+        dist.barrier()
+
+        want = max(1, int(SMI_DURATION / SMI_INTERVAL))
+        metrics = mon.summary(start_s=t0, end_s=t1)
+        inside = [s for s in mon.samples if t0 <= s["timestamp_s"] <= t1]
+        # Count samples that CARRY THE CLOCK, not samples that exist. A metric
+        # query that raises is swallowed so one bad read cannot stop the polling
+        # thread, but the sample is still appended with only its timestamp -- so
+        # counting samples would report a healthy "ok" for a rank whose clock was
+        # never readable at all, which is the rank this telemetry exists to find.
+        n_clk = sum(1 for s in inside if s.get("gfx_clk_mhz") is not None)
+        if n_clk == 0:
+            status = "no_metrics"
+        elif n_clk >= max(2, want // 2):
+            status = "ok"
+        else:
+            status = "insufficient"
+        local = {
+            "label": label,
+            "device": torch.cuda.current_device(),
+            "rank": rank,
+            "interval_s": SMI_INTERVAL,
+            "duration_s": t1 - t0,
+            "launches": rounds * batch,
+            "samples": len(inside),
+            "clock_samples": n_clk,
+            "sample_status": status,
+            "metrics": metrics,
+        }
+        every = [None] * world
+        dist.all_gather_object(every, local)
+        if rank != 0:
+            return None
+        for r in every:
+            _smi.emit(r)
+        return every
+
+    def case(ct, name, mode):
+        """The columns that identify a point: the case arguments, aiter's order."""
+        return {
+            "backend": name,
+            "mode": mode,
+            "ep": world,
+            "m": ct,  # tokens per rank, aiter's row key for problem size
+            "hidden": HIDDEN,
+            "topk": TOPK,
+            "experts_per_rank": EPR,
+            "dispatch_dtype": _DISP,
+            "combine_dtype": "bf16",
+            "combine_in": COMBINE_IN,
+            "data_init": INIT,
+            "seed": SEED,
+            "iters": ITERS,
+        }
+
+    def clocks(records):
+        """Cross-rank clock columns. The MIN over ranks is the point of these:
+        one throttled GPU sets the pair time for all of them, and a mean hides it.
+
+        A rank whose clock never read is EXCLUDED from that min, so the status
+        column has to say so: silently narrowing the min to the readable ranks
+        would report the healthiest GPUs as if they were all of them.
+        """
+        if not records:
+            return {}
+        med = [
+            r["metrics"]["gfx_clk_mhz"]["median"]
+            for r in records
+            if "gfx_clk_mhz" in r["metrics"]
+        ]
+        pwr = [
+            r["metrics"]["power_w"]["median"]
+            for r in records
+            if "power_w" in r["metrics"]
+        ]
+        out = {}
+        if med:
+            out["gfx_clk_mhz"] = round(sum(med) / len(med), 1)
+            out["gfx_clk_mhz_min"] = round(min(med), 1)
+        if pwr:
+            out["power_w"] = round(sum(pwr) / len(pwr), 1)
+        seen = {r["sample_status"] for r in records}
+        # Worst rank wins, and how many ranks the numbers above came from.
+        for worst in ("no_metrics", "insufficient", "ok"):
+            if worst in seen:
+                break
+        out["smi_status"] = worst
+        out["smi_ranks"] = f"{len(med)}/{len(records)}"
+        return out
+
+    rows = []
     failures = checked = points = 0
     for ct in SWEEP:
         i_, w_, x_ = inp[:ct], wts[:ct], idx[:ct]
@@ -301,6 +474,12 @@ def main():
             checked += was_checked
             if not ok:
                 failures += 1
+                # A failed point stays in the table as a row with err_msg, so a
+                # gap in the sweep cannot be mistaken for a tier nobody ran.
+                rows += [
+                    dict(case(ct, name, mode), err_msg="correctness check failed")
+                    for mode in MODES
+                ]
                 continue  # never report bandwidth for a kernel computing garbage
 
             def one_pair():
@@ -332,16 +511,23 @@ def main():
                 return eager_d, lambda: op.combine(buf, routing=held[0])
 
             for mode in MODES:
-                d_us, c_us = time_pairs(
+                d_us, c_us, run_d, run_c = time_pairs(
                     mode, one_pair, capture_pair if mode == "graph" else eager_legs
                 )
-                # Bytes off this rank; the legs differ whenever dispatch is narrower.
-                d_bw = total * HIDDEN * _DISP_NBYTES / (1000**3) / (d_us / 1e6)
-                c_bw = total * HIDDEN * 2 / (1000**3) / (c_us / 1e6)
                 got = torch.tensor([d_us, c_us, float(total)], dtype=torch.float64)
                 dist.all_reduce(got)
+                n = world
+                d_us_m, c_us_m = float(got[0]) / n, float(got[1]) / n
+                recv_m = float(got[2]) / n
+                # Bytes off one rank over that leg's time, BOTH cross-rank means,
+                # so the reported bandwidth follows from the recv_tokens and us
+                # this same row reports. Mixing a local byte count with a mean
+                # time gave a row whose columns did not agree with each other,
+                # and recv counts vary between ranks with the routing. The legs
+                # differ whenever dispatch is narrower than combine.
+                d_bw = recv_m * HIDDEN * _DISP_NBYTES / (1000**3) / (d_us_m / 1e6)
+                c_bw = recv_m * HIDDEN * 2 / (1000**3) / (c_us_m / 1e6)
                 if rank == 0:
-                    n = world
                     print(
                         f"  ct={ct:<5d} [{name}/{mode}] "
                         f"dispatch {got[0]/n:7.1f} us ({d_bw:6.1f} GB/s)  "
@@ -350,6 +536,28 @@ def main():
                         flush=True,
                     )
                 lockstep()
+                smi = smi_window(
+                    f"bench_ep/dispatch_combine/backend={name}/mode={mode}"
+                    f"/M={ct}/disp={_DISP}",
+                    d_us_m + c_us_m,
+                    run_d,
+                    run_c,
+                )
+                lockstep()
+                if rank == 0:
+                    rows.append(
+                        dict(
+                            case(ct, name, mode),
+                            recv_tokens=round(recv_m),
+                            dispatch_us=round(d_us_m, 2),
+                            combine_us=round(c_us_m, 2),
+                            pair_us=round(d_us_m + c_us_m, 2),
+                            dispatch_gbps=round(d_bw, 1),
+                            combine_gbps=round(c_bw, 1),
+                            verified=VERIFY_SCOPE,
+                            **clocks(smi),
+                        )
+                    )
 
     if rank == 0:
         # Say how many points were verified, not just that none failed -- with
@@ -369,6 +577,8 @@ def main():
             f"# {'FAIL' if failures else 'PASS'}: {failures} failed, "
             f"{checked}/{points} points verified{why}"
         )
+        if JSON:
+            _report.print_json_table("mori ep dispatch_combine_v2 summary", rows)
     for op in ops.values():
         op.close()
     comm.destroy()

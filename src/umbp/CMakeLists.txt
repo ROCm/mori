@@ -433,13 +433,30 @@ target_compile_features(umbp_common PUBLIC cxx_std_17)
 
 # ---------- Optional hipfile GDS transfer engine -----------------------------
 # GdsEngine reads an SSD segment's byte range straight into GPU memory via
-# hipFileRead (no host bounce). Auto-enabled when hipfile is installed; a build
-# without it keeps only the memory engines and the host-staged SSD path.
+# hipFileRead (no host bounce). Compiled in when the hipfile headers are
+# installed; a build without them keeps only the memory engines and the
+# host-staged SSD path.
+#
+# HEADERS ONLY, NEVER -lhipfile.  umbp_common is linked into
+# libmori_pybinds.so, so a link-time dependency here becomes a DT_NEEDED on the
+# Python extension and `import mori` fails on any host whose ROCm ships without
+# libhipfile — even for users who never touch UMBP. hipfile_dl.cpp dlopen's the
+# library on first use instead, which keeps GDS working where it exists and
+# costs nothing where it does not.
+# GLOBAL so tests/cpp/umbp/distributed can still gate test_gds_engine on the
+# same target; nothing links it.
 find_package(hipfile QUIET CONFIG GLOBAL)
 if(TARGET hip::hipfile)
-  message(STATUS "[UMBP] hipfile found — GDS transfer engine ENABLED")
-  target_sources(umbp_common PRIVATE distributed/transfer/gds_engine.cpp)
-  target_link_libraries(umbp_common PUBLIC hip::hipfile)
+  message(STATUS "[UMBP] hipfile headers found — GDS transfer engine ENABLED "
+                 "(libhipfile resolved at runtime via dlopen)")
+  target_sources(umbp_common PRIVATE distributed/transfer/gds_engine.cpp
+                                     distributed/transfer/hipfile_dl.cpp)
+  get_target_property(_HIPFILE_INCLUDE_DIRS hip::hipfile
+                      INTERFACE_INCLUDE_DIRECTORIES)
+  if(_HIPFILE_INCLUDE_DIRS)
+    target_include_directories(umbp_common PRIVATE ${_HIPFILE_INCLUDE_DIRS})
+  endif()
+  target_link_libraries(umbp_common PUBLIC ${CMAKE_DL_LIBS})
   target_compile_definitions(umbp_common PUBLIC UMBP_ENABLE_GDS)
 else()
   message(STATUS "[UMBP] hipfile not found — GDS transfer engine disabled")
