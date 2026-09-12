@@ -110,10 +110,16 @@ FP8_E4M3_MAX = 448.0
 WAVE = 64
 WAVE_LOG2 = 6
 
-#: Elements one lane converts per chunk: 8 bf16 is one 16B load, and the 8 fp8
-#: it becomes is one 8B store. Both are contiguous across the wave, so both are
-#: perfectly coalesced.
-CHUNK_ELEMS = 8
+#: Elements one lane converts per chunk. 16, so that the *fp8* side is a full
+#: 16B access (one dwordx4) rather than 8B: at 8 the dequantise read was half
+#: width while its bf16 write was full width, and the kernel ran at 3.4 TB/s
+#: against roughly 8 TB/s of HBM. The bf16 side is then 32B, issued as two
+#: dwordx4. Both stay contiguous across the wave.
+#:
+#: The conversion helpers still work 8 at a time -- that is the width of
+#: `v_cvt_pk_fp8_f32`'s natural grouping here -- so a chunk is two of them.
+CHUNK_ELEMS = 16
+CVT_ELEMS = 8
 
 
 def _raw_value(v):
@@ -481,23 +487,24 @@ def build_sdma_phases(
                 # pass 1: this row's amax, over the whole wave
                 local = fx.Float32(0.0)
                 for c in range_constexpr(chunks_per_row):
-                    i32_off = (row * cfg.n + (c * WAVE) * CHUNK_ELEMS) // 2 + lane * 4
-                    v = (
-                        fx.Vector(
-                            buffer_load(
-                                src,
-                                i32_off,
-                                vec_width=4,
-                                dtype=i32_type(),
-                                cache_modifier=CM_CACHED,
+                    off = row * cfg.n + (c * WAVE + lane) * CHUNK_ELEMS
+                    for h in range_constexpr(2):
+                        v = (
+                            fx.Vector(
+                                buffer_load(
+                                    src,
+                                    off // 2 + h * 4,
+                                    vec_width=4,
+                                    dtype=i32_type(),
+                                    cache_modifier=CM_CACHED,
+                                )
                             )
+                            .bitcast(fx.BFloat16)
+                            .to(fx.Float32)
                         )
-                        .bitcast(fx.BFloat16)
-                        .to(fx.Float32)
-                    )
-                    for e in range_constexpr(CHUNK_ELEMS):
-                        a = v[e]
-                        local = local.maximumf((-a).maximumf(a))
+                        for e in range_constexpr(CVT_ELEMS):
+                            a = v[e]
+                            local = local.maximumf((-a).maximumf(a))
                 amax = _wave_amax(local, lane)
 
                 # A row of exact zeros would divide by zero; 1.0 keeps it exact.
@@ -511,26 +518,30 @@ def build_sdma_phases(
 
                 # pass 2: scale and narrow
                 for c in range_constexpr(chunks_per_row):
-                    base = row * cfg.n + (c * WAVE) * CHUNK_ELEMS
-                    v = (
-                        fx.Vector(
-                            buffer_load(
-                                src,
-                                base // 2 + lane * 4,
-                                vec_width=4,
-                                dtype=i32_type(),
-                                cache_modifier=CM_CACHED,
+                    off = row * cfg.n + (c * WAVE + lane) * CHUNK_ELEMS
+                    words = []
+                    for h in range_constexpr(2):
+                        v = (
+                            fx.Vector(
+                                buffer_load(
+                                    src,
+                                    off // 2 + h * 4,
+                                    vec_width=4,
+                                    dtype=i32_type(),
+                                    cache_modifier=CM_CACHED,
+                                )
                             )
+                            .bitcast(fx.BFloat16)
+                            .to(fx.Float32)
                         )
-                        .bitcast(fx.BFloat16)
-                        .to(fx.Float32)
-                    )
-                    scaled = v * inv
-                    q = _pack8_fp8([scaled[e] for e in range_constexpr(CHUNK_ELEMS)])
+                        scaled = v * inv
+                        q = _pack8_fp8([scaled[e] for e in range_constexpr(CVT_ELEMS)])
+                        words += [q[0], q[1]]
+                    # One dwordx4 out, matching the dequantise side.
                     buffer_store(
-                        q,
+                        fx.Vector.from_elements(words, fx.Int32),
                         dst,
-                        (base + lane * CHUNK_ELEMS) // 4,
+                        off // 4,
                         cache_modifier=CM_CACHED,
                     )
 
@@ -568,24 +579,31 @@ def build_sdma_phases(
                         )
                     )
                     for c in range_constexpr(chunks_per_row):
-                        base = row * cfg.n + (c * WAVE) * CHUNK_ELEMS
+                        off = row * cfg.n + (c * WAVE + lane) * CHUNK_ELEMS
+                        # One dwordx4: 16 fp8. At 8 this was a half-width read
+                        # against a full-width write, and the kernel sat at
+                        # 3.4 TB/s.
                         packed = fx.Vector(
                             buffer_load(
                                 src,
-                                (base + lane * CHUNK_ELEMS) // 4,
-                                vec_width=2,
+                                off // 4,
+                                vec_width=4,
                                 dtype=i32_type(),
                                 cache_modifier=CM_SC1,
                             )
                         )
-                        wide = [e * scale for e in _unpack8_fp8(packed)]
-                        v = fx.Vector.from_elements(wide, fx.Float32)
-                        buffer_store(
-                            v.to(fx.BFloat16).bitcast(fx.Int32),
-                            dst,
-                            base // 2 + lane * 4,
-                            cache_modifier=CM_CACHED,
-                        )
+                        for h in range_constexpr(2):
+                            half = fx.Vector.from_elements(
+                                [packed[2 * h], packed[2 * h + 1]], fx.Int32
+                            )
+                            wide = [e * scale for e in _unpack8_fp8(half)]
+                            v = fx.Vector.from_elements(wide, fx.Float32)
+                            buffer_store(
+                                v.to(fx.BFloat16).bitcast(fx.Int32),
+                                dst,
+                                off // 2 + h * 4,
+                                cache_modifier=CM_CACHED,
+                            )
 
     # Gather. My reduced slice goes to the same offset in every peer's window.
     # On the bf16 wire that offset is in `output` and there is nothing to stage;
