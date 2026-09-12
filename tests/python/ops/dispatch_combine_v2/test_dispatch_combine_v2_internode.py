@@ -763,13 +763,28 @@ def _bench(op, cfg, dist_handle, device, args, comm):
     events = [torch.cuda.Event(enable_timing=True) for _ in range(3 * num_rounds + 1)]
 
     total_recv = 0
+    # Warm with the SAME tensor lifetime the timed loop uses. Passing the
+    # converted tensor inline makes it a temporary that dies at the end of the
+    # statement, so warmup only ever keeps one alive, while the timed loop keeps
+    # two: it binds the result to a name, and Python evaluates the right-hand
+    # side before rebinding, so the previous round's tensor is still referenced.
+    # Warming one block deep leaves the caching allocator holding one where two
+    # are needed, and the second timed round pays a fresh hipMalloc -- ~100us of
+    # HOST time. The timing events tile the timed region, so that host stall is
+    # charged to the combine window as GPU idle and reads as a first round twice
+    # as slow as every round after it.
+    warmup_combine_input = None
     for i in range(args.warmup):
         dispatch_out = op.dispatch(inp, wts, sc, idx, return_routing=True)
         if i == args.warmup - 1:
             # Read it here, not in the timed loop: .item() synchronises.
             torch.cuda.synchronize()
             total_recv = int(dispatch_out[4][0].item())
-        op.combine(convert(dispatch_out[0]), combine_weights, routing=dispatch_out[5])
+        warmup_combine_input = convert(dispatch_out[0])
+        op.combine(warmup_combine_input, combine_weights, routing=dispatch_out[5])
+    # Release before the timed loop: left bound, it keeps a THIRD tensor alive
+    # and just moves the allocation into the measured region.
+    del warmup_combine_input
     torch.cuda.synchronize()
 
     # One pre-loop barrier, gloo, matching what the v1 harness does at this same
@@ -993,9 +1008,16 @@ def _timed_pass(
     """One warmup+timed block. Returns (dispatch_us, combine_us) as grand means over
     rounds x ranks, plus (worst_dispatch, worst_combine) as the worst single round."""
     events = [torch.cuda.Event(enable_timing=True) for _ in range(3 * num_rounds + 1)]
+    # Same tensor lifetime as the timed loop; see the warmup in _bench for why
+    # the inline temporary costs the second timed round a hipMalloc. It matters
+    # more here: this function reports a worst-single-round that the tuner uses
+    # to break ties, against a default --tuning-margin-us of 1.5.
+    warmup_combine_input = None
     for _ in range(num_warmup):
         dispatch_out = op.dispatch(inp, wts, sc, idx, return_routing=True)
-        op.combine(convert(dispatch_out[0]), combine_weights, routing=dispatch_out[5])
+        warmup_combine_input = convert(dispatch_out[0])
+        op.combine(warmup_combine_input, combine_weights, routing=dispatch_out[5])
+    del warmup_combine_input
     torch.cuda.synchronize()
     events[0].record()
     for i in range(num_rounds):
