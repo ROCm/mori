@@ -111,6 +111,8 @@ plus an accumulate in three kernels and a wider staging slot.
 
 import argparse
 import ctypes
+from dataclasses import replace
+import json
 import os
 import sys
 import time
@@ -177,7 +179,9 @@ class Dist:
 def _parse_args(argv):
     parser = argparse.ArgumentParser(description="v2 internode dispatch/combine test")
     parser.add_argument(
-        "--cmd", default="test", choices=["test", "bench", "tuning", "stress"]
+        "--cmd",
+        default="test",
+        choices=["test", "bench", "tuning", "stress", "compare"],
     )
     # stress only: how many datasets to cycle, and how often to drain the queue.
     # v1 uses 128 and 128; matching them keeps the two soaks comparable.
@@ -201,6 +205,12 @@ def _parse_args(argv):
         "--quant-type", default="none", choices=["none", "fp8_direct_cast"]
     )
     parser.add_argument("--num-qp", type=int, default=1)
+    parser.add_argument(
+        "--reference-qp",
+        type=int,
+        default=None,
+        help="QP count for the reference arm in tuning/compare (default: --num-qp)",
+    )
     # 30, matching _EP_ROUNDS in the examples harness. Lower is not a
     # small-sample caveat but a different estimator: at --rounds 3 with
     # --drop-rounds 1 the two kept rounds are the ones that harness documents as
@@ -221,7 +231,23 @@ def _parse_args(argv):
     # geometry. A sweep winner is chosen by a greedy chain of paired tests, each
     # with its own error; before it is written into the table it gets one long
     # head-to-head against what it would replace.
-    parser.add_argument("--tuning-candidate", default=None)
+    candidates = parser.add_mutually_exclusive_group()
+    candidates.add_argument("--tuning-candidate", default=None)
+    candidates.add_argument(
+        "--tuning-candidates",
+        default=None,
+        help="Explicit search grid: semicolon-separated block,rdma,warp triples",
+    )
+    candidates.add_argument(
+        "--tuning-pair",
+        default=None,
+        help="Validate a complete pair: dispatch block,rdma,warp,combine block,rdma,warp",
+    )
+    parser.add_argument("--seed", type=int, default=4242)
+    parser.add_argument("--candidate-first", action="store_true")
+    parser.add_argument(
+        "--result-json", default=None, help="Rank-zero JSON output path"
+    )
     # What a candidate is selected ON. "total" by default, and deliberately:
     # internode_tuning_configs.py records that the two phases are COUPLED -- a
     # dispatch with too few rdma blocks leaves the following combine ~18us slower
@@ -273,7 +299,18 @@ def _parse_args(argv):
         "--kernel-type", default="auto", choices=["auto", "v2", "v2_ll"]
     )
     parser.add_argument("--auto-ll-max-tokens", type=int, default=512)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.num_qp < 1 or (args.reference_qp is not None and args.reference_qp < 1):
+        parser.error("QP counts must be positive")
+    if args.tuning_greedy and (
+        args.result_json or args.tuning_pair or args.reference_qp is not None
+    ):
+        parser.error(
+            "JSON output and pair/QP comparisons require fixed-reference tuning"
+        )
+    if args.cmd == "compare" and (not args.tuning_pair or not args.result_json):
+        parser.error("compare requires --tuning-pair and --result-json")
+    return args
 
 
 def _generate_round(rng, cfg, num_tokens, device, dtype, routing="uniform"):
@@ -381,7 +418,10 @@ def _verify_once(op, cfg, dist_handle, args, comm, inp, idx, wts, sc):
     got = out.float().cpu()
     expected = unique_pes_column * inp.float().cpu()
     input_magnitude = inp.float().cpu().abs()
-    eps = 3e-1 if (args.quant_type != "none" or cfg.dispatch_dtype in _FP8) else 8e-3
+    # The golden already starts from the quantized dispatch input. Reduction
+    # error is determined by the combine leg; FP8 -> BF16 must not tolerate a
+    # missing contribution just because the transported input was FP8.
+    eps = 3e-1 if (args.quant_type != "none" or cfg.combine_dtype in _FP8) else 8e-3
     hidden_ok = bool(
         (
             (got - expected).abs()
@@ -727,7 +767,7 @@ def _bench(op, cfg, dist_handle, device, args, comm):
     """
     _report_loop_alignment(args, dist_handle.rank)
     rng = torch.Generator(device=device)
-    rng.manual_seed(4242 + dist_handle.rank)
+    rng.manual_seed(args.seed + dist_handle.rank)
     num_tokens = args.max_tokens
     inp, idx, wts, sc = _generate_round(
         rng, cfg, num_tokens, device, cfg.dispatch_dtype, args.routing
@@ -974,6 +1014,41 @@ def _bench(op, cfg, dist_handle, device, args, comm):
             ll,
             geometry,
         )
+    if args.result_json:
+        samples = (
+            dist_handle.all_gather_rows(dispatch_us + combine_us + convert_us)
+            .numpy()
+            .reshape(dist_handle.world, 3, -1)
+        )
+        if dist_handle.rank == 0:
+            d, c, conversion = samples[:, 0], samples[:, 1], samples[:, 2]
+
+            def summary(values):
+                return dict(
+                    mean=float(values.mean()),
+                    p50=float(np.percentile(values, 50)),
+                    p95=float(np.percentile(values, 95)),
+                    max=float(values.max()),
+                )
+
+            payload = dict(
+                kind="bench",
+                arguments=vars(args),
+                world_size=dist_handle.world,
+                experts_per_rank=cfg.num_experts_per_rank,
+                num_qp_per_pe=cfg.num_qp_per_pe,
+                kernel=kernel_ran,
+                geometry=_geometry_for_report(op, cfg, args),
+                dispatch_us=summary(d),
+                combine_us=summary(c),
+                total_us=summary(d + c),
+                convert_us=summary(conversion),
+                rank_max_total_us=summary((d + c).max(axis=0)),
+                samples_us=samples.tolist(),
+                verified=True,
+            )
+            with open(args.result_json, "w") as result_file:
+                json.dump(payload, result_file, indent=2)
     return 0
 
 
@@ -1140,7 +1215,7 @@ def _stress(op, cfg, dist_handle, device, args, comm):
     return 0
 
 
-def _tune(cfg, dist_handle, device, args, comm):
+def _tune(cfg, dist_handle, device, args, comm, reference_geometry):
     """Sweep launch geometries and report the winner for this token count.
 
     Structured after tuning_dispatch_combine in the examples harness -- same
@@ -1199,37 +1274,46 @@ def _tune(cfg, dist_handle, device, args, comm):
         for warp in warps
         for rdma in rdma_block_counts(block)
     ]
-    if args.tuning_candidate:
+    if args.tuning_candidates:
+        candidates = [
+            tuple(int(x) for x in triple.split(","))
+            for triple in args.tuning_candidates.split(";")
+        ]
+        if any(len(triple) != 3 for triple in candidates):
+            raise ValueError("--tuning-candidates requires block,rdma,warp triples")
+    elif args.tuning_candidate:
         candidates = [tuple(int(x) for x in args.tuning_candidate.split(","))]
     elif args.tuning_limit:
         candidates = candidates[: args.tuning_limit]
 
-    from mori.ops.dispatch_combine_v2.internode_tuning_configs import lookup
-
-    table_row = lookup(
-        cfg.world_size, cfg.hidden_dim, cfg.num_experts_per_token, args.max_tokens
-    )
-    # The incumbent is the SHIPPED pair, so a win means "better than what we ship".
-    incumbent_dispatch = tuple(table_row["dispatch"]) if table_row else candidates[0]
-    incumbent_combine = tuple(table_row["combine"]) if table_row else candidates[0]
+    # Resolve from the original op: includes dtype, env/caller overrides and the
+    # actual fallback on a table miss. candidates[0] is never a valid baseline.
+    incumbent_dispatch, incumbent_combine = reference_geometry
     phase = args.tuning_phase
     shipped = incumbent_dispatch if phase == "dispatch" else incumbent_combine
-    if shipped in candidates:
+    if shipped in candidates and args.reference_qp in (None, cfg.num_qp_per_pe):
         candidates.remove(shipped)
+    pair_override = None
+    if args.tuning_pair:
+        fields = tuple(int(x) for x in args.tuning_pair.split(","))
+        if len(fields) != 6:
+            raise ValueError("--tuning-pair requires six comma-separated integers")
+        pair_override = (fields[:3], fields[3:])
+        candidates = [pair_override[0 if phase == "dispatch" else 1]]
 
     if dist_handle.rank == 0:
         print(
             f"# TUNING tok={args.max_tokens} phase={phase} "
             f"scope={args.tuning_scope} reps={args.tuning_reps} cus={num_cus} "
-            f"candidates={len(candidates)} shipped dispatch={incumbent_dispatch} "
+            f"candidates={len(candidates)} reference dispatch={incumbent_dispatch} "
             f"combine={incumbent_combine}",
             flush=True,
         )
 
     rng = torch.Generator(device=device)
-    rng.manual_seed(4242 + dist_handle.rank)
+    rng.manual_seed(args.seed + dist_handle.rank)
     inp, idx, wts, sc = _generate_round(
-        rng, cfg, args.max_tokens, device, cfg.dispatch_dtype
+        rng, cfg, args.max_tokens, device, cfg.dispatch_dtype, args.routing
     )
     convert = (
         (lambda tensor: tensor.to(cfg.combine_dtype))
@@ -1264,15 +1348,22 @@ def _tune(cfg, dist_handle, device, args, comm):
         def metric(dispatch_value, combine_value):
             return combine_value
 
-    best_op = _build_op(cfg, comm, *geometries(shipped))
+    reference_cfg = (
+        replace(cfg, num_qp_per_pe=args.reference_qp)
+        if args.reference_qp is not None
+        else cfg
+    )
+    best_op = _build_op(reference_cfg, comm, incumbent_dispatch, incumbent_combine)
     comm.barrier()
     best = shipped
     best_median = None
     fixed_wins = []  # non-greedy: every candidate that beat the fixed incumbent
+    records = []
 
     for index, candidate in enumerate(candidates):
         try:
-            candidate_op = _build_op(cfg, comm, *geometries(candidate))
+            candidate_pair = pair_override or geometries(candidate)
+            candidate_op = _build_op(cfg, comm, *candidate_pair)
         except Exception as exc:  # a geometry the backend rejects is not a failure
             if dist_handle.rank == 0:
                 print(
@@ -1287,39 +1378,33 @@ def _tune(cfg, dist_handle, device, args, comm):
         # (dispatch, combine) per rep, to show the coupling
         incumbent_phases, candidate_phases = [], []
         incumbent_worsts, candidate_worsts = [], []  # worst ROUND per pass, per arm
-        for _ in range(args.tuning_reps):
-            mean_dispatch, mean_combine, worst_dispatch, worst_combine = _timed_pass(
-                best_op,
-                dist_handle,
-                args,
-                inp,
-                idx,
-                wts,
-                sc,
-                combine_weights,
-                convert,
-                args.rounds,
-                args.warmup,
-            )
-            incumbent_metrics.append(metric(mean_dispatch, mean_combine))
-            incumbent_phases.append((mean_dispatch, mean_combine))
-            incumbent_worsts.append(metric(worst_dispatch, worst_combine))
-            mean_dispatch, mean_combine, worst_dispatch, worst_combine = _timed_pass(
-                candidate_op,
-                dist_handle,
-                args,
-                inp,
-                idx,
-                wts,
-                sc,
-                combine_weights,
-                convert,
-                args.rounds,
-                args.warmup,
-            )
-            candidate_metrics.append(metric(mean_dispatch, mean_combine))
-            candidate_phases.append((mean_dispatch, mean_combine))
-            candidate_worsts.append(metric(worst_dispatch, worst_combine))
+        # Reverse A/B order on alternate repetitions to balance order effects.
+        for repetition in range(args.tuning_reps):
+            arms = [
+                (best_op, incumbent_metrics, incumbent_phases, incumbent_worsts),
+                (candidate_op, candidate_metrics, candidate_phases, candidate_worsts),
+            ]
+            if repetition % 2:
+                arms.reverse()
+            for arm, metrics, phases, worsts in arms:
+                mean_dispatch, mean_combine, worst_dispatch, worst_combine = (
+                    _timed_pass(
+                        arm,
+                        dist_handle,
+                        args,
+                        inp,
+                        idx,
+                        wts,
+                        sc,
+                        combine_weights,
+                        convert,
+                        args.rounds,
+                        args.warmup,
+                    )
+                )
+                metrics.append(metric(mean_dispatch, mean_combine))
+                phases.append((mean_dispatch, mean_combine))
+                worsts.append(metric(worst_dispatch, worst_combine))
         incumbent_median = sorted(incumbent_metrics)[len(incumbent_metrics) // 2]
         candidate_median = sorted(candidate_metrics)[len(candidate_metrics) // 2]
         # Worst of the paired reps, as a tail proxy. _timed_pass returns a grand
@@ -1360,6 +1445,20 @@ def _tune(cfg, dist_handle, device, args, comm):
             and (incumbent_worst - candidate_worst) > tail_room
         )
         if dist_handle.rank == 0:
+            records.append(
+                dict(
+                    candidate=candidate_pair,
+                    reference=(incumbent_dispatch, incumbent_combine),
+                    candidate_phases_us=candidate_phases,
+                    reference_phases_us=incumbent_phases,
+                    candidate_worsts_us=candidate_worsts,
+                    reference_worsts_us=incumbent_worsts,
+                    paired_median_us=median_diff,
+                    margin_us=margin,
+                    win=win,
+                    tail_only=tie,
+                )
+            )
             candidate_dispatch_median = _median(
                 dispatch_time for dispatch_time, _ in candidate_phases
             )
@@ -1439,17 +1538,85 @@ def _tune(cfg, dist_handle, device, args, comm):
             best = fixed_wins[0][2]
             best_median = fixed_wins[0][3]
     if dist_handle.rank == 0:
+        if args.result_json:
+            with open(args.result_json, "w") as result_file:
+                json.dump(
+                    dict(
+                        kind="tuning",
+                        arguments=vars(args),
+                        world_size=dist_handle.world,
+                        reference=(incumbent_dispatch, incumbent_combine),
+                        reference_num_qp=reference_cfg.num_qp_per_pe,
+                        candidate_num_qp=cfg.num_qp_per_pe,
+                        candidates=records,
+                    ),
+                    result_file,
+                    indent=2,
+                )
         dispatch_row = best if phase == "dispatch" else incumbent_dispatch
         combine_row = best if phase == "combine" else incumbent_combine
+        if pair_override and fixed_wins:
+            dispatch_row, combine_row = pair_override
         print(
             f"# TUNING RESULT tok={args.max_tokens} phase={phase}: "
-            f"block/rdma/warp={best} median {phase}={best_median:.1f}us "
-            f"(shipped was {shipped})\n"
+            f"block/rdma/warp={best} median {args.tuning_metric}={best_median}us "
+            f"(reference was {shipped})\n"
             f"#   table row: ({args.max_tokens}, {dispatch_row[0]}, "
             f"{dispatch_row[1]}, {dispatch_row[2]}, "
             f"{combine_row[0]}, {combine_row[1]}, {combine_row[2]}),",
             flush=True,
         )
+    return 0
+
+
+def _compare(cfg, dist_handle, device, args, comm, reference_geometry):
+    """Validate a named pair, then measure each arm with only one live op.
+
+    Run this command in three fresh two-node processes, alternating
+    --candidate-first and varying --seed, before accepting a sweep winner.
+    The paired tuner and ordinary bench have different arena/QP lifetimes.
+    Both must improve: a tuner median can hide a geometry's benchmark spikes.
+    """
+    if not args.result_json or not args.tuning_pair:
+        raise ValueError("compare requires --result-json and --tuning-pair")
+    fields = tuple(int(x) for x in args.tuning_pair.split(","))
+    if len(fields) != 6:
+        raise ValueError("--tuning-pair requires six comma-separated integers")
+    candidate_geometry = (fields[:3], fields[3:])
+    paired_args = argparse.Namespace(**vars(args))
+    paired_args.result_json = args.result_json + ".paired.json"
+    paired_args.tuning_greedy = False
+    paired_args.tuning_metric = "total"
+    _tune(cfg, dist_handle, device, paired_args, comm, reference_geometry)
+    reference_cfg = (
+        replace(cfg, num_qp_per_pe=args.reference_qp)
+        if args.reference_qp is not None
+        else cfg
+    )
+    arms = [
+        ("reference", reference_geometry, reference_cfg),
+        ("candidate", candidate_geometry, cfg),
+    ]
+    if args.candidate_first:
+        arms.reverse()
+    for name, geometry, arm_cfg in arms:
+        bench_args = argparse.Namespace(**vars(args))
+        bench_args.result_json = args.result_json + "." + name + ".json"
+        measured_op = _build_op(arm_cfg, comm, *geometry)
+        try:
+            status = _bench(measured_op, arm_cfg, dist_handle, device, bench_args, comm)
+        finally:
+            measured_op.close()
+        if status:
+            return status
+        comm.barrier()
+    if dist_handle.rank == 0:
+        result = dict(kind="compare", arguments=vars(args))
+        for name in ("paired", "reference", "candidate"):
+            with open(args.result_json + "." + name + ".json") as result_file:
+                result[name] = json.load(result_file)
+        with open(args.result_json, "w") as result_file:
+            json.dump(result, result_file, indent=2)
     return 0
 
 
@@ -1566,11 +1733,18 @@ def main(argv):
             dist_handle.shutdown()
             return return_code
 
-        if args.cmd == "tuning":
+        if args.cmd in ("tuning", "compare"):
             # The sweep builds its own ops, one per candidate geometry; this one
             # only proved the config is constructible.
+            reference_geometry = (
+                tuple(op._internode_geom_for("dispatch", args.max_tokens)),
+                tuple(op._internode_geom_for("combine", args.max_tokens)),
+            )
             op.close()
-            return_code = _tune(cfg, dist_handle, device, args, comm)
+            runner = _tune if args.cmd == "tuning" else _compare
+            return_code = runner(
+                cfg, dist_handle, device, args, comm, reference_geometry
+            )
             dist_handle.shutdown()
             return return_code
 
@@ -1626,7 +1800,11 @@ def main(argv):
             # per-element bound by unique_pes) rather than a flat allclose.
             got = out.float().cpu()
             input_magnitude = inp.float().cpu().abs()
-            eps = 3e-1 if (args.quant_type != "none" or dtype in _FP8) else 8e-3
+            eps = (
+                3e-1
+                if (args.quant_type != "none" or cfg.combine_dtype in _FP8)
+                else 8e-3
+            )
             bound = eps * unique_pes_column * input_magnitude.clamp(min=1.0)
             hidden_ok = bool(((got - expected).abs() <= bound).all())
             # Weights are transported as f32 and summed the same way, so their
