@@ -33,7 +33,7 @@ jobs:
       MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -178,6 +178,28 @@ jobs:
           $CT exec $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE && \
             timeout 300 pytest tests/python/cco/test_sdma_api.py -v"
+
+      - name: Run CCO GEMM+AR numerics (up to 8 ranks)
+        run: |
+          # The op ships in mori.ops.gemm_ar, so run pytest from /tmp: from a
+          # repo cwd `python/mori/` shadows the install and a packaging miss
+          # (a subpackage find_packages never picked up) would read as green.
+          $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
+            cd /tmp && python -c 'import mori.ops.gemm_ar as g; print(g.GemmAllReduceOp)' && \
+            timeout 1200 python -m pytest -v \
+              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar.py \
+              $GITHUB_WORKSPACE/tests/python/cco/test_flydsl_ar.py"
+
+      - name: Run CCO GEMM+AR benchmark (8 ranks, accuracy-gated)
+        run: |
+          # Accuracy is a gate (validated + rel_l2); absolute timings are only
+          # recorded -- this runner is shared, so a microsecond threshold would
+          # fail on a busy box and pass a real regression on an idle one. The
+          # one perf assertion is relative (fused beats split, measured back to
+          # back). -s so the numbers reach the log for a bisect to read.
+          $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE && \
+            timeout 1800 pytest -v -s tests/python/cco/test_gemm_ar_bench.py"
 
       - name: Validate CCO ROCm runtime import order
         run: |

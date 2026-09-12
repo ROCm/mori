@@ -259,8 +259,9 @@ class Sdma:
         signal,
         aggregate,
     ):
-        # coop/signal are compile-time; "_ns" (no-signal) is fire-and-forget and
-        # cannot be drained by quiet. aggregate skips the doorbell — call commit().
+        # coop/signal are compile-time. "_ns" (no-signal) only drops the trailing
+        # ATOMIC; quiet()/quietQueue() drain the queue's read pointer and work on
+        # it either way (cco.hpp:1707). aggregate skips the doorbell — call commit().
         tag = _COOP_TAG[_const(coop, "coop")]
         if not signal:
             tag += "_ns"
