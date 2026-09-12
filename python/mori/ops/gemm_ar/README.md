@@ -60,6 +60,49 @@ Measured, fused-sdma at `[16384, 7168]` K=2048 on 8x MI355X:
 | bf16 | 1151.5 | 2.35e-3 |
 | fp8 | **1033.9** (-10.2%) | **2.49e-2** |
 
+### Who moves the fp8 gather
+
+`gather_transport="lsa"` (the default for fp8) pulls each peer's slice over
+xGMI into registers and widens it on the way to memory. `"sdma"` pushes with
+the copy engines and widens in a second kernel -- a copy engine has no ALU, so
+for SDMA those cannot be one step, and the second kernel has to read the landed
+fp8 back out of local HBM (98 MiB a layer).
+
+| gather | us |
+|---|---:|
+| bf16 / sdma | 1150.7 |
+| fp8 / sdma | 1018.9 |
+| **fp8 / lsa** | **957.3** |
+
+The pull's grid is the whole story and is not obvious: these are xGMI reads, so
+the grid throttles outstanding remote requests rather than covering HBM latency,
+and it wants roughly a tenth of what the local conversion kernels want.
+
+| blocks | 16 | 24 | 32 | 48 | 64 | 80 | 128 | 256 | 512 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| us | 1261 | 1091 | 1006 | 962 | **959** | 963 | 1018 | 1138 | 1184 |
+
+The first version launched 512 -- the quantize grid -- and lost to SDMA by 17%.
+
+### Folding the narrowing into the reduce: measured, and it loses
+
+`fuse_quantize=True` makes the reduce write its bf16 and narrow to fp8 from the
+same accumulators, saving a 28 MiB re-read and a launch. It is **off**, because
+it costs 20 us rather than saving 12:
+
+| | us |
+|---|---:|
+| split reduce + quantize | 957.4 |
+| fused, row stashed in registers | 977.1 |
+| fused, row re-read | 982.0 |
+
+Not register pressure -- the re-reading variant keeps no stash and is no better.
+It is the thread map: a per-row amax cannot be taken by a block holding only
+part of a row, so fusing forces one-wave-per-row, where `sdma_reduce` walks
+packs with a flat grid stride and streams a block through all 8 source slices at
+once. Confining a wave to 14 KiB at a time costs the reduce more than the
+re-read saves.
+
 It is not free and the cost is not a tuning problem. e4m3 carries 3 mantissa
 bits, so one rounding costs ~2.1e-2 on a normal payload whatever the scale
 granularity -- per-row measures 2.65e-2 and per-32 measures 2.40e-2, 9% better
