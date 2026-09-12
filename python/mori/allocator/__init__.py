@@ -164,6 +164,7 @@ def _jit_ext():
         extra_ldflags=[
             f"-L{rocm}/lib",
             "-lamdhip64",
+            "-lc10_hip",
             f"-L{pkg}",
             "-lmori_cco",
             f"-Wl,-rpath,{pkg}",
