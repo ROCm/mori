@@ -88,6 +88,12 @@ CM_SC0_SC1 = CM_SC0 | CM_SC1  # 17: publish past L1+L2
 _CDNA_BUFFER_FLAGS = (7 << 12) | (4 << 15)
 _NO_OOB_LIMIT = 0xFFFFFFFF
 
+# Needed on both sides of the split below -- `wave_uniform_i64` and the fp8
+# conversions use it whichever buffer-op surface is available -- so it is
+# imported once here rather than inside a branch. It was in the 0.3 branch only,
+# which made every 0.2.x run die at trace time on `_rocdl is not defined`.
+from flydsl.expr import rocdl as _rocdl  # noqa: E402
+
 try:  # flydsl <= 0.2.x
     # ImportError, not ModuleNotFoundError: on 0.3.0 ``buffer_ops`` is neither a
     # submodule nor a name in ``flydsl.expr``, so this form raises the parent.
@@ -106,7 +112,6 @@ try:  # flydsl <= 0.2.x
 except ImportError:  # flydsl >= 0.3.0
     from flydsl._mlir.dialects import arith as _arith
     from flydsl._mlir.dialects import llvm as _llvm
-    from flydsl.expr import rocdl as _rocdl
     from flydsl.expr.typing import T as _T
 
     HAS_BUFFER_OPS = False
@@ -218,9 +223,6 @@ except ImportError:  # flydsl >= 0.3.0
 # Scopes mirror aiter's start_sync/end_sync: publish at **system** scope (the
 # store must cross xGMI), poll at **agent** scope (we only read our own HBM).
 from flydsl._mlir.dialects import llvm as _llvm_d  # noqa: E402
-from flydsl.expr.typing import AddressSpace as _AS  # noqa: E402
-from flydsl.expr.typing import PointerType as _PT  # noqa: E402
-from flydsl.expr.typing import inttoptr as _inttoptr  # noqa: E402
 
 _SYSTEM_SCOPE = ""  # LLVM AMDGPU: the empty syncscope is system-wide
 _AGENT_SCOPE = "agent"
@@ -245,15 +247,24 @@ def wave_uniform_i64(addr):
     return (fx.Uint64(hi) << 32) | fx.Uint64(lo)
 
 
+#: AMDGPU's LLVM address space for global memory. `fx.to_llvm_ptr` would
+#: resolve this from the active backend, but it does not exist before flydsl
+#: 0.3 and the CI image pins `flydsl<0.3` (the cco Python examples still import
+#: `flydsl.expr.buffer_ops`, which 0.3 dropped). `llvm.inttoptr` is identical in
+#: both -- same signature, same dialect module -- so going straight to an
+#: `!llvm.ptr` keeps one code path instead of a version probe.
+_GLOBAL_LLVM_AS = 1
+_LLVM_GLOBAL_PTR = f"!llvm.ptr<{_GLOBAL_LLVM_AS}>"
+
+
 def signal_ptr(addr_i64):
     """Raw i64 device address -> ``!llvm.ptr`` over one u32 signal slot.
 
-    ``inttoptr`` yields a ``!fly.ptr``; the llvm dialect ops need the lowered
-    ``!llvm.ptr``, hence the extra hop (same shape as aiter's
-    ``kernels/mxfp4_gemm_common.py::_global_base_ptr1``).
+    The llvm dialect ops below (atomic store/load/cmpxchg) need a lowered
+    ``!llvm.ptr``, not the ``!fly.ptr`` that ``fly``'s own ``inttoptr`` yields.
     """
-    return fx.to_llvm_ptr(
-        _inttoptr(_PT.get(_dtype("i32"), _AS.Global), fx.Int64(addr_i64))
+    return _llvm_d.inttoptr(
+        ir.Type.parse(_LLVM_GLOBAL_PTR), fx.Int64(addr_i64).ir_value()
     )
 
 
