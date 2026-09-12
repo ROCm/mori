@@ -690,6 +690,47 @@ TEST_F(PoolClientRangesTest, SplitRemotePutThenGetRoundTrips) {
   }
 }
 
+// One object too big for the WHOLE arena must not decide arena sizing for its
+// batch-mates.  Sharding sizes a call against one shard and falls back to the
+// whole arena exclusively for anything that needs more; asking that question as
+// a batch-wide maximum let the oversized key answer it -- it fails the "fits the
+// full arena" half, exclusivity is switched off for everyone, and a batch-mate
+// that needed the full arena is then rejected at shard size although it was
+// servable before sharding existed.
+//
+// Only bites at shards > 1 (UMBP_DISTRIBUTED_RANGED_SCRATCH_SHARDS); at the
+// default of 1 the shard IS the arena and this passes either way.
+TEST_F(PoolClientRangesTest, OversizedObjectDoesNotVetoArenaFallbackForItsBatch) {
+  const size_t arena = caller_put_scratch_.size();
+  const std::string too_big = "veto-too-big";      // > the whole arena: fails either way
+  const std::string needs_all = "veto-needs-all";  // > one shard, <= the arena
+  std::vector<char> big(arena + kPageSize);
+  std::vector<char> fits(arena);
+  for (size_t i = 0; i < big.size(); ++i) big[i] = static_cast<char>((i * 31 + 7) & 0xff);
+  for (size_t i = 0; i < fits.size(); ++i) fits[i] = static_cast<char>((i * 17 + 3) & 0xff);
+
+  std::vector<std::string> keys = {too_big, needs_all};
+  std::vector<size_t> object_sizes = {big.size(), fits.size()};
+  std::vector<std::vector<const void*>> ptrs = {{big.data()}, {fits.data()}};
+  std::vector<std::vector<size_t>> sizes = {{big.size()}, {fits.size()}};
+  std::vector<std::vector<size_t>> offsets = {{0}, {0}};
+
+  auto put = caller_->BatchPutRanges(keys, object_sizes, ptrs, sizes, offsets);
+  EXPECT_FALSE(put[0]) << "an object larger than the whole arena cannot be staged";
+  ASSERT_TRUE(put[1]) << "batch-mate that fits the arena must still be served";
+
+  caller_->Master().FlushHeartbeat();
+  target_->Master().FlushHeartbeat();
+  ASSERT_TRUE(WaitForExists(caller_.get(), needs_all));
+
+  std::vector<char> out(fits.size(), 0);
+  std::vector<std::vector<void*>> get_ptrs = {{out.data()}};
+  std::vector<std::vector<size_t>> get_sizes = {{fits.size()}};
+  std::vector<std::vector<size_t>> get_offsets = {{0}};
+  ASSERT_TRUE(caller_->BatchGetRanges({needs_all}, get_ptrs, get_sizes, get_offsets).front());
+  EXPECT_EQ(std::memcmp(out.data(), fits.data(), fits.size()), 0);
+}
+
 // Concurrent remote gets (GET arena) and remote puts (PUT arena) on disjoint key
 // sets: every payload must survive byte-for-byte, proving the two arenas never
 // overwrite each other under real contention.
