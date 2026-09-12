@@ -26,6 +26,7 @@ MORI Documentation
    :caption: Benchmarks
 
    MORI-EP-BENCHMARK
+   MORI-GEMM-AR-BENCHMARK
    MORI-IO-BENCHMARK
 
 .. toctree::

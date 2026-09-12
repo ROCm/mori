@@ -10,6 +10,10 @@ The public API is `GemmAllReduceOp` in `op.py`. `kernels_fused.py`,
 window offset and count, and `_gemm_a8w8_8wave.py` / `_shuffle.py` the two
 pieces vendored from aiter so mori does not depend on it.
 
+Full measurements, how to reproduce them, and the model-level evaluation of the
+fp8 wire are in
+[`docs/MORI-GEMM-AR-BENCHMARK.md`](../../../../docs/MORI-GEMM-AR-BENCHMARK.md).
+
 ## What it does
 
 aiter's 8-wave fp8 GEMM with the all-reduce's scatter fused into its epilogue.
