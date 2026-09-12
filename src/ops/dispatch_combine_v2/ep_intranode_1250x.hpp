@@ -513,6 +513,28 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     static_assert(MORI_EP_META_DW == EpMetaDw(kCfg),
                   "MORI_EP_META_DW disagrees with EpMetaDw(Cfg) -- the staging pool would be "
                   "sized at one pitch and written at another");
+    // Every transfer below is issued as a whole row with no planner deciding head/body, which is
+    // only sound because the slot pitch is itself a whole number of rows: the landing address is
+    // `base + slot * pitch` and the bases are row-aligned (the staging pools carry alignas, the
+    // arena aligns each region to 256). Assert the pitch rather than inherit it from how EpMetaDw
+    // happens to round -- the failure it guards against is a transfer whose phase is nonzero, and
+    // that one does not announce itself: it corrupts the neighbouring 128 B block instead of
+    // faulting. This is the invariant #643 had to detect at runtime because the old layout could
+    // not state it (out_wts moved at a 9-dword pitch, and 9 is coprime with 32).
+    static_assert(kMetaDw % (kTdmRowBytes / 4) == 0,
+                  "the metadata slot pitch is not a whole number of TDM rows");
+    static_assert(kEpScaleStride % kTdmRowBytes == 0,
+                  "the scale slot pitch is not a whole number of TDM rows");
+    // The scale row is staged under `dt < kEpScaleRows` and shipped under `ab + cc > recvCapM`,
+    // two bounds written independently in two phases. They are the same number, and saying so
+    // here is worth the line: HANDOFF-EPV2-TOPK9 8 spent an investigation on the theory that they
+    // differ, which would have let a never-written scale row reach a peer. It reads plausible
+    // because the neighbouring guard really is a different constant (_stgCapM, the staging pool's
+    // per-peer stride). If a future cap ever makes these two diverge, fail the build rather than
+    // ship rows the writer skipped.
+    static_assert(kEpScaleBytes == 0 || kEpScaleRows == (size_t)EpMaxRecv(kCfg),
+                  "the scale staging bound and the recv capacity have diverged -- the read side "
+                  "would ship slots the write side skipped");
     // One warp owns a whole (peer, sub-range) run, moving idx+wt+srcmap through one tile.
     const int mtileBytesM = kSlabBytes;  // the whole slab, see above
     // The interleaved metadata row plus the scale row, at the stride each is really
