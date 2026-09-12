@@ -115,6 +115,7 @@ class GemmAllReduceOp:
         block_n: int = DEFAULT_BLOCK_N,
         sdma_queues: int = 1,
         gather_dtype: str = "bf16",
+        gather_transport: str = "lsa",
     ):
         self.comm = comm
         self.rank = comm.rank
@@ -128,6 +129,11 @@ class GemmAllReduceOp:
         #: It costs relL2 ~2.1e-2 against a bf16 wire that is exact -- e4m3's
         #: mantissa, not a tuning knob -- so it is off unless asked for.
         self.gather_dtype = gather_dtype
+        #: Only meaningful with fp8. "lsa" pulls each peer's slice over xGMI and
+        #: widens it on the way in -- one kernel instead of an SDMA push plus a
+        #: dequantise, and it does not read the landed fp8 back out of HBM.
+        #: Measured 957us against SDMA's 1019 on the fused layer.
+        self.gather_transport = gather_transport
         self.m_max = padded_m(m_max, self.world_size, block_m)
 
         if not supports(self.m_max, n, k, self.world_size, block_n=block_n):
@@ -198,6 +204,7 @@ class GemmAllReduceOp:
             recv_slots=self.world_size,
             counter_chunks=counter_chunks(m, self.world_size, self.block_m),
             gather_dtype=self.gather_dtype,
+            gather_transport=self.gather_transport,
         )
         cfg.validate()
         return cfg

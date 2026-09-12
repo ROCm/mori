@@ -279,6 +279,7 @@ def run(args) -> int:
         recv_slots=world_size if needs_sdma else 0,
         counter_chunks=chunks,
         gather_dtype=args.gather_dtype,
+        gather_transport=args.gather_transport,
     )
     cfg.validate()
 
@@ -370,6 +371,7 @@ def run(args) -> int:
                 queues=args.sdma_queues,
                 reduce_self_from_recv=direct_lsa,
                 recv_uncached=direct_lsa,
+                fuse_quantize=args.fuse_quantize,
             )
         if args.mode == "split-lsa":
             lsa_ar, _ = build_lsa_ar(cfg, rank)
@@ -663,6 +665,22 @@ def build_parser() -> argparse.ArgumentParser:
         "and is worth 80us (355 vs 434)",
     )
     p.add_argument("--sdma-queues", type=int, default=8)
+    p.add_argument(
+        "--fuse-quantize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="fold the fp8 narrowing into the reduce instead of running it as "
+        "its own kernel. Same numbers either way; it saves reading the bf16 "
+        "back out of memory.",
+    )
+    p.add_argument(
+        "--gather-transport",
+        choices=("sdma", "lsa"),
+        default="sdma",
+        help="who moves the fp8 gather. sdma pushes with the copy engines and "
+        "widens in a second kernel; lsa pulls over xGMI into registers and "
+        "widens on the way in, one kernel, at the cost of CU time.",
+    )
     p.add_argument(
         "--gather-dtype",
         choices=("bf16", "fp8"),

@@ -75,6 +75,8 @@ in step 3.
 
 from __future__ import annotations
 
+import os
+
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -105,6 +107,11 @@ from .kernels_lsa import _spin_until
 #: e4m3's largest finite magnitude. ``scale = amax / FP8_E4M3_MAX`` puts a row's
 #: biggest element exactly at the top of the range.
 FP8_E4M3_MAX = 448.0
+
+#: Grid for the LSA pull gather. See the sweep at its use site; it is
+#: deliberately not LSA_BLOCK_CAP.
+PULL_BLOCKS = 64
+
 
 #: Wave width, and the width of the amax butterfly below (2**6).
 WAVE = 64
@@ -207,6 +214,7 @@ def build_sdma_phases(
     reduce_blocks=None,
     reduce_self_from_recv: bool = False,
     recv_uncached: bool = False,
+    fuse_quantize: bool = False,
 ):
     """Compile the phases separately, so the fused GEMM can reuse the tail.
 
@@ -456,11 +464,156 @@ def build_sdma_phases(
         chunks_per_row = cfg.n // (CHUNK_ELEMS * WAVE)
         slice_rows = cfg.slice_rows
         quant_blocks = max(1, min(1024, (slice_rows + QUANT_WAVES - 1) // QUANT_WAVES))
+        # The pull gets its own, much smaller grid. These are *xGMI* reads, so
+        # the grid throttles outstanding remote requests rather than covering
+        # HBM latency -- the opposite of what quantize wants, which is why that
+        # one keeps the big grid.
+        #
+        # Swept at [16384, 7168] on 8 ranks, whole fused layer:
+        #
+        #     blocks   16     24     32     48     64     80    128    256
+        #     us     1261   1091   1006    962    959    963   1018   1138
+        #
+        # Flat from 48 to 80 and steep either side: 512 blocks (the quantize
+        # grid) costs 1184, and 16 costs 1261. Note this is *not*
+        # LSA_BLOCK_CAP's 24 -- that cap is for a kernel moving bf16 with no
+        # arithmetic, while this one moves half the bytes and dequantises them,
+        # so it needs more waves in flight to keep the links fed.
+        pull_blocks = max(
+            1,
+            min(
+                int(os.environ.get("MORI_GEMM_AR_PULL_BLOCKS", 0)) or PULL_BLOCKS,
+                quant_blocks,
+            ),
+        )
+
+        def _row_addr_at(w, peer, byte_off):
+            return create_buffer_resource_from_addr(
+                wave_uniform_i64(w.lsa_ptr(peer, byte_off))
+            )
 
         def _row_addr(w, byte_off):
             return create_buffer_resource_from_addr(
                 wave_uniform_i64(w.lsa_ptr(rank, byte_off))
             )
+
+        @flyc.kernel(known_block_size=[QUANT_THREADS, 1, 1])
+        def sdma_reduce_quant(dev_comm: Int64, win: Int64):
+            """The reduce, with the fp8 narrowing folded in.
+
+            Same arithmetic as `sdma_reduce` followed by `quantize_gather`, and
+            the same numbers out -- it quantises from the bf16 it just wrote, so
+            the rounding is identical. What it saves is reading that bf16 back
+            out of memory, 28 MiB a layer at the model's shape, plus a kernel.
+
+            The per-row amax is why this needs a different thread map from
+            `sdma_reduce`: that one is flat and grid-strided, so a row is spread
+            over many blocks and no single block can take its maximum. Here a
+            wave owns a row, which makes the amax a butterfly (below) and keeps
+            every lane's own 112 elements addressable.
+
+            Those 112 are held in registers between the two passes, as bf16
+            packed into 56 i32 rather than 112 f32. That is the whole reason
+            this fits without LDS: at f32 it would not.
+
+            **This loses, and is off by default.** At [16384, 7168] on 8 ranks,
+            whole fused layer with the LSA pull gather:
+
+                split reduce + quantize     957.4us
+                fused, row stashed in regs  977.1us
+                fused, row re-read          982.0us
+
+            It is not register pressure -- the re-reading variant, which keeps
+            no stash at all, is no better. It is the thread map. `sdma_reduce`
+            walks packs with a flat grid stride, so a block streams straight
+            through all 8 source slices at once; one-wave-per-row confines a
+            wave to 14 KiB at a time and scatters the block's footprint across
+            the slice. The reduce loses more to that map than folding the
+            narrowing in saves by skipping the 28 MiB re-read.
+
+            Kept, off, because the shape of the idea is right and the reason it
+            fails is not visible from reading it.
+            """
+            tid = fx.thread_idx.x
+            bid = fx.block_idx.x
+            w = cco.Window(win)
+            lane = tid % fx.Int32(WAVE)
+            wave = tid // fx.Int32(WAVE)
+
+            self_off = (
+                cfg.recv_slot_off(rank)
+                if reduce_self_from_recv
+                else in_off + my_slice_off
+            )
+            srcs = [_row_addr(w, self_off)] + [
+                _row_addr(w, cfg.recv_slot_off((rank + j) % ws)) for j in range(1, ws)
+            ]
+            out = _row_addr(w, out_off + my_slice_off)
+            gdst = _row_addr(w, cfg.gout_off + rank * cfg.slice_rows * cfg.n)
+            gsca = _row_addr(w, cfg.gout_scale_slice_off(rank))
+
+            for row in range(
+                bid * QUANT_WAVES + wave, slice_rows, quant_blocks * QUANT_WAVES
+            ):
+                local = fx.Float32(0.0)
+                stash = []
+                for c in range_constexpr(chunks_per_row):
+                    off = row * cfg.n + (c * WAVE + lane) * CHUNK_ELEMS
+                    for h in range_constexpr(2):
+                        i32_off = off // 2 + h * 4
+                        acc = None
+                        for j in range_constexpr(ws):
+                            # recv is filled by a peer. A cached load can return
+                            # the previous iteration's bytes when the peer's CUs
+                            # wrote it, since our L2 is never invalidated by a
+                            # remote store; SC1 skips L2 for those.
+                            raw = fx.Vector(
+                                buffer_load(
+                                    srcs[j],
+                                    i32_off,
+                                    vec_width=4,
+                                    dtype=i32_type(),
+                                    cache_modifier=(
+                                        CM_SC1 if recv_uncached else CM_CACHED
+                                    ),
+                                )
+                            )
+                            v = raw.bitcast(fx.BFloat16).to(fx.Float32)
+                            acc = v if acc is None else acc + v
+                        for e in range_constexpr(CVT_ELEMS):
+                            a = acc[e]
+                            local = local.maximumf((-a).maximumf(a))
+                        packed = acc.to(fx.BFloat16).bitcast(fx.Int32)
+                        buffer_store(packed, out, i32_off, cache_modifier=CM_CACHED)
+                        stash.append(packed)
+
+                amax = _wave_amax(local, lane)
+                is_zero = amax == fx.Float32(0.0)
+                scale = is_zero.select(
+                    fx.Float32(1.0), amax * fx.Float32(1.0 / FP8_E4M3_MAX)
+                )
+                inv = is_zero.select(fx.Float32(1.0), fx.Float32(FP8_E4M3_MAX) / amax)
+                if lane == fx.Int32(0):
+                    buffer_store(scale, gsca, row, cache_modifier=CM_CACHED)
+
+                for c in range_constexpr(chunks_per_row):
+                    off = row * cfg.n + (c * WAVE + lane) * CHUNK_ELEMS
+                    words = []
+                    for h in range_constexpr(2):
+                        v = (
+                            fx.Vector(stash[c * 2 + h])
+                            .bitcast(fx.BFloat16)
+                            .to(fx.Float32)
+                        )
+                        scaled = v * inv
+                        q = _pack8_fp8([scaled[e] for e in range_constexpr(CVT_ELEMS)])
+                        words += [q[0], q[1]]
+                    buffer_store(
+                        fx.Vector.from_elements(words, fx.Int32),
+                        gdst,
+                        off // 4,
+                        cache_modifier=CM_CACHED,
+                    )
 
         @flyc.kernel(known_block_size=[QUANT_THREADS, 1, 1])
         def quantize_gather(dev_comm: Int64, win: Int64):
@@ -605,6 +758,96 @@ def build_sdma_phases(
                                 cache_modifier=CM_CACHED,
                             )
 
+        @flyc.kernel(known_block_size=[QUANT_THREADS, 1, 1])
+        def lsa_pull_gather(dev_comm: Int64, win: Int64):
+            """Pull every peer's fp8 slice over xGMI and widen it on the way in.
+
+            The alternative to `gather` + `dequantize_gather`. A copy engine has
+            no ALU, so an SDMA push can never scale anything and the widening
+            has to be a second kernel reading the landed fp8 back out of local
+            HBM. A CU pull has the bytes in registers already, so that read --
+            98 MiB a layer at the model's shape -- simply does not happen.
+
+            What it costs is CU time during the transfer, which SDMA does not
+            spend. Whether that trade pays is a measurement, which is why both
+            transports are kept.
+
+            Two things here are load-bearing, and `kernels_lsa.ar_2stage`
+            learned both the hard way:
+
+            * the acquire fence. The barrier before this kernel orders, but does
+              not invalidate, so without it we can read our own stale L2 lines
+              for a peer's gout. Belt and braces with SC1 below, which also
+              costs nothing here: peer bytes are read exactly once, so there is
+              no reuse for L2 to capture.
+            * the loop nesting. Every peer's load is issued before any store, so
+              all 7 links stream at once. Draining one peer at a time pins the
+              whole gather to a single link -- measured there as ~133us against
+              ~660us, and it is invisible in the output.
+            """
+            tid = fx.thread_idx.x
+            bid = fx.block_idx.x
+            w = cco.Window(win)
+            lane = tid % fx.Int32(WAVE)
+            wave = tid // fx.Int32(WAVE)
+
+            raw_cco.cco_system_fence(fx.Int32(0))
+
+            # Peer p reduced slice p, so slice p is read out of p's own window.
+            peers = [(rank + j) % ws for j in range(1, ws)]
+            srcs = [
+                _row_addr_at(w, p, cfg.gout_off + p * cfg.slice_rows * cfg.n)
+                for p in peers
+            ]
+            scas = [_row_addr_at(w, p, cfg.gout_scale_slice_off(p)) for p in peers]
+            # One descriptor for the destination, not one per peer: the slices
+            # are contiguous in my own output, so the peer index folds into the
+            # offset and 7 SGPR quads stay free.
+            out = _row_addr(w, out_off)
+
+            for row in range(
+                bid * QUANT_WAVES + wave, slice_rows, pull_blocks * QUANT_WAVES
+            ):
+                scales = [
+                    fx.Float32(
+                        buffer_load(
+                            scas[i],
+                            row,
+                            vec_width=1,
+                            dtype=fx.Float32,
+                            cache_modifier=CM_SC1,
+                        )
+                    )
+                    for i in range_constexpr(ws - 1)
+                ]
+                for c in range_constexpr(chunks_per_row):
+                    off = row * cfg.n + (c * WAVE + lane) * CHUNK_ELEMS
+                    vals = [
+                        buffer_load(
+                            srcs[i],
+                            off // 4,
+                            vec_width=4,
+                            dtype=i32_type(),
+                            cache_modifier=CM_SC1,
+                        )
+                        for i in range_constexpr(ws - 1)
+                    ]
+                    for i in range_constexpr(ws - 1):
+                        packed = fx.Vector(vals[i])
+                        base = peers[i] * cfg.slice_rows * cfg.n + off
+                        for h in range_constexpr(2):
+                            half = fx.Vector.from_elements(
+                                [packed[2 * h], packed[2 * h + 1]], fx.Int32
+                            )
+                            wide = [e * scales[i] for e in _unpack8_fp8(half)]
+                            v = fx.Vector.from_elements(wide, fx.Float32)
+                            buffer_store(
+                                v.to(fx.BFloat16).bitcast(fx.Int32),
+                                out,
+                                base // 2 + h * 4,
+                                cache_modifier=CM_CACHED,
+                            )
+
     # Gather. My reduced slice goes to the same offset in every peer's window.
     # On the bf16 wire that offset is in `output` and there is nothing to stage;
     # on the fp8 wire it is `gout`, which `quantize_gather` filled, and the
@@ -630,6 +873,11 @@ def build_sdma_phases(
             src_off_expr=lambda tid: fx.Int64(out_off + my_slice_off),
         )
 
+    # Barrier on the gather's signal row, no puts. The LSA pull needs every
+    # peer's quantise to have landed before it reads, and a push kernel with no
+    # puts is exactly that barrier.
+    gather_barrier = _push_kernel(end_off)
+
     # Drain-only twin of `scatter`: same barrier, no puts. The fused GEMM issues
     # the puts from its epilogue, but still has to drain the queues and tell the
     # peers their slices landed.
@@ -651,19 +899,36 @@ def build_sdma_phases(
         "gather": _phase(gather, 1, PUSH_THREADS),
     }
     if cfg.fp8_gather:
-        # Bracket the gather. `quantize` has to follow the reduce and precede the
-        # push; `dequantize` has to follow the barrier the push ends with.
+        # `quantize` has to follow the reduce and precede whichever transport
+        # moves the bytes -- unless it is folded into the reduce, which is the
+        # default, in which case there is no separate phase at all.
         phases["quantize"] = _phase(quantize_gather, quant_blocks, QUANT_THREADS)
-        phases["dequantize"] = _phase(dequantize_gather, quant_blocks, QUANT_THREADS)
+        phases["reduce_quant"] = _phase(sdma_reduce_quant, quant_blocks, QUANT_THREADS)
+        if cfg.lsa_gather:
+            # Pull: barrier first (the peers must have finished quantising),
+            # then one kernel that transfers and widens together.
+            phases["gather_barrier"] = _phase(gather_barrier, 1, PUSH_THREADS)
+            phases["pull"] = _phase(lsa_pull_gather, pull_blocks, QUANT_THREADS)
+        else:
+            # Push: the copy engine cannot widen, so that is a second kernel,
+            # and it runs after the barrier the push ends with.
+            phases["dequantize"] = _phase(
+                dequantize_gather, quant_blocks, QUANT_THREADS
+            )
     # The order a caller must run them in. Carried with the phases rather than
     # left to each caller to hardcode: the fp8 wire adds two, and a caller that
     # kept its own ("scatter", "reduce", "gather") list would silently skip them
     # and all-reduce into zeros.
-    tail = (
-        ("reduce", "quantize", "gather", "dequantize")
-        if cfg.fp8_gather
-        else ("reduce", "gather")
-    )
+    if cfg.fp8_gather:
+        # Folding the narrowing into the reduce replaces two phases with one.
+        # `fuse_quantize=False` keeps them split, which is how the two are
+        # compared.
+        head = ("reduce_quant",) if fuse_quantize else ("reduce", "quantize")
+        tail = head + (
+            ("gather_barrier", "pull") if cfg.lsa_gather else ("gather", "dequantize")
+        )
+    else:
+        tail = ("reduce", "gather")
     phases["order"] = ("scatter",) + tail
     #: The same sequence for the fused GEMM, which issued the scatter's puts from
     #: its own epilogue and only has to drain them.

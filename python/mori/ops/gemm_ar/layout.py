@@ -151,6 +151,15 @@ class ArConfig:
     #: below. ``ArConfig(comm_dtype=...)`` sets both at once.
     scatter_dtype: str = "bf16"
     gather_dtype: str = "bf16"
+    #: Who moves the gather leg's bytes, when it is fp8.
+    #:
+    #: ``"sdma"`` pushes with the copy engines and then dequantises in a second
+    #: kernel -- a copy engine has no ALU, so the two cannot be one step.
+    #: ``"lsa"`` instead *pulls* each peer's slice over xGMI into registers and
+    #: dequantises on the way to memory, which is one kernel and saves reading
+    #: the landed fp8 back out of local HBM. It costs CU time during the
+    #: transfer, where SDMA costs none.
+    gather_transport: str = "sdma"
     #: N-tile the scatter leg's scales are taken over. Must match the fused
     #: GEMM's ``BLOCK_N``: a block owns ``BLOCK_M x BLOCK_N`` of C, so this is
     #: the widest span of a row it can take an amax over.
@@ -199,6 +208,11 @@ class ArConfig:
     @property
     def fp8_gather(self) -> bool:
         return self.gather_dtype == "fp8"
+
+    @property
+    def lsa_gather(self) -> bool:
+        """fp8 gather moved by CU pull rather than by the copy engines."""
+        return self.fp8_gather and self.gather_transport == "lsa"
 
     @property
     def fp8_wire(self) -> bool:
