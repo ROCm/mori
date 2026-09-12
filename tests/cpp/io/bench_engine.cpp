@@ -74,6 +74,7 @@
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <memory>
 #include <msgpack.hpp>
 #include <optional>
 #include <stdexcept>
@@ -401,8 +402,8 @@ struct Args {
   size_t sweep_start = 8;       // --sweep-start-size (Python default 8)
   size_t sweep_max = 1u << 20;  // --sweep-max-size (Python default 2^20)
   size_t sweep_step = 0;        // --sweep-step (0 = geometric x2; >0 = linear +step)
-  int iters = 500;
-  int warmup = 50;  // --warmup-iters
+  int iters = 128;              // Python default
+  int warmup = 50;              // --warmup-iters (no Python equivalent; nixl --warmup_iter)
 
   // RdmaBackendConfig knobs
   int qp_per_transfer = 4;               // --num-qp-per-transfer
@@ -421,14 +422,18 @@ struct Args {
   int num_events = 64;   // --num-events
 
   // batch / session
-  int batch = 1;                      // --transfer-batch-size (transfers per request)
-  bool enable_batch_transfer = true;  // --enable-batch-transfer / --disable-batch-transfer.
-                                      // ON (default): batch>1 => ONE N-descriptor batch request
-                                      // (nixl-equivalent). OFF: batch>1 => N individual single
-                                      // transfers per iteration (Python run_single_once path).
-  bool batch_contiguous = false;      // --batch-contiguous (adjacent offsets → merged WR);
-                                      // default strided (each transfer a separate WR)
-  bool enable_sess = false;           // --enable-sess (session fast-path); Python default: off
+  int batch = 256;                     // --transfer-batch-size (Python default)
+  bool enable_batch_transfer = false;  // --enable-batch-transfer / --disable-batch-transfer.
+                                       // ON: batch>1 => ONE N-descriptor batch request
+                                       // (nixl-equivalent). OFF (default, as in Python): batch>1
+                                       // => N individual single transfers per iteration
+                                       // (Python run_single_once path).
+  bool batch_contiguous = false;       // --batch-contiguous (adjacent offsets → merged WR);
+                                       // default strided (each transfer a separate WR)
+  bool enable_sess = false;            // --enable-sess (session fast-path); Python default: off
+  bool prepare_once = false;           // --prepare-once: build the batch's work requests once and
+                                       // re-post them every iteration, so only the post is timed
+                                       // (nixl's createXferReq / postXferReq split)
 
   std::string mem_type = "gpu";  // --mem-type gpu|cpu
   std::string init_mem_type;     // --initiator-mem-type (empty => mem_type)
@@ -462,14 +467,20 @@ void PrintUsage(const char* argv0) {
       "  --op <write|read>        transfer direction (default: write)\n"
       "  --backend <rdma|xgmi|fabric>  (default: rdma; fabric = UALink scale-up vPOD)\n"
       "  --buffer-size N          message size in bytes when not sweeping (default: 32768)\n"
-      "  --transfer-batch-size N  transfers per iteration (default: 1)\n"
-      "  --enable-batch-transfer  one N-descriptor batch request per iteration (default)\n"
-      "  --disable-batch-transfer N individual transfers per iteration instead\n"
+      "  --transfer-batch-size N  transfers per iteration (default: 256)\n"
+      "  --enable-batch-transfer  one N-descriptor batch request per iteration\n"
+      "  --disable-batch-transfer N individual transfers per iteration instead (default)\n"
       "  --batch-contiguous       adjacent slot offsets (default: strided by msg+1)\n"
-      "  --iters N                timed iterations (default: 500)\n"
+      "  --iters N                timed iterations (default: 128)\n"
       "  --warmup-iters N         untimed warmup iterations (default: 50)\n"
       "  --enable-sess            use the session fast path (default: off)\n"
       "  --disable-sess           call the engine APIs directly\n"
+      "  --prepare-once           build the work requests once per sweep point and re-post\n"
+      "                           them, so the sort/merge/chunk cost leaves the timed loop\n"
+      "                           (nixl createXferReq/postXferReq). Needs --backend rdma with\n"
+      "                           --enable-sess. Works with --enable-batch-transfer (one\n"
+      "                           prepared batch) or --disable-batch-transfer (curBatch\n"
+      "                           prepared single transfers)\n"
       "\n"
       "Sweeps (default: a single point at --buffer-size):\n"
       "  --all                    sweep message size --sweep-start..--sweep-max\n"
@@ -613,6 +624,8 @@ Args ParseArgs(int argc, char** argv) {
       a.enable_sess = true;
     else if (k == "--disable-sess")
       a.enable_sess = false;
+    else if (k == "--prepare-once")
+      a.prepare_once = true;
     else if (k == "--mem-type")
       a.mem_type = next();
     else if (k == "--initiator-mem-type")
@@ -662,6 +675,14 @@ void ValidateArgs(Args& a) {
       if (m == "cpu") throw std::invalid_argument("--backend fabric supports GPU memory only");
     }
   }
+  // XGMI is likewise GPU-only: XgmiBackend::CanHandle rejects any descriptor whose
+  // location is not GPU, so a host-memory run got as far as session creation and
+  // then failed with a bare "CreateSession failed". Reject it here instead.
+  if (a.backend == "xgmi") {
+    for (const std::string& m : {a.mem_type, a.init_mem_type, a.target_mem_type}) {
+      if (m == "cpu") throw std::invalid_argument("--backend xgmi supports GPU memory only");
+    }
+  }
   if (a.num_initiator_dev < 1 || a.num_target_dev < 1) {
     throw std::invalid_argument("--num-initiator-dev / --num-target-dev must be >= 1");
   }
@@ -672,6 +693,20 @@ void ValidateArgs(Args& a) {
     throw std::invalid_argument("--num-initiator-dev must equal --num-target-dev (got " +
                                 std::to_string(a.num_initiator_dev) + " vs " +
                                 std::to_string(a.num_target_dev) + ")");
+  }
+  // Preconditions: the handle is owned by a session, and RDMA is the only
+  // backend that builds one. --enable-batch-transfer is NOT required: with it
+  // on we prepare one N-descriptor handle; with it off (the singles path) we
+  // prepare curBatch single-descriptor handles and post each individually, so
+  // the build cost is hoisted out of the timed loop either way.
+  if (a.prepare_once) {
+    if (a.backend != "rdma") {
+      throw std::invalid_argument("--prepare-once requires --backend rdma (got " + a.backend + ")");
+    }
+    if (!a.enable_sess) {
+      throw std::invalid_argument(
+          "--prepare-once requires --enable-sess (prepared handles live on a session)");
+    }
   }
   if (a.xgmi_single_process && a.xgmi_multiprocess) {
     throw std::invalid_argument("--xgmi-single-process and --xgmi-multiprocess are exclusive");
@@ -845,10 +880,46 @@ std::vector<SweepResult> RunSweep(const Args& a, IOEngine& engine, const MemoryD
     TransferStatusPtrVec statusPtrs{&st[0]};
     TransferUniqueIdVec batchIds(1);
 
+    // --prepare-once: build this point's work requests ONCE here, then re-post the
+    // same handle(s) for every warmup and timed iteration below. The descriptors are
+    // fixed at prepare time, so the timed loop pays only the post -- the same split
+    // nixl reports as createXferReq vs postXferReq.
+    //   batched  -> one N-descriptor handle, posted once per iteration.
+    //   singles  -> curBatch single-descriptor handles (offset i*msg, matching the
+    //               non-prepared singles path), each posted individually so the loop
+    //               still issues curBatch separate requests -- only the build is hoisted.
+    std::vector<std::shared_ptr<PreparedTransfer>> prepared;
+    if (a.prepare_once) {
+      if (batched) {
+        auto p = sessPtr->PrepareBatch(offsets, offsets, sizes, isRead);
+        if (!p) {
+          throw std::runtime_error("PrepareBatch failed: backend has no prepared-transfer support");
+        }
+        prepared.push_back(std::move(p));
+      } else {
+        prepared.reserve(curBatch);
+        for (int i = 0; i < curBatch; ++i) {
+          const size_t off = static_cast<size_t>(i) * msg;
+          auto p = sessPtr->PrepareBatch(SizeVec{off}, SizeVec{off}, SizeVec{msg}, isRead);
+          if (!p) {
+            throw std::runtime_error(
+                "PrepareBatch failed: backend has no prepared-transfer support");
+          }
+          prepared.push_back(std::move(p));
+        }
+      }
+    }
+
     auto post = [&]() {
       TransferStatus* base = &st[0];
       for (int i = 0; i < perSlot; ++i) base[i].SetCode(StatusCode::INIT);
-      if (batched) {
+      if (a.prepare_once) {
+        // Re-post the prepared handle(s): one for batched, curBatch for singles.
+        // Each gets a fresh id and its own status slot, mirroring the non-prepared
+        // paths so reqDone()/reqFailed() see the same perSlot statuses.
+        for (int i = 0; i < perSlot; ++i)
+          sessPtr->PostPrepared(prepared[i], &base[i], sessPtr->AllocateTransferUniqueId());
+      } else if (batched) {
         // ONE N-descriptor batch request (nixl / Python --enable-batch-transfer).
         TransferUniqueId id =
             useSess ? sessPtr->AllocateTransferUniqueId() : engine.AllocateTransferUniqueId();

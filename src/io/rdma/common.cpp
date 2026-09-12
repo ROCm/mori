@@ -1096,5 +1096,445 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
                             callbackMeta, id, isRead, postBatchSize, 0, 1, false);
 }
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                                       Prepared Transfers                                       */
+/* ---------------------------------------------------------------------------------------------- */
+// Self-contained build/post implementation for the opt-in prepared path. Nothing here
+// is shared with RdmaBatchReadWrite above: that function keeps its own build+post body
+// and its thread-local scratch pools, so normal Read/Write/BatchReadWrite calls take on
+// no extra work from this path existing. The duplication is deliberate.
+
+static void ResetPreparedWorkRequestPointers(PreparedWorkRequest* wr) {
+  if (wr == nullptr) return;
+  wr->wr.sg_list = wr->sges.empty() ? nullptr : wr->sges.data();
+  wr->wr.num_sge = static_cast<int>(wr->sges.size());
+}
+
+static void InitPreparedSingleSgeWr(PreparedWorkRequest& w, ibv_wr_opcode op, uint64_t remoteAddr,
+                                    uint64_t localAddr, uint32_t len, uint32_t sgeCap) {
+  w.sges.clear();
+  if (w.sges.capacity() < sgeCap) w.sges.reserve(sgeCap);
+  w.sges.push_back(ibv_sge{.addr = localAddr, .length = len, .lkey = 0});
+  w.totalRemoteLength = len;
+  w.mergedRequests = 1;
+  w.wr = ibv_send_wr{};
+  w.wr.opcode = op;
+  w.wr.send_flags = 0;
+  w.wr.wr.rdma.remote_addr = remoteAddr;
+  w.wr.wr.rdma.rkey = 0;
+  ResetPreparedWorkRequestPointers(&w);
+}
+
+RdmaOpRet BuildPreparedRdmaBatch(const EpPairVec& eps,
+                                 const application::RdmaMemoryRegion& baseLocalMr,
+                                 const application::RdmaMemoryRegion& baseRemoteMr,
+                                 const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                                 const SizeVec& sizes, bool isRead,
+                                 const RdmaTransferControl& control, int postBatchSize,
+                                 PreparedRdmaBatch& out) {
+  MORI_IO_FUNCTION_TIMER;
+
+  out.wrs.clear();
+  out.valid = false;
+
+  if ((localOffsets.size() != remoteOffsets.size()) || (sizes.size() != remoteOffsets.size())) {
+    return {StatusCode::ERR_INVALID_ARGS,
+            "lengths of local offsets, remote offsets or sizes mismatch"};
+  }
+  if (eps.empty()) {
+    return {StatusCode::ERR_INVALID_ARGS, "no endpoints"};
+  }
+  if (control.maxChunks <= 0) {
+    return {StatusCode::ERR_INVALID_ARGS, "maxChunks must be >= 1"};
+  }
+
+  const size_t batchSize = sizes.size();
+  out.batchSize = batchSize;
+  out.control = control;
+  out.postBatchSize = postBatchSize;
+  out.isRead = isRead;
+
+  if (batchSize == 0) {
+    out.valid = true;
+    return {StatusCode::SUCCESS, ""};
+  }
+
+  for (size_t i = 0; i < batchSize; i++) {
+    if (sizes[i] > std::numeric_limits<uint32_t>::max()) {
+      return {StatusCode::ERR_INVALID_ARGS, "single request size " + std::to_string(sizes[i]) +
+                                                " exceeds UINT32_MAX; split it before submitting"};
+    }
+    if (((localOffsets[i] + sizes[i]) > baseLocalMr.length) ||
+        ((remoteOffsets[i] + sizes[i]) > baseRemoteMr.length)) {
+      return {StatusCode::ERR_INVALID_ARGS, "length out of range"};
+    }
+  }
+
+  const uint64_t localBaseAddr = reinterpret_cast<uint64_t>(baseLocalMr.addr);
+  const uint64_t remoteBaseAddr = reinterpret_cast<uint64_t>(baseRemoteMr.addr);
+  // We assume all endpoints have the same maxSge.
+  const uint32_t maxSge = std::max(eps[0].local.handle.maxSge, 1u);
+  const ibv_wr_opcode opcode = isRead ? IBV_WR_RDMA_READ : IBV_WR_RDMA_WRITE;
+  uint64_t localMaxMessageSize = std::numeric_limits<uint64_t>::max();
+  for (size_t epId = 0; epId < eps.size(); ++epId) {
+    const uint64_t epMaxMessageSize = eps[epId].local.maxMsgSize;
+    if (epMaxMessageSize == 0) {
+      return {StatusCode::ERR_BAD_STATE,
+              "RDMA endpoint local max_msg_sz is unavailable for ep " + std::to_string(epId)};
+    }
+    localMaxMessageSize = std::min(localMaxMessageSize, epMaxMessageSize);
+  }
+  auto exceedsLocalMaxMessageSize = [&](const PreparedWorkRequest& wr) {
+    return static_cast<uint64_t>(wr.totalRemoteLength) > localMaxMessageSize;
+  };
+  auto hasOversizedSge = [&](const PreparedWorkRequest& wr) {
+    if (control.chunkBytes == 0) return false;
+    for (const ibv_sge& sge : wr.sges) {
+      if (sge.length > control.chunkBytes) return true;
+    }
+    return false;
+  };
+
+  std::vector<size_t> indices(batchSize);
+  std::iota(indices.begin(), indices.end(), 0);
+  if (!control.disableMerge && !std::is_sorted(remoteOffsets.begin(), remoteOffsets.end())) {
+    std::sort(indices.begin(), indices.end(),
+              [&](size_t a, size_t b) { return remoteOffsets[a] < remoteOffsets[b]; });
+  }
+
+  std::vector<PreparedWorkRequest> merged;
+  merged.reserve(batchSize);
+  for (size_t i = 0; i < batchSize; ++i) {
+    const size_t idx = indices[i];
+    const uint64_t currentLocalAddr = localBaseAddr + localOffsets[idx];
+    const uint64_t currentRemoteAddr = remoteBaseAddr + remoteOffsets[idx];
+    const uint32_t currentSize32 = static_cast<uint32_t>(sizes[idx]);
+
+    bool didMerge = false;
+    if (!control.disableMerge && !merged.empty()) {
+      PreparedWorkRequest& lastWr = merged.back();
+      const uint64_t expectedRemoteAddr = lastWr.wr.wr.rdma.remote_addr + lastWr.totalRemoteLength;
+      if (expectedRemoteAddr == currentRemoteAddr) {
+        ibv_sge& lastSge = lastWr.sges.back();
+        const bool localContiguous = (lastSge.addr + lastSge.length) == currentLocalAddr;
+
+        if (localContiguous) {
+          const uint64_t newLen = static_cast<uint64_t>(lastSge.length) + currentSize32;
+          if (newLen <= std::numeric_limits<uint32_t>::max()) {
+            lastSge.length = static_cast<uint32_t>(newLen);
+            lastWr.mergedRequests += 1;
+            lastWr.totalRemoteLength += currentSize32;
+            didMerge = true;
+          }
+        }
+        if (!didMerge && lastWr.sges.size() < maxSge) {
+          lastWr.sges.push_back(
+              ibv_sge{.addr = currentLocalAddr, .length = currentSize32, .lkey = 0});
+          ResetPreparedWorkRequestPointers(&lastWr);
+          lastWr.mergedRequests += 1;
+          lastWr.totalRemoteLength += currentSize32;
+          didMerge = true;
+        }
+      }
+    }
+    if (!didMerge) {
+      merged.emplace_back();
+      InitPreparedSingleSgeWr(merged.back(), opcode, currentRemoteAddr, currentLocalAddr,
+                              currentSize32, maxSge);
+    }
+  }
+
+  const bool canExpandChunks = control.creditByWrCount && control.chunkBytes > 0;
+  if (!canExpandChunks) {
+    for (size_t k = 0; k < merged.size(); ++k) {
+      if (!exceedsLocalMaxMessageSize(merged[k])) continue;
+      return {StatusCode::ERR_INVALID_ARGS,
+              "merged RDMA WR " + std::to_string(k) + " length " +
+                  std::to_string(merged[k].totalRemoteLength) + " exceeds local max_msg_sz " +
+                  std::to_string(localMaxMessageSize) +
+                  "; enable RDMA transfer chunking or reduce batch size"};
+    }
+  }
+
+  bool useChunked = false;
+  if (canExpandChunks) {
+    for (const PreparedWorkRequest& wr : merged) {
+      if (hasOversizedSge(wr) || exceedsLocalMaxMessageSize(wr)) {
+        useChunked = true;
+        break;
+      }
+    }
+  }
+
+  if (!useChunked) {
+    out.wrs = std::move(merged);
+  } else {
+    std::vector<PreparedWorkRequest> chunked;
+    std::vector<ChunkedSgeSegment> chunkPlan;
+    chunked.reserve(merged.size());
+    for (PreparedWorkRequest& wr : merged) {
+      if (!hasOversizedSge(wr) && !exceedsLocalMaxMessageSize(wr)) {
+        // Preserves multi-sge / small WRs untouched when a sibling WR needs splitting.
+        chunked.push_back(std::move(wr));
+        ResetPreparedWorkRequestPointers(&chunked.back());
+        continue;
+      }
+      const uint64_t remoteBase = wr.wr.wr.rdma.remote_addr;
+      PlanSgeStreamChunks(chunkPlan, wr.sges, static_cast<uint64_t>(wr.totalRemoteLength),
+                          control.chunkBytes, control.maxChunks, localMaxMessageSize);
+      if (chunkPlan.empty() && wr.totalRemoteLength != 0) {
+        return {StatusCode::ERR_BAD_STATE, "failed to plan RDMA chunks for non-empty SGE stream"};
+      }
+      for (const ChunkedSgeSegment& segment : chunkPlan) {
+        chunked.emplace_back();
+        InitPreparedSingleSgeWr(chunked.back(), wr.wr.opcode, remoteBase + segment.remoteOffset,
+                                segment.localAddr, segment.length, 1);
+      }
+    }
+    out.wrs = std::move(chunked);
+  }
+
+  if (control.creditByWrCount) {
+    if (out.wrs.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+      return {StatusCode::ERR_INVALID_ARGS, "final WR count exceeds int range"};
+    }
+    for (PreparedWorkRequest& wr : out.wrs) wr.mergedRequests = 1;
+  }
+
+  // The vector is final now, so the sg_list pointers are stable for every post.
+  for (PreparedWorkRequest& wr : out.wrs) ResetPreparedWorkRequestPointers(&wr);
+  out.epWrsSinceSignal.assign(eps.size(), 0);
+  out.epMergedSinceSignal.assign(eps.size(), 0);
+  out.valid = true;
+  return {StatusCode::SUCCESS, ""};
+}
+
+RdmaOpRet PostPreparedRdmaBatch(const EpPairVec& eps,
+                                const std::vector<application::RdmaMemoryRegion>& localMrPerEp,
+                                const std::vector<application::RdmaMemoryRegion>& remoteMrPerEp,
+                                PreparedRdmaBatch& prepared,
+                                std::shared_ptr<CqCallbackMeta> callbackMeta, TransferUniqueId id) {
+  MORI_IO_FUNCTION_TIMER;
+
+  if (!prepared.valid) {
+    return {StatusCode::ERR_INVALID_ARGS, "prepared batch has not been built"};
+  }
+  if (eps.empty()) {
+    return {StatusCode::ERR_INVALID_ARGS, "no endpoints"};
+  }
+  if (localMrPerEp.size() != eps.size() || remoteMrPerEp.size() != eps.size()) {
+    return {StatusCode::ERR_INVALID_ARGS, "memory-region vectors must align with endpoints"};
+  }
+
+  std::vector<PreparedWorkRequest>& wrs = prepared.wrs;
+  const size_t wrCount = wrs.size();
+  if (wrCount == 0) {
+    return {StatusCode::SUCCESS, ""};
+  }
+
+  const RdmaTransferControl& control = prepared.control;
+  if (control.creditByWrCount && control.ownsTotalBatchSize) {
+    callbackMeta->totalBatchSize = static_cast<int>(wrCount);
+  }
+
+  const size_t epNum = eps.size();
+  const size_t epBatchSize = (wrCount + epNum - 1) / epNum;
+
+  // Resolved per post rather than stored, so a prepared batch stays valid if the
+  // endpoints' SQ limits change between posts.
+  int postBatchSize = prepared.postBatchSize;
+  if (postBatchSize == -1) {
+    postBatchSize = (epBatchSize > static_cast<size_t>(std::numeric_limits<int>::max()))
+                        ? std::numeric_limits<int>::max()
+                        : static_cast<int>(epBatchSize);
+  }
+  {
+    int minMaxSqDepth = std::numeric_limits<int>::max();
+    for (size_t epId = 0; epId < epNum; ++epId) {
+      if (eps[epId].sqDepth && eps[epId].maxSqDepth > 0) {
+        minMaxSqDepth = std::min(minMaxSqDepth, eps[epId].maxSqDepth);
+      }
+    }
+    if (minMaxSqDepth != std::numeric_limits<int>::max() && postBatchSize > minMaxSqDepth)
+      postBatchSize = minMaxSqDepth;
+  }
+  if (postBatchSize <= 0) postBatchSize = 1;
+  const int numPostBatch = static_cast<int>((wrCount + postBatchSize - 1) / postBatchSize);
+
+  std::vector<int>& epWrsSinceSignal = prepared.epWrsSinceSignal;
+  std::vector<size_t>& epMergedSinceSignal = prepared.epMergedSinceSignal;
+  epWrsSinceSignal.assign(epNum, 0);
+  epMergedSinceSignal.assign(epNum, 0);
+
+  // Rotate the starting EP by transfer id so single-WR transfers spread evenly
+  // across QPs instead of always landing on eps[0].
+  const int epStartOffset = static_cast<int>(id % static_cast<uint64_t>(epNum));
+  for (int i = 0; i < numPostBatch; i++) {
+    const int st = i * postBatchSize;
+    const int end = static_cast<int>(std::min(static_cast<size_t>(st) + postBatchSize, wrCount));
+    if (end - st == 0) break;
+    const int epId = (i + epStartOffset) % static_cast<int>(epNum);
+    const int batchWrNum = end - st;
+
+    std::string reserveErr;
+    SqReserveFailureKind reserveFailure = SqReserveFailureKind::None;
+    if (!TryReserveSqDepth(eps[epId], batchWrNum, epId, "prepared", &reserveErr, &reserveFailure)) {
+      AppendHint(&reserveErr, BuildSqDepthHint(eps[epId], epNum, postBatchSize,
+                                               PostSendOpKind::BatchData, reserveFailure));
+      // Earlier post batches in this transfer may have been posted unsignaled on
+      // one or more EPs, each holding an SQ-depth reservation that only a signaled
+      // ledger tail would release. This batch never posts, so those reservations
+      // have no tail to free them -- orphan the pending WRs (as the ibv_post_send
+      // failure path does below) or the EPs leak SQ depth and eventually SQ-full.
+      for (size_t leakEp = 0; leakEp < epNum; ++leakEp) {
+        if (epWrsSinceSignal[leakEp] <= 0) continue;
+        MORI_IO_WARN(
+            "prepared SQ reservation failed on ep {}: moving pending unsignaled WRs on ep {} "
+            "(wrCount={}, mergedReq={}) to orphaned and marking degraded",
+            epId, leakEp, epWrsSinceSignal[leakEp], epMergedSinceSignal[leakEp]);
+        if (eps[leakEp].ledger) {
+          eps[leakEp].ledger->InsertOrphaned(epWrsSinceSignal[leakEp], callbackMeta,
+                                             static_cast<int>(epMergedSinceSignal[leakEp]));
+        } else {
+          MORI_IO_WARN(
+              "EP {} has pending unsignaled WRs but no submission ledger; "
+              "sqDepth may remain stale until endpoint restart",
+              leakEp);
+        }
+        if (eps[leakEp].degraded) {
+          eps[leakEp].degraded->store(true, kSqAdmissionOrder);
+        }
+        NotifySqStateChanged(eps[leakEp]);
+      }
+      return {StatusCode::ERR_RDMA_OP, reserveErr};
+    }
+
+    const auto& localMr = localMrPerEp[epId];
+    const auto& remoteMr = remoteMrPerEp[epId];
+    size_t mergedReqSize = 0;
+    for (int j = st; j < end; j++) {
+      PreparedWorkRequest& preparedWr = wrs[j];
+      for (auto& sge : preparedWr.sges) sge.lkey = localMr.lkey;
+      preparedWr.wr.wr.rdma.rkey = remoteMr.rkey;
+      ResetPreparedWorkRequestPointers(&preparedWr);
+
+      struct ibv_send_wr& wr = preparedWr.wr;
+      wr.wr_id = 0;
+      // Clear any signaling left by an earlier post: only this post's chain tail
+      // may carry IBV_SEND_SIGNALED.
+      wr.send_flags = 0;
+      wr.next = (j + 1 < end) ? &wrs[j + 1].wr : nullptr;
+      mergedReqSize += preparedWr.mergedRequests;
+    }
+
+    epWrsSinceSignal[epId] += batchWrNum;
+    epMergedSinceSignal[epId] += mergedReqSize;
+
+    bool isLastBatchForEp = ((i + epNum) >= static_cast<size_t>(numPostBatch));
+    bool sqNearFull = eps[epId].sqDepth && (epWrsSinceSignal[epId] >= eps[epId].maxSqDepth);
+    bool needSignal = isLastBatchForEp || sqNearFull;
+
+    struct ibv_send_wr& last = wrs[end - 1].wr;
+    uint64_t recordId = 0;
+    if (needSignal) {
+      if (!eps[epId].ledger) {
+        ReleaseSqDepth(eps[epId], batchWrNum);
+        return {StatusCode::ERR_RDMA_OP,
+                "submission ledger is not initialized for signaled WR tracking"};
+      }
+      recordId = eps[epId].ledger->Insert(epWrsSinceSignal[epId], true, callbackMeta,
+                                          static_cast<int>(epMergedSinceSignal[epId]));
+      last.wr_id = recordId;
+      last.send_flags = IBV_SEND_SIGNALED;
+    }
+
+    struct ibv_send_wr* badWr = nullptr;
+    int ret = ibv_post_send(eps[epId].local.ibvHandle.qp, &wrs[st].wr, &badWr);
+    if (ret != 0) {
+      int postedCount = 0;
+      if (badWr != nullptr) {
+        struct ibv_send_wr* cur = &wrs[st].wr;
+        while (cur != nullptr && cur != badWr && postedCount < batchWrNum) {
+          ++postedCount;
+          cur = cur->next;
+        }
+      }
+      postedCount = std::max(0, std::min(postedCount, batchWrNum));
+      const int unpostedCount = batchWrNum - postedCount;
+      if (unpostedCount > 0) {
+        ReleaseSqDepth(eps[epId], unpostedCount);
+        epWrsSinceSignal[epId] = std::max(0, epWrsSinceSignal[epId] - unpostedCount);
+
+        size_t mergedUnposted = 0;
+        for (int j = st + postedCount; j < end; ++j) {
+          mergedUnposted += wrs[j].mergedRequests;
+        }
+        if (epMergedSinceSignal[epId] >= mergedUnposted) {
+          epMergedSinceSignal[epId] -= mergedUnposted;
+        } else {
+          epMergedSinceSignal[epId] = 0;
+        }
+      }
+
+      const bool lastWasPosted = (postedCount == batchWrNum);
+      if (needSignal && !lastWasPosted) {
+        int dummy = 0;
+        eps[epId].ledger->ReleaseByCqe(recordId, nullptr, &dummy);
+      }
+
+      if (postedCount > 0 && (!needSignal || !lastWasPosted)) {
+        MORI_IO_WARN(
+            "ibv_post_send (prepared) partially posted {} / {} WRs without a posted signaled "
+            "tail; marking EP {} as degraded until recovery",
+            postedCount, batchWrNum, epId);
+        if (eps[epId].ledger) {
+          eps[epId].ledger->InsertOrphaned(epWrsSinceSignal[epId], callbackMeta,
+                                           static_cast<int>(epMergedSinceSignal[epId]));
+        }
+        if (eps[epId].degraded) {
+          eps[epId].degraded->store(true, kSqAdmissionOrder);
+        }
+        NotifySqStateChanged(eps[epId]);
+      }
+
+      for (size_t otherEpId = 0; otherEpId < epNum; ++otherEpId) {
+        if (static_cast<int>(otherEpId) == epId) continue;
+        if (epWrsSinceSignal[otherEpId] <= 0) continue;
+        MORI_IO_WARN(
+            "ibv_post_send (prepared) failed on ep {}: moving pending unsignaled WRs on ep {} "
+            "(wrCount={}, mergedReq={}) to orphaned and marking degraded",
+            epId, otherEpId, epWrsSinceSignal[otherEpId], epMergedSinceSignal[otherEpId]);
+        if (eps[otherEpId].ledger) {
+          eps[otherEpId].ledger->InsertOrphaned(epWrsSinceSignal[otherEpId], callbackMeta,
+                                                static_cast<int>(epMergedSinceSignal[otherEpId]));
+        } else {
+          MORI_IO_WARN(
+              "EP {} has pending unsignaled WRs but no submission ledger; "
+              "sqDepth may remain stale until endpoint restart",
+              otherEpId);
+        }
+        if (eps[otherEpId].degraded) {
+          eps[otherEpId].degraded->store(true, kSqAdmissionOrder);
+        }
+        NotifySqStateChanged(eps[otherEpId]);
+      }
+
+      std::string message = "ibv_post_send (prepared) failed with " + std::to_string(ret) + ": " +
+                            strerror(ret) + " (posted " + std::to_string(postedCount) + "/" +
+                            std::to_string(batchWrNum) + " WRs)";
+      AppendHint(&message, BuildPostSendFailureHint(ret, eps[epId], epNum, postBatchSize, badWr,
+                                                    PostSendOpKind::BatchData));
+      return {StatusCode::ERR_RDMA_OP, std::move(message)};
+    }
+
+    if (needSignal) {
+      epWrsSinceSignal[epId] = 0;
+      epMergedSinceSignal[epId] = 0;
+    }
+    MORI_IO_TRACE("ibv_post_send (prepared) ep index {} batch index range [{}, {})", epId, st, end);
+  }
+  return {StatusCode::IN_PROGRESS, ""};
+}
+
 }  // namespace io
 }  // namespace mori

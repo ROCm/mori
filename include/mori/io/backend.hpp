@@ -22,6 +22,7 @@
 #pragma once
 
 #include <cstddef>
+#include <memory>
 
 #include "mori/io/common.hpp"
 #include "mori/io/enum.hpp"
@@ -115,6 +116,16 @@ inline std::ostream& operator<<(std::ostream& os, const FabricBackendConfig& c) 
 }
 
 /* ---------------------------------------------------------------------------------------------- */
+/*                                        PreparedTransfer                                        */
+/* ---------------------------------------------------------------------------------------------- */
+// Opaque handle for a transfer whose work requests have already been built. Backends
+// derive from this to attach whatever they need to re-post the batch.
+struct PreparedTransfer {
+  PreparedTransfer() = default;
+  virtual ~PreparedTransfer() = default;
+};
+
+/* ---------------------------------------------------------------------------------------------- */
 /*                                         BackendSession                                         */
 /* ---------------------------------------------------------------------------------------------- */
 class BackendSession {
@@ -144,6 +155,20 @@ class BackendSession {
                         const SizeVec& sizes, TransferStatus* status, TransferUniqueId id) {
     BatchReadWrite(localOffsets, remoteOffsets, sizes, status, id, true);
   }
+
+  // Opt-in build-once / post-many API. Backends that do not implement it report the
+  // lack of support instead of silently falling back, so callers can tell the two
+  // apart; BatchReadWrite above is unaffected either way.
+  virtual std::shared_ptr<PreparedTransfer> PrepareBatch(const SizeVec& localOffsets,
+                                                         const SizeVec& remoteOffsets,
+                                                         const SizeVec& sizes, bool isRead) {
+    return nullptr;
+  }
+  virtual void PostPrepared(const std::shared_ptr<PreparedTransfer>& prepared,
+                            TransferStatus* status, TransferUniqueId id) {
+    status->Update(StatusCode::ERR_BAD_STATE, "prepared transfers not supported by this backend");
+  }
+
   virtual bool Alive() const = 0;
 };
 
