@@ -89,6 +89,17 @@ inline std::optional<int> ParsePositiveInt(const char* raw) {
   return static_cast<int>(parsed);
 }
 
+inline std::optional<int> ParseNonNegativeInt(const char* raw) {
+  errno = 0;
+  char* end = nullptr;
+  long parsed = std::strtol(raw, &end, 10);
+  if (end == raw || *end != '\0' || errno != 0 || parsed < 0 ||
+      parsed > std::numeric_limits<int>::max()) {
+    return std::nullopt;
+  }
+  return static_cast<int>(parsed);
+}
+
 inline std::optional<int> ParseInt(const char* raw) {
   errno = 0;
   char* end = nullptr;
