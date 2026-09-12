@@ -15,6 +15,10 @@ for bin in tests/cpp/cco/test_*; do
     # SDMA tests need MORI_ENABLE_SDMA=1 to build queues (else they self-SKIP);
     # run separately in CI with that env set, so skip them in this default sweep.
     test_sdma_put|test_sdma_get|test_sdma_put_mt|test_sdma_block|test_sdma_edge) continue ;;
+    # Takes --n_processes/--n_local_devices/--visible_devices instead of a
+    # bare positional nranks arg, and (like its SDMA siblings above) needs
+    # MORI_ENABLE_SDMA=1 to build queues
+    test_sdma_hip_dev_assign)  continue ;;
   esac
   # GDA-FULL tests need intranode cross-rail RDMA (FULL connections). On runners
   # where cross-rail is unavailable they can't pass; skip when

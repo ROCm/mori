@@ -137,7 +137,12 @@ void runExperiment(int srcDeviceId, int dstDeviceId, const ExperimentParams& par
   // ======================
 
   size_t totalNumQueues = params.numOfQueues;
-  anvil::anvil.connect(srcDeviceId, dstDeviceId, params.numOfQueues);
+  // Resolve KFD node ids once: anvil queues are keyed on node ids, not HIP
+  // device ordinals, so both connect() and getSdmaQueue() below must use
+  // the SAME converted id.
+  int srcNode = anvil::anvil.nodeForHipDevice(srcDeviceId);
+  int dstNode = anvil::anvil.nodeForHipDevice(dstDeviceId);
+  anvil::anvil.connect(srcNode, dstNode, params.numOfQueues);
 
   anvil::SdmaQueueDeviceHandle** deviceHandles_d = nullptr;
   CHECK_HIP_ERROR(
@@ -145,8 +150,7 @@ void runExperiment(int srcDeviceId, int dstDeviceId, const ExperimentParams& par
 
   size_t queueIdx = 0;
   for (size_t q = 0; q < params.numOfQueues; q++) {
-    deviceHandles_d[queueIdx] =
-        anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
+    deviceHandles_d[queueIdx] = anvil::anvil.getSdmaQueue(srcNode, dstNode, q)->deviceHandle();
 
     // if (params.verbose)
     // {
