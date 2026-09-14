@@ -307,21 +307,76 @@ def main():
         else:
             run_d, run_c = capture()
 
+        # Three events per iteration, not four: the middle one ends dispatch and starts
+        # combine. Recording two back to back there left the time the GPU spent on those
+        # two packets out of both legs, so d + c came to less than the pair took.
         ev = [
             [torch.cuda.Event(enable_timing=True) for _ in range(ITERS)]
-            for _ in range(4)
+            for _ in range(3)
         ]
         for i in range(ITERS):
             ev[0][i].record()
             run_d()
             ev[1][i].record()
-            ev[2][i].record()
             run_c()
-            ev[3][i].record()
+            ev[2][i].record()
         torch.cuda.synchronize()
         dist.barrier()
         d = sum(ev[0][i].elapsed_time(ev[1][i]) for i in range(ITERS)) / ITERS * 1000
-        c = sum(ev[2][i].elapsed_time(ev[3][i]) for i in range(ITERS)) / ITERS * 1000
+        c = sum(ev[1][i].elapsed_time(ev[2][i]) for i in range(ITERS)) / ITERS * 1000
+
+        # The same pairs timed again with nothing recorded between them: E2E_R of them captured
+        # into one graph and replayed as a unit, one event pair around the whole replay. Each
+        # pair then carries 1/R of a replay and 2/R of an event instead of two replays and three
+        # events, so d + c minus this is what the per-leg method costs, not what the kernels do.
+        #
+        # It is not small and it is not a property of the kernel. On gfx1250 EP4 at 512 tokens
+        # it is 9.1-9.3 us per pair at bf16, fp8 and fp4 alike, and cutting the dispatch kernel
+        # short until it returns on entry -- fifty times less work -- moves it by under 1 us. It
+        # lands inside every per-leg number printed here, so a reader comparing these against a
+        # bench that amortizes its probes is handing over 9 us for nothing. Before #576 this
+        # file timed ITERS calls under a single event pair and paid none of it; that pass also
+        # kept the legs apart, so alternating pairs and cheap timing were never in conflict.
+        #
+        # The pairs go inside the capture, never into a host loop. Submitting them back to back
+        # from the host deadlocks the full kernel for the reason this function's own docstring
+        # gives: a rank that starts call N+1 before every rank finished N overwrites a barrier
+        # flag its peer has not consumed. Inside a graph the order is fixed.
+        #
+        # That also rules out the obvious way to steady this number. d and c each average ITERS
+        # iterations; e2e is one replay, and across four runs at 512 tokens it read 60.8, 61.0,
+        # 63.0 and 65.0 us -- a 4 us spread under a 9 us signal. Replaying several times inside
+        # the event pair would average it, and would hang for the reason just given. Raising
+        # E2E_R is the safe direction, since one replay then covers more pairs; the default of
+        # 10 matches the v1 bench and has not been swept. Until it is, read this across rounds
+        # and take the middle one, not a single run.
+        e2e = -1.0
+        rep = int(os.environ.get("E2E_R", 10))
+        if mode == "graph" and rep > 0:
+            ge = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(ge):
+                for _ in range(rep):
+                    one_pair()
+            lockstep()
+            for _ in range(WARMUP):
+                ge.replay()
+            lockstep()
+            a = torch.cuda.Event(enable_timing=True)
+            b = torch.cuda.Event(enable_timing=True)
+            a.record()
+            ge.replay()
+            b.record()
+            torch.cuda.synchronize()
+            dist.barrier()
+            e2e = a.elapsed_time(b) / rep * 1000
+        # One rank prints. Four ranks each writing a long line is how torn output gets spliced
+        # into a reading that parses and is wrong.
+        if rank == 0 and e2e > 0:
+            print(
+                f"[E2E] mode={mode} d={d:.2f} c={c:.2f} sum={d + c:.2f} "
+                f"e2e={e2e:.2f} cost={d + c - e2e:.2f} R={rep} iters={ITERS}",
+                flush=True,
+            )
         return d, c, run_d, run_c
 
     def smi_window(label, pair_us, run_d, run_c):
