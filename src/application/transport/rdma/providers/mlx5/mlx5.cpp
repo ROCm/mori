@@ -137,13 +137,13 @@ mlx5dv_devx_umem* Mlx5RegisterControlUmem(ibv_context* context, void* addr, size
               reinterpret_cast<uintptr_t>(addr), size, dmabufOffset);
           return umem;
         }
-        MORI_APP_WARN(
+        MORI_APP_TRACE(
             "MLX5 control umem [{}] dmabuf registration failed (addr=0x{:x}, size={}, errno={} ({}))",
             what, reinterpret_cast<uintptr_t>(addr), size, err, strerror(err));
         unavailable = "dmabuf registration failed";
       } else {
-        MORI_APP_WARN("MLX5 control umem [{}] dmabuf export unavailable (addr=0x{:x}, size={})",
-                      what, reinterpret_cast<uintptr_t>(addr), size);
+        MORI_APP_TRACE("MLX5 control umem [{}] dmabuf export unavailable (addr=0x{:x}, size={})",
+                       what, reinterpret_cast<uintptr_t>(addr), size);
         unavailable = "dmabuf export unavailable";
       }
     }
@@ -191,11 +191,11 @@ ibv_mr* Mlx5RegisterMrDmabuf(ibv_pd* pd, void* addr, size_t size, int accessFlag
                        reinterpret_cast<uintptr_t>(addr), size, dmabufOffset);
         return mr;
       }
-      MORI_APP_WARN("MLX5 MR [{}] dmabuf registration failed (addr=0x{:x}, size={})", what,
-                    reinterpret_cast<uintptr_t>(addr), size);
+      MORI_APP_TRACE("MLX5 MR [{}] dmabuf registration failed (addr=0x{:x}, size={})", what,
+                     reinterpret_cast<uintptr_t>(addr), size);
     } else {
-      MORI_APP_WARN("MLX5 MR [{}] dmabuf export unavailable (addr=0x{:x}, size={})", what,
-                    reinterpret_cast<uintptr_t>(addr), size);
+      MORI_APP_TRACE("MLX5 MR [{}] dmabuf export unavailable (addr=0x{:x}, size={})", what,
+                     reinterpret_cast<uintptr_t>(addr), size);
     }
     if (mode == ControlDmabufMode::kForce) {
       MORI_APP_ERROR(
