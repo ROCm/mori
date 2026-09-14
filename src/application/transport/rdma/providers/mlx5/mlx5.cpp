@@ -121,7 +121,9 @@ mlx5dv_devx_umem* Mlx5RegisterControlUmem(ibv_context* context, void* addr, size
         in.addr = reinterpret_cast<void*>(dmabufOffset);  // dmabuf-relative byte offset
         in.size = size;
         in.access = accessFlag;
-        in.pgsz_bitmap = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
+        // Bitmap of allowed log2 page sizes (not a page size); mirror rdma-core's
+        // peermem path (all sizes >= 4K). sysconf() sets one bit and breaks 64K hosts.
+        in.pgsz_bitmap = ~((1ULL << MLX5_ADAPTER_PAGE_SHIFT) - 1);
         in.comp_mask = MORI_MLX5DV_UMEM_MASK_DMABUF;
         in.dmabuf_fd = dmabufFd;
         mlx5dv_devx_umem* umem = Mlx5DvApi::Instance().devx_umem_reg_ex(context, &in);
