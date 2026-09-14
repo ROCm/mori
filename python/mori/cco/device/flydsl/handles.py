@@ -125,8 +125,12 @@ class Window:
         common case here, where the peer and the offset are both Python ints,
         it collapses to a single add against a value already in a register.
 
-        Costs one extra call here (peer=1, offset=0 is exactly
-        ``base + stride``) to remove one from every use site. Returns
+        The two reads go through ``cco_lsa_win_base`` / ``cco_lsa_stride``,
+        which take an ``address_space(1)`` pointer so each is a single
+        ``global_load``. ``cco_lsa_ptr`` casts to a *generic* pointer, and a
+        generic access has to be a ``flat_load`` -- the compiler cannot rule out
+        LDS -- so it is counted against ``lgkmcnt`` as well as ``vmcnt``, and any
+        following ``s_waitcnt`` has one more counter to wait on. Returns
         ``(base, stride)`` for :meth:`lsa_ptr_at`.
 
         **It does not measure on mori's own kernels, and that is expected.**
@@ -142,8 +146,8 @@ class Window:
         the call count is large or per-iteration; do not expect it to show up
         otherwise.
         """
-        base = fx.Int64(raw.cco_lsa_ptr(self.handle, 0, 0))
-        stride = fx.Int64(raw.cco_lsa_ptr(self.handle, 1, 0)) - base
+        base = fx.Int64(raw.cco_lsa_win_base(self.handle))
+        stride = fx.Int64(raw.cco_lsa_stride(self.handle))
         return base, stride
 
     @staticmethod

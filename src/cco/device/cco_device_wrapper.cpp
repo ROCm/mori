@@ -102,6 +102,31 @@ CCO_DEV uint64_t cco_lsa_ptr(uint64_t window, int peer, uint64_t offset) {
   return reinterpret_cast<uint64_t>(w->winBase) + static_cast<uint64_t>(peer) * stride + offset;
 }
 
+// ── LSA window geometry ───────────────────────────────────────────────────────
+// `cco_lsa_ptr` above loads winBase and stride4G on *every* call. A kernel that
+// needs many addresses from one window can take the geometry once with these two
+// and compute `base + peer*stride + offset` itself.
+//
+// The pointer is explicitly address_space(1). `AsWindow` casts a uint64 to a
+// *generic* pointer, and a generic access must be a flat_load: the compiler
+// cannot prove the target is not LDS, so it counts against lgkmcnt as well as
+// vmcnt. Naming the address space lets it emit global_load, which is vmcnt-only
+// -- one fewer counter for any following s_waitcnt to wait on.
+typedef const ccoWindowDevice __attribute__((address_space(1))) * ccoWindowGlobalPtr;
+
+__device__ __attribute__((always_inline)) inline ccoWindowGlobalPtr AsWindowGlobal(uint64_t h) {
+  return reinterpret_cast<ccoWindowGlobalPtr>(h);
+}
+
+CCO_DEV uint64_t cco_lsa_win_base(uint64_t window) {
+  return reinterpret_cast<uint64_t>(AsWindowGlobal(window)->winBase);
+}
+
+// Returns the *byte* stride between peers, i.e. stride4G already shifted.
+CCO_DEV uint64_t cco_lsa_stride(uint64_t window) {
+  return static_cast<uint64_t>(AsWindowGlobal(window)->stride4G) << 32;
+}
+
 // System-scope publication fence used by direct LSA benchmark/store paths.
 // Latency kernels fence from block lane 0; bandwidth kernels fence every lane.
 // This primitive is NOT a barrier: callers must synchronize participating
