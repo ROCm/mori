@@ -393,10 +393,12 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   attr = {};
   attr.qp_state = IBV_QPS_RTS;
   attr.sq_psn = 0;
-  attr.timeout = 14;
-  attr.retry_cnt = 7;
-  attr.rnr_retry = 7;
+  attr.timeout = ReadIoQpTimeoutEnv().value_or(14);
+  attr.retry_cnt = ReadIoQpRetryCntEnv().value_or(7);
+  attr.rnr_retry = ReadIoQpRnrRetryEnv().value_or(7);
   attr.max_rd_atomic = devAttr->orig_attr.max_qp_init_rd_atom;
+  MORI_APP_INFO("ibverbs attr.timeout:{} attr.retry_cnt:{} attr.rnr_retry:{}", attr.timeout,
+                attr.retry_cnt, attr.rnr_retry);
   flags = IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
           IBV_QP_MAX_QP_RD_ATOMIC;
   ModifyOrThrow("RTS", attr, flags);

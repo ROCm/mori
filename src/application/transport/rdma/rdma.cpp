@@ -333,6 +333,45 @@ bool ReadIoTrafficClassDisableEnv() {
   return disable.has_value() && disable.value() == 1;
 }
 
+// The RC retry attributes occupy narrow fields in the QP context, so a value
+// that parses as a uint8_t can still be rejected by ibv_modify_qp. Bound each
+// one here and keep the built-in default when the override is out of range.
+static std::optional<uint8_t> ReadQpRetryAttrEnv(const char* name, uint8_t maxValue) {
+  const char* raw = std::getenv(name);
+  if (!raw) {
+    return std::nullopt;
+  }
+
+  std::optional<uint8_t> value = ReadUint8FromEnvVar(name);
+  if (!value.has_value() || value.value() > maxValue) {
+    MORI_APP_WARN("Ignore invalid {}={} (allowed: 0-{})", name, raw, maxValue);
+    return std::nullopt;
+  }
+  return value;
+}
+
+// Local ACK timeout exponent: the responder gets 4.096us * 2^timeout to ack
+// before the requester retransmits. 0 disables the timeout entirely, which
+// turns a silent peer into an unbounded stall instead of a completion error.
+std::optional<uint8_t> ReadIoQpTimeoutEnv() {
+  std::optional<uint8_t> timeout = ReadQpRetryAttrEnv("MORI_IO_QP_TIMEOUT", 31);
+  if (timeout.has_value() && timeout.value() == 0) {
+    MORI_APP_WARN(
+        "MORI_IO_QP_TIMEOUT=0 disables the local ACK timeout; an unresponsive peer will stall "
+        "transfers indefinitely instead of failing with IBV_WC_RETRY_EXC_ERR");
+  }
+  return timeout;
+}
+
+std::optional<uint8_t> ReadIoQpRetryCntEnv() {
+  return ReadQpRetryAttrEnv("MORI_IO_QP_RETRY_CNT", 7);
+}
+
+// 7 means retry RNR NAKs forever, which is the ibverbs default this path uses.
+std::optional<uint8_t> ReadIoQpRnrRetryEnv() {
+  return ReadQpRetryAttrEnv("MORI_IO_QP_RNR_RETRY", 7);
+}
+
 bool ReadIbEnableRelaxedOrderingEnv() {
   std::optional<uint8_t> enable = ReadUint8FromEnvVar("MORI_IB_ENABLE_RELAXED_ORDERING");
   return enable.has_value() && enable.value() == 1;

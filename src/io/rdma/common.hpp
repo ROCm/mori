@@ -159,7 +159,10 @@ struct CqCallbackMeta {
   CqCallbackMeta(TransferStatus* s, TransferUniqueId id_, int n)
       : status(s), id(id_), totalBatchSize(n) {}
 
-  TransferStatus* status{nullptr};
+  // Claimed with exchange(nullptr) by whoever completes the transfer first, so a
+  // terminal update happens exactly once even though the CQ poller and the async
+  // event monitor can both reach the same meta concurrently.
+  std::atomic<TransferStatus*> status{nullptr};
   TransferUniqueId id{0};
   int totalBatchSize{0};
   std::atomic<uint32_t> finishedBatchSize{0};
@@ -202,11 +205,33 @@ class SubmissionLedger {
 
   bool HasOrphaned() const;
 
+  // Terminal path: fail every record and erase them. Used when the QP or its CQ
+  // has died, so no CQE can ever arrive for the records left behind. Returns the
+  // number of transfers whose status this call moved to a failed state.
+  int FailAll(StatusCode code, const std::string& message, std::atomic<int>* sqDepth);
+
  private:
   mutable std::mutex mu_;
   uint64_t nextId_;
   std::unordered_map<uint64_t, SubmissionRecord> records_;
 };
+
+// A verbs async event that means outstanding work can never complete. Scope says
+// which endpoints are affected: a single QP moved to Error state, or a CQ/device
+// that died and took every endpoint sharing it with it.
+struct QpErrorEvent {
+  enum class Scope : uint8_t { kQueuePair, kCompletionQueue, kDevice };
+
+  Scope scope{Scope::kQueuePair};
+  uint32_t qpNum{0};
+  // CQ handle for kCompletionQueue. Compared by value only: the verbs object may
+  // already be acked and must never be dereferenced here.
+  const void* cq{nullptr};
+  ibv_context* context{nullptr};
+  const char* eventName{""};
+};
+
+using QpErrorHandler = std::function<void(const QpErrorEvent&)>;
 
 inline constexpr std::memory_order kSqAdmissionOrder = std::memory_order_seq_cst;
 

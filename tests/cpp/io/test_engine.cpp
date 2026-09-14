@@ -247,6 +247,40 @@ void CaseSubmissionLedgerBasic() {
   Require(sqDepth2.load(std::memory_order_relaxed) == 5, "sq depth after posted CQE release");
 }
 
+void CaseSubmissionLedgerFailAll() {
+  constexpr uint32_t kNotifPerQp = 16;
+  SubmissionLedger ledger(kNotifPerQp);
+  std::atomic<int> sqDepth{10};
+  TransferStatus statusA;
+  TransferStatus statusB;
+  statusA.SetCode(StatusCode::IN_PROGRESS);
+  statusB.SetCode(StatusCode::IN_PROGRESS);
+
+  // Two records share metaA, mirroring one batch with several signaled sub-batches.
+  auto metaA = std::make_shared<CqCallbackMeta>(&statusA, 301, 4);
+  auto metaB = std::make_shared<CqCallbackMeta>(&statusB, 302, 2);
+  const uint64_t idA1 = ledger.Insert(3, true, metaA, 2);
+  ledger.Insert(2, true, metaA, 2);
+  ledger.InsertOrphaned(1, metaB, 2);
+
+  const int failed = ledger.FailAll(StatusCode::ERR_RDMA_OP, "qp died", &sqDepth);
+  Require(failed == 2, "FailAll should fail each distinct transfer exactly once");
+  Require(statusA.Failed(), "shared-meta transfer should be failed");
+  Require(statusB.Failed(), "orphaned record's transfer should be failed");
+  Require(statusA.Message() == "qp died", "failure message should propagate");
+  // All 6 posted WRs (3 + 2 + 1) released, including the orphaned record's.
+  Require(sqDepth.load(std::memory_order_relaxed) == 4, "unexpected sq depth after FailAll");
+
+  int batchSize = 0;
+  Require(ledger.ReleaseByCqe(idA1, &sqDepth, &batchSize) == nullptr,
+          "FailAll should leave the ledger empty");
+  Require(!ledger.HasOrphaned(), "FailAll should drain orphaned records too");
+
+  // A CQE landing after FailAll must not resurrect the transfer as successful.
+  Require(metaA->status.load() == nullptr, "FailAll should claim the status pointer");
+  Require(statusA.Code() == StatusCode::ERR_RDMA_OP, "status must stay failed");
+}
+
 EpPair MakeSqAdmissionEp(int maxSqDepth, int currentDepth, bool withAdmission = true) {
   EpPair ep{};
   ep.sqDepth = std::make_shared<std::atomic<int>>(currentDepth);
@@ -1809,6 +1843,7 @@ int main(int argc, char* argv[]) {
   SetLogLevel("info");
   std::vector<TestCase> cases = {
       {"submission_ledger_basic", CaseSubmissionLedgerBasic},
+      {"submission_ledger_fail_all", CaseSubmissionLedgerFailAll},
       {"sq_admission_release_wakes_waiter", CaseSqAdmissionReleaseWakesWaiter},
       {"sq_admission_degraded_wakes_waiter", CaseSqAdmissionDegradedWakesWaiter},
       {"sq_admission_negative_depth_reserve_repairs_counter",

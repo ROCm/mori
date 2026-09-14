@@ -198,6 +198,13 @@ std::optional<uint8_t> ReadIoServiceLevelEnv();
 std::optional<uint8_t> ReadIoTrafficClassEnv();
 bool ReadIoTrafficClassDisableEnv();
 
+// RC retry attributes applied at RTS. Each is bounded to the width the QP
+// context allows, so an out-of-range value is ignored rather than failing
+// ibv_modify_qp and taking down connection setup.
+std::optional<uint8_t> ReadIoQpTimeoutEnv();
+std::optional<uint8_t> ReadIoQpRetryCntEnv();
+std::optional<uint8_t> ReadIoQpRnrRetryEnv();
+
 bool ReadIbEnableRelaxedOrderingEnv();
 int MaybeAddRelaxedOrderingFlag(int accessFlag);
 
