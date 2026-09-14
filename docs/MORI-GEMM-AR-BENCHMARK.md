@@ -268,31 +268,44 @@ of a row, so fusing forces one-wave-per-row, where `sdma_reduce` walks packs wit
 a flat grid stride and streams a block through all 8 source slices at once.
 
 **Firing the gather's puts from inside the reduce** (`fuse_reduce_push=True`)
-looked like the safest fusion of the three: the push sends this rank's *own*
-slice, so unlike the pull it has no cross-rank dependency, and SDMA is a copy
-engine so it costs no CU time. It is also exactly the shape of the GEMM's fused
-scatter. It loses anyway, at every band count, against the unfused 1148.0us:
+looked like the safest of the three: the push sends this rank's *own* slice, so
+unlike the pull it has no cross-rank dependency, and SDMA is a copy engine so it
+costs no CU time. It reaches parity and not a win — against 1148.7us unfused:
 
 | bands | 1 | 4 | 8 | 16 | 32 |
 |---|---:|---:|---:|---:|---:|
-| us | 1227.3 | 1380.1 | 1630.3 | 2137.2 | 3026.7 |
+| `publish="writethrough"` | 1162.1 | **1157.2** | 1160.3 | 1190.1 | 1323.5 |
+| `publish="fence"` | 1227.3 | 1380.1 | 1630.3 | 2137.2 | 3026.7 |
 
-Linear, about 61us per band. The cause is neither the traversal nor the puts:
-publishing a range to a copy engine needs a **system-scope release from every
-block that wrote it**, so the bill is 256 blocks x bands fences at ~0.24us each.
-The whole reduce is 42us, so the overlap can never repay it. Isolated by running
-the halves separately at 8 bands: fence but no `vmcnt` drain 1649.8us, drain but
-no fence 1164.5us — the drain is free and the fence is all of it.
+The gap between those rows is the useful result, and it is a lesson about how to
+pay for a release rather than whether to.
 
-Dropping the fence is not the fix it appears to be. Without it the kernel gets to
-1157.9us at 4 bands — still short of 1148.0 — and it is racy: at 32 bands it
-produced relL2 1.8e-2 against the 2.35e-3 floor, differing per rank. The same 32
-bands *with* the fence validate exactly, which rules out an indexing bug and pins
-it on the missing release.
+Handing a range to a copy engine *does* need one: the engine reads over the
+fabric, not through a CU's cache, so `s_waitcnt vmcnt(0)` alone is not enough —
+it only retires the stores as far as this XCD's L2. But the release can be paid
+two ways. Releasing to system scope **after** the stores is L2-writeback work
+charged once per block per band (256 x bands of it, ~61us per band, against a
+reduce that is only 42us in total — unrepayable). Storing with `sc0+sc1` so the
+bytes never stop in L1 or L2 makes the `waitcnt` itself the release, and that is
+**free here**: applying the same store policy to the plain unfused reduce moves
+it 1153.4 -> 1148.7us, i.e. nothing. This output is written once and nothing
+local reads it again before the gather, so holding it in L2 bought nothing.
 
-The contrast with the GEMM's fused scatter is the useful part: there the publish
-is amortised against a 437us transfer hidden behind a compute-bound GEMM; here
-against 42us of bandwidth-saturated reduce. The mechanism only pays when what is
+What remains after that fix is small on both sides and nearly cancels. At
+bands=1 the publish carries the mechanism's cost with none of its benefit —
+1162.1 vs 1148.7, about 13us for the per-band 256-block `wait_barrier`, the
+counter atomic and the elected block's locked puts. Four bands buy back about
+5us of overlap before the sync cost takes over again.
+
+Dropping the release entirely is not an option even though it briefly looks like
+one: with cached stores and no fence the kernel reaches 1157.9us, but at 32 bands
+it produced relL2 1.8e-2 against the 2.35e-3 floor, differing per rank. The same
+32 bands are exact under either correct publish mode, which rules out an indexing
+bug.
+
+The contrast with the GEMM's fused scatter is the transferable part: there the
+publish is amortised against a 437us transfer hidden behind a compute-bound GEMM;
+here against 42us of bandwidth-saturated reduce. The mechanism pays when what is
 hidden is much larger than the cost of publishing it.
 
 **A CK-shaped 4-wave GEMM**, chasing a 22% gap against CK's block-scale kernel

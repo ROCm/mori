@@ -91,6 +91,7 @@ from flydsl._mlir import ir
 
 from ._compat import (
     CM_CACHED,
+    CM_SC0_SC1,
     CM_SC1,
     atomic_add_u32,
     atomic_store_u32,
@@ -221,6 +222,7 @@ def build_sdma_phases(
     recv_uncached: bool = False,
     fuse_quantize: bool = False,
     fuse_reduce_push: bool = False,
+    publish: str = "writethrough",
 ):
     """Compile the phases separately, so the fused GEMM can reuse the tail.
 
@@ -470,6 +472,8 @@ def build_sdma_phases(
     # gather_bands per launch. Counting per pack instead would be ~1.8M atomics.
 
     if fuse_reduce_push:
+        if publish not in ("fence", "writethrough"):
+            raise ValueError(f"publish must be fence or writethrough, got {publish!r}")
         if cfg.fp8_gather:
             raise ValueError(
                 "fuse_reduce_push is for the bf16 gather. The fp8 gather either "
@@ -493,35 +497,54 @@ def build_sdma_phases(
         difference is when the bytes start moving. The following `gather` phase
         becomes drain-only.
 
-        **This loses, and is off by default.** At [16384, 7168] K=2048 on 8
-        ranks, whole fused layer, against the unfused 1148.0us:
+        **Off by default: it reaches parity, not a win.** At [16384, 7168]
+        K=2048 on 8 ranks, whole fused layer, against 1148.7us unfused:
 
-            bands        1       4       8      16      32
-            us      1227.3  1380.1  1630.3  2137.2  3026.7
+            bands              1       4       8      16      32
+            publish=wt    1162.1  1157.2  1160.3  1190.1  1323.5
+            publish=fence 1227.3  1380.1  1630.3  2137.2  3026.7
 
-        Linear in the band count, about 61us each, and losing already at one
-        band. The cause is not the traversal and not the puts: it is that
-        publishing a range to a copy engine needs a *system-scope release from
-        every block that wrote it*, so the cost is 256 blocks x bands fences,
-        around 0.24us apiece. The whole reduce is only 42us, so the overlap can
-        never repay it.
+        The interesting part is the gap between those two rows, because it is
+        not what it first looks like.
 
-        Isolated by running the two halves separately at 8 bands: with the
-        fence but no vmcnt drain, 1649.8us; with the drain but no fence,
-        1164.5us. The drain is free, the fence is all of it.
+        Handing a range to a copy engine needs a release: the engine reads over
+        the fabric, not through a CU's cache, so `s_waitcnt vmcnt(0)` alone is
+        not enough -- that only retires the stores as far as *this XCD's* L2.
+        But there are two ways to pay for it:
 
-        Dropping the fence is not a fix even though it looks like one. Without
-        it the kernel reaches 1157.9us at 4 bands -- still short of 1148.0 --
-        and it is racy: at 32 bands it produced relL2 1.8e-2 against the 2.35e-3
-        floor, differing per rank (4.5e-3, 8.1e-3, 1.6e-2, ...). The same 32
-        bands *with* the fence validate exactly, which is what rules out an
-        indexing bug and pins it on the missing release.
+          publish="fence"        leave the bytes in L2 and release to system
+                                 scope afterwards. That is L2 writeback work
+                                 charged once per block per band -- 256 x bands
+                                 of it, ~61us per band, and the reduce is only
+                                 42us in total, so it can never be repaid.
+          publish="writethrough" store with sc0+sc1 so the bytes never stop in
+                                 L1 or L2, and the waitcnt above *is* the
+                                 release. Same trick as the GEMM's
+                                 _WriteThroughStoreC under fence="writethrough".
+
+        Write-through is free here, measured on its own: applying that store
+        policy to the plain unfused reduce moves it 1153.4 -> 1148.7us, i.e.
+        nothing. This output is written once and nothing local reads it again
+        before the gather, so holding it in L2 was buying nothing.
+
+        What is left after that fix is small on both sides and nearly cancels.
+        At bands=1 the publish happens only after the whole slice is done, so it
+        carries the mechanism's cost with none of its benefit: 1162.1 against
+        1148.7, about 13us for the per-band 256-block `wait_barrier`, the
+        counter atomic and the elected block's locked puts. Going to 4 bands
+        buys back about 5us of overlap and then the sync cost takes over again.
+
+        Dropping the release entirely is not an option even though it briefly
+        looks like one: with cached stores and no fence the kernel reaches
+        1157.9us, but at 32 bands it produced relL2 1.8e-2 against the 2.35e-3
+        floor, differing per rank. The same 32 bands are exact under either
+        correct publish mode, which is what rules out an indexing bug.
 
         Why the GEMM's fused scatter wins where this does not: there the
         publish is amortised against a 437us transfer hidden behind a
-        compute-bound GEMM, and here it is amortised against 42us of
-        bandwidth-saturated reduce. The mechanism is only worth it when what is
-        being hidden is much larger than the cost of publishing it.
+        compute-bound GEMM, here against 42us of bandwidth-saturated reduce.
+        The mechanism pays when what is hidden is much larger than the cost of
+        publishing it.
         """
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -572,21 +595,38 @@ def build_sdma_phases(
                     if elem_dtype is fx.Float32
                     else acc.to(elem_dtype).bitcast(fx.Int32)
                 )
-                buffer_store(packed, out, i32_off, cache_modifier=CM_CACHED)
+                buffer_store(
+                    packed,
+                    out,
+                    i32_off,
+                    cache_modifier=(
+                        CM_SC0_SC1 if publish == "writethrough" else CM_CACHED
+                    ),
+                )
 
-            # Retire this block's stores, then release them where a copy engine
-            # can see them. `wait_barrier(0)` is s_waitcnt vmcnt(0) + s_barrier:
-            # a bare s_barrier would only prove the stores were *issued*, which
-            # is not enough to hand the range to SDMA.
-            # Publishing a band to a copy engine takes both of these, and the
-            # second is where all the cost is -- see the class docstring.
             # `wait_barrier(0)` is s_waitcnt vmcnt(0) + s_barrier: it retires
             # this block's stores, where a bare s_barrier would only prove they
-            # were issued. The system fence then releases them somewhere the
-            # engine can read. Dropping the fence is *not* an option: it is
-            # nearly free in wall time and it is what makes the result correct.
+            # were issued. But "retired" means reached the coherence point the
+            # store's own cache policy targets, and for an ordinary cached store
+            # that is just *this XCD's* L2 -- which a copy engine, reading over
+            # the fabric rather than through a CU's cache, cannot see.
+            #
+            # Two ways to close that gap, and they cost very differently:
+            #
+            #   "fence"        leave the bytes in L2 and release to system scope
+            #                  afterwards. That is L2 writeback work, and it is
+            #                  charged once per block per band.
+            #   "writethrough" store with sc0+sc1 so they never stop in L1 or L2,
+            #                  and the waitcnt above is then the whole release.
+            #                  Same trick as the GEMM's _WriteThroughStoreC
+            #                  under fence="writethrough".
+            #
+            # Writethrough should be the right shape here: this output is
+            # written once and nothing local reads it again before the gather,
+            # so holding it in L2 buys nothing to begin with.
             wait_barrier(0)
-            raw_cco.cco_system_fence(fx.Int32(0))
+            if const_expr(publish == "fence"):
+                raw_cco.cco_system_fence(fx.Int32(0))
             if tid == fx.Int32(0):
                 ctr = signal_ptr(
                     fx.Int64(w.lsa_ptr(rank, gather_counter_off))

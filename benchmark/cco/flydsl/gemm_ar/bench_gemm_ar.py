@@ -374,6 +374,7 @@ def run(args) -> int:
                 recv_uncached=direct_lsa,
                 fuse_quantize=args.fuse_quantize,
                 fuse_reduce_push=args.fuse_reduce_push,
+                publish=args.publish,
             )
         if args.mode == "split-lsa":
             lsa_ar, _ = build_lsa_ar(cfg, rank)
@@ -668,6 +669,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--sdma-queues", type=int, default=8)
     p.add_argument("--gather-bands", type=int, default=8)
+    p.add_argument(
+        "--publish", choices=("fence", "writethrough"), default="writethrough"
+    )
     p.add_argument(
         "--fuse-reduce-push",
         action=argparse.BooleanOptionalAction,
