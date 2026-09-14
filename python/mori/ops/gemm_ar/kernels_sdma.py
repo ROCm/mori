@@ -568,6 +568,16 @@ def build_sdma_phases(
             wave_uniform_i64(w.lsa_ptr(rank, out_off + my_slice_off))
         )
 
+        # `lsa_ptr` is an opaque extern call that loads two fields out of the
+        # window descriptor (`winBase`, `stride4G`) and combines them. The
+        # compiler cannot see through it, so it cannot hoist or CSE the calls
+        # itself -- every call re-reads both. Both of these bases are
+        # loop-invariant, so they are taken once here rather than once per
+        # (block, band). This is the same reason the source/destination buffer
+        # descriptors above are built at kernel scope and not in the pack loop.
+        ctr_base = fx.Int64(w.lsa_ptr(rank, gather_counter_off))
+        lock_base = fx.Int64(w.lsa_ptr(rank, lock_off))
+
         gtid = bid * threads + tid
         for band in range_constexpr(cfg.gather_bands):
             base = band * packs_per_band
@@ -628,10 +638,7 @@ def build_sdma_phases(
             if const_expr(publish == "fence"):
                 raw_cco.cco_system_fence(fx.Int32(0))
             if tid == fx.Int32(0):
-                ctr = signal_ptr(
-                    fx.Int64(w.lsa_ptr(rank, gather_counter_off))
-                    + fx.Int64(band) * fx.Int64(4)
-                )
+                ctr = signal_ptr(ctr_base + fx.Int64(band) * fx.Int64(4))
                 seq = fx.Int32(atomic_add_u32(ctr, 1)) + fx.Int32(1)
                 # Monotonic, never reset, so "last block of this band, this
                 # epoch" is a modulo rather than a compare -- the property that
@@ -641,10 +648,7 @@ def build_sdma_phases(
                         dest = (rank + j) % ws
                         # Two bands can be elected at nearly the same moment and
                         # would then post to the same per-destination queue.
-                        lock = signal_ptr(
-                            fx.Int64(w.lsa_ptr(rank, lock_off))
-                            + fx.Int64(dest) * fx.Int64(4)
-                        )
+                        lock = signal_ptr(lock_base + fx.Int64(dest) * fx.Int64(4))
                         _acquire_peer_lock(lock)
                         sdma.put(
                             dest,
