@@ -123,13 +123,11 @@ def _test_graph_capture(rank, world_size, port, elems, replays, mode, skew_cycle
         def fill_input(replay):
             input_tensor.fill_(_expected(my_pe, replay))
 
-        def enqueue(stream, capturing):
+        def enqueue(ag, stream, capturing):
             if mode == "sync":
-                allgather(
-                    input_tensor, output_tensor, elems, stream, capturing=capturing
-                )
+                ag(input_tensor, output_tensor, elems, stream, capturing=capturing)
             elif mode == "param_contiguous":
-                allgather.enqueue_param_contiguous(
+                ag.enqueue_param_contiguous(
                     input_tensor,
                     output_tensor,
                     elems,
@@ -139,8 +137,8 @@ def _test_graph_capture(rank, world_size, port, elems, replays, mode, skew_cycle
                     capturing=capturing,
                 )
             else:
-                allgather.start_async(input_tensor, output_tensor, elems, stream)
-                allgather.wait_async(stream, capturing=capturing)
+                ag.start_async(input_tensor, output_tensor, elems, stream)
+                ag.wait_async(stream, capturing=capturing)
 
         # Warm up eagerly first: the kernels are JIT compiled on first use and
         # the transit buffers grow on demand, neither of which is capturable.
@@ -149,7 +147,7 @@ def _test_graph_capture(rank, world_size, port, elems, replays, mode, skew_cycle
         warmup_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(warmup_stream):
             for _ in range(3):
-                enqueue(warmup_stream, capturing=False)
+                enqueue(allgather, warmup_stream, capturing=False)
         warmup_stream.synchronize()
         torch.cuda.current_stream().wait_stream(warmup_stream)
         torch.cuda.synchronize()
@@ -159,7 +157,7 @@ def _test_graph_capture(rank, world_size, port, elems, replays, mode, skew_cycle
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            enqueue(torch.cuda.current_stream(), capturing=True)
+            enqueue(allgather, torch.cuda.current_stream(), capturing=True)
         torch.cuda.synchronize()
         dist.barrier()
         if rank == 0:
