@@ -82,10 +82,11 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
   c.blockNum = EnvInt(blkVar, c.blockNum);
   c.warpPerBlock = EnvInt(wrpVar, c.warpPerBlock);
 
-  // Byte8 is transport-only. Dispatch copies its payload untouched, but combine
-  // sums across sources, so a byte type there would compile and silently reduce
-  // garbage. Reject it here rather than let a Cfg like that reach hipcc.
-  if (!isDispatch && c.dtype == EpDType::Byte8) {
+  // The byte types are transport-only. Dispatch copies its payload untouched,
+  // but combine sums across sources, so a byte type there would compile and
+  // silently reduce garbage. Reject it here rather than let a Cfg like that
+  // reach hipcc.
+  if (!isDispatch && EpDTypeIsByte(c.dtype)) {
     throw std::runtime_error(
         "mori v2 ep: combine reduces its input, so it needs an arithmetic dtype; "
         "fp8/fp4 are dispatch-transport only (pair them with a bf16/fp32 combine)");

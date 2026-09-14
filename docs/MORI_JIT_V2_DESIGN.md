@@ -216,7 +216,7 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
 ```
 
 `MakeEpCfg` 也是拒绝非法组合的地方：`EpCfgIsValid` 不过就抛（token 字节数必须 16B 对齐、
-topk 和 worldSize 必须装进一个 wavefront、recv 容量必须覆盖最坏情况），combine 那条腿上的 `Byte8`
+topk 和 worldSize 必须装进一个 wavefront、recv 容量必须覆盖最坏情况），combine 那条腿上的字节类型
 单独拒绝（§3.7）。一个编不出来或跑错的 Cfg 是构造期错误，不是运行期的错误数字。
 
 ### 3.6 环境变量
@@ -234,12 +234,15 @@ dispatch 只**搬运**它的载荷（gfx9xx 是 `WarpCopy`，gfx125x 是一发 T
 combine 要**归约**。这个不对称决定了 dtype 怎么建模：
 
 ```cpp
-enum class EpDType : int { Bf16 = 0, Fp32 = 1, Byte8 = 2 };
+enum class EpDType : int { Bf16 = 0, Fp32 = 1, Fp8 = 2, Fp4x2 = 3 };
 ```
 
-`Byte8` 是传输类型，渲染成 `unsigned char`：fp8 直接用它，fp4 也用它、由调用方把 hiddenDim 减半
-（2 个 e2m1 挤一个字节）。所以支持 fp8/fp4 dispatch **没有新增 kernel**，只是打通 dtype 这条链。
-`MakeEpCfg` 在 combine 那条腿上拒绝 `Byte8`——它要求和，字节类型在那里能编过但会静默把字节加起来。
+`Fp8` 和 `Fp4x2` 都是传输类型，都渲染成 `unsigned char`、都是一字节一**元素**，编出来的 kernel 体
+逐字节相同。分成两个枚举值只为了让 kernel 名说得出是哪一个：`fp4x2` 的一个元素是 2 个 e2m1，所以
+hiddenDim 在那里数的是**字节**、仍由调用方减半。共用一个标签的话 `_h3584` 既可能是 fp8@3584
+也可能是 fp4@7168，profile 上分不出来。所以支持 fp8/fp4 dispatch
+**没有新增 kernel**，只是打通 dtype 这条链。`MakeEpCfg` 在 combine 那条腿上拒绝这两个——它要求和，
+字节类型在那里能编过但会静默把字节加起来。
 
 两条腿本来就是两个独立的 Plan，各带各的 dtype 和元素数，所以「非对称」（fp8/fp4 进、bf16 出）不是
 一个特例路径，就是两个普通 kernel。arena 按 `token_nbytes` / `combine_token_nbytes` 分别定尺寸——
