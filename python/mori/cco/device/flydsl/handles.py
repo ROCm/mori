@@ -151,9 +151,10 @@ class CachedWindow:
 
     So: count address constructions per launch, not ``grep -c lsa_ptr``.
 
-    Measure A/B in one session if you revisit this. Absolute numbers on this box
-    move ~4% between mornings, across every configuration at once, which is
-    several times the effect being looked for.
+    Measure A/B in one session if you revisit this, and pin ``--quant``. The
+    benchmark defaults to ``ptpc``, which is ~3% faster than the ``blockscale``
+    the model actually uses and that the headline numbers are quoted in; reading
+    one against the other looks exactly like a machine that drifts overnight.
 
     Unlike :class:`Window` this is a plain Python object, not a ``cco_struct``,
     so it cannot cross an ``scf.if``/``scf.for`` boundary -- and neither would a

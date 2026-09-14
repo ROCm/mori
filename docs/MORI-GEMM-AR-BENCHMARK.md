@@ -267,6 +267,13 @@ It is the thread map: a per-row amax cannot be taken by a block holding only par
 of a row, so fusing forces one-wave-per-row, where `sdma_reduce` walks packs with
 a flat grid stride and streams a block through all 8 source slices at once.
 
+Re-measured with three repeats each, the cost holds and is if anything larger:
+926.6 against 903.2 on `fp8/lsa`, 980.4 against 961.9 on `fp8/sdma`.
+`build_sdma_phases` has always defaulted it off, so the op and SGLang take the
+fast path; the *benchmark* defaulted it on until `96bd9522`, and any number
+produced by an older driver without an explicit `--no-fuse-quantize` reads about
+23 us slow.
+
 **Firing the gather's puts from inside the reduce** (`fuse_reduce_push=True`)
 looked like the safest of the three: the push sends this rank's *own* slice, so
 unlike the pull it has no cross-rank dependency, and SDMA is a copy engine so it
@@ -307,6 +314,51 @@ The contrast with the GEMM's fused scatter is the transferable part: there the
 publish is amortised against a 437us transfer hidden behind a compute-bound GEMM;
 here against 42us of bandwidth-saturated reduce. The mechanism pays when what is
 hidden is much larger than the cost of publishing it.
+
+Re-measured after the window-geometry work below, with three alternating
+repeats rather than a sweep, it is a clearer loss than the table suggests:
+1128.4 us on against 1112.0 off, +16.4 us, against spreads of 2.2 and 1.5 us.
+
+**Hoisting the window geometry out of `lsa_ptr`.** `cco_lsa_ptr` is
+`winBase + peer*stride + offset` and loads both fields on every call, through a
+*generic* pointer -- which has to be a `flat_load`, since the compiler cannot
+rule out LDS, so it counts against `lgkmcnt` as well as `vmcnt`. FlyDSL emits it
+as an opaque extern call, and a kernel storing through addresses derived from
+that base gives LLVM no way to prove the loads are not clobbered.
+
+Reading the geometry once and doing the arithmetic in the DSL removes all of
+that. It was tried four ways -- hoisting out the band loop, a `lsa_geometry()`
+API, `global_load` accessors in C++ (`cco_lsa_win_base` / `cco_lsa_stride`, which
+take an `address_space(1)` pointer so each is a single `global_load`), and
+finally `cco.CachedWindow`, which reads both in its constructor so a kernel
+changes by one line. All four measured nothing on `kernels_sdma` (21 call sites)
+and `kernels_fused`, in every wire configuration.
+
+It pays in exactly one place (`ptpc`, three alternating repeats):
+
+| | Window | CachedWindow |
+|---|---|---|
+| `split-lsa` | 1264.69 1264.23 1264.85 | 1250.25 1256.85 1254.53 |
+| `fused-sdma` | 1110.45 1109.77 1112.85 | 1110.53 1113.69 1112.61 |
+
+-10.7 us on `split-lsa`, against a 0.6 us spread; nothing on `fused-sdma`.
+`ar_1stage`/`ar_2stage` build nine peer addresses in *every block* of a short
+kernel; everywhere else the addresses are built once per launch against a body
+that runs for a millisecond. **Count address constructions per launch, not
+`grep -c lsa_ptr`.**
+
+The same holds against PR #662's branch in `blockscale`, two alternating
+repeats: `split-lsa` 1463.6 -> 1455.6 us, while `split-sdma` (1461.2 -> 1459.9),
+`fused-sdma` bf16 (1144.9 -> 1145.8) and fp8/lsa (949.2 -> 949.8) do not move.
+
+Two things worth carrying. A `CachedWindow` cannot cross an `scf.if` -- FlyDSL
+captures every variable an if body reads as state and requires single MLIR
+values, which `Window` satisfies only by having exactly one field -- and the way
+out is to compute the addresses before the branch, which is what the offsets
+usually allow. And pin `--quant` when comparing against anything: the benchmark
+defaults to `ptpc`, ~3% faster than the `blockscale` every number on this page is
+quoted in, and reading one against the other looks exactly like a machine that
+drifts overnight.
 
 **A CK-shaped 4-wave GEMM**, chasing a 22% gap against CK's block-scale kernel
 at the same shape, reached CK's instruction mix and not its speed. Ten hypotheses
