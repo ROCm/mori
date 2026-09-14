@@ -1579,24 +1579,4 @@ def compile_fused_gemm_scatter(
     return launch
 
 
-LSA_NOTE = """\
-The LSA transport is not implemented, and the reason is a measurement rather than
-a preference.
-
-Fusing LSA means the epilogue stores into a peer instead of into local C. But
-`StoreC._store_bf16` writes **one bf16 at a time** through `BufferCopy16b`, at
-`c_index = (row + i) * c_cols + col` with `row = base_row + ti*16 + lane//16*4 + i`
-and `col = base_col + tj*16 + lane%16` -- a lane-scatter. gcnasm measured that
-pattern at 0.26x when the destination is a peer, so the variant is worthless
-until `StoreC` is coalesced (their winning form was a wave-local `ds_bpermute`
-pair-coalesced store; staging C through LDS regressed 1-3%).
-
-That rewrite is the expensive half of this step, and the ceiling it is competing
-for is small: at [4096, 7168] the GEMM is ~40us against an all-reduce of ~290us
-(LSA) or ~340us (SDMA), so even perfect overlap removes at most the GEMM, ~12%.
-Fusing the cheap transport first establishes whether the completion-counter
-structure works at all; if the answer is no, the `StoreC` rewrite is wasted
-regardless of transport.
-"""
-
-__all__ = ["compile_fused_gemm_scatter", "LSA_NOTE", "BLOCK_K"]
+__all__ = ["compile_fused_gemm_scatter", "BLOCK_K"]

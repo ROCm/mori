@@ -35,21 +35,68 @@ internally valid but is not a claim about DSV4 as shipped.
 
 ## Using it
 
+Needs a mori built with `BUILD_CCO_SDMA=ON` and `MORI_ENABLE_SDMA=1` in the
+environment. Setting the variable alone is not enough: a host library built
+without the flag has no queues, so every put silently does nothing and the
+all-reduce quietly produces zeros.
+
 ```python
+import torch, torch.distributed as dist
+from mori.cco import Communicator
 from mori.ops.gemm_ar import GemmAllReduceOp, preshuffle_b
 
-op = GemmAllReduceOp(comm, n=7168, k=2048, m_max=16384)
-b_shuffled = preshuffle_b(b_fp8)              # [N, K] -> MFMA preshuffled
-out = op(a_fp8, b_shuffled, a_scale, b_scale)  # [M, N] bf16, already reduced
+rank, world = dist.get_rank(), dist.get_world_size()
+torch.cuda.set_device(rank)
+
+# The window comes out of the communicator's VMM reservation, so size that
+# first -- the op cannot grow it later.
+N, K, M_MAX = 7168, 2048, 16384
+vmm = 2 * GemmAllReduceOp.window_bytes_for(world, m_max=M_MAX, n=N) + (64 << 20)
+
+uid = [bytes(Communicator.get_unique_id()) if rank == 0 else None]
+dist.broadcast_object_list(uid, src=0)
+
+with Communicator.init(world, rank, uid[0], per_rank_vmm=vmm) as comm:
+    with GemmAllReduceOp(comm, n=N, k=K, m_max=M_MAX) as op:
+        b_shuffled = preshuffle_b(b_fp8)          # [N, K], once per weight
+
+        m_pad = op.padded_m(x.shape[0])           # instance method: M only
+        a_fp8, a_scale = quantize_per_1x128(op.pad_rows(x, m_pad))
+        out = op(a_fp8, b_shuffled, a_scale, b_scale)[: x.shape[0]]
 ```
 
-`a_scale` is the A 1x128 block scale, physically `[K/128, M]` fp32 (i.e. `[M,
-K/128]` column-major -- what `aiter_per1x128_quant(transpose_scale=True)`
-emits). `b_scale` is `[N/128, K/128]` fp32 row-major.
+**Pad before quantising.** A padded row produces a zero output row, which the
+caller slices off; quantising first and padding after would also have to extend
+the scales, and in the layout below that is not a row append.
 
-`M` must be a multiple of `world_size * block_m`; `op.padded_m(m, world_size)`
-rounds up and `op.pad_rows` zero-extends to it. A padded row produces a zero
-output row, so the caller slices the result back to `m`.
+**Scales.** `a_scale` is the A 1x128 block scale as fp32. Pass it as `[M, K/128]`
+in either memory order, as `[K/128, M]`, or already flat in physical order --
+the op distinguishes these. What it cannot distinguish is a `[M, K/128]` tensor
+you have already flattened yourself with `reshape(-1)`: for the column-major
+tensor `aiter_per1x128_quant(transpose_scale=True)` returns, that walks the
+logical rows and pairs every scale with the wrong K block, which validates,
+runs, and returns relL2 0.26. `b_scale` is `[N/128, K/128]` fp32 row-major.
+
+**Shapes.** `supports(m, n, k, world_size)` answers whether a shape is
+expressible. `K >= 256` and a multiple of 128; `N` a multiple of 256, and of
+1024 if the gather is fp8; `world_size` in [2, 8] and dividing 512.
+
+**Collective contract.** Every rank must construct the op and call it the same
+number of times in the same order -- the phases carry device-side barriers.
+Work is issued on the current stream and completes asynchronously, so the usual
+stream rules apply to the result.
+
+**The result aliases the window** and is overwritten by the next call; clone it
+to keep it. `pad_rows` returns a reused buffer with the same caveat. One
+instance is not usable concurrently.
+
+**Distinct M values.** Each M compiles its own kernel and takes its own counter
+set, capped by `max_shapes` (8). Warm each M up once before capturing a graph.
+
+**Cleanup.** `close()` (or the `with` above) releases the window, memory and
+dev-comm. The communicator holds a strong reference to each, so dropping the op
+is not enough -- at the model shape that is about 700 MiB per rank. Synchronise
+first if anything may still be in flight.
 
 ## fp8 on the wire
 
@@ -168,10 +215,12 @@ traces.
 
 ``C`` is an ordinary tensor argument, so pointing it at a cco window is a host-side
 change; ``StoreC`` is untouched. That is the whole reason SDMA is the cheap
-transport to fuse. The LSA alternative -- having the epilogue store straight into
-a peer -- would first require coalescing ``StoreC._store_bf16``, which writes one
-bf16 at a time through ``BufferCopy16b``; gcnasm measured that lane-scatter at
-0.26x when pushed to a peer. See ``LSA_NOTE`` at the bottom.
+transport to fuse. The LSA alternative -- the epilogue storing straight into a
+peer -- is implemented as ``fused-lsa``, and it is the slower of the two for the
+reason that was predicted: ``StoreC._store_bf16`` writes one bf16 at a time
+through ``BufferCopy16b``, and gcnasm measured that lane-scatter at 0.26x when
+the destination is a peer. It spends ~560us of its GEMM pushing C over xGMI
+where the copy engines move the same bytes in ~499.
 
 ## Completion protocol
 

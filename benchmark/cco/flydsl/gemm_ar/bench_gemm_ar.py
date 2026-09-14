@@ -488,6 +488,25 @@ def run(args) -> int:
                 "lane_transpose": args.lane_transpose,
                 "fence": args.fence if fused else None,
                 "stop_after": args.stop_after,
+                # The wire and transport, which "mode" does not distinguish: an
+                # fp8/lsa and an fp8/sdma run both say mode="fused-sdma", and a
+                # record separated from its command line cannot say which ran.
+                "gather_dtype": args.gather_dtype,
+                "gather_transport": args.gather_transport,
+                "fuse_quantize": args.fuse_quantize,
+                "fuse_reduce_push": args.fuse_reduce_push,
+                "publish": args.publish,
+                "gather_bands": args.gather_bands,
+                "sdma_queues": args.sdma_queues,
+                "atomic_order": args.atomic,
+                # "auto" resolves to the fused path's rotation
+                # (kernels_fused: `rotated = fuse if rotated is None`), so record
+                # what ran rather than the word that selected it.
+                "resolved_tile_order": (
+                    ("rotated" if fused else "linear")
+                    if args.tile_order == "auto"
+                    else args.tile_order
+                ),
                 "max_rank_time_us": per_rank[max_rank],
                 "critical_rank": max_rank,
                 "per_rank_time_us": per_rank,
@@ -573,10 +592,14 @@ def build_parser() -> argparse.ArgumentParser:
             "raw-wt-leader",
         ),
         default="none",
-        help="release before the epilogue push. Correct: 'agent' (default, "
-        "cheapest) and 'all' (system scope, adds a buffer_inv that costs 20us). "
-        "Incorrect, and present only to price the fence: 'leader', 'none', "
-        "'writethrough'. 'wt-agent' is correct but no faster than 'agent'",
+        help="release issued before the epilogue hands a range to the copy "
+        "engines. The default is 'none'. Measured at m=16384 blockscale on 8 "
+        "ranks, twice each: 'none' 1143.5/1144.8us, 'writethrough' "
+        "1148.5/1145.4, 'agent' 1797.0/1798.5, 'all' 1936.1/1937.5 -- all four "
+        "at relL2 2.350e-3, i.e. the explicit fences cost 650-790us here and "
+        "did not move accuracy. Every 'raw-wt*' mode is known-racy and kept "
+        "only to reproduce that. See docs/MORI-GEMM-AR-BENCHMARK.md for how a "
+        "release can be paid in the store policy instead of in a fence",
     )
     p.add_argument(
         "--stop-after",

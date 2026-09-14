@@ -74,6 +74,15 @@ SDMA_REDUCE_BLOCK_CAP = 256
 ONE_STAGE_MAX_BYTES_LE4 = 160 * 1024
 ONE_STAGE_MAX_BYTES_LE8 = 80 * 1024
 
+# Legal mode strings. Both are selected by equality in the kernels, so an
+# unrecognised value does not fail -- it silently takes the other branch.
+WIRE_DTYPES = frozenset({"bf16", "fp8"})
+GATHER_TRANSPORTS = frozenset({"sdma", "lsa"})
+
+# The fp8 conversion gives one wave one row and converts CHUNK_ELEMS (16)
+# elements per lane per chunk, so a row must be a whole number of wave-chunks.
+FP8_GATHER_N_MULTIPLE = 16 * 64
+
 
 def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
@@ -139,6 +148,21 @@ class ArConfig:
     #: leave while the GEMM is still computing its later ones. Only the fused
     #: path reads this; the standalone SDMA all-reduce always pushes whole slices.
     counter_chunks: int = 1
+    #: Chunks the counter *region* is sized for, as opposed to the number this
+    #: config uses. ``counter_chunks`` is the largest divisor of the band count
+    #: and so changes with ``m``; sizing the region from it moves ``lock_off``
+    #: and everything after it, which silently reinterprets the previous shape's
+    #: payload as control state when one window serves several ``m``. 0 means
+    #: "same as ``counter_chunks``", which is right for a single-shape config.
+    counter_capacity: int = 0
+    #: Independent counter sets the region holds, and which one this config
+    #: uses. The election test is ``seq % tiles_per_chunk == 0`` on a counter
+    #: that is never reset, and ``tiles_per_chunk`` depends on ``m`` -- so two
+    #: shapes sharing a set elect on a residue left by the other. One set per
+    #: shape keeps them independent without resetting anything, which is what
+    #: lets graphs for different ``m`` be replayed in any order.
+    counter_shape_slots: int = 1
+    counter_shape_index: int = 0
     #: What travels on the wire, per leg. ``"bf16"`` sends the payload as-is;
     #: ``"fp8"`` quantises to e4m3 with fp32 scales, halving the bytes. The
     #: reduce always accumulates in fp32 and ``output`` is always bf16 -- only
@@ -361,7 +385,9 @@ class ArConfig:
     def signal_bytes(self) -> int:
         # Everything before `input`: the barrier arrays, the scatter's tile
         # counters, the submit locks, and the gather's band counters.
-        return self.gather_counter_off + self.gather_counter_bytes
+        # The region bases, not this config's slot: the control area has to be
+        # the same size whichever shape slot a config happens to use.
+        return self.gather_counter_region_off + self.gather_counter_bytes
 
     @property
     def start_off(self) -> int:
@@ -383,18 +409,37 @@ class ArConfig:
         return max(1, min(SDMA_REDUCE_BLOCK_CAP, need))
 
     @property
-    def counter_off(self) -> int:
+    def counter_capacity_eff(self) -> int:
+        """Chunks per set the region is sized for; ``counter_chunks`` if unset."""
+        return self.counter_capacity or self.counter_chunks
+
+    @property
+    def counter_region_off(self) -> int:
         """Monotonic tile counters for the fused GEMM, one per (dest, chunk).
 
         Its own 128-byte-aligned region rather than slack in ``_flag``: the count
-        is ``world_size * counter_chunks`` and grows with M, so borrowing the 16
-        spare ``_flag`` slots would silently stop fitting at M >= 8192.
+        is ``world_size * counter_capacity`` and grows with M, so borrowing the
+        16 spare ``_flag`` slots would silently stop fitting at M >= 8192.
         """
         return _align_up(self.flag_off + self.max_blocks * 4, SIGNAL_ALIGN)
 
     @property
+    def counter_set_bytes(self) -> int:
+        """One shape's set of ``(dest, chunk)`` counters."""
+        return self.world_size * self.counter_capacity_eff * 4
+
+    @property
+    def counter_off(self) -> int:
+        """This config's counter set. Sized by capacity, so it does not move."""
+        return (
+            self.counter_region_off + self.counter_shape_index * self.counter_set_bytes
+        )
+
+    @property
     def counter_bytes(self) -> int:
-        return _align_up(self.world_size * self.counter_chunks * 4, SIGNAL_ALIGN)
+        return _align_up(
+            self.counter_set_bytes * self.counter_shape_slots, SIGNAL_ALIGN
+        )
 
     @property
     def lock_off(self) -> int:
@@ -403,15 +448,18 @@ class ArConfig:
         Needed as soon as a destination has more than one chunk: the tile
         counter elects one block per *chunk*, so two of them can reach the SDMA
         submit for the same queue at once.
+
+        Shared across shapes, unlike the counters: a lock is taken and released
+        inside one kernel, so it carries nothing between calls.
         """
-        return self.counter_off + self.counter_bytes
+        return self.counter_region_off + self.counter_bytes
 
     @property
     def lock_bytes(self) -> int:
         return _align_up(self.world_size * 4, SIGNAL_ALIGN)
 
     @property
-    def gather_counter_off(self) -> int:
+    def gather_counter_region_off(self) -> int:
         """Band counters for the gather, when its puts are fired by the reduce.
 
         Its own region rather than a corner of ``counter_off``: the fused GEMM
@@ -423,8 +471,16 @@ class ArConfig:
         return self.lock_off + self.lock_bytes
 
     @property
+    def gather_counter_off(self) -> int:
+        """This config's band counters, one set per shape like the tile ones."""
+        return (
+            self.gather_counter_region_off
+            + self.counter_shape_index * self.gather_bands * 4
+        )
+
+    @property
     def gather_counter_bytes(self) -> int:
-        return _align_up(self.gather_bands * 4, SIGNAL_ALIGN)
+        return _align_up(self.gather_bands * 4 * self.counter_shape_slots, SIGNAL_ALIGN)
 
     def counter_slot(self, dest: int, chunk: int) -> int:
         if not 0 <= dest < self.world_size:
@@ -579,6 +635,41 @@ class ArConfig:
             )
         if self.counter_chunks < 1:
             raise ValueError(f"counter_chunks must be >= 1, got {self.counter_chunks}")
+        if self.counter_capacity and self.counter_capacity < self.counter_chunks:
+            raise ValueError(
+                f"counter_capacity ({self.counter_capacity}) must be >= "
+                f"counter_chunks ({self.counter_chunks}); the region has to hold "
+                "the set this config indexes into"
+            )
+        if self.counter_shape_slots < 1:
+            raise ValueError(
+                f"counter_shape_slots must be >= 1, got {self.counter_shape_slots}"
+            )
+        if not 0 <= self.counter_shape_index < self.counter_shape_slots:
+            raise ValueError(
+                f"counter_shape_index must be in [0, {self.counter_shape_slots}), "
+                f"got {self.counter_shape_index}"
+            )
+        # Mode strings select a code path by equality, so a typo does not fail --
+        # it silently picks the default. "FP8" sent bf16; "sla" sent SDMA.
+        for name, allowed in (
+            ("scatter_dtype", WIRE_DTYPES),
+            ("gather_dtype", WIRE_DTYPES),
+            ("gather_transport", GATHER_TRANSPORTS),
+        ):
+            got = getattr(self, name)
+            if got not in allowed:
+                raise ValueError(f"{name}={got!r} is not one of {sorted(allowed)}")
+        if self.gather_bands < 1:
+            raise ValueError(f"gather_bands must be >= 1, got {self.gather_bands}")
+        if self.m < 1 or self.n < 1:
+            raise ValueError(f"m and n must be positive, got m={self.m} n={self.n}")
+        if self.fp8_gather and self.n % FP8_GATHER_N_MULTIPLE:
+            raise ValueError(
+                f"the fp8 wire gives one wave one row and converts a fixed number "
+                f"of elements per lane per chunk, so n ({self.n}) must be a "
+                f"multiple of {FP8_GATHER_N_MULTIPLE}"
+            )
         if not 0 <= self.recv_slots <= self.world_size:
             raise ValueError(
                 f"recv_slots must be in [0, world_size={self.world_size}], "
@@ -590,6 +681,9 @@ class ArConfig:
 
 __all__ = [
     "ArConfig",
+    "WIRE_DTYPES",
+    "GATHER_TRANSPORTS",
+    "FP8_GATHER_N_MULTIPLE",
     "select_stage",
     "K_MAX_BLOCKS",
     "LSA_BLOCK_CAP",
