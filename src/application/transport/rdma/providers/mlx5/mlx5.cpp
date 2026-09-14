@@ -113,12 +113,12 @@ mlx5dv_devx_umem* Mlx5RegisterControlUmem(ibv_context* context, void* addr, size
     uint64_t dmabufOffset = 0;
     int dmabufFd = TryExportDmabufFd(addr, size, &dmabufOffset);
     if (dmabufFd >= 0) {
-      mlx5dv_devx_umem_in in{};
+      MoriMlx5DevxUmemIn in{};
       in.addr = reinterpret_cast<void*>(dmabufOffset);  // dmabuf-relative byte offset
       in.size = size;
       in.access = accessFlag;
       in.pgsz_bitmap = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
-      in.comp_mask = MLX5DV_UMEM_MASK_DMABUF;
+      in.comp_mask = MORI_MLX5DV_UMEM_MASK_DMABUF;
       in.dmabuf_fd = dmabufFd;
       mlx5dv_devx_umem* umem = Mlx5DvApi::Instance().devx_umem_reg_ex(context, &in);
       close(dmabufFd);

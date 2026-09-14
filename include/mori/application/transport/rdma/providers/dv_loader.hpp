@@ -42,17 +42,15 @@ void* DvLoadSymbol(void* handle, const char* symbol_name, bool warn_on_miss = tr
 // ============================================================================
 // MLX5 direct-verbs function pointers
 // ============================================================================
-// struct mlx5dv_devx_umem_in is defined either by <infiniband/mlx5dv.h> or, when
-// that header is absent, by mlx5_dv.h. It is only used here through a pointer, so
-// an incomplete forward declaration suffices (same as mlx5dv_devx_umem below).
-struct mlx5dv_devx_umem_in;
+// Forward decl for the reg_ex typedef; full definition in mlx5_dv.h. Pointer-only here.
+struct MoriMlx5DevxUmemIn;
 
 struct Mlx5DvApi {
   using devx_general_cmd_t = int (*)(struct ibv_context*, const void*, size_t, void*, size_t);
   using devx_umem_reg_t = struct mlx5dv_devx_umem* (*)(struct ibv_context*, void*, size_t,
                                                        uint32_t);
   using devx_umem_reg_ex_t = struct mlx5dv_devx_umem* (*)(struct ibv_context*,
-                                                          struct mlx5dv_devx_umem_in*);
+                                                          struct MoriMlx5DevxUmemIn*);
   using devx_umem_dereg_t = int (*)(struct mlx5dv_devx_umem*);
   using devx_alloc_uar_t = struct mlx5dv_devx_uar* (*)(struct ibv_context*, uint32_t);
   using devx_free_uar_t = void (*)(struct mlx5dv_devx_uar*);
