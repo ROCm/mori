@@ -160,9 +160,11 @@ class CachedWindow:
     ``cco_struct`` version, because FlyDSL captures every variable a dynamic
     ``if`` body reads as state and requires each to be a *single* MLIR value.
     ``Window`` qualifies only by having one field; a three-field struct fails the
-    same check ("state variable 'w' is list, not an MLIR Value"). Build it inside
-    whichever region needs it, or use ``Window`` there --
-    ``kernels_fused.py:1488`` does the latter.
+    same check ("state variable 'w' is list, not an MLIR Value").
+
+    Usually the way out is neither: compute the addresses *before* the branch and
+    let the ``if`` capture plain ``Int64``. That works whenever the offsets do
+    not depend on the branch, which in practice they rarely do.
     """
 
     __slots__ = ("handle", "base", "stride")
