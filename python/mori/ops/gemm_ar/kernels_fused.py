@@ -1202,7 +1202,7 @@ def compile_fused_gemm_scatter(
                 N_TILES_A,
                 N_TILES_B,
                 c_rsrc=create_buffer_resource_from_addr(
-                    fx.Int64(cco.CachedWindow(win).lsa_ptr(rank, in_off)),
+                    fx.Int64(w_pre.lsa_ptr(rank, in_off)),
                     num_records_bytes=cfg.nbytes,
                 ),
             )
@@ -1485,7 +1485,12 @@ def compile_fused_gemm_scatter(
             # "writethrough": nothing to do -- the stores already went to memory,
             # and wait_barrier(0) above retired them.
 
-            w = cco.Window(win)
+            # Both bases are rank-local and constant-offset, so they are the same
+            # for every thread; taking them here rather than inside the `if` also
+            # keeps the window out of the if's captured state, which has to be
+            # single MLIR values (see cco.CachedWindow).
+            ctr_base = fx.Int64(w_pre.lsa_ptr(rank, counter_off))
+            lock_base = fx.Int64(w_pre.lsa_ptr(rank, lock_off))
             sdma = cco.DevComm(dev_comm).sdma()
             if fx.thread_idx.x == 0:
                 # One release per *block* instead of per wave. cco's leaderOnly
@@ -1499,10 +1504,7 @@ def compile_fused_gemm_scatter(
                     m_tiles_per_chunk
                 )
                 slot = dest * fx.Int32(chunks) + chunk
-                ctr = signal_ptr(
-                    fx.Int64(w.lsa_ptr(rank, counter_off))
-                    + fx.Int64(slot) * fx.Int64(4)
-                )
+                ctr = signal_ptr(ctr_base + fx.Int64(slot) * fx.Int64(4))
                 seq = fx.Int32(
                     atomic_add_u32(ctr, 1, ordering=atomic_order)
                 ) + fx.Int32(1)
@@ -1518,10 +1520,7 @@ def compile_fused_gemm_scatter(
                         # short issue only, and they share one xGMI link either
                         # way, so a queue each would buy nothing.
                         off = fx.Int64(chunk) * fx.Int64(chunk_bytes)
-                        lock = signal_ptr(
-                            fx.Int64(w.lsa_ptr(rank, lock_off))
-                            + fx.Int64(dest) * fx.Int64(4)
-                        )
+                        lock = signal_ptr(lock_base + fx.Int64(dest) * fx.Int64(4))
                         if const_expr(chunks > 1):
                             _acquire_peer_lock(lock)
                         sdma.put(
