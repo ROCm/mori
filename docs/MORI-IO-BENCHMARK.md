@@ -166,13 +166,43 @@ memory region. No RDMA payload crosses it.
   `1,2,4,…,32768`.
 - neither — a single `(--buffer-size, --transfer-batch-size)` point.
 
+### Prepared transfers (`--prepare-once`)
+
+The **C++** benchmark accepts `--prepare-once` (the Python benchmark does not),
+which splits a batch into the two halves nixl reports separately as
+`createXferReq` and `postXferReq`. Normally every iteration re-derives the RDMA
+work requests — sorting the descriptors by remote offset, merging the contiguous
+ones, then chunking whatever still exceeds the NIC's message limit — even though
+the offsets and sizes never change between iterations. With the flag, that build
+happens **once per sweep point** and each iteration only re-posts the resulting
+handle, so the reported latency covers the post alone.
+
+Run the same command with and without it to separate work-request construction
+from the transfer itself:
+
+```bash
+build/tests/cpp/bench_engine --rank 0 --master-ip <ip> \
+    --enable-sess --enable-batch-transfer --transfer-batch-size 64 \
+    --iters 500 --prepare-once
+```
+
+The flag needs `--backend rdma` (the only backend that builds a prepared handle;
+the others report the lack of support rather than quietly falling back) together
+with `--enable-sess` (the handle is owned by a session), and is rejected at
+startup otherwise. It works with **both** submission modes:
+`--enable-batch-transfer` prepares one N-descriptor handle, while
+`--disable-batch-transfer` prepares one single-descriptor handle per transfer and
+posts each individually — either way the build is hoisted out of the timed loop.
+It is independent of `--batch-contiguous`: contiguous offsets still merge, they
+just merge once.
+
 ### Differences from the Python flags
 
 Most flags share names with the Python benchmark (`--op-type`/`--op`,
 `--num-qp-per-transfer`, `--num-worker-threads`, `--transfer-batch-size`,
-`--enable-sess`, `--batch-contiguous`, `--disable-chunking`, `--chunk-bytes`,
-`--poll_cq_mode`, `--mem-type`, `--iters`, `--sweep-step`, `--all`,
-`--all-batch`), but note:
+`--enable-sess`, `--batch-contiguous`, `--disable-chunking`,
+`--chunk-bytes`, `--poll_cq_mode`, `--mem-type`, `--iters`, `--sweep-step`,
+`--all`, `--all-batch`), but note (`--prepare-once` is C++ only):
 
 | Python | C++ (nixl-style) | Notes |
 |--------|------------------|-------|
@@ -180,8 +210,8 @@ Most flags share names with the Python benchmark (`--op-type`/`--op`,
 | `--host` | `--master-ip` + `--self-ip` | `--host` is accepted as a spelling of `--master-ip`. `--master-ip` = rank 0's IP, same on both ranks; `--self-ip` = the control-plane IP each rank advertises to the peer, which Python does not need because torchrun supplies it. |
 | `--src-gpu` / `--dst-gpu` | `--gpu` / `--target-dev-offset` | Python's names are accepted: `--src-gpu` is `--gpu`, and `--dst-gpu N` sets `--target-dev-offset` to `N - gpu` (passing both a conflicting `--dst-gpu` and `--target-dev-offset` is rejected). Under `--xgmi-single-process` they are the two local GPUs directly. |
 | `--num-initiator-dev` / `--num-target-dev` | same | One process per GPU on each side, forked before any HIP call; initiator local *i* pairs with target local *i*, driving GPU `--gpu + i`. The two counts must be equal, as Python asserts. Each pair prints its own `[gpu N]`-prefixed row and rank 0 adds an `[AGGREGATE]` line summing bandwidth across pairs — Python prints per-rank tables with no aggregate. |
-| `--enable-batch-transfer` (default OFF) | `--enable-batch-transfer` / `--disable-batch-transfer` (C++ default **ON**) | Same meaning as Python: **ON** = one N-descriptor batch request (the nixl-equivalent; nixl always batches); **OFF** = `--transfer-batch-size` N *individual* single-transfer submissions per iteration (Python `run_single_once`). The C++ tool defaults **ON** so the out-of-the-box run and `--all-batch` sweep are nixl-comparable; pass `--disable-batch-transfer` for the Python single-submission path. |
-| `--iters` (default `128`) | `--iters` (default `500`), plus `--warmup-iters` | Only the warmup flag is new: it runs untimed iterations before the timed region, matching nixl's `--warmup_iter`. |
+| `--enable-batch-transfer` (default OFF) | same, plus `--disable-batch-transfer` | Same meaning and the same default (**OFF**) as Python: **ON** = one N-descriptor batch request (the nixl-equivalent; nixl always batches); **OFF** = `--transfer-batch-size` N *individual* single-transfer submissions per iteration (Python `run_single_once`). Pass `--enable-batch-transfer` for the nixl-comparable path; `--disable-batch-transfer` restates the default. |
+| `--iters` (default `128`) | same default, plus `--warmup-iters` | Only the warmup flag is new: it runs untimed iterations before the timed region, matching nixl's `--warmup_iter`. |
 | `--sweep-start-size` / `--sweep-max-size` | `--sweep-start` / `--sweep-max` (long names also accepted) | Names only; `--sweep-step` (`0` = geometric ×2, `>0` = linear) behaves the same in both. |
 | `--backend rdma\|xgmi\|fabric` | same | `--num-streams` / `--num-events` size the XGMI **and** FABRIC HIP pools, as in Python. `fabric` (UALink scale-up, GPU memory only) needs a host whose GPUs expose `/sys/bus/pci/devices/*/ualink`; on RoCE-only hardware the engine reports `No available backend found` at the first transfer. |
 | `--xgmi-multiprocess` (default OFF) | `--xgmi-single-process` (default OFF, i.e. multiprocess) | The defaults are **opposite**. The C++ tool's two-rank path is already Python's `--xgmi-multiprocess`: two processes with distinct engine keys, so the backend takes its `hipIpc*` route. `--xgmi-single-process` adds Python's *default* instead — one process owning both GPUs, no rendezvous and no IPC. `--xgmi-multiprocess` is accepted to document intent but is a no-op. |
@@ -232,6 +262,7 @@ Most flags share names with the Python benchmark (`--op-type`/`--op`,
 | `--transfer-batch-size` | Number of consecutive transfers |
 | `--enable-batch-transfer` | Enable batch transfer mode |
 | `--enable-sess` | Enable session transfer (lower latency) |
+| `--prepare-once` | C++ only. Build the work requests once and re-post them, timing only the post (needs `rdma` + `--enable-sess`; works with batched or non-batch submission) |
 | `--num-initiator-dev` | Number of initiator devices |
 | `--num-target-dev` | Number of target devices |
 | `--num-qp-per-transfer` | Number of queue pairs used (default `4`) |

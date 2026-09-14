@@ -353,5 +353,61 @@ inline RdmaOpRet RdmaWrite(const EpPairVec& eps, const application::RdmaMemoryRe
   return RdmaReadWrite(eps, local, localOffset, remote, remoteOffset, size, callbackMeta, id,
                        false);
 }
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                       Prepared Transfers                                       */
+/* ---------------------------------------------------------------------------------------------- */
+// Opt-in "build once, post many" path (the NIXL createXferReq / postXferReq split).
+// It is deliberately kept separate from RdmaBatchReadWrite: that function keeps its
+// own build+post implementation, so normal Read/Write/BatchReadWrite calls are not
+// affected by anything here.
+
+// A single (possibly merged, possibly chunked) work request plus the scatter-gather
+// list it points at. The sges vector is owned so the WR survives across posts;
+// PostPreparedRdmaBatch re-points wr.sg_list at it on every post.
+struct PreparedWorkRequest {
+  ibv_send_wr wr{};
+  std::vector<ibv_sge> sges{};
+  size_t totalRemoteLength{0};
+  size_t mergedRequests{1};
+};
+
+// A batch whose sort/merge/chunk work has already been done. Holds everything the
+// post phase needs except the per-post state (lkey/rkey, wr_id, signaling, next
+// chain), which is re-armed on each post so the same batch can be posted repeatedly.
+struct PreparedRdmaBatch {
+  std::vector<PreparedWorkRequest> wrs{};
+  // Original descriptor count, i.e. the completion credit when !creditByWrCount.
+  size_t batchSize{0};
+  RdmaTransferControl control{};
+  int postBatchSize{-1};
+  bool isRead{false};
+  bool valid{false};
+
+  // Per-post signal accounting, kept here so re-posting a prepared batch stays
+  // allocation-free (assign() reuses the capacity across posts).
+  std::vector<int> epWrsSinceSignal{};
+  std::vector<size_t> epMergedSinceSignal{};
+};
+
+// Build phase. Validates the batch and produces the merged/chunked WR list once.
+// The addresses come from the base MRs, so the result is not tied to a single
+// endpoint; lkey/rkey are filled in per post.
+RdmaOpRet BuildPreparedRdmaBatch(const EpPairVec& eps,
+                                 const application::RdmaMemoryRegion& baseLocalMr,
+                                 const application::RdmaMemoryRegion& baseRemoteMr,
+                                 const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                                 const SizeVec& sizes, bool isRead,
+                                 const RdmaTransferControl& control, int postBatchSize,
+                                 PreparedRdmaBatch& out);
+
+// Post phase. Re-arms the per-post WR state and submits. Mutates `prepared` in
+// place, so concurrent posts of the same batch must be serialized by the caller.
+RdmaOpRet PostPreparedRdmaBatch(const EpPairVec& eps,
+                                const std::vector<application::RdmaMemoryRegion>& localMrPerEp,
+                                const std::vector<application::RdmaMemoryRegion>& remoteMrPerEp,
+                                PreparedRdmaBatch& prepared,
+                                std::shared_ptr<CqCallbackMeta> callbackMeta, TransferUniqueId id);
+
 }  // namespace io
 }  // namespace mori

@@ -163,6 +163,25 @@ void IOEngineSession::BatchWrite(const SizeVec& localOffsets, const SizeVec& rem
   }
 }
 
+std::shared_ptr<PreparedTransfer> IOEngineSession::PrepareBatch(const SizeVec& localOffsets,
+                                                                const SizeVec& remoteOffsets,
+                                                                const SizeVec& sizes, bool isRead) {
+  MORI_IO_FUNCTION_TIMER;
+  return backendSess->PrepareBatch(localOffsets, remoteOffsets, sizes, isRead);
+}
+
+void IOEngineSession::PostPrepared(const std::shared_ptr<PreparedTransfer>& prepared,
+                                   TransferStatus* status, TransferUniqueId id) {
+  MORI_IO_FUNCTION_TIMER;
+  std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
+  internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Session post prepared");
+  backendSess->PostPrepared(prepared, status, id);
+  if (status->Failed()) {
+    LogTransferFailure(diagnostics, "Session post prepared error {} message {}",
+                       status->CodeUint32(), status->Message());
+  }
+}
+
 bool IOEngineSession::Alive() { return backendSess->Alive(); }
 
 /* ---------------------------------------------------------------------------------------------- */
