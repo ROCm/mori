@@ -104,6 +104,12 @@ endif()
 # ---------------------------------------------------------------------------
 include(${CMAKE_SOURCE_DIR}/cmake/MoriDetectDevice.cmake)
 mori_detect_device_config()
+# Device-side CQ layout is a compile-time choice but the host picks it at
+# runtime from the firmware, so every target in the build must agree with what
+# mori_detect_device_config() found.
+if(MORI_IONIC_CCQE_DEFINE)
+  add_compile_definitions(${MORI_IONIC_CCQE_DEFINE})
+endif()
 # Bridge: if user didn't set GPU_TARGETS explicitly, use the detected arch
 if(NOT DEFINED GPU_TARGETS AND MORI_GPU_ARCH)
   set(GPU_TARGETS
