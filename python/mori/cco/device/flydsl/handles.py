@@ -110,6 +110,47 @@ class Window:
         """Peer's LSA-accessible VA inside this window (uint64), for direct load/store."""
         return raw.cco_lsa_ptr(self.handle, peer_lsa_rank, offset)
 
+    def lsa_geometry(self):
+        """Read the window's base and peer stride once, for reuse.
+
+        ``cco_lsa_ptr`` is ``winBase + peer * stride + offset``, and it loads
+        *both* fields out of the window descriptor on every call. FlyDSL emits
+        it as an extern call so the tracer cannot fold it, and although it is
+        ``always_inline`` -- so LLVM does see the two loads -- a kernel that
+        stores through addresses derived from that same base gives LLVM no way
+        to prove the loads are not clobbered, so it must reload them.
+
+        Taking the geometry once turns every later address into ordinary DSL
+        arithmetic over SSA values, which the compiler *can* fold. For the
+        common case here, where the peer and the offset are both Python ints,
+        it collapses to a single add against a value already in a register.
+
+        Costs one extra call here (peer=1, offset=0 is exactly
+        ``base + stride``) to remove one from every use site. Returns
+        ``(base, stride)`` for :meth:`lsa_ptr_at`.
+
+        **It does not measure on mori's own kernels, and that is expected.**
+        Swapping the 15 descriptors in ``gemm_ar``'s LSA pull gather over to it
+        moves a 230us kernel by nothing: 973.2us before, 972.5/975.8/976.1
+        after. Every ``lsa_ptr`` call in that package is already at kernel
+        scope -- descriptors get built once before the hot loop, which is the
+        established idiom there -- so what this removes is on the order of 26
+        loads per launch.
+
+        Where it *would* pay is a kernel that needs an address inside a loop,
+        which is exactly the case the idiom above exists to avoid. Use it when
+        the call count is large or per-iteration; do not expect it to show up
+        otherwise.
+        """
+        base = fx.Int64(raw.cco_lsa_ptr(self.handle, 0, 0))
+        stride = fx.Int64(raw.cco_lsa_ptr(self.handle, 1, 0)) - base
+        return base, stride
+
+    @staticmethod
+    def lsa_ptr_at(base, stride, peer_lsa_rank, offset=0):
+        """:meth:`lsa_ptr` from a cached :meth:`lsa_geometry` -- no extern call."""
+        return base + fx.Int64(peer_lsa_rank) * stride + fx.Int64(offset)
+
 
 @cco_struct
 class Gda:

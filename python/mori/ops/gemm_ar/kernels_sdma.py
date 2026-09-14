@@ -706,15 +706,22 @@ def build_sdma_phases(
             ),
         )
 
-        def _row_addr_at(w, peer, byte_off):
-            return create_buffer_resource_from_addr(
-                wave_uniform_i64(w.lsa_ptr(peer, byte_off))
-            )
+        # These build one descriptor per (peer, region), and `lsa_pull_gather`
+        # wants 15 of them. `lsa_ptr` reads the window's base and stride on
+        # every call, so the geometry is taken once and the rest is arithmetic
+        # -- see Window.lsa_geometry.
+        def _geom(w):
+            return w.lsa_geometry()
 
-        def _row_addr(w, byte_off):
-            return create_buffer_resource_from_addr(
-                wave_uniform_i64(w.lsa_ptr(rank, byte_off))
-            )
+        def _row_addr_at(w, peer, byte_off, geom=None):
+            if geom is None:
+                addr = w.lsa_ptr(peer, byte_off)
+            else:
+                addr = w.lsa_ptr_at(geom[0], geom[1], peer, byte_off)
+            return create_buffer_resource_from_addr(wave_uniform_i64(addr))
+
+        def _row_addr(w, byte_off, geom=None):
+            return _row_addr_at(w, rank, byte_off, geom)
 
         @flyc.kernel(known_block_size=[QUANT_THREADS, 1, 1])
         def sdma_reduce_quant(dev_comm: Int64, win: Int64):
@@ -1012,17 +1019,22 @@ def build_sdma_phases(
 
             raw_cco.cco_system_fence(fx.Int32(0))
 
+            # 15 descriptors below, so the window geometry is read once here
+            # rather than once per descriptor.
+            geom = _geom(w)
             # Peer p reduced slice p, so slice p is read out of p's own window.
             peers = [(rank + j) % ws for j in range(1, ws)]
             srcs = [
-                _row_addr_at(w, p, cfg.gout_off + p * cfg.slice_rows * cfg.n)
+                _row_addr_at(w, p, cfg.gout_off + p * cfg.slice_rows * cfg.n, geom)
                 for p in peers
             ]
-            scas = [_row_addr_at(w, p, cfg.gout_scale_slice_off(p)) for p in peers]
+            scas = [
+                _row_addr_at(w, p, cfg.gout_scale_slice_off(p), geom) for p in peers
+            ]
             # One descriptor for the destination, not one per peer: the slices
             # are contiguous in my own output, so the peer index folds into the
             # offset and 7 SGPR quads stay free.
-            out = _row_addr(w, out_off)
+            out = _row_addr(w, out_off, geom)
 
             for row in range(
                 bid * QUANT_WAVES + wave, slice_rows, pull_blocks * QUANT_WAVES
