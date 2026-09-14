@@ -285,8 +285,13 @@ def main():
             )
         return total, buf, bad.item() == 0, True
 
-    def time_pairs(mode, one_pair, capture):
+    def time_pairs(mode, one_pair, capture, split_legs):
         """ITERS (dispatch, combine) pairs; mean us per leg.
+
+        Timed three ways, and which one gets returned is on the [E2E] line as src=. Under a
+        graph it is the reading whose event records live inside the graph, because recording
+        them from the host every iteration adds 9.3 us to every pair -- see the comments
+        further down for what each way costs and what is left in the one that is reported.
 
         Warmup is lock-stepped per iteration: at small token counts a rank that
         starts call N+1 before every rank finished N can overwrite an unconsumed
@@ -322,59 +327,223 @@ def main():
             ev[2][i].record()
         torch.cuda.synchronize()
         dist.barrier()
-        d = sum(ev[0][i].elapsed_time(ev[1][i]) for i in range(ITERS)) / ITERS * 1000
-        c = sum(ev[1][i].elapsed_time(ev[2][i]) for i in range(ITERS)) / ITERS * 1000
+        hd = sum(ev[0][i].elapsed_time(ev[1][i]) for i in range(ITERS)) / ITERS * 1000
+        hc = sum(ev[1][i].elapsed_time(ev[2][i]) for i in range(ITERS)) / ITERS * 1000
 
-        # The same pairs timed again with nothing recorded between them: E2E_R of them captured
-        # into one graph and replayed as a unit, one event pair around the whole replay. Each
-        # pair then carries 1/R of a replay and 2/R of an event instead of two replays and three
-        # events, so d + c minus this is what the per-leg method costs, not what the kernels do.
+        # The floor: the same pairs with nothing recorded between them. E2E_R of them go into one
+        # graph, one event pair wraps a whole replay, so a pair carries 1/R of a replay and 2/R
+        # of an event instead of two replays and three events. It cannot say what either leg
+        # took, only what a pair costs when nobody is watching, which is what the per-leg
+        # readings get measured against.
         #
-        # It is not small and it is not a property of the kernel. On gfx1250 EP4 at 512 tokens
-        # it is 9.1-9.3 us per pair at bf16, fp8 and fp4 alike, and cutting the dispatch kernel
-        # short until it returns on entry -- fifty times less work -- moves it by under 1 us. It
-        # lands inside every per-leg number printed here, so a reader comparing these against a
-        # bench that amortizes its probes is handing over 9 us for nothing. Before #576 this
-        # file timed ITERS calls under a single event pair and paid none of it; that pass also
-        # kept the legs apart, so alternating pairs and cheap timing were never in conflict.
+        # What the per-iteration method adds is not small and is not a property of the kernel.
+        # On gfx1250 EP4 at 512 tokens it is 9.1-9.3 us per pair at bf16, fp8 and fp4 alike, and
+        # cutting the dispatch kernel short until it returns on entry -- fifty times less work --
+        # moves it by under 1 us. Before #576 this file timed ITERS calls under a single event
+        # pair and paid none of it; that pass also kept the legs apart, so alternating pairs and
+        # cheap timing were never in conflict.
         #
         # The pairs go inside the capture, never into a host loop. Submitting them back to back
         # from the host deadlocks the full kernel for the reason this function's own docstring
         # gives: a rank that starts call N+1 before every rank finished N overwrites a barrier
         # flag its peer has not consumed. Inside a graph the order is fixed.
-        #
-        # That also rules out the obvious way to steady this number. d and c each average ITERS
-        # iterations; e2e is one replay, and across four runs at 512 tokens it read 60.8, 61.0,
-        # 63.0 and 65.0 us -- a 4 us spread under a 9 us signal. Replaying several times inside
-        # the event pair would average it, and would hang for the reason just given. Raising
-        # E2E_R is the safe direction, since one replay then covers more pairs; the default of
-        # 10 matches the v1 bench and has not been swept. Until it is, read this across rounds
-        # and take the middle one, not a single run.
-        e2e = -1.0
+        e2e = slope = -1.0
         rep = int(os.environ.get("E2E_R", 10))
-        if mode == "graph" and rep > 0:
-            ge = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(ge):
-                for _ in range(rep):
+
+        def graph_of(npairs):
+            """A warmed-up graph holding npairs back-to-back pairs."""
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                for _ in range(npairs):
                     one_pair()
             lockstep()
             for _ in range(WARMUP):
-                ge.replay()
+                g.replay()
             lockstep()
-            a = torch.cuda.Event(enable_timing=True)
-            b = torch.cuda.Event(enable_timing=True)
-            a.record()
-            ge.replay()
-            b.record()
+            return g
+
+        def replay_us(g, n):
+            """Mean wall time of one replay of g, in us.
+
+            n replays, each under its own event pair, submitted back to back the way
+            the timed loop above submits its iterations. One replay was a single
+            sample of a quantity the per-iteration reading averages over ITERS, and
+            it moved several us between rounds, which is enough to swamp what this is
+            measuring."""
+            a = [torch.cuda.Event(enable_timing=True) for _ in range(n)]
+            b = [torch.cuda.Event(enable_timing=True) for _ in range(n)]
+            for k in range(n):
+                a[k].record()
+                g.replay()
+                b[k].record()
             torch.cuda.synchronize()
             dist.barrier()
-            e2e = a.elapsed_time(b) / rep * 1000
+            return sum(a[k].elapsed_time(b[k]) for k in range(n)) / n * 1000
+
+        if mode == "graph" and rep > 0:
+            n_e2e = int(os.environ.get("E2E_N", 20))
+            alt = int(os.environ.get("E2E_ALT", 4))
+            g_r, g_2r = graph_of(rep), graph_of(2 * rep)
+            t_r = t_2r = 0.0
+            # R and 2R alternate rather than one running after the other. Taken in
+            # sequence, whatever the machine drifts over those hundreds of replays lands
+            # entirely in the slope below, where dividing by R multiplies it: measured
+            # that way the slope moved 6.5 us between rounds while the two readings it is
+            # built from moved 1.8.
+            for _ in range(alt):
+                t_r += replay_us(g_r, n_e2e)
+                t_2r += replay_us(g_2r, n_e2e)
+            t_r, t_2r = t_r / alt, t_2r / alt
+            e2e = t_r / rep
+            # Dividing one replay by R leaves 1/R of the launch and 1/R of the event pair
+            # inside every pair; the difference between R and 2R is R pairs and nothing
+            # else, so its slope is what one more pair costs once it is nobody's first.
+            # Both are reported: e2e is the convention the numbers already on record were
+            # measured against, and it is the steadier of the two because it is one
+            # measurement rather than a difference of two.
+            slope = (t_2r - t_r) / rep
+        # What this function reports, when the mode allows it: the same R pairs in one graph,
+        # with the event records captured INTO the graph instead of issued from the host once
+        # per iteration. The order is unchanged and the legs stay separable; what changes is
+        # that a timestamp costs a graph node rather than a host API call and a queue packet.
+        # Against the floor above, on a08-1 at 512 tokens across bf16, fp8 and fp4, over 15
+        # rounds that each held the cards alone, this reads 5.3 us per pair where the
+        # per-iteration method reads 9.7.
+        #
+        # Those 5 us are the event nodes themselves and do not go away by batching: taking R
+        # from 10 to 40 left them at 5.5 -> 5.0 us per pair, within the round-to-round spread,
+        # where a cost paid once per replay would have dropped to a quarter. Three nodes a pair
+        # at roughly 1.6 us each. Below this needs a timestamp that never leaves the GPU, i.e.
+        # wall_clock64 inside the kernels (MORI_EP_SEGTIME), which cannot see the launch at all
+        # and which makes the correctness check fail on 17-23% of runs.
+        #
+        # Both legs pay it. Over 15 rounds with the cards to ourselves, combine's two readings
+        # differ by 2.38-3.25 us and dispatch's by -0.05-4.31, and over the ten fp8 and fp4
+        # rounds not one put dispatch near zero. An earlier twelve read 3 us on combine and
+        # nothing on dispatch, which was dispatch's own spread: that spread is still wider
+        # than the gap between the legs, so whether they pay the same is not answerable here.
+        #
+        # Amortizing per leg is not an option and this is why: dispatch accumulates into
+        # total_recv and only combine clears it (see prime), so R dispatches captured back to
+        # back would leave the next combine staging R times the tokens and running past the
+        # arena. Whatever replaces the per-iteration probes has to keep the pairs paired.
+        gd_us = gc_us = -1.0
+        gd_lo = gd_hi = gc_lo = gc_hi = float("nan")
+        gevr = int(os.environ.get("GEV_R", 20))
+        hip = None
+        if mode == "graph" and gevr > 0:
+            import ctypes
+
+            # An event recorded from inside a capture becomes an internal graph node, and an
+            # internal node's timestamp is not readable from the host: elapsed_time on one
+            # returns hipErrorInvalidHandle. The flag that makes it readable is
+            # hipEventRecordExternal, which torch.cuda.Event.record does not expose, so record
+            # through the HIP runtime instead. Where that library is not there, say so and fall
+            # back -- a reading 5 us off is worth having, a silent switch between two of them is
+            # not.
+            try:
+                hip = ctypes.CDLL("libamdhip64.so")
+            except OSError as exc:
+                if rank == 0:
+                    print(f"  [GEV] off, cannot load libamdhip64.so: {exc}", flush=True)
+        if hip is not None:
+            hip.hipEventRecordWithFlags.restype = ctypes.c_int
+            hip.hipEventRecordWithFlags.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_uint,
+            ]
+
+            rd, rc_leg = split_legs()
+            gev = [
+                [torch.cuda.Event(enable_timing=True) for _ in range(3)]
+                for _ in range(gevr)
+            ]
+            # torch creates the underlying hipEvent lazily and cuda_event reads 0 until then,
+            # so record each one once here. Recording into a null handle does not fail, it
+            # succeeds and leaves the timestamps at whatever they were.
+            for trio in gev:
+                for e in trio:
+                    e.record()
+            torch.cuda.synchronize()
+
+            def rec_ext(e):
+                r = hip.hipEventRecordWithFlags(
+                    ctypes.c_void_p(e.cuda_event),
+                    ctypes.c_void_p(torch.cuda.current_stream().cuda_stream),
+                    1,
+                )
+                if r != 0:
+                    raise RuntimeError(f"hipEventRecordWithFlags rc={r}")
+
+            gg = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(gg):
+                for i in range(gevr):
+                    rec_ext(gev[i][0])
+                    rd()
+                    rec_ext(gev[i][1])
+                    rc_leg()
+                    rec_ext(gev[i][2])
+            lockstep()
+            for _ in range(WARMUP):
+                gg.replay()
+            lockstep()
+            # The events are rewritten by every replay, so each one has to be read back before
+            # the next. That sync sits between replays, not between the legs, so it cannot land
+            # inside either reading -- what it does cost is that every replay starts against an
+            # empty queue instead of a full one.
+            n_gev = int(os.environ.get("GEV_N", 20))
+            # The first pair of every replay is dropped. That read-back has to synchronize,
+            # so every replay starts against an empty queue and its first dispatch waits out
+            # the graph launch, which the other R-1 do not. Averaged in at R=10 it put a
+            # tenth of a launch into dispatch and nothing into combine, a bias on one leg
+            # only. Dropping it took dispatch's round-to-round spread from 3.6 us to between
+            # 0.44 and 2.4 depending on dtype.
+            skip = 1 if gevr > 1 else 0
+            npair = gevr - skip
+            ds, cs = [], []
+            for _ in range(n_gev):
+                gg.replay()
+                lockstep()
+                ds.append(
+                    sum(gev[i][0].elapsed_time(gev[i][1]) for i in range(skip, gevr))
+                    / npair
+                    * 1000
+                )
+                cs.append(
+                    sum(gev[i][1].elapsed_time(gev[i][2]) for i in range(skip, gevr))
+                    / npair
+                    * 1000
+                )
+            gd_us, gc_us = sum(ds) / n_gev, sum(cs) / n_gev
+            # Reported so a reader can tell a 2 us effect from a 2 us spread without
+            # rerunning. Each sample here is already a mean over R-1 pairs, so this is the
+            # spread of replay-to-replay drift, not of single pairs.
+            gd_lo, gd_hi = min(ds), max(ds)
+            gc_lo, gc_hi = min(cs), max(cs)
+        # Report the graph-event reading where there is one, and say so on the diagnostic line
+        # rather than silently: two numbers 3 us apart that are both labelled "combine" is
+        # exactly the kind of thing that gets compared across runs months later.
+        d, c = (gd_us, gc_us) if gd_us > 0 else (hd, hc)
         # One rank prints. Four ranks each writing a long line is how torn output gets spliced
         # into a reading that parses and is wrong.
         if rank == 0 and e2e > 0:
+            src = "gev" if gd_us > 0 else "periter"
             print(
-                f"[E2E] mode={mode} d={d:.2f} c={c:.2f} sum={d + c:.2f} "
-                f"e2e={e2e:.2f} cost={d + c - e2e:.2f} R={rep} iters={ITERS}",
+                f"[E2E] mode={mode} src={src} d={d:.2f} c={c:.2f} sum={d + c:.2f} "
+                f"hd={hd:.2f} hc={hc:.2f} hsum={hd + hc:.2f} "
+                f"e2e={e2e:.2f} slope={slope:.2f} cost={hd + hc - e2e:.2f} "
+                f"R={rep} iters={ITERS}",
+                flush=True,
+            )
+        if rank == 0 and gd_us > 0:
+            print(
+                f"[GEV] mode={mode} gd={gd_us:.2f} gc={gc_us:.2f} "
+                f"gsum={gd_us + gc_us:.2f} "
+                f"over={gd_us + gc_us - e2e if e2e > 0 else float('nan'):.2f} "
+                f"overslope={gd_us + gc_us - slope if slope > 0 else float('nan'):.2f} "
+                f"gdlo={gd_lo:.2f} gdhi={gd_hi:.2f} gclo={gc_lo:.2f} gchi={gc_hi:.2f} "
+                f"R={gevr} N={n_gev}",
                 flush=True,
             )
         return d, c, run_d, run_c
@@ -567,7 +736,10 @@ def main():
 
             for mode in MODES:
                 d_us, c_us, run_d, run_c = time_pairs(
-                    mode, one_pair, capture_pair if mode == "graph" else eager_legs
+                    mode,
+                    one_pair,
+                    capture_pair if mode == "graph" else eager_legs,
+                    eager_legs,
                 )
                 got = torch.tensor([d_us, c_us, float(total)], dtype=torch.float64)
                 dist.all_reduce(got)
