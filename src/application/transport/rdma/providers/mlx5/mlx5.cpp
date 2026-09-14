@@ -109,36 +109,46 @@ mlx5dv_devx_umem* Mlx5RegisterControlUmem(ibv_context* context, void* addr, size
                                           uint32_t accessFlag, const char* what) {
   ControlDmabufMode mode = GetControlDmabufMode();
 
-  if (mode != ControlDmabufMode::kOff && Mlx5DvApi::Instance().devx_umem_reg_ex != nullptr) {
-    uint64_t dmabufOffset = 0;
-    int dmabufFd = TryExportDmabufFd(addr, size, &dmabufOffset);
-    if (dmabufFd >= 0) {
-      MoriMlx5DevxUmemIn in{};
-      in.addr = reinterpret_cast<void*>(dmabufOffset);  // dmabuf-relative byte offset
-      in.size = size;
-      in.access = accessFlag;
-      in.pgsz_bitmap = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
-      in.comp_mask = MORI_MLX5DV_UMEM_MASK_DMABUF;
-      in.dmabuf_fd = dmabufFd;
-      mlx5dv_devx_umem* umem = Mlx5DvApi::Instance().devx_umem_reg_ex(context, &in);
-      close(dmabufFd);
-      if (umem) {
-        MORI_APP_TRACE(
-            "MLX5 control umem [{}] registered via dmabuf: addr=0x{:x}, size={}, offset={}", what,
-            reinterpret_cast<uintptr_t>(addr), size, dmabufOffset);
-        return umem;
-      }
-      MORI_APP_WARN("MLX5 control umem [{}] dmabuf registration failed (addr=0x{:x}, size={})",
-                    what, reinterpret_cast<uintptr_t>(addr), size);
+  if (mode != ControlDmabufMode::kOff) {
+    const char* unavailable = nullptr;  // reason for the force-mode abort below
+    if (Mlx5DvApi::Instance().devx_umem_reg_ex == nullptr) {
+      unavailable = "mlx5dv_devx_umem_reg_ex missing (rdma-core too old)";
     } else {
-      MORI_APP_WARN("MLX5 control umem [{}] dmabuf export unavailable (addr=0x{:x}, size={})", what,
-                    reinterpret_cast<uintptr_t>(addr), size);
+      uint64_t dmabufOffset = 0;
+      int dmabufFd = TryExportDmabufFd(addr, size, &dmabufOffset);
+      if (dmabufFd >= 0) {
+        MoriMlx5DevxUmemIn in{};
+        in.addr = reinterpret_cast<void*>(dmabufOffset);  // dmabuf-relative byte offset
+        in.size = size;
+        in.access = accessFlag;
+        in.pgsz_bitmap = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
+        in.comp_mask = MORI_MLX5DV_UMEM_MASK_DMABUF;
+        in.dmabuf_fd = dmabufFd;
+        mlx5dv_devx_umem* umem = Mlx5DvApi::Instance().devx_umem_reg_ex(context, &in);
+        close(dmabufFd);
+        if (umem) {
+          MORI_APP_TRACE(
+              "MLX5 control umem [{}] registered via dmabuf: addr=0x{:x}, size={}, offset={}", what,
+              reinterpret_cast<uintptr_t>(addr), size, dmabufOffset);
+          return umem;
+        }
+        MORI_APP_WARN("MLX5 control umem [{}] dmabuf registration failed (addr=0x{:x}, size={})",
+                      what, reinterpret_cast<uintptr_t>(addr), size);
+        unavailable = "dmabuf registration failed";
+      } else {
+        MORI_APP_WARN("MLX5 control umem [{}] dmabuf export unavailable (addr=0x{:x}, size={})",
+                      what, reinterpret_cast<uintptr_t>(addr), size);
+        unavailable = "dmabuf export unavailable";
+      }
     }
+
+    // Force must abort even when the symbol is missing, else it silently downgrades
+    // to peermem on the old-rdma-core case it is meant to catch.
     if (mode == ControlDmabufMode::kForce) {
       MORI_APP_ERROR(
           "MLX5 control umem [{}] dmabuf required (MORI_MLX5_CONTROL_DMABUF=force) but "
-          "unavailable; aborting",
-          what);
+          "unavailable: {}; aborting",
+          what, unavailable);
       std::abort();
     }
   }
