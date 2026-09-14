@@ -25,6 +25,8 @@
 #include <infiniband/verbs.h>
 #include <unistd.h>
 
+#include <cerrno>
+#include <cstring>
 #include <iostream>
 #include <unordered_map>
 
@@ -127,6 +129,7 @@ mlx5dv_devx_umem* Mlx5RegisterControlUmem(ibv_context* context, void* addr, size
         in.comp_mask = MORI_MLX5DV_UMEM_MASK_DMABUF;
         in.dmabuf_fd = dmabufFd;
         mlx5dv_devx_umem* umem = Mlx5DvApi::Instance().devx_umem_reg_ex(context, &in);
+        int err = errno;  // capture before close() overwrites it
         close(dmabufFd);
         if (umem) {
           MORI_APP_TRACE(
@@ -134,8 +137,9 @@ mlx5dv_devx_umem* Mlx5RegisterControlUmem(ibv_context* context, void* addr, size
               reinterpret_cast<uintptr_t>(addr), size, dmabufOffset);
           return umem;
         }
-        MORI_APP_WARN("MLX5 control umem [{}] dmabuf registration failed (addr=0x{:x}, size={})",
-                      what, reinterpret_cast<uintptr_t>(addr), size);
+        MORI_APP_WARN(
+            "MLX5 control umem [{}] dmabuf registration failed (addr=0x{:x}, size={}, errno={} ({}))",
+            what, reinterpret_cast<uintptr_t>(addr), size, err, strerror(err));
         unavailable = "dmabuf registration failed";
       } else {
         MORI_APP_WARN("MLX5 control umem [{}] dmabuf export unavailable (addr=0x{:x}, size={})",
