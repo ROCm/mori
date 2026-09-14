@@ -591,7 +591,7 @@ DeepEP 的 <code class="docutils literal notranslate"><span class="pre">TokenLay
 </pre></div>
 </div>
 <p><code class="docutils literal notranslate"><span class="pre">MakeEpCfg</span></code> 也是拒绝非法组合的地方：<code class="docutils literal notranslate"><span class="pre">EpCfgIsValid</span></code> 不过就抛（token 字节数必须 16B 对齐、
-topk 和 worldSize 必须装进一个 wavefront、recv 容量必须覆盖最坏情况），combine 那条腿上的 <code class="docutils literal notranslate"><span class="pre">Byte8</span></code>
+topk 和 worldSize 必须装进一个 wavefront、recv 容量必须覆盖最坏情况），combine 那条腿上的字节类型
 单独拒绝（§3.7）。一个编不出来或跑错的 Cfg 是构造期错误，不是运行期的错误数字。</p>
 </section>
 <section id="id6">
@@ -606,12 +606,15 @@ topk 和 worldSize 必须装进一个 wavefront、recv 容量必须覆盖最坏�
 <h3>3.7 dtype 是传输属性，不是算术属性<a class="headerlink" href="#dtype" title="Link to this heading"></a></h3>
 <p>dispatch 只<strong>搬运</strong>它的载荷（gfx9xx 是 <code class="docutils literal notranslate"><span class="pre">WarpCopy</span></code>，gfx125x 是一发 TDM tile），从不对元素做算术。
 combine 要<strong>归约</strong>。这个不对称决定了 dtype 怎么建模：</p>
-<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="k">enum</span><span class="w"> </span><span class="k">class</span><span class="w"> </span><span class="nc">EpDType</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">Bf16</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">Fp32</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="n">Byte8</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="w"> </span><span class="p">};</span>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="k">enum</span><span class="w"> </span><span class="k">class</span><span class="w"> </span><span class="nc">EpDType</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">Bf16</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">Fp32</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="n">Fp8</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="n">Fp4x2</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="w"> </span><span class="p">};</span>
 </pre></div>
 </div>
-<p><code class="docutils literal notranslate"><span class="pre">Byte8</span></code> 是传输类型，渲染成 <code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">char</span></code>：fp8 直接用它，fp4 也用它、由调用方把 hiddenDim 减半
-（2 个 e2m1 挤一个字节）。所以支持 fp8/fp4 dispatch <strong>没有新增 kernel</strong>，只是打通 dtype 这条链。
-<code class="docutils literal notranslate"><span class="pre">MakeEpCfg</span></code> 在 combine 那条腿上拒绝 <code class="docutils literal notranslate"><span class="pre">Byte8</span></code>——它要求和，字节类型在那里能编过但会静默把字节加起来。</p>
+<p><code class="docutils literal notranslate"><span class="pre">Fp8</span></code> 和 <code class="docutils literal notranslate"><span class="pre">Fp4x2</span></code> 都是传输类型，都渲染成 <code class="docutils literal notranslate"><span class="pre">unsigned</span> <span class="pre">char</span></code>、都是一字节一<strong>元素</strong>，编出来的 kernel 体
+逐字节相同。分成两个枚举值只为了让 kernel 名说得出是哪一个：<code class="docutils literal notranslate"><span class="pre">fp4x2</span></code> 的一个元素是 2 个 e2m1，所以
+hiddenDim 在那里数的是<strong>字节</strong>、仍由调用方减半。共用一个标签的话 <code class="docutils literal notranslate"><span class="pre">_h3584</span></code> 既可能是 fp8&#64;3584
+也可能是 fp4&#64;7168，profile 上分不出来。所以支持 fp8/fp4 dispatch
+<strong>没有新增 kernel</strong>，只是打通 dtype 这条链。<code class="docutils literal notranslate"><span class="pre">MakeEpCfg</span></code> 在 combine 那条腿上拒绝这两个——它要求和，
+字节类型在那里能编过但会静默把字节加起来。</p>
 <p>两条腿本来就是两个独立的 Plan，各带各的 dtype 和元素数，所以「非对称」（fp8/fp4 进、bf16 出）不是
 一个特例路径，就是两个普通 kernel。arena 按 <code class="docutils literal notranslate"><span class="pre">token_nbytes</span></code> / <code class="docutils literal notranslate"><span class="pre">combine_token_nbytes</span></code> 分别定尺寸——
 这是 fp4 唯一正确的算法。mori 在这里<strong>不做量化</strong>：载荷进来时就已经是打包好的。</p>
