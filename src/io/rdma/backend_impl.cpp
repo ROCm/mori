@@ -21,6 +21,35 @@
 // SOFTWARE.
 #include "src/io/rdma/backend_impl.hpp"
 
+// ---------------------------------------------------------------------------
+// MoriRdmaHipDeviceGuard: save/restore the caller-visible HIP current device
+// across RDMA backend internals. The RDMA backend's CreateSession /
+// RegisterRdmaMemoryRegion path touches the HIP device (GetOrCreateDeviceContext
+// -> CreateRdmaDeviceContext / RegisterRdmaMemoryRegionAuto) but, unlike the
+// fabric and xgmi backends (which have ScopedHipDeviceGuard), it did NOT restore
+// the caller's device -> it left the model's HIP primary context mutated. On
+// GLM-5.3-Flash disagg (MI355X/ionic) that corrupted the context the model runs
+// on, so the next indexer Triton kernel load_binary / a memory query failed
+// (HIP-209 "no kernel image" or CUDA "OOM 0 bytes free"). This guard restores the
+// device on scope exit, matching the fabric/xgmi backends' existing pattern.
+#include <hip/hip_runtime.h>
+namespace {
+class MoriRdmaHipDeviceGuard {
+ public:
+  MoriRdmaHipDeviceGuard() {
+    if (hipGetDevice(&originalDevice_) != hipSuccess) valid_ = false;
+  }
+  ~MoriRdmaHipDeviceGuard() {
+    if (valid_) (void)hipSetDevice(originalDevice_);
+  }
+  MoriRdmaHipDeviceGuard(const MoriRdmaHipDeviceGuard&) = delete;
+  MoriRdmaHipDeviceGuard& operator=(const MoriRdmaHipDeviceGuard&) = delete;
+ private:
+  int originalDevice_{0};
+  bool valid_{true};
+};
+}  // namespace
+
 #include <infiniband/verbs.h>  // dereferences ibvHandle.qp/cq/compCh (forward-declared in core)
 #include <sys/epoll.h>
 
@@ -1551,7 +1580,10 @@ void RdmaBackend::DeregisterRemoteEngine(const EngineDesc& rdesc) {
   server->DeregisterRemoteEngine(rdesc);
 }
 
-void RdmaBackend::RegisterMemory(MemoryDesc& desc) { server->RegisterMemory(desc); }
+void RdmaBackend::RegisterMemory(MemoryDesc& desc) {
+  MoriRdmaHipDeviceGuard _mori_hip_dev_guard;  // restore caller HIP device on exit
+  server->RegisterMemory(desc);
+}
 
 void RdmaBackend::DeregisterMemory(const MemoryDesc& desc) {
   server->DeregisterMemory(desc);
@@ -1598,6 +1630,7 @@ BackendSession* RdmaBackend::CreateSession(const MemoryDesc& local, const Memory
 
 void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remote,
                                 RdmaBackendSession& sess) {
+  MoriRdmaHipDeviceGuard _mori_hip_dev_guard;  // restore caller HIP device on exit
   TopoKey localKey{local.deviceId, local.loc, local.numaNode};
   TopoKey remoteKey{remote.deviceId, remote.loc, remote.numaNode};
   TopoKeyPair kp{localKey, remoteKey};

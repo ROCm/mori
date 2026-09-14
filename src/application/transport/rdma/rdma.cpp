@@ -339,6 +339,20 @@ bool ReadIbEnableRelaxedOrderingEnv() {
 }
 
 int MaybeAddRelaxedOrderingFlag(int accessFlag) {
+  // Pensando ionic (AINIC) does not support REMOTE_ATOMIC-capable MRs; ibv_reg_mr
+  // returns EINVAL (errno 22) for any MR registered with IBV_ACCESS_REMOTE_ATOMIC,
+  // regardless of size. Set MORI_IO_DISABLE_ATOMIC_MR=1 (alias MORI_NO_ATOMIC_MR=1)
+  // to strip the atomic bit so MoRI-IO KV registration succeeds on ionic (RDMA
+  // write/read still work; the KV transfer path does not rely on NIC remote-atomic).
+  {
+    const char* v = getenv("MORI_IO_DISABLE_ATOMIC_MR");
+    if (!v || v[0] != '1') {
+      v = getenv("MORI_NO_ATOMIC_MR");
+    }
+    if (v && v[0] == '1') {
+      accessFlag &= ~IBV_ACCESS_REMOTE_ATOMIC;
+    }
+  }
 #ifdef IBV_ACCESS_RELAXED_ORDERING
   if (ReadIbEnableRelaxedOrderingEnv()) {
     return accessFlag | IBV_ACCESS_RELAXED_ORDERING;
