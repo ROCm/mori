@@ -110,50 +110,64 @@ class Window:
         """Peer's LSA-accessible VA inside this window (uint64), for direct load/store."""
         return raw.cco_lsa_ptr(self.handle, peer_lsa_rank, offset)
 
-    def lsa_geometry(self):
-        """Read the window's base and peer stride once, for reuse.
 
-        ``cco_lsa_ptr`` is ``winBase + peer * stride + offset``, and it loads
-        *both* fields out of the window descriptor on every call. FlyDSL emits
-        it as an extern call so the tracer cannot fold it, and although it is
-        ``always_inline`` -- so LLVM does see the two loads -- a kernel that
-        stores through addresses derived from that same base gives LLVM no way
-        to prove the loads are not clobbered, so it must reload them.
+class CachedWindow:
+    """A :class:`Window` that reads its geometry once, at construction.
 
-        Taking the geometry once turns every later address into ordinary DSL
-        arithmetic over SSA values, which the compiler *can* fold. For the
-        common case here, where the peer and the offset are both Python ints,
-        it collapses to a single add against a value already in a register.
+    Drop-in for ``Window`` at the top of a kernel::
 
-        The two reads go through ``cco_lsa_win_base`` / ``cco_lsa_stride``,
-        which take an ``address_space(1)`` pointer so each is a single
-        ``global_load``. ``cco_lsa_ptr`` casts to a *generic* pointer, and a
-        generic access has to be a ``flat_load`` -- the compiler cannot rule out
-        LDS -- so it is counted against ``lgkmcnt`` as well as ``vmcnt``, and any
-        following ``s_waitcnt`` has one more counter to wait on. Returns
-        ``(base, stride)`` for :meth:`lsa_ptr_at`.
+        w = cco.CachedWindow(win)       # instead of cco.Window(win)
 
-        **It does not measure on mori's own kernels, and that is expected.**
-        Swapping the 15 descriptors in ``gemm_ar``'s LSA pull gather over to it
-        moves a 230us kernel by nothing: 973.2us before, 972.5/975.8/976.1
-        after. Every ``lsa_ptr`` call in that package is already at kernel
-        scope -- descriptors get built once before the hot loop, which is the
-        established idiom there -- so what this removes is on the order of 26
-        loads per launch.
+    and every ``w.lsa_ptr(...)`` after it becomes arithmetic instead of an
+    extern call. Nothing else about the kernel changes.
 
-        Where it *would* pay is a kernel that needs an address inside a loop,
-        which is exactly the case the idiom above exists to avoid. Use it when
-        the call count is large or per-iteration; do not expect it to show up
-        otherwise.
-        """
-        base = fx.Int64(raw.cco_lsa_win_base(self.handle))
-        stride = fx.Int64(raw.cco_lsa_stride(self.handle))
-        return base, stride
+    ``cco_lsa_ptr`` is ``winBase + peer*stride + offset`` and loads *both*
+    fields out of the window descriptor on every call. It is opaque to FlyDSL's
+    tracer, and although it is ``always_inline`` -- so LLVM does see the loads --
+    a kernel that stores through addresses derived from that same base gives
+    LLVM no way to prove they are not clobbered, so it reloads them.
 
-    @staticmethod
-    def lsa_ptr_at(base, stride, peer_lsa_rank, offset=0):
-        """:meth:`lsa_ptr` from a cached :meth:`lsa_geometry` -- no extern call."""
-        return base + fx.Int64(peer_lsa_rank) * stride + fx.Int64(offset)
+    The two reads here go through ``cco_lsa_win_base`` / ``cco_lsa_stride``,
+    which take an ``address_space(1)`` pointer so each is a single
+    ``global_load``. ``cco_lsa_ptr`` casts to a *generic* pointer, and a generic
+    access has to be a ``flat_load`` -- the compiler cannot rule out LDS -- so it
+    counts against ``lgkmcnt`` as well as ``vmcnt``, giving any following
+    ``s_waitcnt`` one more counter to wait on.
+
+    **It does not measure on mori's own kernels, and that is expected.**
+    A/B/A' at ``m=16384 n=7168 k=2048`` on 8x MI355X, us, lower is better::
+
+        wire         Window    CachedWindow    Window again
+        bf16/sdma    1114.5        1111.4          1115.4
+        fp8/sdma      983.3         983.6           983.6
+        fp8/lsa       926.6         924.3           926.0
+
+    The difference is smaller than the drift between the two Window runs. Every
+    ``lsa_ptr`` call in ``gemm_ar`` is already at kernel scope -- descriptors get
+    built once before the hot loop, which is the established idiom -- so what
+    this removes is on the order of tens of loads per launch against a kernel
+    that runs for a millisecond. Reach for it when a kernel needs addresses *per
+    iteration*; do not expect it to show up otherwise.
+
+    Measure A/B in one session if you revisit this. Absolute numbers on this box
+    move ~4% between mornings, across every configuration at once, which is
+    several times the effect being looked for.
+
+    Unlike :class:`Window` this is a plain Python object, not a ``cco_struct``,
+    so it cannot be carried across an ``scf.if``/``scf.for`` boundary. Build it
+    inside whichever region needs it, or use ``Window`` there.
+    """
+
+    __slots__ = ("handle", "base", "stride")
+
+    def __init__(self, win):
+        self.handle = fx.Int64(win)
+        self.base = fx.Int64(raw.cco_lsa_win_base(self.handle))
+        self.stride = fx.Int64(raw.cco_lsa_stride(self.handle))
+
+    def lsa_ptr(self, peer_lsa_rank, offset=0):
+        """Same contract as :meth:`Window.lsa_ptr`, with no extern call."""
+        return self.base + fx.Int64(peer_lsa_rank) * self.stride + fx.Int64(offset)
 
 
 @cco_struct

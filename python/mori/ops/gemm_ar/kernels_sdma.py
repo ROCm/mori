@@ -294,25 +294,17 @@ def build_sdma_phases(
 
     I32_PER_PACK = 4  # a 16B pack always moves as 4 x i32, whatever the payload
 
-    def _next_flag(w, bid, geom):
+    def _next_flag(w, bid):
         """``_flag[block] + 1`` -- monotonic, never reset (graph-replay safe)."""
-        base = w.lsa_ptr_at(geom[0], geom[1], rank, flag_off) + fx.Int64(
-            bid
-        ) * fx.Int64(4)
+        base = fx.Int64(w.lsa_ptr(rank, flag_off)) + fx.Int64(bid) * fx.Int64(4)
         rsrc = signal_ptr(base)
         return fx.Int32(local_load_u32(rsrc)) + fx.Int32(1), rsrc
 
-    def _signal_and_wait(w, arr_off, flag, tid, geom):
-        """Row-0 barrier: publish to peer ``tid``, then wait on ``tid``'s slot.
-
-        The peer here is a *runtime* lane index, so this is the one site where
-        the address genuinely varies per lane -- and therefore the one where
-        computing it from a cached geometry, rather than calling `lsa_ptr`,
-        replaces a descriptor load pair with a multiply-add.
-        """
-        peer_arr = w.lsa_ptr_at(geom[0], geom[1], tid, arr_off)
+    def _signal_and_wait(w, arr_off, flag, tid):
+        """Row-0 barrier: publish to peer ``tid``, then wait on ``tid``'s slot."""
+        peer_arr = fx.Int64(w.lsa_ptr(tid, arr_off))
         signal_store_u32(signal_ptr(peer_arr + fx.Int64(rank * 4)), flag)
-        self_arr = w.lsa_ptr_at(geom[0], geom[1], rank, arr_off)
+        self_arr = fx.Int64(w.lsa_ptr(rank, arr_off))
         _spin_until(signal_ptr(self_arr + fx.Int64(tid) * fx.Int64(4)), flag)
 
     def _push_kernel(
@@ -341,11 +333,10 @@ def build_sdma_phases(
         @flyc.kernel(known_block_size=[PUSH_THREADS, 1, 1])
         def push(dev_comm: Int64, win: Int64):
             tid = fx.thread_idx.x
-            w = cco.Window(win)
+            w = cco.CachedWindow(win)
             sdma = cco.DevComm(dev_comm).sdma()
 
-            geom = w.lsa_geometry()
-            flag, flag_rsrc = _next_flag(w, 0, geom)
+            flag, flag_rsrc = _next_flag(w, 0)
             if tid < ws:
                 if tid != rank:
                     if const_expr(pushes):
@@ -382,7 +373,7 @@ def build_sdma_phases(
                 # hoisted above the drain, which is the one ordering the receiver
                 # depends on.
                 raw_cco.cco_system_fence(fx.Int32(0))
-                _signal_and_wait(w, arr_off, flag, tid, geom)
+                _signal_and_wait(w, arr_off, flag, tid)
             fgpu.barrier()
             if tid == 0:
                 local_store_u32(flag_rsrc, flag)
@@ -409,26 +400,27 @@ def build_sdma_phases(
         """
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
-        w = cco.Window(win)
+        w = cco.CachedWindow(win)
 
         # j=0 is my own contribution. Normally it is still sitting in my input
         # region; with the Direct-LSA fused GEMM the epilogue wrote it into my own
         # recv slot instead, along with everyone else's.
-        # Nine descriptors from one window: take the geometry once.
-        geom = w.lsa_geometry()
-
-        def _rsrc(byte_off):
-            return create_buffer_resource_from_addr(
-                wave_uniform_i64(w.lsa_ptr_at(geom[0], geom[1], rank, byte_off))
-            )
-
         self_off = (
             cfg.recv_slot_off(rank) if reduce_self_from_recv else in_off + my_slice_off
         )
-        srcs = [_rsrc(self_off)] + [
-            _rsrc(cfg.recv_slot_off((rank + j) % ws)) for j in range(1, ws)
+        srcs = [
+            create_buffer_resource_from_addr(
+                wave_uniform_i64(w.lsa_ptr(rank, self_off))
+            )
+        ] + [
+            create_buffer_resource_from_addr(
+                wave_uniform_i64(w.lsa_ptr(rank, cfg.recv_slot_off((rank + j) % ws)))
+            )
+            for j in range(1, ws)
         ]
-        out = _rsrc(out_off + my_slice_off)
+        out = create_buffer_resource_from_addr(
+            wave_uniform_i64(w.lsa_ptr(rank, out_off + my_slice_off))
+        )
 
         gtid = bid * threads + tid
         for pk in range(gtid, part, red_stride):
@@ -556,34 +548,25 @@ def build_sdma_phases(
         """
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
-        w = cco.Window(win)
+        w = cco.CachedWindow(win)
         sdma = cco.DevComm(dev_comm).sdma()
-
-        # Nine descriptors from one window: take the geometry once.
-        geom = w.lsa_geometry()
-
-        def _rsrc(byte_off):
-            return create_buffer_resource_from_addr(
-                wave_uniform_i64(w.lsa_ptr_at(geom[0], geom[1], rank, byte_off))
-            )
 
         self_off = (
             cfg.recv_slot_off(rank) if reduce_self_from_recv else in_off + my_slice_off
         )
-        srcs = [_rsrc(self_off)] + [
-            _rsrc(cfg.recv_slot_off((rank + j) % ws)) for j in range(1, ws)
+        srcs = [
+            create_buffer_resource_from_addr(
+                wave_uniform_i64(w.lsa_ptr(rank, self_off))
+            )
+        ] + [
+            create_buffer_resource_from_addr(
+                wave_uniform_i64(w.lsa_ptr(rank, cfg.recv_slot_off((rank + j) % ws)))
+            )
+            for j in range(1, ws)
         ]
-        out = _rsrc(out_off + my_slice_off)
-
-        # `lsa_ptr` is an opaque extern call that loads two fields out of the
-        # window descriptor (`winBase`, `stride4G`) and combines them. The
-        # compiler cannot see through it, so it cannot hoist or CSE the calls
-        # itself -- every call re-reads both. Both of these bases are
-        # loop-invariant, so they are taken once here rather than once per
-        # (block, band). This is the same reason the source/destination buffer
-        # descriptors above are built at kernel scope and not in the pack loop.
-        ctr_base = w.lsa_ptr_at(geom[0], geom[1], rank, gather_counter_off)
-        lock_base = w.lsa_ptr_at(geom[0], geom[1], rank, lock_off)
+        out = create_buffer_resource_from_addr(
+            wave_uniform_i64(w.lsa_ptr(rank, out_off + my_slice_off))
+        )
 
         gtid = bid * threads + tid
         for band in range_constexpr(cfg.gather_bands):
@@ -645,7 +628,10 @@ def build_sdma_phases(
             if const_expr(publish == "fence"):
                 raw_cco.cco_system_fence(fx.Int32(0))
             if tid == fx.Int32(0):
-                ctr = signal_ptr(ctr_base + fx.Int64(band) * fx.Int64(4))
+                ctr = signal_ptr(
+                    fx.Int64(w.lsa_ptr(rank, gather_counter_off))
+                    + fx.Int64(band) * fx.Int64(4)
+                )
                 seq = fx.Int32(atomic_add_u32(ctr, 1)) + fx.Int32(1)
                 # Monotonic, never reset, so "last block of this band, this
                 # epoch" is a modulo rather than a compare -- the property that
@@ -655,7 +641,10 @@ def build_sdma_phases(
                         dest = (rank + j) % ws
                         # Two bands can be elected at nearly the same moment and
                         # would then post to the same per-destination queue.
-                        lock = signal_ptr(lock_base + fx.Int64(dest) * fx.Int64(4))
+                        lock = signal_ptr(
+                            fx.Int64(w.lsa_ptr(rank, lock_off))
+                            + fx.Int64(dest) * fx.Int64(4)
+                        )
                         _acquire_peer_lock(lock)
                         sdma.put(
                             dest,
@@ -713,17 +702,15 @@ def build_sdma_phases(
             ),
         )
 
-        # These build one descriptor per (peer, region), and `lsa_pull_gather`
-        # wants 15 of them. `lsa_ptr` reads the window's base and stride on
-        # every call, so callers take the geometry once and the rest is
-        # arithmetic -- see Window.lsa_geometry.
-        def _row_addr_at(w, peer, byte_off, geom):
+        def _row_addr_at(w, peer, byte_off):
             return create_buffer_resource_from_addr(
-                wave_uniform_i64(w.lsa_ptr_at(geom[0], geom[1], peer, byte_off))
+                wave_uniform_i64(w.lsa_ptr(peer, byte_off))
             )
 
-        def _row_addr(w, byte_off, geom):
-            return _row_addr_at(w, rank, byte_off, geom)
+        def _row_addr(w, byte_off):
+            return create_buffer_resource_from_addr(
+                wave_uniform_i64(w.lsa_ptr(rank, byte_off))
+            )
 
         @flyc.kernel(known_block_size=[QUANT_THREADS, 1, 1])
         def sdma_reduce_quant(dev_comm: Int64, win: Int64):
@@ -764,23 +751,21 @@ def build_sdma_phases(
             """
             tid = fx.thread_idx.x
             bid = fx.block_idx.x
-            w = cco.Window(win)
+            w = cco.CachedWindow(win)
             lane = tid % fx.Int32(WAVE)
             wave = tid // fx.Int32(WAVE)
-            geom = w.lsa_geometry()
 
             self_off = (
                 cfg.recv_slot_off(rank)
                 if reduce_self_from_recv
                 else in_off + my_slice_off
             )
-            srcs = [_row_addr(w, self_off, geom)] + [
-                _row_addr(w, cfg.recv_slot_off((rank + j) % ws), geom)
-                for j in range(1, ws)
+            srcs = [_row_addr(w, self_off)] + [
+                _row_addr(w, cfg.recv_slot_off((rank + j) % ws)) for j in range(1, ws)
             ]
-            out = _row_addr(w, out_off + my_slice_off, geom)
-            gdst = _row_addr(w, cfg.gout_off + rank * cfg.slice_rows * cfg.n, geom)
-            gsca = _row_addr(w, cfg.gout_scale_slice_off(rank), geom)
+            out = _row_addr(w, out_off + my_slice_off)
+            gdst = _row_addr(w, cfg.gout_off + rank * cfg.slice_rows * cfg.n)
+            gsca = _row_addr(w, cfg.gout_scale_slice_off(rank))
 
             for row in range(
                 bid * QUANT_WAVES + wave, slice_rows, quant_blocks * QUANT_WAVES
@@ -856,14 +841,13 @@ def build_sdma_phases(
             """
             tid = fx.thread_idx.x
             bid = fx.block_idx.x
-            w = cco.Window(win)
+            w = cco.CachedWindow(win)
             lane = tid % fx.Int32(WAVE)
             wave = tid // fx.Int32(WAVE)
-            geom = w.lsa_geometry()
 
-            src = _row_addr(w, out_off + my_slice_off, geom)
-            dst = _row_addr(w, cfg.gout_off + rank * cfg.slice_rows * cfg.n, geom)
-            sca = _row_addr(w, cfg.gout_scale_slice_off(rank), geom)
+            src = _row_addr(w, out_off + my_slice_off)
+            dst = _row_addr(w, cfg.gout_off + rank * cfg.slice_rows * cfg.n)
+            sca = _row_addr(w, cfg.gout_scale_slice_off(rank))
 
             for row in range(
                 bid * QUANT_WAVES + wave, slice_rows, quant_blocks * QUANT_WAVES
@@ -937,18 +921,15 @@ def build_sdma_phases(
             """
             tid = fx.thread_idx.x
             bid = fx.block_idx.x
-            w = cco.Window(win)
+            w = cco.CachedWindow(win)
             lane = tid % fx.Int32(WAVE)
             wave = tid // fx.Int32(WAVE)
-            geom = w.lsa_geometry()
 
             for j in range_constexpr(1, ws):
                 peer = (rank + j) % ws
-                # All three are in *my own* window: the SDMA push already
-                # delivered peer `peer`'s slice and scales here.
-                src = _row_addr(w, cfg.gout_off + peer * cfg.slice_rows * cfg.n, geom)
-                sca = _row_addr(w, cfg.gout_scale_slice_off(peer), geom)
-                dst = _row_addr(w, out_off + peer * cfg.slice_rows * cfg.n * 2, geom)
+                src = _row_addr(w, cfg.gout_off + peer * cfg.slice_rows * cfg.n)
+                sca = _row_addr(w, cfg.gout_scale_slice_off(peer))
+                dst = _row_addr(w, out_off + peer * cfg.slice_rows * cfg.n * 2)
 
                 for row in range(
                     bid * QUANT_WAVES + wave, slice_rows, quant_blocks * QUANT_WAVES
@@ -1021,28 +1002,23 @@ def build_sdma_phases(
             """
             tid = fx.thread_idx.x
             bid = fx.block_idx.x
-            w = cco.Window(win)
+            w = cco.CachedWindow(win)
             lane = tid % fx.Int32(WAVE)
             wave = tid // fx.Int32(WAVE)
 
             raw_cco.cco_system_fence(fx.Int32(0))
 
-            # 15 descriptors below, so the window geometry is read once here
-            # rather than once per descriptor.
-            geom = w.lsa_geometry()
             # Peer p reduced slice p, so slice p is read out of p's own window.
             peers = [(rank + j) % ws for j in range(1, ws)]
             srcs = [
-                _row_addr_at(w, p, cfg.gout_off + p * cfg.slice_rows * cfg.n, geom)
+                _row_addr_at(w, p, cfg.gout_off + p * cfg.slice_rows * cfg.n)
                 for p in peers
             ]
-            scas = [
-                _row_addr_at(w, p, cfg.gout_scale_slice_off(p), geom) for p in peers
-            ]
+            scas = [_row_addr_at(w, p, cfg.gout_scale_slice_off(p)) for p in peers]
             # One descriptor for the destination, not one per peer: the slices
             # are contiguous in my own output, so the peer index folds into the
             # offset and 7 SGPR quads stay free.
-            out = _row_addr(w, out_off, geom)
+            out = _row_addr(w, out_off)
 
             for row in range(
                 bid * QUANT_WAVES + wave, slice_rows, pull_blocks * QUANT_WAVES
