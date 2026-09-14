@@ -74,6 +74,30 @@ int SubmissionLedger::ReleaseOrphanedByRecovery(std::atomic<int>* sqDepth) {
   return total;
 }
 
+int SubmissionLedger::FailAll(StatusCode code, const std::string& message,
+                              std::atomic<int>* sqDepth) {
+  std::vector<TransferStatus*> claimed;
+  int total = 0;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    for (auto& [id, rec] : records_) {
+      total += rec.postedWr;
+      if (!rec.meta) continue;
+      // Records of one batch share a meta; exchange() makes the first one win and
+      // also stops a racing CQE from reporting a different outcome afterwards.
+      TransferStatus* status = rec.meta->status.exchange(nullptr, std::memory_order_acq_rel);
+      if (status != nullptr) claimed.push_back(status);
+    }
+    records_.clear();
+    if (sqDepth && total > 0) sqDepth->fetch_sub(total, kSqAdmissionOrder);
+  }
+
+  // Update() wakes WaitFor() sleepers, so run it outside the ledger lock to keep
+  // woken threads from contending on a lock this call still holds.
+  for (TransferStatus* status : claimed) status->Update(code, message);
+  return static_cast<int>(claimed.size());
+}
+
 bool SubmissionLedger::HasOrphaned() const {
   std::lock_guard<std::mutex> lock(mu_);
   for (const auto& [id, rec] : records_) {

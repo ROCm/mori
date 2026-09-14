@@ -266,8 +266,16 @@ RdmaManager::RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* 
   bool enableAsyncEvents = true;
   env::Override("MORI_IO_ENABLE_ASYNC_EVENTS", enableAsyncEvents, mori::env::detail::ParseBool);
   if (enableAsyncEvents) {
+    bool failOnAsyncEvent = true;
+    env::Override("MORI_IO_FAIL_ON_ASYNC_EVENT", failOnAsyncEvent, mori::env::detail::ParseBool);
+
+    QpErrorHandler handler = nullptr;
+    if (failOnAsyncEvent) {
+      handler = [this](const QpErrorEvent& event) { FailInFlightTransfers(event); };
+    }
+
     auto logger = mori::ModuleLogger::GetInstance().GetLogger(mori::modules::IO);
-    asyncEventMonitor_ = RdmaAsyncEventMonitor::Create(devices, logger);
+    asyncEventMonitor_ = RdmaAsyncEventMonitor::Create(devices, logger, std::move(handler));
     if (!asyncEventMonitor_ && logger) {
       logger->error("Failed to start RDMA async event monitor; continuing without it");
     }
@@ -275,14 +283,16 @@ RdmaManager::RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* 
 }
 
 RdmaManager::~RdmaManager() {
+  // Join the monitor thread first: its handler reaches back into this object and
+  // into endpoint ledgers, neither of which may be torn down under it.
+  asyncEventMonitor_.reset();
+
   for (auto* devCtx : deviceCtxs) {
     if (devCtx != nullptr) {
       delete devCtx;
     }
   }
   deviceCtxs.clear();
-
-  asyncEventMonitor_.reset();
 
   if (ctx != nullptr) {
     delete ctx;
@@ -609,6 +619,71 @@ application::RdmaDeviceContext* RdmaManager::GetRdmaDeviceContext(int devId) {
   return deviceCtxs[devId];
 }
 
+namespace {
+
+// Which endpoints a fatal async event takes down with it. A QP event hits one
+// endpoint; a CQ or device event hits everything sharing that CQ or context.
+bool EndpointAffectedByAsyncEvent(const QpErrorEvent& event, const EpPair& ep) {
+  const auto& handle = ep.local.ibvHandle;
+  switch (event.scope) {
+    case QpErrorEvent::Scope::kQueuePair:
+      return ep.local.handle.qpn == event.qpNum;
+    case QpErrorEvent::Scope::kCompletionQueue:
+      return handle.cq != nullptr && static_cast<const void*>(handle.cq) == event.cq;
+    case QpErrorEvent::Scope::kDevice:
+      return handle.qp != nullptr && handle.qp->context == event.context;
+  }
+  return false;
+}
+
+const char* AsyncEventScopeReason(QpErrorEvent::Scope scope) {
+  switch (scope) {
+    case QpErrorEvent::Scope::kQueuePair:
+      return "queue pair entered Error state and must be rebuilt before it can carry traffic again";
+    case QpErrorEvent::Scope::kCompletionQueue:
+      return "completion queue failed, so no further completion can be reaped for this endpoint";
+    case QpErrorEvent::Scope::kDevice:
+      return "device reported a fatal error affecting every endpoint on its context";
+  }
+  return "endpoint is unusable";
+}
+
+}  // namespace
+
+int RdmaManager::FailInFlightTransfers(const QpErrorEvent& event) {
+  SnapshotVector runtimes;
+  SnapshotEndpointRuntimes(runtimes);
+
+  const std::string message = std::string("verbs async event ") + event.eventName + ": " +
+                              AsyncEventScopeReason(event.scope);
+
+  int failed = 0;
+  int affectedEps = 0;
+  for (const auto& rt : runtimes) {
+    if (!rt || !rt->ep.ledger) continue;
+    if (!EndpointAffectedByAsyncEvent(event, rt->ep)) continue;
+
+    ++affectedEps;
+    failed += rt->ep.ledger->FailAll(StatusCode::ERR_RDMA_OP, message, rt->ep.sqDepth.get());
+    // The QP cannot carry traffic again without being rebuilt, so refuse new
+    // submissions rather than letting them queue onto it and hang. FailAll left
+    // the ledger empty, so the CQE path cannot clear this flag afterwards.
+    if (rt->ep.degraded) rt->ep.degraded->store(true, kSqAdmissionOrder);
+    NotifySqStateChanged(rt->ep);
+  }
+
+  if (affectedEps > 0) {
+    MORI_IO_ERROR(
+        "async event {}: failed {} in-flight transfer(s) across {} endpoint(s); endpoints marked "
+        "degraded and will reject new submissions until rebuilt",
+        event.eventName, failed, affectedEps);
+  } else {
+    MORI_IO_WARN("async event {}: no live endpoint matched (qpn={}); nothing to fail",
+                 event.eventName, event.qpNum);
+  }
+  return failed;
+}
+
 bool RdmaManager::HasIonicDevice() const {
   for (const auto& [device, portId] : availDevices) {
     const ibv_device_attr_ex* attr = device->GetDeviceAttr();
@@ -768,10 +843,9 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
           LogAsyncTransferFailureIfNeeded(&meta->diagnostics,
                                           static_cast<uint32_t>(StatusCode::ERR_RDMA_OP),
                                           failureAdvice.ComposeStatusMessage());
-          TransferStatus* statusPtr = meta->status;
+          TransferStatus* statusPtr = meta->status.exchange(nullptr, std::memory_order_acq_rel);
           if (statusPtr != nullptr) {
             statusPtr->Update(StatusCode::ERR_RDMA_OP, failureAdvice.ComposeStatusMessage());
-            meta->status = nullptr;
           }
           if (ep.degraded && ep.degraded->load(kSqAdmissionOrder) && ep.ledger) {
             const int orphanedReleased = ep.ledger->ReleaseOrphanedByRecovery(ep.sqDepth.get());
@@ -868,9 +942,13 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
         if (meta) {
           NotifySqStateChanged(ep);
           uint32_t finishedBefore = meta->finishedBatchSize.fetch_add(mergedBatchSize);
-          TransferStatus* statusPtr = meta->status;
-          if (statusPtr != nullptr && (finishedBefore + mergedBatchSize) == meta->totalBatchSize) {
-            statusPtr->Update(StatusCode::SUCCESS, ibv_wc_status_str(wc[i].status));
+          if ((finishedBefore + mergedBatchSize) == meta->totalBatchSize) {
+            // Claim before updating so a concurrent async-event failure cannot
+            // then overwrite a transfer that actually completed.
+            TransferStatus* statusPtr = meta->status.exchange(nullptr, std::memory_order_acq_rel);
+            if (statusPtr != nullptr) {
+              statusPtr->Update(StatusCode::SUCCESS, ibv_wc_status_str(wc[i].status));
+            }
           }
           MORI_IO_TRACE("ProcessOneCqe: batch CQE for task {} total={} finished={} cur={}",
                         meta->id, meta->totalBatchSize, finishedBefore, mergedBatchSize);
