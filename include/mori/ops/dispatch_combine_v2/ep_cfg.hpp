@@ -91,9 +91,7 @@ inline const char* EpDTypeTag(EpDType d) {
   }
 }
 
-constexpr int EpElemSize(EpDType d) {
-  return d == EpDType::Fp32 ? 4 : (EpDTypeIsByte(d) ? 1 : 2);
-}
+constexpr int EpElemSize(EpDType d) { return d == EpDType::Fp32 ? 4 : (EpDTypeIsByte(d) ? 1 : 2); }
 
 inline std::string RenderValue(EpDType d) {
   switch (d) {
