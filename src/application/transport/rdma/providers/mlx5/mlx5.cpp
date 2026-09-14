@@ -160,6 +160,14 @@ mlx5dv_devx_umem* Mlx5RegisterControlUmem(ibv_context* context, void* addr, size
   }
 
   mlx5dv_devx_umem* umem = Mlx5DvApi::Instance().devx_umem_reg(context, addr, size, accessFlag);
+  if (umem == nullptr) {
+    int err = errno;
+    MORI_APP_ERROR(
+        "MLX5 control umem [{}] peermem registration failed (addr=0x{:x}, size={}, errno={} ({})); "
+        "dmabuf and peermem both failed - is a peer-mem module loaded?",
+        what, reinterpret_cast<uintptr_t>(addr), size, err, strerror(err));
+    return nullptr;
+  }
   MORI_APP_TRACE("MLX5 control umem [{}] registered via peermem: addr=0x{:x}, size={}", what,
                  reinterpret_cast<uintptr_t>(addr), size);
   return umem;
@@ -199,6 +207,14 @@ ibv_mr* Mlx5RegisterMrDmabuf(ibv_pd* pd, void* addr, size_t size, int accessFlag
   }
 
   ibv_mr* mr = ibv_reg_mr(pd, addr, size, accessFlag);
+  if (mr == nullptr) {
+    int err = errno;
+    MORI_APP_ERROR(
+        "MLX5 MR [{}] peermem registration failed (addr=0x{:x}, size={}, errno={} ({})); "
+        "dmabuf and peermem both failed - is a peer-mem module loaded?",
+        what, reinterpret_cast<uintptr_t>(addr), size, err, strerror(err));
+    return nullptr;
+  }
   MORI_APP_TRACE("MLX5 MR [{}] registered via peermem: addr=0x{:x}, size={}", what,
                  reinterpret_cast<uintptr_t>(addr), size);
   return mr;
