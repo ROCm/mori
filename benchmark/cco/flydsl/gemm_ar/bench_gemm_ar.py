@@ -682,10 +682,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--fuse-quantize",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="fold the fp8 narrowing into the reduce instead of running it as "
-        "its own kernel. Same numbers either way; it saves reading the bf16 "
-        "back out of memory.",
+        "its own kernel. Costs ~23us at M=16384 despite saving a read of the "
+        "bf16: off, matching build_sdma_phases' own default.",
     )
     p.add_argument(
         "--gather-transport",
