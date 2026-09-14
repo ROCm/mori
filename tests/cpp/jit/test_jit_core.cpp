@@ -414,7 +414,7 @@ TEST(EntryName, DistinguishesWhatAProfileNeedsToTellApart) {
   renamed([](EpCfg& c) { c.worldSize = 4; }, "worldSize");
   renamed([](EpCfg& c) { c.hiddenDim = 1024; }, "hiddenDim");
   renamed([](EpCfg& c) { c.numExpertPerToken = 4; }, "numExpertPerToken");
-  renamed([](EpCfg& c) { c.dtype = mori::ops::v2::EpDType::Byte8; }, "dtype");
+  renamed([](EpCfg& c) { c.dtype = mori::ops::v2::EpDType::Fp8; }, "dtype");
 }
 
 TEST(EntryName, IsALegalSymbol) {

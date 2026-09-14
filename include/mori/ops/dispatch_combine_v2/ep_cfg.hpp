@@ -51,16 +51,24 @@ namespace v2 {
 // so this must agree numerically with mori::ops::v2::DType. Renumbering either
 // alone is a silent wrong answer, not a refactor.
 // ---------------------------------------------------------------------------
-// Byte8 is a TRANSPORT type: dispatch only copies its payload, so fp8 and fp4 (2
-// e2m1 per byte, caller halves hiddenDim) both move as bytes. Combine reduces and
-// cannot use it -- MakeEpCfg rejects it there.
-enum class EpDType : int { Bf16 = 0, Fp32 = 1, Byte8 = 2 };
+// Fp8 and Fp4x2 are TRANSPORT types: dispatch only copies its payload, so both
+// move one byte per ELEMENT and render the same C++ type. They are separate
+// enumerators so the kernel name says which one it is -- a shared tag makes
+// fp8-at-3584 and fp4-at-7168 indistinguishable in a profile. An fp4x2 element
+// is two e2m1, so hiddenDim counts BYTES there and the caller halves it.
+// Combine reduces and cannot use either -- MakeEpCfg rejects them there.
+enum class EpDType : int { Bf16 = 0, Fp32 = 1, Fp8 = 2, Fp4x2 = 3 };
+
+// Both byte transports, for the checks that care about the payload rather than
+// the label.
+constexpr bool EpDTypeIsByte(EpDType d) { return d == EpDType::Fp8 || d == EpDType::Fp4x2; }
 
 inline const char* EpDTypeName(EpDType d) {
   switch (d) {
     case EpDType::Fp32:
       return "float";
-    case EpDType::Byte8:
+    case EpDType::Fp8:
+    case EpDType::Fp4x2:
       return "unsigned char";
     default:
       return "hip_bfloat16";
@@ -74,23 +82,27 @@ inline const char* EpDTypeTag(EpDType d) {
   switch (d) {
     case EpDType::Fp32:
       return "fp32";
-    case EpDType::Byte8:
-      return "byte8";
+    case EpDType::Fp8:
+      return "fp8";
+    case EpDType::Fp4x2:
+      return "fp4x2";
     default:
       return "bf16";
   }
 }
 
 constexpr int EpElemSize(EpDType d) {
-  return d == EpDType::Fp32 ? 4 : (d == EpDType::Byte8 ? 1 : 2);
+  return d == EpDType::Fp32 ? 4 : (EpDTypeIsByte(d) ? 1 : 2);
 }
 
 inline std::string RenderValue(EpDType d) {
   switch (d) {
     case EpDType::Fp32:
       return "::mori::ops::v2::EpDType::Fp32";
-    case EpDType::Byte8:
-      return "::mori::ops::v2::EpDType::Byte8";
+    case EpDType::Fp8:
+      return "::mori::ops::v2::EpDType::Fp8";
+    case EpDType::Fp4x2:
+      return "::mori::ops::v2::EpDType::Fp4x2";
     default:
       return "::mori::ops::v2::EpDType::Bf16";
   }
