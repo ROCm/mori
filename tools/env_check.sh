@@ -2135,20 +2135,28 @@ check_mlx5_qos() {
 # ROCE_CC_PRIO_MASK_P1 is only what the firmware will boot with next time.
 #
 # Prints "<mask> <cnp_dscp>" with mask in ROCE_CC_PRIO_MASK_P1 form: bit p set
-# when priority p has DCQCN on both legs -- roce_np (emit a CNP on seeing an ECN
-# mark) and roce_rp (cut the send rate on receiving one). One leg alone cannot
-# close the control loop, so it does not count as enabled.
+# when roce_rp is on for priority p and roce_np is on for the port.
+# NVIDIA: NP (send CNP) is global per port -- any enable file set turns it on;
+# only RP (cut rate on CNP) is per priority. AND-ing the same index on both
+# trees false-fails a host with NP on prio 3 and RP on prio 5.
+# A value that is not a literal 0/1 means we failed to read, not that DCQCN
+# is off -- return 1 so the caller falls back to mlxconfig rather than FAIL.
 # Returns 1 if the tree is absent (pre-ECN-sysfs driver, or a non-mlx5 netdev).
 mlx5_dcqcn_sysfs() {
     local eth="$1"
     local base="/sys/class/net/$eth/ecn"
     [[ -d "$base/roce_np/enable" && -d "$base/roce_rp/enable" ]] || return 1
 
-    local mask=0 p np rp
+    local np_any=0 mask=0 p v
     for p in 0 1 2 3 4 5 6 7; do
-        np=$(cat "$base/roce_np/enable/$p" 2>/dev/null) || return 1
-        rp=$(cat "$base/roce_rp/enable/$p" 2>/dev/null) || return 1
-        [[ "$np" == "1" && "$rp" == "1" ]] && mask=$(( mask | (1 << p) ))
+        v=$(cat "$base/roce_np/enable/$p" 2>/dev/null) || return 1
+        [[ "$v" == "0" || "$v" == "1" ]] || return 1
+        [[ "$v" == "1" ]] && np_any=1
+    done
+    for p in 0 1 2 3 4 5 6 7; do
+        v=$(cat "$base/roce_rp/enable/$p" 2>/dev/null) || return 1
+        [[ "$v" == "0" || "$v" == "1" ]] || return 1
+        [[ $np_any -eq 1 && "$v" == "1" ]] && mask=$(( mask | (1 << p) ))
     done
 
     echo "$mask $(cat "$base/roce_np/cnp_dscp" 2>/dev/null)"
@@ -2180,7 +2188,7 @@ check_mlx5_dcqcn() {
         if [[ -n "$eth" ]] && sysfs=$(mlx5_dcqcn_sysfs "$eth"); then
             read -r mask cnp_dscp <<< "$sysfs"
             if [[ "$mask" == "0" ]]; then
-                log_fail "$dev ($eth) : DCQCN disabled (no priority has both roce_np and roce_rp enabled)"; fail=1
+                log_fail "$dev ($eth) : DCQCN disabled (NP off for the port, or no priority has roce_rp enabled)"; fail=1
             else
                 log_ok "$dev ($eth) : DCQCN enabled (live prio mask=$mask, CNP_DSCP=${cnp_dscp:-?})"
             fi
