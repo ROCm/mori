@@ -200,7 +200,7 @@ def build_lsa_ar(
     def ar_1stage(dev_comm: Int64, win: Int64):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
-        w = cco.Window(win)
+        w = cco.CachedWindow(win)
 
         flag, flag_rsrc = _next_flag(w, bid)
         if tid < ws:
@@ -228,7 +228,7 @@ def build_lsa_ar(
     def ar_2stage(dev_comm: Int64, win: Int64):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
-        w = cco.Window(win)
+        w = cco.CachedWindow(win)
 
         flag_a, flag_rsrc = _next_flag(w, bid)
         if tid < ws:

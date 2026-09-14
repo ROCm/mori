@@ -1086,7 +1086,7 @@ def compile_fused_gemm_scatter(
             mfma = _SwappedMfma(mfma_raw)
         else:
             mfma = Mfma16x16x128(N_TILES_A, N_TILES_B)
-        w_pre = cco.Window(win)
+        w_pre = cco.CachedWindow(win)
 
         a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
         b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
@@ -1202,7 +1202,7 @@ def compile_fused_gemm_scatter(
                 N_TILES_A,
                 N_TILES_B,
                 c_rsrc=create_buffer_resource_from_addr(
-                    fx.Int64(cco.Window(win).lsa_ptr(rank, in_off)),
+                    fx.Int64(cco.CachedWindow(win).lsa_ptr(rank, in_off)),
                     num_records_bytes=cfg.nbytes,
                 ),
             )

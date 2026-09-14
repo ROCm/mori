@@ -134,28 +134,35 @@ class CachedWindow:
     counts against ``lgkmcnt`` as well as ``vmcnt``, giving any following
     ``s_waitcnt`` one more counter to wait on.
 
-    **It does not measure on mori's own kernels, and that is expected.**
-    A/B/A' at ``m=16384 n=7168 k=2048`` on 8x MI355X, us, lower is better::
+    **What it is worth depends on how often the kernel builds an address, not on
+    how many call sites it has.** A/B at ``m=16384 n=7168 k=2048`` on 8x MI355X,
+    max_rank_time_us, three alternating repeats::
 
-        wire         Window    CachedWindow    Window again
-        bf16/sdma    1114.5        1111.4          1115.4
-        fp8/sdma      983.3         983.6           983.6
-        fp8/lsa       926.6         924.3           926.0
+        mode                Window                    CachedWindow
+        split-lsa    1264.69 1264.23 1264.85    1250.25 1256.85 1254.53   -10.7us
+        fused-sdma   1110.45 1109.77 1112.85    1110.53 1113.69 1112.61     null
 
-    The difference is smaller than the drift between the two Window runs. Every
-    ``lsa_ptr`` call in ``gemm_ar`` is already at kernel scope -- descriptors get
-    built once before the hot loop, which is the established idiom -- so what
-    this removes is on the order of tens of loads per launch against a kernel
-    that runs for a millisecond. Reach for it when a kernel needs addresses *per
-    iteration*; do not expect it to show up otherwise.
+    ``split-lsa`` wins 0.85%, against a Window spread of 0.6us across its three
+    runs. Its ``ar_1stage``/``ar_2stage`` build nine peer addresses in *every
+    block* of a short kernel, so the extern calls are a real fraction of it.
+    ``fused-sdma`` gains nothing: its ``lsa_ptr`` calls are per kernel launch,
+    once, against a body that runs for a millisecond -- and the same was true of
+    ``kernels_sdma``, where converting all 21 sites moved nothing.
+
+    So: count address constructions per launch, not ``grep -c lsa_ptr``.
 
     Measure A/B in one session if you revisit this. Absolute numbers on this box
     move ~4% between mornings, across every configuration at once, which is
     several times the effect being looked for.
 
     Unlike :class:`Window` this is a plain Python object, not a ``cco_struct``,
-    so it cannot be carried across an ``scf.if``/``scf.for`` boundary. Build it
-    inside whichever region needs it, or use ``Window`` there.
+    so it cannot cross an ``scf.if``/``scf.for`` boundary -- and neither would a
+    ``cco_struct`` version, because FlyDSL captures every variable a dynamic
+    ``if`` body reads as state and requires each to be a *single* MLIR value.
+    ``Window`` qualifies only by having one field; a three-field struct fails the
+    same check ("state variable 'w' is list, not an MLIR Value"). Build it inside
+    whichever region needs it, or use ``Window`` there --
+    ``kernels_fused.py:1488`` does the latter.
     """
 
     __slots__ = ("handle", "base", "stride")
