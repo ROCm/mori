@@ -44,7 +44,7 @@ jobs:
       matrix:
         include:
           - platform: MI355X_AINIC
-            runner: [self-hosted, MI355X-AINIC-TW]
+            runner: [self-hosted, MI355X-AINIC-PIT-G17]
           - platform: MI300X_MLX
             runner: [self-hosted, 300_mlx_p19_29]
           # Runner 325_bnxt_108 is decommissioned.
@@ -103,11 +103,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # socket_ifname is pinned because MORI's bootstrap auto-detection
+          # picks the first UP interface with an address, and on this host that
+          # is eno1 (10.13.x) -- an interface whose own address does not accept
+          # TCP connections from the host itself, so rank 1 spins in "retrying
+          # connection to root" for 1500 attempts instead of failing.
           - platform: MI355X_AINIC
-            runner: [self-hosted, MI355X-AINIC-TW]
+            runner: [self-hosted, MI355X-AINIC-PIT-G17]
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
+            socket_ifname: eno0
           # 8x ConnectX-7 NDR on InfiniBand, so no rdma_sl/rdma_tc: mlx5 applies
           # both only on the RoCE path. mlx5_8 is deliberately not in
           # rdma_devices -- it is the 100GbE port behind ens14np0 (the TCP
