@@ -267,6 +267,34 @@ It is the thread map: a per-row amax cannot be taken by a block holding only par
 of a row, so fusing forces one-wave-per-row, where `sdma_reduce` walks packs with
 a flat grid stride and streams a block through all 8 source slices at once.
 
+**Firing the gather's puts from inside the reduce** (`fuse_reduce_push=True`)
+looked like the safest fusion of the three: the push sends this rank's *own*
+slice, so unlike the pull it has no cross-rank dependency, and SDMA is a copy
+engine so it costs no CU time. It is also exactly the shape of the GEMM's fused
+scatter. It loses anyway, at every band count, against the unfused 1148.0us:
+
+| bands | 1 | 4 | 8 | 16 | 32 |
+|---|---:|---:|---:|---:|---:|
+| us | 1227.3 | 1380.1 | 1630.3 | 2137.2 | 3026.7 |
+
+Linear, about 61us per band. The cause is neither the traversal nor the puts:
+publishing a range to a copy engine needs a **system-scope release from every
+block that wrote it**, so the bill is 256 blocks x bands fences at ~0.24us each.
+The whole reduce is 42us, so the overlap can never repay it. Isolated by running
+the halves separately at 8 bands: fence but no `vmcnt` drain 1649.8us, drain but
+no fence 1164.5us — the drain is free and the fence is all of it.
+
+Dropping the fence is not the fix it appears to be. Without it the kernel gets to
+1157.9us at 4 bands — still short of 1148.0 — and it is racy: at 32 bands it
+produced relL2 1.8e-2 against the 2.35e-3 floor, differing per rank. The same 32
+bands *with* the fence validate exactly, which rules out an indexing bug and pins
+it on the missing release.
+
+The contrast with the GEMM's fused scatter is the useful part: there the publish
+is amortised against a 437us transfer hidden behind a compute-bound GEMM; here
+against 42us of bandwidth-saturated reduce. The mechanism only pays when what is
+hidden is much larger than the cost of publishing it.
+
 **A CK-shaped 4-wave GEMM**, chasing a 22% gap against CK's block-scale kernel
 at the same shape, reached CK's instruction mix and not its speed. Ten hypotheses
 were falsified by measurement; hardware counters show identical `SQ_INSTS_MFMA`

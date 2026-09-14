@@ -151,6 +151,11 @@ class ArConfig:
     #: below. ``ArConfig(comm_dtype=...)`` sets both at once.
     scatter_dtype: str = "bf16"
     gather_dtype: str = "bf16"
+    #: Bands the reduce publishes its slice in, when the gather's puts are
+    #: fired from inside it. One SDMA put per band per peer, so this trades
+    #: ramp-up (the first put waits for one band) against per-packet cost (the
+    #: engine charges ~2us per packet whatever its size).
+    gather_bands: int = 8
     #: Who moves the gather leg's bytes, when it is fp8.
     #:
     #: ``"sdma"`` pushes with the copy engines and then dequantises in a second
@@ -354,7 +359,9 @@ class ArConfig:
 
     @property
     def signal_bytes(self) -> int:
-        return self.lock_off + self.lock_bytes
+        # Everything before `input`: the barrier arrays, the scatter's tile
+        # counters, the submit locks, and the gather's band counters.
+        return self.gather_counter_off + self.gather_counter_bytes
 
     @property
     def start_off(self) -> int:
@@ -402,6 +409,22 @@ class ArConfig:
     @property
     def lock_bytes(self) -> int:
         return _align_up(self.world_size * 4, SIGNAL_ALIGN)
+
+    @property
+    def gather_counter_off(self) -> int:
+        """Band counters for the gather, when its puts are fired by the reduce.
+
+        Its own region rather than a corner of ``counter_off``: the fused GEMM
+        bumps every ``(dest, chunk)`` slot including its own rank's -- the
+        ``dest != rank`` test skips the *put*, not the count -- so there is no
+        free slot to borrow, and silently sharing one would elect on a mixture
+        of two different epochs.
+        """
+        return self.lock_off + self.lock_bytes
+
+    @property
+    def gather_counter_bytes(self) -> int:
+        return _align_up(self.gather_bands * 4, SIGNAL_ALIGN)
 
     def counter_slot(self, dest: int, chunk: int) -> int:
         if not 0 <= dest < self.world_size:

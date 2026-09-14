@@ -280,6 +280,7 @@ def run(args) -> int:
         counter_chunks=chunks,
         gather_dtype=args.gather_dtype,
         gather_transport=args.gather_transport,
+        gather_bands=args.gather_bands,
     )
     cfg.validate()
 
@@ -372,6 +373,7 @@ def run(args) -> int:
                 reduce_self_from_recv=direct_lsa,
                 recv_uncached=direct_lsa,
                 fuse_quantize=args.fuse_quantize,
+                fuse_reduce_push=args.fuse_reduce_push,
             )
         if args.mode == "split-lsa":
             lsa_ar, _ = build_lsa_ar(cfg, rank)
@@ -665,6 +667,14 @@ def build_parser() -> argparse.ArgumentParser:
         "and is worth 80us (355 vs 434)",
     )
     p.add_argument("--sdma-queues", type=int, default=8)
+    p.add_argument("--gather-bands", type=int, default=8)
+    p.add_argument(
+        "--fuse-reduce-push",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="fire the gather's SDMA puts from inside the reduce, band by band, "
+        "instead of from a separate kernel after it. bf16 gather only.",
+    )
     p.add_argument(
         "--fuse-quantize",
         action=argparse.BooleanOptionalAction,

@@ -92,6 +92,8 @@ from flydsl._mlir import ir
 from ._compat import (
     CM_CACHED,
     CM_SC1,
+    atomic_add_u32,
+    atomic_store_u32,
     buffer_load,
     buffer_store,
     create_buffer_resource_from_addr,
@@ -103,6 +105,9 @@ from ._compat import (
     wave_uniform_i64,
 )
 from .kernels_lsa import _spin_until
+from ._gemm_a8w8_8wave import wait_barrier
+from .layout import PACK_BYTES
+from .kernels_fused import _acquire_peer_lock
 
 #: e4m3's largest finite magnitude. ``scale = amax / FP8_E4M3_MAX`` puts a row's
 #: biggest element exactly at the top of the range.
@@ -215,6 +220,7 @@ def build_sdma_phases(
     reduce_self_from_recv: bool = False,
     recv_uncached: bool = False,
     fuse_quantize: bool = False,
+    fuse_reduce_push: bool = False,
 ):
     """Compile the phases separately, so the fused GEMM can reuse the tail.
 
@@ -277,6 +283,7 @@ def build_sdma_phases(
     slice_bytes = cfg.slice_bytes
 
     start_off, end_off, flag_off = cfg.start_off, cfg.end_off, cfg.flag_off
+    lock_off = cfg.lock_off
     in_off, out_off = cfg.input_off, cfg.output_off
     # Constant-folded because `rank` is a Python int: the slice I own, and the
     # slot I occupy in every peer's recv region.
@@ -443,6 +450,174 @@ def build_sdma_phases(
                 else acc.to(elem_dtype).bitcast(fx.Int32)
             )
             buffer_store(packed, out, i32_off, cache_modifier=CM_CACHED)
+
+    # --- reduce with the gather's puts fired from inside it -------------------
+    #
+    # The gather push sends *my own* reduced slice, so unlike the pull it has no
+    # cross-rank dependency: nothing outside this rank has to happen before the
+    # bytes can leave. That makes it the same shape as the GEMM's fused scatter
+    # -- produce a contiguous range, elect one block, hand it to a copy engine --
+    # and it reuses that machinery: the submit lock and a monotonic counter.
+    #
+    # The traversal is band-major rather than flat grid-strided, and that is the
+    # whole trick. Under a flat stride every block touches every band, so no
+    # band's counter fills until the kernel is nearly done and there is nothing
+    # to publish early. Sweeping band by band keeps the *inner* map -- and so the
+    # coalescing -- exactly as it was, and only reorders which region the grid
+    # covers first.
+    #
+    # Cost of election is one atomic per (block, band), i.e. red_blocks *
+    # gather_bands per launch. Counting per pack instead would be ~1.8M atomics.
+
+    if fuse_reduce_push:
+        if cfg.fp8_gather:
+            raise ValueError(
+                "fuse_reduce_push is for the bf16 gather. The fp8 gather either "
+                "pushes from `gout` after a separate quantise, or is an LSA pull "
+                "reading peers -- neither is this shape."
+            )
+        if part % cfg.gather_bands:
+            raise ValueError(
+                f"gather_bands={cfg.gather_bands} must divide the {part} packs "
+                f"per rank"
+            )
+        packs_per_band = part // cfg.gather_bands
+        band_bytes = packs_per_band * PACK_BYTES
+        gather_counter_off = cfg.gather_counter_off
+
+    @flyc.kernel(known_block_size=[threads, 1, 1])
+    def sdma_reduce_push(dev_comm: Int64, win: Int64):
+        """`sdma_reduce`, publishing each band to the copy engines as it lands.
+
+        Identical arithmetic and identical output to `sdma_reduce`; the only
+        difference is when the bytes start moving. The following `gather` phase
+        becomes drain-only.
+
+        **This loses, and is off by default.** At [16384, 7168] K=2048 on 8
+        ranks, whole fused layer, against the unfused 1148.0us:
+
+            bands        1       4       8      16      32
+            us      1227.3  1380.1  1630.3  2137.2  3026.7
+
+        Linear in the band count, about 61us each, and losing already at one
+        band. The cause is not the traversal and not the puts: it is that
+        publishing a range to a copy engine needs a *system-scope release from
+        every block that wrote it*, so the cost is 256 blocks x bands fences,
+        around 0.24us apiece. The whole reduce is only 42us, so the overlap can
+        never repay it.
+
+        Isolated by running the two halves separately at 8 bands: with the
+        fence but no vmcnt drain, 1649.8us; with the drain but no fence,
+        1164.5us. The drain is free, the fence is all of it.
+
+        Dropping the fence is not a fix even though it looks like one. Without
+        it the kernel reaches 1157.9us at 4 bands -- still short of 1148.0 --
+        and it is racy: at 32 bands it produced relL2 1.8e-2 against the 2.35e-3
+        floor, differing per rank (4.5e-3, 8.1e-3, 1.6e-2, ...). The same 32
+        bands *with* the fence validate exactly, which is what rules out an
+        indexing bug and pins it on the missing release.
+
+        Why the GEMM's fused scatter wins where this does not: there the
+        publish is amortised against a 437us transfer hidden behind a
+        compute-bound GEMM, and here it is amortised against 42us of
+        bandwidth-saturated reduce. The mechanism is only worth it when what is
+        being hidden is much larger than the cost of publishing it.
+        """
+        tid = fx.thread_idx.x
+        bid = fx.block_idx.x
+        w = cco.Window(win)
+        sdma = cco.DevComm(dev_comm).sdma()
+
+        self_off = (
+            cfg.recv_slot_off(rank) if reduce_self_from_recv else in_off + my_slice_off
+        )
+        srcs = [
+            create_buffer_resource_from_addr(
+                wave_uniform_i64(w.lsa_ptr(rank, self_off))
+            )
+        ] + [
+            create_buffer_resource_from_addr(
+                wave_uniform_i64(w.lsa_ptr(rank, cfg.recv_slot_off((rank + j) % ws)))
+            )
+            for j in range(1, ws)
+        ]
+        out = create_buffer_resource_from_addr(
+            wave_uniform_i64(w.lsa_ptr(rank, out_off + my_slice_off))
+        )
+
+        gtid = bid * threads + tid
+        for band in range_constexpr(cfg.gather_bands):
+            base = band * packs_per_band
+            for pk in range(gtid + base, base + packs_per_band, red_stride):
+                i32_off = pk * I32_PER_PACK
+                acc = None
+                for j in range_constexpr(ws):
+                    raw = fx.Vector(
+                        buffer_load(
+                            srcs[j],
+                            i32_off,
+                            vec_width=4,
+                            dtype=i32_type(),
+                            cache_modifier=CM_SC1 if recv_uncached else CM_CACHED,
+                        )
+                    )
+                    v = (
+                        raw.bitcast(fx.Float32)
+                        if elem_dtype is fx.Float32
+                        else raw.bitcast(elem_dtype).to(fx.Float32)
+                    )
+                    acc = v if acc is None else acc + v
+                packed = (
+                    acc.bitcast(fx.Int32)
+                    if elem_dtype is fx.Float32
+                    else acc.to(elem_dtype).bitcast(fx.Int32)
+                )
+                buffer_store(packed, out, i32_off, cache_modifier=CM_CACHED)
+
+            # Retire this block's stores, then release them where a copy engine
+            # can see them. `wait_barrier(0)` is s_waitcnt vmcnt(0) + s_barrier:
+            # a bare s_barrier would only prove the stores were *issued*, which
+            # is not enough to hand the range to SDMA.
+            # Publishing a band to a copy engine takes both of these, and the
+            # second is where all the cost is -- see the class docstring.
+            # `wait_barrier(0)` is s_waitcnt vmcnt(0) + s_barrier: it retires
+            # this block's stores, where a bare s_barrier would only prove they
+            # were issued. The system fence then releases them somewhere the
+            # engine can read. Dropping the fence is *not* an option: it is
+            # nearly free in wall time and it is what makes the result correct.
+            wait_barrier(0)
+            raw_cco.cco_system_fence(fx.Int32(0))
+            if tid == fx.Int32(0):
+                ctr = signal_ptr(
+                    fx.Int64(w.lsa_ptr(rank, gather_counter_off))
+                    + fx.Int64(band) * fx.Int64(4)
+                )
+                seq = fx.Int32(atomic_add_u32(ctr, 1)) + fx.Int32(1)
+                # Monotonic, never reset, so "last block of this band, this
+                # epoch" is a modulo rather than a compare -- the property that
+                # makes graph replay behave like a fresh launch.
+                if seq % fx.Int32(red_blocks) == fx.Int32(0):
+                    for j in range_constexpr(1, ws):
+                        dest = (rank + j) % ws
+                        # Two bands can be elected at nearly the same moment and
+                        # would then post to the same per-destination queue.
+                        lock = signal_ptr(
+                            fx.Int64(w.lsa_ptr(rank, lock_off))
+                            + fx.Int64(dest) * fx.Int64(4)
+                        )
+                        _acquire_peer_lock(lock)
+                        sdma.put(
+                            dest,
+                            win,
+                            fx.Int64(out_off + my_slice_off + band * band_bytes),
+                            win,
+                            fx.Int64(out_off + my_slice_off + band * band_bytes),
+                            fx.Int64(band_bytes),
+                            dest % fx.Int32(queues),
+                            coop=cco.CoopScope.THREAD,
+                            signal=signal,
+                        )
+                        atomic_store_u32(lock, 0)
 
     # --- fp8 wire: the two conversions that bracket the gather ---------------
     #
@@ -898,6 +1073,11 @@ def build_sdma_phases(
         "reduce": _phase(sdma_reduce, red_blocks, threads),
         "gather": _phase(gather, 1, PUSH_THREADS),
     }
+    if fuse_reduce_push:
+        phases["reduce_push"] = _phase(sdma_reduce_push, red_blocks, threads)
+        # The puts are already out; this only drains the queues and runs the
+        # cross-rank barrier that tells peers their slices landed.
+        phases["gather_drain"] = _phase(_push_kernel(end_off), 1, PUSH_THREADS)
     if cfg.fp8_gather:
         # `quantize` has to follow the reduce and precede whichever transport
         # moves the bytes -- unless it is folded into the reduce, which is the
@@ -927,6 +1107,8 @@ def build_sdma_phases(
         tail = head + (
             ("gather_barrier", "pull") if cfg.lsa_gather else ("gather", "dequantize")
         )
+    elif fuse_reduce_push:
+        tail = ("reduce_push", "gather_drain")
     else:
         tail = ("reduce", "gather")
     phases["order"] = ("scatter",) + tail

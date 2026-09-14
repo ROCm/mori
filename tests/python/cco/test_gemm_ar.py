@@ -89,9 +89,12 @@ def test_bf16_wire_layout_is_unchanged_by_the_fp8_option():
     c = layout.ArConfig(world_size=8, m=16384, n=7168, recv_slots=8, counter_chunks=8)
     c.validate()
     assert c.scatter_dtype == "bf16" and c.gather_dtype == "bf16"
-    # 700.0056 MiB -- the size the running server logs, before any of the
-    # fp8 regions existed.
-    assert c.window_bytes == 734009088
+    # The point of pinning this is to catch layout drift nobody meant, so it
+    # moves only with a stated reason. 734009088 was the size the running
+    # server logged before the fp8 regions existed; +128 is the gather band
+    # counters, one SIGNAL_ALIGN region added when the reduce learned to fire
+    # the gather's puts itself.
+    assert c.window_bytes == 734009088 + 128
     assert c.gout_off == c.output_off
     assert c.gout_bytes == 0
     assert c.scatter_scale_bytes == 0
