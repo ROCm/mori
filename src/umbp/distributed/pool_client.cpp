@@ -39,6 +39,7 @@
 #include <numeric>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -116,17 +117,16 @@ BatchBandwidthSplit ComputeBatchBandwidthBytes(const std::vector<Result>& result
   return acc;
 }
 
-// `master_client` is null on a node running without a master; the histogram
-// simply has nowhere to go, and the caller should not have to know that.
-void ObserveBatchBandwidth(MasterClient* master_client, double bytes, double seconds,
-                           const char* metric_name, const char* metric_help,
-                           std::string_view traffic) {
-  if (master_client == nullptr || bytes <= 0.0 || seconds <= 0.0) return;
+// `sink` is null on a node that publishes nowhere — no master and no local
+// metrics server — in which case the histogram has nowhere to go and the
+// caller should not have to know that.
+void ObserveBatchBandwidth(MetricSink* sink, double bytes, double seconds, const char* metric_name,
+                           const char* metric_help, std::string_view traffic) {
+  if (sink == nullptr || bytes <= 0.0 || seconds <= 0.0) return;
   const double gibps = (bytes / seconds) / kGiB;
   if (gibps <= 0.0) return;
-  MasterClient::Labels labels = {{"traffic", std::string(traffic)}};
-  master_client->Observe(metric_name, metric_help, std::move(labels), BatchBandwidthBucketsGiBps(),
-                         gibps);
+  MetricSink::Labels labels = {{"traffic", std::string(traffic)}};
+  sink->Observe(metric_name, metric_help, std::move(labels), BatchBandwidthBucketsGiBps(), gibps);
 }
 
 // ---------------------------------------------------------------------------
@@ -453,10 +453,9 @@ ScopeExit(Fn) -> ScopeExit<Fn>;
 // exit, so callers just add to them as keys succeed.
 class ScopedBatchBandwidth {
  public:
-  ScopedBatchBandwidth(MasterClient* master_client, const char* metric_name,
-                       const char* metric_help, const double& local_bytes,
-                       const double& remote_bytes)
-      : master_client_(master_client),
+  ScopedBatchBandwidth(MetricSink* sink, const char* metric_name, const char* metric_help,
+                       const double& local_bytes, const double& remote_bytes)
+      : sink_(sink),
         metric_name_(metric_name),
         metric_help_(metric_help),
         local_bytes_(local_bytes),
@@ -470,14 +469,12 @@ class ScopedBatchBandwidth {
     const double seconds = std::chrono::duration_cast<std::chrono::duration<double>>(
                                std::chrono::steady_clock::now() - start_)
                                .count();
-    ObserveBatchBandwidth(master_client_, local_bytes_, seconds, metric_name_, metric_help_,
-                          "local");
-    ObserveBatchBandwidth(master_client_, remote_bytes_, seconds, metric_name_, metric_help_,
-                          "remote");
+    ObserveBatchBandwidth(sink_, local_bytes_, seconds, metric_name_, metric_help_, "local");
+    ObserveBatchBandwidth(sink_, remote_bytes_, seconds, metric_name_, metric_help_, "remote");
   }
 
  private:
-  MasterClient* master_client_;
+  MetricSink* sink_;
   const char* metric_name_;
   const char* metric_help_;
   const double& local_bytes_;
@@ -997,21 +994,41 @@ bool PoolClient::Init() {
 
   if (master_client_) master_client_->SetBackendRegistry(&registry_);
 
-  // Every instrumented component on this node rides the existing metrics tick:
-  // the storage backend (generic slot-lifecycle series from the decorator, plus
-  // whatever the medium says about its own internals) and the transfer engine
-  // (per-engine bytes, plans and in-flight time).  Backend-agnostic by
-  // construction — PoolClient forwards what each component samples and never
-  // learns which medium or transport produced it.
-  if (master_client_) master_client_->AddMetricsProvider([this] { PublishComponentMetrics(); });
+  // Pick this node's metrics destination once, here, so that no emission site
+  // below ever has to ask whether there is a master.  With a master the
+  // MasterClient IS the sink; without one the owner of this client may have
+  // supplied a local Prometheus sink (the standalone server does).  Deliberately
+  // not both: the same series arriving at a master AND at a locally scraped
+  // endpoint would be double-counted by any Prometheus that scrapes the pair.
+  if (master_client_) {
+    metric_sink_ = master_client_.get();
+  } else {
+    metric_sink_ = config_.metric_sink;
+  }
+
+  // Every instrumented component on this node rides a metrics tick: the storage
+  // backend (generic slot-lifecycle series from the decorator, plus whatever the
+  // medium says about its own internals) and the transfer engine (per-engine
+  // bytes, plans and in-flight time).  Backend-agnostic by construction —
+  // PoolClient forwards what each component samples and never learns which
+  // medium or transport produced it.
+  //
+  // Which thread drives that tick is the only difference between the two
+  // deployments: MasterClient already runs one, and a masterless node starts
+  // its own only when it actually has somewhere to publish.
+  if (master_client_) {
+    master_client_->AddMetricsProvider([this] { PublishComponentMetrics(); });
+  } else if (metric_sink_ != nullptr) {
+    StartLocalMetricsReporting();
+  }
 
   // Pack engine_desc for master registration.
   std::vector<uint8_t> engine_desc_bytes;
   if (peer_directory_ != nullptr) engine_desc_bytes = peer_directory_->PackedLocalEngineDesc();
 
   if (config_.peer_service_port > 0 || config_.auto_peer_service_port) {
-    peer_service_ = std::make_unique<PeerServiceServer>(*default_pool_, engine_desc_bytes,
-                                                        master_client_.get());
+    peer_service_ =
+        std::make_unique<PeerServiceServer>(*default_pool_, engine_desc_bytes, metric_sink_);
     if (!peer_service_->Start(config_.peer_service_port)) {
       MORI_UMBP_ERROR("[PoolClient] PeerService failed to start on port {}",
                       config_.peer_service_port);
@@ -1124,6 +1141,10 @@ void PoolClient::Shutdown() {
       MORI_UMBP_WARN("[PoolClient] UnregisterSelf failed: {}", status.error_message());
     }
   }
+  // The masterless counterpart, joined at the same point in teardown and for
+  // the same reason: its final tick samples the backends and transfer engine,
+  // which the code below is about to destroy.
+  StopLocalMetricsReporting();
 
   {
     std::lock_guard<std::mutex> lock(peers_mutex_);
@@ -1156,6 +1177,10 @@ void PoolClient::Shutdown() {
   hbm_engine_ = nullptr;
   transfer_engine_.reset();
 
+  // Drop the sink before the object it may point at. In the master-backed
+  // deployment metric_sink_ aliases master_client_, so leaving it set here
+  // would leave a dangling pointer that any late CountMetric would follow.
+  metric_sink_ = nullptr;
   master_client_.reset();
 }
 
@@ -1187,10 +1212,10 @@ void PoolClient::RouteAllPutsLocally(size_t count,
   routes->assign(count, local);
 }
 
-void PoolClient::CountMetric(std::string name, std::string help, MasterClient::Labels labels,
+void PoolClient::CountMetric(std::string name, std::string help, MetricSink::Labels labels,
                              double delta) {
-  if (master_client_ == nullptr) return;
-  master_client_->AddCounter(std::move(name), std::move(help), std::move(labels), delta);
+  if (metric_sink_ == nullptr) return;
+  metric_sink_->AddCounter(std::move(name), std::move(help), std::move(labels), delta);
 }
 BackendRegistry& PoolClient::Backends() { return registry_; }
 std::map<std::string, uint64_t> PoolClient::TierReadHits() const {
@@ -2236,10 +2261,10 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
       std::chrono::duration_cast<std::chrono::duration<double>>(call_end - call_start).count();
   if (seconds > 0.0) {
     auto split = ComputeBatchBandwidthBytes(outcomes, sizes, routes, config_.master_config.node_id);
-    ObserveBatchBandwidth(master_client_.get(), split.local, seconds,
+    ObserveBatchBandwidth(metric_sink_, split.local, seconds,
                           MORI_UMBP_METRIC_CLIENT_BATCH_PUT_BANDWIDTH,
                           MORI_UMBP_METRIC_CLIENT_BATCH_PUT_BANDWIDTH_HELP, "local");
-    ObserveBatchBandwidth(master_client_.get(), split.remote, seconds,
+    ObserveBatchBandwidth(metric_sink_, split.remote, seconds,
                           MORI_UMBP_METRIC_CLIENT_BATCH_PUT_BANDWIDTH,
                           MORI_UMBP_METRIC_CLIENT_BATCH_PUT_BANDWIDTH_HELP, "remote");
   }
@@ -2960,10 +2985,10 @@ void PoolClient::ObserveBatchGetBandwidth(const std::vector<bool>& results,
                              .count();
   if (seconds <= 0.0) return;
   auto split = ComputeBatchBandwidthBytes(results, sizes, routes, config_.master_config.node_id);
-  ObserveBatchBandwidth(master_client_.get(), split.local, seconds,
+  ObserveBatchBandwidth(metric_sink_, split.local, seconds,
                         MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH,
                         MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH_HELP, "local");
-  ObserveBatchBandwidth(master_client_.get(), split.remote, seconds,
+  ObserveBatchBandwidth(metric_sink_, split.remote, seconds,
                         MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH,
                         MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH_HELP, "remote");
 }
@@ -3122,9 +3147,9 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   // Observed at scope exit for whichever phases ran; see ScopedBatchBandwidth.
   double local_bytes = 0.0;
   double remote_bytes = 0.0;
-  ScopedBatchBandwidth bandwidth(
-      master_client_.get(), MORI_UMBP_METRIC_CLIENT_BATCH_GET_RANGES_BANDWIDTH,
-      MORI_UMBP_METRIC_CLIENT_BATCH_GET_RANGES_BANDWIDTH_HELP, local_bytes, remote_bytes);
+  ScopedBatchBandwidth bandwidth(metric_sink_, MORI_UMBP_METRIC_CLIENT_BATCH_GET_RANGES_BANDWIDTH,
+                                 MORI_UMBP_METRIC_CLIENT_BATCH_GET_RANGES_BANDWIDTH_HELP,
+                                 local_bytes, remote_bytes);
 
   // Sub-timers.  `dbg` is null when disabled, which makes every PhaseTimer inert.
   const bool ranged_debug = RangedDebugEnabled();
@@ -3560,9 +3585,9 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
   // Observed at scope exit for whichever phases ran; see ScopedBatchBandwidth.
   double local_bytes = 0.0;
   double remote_bytes = 0.0;
-  ScopedBatchBandwidth bandwidth(
-      master_client_.get(), MORI_UMBP_METRIC_CLIENT_BATCH_PUT_RANGES_BANDWIDTH,
-      MORI_UMBP_METRIC_CLIENT_BATCH_PUT_RANGES_BANDWIDTH_HELP, local_bytes, remote_bytes);
+  ScopedBatchBandwidth bandwidth(metric_sink_, MORI_UMBP_METRIC_CLIENT_BATCH_PUT_RANGES_BANDWIDTH,
+                                 MORI_UMBP_METRIC_CLIENT_BATCH_PUT_RANGES_BANDWIDTH_HELP,
+                                 local_bytes, remote_bytes);
 
   const bool ranged_debug = RangedDebugEnabled();
   RangedPhases phases;
@@ -4605,14 +4630,14 @@ bool PoolClient::EnsurePeerServiceConnection(PeerConnection& peer) {
 }
 
 void PoolClient::PublishComponentMetrics() {
-  if (!master_client_) return;
+  if (metric_sink_ == nullptr) return;
 
   MetricPublisher::Sink sink{
       [this](const char* name, const char* help, const MetricLabels& labels, double delta) {
         CountMetric(name, help, labels, delta);
       },
       [this](const char* name, const char* help, const MetricLabels& labels, double value) {
-        master_client_->SetGauge(name, help, labels, value);
+        metric_sink_->SetGauge(name, help, labels, value);
       }};
 
   // Storage backends.  tier= and backend= come from the component's own
@@ -4666,6 +4691,61 @@ void PoolClient::PublishComponentMetrics() {
     }
     metric_publisher_.Publish("pool", {}, samples, sink);
   }
+}
+
+// ---------------------------------------------------------------------------
+//  Masterless metrics tick
+//
+//  With a master, PublishComponentMetrics() rides MasterClient's existing
+//  metrics thread (AddMetricsProvider).  Without one there is no such thread,
+//  so a node that publishes to a local metrics server needs its own — otherwise
+//  every counter a component keeps would sit in that component's atomics
+//  forever and /metrics would serve nothing but the handful of series the
+//  data-plane path writes directly.
+// ---------------------------------------------------------------------------
+
+void PoolClient::StartLocalMetricsReporting() {
+  if (local_metrics_running_.load()) return;
+  local_metrics_interval_ms_ = static_cast<uint64_t>(
+      GetEnvMilliseconds("UMBP_METRICS_REPORT_INTERVAL_MS", std::chrono::milliseconds(1000),
+                         /*min_allowed=*/1)
+          .count());
+  local_metrics_running_ = true;
+  try {
+    local_metrics_thread_ = std::thread(&PoolClient::LocalMetricsLoop, this);
+  } catch (const std::system_error& e) {
+    local_metrics_running_ = false;
+    MORI_UMBP_ERROR("[PoolClient] failed to start local metrics thread: {}", e.what());
+    return;
+  }
+  MORI_UMBP_INFO("[PoolClient] local metrics reporting started (interval={}ms, no master)",
+                 local_metrics_interval_ms_);
+}
+
+void PoolClient::StopLocalMetricsReporting() {
+  if (!local_metrics_running_.load()) return;
+  local_metrics_running_ = false;
+  local_metrics_cv_.notify_one();
+  if (local_metrics_thread_.joinable()) local_metrics_thread_.join();
+  MORI_UMBP_INFO("[PoolClient] local metrics reporting stopped");
+}
+
+void PoolClient::LocalMetricsLoop() {
+  while (local_metrics_running_.load()) {
+    {
+      std::unique_lock lock(local_metrics_mu_);
+      local_metrics_cv_.wait_for(lock, std::chrono::milliseconds(local_metrics_interval_ms_),
+                                 [this] { return !local_metrics_running_.load(); });
+    }
+    if (!local_metrics_running_.load()) break;
+    PublishComponentMetrics();
+  }
+  // Final tick, mirroring MasterClient::MetricsLoop: without it the last
+  // sub-interval of every component's deltas would be lost at shutdown, and a
+  // short-lived server (a unit test, a one-shot benchmark) could publish
+  // nothing at all.  Shutdown() calls this before tearing the components down,
+  // so they are still alive here.
+  PublishComponentMetrics();
 }
 
 }  // namespace mori::umbp

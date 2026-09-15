@@ -42,6 +42,7 @@
 #include <vector>
 
 #include "umbp/distributed/config.h"
+#include "umbp/distributed/metrics/metric_sink.h"
 #include "umbp/distributed/peer/backend/medium_backend.h"
 #include "umbp/distributed/routing/route_put_strategy.h"
 #include "umbp/distributed/types.h"
@@ -70,12 +71,15 @@ struct RouteGetResult {
   std::string logical_tier;
 };
 
-class MasterClient {
+// Implements MetricSink: when a node has a master, that is where its metrics
+// go.  A masterless node is given a PrometheusMetricSink instead, and neither
+// PoolClient nor any component publishing through it knows which one it has.
+class MasterClient : public MetricSink {
  public:
-  using Labels = std::vector<std::pair<std::string, std::string>>;
+  using Labels = MetricSink::Labels;
 
   explicit MasterClient(const UMBPMasterClientConfig& config);
-  ~MasterClient();
+  ~MasterClient() override;
 
   MasterClient(const MasterClient&) = delete;
   MasterClient& operator=(const MasterClient&) = delete;
@@ -159,10 +163,10 @@ class MasterClient {
   bool ClearFullSync();
 
   // --- Client-side metrics ---
-  void AddCounter(std::string name, std::string help, Labels labels, double delta);
-  void SetGauge(std::string name, std::string help, Labels labels, double value);
+  void AddCounter(std::string name, std::string help, Labels labels, double delta) override;
+  void SetGauge(std::string name, std::string help, Labels labels, double value) override;
   void Observe(std::string name, std::string help, Labels labels, const std::vector<double>& bounds,
-               double value);
+               double value) override;
 
   // Register a callback run once per metrics flush tick in the existing metrics
   // thread (no new thread) so a component can publish counters/gauges from its

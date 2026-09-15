@@ -480,6 +480,15 @@ target_link_libraries(test_component_metrics PRIVATE umbp_common
 target_compile_features(test_component_metrics PRIVATE cxx_std_17)
 add_test(NAME test_component_metrics COMMAND test_component_metrics)
 
+# test_prometheus_metric_sink — the masterless end of the same seam: the sink
+# that serves a node's own metrics when there is no master to ship them to, and
+# the rule deciding whether the standalone server binds a port for it at all.
+add_executable(test_prometheus_metric_sink test_prometheus_metric_sink.cpp)
+target_link_libraries(test_prometheus_metric_sink PRIVATE umbp_common
+                                                          GTest::gtest_main)
+target_compile_features(test_prometheus_metric_sink PRIVATE cxx_std_17)
+add_test(NAME test_prometheus_metric_sink COMMAND test_prometheus_metric_sink)
+
 # test_gds_engine — GdsEngine routing/planning (no GPU) plus a GPU + hipFile
 # read round trip (skipped without a device, or on a filesystem that rejects
 # O_DIRECT). Built only when the hipfile headers are installed; umbp_common

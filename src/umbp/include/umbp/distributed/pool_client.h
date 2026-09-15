@@ -253,9 +253,10 @@ class PoolClient {
   std::atomic<bool> initialized_{false};
 
   // Sample every instrumented component on this node — each registered storage
-  // backend, plus the transfer engine — and ship the result.  Registered as a
-  // MasterClient metrics provider, so it runs on the metrics thread and never
-  // on a data-plane path.
+  // backend, plus the transfer engine — and ship the result.  With a master it
+  // is registered as a MasterClient metrics provider and runs on that client's
+  // metrics thread; without one it runs on local_metrics_thread_ below.  Either
+  // way it is a tick, never a data-plane path.
   //
   // There is no per-component code here and no place to add any: a component is
   // a MetricSource, the labels that identify it come from Tier() plus the
@@ -269,6 +270,27 @@ class PoolClient {
   MetricPublisher metric_publisher_;
 
   std::unique_ptr<MasterClient> master_client_;
+
+  // Where this node's metrics go.  Points at master_client_ when this node has
+  // a master, otherwise at config_.metric_sink (a PrometheusMetricSink owned by
+  // whoever built this client), and is null when neither exists — the case
+  // where metrics are measured and discarded.  Never owns.
+  MetricSink* metric_sink_ = nullptr;
+
+  // Drives PublishComponentMetrics() when there is no MasterClient whose
+  // metrics thread could.  Started by Init only when metric_sink_ is set and
+  // master_client_ is not; joined by Shutdown before the components it samples
+  // are torn down.  Interval comes from UMBP_METRICS_REPORT_INTERVAL_MS, the
+  // same knob the master-backed path uses, so the two tick alike.
+  void LocalMetricsLoop();
+  void StartLocalMetricsReporting();
+  void StopLocalMetricsReporting();
+
+  std::thread local_metrics_thread_;
+  std::atomic<bool> local_metrics_running_{false};
+  std::mutex local_metrics_mu_;
+  std::condition_variable local_metrics_cv_;
+  uint64_t local_metrics_interval_ms_ = 1000;
 
   // Every storage medium live on this node.  Owned here because PoolClient is
   // the natural lifetime anchor for the per-process IO engine + backend pools.
@@ -724,10 +746,11 @@ class PoolClient {
                                          const std::vector<size_t>& sizes,
                                          std::vector<bool>* results);
 
-  // Counter sink that tolerates a node running without a master: metrics
-  // accumulate on the MasterClient and ride its flush tick, so with no master
-  // there is simply nowhere to put them.
-  void CountMetric(std::string name, std::string help, MasterClient::Labels labels, double delta);
+  // Counter sink that tolerates a node publishing nowhere: with a master the
+  // delta accumulates on the MasterClient and rides its flush tick, without one
+  // it goes straight into the local metrics server, and with neither it is
+  // dropped.
+  void CountMetric(std::string name, std::string help, MetricSink::Labels labels, double delta);
 
   // Placement when there is no master to ask: this node is the only candidate,
   // so every key is routed to it on the medium it serves.  The put paths then
