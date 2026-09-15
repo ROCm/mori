@@ -11,6 +11,13 @@ set -euo pipefail
 # Environment:
 #   MORI_NIC_TYPE        — Override auto-detection (mlx5 | bnxt | ionic)
 #   CONTAINER_RUNTIME    — Override runtime (docker | podman); auto-detected
+#   MORI_CI_NO_PRIVILEGED — Set to 1 to swap --privileged for the narrower
+#                          caps MORI actually needs (IPC_LOCK for RDMA memory
+#                          pinning, NET_ADMIN). Required on hosts whose docker
+#                          daemon runs an authorization plugin that rejects
+#                          --privileged. nicctl needs CAP_SYS_ADMIN/SYS_RAWIO
+#                          for PCI config/BAR access, so `mori check` skips its
+#                          firmware/QoS/DCQCN steps under this mode.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -186,13 +193,19 @@ else
     EXTRA_ARGS+=(--ulimit nproc=100000:100000 --pids-limit=-1 --init)
 fi
 
+PRIV_ARGS=(--privileged)
+if [[ "${MORI_CI_NO_PRIVILEGED:-0}" == "1" ]]; then
+    PRIV_ARGS=(--cap-add=IPC_LOCK --cap-add=NET_ADMIN)
+    echo "[ci_run] MORI_CI_NO_PRIVILEGED=1 | caps: ${PRIV_ARGS[*]}"
+fi
+
 exec "$RUNTIME" run \
     --group-add video \
     --network=host \
     --device=/dev/kfd \
     --device=/dev/dri \
     --device=/dev/infiniband \
-    -d --ipc=host --privileged \
+    -d --ipc=host "${PRIV_ARGS[@]}" \
     "${EXTRA_ARGS[@]}" \
     "${NIC_MOUNTS[@]}" \
     "$@"
