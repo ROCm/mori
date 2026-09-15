@@ -201,6 +201,11 @@ bool ReadIoTrafficClassDisableEnv();
 bool ReadIbEnableRelaxedOrderingEnv();
 int MaybeAddRelaxedOrderingFlag(int accessFlag);
 
+// Export a dmabuf fd for the GPU buffer at `ptr`, reporting the byte offset of
+// `ptr` within the exported dmabuf via `*offset`. Returns -1 if unsupported.
+// Callers own the returned fd and must close() it.
+int TryExportDmabufFd(void* ptr, size_t size, uint64_t* offset);
+
 /* -------------------------------------------------------------------------- */
 /*                              RdmaDeviceContext                             */
 /* -------------------------------------------------------------------------- */
@@ -216,8 +221,8 @@ class RdmaDeviceContext {
   // dmabuf registration with iova=0 (CCO symmetric flat-VA path; BNXT GDA).
   virtual RdmaMemoryRegion RegisterRdmaMemoryRegionDmabufIova0(
       void* ptr, size_t size, int dmabuf_fd, int accessFlag = MR_DEFAULT_ACCESS_FLAG);
-  // ibv_reg_mr-first registration; falls back to dmabuf. Set MORI_ENABLE_DMABUF_REG to try
-  // dmabuf first instead (falling back to ibv_reg_mr).
+  // ibv_reg_mr-first registration; falls back to dmabuf. Set MORI_ENABLE_DMABUF_REG=1
+  // to try dmabuf first for payload MRs and Ionic CQ/SQ/RQ rings.
   virtual RdmaMemoryRegion RegisterRdmaMemoryRegionAuto(void* ptr, size_t size,
                                                         int accessFlag = MR_DEFAULT_ACCESS_FLAG);
   virtual void DeregisterRdmaMemoryRegion(void* ptr);

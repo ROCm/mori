@@ -452,7 +452,7 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabufI
 // silent writes to the wrong address). hsa_amd_portable_export_dmabuf reports the
 // true byte offset, so prefer it and fall back to the hip path (offset 0, correct
 // only for whole-allocation exports) when HSA export is unavailable.
-static int TryExportDmabufFd(void* ptr, size_t size, uint64_t* offset) {
+int TryExportDmabufFd(void* ptr, size_t size, uint64_t* offset) {
   int fd = -1;
   uint64_t off = 0;
   hsa_status_t hs = hsa_amd_portable_export_dmabuf(ptr, size, &fd, &off);
@@ -496,7 +496,8 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionAuto(vo
   };
 
   // Default: ibv_reg_mr first, dmabuf fallback (fast on bnxt). Set
-  // MORI_ENABLE_DMABUF_REG to prefer dmabuf first, falling back to ibv_reg_mr.
+  // MORI_ENABLE_DMABUF_REG=1 to prefer dmabuf first (payload MRs and, on Ionic,
+  // CQ/SQ/RQ rings), falling back to ibv_reg_mr for payload.
   for (int attempt = 0; attempt < 2; ++attempt) {
     bool useDmabuf = (attempt == 0) ? preferDmabufReg : !preferDmabufReg;
     const char* name = useDmabuf ? "dmabuf" : "ibv_reg_mr";
