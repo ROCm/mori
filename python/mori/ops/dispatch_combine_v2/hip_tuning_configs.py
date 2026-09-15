@@ -142,29 +142,6 @@ _COMBINE_TABLE: dict = {
         (8, 7168, 8, None): ((None, 64, 8),),
         (8, 7168, 6, None): ((None, 64, 8),),
     },
-    # gfx1250 EP4 is pinned to 64x8 at every token count, which is NOT what the sweeps
-    # below picked. Holding 64 blocks instead of 128 or 256 leaves CUs for the expert
-    # GEMM this overlaps, and that is worth more than combine's own microseconds -- but
-    # only because combine is not on the critical path alone. The sweeps stay here
-    # because they are the price list: re-tuning later means arguing with these numbers,
-    # and a table with the losing entries deleted looks like 64x8 won.
-    #
-    # topk 6 re-swept 2026-08-17, after the entry barrier stopped charging for a
-    # wide grid. A QUAD group is worldSize warps and takes one token per round, so
-    # block*warp/worldSize groups want to match the token count exactly -- one
-    # round, no loop. Below that the extra blocks only add barrier work.
-    #   ct     64x8   128x8  256x8      groups at 256x8 = 512
-    #   64     15.9    16.5   18.1      <- 64x8 already wins
-    #   128    16.6    17.7   19.3      <- 64x8 already wins
-    #   256    24.3    21.2   23.1      costs +3.1 (15%)
-    #   512    32.0    31.1   29.0      costs +3.0 (10%)
-    #   1024   49.9    44.6   45.7      costs +5.3 (12%)
-    #   2048   85.4    74.7   74.3      costs +11.1 (15%)
-    #   4096  155.5   132.6  133.5      costs +22.9 (17%)
-    #
-    # topk 8 has no 64x8 column of its own -- its edge at 512 came from a sweep that is
-    # not reproduced here -- so the cost of pinning it is UNMEASURED, not zero. topk sets
-    # the tokens consumed per round, so it cannot borrow topk 6's numbers.
     "gfx1250": {
         (4, 7168, 8, None): ((None, 64, 8),),
         (4, 7168, 6, None): ((None, 64, 8),),

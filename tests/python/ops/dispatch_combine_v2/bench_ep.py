@@ -288,11 +288,6 @@ def main():
     def time_pairs(mode, one_pair, capture, split_legs):
         """ITERS (dispatch, combine) pairs; mean us per leg.
 
-        Timed three ways, and which one gets returned is on the [E2E] line as src=. Under a
-        graph it is the reading whose event records live inside the graph, because recording
-        them from the host every iteration adds 9.3 us to every pair -- see the comments
-        further down for what each way costs and what is left in the one that is reported.
-
         Warmup is lock-stepped per iteration: at small token counts a rank that
         starts call N+1 before every rank finished N can overwrite an unconsumed
         cross-device barrier flag, and both ranks hang. The timed loop is not --
@@ -312,9 +307,6 @@ def main():
         else:
             run_d, run_c = capture()
 
-        # Three events per iteration, not four: the middle one ends dispatch and starts
-        # combine. Recording two back to back there left the time the GPU spent on those
-        # two packets out of both legs, so d + c came to less than the pair took.
         ev = [
             [torch.cuda.Event(enable_timing=True) for _ in range(ITERS)]
             for _ in range(3)
@@ -330,28 +322,10 @@ def main():
         hd = sum(ev[0][i].elapsed_time(ev[1][i]) for i in range(ITERS)) / ITERS * 1000
         hc = sum(ev[1][i].elapsed_time(ev[2][i]) for i in range(ITERS)) / ITERS * 1000
 
-        # The floor: the same pairs with nothing recorded between them. E2E_R of them go into one
-        # graph, one event pair wraps a whole replay, so a pair carries 1/R of a replay and 2/R
-        # of an event instead of two replays and three events. It cannot say what either leg
-        # took, only what a pair costs when nobody is watching, which is what the per-leg
-        # readings get measured against.
-        #
-        # What the per-iteration method adds is not small and is not a property of the kernel.
-        # On gfx1250 EP4 at 512 tokens it is 9.1-9.3 us per pair at bf16, fp8 and fp4 alike, and
-        # cutting the dispatch kernel short until it returns on entry -- fifty times less work --
-        # moves it by under 1 us. Before #576 this file timed ITERS calls under a single event
-        # pair and paid none of it; that pass also kept the legs apart, so alternating pairs and
-        # cheap timing were never in conflict.
-        #
-        # The pairs go inside the capture, never into a host loop. Submitting them back to back
-        # from the host deadlocks the full kernel for the reason this function's own docstring
-        # gives: a rank that starts call N+1 before every rank finished N overwrites a barrier
-        # flag its peer has not consumed. Inside a graph the order is fixed.
         e2e = slope = -1.0
         rep = int(os.environ.get("E2E_R", 10))
 
         def graph_of(npairs):
-            """A warmed-up graph holding npairs back-to-back pairs."""
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g):
                 for _ in range(npairs):
@@ -363,13 +337,6 @@ def main():
             return g
 
         def replay_us(g, n):
-            """Mean wall time of one replay of g, in us.
-
-            n replays, each under its own event pair, submitted back to back the way
-            the timed loop above submits its iterations. One replay was a single
-            sample of a quantity the per-iteration reading averages over ITERS, and
-            it moved several us between rounds, which is enough to swamp what this is
-            measuring."""
             a = [torch.cuda.Event(enable_timing=True) for _ in range(n)]
             b = [torch.cuda.Event(enable_timing=True) for _ in range(n)]
             for k in range(n):
@@ -385,48 +352,12 @@ def main():
             alt = int(os.environ.get("E2E_ALT", 4))
             g_r, g_2r = graph_of(rep), graph_of(2 * rep)
             t_r = t_2r = 0.0
-            # R and 2R alternate rather than one running after the other. Taken in
-            # sequence, whatever the machine drifts over those hundreds of replays lands
-            # entirely in the slope below, where dividing by R multiplies it: measured
-            # that way the slope moved 6.5 us between rounds while the two readings it is
-            # built from moved 1.8.
             for _ in range(alt):
                 t_r += replay_us(g_r, n_e2e)
                 t_2r += replay_us(g_2r, n_e2e)
             t_r, t_2r = t_r / alt, t_2r / alt
             e2e = t_r / rep
-            # Dividing one replay by R leaves 1/R of the launch and 1/R of the event pair
-            # inside every pair; the difference between R and 2R is R pairs and nothing
-            # else, so its slope is what one more pair costs once it is nobody's first.
-            # Both are reported: e2e is the convention the numbers already on record were
-            # measured against, and it is the steadier of the two because it is one
-            # measurement rather than a difference of two.
             slope = (t_2r - t_r) / rep
-        # What this function reports, when the mode allows it: the same R pairs in one graph,
-        # with the event records captured INTO the graph instead of issued from the host once
-        # per iteration. The order is unchanged and the legs stay separable; what changes is
-        # that a timestamp costs a graph node rather than a host API call and a queue packet.
-        # Against the floor above, on a08-1 at 512 tokens across bf16, fp8 and fp4, over 15
-        # rounds that each held the cards alone, this reads 5.3 us per pair where the
-        # per-iteration method reads 9.7.
-        #
-        # Those 5 us are the event nodes themselves and do not go away by batching: taking R
-        # from 10 to 40 left them at 5.5 -> 5.0 us per pair, within the round-to-round spread,
-        # where a cost paid once per replay would have dropped to a quarter. Three nodes a pair
-        # at roughly 1.6 us each. Below this needs a timestamp that never leaves the GPU, i.e.
-        # wall_clock64 inside the kernels (MORI_EP_SEGTIME), which cannot see the launch at all
-        # and which makes the correctness check fail on 17-23% of runs.
-        #
-        # Both legs pay it. Over 15 rounds with the cards to ourselves, combine's two readings
-        # differ by 2.38-3.25 us and dispatch's by -0.05-4.31, and over the ten fp8 and fp4
-        # rounds not one put dispatch near zero. An earlier twelve read 3 us on combine and
-        # nothing on dispatch, which was dispatch's own spread: that spread is still wider
-        # than the gap between the legs, so whether they pay the same is not answerable here.
-        #
-        # Amortizing per leg is not an option and this is why: dispatch accumulates into
-        # total_recv and only combine clears it (see prime), so R dispatches captured back to
-        # back would leave the next combine staging R times the tokens and running past the
-        # arena. Whatever replaces the per-iteration probes has to keep the pairs paired.
         gd_us = gc_us = -1.0
         gd_lo = gd_hi = gc_lo = gc_hi = float("nan")
         evflags = 0
@@ -435,13 +366,6 @@ def main():
         if mode == "graph" and gevr > 0:
             import ctypes
 
-            # An event recorded from inside a capture becomes an internal graph node, and an
-            # internal node's timestamp is not readable from the host: elapsed_time on one
-            # returns hipErrorInvalidHandle. The flag that makes it readable is
-            # hipEventRecordExternal, which torch.cuda.Event.record does not expose, so record
-            # through the HIP runtime instead. Where that library is not there, say so and fall
-            # back -- a reading 5 us off is worth having, a silent switch between two of them is
-            # not.
             try:
                 hip = ctypes.CDLL("libamdhip64.so")
             except OSError as exc:
@@ -467,19 +391,6 @@ def main():
                 ctypes.c_void_p,
             ]
 
-            # Recording an event writes back and invalidates cache at system scope, and that is
-            # charged twice: once to the node, once to the kernel behind it that now starts cold.
-            # hip_runtime_api.h says as much where it defines hipEventDisableSystemFence
-            # (0x20000000) -- "can improve the accuracy of timing measurements by avoiding the
-            # cost of cache writeback and invalidation, and the performance impact of those
-            # actions on the execution of following work" -- with hipEventReleaseToDevice
-            # (0x40000000) as the narrower version that keeps a device-scope release. These
-            # events feed nothing but hipEventElapsedTime, which is the case both are documented
-            # for. torch.cuda.Event does not expose either, hence building them here.
-            #
-            # 0 is what torch.cuda.Event(enable_timing=True) creates, so it is the default and
-            # the arm to compare against. It also means switching to hand-built events on its
-            # own changes no reading.
             evflags = int(os.environ.get("GEV_EVFLAGS", "0"), 0)
 
             def make_ev():
@@ -520,17 +431,7 @@ def main():
             for _ in range(WARMUP):
                 gg.replay()
             lockstep()
-            # The events are rewritten by every replay, so each one has to be read back before
-            # the next. That sync sits between replays, not between the legs, so it cannot land
-            # inside either reading -- what it does cost is that every replay starts against an
-            # empty queue instead of a full one.
             n_gev = int(os.environ.get("GEV_N", 20))
-            # The first pair of every replay is dropped. That read-back has to synchronize,
-            # so every replay starts against an empty queue and its first dispatch waits out
-            # the graph launch, which the other R-1 do not. Averaged in at R=10 it put a
-            # tenth of a launch into dispatch and nothing into combine, a bias on one leg
-            # only. Dropping it took dispatch's round-to-round spread from 3.6 us to between
-            # 0.44 and 2.4 depending on dtype.
             skip = 1 if gevr > 1 else 0
             npair = gevr - skip
             ds, cs = [], []
@@ -544,21 +445,9 @@ def main():
                     sum(el_us(gev[i][1], gev[i][2]) for i in range(skip, gevr)) / npair
                 )
             gd_us, gc_us = sum(ds) / n_gev, sum(cs) / n_gev
-            # Reported so a reader can tell a 2 us effect from a 2 us spread without
-            # rerunning. Each sample here is already a mean over R-1 pairs, so this is the
-            # spread of replay-to-replay drift, not of single pairs.
             gd_lo, gd_hi = min(ds), max(ds)
             gc_lo, gc_hi = min(cs), max(cs)
 
-            # A mean over the replays lets a few disturbed ones carry the whole run. Measured
-            # 2026-09-15 on an empty kernel: the clean runs hold every replay inside 0.10 us,
-            # and the runs that read high have the same floor -- 3.98 against the clean 3.91 --
-            # with a few replays up at 5.36 doing all the lifting. Across eight rounds that
-            # turned into 3 us of run-to-run swing on a reading whose real spread is 0.1, and
-            # any effect smaller than the swing was unmeasurable.
-            #
-            # Both are reported until one round has been run with both in hand, because
-            # switching the number that gets quoted is not something to do on an argument.
             def quart(xs):
                 s = sorted(xs)
                 n = len(s)
@@ -567,12 +456,7 @@ def main():
 
             gd_med, gd_p25, gd_p75 = quart(ds)
             gc_med, gc_p25, gc_p75 = quart(cs)
-        # Report the graph-event reading where there is one, and say so on the diagnostic line
-        # rather than silently: two numbers 3 us apart that are both labelled "combine" is
-        # exactly the kind of thing that gets compared across runs months later.
         d, c = (gd_us, gc_us) if gd_us > 0 else (hd, hc)
-        # One rank prints. Four ranks each writing a long line is how torn output gets spliced
-        # into a reading that parses and is wrong.
         if rank == 0 and e2e > 0:
             src = "gev" if gd_us > 0 else "periter"
             print(
@@ -591,8 +475,6 @@ def main():
                 f"gdlo={gd_lo:.2f} gdhi={gd_hi:.2f} gclo={gc_lo:.2f} gchi={gc_hi:.2f} "
                 f"gdmed={gd_med:.2f} gdp25={gd_p25:.2f} gdp75={gd_p75:.2f} "
                 f"gcmed={gc_med:.2f} gcp25={gc_p25:.2f} gcp75={gc_p75:.2f} "
-                # On the line, not only in the script that set it: an arm whose flag never
-                # reached the runtime prints a table of the same shape as one where it did.
                 f"evflags=0x{evflags:x} R={gevr} N={n_gev}",
                 flush=True,
             )
