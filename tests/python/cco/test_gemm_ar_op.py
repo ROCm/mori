@@ -270,20 +270,30 @@ def test_public_op_takes_the_column_major_scale():
 
 
 @requires_two_gpus
-def test_one_instance_serves_a_smaller_m_after_a_larger_one():
-    """M=4096 then M=8192 used to hang: the control region moved under it.
+@pytest.mark.parametrize("m_small,m_large", [(512, 1024), (2048, 4096)])
+def test_one_instance_serves_two_m_values_in_any_order(m_small, m_large):
+    """Two M values through one instance, alternating, then repeated.
 
-    Runs both twice, alternating, so a counter that carried a residue from the
-    other shape would show up on the repeat as well as on the first switch.
-    Shrinking only -- see :func:`test_growing_m_is_refused`.
+    Two separate defects lived here. The reviewer's: counter_chunks changes with
+    M, which moved lock_off and everything after it, so the second shape read the
+    first one's payload as control state and hung. Then, once that was fixed,
+    this: the payload offsets are a running sum of m-sized regions, so at
+    world=2 n=1024 m=1024's output rows 512..767 land exactly where m=512's recv
+    slot for peer 1 was. The first call at the second shape came back with that
+    peer's previous *scatter* payload in those rows -- 4 runs in 8, always the
+    same value, with the repeat correct because by then the bytes were its own.
+
+    Both are fixed by pinning the map: the control region to MAX_CHUNKS, the
+    payload to the instance's m_max. Every shape now has the same map, so a
+    region only ever aliases itself.
     """
     r = _run_worker(
         2,
         "alternating_m",
         "--m-small",
-        "1024",
+        str(m_small),
         "--m-large",
-        "512",
+        str(m_large),
         "-n",
         "1024",
         "-k",
@@ -291,6 +301,55 @@ def test_one_instance_serves_a_smaller_m_after_a_larger_one():
     )
     for key in ("first_small", "first_large", "again_small", "again_large"):
         assert r[key] < FP8_FLOOR, (key, r)
+
+
+def test_the_payload_map_is_the_same_for_every_m():
+    """What the test above checks on hardware, as arithmetic.
+
+    Regression guard for the aliasing itself: without capacity_m every region
+    below the control area sits at a different byte for every M.
+    """
+
+    def cfg(m):
+        c = ArConfig(
+            world_size=2,
+            m=m,
+            n=1024,
+            recv_slots=2,
+            counter_chunks=counter_chunks(m, 2),
+            counter_capacity=MAX_CHUNKS,
+            counter_shape_slots=8,
+            capacity_m=4096,
+        )
+        c.validate()
+        return c
+
+    maps = {
+        m: (
+            cfg(m).input_off,
+            cfg(m).output_off,
+            cfg(m).tmp_off,
+            cfg(m).recv_off,
+            cfg(m).recv_slot_off(1),
+            cfg(m).window_bytes,
+        )
+        for m in (512, 1024, 2048, 4096)
+    }
+    assert len(set(maps.values())) == 1, maps
+
+    # And without it they all differ, which is the bug this guards.
+    loose = {
+        m: ArConfig(
+            world_size=2,
+            m=m,
+            n=1024,
+            recv_slots=2,
+            counter_chunks=counter_chunks(m, 2),
+            counter_capacity=MAX_CHUNKS,
+        ).recv_slot_off(1)
+        for m in (512, 1024, 2048, 4096)
+    }
+    assert len(set(loose.values())) == 4, loose
 
 
 @requires_two_gpus
@@ -307,39 +366,6 @@ def test_changing_operands_between_calls_stays_correct():
     )
     for key in (f"call{i}" for i in range(5)):
         assert r[key] < FP8_FLOOR, (key, r)
-
-
-@requires_two_gpus
-def test_growing_m_is_refused():
-    """Growing M within one instance is a known defect, so it must not run.
-
-    After a call at some M, the first call at a *larger* M comes back wrong
-    about half the time -- always the same value, with the repeat correct.
-    8 runs each on 2 ranks:
-
-        512 -> 1024    4 of 8 wrong
-        1024 -> 512    0 of 8 wrong
-        2048 -> 4096   also wrong, so it is the growth, not the chunk count
-        512 x5, different operands each call     all correct
-
-    The last line rules out a stale read of a peer's slice at a fixed shape, and
-    the per-shape counter sets tested above rule out a counter residue. Root
-    cause still open; until then the op raises instead of returning the wrong
-    answer, and this test pins that behaviour.
-    """
-    r = _run_worker(
-        2,
-        "growing_m",
-        "--m-small",
-        "512",
-        "--m-large",
-        "1024",
-        "-n",
-        "1024",
-        "-k",
-        "512",
-    )
-    assert r["refused"], r
 
 
 @requires_two_gpus

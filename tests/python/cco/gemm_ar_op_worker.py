@@ -133,6 +133,47 @@ def case_scale_order(op, rank, world, m, n, k):
     )
 
 
+def _peer_c(peer: int, m: int, n: int, k: int) -> torch.Tensor:
+    """Peer's *unreduced* GEMM output at this shape, in bf16.
+
+    What the scatter pushes into my recv slot for that peer, so it is also what
+    a stale copy of that push would leave behind.
+    """
+    a, b, sa, sb = _operands(peer, m, n, k)
+    af, bf = a.float(), b.float()
+    out = torch.zeros(m, n, device="cuda", dtype=torch.float32)
+    kb = k // SCALE_BK
+    for j in range(kb):
+        sl = slice(j * SCALE_BK, (j + 1) * SCALE_BK)
+        out += (
+            (af[:, sl] @ bf[:, sl].t())
+            * sa[:, j : j + 1]
+            * sb[:, j].repeat_interleave(SCALE_BK)[:n]
+        )
+    return out.to(torch.bfloat16)
+
+
+def _row_report(got, ref, m):
+    """Which rows are wrong, as a contiguous-block summary.
+
+    A fixed wrong value hit intermittently means the race decides *whether* a
+    region is read stale, not *what* is in it -- so the row map is what points
+    at the region.
+    """
+    err = (got.float() - ref).abs().amax(dim=1)
+    scale = ref.abs().amax(dim=1).clamp_min(1e-6)
+    bad = (err / scale > 0.05).nonzero().flatten()
+    if bad.numel() == 0:
+        return {"bad_rows": 0}
+    return {
+        "bad_rows": int(bad.numel()),
+        "m": m,
+        "first_bad": int(bad[0]),
+        "last_bad": int(bad[-1]),
+        "contiguous": bool(bad.numel() == int(bad[-1]) - int(bad[0]) + 1),
+    }
+
+
 def case_alternating_m(op, rank, world, m_small, m_large, n, k):
     """Two M values through one instance, alternating, then repeated.
 
@@ -149,7 +190,21 @@ def case_alternating_m(op, rank, world, m_small, m_large, n, k):
     ):
         a, b, sa, sb = _operands(rank, m, n, k)
         got = op(a, preshuffle_b(b), sa, sb).clone()
-        results[label] = _rel_l2(got, _reference(world, m, n, k))
+        ref = _reference(world, m, n, k)
+        results[label] = _rel_l2(got, ref)
+        if results[label] > 0.01:
+            rep = _row_report(got, ref, m)
+            # Hypothesis: the bad range is exactly where the *previous* shape's
+            # recv slot for peer 1 sat, and still holds that peer's scatter
+            # payload from the previous call.
+            if rep["bad_rows"] and m_small != m:
+                stale = _peer_c(1, m_small, n, k)[: rep["bad_rows"]]
+                seen = got[rep["first_bad"] : rep["last_bad"] + 1]
+                rep["matches_previous_scatter"] = bool(torch.equal(seen, stale))
+                rep["max_abs_diff_vs_stale"] = float(
+                    (seen.float() - stale.float()).abs().max()
+                )
+            results[f"{label}_rows"] = rep
     _emit(rank, case="alternating_m", **results)
 
 
@@ -191,19 +246,6 @@ def case_changing_data(op, rank, world, m, n, k, calls):
     _emit(rank, case="changing_data", **out)
 
 
-def case_growing_m(op, rank, world, m_small, m_large, n, k):
-    """The op must refuse a larger M after a smaller one, not answer wrongly."""
-    a, b, sa, sb = _operands(rank, m_small, n, k)
-    op(a, preshuffle_b(b), sa, sb)
-    refused = False
-    try:
-        a, b, sa, sb = _operands(rank, m_large, n, k)
-        op(a, preshuffle_b(b), sa, sb)
-    except ValueError:
-        refused = True
-    _emit(rank, case="growing_m", refused=refused)
-
-
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--case", required=True)
@@ -229,10 +271,6 @@ def main() -> int:
                 case_scale_order(op, rank, world, args.m, args.n, args.k)
             elif args.case == "changing_data":
                 case_changing_data(op, rank, world, args.m, args.n, args.k, args.calls)
-            elif args.case == "growing_m":
-                case_growing_m(
-                    op, rank, world, args.m_small, args.m_large, args.n, args.k
-                )
             elif args.case == "alternating_m":
                 case_alternating_m(
                     op, rank, world, args.m_small, args.m_large, args.n, args.k

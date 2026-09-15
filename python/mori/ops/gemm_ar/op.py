@@ -110,6 +110,7 @@ def _build_cfg(
     counter_capacity: int,
     shape_slots: int,
     shape_index: int,
+    capacity_m: int = 0,
 ) -> ArConfig:
     """The one place an ``ArConfig`` is built, so every caller agrees.
 
@@ -126,6 +127,7 @@ def _build_cfg(
         counter_capacity=counter_capacity,
         counter_shape_slots=shape_slots,
         counter_shape_index=shape_index,
+        capacity_m=capacity_m,
         gather_dtype=gather_dtype,
         gather_transport=gather_transport,
     )
@@ -336,8 +338,6 @@ class GemmAllReduceOp:
 
         self._cache: dict[int, _Plan] = {}
         self._pad_in: Optional[torch.Tensor] = None
-        #: M values that have actually run, for :meth:`_check_growth`.
-        self._m_seen: set[int] = set()
 
     @staticmethod
     def window_bytes_for(
@@ -372,30 +372,6 @@ class GemmAllReduceOp:
         """``m`` rounded up to what :meth:`__call__` accepts."""
         return padded_m(m, self.world_size, self.block_m)
 
-    def _check_growth(self, m: int) -> None:
-        """Refuse the first call at an M larger than one already run.
-
-        Known-bad and not yet root-caused: after a call at some M, the first call
-        at a *larger* M comes back wrong about half the time, always with the
-        same value, while the repeat is correct. Measured on 2 ranks, 8 runs
-        each: 512 then 1024 fails 4/8; 1024 then 512 fails 0/8; 2048 then 4096
-        (same chunk count) also fails, so it is the growth and not the chunk
-        count. Zeroing the window and synchronising between the calls avoids it,
-        which points at a read of a region the smaller shape left dirty rather
-        than at the counters -- those are already per-shape.
-
-        Until that is found, this is an error rather than a wrong answer. Serve
-        the largest M first (padding to it is usually what a server does anyway),
-        or give each M its own op.
-        """
-        if self._m_seen and m > max(self._m_seen):
-            raise ValueError(
-                f"M={m} is larger than every M this instance has run "
-                f"{sorted(self._m_seen)}. Growing M within one op is a known "
-                f"defect -- the first call at the larger M is intermittently "
-                f"wrong. Call the largest M first, or build a second op."
-            )
-
     def _slot_for(self, m: int) -> int:
         """This M's counter set, assigned on first sight and then fixed."""
         slot = self._shape_slot.get(m)
@@ -424,6 +400,10 @@ class GemmAllReduceOp:
             counter_capacity=MAX_CHUNKS,
             shape_slots=self.max_shapes,
             shape_index=self._slot_for(m),
+            # Every M this instance serves gets the same map. Without it the
+            # regions of two shapes overlap and a call reads the previous
+            # shape's leftovers -- see ArConfig.capacity_m.
+            capacity_m=self.m_max,
         )
 
     def _compiled(self, m: int):
@@ -573,9 +553,7 @@ class GemmAllReduceOp:
                 f"{self.world_size * self.block_m}; use padded_m()/pad_rows()"
             )
         self._check_operands(a_fp8, b_preshuffled, a_scale, b_scale, m)
-        self._check_growth(m)
         plan = self._compiled(m)
-        self._m_seen.add(m)
         stream = fx.Stream(torch.cuda.current_stream())
         plan.gemm(
             a_fp8.contiguous().view(torch.int8).view(-1),

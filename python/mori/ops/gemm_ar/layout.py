@@ -42,7 +42,7 @@ window layout, they differ only in how bytes move.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dc_replace
 
 # --- aiter parity constants (custom_all_reduce.cuh) ---
 K_MAX_BLOCKS = 80  # kMaxBlocks; also the number of signal slot rows
@@ -163,6 +163,17 @@ class ArConfig:
     #: lets graphs for different ``m`` be replayed in any order.
     counter_shape_slots: int = 1
     counter_shape_index: int = 0
+    #: Lay the payload regions out for this ``m`` instead of for ``m``.
+    #:
+    #: Every offset past the control area is a running sum of m-sized regions,
+    #: so two shapes sharing a window put different regions at the same bytes:
+    #: at world=2 n=1024, m=1024's output rows 512..767 land exactly where
+    #: m=512's recv slot for peer 1 was, and read that peer's previous scatter
+    #: payload instead of its gathered slice. Pinning the offsets to the largest
+    #: m an instance will serve makes every shape's map identical, so a region
+    #: only ever aliases *itself*. Sizes stay m-based -- this moves where things
+    #: are, not how much is moved. 0 means "same as m".
+    capacity_m: int = 0
     #: What travels on the wire, per leg. ``"bf16"`` sends the payload as-is;
     #: ``"fp8"`` quantises to e4m3 with fp32 scales, halving the bytes. The
     #: reduce always accumulates in fp32 and ``output`` is always bf16 -- only
@@ -498,6 +509,18 @@ class ArConfig:
         return block * MAX_WORLD + peer
 
     @property
+    def _cap(self) -> "ArConfig":
+        """This config sized for ``capacity_m``; ``self`` when there is none.
+
+        Every offset below is taken from here rather than from ``self``, which
+        is what makes the map identical across shapes. It has ``capacity_m=0``,
+        so the recursion stops immediately.
+        """
+        if not self.capacity_m or self.capacity_m == self.m:
+            return self
+        return _dc_replace(self, m=self.capacity_m, capacity_m=0)
+
+    @property
     def input_off(self) -> int:
         """The GEMM's C, in the wire dtype. Source of the scatter leg."""
         return _align_up(self.signal_bytes, SIGNAL_ALIGN)
@@ -505,23 +528,24 @@ class ArConfig:
     @property
     def input_scale_off(self) -> int:
         """Scatter-leg scales for ``input``. Zero-sized on the bf16 wire."""
-        return _align_up(self.input_off + self.scatter_nbytes, SIGNAL_ALIGN)
+        c = self._cap
+        return _align_up(c.input_off + c.scatter_nbytes, SIGNAL_ALIGN)
 
     def input_scale_slice_off(self, peer: int) -> int:
         """Where peer ``peer``'s row band's scales start within ``input_scale``."""
-        return (
-            self.input_scale_off
-            + peer * self.slice_rows * self.scatter_tiles_per_row * 4
-        )
+        c = self._cap
+        return c.input_scale_off + peer * c.slice_rows * c.scatter_tiles_per_row * 4
 
     @property
     def output_off(self) -> int:
         """The consumer's tensor. Always bf16 -- only the wire changes dtype."""
-        return self.input_scale_off + self.scatter_scale_bytes
+        c = self._cap
+        return c.input_scale_off + c.scatter_scale_bytes
 
     @property
     def output_end(self) -> int:
-        return _align_up(self.output_off + self.nbytes, SIGNAL_ALIGN)
+        c = self._cap
+        return _align_up(c.output_off + c.nbytes, SIGNAL_ALIGN)
 
     @property
     def gout_off(self) -> int:
@@ -532,7 +556,8 @@ class ArConfig:
         costs nothing. On the fp8 wire it is its own region, because ``output``
         has to stay bf16 for the consumer while the wire carries fp8.
         """
-        return self.output_end if self.fp8_gather else self.output_off
+        c = self._cap
+        return c.output_end if c.fp8_gather else c.output_off
 
     @property
     def gout_bytes(self) -> int:
@@ -540,17 +565,20 @@ class ArConfig:
 
     @property
     def gout_scale_off(self) -> int:
-        return _align_up(self.gout_off + self.gout_bytes, SIGNAL_ALIGN)
+        c = self._cap
+        return _align_up(c.gout_off + c.gout_bytes, SIGNAL_ALIGN)
 
     def gout_scale_slice_off(self, peer: int) -> int:
-        return self.gout_scale_off + peer * self.slice_rows * 4
+        c = self._cap
+        return c.gout_scale_off + peer * c.slice_rows * 4
 
     @property
     def tmp_off(self) -> int:
         # Not simply "after gout_scale": on the bf16 wire gout aliases output and
         # contributes nothing, so the running offset has to be taken past
         # output's own bytes explicitly or tmp lands on top of it.
-        return max(self.output_end, self.gout_scale_off + self.gather_scale_bytes)
+        c = self._cap
+        return max(c.output_end, c.gout_scale_off + c.gather_scale_bytes)
 
     @property
     def tmp_bytes(self) -> int:
@@ -559,11 +587,13 @@ class ArConfig:
 
     @property
     def recv_off(self) -> int:
-        return self.tmp_off + self.tmp_bytes
+        c = self._cap
+        return c.tmp_off + c.tmp_bytes
 
     @property
     def recv_bytes(self) -> int:
-        return self.recv_slots * self.scatter_slice_bytes
+        c = self._cap
+        return c.recv_slots * c.scatter_slice_bytes
 
     def recv_slot_off(self, peer: int) -> int:
         """Where peer ``peer``'s contribution to *my* slice lands."""
@@ -573,17 +603,20 @@ class ArConfig:
             raise IndexError(
                 f"peer {peer} has no landing slot; recv_slots={self.recv_slots}"
             )
-        return self.recv_off + peer * self.scatter_slice_bytes
+        c = self._cap
+        return c.recv_off + peer * c.scatter_slice_bytes
 
     @property
     def recv_scale_off(self) -> int:
-        return _align_up(self.recv_off + self.recv_bytes, SIGNAL_ALIGN)
+        c = self._cap
+        return _align_up(c.recv_off + c.recv_bytes, SIGNAL_ALIGN)
 
     @property
     def recv_scale_bytes(self) -> int:
         if not self.fp8_wire:
             return 0
-        return _align_up(self.recv_slots * self.scatter_scale_slice_bytes, SIGNAL_ALIGN)
+        c = self._cap
+        return _align_up(c.recv_slots * c.scatter_scale_slice_bytes, SIGNAL_ALIGN)
 
     def recv_scale_slot_off(self, peer: int) -> int:
         """Where peer ``peer``'s scales for my slice land."""
@@ -591,11 +624,13 @@ class ArConfig:
             raise IndexError(
                 f"peer {peer} has no landing slot; recv_slots={self.recv_slots}"
             )
-        return self.recv_scale_off + peer * self.scatter_scale_slice_bytes
+        c = self._cap
+        return c.recv_scale_off + peer * c.scatter_scale_slice_bytes
 
     @property
     def window_bytes(self) -> int:
-        return self.recv_scale_off + self.recv_scale_bytes
+        c = self._cap
+        return c.recv_scale_off + c.recv_scale_bytes
 
     # --- traffic model, for reporting alongside measured time ---
 
