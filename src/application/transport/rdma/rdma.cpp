@@ -452,7 +452,7 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabufI
 // silent writes to the wrong address). hsa_amd_portable_export_dmabuf reports the
 // true byte offset, so prefer it and fall back to the hip path (offset 0, correct
 // only for whole-allocation exports) when HSA export is unavailable.
-static int TryExportDmabufFd(void* ptr, size_t size, uint64_t* offset) {
+int TryExportDmabufFd(void* ptr, size_t size, uint64_t* offset) {
   int fd = -1;
   uint64_t off = 0;
   hsa_status_t hs = hsa_amd_portable_export_dmabuf(ptr, size, &fd, &off);
