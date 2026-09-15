@@ -56,10 +56,23 @@ MAX_CHUNKS = 8
 # (relL2 1.41 against 2.4e-3 at K=256).
 MIN_K = 2 * BLOCK_K
 
-# Distinct M values one instance can serve. Each needs its own counter set --
-# see ArConfig.counter_shape_slots -- and each also costs a FlyDSL compile, so
-# this is a small number by nature rather than a tuning knob.
-DEFAULT_MAX_SHAPES = 8
+
+# Distinct M values one instance can serve, when not given explicitly.
+#
+# Each needs its own counter set (ArConfig.counter_shape_slots), and the default
+# is *every* M the window can legally take: a padded M is a multiple of
+# world_size*block_m and at most m_max, so there are m_max/(world_size*block_m)
+# of them and a legal call can never exhaust the table.
+#
+# It is sized that way because running out was not graceful. A server's M
+# changes with the batch -- 4096, 5120, 6144, 7168, ... at this shape -- so a
+# fixed 8 ran out within seconds of real traffic, and SGLang turns any exception
+# from this path into a permanent fallback, so the whole optimisation switched
+# itself off. A counter set is world_size*MAX_CHUNKS*4 bytes, 256 B at tp8, so
+# 16 of them cost 4 KiB of a 700 MiB window; rationing them bought nothing.
+def default_max_shapes(m_pad_max: int, world_size: int, block_m: int) -> int:
+    """How many distinct padded M values fit under ``m_pad_max``."""
+    return max(1, m_pad_max // (world_size * block_m))
 
 
 def padded_m(m: int, world_size: int, block_m: int = DEFAULT_BLOCK_M) -> int:
@@ -166,7 +179,9 @@ def supports(
             gather_dtype=gather_dtype,
             gather_transport=gather_transport,
             counter_capacity=MAX_CHUNKS,
-            shape_slots=DEFAULT_MAX_SHAPES,
+            shape_slots=default_max_shapes(
+                padded_m(m, world_size, block_m), world_size, block_m
+            ),
             shape_index=0,
         )
     except ValueError:
@@ -271,7 +286,7 @@ class GemmAllReduceOp:
         sdma_queues: int = 1,
         gather_dtype: str = "bf16",
         gather_transport: str = "lsa",
-        max_shapes: int = DEFAULT_MAX_SHAPES,
+        max_shapes: Optional[int] = None,
     ):
         self._closed = True  # so a failed constructor leaves close() a no-op
         if gather_dtype not in WIRE_DTYPES:
@@ -287,6 +302,10 @@ class GemmAllReduceOp:
             raise ValueError(
                 f"block_n must be {DEFAULT_BLOCK_N}: the op always compiles with "
                 f"permlane, whose lane transpose is written for that width"
+            )
+        if max_shapes is None:
+            max_shapes = default_max_shapes(
+                padded_m(m_max, comm.nranks, block_m), comm.nranks, block_m
             )
         if block_m < 1 or m_max < 1 or sdma_queues < 1 or max_shapes < 1:
             raise ValueError(
@@ -362,7 +381,7 @@ class GemmAllReduceOp:
         block_m: int = DEFAULT_BLOCK_M,
         gather_dtype: str = "bf16",
         gather_transport: str = "lsa",
-        max_shapes: int = DEFAULT_MAX_SHAPES,
+        max_shapes: Optional[int] = None,
     ) -> int:
         """Symmetric-window bytes an op for this shape will allocate.
 
@@ -378,7 +397,10 @@ class GemmAllReduceOp:
             gather_dtype=gather_dtype,
             gather_transport=gather_transport,
             counter_capacity=MAX_CHUNKS,
-            shape_slots=max_shapes,
+            shape_slots=max_shapes
+            or default_max_shapes(
+                padded_m(m_max, world_size, block_m), world_size, block_m
+            ),
             shape_index=0,
         ).window_bytes
 
