@@ -429,6 +429,7 @@ def main():
         # arena. Whatever replaces the per-iteration probes has to keep the pairs paired.
         gd_us = gc_us = -1.0
         gd_lo = gd_hi = gc_lo = gc_hi = float("nan")
+        evflags = 0
         gevr = int(os.environ.get("GEV_R", 20))
         hip = None
         if mode == "graph" and gevr > 0:
@@ -454,27 +455,58 @@ def main():
                 ctypes.c_uint,
             ]
 
-            rd, rc_leg = split_legs()
-            gev = [
-                [torch.cuda.Event(enable_timing=True) for _ in range(3)]
-                for _ in range(gevr)
+            hip.hipEventCreateWithFlags.restype = ctypes.c_int
+            hip.hipEventCreateWithFlags.argtypes = [
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_uint,
             ]
-            # torch creates the underlying hipEvent lazily and cuda_event reads 0 until then,
-            # so record each one once here. Recording into a null handle does not fail, it
-            # succeeds and leaves the timestamps at whatever they were.
-            for trio in gev:
-                for e in trio:
-                    e.record()
-            torch.cuda.synchronize()
+            hip.hipEventElapsedTime.restype = ctypes.c_int
+            hip.hipEventElapsedTime.argtypes = [
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+            ]
+
+            # Recording an event writes back and invalidates cache at system scope, and that is
+            # charged twice: once to the node, once to the kernel behind it that now starts cold.
+            # hip_runtime_api.h says as much where it defines hipEventDisableSystemFence
+            # (0x20000000) -- "can improve the accuracy of timing measurements by avoiding the
+            # cost of cache writeback and invalidation, and the performance impact of those
+            # actions on the execution of following work" -- with hipEventReleaseToDevice
+            # (0x40000000) as the narrower version that keeps a device-scope release. These
+            # events feed nothing but hipEventElapsedTime, which is the case both are documented
+            # for. torch.cuda.Event does not expose either, hence building them here.
+            #
+            # 0 is what torch.cuda.Event(enable_timing=True) creates, so it is the default and
+            # the arm to compare against. It also means switching to hand-built events on its
+            # own changes no reading.
+            evflags = int(os.environ.get("GEV_EVFLAGS", "0"), 0)
+
+            def make_ev():
+                e = ctypes.c_void_p()
+                r = hip.hipEventCreateWithFlags(ctypes.byref(e), evflags)
+                if r != 0:
+                    raise RuntimeError(f"hipEventCreateWithFlags(0x{evflags:x}) rc={r}")
+                return e
+
+            rd, rc_leg = split_legs()
+            gev = [[make_ev() for _ in range(3)] for _ in range(gevr)]
 
             def rec_ext(e):
                 r = hip.hipEventRecordWithFlags(
-                    ctypes.c_void_p(e.cuda_event),
+                    e,
                     ctypes.c_void_p(torch.cuda.current_stream().cuda_stream),
                     1,
                 )
                 if r != 0:
                     raise RuntimeError(f"hipEventRecordWithFlags rc={r}")
+
+            def el_us(a, b):
+                ms = ctypes.c_float()
+                r = hip.hipEventElapsedTime(ctypes.byref(ms), a, b)
+                if r != 0:
+                    raise RuntimeError(f"hipEventElapsedTime rc={r}")
+                return ms.value * 1000.0
 
             gg = torch.cuda.CUDAGraph()
             with torch.cuda.graph(gg):
@@ -506,14 +538,10 @@ def main():
                 gg.replay()
                 lockstep()
                 ds.append(
-                    sum(gev[i][0].elapsed_time(gev[i][1]) for i in range(skip, gevr))
-                    / npair
-                    * 1000
+                    sum(el_us(gev[i][0], gev[i][1]) for i in range(skip, gevr)) / npair
                 )
                 cs.append(
-                    sum(gev[i][1].elapsed_time(gev[i][2]) for i in range(skip, gevr))
-                    / npair
-                    * 1000
+                    sum(el_us(gev[i][1], gev[i][2]) for i in range(skip, gevr)) / npair
                 )
             gd_us, gc_us = sum(ds) / n_gev, sum(cs) / n_gev
             # Reported so a reader can tell a 2 us effect from a 2 us spread without
@@ -521,6 +549,24 @@ def main():
             # spread of replay-to-replay drift, not of single pairs.
             gd_lo, gd_hi = min(ds), max(ds)
             gc_lo, gc_hi = min(cs), max(cs)
+
+            # A mean over the replays lets a few disturbed ones carry the whole run. Measured
+            # 2026-09-15 on an empty kernel: the clean runs hold every replay inside 0.10 us,
+            # and the runs that read high have the same floor -- 3.98 against the clean 3.91 --
+            # with a few replays up at 5.36 doing all the lifting. Across eight rounds that
+            # turned into 3 us of run-to-run swing on a reading whose real spread is 0.1, and
+            # any effect smaller than the swing was unmeasurable.
+            #
+            # Both are reported until one round has been run with both in hand, because
+            # switching the number that gets quoted is not something to do on an argument.
+            def quart(xs):
+                s = sorted(xs)
+                n = len(s)
+                mid = s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+                return mid, s[n // 4], s[(3 * n) // 4]
+
+            gd_med, gd_p25, gd_p75 = quart(ds)
+            gc_med, gc_p25, gc_p75 = quart(cs)
         # Report the graph-event reading where there is one, and say so on the diagnostic line
         # rather than silently: two numbers 3 us apart that are both labelled "combine" is
         # exactly the kind of thing that gets compared across runs months later.
@@ -543,7 +589,11 @@ def main():
                 f"over={gd_us + gc_us - e2e if e2e > 0 else float('nan'):.2f} "
                 f"overslope={gd_us + gc_us - slope if slope > 0 else float('nan'):.2f} "
                 f"gdlo={gd_lo:.2f} gdhi={gd_hi:.2f} gclo={gc_lo:.2f} gchi={gc_hi:.2f} "
-                f"R={gevr} N={n_gev}",
+                f"gdmed={gd_med:.2f} gdp25={gd_p25:.2f} gdp75={gd_p75:.2f} "
+                f"gcmed={gc_med:.2f} gcp25={gc_p25:.2f} gcp75={gc_p75:.2f} "
+                # On the line, not only in the script that set it: an arm whose flag never
+                # reached the runtime prints a table of the same shape as one where it did.
+                f"evflags=0x{evflags:x} R={gevr} N={n_gev}",
                 flush=True,
             )
         return d, c, run_d, run_c
