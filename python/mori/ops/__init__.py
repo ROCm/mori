@@ -30,10 +30,10 @@ from .local_expert_count import (
     launch_local_expert_count,
 )
 
-# dispatch_combine_v2 (FlyDSL) requires the optional `flydsl` dependency, so it
-# is imported lazily: `import mori.ops` stays usable without flydsl installed,
-# and `mori.ops.dispatch_combine_v2` resolves on first access.
-_LAZY_SUBMODULES = {"dispatch_combine_v2"}
+# dispatch_combine_v2 and gemm_ar (FlyDSL) require the optional `flydsl`
+# dependency, so they are imported lazily: `import mori.ops` stays usable
+# without flydsl installed, and each submodule resolves on first access.
+_LAZY_SUBMODULES = {"dispatch_combine_v2", "gemm_ar"}
 
 
 def __getattr__(name: str):
