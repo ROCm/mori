@@ -260,23 +260,18 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj->peerRkeys, cpuMemObj->peerRkeys,
                               sizeof(uint32_t) * worldSize, hipMemcpyHostToDevice));
 
-  // SDMA peers (same-host). Each peer needs its within-node HIP device id
-  // (0-based) for the anvil queue key, but the device-handle array is addressed
+  // SDMA peers (same-host). The anvil queue key is each GPU's host-global KFD
+  // node id (exchanged in Context), while the device-handle array is addressed
   // by GLOBAL pe in the kernels (deviceHandles_d + pe * numQueues). Keep the two
-  // separate: (pe % 8) is wrong for multi-node / sliced HIP_VISIBLE_DEVICES runs
-  // where global ranks 4..7 on node 1 map to local HIP devices 0..3.
-  std::vector<std::pair<int, int>> sdmaPeers;  // (globalPe, withinNodeDevId)
-  {
-    int within = 0;
-    for (int i = 0; i < worldSize; i++) {
-      if (context.GetTransportType(i) != TransportType::SDMA) continue;
-      sdmaPeers.emplace_back(i, within++);
-    }
+  // separate: KFD node ids stay correct under multi-node / sliced
+  // HIP_VISIBLE_DEVICES runs, where HIP ordinals diverge from topology.
+  std::vector<int> sdmaPeers;  // global pe
+  for (int i = 0; i < worldSize; i++) {
+    if (context.GetTransportType(i) != TransportType::SDMA) continue;
+    sdmaPeers.push_back(i);
   }
   if (!sdmaPeers.empty()) {
-    int srcDeviceId = 0;  // within-node id of self
-    for (int j = 0; j < rank; j++)
-      if (context.GetTransportType(j) == TransportType::SDMA) srcDeviceId++;
+    int srcNode = context.LocalKfdNode();                // KFD node id of self
     int numOfQueuesPerDevice = gpuMemObj->sdmaNumQueue;  // all sdma queues are inited
     // Allocate based on worldSize because indexing uses pe * numQ where pe ranges
     // 0..worldSize-1. Using sdmaPeers.size causes buffer overflow.
@@ -288,11 +283,10 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
         hipMemset(gpuMemObj->deviceHandles_d, 0,
                   numDevices * numOfQueuesPerDevice * sizeof(anvil::SdmaQueueDeviceHandle*)));
 
-    for (auto& peer : sdmaPeers) {
-      int dstPe = peer.first;         // global pe -> array index (kernel-facing)
-      int dstDeviceId = peer.second;  // within-node id -> anvil queue key
+    for (int dstPe : sdmaPeers) {
+      int dstNode = context.KfdNodeId(dstPe);  // KFD node id -> anvil queue key
       for (size_t q = 0; q < numOfQueuesPerDevice; q++) {
-        auto* anvilHandle = anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
+        auto* anvilHandle = anvil::anvil.getSdmaQueue(srcNode, dstNode, q)->deviceHandle();
         HIP_RUNTIME_CHECK(hipMemcpy(&gpuMemObj->deviceHandles_d[dstPe * numOfQueuesPerDevice + q],
                                     &anvilHandle, sizeof(anvilHandle), hipMemcpyHostToDevice));
       }

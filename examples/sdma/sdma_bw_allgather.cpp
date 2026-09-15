@@ -411,8 +411,17 @@ void runExperimentMPI(int srcDeviceId, int mpiRank, int mpiSize, const Experimen
   // =============================
   std::cout << "Process " << mpiRank << ": Setting up Anvil SDMA queues..." << std::endl;
 
+  // Resolve KFD node ids once: anvil queues are keyed on node ids, not HIP
+  // device ordinals, so both connect() and getSdmaQueue() below must use
+  // the SAME converted id. Since this example keeps HIP_VISIBLE_DEVICES
+  // unsliced/identical across all MPI ranks (each rank just binds device ==
+  // its own rank), resolving a peer's node id from THIS process's own device
+  // enumeration is valid -- no cross-process node-id exchange needed here.
+  int srcNode = anvil::anvil.nodeForHipDevice(srcDeviceId);
+
   // Establish connection for each destination GPU
   for (int dstDeviceId : dstDeviceIds) {
+    int dstNode = anvil::anvil.nodeForHipDevice(dstDeviceId);
     try {
       // Ensure correct device context
       err = hipSetDevice(srcDeviceId);
@@ -433,7 +442,7 @@ void runExperimentMPI(int srcDeviceId, int mpiRank, int mpiSize, const Experimen
       std::cout << "Process " << mpiRank << ": Connecting GPU" << srcDeviceId << " -> GPU"
                 << dstDeviceId << " ..." << std::endl;
 
-      anvil::anvil.connect(srcDeviceId, dstDeviceId, params.numOfQueues);
+      anvil::anvil.connect(srcNode, dstNode, params.numOfQueues);
 
       std::cout << "Process " << mpiRank << ": GPU" << srcDeviceId << " -> GPU" << dstDeviceId
                 << " Anvil connection successful" << std::endl;
@@ -444,7 +453,7 @@ void runExperimentMPI(int srcDeviceId, int mpiRank, int mpiSize, const Experimen
       // Try fallback to using 1 queue
       std::cerr << "Process " << mpiRank << ": Trying to reconnect with 1 queue..." << std::endl;
       try {
-        anvil::anvil.connect(srcDeviceId, dstDeviceId, 1);
+        anvil::anvil.connect(srcNode, dstNode, 1);
         std::cout << "Process " << mpiRank << ": GPU" << srcDeviceId << " -> GPU" << dstDeviceId
                   << " Fallback connection successful" << std::endl;
       } catch (const std::exception& e2) {
@@ -479,9 +488,10 @@ void runExperimentMPI(int srcDeviceId, int mpiRank, int mpiSize, const Experimen
 
   for (size_t dstIdx = 0; dstIdx < dstDeviceIds.size(); dstIdx++) {
     int dstDeviceId = dstDeviceIds[dstIdx];
+    int dstNode = anvil::anvil.nodeForHipDevice(dstDeviceId);
     for (size_t q = 0; q < params.numOfQueues; q++) {
       try {
-        auto queue = anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q);
+        auto queue = anvil::anvil.getSdmaQueue(srcNode, dstNode, q);
         if (queue && queue->deviceHandle()) {
           host_device_handles[queueIdx] = queue->deviceHandle();
           std::cout << "Process " << mpiRank << ": Destination GPU" << dstDeviceId << " queue[" << q
