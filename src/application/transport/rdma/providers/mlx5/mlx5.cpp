@@ -138,7 +138,8 @@ mlx5dv_devx_umem* Mlx5RegisterControlUmem(ibv_context* context, void* addr, size
           return umem;
         }
         MORI_APP_TRACE(
-            "MLX5 control umem [{}] dmabuf registration failed (addr=0x{:x}, size={}, errno={} ({}))",
+            "MLX5 control umem [{}] dmabuf registration failed (addr=0x{:x}, size={}, errno={} "
+            "({}))",
             what, reinterpret_cast<uintptr_t>(addr), size, err, strerror(err));
         unavailable = "dmabuf registration failed";
       } else {
