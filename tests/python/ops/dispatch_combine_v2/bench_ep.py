@@ -285,7 +285,7 @@ def main():
             )
         return total, buf, bad.item() == 0, True
 
-    def time_pairs(mode, one_pair, capture):
+    def time_pairs(mode, one_pair, capture, split_legs):
         """ITERS (dispatch, combine) pairs; mean us per leg.
 
         Warmup is lock-stepped per iteration: at small token counts a rank that
@@ -309,19 +309,175 @@ def main():
 
         ev = [
             [torch.cuda.Event(enable_timing=True) for _ in range(ITERS)]
-            for _ in range(4)
+            for _ in range(3)
         ]
         for i in range(ITERS):
             ev[0][i].record()
             run_d()
             ev[1][i].record()
-            ev[2][i].record()
             run_c()
-            ev[3][i].record()
+            ev[2][i].record()
         torch.cuda.synchronize()
         dist.barrier()
-        d = sum(ev[0][i].elapsed_time(ev[1][i]) for i in range(ITERS)) / ITERS * 1000
-        c = sum(ev[2][i].elapsed_time(ev[3][i]) for i in range(ITERS)) / ITERS * 1000
+        hd = sum(ev[0][i].elapsed_time(ev[1][i]) for i in range(ITERS)) / ITERS * 1000
+        hc = sum(ev[1][i].elapsed_time(ev[2][i]) for i in range(ITERS)) / ITERS * 1000
+
+        e2e = slope = -1.0
+        rep = int(os.environ.get("E2E_R", 10))
+
+        def graph_of(npairs):
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                for _ in range(npairs):
+                    one_pair()
+            lockstep()
+            for _ in range(WARMUP):
+                g.replay()
+            lockstep()
+            return g
+
+        def replay_us(g, n):
+            a = [torch.cuda.Event(enable_timing=True) for _ in range(n)]
+            b = [torch.cuda.Event(enable_timing=True) for _ in range(n)]
+            for k in range(n):
+                a[k].record()
+                g.replay()
+                b[k].record()
+            torch.cuda.synchronize()
+            dist.barrier()
+            return sum(a[k].elapsed_time(b[k]) for k in range(n)) / n * 1000
+
+        if mode == "graph" and rep > 0:
+            n_e2e = int(os.environ.get("E2E_N", 20))
+            alt = int(os.environ.get("E2E_ALT", 4))
+            g_r, g_2r = graph_of(rep), graph_of(2 * rep)
+            t_r = t_2r = 0.0
+            for _ in range(alt):
+                t_r += replay_us(g_r, n_e2e)
+                t_2r += replay_us(g_2r, n_e2e)
+            t_r, t_2r = t_r / alt, t_2r / alt
+            e2e = t_r / rep
+            slope = (t_2r - t_r) / rep
+        gd_us = gc_us = -1.0
+        gd_lo = gd_hi = gc_lo = gc_hi = float("nan")
+        evflags = 0
+        gevr = int(os.environ.get("GEV_R", 20))
+        hip = None
+        if mode == "graph" and gevr > 0:
+            import ctypes
+
+            try:
+                hip = ctypes.CDLL("libamdhip64.so")
+            except OSError as exc:
+                if rank == 0:
+                    print(f"  [GEV] off, cannot load libamdhip64.so: {exc}", flush=True)
+        if hip is not None:
+            hip.hipEventRecordWithFlags.restype = ctypes.c_int
+            hip.hipEventRecordWithFlags.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_uint,
+            ]
+
+            hip.hipEventCreateWithFlags.restype = ctypes.c_int
+            hip.hipEventCreateWithFlags.argtypes = [
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_uint,
+            ]
+            hip.hipEventElapsedTime.restype = ctypes.c_int
+            hip.hipEventElapsedTime.argtypes = [
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+            ]
+
+            evflags = int(os.environ.get("GEV_EVFLAGS", "0"), 0)
+
+            def make_ev():
+                e = ctypes.c_void_p()
+                r = hip.hipEventCreateWithFlags(ctypes.byref(e), evflags)
+                if r != 0:
+                    raise RuntimeError(f"hipEventCreateWithFlags(0x{evflags:x}) rc={r}")
+                return e
+
+            rd, rc_leg = split_legs()
+            gev = [[make_ev() for _ in range(3)] for _ in range(gevr)]
+
+            def rec_ext(e):
+                r = hip.hipEventRecordWithFlags(
+                    e,
+                    ctypes.c_void_p(torch.cuda.current_stream().cuda_stream),
+                    1,
+                )
+                if r != 0:
+                    raise RuntimeError(f"hipEventRecordWithFlags rc={r}")
+
+            def el_us(a, b):
+                ms = ctypes.c_float()
+                r = hip.hipEventElapsedTime(ctypes.byref(ms), a, b)
+                if r != 0:
+                    raise RuntimeError(f"hipEventElapsedTime rc={r}")
+                return ms.value * 1000.0
+
+            gg = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(gg):
+                for i in range(gevr):
+                    rec_ext(gev[i][0])
+                    rd()
+                    rec_ext(gev[i][1])
+                    rc_leg()
+                    rec_ext(gev[i][2])
+            lockstep()
+            for _ in range(WARMUP):
+                gg.replay()
+            lockstep()
+            n_gev = int(os.environ.get("GEV_N", 20))
+            skip = 1 if gevr > 1 else 0
+            npair = gevr - skip
+            ds, cs = [], []
+            for _ in range(n_gev):
+                gg.replay()
+                lockstep()
+                ds.append(
+                    sum(el_us(gev[i][0], gev[i][1]) for i in range(skip, gevr)) / npair
+                )
+                cs.append(
+                    sum(el_us(gev[i][1], gev[i][2]) for i in range(skip, gevr)) / npair
+                )
+            gd_us, gc_us = sum(ds) / n_gev, sum(cs) / n_gev
+            gd_lo, gd_hi = min(ds), max(ds)
+            gc_lo, gc_hi = min(cs), max(cs)
+
+            def quart(xs):
+                s = sorted(xs)
+                n = len(s)
+                mid = s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+                return mid, s[n // 4], s[(3 * n) // 4]
+
+            gd_med, gd_p25, gd_p75 = quart(ds)
+            gc_med, gc_p25, gc_p75 = quart(cs)
+        d, c = (gd_us, gc_us) if gd_us > 0 else (hd, hc)
+        if rank == 0 and e2e > 0:
+            src = "gev" if gd_us > 0 else "periter"
+            print(
+                f"[E2E] mode={mode} src={src} d={d:.2f} c={c:.2f} sum={d + c:.2f} "
+                f"hd={hd:.2f} hc={hc:.2f} hsum={hd + hc:.2f} "
+                f"e2e={e2e:.2f} slope={slope:.2f} cost={hd + hc - e2e:.2f} "
+                f"R={rep} iters={ITERS}",
+                flush=True,
+            )
+        if rank == 0 and gd_us > 0:
+            print(
+                f"[GEV] mode={mode} gd={gd_us:.2f} gc={gc_us:.2f} "
+                f"gsum={gd_us + gc_us:.2f} "
+                f"over={gd_us + gc_us - e2e if e2e > 0 else float('nan'):.2f} "
+                f"overslope={gd_us + gc_us - slope if slope > 0 else float('nan'):.2f} "
+                f"gdlo={gd_lo:.2f} gdhi={gd_hi:.2f} gclo={gc_lo:.2f} gchi={gc_hi:.2f} "
+                f"gdmed={gd_med:.2f} gdp25={gd_p25:.2f} gdp75={gd_p75:.2f} "
+                f"gcmed={gc_med:.2f} gcp25={gc_p25:.2f} gcp75={gc_p75:.2f} "
+                f"evflags=0x{evflags:x} R={gevr} N={n_gev}",
+                flush=True,
+            )
         return d, c, run_d, run_c
 
     def smi_window(label, pair_us, run_d, run_c):
@@ -512,7 +668,10 @@ def main():
 
             for mode in MODES:
                 d_us, c_us, run_d, run_c = time_pairs(
-                    mode, one_pair, capture_pair if mode == "graph" else eager_legs
+                    mode,
+                    one_pair,
+                    capture_pair if mode == "graph" else eager_legs,
+                    eager_legs,
                 )
                 got = torch.tensor([d_us, c_us, float(total)], dtype=torch.float64)
                 dist.all_reduce(got)
