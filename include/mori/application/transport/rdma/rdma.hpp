@@ -224,7 +224,8 @@ class RdmaDeviceContext {
   virtual RdmaMemoryRegion RegisterRdmaMemoryRegionDmabufIova0(
       void* ptr, size_t size, int dmabuf_fd, int accessFlag = MR_DEFAULT_ACCESS_FLAG);
   // ibv_reg_mr-first registration; falls back to dmabuf. Set MORI_ENABLE_DMABUF_REG to try
-  // dmabuf first instead (falling back to ibv_reg_mr).
+  // dmabuf first instead (falling back to ibv_reg_mr). This is the vendor-agnostic payload
+  // MR path; independent of the mlx5-specific MORI_MLX5_DMABUF knob.
   virtual RdmaMemoryRegion RegisterRdmaMemoryRegionAuto(void* ptr, size_t size,
                                                         int accessFlag = MR_DEFAULT_ACCESS_FLAG);
   virtual void DeregisterRdmaMemoryRegion(void* ptr);

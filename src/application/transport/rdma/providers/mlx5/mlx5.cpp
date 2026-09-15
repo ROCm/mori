@@ -86,19 +86,25 @@ void Mlx5UnregisterUarHost(void* reg_addr) {
   }
 }
 
-// Registration mode for GPU control-ring umems (CQ/WQ/DBR), from
-// MORI_MLX5_CONTROL_DMABUF: "auto" (default) tries dmabuf then falls back to
-// peermem; "force" requires dmabuf and aborts if it is unavailable; "off"
-// disables dmabuf entirely (peermem only).
-enum class ControlDmabufMode { kAuto, kForce, kOff };
+// Dmabuf registration mode for the mlx5 devx provider (control-ring umems AND
+// the atomic ibuf MR), from MORI_MLX5_DMABUF: "auto" (default) tries dmabuf
+// then falls back to peermem; "force" requires dmabuf and aborts if it is
+// unavailable; "off" disables dmabuf entirely (peermem only).
+//
+// Independent of MORI_ENABLE_DMABUF_REG, which lives in the vendor-agnostic
+// RDMA layer and flips the try-order in RegisterRdmaMemoryRegionAuto (the
+// generic payload MR path used by all providers). Setting MORI_MLX5_DMABUF=off
+// disables dmabuf only in this mlx5-specific codepath; MORI_ENABLE_DMABUF_REG
+// still controls the generic payload path, and vice versa.
+enum class Mlx5DmabufMode { kAuto, kForce, kOff };
 
-ControlDmabufMode GetControlDmabufMode() {
-  static const ControlDmabufMode mode = []() {
-    std::optional<std::string> v = mori::env::GetString("MORI_MLX5_CONTROL_DMABUF");
-    if (!v.has_value()) return ControlDmabufMode::kAuto;
-    if (*v == "force" || *v == "1") return ControlDmabufMode::kForce;
-    if (*v == "off" || *v == "0") return ControlDmabufMode::kOff;
-    return ControlDmabufMode::kAuto;
+Mlx5DmabufMode GetMlx5DmabufMode() {
+  static const Mlx5DmabufMode mode = []() {
+    std::optional<std::string> v = mori::env::GetString("MORI_MLX5_DMABUF");
+    if (!v.has_value()) return Mlx5DmabufMode::kAuto;
+    if (*v == "force" || *v == "1") return Mlx5DmabufMode::kForce;
+    if (*v == "off" || *v == "0") return Mlx5DmabufMode::kOff;
+    return Mlx5DmabufMode::kAuto;
   }();
   return mode;
 }
@@ -109,9 +115,9 @@ ControlDmabufMode GetControlDmabufMode() {
 // registration truly fails (force-mode without dmabuf, or the fallback also fails).
 mlx5dv_devx_umem* Mlx5RegisterControlUmem(ibv_context* context, void* addr, size_t size,
                                           uint32_t accessFlag, const char* what) {
-  ControlDmabufMode mode = GetControlDmabufMode();
+  Mlx5DmabufMode mode = GetMlx5DmabufMode();
 
-  if (mode != ControlDmabufMode::kOff) {
+  if (mode != Mlx5DmabufMode::kOff) {
     const char* unavailable = nullptr;  // reason for the force-mode abort below
     if (Mlx5DvApi::Instance().devx_umem_reg_ex == nullptr) {
       unavailable = "mlx5dv_devx_umem_reg_ex missing (rdma-core too old)";
@@ -151,9 +157,9 @@ mlx5dv_devx_umem* Mlx5RegisterControlUmem(ibv_context* context, void* addr, size
 
     // Force must abort even when the symbol is missing, else it silently downgrades
     // to peermem on the old-rdma-core case it is meant to catch.
-    if (mode == ControlDmabufMode::kForce) {
+    if (mode == Mlx5DmabufMode::kForce) {
       MORI_APP_ERROR(
-          "MLX5 control umem [{}] dmabuf required (MORI_MLX5_CONTROL_DMABUF=force) but "
+          "MLX5 control umem [{}] dmabuf required (MORI_MLX5_DMABUF=force) but "
           "unavailable: {}; aborting",
           what, unavailable);
       std::abort();
@@ -175,12 +181,12 @@ mlx5dv_devx_umem* Mlx5RegisterControlUmem(ibv_context* context, void* addr, size
 }
 
 // Register an ibv MR for GPU memory, preferring dmabuf and falling back to
-// plain ibv_reg_mr (peermem). Respects the same MORI_MLX5_CONTROL_DMABUF knob.
+// plain ibv_reg_mr (peermem). Respects the MORI_MLX5_DMABUF knob.
 ibv_mr* Mlx5RegisterMrDmabuf(ibv_pd* pd, void* addr, size_t size, int accessFlag,
                              const char* what) {
-  ControlDmabufMode mode = GetControlDmabufMode();
+  Mlx5DmabufMode mode = GetMlx5DmabufMode();
 
-  if (mode != ControlDmabufMode::kOff) {
+  if (mode != Mlx5DmabufMode::kOff) {
     uint64_t dmabufOffset = 0;
     int dmabufFd = TryExportDmabufFd(addr, size, &dmabufOffset);
     if (dmabufFd >= 0) {
@@ -198,9 +204,9 @@ ibv_mr* Mlx5RegisterMrDmabuf(ibv_pd* pd, void* addr, size_t size, int accessFlag
       MORI_APP_TRACE("MLX5 MR [{}] dmabuf export unavailable (addr=0x{:x}, size={})", what,
                      reinterpret_cast<uintptr_t>(addr), size);
     }
-    if (mode == ControlDmabufMode::kForce) {
+    if (mode == Mlx5DmabufMode::kForce) {
       MORI_APP_ERROR(
-          "MLX5 MR [{}] dmabuf required (MORI_MLX5_CONTROL_DMABUF=force) but unavailable; "
+          "MLX5 MR [{}] dmabuf required (MORI_MLX5_DMABUF=force) but unavailable; "
           "aborting",
           what);
       std::abort();
