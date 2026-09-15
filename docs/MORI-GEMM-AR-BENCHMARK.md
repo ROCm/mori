@@ -75,6 +75,11 @@ Each run prints a `RESULT_JSON` line with `max_rank_time_us`, `rel_l2` and
 
 Fusing is worth **-22%** at M=16384; the fp8 gather a further **-15%**.
 
+> The fp8 row does **not** survive to the server: end to end it is no better
+> than the bf16 wire and the LSA pull is 28ms worse. See
+> [the end-to-end numbers](#reproducing-the-end-to-end-numbers). A layer
+> measured in isolation is measured without the rank skew it will meet.
+
 For scale, the same layer as the model runs it today (a separate GEMM then an
 NCCL all-reduce) measures **1419.5 us** at M=16384, and the GEMM alone is
 **369.4 us**.
@@ -130,6 +135,12 @@ layer. A CU pull has those bytes in registers already.
 | bf16 / sdma | 1150.7 us |
 | fp8 / sdma | 1018.9 |
 | **fp8 / lsa** | **957.3** |
+
+This ordering reverses in the server: 1021.0ms of GPU busy for bf16 against
+1026.5 for fp8/sdma and 1049.3 for fp8/lsa. A pull needs the peer's slice
+finished at the moment it reads; a push lets each producer send as soon as its
+own band is done, and only the benchmark has every rank in lockstep. SGLang
+defaults the transport to `sdma` for that reason.
 
 The pull also removes fp8's small-M penalty. With the SDMA gather the two
 conversion kernels were a fixed cost against a transfer that shrinks with M, so
@@ -405,17 +416,36 @@ gen(main); post("/stop_profile")
 
 GPU busy time over that capture:
 
+GPU busy, means over two or three runs of the protocol above, each row's
+individual runs in brackets:
+
 | | GPU busy | vs unfused |
 |---|---:|---:|
-| unfused (GEMM + NCCL) | 1101.9 ms | — |
-| fused, bf16 wire | 1077.2 | -2.2% |
-| fused, fp8 / sdma | 1050.4 | -4.7% |
-| fused, fp8 / lsa | **1048.2** | **-4.9%** |
+| unfused (GEMM + NCCL) | 1095.5 ms (1100.2 1095.1 1091.2) | — |
+| **fused, bf16 wire** | **1021.0** (1018.7 1025.1 1019.2) | **-6.8%** |
+| fused, fp8 / sdma | 1026.5 (1025.9 1027.1) | -6.3% |
+| fused, fp8 / lsa | 1049.3 (1048.3 1050.2) | -4.2% |
 
-The three fused rows are one capture session; the unfused baseline is a separate
-one, where the bf16 fused configuration measured 1071.7 ms rather than 1077.2.
-Read the `-2.2%` as approximate and the differences between the fused rows as
-the reliable part.
+The request's own wall time agrees: 1.1854s unfused against 1.0975 fused.
 
-The layer-level win is much larger than the end-to-end one because `wo_b` is
-about 12% of the profile.
+**The fp8 gather does not pay end to end, and the pull costs.** That inverts this
+page's own layer table, where fp8/lsa is 949us against bf16's 1149 at the model
+shape -- fp8/lsa should have been the best row and is the worst of the three
+fused ones. The likely reason is rank skew: a pull needs the peer's slice
+finished at the moment it reads, while a push lets each producer send as soon as
+its own band is done. The layer benchmark runs every rank in lockstep on an idle
+box; a prefill does not. SGLang therefore defaults the transport to `sdma`,
+while `GemmAllReduceOp` keeps `lsa` -- that default is right for the benchmark
+it was measured in, and wrong for the server.
+
+Treat it as the general caution: every number above this section is a layer in
+isolation, and a collective measured that way is measured without the skew it
+will actually meet.
+
+An earlier capture of the same three configurations read 1101.9 / 1077.2 /
+1050.4 / 1048.2. The unfused row reproduces; the bf16 fused row does not, and is
+56ms better here. That measurement predates the move to `mori.ops.gemm_ar` and
+several fixes in this branch, and the cause was not isolated.
+
+The layer-level win is larger than the end-to-end one because `wo_b` is about
+12% of the profile.
