@@ -184,10 +184,16 @@ jobs:
           # The op ships in mori.ops.gemm_ar, so run pytest from /tmp: from a
           # repo cwd `python/mori/` shadows the install and a packaging miss
           # (a subpackage find_packages never picked up) would read as green.
+          #
+          # test_gemm_ar_op.py is the public wrapper's own tests. The other two
+          # go through the benchmark, which calls the low-level builders, so
+          # they said nothing about that layer -- and three correctness bugs
+          # lived there behind a green suite.
           $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
             cd /tmp && python -c 'import mori.ops.gemm_ar as g; print(g.GemmAllReduceOp)' && \
-            timeout 1200 python -m pytest -v \
+            timeout 1800 python -m pytest -v \
               $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar.py \
+              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar_op.py \
               $GITHUB_WORKSPACE/tests/python/cco/test_flydsl_ar.py"
 
       - name: Run CCO GEMM+AR benchmark (8 ranks, accuracy-gated)
