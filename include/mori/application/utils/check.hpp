@@ -99,15 +99,15 @@ namespace application {
   } while (0)
 
 #if MORI_USE_AMDSMI
-#define ROCM_SMI_CHECK(stmt)                                                              \
-  do {                                                                                    \
-    amdsmi_status_t result = (stmt);                                                      \
-    if (AMDSMI_STATUS_SUCCESS != result) {                                                \
-      const char* msg;                                                                    \
-      amdsmi_status_code_to_string(result, &msg);                                         \
-      fprintf(stderr, "[%s:%d] amd smi failed with %s \n", __FILE__, __LINE__, msg);      \
-      exit(-1);                                                                           \
-    }                                                                                     \
+#define ROCM_SMI_CHECK(stmt)                                                         \
+  do {                                                                               \
+    amdsmi_status_t result = (stmt);                                                 \
+    if (AMDSMI_STATUS_SUCCESS != result) {                                           \
+      const char* msg;                                                               \
+      amdsmi_status_code_to_string(result, &msg);                                    \
+      fprintf(stderr, "[%s:%d] amd smi failed with %s \n", __FILE__, __LINE__, msg); \
+      exit(-1);                                                                      \
+    }                                                                                \
   } while (0)
 #else
 #define ROCM_SMI_CHECK(stmt)                                                          \

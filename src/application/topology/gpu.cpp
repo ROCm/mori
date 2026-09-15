@@ -42,14 +42,9 @@ namespace {
 
 void* OpenAmdSmi() {
   const char* candidates[] = {
-    std::getenv("MORI_AMD_SMI_PATH"),
-    "libamd_smi.so",
-    "/opt/rocm/lib/libamd_smi.so",
-    std::getenv("MORI_ROCM_SMI_PATH"),
-    "librocm_smi64.so.1",
-    "librocm_smi64.so",
-    "/opt/rocm/lib/librocm_smi64.so.1"
-  };
+      std::getenv("MORI_AMD_SMI_PATH"),  "libamd_smi.so",      "/opt/rocm/lib/libamd_smi.so",
+      std::getenv("MORI_ROCM_SMI_PATH"), "librocm_smi64.so.1", "librocm_smi64.so",
+      "/opt/rocm/lib/librocm_smi64.so.1"};
   for (const char* path : candidates) {
     if (path && path[0]) {
       if (void* h = dlopen(path, RTLD_NOW | RTLD_LOCAL)) return h;
@@ -164,7 +159,8 @@ void TopoSystemGpu::Load() {
       amdsmi_link_type_t link_type = {};
       amdsmi_p2p_capability_t cap = {};
       ROCM_SMI_CHECK(amdsmi_topo_get_p2p_status(handles[i], handles[j], &link_type, &cap));
-      if (!cap.is_iolink_coherent && !cap.is_iolink_atomics_32bit && !cap.is_iolink_atomics_64bit) continue;
+      if (!cap.is_iolink_coherent && !cap.is_iolink_atomics_32bit && !cap.is_iolink_atomics_64bit)
+        continue;
 
       TopoNodeGpuP2pLink* p2p = new TopoNodeGpuP2pLink();
       ROCM_SMI_CHECK(amdsmi_topo_get_link_type(handles[i], handles[j], &p2p->hops, &p2p->type));
