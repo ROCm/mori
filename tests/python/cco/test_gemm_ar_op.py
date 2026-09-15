@@ -172,27 +172,49 @@ def test_validate_rejects_misspelled_modes(field, value):
 
 
 def test_flatten_a_scale_preserves_physical_order():
-    """The kernel reads (row, kb) at kb*M + row, whatever spelling came in."""
+    """The kernel reads (row, kb) at kb*M + row, for the unambiguous spellings."""
     m, kb = 8, 3
     logical = torch.arange(m * kb, dtype=torch.float32).reshape(m, kb)
     want = logical.t().reshape(-1)
 
-    col_major = logical.t().contiguous().t()  # [M, kb], physically [kb, M]
+    col_major = logical.t().contiguous().t()  # [M, kb], storage already kb-major
     assert col_major.stride() == (1, m)
 
     assert torch.equal(_flatten_a_scale(col_major, m, kb), want)
-    assert torch.equal(_flatten_a_scale(logical, m, kb), want)
     assert torch.equal(_flatten_a_scale(logical.t().contiguous(), m, kb), want)
     assert torch.equal(_flatten_a_scale(want, m, kb), want)
 
 
 def test_flatten_a_scale_is_not_a_reshape():
-    """Guards the exact regression: reshape(-1) on the column-major tensor."""
+    """Guards the review's finding: reshape(-1) on the column-major tensor."""
     m, kb = 8, 3
     col_major = (
         torch.arange(m * kb, dtype=torch.float32).reshape(m, kb).t().contiguous().t()
     )
     assert not torch.equal(_flatten_a_scale(col_major, m, kb), col_major.reshape(-1))
+
+
+def test_flatten_a_scale_refuses_the_ambiguous_row_major_case():
+    """[M, K/128] row-major means two different things and must not be guessed.
+
+    A logical [M, K/128] needs transposing; a K/128-major buffer carrying that
+    shape -- which is what aiter_per1x128_quant(transpose_scale=True) returns --
+    must be read flat. Shape and stride are identical in both cases, and
+    guessing "transpose" took SGLang's perplexity from 3.26 to 862511 while
+    every shape-level test here stayed green, because they build the logical
+    tensor the guess assumes.
+    """
+    m, kb = 8, 3
+    row_major = torch.arange(m * kb, dtype=torch.float32).reshape(m, kb)
+    assert row_major.stride() == (kb, 1)
+    with pytest.raises(ValueError, match="ambiguous"):
+        _flatten_a_scale(row_major, m, kb)
+    # Both meanings stay expressible, and they differ.
+    flat = _flatten_a_scale(row_major.reshape(-1), m, kb)
+    transposed = _flatten_a_scale(row_major.t(), m, kb)
+    assert torch.equal(flat, row_major.reshape(-1))
+    assert torch.equal(transposed, row_major.t().reshape(-1))
+    assert not torch.equal(flat, transposed)
 
 
 @pytest.mark.parametrize("shape", [(7, 3), (8, 4), (8,)])

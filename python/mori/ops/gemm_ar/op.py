@@ -183,22 +183,27 @@ FP8_DTYPES = (torch.float8_e4m3fnuz, torch.float8_e4m3fn)
 def _flatten_a_scale(a_scale: torch.Tensor, m: int, kb: int) -> torch.Tensor:
     """A's block scales in the physical order the kernel indexes.
 
-    The kernel reads element ``(row, kb)`` at ``kb * M + row`` -- the layout
-    ``gemm_a8w8_blockscale_bpreshuffle`` consumes, and what sglang's
-    ``materialize_bpreshuffle_fp8_scale`` produces. Three spellings are accepted
-    and they mean different things:
+    The kernel reads element ``(row, kb)`` at ``kb * M + row``. This does not
+    guess which spelling of that a caller meant, because two of them are
+    indistinguishable:
 
-    * ``[M, K/128]`` -- the logical shape. Transposed here, which is free for the
-      column-major tensor the quantiser returns (``.t()`` is then contiguous) and
-      a copy for a row-major one. **Passing this through ``reshape(-1)`` instead
-      is the bug this function exists to prevent**: for the column-major case
-      that walks the logical rows, pairing every scale with the wrong K block,
-      which still validates and still runs (relL2 0.26 against 2.4e-3).
-    * ``[K/128, M]`` -- the physical shape, taken as-is.
-    * 1-D -- already flattened in physical order, taken as-is.
+    * **1-D** -- already in physical order. Taken as is.
+    * **[K/128, M]** -- the physical shape. Taken as is.
+    * **[M, K/128] column-major** (stride ``(1, M)``) -- the logical shape whose
+      storage is *already* ``kb``-major. Transposed here, which is free.
+      ``reshape(-1)`` on it would copy in logical row order and pair every scale
+      with the wrong K block (relL2 0.26 against 2.4e-3).
+    * **[M, K/128] row-major** -- **rejected**. It is either a genuinely logical
+      ``[M, K/128]`` tensor, which needs transposing, or a ``kb``-major buffer
+      wearing a shape that does not describe it, which must be read flat.
+      ``aiter_per1x128_quant(transpose_scale=True)`` returns the second: it
+      writes transposed data and keeps the ``(M, K/128)`` shape. Shape and
+      stride are identical in both cases, so the caller has to say which by
+      passing ``.reshape(-1)`` or ``.t()``.
 
-    ``m == kb`` would be ambiguous; the logical reading wins, and K would have to
-    be ``128 * M`` for it to arise.
+    Guessing here is what broke SGLang: treating the row-major case as logical
+    took the model's perplexity from 3.26 to 862511 while every shape-level test
+    stayed green, because the tests build the logical tensor the rule assumes.
     """
     if a_scale.dim() == 1:
         if a_scale.numel() != m * kb:
@@ -208,16 +213,25 @@ def _flatten_a_scale(a_scale: torch.Tensor, m: int, kb: int) -> torch.Tensor:
         return a_scale
     if a_scale.dim() != 2:
         raise ValueError(
-            f"a_scale must be [M, K/128], [K/128, M] or flat, got shape "
-            f"{tuple(a_scale.shape)}"
+            f"a_scale must be [K/128, M], [M, K/128] column-major, or flat; got "
+            f"shape {tuple(a_scale.shape)}"
         )
-    if tuple(a_scale.shape) == (m, kb):
-        return a_scale.t().reshape(-1)
-    if tuple(a_scale.shape) == (kb, m):
+    shape = tuple(a_scale.shape)
+    if shape == (kb, m):
         return a_scale.reshape(-1)
+    if shape == (m, kb):
+        if a_scale.stride() == (1, m):
+            return a_scale.t().reshape(-1)
+        raise ValueError(
+            f"a_scale is {shape} row-major, which is ambiguous: a logical "
+            f"[M, K/128] needs transposing, while a K/128-major buffer with this "
+            f"shape -- what aiter_per1x128_quant(transpose_scale=True) returns -- "
+            f"must be read flat. Pass a_scale.reshape(-1) for the second or "
+            f"a_scale.t() for the first."
+        )
     raise ValueError(
-        f"a_scale shape {tuple(a_scale.shape)} matches neither [M, K/128] = "
-        f"{(m, kb)} nor its transpose"
+        f"a_scale shape {shape} matches neither [M, K/128] = {(m, kb)} nor its "
+        f"transpose"
     )
 
 

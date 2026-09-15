@@ -75,10 +75,8 @@ Each run prints a `RESULT_JSON` line with `max_rank_time_us`, `rel_l2` and
 
 Fusing is worth **-22%** at M=16384; the fp8 gather a further **-15%**.
 
-> The fp8 row does **not** survive to the server: end to end it is no better
-> than the bf16 wire and the LSA pull is 28ms worse. See
-> [the end-to-end numbers](#reproducing-the-end-to-end-numbers). A layer
-> measured in isolation is measured without the rank skew it will meet.
+> Both survive to the server, in the same order. See
+> [the end-to-end numbers](#reproducing-the-end-to-end-numbers).
 
 For scale, the same layer as the model runs it today (a separate GEMM then an
 NCCL all-reduce) measures **1419.5 us** at M=16384, and the GEMM alone is
@@ -136,11 +134,8 @@ layer. A CU pull has those bytes in registers already.
 | fp8 / sdma | 1018.9 |
 | **fp8 / lsa** | **957.3** |
 
-This ordering reverses in the server: 1021.0ms of GPU busy for bf16 against
-1026.5 for fp8/sdma and 1049.3 for fp8/lsa. A pull needs the peer's slice
-finished at the moment it reads; a push lets each producer send as soon as its
-own band is done, and only the benchmark has every rank in lockstep. SGLang
-defaults the transport to `sdma` for that reason.
+The ordering holds in the server too: 1070.3ms of GPU busy for bf16 against
+1052.1 for fp8/sdma and 1041.2 for fp8/lsa.
 
 The pull also removes fp8's small-M penalty. With the SDMA gather the two
 conversion kernels were a fixed cost against a transfer that shrinks with M, so
@@ -416,36 +411,27 @@ gen(main); post("/stop_profile")
 
 GPU busy time over that capture:
 
-GPU busy, means over two or three runs of the protocol above, each row's
-individual runs in brackets:
+GPU busy over that capture:
 
-| | GPU busy | vs unfused |
-|---|---:|---:|
-| unfused (GEMM + NCCL) | 1095.5 ms (1100.2 1095.1 1091.2) | — |
-| **fused, bf16 wire** | **1021.0** (1018.7 1025.1 1019.2) | **-6.8%** |
-| fused, fp8 / sdma | 1026.5 (1025.9 1027.1) | -6.3% |
-| fused, fp8 / lsa | 1049.3 (1048.3 1050.2) | -4.2% |
+| | GPU busy | wall | vs unfused |
+|---|---:|---:|---:|
+| unfused (GEMM + NCCL) | 1096.0 ms | 1.1969 s | — |
+| fused, bf16 wire | 1070.3 | 1.1728 | -2.3% |
+| fused, fp8 / sdma | 1052.1 | 1.1455 | -4.0% |
+| **fused, fp8 / lsa** | **1041.2** | **1.1385** | **-5.0%** |
 
-The request's own wall time agrees: 1.1854s unfused against 1.0975 fused.
+An earlier capture of the same four read 1101.9 / 1077.2 / 1050.4 / 1048.2, so
+this reproduces to about half a percent.
 
-**The fp8 gather does not pay end to end, and the pull costs.** That inverts this
-page's own layer table, where fp8/lsa is 949us against bf16's 1149 at the model
-shape -- fp8/lsa should have been the best row and is the worst of the three
-fused ones. The likely reason is rank skew: a pull needs the peer's slice
-finished at the moment it reads, while a push lets each producer send as soon as
-its own band is done. The layer benchmark runs every rank in lockstep on an idle
-box; a prefill does not. SGLang therefore defaults the transport to `sdma`,
-while `GemmAllReduceOp` keeps `lsa` -- that default is right for the benchmark
-it was measured in, and wrong for the server.
-
-Treat it as the general caution: every number above this section is a layer in
-isolation, and a collective measured that way is measured without the skew it
-will actually meet.
-
-An earlier capture of the same three configurations read 1101.9 / 1077.2 /
-1050.4 / 1048.2. The unfused row reproduces; the bf16 fused row does not, and is
-56ms better here. That measurement predates the move to `mori.ops.gemm_ar` and
-several fixes in this branch, and the cause was not isolated.
+> **Check `BUILD_CCO_SDMA=ON` before believing any end-to-end number.** With it
+> off every put silently does nothing: the all-reduce returns mostly the local
+> slice, the model still answers fluently, every mori kernel still appears in
+> the profile, and the fused path measures **faster** than it is because it is
+> not moving data -- -6.8% instead of -2.3%, with fp8/lsa appearing *worst* of
+> the three rather than best, since the pull is the one leg that does not go
+> through SDMA. Perplexity catches it and nothing cheaper does: 862511 against
+> 3.26 on the same text. A short prompt cannot catch it either, because fusing
+> needs M >= 4096.
 
 The layer-level win is larger than the end-to-end one because `wo_b` is about
 12% of the profile.
