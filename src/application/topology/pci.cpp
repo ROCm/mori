@@ -312,8 +312,16 @@ void TopoSystemPci::Load() {
           if (pci_read_byte(dev, PCI_PRIMARY_BUS) < pci_read_byte(lastDev, PCI_PRIMARY_BUS))
             continue;
         }
+        // libpci's scan-time dev->bus disagreeing with a live re-read of the
+        // bridge's own PCI_PRIMARY_BUS register has been observed on this
+        // cluster's ionic NICs -- a renumbering race between the scan and this
+        // read, not memory corruption. This map only feeds GPUDirect NIC
+        // affinity selection, not the data path itself, so a stale/inconsistent
+        // entry is worth a degraded routing hint, not a crashed server: skip
+        // recording this bridge for this downstream bus, the same as the
+        // "lastDev already newer" case just above, instead of asserting.
+        if (dev->bus != pci_read_byte(dev, PCI_PRIMARY_BUS)) continue;
         dsp2dev[dspBusId] = dev;
-        assert(dev->bus == pci_read_byte(dev, PCI_PRIMARY_BUS));
       }
     }
 
