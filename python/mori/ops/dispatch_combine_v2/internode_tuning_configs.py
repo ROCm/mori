@@ -97,9 +97,34 @@ _MI308X_EP16_H6144 = (
     (None, 80, 48, 8, 64, 48, 6),
 )
 
+# MI308X (gfx942, 80 CU) -- EP16, hidden 7168, topk 8. Tuned fp8-dispatch +
+# bf16-combine on the same 2-node rig as H6144, block_num <= 80.
+#
+# Untuned baseline (no table entry): (96, 64, 8) for both phases at every
+# token count -- exceeds the 80-CU count, runs a second short wave per launch.
+#
+# Measured dispatch / combine latency, BEFORE (96,64,8) -> AFTER (this row):
+#   4 tok:  dispatch 46.5us -> 43.5us (~6%)   combine 56.3us -> 48.8us (~13%)
+#   8 tok:  dispatch 47.8us -> 47.3us (~1%, within noise)   combine 57.7us -> 47.3us (~18%)
+#  16 tok:  dispatch 50.3us -> 45.2us (~10%)  combine 62.3us -> 53.0us (~15%)
+#  32 tok:  dispatch 60.4us -> 53.9us (~11%)  combine 75.8us -> 68.4us (~10%)
+#
+# tok=16/32 geometry matches H6144's rows -- independently swept and
+# re-verified, not copied.
+_MI308X_EP16_H7168 = (
+    # max_tokens,
+    # dispatch_block, dispatch_rdma, dispatch_warp,
+    # combine_block, combine_rdma, combine_warp
+    (4, 64, 42, 8, 32, 16, 16),
+    (8, 32, 21, 16, 32, 16, 4),
+    (16, 80, 40, 4, 80, 40, 4),
+    (None, 80, 48, 8, 64, 48, 6),
+)
+
 # (device_key, world_size, hidden_dim, topk) -> {dtype: schedule}
 _TABLE = {
     ("mi308x", 16, 6144, 8): {"fp8": _MI308X_EP16_H6144},
+    ("mi308x", 16, 7168, 8): {"fp8": _MI308X_EP16_H7168},
 }
 
 
