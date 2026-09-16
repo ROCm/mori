@@ -10,24 +10,17 @@ from mori.ccl.torch_fsdp import MoriSdmaAllGather
 class TestMoriSdmaAllGather(unittest.TestCase):
     def test_zero_copy_disabled_uses_default_output(self) -> None:
         comm = MoriSdmaAllGather(zero_copy_output=False)
-        metadata = comm.prepare_output(
-            [2],
-            2,
-            2,
-            torch.float32,
-            torch.device("cpu"),
-            [],
-            [],
-            [],
-        )
-        self.assertIsNone(metadata)
+        self.assertIsNone(comm.layout)
 
     def test_prepare_zero_copy_metadata(self) -> None:
         comm = MoriSdmaAllGather(zero_copy_output=True)
+        layout = comm.layout
+        self.assertIsNotNone(layout)
+        assert layout is not None
         with patch.object(
-            comm, "can_use_param_contiguous_output", return_value=True
+            layout, "can_use_param_contiguous_output", return_value=True
         ):
-            metadata = comm.prepare_output(
+            metadata = layout.prepare_output(
                 [2, 4],
                 6,
                 8,
@@ -44,10 +37,13 @@ class TestMoriSdmaAllGather(unittest.TestCase):
 
     def test_unaligned_split_is_rejected(self) -> None:
         comm = MoriSdmaAllGather()
+        layout = comm.layout
+        self.assertIsNotNone(layout)
+        assert layout is not None
         with patch.object(
-            comm, "can_use_param_contiguous_output", return_value=True
+            layout, "can_use_param_contiguous_output", return_value=True
         ), self.assertRaisesRegex(RuntimeError, "4-byte aligned"):
-            comm.prepare_output(
+            layout.prepare_output(
                 [1],
                 1,
                 2,
@@ -57,6 +53,41 @@ class TestMoriSdmaAllGather(unittest.TestCase):
                 [],
                 [],
             )
+
+    def test_layout_fallback_clears_collective_metadata(self) -> None:
+        comm = MoriSdmaAllGather()
+        layout = comm.layout
+        self.assertIsNotNone(layout)
+        assert layout is not None
+        with patch.object(
+            layout, "can_use_param_contiguous_output", return_value=True
+        ):
+            layout.prepare_output(
+                [1],
+                1,
+                2,
+                torch.float32,
+                torch.device("cpu"),
+                [],
+                [],
+                [],
+            )
+        with patch.object(
+            layout, "can_use_param_contiguous_output", return_value=False
+        ):
+            self.assertIsNone(
+                layout.prepare_output(
+                    [1],
+                    1,
+                    2,
+                    torch.float32,
+                    torch.device("cpu"),
+                    [],
+                    [],
+                    [],
+                )
+            )
+        self.assertFalse(comm._can_call_param_contiguous(torch.empty(1)))
 
     def test_allocate_reuses_persistent_output(self) -> None:
         comm = MoriSdmaAllGather()

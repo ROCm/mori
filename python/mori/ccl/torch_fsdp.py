@@ -16,12 +16,13 @@ ROCm/MORI to be installed.
 """
 
 import importlib
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import Any, TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
 
+from torch.distributed.fsdp._fully_shard._all_gather_layout import AllGatherLayout
 from torch.distributed.fsdp._fully_shard._fsdp_api import AllGather
 
 
@@ -45,6 +46,96 @@ class _MoriSdmaAllGatherWork(dist.Work):
         return True
 
 
+class _MoriSdmaAllGatherLayout(AllGatherLayout):
+    def __init__(self, comm: "MoriSdmaAllGather") -> None:
+        self._comm = comm
+
+    def prepare_output(
+        self,
+        all_gather_input_split_sizes: list[int],
+        all_gather_input_numel: int,
+        world_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        fsdp_params: list["FSDPParam"],
+        param_all_gather_input_dtypes: list[list[torch.dtype]],
+        param_all_gather_input_numels: list[list[int]],
+    ) -> object | None:
+        self._comm._clear_output()
+        if not self.can_use_param_contiguous_output(
+            fsdp_params,
+            param_all_gather_input_dtypes,
+            param_all_gather_input_numels,
+            dtype,
+        ):
+            return None
+        if not all_gather_input_split_sizes:
+            raise RuntimeError("MORI zero-copy allgather requires non-empty splits")
+        if sum(all_gather_input_split_sizes) != all_gather_input_numel:
+            raise RuntimeError(
+                "MORI zero-copy allgather split sizes do not match input numel"
+            )
+        element_size = torch.empty((), dtype=dtype).element_size()
+        split_sizes_u32: list[int] = []
+        split_offsets_u32: list[int] = []
+        offset = 0
+        for split_size in all_gather_input_split_sizes:
+            split_nbytes = int(split_size) * element_size
+            if split_nbytes % 4 != 0:
+                raise RuntimeError(
+                    "MORI zero-copy allgather requires every split to be 4-byte aligned"
+                )
+            split_u32 = split_nbytes // 4
+            split_offsets_u32.append(offset)
+            split_sizes_u32.append(split_u32)
+            offset += split_u32
+        if offset * 4 != all_gather_input_numel * element_size:
+            raise RuntimeError("MORI zero-copy allgather byte size mismatch")
+        self._comm._param_contiguous_split_sizes = torch.tensor(
+            split_sizes_u32, dtype=torch.int64, device=device
+        )
+        self._comm._param_contiguous_split_offsets = torch.tensor(
+            split_offsets_u32, dtype=torch.int64, device=device
+        )
+        return (
+            self._comm._param_contiguous_split_sizes,
+            self._comm._param_contiguous_split_offsets,
+        )
+
+    def copy_in(
+        self,
+        all_gather_inputs: list[torch.Tensor],
+        all_gather_output: torch.Tensor,
+        all_gather_input_split_sizes: list[int],
+        all_gather_input_numel: int,
+        rank: int,
+        output_metadata: object,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        all_gather_input = torch.empty(
+            (all_gather_input_numel,),
+            dtype=all_gather_output.dtype,
+            device=all_gather_output.device,
+        )
+        torch._foreach_copy_(
+            torch.split(all_gather_input, all_gather_input_split_sizes),
+            all_gather_inputs,
+        )
+        return all_gather_input, all_gather_output
+
+    def finalize_outputs(
+        self,
+        all_gather_result: "AllGatherResult",
+        fsdp_params: list["FSDPParam"],
+        group: dist.ProcessGroup,
+    ) -> None:
+        self.init_param_contiguous_outputs(
+            all_gather_result.all_gather_output,
+            fsdp_params,
+            all_gather_result.param_all_gather_input_numels,
+            group.size(),
+        )
+
+
 class MoriSdmaAllGather(AllGather):
     """All-gather backend using MORI SDMA collectives (ROCm).
 
@@ -56,6 +147,7 @@ class MoriSdmaAllGather(AllGather):
 
     def __init__(self, zero_copy_output: bool = True) -> None:
         self._zero_copy_output = zero_copy_output
+        self.layout = _MoriSdmaAllGatherLayout(self) if zero_copy_output else None
         self._collective: Any | None = None
         self._rank: int | None = None
         self._world_size: int | None = None
@@ -130,108 +222,7 @@ class MoriSdmaAllGather(AllGather):
         collective.enqueue(input_tensor, output_tensor, count, stream=stream)
         return None
 
-    def prepare_output(
-        self,
-        all_gather_input_split_sizes: list[int],
-        all_gather_input_numel: int,
-        world_size: int,
-        dtype: torch.dtype,
-        device: torch.device,
-        fsdp_params: list["FSDPParam"],
-        param_all_gather_input_dtypes: list[list[torch.dtype]],
-        param_all_gather_input_numels: list[list[int]],
-    ) -> object | None:
-        if not self._zero_copy_output:
-            return None
-
-        if not self.can_use_param_contiguous_output(
-            fsdp_params,
-            param_all_gather_input_dtypes,
-            param_all_gather_input_numels,
-            dtype,
-        ):
-            return None
-        if not all_gather_input_split_sizes:
-            raise RuntimeError("MORI zero-copy allgather requires non-empty splits")
-        if sum(all_gather_input_split_sizes) != all_gather_input_numel:
-            raise RuntimeError(
-                "MORI zero-copy allgather split sizes do not match input numel"
-            )
-        element_size = torch.empty((), dtype=dtype).element_size()
-        split_sizes_u32: list[int] = []
-        split_offsets_u32: list[int] = []
-        offset = 0
-        for split_size in all_gather_input_split_sizes:
-            split_nbytes = int(split_size) * element_size
-            if split_nbytes % 4 != 0:
-                raise RuntimeError(
-                    "MORI zero-copy allgather requires every split to be 4-byte aligned"
-                )
-            split_u32 = split_nbytes // 4
-            split_offsets_u32.append(offset)
-            split_sizes_u32.append(split_u32)
-            offset += split_u32
-        if offset * 4 != all_gather_input_numel * element_size:
-            raise RuntimeError("MORI zero-copy allgather byte size mismatch")
-        self._param_contiguous_split_sizes = torch.tensor(
-            split_sizes_u32, dtype=torch.int64, device=device
-        )
-        self._param_contiguous_split_offsets = torch.tensor(
-            split_offsets_u32, dtype=torch.int64, device=device
-        )
-        return (
-            self._param_contiguous_split_sizes,
-            self._param_contiguous_split_offsets,
-        )
-
-    def copy_in(
-        self,
-        all_gather_inputs: list[torch.Tensor],
-        all_gather_output: torch.Tensor,
-        all_gather_input_split_sizes: list[int],
-        all_gather_input_numel: int,
-        rank: int,
-        output_metadata: object | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if output_metadata is None:
-            return super().copy_in(
-                all_gather_inputs,
-                all_gather_output,
-                all_gather_input_split_sizes,
-                all_gather_input_numel,
-                rank,
-                output_metadata,
-            )
-        all_gather_input = torch.empty(
-            (all_gather_input_numel,),
-            dtype=all_gather_output.dtype,
-            device=all_gather_output.device,
-        )
-        torch._foreach_copy_(
-            torch.split(all_gather_input, all_gather_input_split_sizes),
-            all_gather_inputs,
-        )
-        return all_gather_input, all_gather_output
-
-    def finalize_outputs(
-        self,
-        all_gather_result: "AllGatherResult",
-        fsdp_params: list["FSDPParam"],
-        group: dist.ProcessGroup,
-        default_finalize: Callable[[], None],
-    ) -> None:
-        if all_gather_result.output_metadata is None:
-            default_finalize()
-            return
-
-        self.init_param_contiguous_outputs(
-            all_gather_result.all_gather_output,
-            fsdp_params,
-            all_gather_result.param_all_gather_input_numels,
-            group.size(),
-        )
-
-    def clear_output(self) -> None:
+    def _clear_output(self) -> None:
         self._param_contiguous_split_sizes = None
         self._param_contiguous_split_offsets = None
 
@@ -243,7 +234,7 @@ class MoriSdmaAllGather(AllGather):
             return False
         split_nbytes = int(self._param_contiguous_split_sizes.sum().item()) * 4
         if split_nbytes != _tensor_nbytes(input_tensor):
-            self.clear_output()
+            self._clear_output()
             return False
         return True
 
