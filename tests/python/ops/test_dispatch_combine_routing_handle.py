@@ -222,20 +222,19 @@ def _replay_correctness(rank, world_size, kernel, gpu_per_node=None):
     )
     assert combine_out is not None
 
-    # --- Payload guard: replay-mode dispatch must actually SCATTER the payload. ---
-    # The assertions above only check routing-map immutability and the recv COUNT, so a
-    # replay dispatch that moves no payload (regression from #532, which dropped the
-    # replay branch of EpDispatchIntraNodeKernel_body) still passes them while leaving
-    # dispatchOut stale -- exactly the MoE training backward path that exploded grad norm.
-    # Route the SAME grad payload through a fresh cache-routing op as the reference and
+    # Replay-mode dispatch must actually scatter the payload.
+    # Route the same grad payload through a fresh cache-routing op as the reference and
     # compare downstream combine outputs, which are in source-token order and therefore
     # invariant to the recv-slot assignment that differs across ops.
     rep_grad_combine, _ = _do_combine(op, rep_disp, rank_idx, routing=R)
     tc.sync()
+    # Reference: a fresh op on the fully independent default path (no routing handle).
+    # Default dispatch populates the op-owned routing maps, so the matching combine reads
+    # them directly -- the most bug-independent oracle for the scattered payload.
     ref_op = mori.ops.EpDispatchCombineOp(config)
-    ref_disp, ref_R = _do_dispatch(ref_op, grad_test_data, return_routing=True)
+    ref_disp, _ = _do_dispatch(ref_op, grad_test_data)
     tc.sync()
-    ref_grad_combine, _ = _do_combine(ref_op, ref_disp, rank_idx, routing=ref_R)
+    ref_grad_combine, _ = _do_combine(ref_op, ref_disp, rank_idx)
     tc.sync()
     assert torch.allclose(
         rep_grad_combine.float(), ref_grad_combine.float(), atol=1e-3, rtol=1e-3
