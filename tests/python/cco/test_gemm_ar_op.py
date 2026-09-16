@@ -44,6 +44,7 @@ pytest.importorskip("flydsl")
 
 from mori.ops.gemm_ar import ArConfig  # noqa: E402
 from mori.ops.gemm_ar.op import (  # noqa: E402
+    FP8_DTYPES,
     MAX_CHUNKS,
     MIN_K,
     _flatten_a_scale,
@@ -227,6 +228,117 @@ def test_padded_m_rounds_to_whole_bands():
     assert padded_m(1, 8, 128) == 1024
     assert padded_m(1024, 8, 128) == 1024
     assert padded_m(1025, 8, 128) == 2048
+
+
+# --- host-only: the tile and dtype boundaries -----------------------------
+
+
+@pytest.mark.parametrize("block_m", [64, 1, 192, 0, -128])
+def test_supports_rejects_tiles_the_kernel_cannot_build(block_m):
+    """The kernel's assert is bare, so the boundary has to answer instead.
+
+    block_m=64 used to return True here, construct, acquire all three
+    resources, and only then raise an empty AssertionError from inside the
+    mainloop on the first real call. block_m=0 used to raise ZeroDivisionError
+    out of the padding arithmetic before reaching any check at all.
+    """
+    assert supports(4096, 7168, 2048, 8, block_m=block_m) is False
+
+
+@pytest.mark.parametrize("block_n", [128, 384, 0])
+def test_supports_rejects_n_tiles_the_kernel_cannot_build(block_n):
+    assert supports(4096, 7168, 2048, 8, block_n=block_n) is False
+
+
+def test_supports_accepts_the_legal_tile_multiples():
+    """256x512 is legal even though it is not the default 128x256."""
+    assert supports(4096, 7168, 2048, 8, block_m=256, block_n=512) is True
+
+
+@pytest.mark.parametrize("world_size", [0, -1])
+def test_supports_rejects_nonsense_world_size(world_size):
+    """padded_m divides by world_size * block_m, so this has to be caught first."""
+    assert supports(4096, 7168, 2048, world_size) is False
+
+
+def test_fnuz_is_not_an_accepted_dtype():
+    """Same width, different exponent bias -- see FP8_DTYPES.
+
+    The MMA atom is fixed to OCP e4m3. Reading FNUZ bytes through it scales
+    every A and every B element by 2, so the product comes back 4x too large:
+    finite, plausible and wrong. Matching element size is not evidence.
+    """
+    assert torch.float8_e4m3fn in FP8_DTYPES
+    assert torch.float8_e4m3fnuz not in FP8_DTYPES
+
+
+def test_constructor_rolls_back_cleanly_when_a_resource_fails(monkeypatch):
+    """Every acquisition step, failed in turn.
+
+    The rollback calls close(), which clears _cache and _pad_in. Those used to
+    be assigned after the try block, so any failure here died with
+    AttributeError -- masking the real error and skipping the release loop that
+    is the whole point of the rollback.
+
+    Recording fakes, not a real communicator: this is about the ordering of the
+    constructor's own state, which needs no GPU. The fake handles carry a null
+    pointer, so the window-zeroing write is stubbed out -- left in, it faults
+    the context and the fault surfaces in whatever runs next.
+    """
+    from mori.ops.gemm_ar import op as op_module
+    from mori.ops.gemm_ar.op import GemmAllReduceOp
+
+    monkeypatch.setattr(op_module, "from_gpu_ptr", lambda *a, **kw: torch.zeros(1))
+
+    class _Handle:
+        def __init__(self, log, name):
+            self._log, self._name = log, name
+            self.ptr, self.size = 0, 0
+
+        def close(self):
+            self._log.append(f"close:{self._name}")
+
+    class _Comm:
+        """Fails at `fail_at`; records what was acquired and what was closed."""
+
+        nranks, rank = 8, 0
+
+        def __init__(self, fail_at):
+            self.fail_at, self.log = fail_at, []
+
+        def _step(self, name):
+            self.log.append(f"acquire:{name}")
+            if name == self.fail_at:
+                raise RuntimeError(f"injected failure in {name}")
+            return _Handle(self.log, name)
+
+        def alloc_mem(self, nbytes):
+            return self._step("alloc_mem")
+
+        def register_window(self, ptr, size):
+            return self._step("register_window")
+
+        def create_dev_comm(self, reqs):
+            return self._step("create_dev_comm")
+
+    for fail_at in ("alloc_mem", "register_window", "create_dev_comm"):
+        comm = _Comm(fail_at)
+        with pytest.raises(RuntimeError) as excinfo:
+            GemmAllReduceOp(comm, n=7168, k=2048, m_max=4096)
+
+        # The injected error propagates, rather than an AttributeError from
+        # cleanup with the real one demoted to __context__.
+        assert fail_at in str(excinfo.value)
+
+        # Everything acquired before the failure was released. The dev-comm is
+        # not in that set by design -- its queues are communicator-scoped and go
+        # with the communicator, so it is never the last-but-one here.
+        acquired = [x[len("acquire:") :] for x in comm.log if x.startswith("acquire:")]
+        closed = {x[len("close:") :] for x in comm.log if x.startswith("close:")}
+        assert acquired[-1] == fail_at, f"stopped at {acquired[-1]}, not {fail_at}"
+        assert set(acquired[:-1]) == closed, (
+            f"failing at {fail_at}: acquired {acquired}, closed {closed}"
+        )
 
 
 # --- multi-rank: the op itself --------------------------------------------

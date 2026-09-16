@@ -42,7 +42,7 @@ all-reduce quietly produces zeros.
 
 ```python
 import torch, torch.distributed as dist
-from mori.cco import Communicator
+from mori.cco import Communicator, UniqueId
 from mori.ops.gemm_ar import GemmAllReduceOp, preshuffle_b
 
 rank, world = dist.get_rank(), dist.get_world_size()
@@ -56,26 +56,40 @@ vmm = 2 * GemmAllReduceOp.window_bytes_for(world, m_max=M_MAX, n=N) + (64 << 20)
 uid = [bytes(Communicator.get_unique_id()) if rank == 0 else None]
 dist.broadcast_object_list(uid, src=0)
 
-with Communicator.init(world, rank, uid[0], per_rank_vmm=vmm) as comm:
+# init takes the UniqueId wrapper, not the bytes that survive a broadcast.
+with Communicator.init(
+    world, rank, UniqueId.from_bytes(uid[0]), per_rank_vmm=vmm
+) as comm:
     with GemmAllReduceOp(comm, n=N, k=K, m_max=M_MAX) as op:
         b_shuffled = preshuffle_b(b_fp8)          # [N, K], once per weight
 
         m_pad = op.padded_m(x.shape[0])           # instance method: M only
         a_fp8, a_scale = quantize_per_1x128(op.pad_rows(x, m_pad))
+        # The result aliases the window, which the `with` frees on exit --
+        # so clone inside it, after the work it was issued behind has run.
         out = op(a_fp8, b_shuffled, a_scale, b_scale)[: x.shape[0]]
+        torch.cuda.current_stream().synchronize()
+        out = out.clone()
 ```
 
 **Pad before quantising.** A padded row produces a zero output row, which the
 caller slices off; quantising first and padding after would also have to extend
 the scales, and in the layout below that is not a row append.
 
-**Scales.** `a_scale` is the A 1x128 block scale as fp32. Pass it as `[M, K/128]`
-in either memory order, as `[K/128, M]`, or already flat in physical order --
-the op distinguishes these. What it cannot distinguish is a `[M, K/128]` tensor
-you have already flattened yourself with `reshape(-1)`: for the column-major
-tensor `aiter_per1x128_quant(transpose_scale=True)` returns, that walks the
-logical rows and pairs every scale with the wrong K block, which validates,
-runs, and returns relL2 0.26. `b_scale` is `[N/128, K/128]` fp32 row-major.
+**Scales.** `a_scale` is the A 1x128 block scale as fp32. The kernel reads
+element `(row, kb)` at `kb * M + row`, so three spellings are accepted because
+each already *is* that order: flat 1-D, `[K/128, M]`, and `[M, K/128]`
+**column-major** (stride `(1, M)`), which is transposed for free.
+
+`[M, K/128]` **row-major is rejected** with a `ValueError`. It is not that the
+op cannot transpose it -- it is that the two `[M, K/128]` tensors are
+indistinguishable by shape, and they need opposite treatment: the column-major
+one must be read flat, the row-major one must be transposed. Guessing gets one
+of them silently wrong (relL2 0.26 either way). Pass `.reshape(-1)` or `.t()`
+yourself to say which you have. `aiter_per1x128_quant(transpose_scale=True)`
+returns the column-major one, so `.reshape(-1)` is right for it.
+
+`b_scale` is `[N/128, K/128]` fp32 row-major.
 
 **Shapes.** `supports(m, n, k, world_size)` answers whether a shape is
 expressible. `K >= 256` and a multiple of 128; `N` a multiple of 256, and of
@@ -91,12 +105,21 @@ to keep it. `pad_rows` returns a reused buffer with the same caveat. One
 instance is not usable concurrently.
 
 **Distinct M values.** Each M compiles its own kernel and takes its own counter
-set, capped by `max_shapes` (8). Warm each M up once before capturing a graph.
+set, capped by `max_shapes`. That defaults to *every* legal M under `m_max`
+(`m_max / (world_size * block_m)`), so the cap is not something a caller
+normally meets; a ninth distinct shape used to raise. Warm each M up once before
+capturing a graph.
 
-**Cleanup.** `close()` (or the `with` above) releases the window, memory and
-dev-comm. The communicator holds a strong reference to each, so dropping the op
-is not enough -- at the model shape that is about 700 MiB per rank. Synchronise
-first if anything may still be in flight.
+**Cleanup.** `close()` (or the `with` above) releases the window and its memory
+-- at the model shape about 700 MiB per rank. The communicator holds a strong
+reference to each, so dropping the op is not enough. The dev-comm is
+deliberately *not* destroyed here: its SDMA queues are communicator-scoped, and
+tearing them down ahead of the communicator aborts the process. They go with the
+communicator. Synchronise first if anything may still be in flight.
+
+**dtype.** A and B must be `torch.float8_e4m3fn`. `float8_e4m3fnuz` is the same
+width but a different exponent bias, and the MMA atom implements OCP's, so it is
+rejected rather than silently returning a result 4x too large.
 
 ## fp8 on the wire
 

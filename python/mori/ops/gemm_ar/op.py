@@ -42,6 +42,16 @@ from .layout import GATHER_TRANSPORTS, WIRE_DTYPES, ArConfig
 DEFAULT_BLOCK_M = 128
 DEFAULT_BLOCK_N = 256
 
+# The tile granules the kernel is written for. Its mainloop builds N_TILES_A =
+# BLOCK_M/64 and N_TILES_B = BLOCK_N/128 MFMA accumulators and the LDS staging
+# halves each dimension, so a tile that is not a whole multiple of these does
+# not describe a real schedule -- the kernel asserts it (`_gemm_a8w8_8wave.py`,
+# the `BLOCK_M >= 128 and ... % 128 == 0` assert). These are the same numbers as
+# DEFAULT_BLOCK_M/N, but for a different reason: those are the measured best
+# tile, these are the only shapes that exist at all.
+TILE_M_GRANULE = 128
+TILE_N_GRANULE = 256
+
 # The block-scale group, on both operands: A is 1x128, B is 128x128.
 SCALE_BLOCK_K = 128
 
@@ -100,6 +110,28 @@ def counter_chunks(m_pad: int, world_size: int, block_m: int = DEFAULT_BLOCK_M) 
             f"to chunk"
         )
     return max(c for c in range(1, min(MAX_CHUNKS, bands) + 1) if bands % c == 0)
+
+
+def _tile_constraints(block_m: int, block_n: int) -> Optional[str]:
+    """Why this tile is not one the kernel can build, or None.
+
+    Checked before anything divides by a tile size. ``padded_m`` and
+    ``default_max_shapes`` both do, so a ``block_m`` of 0 raises
+    ZeroDivisionError from inside the padding arithmetic if this runs later --
+    and the kernel's own assert is bare, so reaching it gives an empty
+    AssertionError on the first real call rather than a reason at the boundary.
+    """
+    for name, value, granule in (
+        ("block_m", block_m, TILE_M_GRANULE),
+        ("block_n", block_n, TILE_N_GRANULE),
+    ):
+        if value < granule or value % granule:
+            return (
+                f"{name}={value} must be a positive multiple of {granule}: the "
+                f"mainloop's MFMA tiling and LDS staging are written for that "
+                f"granule"
+            )
+    return None
 
 
 def _gemm_constraints(n: int, k: int, block_n: int) -> Optional[str]:
@@ -174,6 +206,9 @@ def supports(
     rather than by a second copy of its rules: a predicate that says yes where
     construction raises, or vice versa, is worse than no predicate.
     """
+    # Tile and world size first: everything below divides by their product.
+    if world_size < 1 or _tile_constraints(block_m, block_n) is not None:
+        return False
     if m <= 0 or _gemm_constraints(n, k, block_n) is not None:
         return False
     try:
@@ -195,10 +230,20 @@ def supports(
     return True
 
 
-#: fp8 encodings the kernel's byte reinterpretation is valid for. Both are 1
-#: byte and the GEMM only ever sees the bytes, but forwarding a bf16 tensor here
-#: reinterprets two rows as one and produces finite nonsense.
-FP8_DTYPES = (torch.float8_e4m3fnuz, torch.float8_e4m3fn)
+#: The one fp8 encoding the kernel implements. The launch reinterprets the
+#: tensor as bytes, so the check has to be on the *encoding*, not on the width:
+#:
+#: * ``float8_e4m3fnuz`` is also one byte, but its exponent bias is 8 where OCP's
+#:   is 7, so the same byte means twice the value. The MMA atom is fixed to
+#:   ``fx.Float8E4M3FN`` (``_gemm_a8w8_8wave.py``), so admitting FNUZ would read
+#:   every A and every B element at 2x and return a result 4x too large --
+#:   finite, plausible, and wrong. sglang reaches this on gfx942, where
+#:   ``normalize_e4m3fn_to_e4m3fnuz`` converts weights to FNUZ.
+#: * A wider dtype reinterprets two rows as one, likewise finite nonsense.
+#:
+#: Widening this needs a kernel path for the new encoding and a numerical test
+#: per accepted dtype -- matching element size is not evidence of anything.
+FP8_DTYPES = (torch.float8_e4m3fn,)
 
 
 def _flatten_a_scale(a_scale: torch.Tensor, m: int, kb: int) -> torch.Tensor:
@@ -297,7 +342,15 @@ class GemmAllReduceOp:
         gather_transport: str = "lsa",
         max_shapes: Optional[int] = None,
     ):
+        # Cleanup state before anything can raise. The rollback below calls
+        # close(), which clears these; initialising them after the try block
+        # meant any acquisition failure died in cleanup with an AttributeError,
+        # masking the real error and skipping the handle release it exists for.
         self._closed = True  # so a failed constructor leaves close() a no-op
+        self.mem = self.win = self.dev_comm = None
+        self._cache: dict[int, _Plan] = {}
+        self._pad_in: Optional[torch.Tensor] = None
+
         if gather_dtype not in WIRE_DTYPES:
             raise ValueError(
                 f"gather_dtype={gather_dtype!r} is not one of {sorted(WIRE_DTYPES)}"
@@ -312,16 +365,22 @@ class GemmAllReduceOp:
                 f"block_n must be {DEFAULT_BLOCK_N}: the op always compiles with "
                 f"permlane, whose lane transpose is written for that width"
             )
+        # The tile has to be legal before the padding arithmetic runs: both
+        # padded_m and default_max_shapes divide by world_size * block_m.
+        why = _tile_constraints(block_m, block_n)
+        if why is not None:
+            raise ValueError(f"unsupported tile: {why}")
+        if m_max < 1 or sdma_queues < 1:
+            raise ValueError(
+                f"m_max and sdma_queues must both be >= 1; got m_max={m_max} "
+                f"sdma_queues={sdma_queues}"
+            )
         if max_shapes is None:
             max_shapes = default_max_shapes(
                 padded_m(m_max, comm.nranks, block_m), comm.nranks, block_m
             )
-        if block_m < 1 or m_max < 1 or sdma_queues < 1 or max_shapes < 1:
-            raise ValueError(
-                f"block_m, m_max, sdma_queues and max_shapes must all be >= 1; got "
-                f"block_m={block_m} m_max={m_max} sdma_queues={sdma_queues} "
-                f"max_shapes={max_shapes}"
-            )
+        if max_shapes < 1:
+            raise ValueError(f"max_shapes must be >= 1; got {max_shapes}")
         why = _gemm_constraints(n, k, block_n)
         if why is not None:
             raise ValueError(f"unsupported shape: {why}")
@@ -348,7 +407,6 @@ class GemmAllReduceOp:
         #: are disjoint, so two M values never elect on each other's residue.
         self._shape_slot: dict[int, int] = {}
 
-        self.mem = self.win = self.dev_comm = None
         self.window_bytes = self._make_cfg(self.m_max).window_bytes
         try:
             self.mem = comm.alloc_mem(self.window_bytes)
@@ -377,9 +435,6 @@ class GemmAllReduceOp:
             self.close()
             raise
         self._closed = False
-
-        self._cache: dict[int, _Plan] = {}
-        self._pad_in: Optional[torch.Tensor] = None
 
     @staticmethod
     def window_bytes_for(
