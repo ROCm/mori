@@ -181,7 +181,7 @@ See `examples/io/example.py` for more complete examples including batch transfer
 
 UMBP (the upper-layer cache pool) exposes a separate set of runtime-tunable
 env vars for distributed master / pool client / SPDK proxy timing. Those are
-out of scope for MORI-IO; see [`src/umbp/doc/runtime-env-vars.md`](../src/umbp/doc/runtime-env-vars.md).
+out of scope for MORI-IO; see [`src/umbp/doc/runtime-env-vars.md`](https://github.com/ROCm/mori/blob/main/src/umbp/doc/runtime-env-vars.md).
 
 ## Profiling MORI-IO with ROCTX Markers
 
