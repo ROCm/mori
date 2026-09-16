@@ -1,10 +1,32 @@
 import unittest
+import warnings
 from unittest.mock import MagicMock, patch
 
 import torch
 
 import mori.ccl.torch_fsdp as torch_fsdp
 from mori.ccl.torch_fsdp import MoriSdmaAllGather
+
+
+def _prepare(
+    layout,
+    split_sizes: list[int],
+    *,
+    dtype: torch.dtype = torch.float32,
+    eligible: bool = True,
+    owner_token: int = 1,
+) -> object | None:
+    return layout.prepare_output(
+        split_sizes,
+        sum(split_sizes),
+        2,
+        dtype,
+        torch.device("cpu"),
+        [[dtype] for _ in split_sizes],
+        [[size] for size in split_sizes],
+        eligible,
+        owner_token,
+    )
 
 
 class TestMoriSdmaAllGather(unittest.TestCase):
@@ -17,77 +39,41 @@ class TestMoriSdmaAllGather(unittest.TestCase):
         layout = comm.layout
         self.assertIsNotNone(layout)
         assert layout is not None
-        with patch.object(
-            layout, "can_use_param_contiguous_output", return_value=True
-        ):
-            metadata = layout.prepare_output(
-                [2, 4],
-                6,
-                8,
-                torch.bfloat16,
-                torch.device("cpu"),
-                [],
-                [],
-                [],
-            )
+        metadata = _prepare(layout, [2, 4], dtype=torch.bfloat16)
         self.assertIsNotNone(metadata)
         split_sizes, split_offsets = metadata
         self.assertEqual(split_sizes.tolist(), [1, 2])
         self.assertEqual(split_offsets.tolist(), [0, 1])
 
-    def test_unaligned_split_is_rejected(self) -> None:
+    def test_unaligned_split_warns_once_and_falls_back(self) -> None:
         comm = MoriSdmaAllGather()
         layout = comm.layout
         self.assertIsNotNone(layout)
         assert layout is not None
-        with patch.object(
-            layout, "can_use_param_contiguous_output", return_value=True
-        ), self.assertRaisesRegex(RuntimeError, "4-byte aligned"):
-            layout.prepare_output(
-                [1],
-                1,
-                2,
-                torch.bfloat16,
-                torch.device("cpu"),
-                [],
-                [],
-                [],
-            )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            for _ in range(2):
+                self.assertIsNone(_prepare(layout, [1], dtype=torch.bfloat16))
+        self.assertEqual(len(caught), 1)
+        self.assertIn("falling back", str(caught[0].message))
 
     def test_layout_fallback_clears_collective_metadata(self) -> None:
         comm = MoriSdmaAllGather()
         layout = comm.layout
         self.assertIsNotNone(layout)
         assert layout is not None
-        with patch.object(
-            layout, "can_use_param_contiguous_output", return_value=True
-        ):
-            layout.prepare_output(
-                [1],
-                1,
-                2,
-                torch.float32,
-                torch.device("cpu"),
-                [],
-                [],
-                [],
-            )
-        with patch.object(
-            layout, "can_use_param_contiguous_output", return_value=False
-        ):
-            self.assertIsNone(
-                layout.prepare_output(
-                    [1],
-                    1,
-                    2,
-                    torch.float32,
-                    torch.device("cpu"),
-                    [],
-                    [],
-                    [],
-                )
-            )
+        _prepare(layout, [1])
+        self.assertIsNone(_prepare(layout, [1], eligible=False))
         self.assertFalse(comm._can_call_param_contiguous(torch.empty(1)))
+
+    def test_layout_rejects_sharing_across_parameter_groups(self) -> None:
+        comm = MoriSdmaAllGather()
+        layout = comm.layout
+        self.assertIsNotNone(layout)
+        assert layout is not None
+        _prepare(layout, [1], owner_token=1)
+        with self.assertRaisesRegex(RuntimeError, "cannot be shared"):
+            _prepare(layout, [1], owner_token=2)
 
     def test_allocate_reuses_persistent_output(self) -> None:
         comm = MoriSdmaAllGather()

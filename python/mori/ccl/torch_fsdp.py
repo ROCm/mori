@@ -12,23 +12,20 @@ with::
 When ``zero_copy_output`` is set the backend produces a parameter-contiguous
 output that FSDP can use in place, avoiding the rank-major copy-out. The
 ``mori`` package is imported lazily so importing this module does not require
-ROCm/MORI to be installed.
+ROCm/MORI to be installed. Each instance owns one persistent registered output
+and must be installed on only one FSDP parameter group.
 """
 
 import importlib
+import warnings
 from collections.abc import Sequence
-from typing import Any, TYPE_CHECKING
+from typing import Any
 
 import torch
 import torch.distributed as dist
 
 from torch.distributed.fsdp._fully_shard._all_gather_layout import AllGatherLayout
 from torch.distributed.fsdp._fully_shard._fsdp_api import AllGather
-
-
-if TYPE_CHECKING:
-    from torch.distributed.fsdp._fully_shard._fsdp_collectives import AllGatherResult
-    from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
 
 
 class _MoriSdmaAllGatherWork(dist.Work):
@@ -52,26 +49,23 @@ class _MoriSdmaAllGatherLayout(AllGatherLayout):
 
     def prepare_output(
         self,
-        all_gather_input_split_sizes: list[int],
-        all_gather_input_numel: int,
+        input_split_sizes: list[int],
+        input_numel: int,
         world_size: int,
         dtype: torch.dtype,
         device: torch.device,
-        fsdp_params: list["FSDPParam"],
-        param_all_gather_input_dtypes: list[list[torch.dtype]],
-        param_all_gather_input_numels: list[list[int]],
+        param_input_dtypes: list[list[torch.dtype]],
+        param_input_numels: list[list[int]],
+        can_use_param_contiguous_output: bool,
+        owner_token: int,
     ) -> object | None:
+        self._comm._bind_layout_owner(owner_token)
         self._comm._clear_output()
-        if not self.can_use_param_contiguous_output(
-            fsdp_params,
-            param_all_gather_input_dtypes,
-            param_all_gather_input_numels,
-            dtype,
-        ):
+        if not can_use_param_contiguous_output:
             return None
-        if not all_gather_input_split_sizes:
+        if not input_split_sizes:
             raise RuntimeError("MORI zero-copy allgather requires non-empty splits")
-        if sum(all_gather_input_split_sizes) != all_gather_input_numel:
+        if sum(input_split_sizes) != input_numel:
             raise RuntimeError(
                 "MORI zero-copy allgather split sizes do not match input numel"
             )
@@ -79,17 +73,22 @@ class _MoriSdmaAllGatherLayout(AllGatherLayout):
         split_sizes_u32: list[int] = []
         split_offsets_u32: list[int] = []
         offset = 0
-        for split_size in all_gather_input_split_sizes:
+        for split_size in input_split_sizes:
             split_nbytes = int(split_size) * element_size
             if split_nbytes % 4 != 0:
-                raise RuntimeError(
-                    "MORI zero-copy allgather requires every split to be 4-byte aligned"
-                )
+                if not self._comm._warned_unaligned_split:
+                    warnings.warn(
+                        "MORI zero-copy allgather requires every split to be "
+                        "4-byte aligned; falling back to rank-major output",
+                        stacklevel=2,
+                    )
+                    self._comm._warned_unaligned_split = True
+                return None
             split_u32 = split_nbytes // 4
             split_offsets_u32.append(offset)
             split_sizes_u32.append(split_u32)
             offset += split_u32
-        if offset * 4 != all_gather_input_numel * element_size:
+        if offset * 4 != input_numel * element_size:
             raise RuntimeError("MORI zero-copy allgather byte size mismatch")
         self._comm._param_contiguous_split_sizes = torch.tensor(
             split_sizes_u32, dtype=torch.int64, device=device
@@ -124,15 +123,13 @@ class _MoriSdmaAllGatherLayout(AllGatherLayout):
 
     def finalize_outputs(
         self,
-        all_gather_result: "AllGatherResult",
-        fsdp_params: list["FSDPParam"],
-        group: dist.ProcessGroup,
-    ) -> None:
-        self.init_param_contiguous_outputs(
-            all_gather_result.all_gather_output,
-            fsdp_params,
-            all_gather_result.param_all_gather_input_numels,
-            group.size(),
+        all_gather_output: torch.Tensor,
+        param_input_numels: list[list[int]],
+        world_size: int,
+        output_metadata: object,
+    ) -> list[list[torch.Tensor]]:
+        return self.param_contiguous_output_views(
+            all_gather_output, param_input_numels, world_size
         )
 
 
@@ -156,6 +153,8 @@ class MoriSdmaAllGather(AllGather):
         self._registered_output_ptr: int | None = None
         self._param_contiguous_split_sizes: torch.Tensor | None = None
         self._param_contiguous_split_offsets: torch.Tensor | None = None
+        self._layout_owner_token: int | None = None
+        self._warned_unaligned_split = False
 
     def allocate(
         self,
@@ -225,6 +224,15 @@ class MoriSdmaAllGather(AllGather):
     def _clear_output(self) -> None:
         self._param_contiguous_split_sizes = None
         self._param_contiguous_split_offsets = None
+
+    def _bind_layout_owner(self, owner_token: int) -> None:
+        if self._layout_owner_token is None:
+            self._layout_owner_token = owner_token
+        elif self._layout_owner_token != owner_token:
+            raise RuntimeError(
+                "one MoriSdmaAllGather instance cannot be shared across FSDP "
+                "parameter groups because its registered output is persistent"
+            )
 
     def _can_call_param_contiguous(self, input_tensor: torch.Tensor) -> bool:
         if (
