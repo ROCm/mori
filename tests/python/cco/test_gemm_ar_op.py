@@ -336,9 +336,9 @@ def test_constructor_rolls_back_cleanly_when_a_resource_fails(monkeypatch):
         acquired = [x[len("acquire:") :] for x in comm.log if x.startswith("acquire:")]
         closed = {x[len("close:") :] for x in comm.log if x.startswith("close:")}
         assert acquired[-1] == fail_at, f"stopped at {acquired[-1]}, not {fail_at}"
-        assert set(acquired[:-1]) == closed, (
-            f"failing at {fail_at}: acquired {acquired}, closed {closed}"
-        )
+        assert (
+            set(acquired[:-1]) == closed
+        ), f"failing at {fail_at}: acquired {acquired}, closed {closed}"
 
 
 # --- multi-rank: the op itself --------------------------------------------
