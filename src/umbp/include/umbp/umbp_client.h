@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -47,6 +48,15 @@ enum class UMBPDeploymentMode : int {
   Local = 0,
   StandaloneProcess = 1,
   Distributed = 2,
+};
+
+struct PrefetchOptions {
+  // Protect successful local placements from eviction for this long.
+  std::chrono::milliseconds lease_ttl{2000};
+  // Relative budget measured by the receiving UMBP process. Zero disables the
+  // deadline for direct in-process callers.
+  std::chrono::milliseconds timeout{5000};
+  bool retry_failed_route = true;
 };
 
 /// Abstract interface for UMBP storage clients.
@@ -100,6 +110,14 @@ class IUMBPClient {
   virtual std::vector<bool> BatchGet(const std::vector<std::string>& keys,
                                      const std::vector<uintptr_t>& dsts,
                                      const std::vector<size_t>& sizes) = 0;
+
+  /// Pull remotely-owned objects into this client's local storage without a
+  /// caller-provided destination buffer. The call is synchronous: a true entry
+  /// is locally readable when the method returns. Already-local keys also
+  /// return true; missing, rejected, or failed keys return false.
+  virtual std::vector<bool> BatchPrefetch(
+      const std::vector<std::string>& keys,
+      const PrefetchOptions& options = PrefetchOptions{}) = 0;
 
   /// Read byte ranges of stored objects into scattered user buffers. Shape
   /// errors fail the whole batch; data errors are reported per key.

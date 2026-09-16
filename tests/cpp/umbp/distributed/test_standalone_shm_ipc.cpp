@@ -272,6 +272,53 @@ TEST(StandaloneShmIpcTest, WorkerRegistrationUsesNonZeroOffsetsAndCanReregister)
   std::memset(bytes + 96, 0, 16);
   ASSERT_TRUE(client->Get("offset-key", reinterpret_cast<uintptr_t>(bytes + 96), 16));
   for (int i = 0; i < 16; ++i) EXPECT_EQ(bytes[96 + i], static_cast<unsigned char>(i + 1));
+  // The forwarding RPC preserves one result per key. This embedded server has
+  // no remote peers, so only the already-local object can satisfy prefetch.
+  EXPECT_EQ(client->BatchPrefetch({"offset-key", "missing-prefetch-key"}),
+            std::vector<bool>({true, false}));
+
+  auto prefetch_stub = ::umbp::UMBPStandalone::NewStub(
+      grpc::CreateChannel(address, grpc::InsecureChannelCredentials()));
+  ::umbp::PrefetchRequest submit_request;
+  submit_request.add_keys("offset-key");
+  submit_request.add_keys("missing-prefetch-key");
+  submit_request.set_request_id("standalone-async-prefetch");
+  submit_request.set_timeout_ms(2000);
+  submit_request.set_lease_ttl_ms(1000);
+  grpc::ClientContext submit_context;
+  ::umbp::PrefetchSubmitResponse submit_response;
+  ASSERT_TRUE(
+      prefetch_stub->SubmitPrefetch(&submit_context, submit_request, &submit_response).ok());
+  ASSERT_TRUE(submit_response.accepted()) << submit_response.error();
+  ASSERT_EQ(submit_response.request_id(), submit_request.request_id());
+
+  ::umbp::PrefetchStatusResponse prefetch_status;
+  const auto status_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  do {
+    grpc::ClientContext status_context;
+    ::umbp::PrefetchStatusRequest status_request;
+    status_request.set_request_id(submit_response.request_id());
+    prefetch_status.Clear();
+    ASSERT_TRUE(
+        prefetch_stub->GetPrefetchStatus(&status_context, status_request, &prefetch_status).ok());
+    if (prefetch_status.state() != ::umbp::PREFETCH_STATE_QUEUED &&
+        prefetch_status.state() != ::umbp::PREFETCH_STATE_RUNNING) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  } while (std::chrono::steady_clock::now() < status_deadline);
+  EXPECT_EQ(prefetch_status.state(), ::umbp::PREFETCH_STATE_PARTIAL);
+  ASSERT_EQ(prefetch_status.ok_size(), 2);
+  EXPECT_TRUE(prefetch_status.ok(0));
+  EXPECT_FALSE(prefetch_status.ok(1));
+
+  // Reusing the same request id and payload is idempotent.
+  grpc::ClientContext duplicate_context;
+  ::umbp::PrefetchSubmitResponse duplicate_response;
+  ASSERT_TRUE(
+      prefetch_stub->SubmitPrefetch(&duplicate_context, submit_request, &duplicate_response).ok());
+  EXPECT_TRUE(duplicate_response.accepted());
+  EXPECT_EQ(duplicate_response.request_id(), submit_response.request_id());
 
   client->DeregisterMemory(reinterpret_cast<uintptr_t>(handle.ptr));
   ASSERT_TRUE(client->RegisterMemory(reinterpret_cast<uintptr_t>(handle.ptr), handle.mapped_size));

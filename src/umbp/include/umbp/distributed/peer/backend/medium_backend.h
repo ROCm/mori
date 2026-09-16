@@ -336,6 +336,16 @@ class MediumBackend : public MetricSource {
                                                   bool include_descs,
                                                   bool allow_file_refs = false) = 0;
 
+  // Extend eviction protection for committed local objects without resolving
+  // descriptors or changing their placement. This is a bounded lease, not a
+  // permanent pin: callers supply the remaining lifetime of a prefetch hint.
+  // Unsupported media return false per key.
+  virtual std::vector<bool> ExtendReadLease(const std::vector<std::string>& keys,
+                                            std::chrono::milliseconds ttl) {
+    (void)ttl;
+    return std::vector<bool>(keys.size(), false);
+  }
+
   // Acquire a peer-local migration pin and resolve the key without changing or
   // cancelling normal RPC read leases. The caller must release a successful
   // acquisition after its synchronous transfer completes.

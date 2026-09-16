@@ -47,6 +47,11 @@ struct PoolPlacementRequest {
   TierType tier = TierType::UNKNOWN;
   std::string backend_name;
   std::string logical_tier;
+  // Restrict a tiered-policy placement to the named logical tier (or the
+  // entry tier when logical_tier is empty). Used by proactive prefetch: a
+  // successful result promises hot residency, so silently spilling to a cold
+  // downstream tier would be a false success.
+  bool strict_logical_tier = false;
 };
 
 // Decision-only interface. A policy returns backend ids; PeerPool owns slot
@@ -166,6 +171,11 @@ class TieredPlacementPolicy final : public PoolPolicy {
                                                 : std::vector<uint32_t>{};
     }
     if (graph_ == nullptr) return {};
+    if (request.strict_logical_tier) {
+      return request.logical_tier.empty()
+                 ? graph_->WeightedMemberOrder(graph_->EntryTierIndex(), request.key)
+                 : graph_->PutOrderOnlyTier(request.logical_tier, request.key);
+    }
     return request.logical_tier.empty()
                ? graph_->PutOrder(request.key)
                : graph_->PutOrderFromTier(request.logical_tier, request.key);

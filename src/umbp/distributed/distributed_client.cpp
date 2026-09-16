@@ -269,6 +269,19 @@ std::vector<bool> DistributedClient::BatchGet(const std::vector<std::string>& ke
   return pool_client_->BatchGet(keys, dst_ptrs, sizes);
 }
 
+std::vector<bool> DistributedClient::BatchPrefetch(const std::vector<std::string>& keys,
+                                                   const PrefetchOptions& options) {
+  if (closing_) return std::vector<bool>(keys.size(), false);
+  std::shared_lock lk(op_mutex_);
+  if (closed_ || !pool_client_) return std::vector<bool>(keys.size(), false);
+  const auto deadline =
+      options.timeout <= std::chrono::milliseconds::zero()
+          ? std::chrono::steady_clock::time_point::max()
+          : std::chrono::steady_clock::now() + options.timeout;
+  return pool_client_->BatchPrefetch(keys, options.lease_ttl, deadline,
+                                     options.retry_failed_route);
+}
+
 std::vector<bool> DistributedClient::BatchGetRanges(
     const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dsts,
     const std::vector<std::vector<size_t>>& sizes,

@@ -440,6 +440,99 @@ TEST_F(PoolClientRangesTest, RemoteRoundTripSubBatchesAndInstallsLocally) {
   }
 }
 
+TEST_F(PoolClientRangesTest, ExplicitBatchPrefetchMaterializesRemoteObjects) {
+  const std::string key = "router-prefetch-object";
+  std::vector<char> object(kObjectSize);
+  for (size_t i = 0; i < object.size(); ++i) {
+    object[i] = static_cast<char>((i * 17 + 23) & 0xff);
+  }
+  SeedRemoteObject(key, object);
+  ASSERT_FALSE(LocallyResident(caller_.get(), key));
+
+  // Duplicate keys share one transfer but preserve one result per request
+  // entry. A missing key fails independently.
+  EXPECT_EQ(caller_->BatchPrefetch({key, "router-prefetch-missing", key}),
+            std::vector<bool>({true, false, true}));
+  ASSERT_TRUE(LocallyResident(caller_.get(), key));
+
+  const std::string expired_key = "router-prefetch-expired";
+  SeedRemoteObject(expired_key, object);
+  ASSERT_FALSE(LocallyResident(caller_.get(), expired_key));
+  EXPECT_EQ(caller_->BatchPrefetch({expired_key}, std::chrono::seconds(1),
+                                   std::chrono::steady_clock::now()),
+            std::vector<bool>({false}));
+  EXPECT_FALSE(LocallyResident(caller_.get(), expired_key));
+
+  std::vector<char> readback(kObjectSize, 0);
+  ASSERT_EQ(caller_->BatchGet({key}, {readback.data()}, {readback.size()}),
+            std::vector<bool>({true}));
+  EXPECT_EQ(readback, object);
+}
+
+TEST_F(PoolClientRangesTest, ExplicitBatchPrefetchTargetsOnlyTheHotEntryTier) {
+  caller_->Shutdown();
+  auto tiered = MakeTieredClient("ranges-prefetch-tiered");
+  ASSERT_NE(tiered, nullptr);
+
+  const std::string key = "router-prefetch-hot-object";
+  std::vector<char> object(kObjectSize, 0x5a);
+  PutLocalReplica(target_.get(), key, object);
+  target_->Master().FlushHeartbeat();
+  tiered->Master().FlushHeartbeat();
+  ASSERT_TRUE(WaitForExists(tiered.get(), key));
+
+  auto* cold = tiered->Backends().Get("cold");
+  auto* hot = tiered->Backends().Get("hot");
+  ASSERT_NE(cold, nullptr);
+  ASSERT_NE(hot, nullptr);
+  ASSERT_EQ(tiered->BatchPrefetch({key}, std::chrono::milliseconds(1200)),
+            std::vector<bool>({true}));
+  EXPECT_TRUE(hot->Contains(key));
+  EXPECT_FALSE(cold->Contains(key));
+
+  // The prefetch lease outlives the backend's ordinary 500 ms read lease.
+  // Once its bounded TTL expires, eviction is allowed again.
+  std::this_thread::sleep_for(std::chrono::milliseconds(700));
+  EXPECT_EQ(hot->Evict({key}).front().bytes_freed, 0u);
+  std::this_thread::sleep_for(std::chrono::milliseconds(700));
+  EXPECT_GT(hot->Evict({key}).front().bytes_freed, 0u);
+
+  tiered->Shutdown();
+}
+
+TEST_F(PoolClientRangesTest, ExplicitBatchPrefetchReroutesOnceAfterAStaleSource) {
+  std::vector<char> replica_get_scratch(kScratchSize);
+  std::vector<char> replica_put_scratch(kScratchSize);
+  auto replica = MakeClient("ranges-z-prefetch-replica", kTargetCapacity, replica_get_scratch,
+                            replica_put_scratch);
+  ASSERT_NE(replica, nullptr);
+
+  const std::string key = "router-prefetch-stale-source";
+  std::vector<char> object(kObjectSize, 0x63);
+  PutLocalReplica(target_.get(), key, object);
+  PutLocalReplica(replica.get(), key, object);
+  target_->Master().FlushHeartbeat();
+  replica->Master().FlushHeartbeat();
+  caller_->Master().FlushHeartbeat();
+  ASSERT_TRUE(WaitForRoute(caller_.get(), key, {}, "ranges-target"));
+  ASSERT_TRUE(
+      WaitForRoute(caller_.get(), key, {"ranges-target"}, "ranges-z-prefetch-replica"));
+
+  // Leave the target location stale at Master while keeping the second
+  // replica live. The first transfer fails at peer resolve; prefetch must
+  // exclude that source, route once more, and install from the replica.
+  target_->Master().StopHeartbeat();
+  auto evicted = target_->Backends().Get(TierType::DRAM)->Evict({key});
+  ASSERT_EQ(evicted.size(), 1u);
+  ASSERT_EQ(evicted.front().bytes_freed, kObjectSize);
+  ASSERT_TRUE(WaitForRoute(caller_.get(), key, {}, "ranges-target"));
+
+  EXPECT_EQ(caller_->BatchPrefetch({key}), std::vector<bool>({true}));
+  EXPECT_TRUE(LocallyResident(caller_.get(), key));
+
+  replica->Shutdown();
+}
+
 TEST_F(PoolClientRangesTest, LocalCopyOnlyRegistrationServesRangesAndSharesOnePlan) {
   // kLocalCopyOnly records a region without handing it to the IO engine. It
   // exists because the two halves of "register" are separable: a region that is

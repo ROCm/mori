@@ -62,6 +62,9 @@ class DistributedClient : public IUMBPClient {
   std::vector<bool> BatchGet(const std::vector<std::string>& keys,
                              const std::vector<uintptr_t>& dsts,
                              const std::vector<size_t>& sizes) override;
+  std::vector<bool> BatchPrefetch(
+      const std::vector<std::string>& keys,
+      const PrefetchOptions& options = PrefetchOptions{}) override;
   // Not implemented — see src/umbp/doc/design-tree-connector-port.md §5.  The
   // transfer layer can already express a range (TransferItem carries
   // src_offset/dst_offset/size); what is missing is the object-range to

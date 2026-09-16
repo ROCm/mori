@@ -455,6 +455,27 @@ std::vector<bool> StandaloneProcessClient::BatchGet(const std::vector<std::strin
   return std::vector<bool>(resp.ok().begin(), resp.ok().end());
 }
 
+std::vector<bool> StandaloneProcessClient::BatchPrefetch(
+    const std::vector<std::string>& keys, const PrefetchOptions& options) {
+  if (closing_) return std::vector<bool>(keys.size(), false);
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return std::vector<bool>(keys.size(), false);
+
+  ::umbp::PrefetchRequest req;
+  for (const auto& key : keys) req.add_keys(key);
+  req.set_lease_ttl_ms(static_cast<uint64_t>(
+      std::max(options.lease_ttl, std::chrono::milliseconds::zero()).count()));
+  req.set_timeout_ms(static_cast<uint64_t>(
+      std::max(options.timeout, std::chrono::milliseconds::zero()).count()));
+  grpc::ClientContext ctx;
+  ::umbp::BatchBoolResponse resp;
+  grpc::Status status = stub_->BatchPrefetch(&ctx, req, &resp);
+  if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) {
+    return std::vector<bool>(keys.size(), false);
+  }
+  return std::vector<bool>(resp.ok().begin(), resp.ok().end());
+}
+
 uint64_t StandaloneProcessClient::LookupKeyHandle(const std::vector<std::string>& keys,
                                                   uint64_t* fingerprint) {
   // Nothing to name, and nothing worth remembering: a zero fingerprint tells

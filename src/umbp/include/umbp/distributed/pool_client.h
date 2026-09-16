@@ -136,6 +136,17 @@ class PoolClient {
   std::vector<bool> BatchGet(const std::vector<std::string>& keys, const std::vector<void*>& dsts,
                              const std::vector<size_t>& sizes);
 
+  // Synchronously materialize remotely-owned objects in this node's default
+  // local medium. Unlike BatchGet, no caller buffer participates: peer data is
+  // transferred directly into freshly allocated backend slots and committed
+  // before successful entries are returned.
+  std::vector<bool> BatchPrefetch(
+      const std::vector<std::string>& keys,
+      std::chrono::milliseconds lease_ttl = std::chrono::seconds(2),
+      std::chrono::steady_clock::time_point deadline =
+          std::chrono::steady_clock::time_point::max(),
+      bool retry_failed_route = true);
+
   // Ranged multi-buffer I/O.  One stored object is backed by scattered tier
   // pages while the caller supplies several disjoint object-relative ranges,
   // each with its own buffer.  This is what a KV connector wants: read layer k
@@ -592,7 +603,10 @@ class PoolClient {
   // Best-effort per key: already-local keys are dropped before allocating (the
   // alternative wastes a whole object of wire), and any key whose allocation or
   // transfer fails is aborted without affecting the others.
-  void FetchWholeObjectsIntoMedium(std::vector<ReCacheJob>& jobs);
+  std::vector<bool> FetchWholeObjectsIntoMedium(
+      std::vector<ReCacheJob>& jobs,
+      std::chrono::steady_clock::time_point deadline =
+          std::chrono::steady_clock::time_point::max());
 
   std::deque<ReCacheJob> recache_queue_;
   std::mutex recache_mutex_;

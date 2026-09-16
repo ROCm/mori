@@ -58,6 +58,9 @@ class StandaloneProcessClient : public IUMBPClient {
   std::vector<bool> BatchGet(const std::vector<std::string>& keys,
                              const std::vector<uintptr_t>& dsts,
                              const std::vector<size_t>& sizes) override;
+  std::vector<bool> BatchPrefetch(
+      const std::vector<std::string>& keys,
+      const PrefetchOptions& options = PrefetchOptions{}) override;
   std::vector<bool> BatchGetRanges(const std::vector<std::string>& keys,
                                    const std::vector<std::vector<uintptr_t>>& dsts,
                                    const std::vector<std::vector<size_t>>& sizes,

@@ -13,6 +13,9 @@ service UMBPStandalone {
   rpc BatchPutWithDepth(BatchDataWithDepthRequest) returns (BatchBoolResponse);
   rpc BatchGet(BatchDataRequest) returns (BatchBoolResponse);
   rpc BatchGetRanges(BatchRangeDataRequest) returns (BatchBoolResponse);
+  rpc BatchPrefetch(PrefetchRequest) returns (BatchBoolResponse);
+  rpc SubmitPrefetch(PrefetchRequest) returns (PrefetchSubmitResponse);
+  rpc GetPrefetchStatus(PrefetchStatusRequest) returns (PrefetchStatusResponse);
   rpc Exists(KeyRequest) returns (BoolResponse);
   rpc BatchExists(BatchKeysRequest) returns (BatchBoolResponse);
   rpc BatchExistsConsecutive(BatchKeysRequest) returns (CountResponse);
@@ -59,6 +62,43 @@ message KeyRequest {
 
 message BatchKeysRequest {
   repeated string keys = 1;
+}
+
+message PrefetchRequest {
+  repeated string keys = 1;
+  uint64 lease_ttl_ms = 2;
+  uint64 timeout_ms = 3;
+  // Optional idempotency key for SubmitPrefetch. The server generates one
+  // when this is empty.
+  string request_id = 4;
+}
+
+message PrefetchSubmitResponse {
+  bool accepted = 1;
+  string request_id = 2;
+  string error = 3;
+}
+
+message PrefetchStatusRequest {
+  string request_id = 1;
+}
+
+enum PrefetchState {
+  PREFETCH_STATE_UNKNOWN = 0;
+  PREFETCH_STATE_QUEUED = 1;
+  PREFETCH_STATE_RUNNING = 2;
+  PREFETCH_STATE_READY = 3;
+  PREFETCH_STATE_PARTIAL = 4;
+  PREFETCH_STATE_FAILED = 5;
+  PREFETCH_STATE_EXPIRED = 6;
+}
+
+message PrefetchStatusResponse {
+  PrefetchState state = 1;
+  repeated bool ok = 2;
+  uint64 completed_keys = 3;
+  uint64 total_keys = 4;
+  string error = 5;
 }
 
 message PutRequest {

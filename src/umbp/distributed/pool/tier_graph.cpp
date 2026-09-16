@@ -260,6 +260,14 @@ std::vector<uint32_t> LogicalTierGraph::PutOrder(std::string_view key) const {
   return BackendOrder(ReachableTierOrder(entry_tier_, false, true), key);
 }
 
+std::vector<uint32_t> LogicalTierGraph::PutOrderOnlyTier(std::string_view name,
+                                                        std::string_view key) const {
+  for (TierIndex tier = 0; tier < nodes_.size(); ++tier) {
+    if (NodeAt(tier).name == name) return WeightedMemberOrder(tier, key);
+  }
+  return {};
+}
+
 std::vector<uint32_t> LogicalTierGraph::PutOrderFromTier(std::string_view name,
                                                          std::string_view key) const {
   for (TierIndex tier = 0; tier < nodes_.size(); ++tier) {

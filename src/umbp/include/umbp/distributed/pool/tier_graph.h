@@ -86,6 +86,7 @@ class LogicalTierGraph {
 
   std::vector<uint32_t> WeightedMemberOrder(TierIndex tier, std::string_view key) const;
   std::vector<uint32_t> PutOrder(std::string_view key) const;
+  std::vector<uint32_t> PutOrderOnlyTier(std::string_view name, std::string_view key) const;
   std::vector<uint32_t> PutOrderFromTier(std::string_view name, std::string_view key) const;
   std::vector<uint32_t> TransitionTargetOrder(TierIndex source, std::string_view key) const;
   std::vector<uint32_t> PromoteTargetOrder(TierIndex source, std::string_view key) const;

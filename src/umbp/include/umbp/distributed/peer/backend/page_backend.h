@@ -257,6 +257,8 @@ class PageBackend : public MediumBackend {
   std::vector<bool> BatchAbort(const std::vector<uint64_t>& slot_ids) override;
   std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool include_descs,
                                           bool allow_file_refs = false) override;
+  std::vector<bool> ExtendReadLease(const std::vector<std::string>& keys,
+                                    std::chrono::milliseconds ttl) override;
   bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved) override;
   void ReleaseMigrationRead(const std::string& key) override;
   bool Contains(const std::string& key) const override;

@@ -37,8 +37,10 @@
 #include <cerrno>
 #include <chrono>
 #include <climits>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <list>
 #include <map>
@@ -478,6 +480,24 @@ class KeyHandleStats {
 }  // namespace
 
 class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
+ private:
+  struct AsyncPrefetchRecord {
+    std::string request_id;
+    std::vector<std::string> keys;
+    PrefetchOptions options;
+    std::chrono::steady_clock::time_point deadline;
+    ::umbp::PrefetchState state = ::umbp::PREFETCH_STATE_QUEUED;
+    std::vector<bool> results;
+    std::string error;
+    std::chrono::steady_clock::time_point finished_at{};
+  };
+  inline static constexpr size_t kMaxAsyncPrefetchRequests = 1024;
+  inline static constexpr size_t kMaxAsyncPrefetchKeys = 4096;
+  inline static constexpr auto kAsyncPrefetchRetention = std::chrono::minutes(5);
+  inline static constexpr auto kDefaultAsyncPrefetchTimeout = std::chrono::seconds(5);
+  inline static constexpr auto kMaxAsyncPrefetchTimeout = std::chrono::minutes(5);
+  inline static constexpr auto kMaxAsyncPrefetchLease = std::chrono::minutes(5);
+
  public:
   Impl(const UMBPConfig& config, std::string address)
       : backend_config_(NormalizeBackendConfig(config)),
@@ -554,6 +574,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     if (server_) {
       server_->Shutdown(std::chrono::system_clock::now() + ShutdownDeadline());
     }
+    StopPrefetchWorker();
     UnregisterAllExternalIdentities();
     {
       std::unique_lock<std::shared_mutex> lock(client_mu_);
@@ -731,6 +752,143 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       return grpc::Status::OK;
     }
     FillResults(client_->BatchGet(keys, ptrs, sizes), response);
+    return grpc::Status::OK;
+  }
+
+  grpc::Status BatchPrefetch(grpc::ServerContext*, const ::umbp::PrefetchRequest* request,
+                             ::umbp::BatchBoolResponse* response) override {
+    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+    // No caller mapping participates, so prefetch may share the client
+    // lifetime barrier with Gets. DistributedClient/PoolClient provide their
+    // own storage synchronization for the slot commits.
+    std::shared_lock<std::shared_mutex> lock(client_mu_);
+    if (shutdown_.load()) {
+      FillFalse(request->keys_size(), response);
+      return grpc::Status::OK;
+    }
+    const uint64_t max_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(kMaxAsyncPrefetchTimeout).count());
+    if (request->lease_ttl_ms() > max_ms || request->timeout_ms() > max_ms) {
+      FillFalse(request->keys_size(), response);
+      return grpc::Status::OK;
+    }
+    PrefetchOptions options;
+    if (request->lease_ttl_ms() != 0) {
+      options.lease_ttl = std::chrono::milliseconds(request->lease_ttl_ms());
+    }
+    options.timeout = std::chrono::milliseconds(request->timeout_ms());
+    FillResults(client_->BatchPrefetch(keys, options), response);
+    return grpc::Status::OK;
+  }
+
+  grpc::Status SubmitPrefetch(grpc::ServerContext*, const ::umbp::PrefetchRequest* request,
+                              ::umbp::PrefetchSubmitResponse* response) override {
+    if (shutdown_.load()) {
+      response->set_error("server is shutting down");
+      return grpc::Status::OK;
+    }
+    if (request->keys_size() == 0 ||
+        static_cast<size_t>(request->keys_size()) > kMaxAsyncPrefetchKeys) {
+      response->set_error("prefetch key count is outside the accepted range");
+      return grpc::Status::OK;
+    }
+    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+    if (std::any_of(keys.begin(), keys.end(), [](const std::string& key) { return key.empty(); })) {
+      response->set_error("prefetch keys must be non-empty");
+      return grpc::Status::OK;
+    }
+
+    const auto max_timeout_ms =
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(kMaxAsyncPrefetchTimeout)
+                .count());
+    const auto max_lease_ms =
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(kMaxAsyncPrefetchLease).count());
+    if (request->timeout_ms() > max_timeout_ms || request->lease_ttl_ms() > max_lease_ms) {
+      response->set_error("prefetch timeout or lease exceeds the configured bound");
+      return grpc::Status::OK;
+    }
+    const auto timeout =
+        request->timeout_ms() == 0 ? kDefaultAsyncPrefetchTimeout
+                                   : std::chrono::milliseconds(request->timeout_ms());
+    const auto lease =
+        request->lease_ttl_ms() == 0 ? PrefetchOptions{}.lease_ttl
+                                     : std::chrono::milliseconds(request->lease_ttl_ms());
+    if (timeout <= std::chrono::milliseconds::zero() || lease < std::chrono::milliseconds::zero()) {
+      response->set_error("prefetch timeout or lease exceeds the configured bound");
+      return grpc::Status::OK;
+    }
+
+    std::string request_id = request->request_id();
+    if (request_id.empty()) {
+      request_id =
+          fmt::format("prefetch-{}-{}", std::chrono::steady_clock::now().time_since_epoch().count(),
+                      next_prefetch_request_id_.fetch_add(1, std::memory_order_relaxed));
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(prefetch_mu_);
+      if (prefetch_stop_) {
+        response->set_error("server is shutting down");
+        return grpc::Status::OK;
+      }
+      PrunePrefetchRequestsLocked(std::chrono::steady_clock::now());
+      auto existing = prefetch_requests_.find(request_id);
+      if (existing != prefetch_requests_.end()) {
+        if (existing->second->keys != keys || existing->second->options.timeout != timeout ||
+            existing->second->options.lease_ttl != lease) {
+          response->set_error("request_id already names a different prefetch");
+          return grpc::Status::OK;
+        }
+        response->set_accepted(true);
+        response->set_request_id(request_id);
+        return grpc::Status::OK;
+      }
+      if (prefetch_requests_.size() >= kMaxAsyncPrefetchRequests) {
+        response->set_error("prefetch request table is full");
+        return grpc::Status::OK;
+      }
+
+      auto record = std::make_shared<AsyncPrefetchRecord>();
+      record->request_id = request_id;
+      record->keys = std::move(keys);
+      record->options.lease_ttl = lease;
+      record->options.timeout = timeout;
+      record->deadline = std::chrono::steady_clock::now() + timeout;
+      prefetch_requests_.emplace(request_id, record);
+      prefetch_queue_.push_back(std::move(record));
+      if (!prefetch_worker_.joinable()) {
+        prefetch_worker_ = std::thread([this] { PrefetchWorkerLoop(); });
+      }
+    }
+    prefetch_cv_.notify_one();
+    response->set_accepted(true);
+    response->set_request_id(request_id);
+    return grpc::Status::OK;
+  }
+
+  grpc::Status GetPrefetchStatus(grpc::ServerContext*,
+                                 const ::umbp::PrefetchStatusRequest* request,
+                                 ::umbp::PrefetchStatusResponse* response) override {
+    std::lock_guard<std::mutex> lock(prefetch_mu_);
+    PrunePrefetchRequestsLocked(std::chrono::steady_clock::now());
+    auto it = prefetch_requests_.find(request->request_id());
+    if (it == prefetch_requests_.end()) {
+      response->set_state(::umbp::PREFETCH_STATE_UNKNOWN);
+      response->set_error("unknown or expired request_id");
+      return grpc::Status::OK;
+    }
+    const auto& record = *it->second;
+    response->set_state(record.state);
+    response->set_total_keys(record.keys.size());
+    size_t completed = 0;
+    for (bool ok : record.results) {
+      response->add_ok(ok);
+      if (ok) ++completed;
+    }
+    response->set_completed_keys(completed);
+    response->set_error(record.error);
     return grpc::Status::OK;
   }
 
@@ -1038,6 +1196,87 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     void* base = nullptr;
     size_t refcount = 0;
   };
+
+  void PrefetchWorkerLoop() {
+    for (;;) {
+      std::shared_ptr<AsyncPrefetchRecord> record;
+      {
+        std::unique_lock<std::mutex> lock(prefetch_mu_);
+        prefetch_cv_.wait(lock, [this] { return prefetch_stop_ || !prefetch_queue_.empty(); });
+        if (prefetch_stop_ && prefetch_queue_.empty()) return;
+        record = std::move(prefetch_queue_.front());
+        prefetch_queue_.pop_front();
+        if (std::chrono::steady_clock::now() >= record->deadline) {
+          record->state = ::umbp::PREFETCH_STATE_EXPIRED;
+          record->error = "prefetch deadline expired before execution";
+          record->finished_at = std::chrono::steady_clock::now();
+          continue;
+        }
+        record->state = ::umbp::PREFETCH_STATE_RUNNING;
+      }
+
+      PrefetchOptions options = record->options;
+      options.timeout = std::max(
+          std::chrono::milliseconds(1),
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              record->deadline - std::chrono::steady_clock::now()));
+      std::vector<bool> results(record->keys.size(), false);
+      {
+        // Shared only as a lifetime barrier. Prefetch has no caller-owned
+        // mapping, and the inner client synchronizes its own storage changes.
+        std::shared_lock<std::shared_mutex> lock(client_mu_);
+        if (!shutdown_.load()) results = client_->BatchPrefetch(record->keys, options);
+      }
+
+      const size_t completed =
+          static_cast<size_t>(std::count(results.begin(), results.end(), true));
+      std::lock_guard<std::mutex> lock(prefetch_mu_);
+      record->results = std::move(results);
+      record->finished_at = std::chrono::steady_clock::now();
+      if (record->finished_at >= record->deadline) {
+        record->state = ::umbp::PREFETCH_STATE_EXPIRED;
+        record->error = "prefetch completed after its deadline";
+      } else if (completed == record->keys.size()) {
+        record->state = ::umbp::PREFETCH_STATE_READY;
+      } else if (completed != 0) {
+        record->state = ::umbp::PREFETCH_STATE_PARTIAL;
+      } else {
+        record->state = ::umbp::PREFETCH_STATE_FAILED;
+        record->error = "no requested key became locally resident";
+      }
+    }
+  }
+
+  void StopPrefetchWorker() {
+    {
+      std::lock_guard<std::mutex> lock(prefetch_mu_);
+      prefetch_stop_ = true;
+      const auto now = std::chrono::steady_clock::now();
+      for (const auto& record : prefetch_queue_) {
+        record->state = ::umbp::PREFETCH_STATE_EXPIRED;
+        record->error = "server shut down before prefetch execution";
+        record->finished_at = now;
+      }
+      prefetch_queue_.clear();
+    }
+    prefetch_cv_.notify_all();
+    if (prefetch_worker_.joinable()) prefetch_worker_.join();
+  }
+
+  void PrunePrefetchRequestsLocked(std::chrono::steady_clock::time_point now) {
+    for (auto it = prefetch_requests_.begin(); it != prefetch_requests_.end();) {
+      const auto state = it->second->state;
+      const bool terminal =
+          state == ::umbp::PREFETCH_STATE_READY || state == ::umbp::PREFETCH_STATE_PARTIAL ||
+          state == ::umbp::PREFETCH_STATE_FAILED || state == ::umbp::PREFETCH_STATE_EXPIRED;
+      if (terminal && it->second->finished_at != std::chrono::steady_clock::time_point{} &&
+          now - it->second->finished_at >= kAsyncPrefetchRetention) {
+        it = prefetch_requests_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
 
   bool BackendIsDistributed() const {
     return client_ && client_->GetDeploymentMode() == UMBPDeploymentMode::Distributed;
@@ -1636,6 +1875,14 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
 
   KeyHandleTable key_handles_;
   KeyHandleStats key_handle_stats_;
+
+  std::mutex prefetch_mu_;
+  std::condition_variable prefetch_cv_;
+  std::deque<std::shared_ptr<AsyncPrefetchRecord>> prefetch_queue_;
+  std::unordered_map<std::string, std::shared_ptr<AsyncPrefetchRecord>> prefetch_requests_;
+  std::thread prefetch_worker_;
+  bool prefetch_stop_ = false;
+  std::atomic<uint64_t> next_prefetch_request_id_{1};
 
   std::atomic<bool> fd_running_{false};
   int listen_fd_ = -1;
