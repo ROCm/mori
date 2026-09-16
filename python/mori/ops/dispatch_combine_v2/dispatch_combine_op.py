@@ -63,7 +63,11 @@ WAVE = detect_wave_size()
 # Where each backend lives. Imported lazily, on selection only.
 _BACKEND_MODULES = {"flydsl": "flydsl_backend", "hip": "hip_backend"}
 
-DEFAULT_BACKEND = "flydsl"
+
+def _default_backend() -> str:
+    from mori.ops.dispatch_combine import _is_gfx125x
+
+    return "hip" if _is_gfx125x() else "flydsl"
 
 
 _QUANT_TYPES = ("none", "fp8_direct_cast", "fp8_blockwise")
@@ -356,7 +360,7 @@ class EpDispatchCombineConfig:
             backend = (
                 self.kernel_backend
                 or os.environ.get("MORI_V2_KERNEL_BACKEND")
-                or DEFAULT_BACKEND
+                or _default_backend()
             )
             if backend == "hip":
                 from .hip_tuning_configs import lookup
@@ -712,7 +716,7 @@ class EpDispatchCombineOp:
             name = (
                 getattr(cfg, "kernel_backend", None)
                 or os.environ.get("MORI_V2_KERNEL_BACKEND")
-                or DEFAULT_BACKEND
+                or _default_backend()
             )
             cls = EpDispatchCombineOp._resolve_backend(name)
         return super().__new__(cls)
