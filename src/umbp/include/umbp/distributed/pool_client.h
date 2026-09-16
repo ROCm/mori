@@ -44,6 +44,7 @@
 #include "umbp/distributed/master/master_client.h"
 #include "umbp/distributed/metrics/component_metrics.h"
 #include "umbp/distributed/peer/backend/medium_backend.h"
+#include "umbp/distributed/peer/batch_resolve_codec.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
 #include "umbp/distributed/types.h"
 #include "umbp_peer.grpc.pb.h"
@@ -191,6 +192,50 @@ class PoolClient {
                                    const std::vector<std::vector<const void*>>& srcs,
                                    const std::vector<std::vector<size_t>>& sizes,
                                    const std::vector<std::vector<size_t>>& dst_offsets);
+
+  // ---------------------------------------------------------------------------
+  //  Ranged-get groups
+  // ---------------------------------------------------------------------------
+  //
+  // A layer-wise KV cache restore issues several BatchGetRanges calls in a row
+  // against the SAME key set -- one per layer group, differing only in which
+  // bytes of each key it wants.  On the remote path every one of those calls
+  // re-resolves the key set (a BatchResolveKeys RPC + decode) even though the
+  // resolve does not depend on which bytes are requested; only the transfer
+  // that follows does.
+  //
+  // A group makes the reuse explicit instead of guessing it from a cache: the
+  // caller declares the key set once (BeginRangedGetGroup), issues its
+  // BatchGetRanges calls exactly as before, then declares it done
+  // (EndRangedGetGroup).  PrepareRemoteGetEntries skips the resolve RPC for
+  // whichever of those keys the open group already resolved, as long as it is
+  // still inside the read lease the peer granted it (UMBP_DRAM_READ_LEASE_MS,
+  // default 500ms); once that window has passed, the next call transparently
+  // re-resolves and refreshes the group -- the caller sees no difference
+  // either way beyond which one paid the RPC.
+  //
+  // Correctness is bounded by the caller's own declared scope, not by a
+  // capacity-limited cache guessing which key sets are still wanted: nothing
+  // is kept beyond EndRangedGetGroup, and a key never named to Begin is never
+  // cached at all.
+
+  // Resolves `keys` once against whichever peer serves all of them and holds
+  // the result until EndRangedGetGroup.  Requires every key to route to the
+  // SAME peer (true in practice for one pool's keys); returns false and opens
+  // nothing otherwise, so the caller's BatchGetRanges calls simply resolve
+  // normally, exactly as if no group had been requested.
+  bool BeginRangedGetGroup(const std::vector<std::string>& keys);
+
+  // Drops whatever BeginRangedGetGroup cached for `keys`. Safe to call even if
+  // Begin returned false or was never called.
+  void EndRangedGetGroup(const std::vector<std::string>& keys);
+
+  // How many times this client has issued a live BatchResolveKeys RPC (from
+  // BeginRangedGetGroup or from PrepareRemoteGetEntries falling back because no
+  // open group covered the keys). A plain atomic counter rather than a gated
+  // debug metric: it is cheap enough to always keep on, and a group's whole
+  // value proposition is that this stops moving while it is open.
+  uint64_t RemoteResolveRpcCount() const { return remote_resolve_rpc_count_.load(); }
 
   // Cluster-wide existence check — issues a RouteGet and reports
   // whether master surfaced any replica.  No RDMA, no lease bump.
@@ -943,6 +988,35 @@ class PoolClient {
                                std::vector<TransferItem>* items);
   void FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries, std::vector<bool>* results,
                                 bool recache_remote);
+
+  // ---- ranged-get group cache (BeginRangedGetGroup / EndRangedGetGroup) ----
+
+  // One key's resolve, pinned by an open group.  `resolved_at` is measured
+  // against DramReadLeaseTtl(), not a TTL of the cache's own invention -- see
+  // the header comment on BeginRangedGetGroup.
+  struct RangedGetGroupEntry {
+    DecodedResolveKey resolved;
+    std::chrono::steady_clock::time_point resolved_at;
+  };
+  struct RangedGetGroupPeerCache {
+    uint64_t page_size = 0;
+    std::unordered_map<std::string, RangedGetGroupEntry> keys;
+  };
+  std::mutex ranged_get_group_mutex_;
+  std::unordered_map<std::string, RangedGetGroupPeerCache> ranged_get_group_cache_;
+  std::atomic<uint64_t> remote_resolve_rpc_count_{0};
+
+  // Builds a decoded resolve parallel to `items` straight from the group
+  // cache, iff every item's key is pinned there and still inside its lease.
+  // nullopt means at least one key is not (fully or partly) covered by an open
+  // group -- the caller falls back to the normal resolve RPC.
+  std::optional<DecodedBatchResolve> TryReuseRangedGetGroup(const std::string& node_id,
+                                                            const std::vector<BatchGetItem>& items);
+  // Writes a fresh resolve back into whichever of `items`' keys an open group
+  // already pins for `node_id`.  A key never named to BeginRangedGetGroup is
+  // left untouched, so this never grows the cache on its own.
+  void RefreshRangedGetGroup(const std::string& node_id, const std::vector<BatchGetItem>& items,
+                             const DecodedBatchResolve& decoded);
 
   // One posted-but-not-yet-waited remote read for a single peer; the scheduler
   // waits it later.  The lifetime contract that used to live here — statuses
