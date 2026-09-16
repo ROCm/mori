@@ -42,6 +42,7 @@
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/device_copy.h"
+#include "umbp/common/env_time.h"
 #include "umbp/common/grpc_limits.h"
 #include "umbp/common/range_utils.h"
 #include "umbp/local/host_mem_allocator.h"
@@ -75,6 +76,46 @@ uint64_t FingerprintKeys(const std::vector<std::string>& keys) {
     for (char c : key) mix(static_cast<unsigned char>(c));
   }
   return hash == 0 ? kPrime : hash;
+}
+
+// Every data-plane RPC below used to construct a bare grpc::ClientContext with
+// no deadline, so a server-side stall (observed: BatchExists never returning
+// under real long-context load, standalone_server.cpp handler wedged) blocked
+// the calling scheduler rank forever with no way out. 10s is generous relative
+// to the sub-second round trips these calls normally take, including a
+// BatchExists/BatchGetRanges covering a long context's full page list; a
+// caller that hits this deadline sees the same grpc::Status as a genuine RPC
+// failure (already handled as "not found" / no-op, not an exception).
+int DataPlaneRpcTimeoutMs() {
+  static const int v = static_cast<int>(GetEnvMilliseconds("UMBP_DATA_PLANE_RPC_TIMEOUT_MS",
+                                                           std::chrono::milliseconds(10000),
+                                                           /*min_allowed=*/1)
+                                            .count());
+  return v;
+}
+
+void ArmDataPlaneDeadline(grpc::ClientContext& ctx) {
+  ctx.set_deadline(std::chrono::system_clock::now() +
+                   std::chrono::milliseconds(DataPlaneRpcTimeoutMs()));
+}
+
+// RegisterMemory is not a routine data-plane call: it is a one-time-per-buffer
+// setup RPC that can legitimately take 90-120+ seconds (observed directly:
+// "[DRAMTier] host memory registered for GPU access: 1187840 MiB in 599.6 s"
+// for the bulk step, plus sequential per-GPU IPC handle registration each
+// well over a minute), so it needs its own, longer deadline rather than
+// DataPlaneRpcTimeoutMs()'s 10s.
+int RegisterMemoryRpcTimeoutMs() {
+  static const int v = static_cast<int>(GetEnvMilliseconds("UMBP_REGISTER_MEMORY_RPC_TIMEOUT_MS",
+                                                           std::chrono::milliseconds(180000),
+                                                           /*min_allowed=*/1)
+                                            .count());
+  return v;
+}
+
+void ArmRegisterMemoryDeadline(grpc::ClientContext& ctx) {
+  ctx.set_deadline(std::chrono::system_clock::now() +
+                   std::chrono::milliseconds(RegisterMemoryRpcTimeoutMs()));
 }
 
 ::umbp::TierType TierToProto(TierType tier) {
@@ -321,6 +362,7 @@ bool StandaloneProcessClient::Put(const std::string& key, uintptr_t src, size_t 
   uint64_t region_base = 0;
   if (!OffsetFor(src, size, &offset, &region_base)) return false;
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::PutRequest req;
   req.set_key(key);
   req.set_client_id(ClientId());
@@ -340,6 +382,7 @@ bool StandaloneProcessClient::Get(const std::string& key, uintptr_t dst, size_t 
   uint64_t region_base = 0;
   if (!OffsetFor(dst, size, &offset, &region_base)) return false;
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::GetRequest req;
   req.set_key(key);
   req.set_client_id(ClientId());
@@ -356,6 +399,7 @@ bool StandaloneProcessClient::Exists(const std::string& key) const {
   std::shared_lock lk(op_mutex_);
   if (closed_) return false;
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::KeyRequest req;
   req.set_key(key);
   ::umbp::BoolResponse resp;
@@ -385,6 +429,7 @@ std::vector<bool> StandaloneProcessClient::BatchPut(const std::vector<std::strin
     req.add_sizes(sizes[i]);
   }
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::BatchBoolResponse resp;
   grpc::Status status = stub_->BatchPut(&ctx, req, &resp);
   if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) {
@@ -417,6 +462,7 @@ std::vector<bool> StandaloneProcessClient::BatchPutWithDepth(const std::vector<s
     req.add_depths(i < depths.size() ? depths[i] : -1);
   }
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::BatchBoolResponse resp;
   grpc::Status status = stub_->BatchPutWithDepth(&ctx, req, &resp);
   if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) {
@@ -447,6 +493,7 @@ std::vector<bool> StandaloneProcessClient::BatchGet(const std::vector<std::strin
     req.add_sizes(sizes[i]);
   }
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::BatchBoolResponse resp;
   grpc::Status status = stub_->BatchGet(&ctx, req, &resp);
   if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) {
@@ -579,6 +626,7 @@ std::vector<bool> StandaloneProcessClient::BatchGetRanges(
     }
 
     grpc::ClientContext ctx;
+    ArmDataPlaneDeadline(ctx);
     ::umbp::BatchBoolResponse resp;
     const grpc::Status status = stub_->BatchGetRanges(&ctx, req, &resp);
     if (!status.ok()) return failed;
@@ -628,6 +676,7 @@ std::vector<bool> StandaloneProcessClient::BatchPutRanges(
   }
 
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::BatchBoolResponse resp;
   const grpc::Status status = stub_->BatchPutRanges(&ctx, req, &resp);
   if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) return failed;
@@ -639,6 +688,7 @@ std::vector<bool> StandaloneProcessClient::BatchExists(const std::vector<std::st
   std::shared_lock lk(op_mutex_);
   if (closed_) return std::vector<bool>(keys.size(), false);
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::BatchKeysRequest req;
   for (const auto& key : keys) req.add_keys(key);
   ::umbp::BatchBoolResponse resp;
@@ -654,6 +704,7 @@ size_t StandaloneProcessClient::BatchExistsConsecutive(const std::vector<std::st
   std::shared_lock lk(op_mutex_);
   if (closed_) return 0;
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::BatchKeysRequest req;
   for (const auto& key : keys) req.add_keys(key);
   ::umbp::CountResponse resp;
@@ -666,6 +717,7 @@ bool StandaloneProcessClient::Clear() {
   std::unique_lock lk(op_mutex_);
   if (closed_) return true;
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::Empty req;
   ::umbp::BoolResponse resp;
   grpc::Status status = stub_->Clear(&ctx, req, &resp);
@@ -677,6 +729,7 @@ bool StandaloneProcessClient::Flush() {
   std::shared_lock lk(op_mutex_);
   if (closed_) return true;
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::Empty req;
   ::umbp::BoolResponse resp;
   grpc::Status status = stub_->Flush(&ctx, req, &resp);
@@ -784,6 +837,7 @@ bool StandaloneProcessClient::RegisterDeviceMemory(uintptr_t ptr, size_t size, i
   req.set_alloc_base(allocation_address);
 
   grpc::ClientContext ctx;
+  ArmRegisterMemoryDeadline(ctx);
   ::umbp::BoolResponse resp;
   const grpc::Status rpc_status = stub_->RegisterMemory(&ctx, req, &resp);
   if (!rpc_status.ok() || !resp.ok()) {
@@ -823,6 +877,7 @@ bool StandaloneProcessClient::RegisterHostShmMemory(uintptr_t ptr, size_t size) 
     }
 
     grpc::ClientContext ctx;
+    ArmRegisterMemoryDeadline(ctx);
     ::umbp::RegisterMemoryRequest req;
     req.set_client_id(client_id);
     req.set_worker_base(reinterpret_cast<uintptr_t>(allocation->base));
@@ -872,6 +927,7 @@ void StandaloneProcessClient::DeregisterMemoryLocked() {
   // One RPC tears down all of this client's regions server-side (UnmapClient),
   // so a single DeregisterMemory call covers every region.
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::DeregisterMemoryRequest req;
   req.set_client_id(client_id);
   ::umbp::Empty resp;
@@ -902,6 +958,7 @@ void StandaloneProcessClient::DeregisterMemory(uintptr_t /*ptr*/) {
 bool StandaloneProcessClient::ReportExternalKvBlocks(const std::vector<std::string>& hashes,
                                                      TierType tier) {
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::StandaloneExternalKvMutationRequest req;
   for (const auto& hash : hashes) req.add_hashes(hash);
   req.set_tier(TierToProto(tier));
@@ -914,6 +971,7 @@ bool StandaloneProcessClient::ReportExternalKvBlocks(const std::vector<std::stri
 bool StandaloneProcessClient::RevokeExternalKvBlocks(const std::vector<std::string>& hashes,
                                                      TierType tier) {
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::StandaloneExternalKvMutationRequest req;
   for (const auto& hash : hashes) req.add_hashes(hash);
   req.set_tier(TierToProto(tier));
@@ -925,6 +983,7 @@ bool StandaloneProcessClient::RevokeExternalKvBlocks(const std::vector<std::stri
 
 bool StandaloneProcessClient::RevokeAllExternalKvBlocksAtTier(TierType tier) {
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::StandaloneExternalKvTierRequest req;
   req.set_tier(TierToProto(tier));
   req.set_client_id(ClientId());
@@ -936,6 +995,7 @@ bool StandaloneProcessClient::RevokeAllExternalKvBlocksAtTier(TierType tier) {
 std::vector<IUMBPClient::ExternalKvMatch> StandaloneProcessClient::MatchExternalKv(
     const std::vector<std::string>& hashes, bool count_as_hit) {
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::StandaloneMatchExternalKvRequest req;
   for (const auto& hash : hashes) req.add_hashes(hash);
   req.set_count_as_hit(count_as_hit);
@@ -962,6 +1022,7 @@ std::vector<IUMBPClient::ExternalKvMatch> StandaloneProcessClient::MatchExternal
 std::vector<IUMBPClient::ExternalKvHitCountEntry> StandaloneProcessClient::GetExternalKvHitCounts(
     const std::vector<std::string>& hashes) {
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::StandaloneExternalKvHitCountsRequest req;
   for (const auto& hash : hashes) req.add_hashes(hash);
   req.set_client_id(ClientId());
