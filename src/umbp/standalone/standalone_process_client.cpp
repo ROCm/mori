@@ -118,6 +118,20 @@ void ArmRegisterMemoryDeadline(grpc::ClientContext& ctx) {
                    std::chrono::milliseconds(RegisterMemoryRpcTimeoutMs()));
 }
 
+// Every routine data-plane call below degrades a non-OK grpc::Status to the
+// same "not found" / no-op return the caller already uses for a genuine miss,
+// so a deadline firing was previously silent -- indistinguishable, from the
+// logs, from the key really not being there. Log it, so DEADLINE_EXCEEDED
+// (the two ArmXxxDeadline() calls above are the only source of it here) reads
+// as what it is instead of vanishing into an unremarkable hit-rate dip.
+void LogDataPlaneRpcFailure(const char* call, const grpc::Status& status) {
+  if (status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED) {
+    MORI_UMBP_WARN("[StandaloneProcessClient] {} timed out: {}", call, status.error_message());
+  } else {
+    MORI_UMBP_WARN("[StandaloneProcessClient] {} failed: {}", call, status.error_message());
+  }
+}
+
 ::umbp::TierType TierToProto(TierType tier) {
   switch (tier) {
     case TierType::HBM:
@@ -371,7 +385,11 @@ bool StandaloneProcessClient::Put(const std::string& key, uintptr_t src, size_t 
   req.set_region_base(region_base);
   ::umbp::BoolResponse resp;
   grpc::Status status = stub_->Put(&ctx, req, &resp);
-  return status.ok() && resp.ok();
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("Put", status);
+    return false;
+  }
+  return resp.ok();
 }
 
 bool StandaloneProcessClient::Get(const std::string& key, uintptr_t dst, size_t size) {
@@ -391,7 +409,11 @@ bool StandaloneProcessClient::Get(const std::string& key, uintptr_t dst, size_t 
   req.set_region_base(region_base);
   ::umbp::BoolResponse resp;
   grpc::Status status = stub_->Get(&ctx, req, &resp);
-  return status.ok() && resp.ok();
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("Get", status);
+    return false;
+  }
+  return resp.ok();
 }
 
 bool StandaloneProcessClient::Exists(const std::string& key) const {
@@ -404,7 +426,11 @@ bool StandaloneProcessClient::Exists(const std::string& key) const {
   req.set_key(key);
   ::umbp::BoolResponse resp;
   grpc::Status status = stub_->Exists(&ctx, req, &resp);
-  return status.ok() && resp.ok();
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("Exists", status);
+    return false;
+  }
+  return resp.ok();
 }
 
 std::vector<bool> StandaloneProcessClient::BatchPut(const std::vector<std::string>& keys,
@@ -432,7 +458,11 @@ std::vector<bool> StandaloneProcessClient::BatchPut(const std::vector<std::strin
   ArmDataPlaneDeadline(ctx);
   ::umbp::BatchBoolResponse resp;
   grpc::Status status = stub_->BatchPut(&ctx, req, &resp);
-  if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) {
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("BatchPut", status);
+    return std::vector<bool>(keys.size(), false);
+  }
+  if (resp.ok_size() != static_cast<int>(keys.size())) {
     return std::vector<bool>(keys.size(), false);
   }
   return std::vector<bool>(resp.ok().begin(), resp.ok().end());
@@ -465,7 +495,11 @@ std::vector<bool> StandaloneProcessClient::BatchPutWithDepth(const std::vector<s
   ArmDataPlaneDeadline(ctx);
   ::umbp::BatchBoolResponse resp;
   grpc::Status status = stub_->BatchPutWithDepth(&ctx, req, &resp);
-  if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) {
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("BatchPutWithDepth", status);
+    return std::vector<bool>(keys.size(), false);
+  }
+  if (resp.ok_size() != static_cast<int>(keys.size())) {
     return std::vector<bool>(keys.size(), false);
   }
   return std::vector<bool>(resp.ok().begin(), resp.ok().end());
@@ -496,7 +530,11 @@ std::vector<bool> StandaloneProcessClient::BatchGet(const std::vector<std::strin
   ArmDataPlaneDeadline(ctx);
   ::umbp::BatchBoolResponse resp;
   grpc::Status status = stub_->BatchGet(&ctx, req, &resp);
-  if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) {
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("BatchGet", status);
+    return std::vector<bool>(keys.size(), false);
+  }
+  if (resp.ok_size() != static_cast<int>(keys.size())) {
     return std::vector<bool>(keys.size(), false);
   }
   return std::vector<bool>(resp.ok().begin(), resp.ok().end());
@@ -629,7 +667,10 @@ std::vector<bool> StandaloneProcessClient::BatchGetRanges(
     ArmDataPlaneDeadline(ctx);
     ::umbp::BatchBoolResponse resp;
     const grpc::Status status = stub_->BatchGetRanges(&ctx, req, &resp);
-    if (!status.ok()) return failed;
+    if (!status.ok()) {
+      LogDataPlaneRpcFailure("BatchGetRanges", status);
+      return failed;
+    }
     if (resp.key_handle_unknown()) {
       ForgetKeyHandle(handle);
       handle = 0;
@@ -679,7 +720,11 @@ std::vector<bool> StandaloneProcessClient::BatchPutRanges(
   ArmDataPlaneDeadline(ctx);
   ::umbp::BatchBoolResponse resp;
   const grpc::Status status = stub_->BatchPutRanges(&ctx, req, &resp);
-  if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) return failed;
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("BatchPutRanges", status);
+    return failed;
+  }
+  if (resp.ok_size() != static_cast<int>(keys.size())) return failed;
   return std::vector<bool>(resp.ok().begin(), resp.ok().end());
 }
 
@@ -693,7 +738,11 @@ std::vector<bool> StandaloneProcessClient::BatchExists(const std::vector<std::st
   for (const auto& key : keys) req.add_keys(key);
   ::umbp::BatchBoolResponse resp;
   grpc::Status status = stub_->BatchExists(&ctx, req, &resp);
-  if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) {
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("BatchExists", status);
+    return std::vector<bool>(keys.size(), false);
+  }
+  if (resp.ok_size() != static_cast<int>(keys.size())) {
     return std::vector<bool>(keys.size(), false);
   }
   return std::vector<bool>(resp.ok().begin(), resp.ok().end());
@@ -709,7 +758,11 @@ size_t StandaloneProcessClient::BatchExistsConsecutive(const std::vector<std::st
   for (const auto& key : keys) req.add_keys(key);
   ::umbp::CountResponse resp;
   grpc::Status status = stub_->BatchExistsConsecutive(&ctx, req, &resp);
-  return status.ok() ? static_cast<size_t>(resp.count()) : 0;
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("BatchExistsConsecutive", status);
+    return 0;
+  }
+  return static_cast<size_t>(resp.count());
 }
 
 bool StandaloneProcessClient::Clear() {
@@ -721,7 +774,11 @@ bool StandaloneProcessClient::Clear() {
   ::umbp::Empty req;
   ::umbp::BoolResponse resp;
   grpc::Status status = stub_->Clear(&ctx, req, &resp);
-  return status.ok() && resp.ok();
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("Clear", status);
+    return false;
+  }
+  return resp.ok();
 }
 
 bool StandaloneProcessClient::Flush() {
@@ -733,7 +790,11 @@ bool StandaloneProcessClient::Flush() {
   ::umbp::Empty req;
   ::umbp::BoolResponse resp;
   grpc::Status status = stub_->Flush(&ctx, req, &resp);
-  return status.ok() && resp.ok();
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("Flush", status);
+    return false;
+  }
+  return resp.ok();
 }
 
 void StandaloneProcessClient::Close() {
@@ -965,7 +1026,11 @@ bool StandaloneProcessClient::ReportExternalKvBlocks(const std::vector<std::stri
   req.set_client_id(ClientId());
   ::umbp::BoolResponse resp;
   grpc::Status status = stub_->ReportExternalKvBlocks(&ctx, req, &resp);
-  return status.ok() && resp.ok();
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("ReportExternalKvBlocks", status);
+    return false;
+  }
+  return resp.ok();
 }
 
 bool StandaloneProcessClient::RevokeExternalKvBlocks(const std::vector<std::string>& hashes,
@@ -978,7 +1043,11 @@ bool StandaloneProcessClient::RevokeExternalKvBlocks(const std::vector<std::stri
   req.set_client_id(ClientId());
   ::umbp::BoolResponse resp;
   grpc::Status status = stub_->RevokeExternalKvBlocks(&ctx, req, &resp);
-  return status.ok() && resp.ok();
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("RevokeExternalKvBlocks", status);
+    return false;
+  }
+  return resp.ok();
 }
 
 bool StandaloneProcessClient::RevokeAllExternalKvBlocksAtTier(TierType tier) {
@@ -989,7 +1058,11 @@ bool StandaloneProcessClient::RevokeAllExternalKvBlocksAtTier(TierType tier) {
   req.set_client_id(ClientId());
   ::umbp::BoolResponse resp;
   grpc::Status status = stub_->RevokeAllExternalKvBlocksAtTier(&ctx, req, &resp);
-  return status.ok() && resp.ok();
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("RevokeAllExternalKvBlocksAtTier", status);
+    return false;
+  }
+  return resp.ok();
 }
 
 std::vector<IUMBPClient::ExternalKvMatch> StandaloneProcessClient::MatchExternalKv(
@@ -1002,7 +1075,10 @@ std::vector<IUMBPClient::ExternalKvMatch> StandaloneProcessClient::MatchExternal
   req.set_client_id(ClientId());
   ::umbp::StandaloneMatchExternalKvResponse resp;
   grpc::Status status = stub_->MatchExternalKv(&ctx, req, &resp);
-  if (!status.ok()) return {};
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("MatchExternalKv", status);
+    return {};
+  }
 
   std::vector<IUMBPClient::ExternalKvMatch> out;
   out.reserve(resp.matches_size());
@@ -1028,7 +1104,10 @@ std::vector<IUMBPClient::ExternalKvHitCountEntry> StandaloneProcessClient::GetEx
   req.set_client_id(ClientId());
   ::umbp::StandaloneExternalKvHitCountsResponse resp;
   grpc::Status status = stub_->GetExternalKvHitCounts(&ctx, req, &resp);
-  if (!status.ok()) return {};
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("GetExternalKvHitCounts", status);
+    return {};
+  }
   std::vector<IUMBPClient::ExternalKvHitCountEntry> out;
   out.reserve(resp.entries_size());
   for (const auto& e : resp.entries()) {
