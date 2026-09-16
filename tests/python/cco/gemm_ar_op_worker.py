@@ -205,7 +205,53 @@ def case_alternating_m(op, rank, world, m_small, m_large, n, k):
                     (seen.float() - stale.float()).abs().max()
                 )
             results[f"{label}_rows"] = rep
-    _emit(rank, case="alternating_m", **results)
+    _emit(
+        rank,
+        case=f"alternating_m_{m_small}_{m_large}",
+        **results,
+    )
+
+
+def case_self_test(op, rank, world, n, k):
+    """self_test must pass on a working stack, and its check must have teeth.
+
+    The second half matters more than the first: a check that cannot fail is
+    exactly what let a whole end-to-end campaign run against a mori whose SDMA
+    puts were compiled out.
+    """
+    op.self_test()
+    ok = True
+    # Now break it the way a dead transport would: run `reduce -> gather` with no
+    # scatter, which is what an inert put amounts to.
+    #
+    # The landing slots have to be zeroed first, and that is not a detail. This
+    # op has already served several cases, so the slots still hold a previous
+    # call's peer data -- reducing that produces a plausible sum and the check
+    # passes, which is the same stale-read effect that made an inert transport
+    # look correct in the first place. Without this the teeth test has none.
+    from mori.tensor_utils import from_gpu_ptr
+
+    cfg = op._make_cfg(op.m_max)
+    from_gpu_ptr(op.mem.ptr + cfg.recv_off, (cfg.recv_bytes,), torch.uint8).zero_()
+    plan = op._compiled(op.m_max)
+    plan.input.fill_(float(rank + 1))
+    plan.output.zero_()
+    import flydsl.expr as _fx
+
+    stream = _fx.Stream(torch.cuda.current_stream())
+    for name in plan.parts["order"]:
+        if name == "scatter":
+            continue
+        plan.parts[name](op.dev_comm.ptr, op.win.handle, stream=stream)
+    torch.cuda.current_stream().synchronize()
+    want = world * (world + 1) / 2
+    detected = bool((plan.output.float() - want).abs().max().item() / want > 1e-2)
+    _emit(
+        rank,
+        case="self_test",
+        passes_on_working_stack=ok,
+        detects_missing_scatter=detected,
+    )
 
 
 def case_close_is_idempotent(comm, rank, n, k, m_max):
@@ -246,6 +292,43 @@ def case_changing_data(op, rank, world, m, n, k, calls):
     _emit(rank, case="changing_data", **out)
 
 
+#: Every case this worker knows, and the operands each wants, so the whole file
+#: can be served by one spawn.
+#:
+#: Six separate 2-rank launches is what it cost before, and the queues do not
+#: recycle that fast: back-to-back 8-rank jobs fail in hsaKmtCreateQueueExt
+#: (anvil.cpp:237), and the ones that fell over were as often the *neighbouring*
+#: file's as this one's. One process, one communicator, every case.
+ALL_CASES = [
+    ("scale_order", {"m": 512}),
+    ("alternating_m", {"m_small": 512, "m_large": 1024}),
+    ("alternating_m", {"m_small": 2048, "m_large": 4096}),
+    ("changing_data", {"m": 512, "calls": 5}),
+    ("self_test", {"m": 1024}),
+]
+
+
+def run_all(comm, rank, world, n, k):
+    """Every case in one process, sharing one communicator.
+
+    m_max covers the largest M any case asks for, so one op serves them all --
+    which is also closer to how a server uses it than a fresh op per shape.
+    """
+    m_max = max(max(kw.get("m", 0), kw.get("m_large", 0)) for _, kw in ALL_CASES)
+    with GemmAllReduceOp(comm, n=n, k=k, m_max=m_max) as op:
+        for case, kw in ALL_CASES:
+            if case == "scale_order":
+                case_scale_order(op, rank, world, kw["m"], n, k)
+            elif case == "alternating_m":
+                case_alternating_m(op, rank, world, kw["m_small"], kw["m_large"], n, k)
+            elif case == "changing_data":
+                case_changing_data(op, rank, world, kw["m"], n, k, kw["calls"])
+            elif case == "self_test":
+                case_self_test(op, rank, world, n, k)
+    # close() needs its own ops, so it comes after the shared one is released.
+    case_close_is_idempotent(comm, rank, n, k, 512)
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--case", required=True)
@@ -258,17 +341,26 @@ def main() -> int:
     args = p.parse_args()
 
     rank, world, uid = _setup()
-    m_max = max(args.m, args.m_large, args.m_small)
+    if args.case == "all":
+        # The cases carry their own shapes; the command line has none.
+        m_max = max(max(kw.get("m", 0), kw.get("m_large", 0)) for _, kw in ALL_CASES)
+    else:
+        m_max = max(args.m, args.m_large, args.m_small)
     vmm = 2 * GemmAllReduceOp.window_bytes_for(world, m_max=m_max, n=args.n) + (
         256 << 20
     )
     with Communicator.init(world, rank, uid, per_rank_vmm=vmm) as comm:
+        if args.case == "all":
+            run_all(comm, rank, world, args.n, args.k)
+            return 0
         if args.case == "close":
             case_close_is_idempotent(comm, rank, args.n, args.k, m_max)
             return 0
         with GemmAllReduceOp(comm, n=args.n, k=args.k, m_max=m_max) as op:
             if args.case == "scale_order":
                 case_scale_order(op, rank, world, args.m, args.n, args.k)
+            elif args.case == "self_test":
+                case_self_test(op, rank, world, args.n, args.k)
             elif args.case == "changing_data":
                 case_changing_data(op, rank, world, args.m, args.n, args.k, args.calls)
             elif args.case == "alternating_m":

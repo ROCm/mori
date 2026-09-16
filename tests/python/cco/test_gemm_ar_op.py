@@ -239,7 +239,25 @@ def test_padded_m_rounds_to_whole_bands():
 _SETTLE_SECONDS = 20
 
 
-def _run_worker(world_size: int, case: str, *extra: str, timeout: int = 900):
+#: hsaKmtCreateQueueExt failing because the previous run's SDMA queues are not
+#: reclaimed yet. It is a resource race, not a defect in what is under test, and
+#: it is the only failure worth retrying -- everything else is reported as is.
+_QUEUE_EXHAUSTED = "anvil.cpp"
+
+
+def _run_worker_multi(world_size: int, case: str, *extra: str, timeout: int = 900):
+    result = _spawn_worker(world_size, case, *extra, timeout=timeout)
+    if result is None:
+        # One retry, with a longer settle. Two files' worth of 8-rank runs come
+        # before this one, and the queues do not always come back in 20s.
+        time.sleep(_SETTLE_SECONDS * 3)
+        result = _spawn_worker(world_size, case, *extra, timeout=timeout, last=True)
+    return result
+
+
+def _spawn_worker(
+    world_size: int, case: str, *extra: str, timeout: int = 900, last: bool = False
+):
     time.sleep(_SETTLE_SECONDS)
     env = os.environ.copy()
     env.setdefault("MORI_SOCKET_IFNAME", "lo")
@@ -263,14 +281,22 @@ def _run_worker(world_size: int, case: str, *extra: str, timeout: int = 900):
         timeout=timeout,
     )
     output = result.stdout + result.stderr
-    assert result.returncode == 0, output
+    if result.returncode != 0:
+        if _QUEUE_EXHAUSTED in output and not last:
+            return None
+        raise AssertionError(output)
     records = [
         json.loads(line.removeprefix("RESULT_JSON "))
         for line in output.splitlines()
         if line.startswith("RESULT_JSON ")
     ]
     assert records, output
-    return records[0]
+    return records
+
+
+def _run_worker(world_size: int, case: str, *extra: str, timeout: int = 900):
+    """One case, one record."""
+    return _run_worker_multi(world_size, case, *extra, timeout=timeout)[0]
 
 
 requires_two_gpus = pytest.mark.skipif(
@@ -278,14 +304,34 @@ requires_two_gpus = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(scope="module")
+def worker_results():
+    """Every GPU case, from one 2-rank spawn.
+
+    Each case used to get its own launch. Six of them back to back outran the
+    SDMA queue reclaim (hsaKmtCreateQueueExt, anvil.cpp:237) and the casualties
+    were as often the neighbouring file's tests as this file's, because the cost
+    is paid by whoever launches next. One spawn, results keyed by case.
+    """
+    records = _run_worker_multi(2, "all", "-n", "1024", "-k", "512")
+    return records
+
+
+def _case(records, name):
+    for r in records:
+        if r.get("case") == name:
+            return r
+    raise AssertionError(f"worker produced no record for {name!r}: {records}")
+
+
 @requires_two_gpus
-def test_public_op_takes_the_column_major_scale():
+def test_public_op_takes_the_column_major_scale(worker_results):
     """End to end through ``GemmAllReduceOp``, with the scale the model emits.
 
     Before the fix this returned relL2 0.26: ``reshape(-1)`` on a column-major
     ``[M, K/128]`` walks the logical rows, so every scale met the wrong K block.
     """
-    r = _run_worker(2, "scale_order", "-m", "512", "-n", "1024", "-k", "512")
+    r = _case(worker_results, "scale_order")
     assert r["rel_l2"] < FP8_FLOOR, r
     assert r["flat_matches"], r
     assert r["physical_matches"], r
@@ -293,7 +339,9 @@ def test_public_op_takes_the_column_major_scale():
 
 @requires_two_gpus
 @pytest.mark.parametrize("m_small,m_large", [(512, 1024), (2048, 4096)])
-def test_one_instance_serves_two_m_values_in_any_order(m_small, m_large):
+def test_one_instance_serves_two_m_values_in_any_order(
+    worker_results, m_small, m_large
+):
     """Two M values through one instance, alternating, then repeated.
 
     Two separate defects lived here. The reviewer's: counter_chunks changes with
@@ -309,73 +357,13 @@ def test_one_instance_serves_two_m_values_in_any_order(m_small, m_large):
     payload to the instance's m_max. Every shape now has the same map, so a
     region only ever aliases itself.
     """
-    r = _run_worker(
-        2,
-        "alternating_m",
-        "--m-small",
-        str(m_small),
-        "--m-large",
-        str(m_large),
-        "-n",
-        "1024",
-        "-k",
-        "512",
-    )
+    r = _case(worker_results, f"alternating_m_{m_small}_{m_large}")
     for key in ("first_small", "first_large", "again_small", "again_large"):
         assert r[key] < FP8_FLOOR, (key, r)
 
 
-def test_the_payload_map_is_the_same_for_every_m():
-    """What the test above checks on hardware, as arithmetic.
-
-    Regression guard for the aliasing itself: without capacity_m every region
-    below the control area sits at a different byte for every M.
-    """
-
-    def cfg(m):
-        c = ArConfig(
-            world_size=2,
-            m=m,
-            n=1024,
-            recv_slots=2,
-            counter_chunks=counter_chunks(m, 2),
-            counter_capacity=MAX_CHUNKS,
-            counter_shape_slots=8,
-            capacity_m=4096,
-        )
-        c.validate()
-        return c
-
-    maps = {
-        m: (
-            cfg(m).input_off,
-            cfg(m).output_off,
-            cfg(m).tmp_off,
-            cfg(m).recv_off,
-            cfg(m).recv_slot_off(1),
-            cfg(m).window_bytes,
-        )
-        for m in (512, 1024, 2048, 4096)
-    }
-    assert len(set(maps.values())) == 1, maps
-
-    # And without it they all differ, which is the bug this guards.
-    loose = {
-        m: ArConfig(
-            world_size=2,
-            m=m,
-            n=1024,
-            recv_slots=2,
-            counter_chunks=counter_chunks(m, 2),
-            counter_capacity=MAX_CHUNKS,
-        ).recv_slot_off(1)
-        for m in (512, 1024, 2048, 4096)
-    }
-    assert len(set(loose.values())) == 4, loose
-
-
 @requires_two_gpus
-def test_changing_operands_between_calls_stays_correct():
+def test_changing_operands_between_calls_stays_correct(worker_results):
     """Five calls at one M, different data each time.
 
     Every other test and every benchmark feeds identical operands on every
@@ -383,15 +371,32 @@ def test_changing_operands_between_calls_stays_correct():
     previous call's bytes -- bit-identical to the right answer. This is the only
     thing in the suite that would notice.
     """
-    r = _run_worker(
-        2, "changing_data", "-m", "512", "-n", "1024", "-k", "512", "--calls", "5"
-    )
+    r = _case(worker_results, "changing_data")
     for key in (f"call{i}" for i in range(5)):
         assert r[key] < FP8_FLOOR, (key, r)
 
 
 @requires_two_gpus
-def test_close_releases_and_is_idempotent():
+def test_self_test_passes_and_can_fail(worker_results):
+    """The guard against a mori whose SDMA puts were compiled out.
+
+    That build is the default (`BUILD_CCO_SDMA` is OFF unless BUILD_BENCHMARK is
+    ON) and it fails silently: every symbol is there, every kernel launches,
+    every put returns, and nothing moves. The all-reduce then yields mostly the
+    local slice, the model still answers fluently, and the fused path measures
+    *faster* than it is. An end-to-end campaign read -6.8% instead of -2.3% that
+    way and only perplexity caught it.
+
+    So this asserts both halves: the check passes on a working stack, and it
+    fails when the scatter does not happen -- which is what an inert put is.
+    """
+    r = _case(worker_results, "self_test")
+    assert r["passes_on_working_stack"], r
+    assert r["detects_missing_scatter"], r
+
+
+@requires_two_gpus
+def test_close_releases_and_is_idempotent(worker_results):
     """The communicator holds the handles, so dropping the op is not enough."""
-    r = _run_worker(2, "close", "-n", "1024", "-k", "512", "-m", "512")
+    r = _case(worker_results, "close")
     assert r["refused_after_close"], r

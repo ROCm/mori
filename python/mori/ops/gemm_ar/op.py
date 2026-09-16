@@ -93,6 +93,12 @@ def counter_chunks(m_pad: int, world_size: int, block_m: int = DEFAULT_BLOCK_M) 
     against 1434.0us for a chunk count of 1.
     """
     bands = m_pad // (world_size * block_m)
+    if bands < 1:
+        raise ValueError(
+            f"m_pad={m_pad} is smaller than one row band per destination "
+            f"(world_size*block_m = {world_size * block_m}), so there is nothing "
+            f"to chunk"
+        )
     return max(c for c in range(1, min(MAX_CHUNKS, bands) + 1) if bands % c == 0)
 
 
@@ -262,6 +268,9 @@ class _Plan(NamedTuple):
     tail: tuple
     input: torch.Tensor
     output: torch.Tensor
+    #: The unresolved phase table, kept for :meth:`GemmAllReduceOp.self_test`,
+    #: which needs the standalone ``scatter`` that ``fused_order`` omits.
+    parts: dict
 
 
 class GemmAllReduceOp:
@@ -473,6 +482,7 @@ class GemmAllReduceOp:
         hit = _Plan(
             gemm=gemm,
             tail=tail,
+            parts=parts,
             input=from_gpu_ptr(
                 self.mem.ptr + cfg.input_off, (m, self.n), torch.bfloat16
             ),
@@ -482,6 +492,73 @@ class GemmAllReduceOp:
         )
         self._cache[m] = hit
         return hit
+
+    def self_test(self, m: Optional[int] = None) -> None:
+        """Verify that the collective actually moves bytes. Raises if it does not.
+
+        The failure this exists for is silent. A mori built without
+        ``BUILD_CCO_SDMA=ON`` -- which is the *default*, and what SGLang's CI
+        image ships -- still has every symbol, still launches every kernel, and
+        still returns from every put. The puts simply do nothing. The all-reduce
+        then returns mostly the local slice, the model keeps answering fluently,
+        the profile keeps showing all the kernels, and the fused path measures
+        **faster** than it is because it is not moving any data. An end-to-end
+        run read -6.8% instead of -2.3% that way, and the only signal that caught
+        it was perplexity: 862511 against 3.26.
+
+        So: write ``rank + 1`` over the whole input region, run the *split* order
+        (``scatter -> reduce -> gather``), and check every element came back as
+        ``sum(1..world_size)``. With the puts inert each rank sees only its own
+        contribution and the check fails.
+
+        Uses ``parts["order"]`` rather than ``fused_order`` on purpose:
+        ``fused_order`` opens with ``drain``, which assumes the GEMM epilogue has
+        already pushed, so without a GEMM it would drain nothing and reduce
+        whatever the window happened to hold.
+
+        Runs at ``m_max`` by default, which compiles the shape the first real
+        call needs anyway rather than burning a second one.
+        """
+        if self.mem is None:
+            raise RuntimeError("this GemmAllReduceOp has been closed")
+        m = m or self.m_max
+
+        try:
+            from mori.cco.device._build_flags import BUILD_CCO_SDMA
+        except ImportError:
+            BUILD_CCO_SDMA = None
+        built_without_sdma = BUILD_CCO_SDMA is False
+
+        plan = self._compiled(m)
+        want = self.world_size * (self.world_size + 1) / 2
+        plan.input.fill_(float(self.rank + 1))
+        plan.output.zero_()
+
+        stream = fx.Stream(torch.cuda.current_stream())
+        for name in plan.parts["order"]:
+            plan.parts[name](self.dev_comm.ptr, self.win.handle, stream=stream)
+        torch.cuda.current_stream().synchronize()
+
+        got = plan.output.float()
+        worst = (got - want).abs().max().item() / want
+        # The bf16 wire is exact on small integers; the fp8 gather rounds, but
+        # e4m3 represents integers this small exactly once the row scale is
+        # applied, so a percent is generous either way.
+        if worst > 1e-2:
+            hint = (
+                " mori was built with BUILD_CCO_SDMA=OFF (the default), so the "
+                "SDMA puts are compiled out and do nothing."
+                if built_without_sdma
+                else " Check that mori was built with BUILD_CCO_SDMA=ON and that "
+                "MORI_ENABLE_SDMA=1 is set: without either, every put silently "
+                "does nothing."
+            )
+            raise RuntimeError(
+                f"gemm_ar self-test failed: the all-reduce returned "
+                f"{got.flatten()[0].item():g} where {want:g} was expected "
+                f"(worst relative error {worst:.3g} at M={m}, world_size="
+                f"{self.world_size}).{hint}"
+            )
 
     def close(self) -> None:
         """Release this op's window and memory. Idempotent.
