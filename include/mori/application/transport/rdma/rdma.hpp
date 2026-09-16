@@ -201,6 +201,13 @@ bool ReadIoTrafficClassDisableEnv();
 bool ReadIbEnableRelaxedOrderingEnv();
 int MaybeAddRelaxedOrderingFlag(int accessFlag);
 
+// Export a dmabuf fd for the GPU buffer at `ptr`, reporting the byte offset of
+// `ptr` within the exported dmabuf via `*offset`. Returns -1 (and leaves fd
+// closed) if dmabuf export is unsupported. Caller owns the returned fd and must
+// close() it after registration. Used for both payload MRs and, on providers
+// that support it, GPU control-ring umems (mlx5 CQ/WQ/DBR).
+int TryExportDmabufFd(void* ptr, size_t size, uint64_t* offset);
+
 /* -------------------------------------------------------------------------- */
 /*                              RdmaDeviceContext                             */
 /* -------------------------------------------------------------------------- */
@@ -217,7 +224,8 @@ class RdmaDeviceContext {
   virtual RdmaMemoryRegion RegisterRdmaMemoryRegionDmabufIova0(
       void* ptr, size_t size, int dmabuf_fd, int accessFlag = MR_DEFAULT_ACCESS_FLAG);
   // ibv_reg_mr-first registration; falls back to dmabuf. Set MORI_ENABLE_DMABUF_REG to try
-  // dmabuf first instead (falling back to ibv_reg_mr).
+  // dmabuf first instead (falling back to ibv_reg_mr). This is the vendor-agnostic payload
+  // MR path; independent of the mlx5-specific MORI_MLX5_DMABUF knob.
   virtual RdmaMemoryRegion RegisterRdmaMemoryRegionAuto(void* ptr, size_t size,
                                                         int accessFlag = MR_DEFAULT_ACCESS_FLAG);
   virtual void DeregisterRdmaMemoryRegion(void* ptr);
