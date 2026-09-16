@@ -17,7 +17,10 @@ jobs:
   # ── Stage 1: Build wheels ──────────────────────────────────────────────────
   build-wheel:
     name: wheel (py${{ matrix.python }})
-    runs-on: [self-hosted, MI355X-AINIC-TW]
+    # Same box as the MI355X_AINIC intranode tests below: the ionic collapsed-CQE
+    # device path is a compile-time choice made from the builder's firmware, so
+    # building elsewhere can hand the tests a wheel their runtime disagrees with.
+    runs-on: [self-hosted, MI355X-AINIC-PIT-G17]
     env:
       IMAGE: rocm/mori:ci-py${{ matrix.python }}
     strategy:
@@ -171,22 +174,29 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # socket_ifname is pinned because MORI's bootstrap auto-detection
+          # picks the first UP interface with an address, and on this host that
+          # is eno1 (10.13.x) -- an interface whose own address does not accept
+          # TCP connections from the host itself, so rank 1 spins in "retrying
+          # connection to root" for 1500 attempts instead of failing.
           - platform: MI355X_AINIC
             python: "3.10"
-            runner: [self-hosted, MI355X-AINIC-TW]
+            runner: [self-hosted, MI355X-AINIC-PIT-G17]
             base_image: rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.8.0
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
+            socket_ifname: eno0
             timeout_minutes: 45
 
           - platform: MI355X_AINIC
             python: "3.12"
-            runner: [self-hosted, MI355X-AINIC-TW]
+            runner: [self-hosted, MI355X-AINIC-PIT-G17]
             base_image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
+            socket_ifname: eno0
             timeout_minutes: 45
           # 8x ConnectX-7 NDR on InfiniBand, so no rdma_sl/rdma_tc: mlx5 applies
           # both only on the RoCE path. mlx5_8 is deliberately not in

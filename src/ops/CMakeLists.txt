@@ -33,9 +33,14 @@ if(BUILD_OPS_DEVICE)
   endif()
 
   # NIC and feature defines (from top-level CMake)
+  # hipcc runs outside the target system, so directory-level compile
+  # definitions do not reach it -- pass them explicitly.
   set(_nic_defs "")
   if(MORI_DEVICE_NIC_DEFINE)
-    set(_nic_defs "-D${MORI_DEVICE_NIC_DEFINE}")
+    list(APPEND _nic_defs "-D${MORI_DEVICE_NIC_DEFINE}")
+  endif()
+  if(MORI_IONIC_CCQE_DEFINE)
+    list(APPEND _nic_defs "-D${MORI_IONIC_CCQE_DEFINE}")
   endif()
 
   set(_extra_defs "")
@@ -61,8 +66,11 @@ if(BUILD_OPS_DEVICE)
       ep_intranode.hip ep_internode.hip ep_internode_v1.hip
       ep_internode_v1ll.hip ep_async_ll.hip ep_local_expert_count.hip)
 
-  # Output to build/lib/<arch>_<nic>/ (matches JIT cache layout)
+  # Output to build/lib/<arch>_<nic>[_ccqe]/ (matches JIT cache layout)
   set(_arch_nic "${GPU_TARGETS}_${MORI_DEVICE_NIC}")
+  if(MORI_IONIC_CCQE_DEFINE)
+    set(_arch_nic "${_arch_nic}_ccqe")
+  endif()
   set(_hsaco_dir "${CMAKE_BINARY_DIR}/lib/${_arch_nic}")
   file(MAKE_DIRECTORY ${_hsaco_dir})
 
