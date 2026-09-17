@@ -421,8 +421,10 @@ def test_mxfp8_lands_at_the_fp8_floor(m, n, k):
         a.contiguous().view(torch.int8).view(-1),
         b_shuf.contiguous().view(torch.int8).view(-1),
         ours.view(-1),
-        ea.reshape(-1).contiguous(),
-        eb.reshape(-1).contiguous(),
+        # K-block major: [K/32, M] and [K/32, N/32], the layout that makes a
+        # block group's sixteen lanes read consecutive addresses.
+        ea.t().reshape(-1).contiguous(),
+        eb.t().reshape(-1).contiguous(),
         m,
         n,
         0,

@@ -1,0 +1,16 @@
+4096 gemm-only 70.4
+4096 split-sdma 447.84
+4096 split-lsa 430.04
+4096 fused-sdma 439.92
+8192 gemm-only 110.08
+8192 split-sdma 833.13
+8192 split-lsa 810.09
+8192 fused-sdma 804.65
+12288 gemm-only 152.16
+12288 split-sdma 1214.73
+12288 split-lsa 1222.97
+12288 fused-sdma 1139.17
+16384 gemm-only 192.72
+16384 split-sdma 1616.57
+16384 split-lsa 1618.93
+16384 fused-sdma 1502.21

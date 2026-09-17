@@ -386,6 +386,8 @@ class _Mxfp8ScaleK:
 
     def __init__(self, A_scale, B_scale, m, n, k, *, n_tiles_a, n_tiles_b):
         self.kb_count = k // self.BLOCK
+        self.m = m
+        self.n_groups = n // self.BLOCK
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
         self.lane = fx.thread_idx.x % 64
@@ -411,28 +413,38 @@ class _Mxfp8ScaleK:
         return fx.Int32(ks * 4) + self.lane // 16
 
     def a_scales(self, base_row, ks):
-        """Per M-tile A scale operand, ``A_scale`` row-major ``[M, K/32]``."""
+        """Per M-tile A scale operand. ``A_scale`` is **K-block major**, ``[K/32, M]``.
+
+        The layout is the point. A lane wants row ``lane % 16`` of block
+        ``4*ks + lane//16``, so the sixteen lanes of one block group differ only
+        in the row. K-block major puts those sixteen at consecutive addresses --
+        one coalesced load. Row major ``[M, K/32]`` puts them ``K/32`` dwords
+        apart instead, which is sixteen separate transactions per group and
+        measured 19% off the pace at M=4096 even after matching BLOCK_M.
+        ``_BlockScaleK`` takes the same column-major A scale for the same
+        reason.
+        """
         kb = self._kb(ks)
         row = base_row + self.lane % 16
         return [
-            self._load1(self.sa_div, (row + ti * 16) * fx.Int32(self.kb_count) + kb)
+            self._load1(self.sa_div, kb * fx.Int32(self.m) + row + ti * 16)
             for ti in range_constexpr(self.n_tiles_a)
         ]
 
     def b_scales(self, base_col, ks):
-        """Per N-tile B scale operand, ``B_scale`` row-major ``[N/32, K/32]``.
+        """Per N-tile B scale operand. ``B_scale`` is K-block major, ``[K/32, N/32]``.
 
         A 16-column tile never straddles a 32-column group (``base_col`` is a
-        multiple of 16), so the group index is constant across the tile's rows
-        and the divide folds away for the aligned half.
+        multiple of 16), so the group index is constant across the tile's rows:
+        all sixteen lanes of a block group read the same address and the load is
+        a broadcast.
         """
         kb = self._kb(ks)
         col = base_col + self.lane % 16
         return [
             self._load1(
                 self.sb_div,
-                ((col + tj * 16) // fx.Int32(self.BLOCK)) * fx.Int32(self.kb_count)
-                + kb,
+                kb * fx.Int32(self.n_groups) + (col + tj * 16) // fx.Int32(self.BLOCK),
             )
             for tj in range_constexpr(self.n_tiles_b)
         ]

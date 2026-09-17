@@ -393,10 +393,14 @@ def run(args) -> int:
             # ue8m0 exponent bytes widened to int32 with the byte in the low 8
             # bits: the MFMA's scale operand is a 32-bit register read at
             # op_sel 0, so this is what it wants, and it keeps the kernel on a
-            # plain dword load. Both arrays stay row-major -- A [M, K/32],
-            # B [N/32, K/32] -- which is what `_Mxfp8ScaleK` indexes.
-            sa_arg = sa.to(torch.int32).reshape(-1).contiguous()
-            sb_arg = sb.to(torch.int32).reshape(-1).contiguous()
+            # plain dword load.
+            #
+            # Both are handed over **K-block major** -- A as [K/32, M], B as
+            # [K/32, N/32] -- because a block group's sixteen lanes differ only
+            # in the row, so that layout makes their load coalesce. Same reason
+            # blockscale takes a column-major A scale.
+            sa_arg = sa.to(torch.int32).t().reshape(-1).contiguous()
+            sb_arg = sb.to(torch.int32).t().reshape(-1).contiguous()
         else:
             sa_arg, sb_arg = sa, sb
 
