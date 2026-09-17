@@ -1665,7 +1665,19 @@ int ResolveMetricsPortFromEnv(bool* ok, std::string* error) {
   if (value == "off" || value == "false" || value == "no") return 0;
 
   try {
-    const long port = std::stol(value);
+    std::size_t consumed = 0;
+    const long port = std::stol(value, &consumed);
+    // std::stol stops at the first character it cannot use and reports success
+    // for what it did read, so "9O92" (letter O) would resolve to port 9 and
+    // bind -- or fail to bind -- somewhere nobody is looking. Anything left
+    // over means the operator wrote something other than a port number.
+    if (consumed != value.size()) {
+      if (ok != nullptr) *ok = false;
+      if (error != nullptr) {
+        *error = "UMBP_STANDALONE_METRICS_PORT is not a number: " + std::string(raw);
+      }
+      return 0;
+    }
     if (port == 0) return 0;
     if (port < 0 || port > 65535) {
       if (ok != nullptr) *ok = false;
