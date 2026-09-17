@@ -886,7 +886,7 @@ jobs:
     name: test pypi wheel (py${{ matrix.python }})
     needs: [test-wheel, test-wheel-internode]
     if: github.event_name != 'pull_request'
-    runs-on: [self-hosted, MI355X-AINIC-TW]
+    runs-on: [self-hosted, MI355X-AINIC-PIT-G17]
     strategy:
       fail-fast: false
       matrix:
