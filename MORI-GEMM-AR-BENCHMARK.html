@@ -1,0 +1,1102 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MORI GEMM + All-Reduce Benchmark &mdash; MORI 0.1.0 documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=01f34227"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="MORI-IO Benchmark" href="MORI-IO-BENCHMARK.html" />
+    <link rel="prev" title="MORI-EP Benchmark" href="MORI-EP-BENCHMARK.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search"  style="background: #C00000" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            MORI
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#installation-methods">Installation Methods</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#from-source">From Source</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#verification">Verification</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#troubleshooting">Troubleshooting</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-ep-dispatch-and-combine">MORI-EP: Dispatch and Combine</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-io-point-to-point-transfers">MORI-IO: Point-to-Point Transfers</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-shmem-symmetric-memory">MORI Shmem: Symmetric Memory</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-ir-device-bitcode-for-gpu-kernels">MORI-IR: Device Bitcode for GPU Kernels</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#profiling-with-mori-viz">Profiling with MORI-VIZ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#next-steps">Next Steps</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">User Guides</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-GUIDE.html">MORI-EP User Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#kernel-types">1. Kernel Types</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#configuration">2. Configuration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#epdispatchcombineconfig">EpDispatchCombineConfig</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#operator-api">3. Operator API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#epdispatchcombineop">EpDispatchCombineOp</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#dispatch">dispatch()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#combine">combine()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#split-dispatch-combine-send-recv">Split dispatch/combine (send + recv)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#reset">reset()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#get-dispatch-src-token-pos">get_dispatch_src_token_pos()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#get-registered-combine-input-buffer">get_registered_combine_input_buffer()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#standard-moe-compatibility-deepep">4. Standard MoE Compatibility (DeepEP)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#dispatch-standard-moe">dispatch_standard_moe()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#combine-standard-moe">combine_standard_moe()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#convert-dispatch-output">convert_dispatch_output()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#convert-combine-input">convert_combine_input()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#initialization">5. Initialization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#launch-configuration">6. Launch Configuration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#manual-mode-default">Manual Mode (Default)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#auto-mode">Auto Mode</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#complete-example">7. Complete Example</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#environment-variables">8. Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#benchmarking">9. Benchmarking</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#intra-node">Intra-node</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#inter-node">Inter-node</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#reference-performance-deepseek-v3-config">Reference Performance (DeepSeek V3 config)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#tuning">10. Tuning</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#overview">Overview</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#tuning-config-files">Tuning Config Files</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#intra-node-tuning">Intra-node Tuning</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#inter-node-tuning">Inter-node Tuning</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#tuning-on-a-new-gpu-platform">Tuning on a New GPU Platform</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#profiling-with-mori-viz">11. Profiling with MORI-VIZ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#framework-integration">12. Framework Integration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#build-options">Build Options</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-SHMEM-GUIDE.html">MORI Shmem Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#concepts">1. Concepts</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#symmetric-memory">Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#processing-element-pe">Processing Element (PE)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#symmetric-heap">Symmetric Heap</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization">2. Initialization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-3-mpi-communicator-c-mpi-environments">Method 3: MPI Communicator (C++ / MPI environments)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization-comparison">Initialization Comparison</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#finalization">Finalization</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#query-apis">3. Query APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#memory-management">4. Memory Management</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#allocating-symmetric-memory">Allocating Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#freeing-symmetric-memory">Freeing Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#registering-existing-buffers">Registering Existing Buffers</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#p2p-address-translation">5. P2P Address Translation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#synchronization">6. Synchronization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#hip-module-init-triton-integration">7. HIP Module Init (Triton Integration)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization-flags">8. Initialization Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#rail-only-connections">Rail-only connections</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-CCO-GUIDE.html">MORI CCO Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#concepts">1. Concepts</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-CCO-GUIDE.html#communicator-ccocomm">Communicator (<code class="docutils literal notranslate"><span class="pre">ccoComm</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-CCO-GUIDE.html#symmetric-memory-and-windows">Symmetric memory and windows</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-CCO-GUIDE.html#device-communicator-ccodevcomm">Device communicator (<code class="docutils literal notranslate"><span class="pre">ccoDevComm</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-CCO-GUIDE.html#teams">Teams</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#initialization">2. Initialization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#memory-and-windows">3. Memory and Windows</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#device-communicator">4. Device Communicator</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#host-barrier">5. Host Barrier</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#device-side-programming">6. Device-Side Programming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#examples">7. Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#c-api">8. C++ API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#environment-variables">9. Environment Variables</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IR-GUIDE.html">MORI-IR Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#architecture">Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#host-side-python-api">1. Host-Side Python API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#mori-ir-framework-agnostic"><code class="docutils literal notranslate"><span class="pre">mori.ir</span></code> (framework-agnostic)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#mori-ir-triton-triton-specific-reference-backend"><code class="docutils literal notranslate"><span class="pre">mori.ir.triton</span></code> (Triton-specific reference backend)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#device-bitcode">2. Device Bitcode</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#device-functions">3. Device Functions</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#query">Query</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#point-to-point">Point-to-Point</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#putnbi-thread-warp-block">PutNbi (Thread / Warp / Block)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#putnbi-with-signal">PutNbi with Signal</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#immediate-put">Immediate Put</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#atomics">Atomics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#wait">Wait</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#synchronization">Synchronization</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#integration-example-triton">4. Integration Example: Triton</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#integration-example-raw-bitcode-no-framework">5. Integration Example: Raw Bitcode (no framework)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#bitcode-jit-compilation">6. Bitcode JIT Compilation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#examples">7. Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#testing">8. Testing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#known-limitations">Known Limitations</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-GUIDE.html">MORI-IO Introduction</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#design-concepts">Design &amp; Concepts</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#workflow">Workflow</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#architecture">Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#python-api-quick-reference">Python API Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#example-basic-read-write">Example: Basic Read/Write</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#environment-configuration">Environment &amp; Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#profiling-mori-io-with-roctx-markers">Profiling MORI-IO with ROCTX Markers</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="PROFILER.html">MORI-VIZ (Visualizer)</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#instrumentation">Instrumentation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#include-headers">1. Include Headers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#define-profiler-context">2. Define Profiler Context</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#add-trace-points">3. Add Trace Points</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#build-code-generation">Build &amp; Code Generation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#enabling-the-profiler">Enabling the Profiler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#code-generation">Code Generation</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#python-analysis">Python Analysis</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#device-side-elapsed-time-measurement">Device-side Elapsed Time Measurement</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#viewing-the-trace">Viewing the Trace</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#best-practices">Best Practices</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-BENCHMARK.html">MORI-EP Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#intra-node">Intra-node</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#profiling-intranode-kernels">Profiling intranode kernels</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#inter-node">Inter-node</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#nic-selection">NIC Selection</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#bandwidth-computation">Bandwidth Computation</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#rdma-bandwidth">RDMA bandwidth</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="MORI-EP-BENCHMARK.html#algo-bw-vs-physical-bw">Algo BW vs Physical BW</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#nvl-xgmi-bandwidth">NVL / XGMI bandwidth</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#why-deepep-and-mori-rdma-token-counts-are-equivalent">Why DeepEP and Mori RDMA token counts are equivalent</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#combine">Combine</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#reference-print-bw-values-py">Reference: <code class="docutils literal notranslate"><span class="pre">print_bw_values.py</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#profiling-internode-kernels">Profiling Internode Kernels</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#analyzing-traces-with-analyze-ep-kernel-trace-py">Analyzing traces with <code class="docutils literal notranslate"><span class="pre">analyze_ep_kernel_trace.py</span></code></a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">MORI GEMM + All-Reduce Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#running-the-benchmark">Running the benchmark</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#headline">Headline</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#where-the-time-goes">Where the time goes</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#the-fp8-wire">The fp8 wire</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#who-moves-the-gather">Who moves the gather</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#the-pull-grid">The pull grid</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#what-fp8-costs-numerically">What fp8 costs, numerically</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#model-level-evaluation">Model-level evaluation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#negative-results">Negative results</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#reproducing-the-end-to-end-numbers">Reproducing the end-to-end numbers</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-BENCHMARK.html">MORI-IO Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#benchmark-commands">Benchmark Commands</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#fabric-cross-node-scale-up-ualink-super-node">Fabric (cross-node scale-up UALink super-node)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#c-benchmark-nixlbench-matching">C++ Benchmark (nixlbench-matching)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#build">Build</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#run-two-nodes">Run (two nodes)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#sweep-modes">Sweep modes</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#differences-from-the-python-flags">Differences from the Python flags</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#benchmark-arguments">Benchmark Arguments</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-thor2-rdma-read">Results: Thor2 RDMA Read</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-thor2-rdma-write">Results: Thor2 RDMA Write</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#message-size-sweep">Message Size Sweep</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#batch-size-sweep">Batch Size Sweep</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-cx7-rdma-batch-size-1">Results: CX7 RDMA (Batch Size = 1)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#write">Write</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#read">Read</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#benchmark-tuning-guide">Benchmark Tuning Guide</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#recommended-starting-config">Recommended starting config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#parameters-that-help">Parameters that help</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#the-merged-wr-size-limit">The merged-WR size limit</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#parameters-that-usually-do-not-help-or-can-hurt">Parameters that usually do not help (or can hurt)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#host-cpu-vs-gpu-memory">Host (CPU) vs GPU memory</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="api/communication.html">Communication APIs</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-ep-expert-parallelism">MORI-EP (Expert Parallelism)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-shmem-symmetric-memory">MORI Shmem (Symmetric Memory)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-io-point-to-point-i-o">MORI-IO (Point-to-Point I/O)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-ir-device-bitcode-integration">MORI-IR (Device Bitcode Integration)</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api/profiler.html">MORI-VIZ Kernel Profiler</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#usage">Usage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#export-to-perfetto">export_to_perfetto</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#c-profiler-apis">C++ Profiler APIs</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api/umbp.html">UMBP Master Client</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#starting-the-master-server">Starting the Master Server</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbptiertype">UMBPTierType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbpexternalkvnodematch">UMBPExternalKvNodeMatch</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbpmasterclient">UMBPMasterClient</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#cache-hit-tracking">Cache Hit Tracking</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="api/umbp.html#finding-hot-kv-blocks-the-typical-workflow">Finding hot KV blocks (the typical workflow)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="api/umbp.html#lifetime-cumulative-not-a-rate">Lifetime cumulative — not a rate</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbpexternalkvhitcountentry">UMBPExternalKvHitCountEntry</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#usage-examples">Usage Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#end-to-end-example">End-to-End Example</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu"  style="background: #C00000" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">MORI</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">MORI GEMM + All-Reduce Benchmark</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/MORI-GEMM-AR-BENCHMARK.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="mori-gemm-all-reduce-benchmark">
+<h1>MORI GEMM + All-Reduce Benchmark<a class="headerlink" href="#mori-gemm-all-reduce-benchmark" title="Link to this heading"></a></h1>
+<p>Measurements for <code class="docutils literal notranslate"><span class="pre">mori.ops.gemm_ar</span></code>, the fused fp8 GEMM + all-reduce. The design
+and the API live next to the code in
+<span class="xref myst"><code class="docutils literal notranslate"><span class="pre">python/mori/ops/gemm_ar/README.md</span></code></span>;
+this file is how to reproduce the numbers and what they were.</p>
+<p>Every number below was taken on <strong>8x MI355X (gfx950)</strong>, one node, at the shape
+<code class="docutils literal notranslate"><span class="pre">[M,</span> <span class="pre">7168]</span></code> with <code class="docutils literal notranslate"><span class="pre">K=2048</span></code> — DeepSeek-V4-Pro’s <code class="docutils literal notranslate"><span class="pre">wo_b</span></code> under TP8 with
+<code class="docutils literal notranslate"><span class="pre">--chunked-prefill-size</span> <span class="pre">16384</span></code>. Kernel timings are the median over 11
+graph-replayed iterations, maximum over ranks, on an otherwise idle box.
+Run-to-run spread at this shape is about <strong>2%</strong>, so differences below that are
+not differences.</p>
+<section id="table-of-contents">
+<h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="#running-the-benchmark"><span class="xref myst">Running the benchmark</span></a></p></li>
+<li><p><a class="reference internal" href="#headline"><span class="xref myst">Headline</span></a></p></li>
+<li><p><a class="reference internal" href="#where-the-time-goes"><span class="xref myst">Where the time goes</span></a></p></li>
+<li><p><a class="reference internal" href="#the-fp8-wire"><span class="xref myst">The fp8 wire</span></a></p>
+<ul>
+<li><p><a class="reference internal" href="#who-moves-the-gather"><span class="xref myst">Who moves the gather</span></a></p></li>
+<li><p><a class="reference internal" href="#the-pull-grid"><span class="xref myst">The pull grid</span></a></p></li>
+<li><p><a class="reference internal" href="#what-fp8-costs-numerically"><span class="xref myst">What fp8 costs, numerically</span></a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#model-level-evaluation"><span class="xref myst">Model-level evaluation</span></a></p></li>
+<li><p><a class="reference internal" href="#negative-results"><span class="xref myst">Negative results</span></a></p></li>
+<li><p><a class="reference internal" href="#reproducing-the-end-to-end-numbers"><span class="xref myst">Reproducing the end-to-end numbers</span></a></p></li>
+</ul>
+</section>
+<section id="running-the-benchmark">
+<h2>Running the benchmark<a class="headerlink" href="#running-the-benchmark" title="Link to this heading"></a></h2>
+<p>Needs a mori built with <code class="docutils literal notranslate"><span class="pre">BUILD_CCO_SDMA=ON</span></code>. Setting <code class="docutils literal notranslate"><span class="pre">MORI_ENABLE_SDMA</span></code> in the
+environment only rebuilds the <em>device</em> bitcode — a host library built without
+the flag has no SDMA queues, every put silently does nothing, and the all-reduce
+quietly produces zeros.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>/path/to/mori
+<span class="nv">BUILD_CCO_SDMA</span><span class="o">=</span>ON<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>.
+
+<span class="nv">MORI_ENABLE_SDMA</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">MORI_SOCKET_IFNAME</span><span class="o">=</span>lo<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>torchrun<span class="w"> </span>--standalone<span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>benchmark/cco/flydsl/gemm_ar/bench_gemm_ar.py<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--mode<span class="w"> </span>fused-sdma<span class="w"> </span>--quant<span class="w"> </span>blockscale<span class="w"> </span>-m<span class="w"> </span><span class="m">16384</span><span class="w"> </span>-n<span class="w"> </span><span class="m">7168</span><span class="w"> </span>-k<span class="w"> </span><span class="m">2048</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">--mode</span></code> selects what is measured, all reaching the same end state:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>mode</p></th>
+<th class="head"><p>what runs</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">gemm-only</span></code></p></td>
+<td><p>the GEMM alone, to size the ceiling</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">split-sdma</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">gemm</span></code> then a 4-kernel SDMA all-reduce</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">fused-sdma</span></code></p></td>
+<td><p>GEMM with the scatter fused into its epilogue</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">split-lsa</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">gemm</span></code> then the 2-kernel LSA all-reduce</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">fused-lsa</span></code></p></td>
+<td><p>GEMM storing straight into peers</p></td>
+</tr>
+</tbody>
+</table>
+<p><code class="docutils literal notranslate"><span class="pre">--quant</span> <span class="pre">blockscale</span></code> is the model’s own quantisation (A 1x128, B 128x128, fp32
+scales) and is the column to read. <code class="docutils literal notranslate"><span class="pre">--gather-dtype</span> <span class="pre">fp8</span></code> and
+<code class="docutils literal notranslate"><span class="pre">--gather-transport</span> <span class="pre">{sdma,lsa}</span></code> select the wire; see <a class="reference internal" href="#the-fp8-wire"><span class="xref myst">the fp8 wire</span></a>.</p>
+<p>Each run prints a <code class="docutils literal notranslate"><span class="pre">RESULT_JSON</span></code> line with <code class="docutils literal notranslate"><span class="pre">max_rank_time_us</span></code>, <code class="docutils literal notranslate"><span class="pre">rel_l2</span></code> and
+<code class="docutils literal notranslate"><span class="pre">validated</span></code>, so a sweep can be parsed rather than eyeballed.</p>
+<blockquote>
+<div><p><strong>Between runs, give the SDMA queues time to drain.</strong> Back-to-back 8-rank runs
+hit <code class="docutils literal notranslate"><span class="pre">hsaKmtCreateQueueExt</span></code> failures (<code class="docutils literal notranslate"><span class="pre">anvil.cpp:237</span></code>) if a previous run’s ranks
+have not exited. ~10s is enough; a leftover server holding queues is not.</p>
+</div></blockquote>
+</section>
+<section id="headline">
+<h2>Headline<a class="headerlink" href="#headline" title="Link to this heading"></a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">--quant</span> <span class="pre">blockscale</span></code>, median of 11:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>M</p></th>
+<th class="head text-right"><p><code class="docutils literal notranslate"><span class="pre">split-sdma</span></code></p></th>
+<th class="head text-right"><p><code class="docutils literal notranslate"><span class="pre">fused-sdma</span></code></p></th>
+<th class="head text-right"><p><code class="docutils literal notranslate"><span class="pre">fused-sdma</span></code> + fp8 gather</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>4096</p></td>
+<td class="text-right"><p>398.1 us</p></td>
+<td class="text-right"><p>351.0 us</p></td>
+<td class="text-right"><p><strong>329.5 us</strong></p></td>
+</tr>
+<tr class="row-odd"><td><p>8192</p></td>
+<td class="text-right"><p>722.0</p></td>
+<td class="text-right"><p>621.1</p></td>
+<td class="text-right"><p><strong>539.3</strong></p></td>
+</tr>
+<tr class="row-even"><td><p>16384</p></td>
+<td class="text-right"><p>1472.9</p></td>
+<td class="text-right"><p>1148.8</p></td>
+<td class="text-right"><p><strong>979.3</strong></p></td>
+</tr>
+</tbody>
+</table>
+<p>Fusing is worth <strong>-22%</strong> at M=16384; the fp8 gather a further <strong>-15%</strong>.</p>
+<blockquote>
+<div><p>Both survive to the server, in the same order. See
+<a class="reference internal" href="#reproducing-the-end-to-end-numbers"><span class="xref myst">the end-to-end numbers</span></a>.</p>
+</div></blockquote>
+<p>For scale, the same layer as the model runs it today (a separate GEMM then an
+NCCL all-reduce) measures <strong>1419.5 us</strong> at M=16384, and the GEMM alone is
+<strong>369.4 us</strong>.</p>
+</section>
+<section id="where-the-time-goes">
+<h2>Where the time goes<a class="headerlink" href="#where-the-time-goes" title="Link to this heading"></a></h2>
+<p>Per layer, captured in SGLang over one 20000-token prefill (not the standalone
+benchmark — this is the pipeline as the model drives it):</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>phase</p></th>
+<th class="head text-right"><p>bf16</p></th>
+<th class="head text-right"><p>fp8 / sdma</p></th>
+<th class="head text-right"><p>fp8 / lsa</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>gemm</p></td>
+<td class="text-right"><p>441.9 us</p></td>
+<td class="text-right"><p>438.2 us</p></td>
+<td class="text-right"><p>441.3 us</p></td>
+</tr>
+<tr class="row-odd"><td><p>drain</p></td>
+<td class="text-right"><p>180.2</p></td>
+<td class="text-right"><p>170.9</p></td>
+<td class="text-right"><p>204.8</p></td>
+</tr>
+<tr class="row-even"><td><p>reduce</p></td>
+<td class="text-right"><p>41.7</p></td>
+<td class="text-right"><p>42.5</p></td>
+<td class="text-right"><p>43.1</p></td>
+</tr>
+<tr class="row-odd"><td><p>quantize</p></td>
+<td class="text-right"><p>—</p></td>
+<td class="text-right"><p>11.8</p></td>
+<td class="text-right"><p>11.9</p></td>
+</tr>
+<tr class="row-even"><td><p>gather</p></td>
+<td class="text-right"><p>437.8</p></td>
+<td class="text-right"><p>256.4</p></td>
+<td class="text-right"><p>7.5 (barrier only)</p></td>
+</tr>
+<tr class="row-odd"><td><p>dequantize</p></td>
+<td class="text-right"><p>—</p></td>
+<td class="text-right"><p>61.0</p></td>
+<td class="text-right"><p>—</p></td>
+</tr>
+<tr class="row-even"><td><p>pull</p></td>
+<td class="text-right"><p>—</p></td>
+<td class="text-right"><p>—</p></td>
+<td class="text-right"><p>230.5</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>wo_b layer</strong></p></td>
+<td class="text-right"><p><strong>1101.6</strong></p></td>
+<td class="text-right"><p><strong>980.8</strong></p></td>
+<td class="text-right"><p><strong>939.1</strong></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td class="text-right"><p></p></td>
+<td class="text-right"><p>-11.0%</p></td>
+<td class="text-right"><p><strong>-14.7%</strong></p></td>
+</tr>
+</tbody>
+</table>
+<p>Two things to read out of the bf16 column:</p>
+<ul class="simple">
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">gather</span></code> is the bottleneck</strong>, not <code class="docutils literal notranslate"><span class="pre">drain</span></code>. It moves 196 MiB at 470 GB/s,
+which is 7 xGMI links flat out, so halving its bytes halves its time.</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">drain</span></code>’s apparent 1140 GB/s is not a bandwidth.</strong> Seven links cannot do
+that. It is the tell that the scatter’s pushes already went out from the GEMM
+epilogue and the drain is only waiting for the tail — which is why the scatter
+leg has far less to give than its byte count suggests, and why it is still
+bf16.</p></li>
+</ul>
+</section>
+<section id="the-fp8-wire">
+<h2>The fp8 wire<a class="headerlink" href="#the-fp8-wire" title="Link to this heading"></a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">--gather-dtype</span> <span class="pre">fp8</span></code> sends the all-gather leg as e4m3 with one fp32 scale per
+row. The reduce still accumulates in fp32 and <code class="docutils literal notranslate"><span class="pre">output</span></code> is still bf16; only the
+wire changes. The scatter leg is unchanged — it carries partial sums that are
+then added across every rank, so its error would compound rather than being a
+single rounding.</p>
+<section id="who-moves-the-gather">
+<h3>Who moves the gather<a class="headerlink" href="#who-moves-the-gather" title="Link to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p><code class="docutils literal notranslate"><span class="pre">--gather-transport</span></code></p></th>
+<th class="head"><p>how</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">sdma</span></code></p></td>
+<td><p>copy engines push, a second kernel widens</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">lsa</span></code> (default)</p></td>
+<td><p>CUs pull over xGMI and widen on the way in</p></td>
+</tr>
+</tbody>
+</table>
+<p>A copy engine has no ALU, so for SDMA the widening <em>cannot</em> be the same step: it
+is a second kernel that reads the landed fp8 back out of local HBM, 98 MiB a
+layer. A CU pull has those bytes in registers already.</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>gather</p></th>
+<th class="head text-right"><p>M=16384</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>bf16 / sdma</p></td>
+<td class="text-right"><p>1150.7 us</p></td>
+</tr>
+<tr class="row-odd"><td><p>fp8 / sdma</p></td>
+<td class="text-right"><p>1018.9</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>fp8 / lsa</strong></p></td>
+<td class="text-right"><p><strong>957.3</strong></p></td>
+</tr>
+</tbody>
+</table>
+<p>The ordering holds in the server too: 1070.3ms of GPU busy for bf16 against
+1052.1 for fp8/sdma and 1041.2 for fp8/lsa.</p>
+<p>The pull also removes fp8’s small-M penalty. With the SDMA gather the two
+conversion kernels were a fixed cost against a transfer that shrinks with M, so
+fp8 measured <strong>+2.3% (slower)</strong> at M=4096. With the pull there is no fixed
+conversion cost left and fp8 wins wherever fusing does.</p>
+</section>
+<section id="the-pull-grid">
+<h3>The pull grid<a class="headerlink" href="#the-pull-grid" title="Link to this heading"></a></h3>
+<p>The single most important tuning parameter, and it is not obvious from the
+source. These are <em>xGMI</em> reads, so the grid throttles outstanding remote
+requests rather than covering HBM latency — it wants roughly a <strong>tenth</strong> of what
+the local conversion kernels want.</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>blocks</p></th>
+<th class="head text-right"><p>16</p></th>
+<th class="head text-right"><p>24</p></th>
+<th class="head text-right"><p>32</p></th>
+<th class="head text-right"><p>48</p></th>
+<th class="head text-right"><p>64</p></th>
+<th class="head text-right"><p>80</p></th>
+<th class="head text-right"><p>128</p></th>
+<th class="head text-right"><p>256</p></th>
+<th class="head text-right"><p>512</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>us</p></td>
+<td class="text-right"><p>1261</p></td>
+<td class="text-right"><p>1091</p></td>
+<td class="text-right"><p>1006</p></td>
+<td class="text-right"><p>962</p></td>
+<td class="text-right"><p><strong>959</strong></p></td>
+<td class="text-right"><p>963</p></td>
+<td class="text-right"><p>1018</p></td>
+<td class="text-right"><p>1138</p></td>
+<td class="text-right"><p>1184</p></td>
+</tr>
+</tbody>
+</table>
+<p>Flat from 48 to 80, steep either side. The first implementation launched 512 —
+the grid the local quantize kernel uses — and <strong>lost to SDMA by 17%</strong>, which
+looked like “LSA is the wrong transport” rather than “the grid is wrong”.</p>
+<p>Note this is also not <code class="docutils literal notranslate"><span class="pre">LSA_BLOCK_CAP</span></code>’s 24: that cap is for a kernel moving bf16
+with no arithmetic, while this one moves half the bytes and dequantises them, so
+it needs more waves in flight to keep the links fed.</p>
+<p>Sweep it with <code class="docutils literal notranslate"><span class="pre">MORI_GEMM_AR_PULL_BLOCKS</span></code>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="k">for</span><span class="w"> </span>b<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="m">16</span><span class="w"> </span><span class="m">24</span><span class="w"> </span><span class="m">32</span><span class="w"> </span><span class="m">48</span><span class="w"> </span><span class="m">64</span><span class="w"> </span><span class="m">80</span><span class="w"> </span><span class="m">128</span><span class="w"> </span><span class="m">256</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">  </span><span class="nv">MORI_GEMM_AR_PULL_BLOCKS</span><span class="o">=</span><span class="nv">$b</span><span class="w"> </span><span class="nv">MORI_ENABLE_SDMA</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">MORI_SOCKET_IFNAME</span><span class="o">=</span>lo<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>torchrun<span class="w"> </span>--standalone<span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>benchmark/cco/flydsl/gemm_ar/bench_gemm_ar.py<span class="w"> </span>--mode<span class="w"> </span>fused-sdma<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--quant<span class="w"> </span>blockscale<span class="w"> </span>--gather-dtype<span class="w"> </span>fp8<span class="w"> </span>--gather-transport<span class="w"> </span>lsa<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-m<span class="w"> </span><span class="m">16384</span><span class="w"> </span>-n<span class="w"> </span><span class="m">7168</span><span class="w"> </span>-k<span class="w"> </span><span class="m">2048</span>
+<span class="w">  </span>sleep<span class="w"> </span><span class="m">10</span>
+<span class="k">done</span>
+</pre></div>
+</div>
+</section>
+<section id="what-fp8-costs-numerically">
+<h3>What fp8 costs, numerically<a class="headerlink" href="#what-fp8-costs-numerically" title="Link to this heading"></a></h3>
+<p>relL2 against an fp32 host reference goes from <strong>2.35e-3</strong> (bf16 wire, which is
+bitwise exact through the collective) to <strong>2.49e-2</strong>.</p>
+<p>That is a floor, not a tuning problem. e4m3 carries 3 mantissa bits, and scale
+granularity barely moves it — measured in torch on a <code class="docutils literal notranslate"><span class="pre">[2048,</span> <span class="pre">7168]</span></code> standard
+normal payload:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>scale granularity</p></th>
+<th class="head text-right"><p>relL2</p></th>
+<th class="head text-right"><p>scale bytes</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>per row (7168)</p></td>
+<td class="text-right"><p>2.646e-2</p></td>
+<td class="text-right"><p>0.06%</p></td>
+</tr>
+<tr class="row-odd"><td><p>per 512</p></td>
+<td class="text-right"><p>2.631e-2</p></td>
+<td class="text-right"><p>0.78%</p></td>
+</tr>
+<tr class="row-even"><td><p>per 256</p></td>
+<td class="text-right"><p>2.609e-2</p></td>
+<td class="text-right"><p>1.56%</p></td>
+</tr>
+<tr class="row-odd"><td><p>per 128</p></td>
+<td class="text-right"><p>2.572e-2</p></td>
+<td class="text-right"><p>3.12%</p></td>
+</tr>
+<tr class="row-even"><td><p>per 32</p></td>
+<td class="text-right"><p>2.399e-2</p></td>
+<td class="text-right"><p>12.5%</p></td>
+</tr>
+</tbody>
+</table>
+<p><strong>200x the scale bytes buys 9%.</strong> Per-row is therefore the right choice, and
+~2.5e-2 is what fp8 costs.</p>
+</section>
+</section>
+<section id="model-level-evaluation">
+<h2>Model-level evaluation<a class="headerlink" href="#model-level-evaluation" title="Link to this heading"></a></h2>
+<p>The kernel-level cost above is large — 6.7x the bf16 wire. Whether it <em>matters</em>
+is a different question, and it needs the model, so this section was measured in
+SGLang on DeepSeek-V4-Pro at TP8. The fp8 path was verified live throughout:
+<code class="docutils literal notranslate"><span class="pre">SGLANG_DEBUG_FUSED_WO_B_AR=1</span></code> logs relL2 per layer call during the very
+requests being scored.</p>
+<p><strong>At the layer</strong>, relL2 against the unfused path, 488 layer calls:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>wire</p></th>
+<th class="head text-right"><p>min</p></th>
+<th class="head text-right"><p>median</p></th>
+<th class="head text-right"><p>max</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>bf16</p></td>
+<td class="text-right"><p>3.706e-3</p></td>
+<td class="text-right"><p>—</p></td>
+<td class="text-right"><p>4.046e-3</p></td>
+</tr>
+<tr class="row-odd"><td><p>fp8 / sdma</p></td>
+<td class="text-right"><p>1.435e-2</p></td>
+<td class="text-right"><p><strong>2.505e-2</strong></p></td>
+<td class="text-right"><p>2.654e-2</p></td>
+</tr>
+<tr class="row-even"><td><p>fp8 / lsa</p></td>
+<td class="text-right"><p>2.153e-2</p></td>
+<td class="text-right"><p><strong>2.496e-2</strong></p></td>
+<td class="text-right"><p>2.683e-2</p></td>
+</tr>
+</tbody>
+</table>
+<p><strong>At the model output</strong>, it is not detectable. Scoring 10941 tokens of real
+source text in a single prefill (mean logprob; lower is a worse model):</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>run</p></th>
+<th class="head text-right"><p>mean logprob</p></th>
+<th class="head text-right"><p>ppl</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>bf16</p></td>
+<td class="text-right"><p>-1.184169</p></td>
+<td class="text-right"><p>3.2680</p></td>
+</tr>
+<tr class="row-odd"><td><p>bf16, rerun</p></td>
+<td class="text-right"><p>-1.182018</p></td>
+<td class="text-right"><p>3.2609</p></td>
+</tr>
+<tr class="row-even"><td><p>bf16, again</p></td>
+<td class="text-right"><p>-1.180106</p></td>
+<td class="text-right"><p>3.2547</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>fp8</strong></p></td>
+<td class="text-right"><p><strong>-1.183895</strong></p></td>
+<td class="text-right"><p><strong>3.2671</strong></p></td>
+</tr>
+<tr class="row-even"><td><p>fp8, with debug</p></td>
+<td class="text-right"><p>-1.183358</p></td>
+<td class="text-right"><p>3.2653</p></td>
+</tr>
+</tbody>
+</table>
+<p>fp8 lands <strong>inside the bf16 run-to-run band</strong>. Paired per token against the same
+bf16 run:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>pair</p></th>
+<th class="head text-right"><p>mean d</p></th>
+<th class="head text-right"><p>sd d</p></th>
+<th class="head text-right"><p>max abs d</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>CONTROL bf16 rerun</p></td>
+<td class="text-right"><p>+0.002151</p></td>
+<td class="text-right"><p>0.229</p></td>
+<td class="text-right"><p>3.42</p></td>
+</tr>
+<tr class="row-odd"><td><p>CONTROL bf16 again</p></td>
+<td class="text-right"><p>+0.004063</p></td>
+<td class="text-right"><p>0.230</p></td>
+<td class="text-right"><p>4.05</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>TEST fp8</strong></p></td>
+<td class="text-right"><p><strong>+0.000274</strong></p></td>
+<td class="text-right"><p><strong>0.219</strong></p></td>
+<td class="text-right"><p><strong>2.93</strong></p></td>
+</tr>
+</tbody>
+</table>
+<p>On every statistic, fp8 is closer to bf16 than bf16 is to itself.</p>
+<p>That band is wide because <strong>this model is already strongly non-deterministic</strong>:
+two bf16 runs disagree on ~48% of tokens by more than 0.01 logprob, and greedy
+decode diverges within 10-20 tokens. The likely cause is the MoE stage-2
+epilogue, which accumulates with <code class="docutils literal notranslate"><span class="pre">atomic_fadd</span></code>. This is also why greedy token
+agreement is useless as a metric here — the bf16-vs-bf16 control is as divergent
+as bf16-vs-fp8:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>pair</p></th>
+<th class="head text-right"><p>~12k tok</p></th>
+<th class="head text-right"><p>~24k tok</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>CONTROL bf16 vs bf16</p></td>
+<td class="text-right"><p>35.9%</p></td>
+<td class="text-right"><p>15.6%</p></td>
+</tr>
+<tr class="row-odd"><td><p>TEST bf16 vs fp8</p></td>
+<td class="text-right"><p>28.1%</p></td>
+<td class="text-right"><p>23.4%</p></td>
+</tr>
+</tbody>
+</table>
+<p>Needle-in-a-haystack retrieval at 15140 tokens is <strong>24/24 on both wires</strong> —
+saturated, so it bounds gross damage without resolving anything finer.</p>
+<p><strong>What this does and does not say.</strong> It says fp8 causes no gross degradation and
+no measurable shift in next-token distribution on one scoring task. It does not
+say quality is unaffected on long-chain reasoning, code or maths — that needs a
+task benchmark, which has not been run. Note also that short prompts and decode
+never reach this path at all (it engages only at M &gt;= 4096), so only
+long-prefill workloads are affected.</p>
+</section>
+<section id="negative-results">
+<h2>Negative results<a class="headerlink" href="#negative-results" title="Link to this heading"></a></h2>
+<p>Kept because each reads as obviously right and the reason it is not cannot be
+seen from the source.</p>
+<p><strong>Folding the narrowing into the reduce</strong> (<code class="docutils literal notranslate"><span class="pre">fuse_quantize=True</span></code>) saves a 28 MiB
+re-read and a kernel launch, and costs 20 us:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p></p></th>
+<th class="head text-right"><p>us</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>split reduce + quantize</p></td>
+<td class="text-right"><p>957.4</p></td>
+</tr>
+<tr class="row-odd"><td><p>fused, row stashed in registers</p></td>
+<td class="text-right"><p>977.1</p></td>
+</tr>
+<tr class="row-even"><td><p>fused, row re-read</p></td>
+<td class="text-right"><p>982.0</p></td>
+</tr>
+</tbody>
+</table>
+<p>Not register pressure — the re-reading variant keeps no stash and is no better.
+It is the thread map: a per-row amax cannot be taken by a block holding only part
+of a row, so fusing forces one-wave-per-row, where <code class="docutils literal notranslate"><span class="pre">sdma_reduce</span></code> walks packs with
+a flat grid stride and streams a block through all 8 source slices at once.</p>
+<p>Re-measured with three repeats each, the cost holds and is if anything larger:
+926.6 against 903.2 on <code class="docutils literal notranslate"><span class="pre">fp8/lsa</span></code>, 980.4 against 961.9 on <code class="docutils literal notranslate"><span class="pre">fp8/sdma</span></code>.
+<code class="docutils literal notranslate"><span class="pre">build_sdma_phases</span></code> has always defaulted it off, so the op and SGLang take the
+fast path; the <em>benchmark</em> defaulted it on until <code class="docutils literal notranslate"><span class="pre">96bd9522</span></code>, and any number
+produced by an older driver without an explicit <code class="docutils literal notranslate"><span class="pre">--no-fuse-quantize</span></code> reads about
+23 us slow.</p>
+<p><strong>Firing the gather’s puts from inside the reduce</strong> (<code class="docutils literal notranslate"><span class="pre">fuse_reduce_push=True</span></code>)
+looked like the safest of the three: the push sends this rank’s <em>own</em> slice, so
+unlike the pull it has no cross-rank dependency, and SDMA is a copy engine so it
+costs no CU time. It reaches parity and not a win — against 1148.7us unfused:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>bands</p></th>
+<th class="head text-right"><p>1</p></th>
+<th class="head text-right"><p>4</p></th>
+<th class="head text-right"><p>8</p></th>
+<th class="head text-right"><p>16</p></th>
+<th class="head text-right"><p>32</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">publish=&quot;writethrough&quot;</span></code></p></td>
+<td class="text-right"><p>1162.1</p></td>
+<td class="text-right"><p><strong>1157.2</strong></p></td>
+<td class="text-right"><p>1160.3</p></td>
+<td class="text-right"><p>1190.1</p></td>
+<td class="text-right"><p>1323.5</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">publish=&quot;fence&quot;</span></code></p></td>
+<td class="text-right"><p>1227.3</p></td>
+<td class="text-right"><p>1380.1</p></td>
+<td class="text-right"><p>1630.3</p></td>
+<td class="text-right"><p>2137.2</p></td>
+<td class="text-right"><p>3026.7</p></td>
+</tr>
+</tbody>
+</table>
+<p>The gap between those rows is the useful result, and it is a lesson about how to
+pay for a release rather than whether to.</p>
+<p>Handing a range to a copy engine <em>does</em> need one: the engine reads over the
+fabric, not through a CU’s cache, so <code class="docutils literal notranslate"><span class="pre">s_waitcnt</span> <span class="pre">vmcnt(0)</span></code> alone is not enough —
+it only retires the stores as far as this XCD’s L2. But the release can be paid
+two ways. Releasing to system scope <strong>after</strong> the stores is L2-writeback work
+charged once per block per band (256 x bands of it, ~61us per band, against a
+reduce that is only 42us in total — unrepayable). Storing with <code class="docutils literal notranslate"><span class="pre">sc0+sc1</span></code> so the
+bytes never stop in L1 or L2 makes the <code class="docutils literal notranslate"><span class="pre">waitcnt</span></code> itself the release, and that is
+<strong>free here</strong>: applying the same store policy to the plain unfused reduce moves
+it 1153.4 -&gt; 1148.7us, i.e. nothing. This output is written once and nothing
+local reads it again before the gather, so holding it in L2 bought nothing.</p>
+<p>What remains after that fix is small on both sides and nearly cancels. At
+bands=1 the publish carries the mechanism’s cost with none of its benefit —
+1162.1 vs 1148.7, about 13us for the per-band 256-block <code class="docutils literal notranslate"><span class="pre">wait_barrier</span></code>, the
+counter atomic and the elected block’s locked puts. Four bands buy back about
+5us of overlap before the sync cost takes over again.</p>
+<p>Dropping the release entirely is not an option even though it briefly looks like
+one: with cached stores and no fence the kernel reaches 1157.9us, but at 32 bands
+it produced relL2 1.8e-2 against the 2.35e-3 floor, differing per rank. The same
+32 bands are exact under either correct publish mode, which rules out an indexing
+bug.</p>
+<p>The contrast with the GEMM’s fused scatter is the transferable part: there the
+publish is amortised against a 437us transfer hidden behind a compute-bound GEMM;
+here against 42us of bandwidth-saturated reduce. The mechanism pays when what is
+hidden is much larger than the cost of publishing it.</p>
+<p>Re-measured after the window-geometry work below, with three alternating
+repeats rather than a sweep, it is a clearer loss than the table suggests:
+1128.4 us on against 1112.0 off, +16.4 us, against spreads of 2.2 and 1.5 us.</p>
+<p><strong>Hoisting the window geometry out of <code class="docutils literal notranslate"><span class="pre">lsa_ptr</span></code>.</strong> <code class="docutils literal notranslate"><span class="pre">cco_lsa_ptr</span></code> is
+<code class="docutils literal notranslate"><span class="pre">winBase</span> <span class="pre">+</span> <span class="pre">peer*stride</span> <span class="pre">+</span> <span class="pre">offset</span></code> and loads both fields on every call, through a
+<em>generic</em> pointer – which has to be a <code class="docutils literal notranslate"><span class="pre">flat_load</span></code>, since the compiler cannot
+rule out LDS, so it counts against <code class="docutils literal notranslate"><span class="pre">lgkmcnt</span></code> as well as <code class="docutils literal notranslate"><span class="pre">vmcnt</span></code>. FlyDSL emits it
+as an opaque extern call, and a kernel storing through addresses derived from
+that base gives LLVM no way to prove the loads are not clobbered.</p>
+<p>Reading the geometry once and doing the arithmetic in the DSL removes all of
+that. It was tried four ways – hoisting out the band loop, a <code class="docutils literal notranslate"><span class="pre">lsa_geometry()</span></code>
+API, <code class="docutils literal notranslate"><span class="pre">global_load</span></code> accessors in C++ (<code class="docutils literal notranslate"><span class="pre">cco_lsa_win_base</span></code> / <code class="docutils literal notranslate"><span class="pre">cco_lsa_stride</span></code>, which
+take an <code class="docutils literal notranslate"><span class="pre">address_space(1)</span></code> pointer so each is a single <code class="docutils literal notranslate"><span class="pre">global_load</span></code>), and
+finally <code class="docutils literal notranslate"><span class="pre">cco.CachedWindow</span></code>, which reads both in its constructor so a kernel
+changes by one line. All four measured nothing on <code class="docutils literal notranslate"><span class="pre">kernels_sdma</span></code> (21 call sites)
+and <code class="docutils literal notranslate"><span class="pre">kernels_fused</span></code>, in every wire configuration.</p>
+<p>It pays in exactly one place (<code class="docutils literal notranslate"><span class="pre">ptpc</span></code>, three alternating repeats):</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p></p></th>
+<th class="head"><p>Window</p></th>
+<th class="head"><p>CachedWindow</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">split-lsa</span></code></p></td>
+<td><p>1264.69 1264.23 1264.85</p></td>
+<td><p>1250.25 1256.85 1254.53</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">fused-sdma</span></code></p></td>
+<td><p>1110.45 1109.77 1112.85</p></td>
+<td><p>1110.53 1113.69 1112.61</p></td>
+</tr>
+</tbody>
+</table>
+<p>-10.7 us on <code class="docutils literal notranslate"><span class="pre">split-lsa</span></code>, against a 0.6 us spread; nothing on <code class="docutils literal notranslate"><span class="pre">fused-sdma</span></code>.
+<code class="docutils literal notranslate"><span class="pre">ar_1stage</span></code>/<code class="docutils literal notranslate"><span class="pre">ar_2stage</span></code> build nine peer addresses in <em>every block</em> of a short
+kernel; everywhere else the addresses are built once per launch against a body
+that runs for a millisecond. <strong>Count address constructions per launch, not
+<code class="docutils literal notranslate"><span class="pre">grep</span> <span class="pre">-c</span> <span class="pre">lsa_ptr</span></code>.</strong></p>
+<p>The same holds against PR #662’s branch in <code class="docutils literal notranslate"><span class="pre">blockscale</span></code>, two alternating
+repeats: <code class="docutils literal notranslate"><span class="pre">split-lsa</span></code> 1463.6 -&gt; 1455.6 us, while <code class="docutils literal notranslate"><span class="pre">split-sdma</span></code> (1461.2 -&gt; 1459.9),
+<code class="docutils literal notranslate"><span class="pre">fused-sdma</span></code> bf16 (1144.9 -&gt; 1145.8) and fp8/lsa (949.2 -&gt; 949.8) do not move.</p>
+<p>Two things worth carrying. A <code class="docutils literal notranslate"><span class="pre">CachedWindow</span></code> cannot cross an <code class="docutils literal notranslate"><span class="pre">scf.if</span></code> – FlyDSL
+captures every variable an if body reads as state and requires single MLIR
+values, which <code class="docutils literal notranslate"><span class="pre">Window</span></code> satisfies only by having exactly one field – and the way
+out is to compute the addresses before the branch, which is what the offsets
+usually allow. And pin <code class="docutils literal notranslate"><span class="pre">--quant</span></code> when comparing against anything: the benchmark
+defaults to <code class="docutils literal notranslate"><span class="pre">ptpc</span></code>, ~3% faster than the <code class="docutils literal notranslate"><span class="pre">blockscale</span></code> every number on this page is
+quoted in, and reading one against the other looks exactly like a machine that
+drifts overnight.</p>
+<p><strong>A CK-shaped 4-wave GEMM</strong>, chasing a 22% gap against CK’s block-scale kernel
+at the same shape, reached CK’s instruction mix and not its speed. Ten hypotheses
+were falsified by measurement; hardware counters show identical <code class="docutils literal notranslate"><span class="pre">SQ_INSTS_MFMA</span></code>
+(7,340,032) and <code class="docutils literal notranslate"><span class="pre">SQ_VALU_MFMA_BUSY_CYCLES</span></code> (234,881,024), VALU within 1%,
+<code class="docutils literal notranslate"><span class="pre">MemUnitStalled</span></code> at approximately zero — but <code class="docutils literal notranslate"><span class="pre">SQ_WAIT_ANY</span></code> 156.0M against 120.4M.
+A K-sweep puts the whole difference per-iteration: our fixed cost is <em>lower</em>
+(51.6 us against 66.0), while each K-block costs 20.9 us against 14.5. The gap is
+wait, not work. See commits <code class="docutils literal notranslate"><span class="pre">cc696762</span></code>, <code class="docutils literal notranslate"><span class="pre">54fef960</span></code>, <code class="docutils literal notranslate"><span class="pre">9f990637</span></code>, <code class="docutils literal notranslate"><span class="pre">1dead3fc</span></code>.</p>
+</section>
+<section id="reproducing-the-end-to-end-numbers">
+<h2>Reproducing the end-to-end numbers<a class="headerlink" href="#reproducing-the-end-to-end-numbers" title="Link to this heading"></a></h2>
+<p>The SGLang numbers need the integration branch and a mori built with
+<code class="docutils literal notranslate"><span class="pre">BUILD_CCO_SDMA=ON</span></code> on <code class="docutils literal notranslate"><span class="pre">PYTHONPATH</span></code>.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">MORI_ENABLE_SDMA</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">MORI_SOCKET_IFNAME</span><span class="o">=</span>lo
+<span class="nb">export</span><span class="w"> </span><span class="nv">PYTHONPATH</span><span class="o">=</span>/path/to/mori-with-sdma
+<span class="nb">export</span><span class="w"> </span><span class="nv">SGLANG_OPT_FUSED_WO_B_AR</span><span class="o">=</span><span class="m">1</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">SGLANG_OPT_FUSED_WO_B_AR_FP8_GATHER</span><span class="o">=</span><span class="m">1</span><span class="w">     </span><span class="c1"># optional, the fp8 wire</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">SGLANG_DEBUG_FUSED_WO_B_AR</span><span class="o">=</span><span class="m">1</span><span class="w">              </span><span class="c1"># optional, logs per-layer relL2</span>
+
+sglang<span class="w"> </span>serve<span class="w"> </span>--model-path<span class="w"> </span>&lt;DeepSeek-V4-Pro&gt;<span class="w"> </span>--tp<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--attention-backend<span class="w"> </span>dsv4<span class="w"> </span>--page-size<span class="w"> </span><span class="m">256</span><span class="w"> </span>--chunked-prefill-size<span class="w"> </span><span class="m">16384</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--mem-fraction-static<span class="w"> </span><span class="m">0</span>.88<span class="w"> </span>--kv-cache-dtype<span class="w"> </span>fp8_e4m3<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--enforce-shared-experts-fusion
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">--mem-fraction-static</span></code> has to leave room for the symmetric window, which is VMM
+memory <strong>outside</strong> torch’s allocator: 700 MiB on the bf16 wire and 812 MiB on
+fp8, which needs the extra staging region.</p>
+<p>The capture protocol matters more than it looks. Profile a <em>different</em> prompt
+than the one used to warm up, <code class="docutils literal notranslate"><span class="pre">flush_cache</span></code> between them, and compare the same
+request on both sides — an earlier A/B without those controls reported a <strong>+8.3%
+regression</strong> that did not exist.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">warm</span> <span class="o">=</span> <span class="s2">"Pack my box with five dozen liquor jugs. "</span> <span class="o">*</span> <span class="mi">2800</span>
+<span class="n">main</span> <span class="o">=</span> <span class="s2">"The quick brown fox jumps over the lazy dog. "</span> <span class="o">*</span> <span class="mi">2800</span>
+<span class="n">gen</span><span class="p">(</span><span class="n">warm</span><span class="p">);</span> <span class="n">post</span><span class="p">(</span><span class="s2">"/flush_cache"</span><span class="p">);</span> <span class="n">post</span><span class="p">(</span><span class="s2">"/start_profile"</span><span class="p">)</span>
+<span class="n">gen</span><span class="p">(</span><span class="n">main</span><span class="p">);</span> <span class="n">post</span><span class="p">(</span><span class="s2">"/stop_profile"</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>GPU busy time over that capture:</p>
+<p>GPU busy over that capture:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p></p></th>
+<th class="head text-right"><p>GPU busy</p></th>
+<th class="head text-right"><p>wall</p></th>
+<th class="head text-right"><p>vs unfused</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>unfused (GEMM + NCCL)</p></td>
+<td class="text-right"><p>1096.0 ms</p></td>
+<td class="text-right"><p>1.1969 s</p></td>
+<td class="text-right"><p>—</p></td>
+</tr>
+<tr class="row-odd"><td><p>fused, bf16 wire</p></td>
+<td class="text-right"><p>1070.3</p></td>
+<td class="text-right"><p>1.1728</p></td>
+<td class="text-right"><p>-2.3%</p></td>
+</tr>
+<tr class="row-even"><td><p>fused, fp8 / sdma</p></td>
+<td class="text-right"><p>1052.1</p></td>
+<td class="text-right"><p>1.1455</p></td>
+<td class="text-right"><p>-4.0%</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>fused, fp8 / lsa</strong></p></td>
+<td class="text-right"><p><strong>1041.2</strong></p></td>
+<td class="text-right"><p><strong>1.1385</strong></p></td>
+<td class="text-right"><p><strong>-5.0%</strong></p></td>
+</tr>
+</tbody>
+</table>
+<p>An earlier capture of the same four read 1101.9 / 1077.2 / 1050.4 / 1048.2, so
+this reproduces to about half a percent.</p>
+<blockquote>
+<div><p><strong>Check <code class="docutils literal notranslate"><span class="pre">BUILD_CCO_SDMA=ON</span></code> before believing any end-to-end number.</strong> With it
+off every put silently does nothing: the all-reduce returns mostly the local
+slice, the model still answers fluently, every mori kernel still appears in
+the profile, and the fused path measures <strong>faster</strong> than it is because it is
+not moving data – -6.8% instead of -2.3%, with fp8/lsa appearing <em>worst</em> of
+the three rather than best, since the pull is the one leg that does not go
+through SDMA. Perplexity catches it and nothing cheaper does: 862511 against
+3.26 on the same text. A short prompt cannot catch it either, because fusing
+needs M &gt;= 4096.</p>
+</div></blockquote>
+<p>The layer-level win is larger than the end-to-end one because <code class="docutils literal notranslate"><span class="pre">wo_b</span></code> is about
+12% of the profile.</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="MORI-EP-BENCHMARK.html" class="btn btn-neutral float-left" title="MORI-EP Benchmark" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="MORI-IO-BENCHMARK.html" class="btn btn-neutral float-right" title="MORI-IO Benchmark" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, AMD.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>
