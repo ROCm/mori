@@ -533,6 +533,37 @@ TEST_F(PoolClientRangesTest, ExplicitBatchPrefetchReroutesOnceAfterAStaleSource)
   replica->Shutdown();
 }
 
+TEST_F(PoolClientRangesTest, Tp4BatchPrefetchBetweenTwoPoolsOnOneHost) {
+  constexpr size_t kTpSize = 4;
+  std::vector<std::string> keys;
+  std::vector<std::vector<char>> objects;
+  keys.reserve(kTpSize);
+  objects.reserve(kTpSize);
+  for (size_t rank = 0; rank < kTpSize; ++rank) {
+    keys.push_back("tp4-prefetch-rank-" + std::to_string(rank));
+    objects.emplace_back(kObjectSize);
+    for (size_t i = 0; i < kObjectSize; ++i) {
+      objects.back()[i] = static_cast<char>((rank * 37 + i * 11) & 0xff);
+    }
+    SeedRemoteObject(keys.back(), objects.back());
+    ASSERT_FALSE(LocallyResident(caller_.get(), keys.back()));
+  }
+
+  EXPECT_EQ(caller_->BatchPrefetch(keys), std::vector<bool>(kTpSize, true));
+  for (const auto& key : keys) EXPECT_TRUE(LocallyResident(caller_.get(), key));
+
+  // Remove the source before restoring all four TP shards. A successful read
+  // therefore proves the batch was materialized in the target pool.
+  target_->Shutdown();
+  std::vector<std::vector<char>> restored(kTpSize, std::vector<char>(kObjectSize, 0));
+  std::vector<void*> dsts;
+  dsts.reserve(kTpSize);
+  for (auto& shard : restored) dsts.push_back(shard.data());
+  EXPECT_EQ(caller_->BatchGet(keys, dsts, std::vector<size_t>(kTpSize, kObjectSize)),
+            std::vector<bool>(kTpSize, true));
+  EXPECT_EQ(restored, objects);
+}
+
 TEST_F(PoolClientRangesTest, LocalCopyOnlyRegistrationServesRangesAndSharesOnePlan) {
   // kLocalCopyOnly records a region without handing it to the IO engine. It
   // exists because the two halves of "register" are separable: a region that is

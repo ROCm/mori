@@ -300,6 +300,20 @@ target_link_libraries(
           gtest_main)
 add_test(NAME umbp_pool_client_ranges COMMAND test_umbp_pool_client_ranges)
 
+# Manual two-process/two-host TP8 prefetch harness. It is intentionally not
+# registered with CTest: both copies must be launched together with distinct
+# node addresses/ports and a shared coordination directory.
+add_executable(test_umbp_prefetch_tp_cross_host
+               test_prefetch_tp_cross_host.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_prefetch_tp_cross_host PRIVATE
+                      -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_prefetch_tp_cross_host
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+
 # test_umbp_ssd_ranged_io — ranged multi-buffer I/O on an SSD-medium node
 # (doc/design-ssd-ranged-io.md, D0): the capability flag now turning on the
 # arena alone, plus local and remote ranged put/get against an SSD-only peer.
