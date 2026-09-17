@@ -353,6 +353,88 @@ def test_blockscale_lands_at_the_fp8_floor(m, n, k):
     assert rel < 3e-3, f"blockscale relL2 {rel:.3e} against the fp32 reference"
 
 
+@pytest.mark.parametrize("m,n,k", [(1024, 512, 512), (2048, 5120, 2048)])
+def test_mxfp8_lands_at_the_fp8_floor(m, n, k):
+    """``quant="mxfp8"`` -- DeepSeek-V4.1-Flash's quantisation -- against fp32.
+
+    32-wide ue8m0 on both sides, which is the scaled MFMA's own operand format:
+    the four scales of a K=128 step are gathered *across lanes* (lane ``16*s+r``
+    supplies block ``s`` of row ``r``) and applied in hardware, so unlike
+    ``blockscale`` there is no promote arithmetic in the mainloop at all.
+
+    The scales must be exact powers of two -- ue8m0 is an exponent with no
+    mantissa -- so the only error here is the fp8 rounding of the operands,
+    same floor as the other two quantisations. A wrong lane mapping does not
+    land near the floor: it misses by the ratio of two random powers of two.
+
+    ``n=5120, k=2048`` is ``wo_b`` per rank at TP4 on V4.1-Flash.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires a GPU")
+    pytest.importorskip("flydsl")
+    import flydsl.expr as fx
+
+    from mori.ops.gemm_ar import compile_fused_gemm_scatter, preshuffle_b
+
+    BK = 32
+    g = torch.Generator(device="cuda").manual_seed(11)
+    a = (torch.randn(m, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
+    b = (torch.randn(n, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
+    # ue8m0 exponent bytes around 2**-7; the kernel reads them as int32 at
+    # op_sel 0, so the byte sits in the low 8 bits.
+    ea = torch.randint(
+        120, 123, (m, k // BK), generator=g, device="cuda", dtype=torch.int32
+    )
+    eb = torch.randint(
+        120, 123, (n // BK, k // BK), generator=g, device="cuda", dtype=torch.int32
+    )
+    sa, sb = torch.exp2(ea.float() - 127.0), torch.exp2(eb.float() - 127.0)
+    b_shuf = preshuffle_b(b)
+
+    af, bf = a.float(), b.float()
+    ref = torch.zeros(m, n, device="cuda", dtype=torch.float32)
+    for i in range(k // BK):
+        ks = slice(i * BK, (i + 1) * BK)
+        ref += (
+            (af[:, ks] @ bf[:, ks].T)
+            * sa[:, i][:, None]
+            * sb[:, i].repeat_interleave(BK)[None, :]
+        )
+    rn = ref.norm()
+
+    cfg = layout.ArConfig(world_size=2, m=m, n=n)
+    gemm = compile_fused_gemm_scatter(
+        cfg,
+        0,
+        K=k,
+        BLOCK_M=256,
+        BLOCK_N=256,
+        b_preshuffled=True,
+        fuse=False,
+        swap_ab=True,
+        permlane=True,
+        lane_transpose=True,
+        quant="mxfp8",
+    )
+    ours = torch.zeros(m, n, device="cuda", dtype=torch.bfloat16)
+    gemm(
+        a.contiguous().view(torch.int8).view(-1),
+        b_shuf.contiguous().view(torch.int8).view(-1),
+        ours.view(-1),
+        ea.reshape(-1).contiguous(),
+        eb.reshape(-1).contiguous(),
+        m,
+        n,
+        0,
+        0,
+        stream=fx.Stream(torch.cuda.current_stream()),
+    )
+    torch.cuda.synchronize()
+
+    rel = ((ours.float() - ref).norm() / rn).item()
+    assert rel < 3e-3, f"mxfp8 relL2 {rel:.3e} against the fp32 reference"
+
+
 @pytest.mark.parametrize("m,n,k", [(512, 512, 256), (4096, 7168, 1024)])
 def test_swap_ab_is_bitwise_identical(m, n, k):
     """Exchanging the MFMA operands must not change a single bit.

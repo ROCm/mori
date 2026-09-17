@@ -133,6 +133,28 @@ def _setup_distributed():
 #: (``aiter_per1x128_quant``) and by the kernel, whose BLOCK_K is already 128.
 SCALE_BK = 128
 
+#: MXFP8 block size, along K for A and along both N and K for B. Fixed by the
+#: scaled MFMA, which carries one ue8m0 scale per 32 K per row, and by
+#: DeepSeek-V4.1-Flash's checkpoint (``weight_block_size [32, 32]``,
+#: ``scale_fmt "ue8m0"``).
+MXFP8_BK = 32
+
+
+def _ue8m0_bytes(shape, g, lo=120, hi=123):
+    """Random ue8m0 exponent bytes, i.e. scales 2**(byte-127) around 1e-2.
+
+    ue8m0 *is* the exponent: there is no mantissa, so every scale is exactly a
+    power of two and applying it is lossless. That is the whole reason the
+    scaled MFMA can take it as an operand.
+    """
+    e = torch.randint(lo, hi, shape, generator=g, device="cuda", dtype=torch.int32)
+    return e.to(torch.uint8)
+
+
+def _ue8m0_value(e: torch.Tensor) -> torch.Tensor:
+    """ue8m0 exponent bytes -> the fp32 powers of two they denote."""
+    return torch.exp2(e.to(torch.float32) - 127.0)
+
 
 def make_operands(rank: int, m: int, n: int, k: int, quant: str = "ptpc"):
     """Deterministic per-rank fp8 operands and their scales.
@@ -164,8 +186,16 @@ def make_operands(rank: int, m: int, n: int, k: int, quant: str = "ptpc"):
             torch.rand(n, generator=g, device="cuda", dtype=torch.float32) * 0.01 + 0.01
         )
         return a, b, sa, sb
+    if quant == "mxfp8":
+        # DeepSeek-V4.1-Flash's dense form: A per-32-K, B per-32x32, both ue8m0.
+        # Scales stay as exponent bytes all the way to the MFMA, which is what
+        # the instruction's scale operand reads.
+        kb = k // MXFP8_BK
+        sa = _ue8m0_bytes((m, kb), g)
+        sb = _ue8m0_bytes((n // MXFP8_BK, kb), g)
+        return a, b, sa.contiguous(), sb.contiguous()
     if quant != "blockscale":
-        raise ValueError(f"quant must be ptpc or blockscale, got {quant!r}")
+        raise ValueError(f"quant must be ptpc, blockscale or mxfp8, got {quant!r}")
     kb = k // SCALE_BK
     sa = (
         torch.rand(m, kb, generator=g, device="cuda", dtype=torch.float32) * 0.01 + 0.01
@@ -183,6 +213,17 @@ def reference_partial(a, b, sa, sb, quant: str) -> torch.Tensor:
     af, bf = a.float(), b.float()
     if quant == "ptpc":
         return (af @ bf.T) * sa[:, None] * sb[None, :]
+    if quant == "mxfp8":
+        sav, sbv = _ue8m0_value(sa), _ue8m0_value(sb)
+        out = torch.zeros(a.shape[0], b.shape[0], device=a.device, dtype=torch.float32)
+        for i in range(a.shape[1] // MXFP8_BK):
+            ks = slice(i * MXFP8_BK, (i + 1) * MXFP8_BK)
+            out += (
+                (af[:, ks] @ bf[:, ks].T)
+                * sav[:, i][:, None]
+                * sbv[:, i].repeat_interleave(MXFP8_BK)[None, :]
+            )
+        return out
     out = torch.zeros(a.shape[0], b.shape[0], device=a.device, dtype=torch.float32)
     for i in range(a.shape[1] // SCALE_BK):
         ks = slice(i * SCALE_BK, (i + 1) * SCALE_BK)
@@ -348,6 +389,14 @@ def run(args) -> int:
         if args.quant == "blockscale":
             sa_arg = sa.t().reshape(-1).contiguous()
             sb_arg = sb.reshape(-1).contiguous()
+        elif args.quant == "mxfp8":
+            # ue8m0 exponent bytes widened to int32 with the byte in the low 8
+            # bits: the MFMA's scale operand is a 32-bit register read at
+            # op_sel 0, so this is what it wants, and it keeps the kernel on a
+            # plain dword load. Both arrays stay row-major -- A [M, K/32],
+            # B [N/32, K/32] -- which is what `_Mxfp8ScaleK` indexes.
+            sa_arg = sa.to(torch.int32).reshape(-1).contiguous()
+            sb_arg = sb.to(torch.int32).reshape(-1).contiguous()
         else:
             sa_arg, sb_arg = sa, sb
 
@@ -537,7 +586,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-k", type=int, default=1024)
     p.add_argument(
         "--quant",
-        choices=("ptpc", "blockscale"),
+        choices=("ptpc", "blockscale", "mxfp8"),
         default="ptpc",
         help="a8w8 per-token/per-channel (the aiter 8wave kernel's native form) "
         "or the model's 1x128 / 128x128 block scale. blockscale applies the "

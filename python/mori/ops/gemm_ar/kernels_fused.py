@@ -184,8 +184,14 @@ class _SwappedMfma:
     def idx(self, i, j):
         return self._inner.idx(j, i)
 
-    def call(self, a, b, c, *, set_prio=True):
-        return self._inner.call(b, a, c, set_prio=set_prio)
+    def call(self, a, b, c, *, set_prio=True, scale_a=None, scale_b=None):
+        # The scales follow their operands: with the exchange the instruction's
+        # A is our B, so its scale_a must be our B scale. The lane mapping is
+        # unaffected -- row is still ``lane % 16`` and the 32-block still
+        # ``lane // 16`` -- only which matrix that row indexes changes.
+        return self._inner.call(
+            b, a, c, set_prio=set_prio, scale_a=scale_b, scale_b=scale_a
+        )
 
 
 class _BlockScaleK:
@@ -345,6 +351,106 @@ class _BlockScaleK:
             self.scale_acc(c01, fa0, fb1, idx_fn, n_tiles_b),
             self.scale_acc(c10, fa1, fb0, idx_fn, n_tiles_b),
             self.scale_acc(c11, fa1, fb1, idx_fn, n_tiles_b),
+        )
+
+
+class _Mxfp8ScaleK:
+    """DeepSeek-V4.1-Flash's 32-wide ue8m0 scales, fed to the MFMA as operands.
+
+    The checkpoint quantises A per 32 K and B per 32x32 with ue8m0 -- exponent
+    only, so every scale is exactly a power of two and applying it is lossless.
+    That is precisely the operand format of
+    ``v_mfma_scale_f32_16x16x128_f8f6f4``, so unlike ``_BlockScaleK`` there is
+    **no arithmetic here at all**: no second accumulator, no running rescale, no
+    division. One MFMA consumes a whole K=128 step with its four 32-blocks
+    already dequantised in hardware. ``_BlockScaleK`` exists only because a
+    128-wide block cannot be expressed this way.
+
+    Lane mapping (from sglang's ``mxfp8_gemv_gfx95.cuh``, whose header notes it
+    was measured with a lane probe and is not documented): lane ``16*s + r``
+    supplies the ue8m0 scale of 32-block ``s`` of row ``r``, at op_sel 0. So for
+    a K step ``ks`` this lane wants block ``4*ks + lane//16`` of row
+    ``lane % 16`` -- one scalar per tile, and the same shape of index
+    ``_BlockScaleK.a_scales`` already uses under ``swap_ab``.
+
+    Scales arrive as int32 with the exponent byte in the low 8 bits rather than
+    as packed uint8. The MFMA's scale operand is a 32-bit register read at
+    op_sel 0, so the widening is free at the instruction; doing it on the host
+    costs 4x on an array that is 1 MB against the weight's hundreds, and buys a
+    plain dword load here instead of sub-dword addressing.
+    """
+
+    #: ue8m0 block size along K (and along N for B). Fixed by the checkpoint
+    #: and by the instruction.
+    BLOCK = 32
+
+    def __init__(self, A_scale, B_scale, m, n, k, *, n_tiles_a, n_tiles_b):
+        self.kb_count = k // self.BLOCK
+        self.n_tiles_a = n_tiles_a
+        self.n_tiles_b = n_tiles_b
+        self.lane = fx.thread_idx.x % 64
+        gSA = fx.rocdl.make_buffer_tensor(
+            A_scale, max_size=False, num_records_bytes=m * self.kb_count * 4
+        )
+        gSB = fx.rocdl.make_buffer_tensor(
+            B_scale,
+            max_size=False,
+            num_records_bytes=(n // self.BLOCK) * self.kb_count * 4,
+        )
+        self.sa_div = fx.logical_divide(gSA, fx.make_layout(1, 1))
+        self.sb_div = fx.logical_divide(gSB, fx.make_layout(1, 1))
+        self.atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
+        self.reg_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int32)
+
+    def _load1(self, div, index):
+        fx.copy(self.atom_1, fx.slice(div, (None, fx.Int32(index))), self.reg_1)
+        return Vec(fx.memref_load_vec(self.reg_1))[0]
+
+    def _kb(self, ks):
+        """This lane's 32-block for K step ``ks``: block ``4*ks + lane//16``."""
+        return fx.Int32(ks * 4) + self.lane // 16
+
+    def a_scales(self, base_row, ks):
+        """Per M-tile A scale operand, ``A_scale`` row-major ``[M, K/32]``."""
+        kb = self._kb(ks)
+        row = base_row + self.lane % 16
+        return [
+            self._load1(self.sa_div, (row + ti * 16) * fx.Int32(self.kb_count) + kb)
+            for ti in range_constexpr(self.n_tiles_a)
+        ]
+
+    def b_scales(self, base_col, ks):
+        """Per N-tile B scale operand, ``B_scale`` row-major ``[N/32, K/32]``.
+
+        A 16-column tile never straddles a 32-column group (``base_col`` is a
+        multiple of 16), so the group index is constant across the tile's rows
+        and the divide folds away for the aligned half.
+        """
+        kb = self._kb(ks)
+        col = base_col + self.lane % 16
+        return [
+            self._load1(
+                self.sb_div,
+                ((col + tj * 16) // fx.Int32(self.BLOCK)) * fx.Int32(self.kb_count)
+                + kb,
+            )
+            for tj in range_constexpr(self.n_tiles_b)
+        ]
+
+    def step(self, base_row, base_col, ks, lds_block_m, lds_block_n):
+        """The A/B scale operands of K step ``ks`` for the four LDS halves.
+
+        Returned in the order the mainloop consumes them: ``(a0, a1, b0, b1)``,
+        pairing as c00=(a0,b0), c01=(a0,b1), c10=(a1,b0), c11=(a1,b1). A method
+        rather than a closure for the reason ``_BlockScaleK.rescale_for``
+        documents: FlyDSL rewrites the AST of every ``def`` nested in a kernel
+        and that turns captured instances into locals.
+        """
+        return (
+            self.a_scales(base_row + 0 * lds_block_m, ks),
+            self.a_scales(base_row + 1 * lds_block_m, ks),
+            self.b_scales(base_col + 0 * lds_block_n, ks),
+            self.b_scales(base_col + 1 * lds_block_n, ks),
         )
 
 
@@ -877,20 +983,28 @@ def compile_fused_gemm_scatter(
             "--lane-transpose for the real thing on --mode fused-lsa"
         )
     direct_lsa = fuse and transport == "lsa"
-    if quant not in ("ptpc", "blockscale"):
-        raise ValueError(f"quant must be ptpc or blockscale, got {quant!r}")
+    if quant not in ("ptpc", "blockscale", "mxfp8"):
+        raise ValueError(f"quant must be ptpc, blockscale or mxfp8, got {quant!r}")
     blockscale = quant == "blockscale"
+    mxfp8 = quant == "mxfp8"
+    if (blockscale or mxfp8) and not swap_ab:
+        raise ValueError(
+            f"--quant {quant} needs --swap-ab: the unswapped epilogue "
+            "applies its scales inside the stock StoreC, which this copy does "
+            "not override"
+        )
     if blockscale:
-        if not swap_ab:
-            raise ValueError(
-                "--quant blockscale needs --swap-ab: the unswapped epilogue "
-                "applies its scales inside the stock StoreC, which this copy does "
-                "not override"
-            )
         if K % 128:
             raise ValueError(f"blockscale needs K % 128 == 0, got K={K}")
         if N % 128:
             raise ValueError(f"blockscale needs N % 128 == 0, got N={N}")
+    if mxfp8:
+        # K by the MFMA's own step, N by the 32-column scale group. Both hold
+        # for DeepSeek-V4.1-Flash's wo_b: N=5120, K=8192/tp.
+        if K % 128:
+            raise ValueError(f"mxfp8 needs K % 128 == 0, got K={K}")
+        if N % _Mxfp8ScaleK.BLOCK:
+            raise ValueError(f"mxfp8 needs N % {_Mxfp8ScaleK.BLOCK} == 0, got N={N}")
     rotated = fuse if rotated is None else rotated
     # n_stripe spans 1..N//BLOCK_N; the top of the range *is* chunk-major, so
     # 0 ("per-mode default") resolves to it rather than to a separate branch.
@@ -1219,6 +1333,16 @@ def compile_fused_gemm_scatter(
         # visible to a nested def afterwards (a `nonlocal` on one raised "no
         # binding" and reading one raised UnboundLocalError).
         bsk = nb0 = base_row_pre = None
+        msk = base_col_pre = None
+        if mxfp8:
+            # Same deal as blockscale: the scales land in the accumulator during
+            # the mainloop, so the epilogue must not apply them again.
+            store_c._preapplied = True
+            msk = _Mxfp8ScaleK(
+                A_scale, B_scale, c_m, N, K, n_tiles_a=N_TILES_A, n_tiles_b=N_TILES_B
+            )
+            base_row_pre = block_m * BLOCK_M + wave_m * (N_TILES_A * 16)
+            base_col_pre = block_n * BLOCK_N + wave_n * (N_TILES_B * 16)
         if blockscale:
             # Set after construction rather than threading a kwarg through
             # thirteen call sites: it is a trace-time Python bool read by
@@ -1271,24 +1395,29 @@ def compile_fused_gemm_scatter(
                     n_tiles_b=N_TILES_B,
                     lds_block_m=LDS_BLOCK_M,
                 )
+            msa0 = msa1 = msb0 = msb1 = None
+            if mxfp8:
+                msa0, msa1, msb0, msb1 = msk.step(
+                    base_row_pre, base_col_pre, k, LDS_BLOCK_M, LDS_BLOCK_N
+                )
             b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
             a0_frag = a_s2r.load(a_cur0)
             a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
             rocdl.s_barrier()
 
-            c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
+            c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, scale_a=msa0, scale_b=msb0)
 
             b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
             b_g2s.load(b_cur0, B0_gl_offset + (k + 2) * B_K_STEP)
             rocdl.s_barrier()
 
-            c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
+            c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, scale_a=msa0, scale_b=msb1)
 
             a1_frag = a_s2r.load(a_cur1)
             a_g2s.load(a_cur0, A0_gl_offset + (k + 2) * BLOCK_K)
             rocdl.s_barrier()
 
-            c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
+            c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, scale_a=msa1, scale_b=msb0)
 
             b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * B_K_STEP)
             # aiter has `2 * N_LDS_STEPS_A + N_LDS_STEPS_B` here, which lets
@@ -1312,7 +1441,7 @@ def compile_fused_gemm_scatter(
             # measurably correct here, not a proven-general formula.
             wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B - 1)
 
-            c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
+            c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, scale_a=msa1, scale_b=msb1)
 
             a_cur0, a_next0 = a_next0, a_cur0
             a_cur1, a_next1 = a_next1, a_cur1
@@ -1331,27 +1460,32 @@ def compile_fused_gemm_scatter(
                 n_tiles_b=N_TILES_B,
                 lds_block_m=LDS_BLOCK_M,
             )
+        msa0 = msa1 = msb0 = msb1 = None
+        if mxfp8:
+            msa0, msa1, msb0, msb1 = msk.step(
+                base_row_pre, base_col_pre, K_ITERS - 2, LDS_BLOCK_M, LDS_BLOCK_N
+            )
         b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
         a0_frag = a_s2r.load(a_cur0)
         rocdl.s_barrier()
 
-        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
+        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, scale_a=msa0, scale_b=msb0)
 
         b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
         rocdl.s_barrier()
 
-        c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
+        c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, scale_a=msa0, scale_b=msb1)
 
         a1_frag = a_s2r.load(a_cur1)
         a_g2s.load(a_next1, A1_gl_offset + (K_ITERS - 1) * BLOCK_K)
         rocdl.s_barrier()
 
-        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
+        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, scale_a=msa1, scale_b=msb0)
 
         b0_frag = b_s2r.load(b_next0, preshuffled=b_preshuffled)
         rocdl.s_barrier()
 
-        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
+        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, scale_a=msa1, scale_b=msb1)
 
         a_cur0, a_next0 = a_next0, a_cur0
         a_cur1, a_next1 = a_next1, a_cur1
@@ -1370,22 +1504,31 @@ def compile_fused_gemm_scatter(
                 n_tiles_b=N_TILES_B,
                 lds_block_m=LDS_BLOCK_M,
             )
+        msa0 = msa1 = msb0 = msb1 = None
+        if mxfp8:
+            msa0, msa1, msb0, msb1 = msk.step(
+                base_row_pre, base_col_pre, K_ITERS - 1, LDS_BLOCK_M, LDS_BLOCK_N
+            )
         a0_frag = a_s2r.load(a_cur0)
         wait_barrier(0)
 
-        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
+        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, scale_a=msa0, scale_b=msb0)
 
         b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
         rocdl.s_barrier()
 
-        c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
+        c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, scale_a=msa0, scale_b=msb1)
 
         a1_frag = a_s2r.load(a_cur1)
         rocdl.s_barrier()
 
         rocdl.s_setprio(1)
-        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, set_prio=False)
-        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, set_prio=False)
+        c10_frag = mfma.call(
+            a1_frag, b0_frag, c10_frag, set_prio=False, scale_a=msa1, scale_b=msb0
+        )
+        c11_frag = mfma.call(
+            a1_frag, b1_frag, c11_frag, set_prio=False, scale_a=msa1, scale_b=msb1
+        )
         rocdl.s_setprio(0)
         rocdl.s_barrier()
 

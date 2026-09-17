@@ -309,10 +309,27 @@ class Mfma16x16x128:
         fx.gemm(self.atom, c_frag, a_frag, b_frag, c_frag)
         return c_frag.load().ir_value()
 
-    def call(self, a, b, c, *, set_prio=True):
+    def call(self, a, b, c, *, set_prio=True, scale_a=None, scale_b=None):
+        """``scale_a`` / ``scale_b``, when given, are per-tile ue8m0 operands.
+
+        ``v_mfma_scale_f32_16x16x128_f8f6f4`` carries one ue8m0 scale per 32 K
+        per row and gathers the four of them *across lanes*: lane ``16*s + r``
+        supplies block ``s`` of row ``r`` at op_sel 0. So one MFMA consumes a
+        whole K=128 step with its four 32-blocks already dequantised in
+        hardware -- there is no promote arithmetic to schedule, which is the
+        entire reason the 32-wide form is cheaper than ``_BlockScaleK``'s
+        128-wide rescale chain.
+
+        Leaving both None keeps the unscaled call byte-for-byte as it was.
+        """
         assert len(a) == self.n_tiles_a
         assert len(b) == self.n_tiles_b
         assert len(c) == self.n_tiles_a * self.n_tiles_b
+        scaled = scale_a is not None
+        assert scaled == (scale_b is not None), "pass both scales or neither"
+        if scaled:
+            assert len(scale_a) == self.n_tiles_a
+            assert len(scale_b) == self.n_tiles_b
 
         a_frags = [
             self._make_operand_frag(a[idx]) for idx in range_constexpr(self.n_tiles_a)
@@ -329,7 +346,18 @@ class Mfma16x16x128:
         for i in range_constexpr(self.n_tiles_a):
             for j in range_constexpr(self.n_tiles_b):
                 cf = c_frags[self.idx(i, j)]
-                fx.gemm(self.atom, cf, a_frags[i], b_frags[j], cf)
+                if const_expr(scaled):
+                    fx.gemm(
+                        self.atom,
+                        cf,
+                        a_frags[i],
+                        b_frags[j],
+                        cf,
+                        scale_a=scale_a[i],
+                        scale_b=scale_b[j],
+                    )
+                else:
+                    fx.gemm(self.atom, cf, a_frags[i], b_frags[j], cf)
         if const_expr(set_prio):
             rocdl.s_setprio(0)
             rocdl.s_barrier()
