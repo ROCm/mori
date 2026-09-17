@@ -55,7 +55,7 @@ def invalid_constexpr_axis_kernel(
 
 
 def test_all_cco_device_symbols_are_exported_to_triton():
-    assert len(CCO_DEVICE_FUNCTIONS) == 68
+    assert len(CCO_DEVICE_FUNCTIONS) == 70
     assert set(CCO_DEVICE_FUNCTIONS).issubset(cco.__all__)
     for name in CCO_DEVICE_FUNCTIONS:
         assert callable(getattr(cco, name))
@@ -180,6 +180,8 @@ def test_flydsl_and_triton_share_the_same_scalar_abi():
         *_bindings.SDMA_COMMIT.values(),
         _bindings.cco_sdma_quiet_queue,
         _bindings.cco_lsa_ptr,
+        _bindings.cco_lsa_win_base,
+        _bindings.cco_lsa_stride,
         _bindings.cco_system_fence,
         _bindings.cco_devcomm_rank,
         _bindings.cco_devcomm_world_size,
