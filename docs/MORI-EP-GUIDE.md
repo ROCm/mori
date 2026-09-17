@@ -280,6 +280,54 @@ combine_buf[:recv_num_token, :].copy_(expert_output[:recv_num_token, :])
 
 ---
 
+### Adaptive MORI/Kiwi backend selection
+
+`AdaptiveEpDispatchCombineOp` keeps a MORI operator and a Kiwi operator alive
+and selects one backend for each complete dispatch/combine pair. The selection
+key defaults to `dispatch_input.size(0)`. Callers may provide
+`selection_num_tokens_fn` to derive a rank-consistent selection count. For
+example, when used with vLLM, the wrapper uses the maximum token count across DP
+ranks reported by vLLM's forward context. CUDA-graph capture records the
+selected backend in each captured graph.
+
+The wrapper forwards the indices supplied to `combine()`. In vLLM these are
+the received-token indices returned by `dispatch()`, matching both native MORI
+and Kiwi prepare/finalize behavior.
+
+```python
+from mori.ops import AdaptiveEpDispatchCombineOp
+
+op = AdaptiveEpDispatchCombineOp(
+    config,
+    kiwi_max_num_tokens=32,
+    dispatch_dtype=torch.bfloat16,
+    combine_dtype=torch.bfloat16,
+    group_name="mori",
+)
+```
+
+vLLM can opt into the wrapper without changing its MORI integration. Set
+`MORI_EP_KIWI_MAX_TOKENS` before starting vLLM; its existing
+`mori.ops.EpDispatchCombineOp(config)` construction then creates the adaptive
+operator. For example, `MORI_EP_KIWI_MAX_TOKENS=16` uses Kiwi for token buckets
+up to 16 and MORI for larger buckets. Leaving the variable unset preserves the
+normal MORI operator. The vLLM path defaults its combine dtype to BF16;
+`MORI_EP_KIWI_COMBINE_DTYPE=float32` selects FP32 when the MORI buffer config
+uses four-byte elements. `MORI_EP_KIWI_TRACE=1` prints the first selected Kiwi
+and MORI bucket per process for deployment verification.
+
+The named PyTorch process group must already be registered and MORI SHMEM must
+already be initialized. The wrapper initializes Kiwi/LCI from the same group
+using LCI's TCP PMI bootstrap. `lci_master_addr` and `lci_master_port` can be
+specified when automatic hostname and free-port selection are unsuitable.
+
+All expert-parallel ranks must select the same backend for a pair, although
+their local token counts may differ. The vLLM path guarantees this using the
+rank-global maximum; other callers are responsible for coordinating selection.
+Split send/receive, MORI routing handles, local-expert counting on Kiwi-selected
+buckets, capped receive allocation, zero-copy combine input, and MORI combine
+quantization are rejected explicitly for the Kiwi path.
+
 ## 4. Standard MoE Compatibility (DeepEP)
 
 MORI-EP provides DeepEP-compatible APIs for frameworks that use standard 3D MoE tensor layouts. These require building with `ENABLE_STANDARD_MOE_ADAPT=ON`:
