@@ -1,6 +1,6 @@
 import unittest
 import warnings
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import torch
 
@@ -14,7 +14,6 @@ def _prepare(
     *,
     dtype: torch.dtype = torch.float32,
     eligible: bool = True,
-    owner_token: int = 1,
 ) -> object | None:
     return layout.prepare_output(
         split_sizes,
@@ -25,7 +24,6 @@ def _prepare(
         [[dtype] for _ in split_sizes],
         [[size] for size in split_sizes],
         eligible,
-        owner_token,
     )
 
 
@@ -66,14 +64,18 @@ class TestMoriSdmaAllGather(unittest.TestCase):
         self.assertIsNone(_prepare(layout, [1], eligible=False))
         self.assertFalse(comm._can_call_param_contiguous(torch.empty(1)))
 
-    def test_layout_rejects_sharing_across_parameter_groups(self) -> None:
+    def test_metadata_validation_does_not_read_gpu_values(self) -> None:
         comm = MoriSdmaAllGather()
-        layout = comm.layout
-        self.assertIsNotNone(layout)
-        assert layout is not None
-        _prepare(layout, [1], owner_token=1)
-        with self.assertRaisesRegex(RuntimeError, "cannot be shared"):
-            _prepare(layout, [1], owner_token=2)
+        _prepare(comm.layout, [2, 4], dtype=torch.bfloat16)
+        with patch.object(torch.Tensor, "item", side_effect=AssertionError):
+            self.assertTrue(
+                comm._can_call_param_contiguous(torch.empty(6, dtype=torch.bfloat16))
+            )
+            self.assertFalse(
+                comm._can_call_param_contiguous(torch.empty(7, dtype=torch.bfloat16))
+            )
+        self.assertIsNone(comm._param_contiguous_split_sizes)
+        self.assertEqual(comm._param_contiguous_input_nbytes, 0)
 
     def test_allocate_reuses_persistent_output(self) -> None:
         comm = MoriSdmaAllGather()
@@ -96,33 +98,117 @@ class TestMoriSdmaAllGather(unittest.TestCase):
             patch.object(comm, "_get_collective", return_value=collective),
             patch.object(comm, "_validate_tensors"),
             patch.object(torch.cuda, "current_stream", return_value=stream),
+            patch.object(torch.Tensor, "record_stream", autospec=True),
         ):
             self.assertIsNone(comm(output, input, group, async_op=False))
         collective.enqueue.assert_called_once_with(
             input, output, input.numel(), stream=stream
         )
 
-    def test_async_work_waits_and_synchronizes_once(self) -> None:
+    def test_unaligned_input_uses_process_group_fallback(self) -> None:
+        comm = MoriSdmaAllGather(zero_copy_output=False)
+        group = MagicMock()
+        output = torch.empty(2, dtype=torch.bfloat16)
+        input = torch.empty(1, dtype=torch.bfloat16)
+        work = MagicMock()
+        with (
+            patch.object(comm, "_validate_tensors"),
+            patch.object(
+                torch.distributed, "all_gather_into_tensor", return_value=work
+            ) as fallback,
+            warnings.catch_warnings(),
+        ):
+            warnings.simplefilter("ignore")
+            self.assertIs(comm(output, input, group, async_op=True), work)
+        fallback.assert_called_once_with(
+            output, input, group=group, async_op=True
+        )
+
+    def test_param_contiguous_call_preserves_stream_lifetimes(self) -> None:
+        comm = MoriSdmaAllGather()
+        layout = comm.layout
+        self.assertIsNotNone(layout)
+        assert layout is not None
+        _prepare(layout, [2], dtype=torch.bfloat16)
+        collective = MagicMock()
+        group = MagicMock()
+        output = torch.empty(4, dtype=torch.bfloat16)
+        input = torch.empty(2, dtype=torch.bfloat16)
+        stream = MagicMock()
+        with (
+            patch.object(comm, "_get_collective", return_value=collective),
+            patch.object(comm, "_validate_tensors"),
+            patch.object(torch.cuda, "current_stream", return_value=stream),
+            patch.object(torch.Tensor, "record_stream") as record_stream,
+        ):
+            work = comm(output, input, group, async_op=False)
+            self.assertIsNone(work)
+        collective.enqueue_param_contiguous.assert_called_once()
+        self.assertEqual(record_stream.call_args_list, [call(stream)] * 4)
+        collective.start_async_param_contiguous.assert_not_called()
+        collective.wait_async.assert_not_called()
+        stream.synchronize.assert_not_called()
+
+    def test_async_work_orders_each_consumer_after_completion(self) -> None:
         comm = MoriSdmaAllGather(zero_copy_output=False)
         collective = MagicMock()
         group = MagicMock()
         output = torch.empty(4)
         input = torch.empty(2)
         stream = MagicMock()
+        consumer = MagicMock()
+        other_consumer = MagicMock()
+        order = MagicMock()
+        order.attach_mock(collective.enqueue, "enqueue")
+        order.attach_mock(stream.record_event, "record_event")
         with (
             patch.object(comm, "_get_collective", return_value=collective),
             patch.object(comm, "_validate_tensors"),
-            patch.object(torch.cuda, "current_stream", return_value=stream),
+            patch.object(
+                torch.cuda, "current_stream",
+                side_effect=[stream, consumer, other_consumer],
+            ),
+            patch.object(torch.Tensor, "record_stream"),
         ):
             work = comm(output, input, group, async_op=True)
             self.assertIsInstance(work, torch.distributed.Work)
             self.assertTrue(work.wait())
             self.assertTrue(work.wait())
-        collective.start_async.assert_called_once_with(
+        collective.enqueue.assert_called_once_with(
             input, output, input.numel(), stream=stream
         )
-        collective.wait_async.assert_called_once_with(stream=stream)
-        stream.synchronize.assert_called_once_with()
+        self.assertEqual(
+            order.mock_calls,
+            [call.enqueue(input, output, input.numel(), stream=stream),
+             call.record_event()],
+        )
+        consumer.wait_event.assert_called_once_with(stream.record_event.return_value)
+        other_consumer.wait_event.assert_called_once_with(stream.record_event.return_value)
+        collective.wait_async.assert_not_called()
+        stream.synchronize.assert_not_called()
+
+    def test_param_contiguous_async_call_returns_event_work(self) -> None:
+        comm = MoriSdmaAllGather()
+        _prepare(comm.layout, [2], dtype=torch.bfloat16)
+        collective = MagicMock()
+        stream = MagicMock()
+        consumer = MagicMock()
+        with (
+            patch.object(comm, "_get_collective", return_value=collective),
+            patch.object(comm, "_validate_tensors"),
+            patch.object(torch.Tensor, "record_stream"),
+            patch.object(torch.cuda, "current_stream", side_effect=[stream, consumer]),
+        ):
+            work = comm(
+                torch.empty(4, dtype=torch.bfloat16),
+                torch.empty(2, dtype=torch.bfloat16),
+                MagicMock(), async_op=True,
+            )
+            self.assertIsInstance(work, torch.distributed.Work)
+            self.assertTrue(work.wait())
+        collective.enqueue_param_contiguous.assert_called_once()
+        consumer.wait_event.assert_called_once_with(stream.record_event.return_value)
+        collective.wait_async.assert_not_called()
 
     def test_missing_mori_dependency_has_actionable_error(self) -> None:
         def import_module(name: str):

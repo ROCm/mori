@@ -32,14 +32,11 @@ class _MoriSdmaAllGatherWork(dist.Work):
     def __init__(self, collective: Any, stream: torch.Stream) -> None:
         super().__init__()
         self._collective = collective
-        self._stream = stream
-        self._waited = False
+        self._device = stream.device
+        self._event = stream.record_event()
 
     def wait(self, timeout: object | None = None) -> bool:
-        if not self._waited:
-            self._collective.wait_async(stream=self._stream)
-            self._stream.synchronize()
-            self._waited = True
+        torch.cuda.current_stream(self._device).wait_event(self._event)
         return True
 
 
@@ -57,9 +54,7 @@ class _MoriSdmaAllGatherLayout(AllGatherLayout):
         param_input_dtypes: list[list[torch.dtype]],
         param_input_numels: list[list[int]],
         can_use_param_contiguous_output: bool,
-        owner_token: int,
     ) -> object | None:
-        self._comm._bind_layout_owner(owner_token)
         self._comm._clear_output()
         if not can_use_param_contiguous_output:
             return None
@@ -76,13 +71,10 @@ class _MoriSdmaAllGatherLayout(AllGatherLayout):
         for split_size in input_split_sizes:
             split_nbytes = int(split_size) * element_size
             if split_nbytes % 4 != 0:
-                if not self._comm._warned_unaligned_split:
-                    warnings.warn(
-                        "MORI zero-copy allgather requires every split to be "
-                        "4-byte aligned; falling back to rank-major output",
-                        stacklevel=2,
-                    )
-                    self._comm._warned_unaligned_split = True
+                self._comm._warn_unaligned_fallback(
+                    "MORI zero-copy allgather requires every split to be "
+                    "4-byte aligned; falling back to rank-major output"
+                )
                 return None
             split_u32 = split_nbytes // 4
             split_offsets_u32.append(offset)
@@ -96,6 +88,7 @@ class _MoriSdmaAllGatherLayout(AllGatherLayout):
         self._comm._param_contiguous_split_offsets = torch.tensor(
             split_offsets_u32, dtype=torch.int64, device=device
         )
+        self._comm._param_contiguous_input_nbytes = input_numel * element_size
         return (
             self._comm._param_contiguous_split_sizes,
             self._comm._param_contiguous_split_offsets,
@@ -153,8 +146,8 @@ class MoriSdmaAllGather(AllGather):
         self._registered_output_ptr: int | None = None
         self._param_contiguous_split_sizes: torch.Tensor | None = None
         self._param_contiguous_split_offsets: torch.Tensor | None = None
-        self._layout_owner_token: int | None = None
-        self._warned_unaligned_split = False
+        self._param_contiguous_input_nbytes = 0
+        self._warned_unaligned = False
 
     def allocate(
         self,
@@ -185,6 +178,18 @@ class MoriSdmaAllGather(AllGather):
         async_op: bool = False,
     ) -> Any | None:
         self._validate_tensors(output_tensor, input_tensor, group)
+        if _tensor_nbytes(input_tensor) % 4 != 0:
+            self._clear_output()
+            self._warn_unaligned_fallback(
+                "MORI SDMA allgather requires 4-byte-aligned input; falling "
+                "back to the process-group all-gather"
+            )
+            return dist.all_gather_into_tensor(
+                output_tensor,
+                input_tensor,
+                group=group,
+                async_op=async_op,
+            )
         collective = self._get_collective(group)
         stream = torch.cuda.current_stream(input_tensor.device)
         count = input_tensor.numel()
@@ -196,16 +201,7 @@ class MoriSdmaAllGather(AllGather):
                 raise RuntimeError(
                     "MORI param-contiguous allgather metadata is not initialized"
                 )
-            if async_op:
-                collective.start_async_param_contiguous(
-                    input_tensor,
-                    output_tensor,
-                    count,
-                    split_sizes,
-                    split_offsets,
-                    stream=stream,
-                )
-                return _MoriSdmaAllGatherWork(collective, stream)
+            # This kernel waits for remote SDMA writes before completing.
             collective.enqueue_param_contiguous(
                 input_tensor,
                 output_tensor,
@@ -214,25 +210,26 @@ class MoriSdmaAllGather(AllGather):
                 split_offsets,
                 stream=stream,
             )
-            return None
+            split_sizes.record_stream(stream)
+            split_offsets.record_stream(stream)
+        else:
+            collective.enqueue(input_tensor, output_tensor, count, stream=stream)
+        # MORI uses raw pointers, so the allocator cannot track these uses.
+        input_tensor.record_stream(stream)
+        output_tensor.record_stream(stream)
         if async_op:
-            collective.start_async(input_tensor, output_tensor, count, stream=stream)
             return _MoriSdmaAllGatherWork(collective, stream)
-        collective.enqueue(input_tensor, output_tensor, count, stream=stream)
         return None
 
     def _clear_output(self) -> None:
         self._param_contiguous_split_sizes = None
         self._param_contiguous_split_offsets = None
+        self._param_contiguous_input_nbytes = 0
 
-    def _bind_layout_owner(self, owner_token: int) -> None:
-        if self._layout_owner_token is None:
-            self._layout_owner_token = owner_token
-        elif self._layout_owner_token != owner_token:
-            raise RuntimeError(
-                "one MoriSdmaAllGather instance cannot be shared across FSDP "
-                "parameter groups because its registered output is persistent"
-            )
+    def _warn_unaligned_fallback(self, message: str) -> None:
+        if not self._warned_unaligned:
+            warnings.warn(message, stacklevel=3)
+            self._warned_unaligned = True
 
     def _can_call_param_contiguous(self, input_tensor: torch.Tensor) -> bool:
         if (
@@ -240,8 +237,7 @@ class MoriSdmaAllGather(AllGather):
             or self._param_contiguous_split_offsets is None
         ):
             return False
-        split_nbytes = int(self._param_contiguous_split_sizes.sum().item()) * 4
-        if split_nbytes != _tensor_nbytes(input_tensor):
+        if self._param_contiguous_input_nbytes != _tensor_nbytes(input_tensor):
             self._clear_output()
             return False
         return True
@@ -267,13 +263,6 @@ class MoriSdmaAllGather(AllGather):
             raise RuntimeError(
                 "MORI FSDP SDMA allgather expected output numel "
                 f"{expected_numel}, got {output_tensor.numel()}"
-            )
-        input_nbytes = _tensor_nbytes(input_tensor)
-        output_nbytes = _tensor_nbytes(output_tensor)
-        if input_nbytes % 4 != 0 or output_nbytes % 4 != 0:
-            raise RuntimeError(
-                "MORI FSDP SDMA allgather requires input/output byte sizes "
-                "to be 4-byte aligned"
             )
 
     def _get_collective(self, group: dist.ProcessGroup) -> Any:
