@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <climits>
@@ -48,6 +49,7 @@
 #include <optional>
 #include <random>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -59,6 +61,7 @@
 #include "umbp/common/device_copy.h"
 #include "umbp/common/grpc_limits.h"
 #include "umbp/distributed/config.h"
+#include "umbp/distributed/metrics/prometheus_metric_sink.h"
 #include "umbp/standalone/external_kv_identity_client.h"
 #include "umbp/standalone/ipc.h"
 #include "umbp/umbp_client.h"
@@ -124,6 +127,11 @@ bool SetFdSocketTimeouts(int fd, std::chrono::milliseconds timeout) {
          setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) == 0;
 }
 
+// Resolve the deployment the server will actually run.  Called exactly once,
+// by the StandaloneServer constructor, before the Impl (and therefore the
+// PoolClient) is built: the node id the metrics `node` label needs does not
+// exist in the config as given — it is synthesized here — so anything that
+// wants it has to run after this and before the client.
 UMBPConfig NormalizeBackendConfig(UMBPConfig config) {
   // Older callers pass the worker-facing standalone_process field to the
   // server constructor. The server backend must never consume that field,
@@ -479,8 +487,10 @@ class KeyHandleStats {
 
 class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
  public:
+  // `config` must already be normalized (see NormalizeBackendConfig) — the
+  // constructor hands it straight to CreateUMBPClient.
   Impl(const UMBPConfig& config, std::string address)
-      : backend_config_(NormalizeBackendConfig(config)),
+      : backend_config_(config),
         client_(CreateUMBPClient(backend_config_)),
         // Concurrent reads for every medium but SSD, whose manager serializes
         // around its staging arena.  Keyed on the LIVE medium rather than on
@@ -1644,8 +1654,106 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   std::thread fd_thread_;
 };
 
+int ResolveMetricsPortFromEnv(bool* ok, std::string* error) {
+  if (ok != nullptr) *ok = true;
+  const char* raw = std::getenv("UMBP_STANDALONE_METRICS_PORT");
+  if (raw == nullptr || raw[0] == '\0') return kDefaultStandaloneMetricsPort;
+
+  std::string value(raw);
+  std::transform(value.begin(), value.end(), value.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  if (value == "off" || value == "false" || value == "no") return 0;
+
+  try {
+    std::size_t consumed = 0;
+    const long port = std::stol(value, &consumed);
+    // std::stol stops at the first character it cannot use and reports success
+    // for what it did read, so "9O92" (letter O) would resolve to port 9 and
+    // bind -- or fail to bind -- somewhere nobody is looking. Anything left
+    // over means the operator wrote something other than a port number.
+    if (consumed != value.size()) {
+      if (ok != nullptr) *ok = false;
+      if (error != nullptr) {
+        *error = "UMBP_STANDALONE_METRICS_PORT is not a number: " + std::string(raw);
+      }
+      return 0;
+    }
+    if (port == 0) return 0;
+    if (port < 0 || port > 65535) {
+      if (ok != nullptr) *ok = false;
+      if (error != nullptr) {
+        *error = "UMBP_STANDALONE_METRICS_PORT must be 0 (off) or 1..65535, got " + value;
+      }
+      return 0;
+    }
+    return static_cast<int>(port);
+  } catch (const std::exception&) {
+    if (ok != nullptr) *ok = false;
+    if (error != nullptr) {
+      *error = "UMBP_STANDALONE_METRICS_PORT is not a number: " + std::string(raw);
+    }
+    return 0;
+  }
+}
+
 StandaloneServer::StandaloneServer(UMBPConfig config, std::string address)
-    : config_(std::move(config)), address_(std::move(address)) {
+    : config_(NormalizeBackendConfig(std::move(config))), address_(std::move(address)) {
+  // Metrics are only this process's job when it has no master.  With one, the
+  // PoolClient below ships every series to that master, which already owns a
+  // MetricsServer and merges them there — binding a second endpoint here would
+  // publish the same numbers twice to anything scraping both.
+  const bool has_master =
+      config_.distributed.has_value() && !config_.distributed->master_config.master_address.empty();
+
+  bool port_ok = true;
+  std::string port_error;
+  const int metrics_port = ResolveMetricsPortFromEnv(&port_ok, &port_error);
+  if (!port_ok) {
+    // Refuse to quietly fall back to the default: an operator who set the
+    // variable wants a specific answer, and guessing one hides the typo until
+    // someone notices a blank dashboard.
+    MORI_UMBP_ERROR("[StandaloneServer] {}", port_error);
+    throw std::runtime_error(port_error);
+  }
+
+  if (has_master) {
+    MORI_UMBP_INFO(
+        "[StandaloneServer] metrics endpoint not started: a master is configured ({}), so this "
+        "node's metrics are reported to it",
+        config_.distributed->master_config.master_address);
+  } else if (metrics_port == 0) {
+    MORI_UMBP_INFO(
+        "[StandaloneServer] metrics endpoint disabled by UMBP_STANDALONE_METRICS_PORT=0");
+  } else if (!config_.distributed.has_value()) {
+    // Unreachable via NormalizeBackendConfig, which synthesizes a deployment
+    // for exactly this case.  Handled rather than asserted because the
+    // alternative is dereferencing an empty optional to store the sink pointer,
+    // and a missing endpoint is a better failure than that.
+    MORI_UMBP_WARN(
+        "[StandaloneServer] metrics endpoint not started: no distributed deployment was resolved, "
+        "so there is no client to publish through");
+  } else {
+    const std::string node_id = config_.distributed->master_config.node_id;
+    try {
+      metric_sink_ = std::make_unique<PrometheusMetricSink>(metrics_port, node_id);
+      // Borrowed by the PoolClient that Impl builds below.  metric_sink_ is
+      // declared before impl_ in the header, so it outlives it.
+      config_.distributed->metric_sink = metric_sink_.get();
+      MORI_UMBP_INFO("[StandaloneServer] metrics endpoint on http://0.0.0.0:{}/metrics (node='{}')",
+                     metric_sink_->port(), node_id);
+    } catch (const std::exception& exc) {
+      // A busy port must not take the data plane down with it: a server that
+      // stores KV but cannot be scraped is strictly better than one that does
+      // not start.  It is an ERROR because the operator asked for metrics and
+      // is not getting them.
+      MORI_UMBP_ERROR(
+          "[StandaloneServer] metrics endpoint failed to bind port {} ({}); continuing without "
+          "metrics",
+          metrics_port, exc.what());
+      metric_sink_.reset();
+    }
+  }
+
   impl_ = std::make_unique<Impl>(config_, address_);
 }
 
@@ -1654,6 +1762,10 @@ StandaloneServer::~StandaloneServer() { Shutdown(); }
 bool StandaloneServer::Start() { return impl_->Start(); }
 
 void StandaloneServer::Run() { impl_->Run(); }
+
+int StandaloneServer::metrics_port() const {
+  return metric_sink_ == nullptr ? 0 : metric_sink_->port();
+}
 
 void StandaloneServer::Shutdown() {
   if (impl_) impl_->Shutdown();
