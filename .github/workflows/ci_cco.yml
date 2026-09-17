@@ -87,13 +87,31 @@ jobs:
           # Every one of these SKIPs and exits 0 when the comm has no SDMA queues,
           # so a build or runner that quietly loses SDMA would turn the whole
           # suite green. Treat a SKIP as a failure.
+          #
+          # These are seven back-to-back 8-rank process groups. SDMA queues are
+          # not reclaimed the instant a process exits, so the next one can find
+          # none left: it either fails in hsaKmtCreateQueueExt (anvil.cpp:237)
+          # or hangs there until the timeout kills it. test_sdma_edge did the
+          # latter on main -- 241s against the 3s it takes when it runs.
+          #
+          # So: settle between tests, and give a failed one a second chance
+          # after a longer settle. A test that is actually broken fails both
+          # times and the step still fails, with both outputs in the log.
           $CT exec -e MORI_ENABLE_SDMA=1 $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE && \
             for t in test_sdma_put test_sdma_get test_sdma_put_mt test_sdma_block test_sdma_edge \
                      test_sdma_signal test_sdma_warp_issue; do \
-              echo \"=== \$t ===\" && \
-              out=\$(timeout 240 ./build/tests/cpp/cco/\$t 8 2>&1) || { echo \"\$out\"; exit 1; }; \
+              echo \"=== \$t ===\"; \
+              sleep 10; \
+              out=\$(timeout 240 ./build/tests/cpp/cco/\$t 8 2>&1); rc=\$?; \
+              if [ \$rc -ne 0 ]; then \
+                echo \"\$out\"; \
+                echo \"=== \$t failed (rc=\$rc); settling 60s and retrying once ===\"; \
+                sleep 60; \
+                out=\$(timeout 240 ./build/tests/cpp/cco/\$t 8 2>&1); rc=\$?; \
+              fi; \
               echo \"\$out\"; \
+              [ \$rc -eq 0 ] || { echo \"\$t failed twice\"; exit 1; }; \
               case \"\$out\" in *SKIP*) echo \"\$t SKIPped: SDMA is not active\"; exit 1;; esac; \
             done"
 
