@@ -1022,6 +1022,10 @@ bool PoolClient::Init() {
     StartLocalMetricsReporting();
   }
 
+  // Runs in EVERY deployment, master or not, sink or not: it is the readout
+  // for the case where no metrics destination exists at all.
+  StartActivitySummary();
+
   // Pack engine_desc for master registration.
   std::vector<uint8_t> engine_desc_bytes;
   if (peer_directory_ != nullptr) engine_desc_bytes = peer_directory_->PackedLocalEngineDesc();
@@ -1145,6 +1149,9 @@ void PoolClient::Shutdown() {
   // the same reason: its final tick samples the backends and transfer engine,
   // which the code below is about to destroy.
   StopLocalMetricsReporting();
+  // Joined here for the same reason and at the same point: its final render
+  // samples the backends and the pool, which the code below destroys.
+  StopActivitySummary();
 
   {
     std::lock_guard<std::mutex> lock(peers_mutex_);
@@ -1929,8 +1936,7 @@ void PoolClient::MaybeReCacheAfterRemote(const std::string& key, const void* src
   // pure predicate, unit-tested in test_cache_remote_admission.cpp.
   if (!ShouldAdmitReCache(config_.cache_remote_fetches, config_.cache_remote_admission,
                           config_.admission_max_block_bytes, size)) {
-    MORI_UMBP_DEBUG("[PoolClient] MaybeReCacheAfterRemote: key='{}' size={} not admitted", key,
-                    size);
+    recache_stats_.rejected.fetch_add(1, std::memory_order_relaxed);
     return;
   }
   // ALWAYS and SIZE both delegate capacity enforcement to the peer allocator:
@@ -1944,8 +1950,7 @@ void PoolClient::MaybeReCacheAfterRemote(const std::string& key, const void* src
   job.key = key;
   job.bytes = std::unique_ptr<char[]>(new (std::nothrow) char[size]);
   if (!job.bytes) {
-    MORI_UMBP_DEBUG("[PoolClient] MaybeReCacheAfterRemote: allocation failed for key='{}' size={}",
-                    key, size);
+    recache_stats_.alloc_failed.fetch_add(1, std::memory_order_relaxed);
     return;
   }
   job.size = size;
@@ -1960,11 +1965,12 @@ void PoolClient::MaybeReCacheAfterRemote(const std::string& key, const void* src
     std::lock_guard<std::mutex> lk(recache_mutex_);
     if (recache_stop_) return;
     if (recache_queue_.size() >= recache_queue_max_) {
-      MORI_UMBP_DEBUG("[PoolClient] MaybeReCacheAfterRemote: queue full, dropping key='{}'", key);
+      recache_stats_.queue_full.fetch_add(1, std::memory_order_relaxed);
       return;
     }
     recache_queue_.push_back(std::move(job));
   }
+  recache_stats_.admitted.fetch_add(1, std::memory_order_relaxed);
   recache_cv_.notify_one();
 }
 
@@ -2017,12 +2023,13 @@ void PoolClient::MaybePrefetchWholeObject(const std::string& key, size_t object_
     std::lock_guard<std::mutex> lk(recache_mutex_);
     if (recache_stop_) return;
     if (recache_queue_.size() >= recache_queue_max_) {
-      MORI_UMBP_DEBUG("[PoolClient] MaybePrefetchWholeObject: queue full, dropping key='{}'", key);
+      recache_stats_.queue_full.fetch_add(1, std::memory_order_relaxed);
       return;
     }
     if (!prefetch_inflight_.insert(key).second) return;  // already queued or running
     recache_queue_.push_back(std::move(job));
   }
+  recache_stats_.admitted.fetch_add(1, std::memory_order_relaxed);
   recache_cv_.notify_one();
 }
 
@@ -2083,8 +2090,7 @@ void PoolClient::FetchWholeObjectsIntoMedium(std::vector<ReCacheJob>& jobs) {
     TransferRef slot_buffer =
         contiguous ? backend->BufferRef(alloc.pages.front().buffer_index) : TransferRef{};
     if (!contiguous || !slot_buffer.Valid()) {
-      MORI_UMBP_DEBUG("[PoolClient] prefetch: slot for key='{}' is not one addressable run",
-                      job.key);
+      recache_stats_.fragmented.fetch_add(1, std::memory_order_relaxed);
       // Aborted here and never revisited: the commit/abort pass below walks
       // `planned`, which this key does not enter.
       backend->BatchAbort({alloc.slot_id});
@@ -2186,7 +2192,7 @@ void PoolClient::ReCacheWorkerLoop() {
         std::lock_guard<std::mutex> lk(recache_mutex_);
         for (const auto& done : prefetch_batch) prefetch_inflight_.erase(done.key);
       }
-      MORI_UMBP_DEBUG("[PoolClient] ReCacheWorker: prefetched {} objects", prefetch_batch.size());
+      recache_stats_.prefetched.fetch_add(prefetch_batch.size(), std::memory_order_relaxed);
       prefetch_batch.clear();
       continue;
     }
@@ -2197,14 +2203,14 @@ void PoolClient::ReCacheWorkerLoop() {
     // the same key.
     switch (ExecuteLocalPut(job.key, job.bytes.get(), job.size, medium_)) {
       case PutAttemptOutcome::kSuccess:
-        MORI_UMBP_DEBUG("[PoolClient] ReCacheWorker: re-cached key='{}' size={}", job.key,
-                        job.size);
+        recache_stats_.installed.fetch_add(1, std::memory_order_relaxed);
         break;
       case PutAttemptOutcome::kSuccessAlreadyExists:
+        recache_stats_.already_present.fetch_add(1, std::memory_order_relaxed);
         break;
       case PutAttemptOutcome::kRetry:
       case PutAttemptOutcome::kFatal:
-        MORI_UMBP_DEBUG("[PoolClient] ReCacheWorker: local install failed for key='{}'", job.key);
+        recache_stats_.install_failed.fetch_add(1, std::memory_order_relaxed);
         break;
     }
   }
@@ -4728,6 +4734,152 @@ void PoolClient::StopLocalMetricsReporting() {
   local_metrics_cv_.notify_one();
   if (local_metrics_thread_.joinable()) local_metrics_thread_.join();
   MORI_UMBP_INFO("[PoolClient] local metrics reporting stopped");
+}
+
+// ---------------------------------------------------------------------------
+//  The periodic activity summary
+//
+//  Everything here is already in Prometheus.  This exists for the runs that
+//  have no Prometheus: a ctest, a one-shot benchmark, an sglang rank on a
+//  customer node, a bisect.  In those the counters lived in atomics nothing
+//  ever read, and the only way to see an eviction or a dropped re-cache was
+//  DEBUG, which prints per key.
+// ---------------------------------------------------------------------------
+
+ActivitySnapshot PoolClient::CollectActivitySnapshot() const {
+  ActivitySnapshot snap;
+
+  for (MediumBackend* backend : registry_.All()) {
+    if (backend == nullptr) continue;
+    TierActivity& tier = snap.tiers[TierTypeName(backend->Tier())];
+
+    // Read the same cumulative samples the metrics tick reads, and pick out the
+    // ops this summary speaks about.  Going through SampleMetrics() rather than
+    // adding accessors keeps the rule the component layer is built on: a
+    // backend is observed through one seam, and a new medium lands here with no
+    // code of its own.  MetricPublisher is deliberately NOT involved -- it owns
+    // the delta baselines for the Prometheus path, and sharing them would make
+    // each consumer steal the other's window.
+    for (const MetricSample& sample : backend->SampleMetrics()) {
+      const auto label = [&sample](const char* key) -> std::string {
+        for (const auto& kv : sample.labels) {
+          if (kv.first == key) return kv.second;
+        }
+        return {};
+      };
+
+      if (std::strcmp(sample.name, MORI_UMBP_METRIC_BACKEND_OPS_TOTAL) == 0) {
+        const std::string op = label("op");
+        const std::string status = label("status");
+        // Key counts are the successful ones: an allocate that found no space
+        // is not an offloaded key, and counting it as one would make a tier
+        // that is refusing everything look busy.
+        if (op == "commit" && status == "ok") tier.offload_keys += sample.value;
+        if (op == "resolve" && status == "ok") tier.load_keys += sample.value;
+        if (op == "resolve" && status == "miss") tier.load_misses += sample.value;
+        if (op == "evict" && status == "ok") tier.evict_keys += sample.value;
+      } else if (std::strcmp(sample.name, MORI_UMBP_METRIC_BACKEND_BYTES_TOTAL) == 0) {
+        const std::string op = label("op");
+        if (op == "commit") tier.offload_bytes += sample.value;
+        if (op == "resolve") tier.load_bytes += sample.value;
+        if (op == "evict") tier.evict_bytes += sample.value;
+      } else if (std::strcmp(sample.name, MORI_UMBP_METRIC_BACKEND_MEDIUM_EVENTS_TOTAL) == 0 &&
+                 label("event") == kPageBackendLocalEvictEvent) {
+        // Added to op="evict" rather than reported separately: to the operator
+        // asking "is this tier reclaiming", who initiated the reclaim is
+        // detail.  The two are disjoint -- a local round never makes the
+        // interface call -- so this adds, it does not double-count.
+        tier.evict_keys += sample.value;
+      } else if (std::strcmp(sample.name, MORI_UMBP_METRIC_BACKEND_MEDIUM_BYTES_TOTAL) == 0 &&
+                 label("event") == kPageBackendLocalEvictEvent) {
+        tier.evict_bytes += sample.value;
+      }
+    }
+
+    const TierCapacity capacity = backend->Capacity();
+    tier.capacity_bytes += capacity.total_bytes;
+    tier.used_bytes += capacity.total_bytes >= capacity.available_bytes
+                           ? capacity.total_bytes - capacity.available_bytes
+                           : 0;
+    tier.resident_keys += backend->OwnedKeyCount();
+  }
+
+  if (default_pool_ != nullptr) snap.transitions = default_pool_->TransitionMetrics();
+
+  snap.recache.admitted = recache_stats_.admitted.load(std::memory_order_relaxed);
+  snap.recache.rejected = recache_stats_.rejected.load(std::memory_order_relaxed);
+  snap.recache.queue_full = recache_stats_.queue_full.load(std::memory_order_relaxed);
+  snap.recache.alloc_failed = recache_stats_.alloc_failed.load(std::memory_order_relaxed);
+  snap.recache.installed = recache_stats_.installed.load(std::memory_order_relaxed);
+  snap.recache.already_present = recache_stats_.already_present.load(std::memory_order_relaxed);
+  snap.recache.install_failed = recache_stats_.install_failed.load(std::memory_order_relaxed);
+  snap.recache.prefetched = recache_stats_.prefetched.load(std::memory_order_relaxed);
+  snap.recache.fragmented = recache_stats_.fragmented.load(std::memory_order_relaxed);
+  return snap;
+}
+
+void PoolClient::EmitActivitySummary(double window_seconds) {
+  const auto lines = activity_summary_.Render(CollectActivitySnapshot(), window_seconds);
+  for (const std::string& line : lines) MORI_UMBP_INFO("{}", line);
+}
+
+void PoolClient::StartActivitySummary() {
+  if (summary_running_.load()) return;
+  // 0 disables.  Unlike the metrics port, a value this cannot parse falls back
+  // to the default rather than refusing to start: a wrong cadence announces
+  // itself in the very next line the summary prints, where a silently disabled
+  // metrics endpoint is discovered days later as a blank dashboard.
+  summary_interval_ms_ = static_cast<uint64_t>(GetEnvMilliseconds("UMBP_SUMMARY_INTERVAL_MS",
+                                                                  std::chrono::milliseconds(60000),
+                                                                  /*min_allowed=*/0)
+                                                   .count());
+  if (summary_interval_ms_ == 0) {
+    MORI_UMBP_INFO("[PoolClient] periodic activity summary disabled (UMBP_SUMMARY_INTERVAL_MS=0)");
+    return;
+  }
+  summary_last_ = std::chrono::steady_clock::now();
+  summary_running_ = true;
+  try {
+    summary_thread_ = std::thread(&PoolClient::ActivitySummaryLoop, this);
+  } catch (const std::system_error& e) {
+    summary_running_ = false;
+    MORI_UMBP_ERROR("[PoolClient] failed to start activity summary thread: {}", e.what());
+    return;
+  }
+  MORI_UMBP_INFO("[PoolClient] periodic activity summary every {}ms", summary_interval_ms_);
+}
+
+void PoolClient::StopActivitySummary() {
+  if (!summary_running_.load()) return;
+  summary_running_ = false;
+  summary_cv_.notify_one();
+  if (summary_thread_.joinable()) summary_thread_.join();
+}
+
+void PoolClient::ActivitySummaryLoop() {
+  while (summary_running_.load()) {
+    {
+      std::unique_lock lock(summary_mu_);
+      summary_cv_.wait_for(lock, std::chrono::milliseconds(summary_interval_ms_),
+                           [this] { return !summary_running_.load(); });
+    }
+    if (!summary_running_.load()) break;
+    const auto now = std::chrono::steady_clock::now();
+    // The MEASURED window, not the configured one: a tick delayed behind a
+    // stalled backend should read as a long window rather than as a rate
+    // computed against a cadence that did not happen.
+    const double elapsed =
+        std::chrono::duration_cast<std::chrono::duration<double>>(now - summary_last_).count();
+    summary_last_ = now;
+    EmitActivitySummary(elapsed);
+  }
+  // A final line before the backends are torn down, for the same reason the
+  // metrics tick has one: a run shorter than one window would otherwise report
+  // nothing at all, and that run is usually the unit test someone is trying to
+  // understand.
+  const auto now = std::chrono::steady_clock::now();
+  EmitActivitySummary(
+      std::chrono::duration_cast<std::chrono::duration<double>>(now - summary_last_).count());
 }
 
 void PoolClient::LocalMetricsLoop() {

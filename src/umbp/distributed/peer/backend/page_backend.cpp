@@ -30,6 +30,7 @@
 #include <utility>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/distributed/metrics/component_metrics.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
 
 namespace mori::umbp {
@@ -757,6 +758,42 @@ void PageBackend::SetEventPublishing(bool enabled) {
 //  Local eviction (no-master deployments; see EnableLocalEviction)
 // ---------------------------------------------------------------------------
 
+std::vector<MetricSample> PageBackend::SampleMetrics() const {
+  // Only what the MediumBackend interface hides.  Commits, resolves and
+  // master-driven evictions are all interface calls and are already measured by
+  // InstrumentedBackend; repeating them here would double-count them.
+  //
+  // Local watermark eviction is the exception that makes this function
+  // necessary: a round frees pages directly instead of calling Evict(), so from
+  // outside this class it is indistinguishable from keys that were never
+  // stored.  On a masterless node that is ALL of the eviction there is.
+  std::vector<MetricSample> out;
+
+  auto event = [&out](const char* name, uint64_t v) {
+    if (v == 0) return;
+    out.push_back(MetricSample{MORI_UMBP_METRIC_BACKEND_MEDIUM_EVENTS_TOTAL,
+                               MORI_UMBP_METRIC_BACKEND_MEDIUM_EVENTS_TOTAL_HELP,
+                               {{"event", name}},
+                               v});
+  };
+
+  event(kPageBackendLocalEvictEvent, local_evict_keys_.load(std::memory_order_relaxed));
+  event("local_evict_round", local_evict_rounds_.load(std::memory_order_relaxed));
+  // A round that found nothing reclaimable: every candidate was under a read
+  // lease or a copy pin.  Distinguishes a tier that cannot evict from one that
+  // has nothing to evict, which look the same in the freed-bytes counter.
+  event("local_evict_no_candidate", local_evict_no_candidate_.load(std::memory_order_relaxed));
+
+  const uint64_t freed_bytes = local_evict_bytes_.load(std::memory_order_relaxed);
+  if (freed_bytes != 0) {
+    out.push_back(MetricSample{MORI_UMBP_METRIC_BACKEND_MEDIUM_BYTES_TOTAL,
+                               MORI_UMBP_METRIC_BACKEND_MEDIUM_BYTES_TOTAL_HELP,
+                               {{"event", kPageBackendLocalEvictEvent}},
+                               freed_bytes});
+  }
+  return out;
+}
+
 void PageBackend::EnableLocalEviction(double high_watermark, double low_watermark) {
   if (!(high_watermark > 0.0 && high_watermark <= 1.0 && low_watermark > 0.0 &&
         low_watermark < high_watermark)) {
@@ -860,13 +897,20 @@ size_t PageBackend::MaybeEvictToLowWatermark() {
     owned_.erase(owned_it);
     ++freed;
   }
+  local_evict_rounds_.fetch_add(1, std::memory_order_relaxed);
   if (freed > 0) {
-    MORI_UMBP_DEBUG("[PageBackend] local eviction freed {} key(s) ({} bytes) tier={}", freed,
-                    selected_bytes, static_cast<int>(tier_));
+    // Counted, not logged.  A round frees a handful of keys and runs whenever
+    // a commit finds the tier above its high watermark, so the per-round line
+    // this replaced could reach thousands per second under steady offload —
+    // and it was at DEBUG, so the volume also bought every other DEBUG line in
+    // the process.  The periodic activity summary reports the window total.
+    local_evict_keys_.fetch_add(freed, std::memory_order_relaxed);
+    local_evict_bytes_.fetch_add(selected_bytes, std::memory_order_relaxed);
     local_evict_warned_ = false;
   } else if (!local_evict_warned_) {
     // Latched: a wedged pool would otherwise log this on every commit.
     local_evict_warned_ = true;
+    local_evict_no_candidate_.fetch_add(1, std::memory_order_relaxed);
     MORI_UMBP_WARN(
         "[PageBackend] local eviction found no reclaimable key at {}/{} bytes used "
         "(all leased or pinned) tier={}",

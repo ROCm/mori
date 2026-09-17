@@ -489,6 +489,14 @@ target_link_libraries(test_prometheus_metric_sink PRIVATE umbp_common
 target_compile_features(test_prometheus_metric_sink PRIVATE cxx_std_17)
 add_test(NAME test_prometheus_metric_sink COMMAND test_prometheus_metric_sink)
 
+# test_activity_summary — the periodic INFO line that replaced the per-key DEBUG
+# logs on the offload / load / evict / promote / demote paths. Pure rendering,
+# so the deltas, units and the idle case are testable without a pool.
+add_executable(test_activity_summary test_activity_summary.cpp)
+target_link_libraries(test_activity_summary PRIVATE umbp_common GTest::gtest_main)
+target_compile_features(test_activity_summary PRIVATE cxx_std_17)
+add_test(NAME test_activity_summary COMMAND test_activity_summary)
+
 # test_gds_engine — GdsEngine routing/planning (no GPU) plus a GPU + hipFile
 # read round trip (skipped without a device, or on a filesystem that rejects
 # O_DIRECT). Built only when the hipfile headers are installed; umbp_common
