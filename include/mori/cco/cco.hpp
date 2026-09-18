@@ -1308,12 +1308,7 @@ struct ccoSdmaQueueDeviceHandle {
   uint64_t cachedHwReadIndex;
 };
 
-// Combined helper for call sites that only need the handle snapshot, not the
-// `shared` pointer itself (contrast ccoSdmaPutThread, which keeps `shared`
-// around to pass into ReserveSlot()). Both derefs are flat loads off device
-// memory (the per-queue handle pointer, then the handle it points to, shared
-// across all CUs touching that queue) — hint each as global like every other
-// cross-CU access here.
+// Helper function to force global memory access for the pointer to the queue handle.
 inline __device__ ccoSdmaQueueDeviceHandle ccoSdmaLoadQueueHandle(ccoSdmaQueueDeviceHandle** ptr) {
   return *impl::global(*impl::global(ptr));
 }
