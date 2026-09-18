@@ -115,9 +115,10 @@ __device__ inline int warpSize() { return __builtin_amdgcn_wavefrontsize(); }
 
 #define CCO_GLOBAL_SPACE __attribute__((address_space(1)))
 // Implicit cast to global memory space.
-template <typename T, typename T2 = typename std::remove_volatile<T>::type>
-__device__ __host__ inline static T2* global(T* ptr) {
-  return (T2*)(T2 CCO_GLOBAL_SPACE*)reinterpret_cast<uintptr_t>(ptr);
+template <typename T>
+__device__ inline T* global(T* ptr) {
+  static_assert(!std::is_volatile<T>::value, "T must not be volatile");
+  return (T*)(T CCO_GLOBAL_SPACE*)reinterpret_cast<uintptr_t>(ptr);
 }
 #undef CCO_GLOBAL_SPACE
 
@@ -713,7 +714,7 @@ __device__ inline ccoLsaBarrierSession<Coop>::ccoLsaBarrierSession(Coop coop, cc
   const auto& rw = comm->resourceWindow_inlined;
   char* base = rw.winBase + ((uint64_t)comm->lsaRank * rw.stride4G << 32);
   uint32_t* state = reinterpret_cast<uint32_t*>(base + h.bufOffset);
-  this->epoch = state[idx];  // unicast epoch slot
+  this->epoch = impl::global(state)[idx];  // unicast epoch slot
 }
 
 template <typename Coop>
@@ -723,7 +724,7 @@ __device__ inline ccoLsaBarrierSession<Coop>::~ccoLsaBarrierSession() {
   char* base = rw.winBase + ((uint64_t)this->comm->lsaRank * rw.stride4G << 32);
   uint32_t* state = reinterpret_cast<uint32_t*>(base + this->handle.bufOffset);
   if (this->coop.thread_rank() == 0) {
-    state[this->index] = this->epoch;  // unicast epoch slot
+    impl::global(state)[this->index] = this->epoch;  // unicast epoch slot
   }
   this->coop.sync();
 }
@@ -743,8 +744,8 @@ __device__ inline void ccoLsaBarrierSession<Coop>::arrive(Coop) {
 
   for (int i = this->coop.thread_rank(); i < nranks - 1; i += this->coop.size()) {
     int peer = i + ((i >= myRank) ? 1 : 0);
-    __hip_atomic_store(this->ucInbox(peer, myRank), this->epoch + 1, __ATOMIC_RELAXED,
-                       __HIP_MEMORY_SCOPE_SYSTEM);
+    __hip_atomic_store(impl::global(this->ucInbox(peer, myRank)), this->epoch + 1,
+                       __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
   }
 }
 
@@ -765,7 +766,8 @@ __device__ inline int ccoLsaBarrierSession<Coop>::waitInternal(Coop, uint64_t ti
     uint32_t* slot = this->ucInbox(myRank, peer);
 
     while (true) {
-      uint32_t got = __hip_atomic_load(slot, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+      uint32_t got =
+          __hip_atomic_load(impl::global(slot), __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
 
       if ((got - (uint32_t)(this->epoch + 1)) <= ((uint32_t)-1 >> 1)) break;
 
@@ -1248,8 +1250,8 @@ struct ccoSdmaQueueDeviceHandle {
   // actually had, so racing writers are harmless.
   __device__ __forceinline__ uint64_t ReserveSlot(uint64_t slotBytes,
                                                   ccoSdmaQueueDeviceHandle* shared) {
-    uint64_t base =
-        __hip_atomic_fetch_add(cachedWptr, slotBytes, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    uint64_t base = __hip_atomic_fetch_add(impl::global(cachedWptr), slotBytes, __ATOMIC_RELAXED,
+                                           __HIP_MEMORY_SCOPE_AGENT);
     if ((base + slotBytes) - cachedHwReadIndex > CCO_SDMA_QUEUE_SIZE) {
       [[maybe_unused]] int retries = 0;
       do {
@@ -1305,6 +1307,16 @@ struct ccoSdmaQueueDeviceHandle {
   // local variables
   uint64_t cachedHwReadIndex;
 };
+
+// Combined helper for call sites that only need the handle snapshot, not the
+// `shared` pointer itself (contrast ccoSdmaPutThread, which keeps `shared`
+// around to pass into ReserveSlot()). Both derefs are flat loads off device
+// memory (the per-queue handle pointer, then the handle it points to, shared
+// across all CUs touching that queue) — hint each as global like every other
+// cross-CU access here.
+inline __device__ ccoSdmaQueueDeviceHandle ccoSdmaLoadQueueHandle(ccoSdmaQueueDeviceHandle** ptr) {
+  return *impl::global(*impl::global(ptr));
+}
 
 // ── from mori/core/transport/sdma/device_primitives.hpp ──
 /* ---------------------------------------------------------------------------------------------- */
@@ -1365,13 +1377,13 @@ inline __device__ uint64_t ccoSdmaGroupBytes(unsigned n) {
                        : CCO_SDMA_UNIT * (n + sig);
 }
 
-using Uint4 = uint32_t __attribute__((ext_vector_type(4)));
+using ccoUint4 = uint32_t __attribute__((ext_vector_type(4)));
 struct alignas(16) ccoSdmaUnit {
-  constexpr static size_t kVecSize = CCO_SDMA_UNIT / sizeof(Uint4);
-  Uint4 vec[kVecSize];
+  constexpr static size_t kVecSize = CCO_SDMA_UNIT / sizeof(ccoUint4);
+  ccoUint4 vec[kVecSize];
 };
-static_assert(CCO_SDMA_UNIT % sizeof(Uint4) == 0,
-              "CCO_SDMA_UNIT must be divisible by sizeof(Uint4)");
+static_assert(CCO_SDMA_UNIT % sizeof(ccoUint4) == 0,
+              "CCO_SDMA_UNIT must be divisible by sizeof(ccoUint4)");
 static_assert(sizeof(ccoSdmaUnit) == CCO_SDMA_UNIT);
 static_assert(CCO_SDMA_QUEUE_SIZE % CCO_SDMA_UNIT == 0, "ring must be whole units");
 static_assert(sizeof(CCO_SDMA_PKT_COPY_LINEAR) <= CCO_SDMA_UNIT, "COPY must fit one unit");
@@ -1380,6 +1392,9 @@ static_assert(sizeof(CCO_SDMA_PKT_ATOMIC) == CCO_SDMA_UNIT, "ATOMIC must be exac
 // Where a unit at monotonic byte offset `at` lands. Units are 32B-aligned in a
 // 32B-multiple ring, so this never needs to split a packet.
 inline __device__ ccoSdmaUnit* ccoSdmaUnitAt(uint32_t* queueBuf, uint64_t at) {
+  if constexpr (CCO_SDMA_BREAK_ON_RETRIES) {
+    if ((at % CCO_SDMA_UNIT) != 0) __builtin_trap();  // caller must pass a unit-aligned offset
+  }
   constexpr uint64_t kRingDwords = CCO_SDMA_QUEUE_SIZE / sizeof(uint32_t);
   static_assert((kRingDwords & (kRingDwords - 1)) == 0, "ring must be a power of two to mask");
   return reinterpret_cast<ccoSdmaUnit*>(queueBuf + ((at / sizeof(uint32_t)) & (kRingDwords - 1)));
@@ -1390,16 +1405,17 @@ inline __device__ void ccoSdmaWriteCopy(uint32_t* queueBuf, uint64_t at, void* s
   auto pkt = ccoCreateCopyPacket(srcPtr, dstPtr, size);
   const uint32_t* p = reinterpret_cast<const uint32_t*>(&pkt);
   auto dst = impl::global(ccoSdmaUnitAt(queueBuf, at));
-  dst->vec[0] = Uint4{p[0], p[1], p[2], p[3]};
-  dst->vec[1] = Uint4{p[4], p[5], p[6], 0};
+  dst->vec[0] = ccoUint4{p[0], p[1], p[2], p[3]};
+  // Last dword is NOP (op=0), pads COPY out to the unit; engine skips it
+  dst->vec[1] = ccoUint4{p[4], p[5], p[6], 0};
 }
 
 inline __device__ void ccoSdmaWriteAtomic(uint32_t* queueBuf, uint64_t at, HSAuint64* target) {
   auto pkt = ccoCreateAtomicIncPacket(target);
   const uint32_t* p = reinterpret_cast<const uint32_t*>(&pkt);
   auto dst = impl::global(ccoSdmaUnitAt(queueBuf, at));
-  dst->vec[0] = Uint4{p[0], p[1], p[2], p[3]};
-  dst->vec[1] = Uint4{p[4], p[5], p[6], p[7]};
+  dst->vec[0] = ccoUint4{p[0], p[1], p[2], p[3]};
+  dst->vec[1] = ccoUint4{p[4], p[5], p[6], p[7]};
 }
 
 template <bool localSignal, bool remoteSignal>
@@ -1514,7 +1530,9 @@ inline __device__ void ccoSdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_
   constexpr bool kRing = !(optFlags & ccoSdmaOptFlagsAggregate);
   constexpr bool kPerCopy = (optFlags & ccoSdmaOptFlagsSignalPerCopy) != 0;
   constexpr uint64_t kStride = ccoSdmaStrideBytes<localSignal, remoteSignal, kPerCopy>();
-  ccoSdmaQueueDeviceHandle* shared = *(deviceHandles + qId);
+  // *ptr is itself a flat load (the per-queue handle pointer lives in device
+  // memory) — hint it as global like every other cross-CU access here.
+  ccoSdmaQueueDeviceHandle* shared = *impl::global(deviceHandles + qId);
 
   // Post alone: one reservation, one doorbell, nothing to coordinate.
   auto postSolo = [&]() {
@@ -1617,7 +1635,7 @@ inline __device__ void ccoSdmaPutBlock(void* srcBuf, void* dstBuf, size_t copy_s
 inline __device__ void ccoSdmaCommitThread(ccoSdmaQueueDeviceHandle** deviceHandles,
                                            uint32_t queNum, uint32_t qId) {
   if (qId >= queNum) return;  // out-of-range queue: no-op, not OOB
-  ccoSdmaQueueDeviceHandle handle = **(deviceHandles + qId);
+  ccoSdmaQueueDeviceHandle handle = ccoSdmaLoadQueueHandle(deviceHandles + qId);
   ccoSdmaRingQueueDbr(handle);
 }
 
@@ -1625,7 +1643,7 @@ inline __device__ void ccoSdmaCommitWarp(ccoSdmaQueueDeviceHandle** deviceHandle
                                          uint32_t queNum) {
   const int q = ccoSdmaWarpQueueId(queNum);
   if (q < 0) return;
-  ccoSdmaQueueDeviceHandle handle = **(deviceHandles + q);
+  ccoSdmaQueueDeviceHandle handle = ccoSdmaLoadQueueHandle(deviceHandles + q);
   ccoSdmaRingQueueDbr(handle);
 }
 
@@ -1633,7 +1651,7 @@ inline __device__ void ccoSdmaCommitBlock(ccoSdmaQueueDeviceHandle** deviceHandl
                                           uint32_t queNum) {
   const int q = ccoSdmaBlockQueueId(queNum);
   if (q < 0) return;
-  ccoSdmaQueueDeviceHandle handle = **(deviceHandles + q);
+  ccoSdmaQueueDeviceHandle handle = ccoSdmaLoadQueueHandle(deviceHandles + q);
   ccoSdmaRingQueueDbr(handle);
 }
 
@@ -1786,7 +1804,7 @@ struct ccoSdma {
     Coop coop{};
     for (uint32_t q = static_cast<uint32_t>(coop.thread_rank()); q < n;
          q += static_cast<uint32_t>(coop.size())) {
-      ccoSdmaQueueDeviceHandle handle = **(s.deviceHandles + peer * n + q);
+      ccoSdmaQueueDeviceHandle handle = ccoSdmaLoadQueueHandle(s.deviceHandles + peer * n + q);
       ccoSdmaDrainQueue(handle);
     }
     coop.sync();  // completion visible to the whole group before returning
@@ -1804,7 +1822,8 @@ struct ccoSdma {
     const uint32_t n = s.sdmaNumQueue;
     Coop coop{};
     if (queueId >= 0 && static_cast<uint32_t>(queueId) < n && coop.thread_rank() == 0) {
-      ccoSdmaQueueDeviceHandle handle = **(s.deviceHandles + peer * n + queueId);
+      ccoSdmaQueueDeviceHandle handle =
+          ccoSdmaLoadQueueHandle(s.deviceHandles + peer * n + queueId);
       ccoSdmaDrainQueue(handle);
     }
     coop.sync();
@@ -1824,7 +1843,8 @@ struct ccoSdma {
     }
     HSAuint64* slot =
         s.signalBuf + (static_cast<uint32_t>(srcRank) * n + static_cast<uint32_t>(queueId));
-    while (__hip_atomic_load(slot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) < expected) {
+    while (__hip_atomic_load(impl::global(slot), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) <
+           expected) {
       __builtin_amdgcn_s_sleep(2);
     }
   }
