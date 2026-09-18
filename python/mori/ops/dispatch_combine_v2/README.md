@@ -22,7 +22,9 @@ ROCm/FlyDSL PR #522 (`dispatch_combine_intranode_{kernel,op}.py`).
 
 Supported token dtypes: **bf16**, **f32**, **fp8** (gather-only; OCP e4m3 on
 gfx950, e4m3**fnuz** max 240 on gfx942) and **fp4** (e2m1, gather-only,
-**gfx950-only** — the `cvt_scalef32_*_fp4` intrinsics don't exist on gfx942).
+**gfx950 and gfx1250** — the conversion intrinsics don't exist on gfx942. The
+two differ: gfx950 uses the pair-at-a-time `cvt_scalef32_pk_*_fp4` family,
+gfx1250 a single pack-of-8 per i32, so `_accum_funcs` branches on `WAVE`).
 Combine: gather (UseP2PRead) **and** scatter (`_nop2p`); weighted combine
 (`out_weights`); StdMoE (ConvertDispatchOutput / ConvertCombineInput, standalone
 + wired into the op); fp8 combine-wire **quant** (`fp8_direct_cast` **and**
