@@ -334,9 +334,9 @@ bool ReadIoTrafficClassDisableEnv() {
 }
 
 // The RC retry attributes occupy narrow fields in the QP context, so a value
-// that parses as a uint8_t can still be rejected by ibv_modify_qp. Bound each
-// one here and keep the built-in default when the override is out of range.
-static std::optional<uint8_t> ReadQpRetryAttrEnv(const char* name, uint8_t maxValue) {
+// that parses as a uint8_t can still be rejected by ibv_modify_qp. Bound the
+// value here and keep the built-in default when the override is out of range.
+static std::optional<uint8_t> ReadBoundedQpAttrEnv(const char* name, uint8_t maxValue) {
   const char* raw = std::getenv(name);
   if (!raw) {
     return std::nullopt;
@@ -350,11 +350,24 @@ static std::optional<uint8_t> ReadQpRetryAttrEnv(const char* name, uint8_t maxVa
   return value;
 }
 
+// IO QPs read MORI_IO_QP_* first; when that is unset, fall back to a
+// transport-wide MORI_RDMA_QP_* so the same knob also tunes the shmem/CCO QPs
+// that share this ibverbs path but never see the IO-specific name. The IO name
+// wins when both are set.
+static std::optional<uint8_t> ReadQpRetryAttrEnv(const char* ioName, const char* rdmaName,
+                                                 uint8_t maxValue) {
+  if (std::optional<uint8_t> io = ReadBoundedQpAttrEnv(ioName, maxValue); io.has_value()) {
+    return io;
+  }
+  return ReadBoundedQpAttrEnv(rdmaName, maxValue);
+}
+
 // Local ACK timeout exponent: the responder gets 4.096us * 2^timeout to ack
 // before the requester retransmits. 0 disables the timeout entirely, which
 // turns a silent peer into an unbounded stall instead of a completion error.
 std::optional<uint8_t> ReadIoQpTimeoutEnv() {
-  std::optional<uint8_t> timeout = ReadQpRetryAttrEnv("MORI_IO_QP_TIMEOUT", 31);
+  std::optional<uint8_t> timeout =
+      ReadQpRetryAttrEnv("MORI_IO_QP_TIMEOUT", "MORI_RDMA_QP_TIMEOUT", 31);
   if (timeout.has_value() && timeout.value() == 0) {
     MORI_APP_WARN(
         "MORI_IO_QP_TIMEOUT=0 disables the local ACK timeout; an unresponsive peer will stall "
@@ -364,12 +377,20 @@ std::optional<uint8_t> ReadIoQpTimeoutEnv() {
 }
 
 std::optional<uint8_t> ReadIoQpRetryCntEnv() {
-  return ReadQpRetryAttrEnv("MORI_IO_QP_RETRY_CNT", 7);
+  return ReadQpRetryAttrEnv("MORI_IO_QP_RETRY_CNT", "MORI_RDMA_QP_RETRY_CNT", 7);
 }
 
 // 7 means retry RNR NAKs forever, which is the ibverbs default this path uses.
 std::optional<uint8_t> ReadIoQpRnrRetryEnv() {
-  return ReadQpRetryAttrEnv("MORI_IO_QP_RNR_RETRY", 7);
+  return ReadQpRetryAttrEnv("MORI_IO_QP_RNR_RETRY", "MORI_RDMA_QP_RNR_RETRY", 7);
+}
+
+// Minimum RNR NAK timer: how long the responder makes the requester wait before
+// retrying after an RNR NAK. Encoded value 0 means 655.36ms (the longest), 1-31
+// map to the IB-spec table. Tunable alongside rnr_retry so a receiver that is
+// slow to post buffers can widen the backoff instead of exhausting the retries.
+std::optional<uint8_t> ReadIoQpMinRnrTimerEnv() {
+  return ReadQpRetryAttrEnv("MORI_IO_QP_MIN_RNR_TIMER", "MORI_RDMA_QP_MIN_RNR_TIMER", 31);
 }
 
 bool ReadIbEnableRelaxedOrderingEnv() {

@@ -423,8 +423,7 @@ static void OrphanPendingWrsOnOtherEps(const EpPairVec& eps, int failedEpId, con
     MORI_IO_WARN(
         "{} on ep {}: moving pending unsignaled WRs on ep {} "
         "(wrCount={}, mergedReq={}) to orphaned and marking degraded",
-        reason, failedEpId, otherEpId, epWrsSinceSignal[otherEpId],
-        epMergedSinceSignal[otherEpId]);
+        reason, failedEpId, otherEpId, epWrsSinceSignal[otherEpId], epMergedSinceSignal[otherEpId]);
     if (eps[otherEpId].ledger) {
       eps[otherEpId].ledger->InsertOrphaned(epWrsSinceSignal[otherEpId], callbackMeta,
                                             static_cast<int>(epMergedSinceSignal[otherEpId]));

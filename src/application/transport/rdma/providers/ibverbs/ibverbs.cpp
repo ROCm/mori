@@ -353,7 +353,7 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   attr.dest_qp_num = remote.qpn;
   attr.rq_psn = 0;
   attr.max_dest_rd_atomic = devAttr->orig_attr.max_qp_rd_atom;
-  attr.min_rnr_timer = 12;
+  attr.min_rnr_timer = ReadIoQpMinRnrTimerEnv().value_or(12);
   attr.ah_attr.src_path_bits = 0;
   attr.ah_attr.port_num = local.portId;
   std::optional<uint8_t> sl = ReadIoServiceLevelEnv();

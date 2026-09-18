@@ -204,6 +204,7 @@ bool ReadIoTrafficClassDisableEnv();
 std::optional<uint8_t> ReadIoQpTimeoutEnv();
 std::optional<uint8_t> ReadIoQpRetryCntEnv();
 std::optional<uint8_t> ReadIoQpRnrRetryEnv();
+std::optional<uint8_t> ReadIoQpMinRnrTimerEnv();
 
 bool ReadIbEnableRelaxedOrderingEnv();
 int MaybeAddRelaxedOrderingFlag(int accessFlag);
