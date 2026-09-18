@@ -27,6 +27,7 @@ namespace io {
 uint64_t SubmissionLedger::Insert(int postedWr, bool hasSignaledTail,
                                   std::shared_ptr<CqCallbackMeta> meta, int batchSize) {
   std::lock_guard<std::mutex> lock(mu_);
+  if (closed_) return kInvalidRecordId;
   uint64_t id = nextId_++;
   records_[id] = SubmissionRecord{
       id, postedWr, hasSignaledTail, SubmissionState::Posted, std::move(meta), batchSize};
@@ -36,6 +37,7 @@ uint64_t SubmissionLedger::Insert(int postedWr, bool hasSignaledTail,
 void SubmissionLedger::InsertOrphaned(int postedWr, std::shared_ptr<CqCallbackMeta> meta,
                                       int batchSize) {
   std::lock_guard<std::mutex> lock(mu_);
+  if (closed_) return;
   uint64_t id = nextId_++;
   records_[id] =
       SubmissionRecord{id, postedWr, false, SubmissionState::Orphaned, std::move(meta), batchSize};
@@ -72,6 +74,36 @@ int SubmissionLedger::ReleaseOrphanedByRecovery(std::atomic<int>* sqDepth) {
   }
   if (sqDepth && total > 0) sqDepth->fetch_sub(total, kSqAdmissionOrder);
   return total;
+}
+
+int SubmissionLedger::FailAll(StatusCode code, const std::string& message,
+                              std::atomic<int>* sqDepth) {
+  std::vector<TransferStatus*> claimed;
+  int total = 0;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    closed_ = true;
+    for (auto& [id, rec] : records_) {
+      total += rec.postedWr;
+      if (!rec.meta) continue;
+      // Records of one batch share a meta; exchange() makes the first one win and
+      // also stops a racing CQE from reporting a different outcome afterwards.
+      TransferStatus* status = rec.meta->status.exchange(nullptr, std::memory_order_acq_rel);
+      if (status != nullptr) claimed.push_back(status);
+    }
+    records_.clear();
+    if (sqDepth && total > 0) sqDepth->fetch_sub(total, kSqAdmissionOrder);
+  }
+
+  // Update() wakes WaitFor() sleepers, so run it outside the ledger lock to keep
+  // woken threads from contending on a lock this call still holds.
+  for (TransferStatus* status : claimed) status->Update(code, message);
+  return static_cast<int>(claimed.size());
+}
+
+bool SubmissionLedger::Closed() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return closed_;
 }
 
 bool SubmissionLedger::HasOrphaned() const {

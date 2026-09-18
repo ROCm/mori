@@ -111,6 +111,12 @@ class RdmaManager {
   size_t NumAvailDevices() const { return availDevices.size(); }
   bool HasIonicDevice() const;
 
+  // Fails every in-flight transfer on the endpoints implicated by a fatal verbs
+  // async event, and marks them degraded so later submissions fail fast instead
+  // of queueing onto a dead QP. Returns the number of transfers this call moved
+  // to a failed state.
+  int FailInFlightTransfers(const QpErrorEvent& event);
+
  private:
   application::RdmaDeviceContext* GetOrCreateDeviceContext(int devId);
 
