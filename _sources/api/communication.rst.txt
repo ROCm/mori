@@ -65,7 +65,7 @@ Dispatch and combine kernels for MoE expert parallelism.
    * - ``get_registered_combine_input_buffer(dtype)``
      - Get pre-registered zero-copy combine buffer.
 
-See `MORI-EP Guide <../MORI-EP-GUIDE.md>`_ for full API reference.
+See :doc:`MORI-EP Guide <../MORI-EP-GUIDE>` for full API reference.
 
 MORI Shmem (Symmetric Memory)
 -------------------------------
@@ -140,7 +140,7 @@ OpenSHMEM-style APIs for GPU memory management and RDMA.
    * - ``shmem_barrier_all()``
      - Global barrier across all PEs
 
-See `Shmem Guide <../MORI-SHMEM-GUIDE.md>`_ for full API reference.
+See :doc:`Shmem Guide <../MORI-SHMEM-GUIDE>` for full API reference.
 
 MORI-IO (Point-to-Point I/O)
 ------------------------------
@@ -187,7 +187,7 @@ RDMA-based P2P communication for KVCache transfer.
 - ``BackendType``: ``Unknown``, ``XGMI``, ``RDMA``, ``TCP``
 - ``StatusCode``: ``SUCCESS``, ``INIT``, ``IN_PROGRESS``, ``ERR_INVALID_ARGS``, ``ERR_NOT_FOUND``, ``ERR_RDMA_OP``, ``ERR_BAD_STATE``, ``ERR_GPU_OP``
 
-See `MORI-IO Guide <../MORI-IO-GUIDE.md>`_ for full API reference.
+See :doc:`MORI-IO Guide <../MORI-IO-GUIDE>` for full API reference.
 
 MORI-IR (Device Bitcode Integration)
 --------------------------------------
@@ -269,4 +269,4 @@ into GPU kernel frameworks (Triton, FlyDSL, MLIR, custom HIP, etc.).
      - ``quiet_thread()``, ``fence_thread()``, ``barrier_all_block()``
      - Ordering and synchronization
 
-See `MORI-IR Guide <../MORI-IR-GUIDE.md>`_ for full device function table and integration examples.
+See :doc:`MORI-IR Guide <../MORI-IR-GUIDE>` for full device function table and integration examples.

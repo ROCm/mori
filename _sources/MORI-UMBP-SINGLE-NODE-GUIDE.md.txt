@@ -1,13 +1,13 @@
 # MORI UMBP Single-Node Smoke Test
 
-This guide documents how to run the single-node UMBP + SGLang correctness smoke test that ships with Mori. The flow mirrors the `umbp-single-node-launcher` skill and launches the [`run_umbp_single_node_hicache.sh`](../src/umbp/scripts/run_umbp_single_node_hicache.sh) helper script inside a ROCm container.
+This guide documents how to run the single-node UMBP + SGLang correctness smoke test that ships with Mori. The flow mirrors the `umbp-single-node-launcher` skill and launches the [`run_umbp_single_node_hicache.sh`](https://github.com/ROCm/mori/blob/main/src/umbp/scripts/run_umbp_single_node_hicache.sh) helper script inside a ROCm container.
 
 Use the placeholders in this document to map the workflow to any target node. Every environment-dependent value is surfaced as an argument or environment variable; update those inputs and the script can run unchanged.
 
 For the underlying architecture see
-[`src/umbp/doc/design-master-control-plane.md`](../src/umbp/doc/design-master-control-plane.md);
+[`src/umbp/doc/design-master-control-plane.md`](https://github.com/ROCm/mori/blob/main/src/umbp/doc/design-master-control-plane.md);
 for the full env-var inventory see
-[`src/umbp/doc/runtime-env-vars.md`](../src/umbp/doc/runtime-env-vars.md).
+[`src/umbp/doc/runtime-env-vars.md`](https://github.com/ROCm/mori/blob/main/src/umbp/doc/runtime-env-vars.md).
 
 ## Overview
 

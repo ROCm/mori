@@ -1,7 +1,36 @@
 Quickstart
 ==========
 
-This guide will get you started with MORI's core components.
+Start with :doc:`installation` and choose an API using :doc:`ep_backends`.
+The snippets below explain the API flow; variables such as ``input_tokens``,
+``weights`` and peer descriptors are application-provided, so these are not
+standalone programs.
+
+Runnable checks
+---------------
+
+From a source checkout with MORI installed, use the maintained examples and tests:
+
+.. code-block:: bash
+
+   # Legacy EP correctness; requires eight local GPUs and pytest.
+   pytest tests/python/ops/test_dispatch_combine_intranode.py -q
+
+   # EPv2 identity-expert correctness; eight GPUs, HIP backend (no FlyDSL needed).
+   MORI_V2_KERNEL_BACKEND=hip pytest -q \
+       'tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_intranode.py::test_dispatch_combine_v2_intranode[bf16-gather]'
+
+   # SHMEM device integration; two GPUs and a compatible Triton installation.
+   torchrun --standalone --nproc_per_node=2 examples/shmem/ir/test_triton_shmem.py
+
+The test programs construct inputs, initialize ranks, check results and clean up.
+The EPv2 pytest wrapper also checks the runner's printed PASS/FAIL results; a zero
+exit code from the underlying ``test_op.py`` alone is not a correctness gate.
+Run them on an allocated node without competing jobs. For two-node EPv2,
+including its preview restrictions, see :doc:`ep_backends`.
+
+API sketches
+------------
 
 MORI-EP: Dispatch and Combine
 ------------------------------
@@ -45,7 +74,7 @@ Route tokens to MoE experts and combine results back:
        mori.shmem.shmem_finalize()
        dist.destroy_process_group()
 
-See the `MORI-EP Guide <MORI-EP-GUIDE.md>`_ for the full API reference.
+See the :doc:`MORI-EP Guide <MORI-EP-GUIDE>` for the full API reference.
 
 MORI-IO: Point-to-Point Transfers
 -----------------------------------
@@ -68,7 +97,7 @@ Transfer GPU memory between nodes via RDMA:
    status = engine.write(local_mem, 0, remote_mem, 0, size, uid)
    status.Wait()
 
-See `MORI-IO Guide <MORI-IO-GUIDE.md>`_ for architecture and full API.
+See :doc:`MORI-IO Guide <MORI-IO-GUIDE>` for architecture and full API.
 
 MORI Shmem: Symmetric Memory
 ------------------------------
@@ -89,7 +118,7 @@ Allocate GPU memory accessible across all ranks:
    mori.shmem.shmem_free(ptr)
    mori.shmem.shmem_finalize()
 
-See the `Shmem Guide <MORI-SHMEM-GUIDE.md>`_ for full API reference.
+See the :doc:`Shmem Guide <MORI-SHMEM-GUIDE>` for full API reference.
 
 MORI-IR: Device Bitcode for GPU Kernels
 -----------------------------------------
@@ -118,7 +147,7 @@ Use MORI shmem device functions inside Triton (or any LLVM-based) kernels:
 
    my_kernel[(grid,)](buf, BLOCK=1024, extern_libs=get_extern_libs())
 
-See `MORI-IR Guide <MORI-IR-GUIDE.md>`_ for full device function table and non-Triton integration.
+See :doc:`MORI-IR Guide <MORI-IR-GUIDE>` for full device function table and non-Triton integration.
 
 Profiling with MORI-VIZ
 -------------------------
@@ -135,13 +164,13 @@ Capture warp-level kernel traces (build with ``ENABLE_PROFILER=ON``):
 
    # Visualize at https://ui.perfetto.dev/
 
-See `Profiler docs <PROFILER.md>`_ for details.
+See :doc:`Profiler docs <PROFILER>` for details.
 
 Next Steps
 ----------
 
-* `MORI-EP Guide <MORI-EP-GUIDE.md>`_ — Full EP API reference and examples
-* `Shmem Guide <MORI-SHMEM-GUIDE.md>`_ — Symmetric memory concepts and APIs
-* `MORI-IR Guide <MORI-IR-GUIDE.md>`_ — Device bitcode integration for Triton
-* `MORI-IO Guide <MORI-IO-GUIDE.md>`_ — IO architecture and Python API
-* `Profiler <PROFILER.md>`_ — Warp-level kernel profiler
+* :doc:`MORI-EP Guide <MORI-EP-GUIDE>` — Full EP API reference and examples
+* :doc:`Shmem Guide <MORI-SHMEM-GUIDE>` — Symmetric memory concepts and APIs
+* :doc:`MORI-IR Guide <MORI-IR-GUIDE>` — Device bitcode integration for Triton
+* :doc:`MORI-IO Guide <MORI-IO-GUIDE>` — IO architecture and Python API
+* :doc:`Profiler <PROFILER>` — Warp-level kernel profiler

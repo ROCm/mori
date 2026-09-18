@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Installation &mdash; MORI 0.1.0 documentation</title>
+  <title>Install MORI &mdash; MORI development (1231671a) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=01f34227"></script>
+      <script src="_static/documentation_options.js?v=a17dc8d0"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -44,24 +44,37 @@
         </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
               <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
 <ul class="current">
-<li class="toctree-l1 current"><a class="current reference internal" href="#">Installation</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="#requirements">Requirements</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#installation-methods">Installation Methods</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#from-source">From Source</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Install MORI</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#installation">Installation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#prerequisites">Prerequisites</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#validate-the-environment">Validate the environment</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#install">Install</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#from-pypi-stable-release">From PyPI (stable release)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#nightly-pre-built-tested-daily">Nightly (pre-built, tested daily)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#from-source">From source</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="#environment-variables">Environment Variables</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#verification">Verification</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#troubleshooting">Troubleshooting</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#verify-installation">Verify installation</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#optional-flydsl-integration">Optional FlyDSL integration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#next-steps">Next steps</a></li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#runnable-checks">Runnable checks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#api-sketches">API sketches</a></li>
 <li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-ep-dispatch-and-combine">MORI-EP: Dispatch and Combine</a></li>
 <li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-io-point-to-point-transfers">MORI-IO: Point-to-Point Transfers</a></li>
 <li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-shmem-symmetric-memory">MORI Shmem: Symmetric Memory</a></li>
 <li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-ir-device-bitcode-for-gpu-kernels">MORI-IR: Device Bitcode for GPU Kernels</a></li>
 <li class="toctree-l2"><a class="reference internal" href="quickstart.html#profiling-with-mori-viz">Profiling with MORI-VIZ</a></li>
 <li class="toctree-l2"><a class="reference internal" href="quickstart.html#next-steps">Next Steps</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="ep_backends.html">Choosing an EP API and backend</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="ep_backends.html#epv2-configuration-and-lifecycle">EPv2 configuration and lifecycle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ep_backends.html#validation-before-tuning">Validation before tuning</a></li>
 </ul>
 </li>
 </ul>
@@ -217,6 +230,19 @@
 <li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#source-files">Source Files</a></li>
 </ul>
 </li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html">MORI UMBP Single-Node Smoke Test</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#prerequisites">Prerequisites</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#configuration-inputs">Configuration Inputs</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#script-constants">Script constants</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#runtime-environment-variables">Runtime environment variables</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#launch-steps">Launch Steps</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#core-dumps">Core Dumps</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#troubleshooting">Troubleshooting</a></li>
+</ul>
+</li>
 <li class="toctree-l1"><a class="reference internal" href="PROFILER.html">MORI-VIZ (Visualizer)</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="PROFILER.html#table-of-contents">Table of Contents</a></li>
 <li class="toctree-l2"><a class="reference internal" href="PROFILER.html#overview">Overview</a></li>
@@ -317,6 +343,131 @@
 </li>
 </ul>
 </li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html">MORI UMBP PD Disaggregation Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#prerequisites">Prerequisites</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#topology">Topology</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#configuration">Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-1-start-docker-on-all-nodes">Step 1 — Start Docker on all nodes</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-2-start-grafana-and-prometheus">Step 2 — Start Grafana and Prometheus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-3-build-mori-on-all-nodes">Step 3 — Build mori on all nodes</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-4-create-launcher-scripts">Step 4 — Create launcher scripts</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-5-kill-stale-processes-and-launch-prefill">Step 5 — Kill stale processes and launch prefill</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-6-wait-for-all-prefills-ready">Step 6 — Wait for ALL prefills ready</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-7-launch-decode-and-benchmark">Step 7 — Launch decode and benchmark</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-8-monitor-decode-and-benchmark">Step 8 — Monitor decode and benchmark</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-9-show-results">Step 9 — Show results</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#teardown">Teardown</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#environment-variable-reference">Environment Variable Reference</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#topology-this-guide-s-wrapper-variables">Topology (this guide’s wrapper variables)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#umbp-mori-consumed-by-run-pd-disagg-bench-dp8ep8-sh">UMBP / mori (consumed by <code class="docutils literal notranslate"><span class="pre">run_pd_disagg_bench_dp8ep8.sh</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#troubleshooting">Troubleshooting</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html">UMBP Distributed Tier-Management Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html#build">Build</a></li>
+<li class="toctree-l2"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html#run-generate-and-replay">Run, generate, and replay</a></li>
+<li class="toctree-l2"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html#json-backend-and-tier-policy">JSON backend and tier policy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html#synthetic-profiles">Synthetic profiles</a></li>
+<li class="toctree-l2"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html#trace-contract">Trace contract</a></li>
+<li class="toctree-l2"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html#results">Results</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="rdma_bandwidth_utilization.html">RDMA Bandwidth Utilization in Dispatch/Combine Kernels</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#kernel-execution-path">Kernel Execution Path</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#what-rdma-actually-transfers">What RDMA Actually Transfers</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#dispatch-send-dispatchinternodesend-dispatchinternodellsend">Dispatch send (<code class="docutils literal notranslate"><span class="pre">DispatchInterNodeSend</span></code> / <code class="docutils literal notranslate"><span class="pre">DispatchInterNodeLLSend</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#combine-send-combineinternodetyped-combineinternodelltyped">Combine send (<code class="docutils literal notranslate"><span class="pre">CombineInterNodeTyped</span></code> / <code class="docutils literal notranslate"><span class="pre">CombineInterNodeLLTyped</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#theoretical-peak-vs-observed-throughput">Theoretical Peak vs. Observed Throughput</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#computing-theoretical-peak">Computing theoretical peak</a></li>
+<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#understanding-the-receive-side-timing">Understanding the receive-side timing</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#how-to-check-rdma-bandwidth-from-the-trace">How to Check RDMA Bandwidth from the Trace</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#step-1-collect-a-profiler-trace">Step 1: Collect a profiler trace</a></li>
+<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#step-2-read-key-durations-from-the-text-summary">Step 2: Read key durations from the text summary</a></li>
+<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#step-3-compute-observed-rdma-bandwidth">Step 3: Compute observed RDMA bandwidth</a></li>
+<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#step-4-interpret-results">Step 4: Interpret results</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#key-tuning-parameters-that-affect-rdma-utilization">Key Tuning Parameters That Affect RDMA Utilization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#v1-vs-v1-ll-low-latency-tradeoff">v1 vs. v1_ll (low-latency) tradeoff</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#sanity-checks-from-hardware-counters-optional">Sanity Checks from Hardware Counters (optional)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#summary">Summary</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Developer Guides</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI_IR_INTEGRATION.html">Mori IR Integration</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html">MORI JIT Compilation Framework</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#quick-start">Quick Start</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#architecture-overview">Architecture Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#packaging-how-wheel-installs-support-jit">Packaging: How Wheel Installs Support JIT</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#compilation-split-host-cxx-vs-device-jit">Compilation Split: Host CXX vs Device JIT</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#what-compiles-as-cxx-at-pip-install-time">What compiles as CXX (at <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span></code> time)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#what-compiles-as-hip-runtime-jit-only">What compiles as HIP (runtime JIT only)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#template-args-vs-raw-args">Template Args vs Raw Args</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#what-gets-jit-compiled">What Gets JIT-Compiled</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#kernel-launch-flow">Kernel Launch Flow</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#hip-driver-api-python-ctypes">HIP Driver API (Python ctypes)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#triton-integration">Triton Integration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#cache-structure">Cache Structure</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#testing">Testing</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#docker-environment">Docker Environment</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#non-editable-install-wheel">1. Non-Editable Install (Wheel)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#editable-install-development">2. Editable Install (Development)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#pre-compile-all-kernels">3. Pre-compile All Kernels</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#verify-jit-configuration">4. Verify JIT Configuration</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#verify-compilation-separation">5. Verify Compilation Separation</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#dispatch-combine-correctness">6. Dispatch/Combine Correctness</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#dispatch-combine-benchmark">7. Dispatch/Combine Benchmark</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#shmem-api">8. Shmem API</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#id1">9. Triton Integration</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#full-clean-slate-test">10. Full Clean-Slate Test</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#kernel-source-files">Kernel Source Files</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#adding-a-new-kernel">Adding a New Kernel</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#host-device-nic-macro-separation">Host/Device NIC Macro Separation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#rocm-version-compatibility">ROCm Version Compatibility</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html">MORI JIT v2</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id1">1. 核心不变量</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id2">2. 分层</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#kernel">3. 一个 kernel 的三件套</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#cfg-c-20-structural-nttp">3.1 Cfg 作为单一模板参数（C++20 structural NTTP）</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id3">3.2 字段列表的完整性是承重的</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id4">3.3 生成的源码</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id5">3.4 缓存</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#host-device-host-hipcc">3.5 host/device 常量只有一份，且 host 不需要 hipcc</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id6">3.6 环境变量</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#dtype">3.7 dtype 是传输属性，不是算术属性</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#op">4. op 层</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id7">5. 两个后端共用一个 op</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#dispatch-combine">5.1 几何调优表：每个后端一份，dispatch 和 combine 再分开</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#python">6. Python 绑定</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id8">7. 几个有证据的决定</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id9">8. 性能</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id10">9. 移植来源与覆盖范围</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id11">10. 测试</a></li>
+</ul>
+</li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul>
@@ -365,9 +516,9 @@
           <div role="navigation" aria-label="Page navigation">
   <ul class="wy-breadcrumbs">
       <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
-      <li class="breadcrumb-item active">Installation</li>
+      <li class="breadcrumb-item active">Install MORI</li>
       <li class="wy-breadcrumbs-aside">
-            <a href="_sources/installation.rst.txt" rel="nofollow"> View page source</a>
+            <a href="_sources/installation.md.txt" rel="nofollow"> View page source</a>
       </li>
   </ul>
   <hr/>
@@ -375,87 +526,154 @@
           <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
            <div itemprop="articleBody">
              
-  <section id="installation">
-<h1>Installation<a class="headerlink" href="#installation" title="Link to this heading"></a></h1>
-<section id="requirements">
-<h2>Requirements<a class="headerlink" href="#requirements" title="Link to this heading"></a></h2>
+  <section id="install-mori">
+<h1>Install MORI<a class="headerlink" href="#install-mori" title="Link to this heading"></a></h1>
+<p>Use a ROCm environment with Python 3.10 or later and a matching ROCm build of
+PyTorch for tensor-based examples. Choose either the stable or nightly package;
+both provide the <code class="docutils literal notranslate"><span class="pre">mori</span></code> import and must not be installed together.</p>
+<p>The installation instructions below are included from the repository README so
+package choices, system dependencies and fabric checks stay consistent.</p>
+<section id="installation">
+<h2>Installation<a class="headerlink" href="#installation" title="Link to this heading"></a></h2>
+<section id="prerequisites">
+<h3>Prerequisites<a class="headerlink" href="#prerequisites" title="Link to this heading"></a></h3>
 <ul class="simple">
-<li><p>Python 3.10 or later</p></li>
-<li><p>ROCm 6.4 or later</p></li>
-<li><p>PyTorch with ROCm support</p></li>
-<li><p>AMD Instinct GPU (MI308X, MI300X, MI325X, MI355X)</p></li>
+<li><p>ROCm &gt;= 6.4 (hipcc needed at runtime for JIT kernel compilation, not at install time)</p></li>
+<li><p>System packages (required for <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span></code>; not bundled in wheels). On Debian/Ubuntu install at least:</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">libpci-dev</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">libibverbs-dev</span></code>, <code class="docutils literal notranslate"><span class="pre">ibverbs-utils</span></code>
+See <a class="reference external" href="https://github.com/ROCm/mori/blob/main/docker/Dockerfile.dev">docker/Dockerfile.dev</a> for the full apt list used in CI/dev images.</p></li>
 </ul>
-</section>
-<section id="installation-methods">
-<h2>Installation Methods<a class="headerlink" href="#installation-methods" title="Link to this heading"></a></h2>
-<section id="from-source">
-<h3>From Source<a class="headerlink" href="#from-source" title="Link to this heading"></a></h3>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Clone the repository</span>
-git<span class="w"> </span>clone<span class="w"> </span>--recursive<span class="w"> </span>https://github.com/ROCm/mori.git
-<span class="nb">cd</span><span class="w"> </span>mori
-
-<span class="c1"># Install PyTorch with ROCm support first</span>
-<span class="c1"># See https://pytorch.org for ROCm installation instructions</span>
-
-<span class="c1"># Build and install MORI</span>
-pip<span class="w"> </span>install<span class="w"> </span>.
-<span class="c1"># For venv build: pip install . --no-build-isolation</span>
+</li>
+<li><p>Optional: <code class="docutils literal notranslate"><span class="pre">libopenmpi-dev</span></code>, <code class="docutils literal notranslate"><span class="pre">openmpi-bin</span></code> — only needed when building C++ examples (<code class="docutils literal notranslate"><span class="pre">BUILD_EXAMPLES=ON</span></code>) or enabling MPI bootstrap (<code class="docutils literal notranslate"><span class="pre">MORI_WITH_MPI=ON</span></code>)</p></li>
+</ul>
+<p>Or build docker image with:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>mori<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>docker<span class="w"> </span>build<span class="w"> </span>-t<span class="w"> </span>rocm/mori:dev<span class="w"> </span>-f<span class="w"> </span>docker/Dockerfile.dev<span class="w"> </span>.
 </pre></div>
 </div>
-<p>No hipcc is needed at install time — host code compiles with a standard C++
-compiler. GPU kernels are JIT-compiled on first use and cached to <code class="docutils literal notranslate"><span class="pre">~/.mori/jit/</span></code>.</p>
+<p><strong>IBGDA NIC support</strong> (optional, for GPU-direct RDMA — auto-detected, no manual configuration needed):</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>NIC</p></th>
+<th class="head"><p>User library</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>AMD Pollara (AINIC)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">libionic.so</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Mellanox ConnectX</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">libmlx5.so</span></code> (typically pre-installed)</p></td>
+</tr>
+<tr class="row-even"><td><p>Broadcom Thor2</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">libbnxt_re.so</span></code></p></td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<div><p><strong>Note</strong>: IBGDA requires vendor-specific DV (Direct Verbs) libraries. Mellanox <code class="docutils literal notranslate"><span class="pre">libmlx5</span></code> is
+typically pre-installed with the kernel OFED stack. For Thor2 and Pollara, install the
+corresponding userspace library from your NIC vendor.</p>
+</div></blockquote>
+<p><strong>Recommended NIC firmware/driver versions</strong> (check with <code class="docutils literal notranslate"><span class="pre">mori</span> <span class="pre">check</span></code> or <code class="docutils literal notranslate"><span class="pre">tools/env_check.sh</span></code>):</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Vendor</p></th>
+<th class="head"><p>Recommendation</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>AMD Pollara (AINIC)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&gt;=</span> <span class="pre">1.117.5-a-45</span></code> (<code class="docutils literal notranslate"><span class="pre">1.117.1</span></code> major lacks IBGDA support)</p></td>
+</tr>
+<tr class="row-odd"><td><p>Broadcom (Thor2)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">237.1.137.x</span></code> / <code class="docutils literal notranslate"><span class="pre">235.2.86.x</span></code>; known bad: <code class="docutils literal notranslate"><span class="pre">231.x</span></code>, <code class="docutils literal notranslate"><span class="pre">232.x</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Mellanox (ConnectX, mlx5)</p></td>
+<td><p>No known minimum; tested on <code class="docutils literal notranslate"><span class="pre">ConnectX-7</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="validate-the-environment">
+<h3>Validate the environment<a class="headerlink" href="#validate-the-environment" title="Link to this heading"></a></h3>
+<p>Before a cross-node run, check the fabric:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>mori<span class="w"> </span>check<span class="w"> </span>&lt;peer_ip&gt;<span class="w">          </span><span class="c1"># or: tools/env_check.sh &lt;peer_ip&gt;</span>
+</pre></div>
+</div>
+<p>Six steps — NIC firmware and driver, QoS/PFC, DCQCN, then intra-node,
+inter-node bandwidth and latency meshes over every NIC pair, on host memory and
+on GPU memory. Exits non-zero if any check failed, and reports the fabric
+topology, which decides what can run on it.</p>
+</section>
+<section id="install">
+<h3>Install<a class="headerlink" href="#install" title="Link to this heading"></a></h3>
+<p>MoRI can be installed in three ways: from PyPI (stable), nightly pre-built wheels (latest dev), or from source.</p>
+<section id="from-pypi-stable-release">
+<h4>From PyPI (stable release)<a class="headerlink" href="#from-pypi-stable-release" title="Link to this heading"></a></h4>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span>amd_mori
+</pre></div>
+</div>
+</section>
+<section id="nightly-pre-built-tested-daily">
+<h4>Nightly (pre-built, tested daily)<a class="headerlink" href="#nightly-pre-built-tested-daily" title="Link to this heading"></a></h4>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span>--pre<span class="w"> </span>amd-mori-nightly
+</pre></div>
+</div>
+<blockquote>
+<div><p><strong>Deprecated</strong>: the GitHub Pages nightly index
+(<code class="docutils literal notranslate"><span class="pre">https://rocm.github.io/mori/nightly/</span></code>) is being retired. Please install
+nightly builds from PyPI (<code class="docutils literal notranslate"><span class="pre">amd-mori-nightly</span></code>) as shown above.</p>
+</div></blockquote>
+<blockquote>
+<div><p><strong>Note</strong>: <code class="docutils literal notranslate"><span class="pre">amd-mori</span></code> and <code class="docutils literal notranslate"><span class="pre">amd-mori-nightly</span></code> both provide the <code class="docutils literal notranslate"><span class="pre">mori</span></code> Python module.
+Do not install both at the same time — uninstall one before installing the other.</p>
+</div></blockquote>
+</section>
+<section id="from-source">
+<h4>From source<a class="headerlink" href="#from-source" title="Link to this heading"></a></h4>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>git<span class="w"> </span>clone<span class="w"> </span>--recursive<span class="w"> </span>https://github.com/ROCm/mori.git
+<span class="nb">cd</span><span class="w"> </span>mori
+<span class="c1"># NOTE: for venv build, add --no-build-isolation at the end</span>
+pip<span class="w"> </span>install<span class="w"> </span>.
+</pre></div>
+</div>
+<p>No hipcc needed at install time — host code compiles with a standard
+C++ compiler. GPU kernels are JIT-compiled on first use and cached to
+<code class="docutils literal notranslate"><span class="pre">~/.mori/jit/</span></code>. If a GPU is detected during install, kernel precompilation
+starts automatically in the background.</p>
 <p>To manually precompile all kernels (e.g. in a Docker image build):</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">MORI_PRECOMPILE</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"import mori"</span>
 </pre></div>
 </div>
 </section>
 </section>
-<section id="environment-variables">
-<h2>Environment Variables<a class="headerlink" href="#environment-variables" title="Link to this heading"></a></h2>
-<p>Common environment variables:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Symmetric heap size (required for shmem/EP)</span>
-<span class="nb">export</span><span class="w"> </span><span class="nv">MORI_SHMEM_HEAP_SIZE</span><span class="o">=</span>6G
-
-<span class="c1"># Log verbosity</span>
-<span class="nb">export</span><span class="w"> </span><span class="nv">MORI_GLOBAL_LOG_LEVEL</span><span class="o">=</span>INFO<span class="w">  </span><span class="c1"># TRACE, DEBUG, INFO</span>
+<section id="verify-installation">
+<h3>Verify installation<a class="headerlink" href="#verify-installation" title="Link to this heading"></a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"import mori; print(mori.__version__)"</span>
 </pre></div>
 </div>
 </section>
-<section id="verification">
-<h2>Verification<a class="headerlink" href="#verification" title="Link to this heading"></a></h2>
-<p>Verify the installation:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">mori</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
-
-<span class="c1"># Check if modules loaded successfully</span>
-<span class="nb">print</span><span class="p">(</span><span class="s2">"MORI modules available:"</span><span class="p">)</span>
-<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  - mori.shmem: </span><span class="si">{</span><span class="nb">hasattr</span><span class="p">(</span><span class="n">mori</span><span class="p">,</span><span class="w"> </span><span class="s1">'shmem'</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  - mori.ops: </span><span class="si">{</span><span class="nb">hasattr</span><span class="p">(</span><span class="n">mori</span><span class="p">,</span><span class="w"> </span><span class="s1">'ops'</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  - mori.io: </span><span class="si">{</span><span class="nb">hasattr</span><span class="p">(</span><span class="n">mori</span><span class="p">,</span><span class="w"> </span><span class="s1">'io'</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  - mori.kernel_profiler: </span><span class="si">{</span><span class="nb">hasattr</span><span class="p">(</span><span class="n">mori</span><span class="p">,</span><span class="w"> </span><span class="s1">'kernel_profiler'</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-
-<span class="c1"># Check ROCm availability via PyTorch</span>
-<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="se">\n</span><span class="s2">PyTorch version: </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">__version__</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"ROCm available: </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">()</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"ROCm version: </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">version</span><span class="o">.</span><span class="n">hip</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="nb">hasattr</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">version</span><span class="p">,</span><span class="w"> </span><span class="s1">'hip'</span><span class="p">)</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s1">'N/A'</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-</pre></div>
-</div>
 </section>
-<section id="troubleshooting">
-<h2>Troubleshooting<a class="headerlink" href="#troubleshooting" title="Link to this heading"></a></h2>
-<dl>
-<dt><strong>ImportError: No module named ‘mori’</strong></dt><dd><p>Ensure ROCm libraries are in your library path:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">LD_LIBRARY_PATH</span><span class="o">=</span>/opt/rocm/lib:<span class="nv">$LD_LIBRARY_PATH</span>
+<section id="optional-flydsl-integration">
+<h2>Optional FlyDSL integration<a class="headerlink" href="#optional-flydsl-integration" title="Link to this heading"></a></h2>
+<p>The FlyDSL device API is optional. To install it with the stable MORI package:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span><span class="s1">'amd_mori[flydsl]'</span>
 </pre></div>
 </div>
-</dd>
-<dt><strong>RuntimeError: No AMD GPU found</strong></dt><dd><p>Verify GPU is accessible:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>rocm-smi
-rocminfo<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>gfx
-</pre></div>
-</div>
-</dd>
-</dl>
+<p>The optional dependency is not version-pinned by MORI. When using MORI in a
+framework image, preserve that image’s tested FlyDSL version rather than
+upgrading the compiler independently. See <a class="reference internal" href="ep_backends.html"><span class="std std-doc">EP backends</span></a> for
+paths that require FlyDSL and paths that can run with HIP alone.</p>
+</section>
+<section id="next-steps">
+<h2>Next steps<a class="headerlink" href="#next-steps" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="quickstart.html"><span class="std std-doc">Quickstart</span></a> provides runnable checks and API sketches.</p></li>
+<li><p><a class="reference internal" href="ep_backends.html"><span class="std std-doc">EP backends</span></a> explains API and backend selection.</p></li>
+<li><p><a class="reference internal" href="MORI-CCO-GUIDE.html"><span class="std std-doc">CCO guide</span></a> describes communicator setup and transports.</p></li>
+</ul>
 </section>
 </section>
 
@@ -470,7 +688,9 @@ rocminfo<span class="w"> </span><span class="p">|</span><span class="w"> </span>
   <hr/>
 
   <div role="contentinfo">
-    <p>&#169; Copyright 2026, AMD.</p>
+    <p>&#169; Copyright 2026, AMD.
+      <span class="lastupdated">Last updated on 2026-09-18.
+      </span></p>
   </div>
 
   Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
