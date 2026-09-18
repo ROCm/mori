@@ -65,36 +65,6 @@ constexpr size_t kRemoteCap = 8 << 20;
 
 constexpr const char* kBatchPutWarnSubstr = "BatchPut: src not registered for key=";
 
-// Unique peer-service port per PoolClient.  A non-zero peer_service_port is
-// required for a node to register a peer_address and serve remote
-// AllocateSlot/CommitSlot RPCs; without it the caller's remote BatchPut fails
-// with "peer service connection unavailable".
-//
-// The port must be free *at bind time* (PoolClient binds it directly and
-// registers it verbatim), so a hard-coded base collides with concurrent test
-// processes / leftover servers on a shared (self-hosted CI) host.  Ask the
-// kernel for a currently-free ephemeral port instead.
-inline uint16_t NextPeerServicePort() {
-  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (fd >= 0) {
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = 0;  // kernel picks a free port
-    socklen_t len = sizeof(addr);
-    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 &&
-        ::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0) {
-      uint16_t port = ntohs(addr.sin_port);
-      ::close(fd);
-      return port;
-    }
-    ::close(fd);
-  }
-  static std::atomic<uint16_t> next{
-      static_cast<uint16_t>(53000 + (static_cast<unsigned>(::getpid()) % 4000))};
-  return next.fetch_add(1);
-}
-
 // Minimal sink that copies every payload into a vector for later
 // substring inspection.  Derived from base_sink (mt) so it is safe to
 // share across the umbp logger's worker.
@@ -187,7 +157,12 @@ class BatchPutWarnTest : public ::testing::Test {
     cfg_caller.master_config.master_address = master_addr;
     cfg_caller.io_engine.host = "0.0.0.0";
     cfg_caller.io_engine.port = 0;
-    cfg_caller.peer_service_port = NextPeerServicePort();
+    // A peer service is required for the node to register a peer_address and
+    // serve remote AllocateSlot/CommitSlot RPCs; without one, remote access
+    // fails with "peer service connection unavailable".  Let gRPC choose the
+    // port: probing for a free one and closing the socket before PoolClient
+    // binds it races with everything else on a shared CI host.
+    cfg_caller.auto_peer_service_port = true;
     cfg_caller.dram_page_size = kPageSize;
     cfg_caller.dram.buffer_sizes = {kPageSize};
     caller_ = std::make_unique<PoolClient>(std::move(cfg_caller));
@@ -199,7 +174,7 @@ class BatchPutWarnTest : public ::testing::Test {
     cfg_target.master_config.master_address = master_addr;
     cfg_target.io_engine.host = "0.0.0.0";
     cfg_target.io_engine.port = 0;
-    cfg_target.peer_service_port = NextPeerServicePort();
+    cfg_target.auto_peer_service_port = true;
     cfg_target.dram_page_size = kPageSize;
     cfg_target.dram.buffer_sizes = {kRemoteCap};
     target_ = std::make_unique<PoolClient>(std::move(cfg_target));

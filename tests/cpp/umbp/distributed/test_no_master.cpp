@@ -53,12 +53,6 @@ constexpr size_t kPageSize = 4096;
 constexpr size_t kDramCap = 32ULL * 1024 * 1024;
 constexpr size_t kObjectSize = 8192;
 
-uint16_t NextPeerServicePort() {
-  static std::atomic<uint16_t> next{
-      static_cast<uint16_t>(47000 + (static_cast<unsigned>(::getpid()) % 3000))};
-  return next.fetch_add(1);
-}
-
 std::vector<char> Pattern(size_t size, int seed) {
   std::vector<char> out(size);
   for (size_t i = 0; i < size; ++i) out[i] = static_cast<char>((i * 37 + seed) & 0xFF);
@@ -76,7 +70,12 @@ class NoMasterTest : public ::testing::Test {
     cfg.master_config.master_address = "";  // <-- the whole difference
     cfg.io_engine.host = "0.0.0.0";
     cfg.io_engine.port = 0;
-    cfg.peer_service_port = NextPeerServicePort();
+    // A peer service is required for the node to register a peer_address and
+    // serve remote AllocateSlot/CommitSlot RPCs; without one, remote access
+    // fails with "peer service connection unavailable".  Let gRPC choose the
+    // port: probing for a free one and closing the socket before PoolClient
+    // binds it races with everything else on a shared CI host.
+    cfg.auto_peer_service_port = true;
     cfg.dram_page_size = kPageSize;
     cfg.medium = TierType::DRAM;
     cfg.dram.buffer_sizes = {kDramCap};
@@ -262,7 +261,7 @@ TEST_F(NoMasterTest, SameClientClassServesBothDeployments) {
   dc.master_config.master_address = "";
   dc.io_engine.host = "0.0.0.0";
   dc.io_engine.port = 0;
-  dc.peer_service_port = NextPeerServicePort();
+  dc.auto_peer_service_port = true;
   dc.dram_page_size = kPageSize;
   cfg.distributed = dc;
 
