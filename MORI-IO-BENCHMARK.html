@@ -283,15 +283,16 @@
 </li>
 <li class="toctree-l1 current"><a class="current reference internal" href="#">MORI-IO Benchmark</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="#table-of-contents">Table of Contents</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#benchmark-commands">Benchmark Commands</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#fabric-cross-node-scale-up-ualink-super-node">Fabric (cross-node scale-up UALink super-node)</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="#c-benchmark-nixlbench-matching">C++ Benchmark (nixlbench-matching)</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#which-benchmark-to-use">Which benchmark to use</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#c-benchmark-default-nixlbench-matching">C++ Benchmark (default, nixlbench-matching)</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="#build">Build</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#run-two-nodes">Run (two nodes)</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#sweep-modes">Sweep modes</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#differences-from-the-python-flags">Differences from the Python flags</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#python-benchmark">Python Benchmark</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#fabric-cross-node-scale-up-ualink-super-node">Fabric (cross-node scale-up UALink super-node)</a></li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="#benchmark-arguments">Benchmark Arguments</a></li>
@@ -379,17 +380,18 @@
 <section id="table-of-contents">
 <h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading"></a></h2>
 <ul class="simple">
-<li><p><a class="reference internal" href="#benchmark-commands"><span class="xref myst">Benchmark Commands</span></a></p>
-<ul>
-<li><p><a class="reference internal" href="#fabric-cross-node-scale-up-ualink-super-node"><span class="xref myst">Fabric (cross-node scale-up UALink super-node)</span></a></p></li>
-</ul>
-</li>
-<li><p><a class="reference internal" href="#c-benchmark-nixlbench-matching"><span class="xref myst">C++ Benchmark (nixlbench-matching)</span></a></p>
+<li><p><a class="reference internal" href="#which-benchmark-to-use"><span class="xref myst">Which benchmark to use</span></a></p></li>
+<li><p><a class="reference internal" href="#c-benchmark-default-nixlbench-matching"><span class="xref myst">C++ Benchmark (default, nixlbench-matching)</span></a></p>
 <ul>
 <li><p><a class="reference internal" href="#build"><span class="xref myst">Build</span></a></p></li>
 <li><p><a class="reference internal" href="#run-two-nodes"><span class="xref myst">Run (two nodes)</span></a></p></li>
 <li><p><a class="reference internal" href="#sweep-modes"><span class="xref myst">Sweep modes</span></a></p></li>
 <li><p><a class="reference internal" href="#differences-from-the-python-flags"><span class="xref myst">Differences from the Python flags</span></a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#python-benchmark"><span class="xref myst">Python Benchmark</span></a></p>
+<ul>
+<li><p><a class="reference internal" href="#fabric-cross-node-scale-up-ualink-super-node"><span class="xref myst">Fabric (cross-node scale-up UALink super-node)</span></a></p></li>
 </ul>
 </li>
 <li><p><a class="reference internal" href="#benchmark-arguments"><span class="xref myst">Benchmark Arguments</span></a></p></li>
@@ -417,46 +419,36 @@
 </li>
 </ul>
 </section>
-<section id="benchmark-commands">
-<h2>Benchmark Commands<a class="headerlink" href="#benchmark-commands" title="Link to this heading"></a></h2>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>/path/to/mori
-<span class="nb">export</span><span class="w"> </span><span class="nv">PYTHONPATH</span><span class="o">=</span>/path/to/mori:<span class="nv">$PYTHONPATH</span>
-<span class="nb">export</span><span class="w"> </span><span class="nv">GLOO_SOCKET_IFNAME</span><span class="o">=</span>ens14np0<span class="w">  </span><span class="c1"># Set to your NIC interface</span>
+<section id="which-benchmark-to-use">
+<h2>Which benchmark to use<a class="headerlink" href="#which-benchmark-to-use" title="Link to this heading"></a></h2>
+<p>MORI-IO ships two benchmarks that measure the same transfer paths:</p>
+<ul class="simple">
+<li><p><strong>C++ (<code class="docutils literal notranslate"><span class="pre">tests/cpp/io/bench_engine</span></code>) — the default.</strong> No Python interpreter in
+the measurement loop, and its timing matches
+<a class="reference external" href="https://github.com/ai-dynamo/nixl">nixlbench</a> so MORI-IO and NIXL numbers are
+directly comparable. This is what <code class="docutils literal notranslate"><span class="pre">tools/run_internode_io_benchmark.sh</span></code> runs by
+default and what CI reports. Start here.</p></li>
+<li><p><strong>Python (<code class="docutils literal notranslate"><span class="pre">tests/python/io/benchmark.py</span></code>) — kept for parity.</strong> Uses <code class="docutils literal notranslate"><span class="pre">torchrun</span></code>
+for rendezvous; convenient when you are already in a torch/torchrun workflow.
+Select it with <code class="docutils literal notranslate"><span class="pre">run_internode_io_benchmark.sh</span> <span class="pre">--engine</span> <span class="pre">python</span></code>.</p></li>
+</ul>
+<p>Both accept the same workload flags (op, sweep, batch, QP, session); the C++ tool
+also accepts the Python spellings as aliases. See
+<a class="reference internal" href="#differences-from-the-python-flags"><span class="xref myst">Differences from the Python flags</span></a>.</p>
+<p>The two-node runner picks the engine with <code class="docutils literal notranslate"><span class="pre">--engine</span></code>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># C++ engine (default)</span>
+tools/run_internode_io_benchmark.sh<span class="w"> </span>--rank<span class="w"> </span><span class="m">0</span><span class="w"> </span>--master-addr<span class="w"> </span>&lt;ip&gt;<span class="w"> </span>--ifname<span class="w"> </span>&lt;nic&gt;<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--<span class="w"> </span>--op<span class="w"> </span>write<span class="w"> </span>--all<span class="w"> </span>--enable-sess<span class="w"> </span>--enable-batch-transfer
 
-<span class="c1"># Run on two nodes (replace node_rank and master_addr)</span>
-torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--node_rank<span class="o">=</span><span class="m">0</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">"10.194.129.65"</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>tests/python/io/benchmark.py<span class="w"> </span>--host<span class="o">=</span><span class="s2">"10.194.129.65"</span>
+<span class="c1"># Python engine</span>
+tools/run_internode_io_benchmark.sh<span class="w"> </span>--engine<span class="w"> </span>python<span class="w"> </span>--rank<span class="w"> </span><span class="m">0</span><span class="w"> </span>--master-addr<span class="w"> </span>&lt;ip&gt;<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--ifname<span class="w"> </span>&lt;nic&gt;<span class="w"> </span>--<span class="w"> </span>--op-type<span class="w"> </span>write<span class="w"> </span>--all<span class="w"> </span>--enable-sess<span class="w"> </span>--enable-batch-transfer
 </pre></div>
 </div>
-<section id="fabric-cross-node-scale-up-ualink-super-node">
-<h3>Fabric (cross-node scale-up UALink super-node)<a class="headerlink" href="#fabric-cross-node-scale-up-ualink-super-node" title="Link to this heading"></a></h3>
-<p>The <code class="docutils literal notranslate"><span class="pre">fabric</span></code> backend transfers between two nodes that share the same scale-up
-fabric domain (<strong>same vPOD</strong> — verify with <code class="docutils literal notranslate"><span class="pre">amd-smi</span> <span class="pre">fabric</span></code> that <code class="docutils literal notranslate"><span class="pre">PPOD_ID</span></code> and
-<code class="docutils literal notranslate"><span class="pre">VPOD_ID</span></code> match and <code class="docutils literal notranslate"><span class="pre">ACCEL_STATE</span></code> is <code class="docutils literal notranslate"><span class="pre">READY</span></code> on both). Buffers are allocated as
-fabric-exportable VMM memory internally, so no <code class="docutils literal notranslate"><span class="pre">--host</span></code>/QP options are needed;
-OOB metadata is still exchanged over gloo (torchrun).</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># node A (initiator)</span>
-torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--node_rank<span class="o">=</span><span class="m">0</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">"&lt;nodeA_ip&gt;"</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>tests/python/io/benchmark.py<span class="w"> </span>--backend<span class="w"> </span>fabric<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--all<span class="w"> </span>--enable-sess<span class="w"> </span>--enable-batch-transfer<span class="w"> </span>--transfer-batch-size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--sweep-start-size<span class="w"> </span><span class="m">1048576</span><span class="w"> </span>--sweep-max-size<span class="w"> </span><span class="m">268435456</span><span class="w"> </span>--op-type<span class="w"> </span><span class="nb">read</span>
-
-<span class="c1"># node B (target): same command with --node_rank=1</span>
-</pre></div>
-</div>
-<blockquote>
-<div><p>Requires ROCm ≥ 7.15 (HIP fabric VMM APIs). Only GPU memory is supported
-(<code class="docutils literal notranslate"><span class="pre">--mem-type</span> <span class="pre">gpu</span></code>). If the two nodes are not in the same vPOD, session creation
-fails fast with a clear error.</p>
-</div></blockquote>
 </section>
-</section>
-<section id="c-benchmark-nixlbench-matching">
-<h2>C++ Benchmark (nixlbench-matching)<a class="headerlink" href="#c-benchmark-nixlbench-matching" title="Link to this heading"></a></h2>
-<p>The commands above use the <strong>Python</strong> benchmark (<code class="docutils literal notranslate"><span class="pre">tests/python/io/benchmark.py</span></code>).
-There is also a native <strong>C++</strong> benchmark, <code class="docutils literal notranslate"><span class="pre">tests/cpp/io/bench_engine.cpp</span></code>, whose
+<section id="c-benchmark-default-nixlbench-matching">
+<h2>C++ Benchmark (default, nixlbench-matching)<a class="headerlink" href="#c-benchmark-default-nixlbench-matching" title="Link to this heading"></a></h2>
+<p>The <strong>C++</strong> benchmark, <code class="docutils literal notranslate"><span class="pre">tests/cpp/io/bench_engine.cpp</span></code>, is the default. Its
 measurement loop is written to <strong>match <a class="reference external" href="https://github.com/ai-dynamo/nixl">nixlbench</a></strong>
 (NVIDIA NIXL’s <code class="docutils literal notranslate"><span class="pre">xferbench</span></code>) exactly, so MORI-IO and NIXL RDMA numbers are
 apples-to-apples on the same fabric. Use it when you want a head-to-head
@@ -652,6 +644,45 @@ from the <strong>global</strong> rank, so <code class="docutils literal notransl
 <code class="docutils literal notranslate"><span class="pre">P+1</span> <span class="pre">…</span> <span class="pre">P+2N</span></code> for the engines — leave that range free. Each side forks <code class="docutils literal notranslate"><span class="pre">N-1</span></code>
 children before touching HIP, so a failure in one pair still reaps the others
 rather than leaving them holding ports.</p>
+</div></blockquote>
+</section>
+</section>
+<section id="python-benchmark">
+<h2>Python Benchmark<a class="headerlink" href="#python-benchmark" title="Link to this heading"></a></h2>
+<p>Kept for parity with the C++ default (select it in the runner with
+<code class="docutils literal notranslate"><span class="pre">--engine</span> <span class="pre">python</span></code>). It uses <code class="docutils literal notranslate"><span class="pre">torchrun</span></code> for the out-of-band rendezvous instead of
+MORI’s socket bootstrap.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>/path/to/mori
+<span class="nb">export</span><span class="w"> </span><span class="nv">PYTHONPATH</span><span class="o">=</span>/path/to/mori:<span class="nv">$PYTHONPATH</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">GLOO_SOCKET_IFNAME</span><span class="o">=</span>ens14np0<span class="w">  </span><span class="c1"># Set to your NIC interface</span>
+
+<span class="c1"># Run on two nodes (replace node_rank and master_addr)</span>
+torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--node_rank<span class="o">=</span><span class="m">0</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">"10.194.129.65"</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>tests/python/io/benchmark.py<span class="w"> </span>--host<span class="o">=</span><span class="s2">"10.194.129.65"</span>
+</pre></div>
+</div>
+<section id="fabric-cross-node-scale-up-ualink-super-node">
+<h3>Fabric (cross-node scale-up UALink super-node)<a class="headerlink" href="#fabric-cross-node-scale-up-ualink-super-node" title="Link to this heading"></a></h3>
+<p>The <code class="docutils literal notranslate"><span class="pre">fabric</span></code> backend transfers between two nodes that share the same scale-up
+fabric domain (<strong>same vPOD</strong> — verify with <code class="docutils literal notranslate"><span class="pre">amd-smi</span> <span class="pre">fabric</span></code> that <code class="docutils literal notranslate"><span class="pre">PPOD_ID</span></code> and
+<code class="docutils literal notranslate"><span class="pre">VPOD_ID</span></code> match and <code class="docutils literal notranslate"><span class="pre">ACCEL_STATE</span></code> is <code class="docutils literal notranslate"><span class="pre">READY</span></code> on both). Buffers are allocated as
+fabric-exportable VMM memory internally, so no <code class="docutils literal notranslate"><span class="pre">--host</span></code>/QP options are needed;
+OOB metadata is still exchanged over gloo (torchrun).</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># node A (initiator)</span>
+torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--node_rank<span class="o">=</span><span class="m">0</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">"&lt;nodeA_ip&gt;"</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>tests/python/io/benchmark.py<span class="w"> </span>--backend<span class="w"> </span>fabric<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--all<span class="w"> </span>--enable-sess<span class="w"> </span>--enable-batch-transfer<span class="w"> </span>--transfer-batch-size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--sweep-start-size<span class="w"> </span><span class="m">1048576</span><span class="w"> </span>--sweep-max-size<span class="w"> </span><span class="m">268435456</span><span class="w"> </span>--op-type<span class="w"> </span><span class="nb">read</span>
+
+<span class="c1"># node B (target): same command with --node_rank=1</span>
+</pre></div>
+</div>
+<blockquote>
+<div><p>Requires ROCm ≥ 7.15 (HIP fabric VMM APIs). Only GPU memory is supported
+(<code class="docutils literal notranslate"><span class="pre">--mem-type</span> <span class="pre">gpu</span></code>). If the two nodes are not in the same vPOD, session creation
+fails fast with a clear error. The C++ benchmark also supports <code class="docutils literal notranslate"><span class="pre">--backend</span> <span class="pre">fabric</span></code>.</p>
 </div></blockquote>
 </section>
 </section>
@@ -932,12 +963,14 @@ RDMA write bandwidth</strong> with large messages and batched transfers. Latency
 or single-transfer workloads may prefer different settings.</p>
 <section id="recommended-starting-config">
 <h3>Recommended starting config<a class="headerlink" href="#recommended-starting-config" title="Link to this heading"></a></h3>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>tests/python/io/benchmark.py<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--op-type<span class="w"> </span>write<span class="w"> </span><span class="se">\</span>
+<p>These workload flags apply to both engines (the C++ default and Python); only the
+launch wrapper differs. Shown against the C++ binary:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>tests/cpp/io/bench_engine<span class="w"> </span>--op<span class="w"> </span>write<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--enable-sess<span class="w"> </span>--enable-batch-transfer<span class="w"> </span>--batch-contiguous<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--disable-chunking<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--num-qp-per-transfer<span class="w"> </span><span class="m">8</span><span class="w"> </span>--num-worker-threads<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--transfer-batch-size<span class="w"> </span><span class="m">128</span><span class="w"> </span>--num-initiator-dev<span class="w"> </span><span class="m">1</span><span class="w"> </span>--num-target-dev<span class="w"> </span><span class="m">1</span>
+<span class="w">    </span><span class="c1"># (plus --rank/--master-ip/--self-ip/--port for the two-node rendezvous)</span>
 </pre></div>
 </div>
 <p>On a 400G-class NIC this typically reaches ~95%+ of link rate across the
