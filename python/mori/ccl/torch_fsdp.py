@@ -14,6 +14,11 @@ output that FSDP can use in place, avoiding the rank-major copy-out. The
 ``mori`` package is imported lazily so importing this module does not require
 ROCm/MORI to be installed. Each instance owns one persistent registered output
 and must be installed on only one FSDP parameter group.
+
+The full output allocation remains resident after both forward and backward
+reshard, including when zero-copy output is disabled. Logical reshard and
+backward all-gather still follow FSDP's policy. This mode trades device memory
+for persistent registration; it does not reclaim output buffers on reshard.
 """
 
 import importlib
@@ -24,7 +29,11 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from torch.distributed.fsdp._fully_shard._all_gather_layout import AllGatherLayout
+from torch.distributed.fsdp._fully_shard._all_gather_layout import (
+    AllGatherLayout,
+    AllGatherOutputs,
+    AllGatherParamMetadata,
+)
 from torch.distributed.fsdp._fully_shard._fsdp_api import AllGather
 
 
@@ -56,7 +65,7 @@ class _MoriSdmaAllGatherLayout(AllGatherLayout):
         can_use_param_contiguous_output: bool,
     ) -> object | None:
         self._comm._clear_output()
-        if not can_use_param_contiguous_output:
+        if not self._comm._zero_copy_output or not can_use_param_contiguous_output:
             return None
         if not input_split_sizes:
             raise RuntimeError("MORI zero-copy allgather requires non-empty splits")
@@ -117,12 +126,15 @@ class _MoriSdmaAllGatherLayout(AllGatherLayout):
     def finalize_outputs(
         self,
         all_gather_output: torch.Tensor,
-        param_input_numels: list[list[int]],
+        param_metadata: list[AllGatherParamMetadata],
         world_size: int,
-        output_metadata: object,
-    ) -> list[list[torch.Tensor]]:
-        return self.param_contiguous_output_views(
-            all_gather_output, param_input_numels, world_size
+        output_metadata: object | None,
+    ) -> AllGatherOutputs:
+        return AllGatherOutputs(
+            self.param_contiguous_output_views(
+                all_gather_output, [param.input_numels for param in param_metadata], world_size
+            ),
+            backend_owned=True,
         )
 
 
@@ -135,9 +147,11 @@ class MoriSdmaAllGather(AllGather):
             parameter group is eligible. Defaults to ``True``.
     """
 
+    reuses_output_storage = True
+
     def __init__(self, zero_copy_output: bool = True) -> None:
         self._zero_copy_output = zero_copy_output
-        self.layout = _MoriSdmaAllGatherLayout(self) if zero_copy_output else None
+        self.layout = _MoriSdmaAllGatherLayout(self)
         self._collective: Any | None = None
         self._rank: int | None = None
         self._world_size: int | None = None
@@ -217,6 +231,8 @@ class MoriSdmaAllGather(AllGather):
         # MORI uses raw pointers, so the allocator cannot track these uses.
         input_tensor.record_stream(stream)
         output_tensor.record_stream(stream)
+        # Layout selection applies to one call, including when input hooks change.
+        self._clear_output()
         if async_op:
             return _MoriSdmaAllGatherWork(collective, stream)
         return None

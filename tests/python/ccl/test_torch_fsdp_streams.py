@@ -55,12 +55,11 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                 torch.cuda.synchronize()
                 with torch.cuda.stream(producer):
                     source = torch.full((count,), float(rank + 1), device=device)
-                    if comm.layout is not None:
-                        comm.layout.prepare_output(
-                            splits, count, world_size, torch.float32, device,
-                            [[torch.float32], [torch.float32]],
-                            [[size] for size in splits], True,
-                        )
+                    comm.layout.prepare_output(
+                        splits, count, world_size, torch.float32, device,
+                        [[torch.float32], [torch.float32]],
+                        [[size] for size in splits], True,
+                    )
                 gather.wait_stream(producer)
                 with torch.cuda.stream(gather), patch.object(
                     collective, enqueue_name, side_effect=delayed_enqueue

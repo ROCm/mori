@@ -6,6 +6,7 @@ import torch
 
 import mori.ccl.torch_fsdp as torch_fsdp
 from mori.ccl.torch_fsdp import MoriSdmaAllGather
+from torch.distributed.fsdp._fully_shard._all_gather_layout import DefaultAllGatherLayout
 
 
 def _prepare(
@@ -30,7 +31,24 @@ def _prepare(
 class TestMoriSdmaAllGather(unittest.TestCase):
     def test_zero_copy_disabled_uses_default_output(self) -> None:
         comm = MoriSdmaAllGather(zero_copy_output=False)
-        self.assertIsNone(comm.layout)
+        self.assertIsNone(_prepare(comm.layout, [2, 4]))
+
+    def test_rank_major_backend_cannot_be_shared_between_groups(self) -> None:
+        comm = MoriSdmaAllGather(zero_copy_output=False)
+        comm.layout._bind_owner(object())
+        with self.assertRaisesRegex(ValueError, "cannot be shared"):
+            comm.layout._bind_owner(object())
+
+    def test_fallback_selects_default_finalizer(self) -> None:
+        comm = MoriSdmaAllGather()
+        copy_in, selected_layout, metadata = comm.layout.prepare(
+            [2, 4], 6, 2, torch.float32, torch.device("cpu"),
+            [[torch.float32], [torch.float32]], [[2], [4]], False,
+        )
+        self.assertIs(copy_in, torch.ops.fsdp.all_gather_copy_in)
+        self.assertIsInstance(selected_layout, DefaultAllGatherLayout)
+        self.assertIsNone(metadata)
+        self.assertIsNone(comm._param_contiguous_split_sizes)
 
     def test_prepare_zero_copy_metadata(self) -> None:
         comm = MoriSdmaAllGather(zero_copy_output=True)
@@ -148,6 +166,41 @@ class TestMoriSdmaAllGather(unittest.TestCase):
         collective.start_async_param_contiguous.assert_not_called()
         collective.wait_async.assert_not_called()
         stream.synchronize.assert_not_called()
+
+    def test_next_call_without_prepare_uses_rank_major(self) -> None:
+        comm = MoriSdmaAllGather()
+        metadata = _prepare(comm.layout, [2, 4])
+        collective = MagicMock()
+        group = MagicMock()
+        output = torch.empty(12)
+        input = torch.arange(6.0)
+        stream = MagicMock()
+
+        def param_contiguous(input, output, count, sizes, offsets, *, stream):
+            output.copy_(torch.cat([t.repeat(2) for t in input.split([2, 4])]))
+
+        def rank_major(input, output, count, *, stream):
+            output.copy_(input.repeat(2))
+
+        collective.enqueue_param_contiguous.side_effect = param_contiguous
+        collective.enqueue.side_effect = rank_major
+        with (
+            patch.object(comm, "_get_collective", return_value=collective),
+            patch.object(comm, "_validate_tensors"),
+            patch.object(torch.cuda, "current_stream", return_value=stream),
+            patch.object(torch.Tensor, "record_stream"),
+        ):
+            comm(output, input, group)
+            self.assertEqual(output.tolist(), [0, 1, 0, 1, 2, 3, 4, 5, 2, 3, 4, 5])
+            self.assertIsNone(comm._param_contiguous_split_sizes)
+            self.assertIsNone(comm._param_contiguous_split_offsets)
+            self.assertEqual(comm._param_contiguous_input_nbytes, 0)
+            # A custom input hook may return rank-major inputs without prepare.
+            comm(output, input + 10, group)
+        collective.enqueue_param_contiguous.assert_called_once()
+        collective.enqueue.assert_called_once()
+        self.assertEqual(output.tolist(), (input + 10).repeat(2).tolist())
+        self.assertEqual(metadata[0].tolist(), [2, 4])
 
     def test_async_work_orders_each_consumer_after_completion(self) -> None:
         comm = MoriSdmaAllGather(zero_copy_output=False)
