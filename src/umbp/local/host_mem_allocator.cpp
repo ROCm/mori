@@ -41,7 +41,6 @@
 #include <vector>
 
 #include "mori/utils/mori_log.hpp"
-#include "umbp/common/env_time.h"
 
 namespace mori::umbp {
 namespace {
@@ -142,36 +141,6 @@ void LogNumaUnavailableOnce() {
   });
 }
 
-void LogHugepageAdviceFailedOnce(int err) {
-  static std::once_flag once;
-  std::call_once(once, [err] {
-    MORI_UMBP_WARN(
-        "HostMemAllocator: madvise(MADV_HUGEPAGE) failed ({}: {}); the mapping stays correct, "
-        "just backed by base pages",
-        err, std::strerror(err));
-  });
-}
-
-bool TransparentHugepagesEnabled() {
-  static const bool enabled = GetEnvUint32("UMBP_DRAM_TRANSPARENT_HUGEPAGES", 1) != 0;
-  return enabled;
-}
-
-// MAP_HUGETLB needs a reserved pool, and hosts that run HugePages_Total=0 fall
-// back to base pages: a 1 TiB tier is then 268 M pages, and both the prefault
-// and the hipHostRegister that follows are charged per page. THP is available
-// in madvise mode on those hosts, so the kernel backs the range with 2 MiB
-// pages -- 512x fewer entries -- but only when asked.
-void AdviseTransparentHugepages(const HostBufferHandle& handle) {
-#ifdef MADV_HUGEPAGE
-  if (madvise(handle.ptr, handle.mapped_size, MADV_HUGEPAGE) != 0) {
-    LogHugepageAdviceFailedOnce(errno);
-  }
-#else
-  (void)handle;
-#endif
-}
-
 void TouchPages(void* ptr, size_t mapped_size, size_t stride) {
   volatile char* bytes = static_cast<volatile char*>(ptr);
   for (size_t offset = 0; offset < mapped_size; offset += stride) {
@@ -228,15 +197,6 @@ int MbindMemory(void* ptr, size_t mapped_size, int numa_node) {
 void ApplyPostMappingPolicies(HostBufferHandle& handle, const HostBufferOptions& opts) {
   if (!handle.valid()) return;
 
-  const bool is_hugetlb = handle.actual_backing == HostBufferBacking::kAnonymousHugetlb ||
-                          handle.actual_backing == HostBufferBacking::kAnonymousShmHugetlb;
-
-  // Before any faulting below, so the population itself lands in 2 MiB units.
-  // hugetlb mappings are already huge and reject the advice with EINVAL.
-  if (!is_hugetlb && TransparentHugepagesEnabled()) {
-    AdviseTransparentHugepages(handle);
-  }
-
   if (opts.numa_node >= 0) {
     const int rc = MbindMemory(handle.ptr, handle.mapped_size, opts.numa_node);
     if (rc == -ENOSYS) {
@@ -248,6 +208,8 @@ void ApplyPostMappingPolicies(HostBufferHandle& handle, const HostBufferOptions&
   }
 
   if (opts.prefault) {
+    const bool is_hugetlb = handle.actual_backing == HostBufferBacking::kAnonymousHugetlb ||
+                            handle.actual_backing == HostBufferBacking::kAnonymousShmHugetlb;
     const size_t stride = is_hugetlb ? handle.actual_alignment : GetPageSize();
     PrefaultPages(handle.ptr, handle.mapped_size, stride);
   }
