@@ -744,8 +744,8 @@ __device__ inline void ccoLsaBarrierSession<Coop>::arrive(Coop) {
 
   for (int i = this->coop.thread_rank(); i < nranks - 1; i += this->coop.size()) {
     int peer = i + ((i >= myRank) ? 1 : 0);
-    __hip_atomic_store(impl::global(this->ucInbox(peer, myRank)), this->epoch + 1,
-                       __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    __hip_atomic_store(impl::global(this->ucInbox(peer, myRank)), this->epoch + 1, __ATOMIC_RELAXED,
+                       __HIP_MEMORY_SCOPE_SYSTEM);
   }
 }
 
