@@ -181,6 +181,9 @@ message BatchBoolResponse {
   // offered fingerprint. Nothing was read; `ok` is empty. Repeat the call with
   // the keys.
   bool key_handle_unknown = 3;
+  // BatchPrefetch only: server-side wall time from entering the RPC handler
+  // until every key result is settled.
+  uint64 operation_latency_us = 4;
 }
 
 enum MemoryKind {

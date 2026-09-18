@@ -469,7 +469,17 @@ std::vector<bool> StandaloneProcessClient::BatchPrefetch(
       std::max(options.timeout, std::chrono::milliseconds::zero()).count()));
   grpc::ClientContext ctx;
   ::umbp::BatchBoolResponse resp;
+  const auto started_at = std::chrono::steady_clock::now();
   grpc::Status status = stub_->BatchPrefetch(&ctx, req, &resp);
+  const auto rpc_latency_us =
+      std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                            started_at)
+          .count();
+  MORI_UMBP_INFO(
+      "[StandaloneProcessClient] BatchPrefetch keys={} rpc_latency_us={} "
+      "server_latency_us={} status={}",
+      keys.size(), rpc_latency_us, resp.operation_latency_us(),
+      status.ok() ? "ok" : status.error_message());
   if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) {
     return std::vector<bool>(keys.size(), false);
   }

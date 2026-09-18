@@ -759,6 +759,13 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
 
   grpc::Status BatchPrefetch(grpc::ServerContext*, const ::umbp::PrefetchRequest* request,
                              ::umbp::BatchBoolResponse* response) override {
+    const auto started_at = std::chrono::steady_clock::now();
+    const auto finish_timing = [&] {
+      response->set_operation_latency_us(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - started_at)
+              .count());
+    };
     std::vector<std::string> keys(request->keys().begin(), request->keys().end());
     // No caller mapping participates, so prefetch may share the client
     // lifetime barrier with Gets. DistributedClient/PoolClient provide their
@@ -766,12 +773,14 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     std::shared_lock<std::shared_mutex> lock(client_mu_);
     if (shutdown_.load()) {
       FillFalse(request->keys_size(), response);
+      finish_timing();
       return grpc::Status::OK;
     }
     const uint64_t max_ms = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(kMaxAsyncPrefetchTimeout).count());
     if (request->lease_ttl_ms() > max_ms || request->timeout_ms() > max_ms) {
       FillFalse(request->keys_size(), response);
+      finish_timing();
       return grpc::Status::OK;
     }
     PrefetchOptions options;
@@ -780,6 +789,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     }
     options.timeout = std::chrono::milliseconds(request->timeout_ms());
     FillResults(client_->BatchPrefetch(keys, options), response);
+    finish_timing();
     return grpc::Status::OK;
   }
 

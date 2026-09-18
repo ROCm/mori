@@ -25,6 +25,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <iostream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -160,9 +161,17 @@ TEST(CrossHostPrefetch, Tp8BatchPrefetch) {
   ASSERT_NE(client, nullptr);
   for (const auto& key : keys) ASSERT_TRUE(WaitForClusterKey(client.get(), key)) << key;
 
-  ASSERT_EQ(client->BatchPrefetch(keys, std::chrono::seconds(10),
-                                  std::chrono::steady_clock::now() + std::chrono::seconds(30)),
-            std::vector<bool>(kTpSize, true));
+  const auto prefetch_started_at = std::chrono::steady_clock::now();
+  const auto prefetch_results =
+      client->BatchPrefetch(keys, std::chrono::seconds(10),
+                            prefetch_started_at + std::chrono::seconds(30));
+  const auto prefetch_latency_us =
+      std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                            prefetch_started_at)
+          .count();
+  std::cout << "[ TP8 PREFETCH LATENCY ] total_latency_us=" << prefetch_latency_us << '\n';
+  ASSERT_GT(prefetch_latency_us, 0);
+  ASSERT_EQ(prefetch_results, std::vector<bool>(kTpSize, true));
   auto* dram = client->Backends().Get(TierType::DRAM);
   ASSERT_NE(dram, nullptr);
   for (const auto& key : keys) ASSERT_TRUE(dram->Contains(key)) << key;

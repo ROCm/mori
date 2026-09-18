@@ -34,6 +34,7 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <iostream>
 #include <memory>
 #include <string>
 #include <thread>
@@ -279,6 +280,16 @@ TEST(StandaloneShmIpcTest, WorkerRegistrationUsesNonZeroOffsetsAndCanReregister)
 
   auto prefetch_stub = ::umbp::UMBPStandalone::NewStub(
       grpc::CreateChannel(address, grpc::InsecureChannelCredentials()));
+  ::umbp::PrefetchRequest sync_request;
+  sync_request.add_keys("offset-key");
+  sync_request.add_keys("missing-prefetch-key");
+  grpc::ClientContext sync_context;
+  ::umbp::BatchBoolResponse sync_response;
+  ASSERT_TRUE(prefetch_stub->BatchPrefetch(&sync_context, sync_request, &sync_response).ok());
+  EXPECT_GT(sync_response.operation_latency_us(), 0u);
+  std::cout << "[ SYNC PREFETCH LATENCY ] server_latency_us="
+            << sync_response.operation_latency_us() << '\n';
+
   ::umbp::PrefetchRequest submit_request;
   submit_request.add_keys("offset-key");
   submit_request.add_keys("missing-prefetch-key");
@@ -314,6 +325,10 @@ TEST(StandaloneShmIpcTest, WorkerRegistrationUsesNonZeroOffsetsAndCanReregister)
   EXPECT_GT(prefetch_status.total_latency_us(), 0u);
   EXPECT_GE(prefetch_status.total_latency_us(), prefetch_status.queue_latency_us());
   EXPECT_GE(prefetch_status.total_latency_us(), prefetch_status.execution_latency_us());
+  std::cout << "[ ASYNC PREFETCH LATENCY ] queue_latency_us="
+            << prefetch_status.queue_latency_us()
+            << " execution_latency_us=" << prefetch_status.execution_latency_us()
+            << " total_latency_us=" << prefetch_status.total_latency_us() << '\n';
 
   // Reusing the same request id and payload is idempotent.
   grpc::ClientContext duplicate_context;
