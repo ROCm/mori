@@ -29,8 +29,7 @@
 
 #include "mori/application/transport/sdma/anvil.hpp"
 
-#include <unistd.h>
-
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -41,11 +40,10 @@
 #include <unordered_map>
 namespace anvil {
 
-// Bound on the SDMA-queue-creation retry below: 20 x 100ms. Long enough to
-// outlast the kernel reclaiming a just-exited process's queues, short enough
-// that a box with none genuinely left still fails in the same job step.
-constexpr int kCreateQueueAttempts = 20;
-constexpr useconds_t kCreateQueueRetryUs = 100000;
+// How many SDMA queues this process has built, for the failure message below:
+// it separates "mori asked for an unreasonable number" from "the box was
+// already full when we asked for our first".
+std::atomic<int> queuesCreated_{0};
 
 auto checkHsaError = [](hsa_status_t s, const char* msg, const char* file, int line) {
   if (s != HSA_STATUS_SUCCESS) {
@@ -58,10 +56,10 @@ auto checkHsaError = [](hsa_status_t s, const char* msg, const char* file, int l
 
 #define CHECK_HSA_ERROR(cmd) checkHsaError((cmd), #cmd, __FILE__, __LINE__)
 
-// `call` is evaluated once: it used to appear again in the message, so a failing
-// hsaKmt call was issued a second time on the way out -- a second CreateQueueExt
-// against a node that just refused one, a second Alloc that leaks, a double
-// DestroyQueue.
+// `call` is evaluated once. It used to appear a second time in the message, so
+// every failing hsaKmt call was issued twice on the way out: a second
+// CreateQueueExt against a node that had just refused one, a second AllocMemory
+// that leaks, a double DestroyQueue.
 #define CHECK_HSAKMT_SUCCESS(call, msg)                                                  \
   do {                                                                                   \
     HSAKMT_STATUS _hsakmt_status = (call);                                               \
@@ -244,34 +242,47 @@ SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAg
   // TODO needed here?
   memset(&queue_, 0, sizeof(HsaQueueResource));
 
-  // Queues are reclaimed by the kernel when the owning process's KFD fd closes,
-  // not by us: ~AnvilLib is deliberately never run (see getInstance), so
-  // ~SdmaQueue's hsaKmtDestroyQueue never fires. A process group launched right
-  // after another therefore races that reclaim and gets NO_MEMORY here. Retrying
-  // costs nothing when there is no contention, and is bounded so a genuine
-  // exhaustion still fails fast rather than turning into a hang.
-  HSAKMT_STATUS queueStatus = HSAKMT_STATUS_ERROR;
-  for (int attempt = 0; attempt < kCreateQueueAttempts; ++attempt) {
-    queueStatus =
-        hsaKmtCreateQueueExt(localNodeId, HSA_QUEUE_SDMA_BY_ENG_ID, 100, HSA_QUEUE_PRIORITY_MAXIMUM,
-                             engineId, queueBuffer_, SDMA_QUEUE_SIZE, nullptr, &queue_);
-    if (queueStatus == HSAKMT_STATUS_SUCCESS) {
-      if (attempt > 0) {
-        std::cout << "SDMA queue created on attempt " << (attempt + 1) << " (node " << localNodeId
-                  << ", engine " << engineId << ")" << std::endl;
-      }
-      break;
+  // Two very different failures arrive here with nothing to tell them apart, and
+  // the difference decides who has to act. Measured on MI355X (gfx950), which has
+  // 2 PCIe + 14 XGMI SDMA engines and 8 queues per engine:
+  //
+  //   HSAKMT_STATUS_ERROR (1)      the kernel refused. Every form of "no queue
+  //                                for you" lands here: the per-engine cap
+  //                                (verified at 8/engine, and at the full 128 on
+  //                                a node), and an engine id the node does not
+  //                                have. A dead process's slots come back before
+  //                                a new process can reach this call, so a retry
+  //                                buys nothing.
+  //   HSAKMT_STATUS_NO_MEMORY (6)  libhsakmt could not allocate for the queue in
+  //                                THIS process's address space. Reproduced by
+  //                                constraining RLIMIT_AS: the refusal moves to
+  //                                the 11th, 5th, 3rd queue as the limit drops,
+  //                                while an unconstrained process reaches 128.
+  //                                Nothing about SDMA is exhausted; the process
+  //                                or the box is out of memory.
+  //
+  // Say which one it is, with the numbers needed to size it, so this does not
+  // have to be re-derived from a bare error code. See ROCm/mori#685.
+  HSAKMT_STATUS queueStatus =
+      hsaKmtCreateQueueExt(localNodeId, HSA_QUEUE_SDMA_BY_ENG_ID, 100, HSA_QUEUE_PRIORITY_MAXIMUM,
+                           engineId, queueBuffer_, SDMA_QUEUE_SIZE, nullptr, &queue_);
+  if (queueStatus != HSAKMT_STATUS_SUCCESS) {
+    HsaNodeProperties props{};
+    bool haveProps = hsaKmtGetNodeProperties(localNodeId, &props) == HSAKMT_STATUS_SUCCESS;
+    std::cout << "SDMA queue creation failed: status=" << std::dec << queueStatus << " ("
+              << (queueStatus == HSAKMT_STATUS_NO_MEMORY
+                      ? "NO_MEMORY: out of memory in this process, not out of SDMA queues"
+                      : "ERROR: the kernel refused this engine")
+              << ")\n  node=" << localNodeId << " engine=" << engineId
+              << " queues_created_by_this_process=" << queuesCreated_.load();
+    if (haveProps) {
+      std::cout << "\n  node has " << props.NumSdmaEngines << " PCIe + " << props.NumSdmaXgmiEngines
+                << " XGMI SDMA engines, " << props.NumSdmaQueuesPerEngine << " queues per engine";
     }
-    // Say it once, so a box whose reclaim is genuinely slow is visible in the
-    // log instead of just being quietly slower.
-    if (attempt == 0) {
-      std::cout << "SDMA queue not available yet (status " << std::dec << queueStatus << ", node "
-                << localNodeId << ", engine " << engineId << "); retrying for up to "
-                << (kCreateQueueAttempts * kCreateQueueRetryUs / 1000) << " ms" << std::endl;
-    }
-    usleep(kCreateQueueRetryUs);
+    std::cout << std::endl;
   }
   CHECK_HSAKMT_SUCCESS(queueStatus, "Failed");
+  queuesCreated_.fetch_add(1);
 
   // Populate Device Handle
   // TODO uncached
