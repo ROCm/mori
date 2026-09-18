@@ -186,6 +186,8 @@ GPU Direct RDMA READ, pairwise, 128 consecutive transfers, 1 GPU, MI300X + Thor2
 
 ✅ Supported &emsp; 🚧 Under Development
 
+<!-- mori-installation-start -->
+
 ## Installation
 
 ### Prerequisites
@@ -194,7 +196,7 @@ GPU Direct RDMA READ, pairwise, 128 consecutive transfers, 1 GPU, MI300X + Thor2
 - System packages (required for `pip install`; not bundled in wheels). On Debian/Ubuntu install at least:
   - `libpci-dev`
   - `libibverbs-dev`, `ibverbs-utils`
-  See [docker/Dockerfile.dev](docker/Dockerfile.dev) for the full apt list used in CI/dev images.
+  See [docker/Dockerfile.dev](https://github.com/ROCm/mori/blob/main/docker/Dockerfile.dev) for the full apt list used in CI/dev images.
 - Optional: `libopenmpi-dev`, `openmpi-bin` — only needed when building C++ examples (`BUILD_EXAMPLES=ON`) or enabling MPI bootstrap (`MORI_WITH_MPI=ON`)
 
 Or build docker image with:
@@ -261,8 +263,10 @@ pip install --pre amd-mori-nightly
 #### From source
 
 ```bash
+git clone --recursive https://github.com/ROCm/mori.git
+cd mori
 # NOTE: for venv build, add --no-build-isolation at the end
-cd mori && pip install .
+pip install .
 ```
 
 No hipcc needed at install time — host code compiles with a standard

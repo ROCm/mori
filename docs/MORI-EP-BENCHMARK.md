@@ -42,7 +42,7 @@ torchrun --nnodes=1 --nproc_per_node=8 \
     tests/python/ops/bench_dispatch_combine.py --cmd profile
 ```
 
-Traces land as `trace_intranode_rank<rank>_<timestamp>.json` in the current working directory — one file per rank.  Open them in [Perfetto UI](https://ui.perfetto.dev) or analyze with `analyze_ep_kernel_trace.py` as described in the [Profiling EP Kernels](#profiling-ep-kernels) section.
+Traces land as `trace_intranode_rank<rank>_<timestamp>.json` in the current working directory — one file per rank.  Open them in [Perfetto UI](https://ui.perfetto.dev) or analyze with `analyze_ep_kernel_trace.py` as described in the [trace analysis](#analyzing-traces-with-analyze_ep_kernel_tracepy) section.
 
 ## Inter-node
 
@@ -412,7 +412,7 @@ Repeat for `--kernel-type v1_ll` and `--kernel-type async_ll`.  Traces land as `
 
 ### Analyzing traces with `analyze_ep_kernel_trace.py`
 
-[tools/profiler/analyze_ep_kernel_trace.py](../tools/profiler/analyze_ep_kernel_trace.py) parses a single `trace_rank_*.json` file and produces a Gantt-style PNG showing how EP kernels overlap within each dispatch+combine iteration.
+[tools/profiler/analyze_ep_kernel_trace.py](https://github.com/ROCm/mori/blob/main/tools/profiler/analyze_ep_kernel_trace.py) parses a single `trace_rank_*.json` file and produces a Gantt-style PNG showing how EP kernels overlap within each dispatch+combine iteration.
 
 **Usage**
 

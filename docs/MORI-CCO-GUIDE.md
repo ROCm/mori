@@ -178,7 +178,7 @@ FlyDSL kernels can drive the same device API — see the Python examples below.
 
 ## 7. Examples
 
-Runnable examples live in [`examples/cco/`](../examples/cco/):
+Runnable examples live in [`examples/cco/`](https://github.com/ROCm/mori/blob/main/examples/cco/):
 
 | Example | Lang | Shows |
 |---|---|---|
