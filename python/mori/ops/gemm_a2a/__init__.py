@@ -39,7 +39,7 @@ from ..gemm_ar import preshuffle_b
 _LAZY = {
     "build_lsa_a2a": "kernels_lsa",
     "build_sdma_phases": "kernels_sdma",
-    "compile_fused_gemm_a2a": "kernels_fused",
+    "compile_gemm_local": "kernels_fused",
 }
 
 __all__ = [
@@ -48,7 +48,7 @@ __all__ = [
     "a2a_config",
     "build_lsa_a2a",
     "build_sdma_phases",
-    "compile_fused_gemm_a2a",
+    "compile_gemm_local",
     "counter_chunks",
     "preshuffle_b",
 ]
