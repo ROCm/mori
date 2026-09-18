@@ -42,39 +42,6 @@ namespace {
 constexpr size_t kBufSize = 1 << 20;
 constexpr size_t kBlockSize = 4096;
 
-// Unique peer-service port per PoolClient.  A non-zero peer_service_port is
-// required for the node to register a peer_address and accept remote
-// AllocateSlot/CommitSlot RPCs; without it remote BatchPut fails with
-// "peer service connection unavailable".
-//
-// The port must be free *at bind time*: PoolClient binds it directly and
-// registers it verbatim as its peer_address (see PoolClient::Init), so a
-// hard-coded base collides with concurrent test processes / leftover servers
-// on a shared (self-hosted CI) host and makes the whole suite flaky.  Ask the
-// kernel for a currently-free ephemeral port instead.
-inline uint16_t NextPeerServicePort() {
-  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (fd >= 0) {
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = 0;  // kernel picks a free port
-    socklen_t len = sizeof(addr);
-    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 &&
-        ::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0) {
-      uint16_t port = ntohs(addr.sin_port);
-      ::close(fd);
-      return port;
-    }
-    ::close(fd);
-  }
-  // Fallback: randomized high base to keep collisions unlikely if the probe
-  // path is unavailable.
-  static std::atomic<uint16_t> next{
-      static_cast<uint16_t>(52000 + (static_cast<unsigned>(::getpid()) % 4000))};
-  return next.fetch_add(1);
-}
-
 // The master index is eventually consistent: a committed key becomes visible
 // only after the owning peer ships its ADD event on the next heartbeat.  Poll
 // Exists() until the key shows up (or the timeout elapses) before asserting
@@ -123,7 +90,12 @@ class CrossNodeSmoke : public ::testing::Test {
     cfg_a.master_config.master_address = master_addr;
     cfg_a.io_engine.host = "0.0.0.0";
     cfg_a.io_engine.port = 0;
-    cfg_a.peer_service_port = NextPeerServicePort();
+    // A peer service is required for the node to register a peer_address and
+    // serve remote AllocateSlot/CommitSlot RPCs; without one, remote access
+    // fails with "peer service connection unavailable".  Let gRPC choose the
+    // port: probing for a free one and closing the socket before PoolClient
+    // binds it races with everything else on a shared CI host.
+    cfg_a.auto_peer_service_port = true;
     cfg_a.dram.buffer_sizes = {kBlockSize};
     cfg_a.dram_page_size = kBlockSize;
     client_a_ = std::make_unique<PoolClient>(std::move(cfg_a));
@@ -135,7 +107,7 @@ class CrossNodeSmoke : public ::testing::Test {
     cfg_b.master_config.master_address = master_addr;
     cfg_b.io_engine.host = "0.0.0.0";
     cfg_b.io_engine.port = 0;
-    cfg_b.peer_service_port = NextPeerServicePort();
+    cfg_b.auto_peer_service_port = true;
     cfg_b.dram.buffer_sizes = {kBufSize};
     cfg_b.dram_page_size = kBlockSize;
     client_b_ = std::make_unique<PoolClient>(std::move(cfg_b));
@@ -267,7 +239,7 @@ class CrossNodeMultiPage : public ::testing::Test {
     cfg.master_config.master_address = "localhost:" + std::to_string(master_->GetBoundPort());
     cfg.io_engine.host = "0.0.0.0";
     cfg.io_engine.port = 0;
-    cfg.peer_service_port = NextPeerServicePort();
+    cfg.auto_peer_service_port = true;
     cfg.dram_page_size = kPageSize;
     cfg.dram.buffer_sizes = setup.buffer_sizes;
     auto cli = std::make_unique<PoolClient>(std::move(cfg));
@@ -566,7 +538,7 @@ class CrossNodeOverlap : public ::testing::Test {
     cfg.master_config.master_address = "localhost:" + std::to_string(master_->GetBoundPort());
     cfg.io_engine.host = "0.0.0.0";
     cfg.io_engine.port = 0;
-    cfg.peer_service_port = NextPeerServicePort();
+    cfg.auto_peer_service_port = true;
     cfg.dram_page_size = kPageSize;
     if (staging_buffer_size > 0) cfg.staging_buffer_size = staging_buffer_size;
     cfg.dram.buffer_sizes = buffer_sizes;

@@ -367,6 +367,7 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.ssd_staging_use_hugepages = dc.ssd_staging_use_hugepages;
   pc.ssd_staging_hugepage_size = dc.ssd_staging_hugepage_size;
   pc.peer_service_port = dc.peer_service_port;
+  pc.auto_peer_service_port = dc.auto_peer_service_port;
   pc.cache_remote_fetches = dc.cache_remote_fetches;
   pc.cache_remote_admission = dc.cache_remote_admission;
   pc.admission_max_block_bytes = dc.admission_max_block_bytes;
