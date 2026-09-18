@@ -33,8 +33,10 @@ jobs:
 
       # The reference pages are source documents; do not compile MORI or install
       # a CPU PyTorch wheel just to render them on this non-GPU runner.
+      # -E matches the command this configuration was validated with; the runner
+      # has no cache, so it only removes a difference, it does not add work.
       - name: Build Sphinx documentation
-        run: python -m sphinx -n -W --keep-going -b html docs docs/_build/html
+        run: python -m sphinx -E -n -W --keep-going -b html docs docs/_build/html
 
       - name: Check rendered local links
         run: python tools/check_docs_links.py docs/_build/html

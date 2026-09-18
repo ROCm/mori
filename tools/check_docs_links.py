@@ -20,7 +20,13 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""Check local href targets and fragments in a rendered Sphinx site, offline."""
+"""Check local href targets and fragments in a rendered Sphinx site, offline.
+
+Scope: ``<a href>`` only. ``<link rel="next|prev">``, ``<img src>``, ``<script
+src>`` and stylesheet ``<link href>`` are not followed -- the theme generates
+those from the toctree and the static tree, so they do not rot independently of
+the anchors that do. Do not read a clean run as "every asset resolves".
+"""
 
 import argparse
 from html.parser import HTMLParser
