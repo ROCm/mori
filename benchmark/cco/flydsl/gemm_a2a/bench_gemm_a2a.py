@@ -63,11 +63,19 @@ from mori.cco import (
 )
 from mori.tensor_utils import from_gpu_ptr
 
-from mori.ops.gemm_a2a import a2a_config, build_lsa_a2a, preshuffle_b
-from mori.ops.gemm_a2a.kernels_fused import compile_gemm_local
+from mori.ops.gemm_a2a import (
+    a2a_config,
+    build_lsa_a2a,
+    build_lsa_barrier,
+    preshuffle_b,
+)
+from mori.ops.gemm_a2a.kernels_fused import (
+    compile_fused_gemm_a2a,
+    compile_gemm_local,
+)
 
-MODES = ("gemm-only", "split-lsa")
-NOT_YET = ("split-sdma", "fused-lsa", "fused-sdma")
+MODES = ("gemm-only", "split-lsa", "fused-lsa")
+NOT_YET = ("split-sdma", "fused-sdma")
 
 #: fp8 block-scale group size along K. Fixed by the model's quantiser and by the
 #: kernel, whose BLOCK_K is already 128.
@@ -235,18 +243,34 @@ def run(args) -> int:
         reqs.gda_counter_count = 0
         dc = comm.create_dev_comm(reqs)
 
-        gemm = compile_gemm_local(
-            cfg,
-            rank,
-            K=args.k,
-            BLOCK_M=args.block_m,
-            BLOCK_N=args.block_n,
-            quant=args.quant,
-            waves_per_eu=args.waves_per_eu,
-            xcd_swizzle=args.xcd_swizzle,
-            swap_ab=args.swap_ab,
-            permlane=args.permlane,
-        )
+        if args.mode == "fused-lsa":
+            # The epilogue writes into the peers, so there is no separate
+            # collective -- only the barrier below.
+            gemm = compile_fused_gemm_a2a(
+                cfg,
+                rank,
+                K=args.k,
+                BLOCK_M=args.block_m,
+                BLOCK_N=args.block_n,
+                quant=args.quant,
+                waves_per_eu=args.waves_per_eu,
+                xcd_swizzle=args.xcd_swizzle,
+                rotated=args.rotated,
+                n_stripe=args.n_stripe,
+            )
+        else:
+            gemm = compile_gemm_local(
+                cfg,
+                rank,
+                K=args.k,
+                BLOCK_M=args.block_m,
+                BLOCK_N=args.block_n,
+                quant=args.quant,
+                waves_per_eu=args.waves_per_eu,
+                xcd_swizzle=args.xcd_swizzle,
+                swap_ab=args.swap_ab,
+                permlane=args.permlane,
+            )
         a_i8 = a.contiguous().view(torch.int8).view(-1)
         b_i8 = b_shuf.contiguous().view(torch.int8).view(-1)
         c_flat = c.view(-1)
@@ -260,6 +284,10 @@ def run(args) -> int:
             sa_arg, sb_arg = sa, sb
 
         copy = build_lsa_a2a(cfg, rank) if args.mode == "split-lsa" else None
+        # fused-lsa has no collective kernel -- the epilogue already wrote into
+        # the peers -- but it still needs the agreement that every peer
+        # *finished*, or a rank reads a slab a peer is still writing.
+        barrier = build_lsa_barrier(cfg, rank) if args.mode == "fused-lsa" else None
         c_ptr = c.data_ptr()
 
         def once():
@@ -278,6 +306,8 @@ def run(args) -> int:
             )
             if copy is not None:
                 copy(c_ptr, dc.ptr, win.handle, stream=stream)
+            if barrier is not None:
+                barrier(dc.ptr, win.handle, stream=stream)
 
         comm.barrier()
         once()
@@ -346,6 +376,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--xcd-swizzle", type=int, default=0)
     p.add_argument("--swap-ab", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--permlane", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--rotated", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--n-stripe", type=int, default=1)
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--no-graph", action="store_true")

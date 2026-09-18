@@ -242,7 +242,9 @@ def build_lsa_a2a(cfg, rank: int, *, src: str = "local"):
             local_store_u32(flag_rsrc, flag)
 
     @flyc.jit
-    def run(src_ptr: Int64, dev_comm: Int64, win: Int64, stream=fx.Stream(None)):
+    def run(
+        src_ptr: Int64, dev_comm: Int64, win: Int64, stream: fx.Stream = fx.Stream(None)
+    ):
         a2a_copy(src_ptr, dev_comm, win).launch(
             grid=(blocks, 1, 1), block=[threads, 1, 1], stream=stream
         )
@@ -250,4 +252,71 @@ def build_lsa_a2a(cfg, rank: int, *, src: str = "local"):
     return run
 
 
-__all__ = ["build_lsa_a2a"]
+def build_lsa_barrier(cfg, rank: int, *, blocks: int = 1):
+    """Compile the cross-rank barrier on its own, for the fused path.
+
+    ``fused-lsa`` has no collective kernel: the GEMM epilogue already wrote into
+    every peer. What is still missing is the agreement that it *finished* --
+    without it a rank reads its ``recv`` while a peer is mid-epilogue, and the
+    result is a partially stale slab that validates on some runs and not others.
+
+    Same monotonic-flag protocol as ``build_lsa_a2a``'s tail, so the two cannot
+    disagree about the slot map. One block is enough and is the cheapest: this
+    kernel moves no data, and the flag array is indexed by block, so more blocks
+    would mean more round trips for no extra parallelism.
+
+    The producer's release is *not* here. It cannot be: this kernel is one
+    block, so its fence reaches one XCD's L2 out of eight, and the other seven
+    would still hold the peer-homed lines dirty while this kernel's
+    system-scope atomic overtook them. The GEMM publishes its own stores -- see
+    the tail of ``kernels_fused.compile_fused_gemm_a2a``.
+    """
+    cfg.validate()
+    ws = cfg.world_size
+    threads = cfg.threads
+    start_off, flag_off = cfg.start_off, cfg.flag_off
+
+    def _next_flag(w, bid):
+        base = fx.Int64(w.lsa_ptr(rank, flag_off)) + fx.Int64(bid) * fx.Int64(4)
+        rsrc = signal_ptr(base)
+        return fx.Int32(local_load_u32(rsrc)) + fx.Int32(1), rsrc
+
+    def _signal_and_wait(w, bid, flag, tid):
+        """Publish to peer ``tid``, then wait for peer ``tid``'s publication.
+
+        A closure taking ``w``, not inlined into the ``if`` below. A
+        ``CachedWindow`` holds three MLIR values, and FlyDSL's scf.if state
+        capture requires single values -- inlining this raised
+        ``Cannot extract IR values from CachedWindow``. Passing it as a call
+        argument keeps it out of the branch's captured state.
+        """
+        peer_arr = fx.Int64(w.lsa_ptr(tid, start_off))
+        mine = fx.Int64((bid * MAX_WORLD + rank) * 4)
+        signal_store_u32(signal_ptr(peer_arr + mine), flag)
+
+        self_arr = fx.Int64(w.lsa_ptr(rank, start_off))
+        theirs = fx.Int64(bid * MAX_WORLD * 4) + fx.Int64(tid) * fx.Int64(4)
+        _spin_until(signal_ptr(self_arr + theirs), flag)
+
+    @flyc.kernel(known_block_size=[threads, 1, 1])
+    def barrier(dev_comm: Int64, win: Int64):
+        bid = fx.block_idx.x
+        tid = fx.thread_idx.x
+        w = cco.CachedWindow(win)
+        flag, flag_rsrc = _next_flag(w, bid)
+        if tid < ws:
+            _signal_and_wait(w, bid, flag, tid)
+        fgpu.barrier()
+        if tid == 0:
+            local_store_u32(flag_rsrc, flag)
+
+    @flyc.jit
+    def run(dev_comm: Int64, win: Int64, stream: fx.Stream = fx.Stream(None)):
+        barrier(dev_comm, win).launch(
+            grid=(blocks, 1, 1), block=[threads, 1, 1], stream=stream
+        )
+
+    return run
+
+
+__all__ = ["build_lsa_a2a", "build_lsa_barrier"]
