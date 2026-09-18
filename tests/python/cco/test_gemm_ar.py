@@ -32,7 +32,6 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-import time
 
 import pytest
 import torch
@@ -472,39 +471,7 @@ def test_rotated_tile_order_is_a_permutation_of_the_linear_one():
 # --------------------------------------------------------------------------
 
 
-#: Back-to-back distributed launches outrun SDMA queue teardown: the next
-#: process then fails in hsaKmtCreateQueueExt (anvil.cpp:237), or aborts in the
-#: bootstrap allgather that follows it. Give the previous run's queues time to
-#: come back before starting the next.
-_SETTLE_SECONDS = 20
-
-
-#: The one failure worth retrying. It is a resource race between processes, not
-#: a defect in what is under test, so retrying it hides nothing -- and every
-#: other failure is still reported as is, on the first occurrence.
-_QUEUE_EXHAUSTED = "anvil.cpp"
-
-
 def _run_bench(world_size, mode, m, n, k, extra=()):
-    """Run one benchmark process group, retrying once if its queues were not free.
-
-    This file spawns a fresh `torch.distributed.run` per case, and the cases run
-    in sequence. Without the settle below, a whole run's worth of process groups
-    accumulates and the last few cannot create their SDMA queues -- which is how
-    three of these failed in CI at 09:22 after 22 minutes of green.
-    """
-    result = _spawn_bench(world_size, mode, m, n, k, extra)
-    if result is None:
-        # Longer settle on the retry: by the time this triggers, the queues have
-        # already failed to come back in _SETTLE_SECONDS once.
-        time.sleep(_SETTLE_SECONDS * 3)
-        result = _spawn_bench(world_size, mode, m, n, k, extra, last=True)
-    return result
-
-
-def _spawn_bench(world_size, mode, m, n, k, extra=(), last=False):
-    """One launch. Returns None if it lost the queue race and may be retried."""
-    time.sleep(_SETTLE_SECONDS)
     env = os.environ.copy()
     env.setdefault("MORI_SOCKET_IFNAME", "lo")
     env.setdefault("MORI_ENABLE_SDMA", "1")
@@ -533,10 +500,7 @@ def _spawn_bench(world_size, mode, m, n, k, extra=(), last=False):
         command, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=1200
     )
     output = result.stdout + result.stderr
-    if result.returncode != 0:
-        if _QUEUE_EXHAUSTED in output and not last:
-            return None
-        raise AssertionError(output)
+    assert result.returncode == 0, output
     records = [
         json.loads(line.removeprefix("RESULT_JSON "))
         for line in output.splitlines()
