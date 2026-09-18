@@ -150,8 +150,14 @@ __global__ void OneShotAllGatherSdmaParamContiguousAsyncPutKernel(
 
 __device__ void OneShotAllGatherSdmaAsyncWaitKernel_body(
     int myPe, int npes, const application::SymmMemObjPtr dstMemObj,
-    const application::SymmMemObjPtr flagsMemObj, uint64_t flagVal = 1) {
+    const application::SymmMemObjPtr flagsMemObj, uint64_t* genCounter = nullptr) {
   uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
+
+  // Device-derived generation; see CclAllgatherArgs::genCounter. This kernel
+  // both publishes and consumes the generation, so the paired PUT kernel needs
+  // no token of its own and nothing has to survive between the two launches.
+  // Non-const: the AMO below takes the value by address.
+  uint64_t flagVal = (genCounter != nullptr) ? core::AtomicLoadRelaxed(genCounter) + 1ULL : 1ULL;
 
   const size_t threadLinearId =
       static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
@@ -165,6 +171,12 @@ __device__ void OneShotAllGatherSdmaAsyncWaitKernel_body(
   }
   __syncthreads();
 
+  // SYSTEM-scope loads, a seq-cst acquire on exit and a tail system fence, as
+  // OneShotAllGatherSdmaKernel_body already does: the flags are written by a
+  // peer GPU's SDMA engine, so a device-scope load does not order the payload
+  // behind them. Needed regardless of `capturing`: a host stream sync only
+  // waits for this kernel to retire, it does not pull the peer's writes into
+  // this GPU's caches for the consumer kernel. It was merely masking this.
   for (int sender = 0; sender < npes; ++sender) {
     if (sender == myPe) {
       continue;
@@ -173,16 +185,24 @@ __device__ void OneShotAllGatherSdmaAsyncWaitKernel_body(
     if (threadLinearId == 0) {
       int spinCount = 0;
       bool warned = false;
-      while (core::AtomicLoadRelaxed(flags + sender) < flagVal) {
+      while (core::AtomicLoadRelaxedSystem(flags + sender) < flagVal) {
         ++spinCount;
         if (!warned && spinCount > 10000000) {
           printf("PE %d: Slow wait for data from peer %d (still waiting)\n", myPe, sender);
           warned = true;
         }
       }
+      (void)core::AtomicLoadSeqCstSystem(flags + sender);
     }
     __syncthreads();
   }
+  if (threadLinearId == 0) {
+    __threadfence_system();
+    // Advance only after every peer's flag is in: the next wait derives its
+    // generation from this value.
+    if (genCounter != nullptr) core::AtomicStoreRelaxed(genCounter, flagVal);
+  }
+  __syncthreads();
 
   // Monotonic generation flags; no reset needed.
 }
@@ -190,8 +210,8 @@ __device__ void OneShotAllGatherSdmaAsyncWaitKernel_body(
 __global__ void OneShotAllGatherSdmaAsyncWaitKernel(int myPe, int npes,
                                                     const application::SymmMemObjPtr dstMemObj,
                                                     const application::SymmMemObjPtr flagsMemObj,
-                                                    uint64_t flagVal = 1) {
-  OneShotAllGatherSdmaAsyncWaitKernel_body(myPe, npes, dstMemObj, flagsMemObj, flagVal);
+                                                    uint64_t* genCounter = nullptr) {
+  OneShotAllGatherSdmaAsyncWaitKernel_body(myPe, npes, dstMemObj, flagsMemObj, genCounter);
 }
 }  // namespace collective
 }  // namespace mori
