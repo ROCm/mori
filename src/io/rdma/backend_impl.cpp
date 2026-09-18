@@ -619,22 +619,25 @@ application::RdmaDeviceContext* RdmaManager::GetRdmaDeviceContext(int devId) {
   return deviceCtxs[devId];
 }
 
-namespace {
-
-// Which endpoints a fatal async event takes down with it. A QP event hits one
-// endpoint; a CQ or device event hits everything sharing that CQ or context.
 bool EndpointAffectedByAsyncEvent(const QpErrorEvent& event, const EpPair& ep) {
   const auto& handle = ep.local.ibvHandle;
+  if (handle.qp == nullptr) return false;
   switch (event.scope) {
     case QpErrorEvent::Scope::kQueuePair:
-      return ep.local.handle.qpn == event.qpNum;
+      // qp_num is only unique within one device, and a node with several NICs
+      // hands out the same number on each of them. Without the context check a
+      // QP_FATAL on one NIC would fail transfers on a healthy endpoint of
+      // another that happens to share the number.
+      return handle.qp->context == event.context && ep.local.handle.qpn == event.qpNum;
     case QpErrorEvent::Scope::kCompletionQueue:
       return handle.cq != nullptr && static_cast<const void*>(handle.cq) == event.cq;
     case QpErrorEvent::Scope::kDevice:
-      return handle.qp != nullptr && handle.qp->context == event.context;
+      return handle.qp->context == event.context;
   }
   return false;
 }
+
+namespace {
 
 const char* AsyncEventScopeReason(QpErrorEvent::Scope scope) {
   switch (scope) {
@@ -664,11 +667,13 @@ int RdmaManager::FailInFlightTransfers(const QpErrorEvent& event) {
     if (!EndpointAffectedByAsyncEvent(event, rt->ep)) continue;
 
     ++affectedEps;
-    failed += rt->ep.ledger->FailAll(StatusCode::ERR_RDMA_OP, message, rt->ep.sqDepth.get());
-    // The QP cannot carry traffic again without being rebuilt, so refuse new
-    // submissions rather than letting them queue onto it and hang. FailAll left
-    // the ledger empty, so the CQE path cannot clear this flag afterwards.
+    // Close admission before failing the ledger, not after: the endpoint cannot
+    // carry traffic again without being rebuilt, and turning submitters away
+    // first keeps the window in which one can still reach the ledger as small as
+    // possible. FailAll() closes the ledger outright, which is what actually
+    // makes this airtight for a submitter already past the check.
     if (rt->ep.degraded) rt->ep.degraded->store(true, kSqAdmissionOrder);
+    failed += rt->ep.ledger->FailAll(StatusCode::ERR_RDMA_OP, message, rt->ep.sqDepth.get());
     NotifySqStateChanged(rt->ep);
   }
 
@@ -677,9 +682,11 @@ int RdmaManager::FailInFlightTransfers(const QpErrorEvent& event) {
         "async event {}: failed {} in-flight transfer(s) across {} endpoint(s); endpoints marked "
         "degraded and will reject new submissions until rebuilt",
         event.eventName, failed, affectedEps);
-  } else {
+  } else if (event.scope == QpErrorEvent::Scope::kQueuePair) {
     MORI_IO_WARN("async event {}: no live endpoint matched (qpn={}); nothing to fail",
                  event.eventName, event.qpNum);
+  } else {
+    MORI_IO_WARN("async event {}: no live endpoint matched; nothing to fail", event.eventName);
   }
   return failed;
 }
@@ -847,7 +854,11 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
           if (statusPtr != nullptr) {
             statusPtr->Update(StatusCode::ERR_RDMA_OP, failureAdvice.ComposeStatusMessage());
           }
-          if (ep.degraded && ep.degraded->load(kSqAdmissionOrder) && ep.ledger) {
+          // A closed ledger means a fatal async event already retired this
+          // endpoint, so its degraded flag is terminal rather than the
+          // partial-post kind this path recovers from.
+          if (ep.degraded && ep.degraded->load(kSqAdmissionOrder) && ep.ledger &&
+              !ep.ledger->Closed()) {
             const int orphanedReleased = ep.ledger->ReleaseOrphanedByRecovery(ep.sqDepth.get());
             ep.degraded->store(false, kSqAdmissionOrder);
             MORI_IO_WARN(

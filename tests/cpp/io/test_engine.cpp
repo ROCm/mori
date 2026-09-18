@@ -281,6 +281,86 @@ void CaseSubmissionLedgerFailAll() {
   Require(statusA.Code() == StatusCode::ERR_RDMA_OP, "status must stay failed");
 }
 
+void CaseSubmissionLedgerClosedAfterFailAll() {
+  constexpr uint32_t kNotifPerQp = 16;
+  SubmissionLedger ledger(kNotifPerQp);
+  std::atomic<int> sqDepth{8};
+  TransferStatus status;
+  status.SetCode(StatusCode::IN_PROGRESS);
+  auto meta = std::make_shared<CqCallbackMeta>(&status, 401, 1);
+  ledger.Insert(2, true, meta, 1);
+
+  Require(!ledger.Closed(), "a fresh ledger accepts records");
+  ledger.FailAll(StatusCode::ERR_RDMA_OP, "cq died", &sqDepth);
+  Require(ledger.Closed(), "FailAll should close the ledger");
+
+  // A submitter that cleared the degraded check just before the async event
+  // landed still reaches Insert(). Accepting it would post a signaled WR onto a
+  // QP/CQ that can no longer produce the CQE that completes it.
+  TransferStatus lateStatus;
+  lateStatus.SetCode(StatusCode::IN_PROGRESS);
+  auto lateMeta = std::make_shared<CqCallbackMeta>(&lateStatus, 402, 1);
+  const uint64_t lateId = ledger.Insert(3, true, lateMeta, 1);
+  Require(lateId == SubmissionLedger::kInvalidRecordId, "a closed ledger must refuse new records");
+  ledger.InsertOrphaned(3, lateMeta, 1);
+  Require(!ledger.HasOrphaned(), "a closed ledger must refuse orphaned records too");
+  Require(sqDepth.load(std::memory_order_relaxed) == 6, "a refused record must not touch sq depth");
+  Require(lateStatus.Code() == StatusCode::IN_PROGRESS,
+          "refusing a record leaves the status for the submitter to fail");
+}
+
+EpPair MakeAsyncEventEp(ibv_qp* qp, ibv_cq* cq, uint32_t qpn) {
+  EpPair ep{};
+  ep.local.ibvHandle.qp = qp;
+  ep.local.ibvHandle.cq = cq;
+  ep.local.handle.qpn = qpn;
+  return ep;
+}
+
+void CaseAsyncEventScopeMatching() {
+  // Two NICs that handed out the same qp_num, which is the normal case: qp_num is
+  // only unique within one device.
+  ibv_context ctxA{};
+  ibv_context ctxB{};
+  ibv_qp qpA{};
+  ibv_qp qpB{};
+  qpA.context = &ctxA;
+  qpB.context = &ctxB;
+  ibv_cq cqA{};
+  ibv_cq cqB{};
+
+  constexpr uint32_t kSharedQpn = 137;
+  const EpPair epA = MakeAsyncEventEp(&qpA, &cqA, kSharedQpn);
+  const EpPair epB = MakeAsyncEventEp(&qpB, &cqB, kSharedQpn);
+
+  QpErrorEvent qpEvent;
+  qpEvent.scope = QpErrorEvent::Scope::kQueuePair;
+  qpEvent.qpNum = kSharedQpn;
+  qpEvent.context = &ctxA;
+  Require(EndpointAffectedByAsyncEvent(qpEvent, epA), "QP event must hit its own endpoint");
+  Require(!EndpointAffectedByAsyncEvent(qpEvent, epB),
+          "QP event must not hit a same-qpn endpoint on another device");
+
+  QpErrorEvent cqEvent;
+  cqEvent.scope = QpErrorEvent::Scope::kCompletionQueue;
+  cqEvent.cq = &cqB;
+  cqEvent.context = &ctxB;
+  Require(EndpointAffectedByAsyncEvent(cqEvent, epB), "CQ event must hit the endpoint on that CQ");
+  Require(!EndpointAffectedByAsyncEvent(cqEvent, epA), "CQ event must not hit another CQ");
+
+  QpErrorEvent deviceEvent;
+  deviceEvent.scope = QpErrorEvent::Scope::kDevice;
+  deviceEvent.context = &ctxA;
+  Require(EndpointAffectedByAsyncEvent(deviceEvent, epA),
+          "device event must hit every endpoint on its context");
+  Require(!EndpointAffectedByAsyncEvent(deviceEvent, epB),
+          "device event must not cross into another context");
+
+  const EpPair unbuilt = MakeAsyncEventEp(nullptr, nullptr, kSharedQpn);
+  Require(!EndpointAffectedByAsyncEvent(qpEvent, unbuilt),
+          "an endpoint with no verbs QP must never match");
+}
+
 EpPair MakeSqAdmissionEp(int maxSqDepth, int currentDepth, bool withAdmission = true) {
   EpPair ep{};
   ep.sqDepth = std::make_shared<std::atomic<int>>(currentDepth);
@@ -1844,6 +1924,8 @@ int main(int argc, char* argv[]) {
   std::vector<TestCase> cases = {
       {"submission_ledger_basic", CaseSubmissionLedgerBasic},
       {"submission_ledger_fail_all", CaseSubmissionLedgerFailAll},
+      {"submission_ledger_closed_after_fail_all", CaseSubmissionLedgerClosedAfterFailAll},
+      {"async_event_scope_matching", CaseAsyncEventScopeMatching},
       {"sq_admission_release_wakes_waiter", CaseSqAdmissionReleaseWakesWaiter},
       {"sq_admission_degraded_wakes_waiter", CaseSqAdmissionDegradedWakesWaiter},
       {"sq_admission_negative_depth_reserve_repairs_counter",

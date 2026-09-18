@@ -409,6 +409,38 @@ static void ReleaseSqDepth(const EpPair& ep, int wrCount) {
   NotifySqStateChanged(ep);
 }
 
+// When a multi-EP post gives up partway, the WRs already posted on the other EPs
+// have no signaled tail behind them, so no CQE will ever release their depth.
+// Park them as orphaned and mark those EPs degraded so the recovery path can
+// reclaim them.
+static void OrphanPendingWrsOnOtherEps(const EpPairVec& eps, int failedEpId, const char* reason,
+                                       const std::vector<int>& epWrsSinceSignal,
+                                       const std::vector<size_t>& epMergedSinceSignal,
+                                       const std::shared_ptr<CqCallbackMeta>& callbackMeta) {
+  for (size_t otherEpId = 0; otherEpId < eps.size(); ++otherEpId) {
+    if (static_cast<int>(otherEpId) == failedEpId) continue;
+    if (epWrsSinceSignal[otherEpId] <= 0) continue;
+    MORI_IO_WARN(
+        "{} on ep {}: moving pending unsignaled WRs on ep {} "
+        "(wrCount={}, mergedReq={}) to orphaned and marking degraded",
+        reason, failedEpId, otherEpId, epWrsSinceSignal[otherEpId],
+        epMergedSinceSignal[otherEpId]);
+    if (eps[otherEpId].ledger) {
+      eps[otherEpId].ledger->InsertOrphaned(epWrsSinceSignal[otherEpId], callbackMeta,
+                                            static_cast<int>(epMergedSinceSignal[otherEpId]));
+    } else {
+      MORI_IO_WARN(
+          "EP {} has pending unsignaled WRs but no submission ledger; "
+          "sqDepth may remain stale until endpoint restart",
+          otherEpId);
+    }
+    if (eps[otherEpId].degraded) {
+      eps[otherEpId].degraded->store(true, kSqAdmissionOrder);
+    }
+    NotifySqStateChanged(eps[otherEpId]);
+  }
+}
+
 namespace detail {
 
 bool TryReserveSqDepthForTesting(const EpPair& ep, int wrCount, std::string* errMsg) {
@@ -959,6 +991,20 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
       }
       recordId = eps[epId].ledger->Insert(epWrsSinceSignal[epId], true, callbackMeta,
                                           static_cast<int>(epMergedSinceSignal[epId]));
+      if (recordId == SubmissionLedger::kInvalidRecordId) {
+        // A fatal async event retired this endpoint while we were mid-post. The
+        // signaled WR must not go out: its CQE is what would complete everything
+        // unsignaled behind it, and this QP/CQ can no longer produce one. Give
+        // back the depth held on this EP and park what the siblings already
+        // posted, so the caller sees a failure instead of waiting forever.
+        ReleaseSqDepth(eps[epId], epWrsSinceSignal[epId]);
+        epWrsSinceSignal[epId] = 0;
+        epMergedSinceSignal[epId] = 0;
+        OrphanPendingWrsOnOtherEps(eps, epId, "endpoint retired by a fatal async event",
+                                   epWrsSinceSignal, epMergedSinceSignal, callbackMeta);
+        return {StatusCode::ERR_RDMA_OP,
+                "endpoint was failed by a fatal verbs async event; submission rejected"};
+      }
       last.wr_id = recordId;
       last.send_flags = IBV_SEND_SIGNALED;
       // ADDITIVE (MORI_ROCTX_TRANSFER=1): start an ASYNC post-to-completion range
@@ -1029,27 +1075,8 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
         NotifySqStateChanged(eps[epId]);
       }
 
-      for (size_t otherEpId = 0; otherEpId < epNum; ++otherEpId) {
-        if (static_cast<int>(otherEpId) == epId) continue;
-        if (epWrsSinceSignal[otherEpId] <= 0) continue;
-        MORI_IO_WARN(
-            "ibv_post_send failed on ep {}: moving pending unsignaled WRs on ep {} "
-            "(wrCount={}, mergedReq={}) to orphaned and marking degraded",
-            epId, otherEpId, epWrsSinceSignal[otherEpId], epMergedSinceSignal[otherEpId]);
-        if (eps[otherEpId].ledger) {
-          eps[otherEpId].ledger->InsertOrphaned(epWrsSinceSignal[otherEpId], callbackMeta,
-                                                static_cast<int>(epMergedSinceSignal[otherEpId]));
-        } else {
-          MORI_IO_WARN(
-              "EP {} has pending unsignaled WRs but no submission ledger; "
-              "sqDepth may remain stale until endpoint restart",
-              otherEpId);
-        }
-        if (eps[otherEpId].degraded) {
-          eps[otherEpId].degraded->store(true, kSqAdmissionOrder);
-        }
-        NotifySqStateChanged(eps[otherEpId]);
-      }
+      OrphanPendingWrsOnOtherEps(eps, epId, "ibv_post_send failed", epWrsSinceSignal,
+                                 epMergedSinceSignal, callbackMeta);
 
       std::string message = "ibv_post_send failed with " + std::to_string(ret) + ": " +
                             strerror(ret) + " (posted " + std::to_string(postedCount) + "/" +

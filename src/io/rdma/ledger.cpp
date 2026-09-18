@@ -27,6 +27,7 @@ namespace io {
 uint64_t SubmissionLedger::Insert(int postedWr, bool hasSignaledTail,
                                   std::shared_ptr<CqCallbackMeta> meta, int batchSize) {
   std::lock_guard<std::mutex> lock(mu_);
+  if (closed_) return kInvalidRecordId;
   uint64_t id = nextId_++;
   records_[id] = SubmissionRecord{
       id, postedWr, hasSignaledTail, SubmissionState::Posted, std::move(meta), batchSize};
@@ -36,6 +37,7 @@ uint64_t SubmissionLedger::Insert(int postedWr, bool hasSignaledTail,
 void SubmissionLedger::InsertOrphaned(int postedWr, std::shared_ptr<CqCallbackMeta> meta,
                                       int batchSize) {
   std::lock_guard<std::mutex> lock(mu_);
+  if (closed_) return;
   uint64_t id = nextId_++;
   records_[id] =
       SubmissionRecord{id, postedWr, false, SubmissionState::Orphaned, std::move(meta), batchSize};
@@ -80,6 +82,7 @@ int SubmissionLedger::FailAll(StatusCode code, const std::string& message,
   int total = 0;
   {
     std::lock_guard<std::mutex> lock(mu_);
+    closed_ = true;
     for (auto& [id, rec] : records_) {
       total += rec.postedWr;
       if (!rec.meta) continue;
@@ -96,6 +99,11 @@ int SubmissionLedger::FailAll(StatusCode code, const std::string& message,
   // woken threads from contending on a lock this call still holds.
   for (TransferStatus* status : claimed) status->Update(code, message);
   return static_cast<int>(claimed.size());
+}
+
+bool SubmissionLedger::Closed() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return closed_;
 }
 
 bool SubmissionLedger::HasOrphaned() const {
