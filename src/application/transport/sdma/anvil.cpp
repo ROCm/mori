@@ -29,6 +29,8 @@
 
 #include "mori/application/transport/sdma/anvil.hpp"
 
+#include <unistd.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -38,6 +40,12 @@
 #include <stdexcept>
 #include <unordered_map>
 namespace anvil {
+
+// Bound on the SDMA-queue-creation retry below: 20 x 100ms. Long enough to
+// outlast the kernel reclaiming a just-exited process's queues, short enough
+// that a box with none genuinely left still fails in the same job step.
+constexpr int kCreateQueueAttempts = 20;
+constexpr useconds_t kCreateQueueRetryUs = 100000;
 
 auto checkHsaError = [](hsa_status_t s, const char* msg, const char* file, int line) {
   if (s != HSA_STATUS_SUCCESS) {
@@ -50,13 +58,18 @@ auto checkHsaError = [](hsa_status_t s, const char* msg, const char* file, int l
 
 #define CHECK_HSA_ERROR(cmd) checkHsaError((cmd), #cmd, __FILE__, __LINE__)
 
-#define CHECK_HSAKMT_SUCCESS(call, msg)                                                       \
-  do {                                                                                        \
-    if ((call) != HSAKMT_STATUS_SUCCESS) {                                                    \
-      std::cout << "ERROR code: " << std::dec << call << " " << msg << " (File: " << __FILE__ \
-                << ", Line: " << __LINE__ << ")" << std::endl;                                \
-      exit(EXIT_FAILURE);                                                                     \
-    }                                                                                         \
+// `call` is evaluated once: it used to appear again in the message, so a failing
+// hsaKmt call was issued a second time on the way out -- a second CreateQueueExt
+// against a node that just refused one, a second Alloc that leaks, a double
+// DestroyQueue.
+#define CHECK_HSAKMT_SUCCESS(call, msg)                                                  \
+  do {                                                                                   \
+    HSAKMT_STATUS _hsakmt_status = (call);                                               \
+    if (_hsakmt_status != HSAKMT_STATUS_SUCCESS) {                                       \
+      std::cout << "ERROR code: " << std::dec << _hsakmt_status << " " << msg            \
+                << " (File: " << __FILE__ << ", Line: " << __LINE__ << ")" << std::endl; \
+      exit(EXIT_FAILURE);                                                                \
+    }                                                                                    \
   } while (0)
 
 #if 0
@@ -231,10 +244,34 @@ SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAg
   // TODO needed here?
   memset(&queue_, 0, sizeof(HsaQueueResource));
 
-  CHECK_HSAKMT_SUCCESS(
-      hsaKmtCreateQueueExt(localNodeId, HSA_QUEUE_SDMA_BY_ENG_ID, 100, HSA_QUEUE_PRIORITY_MAXIMUM,
-                           engineId, queueBuffer_, SDMA_QUEUE_SIZE, nullptr, &queue_),
-      "Failed");
+  // Queues are reclaimed by the kernel when the owning process's KFD fd closes,
+  // not by us: ~AnvilLib is deliberately never run (see getInstance), so
+  // ~SdmaQueue's hsaKmtDestroyQueue never fires. A process group launched right
+  // after another therefore races that reclaim and gets NO_MEMORY here. Retrying
+  // costs nothing when there is no contention, and is bounded so a genuine
+  // exhaustion still fails fast rather than turning into a hang.
+  HSAKMT_STATUS queueStatus = HSAKMT_STATUS_ERROR;
+  for (int attempt = 0; attempt < kCreateQueueAttempts; ++attempt) {
+    queueStatus =
+        hsaKmtCreateQueueExt(localNodeId, HSA_QUEUE_SDMA_BY_ENG_ID, 100, HSA_QUEUE_PRIORITY_MAXIMUM,
+                             engineId, queueBuffer_, SDMA_QUEUE_SIZE, nullptr, &queue_);
+    if (queueStatus == HSAKMT_STATUS_SUCCESS) {
+      if (attempt > 0) {
+        std::cout << "SDMA queue created on attempt " << (attempt + 1) << " (node " << localNodeId
+                  << ", engine " << engineId << ")" << std::endl;
+      }
+      break;
+    }
+    // Say it once, so a box whose reclaim is genuinely slow is visible in the
+    // log instead of just being quietly slower.
+    if (attempt == 0) {
+      std::cout << "SDMA queue not available yet (status " << std::dec << queueStatus << ", node "
+                << localNodeId << ", engine " << engineId << "); retrying for up to "
+                << (kCreateQueueAttempts * kCreateQueueRetryUs / 1000) << " ms" << std::endl;
+    }
+    usleep(kCreateQueueRetryUs);
+  }
+  CHECK_HSAKMT_SUCCESS(queueStatus, "Failed");
 
   // Populate Device Handle
   // TODO uncached
