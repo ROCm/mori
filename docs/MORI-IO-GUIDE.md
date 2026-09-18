@@ -181,7 +181,7 @@ See `examples/io/example.py` for more complete examples including batch transfer
 
 UMBP (the upper-layer cache pool) exposes a separate set of runtime-tunable
 env vars for distributed master / pool client / SPDK proxy timing. Those are
-out of scope for MORI-IO; see [`src/umbp/doc/runtime-env-vars.md`](../src/umbp/doc/runtime-env-vars.md).
+out of scope for MORI-IO; see [`src/umbp/doc/runtime-env-vars.md`](https://github.com/ROCm/mori/blob/main/src/umbp/doc/runtime-env-vars.md).
 
 ## Profiling MORI-IO with ROCTX Markers
 
@@ -225,5 +225,6 @@ Either variable can be enabled alone. Enabled values include `1`, `on`, and
 | `src/pybind/mori.cpp` | IO binding registration (`RegisterMoriIo`) |
 | `examples/io/example.py` | Complete usage examples (read, write, batch, session) |
 | `tests/python/io/test_engine.py` | Comprehensive test suite |
-| `tests/python/io/benchmark.py` | Performance benchmark |
+| `tests/cpp/io/bench_engine.cpp` | Performance benchmark (default, nixlbench-matching) |
+| `tests/python/io/benchmark.py` | Performance benchmark (Python, kept for parity) |
 | `docs/MORI-IO-BENCHMARK.md` | Benchmark commands and results |

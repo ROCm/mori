@@ -343,6 +343,10 @@ struct UMBPDistributedConfig {
 
   uint16_t peer_service_port = 0;  // gRPC peer service port
 
+  // Start the peer service on a gRPC-selected port instead of a caller-supplied
+  // one. See PoolClientConfig::auto_peer_service_port.
+  bool auto_peer_service_port = false;
+
   bool cache_remote_fetches = true;  // cache remotely-fetched blocks locally
 
   // After a remote RANGED read, pull the whole object into this node's medium

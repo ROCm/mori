@@ -65,26 +65,6 @@ bool GatherPathAvailable() {
   return available;
 }
 
-uint16_t FreePort() {
-  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (fd >= 0) {
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = 0;
-    socklen_t len = sizeof(addr);
-    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 &&
-        ::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0) {
-      const uint16_t port = ntohs(addr.sin_port);
-      ::close(fd);
-      return port;
-    }
-    ::close(fd);
-  }
-  static std::atomic<uint16_t> next{56000};
-  return next.fetch_add(1);
-}
-
 bool WaitForExists(PoolClient* client, const std::string& key) {
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
   while (std::chrono::steady_clock::now() < deadline) {
@@ -152,7 +132,12 @@ class PoolClientRangesTest : public ::testing::Test {
     cfg.master_config.master_address = master_address_;
     cfg.io_engine.host = "0.0.0.0";
     cfg.io_engine.port = 0;
-    cfg.peer_service_port = FreePort();
+    // A peer service is required for the node to register a peer_address and
+    // serve remote AllocateSlot/CommitSlot RPCs; without one, remote access
+    // fails with "peer service connection unavailable".  Let gRPC choose the
+    // port: probing for a free one and closing the socket before PoolClient
+    // binds it races with everything else on a shared CI host.
+    cfg.auto_peer_service_port = true;
     cfg.dram_page_size = kPageSize;
     // Smaller than one object: ranged remote I/O can pass only through the
     // registered arena's zero-copy descriptor, never the legacy staging path.
@@ -189,7 +174,7 @@ class PoolClientRangesTest : public ::testing::Test {
     distributed.master_config.master_address = master_address_;
     distributed.io_engine.host = "0.0.0.0";
     distributed.io_engine.port = 0;
-    distributed.peer_service_port = FreePort();
+    distributed.auto_peer_service_port = true;
     distributed.dram_page_size = kPageSize;
     distributed.staging_buffer_size = 4 * kObjectSize;
     distributed.ranged_scratch_size = ranged_scratch_size;
@@ -263,7 +248,7 @@ class PoolClientRangesTest : public ::testing::Test {
     cfg.master_config.master_address = master_address_;
     cfg.io_engine.host = "0.0.0.0";
     cfg.io_engine.port = 0;
-    cfg.peer_service_port = FreePort();
+    cfg.auto_peer_service_port = true;
     cfg.dram_page_size = kPageSize;
     cfg.staging_buffer_size = 1024;
     tiered_get_scratch_.resize(kScratchSize);

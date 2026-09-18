@@ -2,7 +2,7 @@
 
 Measurements for `mori.ops.gemm_ar`, the fused fp8 GEMM + all-reduce. The design
 and the API live next to the code in
-[`python/mori/ops/gemm_ar/README.md`](../python/mori/ops/gemm_ar/README.md);
+[`python/mori/ops/gemm_ar/README.md`](https://github.com/ROCm/mori/blob/main/python/mori/ops/gemm_ar/README.md);
 this file is how to reproduce the numbers and what they were.
 
 Every number below was taken on **8x MI355X (gfx950)**, one node, at the shape

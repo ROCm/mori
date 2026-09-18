@@ -186,6 +186,8 @@ GPU Direct RDMA READ, pairwise, 128 consecutive transfers, 1 GPU, MI300X + Thor2
 
 ✅ Supported &emsp; 🚧 Under Development
 
+<!-- mori-installation-start -->
+
 ## Installation
 
 ### Prerequisites
@@ -194,7 +196,7 @@ GPU Direct RDMA READ, pairwise, 128 consecutive transfers, 1 GPU, MI300X + Thor2
 - System packages (required for `pip install`; not bundled in wheels). On Debian/Ubuntu install at least:
   - `libpci-dev`
   - `libibverbs-dev`, `ibverbs-utils`
-  See [docker/Dockerfile.dev](docker/Dockerfile.dev) for the full apt list used in CI/dev images.
+  See [docker/Dockerfile.dev](https://github.com/ROCm/mori/blob/main/docker/Dockerfile.dev) for the full apt list used in CI/dev images.
 - Optional: `libopenmpi-dev`, `openmpi-bin` — only needed when building C++ examples (`BUILD_EXAMPLES=ON`) or enabling MPI bootstrap (`MORI_WITH_MPI=ON`)
 
 Or build docker image with:
@@ -261,8 +263,10 @@ pip install --pre amd-mori-nightly
 #### From source
 
 ```bash
+git clone --recursive https://github.com/ROCm/mori.git
+cd mori
 # NOTE: for venv build, add --no-build-isolation at the end
-cd mori && pip install .
+pip install .
 ```
 
 No hipcc needed at install time — host code compiles with a standard
@@ -308,11 +312,14 @@ export PYTHONPATH=/path/to/mori:$PYTHONPATH
 # Correctness tests
 pytest tests/python/io/
 
-# Benchmark performance (two nodes)
-export GLOO_SOCKET_IFNAME=ens14np0
-torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr="10.194.129.65" --master_port=1234 \
-  tests/python/io/benchmark.py --host="10.194.129.65" --enable-batch-transfer --enable-sess --buffer-size 32768 --transfer-batch-size 128
+# Benchmark performance (two nodes). The runner defaults to the native C++
+# benchmark (tests/cpp/io/bench_engine); pass --engine python for the torchrun path.
+tools/run_internode_io_benchmark.sh --rank 0 --master-addr "10.194.129.65" --ifname ens14np0 \
+  -- --op write --enable-batch-transfer --enable-sess --buffer-size 32768 --transfer-batch-size 128
+# (run the same command on the second node with --rank 1)
 ```
+
+See [docs/MORI-IO-BENCHMARK.md](docs/MORI-IO-BENCHMARK.md) for both engines and tuning.
 
 ### Test MORI-IR (Triton + shmem integration, [guide](python/mori/ir/README.md))
 
