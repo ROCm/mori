@@ -311,6 +311,9 @@ TEST(StandaloneShmIpcTest, WorkerRegistrationUsesNonZeroOffsetsAndCanReregister)
   ASSERT_EQ(prefetch_status.ok_size(), 2);
   EXPECT_TRUE(prefetch_status.ok(0));
   EXPECT_FALSE(prefetch_status.ok(1));
+  EXPECT_GT(prefetch_status.total_latency_us(), 0u);
+  EXPECT_GE(prefetch_status.total_latency_us(), prefetch_status.queue_latency_us());
+  EXPECT_GE(prefetch_status.total_latency_us(), prefetch_status.execution_latency_us());
 
   // Reusing the same request id and payload is idempotent.
   grpc::ClientContext duplicate_context;

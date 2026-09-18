@@ -489,6 +489,8 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     ::umbp::PrefetchState state = ::umbp::PREFETCH_STATE_QUEUED;
     std::vector<bool> results;
     std::string error;
+    std::chrono::steady_clock::time_point submitted_at{};
+    std::chrono::steady_clock::time_point started_at{};
     std::chrono::steady_clock::time_point finished_at{};
   };
   inline static constexpr size_t kMaxAsyncPrefetchRequests = 1024;
@@ -855,7 +857,8 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       record->keys = std::move(keys);
       record->options.lease_ttl = lease;
       record->options.timeout = timeout;
-      record->deadline = std::chrono::steady_clock::now() + timeout;
+      record->submitted_at = std::chrono::steady_clock::now();
+      record->deadline = record->submitted_at + timeout;
       prefetch_requests_.emplace(request_id, record);
       prefetch_queue_.push_back(std::move(record));
       if (!prefetch_worker_.joinable()) {
@@ -889,6 +892,22 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     }
     response->set_completed_keys(completed);
     response->set_error(record.error);
+    if (record.finished_at != std::chrono::steady_clock::time_point{} &&
+        record.submitted_at != std::chrono::steady_clock::time_point{}) {
+      const auto micros = [](auto duration) {
+        return static_cast<uint64_t>(
+            std::max<int64_t>(0, std::chrono::duration_cast<std::chrono::microseconds>(duration)
+                                     .count()));
+      };
+      const auto queue_end =
+          record.started_at == std::chrono::steady_clock::time_point{} ? record.finished_at
+                                                                       : record.started_at;
+      response->set_queue_latency_us(micros(queue_end - record.submitted_at));
+      if (record.started_at != std::chrono::steady_clock::time_point{}) {
+        response->set_execution_latency_us(micros(record.finished_at - record.started_at));
+      }
+      response->set_total_latency_us(micros(record.finished_at - record.submitted_at));
+    }
     return grpc::Status::OK;
   }
 
@@ -1213,6 +1232,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
           continue;
         }
         record->state = ::umbp::PREFETCH_STATE_RUNNING;
+        record->started_at = std::chrono::steady_clock::now();
       }
 
       PrefetchOptions options = record->options;
@@ -1244,6 +1264,15 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
         record->state = ::umbp::PREFETCH_STATE_FAILED;
         record->error = "no requested key became locally resident";
       }
+      const auto total_latency_us =
+          std::chrono::duration_cast<std::chrono::microseconds>(record->finished_at -
+                                                                record->submitted_at)
+              .count();
+      MORI_UMBP_INFO(
+          "[StandaloneServer] prefetch complete request_id={} state={} completed={}/{} "
+          "total_latency_us={}",
+          record->request_id, static_cast<int>(record->state), completed, record->keys.size(),
+          total_latency_us);
     }
   }
 
