@@ -149,8 +149,7 @@ void TopoSystemGpu::Load() {
     ROCM_SMI_CHECK(amdsmi_get_processor_handles(sockets[s], &procCount, nullptr));
     size_t prevSize = handles.size();
     handles.resize(prevSize + procCount);
-    ROCM_SMI_CHECK(
-        amdsmi_get_processor_handles(sockets[s], &procCount, handles.data() + prevSize));
+    ROCM_SMI_CHECK(amdsmi_get_processor_handles(sockets[s], &procCount, handles.data() + prevSize));
   }
   uint32_t numGpus = handles.size();
 
