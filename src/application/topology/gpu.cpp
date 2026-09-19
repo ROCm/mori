@@ -107,6 +107,8 @@ TopoSystemGpu::~TopoSystemGpu() {}
 #if MORI_USE_AMDSMI
 // ---- amd_smi Load() (ROCm 10.1+) ----
 // Uses socket/processor handle model instead of flat device indices.
+// In amd_smi, each GPU is modeled as its own socket with one processor,
+// so we must iterate all sockets to discover all GPUs.
 
 PciBusId AmdSmiBdf2PciBusId(amdsmi_bdf_t bdf) {
   uint16_t domain = bdf.domain_number;
@@ -132,13 +134,25 @@ void TopoSystemGpu::Load() {
 
   uint32_t socketCount = 0;
   ROCM_SMI_CHECK(amdsmi_get_socket_handles(&socketCount, nullptr));
+  if (socketCount == 0) {
+    fprintf(stderr, "[AMD-SMI] amdsmi_get_socket_handles reported 0 sockets\n");
+    exit(-1);
+  }
   std::vector<amdsmi_socket_handle> sockets(socketCount);
   ROCM_SMI_CHECK(amdsmi_get_socket_handles(&socketCount, sockets.data()));
 
-  uint32_t numGpus = 0;
-  ROCM_SMI_CHECK(amdsmi_get_processor_handles(sockets[0], &numGpus, nullptr));
-  std::vector<amdsmi_processor_handle> handles(numGpus);
-  ROCM_SMI_CHECK(amdsmi_get_processor_handles(sockets[0], &numGpus, handles.data()));
+  // Collect processor handles from ALL sockets. In amd_smi each GPU is its
+  // own socket (socket_count == GPU count), each with processor_count == 1.
+  std::vector<amdsmi_processor_handle> handles;
+  for (uint32_t s = 0; s < socketCount; ++s) {
+    uint32_t procCount = 0;
+    ROCM_SMI_CHECK(amdsmi_get_processor_handles(sockets[s], &procCount, nullptr));
+    size_t prevSize = handles.size();
+    handles.resize(prevSize + procCount);
+    ROCM_SMI_CHECK(
+        amdsmi_get_processor_handles(sockets[s], &procCount, handles.data() + prevSize));
+  }
+  uint32_t numGpus = handles.size();
 
   if (numGpus == 0) {
     fprintf(stderr, "[AMD-SMI] amdsmi_get_processor_handles reported 0 GPUs\n");
