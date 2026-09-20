@@ -78,13 +78,20 @@ from every lane.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, range_constexpr, rocdl
+from flydsl.expr import gpu as fgpu
 from flydsl.expr.typing import Int64
 
 import mori.cco.device.flydsl as cco
 from mori.cco.device.flydsl import _bindings as raw_cco
 
-from ..gemm_ar._compat import create_buffer_resource_from_addr, wave_uniform_i64
+from ..gemm_ar._compat import (
+    atomic_add_u32,
+    atomic_store_u32,
+    create_buffer_resource_from_addr,
+    signal_ptr,
+    wave_uniform_i64,
+)
 from ..gemm_ar._gemm_a8w8_8wave import (
     G2SLoader,
     Mfma16x16x128,
@@ -103,7 +110,12 @@ from ..gemm_ar._gemm_a8w8_8wave import (
 # which would silently diverge the moment one of them was not. The names used
 # here are the two the a2a path builds on; if either changes shape, this file
 # fails at import rather than at runtime.
-from ..gemm_ar.kernels_fused import _BlockScaleK, _PermlaneStoreC, _SwappedMfma
+from ..gemm_ar.kernels_fused import (
+    _acquire_peer_lock,
+    _BlockScaleK,
+    _PermlaneStoreC,
+    _SwappedMfma,
+)
 from .layout import DEFAULT_BLOCK_M, DEFAULT_BLOCK_N  # noqa: F401
 
 BLOCK_K = 128
@@ -217,6 +229,9 @@ def compile_fused_gemm_a2a(
     rotated: bool = True,
     n_stripe: int = 1,
     transport: str = "lsa",
+    fuse: bool = True,
+    chunks: int = 1,
+    sdma_queues: int = 1,
 ):
     """The GEMM with its C stored straight into the destinations' windows.
 
@@ -233,10 +248,19 @@ def compile_fused_gemm_a2a(
     setting to assume transfers.
     """
     cfg.validate()
-    if transport != "lsa":
-        raise NotImplementedError(
-            f"transport={transport!r}: only the LSA (direct) path exists so far; "
-            f"'sdma' needs the staging slab and the completion counters"
+    if transport not in ("lsa", "sdma"):
+        raise ValueError(f"transport must be lsa or sdma, got {transport!r}")
+    if transport == "sdma" and not cfg.staged:
+        raise ValueError(
+            "transport='sdma' needs a config built with staged=True: the copy "
+            "engine reads one contiguous range, so C has to land in the "
+            "[dst][M][shard_n] slab rather than in the peer"
+        )
+    if transport == "lsa" and not fuse:
+        raise ValueError(
+            "fuse=False is only meaningful with transport='sdma', where it gives "
+            "the staging GEMM for the split path; an unfused LSA GEMM is just "
+            "compile_gemm_local"
         )
     if quant not in ("ptpc", "blockscale"):
         raise ValueError(f"quant must be ptpc or blockscale, got {quant!r}")
@@ -255,6 +279,21 @@ def compile_fused_gemm_a2a(
     n_blocks_per_peer = cfg.n_blocks_per_peer
     my_recv_slot = cfg.recv_slot_off(rank)
     slab_bytes = cfg.slab_bytes
+    cap_slab_bytes = cfg.cap_slab_bytes
+    staging_off = cfg.staging_off if cfg.staged else 0
+    counter_off, lock_off = cfg.counter_off, cfg.lock_off
+    direct_lsa = transport == "lsa"
+    if not direct_lsa and cfg.counter_chunks != chunks:
+        raise ValueError(
+            f"chunks={chunks} disagrees with the config's counter_chunks="
+            f"{cfg.counter_chunks}; the counter region is sized from the "
+            f"config's, so an epilogue electing on a different count would index "
+            f"past it"
+        )
+    # A chunk is a run of row tiles, so it stays contiguous inside the slab.
+    m_tiles_per_chunk = cfg.m_tiles // chunks
+    tiles_per_chunk = m_tiles_per_chunk * n_blocks_per_peer
+    chunk_bytes = m_tiles_per_chunk * BLOCK_M * shard_n * 2
     if rotated and n_blocks_per_peer % n_stripe:
         raise ValueError(
             f"n_stripe={n_stripe} must divide the {n_blocks_per_peer} N tiles in a "
@@ -274,8 +313,10 @@ def compile_fused_gemm_a2a(
     b_lds_size = LDS_BLOCK_N * BLOCK_K
 
     _kname = (
-        f"mori_a2a_fused_lsa_8w_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_k{K}_"
-        f"{'B' if blockscale else 'P'}{'r' if rotated else 'l'}s{n_stripe}_r{rank}"
+        f"mori_a2a_{transport if fuse else 'stage'}_8w_"
+        f"{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_k{K}_"
+        f"{'B' if blockscale else 'P'}{'r' if rotated else 'l'}s{n_stripe}"
+        f"c{chunks}q{sdma_queues}_r{rank}"
     )
 
     @fx.struct
@@ -377,7 +418,37 @@ def compile_fused_gemm_a2a(
         # Which destination this block's columns belong to, and its slab. The
         # descriptor is the slab itself, so the store index needs no rebasing
         # and StoreC's own `oob = c_rows * c_cols` lands exactly one past it.
+        #
+        # LSA writes the destination's slab in the *destination's* window; SDMA
+        # writes the same slab shape in this rank's own staging region, which the
+        # copy engine then pushes. Only the base address differs -- the index
+        # math, the bounds test and the oob sentinel are identical, which is why
+        # one store class serves both. (`peer_rsrc` is then a misnomer on the
+        # SDMA path: it is a local resource. Renaming it in gemm_ar to suit this
+        # op would be the tail wagging the dog.)
         dest_blk = block_n // fx.Int32(n_blocks_per_peer)
+        if const_expr(direct_lsa):
+            store_base = wave_uniform_i64(w_pre.lsa_ptr(dest_blk, my_recv_slot))
+        else:
+            # `dest == rank` goes straight into my own recv slot rather than
+            # into staging. Nothing ever pushes that slab -- the put loop skips
+            # self, because a copy engine round trip to our own memory would be
+            # pure cost -- so staging it would strand it. Leaving it out is not
+            # a visible failure either: every *remote* slab still arrives
+            # correct, so the transport looks fine and only one eighth of the
+            # answer is missing. That is what it did.
+            win_base = fx.Int64(w_pre.lsa_ptr(rank, 0))
+            staged_at = fx.Int64(staging_off) + fx.Int64(dest_blk) * fx.Int64(
+                cap_slab_bytes
+            )
+            store_base = wave_uniform_i64(
+                win_base
+                + arith.select(
+                    dest_blk == fx.Int32(rank),
+                    fx.Int64(my_recv_slot),
+                    staged_at,
+                )
+            )
         store_c = _A2aPeerStoreC(
             A_scale,
             B_scale,
@@ -388,8 +459,7 @@ def compile_fused_gemm_a2a(
             N_TILES_A,
             N_TILES_B,
             peer_rsrc=create_buffer_resource_from_addr(
-                wave_uniform_i64(w_pre.lsa_ptr(dest_blk, my_recv_slot)),
-                num_records_bytes=slab_bytes,
+                store_base, num_records_bytes=slab_bytes
             ),
             dest_col_base=dest_blk * fx.Int32(shard_n),
             b_scale=B_scale,
@@ -575,12 +645,74 @@ def compile_fused_gemm_a2a(
         store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
         # ---- end pinned copy ----
 
-        # Publish the peer stores from the blocks that made them. The barrier
-        # kernel that follows is one block, hence one XCD's L2 out of eight; the
-        # other seven would keep their peer-homed lines dirty and the barrier's
-        # system-scope atomic would overtake them.
-        wait_barrier(0)
-        raw_cco.cco_system_fence(fx.Int32(0))
+        if const_expr(direct_lsa):
+            # Publish the peer stores from the blocks that made them. The barrier
+            # kernel that follows is one block, hence one XCD's L2 out of eight;
+            # the other seven would keep their peer-homed lines dirty and the
+            # barrier's system-scope atomic would overtake them.
+            wait_barrier(0)
+            raw_cco.cco_system_fence(fx.Int32(0))
+        else:
+            # Retire this block's stores into the staging slab, agree block-wide
+            # that they are retired, then publish them to the copy engine. The
+            # fence is not optional even though the engine reads memory this CU
+            # wrote: gemm_ar measured dropping it as still validating on 2 ranks
+            # while taking relL2 from 2.35e-3 to 3.76e-3 on 8, i.e. the engine
+            # reads some tiles stale.
+            wait_barrier(0)
+            raw_cco.cco_system_fence(fx.Int32(0))
+
+            # Both bases are rank-local and constant-offset, so they are the same
+            # for every thread. Taking them here rather than inside the `if` also
+            # keeps the window out of the branch's captured state, which has to
+            # be single MLIR values -- see CachedWindow.
+            ctr_base = fx.Int64(w_pre.lsa_ptr(rank, counter_off))
+            lock_base = fx.Int64(w_pre.lsa_ptr(rank, lock_off))
+            sdma = cco.DevComm(dev_comm).sdma()
+            if fx.thread_idx.x == 0:
+                # dest is the *column* block's owner and chunk is a run of row
+                # tiles, which is the transpose of gemm_ar's (dest from rows,
+                # chunk from... rows as well). Chunking along M is what keeps a
+                # chunk contiguous inside [dst][M][shard_n].
+                dest = block_n // fx.Int32(n_blocks_per_peer)
+                chunk = block_m // fx.Int32(m_tiles_per_chunk)
+                slot = dest * fx.Int32(chunks) + chunk
+                ctr = signal_ptr(ctr_base + fx.Int64(slot) * fx.Int64(4))
+                # acq_rel, matching gemm_ar's default rather than
+                # _compat's "monotonic": the election has to order
+                # against the stores the fence above published.
+                seq = fx.Int32(atomic_add_u32(ctr, 1, ordering="acq_rel")) + fx.Int32(1)
+                # Monotonic: the counters are never reset, so "last tile of this
+                # chunk, this epoch" is a modulo test rather than a compare --
+                # the same property that makes graph replay behave like a fresh
+                # launch.
+                if seq % fx.Int32(tiles_per_chunk) == fx.Int32(0):
+                    if const_expr(fuse) and dest != fx.Int32(rank):
+                        off = fx.Int64(chunk) * fx.Int64(chunk_bytes)
+                        lock = signal_ptr(lock_base + fx.Int64(dest) * fx.Int64(4))
+                        if const_expr(chunks > 1):
+                            # Two chunks of one destination can be elected at
+                            # nearly the same moment and would then post to the
+                            # same queue concurrently.
+                            _acquire_peer_lock(lock)
+                        sdma.put(
+                            dest,
+                            win,
+                            fx.Int64(my_recv_slot) + off,
+                            win,
+                            fx.Int64(staging_off)
+                            + fx.Int64(dest) * fx.Int64(cap_slab_bytes)
+                            + off,
+                            fx.Int64(chunk_bytes),
+                            dest % fx.Int32(sdma_queues),
+                            coop=cco.CoopScope.THREAD,
+                            signal=False,
+                        )
+                        if const_expr(chunks > 1):
+                            atomic_store_u32(lock, 0)
+            # gcnasm closes its ChunkFused epilogue with a barrier here; its
+            # README lists removing it as a rejected experiment that deadlocked.
+            fgpu.barrier()
 
     @flyc.jit
     def launch(

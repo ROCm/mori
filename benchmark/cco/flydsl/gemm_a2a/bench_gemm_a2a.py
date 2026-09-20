@@ -67,6 +67,8 @@ from mori.ops.gemm_a2a import (
     a2a_config,
     build_lsa_a2a,
     build_lsa_barrier,
+    build_sdma_phases,
+    counter_chunks,
     preshuffle_b,
 )
 from mori.ops.gemm_a2a.kernels_fused import (
@@ -74,8 +76,8 @@ from mori.ops.gemm_a2a.kernels_fused import (
     compile_gemm_local,
 )
 
-MODES = ("gemm-only", "split-lsa", "fused-lsa")
-NOT_YET = ("split-sdma", "fused-sdma")
+MODES = ("gemm-only", "split-lsa", "fused-lsa", "split-sdma", "fused-sdma")
+NOT_YET = ()
 
 #: fp8 block-scale group size along K. Fixed by the model's quantiser and by the
 #: kernel, whose BLOCK_K is already 128.
@@ -193,6 +195,7 @@ def _validate_recv(recv, a, b, sa, sb, args, rank, world_size) -> tuple[float, b
     shard_n = args.n // world_size
     my_cols = slice(rank * shard_n, (rank + 1) * shard_n)
     worst = 0.0
+    per_src = []
     for src in range(world_size):
         a_src, b_src, sa_src, sb_src = make_operands(
             src, args.m, args.n, args.k, args.quant
@@ -202,7 +205,17 @@ def _validate_recv(recv, a, b, sa, sb, args, rank, world_size) -> tuple[float, b
         denom = ref.norm().item()
         rel = (got - ref).norm().item() / denom if denom else float("inf")
         worst = max(worst, rel)
+        per_src.append(rel)
         del a_src, b_src, sa_src, sb_src, ref
+    if worst >= args.tolerance:
+        # Per source, not just the worst. "Everything is missing" and "only my
+        # own slab is missing" both report relL2 1.0 from the maximum, and they
+        # are entirely different bugs -- the second means the transport works
+        # and the local copy was forgotten.
+        marks = " ".join(
+            f"{i}{'*' if i == rank else ''}={r:.2e}" for i, r in enumerate(per_src)
+        )
+        print(f"[rank {rank}] per-source relL2: {marks}", flush=True)
     return worst, worst < args.tolerance
 
 
@@ -213,12 +226,18 @@ def run(args) -> int:
             print(f"--mode {args.mode} is not implemented yet", file=sys.stderr)
         return 2
 
+    needs_sdma = args.mode in ("split-sdma", "fused-sdma")
+    # A chunk is a run of row tiles; the count has to divide them, and the
+    # request is rounded down rather than rejected so a sweep stays usable.
+    chunks = counter_chunks(args.m // args.block_m, args.chunks) if needs_sdma else 1
     cfg = a2a_config(
         world_size=world_size,
         m=args.m,
         n=args.n,
         block_m=args.block_m,
         block_n=args.block_n,
+        staged=needs_sdma,
+        counter_chunks=chunks,
     )
     a, b, sa, sb = make_operands(rank, args.m, args.n, args.k, args.quant)
     b_shuf = preshuffle_b(b)
@@ -241,9 +260,31 @@ def run(args) -> int:
         reqs.gda_connection_type = GDA_CONNECTION_NONE
         reqs.gda_signal_count = 0
         reqs.gda_counter_count = 0
+        if needs_sdma:
+            reqs.sdma_queue_count = args.sdma_queues
         dc = comm.create_dev_comm(reqs)
 
-        if args.mode == "fused-lsa":
+        if needs_sdma:
+            # The same kernel for both SDMA modes, differing only in whether the
+            # epilogue posts the puts. That is the point of a split baseline:
+            # one changed thing, not two.
+            gemm = compile_fused_gemm_a2a(
+                cfg,
+                rank,
+                K=args.k,
+                BLOCK_M=args.block_m,
+                BLOCK_N=args.block_n,
+                quant=args.quant,
+                waves_per_eu=args.waves_per_eu,
+                xcd_swizzle=args.xcd_swizzle,
+                rotated=args.rotated,
+                n_stripe=args.n_stripe,
+                transport="sdma",
+                fuse=args.mode == "fused-sdma",
+                chunks=chunks,
+                sdma_queues=args.sdma_queues,
+            )
+        elif args.mode == "fused-lsa":
             # The epilogue writes into the peers, so there is no separate
             # collective -- only the barrier below.
             gemm = compile_fused_gemm_a2a(
@@ -288,6 +329,11 @@ def run(args) -> int:
         # the peers -- but it still needs the agreement that every peer
         # *finished*, or a rank reads a slab a peer is still writing.
         barrier = build_lsa_barrier(cfg, rank) if args.mode == "fused-lsa" else None
+        parts = (
+            build_sdma_phases(cfg, rank, queues=args.sdma_queues)
+            if needs_sdma
+            else None
+        )
         c_ptr = c.data_ptr()
 
         def once():
@@ -308,6 +354,11 @@ def run(args) -> int:
                 copy(c_ptr, dc.ptr, win.handle, stream=stream)
             if barrier is not None:
                 barrier(dc.ptr, win.handle, stream=stream)
+            if parts is not None:
+                # fused-sdma: the puts left from the epilogue, so only the drain
+                # runs. split-sdma: the full scatter.
+                phase = "drain" if args.mode == "fused-sdma" else "scatter"
+                parts[phase](dc.ptr, win.handle, stream=stream)
 
         comm.barrier()
         once()
@@ -378,6 +429,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--permlane", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--rotated", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--n-stripe", type=int, default=1)
+    p.add_argument("--chunks", type=int, default=1)
+    p.add_argument("--sdma-queues", type=int, default=1)
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--no-graph", action="store_true")
