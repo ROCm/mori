@@ -332,9 +332,7 @@ class Mxfp8GemmOp:
             )
         self._check_operands(a_fp8, b_preshuffled, a_scale, b_scale, m)
         if out is None:
-            out = torch.empty(
-                (m, self.n), dtype=torch.bfloat16, device=a_fp8.device
-            )
+            out = torch.empty((m, self.n), dtype=torch.bfloat16, device=a_fp8.device)
         elif tuple(out.shape) != (m, self.n) or out.dtype != torch.bfloat16:
             raise ValueError(
                 f"out must be {(m, self.n)} bfloat16, got {tuple(out.shape)} "

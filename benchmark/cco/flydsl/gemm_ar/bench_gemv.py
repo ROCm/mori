@@ -1,4 +1,25 @@
 #!/usr/bin/env python3
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 """mori's mxfp8 GEMV against sglang's, and a config sweep for mori's.
 
 Both sides get the same raw weight and the same ue8m0 scales, each in its own
@@ -142,9 +163,13 @@ def main() -> int:
     p.add_argument("--sweep", action="store_true")
     p.add_argument("--config", default=None)
     p.add_argument("--reps", type=int, default=64)
-    p.add_argument("--baseline", choices=("sglang", "none"), default="sglang",
-                   help="'none' drops the SGLang import; mori's own numbers "
-                        "need nothing but mori")
+    p.add_argument(
+        "--baseline",
+        choices=("sglang", "none"),
+        default="sglang",
+        help="'none' drops the SGLang import; mori's own numbers "
+        "need nothing but mori",
+    )
     p.add_argument("--tol", type=float, default=2.4e-3)
     p.add_argument("--json-out", default="gemv.jsonl")
     args = p.parse_args()
@@ -157,9 +182,15 @@ def main() -> int:
     vram_before = timing.vram_used()
 
     common = {
-        "bench": "gemv", "scope": "kernel", "quant": "mxfp8",
-        "shape": args.shape, "n": n, "k": k, "m": m,
-        "input": "fp8", "includes_quant": False,
+        "bench": "gemv",
+        "scope": "kernel",
+        "quant": "mxfp8",
+        "shape": args.shape,
+        "n": n,
+        "k": k,
+        "m": m,
+        "input": "fp8",
+        "includes_quant": False,
         "timing": "amortized-graph-cold-hot",
     }
     rows, base, ref, failures = [], None, None, 0
@@ -173,8 +204,16 @@ def main() -> int:
             f"cold {base['cold_us']:6.2f}",
             flush=True,
         )
-        rows.append(dict(common, impl="sglang", route="sglang-gemv",
-                         rel_l2=0.0, validated=True, **base))
+        rows.append(
+            dict(
+                common,
+                impl="sglang",
+                route="sglang-gemv",
+                rel_l2=0.0,
+                validated=True,
+                **base,
+            )
+        )
 
     if args.config:
         cfgs = [parse_key(args.config)]
@@ -192,36 +231,57 @@ def main() -> int:
             torch.cuda.synchronize()
             rel = (
                 ((out[:m].float() - ref).norm() / ref.norm().clamp_min(1e-30)).item()
-                if ref is not None else None
+                if ref is not None
+                else None
             )
             res = timing.cold_hot_us(call, [wt], reps=args.reps)
         except Exception as err:  # noqa: BLE001 - a bad config must not stop the sweep
             print(f"  {key_of(cfg):<12} FAILED {type(err).__name__}: {err}", flush=True)
             traceback.print_exc(limit=3)
-            rows.append(dict(common, impl="mori", config=key_of(cfg),
-                             validated=False,
-                             error=f"{type(err).__name__}: {err}"))
+            rows.append(
+                dict(
+                    common,
+                    impl="mori",
+                    config=key_of(cfg),
+                    validated=False,
+                    error=f"{type(err).__name__}: {err}",
+                )
+            )
             failures += 1
             continue
         ok = rel is None or rel <= args.tol
         failures += 0 if ok else 1
-        vs = (f"  {(res['cold_us'] / base['cold_us'] - 1) * 100:+6.1f}%"
-              if base else " " * 8)
+        vs = (
+            f"  {(res['cold_us'] / base['cold_us'] - 1) * 100:+6.1f}%"
+            if base
+            else " " * 8
+        )
         rel_s = "   n/a  " if rel is None else f"  relL2 {rel:.2e}"
         print(
             f"  {key_of(cfg):<12} hot {res['hot_us']:6.2f}  cold {res['cold_us']:6.2f}"
             f"{vs}{rel_s}{'' if ok else '  !! over tol'}",
             flush=True,
         )
-        rows.append(dict(common, impl="mori", config=key_of(cfg),
-                         route=f"mori-gemv-{key_of(cfg)}",
-                         rel_l2=rel, validated=ok, **res))
+        rows.append(
+            dict(
+                common,
+                impl="mori",
+                config=key_of(cfg),
+                route=f"mori-gemv-{key_of(cfg)}",
+                rel_l2=rel,
+                validated=ok,
+                **res,
+            )
+        )
 
     with open(args.json_out, "a") as f:
         for r in rows:
-            f.write(json.dumps(dict(
-                r, vram_before=vram_before, vram_after=timing.vram_used()
-            )) + "\n")
+            f.write(
+                json.dumps(
+                    dict(r, vram_before=vram_before, vram_after=timing.vram_used())
+                )
+                + "\n"
+            )
     # A benchmark that fails and exits 0 is how a broken sweep looks green.
     return 1 if failures else 0
 

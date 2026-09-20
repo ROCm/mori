@@ -421,7 +421,9 @@ class _Mxfp8ScaleK:
             a_bytes = m * self.kb_count
         else:
             a_bytes = m * (self.k_dwords if row_major else self.kb_count) * 4
-        b_bytes = (n // self.BLOCK) * (self.k_dwords if row_major else self.kb_count) * 4
+        b_bytes = (
+            (n // self.BLOCK) * (self.k_dwords if row_major else self.kb_count) * 4
+        )
         gSA = fx.rocdl.make_buffer_tensor(
             A_scale, max_size=False, num_records_bytes=a_bytes
         )
@@ -448,9 +450,13 @@ class _Mxfp8ScaleK:
         four block groups read the same sixteen addresses and only the shift
         differs. Two VALU ops per scale, both cheap; what row major costs is in
         the addresses, not here.
+
+        FlyDSL's own operators rather than ``arith.shrui``/``andi``: the raw MLIR
+        builders read ``.type`` off the operand, which an ``fx.Int32`` wrapper
+        does not carry. See the same note in ``kernels_gemv._byte``.
         """
         v = self._load1(div, dword_index)
-        return arith.andi(arith.shrui(v, self.byte_shift), fx.Int32(0xFF))
+        return (v >> self.byte_shift) & fx.Int32(0xFF)
 
     def _kb(self, ks):
         """This lane's 32-block for K step ``ks``: block ``4*ks + lane//16``."""
@@ -1132,9 +1138,10 @@ def compile_fused_gemm_scatter(
     # is legal without permlane and not with it, which is what the store's own
     # assert says a few frames deeper and less usefully.
     n_floor = 256 if permlane else 128
-    assert BLOCK_M >= 128 and BLOCK_N >= n_floor, (
-        f"BLOCK_N={BLOCK_N} is below {n_floor}"
-        + (" (permlane's store pairs two N-tiles)" if permlane else "")
+    assert (
+        BLOCK_M >= 128 and BLOCK_N >= n_floor
+    ), f"BLOCK_N={BLOCK_N} is below {n_floor}" + (
+        " (permlane's store pairs two N-tiles)" if permlane else ""
     )
     assert BLOCK_M % 128 == 0 and BLOCK_N % 128 == 0
     assert K % BLOCK_K == 0
@@ -1310,9 +1317,7 @@ def compile_fused_gemm_scatter(
             # idx(tj, ti).
             # With the swap the instruction's B is our A, so the per-tile
             # opsel that selects a packed A byte is opsel_b on the raw atom.
-            mfma_raw = Mfma16x16x128(
-                N_TILES_B, N_TILES_A, opsel_b_per_tile=mxfp8_pack
-            )
+            mfma_raw = Mfma16x16x128(N_TILES_B, N_TILES_A, opsel_b_per_tile=mxfp8_pack)
             mfma = _SwappedMfma(mfma_raw)
         else:
             mfma = Mfma16x16x128(N_TILES_A, N_TILES_B)

@@ -93,6 +93,7 @@ def _quant_tile_constraint(quant: str, block_m: int) -> str | None:
         )
     return None
 
+
 # Chunks are how many separate pushes a destination receives, and so how early
 # the first bytes leave. More is better until the pieces get small enough that
 # the SDMA per-packet cost shows; 8 is the measured knee.
@@ -150,7 +151,9 @@ def counter_chunks(m_pad: int, world_size: int, block_m: int = DEFAULT_BLOCK_M) 
     return max(c for c in range(1, min(MAX_CHUNKS, bands) + 1) if bands % c == 0)
 
 
-def _tile_constraints(block_m: int, block_n: int, n_granule: int | None = None) -> str | None:
+def _tile_constraints(
+    block_m: int, block_n: int, n_granule: int | None = None
+) -> str | None:
     """Why this tile is not one the kernel can build, or None.
 
     Checked before anything divides by a tile size. ``padded_m`` and

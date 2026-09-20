@@ -414,9 +414,7 @@ def _run_worker(world_size: int, case: str, *extra: str, timeout: int = 900):
 requires_two_gpus = pytest.mark.skipif(
     torch.cuda.device_count() < 2, reason="needs 2 GPUs"
 )
-requires_gpu = pytest.mark.skipif(
-    torch.cuda.device_count() < 1, reason="needs a GPU"
-)
+requires_gpu = pytest.mark.skipif(torch.cuda.device_count() < 1, reason="needs a GPU")
 
 
 def _mxfp8_gemm_rel_l2(n: int, k: int, m: int, pad: bool = False) -> float:
@@ -457,9 +455,7 @@ def _mxfp8_gemm_rel_l2(n: int, k: int, m: int, pad: bool = False) -> float:
 
 
 @requires_gpu
-@pytest.mark.parametrize(
-    "n,k,label", [(8192, 1280, "wq_b"), (5120, 2048, "wo_b")]
-)
+@pytest.mark.parametrize("n,k,label", [(8192, 1280, "wq_b"), (5120, 2048, "wo_b")])
 @pytest.mark.parametrize("m", [64, 192, 1024])
 def test_standalone_mxfp8_gemm(n, k, label, m):
     """``Mxfp8GemmOp`` at DeepSeek-V4.1-Flash's two attention shapes.
@@ -584,9 +580,9 @@ def test_supports_gemm_takes_both_attention_shapes():
     """Neither of V4.1-Flash's attention GEMMs needs a special case."""
     from mori.ops.gemm_ar import supports_gemm
 
-    assert supports_gemm(8192, 1280) is True   # wq_b, ColumnParallel
-    assert supports_gemm(5120, 2048) is True   # wo_b, RowParallel
-    assert supports_gemm(5120, 64) is False    # K below MIN_K
+    assert supports_gemm(8192, 1280) is True  # wq_b, ColumnParallel
+    assert supports_gemm(5120, 2048) is True  # wo_b, RowParallel
+    assert supports_gemm(5120, 64) is False  # K below MIN_K
     assert supports_gemm(5000, 2048) is False  # N not a multiple of BLOCK_N
 
 

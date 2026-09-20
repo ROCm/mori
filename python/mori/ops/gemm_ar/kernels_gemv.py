@@ -138,9 +138,19 @@ class _Gemv:
         return Vec(fx.memref_load_vec(self.reg_4))
 
     def _byte(self, div, index):
-        """One ue8m0 scale out of a row-major dword of four."""
+        """One ue8m0 scale out of a row-major dword of four.
+
+        Shift and mask through FlyDSL's operators, not ``arith.shrui``/``andi``.
+        The generated MLIR builders take an operand's ``.type`` directly, which
+        only works if the value handed in is already an ``ArithValue``; an
+        ``fx.Int32`` wrapper has ``dtype`` instead and raises. FlyDSL's operators
+        unwrap the operands first (``_make_binop`` -> ``_extract_arith``), so they
+        are correct on every FlyDSL that has them -- and that difference is
+        invisible on one version and fatal on the next, which is how this passed
+        locally and failed CI on all ten GEMV shapes.
+        """
         v = self._load1(div, index)
-        return arith.andi(arith.shrui(v, self.byte_shift), fx.Int32(0xFF))
+        return (v >> self.byte_shift) & fx.Int32(0xFF)
 
     def w_frag(self, tile, t, step_dw):
         """The 32 weight bytes of tile ``tile + t`` this lane feeds one MFMA.
@@ -212,7 +222,9 @@ def compile_mxfp8_gemv(
     if n % TILE:
         raise ValueError(f"N={n} must be a multiple of {TILE}")
     if n % MXFP8_BLOCK:
-        raise ValueError(f"N={n} must be a multiple of {MXFP8_BLOCK} (the B scale group)")
+        raise ValueError(
+            f"N={n} must be a multiple of {MXFP8_BLOCK} (the B scale group)"
+        )
     if rows not in (16, 32) or tokens not in (16, 32):
         raise ValueError(f"rows/tokens must be 16 or 32, got {rows}/{tokens}")
     if tokens < m_max:
@@ -341,10 +353,16 @@ def compile_mxfp8_gemv(
                     [gv.x_frag(toks[b], x_step_dw) for b in range_constexpr(BT)]
                 )
                 w_sc.append(
-                    [gv.scale_at(gv.ws, w_sc_base[t], sc_step) for t in range_constexpr(AT)]
+                    [
+                        gv.scale_at(gv.ws, w_sc_base[t], sc_step)
+                        for t in range_constexpr(AT)
+                    ]
                 )
                 x_sc.append(
-                    [gv.scale_at(gv.xs, x_sc_base[b], sc_step) for b in range_constexpr(BT)]
+                    [
+                        gv.scale_at(gv.xs, x_sc_base[b], sc_step)
+                        for b in range_constexpr(BT)
+                    ]
                 )
             for s in range_constexpr(len(w_frags)):
                 acc = mfma.call(
@@ -365,8 +383,13 @@ def compile_mxfp8_gemv(
         c_div = fx.logical_divide(gC, fx.make_layout(1, 1))
 
         def store(value, tok, col):
-            in_range = arith.andi(tok < c_m, col < c_n)
-            idx = arith.select(in_range, tok * c_n + col, oob)
+            # Nested selects rather than `arith.andi` on the two predicates:
+            # `select` is the op the rest of mori already builds with, so it is
+            # the one proven against the FlyDSL that CI ships. Same result --
+            # out of range on either axis sends the store past `num_records`.
+            idx = arith.select(
+                tok < c_m, arith.select(col < c_n, tok * c_n + col, oob), oob
+            )
             fx.memref_store_vec(Vec.filled(1, value, fx.BFloat16), out_reg)
             fx.copy(out_atom, out_reg, fx.slice(c_div, (None, fx.Int32(idx))))
 

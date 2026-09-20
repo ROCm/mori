@@ -103,11 +103,28 @@ CASES = ALL_CASES if os.environ.get("MORI_TEST_GEMV_FULL") == "1" else QUICK
 def _run_case(shape, m, waves, steps, rows, tokens, ksplit):
     """One configuration, in its own interpreter. Returns (rc, payload|text)."""
     p = subprocess.run(
-        [sys.executable, os.path.abspath(__file__), "--worker",
-         "--shape", shape, "-m", str(m), "--waves", str(waves),
-         "--steps", str(steps), "--rows", str(rows), "--tokens", str(tokens),
-         "--ksplit", str(ksplit)],
-        capture_output=True, text=True, timeout=900,
+        [
+            sys.executable,
+            os.path.abspath(__file__),
+            "--worker",
+            "--shape",
+            shape,
+            "-m",
+            str(m),
+            "--waves",
+            str(waves),
+            "--steps",
+            str(steps),
+            "--rows",
+            str(rows),
+            "--tokens",
+            str(tokens),
+            "--ksplit",
+            str(ksplit),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=900,
     )
     for line in p.stdout.splitlines():
         if line.startswith("RESULT_JSON"):
@@ -117,9 +134,12 @@ def _run_case(shape, m, waves, steps, rows, tokens, ksplit):
 
 @requires_gpu
 @pytest.mark.parametrize(
-    "shape,m,waves,steps,rows,tokens,ksplit", CASES,
-    ids=[f"{s}-m{m}-w{w}s{st}r{r}t{t}{'k' if ks else 'n'}"
-         for s, m, w, st, r, t, ks in CASES],
+    "shape,m,waves,steps,rows,tokens,ksplit",
+    CASES,
+    ids=[
+        f"{s}-m{m}-w{w}s{st}r{r}t{t}{'k' if ks else 'n'}"
+        for s, m, w, st, r, t, ks in CASES
+    ],
 )
 def test_gemv_config(shape, m, waves, steps, rows, tokens, ksplit):
     """Every configuration must agree with an fp32 reference, not just the tuned one."""
@@ -149,14 +169,22 @@ def _worker(args) -> int:
     # row must not reach past the allocation. At M=1 there is no next row.
     x = (torch.randn(m, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
     w = (torch.randn(n, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
-    ex = torch.randint(120, 123, (m, k // bk), generator=g,
-                       device="cuda", dtype=torch.int32)
-    ew = torch.randint(120, 123, (n // bk, k // bk), generator=g,
-                       device="cuda", dtype=torch.int32)
+    ex = torch.randint(
+        120, 123, (m, k // bk), generator=g, device="cuda", dtype=torch.int32
+    )
+    ew = torch.randint(
+        120, 123, (n // bk, k // bk), generator=g, device="cuda", dtype=torch.int32
+    )
 
     gemv = compile_mxfp8_gemv(
-        n=n, k=k, m_max=args.tokens, waves=args.waves, steps=args.steps,
-        rows=args.rows, tokens=args.tokens, ksplit=bool(args.ksplit),
+        n=n,
+        k=k,
+        m_max=args.tokens,
+        waves=args.waves,
+        steps=args.steps,
+        rows=args.rows,
+        tokens=args.tokens,
+        ksplit=bool(args.ksplit),
     )
     out = torch.zeros(m, n, device="cuda", dtype=torch.bfloat16)
     gemv(
@@ -164,7 +192,9 @@ def _worker(args) -> int:
         ew.to(torch.uint8).contiguous().view(torch.int32).view(-1),
         x.contiguous().view(torch.int32).view(-1),
         ex.to(torch.uint8).contiguous().view(torch.int32).view(-1),
-        out.view(-1), m, n,
+        out.view(-1),
+        m,
+        n,
         stream=fx.Stream(torch.cuda.current_stream()),
     )
     torch.cuda.synchronize()
@@ -174,17 +204,28 @@ def _worker(args) -> int:
     ref = torch.zeros(m, n, device="cuda", dtype=torch.float32)
     for i in range(k // bk):
         ks = slice(i * bk, (i + 1) * bk)
-        ref += ((xf[:, ks] @ wf[:, ks].T) * sx[:, i][:, None]
-                * sw[:, i].repeat_interleave(bk)[None, :])
+        ref += (
+            (xf[:, ks] @ wf[:, ks].T)
+            * sx[:, i][:, None]
+            * sw[:, i].repeat_interleave(bk)[None, :]
+        )
     got = out.float()
-    rel = (torch.linalg.vector_norm(got - ref)
-           / torch.linalg.vector_norm(ref)).item()
-    print("RESULT_JSON " + json.dumps({
-        "shape": args.shape, "n": n, "k": k, "m": m,
-        "config": f"w{args.waves}s{args.steps}r{args.rows}t{args.tokens}"
-                  f"{'k' if args.ksplit else 'n'}",
-        "rel_l2": rel, "finite": bool(got.isfinite().all()),
-    }))
+    rel = (torch.linalg.vector_norm(got - ref) / torch.linalg.vector_norm(ref)).item()
+    print(
+        "RESULT_JSON "
+        + json.dumps(
+            {
+                "shape": args.shape,
+                "n": n,
+                "k": k,
+                "m": m,
+                "config": f"w{args.waves}s{args.steps}r{args.rows}t{args.tokens}"
+                f"{'k' if args.ksplit else 'n'}",
+                "rel_l2": rel,
+                "finite": bool(got.isfinite().all()),
+            }
+        )
+    )
     return 0
 
 

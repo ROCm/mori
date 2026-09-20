@@ -1,4 +1,25 @@
 #!/usr/bin/env python3
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 """mori's mxfp8/blockscale GEMM, at either scope, optionally against SGLang.
 
 One entry point for the two questions that are *not* about the collective, and
@@ -85,8 +106,12 @@ def build_mxfp8(n, k, seed=1234, want_sglang=False):
     g = torch.Generator(device="cuda").manual_seed(seed)
     w = (torch.randn(n, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
     eb = torch.randint(
-        120, 123, (n // MXFP8_BK, k // MXFP8_BK), generator=g,
-        device="cuda", dtype=torch.int32,
+        120,
+        123,
+        (n // MXFP8_BK, k // MXFP8_BK),
+        generator=g,
+        device="cuda",
+        dtype=torch.int32,
     )
     out = {
         "w_raw": w,
@@ -105,7 +130,9 @@ def build_mxfp8(n, k, seed=1234, want_sglang=False):
         shuffled, scale_e8m0, weight_bf16 = prepare_mxfp8_native_weight(
             w, torch.exp2(eb.float() - 127.0), (32, 32)
         )
-        out["layer"] = _Layer(shuffled.view(torch.float8_e4m3fn), scale_e8m0, weight_bf16)
+        out["layer"] = _Layer(
+            shuffled.view(torch.float8_e4m3fn), scale_e8m0, weight_bf16
+        )
     return out
 
 
@@ -117,10 +144,13 @@ def build_blockscale(n, k, m, seed=1234):
     a = (torch.randn(m, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
     w = (torch.randn(n, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
     kb = k // SCALE_BK
-    sa = torch.rand(m, kb, generator=g, device="cuda", dtype=torch.float32) * 0.01 + 0.01
+    sa = (
+        torch.rand(m, kb, generator=g, device="cuda", dtype=torch.float32) * 0.01 + 0.01
+    )
     sb = (
         torch.rand(n // SCALE_BK, kb, generator=g, device="cuda", dtype=torch.float32)
-        * 0.01 + 0.01
+        * 0.01
+        + 0.01
     )
     return a, w, preshuffle_b(w), sa.t().contiguous().t(), sb
 
@@ -187,17 +217,35 @@ def mori_kernel_call(ops, n, k, m, block_n, quant):
 
         a, _w, w_shuf, sa, sb = ops
         gemm = compile_fused_gemm_scatter(
-            layout.ArConfig(world_size=2, m=128, n=n), 0, K=k,
-            BLOCK_M=128, BLOCK_N=block_n or 256, b_preshuffled=True, fuse=False,
-            swap_ab=True, permlane=True, lane_transpose=True, quant="blockscale",
+            layout.ArConfig(world_size=2, m=128, n=n),
+            0,
+            K=k,
+            BLOCK_M=128,
+            BLOCK_N=block_n or 256,
+            b_preshuffled=True,
+            fuse=False,
+            swap_ab=True,
+            permlane=True,
+            lane_transpose=True,
+            quant="blockscale",
         )
         y = torch.zeros(m, n, device="cuda", dtype=torch.bfloat16)
         a_i8 = a.contiguous().view(torch.int8).view(-1)
         sa_arg, sb_arg = sa.t().reshape(-1).contiguous(), sb.reshape(-1).contiguous()
 
         def call(picked):
-            gemm(a_i8, picked[0], y.view(-1), sa_arg, sb_arg, m, n, 0, 0,
-                 stream=fx.Stream(torch.cuda.current_stream()))
+            gemm(
+                a_i8,
+                picked[0],
+                y.view(-1),
+                sa_arg,
+                sb_arg,
+                m,
+                n,
+                0,
+                0,
+                stream=fx.Stream(torch.cuda.current_stream()),
+            )
             return y
 
         return call, [w_shuf.contiguous().view(torch.int8).view(-1)]
@@ -254,7 +302,9 @@ def sglang_linear_call(layer, x_bf16):
 
     def call(picked):
         return mxfp8_native_blockscaled_linear(
-            x_bf16, picked[0].view(torch.uint8), layer.weight_scale_mx_e8m0,
+            x_bf16,
+            picked[0].view(torch.uint8),
+            layer.weight_scale_mx_e8m0,
             weight_bf16=(picked[1] if len(picked) > 1 else None),
         )
 
@@ -281,11 +331,18 @@ def main() -> int:
     p.add_argument("-m", type=int, required=True)
     p.add_argument("--scope", choices=("kernel", "linear"), default="linear")
     p.add_argument("--quant", choices=("mxfp8", "blockscale"), default="mxfp8")
-    p.add_argument("--impl", default="auto,gemm256,gemm128,sglang",
-                   help="comma-separated: " + ", ".join(IMPLS))
+    p.add_argument(
+        "--impl",
+        default="auto,gemm256,gemm128,sglang",
+        help="comma-separated: " + ", ".join(IMPLS),
+    )
     p.add_argument("--reps", type=int, default=32)
-    p.add_argument("--tol", type=float, default=2.4e-3,
-                   help="rel_l2 above this marks the row invalid")
+    p.add_argument(
+        "--tol",
+        type=float,
+        default=2.4e-3,
+        help="rel_l2 above this marks the row invalid",
+    )
     p.add_argument("--json-out", default="gemm.jsonl")
     args = p.parse_args()
 
@@ -304,8 +361,6 @@ def main() -> int:
 
     if args.quant == "blockscale" and ("sglang" in impls or args.scope == "linear"):
         p.error("--quant blockscale is mori-only and kernel-scope only")
-    # `linear` means "quantise a bf16 activation", which is SGLang's quantiser.
-    needs_sglang = "sglang" in impls or args.scope == "linear"
 
     vram_before = timing.vram_used()
     if args.quant == "mxfp8":
@@ -315,8 +370,13 @@ def main() -> int:
     x = (torch.randn(m, k, device="cuda") / 8).to(torch.bfloat16)
 
     common = {
-        "bench": "gemm", "scope": args.scope, "quant": args.quant,
-        "shape": args.shape, "n": n, "k": k, "m": m,
+        "bench": "gemm",
+        "scope": args.scope,
+        "quant": args.quant,
+        "shape": args.shape,
+        "n": n,
+        "k": k,
+        "m": m,
         "input": "bf16" if args.scope == "linear" else "fp8",
         "includes_quant": args.scope == "linear",
         "timing": "amortized-graph-cold-hot",
@@ -324,8 +384,7 @@ def main() -> int:
     rows, ref, failures = [], None, 0
 
     # SGLang first when present, so it is the reference the rest are scored on.
-    order = ([i for i in impls if i == "sglang"]
-             + [i for i in impls if i != "sglang"])
+    order = [i for i in impls if i == "sglang"] + [i for i in impls if i != "sglang"]
     for impl in order:
         row = dict(common, impl=impl)
         try:
@@ -335,6 +394,7 @@ def main() -> int:
                 from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
                     native_route_plan,
                 )
+
                 row["route"] = native_route_plan(
                     m, n, k, ops["layer"].weight_bf16 is not None, False
                 )
@@ -380,9 +440,12 @@ def main() -> int:
 
     with open(args.json_out, "a") as f:
         for r in rows:
-            f.write(json.dumps(
-                dict(r, vram_before=vram_before, vram_after=timing.vram_used())
-            ) + "\n")
+            f.write(
+                json.dumps(
+                    dict(r, vram_before=vram_before, vram_after=timing.vram_used())
+                )
+                + "\n"
+            )
     # A benchmark that fails and exits 0 is how a broken sweep looks green.
     return 1 if failures else 0
 
