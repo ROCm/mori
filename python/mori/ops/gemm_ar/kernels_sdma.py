@@ -519,8 +519,7 @@ def build_sdma_phases(
                                  42us in total, so it can never be repaid.
           publish="writethrough" store with sc0+sc1 so the bytes never stop in
                                  L1 or L2, and the waitcnt above *is* the
-                                 release. Same trick as the GEMM's
-                                 _WriteThroughStoreC under fence="writethrough".
+                                 release.
 
         Write-through is free here, measured on its own: applying that store
         policy to the plain unfused reduce moves it 1153.4 -> 1148.7us, i.e.
@@ -625,8 +624,6 @@ def build_sdma_phases(
             #                  charged once per block per band.
             #   "writethrough" store with sc0+sc1 so they never stop in L1 or L2,
             #                  and the waitcnt above is then the whole release.
-            #                  Same trick as the GEMM's _WriteThroughStoreC
-            #                  under fence="writethrough".
             #
             # Writethrough should be the right shape here: this output is
             # written once and nothing local reads it again before the gather,

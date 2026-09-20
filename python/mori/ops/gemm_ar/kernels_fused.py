@@ -42,8 +42,7 @@ One monotonic counter per (destination, chunk) in the window
 (``cfg.counter_off``). Every block, after its four ``store_c.store`` calls::
 
     s_waitcnt vmcnt(0) ; s_barrier       -- this block's C tile has retired
-    __threadfence_system()               -- ...and is visible to the copy engine
-    thread 0: prev = atomic_add(counter[dest][chunk], 1)
+    thread 0: prev = atomic_add_acq_rel(counter[dest][chunk], 1)
     if (prev + 1) % tiles_per_chunk == 0 -- I am the last tile of that chunk
         sdma.put(dest, ...)              -- fire and forget, no quiet
 
@@ -96,7 +95,6 @@ from ._compat import (
     buffer_store,
     create_buffer_resource_from_addr,
     i32_type,
-    release_fence,
     signal_ptr,
     wave_uniform_i64,
 )
@@ -138,34 +136,6 @@ def _acquire_peer_lock(lock_ptr):
         fx.rocdl.s_sleep(1)
         nxt = atomic_xchg_u32(lock_ptr, 1)
         scf.YieldOp([nxt])
-
-
-class _RawWriteThroughStoreC(StoreC):
-    """``StoreC`` whose C stores really do bypass L1 *and* L2.
-
-    ``StoreC`` stores through a copy atom whose ``cache_modifier`` is a two-value
-    enum (0=cached, 2=nt), so ``sc0|sc1`` is not expressible there -- asking for
-    it emits a plain ``sc0`` and leaves the line dirty in L2, which is why the
-    earlier ``--fence writethrough`` probe measured nothing. This goes around the
-    atom to ``raw_ptr_buffer_store``, whose ``aux`` operand is the real cache
-    policy, so the data reaches memory at the store and the per-block
-    ``buffer_wbl2`` release becomes unnecessary.
-
-    The descriptor is built from the window rather than from the ``C`` argument
-    because in the fused kernel they are the same bytes: C *is* the all-reduce's
-    input region. ``num_records`` still bounds it, so ``store``'s out-of-bounds
-    index for masked columns is dropped exactly as before.
-
-    Deliberately *not* coalesced: the point of this variant is to find out
-    whether the coalescing rewrite is needed before paying for it.
-    """
-
-    def __init__(self, *args, c_rsrc=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._c_rsrc = c_rsrc
-
-    def _store_bf16(self, value_bf16, c_index):
-        buffer_store(value_bf16, self._c_rsrc, c_index, cache_modifier=CM_SC0_SC1)
 
 
 class _SwappedMfma:
@@ -736,38 +706,6 @@ class _PeerDirectStoreC(StoreC):
         buffer_store(value_bf16, self._peer_rsrc, c_index - self._elem_base)
 
 
-class _NonTemporalStoreC(StoreC):
-    """``StoreC`` with non-temporal C stores (the copy atom's only other mode).
-
-    Probes whether ``buffer_wbl2`` gets cheaper when the lines it is asked to
-    flush have already been evicted. The atom's ``cache_modifier`` is a two-value
-    enum, 0=cached / 2=nt -- it is *not* the aux bitmask that
-    ``raw_ptr_buffer_store`` takes, so sc0|sc1 cannot be requested this way.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.out_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy16b(2), fx.BFloat16)
-
-
-class _WriteThroughStoreC(StoreC):
-    """``StoreC`` whose C stores bypass L1 and L2 instead of being written back.
-
-    The only change is the copy atom's cache modifier. It exists because a
-    per-block release fence is quadratic: ``buffer_wbl2`` flushes the *whole* L2,
-    so block k redundantly writes back every tile blocks 1..k-1 already wrote,
-    448 times over. Writing C through in the first place makes the release free --
-    ``s_waitcnt vmcnt(0)`` is then all the copy engine needs -- and adds no
-    traffic, since C has to reach memory regardless.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.out_atom_1 = fx.make_copy_atom(
-            fx.rocdl.BufferCopy16b(CM_SC0_SC1), fx.BFloat16
-        )
-
-
 BLOCK_K = 128
 
 
@@ -794,7 +732,6 @@ def compile_fused_gemm_scatter(
     peer_uncached: bool = False,
     direct_fence: str = "leader",
     transport: str = "sdma",
-    fence: str = "none",
     emit_put: bool = True,
     atomic_order: str = "acq_rel",
 ):
@@ -955,23 +892,7 @@ def compile_fused_gemm_scatter(
     tiles_per_chunk = m_tiles_per_chunk * n_blocks_const
     chunk_bytes = cfg.slice_bytes // chunks
 
-    if fence not in (
-        "all",
-        "agent",
-        "agent-leader",
-        "nt-agent",
-        "leader",
-        "none",
-        "writethrough",
-        "wt-agent",
-        "raw-wt",
-        "raw-wt-agent",
-        "raw-wt-leader",
-    ):
-        raise ValueError(
-            f"fence must be all/agent/leader/none/writethrough/wt-agent, got {fence!r}"
-        )
-    _kname_tag = f"{'B' if blockscale else ''}{'S' if swap_ab else ''}{'P' if permlane else ''}{'T' if lane_transpose else ''}{'H' if hoist_scales else ''}{'U' if peer_uncached else ''}{direct_fence[0]}{'W' if store_probe else ''}c{chunks}{'r' if rotated else 'l'}q{sdma_queues}{'' if n_stripe == 1 else f's{n_stripe}'}{fence[0]}"
+    _kname_tag = f"{'B' if blockscale else ''}{'S' if swap_ab else ''}{'P' if permlane else ''}{'T' if lane_transpose else ''}{'H' if hoist_scales else ''}{'U' if peer_uncached else ''}{direct_fence[0]}{'W' if store_probe else ''}c{chunks}{'r' if rotated else 'l'}q{sdma_queues}{'' if n_stripe == 1 else f's{n_stripe}'}"
     counter_off = cfg.counter_off
     lock_off = cfg.lock_off
     in_off = cfg.input_off
@@ -1186,29 +1107,6 @@ def compile_fused_gemm_scatter(
                     num_records_bytes=cfg.slice_bytes,
                 ),
                 elem_base=dest_blk * fx.Int32(slice_rows) * c_n,
-            )
-        elif const_expr(fence in ("writethrough", "wt-agent")):
-            store_c = _WriteThroughStoreC(
-                A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B
-            )
-        elif const_expr(fence in ("raw-wt", "raw-wt-agent", "raw-wt-leader")):
-            store_c = _RawWriteThroughStoreC(
-                A_scale,
-                B_scale,
-                C,
-                c_m,
-                c_n,
-                mfma.idx,
-                N_TILES_A,
-                N_TILES_B,
-                c_rsrc=create_buffer_resource_from_addr(
-                    fx.Int64(w_pre.lsa_ptr(rank, in_off)),
-                    num_records_bytes=cfg.nbytes,
-                ),
-            )
-        elif const_expr(fence == "nt-agent"):
-            store_c = _NonTemporalStoreC(
-                A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B
             )
         else:
             store_c = StoreC(
@@ -1469,21 +1367,16 @@ def compile_fused_gemm_scatter(
             # retired. `wait_barrier` is aiter's own `s_waitcnt vmcnt(0);
             # s_barrier` pair, reused so the tail matches the main loop's idiom.
             wait_barrier(0)
-            # Then publish them. This fence is not optional: dropping it -- on the
-            # theory that the copy engine reads through our own L2 -- still
-            # validates on 2 ranks but takes relL2 from 2.35e-3 to 3.76e-3 on 8,
-            # i.e. the engine reads some tiles stale. Every lane fences, which is
-            # the form cco_device_wrapper.cpp:105-111 documents for producer
-            # lanes; leaderOnly orders thread 0 only and is explicitly not a
-            # substitute for a release issued by every producer.
-            if const_expr(fence == "all"):
-                raw_cco.cco_system_fence(fx.Int32(0))
-            elif const_expr(fence == "leader"):
-                raw_cco.cco_system_fence(fx.Int32(1))
-            elif const_expr(fence in ("agent", "wt-agent", "nt-agent", "raw-wt-agent")):
-                release_fence("agent")
-            # "writethrough": nothing to do -- the stores already went to memory,
-            # and wait_barrier(0) above retired them.
+            # No explicit release here, because the counter below already is one.
+            # The `acq_rel` atomic_add emits its own `buffer_wbl2`/`buffer_inv`
+            # pair -- on thread 0 only -- so an added `__threadfence_system` does
+            # the same work again, per lane. gcnasm's `opus_chunk_sdma_submit`
+            # has the same shape and no fence, which is what pointed at this.
+            #
+            # Measured at m=16384 blockscale on 8 ranks, twice each: no fence
+            # 1143.5/1144.8us, agent 1797.0/1798.5, system 1936.1/1937.5 -- all
+            # three at relL2 2.350e-3. The fences cost 650-790us and moved
+            # accuracy by nothing.
 
             # Both bases are rank-local and constant-offset, so they are the same
             # for every thread; taking them here rather than inside the `if` also
@@ -1493,12 +1386,6 @@ def compile_fused_gemm_scatter(
             lock_base = fx.Int64(w_pre.lsa_ptr(rank, lock_off))
             sdma = cco.DevComm(dev_comm).sdma()
             if fx.thread_idx.x == 0:
-                # One release per *block* instead of per wave. cco's leaderOnly
-                # form was already shown incorrect, but that went through an
-                # extern wrapper; emitting the fence inline rules out the
-                # compiler having sunk it past the atomic.
-                if const_expr(fence in ("agent-leader", "raw-wt-leader")):
-                    release_fence("agent")
                 dest = block_m // fx.Int32(m_tiles_per_peer)
                 chunk = (block_m % fx.Int32(m_tiles_per_peer)) // fx.Int32(
                     m_tiles_per_chunk
