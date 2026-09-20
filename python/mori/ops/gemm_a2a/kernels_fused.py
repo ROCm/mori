@@ -121,6 +121,11 @@ from .layout import DEFAULT_BLOCK_M, DEFAULT_BLOCK_N  # noqa: F401
 BLOCK_K = 128
 
 
+def direct_lsa_probe(transport: str) -> bool:
+    """``transport == "lsa"``, named so the validation above reads as a claim."""
+    return transport == "lsa"
+
+
 class _A2aPeerStoreC(_PermlaneStoreC):
     """``_PermlaneStoreC`` writing into the destination's compact slab.
 
@@ -148,12 +153,19 @@ class _A2aPeerStoreC(_PermlaneStoreC):
                 fx.make_layout(1, 1),
             )
 
-    def store(self, c_frag, base_row, base_col):
+    def store(self, c_frag, base_row, base_col, scale_row=None):
+        """``base_row`` addresses the store; ``scale_row`` indexes A's scale.
+
+        They differ on the copy path, where the destination is folded into the
+        row index to keep one static descriptor: the store wants
+        ``dest*M + row`` and the A scale still wants ``row``. Passing one value
+        for both is the bug this signature exists to make impossible.
+        """
         self._emit(
             c_frag,
             base_row,
             base_col - self._dest_col_base,
-            self._a_scales(base_row),
+            self._a_scales(base_row if scale_row is None else scale_row),
             self._b_scales(base_col),
         )
 
@@ -232,6 +244,8 @@ def compile_fused_gemm_a2a(
     fuse: bool = True,
     chunks: int = 1,
     sdma_queues: int = 1,
+    self_to_recv: bool = True,
+    staging_store: str = "buffer",
 ):
     """The GEMM with its C stored straight into the destinations' windows.
 
@@ -262,6 +276,13 @@ def compile_fused_gemm_a2a(
             "the staging GEMM for the split path; an unfused LSA GEMM is just "
             "compile_gemm_local"
         )
+    if staging_store not in ("buffer", "copy"):
+        raise ValueError(f"staging_store must be buffer or copy, got {staging_store!r}")
+    if staging_store == "copy" and direct_lsa_probe(transport):
+        raise ValueError(
+            "staging_store only applies to transport='sdma'; the LSA path stores "
+            "into a peer, which a copy atom's static descriptor cannot address"
+        )
     if quant not in ("ptpc", "blockscale"):
         raise ValueError(f"quant must be ptpc or blockscale, got {quant!r}")
     if (BLOCK_M, BLOCK_N) != (cfg.block_m, cfg.block_n):
@@ -274,7 +295,7 @@ def compile_fused_gemm_a2a(
     blockscale = quant == "blockscale"
 
     ws = cfg.world_size
-    N = cfg.n
+    M, N = cfg.m, cfg.n
     shard_n = cfg.shard_n
     n_blocks_per_peer = cfg.n_blocks_per_peer
     my_recv_slot = cfg.recv_slot_off(rank)
@@ -316,7 +337,7 @@ def compile_fused_gemm_a2a(
         f"mori_a2a_{transport if fuse else 'stage'}_8w_"
         f"{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_k{K}_"
         f"{'B' if blockscale else 'P'}{'r' if rotated else 'l'}s{n_stripe}"
-        f"c{chunks}q{sdma_queues}_r{rank}"
+        f"c{chunks}q{sdma_queues}{'S' if self_to_recv else 'A'}_r{rank}"
     )
 
     @fx.struct
@@ -427,44 +448,82 @@ def compile_fused_gemm_a2a(
         # SDMA path: it is a local resource. Renaming it in gemm_ar to suit this
         # op would be the tail wagging the dog.)
         dest_blk = block_n // fx.Int32(n_blocks_per_peer)
+        # `copy` folds the destination into the row index instead of into the
+        # base address, so one static descriptor covers the whole staging region
+        # and the inherited copy-atom store applies -- the same path gemm-only
+        # takes. `buffer` builds a per-block descriptor at the slab's base and
+        # stores through it. They write identical bytes; the question this knob
+        # exists to answer is what the difference costs.
+        # Plain Python bool, and every `if` on it below is written as
+        # `const_expr(via_copy)`: FlyDSL's rewriter looks for that call
+        # *syntactically*, so `if via_copy:` would be lowered to an scf.if
+        # and the names it binds would not survive the branch.
+        via_copy = not direct_lsa and staging_store == "copy"
         if const_expr(direct_lsa):
             store_base = wave_uniform_i64(w_pre.lsa_ptr(dest_blk, my_recv_slot))
         else:
-            # `dest == rank` goes straight into my own recv slot rather than
-            # into staging. Nothing ever pushes that slab -- the put loop skips
-            # self, because a copy engine round trip to our own memory would be
-            # pure cost -- so staging it would strand it. Leaving it out is not
-            # a visible failure either: every *remote* slab still arrives
-            # correct, so the transport looks fine and only one eighth of the
-            # answer is missing. That is what it did.
+            # `dest == rank` normally goes straight into my own recv slot
+            # rather than into staging. Nothing ever pushes that slab -- the put
+            # loop skips self, because a copy engine round trip to our own
+            # memory would be pure cost -- so staging it would strand it.
+            # Leaving it out is not a visible failure either: every *remote*
+            # slab still arrives correct, so the transport looks fine and only
+            # one eighth of the answer is missing. That is what it did.
+            #
+            # `self_to_recv=False` turns the optimisation off, which a transport
+            # that moves *all* world chunks uniformly needs: RCCL's
+            # all_to_all_single takes one input tensor covering every
+            # destination, self included, and would read a hole where this
+            # rank's own chunk should be.
             win_base = fx.Int64(w_pre.lsa_ptr(rank, 0))
             staged_at = fx.Int64(staging_off) + fx.Int64(dest_blk) * fx.Int64(
                 cap_slab_bytes
             )
-            store_base = wave_uniform_i64(
-                win_base
-                + arith.select(
-                    dest_blk == fx.Int32(rank),
-                    fx.Int64(my_recv_slot),
-                    staged_at,
+            if const_expr(self_to_recv):
+                store_base = wave_uniform_i64(
+                    win_base
+                    + arith.select(
+                        dest_blk == fx.Int32(rank),
+                        fx.Int64(my_recv_slot),
+                        staged_at,
+                    )
                 )
+            else:
+                store_base = wave_uniform_i64(win_base + staged_at)
+        if const_expr(via_copy):
+            # C is the staging tensor, the descriptor spans every slab, and the
+            # destination rides in the row index -- so this is gemm-only's own
+            # copy-atom store with a different c_cols.
+            store_c = _A2aPeerStoreC(
+                A_scale,
+                B_scale,
+                C,
+                fx.Int32(2 * ws * M),
+                fx.Int32(shard_n),
+                mfma.idx,
+                N_TILES_A,
+                N_TILES_B,
+                dest_col_base=dest_blk * fx.Int32(shard_n),
+                b_scale=B_scale,
+                n=N,
             )
-        store_c = _A2aPeerStoreC(
-            A_scale,
-            B_scale,
-            C,
-            c_m,
-            fx.Int32(shard_n),
-            mfma.idx,
-            N_TILES_A,
-            N_TILES_B,
-            peer_rsrc=create_buffer_resource_from_addr(
-                store_base, num_records_bytes=slab_bytes
-            ),
-            dest_col_base=dest_blk * fx.Int32(shard_n),
-            b_scale=B_scale,
-            n=N,
-        )
+        else:
+            store_c = _A2aPeerStoreC(
+                A_scale,
+                B_scale,
+                C,
+                c_m,
+                fx.Int32(shard_n),
+                mfma.idx,
+                N_TILES_A,
+                N_TILES_B,
+                peer_rsrc=create_buffer_resource_from_addr(
+                    store_base, num_records_bytes=slab_bytes
+                ),
+                dest_col_base=dest_blk * fx.Int32(shard_n),
+                b_scale=B_scale,
+                n=N,
+            )
 
         # Bound unconditionally: the kernel body is re-parsed by FlyDSL's AST
         # rewriter, and names that only exist inside a branch are not reliably
@@ -629,6 +688,24 @@ def compile_fused_gemm_a2a(
         wave_m_offset = wave_m * (N_TILES_A * 16)
         base_row = block_m * BLOCK_M + wave_m_offset
         base_col = block_n * BLOCK_N + wave_n_offset
+        if const_expr(via_copy):
+            # recv follows staging in the window, so one descriptor spans both:
+            # rows [0, world*M) are the staging slabs and [world*M, 2*world*M)
+            # the recv ones. That keeps the self-to-recv shortcut -- which a
+            # per-block base address got by selecting between two addresses --
+            # available to a *static* descriptor, by selecting between two row
+            # offsets instead.
+            #
+            # A's scale is indexed by row too, and must stay global; store()
+            # takes it from a separate argument for exactly this reason.
+            slab_i = arith.select(
+                dest_blk == fx.Int32(rank),
+                fx.Int32(ws + rank) if const_expr(self_to_recv) else dest_blk,
+                dest_blk,
+            )
+            base_row_store = base_row + slab_i * fx.Int32(M)
+        else:
+            base_row_store = base_row
 
         # Close the half-wave barrier the prologue opened. Its
         # `if wave_m == 1: s_barrier()` gives waves 4-7 one extra barrier, and
@@ -639,10 +716,22 @@ def compile_fused_gemm_a2a(
         if wave_m == 0:
             rocdl.s_barrier()
 
-        store_c.store(c00_frag, base_row + 0, base_col + 0)
-        store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
-        store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
-        store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
+        store_c.store(c00_frag, base_row_store + 0, base_col + 0, base_row + 0)
+        store_c.store(
+            c01_frag, base_row_store + 0, base_col + LDS_BLOCK_N, base_row + 0
+        )
+        store_c.store(
+            c10_frag,
+            base_row_store + LDS_BLOCK_M,
+            base_col + 0,
+            base_row + LDS_BLOCK_M,
+        )
+        store_c.store(
+            c11_frag,
+            base_row_store + LDS_BLOCK_M,
+            base_col + LDS_BLOCK_N,
+            base_row + LDS_BLOCK_M,
+        )
         # ---- end pinned copy ----
 
         if const_expr(direct_lsa):
@@ -654,13 +743,25 @@ def compile_fused_gemm_a2a(
             raw_cco.cco_system_fence(fx.Int32(0))
         else:
             # Retire this block's stores into the staging slab, agree block-wide
-            # that they are retired, then publish them to the copy engine. The
-            # fence is not optional even though the engine reads memory this CU
-            # wrote: gemm_ar measured dropping it as still validating on 2 ranks
-            # while taking relL2 from 2.35e-3 to 3.76e-3 on 8, i.e. the engine
-            # reads some tiles stale.
+            # that they are retired, then publish them -- but only when this
+            # kernel is the thing that publishes.
+            #
+            # The fence is a *whole-L2* writeback issued by every lane of every
+            # block, so block k redundantly writes back every tile blocks
+            # 1..k-1 already wrote. At 1152 blocks that is quadratic and it is
+            # the single most expensive line in this epilogue: gating it on
+            # `fuse` is what took the unfused staging GEMM from 458 to ~320us,
+            # level with the plain one.
+            #
+            # With `fuse=False` nothing is published here at all -- the separate
+            # scatter kernel issues the puts and does its own ordering -- so the
+            # fence has no one to release to. With `fuse=True` it is not
+            # optional: gemm_ar measured dropping it as still validating on 2
+            # ranks while taking relL2 from 2.35e-3 to 3.76e-3 on 8, i.e. the
+            # copy engine reads some tiles stale.
             wait_barrier(0)
-            raw_cco.cco_system_fence(fx.Int32(0))
+            if const_expr(fuse):
+                raw_cco.cco_system_fence(fx.Int32(0))
 
             # Both bases are rank-local and constant-offset, so they are the same
             # for every thread. Taking them here rather than inside the `if` also
@@ -669,7 +770,7 @@ def compile_fused_gemm_a2a(
             ctr_base = fx.Int64(w_pre.lsa_ptr(rank, counter_off))
             lock_base = fx.Int64(w_pre.lsa_ptr(rank, lock_off))
             sdma = cco.DevComm(dev_comm).sdma()
-            if fx.thread_idx.x == 0:
+            if fx.thread_idx.x == 0 and const_expr(fuse):
                 # dest is the *column* block's owner and chunk is a run of row
                 # tiles, which is the transpose of gemm_ar's (dest from rows,
                 # chunk from... rows as well). Chunking along M is what keeps a

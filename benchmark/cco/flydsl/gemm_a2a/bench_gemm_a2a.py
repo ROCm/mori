@@ -22,6 +22,8 @@
 """fp8 GEMM + all-to-all on cco, by mode.
 
     gemm-only    the GEMM alone, to size the ceiling
+    gemm-staging the staging GEMM alone -- what split-sdma/rccl subtract
+    gemm-to-window  gemm-only's kernel, writing the window instead of a tensor
     split-lsa    gemm(); then the standalone LSA all-to-all
     split-sdma   gemm(); then staged SDMA pushes            (not yet)
     fused-lsa    C stored straight into the peers            (not yet)
@@ -76,7 +78,21 @@ from mori.ops.gemm_a2a.kernels_fused import (
     compile_gemm_local,
 )
 
-MODES = ("gemm-only", "split-lsa", "fused-lsa", "split-sdma", "fused-sdma")
+#: gemm-staging exists to make the split-sdma subtraction honest. Its GEMM
+#: writes [dst][M][shard_n] and is a *different kernel* from gemm-only's
+#: [M,N] one, so "split-sdma minus gemm-only" silently charges the transfer
+#: for however much the two GEMMs differ. split-lsa has no such problem --
+#: its GEMM is gemm-only's, literally.
+MODES = (
+    "gemm-only",
+    "gemm-staging",
+    "split-lsa",
+    "fused-lsa",
+    "split-sdma",
+    "fused-sdma",
+    "split-rccl",
+    "gemm-to-window",
+)
 NOT_YET = ()
 
 #: fp8 block-scale group size along K. Fixed by the model's quantiser and by the
@@ -88,7 +104,10 @@ def _setup_distributed():
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
     if not dist.is_initialized():
-        dist.init_process_group(backend="cpu:gloo")
+        # gloo for the object broadcasts the bootstrap needs, nccl (RCCL here)
+        # for the collective baseline. Asking for both up front is cheaper than
+        # a second group later and costs nothing when the baseline is not run.
+        dist.init_process_group(backend="cpu:gloo,cuda:nccl")
     rank, world_size = dist.get_rank(), dist.get_world_size()
     payload = [bytes(Communicator.get_unique_id()) if rank == 0 else None]
     dist.broadcast_object_list(payload, src=0)
@@ -226,6 +245,14 @@ def run(args) -> int:
             print(f"--mode {args.mode} is not implemented yet", file=sys.stderr)
         return 2
 
+    # All three want the [dst][M][shard_n] slab; only two of them push it
+    # with the copy engine.
+    needs_staging = args.mode in (
+        "split-sdma",
+        "fused-sdma",
+        "gemm-staging",
+        "split-rccl",
+    )
     needs_sdma = args.mode in ("split-sdma", "fused-sdma")
     # A chunk is a run of row tiles; the count has to divide them, and the
     # request is rounded down rather than rejected so a sweep stays usable.
@@ -236,7 +263,7 @@ def run(args) -> int:
         n=args.n,
         block_m=args.block_m,
         block_n=args.block_n,
-        staged=needs_sdma,
+        staged=needs_staging,
         counter_chunks=chunks,
         force_blocks=args.copy_blocks or None,
     )
@@ -254,7 +281,16 @@ def run(args) -> int:
             (world_size * args.m, cfg.shard_n),
             torch.bfloat16,
         )
-        c = torch.empty(args.m, args.n, device="cuda", dtype=torch.bfloat16)
+        if args.mode == "gemm-to-window":
+            # The control that separates "the staging GEMM's address map is
+            # slower" from "writing cco's window is slower". recv is exactly
+            # M*N*2 bytes, so gemm-only's kernel can target it unchanged: same
+            # instructions, same address map, same descriptor size -- only the
+            # memory differs. Its contents are then meaningless, so this mode
+            # does not validate.
+            c = from_gpu_ptr(mem.ptr + cfg.recv_off, (args.m, args.n), torch.bfloat16)
+        else:
+            c = torch.empty(args.m, args.n, device="cuda", dtype=torch.bfloat16)
         torch.cuda.synchronize()
 
         reqs = CCODevCommRequirements()
@@ -265,8 +301,8 @@ def run(args) -> int:
             reqs.sdma_queue_count = args.sdma_queues
         dc = comm.create_dev_comm(reqs)
 
-        if needs_sdma:
-            # The same kernel for both SDMA modes, differing only in whether the
+        if needs_staging:
+            # The same kernel for every staging mode, differing only in whether the
             # epilogue posts the puts. That is the point of a split baseline:
             # one changed thing, not two.
             gemm = compile_fused_gemm_a2a(
@@ -284,6 +320,11 @@ def run(args) -> int:
                 fuse=args.mode == "fused-sdma",
                 chunks=chunks,
                 sdma_queues=args.sdma_queues,
+                # RCCL takes one input covering every destination,
+                # self included, so the self-to-recv shortcut has to
+                # be off or it reads a hole.
+                self_to_recv=args.mode != "split-rccl",
+                staging_store=args.staging_store,
             )
         elif args.mode == "fused-lsa":
             # The epilogue writes into the peers, so there is no separate
@@ -313,9 +354,21 @@ def run(args) -> int:
                 swap_ab=args.swap_ab,
                 permlane=args.permlane,
             )
+        if needs_staging and args.staging_store == "copy":
+            # The copy path's descriptor is the staging region, so that is what
+            # the kernel's C argument has to be.
+            # staging and recv, as one contiguous descriptor: the store
+            # selects between them by row offset rather than by base address.
+            c_for_gemm = from_gpu_ptr(
+                mem.ptr + cfg.staging_off,
+                (2 * world_size * args.m, cfg.shard_n),
+                torch.bfloat16,
+            )
+        else:
+            c_for_gemm = c
         a_i8 = a.contiguous().view(torch.int8).view(-1)
         b_i8 = b_shuf.contiguous().view(torch.int8).view(-1)
-        c_flat = c.view(-1)
+        c_flat = c_for_gemm.reshape(-1)
         # The kernel indexes both scale buffers linearly, so it needs the
         # *physical* element order. sa is logically [M, K/128] but column-major,
         # so its physical order is sa.t().
@@ -325,7 +378,11 @@ def run(args) -> int:
         else:
             sa_arg, sb_arg = sa, sb
 
-        copy = build_lsa_a2a(cfg, rank) if args.mode == "split-lsa" else None
+        copy = (
+            build_lsa_a2a(cfg, rank, uncached=args.lsa_uncached)
+            if args.mode == "split-lsa"
+            else None
+        )
         # fused-lsa has no collective kernel -- the epilogue already wrote into
         # the peers -- but it still needs the agreement that every peer
         # *finished*, or a rank reads a slab a peer is still writing.
@@ -335,6 +392,16 @@ def run(args) -> int:
             if needs_sdma
             else None
         )
+        staging = (
+            from_gpu_ptr(
+                mem.ptr + cfg.staging_off,
+                (world_size * args.m, cfg.shard_n),
+                torch.bfloat16,
+            )
+            if needs_staging
+            else None
+        )
+        rccl = args.mode == "split-rccl"
         c_ptr = c.data_ptr()
 
         def once():
@@ -355,6 +422,12 @@ def run(args) -> int:
                 copy(c_ptr, dc.ptr, win.handle, stream=stream)
             if barrier is not None:
                 barrier(dc.ptr, win.handle, stream=stream)
+            if rccl:
+                # Same bytes, same layout, same GEMM as split-sdma: only the
+                # transport differs. all_to_all_single splits the input along
+                # dim 0 into world chunks and gives back the concatenation of
+                # what each rank sent, which is exactly staging -> recv.
+                dist.all_to_all_single(recv, staging)
             if parts is not None:
                 # fused-sdma: the puts left from the epilogue, so only the drain
                 # runs. split-sdma: the full scatter.
@@ -369,7 +442,33 @@ def run(args) -> int:
         rel_l2 = float("nan")
         validated = True
         if not args.skip_validation:
-            if args.mode == "gemm-only":
+            if args.mode == "gemm-to-window":
+                # Writing [M,N] over the recv region does not produce the
+                # all-to-all's answer, and is not meant to. Only the time
+                # is of interest.
+                rel_l2, validated = float("nan"), True
+            elif args.mode == "gemm-staging":
+                # Nothing is transferred, so recv is meaningless except for this
+                # rank's own block, which the GEMM routes there directly. Check
+                # that *and* the remote destinations' staging slabs: a timing of
+                # a kernel that is not doing the work is worth nothing, and the
+                # whole point of this mode is to be subtracted from another.
+                ref = reference_gemm(a, b, sa, sb, args.quant)
+                worst = 0.0
+                for d in range(world_size):
+                    cols = slice(d * cfg.shard_n, (d + 1) * cfg.shard_n)
+                    want = ref[:, cols]
+                    if d == rank:
+                        got = recv[rank * args.m : (rank + 1) * args.m]
+                    else:
+                        got = staging[d * args.m : (d + 1) * args.m]
+                    den = want.norm().item()
+                    worst = max(
+                        worst, (got.float() - want).norm().item() / den if den else 0.0
+                    )
+                rel_l2, validated = worst, worst < args.tolerance
+                del ref
+            elif args.mode == "gemm-only":
                 # The GEMM on its own. Without this control a GEMM bug reads as
                 # a transport bug: every other mode validates what arrived, so a
                 # corrupt C and a corrupt copy are indistinguishable.
@@ -432,6 +531,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--n-stripe", type=int, default=1)
     p.add_argument("--chunks", type=int, default=1)
     p.add_argument("--copy-blocks", type=int, default=0)
+    p.add_argument(
+        "--lsa-uncached", action=argparse.BooleanOptionalAction, default=True
+    )
+    p.add_argument("--staging-store", choices=("buffer", "copy"), default="buffer")
     p.add_argument("--sdma-queues", type=int, default=1)
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--iters", type=int, default=20)
