@@ -119,6 +119,15 @@ EPCOMPACT_LIB = os.environ.get("EPCOMPACT_LIB", "/tmp/libepcompact.so")
 # the payload move alone costs -- correctness needs it on, so EPCOMPACT_MAP=0 is
 # a timing probe only and CHECK must be 0 with it.
 EPCOMPACT_MAP = int(os.environ.get("EPCOMPACT_MAP", "1"))
+# Eliminate the expand pass. Combine gathers wherever dispDestTokIdMap points, so
+# rewriting that map from segmented slots to dense rows lets the expert leave its
+# output dense: 12 KB of int32 instead of a 24 MB + 24 MB scatter. compact STAYS --
+# the expert still needs dense rows to read.
+EPREMAP = int(os.environ.get("EPREMAP", "0"))
+# Do the payload move, the reverse-map compaction and the dest-map remap in ONE
+# launch. Separately the two index passes cost 1.58us and 1.77us for 20 KB, which is
+# launch overhead, not work. Requires EPREMAP.
+EPFUSE = int(os.environ.get("EPFUSE", "0"))
 # What the correctness gate covers, as one token. A bool cannot say it: fp4 and
 # an all-zero payload verify the dispatch bytes but never compare combine's
 # output, and a row claiming "verified" next to a combine_us nobody checked is
@@ -223,6 +232,30 @@ def main():
         for fn in (lib.ep_compact_idx, lib.ep_expand_idx):
             fn.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_int] * 3 + [ctypes.c_void_p]
             fn.restype = ctypes.c_int
+        lib.ep_remap.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        lib.ep_remap.restype = ctypes.c_int
+        lib.ep_compact_fused.argtypes = (
+            [ctypes.c_void_p] * 3
+            + [ctypes.c_int] * 4
+            + [ctypes.c_void_p] * 3
+            + [
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_void_p,
+            ]
+        )
+        lib.ep_compact_fused.restype = ctypes.c_int
 
         recv, comb = op.recv_tokens(), op.combine_in_view()
         cap = recv.shape[0]
@@ -239,6 +272,12 @@ def main():
         # 3584, but it is a real launch and is charged to the dispatch leg.
         d_map = torch.zeros(cap, dtype=torch.int32, device=f"cuda:{rank}")
         seg_map = [None]  # the routing handle's map tensor, bound per dispatch
+        # prefix[p] = sum_{j<rank} counts_p[j]: where MY rows start in peer p's dense
+        # run. A column sum over what other senders sent to p, so it is the one value
+        # the sender cannot compute locally -- see remap() and the README.
+        prefix = torch.zeros(world, dtype=torch.int32, device=f"cuda:{rank}")
+        dest_map = [None]  # the sender-side dispDestTokIdMap, bound per dispatch
+        flat_stride = cap  # EpFlatStride == EpMaxRecv
         if rank == 0:
             print(
                 f"# epcompact: cap={cap} stride={stride} "
@@ -256,6 +295,56 @@ def main():
                 world,
                 stride,
                 cap,
+                torch.cuda.current_stream().cuda_stream,
+            )
+
+        def build_prefix():
+            """One all_gather of `world` int32, off the timed path.
+
+            The routing is fixed across iterations here, so this is computed once
+            during priming. A real implementation cannot do that -- but it also does
+            not need a collective: every sender knows its own send-count row before
+            any payload moves, so the row can ride the existing signal path and land
+            well inside dispatch's ~13us inbound wait. What is NOT measured below is
+            that exchange; what is measured is the remap kernel it feeds.
+            """
+            c = counts.cpu()
+            got = [torch.zeros_like(c) for _ in range(world)]
+            dist.all_gather(got, c)
+            # C[p][j] = counts_p[j] = tokens sender j put on receiver p
+            C = torch.stack(got)
+            prefix.copy_(C[:, :rank].sum(1).to(torch.int32).to(prefix.device))
+
+        def remap(n_ent):
+            if dest_map[0] is None:
+                return
+            lib.ep_remap(
+                dest_map[0].data_ptr(),
+                n_ent,
+                prefix.data_ptr(),
+                rank,
+                world,
+                stride,
+                flat_stride,
+                torch.cuda.current_stream().cuda_stream,
+            )
+
+        def compact_fused(n_ent):
+            lib.ep_compact_fused(
+                recv.data_ptr(),
+                d_disp.data_ptr(),
+                counts.data_ptr(),
+                world,
+                stride,
+                drowB,
+                cap,
+                seg_map[0].data_ptr(),
+                d_map.data_ptr(),
+                dest_map[0].data_ptr(),
+                n_ent,
+                prefix.data_ptr(),
+                rank,
+                flat_stride,
                 torch.cuda.current_stream().cuda_stream,
             )
 
@@ -285,6 +374,11 @@ def main():
 
         return dict(
             compact_map=compact_map,
+            compact_fused=compact_fused,
+            remap=remap,
+            build_prefix=build_prefix,
+            destmap=dest_map,
+            prefix=prefix,
             dmap=d_map,
             segmap=seg_map,
             compact=compact,
@@ -380,10 +474,21 @@ def main():
         cp = _CP.get(id(op))
         if cp:
             cp["segmap"][0] = r.disp_tok_id_to_src_tok_id_local
-            cp["compact"]()
-            cp["compact_map"]()
+            cp["destmap"][0] = r.disp_dest_tok_id_map
+            if not EPFUSE:
+                cp["compact"]()
+                cp["compact_map"]()
         lockstep()  # the reverse map is only valid after this barrier
         total = int(total_t.cpu().item())
+        if cp and EPREMAP:
+            # Once per point, off the timed path: the routing is fixed here.
+            cp["build_prefix"]()
+        # remap is NOT idempotent -- the fused kernel already does it, so these are
+        # alternatives, never both.
+        if cp and EPFUSE:
+            cp["compact_fused"](ct * TOPK)
+        elif cp and EPREMAP:
+            cp["remap"](ct * TOPK)
         dispatch_bad = check_dispatch(op, total, r)
         stage = op.combine_in_view()[:total]
         # An all-zero payload reduces the identity-expert check to 0 == 0, which
@@ -398,8 +503,14 @@ def main():
             # variant A the live rows run to the end of the last segment.
             if checked:
                 src = cp["dense"][:total].view(cp["ddtype"])
-                cp["dcomb"][:total].copy_(src.to(cp["dcomb"].dtype))
-            cp["expand"]()
+                if EPREMAP:
+                    # The map now names dense rows, so the expert leaves its output
+                    # dense and nothing scatters it back.
+                    stage.copy_(src.to(stage.dtype))
+                else:
+                    cp["dcomb"][:total].copy_(src.to(cp["dcomb"].dtype))
+            if not EPREMAP:
+                cp["expand"]()
             base = op.combine_in_view()
         else:
             if checked:  # identity expert: stage the dispatched tokens unchanged
@@ -791,15 +902,21 @@ def main():
                 *_, r = op.dispatch(i_, w_, scales_arg(op), x_, return_routing=True)
                 if cp:
                     cp["segmap"][0] = r.disp_tok_id_to_src_tok_id_local
-                    cp["compact"]()
-                    cp["compact_map"]()
+                    cp["destmap"][0] = r.disp_dest_tok_id_map
+                    if EPFUSE:
+                        cp["compact_fused"](ct * TOPK)
+                    else:
+                        cp["compact"]()
+                        cp["compact_map"]()
+                        if EPREMAP:
+                            cp["remap"](ct * TOPK)
                 return r
 
             def c_leg(r):
                 """The combine leg: scatter the expert's output back to segmented
                 positions, then combine. The expert itself is identity here, as
                 on the stock path, so only the two transports are timed."""
-                if cp:
+                if cp and not EPREMAP:
                     cp["expand"]()
                 op.combine(buf, routing=r)
 

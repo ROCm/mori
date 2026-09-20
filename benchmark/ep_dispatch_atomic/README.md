@@ -94,31 +94,64 @@ last source. Two ways out, both provided:
 Measured **in flow**, inside `bench_ep.py`'s own in-graph GEV window, with `EPCOMPACT=1`
 running the production order `dispatch -> compact -> expert -> expand -> combine`.
 compact is charged to the dispatch leg, expand to the combine leg -- nothing downstream
-can start until compact lands, and combine cannot start until expand does.
+can start until compact lands, and combine cannot start until expand does. `EPREMAP=1`
+deletes expand; `EPFUSE=1` also folds the two index passes into the payload kernel.
 
 | fp4 | dispatch leg | combine leg | **pair** | vs stock | consumer |
 |---|---:|---:|---:|---:|---|
-| stock | 35.69 | 40.83 | **76.52us** | -- | unchanged |
+| stock | 35.78 | 40.75 | **76.53us** | -- | unchanged |
+| variant A + compaction, **expand** | 33.35 | 44.59 | 77.95us | +1.9% | unchanged |
+| variant A + compaction, **remap** | 34.81 | 40.73 | 75.53us | -1.3% | unchanged |
+| variant A + compaction, **remap, fused** | 31.87 | 40.77 | **72.64us** | **-5.1%** | unchanged |
 | variant A, segment-aware consumer | 26.32 | 41.21 | **67.53us** | **-11.8%** | must change |
-| variant A + compaction (drop-in) | 33.12 | 44.86 | **77.98us** | **+1.9%** | unchanged |
 
 | bf16 | dispatch leg | combine leg | **pair** | vs stock |
 |---|---:|---:|---:|---:|
-| stock | 51.23 | 41.00 | **92.22us** | -- |
-| variant A + compaction (drop-in) | 50.98 | 44.81 | **95.79us** | **+3.9%** |
+| stock | 51.68 | 41.13 | **92.81us** | -- |
+| variant A + compaction, expand | 51.80 | 45.00 | 96.80us | +4.3% |
+| variant A + compaction, **remap, fused** | 50.34 | 40.80 | **91.13us** | **-1.8%** |
 
-**Compaction does not pay for itself.** Variant A saves 9.37us on the fp4 dispatch leg
-and compaction gives back 10.46us, so the drop-in path is a net *regression*. The win is
-real but it only exists for a consumer that can walk the segments.
+Repeated in a second matched session: fp4 stock 75.96 against fused 72.63 (**-4.4%**),
+bf16 stock 91.59 against fused 91.06 (-0.6%).
 
-Cost of compaction in flow, by difference against variant A alone:
+So **fp4 is a consistent -4 to -5% win** and **bf16 is a wash** -- its two margins, -1.8%
+and -0.6%, straddle the run-to-run spread of the stock arm itself (92.81 then 91.59), so
+nothing there should be claimed. bf16 dispatch is 51us of payload against fp4's 26, and
+compaction's 5.55us is the same either way, so the proportional win has to be smaller.
 
-| step | leg | fp4 | note |
-|---|---|---:|---|
-| compact, payload | dispatch | 5.22 | 3584 B rows |
-| compact, reverse map | dispatch | 1.58 | 8 KB, a second launch -- almost all overhead |
-| expand, payload | combine | 3.66 | **14336 B rows: combine input is bf16, not fp4** |
-| | | **10.46us** | |
+Both pass with the bench's own unmodified layout-unaware identity expert. The combine leg
+comes back to exactly stock (40.77 against 40.75) -- expand leaves no residue.
+
+Getting there took two steps past the naive version:
+
+**1. Delete expand (-2.4us).** Combine gathers wherever `dispDestTokIdMap` points, so
+rewriting that map from segmented slots to dense rows lets the expert leave its output
+dense. 12 KB of int32 replaces a 24 MB read plus 24 MB write.
+
+**2. Fuse the three dispatch-side passes into one launch (-2.9us).** The payload move is
+6 MB and the two index moves are 20 KB, yet separately they cost 1.58us and 1.77us --
+launch overhead, not work. They share the prefix sum, and an fp4 row is 224 uint4 against
+256 threads, so the index work rides lanes the payload loop leaves idle.
+
+| | dispatch leg |
+|---|---:|
+| variant A, no compaction | 26.32 |
+| + payload compact | 31.40 |
+| + reverse-map compact (2nd launch) | 32.98 |
+| + dest-map remap (3rd launch) | 34.81 |
+| **all three fused into one launch** | **31.87** |
+
+What compaction now costs in flow is 5.55us on the dispatch leg and nothing on the
+combine leg, against variant A's 9.4us saving.
+
+**Not measured: the prefix exchange.** `prefix[pe] = sum_{j<rank} counts_pe[j]` is a
+column sum over what OTHER senders put on pe, so the sender cannot compute it locally.
+Here it is built once during priming with an `all_gather` of `world` int32, which is
+legitimate only because the routing is fixed across iterations. A real implementation
+needs it per batch -- but not a collective: every sender knows its own send-count row
+before any payload moves, so the row can ride the existing signal path and land well
+inside dispatch's ~13us inbound wait. That is `world^2` ints, 64 B at EP4. Believed
+free, **not demonstrated**.
 
 Two things an isolated benchmark got wrong, both found only by measuring in flow:
 
@@ -200,11 +233,15 @@ its own row before any payload moves. So it needs a counts-only exchange at the 
 dispatch: `world^2` ints, 64 B at EP4, and a rendezvous before slot assignment. This is
 what DeepEP's notify_dispatch does.
 
-The open question is whether that front rendezvous costs less than the 4.7us it saves.
-Today dispatch waits only at the END, so a front barrier converts skew that the inbound
-wait currently absorbs into skew paid twice. Estimated, if the rendezvous lands at 2-3us:
-dispatch ~29-30 against stock's 35.69, pair ~70-71 against 76.52, **-7 to -8% with a
-dense layout and no consumer change**. Not measured -- this is the next experiment.
+**Expand is now deleted** (`EPREMAP=1`, `ep_remap` / the fused kernel): the map rewrite
+is real and validated, and the numbers are in the table above. Combine returns to exactly
+its stock time.
+
+**Compact is deliberately kept.** Making `s_base[p]` the dense base would delete it too,
+but only by moving the prefix ahead of the payload write -- and the expert needs dense
+rows regardless, so the pass has to happen somewhere. Folding it into dispatch's tail is
+the remaining idea; it needs the counts BEFORE the transfer, which means a front
+rendezvous, and today dispatch waits only at the end. Not attempted.
 
 ## Correctness
 
@@ -219,6 +256,8 @@ dense layout and no consumer change**. Not measured -- this is the next experime
 | `bench_ep.py EPCOMPACT=1` fp4 | in-flow compaction, dispatch bytes via the **compacted** map | PASS, 1/1 |
 | `bench_ep.py EPCOMPACT=1` bf16 | in-flow compaction, **full identity-expert value check** | PASS, 1/1 |
 | `bench_ep.py EPCOMPACT=0` bf16 on variant A (control) | same, compaction off | **FAIL** as expected |
+| `bench_ep.py EPREMAP=1` fp4 / bf16 | expand deleted, combine gathers dense rows | PASS, 1/1 both |
+| `bench_ep.py EPFUSE=1` fp4 / bf16 | all three dispatch-side passes in one kernel | PASS, 1/1 both |
 
 The end-to-end criterion is `bench_ep.py`'s: with an identity expert,
 `combine[t] == U[t] * input[t]`, where `U[t]` is the number of distinct ranks token `t`
@@ -237,13 +276,13 @@ kernel still fails, so the gate has not simply gone blind.
 
 ## Not done
 
-- **The map move is a separate launch.** `ep_compact_idx` moves 8 KB and costs 1.58us,
-  nearly all of it launch and latency. It is the same permutation as the payload move
-  and belongs in the same kernel.
-- **Compaction is not worth shipping as-is.** At 10.46us against a 9.37us saving it is a
-  net loss on both dtypes. Either fuse it into the dispatch kernel's tail -- where the
-  rows are already in registers and the barrier has already been paid -- or give the
-  consumer the segment table and skip it entirely.
+- **The prefix exchange is modelled, not built.** It is computed once during priming
+  with an `all_gather`, which only works because the routing is fixed here. The argument
+  that it rides the signal path for free is untested, and it is the one thing standing
+  between this and a real integration.
+- **Compaction still costs 5.55us.** Folding the payload move into dispatch's tail would
+  remove it, but that needs the counts before the transfer -- a front rendezvous against
+  a kernel that currently waits only at the end.
 - The compaction kernels launch from Python via `ctypes`, not from inside the op.
 - The per-source counts ride on `args.scalesBuf`, which is only safe while
   `kCfg.scaleBytes == 0`. A real integration wants its own `EpArgs` field -- an ABI
@@ -292,9 +331,11 @@ cd tests/python/ops/dispatch_combine_v2
 export HIDDEN=7168 TOPK=6 EPR=96 SWEEP=512 ITERS=100 MODES=graph DISP=fp4 CHECK=1
 R="torchrun --standalone --nproc_per_node=4 bench_ep.py"
 
+V=/tmp/jit_variantA
 EPCOMPACT=0 $R                                              # stock
-MORI_SOURCE_ROOT=/tmp/jit_variantA CHECK=0 EPCOMPACT=0 $R   # variant A alone
-MORI_SOURCE_ROOT=/tmp/jit_variantA EPCOMPACT=1 $R           # variant A + compaction
+MORI_SOURCE_ROOT=$V CHECK=0 EPCOMPACT=0 $R                  # variant A alone
+MORI_SOURCE_ROOT=$V EPCOMPACT=1 $R                          # + compaction, expand
+MORI_SOURCE_ROOT=$V EPCOMPACT=1 EPREMAP=1 EPFUSE=1 $R       # + remap, fused (best)
 ```
 
 `EPCOMPACT=0` is the stock path byte for byte -- it was re-run against the unmodified
