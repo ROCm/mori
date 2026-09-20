@@ -1,0 +1,58 @@
+373a374,401
+>   // ---- VARIANT A: static per-source partition of the landing zone ----
+>   //
+>   // Stock reserves from a single index_t allocator in the PEER's memory, so every
+>   // block of every rank does a SYSTEM-scope RMW on one remote word: blockNum x
+>   // npes x worldSize RMWs onto worldSize words. Measured on gfx1250 at EP4 /
+>   // hidden 7168 / topk 6 / 512 tok-rank that is 10.87us mean (p95 21.6), the
+>   // largest single item in the kernel -- of which only ~3.1us is the fabric round
+>   // trip and 0.72us the barrier; the rest is queueing.
+>   //
+>   // The landing zone is ALREADY sized at EpMaxRecv == worldSize * maxTokPerRank,
+>   // one full quota per source. So give source s the slot range
+>   // [s*kSegStride, (s+1)*kSegStride) in every peer and the base becomes local: no
+>   // peer has to arbitrate, because no two sources can name the same slot. Dedup
+>   // caps a source at one slot per token per destination, so maxTokPerRank per
+>   // (src,dst) is exactly sufficient.
+>   //
+>   // The only atomic left is the AGENT-scope one on destPeTokenCounter that the
+>   // stock path already performs; its pre-increment return IS the offset inside
+>   // our segment, so the remote RMW is removed at no added cost.
+>   //
+>   // COST: the landing zone is no longer one packed run. Consumers must either walk
+>   // the four segments (counts are exported below) or compact -- see the README.
+>   constexpr index_t kSegStride = (index_t)(EpMaxRecv(kCfg) / npes);
+>   static_assert(EpMaxRecv(kCfg) % npes == 0,
+>                 "segmented dispatch needs the landing zone to divide evenly by worldSize");
+>   static_assert((long long)(EpMaxRecv(kCfg) / npes) >= (long long)kCfg.maxTokPerRank,
+>                 "a source can send maxTokPerRank tokens to one peer, so its segment must be "
+>                 "at least that wide -- a reduced recv cap cannot use this path");
+378,379c406,407
+<       s_base[p] = __hip_atomic_fetch_add(EpPeer<index_t>(win, p, args.offTokOff), n,
+<                                          __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+---
+>       index_t off = (index_t)atomicAdd(&args.destPeTokenCounter[p], (int)n);
+>       s_base[p] = (index_t)myPe * kSegStride + off;
+381d408
+<       atomicAdd(&args.destPeTokenCounter[p], n);
+718a746,752
+>       // Export the per-source count before the signal is cleared: with a segmented
+>       // landing zone a consumer needs (start, count) per source, and only `start`
+>       // is derivable from the Cfg. This is the one number the kernel already reads
+>       // and throws away. Rides on scalesBuf, which is dead when scaleBytes == 0;
+>       // a real integration wants its own EpArgs field.
+>       if (args.scalesBuf)
+>         reinterpret_cast<int*>(const_cast<void*>(args.scalesBuf))[srcPe] = (int)recvTokenNum;
+814a849,856
+>   // Received rows sit at s*kSegStride + k, NOT packed into [0, totalRecvTokenNum).
+>   // The gather below needs no change -- it addresses by disp_dest_tok_id_map, which
+>   // dispatch filled with the segmented slot ids -- but this staging copy walked a
+>   // dense run. Combine has no per-source counts to walk the segments exactly, so it
+>   // covers the whole landing zone: correct for any distribution, and it costs the
+>   // extra rows only on the non-in-place path (the default aliases inpTokenBuf to
+>   // stage and skips this loop entirely).
+>   const index_t kStageRows = (index_t)EpMaxRecv(kCfg);
+816c858
+<     for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
+---
+>     for (int i = globalWarpId; i < kStageRows; i += globalWarpNum) {
