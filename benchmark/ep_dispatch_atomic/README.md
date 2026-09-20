@@ -179,6 +179,31 @@ in flow, compact reads 6 MB that dispatch has only just written, behind dispatch
 barrier tail. **Isolated kernel timings did not compose here** -- that is the main
 methodological lesson of this file.
 
+## The win does not depend on the measurement method
+
+All three of the bench's timing methods, stock against optimized, fp4, one session,
+every arm correctness-gated:
+
+| method | stock pair | optimized pair | delta |
+|---|---:|---:|---:|
+| graph, events INSIDE the graph (GEV) | 76.53 | **71.25** | **-6.9%** |
+| eager, events around the CALLS | 79.20 | **74.40** | **-6.1%** |
+| graph, events around the REPLAYS (`hd`/`hc`) | 83.52 | **77.58** | **-7.1%** |
+
+| method | stock dispatch | optimized dispatch | delta |
+|---|---:|---:|---:|
+| GEV | 35.52 | **30.40** | -14.4% |
+| eager | 37.20 | **32.10** | -13.7% |
+| replays | 39.68 | **33.45** | -15.7% |
+
+The three methods disagree with each other by up to 7us on absolute time -- eager costs
+about 3us over GEV, and timing graph REPLAYS from outside costs about 6.5us, since that
+pays a replay launch and an event pair per iteration. But the overhead is the same for
+both arms, so the delta is stable at -5 to -6us on dispatch whichever instrument is used.
+GEV is the one to quote because it is the tightest, not because it flatters the result.
+
+combine lands within 40.6-44.1us in all six runs, confirming it is untouched.
+
 ## Can compact be made faster? No -- it is already at the floor
 
 Two experiments, both negative, both worth recording:
