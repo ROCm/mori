@@ -108,6 +108,26 @@ _DISP_DT = {
 }[_DISP]
 _DISP_NBYTES = {torch.bfloat16: 2, torch.float8_e4m3fn: 1}.get(_DISP_DT, 0.5)
 _FP4 = _DISP_DT is torch.float4_e2m1fn_x2
+# Combine SUMS the topk contributions, so unlike dispatch it needs an arithmetic
+# type: the HIP backend takes bf16 or fp32 only (hip_backend.py:506). fp4 combine
+# does not exist. This knob exists to price how combine scales with payload width.
+_COMB = os.environ.get("COMBINE_DT", "bf16")
+_COMB_DT = {
+    "bf16": torch.bfloat16,
+    "fp32": torch.float32,
+    "fp8": torch.float8_e4m3fn,
+    "fp4": torch.float4_e2m1fn_x2,
+}[_COMB]
+_COMB_NBYTES = {
+    torch.bfloat16: 2,
+    torch.float32: 4,
+    torch.float8_e4m3fn: 1,
+    torch.float4_e2m1fn_x2: 0.5,
+}[_COMB_DT]
+# Only bf16/fp32 combine output can be value-compared; torch has no fp4 or fp8
+# arithmetic to build the reference with. The HIP backend refuses fp4/fp8 combine
+# outright (hip_backend.py:506); flydsl accepts it, gather-only.
+_COMB_COMPARABLE = _COMB_DT in (torch.bfloat16, torch.float32)
 # Variant A's landing zone is segmented, so a layout-unaware consumer needs a
 # compaction pass. Production order is dispatch -> compact -> expert -> expand ->
 # combine, so compact is charged to the dispatch leg and expand to the combine
@@ -201,7 +221,11 @@ def main():
             num_experts_per_token=TOPK,
             data_type=torch.bfloat16,
             dispatch_data_type=None if _DISP_DT is torch.bfloat16 else _DISP_DT,
-            combine_data_type=None if _DISP_DT is torch.bfloat16 else torch.bfloat16,
+            combine_data_type=(
+                None
+                if (_DISP_DT is torch.bfloat16 and _COMB_DT is torch.bfloat16)
+                else _COMB_DT
+            ),
             kernel_backend=backend,
             dispatch_block_num=_G["DBN"],
             warp_num_per_block=_G["DWPB"],
@@ -460,6 +484,21 @@ def main():
             else routing.disp_tok_id_to_src_tok_id_local
         )[:total].cpu()
         src_pe, src_tok = (tis // M).to(torch.int64), (tis % M).to(torch.int64)
+        # The byte comparison below asks "does dense[i] hold the row dmap[i]
+        # names?" -- and under compaction BOTH sides are outputs of the same
+        # kernel, which with EPFUSE derives the payload move and the map move
+        # from one shared index computation. A bug there that duplicated a row
+        # in both would agree with itself and pass. The received rows are
+        # distinct (pe, localTokId) pairs by construction, so requiring the map
+        # to be injective closes that off. Stock is held to the same rule: it is
+        # a property of the routing, not of compaction.
+        perm_bad = total - int(torch.unique(tis).numel())
+        if perm_bad and rank == 0:
+            print(
+                f"  [{op.backend_name}] MAP NOT INJECTIVE: {perm_bad} duplicate "
+                f"entries in {total} rows (EPCOMPACT={EPCOMPACT})",
+                flush=True,
+            )
         # With compaction the consumer reads the DENSE buffer, so that is what
         # gets checked -- which makes this gate cover the compaction pass too,
         # not just the transport. Rows [0,total) are dense under both layouts,
@@ -478,7 +517,7 @@ def main():
                 constant=CONST_VAL,
             ).view(torch.uint8)
             bad += int((got[sel] != ref[src_tok[sel]]).any(dim=1).sum())
-        n = torch.tensor([bad])
+        n = torch.tensor([bad + perm_bad])
         dist.all_reduce(n)
         if rank == 0 and n.item():
             print(
@@ -520,7 +559,12 @@ def main():
         # An all-zero payload reduces the identity-expert check to 0 == 0, which
         # holds however wrong the kernel is. fp4 cannot go through combine at all
         # (hip has no fp4 combine), so for it check_dispatch is the whole story.
-        checked = bool(CHECK) and not _FP4 and not _data.verifies_nothing(INIT)
+        checked = (
+            bool(CHECK)
+            and not _FP4
+            and _COMB_COMPARABLE
+            and not _data.verifies_nothing(INIT)
+        )
         if cp:
             # Identity expert on the DENSE buffer compaction produced, then
             # scatter back to segmented positions -- a real expert's output has
@@ -736,6 +780,95 @@ def main():
 
             gd_med, gd_p25, gd_p75 = quart(ds)
             gc_med, gc_p25, gc_p75 = quart(cs)
+
+            # GEVOH: what do the in-graph event records themselves cost?
+            #
+            # Two graph SIZES, instrumented and clean, all four timed from
+            # outside by the same host-event timer, all four alternated inside
+            # ONE process. Alternation is what makes this trustworthy: a naive
+            # two-process fit is worthless here because the clean graph's own
+            # per-pair cost drifts several percent between processes, which is
+            # the same order as the delta being measured.
+            #
+            # MEASURED RESULT, fp4 / EP4 / h7168 / topk6 / 512 tok-rank:
+            # GEV reads ~6us high on the PAIR, on both the stock and the
+            # compacted arm (5.66, 5.90, 5.93, 6.08 across two experiments).
+            # Because the bias is the same on both arms it cancels in any
+            # A/B; it only inflates absolute numbers, by ~8%.
+            #
+            # TRUST d1/r1, NOT THE DECOMPOSITION. The inst-minus-clean slope
+            # below is NOT size-independent: fitting it at r1=5,10,20,30 gives
+            # 9.2, 8.9, 2.8, 1.4 us/pair, because clean_slope itself wanders
+            # (70.5 -> 78.0) while inst_slope stays put (~79.4). The split into
+            # "fixed" and "marginal" is therefore an artefact of which sizes
+            # were fitted, and fixed1 == fixed2 always (it is forced when
+            # r2 == 2*r1, so it is an identity, not a cross-check).
+            #
+            # gsum - slope is a good cheap estimator of the same bias and
+            # agrees with this (5.9/6.1 vs 5.66/5.93). An earlier version of
+            # this comment claimed it could not work, on the theory that slope
+            # nets out inter-pair overlap while gsum cannot; measurement showed
+            # that overlap is small here, so the objection does not bite.
+            #
+            # Practical upshot: `slope` is the instrument to quote. It is
+            # unbiased AND the steadiest thing in this file (0.18-0.63us spread
+            # across six runs, vs ~0.72 for gsum).
+            gev_oh = float("nan")
+            if int(os.environ.get("GEVOH", "0")):
+                alt_oh = int(os.environ.get("GEVOH_ALT", "4"))
+                r1 = gevr
+                r2 = 2 * gevr
+
+                def build_inst(n):
+                    evs = [[make_ev() for _ in range(3)] for _ in range(n)]
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g):
+                        for j in range(n):
+                            rec_ext(evs[j][0])
+                            rd()
+                            rec_ext(evs[j][1])
+                            rc_leg()
+                            rec_ext(evs[j][2])
+                    lockstep()
+                    for _ in range(WARMUP):
+                        g.replay()
+                    lockstep()
+                    return g
+
+                gi1, gi2 = gg, build_inst(r2)
+                gc1, gc2 = graph_of(r1), graph_of(r2)
+                ti1 = ti2 = tc1 = tc2 = 0.0
+                for _ in range(alt_oh):
+                    ti1 += replay_us(gi1, n_gev)
+                    tc1 += replay_us(gc1, n_gev)
+                    ti2 += replay_us(gi2, n_gev)
+                    tc2 += replay_us(gc2, n_gev)
+                ti1, tc1 = ti1 / alt_oh, tc1 / alt_oh
+                ti2, tc2 = ti2 / alt_oh, tc2 / alt_oh
+                # marginal per-pair cost of each graph, from its own two sizes
+                inst_sl = (ti2 - ti1) / (r2 - r1)
+                clean_sl = (tc2 - tc1) / (r2 - r1)
+                gev_oh = inst_sl - clean_sl  # per pair, 3 event nodes
+                # Intercept of the two-point fit. Exactly determined, so it is
+                # not evidence of anything; see the note above before using it.
+                fixed = (ti1 - tc1) - gev_oh * r1
+                if rank == 0:
+                    print(
+                        f"[GEVOH] r1={r1} inst={ti1:.2f} clean={tc1:.2f} "
+                        f"d1={ti1 - tc1:.2f} | r2={r2} inst={ti2:.2f} "
+                        f"clean={tc2:.2f} d2={ti2 - tc2:.2f}",
+                        flush=True,
+                    )
+                    print(
+                        f"[GEVOH] inst_slope={inst_sl:.3f} "
+                        f"clean_slope={clean_sl:.3f} "
+                        f"per_pair={gev_oh:.3f} per_event={gev_oh / 3.0:.3f} "
+                        f"intercept={fixed:.2f} "
+                        f"bias_d1={(ti1 - tc1) / r1:.2f} "
+                        f"gsum={gd_us + gc_us:.2f} vs_slope={gd_us + gc_us - slope:.2f} "
+                        f"alt={alt_oh} n={n_gev}",
+                        flush=True,
+                    )
         d, c = (gd_us, gc_us) if gd_us > 0 else (hd, hc)
         if rank == 0 and e2e > 0:
             src = "gev" if gd_us > 0 else "periter"
@@ -991,7 +1124,7 @@ def main():
                 # and recv counts vary between ranks with the routing. The legs
                 # differ whenever dispatch is narrower than combine.
                 d_bw = recv_m * HIDDEN * _DISP_NBYTES / (1000**3) / (d_us_m / 1e6)
-                c_bw = recv_m * HIDDEN * 2 / (1000**3) / (c_us_m / 1e6)
+                c_bw = recv_m * HIDDEN * _COMB_NBYTES / (1000**3) / (c_us_m / 1e6)
                 if rank == 0:
                     print(
                         f"  ct={ct:<5d} [{name}/{mode}] "
