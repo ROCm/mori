@@ -414,6 +414,180 @@ def _run_worker(world_size: int, case: str, *extra: str, timeout: int = 900):
 requires_two_gpus = pytest.mark.skipif(
     torch.cuda.device_count() < 2, reason="needs 2 GPUs"
 )
+requires_gpu = pytest.mark.skipif(
+    torch.cuda.device_count() < 1, reason="needs a GPU"
+)
+
+
+def _mxfp8_gemm_rel_l2(n: int, k: int, m: int, pad: bool = False) -> float:
+    """One standalone GEMM against an fp32 reference built from the same bytes."""
+    from mori.ops.gemm_ar import Mxfp8GemmOp, preshuffle_a_scale, preshuffle_b
+
+    g = torch.Generator(device="cuda").manual_seed(11)
+    op = Mxfp8GemmOp(n=n, k=k)
+    m_pad = op.padded_m(m) if pad else m
+    a_bf16 = (torch.randn(m, k, generator=g, device="cuda") / 8).to(torch.bfloat16)
+    a_in = op.pad_rows(a_bf16, m_pad) if m_pad != m else a_bf16
+    a = a_in.to(torch.float8_e4m3fn)
+    b = (torch.randn(n, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
+    ea = torch.randint(
+        120, 123, (m_pad, k // 32), generator=g, device="cuda", dtype=torch.int32
+    )
+    eb = torch.randint(
+        120, 123, (n // 32, k // 32), generator=g, device="cuda", dtype=torch.int32
+    )
+    got = op(
+        a, preshuffle_b(b), preshuffle_a_scale(ea), eb.t().reshape(-1).contiguous()
+    )[:m]
+
+    sav, sbv = torch.exp2(ea.float() - 127.0), torch.exp2(eb.float() - 127.0)
+    af, bf = a.float(), b.float()
+    ref = torch.zeros(m_pad, n, device="cuda", dtype=torch.float32)
+    for j in range(k // 32):
+        sl = slice(j * 32, (j + 1) * 32)
+        ref += (
+            (af[:, sl] @ bf[:, sl].t())
+            * sav[:, j : j + 1]
+            * sbv[:, j].repeat_interleave(32)[None, :n]
+        )
+    ref = ref[:m]
+    return (
+        torch.linalg.vector_norm(got.float() - ref) / torch.linalg.vector_norm(ref)
+    ).item()
+
+
+@requires_gpu
+@pytest.mark.parametrize(
+    "n,k,label", [(8192, 1280, "wq_b"), (5120, 2048, "wo_b")]
+)
+@pytest.mark.parametrize("m", [64, 192, 1024])
+def test_standalone_mxfp8_gemm(n, k, label, m):
+    """``Mxfp8GemmOp`` at DeepSeek-V4.1-Flash's two attention shapes.
+
+    Single process on purpose: this op has no communicator and no symmetric
+    window, which is the whole reason it exists -- a ColumnParallelLinear like
+    wq_b has no all-reduce to fuse with. M=192 is not a multiple of BLOCK_M and
+    still has to be exact: the grid is ceildiv and the tail block masks.
+    """
+    assert _mxfp8_gemm_rel_l2(n, k, m) < FP8_FLOOR
+
+
+@requires_gpu
+def test_standalone_mxfp8_gemm_pads_ragged_m():
+    """A ragged M is zero-extended to the packed A scale's 64-row group.
+
+    The padded rows must not disturb the real ones, and the check is numerical
+    because they would not: a GEMM row depends only on its own input row, so
+    getting this wrong shifts the *scale* layout rather than raising.
+    """
+    from mori.ops.gemm_ar import Mxfp8GemmOp
+
+    op = Mxfp8GemmOp(n=5120, k=2048)
+    assert op.padded_m(100) == 128
+    assert op.padded_m(64) == 64
+    assert _mxfp8_gemm_rel_l2(5120, 2048, 100, pad=True) < FP8_FLOOR
+
+
+@requires_gpu
+def test_standalone_mxfp8_gemm_refuses_unpadded_m():
+    """M not on the group boundary is refused rather than quietly mis-scaled."""
+    from mori.ops.gemm_ar import Mxfp8GemmOp
+
+    op = Mxfp8GemmOp(n=5120, k=2048)
+    a = torch.zeros(100, 2048, device="cuda", dtype=torch.float8_e4m3fn)
+    b = torch.zeros(5120, 2048, device="cuda", dtype=torch.float8_e4m3fn)
+    sa = torch.zeros(100 * 2048 // 128, device="cuda", dtype=torch.int32)
+    sb = torch.zeros(160 * 64, device="cuda", dtype=torch.int32)
+    with pytest.raises(ValueError, match="multiple of 64"):
+        op(a, b, sa, sb)
+
+
+def _mxfp8_gemv_rel_l2(n: int, k: int, m: int) -> float:
+    """One skinny GEMM against an fp32 reference built from the same bytes."""
+    from mori.ops.gemm_ar import Mxfp8GemvOp, preshuffle_b
+
+    g = torch.Generator(device="cuda").manual_seed(11)
+    x = (torch.randn(m, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
+    w = (torch.randn(n, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
+    ex = torch.randint(
+        120, 123, (m, k // 32), generator=g, device="cuda", dtype=torch.int32
+    )
+    ew = torch.randint(
+        120, 123, (n // 32, k // 32), generator=g, device="cuda", dtype=torch.int32
+    )
+    got = Mxfp8GemvOp(n=n, k=k)(
+        x, preshuffle_b(w), ex.to(torch.uint8), ew.to(torch.uint8)
+    )
+
+    sxv, swv = torch.exp2(ex.float() - 127.0), torch.exp2(ew.float() - 127.0)
+    xf, wf = x.float(), w.float()
+    ref = torch.zeros(m, n, device="cuda", dtype=torch.float32)
+    for j in range(k // 32):
+        sl = slice(j * 32, (j + 1) * 32)
+        ref += (
+            (xf[:, sl] @ wf[:, sl].t())
+            * sxv[:, j : j + 1]
+            * swv[:, j].repeat_interleave(32)[None, :n]
+        )
+    return (
+        torch.linalg.vector_norm(got.float() - ref) / torch.linalg.vector_norm(ref)
+    ).item()
+
+
+@requires_gpu
+@pytest.mark.parametrize("n,k,label", [(8192, 1280, "wq_b"), (5120, 2048, "wo_b")])
+@pytest.mark.parametrize("m", [1, 3, 16, 17, 32])
+def test_standalone_mxfp8_gemv(n, k, label, m):
+    """``Mxfp8GemvOp`` at V4.1-Flash's two attention shapes, over the M ladder.
+
+    M=3 and M=17 are the ones that matter: they are not tile widths, so the
+    token rows past M read a clamped row and must not reach the output, and
+    M=17 additionally crosses from a 16-token config to a 32-token one.
+    """
+    assert _mxfp8_gemv_rel_l2(n, k, m) < FP8_FLOOR
+
+
+@requires_gpu
+def test_mxfp8_gemv_refuses_m_above_its_tile():
+    """Past 32 tokens it declines rather than silently truncating the batch.
+
+    The B operand is two 16-row MFMA tiles and there is no third, so a 33rd
+    token has nowhere to go; without this it would compute 32 rows and return a
+    tensor whose remaining rows were never written.
+    """
+    from mori.ops.gemm_ar import Mxfp8GemvOp
+
+    op = Mxfp8GemvOp(n=5120, k=2048)
+    x = torch.zeros(33, 2048, device="cuda", dtype=torch.float8_e4m3fn)
+    w = torch.zeros(5120, 2048, device="cuda", dtype=torch.float8_e4m3fn)
+    sx = torch.zeros(33, 64, device="cuda", dtype=torch.uint8)
+    sw = torch.zeros(160, 64, device="cuda", dtype=torch.uint8)
+    with pytest.raises(ValueError, match="exceeds the skinny kernel"):
+        op(x, w, sx, sw)
+
+
+def test_gemv_config_widens_the_token_tile_for_the_top_bucket():
+    """A tuned 16-token config must not be handed an M it cannot hold.
+
+    The table is keyed by bucket and a bucket's config is free to be narrower
+    than the bucket; the guard is here rather than in the kernel because the
+    kernel's rejection would be a compile error on a server's hot path.
+    """
+    from mori.ops.gemm_ar.gemv import m_bucket, select_config
+
+    assert m_bucket(1) == 1 and m_bucket(17) == 32
+    assert select_config(8192, 1280, 1)["tokens"] == 16
+    assert select_config(8192, 1280, 17)["tokens"] == 32
+
+
+def test_supports_gemm_takes_both_attention_shapes():
+    """Neither of V4.1-Flash's attention GEMMs needs a special case."""
+    from mori.ops.gemm_ar import supports_gemm
+
+    assert supports_gemm(8192, 1280) is True   # wq_b, ColumnParallel
+    assert supports_gemm(5120, 2048) is True   # wo_b, RowParallel
+    assert supports_gemm(5120, 64) is False    # K below MIN_K
+    assert supports_gemm(5000, 2048) is False  # N not a multiple of BLOCK_N
 
 
 @pytest.fixture(scope="module")
@@ -486,6 +660,22 @@ def test_changing_operands_between_calls_stays_correct(worker_results):
     r = _case(worker_results, "changing_data")
     for key in (f"call{i}" for i in range(5)):
         assert r[key] < FP8_FLOOR, (key, r)
+
+
+@requires_two_gpus
+def test_mxfp8_quant_runs_end_to_end(worker_results):
+    """``quant="mxfp8"`` through the public op: V4.1-Flash's quantisation.
+
+    The op hardcoded ``quant="blockscale"`` until this, so the mxfp8 kernel --
+    tuned and tested at the kernel layer -- had no way out to a caller. What
+    this covers that the kernel tests do not is the operand contract: the A
+    scale is ``preshuffle_a_scale``'s packed int32 and the B scale is
+    ``[N/32, K/32]`` exponent bytes K-block major, and both are int32 where
+    blockscale's are fp32. Getting either wrong returns finite nonsense rather
+    than failing, which is why the check is numerical.
+    """
+    r = _case(worker_results, "mxfp8")
+    assert r["rel_l2"] < FP8_FLOOR, r
 
 
 @requires_two_gpus

@@ -39,11 +39,11 @@ import sys
 
 import torch
 import torch.distributed as dist
-
 from mori.cco import Communicator, UniqueId
-from mori.ops.gemm_ar import GemmAllReduceOp, preshuffle_b
+from mori.ops.gemm_ar import GemmAllReduceOp, preshuffle_a_scale, preshuffle_b
 
 SCALE_BK = 128
+MXFP8_BK = 32
 
 
 def _setup():
@@ -254,6 +254,74 @@ def case_self_test(op, rank, world, n, k):
     )
 
 
+def _mxfp8_operands(rank: int, m: int, n: int, k: int, salt: int = 0):
+    """ue8m0 operands, in the layouts DeepSeek-V4.1-Flash's loader produces.
+
+    Exponent bytes rather than arbitrary floats because that is what ue8m0 is:
+    every scale is exactly a power of two, which is why the scaled MFMA can take
+    them as instruction operands and apply them losslessly.
+    """
+    g = torch.Generator(device="cuda").manual_seed(4321 + rank + 7919 * salt)
+    a = (torch.randn(m, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
+    b = (torch.randn(n, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
+    ea = torch.randint(
+        120, 123, (m, k // MXFP8_BK), generator=g, device="cuda", dtype=torch.int32
+    )
+    eb = torch.randint(
+        120,
+        123,
+        (n // MXFP8_BK, k // MXFP8_BK),
+        generator=g,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    return a, b, ea, eb
+
+
+def _mxfp8_reference(world: int, m: int, n: int, k: int) -> torch.Tensor:
+    acc = torch.zeros(m, n, device="cuda", dtype=torch.float32)
+    for r in range(world):
+        a, b, ea, eb = _mxfp8_operands(r, m, n, k)
+        af, bf = a.float(), b.float()
+        sav, sbv = torch.exp2(ea.float() - 127.0), torch.exp2(eb.float() - 127.0)
+        for j in range(k // MXFP8_BK):
+            sl = slice(j * MXFP8_BK, (j + 1) * MXFP8_BK)
+            acc += (
+                (af[:, sl] @ bf[:, sl].t())
+                * sav[:, j : j + 1]
+                * sbv[:, j].repeat_interleave(MXFP8_BK)[None, :n]
+            )
+    return acc
+
+
+def case_mxfp8(comm, rank, world, m, n, k):
+    """``quant="mxfp8"`` end to end: DeepSeek-V4.1-Flash's quantisation.
+
+    Its own op rather than a case on the shared one: mxfp8 compiles at
+    BLOCK_M=256 where blockscale needs 128, so the two cannot share a window --
+    the padding granule and the counter slots both come from block_m.
+
+    The A scale goes through ``preshuffle_a_scale`` and the B scale is the
+    ``[N/32, K/32]`` exponent bytes K-block major, which is exactly what
+    sglang's ``prepare_mxfp8_native_weight`` leaves on the layer.
+    """
+    with GemmAllReduceOp(comm, n=n, k=k, m_max=m, quant="mxfp8") as op:
+        op.self_test()
+        a, b, ea, eb = _mxfp8_operands(rank, m, n, k)
+        got = op(
+            a,
+            preshuffle_b(b),
+            preshuffle_a_scale(ea),
+            eb.t().reshape(-1).contiguous(),
+        ).clone()
+    _emit(
+        rank,
+        case="mxfp8",
+        rel_l2=_rel_l2(got, _mxfp8_reference(world, m, n, k)),
+        m=m,
+    )
+
+
 def case_close_is_idempotent(comm, rank, n, k, m_max):
     """close() releases, twice is a no-op, and a closed op refuses to run."""
     op = GemmAllReduceOp(comm, n=n, k=k, m_max=m_max)
@@ -325,7 +393,10 @@ def run_all(comm, rank, world, n, k):
                 case_changing_data(op, rank, world, kw["m"], n, k, kw["calls"])
             elif case == "self_test":
                 case_self_test(op, rank, world, n, k)
-    # close() needs its own ops, so it comes after the shared one is released.
+    # Both of these need their own op, so they come after the shared one is
+    # released: mxfp8 compiles at a different BLOCK_M, and close() is about the
+    # lifecycle.
+    case_mxfp8(comm, rank, world, world * 256, n, k)
     case_close_is_idempotent(comm, rank, n, k, 512)
 
 
