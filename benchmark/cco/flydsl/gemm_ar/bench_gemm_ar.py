@@ -97,22 +97,21 @@ import sys
 import flydsl.expr as fx
 import torch
 import torch.distributed as dist
-
 from mori.cco import (
+    GDA_CONNECTION_NONE,
     CCODevCommRequirements,
     Communicator,
-    GDA_CONNECTION_NONE,
     UniqueId,
 )
-from mori.tensor_utils import from_gpu_ptr
-
 from mori.ops.gemm_ar import (
     ArConfig,
     build_lsa_ar,
     build_sdma_phases,
     compile_fused_gemm_scatter,
+    preshuffle_a_scale,
     preshuffle_b,
 )
+from mori.tensor_utils import from_gpu_ptr
 
 VMM_SLACK = 512 * 1024 * 1024
 MODES = ("gemm-only", "split-sdma", "fused-sdma", "fused-lsa", "split-lsa")
@@ -132,6 +131,28 @@ def _setup_distributed():
 #: fp8 block-scale group size along K. Fixed by the model's quantiser
 #: (``aiter_per1x128_quant``) and by the kernel, whose BLOCK_K is already 128.
 SCALE_BK = 128
+
+#: MXFP8 block size, along K for A and along both N and K for B. Fixed by the
+#: scaled MFMA, which carries one ue8m0 scale per 32 K per row, and by
+#: DeepSeek-V4.1-Flash's checkpoint (``weight_block_size [32, 32]``,
+#: ``scale_fmt "ue8m0"``).
+MXFP8_BK = 32
+
+
+def _ue8m0_bytes(shape, g, lo=120, hi=123):
+    """Random ue8m0 exponent bytes, i.e. scales 2**(byte-127) around 1e-2.
+
+    ue8m0 *is* the exponent: there is no mantissa, so every scale is exactly a
+    power of two and applying it is lossless. That is the whole reason the
+    scaled MFMA can take it as an operand.
+    """
+    e = torch.randint(lo, hi, shape, generator=g, device="cuda", dtype=torch.int32)
+    return e.to(torch.uint8)
+
+
+def _ue8m0_value(e: torch.Tensor) -> torch.Tensor:
+    """ue8m0 exponent bytes -> the fp32 powers of two they denote."""
+    return torch.exp2(e.to(torch.float32) - 127.0)
 
 
 def make_operands(rank: int, m: int, n: int, k: int, quant: str = "ptpc"):
@@ -164,8 +185,16 @@ def make_operands(rank: int, m: int, n: int, k: int, quant: str = "ptpc"):
             torch.rand(n, generator=g, device="cuda", dtype=torch.float32) * 0.01 + 0.01
         )
         return a, b, sa, sb
+    if quant == "mxfp8":
+        # DeepSeek-V4.1-Flash's dense form: A per-32-K, B per-32x32, both ue8m0.
+        # Scales stay as exponent bytes all the way to the MFMA, which is what
+        # the instruction's scale operand reads.
+        kb = k // MXFP8_BK
+        sa = _ue8m0_bytes((m, kb), g)
+        sb = _ue8m0_bytes((n // MXFP8_BK, kb), g)
+        return a, b, sa.contiguous(), sb.contiguous()
     if quant != "blockscale":
-        raise ValueError(f"quant must be ptpc or blockscale, got {quant!r}")
+        raise ValueError(f"quant must be ptpc, blockscale or mxfp8, got {quant!r}")
     kb = k // SCALE_BK
     sa = (
         torch.rand(m, kb, generator=g, device="cuda", dtype=torch.float32) * 0.01 + 0.01
@@ -183,6 +212,17 @@ def reference_partial(a, b, sa, sb, quant: str) -> torch.Tensor:
     af, bf = a.float(), b.float()
     if quant == "ptpc":
         return (af @ bf.T) * sa[:, None] * sb[None, :]
+    if quant == "mxfp8":
+        sav, sbv = _ue8m0_value(sa), _ue8m0_value(sb)
+        out = torch.zeros(a.shape[0], b.shape[0], device=a.device, dtype=torch.float32)
+        for i in range(a.shape[1] // MXFP8_BK):
+            ks = slice(i * MXFP8_BK, (i + 1) * MXFP8_BK)
+            out += (
+                (af[:, ks] @ bf[:, ks].T)
+                * sav[:, i][:, None]
+                * sbv[:, i].repeat_interleave(MXFP8_BK)[None, :]
+            )
+        return out
     out = torch.zeros(a.shape[0], b.shape[0], device=a.device, dtype=torch.float32)
     for i in range(a.shape[1] // SCALE_BK):
         ks = slice(i * SCALE_BK, (i + 1) * SCALE_BK)
@@ -195,6 +235,12 @@ def reference_partial(a, b, sa, sb, quant: str) -> torch.Tensor:
 
 
 def _median_us(fn, warmup: int, iters: int, *, graph: bool = True) -> float:
+    # One call per graph capture, which on MI355X carries a ~13.4us replay
+    # floor. Left alone because everything this file times is a whole fused
+    # all-reduce at 300-1600us, where that is 1-4% and identical across the
+    # modes being compared -- but do not copy this into a benchmark of a single
+    # small kernel. `timing.py` is the one to use there; see the README's
+    # "Measurement traps".
     if graph:
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
@@ -225,6 +271,18 @@ def _median_us(fn, warmup: int, iters: int, *, graph: bool = True) -> float:
 
 
 def run(args) -> int:
+    # `build_lsa_ar` has no gather_dtype: the LSA 2-stage all-reduce moves bf16
+    # and there is no fp8 leg in it. Asking for one used to run a bf16
+    # collective and report it under the fp8 label. The two-sided validation
+    # gate below did catch it -- relL2 landed at the bf16 floor, under the
+    # 5e-3 lower bound that exists to assert the fp8 wire was taken -- but only
+    # after paying for the run, and with an error that says "VALIDATION FAILED"
+    # rather than what is actually wrong.
+    if args.mode == "split-lsa" and args.gather_dtype == "fp8":
+        raise SystemExit(
+            "--mode split-lsa has no fp8 gather leg (build_lsa_ar takes no "
+            "gather_dtype); use split-sdma or fused-sdma for --gather-dtype fp8"
+        )
     local_rank, rank, world_size, uid = _setup_distributed()
     # blockscale keeps a second fp32 accumulator for the per-K-block promotion,
     # which doubles the accumulator VGPRs; 256x256 needs 256 of them and the
@@ -348,6 +406,18 @@ def run(args) -> int:
         if args.quant == "blockscale":
             sa_arg = sa.t().reshape(-1).contiguous()
             sb_arg = sb.reshape(-1).contiguous()
+        elif args.quant == "mxfp8":
+            # ue8m0 exponent bytes widened to int32 with the byte in the low 8
+            # bits: the MFMA's scale operand is a 32-bit register read at
+            # op_sel 0, so this is what it wants, and it keeps the kernel on a
+            # plain dword load.
+            #
+            # A goes through preshuffle_a_scale, which documents both moves it
+            # makes and what each was worth. B stays K-block major [K/32, N/32]:
+            # a 16-column tile never straddles a 32-column group, so its load is
+            # already a broadcast and there is nothing to pack.
+            sa_arg = preshuffle_a_scale(sa)
+            sb_arg = sb.to(torch.int32).t().reshape(-1).contiguous()
         else:
             sa_arg, sb_arg = sa, sb
 
@@ -537,7 +607,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-k", type=int, default=1024)
     p.add_argument(
         "--quant",
-        choices=("ptpc", "blockscale"),
+        choices=("ptpc", "blockscale", "mxfp8"),
         default="ptpc",
         help="a8w8 per-token/per-channel (the aiter 8wave kernel's native form) "
         "or the model's 1x128 / 128x128 block scale. blockscale applies the "
