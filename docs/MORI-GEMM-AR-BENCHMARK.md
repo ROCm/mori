@@ -68,7 +68,7 @@ than both working on it.
 > One `both`-enabled server out of nine hit an illegal memory access under
 > sustained load and has not reproduced. It is not established that the
 > combination caused it; see
-> [the operator README](../python/mori/ops/gemm_ar/README.md#end-to-end-in-sglang)
+> [the operator README](https://github.com/ROCm/mori/blob/main/python/mori/ops/gemm_ar/README.md#end-to-end-in-sglang)
 > for what has been ruled out.
 
 Full tables, the numerical cost of the fp8 wire, the model-level quality
