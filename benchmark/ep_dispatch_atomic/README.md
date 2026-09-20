@@ -99,25 +99,33 @@ deletes expand; `EPFUSE=1` also folds the two index passes into the payload kern
 
 | fp4 | dispatch leg | combine leg | **pair** | vs stock | consumer |
 |---|---:|---:|---:|---:|---|
-| stock | 35.78 | 40.75 | **76.53us** | -- | unchanged |
+| stock | 35.28 | 40.83 | **76.11us** | -- | unchanged |
 | variant A + compaction, **expand** | 33.35 | 44.59 | 77.95us | +1.9% | unchanged |
 | variant A + compaction, **remap** | 34.81 | 40.73 | 75.53us | -1.3% | unchanged |
-| variant A + compaction, **remap, fused** | 31.87 | 40.77 | **72.64us** | **-5.1%** | unchanged |
+| variant A + compaction, **remap, fused** | 31.87 | 40.77 | 72.64us | -5.1% | unchanged |
+| **+ no per-iteration reverse-map clone** | **30.59** | 41.05 | **71.65us** | **-5.9%** | unchanged |
 | variant A, segment-aware consumer | 26.32 | 41.21 | **67.53us** | **-11.8%** | must change |
 
 | bf16 | dispatch leg | combine leg | **pair** | vs stock |
 |---|---:|---:|---:|---:|
-| stock | 51.68 | 41.13 | **92.81us** | -- |
+| stock | 51.65 | 41.32 | **92.97us** | -- |
 | variant A + compaction, expand | 51.80 | 45.00 | 96.80us | +4.3% |
-| variant A + compaction, **remap, fused** | 50.34 | 40.80 | **91.13us** | **-1.8%** |
+| variant A + compaction, remap, fused | 50.34 | 40.80 | 91.13us | -1.8% |
+| **+ no per-iteration reverse-map clone** | **48.91** | 41.23 | **90.14us** | **-3.0%** |
 
-Repeated in a second matched session: fp4 stock 75.96 against fused 72.63 (**-4.4%**),
-bf16 stock 91.59 against fused 91.06 (-0.6%).
+A rocprofv3 kernel trace found a `__amd_rocclr_copyBuffer` running once per iteration
+between dispatch and the compaction, which stock does not have (8 dispatches in a whole
+stock run against 3350 here). It was the bench's own doing:
+`routing.disp_tok_id_to_src_tok_id_local` is a property that CLONES off the arena on
+first access, and dispatch hands back a fresh routing handle every call, so reading it
+once per iteration bought a device copy per iteration. The op makes that clone lazy
+exactly so the common combine path never pays it. The compaction kernel wants the source
+pointer, not a private copy, so it now binds the live arena view (`_reverse_src_view`).
+Copies per run: 3350 -> 10, and the steady-state sequence is finally just
+`DISPATCH -> FUSED -> COMBINE`.
 
-So **fp4 is a consistent -4 to -5% win** and **bf16 is a wash** -- its two margins, -1.8%
-and -0.6%, straddle the run-to-run spread of the stock arm itself (92.81 then 91.59), so
-nothing there should be claimed. bf16 dispatch is 51us of payload against fp4's 26, and
-compaction's 5.55us is the same either way, so the proportional win has to be smaller.
+That is worth **1.3us at fp4 and 1.4us at bf16**, and it is what moves bf16 from a wash
+to a real win. Both figures below are with it removed.
 
 Both pass with the bench's own unmodified layout-unaware identity expert. The combine leg
 comes back to exactly stock (40.77 against 40.75) -- expand leaves no residue.

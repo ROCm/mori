@@ -128,6 +128,10 @@ EPREMAP = int(os.environ.get("EPREMAP", "0"))
 # launch. Separately the two index passes cost 1.58us and 1.77us for 20 KB, which is
 # launch overhead, not work. Requires EPREMAP.
 EPFUSE = int(os.environ.get("EPFUSE", "0"))
+# Diagnostic only: pass None for scales the way stock does, to isolate whether the
+# per-iteration device copy in the traces comes from handing dispatch a scales
+# buffer. Breaks the counts export, so CHECK must be 0.
+EPNOSCALES = int(os.environ.get("EPNOSCALES", "0"))
 # What the correctness gate covers, as one token. A bool cannot say it: fp4 and
 # an all-zero payload verify the dispatch bytes but never compare combine's
 # output, and a row claiming "verified" next to a combine_us nobody checked is
@@ -207,6 +211,26 @@ def main():
         return EpDispatchCombineOp(cfg, comm)
 
     ops = {b: build(b) for b in BACKENDS}
+
+    def _reverse_view(r):
+        """The reverse map as a LIVE ARENA VIEW, not the public property.
+
+        `disp_tok_id_to_src_tok_id_local` clones off the arena on first access, and
+        dispatch hands back a fresh routing handle every call -- so reading it once
+        per iteration buys a device-to-device copy per iteration, which the traces
+        show as __amd_rocclr_copyBuffer sitting between dispatch and the compaction.
+        The op makes that clone lazy precisely so the common combine path never pays
+        it (dispatch_combine_op.py:623).
+
+        The compaction kernel wants the source pointer, not a private copy, so take
+        the view. The clone exists to survive the NEXT dispatch overwriting the
+        region; here it is consumed on the same stream, immediately, before any
+        such dispatch can run. The staleness the docstring warns about is a HOST
+        read racing peers' P2P writes -- a device read ordered after the dispatch
+        kernel is already past that kernel's own inbound barrier.
+        """
+        v = getattr(r, "_reverse_src_view", None)
+        return v if v is not None else r.disp_tok_id_to_src_tok_id_local
 
     def compaction_for(op):
         """Closures for one op's compact/expand, plus the counts buffer dispatch
@@ -393,7 +417,9 @@ def main():
 
     def scales_arg(op):
         """Variant A rides its per-source counts on the dead scalesBuf slot."""
-        return _CP[id(op)]["counts"] if EPCOMPACT else None
+        if not EPCOMPACT or EPNOSCALES:
+            return None
+        return _CP[id(op)]["counts"]
 
     if rank == 0:
         print(
@@ -473,7 +499,7 @@ def main():
         *_, total_t, r = op.dispatch(i_, w_, scales_arg(op), x_, return_routing=True)
         cp = _CP.get(id(op))
         if cp:
-            cp["segmap"][0] = r.disp_tok_id_to_src_tok_id_local
+            cp["segmap"][0] = _reverse_view(r)
             cp["destmap"][0] = r.disp_dest_tok_id_map
             if not EPFUSE:
                 cp["compact"]()
@@ -901,7 +927,7 @@ def main():
                 nothing downstream can start until the second one lands."""
                 *_, r = op.dispatch(i_, w_, scales_arg(op), x_, return_routing=True)
                 if cp:
-                    cp["segmap"][0] = r.disp_tok_id_to_src_tok_id_local
+                    cp["segmap"][0] = _reverse_view(r)
                     cp["destmap"][0] = r.disp_dest_tok_id_map
                     if EPFUSE:
                         cp["compact_fused"](ct * TOPK)
