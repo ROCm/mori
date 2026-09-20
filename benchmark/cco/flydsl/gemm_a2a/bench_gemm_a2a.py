@@ -238,6 +238,7 @@ def run(args) -> int:
         block_n=args.block_n,
         staged=needs_sdma,
         counter_chunks=chunks,
+        force_blocks=args.copy_blocks or None,
     )
     a, b, sa, sb = make_operands(rank, args.m, args.n, args.k, args.quant)
     b_shuf = preshuffle_b(b)
@@ -430,6 +431,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rotated", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--n-stripe", type=int, default=1)
     p.add_argument("--chunks", type=int, default=1)
+    p.add_argument("--copy-blocks", type=int, default=0)
     p.add_argument("--sdma-queues", type=int, default=1)
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--iters", type=int, default=20)

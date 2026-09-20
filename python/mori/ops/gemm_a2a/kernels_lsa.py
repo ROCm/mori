@@ -208,28 +208,38 @@ def build_lsa_a2a(cfg, rank: int, *, src: str = "local"):
 
         gtid = bid * threads + tid
         stride = blocks * threads
-        for j in range_constexpr(ws):
-            d = (rank + j) % ws
-            # `pk` walks the destination's slab in pack units, which is the
-            # *write* side's natural order because that side is compact. The
-            # read address is then derived from it.
-            #
-            # `row_packs` is a build-time constant, so the div/mod below become
-            # a multiply-shift pair rather than real division.
-            for pk in range(gtid, slab_packs, stride):
+        # Destination is the *inner*, unrolled loop and the pack index the outer
+        # one, so a thread holds all `world` links in flight at once. The other
+        # nesting -- a thread finishing destination 0 before starting 1 -- keeps
+        # exactly one link busy per thread and measured half the per-link
+        # bandwidth of the fused path over the same transport. gemm_ar's
+        # all-gather says the same thing at its own loop: "issue every load
+        # before any store so the links overlap; a load/store pair per peer
+        # would serialise on each s_waitcnt".
+        #
+        # `pk` walks a destination's slab in pack units, which is the *write*
+        # side's natural order because that side is compact. `row_packs` is a
+        # build-time constant, so the div/mod are a multiply-shift pair.
+        for pk in range(gtid, slab_packs, stride):
+            row = pk // row_packs
+            col_pack = pk % row_packs
+            vals = []
+            for j in range_constexpr(ws):
+                d = (rank + j) % ws
                 if const_expr(src == "staging"):
                     read_at = (d * slab_packs + pk) * I32_PER_PACK
                 else:
                     # [M, N]: skip to this row, then into the destination's block.
-                    row = pk // row_packs
-                    col_pack = pk % row_packs
                     read_at = (
                         row * n_row_packs + d * row_packs + col_pack
                     ) * I32_PER_PACK
-                v = buffer_load(source, read_at, vec_width=4, dtype=i32_type())
-                # Write: compact, so the peer-side address is just `pk`. That is
+                vals.append(buffer_load(source, read_at, vec_width=4, dtype=i32_type()))
+            for j in range_constexpr(ws):
+                # Compact on the peer side, so the address is just `pk`. That is
                 # the side that crosses xGMI, and it is fully contiguous.
-                buffer_store(v, dests[j], pk * I32_PER_PACK, cache_modifier=CM_CACHED)
+                buffer_store(
+                    vals[j], dests[j], pk * I32_PER_PACK, cache_modifier=CM_CACHED
+                )
 
         # Every store must be visible to the destination before it is told the
         # data is there, and the flag update must not be reordered before them.
