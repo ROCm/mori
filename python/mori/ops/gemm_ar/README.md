@@ -850,12 +850,49 @@ fp8 column's +3.4% there is a real win rather than drift.
 GSM8K 0.920 / 0.928. Its shape log shows `wq_b`, `wo_b` and `wqkv_a` served and
 `shared gate_up` declined, which is what the tables above predict.
 
-**These three results do not add.** At `wo_b` the model calls `fused_wo_b`
-first and only reaches the linear when it declines, so the two paths split that
-layer rather than stacking on it; what the standalone GEMM adds beyond the
-fused path is `wq_b` and `wqkv_a`, which are column-parallel and have no
-collective to fuse with. Both enabled together is a fourth configuration and
-has not been measured.
+**Both at once**, which is a fourth configuration rather than the sum of the
+other two. Against the same session's base:
+
+| bs | base | fp8 wire only | both | vs base | vs fp8 only |
+|---|---:|---:|---:|---:|---:|
+| 1 | 28148 | 29107 | 29504 | +4.8% | +1.4% |
+| 4 | 34386 | 36442 | 37023 | **+7.7%** | +1.6% |
+| 8 | 35153 | 37217 | 37870 | **+7.7%** | +1.8% |
+| 16 | 35423 | 37416 | 38058 | **+7.4%** | +1.7% |
+
+GSM8K 0.918.
+
+**They stack, but they do not add.** The fp8 wire alone is +6.0% and the
+standalone GEMM alone is +2.3%; together they are +7.7%, not +8.3%. At `wo_b`
+the model calls `fused_wo_b` first and the linear only ever sees what it
+declines, so the two divide that layer by M rather than both working on it.
+What the GEMM adds on top is `wq_b` and `wqkv_a` -- column-parallel, no
+collective to fuse with, so fusing could never have reached them.
+
+> **One server out of nine hit an illegal memory access, and it has not
+> reproduced.** It was a `both`-enabled run: it served GSM8K for 13 minutes at
+> ~250 concurrent requests and then four ranks failed together with
+> `hipErrorIllegalAddress`. Re-running the same variant with the same
+> configuration completed cleanly -- 0.918, no faults -- and the numbers above
+> are from that second run.
+>
+> **It is not established that the combination caused it**, and the evidence is
+> thin in both directions: the combination is the only configuration that has
+> ever shown it, and it has shown it once. What was ruled out, so it is not
+> re-walked: the two paths do not share a FlyDSL `JitFunction` or `CallState`
+> (two identical compiles return distinct objects); 30 rounds of interleaving
+> the two paths on four ranks is clean; so is 40 rounds of driving one layer
+> across the fusing threshold; `_PinnedLaunch` survives being pinned inside a
+> CUDA graph and reused eagerly, replaying bit-identical to a fresh call; and
+> memory is not it -- the two servers' pools are byte-identical and 31.7 GB was
+> free at the fault. The standalone GEMM also served the same M distribution in
+> the run that did not fault as in the one that did.
+>
+> `hipErrorIllegalAddress` is reported asynchronously, so the traceback points
+> at the scheduler's next synchronisation rather than the faulting kernel.
+> Pinning it down needs `AMD_SERIALIZE_KERNEL=3`, which is only worth spending
+> on a repro that reproduces -- and serialising changes the timing a race
+> depends on. Left open, to be re-tested under longer stress.
 
 The decode column is not reported as evidence. `wo_b` never fuses at decode's M,
 so the three variants should be identical, and they scatter -8.6% to +14.1% --

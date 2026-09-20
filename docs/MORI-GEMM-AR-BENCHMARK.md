@@ -57,12 +57,19 @@ decides the outcome is the grid, `ceildiv(M,256) * (N/256)`:
 | 129-256 | **-26.6%** |
 | >256 | **-26.4%** |
 
-End to end in a server, V4.1-Flash prefill throughput is **+5.6% to +6.0%** at
-batch sizes 4-16 on the fp8 wire, or **+2.2% to +2.5%** from the standalone
-GEMM with nothing fused; V4-Pro is **-5.0% GPU busy** over a profiled prefill.
-Per-layer wins are larger than end-to-end ones because `wo_b` is about 12% of
-the profile, and the two SGLang-side results do not add -- they split that
-layer rather than stacking on it.
+End to end in a server, V4.1-Flash prefill throughput at batch sizes 4-16 is
+**+5.6% to +6.0%** on the fp8 wire, **+2.2% to +2.5%** from the standalone GEMM
+with nothing fused, and **+7.4% to +7.7%** with both enabled; V4-Pro is
+**-5.0% GPU busy** over a profiled prefill. Per-layer wins are larger than
+end-to-end ones because `wo_b` is about 12% of the profile, and the two
+SGLang-side results stack without adding -- they split that layer by M rather
+than both working on it.
+
+> One `both`-enabled server out of nine hit an illegal memory access under
+> sustained load and has not reproduced. It is not established that the
+> combination caused it; see
+> [the operator README](../python/mori/ops/gemm_ar/README.md#end-to-end-in-sglang)
+> for what has been ruled out.
 
 Full tables, the numerical cost of the fp8 wire, the model-level quality
 evaluation, and the threshold derivations are in
