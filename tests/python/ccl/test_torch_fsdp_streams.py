@@ -9,8 +9,69 @@ from unittest.mock import patch
 import pytest
 import torch
 import torch.distributed as dist
+from torch.distributed.fsdp._fully_shard._all_gather_layout import AllGatherInputMetadata
 
-from mori.ccl.torch_fsdp import MoriSdmaAllGather
+from mori.ccl.torch_fsdp import MoriSdmaAllGather, MoriSdmaAllGatherPool
+
+
+def _metadata_cache_case(rank: int, world_size: int) -> None:
+    device = torch.device("cuda", rank)
+    count = 4096
+    pool = MoriSdmaAllGatherPool([count * world_size * 4], group=dist.group.WORLD, device=device)
+    comm = MoriSdmaAllGather(output_pool=pool)
+    pool.initialize()
+    producers = [torch.cuda.Stream(), torch.cuda.Stream()]
+    gathers = [torch.cuda.Stream(), torch.cuda.Stream()]
+    consumer = torch.cuda.Stream()
+
+    def prepare(splits, requested_device=device):
+        return comm.layout.prepare_output(AllGatherInputMetadata(
+            input_split_sizes=splits, input_numel=count, world_size=world_size,
+            dtype=torch.float32, device=requested_device,
+            can_use_param_contiguous_output=True,
+        ))
+
+    first = prepare([1024, 3072], torch.device("cuda"))
+    with patch.object(torch, "tensor", side_effect=AssertionError("cache miss")):
+        assert prepare([1024, 3072])[0] is first[0]
+    with torch.cuda.device((rank + 1) % world_size):
+        other = prepare([1024, 3072], torch.device("cuda"))
+        assert other[0].device.index == (rank + 1) % world_size
+    del first, other
+
+    for step in range(4):
+        producer, gather = producers[step % 2], gathers[step % 2]
+        splits = [1024, 3072] if step % 2 == 0 else [2048, 2048]
+        with torch.cuda.stream(producer):
+            metadata = prepare(splits)
+            with patch.object(torch, "tensor", side_effect=AssertionError("cache miss")):
+                hit = prepare(splits)
+            assert hit[0] is metadata[0] and hit[1] is metadata[1]
+            output = comm.allocate((count * world_size,), dtype=torch.float32, device=device)
+            source = torch.arange(count, device=device, dtype=torch.float32) + rank * count
+        gather.wait_stream(producer)
+        with torch.cuda.stream(gather):
+            torch.cuda._sleep(20_000_000)
+            work = comm(output, source, dist.group.WORLD, async_op=True)
+        del metadata, hit, source
+        # Evict metadata while the preceding raw-pointer kernel is still pending.
+        with torch.cuda.stream(producers[(step + 1) % 2]):
+            prepare([512, 3584])
+            comm._clear_prepared_output()
+            churn = [torch.full((2,), -999, device=device, dtype=torch.int64) for _ in range(32)]
+        with torch.cuda.stream(consumer):
+            work.wait()
+            result = output.clone()
+            comm.release_output()
+        torch.cuda.synchronize()
+        peer_inputs = [
+            (torch.arange(count, device=device, dtype=torch.float32) + peer * count).split(splits)
+            for peer in range(world_size)
+        ]
+        expected = torch.cat([peer_inputs[peer][i] for i in range(2) for peer in range(world_size)])
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        del churn
+    pool.close()
 
 
 def _worker(rank: int, world_size: int, port: int) -> None:
@@ -26,6 +87,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         shmem.shmem_torch_process_group_init("default")
         device = torch.device("cuda", rank)
         torch.cuda.set_device(device)
+        _metadata_cache_case(rank, world_size)
         producer = torch.cuda.Stream()
         gather = torch.cuda.Stream()
         consumers = [torch.cuda.Stream(), torch.cuda.Stream()]
@@ -56,9 +118,11 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                 with torch.cuda.stream(producer):
                     source = torch.full((count,), float(rank + 1), device=device)
                     comm.layout.prepare_output(
-                        splits, count, world_size, torch.float32, device,
-                        [[torch.float32], [torch.float32]],
-                        [[size] for size in splits], True,
+                        AllGatherInputMetadata(
+                            input_split_sizes=splits, input_numel=count,
+                            world_size=world_size, dtype=torch.float32, device=device,
+                            can_use_param_contiguous_output=True,
+                        )
                     )
                 gather.wait_stream(producer)
                 with torch.cuda.stream(gather), patch.object(
@@ -68,7 +132,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                     done = gather.record_event()
                 # Releasing buffers while SDMA is pending must not allow reuse.
                 del source
-                comm._clear_output()
+                comm._clear_prepared_output()
                 with torch.cuda.stream(producer):
                     replacement = torch.full((count,), -99.0, device=device)
                 results = []

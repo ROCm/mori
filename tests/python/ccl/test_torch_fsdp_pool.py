@@ -10,6 +10,8 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+from torch.distributed.fsdp._fully_shard._all_gather_layout import AllGatherInputMetadata
+from torch.distributed.fsdp._fully_shard._fsdp_collectives import DefaultAllGather
 
 from mori.ccl.torch_fsdp import MoriSdmaAllGather, MoriSdmaAllGatherPool
 
@@ -120,6 +122,10 @@ def _training_case(rank, world_size, dtype, async_op, reshard, zero_copy=True):
         if expected_pointers is None:
             expected_pointers = pointers
         assert pointers == expected_pointers
+        if zero_copy:
+            shared.blocks[0].set_custom_all_gather(comms[0])
+            with pytest.raises(ValueError, match="cannot replace.*all-gather"):
+                shared.blocks[0].set_custom_all_gather(DefaultAllGather())
     for handle in handles:
         handle.remove()
     ready_bytes = (world_size * 4 + 15) // 16 * 16
@@ -161,6 +167,22 @@ def _stream_reuse_case(rank, world_size):
     pool.close()
 
 
+def _device_case(rank, world_size):
+    target = torch.device("cuda", rank)
+    for requested in (torch.device("cuda"), target):
+        current = rank if requested.index is None else (rank + 1) % world_size
+        with torch.cuda.device(current):
+            pool = MoriSdmaAllGatherPool([128], group=dist.group.WORLD, device=requested)
+            assert torch.cuda.current_device() == current
+        assert pool._device == target
+        assert pool._buffer.device == target
+        assert any(
+            segment["address"] == pool._buffer.data_ptr() and segment["device"] == rank
+            for segment in pool._mem_pool.snapshot()
+        )
+        pool.close()
+
+
 def _persistent_packing_case(rank):
     device = torch.device("cuda", rank)
     packer, consumer = torch.cuda.Stream(), torch.cuda.Stream()
@@ -192,8 +214,11 @@ def _subgroup_case(rank, world_size):
     comm = MoriSdmaAllGather(output_pool=pool)
     pool.initialize()
     if rank < 2:
-        comm.layout.prepare_output([4], 4, 2, torch.float32, device,
-                                   [[torch.float32]], [[4]], False)
+        comm.layout.prepare_output(AllGatherInputMetadata(
+            input_split_sizes=[4], input_numel=4, world_size=2,
+            dtype=torch.float32, device=device,
+            can_use_param_contiguous_output=False,
+        ))
         output = comm.allocate((8,), dtype=torch.float32, device=device)
         source = torch.full((4,), float(rank), device=device)
         comm(output, source, subgroup, async_op=True).wait()
@@ -202,8 +227,18 @@ def _subgroup_case(rank, world_size):
         assert not comm._pool_active
     # Nonmembers never enter the adapter's subgroup call.
     dist.barrier()
-    comm.layout.prepare_output([4], 4, world_size, torch.float32, device,
-                               [[torch.float32]], [[4]], True)
+    # A custom input callback can allocate directly without preparing a layout.
+    output = comm.allocate((4 * world_size,), dtype=torch.float32, device=device)
+    comm(output, torch.full((4,), float(rank), device=device), dist.group.WORLD, async_op=True).wait()
+    expected = torch.arange(world_size, device=device, dtype=torch.float32).repeat_interleave(4)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    comm.release_output()
+    collective = pool._collective
+    comm.layout.prepare_output(AllGatherInputMetadata(
+        input_split_sizes=[4], input_numel=4, world_size=world_size,
+        dtype=torch.float32, device=device,
+        can_use_param_contiguous_output=True,
+    ))
     output = comm.allocate((4 * world_size,), dtype=torch.float32, device=device)
     try:
         comm(output, torch.ones(4, device=device), other_full_group)
@@ -211,7 +246,7 @@ def _subgroup_case(rank, world_size):
         assert "bound process group" in str(error)
     else:
         raise AssertionError("a different full process group was accepted")
-    assert pool._collective is None
+    assert pool._collective is collective
     assert pool._slots[0].owner is None
     output = comm.allocate((4 * world_size,), dtype=torch.float32, device=device)
     comm(output, torch.full((4,), float(rank), device=device), dist.group.WORLD, async_op=True).wait()
@@ -257,6 +292,7 @@ def _worker(rank, world_size, port):
     )
     torch._C._distributed_c10d._register_process_group("default", dist.group.WORLD)
     shmem.shmem_torch_process_group_init("default")
+    _device_case(rank, world_size)
     _configuration_case(rank)
     _subgroup_case(rank, world_size)
     _persistent_packing_case(rank)

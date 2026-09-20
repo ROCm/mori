@@ -4,6 +4,14 @@
 parameter-contiguous zero-copy and stable registered addresses. Keep a separate
 `MoriSdmaAllGather` instance per FSDP parameter group; share only its pool.
 
+The adapter targets the matching experimental private PyTorch layout contract,
+including `AllGatherInputMetadata` and `AllGather.release_output`. These are
+not public imports from `torch.distributed.fsdp`; updating the adapter and
+PyTorch sides together is required. The contract is documented in PyTorch's
+`_fully_shard/_all_gather_layout.py`. Preparation receives one metadata object;
+the base copy-in packs a separate input without modifying registered outputs.
+World size and per-call output metadata remain necessary for subgroup fallback.
+
 ```python
 from mori.ccl.torch_fsdp import MoriSdmaAllGather, MoriSdmaAllGatherPool
 
@@ -24,9 +32,12 @@ This assignment is for sequential blocks with at most one prefetched block.
 The non-resharding root needs its own slot. This is not a general schedule
 planner: deeper prefetch, branches, repeated modules, or multiple simultaneously
 unsharded groups may need more slots. A live lease conflict raises an error.
-Install the backends before the first unshard. Switching an already-used group
-to a new pool may require copying into its existing parameter storage to
-preserve saved aliases, rather than adopting the new arena's views.
+Install the backends before the first unshard. FSDP rejects backend replacement
+while an all-gather is pending, while parameters are unsharded, or once they use backend-owned storage:
+their saved aliases must remain coordinated by the original pool. Reinstalling
+the same backend instance is allowed. Replacing a backend with only FSDP-owned
+outputs preserves those destinations, so a newly installed pool may need copy-out
+rather than adopting its arena's views.
 
 For an ordinary homogeneous-dtype parameter group, its required capacity is
 the sum of its padded shard element counts, multiplied by the shard world size
@@ -35,6 +46,10 @@ and identical across ranks. Slot assignments must also be identical across
 ranks: SDMA applies the local arena offset to each peer's arena. Slots never
 grow or move. Construct the pool and perform the same gather/release schedule
 on every rank.
+
+An index-less CUDA device resolves to the current device at pool construction.
+An explicit device selects that GPU for both the private allocator and arena,
+even when another GPU is current; construction restores the caller's device.
 
 Call `initialize()` collectively after constructing every adapter and before
 training or any subgroup call. It validates ordered group members, capacities,
