@@ -12,18 +12,20 @@ with::
 When ``zero_copy_output`` is set the backend produces a parameter-contiguous
 output that FSDP can use in place, avoiding the rank-major copy-out. The
 ``mori`` package is imported lazily so importing this module does not require
-ROCm/MORI to be installed. Each instance owns one persistent registered output
-and must be installed on only one FSDP parameter group.
+ROCm/MORI to be installed. Each instance must be installed on only one FSDP
+parameter group. Instances may share registered storage through an explicitly
+sized ``MoriSdmaAllGatherPool`` with fixed slot assignments.
 
-The full output allocation remains resident after both forward and backward
-reshard, including when zero-copy output is disabled. Logical reshard and
-backward all-gather still follow FSDP's policy. This mode trades device memory
-for persistent registration; it does not reclaim output buffers on reshard.
+Without a pool, every instance retains a full output after reshard, including
+when zero-copy is disabled. A pool retains only its configured slot capacities;
+reshard returns a slot lease without unregistering or reallocating its storage.
+Both modes follow FSDP's logical reshard and backward all-gather policy.
 """
 
 import importlib
 import warnings
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -33,8 +35,200 @@ from torch.distributed.fsdp._fully_shard._all_gather_layout import (
     AllGatherLayout,
     AllGatherOutputs,
     AllGatherParamMetadata,
+    DefaultAllGatherLayout,
 )
 from torch.distributed.fsdp._fully_shard._fsdp_api import AllGather
+
+
+_POOLED_RANK_MAJOR = object()
+
+
+@dataclass
+class _OutputSlot:
+    buffer: torch.Tensor
+    owner: object | None = None
+    last_use: torch.Event | None = None
+
+
+class MoriSdmaAllGatherPool:
+    """Fixed registered output slots shared by non-overlapping FSDP groups.
+
+    Construct collectively, with identical byte capacities on every rank.
+    Each backend has a fixed slot so saved parameter views keep their storage.
+    Assign concurrently unsharded groups, including a non-resharding root, to
+    different slots. Slot conflicts raise instead of overwriting live outputs.
+    FSDP must call ``AllGather.release_output`` after reshard. This pool requires
+    the matching FSDP layout/lifetime contract and supports eager execution;
+    CUDA graph capture is not supported.
+
+    A small SDMA all-gather orders slot reuse across ranks without a host
+    completion wait. The arena stays registered until collective ``close()``.
+    """
+
+    def __init__(
+        self,
+        buffer_sizes: Sequence[int],
+        *,
+        group: dist.ProcessGroup,
+        device: torch.device,
+    ) -> None:
+        if not buffer_sizes or any(size <= 0 or size % 4 for size in buffer_sizes):
+            raise ValueError("pool sizes must be positive multiples of four bytes")
+        if not hasattr(AllGather, "release_output"):
+            raise RuntimeError("shared outputs require FSDP AllGather.release_output")
+        self._group = group
+        self._device = torch.device(device)
+        self._capacities = tuple(buffer_sizes)
+        self._bindings: list[tuple[str, int, bool]] = []
+        self._mode: bool | None = None
+        self._initialized = False
+        self._failed = False
+        self._members: tuple[int, ...] = ()
+        self._subgroups: set[dist.ProcessGroup] = set()
+        # MORI imports IPC allocation bases, not PyTorch suballocation offsets.
+        # A fresh private pool makes this arena its allocation's first address.
+        self._mem_pool = torch.cuda.MemPool()
+        capacities = [(size + 15) // 16 * 16 for size in buffer_sizes]
+        ready_bytes = (group.size() * 4 + 15) // 16 * 16
+        with torch.cuda.use_mem_pool(self._mem_pool):
+            self._buffer = torch.empty(sum(capacities) + ready_bytes, dtype=torch.uint8, device=device)
+        self._slots = []
+        offset = 0
+        for size, capacity in zip(buffer_sizes, capacities):
+            self._slots.append(_OutputSlot(self._buffer.narrow(0, offset, size)))
+            offset += capacity
+        self._collective: Any | None = None
+        self._ready_input = torch.zeros(1, dtype=torch.int32, device=device)
+        self._ready_output = self._buffer.narrow(0, offset, group.size() * 4).view(torch.int32)
+        self._last_write_event: torch.Event | None = (
+            torch.cuda.current_stream(self._device).record_event()
+            if self._device.type == "cuda" else None
+        )
+        self._closed = False
+
+    @property
+    def allocated_bytes(self) -> int:
+        return self._buffer.numel()
+
+    def _bind(self, comm, key: str | None) -> None:
+        if self._initialized or self._closed:
+            raise RuntimeError("bind all adapters before pool.initialize()")
+        if self._mode is not None and self._mode != comm._zero_copy_output:
+            raise ValueError("all adapters in a MORI pool must use the same zero_copy_output")
+        key = str(len(self._bindings)) if key is None else key
+        if not isinstance(key, str) or any(binding[0] == key for binding in self._bindings):
+            raise ValueError("pool group_key values must be unique strings")
+        self._mode = comm._zero_copy_output
+        self._bindings.append((key, comm._buffer_index, comm._zero_copy_output))
+
+    def initialize(self) -> None:
+        """Collectively validate the complete static configuration before use."""
+        if self._closed or self._failed:
+            raise RuntimeError("MORI output pool is closed or failed")
+        if self._initialized:
+            return
+        members = tuple(dist.get_process_group_ranks(self._group))
+        config = (members, self._capacities, tuple(self._bindings))
+        configs = [None] * self._group.size()
+        dist.all_gather_object(configs, config, group=self._group)
+        if not self._bindings or any(peer != config for peer in configs):
+            raise ValueError("MORI pool capacities, group mappings, or adapter assignments differ across ranks")
+        self._members = members
+        self._initialized = True
+
+    def _check_ready(self) -> None:
+        if self._closed or self._failed:
+            raise RuntimeError("MORI output pool is closed or failed; failed communication cannot be reused")
+        if not self._initialized:
+            raise RuntimeError("call pool.initialize() collectively after binding all adapters")
+
+    def _validate_group(self, group) -> bool:
+        self._check_ready()
+        if group is self._group:
+            return False
+        if group not in self._subgroups:
+            members = tuple(dist.get_process_group_ranks(group))
+            if (
+                not 0 < len(members) < len(self._members)
+                or not set(members).issubset(self._members)
+                or members[group.rank()] != self._members[self._group.rank()]
+            ):
+                raise ValueError("MORI pool requires its bound process group or a valid strict subgroup")
+            self._subgroups.add(group)
+        return True
+
+    def _acquire(self, comm, size, dtype, device) -> torch.Tensor:
+        self._check_ready()
+        if torch.device(device) != self._device:
+            raise ValueError("MORI output pool and parameter devices must match")
+        slot = self._slots[comm._buffer_index]
+        if slot.owner is not None:
+            raise RuntimeError(
+                "MORI output slot is still leased by an unsharded group; "
+                "assign overlapping groups/prefetches to different slots"
+            )
+        nbytes = _numel(size) * torch.empty((), dtype=dtype).element_size()
+        if nbytes > slot.buffer.numel():
+            raise ValueError(
+                f"MORI output requires {nbytes} bytes, slot has {slot.buffer.numel()}; "
+                "size slots before training so registered addresses remain stable"
+            )
+        output = slot.buffer.narrow(0, 0, nbytes).view(dtype).view(size)
+        if slot.last_use is not None:
+            torch.cuda.current_stream(self._device).wait_event(slot.last_use)
+        slot.owner = comm
+        return output
+
+    def _before_write(self, comm, stream) -> None:
+        self._check_ready()
+        slot = self._slots[comm._buffer_index]
+        if self._closed or slot.owner is not comm:
+            raise RuntimeError("MORI output writes require an active slot lease")
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("MORI shared output slots do not support graph capture")
+        if slot.last_use is not None:
+            stream.wait_event(slot.last_use)
+        if self._last_write_event is not None:
+            stream.wait_event(self._last_write_event)
+        # Only the disjoint control region is written until every peer is ready.
+        collective = self._collective_for(comm, self._group)
+        collective.enqueue(self._ready_input, self._ready_output, 1, stream=stream)
+
+    def _after_write(self, stream) -> None:
+        # One collective/arena is shared, including when callers change streams.
+        self._last_write_event = stream.record_event()
+
+    def _release(self, comm) -> None:
+        slot = self._slots[comm._buffer_index]
+        if slot.owner is not comm:
+            raise RuntimeError("MORI output slot released by a different group")
+        if not self._failed:
+            slot.last_use = torch.cuda.current_stream(self._device).record_event()
+        slot.owner = None
+
+    def _collective_for(self, comm, group):
+        self._check_ready()
+        if group is not self._group:
+            raise ValueError("only the bound process group may use the MORI pool collective")
+        if self._collective is None:
+            self._collective = comm._make_collective(group)
+            self._collective.register_output_buffer(self._buffer)
+        return self._collective
+
+    def close(self) -> None:
+        """Collectively unregister slots after all groups have resharded."""
+        if self._closed:
+            return
+        if self._failed:
+            raise RuntimeError("cannot close a failed MORI pool safely; terminate the distributed workers")
+        if any(slot.owner is not None for slot in self._slots):
+            raise RuntimeError("reshard all groups before closing the MORI output pool")
+        torch.cuda.synchronize(self._device)
+        dist.barrier(group=self._group)
+        if self._collective is not None:
+            self._collective.deregister_output_buffer(self._buffer)
+            self._collective = None
+        self._closed = True
 
 
 class _MoriSdmaAllGatherWork(dist.Work):
@@ -65,8 +259,13 @@ class _MoriSdmaAllGatherLayout(AllGatherLayout):
         can_use_param_contiguous_output: bool,
     ) -> object | None:
         self._comm._clear_output()
+        pool = self._comm._output_pool
+        self._comm._native_fallback = pool is not None and world_size != pool._group.size()
+        fallback = _POOLED_RANK_MAJOR if pool is not None else None
+        if pool is not None and world_size != pool._group.size():
+            return fallback
         if not self._comm._zero_copy_output or not can_use_param_contiguous_output:
-            return None
+            return fallback
         if not input_split_sizes:
             raise RuntimeError("MORI zero-copy allgather requires non-empty splits")
         if sum(input_split_sizes) != input_numel:
@@ -84,7 +283,7 @@ class _MoriSdmaAllGatherLayout(AllGatherLayout):
                     "MORI zero-copy allgather requires every split to be "
                     "4-byte aligned; falling back to rank-major output"
                 )
-                return None
+                return fallback
             split_u32 = split_nbytes // 4
             split_offsets_u32.append(offset)
             split_sizes_u32.append(split_u32)
@@ -130,6 +329,18 @@ class _MoriSdmaAllGatherLayout(AllGatherLayout):
         world_size: int,
         output_metadata: object | None,
     ) -> AllGatherOutputs:
+        if output_metadata is _POOLED_RANK_MAJOR:
+            outputs = DefaultAllGatherLayout().finalize_outputs(
+                all_gather_output, param_metadata, world_size, None
+            )
+            # Existing zero-copy parameters can still alias this slot on fallback.
+            if not any(param.backend_owned for param in param_metadata):
+                self._comm.release_output()
+            return outputs
+        if self._comm._output_pool is not None:
+            self._comm._aliases_pool = any(
+                not param.outputs or param.backend_owned for param in param_metadata
+            )
         return AllGatherOutputs(
             self.param_contiguous_output_views(
                 all_gather_output, [param.input_numels for param in param_metadata], world_size
@@ -145,23 +356,50 @@ class MoriSdmaAllGather(AllGather):
         zero_copy_output (bool): produce a parameter-contiguous output that FSDP
             uses in place, skipping the rank-major copy-out wherever the
             parameter group is eligible. Defaults to ``True``.
+        output_pool: Optional shared registered storage. Each backend retains a
+            separate layout/owner; only its output memory is shared.
+        buffer_index: Fixed slot in ``output_pool``. Assign groups that may be
+            unsharded concurrently to distinct slots.
     """
 
     reuses_output_storage = True
 
-    def __init__(self, zero_copy_output: bool = True) -> None:
+    def __init__(
+        self, zero_copy_output: bool = True, *,
+        output_pool: MoriSdmaAllGatherPool | None = None,
+        buffer_index: int = 0,
+        group_key: str | None = None,
+    ) -> None:
+        if output_pool is not None and not 0 <= buffer_index < len(output_pool._slots):
+            raise ValueError("buffer_index is outside the MORI output pool")
+        self._output_pool = output_pool
+        self._buffer_index = buffer_index
+        self._pool_active = False
+        self._native_fallback = False
+        self._aliases_pool = False
         self._zero_copy_output = zero_copy_output
         self.layout = _MoriSdmaAllGatherLayout(self)
         self._collective: Any | None = None
         self._rank: int | None = None
         self._world_size: int | None = None
+        self._process_group: dist.ProcessGroup | None = None
         self._output_buffer: torch.Tensor | None = None
+        self._output_active = False
+        self._last_use_event: torch.Event | None = None
         self._output_buffer_nbytes = 0
         self._registered_output_ptr: int | None = None
         self._param_contiguous_split_sizes: torch.Tensor | None = None
         self._param_contiguous_split_offsets: torch.Tensor | None = None
         self._param_contiguous_input_nbytes = 0
         self._warned_unaligned = False
+        if output_pool is not None:
+            output_pool._bind(self, group_key)
+        elif not zero_copy_output:
+            warnings.warn(
+                "MORI without output_pool retains a full output per group even with "
+                "zero_copy_output=False; use a shared pool for bounded output storage",
+                stacklevel=2,
+            )
 
     def allocate(
         self,
@@ -170,6 +408,19 @@ class MoriSdmaAllGather(AllGather):
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
+        if self._output_pool is not None:
+            self._output_pool._check_ready()
+            if self._native_fallback:
+                output = torch.empty(size, dtype=dtype, device=device)
+                if self._aliases_pool:
+                    self._output_pool._acquire(self, size, dtype, device)
+                    self._pool_active = True
+                return output
+            output = self._output_pool._acquire(self, size, dtype, device)
+            self._pool_active = True
+            return output
+        if self._last_use_event is not None:
+            torch.cuda.current_stream(device).wait_event(self._last_use_event)
         numel = _numel(size)
         if (
             self._output_buffer is not None
@@ -177,11 +428,14 @@ class MoriSdmaAllGather(AllGather):
             and self._output_buffer.device == device
             and self._output_buffer.numel() >= numel
         ):
-            return self._output_buffer.narrow(0, 0, numel)
+            output = self._output_buffer.narrow(0, 0, numel)
+            self._output_active = True
+            return output
         self._deregister_output_buffer_if_needed()
         self._output_buffer = torch.empty(*size, dtype=dtype, device=device)
         self._output_buffer_nbytes = _tensor_nbytes(self._output_buffer)
         self._registered_output_ptr = None
+        self._output_active = True
         return self._output_buffer
 
     def __call__(
@@ -191,19 +445,54 @@ class MoriSdmaAllGather(AllGather):
         group: dist.ProcessGroup,
         async_op: bool = False,
     ) -> Any | None:
-        self._validate_tensors(output_tensor, input_tensor, group)
+        pool = self._output_pool
+        try:
+            subgroup = pool._validate_group(group) if pool is not None else False
+            self._validate_tensors(output_tensor, input_tensor, group)
+            if subgroup and output_tensor.untyped_storage().data_ptr() == pool._buffer.data_ptr():
+                raise ValueError("subgroup fallback requires independent staging from layout preparation")
+        except BaseException:
+            self.release_output()
+            raise
+        if subgroup:
+            self._clear_output()
+            try:
+                return dist.all_gather_into_tensor(
+                    output_tensor, input_tensor, group=group, async_op=async_op
+                )
+            except BaseException:
+                pool._failed = True
+                self.release_output()
+                raise
+        try:
+            return self._call_full_group(output_tensor, input_tensor, group, async_op)
+        except BaseException:
+            if pool is not None:
+                pool._failed = True
+            self.release_output()
+            raise
+
+    def _call_full_group(self, output_tensor, input_tensor, group, async_op):
+        if self._output_pool is not None:
+            stream = torch.cuda.current_stream(input_tensor.device)
+            self._output_pool._before_write(self, stream)
+        elif self._last_use_event is not None:
+            torch.cuda.current_stream(input_tensor.device).wait_event(self._last_use_event)
         if _tensor_nbytes(input_tensor) % 4 != 0:
             self._clear_output()
             self._warn_unaligned_fallback(
                 "MORI SDMA allgather requires 4-byte-aligned input; falling "
                 "back to the process-group all-gather"
             )
-            return dist.all_gather_into_tensor(
+            work = dist.all_gather_into_tensor(
                 output_tensor,
                 input_tensor,
                 group=group,
                 async_op=async_op,
             )
+            if self._output_pool is not None:
+                self._output_pool._after_write(stream)
+            return work
         collective = self._get_collective(group)
         stream = torch.cuda.current_stream(input_tensor.device)
         count = input_tensor.numel()
@@ -231,11 +520,22 @@ class MoriSdmaAllGather(AllGather):
         # MORI uses raw pointers, so the allocator cannot track these uses.
         input_tensor.record_stream(stream)
         output_tensor.record_stream(stream)
+        if self._output_pool is not None:
+            self._output_pool._after_write(stream)
         # Layout selection applies to one call, including when input hooks change.
         self._clear_output()
         if async_op:
             return _MoriSdmaAllGatherWork(collective, stream)
         return None
+
+    def release_output(self) -> None:
+        if self._output_pool is not None:
+            if self._pool_active:
+                self._output_pool._release(self)
+                self._pool_active = False
+        elif self._output_active and self._output_buffer is not None:
+            self._last_use_event = torch.cuda.current_stream(self._output_buffer.device).record_event()
+            self._output_active = False
 
     def _clear_output(self) -> None:
         self._param_contiguous_split_sizes = None
@@ -283,13 +583,24 @@ class MoriSdmaAllGather(AllGather):
 
     def _get_collective(self, group: dist.ProcessGroup) -> Any:
         rank, world_size = group.rank(), group.size()
-        if (
-            self._collective is not None
-            and self._rank == rank
-            and self._world_size == world_size
-        ):
+        if self._output_pool is not None:
+            if rank != self._output_pool._group.rank():
+                raise ValueError("MORI pool and collective rank mappings must match")
+            return self._output_pool._collective_for(self, group)
+        if self._collective is not None:
+            if group is not self._process_group:
+                raise ValueError("a MORI adapter cannot reuse its collective with a different process group")
             return self._collective
 
+        self._collective = self._make_collective(group)
+        self._rank = rank
+        self._world_size = world_size
+        self._process_group = group
+        self._registered_output_ptr = None
+        return self._collective
+
+    def _make_collective(self, group: dist.ProcessGroup) -> Any:
+        rank, world_size = group.rank(), group.size()
         try:
             shmem = importlib.import_module("mori.shmem")
             AllgatherSdma = importlib.import_module("mori.ccl").AllgatherSdma
@@ -311,21 +622,21 @@ class MoriSdmaAllGather(AllGather):
                 f"my_pe/npes={my_pe}/{npes}"
             )
 
-        self._collective = AllgatherSdma(
+        return AllgatherSdma(
             my_pe,
             npes,
             input_buffer_size=4,
             output_buffer_size=4,
             copy_output_to_user=not self._zero_copy_output,
         )
-        self._rank = rank
-        self._world_size = world_size
-        self._registered_output_ptr = None
-        return self._collective
 
     def _ensure_output_registered(
         self, collective: Any, output_tensor: torch.Tensor
     ) -> None:
+        if self._output_pool is not None:
+            if not collective.is_output_registered(output_tensor):
+                raise RuntimeError("MORI output does not belong to a registered pool slot")
+            return
         ptr = output_tensor.data_ptr()
         nbytes = _tensor_nbytes(output_tensor)
         if self._registered_output_ptr == ptr and self._output_buffer_nbytes >= nbytes:
@@ -344,6 +655,8 @@ class MoriSdmaAllGather(AllGather):
         self._registered_output_ptr = ptr
 
     def _deregister_output_buffer_if_needed(self) -> None:
+        if self._output_pool is not None:
+            return  # The pool owns the registration across all its users.
         if self._collective is None or self._output_buffer is None:
             return
         if self._registered_output_ptr != self._output_buffer.data_ptr():
