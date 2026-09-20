@@ -63,3 +63,47 @@ def preshuffle_b(w: torch.Tensor) -> torch.Tensor:
     out = w.view(n // n_lane, n_lane, k // bk, bk // k_pack, k_pack)
     out = out.permute(0, 2, 3, 1, 4).contiguous()
     return out.view(n, k).view(dtype)
+
+
+#: ue8m0 block size along K, fixed by the checkpoint and by the MFMA.
+MXFP8_BLOCK = 32
+#: M rows a wave's four 16-row A tiles span, and so the packing group.
+_A_SCALE_GROUP = 64
+
+
+def preshuffle_a_scale(exps: torch.Tensor) -> torch.Tensor:
+    """Put the ue8m0 A scales in the layout ``--quant mxfp8`` reads.
+
+    Takes the exponent bytes as ``[M, K/32]`` -- one per 32-wide K block, the
+    orientation every quantiser emits -- and returns a flat int32 buffer to hand
+    the kernel as its ``A_scale`` argument.
+
+    Two things happen, for two different reasons.
+
+    **K-block major.** A block group's sixteen lanes want sixteen consecutive
+    rows of one K block, so K major puts them at consecutive addresses and the
+    load coalesces. Row major spreads them ``K/32`` bytes apart, which measured
+    +50-67% on the whole GEMM -- the addresses, not the bytes: same instruction
+    count, 3.2x the cache accesses.
+
+    **Four M tiles to a dword.** A lane's four A tiles differ only by sixteen
+    rows and share the K block, and ``opsel_b`` on the scaled MFMA names which
+    byte of the 32-bit scale operand the instruction reads. So packing the four
+    into one dword turns four loads into one and the byte select costs nothing
+    -- it is the instruction's own field, not a shift. Worth -5 to -7.5%, and
+    it also shrinks the buffer 4x by storing bytes rather than int32. CK does
+    the same thing in ``preShuffleScaleBuffer_gfx950`` (its ``MNXdlPack``).
+
+    So within each 64-row group the order goes from ``ti*16 + r`` to
+    ``r*4 + ti``, which is a ``(4, 16) -> (16, 4)`` transpose and nothing else.
+    """
+    if exps.ndim != 2:
+        raise ValueError(f"expected a 2-D [M, K/32] scale, got {exps.ndim}-D")
+    m, kb = exps.shape
+    if m % _A_SCALE_GROUP:
+        raise ValueError(f"M={m} must be a multiple of {_A_SCALE_GROUP}")
+    if (m * kb) % 4:
+        raise ValueError(f"M*K/32 = {m * kb} must be a multiple of 4")
+    out = exps.to(torch.uint8).t().contiguous()  # [K/32, M], K-block major
+    out = out.view(kb, m // _A_SCALE_GROUP, 4, 16)  # split M into (group, ti, r)
+    return out.permute(0, 1, 3, 2).contiguous().reshape(-1).view(torch.int32)

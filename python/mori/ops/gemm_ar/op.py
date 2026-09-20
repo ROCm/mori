@@ -23,12 +23,12 @@
 
 from __future__ import annotations
 
-from typing import NamedTuple, Optional
-
-import torch
+from typing import NamedTuple
 
 import flydsl.expr as fx
-from mori.cco import CCODevCommRequirements, GDA_CONNECTION_NONE
+import torch
+
+from mori.cco import GDA_CONNECTION_NONE, CCODevCommRequirements
 from mori.tensor_utils import from_gpu_ptr
 
 from .kernels_fused import BLOCK_K, compile_fused_gemm_scatter
@@ -54,6 +54,44 @@ TILE_N_GRANULE = 256
 
 # The block-scale group, on both operands: A is 1x128, B is 128x128.
 SCALE_BLOCK_K = 128
+
+# The ue8m0 group, on both operands: A is 1x32, B is 32x32. DeepSeek-V4.1-Flash
+# quantises this way (`weight_block_size [32, 32]`, `scale_fmt "ue8m0"`).
+MXFP8_BLOCK = 32
+
+#: What the GEMM's operands are quantised as.
+#:
+#: ``"blockscale"``  A 1x128 fp32 scales, B 128x128. DeepSeek-V4-Pro.
+#: ``"mxfp8"``       32-wide ue8m0 on both, fed to the scaled MFMA as
+#:                   instruction operands. DeepSeek-V4.1-Flash.
+#:
+#: They differ in more than a group size: mxfp8 needs BLOCK_M=256 (see
+#: MXFP8_BLOCK_M) and takes its A scale through ``preshuffle_a_scale`` as
+#: int32, where blockscale takes fp32. Both are checked, not assumed.
+QUANTS = ("blockscale", "mxfp8")
+
+
+#: mxfp8's BLOCK_M is not a preference. The kernel packs a lane's four M tiles
+#: into one dword and picks the byte with the MFMA's ``opsel``, and there are
+#: four tiles only when ``BLOCK_M // 64 == 4``. blockscale has no such rule --
+#: its 128 is the measured tile (256x256 spills the doubled accumulator VGPRs),
+#: so other granule-legal tiles stay expressible there.
+MXFP8_BLOCK_M = 256
+
+
+def _default_block_m(quant: str) -> int:
+    return MXFP8_BLOCK_M if quant == "mxfp8" else DEFAULT_BLOCK_M
+
+
+def _quant_tile_constraint(quant: str, block_m: int) -> str | None:
+    """Why this BLOCK_M cannot serve this quantisation, or None."""
+    if quant == "mxfp8" and block_m != MXFP8_BLOCK_M:
+        return (
+            f"quant='mxfp8' requires block_m={MXFP8_BLOCK_M}, got {block_m}: the "
+            f"packed A scale puts a lane's four M tiles in one dword, which is "
+            f"four tiles only at BLOCK_M//64 == 4"
+        )
+    return None
 
 # Chunks are how many separate pushes a destination receives, and so how early
 # the first bytes leave. More is better until the pieces get small enough that
@@ -112,7 +150,7 @@ def counter_chunks(m_pad: int, world_size: int, block_m: int = DEFAULT_BLOCK_M) 
     return max(c for c in range(1, min(MAX_CHUNKS, bands) + 1) if bands % c == 0)
 
 
-def _tile_constraints(block_m: int, block_n: int) -> Optional[str]:
+def _tile_constraints(block_m: int, block_n: int, n_granule: int | None = None) -> str | None:
     """Why this tile is not one the kernel can build, or None.
 
     Checked before anything divides by a tile size. ``padded_m`` and
@@ -123,7 +161,7 @@ def _tile_constraints(block_m: int, block_n: int) -> Optional[str]:
     """
     for name, value, granule in (
         ("block_m", block_m, TILE_M_GRANULE),
-        ("block_n", block_n, TILE_N_GRANULE),
+        ("block_n", block_n, n_granule or TILE_N_GRANULE),
     ):
         if value < granule or value % granule:
             return (
@@ -134,10 +172,15 @@ def _tile_constraints(block_m: int, block_n: int) -> Optional[str]:
     return None
 
 
-def _gemm_constraints(n: int, k: int, block_n: int) -> Optional[str]:
+def _gemm_constraints(
+    n: int, k: int, block_n: int, quant: str = "blockscale"
+) -> str | None:
     """Why the GEMM cannot take this shape, or None. See :func:`supports`."""
+    # K % 128 holds for both, for different reasons: it is blockscale's group,
+    # and it is the scaled MFMA's K step.
     if k % SCALE_BLOCK_K:
-        return f"K={k} must be a multiple of {SCALE_BLOCK_K} (the block-scale group)"
+        why = "the block-scale group" if quant == "blockscale" else "the MFMA's K step"
+        return f"K={k} must be a multiple of {SCALE_BLOCK_K} ({why})"
     if k < MIN_K:
         return (
             f"K={k} is below the minimum {MIN_K}: the mainloop prefetches a "
@@ -145,8 +188,9 @@ def _gemm_constraints(n: int, k: int, block_n: int) -> Optional[str]:
         )
     if n % block_n:
         return f"N={n} must be a multiple of block_n={block_n}"
-    if n % SCALE_BLOCK_K:
-        return f"N={n} must be a multiple of {SCALE_BLOCK_K} (the B scale group)"
+    b_group = MXFP8_BLOCK if quant == "mxfp8" else SCALE_BLOCK_K
+    if n % b_group:
+        return f"N={n} must be a multiple of {b_group} (the B scale group)"
     return None
 
 
@@ -192,10 +236,11 @@ def supports(
     k: int,
     world_size: int,
     *,
-    block_m: int = DEFAULT_BLOCK_M,
+    block_m: int | None = None,
     block_n: int = DEFAULT_BLOCK_N,
     gather_dtype: str = "bf16",
     gather_transport: str = "lsa",
+    quant: str = "blockscale",
 ) -> bool:
     """Whether this shape is *expressible*, which is not whether it is faster.
 
@@ -206,10 +251,17 @@ def supports(
     rather than by a second copy of its rules: a predicate that says yes where
     construction raises, or vice versa, is worse than no predicate.
     """
+    if quant not in QUANTS:
+        return False
+    # block_m follows the quantisation unless the caller pins it; passing the
+    # wrong one is a rejection rather than a silent reinterpretation.
+    block_m = _default_block_m(quant) if block_m is None else block_m
     # Tile and world size first: everything below divides by their product.
     if world_size < 1 or _tile_constraints(block_m, block_n) is not None:
         return False
-    if m <= 0 or _gemm_constraints(n, k, block_n) is not None:
+    if _quant_tile_constraint(quant, block_m) is not None:
+        return False
+    if m <= 0 or _gemm_constraints(n, k, block_n, quant) is not None:
         return False
     try:
         _build_cfg(
@@ -301,6 +353,91 @@ def _flatten_a_scale(a_scale: torch.Tensor, m: int, kb: int) -> torch.Tensor:
     )
 
 
+def _flatten_mxfp8_a_scale(a_scale: torch.Tensor, m: int, k: int) -> torch.Tensor:
+    """A's ue8m0 scales as ``preshuffle_a_scale`` emits them.
+
+    Deliberately stricter than :func:`_flatten_a_scale`: there is no logical 2-D
+    spelling to disambiguate here, because the layout is not a transpose of
+    anything. Inside each 64-row group the order goes from ``ti*16 + r`` to
+    ``r*4 + ti`` so a lane's four M tiles land in one dword, which no 2-D shape
+    describes. Callers build it with ``preshuffle_a_scale`` (or have their
+    quantiser write it directly) and pass it flat; anything else is rejected
+    rather than reinterpreted.
+
+    int32 rather than the uint8 the scales really are: the MFMA's scale operand
+    is a 32-bit register, and four packed bytes are one element of it.
+    """
+    want = m * k // (4 * MXFP8_BLOCK)  # four ue8m0 bytes to an int32
+    if a_scale.dim() != 1:
+        raise ValueError(
+            f"a_scale must be the flat buffer preshuffle_a_scale returns; got "
+            f"shape {tuple(a_scale.shape)}. The packed layout is a permutation "
+            f"within each 64-row group, so no 2-D shape describes it."
+        )
+    if a_scale.numel() != want:
+        raise ValueError(
+            f"a_scale has {a_scale.numel()} elements, expected M*K/128 = {want} "
+            f"(M*K/32 ue8m0 bytes, four to an int32)"
+        )
+    return a_scale
+
+
+class _PinnedLaunch:
+    """A compiled FlyDSL kernel with its dispatch resolved once.
+
+    ``JitFunction.__call__`` re-derives the cache key on every call before it
+    reaches the ``CallState`` that does the work: an ``inspect`` signature bind,
+    a snapshot of ~35 referenced globals, a drift check against them, a
+    compile-hint resolve and a runtime-pairing check. Measured on the fused wo_b
+    at M=5120: **31.9us for a phase and 85.9us for the GEMM**, against 5.9us of
+    actual ``hipModuleLaunchKernel``. Four launches per call is 181.6us of
+    Python, and the phases are sequential, so it sits on the critical path
+    between them -- enough to make a layer whose GPU work is 526us take 707us.
+
+    So let the first call go through the normal path, then keep the
+    ``CallState`` it produced and hand it the argument tuple directly. Safe
+    because ``CallState`` re-reads every argument each call -- it pre-allocates
+    the ctypes storage, not the values.
+
+    The tuple order is *verified*, not assumed: at capture time this binds the
+    same arguments through FlyDSL's own signature and checks element-by-element
+    that the tuple it would build is identical. Getting that order wrong would
+    not fail, it would feed the kernel the wrong pointers.
+    """
+
+    __slots__ = ("_fn", "_state")
+
+    def __init__(self, fn):
+        self._fn = fn
+        self._state = None
+
+    def __call__(self, *args, stream):
+        if self._state is not None:
+            return self._state(args + (stream,))
+        out = self._fn(*args, stream=stream)
+        self._pin(args, stream)
+        return out
+
+    def _pin(self, args, stream):
+        """Capture the CallState, or give up and stay on the normal path."""
+        try:
+            cache = self._fn._call_state_cache
+            # One JitFunction per compiled shape here, so one entry. More than
+            # one means it is shared and the entry cannot be chosen blind.
+            if len(cache) != 1:
+                return
+            state = next(iter(cache.values()))
+            bound = self._fn._sig.bind(*args, stream=stream)
+            bound.apply_defaults()
+            want = tuple(bound.arguments.values())
+            ours = args + (stream,)
+            if len(want) != len(ours) or any(a is not b for a, b in zip(want, ours)):
+                return
+        except Exception:  # noqa: BLE001 - any surprise means stay on the slow path
+            return
+        self._state = state
+
+
 class _Plan(NamedTuple):
     """One M's compiled pipeline.
 
@@ -335,12 +472,13 @@ class GemmAllReduceOp:
         n: int,
         k: int,
         m_max: int,
-        block_m: int = DEFAULT_BLOCK_M,
+        block_m: int | None = None,
         block_n: int = DEFAULT_BLOCK_N,
         sdma_queues: int = 1,
         gather_dtype: str = "bf16",
         gather_transport: str = "lsa",
-        max_shapes: Optional[int] = None,
+        quant: str = "blockscale",
+        max_shapes: int | None = None,
     ):
         # Cleanup state before anything can raise. The rollback below calls
         # close(), which clears these; initialising them after the try block
@@ -349,8 +487,18 @@ class GemmAllReduceOp:
         self._closed = True  # so a failed constructor leaves close() a no-op
         self.mem = self.win = self.dev_comm = None
         self._cache: dict[int, _Plan] = {}
-        self._pad_in: Optional[torch.Tensor] = None
+        self._pad_in: torch.Tensor | None = None
 
+        if quant not in QUANTS:
+            raise ValueError(f"quant={quant!r} is not one of {sorted(QUANTS)}")
+        # Each quantisation has exactly one legal BLOCK_M (see _quant_block_m).
+        # Default to it, and reject a mismatch loudly rather than compiling a
+        # kernel whose scale indexing does not match the operand handed in.
+        if block_m is None:
+            block_m = _default_block_m(quant)
+        why = _quant_tile_constraint(quant, block_m)
+        if why is not None:
+            raise ValueError(why)
         if gather_dtype not in WIRE_DTYPES:
             raise ValueError(
                 f"gather_dtype={gather_dtype!r} is not one of {sorted(WIRE_DTYPES)}"
@@ -381,7 +529,7 @@ class GemmAllReduceOp:
             )
         if max_shapes < 1:
             raise ValueError(f"max_shapes must be >= 1; got {max_shapes}")
-        why = _gemm_constraints(n, k, block_n)
+        why = _gemm_constraints(n, k, block_n, quant)
         if why is not None:
             raise ValueError(f"unsupported shape: {why}")
         self.comm = comm
@@ -390,6 +538,7 @@ class GemmAllReduceOp:
         # world_size. Normalise here so the op's own surface has one name.
         self.world_size = comm.nranks
         self.n, self.k = n, k
+        self.quant = quant
         self.block_m, self.block_n = block_m, block_n
         self.sdma_queues = sdma_queues
         #: fp8 halves the all-gather's bytes, which is ~40% of a fused layer.
@@ -445,7 +594,7 @@ class GemmAllReduceOp:
         block_m: int = DEFAULT_BLOCK_M,
         gather_dtype: str = "bf16",
         gather_transport: str = "lsa",
-        max_shapes: Optional[int] = None,
+        max_shapes: int | None = None,
     ) -> int:
         """Symmetric-window bytes an op for this shape will allocate.
 
@@ -521,7 +670,7 @@ class GemmAllReduceOp:
             b_preshuffled=True,
             fuse=True,
             transport="sdma",
-            quant="blockscale",
+            quant=self.quant,
             sdma_queues=self.sdma_queues,
             # The three C-store stages are off by default in
             # compile_fused_gemm_scatter, and blockscale requires swap_ab.
@@ -533,9 +682,11 @@ class GemmAllReduceOp:
         # fused_order rather than a literal list: the fp8 wire inserts a
         # quantise and a dequantise around the gather, and a hardcoded
         # drain/reduce/gather would skip them and reduce into zeros.
-        tail = tuple(parts[name] for name in parts["fused_order"])
+        # Pinned launchers on the hot path; `parts` keeps the raw ones, which is
+        # what self_test uses (it runs a different order, once).
+        tail = tuple(_PinnedLaunch(parts[name]) for name in parts["fused_order"])
         hit = _Plan(
-            gemm=gemm,
+            gemm=_PinnedLaunch(gemm),
             tail=tail,
             parts=parts,
             input=from_gpu_ptr(
@@ -548,7 +699,7 @@ class GemmAllReduceOp:
         self._cache[m] = hit
         return hit
 
-    def self_test(self, m: Optional[int] = None) -> None:
+    def self_test(self, m: int | None = None) -> None:
         """Verify that the collective actually moves bytes. Raises if it does not.
 
         The failure this exists for is silent. A mori built without
@@ -645,7 +796,7 @@ class GemmAllReduceOp:
                 handle.close()
         self.win = self.mem = None
 
-    def __enter__(self) -> "GemmAllReduceOp":
+    def __enter__(self) -> GemmAllReduceOp:
         return self
 
     def __exit__(self, *exc) -> None:
@@ -699,10 +850,22 @@ class GemmAllReduceOp:
         block_m`` (see :meth:`padded_m`), ``b_preshuffled`` is ``[N, K]``
         through :func:`preshuffle_b`.
 
-        ``a_scale`` may be ``[M, K/128]`` (the logical shape, either memory
-        order), ``[K/128, M]``, or already flat in physical order -- see
-        :func:`_flatten_a_scale`, which is where the distinction is made rather
-        than assumed. ``b_scale`` is ``[N/128, K/128]`` row-major.
+        The scales follow ``quant``:
+
+        ``blockscale``
+            ``a_scale`` may be ``[M, K/128]`` (the logical shape, either memory
+            order), ``[K/128, M]``, or already flat in physical order -- see
+            :func:`_flatten_a_scale`, which is where the distinction is made
+            rather than assumed. ``b_scale`` is ``[N/128, K/128]`` row-major.
+            Both fp32.
+
+        ``mxfp8``
+            ``a_scale`` is what :func:`~mori.ops.gemm_ar.preshuffle_a_scale`
+            returns: flat int32, ``M*K/128`` elements, and **only** flat -- the
+            packed layout is a permutation inside each 64-row group, so no 2-D
+            shape describes it. ``b_scale`` is the ``[N/32, K/32]`` ue8m0 bytes
+            K-block major and widened, i.e. ``e.t().contiguous().to(int32)``,
+            flat. Both int32.
 
         The returned tensor aliases the window and is overwritten by the next
         call. Clone it to keep it. One instance is not usable concurrently: the
@@ -727,7 +890,11 @@ class GemmAllReduceOp:
             a_fp8.contiguous().view(torch.int8).view(-1),
             b_preshuffled.contiguous().view(torch.int8).view(-1),
             plan.input.view(-1),
-            _flatten_a_scale(a_scale, m, self.k // SCALE_BLOCK_K),
+            (
+                _flatten_mxfp8_a_scale(a_scale, m, self.k)
+                if self.quant == "mxfp8"
+                else _flatten_a_scale(a_scale, m, self.k // SCALE_BLOCK_K)
+            ),
             b_scale.reshape(-1),
             m,
             self.n,
@@ -749,6 +916,7 @@ class GemmAllReduceOp:
         """
         if self.mem is None:
             raise RuntimeError("this GemmAllReduceOp has been closed")
+        mxfp8 = self.quant == "mxfp8"
         kb = self.k // SCALE_BLOCK_K
         for name, t, shape in (
             ("a_fp8", a_fp8, (m, self.k)),
@@ -764,12 +932,30 @@ class GemmAllReduceOp:
                 )
             if t.device.type != "cuda":
                 raise ValueError(f"{name} must be on a GPU, got {t.device}")
-        for name, t, numel in (
-            ("a_scale", a_scale, m * kb),
-            ("b_scale", b_scale, (self.n // SCALE_BLOCK_K) * kb),
-        ):
-            if t.dtype != torch.float32:
-                raise ValueError(f"{name} must be float32, got {t.dtype}")
+        # mxfp8's scales are ue8m0 exponent bytes read as int32, four packed to
+        # an element on A and one per 32x32 block on B. blockscale's are fp32.
+        # The dtype is load-bearing on both: the kernel indexes dwords, so a
+        # tensor of the right element count in the wrong dtype spans the wrong
+        # bytes and returns finite nonsense.
+        if mxfp8:
+            want_dtype = torch.int32
+            sizes = (
+                ("a_scale", a_scale, m * self.k // (4 * MXFP8_BLOCK)),
+                (
+                    "b_scale",
+                    b_scale,
+                    (self.n // MXFP8_BLOCK) * (self.k // MXFP8_BLOCK),
+                ),
+            )
+        else:
+            want_dtype = torch.float32
+            sizes = (
+                ("a_scale", a_scale, m * kb),
+                ("b_scale", b_scale, (self.n // SCALE_BLOCK_K) * kb),
+            )
+        for name, t, numel in sizes:
+            if t.dtype != want_dtype:
+                raise ValueError(f"{name} must be {want_dtype}, got {t.dtype}")
             if t.numel() != numel:
                 raise ValueError(f"{name} must have {numel} elements, got {t.numel()}")
             if t.device.type != "cuda":
