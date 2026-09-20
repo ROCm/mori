@@ -813,25 +813,49 @@ plus a fill guard.
 
 ### End to end, in SGLang
 
-Three servers, one per wire, GSM8K then `bench_one_batch_server`, two full runs.
-Prefill throughput, tok/s, median, on V4.1-Flash:
+Prefill throughput, tok/s, `bench_one_batch_server`, TP4 on V4.1-Flash, one
+server per variant with GSM8K in front of it.
+
+**The fused wo_b**, three servers:
 
 | bs | base | bf16 wire | | fp8 wire | |
 |---|---:|---:|---:|---:|---:|
-| 1 | 27349 | 27632 | +1.0% | 28173 | +3.0% |
-| 4 | 34101 | 34990 | +2.6% | 36029 | **+5.7%** |
-| 8 | 34948 | 35790 | +2.4% | 36733 | **+5.1%** |
-| 16 | 35151 | 35969 | +2.3% | 36930 | **+5.1%** |
+| 1 | 28148 | 28469 | +1.1% | 29107 | **+3.4%** |
+| 4 | 34386 | 35356 | +2.8% | 36442 | **+6.0%** |
+| 8 | 35153 | 35920 | +2.2% | 37217 | **+5.9%** |
+| 16 | 35423 | 36084 | +1.9% | 37416 | **+5.6%** |
 
-**bs=1 is a built-in control**: M=4096 is below both floors, so no variant fuses
-there and all three should agree -- they do, within 3%. That is what makes the
-bs>=4 figures a signal rather than drift.
+GSM8K 0.917 / 0.912 / 0.918, all three inside each other's noise, so the fp8
+leg's relL2 2.3e-2 is below what 1319 questions resolve. That is not what the
+gate is for: it catches a collective that moved nothing, which scores near zero
+while still answering fluently.
 
-GSM8K passes on all three (base .915/.916, bf16 .914/.917, fp8 .921/.924) and
-the three sit inside each other's noise, so the fp8 leg's relL2 2.3e-2 is below
-what 1319 questions resolve. That is not what the gate is for: it catches a
-collective that moved nothing, which scores near zero while still answering
-fluently.
+**The two wires do not fuse at the same batch size, and an earlier revision of
+this section had that wrong.** It called bs=1 a built-in control on the grounds
+that M=4096 is below both floors -- but the floors are 8192 for bf16 and *2048*
+for fp8. The shape log settles it: the bf16 wire's smallest served M is 7734,
+the fp8 wire's is 1792. So bs=1 is a control for the bf16 column only, and the
+fp8 column's +3.4% there is a real win rather than drift.
+
+**The GEMM on its own**, a separate pair of servers with
+`SGLANG_OPT_MORI_MXFP8_GEMM=1` and nothing fused:
+
+| bs | base | mori GEMM | |
+|---|---:|---:|---:|
+| 1 | 28598 | 29313 | +2.5% |
+| 4 | 34269 | 35047 | +2.3% |
+| 8 | 35086 | 35865 | +2.2% |
+| 16 | 35412 | 36232 | +2.3% |
+
+GSM8K 0.920 / 0.928. Its shape log shows `wq_b`, `wo_b` and `wqkv_a` served and
+`shared gate_up` declined, which is what the tables above predict.
+
+**These three results do not add.** At `wo_b` the model calls `fused_wo_b`
+first and only reaches the linear when it declines, so the two paths split that
+layer rather than stacking on it; what the standalone GEMM adds beyond the
+fused path is `wq_b` and `wqkv_a`, which are column-parallel and have no
+collective to fuse with. Both enabled together is a fourth configuration and
+has not been measured.
 
 The decode column is not reported as evidence. `wo_b` never fuses at decode's M,
 so the three variants should be identical, and they scatter -8.6% to +14.1% --
