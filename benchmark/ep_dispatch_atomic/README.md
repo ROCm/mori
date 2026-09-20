@@ -138,6 +138,74 @@ in flow, compact reads 6 MB that dispatch has only just written, behind dispatch
 barrier tail. **Isolated kernel timings did not compose here** -- that is the main
 methodological lesson of this file.
 
+## Can compact be made faster? No -- it is already at the floor
+
+Two experiments, both negative, both worth recording:
+
+**Block size is already optimal.** An fp4 row is 3584 B = 224 uint4, so at 256 threads
+each thread moves a single 16 B chunk with 32 lanes idle -- it looks starved of work
+next to bf16's 3.5 chunks per thread. Giving threads more work makes it *worse*: the
+kernel is parallelism-bound, not ILP-bound.
+
+| threads/block | dispatch leg | combine leg | pair |
+|---:|---:|---:|---:|
+| 64 | 34.36 | 49.03 | 83.39 |
+| 128 | 33.56 | 45.90 | 79.46 |
+| **256** (default) | **32.84** | **44.87** | **77.71** |
+| 512 | 34.01 | 45.30 | 79.31 |
+| 1024 | 35.22 | 46.71 | 81.93 |
+
+**The permutation is free.** `EPCOMPACT_STRAIGHT=1` drops the segment search, the LDS
+prefix sum and the `__syncthreads()`, copying row r to row r -- same volume, same launch,
+no gather:
+
+| | dispatch leg |
+|---|---:|
+| variant A, no compaction | 26.64 |
+| + payload compact, permuted | 31.40 |
+| + payload compact, **straight copy** | 31.32 |
+
+0.08us apart. The addressing costs nothing; the entire 4.7us is moving 12 MB right after
+dispatch has written it. **There is no kernel optimization left.** The only way to make
+compaction cheaper is to not do it.
+
+## Eliminating the passes
+
+`dispDestTokIdMap` is written by the SENDER at dispatch (line 446 of the variant header):
+
+```cpp
+index_t j = atomicAdd(&s_run[myDestPe], 1);
+myDestTokId = s_base[myDestPe] + j;              // segmented slot under variant A
+args.dispDestTokIdMap[tok * topk + _eLane] = EpFlatIndex<kCfg>(myDestPe, myDestTokId);
+```
+
+and combine reads it back and gathers straight from the peer (line 1197):
+
+```cpp
+index_t destTokId = args.dispDestTokIdMap[tokenId * topk + j];
+srcPtrs[j] = EpPeer<TokT>(win, destPe, args.offOutTok) + destLocalTokId * hiddenDim + ...;
+```
+
+Combine never assumes a layout -- it goes exactly where the map points. So the layout is
+decided by one value, `s_base[p]`, and both passes are bookkeeping, not data:
+
+- **expand dies if the map holds dense indices.** `dense_idx = prefix_p[me] + off`, where
+  `prefix_p[me] = sum_{j<me} n[j][p]`. Rewriting the map is 3072 int32 = 12 KB against
+  expand's 24 MB read + 24 MB write.
+- **compact dies too if `s_base[p]` is that dense base in the first place.** Then the
+  payload lands dense, the layout is byte-identical to stock, and no consumer changes.
+
+`prefix_p[me]` depends only on `n[j][p]`, the send counts -- which every sender knows for
+its own row before any payload moves. So it needs a counts-only exchange at the head of
+dispatch: `world^2` ints, 64 B at EP4, and a rendezvous before slot assignment. This is
+what DeepEP's notify_dispatch does.
+
+The open question is whether that front rendezvous costs less than the 4.7us it saves.
+Today dispatch waits only at the END, so a front barrier converts skew that the inbound
+wait currently absorbs into skew paid twice. Estimated, if the rendezvous lands at 2-3us:
+dispatch ~29-30 against stock's 35.69, pair ~70-71 against 76.52, **-7 to -8% with a
+dense layout and no consumer change**. Not measured -- this is the next experiment.
+
 ## Correctness
 
 | check | covers | result |
