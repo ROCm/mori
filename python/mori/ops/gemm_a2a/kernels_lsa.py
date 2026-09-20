@@ -70,6 +70,7 @@ import mori.cco.device.flydsl as cco
 # copy of them would be a second thing to keep in step with flydsl's API.
 from ..gemm_ar._compat import (
     CM_CACHED,
+    CM_SC0_SC1,
     buffer_load,
     buffer_store,
     create_buffer_resource_from_addr,
@@ -114,7 +115,7 @@ def _spin_until(rsrc, flag):
         scf.YieldOp([nxt.ir_value() if hasattr(nxt, "ir_value") else nxt])
 
 
-def build_lsa_a2a(cfg, rank: int, *, src: str = "local"):
+def build_lsa_a2a(cfg, rank: int, *, src: str = "local", uncached: bool = True):
     """Compile an LSA all-to-all launcher for ``cfg`` on ``rank``.
 
     Returns ``run(dev_comm, win, stream=...)``, which moves this rank's
@@ -133,6 +134,22 @@ def build_lsa_a2a(cfg, rank: int, *, src: str = "local"):
     the *destination* has to be symmetric, and reserving another ``M*N*2`` bytes
     of registered window (75 MiB at the model shape) to hold a buffer no peer
     ever reads would be pure waste.
+
+    ``uncached`` sends the peer stores with ``sc0|sc1`` instead of letting them
+    sit in this rank's L2. It is on by default for two reasons, and the
+    correctness one came first:
+
+    * A cached store to peer-homed memory leaves the line dirty in whichever
+      XCD's L2 the block ran on, and the barrier that follows publishes arrival
+      with a *system-scope* atomic, which can overtake it. gemm_ar hit exactly
+      this and its note is at the same store. Nothing here fences before
+      signalling, so cached stores were relying on luck.
+    * It is also what the bandwidth wants: cached peer stores were reaching 58%
+      of line rate where the copy engines reach 94%.
+
+    The reason gemm_ar could not always use it is that a 2-byte partial-line
+    write over the fabric loses updates. This kernel stores 16 bytes per lane
+    and 1024 contiguous bytes per wave, so that objection does not apply.
 
     Each kernel is specialised on the Python ``rank`` so every window offset
     folds to a constant, as ``examples/cco/python/07_flydsl_sdma`` does.
@@ -238,7 +255,10 @@ def build_lsa_a2a(cfg, rank: int, *, src: str = "local"):
                 # Compact on the peer side, so the address is just `pk`. That is
                 # the side that crosses xGMI, and it is fully contiguous.
                 buffer_store(
-                    vals[j], dests[j], pk * I32_PER_PACK, cache_modifier=CM_CACHED
+                    vals[j],
+                    dests[j],
+                    pk * I32_PER_PACK,
+                    cache_modifier=CM_SC0_SC1 if uncached else CM_CACHED,
                 )
 
         # Every store must be visible to the destination before it is told the
