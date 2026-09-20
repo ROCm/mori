@@ -108,6 +108,17 @@ _DISP_DT = {
 }[_DISP]
 _DISP_NBYTES = {torch.bfloat16: 2, torch.float8_e4m3fn: 1}.get(_DISP_DT, 0.5)
 _FP4 = _DISP_DT is torch.float4_e2m1fn_x2
+# Variant A's landing zone is segmented, so a layout-unaware consumer needs a
+# compaction pass. Production order is dispatch -> compact -> expert -> expand ->
+# combine, so compact is charged to the dispatch leg and expand to the combine
+# leg -- that is what a serving stack actually pays. Off by default: with
+# EPCOMPACT=0 every call below is the stock one, byte for byte.
+EPCOMPACT = int(os.environ.get("EPCOMPACT", "0"))
+EPCOMPACT_LIB = os.environ.get("EPCOMPACT_LIB", "/tmp/libepcompact.so")
+# The reverse-map move is a SECOND launch on the dispatch leg. Off isolates what
+# the payload move alone costs -- correctness needs it on, so EPCOMPACT_MAP=0 is
+# a timing probe only and CHECK must be 0 with it.
+EPCOMPACT_MAP = int(os.environ.get("EPCOMPACT_MAP", "1"))
 # What the correctness gate covers, as one token. A bool cannot say it: fp4 and
 # an all-zero payload verify the dispatch bytes but never compare combine's
 # output, and a row claiming "verified" next to a combine_us nobody checked is
@@ -188,6 +199,108 @@ def main():
 
     ops = {b: build(b) for b in BACKENDS}
 
+    def compaction_for(op):
+        """Closures for one op's compact/expand, plus the counts buffer dispatch
+        exports into and the dense buffer an expert would read.
+
+        The two legs move DIFFERENT row widths. dispatch's landing zone is at the
+        wire dtype (fp4 -> 3584 B) but combine's input is always bf16 (14336 B),
+        so expand is 4x the bytes of compact on the fp4 path. Pricing both at the
+        dispatch width understates the drop-in cost, so each is measured against
+        its own tensor rather than a shared HIDDEN*nbytes.
+
+        maxRows is fixed at the recv CAPACITY, not the live total: the kernel
+        derives its real bound from counts[] on device, and a production caller
+        cannot know the total without a host sync it would never pay for. That
+        also keeps the launch shape constant, which graph capture requires.
+        """
+        import ctypes
+
+        lib = ctypes.CDLL(EPCOMPACT_LIB)
+        for fn in (lib.ep_compact, lib.ep_expand):
+            fn.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
+            fn.restype = ctypes.c_int
+        for fn in (lib.ep_compact_idx, lib.ep_expand_idx):
+            fn.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_int] * 3 + [ctypes.c_void_p]
+            fn.restype = ctypes.c_int
+
+        recv, comb = op.recv_tokens(), op.combine_in_view()
+        cap = recv.shape[0]
+        stride, drowB = cap // world, recv.nbytes // cap
+        crowB = comb.nbytes // comb.shape[0]
+        counts = torch.zeros(world, dtype=torch.int32, device=f"cuda:{rank}")
+        # Raw bytes, not zeros_like: torch has no fill_cuda for fp4, and the
+        # kernel wants a pointer and a row width regardless. (n, rowB) uint8 is
+        # also exactly the shape check_dispatch compares against.
+        d_disp = torch.zeros(cap, drowB, dtype=torch.uint8, device=f"cuda:{rank}")
+        d_comb = torch.zeros_like(comb)  # what the expert writes; combine is bf16
+        # The per-slot reverse map carries the same gaps as the payload, so a
+        # consumer reading dense rows needs it in dense order too. 4 B/row against
+        # 3584, but it is a real launch and is charged to the dispatch leg.
+        d_map = torch.zeros(cap, dtype=torch.int32, device=f"cuda:{rank}")
+        seg_map = [None]  # the routing handle's map tensor, bound per dispatch
+        if rank == 0:
+            print(
+                f"# epcompact: cap={cap} stride={stride} "
+                f"disp_row={drowB}B comb_row={crowB}B lib={EPCOMPACT_LIB}",
+                flush=True,
+            )
+
+        def compact_map():
+            if seg_map[0] is None or not EPCOMPACT_MAP:
+                return
+            lib.ep_compact_idx(
+                seg_map[0].data_ptr(),
+                d_map.data_ptr(),
+                counts.data_ptr(),
+                world,
+                stride,
+                cap,
+                torch.cuda.current_stream().cuda_stream,
+            )
+
+        def compact():
+            lib.ep_compact(
+                recv.data_ptr(),
+                d_disp.data_ptr(),
+                counts.data_ptr(),
+                world,
+                stride,
+                drowB,
+                cap,
+                torch.cuda.current_stream().cuda_stream,
+            )
+
+        def expand():
+            lib.ep_expand(
+                comb.data_ptr(),
+                d_comb.data_ptr(),
+                counts.data_ptr(),
+                world,
+                stride,
+                crowB,
+                cap,
+                torch.cuda.current_stream().cuda_stream,
+            )
+
+        return dict(
+            compact_map=compact_map,
+            dmap=d_map,
+            segmap=seg_map,
+            compact=compact,
+            expand=expand,
+            counts=counts,
+            dense=d_disp,
+            dcomb=d_comb,
+            ddtype=recv.dtype,
+        )
+
+    _CP = {id(o): compaction_for(o) for o in ops.values()} if EPCOMPACT else {}
+
+    def scales_arg(op):
+        """Variant A rides its per-source counts on the dead scalesBuf slot."""
+        return _CP[id(op)]["counts"] if EPCOMPACT else None
+
     if rank == 0:
         print(
             f"# EP{world} hidden={HIDDEN} topk={TOPK} epr={EPR} "
@@ -219,9 +332,21 @@ def main():
         """
         if not CHECK or total == 0:
             return 0
-        tis = routing.disp_tok_id_to_src_tok_id_local[:total].cpu()
+        # Under compaction the map is compacted alongside the payload, so both
+        # are in dense order and index each other. Without it, both are raw.
+        tis = (
+            _CP[id(op)]["dmap"]
+            if EPCOMPACT
+            else routing.disp_tok_id_to_src_tok_id_local
+        )[:total].cpu()
         src_pe, src_tok = (tis // M).to(torch.int64), (tis % M).to(torch.int64)
-        got = op.recv_tokens()[:total].cpu().view(torch.uint8)
+        # With compaction the consumer reads the DENSE buffer, so that is what
+        # gets checked -- which makes this gate cover the compaction pass too,
+        # not just the transport. Rows [0,total) are dense under both layouts,
+        # and the reverse map is in the same order, so the comparison is
+        # unchanged; only the buffer it reads from moves.
+        src = _CP[id(op)]["dense"] if EPCOMPACT else op.recv_tokens()
+        got = src[:total].cpu().view(torch.uint8)
         bad = 0
         for pe in src_pe.unique().tolist():  # one regeneration per source rank
             sel = src_pe == pe
@@ -251,7 +376,12 @@ def main():
         dispatch accumulates into it while only combine clears it, so the next
         combine would stage twice the tokens and run past the arena.
         Returns (total_recv, buf, ok, checked)."""
-        *_, total_t, r = op.dispatch(i_, w_, None, x_, return_routing=True)
+        *_, total_t, r = op.dispatch(i_, w_, scales_arg(op), x_, return_routing=True)
+        cp = _CP.get(id(op))
+        if cp:
+            cp["segmap"][0] = r.disp_tok_id_to_src_tok_id_local
+            cp["compact"]()
+            cp["compact_map"]()
         lockstep()  # the reverse map is only valid after this barrier
         total = int(total_t.cpu().item())
         dispatch_bad = check_dispatch(op, total, r)
@@ -260,9 +390,22 @@ def main():
         # holds however wrong the kernel is. fp4 cannot go through combine at all
         # (hip has no fp4 combine), so for it check_dispatch is the whole story.
         checked = bool(CHECK) and not _FP4 and not _data.verifies_nothing(INIT)
-        if checked:  # identity expert: stage the dispatched tokens unchanged
-            stage.copy_(op.recv_tokens()[:total].to(stage.dtype))
-        buf = stage.clone() if COMBINE_IN == "staged" else stage
+        if cp:
+            # Identity expert on the DENSE buffer compaction produced, then
+            # scatter back to segmented positions -- a real expert's output has
+            # to make the same trip, since combine gathers through the SENDER's
+            # map. combine gets the full view, not a [:total] slice: under
+            # variant A the live rows run to the end of the last segment.
+            if checked:
+                src = cp["dense"][:total].view(cp["ddtype"])
+                cp["dcomb"][:total].copy_(src.to(cp["dcomb"].dtype))
+            cp["expand"]()
+            base = op.combine_in_view()
+        else:
+            if checked:  # identity expert: stage the dispatched tokens unchanged
+                stage.copy_(op.recv_tokens()[:total].to(stage.dtype))
+            base = stage
+        buf = base.clone() if COMBINE_IN == "staged" else base
         out, _ = op.combine(buf, routing=r)
         lockstep()
         if dispatch_bad:
@@ -638,10 +781,31 @@ def main():
                 ]
                 continue  # never report bandwidth for a kernel computing garbage
 
+            cp = _CP.get(id(op))
+
+            def d_leg():
+                """The dispatch leg as a consumer sees it: transport, then -- if
+                the landing zone is segmented -- the compaction that hands the
+                expert a dense buffer. Both are charged to dispatch, because
+                nothing downstream can start until the second one lands."""
+                *_, r = op.dispatch(i_, w_, scales_arg(op), x_, return_routing=True)
+                if cp:
+                    cp["segmap"][0] = r.disp_tok_id_to_src_tok_id_local
+                    cp["compact"]()
+                    cp["compact_map"]()
+                return r
+
+            def c_leg(r):
+                """The combine leg: scatter the expert's output back to segmented
+                positions, then combine. The expert itself is identity here, as
+                on the stock path, so only the two transports are timed."""
+                if cp:
+                    cp["expand"]()
+                op.combine(buf, routing=r)
+
             def one_pair():
                 """A layer's two all2all legs, in order, nothing in between."""
-                *_, r = op.dispatch(i_, w_, None, x_, return_routing=True)
-                op.combine(buf, routing=r)
+                c_leg(d_leg())
 
             def capture_pair():
                 """One graph per leg, so the pair still alternates on replay. The
@@ -649,22 +813,21 @@ def main():
                 combine graph was captured against that handle."""
                 gd = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(gd):
-                    *_, r_cap = op.dispatch(i_, w_, None, x_, return_routing=True)
+                    r_cap = d_leg()
                 lockstep()
                 gc = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(gc):
-                    op.combine(buf, routing=r_cap)
+                    c_leg(r_cap)
                 lockstep()
                 return gd, gc
 
             held = [None]  # eager's combine needs the handle its dispatch produced
 
             def eager_d():
-                *_, r = op.dispatch(i_, w_, None, x_, return_routing=True)
-                held[0] = r
+                held[0] = d_leg()
 
             def eager_legs():
-                return eager_d, lambda: op.combine(buf, routing=held[0])
+                return eager_d, lambda: c_leg(held[0])
 
             for mode in MODES:
                 d_us, c_us, run_d, run_c = time_pairs(

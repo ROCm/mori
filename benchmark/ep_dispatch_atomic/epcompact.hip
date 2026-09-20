@@ -34,6 +34,32 @@ __global__ void k_move(uint4* __restrict__ seg, uint4* __restrict__ dense,
   }
 }
 
+// The payload is not the only thing dispatch leaves segmented: the per-slot
+// reverse map (disp_tok_id_to_src_tok_id_local) is sized at the recv capacity and
+// carries the same gaps, so a consumer reading dense rows needs it in dense order
+// too. Same permutation, 4 B rows instead of 3584 -- too narrow for the uint4 path
+// above, so it gets one thread per row rather than one block.
+template <bool COMPACT>
+__global__ void k_move_i32(int* __restrict__ seg, int* __restrict__ dense,
+                           const int* __restrict__ counts, int world, int stride) {
+  extern __shared__ int pre[];
+  if (threadIdx.x == 0) {
+    int acc = 0;
+    for (int s = 0; s < world; ++s) { pre[s] = acc; acc += counts[s]; }
+    pre[world] = acc;
+  }
+  __syncthreads();
+  const int total = pre[world];
+  for (int r = blockIdx.x * blockDim.x + threadIdx.x; r < total;
+       r += gridDim.x * blockDim.x) {
+    int s = 0;
+    while (s + 1 < world && r >= pre[s + 1]) ++s;
+    const int slot = s * stride + (r - pre[s]);
+    if (COMPACT) dense[r] = seg[slot];
+    else         seg[slot] = dense[r];
+  }
+}
+
 extern "C" {
 // rowBytes must be a multiple of 16; both fp4 (3584) and bf16 (14336) are.
 int ep_compact(void* seg, void* dense, const void* counts, int world, int stride,
@@ -50,6 +76,24 @@ int ep_expand(void* seg, void* dense, const void* counts, int world, int stride,
   int grid = maxRows < 4096 ? maxRows : 4096;
   hipLaunchKernelGGL((k_move<false>), dim3(grid), dim3(256), (world + 1) * sizeof(int), (hipStream_t)stream,
                      (uint4*)seg, (uint4*)dense, (const int*)counts, world, stride, rowBytes / 16);
+  return 0;
+}
+// int32-per-row variant for the reverse map. maxRows sizes the grid only; the
+// real bound still comes from counts[] on device.
+int ep_compact_idx(void* seg, void* dense, const void* counts, int world, int stride,
+                   int maxRows, void* stream) {
+  int grid = (maxRows + 255) / 256;
+  if (grid < 1) grid = 1;
+  hipLaunchKernelGGL((k_move_i32<true>), dim3(grid), dim3(256), (world + 1) * sizeof(int), (hipStream_t)stream,
+                     (int*)seg, (int*)dense, (const int*)counts, world, stride);
+  return 0;
+}
+int ep_expand_idx(void* seg, void* dense, const void* counts, int world, int stride,
+                  int maxRows, void* stream) {
+  int grid = (maxRows + 255) / 256;
+  if (grid < 1) grid = 1;
+  hipLaunchKernelGGL((k_move_i32<false>), dim3(grid), dim3(256), (world + 1) * sizeof(int), (hipStream_t)stream,
+                     (int*)seg, (int*)dense, (const int*)counts, world, stride);
   return 0;
 }
 }
