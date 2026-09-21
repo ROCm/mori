@@ -152,6 +152,11 @@ launch overhead, not work. They share the prefix sum, and an fp4 row is 224 uint
 What compaction now costs in flow is 5.55us on the dispatch leg and nothing on the
 combine leg, against variant A's 9.4us saving.
 
+That 5.55us is this arm at this iteration count. Measured in isolation, one token count
+per process, the same pass is 4.1us at 512 tokens and ranges 4.0 to 12.25us across the
+shapes in "The win is shape-dependent" above. Quote a compaction cost with the shape it
+was measured at; there is no single number.
+
 **Not measured: the prefix exchange.** `prefix[pe] = sum_{j<rank} counts_pe[j]` is a
 column sum over what OTHER senders put on pe, so the sender cannot compute it locally.
 Here it is built once during priming with an `all_gather` of `world` int32, which is
@@ -174,10 +179,36 @@ Two things an isolated benchmark got wrong, both found only by measuring in flow
   kernel is the obvious fix and is not done.
 
 Payload compaction also costs 5.22us in flow against 2.18us measured in a tight local
-loop. The isolated loop re-reads the same buffers 50 times with everything resident;
+loop (`evidence/compact.hip`). The isolated loop re-reads the same buffers 50 times with everything resident;
 in flow, compact reads 6 MB that dispatch has only just written, behind dispatch's
 barrier tail. **Isolated kernel timings did not compose here** -- that is the main
 methodological lesson of this file.
+
+### The win is shape-dependent, and it is gone by 4096 tokens
+
+Everything above is the 512 token-per-rank target shape. The win does not hold across
+shapes. Dispatch leg, one token count per process, two runs each, spread <= 0.4us:
+
+| tokens/rank | stock | variant A alone | + compact (shipped) | net |
+|---:|---:|---:|---:|---:|
+| 256 | 30.5 | 25.5 | 29.5 | -3.3% |
+| 512 | 35.65 | 26.5 | **30.6** | **-14.2%** |
+| 1024 | 57.5 | 48.7 | 54.0 | -6.1% |
+| 2048 | 64.2 | 51.3 | 58.4 | -9.0% |
+| 4096 | 67.8 | 55.2 | 67.45 | **-0.5%** |
+
+Two curves in opposite directions. Variant A's own gain saturates -- 5.0, 9.2, 8.8, 12.9,
+12.6us -- because it removes contention and barrier queueing, a per-round cost that does
+not scale with payload. Compaction's cost grows with the data: 4.0, 4.1, 5.3, 7.1,
+12.25us. At 4096 they are 12.6 against 12.25 and cancel. Past 4096 the shipped path will
+be SLOWER than stock, because the gain is capped and the cost is not. Anyone taking this
+to a larger shape needs the "Eliminating the passes" work first, not this as-is.
+
+**Measure one token count per process.** A multi-point sweep inflates its later points,
+unequally between arms: 4096 reads 76-83us as the tail of a sweep and 67.8 +/- 0.4 on its
+own. An earlier revision of this file's conclusions came from sweeps and reported a win
+at 4096 that does not exist. If a result disagrees with an isolated re-run, trust the
+isolated one.
 
 ## The win does not depend on the measurement method
 
@@ -204,9 +235,11 @@ GEV is the one to quote because it is the tightest, not because it flatters the 
 
 combine lands within 40.6-44.1us in all six runs, confirming it is untouched.
 
-## Can compact be made faster? No -- it is already at the floor
+## Can compact be made faster?
 
-Two experiments, both negative, both worth recording:
+Two experiments below are negative and worth recording. They do NOT add up to
+"nothing left" -- see the limits at the end of this section, which an earlier
+revision of this file got wrong.
 
 **Block size is already optimal.** An fp4 row is 3584 B = 224 uint4, so at 256 threads
 each thread moves a single 16 B chunk with 32 lanes idle -- it looks starved of work
@@ -231,9 +264,37 @@ no gather:
 | + payload compact, permuted | 31.40 |
 | + payload compact, **straight copy** | 31.32 |
 
-0.08us apart. The addressing costs nothing; the entire 4.7us is moving 12 MB right after
-dispatch has written it. **There is no kernel optimization left.** The only way to make
-compaction cheaper is to not do it.
+0.08us apart. The addressing costs nothing -- and note this also rules the per-block
+prologue out as the cost, since `STRAIGHT` drops the segment search, the LDS prefix sum
+and the `__syncthreads()` for 0.08us.
+
+**What these two experiments do not show.** Both were run at one token count, and they
+vary threads-per-block and addressing -- not the grid, and not the fixed/marginal split.
+Measured per token count, one count per process, compact's achieved bandwidth is not flat:
+
+| tokens/rank | recv rows | MB moved (r+w) | compact us | achieved GB/s |
+|---:|---:|---:|---:|---:|
+| 256 | 844 | 6.05 | 4.0 | 1512 |
+| 512 | 1688 | 12.10 | 4.1 | 2951 |
+| 1024 | 3358 | 24.07 | 5.3 | 4541 |
+| 2048 | 6743 | 48.33 | 7.1 | 6808 |
+| 4096 | 13513 | 96.86 | 12.25 | **7907** |
+
+Doubling the data from 256 to 512 tokens costs 2.5% more time, so most of the 4.1us at
+the target shape is fixed, not bandwidth. And 7907 GB/s at 4096 is far above the 3496
+GB/s uncached-gather figure the "at the floor" claim rested on, so that figure was not
+the right ceiling for this kernel.
+
+Two things remain untested, and a colleague should treat them as open:
+
+- **The grid is never swept.** `epcompact.hip` hardcodes `grid = min(maxRows, 4096)`, and
+  `maxRows` is the worst case (`world * maxTokPerRank`) while dedup delivers ~82% of it.
+  So every block gets about one row until the grid saturates at 4096 -- which is exactly
+  the point where achieved bandwidth peaks. There is no env knob for it yet.
+- **The fixed cost is not split.** How much of the ~4us is the extra graph node versus
+  work inside the kernel is unmeasured. If it is mostly the node, only fusing or
+  eliminating the pass helps; if not, the grid is worth a sweep. Isolate it by running
+  compact with the payload move compiled out.
 
 ## Eliminating the passes
 
@@ -313,9 +374,13 @@ kernel still fails, so the gate has not simply gone blind.
   with an `all_gather`, which only works because the routing is fixed here. The argument
   that it rides the signal path for free is untested, and it is the one thing standing
   between this and a real integration.
-- **Compaction still costs 5.55us.** Folding the payload move into dispatch's tail would
-  remove it, but that needs the counts before the transfer -- a front rendezvous against
-  a kernel that currently waits only at the end.
+- **Folding compaction into dispatch's tail was tried and it regresses.** The epilogue
+  version is correct but measures 37.3us against 30.5us for dispatch plus a separate
+  compact kernel. A diagnostic build with the payload copy removed put 9.1 of the 11.6us
+  down to holding every block resident through the peer wait; the copy itself was 2.5us,
+  as predicted. The pass is cheap, staying resident to do it is not. Do not re-try this
+  without first solving the front rendezvous -- the counts are needed before the
+  transfer, and the kernel currently waits only at the end.
 - The compaction kernels launch from Python via `ctypes`, not from inside the op.
 - The per-source counts ride on `args.scalesBuf`, which is only safe while
   `kCfg.scaleBytes == 0`. A real integration wants its own `EpArgs` field -- an ABI
@@ -339,6 +404,82 @@ step). `export_to_perfetto` takes `slot_map=` so the names come from Python.
 Covers all 512 warps (64 blocks x 8 warps -- the real geometry, which
 `hip_tuning_configs.py` selects for this shape; note it is 8 warps, not the
 `ep_spec.cpp` default of 16). Wall clock calibrated at **99.845 MHz** against the host.
+
+### Profiling variant A (`ep_intranode_1250x.profilerA.hpp`)
+
+`ep_intranode_1250x.profiler.hpp` instruments the STOCK body, so it answers "why is
+stock slow", not "what does variant A look like". `ep_intranode_1250x.profilerA.hpp` is
+the same instrumentation over the variant A body: `variantA.patch` hunks 1, 2 and 4.
+
+Hunk 3 is deliberately left out. Variant A's per-source count export and the profiler's
+trace buffer both ride on the dead `EpArgs.scalesBuf`, so they cannot coexist; the
+profiler keeps it, since nothing in a profiling run reads those counts. The cost is that
+this header cannot drive the compaction path -- to trace dispatch and compact in one
+timeline, move the count export to `outWeightsBuf` (also dead in dispatch) first.
+
+Run either header with `profiler/ept_prof.py`, which allocates the ring, drains it and
+calls `export_to_perfetto`; `profiler/trace_stats2.py` reduces the drained `.pt` to the
+per-slot tables below, split by whether a warp was the first arriver:
+
+```sh
+cp -a <jit tree> /tmp/jit_profA
+cp benchmark/ep_dispatch_atomic/profiler/ep_intranode_1250x.profilerA.hpp \
+   /tmp/jit_profA/src/ops/dispatch_combine_v2/ep_intranode_1250x.hpp
+MORI_SOURCE_ROOT=/tmp/jit_profA MORI_JIT_EXTRA_FLAGS=-DENABLE_PROFILER ENABLE_PROFILER=1 \
+  M=512 PAIRS=5 WARMUP=20 torchrun --standalone --nproc_per_node=4 profiler/ept_prof.py
+```
+
+ENABLE_PROFILER kernels are cached under a separate JIT key, so `~/.mori` needs no wipe.
+
+Stock against variant A, identical routing (recv 1701/1697/1663/1693), mean us per warp:
+
+| slot | stock | variant A | stock p95 | variant A p95 |
+|---|---:|---:|---:|---:|
+| SlotReserve | 11.29 | **0.74** | 20.35 | **0.96** |
+| PayloadTdm | 9.11 | 9.23 | 13.70 | 13.82 |
+| MetaTdm | 2.79 | 2.92 | 8.37 | 8.05 |
+| MetaStage | 1.27 | 1.06 | 1.64 | 1.36 |
+| Setup | 1.07 | 1.13 | 1.56 | 1.68 |
+| Routing | 0.71 | 0.69 | 0.92 | 0.92 |
+
+Everything else moves by 0.15us or less. On the first-arriver warp, which owns the waits,
+`SlotReserve` goes 8.40 -> 0.70 and `InboundWait` 12.01 -> 4.69: peers reach the barrier
+sooner once they are not queueing on the allocator.
+
+Traced spans are for attribution only. They cost about 4us (traced stock 39.62us against
+35.65us in the bench) and cost more on the contended path, so the traced delta overstates
+the bench delta. Use the trace to apportion, the bench for totals. Keep the launch
+geometry at the 64x8 default: `PROFILER_WARPS_PER_RANK` backs 4096 warps, and a larger
+grid is dropped silently rather than reported.
+
+## Validated from a clean tree
+
+Final check of the shipped artifacts: `_jit-sources` copied fresh, this directory's
+`ep_intranode_1250x.variantA.hpp` dropped in, `epcompact.hip` rebuilt from this
+directory, four arms run one per process at 512 tokens/rank, fp4, ITERS=50.
+
+| arm | dispatch | combine | correctness |
+|---|---:|---:|---|
+| stock | 35.87 | 40.97 | 1/1 verified |
+| variant A alone | 26.5 | 40.9 | not checkable -- see note |
+| variant A + compact | 31.5 | 44.8 | 1/1 verified |
+| **variant A + fused + remap (ship)** | **30.28** | 41.45 | **1/1 verified** |
+
+Dispatch leg -5.59us, -15.6%. Pair 76.84 -> 71.73us, -6.7%. Zero byte mismatches and
+zero injectivity failures on every checkable arm.
+
+The dispatch spread also collapses: stock ranges 32.73-38.84us across 20 replays, the
+shipped path 29.77-30.98us. That is the same contention removal the profiler sees as
+`SlotReserve` p95 falling 20.35 -> 0.96us.
+
+`variant A alone` cannot be correctness-checked: with `EPCOMPACT=0` the checker reads
+`[:total]` of a landing zone that is now segmented, so it walks the gaps and reports
+false mismatches. It is a timing arm only, which is why it runs with `CHECK=0`.
+
+Confirm the `[GEV]` line shows `mode=graph ... R=20 N=20` and that no line says
+`periter`; the host-event fallback reports dispatch ~8us high and would invalidate the
+comparison. Note the `[E2E]` line that prints `src=` is suppressed when `E2E_R=0`, so
+checking for `src=gev` there is vacuous in this configuration -- grep `[GEV]` instead.
 
 ## Reproducing
 
