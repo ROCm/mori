@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MORI Shmem Guide &mdash; MORI development (e7e97479) documentation</title>
+  <title>MORI Shmem Guide &mdash; MORI development (bb3a9aa3) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=b00cea33"></script>
+      <script src="_static/documentation_options.js?v=2fefe6e0"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -293,17 +293,14 @@
 </li>
 <li class="toctree-l1"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html">MORI GEMM + All-Reduce Benchmark</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#running-the-benchmark">Running the benchmark</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#headline">Headline</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#where-the-time-goes">Where the time goes</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#the-fp8-wire">The fp8 wire</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#who-moves-the-gather">Who moves the gather</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#the-pull-grid">The pull grid</a></li>
-<li class="toctree-l3"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#what-fp8-costs-numerically">What fp8 costs, numerically</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#summary">Summary</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#running-the-benchmark">Running the benchmark</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#modes-and-quantisation">Modes and quantisation</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#the-fp8-wire-s-knobs">The fp8 wire’s knobs</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#the-gemm-on-its-own">The GEMM on its own</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#model-level-evaluation">Model-level evaluation</a></li>
-<li class="toctree-l2"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#negative-results">Negative results</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#measurement-discipline">Measurement discipline</a></li>
 <li class="toctree-l2"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#reproducing-the-end-to-end-numbers">Reproducing the end-to-end numbers</a></li>
 </ul>
 </li>
@@ -1043,7 +1040,7 @@ what the EP proxy formula above assumes.</p></li>
 
   <div role="contentinfo">
     <p>&#169; Copyright 2026, AMD.
-      <span class="lastupdated">Last updated on 2026-09-20.
+      <span class="lastupdated">Last updated on 2026-09-21.
       </span></p>
   </div>
 
