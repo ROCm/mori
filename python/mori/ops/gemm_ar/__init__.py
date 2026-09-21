@@ -29,8 +29,8 @@
 # touching the op or the kernels raises.
 import importlib
 
-from .layout import ArConfig, MAX_WORLD, ar_config, select_stage
-from ._shuffle import preshuffle_b
+from ._shuffle import preshuffle_a_scale, preshuffle_b
+from .layout import MAX_WORLD, ArConfig, ar_config, select_stage
 
 _LAZY = {
     "GemmAllReduceOp": "op",
@@ -41,6 +41,11 @@ _LAZY = {
     "DEFAULT_BLOCK_N": "op",
     "MAX_CHUNKS": "op",
     "SCALE_BLOCK_K": "op",
+    "Mxfp8GemmOp": "gemm",
+    "supports_gemm": "gemm",
+    "Mxfp8GemvOp": "gemv",
+    "supports_gemv": "gemv",
+    "select_config": "gemv",
     "compile_fused_gemm_scatter": "kernels_fused",
     "build_sdma_phases": "kernels_sdma",
     "build_sdma_ar": "kernels_sdma",
@@ -48,19 +53,24 @@ _LAZY = {
 }
 
 __all__ = [
-    "ArConfig",
-    "ar_config",
-    "GemmAllReduceOp",
     "MAX_WORLD",
+    "ArConfig",
+    "GemmAllReduceOp",
+    "Mxfp8GemmOp",
+    "Mxfp8GemvOp",
+    "ar_config",
     "build_lsa_ar",
     "build_sdma_ar",
     "build_sdma_phases",
     "compile_fused_gemm_scatter",
     "counter_chunks",
     "padded_m",
+    "preshuffle_a_scale",
     "preshuffle_b",
     "select_stage",
     "supports",
+    "supports_gemm",
+    "supports_gemv",
 ]
 
 
