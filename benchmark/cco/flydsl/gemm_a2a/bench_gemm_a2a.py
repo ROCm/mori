@@ -92,6 +92,7 @@ MODES = (
     "fused-sdma",
     "split-rccl",
     "gemm-to-window",
+    "split-lsa-staged",
 )
 NOT_YET = ()
 
@@ -252,6 +253,7 @@ def run(args) -> int:
         "fused-sdma",
         "gemm-staging",
         "split-rccl",
+        "split-lsa-staged",
     )
     needs_sdma = args.mode in ("split-sdma", "fused-sdma")
     # A chunk is a run of row tiles; the count has to divide them, and the
@@ -340,6 +342,9 @@ def run(args) -> int:
                 xcd_swizzle=args.xcd_swizzle,
                 rotated=args.rotated,
                 n_stripe=args.n_stripe,
+                direct_fence=args.direct_fence,
+                emit_put=not args.no_put,
+                fence=args.fence,
             )
         else:
             gemm = compile_gemm_local(
@@ -378,9 +383,17 @@ def run(args) -> int:
         else:
             sa_arg, sb_arg = sa, sb
 
+        # Same kernel, same store side, same bytes over the fabric. Only the
+        # *read* layout differs: [M,N] strided against the compacted slab. That
+        # is the one variable this pair isolates.
         copy = (
-            build_lsa_a2a(cfg, rank, uncached=args.lsa_uncached)
-            if args.mode == "split-lsa"
+            build_lsa_a2a(
+                cfg,
+                rank,
+                src="staging" if args.mode == "split-lsa-staged" else "local",
+                uncached=args.lsa_uncached,
+            )
+            if args.mode in ("split-lsa", "split-lsa-staged")
             else None
         )
         # fused-lsa has no collective kernel -- the epilogue already wrote into
@@ -402,7 +415,11 @@ def run(args) -> int:
             else None
         )
         rccl = args.mode == "split-rccl"
-        c_ptr = c.data_ptr()
+        c_ptr = (
+            mem.ptr + cfg.staging_off
+            if args.mode == "split-lsa-staged"
+            else c.data_ptr()
+        )
 
         def once():
             stream = fx.Stream(torch.cuda.current_stream())
@@ -441,7 +458,11 @@ def run(args) -> int:
 
         rel_l2 = float("nan")
         validated = True
-        if not args.skip_validation:
+        if args.no_put:
+            # Nothing was transferred; the received buffer holds this
+            # rank's own block and stale peer blocks. Timing only.
+            rel_l2, validated = float("nan"), True
+        elif not args.skip_validation:
             if args.mode == "gemm-to-window":
                 # Writing [M,N] over the recv region does not produce the
                 # all-to-all's answer, and is not meant to. Only the time
@@ -488,6 +509,43 @@ def run(args) -> int:
                 )
 
         us = _median_us(once, args.warmup, args.iters, graph=not args.no_graph)
+        # Same-run phase split, as gcnasm's strict_timing does. The headline
+        # `us` stays the whole thing; these two are only for attribution, and
+        # they exist because "mode E2E minus a separate gemm-only run" charges
+        # the transfer for any difference between two process groups.
+        phase_us = {}
+        # Every communicating mode, rccl included -- it has neither `copy` nor
+        # `parts` because the collective is a torch call.
+        #
+        # Order matters and is the same for all of them: the full thing first,
+        # then the GEMM alone. Measuring the GEMM in a *separate run* gave
+        # 324.4us where the same kernel measured here gives 297.3 -- 27us of
+        # clock ramp, which a cross-run subtraction charges to the transport.
+        # That is how split-sdma came to look like 94% of line rate when it is
+        # 81%.
+        if args.phase_split and (copy is not None or parts is not None or rccl):
+
+            def _gemm_only():
+                stream = fx.Stream(torch.cuda.current_stream())
+                gemm(
+                    a_i8,
+                    b_i8,
+                    c_flat,
+                    sa_arg,
+                    sb_arg,
+                    args.m,
+                    args.n,
+                    dc.ptr,
+                    win.handle,
+                    stream=stream,
+                )
+
+            comm.barrier()
+            phase_us["compute"] = _median_us(
+                _gemm_only, args.warmup, args.iters, graph=not args.no_graph
+            )
+            comm.barrier()
+            phase_us["comm"] = us - phase_us["compute"]
         comm.barrier()
 
         gathered = [None] * world_size
@@ -505,6 +563,7 @@ def run(args) -> int:
                 "rel_l2": rel_l2,
                 "validated": all(g["ok"] for g in gathered),
                 "remote_bytes_per_rank": cfg.remote_bytes_per_rank,
+                **{f"phase_{k}": v for k, v in phase_us.items()},
             }
             print("RESULT_JSON " + json.dumps(result, sort_keys=True), flush=True)
 
@@ -530,6 +589,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rotated", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--n-stripe", type=int, default=1)
     p.add_argument("--chunks", type=int, default=1)
+    p.add_argument("--direct-fence", choices=("leader", "all"), default="leader")
+    p.add_argument("--fence", choices=("none", "leader", "all"), default="leader")
     p.add_argument("--copy-blocks", type=int, default=0)
     p.add_argument(
         "--lsa-uncached", action=argparse.BooleanOptionalAction, default=True
@@ -539,6 +600,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--no-graph", action="store_true")
+    p.add_argument("--phase-split", action="store_true")
+    p.add_argument(
+        "--no-put",
+        action="store_true",
+        help="run the fused epilogue without posting; output is wrong "
+        "by construction and validation is skipped",
+    )
     p.add_argument("--skip-validation", action="store_true")
     #: fp8's own floor at these shapes is ~2e-3; 3e-3 leaves headroom for the
     #: accumulation order differing from the host reference without admitting a

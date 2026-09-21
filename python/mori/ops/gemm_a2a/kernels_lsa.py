@@ -243,6 +243,14 @@ def build_lsa_a2a(cfg, rank: int, *, src: str = "local", uncached: bool = True):
             vals = []
             for j in range_constexpr(ws):
                 d = (rank + j) % ws
+                if const_expr(src == "staging" and d == rank):
+                    # The staging GEMM routes its own destination straight into
+                    # recv, so that slab is not in staging and is already where
+                    # it belongs. Skipping it also makes this path move exactly
+                    # the bytes the SDMA scatter moves, which is the point of
+                    # being able to compare them.
+                    vals.append(None)
+                    continue
                 if const_expr(src == "staging"):
                     read_at = (d * slab_packs + pk) * I32_PER_PACK
                 else:
@@ -252,6 +260,8 @@ def build_lsa_a2a(cfg, rank: int, *, src: str = "local", uncached: bool = True):
                     ) * I32_PER_PACK
                 vals.append(buffer_load(source, read_at, vec_width=4, dtype=i32_type()))
             for j in range_constexpr(ws):
+                if const_expr(vals[j] is None):
+                    continue
                 # Compact on the peer side, so the address is just `pk`. That is
                 # the side that crosses xGMI, and it is fully contiguous.
                 buffer_store(

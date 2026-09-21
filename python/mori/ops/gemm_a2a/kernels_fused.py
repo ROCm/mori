@@ -246,6 +246,9 @@ def compile_fused_gemm_a2a(
     sdma_queues: int = 1,
     self_to_recv: bool = True,
     staging_store: str = "buffer",
+    direct_fence: str = "leader",
+    emit_put: bool = True,
+    fence: str = "leader",
 ):
     """The GEMM with its C stored straight into the destinations' windows.
 
@@ -253,6 +256,13 @@ def compile_fused_gemm_a2a(
     stream=...)``. ``C`` is not written on this path -- it is still passed
     because the shared ``StoreC`` builds a descriptor from it -- and a cross-rank
     barrier still has to follow the launch before ``recv`` may be read.
+
+    ``emit_put=False`` runs the whole epilogue -- the release fence, the
+    completion counter, the submit lock -- and simply does not post. The result
+    is wrong by construction and it exists only to price the bookkeeping
+    separately from the transfer, which matters because at M=16384 this path is
+    26% *slower* than its own split baseline and a transfer that is genuinely
+    overlapped cannot do that.
 
     ``rotated`` walks the destinations round-robin, offset by ``rank``, instead
     of finishing destination 0's columns before starting 1's. Linear order makes
@@ -276,6 +286,10 @@ def compile_fused_gemm_a2a(
             "the staging GEMM for the split path; an unfused LSA GEMM is just "
             "compile_gemm_local"
         )
+    if fence not in ("none", "leader", "all"):
+        raise ValueError(f"fence must be none, leader or all, got {fence!r}")
+    if direct_fence not in ("leader", "all"):
+        raise ValueError(f"direct_fence must be leader or all, got {direct_fence!r}")
     if staging_store not in ("buffer", "copy"):
         raise ValueError(f"staging_store must be buffer or copy, got {staging_store!r}")
     if staging_store == "copy" and direct_lsa_probe(transport):
@@ -337,7 +351,8 @@ def compile_fused_gemm_a2a(
         f"mori_a2a_{transport if fuse else 'stage'}_8w_"
         f"{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_k{K}_"
         f"{'B' if blockscale else 'P'}{'r' if rotated else 'l'}s{n_stripe}"
-        f"c{chunks}q{sdma_queues}{'S' if self_to_recv else 'A'}_r{rank}"
+        f"c{chunks}q{sdma_queues}{'S' if self_to_recv else 'A'}"
+        f"{direct_fence[0]}{fence[0]}{'p' if emit_put else 'x'}_r{rank}"
     )
 
     @fx.struct
@@ -739,8 +754,17 @@ def compile_fused_gemm_a2a(
             # kernel that follows is one block, hence one XCD's L2 out of eight;
             # the other seven would keep their peer-homed lines dirty and the
             # barrier's system-scope atomic would overtake them.
+            #
+            # One wave per block, not every lane. That is legal *because* the
+            # barrier pair above is closed: wait_barrier(0) means every wave's
+            # stores have retired into this CU's L2, so one wave writing it back
+            # covers all eight. gemm_ar carries the same reasoning and the same
+            # default, and measured the leader form as incorrect only before its
+            # barrier pair was fixed. Every-lane costs a whole-L2 writeback per
+            # lane, which is the same shape of mistake as the unfused staging
+            # GEMM's unconditional fence.
             wait_barrier(0)
-            raw_cco.cco_system_fence(fx.Int32(0))
+            raw_cco.cco_system_fence(fx.Int32(1 if direct_fence == "leader" else 0))
         else:
             # Retire this block's stores into the staging slab, agree block-wide
             # that they are retired, then publish them -- but only when this
@@ -760,8 +784,26 @@ def compile_fused_gemm_a2a(
             # ranks while taking relL2 from 2.35e-3 to 3.76e-3 on 8, i.e. the
             # copy engine reads some tiles stale.
             wait_barrier(0)
-            if const_expr(fuse):
+            if const_expr(fuse and fence == "all"):
                 raw_cco.cco_system_fence(fx.Int32(0))
+            elif const_expr(fuse and fence == "leader"):
+                # One wave per block, not every lane. Every lane costs a whole-L2
+                # writeback each, and at M=16384 there are 9216 blocks: the
+                # epilogue's bookkeeping measured 2358us against a 2798us GEMM,
+                # with the PUT itself worth 0.8us of that. Same mistake as the
+                # unfused path's unconditional fence and the direct-LSA tail's
+                # every-lane one; this is the third place it was written.
+                #
+                # Legal for the same reason the direct-LSA tail's is: the
+                # half-wave barrier pair is closed above, so wait_barrier(0)
+                # really does mean every wave's stores have retired into this
+                # CU's L2 and one wave writing it back covers all eight.
+                raw_cco.cco_system_fence(fx.Int32(1))
+            # "none": gemm_ar's own default here. Its stores go through the
+            # same L2 the copy engine reads, and it measured the fence as
+            # unnecessary on that path -- but it also measured dropping it as
+            # taking relL2 from 2.35e-3 to 3.76e-3 on 8 ranks, so it stays
+            # selectable rather than assumed.
 
             # Both bases are rank-local and constant-offset, so they are the same
             # for every thread. Taking them here rather than inside the `if` also
@@ -788,7 +830,7 @@ def compile_fused_gemm_a2a(
                 # the same property that makes graph replay behave like a fresh
                 # launch.
                 if seq % fx.Int32(tiles_per_chunk) == fx.Int32(0):
-                    if const_expr(fuse) and dest != fx.Int32(rank):
+                    if const_expr(fuse and emit_put) and dest != fx.Int32(rank):
                         off = fx.Int64(chunk) * fx.Int64(chunk_bytes)
                         lock = signal_ptr(lock_base + fx.Int64(dest) * fx.Int64(4))
                         if const_expr(chunks > 1):
