@@ -139,12 +139,14 @@ PRESETS = {
     ),
     "fused-fp8": dict(
         doc="the same mode matrix on the winning fp8 wire, which is where the "
-        "fusion is actually deployed",
+        "fusion is actually deployed. `split-lsa` is absent on purpose: it has "
+        "no fp8 gather leg (`build_lsa_ar` takes no `gather_dtype`), so the "
+        "bench refuses the pair at entry and those points can never run",
         script="bench_gemm_ar.py",
         world=4,
         grid=_grid(
             m=[4096, 8192, 16384],
-            mode=["gemm-only", "split-sdma", "split-lsa", "fused-sdma", "fused-lsa"],
+            mode=["gemm-only", "split-sdma", "fused-sdma", "fused-lsa"],
         ),
         args=[
             "-n",

@@ -58,6 +58,21 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
 import timing  # noqa: E402
+from bench_gemm_ar import reference_partial  # noqa: E402
+
+#: Why the reference is built here rather than taken from the first impl.
+#:
+#: Seeding `ref` from the first implementation's output makes that impl its own
+#: reference: its `rel_l2` is identically 0 and it is reported `validated=true`
+#: whatever it computed. A single-impl run -- which this benchmark supports and
+#: the docs recommend -- then validates nothing at all, and a bug shared by
+#: every impl is invisible.
+#:
+#: `reference_partial` is the fp32 reference `bench_gemm_ar.py` already scores
+#: against, reused so the two benchmarks next to each other are equally strong.
+#: Where no independent reference exists (anything that quantises inside the
+#: timed region), `validated` is `None` -- not `True`.
+_REF_NOTE = __doc__
 
 MXFP8_BK = 32
 SCALE_BK = 128
@@ -215,7 +230,7 @@ def mori_kernel_call(ops, n, k, m, block_n, quant):
         from mori.ops.gemm_ar import layout
         from mori.ops.gemm_ar.kernels_fused import compile_fused_gemm_scatter
 
-        a, _w, w_shuf, sa, sb = ops
+        a, w, w_shuf, sa, sb = ops
         gemm = compile_fused_gemm_scatter(
             layout.ArConfig(world_size=2, m=128, n=n),
             0,
@@ -248,7 +263,10 @@ def mori_kernel_call(ops, n, k, m, block_n, quant):
             )
             return y
 
-        return call, [w_shuf.contiguous().view(torch.int8).view(-1)]
+        # An fp32 reference built from the same raw operands, not from another
+        # implementation's output. See `_REF_NOTE`.
+        ref = reference_partial(a, w, sa, sb, "blockscale")
+        return call, [w_shuf.contiguous().view(torch.int8).view(-1)], ref
 
     from mori.ops.gemm_ar import preshuffle_a_scale
 
@@ -264,7 +282,10 @@ def mori_kernel_call(ops, n, k, m, block_n, quant):
     def call(picked):
         return op(a, picked[0], a_scale, ops["b_scale"])[:m]
 
-    return call, [ops["mori_w"]]
+    # `ea`/`w_exps` are the raw ue8m0 bytes the preshuffles were built from, so
+    # this reference shares no code with the kernel under test. See `_REF_NOTE`.
+    ref = reference_partial(a[:m], ops["w_raw"], ea[:m], ops["w_exps"], "mxfp8")
+    return call, [ops["mori_w"]], ref
 
 
 def mori_linear_call(ops, n, k, m, block_n, x_bf16):
@@ -279,7 +300,10 @@ def mori_linear_call(ops, n, k, m, block_n, x_bf16):
         a_fp8, a_scale = quantize_packed(x_in)
         return op(a_fp8, picked[0], a_scale, ops["b_scale"])[:m]
 
-    return call, [ops["mori_w"]]
+    # No independent reference: the A quantisation happens inside the timed
+    # region and its packed scales are not the raw exponents `reference_partial`
+    # takes. Reported as `validated=None` rather than guessed at.
+    return call, [ops["mori_w"]], None
 
 
 def sglang_linear_call(layer, x_bf16):
@@ -308,7 +332,9 @@ def sglang_linear_call(layer, x_bf16):
             weight_bf16=(picked[1] if len(picked) > 1 else None),
         )
 
-    return call, weights
+    # SGLang's linear quantises inside the timed region, same as
+    # `mori_linear_call`; no independent reference. See `_REF_NOTE`.
+    return call, weights, None
 
 
 # --------------------------------------------------------------------------
@@ -361,6 +387,20 @@ def main() -> int:
 
     if args.quant == "blockscale" and ("sglang" in impls or args.scope == "linear"):
         p.error("--quant blockscale is mori-only and kernel-scope only")
+    if args.scope == "kernel" and "sglang" in impls:
+        # The two sides do not share operands: `mori_kernel_call` builds its own
+        # pre-quantised A from seed 99, while SGLang's entry point is a *linear*
+        # and quantises the outer bf16 `x` itself. Scoring one against the other
+        # reads as SGLang failing validation -- a false accusation against the
+        # baseline -- and the timings are not comparable either, since only one
+        # side carries the quantisation. `--scope linear` is the scope in which
+        # the comparison means anything, which is what this file's own docstring
+        # already says.
+        p.error(
+            "--impl sglang needs --scope linear: in kernel scope the two sides "
+            "consume different operands, so neither the relL2 nor the time is a "
+            "comparison. Use --scope linear, or drop sglang from --impl."
+        )
 
     vram_before = timing.vram_used()
     if args.quant == "mxfp8":
@@ -398,22 +438,29 @@ def main() -> int:
                 row["route"] = native_route_plan(
                     m, n, k, ops["layer"].weight_bf16 is not None, False
                 )
-                call, weights = sglang_linear_call(ops["layer"], x)
+                call, weights, impl_ref = sglang_linear_call(ops["layer"], x)
             else:
                 block_n = {"auto": None, "gemm256": 256, "gemm128": 128}[impl]
                 row["route"] = impl
                 if args.scope == "kernel":
-                    call, weights = mori_kernel_call(ops, n, k, m, block_n, args.quant)
+                    call, weights, impl_ref = mori_kernel_call(
+                        ops, n, k, m, block_n, args.quant
+                    )
                 else:
-                    call, weights = mori_linear_call(ops, n, k, m, block_n, x)
+                    call, weights, impl_ref = mori_linear_call(ops, n, k, m, block_n, x)
 
             got = call(weights)
             torch.cuda.synchronize()
-            if ref is None:
-                ref = got.float().clone()
-            row["rel_l2"] = rel_l2(got, ref)
+            # The fp32 reference from the impl's own raw operands, when it has
+            # one. Never seeded from another impl's output -- see `_REF_NOTE`.
+            if ref is None and impl_ref is not None:
+                ref = impl_ref.float()
+            row["rel_l2"] = rel_l2(got, ref) if ref is not None else None
             row.update(timing.cold_hot_us(call, weights, reps=args.reps))
-            row["validated"] = row["rel_l2"] is None or row["rel_l2"] <= args.tol
+            # `None` means "nothing to check against", which is not a pass.
+            row["validated"] = (
+                None if row["rel_l2"] is None else row["rel_l2"] <= args.tol
+            )
         except _Unsupported as err:
             # The op declining a shape it documents as out of range is a
             # *result*, not a crash: `shared_gate_up` is N=1152, which is 4.5
@@ -428,13 +475,21 @@ def main() -> int:
             print(f"  {impl:<10} FAILED {row['error']}", flush=True)
             traceback.print_exc(limit=2)
         else:
-            flag = "" if row["validated"] else "  !! rel_l2 over tol"
+            if row["validated"] is None:
+                # Timed but unchecked. Distinguished from a pass in the output
+                # as well as in the JSON, so a run that validated nothing does
+                # not read like one that validated everything.
+                rel = "  relL2      n/a (no independent reference)"
+            else:
+                rel = f"  relL2 {row['rel_l2']:.2e}" + (
+                    "" if row["validated"] else "  !! rel_l2 over tol"
+                )
             print(
                 f"  {impl:<10} hot {row['hot_us']:8.2f}  cold {row['cold_us']:8.2f}"
-                f"  relL2 {row['rel_l2']:.2e}{flag}",
+                f"{rel}",
                 flush=True,
             )
-            if not row["validated"]:
+            if row["validated"] is False:
                 failures += 1
         rows.append(row)
 

@@ -51,6 +51,7 @@ from mori.ops.gemm_ar.kernels_gemv import compile_mxfp8_gemv
 
 sys.path.insert(0, str(Path(__file__).parent))
 import timing  # noqa: E402
+from bench_gemm_ar import reference_partial  # noqa: E402
 
 MXFP8_BK = 32
 SHAPES = {"wq_b": (8192, 1280), "wo_b": (5120, 2048)}
@@ -193,12 +194,18 @@ def main() -> int:
         "includes_quant": False,
         "timing": "amortized-graph-cold-hot",
     }
-    rows, base, ref, failures = [], None, None, 0
+    rows, base, failures = [], None, 0
+
+    # The fp32 reference comes from the raw operands, never from a baseline's
+    # output. With `--baseline none` there is no baseline to borrow one from,
+    # and treating "nothing to compare against" as a pass is how a benchmark
+    # reports success for a kernel it never checked. `reference_partial` is the
+    # same reference `bench_gemm_ar.py` scores against.
+    ref = reference_partial(x[:m], w, ex[:m], ew, "mxfp8").float()
 
     if args.baseline == "sglang":
         call, wt = sglang_call(n, k, m, x, w, ex, ew, out)
         base = timing.cold_hot_us(call, [wt], reps=args.reps)
-        ref = out[:m].float().clone()
         print(
             f"{args.shape} M={m}  sglang    hot {base['hot_us']:6.2f}  "
             f"cold {base['cold_us']:6.2f}",
@@ -249,8 +256,8 @@ def main() -> int:
             )
             failures += 1
             continue
-        ok = rel is None or rel <= args.tol
-        failures += 0 if ok else 1
+        ok = None if rel is None else rel <= args.tol
+        failures += 1 if ok is False else 0
         vs = (
             f"  {(res['cold_us'] / base['cold_us'] - 1) * 100:+6.1f}%"
             if base
@@ -259,7 +266,7 @@ def main() -> int:
         rel_s = "   n/a  " if rel is None else f"  relL2 {rel:.2e}"
         print(
             f"  {key_of(cfg):<12} hot {res['hot_us']:6.2f}  cold {res['cold_us']:6.2f}"
-            f"{vs}{rel_s}{'' if ok else '  !! over tol'}",
+            f"{vs}{rel_s}{'' if ok is not False else '  !! over tol'}",
             flush=True,
         )
         rows.append(

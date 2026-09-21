@@ -175,6 +175,26 @@ def _tile_constraints(
     return None
 
 
+def permlane_tile_constraint(block_n: int) -> str | None:
+    """Why ``block_n`` cannot be stored by the permlane epilogue, or None.
+
+    An equality, not a floor: ``_PermlaneStoreC._emit`` pairs *exactly* two
+    N-tiles and asserts ``n_tiles_b == 2``. The mainloop is happy with any
+    count, so a wider tile compiles right up to the store.
+
+    Lives here, next to ``_tile_constraints``, because every predicate that
+    answers "can this shape be served" has to apply it *without* compiling --
+    `supports_gemm` cannot reach the kernel's own assert. The assert stays as
+    the backstop for callers that build a kernel directly.
+    """
+    if block_n != DEFAULT_BLOCK_N:
+        return (
+            f"block_n={block_n} must be {DEFAULT_BLOCK_N}: the permlane "
+            f"epilogue's lane transpose pairs exactly two N-tiles"
+        )
+    return None
+
+
 def _gemm_constraints(
     n: int, k: int, block_n: int, quant: str = "blockscale"
 ) -> str | None:
@@ -511,11 +531,9 @@ class GemmAllReduceOp:
                 f"gather_transport={gather_transport!r} is not one of "
                 f"{sorted(GATHER_TRANSPORTS)}"
             )
-        if block_n != DEFAULT_BLOCK_N:
-            raise ValueError(
-                f"block_n must be {DEFAULT_BLOCK_N}: the op always compiles with "
-                f"permlane, whose lane transpose is written for that width"
-            )
+        why = permlane_tile_constraint(block_n)
+        if why is not None:
+            raise ValueError(why)
         # The tile has to be legal before the padding arithmetic runs: both
         # padded_m and default_max_shapes divide by world_size * block_m.
         why = _tile_constraints(block_m, block_n)

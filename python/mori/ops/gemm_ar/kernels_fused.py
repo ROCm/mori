@@ -1132,18 +1132,28 @@ def compile_fused_gemm_scatter(
     if n_stripe < N // BLOCK_N and not rotated:
         raise ValueError("a striped tile order needs --tile-order rotated")
 
-    # BLOCK_N's floor belongs to the *store*, not the mainloop: the mainloop
-    # builds N_TILES_B = BLOCK_N//128 accumulators and is happy with one, while
-    # _LaneTransposeStoreC's permlane mapping pairs exactly two N-tiles. So 128
-    # is legal without permlane and not with it, which is what the store's own
-    # assert says a few frames deeper and less usefully.
-    n_floor = 256 if permlane else 128
-    assert (
-        BLOCK_M >= 128 and BLOCK_N >= n_floor
-    ), f"BLOCK_N={BLOCK_N} is below {n_floor}" + (
-        " (permlane's store pairs two N-tiles)" if permlane else ""
-    )
-    assert BLOCK_M % 128 == 0 and BLOCK_N % 128 == 0
+    # BLOCK_N's constraint belongs to the *store*, not the mainloop: the mainloop
+    # builds N_TILES_B = BLOCK_N//128 accumulators and is happy with any count,
+    # while `_PermlaneStoreC._emit` pairs *exactly* two N-tiles and asserts
+    # `n_tiles_b == 2`. So permlane needs BLOCK_N == 256 -- an equality, not a
+    # floor.
+    #
+    # It was written as `>= 256`, which let BLOCK_N=512 through here and into an
+    # assert several frames deeper. That is the worst shape for the failure to
+    # take: the wide tile is only chosen once the grid is large enough, so such
+    # an instance serves small batches correctly for as long as they stay small
+    # and dies when one grows. `supports_gemm` asks this same question and was
+    # wrong in the same way; checking it here fixes that caller too, rather than
+    # restating the rule at every entry point.
+    assert BLOCK_M >= 128 and BLOCK_M % 128 == 0, f"BLOCK_M={BLOCK_M}"
+    if permlane:
+        assert BLOCK_N == 256, (
+            f"BLOCK_N={BLOCK_N}: permlane's store pairs exactly two N-tiles, "
+            "so it needs BLOCK_N == 256 (pass permlane=False for other widths)"
+        )
+    else:
+        assert BLOCK_N >= 128, f"BLOCK_N={BLOCK_N} is below 128"
+    assert BLOCK_N % 128 == 0, f"BLOCK_N={BLOCK_N}"
     assert K % BLOCK_K == 0
     if N % BLOCK_N:
         raise ValueError(

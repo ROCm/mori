@@ -61,6 +61,7 @@ from .op import (
     _flatten_mxfp8_a_scale,
     _PinnedLaunch,
     _tile_constraints,
+    permlane_tile_constraint,
 )
 
 #: Rows one packed A-scale group spans: four M tiles of sixteen rows. M is
@@ -149,6 +150,11 @@ def supports_gemm(n: int, k: int, *, block_n: int = DEFAULT_BLOCK_N) -> bool:
     """
     return (
         _tile_constraints(MXFP8_BLOCK_M, block_n) is None
+        # The wide tile compiles with permlane, which is an equality on
+        # block_n rather than a floor. Without this, block_n=512 answers
+        # True here and dies in the store once the grid is wide enough to
+        # pick that tile -- i.e. only after the batch grows.
+        and permlane_tile_constraint(block_n) is None
         and _gemm_shape_constraint(n, k, block_n) is None
         # Small M runs the narrow tile, so N has to divide by that too.
         and _gemm_shape_constraint(n, k, NARROW_BLOCK_N) is None
@@ -181,6 +187,9 @@ class Mxfp8GemmOp:
         block_n: int = DEFAULT_BLOCK_N,
     ):
         why = _tile_constraints(MXFP8_BLOCK_M, block_n)
+        if why is not None:
+            raise ValueError(f"unsupported tile: {why}")
+        why = permlane_tile_constraint(block_n)
         if why is not None:
             raise ValueError(f"unsupported tile: {why}")
         why = _gemm_shape_constraint(n, k, block_n)
