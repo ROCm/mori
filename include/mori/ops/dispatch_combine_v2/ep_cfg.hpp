@@ -380,12 +380,6 @@ constexpr int EpXdbFlagSlots = 256;
 // Capped by the physical LDS rather than by combine's budget: the two are the
 // same number today, but for a shared physical reason, not because dispatch
 // follows combine.
-//
-// FP4 dispatch uses four consecutive token tiles per warp. Four warps form one
-// EP4 unit and each warp sends one peer. The device derives its pack count from
-// this slab, so host and kernel cannot disagree about how much LDS exists.
-// hiddenDim already counts packed bytes for Fp4x2: hidden 7168 becomes 3584 B,
-// hence 16 warps * 4 * 3584 B = 229376 B, below the 327680 B physical ceiling.
 constexpr int EpDispatch1250xSlabBytes(const EpCfg& c) {
   const int payload = c.hiddenDim * EpElemSize(c.dtype);
   if (c.dtype == EpDType::Fp4x2) {
@@ -398,8 +392,6 @@ constexpr int EpDispatch1250xSlabBytes(const EpCfg& c) {
   const long long total = (long long)wide * c.warpPerBlock;
   return (wide > payload && total <= Ep1250xLdsBytes) ? wide : payload;
 }
-// A second per-warp tile so the metadata store and the payload transfers do not share bytes.
-// Zero when the pair would not fit, which leaves the single-tile layout and its wait in place.
 constexpr int EpDispatch1250xMetaSlabBytes(const EpCfg& c) {
   const int slab = EpDispatch1250xSlabBytes(c);
   return ((long long)c.warpPerBlock * 2 * slab <= Ep1250xLdsBytes) ? slab : 0;

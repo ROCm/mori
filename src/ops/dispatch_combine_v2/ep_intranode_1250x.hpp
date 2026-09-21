@@ -485,11 +485,6 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   }
   __syncthreads();
 
-  // The first payload group, issued before the metadata phase instead of inside the payload
-  // loop. It is only safe because metadata now owns a tile of its own: sharing one tile, the
-  // metadata loads would land on these same bytes and overwrite the group before it is sent.
-  // kMetaSlabBytes is 0 when the second tile does not fit, and the guard below skips the
-  // hoist in that case.
   int _pfN = 0;
   index_t _pfSlot0 = 0;
   T* _pfDst = nullptr;
@@ -511,8 +506,6 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
           const index_t _pfCnt = _pfPart + (((index_t)_pfUnit < _pfRem) ? (index_t)1 : (index_t)0);
           const index_t _pfBase = s_base[_pfPe] + (index_t)_pfUnit * _pfPart +
                                   (((index_t)_pfUnit < _pfRem) ? (index_t)_pfUnit : _pfRem);
-          // One group only: with more than kPack slots the payload loop would run after the
-          // merged store and reload this tile, which is the case that fails CHECK at ct>=4096.
           if (_pfCnt > 0 && _pfCnt <= (index_t)_pfPack && kMetaSlabBytes > 0) {
             int _pfn = (int)_pfCnt;
             if (_pfn > _pfPack) _pfn = _pfPack;
@@ -639,8 +632,6 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
             if (spW.body) TdmIssueStore<int>(reinterpret_cast<int*>(dW + spW.head), tW, gW);
             if (spR.body) TdmIssueStore<int>(reinterpret_cast<int*>(dR + spR.head), tR, gR);
             if (spS.body) TdmIssueStore<int>(reinterpret_cast<int*>(dS + spS.head), tS, gS);
-            // Back to back with the metadata stores: the wait that follows this phase covers both,
-            // so the payload store does not pay a round trip of its own.
             if (!_pfSent && _pfN > 0 && _pfDst != nullptr) {
               const int _mTokB = (int)(hiddenDim * sizeof(T));
               TdmIssueStore<int>(
@@ -691,12 +682,6 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   __builtin_amdgcn_s_wait_tensorcnt(0);
 
   if (args.tokenIndices && args.inpTokenBuf) {
-    // FP4 payload send: four warps form one EP4 unit. Warp w sends only
-    // peer (w % 4), and four consecutive destination slots are packed into one
-    // TDM store. The count phase reserved [s_base[p], s_base[p] + s_N[p]) for
-    // this block with one fetch_add, so this loop consumes exactly that run:
-    // no spare slots and no holes. stgSrc maps each reserved slot back to its
-    // source token; the barrier before metadata send made those writes visible.
     constexpr int kTokB = kCfg.hiddenDim * (int)sizeof(T);
     constexpr bool kFp4Pack4 =
         kCfg.dtype == EpDType::Fp4x2 && kSlabBytes >= 4 * kTokB;
@@ -741,8 +726,6 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
         }
       }
     } else {
-      // bf16/fp8 and non-EP4 geometries keep the original one-warp/one-token
-      // path byte-for-byte; their host-side slab size is unchanged.
       for (int tokBase = aWarp * _etpi; tokBase < args.numTokens; tokBase += aWarps * _etpi) {
         for (int _sub = 0; _sub < _etpi; ++_sub) {
           int tok = tokBase + _sub;
