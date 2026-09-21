@@ -3,115 +3,154 @@
 Measurements for `mori.ops.gemm_a2a`, the column-sharded all-to-all fused into
 the epilogue of mori's 8-wave fp8 GEMM.
 
-## What is measured
+## What the operator is
 
 Every rank holds its own `A [M, K]` and a replicated `B [N, K]`, computes the
 whole `C = A @ B.T`, and sends column block `j` to rank `j`. Rank `d` ends up
 with `[world*M, shard_n]` bf16, source rank `r` at rows `[r*M, (r+1)*M)`.
 
+The shape it is aimed at is a QKV projection under Ulysses sequence
+parallelism: `K` is the hidden size, `N` the QKV width, `s = N/P` the per-rank
+head shard, and **`M = S/P`** — so sweeping `M` is sweeping the sequence length.
+
 | mode | what it does |
 |---|---|
 | `gemm-only` | the GEMM alone, to size the ceiling |
-| `split-lsa` | `gemm()`; then a copy kernel reads `[M,N]` and vector-stores into the peers |
-| `split-sdma` | `gemm()` into `[dst][M][shard_n]`; then one SDMA push per destination |
+| `split-lsa` | `gemm()`; a copy kernel reads `[M,N]` and vector-stores into the peers |
+| `split-sdma` | `gemm()` into `[dst][M][shard_n]`; one SDMA push per destination |
+| `split-rccl` | the same staging GEMM; then `all_to_all_single` |
 | `fused-lsa` | C stored straight into the peers from the epilogue |
 | `fused-sdma` | C staged per destination, pushed by the copy engine per chunk |
 
-`split-sdma` and `fused-sdma` use the **same** GEMM with the epilogue's put tail
-compiled out, so they differ in one thing only.
+`split-sdma`, `split-rccl` and `fused-sdma` share a GEMM byte for byte, so the
+differences between them are transport and nothing else.
 
 ## Conditions
 
-8x MI355X (gfx950), TP8, `M=2048 N=18432 K=8192`, `shard_n = 2304`,
-`--quant ptpc`, CUDA-graph replay, median of 21 iterations after 8 warmups, max
-over ranks. **Three independent launches per configuration**; the table reports
-the median of the three and the spread between them.
+8x MI355X (gfx950), fp8 e4m3 in / bf16 out, `--quant ptpc`, tile 128x256, CUDA
+graph replay, median of 21 iterations after 30 warmups, max over ranks.
 
-The shape is gcnasm's `opus_gemm_a2a_lsa` 8-rank full-N configuration, so the
-*shapes* are comparable. Its numbers are bf16 and this is fp8, so only the
-fused-vs-split **ratio** transfers, never the absolute time.
+**Three to four independent launches per cell, interleaved.** Every
+configuration is measured once per round and the rounds repeat, so machine
+drift lands inside each configuration's own samples where the spread shows it,
+rather than between the things being compared. Every launch waits for an idle
+box; any sample taken with a neighbour present is discarded, not averaged in.
+Clock and junction temperature are recorded next to every measurement.
 
-> Measured on an idle box, verified with `rocm-smi --showpids` beforehand. An
-> earlier attempt on a shared box put the same configuration at 635.5us and
-> 787.6us on consecutive runs -- 24% apart, wider than anything being measured.
-> Those runs were discarded, not averaged in.
+Reported spread is 0.0–2.9% on every cell below.
+
+> **This protocol is not optional here, and the cost of skipping it was most of
+> a day.** A neighbour on the box is worth 9% on a *pure GEMM* — a kernel that
+> communicates nothing — and it is not a uniform slowdown: with company, 70B's
+> best chunk count measured as 2 with a 4.3% margin; alone, it is 4 with a 9.2%
+> margin. The ranking changes, so a contaminated table cannot be rescued by
+> scaling it. Earlier sweeps in this file's history were grouped by
+> configuration rather than interleaved, and one cell measured 5153us four
+> times running and 3508us four times running with a byte-identical kernel and
+> an identical config; nothing in the code explained it and nothing needed to.
 
 ## Results
 
-| configuration | median (us) | spread | comm (us) | vs `split-lsa` |
+### Llama-3.1-70B / Qwen2.5-72B — `N=10240 K=8192` (s=1280)
+
+| M | S | gemm-only | split-sdma | split-rccl | best fused | vs split | vs rccl |
+|---:|---:|---:|---:|---:|---|---:|---:|
+| 2048 | 16k | 180 | 270 | 298 | **245** `c4` | 9.2% | 17.8% |
+| 4096 | 32k | 300 | 471 | 552 | **417** `c4` | 11.5% | 24.5% |
+| 8192 | 64k | 625 | 911 | 1146 | **766** `c8` | **15.9%** | **33.2%** |
+| 16384 | 128k | 1431 | 2124 | 2304 | **1884** `c8` | 11.3% | 18.3% |
+
+### Llama-3.1-405B — `N=18432 K=16384` (s=2304)
+
+| M | S | gemm-only | split-sdma | split-rccl | best fused | vs split | vs rccl |
+|---:|---:|---:|---:|---:|---|---:|---:|
+| 2048 | 16k | 687 | 831 | 891 | **802** `c8` | 3.5% | 9.9% |
+| 4096 | 32k | 1232 | 1546 | 1633 | **1440** `c8` | 6.8% | 11.8% |
+| 8192 | 64k | 2444 | 3103 | 3277 | **2866** `c8` | 7.7% | 12.5% |
+| 16384 | 128k | 4880 | 6263 | 6606 | **5726** `c8` | **8.6%** | 13.3% |
+
+All modes agree to the digit on relL2 — 1.66e-3, fp8's own floor at these
+operands — so the transports write identical bytes and the numbers above are
+comparing the same computation.
+
+### The full mode table at one cell, `M=2048`
+
+| | 70B | | 405B | |
 |---|---:|---:|---:|---:|
-| `gemm-only` | **325.0** | 1.2% | — | — |
-| `split-lsa` | 952.4 | 0.2% | 627.4 | — |
-| `split-sdma` | 630.3 | 0.5% | 305.3 | −33.8% |
-| `fused-lsa` (rotated, stripe 1) | 642.6 | 2.0% | 317.6 | −32.5% |
-| `fused-lsa` (no rotation) | 618.2 | 1.6% | 293.2 | −35.1% |
-| `fused-lsa` (rotated, stripe 3) | 623.4 | 0.2% | 298.5 | −34.5% |
-| `fused-sdma --chunks 1` | 622.0 | 6.5% | 297.1 | −34.7% |
-| `fused-sdma --chunks 2` | 552.5 | 0.4% | 227.5 | −42.0% |
-| **`fused-sdma --chunks 4`** | **522.3** | 0.6% | **197.3** | **−45.2%** |
-| `fused-sdma --chunks 8` | 532.4 | 0.5% | 207.5 | −44.1% |
-| `fused-sdma --chunks 16` | 567.1 | 0.4% | 242.1 | −40.5% |
+| | us | comm | us | comm |
+| `gemm-only` | 180.4 | — | 686.9 | — |
+| `fused-sdma --chunks 4` | **245.3** | 29.5 | 816.0 | 60.8 |
+| `fused-sdma --chunks 8` | 256.2 | 36.1 | **802.0** | 37.0 |
+| `fused-sdma --chunks 2` | 258.2 | 55.6 | 847.0 | 92.6 |
+| `split-sdma` | 270.2 | 100.4 | 831.3 | 171.8 |
+| `split-lsa` | 271.2 | 101.2 | 856.3 | 186.3 |
+| `fused-lsa` | 288.2 | — | 915.0 | — |
+| `split-rccl` | 298.4 | 126.5 | 890.6 | 230.2 |
 
-"comm" is `median - gemm-only`, i.e. everything the GEMM does not account for.
-It is the number the fusion is trying to move, and quoting only the end-to-end
-figure understates it by the GEMM's share.
+"comm" is `total - gemm` **measured in the same run**. On the fused rows it is
+the *unhidden tail*, not wire time — the transfer is inside the GEMM — so it is
+comparable across fused configurations but not against the split ones.
 
-**Headline: `fused-sdma --chunks 4` at 522.3us, 45.2% under `split-lsa` and
-17.1% under `split-sdma`. Against its own split baseline the comm half falls
-305.3 -> 197.3us, −35.4%.**
+## Reading the tables
 
-## Reading the table
+**Fusing wins in all eight cells, and the margin grows with sequence length.**
+405B is monotone: 3.5% → 6.8% → 7.7% → 8.6%. The mechanism is the one gcnasm
+reports for its own version: at larger M each persistent workgroup owns more
+tiles, so an early PUT has more remaining compute to overlap against. 70B peaks
+at S=64k (15.9%) and falls back to 11.3% at 128k; that non-monotonicity is
+**not explained here** — it may be the slab outgrowing a bandwidth knee, or
+`--chunks` needing to go past 8, which was not measured.
 
-**SDMA beats LSA on both halves, and that is the opposite of what gcnasm
-reports.** Its README has Direct (fused) LSA ahead of Fused SDMA on all seven
-8-rank shapes. Here `fused-sdma` (522.3) beats `fused-lsa` (618.2) by 15.5%,
-and even `split-sdma` (630.3) beats the best `fused-lsa`.
+**The best chunk count moves right with size.** 70B wants `c4` at S≤32k and
+`c8` at S≥64k; 405B wants `c8` throughout. Splitting further lets a
+destination's early rows leave sooner, but each PUT gets smaller and below
+roughly 1 MiB the per-packet cost starts dominating — so the right count is the
+one that keeps the PUT above that knee while starting as early as possible.
 
-The difference is not a contradiction, it is the shape. gcnasm's experiment is
-**bf16** and this is **fp8**: same output bytes, half the input bytes, so the
-GEMM is roughly twice as fast and the compute/comm ratio is half. LSA wins when
-there is enough compute to hide CU-issued stores behind; SDMA wins when the
-copy engines' independence from the CUs matters more. Halving the compute moves
-the shape across that line. This is the same mechanism recorded for `gemm_ar`,
-where `fused-sdma` won at compute/comm 0.22 while gcnasm's 2.8 favoured LSA --
-the ratio, not the transport, is what decides.
+**RCCL is last in every cell**, 10–33% behind the best fused path and 3–26%
+behind `split-sdma`. That comparison is clean: `split-rccl` and `split-sdma`
+run the same GEMM over the same bytes in the same layout.
 
-**Chunking is the whole of the fused-SDMA win.** At `--chunks 1` the fused path
-is 622.0us, statistically the same as `split-sdma`'s 630.3 -- one put per
-destination cannot start until that destination's last tile is written, which is
-near the end of the GEMM either way, so there is nothing to overlap. Chunks 2
-and 4 let a destination's earlier rows leave while its later ones are still
-being computed, and that is worth 100us. Past 4 it reverses: at 16 chunks each
-put is 576 KiB, below the knee in the SDMA bandwidth curve, and the per-packet
-cost starts dominating. The curve's minimum at 4 is shallow -- 4 and 8 are
-within 2% -- so this is not a knife edge.
+**Fusing nearly eliminates the exposed transfer, and that bounds the win.** At
+405B/M=16384 the communication drops 1517us → 264us, −83%, yet end to end the
+gain is 8.6%. The GEMM is 78% of the fused total, so there is very little left
+to hide. Past this point the lever is the GEMM, not the transport.
 
-**Destination rotation does not pay here, and may cost.** `fused-lsa` is
-fastest with rotation *off* (618.2 against 642.6 rotated). gcnasm measured the
-rotation worth 17-27% at 8 ranks, but for `M >= 8192`; this is `M = 2048`, a
-quarter of its smallest striped shape. With only 16 row tiles there is little
-for a rotation to spread. The knob is kept because the effect is shape-dependent
-by construction, not because this configuration wants it on.
+**LSA loses to SDMA on this operator.** `split-lsa` reaches only ~60% of the
+76.8 GB/s line rate where the copy engines reach ~75%; `fused-lsa` is the
+slowest mode at both shapes. Ruled out as causes: grid size (24/48/80 blocks
+within 0.6%), cache policy (`sc0|sc1` worth 1.7%), local memory bandwidth
+(10.6us of an 88us gap), and the read layout — `split-lsa-staged` reads a
+compacted slab instead of a strided `[M,N]`, moves 12% fewer bytes, and takes
+the same time, so LSA's cost is its peer stores alone. gcnasm's independent
+measurement of the same kind of store puts it at 46.1 GB/s per link against our
+48.3, and its ATT capture found 99% of that time was stall.
 
-**The one noisy cell is `fused-sdma --chunks 1`** at 6.5% spread (618.4 / 622.0
-/ 658.5). It is also the configuration with the least overlap, so its timing is
-most exposed to when the last tile happens to land. Not chased further: it is
-not a configuration anyone would ship.
+## Shape constraints
 
-## Correctness
+`validate()` rejects `n % (world_size * block_n) != 0`, which for P=8 and
+block_n=256 means **N must be a multiple of 2048**. That is not an arbitrary
+tile rule: a destination's column run has to be a whole number of GEMM tiles or
+a tile straddles two destinations and its store cannot stay contiguous.
 
-All five modes validate at relL2 **0.0016595761784107884** -- the same value to
-every digit, so the four communicating paths write identical bytes and the
-number is fp8's own floor at these operands rather than anything the transport
-adds. `gemm-only` is 0.0016583964824022402 against its local reference.
+Checked against real QKV widths at P=8:
 
-Validation reads the **received** buffer and checks every source rank's row
-block separately against that rank's rebuilt operands. This matters more than
-it sounds: during development the SDMA modes reported relL2 exactly 1.0 while
-every *remote* slab was perfect and only the rank's own was missing -- the put
-loop skips self, so a self-destination tile written to staging was stranded. A
-check that sampled one remote slab, or that took a mean rather than a max, would
-have passed it.
+| model | K | N | s | validate |
+|---|---:|---:|---:|---|
+| Llama-3.1-8B | 4096 | 6144 | 768 | ok |
+| Llama-3.1-70B | 8192 | 10240 | 1280 | ok |
+| Qwen2.5-72B | 8192 | 10240 | 1280 | ok |
+| Qwen3-32B | 5120 | 10240 | 1280 | ok |
+| Llama-3.1-405B | 16384 | 18432 | 2304 | ok |
+| Qwen3-235B-A22B | 4096 | 9216 | 1152 | **rejected** |
+
+Qwen3-235B has 4 KV heads, so `N = (64 + 2*4) * 128 = 9216` and `9216 / 2048`
+is not an integer. The deeper constraint is that it has fewer KV heads than
+ranks, so Ulysses at P=8 would have to replicate KV — the layout rule is that
+condition showing up in this kernel, not a separate limitation.
+
+Head alignment is exact for the others and needs no padding: 70B's `s = 1280`
+is 8 q heads + 1 k + 1 v at 128 each, which is one whole GQA group per rank.
 
 ## Reproducing
 
@@ -120,28 +159,31 @@ have passed it.
 MORI_ENABLE_SDMA=1 MORI_SOCKET_IFNAME=lo \
   python -m torch.distributed.run --standalone --nproc_per_node=8 \
   benchmark/cco/flydsl/gemm_a2a/bench_gemm_a2a.py \
-  --mode fused-sdma --chunks 4 -m 2048 -n 18432 -k 8192 \
-  --warmup 8 --iters 21
+  --mode fused-sdma --chunks 8 -m 16384 -n 18432 -k 16384 \
+  --warmup 30 --iters 21 --phase-split
 
-# the whole table (three repeats per cell, retries the queue race)
-python benchmark/cco/flydsl/gemm_a2a/sweep_a2a.py --out a2a_sweep.jsonl
+# the model tables, with the idle-box protocol
+python benchmark/cco/flydsl/gemm_a2a/sweep_models.py --rounds 3 --out models.jsonl
+
+# the mode/chunk sweep at one shape
+python benchmark/cco/flydsl/gemm_a2a/sweep_a2a.py --out sweep.jsonl
 ```
 
 `BUILD_CCO_SDMA=ON` is required for the SDMA modes. Without it every put is a
-silent no-op; here that is caught -- the received slabs stay zero and validation
-reports relL2 1.0 -- but only because validation reads what arrived.
+silent no-op; that is caught here — the received slabs stay zero and validation
+reports relL2 1.0 — but only because validation reads what arrived, per source
+rank, rather than this rank's own block.
 
 Back-to-back launches lose the SDMA queue reclamation race (`anvil.cpp:237`)
-often enough that a bare loop over the table cannot finish. The sweep driver
-settles 25s between launches and retries a lost race after 90s rather than
-recording it.
+often enough that a bare loop cannot finish a table. Both drivers settle
+between launches and retry a lost race rather than recording it.
 
 ## Not measured
 
-* `--quant blockscale`, which is what a model runs. The a2a shape here has no
-  model behind it yet, so ptpc -- the kernel's native form -- is the honest
-  default. `gemm_ar` found the fused margin *grew* under blockscale.
-* Other `M`. gcnasm's rotation result is an `M >= 8192` effect and this table is
-  `M = 2048`; the two do not settle each other.
-* fp8 on the wire. Halving the payload is the obvious next lever and is the one
-  thing here that would move the comm half again.
+* `--quant blockscale`, which is what a model runs. `gemm_ar` found the fused
+  margin *grew* under blockscale.
+* `--chunks` past 8, which is where 70B's S=128k regression might resolve.
+* The other validated shapes — 8B, Qwen3-32B.
+* fp8 on the wire. The transfer is already 83% hidden at the large end, so this
+  would help the small-M cells rather than the large ones.
+* Anything at P != 8.
