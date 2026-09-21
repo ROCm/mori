@@ -42,6 +42,7 @@
 #include "mori/io/engine.hpp"
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/master/master_client.h"
+#include "umbp/distributed/metrics/activity_summary.h"
 #include "umbp/distributed/metrics/component_metrics.h"
 #include "umbp/distributed/peer/backend/medium_backend.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
@@ -253,9 +254,10 @@ class PoolClient {
   std::atomic<bool> initialized_{false};
 
   // Sample every instrumented component on this node — each registered storage
-  // backend, plus the transfer engine — and ship the result.  Registered as a
-  // MasterClient metrics provider, so it runs on the metrics thread and never
-  // on a data-plane path.
+  // backend, plus the transfer engine — and ship the result.  With a master it
+  // is registered as a MasterClient metrics provider and runs on that client's
+  // metrics thread; without one it runs on local_metrics_thread_ below.  Either
+  // way it is a tick, never a data-plane path.
   //
   // There is no per-component code here and no place to add any: a component is
   // a MetricSource, the labels that identify it come from Tier() plus the
@@ -269,6 +271,55 @@ class PoolClient {
   MetricPublisher metric_publisher_;
 
   std::unique_ptr<MasterClient> master_client_;
+
+  // Where this node's metrics go.  Points at master_client_ when this node has
+  // a master, otherwise at config_.metric_sink (a PrometheusMetricSink owned by
+  // whoever built this client), and is null when neither exists — the case
+  // where metrics are measured and discarded.  Never owns.
+  MetricSink* metric_sink_ = nullptr;
+
+  // Drives PublishComponentMetrics() when there is no MasterClient whose
+  // metrics thread could.  Started by Init only when metric_sink_ is set and
+  // master_client_ is not; joined by Shutdown before the components it samples
+  // are torn down.  Interval comes from UMBP_METRICS_REPORT_INTERVAL_MS, the
+  // same knob the master-backed path uses, so the two tick alike.
+  void LocalMetricsLoop();
+  void StartLocalMetricsReporting();
+  void StopLocalMetricsReporting();
+
+  std::thread local_metrics_thread_;
+  std::atomic<bool> local_metrics_running_{false};
+  std::mutex local_metrics_mu_;
+  std::condition_variable local_metrics_cv_;
+  uint64_t local_metrics_interval_ms_ = 1000;
+
+  // ---- the periodic activity summary ------------------------------------
+  // One INFO line per window saying what this process offloaded, loaded,
+  // evicted, promoted and demoted.  Deliberately NOT tied to the metrics tick
+  // above: that one exists only when there is somewhere to publish (a master,
+  // or a local Prometheus endpoint), and the deployments where this summary
+  // earns its keep are exactly the ones with neither.  It therefore runs in
+  // every deployment, on its own much slower timer.
+  //
+  // Cadence: UMBP_SUMMARY_INTERVAL_MS, default 60000, 0 disables.  Joined by
+  // Shutdown before the backends it samples are destroyed, with a final render
+  // so a short run still reports what it did.
+  void ActivitySummaryLoop();
+  void StartActivitySummary();
+  void StopActivitySummary();
+  // Reads every backend's cumulative counters plus the pool's transition
+  // totals.  Cheap and lock-light — SampleMetrics() is relaxed atomic loads —
+  // but still a tick, never a data-plane path.
+  ActivitySnapshot CollectActivitySnapshot() const;
+  void EmitActivitySummary(double window_seconds);
+
+  ActivitySummary activity_summary_;
+  std::thread summary_thread_;
+  std::atomic<bool> summary_running_{false};
+  std::mutex summary_mu_;
+  std::condition_variable summary_cv_;
+  uint64_t summary_interval_ms_ = 60000;
+  std::chrono::steady_clock::time_point summary_last_;
 
   // Every storage medium live on this node.  Owned here because PoolClient is
   // the natural lifetime anchor for the per-process IO engine + backend pools.
@@ -615,6 +666,26 @@ class PoolClient {
   std::thread recache_worker_;
   bool recache_stop_ = false;
   size_t recache_queue_max_ = 1024;
+
+  // Outcome counts for the local-tier admission path, reported by the periodic
+  // activity summary.  These replaced per-key DEBUG lines at each of these
+  // sites: every one of them is a best-effort give-up that leaves the read it
+  // was helping perfectly correct, so the only way to see one was to turn on a
+  // level that prints a line per key and changes the timing of the thing being
+  // measured.  Relaxed atomics — read once per summary window, sampled from
+  // another thread, never correctness state.
+  struct ReCacheCounters {
+    std::atomic<uint64_t> admitted{0};
+    std::atomic<uint64_t> rejected{0};
+    std::atomic<uint64_t> queue_full{0};
+    std::atomic<uint64_t> alloc_failed{0};
+    std::atomic<uint64_t> installed{0};
+    std::atomic<uint64_t> already_present{0};
+    std::atomic<uint64_t> install_failed{0};
+    std::atomic<uint64_t> prefetched{0};
+    std::atomic<uint64_t> fragmented{0};
+  };
+  ReCacheCounters recache_stats_;
   struct BatchPutItem {
     size_t index;
     const std::string* key;
@@ -724,10 +795,11 @@ class PoolClient {
                                          const std::vector<size_t>& sizes,
                                          std::vector<bool>* results);
 
-  // Counter sink that tolerates a node running without a master: metrics
-  // accumulate on the MasterClient and ride its flush tick, so with no master
-  // there is simply nowhere to put them.
-  void CountMetric(std::string name, std::string help, MasterClient::Labels labels, double delta);
+  // Counter sink that tolerates a node publishing nowhere: with a master the
+  // delta accumulates on the MasterClient and rides its flush tick, without one
+  // it goes straight into the local metrics server, and with neither it is
+  // dropped.
+  void CountMetric(std::string name, std::string help, MetricSink::Labels labels, double delta);
 
   // Placement when there is no master to ask: this node is the only candidate,
   // so every key is routed to it on the medium it serves.  The put paths then

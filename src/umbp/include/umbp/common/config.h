@@ -30,6 +30,11 @@
 
 namespace mori::umbp {
 
+// Forward-declared rather than included: the dependency runs the other way
+// (distributed/metrics/metric_sink.h is a distributed-layer header), and the
+// config only ever stores a pointer to one.
+class MetricSink;
+
 enum class UMBPRole : int {
   Standalone = 0,
   SharedSSDLeader = 1,
@@ -435,6 +440,12 @@ struct UMBPDistributedConfig {
   std::string workload_trace_path;
   uint32_t workload_trace_client_id = 0;
   uint64_t workload_trace_seed = 0;
+
+  // Where a MASTERLESS node publishes its metrics; see
+  // PoolClientConfig::metric_sink, which this is lowered into verbatim.
+  // Caller-owned, must outlive the client, null disables. Ignored when
+  // master_config.master_address is set.
+  MetricSink* metric_sink = nullptr;
 };
 
 // User-facing same-host standalone-process configuration.  Set

@@ -355,6 +355,12 @@ class PageBackend : public MediumBackend {
   // local eviction off.
   void EnableLocalEviction(double high_watermark, double low_watermark) override;
 
+  // What this medium's interface cannot show from outside: the local
+  // watermark-eviction rounds, which never become an interface call.  Follows
+  // the generic MORI_UMBP_METRIC_BACKEND_MEDIUM_* names with the specifics in
+  // an event= label, so it lands in the panel that is already there.
+  std::vector<MetricSample> SampleMetrics() const override;
+
   // Test seam: run one local-eviction round synchronously.  Returns the number
   // of keys freed (0 when local eviction is off or usage is below the high
   // watermark).
@@ -577,6 +583,18 @@ class PageBackend : public MediumBackend {
   // per episode rather than once per commit.  Cleared by the next round that
   // frees something.
   bool local_evict_warned_ = false;
+
+  // Local high-watermark eviction is the one reclaim path NOT visible to the
+  // instrumentation decorator: the rounds below free pages inline rather than
+  // calling this backend's own Evict(), so no interface call is ever made and
+  // op="evict" stays at zero however much a masterless node reclaims.  These
+  // counters are what the medium publishes about itself for that reason, and
+  // they are what the periodic activity summary reports as eviction on a node
+  // with no master.  Relaxed atomics, read once per tick from another thread.
+  std::atomic<uint64_t> local_evict_keys_{0};
+  std::atomic<uint64_t> local_evict_bytes_{0};
+  std::atomic<uint64_t> local_evict_rounds_{0};
+  std::atomic<uint64_t> local_evict_no_candidate_{0};
 
   // False stops QueueEventLocked from recording anything (no master to ship
   // to).  True is the cluster default.

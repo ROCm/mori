@@ -32,6 +32,7 @@
 
 #include "umbp/common/config.h"
 #include "umbp/common/env_time.h"
+#include "umbp/distributed/metrics/metric_sink.h"
 #include "umbp/distributed/pool/policy_config.h"
 #include "umbp/distributed/types.h"
 
@@ -339,6 +340,20 @@ struct PoolClientConfig {
   std::string workload_trace_path;
   uint32_t workload_trace_client_id = 0;
   uint64_t workload_trace_seed = 0;
+
+  // Where this node's metrics go, for a node that has no master to send them
+  // to.  Caller-owned and must outlive the PoolClient; null means metrics are
+  // measured and discarded, which is what every masterless deployment did
+  // before this seam existed.  IGNORED when master_config.master_address is
+  // set: with a master, MasterClient is the sink and shipping the same series
+  // to both would double-count it on any Prometheus scraping the pair.
+  //
+  // PoolClient does not create one of these itself.  A sink binds a TCP port,
+  // and PoolClient is also constructed in-process inside every sglang rank —
+  // eight of them per node — so making it implicit would turn one config flag
+  // into eight racing binds.  The standalone server, which is one process per
+  // node, opts in explicitly.
+  MetricSink* metric_sink = nullptr;
 };
 
 // Lower a user-facing UMBPDistributedConfig to the internal PoolClientConfig.
@@ -381,6 +396,7 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.workload_trace_path = dc.workload_trace_path;
   pc.workload_trace_client_id = dc.workload_trace_client_id;
   pc.workload_trace_seed = dc.workload_trace_seed;
+  pc.metric_sink = dc.metric_sink;
   pc.dram = std::move(dram);
   pc.ssd = std::move(ssd);
   // Unlike dram/ssd, UMBPHbmConfig carries no ownership knobs that live
