@@ -37,7 +37,12 @@ OVERLAY = os.environ.get("PYTHONPATH", "")
 
 SETTLE = 25
 RETRY_SETTLE = 90
-QUEUE_RACE = ("anvil.cpp", "Allgather operation failed", "ChildFailedError")
+# `ChildFailedError` on its own is too coarse to be a retry signal: torchrun
+# reports *every* child failure that way, so an ImportError in the bench --
+# which is what a missing PYTHONPATH overlay looks like -- was classified as a
+# lost queue race and retried three times per cell, silently emptying a whole
+# sweep. Only retry when a real SDMA-side marker is present.
+QUEUE_RACE = ("anvil.cpp", "Allgather operation failed")
 
 # M = S/P, so sweeping M is sweeping the sequence length: at P=8,
 # M = 4096/8192/16384 is S = 32k/64k/128k. That is the dimension this operator
@@ -48,7 +53,7 @@ MODELS = {
     "70B": dict(n=10240, k=8192),
     "405B": dict(n=18432, k=16384),
 }
-MS = [4096, 8192, 16384]
+MS = [2048, 4096, 8192, 16384]
 SHAPES = {f"{name}@M{m}": dict(m=m, **cfg) for m in MS for name, cfg in MODELS.items()}
 
 # gemm-only and split-sdma are carried over from the previous sweep as anchors:
@@ -116,7 +121,7 @@ def gpu_state():
         return (-1, -1.0)
 
 
-def launch(mode, shape, extra, warmup=30, iters=21, timeout=3000):
+def launch(mode, shape, extra, quant="ptpc", warmup=30, iters=21, timeout=3000):
     time.sleep(SETTLE)
     env = dict(os.environ)
     env.update(MORI_ENABLE_SDMA="1", MORI_SOCKET_IFNAME="lo", PYTHONPATH=OVERLAY)
@@ -135,6 +140,8 @@ def launch(mode, shape, extra, warmup=30, iters=21, timeout=3000):
         str(shape["n"]),
         "-k",
         str(shape["k"]),
+        "--quant",
+        quant,
         "--warmup",
         str(warmup),
         "--iters",
@@ -171,6 +178,7 @@ def launch(mode, shape, extra, warmup=30, iters=21, timeout=3000):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--rounds", type=int, default=3)
+    ap.add_argument("--quant", choices=("ptpc", "blockscale", "mxfp8"), default="ptpc")
     ap.add_argument("--out", default="a2a_models.jsonl")
     args = ap.parse_args()
 
@@ -184,7 +192,7 @@ def main():
                     r = None
                     for _ in range(3):
                         try:
-                            r = launch(mode, shape, extra)
+                            r = launch(mode, shape, extra, quant=args.quant)
                         except RuntimeError as e:
                             print(f"  {key}: FAILED {e}", flush=True)
                             r = "err"

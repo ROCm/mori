@@ -27,8 +27,10 @@ differences between them are transport and nothing else.
 
 ## Conditions
 
-8x MI355X (gfx950), fp8 e4m3 in / bf16 out, `--quant ptpc`, tile 128x256, CUDA
-graph replay, median of 21 iterations after 30 warmups, max over ranks.
+8x MI355X (gfx950), fp8 e4m3 in / bf16 out, CUDA graph replay, median of 21
+iterations after 30 warmups, max over ranks. Tile is 128x256 under `--quant
+ptpc` and 256x256 under `--quant mxfp8`, which needs `BLOCK_M=256` for the
+scale operands.
 
 **Three to four independent launches per cell, interleaved.** Every
 configuration is measured once per round and the rounds repeat, so machine
@@ -51,7 +53,7 @@ Reported spread is 0.0–2.9% on every cell below.
 
 ## Results
 
-### Llama-3.1-70B / Qwen2.5-72B — `N=10240 K=8192` (s=1280)
+### PTPC — Llama-3.1-70B / Qwen2.5-72B — `N=10240 K=8192` (s=1280)
 
 | M | S | gemm-only | split-sdma | split-rccl | best fused | vs split | vs rccl |
 |---:|---:|---:|---:|---:|---|---:|---:|
@@ -60,7 +62,7 @@ Reported spread is 0.0–2.9% on every cell below.
 | 8192 | 64k | 625 | 911 | 1146 | **766** `c8` | **15.9%** | **33.2%** |
 | 16384 | 128k | 1431 | 2124 | 2304 | **1884** `c8` | 11.3% | 18.3% |
 
-### Llama-3.1-405B — `N=18432 K=16384` (s=2304)
+### PTPC — Llama-3.1-405B — `N=18432 K=16384` (s=2304)
 
 | M | S | gemm-only | split-sdma | split-rccl | best fused | vs split | vs rccl |
 |---:|---:|---:|---:|---:|---|---:|---:|
@@ -72,6 +74,49 @@ Reported spread is 0.0–2.9% on every cell below.
 All modes agree to the digit on relL2 — 1.66e-3, fp8's own floor at these
 operands — so the transports write identical bytes and the numbers above are
 comparing the same computation.
+
+### MXFP8 — the same eight cells, `--quant mxfp8`
+
+Two rounds, spread 0.1–1.0%, same protocol. `relL2` is 1.66e-3, the same as
+ptpc: the operands are identical and the fp8 mantissa dominates the ue8m0
+scales.
+
+| M | S | gemm-only | split-sdma | split-rccl | best fused | vs split | vs rccl |
+|---:|---:|---:|---:|---:|---|---:|---:|
+| **70B** | | | | | | | |
+| 2048 | 16k | 197 | 294 | 322 | **249** `c4` | 15.3% | 22.8% |
+| 4096 | 32k | 305 | 481 | 552 | **391** `c4` | 18.7% | 29.1% |
+| 8192 | 64k | 596 | 898 | 1047 | **681** `c4` | 24.2% | 35.0% |
+| 16384 | 128k | 1211 | 1916 | 2121 | **1443** `c8` | **24.7%** | 32.0% |
+| **405B** | | | | | | | |
+| 2048 | 16k | 669 | 826 | 872 | **733** `c8` | 11.3% | 16.0% |
+| 4096 | 32k | 1151 | 1465 | 1546 | **1257** `c8` | 14.2% | 18.7% |
+| 8192 | 64k | 2129 | 2788 | 2959 | **2341** `c8` | 16.1% | 20.9% |
+| 16384 | 128k | 4230 | 5649 | 5988 | **4696** `c8` | **16.9%** | 21.6% |
+
+**Fusing pays about twice as much under mxfp8**, 11–25% against ptpc's 3.5–16%,
+and **both shapes are now monotone in S** — 70B's unexplained fall-back at
+S=128k is gone, so it was a property of the ptpc kernel rather than of the
+slab size or the chunk count.
+
+The split-path communication matches ptpc cell for cell (405B/M=16384: 1511us
+against 1517us), which is the expected result and a useful check — the bytes,
+the layout and the transport are unchanged, so only the GEMM differs between
+the two tables.
+
+Two things move, and they move in opposite directions:
+
+* **The GEMM crosses over.** mxfp8 is 9% *slower* than ptpc at M=2048
+  (197 vs 180us on 70B) and 13–15% *faster* at M=16384 (1211 vs 1431, 4230 vs
+  4880). `BLOCK_M` is 256 for mxfp8 against ptpc's 128 — a shape that costs
+  occupancy when there are few row tiles and buys reuse once there are many.
+* **The fused path hides more of the transfer.** The unhidden tail is 50–74% of
+  the split-path communication here; under ptpc at 405B/M=16384 it was 846us of
+  1517 (44%) against 466 of 1511 (69%) now.
+
+That combination is why the margin roughly doubles: the epilogue overlaps a
+larger fraction of a transfer that is unchanged, against a GEMM that at the
+large end is also cheaper.
 
 ### The full mode table at one cell, `M=2048`
 
@@ -98,8 +143,9 @@ comparable across fused configurations but not against the split ones.
 reports for its own version: at larger M each persistent workgroup owns more
 tiles, so an early PUT has more remaining compute to overlap against. 70B peaks
 at S=64k (15.9%) and falls back to 11.3% at 128k; that non-monotonicity is
-**not explained here** — it may be the slab outgrowing a bandwidth knee, or
-`--chunks` needing to go past 8, which was not measured.
+**not explained here**, but it does not survive the change of quantisation —
+the mxfp8 table is monotone at both shapes — so it is a property of the ptpc
+kernel rather than of the slab size or of `--chunks` stopping at 8.
 
 **The best chunk count moves right with size.** 70B wants `c4` at S≤32k and
 `c8` at S≥64k; 405B wants `c8` throughout. Splitting further lets a
@@ -164,6 +210,8 @@ MORI_ENABLE_SDMA=1 MORI_SOCKET_IFNAME=lo \
 
 # the model tables, with the idle-box protocol
 python benchmark/cco/flydsl/gemm_a2a/sweep_models.py --rounds 3 --out models.jsonl
+python benchmark/cco/flydsl/gemm_a2a/sweep_models.py --quant mxfp8 --rounds 2 \
+  --out mxfp8.jsonl
 
 # the mode/chunk sweep at one shape
 python benchmark/cco/flydsl/gemm_a2a/sweep_a2a.py --out sweep.jsonl
@@ -180,9 +228,9 @@ between launches and retry a lost race rather than recording it.
 
 ## Not measured
 
-* `--quant blockscale`, which is what a model runs. `gemm_ar` found the fused
-  margin *grew* under blockscale.
-* `--chunks` past 8, which is where 70B's S=128k regression might resolve.
+* `--quant blockscale`. `gemm_ar` found the fused margin *grew* under
+  blockscale, which is the direction mxfp8 went here too.
+* `--chunks` past 8, and `--chunks 2` anywhere but `M=2048`.
 * The other validated shapes — 8B, Qwen3-32B.
 * fp8 on the wire. The transfer is already 83% hidden at the large end, so this
   would help the small-M cells rather than the large ones.
